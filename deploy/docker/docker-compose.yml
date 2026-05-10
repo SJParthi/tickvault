@@ -1,11 +1,21 @@
 # =============================================================================
 # tickvault — Docker Compose
 # =============================================================================
-# ALL versions from Tech Stack Bible V6. Same file on Mac and AWS c7i.xlarge.
-# Target: c7i.xlarge (4 vCPUs, 8GB RAM) — 1yr reserved ~₹6,400/mo
-# Memory budget: QuestDB 4GB + App 1GB + Valkey 256MB + Prometheus 512MB
-#   + Grafana 256MB + Traefik 128MB + OS 1GB = ~7.2GB (fits in 8GB)
-# Loki + Alloy + Jaeger REMOVED — saves ~2.5GB RAM.
+# ALL versions from Tech Stack Bible V6. Same file on Mac and AWS c7i/c8g.xlarge.
+# Target: c7i.xlarge OR c8g.xlarge (4 vCPUs, 8GB RAM)
+#
+# Wave 7-A trim (2026-05-10) — see .claude/rules/project/aws-budget.md:
+#   QuestDB 2GB + Valkey 512MB + Prometheus 384MB + Grafana 768MB
+#   + App ~500MB + OS ~200MB = ~3.7GB total. ~4.3GB headroom on 8GB.
+#
+# REMOVED in Wave 7-A:
+#   - Traefik    -> AWS ALB free tier (HTTPS termination)
+#   - Alertmanager -> app /webhook/prometheus -> teloxide direct
+#   - valkey-exporter -> not queried; remove
+#
+# Already removed (pre-Wave-7-A):
+#   - Loki + Alloy + Jaeger -> saves ~2.5GB. Profile-gated for opt-in dev use.
+#
 # Container prefix: tv- (tickvault)
 # Network: tv-network (all services communicate via Docker DNS)
 # ALL images pinned with SHA256 digest (Bible Section 14 #71)
@@ -32,24 +42,26 @@ volumes:
 services:
   # ---------------------------------------------------------------------------
   # QuestDB — Time-Series Database (tick data, orders, audit trail)
-  # Bible #16: questdb/questdb:9.3.2
+  # Bible #16: questdb/questdb:9.3.5
+  # Wave 7-A: 4GB -> 2GB (cascading mat views removed in Wave 6, ticks-only
+  #          + 9 sealed-candle shadow tables = 80% less write pressure).
   # ---------------------------------------------------------------------------
   tv-questdb:
     image: questdb/questdb:9.3.5@sha256:5b6f1518296b45aa9ba049382b11b15cfb71e39d8b9dd5634683184bbd97bf0b
     container_name: tv-questdb
     hostname: tv-questdb
     restart: unless-stopped
-    # Memory: 4GB fits c7i.xlarge (8GB total) and Mac dev (48GB).
+    # Wave 7-A trim: 2GB sufficient post Wave-6 cascade removal.
     # QuestDB mmaps data files — actual RSS is much lower than limit.
     # Partition manager keeps hot data bounded to ~90 days.
-    mem_limit: 4g
-    mem_reservation: 2g
+    mem_limit: 2g
+    mem_reservation: 1g
     cpus: 2.0
     # OOM protection: prefer killing other containers over QuestDB.
     # QuestDB holds all trading data — losing it mid-session is catastrophic.
     oom_score_adj: -500
     # Shared memory: QuestDB uses mmap heavily for WAL + column storage.
-    # Default 64MB causes SIGBUS on large tables. 2GB matches production needs.
+    # Default 64MB causes SIGBUS on large tables. 512MB matches production needs.
     shm_size: 512m
     ports:
       # E5 security: bind web console to localhost only (no external access).
@@ -69,27 +81,26 @@ services:
       # patterns (25K instruments send bursts, then pause between flush cycles).
       QDB_LINE_TCP_DISCONNECT_ON_ERROR: "false"
       QDB_METRICS_ENABLED: "TRUE"
-      # --- WAL Tuning (Phase B: 100-500GB future-proof) ---
-      # WAL segment rollover: 64MB (default 16MB). Fewer file ops for high-throughput ILP.
+      # --- WAL Tuning (Wave 7-A: tightened for 2GB ceiling) ---
+      # WAL segment rollover: 64MB. Fewer file ops for high-throughput ILP.
       QDB_WAL_SEGMENT_ROLLOVER_SIZE: "67108864"
-      # Max uncommitted rows per WAL writer: 2M (default 500K). Larger batches = fewer commits.
+      # Max uncommitted rows per WAL writer: 2M. Larger batches = fewer commits.
       QDB_CAIRO_MAX_UNCOMMITTED_ROWS: "2000000"
-      # WAL apply job interval: 100ms (default 300ms). Faster WAL→table merge for freshness.
+      # WAL apply job interval: 100ms. Faster WAL→table merge for freshness.
       QDB_WAL_APPLY_TABLE_TIME_QUOTA: "100000"
-      # O3 max lag: 60s (default 300s). Tighter out-of-order merge window.
+      # O3 max lag: 60s. Tighter out-of-order merge window.
       QDB_CAIRO_O3_MAX_LAG: "60000000"
-      # ILP connection limit: 20 (default 10). We have ~15 writers (tick, depth, OBI, indicators, candles, etc.).
+      # ILP connection limit: 20. We have ~15 writers (tick, depth, OBI, indicators, candles, etc.).
       QDB_LINE_TCP_NET_ACTIVE_CONNECTION_LIMIT: "20"
-      # ILP idle timeout: 10 minutes (default 5 min = 300000ms). Prevents premature disconnect
-      # during burst-then-idle patterns (depth writers flush every 500 records, may idle 30-60s between).
+      # ILP idle timeout: 10 minutes. Prevents premature disconnect during
+      # burst-then-idle patterns (depth writers flush every 500 records, may idle 30-60s between).
       QDB_LINE_TCP_MIN_IDLE_MS_BEFORE_WRITER_RELEASE: "600000"
-      # ILP connection receive buffer: 4MB (default 1MB). Handles burst ILP writes without backpressure.
+      # ILP connection receive buffer: 4MB. Handles burst ILP writes without backpressure.
       QDB_LINE_TCP_NET_RECV_BUF_SIZE: "4194304"
       # --- Crash Recovery & Stability ---
-      # Writer append page size: 1MB (default 256KB). Reduces mmap syscalls for large batches.
+      # Writer append page size: 1MB. Reduces mmap syscalls for large batches.
       QDB_CAIRO_WRITER_DATA_APPEND_PAGE_SIZE: "1048576"
-      # Parallel WAL apply threads: 4 (match CPU count). Faster WAL→table merge.
-      # WAL workers: 2 (matches c7i.large vCPUs). Mac has more but 2 is sufficient.
+      # Parallel WAL apply threads: 2 (matches c7i/c8g.xlarge vCPUs).
       QDB_WAL_APPLY_WORKER_COUNT: "2"
       QDB_PG_USER: ${TV_QUESTDB_PG_USER:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
       QDB_PG_PASSWORD: ${TV_QUESTDB_PG_PASSWORD:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
@@ -110,15 +121,16 @@ services:
       - tv-network
 
   # ---------------------------------------------------------------------------
-  # Valkey — Cache (state, lookups, session data)
-  # Bible #18: valkey/valkey:9.0.2-alpine
+  # Valkey — Cache (token cache, instrument cache, session data)
+  # Bible #18: valkey/valkey:9.0.3-alpine
+  # Wave 7-A: 1GB -> 512MB (token + instrument cache fits easily).
   # ---------------------------------------------------------------------------
   tv-valkey:
     image: valkey/valkey:9.0.3-alpine@sha256:f741f6f4080be5f2bc213f31206a608bee5369ab617a03d6970b800ee60a00c5
     container_name: tv-valkey
     hostname: tv-valkey
     restart: unless-stopped
-    mem_limit: 1g
+    mem_limit: 512m
     cpus: 0.5
     ports:
       - "6379:6379"
@@ -127,7 +139,7 @@ services:
     command: >
       valkey-server
       --requirepass ${TV_VALKEY_PASSWORD:-tv-dev-only}
-      --maxmemory 512mb
+      --maxmemory 256mb
       --maxmemory-policy allkeys-lru
       --save 60 1000
       --appendonly yes
@@ -147,47 +159,22 @@ services:
       - tv-network
 
   # ---------------------------------------------------------------------------
-  # Valkey Exporter — Prometheus metrics for Valkey/Redis
-  # Exports Valkey INFO stats as Prometheus metrics on :9121/metrics.
-  # Bible: oliver006/redis_exporter:v1.67.0
+  # Wave 7-A REMOVED: tv-valkey-exporter (oliver006/redis_exporter)
+  # Reason: We don't query Valkey-internal metrics in dashboards or alerts today.
+  # If needed in the future, re-add behind a `--profile metrics-extra` opt-in.
   # ---------------------------------------------------------------------------
-  tv-valkey-exporter:
-    image: oliver006/redis_exporter:v1.82.0@sha256:4b467f718ea9f62fe47b87ce39039ebeedff7764c40fde2a129913484fff716f
-    container_name: tv-valkey-exporter
-    hostname: tv-valkey-exporter
-    restart: unless-stopped
-    mem_limit: 128m
-    cpus: 0.25
-    environment:
-      - REDIS_ADDR=redis://tv-valkey:6379
-      - REDIS_PASSWORD=${TV_VALKEY_PASSWORD:-tv-dev-only}
-    depends_on:
-      tv-valkey:
-        condition: service_healthy
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "3"
-    healthcheck:
-      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:9121/metrics || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    networks:
-      - tv-network
 
   # ---------------------------------------------------------------------------
   # Prometheus — Metrics Collection
-  # Bible #28: prom/prometheus:v3.9.1
+  # Bible #28: prom/prometheus:v3.11.2
+  # Wave 7-A: 512MB -> 384MB, retention 30d -> 7d.
   # ---------------------------------------------------------------------------
   tv-prometheus:
     image: prom/prometheus:v3.11.2@sha256:3674db04d3640d2157de57f8679dbe8dbc10a673e6d63ec58d9430e34abbfe68
     container_name: tv-prometheus
     hostname: tv-prometheus
     restart: unless-stopped
-    mem_limit: 512m
+    mem_limit: 384m
     cpus: 0.5
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -201,7 +188,9 @@ services:
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
-      - "--storage.tsdb.retention.time=30d"
+      # Wave 7-A: 30d -> 7d. SEBI long-term retention is in QuestDB audit tables;
+      # Prometheus only needs recent operator-health window (alerts + dashboards).
+      - "--storage.tsdb.retention.time=7d"
       - "--web.enable-lifecycle"
       # NOTE: --web.console.libraries and --web.console.templates removed.
       # Prometheus v3.x no longer bundles console templates (we use Grafana).
@@ -220,57 +209,36 @@ services:
       - tv-network
 
   # ---------------------------------------------------------------------------
-  # Alertmanager — Alert Routing (Prometheus → Telegram)
-  # Forwards Prometheus alerts to Telegram via webhook receiver.
-  # Pinned: prom/alertmanager:v0.28.1
+  # Wave 7-A REMOVED: tv-alertmanager (prom/alertmanager)
+  # Replacement: Prometheus alerts route directly to the tickvault app's
+  #              /webhook/prometheus endpoint, which dispatches Telegram via
+  #              the in-process teloxide client. One less hop, one less
+  #              container, one less point of failure.
+  # Code change required (Wave 7-B follow-up):
+  #   - Add crates/api/src/handlers/prometheus_webhook.rs
+  #   - Wire /webhook/prometheus into crates/api/src/lib.rs
+  #   - Update prometheus.yml alerting.alertmanagers to point at
+  #     http://host.docker.internal:3001/webhook/prometheus
   # ---------------------------------------------------------------------------
-  tv-alertmanager:
-    image: prom/alertmanager:v0.32.0@sha256:fe1f57b89ec7b94928746e61d9924cafd3674c688e3c7c3ad9600d8ef5da6cf9
-    container_name: tv-alertmanager
-    hostname: tv-alertmanager
-    restart: unless-stopped
-    mem_limit: 256m
-    cpus: 0.25
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    ports:
-      - "127.0.0.1:9093:9093"
-    volumes:
-      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
-    command:
-      - "--config.file=/etc/alertmanager/alertmanager.yml"
-      - "--storage.path=/alertmanager"
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "3"
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:9093/-/healthy || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    networks:
-      - tv-network
 
   # ---------------------------------------------------------------------------
-  # Loki + Alloy + Jaeger — REMOVED for c7i.large (4GB) memory budget.
-  # Saves ~2.5GB RAM. Logs available via: docker logs tickvaultlication
+  # Loki + Alloy + Jaeger — REMOVED for memory budget. Saves ~2.5GB RAM.
+  # Logs available via: docker logs tv-app  AND  data/logs/errors.jsonl.*
   # Tracing available via: Prometheus metrics (tv_tick_processing_duration_ns)
-  # Re-enable on c7i.xlarge+ by uncommenting these services.
+  # Re-enable on c7i.2xlarge+ by enabling the `logs` profile below.
   # ---------------------------------------------------------------------------
 
   # ---------------------------------------------------------------------------
   # Grafana — Dashboards & Visualization
-  # Bible #27: grafana/grafana-oss:12.3.3
+  # Bible #27: grafana/grafana-oss:13.0.1
+  # Wave 7-A: 1GB -> 768MB.
   # ---------------------------------------------------------------------------
   tv-grafana:
     image: grafana/grafana-oss:13.0.1@sha256:3625fdfa3cab904abdf9faaff8f40de0639b456ac5c5d322964fe705051d5455
     container_name: tv-grafana
     hostname: tv-grafana
     restart: unless-stopped
-    mem_limit: 1g
+    mem_limit: 768m
     cpus: 0.5
     ports:
       - "3000:3000"
@@ -312,40 +280,14 @@ services:
       - tv-network
 
   # ---------------------------------------------------------------------------
-  # Traefik — Reverse Proxy & Load Balancer
-  # Bible #79: traefik:v3.6.8
+  # Wave 7-A REMOVED: tv-traefik (traefik reverse proxy)
+  # Replacement on AWS: AWS Application Load Balancer (free tier 750 hrs/mo).
+  # Replacement on Mac dev: app listens directly on port 3001
+  #   (set TV_API_BIND=127.0.0.1:3001 in .env).
+  # Reason: Traefik's HTTPS termination + dashboard added 512MB RAM and a
+  #         containerized hop with no functional benefit on a single-app host.
+  #         AWS ALB does the same job free, and Mac dev does not need HTTPS.
   # ---------------------------------------------------------------------------
-  tv-traefik:
-    image: traefik:v3.6.14@sha256:e08f2a770aee6b838b4c1be5fe25569a653b1592e4673a240414bc8bc4ad0aaa
-    container_name: tv-traefik
-    hostname: tv-traefik
-    restart: unless-stopped
-    mem_limit: 512m
-    cpus: 0.5
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    ports:
-      - "80:80"        # HTTP
-      - "443:443"      # HTTPS
-      - "8080:8080"    # Traefik Dashboard
-      - "8082:8082"    # Prometheus metrics
-    volumes:
-      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
-      - ./traefik/dynamic:/etc/traefik/dynamic:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    logging:
-      driver: json-file
-      options:
-        max-size: "100m"
-        max-file: "5"
-    healthcheck:
-      test: ["CMD", "traefik", "healthcheck", "--ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    networks:
-      - tv-network
 
 
   # ---------------------------------------------------------------------------
