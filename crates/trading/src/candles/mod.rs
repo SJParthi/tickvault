@@ -29,6 +29,7 @@ pub mod engine_map;
 pub mod multi_tf_aggregator;
 pub mod parity;
 pub mod pct_stamping;
+pub mod seal_ring;
 pub mod tf_index;
 
 pub use aggregator_cell::{AggregatorCell, ConsumeOutcome, LiveCandleState};
@@ -46,4 +47,5 @@ pub use parity::{InstrumentKey, ParityMismatch, ParityReport, compare_bars, swee
 pub use pct_stamping::{
     PrevDayRefs, compute_close_pct, compute_oi_pct, compute_volume_pct, stamp_bar_pct_fields,
 };
+pub use seal_ring::{BufferOutcome, BufferedSeal, SEAL_BUFFER_CAPACITY, SealRing};
 pub use tf_index::TfIndex;
