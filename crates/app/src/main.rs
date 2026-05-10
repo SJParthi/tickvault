@@ -6158,70 +6158,88 @@ async fn main() -> Result<()> {
             //
             // Audit-findings Rule 3: market-hours-aware. Trading-day check
             // + skip if past 09:13.
-            {
-                let anchor_notifier = notifier.clone();
-                let anchor_buffer = std::sync::Arc::clone(&preopen_buffer);
-                let anchor_universe = depth_anchor_universe;
-                let anchor_calendar = std::sync::Arc::clone(&trading_calendar);
-                // Plan item real-C (2026-04-23): the 09:13 task now also
-                // dispatches InitialSubscribe20/InitialSubscribe200 commands
-                // to the depth connections spawned in DEFERRED mode (item
-                // B.2). `anchor_cmd_senders` is the per-underlying map of
-                // mpsc::Sender<DepthCommand> built when depth connections
-                // were spawned earlier in boot.
-                let anchor_cmd_senders = std::sync::Arc::clone(&depth_cmd_senders);
-                let anchor_twenty_max = config.subscription.twenty_depth_max_instruments;
-                // Wave 5 commit 5: feature flag for single-side fan-out at 09:13.
-                // PR-C2 follow-up (hostile-bug-hunt integration finding): when
-                // pipeline_v2 is active, the unified diff dispatcher owns all
-                // swap traffic — the 09:13 anchor's per-underlying senders
-                // (HashMap<String, _>) are empty because v2 uses
-                // HashMap<u8, _>. Setting this flag false silences the
-                // per-underlying warn flood when v2 is on.
-                let anchor_single_side_enabled = config.features.depth_dynamic_top_volume
-                    && !config.features.depth_dynamic_pipeline_v2;
-                // Live LTPs for FINNIFTY + MIDCPNIFTY (the preopen buffer
-                // only captures NIFTY + BANKNIFTY IDX_I). At 09:13 the main
-                // feed has been streaming for ~13 min so these are present.
-                let anchor_shared_spot_prices = std::sync::Arc::clone(&shared_spot_prices);
-                tokio::spawn(async move {
-                    use chrono::{FixedOffset, NaiveTime, TimeZone, Utc};
-                    use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
-                    let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
-                        return;
-                    };
-                    let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
-                    let today_ist = now_ist.date_naive();
-                    if !anchor_calendar.is_trading_day(today_ist) {
-                        info!("depth-anchor: skipping (non-trading day)");
-                        return;
-                    }
-                    let Some(target) = NaiveTime::from_hms_opt(9, 13, 0) else {
-                        return;
-                    };
-                    let now_time = now_ist.time();
-                    if now_time >= target {
-                        // 2026-04-24 Fix D: demoted INFO → DEBUG. A mid-session
-                        // fresh boot legitimately runs past 09:13:00; the real
-                        // ATM/depth dispatch happens via the boot-time
-                        // spot-wait path (see run_depth_init_sync).
-                        debug!(
-                            now = %now_time,
-                            "depth-anchor: skipping (past 09:13:00 — expected on mid-session boot)"
-                        );
-                        return;
-                    }
-                    let secs_until = (target - now_time).num_seconds().max(0) as u64;
-                    info!(secs_until, "depth-anchor: sleeping until 09:13:00 IST");
-                    tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+            //
+            // PR-C2 cutover follow-up (2026-05-10, queued from PR #544): under
+            // `depth_dynamic_pipeline_v2 = true` (the live default), the depth
+            // pools are owned end-to-end by `spawn_depth_dynamic_pool` —
+            // `anchor_cmd_senders` (HashMap<String, _>) is empty because v2
+            // uses HashMap<u8, _>, and `anchor_single_side_enabled` already
+            // short-circuits the per-symbol dispatch to a no-op. Spawning the
+            // task at all under v2 still computes ATM via
+            // `select_depth_instruments`, emits the once-per-day
+            // MarketOpenDepthAnchor Telegram, and then drops the result on the
+            // floor. Skipping the task entirely under v2 removes the dead
+            // computation + retires the last call site of
+            // `select_depth_instruments` from the live boot path. The
+            // historical anchor visibility is replaced by the dynamic pool's
+            // own boot logs (`PR-C2 cutover: depth_dynamic_pipeline_v2 spawn
+            // complete`). Operator confirmed via AskUserQuestion 2026-05-10.
+            if !config.features.depth_dynamic_pipeline_v2 {
+                {
+                    let anchor_notifier = notifier.clone();
+                    let anchor_buffer = std::sync::Arc::clone(&preopen_buffer);
+                    let anchor_universe = depth_anchor_universe;
+                    let anchor_calendar = std::sync::Arc::clone(&trading_calendar);
+                    // Plan item real-C (2026-04-23): the 09:13 task now also
+                    // dispatches InitialSubscribe20/InitialSubscribe200 commands
+                    // to the depth connections spawned in DEFERRED mode (item
+                    // B.2). `anchor_cmd_senders` is the per-underlying map of
+                    // mpsc::Sender<DepthCommand> built when depth connections
+                    // were spawned earlier in boot.
+                    let anchor_cmd_senders = std::sync::Arc::clone(&depth_cmd_senders);
+                    let anchor_twenty_max = config.subscription.twenty_depth_max_instruments;
+                    // Wave 5 commit 5: feature flag for single-side fan-out at 09:13.
+                    // PR-C2 follow-up (hostile-bug-hunt integration finding): when
+                    // pipeline_v2 is active, the unified diff dispatcher owns all
+                    // swap traffic — the 09:13 anchor's per-underlying senders
+                    // (HashMap<String, _>) are empty because v2 uses
+                    // HashMap<u8, _>. Setting this flag false silences the
+                    // per-underlying warn flood when v2 is on.
+                    let anchor_single_side_enabled = config.features.depth_dynamic_top_volume
+                        && !config.features.depth_dynamic_pipeline_v2;
+                    // Live LTPs for FINNIFTY + MIDCPNIFTY (the preopen buffer
+                    // only captures NIFTY + BANKNIFTY IDX_I). At 09:13 the main
+                    // feed has been streaming for ~13 min so these are present.
+                    let anchor_shared_spot_prices = std::sync::Arc::clone(&shared_spot_prices);
+                    tokio::spawn(async move {
+                        use chrono::{FixedOffset, NaiveTime, TimeZone, Utc};
+                        use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+                        let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+                            return;
+                        };
+                        let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+                        let today_ist = now_ist.date_naive();
+                        if !anchor_calendar.is_trading_day(today_ist) {
+                            info!("depth-anchor: skipping (non-trading day)");
+                            return;
+                        }
+                        let Some(target) = NaiveTime::from_hms_opt(9, 13, 0) else {
+                            return;
+                        };
+                        let now_time = now_ist.time();
+                        if now_time >= target {
+                            // 2026-04-24 Fix D: demoted INFO → DEBUG. A mid-session
+                            // fresh boot legitimately runs past 09:13:00; the real
+                            // ATM/depth dispatch happens via the boot-time
+                            // spot-wait path (see run_depth_init_sync).
+                            debug!(
+                                now = %now_time,
+                                "depth-anchor: skipping (past 09:13:00 — expected on mid-session boot)"
+                            );
+                            return;
+                        }
+                        let secs_until = (target - now_time).num_seconds().max(0) as u64;
+                        info!(secs_until, "depth-anchor: sleeping until 09:13:00 IST");
+                        tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
 
-                    // Read preopen buffer snapshot.
-                    let snap =
-                        tickvault_core::instrument::preopen_price_buffer::snapshot(&anchor_buffer)
-                            .await;
+                        // Read preopen buffer snapshot.
+                        let snap = tickvault_core::instrument::preopen_price_buffer::snapshot(
+                            &anchor_buffer,
+                        )
+                        .await;
 
-                    // For each whitelisted index, derive close + ATM strike + emit Telegram.
-                    for (sym, _id) in
+                        // For each whitelisted index, derive close + ATM strike + emit Telegram.
+                        for (sym, _id) in
                         tickvault_core::instrument::preopen_price_buffer::PREOPEN_INDEX_UNDERLYINGS
                     {
                         let symbol = (*sym).to_string();
@@ -6274,30 +6292,30 @@ async fn main() -> Result<()> {
                         });
                     }
 
-                    // Plan item real-C (2026-04-23): dispatch
-                    // InitialSubscribe20 + InitialSubscribe200 to depth
-                    // connections spawned in DEFERRED mode (item B.2).
-                    //
-                    // Spot prices sourced from two places, in priority order:
-                    //   1. NIFTY + BANKNIFTY: 09:12 close from the preopen
-                    //      buffer (authoritative — matches Dhan's reference).
-                    //   2. FINNIFTY + MIDCPNIFTY: live LTP from
-                    //      SharedSpotPrices (main feed has been streaming
-                    //      since 09:00 pre-open).
-                    //
-                    // Underlyings missing a spot at 09:13 are skipped with a
-                    // WARN; the depth rebalancer's 09:15 first-check gate
-                    // will pick them up once the main feed has a fresh LTP.
-                    let mut spot_map: std::collections::HashMap<String, f64> =
+                        // Plan item real-C (2026-04-23): dispatch
+                        // InitialSubscribe20 + InitialSubscribe200 to depth
+                        // connections spawned in DEFERRED mode (item B.2).
+                        //
+                        // Spot prices sourced from two places, in priority order:
+                        //   1. NIFTY + BANKNIFTY: 09:12 close from the preopen
+                        //      buffer (authoritative — matches Dhan's reference).
+                        //   2. FINNIFTY + MIDCPNIFTY: live LTP from
+                        //      SharedSpotPrices (main feed has been streaming
+                        //      since 09:00 pre-open).
+                        //
+                        // Underlyings missing a spot at 09:13 are skipped with a
+                        // WARN; the depth rebalancer's 09:15 first-check gate
+                        // will pick them up once the main feed has a fresh LTP.
+                        let mut spot_map: std::collections::HashMap<String, f64> =
                         // O(1) EXEMPT: 4-entry map built once per day
                         std::collections::HashMap::new();
-                    {
-                        let live = anchor_shared_spot_prices.read().await;
-                        for (k, entry) in live.iter() {
-                            spot_map.insert(k.clone(), entry.price); // O(1) EXEMPT: 4 entries
+                        {
+                            let live = anchor_shared_spot_prices.read().await;
+                            for (k, entry) in live.iter() {
+                                spot_map.insert(k.clone(), entry.price); // O(1) EXEMPT: 4 entries
+                            }
                         }
-                    }
-                    for (sym, _id) in
+                        for (sym, _id) in
                         tickvault_core::instrument::preopen_price_buffer::PREOPEN_INDEX_UNDERLYINGS
                     {
                         if let Some(c) = snap.get(*sym).and_then(|cl| cl.backtrack_latest()) {
@@ -6305,10 +6323,10 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    // 2026-04-25: Reduced 4 → 2. FINNIFTY/MIDCPNIFTY dropped from depth.
-                    let depth_ul: [&str; 2] = ["NIFTY", "BANKNIFTY"];
-                    let today = now_ist.date_naive();
-                    let selections =
+                        // 2026-04-25: Reduced 4 → 2. FINNIFTY/MIDCPNIFTY dropped from depth.
+                        let depth_ul: [&str; 2] = ["NIFTY", "BANKNIFTY"];
+                        let today = now_ist.date_naive();
+                        let selections =
                         tickvault_core::instrument::depth_strike_selector::select_depth_instruments(
                             &anchor_universe,
                             &depth_ul,
@@ -6316,29 +6334,29 @@ async fn main() -> Result<()> {
                             today,
                             tickvault_core::instrument::depth_strike_selector::DEPTH_ATM_STRIKES_EACH_SIDE,
                         );
-                    let m_dispatch_total =
-                        metrics::counter!("tv_depth_initial_subscribe_dispatched_total");
-                    let m_dispatch_failed =
-                        metrics::counter!("tv_depth_initial_subscribe_dispatch_failed_total");
+                        let m_dispatch_total =
+                            metrics::counter!("tv_depth_initial_subscribe_dispatched_total");
+                        let m_dispatch_failed =
+                            metrics::counter!("tv_depth_initial_subscribe_dispatch_failed_total");
 
-                    let senders = anchor_cmd_senders.lock().await;
-                    for sel in &selections {
-                        // 20-level InitialSubscribe.
-                        // Wave 5 commit 5: when single-side layout is ON
-                        // (`[features] depth_dynamic_top_volume = true`),
-                        // fan out to 4 single-side keys per pair of CE+PE
-                        // depth-20 conns. Otherwise dispatch the legacy
-                        // mixed-CE+PE single InitialSubscribe20 to a
-                        // bundled `"NIFTY"` / `"BANKNIFTY"` sender.
-                        if anchor_single_side_enabled {
-                            for (side_char, opt_label) in [('C', "CE"), ('P', "PE")] {
-                                let key = format!("{}-{}", sel.underlying_symbol, opt_label);
-                                let single_side_ids: &Vec<u32> = if side_char == 'C' {
-                                    &sel.call_security_ids
-                                } else {
-                                    &sel.put_security_ids
-                                };
-                                let instruments: Vec<
+                        let senders = anchor_cmd_senders.lock().await;
+                        for sel in &selections {
+                            // 20-level InitialSubscribe.
+                            // Wave 5 commit 5: when single-side layout is ON
+                            // (`[features] depth_dynamic_top_volume = true`),
+                            // fan out to 4 single-side keys per pair of CE+PE
+                            // depth-20 conns. Otherwise dispatch the legacy
+                            // mixed-CE+PE single InitialSubscribe20 to a
+                            // bundled `"NIFTY"` / `"BANKNIFTY"` sender.
+                            if anchor_single_side_enabled {
+                                for (side_char, opt_label) in [('C', "CE"), ('P', "PE")] {
+                                    let key = format!("{}-{}", sel.underlying_symbol, opt_label);
+                                    let single_side_ids: &Vec<u32> = if side_char == 'C' {
+                                        &sel.call_security_ids
+                                    } else {
+                                        &sel.put_security_ids
+                                    };
+                                    let instruments: Vec<
                                     tickvault_core::websocket::types::InstrumentSubscription,
                                 > = single_side_ids
                                     .iter()
@@ -6350,39 +6368,39 @@ async fn main() -> Result<()> {
                                         )
                                     })
                                     .collect::<Vec<_>>(); // O(1) EXEMPT: 4 keys × ~49 contracts, once per day
-                                let subscribe_messages = tickvault_core::websocket::subscription_builder::build_twenty_depth_subscription_messages(
+                                    let subscribe_messages = tickvault_core::websocket::subscription_builder::build_twenty_depth_subscription_messages(
                                     &instruments,
                                     50,
                                 );
-                                if let Some(sender) = senders.get(&key) {
-                                    let cmd = tickvault_core::websocket::DepthCommand::InitialSubscribe20 {
+                                    if let Some(sender) = senders.get(&key) {
+                                        let cmd = tickvault_core::websocket::DepthCommand::InitialSubscribe20 {
                                         subscribe_messages,
                                     };
-                                    if sender.send(cmd).await.is_err() {
-                                        error!(
-                                            key = %key,
-                                            "09:13 dispatch (Wave 5): InitialSubscribe20 send failed — depth receiver dropped"
-                                        );
-                                        m_dispatch_failed.increment(1);
+                                        if sender.send(cmd).await.is_err() {
+                                            error!(
+                                                key = %key,
+                                                "09:13 dispatch (Wave 5): InitialSubscribe20 send failed — depth receiver dropped"
+                                            );
+                                            m_dispatch_failed.increment(1);
+                                        } else {
+                                            info!(
+                                                key = %key,
+                                                instruments = instruments.len(),
+                                                "PROOF: 09:13 dispatch InitialSubscribe20 sent to single-side key {} ({} SIDs)",
+                                                key,
+                                                instruments.len()
+                                            );
+                                            m_dispatch_total.increment(1);
+                                        }
                                     } else {
-                                        info!(
+                                        warn!(
                                             key = %key,
-                                            instruments = instruments.len(),
-                                            "PROOF: 09:13 dispatch InitialSubscribe20 sent to single-side key {} ({} SIDs)",
-                                            key,
-                                            instruments.len()
+                                            "09:13 dispatch (Wave 5): no depth_cmd_sender for {key}"
                                         );
-                                        m_dispatch_total.increment(1);
                                     }
-                                } else {
-                                    warn!(
-                                        key = %key,
-                                        "09:13 dispatch (Wave 5): no depth_cmd_sender for {key}"
-                                    );
                                 }
-                            }
-                        } else {
-                            let instruments: Vec<
+                            } else {
+                                let instruments: Vec<
                                 tickvault_core::websocket::types::InstrumentSubscription,
                             > = sel
                                 .all_security_ids
@@ -6395,104 +6413,114 @@ async fn main() -> Result<()> {
                                     )
                                 })
                                 .collect::<Vec<_>>(); // O(1) EXEMPT: legacy mixed dispatch
-                            let subscribe_messages = tickvault_core::websocket::subscription_builder::build_twenty_depth_subscription_messages(
+                                let subscribe_messages = tickvault_core::websocket::subscription_builder::build_twenty_depth_subscription_messages(
                                 &instruments,
                                 50,
                             );
-                            if let Some(sender) = senders.get(&sel.underlying_symbol) {
-                                let cmd =
+                                if let Some(sender) = senders.get(&sel.underlying_symbol) {
+                                    let cmd =
                                     tickvault_core::websocket::DepthCommand::InitialSubscribe20 {
                                         subscribe_messages,
                                     };
-                                if sender.send(cmd).await.is_err() {
-                                    error!(
-                                        underlying = %sel.underlying_symbol,
-                                        "09:13 dispatch (legacy): InitialSubscribe20 send failed — depth receiver dropped"
-                                    );
-                                    m_dispatch_failed.increment(1);
+                                    if sender.send(cmd).await.is_err() {
+                                        error!(
+                                            underlying = %sel.underlying_symbol,
+                                            "09:13 dispatch (legacy): InitialSubscribe20 send failed — depth receiver dropped"
+                                        );
+                                        m_dispatch_failed.increment(1);
+                                    } else {
+                                        m_dispatch_total.increment(1);
+                                    }
                                 } else {
-                                    m_dispatch_total.increment(1);
+                                    warn!(
+                                        underlying = %sel.underlying_symbol,
+                                        "09:13 dispatch (legacy): no depth_cmd_sender registered for 20-level underlying"
+                                    );
                                 }
-                            } else {
-                                warn!(
-                                    underlying = %sel.underlying_symbol,
-                                    "09:13 dispatch (legacy): no depth_cmd_sender registered for 20-level underlying"
-                                );
                             }
-                        }
 
-                        // 200-level: only NIFTY + BANKNIFTY (Dhan 5-conn cap).
-                        // Wave 5 commit 6: when single-side layout is ON,
-                        // depth-200 is top-volume-driven (NOT ATM-following) —
-                        // the dynamic orchestrator at `main.rs:2722` owns the
-                        // 5 depth-200 slot senders. The 09:13 anchor would
-                        // hit `senders.get(&"NIFTY-CE")` which IS registered
-                        // (depth-20 single-side conn) and accidentally route
-                        // an InitialSubscribe200 to a depth-20 channel.
-                        // Skip the entire 200-level block under the flag so
-                        // the dynamic orchestrator handles it instead.
-                        if anchor_single_side_enabled {
-                            continue;
-                        }
-                        if sel.underlying_symbol != "NIFTY" && sel.underlying_symbol != "BANKNIFTY"
-                        {
-                            continue;
-                        }
-                        for (opt_label, opt_sid) in [
-                            ("CE", sel.atm_ce_security_id),
-                            ("PE", sel.atm_pe_security_id),
-                        ] {
-                            let Some(sid) = opt_sid else {
-                                warn!(
-                                    underlying = %sel.underlying_symbol,
-                                    option = opt_label,
-                                    "09:13 dispatch: missing ATM CE/PE sid for 200-level"
-                                );
+                            // 200-level: only NIFTY + BANKNIFTY (Dhan 5-conn cap).
+                            // Wave 5 commit 6: when single-side layout is ON,
+                            // depth-200 is top-volume-driven (NOT ATM-following) —
+                            // the dynamic orchestrator at `main.rs:2722` owns the
+                            // 5 depth-200 slot senders. The 09:13 anchor would
+                            // hit `senders.get(&"NIFTY-CE")` which IS registered
+                            // (depth-20 single-side conn) and accidentally route
+                            // an InitialSubscribe200 to a depth-20 channel.
+                            // Skip the entire 200-level block under the flag so
+                            // the dynamic orchestrator handles it instead.
+                            if anchor_single_side_enabled {
                                 continue;
-                            };
-                            let segment_str =
-                                tickvault_common::types::ExchangeSegment::NseFno.as_str();
-                            let sid_str = sid.to_string(); // O(1) EXEMPT: 4 per day
-                            let subscribe_message = serde_json::json!({
-                                "RequestCode": 23,
-                                "ExchangeSegment": segment_str,
-                                "SecurityId": sid_str,
-                            })
-                            .to_string(); // O(1) EXEMPT: 4 per day
-                            let key = format!("{}-{}", sel.underlying_symbol, opt_label); // O(1) EXEMPT: 4 per day
-                            if let Some(sender) = senders.get(&key) {
-                                let cmd =
+                            }
+                            if sel.underlying_symbol != "NIFTY"
+                                && sel.underlying_symbol != "BANKNIFTY"
+                            {
+                                continue;
+                            }
+                            for (opt_label, opt_sid) in [
+                                ("CE", sel.atm_ce_security_id),
+                                ("PE", sel.atm_pe_security_id),
+                            ] {
+                                let Some(sid) = opt_sid else {
+                                    warn!(
+                                        underlying = %sel.underlying_symbol,
+                                        option = opt_label,
+                                        "09:13 dispatch: missing ATM CE/PE sid for 200-level"
+                                    );
+                                    continue;
+                                };
+                                let segment_str =
+                                    tickvault_common::types::ExchangeSegment::NseFno.as_str();
+                                let sid_str = sid.to_string(); // O(1) EXEMPT: 4 per day
+                                let subscribe_message = serde_json::json!({
+                                    "RequestCode": 23,
+                                    "ExchangeSegment": segment_str,
+                                    "SecurityId": sid_str,
+                                })
+                                .to_string(); // O(1) EXEMPT: 4 per day
+                                let key = format!("{}-{}", sel.underlying_symbol, opt_label); // O(1) EXEMPT: 4 per day
+                                if let Some(sender) = senders.get(&key) {
+                                    let cmd =
                                     tickvault_core::websocket::DepthCommand::InitialSubscribe200 {
                                         subscribe_message,
                                     };
-                                if sender.send(cmd).await.is_err() {
-                                    error!(
-                                        key,
-                                        "09:13 dispatch: InitialSubscribe200 send failed — depth receiver dropped"
-                                    );
-                                    m_dispatch_failed.increment(1);
+                                    if sender.send(cmd).await.is_err() {
+                                        error!(
+                                            key,
+                                            "09:13 dispatch: InitialSubscribe200 send failed — depth receiver dropped"
+                                        );
+                                        m_dispatch_failed.increment(1);
+                                    } else {
+                                        m_dispatch_total.increment(1);
+                                    }
                                 } else {
-                                    m_dispatch_total.increment(1);
+                                    warn!(
+                                        key,
+                                        "09:13 dispatch: no depth_cmd_sender registered for 200-level key"
+                                    );
                                 }
-                            } else {
-                                warn!(
-                                    key,
-                                    "09:13 dispatch: no depth_cmd_sender registered for 200-level key"
-                                );
                             }
-                        }
 
-                        info!(
-                            underlying = %sel.underlying_symbol,
-                            atm_strike = sel.atm_strike,
-                            twenty_count = sel.all_security_ids.len(),
-                            atm_ce_sid = ?sel.atm_ce_security_id,
-                            atm_pe_sid = ?sel.atm_pe_security_id,
-                            "PROOF: 09:13 dispatcher sent InitialSubscribe20 + InitialSubscribe200"
-                        );
-                    }
-                    drop(senders);
-                });
+                            info!(
+                                underlying = %sel.underlying_symbol,
+                                atm_strike = sel.atm_strike,
+                                twenty_count = sel.all_security_ids.len(),
+                                atm_ce_sid = ?sel.atm_ce_security_id,
+                                atm_pe_sid = ?sel.atm_pe_security_id,
+                                "PROOF: 09:13 dispatcher sent InitialSubscribe20 + InitialSubscribe200"
+                            );
+                        }
+                        drop(senders);
+                    });
+                }
+            } else {
+                info!(
+                    "09:13 IST anchor task SKIPPED — depth_dynamic_pipeline_v2 \
+                     owns depth-20 + depth-200 dispatch via the unified diff \
+                     dispatcher; legacy per-underlying anchor (which would have \
+                     called select_depth_instruments + emitted MarketOpenDepthAnchor) \
+                     would have been a no-op under v2 (anchor_single_side_enabled = false)"
+                );
             }
 
             // L1: Listen for rebalance events → Telegram alert + send swap commands (zero disconnect).
