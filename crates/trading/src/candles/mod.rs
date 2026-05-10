@@ -21,6 +21,7 @@
 //! (parity tests against live `candles_*` matviews) is gated on the
 //! 7-day soak per plan §6.
 
+pub mod aggregator_cell;
 pub mod cascade;
 pub mod cascade_fanout;
 pub mod engine;
@@ -29,6 +30,7 @@ pub mod parity;
 pub mod pct_stamping;
 pub mod tf_index;
 
+pub use aggregator_cell::{AggregatorCell, ConsumeOutcome, LiveCandleState};
 pub use cascade::{
     run_cascade_1s, run_midnight_rollover_task_with_fanout, spawn_supervised_cascade_1s,
 };
