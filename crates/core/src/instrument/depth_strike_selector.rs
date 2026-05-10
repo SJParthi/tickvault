@@ -52,9 +52,9 @@ pub struct DepthStrikeSelection {
     pub atm_pe_security_id: Option<SecurityId>,
     /// Dhan CSV `display_name` for the ATM CE contract (e.g.
     /// `"BANKNIFTY 28 APR 54300 CALL"`). Populated by
-    /// [`select_depth_instruments`] from
-    /// `FnoUniverse::derivative_contracts`. `None` if the registry lookup
-    /// fails (degrade gracefully — caller should fall back to the
+    /// [`fill_display_names_from_universe`](DepthStrikeSelection::fill_display_names_from_universe)
+    /// from `FnoUniverse::derivative_contracts`. `None` if the registry
+    /// lookup fails (degrade gracefully — caller should fall back to the
     /// synthesized `UNDERLYING-MmmYYYY-STRIKE-SIDE` label).
     ///
     /// Prefer this over the synthesized label in operator-facing surfaces
@@ -136,9 +136,9 @@ pub fn select_atm_strikes(
         all_security_ids: all_ids,
         atm_ce_security_id,
         atm_pe_security_id,
-        // Filled in by `select_depth_instruments` (which has registry access)
-        // or by `fill_display_names_from_universe` for direct callers. Left
-        // as None here because `OptionChain` does not carry display_name.
+        // Filled in by `fill_display_names_from_universe` for callers that
+        // have registry access. Left as None here because `OptionChain` does
+        // not carry display_name.
         atm_ce_display_name: None,
         atm_pe_display_name: None,
         underlying_symbol: chain.underlying_symbol.clone(),
@@ -170,7 +170,8 @@ impl DepthStrikeSelection {
     }
 }
 
-/// Wave 5 Items 4+5 LIVE — single-side variant of `select_depth_instruments`.
+/// Wave 5 Items 4+5 LIVE — single-side ATM ± N selector for one
+/// underlying × one side (CE or PE).
 ///
 /// Per operator spec (Option B per plan §"BLOCKER C1"), depth-20 conns
 /// 1-4 each carry one underlying × one side × ATM ± 24:
@@ -193,7 +194,7 @@ impl DepthStrikeSelection {
 ///
 /// Returns `None` if expiry / chain / ATM unavailable.
 #[must_use]
-// TEST-EXEMPT: thin orchestrator over `select_atm_strikes` + side-filter; covered indirectly by `select_depth_instruments` integration tests. WIRING-EXEMPT: caller (single-side spawn loop in main.rs) lands in next sub-PR per operator 2026-05-01.
+// TEST-EXEMPT: thin orchestrator over `select_atm_strikes` + side-filter; covered by `crates/app/src/depth_20_single_side_planner.rs` and `main.rs:5197` rebalance call site. WIRING-EXEMPT: same.
 pub fn select_single_side_contracts(
     universe: &FnoUniverse,
     underlying: &str,
