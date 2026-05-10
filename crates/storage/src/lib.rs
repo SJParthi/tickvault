@@ -100,6 +100,7 @@ pub mod seal_absorption;
 pub mod seal_dlq;
 pub mod seal_spill;
 pub mod selftest_audit_persistence;
+pub mod shadow_candle_writer;
 pub mod shadow_persistence;
 pub mod shadow_seal_columns;
 pub mod tick_persistence;
