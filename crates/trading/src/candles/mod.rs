@@ -26,6 +26,7 @@ pub mod cascade;
 pub mod cascade_fanout;
 pub mod engine;
 pub mod engine_map;
+pub mod multi_tf_aggregator;
 pub mod parity;
 pub mod pct_stamping;
 pub mod tf_index;
@@ -40,6 +41,7 @@ pub use engine::{
     Tf10s, Tf15m, Tf15s, Tf30m, Tf30s, Timeframe,
 };
 pub use engine_map::CandleEngineMap;
+pub use multi_tf_aggregator::{ConsumeStats, InstrumentEntry, MultiTfAggregator};
 pub use parity::{InstrumentKey, ParityMismatch, ParityReport, compare_bars, sweep_parity};
 pub use pct_stamping::{
     PrevDayRefs, compute_close_pct, compute_oi_pct, compute_volume_pct, stamp_bar_pct_fields,
