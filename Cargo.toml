@@ -32,6 +32,15 @@ dashmap = "6.1.0"
 crossbeam-channel = "0.5.15"
 rtrb = "0.3.4"
 ringbuf = "0.4.8"
+# Wave 6 Sub-PR #1 (2026-05-10): per-cell mutex for the multi-TF
+# aggregator's `[Mutex<LiveCandleState>; 9]` per-instrument array.
+# Operator-approved alternative to `crossbeam_utils::atomic::AtomicCell`
+# (locked decision L-C2): `LiveCandleState` is ~64 bytes which is
+# beyond AtomicCell's 16-byte lock-free threshold, so AtomicCell would
+# spin-lock internally anyway. parking_lot::Mutex is ~30ns uncontended,
+# never poisons, and is already present transitively via tokio /
+# tokio-tungstenite / redis.
+parking_lot = "0.12.5"
 
 # ---- Section 4: Database & Cache ----
 questdb-rs = { version = "6.1.0", features = ["chrono_timestamp"] }
