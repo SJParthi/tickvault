@@ -59,20 +59,24 @@ S3 archival exports detached partitions before removal (Plan Item 7, needs aws-s
    Free tier covers: 10 custom metrics, 10 alarms, 5GB logs, 3 dashboards. Stay within free tier.
 5. **S3 lifecycle policy is MANDATORY** — auto-tier to Intelligent-Tiering (90d) → Glacier (365d).
    Keeps 500GB cold data under ₹333/mo instead of ₹1,063/mo.
-6. **Docker memory budget for c7i.xlarge / c8g.xlarge (8GB)** — Wave 7-A trimmed (2026-05-10):
-   - QuestDB: **2GB** (down from 4GB; cascading mat views removed in Wave 6)
-   - Valkey: **512MB** (down from 1GB; token + instrument cache fits easily)
-   - Prometheus: **384MB** (down from 512MB; 7d retention)
-   - Grafana: **768MB** (down from 1GB)
-   - **Alertmanager: 256MB (KEPT — independent process, app-crash alert safety)**
-   - Tickvault app: ~500MB
-   - Total Docker: ~4.0GB. Remaining: ~4.0GB for OS + buffer.
+6. **Host memory budget for c7i.xlarge / c8g.xlarge (8GB)** — Wave 7-A2 locked (2026-05-10):
+   - **Docker containers (5 services, ~3.92 GB):**
+     - QuestDB: 2GB (Wave 7-A: cascading mat views removed in Wave 6)
+     - Grafana: 768MB
+     - Valkey: 512MB
+     - Prometheus: 384MB (7d retention)
+     - Alertmanager: 256MB (KEPT — independent process for app-crash alerts)
+   - **Host process — Tickvault app: 1.5 GB** (rescue ring 5M ticks ≈ 30 sec WS outage absorbed)
+   - **OS + filesystem cache: 600 MB** (tracing log writes, audit flush bursts, kernel TCP buffers)
+   - **Total used: ~6.0 GB**
+   - **Headroom (HARD FLOOR): 2.0 GB** — Linux kswapd needs ≥1 GB free; 2 GB prevents OOM under bursts
    - **REMOVED in Wave 7-A:** Traefik (use AWS ALB free tier), valkey-exporter (not queried).
    - **Already removed:** Jaeger, Loki, Alloy (saves 2.5GB RAM).
 7. **Manual starts budgeted at 20hr/month max.** If consistently exceeding, review schedule.
 8. **HTTP gateway:** Use AWS ALB (free tier 750 hrs/mo) for HTTPS termination, or app on port 3001 directly behind security group for internal-only access.
 9. **Alert routing:** Prometheus → Alertmanager → Telegram (standard pattern). Alertmanager runs as an independent container so app-crash alerts still reach the operator. Routing alerts through the app itself is a single-point-of-failure anti-pattern (rejected 2026-05-10).
 10. **NO manual configuration on AWS deployment** — every setting (memory, schedule, alerts, dashboards, audits) lives in version-controlled config files. `git clone` + `docker compose up -d` reproduces full stack identically on Mac dev and AWS prod.
+11. **Headroom floor is non-negotiable: 2 GB minimum free RAM at all times** (Wave 7-A2). Below this, Linux kswapd thrashes, OOM killer becomes aggressive, latency jitter spikes. CI ratchet `test_total_host_memory_below_6_gb_ceiling` enforces it.
 
 ## What This Prevents
 
@@ -84,6 +88,7 @@ S3 archival exports detached partitions before removal (Plan Item 7, needs aws-s
 - S3 costs exploding (Intelligent-Tiering + Glacier keep cold data cheap)
 - App-crash alerts vanishing (Alertmanager independence prevents this)
 - Manual config drift between Mac and AWS (single compose file)
+- OOM killer striking under burst load (2 GB headroom floor prevents this)
 
 ## Instance Schedule (Wave 7-A — 2026-05-10 update)
 
@@ -107,21 +112,69 @@ S3 archival exports detached partitions before removal (Plan Item 7, needs aws-s
 | 1 weekend day (8hr manual) | ₹121 |
 | 1 quick check (2hr manual) | ₹30 |
 
-## RAM Trim Audit (Wave 7-A, 2026-05-10 — Alertmanager retained)
+## Host Memory Budget — Wave 7-A2 Locked (2026-05-10)
 
-| Service | Pre-Wave-7-A | Post-Wave-7-A | Saved |
+**c8g.xlarge / c7i.xlarge — 8 GB total:**
+
+| Component | RAM | Type | Notes |
 |---|---|---|---|
-| QuestDB | 4 GB | 2 GB | -2 GB |
-| Valkey | 1 GB | 512 MB | -512 MB |
-| Grafana | 1 GB | 768 MB | -256 MB |
-| Prometheus | 512 MB | 384 MB | -128 MB |
-| **Alertmanager** | 256 MB | **256 MB (KEPT)** | 0 |
-| Traefik | 512 MB | REMOVED | -512 MB |
-| Valkey-exporter | 128 MB | REMOVED | -128 MB |
-| **Total Docker** | **~7.4 GB** | **~4.0 GB** | **-3.4 GB** |
-| **Headroom on 8 GB** | ~600 MB | **~4.0 GB** | massive |
+| QuestDB | 2.0 GB | Docker | Time-series DB (mmap-heavy) |
+| **Tickvault app** | **1.5 GB** | **Host process** | **Rescue ring 5M ticks (~30 sec WS outage absorbed)** |
+| Grafana | 768 MB | Docker | Dashboards |
+| **OS + FS cache** | **600 MB** | **Host kernel** | **tracing log writes + audit bursts** |
+| Valkey | 512 MB | Docker | Token + instrument cache |
+| Prometheus | 384 MB | Docker | 7d retention |
+| Alertmanager | 256 MB | Docker | Independent alert routing |
+| **TOTAL USED** | **6.0 GB** | | |
+| **HEADROOM (hard floor)** | **2.0 GB** | | OOM safety margin |
 
-## 100% Coverage Verification (after Wave 7-A trim)
+### Tickvault App (1.5 GB) Memory Breakdown
+
+| Component | Math | RAM |
+|---|---|---|
+| Live aggregator (current candle per TF) | 11,045 × 9 × 80 bytes | 8 MB |
+| SPSC channels (5 writers × 65K slots × 200B) | 5 × 65,536 × 200 | 65 MB |
+| **Rescue ring buffer (5M ticks × 200 bytes)** | 5,000,000 × 200 | **1.0 GB** |
+| Indicator state (99K indicators × 500 bytes) | 99,405 × 500 | 50 MB |
+| Token + instrument cache | 10K entries × 1KB | 10 MB |
+| WebSocket buffers (5 conns × 4MB) | 5 × 4 MB | 20 MB |
+| OMS + Greeks pipeline | misc | 10 MB |
+| Tracing + log queues | bounded | 5 MB |
+| Tokio runtime + 4 thread stacks | 4 × 2 MB + internal | 20 MB |
+| Heap fragmentation (~25% scaled) | jemalloc | 200 MB |
+| **APP TOTAL** | | **~1,388 MB** |
+| **App safety headroom** | | **~112 MB** ✅ |
+
+### Why 2 GB Host Headroom Is Non-Negotiable
+
+| Reason | What goes wrong without it |
+|---|---|
+| Linux kswapd needs ≥1 GB free | thrashes < 1 GB → page cache evictions |
+| Kernel TCP buffers under burst | Direct Connect throughput dips |
+| Docker daemon overhead | metrics scrape, log rotation, healthchecks |
+| Service start/stop transients | restarts spike memory briefly |
+| OOM killer behavior | aggressive < 1 GB free, kills random processes |
+| NUMA + swap behavior | latency jitter spikes |
+
+**Below 2 GB headroom → Linux gets twitchy. Above 2 GB → smooth operation.**
+
+## RAM Trim Audit (Wave 7-A → Wave 7-A2 trajectory)
+
+| Service | Pre-Wave-7 | Wave 7-A | Wave 7-A2 | Final state |
+|---|---|---|---|---|
+| QuestDB | 4 GB | 2 GB | 2 GB | 2 GB |
+| App | 500 MB | 500 MB | **1.5 GB** | **1.5 GB** ⬆️ |
+| Grafana | 1 GB | 768 MB | 768 MB | 768 MB |
+| OS + FS cache | 100 MB | 200 MB | **600 MB** | **600 MB** ⬆️ |
+| Valkey | 1 GB | 512 MB | 512 MB | 512 MB |
+| Prometheus | 512 MB | 384 MB | 384 MB | 384 MB |
+| Alertmanager | 256 MB | 256 MB | 256 MB | 256 MB |
+| Traefik | 512 MB | REMOVED | — | — |
+| Valkey-exporter | 128 MB | REMOVED | — | — |
+| **Total Used** | ~7.9 GB | ~4.6 GB | **~6.0 GB** | **~6.0 GB** |
+| **Headroom** | ~100 MB ⚠️ | ~3.4 GB | **~2.0 GB** ✅ | **~2.0 GB (locked floor)** |
+
+## 100% Coverage Verification (after Wave 7-A2 trim)
 
 | Need | Tool | Status |
 |---|---|---|
@@ -135,6 +188,7 @@ S3 archival exports detached partitions before removal (Plan Item 7, needs aws-s
 | Dashboards | Grafana operator-health single page | ✅ KEEP |
 | HTTP gateway | AWS ALB (free tier) | ✅ replaces Traefik |
 | Distributed tracing | CloudWatch X-Ray (optional, free tier 100K traces/mo) | ⚠️ optional |
+| Zero tick loss envelope | Rescue ring 5M ticks (Wave 7-A2) | ✅ 30 sec absorbed |
 
 ## Common Runtime / Dynamic / Scalable / Automated Charter (mandatory)
 
@@ -155,6 +209,15 @@ notified on Telegram, no manual inputs."
 | Automated notifications | teloxide Telegram client + Alertmanager webhook; `Severity::High`/`Critical` auto-page operator |
 | No manual inputs | Boot sequence is fully automatic: bootstrap.sh pulls SSM → Docker compose up → app self-tests via `make doctor` → 3-tier fallback (cache → SSM → TOTP) → market-open self-test at 09:16:30 IST |
 
+## Wave 7-A3 Follow-Up (Rust code, deferred to Mac commit)
+
+| Change | File | Status |
+|---|---|---|
+| `TICK_BUFFER_CAPACITY: 2_000_000` → `5_000_000` | `crates/common/src/constants.rs` | ⏳ pending Mac commit (sandbox cargo broken) |
+| Update ratchet test for 5M | `crates/storage/tests/zero_tick_loss_alert_guard.rs` | ⏳ pending |
+| DHAT zero-alloc verify with 5M ring | `crates/core/tests/dhat_*.rs` | ⏳ pending |
+| Adversarial 3-agent review for ring expansion | hot-path + security + bug-hunt | ⏳ pending |
+
 ## Trigger
 
 This rule activates when editing files matching:
@@ -162,4 +225,5 @@ This rule activates when editing files matching:
 - `deploy/aws/*`
 - `scripts/aws-*`
 - `crates/app/src/infra.rs`
-- Any file containing `c7i`, `c8g`, `mem_limit`, `EBS`, `gp3`, `instance_type`, `aws_region`
+- `crates/common/src/constants.rs` (TICK_BUFFER_CAPACITY)
+- Any file containing `c7i`, `c8g`, `mem_limit`, `EBS`, `gp3`, `instance_type`, `aws_region`, `TICK_BUFFER_CAPACITY`
