@@ -160,21 +160,18 @@ ensure_pgpass() {
     chmod 600 ~/.pgpass
 }
 
-# ---- Fast path: check if all 7 containers are running ----
-# Loki, Alloy, and Jaeger were removed per `.claude/rules/project/aws-budget.md`
-# to save 2.5GB RAM on the c7i.xlarge AWS budget. Previously this list
-# still contained them, so `all_running` always returned false, the fast
-# path never fired, and `open_dashboards()` was never reached — that's
-# why "auto-open dashboards" was silently broken. Keep this list in sync
-# with `deploy/docker/docker-compose.yml` services.
+# ---- Fast path: check if all 5 containers are running ----
+# Loki, Alloy, Jaeger, Traefik, and valkey-exporter were removed per
+# `.claude/rules/project/aws-budget.md` (Wave 7-A) to fit the 8GB c7i.xlarge
+# AWS budget. AWS ALB free tier replaces Traefik; valkey-exporter wasn't
+# queried by any panel. Keep this list in sync with
+# `deploy/docker/docker-compose.yml` services (excluding profile-gated ones).
 REQUIRED_CONTAINERS=(
     "tv-questdb"
     "tv-valkey"
-    "tv-valkey-exporter"
     "tv-prometheus"
     "tv-alertmanager"
     "tv-grafana"
-    "tv-traefik"
 )
 
 all_running() {
@@ -197,7 +194,7 @@ fi
 # Quick check — if everything is already running, still ensure schema is up-to-date
 if all_running; then
     ensure_pgpass
-    echo -e "${GREEN}All 8 infrastructure containers running.${NC}"
+    echo -e "${GREEN}All 5 infrastructure containers running.${NC}"
     # Always run schema init (idempotent) — ensures new tables are created
     # even when containers were already running before a code update.
     echo -e "${CYAN}Ensuring QuestDB schema is up-to-date...${NC}"
@@ -311,7 +308,7 @@ fi
 echo ""
 if all_running; then
     echo -e "${GREEN}╔════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║   Infrastructure ready. All 8 services UP.     ║${NC}"
+    echo -e "${GREEN}║   Infrastructure ready. All 5 services UP.     ║${NC}"
     echo -e "${GREEN}╚════════════════════════════════════════════════╝${NC}"
     open_dashboards
     exit 0

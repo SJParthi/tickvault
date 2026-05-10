@@ -85,40 +85,10 @@ groups:
         labels:
           severity: critical
 
-      - uid: tv-high-error-rate
-        title: "High Traefik Error Rate"
-        condition: C
-        data:
-          - refId: A
-            relativeTimeRange: { from: 300, to: 0 }
-            datasourceUid: prometheus
-            model:
-              expr: "sum(rate(traefik_entrypoint_requests_total{code=~\"5..\"}[5m])) / sum(rate(traefik_entrypoint_requests_total[5m])) > 0.05"
-              intervalMs: 15000
-              maxDataPoints: 43200
-          - refId: B
-            relativeTimeRange: { from: 300, to: 0 }
-            datasourceUid: __expr__
-            model:
-              type: reduce
-              expression: A
-              reducer: last
-          - refId: C
-            relativeTimeRange: { from: 300, to: 0 }
-            datasourceUid: __expr__
-            model:
-              type: threshold
-              expression: B
-              conditions:
-                - evaluator: { type: gt, params: [0] }
-        noDataState: OK
-        execErrState: Alerting
-        for: 5m
-        annotations:
-          summary: "Traefik 5xx error rate above 5%"
-          description: "More than 5% of Traefik requests are returning 5xx errors over the last 5 minutes."
-        labels:
-          severity: warning
+      # Wave 7-A: tv-high-error-rate (Traefik 5xx) alert removed.
+      # Traefik was retired (replaced by AWS ALB free tier). The
+      # `traefik_entrypoint_requests_total` series no longer exists, so this
+      # alert was firing NoData -> OK silently but cluttered Grafana's UI.
 
   - orgId: 1
     name: tickvault
@@ -127,19 +97,21 @@ groups:
     rules:
       - uid: tickvault-down
         title: "Application Down"
-        # Boot sequence is ~37s (CryptoProvider → Config → SSM → JWT → DDL →
-        # universe build → WebSocket pool). Scrape interval is 15s. Old
-        # `for: 1m` + `noDataState: Alerting` fired during every cold start
-        # before the first successful scrape landed. 5 minutes is the smallest
-        # window that covers a clean boot + 1-2 missed scrapes without paging
-        # the operator on every restart.
+        # Wave 7-A market-hours gate: only page when app is down DURING
+        # IST 09:15-15:30 Mon-Fri. Off-hours / weekend / dev cycles must
+        # not trip this critical alert. Implemented inline via hour() +
+        # minute() + day_of_week() so it works without recording rules.
+        # IST 09:15 = UTC 03:45, IST 15:30 = UTC 10:00.
         condition: C
         data:
           - refId: A
             relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: prometheus
             model:
-              expr: "up{job=\"tickvault\"} == 0"
+              expr: |
+                up{job="tickvault"} == 0
+                and on() (((hour() == 3 and minute() >= 45) or (hour() >= 4 and hour() < 10))
+                         and (day_of_week() >= 1 and day_of_week() <= 5))
               intervalMs: 15000
               maxDataPoints: 43200
           - refId: B
@@ -211,13 +183,16 @@ groups:
 
       - uid: tv-no-ticks
         title: "No Ticks Received"
+        # Wave 7-A: gate on tv_pipeline_active == 1 so this critical alert
+        # only fires when the app SAYS its pipeline is up but no ticks are
+        # flowing. Off-hours / app-not-running silently goes OK.
         condition: C
         data:
           - refId: A
             relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: prometheus
             model:
-              expr: "rate(tv_ticks_processed_total[5m]) == 0"
+              expr: "rate(tv_ticks_processed_total[5m]) == 0 and tv_pipeline_active == 1"
               intervalMs: 15000
               maxDataPoints: 43200
           - refId: B
@@ -235,12 +210,12 @@ groups:
               expression: B
               conditions:
                 - evaluator: { type: lt, params: [1] }
-        noDataState: Alerting
+        noDataState: OK
         execErrState: Alerting
         for: 5m
         annotations:
           summary: "No ticks received for 5 minutes"
-          description: "Tick processing rate has been zero for 5+ minutes. Market data feed may be dead."
+          description: "Tick processing rate has been zero for 5+ minutes while pipeline is active."
         labels:
           severity: critical
 
@@ -351,13 +326,16 @@ groups:
 
       - uid: tv-websocket-disconnect
         title: "WebSocket Disconnected"
+        # Wave 7-A: gate on tv_pipeline_active == 1 — when the app is
+        # intentionally not running (off-hours, dev cycle), the metric
+        # is absent and we fall to noDataState=OK below.
         condition: C
         data:
           - refId: A
             relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: prometheus
             model:
-              expr: "tv_websocket_connections_active == 0"
+              expr: "tv_websocket_connections_active == 0 and tv_pipeline_active == 1"
               intervalMs: 15000
               maxDataPoints: 43200
           - refId: B
@@ -375,12 +353,12 @@ groups:
               expression: B
               conditions:
                 - evaluator: { type: lt, params: [1] }
-        noDataState: NoData
+        noDataState: OK
         execErrState: Alerting
         for: 2m
         annotations:
           summary: "All WebSocket connections lost"
-          description: "No active WebSocket connections to Dhan feed for 2+ minutes. Market data is stale."
+          description: "No active WebSocket connections to Dhan feed for 2+ minutes while pipeline is active."
         labels:
           severity: critical
 
