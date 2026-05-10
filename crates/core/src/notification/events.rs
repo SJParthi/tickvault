@@ -2618,7 +2618,18 @@ impl NotificationEvent {
             Self::SelfTestPassed { .. } => Severity::Info,
             Self::SelfTestDegraded { .. } => Severity::High,
             Self::RealtimeGuaranteeHealthy { .. } => Severity::Info,
-            Self::RealtimeGuaranteeDegraded { .. } => Severity::High,
+            // 2026-05-11 hotfix — `RealtimeGuaranteeDegraded` (band
+            // 0.80–0.95) was previously `High`, which routed it to
+            // Telegram. The 10s SLO scheduler can flap across the 0.95
+            // edge multiple times per minute under normal load, producing
+            // pager fatigue with no actionable signal (see operator
+            // feedback 2026-05-11). Downgraded to `Low` — the event still
+            // emits to Loki + Grafana for trend visibility, but does not
+            // page. The genuine-fire `RealtimeGuaranteeCritical` variant
+            // (score < 0.80) keeps `Critical` severity and continues to
+            // page on Telegram. Ratcheted by
+            // `test_realtime_guarantee_degraded_severity_is_low_not_high`.
+            Self::RealtimeGuaranteeDegraded { .. } => Severity::Low,
             Self::RealtimeGuaranteeCritical { .. } => Severity::Critical,
             Self::SelfTestCritical { .. } => Severity::Critical,
             Self::DepthIndexLtpTimeout { .. } => Severity::High,
@@ -4999,6 +5010,41 @@ mod tests {
     /// contain `[0.80, 0.95)` which is bracket-safe but the parens-with-
     /// `<` pattern is what crashed the Critical variant; keep this guard
     /// so a future edit can't reintroduce a literal `<` here either.
+    /// 2026-05-11 hotfix — `RealtimeGuaranteeDegraded` MUST stay at
+    /// `Severity::Low` so the 10s SLO scheduler does NOT flap-page
+    /// the operator on the 0.95 boundary. `RealtimeGuaranteeCritical`
+    /// stays at `Severity::Critical` for genuine fires (score < 0.80).
+    /// Ratchet — a future "tighten alerting" PR cannot silently
+    /// re-enable the pager spam without flipping this test.
+    #[test]
+    fn test_realtime_guarantee_degraded_severity_is_low_not_high() {
+        let event = NotificationEvent::RealtimeGuaranteeDegraded {
+            score: 0.85,
+            weakest: "ws_health",
+        };
+        assert_eq!(
+            event.severity(),
+            Severity::Low,
+            "Degraded MUST be Low (Loki + Grafana only, no Telegram)"
+        );
+    }
+
+    #[test]
+    fn test_realtime_guarantee_critical_severity_remains_critical() {
+        // The Critical variant (score < 0.80) is the genuine fire — it
+        // MUST remain at Severity::Critical so it keeps paging on
+        // Telegram even after the Degraded downgrade.
+        let event = NotificationEvent::RealtimeGuaranteeCritical {
+            score: 0.50,
+            weakest: "qdb_health",
+        };
+        assert_eq!(
+            event.severity(),
+            Severity::Critical,
+            "Critical MUST stay Critical so genuine fires still page"
+        );
+    }
+
     #[test]
     fn test_realtime_guarantee_degraded_body_has_no_unescaped_html_brackets() {
         let event = NotificationEvent::RealtimeGuaranteeDegraded {
