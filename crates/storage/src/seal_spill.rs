@@ -69,6 +69,7 @@ use chrono::{TimeZone, Utc};
 use tracing::{info, warn};
 
 use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+use tickvault_trading::candles::{BufferedSeal, TfIndex};
 
 /// Production spill directory — same parent as `tick_persistence.rs`'s
 /// `TICK_SPILL_DIR` for operational consistency.
@@ -176,6 +177,93 @@ impl SerializedSeal {
                 buf[88], buf[89], buf[90], buf[91], buf[92], buf[93], buf[94], buf[95],
             ]),
         })
+    }
+
+    /// Decode `tf_ordinal` back to a strongly-typed [`TfIndex`].
+    /// Returns `None` if the on-disk record was written with an
+    /// out-of-range ordinal (forward-compat scenario where a future
+    /// shadow-table set adds TFs that this older binary doesn't
+    /// recognise — the writer task drops the record with a `warn!`
+    /// rather than panicking).
+    #[must_use]
+    pub fn tf(&self) -> Option<TfIndex> {
+        TfIndex::from_ordinal(self.tf_ordinal as usize)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trading↔storage glue (item 1.2c)
+// ---------------------------------------------------------------------------
+
+impl From<&BufferedSeal> for SerializedSeal {
+    /// Lossless conversion from the trading-side ring payload to the
+    /// storage-side wire-format record. `O(1)`, zero allocation.
+    ///
+    /// Field-by-field copy. The 3 Wave-5 pct fields
+    /// (`close_pct_from_prev_day` / `oi_pct_from_prev_day` /
+    /// `volume_pct_from_prev_day`) are carried through unchanged —
+    /// per locked decision L-H6 they're stamped by the seal-time
+    /// caller BEFORE the seal enters the ring, so by the time we
+    /// serialise them the values are already correct (or 0.0 on
+    /// PREVCLOSE-04 cold-boot).
+    ///
+    /// The reverse direction (`SerializedSeal → BufferedSeal`) is
+    /// the writer task's REPLAY path and uses [`Self::tf`] for
+    /// strongly-typed `TfIndex` round-trip with `Option<>` safety.
+    #[inline]
+    fn from(b: &BufferedSeal) -> Self {
+        Self {
+            security_id: b.security_id,
+            exchange_segment_code: b.exchange_segment_code,
+            tf_ordinal: b.tf.as_ordinal() as u8,
+            bucket_start_ist_secs: b.state.bucket_start_ist_secs,
+            tick_count: b.state.tick_count,
+            volume: b.state.volume,
+            bucket_start_cumulative: b.state.bucket_start_cumulative,
+            oi: b.state.oi,
+            open: b.state.open,
+            high: b.state.high,
+            low: b.state.low,
+            close: b.state.close,
+            close_pct_from_prev_day: b.state.close_pct_from_prev_day,
+            oi_pct_from_prev_day: b.state.oi_pct_from_prev_day,
+            volume_pct_from_prev_day: b.state.volume_pct_from_prev_day,
+        }
+    }
+}
+
+impl SerializedSeal {
+    /// Construct a [`BufferedSeal`] from this serialised record.
+    /// Returns `None` if `tf_ordinal` is out of range (forward-compat
+    /// guard per [`Self::tf`]). Used by the writer task on REPLAY
+    /// from disk-spill.
+    ///
+    /// Callers that get `None` MUST log
+    /// `warn!(?tf_ordinal, "spill record skipped — unknown tf_ordinal")`
+    /// and continue draining the rest of the file rather than abort.
+    #[must_use]
+    pub fn try_into_buffered_seal(&self) -> Option<BufferedSeal> {
+        use tickvault_trading::candles::LiveCandleState;
+        let tf = self.tf()?;
+        let mut state = LiveCandleState::empty();
+        state.bucket_start_ist_secs = self.bucket_start_ist_secs;
+        state.open = self.open;
+        state.high = self.high;
+        state.low = self.low;
+        state.close = self.close;
+        state.volume = self.volume;
+        state.bucket_start_cumulative = self.bucket_start_cumulative;
+        state.oi = self.oi;
+        state.tick_count = self.tick_count;
+        state.close_pct_from_prev_day = self.close_pct_from_prev_day;
+        state.oi_pct_from_prev_day = self.oi_pct_from_prev_day;
+        state.volume_pct_from_prev_day = self.volume_pct_from_prev_day;
+        Some(BufferedSeal::new(
+            self.security_id,
+            self.exchange_segment_code,
+            tf,
+            state,
+        ))
     }
 }
 
@@ -687,5 +775,172 @@ mod tests {
     #[test]
     fn test_seal_spill_io_timeout_constant_pinned() {
         assert_eq!(SEAL_SPILL_IO_TIMEOUT, Duration::from_secs(5));
+    }
+
+    // -----------------------------------------------------------------------
+    // Trading↔storage glue tests (item 1.2c)
+    // -----------------------------------------------------------------------
+
+    use tickvault_trading::candles::{BufferedSeal, LiveCandleState, TfIndex};
+
+    fn mk_buffered_seal(sid: u32, seg: u8, tf: TfIndex, bucket: u32, close: f64) -> BufferedSeal {
+        let mut state = LiveCandleState::empty();
+        state.bucket_start_ist_secs = bucket;
+        state.open = 100.0;
+        state.high = 105.0;
+        state.low = 99.0;
+        state.close = close;
+        state.volume = 1234;
+        state.bucket_start_cumulative = 1000;
+        state.oi = 50_000;
+        state.tick_count = 5;
+        state.close_pct_from_prev_day = 1.5;
+        state.oi_pct_from_prev_day = -0.2;
+        state.volume_pct_from_prev_day = 12.3;
+        BufferedSeal::new(sid, seg, tf, state)
+    }
+
+    #[test]
+    fn test_from_buffered_seal_copies_every_field_losslessly() {
+        let buffered = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 102.5);
+        let serialised = SerializedSeal::from(&buffered);
+        assert_eq!(serialised.security_id, 13);
+        assert_eq!(serialised.exchange_segment_code, 0);
+        assert_eq!(serialised.tf_ordinal, 0); // M1.as_ordinal() = 0
+        assert_eq!(serialised.bucket_start_ist_secs, 1_716_000_900);
+        assert_eq!(serialised.tick_count, 5);
+        assert_eq!(serialised.volume, 1234);
+        assert_eq!(serialised.bucket_start_cumulative, 1000);
+        assert_eq!(serialised.oi, 50_000);
+        assert_eq!(serialised.open, 100.0);
+        assert_eq!(serialised.high, 105.0);
+        assert_eq!(serialised.low, 99.0);
+        assert_eq!(serialised.close, 102.5);
+        assert_eq!(serialised.close_pct_from_prev_day, 1.5);
+        assert_eq!(serialised.oi_pct_from_prev_day, -0.2);
+        assert_eq!(serialised.volume_pct_from_prev_day, 12.3);
+    }
+
+    #[test]
+    fn test_from_buffered_seal_maps_all_9_tfs_to_correct_ordinal() {
+        // Verify every TfIndex variant maps to its canonical ordinal
+        // (0..=8). This pins the trading↔storage contract: a future
+        // re-ordering of TfIndex::ALL would silently flip every
+        // spilled record's TF assignment.
+        let buffered = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0);
+        let mut tested: Vec<u8> = Vec::with_capacity(9);
+        for tf in TfIndex::ALL {
+            let mut b = buffered;
+            b.tf = tf;
+            let s = SerializedSeal::from(&b);
+            assert_eq!(
+                s.tf_ordinal as usize,
+                tf.as_ordinal(),
+                "tf_ordinal mismatch for {}",
+                tf.display_name()
+            );
+            tested.push(s.tf_ordinal);
+        }
+        assert_eq!(tested, vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn test_serialized_seal_tf_returns_some_for_valid_ordinals() {
+        for (idx, tf) in TfIndex::ALL.iter().enumerate() {
+            let mut s =
+                SerializedSeal::from(&mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0));
+            s.tf_ordinal = idx as u8;
+            assert_eq!(s.tf(), Some(*tf));
+        }
+    }
+
+    #[test]
+    fn test_serialized_seal_tf_returns_none_for_out_of_range_ordinal() {
+        let mut s =
+            SerializedSeal::from(&mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0));
+        s.tf_ordinal = 9; // out of range
+        assert_eq!(s.tf(), None);
+        s.tf_ordinal = 255;
+        assert_eq!(s.tf(), None);
+    }
+
+    #[test]
+    fn test_try_into_buffered_seal_roundtrip_preserves_every_field() {
+        let original = mk_buffered_seal(25, 1, TfIndex::H4, 1_716_001_500, 200.75);
+        let serialised = SerializedSeal::from(&original);
+        let recovered = serialised
+            .try_into_buffered_seal()
+            .expect("valid tf_ordinal");
+        assert_eq!(recovered.security_id, original.security_id);
+        assert_eq!(
+            recovered.exchange_segment_code,
+            original.exchange_segment_code
+        );
+        assert_eq!(recovered.tf, original.tf);
+        assert_eq!(
+            recovered.state.bucket_start_ist_secs,
+            original.state.bucket_start_ist_secs
+        );
+        assert_eq!(recovered.state.open, original.state.open);
+        assert_eq!(recovered.state.high, original.state.high);
+        assert_eq!(recovered.state.low, original.state.low);
+        assert_eq!(recovered.state.close, original.state.close);
+        assert_eq!(recovered.state.volume, original.state.volume);
+        assert_eq!(
+            recovered.state.bucket_start_cumulative,
+            original.state.bucket_start_cumulative
+        );
+        assert_eq!(recovered.state.oi, original.state.oi);
+        assert_eq!(recovered.state.tick_count, original.state.tick_count);
+        assert_eq!(
+            recovered.state.close_pct_from_prev_day,
+            original.state.close_pct_from_prev_day
+        );
+        assert_eq!(
+            recovered.state.oi_pct_from_prev_day,
+            original.state.oi_pct_from_prev_day
+        );
+        assert_eq!(
+            recovered.state.volume_pct_from_prev_day,
+            original.state.volume_pct_from_prev_day
+        );
+    }
+
+    #[test]
+    fn test_try_into_buffered_seal_returns_none_on_unknown_tf_ordinal() {
+        let mut s =
+            SerializedSeal::from(&mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0));
+        s.tf_ordinal = 42; // unknown future TF
+        assert!(s.try_into_buffered_seal().is_none());
+    }
+
+    #[test]
+    fn test_full_roundtrip_buffered_seal_to_bytes_to_buffered_seal() {
+        // End-to-end: BufferedSeal -> SerializedSeal -> bytes -> SerializedSeal -> BufferedSeal.
+        // The whole chain is what the writer task uses on REPLAY from disk-spill.
+        let original = mk_buffered_seal(13, 0, TfIndex::M5, 1_716_000_900, 105.5);
+        let serialised = SerializedSeal::from(&original);
+        let bytes = serialised.to_bytes();
+        let decoded = SerializedSeal::from_bytes(&bytes).expect("full record");
+        let recovered = decoded.try_into_buffered_seal().expect("valid tf_ordinal");
+        assert_eq!(recovered, original);
+    }
+
+    #[test]
+    fn test_from_buffered_seal_preserves_i_p1_11_segment_distinction() {
+        // Same security_id × 2 segments must produce 2 distinct
+        // serialised records that round-trip to 2 distinct buffered
+        // seals — the I-P1-11 invariant must hold across the
+        // trading↔storage glue.
+        let seg0 = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0);
+        let seg1 = mk_buffered_seal(13, 1, TfIndex::M1, 1_716_000_900, 200.0);
+        let s0 = SerializedSeal::from(&seg0);
+        let s1 = SerializedSeal::from(&seg1);
+        assert_ne!(s0, s1);
+        let r0 = s0.try_into_buffered_seal().expect("valid tf");
+        let r1 = s1.try_into_buffered_seal().expect("valid tf");
+        assert_ne!(r0, r1);
+        assert_eq!(r0.exchange_segment_code, 0);
+        assert_eq!(r1.exchange_segment_code, 1);
     }
 }

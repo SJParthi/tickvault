@@ -4285,6 +4285,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tickvault-common",
+ "tickvault-trading",
  "tokio",
  "tracing",
  "tracing-subscriber",
