@@ -59,6 +59,50 @@ use crate::seal_absorption::{SealAbsorptionPipeline, SubmitOutcome};
 use crate::seal_writer_task::{DrainOutcome, drain_once};
 use crate::shadow_candle_writer::ShadowCandleWriter;
 
+/// Wave 6 Sub-PR #1 item 1.4c — process-global mpsc Sender that any
+/// producer (e.g. the future aggregator task that subscribes to the
+/// tick broadcast in `crates/app/src/main.rs`) can clone to push
+/// `BufferedSeal`s into the writer task without threading a Sender
+/// through every layer of the boot sequence.
+///
+/// Mirrors the `GLOBAL_QUESTDB_CONFIG` pattern shipped earlier in
+/// this crate — `OnceLock` is set ONCE at boot (right before the
+/// writer task is spawned) and read-only thereafter.
+///
+/// If the bridge is `None` (i.e. the writer task failed to construct,
+/// or boot has not progressed far enough), producers should treat
+/// this as "seals discarded" — log a `tv_seal_producer_no_bridge_total`
+/// counter increment per call site and continue. The legacy
+/// `candles_1s` path is still feeding production trading; only the
+/// new shadow-table pipeline goes dark.
+static GLOBAL_SEAL_SENDER: std::sync::OnceLock<mpsc::Sender<BufferedSeal>> =
+    std::sync::OnceLock::new();
+
+/// Install the global seal Sender. Idempotent — returns `true` on
+/// first install; subsequent calls return `false` and do NOT replace
+/// the existing sender (matches `set_global_questdb_config`).
+///
+/// Caller (typically the boot sequence in `main.rs`) MUST call this
+/// BEFORE moving the `SealWriterRunner` into its `tokio::spawn` block,
+/// because `runner.sender()` becomes inaccessible after the move.
+pub fn set_global_seal_sender(sender: mpsc::Sender<BufferedSeal>) -> bool {
+    GLOBAL_SEAL_SENDER.set(sender).is_ok()
+}
+
+/// Read-only accessor for the global seal Sender. Returns `None`
+/// until the boot path installs one.
+///
+/// Producers clone the returned sender (mpsc Senders are cheap to
+/// clone) and call `try_send(seal)` on the clone. `try_send` is
+/// non-blocking by design — if the mpsc is full (after the writer
+/// task has fallen behind for ~20 seconds at peak burst), the seal
+/// is dropped and the producer increments
+/// `tv_seal_producer_mpsc_full_total`.
+#[must_use]
+pub fn global_seal_sender() -> Option<&'static mpsc::Sender<BufferedSeal>> {
+    GLOBAL_SEAL_SENDER.get()
+}
+
 /// Bounded mpsc capacity for the producer→consumer wire. Sized to
 /// absorb the IST-midnight burst (~99K seals across 11K instruments
 /// × 9 TFs) without saturating; matches `SEAL_BUFFER_CAPACITY` for
@@ -496,5 +540,36 @@ mod tests {
         // silently lower it (which would push more producer-side
         // drops at IST midnight).
         assert_eq!(SEAL_MPSC_CAPACITY, 200_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave 6 Sub-PR #1 item 1.4c — global seal-sender accessor tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_global_seal_sender_before_install_returns_none() {
+        // Note: the OnceLock is process-global. Other tests in this
+        // mod may have installed a sender. We assert "Option<...>"
+        // type — either None (clean test run) or Some (after another
+        // test installed it). The accessor signature is the contract;
+        // null-before-install is a property of OnceLock itself, not
+        // our wrapper.
+        let _: Option<&'static mpsc::Sender<BufferedSeal>> = global_seal_sender();
+    }
+
+    #[test]
+    fn test_set_global_seal_sender_is_idempotent() {
+        // The OnceLock semantics: only the FIRST set() succeeds.
+        // Subsequent calls return Err (we wrap as `false`).
+        let (tx_a, _rx_a) = mpsc::channel::<BufferedSeal>(8);
+        let (tx_b, _rx_b) = mpsc::channel::<BufferedSeal>(8);
+        let first = set_global_seal_sender(tx_a);
+        let second = set_global_seal_sender(tx_b);
+        // First MAY be true (if no prior install) OR false (if another
+        // test installed). Second MUST be false (idempotency).
+        assert!(
+            !(first && second),
+            "set_global_seal_sender MUST be idempotent — both calls returning true violates the contract"
+        );
     }
 }

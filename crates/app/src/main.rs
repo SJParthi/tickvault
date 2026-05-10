@@ -2291,6 +2291,19 @@ async fn main() -> Result<()> {
 
         match SealWriterRunner::new(&config.questdb, SEAL_MAX_DRAIN_PER_CYCLE) {
             Ok(runner) => {
+                // Wave 6 Sub-PR #1 item 1.4c — publish the seal Sender
+                // GLOBALLY before moving `runner` into the spawn block.
+                // The future tick-broadcast subscriber task (item 1.4d,
+                // declared in a deeper scope where `fast_tick_broadcast_sender`
+                // is in scope) reads this via
+                // `tickvault_storage::seal_writer_runner::global_seal_sender()`
+                // and clones it to push BufferedSeal payloads from the
+                // aggregator's seal callback.
+                if !tickvault_storage::seal_writer_runner::set_global_seal_sender(runner.sender()) {
+                    tracing::warn!(
+                        "global seal sender was already installed (idempotent skip) — first installer wins"
+                    );
+                }
                 let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
                 // Hold `cancel_tx` alive for the lifetime of `main` so the
                 // watch channel does not disconnect (which would wake the
