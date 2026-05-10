@@ -14,7 +14,7 @@ license = "MIT"
 # Run `bash .claude/hooks/dep-freshness-scanner.sh` to check for drift.
 
 # ---- Section 2: Backend Core — Async Runtime ----
-tokio = { version = "1.52.1", features = ["full"] }
+tokio = { version = "1.52.3", features = ["full"] }
 
 # ---- Section 2: Backend Core — WebSocket ----
 tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-native-roots"] }
@@ -92,7 +92,7 @@ reqwest = { version = "0.13.3", features = ["json", "rustls", "charset", "http2"
 # ---- Section 8: HTTP Server ----
 axum = { version = "0.8.9", features = ["macros", "ws"] }
 tower = { version = "0.5.3", features = ["full"] }
-tower-http = { version = "0.6.8", features = ["cors", "trace", "compression-gzip", "fs"] }
+tower-http = { version = "0.6.10", features = ["cors", "trace", "compression-gzip", "fs"] }
 
 # ---- Section 9: Configuration ----
 toml = "1.1.2"
