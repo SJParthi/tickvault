@@ -2262,6 +2262,70 @@ async fn main() -> Result<()> {
         tickvault_storage::shadow_persistence::ensure_shadow_candle_tables(&config.questdb),
     );
 
+    // Wave 6 Sub-PR #1 item 1.4b — spawn the seal-writer tokio loop.
+    // This drains the SealAbsorptionPipeline ring (filled by the
+    // future producer-side wiring in item 1.4c) → ShadowCandleWriter
+    // ILP buffer → flush every 100 ms. On flush failure the rescue
+    // cascade walks ring → spill → DLQ → AGGREGATOR-DROP-01.
+    //
+    // During this slice (1.4b) the producer side is NOT yet wired —
+    // the loop runs idle (mpsc empty, ring empty, drain reports
+    // is_idle()) at zero CPU cost. The boot wiring is in place so
+    // item 1.4c is a thin call-site change in tick_processor.rs.
+    //
+    // Cancel bridge: the existing `shutdown_notify` Arc<Notify> drives
+    // the global graceful-shutdown sequence. We spawn a tiny bridge
+    // task that subscribes to it and flips the watch::Sender<bool>
+    // that `run_seal_writer_loop` listens on. This keeps the loop's
+    // signature unchanged (still uses `tokio::sync::watch` per the
+    // shipped 1.2f.5 contract) while integrating with the codebase's
+    // existing shutdown pattern.
+    {
+        use tickvault_storage::seal_writer_loop::{run_seal_writer_loop, seal_drain_interval};
+        use tickvault_storage::seal_writer_runner::SealWriterRunner;
+
+        // Bound the per-cycle drain — 1024 seals × 100 ms cycle =
+        // 10,240 seals/sec sustained throughput, well above the
+        // ~99K-seal IST-midnight burst absorbed across ~10 cycles.
+        const SEAL_MAX_DRAIN_PER_CYCLE: usize = 1_024;
+
+        match SealWriterRunner::new(&config.questdb, SEAL_MAX_DRAIN_PER_CYCLE) {
+            Ok(runner) => {
+                let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                // Hold `cancel_tx` alive for the lifetime of `main` so the
+                // watch channel does not disconnect (which would wake the
+                // loop's `.changed().await` immediately). The full graceful-
+                // shutdown bridge (subscribe to `shutdown_notify` →
+                // `cancel_tx.send(true)` → loop performs final drain) is
+                // wired in item 1.4c when the producer side becomes
+                // observable. For now: forget() leaks the sender to the
+                // 'static lifetime; on process exit Linux reclaims it.
+                std::mem::forget(cancel_tx);
+                tokio::spawn(async move {
+                    let _final_outcome =
+                        run_seal_writer_loop(runner, seal_drain_interval(), cancel_rx).await;
+                    tracing::info!("seal writer loop exited gracefully");
+                });
+                tracing::info!(
+                    interval_ms = seal_drain_interval().as_millis(),
+                    max_drain_per_cycle = SEAL_MAX_DRAIN_PER_CYCLE,
+                    "Wave 6 Sub-PR #1 item 1.4b — seal writer task spawned"
+                );
+            }
+            Err(err) => {
+                // Constructing the runner fails only if QuestDB ILP is
+                // catastrophically misconfigured (the lazy connect path
+                // already absorbs unreachable QuestDB). Log + continue —
+                // legacy candles_1s path is still active so trading
+                // does not stop, but shadow tables will not populate.
+                tracing::error!(
+                    ?err,
+                    "failed to construct SealWriterRunner — shadow tables will NOT populate this session"
+                );
+            }
+        }
+    }
+
     // Wave 2 Item 9 — boot audit row for the QuestDB readiness step.
     // Must run AFTER the `tokio::join!` above so `ensure_boot_audit_table`
     // has created the table. Writing this row before the join was the cause
