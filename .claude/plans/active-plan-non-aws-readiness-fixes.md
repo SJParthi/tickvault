@@ -155,3 +155,13 @@
 - Audit Finding #1 (EventBridge cron 08:00 vs 7:45 IST) — AWS-related
 - HIGH #4 sub-item: actually wiring S3 backup to Glacier — deferred until bucket
 - Wave-6 backlog implementation — only the backlog FILE is created here
+
+
+## Per-Wave Guarantee Matrix Cross-Reference
+
+This plan inherits the canonical 15-row + 7-row guarantee matrices from
+`.claude/rules/project/per-wave-guarantee-matrix.md`. Every item in this plan
+applies all 15 rows of the 100% Mechanical Proof Matrix and all 7 rows of
+the Resilience Demand Matrix without exception. See that rule file for the
+full table; this cross-reference satisfies
+`.claude/hooks/per-item-guarantee-check.sh`.
