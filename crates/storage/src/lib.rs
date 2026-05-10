@@ -97,6 +97,7 @@ pub mod phase2_subscription_marker;
 pub mod previous_close_persistence;
 pub mod questdb_health;
 pub mod selftest_audit_persistence;
+pub mod shadow_persistence;
 pub mod tick_persistence;
 pub mod tick_spill_drain;
 pub mod valkey_cache;

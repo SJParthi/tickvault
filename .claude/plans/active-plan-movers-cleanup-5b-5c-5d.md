@@ -109,3 +109,13 @@ Attempting them blind in one PR risks invisible regressions that only surface at
 - PR #519 / #520 / #521 / #522: Wave-5 §K-L# baseline that retired the cascade engines.
 - PR #525: 7-matview retirement — the pattern this roadmap mirrors.
 - PR #529: V1 `/api/movers` handler deletion (the first slice).
+
+
+## Per-Wave Guarantee Matrix Cross-Reference
+
+This plan inherits the canonical 15-row + 7-row guarantee matrices from
+`.claude/rules/project/per-wave-guarantee-matrix.md`. Every item in this plan
+applies all 15 rows of the 100% Mechanical Proof Matrix and all 7 rows of
+the Resilience Demand Matrix without exception. See that rule file for the
+full table; this cross-reference satisfies
+`.claude/hooks/per-item-guarantee-check.sh`.

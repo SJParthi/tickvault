@@ -29,6 +29,7 @@ use tickvault_common::constants::{
     CANDLE_BUFFER_CAPACITY, CANDLE_FLUSH_BATCH_SIZE, IST_UTC_OFFSET_SECONDS_I64,
     QUESTDB_TABLE_CANDLES_1S, QUESTDB_TABLE_HISTORICAL_CANDLES,
 };
+use tickvault_common::error_code::ErrorCode;
 use tickvault_common::segment::segment_code_to_str;
 use tickvault_common::tick_types::HistoricalCandle;
 
@@ -633,7 +634,17 @@ impl LiveCandleWriter {
             .and_then(|b| b.column_f64("volume_pct_from_prev_day", volume_pct_from_prev_day))
             .and_then(|b| b.at(ts_nanos))
         {
-            warn!(?err, "live candle ILP buffer error — buffering candle");
+            // Wave 6 Sub-PR #1 H11 precursor (2026-05-10): per
+            // `error_level_meta_guard.rs` Rule 5, persist/flush
+            // failures MUST be `error!` not `warn!`. Carries the
+            // typed `code = ErrorCode::AggregatorSeal01IlpFailed`
+            // field so the tag-guard meta-test passes and Loki
+            // routes the event to Telegram.
+            error!(
+                ?err,
+                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                "live candle ILP buffer error — buffering candle for retry"
+            );
             let candle = BufferedCandle {
                 security_id,
                 exchange_segment_code,

@@ -1676,3 +1676,13 @@ All 10 gates run automatically in CI before merge.
 | **TOTAL** | **130** | **L1–L130** |
 
 c8g.xlarge ONLY. 130 locked decisions. **Code for #504a will be written ONLY against the revised L18 + L121–L130 lock set.**
+
+
+## Per-Wave Guarantee Matrix Cross-Reference
+
+This plan inherits the canonical 15-row + 7-row guarantee matrices from
+`.claude/rules/project/per-wave-guarantee-matrix.md`. Every item in this plan
+applies all 15 rows of the 100% Mechanical Proof Matrix and all 7 rows of
+the Resilience Demand Matrix without exception. See that rule file for the
+full table; this cross-reference satisfies
+`.claude/hooks/per-item-guarantee-check.sh`.
