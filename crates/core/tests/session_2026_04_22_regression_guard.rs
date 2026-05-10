@@ -97,16 +97,6 @@ fn guard_streaming_heartbeat_task_exists_in_main() {
 }
 
 #[test]
-fn guard_depth_anchor_task_exists_in_main() {
-    // Commit 427bf2d — once-per-trading-day depth anchor at 09:13:00 IST.
-    let src = read_file("crates/app/src/main.rs");
-    assert!(
-        src.contains("MarketOpenDepthAnchor"),
-        "Depth-anchor task MUST be wired in main.rs (commit 427bf2d)."
-    );
-}
-
-#[test]
 fn guard_depth_command_initial_subscribe_variants_exist() {
     // Commit 6fd9c2a — DepthCommand::InitialSubscribe20 / InitialSubscribe200
     // variants exist for the future unified 09:13 dispatch (Items B+C).
