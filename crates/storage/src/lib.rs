@@ -99,6 +99,7 @@ pub mod questdb_health;
 pub mod seal_absorption;
 pub mod seal_dlq;
 pub mod seal_spill;
+pub mod seal_writer_runner;
 pub mod seal_writer_task;
 pub mod selftest_audit_persistence;
 pub mod shadow_candle_writer;
