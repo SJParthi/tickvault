@@ -3899,7 +3899,6 @@ async fn main() -> Result<()> {
             // Pre-clone universe handles for the snapshotter + Phase 2
             // delta computation BEFORE the rebalancer takes ownership.
             let snapshotter_universe = std::sync::Arc::clone(&universe_arc);
-            let stock_ltps_universe = std::sync::Arc::clone(&universe_arc);
             // Plan item C (2026-04-22, visibility version): the 09:13 IST
             // depth-anchor task needs its own universe handle to look up
             // 2026-05-09 PR 5c.5-final: movers QuestDB infrastructure
@@ -3970,54 +3969,6 @@ async fn main() -> Result<()> {
             // audit-findings Rule 3.
             let preopen_buffer =
                 tickvault_core::instrument::preopen_price_buffer::new_shared_preopen_buffer();
-            // Plan: Phase 2 live-LTP fallback (2026-04-23). Holds the
-            // latest NSE_EQ LTP per F&O underlying stock, continuously
-            // updated from the main-feed tick broadcast. Used by Phase 2
-            // when the preopen buffer is empty at trigger time (fresh-
-            // clone deploy at 11:26 AM, crash recovery, etc.) so stock
-            // F&O still gets subscribed this session using live data.
-            let live_stock_ltps =
-                tickvault_core::instrument::preopen_price_buffer::new_shared_stock_ltps();
-            {
-                let stock_ltps_updater = std::sync::Arc::clone(&live_stock_ltps);
-                let mut stock_rx = tick_broadcast_sender.subscribe();
-                tokio::spawn(async move {
-                    loop {
-                        match stock_rx.recv().await {
-                            Ok(tick) => {
-                                // NSE_EQ = segment code 1. Only F&O underlyings
-                                // are useful for Phase 2; filter via the
-                                // universe reverse-lookup so we don't fill the
-                                // map with the whole ~200 NSE equity universe.
-                                if tick.exchange_segment_code != 1 {
-                                    continue;
-                                }
-                                if tick.last_traded_price <= 0.0
-                                    || !tick.last_traded_price.is_finite()
-                                {
-                                    continue;
-                                }
-                                let Some(symbol) =
-                                    stock_ltps_universe.security_id_to_symbol(tick.security_id)
-                                else {
-                                    continue;
-                                };
-                                if !stock_ltps_universe.underlyings.contains_key(symbol) {
-                                    continue;
-                                }
-                                let sym_owned = symbol.to_string(); // O(1) EXEMPT: per-tick but only F&O subset
-                                let ltp = f64::from(tick.last_traded_price);
-                                let mut map = stock_ltps_updater.write().await;
-                                map.insert(sym_owned, ltp);
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                continue;
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        }
-                    }
-                });
-            }
             {
                 let snap_buffer = std::sync::Arc::clone(&preopen_buffer);
                 let snap_universe = snapshotter_universe;
