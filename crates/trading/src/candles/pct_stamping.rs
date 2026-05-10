@@ -37,6 +37,7 @@
 //!
 //! Pinned by `test_compute_*_pct_handles_zero_baseline_without_nan`.
 
+use crate::candles::aggregator_cell::LiveCandleState;
 use crate::candles::engine::Bar;
 
 /// Frozen-per-day reference values for one `(security_id,
@@ -146,6 +147,35 @@ pub fn stamp_bar_pct_fields(bar: &mut Bar, refs: PrevDayRefs) {
     bar.oi_pct_from_prev_day = compute_oi_pct(bar.oi, refs.prev_day_oi);
     bar.volume_pct_from_prev_day =
         compute_volume_pct(bar.volume_cum_day_at_end, refs.prev_day_total_volume);
+}
+
+/// Wave 6 Sub-PR #1 item 1.5 — stamp the 3 % fields on a sealed
+/// [`LiveCandleState`] using the supplied prev-day refs. The
+/// [`LiveCandleState`] type does NOT carry `prev_day_close` /
+/// `prev_day_oi` baseline fields (only `Bar` does); only the 3
+/// pct fields get populated.
+///
+/// Volume-pct uses **cumulative-at-bucket-end** = `bucket_start_cumulative
+/// + volume`. The `u64 → i64` cast saturates at `i64::MAX` to defend
+/// against rogue upstream values that could otherwise wrap negative
+/// (mirrors the saturating cast in
+/// `tickvault_storage::shadow_seal_columns::ShadowSealRow::from_buffered_seal`).
+///
+/// **Hot-path cost**: 1 add + 1 saturating cast + 3 fp divisions + 3
+/// fp multiplications + 3 stores = ~20 ns. Called on the SEAL path
+/// (not per-tick), so the per-tick budget is unaffected.
+///
+/// Idempotent — calling twice with the same `refs` produces the same
+/// fields.
+#[inline]
+pub fn stamp_seal_pct_fields(state: &mut LiveCandleState, refs: PrevDayRefs) {
+    let cum_volume_at_end_i64 =
+        i64::try_from(state.bucket_start_cumulative.saturating_add(state.volume))
+            .unwrap_or(i64::MAX);
+    state.close_pct_from_prev_day = compute_close_pct(state.close, refs.prev_day_close);
+    state.oi_pct_from_prev_day = compute_oi_pct(state.oi, refs.prev_day_oi);
+    state.volume_pct_from_prev_day =
+        compute_volume_pct(cum_volume_at_end_i64, refs.prev_day_total_volume);
 }
 
 #[cfg(test)]
@@ -323,5 +353,179 @@ mod tests {
         // function must not panic on it.
         let result = compute_close_pct(50.0, -100.0);
         assert!(result.is_finite());
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave 6 Sub-PR #1 item 1.5 — stamp_seal_pct_fields tests
+    // -----------------------------------------------------------------------
+
+    fn mk_live_candle_state(
+        close: f64,
+        oi: i64,
+        volume: u64,
+        cum_at_start: u64,
+    ) -> LiveCandleState {
+        let mut s = LiveCandleState::empty();
+        s.bucket_start_ist_secs = 1_716_000_900;
+        s.open = close;
+        s.high = close;
+        s.low = close;
+        s.close = close;
+        s.volume = volume;
+        s.bucket_start_cumulative = cum_at_start;
+        s.oi = oi;
+        s.tick_count = 1;
+        s
+    }
+
+    #[test]
+    fn test_stamp_seal_pct_fields_happy_path() {
+        let mut state = mk_live_candle_state(105.0, 1_500_000, 5_000_000, 20_000_000);
+        // cum_at_end = 20M + 5M = 25M
+        let refs = PrevDayRefs {
+            prev_day_close: 100.0,
+            prev_day_oi: 1_000_000,
+            prev_day_total_volume: 10_000_000,
+        };
+        stamp_seal_pct_fields(&mut state, refs);
+        assert_eq!(state.close_pct_from_prev_day, 5.0);
+        assert_eq!(state.oi_pct_from_prev_day, 50.0);
+        assert_eq!(state.volume_pct_from_prev_day, 150.0);
+    }
+
+    #[test]
+    fn test_stamp_seal_pct_fields_zero_baseline_yields_zero_no_nan() {
+        // L13 div-by-zero policy applies via the underlying compute_* fns.
+        let mut state = mk_live_candle_state(123.45, 999, 99_999, 0);
+        let refs = PrevDayRefs::default();
+        stamp_seal_pct_fields(&mut state, refs);
+        assert_eq!(state.close_pct_from_prev_day, 0.0);
+        assert_eq!(state.oi_pct_from_prev_day, 0.0);
+        assert_eq!(state.volume_pct_from_prev_day, 0.0);
+        assert!(!state.close_pct_from_prev_day.is_nan());
+        assert!(!state.oi_pct_from_prev_day.is_nan());
+        assert!(!state.volume_pct_from_prev_day.is_nan());
+    }
+
+    #[test]
+    fn test_stamp_seal_pct_fields_negative_red_day() {
+        let mut state = mk_live_candle_state(80.0, 500_000, 1_000_000, 4_000_000);
+        // cum_at_end = 5M
+        let refs = PrevDayRefs {
+            prev_day_close: 100.0,
+            prev_day_oi: 1_000_000,
+            prev_day_total_volume: 10_000_000,
+        };
+        stamp_seal_pct_fields(&mut state, refs);
+        assert_eq!(state.close_pct_from_prev_day, -20.0);
+        assert_eq!(state.oi_pct_from_prev_day, -50.0);
+        assert_eq!(state.volume_pct_from_prev_day, -50.0);
+    }
+
+    #[test]
+    fn test_stamp_seal_pct_fields_is_idempotent() {
+        let mut state = mk_live_candle_state(105.0, 1_500_000, 5_000_000, 20_000_000);
+        let refs = PrevDayRefs {
+            prev_day_close: 100.0,
+            prev_day_oi: 1_000_000,
+            prev_day_total_volume: 10_000_000,
+        };
+        stamp_seal_pct_fields(&mut state, refs);
+        let snapshot = state;
+        stamp_seal_pct_fields(&mut state, refs);
+        assert_eq!(state, snapshot);
+    }
+
+    #[test]
+    fn test_stamp_seal_pct_fields_preserves_unrelated_state() {
+        // Stamping must NOT touch open / high / low / close / volume / oi
+        // / tick_count / bucket_start_ist_secs — only the 3 pct fields.
+        let mut state = mk_live_candle_state(105.0, 1_500_000, 5_000_000, 20_000_000);
+        state.open = 99.0;
+        state.high = 110.0;
+        state.low = 90.0;
+        state.tick_count = 42;
+        let refs = PrevDayRefs {
+            prev_day_close: 100.0,
+            prev_day_oi: 1_000_000,
+            prev_day_total_volume: 10_000_000,
+        };
+        stamp_seal_pct_fields(&mut state, refs);
+        assert_eq!(state.open, 99.0);
+        assert_eq!(state.high, 110.0);
+        assert_eq!(state.low, 90.0);
+        assert_eq!(state.close, 105.0);
+        assert_eq!(state.volume, 5_000_000);
+        assert_eq!(state.bucket_start_cumulative, 20_000_000);
+        assert_eq!(state.oi, 1_500_000);
+        assert_eq!(state.tick_count, 42);
+        assert_eq!(state.bucket_start_ist_secs, 1_716_000_900);
+    }
+
+    #[test]
+    fn test_stamp_seal_pct_fields_uses_cum_at_end_for_volume_pct() {
+        // The volume_pct must be computed from bucket_start_cumulative
+        // + volume (cum-at-end), NOT just `volume` (incremental). A
+        // common bug class is to use the incremental-only value, which
+        // would massively under-report % vs prev day.
+        let mut state = mk_live_candle_state(100.0, 0, 1_000_000, 9_000_000);
+        // cum_at_end = 10M; prev_day_total_volume = 5M → +100%
+        let refs = PrevDayRefs {
+            prev_day_close: 0.0,
+            prev_day_oi: 0,
+            prev_day_total_volume: 5_000_000,
+        };
+        stamp_seal_pct_fields(&mut state, refs);
+        // If the bug existed (only `volume` used), result would be
+        // ((1M - 5M) / 5M) * 100 = -80% — wrong!
+        // Correct: ((10M - 5M) / 5M) * 100 = +100%.
+        assert_eq!(state.volume_pct_from_prev_day, 100.0);
+    }
+
+    #[test]
+    fn test_stamp_seal_pct_fields_volume_saturates_at_i64_max_safely() {
+        // Defensive: u64::MAX volumes saturate to i64::MAX rather than
+        // wrapping to a negative i64 (which would give a nonsense pct).
+        let mut state = mk_live_candle_state(100.0, 0, u64::MAX, u64::MAX);
+        let refs = PrevDayRefs {
+            prev_day_close: 0.0,
+            prev_day_oi: 0,
+            prev_day_total_volume: 1,
+        };
+        stamp_seal_pct_fields(&mut state, refs);
+        // Result must be finite + positive (saturated, not wrapped).
+        assert!(state.volume_pct_from_prev_day.is_finite());
+        assert!(state.volume_pct_from_prev_day > 0.0);
+    }
+
+    #[test]
+    fn test_stamp_seal_pct_fields_empty_state_zeros_pct_fields() {
+        // LiveCandleState::empty() + PrevDayRefs::default() must
+        // produce all-zero pct fields without panic.
+        let mut state = LiveCandleState::empty();
+        stamp_seal_pct_fields(&mut state, PrevDayRefs::default());
+        assert_eq!(state.close_pct_from_prev_day, 0.0);
+        assert_eq!(state.oi_pct_from_prev_day, 0.0);
+        assert_eq!(state.volume_pct_from_prev_day, 0.0);
+    }
+
+    #[test]
+    fn test_stamp_seal_pct_fields_overwrites_pre_existing_pct_values() {
+        // If the state already has stale pct values (from a previous
+        // seal), stamping with new refs must REPLACE them (not add
+        // to / merge).
+        let mut state = mk_live_candle_state(105.0, 1_500_000, 5_000_000, 20_000_000);
+        state.close_pct_from_prev_day = 999.99;
+        state.oi_pct_from_prev_day = -88.88;
+        state.volume_pct_from_prev_day = 77.77;
+        let refs = PrevDayRefs {
+            prev_day_close: 100.0,
+            prev_day_oi: 1_000_000,
+            prev_day_total_volume: 10_000_000,
+        };
+        stamp_seal_pct_fields(&mut state, refs);
+        assert_eq!(state.close_pct_from_prev_day, 5.0);
+        assert_eq!(state.oi_pct_from_prev_day, 50.0);
+        assert_eq!(state.volume_pct_from_prev_day, 150.0);
     }
 }
