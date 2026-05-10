@@ -64,13 +64,15 @@ S3 archival exports detached partitions before removal (Plan Item 7, needs aws-s
    - Valkey: **512MB** (down from 1GB; token + instrument cache fits easily)
    - Prometheus: **384MB** (down from 512MB; 7d retention)
    - Grafana: **768MB** (down from 1GB)
+   - **Alertmanager: 256MB (KEPT — independent process, app-crash alert safety)**
    - Tickvault app: ~500MB
-   - Total Docker: ~3.7GB. Remaining: ~4.3GB for OS + buffer.
-   - **REMOVED in Wave 7-A:** Traefik (use AWS ALB free tier), Alertmanager (replaced by app `/webhook/prometheus` → teloxide direct), valkey-exporter (not queried).
+   - Total Docker: ~4.0GB. Remaining: ~4.0GB for OS + buffer.
+   - **REMOVED in Wave 7-A:** Traefik (use AWS ALB free tier), valkey-exporter (not queried).
    - **Already removed:** Jaeger, Loki, Alloy (saves 2.5GB RAM).
 7. **Manual starts budgeted at 20hr/month max.** If consistently exceeding, review schedule.
 8. **HTTP gateway:** Use AWS ALB (free tier 750 hrs/mo) for HTTPS termination, or app on port 3001 directly behind security group for internal-only access.
-9. **Alert routing:** Prometheus alerts route directly to tickvault app's `/webhook/prometheus` endpoint, which dispatches via the in-process teloxide Telegram client. No Alertmanager hop needed.
+9. **Alert routing:** Prometheus → Alertmanager → Telegram (standard pattern). Alertmanager runs as an independent container so app-crash alerts still reach the operator. Routing alerts through the app itself is a single-point-of-failure anti-pattern (rejected 2026-05-10).
+10. **NO manual configuration on AWS deployment** — every setting (memory, schedule, alerts, dashboards, audits) lives in version-controlled config files. `git clone` + `docker compose up -d` reproduces full stack identically on Mac dev and AWS prod.
 
 ## What This Prevents
 
@@ -80,6 +82,8 @@ S3 archival exports detached partitions before removal (Plan Item 7, needs aws-s
 - Forgetting Elastic IP charges when instance is stopped
 - Adding managed services that balloon the bill
 - S3 costs exploding (Intelligent-Tiering + Glacier keep cold data cheap)
+- App-crash alerts vanishing (Alertmanager independence prevents this)
+- Manual config drift between Mac and AWS (single compose file)
 
 ## Instance Schedule (Wave 7-A — 2026-05-10 update)
 
@@ -103,19 +107,19 @@ S3 archival exports detached partitions before removal (Plan Item 7, needs aws-s
 | 1 weekend day (8hr manual) | ₹121 |
 | 1 quick check (2hr manual) | ₹30 |
 
-## RAM Trim Audit (Wave 7-A, 2026-05-10)
+## RAM Trim Audit (Wave 7-A, 2026-05-10 — Alertmanager retained)
 
-| Service | Pre-Wave-6 | Post-Wave-7-A | Saved |
+| Service | Pre-Wave-7-A | Post-Wave-7-A | Saved |
 |---|---|---|---|
 | QuestDB | 4 GB | 2 GB | -2 GB |
 | Valkey | 1 GB | 512 MB | -512 MB |
 | Grafana | 1 GB | 768 MB | -256 MB |
 | Prometheus | 512 MB | 384 MB | -128 MB |
+| **Alertmanager** | 256 MB | **256 MB (KEPT)** | 0 |
 | Traefik | 512 MB | REMOVED | -512 MB |
-| Alertmanager | 256 MB | REMOVED | -256 MB |
 | Valkey-exporter | 128 MB | REMOVED | -128 MB |
-| **Total Docker** | **~7.4 GB** | **~3.7 GB** | **-3.7 GB** |
-| **Headroom on 8 GB** | ~600 MB | **~4.3 GB** | massive |
+| **Total Docker** | **~7.4 GB** | **~4.0 GB** | **-3.4 GB** |
+| **Headroom on 8 GB** | ~600 MB | **~4.0 GB** | massive |
 
 ## 100% Coverage Verification (after Wave 7-A trim)
 
@@ -124,13 +128,32 @@ S3 archival exports detached partitions before removal (Plan Item 7, needs aws-s
 | Tracking | QuestDB audit tables (15+) | ✅ KEEP |
 | Logging | tracing → errors.jsonl + CloudWatch Logs | ✅ KEEP local + add CW |
 | Monitoring | Prometheus (14 new metrics in Wave 6 plan) | ✅ KEEP |
-| Alerting | Direct: Prom → app `/webhook/prometheus` → teloxide | ✅ replaces Alertmanager |
+| Alerting | Prometheus → Alertmanager → Telegram (standard pattern) | ✅ KEEP (independent process) |
 | Auditing | QuestDB audit tables + S3 cold archive | ✅ KEEP |
 | Capturing | QuestDB ticks + candles | ✅ KEEP |
 | Visualizing | Grafana | ✅ KEEP |
 | Dashboards | Grafana operator-health single page | ✅ KEEP |
 | HTTP gateway | AWS ALB (free tier) | ✅ replaces Traefik |
 | Distributed tracing | CloudWatch X-Ray (optional, free tier 100K traces/mo) | ⚠️ optional |
+
+## Common Runtime / Dynamic / Scalable / Automated Charter (mandatory)
+
+Operator demand 2026-05-10: "extremely common runtime dynamic scalable approach,
+fully comprehensively automated, logged, tracked, captured, visualized, alerted,
+notified on Telegram, no manual inputs."
+
+| Demand | Mechanical enforcement |
+|---|---|
+| Common runtime | Same `docker-compose.yml` Mac dev = AWS prod (rule 10) |
+| Dynamic | EventBridge auto-start/stop, dynamic depth-20/200 selectors, dynamic Phase 2 dispatch, dynamic SLO score 10s |
+| Scalable | Bounded mpsc + spill ring + DLQ; horizontal: depth-20 5×50, depth-200 5×1; QuestDB partition manager prunes old data automatically |
+| Automated logging | tracing macros mandatory; ERROR auto-routes to Telegram via Alertmanager; hourly errors.jsonl rotation; 48h retention sweep auto |
+| Automated tracking | 15+ audit tables auto-INSERT on every typed event with DEDUP UPSERT KEYS |
+| Automated capturing | every tick auto-persists to QuestDB; spill NDJSON catches overflow; auto-replays on rehydration |
+| Automated visualizing | Grafana dashboards auto-provisioned via `grafana/provisioning/`; operator-health single-page renders without setup |
+| Automated alerting | Prometheus alert rules in `alerts.yml` evaluate every 30s; Alertmanager auto-routes by severity to Telegram |
+| Automated notifications | teloxide Telegram client + Alertmanager webhook; `Severity::High`/`Critical` auto-page operator |
+| No manual inputs | Boot sequence is fully automatic: bootstrap.sh pulls SSM → Docker compose up → app self-tests via `make doctor` → 3-tier fallback (cache → SSM → TOTP) → market-open self-test at 09:16:30 IST |
 
 ## Trigger
 
