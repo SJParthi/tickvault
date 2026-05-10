@@ -27,6 +27,7 @@ pub mod engine;
 pub mod engine_map;
 pub mod parity;
 pub mod pct_stamping;
+pub mod tf_index;
 
 pub use cascade::{
     run_cascade_1s, run_midnight_rollover_task_with_fanout, spawn_supervised_cascade_1s,
@@ -41,3 +42,4 @@ pub use parity::{InstrumentKey, ParityMismatch, ParityReport, compare_bars, swee
 pub use pct_stamping::{
     PrevDayRefs, compute_close_pct, compute_oi_pct, compute_volume_pct, stamp_bar_pct_fields,
 };
+pub use tf_index::TfIndex;
