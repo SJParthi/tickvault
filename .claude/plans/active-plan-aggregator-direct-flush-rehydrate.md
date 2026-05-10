@@ -1,442 +1,523 @@
-# Implementation Plan: Multi-TF In-Memory Aggregator + Direct Flush + Rehydrate-from-Ticks
+# Implementation Plan: Multi-TF In-Memory Aggregator + Direct Flush + Rehydrate-from-Ticks + Post-Market Cross-Verify
 
-**Status:** APPROVED (operator confirmed 2026-05-10, asked next session to execute)
+**Status:** APPROVED (operator confirmed 2026-05-10, this revision merges discussion deltas)
 **Date:** 2026-05-10
 **Approved by:** Parthiban (operator)
 **Wave:** 6 (post Wave-5 indices-only scope)
-**Branch:** to be created from `main` AFTER PR #548 merges (e.g. `claude/wave-6-aggregator-direct-flush`)
-**Scope size:** Multi-PR (4 sub-PRs minimum), 2-3 weeks calendar, ~3000-5000 LoC net
+**Branch:** to be created from `main` AFTER PR #548 merges (e.g. `claude/wave-6-pr1-multi-tf-aggregator`)
+**Scope size:** Multi-PR (4 sub-PRs), 2-3 weeks calendar, ~3000-5000 LoC net
+**Schedule assumption:** AWS instance runs **08:30 → 17:30 IST** (operator decision 2026-05-10; `aws-budget.md` to be updated separately if this becomes the new permanent schedule)
 
 ---
 
-## MANDATORY HONEST ENVELOPE QUALIFIER (per CLAUDE.md + wave-4-shared-preamble.md)
+## 🧒 Plain-English One-Liner (kid-friendly)
 
-> **100% inside the tested envelope, with ratcheted regression coverage:**
-> ≤60s QuestDB outage absorbed by rescue→spill→DLQ;
-> ≤2,000,000-tick ring buffer (`TICK_BUFFER_CAPACITY`, ratcheted by `zero_tick_loss_alert_guard.rs`);
-> ≤60s aggregator rehydration on cold boot (bench-gated);
-> bench-gated O(1) hot path (DHAT zero-alloc + Criterion p99 ≤100ns);
-> composite-key uniqueness `(security_id, exchange_segment)` per I-P1-11;
-> chaos-tested 65h Fri 16:00 IST → Mon 09:00 IST weekend sleep/wake.
-> **Beyond envelope:** DLQ NDJSON catches every tick as recoverable text.
-> **Outside envelope = disk-full or Dhan upstream outage; gap equals duration of that condition.**
+> Stop building candles by chaining 9 database "views" on top of each other (slow + fragile). Instead, build all 9 candle sizes (1m → 1d) in RAM directly from live ticks. Flush each finished candle straight to its own table at seal time (no cascade). On boot, replay missing ticks to catch up. After market close, fetch Dhan's authoritative 1m data for all ~11,045 instruments, zero-tolerance per-timestamp per-field cross-verify against our live aggregator, self-heal any mismatches via UPSERT, extract prev-day OHLCVOI from the last 1m candle. Persistent retry queue + 7-trading-day escalation cap means we **never silently drop an instrument**.
+
+---
+
+## 🎯 The 4 Sub-PRs (build order)
+
+| # | Sub-PR | Purpose | Branch | After |
+|---|---|---|---|---|
+| 1 | **Aggregator engine** | RAM-based 9 TFs, bounded mpsc, IST midnight + Muhurat boundary timer | `claude/wave-6-pr1-multi-tf-aggregator` | PR #548 merged |
+| 2 | **Rehydration** | Boot replays missing ticks, race-free buffer gate, fail-closed HALT | `claude/wave-6-pr2-rehydration` | PR1 merges |
+| 3 | **Post-market 1m fetch + cross-verify + self-heal** | Single big job at 15:30 IST: fetch → aggregate → verify → heal → extract prev-day | `claude/wave-6-pr3-postmarket-1m` | PR2 merges |
+| 4 | **Promotion** | Drop `candles_1s` + 9 mat views + LiveCandleWriter, rename shadow tables | `claude/wave-6-pr4-promote` | PR3 + 1 trading week zero-diff + 2 days clean |
+
+---
+
+## 📅 Final Daily Schedule
+
+| Time IST | Action | Notes |
+|---|---|---|
+| **08:30** | AWS auto-starts → app boots | EventBridge |
+| 08:31 | Token load, QuestDB DDL, universe load | 1 min |
+| 08:33 | Resume retry queue (if non-empty from yesterday) | reads `cross_verify_retry_queue` |
+| 08:33 → 09:13 | Retry queue drain + aggregator rehydration | 40 min carryover window |
+| 09:13 | Phase 2 dispatcher fires | Wave 5 indices-only scope |
+| 09:15 | Market opens — live aggregator runs in RAM | hot path |
+| 09:15 → 15:30 | Live trading + RAM aggregator + direct-flush at seal | — |
+| **15:30:00** | **🚀 Post-market 1m fetch fires immediately** | Tokio scheduled task |
+| 15:30 → 16:07 | 11,045 calls @ 5/sec rate limit | 37 min, 11% of daily Dhan quota |
+| 16:07 → 17:00 | Slow retry every 5 min for failed instruments | 53 min retry window |
+| 17:00 → 17:15 | Cross-verify + self-heal + prev_day OHLCVOI extract | 15 min |
+| 17:15 → 17:25 | Persist retry queue snapshot + write CSV mismatch file | 10 min |
+| 17:25 | Telegram daily summary | — |
+| **17:30** | AWS auto-stops | shutdown |
+| (overnight 15h) | OFF — queue + audit safe in QuestDB + S3 | — |
+
+---
+
+## 🌐 Universe Coverage (~11,045 instruments)
+
+The single Dhan REST endpoint `/v2/charts/intraday` covers ALL segments. Same fetcher code path, just different `exchangeSegment` + `instrument` params per call.
+
+| Segment | Approx count | Instrument types | OI meaningful? | Volume meaningful? |
+|---|---|---|---|---|
+| **IDX_I** (indices) | ~29 | NIFTY=13, BANKNIFTY=25, SENSEX=51 + 26 display indices | ❌ Always 0 | ⚠️ Synthetic |
+| **NSE_EQ** (cash equities) | ~216 | F&O underlying stock cash | ❌ Always 0 | ✅ Real |
+| **NSE_FNO** (NIFTY+BANKNIFTY all expiries) | ~7,500 | FUTIDX + OPTIDX | ✅ Real | ✅ Real |
+| **BSE_FNO** (SENSEX all expiries) | ~3,300 | FUTIDX + OPTIDX | ✅ Real | ✅ Real |
+| **TOTAL** | **~11,045** | | | |
+
+**Stock F&O:** NOT subscribed under Wave 5 indices-only scope. **BSE_EQ:** NOT subscribed today (Wave 7 if added). The fetcher is segment-agnostic — adding new segments later requires zero code change.
+
+---
+
+## 🔑 Honest 100% Charter (operator-locked, mandatory PR-body wording)
+
+> **"100% inside the tested envelope, with ratcheted regression coverage:**
 >
-> Literal "WebSocket never disconnects" / "QuestDB never fails" CANNOT be promised — TCP and OS physics make this impossible. The envelope above is the honest engineering guarantee.
+> - ≤60s QuestDB outage absorbed by rescue→spill→DLQ
+> - ≤2,000,000-tick ring buffer (`TICK_BUFFER_CAPACITY` ratcheted by `zero_tick_loss_alert_guard.rs`)
+> - bench-gated O(1) hot path (DHAT zero-alloc + Criterion p99 ≤100ns + ≤5% regression)
+> - composite-key uniqueness `(security_id, exchange_segment)` per I-P1-11
+> - chaos-tested 65h Fri 16:00 IST → Mon 09:00 IST weekend sleep/wake
+> - post-market 1m fetch + **zero-tolerance per-timestamp per-field cross-verify** + self-heal + 7-day retry escalation cap
+> - 7-layer observability per item (Prom counter+gauge + tracing + Loki + Telegram + Grafana + audit table)
+> - 22-category test ratchet + 100% line coverage threshold + adversarial 3-agent review
+> - SLO-01/02 real-time guarantee score @ 10s
+>
+> **Beyond envelope** (honest physics):
+>
+> - TCP can RST → we DETECT in ≤5s, reconnect with `SubscribeRxGuard`, sleep-until-open post-close
+> - Disk full → DLQ NDJSON catches every payload as recoverable text
+> - Dhan REST outage > 7 trading days → operator manual action (POSTMARKET-FATAL HALT)
+> - Contracts expiring instantly at 15:30:00 IST may move to Dhan's expired-options endpoint (Wave 7 fix pending Dhan support clarification)
+> - Outside envelope = honest gap equals duration of condition
+>
+> **Anything weaker than mechanical-ratchet enforcement = NOT 100%. Aspirational claims = REJECTED IN REVIEW."**
 
 ---
 
-## GOAL
+## 🛡️ The 15-Row 100% Mechanical Proof Matrix (every Wave 6 item carries this)
 
-Replace the `candles_1s` base table + 9 cascading materialized views with:
-1. A **multi-timeframe in-memory aggregator** that builds 9 TFs (1m, 5m, 15m, 30m, 1h, 2h, 3h, 4h, 1d) directly from raw ticks
-2. **Direct flush** of each sealed candle to per-TF QuestDB tables at seal time (no cascade)
-3. **Rehydration on boot** by replaying ticks from the latest sealed timestamp per (security_id, exchange_segment, TF)
-4. **Wave-5 % columns** stamped at seal time inside the aggregator (no cascade dependency)
-5. **Wall-clock timer-driven seal** for sparse F&O contracts (NSE midnight + Muhurat 17:30-18:30 IST aware)
-6. **Race-free** boot order: rehydrate → snapshot → start WS subscribe (live ticks buffered until rehydration completes)
-7. **Fail-closed** boot: if rehydration fails partially, HALT with Telegram CRITICAL — do NOT start strategy/greeks/depth on incomplete state
+| # | 100% demand | Mechanical proof artifact | Real-time check | Per-item gate |
+|---|---|---|---|---|
+| 1 | 100% code coverage | `quality/crate-coverage-thresholds.toml` 100% min/crate; `scripts/coverage-gate.sh` | post-merge llvm-cov | item PR includes coverage delta |
+| 2 | 100% audit coverage | `<event>_audit` per typed event with DEDUP UPSERT KEYS | `mcp__tickvault-logs__questdb_sql` | item adds/extends audit table |
+| 3 | 100% testing coverage | 22 test categories per `testing.md` | `cargo test --workspace` green | item declares which 22 |
+| 4 | 100% code checks | banned-pattern + pub-fn-test + pub-fn-wiring + plan-verify + secret-scan + 8 pre-commit gates | pre-push mandatory | all gates green |
+| 5 | 100% performance | DHAT zero-alloc + Criterion p99 budgets + bench-gate ≤5% | `cargo bench` + `bench-gate.sh` | DHAT test if hot path |
+| 6 | 100% monitoring | 7-layer telemetry (Prom counter+gauge + tracing span + Loki log + Telegram event + Grafana panel + audit table) | `mcp__tickvault-logs__run_doctor` | 9-box completes 7 layers |
+| 7 | 100% logging | tracing macros mandatory; ERROR → Telegram; hourly errors.jsonl rotation | tag-guard meta-test | every error has `code` field |
+| 8 | 100% alerting | `alerts.yml` Prom rule + `resilience_sla_alert_guard.rs` ratchet | `mcp__tickvault-logs__list_active_alerts` | item adds alert for new failure |
+| 9 | 100% security | banned-pattern + secret-scan + `Secret<T>` + security-reviewer agent | `cargo audit` post-deploy | item runs security-reviewer |
+| 10 | 100% security hardening | static IP + secret scan + `unused_must_use` lint | post-deploy IP verify | item declares attack-surface delta |
+| 11 | 100% bugs fixing | adversarial 3-agent review (proven 4-bug catch rate per PR #393) | pre-PR + post-impl | item runs all 3 agents |
+| 12 | 100% scenarios | 9-box + chaos test for new failure mode | chaos suite | item declares scenarios |
+| 13 | 100% functionalities | every pub fn has call site + test (`pub-fn-wiring-guard.sh` + `pub-fn-test-guard.sh`) | pre-push gates 6+11 | tests for every new pub fn |
+| 14 | 100% code review | adversarial 3-agent on diff before AND after impl | per-PR | item PR includes both passes |
+| 15 | 100% extreme check | all of above + ratchet tests fail build on regression | every commit | item adds ratchet test |
 
 ---
 
-## WHY (operator's principle, restated)
+## 🛡️ The 7-Row Resilience Demand Matrix (honest envelope)
 
-> "Ticks are source of truth. Trading reads from in-memory aggregator. DB is for replay/historical only. Save milliseconds for trading decisions."
-
-Today this principle is partially met (trading reads in-memory 1s aggregator, no DB touches for decisions), but higher timeframes derive on the DB side via mat views. After this work, ALL timeframes derive in-memory, and DB is purely a parallel persistence sink.
-
----
-
-## CRITICAL CONSTRAINTS DISCOVERED BY 3-AGENT REVIEW (2026-05-10)
-
-The agent research session caught FALSE PREMISES that any implementation MUST resolve. Each constraint maps to a sub-PR.
-
-| # | Severity | Finding | Resolution required in plan |
+| Demand | Honest envelope | What we cannot promise (physics) | Per-item proof |
 |---|---|---|---|
-| 1 | CRITICAL | `CandleAggregator` is 1-second only TODAY. CLAUDE.md's "21 TFs" is wrong about this code. | Sub-PR #1 must build new multi-TF aggregator from scratch. NOT a refactor. |
-| 2 | CRITICAL | Day-bucket seal must be wall-clock-timer driven (NSE midnight + Muhurat 17:30-18:30 IST). Currently tick-driven only. | Sub-PR #1 must include `BoundaryTimer` task per TF + `MuhuratCalendar`. |
-| 3 | CRITICAL | Rehydration ↔ live WS race window: ticks fed twice OR skipped during boot. | Sub-PR #2 must implement `LiveTickBufferGate` that holds live WS ticks until rehydration completes. |
-| 4 | CRITICAL | Partial rehydration → trading on incomplete data. | Sub-PR #2 must implement fail-closed boot halt + Telegram CRITICAL event. |
-| 5 | CRITICAL | `LiveCandleWriter::append_candle` is SYNCHRONOUS today. 9 TFs sealing simultaneously = blocks tick processor. | Sub-PR #1 must add bounded `mpsc::channel(N)` per TF + dedicated drain task. |
-| 6 | CRITICAL | Channel drop policy undefined. Default = silent block = SEV-1. | Sub-PR #1 must spec drop-newest + `tv_candle_writer_dropped_total{tf}` + edge-triggered Telegram. |
-| 7 | HIGH | `[LiveCandle; 9]` contiguous array per security required for cache locality. 9 random HashMap lookups per tick = TLB misses. | Sub-PR #1 aggregator state must be `papaya::HashMap<(u32, u8), [LiveCandle; 9]>`. |
-| 8 | HIGH | `last_cumulative_volume` tracker must stay shared across TFs (not duplicated 9×) for Item 28 session-reset. | Sub-PR #1 must enforce single shared `VolumeResetTracker` instance. |
-| 9 | HIGH | DEDUP doesn't tell rehydration "was last bucket sealed-and-flushed." Always replay from `MAX(ts) - 1 bucket`. | Sub-PR #2 rehydration contract must document this. |
-| 10 | HIGH | Multi-TF seal burst (1m+5m+15m+30m × 11K instruments = ~55K rows in one tick handler) → mpsc backpressure → tick loss. | Sub-PR #1 must spec mpsc capacity ≥ 65536 + spill-to-disk on overflow (mirror STORAGE-GAP-03 rescue-ring pattern). |
-| 11 | HIGH | 7 production code paths break + ~50 tests need rewrite. Wave-5 % cascade boot order needs redesign. | Sub-PR #4 mechanical cleanup. |
-| 12 | MEDIUM | Rehydration SELECT must STREAM (cursor), banned `.collect::<Vec>()`, MUST `ORDER BY ts ASC`, MUST `LIMIT N`. | Sub-PR #2 must use QuestDB PG-wire cursor or chunked `LIMIT/OFFSET`. |
-| 13 | MEDIUM | TF-specific replay watermark: `MAX(ts) + 1 minute` for 1m, `+ 1 day` for 1d, NOT a single watermark. | Sub-PR #2 watermark fn signature: `fn replay_start(tf: Timeframe, latest_seal_ts: i64) -> i64`. |
-| 14 | MEDIUM | App runs on host (no Docker `mem_limit`). OOM risk during rehydration. | Sub-PR #2 must add `MAX_REHYDRATION_TICKS` cap + benchmark RSS. |
-| 15 | MEDIUM | DDL `execute_ddl_check_stale` allow-list still missing. | Sub-PR #1 must add compile-time allow-list (`&'static str` enum). |
+| Zero ticks lost | BOUNDED zero loss inside chaos envelope: ring 2M → spill NDJSON → DLQ | Disk-full unbounded → spill grows → eventual drop | item must not introduce new tick-drop path |
+| WS never disconnects | DETECT ≤5s, reconnect with `SubscribeRxGuard`, sleep-until-open post-close | TCP RST anytime; OS preempt; Dhan can drop | item must not break SubscribeRxGuard or pool watchdog |
+| Never slow/locked/hanged | DHAT ≤4 alloc/8KB across 10K calls; Criterion p99 ≤100ns; tick-gap >30s Telegram | OS scheduler can preempt → we DETECT, we don't PREVENT | item must not add hot-path allocation |
+| QuestDB never fails | ABSORB ≤60s outage via 3-tier rescue→spill→DLQ + schema self-heal | Remote process; cannot prevent its failures | item must not break self-heal |
+| O(1) latency | `from_le_bytes` + `papaya` + `Arc<HashMap>` + SPSC bounded; bench-gate ≤5% | Drift returns within 1 month without ratchet | item adds Criterion bench if hot path |
+| Uniqueness + dedup | Composite `(security_id, exchange_segment)` per I-P1-11 + DEDUP UPSERT KEYS + meta-guard | Without composite key, 2026-04-17 production bug recurs | item DEDUP key includes segment |
+| Real-time proof | 7-layer telemetry + SLO-01/02 @ 10s + market-open self-test @ 09:16:30 IST | None — fully mechanical | item ratchet pins all 7 layers |
 
 ---
 
-## RECOMMENDED APPROACH: SHADOW-TABLE SPIKE (per agent recommendation)
+## 🤖 Automation Charter (every Claude session inherits)
 
-**Do NOT big-bang.** The agents found 6 CRITICAL findings, all NEW code. Validate against production via shadow tables for 1 trading week before promotion.
-
-| Phase | What runs in parallel | Verification | Duration |
-|---|---|---|---|
-| Phase 1 | Existing mat views (production) + new aggregator writes to `candles_1m_shadow`, `candles_5m_shadow`, ..., `candles_1d_shadow` | Cross-verify daily: `SELECT * FROM candles_1m EXCEPT SELECT * FROM candles_1m_shadow` → must be empty | 1 trading week |
-| Phase 2 | Switch reads to shadow tables. Mat views still write but unread. | Monitor for 2 days | 2 trading days |
-| Phase 3 | Drop mat views + `candles_1s` + `LiveCandleWriter`. Rename shadow tables to canonical. | Promotion | atomic |
-
----
-
-## SUB-PR SEQUENCING (4 PRs, must merge in order)
-
-### Sub-PR #1 — New multi-TF aggregator + bounded mpsc + boundary timer + Muhurat calendar
-**Branch:** `claude/wave-6-pr1-multi-tf-aggregator`
-**Files (NEW):**
-- `crates/core/src/pipeline/multi_tf_aggregator.rs` — new aggregator with `[LiveCandle; 9]` per security
-- `crates/core/src/pipeline/boundary_timer.rs` — wall-clock timer task per TF
-- `crates/common/src/muhurat_calendar.rs` — Diwali Muhurat session detection
-- `crates/storage/src/multi_tf_writer.rs` — bounded mpsc(65536) per TF + drain task + drop-newest + `tv_candle_writer_dropped_total{tf}`
-- `crates/storage/src/aggregator_spill.rs` — STORAGE-GAP-03-mirror spill-to-disk on writer overflow
-
-**Files (MODIFIED):**
-- `crates/core/src/pipeline/mod.rs` (export new modules)
-- `Cargo.toml` (no new deps expected)
-
-**Files (NOT TOUCHED yet):** existing `candle_aggregator.rs`, `LiveCandleWriter`, mat views, `candles_1s` — runs in parallel.
-
-**Deliverables:**
-- Multi-TF aggregator builds 9 TFs in-memory from tick stream
-- Wave-5 % columns computed at seal time per TF (`prev_day_cache_loader.rs::populate_prev_day_cache_at_boot` MUST run BEFORE aggregator spawn — boot order verified by ratchet)
-- Wall-clock timer seals 1d at IST midnight + each hourly at the hour, regardless of tick presence
-- Muhurat calendar correctly seals 1d bar that includes both regular (09:15-15:30) and Muhurat (17:30-18:30) sessions on Diwali
-- Bounded mpsc + drop-newest policy + counter + Telegram on drop edge
-- Spill-to-disk on writer overflow (NDJSON, mirror tick spill pattern)
-- Writes go to `candles_*_shadow` tables (NOT yet replacing canonical)
-- DEDUP UPSERT KEYS `(ts, security_id, exchange_segment)` on every shadow table
-
-**Tests:**
-- Unit: 9-TF seal at 09:30:00 boundary = exactly 4 candles per security (1m, 5m, 15m, 30m)
-- Unit: 1d seal at IST midnight via timer (no tick)
-- Unit: Muhurat session 17:30-18:30 included in same-day 1d bar
-- Property: `aggregate(ticks[0..N]) == aggregate(replay(ticks[0..N]))` (purity)
-- DHAT zero-alloc: aggregator hot path ≤4 alloc blocks/8KB across 10K calls
-- Criterion: p99 per-tick aggregator update ≤100ns
-- Loom: concurrent aggregator + writer drain task — no data race
-- Integration: shadow-table writes match mat-view production output for fixture day
-
-**Verification gates:** all 22 test categories per `testing.md` for affected crates.
-
-### Sub-PR #2 — Rehydration boot path + race gate + fail-closed boot halt
-**Branch:** `claude/wave-6-pr2-rehydration`
-**Depends on:** Sub-PR #1 merged
-**Files (NEW):**
-- `crates/core/src/pipeline/rehydration.rs` — boot rehydration logic
-- `crates/core/src/pipeline/live_tick_buffer_gate.rs` — buffer live WS ticks until rehydration completes
-- `crates/storage/src/aggregator_rehydration_audit.rs` — audit table writer
-
-**Files (MODIFIED):**
-- `crates/app/src/main.rs` (boot sequence: rehydrate → snapshot → unblock buffer gate → WS subscribe)
-- `crates/storage/src/materialized_views.rs` (add `aggregator_rehydration_audit` table DDL)
-
-**Boot order (MUST be exact):**
-1. QuestDB ready (`BOOT-01`)
-2. Wave-5 prev_day_cache loaded (`PREVCLOSE-04`) — must precede aggregator
-3. Multi-TF aggregator spawned, empty state
-4. WS connection pool created BUT subscribe deferred (live tick buffer gate active)
-5. **Rehydration:** for each TF, `SELECT max(ts) FROM candles_<tf>_shadow GROUP BY security_id, exchange_segment` → for each `(sid, segment, tf, max_ts)`, replay `SELECT * FROM ticks WHERE ts >= max_ts - 1_bucket ORDER BY ts ASC LIMIT MAX_REHYDRATION_TICKS` (streaming cursor)
-6. Aggregator state validated (all expected sids covered, no NaN values)
-7. **Audit row written** to `aggregator_rehydration_audit`
-8. **Telegram:** `AggregatorRehydrationComplete` (Severity::Info) with counts
-9. **Live tick buffer gate UNLOCKED** — buffered ticks drain through aggregator in ts order
-10. WS subscribe fires
-11. Normal operation resumes
-
-**Fail-closed paths:**
-- Rehydration takes > `REHYDRATION_DEADLINE_SECS` (default 300s = 5min) → HALT + `AggregatorRehydrationFailed` Telegram CRITICAL
-- Rehydration finds inconsistent state (e.g., orphan candle without recent tick) → HALT
-- `MAX_REHYDRATION_TICKS` cap hit per (sid, tf) → HALT (indicates ticks table corruption or impossibly large gap)
-- Wave-5 prev_day_cache empty AND market hours → HALT (cannot stamp % columns correctly)
-
-**New ErrorCodes (must add to `crates/common/src/error_code.rs` + runbook in `wave-6-error-codes.md`):**
-- `REHYDRATE-01` Rehydration started (Info)
-- `REHYDRATE-02` Rehydration completed (Info)
-- `REHYDRATE-03` Rehydration deadline exceeded — HALT (Critical)
-- `REHYDRATE-04` Rehydration partial state inconsistency — HALT (Critical)
-- `REHYDRATE-05` `MAX_REHYDRATION_TICKS` cap hit — HALT (Critical)
-- `BUFFER-GATE-01` Live tick buffer gate held live ticks (Info, debug)
-- `BUFFER-GATE-02` Live tick buffer overflow — drop policy fired (High)
-
-**Tests:**
-- Property: post-rehydration aggregator state == pre-crash aggregator state (deterministic from ticks)
-- Chaos: simulate crash at every minute boundary in a 6h trading session, verify rehydration recovers identical state
-- Chaos: simulate QDB timeout mid-rehydration → assert HALT + Telegram fires
-- Chaos: simulate ticks table corruption (missing rows) → assert HALT
-- Integration: shadow-table cross-verify after rehydration matches pre-crash
-
-### Sub-PR #3 — Cross-verify + Grafana migration to shadow tables
-**Branch:** `claude/wave-6-pr3-readers-migrate`
-**Depends on:** Sub-PR #2 merged + 1 trading week of shadow-vs-canonical zero-diff verification
-**Files (MODIFIED):**
-- `crates/core/src/historical/cross_verify.rs` (point queries at shadow tables OR keep mat-view comparison as a triple-check)
-- `crates/core/src/pipeline/prev_oi_cache.rs` (verify `candles_1d` schema parity, no change if compatible)
-- Grafana dashboards under `deploy/docker/grafana/dashboards/` (point candle panels at shadow tables)
-
-**Verification:**
-- Manual review of every Grafana panel's data source
-- Daily zero-diff cross-verify report posted to Telegram for 2 trading days
-
-### Sub-PR #4 — Promotion: drop candles_1s + LiveCandleWriter + 9 mat views, rename shadow tables to canonical
-**Branch:** `claude/wave-6-pr4-promote`
-**Depends on:** Sub-PR #3 merged + 2 trading days clean
-**Files (DELETED):**
-- `crates/storage/src/candle_persistence.rs::LiveCandleWriter` impl (lines 360-578)
-- 9 mat-view DDL blocks in `crates/storage/src/materialized_views.rs`
-- `crates/storage/src/materialized_views.rs::CANDLES_1S_TABLE_SQL`
-- `crates/storage/src/materialized_views.rs::CANDLES_1S_DEDUP_SQL`
-- `crates/common/src/constants.rs::QUESTDB_TABLE_CANDLES_1S`
-- `crates/storage/src/partition_manager.rs:74` (remove `candles_1s` from `DAY_PARTITIONED_TABLES`)
-- `crates/app/src/main.rs:1679-1684, 2832-2838, 7263-7284` (LiveCandleWriter spawn sites)
-- `crates/storage/tests/grafana_query_tests.rs:252` (`schema_candles_1s_table`)
-- `crates/core/tests/websocket_protocol_e2e.rs:743` (`assert_eq!(QUESTDB_TABLE_CANDLES_1S, "candles_1s")`)
-- ~50 unit tests in `materialized_views.rs::tests` (`candles_1s_ddl_*`, `test_candles_1s_*`)
-
-**Files (MODIFIED — RENAME):**
-- `candles_1m_shadow` → `candles_1m`, etc. for all 9 TFs (atomic QuestDB rename if supported, else CREATE+COPY+SWAP+DROP)
-
-**Banned-pattern hook update:**
-- Add `.claude/hooks/banned-pattern-scanner.sh` category 7: rejects any new `candles_1s` reference, any new `LiveCandleWriter`, any `mat_view` for candle aggregation
-
-**Verification:**
-- `cargo check --workspace` clean
-- `cargo test --workspace` all green (after deletion of dead tests)
-- Banned-pattern scan green
-- Grafana dashboards render
-- 1 trading day post-promotion observation
-
----
-
-## PER-ITEM 15-ROW MANDATORY GUARANTEE MATRIX (per per-wave-guarantee-matrix.md)
-
-Every sub-PR (#1, #2, #3, #4) MUST carry this matrix before merge. Mechanical enforcement: `bash .claude/hooks/per-item-guarantee-check.sh` (exit 2 = block).
-
-| Demand | Mechanical proof artefact | Real-time check | Per-item gate |
-|---|---|---|---|
-| 100% code coverage | `quality/crate-coverage-thresholds.toml` 100% min per crate | post-merge llvm-cov | item PR includes coverage delta |
-| 100% audit coverage | `aggregator_rehydration_audit` + `multi_tf_writer_drop_audit` tables | `mcp__tickvault-logs__questdb_sql` | item adds/extends audit table |
-| 100% testing coverage | 22 test categories per `testing.md` | `cargo test --workspace` green | item declares which 22 it covers |
-| 100% code checks | banned-pattern + pub-fn-test + pub-fn-wiring + plan-verify + secret-scan + 8 pre-commit gates | pre-push mandatory | all gates green |
-| 100% performance | DHAT ≤4 alloc/8KB across 10K calls + Criterion p99 ≤100ns + bench-gate ≤5% regression | `cargo bench` + `scripts/bench-gate.sh` | DHAT test mandatory |
-| 100% monitoring | 7-layer: Prom counter + gauge + tracing span + Loki log + Telegram event + Grafana panel + audit table | `mcp__tickvault-logs__run_doctor` | 9-box completes 7 layers |
-| 100% logging | `tracing` macros mandatory; ERROR → Telegram via Loki | hourly errors.jsonl rotation | every error path uses `error!` with `code` |
-| 100% alerting | Prom rule in `alerts.yml` + `resilience_sla_alert_guard.rs` ratchet | `mcp__tickvault-logs__list_active_alerts` | item adds alert |
-| 100% security | banned-pattern + secret-scan + `Secret<T>` + security-reviewer agent | `cargo audit` post-deploy | item runs security-reviewer |
-| 100% security hardening | DDL allow-list + pre-commit secret scan + `unused_must_use` lint | post-deploy IP verify | item declares attack-surface delta |
-| 100% bug fixing | adversarial 3-agent review (proven pattern from this session) | pre-PR + post-impl agent pass | item runs all 3 agents |
-| 100% scenario coverage | 9-box + chaos test for new failure mode | chaos suite | item declares scenarios |
-| 100% functionality coverage | every pub fn has call site + test | pre-push gates 6+11 | item adds tests for every pub fn |
-| 100% code review | adversarial 3-agent on diff before AND after impl | per-PR | item PR includes both passes |
-| 100% extreme check | all of above + ratchet tests fail build on regression | every commit | item adds ratchet test |
-
-## PER-ITEM 7-ROW RESILIENCE DEMAND MATRIX
-
-| Demand | Honest envelope | Per-item proof |
+| Need | Auto-available tool | When |
 |---|---|---|
-| Zero ticks lost | Bounded zero loss inside chaos envelope: ring 2M → spill NDJSON → DLQ | item must not introduce new tick-drop path |
-| WS never disconnects | DETECT ≤5s, reconnect with `SubscribeRxGuard`, sleep-until-open post-close | item must not break SubscribeRxGuard or pool watchdog |
-| Never slow/locked/hanged | DHAT ≤4 alloc/8KB across 10K; Criterion p99 ≤100ns; tick-gap >30s Telegram; core_affinity Core 0 | item must not add hot-path allocation |
-| QuestDB never fails | ABSORB via 3-tier rescue→spill→DLQ + schema self-heal | item must not break self-heal |
-| O(1) latency | `from_le_bytes` + `papaya` + `Arc<HashMap>` + SPSC bounded; bench-gate ≤5% regression | item adds Criterion bench if hot path |
-| Uniqueness + dedup | Composite `(security_id, exchange_segment)` per I-P1-11 + DEDUP UPSERT KEYS + meta-guard | item DEDUP key includes segment |
-| Real-time proof | 7-layer telemetry + SLO-01/SLO-02 @ 10s + market-open self-test @ 09:16:30 IST | item ratchet pins all 7 layers |
+| Health check | `mcp__tickvault-logs__run_doctor` | session start, before code |
+| Tail recent ERRORs | `mcp__tickvault-logs__tail_errors` | investigating any failure |
+| Find runbook for ErrorCode | `mcp__tickvault-logs__find_runbook_for_code` | emitting/referencing an ERROR |
+| Live Prometheus query | `mcp__tickvault-logs__prometheus_query` | verifying counter increments |
+| Live QuestDB SQL | `mcp__tickvault-logs__questdb_sql` | verifying table writes / DEDUP |
+| Live Grafana panel | `mcp__tickvault-logs__grafana_query` | verifying dashboard renders |
+| Detect novel errors | `mcp__tickvault-logs__list_novel_signatures` | after ERROR-emitting change |
+| Source-grep | `mcp__tickvault-logs__grep_codebase` | faster than spawning agent |
+| Latest summary | `mcp__tickvault-logs__summary_snapshot` | session start |
+| Active Prom alerts | `mcp__tickvault-logs__list_active_alerts` | before opening PR |
+| Local app log tail | `mcp__tickvault-logs__app_log_tail` | debugging runtime issues |
+| Triage log tail | `mcp__tickvault-logs__triage_log_tail` | reviewing auto-fix outcomes |
+| Docker container status | `mcp__tickvault-logs__docker_status` | when service OFFLINE |
+| AWS access | `aws` CLI + SSM `/tickvault/<env>/<key>` | on-demand |
+
+**Mandatory automation steps at session start (BEFORE TodoWrite, BEFORE code):**
+1. Run `mcp__tickvault-logs__run_doctor` — capture current health
+2. Run `mcp__tickvault-logs__summary_snapshot` — read recent ERROR signatures
+3. Run `mcp__tickvault-logs__list_active_alerts` — fail loudly if anything red
+4. Run `bash .claude/hooks/session-auto-health.sh` if present
+5. Read `data/logs/session-auto-health.latest.txt` if present
 
 ---
 
-## NEW PROMETHEUS METRICS
+## 🧪 Adversarial 3-Agent Review Protocol (mandatory per sub-PR)
 
-| Metric | Type | Labels | Purpose |
-|---|---|---|---|
-| `tv_multi_tf_aggregator_ticks_consumed_total` | counter | tf | Per-TF tick processing rate |
-| `tv_multi_tf_aggregator_seals_total` | counter | tf, source (timer\|tick) | Per-TF seal events |
-| `tv_multi_tf_writer_dropped_total` | counter | tf, reason (channel_full\|spill_full) | Drop policy fired |
-| `tv_multi_tf_writer_spill_bytes_total` | counter | tf | Spill-to-disk volume |
-| `tv_multi_tf_writer_pending_in_channel` | gauge | tf | Channel depth real-time |
-| `tv_aggregator_rehydration_total` | counter | result (complete\|failed\|deadline) | Boot rehydration outcomes |
-| `tv_aggregator_rehydration_seconds` | gauge | — | Last rehydration duration |
-| `tv_aggregator_rehydration_ticks_replayed` | gauge | — | Last rehydration tick count |
-| `tv_live_tick_buffer_gate_buffered` | gauge | — | Live ticks held in buffer (real-time) |
-| `tv_live_tick_buffer_gate_drain_seconds` | gauge | — | Time to drain buffer post-rehydration |
+For ANY decision touching > 3 crates or > 1,000 LoC:
 
----
-
-## NEW TELEGRAM EVENTS
-
-| Event | Severity | When |
+| Agent | Role | Report cap |
 |---|---|---|
-| `MultiTfAggregatorReady` | Info | Boot, after rehydration completes |
-| `AggregatorRehydrationComplete` | Info | Boot success with counts |
-| `AggregatorRehydrationFailed` | Critical | Boot failure → HALT |
-| `MultiTfWriterDrop` | High | Edge-triggered when drop counter increments after silence window |
-| `MultiTfWriterSpill` | Medium | Spill-to-disk fired |
-| `BoundaryTimerSealed` | Info (debug) | Wall-clock timer sealed bucket without tick (sparse F&O) |
-| `MuhuratSessionDetected` | Info | Diwali Muhurat day boot, scheduler armed |
-| `ShadowTableDiff` | High | Daily cross-verify diff between shadow and mat-view production output |
+| `hot-path-reviewer` | Hot-path violations: `.clone`, `Vec::new`, `format!`, `Box`, `dyn`, unbounded channels | under 400 words |
+| `security-reviewer` | Secret exposure in logs/labels, ILP injection, path traversal, unsafe blocks, missing input sanitization | under 400 words |
+| `general-purpose` (hostile bug-hunt) | Race conditions, daily-reset collisions, missing market-hours gate, missing edge-trigger, flush/persist using `warn!` instead of `error!`, counters shown raw without `increase()`, pub fn defined-but-never-called, false-OK class bugs | under 600 words |
+
+Wait for ALL THREE reports. Synthesize into verdict table: CRITICAL / HIGH / MEDIUM / LOW / FALSE-POSITIVE. Fix every CRITICAL and HIGH inline BEFORE opening the PR. After implementation lands green, run the SAME 3 agents again as adversarial review on the diff.
 
 ---
 
-## NEW GRAFANA PANELS
+## 📦 Per-Item 12-Box Done Matrix (every Wave 6 item must tick all 12)
 
-- Per-TF seal rate (rate panel, 9 series)
-- Aggregator rehydration duration (last 30 boots, single bar chart)
-- Multi-TF writer pending-in-channel (gauge, 9 series, with red threshold at 80% capacity)
-- Shadow vs canonical diff count over time (Phase 1-2 only)
-- Boundary timer fires per TF (counter, 9 series)
-- Live tick buffer gate buffered count (gauge with red threshold)
+| Box | Meaning | Proof |
+|---|---|---|
+| 1. Implemented | Code merged | git SHA |
+| 2. Unit tested | `#[test]` happy + edge cases | test names |
+| 3. Integration tested | end-to-end flow | test file |
+| 4. Property tested | `proptest` input space (where applicable) | proptest name |
+| 5. DHAT zero-alloc | hot path 0 alloc | dhat test (hot path only) |
+| 6. Criterion bench | p99 budget pinned | budget toml entry (hot path only) |
+| 7. Chaos tested | failure-mode coverage | chaos file name |
+| 8. Prom counter + Grafana panel | telemetry visible | metric + panel name |
+| 9. Telegram event + alert rule | operator paged | event variant + alert |
+| 10. Audit table written | SEBI trail | table + DEDUP key |
+| 11. `make doctor` green | real-time check | doctor section |
+| 12. Adversarial 3-agent review | hot-path + security + bug-hunt | review SHA |
+
+**Status sticker per item:** 🟢 12/12 · 🟡 partial · 🔴 not started
 
 ---
 
-## NEW PROMETHEUS ALERTS
+## 🏗️ Sub-PR #1 — Aggregator Engine
 
-```yaml
-- alert: tv-multi-tf-writer-dropping
-  expr: rate(tv_multi_tf_writer_dropped_total[5m]) > 0
-  for: 60s
-  severity: high
+| # | Item | Detail |
+|---|---|---|
+| 1.1 | RAM-based 9-TF aggregator | `[LiveCandle; 9]` array per `(security_id, exchange_segment)` in `papaya::HashMap` |
+| 1.2 | Bounded mpsc channel | capacity 65,536, drop-newest policy |
+| 1.3 | Boundary timer | IST midnight + Diwali Muhurat (17:30-18:30 IST) inclusion via `TradingCalendar` |
+| 1.4 | Direct-flush at seal | sealed candle → 9 shadow tables via DEDUP UPSERT KEYS `(ts, security_id, exchange_segment)` |
+| 1.5 | Wave-5 pct-stamping at seal | reads `previous_day` for `close_pct_from_prev_day`, `oi_pct_from_prev_day`, `volume_pct_from_prev_day` |
+| 1.6 | DHAT zero-alloc + Criterion p99 ≤100ns | hot-path budgets pinned in `quality/benchmark-budgets.toml` |
+| 1.7 | Property tests for aggregation | proptest: 1m × 5 → 5m, 1m × 15 → 15m, etc. (all 9 TFs) |
 
-- alert: tv-aggregator-rehydration-failed
-  expr: increase(tv_aggregator_rehydration_total{result="failed"}[1d]) > 0
-  for: 0s
-  severity: critical
+**Done matrix:** 🔴 0/12
 
-- alert: tv-aggregator-rehydration-slow
-  expr: tv_aggregator_rehydration_seconds > 60
-  for: 0s
-  severity: high
+---
 
-- alert: tv-shadow-table-diff
-  expr: tv_shadow_table_diff_total > 0
-  for: 0s
-  severity: high
+## 🏗️ Sub-PR #2 — Rehydration On Boot
+
+| # | Item | Detail |
+|---|---|---|
+| 2.1 | Boot-time replay | reads latest sealed timestamp per `(security_id, segment, TF)` from shadow tables, replays missing ticks |
+| 2.2 | Race-free buffer gate | live ticks buffered in mpsc until rehydration completes; gate flipped before WS subscribe |
+| 2.3 | Fail-closed HALT | if rehydration fails after 3 retries → app refuses to start; Telegram CRITICAL |
+| 2.4 | 60s rehydration budget | bench-gated via `tv_aggregator_rehydration_seconds` Prom histogram |
+| 2.5 | Idempotent on multiple boots | rehydration is pure function of ticks table state |
+| 2.6 | Tracing span per phase | `#[instrument]` on rehydration entry + per-instrument span |
+
+**Done matrix:** 🔴 0/12
+
+---
+
+## 🏗️ Sub-PR #3 — Post-Market 1m Fetch + Cross-Verify + Self-Heal (THE BIG ONE)
+
+| # | Item | Detail |
+|---|---|---|
+| 3.1 | Trigger at 15:30:00 IST sharp | Tokio scheduled task (uses `TradingCalendar` to skip non-trading days) |
+| 3.2 | Rate-limited fetcher | 5 calls/sec via `governor` GCRA; respects Dhan Data API limit |
+| 3.3 | Endpoint locked | `POST /v2/charts/intraday` with `interval="1"`, `oi=true`, `fromDate=today`, `toDate=today` (NOT 5/15/25/60 — banned) |
+| 3.4 | 11K calls in ~37 min best case | 11,045 / 5 = ~2209s = ~37 min |
+| 3.5 | Per-instrument retry strategy | 6 quick retries (1s → 32s exponential) → slow retry every 5 min until 17:00 IST |
+| 3.6 | **Persistent retry queue** | failed instruments → `cross_verify_retry_queue` QuestDB table with DEDUP UPSERT KEYS `(trading_date_ist, security_id, exchange_segment)` |
+| 3.7 | **Resume on every boot** | 08:33 next day reads queue, resumes retry; 1h 27min before 09:13 Phase 2 |
+| 3.8 | **7-trading-day hard escalation cap** | if same instrument unfetched after 7 trading days → POSTMARKET-FATAL → HALT next boot, operator manual |
+| 3.9 | Dhan error code routing | DH-904/805/807/901 retried with backoff; DH-905/906/907 escalated immediately (our bug, never silent retry) |
+| 3.10 | Idempotent re-run | killed mid-fetch → restart from last completed instrument via queue state |
+| 3.11 | Local aggregation 1m → 5m/15m/30m/1h/2h/3h/4h/1d | deterministic rollup; we DO NOT fetch higher TFs from Dhan |
+| 3.12 | **Zero-tolerance per-timestamp per-field cross-verify** | for each `(security_id, segment, candle_ts)` × 6 fields (O/H/L/C/V/OI) → exact compare; ANY delta = mismatch |
+| 3.13 | Mismatch detection scope | **1m candles only** (vs Dhan 1m fetch); higher TFs by-construction correct after self-heal |
+| 3.14 | Self-heal | UPSERT Dhan's value into shadow tables; re-aggregate 1m → 5m/15m/etc. for affected timestamps |
+| 3.15 | Extract prev_day OHLCVOI from last 1m candle | `previous_day` table populated for tomorrow's pct-stamping |
+| 3.16 | **Four-sink output design** | (1) Telegram summary (~25 lines, references CSV path) (2) CSV at `/data/cross-verify/{date}-mismatches.csv` (3) `cross_verify_mismatch_audit` QuestDB table (4) errors.jsonl + Loki for MCP access |
+| 3.17 | Telegram daily summary | "Fetched X/11045, Mismatches Y, Self-healed Z, CSV: path, Top 5: ..." |
+| 3.18 | Two distinct checks | (a) Fetch Completeness (X/11045 succeeded) (b) Mismatch Detection (Y per-field deltas found) — never conflated |
+
+**Done matrix:** 🔴 0/12
+
+---
+
+## 🏗️ Sub-PR #4 — Promotion (Atomic Cutover)
+
+| # | Item | Detail |
+|---|---|---|
+| 4.1 | Drop `candles_1s` base table | banned-pattern guard added |
+| 4.2 | Drop 9 cascading materialized views | dead code |
+| 4.3 | Drop `LiveCandleWriter` | dead code |
+| 4.4 | Rename shadow tables to canonical | `candles_1m_shadow` → `candles_1m`, etc. |
+| 4.5 | Migrate Grafana panels | point to renamed tables |
+| 4.6 | Banned-pattern: `candles_1s` reference | `banned-pattern-scanner.sh` blocks any future re-add |
+| 4.7 | Pre-promotion gate | 1 trading week of zero-diff cross-verify + 2 days clean |
+
+**Done matrix:** 🔴 0/12
+
+---
+
+## 🗄️ NEW QuestDB Tables (2 new, this plan)
+
+### `cross_verify_retry_queue`
+
 ```
+ts TIMESTAMP,
+trading_date_ist DATE,
+security_id INT,
+exchange_segment SYMBOL,
+attempts INT,
+last_error STRING,
+last_attempt_ts TIMESTAMP,
+status SYMBOL  -- 'pending' | 'succeeded' | 'escalated'
+DEDUP UPSERT KEYS(trading_date_ist, security_id, exchange_segment)
+```
+
+Survives reboots. Resumed on every boot. SEBI 5y retention via S3 cold tier.
+
+### `cross_verify_mismatch_audit`
+
+```
+ts TIMESTAMP,                          -- when verify ran
+trading_date_ist DATE,
+security_id INT,
+exchange_segment SYMBOL,
+candle_ts TIMESTAMP,                   -- the 1m bucket where mismatch found
+timeframe SYMBOL,                      -- '1m' (only TF cross-verified vs Dhan)
+field SYMBOL,                          -- 'open'|'high'|'low'|'close'|'volume'|'open_interest'
+our_value DOUBLE,
+dhan_value DOUBLE,
+delta DOUBLE,
+healed_at TIMESTAMP                    -- when self-healed via UPSERT
+DEDUP UPSERT KEYS(trading_date_ist, security_id, exchange_segment, candle_ts, timeframe, field)
+```
+
+Per-timestamp per-field forensic record. Grafana panel + MCP query support. SEBI 5y retention.
+
+---
+
+## 📂 NEW File / Path Layout
+
+| Path | Purpose | Retention |
+|---|---|---|
+| `/data/cross-verify/{YYYY-MM-DD}-mismatches.csv` | Per-day forensic CSV (operator + Claude session offline review) | 90d local → S3 cold (5y SEBI) |
+| `/data/cross-verify/latest.csv` | Symlink to most-recent CSV | always |
+| `cross_verify_retry_queue` (QuestDB) | Pending retries | until empty + 7d archive |
+| `cross_verify_mismatch_audit` (QuestDB) | Structured mismatch record | 90d hot → S3 cold (5y) |
+
+**CSV schema:** `trading_date_ist, security_id, exchange_segment, symbol, candle_ts, field, our_value, dhan_value, delta, healed_at, heuristic_cause`
+
+---
+
+## 📱 Telegram Summary Template (compact, ~25 lines, ~600 chars)
+
+```
+🔍 Cross-Verify Report — 2026-05-08
+
+✅ Fetched: 11,045 / 11,045 instruments (100%)
+✅ Cross-verified: 1m candles only (zero tolerance)
+⚠️ Comparisons: 24,756,750 (375 bars × 6 fields × 11,045)
+🟡 Mismatches: 1,247 detected & healed
+🩹 Self-healed: 1,247 / 1,247 (100%)
+
+📋 Full CSV: /data/cross-verify/2026-05-08-mismatches.csv
+🗄️ SQL: SELECT * FROM cross_verify_mismatch_audit WHERE trading_date_ist='2026-05-08'
+
+Top 5 by mismatch count:
+  • SBIN NSE_EQ — 78
+  • HDFCBANK NSE_EQ — 62
+  • RELIANCE NSE_EQ — 51
+  • NIFTY26MAY24500CE NSE_FNO — 28
+  • BANKNIFTY26MAY54000PE BSE_FNO — 19
+
+Likely cause (heuristic): WS disconnect 14:23-14:26 IST
+```
+
+---
+
+## 🚨 ErrorCodes (14 total — pinned in `wave-6-error-codes.md` runbook section)
+
+| Code | Severity | Trigger |
+|---|---|---|
+| REHYDRATE-01 | High | Rehydration query failed |
+| REHYDRATE-02 | High | Rehydration timeout (>60s) |
+| REHYDRATE-03 | Critical | Rehydration retry exhausted → HALT |
+| REHYDRATE-04 | High | Buffer gate stuck |
+| REHYDRATE-05 | Critical | Tick replay corrupted |
+| BUFFER-GATE-01 | High | Live tick buffer overflow during rehydration |
+| BUFFER-GATE-02 | High | Buffer drain timeout |
+| POSTMARKET-01 | High | 15:30 fetch incomplete → queue persisted |
+| POSTMARKET-03 | Medium | Retry queue carrying over to next boot |
+| POSTMARKET-04 | High | Queue still pending at 09:13 next day |
+| POSTMARKET-FATAL | **Critical** | 7-trading-day cap exceeded → operator manual |
+| VERIFY-01 | Info | Mismatches detected & self-healed (normal) |
+| VERIFY-02 | High | Mismatch count > 10K threshold (systemic problem) |
+| VERIFY-03 | Medium | Same instrument > 3 days (parser bug suspect) |
+
+---
+
+## 🚫 Banned Patterns (added to `banned-pattern-scanner.sh`)
+
+| Pattern | Why banned |
+|---|---|
+| `interval = "5"` / `"15"` / `"25"` / `"60"` in cross-verify code | Only 1m allowed (lower granularity loses last-bucket data) |
+| `/v2/charts/historical` (daily endpoint) | Not needed — derive from 1m |
+| `/v2/charts/expired` | Wave 7 only (Dhan support clarification pending) |
+| `nsearchives.nseindia.com` (bhavcopy) | Wave 7 only (deferred) |
+| `bseindia.com/download/Bhavcopy` | Wave 7 only (deferred) |
+| Groww unofficial API | Permanently banned (no SLA, ToS risk) |
+| `candles_1s` reference (post-PR4) | Table dropped, banned in code |
+| `LiveCandleWriter` reference (post-PR4) | Dead code, banned |
+
+---
+
+## 🛡️ Real-Time Observability Per Item (7 layers, mandatory)
+
+For EACH new code path in this plan, ALL SEVEN layers fire.
+
+| # | Layer | Mechanism | Verification |
+|---|---|---|---|
+| 1 | Prom counter | `metrics::counter!("tv_<name>_total", ...)` static labels | `mcp__tickvault-logs__prometheus_query` |
+| 2 | Prom gauge | `metrics::gauge!("tv_<name>", ...)` | dashboard panel cites it |
+| 3 | Tracing span | `#[instrument]` on hot-path entry fns | `error_code_tag_guard` |
+| 4 | Loki structured log | `error!`/`warn!`/`info!` with `code = ErrorCode::X.code_str()` | `mcp__tickvault-logs__tail_errors` |
+| 5 | Telegram event | `NotificationEvent::*` typed variant | notification_service routes Severity::High/Critical |
+| 6 | Grafana panel | wraps counter in `increase()`/`rate()` per audit-findings Rule 12 | `mcp__tickvault-logs__grafana_query` |
+| 7 | Audit table | INSERT into `<event>_audit` table with DEDUP UPSERT KEYS | `mcp__tickvault-logs__questdb_sql` |
+
+---
+
+## 📊 New Prometheus Metrics (this plan adds 14)
+
+| Metric | Type | Purpose |
+|---|---|---|
+| `tv_multi_tf_aggregator_ticks_consumed_total` | counter | hot-path tick consumption |
+| `tv_multi_tf_aggregator_seals_total{tf}` | counter | per-TF seal count |
+| `tv_multi_tf_writer_dropped_total{reason}` | counter | bounded channel drops |
+| `tv_multi_tf_writer_spill_bytes_total` | counter | NDJSON spill volume |
+| `tv_multi_tf_pending_in_channel` | gauge | mpsc occupancy |
+| `tv_aggregator_rehydration_total{outcome}` | counter | boot replay outcomes |
+| `tv_aggregator_rehydration_seconds` | histogram | replay latency |
+| `tv_aggregator_rehydration_ticks_replayed` | counter | replay tick count |
+| `tv_live_tick_buffer_gate_buffered` | gauge | gate occupancy |
+| `tv_postmarket_fetch_completeness_pct` | gauge | fetch success % |
+| `tv_postmarket_fetch_attempts_total{outcome}` | counter | per-call outcome |
+| `tv_cross_verify_comparisons_total` | counter | 24.75M/day comparisons |
+| `tv_cross_verify_mismatches_total{field}` | counter | per-field mismatch count |
+| `tv_cross_verify_retry_queue_size` | gauge | persistent queue size |
+
+---
+
+## 🚨 New Prometheus Alerts (this plan adds 5)
+
+| Alert | Threshold | Severity |
+|---|---|---|
+| `tv-multi-tf-writer-dropping` | `rate(...dropped_total[1m]) > 0` | High |
+| `tv-aggregator-rehydration-failed` | `tv_aggregator_rehydration_total{outcome="failed"} > 0` | Critical |
+| `tv-aggregator-rehydration-slow` | `tv_aggregator_rehydration_seconds > 60` | High |
+| `tv-postmarket-fetch-incomplete` | `tv_postmarket_fetch_completeness_pct < 100` for 30min | High |
+| `tv-cross-verify-mismatches-high` | `tv_cross_verify_mismatches_total > 10000` for 1 run | High |
 
 All wired into `crates/storage/tests/resilience_sla_alert_guard.rs` ratchet.
 
 ---
 
-## RATCHETS (will fail build on regression)
+## 🧪 Ratchet Tests Added (20+)
 
-| Ratchet | Where | What it pins |
+| # | Test | Pins |
 |---|---|---|
-| `test_multi_tf_aggregator_purity` | property test | `aggregate(ticks) == aggregate(replay(ticks))` |
-| `test_multi_tf_writer_bounded_channel_capacity` | unit | mpsc capacity = 65536 |
-| `test_multi_tf_writer_drop_policy_is_drop_newest` | unit | drop policy + counter increment |
-| `test_boundary_timer_seals_at_ist_midnight` | unit | wall-clock seal independent of ticks |
-| `test_muhurat_calendar_includes_evening_session_in_1d` | unit | Diwali Muhurat handling |
-| `test_rehydration_serial_before_ws_subscribe` | integration | boot order assertion |
-| `test_rehydration_fail_closed_on_timeout` | chaos | HALT path verified |
-| `test_live_tick_buffer_gate_holds_until_unlocked` | unit | gate semantics |
-| `test_aggregator_dhat_zero_alloc` | dhat | hot-path zero-alloc invariant |
-| `test_aggregator_criterion_p99_le_100ns` | bench | hot-path latency bound |
-| `test_dedup_keys_include_segment_for_all_9_tfs` | meta-guard | I-P1-11 enforcement |
-| `test_no_candles_1s_references_after_pr4` | banned-pattern | promotion completeness |
-| `test_aggregator_rehydration_audit_table_exists` | DDL test | audit completeness |
-| `test_wave5_pct_columns_stamped_at_seal` | unit | Wave-5 % column preservation |
-| `test_prev_day_cache_loaded_before_aggregator_spawn` | boot order test | F2 ordering preserved |
+| 1 | `test_aggregator_purity` | aggregator is pure function of input ticks |
+| 2 | `test_bounded_channel_capacity` | mpsc cap = 65536 |
+| 3 | `test_drop_newest_policy` | overflow drops newest, preserves order |
+| 4 | `test_boundary_timer_at_ist_midnight` | seal fires at 00:00 IST exactly |
+| 5 | `test_muhurat_session_inclusion` | 17:30-18:30 IST seals ON Diwali Muhurat day |
+| 6 | `test_rehydrate_before_ws_subscribe` | boot order race-free |
+| 7 | `test_rehydration_fail_closed_halt` | 3 retry exhaustion = HALT |
+| 8 | `test_buffer_gate_drains_in_order` | FIFO during gate-flip |
+| 9 | `test_aggregator_dhat_zero_alloc` | hot path 0 alloc / 10K calls |
+| 10 | `test_aggregator_criterion_p99_lt_100ns` | bench-gate ≤5% regression |
+| 11 | `test_dedup_keys_include_segment_for_all_9_tfs` | I-P1-11 enforced |
+| 12 | `test_no_candles_1s_after_pr4` | banned-pattern post-promotion |
+| 13 | `test_audit_tables_exist` | `cross_verify_*` tables present |
+| 14 | `test_wave5_pct_columns_stamped_at_seal` | seal-time pct works |
+| 15 | `test_prev_day_cache_loaded_before_aggregator_spawn` | boot order |
+| 16 | `test_cross_verify_uses_only_1m_interval` | banned 5/15/25/60 |
+| 17 | `test_retry_queue_persists_across_reboot` | queue survives shutdown |
+| 18 | `test_retry_queue_7_day_escalation_cap` | POSTMARKET-FATAL fires at day 8 |
+| 19 | `test_zero_tolerance_no_epsilon_anywhere` | tolerance constant = 0.0 |
+| 20 | `test_csv_mismatch_file_written_with_correct_schema` | CSV format pinned |
 
 ---
 
-## CHAOS TESTS (NEW)
+## 🔥 Chaos Tests Added (6)
 
-| Chaos test | Scenario | Pass criteria |
+| Test | Failure mode |
+|---|---|
+| `chaos_aggregator_crash_every_minute` | rehydration recovers within 60s |
+| `chaos_questdb_timeout_mid_rehydration` | rescue ring + spill catches |
+| `chaos_ticks_corruption_during_replay` | parser rejects, no panic |
+| `chaos_30m_seal_burst` | 44K rows in 1 second handled |
+| `chaos_muhurat_day_seal` | non-standard market hours |
+| `chaos_65h_idle_weekend` | sleep-until-open + boot rehydration |
+
+---
+
+## 🛡️ Known Limitation (documented honestly)
+
+| What | Why | Impact | Workaround |
+|---|---|---|---|
+| Contracts expiring instantly at 15:30:00 IST | If Dhan moves them to `/v2/charts/expired` AT EXACTLY 15:30:00, our `/v2/charts/intraday` fetch returns empty | Those specific contracts may lack prev-day data on their final expiry day | Wave 7: dual-path fallback to `/v2/charts/expired` (pending Dhan support clarification) |
+| ~10-50 contracts on weekly expiry day | Acceptable today (those contracts don't trade after expiry anyway) | ✅ Accept | — |
+
+---
+
+## 📅 Wave 7 Backlog (deferred from this plan)
+
+| Item | Why deferred |
+|---|---|
+| Expiry-day fallback (`/v2/charts/expired` dual-path) | Pending Dhan support ticket clarification on roll-over timing |
+| Bhavcopy triangulation (NSE+BSE 4-file fetch) | 1m fetch covers all primary needs; bhavcopy = nice-to-have 3rd source |
+| BSE_EQ if added to subscription universe | Currently not subscribed; fetcher already segment-agnostic |
+| NSE indices bhavcopy (`ind_close_all`) | Dhan WS code-6 already covers IDX_I prev_close + prev_OI |
+
+---
+
+## ✅ Status Tracker (one-glance)
+
+| Sub-PR | Boxes done | Status |
 |---|---|---|
-| `chaos_aggregator_crash_every_minute_boundary` | Crash app at each minute boundary in a 6h trading session, restart, verify rehydration | All sealed candles match pre-crash; in-flight buckets correctly reconstructed |
-| `chaos_qdb_timeout_mid_rehydration` | Pause QuestDB after 30s of rehydration | App HALTs with REHYDRATE-03, Telegram CRITICAL fires |
-| `chaos_ticks_corruption_mid_replay` | Inject NULL into `ticks.ltp` mid-replay | App HALTs with REHYDRATE-04 |
-| `chaos_multi_tf_seal_burst_at_30m_boundary` | Generate 11K securities × 1m+5m+15m+30m seal at 09:30:00 IST | No tick loss, no channel block, all 4×11K=44K rows persisted |
-| `chaos_muhurat_day_aggregator` | Simulate Diwali Muhurat trading day | 1d bar correctly includes both regular and Muhurat sessions |
-| `chaos_long_idle_aggregator_state_preserved` | Idle aggregator over 65h Fri→Mon weekend | State intact, day boundary timer fires correctly at each midnight |
+| #1 Aggregator engine | 0/12 | 🔴 not started |
+| #2 Rehydration | 0/12 | 🔴 not started |
+| #3 Post-market 1m fetch + cross-verify + self-heal | 0/12 | 🔴 not started |
+| #4 Promotion | 0/12 | 🔴 not started |
 
 ---
 
-## OPEN QUESTIONS FOR NEXT SESSION
+## 🔗 Cross-References
 
-| Question | Default if no operator answer |
-|---|---|
-| Skip 10s explicit checkpoint table (accept ≤60s rehydration)? | YES skip |
-| Persist all 9 TFs (1m..1d) or fewer? | All 9 |
-| Add `aggregator_rehydration_audit` table with 90-day hot + S3 cold retention? | YES |
-| Multi-TF aggregator: build for ~11K (Wave-5 indices-only) or also stock-FNO ~25K? | Match `[subscription] scope` config — start ~11K |
-| Boundary timer: per-second granularity or per-minute? | Per-minute (sufficient for 1m smallest TF) |
-| Rehydration deadline: 5 minutes? | YES (300s) |
-| `MAX_REHYDRATION_TICKS` cap per (sid, tf): 10M? | YES (configurable) |
-| Atomic shadow→canonical rename via QuestDB? Confirm syntax. | Investigate at Phase 3 |
-
----
-
-## NON-GOALS (explicitly out of scope)
-
-- Trading-decision logic changes — UNCHANGED. Trading reads from in-memory aggregator (now 9-TF instead of 1s); zero DB touches for decisions.
-- `ticks` table — UNCHANGED. Still raw IST epoch nanos source of truth.
-- `historical_candles` table — UNCHANGED. Separate Dhan REST cold-fetch path.
-- WebSocket/auth/order-update systems — UNCHANGED.
-- Greeks pipeline — UNCHANGED. (No `candles_1s` reads.)
-- Phase 2 dispatcher / depth rebalancer — UNCHANGED.
+- `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row matrices, mandatory)
+- `.claude/rules/project/wave-4-shared-preamble.md` (Section 7 honest 100% charter)
+- `.claude/rules/project/observability-architecture.md` (5-sink + ErrorCode taxonomy)
+- `.claude/rules/project/disaster-recovery.md` (boot modes + recovery primitives)
+- `.claude/rules/project/historical-candles-cross-verify.md` (existing cross-verify infrastructure)
+- `.claude/rules/project/security-id-uniqueness.md` (I-P1-11 composite key)
+- `docs/dhan-ref/05-historical-data.md` (Dhan REST historical contract)
+- `docs/dhan-ref/03-live-market-feed-websocket.md` (live-feed parsing)
+- `docs/dhan-ref/08-annexure-enums.md` (ExchangeSegment + InstrumentType + rate limits)
+- `quality/benchmark-budgets.toml` (Criterion p99 budgets)
+- `quality/crate-coverage-thresholds.toml` (100% min per crate)
 
 ---
 
-## NEXT-SESSION KICKOFF CHECKLIST
+## 🎬 Next Action
 
-When the next Claude Code session starts on this plan, BEFORE any code:
+When operator says "start sub-PR #1": next session creates branch `claude/wave-6-pr1-multi-tf-aggregator` from latest `main`, implements aggregator engine per items 1.1–1.7, runs adversarial 3-agent review (pre + post), fills 12-box done matrix, opens draft PR.
 
-1. Read this entire plan file end-to-end
-2. Read `.claude/rules/project/wave-4-shared-preamble.md` (charter)
-3. Read `.claude/rules/project/per-wave-guarantee-matrix.md` (mandatory matrix)
-4. Read `.claude/rules/project/stream-resilience.md` (12 rules including B3 3-agent review)
-5. Run `make doctor` (auto-loaded MCP) — confirm all systems green
-6. Run `mcp__tickvault-logs__list_active_alerts` — must be empty
-7. Verify PR #548 is merged to main and current branch is up to date with main
-8. Create new branch `claude/wave-6-pr1-multi-tf-aggregator` from `main`
-9. Spawn 3 fresh agents (hot-path-reviewer, security-reviewer, general-purpose hostile bug-hunt) for Sub-PR #1 specifically
-10. Synthesize agent findings BEFORE writing code
-11. Implement Sub-PR #1
-12. Run all 22 test categories for changed crates per `testing-scope.md`
-13. Open Sub-PR #1 as DRAFT against main
-14. Wait for operator approval before starting Sub-PR #2
-
-**CRITICAL: Do NOT big-bang. Sub-PR #1 ships shadow tables only. NO existing code is deleted until Sub-PR #4.**
-
----
-
-## SCENARIO TABLE (every worst-case answered)
-
-| # | Scenario | Detection | Recovery | Recovery time | Tick loss? |
-|---|---|---|---|---|---|
-| 1 | WS disconnect (TCP RST) | watchdog ≤5s | reconnect with SubscribeRxGuard | ≤10s | NO (rescue ring buffers) |
-| 2 | App panic / OOM | OS detects | reboot → rehydrate | ≤60s + restart | NO (ticks durable) |
-| 3 | App crash mid-aggregator-flush | next boot finds incomplete bucket | replay from `MAX(ts) - 1 bucket`, DEDUP UPSERT handles re-flush | ≤60s | NO |
-| 4 | QuestDB crash | rescue ring fills | spill to NDJSON; on QDB return, drain | ≤60s envelope | NO (inside envelope) |
-| 5 | QuestDB OOM | same as crash | same | ≤60s | NO |
-| 6 | Network partition app↔QDB | rescue ring fills | drain on heal | bounded by 2M ring | NO |
-| 7 | Long idle weekend (65h) | sleep-until-open Wave-2 WS-GAP-04 | aggregator state preserved across idle | 0s (state intact) | NO |
-| 8 | Holiday weekend (92h) | same | same | 0s | NO |
-| 9 | Token expires mid-session | DH-901 detected | force-renew Wave-2 AUTH-GAP-03 | ≤15s | NO |
-| 10 | Multi-TF seal burst at 09:30:00 | bounded mpsc | 65536 capacity absorbs ~55K row burst | <1s | NO (capacity headroom) |
-| 11 | mpsc overflow (>65536 in flight) | spill-to-disk fires | drain to candles_*_spill NDJSON | bounded | NO (recoverable) |
-| 12 | Sparse F&O contract no ticks for hours | boundary timer fires at IST midnight | wall-clock seal | 0s | NO (no ticks to lose) |
-| 13 | Diwali Muhurat session | Muhurat calendar detects | 1d bar includes both regular + Muhurat ticks | 0s | NO |
-| 14 | Cosmic-ray bit-flip in aggregator | volume monotonicity guard Wave-5 VOLUME-MONO-01 | Telegram alert + force re-rehydration | ≤60s | NO (ticks durable) |
-| 15 | Disk full on app host | BOOT-02 alarm | App halts. Operator clears. Ticks resumed from Dhan from disconnect-time. | bounded by disk-full duration | YES (gap = disk-full duration) — outside envelope |
-| 16 | Dhan upstream outage | tick-gap detector | nothing we can do — Dhan owns the source | bounded by Dhan recovery | YES (gap = Dhan outage) — outside envelope |
-| 17 | Rehydration deadline > 5min | REHYDRATE-03 alarm | HALT, Telegram CRITICAL, operator inspects | indefinite | NO (fail-closed prevents corruption) |
-| 18 | Rehydration finds inconsistent state | REHYDRATE-04 | HALT, Telegram CRITICAL | indefinite | NO |
-| 19 | Wave-5 prev_day_cache empty at boot during market hours | PREVCLOSE-04 (existing) | HALT (cannot stamp % columns correctly) | indefinite | NO |
-| 20 | Live tick buffer overflow during rehydration | BUFFER-GATE-02 | drop-newest with counter, Telegram | bounded | YES (drop-newest) — operator alarm |
-
----
-
-## FINAL HONEST ASSESSMENT
-
-| Aspect | Verdict |
-|---|---|
-| Operator's "ticks → memory → DB for replay" principle | Already met today. This plan extends it to all 9 TFs. |
-| Real benefit | Fewer DB-side moving parts (9 mat views → 9 plain tables); no OFFSET/cascade gotchas; cleaner add-new-TF path. |
-| Real cost | 2-3 weeks engineering. Net app-memory +38 MB. New code = new bug surface (mitigated by shadow phase). |
-| Risk if rushed (big-bang) | High — 6 CRITICAL agent findings, all NEW code, untested on live data. |
-| Risk if shadow-phased | Low — 1 trading week parallel run + cross-verify catches divergence. |
-| Trading decision impact | ZERO (already in-memory off ticks; no DB reads for decisions). |
-
-**This plan is APPROVED in scope. Next session executes Sub-PR #1 first.**
+**This plan is the contract. Every sub-PR delivers against it. No silent scope creep.**
