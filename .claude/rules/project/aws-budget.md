@@ -25,8 +25,8 @@
 
 ### Pricing Type: ON-DEMAND (not reserved, not spot)
 - No upfront commitment. Pay only when instance is running.
-- Weekdays: 8AM-5PM IST (9hr, auto via EventBridge Scheduler).
-- Weekends: 8AM-1PM IST (5hr, auto via EventBridge Scheduler).
+- Weekdays: 8:30 AM – 5:30 PM IST (9hr, auto via EventBridge Scheduler).
+- Weekends: 8:30 AM – 1:30 PM IST (5hr, auto via EventBridge Scheduler).
 - Manual: start/stop anytime via AWS Console or CLI for extra checks.
 - Cost per hour: **₹15.17** ($0.1785 × ₹85).
 
@@ -53,17 +53,24 @@ S3 archival exports detached partitions before removal (Plan Item 7, needs aws-s
 1. **NEVER provision a larger instance than c7i.xlarge** without Parthiban's approval.
 2. **NEVER increase EBS beyond 100GB** without Parthiban's approval.
    If 100GB fills up, partition manager detaches old data → export to S3 → free space.
-3. **NEVER add paid AWS services** (RDS, ElastiCache, ALB, NAT Gateway, etc.) without budget review.
+3. **NEVER add paid AWS services** (RDS, ElastiCache, NAT Gateway, etc.) without budget review.
+   AWS ALB allowed within free tier (750 hrs/mo) replacing Traefik.
 4. **CloudWatch is MANDATORY and always enabled** — monitoring, logging, alerting are non-negotiable.
    Free tier covers: 10 custom metrics, 10 alarms, 5GB logs, 3 dashboards. Stay within free tier.
 5. **S3 lifecycle policy is MANDATORY** — auto-tier to Intelligent-Tiering (90d) → Glacier (365d).
    Keeps 500GB cold data under ₹333/mo instead of ₹1,063/mo.
-6. **Docker memory budget for c7i.xlarge (8GB)**:
-   - QuestDB: 4GB | Valkey: 1GB | Prometheus: 512MB | Grafana: 1GB
-   - Alertmanager: 256MB | Traefik: 512MB | Valkey-exporter: 128MB
-   - Total: 7.4GB. Remaining: 600MB for OS.
-   - Jaeger, Loki, Alloy: REMOVED (saves 2.5GB RAM).
+6. **Docker memory budget for c7i.xlarge / c8g.xlarge (8GB)** — Wave 7-A trimmed (2026-05-10):
+   - QuestDB: **2GB** (down from 4GB; cascading mat views removed in Wave 6)
+   - Valkey: **512MB** (down from 1GB; token + instrument cache fits easily)
+   - Prometheus: **384MB** (down from 512MB; 7d retention)
+   - Grafana: **768MB** (down from 1GB)
+   - Tickvault app: ~500MB
+   - Total Docker: ~3.7GB. Remaining: ~4.3GB for OS + buffer.
+   - **REMOVED in Wave 7-A:** Traefik (use AWS ALB free tier), Alertmanager (replaced by app `/webhook/prometheus` → teloxide direct), valkey-exporter (not queried).
+   - **Already removed:** Jaeger, Loki, Alloy (saves 2.5GB RAM).
 7. **Manual starts budgeted at 20hr/month max.** If consistently exceeding, review schedule.
+8. **HTTP gateway:** Use AWS ALB (free tier 750 hrs/mo) for HTTPS termination, or app on port 3001 directly behind security group for internal-only access.
+9. **Alert routing:** Prometheus alerts route directly to tickvault app's `/webhook/prometheus` endpoint, which dispatches via the in-process teloxide Telegram client. No Alertmanager hop needed.
 
 ## What This Prevents
 
@@ -74,16 +81,18 @@ S3 archival exports detached partitions before removal (Plan Item 7, needs aws-s
 - Adding managed services that balloon the bill
 - S3 costs exploding (Intelligent-Tiering + Glacier keep cold data cheap)
 
-## Instance Schedule
+## Instance Schedule (Wave 7-A — 2026-05-10 update)
 
-- **Weekday Start:** 7:45 AM IST Mon-Fri (EventBridge: `cron(15 2 ? * MON-FRI *)`)
-- **Weekday Stop:** 5:15 PM IST Mon-Fri (EventBridge: `cron(45 11 ? * MON-FRI *)`)
-- **Weekend Start:** 7:45 AM IST Sat-Sun (EventBridge: `cron(15 2 ? * SAT,SUN *)`)
-- **Weekend Stop:** 1:15 PM IST Sat-Sun (EventBridge: `cron(45 7 ? * SAT,SUN *)`)
+- **Weekday Start:** 8:30 AM IST Mon-Fri (EventBridge: `cron(0 3 ? * MON-FRI *)`)
+- **Weekday Stop:** 5:30 PM IST Mon-Fri (EventBridge: `cron(0 12 ? * MON-FRI *)`)
+- **Weekend Start:** 8:30 AM IST Sat-Sun (EventBridge: `cron(0 3 ? * SAT,SUN *)`)
+- **Weekend Stop:** 1:30 PM IST Sat-Sun (EventBridge: `cron(0 8 ? * SAT,SUN *)`)
 - **Manual Start:** Anytime — `aws ec2 start-instances --instance-ids i-xxx` or AWS Console
 - **Manual Stop:** Anytime — `aws ec2 stop-instances --instance-ids i-xxx` or AWS Console
 - **Static IP:** Elastic IP stays associated 24/7 (never release — Dhan static IP has 7-day cooldown)
 - **Skip weekends to save:** Each skipped weekend day saves ₹76 (5hr × ₹15.17)
+
+> **Note:** Schedule shifted from 7:45→17:15 to 8:30→17:30 (still 9 hours, ~₹170/mo savings). Aligns with Wave 6 plan post-market 1m fetch window: market closes 15:30, fetch + cross-verify + persist by 17:25, AWS auto-stops 17:30 with 5 min buffer.
 
 ## Cost Per Hour Reference
 
@@ -94,6 +103,35 @@ S3 archival exports detached partitions before removal (Plan Item 7, needs aws-s
 | 1 weekend day (8hr manual) | ₹121 |
 | 1 quick check (2hr manual) | ₹30 |
 
+## RAM Trim Audit (Wave 7-A, 2026-05-10)
+
+| Service | Pre-Wave-6 | Post-Wave-7-A | Saved |
+|---|---|---|---|
+| QuestDB | 4 GB | 2 GB | -2 GB |
+| Valkey | 1 GB | 512 MB | -512 MB |
+| Grafana | 1 GB | 768 MB | -256 MB |
+| Prometheus | 512 MB | 384 MB | -128 MB |
+| Traefik | 512 MB | REMOVED | -512 MB |
+| Alertmanager | 256 MB | REMOVED | -256 MB |
+| Valkey-exporter | 128 MB | REMOVED | -128 MB |
+| **Total Docker** | **~7.4 GB** | **~3.7 GB** | **-3.7 GB** |
+| **Headroom on 8 GB** | ~600 MB | **~4.3 GB** | massive |
+
+## 100% Coverage Verification (after Wave 7-A trim)
+
+| Need | Tool | Status |
+|---|---|---|
+| Tracking | QuestDB audit tables (15+) | ✅ KEEP |
+| Logging | tracing → errors.jsonl + CloudWatch Logs | ✅ KEEP local + add CW |
+| Monitoring | Prometheus (14 new metrics in Wave 6 plan) | ✅ KEEP |
+| Alerting | Direct: Prom → app `/webhook/prometheus` → teloxide | ✅ replaces Alertmanager |
+| Auditing | QuestDB audit tables + S3 cold archive | ✅ KEEP |
+| Capturing | QuestDB ticks + candles | ✅ KEEP |
+| Visualizing | Grafana | ✅ KEEP |
+| Dashboards | Grafana operator-health single page | ✅ KEEP |
+| HTTP gateway | AWS ALB (free tier) | ✅ replaces Traefik |
+| Distributed tracing | CloudWatch X-Ray (optional, free tier 100K traces/mo) | ⚠️ optional |
+
 ## Trigger
 
 This rule activates when editing files matching:
@@ -101,4 +139,4 @@ This rule activates when editing files matching:
 - `deploy/aws/*`
 - `scripts/aws-*`
 - `crates/app/src/infra.rs`
-- Any file containing `c7i`, `mem_limit`, `EBS`, `gp3`, `instance_type`, `aws_region`
+- Any file containing `c7i`, `c8g`, `mem_limit`, `EBS`, `gp3`, `instance_type`, `aws_region`
