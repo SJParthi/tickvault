@@ -2132,6 +2132,124 @@
         "graphMode": "none",
         "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" }
       }
+    },
+    {
+      "type": "stat",
+      "id": 54,
+      "title": "Aggregator seals emitted (5m)",
+      "description": "Wave 6 Sub-PR #1 item 1.4i. Sealed candles forwarded from the multi-TF aggregator subscriber task (master switch, 1.4d) to the seal-writer mpsc channel (1.4c) over the last 5 minutes. Wrapped in increase() per Rule 12 — raw counters lie after process restart. Expected: ramps up at 09:15 IST market open, plateaus at ~99K bars/minute (11K instruments x 9 TFs) on minute boundaries, ramps down at 15:30 IST. Companion log line per minute: tail data/logs/app.YYYY-MM-DD.log | grep 'aggregator heartbeat'. Runbook: .claude/rules/project/wave-6-error-codes.md::AGGREGATOR-HB-01.",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 88 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "increase(tv_aggregator_seals_emitted_total[5m])",
+          "legendFormat": "seals emitted",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue" },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background_solid",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" }
+      }
+    },
+    {
+      "type": "stat",
+      "id": 55,
+      "title": "Aggregator drops & lag (5m)",
+      "description": "Wave 6 Sub-PR #1 item 1.4k. Three drop counters from the multi-TF aggregator pipeline, all wrapped in increase() per Rule 12: (1) tv_seal_mpsc_dropped_total — seal mpsc full (writer task fell behind ~20s at peak burst), (2) tv_aggregator_late_ticks_discarded_total — tick arrived after its bucket sealed, (3) tv_aggregator_tick_lag_total — broadcast::Lagged frames the subscriber missed. Companion panel to 'Aggregator seals emitted (5m)' (1.4i) — when the no-seals alert fires (1.4j), this panel tells the operator which class of drop is causing it. Healthy state: all zero or very low (< 100 / 5m). Runbook: .claude/rules/project/wave-6-error-codes.md::AGGREGATOR-DROP-01.",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 88 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "increase(tv_seal_mpsc_dropped_total[5m])",
+          "legendFormat": "mpsc dropped",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "increase(tv_aggregator_late_ticks_discarded_total[5m])",
+          "legendFormat": "late ticks",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "increase(tv_aggregator_tick_lag_total[5m])",
+          "legendFormat": "broadcast lag",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green" },
+              { "color": "orange", "value": 1 },
+              { "color": "red", "value": 100 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background_solid",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" }
+      }
+    },
+    {
+      "type": "stat",
+      "id": 56,
+      "title": "Aggregator instrument-registration rate (5m)",
+      "description": "Wave 6 Sub-PR #1 item 1.4m. Increment per 5m of (security_id, exchange_segment) pairs lazily registered by the multi-TF aggregator on first-tick (item 1.4d closure: `agg_clone.pre_populate(...)` when `stats.instrument_found == false`). At 09:15:00 IST market open this spikes rapidly as each subscribed instrument fires its first tick. Healthy ramp: spike to a few thousand in the first 5 minutes, then taper to near-zero by 09:30. Wrapped in increase() per audit-findings Rule 12. A flat 0 line at 09:15:01 IST indicates either (a) the master switch never wired, or (b) no ticks are flowing — cross-check tv_ticks_processed_total. Runbook: .claude/rules/project/wave-6-error-codes.md::AGGREGATOR-HB-01.",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 94 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "increase(tv_aggregator_instruments_lazy_inserted_total[5m])",
+          "legendFormat": "new instruments / 5m",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue" },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background_solid",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" }
+      }
     }
   ]
 }
