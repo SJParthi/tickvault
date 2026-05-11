@@ -58,6 +58,13 @@ const REQUIRED_PANELS: &[(&str, &str)] = &[
         "Aggregator seals emitted (5m)",
         "tv_aggregator_seals_emitted_total",
     ),
+    // Wave 6 Sub-PR #1 item 1.4k — companion drop-counters panel.
+    // Single panel with 3 series so the operator can diagnose
+    // tv-aggregator-no-seals-during-market alerts (1.4j) — when seals
+    // are zero, this panel tells WHICH drop class caused it
+    // (mpsc full, late tick, or broadcast lag). Runbook:
+    // .claude/rules/project/wave-6-error-codes.md::AGGREGATOR-DROP-01.
+    ("Aggregator drops & lag (5m)", "tv_seal_mpsc_dropped_total"),
 ];
 
 fn workspace_root() -> PathBuf {
