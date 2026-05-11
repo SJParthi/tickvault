@@ -43,6 +43,22 @@
 
 [2026-05-11 21:03 IST] [step-1] CORE-PINNING DESIGN LOCKED: ONE dedicated core for ALL 5 WS connections (async-multiplex), NOT one core per connection. Same 4-core scheme Mac=AWS: Core 0 WS recv / Core 1 parser / Core 2 ILP writer / Core 3 other. Mac wastes 10 idle cores (no harm). AWS c8g.xlarge uses all 4. Item 0.5.9 verifies pinning is wired in main.rs (helper exists per Wave 5 Item 6; wiring unverified).
 
+[2026-05-11 21:05 IST] [meta] WEB SESSION 400'D — "API Error: 400 messages.150.content.2.text: cache_control cannot be set for empty text blocks" then repeated 400s on retry. Session unusable. Continuing in CLI on same branch `claude/trading-tick-vault-BkvpS`. All decisions persisted to disk pre-400, no context lost. Commit 4f97281 already on origin.
+
+[2026-05-11 21:08 IST] [meta] CLI CONTINUATION begun. Branch switched from `claude/document-disconnect-causes-5r7fo` (CLI default) to `claude/trading-tick-vault-BkvpS` (planning branch). Operator pick A from web (item 0.5.10 PreMarketReady Telegram) carried forward. Commit bf62c99 (cursor update) pushed.
+
+[2026-05-11 21:15 IST] [step-1] ITEM 0.5.10 ADDED (operator pick A in web before 400): consolidated `PreMarketReady` Telegram event replacing the 6 fragmented "Auth OK / Universe loaded / WS 1-5 connected / Phase 2 complete" messages. ~200 LoC, new task file `tasks/T05-10-pre-market-ready-telegram.md` to be created Wed during sub-PR planning. 3 severity tiers: PreMarketReady (Info), PreMarketDegraded (High, ≥1 step failed by 08:55 IST), PreMarketCritical (Critical, NONE green by 09:00 IST).
+
+[2026-05-11 21:20 IST] [meta] FAANG 3-DAY MAP LOCKED: Mon eve = Step 1 (WS disconnect resilience + honest envelope) WRAPPED ✅ / Tue eve = Step 2 (capital + risk engine) / Wed eve = Step 3 (go-live gate + adversarial 3-agent review + mega plan APPROVAL flip). Thu = synthesize. Friday = 5+ parallel Claude sessions execute. NO IMPLEMENTATION Mon-Wed; pick C ("start coding T05-01 now") explicitly rejected by operator.
+
+[2026-05-11 21:25 IST] [step-1] OPERATOR CHARTER RE-CONFIRMED VERBATIM: "extreme complete comprehensive extensive automation 100 percentage" + every-session-auto-everything + every-Cowork-task-auto-everything + access logs/queries/dbs/project entirely local-or-AWS + common-runtime dynamic-scalable + 100% in 15 dimensions (code coverage, audit coverage, testing coverage, code checks, code performance, monitoring, logging, alerting, security, security hardening, bugs fixing, scenarios covering, functionalities covering, code review, extreme check). Persisted in `step-1-honest-envelope.md`. Every Phase 0.5 / Step 2 / Step 3 / Friday task MUST carry the 15-row + 7-row matrix per `per-wave-guarantee-matrix.md`. Mechanically enforced by `per-item-guarantee-check.sh` + `make wave-guarantee-check`.
+
+[2026-05-11 21:30 IST] [step-1] TELEGRAM SCREENSHOT (Mon 9:04 PM IST) confirms LIVE system: 97,422 derivatives loaded, 218 underlyings, Auth OK, Order Update WS connected, Order Update WS reconnected after 1 failure (recovery working), NSE bhavcopy cross-check FAILED (questdb_query_failed — Phase 0.5 NET-02/DH-911 will catch upstream causes), clean shutdown at 07:18 PM, boot complete with 5/5 main feeds DEFERRED until 09:00 IST post-market sleep working. System IS real. Phase 0.5 adds 8 more failure-mode detectors. Mon 21:21 IST post-market reset (`reset_daily()` per Wave-2-D Fix 2) due 15:35 IST — already fired today.
+
+[2026-05-11 21:35 IST] [meta] PERSISTENCE PASS triggered by operator: "don't worry about tokens, persist EVERYTHING to plan files / docs / subs, commit + push, then discuss later." 4 new files written: step-1-honest-envelope.md (canonical reference), step-1-discussion-log-mon-eve.md (Mon transcript), step-2-tue-eve-agenda.md (Tue pre-loaded questions), step-3-wed-eve-agenda.md (Wed pre-loaded blocks A-G). INDEX bumped. Cursor updated. Commit + push next.
+
+[2026-05-11 21:40 IST] [meta] STEP 1 WRAPPED for Mon eve. Tue eve resumes with Step 2 (capital + risk engine, 8 pre-loaded questions). Wed eve = Step 3 (adversarial 3-agent review + APPROVAL flip). NO open Step-1 questions remain — operator's verbatim charter answered, Phase 0.5 locked, 5-layer defence diagram persisted, per-item matrix mandated. Any future session opening cold: read step-1-honest-envelope.md FIRST.
+
 ---
 
 ## Reversal procedure
