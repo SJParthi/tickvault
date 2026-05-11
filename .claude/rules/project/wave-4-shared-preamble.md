@@ -233,7 +233,7 @@ When the PR description quotes "100% guarantee", it MUST be phrased exactly:
 
 > "100% inside the tested envelope, with ratcheted regression coverage:
 > <= 60s QuestDB outage absorbed by rescue->spill->DLQ;
-> <= 2,000,000-tick ring buffer capacity (constant `TICK_BUFFER_CAPACITY`,
+> <= 5,000,000-tick ring buffer capacity (constant `TICK_BUFFER_CAPACITY`,
 > `crates/common/src/constants.rs`, ratcheted by
 > `crates/storage/tests/zero_tick_loss_alert_guard.rs`); bench-gated
 > O(1) hot path; composite-key uniqueness;
