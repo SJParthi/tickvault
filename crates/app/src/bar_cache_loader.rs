@@ -177,6 +177,86 @@ pub async fn populate_bar_cache_at_boot(
     })
 }
 
+/// Convenience boot wiring helper: invokes
+/// [`populate_bar_cache_at_boot`] and emits the structured
+/// `info!` / `warn!` / `error!` chain that downstream operators
+/// expect.
+///
+/// Decoupled from `main.rs` so the boot-time logging is testable +
+/// auditable. Mirrors `prev_day_cache_loader::populate_and_log`
+/// (PR #520).
+///
+/// Severity tiers:
+/// - `info!` on success (rows_inserted > 0) — operator sees the
+///   cache is primed and ready for the next indicator/strategy read
+///   migration that reads from it.
+/// - `info!` on empty result outside market hours (off-hours boot,
+///   weekend, holiday — shadow tables legitimately empty).
+/// - `warn!` on empty result during market hours — degraded but not
+///   catastrophic; the indicator engine handles `BarCache::lookup
+///   == None` gracefully by falling back to its on-tick partial-bar
+///   state.
+/// - `error!` on QuestDB unavailability — same graceful fallback,
+///   but routed to Telegram so the operator can investigate.
+///
+/// NOT yet called from `main.rs` — gated on Wave 6 sub-PR #4
+/// promotion. The wiring is a separate W7-A4 follow-up.
+pub async fn populate_and_log(questdb_config: &QuestDbConfig, cache: &BarCache) {
+    use tickvault_common::market_hours::is_within_trading_session_ist;
+    use tracing::{info, warn};
+
+    match populate_bar_cache_at_boot(questdb_config, cache).await {
+        Ok(outcome) => {
+            if outcome.rows_inserted == 0 {
+                if is_within_trading_session_ist() {
+                    warn!(
+                        skipped_unknown_segment = outcome.skipped_unknown_segment,
+                        skipped_unknown_tf = outcome.skipped_unknown_tf,
+                        skipped_malformed = outcome.skipped_malformed,
+                        "W7-A4.8 BarCache loader: shadow tables are empty — \
+                         indicator + strategy reads will fall back to on-tick \
+                         partial-bar state until live seals repopulate the \
+                         shadow tables (Wave 6 master switch must be producing seals)"
+                    );
+                } else {
+                    info!(
+                        skipped_unknown_segment = outcome.skipped_unknown_segment,
+                        skipped_unknown_tf = outcome.skipped_unknown_tf,
+                        skipped_malformed = outcome.skipped_malformed,
+                        "W7-A4.8 BarCache loader: shadow tables empty \
+                         (off-hours / weekend boot — expected; cache will \
+                         populate from live seals during the next session)"
+                    );
+                }
+            } else {
+                info!(
+                    rows_inserted = outcome.rows_inserted,
+                    skipped_unknown_segment = outcome.skipped_unknown_segment,
+                    skipped_unknown_tf = outcome.skipped_unknown_tf,
+                    skipped_malformed = outcome.skipped_malformed,
+                    estimated_bytes = cache.estimated_bytes(),
+                    "W7-A4.8 BarCache loader: cache populated — RAM-first \
+                     indicator + strategy read path is now armed"
+                );
+            }
+        }
+        Err(err) => {
+            // QuestDB unreachable / SELECT failed. The indicator
+            // engine + strategy code paths handle `BarCache::lookup
+            // == None` gracefully (fall back to on-tick partial-bar
+            // state) — this is degraded but not catastrophic. ERROR
+            // routes to Telegram via Loki so the operator sees it.
+            tracing::error!(
+                ?err,
+                "W7-A4.8 BarCache loader: QuestDB SELECT failed — \
+                 indicator + strategy reads will fall back to on-tick \
+                 partial-bar state until the next boot succeeds in \
+                 reading the shadow tables"
+            );
+        }
+    }
+}
+
 /// One parsed row from the QuestDB dataset response. Carries all the
 /// dimensions needed to insert into [`BarCache`] in one shot.
 #[derive(Debug, Clone, Copy, PartialEq)]
