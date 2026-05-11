@@ -48,7 +48,7 @@ pub mod reset_scheduler;
 pub mod tick_storage;
 pub mod top_n;
 
-pub use bar_cache::{BarCache, CompactBar};
+pub use bar_cache::{BarCache, CompactBar, bar_cache_clear_before_threshold};
 pub use consumer::run_tick_storage_consumer;
 pub use prev_day_cache::PrevDayCache;
 pub use reset_scheduler::{run_tick_storage_daily_reset, secs_until_next_market_open_ist};
