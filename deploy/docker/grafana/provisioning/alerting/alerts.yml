@@ -1588,3 +1588,47 @@ groups:
         labels:
           severity: high
           wave: "6"
+
+      # Wave 6 Sub-PR #1 item 1.4l — companion alert for the
+      # tv_seal_mpsc_dropped_total counter (one of the 3 drop series
+      # in the 'Aggregator drops & lag (5m)' panel, 1.4k). Fires when
+      # the writer task fell behind the subscriber task by enough that
+      # > 100 seals were dropped in the last minute. The seal is NOT
+      # lost (caught by the shadow seal writer ring → spill → DLQ
+      # cascade), but the producer-side drop is a strong signal that
+      # the consumer is slowing down — the operator needs to know.
+      - uid: tv-aggregator-mpsc-drop-storm
+        title: "Wave 6 — aggregator seal mpsc drop storm (>100/min)"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 60, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "(increase(tv_seal_mpsc_dropped_total[1m]) > 100) and on() tv_market_hours_active == 1"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 60, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 60, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 1m
+        annotations:
+          summary: "Wave 6: > 100 seal mpsc drops in last 1m during market hours"
+          description: "The producer-side mpsc channel between the multi-TF aggregator subscriber task (1.4d) and the seal-writer task (1.4b) is overflowing. > 100 sealed candles dropped in the last 1 min. The seal-writer's three-tier rescue (ring → spill → DLQ) catches dropped seals AT THE WRITER SIDE — but this counter measures PRODUCER-SIDE drops, where the mpsc try_send returned Err because the writer task couldn't keep up. Likely causes: (1) QuestDB ILP backpressure (check tv_questdb_disconnected_seconds + BOOT-01 runbook), (2) seal_ring saturated and spilling (check tv_seal_ring_spilled_total). Runbook: .claude/rules/project/wave-6-error-codes.md::AGGREGATOR-DROP-01."
+        labels:
+          severity: high
+          wave: "6"
