@@ -155,3 +155,60 @@ fn aggregator_mpsc_drop_storm_alert_severity_is_high() {
          `high` (Telegram pages operator). Found: {severity_slice:?}"
     );
 }
+
+// Wave 6 Sub-PR #1 item 1.4n — companion alert for the
+// `tv_aggregator_tick_lag_total` counter (third drop class:
+// broadcast::recv() returning Lagged because the subscriber fell
+// behind the producer).
+
+#[test]
+fn aggregator_broadcast_lag_storm_alert_uid_is_pinned() {
+    let yaml = read_alerts_yaml();
+    assert!(
+        yaml.contains("uid: tv-aggregator-broadcast-lag-storm"),
+        "Wave 6 Sub-PR #1 item 1.4n regression: alert \
+         `tv-aggregator-broadcast-lag-storm` MUST exist in alerts.yml \
+         so the operator gets a Telegram page when the aggregator \
+         subscriber falls behind the fast_tick_broadcast producer \
+         enough that > 100 frames are dropped at the broadcast \
+         boundary in 1 minute during market hours."
+    );
+}
+
+#[test]
+fn aggregator_broadcast_lag_storm_alert_expression_includes_market_hours_gate() {
+    let yaml = read_alerts_yaml();
+    assert!(
+        yaml.contains("increase(tv_aggregator_tick_lag_total[1m]) > 100"),
+        "Wave 6 Sub-PR #1 item 1.4n regression: alert expression must \
+         reference `increase(tv_aggregator_tick_lag_total[1m]) > 100` \
+         per audit-findings Rule 12 + Rule 4."
+    );
+    let uid_pos = yaml
+        .find("uid: tv-aggregator-broadcast-lag-storm")
+        .expect("alert uid must exist");
+    let rest = &yaml[uid_pos..uid_pos.saturating_add(2000).min(yaml.len())];
+    assert!(
+        rest.contains("tv_market_hours_active == 1"),
+        "Wave 6 Sub-PR #1 item 1.4n regression: tv-aggregator-broadcast-lag-storm \
+         MUST be gated by `tv_market_hours_active == 1` per audit-findings Rule 3."
+    );
+}
+
+#[test]
+fn aggregator_broadcast_lag_storm_alert_severity_is_high() {
+    let yaml = read_alerts_yaml();
+    let uid_pos = yaml
+        .find("uid: tv-aggregator-broadcast-lag-storm")
+        .expect("alert uid must exist");
+    let rest = &yaml[uid_pos..];
+    let severity_pos = rest
+        .find("severity:")
+        .expect("severity label must follow the alert uid");
+    let severity_slice = &rest[severity_pos..severity_pos + 32];
+    assert!(
+        severity_slice.contains("high"),
+        "Wave 6 Sub-PR #1 item 1.4n regression: alert severity must be \
+         `high` (Telegram pages operator). Found: {severity_slice:?}"
+    );
+}
