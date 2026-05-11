@@ -9,8 +9,9 @@
 
 **CANONICAL REFERENCE FILES (read in order):**
 1. `.claude/rules/project/operator-charter-forever.md` — **FOREVER CHARTER** (auto-loaded every session, permanent contract)
-2. `.claude/plans/friday-may-15-mega/step-1-honest-envelope.md` — Mon eve honest envelope (canonical reference for tickvault-specific envelope)
-3. `.claude/plans/friday-may-15-mega/topic-telegram-message-style-rules.md` — Telegram style rules (auto-driver-level only)
+2. `.claude/plans/friday-may-15-mega/00-HIGH-LEVEL-PLAN.md` — **5-MINUTE READABLE SUMMARY** of everything (NEW Mon 23:25 IST)
+3. `.claude/plans/friday-may-15-mega/step-1-honest-envelope.md` — Mon eve honest envelope (canonical reference for tickvault-specific envelope)
+4. `.claude/plans/friday-may-15-mega/topic-telegram-message-style-rules.md` — Telegram style rules (auto-driver-level only)
 
 ---
 
