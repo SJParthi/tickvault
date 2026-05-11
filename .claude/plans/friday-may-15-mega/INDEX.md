@@ -2,7 +2,7 @@
 
 **Plan status:** DISCUSSING (Mon-Wed FAANG-style design reviews underway)
 **Current step:** Step 0 — "WHY are we building this?" (about to start)
-**Last update:** 2026-05-11 20:35 IST (Mon evening)
+**Last update:** 2026-05-11 20:55 IST (Mon evening — tasks/ subdir added for parallel sessions)
 **Total steps planned:** Step 0 through Step ~10 (each ~30-60 min discussion)
 **Final mega plan goes live:** Wed 2026-05-13 23:59 IST
 **Friday execution starts:** 2026-05-15 06:00 IST
@@ -37,6 +37,9 @@ If even `00-decisions-log.md` is corrupted → run `bash scripts/recover.sh`.
 | `.last-cursor.md` | LIVING | (written before every Claude reply) | in-flight state checkpoint |
 | `.session-lock` | OPTIONAL | (only if multiple sessions) | concurrency guard |
 | `01-step-0-why.md` | NOT YET CREATED | — | first discussion topic |
+| `tasks/_board.md` | LIVING | Mon 20:50 IST | live task board for 5+ parallel Claude sessions |
+| `tasks/T00-example-template.md` | TEMPLATE | Mon 20:50 IST | copy-this skeleton for new task files |
+| `tasks/T<NN>-*.md` | NOT YET CREATED | — | one file per executable task (created Tue-Wed) |
 
 ## Verify checklist (run on every session start — scenario 14 hardening)
 
@@ -82,6 +85,7 @@ Numbering is suggestive — operator may reorder / add / remove steps.
 | L4 | First live order DEFERRED to Wave 8 (this week: shadow-max) | Mon 19:00 IST | log entry #4 |
 | L5 | Write-Before-Reply protocol | Mon 20:25 IST | log entry #7 |
 | L6 | Hardened recovery: README + INDEX + decisions-log + cursor + Layer 3 script | Mon 20:35 IST | log entry #8 |
+| L7 | Task Board pattern adopted — `tasks/` subdir + `_board.md` + per-task branches + atomic-claim via commit-push for 5+ parallel sessions | Mon 20:50 IST | log entry #13 |
 
 ---
 
