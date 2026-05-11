@@ -1,11 +1,13 @@
 # INDEX — Friday May 15 Mega Plan workspace
 
-**Plan status:** DISCUSSING (Mon-Wed FAANG-style design reviews underway)
-**Current step:** Step 0 — "WHY are we building this?" (about to start)
-**Last update:** 2026-05-11 20:55 IST (Mon evening — tasks/ subdir added for parallel sessions)
-**Total steps planned:** Step 0 through Step ~10 (each ~30-60 min discussion)
+**Plan status:** DISCUSSING (Mon-Wed FAANG-style design reviews — Mon eve wrapped ✅)
+**Current step:** Step 1 — WS Disconnect Resilience + Honest Envelope ✅ WRAPPED Mon eve. Tue eve resumes with Step 2.
+**Last update:** 2026-05-11 21:40 IST (Mon eve persistence pass — 4 step files written)
+**Total steps planned:** Step 1 (Mon ✅) → Step 2 (Tue) → Step 3 (Wed) → Thu synthesize → Fri execute
 **Final mega plan goes live:** Wed 2026-05-13 23:59 IST
 **Friday execution starts:** 2026-05-15 06:00 IST
+
+**CANONICAL REFERENCE FILE:** `step-1-honest-envelope.md` — any future session opening cold MUST read this FIRST to avoid re-debating closed items (operator charter + honest envelope + 5-layer defence diagram + per-item matrix).
 
 ---
 
@@ -36,7 +38,13 @@ If even `00-decisions-log.md` is corrupted → run `bash scripts/recover.sh`.
 | `scripts/recover.sh` | STABLE | Mon 20:35 IST | Layer 3 transcript fallback |
 | `.last-cursor.md` | LIVING | (written before every Claude reply) | in-flight state checkpoint |
 | `.session-lock` | OPTIONAL | (only if multiple sessions) | concurrency guard |
-| `01-step-0-why.md` | NOT YET CREATED | — | first discussion topic |
+| `step-1-honest-envelope.md` | CANONICAL | Mon 21:35 IST | **READ FIRST** — operator charter + honest envelope + matrix |
+| `step-1-discussion-log-mon-eve.md` | WRAPPED | Mon 21:35 IST | Mon eve transcript summary |
+| `step-2-tue-eve-agenda.md` | PRE-LOADED | Mon 21:35 IST | Tue eve 8 questions on capital + risk |
+| `step-3-wed-eve-agenda.md` | PRE-LOADED | Mon 21:35 IST | Wed eve blocks A-G (adversarial + APPROVAL) |
+| `step-2-discussion-log-tue-eve.md` | NOT YET CREATED | — | Tue eve transcript (written Tue night) |
+| `step-3-discussion-log-wed-eve.md` | NOT YET CREATED | — | Wed eve transcript (written Wed night) |
+| `01-step-0-why.md` | DEPRECATED | — | superseded by `step-1-honest-envelope.md` (numbering reorg) |
 | `tasks/_board.md` | LIVING | Mon 20:50 IST | live task board for 5+ parallel Claude sessions |
 | `tasks/T00-example-template.md` | TEMPLATE | Mon 20:50 IST | copy-this skeleton for new task files |
 | `tasks/T<NN>-*.md` | NOT YET CREATED | — | one file per executable task (created Tue-Wed) |
@@ -86,12 +94,24 @@ Numbering is suggestive — operator may reorder / add / remove steps.
 | L5 | Write-Before-Reply protocol | Mon 20:25 IST | log entry #7 |
 | L6 | Hardened recovery: README + INDEX + decisions-log + cursor + Layer 3 script | Mon 20:35 IST | log entry #8 |
 | L7 | Task Board pattern adopted — `tasks/` subdir + `_board.md` + per-task branches + atomic-claim via commit-push for 5+ parallel sessions | Mon 20:50 IST | log entry #13 |
+| L8 | Honest envelope re-affirmed: literal "never disconnect" IMPOSSIBLE (SEBI 24h JWT). Bounded zero-loss guaranteed in chaos envelope. 22-scenario matrix → 8 gaps. | Mon 20:55 IST | log entry #14 |
+| L9 | Full-mode 11,034 instruments confirmed NOT a disconnect cause; can AMPLIFY backpressure only. | Mon 20:58 IST | log entry #15 |
+| L10 | Phase 0.5 ADOPTED into mega plan: 8+1 items closing 8 of 22 gaps. 5 reserved ErrorCodes promoted + 3 new + 1 verification. | Mon 21:00 IST | log entry #16 |
+| L11 | Mac dev env documented: M4 Pro 14c/48GB out-specs AWS c8g.xlarge. Common-runtime principle preserved. | Mon 21:02 IST | log entry #17 |
+| L12 | Core-pinning design LOCKED: ONE core for ALL 5 WS conns. Same 4-core scheme Mac=AWS. | Mon 21:03 IST | log entry #18 |
+| L13 | Web session 400'd at 21:05 IST. CLI continuation on same branch. Zero context lost (all on disk). | Mon 21:05-21:08 | log entries #19-20 |
+| L14 | Item 0.5.10 ADDED: consolidated `PreMarketReady` Telegram (operator pick A). 200 LoC, Wed sub-PR planning. | Mon 21:15 IST | log entry #21 |
+| L15 | FAANG 3-day map LOCKED: Mon eve = Step 1 ✅ / Tue eve = Step 2 (capital+risk) / Wed eve = Step 3 (adversarial + APPROVAL). NO implementation Mon-Wed. | Mon 21:20 IST | log entry #22 |
+| L16 | Operator charter re-confirmed verbatim. Every plan item carries 15-row + 7-row matrix per per-wave-guarantee-matrix.md. Mechanically enforced. | Mon 21:25 IST | log entry #23 |
+| L17 | Telegram screenshot Mon 9:04 PM IST confirms LIVE system streaming (97,422 derivatives, Auth OK, Order WS reconnect working). | Mon 21:30 IST | log entry #24 |
+| L18 | Persistence pass: 4 new step files + appended log + INDEX update + cursor + commit + push. Future sessions resume from files. | Mon 21:35 IST | log entry #25 |
+| L19 | Step 1 wrapped for Mon eve. NO open Step-1 questions. Tue eve resumes with Step 2. | Mon 21:40 IST | log entry #26 |
 
 ---
 
 ## Next action
 
-Operator and Claude start **Step 0 (`01-step-0-why.md`)** discussion in the next chat turn. Claude creates the file with the WHY options + kid-friendly explanation. Operator picks. Decision goes to log. Move to Step 1.
+**Tue eve session opens cold** → reads INDEX (this file) → reads `step-1-honest-envelope.md` (canonical) → reads `step-2-tue-eve-agenda.md` (pre-loaded 8 questions on capital + risk) → asks operator Q1 (daily loss budget). Decision per Q goes to log. Move through Q1-Q8. End-of-session: write `step-2-discussion-log-tue-eve.md` + update cursor + commit + push.
 
 ---
 
