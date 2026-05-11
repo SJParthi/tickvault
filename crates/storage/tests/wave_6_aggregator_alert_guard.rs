@@ -372,3 +372,37 @@ fn wave_6_aggregator_alert_family_all_severity_high() {
          {wrong_severity:?}"
     );
 }
+
+/// Wave 6 Sub-PR #1 item 1.4r — pins that every alert in the family
+/// carries the `wave: "6"` label so dashboards / Alertmanager routing
+/// rules can filter the Wave 6 family without enumerating each uid.
+#[test]
+fn wave_6_aggregator_alert_family_all_labeled_wave_six() {
+    let yaml = read_alerts_yaml();
+    let uids = [
+        "tv-aggregator-no-seals-during-market",
+        "tv-aggregator-mpsc-drop-storm",
+        "tv-aggregator-broadcast-lag-storm",
+        "tv-aggregator-late-tick-sustained",
+    ];
+    let mut missing_label: Vec<&str> = Vec::new();
+    for uid in &uids {
+        let pos = yaml
+            .find(&format!("uid: {uid}"))
+            .unwrap_or_else(|| panic!("alert uid {uid} must exist (1.4r requires it)"));
+        let end = pos.saturating_add(2000).min(yaml.len());
+        let block = &yaml[pos..end];
+        let has_double_quoted = block.contains("wave: \"6\"");
+        let has_single_quoted = block.contains("wave: '6'");
+        if !has_double_quoted && !has_single_quoted {
+            missing_label.push(*uid);
+        }
+    }
+    assert!(
+        missing_label.is_empty(),
+        "Wave 6 Sub-PR #1 item 1.4r regression: every aggregator drop-class \
+         alert MUST carry `wave: \"6\"` label so dashboards / Alertmanager \
+         routing can group the Wave 6 family without enumerating uids. \
+         Missing the label: {missing_label:?}"
+    );
+}
