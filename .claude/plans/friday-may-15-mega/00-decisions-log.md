@@ -89,6 +89,10 @@
 
 [2026-05-12 00:00 IST] [topic] TELEGRAM RICH VISUALIZATION written to topic-telegram-rich-visualization.md. Operator flagged plain-text Telegrams as boring. Proposed Phase 0.5 Item 0.5.20 — Rich Notification Renderer with 5 sub-items: (a) HTML parse_mode + Unicode progress bars + text sparklines (80 LoC), (b) PNG charts via plotters crate + sendPhoto (200 LoC), (c) animated GIFs via sendAnimation + 5 asset files (100 LoC), (d) inline keyboards + callback handler (150 LoC), (e) live message editing via editMessageText (200 LoC). All 4 pings re-designed in rich format with concrete HTML examples. Total Item 0.5.20 = 730 LoC, all Low severity (style polish). Phase 0.5 now optionally 20 items, ~2,500 LoC. Awaiting operator pick A (full 730 LoC) / B (just text+GIFs 180 LoC) / C (skip, do Wave 6) / D (different variant).
 
+[2026-05-12 00:10 IST] [step-1] PICK A LOCKED: full Phase 0.5 Item 0.5.20 rich treatment (a+b+c+d+e = 730 LoC). Operator: "this animation looks extremely awesome — pick A — this is how everyone would expect like Insta reels or marketing."
+
+[2026-05-12 00:15 IST] [topic] CRISIS / OUTAGE / BREAKAGE VISUALIZATION written to topic-telegram-crisis-visualization.md. 5-tier severity visual hierarchy locked: 🟢 INFO (static GIF, default sound, no pin) / 🔵 NORMAL (subtle pulse) / 🟡 WARNING (pulse + vibrate) / 🔴 CRITICAL (flashing siren + URGENT sound + pinned + auto-repeat every 5 min) / 🚨 EMERGENCY (strobe + SMS + pinned + auto-repeat every 2 min + escalates). 8 concrete crisis scenarios designed (WS-all-dropped, auth-expired, OOM, disk-full, cross-verify-fail, Dhan-outage, zombie-deadlock, risk-breach). Cascade coalescer designed (3 alerts in 60s → 1 consolidated message with root-cause hint). Auto-escalation chain locked (T+5min repeat / T+10min SMS / T+15min email / T+30min voice-call future). Recovery celebration messages designed. Item 0.5.20 expanded with 3 new sub-items (f severity-tier visual, g cascade coalescer, h recovery celebration) bringing total to ~1,160 LoC. Phase 0.5 grows to 20 items, ~2,930 LoC. Friday Session 5 absorbs 510 LoC (a+c+f+h), Wave 6 polish gets 650 LoC (b+d+e+g).
+
 ---
 
 ## Reversal procedure
