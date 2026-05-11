@@ -2132,6 +2132,41 @@
         "graphMode": "none",
         "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" }
       }
+    },
+    {
+      "type": "stat",
+      "id": 54,
+      "title": "Aggregator seals emitted (5m)",
+      "description": "Wave 6 Sub-PR #1 item 1.4i. Sealed candles forwarded from the multi-TF aggregator subscriber task (master switch, 1.4d) to the seal-writer mpsc channel (1.4c) over the last 5 minutes. Wrapped in increase() per Rule 12 — raw counters lie after process restart. Expected: ramps up at 09:15 IST market open, plateaus at ~99K bars/minute (11K instruments x 9 TFs) on minute boundaries, ramps down at 15:30 IST. Companion log line per minute: tail data/logs/app.YYYY-MM-DD.log | grep 'aggregator heartbeat'. Runbook: .claude/rules/project/wave-6-error-codes.md::AGGREGATOR-HB-01.",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 88 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "increase(tv_aggregator_seals_emitted_total[5m])",
+          "legendFormat": "seals emitted",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue" },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background_solid",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" }
+      }
     }
   ]
 }
