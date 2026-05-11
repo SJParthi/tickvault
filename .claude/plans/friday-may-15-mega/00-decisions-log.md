@@ -81,6 +81,8 @@
 
 [2026-05-11 23:10 IST] [meta] BINDING SCOPE: forever-charter applies to (a) every Claude Code session opening this repo, (b) every Claude Cowork task, (c) every new branch claude/*, (d) every PR (template now mandates checklist), (e) every plan item (per-item-guarantee-check.sh enforces matrix), (f) every Friday task on the Task Board. PERMANENT. Cannot be superseded.
 
+[2026-05-11 23:25 IST] [meta] HIGH-LEVEL PLAN written to 00-HIGH-LEVEL-PLAN.md. Single 5-minute readable summary covering: in-one-paragraph mission, 24-hour clock (08:30/09:00/09:13/09:15:30/15:30/16:00 IST), 5 daily Telegrams, 7-day weekly cycle, 365-day yearly handling (holidays/expiries/half-days), 5-layer safety net, 99.9% scenario coverage matrix (90+ scenarios), 19 Phase 0.5 items, Mac vs AWS identical experience, 6 honest confidence guarantees (with envelope), 3-minute boot story, Insta-reel auto-driver summary. INDEX bumped to mark 00-HIGH-LEVEL-PLAN.md as canonical-read-2 alongside operator-charter-forever.md.
+
 ---
 
 ## Reversal procedure
