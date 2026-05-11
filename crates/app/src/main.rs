@@ -1841,6 +1841,108 @@ async fn main() -> Result<()> {
             }
         };
 
+        // Wave 6 Sub-PR #1 item 1.4d — MASTER SWITCH.
+        // Spawns the multi-TF aggregator task that subscribes to the
+        // live tick broadcast and produces sealed candles for the
+        // shadow tables. This is the LAST wire — once this task is
+        // running, the full pipeline is live:
+        //
+        //   Dhan WebSocket → tick_processor → fast_tick_broadcast
+        //     → THIS TASK: MultiTfAggregator::consume_tick → BufferedSeal
+        //       → mpsc::Sender (published in 1.4c) → SealWriterRunner
+        //         → SealAbsorptionPipeline (ring → spill → DLQ)
+        //           → ShadowCandleWriter → candles_*_shadow tables
+        //
+        // Producer-side hot-path budget: ~300 ns per tick across all 9 TFs
+        // (per consume_tick docstring). Cold-path drain handles ILP.
+        //
+        // Lazy registration: pre_populate is called on-demand when
+        // consume_tick reports `instrument_found = false` (the first
+        // tick for that (security_id, exchange_segment_code) pair).
+        // Skips pre-loading the entire 11K-instrument registry to keep
+        // this slice narrow and avoid coupling main.rs to the universe
+        // builder. First tick per instrument is dropped; second tick
+        // onwards folds. Acceptable for the shadow-table validation
+        // phase — over the trading session every active instrument
+        // gets registered after its first tick.
+        {
+            use tickvault_storage::seal_writer_runner::global_seal_sender;
+            use tickvault_trading::candles::{BufferedSeal, MultiTfAggregator};
+
+            // 11K-instrument capacity (matches MAX_TOTAL_SUBSCRIPTIONS
+            // headroom per `aws-budget.md`). HashMap grows lazily so
+            // this is a hint, not a hard cap.
+            const AGGREGATOR_CAPACITY: usize = 11_000;
+
+            let aggregator =
+                std::sync::Arc::new(MultiTfAggregator::with_capacity(AGGREGATOR_CAPACITY));
+            let agg_clone = std::sync::Arc::clone(&aggregator);
+            let mut tick_rx = fast_tick_broadcast_sender.subscribe();
+
+            tokio::spawn(async move {
+                loop {
+                    match tick_rx.recv().await {
+                        Ok(tick) => {
+                            // OnceLock read is cheap — single atomic load.
+                            // None means the writer task failed to construct;
+                            // drop ticks silently (legacy candles_1s path
+                            // still feeds production trading).
+                            let Some(sender) = global_seal_sender() else {
+                                continue;
+                            };
+                            let stats = agg_clone.consume_tick(
+                                &tick,
+                                tick.exchange_segment_code,
+                                |tf, state| {
+                                    let seal = BufferedSeal::new(
+                                        tick.security_id,
+                                        tick.exchange_segment_code,
+                                        tf,
+                                        state,
+                                    );
+                                    // Non-blocking try_send. On full mpsc
+                                    // (writer task fell behind ~20s at peak
+                                    // burst): drop with counter. The
+                                    // producer NEVER blocks on I/O per L-C1.
+                                    if sender.try_send(seal).is_err() {
+                                        metrics::counter!("tv_seal_mpsc_dropped_total")
+                                            .increment(1);
+                                    }
+                                },
+                            );
+                            // Lazy registration for first-time instruments.
+                            // pre_populate is idempotent (only inserts when
+                            // key is absent) so the second-tick-onward path
+                            // is a no-op.
+                            if !stats.instrument_found {
+                                agg_clone.pre_populate(std::iter::once((
+                                    tick.security_id,
+                                    tick.exchange_segment_code,
+                                )));
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            // Broadcast channel overflowed — we lost some
+                            // ticks. Increment counter; the legacy path
+                            // also receives the same ticks via its own
+                            // subscriber, so trading is unaffected.
+                            metrics::counter!("tv_aggregator_tick_lag_total").increment(skipped);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            tracing::info!(
+                                "Wave 6 aggregator subscriber: broadcast closed, exiting"
+                            );
+                            break;
+                        }
+                    }
+                }
+            });
+            tracing::info!(
+                aggregator_capacity = AGGREGATOR_CAPACITY,
+                "Wave 6 Sub-PR #1 item 1.4d — multi-TF aggregator task spawned (master switch ON)"
+            );
+        }
+
         // --- Background: Index constituency (best-effort) ---
         // During market hours, skip network downloads to niftyindices.com
         // (they often return HTML instead of CSV) and use the cached JSON.
