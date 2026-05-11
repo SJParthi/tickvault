@@ -60,13 +60,13 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
@@ -86,6 +86,24 @@ use tickvault_storage::depth_dynamic_diff_audit_persistence::append_depth_dynami
 /// Re-selection cadence — pinned at 60s per the operator spec
 /// (matches the legacy v1 pipeline so dashboards/alerts unchanged).
 const RESELECT_INTERVAL_SECS: u64 = 60;
+
+/// 2026-05-11 v3 — boot-warmup grace window for empty-cohort suppression.
+///
+/// The `movers_1m` materialised view (now sourced from `cascade.snapshot_1m()`)
+/// needs at least one full 1-minute bar of live ticks before it returns any
+/// rows. On a fresh boot at market open the FIRST cohort fetch ALWAYS
+/// returns empty, which used to fire `DEPTH-DYN-V2-01` ERROR (and
+/// therefore Telegram) every single boot — pure pager fatigue.
+///
+/// Within this grace window from pipeline start, an empty cohort is
+/// logged at DEBUG only (no Telegram, no ERROR). After the grace expires
+/// and the cohort is STILL empty, the existing rising-edge ERROR fires
+/// — that is the genuine "movers writer is broken" signal.
+///
+/// 300s = 5 × the 60s reselect cadence, so we tolerate up to 4 empty
+/// 1-minute bars (e.g. ultra-quiet pre-market or full Dhan outage)
+/// before pages. Ratcheted by `test_depth_dyn_boot_grace_secs_is_300`.
+const DEPTH_DYN_BOOT_GRACE_SECS: u64 = 300;
 
 // QUESTDB_SELECT_TIMEOUT_SECS removed in PR 5c.3 — the SQL fallback
 // path was retired so the HTTP timeout has no caller. Re-add if a
@@ -187,6 +205,11 @@ pub fn spawn_depth_dynamic_pool(
         let mut cohort_failing = false;
         let mut diff_failing = false;
         let mut audit_failing = false;
+
+        // 2026-05-11 v3 — boot-warmup tracker for DEPTH_DYN_BOOT_GRACE_SECS.
+        // Captured at task start so a process restart resets the grace
+        // (i.e. each fresh boot gets its own warmup window).
+        let pipeline_started_at = Instant::now();
 
         // PR-C2 follow-up (hostile-bug-hunt fix H3) — positive heartbeat
         // signal. Fires ONCE on the first non-no-op diff cycle so the
@@ -323,11 +346,38 @@ pub fn spawn_depth_dynamic_pool(
                                 MAX_COHORT_SIZE,
                             );
                             if rows.is_empty() {
-                                if !cohort_failing {
+                                // 2026-05-11 v3 — boot-warmup grace window.
+                                // On a fresh boot `cascade.snapshot_1m()`
+                                // returns empty until the first 1-min bar
+                                // has finished aggregating (~60s of live
+                                // ticks). Suppress the ERROR (and therefore
+                                // Telegram) during the grace window —
+                                // operator visibility via DEBUG log +
+                                // metrics counter. After grace expires the
+                                // original rising-edge ERROR fires, which
+                                // is the genuine "movers writer broken"
+                                // signal.
+                                let elapsed = pipeline_started_at.elapsed().as_secs();
+                                let within_boot_grace =
+                                    elapsed < DEPTH_DYN_BOOT_GRACE_SECS;
+                                if within_boot_grace {
+                                    debug!(
+                                        label = cfg.label,
+                                        elapsed_secs = elapsed,
+                                        grace_secs = DEPTH_DYN_BOOT_GRACE_SECS,
+                                        "depth_dynamic_pool_v2 cohort empty during boot warmup grace (movers_1m still building first bar) — skipping cycle"
+                                    );
+                                    metrics::counter!(
+                                        "tv_depth_dynamic_cohort_empty_in_grace_total",
+                                        "label" => cfg.label,
+                                    )
+                                    .increment(1);
+                                } else if !cohort_failing {
                                     error!(
                                         code = "DEPTH-DYN-V2-01",
                                         label = cfg.label,
-                                        "depth_dynamic_pool_v2 cohort fetch failed (RAM empty — SQL fallback retired in PR 5c.3)"
+                                        elapsed_secs = elapsed,
+                                        "depth_dynamic_pool_v2 cohort fetch failed (RAM empty after boot grace — SQL fallback retired in PR 5c.3)"
                                     );
                                     cohort_failing = true;
                                 }
@@ -1230,6 +1280,57 @@ mod tests {
         assert!(
             diff.as_secs() <= 1,
             "two consecutive minute-boundary calls produced Instants {diff:?} apart"
+        );
+    }
+
+    /// 2026-05-11 v3 — boot-warmup grace constant ratchet. Pins the
+    /// 5-minute boot grace at 300s so a future "tighten alerting" PR
+    /// cannot silently shorten the grace and re-introduce the boot-time
+    /// DEPTH-DYN-V2-01 Telegram spam. Tied to the operator directive
+    /// 2026-05-11 (suppress SLO + boot-warmup Telegram noise).
+    #[test]
+    fn test_depth_dyn_boot_grace_secs_is_300() {
+        assert_eq!(
+            DEPTH_DYN_BOOT_GRACE_SECS, 300,
+            "Boot warmup grace MUST be 300s (5 × the 60s reselect cadence) — \
+             a shorter grace re-introduces the DEPTH-DYN-V2-01 boot Telegram spam"
+        );
+        // Cross-relation invariant: grace must be a multiple of the
+        // reselect cadence so we tolerate an integer number of empty cycles.
+        assert_eq!(
+            DEPTH_DYN_BOOT_GRACE_SECS % RESELECT_INTERVAL_SECS,
+            0,
+            "Boot grace ({DEPTH_DYN_BOOT_GRACE_SECS}s) must be a multiple of the reselect cadence ({RESELECT_INTERVAL_SECS}s)"
+        );
+        // Sanity: must tolerate at least 3 empty cycles to absorb any
+        // mid-boot stagger / clock skew between the cadence and the
+        // 1-minute bar boundary.
+        assert!(
+            DEPTH_DYN_BOOT_GRACE_SECS >= RESELECT_INTERVAL_SECS * 3,
+            "Boot grace must tolerate at least 3 empty cycles"
+        );
+    }
+
+    /// 2026-05-11 v3 — source-scan ratchet pinning the boot-grace branch
+    /// in the empty-cohort handler. Removing the `within_boot_grace`
+    /// branch would re-introduce the boot-time DEPTH-DYN-V2-01 ERROR
+    /// every fresh boot.
+    #[test]
+    fn test_boot_grace_branch_present_in_empty_cohort_handler() {
+        let src = include_str!("depth_dynamic_pipeline_v2.rs");
+        assert!(
+            src.contains("within_boot_grace"),
+            "Empty-cohort handler must check the boot grace window — \
+             a missing `within_boot_grace` branch re-introduces boot Telegram spam"
+        );
+        assert!(
+            src.contains("tv_depth_dynamic_cohort_empty_in_grace_total"),
+            "Boot-grace branch must emit the counter for operator visibility"
+        );
+        assert!(
+            src.contains("RAM empty after boot grace"),
+            "Post-grace ERROR message must distinguish itself from the legacy text \
+             so log triage can tell `boot warmup` (silent) from `movers writer broken` (ERROR)"
         );
     }
 
