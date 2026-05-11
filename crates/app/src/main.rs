@@ -1868,7 +1868,7 @@ async fn main() -> Result<()> {
         {
             use tickvault_storage::seal_writer_runner::global_seal_sender;
             use tickvault_trading::candles::{
-                BufferedSeal, MultiTfAggregator, PrevDayRefs, stamp_seal_pct_fields,
+                BufferedSeal, MultiTfAggregator, stamp_seal_pct_fields,
             };
 
             // 11K-instrument capacity (matches MAX_TOTAL_SUBSCRIPTIONS
@@ -1879,6 +1879,16 @@ async fn main() -> Result<()> {
             let aggregator =
                 std::sync::Arc::new(MultiTfAggregator::with_capacity(AGGREGATOR_CAPACITY));
             let agg_clone = std::sync::Arc::clone(&aggregator);
+            // Wave 6 Sub-PR #1 item 1.4g — clone the boot-loaded
+            // `PrevDayCache` (line 673) into the aggregator task so the
+            // seal closure replaces `PrevDayRefs::default()` (all zeros)
+            // with the real day-(N-1) refs. Lookup is O(1) lock-free
+            // (~30 ns on the cold seal path). Returns `None` on cache
+            // miss (newly listed contract or PREVCLOSE-04 cold-boot
+            // empty-table state) — graceful fallback to zeros keeps
+            // the seal valid (compute_*_pct div-by-zero guards per
+            // L-H14 produce 0.0 % values, never NaN).
+            let prev_day_cache_for_agg = std::sync::Arc::clone(&prev_day_cache);
             let mut tick_rx = fast_tick_broadcast_sender.subscribe();
 
             tokio::spawn(async move {
@@ -1896,20 +1906,20 @@ async fn main() -> Result<()> {
                                 &tick,
                                 tick.exchange_segment_code,
                                 |tf, mut state| {
-                                    // Wave 6 Sub-PR #1 item 1.4f — wire
-                                    // stamp_seal_pct_fields (shipped in
-                                    // PR #570) at the seal emission site.
-                                    // Per audit-findings Rule 13, a method
-                                    // that exists + is tested but never
-                                    // called IS a bug. This wires the call
-                                    // site now; the prev_day_cache loader
-                                    // is a separate follow-up. Until that
-                                    // lands, refs are `default()` (all
-                                    // zeros), so close_pct/oi_pct/volume_pct
-                                    // remain 0.0 (handled gracefully by the
-                                    // compute_*_pct div-by-zero guards per
-                                    // L-H14 / PREVCLOSE-04 cold-boot).
-                                    stamp_seal_pct_fields(&mut state, PrevDayRefs::default());
+                                    // Wave 6 Sub-PR #1 item 1.4g — look up
+                                    // real prev-day refs from the boot-
+                                    // loaded `PrevDayCache` (F2 loader,
+                                    // PR #520). Cache miss → fallback to
+                                    // `PrevDayRefs::default()` (all zeros)
+                                    // for newly listed contracts and
+                                    // PREVCLOSE-04 cold-boot scenarios.
+                                    // div-by-zero guards in compute_*_pct
+                                    // produce 0.0 % values per L-H14, so
+                                    // the seal stays valid either way.
+                                    let refs = prev_day_cache_for_agg
+                                        .lookup(tick.security_id, tick.exchange_segment_code)
+                                        .unwrap_or_default();
+                                    stamp_seal_pct_fields(&mut state, refs);
                                     let seal = BufferedSeal::new(
                                         tick.security_id,
                                         tick.exchange_segment_code,
