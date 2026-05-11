@@ -41,12 +41,14 @@
 //! next day's first push does NOT re-allocate). Drain is `O(N)` over
 //! the keys; happens once per trading day off the hot path.
 
+pub mod bar_cache;
 pub mod consumer;
 pub mod prev_day_cache;
 pub mod reset_scheduler;
 pub mod tick_storage;
 pub mod top_n;
 
+pub use bar_cache::{BarCache, CompactBar};
 pub use consumer::run_tick_storage_consumer;
 pub use prev_day_cache::PrevDayCache;
 pub use reset_scheduler::{run_tick_storage_daily_reset, secs_until_next_market_open_ist};
