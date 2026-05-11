@@ -34,6 +34,29 @@ unwritable — by definition catastrophic.
 
 **Source:** `crates/storage/src/shadow_persistence.rs::ShadowCandleWriter::handle_drop`.
 
+### 2026-05-11 Update — 4-alert drop-class family is now live
+
+Per Wave 6 Sub-PR #1 items 1.4j/l/n/o (merged #584/#587/#589/#590) the
+operator has Telegram coverage for EVERY drop class shown on the 1.4k
+dashboard panel:
+
+| Prometheus alert uid | Counter | Threshold | for | PR |
+|---|---|---|---|---|
+| `tv-aggregator-no-seals-during-market` | `tv_aggregator_seals_emitted_total == 0` | seals == 0 / 5m | 5m | #584 |
+| `tv-aggregator-mpsc-drop-storm` | `tv_seal_mpsc_dropped_total` | > 100 / 1m | 1m | #587 |
+| `tv-aggregator-broadcast-lag-storm` | `tv_aggregator_tick_lag_total` | > 100 / 1m | 1m | #589 |
+| `tv-aggregator-late-tick-sustained` | `tv_aggregator_late_ticks_discarded_total` | > 300 / 5m sustained | 5m | #590 |
+
+All 4 alerts:
+- Gated by `tv_market_hours_active == 1` (audit-findings Rule 3)
+- Severity::High (pages Telegram)
+- Wrapped in `increase()` per Rule 12
+
+Family completeness is meta-ratcheted by 3 tests in
+`crates/storage/tests/wave_6_aggregator_alert_guard.rs` (item 1.4p,
+merged #591). Future deletion of any single alert OR severity
+downgrade OR market-hours-gate removal fails the build.
+
 ## AGGREGATOR-LATE-01 — tick arrived after its bucket sealed (discarded)
 
 **Trigger:** at a minute boundary the aggregator sealed a 1m bucket; a
