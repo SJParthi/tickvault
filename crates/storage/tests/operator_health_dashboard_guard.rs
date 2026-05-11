@@ -49,6 +49,15 @@ const REQUIRED_PANELS: &[(&str, &str)] = &[
     // 0.95), red < 0.80. Runbook:
     // .claude/rules/project/wave-3-d-error-codes.md
     ("Real-time guarantee score", "tv_realtime_guarantee_score"),
+    // Wave 6 Sub-PR #1 item 1.4i — aggregator master-switch positive-
+    // signal panel. Pins the operator's one-glance view of "is the
+    // Wave 6 multi-TF aggregator producing sealed candles?".
+    // Wrapped in increase() per Rule 12. Runbook:
+    // .claude/rules/project/wave-6-error-codes.md::AGGREGATOR-HB-01.
+    (
+        "Aggregator seals emitted (5m)",
+        "tv_aggregator_seals_emitted_total",
+    ),
 ];
 
 fn workspace_root() -> PathBuf {
