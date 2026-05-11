@@ -1,11 +1,11 @@
 # INDEX — Friday May 15 Mega Plan workspace
 
-**Plan status:** DISCUSSING (Mon-Wed FAANG-style design reviews — Mon eve wrapped ✅)
-**Current step:** Step 1 — WS Disconnect Resilience + Honest Envelope ✅ WRAPPED Mon eve. Tue eve resumes with Step 2.
-**Last update:** 2026-05-11 21:40 IST (Mon eve persistence pass — 4 step files written)
-**Total steps planned:** Step 1 (Mon ✅) → Step 2 (Tue) → Step 3 (Wed) → Thu synthesize → Fri execute
-**Final mega plan goes live:** Wed 2026-05-13 23:59 IST
-**Friday execution starts:** 2026-05-15 06:00 IST
+**Plan status:** DISCUSSING (FREE-FORM BRAINSTORM mode — calendar dropped 21:50 IST)
+**Current step:** No fixed sequence — operator drives topics, Claude responds. Step 1 (WS resilience + envelope) WRAPPED ✅. Topic pools available for: capital + risk / approval mechanism / anything new operator brings up.
+**Last update:** 2026-05-11 21:50 IST (calendar dropped, brainstorm mode locked)
+**Mode:** Operator spits thoughts → Claude debates / synthesizes / argues / agrees → decisions land in `00-decisions-log.md` → tables + diagrams persist in topic files → commit + push every session.
+**Friday execution target:** 2026-05-15 (retained — when we're ready, we go)
+**No implementation rule:** STILL ACTIVE. Brainstorm + design only. Code lands Friday.
 
 **CANONICAL REFERENCE FILE:** `step-1-honest-envelope.md` — any future session opening cold MUST read this FIRST to avoid re-debating closed items (operator charter + honest envelope + 5-layer defence diagram + per-item matrix).
 
@@ -40,10 +40,8 @@ If even `00-decisions-log.md` is corrupted → run `bash scripts/recover.sh`.
 | `.session-lock` | OPTIONAL | (only if multiple sessions) | concurrency guard |
 | `step-1-honest-envelope.md` | CANONICAL | Mon 21:35 IST | **READ FIRST** — operator charter + honest envelope + matrix |
 | `step-1-discussion-log-mon-eve.md` | WRAPPED | Mon 21:35 IST | Mon eve transcript summary |
-| `step-2-tue-eve-agenda.md` | PRE-LOADED | Mon 21:35 IST | Tue eve 8 questions on capital + risk |
-| `step-3-wed-eve-agenda.md` | PRE-LOADED | Mon 21:35 IST | Wed eve blocks A-G (adversarial + APPROVAL) |
-| `step-2-discussion-log-tue-eve.md` | NOT YET CREATED | — | Tue eve transcript (written Tue night) |
-| `step-3-discussion-log-wed-eve.md` | NOT YET CREATED | — | Wed eve transcript (written Wed night) |
+| `step-2-tue-eve-agenda.md` | TOPIC POOL (calendar dropped) | Mon 21:35 IST | 8 questions on capital + risk — pull when topic comes up |
+| `step-3-wed-eve-agenda.md` | TOPIC POOL (calendar dropped) | Mon 21:35 IST | 7 blocks A-G (adversarial + approval mechanism) — pull when topic comes up |
 | `01-step-0-why.md` | DEPRECATED | — | superseded by `step-1-honest-envelope.md` (numbering reorg) |
 | `tasks/_board.md` | LIVING | Mon 20:50 IST | live task board for 5+ parallel Claude sessions |
 | `tasks/T00-example-template.md` | TEMPLATE | Mon 20:50 IST | copy-this skeleton for new task files |

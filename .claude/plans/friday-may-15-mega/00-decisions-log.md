@@ -59,6 +59,8 @@
 
 [2026-05-11 21:40 IST] [meta] STEP 1 WRAPPED for Mon eve. Tue eve resumes with Step 2 (capital + risk engine, 8 pre-loaded questions). Wed eve = Step 3 (adversarial 3-agent review + APPROVAL flip). NO open Step-1 questions remain — operator's verbatim charter answered, Phase 0.5 locked, 5-layer defence diagram persisted, per-item matrix mandated. Any future session opening cold: read step-1-honest-envelope.md FIRST.
 
+[2026-05-11 21:50 IST] [meta] SUPERSEDED entries 21:20 + 21:40 IST FAANG-3-day calendar: operator dropped the rigid Mon/Tue/Wed/Thu schedule. New mode = FREE-FORM BRAINSTORM. Operator spits thoughts/ideas/decisions/arguments whenever, Claude responds with debate/synthesis. Existing step-2-tue-eve-agenda.md + step-3-wed-eve-agenda.md become TOPIC POOLS (not calendar items) — pull from them anytime. Rules that still hold: (a) NO implementation, (b) every decision persists to files, (c) commit + push every session-end, (d) honest-envelope charter in step-1-honest-envelope.md is canonical, (e) per-item 15-row + 7-row matrix on every plan item, (f) every-session auto-everything via MCP. Friday execution-day target retained — when we get there, we get there.
+
 ---
 
 ## Reversal procedure
