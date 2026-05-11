@@ -44,9 +44,138 @@
 //! 1.4a) are union-queried via `UNION ALL` so a single SELECT yields
 //! every TF in one dataset.
 
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use serde::Deserialize;
 use serde_json::Value;
+use tickvault_common::config::QuestDbConfig;
 use tickvault_trading::candles::TfIndex;
 use tickvault_trading::in_mem::{BarCache, CompactBar};
+
+/// QuestDB `/exec` JSON response (only the `dataset` field is used).
+#[derive(Debug, Deserialize)]
+struct QuestDbExecResponse {
+    #[serde(default)]
+    dataset: Value,
+}
+
+/// HTTP request timeout for the boot SELECT.
+///
+/// Mirrors the `prev_day_cache_loader::QUESTDB_QUERY_TIMEOUT_SECS = 10`.
+/// The union SELECT across 9 shadow tables can return up to ~11M rows
+/// (today + yesterday × 9 TFs × ~5.5M per TF averaged) so the timeout
+/// is generous.
+const BAR_CACHE_QUERY_TIMEOUT_SECS: u64 = 30;
+
+/// IST seconds-per-day cutoff: 24h. Used in `dateadd('d', -1, now())`
+/// equivalent — load today + yesterday only.
+const BAR_CACHE_LOOKBACK_DAYS: i32 = 2;
+
+/// Build the UNION ALL SQL across the 9 shadow tables. Pure function
+/// so the caller can inspect the SQL in a test without spinning
+/// QuestDB.
+#[must_use]
+pub fn build_bar_cache_select_sql() -> String {
+    let tables = [
+        ("candles_1m_shadow", "1m"),
+        ("candles_5m_shadow", "5m"),
+        ("candles_15m_shadow", "15m"),
+        ("candles_30m_shadow", "30m"),
+        ("candles_1h_shadow", "1h"),
+        ("candles_2h_shadow", "2h"),
+        ("candles_3h_shadow", "3h"),
+        ("candles_4h_shadow", "4h"),
+        ("candles_1d_shadow", "1d"),
+    ];
+    let mut sql = String::with_capacity(2048); // O(1) EXEMPT: cold-path boot SELECT builder
+    for (idx, (table, tf_label)) in tables.iter().enumerate() {
+        if idx > 0 {
+            sql.push_str(" UNION ALL ");
+        }
+        sql.push_str(&format!(
+            "SELECT exchange_segment, '{tf_label}' AS timeframe, security_id, \
+             (ts / 1000000000) AS bucket_start_ist_secs, open, high, low, close, \
+             volume, oi, tick_count FROM {table} \
+             WHERE ts >= dateadd('d', -{BAR_CACHE_LOOKBACK_DAYS}, now())"
+        ));
+    }
+    sql
+}
+
+/// Diagnostic outcome of [`populate_bar_cache_at_boot`].
+///
+/// Mirrors `prev_day_cache_loader::PopulationOutcome`. Lets the caller
+/// distinguish "table empty" (`rows_inserted == 0`) from "schema
+/// drift" (`skipped_malformed > 0`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PopulationOutcome {
+    pub rows_inserted: usize,
+    pub skipped_unknown_segment: u32,
+    pub skipped_unknown_tf: u32,
+    pub skipped_malformed: u32,
+}
+
+/// Boot-time entry point: read today + yesterday sealed bars from the
+/// 9 `candles_<tf>_shadow` tables and populate the `BarCache`.
+///
+/// Best-effort — emits `Err` on QuestDB unavailability so the caller
+/// can log + continue boot. The hot-path code paths that read from
+/// `BarCache` already handle `lookup() == None` gracefully (the
+/// indicator engine will simply fall back to the on-tick partial-bar
+/// state until the next seal completes).
+///
+/// Cold path — called once at boot. Bounded by total bar count
+/// (~11M for today + yesterday). At ~2M papaya inserts/sec the merge
+/// step takes ~6 seconds; the QuestDB HTTP roundtrip dominates.
+///
+/// NOT yet wired into `main.rs` — gated on Wave 6 sub-PR #4
+/// promotion. The shadow tables become production at that point and
+/// this loader's `WHERE ts >= dateadd('d', -2, now())` filter starts
+/// returning real data instead of partial shadow-validation rows.
+pub async fn populate_bar_cache_at_boot(
+    questdb_config: &QuestDbConfig,
+    cache: &BarCache,
+) -> Result<PopulationOutcome> {
+    let url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(BAR_CACHE_QUERY_TIMEOUT_SECS))
+        .build()
+        .context("build reqwest client for bar_cache SELECT")?;
+    let sql = build_bar_cache_select_sql();
+    let resp = client
+        .get(&url)
+        .query(&[("query", sql.as_str())])
+        .send()
+        .await
+        .context("HTTP GET bar_cache SELECT against QuestDB")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body_truncated: String = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect::<String>(); // O(1) EXEMPT: cold-path error logging.
+        anyhow::bail!("QuestDB bar_cache SELECT returned HTTP {status}: {body_truncated}");
+    }
+    let parsed_body: QuestDbExecResponse = resp
+        .json()
+        .await
+        .context("parse QuestDB JSON dataset for bar_cache SELECT")?;
+    let parse_result = parse_questdb_bar_dataset(&parsed_body.dataset);
+    let inserted = merge_into_cache(&parse_result.rows, cache);
+    Ok(PopulationOutcome {
+        rows_inserted: inserted,
+        skipped_unknown_segment: parse_result.skipped_unknown_segment,
+        skipped_unknown_tf: parse_result.skipped_unknown_tf,
+        skipped_malformed: parse_result.skipped_malformed,
+    })
+}
 
 /// One parsed row from the QuestDB dataset response. Carries all the
 /// dimensions needed to insert into [`BarCache`] in one shot.
@@ -495,5 +624,65 @@ mod tests {
         let inserted = merge_into_cache(&result.rows, &cache);
         assert_eq!(inserted, 2);
         assert_eq!(cache.len_bars(), 2);
+    }
+
+    #[test]
+    fn test_build_sql_includes_all_9_shadow_tables() {
+        let sql = build_bar_cache_select_sql();
+        for table in [
+            "candles_1m_shadow",
+            "candles_5m_shadow",
+            "candles_15m_shadow",
+            "candles_30m_shadow",
+            "candles_1h_shadow",
+            "candles_2h_shadow",
+            "candles_3h_shadow",
+            "candles_4h_shadow",
+            "candles_1d_shadow",
+        ] {
+            assert!(
+                sql.contains(table),
+                "SQL must include FROM {table} clause; got:\n{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_sql_uses_union_all_between_tables() {
+        let sql = build_bar_cache_select_sql();
+        let union_count = sql.matches(" UNION ALL ").count();
+        assert_eq!(
+            union_count, 8,
+            "9 tables → 8 UNION ALL separators; got {union_count}\nSQL:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn test_build_sql_converts_ts_nanos_to_secs() {
+        let sql = build_bar_cache_select_sql();
+        assert!(
+            sql.contains("(ts / 1000000000) AS bucket_start_ist_secs"),
+            "SQL must divide ts (nanos) by 1e9 to get bucket_start_ist_secs; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn test_build_sql_filters_to_last_2_days() {
+        let sql = build_bar_cache_select_sql();
+        assert!(
+            sql.contains("dateadd('d', -2, now())"),
+            "SQL must filter to last 2 days (today + yesterday); got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn test_build_sql_injects_tf_label_literals() {
+        let sql = build_bar_cache_select_sql();
+        for tf_label in ["1m", "5m", "15m", "30m", "1h", "2h", "3h", "4h", "1d"] {
+            assert!(
+                sql.contains(&format!("'{tf_label}' AS timeframe")),
+                "SQL must inject TF literal '{tf_label}' AS timeframe; got:\n{sql}"
+            );
+        }
     }
 }
