@@ -212,3 +212,58 @@ fn aggregator_broadcast_lag_storm_alert_severity_is_high() {
          `high` (Telegram pages operator). Found: {severity_slice:?}"
     );
 }
+
+// Wave 6 Sub-PR #1 item 1.4o — companion alert for the
+// `tv_aggregator_late_ticks_discarded_total` counter (4th drop class:
+// tick arrived AFTER its bucket sealed). Threshold is sustained
+// 60/min for 5m (= > 300/5m) to filter routine IST midnight rollover.
+
+#[test]
+fn aggregator_late_tick_sustained_alert_uid_is_pinned() {
+    let yaml = read_alerts_yaml();
+    assert!(
+        yaml.contains("uid: tv-aggregator-late-tick-sustained"),
+        "Wave 6 Sub-PR #1 item 1.4o regression: alert \
+         `tv-aggregator-late-tick-sustained` MUST exist in alerts.yml \
+         so the operator gets a Telegram page when late-tick rate \
+         stays > 60/min for 5 consecutive minutes during market hours \
+         (clock drift or slow consumer per AGGREGATOR-LATE-01)."
+    );
+}
+
+#[test]
+fn aggregator_late_tick_sustained_alert_expression_includes_market_hours_gate() {
+    let yaml = read_alerts_yaml();
+    assert!(
+        yaml.contains("increase(tv_aggregator_late_ticks_discarded_total[5m]) > 300"),
+        "Wave 6 Sub-PR #1 item 1.4o regression: alert expression must \
+         reference `increase(tv_aggregator_late_ticks_discarded_total[5m]) > 300` \
+         (= sustained 60/min for 5m) per audit-findings Rule 12."
+    );
+    let uid_pos = yaml
+        .find("uid: tv-aggregator-late-tick-sustained")
+        .expect("alert uid must exist");
+    let rest = &yaml[uid_pos..uid_pos.saturating_add(2000).min(yaml.len())];
+    assert!(
+        rest.contains("tv_market_hours_active == 1"),
+        "Wave 6 Sub-PR #1 item 1.4o regression: tv-aggregator-late-tick-sustained \
+         MUST be gated by `tv_market_hours_active == 1` per audit-findings Rule 3."
+    );
+}
+
+#[test]
+fn aggregator_late_tick_sustained_alert_for_window_is_5m() {
+    let yaml = read_alerts_yaml();
+    let uid_pos = yaml
+        .find("uid: tv-aggregator-late-tick-sustained")
+        .expect("alert uid must exist");
+    let rest = &yaml[uid_pos..];
+    let for_pos = rest.find("for:").expect("for: clause must exist");
+    let for_slice = &rest[for_pos..for_pos + 16];
+    assert!(
+        for_slice.contains("5m"),
+        "Wave 6 Sub-PR #1 item 1.4o regression: alert `for:` window must \
+         be `5m` so transient IST midnight cascade bursts do not fire. \
+         Found: {for_slice:?}"
+    );
+}
