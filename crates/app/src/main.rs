@@ -1907,9 +1907,29 @@ async fn main() -> Result<()> {
                                     if sender.try_send(seal).is_err() {
                                         metrics::counter!("tv_seal_mpsc_dropped_total")
                                             .increment(1);
+                                    } else {
+                                        // Wave 6 Sub-PR #1 item 1.4e —
+                                        // positive-signal counter so the
+                                        // operator can see in Grafana that
+                                        // the master switch is actually
+                                        // producing seals. Labels are not
+                                        // used here (one global counter)
+                                        // because the per-TF / per-segment
+                                        // breakdown lives in the
+                                        // `aggregator_seal_audit` table.
+                                        metrics::counter!("tv_aggregator_seals_emitted_total")
+                                            .increment(1);
                                     }
                                 },
                             );
+                            // Wave 6 Sub-PR #1 item 1.4e — emit observability
+                            // counters from `ConsumeStats`. These are the
+                            // operator's first visibility into whether the
+                            // 1.4d master switch is processing live ticks.
+                            if stats.late_count > 0 {
+                                metrics::counter!("tv_aggregator_late_ticks_discarded_total")
+                                    .increment(u64::from(stats.late_count));
+                            }
                             // Lazy registration for first-time instruments.
                             // pre_populate is idempotent (only inserts when
                             // key is absent) so the second-tick-onward path
@@ -1919,6 +1939,13 @@ async fn main() -> Result<()> {
                                     tick.security_id,
                                     tick.exchange_segment_code,
                                 )));
+                                // Wave 6 Sub-PR #1 item 1.4e — count lazy
+                                // registrations so the operator can see the
+                                // ramp-up curve in the first minutes of the
+                                // session as each instrument's first tick
+                                // arrives.
+                                metrics::counter!("tv_aggregator_instruments_lazy_inserted_total")
+                                    .increment(1);
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
