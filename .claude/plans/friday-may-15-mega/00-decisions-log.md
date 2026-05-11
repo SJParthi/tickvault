@@ -87,6 +87,8 @@
 
 [2026-05-11 23:42 IST] [topic] TELEGRAM TIMELINE 08:30→09:15:30 written to topic-telegram-timeline-0830-to-0915.md. Operator's "show me exact messages 8:30 till 9:15 AM" answered: 4 ping schedule with FULL message bodies (PreMarketReady 08:33 with 18-checkmark consolidation / MarketOpening 09:00 / Phase2Complete 09:13:30 / MarketOpenStreaming 09:15:30) + degraded + critical variants + before/after comparison with today's 6-fragment Telegram screenshot. Daily Telegram budget on healthy day = 5 messages (4 pre-market + 1 cross-verify at 16:00). Weekend/holiday = 0 messages.
 
+[2026-05-12 00:00 IST] [topic] TELEGRAM RICH VISUALIZATION written to topic-telegram-rich-visualization.md. Operator flagged plain-text Telegrams as boring. Proposed Phase 0.5 Item 0.5.20 — Rich Notification Renderer with 5 sub-items: (a) HTML parse_mode + Unicode progress bars + text sparklines (80 LoC), (b) PNG charts via plotters crate + sendPhoto (200 LoC), (c) animated GIFs via sendAnimation + 5 asset files (100 LoC), (d) inline keyboards + callback handler (150 LoC), (e) live message editing via editMessageText (200 LoC). All 4 pings re-designed in rich format with concrete HTML examples. Total Item 0.5.20 = 730 LoC, all Low severity (style polish). Phase 0.5 now optionally 20 items, ~2,500 LoC. Awaiting operator pick A (full 730 LoC) / B (just text+GIFs 180 LoC) / C (skip, do Wave 6) / D (different variant).
+
 ---
 
 ## Reversal procedure
