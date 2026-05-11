@@ -1632,3 +1632,47 @@ groups:
         labels:
           severity: high
           wave: "6"
+
+      # Wave 6 Sub-PR #1 item 1.4n — companion alert for the
+      # tv_aggregator_tick_lag_total counter (broadcast::recv() returned
+      # Lagged because the subscriber fell behind the producer). > 100
+      # lag events in 1m during market hours is a strong signal that
+      # the subscriber loop is starving — under normal load with the
+      # broadcast channel sized for the live tick rate this should
+      # NEVER happen. If it does, ticks are being SKIPPED at the
+      # broadcast boundary and shadow seals will under-count.
+      - uid: tv-aggregator-broadcast-lag-storm
+        title: "Wave 6 — aggregator broadcast lag storm (>100/min)"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 60, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "(increase(tv_aggregator_tick_lag_total[1m]) > 100) and on() tv_market_hours_active == 1"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 60, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 60, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 1m
+        annotations:
+          summary: "Wave 6: > 100 aggregator broadcast lag events in last 1m during market hours"
+          description: "The Wave 6 multi-TF aggregator subscriber task fell behind the fast_tick_broadcast producer enough that > 100 frames were dropped at the broadcast boundary in the last 1 min during 09:15-15:30 IST. Note: the LEGACY tick pipeline subscribes to the SAME broadcast channel, so trading is NOT affected (this is purely shadow-table coverage loss). Likely cause: subscriber task's consume_tick + try_send path is too slow per tick — investigate hot-path budget (audit-findings Rule 3 + Wave 6 §1.6 DHAT bench). Runbook: .claude/rules/project/wave-6-error-codes.md::AGGREGATOR-DROP-01."
+        labels:
+          severity: high
+          wave: "6"
