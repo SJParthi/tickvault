@@ -67,6 +67,14 @@
 
 [2026-05-11 22:30 IST] [topic] BYZANTINE / ZOMBIE / "LOOKS HEALTHY BUT ISN'T" matrix written to topic-byzantine-and-zombie-scenarios.md. 68 Byzantine scenarios enumerated across 10 categories: Process-level / Network "TCP open no flow" / Storage "write OK no commit" / Time-clock / Resource exhaustion / False-OK telemetry / Compound cascade / Logical off-by-one / Operator-introduced / Dhan-side silent semantic changes. 24 NEW gaps identified (G19-G46) on top of the 18 from prior matrix. Severity breakdown: 1 Critical (G38 dual-instance live-lock — must close before any live order) + 5 High + 12 Medium + 10 Low. 6 Phase 0.5 additions proposed (0.5.13-0.5.18) to hit 99% Byzantine coverage at ~600 LoC. Honest envelope language preserved. Awaiting operator pick.
 
+[2026-05-11 22:45 IST] [topic] PRE-MARKET READINESS FLOW written to topic-pre-market-readiness-flow.md. 45-min golden window 08:30 → 09:15:30 IST mapped step-by-step. 4-ping Telegram schedule locked: PreMarketReady at 08:33 (18-checkpoint consolidated message replacing 6 fragments) + MarketOpening at 09:00 (WS handshake survived) + Phase2Complete+DepthAnchor at 09:13:30 + MarketOpenStreamingConfirmation at 09:15:30. Degraded + Critical variants designed for failure paths. Mac local = AWS prod identical experience (only "Environment:" field differs). Boot budget: 3 min target / 5 min warn / 25 min HALT at 09:00.
+
+[2026-05-11 22:50 IST] [step-1] ALL 6 PHASE 0.5 ADDITIONS ADOPTED (operator: "add everything into the plans docs"). Phase 0.5 grows from 10 items to 18 items. New items 0.5.11 (renewal-task supervisor, ~80 LoC, Med) + 0.5.12 (pool-supervisor-supervisor, ~60 LoC, Med) + 0.5.13 (🔥 dual-instance live-lock, ~50 LoC, CRITICAL — MUST close before any live order) + 0.5.14 (Tokio deadlock liveness probe, ~100 LoC, High) + 0.5.15 (TCP-flow watchdog per-conn, ~80 LoC, High) + 0.5.16 (Subscribe-ACK parser, ~120 LoC, High) + 0.5.17 (Cross-validation 2-source agreement, ~150 LoC, High) + 0.5.18 (Mid-rebalance replay from subscription_audit, ~100 LoC, High). Total Phase 0.5: ~1,690 LoC. Doable Friday parallel sessions (3-5 sessions × 350 LoC each).
+
+[2026-05-11 22:50 IST] [step-1] Item 0.5.10 LoC estimate raised from 200 → 250 to accommodate MarketOpening 09:00 IST ping + 18-checkpoint state collection + degraded/critical variants.
+
+[2026-05-11 22:50 IST] [meta] COMMON-RUNTIME PRINCIPLE re-affirmed for pre-market flow: Mac dev and AWS prod produce IDENTICAL 4-ping Telegram sequence. Only the "Environment:" line differs in PreMarketReady message ("AWS c8g.xlarge ap-south-1" vs "Mac M4 Pro local"). Same docker-compose, same boot sequence, same checkpoints, same confidence.
+
 ---
 
 ## Reversal procedure
