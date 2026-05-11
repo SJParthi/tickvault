@@ -210,6 +210,42 @@ impl BarCache {
     }
 }
 
+/// Compute the `clear_before` threshold for the daily IST-midnight
+/// BarCache rollover.
+///
+/// Given the current IST epoch second, returns the IST epoch second
+/// at which "yesterday" begins. Bars with `bucket_start_ist_secs <
+/// threshold` get evicted by [`BarCache::clear_before`], preserving
+/// **today + yesterday** in the cache.
+///
+/// ## Example
+///
+/// At IST midnight on day-N:
+/// - `now_ist_epoch_secs` = start of day-N (e.g. 1715040000)
+/// - `today_midnight` = `now / 86400 * 86400` = day-N start
+/// - `threshold` = `today_midnight - 86400` = day-(N-1) start
+/// - Bars with `bucket_start < day-(N-1) start` get evicted
+/// - Day-(N-1) (yesterday) + day-N (today, empty so far) preserved
+///
+/// ## Pure function
+///
+/// No I/O, no allocation, `const fn`-eligible (but kept `fn` for
+/// `SECONDS_PER_DAY` import readability). Safe for use inside the
+/// `tokio::spawn`-able daily rollover task without `await` points.
+///
+/// ## Status
+///
+/// Wave 7-A4.10 ships this helper as the pure-logic primitive. The
+/// `tokio::spawn` task that calls `BarCache::clear_before(threshold)`
+/// at IST midnight is a separate wiring follow-up (mirrors
+/// `reset_scheduler::run_tick_storage_daily_reset`).
+#[must_use]
+pub fn bar_cache_clear_before_threshold(now_ist_epoch_secs: u32) -> u32 {
+    use tickvault_common::constants::SECONDS_PER_DAY;
+    let today_midnight = (now_ist_epoch_secs / SECONDS_PER_DAY) * SECONDS_PER_DAY;
+    today_midnight.saturating_sub(SECONDS_PER_DAY)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,5 +445,92 @@ mod tests {
         }
         let expected = 100 * std::mem::size_of::<CompactBar>() as u64;
         assert_eq!(cache.estimated_bytes(), expected);
+    }
+
+    // Wave 7-A4 sub-PR #10 (W7-A4.10) — daily IST-midnight rollover
+    // threshold helper.
+
+    #[test]
+    fn test_threshold_at_exact_ist_midnight_returns_yesterday_start() {
+        // now = exact IST midnight today (multiple of 86400).
+        let today_midnight: u32 = 1_715_040_000; // arbitrary aligned value
+        let yesterday_start = today_midnight - 86_400;
+        assert_eq!(
+            bar_cache_clear_before_threshold(today_midnight),
+            yesterday_start
+        );
+    }
+
+    #[test]
+    fn test_threshold_at_noon_returns_yesterday_start() {
+        // now = noon (12:00:00) on today. Threshold = start of
+        // yesterday, NOT start of today (we want to keep today + yesterday).
+        let today_midnight: u32 = 1_715_040_000;
+        let noon = today_midnight + 12 * 3600;
+        let yesterday_start = today_midnight - 86_400;
+        assert_eq!(bar_cache_clear_before_threshold(noon), yesterday_start);
+    }
+
+    #[test]
+    fn test_threshold_at_one_second_before_next_midnight() {
+        // now = 23:59:59 on today. Threshold still = yesterday_start.
+        let today_midnight: u32 = 1_715_040_000;
+        let last_sec = today_midnight + 86_399;
+        let yesterday_start = today_midnight - 86_400;
+        assert_eq!(bar_cache_clear_before_threshold(last_sec), yesterday_start);
+    }
+
+    #[test]
+    fn test_threshold_at_one_second_after_next_midnight() {
+        // now = 00:00:01 on tomorrow. Threshold ROLLS to today's start.
+        let today_midnight: u32 = 1_715_040_000;
+        let tomorrow_first_sec = today_midnight + 86_401;
+        // After rollover: "today" is what was tomorrow; "yesterday" is what was today.
+        // threshold = (tomorrow_midnight) - 86400 = today_midnight.
+        let expected_threshold = today_midnight;
+        assert_eq!(
+            bar_cache_clear_before_threshold(tomorrow_first_sec),
+            expected_threshold
+        );
+    }
+
+    #[test]
+    fn test_threshold_saturates_at_epoch_zero() {
+        // Defensive: if now < 86400 (impossibly early in IST epoch),
+        // saturating_sub prevents underflow.
+        assert_eq!(bar_cache_clear_before_threshold(0), 0);
+        assert_eq!(bar_cache_clear_before_threshold(100), 0);
+        assert_eq!(bar_cache_clear_before_threshold(86_399), 0);
+    }
+
+    #[test]
+    fn test_threshold_used_with_clear_before_keeps_yesterday_and_today() {
+        let cache = BarCache::new();
+        let today_midnight: u32 = 1_715_040_000;
+        let day_before_yesterday_start = today_midnight - 2 * 86_400;
+        let yesterday_start = today_midnight - 86_400;
+        let today_noon = today_midnight + 12 * 3600;
+        // Insert bars from 3 different days.
+        cache.insert(
+            13,
+            0,
+            TfIndex::M1,
+            make_bar(day_before_yesterday_start, 100.0, 0),
+        );
+        cache.insert(13, 0, TfIndex::M1, make_bar(yesterday_start, 110.0, 0));
+        cache.insert(13, 0, TfIndex::M1, make_bar(today_noon, 120.0, 0));
+        assert_eq!(cache.len_bars(), 3);
+        // Apply rollover threshold "as of now = today noon".
+        let threshold = bar_cache_clear_before_threshold(today_noon);
+        cache.clear_before(threshold);
+        // Day-before-yesterday is dropped; yesterday + today survive.
+        assert_eq!(cache.len_bars(), 2);
+        assert!(
+            cache
+                .lookup(13, 0, TfIndex::M1, day_before_yesterday_start)
+                .is_none()
+        );
+        assert!(cache.lookup(13, 0, TfIndex::M1, yesterday_start).is_some());
+        assert!(cache.lookup(13, 0, TfIndex::M1, today_noon).is_some());
     }
 }
