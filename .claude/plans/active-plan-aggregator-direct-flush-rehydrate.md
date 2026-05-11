@@ -596,3 +596,96 @@ All wired into `crates/storage/tests/resilience_sla_alert_guard.rs` ratchet.
 When operator says "start sub-PR #1": next session creates branch `claude/wave-6-pr1-multi-tf-aggregator` from latest `main`, implements aggregator engine per items 1.1–1.7, runs adversarial 3-agent review (pre + post), fills 12-box done matrix, opens draft PR.
 
 **This plan is the contract. Every sub-PR delivers against it. No silent scope creep.**
+
+---
+
+## 🧠 Wave 7-A4 — RAM-First Hot-Path Hardening (5 sub-PRs)
+
+**Status:** DRAFT — added 2026-05-11 per operator request to cover the
+entire active plan in one file. Spec source:
+`.claude/rules/project/aws-budget.md` § "Host Memory Budget — Wave 7-A4
+Locked (2026-05-10)" and § "RAM-First Architecture (Wave 7-A4 mandatory)".
+
+**Why this is in this plan file:** Wave 6 (sub-PRs #1–#4 above) builds
+the **WRITE path** — candles in RAM, flushed to shadow tables. Wave 7-A4
+locks down the **READ path** — every trading decision reads from RAM,
+never queries QuestDB on the tick→order critical path. The two
+workstreams share the same sealed-bar data — Wave 6 produces it, Wave
+7-A4 consumes it. Tracking them in one plan prevents drift between
+producer + consumer assumptions.
+
+**Honest scope statement (per `wave-4-shared-preamble.md` §8):** Wave
+7-A4 ships the data structures + ratchets. The actual indicator /
+strategy migration to RAM-first reads is gated on Wave 6 sub-PR #4
+(promotion) — shadow tables become production at that point, and the
+RAM-first reads target the same sealed-bar source.
+
+### Demand (from operator + aws-budget.md)
+
+| Demand | Wave 7-A4 mechanism |
+|---|---|
+| Zero ticks lost during ≤30s QuestDB outage | bump `TICK_BUFFER_CAPACITY` 2M → 5M (3 hours peak absorbed) |
+| Today's sealed bars in RAM (no DB hit on hot path) | new `BarCache` module with today + yesterday in compact 32B format |
+| Yesterday's sealed bars in RAM (gap detection + prev-day refs) | same `BarCache` module, partitioned by trading_date_ist |
+| Indicator state in RAM (RSI/MACD/BB/EMA/SMA) | already in RAM today via `trading::indicator::IndicatorEngine` — Wave 7-A4 just pins the ban |
+| RAM-first guard on hot path | banned-pattern hook rejects SELECT in `crates/trading/src/{strategy,indicator}/` + `crates/trading/src/oms/risk_check.rs` + `crates/core/src/pipeline/tick_processor.rs` |
+| 8GB AWS instance memory budget | `BarCache` ~176MB (today + yesterday × 9 TFs × 11K instruments × 32B) — fits in app's 2GB allocation per aws-budget.md |
+
+### Sub-PR breakdown (5 narrow sub-PRs)
+
+| # | Sub-PR | Files | LoC | Status |
+|---|---|---|---|---|
+| **W7-A4.1** | bump `TICK_BUFFER_CAPACITY` 2M → 5M + ratchet | `crates/common/src/constants.rs` + ratchet test | ~15 | NOT STARTED |
+| **W7-A4.2** | banned-pattern guard for SELECT in hot-path crates | `.claude/hooks/banned-pattern-scanner.sh` category 7 + negative self-test | ~40 | NOT STARTED |
+| **W7-A4.3** | `BarCache` module — today + yesterday sealed bars in RAM | `crates/trading/src/in_mem/bar_cache.rs` (NEW) + ~20 unit tests | ~250 | NOT STARTED |
+| **W7-A4.4** | Boot-time rehydration loader for `BarCache` | `crates/app/src/bar_cache_loader.rs` (NEW) — reads today's bars from shadow tables on boot | ~150 | NOT STARTED, depends on W6 sub-PR #1 merge (DONE per #575-594) |
+| **W7-A4.5** | DHAT zero-alloc test for indicator + BarCache hot path | `crates/trading/tests/dhat_indicator_with_bar_cache.rs` (NEW) | ~100 | NOT STARTED, depends on W7-A4.3 |
+
+### Per-Item Guarantee Matrix (15-row, mandatory per `per-wave-guarantee-matrix.md`)
+
+Every W7-A4 sub-PR ships:
+
+| Row | Required artefact | Where |
+|---|---|---|
+| 100% code coverage | `quality/crate-coverage-thresholds.toml` ratchet | per-crate |
+| 100% audit coverage | NONE — this is hot-path code, no audit table | n/a |
+| 100% testing coverage | 22 test categories per `testing.md` scoped to changed crate | per-crate |
+| 100% code checks | banned-pattern + pub-fn-test + pub-fn-wiring + plan-verify | pre-push |
+| 100% code performance | DHAT zero-alloc + Criterion p99 budgets (≤10ns tick parse, ≤100ns indicator update) | W7-A4.5 |
+| 100% monitoring | Prom counter `tv_bar_cache_lookups_total` + gauge `tv_bar_cache_size_bytes` | W7-A4.3 |
+| 100% logging | tracing macros mandatory; ERROR → Telegram on miss-rate-high | W7-A4.3 |
+| 100% alerting | Prom alert `tv-bar-cache-miss-rate-high` (>1%/5m in market hours) | W7-A4.3 follow-up |
+| 100% security | banned-pattern: no SELECT on hot path (W7-A4.2 enforces) | hook |
+| 100% security hardening | Secret<T> N/A (no secrets in cache); unused_must_use enforces flush handling | per-crate |
+| 100% bugs fixing | adversarial 3-agent review (pre + post per `stream-resilience.md` B3) | per-PR |
+| 100% scenarios covering | property tests: lookup-miss, IST-midnight-rollover, cache-eviction | W7-A4.3 |
+| 100% functionalities covering | pub-fn-test-guard + pub-fn-wiring-guard ratchets | per-crate |
+| 100% code review | hot-path-reviewer + security-reviewer + general-purpose agents | per-PR |
+| 100% extreme check | all of above + ratchet tests fail build on regression | per-commit |
+
+### Honest 100% claim (forced PR-body wording per `wave-4-shared-preamble.md` §8)
+
+> "Wave 7-A4 ships 5M tick rescue ring (`TICK_BUFFER_CAPACITY`,
+> `crates/common/src/constants.rs`, ratcheted by
+> `crates/storage/tests/zero_tick_loss_alert_guard.rs`), today+yesterday
+> sealed bar RAM cache (~176MB at 11K instruments × 9 TFs × 32B
+> compact format, ratcheted by unit + DHAT tests), boot-time
+> rehydration from shadow tables, and banned-pattern guard rejecting
+> SELECT on the indicator/strategy/risk_check hot path. 100% inside
+> the tested envelope: 5M ring absorbs ≤3-hour QuestDB outage at
+> peak tick rate; BarCache lookup is O(1) lock-free papaya (~30ns);
+> banned-pattern guard fails the build on any `.exec(` / `SELECT`
+> introduction inside the listed paths. Beyond the envelope:
+> indicator/strategy code paths must STILL be migrated to read from
+> BarCache (gated on Wave 6 sub-PR #4 promotion); until then this
+> ship is the data structure + ratchets only."
+
+### Schedule
+
+W7-A4.1 first (smallest, lowest-risk: single constant + ratchet).
+W7-A4.2 next (hook category 7 + self-test).
+W7-A4.3 (BarCache module) is the biggest — schedule after first 2 ship.
+W7-A4.4 + W7-A4.5 depend on W7-A4.3.
+
+**No code in this plan section is shipped yet as of 2026-05-11.**
+
