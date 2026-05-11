@@ -16,6 +16,7 @@ This week takes the tickvault project from "live-streaming infrastructure with p
 
 | Phase | Wall-clock | Focus | Exit gate |
 |---|---|---|---|
+| **Phase 0.5 — WS Disconnect Resilience Hardening** (NEW — added Mon 2026-05-11 21:00 IST) | Fri-Sat overlap | Close 8 of 22 documented disconnect scenarios. Promote 5 reserved ErrorCodes (NET-01 IP change, NET-02 DNS cascade, PROC-01 OOM, DH-911 Dhan black-hole, RESOURCE-03 disk-full) + add 3 NEW (`tv_ws_recv_window_bytes` gauge for TCP zero-window detection, TCP `SO_KEEPALIVE` enable, `tv_ws_recv_buffer_bytes` + `SO_RCVBUF` tuning). Verify 4-core pinning (Wave 5 Item 6) is wired in `main.rs`. | All 22 disconnect scenarios have detect+recover+alert+audit+ratchet coverage |
 | **Phase 1 — Wave 6 close-out + 4 CRITICAL fixes** | Fri–Sat (Day 1–2) | Land PR #551, ship missing DHAT + Criterion + 6 chaos tests + 3-agent post-impl review for aggregator engine. Fix the 4 P0 silent-data-corruption bugs found by adversarial review. | Wave 6 Sub-PR #1 100% green on the 15-row guarantee matrix; 4 CRITICAL fixes merged |
 | **Phase 2 — Wave 7-A4 wiring + Wave 6 Sub-PR #2 (rehydration)** | Sun–Mon (Day 3–4) | Wire BarCache into IndicatorEngine, ship boot rehydration loader, schedule midnight `clear_before`, fix `BarKey` cross-day collision, decide per-TF indicator architecture, ship live RSS gauge | Wave 7-A4 RAM-first hot path FUNCTIONAL (not aspirational); banned-pattern Cat 10 enforces against a populated cache |
 | **Phase 3 — Trading observability + OMS go-live (paper→live cutover ready)** | Tue–Thu (Day 5–7) | 5 missing audit tables + 13 missing Prom alerts + 5 missing dashboards FIRST. Then wire OmsEngine in main.rs, hard-gate the 4 boot preconditions, hit `append_order_audit_row` on every state transition, add 15:30 IST cutoff + Dhan kill-switch sync. Defer Super/Forever/AMO/Slicing to Wave 8. | Mon 2026-05-25 09:15 IST first paper-equivalence live shadow session (NOT actual orders); first live order placement deferred to Wave 8 operator decision |
@@ -23,6 +24,43 @@ This week takes the tickvault project from "live-streaming infrastructure with p
 Concurrent track (runs alongside all phases): **AWS deployment readiness** — 4 blockers (ALB, SSM hierarchy, CloudWatch agent in user-data, Dhan `setIP` automation), Wave 6 Sub-PR #3 design decomposition into 4 slices, Wave-4-E1/E2/E3 reserved ErrorCodes promoted to shipped with chaos tests.
 
 **Honest 100% claim (per per-wave-guarantee-matrix.md §8 mandatory wording):** This plan delivers "100% inside the tested envelope, with ratcheted regression coverage". Beyond-envelope behaviour falls back to DLQ NDJSON + kill-switch + halt. The plan does NOT promise literal "WebSocket never disconnects" or "QuestDB never fails".
+
+---
+
+## DEV ENVIRONMENT (operator's local Mac — same docker-compose runs on AWS)
+
+| Spec | Value |
+|---|---|
+| Model | MacBook Pro (Mac16,7) Apple M4 Pro |
+| CPU cores | 14 (10 Performance + 4 Efficiency) |
+| RAM | 48 GB |
+| Network | home WiFi (variable latency, possible IP roam) |
+
+**Implication:** Mac OUT-SPECS the planned AWS c8g.xlarge (4 vCPU / 8GB). Mac is NOT the bottleneck for CPU/RAM. If Mac disconnects, cause is network/IP/power — fixed by AWS Mumbai EIP + UPS. Common-runtime principle (Mac dev = AWS prod) holds: same `docker-compose.yml`, same 4-core pinning scheme (Core 0 WS-recv-for-all-5-conns / Core 1 parser / Core 2 ILP writer / Core 3 other). On Mac, 10 cores stay idle (no harm). On AWS c8g.xlarge, all 4 cores used (perfect fit).
+
+---
+
+## PHASE 0.5 DETAIL — WS Disconnect Resilience Hardening (8 items)
+
+(Inserted Mon 2026-05-11 21:00 IST per operator design review meeting #1 on WebSocket disconnect causes. Decisions captured in `00-decisions-log.md` entries #14-#17.)
+
+The 22-scenario disconnect matrix has 8 unfixed gaps. Phase 0.5 closes them ALL.
+
+| # | Item | Existing code/reserved? | Files to touch | LoC | New ErrorCode | Severity |
+|---|---|---|---|---|---|---|
+| 0.5.1 | NET-01 promotion: IP-change-mid-session detection (60s poll vs boot baseline) | RESERVED (wave-4-error-codes.md) | `crates/core/src/network/ip_monitor.rs` extend | ~150 | NET-01 | Critical mid-market / High off-hours |
+| 0.5.2 | NET-02 promotion: DNS-cascade detection (3 consecutive failures targeting Dhan domains in 60s) | RESERVED | `crates/core/src/network/dns_watchdog.rs` (new) | ~200 | NET-02 | High |
+| 0.5.3 | PROC-01 promotion: OOM kill watcher (`/sys/fs/cgroup/.../memory.events`) | RESERVED | `crates/app/src/oom_monitor.rs` (new) | ~250 | PROC-01 | Critical |
+| 0.5.4 | DH-911 promotion: Dhan-side silent black-hole (subscribe accepted but zero packets in 60s) | RESERVED | extend `WS-GAP-06` tick-gap detector | ~150 | DH-911 | High |
+| 0.5.5 | RESOURCE-03 promotion: disk-full pre-flight at boot AND before every spill write | partial (boot only) | `crates/storage/src/spill.rs` extend | ~100 | RESOURCE-03 | High |
+| 0.5.6 | NEW: `tv_ws_recv_window_bytes` gauge — exposes TCP zero-window state BEFORE Dhan RSTs | not existing | `crates/core/src/websocket/connection.rs` add socket-stat poll | ~150 | NEW: WS-BACKPRESSURE-01 | High |
+| 0.5.7 | NEW: TCP `SO_KEEPALIVE` enable on every WS socket (catches NAT timeout) | not existing | `crates/core/src/websocket/connection.rs` add setsockopt | ~50 | n/a (configuration only) | n/a |
+| 0.5.8 | NEW: `tv_ws_recv_buffer_bytes` gauge + `SO_RCVBUF` tuning to 4 MB | not existing | same | ~80 | NEW: WS-BACKPRESSURE-02 | Medium |
+| 0.5.9 | NEW (verification): confirm Wave 5 Item 6 `core_pinning::pin_workers` is WIRED in `main.rs` boot, not just defined | helper exists | `crates/app/src/main.rs` boot wiring check + `crates/app/tests/core_pin_wiring_guard.rs` | ~80 | CORE-PIN-01/02 (already reserved) | High |
+
+**Each item gets its own task file (`tasks/T05-NN-*.md`) on Wed during execution-planning sprint.** Today (Mon) we only LOCK the scope; concrete task files written Wed once dependencies + Touches scope finalized.
+
+**The 22-scenario coverage table after Phase 0.5 lands:** see `02-step-1-ws-disconnect-resilience.md` (will be created Tue when we deep-dive each scenario).
 
 ---
 
