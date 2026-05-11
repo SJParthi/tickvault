@@ -4739,7 +4739,13 @@ async fn main() -> Result<()> {
             //
             // Gated on `config.features.realtime_guarantee_score`.
             if config.features.realtime_guarantee_score {
-                let slo_notifier = notifier.clone();
+                // 2026-05-11 v3: SLO Telegram dispatch removed — see the
+                // `slo_notifier.notify(...)` removal note in the
+                // `cur_tier > prev_tier` block below. The clone is
+                // retained under `_` so a future "re-enable SLO Telegram"
+                // PR has a one-line revert (drop the underscore + restore
+                // the notify() calls).
+                let _slo_notifier = notifier.clone();
                 let slo_health = health_status.clone();
                 let slo_qcfg = config.questdb.clone();
                 // PR #509d (Wave-5 §R.1): the Phase 2 dispatcher chain is
@@ -5003,13 +5009,29 @@ async fn main() -> Result<()> {
 
                         let cur_tier = outcome.tier();
 
-                        // Edge-triggered Telegram — fire ONLY during market
-                        // hours (off-hours pinning makes the score
-                        // operator-meaningful, but transient off-hours
-                        // QDB/token blips should not page).
+                        // 2026-05-11 hotfix v3 — Telegram-suppress ALL three
+                        // SLO transitions (Degraded, Critical, Healthy).
+                        // Operator directive: the composite SLO score is
+                        // computed from six dimensions (ws_health,
+                        // qdb_health, tick_freshness, token_freshness,
+                        // spill_health, phase2_health) and the underlying
+                        // typed errors for each dimension (WS-GAP-06,
+                        // BOOT-01/02, AUTH-GAP-03, STORAGE-GAP-03,
+                        // PHASE2-01) ALREADY fire their own Telegram alerts.
+                        // SLO-02 paging is duplicate operator noise — the
+                        // 10s scheduler flaps multiple times per minute
+                        // because `tick_freshness` momentarily reads 0 when
+                        // illiquid IDX_I instruments don't tick within the
+                        // 30s window (normal market behaviour). Keep the
+                        // log (warn / info) + counter for the
+                        // operator-health Grafana dashboard, but DO NOT
+                        // dispatch to the notification service.
+                        // Defense-in-depth: events.rs also demotes
+                        // `RealtimeGuaranteeCritical` to Severity::Low so
+                        // any accidental future notify() call still does
+                        // not page.
                         if in_market {
                             if cur_tier > prev_tier {
-                                // Worsened — page on the rising edge.
                                 match &outcome {
                                     SloOutcome::Healthy { .. } => {
                                         // Cannot reach: tier 0 is Healthy
@@ -5018,47 +5040,31 @@ async fn main() -> Result<()> {
                                         // cur_tier == 0. Defensive only.
                                     }
                                     SloOutcome::Degraded { score, weakest } => {
-                                        slo_notifier.notify(
-                                            tickvault_core::notification::events::NotificationEvent::RealtimeGuaranteeDegraded {
-                                                score: *score,
-                                                weakest,
-                                            },
-                                        );
-                                        error!(
+                                        warn!(
                                             code = ErrorCode::Slo02Degraded.code_str(),
                                             score = *score,
                                             weakest = weakest,
-                                            "SLO score crossed below 0.95 — DEGRADED"
+                                            "SLO score crossed below 0.95 — DEGRADED (log-only, Telegram suppressed)"
                                         );
                                     }
                                     SloOutcome::Critical { score, weakest } => {
-                                        slo_notifier.notify(
-                                            tickvault_core::notification::events::NotificationEvent::RealtimeGuaranteeCritical {
-                                                score: *score,
-                                                weakest,
-                                            },
-                                        );
-                                        error!(
+                                        warn!(
                                             code = ErrorCode::Slo02Degraded.code_str(),
                                             score = *score,
                                             weakest = weakest,
-                                            "SLO score crossed below 0.80 — CRITICAL"
+                                            "SLO score crossed below 0.80 — CRITICAL (log-only, Telegram suppressed)"
                                         );
                                     }
                                 }
                             } else if cur_tier < prev_tier && cur_tier == 0 {
-                                // Recovery to Healthy from worse — Info
-                                // ping (audit-findings Rule 4: positive
-                                // signal on falling edge).
-                                slo_notifier.notify(
-                                    tickvault_core::notification::events::NotificationEvent::RealtimeGuaranteeHealthy {
-                                        score: outcome.score(),
-                                    },
-                                );
+                                // Recovery to Healthy — log-only (no
+                                // Telegram ping per operator directive
+                                // 2026-05-11; the underlying typed events
+                                // already announced their own recovery).
                                 info!(
                                     code = ErrorCode::Slo01Healthy.code_str(),
                                     score = outcome.score(),
-                                    "SLO score recovered to healthy"
+                                    "SLO score recovered to healthy (log-only, Telegram suppressed)"
                                 );
                             }
                         }
