@@ -96,3 +96,62 @@ fn aggregator_no_seals_alert_for_window_is_5m() {
          rollover, etc.) do not fire. Found: {for_slice:?}"
     );
 }
+
+// Wave 6 Sub-PR #1 item 1.4l — companion alert for the
+// `tv_seal_mpsc_dropped_total` counter (one of the 3 drop series
+// in the "Aggregator drops & lag (5m)" panel from 1.4k).
+
+#[test]
+fn aggregator_mpsc_drop_storm_alert_uid_is_pinned() {
+    let yaml = read_alerts_yaml();
+    assert!(
+        yaml.contains("uid: tv-aggregator-mpsc-drop-storm"),
+        "Wave 6 Sub-PR #1 item 1.4l regression: alert \
+         `tv-aggregator-mpsc-drop-storm` MUST exist in alerts.yml so \
+         the operator gets a Telegram page when the seal-writer task \
+         falls behind enough that > 100 seals are dropped at the \
+         producer side in 1 minute during market hours."
+    );
+}
+
+#[test]
+fn aggregator_mpsc_drop_storm_alert_expression_includes_market_hours_gate() {
+    let yaml = read_alerts_yaml();
+    assert!(
+        yaml.contains("increase(tv_seal_mpsc_dropped_total[1m]) > 100"),
+        "Wave 6 Sub-PR #1 item 1.4l regression: alert expression must \
+         reference `increase(tv_seal_mpsc_dropped_total[1m]) > 100` \
+         per audit-findings Rule 12 + Rule 4 (rising-edge fire only)."
+    );
+    // The market-hours gate `tv_market_hours_active == 1` is already
+    // pinned for the 1.4j alert above; this assertion only confirms
+    // the new alert ALSO carries the gate (audit-findings Rule 3).
+    let uid_pos = yaml
+        .find("uid: tv-aggregator-mpsc-drop-storm")
+        .expect("alert uid must exist");
+    let rest = &yaml[uid_pos..uid_pos.saturating_add(2000).min(yaml.len())];
+    assert!(
+        rest.contains("tv_market_hours_active == 1"),
+        "Wave 6 Sub-PR #1 item 1.4l regression: tv-aggregator-mpsc-drop-storm \
+         MUST be gated by `tv_market_hours_active == 1` so pre-market / \
+         post-market silence does not page (audit-findings Rule 3)."
+    );
+}
+
+#[test]
+fn aggregator_mpsc_drop_storm_alert_severity_is_high() {
+    let yaml = read_alerts_yaml();
+    let uid_pos = yaml
+        .find("uid: tv-aggregator-mpsc-drop-storm")
+        .expect("alert uid must exist");
+    let rest = &yaml[uid_pos..];
+    let severity_pos = rest
+        .find("severity:")
+        .expect("severity label must follow the alert uid");
+    let severity_slice = &rest[severity_pos..severity_pos + 32];
+    assert!(
+        severity_slice.contains("high"),
+        "Wave 6 Sub-PR #1 item 1.4l regression: alert severity must be \
+         `high` (Telegram pages operator). Found: {severity_slice:?}"
+    );
+}
