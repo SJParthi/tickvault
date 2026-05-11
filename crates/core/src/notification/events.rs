@@ -2618,19 +2618,26 @@ impl NotificationEvent {
             Self::SelfTestPassed { .. } => Severity::Info,
             Self::SelfTestDegraded { .. } => Severity::High,
             Self::RealtimeGuaranteeHealthy { .. } => Severity::Info,
-            // 2026-05-11 hotfix — `RealtimeGuaranteeDegraded` (band
-            // 0.80–0.95) was previously `High`, which routed it to
-            // Telegram. The 10s SLO scheduler can flap across the 0.95
-            // edge multiple times per minute under normal load, producing
-            // pager fatigue with no actionable signal (see operator
-            // feedback 2026-05-11). Downgraded to `Low` — the event still
-            // emits to Loki + Grafana for trend visibility, but does not
-            // page. The genuine-fire `RealtimeGuaranteeCritical` variant
-            // (score < 0.80) keeps `Critical` severity and continues to
-            // page on Telegram. Ratcheted by
-            // `test_realtime_guarantee_degraded_severity_is_low_not_high`.
+            // 2026-05-11 hotfix v2 — BOTH `RealtimeGuaranteeDegraded`
+            // and `RealtimeGuaranteeCritical` are SUMMARY signals over the
+            // six dimensions. The composite score can flap to 0.0 multiple
+            // times per minute under normal market load when
+            // `tick_freshness` momentarily reads 0 (some IDX_I instruments
+            // legitimately don't tick every 30s). Per operator feedback
+            // 2026-05-11 13:14 IST: the underlying typed errors
+            // (WS-GAP-06 tick gaps, BOOT-01 QuestDB, AUTH-GAP-03 token)
+            // ALREADY fire Telegram on their own — SLO-02 paging is
+            // duplicate noise. Both demoted to `Low`: the events still
+            // emit to Loki + Grafana + audit table for trend visibility,
+            // but do NOT page Telegram. The composite score remains
+            // available for the operator-health dashboard and the
+            // `tv_realtime_guarantee_evaluations_total` counter.
+            // Ratcheted by
+            // `test_realtime_guarantee_degraded_severity_is_low_not_high`
+            // and
+            // `test_realtime_guarantee_critical_severity_is_low_not_critical`.
             Self::RealtimeGuaranteeDegraded { .. } => Severity::Low,
-            Self::RealtimeGuaranteeCritical { .. } => Severity::Critical,
+            Self::RealtimeGuaranteeCritical { .. } => Severity::Low,
             Self::SelfTestCritical { .. } => Severity::Critical,
             Self::DepthIndexLtpTimeout { .. } => Severity::High,
             Self::DepthUnderlyingMissing { .. } => Severity::High,
@@ -5030,18 +5037,28 @@ mod tests {
     }
 
     #[test]
-    fn test_realtime_guarantee_critical_severity_remains_critical() {
-        // The Critical variant (score < 0.80) is the genuine fire — it
-        // MUST remain at Severity::Critical so it keeps paging on
-        // Telegram even after the Degraded downgrade.
+    fn test_realtime_guarantee_critical_severity_is_low_not_critical() {
+        // 2026-05-11 hotfix v2 — operator directive: SLO-02 is a SUMMARY
+        // signal; the underlying typed errors (WS-GAP-06, BOOT-01/02,
+        // AUTH-GAP-03, STORAGE-GAP-03, PHASE2-01) already fire Telegram
+        // on their own. The composite-score scheduler flaps multiple
+        // times per minute under normal market load (tick_freshness can
+        // read 0 when illiquid IDX_I instruments don't tick within 30s).
+        // Both Degraded AND Critical demoted to Low (no Telegram page).
+        // Composite score still computed + emitted as counter for the
+        // operator-health Grafana dashboard.
+        // Defense-in-depth — main.rs also drops the `notify()` call site
+        // entirely (Telegram-suppressed at the call site). This severity
+        // ratchet guards against a future regression that re-adds a
+        // notify() call without re-evaluating the operator directive.
         let event = NotificationEvent::RealtimeGuaranteeCritical {
             score: 0.50,
             weakest: "qdb_health",
         };
         assert_eq!(
             event.severity(),
-            Severity::Critical,
-            "Critical MUST stay Critical so genuine fires still page"
+            Severity::Low,
+            "Critical MUST be Low — no Telegram page (Loki + audit only)"
         );
     }
 
