@@ -1676,3 +1676,46 @@ groups:
         labels:
           severity: high
           wave: "6"
+
+      # Wave 6 Sub-PR #1 item 1.4o — companion alert for the
+      # tv_aggregator_late_ticks_discarded_total counter (4th drop
+      # class: tick arrived AFTER its bucket sealed, must be discarded
+      # per AGGREGATOR-LATE-01 runbook). Late ticks are EXPECTED at
+      # IST midnight cascade rollover (small bursts), so the threshold
+      # is sustained 60/min for 5m — that filters routine boundary
+      # noise but catches real clock-drift / slow-consumer scenarios.
+      - uid: tv-aggregator-late-tick-sustained
+        title: "Wave 6 — aggregator late-tick rate > 60/min sustained 5m"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "(increase(tv_aggregator_late_ticks_discarded_total[5m]) > 300) and on() tv_market_hours_active == 1"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 5m
+        annotations:
+          summary: "Wave 6: > 60 late ticks/min sustained 5m during market hours"
+          description: "tv_aggregator_late_ticks_discarded_total counted > 300 events in the last 5 minutes (= sustained > 60/min). Per AGGREGATOR-LATE-01 runbook, late-tick bursts at IST midnight cascade rollover are expected and short; a sustained 5-minute rate above 60/min indicates either (1) clock drift between Dhan WebSocket and our host (check tv_host_clock_skew_seconds + BOOT-03 runbook), or (2) the consumer pipeline is slow enough that ticks queue past their bucket-seal deadline. Runbook: .claude/rules/project/wave-6-error-codes.md::AGGREGATOR-LATE-01."
+        labels:
+          severity: high
+          wave: "6"
