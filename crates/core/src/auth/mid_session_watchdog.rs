@@ -191,6 +191,16 @@ fn is_transient_network_failure(reason: &str) -> bool {
     }
     let lower = reason.to_lowercase();
     [
+        // Bare reqwest send-leg error: produced when the inner cause is
+        // a generic Request/Connect failure that doesn't surface a more
+        // specific substring. Observed on 2026-05-11 14:44 IST production
+        // page where the entire reason was just
+        // "profile request failed: error sending request for url
+        //  (https://api.dhan.co/v2/profile)" with no further qualifier.
+        // This is a transport-level failure by construction (an HTTP
+        // response would use the "profile request HTTP {status}"
+        // wrapper instead), so matching the bare prefix is safe.
+        "error sending request for url",
         "dns error",
         "failed to lookup address",
         "connection refused",
@@ -370,6 +380,17 @@ mod tests {
     fn transient_request_timeout_is_transient() {
         let reason = "profile request failed: \
                       reqwest::Error { kind: Request, source: TimedOut }";
+        assert!(is_transient_network_failure(reason));
+    }
+
+    #[test]
+    fn transient_bare_reqwest_send_error_is_transient() {
+        // Verbatim from the 2026-05-11 14:44 IST production page.
+        // The reqwest::Error Display did not include a DNS / Connect /
+        // Timeout sub-cause in the rendered string, so the previous
+        // substring whitelist let it slip through and CRITICAL-paged.
+        let reason = "profile request failed: error sending request for url \
+                      (https://api.dhan.co/v2/profile)";
         assert!(is_transient_network_failure(reason));
     }
 
