@@ -13,6 +13,7 @@
 #![cfg_attr(test, allow(clippy::assertions_on_constants))]
 #![cfg_attr(test, allow(clippy::field_reassign_with_default))]
 
+pub mod bar_cache_loader;
 pub mod bhavcopy_pipeline;
 pub mod boot_helpers;
 pub mod boot_smoke_test;
