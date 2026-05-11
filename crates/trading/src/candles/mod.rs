@@ -47,6 +47,7 @@ pub use multi_tf_aggregator::{ConsumeStats, InstrumentEntry, MultiTfAggregator};
 pub use parity::{InstrumentKey, ParityMismatch, ParityReport, compare_bars, sweep_parity};
 pub use pct_stamping::{
     PrevDayRefs, compute_close_pct, compute_oi_pct, compute_volume_pct, stamp_bar_pct_fields,
+    stamp_seal_pct_fields,
 };
 pub use seal_ring::{BufferOutcome, BufferedSeal, SEAL_BUFFER_CAPACITY, SealRing};
 pub use tf_index::TfIndex;

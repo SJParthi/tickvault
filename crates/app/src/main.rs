@@ -1867,7 +1867,9 @@ async fn main() -> Result<()> {
         // gets registered after its first tick.
         {
             use tickvault_storage::seal_writer_runner::global_seal_sender;
-            use tickvault_trading::candles::{BufferedSeal, MultiTfAggregator};
+            use tickvault_trading::candles::{
+                BufferedSeal, MultiTfAggregator, PrevDayRefs, stamp_seal_pct_fields,
+            };
 
             // 11K-instrument capacity (matches MAX_TOTAL_SUBSCRIPTIONS
             // headroom per `aws-budget.md`). HashMap grows lazily so
@@ -1893,7 +1895,21 @@ async fn main() -> Result<()> {
                             let stats = agg_clone.consume_tick(
                                 &tick,
                                 tick.exchange_segment_code,
-                                |tf, state| {
+                                |tf, mut state| {
+                                    // Wave 6 Sub-PR #1 item 1.4f — wire
+                                    // stamp_seal_pct_fields (shipped in
+                                    // PR #570) at the seal emission site.
+                                    // Per audit-findings Rule 13, a method
+                                    // that exists + is tested but never
+                                    // called IS a bug. This wires the call
+                                    // site now; the prev_day_cache loader
+                                    // is a separate follow-up. Until that
+                                    // lands, refs are `default()` (all
+                                    // zeros), so close_pct/oi_pct/volume_pct
+                                    // remain 0.0 (handled gracefully by the
+                                    // compute_*_pct div-by-zero guards per
+                                    // L-H14 / PREVCLOSE-04 cold-boot).
+                                    stamp_seal_pct_fields(&mut state, PrevDayRefs::default());
                                     let seal = BufferedSeal::new(
                                         tick.security_id,
                                         tick.exchange_segment_code,
