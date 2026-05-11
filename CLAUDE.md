@@ -1,6 +1,8 @@
 # CLAUDE.md — tickvault
 
 > **Authority chain (S6-Step8 — Bible deleted):** `Cargo.toml` workspace deps + `deny.toml` + `dhan_locked_facts.rs` are the executable single source of truth for versions and Dhan facts. This file (`CLAUDE.md`) is the workflow + architecture guide. If neither covers a topic, ASK Parthiban.
+>
+> **FOREVER CHARTER (auto-loaded every session):** `.claude/rules/project/operator-charter-forever.md` is the operator's permanent binding contract — applies to every Claude Code session, every Cowork task, every branch, every PR, every plan item. Read it FIRST before any work. Contains the 15-row + 7-row guarantee matrix, the 10 Telegram commandments, the honest 100% claim wording, the 11 always-on rules, and the mechanical enforcement chain.
 
 ## THREE PRINCIPLES
 
