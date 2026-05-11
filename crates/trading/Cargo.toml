@@ -48,5 +48,9 @@ harness = false
 name = "cascade_fanout"
 harness = false
 
+[[bench]]
+name = "bar_cache_lookup"
+harness = false
+
 [package.metadata.cargo-machete]
 ignored = ["anyhow", "chrono", "chrono-tz", "tickvault-common", "governor", "jaeckel", "loom", "metrics", "secrecy", "serde", "thiserror", "tokio", "tracing", "uuid"]
