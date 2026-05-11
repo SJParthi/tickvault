@@ -44,21 +44,47 @@ Concurrent track (runs alongside all phases): **AWS deployment readiness** — 4
 
 (Inserted Mon 2026-05-11 21:00 IST per operator design review meeting #1 on WebSocket disconnect causes. Decisions captured in `00-decisions-log.md` entries #14-#17.)
 
-The 22-scenario disconnect matrix has 8 unfixed gaps. Phase 0.5 closes them ALL.
+The 22-scenario disconnect matrix has 8 unfixed gaps. The Byzantine/zombie audit (Mon 22:30 IST) added 24 more (G19-G46). The pre-market readiness flow audit (Mon 22:45 IST) confirmed PreMarketReady consolidator (0.5.10) is needed. The Telegram style audit (Mon 23:00 IST) added jargon-guard (0.5.19). Phase 0.5 grew from 9 items to **19 items**.
 
-| # | Item | Existing code/reserved? | Files to touch | LoC | New ErrorCode | Severity |
-|---|---|---|---|---|---|---|
-| 0.5.1 | NET-01 promotion: IP-change-mid-session detection (60s poll vs boot baseline) | RESERVED (wave-4-error-codes.md) | `crates/core/src/network/ip_monitor.rs` extend | ~150 | NET-01 | Critical mid-market / High off-hours |
-| 0.5.2 | NET-02 promotion: DNS-cascade detection (3 consecutive failures targeting Dhan domains in 60s) | RESERVED | `crates/core/src/network/dns_watchdog.rs` (new) | ~200 | NET-02 | High |
-| 0.5.3 | PROC-01 promotion: OOM kill watcher (`/sys/fs/cgroup/.../memory.events`) | RESERVED | `crates/app/src/oom_monitor.rs` (new) | ~250 | PROC-01 | Critical |
-| 0.5.4 | DH-911 promotion: Dhan-side silent black-hole (subscribe accepted but zero packets in 60s) | RESERVED | extend `WS-GAP-06` tick-gap detector | ~150 | DH-911 | High |
-| 0.5.5 | RESOURCE-03 promotion: disk-full pre-flight at boot AND before every spill write | partial (boot only) | `crates/storage/src/spill.rs` extend | ~100 | RESOURCE-03 | High |
-| 0.5.6 | NEW: `tv_ws_recv_window_bytes` gauge — exposes TCP zero-window state BEFORE Dhan RSTs | not existing | `crates/core/src/websocket/connection.rs` add socket-stat poll | ~150 | NEW: WS-BACKPRESSURE-01 | High |
-| 0.5.7 | NEW: TCP `SO_KEEPALIVE` enable on every WS socket (catches NAT timeout) | not existing | `crates/core/src/websocket/connection.rs` add setsockopt | ~50 | n/a (configuration only) | n/a |
-| 0.5.8 | NEW: `tv_ws_recv_buffer_bytes` gauge + `SO_RCVBUF` tuning to 4 MB | not existing | same | ~80 | NEW: WS-BACKPRESSURE-02 | Medium |
-| 0.5.9 | NEW (verification): confirm Wave 5 Item 6 `core_pinning::pin_workers` is WIRED in `main.rs` boot, not just defined | helper exists | `crates/app/src/main.rs` boot wiring check + `crates/app/tests/core_pin_wiring_guard.rs` | ~80 | CORE-PIN-01/02 (already reserved) | High |
+**Severity-sorted Phase 0.5 (19 items, ~1,770 LoC total):**
+
+| # | Severity | Item | Existing code/reserved? | LoC | New ErrorCode |
+|---|---|---|---|---|---|
+| 0.5.13 | 🔥 **CRITICAL** | **Dual-instance live-lock** — boot reads `live_instance_lock` table; if other instance < 60s old → REFUSE boot (prevents 2× orders from Mac+AWS running together) | NEW (G38) | ~50 | RESILIENCE-01 |
+| 0.5.1 | High (mid-market) | NET-01 promotion: IP-change-mid-session detection (60s poll vs boot baseline) | RESERVED (wave-4-error-codes.md) | ~150 | NET-01 |
+| 0.5.2 | High | NET-02 promotion: DNS-cascade detection (3 consecutive failures targeting Dhan domains in 60s) | RESERVED | ~200 | NET-02 |
+| 0.5.4 | High | DH-911 promotion: Dhan-side silent black-hole (subscribe accepted but zero packets in 60s) | RESERVED | ~150 | DH-911 |
+| 0.5.5 | High | RESOURCE-03 promotion: disk-full pre-flight at boot AND before every spill write | partial (boot only) | ~100 | RESOURCE-03 |
+| 0.5.6 | High | NEW: `tv_ws_recv_window_bytes` gauge — exposes TCP zero-window state BEFORE Dhan RSTs | not existing | ~150 | WS-BACKPRESSURE-01 |
+| 0.5.9 | High | NEW (verification): confirm Wave 5 Item 6 `core_pinning::pin_workers` is WIRED in `main.rs` boot | helper exists | ~80 | CORE-PIN-01/02 |
+| 0.5.14 | High | **Tokio deadlock liveness probe** — tests business logic, not just /health 200 (G19) | NEW | ~100 | LIVENESS-01 |
+| 0.5.15 | High | **TCP-flow watchdog per-conn** — last-byte-age alert (G22 — catches "TCP open, zero data") | NEW | ~80 | WS-FLOW-01 |
+| 0.5.16 | High | **Subscribe-ACK parser** — verify Dhan actually accepted subscribe (G24 — catches silently-lost subscribe messages) | NEW | ~120 | WS-SUB-01 |
+| 0.5.17 | High | **Cross-validation (2-source agreement)** — critical metrics verified by 2 independent paths (G35) | NEW | ~150 | TELEMETRY-01 |
+| 0.5.18 | High | **Mid-rebalance replay from subscription_audit** — recover unfinished Swap20/Swap200 on boot (G39) | NEW | ~100 | RESILIENCE-02 |
+| 0.5.3 | Medium | PROC-01 promotion: OOM kill watcher (`/sys/fs/cgroup/.../memory.events`) | RESERVED | ~250 | PROC-01 |
+| 0.5.8 | Medium | NEW: `tv_ws_recv_buffer_bytes` gauge + `SO_RCVBUF` tuning to 4 MB | not existing | ~80 | WS-BACKPRESSURE-02 |
+| 0.5.11 | Medium | **Renewal-task supervisor** — wraps `spawn_renewal_task` in respawn loop (G3) | NEW | ~80 | AUTH-SUPER-01 |
+| 0.5.12 | Medium | **Pool-supervisor-supervisor** — supervises the pool supervisor (G9 — paranoia tier) | NEW | ~60 | WS-SUPER-01 |
+| 0.5.7 | Low | NEW: TCP `SO_KEEPALIVE` enable on every WS socket (catches NAT timeout) | not existing | ~40 | (config only) |
+| 0.5.10 | Low | **PreMarketReady consolidated Telegram** — replaces 6 fragmented messages with 1 (Item 0.5.10) | NEW | ~250 | (notification only) |
+| 0.5.19 | Low | **Telegram jargon guard** — banned-word scanner fails build if Telegram message contains library jargon (G47) | NEW | ~80 | (test only) |
+
+**Sub-totals by severity:**
+- 🔥 Critical: 1 item, 50 LoC
+- High: 11 items, 1,380 LoC
+- Medium: 4 items, 470 LoC
+- Low: 3 items, 370 LoC
+- **TOTAL: 19 items, ~1,770 LoC**
 
 **Each item gets its own task file (`tasks/T05-NN-*.md`) on Wed during execution-planning sprint.** Today (Mon) we only LOCK the scope; concrete task files written Wed once dependencies + Touches scope finalized.
+
+**Friday distribution (5 parallel Claude sessions):**
+- Session 1: 0.5.13 (CRITICAL — must close first) + 0.5.14 + 0.5.15 = 230 LoC
+- Session 2: 0.5.16 + 0.5.17 + 0.5.18 = 370 LoC
+- Session 3: 0.5.1 + 0.5.2 + 0.5.4 + 0.5.9 = 580 LoC
+- Session 4: 0.5.3 + 0.5.5 + 0.5.6 + 0.5.11 + 0.5.12 = 540 LoC
+- Session 5: 0.5.7 + 0.5.8 + 0.5.10 + 0.5.19 = 450 LoC (front-loaded with the PreMarketReady consolidator since it's user-visible)
 
 **The 22-scenario coverage table after Phase 0.5 lands:** see `02-step-1-ws-disconnect-resilience.md` (will be created Tue when we deep-dive each scenario).
 

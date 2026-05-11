@@ -83,6 +83,10 @@
 
 [2026-05-11 23:25 IST] [meta] HIGH-LEVEL PLAN written to 00-HIGH-LEVEL-PLAN.md. Single 5-minute readable summary covering: in-one-paragraph mission, 24-hour clock (08:30/09:00/09:13/09:15:30/15:30/16:00 IST), 5 daily Telegrams, 7-day weekly cycle, 365-day yearly handling (holidays/expiries/half-days), 5-layer safety net, 99.9% scenario coverage matrix (90+ scenarios), 19 Phase 0.5 items, Mac vs AWS identical experience, 6 honest confidence guarantees (with envelope), 3-minute boot story, Insta-reel auto-driver summary. INDEX bumped to mark 00-HIGH-LEVEL-PLAN.md as canonical-read-2 alongside operator-charter-forever.md.
 
+[2026-05-11 23:40 IST] [topic] STRAWMAN UPDATED with all 19 Phase 0.5 items severity-sorted (1 Critical + 11 High + 4 Medium + 3 Low = 1,770 LoC). Items 0.5.10-0.5.19 (added Mon eve after strawman first written) now precisely listed with severity tags + LoC + ErrorCode + Files-to-touch. Friday parallel-session distribution proposed: 5 sessions × ~350 LoC each.
+
+[2026-05-11 23:42 IST] [topic] TELEGRAM TIMELINE 08:30→09:15:30 written to topic-telegram-timeline-0830-to-0915.md. Operator's "show me exact messages 8:30 till 9:15 AM" answered: 4 ping schedule with FULL message bodies (PreMarketReady 08:33 with 18-checkmark consolidation / MarketOpening 09:00 / Phase2Complete 09:13:30 / MarketOpenStreaming 09:15:30) + degraded + critical variants + before/after comparison with today's 6-fragment Telegram screenshot. Daily Telegram budget on healthy day = 5 messages (4 pre-market + 1 cross-verify at 16:00). Weekend/holiday = 0 messages.
+
 ---
 
 ## Reversal procedure
