@@ -65,6 +65,14 @@ const REQUIRED_PANELS: &[(&str, &str)] = &[
     // (mpsc full, late tick, or broadcast lag). Runbook:
     // .claude/rules/project/wave-6-error-codes.md::AGGREGATOR-DROP-01.
     ("Aggregator drops & lag (5m)", "tv_seal_mpsc_dropped_total"),
+    // Wave 6 Sub-PR #1 item 1.4m — instrument-registration ramp-up
+    // panel. Wrapped in increase() so the operator sees the 09:15:00
+    // IST burst as each subscribed instrument fires its first tick.
+    // Runbook: .claude/rules/project/wave-6-error-codes.md::AGGREGATOR-HB-01.
+    (
+        "Aggregator instrument-registration rate (5m)",
+        "tv_aggregator_instruments_lazy_inserted_total",
+    ),
 ];
 
 fn workspace_root() -> PathBuf {
