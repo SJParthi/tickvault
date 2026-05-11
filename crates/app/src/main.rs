@@ -1868,7 +1868,7 @@ async fn main() -> Result<()> {
         {
             use tickvault_storage::seal_writer_runner::global_seal_sender;
             use tickvault_trading::candles::{
-                BufferedSeal, MultiTfAggregator, stamp_seal_pct_fields,
+                AggregatorHeartbeatCounters, BufferedSeal, MultiTfAggregator, stamp_seal_pct_fields,
             };
 
             // 11K-instrument capacity (matches MAX_TOTAL_SUBSCRIPTIONS
@@ -1889,6 +1889,20 @@ async fn main() -> Result<()> {
             // the seal valid (compute_*_pct div-by-zero guards per
             // L-H14 produce 0.0 % values, never NaN).
             let prev_day_cache_for_agg = std::sync::Arc::clone(&prev_day_cache);
+            // Wave 6 Sub-PR #1 item 1.4h — per-minute aggregator
+            // heartbeat counters. Three AtomicU64 shared between the
+            // subscriber task (writer) and the once-per-minute
+            // heartbeat task (reader-resetter). Provides positive
+            // signal for the AGGREGATOR-HB-01 runbook so the operator
+            // can confirm via `tail -f data/logs/app.YYYY-MM-DD.log
+            // | grep 'aggregator heartbeat'` that the master switch
+            // is producing sealed candles. Counters are SEPARATE from
+            // the existing `metrics::counter!` increments (1.4e) —
+            // those go to Prometheus; these enable a coalesced 60s
+            // structured log without scraping Prometheus.
+            let heartbeat = AggregatorHeartbeatCounters::new();
+            let heartbeat_writer = heartbeat.clone();
+            let heartbeat_reader = heartbeat.clone();
             let mut tick_rx = fast_tick_broadcast_sender.subscribe();
 
             tokio::spawn(async move {
@@ -1933,6 +1947,10 @@ async fn main() -> Result<()> {
                                     if sender.try_send(seal).is_err() {
                                         metrics::counter!("tv_seal_mpsc_dropped_total")
                                             .increment(1);
+                                        // Wave 6 Sub-PR #1 item 1.4h — also
+                                        // record into the heartbeat counters
+                                        // for the per-minute structured log.
+                                        heartbeat_writer.record_drop();
                                     } else {
                                         // Wave 6 Sub-PR #1 item 1.4e —
                                         // positive-signal counter so the
@@ -1945,6 +1963,9 @@ async fn main() -> Result<()> {
                                         // `aggregator_seal_audit` table.
                                         metrics::counter!("tv_aggregator_seals_emitted_total")
                                             .increment(1);
+                                        // Wave 6 Sub-PR #1 item 1.4h — also
+                                        // record into the heartbeat counters.
+                                        heartbeat_writer.record_emit();
                                     }
                                 },
                             );
@@ -1955,6 +1976,9 @@ async fn main() -> Result<()> {
                             if stats.late_count > 0 {
                                 metrics::counter!("tv_aggregator_late_ticks_discarded_total")
                                     .increment(u64::from(stats.late_count));
+                                // Wave 6 Sub-PR #1 item 1.4h — also record
+                                // into the heartbeat counters.
+                                heartbeat_writer.record_late_ticks(u64::from(stats.late_count));
                             }
                             // Lazy registration for first-time instruments.
                             // pre_populate is idempotent (only inserts when
@@ -1993,6 +2017,45 @@ async fn main() -> Result<()> {
             tracing::info!(
                 aggregator_capacity = AGGREGATOR_CAPACITY,
                 "Wave 6 Sub-PR #1 item 1.4d — multi-TF aggregator task spawned (master switch ON)"
+            );
+
+            // Wave 6 Sub-PR #1 item 1.4h — per-minute aggregator
+            // heartbeat task. Drains the three counters every 60 s
+            // and emits a structured `info!` log when any counter is
+            // non-zero. Pre-market / post-market silence produces
+            // zero snapshots and stays silent (audit-findings Rule 3
+            // market-hours awareness + Rule 11 false-OK avoidance).
+            // No Telegram emission yet — log-only is the safest first
+            // pass; a Telegram `AggregatorMinuteSealBurst` event can
+            // be wired in a later slice once the operator confirms
+            // the log volume is healthy.
+            const AGGREGATOR_HEARTBEAT_INTERVAL_SECS: u64 = 60;
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                    AGGREGATOR_HEARTBEAT_INTERVAL_SECS,
+                ));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // First tick fires immediately; skip it so the first
+                // emitted log represents a full 60s window.
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    let snap = heartbeat_reader.drain();
+                    if !snap.is_active() {
+                        continue;
+                    }
+                    tracing::info!(
+                        seals_emitted = snap.seals_emitted,
+                        seals_dropped = snap.seals_dropped,
+                        late_ticks_discarded = snap.late_ticks_discarded,
+                        interval_secs = AGGREGATOR_HEARTBEAT_INTERVAL_SECS,
+                        "aggregator heartbeat (Wave 6 Sub-PR #1 item 1.4h)"
+                    );
+                }
+            });
+            tracing::info!(
+                interval_secs = AGGREGATOR_HEARTBEAT_INTERVAL_SECS,
+                "Wave 6 Sub-PR #1 item 1.4h — aggregator heartbeat task spawned (per-minute summary)"
             );
         }
 
