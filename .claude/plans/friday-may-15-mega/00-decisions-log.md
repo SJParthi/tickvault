@@ -65,6 +65,8 @@
 
 [2026-05-11 22:10 IST] [topic] FULL-SYSTEM matrix written to topic-full-system-coverage-matrix.md. 3 systems (JWT + Instruments + WS Feed) × 4 time windows × 8 crash modes × 2 paths = 288 sub-scenarios audited. 18 unique gaps identified: 8 closed by Phase 0.5 already-approved items, 2 candidates for Phase 0.5 additions (Items 0.5.11 renewal-task-supervisor + 0.5.12 pool-supervisor-supervisor), 3 to Wave 6 backlog, 5 by-design / out-of-scope. Worst-case envelope confirmed: ≤60s QDB outage absorbed, ≤30s WS gap absorbed, ≤5M-tick rescue ring, DLQ NDJSON for excess. Awaiting operator pick on 0.5.11 / 0.5.12 / persistent rescue ring investigation.
 
+[2026-05-11 22:30 IST] [topic] BYZANTINE / ZOMBIE / "LOOKS HEALTHY BUT ISN'T" matrix written to topic-byzantine-and-zombie-scenarios.md. 68 Byzantine scenarios enumerated across 10 categories: Process-level / Network "TCP open no flow" / Storage "write OK no commit" / Time-clock / Resource exhaustion / False-OK telemetry / Compound cascade / Logical off-by-one / Operator-introduced / Dhan-side silent semantic changes. 24 NEW gaps identified (G19-G46) on top of the 18 from prior matrix. Severity breakdown: 1 Critical (G38 dual-instance live-lock — must close before any live order) + 5 High + 12 Medium + 10 Low. 6 Phase 0.5 additions proposed (0.5.13-0.5.18) to hit 99% Byzantine coverage at ~600 LoC. Honest envelope language preserved. Awaiting operator pick.
+
 ---
 
 ## Reversal procedure
