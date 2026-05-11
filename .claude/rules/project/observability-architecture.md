@@ -194,6 +194,22 @@ summary file and drives the above flow.
    heartbeat revealed on 2026-04-24. Ratchet:
    `test_pool_watchdog_task_accepts_health_status` (source-scan guard
    in `crates/api/tests/health_counter_fix7_guard.rs`).
+10. **Do not re-route `DepthRebalanced` (Severity::Low) to Telegram.**
+    2026-05-11 PR shipped explicit suppression at the top of
+    `NotificationService::notify()` for the routine zero-disconnect
+    swap variant — operators reported 10-30 Telegram messages per day
+    during volatile sessions and zero of them were actionable. The
+    audit trail lives in 4 other sinks: QuestDB `depth_rebalance_audit`
+    (AUDIT-02, SEBI-relevant), Grafana `depth-flow.json` panel,
+    Prometheus `tv_depth_rebalances_total{underlying}`, and Loki
+    `data/logs/errors.jsonl.*`. Telegram is reserved for eyes-on-now
+    events. The companion `DepthRebalanceFailed` (Severity::High —
+    swap command channel broken, ATM unresolved) is NOT suppressed
+    and still pages. Suppression is observable via Prometheus counter
+    `tv_depth_rebalance_telegram_suppressed_total`. Ratchets:
+    `crates/core/tests/depth_rebalance_telegram_suppression_guard.rs`
+    (3 source-scan tests pinning suppression presence, failure-variant
+    exclusion, and counter metric name).
 
 ## Completion status of the Zero-Touch plan
 
