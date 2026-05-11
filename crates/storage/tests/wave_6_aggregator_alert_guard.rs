@@ -267,3 +267,108 @@ fn aggregator_late_tick_sustained_alert_for_window_is_5m() {
          Found: {for_slice:?}"
     );
 }
+
+// Wave 6 Sub-PR #1 item 1.4p — alert-family completeness meta-test.
+// Pins the relationship between the 4 drop-class alerts (1.4j seals,
+// 1.4l mpsc, 1.4n broadcast, 1.4o late ticks). If any future PR
+// silently deletes one without removing it from the family, this
+// test fails the build — operator's drop-diagnosis coverage cannot
+// silently regress.
+
+#[test]
+fn wave_6_aggregator_drop_alert_family_is_complete() {
+    let yaml = read_alerts_yaml();
+    let required: &[(&str, &str)] = &[
+        (
+            "tv-aggregator-no-seals-during-market",
+            "1.4j (master switch dead)",
+        ),
+        ("tv-aggregator-mpsc-drop-storm", "1.4l (writer fell behind)"),
+        (
+            "tv-aggregator-broadcast-lag-storm",
+            "1.4n (subscriber fell behind)",
+        ),
+        (
+            "tv-aggregator-late-tick-sustained",
+            "1.4o (clock drift / slow consumer)",
+        ),
+    ];
+    let mut missing: Vec<String> = Vec::new();
+    for (uid, label) in required {
+        let needle = format!("uid: {uid}");
+        if !yaml.contains(&needle) {
+            missing.push(format!("{uid} — {label}"));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "Wave 6 Sub-PR #1 item 1.4p regression: the 4-alert drop-class \
+         family must coexist in alerts.yml so the operator has Telegram \
+         coverage for EVERY drop class shown on the 1.4k dashboard \
+         panel. Missing:\n  {}\n\nIf you genuinely need to remove one, \
+         update the required-set in this test first and document why \
+         the operator no longer needs that coverage.",
+        missing.join("\n  ")
+    );
+}
+
+#[test]
+fn wave_6_aggregator_alert_family_all_gated_by_market_hours() {
+    let yaml = read_alerts_yaml();
+    let uids = [
+        "tv-aggregator-no-seals-during-market",
+        "tv-aggregator-mpsc-drop-storm",
+        "tv-aggregator-broadcast-lag-storm",
+        "tv-aggregator-late-tick-sustained",
+    ];
+    let mut missing_gate: Vec<&str> = Vec::new();
+    for uid in &uids {
+        let pos = yaml
+            .find(&format!("uid: {uid}"))
+            .unwrap_or_else(|| panic!("alert uid {uid} must exist (1.4p requires it)"));
+        let end = pos.saturating_add(2000).min(yaml.len());
+        let block = &yaml[pos..end];
+        if !block.contains("tv_market_hours_active == 1") {
+            missing_gate.push(*uid);
+        }
+    }
+    assert!(
+        missing_gate.is_empty(),
+        "Wave 6 Sub-PR #1 item 1.4p regression: every aggregator drop-class \
+         alert MUST be gated by `tv_market_hours_active == 1` per \
+         audit-findings Rule 3 (no off-hours pages). Missing the gate: \
+         {missing_gate:?}"
+    );
+}
+
+#[test]
+fn wave_6_aggregator_alert_family_all_severity_high() {
+    let yaml = read_alerts_yaml();
+    let uids = [
+        "tv-aggregator-no-seals-during-market",
+        "tv-aggregator-mpsc-drop-storm",
+        "tv-aggregator-broadcast-lag-storm",
+        "tv-aggregator-late-tick-sustained",
+    ];
+    let mut wrong_severity: Vec<&str> = Vec::new();
+    for uid in &uids {
+        let pos = yaml
+            .find(&format!("uid: {uid}"))
+            .unwrap_or_else(|| panic!("alert uid {uid} must exist (1.4p requires it)"));
+        let rest = &yaml[pos..];
+        let sev_pos = rest
+            .find("severity:")
+            .unwrap_or_else(|| panic!("severity: must follow alert {uid}"));
+        let sev_slice = &rest[sev_pos..sev_pos + 32];
+        if !sev_slice.contains("high") {
+            wrong_severity.push(*uid);
+        }
+    }
+    assert!(
+        wrong_severity.is_empty(),
+        "Wave 6 Sub-PR #1 item 1.4p regression: every aggregator drop-class \
+         alert MUST be severity:high so it pages Telegram. Downgrading to \
+         medium / low silently buries operator pages. Wrong severity: \
+         {wrong_severity:?}"
+    );
+}
