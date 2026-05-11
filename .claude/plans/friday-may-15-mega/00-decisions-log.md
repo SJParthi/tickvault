@@ -75,6 +75,12 @@
 
 [2026-05-11 22:50 IST] [meta] COMMON-RUNTIME PRINCIPLE re-affirmed for pre-market flow: Mac dev and AWS prod produce IDENTICAL 4-ping Telegram sequence. Only the "Environment:" line differs in PreMarketReady message ("AWS c8g.xlarge ap-south-1" vs "Mac M4 Pro local"). Same docker-compose, same boot sequence, same checkpoints, same confidence.
 
+[2026-05-11 23:00 IST] [topic] TELEGRAM MESSAGE STYLE RULES locked. Written to topic-telegram-message-style-rules.md. 10 commandments + banned-word list (rkyv/DEDUP/papaya/arc-swap/mpsc/GCRA all banned in operator-facing text) + 4 pre-market pings rewritten in plain English + degraded/critical variants + mid-market alert examples + auto-driver litmus test. New Phase 0.5 Item 0.5.19 added: Telegram Jargon Guard (mechanical scanner, ~80 LoC, Low severity). Phase 0.5 grows to 19 items, ~1,770 LoC.
+
+[2026-05-11 23:10 IST] [meta] FOREVER CHARTER locked at .claude/rules/project/operator-charter-forever.md. Auto-loaded every session via standard rules-directory mechanism. Contains: verbatim operator charter (preserved exactly) + 15-row "100% everything" matrix + 7-row "Resilience" matrix + 10 Telegram commandments + honest 100% claim wording + 11 always-on rules + read-this-first protocol + mechanical enforcement chain. PR template (.github/pull_request_template.md) updated to include 15+7 matrix checkboxes + Telegram style verification + honest-envelope-qualifier check. CLAUDE.md updated to reference the forever-charter as canonical authority.
+
+[2026-05-11 23:10 IST] [meta] BINDING SCOPE: forever-charter applies to (a) every Claude Code session opening this repo, (b) every Claude Cowork task, (c) every new branch claude/*, (d) every PR (template now mandates checklist), (e) every plan item (per-item-guarantee-check.sh enforces matrix), (f) every Friday task on the Task Board. PERMANENT. Cannot be superseded.
+
 ---
 
 ## Reversal procedure

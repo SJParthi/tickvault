@@ -7,7 +7,10 @@
 **Friday execution target:** 2026-05-15 (retained — when we're ready, we go)
 **No implementation rule:** STILL ACTIVE. Brainstorm + design only. Code lands Friday.
 
-**CANONICAL REFERENCE FILE:** `step-1-honest-envelope.md` — any future session opening cold MUST read this FIRST to avoid re-debating closed items (operator charter + honest envelope + 5-layer defence diagram + per-item matrix).
+**CANONICAL REFERENCE FILES (read in order):**
+1. `.claude/rules/project/operator-charter-forever.md` — **FOREVER CHARTER** (auto-loaded every session, permanent contract)
+2. `.claude/plans/friday-may-15-mega/step-1-honest-envelope.md` — Mon eve honest envelope (canonical reference for tickvault-specific envelope)
+3. `.claude/plans/friday-may-15-mega/topic-telegram-message-style-rules.md` — Telegram style rules (auto-driver-level only)
 
 ---
 
