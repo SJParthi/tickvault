@@ -1444,13 +1444,19 @@ pub const TICK_FLUSH_INTERVAL_MS: u64 = 1000;
 /// - 600K → 2M (PR #452, 2026-05-03): operator-spec'd extreme
 ///   memory pressure handling. 233% capacity increase. ~3.3× outage
 ///   survival window before disk spill kicks in.
-pub const TICK_BUFFER_CAPACITY: usize = 2_000_000;
+/// - 2M → 5M (Wave 7-A4, 2026-05-11): RAM-first hot-path hardening
+///   per `.claude/rules/project/aws-budget.md` § "Host Memory Budget
+///   — Wave 7-A4 Locked". 5M × ~200B = ~1.0 GB pre-allocated VecDeque,
+///   absorbed inside the app's 2 GB allocation. Absorbs ≤30 sec
+///   QuestDB outage at peak burst (~99K seals/min minute boundary
+///   spike), or ~3 hours at sustained ~470 ticks/sec.
+pub const TICK_BUFFER_CAPACITY: usize = 5_000_000;
 
 /// High watermark threshold for tick ring buffer (80% of capacity).
 /// When buffer occupancy exceeds this, a WARN-level alert fires once
 /// to signal imminent disk spill. Triggers Telegram via Loki ERROR rule.
-/// 80% of 2,000,000 = 1,600,000 ticks.
-pub const TICK_BUFFER_HIGH_WATERMARK: usize = TICK_BUFFER_CAPACITY * 4 / 5; // 1,600,000
+/// 80% of 5,000,000 = 4,000,000 ticks.
+pub const TICK_BUFFER_HIGH_WATERMARK: usize = TICK_BUFFER_CAPACITY * 4 / 5; // 4,000,000
 
 /// Minimum free disk space (bytes) to log a warning before spill write.
 /// 100 MB — below this, a WARN fires on each spill open to alert operator

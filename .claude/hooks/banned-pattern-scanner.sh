@@ -540,6 +540,127 @@ scan_movers_orphan_ddl() {
 scan_movers_orphan_ddl "$STAGED_FILES"
 
 # ─────────────────────────────────────────────
+# CATEGORY 10: RAM-FIRST HOT-PATH READS (Wave 7-A4, 2026-05-11)
+# ─────────────────────────────────────────────
+#
+# Per `.claude/rules/project/aws-budget.md` § "RAM-First Architecture
+# (Wave 7-A4 mandatory)":
+#
+# > Tick → strategy decision must read indicator state, today's sealed
+# > bars, yesterday's sealed bars, and prev_day_OI cache from RAM only.
+# > QuestDB is for: persistence, audit, cross-verify (cold path), boot
+# > rehydration.
+#
+# Hard ban on QuestDB / SQL reads from the trading hot path. The
+# strategy + indicator + risk-check code paths sit between the
+# WebSocket tick parse and the order-out wire — every microsecond of
+# DB I/O blocks the tokio worker and adds latency to the next order.
+#
+# The cold-path equivalents (boot rehydration, post-market cross-verify,
+# operator dashboard SELECTs) are allowed in their respective modules.
+#
+# Hot-path files (start narrow — extend as Wave 7-A4 lands the full
+# RAM-first migration):
+#   - crates/trading/src/strategy/*.rs
+#   - crates/trading/src/indicator/*.rs
+#   - crates/trading/src/oms/risk_check.rs
+#   - crates/core/src/pipeline/tick_processor.rs
+#
+# Exempt: `// HOT-PATH-EXEMPT: <reason>` on the preceding line, or
+# the SELECT/exec/query call lives inside a `tokio::task::spawn_blocking`
+# or `tokio::task::spawn` closure (those run off the hot path).
+#
+# Wave 7-A4 status: this category lands the GUARD. The
+# indicator/strategy migration to read from `BarCache` (W7-A4.3) ships
+# in follow-up sub-PRs.
+
+scan_ram_first_hot_path() {
+  local pattern="$1"
+  local description="$2"
+  local files="$3"
+  local target_files
+
+  target_files=$(echo "$files" | grep -E \
+    '^crates/trading/src/strategy/.*\.rs$|^crates/trading/src/indicator/.*\.rs$|^crates/trading/src/oms/risk_check\.rs$|^crates/core/src/pipeline/tick_processor\.rs$' \
+    || true)
+  if [ -z "$target_files" ]; then
+    return
+  fi
+
+  while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    [ ! -f "$file" ] && continue
+
+    # Find lines matching the pattern, excluding comment-only lines + tests
+    local matches
+    matches=$(grep -n -E "$pattern" "$file" 2>/dev/null \
+      | grep -v -E '^[[:space:]]*//' \
+      | grep -v -E '^[[:space:]]*#\[' \
+      || true)
+
+    [ -z "$matches" ] && continue
+
+    while IFS= read -r match_line; do
+      [ -z "$match_line" ] && continue
+      local line_num
+      line_num=$(echo "$match_line" | cut -d: -f1)
+      local content
+      content=$(echo "$match_line" | cut -d: -f2-)
+
+      # Skip if inside a test module — naive check: any module above
+      # this line containing `#[cfg(test)]` is exempt.
+      if head -n "$line_num" "$file" | grep -qE '^[[:space:]]*#\[cfg\(test\)\]' && \
+         head -n "$line_num" "$file" | tail -n 30 | grep -qE 'mod tests'; then
+        continue
+      fi
+
+      # Allow `// HOT-PATH-EXEMPT:` comment on preceding line
+      local prev_line
+      prev_line=$(sed -n "$((line_num - 1))p" "$file" 2>/dev/null)
+      if echo "$prev_line" | grep -qE '//\s*(HOT-PATH-EXEMPT|APPROVED):'; then
+        continue
+      fi
+
+      # Allow if line is inside a spawn_blocking / tokio::spawn closure
+      # (naive check: look backwards 20 lines for `spawn_blocking(` or
+      # `tokio::spawn(`; if found and no closing `})` before our line,
+      # we're inside the closure).
+      local in_async_closure
+      in_async_closure=$(head -n "$line_num" "$file" | tail -n 30 \
+        | grep -cE 'spawn_blocking\s*\(|tokio::spawn\s*\(|tokio::task::spawn' \
+        || true)
+      # grep -c always prints a count; default to 0 if empty
+      : "${in_async_closure:=0}"
+      if [ "$in_async_closure" -gt 0 ] 2>/dev/null; then
+        # heuristic — if a closure is open above and not closed yet,
+        # we treat it as OK. Conservative: only skip if pattern is in
+        # an obviously async context. The operator can always add
+        # `// HOT-PATH-EXEMPT:` for clarity.
+        :  # not skipping by default — operator must annotate
+      fi
+
+      VIOLATIONS=$((VIOLATIONS + 1))
+      REPORT="${REPORT}\n  [BANNED] Cat 10 ($description): $file:$line_num\n    $content"
+    done <<< "$matches"
+  done <<< "$target_files"
+}
+
+# QuestDB / SQL read calls on the hot path — block any SELECT statement
+# or low-level `.exec(` / `.query(` / `.fetch_*(` invocation.
+scan_ram_first_hot_path '\bSELECT\b' \
+  'RAM-FIRST: SELECT on hot path is banned (Wave 7-A4). Read from BarCache / IndicatorEngine RAM state.' \
+  "$STAGED_FILES"
+scan_ram_first_hot_path '\.exec\b[[:space:]]*\(' \
+  'RAM-FIRST: .exec() on hot path is banned (Wave 7-A4). Use RAM cache or move to cold-path task.' \
+  "$STAGED_FILES"
+scan_ram_first_hot_path '\.query\b[[:space:]]*\(' \
+  'RAM-FIRST: .query() on hot path is banned (Wave 7-A4). Use RAM cache or move to cold-path task.' \
+  "$STAGED_FILES"
+scan_ram_first_hot_path '\.fetch_(one|all|optional)\b[[:space:]]*\(' \
+  'RAM-FIRST: .fetch_*() on hot path is banned (Wave 7-A4). Use RAM cache or move to cold-path task.' \
+  "$STAGED_FILES"
+
+# ─────────────────────────────────────────────
 # RESULT
 # ─────────────────────────────────────────────
 

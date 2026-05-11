@@ -12,8 +12,14 @@
 //! handling. Wording in `wave-4-shared-preamble.md` + `per-wave-guarantee-matrix.md`
 //! updated to "2,000,000-tick" in tandem.
 //!
+//! 2026-05-11 (Wave 7-A4): rescue ring capacity bumped 2M → 5M (~1.0 GB
+//! pre-allocated VecDeque) per RAM-first hot-path hardening spec in
+//! `.claude/rules/project/aws-budget.md` § "Host Memory Budget — Wave
+//! 7-A4 Locked". Wording in both rule files updated to "5,000,000-tick"
+//! in tandem.
+//!
 //! After investigation:
-//! - `TICK_BUFFER_CAPACITY = 2_000_000` exists in
+//! - `TICK_BUFFER_CAPACITY = 5_000_000` exists in
 //!   `crates/common/src/constants.rs` and is ratcheted by
 //!   `crates/storage/tests/zero_tick_loss_alert_guard.rs`.
 //! - The 65h Fri 16:00 → Mon 09:00 IST weekend sleep/wake test
@@ -62,10 +68,10 @@ fn section8_keeps_2m_rescue_ring_claim_with_evidence_pointer() {
         // claim must cite the constant + ratchet test so future
         // readers can verify the proof in one grep.
         assert!(
-            text.contains("2,000,000-tick ring buffer capacity"),
-            "{label} ({path}) must keep the proven 2,000,000-tick ring \
-             buffer capacity claim (PR #452 bumped 600K → 2M for \
-             extreme memory pressure handling)."
+            text.contains("5,000,000-tick ring buffer capacity"),
+            "{label} ({path}) must keep the proven 5,000,000-tick ring \
+             buffer capacity claim (Wave 7-A4 bumped 2M → 5M for \
+             RAM-first hot-path hardening per aws-budget.md)."
         );
         assert!(
             text.contains("`TICK_BUFFER_CAPACITY`"),
