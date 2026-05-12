@@ -652,3 +652,45 @@ Prior 490 MB design was too conservative. Wasted 1.5 GB headroom.
 5. Explicit budget enforcement (boot guard)
 
 Discussion mode continues. NO IMPLEMENTATION.
+
+## 2026-05-12 14:05 IST — BACKTESTING CORRECTION (tickvault is LIVE-ONLY)
+
+Operator correction 2026-05-12 14:00 IST: "we won't do any backtesting
+here — that's a SEPARATE product. When we finalize strategies +
+indicators + technical + functional + percentage checks (in that
+separate product), THEN we will implement those alone here in live."
+
+**What changed:**
+- DROP 50 MB "Backtest warmup ring" — not needed in live-only product
+- Indicator cold-start (mid-day boot lookback) uses Tier 2 sealed bars
+  (already allocated 215 MB today + 50 MB yesterday LRU)
+- Multi-day lookback indicators (SMA-200 on 1d) lazy-load older days
+  from QuestDB ONE TIME at boot, then run in-memory forever
+
+**Reallocation:**
+- 50 MB freed from removed warmup ring
+- → Moved to indicator state: 230 MB → 280 MB (4.6x prior allocation)
+- Total still 2.0 GB inside cap
+
+**What tickvault DOES:**
+- Run finalized indicators in live market
+- Run finalized strategies (dry-run or live)
+- Cross-verify post-market
+- Audit + Telegram + Grafana
+
+**What tickvault DOES NOT do (separate product):**
+- Strategy backtesting
+- Indicator parameter sweep
+- Walk-forward analysis
+- Monte Carlo simulation
+- Strategy library design + iteration
+
+**Common runtime dynamic scalable in LIVE-ONLY context:**
+- Same TOML config Mac dev = AWS prod (common)
+- Config hot-reload on indicators.toml change (dynamic)
+- Boot guard validates RAM fit when new indicator added (scalable)
+- Enable 1 indicator at a time post-backtesting (incremental)
+
+Final budget unchanged at ~2 GB, with indicator slot bumped to 280 MB.
+
+Discussion mode continues. NO IMPLEMENTATION.
