@@ -610,3 +610,203 @@ The simplified strategy is STRONGER, not weaker:
 > - prev_day_oi: bhavcopy (P1) covers 99%+ of trading days; Dhan historical (P2) covers the remaining 1%; emergency P3 (yesterday last-tick) + P4 (first-tick capture) wired as fallback only."
 
 Operator's instinct cut 75% of the work AND made the system MORE robust. ☕→💡
+
+---
+
+## 📌 APPENDIX D — Operator confirmation 2026-05-12 12:00 IST (NSE bhavcopy = PRIMARY for prev_day_*)
+
+**Operator's exact reasoning:**
+> "For prev_day_oi I believe it's better to consider NSE bhavcopy — that would be the best case. At 8:30 AM when we download bhavcopy we can easily fetch the entire current day instruments data matching with NSE bhavcopy. It's exactly precise to believe bhavcopy. Even from there we can easily get prev_day_high, low, close, prev_day_oi — everything."
+
+**Confirmed correct.** This is the cleanest design. Let me reorganize the strategy.
+
+### What NSE bhavcopy actually contains
+
+| File | Coverage | Fields |
+|---|---|---|
+| **Equity bhavcopy** (`cm_*.csv`) | All NSE_EQ instruments | SYMBOL, SERIES, OPEN, HIGH, LOW, CLOSE, LAST, PREVCLOSE, TOTTRDQTY (volume), TOTTRDVAL, TIMESTAMP, TOTALTRADES, ISIN |
+| **F&O bhavcopy** (`fo_*.csv`) | All NSE_FNO instruments | INSTRUMENT, SYMBOL, EXPIRY_DT, STRIKE_PR, OPTION_TYP, OPEN, HIGH, LOW, CLOSE, SETTLE_PR, **CONTRACTS** (volume), VAL_INLAKH, **OPEN_INT (OI)** ✨, **CHG_IN_OI**, TIMESTAMP |
+
+**The F&O bhavcopy gives us OI for free for every derivative.** 98K derivatives in one CSV download.
+
+### Bhavcopy timing
+
+- **Published:** ~18:00 IST same day (after market close)
+- **Available:** by 18:30 IST same day reliably
+- **Our download:** at next morning's boot, ~08:30 IST (operator's AWS schedule)
+- **Means:** by the time AWS starts at 08:30 IST, bhavcopy from yesterday is 14+ hours stale (= solidly published, no race)
+
+### Re-organized strategy (CLEANEST design)
+
+| Field | PRIMARY source | When | Why |
+|---|---|---|---|
+| `prev_day_close` (IDX_I) | PrevClose packet (code 6) | Live, market open | Free from tick stream |
+| `prev_day_close` (NSE_EQ + NSE_FNO) | Quote/Full `close` field | Live, every tick all day | Free from tick stream |
+| `prev_day_high` | **NSE bhavcopy** | 08:30 IST boot | No tick equivalent; bhavcopy is authoritative |
+| `prev_day_low` | **NSE bhavcopy** | 08:30 IST boot | Same |
+| `prev_day_oi` (NSE_FNO only) | **NSE bhavcopy F&O CSV (OPEN_INT field)** | 08:30 IST boot | THE OPERATOR'S BEST CASE — official, precise, covers all 98K |
+| `prev_day_volume` | NOT NEEDED | — | Operator confirmed earlier |
+
+### Bhavcopy + Dhan historical = DIFFERENT roles (not redundant)
+
+This is the key insight I want to lock:
+
+| Concern | Source | Why |
+|---|---|---|
+| "What were yesterday's daily values?" (close/high/low/oi) | **NSE bhavcopy at 08:30 IST** | Official, single CSV download, all 98K instruments at once |
+| "Were today's minute candles correct?" (1m cross-verify) | **Dhan historical at 15:31 IST** | Per-minute granularity, OHLCV+OI per bucket, only Dhan can provide |
+
+**They do NOT overlap.** Each serves its strength:
+- Bhavcopy = DAILY granularity, official, all instruments in 1 download
+- Dhan historical = MINUTE granularity, per-instrument calls, supports cross-verify
+
+**Operator's worry "should bhavcopy be first?" — YES for prev_day_*. Dhan historical is for the cross-verify only, not for prev_day_*.**
+
+### Refined Z+ 7-Layer for prev_day_oi (bhavcopy-first)
+
+| Layer | Mechanism |
+|---|---|
+| L1 DETECT | `tv_bhavcopy_load_success_total`, `tv_bhavcopy_load_failed_total`, `tv_prev_day_oi_cache_size` gauge |
+| L2 VERIFY | At 08:35 IST after bhavcopy load, compare cache size to expected (~98K F&O entries) |
+| L3 RECONCILE | Daily 23:00 IST: cross-check yesterday's bhavcopy OI vs last 1m candle OI from candles_1m_shadow |
+| L4 PREVENT | At 08:30 IST: pre-fetch bhavcopy, BLOCK boot completion until cache populated |
+| L5 AUDIT | NEW `bhavcopy_load_audit` table (per download attempt) |
+| L6 RECOVER | If bhavcopy unreachable: 5x retry with 5min backoff → fall through to P2 (Dhan historical fetch for yesterday) → P3 (yesterday's last-tick from previous_close table) |
+| L7 COOLDOWN | Between download retries: 5 min |
+
+### Friday LoC estimate (UPDATED — even simpler now)
+
+| Item | Before | After bhavcopy-primary |
+|---|---|---|
+| prev_day_close loader | ~50 LoC | ~50 LoC (unchanged — from ticks) |
+| prev_day_oi loader (was 4-tier) | ~250 LoC | ~150 LoC (bhavcopy primary + 2 fallbacks) |
+| prev_day_high/low loader (NEW) | — | ~80 LoC (bhavcopy adds, basically free) |
+| Bhavcopy download + parser | — | ~200 LoC |
+| **Total prev_day code** | ~300 LoC | ~480 LoC |
+
+Slightly MORE LoC but covers more fields (high/low) AND is more reliable. Operator's call.
+
+---
+
+## 📌 APPENDIX E — Bhavcopy implementation notes (Friday-relevant)
+
+### URLs (NSE)
+
+**WARNING:** NSE changed bhavcopy URLs in 2024-2025. Old `nseindia.com/archives/equities/bhavcopy/pr/PR<DDMMYY>.zip` may not work.
+
+**Current (as of 2026):**
+- Equity: `https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_<DDMMYYYY>.csv` (NEW format)
+- F&O: `https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_<DDMMYYYY>_F_0000.csv.zip` (NEW format)
+
+**Action for Friday:** verify these URLs work. Have fallback URL ready.
+
+### Mapping bhavcopy → security_id
+
+Bhavcopy uses SYMBOL + EXPIRY_DT + STRIKE_PR + OPTION_TYP. Our system uses security_id.
+
+**Mapping logic:**
+1. Parse bhavcopy row
+2. For F&O: lookup `(SYMBOL, EXPIRY_DT, STRIKE_PR, OPTION_TYP)` in our `derivative_contracts` table → get security_id
+3. For equity: lookup `SYMBOL` in `fno_underlyings` or `subscribed_indices` → get security_id
+
+**Failure mode:** if bhavcopy has a new strike we don't have in our instrument master → log warning, skip (won't be subscribed anyway).
+
+### Caching to QuestDB
+
+Once parsed, write to `previous_close` table (existing) with columns:
+- `security_id`
+- `segment`
+- `trading_date`
+- `prev_close` (already there)
+- `prev_open`, `prev_high`, `prev_low` (NEW)
+- `prev_oi` (NEW for F&O)
+- `prev_volume` (NEW — even if not used now, store for future)
+
+### Idempotency
+
+Same pattern as historical fetch:
+- `bhavcopy_load_state` table: status per `(trading_date, file_type)` where file_type = "equity" | "fno"
+- Once `status='success'`, don't re-download
+- DEDUP UPSERT KEYS(trading_date, file_type)
+
+---
+
+## 📌 APPENDIX F — FINAL CONSOLIDATED prev_day_* strategy (this is THE design)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  08:30 IST boot (Mon–Fri + Mock Sat)                         │
+│  ┌─────────────────────────────────────────────────────────┐ │
+│  │  Download YESTERDAY's bhavcopy (equity + F&O CSVs)      │ │
+│  │  Parse → write to previous_close table                  │ │
+│  │  → ALL prev_day_* fields available for TODAY's session  │ │
+│  └─────────────────────────────────────────────────────────┘ │
+│                              │                                │
+│                              ▼                                │
+│  09:00 IST pre-open                                           │
+│  ┌─────────────────────────────────────────────────────────┐ │
+│  │  Live tick stream starts                                 │ │
+│  │  - IDX_I PrevClose packet (code 6) — capture in-memory   │ │
+│  │  - NSE_EQ/FNO close field — capture in-memory           │ │
+│  │  → CROSS-CHECK against bhavcopy values (alert mismatch) │ │
+│  └─────────────────────────────────────────────────────────┘ │
+│                              │                                │
+│                              ▼                                │
+│  09:15 IST market open                                        │
+│  ┌─────────────────────────────────────────────────────────┐ │
+│  │  Live aggregation builds candles_1m_shadow              │ │
+│  │  Strategy/indicators use prev_day_oi from bhavcopy      │ │
+│  └─────────────────────────────────────────────────────────┘ │
+│                              │                                │
+│                              ▼                                │
+│  15:30 IST market close                                       │
+│  ┌─────────────────────────────────────────────────────────┐ │
+│  │  All 16 WS disconnect                                    │ │
+│  └─────────────────────────────────────────────────────────┘ │
+│                              │                                │
+│                              ▼                                │
+│  15:31 IST post-market                                        │
+│  ┌─────────────────────────────────────────────────────────┐ │
+│  │  Dhan historical /v2/charts/intraday fetch              │ │
+│  │  - 11K instruments × 1m candles                          │ │
+│  │  - Cross-verify against candles_1m_shadow               │ │
+│  │  - Zero tolerance OHLCV+OI                              │ │
+│  └─────────────────────────────────────────────────────────┘ │
+│                              │                                │
+│                              ▼                                │
+│  17:30 IST AWS shutdown                                       │
+└─────────────────────────────────────────────────────────────┘
+
+Next morning 08:30 IST: cycle repeats with TODAY's bhavcopy
+(which has YESTERDAY's session data — becomes TOMORROW's prev_day_*).
+```
+
+### The TWO independent sources, summarized
+
+| Source | Granularity | When | Primary role |
+|---|---|---|---|
+| **NSE bhavcopy** | Daily | 08:30 IST next morning | `prev_day_*` (close, high, low, OI, volume) |
+| **Dhan historical** | 1-minute | 15:31 IST same day | Cross-verify live aggregation |
+
+Each is AUTHORITATIVE for its domain. They complement, do not overlap.
+
+### Operator-correct ultra-summary
+
+> "Yesterday's bhavcopy → today's prev_day_*. Today's Dhan historical → cross-verify today's candles. Two sources, two roles, zero conflict."
+
+---
+
+## 🎤 What this changes for Friday
+
+| Friday task | Change |
+|---|---|
+| ~~prev_day_oi 4-tier loader~~ | RETIRED — bhavcopy primary, simpler |
+| Bhavcopy downloader + parser | NEW — ~200 LoC |
+| Boot-time bhavcopy load orchestrator | NEW — ~100 LoC |
+| `bhavcopy_load_audit` table | NEW |
+| Cross-check bhavcopy vs `close` field (Z+ L2 VERIFY) | NEW |
+| Z+ 7-Layer for bhavcopy | NEW |
+
+Net LoC: similar to before. Reliability: MUCH better. Coverage: ALL prev_day_* fields, not just OI.
+
+Floor's yours for next angle.

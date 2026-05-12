@@ -528,3 +528,95 @@ Higher TFs aggregated locally from 1m. But our local 1d aggregator depends on re
 > This is the heart of zero-tick-loss. The live aggregation might miss; the post-market fetch CATCHES it.
 
 3 days no code. Floor's yours for the 6 D-items. 🫡
+
+---
+
+## 📌 APPENDIX A — Operator decisions on D-items 2026-05-12 12:10 IST
+
+All 6 D-items resolved:
+
+| # | Question | Operator decision |
+|---|---|---|
+| **D1** | Endpoint — `/v2/charts/intraday`? | ✅ Locked |
+| **D2** | Write prev_day_oi cache BEFORE or AFTER cross-verify? | ✅ AFTER (only authoritative values) |
+| **D3** | AWS shutdown vs wait-for-fetch? | ✅ **AWS shutdown NEEDED** — accept it; resume next boot if needed |
+| **D4** | Mock Trading Saturday — Dhan provides data? | ✅ **YES — Dhan provides** (operator confirmed). Fetch on Mock Sessions. |
+| **D5** | Timestamp precision — exact or ±1sec? | ✅ **PRECISE** (exact match required, no tolerance) |
+| **D6** | ALSO fetch 1d historical for daily cross-verify? | ✅ **NOT NEEDED** — skip. Local 1m → higher TF aggregation trusted. |
+
+### Implications
+
+**D3 AWS shutdown:**
+- AWS hard-stops at 17:30 IST regardless of fetch state
+- Fetch budget = 15:31 → 17:25 = 1h54m (5min safety before shutdown)
+- 11K × 0.2s/call = 37 min typical = comfortable margin
+- Worst case (rate-limit retries push past 17:25): state saved → resume next morning 08:30 boot
+- Cross-verify summary may be delayed to next day morning — accepted trade-off
+
+**D4 Mock Trading day handling:**
+- `is_mock_trading_session(today) == true` → same path as regular trading day
+- Same fetch + same cross-verify + same audit
+- No special-casing in code
+- TEST on next Mock Trading Saturday (~next planned: 2026-XX-XX from calendar)
+
+**D5 timestamp precision:**
+- Live aggregator seals at exact minute boundary (e.g., 10:15:00.000 IST)
+- Dhan historical timestamp must be **exact same epoch** (modulo IST offset)
+- If Dhan returns 10:15:01 IST → that's a PARSER BUG (likely +1s shift)
+- Cross-verify treats timestamp mismatch as a fundamental error (not data mismatch)
+- Per-candle `candle_ts` is the primary join key — must match byte-for-byte
+
+**D6 no 1d historical fetch:**
+- Saves 11K API calls per day (~2 hours of API time)
+- Trust local 1m → 1d aggregation
+- If local aggregation buggy, cross-verify on 1m WILL catch (all 375 candles wrong → all 1d wrong)
+- Single point of detection at 1m level is sufficient
+
+### Updated API budget
+
+| Item | Calls/day | % of 100K daily quota |
+|---|---|---|
+| Dhan historical 1m fetch | 11,000 | 11% |
+| ~~Dhan historical 1d fetch~~ | ~~11,000~~ | ~~11%~~ (D6 dropped) |
+| Other Data API uses (quote/option chain/etc.) | ~5,000 | 5% |
+| **TOTAL** | ~16,000 | ~16% |
+
+**Comfortable margin of 84K calls/day reserved for retries + emergency fetches.**
+
+### Updated time budget
+
+| Stage | Duration |
+|---|---|
+| 15:30 market close | — |
+| 15:30–15:31 WS drain | 1 min |
+| 15:31 orchestrator fires | — |
+| 15:31–16:08 Dhan historical fetch (11K × 0.2s @ 5/sec) | 37 min |
+| 16:08–16:15 cross-verify (4.1M comparisons) | ~7 min |
+| 16:15–16:20 write audit + Telegram summary | 5 min |
+| 16:20–17:25 buffer for retries | 65 min |
+| 17:25–17:30 graceful shutdown prep | 5 min |
+| 17:30 AWS hard-shutdown | — |
+
+**Total work time: ~50 min normal. Buffer: 65 min for retries. Margin: comfortable.**
+
+---
+
+## 📌 APPENDIX B — Final FRIDAY LoC estimate for the heart piece
+
+| Component | LoC |
+|---|---|
+| Historical fetch orchestrator | 200 |
+| Per-instrument fetch worker (with retry/resume) | 250 |
+| historical_fetch_state table writes + reads | 100 |
+| Cross-verify engine (per-field comparison) | 200 |
+| cross_verify_mismatches + summary table writes | 150 |
+| Idempotency state machine | 100 |
+| WS-disconnect gate (wait for all 16 to close) | 80 |
+| Prometheus metrics (8) | 100 |
+| Alert rules in alerts.yml (4) | 50 |
+| Grafana panels (6) | 150 (JSON) |
+| Telegram NotificationEvent variants (4) | 80 |
+| Ratchet tests (~15 test cases) | 400 |
+| **TOTAL** | **~1,860 LoC** |
+
+This is ONE Friday session work item. Operator pick: how many sub-PRs to split into?
