@@ -385,3 +385,37 @@ NSE bhavcopy is third backstop.
 - D3 (AWS shutdown vs wait for fetch) — my vote accept shutdown
 
 Discussion mode continues. NO IMPLEMENTATION.
+
+## 2026-05-12 12:10 IST — bhavcopy PRIMARY for prev_day_* + D-items resolved
+
+### Bhavcopy decision (operator-locked)
+
+**Operator's call:** NSE bhavcopy is PRIMARY for prev_day_oi, prev_day_high, prev_day_low, prev_day_close (where not from ticks).
+
+**Key insight locked:** bhavcopy + Dhan historical serve DIFFERENT roles, not redundant:
+- bhavcopy = DAILY granularity, all instruments in 1 download → prev_day_* fields
+- Dhan historical = MINUTE granularity, per-instrument → 1m cross-verify
+
+Strategy:
+- prev_day_close (IDX_I): PrevClose packet (free from ticks)
+- prev_day_close (NSE_EQ/FNO): close field from Quote/Full (free from ticks)
+- prev_day_high/low: NSE bhavcopy (no tick equivalent)
+- prev_day_oi: NSE bhavcopy (operator's "best case")
+- prev_day_volume: NOT NEEDED (operator confirmed earlier)
+
+### All D-items resolved (post-market plan):
+
+| # | Decision |
+|---|---|
+| D1 | `/v2/charts/intraday` endpoint locked |
+| D2 | Write prev_day cache AFTER cross-verify (only authoritative values) |
+| D3 | AWS shutdown NEEDED — accept it, resume next boot if fetch incomplete |
+| D4 | Mock Trading sessions: Dhan provides data — fetch same as regular days |
+| D5 | Timestamp precision: PRECISE (exact match required, no tolerance) |
+| D6 | 1d historical fetch: NOT NEEDED (skip — trust local aggregation from 1m) |
+
+### Final Friday LoC for heart piece: ~1,860 LoC
+
+Updated API budget: 16% of daily quota (was 22% with 1d). Comfortable margin.
+
+Discussion mode continues. NO IMPLEMENTATION.
