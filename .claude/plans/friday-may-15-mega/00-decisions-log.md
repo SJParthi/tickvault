@@ -334,3 +334,54 @@ Operator decision LOCKED:
 **Total Friday brainstorm output so far: 11 plan files. 3 days remaining for discussion.**
 
 NO IMPLEMENTATION. Discussion mode continues.
+
+## 2026-05-12 11:45 IST — POST-MARKET FETCH = THE HEART PIECE
+
+Operator decisions LOCKED (7 Q's answered):
+
+| # | Question | Decision |
+|---|---|---|
+| Q1 | TFs to fetch | ONLY 1m. Higher TFs aggregated locally from 1m. |
+| Q2 | Cross-verify tolerance | 0% zero. Per (ts,tf), OHLCV+OI must match EXACTLY. |
+| Q3 | Resume on failure | Resume from last successful instrument. NEVER skip. Retry until success. |
+| Q4 | Mock Trading + weekends/holidays | Trading days + Mock Sessions only fetch. Others = no-op. |
+| Q5 | Final candle | 15:29:00 → 15:29:59 INCLUSIVE (live aggregation source-of-truth) |
+| Q6 | Dhan historical vs NSE bhavcopy | BOTH. Different roles. Dhan @ 15:31 IST same day for cross-verify; bhavcopy @ 08:15 IST next morning for independent prev_day_oi backup. |
+| Q7 | Trigger | Post-market only. Wait for all 16 WS conns CLOSED. ONCE per day on successful complete fetch. |
+
+Locked plan: `topic-post-market-historical-fetch-cross-verify.md`:
+
+**3 NEW QuestDB tables:**
+- `historical_fetch_state` (per-instrument progress, DEDUP UPSERT KEYS)
+- `cross_verify_mismatches` (per-field mismatch audit, SEBI 5y retention)
+- `cross_verify_summary` (per-day rollup, SEBI 5y retention)
+
+**8 NEW Prom metrics + 4 NEW alerts + 6 NEW Grafana panels + 4 NEW Telegram events.**
+
+**15 worst-case scenarios W1-W15 all defended.**
+
+**Idempotency proof:**
+- Survives process death (state in QuestDB)
+- Survives AWS shutdown (resume next boot)
+- Survives concurrent runs (DEDUP UPSERT)
+- Never duplicates work (success rows skipped)
+- Never misses data (resume from last failed)
+
+**Zero-tolerance enforcement:** mismatches table is PER-FIELD. Single SQL filter
+shows all OI mismatches, all volume mismatches, etc.
+
+**Dhan/bhavcopy resolution:** BOTH run unconditionally:
+- Dhan historical @ 15:31 = cross-verify capability (needs full OHLCV+OI)
+- NSE bhavcopy @ 08:15 next morning = independent backup for prev_day_oi
+- They cross-check each other on OI
+
+**Operator's worst-case worry (WS fail at 3:29 PM):** Dhan historical fetch
+still has 15:29 candle on Dhan-side; cross-verify catches the live gap;
+NSE bhavcopy is third backstop.
+
+**6 D-items still need operator pick** (D1-D6 in plan file):
+- D6 (fetch 1d historical too as cheap insurance) — my vote YES
+- D4 (Mock Trading Saturday Dhan behavior) — need Dhan email
+- D3 (AWS shutdown vs wait for fetch) — my vote accept shutdown
+
+Discussion mode continues. NO IMPLEMENTATION.
