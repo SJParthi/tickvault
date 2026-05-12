@@ -139,3 +139,40 @@ Locked design captured in `topic-ws-flow-health-7-layer-defense.md`:
 | Friday session | Own ~10–12hr session, NOT bundled with dynamic depth |
 
 Pending: operator `LGTM` to flip DRAFT → APPROVED.
+
+## 2026-05-12 10:25 IST — LIVE LOG diagnosis confirms 7-Layer plan correctness
+
+Operator ran app at 10:14 IST. Log analyzed in
+`topic-live-log-analysis-2026-05-12-10am.md`.
+
+**Key events observed:**
+- 10:14:50 — Clean 40.5s boot
+- 10:15:12 onwards — illiquid instrument tick-gap noise (1 → 156 instruments)
+- 10:18:10 / 10:21:15 / 10:21:55 — SLO-02 flapping (correctly edge-triggered)
+- **10:21:15 — DHAN-SIDE MASS TCP RST**: 9 of 10 WS endpoints RST'd in 1 second
+  (5 depth-20 + 4 main feed). Conn #3 NOT in storm — went silent instead.
+- 10:21:16 — All 9 reconnected in <200ms (SubscribeRxGuard PR #337 worked)
+- 10:21:21 — 910 instruments had 30-281s gaps (post-reconnect blind window)
+- 10:22:14 — WS activity watchdog fired on conn #3 (silent 54s)
+- 10:19:46 — DEPTH-DYN-V2-01 cohort empty (RAM-empty after boot grace)
+
+**Plan coverage verdict (HONEST):**
+| Symptom | Z+ plan covers? |
+|---|---|
+| Mass TCP RST | ✅ L7 30s cooldown + L6 soft restart |
+| Conn #3 silent socket | ✅ L1 frame-rate gauge (5s window) — would catch in 10s instead of 54s |
+| 30s blind window after reconnect | ✅ L2 subscribe-ACK round-trip |
+| Illiquid tick-gap noise | ❌ Need liquidity filter (Task 13 retrofit) |
+| DEPTH-DYN-V2-01 cohort empty | 🟡 Accept cold-start cycle OR extend boot grace |
+| Prometheus `hyper::Error(IncompleteMessage)` | ❌ NEW topic needed — observability 7-layer |
+
+**Action items (NO IMPLEMENTATION — plan-only):**
+1. Update `topic-ws-11-root-causes-ratchet-spec.md` — add Scenario #12 (Dhan-side mass RST)
+2. Update `topic-ws-flow-health-7-layer-defense.md` — L7 cooldown 30s HARD (not hybrid)
+3. NEW topic `topic-observability-7-layer-z-plus-defense.md` — Prometheus exporter resilience
+4. Email Dhan support — ask about mass-RST trigger interval
+5. Update Task 13 retrofit — WS-GAP-06 liquidity filter
+
+Honest envelope claim updated: "Inside the tested envelope, mass-RST recovery
+≤ 30s (L7 cooldown + L2 subscribe-ACK), single-conn silent-socket detection
+≤ 10s (L1 frame-rate gauge). Beyond envelope, soft restart (L6) within 90s."
