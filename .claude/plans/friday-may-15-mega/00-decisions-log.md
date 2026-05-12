@@ -176,3 +176,44 @@ Operator ran app at 10:14 IST. Log analyzed in
 Honest envelope claim updated: "Inside the tested envelope, mass-RST recovery
 ≤ 30s (L7 cooldown + L2 subscribe-ACK), single-conn silent-socket detection
 ≤ 10s (L1 frame-rate gauge). Beyond envelope, soft restart (L6) within 90s."
+
+## 2026-05-12 10:45 IST — ZERO TICK LOSS COVERAGE MAP locked
+
+Operator demand: "not even a single tick data loss is acceptable"
+
+Locked TWO new files:
+
+**1. `topic-zero-tick-loss-coverage-map.md`** — Master map
+- 8 stages: Network → Parser → Channel → Processor → Persist → Retention → Replay → Cross-verify
+- 59 loss paths identified, 59 defended ✅
+- Each defense has a ratchet test path
+- Honest envelope claim mandated
+
+**2. `topic-observability-7-layer-z-plus-defense.md`** — G1 (NEW)
+- 11 observability failure paths mapped
+- 7-Layer Z+ pattern applied (77-cell matrix)
+- 7 NEW metrics + 7 alerts + 7 panels
+- NEW audit table: `observability_health_audit`
+- Belt+suspenders Telegram (Alertmanager + direct path)
+
+**Honest envelope wording (mandatory):**
+> "Zero tick loss inside the tested envelope:
+> Stage 1: ≤30s mass-RST recovery; ≤10s silent-socket detect; ≤80s soft restart
+> Stage 2: compile-time ratchets
+> Stage 3: 5M-tick rescue ring (TICK_BUFFER_CAPACITY)
+> Stage 4: O(1) hot path, DHAT zero-alloc, composite-key
+> Stage 5: 3-tier rescue→spill→DLQ; ≤60s QuestDB outage
+> Stage 6: dry-run + hard floor (refuse drop date >= today-30d)
+> Stage 7: per-record checksum + DEDUP idempotency
+> Stage 8: daily bhavcopy + Option Chain reconcile
+>
+> Beyond envelope: NDJSON DLQ catches every payload as recoverable text.
+> SEBI 5y S3 retention guarantees long-term recovery.
+>
+> Mathematically impossible literal: SEBI 24h JWT mandates >=1 disconnect/day.
+> 'WS never disconnects' is a physics violation. Our envelope handles it."
+
+Total Friday workload now: ~6,000 LoC + zero-tick-loss coverage map +
+observability 7-layer + 11 root-cause ratchets. ~3 days x ~3 sessions.
+
+Pending: operator LGTM to flip all DRAFT → APPROVED status.
