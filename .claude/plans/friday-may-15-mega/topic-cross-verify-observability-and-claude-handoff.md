@@ -481,3 +481,101 @@ If we change the bundle format, old bundles become incompatible.
 Pick D1-D6 or surface new angle. This is the operational glue that makes the heart-piece actually USABLE in 5-minute incident response.
 
 3 days no code, brainstorm continues. 🫡
+
+---
+
+## 📌 APPENDIX A — OPERATOR-APPROVED Telegram Message Templates (LOCKED)
+
+**Status:** Operator-approved 2026-05-12 13:15 IST. These are the EXACT canonical templates. Implementation must produce these byte-for-byte.
+
+### ✅ Happy case template (99% of days)
+
+```
+✅ Cross-verify PASSED — 2026-05-12
+
+Instruments: 11,034 / 11,034 (100%)
+Candles compared: 4,137,750
+Mismatches: 0
+Duration: 37 min 12 sec
+All systems green. 🫡
+```
+
+### 🚨 Sad case template (the killer feature)
+
+```
+🚨 [CRITICAL] Cross-verify FAILED — 2026-05-12
+
+Mismatches: 47 across 5 instruments
+[breakdown table]
+═══════════════════════════════════════
+📋 CLAUDE HANDOFF BUNDLE:
+  data/claude-handoffs/cross-verify-2026-05-12-FAILED.md
+═══════════════════════════════════════
+Action: open new Claude session, paste path with "investigate".
+```
+
+### Template variables (replaced at send time)
+
+| Variable | Source |
+|---|---|
+| `2026-05-12` | `today.format("%Y-%m-%d")` |
+| `11,034 / 11,034` | `success_count / total_subscribed` from `historical_fetch_state` |
+| `4,137,750` | `tv_cross_verify_candles_compared_total` |
+| `47` | `tv_cross_verify_mismatches_total` |
+| `5 instruments` | `count(distinct security_id) FROM cross_verify_mismatches WHERE trading_date = today` |
+| `37 min 12 sec` | `tv_historical_fetch_duration_seconds` |
+| `[breakdown table]` | Per-field counts `open=0 high=12 low=0 close=5 volume=30 oi=0` |
+| `data/claude-handoffs/cross-verify-2026-05-12-FAILED.md` | bundle generator output path |
+
+### Mechanical enforcement (ratchet tests)
+
+NEW test: `crates/core/tests/telegram_cross_verify_template_guard.rs`
+- Pins the EXACT byte-for-byte template format
+- Fails build if any character (including spacing, ═ separator, emoji) drifts
+- Tests both PASSED and FAILED variants
+
+### Auto-driver test compliance
+
+| Rule | Check |
+|---|---|
+| Plain English only | ✅ "PASSED" / "FAILED" / "All systems green" |
+| No library names | ✅ No `rkyv` / `papaya` / `DEDUP` mentioned |
+| No file paths in body | ⚠️ ONE file path (the handoff bundle path) — this is INTENTIONAL because it's actionable |
+| Emoji for status | ✅ ✅ / 🚨 / 📋 / 🫡 |
+| Specific numbers | ✅ "11,034", "4,137,750", "47" |
+| Action verbs | ✅ "open new Claude session, paste path with 'investigate'" |
+| One Telegram = one decision | ✅ HAPPY: sleep / SAD: open Claude with bundle |
+| Time stamps 12-hr IST | (none in this message; dates only) |
+| Severity emoji at start of subject | ✅ ✅ or 🚨 |
+
+**Verdict:** passes operator-charter-forever §D Telegram commandments. ✅
+
+### Notification suppression rules
+
+| Rule | Why |
+|---|---|
+| ONE message per cross-verify run | Avoid spam (operator confirmed: "one and only once per day") |
+| If 100% mismatch storm (W38): coalesce to ONE summary message | Per Wave-3 coalescer; cap at 1 msg/topic/60s |
+| If cross-verify retry due to transient fail: no Telegram on retry, only on FINAL outcome | Avoid intermediate noise |
+| Edge-triggered: PASSED message only fires on RISING EDGE (from FAILED → PASSED) OR first-of-day | Don't spam with daily PASSED if always green |
+
+**Wait — clarify edge trigger for PASSED:**
+
+| Option | Behavior |
+|---|---|
+| (a) Fire PASSED every trading day (predictable positive signal) | Operator gets daily "all good" — but per audit-findings Rule 11 "no false-OK signals", this might be noise |
+| (b) Fire PASSED only on rising edge after a FAILED | Operator only hears about transitions; silence = good news |
+| (c) Fire PASSED weekly digest instead of daily | Compromise |
+
+**Operator decision needed.** Default if not specified: (a) — daily positive signal per operator's "always notify" charter.
+
+---
+
+## 🎤 Operator decision pending
+
+Pick the PASSED message frequency:
+- (a) Daily — every trading day's clean pass
+- (b) Rising edge only — silence is good news
+- (c) Weekly digest
+
+Default: **(a) daily**. Operator can override.
