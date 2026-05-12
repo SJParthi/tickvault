@@ -694,3 +694,60 @@ separate product), THEN we will implement those alone here in live."
 Final budget unchanged at ~2 GB, with indicator slot bumped to 280 MB.
 
 Discussion mode continues. NO IMPLEMENTATION.
+
+## 2026-05-12 14:15 IST — AWS BUDGET + MAC↔AWS PARITY (common runtime)
+
+Operator demand 2026-05-12 14:10 IST: comprehensive AWS budget +
+monitoring + triggering + logging + tracking + capturing + finalized
+automation. Plus Mac dev must replicate AWS (including core pinning).
+
+Locked `topic-aws-budget-and-mac-aws-parity.md`:
+
+**AWS Budget Automation (₹5K/mo cap):**
+- Daily Cost Explorer scrape at 09:00 IST
+- 6 thresholds: 70% Low / 90% High / 100% Critical / forecast / anomaly / 3x spike
+- Telegram daily digest with breakdown
+- NEW Lambda: instance-watchdog (5-min cron during business hours)
+- NEW components: aws_budget_monitor.rs + aws_budget_audit table +
+  AwsBudgetDigest notification
+
+**Mac↔AWS Parity (10 checks):**
+1. Docker compose SHA256
+2. Config base.toml SHA256
+3. Config indicators.toml SHA256
+4. Config strategies.toml SHA256
+5. Docker image digest match
+6. Rust binary git commit hash
+7. QuestDB schema match
+8. Grafana dashboards SHA256
+9. Prometheus alerts.yml SHA256
+10. Core pinning status (Mac=4/4, AWS=4/4)
+
+NEW: `make parity-check` command
+NEW: parity_check_audit table (daily 23:00 IST + boot 08:30)
+NEW: parity_drift_count gauge per check_name
+NEW: ParityDrift Telegram event
+
+**Core Pinning Parity (Wave 5 CORE-PIN-01):**
+- 4 Tokio worker threads pinned to cores 0-3
+- Same `core_affinity` crate works on macOS + Linux
+- Mac M1/M2: P-cores 0-3
+- AWS c8g.xlarge: vCPUs 0-3
+- Drift watchdog re-pins on detection
+- Verified via tv_core_pinning_workers_pinned_total gauge
+
+**Comprehensive automation chain (5 W's both machines):**
+- TRACK / MONITOR / LOG / AUDIT / CAPTURE all on both Mac dev + AWS prod
+- Same code, different SSM env paths, different Telegram channels
+- Same Prometheus / Grafana / QuestDB schema
+
+**Critical invariant:** Mac dev and AWS prod ALWAYS on same git commit
+during trading hours. Parity check step 6 enforces.
+
+10 NEW worst-case scenarios (W171-W180) for parity drift defended.
+
+Friday LoC estimate: ~1,440 LoC.
+
+5 D-items pending operator decision.
+
+Discussion mode continues. NO IMPLEMENTATION.
