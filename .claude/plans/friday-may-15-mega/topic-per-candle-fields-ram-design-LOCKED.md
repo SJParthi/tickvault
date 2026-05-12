@@ -568,3 +568,140 @@ Per operator-charter-forever §A 4-word test:
 Tight 20 MB margin inside 2 GB. Bench-gate ratchets it. Operator picks indicator priorities via config.
 
 Discussion mode continues. NO IMPLEMENTATION.
+
+---
+
+## 📌 APPENDIX B — OPERATOR CORRECTION 2026-05-12 14:00 IST: NO BACKTESTING IN TICKVAULT
+
+**Operator's correction (verbatim paraphrased):**
+> "We won't do any backtesting here — that's a SEPARATE product. When we finalize strategies + indicators + technical + functional + percentage checks (in that separate product), THEN we will implement those alone here in live."
+
+**Translation:** tickvault is a LIVE-ONLY product. Backtesting happens in a separate codebase / system. Only FINALIZED post-backtest indicators/strategies run in tickvault.
+
+### What this changes
+
+| Item | Before (wrong) | After (corrected) |
+|---|---|---|
+| 50 MB "Backtest warmup ring" | ❌ Allocated for backtest replay buffer | ❌ REMOVED — no backtesting in tickvault |
+| Indicator cold-start (mid-day boot needs lookback bars) | Conflated with "backtest" | ✅ Renamed: **"Indicator cold-start lookback"** — fundamentally different concern |
+| Strategy library | Implies design + iteration in tickvault | ✅ Strategies are PRE-FINALIZED in separate product; tickvault just RUNS them |
+
+### What stays the same
+
+**Indicator cold-start is still needed.** When app boots mid-day at 11:30 IST:
+- SMA-20 on 1m TF needs last 20 1m bars to compute current value
+- RSI-14 needs last 14 bars
+- MACD(12,26,9) needs ~35 bars
+- BB(20) needs 20 bars
+
+These cold-start bars come from **Tier 2 today's sealed bars (215 MB)** which is ALREADY allocated. No separate slot needed.
+
+**For multi-day lookback indicators (e.g., SMA-200 on 1d TF):**
+- Tier 2 has today + yesterday LRU (2 days)
+- 200-day SMA on 1d needs 200 days
+- Solution: lazy-load older days from QuestDB on cold-start ONE TIME at boot
+- Then indicator runs in-memory forever (only updates at bucket seals)
+
+**No separate warmup ring needed.** Cold-start uses Tier 2 + lazy QuestDB read.
+
+### Revised budget (50 MB freed → moved to indicator state)
+
+| Slot | Was | Now | Notes |
+|---|---|---|---|
+| Rescue ring | 1024 MB | 1024 MB | Same |
+| Tier 1 hot-path | 5 MB | 5 MB | Same |
+| Tier 2 today | 215 MB | 215 MB | Same |
+| Tier 2 yesterday LRU | 50 MB | 50 MB | Same |
+| **Indicator state** | **230 MB** | **280 MB** ⬆️ | +50 MB from removed warmup ring |
+| **Strategy state** | **100 MB** | **100 MB** | Same |
+| **~~Backtest warmup ring~~** | ~~50 MB~~ | **REMOVED** | Not needed in live-only product |
+| Greeks state | 50 MB | 50 MB | |
+| Depth book | 20 MB | 20 MB | |
+| SPSC channels | 65 MB | 65 MB | |
+| Token + cache | 10 MB | 10 MB | |
+| WS buffers | 20 MB | 20 MB | |
+| OMS queues | 10 MB | 10 MB | |
+| Tracing queues | 5 MB | 5 MB | |
+| Tokio runtime | 20 MB | 20 MB | |
+| **Subtotal** | 1874 MB | **1874 MB** | unchanged |
+| Heap frag | 130 MB | 130 MB | |
+| **TOTAL** | **~2004 MB** | **~2004 MB** | unchanged |
+
+**Net effect:** same 2 GB total. Indicator allocation grows from 230 → 280 MB. Backtest concept eliminated.
+
+### Indicator state allocation (revised — 280 MB)
+
+Now supports more indicators OR more periods OR more TFs per indicator:
+
+| Indicator | Bytes/state | Per (inst, TF, period) | Example: 6 indicators × multi-period × 6 TFs × 11K |
+|---|---|---|---|
+| RSI | 16 | 1 period | 11K × 6 × 2 periods × 16B = 2.1 MB |
+| MACD | 80 | 1 variant (12,26,9) | 11K × 6 × 1 × 80B = 5.3 MB |
+| EMA | 80 | 6 periods (9,21,50,100,200,500) | 11K × 6 × 6 × 80B = 31.7 MB |
+| SMA | 80 | 6 periods | 11K × 6 × 6 × 80B = 31.7 MB |
+| BB | 24 | 1 period (20) + std 2.0 | 11K × 6 × 1 × 24B = 1.6 MB |
+| ATR | 16 | 2 periods (14, 28) | 11K × 6 × 2 × 16B = 2.1 MB |
+| Stochastic | 24 | 1 variant | 11K × 6 × 1 × 24B = 1.6 MB |
+| Volume Profile (last N bars) | 200 | 1 | 11K × 6 × 1 × 200B = 13.2 MB |
+| **Subtotal** | | | **~89 MB** |
+| **Headroom for future** | | | **~191 MB** (280 - 89) |
+
+**Plenty of room for the 6 indicators operator names + 4-5 more after backtesting.**
+
+### What "common runtime dynamic scalable" means HERE (live-only)
+
+- **Common runtime:** same TOML config Mac dev = AWS prod
+- **Dynamic:** config hot-reload on `config/indicators.toml` change (no restart)
+- **Scalable:** add new indicator post-backtest → flip TOML flag → boot guard validates RAM fit → ready
+- **Incremental:** enable 1 indicator at a time; per-indicator audit + monitoring
+
+### What we DON'T do here (separate product's job)
+
+| Concern | Where it happens |
+|---|---|
+| Strategy backtesting | Separate product (operator's other system) |
+| Indicator parameter sweep | Separate product |
+| Walk-forward analysis | Separate product |
+| Monte Carlo simulation | Separate product |
+| Strategy library design + iteration | Separate product |
+| Functional/percentage check tuning | Separate product |
+
+**Tickvault's role:** RUN finalized indicators + strategies in live market with nanosecond hot path + zero tick loss + cross-verify audit.
+
+---
+
+## 📋 Final FINAL revised budget (LOCKED, corrected)
+
+| Slot | MB |
+|---|---|
+| Rescue ring | 1024 |
+| Tier 1 hot-path | 5 |
+| Tier 2 today | 215 |
+| Tier 2 yesterday LRU | 50 |
+| **Indicator state (configurable)** | **280** ⬆️ |
+| Strategy state (configurable) | 100 |
+| Greeks state | 50 |
+| Depth book state | 20 |
+| SPSC channels | 65 |
+| Token + cache | 10 |
+| WS buffers | 20 |
+| OMS queues | 10 |
+| Tracing queues | 5 |
+| Tokio runtime | 20 |
+| **Subtotal** | **1874** |
+| Heap frag | 130 |
+| **TOTAL** | **~2004 MB** (~2.0 GB cap, 20 MB margin) ✅ |
+
+**No backtesting concept.** Indicator allocation upgraded to 280 MB. Plenty of room for finalized indicators.
+
+---
+
+## 🚗 Auto-Driver Story (corrected)
+
+> Sir, I was wrong to mention "backtesting" earlier. Tickvault is a LIVE-ONLY juice shop. The lab where you experiment with juice recipes (backtesting) is a SEPARATE building.
+>
+> When you finalize 6 indicators + 5 strategies in your lab, you bring the FINAL recipes here. Tickvault just RUNS them, 50 nanoseconds per check.
+>
+> The 50 MB I had reserved for "lab experiments" → reallocated to "more recipes per TF". So now we can run 280 MB worth of finalized indicators instead of 230 MB. Bigger working set, no waste.
+>
+> Same 2 GB cap. Same nanosecond hot path. Same zero-tick-loss. Just no lab here — only the live shop.
