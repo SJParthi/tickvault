@@ -293,3 +293,44 @@ Operator screenshots revealed:
 > SEBI 24h JWT: >=1 disconnect/day by law — handled by L1+L2+L7 in <=30s.
 
 Discussion mode continues. 3 days. No code.
+
+## 2026-05-12 11:05 IST — Tick → Candle math + Token/Auth Z+ + Grafana observations
+
+Operator decision LOCKED:
+1. **6 timeframes** (was 9): `1m, 3m, 5m, 15m, 1h, 1d`. DROP: 1s, 30m, 2h, 3h, 4h. ADD: 3m.
+2. **Direct-from-ticks aggregation** — each TF runs independent in-memory aggregator; no cascade. Retires `candles_1s` base.
+3. **prev_day_close** clean:
+   - IDX_I: PrevClose packet (code 6) bytes 8-11
+   - NSE_EQ + NSE_FNO: `close` field in Quote (38-41) / Full (50-53)
+4. **prev_day_oi QUADRUPLE strategy:**
+   - P1 NSE bhavcopy CSV (gold — official EOD)
+   - P2 Dhan Option Chain REST overlay (silver — already wired, 873 today)
+   - P3 yesterday's last-tick OI from `previous_close` table (bronze)
+   - P4 first tick of day = prev_day_oi (fallback)
+
+**3 NEW files locked:**
+
+1. `topic-tick-to-candle-math-prevday-sourcing.md` — 6-TF direct-from-ticks math
+2. `topic-token-auth-7-layer-z-plus-defense.md` (Option C deferred) — 11 root causes × 7 layers = 77 cells; 4 independent renewal defenses
+3. `topic-grafana-dashboard-observations.md` — Market Data Explorer reference
+
+**3 NEW gaps surfaced from Grafana screenshots:**
+- Gap A: `build_time = 1970-01-01 05:30:00` (epoch bug, cosmetic)
+- Gap B: `index_constituents` table empty (boot WARN "no constituency cache")
+- Gap C: Index Summary + Index Constituents panels empty (depends on B)
+
+**Discussion items requiring operator decision (D1-D7 tick math + D1-D6 token + D1-D4 dashboard):**
+- 1h alignment 09:15-base vs clock-hour
+- Whether to keep 1s for HF strategy
+- Daily candle seal time (15:30 vs 15:35)
+- Late tick handling (drop vs merge)
+- Cross-TF reconcile cadence
+- prev_day_volume mirror strategy
+- TOTP clock-drift strictness
+- IP allowlist primary + secondary
+- All-WS subscribe-refresh on token rotate
+- Constituency source-of-truth (niftyindices vs nseindia vs Dhan)
+
+**Total Friday brainstorm output so far: 11 plan files. 3 days remaining for discussion.**
+
+NO IMPLEMENTATION. Discussion mode continues.
