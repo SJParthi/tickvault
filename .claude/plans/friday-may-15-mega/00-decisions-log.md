@@ -751,3 +751,67 @@ Friday LoC estimate: ~1,440 LoC.
 5 D-items pending operator decision.
 
 Discussion mode continues. NO IMPLEMENTATION.
+
+## 2026-05-12 15:35 IST — COMPREHENSIVE TIMING AUDIT (Option A swept)
+
+Operator: "Yes check Option A dude" — audit all plan files for timing bugs.
+
+Locked `topic-comprehensive-timing-audit-fix.md`:
+
+**23 timing violations found across 10+ plan files:**
+
+Category A — 23:00 IST violations (15 instances):
+- topic-questdb-7-layer-z-plus-defense.md line 75
+- topic-tick-to-candle-math-prevday-sourcing.md lines 173, 278, 390, 671
+- topic-zero-tick-loss-coverage-map.md line 242
+- topic-observability-7-layer-z-plus-defense.md lines 89-92 (4 reconciles)
+- topic-z-plus-retrofit-23-monday-tasks.md line 86
+- topic-memory-wal-ring-shadow-deep-drill.md (multiple L3 cells)
+
+Category B — 08:15 IST bhavcopy violations (6 instances):
+- topic-tick-to-candle-math-prevday-sourcing.md lines 263, 451, 539
+- topic-z-plus-retrofit-23-monday-tasks.md line 164
+- topic-post-market-historical-fetch-cross-verify.md lines 43, 57
+- topic-cross-verify-observability-and-claude-handoff.md (auto-driver story)
+
+Category C — Midnight rollover (3 instances):
+- 99-mega-plan-strawman.md (multiple)
+- topic-tick-to-candle-math-prevday-sourcing.md
+- topic-zero-tick-loss-coverage-map.md
+
+Category D — Nightly EBS snapshot: FALSE alarm (AWS Backup is server-side)
+
+**Fix matrix:**
+- 23:00 IST daily reconciles → 17:25 IST (pre-shutdown)
+- 08:15 IST bhavcopy → 08:35 IST (post-boot orchestrator)
+- 00:00 IST midnight rollover → 08:30:30 IST "new-day boot logic"
+
+**Revised daily schedule (operator-corrected):**
+
+08:30:00  AWS auto-start
+08:30:30  New-day boot logic (drop caches, reset counters)
+08:35:00  Bhavcopy download (prev_day_oi/high/low/close)
+08:35:30  Parity check #1 vs origin/main
+08:45:00  Pre-market token validity
+09:00:00  AWS budget scrape
+09:13:00  Phase 2 readiness
+09:15:00  Market open
+09:15:30  Streaming confirmation
+09:16:30  Market-open self-test
+... TRADING SESSION ...
+15:30:00  Market close
+15:31:00  Post-market historical fetch
+16:08:00  Cross-verify
+16:15:00  Telegram digest
+16:20:00  Indicator snapshots saved
+17:25:00  DAILY RECONCILES (was 23:00)
+17:28:00  Telegram daily digest
+17:30:00  AWS auto-stop (hard kill)
+
+6 NEW worst-case scenarios W185-W190 added.
+
+**Grand total worst-case paths across all plans: 401.**
+
+**Plan files needing edits in Friday work: 8 files, ~30 line changes total.**
+
+Discussion mode continues. NO IMPLEMENTATION.
