@@ -114,3 +114,28 @@ If a decision needs to change:
 ```
 
 Original entry is never edited. Audit trail stays intact.
+
+## 2026-05-12 04:42 IST — WS Flow Health 7-Layer Defense LOCKED
+
+Operator hit "Connected ≠ Streaming" LIVE — only manual `make stop && make run` fixed it.
+Root cause hypothesis #1: Dhan-side conn counter stale for 60–120s after TCP-RST.
+
+Locked design captured in `topic-ws-flow-health-7-layer-defense.md`:
+
+| Decision | Lock |
+|---|---|
+| Layers | L1 frame-rate + L2 sub-ACK + L3 daily reconcile + L4 token-age + L5 ping audit + L6 soft restart + L7 cooldown |
+| Cooldown | Hybrid: 5s first attempt, 30s retry |
+| Restart mode | Internal soft restart (Tokio survives, WS layer rebuilt) |
+| Reconcile time | 09:14:30 IST daily |
+| Scope | All 16 WS conns (5 main + 5 depth-20 + 5 depth-200 + 1 order-update) |
+| Total LoC | ~1,790 |
+| NEW ErrorCodes | WS-FLOW-01 (dead-air), WS-FLOW-02 (recovered), AUDIT-07 (recovery audit fail) |
+| NEW table | `ws_recovery_audit` (DEDUP UPSERT KEYS(ts, conn_id, event)) |
+| NEW metrics | 8 Prom metrics (frame-rate gauge + recovery counters + cooldown histogram) |
+| NEW alerts | 5 alert rules in `alerts.yml` |
+| NEW panels | 5 Grafana panels in `operator-health.json` |
+| Rollout | Wave A (L1+L7) → B (L2+L4) → C (L3+L5) → D (L6) — incremental |
+| Friday session | Own ~10–12hr session, NOT bundled with dynamic depth |
+
+Pending: operator `LGTM` to flip DRAFT → APPROVED.
