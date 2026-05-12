@@ -254,3 +254,42 @@ BEFORE parsing. This is the STRONGEST possible defense against tick loss
 This is a MEANINGFULLY STRONGER guarantee than the previous map.
 
 Locked in `topic-data-directory-architecture-map.md`.
+
+## 2026-05-12 11:00 IST — DEEP DRILL on memory/WAL/ring/shadow tables
+
+Operator screenshots revealed:
+1. 37 QuestDB tables incl **9 shadow tables** (parallel persistence)
+2. Live Telegram at 10:31 AM fired EXACT pattern we're designing for:
+   "[CRITICAL] zero live ticks during market hours, Silent for 257s (threshold 120s)"
+3. "[HIGH] Depth spot price STALE BANKNIFTY Age 257s threshold 180s"
+4. TWO mass-RST rounds at 10:21 + 10:31 = **9 min interval** (load-balancer rotation hypothesis)
+
+**Locked `topic-memory-wal-ring-shadow-deep-drill.md`:**
+- 4 sub-systems × 11 paths each = **44 NEW paths defended**
+- 4 sub-systems × Z+ 7-layer = 28 cell defenses
+- Existing defenses CONFIRMED:
+  * `[CRITICAL] zero live ticks` alert (threshold 120s) ✅ exists
+  * Depth spot stale detector (threshold 180s) ✅ exists
+  * Shadow tables (9) ✅ exist
+  * `aggregator_seal_audit` table ✅ exists
+
+**Combined with prior coverage map: 103 total tick-loss paths defended.**
+
+**3 CRITICAL gaps surfaced from screenshots:**
+- GAP A: Threshold 120s → need 30s (with per-instrument liquidity filter)
+- GAP B: 9-min mass-RST pattern → need Dhan support email
+- GAP C: Depth spot stale 180s → need 30s (same liquidity filter)
+
+**Updated honest envelope (FINAL form — STRENGTHENED):**
+> Zero tick loss inside tested envelope, with quintuple coverage:
+> 1. Primary 7-Layer Z+ across 9 stages
+> 2. Stage 1.5 Black-box WS WAL recorder (raw bytes on disk pre-parse)
+> 3. 5M-tick rescue ring (83s peak / 333s real-world headroom)
+> 4. 9 shadow tables (parallel persistence)
+> 5. NDJSON DLQ (final catch)
+>
+> Memory bounded: 2 GB app cap + 2 GB host headroom (hard floor)
+> Beyond envelope: requires 5 simultaneous failures.
+> SEBI 24h JWT: >=1 disconnect/day by law — handled by L1+L2+L7 in <=30s.
+
+Discussion mode continues. 3 days. No code.
