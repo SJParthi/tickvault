@@ -498,3 +498,41 @@ W145 (forgot static IP verify), W153 (5-way simultaneous failure).
 - expected_candle_count per holiday in trading_calendar
 
 Discussion mode continues. NO IMPLEMENTATION.
+
+## 2026-05-12 13:05 IST — CROSS-VERIFY OBSERVABILITY + CLAUDE HANDOFF design
+
+Operator demand 2026-05-12 13:00 IST: "how will you track + monitor + log +
+audit + capture + notify me so I can hand instantly to a new Claude session?"
+
+**Locked `topic-cross-verify-observability-and-claude-handoff.md`:**
+
+The 5 W's of observability designed:
+- TRACK: historical_fetch_state + cross_verify_state tables (live progress)
+- MONITOR: 8 Prom metrics + 4 alerts + 6 Grafana panels
+- LOG: tracing ERROR with code field → errors.jsonl
+- AUDIT: cross_verify_mismatches + summary + NEW claude_handoff_audit tables
+- CAPTURE: raw Dhan responses → data/captures/historical-fetch-<date>.jsonl.gz
+
+THE KILLER FEATURE — Claude Handoff Bundle:
+- File: data/claude-handoffs/cross-verify-<date>-FAILED.md
+- 10 sections: mismatches / raw responses / SQL / grep / ratchets /
+  commits / error code / env snapshot / investigation order / MCP refs
+- Telegram contains ONE path; operator opens new Claude session +
+  types "@<path> investigate" — total operator effort 30 seconds
+
+Workflow:
+T+0 incident → T+5s bundle written + Telegram sent →
+T+30s operator opens Claude → T+5min fix shipped + ratchet added
+
+15 worst-case scenarios for the handoff itself (W156-W170) all defended.
+
+NEW audit table: claude_handoff_audit (SEBI 5y, tracks every incident
++ resolution).
+
+Z+ 7-layer applied to the handoff system itself.
+
+Friday LoC estimate for handoff system: ~940 LoC.
+
+6 D-items pending operator decision (D1-D6 in plan).
+
+Discussion mode continues. NO IMPLEMENTATION.
