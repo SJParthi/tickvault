@@ -460,3 +460,174 @@ Treat as Critical and halt? OR Treat as Medium and continue?
 Discussion mode continues. NO IMPLEMENTATION.
 EOF
 echo "AWS budget + Mac parity plan locked"
+---
+
+## 🚨 APPENDIX A — CORRECTION 2026-05-12 15:20 IST: 23:00 IST parity check is WRONG
+
+**Operator caught a critical design flaw:** "what is this 11 PM parity check dude?"
+
+### The bug
+
+I designed:
+> "Daily run @ 23:00 IST → write all 10 check results"
+
+**But AWS instance is OFF at 17:30 IST (per `aws-budget.md` schedule).**
+
+At 23:00 IST:
+- AWS state: **STOPPED** (auto-shutdown 5.5h ago)
+- Mac state: maybe on (operator's choice)
+- Result: parity check on AWS = impossible (no running process to query)
+
+**The 23:00 IST timing was nonsense.** ❌
+
+### The CORRECT design
+
+**Parity is compared against GIT REMOTE (single source of truth), not machine-vs-machine directly.**
+
+```
+Mac dev → compare local files vs `origin/main` → drift check
+AWS prod → compare local files vs `origin/main` → drift check
+
+If BOTH match origin/main → they match each other (transitively).
+```
+
+This is cleaner because:
+- Runs on either machine independently
+- Doesn't need both up simultaneously
+- Git remote is already the source of truth
+- Timing is flexible
+
+### REVISED parity check timings
+
+| Machine | Time | Trigger | Why |
+|---|---|---|---|
+| **AWS prod** | **08:35 IST (just after boot)** | Boot orchestrator | Catch drift BEFORE market opens. If config drifted, fail-fast before live trading. |
+| **AWS prod** | **17:25 IST (just before shutdown)** | Pre-shutdown hook | Last chance to validate; capture state for next day comparison |
+| **Mac dev** | **On `make parity-check`** | Manual + pre-commit hook | Developer-driven; pre-commit catches before push |
+| **Mac dev** | **On every `git pull origin main`** | Post-pull hook | Ensures Mac is in sync after pull |
+
+**No 23:00 IST run.** AWS would be off. Useless.
+
+### What changes in the audit table
+
+```sql
+-- OLD (wrong): daily 23:00 IST entry
+INSERT INTO parity_check_audit ts='2026-05-12 23:00 IST' ...
+
+-- NEW (correct): 2 entries per AWS day + manual Mac runs
+INSERT INTO parity_check_audit ts='2026-05-12 08:35 IST' check='boot' ...
+INSERT INTO parity_check_audit ts='2026-05-12 17:25 IST' check='pre_shutdown' ...
+INSERT INTO parity_check_audit ts='<varies>' check='mac_manual' ...
+```
+
+### What's preserved from prior design
+
+| Element | Status |
+|---|---|
+| 10-check matrix | UNCHANGED |
+| `make parity-check` command | UNCHANGED |
+| `parity_check_audit` table schema | UNCHANGED |
+| Drift detection → Telegram | UNCHANGED |
+| Comparison method (SHA256 + git commit hash) | UNCHANGED |
+| Comparison BASIS | **CHANGED: was machine-vs-machine; now machine-vs-git-remote** |
+| Timing | **CHANGED: 23:00 IST → 08:35 + 17:25 IST + on-demand** |
+
+### Updated trigger logic
+
+```
+On AWS boot at 08:30 IST:
+  ... (normal boot sequence)
+  ... at step 08:35:
+  ↓
+  run `make parity-check` against origin/main
+  ↓
+  IF drift detected:
+    - log to parity_check_audit
+    - emit ParityDrift Telegram (HIGH severity)
+    - DO NOT block boot (operator may have intentional dev branch)
+  ELSE:
+    - log to parity_check_audit (clean)
+
+On AWS pre-shutdown at 17:25 IST:
+  ↓
+  run `make parity-check` against origin/main
+  ↓
+  capture end-of-day state for next day comparison
+
+On Mac dev `make parity-check`:
+  ↓
+  same logic; emit local Telegram (dev channel) if drift
+```
+
+### NEW Z+ layer addition
+
+| Layer | Was | Now |
+|---|---|---|
+| L3 RECONCILE | Daily 23:00 IST (WRONG) | Twice per AWS-up day (08:35 + 17:25) + on-demand Mac runs |
+
+### What about Mac vs AWS direct comparison?
+
+Still possible **but only when both are up**:
+- Operator runs `make parity-check --compare-aws` from Mac during market hours
+- Uses SSH to AWS to fetch its local state
+- Compares Mac state vs AWS state vs origin/main (3-way)
+- Heaviest check; runs on-demand only
+
+**This is the "deep" parity check.** Rare use, manual operator trigger.
+
+### Updated worst-case scenarios
+
+| # | Scenario | Old defense | New defense |
+|---|---|---|---|
+| W181 | AWS shuts down before parity check completes | Was scheduled at 23:00 — IMPOSSIBLE | Now at 17:25 — 5 min buffer before 17:30 hard-stop |
+| W182 | Mac developer pushes without parity check | Pre-commit hook didn't exist in old design | NEW: pre-commit hook + `make parity-check` |
+| W183 | Drift between AWS 17:25 check and next day 08:35 check | Old: 18 hour gap not monitored | NEW: 08:35 catches any overnight drift (someone edited config) |
+| W184 | Operator pulls main but doesn't run parity-check | Manual gap | NEW: post-pull git hook auto-runs |
+
+---
+
+## 📊 Final updated trigger schedule (operator-corrected)
+
+```
+06:00 AM  (operator wakes)
+   ↓
+08:30 IST  AWS auto-start
+   ↓
+08:35 IST  AWS parity-check #1 (post-boot, pre-market)
+   ↓
+09:15 IST  Market opens
+   ↓
+... (trading day) ...
+   ↓
+15:30 IST  Market closes
+   ↓
+15:31 IST  Post-market historical fetch starts
+   ↓
+16:08 IST  Cross-verify completes; Telegram digest
+   ↓
+17:25 IST  AWS parity-check #2 (pre-shutdown, end-of-day capture)
+   ↓
+17:30 IST  AWS auto-stop
+   ↓
+... (AWS idle until next morning) ...
+   ↓
+08:30 IST next day  AWS auto-start
+   ↓
+08:35 IST  AWS parity-check #1 (catch overnight drift if any)
+```
+
+**Mac dev:** runs `make parity-check` whenever operator wants. Pre-commit + post-pull hooks enforce.
+
+---
+
+## 🎤 Operator's question answered
+
+**Q: "What is this 11 PM parity check dude?"**
+
+**A: It was wrong.** AWS is OFF at 11 PM IST. The check was unrunnable.
+
+**Fixed:** parity check runs at **08:35 IST (post-boot)** and **17:25 IST (pre-shutdown)** on AWS. Mac dev runs on-demand + pre-commit + post-pull.
+
+Comparison is against `origin/main` git remote (single source of truth), not direct machine-vs-machine. Both machines staying in sync with `origin/main` ⇒ in sync with each other.
+
+Good catch dude. ✅
