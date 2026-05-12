@@ -536,3 +536,56 @@ Friday LoC estimate for handoff system: ~940 LoC.
 6 D-items pending operator decision (D1-D6 in plan).
 
 Discussion mode continues. NO IMPLEMENTATION.
+
+## 2026-05-12 13:30 IST — PER-CANDLE FIELDS + RAM DESIGN LOCKED (Claude-recommended)
+
+Operator asked Claude to pick best approach: "when nanoseconds matter, RAM is the only choice".
+
+Locked `topic-per-candle-fields-ram-design-LOCKED.md`:
+
+**Q1 — Session start:** 09:15:00 IST sharp (NSE official)
+**Q2 — Pre-open ticks:** EXCLUDED from session_open price; INCLUDED in volume_cumulative
+**Q3 — IDX_I volume:** store 0; segment-check in code; frontend hides
+**Q4 — Pct formula:** standard `(curr - prev) / prev × 100`; 0% on div-by-zero
+**Q5 — Flush interval:** IMMEDIATE on bucket seal (async ILP)
+
+**Memory design — HYBRID (best of both):**
+
+| Tier | Purpose | Size | Pct computation |
+|---|---|---|---|
+| Tier 1 — Hot-path "current state" | Strategy reads | ~5 MB | PRE-COMPUTED (50ns reads) |
+| Tier 2 — Sealed bar cache | Audit/replay | ~430 MB | Lazy on read (~10ns) |
+| Indicator state (existing) | RSI/MACD/BB | 50 MB | — |
+| Reference caches | prev_day_*, session_open | 5 MB | Static |
+| **TOTAL** | | **~490 MB** | INSIDE 2 GB cap |
+
+**Tier 1 — CurrentBarState struct (80 bytes, cache-aligned):**
+- live OHLCV+OI (updated every tick)
+- prev_day_close, prev_day_oi (from bhavcopy at 08:30)
+- session_open_today_price/oi/volume_cum (captured at first tick after 09:15)
+- 4 pre-computed pcts (close from prev_day, close from session_open,
+  oi from prev_day, oi from session_open) — recomputed on every tick
+- last_sealed_ts/close/oi/volume_bar (for indicator lookback)
+
+**Tier 2 — SealedBarCompact (32 bytes):**
+- ts, OHLC, volume_bar, oi_close
+- 6.7M bars/day × 32B × 2 days = 428 MB
+
+**Hot path budget:** ≤500ns per tick across all 6 TFs.
+- HashMap lookup: ~20ns
+- Struct update: ~20ns
+- Pct recompute (4 divisions): ~20ns
+- Bucket seal check: ~10ns
+- × 6 TFs = ~420ns. Inside budget.
+
+**Z+ 7-Layer applied to bar cache:**
+L1 cache size gauge, L2 Tier1 vs Tier2 consistency check on seal,
+L3 daily reconcile cache vs candles_1m_shadow, L4 boot-time
+allocation with_capacity, L5 bar_cache_audit table, L6 rehydrate
+from QuestDB on corruption, L7 5s exponential backoff.
+
+5 NEW Prometheus metrics.
+
+Hot path STAYS in nanosecond-land. DB is async cold path only.
+
+Discussion mode continues. NO IMPLEMENTATION.
