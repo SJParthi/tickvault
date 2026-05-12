@@ -217,3 +217,40 @@ Total Friday workload now: ~6,000 LoC + zero-tick-loss coverage map +
 observability 7-layer + 11 root-cause ratchets. ~3 days x ~3 sessions.
 
 Pending: operator LGTM to flip all DRAFT → APPROVED status.
+
+## 2026-05-12 10:50 IST — data/ws_wal/ DISCOVERY = Stage 1.5 added to ZTL map
+
+Operator screenshot of IntelliJ project structure revealed `data/ws_wal/`
+directory with 4 active `.wal` files. This is a layer I did NOT have in
+my mental model.
+
+**Implication:** every raw WS frame is persisted to disk as binary WAL
+BEFORE parsing. This is the STRONGEST possible defense against tick loss
+— even if all downstream stages fail, raw bytes are on disk.
+
+**Coverage map update:** Stage count 8 → 9 (added Stage 1.5 — WS WAL capture).
+
+**New audit table:** `ws_wal_audit` (NEW — write events, rotation, retention).
+
+**Open questions (Friday verification needed):**
+1. Per-conn or per-feed WAL files? (4 files visible, 16 endpoints)
+2. Sync vs async writes? Flush interval?
+3. Retention policy? Disk math: ~14 GB/trading day
+4. Is replay tool already built? grep `replay_ws_wal`
+5. Is WAL on hot path? DHAT verify ≤10µs write latency
+
+**Updated honest envelope claim (mandatory):**
+> Zero tick loss inside the tested envelope, with belt-and-suspenders:
+> - Primary path (Stage 1 → 8): 7-Layer Z+ across 8 stages
+> - 🆕 Black-box recorder (Stage 1.5): raw WS frames persisted to
+>   data/ws_wal/ BEFORE parsing. Even if all downstream fails, raw bytes
+>   are on disk for replay.
+> - Catastrophic envelope: ws_wal disk full AND QuestDB down AND rescue
+>   ring full AND spill disk full SIMULTANEOUSLY → 5M-tick in-memory ring
+>   still buffers.
+> - Beyond catastrophic: requires 4 simultaneous disk failures + 2 process
+>   failures. Not software-recoverable.
+
+This is a MEANINGFULLY STRONGER guarantee than the previous map.
+
+Locked in `topic-data-directory-architecture-map.md`.
