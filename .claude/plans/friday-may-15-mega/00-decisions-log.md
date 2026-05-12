@@ -589,3 +589,66 @@ from QuestDB on corruption, L7 5s exponential backoff.
 Hot path STAYS in nanosecond-land. DB is async cold path only.
 
 Discussion mode continues. NO IMPLEMENTATION.
+
+## 2026-05-12 13:50 IST — RAM REDESIGN: FULL 2 GB USED MASSIVELY
+
+Operator clarification 2026-05-12 13:45 IST: "use 2GB massively for
+future indicators + strategies, common runtime dynamic scalable."
+
+Prior 490 MB design was too conservative. Wasted 1.5 GB headroom.
+
+**REVISED 2 GB budget (operator-aligned):**
+
+| Slot | MB | Notes |
+|---|---|---|
+| Rescue ring (5M × 200B) | 1024 | Zero-tick-loss — DO NOT TRIM |
+| Tier 1 hot-path CurrentBarState | 5 | 50ns reads |
+| Tier 2 today (compact 32B) | 215 | Today's audit + lookback |
+| Tier 2 yesterday LRU | 50 | Lazy from disk on demand |
+| **Indicator state (CONFIGURABLE)** | **230** | 6+ indicators × multi-period × 6 TFs |
+| **Strategy state (CONFIGURABLE)** | **100** | Per-strategy × inst × TF |
+| **Backtest warmup ring** | **50** | Cold-start bars cache |
+| Greeks state | 50 | Existing |
+| Depth book state | 20 | Bid/ask reconstruction |
+| SPSC channels | 65 | Bounded mpsc |
+| Token + cache | 10 | |
+| WS buffers | 20 | |
+| OMS queues | 10 | |
+| Tracing queues | 5 | |
+| Tokio runtime | 20 | |
+| **SUBTOTAL** | **1874** | |
+| Heap frag (~7%) | 130 | jemalloc |
+| **TOTAL** | **~2004 MB** | INSIDE 2 GB cap ✅ |
+| Margin | ~20 MB | Tight but workable |
+
+**Key change vs prior 490 MB design:**
+- Lazy-load yesterday's Tier 2 (saves 215 MB)
+- Indicator state expanded 50 MB → 230 MB (4.6x growth)
+- NEW strategy state slot: 100 MB
+- NEW backtest warmup slot: 50 MB
+
+**Common runtime dynamic scalable enforcement:**
+- Indicators/strategies registered in config TOML
+- Boot-time RAM budget guard validates sum vs INDICATOR_RAM_BUDGET_MB=230
+  and STRATEGY_RAM_BUDGET_MB=100
+- Boot FAILS on overflow with explicit "drop X or Y"
+- Hot-reload on config change (existing notify watcher)
+- Same TOML Mac dev = AWS prod
+
+**Z+ 7-Layer for indicator/strategy RAM:**
+- L1 tv_indicator_ram_bytes gauge per indicator
+- L2 boot-time budget validate halt
+- L3 daily reconcile enabled-config vs running-tasks
+- L4 compile-time static_assert per indicator bytes
+- L5 NEW indicator_lifecycle_audit table
+- L6 fall back to prior config on reload failure
+- L7 60s cooldown between config reloads
+
+**What this unlocks for the future:**
+1. Backtest 10+ indicators (single config flag)
+2. Strategy library scales (per-strategy budget)
+3. Per-TF independent state (each TF gets its own indicator instance)
+4. Hot-reload without restart
+5. Explicit budget enforcement (boot guard)
+
+Discussion mode continues. NO IMPLEMENTATION.

@@ -307,3 +307,264 @@ Continue (total hot path: ~60-80ns per tick per TF, x6 TFs = 360-480ns)
 > Nanosecond hot path. Dhan-precise math. RAM-only trading. Disk-only audit. **Locked.** 🫡
 EOF
 echo "RAM design locked"
+---
+
+## 📌 APPENDIX A — OPERATOR INTENT: USE FULL 2 GB MASSIVELY (2026-05-12 13:45 IST)
+
+**Operator clarification (verbatim paraphrased):**
+> "My plan is to use 2GB for app so we can use it massively. Future indicators + strategies (after backtesting + finalizing) would be needed — that too based on timeframes. Common runtime dynamic scalable approach."
+
+**Translation:** the 490 MB design I locked is TOO CONSERVATIVE. Operator wants headroom for ~6 indicators × 11K instruments × 6 TFs + ~5 strategies. Plan must accommodate growth WITHOUT redesign.
+
+### Why the prior 490 MB was wrong
+
+Old assumption: indicators get 50 MB total (existing).
+Reality (post-backtesting): operator may run 6+ indicators across all 6 TFs:
+- RSI (16 bytes state × 11K × 6 = 1 MB)
+- MACD (80 bytes × 11K × 6 = 5.3 MB)
+- Bollinger Bands (24 bytes × 11K × 6 = 1.6 MB)
+- EMA (20-period: 80 bytes × 11K × 6 = 5.3 MB; multi-period adds more)
+- SMA (multi-period: 80 bytes × 11K × 6 = 5.3 MB)
+- ATR (16 bytes × 11K × 6 = 1 MB)
+- Stochastic (24 bytes × 11K × 6 = 1.6 MB)
+- BB Width / MACD Histogram derivatives (24 bytes × 11K × 6 = 1.6 MB)
+
+**Subtotal for "modest" indicator set: ~22 MB.**
+
+But operator may want:
+- Multi-period variants (SMA-5, SMA-10, SMA-20, SMA-50, SMA-100, SMA-200) = 6x
+- Heikin-Ashi state
+- Volume Profile (last N bars per instrument)
+- Order Flow indicators (bid/ask delta)
+- Custom indicators yet to be designed
+
+**Realistic future indicator state: 200-300 MB.**
+
+Plus strategy state (~100 MB) + backtest replay warmup (~50 MB).
+
+---
+
+## 🏗️ REVISED FULL 2 GB BUDGET (operator-aligned)
+
+### The decision: lazy-load yesterday's Tier 2 (frees ~215 MB)
+
+Today's sealed bars stay in RAM. Yesterday's sealed bars LAZY-LOAD from QuestDB into LRU cache only when:
+- Cross-verify accesses yesterday for comparison (post-market)
+- Operator queries via dashboard
+- Strategy uses N-day lookback indicator
+
+LRU eviction keeps yesterday cache bounded at ~50 MB.
+
+### Revised budget table
+
+| Component | Allocation | Type | Notes |
+|---|---|---|---|
+| **Rescue ring** (`TICK_BUFFER_CAPACITY = 5M` × 200B) | **1.0 GB** | Zero-tick-loss guarantee — DO NOT TRIM | |
+| **Tier 1 hot-path** `CurrentBarState` (80B × 11K × 6 TFs) | **5 MB** | Strategy reads in 50ns | |
+| **Tier 2 today only** (compact 32B × 6.7M bars) | **215 MB** | This day's audit + lookback | |
+| **Tier 2 yesterday LRU cache** | **50 MB** | Lazy load on demand from QuestDB | |
+| **Indicator state — EXPANDED future-proof** | **250 MB** | 6 indicators × multi-period × 6 TFs × 11K | |
+| **Strategy state** | **100 MB** | Per-strategy × per-instrument × per-TF state machines | |
+| **Backtest warmup ring** | **50 MB** | Last 200 bars per (instrument, TF, indicator) for cold-start | |
+| **Greeks state** | **50 MB** | Existing — option_greeks_live | |
+| **Depth book state** | **20 MB** | Bid/ask 20-level + 200-level reconstruction | |
+| **SPSC channels** (5 writers × 65K × 200B) | **65 MB** | Existing — bounded mpsc | |
+| **Token + instrument cache** | **10 MB** | Auth + registry | |
+| **WS buffers** (5 conns × 4MB recv) | **20 MB** | Existing | |
+| **OMS + audit queues** | **10 MB** | Order pipeline | |
+| **Tracing + log writer queues** | **5 MB** | bounded |
+| **Tokio runtime + thread stacks** | **20 MB** | 4 threads × 2 MB + internal | |
+| **SUBTOTAL working set** | **~1.870 GB** | |
+| **Heap fragmentation** (~10%) | **130 MB** | jemalloc tuning | |
+| **APP TOTAL** | **~2.0 GB** | **INSIDE 2 GB cap** ✅ |
+
+**Margin inside 2 GB cap: ~0 MB.** Tight but workable.
+
+**Add 1 % safety:** trim indicator state from 250 MB → 230 MB. Gets us 20 MB margin.
+
+Final budget: ~1.98 GB. **20 MB headroom inside 2 GB hard cap.**
+
+---
+
+## 🔧 COMMON RUNTIME DYNAMIC SCALABLE — config-driven indicator allocation
+
+**Key insight:** indicators/strategies are CONFIGURABLE. Not hardcoded. The RAM allocation must adapt to operator's enabled set.
+
+### Design: indicator + strategy registry with budget guard
+
+```toml
+# config/indicators.toml
+[indicators.rsi]
+enabled = true
+periods = [14, 21]                    # 2 periods × 11K × 6 TFs × 16B = 2 MB
+timeframes = ["1m", "3m", "5m", "15m", "1h", "1d"]
+instruments = "all_subscribed"
+
+[indicators.macd]
+enabled = true
+periods = ["12,26,9"]                 # 1 variant × 11K × 6 TFs × 80B = 5.3 MB
+timeframes = ["5m", "15m", "1h", "1d"]
+instruments = "all_subscribed"
+
+[indicators.bollinger]
+enabled = true
+periods = [20]
+std_dev = 2.0
+timeframes = ["15m", "1h"]
+instruments = "fno_only"
+
+[indicators.ema]
+enabled = true
+periods = [9, 21, 50, 200]
+timeframes = ["1m", "5m", "15m", "1h", "1d"]
+instruments = "all_subscribed"
+
+[indicators.atr]
+enabled = false                        # disable until backtesting validates
+```
+
+### Boot-time RAM budget guard
+
+```rust
+// crates/trading/src/indicator/registry.rs (NEW)
+fn validate_indicator_ram_budget(config: &IndicatorsConfig) -> Result<()> {
+    let mut total_bytes = 0_usize;
+
+    for (name, ind) in &config.indicators {
+        if !ind.enabled { continue; }
+        let cost = ind.bytes_per_instance()
+                 * ind.timeframes.len()
+                 * ind.periods.len()
+                 * count_instruments(&ind.instruments);
+        total_bytes += cost;
+        info!("indicator {} → {} bytes", name, cost);
+    }
+
+    if total_bytes > INDICATOR_RAM_BUDGET_MB * 1_000_000 {
+        anyhow::bail!(
+            "indicator RAM budget exceeded: {} bytes > {} MB cap",
+            total_bytes,
+            INDICATOR_RAM_BUDGET_MB
+        );
+    }
+    Ok(())
+}
+```
+
+**INDICATOR_RAM_BUDGET_MB = 230** (per revised budget).
+
+**If operator enables too many indicators → boot fails with explicit error.** Operator picks priorities.
+
+### Same pattern for strategies
+
+```toml
+# config/strategies.toml
+[strategies.bullish_breakout]
+enabled = true
+timeframes = ["5m", "15m"]
+instruments = "nse_fno"
+state_bytes_per_instance = 256       # explicit budget per strategy
+[strategies.iron_condor]
+enabled = false
+```
+
+**STRATEGY_RAM_BUDGET_MB = 100.**
+
+---
+
+## 📊 Common Runtime / Dynamic / Scalable / Incremental check
+
+Per operator-charter-forever §A 4-word test:
+
+| Word | This design satisfies |
+|---|---|
+| **Common** | Same TOML config Mac dev = AWS prod |
+| **Runtime** | Config hot-reload via notify crate (existing) → reallocate state on indicator enable/disable |
+| **Dynamic** | Indicator set adapts to backtesting results without code change |
+| **Scalable** | Boot-time budget guard prevents over-allocation; explicit cap |
+| **Incremental** | Enable 1 indicator at a time; backtest; commit; deploy |
+
+---
+
+## 🛡️ Z+ 7-Layer for indicator/strategy RAM allocation
+
+| Layer | Mechanism |
+|---|---|
+| L1 DETECT | `tv_indicator_ram_bytes` gauge per indicator name + total |
+| L2 VERIFY | Boot-time validate sum vs `INDICATOR_RAM_BUDGET_MB`; halt on overflow |
+| L3 RECONCILE | Daily: compare config'd indicators vs actually-running tasks |
+| L4 PREVENT | Compile-time `static_assert` per indicator bytes constant |
+| L5 AUDIT | `indicator_lifecycle_audit` table (NEW) — every enable/disable logged |
+| L6 RECOVER | On config-reload failure, fall back to prior config; alert |
+| L7 COOLDOWN | Between config reloads: 60s |
+
+---
+
+## 🚗 Auto-Driver Story (revised)
+
+> Sir, the 2 GB is YOUR budget — use it ALL. Like a chef's pantry:
+>
+> - **Today's freshest groceries (RAM):** rescue ring (1 GB safety net) + today's candles (215 MB) + indicator running state (230 MB) + strategy state (100 MB) + future-proofing slots = 2 GB used wisely.
+> - **Yesterday's groceries:** in the freezer (disk). Pulled up on-demand if a strategy needs them.
+> - **Future recipes (post-backtesting):** when you finalize 6 indicators + 5 strategies, the config TOML enables them. Boot guard checks "do they fit in the pantry?" — yes/no answer.
+>
+> If pantry overflows → boot fails with explicit "drop indicator X or Y". You pick. Operator-driven priorities.
+>
+> Common runtime dynamic scalable: same TOML on Mac dev = AWS prod. Hot-reload on config change. Bench-gate keeps O(1) latency.
+
+---
+
+## 📋 Final REVISED budget (LOCKED)
+
+| Slot | MB | Purpose |
+|---|---|---|
+| Rescue ring | 1024 | Zero-tick-loss guarantee |
+| Tier 1 hot-path | 5 | Strategy 50ns reads |
+| Tier 2 today | 215 | Today's audit + lookback |
+| Tier 2 yesterday LRU | 50 | Lazy from disk |
+| **Indicator state (configurable)** | **230** | RSI/MACD/BB/EMA/SMA/ATR/Stoch + future |
+| **Strategy state (configurable)** | **100** | Per-strategy state machines |
+| **Backtest warmup ring** | **50** | Cold-start bars cache |
+| Greeks state | 50 | Existing |
+| Depth book state | 20 | Bid/ask reconstruction |
+| SPSC channels | 65 | Bounded mpsc |
+| Token + instrument cache | 10 | |
+| WS buffers | 20 | |
+| OMS queues | 10 | |
+| Tracing queues | 5 | |
+| Tokio runtime | 20 | |
+| **Subtotal** | **1874 MB** | |
+| Heap fragmentation | 130 | jemalloc |
+| **TOTAL** | **~2004 MB** | INSIDE 2.0 GB cap ✅ |
+| **Margin** | **~20 MB** | Tight but workable |
+
+**Configurable slots highlighted** — these grow as operator enables more after backtesting.
+
+---
+
+## 🎯 What this unlocks
+
+1. **Backtest 10+ indicators in dev** (single config flag)
+2. **Strategy library scales** (per-strategy budget)
+3. **Per-TF independent state** (each TF gets its own indicator instance)
+4. **Hot-reload without restart** (config notify watcher)
+5. **Explicit budget enforcement** (boot guard, no surprises)
+6. **Common runtime dynamic scalable** ✅
+
+---
+
+## 🎤 Final answer to operator
+
+**Q: "Use 2 GB massively for future indicators + strategies — common runtime dynamic scalable?"**
+
+**A: LOCKED. Revised budget uses full 2 GB:**
+- Conservative (current): 490 MB → wasted 1.5 GB headroom
+- **Operator-aligned (revised): 2.0 GB → 230 MB indicators + 100 MB strategies + 50 MB warmup + lazy yesterday + everything else**
+- Config-driven enable/disable per indicator + per strategy
+- Boot guard prevents over-allocation
+- Hot-reload on TOML change
+- Same Mac dev = AWS prod
+
+Tight 20 MB margin inside 2 GB. Bench-gate ratchets it. Operator picks indicator priorities via config.
+
+Discussion mode continues. NO IMPLEMENTATION.
