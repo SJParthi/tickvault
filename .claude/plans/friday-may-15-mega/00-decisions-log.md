@@ -419,3 +419,82 @@ Strategy:
 Updated API budget: 16% of daily quota (was 22% with 1d). Comfortable margin.
 
 Discussion mode continues. NO IMPLEMENTATION.
+
+## 2026-05-12 12:45 IST — EXTREME WORST-CASE SWEEP + Z+ UNIVERSAL ENFORCEMENT
+
+Operator demand 2026-05-12 12:35 IST: "dig more worst cases dude"
+Operator demand 2026-05-12 12:40 IST: "Z+ defensive layer always, every time, everywhere, every place, always dude"
+
+**Locked `topic-extreme-worst-case-sweep.md`:**
+
+110 NEW worst-case scenarios across 10 categories (W46-W155):
+- A: AWS Infrastructure (W46-W60) — 15 scenarios
+- B: Multi-System Cascade Failures (W61-W75) — 15 scenarios
+- C: Indian Market Regulatory Events (W76-W90) — 15 scenarios
+- D: Boot Sequence Partial Failures (W91-W100) — 10 scenarios
+- E: Concurrency Races (W101-W110) — 10 scenarios
+- F: Time/Clock Extremes (W111-W118) — 8 scenarios
+- G: Storage/Disk Edge Cases (W119-W125) — 7 scenarios
+- H: Security Attack Scenarios (W126-W135) — 10 scenarios
+- I: Operator Error Scenarios (W136-W145) — 10 scenarios
+- J: Truly Apocalyptic (W146-W155) — 10 scenarios
+
+**GRAND TOTAL across all plan files: 366 defense paths.**
+
+**APPENDIX A — Z+ UNIVERSAL ENFORCEMENT (locked FOREVER):**
+
+Every one of the 366 scenarios subject to Z+ 7-layer pattern:
+L1 DETECT, L2 VERIFY, L3 RECONCILE, L4 PREVENT, L5 AUDIT, L6 RECOVER, L7 COOLDOWN.
+
+Plus 15-row × 7-layer = 105-cell matrix per item (operator-charter-forever §C):
+code coverage / audit / testing / checks / performance / monitoring /
+logging / alerting / security / hardening / bugs / scenarios /
+functionalities / code review / extreme check.
+
+Plus auto-driver test (universal): plain English, no library names,
+no file paths, juice-shop/phone-line/bodyguard analogies, ASCII visuals.
+
+Plus 4-word test: common / runtime / dynamic / scalable / incremental.
+
+13 mechanical gates active and enforced:
+- per-item-guarantee-check.sh
+- banned-pattern-scanner.sh
+- pub-fn-test-guard.sh
+- pub-fn-wiring-guard.sh
+- plan-verify.sh
+- error_code_tag_guard.rs
+- error_code_rule_file_crossref.rs
+- dedup_segment_meta_guard.rs
+- operator_health_dashboard_guard.rs
+- resilience_sla_alert_guard.rs
+- error_level_meta_guard.rs
+- bench-gate.sh
+- coverage-gate.sh
+
+If you don't pass these gates, your PR doesn't merge. Period.
+
+Honest envelope wording (universal mandatory):
+> "100% inside the tested envelope, with ratcheted regression coverage:
+>  366 worst-case scenarios mapped to L1-L7 defense layers,
+>  5-tier persistence (rescue ring + spill + DLQ + shadow tables + ws_wal),
+>  Bounded recovery times per scenario,
+>  Beyond envelope: NDJSON DLQ + ws_wal/ raw frames + S3 5y retention,
+>  Mathematically impossible literal: SEBI 24h JWT mandates >=1 disconnect/day."
+
+Anything stronger without envelope qualifier = REJECT IN REVIEW.
+
+**10 most underestimated scenarios** identified for special attention:
+W47 (AWS EIP misclick), W57 (cost drift), W76 (NSE circuit breaker),
+W81 (F&O ban list), W88 (bhavcopy retirement), W89 (margin change),
+W136 (wrong config to AWS), W143 (operator restart mid-fetch),
+W145 (forgot static IP verify), W153 (5-way simultaneous failure).
+
+**Defense gaps surfaced for Friday:**
+- AWS CloudTrail integration
+- SMS backup contact (W154)
+- live_instance_lock table verification (Wave-4 RESILIENCE-01)
+- Daily AWS cost scrape
+- F&O ban list daily ingest
+- expected_candle_count per holiday in trading_calendar
+
+Discussion mode continues. NO IMPLEMENTATION.
