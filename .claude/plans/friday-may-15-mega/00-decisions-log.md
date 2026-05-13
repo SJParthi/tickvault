@@ -1082,3 +1082,28 @@ Operator decision after live disconnect storm 09:16-09:29 IST:
 - 223 SIDs subscribed: 4 indices (Ticker) + 218 stocks (Quote)
 - 6 candle base tables + 1 ticks table + 15 audit tables
 - ZERO matviews, ZERO `candles_1s`
+
+## 2026-05-13 late-evening — Z+ adversarial review (item 31 added)
+
+### 3-agent review fired in parallel on the 6-TF lock
+- **hot-path-reviewer** (agent adb1e877856a68405) — 1 CRITICAL + 2 HIGH + 3 MEDIUM + 2 LOW
+- **security-reviewer** (agent ae9a5c62b7ce91ff2) — 0 CRITICAL + 2 HIGH + 2 MEDIUM + 1 LOW
+- **general-purpose hostile** (agent aafc0d9fc4b1620c9) — 4 CRITICAL + 5 HIGH + 5 MEDIUM + 4 LOW
+
+### 27 findings synthesized, all carry named ratchet tests
+- 5 CRITICAL — close-of-session forced seal (C1), bucket boundary rule (C2), first-tick poisoning (C3), oi_pct NULL guard (C4), ILP fan-out burst (C5)
+- 9 HIGH — VIX code-6 unverified (H1), boot-partial phase (H2), EOD write window (H3), ALTER ordering (H4), cross-verify prev_close revalidate (H5), papaya cache primitive (H6), 1d RAM-only lookup (H7), I-P1-11 cache migration (H8), prev_close bounds guard (H9)
+- 9 MEDIUM — 3m bucket edge (M1), sequence number verify (M2), per-SID watchdog (M3), 1d RAM (M4), VIX semantics guard (M5), spawn race (M6), DDL warn→error (M7), tick_count LONG (M8), fixed-array bucket (M9)
+- 4 LOW — alignment constants (L1), SYMBOL CAPACITY (L2), matview drop idempotency (L3), tick_count i32 wrap (L4)
+
+### Honest 100% claim locked
+- Wording mandated in PR bodies, Telegram, docs: "100% inside the tested envelope" with explicit envelope bounds (60s QDB outage, 5M-tick ring, 65h weekend chaos, 27 findings closed)
+
+### Z+ Defense matrix doc shipped
+- `topic-Z-PLUS-DEFENSE-6TF-LOCK.md` — 15-row + 7-row matrices, verdict table, data-flow ASCII, auto-driver explanation
+
+### Phase 0 TRUE-TRUE-FINAL tally
+- 30 active items (item 22 GIFT NIFTY PARKED), ~6,520 LoC, 9 docs
+- 223 SIDs (4 IDX_I + 218 NSE_EQ)
+- 6 candle base tables, ZERO matviews, ZERO `candles_1s`
+- 17 ratchets in item 30 + 27 new ratchets in item 31 = 44 build-failing guards on the candle subsystem alone

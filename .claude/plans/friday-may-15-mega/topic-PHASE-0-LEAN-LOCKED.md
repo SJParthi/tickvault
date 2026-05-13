@@ -1006,7 +1006,72 @@ close_pct_from_prev_day = (bar.close - prev_close_cache[(sid, segment)]) / prev_
 
 **LoC: ~480 (6 ALTER × 3 cols + bar-seal computation × 6 timeframes + cross-verify recompute hook + daily-candle lookup + Telegram + 17 ratchets + matview cleanup at boot).**
 
-**Total Friday + Saturday + Sunday build: ~5,900 LoC across 29 active items + 8 docs.**
+---
+
+### 31. Z+ adversarial review — 5 CRITICAL + 9 HIGH fixes (operator-locked 2026-05-13 late-evening)
+
+**Authority:** `topic-Z-PLUS-DEFENSE-6TF-LOCK.md` (27 findings from 3 adversarial agents).
+
+**5 CRITICAL fixes (must merge before Friday):**
+
+| # | Fix | New constant / API | Ratchet |
+|---|---|---|---|
+| C1 | Force-seal every TF at 15:30:00 IST exchange-ts (1h's 15:15-16:15 bucket would otherwise wait until 16:15) | `MARKET_CLOSE_FORCED_SEAL_IST = "15:30:00"` | `test_candles_1h_final_bar_seals_at_15_30_not_16_15` |
+| C2 | Pin bucket boundary rule `[start, end)` (half-open right) so tick at 09:16:00.000 lands in 09:16 bucket | `BUCKET_BOUNDARY_RULE = "[start, end)"` | `test_tick_at_exact_boundary_falls_into_next_bucket` |
+| C3 | NSE_EQ first-Quote-tick prev_close: reject if `< 1e-9` OR `> 10× boot-loaded QuestDB value`; wait for next tick instead of locking cache | `NSE_EQ_FIRST_TICK_PREV_CLOSE_DRIFT_LIMIT = 10.0` | `test_nse_eq_first_tick_rejects_zero_or_implausible_value` |
+| C4 | `oi_pct_from_prev_day` is NULL in Phase 0 — block any strategy/dashboard query that references it without `COALESCE` | dashboard JSON scan + banned-pattern category | `test_no_strategy_or_dashboard_query_references_oi_pct_without_coalesce` |
+| C5 | ILP fan-out at 09:30:00 IST (1m+3m+5m+15m co-fire = 892 rows in <1ms): dedicated tokio task + bounded `mpsc::channel(2048)` + reused `questdb_rs::Buffer` + rescue-ring overflow | `SEAL_BURST_CHANNEL_CAPACITY = 2048` | `test_minute_boundary_burst_does_not_block_ws_read_loop` + Criterion `bench_seal_burst_892_rows_p99_under_5ms` |
+
+**9 HIGH fixes:**
+
+| # | Fix | Ratchet |
+|---|---|---|
+| H1 | INDIA VIX code-6 emission UNVERIFIED — pre-Friday smoke test subscribes VIX alone, verifies code-6 receipt within 60s; fallback to QuestDB `previous_close` row if absent | `test_vix_code6_smoke_or_fallback_path` |
+| H2 | Boot mid-day (e.g. 11:30 IST) → bar `open` is wrong (first tick after boot, not true 11:15 open). Stamp `phase = "boot_partial"`; backtest filters on it | `test_partial_boot_bars_marked_boot_partial` |
+| H3 | `previous_close` EOD write window pinned `[15:30:30, 15:31:30]` IST with DEDUP UPSERT + edge-trigger single-fire guard | `test_previous_close_eod_writes_exactly_once_per_day` |
+| H4 | ALTER block (24 ALTER ADD COLUMN) MUST complete BEFORE first ILP-writer spawn — boot ordering constraint | `test_alter_block_completes_before_aggregator_spawn` |
+| H5 | Cross-verify revalidates prev_close (not just bar.close) against Dhan historical's previous-day `_1d.close`; overwrite if drifted | `test_cross_verify_revalidates_prev_close_not_just_bar_close` |
+| H6 | `prev_close_cache` primitive PINNED as `Arc<papaya::HashMap<(u32, ExchangeSegment), f64>>` (lock-free read; no Mutex/RwLock) | `test_prev_close_cache_uses_papaya_not_mutex` |
+| H7 | `candles_1d` self-referential prev_close at seal time MUST read from RAM cache only (no QuestDB SELECT) | `test_candles_1d_self_referential_does_not_select_at_seal_time` |
+| H8 | `index_prev_close_cache` migrated from `HashMap<u32, f32>` to composite `HashMap<(u32, ExchangeSegment), f64>` (I-P1-11 compliance) | banned-pattern category 5 explicit guard on `tick_processor.rs:537` |
+| H9 | Pre-ILP bounds guard on `prev_close` f32: reject `!is_finite()` OR `<= 0.0` OR `> 10_000_000.0` BEFORE writing to QuestDB or RAM cache | `test_prev_close_rejects_nan_inf_zero_and_extreme` |
+
+**9 MEDIUM fixes (folded into other items):**
+
+| # | Fix | Owner |
+|---|---|---|
+| M1 | 3m bucket 09:12-09:15 spans pre-open boundary → empty (G1 gate) OR `phase = "market_open_partial"` | item 8 (G1 dual-gate) |
+| M2 | Verify sequence number on Quote packets; if absent, switch tick DEDUP key to `(ts, security_id, segment, tick_count_in_minute)` | item 29 schema |
+| M3 | Per-SID seal-emission watchdog Prometheus counter `tv_aggregator_seals_per_sid_total{sid,tf}` + alert `tv-aggregator-seal-stopped-per-sid` for 5m during market hours | item 11 (timing audit) |
+| M4 | 1d pct computation reads RAM cache only (subsumed by H7) | H7 |
+| M5 | Source-scan guard: `test_vix_pct_used_only_by_regime_filter_never_by_ranker` | item 31 |
+| M6 | `prev_close_persist::spawn_global` race: spawn writer exactly once from main.rs BEFORE any parallel task; ratchet `test_prev_close_writer_spawned_exactly_once_at_boot` | item 31 |
+| M7 | DDL errors upgrade `warn!` → `error!(code = ErrorCode::PrevCloseDdl04.code_str(), ...)` to route through Telegram | item 31 |
+| M8 | `tick_count` column type `INT` → `LONG` on all 6 candle tables (i32 wrap at 2.1B for re-aggregation) | item 29 schema |
+| M9 | Per-tick aggregator bucket lookup: `Arc<papaya::HashMap<(u32, ExchangeSegment), [Bucket; 6]>>` indexed by `TimeframeIdx as usize` (fixed-array, not 6 hash probes) | item 31 |
+
+**4 LOW fixes:**
+
+| # | Fix | Owner |
+|---|---|---|
+| L1 | `CANDLE_1H_ALIGN_OFFSET = "00:15"` + `CANDLE_DEFAULT_ALIGN_OFFSET = "00:00"` constants in `crates/common/src/constants.rs` | item 31 |
+| L2 | `source SYMBOL CAPACITY 8` (avoid default 256) | item 29 DDL |
+| L3 | `test_drop_matview_idempotent_when_view_absent_or_present` | item 31 |
+| L4 | `tick_count LONG` (subsumed by M8) | M8 |
+
+**Honest 100% claim wording (verbatim, mandated):**
+
+> "100% inside the tested envelope, with ratcheted regression coverage:
+> ≤60s QuestDB outage absorbed by rescue→spill→DLQ;
+> ≤5,000,000-tick ring buffer (`TICK_BUFFER_CAPACITY`);
+> bench-gated O(1) hot path; composite-key uniqueness;
+> chaos-tested 65h weekend sleep/wake;
+> 27 hostile findings from 3 adversarial agents all closed with named ratchets (this item).
+> Beyond the envelope, DLQ NDJSON catches every payload as recoverable text."
+
+**LoC: ~620 (5 CRITICAL fixes ~300 + 9 HIGH fixes ~200 + 9 MEDIUM ~80 + 4 LOW ~40 + 27 ratchet tests).**
+
+**Total Friday + Saturday + Sunday build: ~6,520 LoC across 30 active items + 9 docs.**
 
 ---
 
