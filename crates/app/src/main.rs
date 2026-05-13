@@ -4518,9 +4518,17 @@ async fn main() -> Result<()> {
                         token_remaining_secs = token_secs,
                         "PROOF: market-open readiness confirmation fired @ 09:14:00 IST"
                     );
+                    // Phase 0 Item 2 hostile-review HIGH #3 fix (2026-05-13):
+                    // `main_feed_total` is the operator's EXPECTED count for
+                    // the day, NOT the Dhan slot ceiling. Under Phase 0 the
+                    // expected total is 1; reading "1/5" would falsely
+                    // suggest 4 missing connections.
                     readiness_notifier.notify(NotificationEvent::MarketOpenReadinessConfirmation {
                         main_feed_active: main_active,
-                        main_feed_total: tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS,
+                        main_feed_total: tickvault_common::config::effective_main_feed_pool_size(
+                            config.subscription.scope,
+                            config.dhan.max_websocket_connections,
+                        ),
                         depth_20_active: d20,
                         depth_200_active: d200,
                         order_update_active: oms,
@@ -4592,10 +4600,17 @@ async fn main() -> Result<()> {
                     // the High-severity Failed variant so the operator pages,
                     // not to the Info-severity Confirmation that reads confusingly
                     // as "Streaming live / Main feed: 0/5".
+                    // Phase 0 Item 2 hostile-review HIGH #3 fix (2026-05-13):
+                    // see MarketOpenReadinessConfirmation above for rationale.
+                    let expected_main_feed_total =
+                        tickvault_common::config::effective_main_feed_pool_size(
+                            config.subscription.scope,
+                            config.dhan.max_websocket_connections,
+                        );
                     if main_active == 0 {
                         heartbeat_notifier.notify(NotificationEvent::MarketOpenStreamingFailed {
                             main_feed_active: main_active,
-                            main_feed_total: tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS,
+                            main_feed_total: expected_main_feed_total,
                             depth_20_active: d20,
                             depth_200_active: d200,
                             order_update_active: oms,
@@ -4604,8 +4619,7 @@ async fn main() -> Result<()> {
                         heartbeat_notifier.notify(
                             NotificationEvent::MarketOpenStreamingConfirmation {
                                 main_feed_active: main_active,
-                                main_feed_total:
-                                    tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS,
+                                main_feed_total: expected_main_feed_total,
                                 depth_20_active: d20,
                                 depth_200_active: d200,
                                 order_update_active: oms,
@@ -4876,14 +4890,35 @@ async fn main() -> Result<()> {
                     };
 
                     /// Sum of expected connections across the four pools:
-                    /// Total expected websocket count = 12. Breakdown:
-                    /// 5 main feed, 4 depth-20 (NIFTY, BANKNIFTY, FINNIFTY,
-                    /// MIDCPNIFTY per pre-2026-04-25 universe; rebuild reduced
-                    /// to 2 but pool capacity still permits 4), 2 depth-200
-                    /// (NIFTY ATM CE/PE plus BANKNIFTY ATM CE/PE, capped at 2
-                    /// in live config), 1 order-update.
-                    /// Used as `expected` divisor for `WS_health = active / expected`.
-                    const SLO_WS_EXPECTED_TOTAL: f64 = 12.0;
+                    /// Default = 12. Breakdown: 5 main feed, 4 depth-20 (NIFTY,
+                    /// BANKNIFTY, FINNIFTY, MIDCPNIFTY per pre-2026-04-25
+                    /// universe; rebuild reduced to 2 but pool capacity still
+                    /// permits 4), 2 depth-200 (NIFTY ATM CE/PE + BANKNIFTY
+                    /// ATM CE/PE), 1 order-update.
+                    ///
+                    /// Phase 0 Item 2 fix (operator-locked 2026-05-13,
+                    /// hostile-review CRITICAL #1): main-feed component
+                    /// scope-aware. Under `IndicesUnderlyingsOnly` the main
+                    /// pool is clamped to `PHASE_0_MAIN_FEED_CONNECTION_COUNT
+                    /// = 1`, so the expected denominator must match the
+                    /// effective pool size — otherwise `ws_health = 8/12 =
+                    /// 0.667` → `SLO-02 Critical` Telegram every 10s during
+                    /// market hours (pager fatigue). Depth-20 + depth-200
+                    /// gating to 0 under Phase 0 is wired in PR-3 (Item 3
+                    /// feature flags); until then this denominator reads
+                    /// `effective_main + 4 + 2 + 1 = 8` under Phase 0.
+                    const SLO_WS_EXPECTED_DEPTH_20: f64 = 4.0;
+                    const SLO_WS_EXPECTED_DEPTH_200: f64 = 2.0;
+                    const SLO_WS_EXPECTED_ORDER_UPDATE: f64 = 1.0;
+                    let slo_ws_expected_main_feed: f64 =
+                        tickvault_common::config::effective_main_feed_pool_size(
+                            config.subscription.scope,
+                            config.dhan.max_websocket_connections,
+                        ) as f64;
+                    let slo_ws_expected_total: f64 = slo_ws_expected_main_feed
+                        + SLO_WS_EXPECTED_DEPTH_20
+                        + SLO_WS_EXPECTED_DEPTH_200
+                        + SLO_WS_EXPECTED_ORDER_UPDATE;
 
                     /// Tick-freshness threshold during market hours: a tick
                     /// gap >= this many seconds drives `tick_freshness = 0.0`.
@@ -4991,7 +5026,7 @@ async fn main() -> Result<()> {
                             0.0
                         };
                         let active_total = active_main + active_d20 + active_d200 + active_ou;
-                        let raw_ws_health = active_total / SLO_WS_EXPECTED_TOTAL;
+                        let raw_ws_health = active_total / slo_ws_expected_total;
                         // Off-hours: by-design sleeping connections must
                         // NOT degrade the SLO. Pin to 1.0.
                         let ws_health = if !in_market { 1.0 } else { raw_ws_health };
@@ -5084,7 +5119,7 @@ async fn main() -> Result<()> {
                         // per-dimension gauge value into [0, 1] before
                         // emit so that a future regression that lets a
                         // raw f64 (e.g. NaN from div-by-zero or > 1.0
-                        // from a misconfigured `SLO_WS_EXPECTED_TOTAL`)
+                        // from a misconfigured `slo_ws_expected_total`)
                         // cannot pollute the dashboard. `evaluate_slo_score`
                         // already clamps internally for the composite —
                         // this is the same defense for the per-dimension
@@ -6358,13 +6393,43 @@ fn create_websocket_pool(
     // stock equities → stock derivatives. So truncating the tail drops
     // the lowest-priority items first (typically stock options far from
     // ATM that Phase 2 would otherwise add post-09:12 IST).
-    let effective_capacity = config
-        .dhan
+    // Phase 0 Item 2 (operator-locked 2026-05-13): under
+    // `SubscriptionScope::IndicesUnderlyingsOnly` the planner emits ~222
+    // SIDs (well below the 5000-per-conn Dhan cap). Spinning up 5
+    // main-feed connections would waste 4 idle slots, fragment the
+    // token/IP budget, and trip the pool watchdog with false-positive
+    // "connection idle" signals. `effective_main_feed_pool_size` clamps
+    // the count to `PHASE_0_MAIN_FEED_CONNECTION_COUNT = 1` under that
+    // scope; legacy + Wave 5 scopes honour the configured value.
+    //
+    // Security-review MEDIUM fix (2026-05-13): compute the pool clamp
+    // BEFORE the capacity check so `effective_capacity` and the actual
+    // pool size agree. Pre-fix the capacity check used the configured
+    // (unclamped) value, allowing a future >5000-SID Phase 0 plan to
+    // slip past truncation and then fail `CapacityExceeded` at pool
+    // construction. Harmless today (222 SIDs ≪ 5000) but a logical
+    // inconsistency we close now.
+    let mut dhan_for_pool = config.dhan.clone();
+    let configured_pool_size = dhan_for_pool.max_websocket_connections;
+    let effective_pool_size = tickvault_common::config::effective_main_feed_pool_size(
+        config.subscription.scope,
+        configured_pool_size,
+    );
+    if effective_pool_size != configured_pool_size {
+        info!(
+            scope = config.subscription.scope.as_str(),
+            configured = configured_pool_size,
+            effective = effective_pool_size,
+            "Phase 0 Item 2: main-feed pool size clamped by scope"
+        );
+        dhan_for_pool.max_websocket_connections = effective_pool_size;
+    }
+
+    let effective_capacity = dhan_for_pool
         .max_instruments_per_connection
         .min(tickvault_common::constants::MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION)
         .saturating_mul(
-            config
-                .dhan
+            dhan_for_pool
                 .max_websocket_connections
                 .min(tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS),
         );
@@ -6387,7 +6452,7 @@ fn create_websocket_pool(
     let mut pool = match WebSocketConnectionPool::new_with_optional_wal(
         token_handle.clone(),
         client_id.to_string(),
-        config.dhan.clone(),
+        dhan_for_pool,
         ws_config,
         instruments,
         feed_mode,

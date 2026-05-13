@@ -799,6 +799,105 @@ mod tests {
         assert_eq!(pool.total_instruments(), 5001);
     }
 
+    // ----------------------------------------------------------------------
+    // Phase 0 Item 2 (operator-locked 2026-05-13) — 1-conn main-feed pool.
+    //
+    // Under `SubscriptionScope::IndicesUnderlyingsOnly`, main.rs overrides
+    // `dhan_config.max_websocket_connections` via
+    // `effective_main_feed_pool_size(scope, configured)` to
+    // `PHASE_0_MAIN_FEED_CONNECTION_COUNT = 1` BEFORE calling the pool
+    // constructor. These ratchets verify that:
+    //   * a 1-conn pool builds correctly with 222 SIDs (the Phase 0 universe)
+    //   * ALL 222 SIDs land on conn 0 (round-robin with N=1 = "all on 0")
+    //   * the other 4 connection objects are NOT created (no false-positive
+    //     "idle conn" watchdog signals)
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn test_pool_one_main_feed_conn_builds_correctly_with_phase_0_universe() {
+        // Phase 0 universe = 222 SIDs ≤ 5000-per-conn cap → fits on 1 conn.
+        let mut dhan = make_test_dhan_config();
+        dhan.max_websocket_connections =
+            tickvault_common::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT;
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            dhan,
+            make_test_ws_config(),
+            make_instruments(222),
+            FeedMode::Ticker,
+            None,
+        )
+        .expect("Phase 0 1-conn pool with 222 instruments must build");
+        assert_eq!(
+            pool.connection_count(),
+            tickvault_common::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT,
+            "Phase 0 pool must spawn exactly 1 main-feed conn",
+        );
+        assert_eq!(
+            pool.total_instruments(),
+            222,
+            "all 222 Phase 0 SIDs must be assigned",
+        );
+    }
+
+    #[test]
+    fn test_pool_one_main_feed_conn_assigns_all_instruments_to_conn_zero() {
+        // Round-robin distribution with N=1 collapses to "all on slot 0".
+        let mut dhan = make_test_dhan_config();
+        dhan.max_websocket_connections = 1;
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            dhan,
+            make_test_ws_config(),
+            make_instruments(222),
+            FeedMode::Quote,
+            None,
+        )
+        .unwrap();
+
+        // Single-conn pool → exactly 1 health entry → that entry holds 222.
+        let health = pool.health();
+        assert_eq!(
+            health.len(),
+            1,
+            "Phase 0 pool must expose exactly 1 health entry",
+        );
+        assert_eq!(
+            health[0].subscribed_count, 222,
+            "all 222 SIDs must be assigned to conn 0",
+        );
+    }
+
+    #[test]
+    fn test_pool_one_main_feed_conn_capacity_limit_still_5000() {
+        // The per-conn capacity cap is still 5000 even when only 1 conn
+        // spawns. CapacityExceeded must fire at 5001 SIDs under N=1.
+        let mut dhan = make_test_dhan_config();
+        dhan.max_websocket_connections = 1;
+        let err = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            dhan,
+            make_test_ws_config(),
+            make_instruments(5001),
+            FeedMode::Ticker,
+            None,
+        )
+        .expect_err("5001 instruments on 1 conn must exceed effective capacity");
+        match err {
+            WebSocketError::CapacityExceeded {
+                requested,
+                capacity,
+            } => {
+                assert_eq!(requested, 5001);
+                assert_eq!(capacity, 5000, "single-conn effective capacity = 5000");
+            }
+            other => panic!("expected CapacityExceeded, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_pool_25000_uses_five_connections() {
         let pool = WebSocketConnectionPool::new(

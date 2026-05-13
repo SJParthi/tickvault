@@ -952,6 +952,23 @@ const _: () = {
     );
 };
 
+/// Phase 0 LEAN MVP main-feed pool size (operator decision 2026-05-13).
+///
+/// Under `SubscriptionScope::IndicesUnderlyingsOnly`, only ~222 SIDs are
+/// subscribed — well below the 5,000-per-connection Dhan cap. Spinning up
+/// 5 main-feed WebSocket connections is wasteful: 4 of them would sit
+/// idle holding zero instruments, fragment the token/IP usage budget,
+/// and produce 4 false-positive "connection idle" watchdog signals.
+///
+/// Item 2 of `topic-PHASE-0-LEAN-LOCKED.md` reduces the live count to 1.
+/// The other 4 stay defined in the codebase + ratchets — Phase 2 will
+/// restore them by widening the scope, not by editing this constant.
+///
+/// Pool sizing is decided by `effective_main_feed_pool_size(scope, ..)`
+/// in `crates/common/src/config.rs`; this constant is the locked Phase 0
+/// value referenced from that helper and from the pool ratchet tests.
+pub const PHASE_0_MAIN_FEED_CONNECTION_COUNT: usize = 1;
+
 // ---------------------------------------------------------------------------
 // F&O Universe — Index Aliases (FNO symbol → IDX_I symbol)
 // ---------------------------------------------------------------------------
