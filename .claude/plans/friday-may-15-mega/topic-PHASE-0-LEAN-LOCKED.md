@@ -912,6 +912,55 @@ The 09:15 bar seals at 09:16:00.005 IST; cross-verify completes around 09:16:50 
 
 ---
 
+### 30. Per-minute % change from prev_close stored in candle tables (operator-locked 2026-05-13)
+
+Every sealed bar (1m/5m/15m/1h/1d) gets `pct_from_prev_close` computed at seal time and stored as a new column. Strategy hot-path reads directly — zero math on every tick. Dashboard SQL is one column. Backtest reads identical-shape rows.
+
+**Schema delta (ALTER ADD COLUMN IF NOT EXISTS, idempotent at boot):**
+
+| Table | New column |
+|---|---|
+| `candles_1m` | `pct_from_prev_close DOUBLE` |
+| `candles_5m` | `pct_from_prev_close DOUBLE` |
+| `candles_15m` | `pct_from_prev_close DOUBLE` |
+| `candles_1h` | `pct_from_prev_close DOUBLE` |
+| `candles_1d` | `pct_from_prev_close DOUBLE` |
+
+**DEDUP UPSERT KEYS unchanged** — `(security_id, exchange_segment, ts, timeframe)` already uniquely identifies each row. The `pct_from_prev_close` is a new attribute on the existing row, NOT a new identity dimension.
+
+**Computation:**
+
+```
+pct_from_prev_close = (bar.close - prev_close_cache[(sid, segment)]) / prev_close * 100.0
+```
+
+| Trigger | Action |
+|---|---|
+| Bar seal (every 1m/5m/15m/1h/1d boundary) | Compute + UPSERT into candle row |
+| `prev_close_cache` miss for that SID | Skip field (NULL) + Telegram `PctFromPrevCloseSkipped` (Low — should be impossible after 09:14:55 cutoff) |
+| Cross-verify overwrite (item 28) corrects the bar's close | Re-compute pct using corrected close + same cached prev_close |
+| Daily candle (`candles_1d`) | Self-referential — `prev_close = yesterday's candles_1d.close` lookup at session end |
+| `prev_close < 1e-9` (degenerate edge) | Skip + log Info — avoids div-by-zero |
+
+**Constants pinned:**
+- `PCT_FROM_PREV_CLOSE_DEGENERATE_THRESHOLD = 1e-9`
+
+**Ratchet tests (mandatory):**
+- `test_pct_from_prev_close_computed_at_bar_seal_for_1m`
+- `test_pct_from_prev_close_computed_for_all_5_timeframes`
+- `test_pct_recomputed_after_cross_verify_overwrite_item_28`
+- `test_pct_skipped_when_prev_close_below_degenerate_threshold`
+- `test_pct_skipped_when_prev_close_cache_miss`
+- `test_alter_add_pct_column_idempotent_on_boot`
+- `test_candles_1d_pct_uses_yesterday_close_self_referential`
+- `test_candle_dedup_key_unchanged_security_segment_ts_timeframe`
+
+**LoC: ~400 (5 ALTER + bar-seal computation × 5 timeframes + cross-verify recompute hook + daily-candle lookup + Telegram + 8 ratchets).**
+
+**Total Friday + Saturday + Sunday build: ~5,820 LoC across 29 active items + 8 docs.**
+
+---
+
 ## Phase 0 progress checkboxes (operator-locked checkbox defense protocol 2026-05-13)
 
 **Mandatory rule:** Every Claude Code session MUST check these boxes at session start. Only mark `- [x]` when ALL 4 criteria met: (1) code merged, (2) ratchet tests green in CI, (3) 7-layer observability wired, (4) PR closed.
@@ -958,6 +1007,7 @@ The 09:15 bar seals at 09:16:00.005 IST; cross-verify completes around 09:16:50 
 - [ ] **Item 27h** — `.claude/rules/project/phase-0-architecture.md`
 - [ ] **Item 28** — Cross-verify mismatch DEDUP UPSERT overwrite + 09:15 strategy gate + `bar_correction_audit`
 - [ ] **Item 29** — QuestDB schema changes (candles source column + 15 new audit tables + 15 schema ratchets)
+- [ ] **Item 30** — `pct_from_prev_close` column on all 5 candle tables + bar-seal computation + cross-verify recompute hook + 8 ratchets (DEDUP KEYS unchanged: `(security_id, exchange_segment, ts, timeframe)`)
 
 **Total active items to check off: 36 boxes (28 active items, of which 27 = items 1-21,23-28; item 22 PARKED; item 27 has 8 sub-doc boxes; item 29 added).**
 
