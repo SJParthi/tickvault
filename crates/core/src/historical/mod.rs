@@ -35,3 +35,8 @@
 
 pub mod candle_fetcher;
 pub mod cross_verify;
+// Phase 0 Item 10 — pure planner that computes which 1m bar starts a
+// disconnect gap-fill scheduler should refill. Does NOT write to ticks
+// or synthesize ticks (compliant with live-feed-purity rule). The
+// scheduler task that consumes this plan lands in a follow-up PR.
+pub mod gap_fill_planner;
