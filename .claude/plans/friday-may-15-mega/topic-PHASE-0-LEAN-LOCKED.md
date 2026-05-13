@@ -320,6 +320,165 @@ CREATE TABLE IF NOT EXISTS gap_fill_audit (
 
 **Total Friday build: ~2,030 LoC across 18 changes.**
 
+### 10. Tightened detector timings (operator-locked 2026-05-13)
+
+| Detector / Action | Old | NEW (locked) | Floor reason |
+|---|---:|---:|---|
+| First reconnect attempt | 1-2s | **0 ms (instant)** | TCP reconnect fires same-tick as `Err` |
+| Subscribe re-send after reconnect | varies | **0 ms** | `SubscribeRxGuard` already holds channel |
+| **IDX_I activity watchdog** | 15s | **3 s** | IDX_I 1-3 ticks/sec; 3s = 3-9 missed ticks |
+| **NSE_EQ activity watchdog** | 30s | **10 s** | 0.5-2 ticks/sec; 10s = ≥5 missed |
+| **VIX activity watchdog** | — | **30 s** | ~1 tick/10s normal |
+| **Subscribe-ACK first frame** | 5s | **2 s** | Dhan typically <500ms |
+| **WS handshake deadline** | 30s | **5 s** | AWS direct path ≤5s |
+| **Order placement REST timeout** | default | **5 s** | Dhan REST p99 ~800ms |
+
+### 11. Daily SEBI 24h JWT renewal observability (operator-locked 2026-05-13)
+
+Every day at ~T-1h before expiry, token manager force-renews. Operator MUST see the renewal succeed (positive ping) and audit row written.
+
+- New typed Telegram: `JwtRenewalCompleted` (Info — daily once)
+- New audit table: `auth_renewal_audit` with `(trading_date_ist, renewal_ts, old_token_expiry, new_token_expiry, source = valkey|ssm|totp, latency_ms, result)`
+- DEDUP UPSERT KEYS `(trading_date_ist, renewal_ts)`
+- `tv_token_renewals_total{source,result}` Prom counter
+- Ratchet: `test_jwt_renewal_audit_row_written_on_success`
+
+**LoC: ~150.**
+
+### 12. Static IP boot check (operator-locked 2026-05-13)
+
+At boot, before any order-path code spawns:
+- Call `GET /v2/ip/getIP` (free, non-rate-limited)
+- Verify `ordersAllowed == true`
+- HALT + Telegram CRITICAL if false
+- Compare `detectedIP` vs SSM-stored `expected_primary_ip` — mismatch = static IP changed externally
+
+**LoC: ~80.**
+
+### 13. Dual-instance lock (RESILIENCE-01, operator-locked 2026-05-13)
+
+Refuse to boot if another tickvault instance is already running against the same Dhan client_id (would fragment WS budget + static-IP conflict).
+
+- QuestDB `live_instance_lock` table: `(client_id, host_id, boot_ts)` with DEDUP UPSERT KEYS `(client_id)`
+- At boot: SELECT existing row; if `boot_ts > now() - 60s` → refuse start + Telegram CRITICAL `DualInstanceDetected`
+- Lock heartbeat updates `boot_ts` every 30s
+
+**LoC: ~150.**
+
+### 14. Orphan position 15:25 IST watchdog (operator-locked 2026-05-13)
+
+Strategy is intraday option-buying — NO overnight positions allowed.
+
+- Tokio task fires at 15:25:00 IST
+- Query `/v2/positions` for any `netQty != 0`
+- For each open position: cancel pending Super Order legs + place market exit
+- Telegram CRITICAL `OrphanPositionAutoClosed` with position details
+- New audit row in `orphan_position_audit` table
+
+**LoC: ~200.**
+
+### 15. NaN / division-by-zero guards in indicator engine (operator-locked 2026-05-13)
+
+Every yata/custom indicator wrapped — RSI with no down-moves, MACD with zero stddev, BB with zero variance, etc. all return NaN → poison downstream signals.
+
+- Wrap each indicator update with `validate_finite()` that returns `Option<f64>`
+- On NaN/Inf: reset indicator state for that SID + Telegram High `IndicatorNaNReset { sid, indicator }`
+- Counter `tv_indicator_nan_resets_total{indicator,sid}`
+
+**LoC: ~150.**
+
+### 16. Order placement 5s REST timeout + retry policy (operator-locked 2026-05-13)
+
+- Reqwest client built with `.timeout(Duration::from_secs(5))`
+- DH-904 (rate limit) → exponential backoff 10s→20s→40s→80s, then give-up + CRITICAL
+- DH-905 (input err), DH-906 (order err) → NEVER retry, log + alert operator
+- DH-908 (server err) → retry once with 2s backoff
+- DH-909 (network err) → retry 3 times with backoff
+
+**LoC: ~100.**
+
+### 17. Stop-loss-leg-cancelled detection (operator-locked 2026-05-13)
+
+If operator manually cancels SL leg on Dhan UI, position becomes naked.
+
+- Order-update WS handler: detect `Source=N` (Normal, not API) + `LegNo=2` (SL leg) + `status=CANCELLED`
+- Within 30s: place fresh STOP_LOSS_MARKET order at the original SL price
+- Telegram CRITICAL `NakedPositionDetectedSLReplaced`
+- New audit row in `sl_replacement_audit`
+
+**LoC: ~180.**
+
+### 18. Boot-success Telegram positive ping (operator-locked 2026-05-13)
+
+False-OK Rule 11: operator must SEE green before market opens.
+
+- At 09:14:55 IST (just before pre-open buffer read), assemble status: `subscribed=N/222, token_ok, qdb_ok, ip_ok, preopen_buffer_filled=N/218`
+- Send ONCE per trading day as `BootReadyConfirmation` (Info)
+- If ANY check fails, send `BootDegraded` (Critical) instead with diagnostic
+
+**LoC: ~80.**
+
+### 19. End-of-day Telegram digest (operator-locked 2026-05-13)
+
+Operator's "did today work?" question gets one daily answer.
+
+- Fires at 15:31:30 IST after final bar seal
+- Payload: P&L (realized/unrealized), signals fired, orders placed, fills, disconnects count, gap-fills count, cross-verify result (pass/fail), top 3 errors
+- Telegram `DailyDigest` (Info if all green, High if any cross-verify mismatch, Critical if open positions remain)
+
+**LoC: ~150.**
+
+### 20. Tick-level integrity guards (operator-locked 2026-05-13)
+
+- Reject `price ≤ 0` or `price > 10_000_000` → counter `tv_ticks_rejected_invalid_price_total{reason}` + audit row
+- Reject `oi < 0` → same
+- Aggregator validation at bar seal: `assert high >= low && open ∈ [low,high] && close ∈ [low,high]` — violation marks `corrupt=true` + Telegram + skip strategy decisions on that bar
+- Counter `tv_aggregator_corrupt_bars_total{sid}`
+
+**LoC: ~160.**
+
+### 21. Self-trade prevention (operator-locked 2026-05-13)
+
+SEBI rule: no wash trades. Within single account:
+
+- Refuse SELL on a SID if we placed BUY in last 60s for same SID+ProductType (or vice versa)
+- New constant `SELF_TRADE_COOLDOWN_SECS = 60`
+- Telegram High `SelfTradePrevented` with both order details
+- Audit row in `self_trade_audit` table
+
+**LoC: ~100.**
+
+### 22. GIFT NIFTY — per-segment market hours + overnight close fetch (operator-locked 2026-05-13)
+
+GIFT NIFTY = NIFTY 50 futures on NSE IX (GIFT City), USD-denominated, ~21h/day across 2 sessions.
+
+**Architecture changes:**
+
+| # | Sub-item | LoC |
+|---|---|---:|
+| 22a | **Per-segment market-hours table** `HashMap<ExchangeSegment, MarketHoursSchedule>` (replaces single `[09:15, 15:30)` constant) | ~150 |
+| 22b | **NSE_IFSC segment** added to `ExchangeSegment` enum + binary parser (if Dhan supports) | ~50 |
+| 22c | **GIFT NIFTY SecurityId** added to subscription planner, Ticker mode | ~30 |
+| 22d | **AWS EventBridge schedule** revised to **06:30 - 15:45 IST Mon-Fri** (was 08:30-17:30) | ~20 (Terraform) |
+| 22e | **Overnight-close REST fetch at boot** — fetch GIFT NIFTY 02:45 IST close via `/v2/charts/intraday`; store in `gift_nifty_overnight_audit` | ~150 |
+| 22f | **09:15 open source** for GIFT NIFTY = last continuous tick before 09:15 (no pre-open buffer concept) | ~30 |
+| 22g | **6 ratchet tests** — NSE_IFSC schedule, overnight fetch, 09:15 open source, 02:45 close cutoff, per-segment gate, GIFT skip on cross-verify if not in Dhan historical | ~150 |
+
+**Pre-flight verification mandatory before Friday:**
+
+| Check | Owner | Deadline |
+|---|---|---|
+| GIFT NIFTY in Dhan instrument master CSV — get SecurityId + segment code | operator | Thu 2026-05-14 |
+| Test subscribe + first frame on Mac dev | operator | Thu |
+| Verify `/v2/charts/intraday` returns GIFT NIFTY bars | operator | Thu |
+| If unsupported → defer to Phase 2 OR build separate NSE IX feed (separate plan) | operator | Thu |
+
+**Schedule choice locked: Option B — extend AWS to 06:30-15:45 IST. Captures Session 1 (overlaps NSE) + overnight close fetched once at boot via REST. Skips Session 2 (17:00-02:45 IST). AWS cost delta: +~₹20/mo.**
+
+**LoC: ~580 across 7 sub-items.**
+
+**Total Friday + Saturday build: ~4,120 LoC across 22 top-level items (with 7 sub-items in #22). Approximately 1.5-2 focused days.**
+
 ---
 
 ## Honest envelope (the 100% claim)
