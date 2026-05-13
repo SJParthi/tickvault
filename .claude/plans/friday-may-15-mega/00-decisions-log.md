@@ -913,3 +913,13 @@ Operator decision after live disconnect storm 09:16-09:29 IST:
   2. SENSEX code 6 packet behavior
   3. NSE_EQ Quote mode bytes 38-41 prev_close verification
   4. /v2/charts/historical interval=1d format verification
+
+## 2026-05-13 (final-final) — GIFT NIFTY DROPPED from Phase 0
+
+- Operator decision: drop GIFT NIFTY from Phase 0 to keep Friday build lean.
+- Reasons: Dhan support unverified (adds Thu pre-flight risk), per-segment-hours table adds ~150 LoC complexity, AWS schedule revision (08:30→06:30) was reversible noise, overnight gap-direction signal can be inferred from NIFTY morning behaviour during Phase 1.
+- Reverted: AWS schedule back to 08:30-17:30 IST Mon-Fri (original). Single market-hours window [09:15, 15:30) restored (no per-segment table). NSE_IFSC segment NOT added.
+- Total SIDs: 222 (was 223). LoC: ~4,170 (was ~4,750).
+- GIFT NIFTY design remains documented in plan file as PARKED (item 22-OLD) for Phase 2 re-evaluation.
+- Re-eval trigger: Phase 1 monitoring data shows clear demand for overnight gap signal.
+- Phase 0 LOCKED is now 22 items (1-21 + 23, where 23 is prev-close mode mix), 4,170 LoC, 1.5-2 days.
