@@ -710,6 +710,7 @@ mod tests {
             reconnect_max_attempts: 10,
             subscription_batch_size: 100,
             connection_stagger_ms: 0, // No stagger in tests for speed
+            activity_watchdog_threshold_secs: 50,
         }
     }
 

@@ -71,9 +71,7 @@ use tickvault_common::types::FeedMode;
 use tickvault_storage::ws_frame_spill::{WsFrameSpill, WsType};
 
 use crate::auth::TokenHandle;
-use crate::websocket::activity_watchdog::{
-    ActivityWatchdog, WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
-};
+use crate::websocket::activity_watchdog::ActivityWatchdog;
 use crate::websocket::subscription_builder::build_subscription_messages;
 use crate::websocket::tls::build_websocket_tls_connector;
 use crate::websocket::types::{
@@ -412,8 +410,8 @@ impl WebSocketConnection {
             // Audit-2026-05-03 H2: resolve the static label ONCE at
             // construction. `connection_id_label_static` is a pure O(1)
             // const-array index — zero heap allocation, label points to
-            // `.rodata`. Previously the `run()` loop called
-            // `self.connection_id.to_string()` which heap-allocated.
+            // `.rodata`. Previously the `run()` loop did a per-call
+            // `self.connection_id` to-string conversion which heap-allocated.
             connection_id_label: connection_id_label_static(connection_id),
         }
     }
@@ -620,10 +618,14 @@ impl WebSocketConnection {
                     // returns.
                     // O(1) EXEMPT: watchdog label built once per reconnect cycle, not per frame
                     let watchdog_label = format!("live-feed-{}", self.connection_id);
+                    // Phase 0 Item 4 (2026-05-13): threshold read from ws_config
+                    // so main.rs can scope-override (Phase 0 = 3s; legacy = 50s).
+                    // See `effective_main_feed_watchdog_threshold_secs` in
+                    // `phase2_recovery.rs`.
                     let watchdog = ActivityWatchdog::new(
                         watchdog_label,
                         Arc::clone(&self.activity_counter),
-                        Duration::from_secs(WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS),
+                        Duration::from_secs(self.ws_config.activity_watchdog_threshold_secs),
                         Arc::clone(&self.watchdog_notify),
                     );
                     // WS-1: use panic-safe spawn so a watchdog panic fires
@@ -981,8 +983,11 @@ impl WebSocketConnection {
                 () = self.watchdog_notify.notified() => {
                     return Err(WebSocketError::WatchdogFired {
                         label: format!("live-feed-{}", self.connection_id), // O(1) EXEMPT: cold path — fires once per dead socket, not per frame
-                        silent_secs: WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
-                        threshold_secs: WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
+                        // Phase 0 Item 4 (2026-05-13): same field as the watchdog
+                        // constructor so the WatchdogFired event reports the actual
+                        // threshold (3s under Phase 0; 50s under legacy).
+                        silent_secs: self.ws_config.activity_watchdog_threshold_secs,
+                        threshold_secs: self.ws_config.activity_watchdog_threshold_secs,
                     });
                 }
                 () = self.shutdown_notify.notified() => {
@@ -1553,12 +1558,14 @@ impl WebSocketConnection {
             );
         }
 
-        // Exponential backoff: initial * 2^attempt, capped at max.
-        let base_delay_ms = self
-            .ws_config
-            .reconnect_initial_delay_ms
-            .saturating_mul(1u64.checked_shl(attempt.min(63) as u32).unwrap_or(u64::MAX))
-            .min(self.ws_config.reconnect_max_delay_ms);
+        // Phase 0 Item 4 (operator-locked 2026-05-13): first reconnect
+        // attempt fires INSTANTLY (0ms). See
+        // `compute_reconnect_base_delay_ms` doc for the full rationale.
+        let base_delay_ms = compute_reconnect_base_delay_ms(
+            attempt,
+            self.ws_config.reconnect_initial_delay_ms,
+            self.ws_config.reconnect_max_delay_ms,
+        );
 
         // B1: add deterministic-but-varying jitter so 5 connections failing
         // together do not synchronize their reconnect attempts and hammer
@@ -1641,6 +1648,30 @@ const RECONNECT_JITTER_PCT: u64 = 20;
 /// - For `base == 0`, returns `0`.
 /// - For very small `base` (< 5ms), returns `base` unchanged (jitter
 ///   would be less than 1ms and add no decorrelation).
+/// Phase 0 Item 4 (operator-locked 2026-05-13) — computes the base
+/// reconnect delay (pre-jitter) for a given attempt index. The FIRST
+/// attempt (`attempt == 0`) fires instantly (0 ms) — TCP-side errors
+/// typically indicate an already-dead socket, so waiting 500ms before
+/// the first reconnect just adds latency to detection of the existing
+/// dead state. Subsequent attempts (1, 2, ...) exponential-backoff as
+/// before: `initial * 2^(attempt-1)`, capped at `max_ms`.
+///
+/// Pure function (cannot be `const fn` — `u64::min` is not const-stable
+/// yet, see <https://github.com/rust-lang/rust/issues/143874>). Tested by
+/// `test_compute_reconnect_base_delay_ms_first_attempt_is_zero` +
+/// `test_compute_reconnect_base_delay_ms_subsequent_attempts_exponential`.
+#[inline]
+#[must_use]
+pub fn compute_reconnect_base_delay_ms(attempt: u64, initial_ms: u64, max_ms: u64) -> u64 {
+    if attempt == 0 {
+        return 0;
+    }
+    // attempt=1 → initial; attempt=2 → 2×initial; etc.
+    let shift = attempt.saturating_sub(1).min(63) as u32;
+    let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+    initial_ms.saturating_mul(multiplier).min(max_ms)
+}
+
 pub(crate) fn jitter_reconnect_delay(base_delay_ms: u64, connection_id: u8, attempt: u64) -> u64 {
     if base_delay_ms == 0 {
         return 0;
@@ -1701,6 +1732,39 @@ mod tests {
     fn test_jitter_reconnect_delay_zero_base() {
         assert_eq!(jitter_reconnect_delay(0, 0, 0), 0);
         assert_eq!(jitter_reconnect_delay(0, 7, 42), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 0 Item 4 — compute_reconnect_base_delay_ms ratchets
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_reconnect_base_delay_ms_first_attempt_is_zero() {
+        // attempt=0 → instant reconnect regardless of initial/max.
+        assert_eq!(compute_reconnect_base_delay_ms(0, 500, 30_000), 0);
+        assert_eq!(compute_reconnect_base_delay_ms(0, 0, 0), 0);
+        assert_eq!(compute_reconnect_base_delay_ms(0, 1, 1_000_000), 0);
+    }
+
+    #[test]
+    fn test_compute_reconnect_base_delay_ms_subsequent_attempts_exponential() {
+        // attempt=1 → initial. attempt=2 → 2×initial. attempt=3 → 4×initial.
+        assert_eq!(compute_reconnect_base_delay_ms(1, 500, 30_000), 500);
+        assert_eq!(compute_reconnect_base_delay_ms(2, 500, 30_000), 1_000);
+        assert_eq!(compute_reconnect_base_delay_ms(3, 500, 30_000), 2_000);
+        assert_eq!(compute_reconnect_base_delay_ms(4, 500, 30_000), 4_000);
+        assert_eq!(compute_reconnect_base_delay_ms(5, 500, 30_000), 8_000);
+        assert_eq!(compute_reconnect_base_delay_ms(6, 500, 30_000), 16_000);
+    }
+
+    #[test]
+    fn test_compute_reconnect_base_delay_ms_caps_at_max_ms() {
+        // Capping kicks in once the exponential overshoots max.
+        // 500 * 2^7 = 64_000 > 30_000 → clamped to 30_000.
+        assert_eq!(compute_reconnect_base_delay_ms(8, 500, 30_000), 30_000);
+        assert_eq!(compute_reconnect_base_delay_ms(20, 500, 30_000), 30_000);
+        // saturating_mul protects against u64 overflow at very high attempts.
+        assert_eq!(compute_reconnect_base_delay_ms(100, 500, 30_000), 30_000);
     }
 
     #[test]
@@ -1773,6 +1837,7 @@ mod tests {
             reconnect_max_attempts: 10,
             subscription_batch_size: 100,
             connection_stagger_ms: 0,
+            activity_watchdog_threshold_secs: 50,
         }
     }
 
@@ -3054,6 +3119,7 @@ mod tests {
             reconnect_max_attempts: 7,
             subscription_batch_size: 50,
             connection_stagger_ms: 0,
+            activity_watchdog_threshold_secs: 50,
         };
         let instruments: Vec<_> = (0..250)
             .map(|i| InstrumentSubscription::new(ExchangeSegment::NseFno, 3000 + i))
@@ -3295,6 +3361,7 @@ mod tests {
                 reconnect_max_delay_ms: 1,
                 subscription_batch_size: 100,
                 connection_stagger_ms: 0,
+                activity_watchdog_threshold_secs: 50,
             },
             vec![],
             FeedMode::Ticker,
