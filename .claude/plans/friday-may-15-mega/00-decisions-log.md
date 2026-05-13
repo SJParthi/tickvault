@@ -963,3 +963,31 @@ Operator decision after live disconnect storm 09:16-09:29 IST:
 - AWS deploy: Mon 2026-05-18
 - Phase 1 monitoring: Mon 2026-05-19 → Mon 2026-06-13 (22 trading days dry_run=true)
 - Phase 2A live trading kickoff: Tue 2026-06-16 (after Phase 1 decision gate)
+
+## 2026-05-13 (final-final-final-final) — Cross-verify mismatch overwrite + Phase B parked
+
+### Item 28 ADDED — cross-verify mismatch DEDUP UPSERT overwrite
+- Mechanical rule locked: Dhan historical = SOURCE OF TRUTH at cross-verify time
+- Mismatch → DEDUP UPSERT overwrite of candles_1m row + RAM bar cache atomic replace + Telegram CRITICAL BarMismatchCorrectedFromHistorical + bar_correction_audit row
+- Triggers: 09:16:05 IST (the 09:15 bar) AND 15:31 IST EOD (all bars)
+- Strategy gate: skip 09:15 bar signals until 09:16:55 IST (anti-stale-signal)
+- bar_correction_audit table with DEDUP UPSERT KEYS (trading_date_ist, bar_ts, security_id, exchange_segment, field, source_of_correction)
+- Constants: BAR_CORRECTION_LATENCY_BUDGET_SECS=50, STRATEGY_GATE_FOR_09_15_BAR_UNTIL_IST=09:16:55, MAX_BAR_CORRECTIONS_PER_DAY_THRESHOLD=5
+- 3 new Telegram events + 7 ratchet tests
+- LoC: ~200
+
+### Phase B (Backtest brute-force) DISCUSSION PARKED
+- Topic raised tonight: extreme brute-force permutation/combination backtest on 5y Dhan /charts/intraday underlying data + /charts/rollingoption expired options data for end-to-end strategy discovery on Mac
+- Operator decision: finish Phase 0 LIVE phase first, THEN move to Phase B
+- Phase B will get its own LOCKED plan file (topic-PHASE-B-BACKTEST-LOCKED.md) post Phase 0 completion
+- Anti-scope-creep: do NOT mix Phase B work into Phase 0 build
+
+### Phase 0 TRUE FINAL FINAL TALLY (after item 28)
+- 27 active items (1-21 + 23-28; item 22 GIFT NIFTY PARKED for Phase 2)
+- ~5,170 LoC + ~10,000 words across 8 docs
+- 3-day window: Fri 8h + Sat 9h + Sun AM 4h + Sun PM 6h docs
+- 222 SIDs, mixed-mode (IDX_I=Ticker, NSE_EQ=Quote)
+- AWS t3.medium 08:30-17:30 IST Mon-Fri ~rupees-1,252/mo
+- Phase 1 monitoring: 22 trading days
+- Phase 2A live trading: after Phase 1 decision gate
+- Phase B (brute-force backtest): AFTER Phase 0 completion
