@@ -875,11 +875,16 @@ The 09:15 bar seals at 09:16:00.005 IST; cross-verify completes around 09:16:50 
 
 ---
 
-### 29. QuestDB schema changes (operator-locked 2026-05-13)
+### 29. QuestDB schema changes (operator-locked 2026-05-13, REVISED late-evening for 6-TF + no-1s + no-matview lock)
+
+**Timeframe set LOCKED:** `1m`, `3m`, `5m`, `15m`, `1h`, `1d` — exactly 6 candle base tables.
+- **NO `candles_1s` table** — wasteful and never read on hot path. Aggregator computes 1m directly from ticks in RAM.
+- **NO materialized views** — every candle TF is its own base table written by the in-RAM aggregator. Matviews are never used. Reason: hot path is RAM-only (per `aws-budget.md` rule 12); matviews give zero benefit and create offset/lag traps.
 
 **Existing tables — delta:**
 - `ticks`: NO new columns (prev_close from Quote bytes 38-41 stored in `prev_close_audit`, not per-tick)
-- `candles_1m`/`_5m`/`_15m`/`_1h`/`_1d`: **ADD COLUMN `source SYMBOL`** (`live_aggregated` | `dhan_historical_overwrite` | `gap_fill_backfill`)
+- `candles_1m`/`_3m`/`_5m`/`_15m`/`_1h`/`_1d`: **ADD COLUMN `source SYMBOL`** (`live_aggregated` | `dhan_historical_overwrite` | `gap_fill_backfill`)
+- `candles_1h` uses **ALIGN TO CALENDAR WITH OFFSET '00:15'** so buckets match Dhan `/charts/intraday?interval=60` (09:15 IST market-open aligned). All other TFs use `'00:00'` IST midnight alignment.
 - All via idempotent `ALTER ADD COLUMN IF NOT EXISTS` at boot per schema self-heal pattern
 
 **15 NEW audit tables** (all with DEDUP UPSERT KEYS, created at boot if missing):
@@ -902,7 +907,29 @@ The 09:15 bar seals at 09:16:00.005 IST; cross-verify completes around 09:16:50 
 | `bar_correction_audit` | `(trading_date_ist, bar_ts, security_id, exchange_segment, field, source_of_correction)` |
 | `self_trade_audit` | `(trading_date_ist, security_id, exchange_segment, ts)` |
 
-**Mat views NOT in Phase 0:** `movers_1s`/`_1m`/`option_movers` stay KEPT but feature-flagged OFF.
+**Mat views removed entirely:** Wave-5 matviews `candles_1m/5m/15m/30m/1h/2h/3h/4h/1d` and `candles_1s` base table are **DROPPED** in Phase 0 boot. Replaced by 6 native base tables (1m/3m/5m/15m/1h/1d) written directly by the in-RAM aggregator. `movers_1s`/`_1m`/`option_movers` matviews stay DROPPED (no use case in Phase 0; reintroduce only when derivatives come back).
+
+**6-table column contract (identical schema for all 6 candle tables):**
+
+```
+segment              SYMBOL
+security_id          LONG
+open / high / low / close   DOUBLE
+volume               LONG
+oi                   LONG       -- always 0 for NSE_EQ in Phase 0 (no derivatives subscribed)
+tick_count           INT
+volume_cum_day_at_end        LONG
+prev_day_close               DOUBLE
+prev_day_oi                  LONG
+phase                SYMBOL
+close_pct_from_prev_day      DOUBLE     -- item 30 (Wave-5 naming kept)
+oi_pct_from_prev_day         DOUBLE     -- NULL in Phase 0
+volume_pct_from_prev_day     DOUBLE
+source               SYMBOL              -- live_aggregated | dhan_historical_overwrite | gap_fill_backfill
+ts                   TIMESTAMP    (designated, IST)
+```
+
+**DEDUP UPSERT KEYS (6 candle tables):** `(ts, security_id, segment)` — identical across all 6. **No `timeframe` column** because each TF lives in its own table; the table name IS the timeframe.
 
 **REST boot fetch time correction:** `PREV_CLOSE_BOOT_FETCH_AT_APP_BOOT = true` (~08:31 IST, post AWS instance start at 08:30 + 30-60s QuestDB readiness probe). Was incorrectly `06:30 IST` before — AWS instance not up at 06:30. Must complete by `PREV_CLOSE_FALLBACK_DEADLINE_IST = 09:14:55`.
 
@@ -912,52 +939,74 @@ The 09:15 bar seals at 09:16:00.005 IST; cross-verify completes around 09:16:50 
 
 ---
 
-### 30. Per-minute % change from prev_close stored in candle tables (operator-locked 2026-05-13)
+### 30. Per-minute % change from prev_close stored in candle tables (operator-locked 2026-05-13, REVISED late-evening to 6 TFs + Wave-5 column name)
 
-Every sealed bar (1m/5m/15m/1h/1d) gets `pct_from_prev_close` computed at seal time and stored as a new column. Strategy hot-path reads directly — zero math on every tick. Dashboard SQL is one column. Backtest reads identical-shape rows.
+Every sealed bar (1m/3m/5m/15m/1h/1d) gets `close_pct_from_prev_day` computed at seal time and stored as a column. Strategy hot-path reads it directly from RAM — zero math on every tick. Dashboard SQL is one column. Backtest reads identical-shape rows.
+
+**Column name:** `close_pct_from_prev_day` (Wave-5 §K-L12 naming, kept to avoid fragmenting the codebase). Sister columns `oi_pct_from_prev_day` and `volume_pct_from_prev_day` are present in the schema (NULL in Phase 0 — no derivatives, equity Quote packet has no OI).
 
 **Schema delta (ALTER ADD COLUMN IF NOT EXISTS, idempotent at boot):**
 
-| Table | New column |
+| Table | New columns |
 |---|---|
-| `candles_1m` | `pct_from_prev_close DOUBLE` |
-| `candles_5m` | `pct_from_prev_close DOUBLE` |
-| `candles_15m` | `pct_from_prev_close DOUBLE` |
-| `candles_1h` | `pct_from_prev_close DOUBLE` |
-| `candles_1d` | `pct_from_prev_close DOUBLE` |
+| `candles_1m` | `close_pct_from_prev_day DOUBLE`, `oi_pct_from_prev_day DOUBLE`, `volume_pct_from_prev_day DOUBLE` |
+| `candles_3m` | same |
+| `candles_5m` | same |
+| `candles_15m` | same |
+| `candles_1h` | same |
+| `candles_1d` | same |
 
-**DEDUP UPSERT KEYS unchanged** — `(security_id, exchange_segment, ts, timeframe)` already uniquely identifies each row. The `pct_from_prev_close` is a new attribute on the existing row, NOT a new identity dimension.
+**DEDUP UPSERT KEYS unchanged** — `(ts, security_id, segment)` already uniquely identifies each row in each table. The 3 pct fields are new attributes on the existing row, NOT new identity dimensions.
+
+**Prev-close source (two-source routing, Dhan Ticket #5525125 confirmed):**
+
+| Segment | Source of prev_close | Bytes |
+|---|---|---|
+| IDX_I (NIFTY, BANKNIFTY, SENSEX, INDIA VIX — 4 SIDs in Ticker mode) | Standalone PrevClose packet (code 6, 16 bytes) | `buf[8..12]` f32 LE — auto-fires once per session at subscribe |
+| NSE_EQ (218 F&O stocks in Quote mode) | `close` field of Quote packet (NOT today's running close — Dhan-mislabeled, actually previous session's close) | `buf[38..42]` f32 LE — read on first Quote tick, cache, ignore subsequent |
+
+**Boot-time cache loader** (PREVCLOSE-04 / Wave-5 §K-L13): `populate_prev_day_cache_at_boot` reads `previous_close` table from QuestDB (7-day lookback) so RAM cache is warm BEFORE first tick. Live packets overwrite stale cache within seconds of subscribe.
 
 **Computation:**
 
 ```
-pct_from_prev_close = (bar.close - prev_close_cache[(sid, segment)]) / prev_close * 100.0
+close_pct_from_prev_day = (bar.close - prev_close_cache[(sid, segment)]) / prev_close * 100.0
 ```
 
 | Trigger | Action |
 |---|---|
-| Bar seal (every 1m/5m/15m/1h/1d boundary) | Compute + UPSERT into candle row |
-| `prev_close_cache` miss for that SID | Skip field (NULL) + Telegram `PctFromPrevCloseSkipped` (Low — should be impossible after 09:14:55 cutoff) |
-| Cross-verify overwrite (item 28) corrects the bar's close | Re-compute pct using corrected close + same cached prev_close |
+| Bar seal (every 1m/3m/5m/15m/1h/1d boundary) | Compute + ILP write into candle row |
+| `prev_close_cache` miss for that SID | Write NULL + Telegram `PctFromPrevCloseSkipped` (Low — should be impossible after 09:14:55 cutoff) |
+| Cross-verify overwrite (item 28) corrects bar.close | Re-compute pct using corrected close + same cached prev_close |
 | Daily candle (`candles_1d`) | Self-referential — `prev_close = yesterday's candles_1d.close` lookup at session end |
-| `prev_close < 1e-9` (degenerate edge) | Skip + log Info — avoids div-by-zero |
+| `prev_close < 1e-9` (degenerate edge) | Write NULL + log Info — avoids div-by-zero |
 
 **Constants pinned:**
 - `PCT_FROM_PREV_CLOSE_DEGENERATE_THRESHOLD = 1e-9`
+- `CANDLE_TIMEFRAMES_LOCKED = ["1m", "3m", "5m", "15m", "1h", "1d"]` (6 entries — adding/removing fails build)
 
 **Ratchet tests (mandatory):**
-- `test_pct_from_prev_close_computed_at_bar_seal_for_1m`
-- `test_pct_from_prev_close_computed_for_all_5_timeframes`
+- `test_pct_computed_at_bar_seal_for_1m`
+- `test_pct_computed_for_all_6_timeframes`
 - `test_pct_recomputed_after_cross_verify_overwrite_item_28`
 - `test_pct_skipped_when_prev_close_below_degenerate_threshold`
 - `test_pct_skipped_when_prev_close_cache_miss`
-- `test_alter_add_pct_column_idempotent_on_boot`
+- `test_alter_add_pct_columns_idempotent_on_boot`
 - `test_candles_1d_pct_uses_yesterday_close_self_referential`
-- `test_candle_dedup_key_unchanged_security_segment_ts_timeframe`
+- `test_candle_dedup_key_is_ts_security_id_segment_no_timeframe_column`
+- `test_idx_i_prev_close_routes_through_code6_packet`
+- `test_nse_eq_prev_close_routes_through_quote_close_field_bytes_38_41`
+- `test_nse_eq_first_seen_only_writes_cache_once_per_day`
+- `test_india_vix_uses_idx_i_code6_routing`
+- `test_no_candles_1s_base_table_in_ddl`
+- `test_no_materialized_views_in_storage_crate` (greps for `CREATE MATERIALIZED VIEW` — must return zero hits)
+- `test_no_db_select_in_indicator_strategy_risk_hot_path` (banned-pattern category extension)
+- `test_exactly_six_candle_base_tables_exist`
+- `test_candle_1h_uses_0915_ist_offset_for_dhan_parity`
 
-**LoC: ~400 (5 ALTER + bar-seal computation × 5 timeframes + cross-verify recompute hook + daily-candle lookup + Telegram + 8 ratchets).**
+**LoC: ~480 (6 ALTER × 3 cols + bar-seal computation × 6 timeframes + cross-verify recompute hook + daily-candle lookup + Telegram + 17 ratchets + matview cleanup at boot).**
 
-**Total Friday + Saturday + Sunday build: ~5,820 LoC across 29 active items + 8 docs.**
+**Total Friday + Saturday + Sunday build: ~5,900 LoC across 29 active items + 8 docs.**
 
 ---
 
