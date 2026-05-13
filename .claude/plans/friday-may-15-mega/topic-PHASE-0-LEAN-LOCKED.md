@@ -184,7 +184,7 @@ The operator's strategy: **intraday option BUYING + Fibonacci + multiple indicat
 
 ---
 
-## The 5 hardening changes (bundled into Phase 0)
+## The 7 hardening changes (bundled into Phase 0)
 
 These came from the disconnect-storm analysis on 2026-05-13. They are universal — needed regardless of scope:
 
@@ -192,11 +192,48 @@ These came from the disconnect-storm analysis on 2026-05-13. They are universal 
 |---|---|---|
 | 1 | Activity watchdog tighter for IDX_I (15s) vs stocks (30s) | ~80 |
 | 2 | Subscribe-ACK verification (post-subscribe, require frame within 5s) | ~80 |
-| 3 | REST `/marketfeed/ltp` gap-fill module (during WS outage, 1/min) | ~200 |
+| 3 | **Disconnect gap-fill via `/v2/charts/intraday`** (seal-then-fetch, 5s buffer after bar boundary, DEDUP UPSERT into `candles_1m` + RAM bar cache, `gap_fill_audit` table, multi-minute support, market-close cutoff). **REPLACES original `/marketfeed/ltp` gap-fill — LTP has no per-minute OHLCV.** | ~450 |
 | 4 | Stagger initial conn 2s apart (no effect when only 1 conn, but safe) | ~10 |
 | 5 | Defer depth-20 connect until cohort selector has ≥50 SIDs (N/A in Phase 0 but ratchet retained) | ~50 |
+| 6 | **Disconnect-chain 7-layer observability** (5 Prom counters + 2 gauges + 2 audit tables + 5 typed Telegram variants + 6 ratchet tests + Grafana panels) | already counted in #3 |
+| 7 | **Seal-then-fetch scheduler invariants** (constants `GAP_FILL_POST_SEAL_BUFFER_SECS=5`, `GAP_FILL_FETCH_TIMEOUT_SECS=30`, `GAP_FILL_MAX_CONCURRENT_FETCHES=5`, `GAP_FILL_RETRY_ATTEMPTS=3`, `GAP_FILL_RETRY_BACKOFF_SECS=[2,5,10]` + ratchets) | already counted in #3 |
 
-**Total Friday build: ~620 LoC. Achievable in one focused day.**
+### Seal-then-fetch rule (mechanical invariant, 2026-05-13 lock)
+
+| Disconnect time | Bar to refill | Earliest legal fetch |
+|---|---|---|
+| 09:33:03 | 09:33 | 09:34:05 (bar_end + 5s buffer) |
+| 09:33:03 (3-min outage to 09:36:00) | 09:33, 09:34, 09:35 | each at `bar_end + 5s` |
+| Outage spans 15:29 → 15:31 | 15:29 bar only | 15:30:05 (do NOT fetch 15:30 — market closed mid-bar) |
+
+**Why 5s buffer:** Dhan ingestion lag + clock skew safety (±2s per BOOT-03) + round-trip overhead. Asking earlier = half-cooked bar = wrong data.
+
+### Why NOT `/marketfeed/ltp` (operator-rejected 2026-05-13)
+
+| Reason | Detail |
+|---|---|
+| No proper timestamp | LTP is "current price now" — no per-minute resolution |
+| Can't reconstruct OHLC | One snapshot ≠ open/high/low/close of a 1m bar |
+| Missing volume per bar | Only cumulative day volume |
+| Wrong tool for the job | LTP is for "what's the price now", not "what was the bar" |
+
+### `gap_fill_audit` table schema
+
+```sql
+CREATE TABLE IF NOT EXISTS gap_fill_audit (
+  ts TIMESTAMP,                 -- minute bar start (IST nanos)
+  trading_date_ist STRING,
+  bar_minute STRING,            -- "09:33"
+  trigger_event STRING,         -- ws_disconnect | manual | scheduler_catchup
+  sids_requested INT,
+  sids_completed INT,
+  sids_failed INT,
+  duration_ms LONG,
+  result STRING                 -- success | partial | failed
+) DEDUP UPSERT KEYS(trading_date_ist, bar_minute, trigger_event);
+```
+
+**Total Friday build: ~1,120 LoC. Achievable in one focused day.**
 
 ---
 
