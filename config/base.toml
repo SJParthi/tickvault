@@ -182,7 +182,12 @@ reconnect_initial_delay_ms = 500
 reconnect_max_delay_ms = 60000
 reconnect_max_attempts = 0
 subscription_batch_size = 100
-connection_stagger_ms = 10000
+# Phase 0 Item 6 (operator-locked 2026-05-13): reduced from 10000ms to 2000ms.
+# Under Phase 0 LEAN MVP (1 main-feed conn) the stagger is a no-op. Under
+# legacy / Wave 5 scopes (up to 5 conns) 2s × 4 staggers = 8s startup delay,
+# still safely under Dhan's burst-rate thresholds while shrinking boot
+# time from 40s to 8s. See `topic-PHASE-0-LEAN-LOCKED.md` §10.
+connection_stagger_ms = 2000
 
 [network]
 request_timeout_ms = 10000
