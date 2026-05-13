@@ -830,3 +830,13 @@ Operator decision after live disconnect storm 09:16-09:29 IST:
 - All other 35+ topic files in friday-may-15-mega/ are now Phase 2 reference material; LOCKED file is self-contained for Friday build
 - Canonical file: topic-PHASE-0-LEAN-LOCKED.md
 
+
+## 2026-05-13 (afternoon) — Disconnect gap-fill + dual-gate market-hours fix
+
+- REJECT `/marketfeed/ltp` for gap-fill (no per-minute OHLCV, no proper timestamp). REPLACE with `/v2/charts/intraday` seal-then-fetch (bar_end + 5s buffer, DEDUP UPSERT, multi-minute support, 15:30 cutoff).
+- 7-layer observability mandated for every disconnect/reconnect/resubscribe/backfill event: 5 Prom counters + 2 gauges + ws_reconnect_audit + gap_fill_audit + 5 typed Telegram variants + Grafana + 6 ratchet tests.
+- BUG locked: 15:29:59.586 skipped-tick — market-hours gate uses local `now()` instead of `tick.exchange_timestamp_ist`. The 500-600ms pipeline delay pushed local clock past 15:30:00 → tick rejected even though exchange_ts < 15:30.
+- FIX: dual-gate design. G1 (Exchange Gate) gates on `tick.exchange_timestamp_ist`, range `[09:15:00.000, 15:30:00.000)` exclusive on close. G2 (Wall-Clock Gate) keeps socket open + bar-seal pending until 15:31:00 IST (60s grace after market close). Final 15:29 bar seals at 15:31:00.
+- Banned-pattern hook category added: any `is_within_market_hours.*now\(\)` → REJECT at commit.
+- Phase 0 Friday build revised: ~1,330 LoC across 14 changes (was ~620 LoC across 8).
+- Post-15:30 cross-verify (live vs Dhan historical, zero tolerance) is unchanged — existing `historical-candles-cross-verify.md` rule continues to apply, runs at 15:31:05 IST after the final bar seals.

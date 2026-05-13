@@ -233,7 +233,44 @@ CREATE TABLE IF NOT EXISTS gap_fill_audit (
 ) DEDUP UPSERT KEYS(trading_date_ist, bar_minute, trigger_event);
 ```
 
-**Total Friday build: ~1,120 LoC. Achievable in one focused day.**
+### 8. Dual-gate market-hours fix (the 15:29:59.586 skipped-tick bug, operator-locked 2026-05-13)
+
+**Bug observed yesterday:** tick with `exchange_timestamp = 15:29:59.586` was REJECTED because local wall-clock had advanced to `15:30:00.100` by the time the gate evaluated. The 15:29 bar's true close was lost.
+
+**Root cause:** market-hours gate evaluates `is_within_market_hours_ist(now())` — checks LOCAL clock instead of the tick's stamped time.
+
+**Fix — two timestamps, two gates:**
+
+| Gate | Source | Boundary | Purpose |
+|---|---|---|---|
+| **G1 Exchange Gate** (the truth) | `tick.exchange_timestamp_ist` | `[09:15:00.000, 15:30:00.000)` exclusive on close | Decides if tick belongs to session |
+| **G2 Wall-Clock Gate** (wait window) | local `now_ist()` | open until **15:31:00 IST** (60s grace) | Decides when to close socket / seal final bar |
+
+**Constants pinned:**
+- `MARKET_OPEN_IST_NANOS = 09:15:00.000_000_000`
+- `MARKET_CLOSE_IST_NANOS = 15:30:00.000_000_000` (exclusive)
+- `WS_GRACE_AFTER_CLOSE_SECS = 60`
+- `BAR_FINAL_SEAL_OFFSET_SECS = 60` (15:29 bar seals at 15:31:00)
+- `LATE_TICK_ANOMALY_THRESHOLD_MS = 30_000`
+
+**Why 60s grace, not 5s:** Dhan ingestion + network at close-of-day spike can delay last ticks up to ~45s. 60s safely covers; matches T+1-minute industry trade-reporting tail.
+
+**Banned-pattern hook addition:** scanner rejects any `is_within_market_hours.*now\(\)` — must use `tick.exchange_timestamp_ist`.
+
+**Ratchet tests (mandatory):**
+- `test_tick_with_exchange_ts_15_29_59_586_accepted_even_if_local_recv_15_30_00_100`
+- `test_tick_with_exchange_ts_15_30_00_000_rejected`
+- `test_ws_socket_stays_open_until_15_31_00`
+- `test_final_bar_seals_at_15_31_00_not_15_30_00`
+- `test_market_gate_does_not_call_local_now` (source-scan)
+
+**New Telegram event:** `LastTickAfterBoundary` (Info) fires if any tick arrives with `exchange_ts ≥ 15:30:00.000` — should be zero; informational only.
+
+**New audit table:** `last_tick_audit` — per-SID last-tick exchange_ts at each minute seal, for forensic queries.
+
+**LoC: ~210 across 8 files.**
+
+**Total Friday build: ~1,330 LoC. Still achievable in one focused day.**
 
 ---
 
