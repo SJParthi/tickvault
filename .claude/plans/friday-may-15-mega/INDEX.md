@@ -9,6 +9,7 @@
 
 **CANONICAL REFERENCE FILES (read in order):**
 1. **`topic-PHASE-0-LEAN-LOCKED.md`** — **🔒 LOCKED PHASE 0 PLAN** (operator decision 2026-05-13 ~10:30 IST) — supersedes everything below for Friday build scope
+2. **`topic-PHASE-1-RESILIENCE-LOCKED.md`** — **🔒 LOCKED PHASE 1 PLAN** — honest envelope, Z+ 7-layer per disconnect class, 5 hardening changes, mechanical ratchets
 2. `.claude/rules/project/operator-charter-forever.md` — **FOREVER CHARTER** (auto-loaded every session, permanent contract)
 3. `.claude/plans/friday-may-15-mega/00-HIGH-LEVEL-PLAN.md` — 5-minute readable summary of pre-lean discussions
 4. `.claude/plans/friday-may-15-mega/step-1-honest-envelope.md` — Mon eve honest envelope (canonical reference for tickvault-specific envelope)
