@@ -871,7 +871,99 @@ The 09:15 bar seals at 09:16:00.005 IST; cross-verify completes around 09:16:50 
 
 **LoC: ~200 across 3 files.**
 
-**Total Friday + Saturday + Sunday build (FINAL FINAL FINAL): ~5,170 LoC across 27 active items + 8 docs.**
+**Total Friday + Saturday + Sunday build: ~5,170 LoC across 27 active items + 8 docs.**
+
+---
+
+### 29. QuestDB schema changes (operator-locked 2026-05-13)
+
+**Existing tables — delta:**
+- `ticks`: NO new columns (prev_close from Quote bytes 38-41 stored in `prev_close_audit`, not per-tick)
+- `candles_1m`/`_5m`/`_15m`/`_1h`/`_1d`: **ADD COLUMN `source SYMBOL`** (`live_aggregated` | `dhan_historical_overwrite` | `gap_fill_backfill`)
+- All via idempotent `ALTER ADD COLUMN IF NOT EXISTS` at boot per schema self-heal pattern
+
+**15 NEW audit tables** (all with DEDUP UPSERT KEYS, created at boot if missing):
+
+| Table | DEDUP KEYS |
+|---|---|
+| `gap_fill_audit` | `(trading_date_ist, bar_minute, trigger_event)` |
+| `last_tick_audit` | `(trading_date_ist, security_id, exchange_segment, bar_minute)` |
+| `open_price_audit` | `(trading_date_ist, security_id, exchange_segment)` |
+| `prev_close_audit` (with `source` col) | `(trading_date_ist, security_id, exchange_segment)` |
+| `auth_renewal_audit` | `(trading_date_ist, renewal_ts)` |
+| `live_instance_lock` | `(client_id)` |
+| `orphan_position_audit` | `(trading_date_ist, security_id, exchange_segment)` |
+| `sl_replacement_audit` | `(trading_date_ist, original_order_id)` |
+| `external_order_audit` | `(ts, exchange_order_id)` |
+| `order_update_ws_audit` | `(ts, event)` |
+| `pnl_audit` | `(trading_date_ist, mode)` |
+| `signal_audit` | `(ts, security_id, strategy_id)` |
+| `decision_audit` | `(ts, security_id, strategy_id, no_signal_reason)` |
+| `bar_correction_audit` | `(trading_date_ist, bar_ts, security_id, exchange_segment, field, source_of_correction)` |
+| `self_trade_audit` | `(trading_date_ist, security_id, exchange_segment, ts)` |
+
+**Mat views NOT in Phase 0:** `movers_1s`/`_1m`/`option_movers` stay KEPT but feature-flagged OFF.
+
+**REST boot fetch time correction:** `PREV_CLOSE_BOOT_FETCH_AT_APP_BOOT = true` (~08:31 IST, post AWS instance start at 08:30 + 30-60s QuestDB readiness probe). Was incorrectly `06:30 IST` before — AWS instance not up at 06:30. Must complete by `PREV_CLOSE_FALLBACK_DEADLINE_IST = 09:14:55`.
+
+**LoC: ~250** (DDL + 15 schema ratchet tests).
+
+**Total build (after item 29): ~5,420 LoC across 28 active items + 8 docs.**
+
+---
+
+## Phase 0 progress checkboxes (operator-locked checkbox defense protocol 2026-05-13)
+
+**Mandatory rule:** Every Claude Code session MUST check these boxes at session start. Only mark `- [x]` when ALL 4 criteria met: (1) code merged, (2) ratchet tests green in CI, (3) 7-layer observability wired, (4) PR closed.
+
+- [ ] **Item 1** — Subscription planner mode mix (IDX_I Ticker + NSE_EQ Quote)
+- [ ] **Item 2** — Connection pool: 1 main-feed WS conn (others dormant)
+- [ ] **Item 3** — Config feature flags (depth-20/200/greeks/movers/Phase 2 dispatcher all `false`)
+- [ ] **Item 4** — Watchdog timings: IDX_I 3s / NSE_EQ 10s / VIX 30s / Subscribe-ACK 2s / first reconnect 0ms
+- [ ] **Item 5** — SubscribeRxGuard preservation (existing, verify wired)
+- [ ] **Item 6** — Stagger init conns 2s
+- [ ] **Item 7** — Defer depth-20 connect (ratchet retained for Phase 2)
+- [ ] **Item 8** — Gap-fill scheduler `/charts/intraday` seal-then-fetch (bar_end + 5s buffer)
+- [ ] **Item 9** — Gap-fill DEDUP UPSERT into candles_1m + RAM bar cache + `gap_fill_audit`
+- [ ] **Item 10** — Disconnect-chain 7-layer observability (5 counters + 2 gauges + 2 audit + 5 Telegram + ratchets)
+- [ ] **Item 11** — Dual-gate market-hours fix (G1 exchange_ts + G2 wall-clock 60s grace)
+- [ ] **Item 12** — `last_tick_audit` + `LastTickAfterBoundary` Telegram + banned-pattern hook
+- [ ] **Item 13** — Pre-open buffer → 09:15 candle.open wiring (IDX_I + NSE_EQ)
+- [ ] **Item 14** — REST `/marketfeed/quote.day_open` fallback at 09:14:55 IST
+- [ ] **Item 15** — 09:16:05 IST cross-check vs Dhan `/charts/intraday` 09:15 bar
+- [ ] **Item 16** — `open_price_audit` + 3 Telegram variants + 8 ratchets
+- [ ] **Item 17** — SEBI 24h JWT daily renewal observability + `auth_renewal_audit`
+- [ ] **Item 18** — Static IP boot check (`ordersAllowed=true`)
+- [ ] **Item 19** — Dual-instance lock (RESILIENCE-01) via `live_instance_lock` table
+- [ ] **Item 20** — Orphan position 15:25 IST watchdog
+- [ ] **Item 21** — NaN / div-by-zero indicator guards
+- [ ] **Item 22a** — Order placement 5s REST timeout + DH-904 retry policy
+- [ ] **Item 22b** — Stop-loss-leg-cancelled auto-replace + `sl_replacement_audit`
+- [ ] **Item 22c** — Boot-success Telegram positive ping at 09:14:55 IST
+- [ ] **Item 22d** — End-of-day Telegram digest at 15:31:30 IST
+- [ ] **Item 22e** — Tick-level integrity guards (price/oi/high≥low)
+- [ ] **Item 22f** — Self-trade prevention 60s cooldown + `self_trade_audit`
+- [ ] ~~Item 22~~ — GIFT NIFTY (PARKED for Phase 2, do NOT implement)
+- [ ] **Item 23** — Prev-close mode mix + REST boot fetch + `PrevCloseMissingAtMarketOpen` + banned-pattern hook
+- [ ] **Item 24** — Order Update WS 7-layer observability + `order_update_ws_audit` + Source filter
+- [ ] **Item 25** — P&L tracker scaffolding (dry-run hypothetical) + `pnl_audit`
+- [ ] **Item 26** — `signal_audit` + `decision_audit` tables (sampled)
+- [ ] **Item 27a** — `docs/phases/phase-0-readme.md`
+- [ ] **Item 27b** — `docs/runbooks/aws-deployment.md`
+- [ ] **Item 27c** — `docs/runbooks/operator-daily-startup.md`
+- [ ] **Item 27d** — `docs/runbooks/troubleshooting.md`
+- [ ] **Item 27e** — `docs/runbooks/kill-switch.md`
+- [ ] **Item 27f** — `docs/runbooks/backtest-runner.md`
+- [ ] **Item 27g** — `docs/runbooks/phase-1-monitoring-rubric.md`
+- [ ] **Item 27h** — `.claude/rules/project/phase-0-architecture.md`
+- [ ] **Item 28** — Cross-verify mismatch DEDUP UPSERT overwrite + 09:15 strategy gate + `bar_correction_audit`
+- [ ] **Item 29** — QuestDB schema changes (candles source column + 15 new audit tables + 15 schema ratchets)
+
+**Total active items to check off: 36 boxes (28 active items, of which 27 = items 1-21,23-28; item 22 PARKED; item 27 has 8 sub-doc boxes; item 29 added).**
+
+**Session-start protocol:** new `.claude/hooks/phase-0-progress-check.sh` runs at every Claude Code session start; parses this section; prints `Phase 0 progress: N/36 complete` + next pending item.
+
+**Pre-push gate:** `bash .claude/hooks/plan-verify.sh` rejects any push that has unchecked `- [ ]` items remaining IF the PR description claims "Phase 0 complete".
 
 ---
 
