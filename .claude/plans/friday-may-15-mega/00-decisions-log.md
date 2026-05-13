@@ -1034,3 +1034,16 @@ Operator decision after live disconnect storm 09:16-09:29 IST:
 - 3-day build window unchanged
 - 222 SIDs, mixed-mode (IDX_I=Ticker, NSE_EQ=Quote)
 - AWS t3.medium 08:30-17:30 IST Mon-Fri ~rupees-1,252/mo
+
+## 2026-05-13 09:02 IST — DEDUP key contract doc
+
+### topic-dedup-key-contract-tick-vs-candle.md ADDED
+- Pins tick vs candle dedup-key composition with explanations
+- 28 worst-case scenarios documented (14 tick + 14 candle):
+  - Burst quotes, cross-segment SID collisions, replay, disconnect/reconnect
+  - Clock skew, zero-sequence, u32 wrap, midnight cross, future ts
+  - Late ticks, boundary catch-up, dual-instance, schema drift
+  - First-listing day, DST, time-zone bug, cross-verify overwrite, pct recompute
+- Mechanical ratchets named (7 tests including item 30's no-op guarantee)
+- Auto-driver explanation + cross-refs to security-id-uniqueness.md, wave-2/6 error codes
+- Locks item 30's "no DEDUP change" promise as a build-failing test
