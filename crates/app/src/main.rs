@@ -1692,7 +1692,15 @@ async fn main() -> Result<()> {
         }
 
         // --- Background: Greeks pipeline (option chain fetch → compute → persist) ---
-        if config.greeks.enabled {
+        //
+        // Phase 0 Item 3 (operator-locked 2026-05-13): under `IndicesUnderlyingsOnly`
+        // the greeks pipeline is PARKED — option-buying strategy computes
+        // indicators on underlying spot ticks; streaming Delta/Theta/Vega
+        // is Phase 2 territory.
+        if tickvault_app::phase2_recovery::should_spawn_greeks_pipeline(
+            config.subscription.scope,
+            config.greeks.enabled,
+        ) {
             let greeks_token = token_handle.clone();
             let greeks_client_id = client_id.clone();
             let greeks_base_url = config.dhan.rest_api_base_url.clone();
@@ -3314,7 +3322,16 @@ async fn main() -> Result<()> {
         // the unified pipeline_v2 path replaces BOTH the Wave 5 orchestrator
         // block below AND the single-side static depth-20 spawn block at
         // line ~4118. Default: false (Wave 5 path active for safe rollback).
-        let pipeline_v2_active = config.features.depth_dynamic_pipeline_v2;
+        //
+        // Phase 0 Item 3 (operator-locked 2026-05-13): `should_spawn_depth_dynamic_pipeline`
+        // returns FALSE under `SubscriptionScope::IndicesUnderlyingsOnly`
+        // regardless of the feature flag — Phase 0 LEAN MVP parks depth
+        // feeds entirely (option-buying strategy uses underlying ticks only).
+        let pipeline_v2_active =
+            tickvault_app::phase2_recovery::should_spawn_depth_dynamic_pipeline(
+                config.subscription.scope,
+                config.features.depth_dynamic_pipeline_v2,
+            );
         if pipeline_v2_active {
             tracing::info!(
                 "PR-C2 cutover: depth_dynamic_pipeline_v2 feature ON — \
@@ -4903,21 +4920,41 @@ async fn main() -> Result<()> {
                     /// = 1`, so the expected denominator must match the
                     /// effective pool size — otherwise `ws_health = 8/12 =
                     /// 0.667` → `SLO-02 Critical` Telegram every 10s during
-                    /// market hours (pager fatigue). Depth-20 + depth-200
-                    /// gating to 0 under Phase 0 is wired in PR-3 (Item 3
-                    /// feature flags); until then this denominator reads
-                    /// `effective_main + 4 + 2 + 1 = 8` under Phase 0.
-                    const SLO_WS_EXPECTED_DEPTH_20: f64 = 4.0;
-                    const SLO_WS_EXPECTED_DEPTH_200: f64 = 2.0;
+                    /// market hours (pager fatigue).
+                    ///
+                    /// Phase 0 Item 3 (operator-locked 2026-05-13): depth-20
+                    /// + depth-200 expected components ALSO scope-aware via
+                    /// `should_spawn_depth_dynamic_pipeline`. Under
+                    /// `IndicesUnderlyingsOnly` the depth pipeline is parked
+                    /// → expected count is 0, matching the actual 0 active.
+                    /// Phase 0 denominator: `1 + 0 + 0 + 1 = 2` (matches
+                    /// active when main + OMS up → `ws_health = 1.0`).
+                    const SLO_WS_EXPECTED_DEPTH_20_DEFAULT: f64 = 4.0;
+                    const SLO_WS_EXPECTED_DEPTH_200_DEFAULT: f64 = 2.0;
                     const SLO_WS_EXPECTED_ORDER_UPDATE: f64 = 1.0;
                     let slo_ws_expected_main_feed: f64 =
                         tickvault_common::config::effective_main_feed_pool_size(
                             config.subscription.scope,
                             config.dhan.max_websocket_connections,
                         ) as f64;
+                    let depth_pipeline_enabled =
+                        tickvault_app::phase2_recovery::should_spawn_depth_dynamic_pipeline(
+                            config.subscription.scope,
+                            config.features.depth_dynamic_pipeline_v2,
+                        );
+                    let slo_ws_expected_depth_20: f64 = if depth_pipeline_enabled {
+                        SLO_WS_EXPECTED_DEPTH_20_DEFAULT
+                    } else {
+                        0.0
+                    };
+                    let slo_ws_expected_depth_200: f64 = if depth_pipeline_enabled {
+                        SLO_WS_EXPECTED_DEPTH_200_DEFAULT
+                    } else {
+                        0.0
+                    };
                     let slo_ws_expected_total: f64 = slo_ws_expected_main_feed
-                        + SLO_WS_EXPECTED_DEPTH_20
-                        + SLO_WS_EXPECTED_DEPTH_200
+                        + slo_ws_expected_depth_20
+                        + slo_ws_expected_depth_200
                         + SLO_WS_EXPECTED_ORDER_UPDATE;
 
                     /// Tick-freshness threshold during market hours: a tick
