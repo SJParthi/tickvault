@@ -241,8 +241,66 @@ pub fn select_stock_expiry_with_rollover(
 #[must_use]
 pub const fn should_subscribe_stock_derivatives(config: &SubscriptionConfig) -> bool {
     match config.scope {
+        // Wave 5 default — stock F&O dropped to free capacity for index full chain.
         SubscriptionScope::IndicesOnlyAllExpiries => false,
+        // Phase 0 LEAN MVP — derivatives parked, only IDX_I + NSE_EQ subscribed.
+        SubscriptionScope::IndicesUnderlyingsOnly => false,
         SubscriptionScope::FullUniverse => config.subscribe_stock_derivatives,
+    }
+}
+
+/// Phase 0 Item 1 — gate on whether to emit index F&O derivatives.
+///
+/// Under `IndicesUnderlyingsOnly` (Phase 0 LEAN MVP), index derivatives are
+/// PARKED — only the 4 IDX_I price feeds + ~218 NSE_EQ underlyings are
+/// subscribed. Under the Wave 5 / legacy scopes, falls through to the
+/// existing `subscribe_index_derivatives` boolean.
+///
+/// Pure function; tested by
+/// `test_indices_underlyings_only_scope_skips_index_derivatives`.
+#[inline]
+#[must_use]
+pub const fn should_subscribe_index_derivatives(config: &SubscriptionConfig) -> bool {
+    match config.scope {
+        SubscriptionScope::IndicesUnderlyingsOnly => false,
+        SubscriptionScope::IndicesOnlyAllExpiries | SubscriptionScope::FullUniverse => {
+            config.subscribe_index_derivatives
+        }
+    }
+}
+
+/// Phase 0 Item 1 — gate on whether a given display-index is allowed.
+///
+/// Under `IndicesUnderlyingsOnly` (Phase 0 LEAN MVP), the display-index
+/// section is filtered to INDIA VIX ONLY — sectoral / broad-market indices
+/// are PARKED. INDIA VIX stays in because the operator's option-buying
+/// strategy uses VIX as a volatility-regime filter on entry
+/// (`topic-PHASE-0-LEAN-LOCKED.md` line 131). Under the Wave 5 / legacy
+/// scopes, falls through to the existing `subscribe_display_indices`
+/// boolean (all display indices in or none).
+///
+/// **Hostile-review HIGH H2 fix (2026-05-13):** gates by stable Dhan
+/// `SecurityId` (`INDIA_VIX_SECURITY_ID = 21`), NOT the display name.
+/// Filtering on `"INDIA VIX"` string literal was brittle against Dhan
+/// CSV name drift (case / whitespace / minor spelling changes); the
+/// numeric SID is the contract Dhan supports for legacy compatibility
+/// and is cross-checked at compile time in `constants.rs`.
+///
+/// Pure `const fn`; tested by
+/// `test_is_display_index_allowed_under_scope_keeps_only_india_vix`.
+#[inline]
+#[must_use]
+pub const fn is_display_index_allowed_under_scope(
+    config: &SubscriptionConfig,
+    security_id: u32,
+) -> bool {
+    match config.scope {
+        SubscriptionScope::IndicesUnderlyingsOnly => {
+            security_id == tickvault_common::constants::INDIA_VIX_SECURITY_ID
+        }
+        SubscriptionScope::IndicesOnlyAllExpiries | SubscriptionScope::FullUniverse => {
+            config.subscribe_display_indices
+        }
     }
 }
 
@@ -292,18 +350,21 @@ pub fn build_subscription_plan(
 
     // -----------------------------------------------------------------------
     // 2. Display indices (IDX_I) — 23 symbols
+    //
+    // Phase 0 Item 1 (2026-05-13): under `IndicesUnderlyingsOnly` scope this
+    // loop is filtered to INDIA VIX only via `is_display_index_allowed_under_scope`.
+    // The other 22 sectoral/broad-market indices are PARKED until Phase 2.
     // -----------------------------------------------------------------------
-    if config.subscribe_display_indices {
-        for index in &universe.subscribed_indices {
-            if index.category == IndexCategory::DisplayIndex
-                && seen_ids.insert((index.security_id, ExchangeSegment::IdxI))
-            {
-                instruments.push(make_display_index_instrument(
-                    index.security_id,
-                    &index.symbol,
-                    feed_mode,
-                ));
-            }
+    for index in &universe.subscribed_indices {
+        if index.category == IndexCategory::DisplayIndex
+            && is_display_index_allowed_under_scope(config, index.security_id)
+            && seen_ids.insert((index.security_id, ExchangeSegment::IdxI))
+        {
+            instruments.push(make_display_index_instrument(
+                index.security_id,
+                &index.symbol,
+                feed_mode,
+            ));
         }
     }
 
@@ -327,8 +388,12 @@ pub fn build_subscription_plan(
     // Per ratchet `test_index_expiry_never_rolls_via_planner`, index
     // strategies legitimately trade expiry-day, so every future expiry
     // (including today) stays in.
+    //
+    // Phase 0 Item 1 (2026-05-13): `should_subscribe_index_derivatives` returns
+    // FALSE under the `IndicesUnderlyingsOnly` scope — the entire index F&O
+    // chain (~10K contracts) is PARKED until Phase 2.
     // -----------------------------------------------------------------------
-    if config.subscribe_index_derivatives {
+    if should_subscribe_index_derivatives(config) {
         // Single pass: subscribe every NIFTY/BANKNIFTY/SENSEX derivative
         // whose expiry is today or future. No nearest-expiry filter.
         for contract in universe.derivative_contracts.values() {
@@ -773,20 +838,20 @@ pub fn build_subscription_plan_from_archived(
 
     // -----------------------------------------------------------------------
     // 2. Display indices (IDX_I)
+    //
+    // Phase 0 Item 1 (archived path mirror): filtered to INDIA VIX only
+    // under `IndicesUnderlyingsOnly` scope via
+    // `is_display_index_allowed_under_scope`.
     // -----------------------------------------------------------------------
-    if config.subscribe_display_indices {
-        for index in universe.subscribed_indices.iter() {
-            let cat = IndexCategory::from(&index.category);
-            let sec_id = index.security_id.to_native();
-            if cat == IndexCategory::DisplayIndex
-                && seen_ids.insert((sec_id, ExchangeSegment::IdxI))
-            {
-                instruments.push(make_display_index_instrument(
-                    sec_id,
-                    index.symbol.as_str(),
-                    feed_mode,
-                ));
-            }
+    for index in universe.subscribed_indices.iter() {
+        let cat = IndexCategory::from(&index.category);
+        let sec_id = index.security_id.to_native();
+        let symbol = index.symbol.as_str();
+        if cat == IndexCategory::DisplayIndex
+            && is_display_index_allowed_under_scope(config, sec_id)
+            && seen_ids.insert((sec_id, ExchangeSegment::IdxI))
+        {
+            instruments.push(make_display_index_instrument(sec_id, symbol, feed_mode));
         }
     }
 
@@ -796,8 +861,12 @@ pub fn build_subscription_plan_from_archived(
     // 2026-04-25: Mirror of live planner change. See sibling
     // `build_subscription_plan` Section 3 for rationale (current-expiry filter
     // for FULL_CHAIN_INDEX_SYMBOLS to fit 25K WS capacity).
+    //
+    // Phase 0 Item 1 (archived path mirror): `should_subscribe_index_derivatives`
+    // returns FALSE under `IndicesUnderlyingsOnly` — entire index F&O block
+    // skipped.
     // -----------------------------------------------------------------------
-    if config.subscribe_index_derivatives {
+    if should_subscribe_index_derivatives(config) {
         // Pre-pass: nearest expiry per full-chain index.
         let mut index_nearest_expiry: HashMap<&str, NaiveDate> =
             HashMap::with_capacity(FULL_CHAIN_INDEX_SYMBOLS.len());
@@ -1279,6 +1348,53 @@ mod tests {
             },
         );
 
+        // --- BANKNIFTY (major index — minimal fixture for Phase 0 ratchets) ---
+        // Hostile-review M1 fix (2026-05-13): BANKNIFTY + SENSEX must be present
+        // in the test universe so the Phase 0 planner ratchets actually detect
+        // a regression that drops them from Section 1.
+        underlyings.insert(
+            "BANKNIFTY".to_string(),
+            FnoUnderlying {
+                underlying_symbol: "BANKNIFTY".to_string(),
+                underlying_security_id: 26009,
+                price_feed_security_id: 25,
+                price_feed_segment: ExchangeSegment::IdxI,
+                derivative_segment: ExchangeSegment::NseFno,
+                kind: UnderlyingKind::NseIndex,
+                lot_size: 15,
+                contract_count: 0,
+            },
+        );
+        expiry_calendars.insert(
+            "BANKNIFTY".to_string(),
+            ExpiryCalendar {
+                underlying_symbol: "BANKNIFTY".to_string(),
+                expiry_dates: vec![expiry],
+            },
+        );
+
+        // --- SENSEX (BSE major index — minimal fixture for Phase 0 ratchets) ---
+        underlyings.insert(
+            "SENSEX".to_string(),
+            FnoUnderlying {
+                underlying_symbol: "SENSEX".to_string(),
+                underlying_security_id: 26010,
+                price_feed_security_id: 51,
+                price_feed_segment: ExchangeSegment::IdxI,
+                derivative_segment: ExchangeSegment::BseFno,
+                kind: UnderlyingKind::BseIndex,
+                lot_size: 10,
+                contract_count: 0,
+            },
+        );
+        expiry_calendars.insert(
+            "SENSEX".to_string(),
+            ExpiryCalendar {
+                underlying_symbol: "SENSEX".to_string(),
+                expiry_dates: vec![expiry],
+            },
+        );
+
         // --- RELIANCE (stock) ---
         underlyings.insert(
             "RELIANCE".to_string(),
@@ -1441,9 +1557,11 @@ mod tests {
             None,
         );
 
-        // NIFTY is a major index → its IDX_I feed + ALL derivatives subscribed
-        assert_eq!(plan.summary.major_index_values, 1); // NIFTY (only 1 of the 5 is in test universe)
-        assert!(plan.summary.index_derivatives > 0); // NIFTY futures + options
+        // Phase 0 Item 1 fixture expansion (2026-05-13): NIFTY + BANKNIFTY +
+        // SENSEX all live in the test universe so the Phase 0 lower-bound
+        // ratchet detects regressions that drop any of the 3 majors.
+        assert_eq!(plan.summary.major_index_values, 3); // NIFTY + BANKNIFTY + SENSEX
+        assert!(plan.summary.index_derivatives > 0); // NIFTY futures + options (only NIFTY has them)
 
         // INDIA VIX is a display index
         assert_eq!(plan.summary.display_indices, 1);
@@ -1571,7 +1689,8 @@ mod tests {
         );
 
         assert_eq!(plan.summary.index_derivatives, 0);
-        assert_eq!(plan.summary.major_index_values, 1); // Index value feed still subscribed
+        // Phase 0 Item 1 (2026-05-13): fixture now contains NIFTY + BANKNIFTY + SENSEX.
+        assert_eq!(plan.summary.major_index_values, 3); // All 3 IDX_I value feeds still subscribed
     }
 
     #[test]
@@ -1805,8 +1924,10 @@ mod tests {
         );
         let grouped = plan.registry.by_exchange_segment();
 
-        // IDX_I: NIFTY value (13) + INDIA VIX (21) = 2
-        assert_eq!(grouped.get(&ExchangeSegment::IdxI).unwrap().len(), 2);
+        // Phase 0 Item 1 (2026-05-13): fixture now includes BANKNIFTY (25) +
+        // SENSEX (51). IDX_I total = NIFTY (13) + BANKNIFTY (25) + SENSEX (51)
+        // + INDIA VIX (21) = 4.
+        assert_eq!(grouped.get(&ExchangeSegment::IdxI).unwrap().len(), 4);
 
         // NSE_EQ: RELIANCE (2885) = 1
         assert_eq!(grouped.get(&ExchangeSegment::NseEquity).unwrap().len(), 1);
@@ -4615,6 +4736,299 @@ mod tests {
         assert!(
             stock_fno_count_full > 0,
             "FullUniverse scope must restore stock F&O subscription path"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Phase 0 Item 1 — IndicesUnderlyingsOnly scope (operator-locked 2026-05-13)
+    //
+    // Contract: under `IndicesUnderlyingsOnly` the planner emits ONLY
+    //   - NIFTY / BANKNIFTY / SENSEX IDX_I value feeds (Ticker)
+    //   - INDIA VIX IDX_I display-index feed (Ticker)
+    //   - NSE_EQ cash-equity feeds for the F&O underlying stocks (Quote)
+    // and PARKS index derivatives + stock derivatives + sectoral/broad-market
+    // display indices. Target ~222 SIDs.
+    // ----------------------------------------------------------------------
+
+    fn phase_0_config() -> SubscriptionConfig {
+        SubscriptionConfig {
+            scope: SubscriptionScope::IndicesUnderlyingsOnly,
+            ..SubscriptionConfig::default()
+        }
+    }
+
+    #[test]
+    fn test_should_subscribe_index_derivatives_false_under_phase_0_scope() {
+        let cfg = phase_0_config();
+        assert!(
+            !should_subscribe_index_derivatives(&cfg),
+            "Phase 0 scope must skip index derivatives regardless of \
+             subscribe_index_derivatives flag"
+        );
+        // Sanity: other scopes still honour the flag.
+        let legacy = legacy_full_universe_config();
+        assert_eq!(
+            should_subscribe_index_derivatives(&legacy),
+            legacy.subscribe_index_derivatives
+        );
+    }
+
+    #[test]
+    fn test_indices_underlyings_only_scope_skips_stock_derivatives() {
+        let cfg = phase_0_config();
+        assert!(
+            !should_subscribe_stock_derivatives(&cfg),
+            "Phase 0 scope must skip stock derivatives"
+        );
+    }
+
+    #[test]
+    fn test_is_display_index_allowed_under_scope_keeps_only_india_vix() {
+        let cfg = phase_0_config();
+        let vix_sid = tickvault_common::constants::INDIA_VIX_SECURITY_ID;
+        // INDIA VIX (SID 21) — allowed under Phase 0.
+        assert!(is_display_index_allowed_under_scope(&cfg, vix_sid));
+        // Other display indices (sectoral / broad-market) — PARKED.
+        assert!(!is_display_index_allowed_under_scope(&cfg, 17)); // NIFTY 100
+        assert!(!is_display_index_allowed_under_scope(&cfg, 19)); // NIFTY 500
+        assert!(!is_display_index_allowed_under_scope(&cfg, 14)); // NIFTY AUTO
+        assert!(!is_display_index_allowed_under_scope(&cfg, 0));
+        // Sanity: under Wave 5 / legacy scope, falls through to flag.
+        let mut legacy = legacy_full_universe_config();
+        legacy.subscribe_display_indices = true;
+        assert!(is_display_index_allowed_under_scope(&legacy, vix_sid));
+        assert!(is_display_index_allowed_under_scope(&legacy, 17));
+        legacy.subscribe_display_indices = false;
+        assert!(!is_display_index_allowed_under_scope(&legacy, vix_sid));
+    }
+
+    #[test]
+    fn test_indices_underlyings_only_planner_emits_zero_derivatives() {
+        let universe = make_test_universe();
+        let cfg = phase_0_config();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(
+            &universe,
+            &cfg,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
+
+        assert_eq!(
+            plan.summary.index_derivatives, 0,
+            "Phase 0 plan must contain ZERO index derivatives"
+        );
+        assert_eq!(
+            plan.summary.stock_derivatives, 0,
+            "Phase 0 plan must contain ZERO stock derivatives"
+        );
+        for inst in plan.registry.iter() {
+            assert!(
+                !matches!(
+                    inst.instrument_kind,
+                    Some(DhanInstrumentKind::OptionStock)
+                        | Some(DhanInstrumentKind::FutureStock)
+                        | Some(DhanInstrumentKind::OptionIndex)
+                        | Some(DhanInstrumentKind::FutureIndex)
+                ),
+                "derivative leaked into Phase 0 plan: {} {:?}",
+                inst.display_label,
+                inst.instrument_kind,
+            );
+        }
+    }
+
+    #[test]
+    fn test_indices_underlyings_only_planner_nse_eq_uses_quote_mode() {
+        let universe = make_test_universe();
+        let cfg = phase_0_config();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(
+            &universe,
+            &cfg,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
+
+        let nse_eq: Vec<_> = plan
+            .registry
+            .iter()
+            .filter(|i| i.exchange_segment == ExchangeSegment::NseEquity)
+            .collect();
+        assert!(
+            !nse_eq.is_empty(),
+            "Phase 0 plan must include at least one NSE_EQ cash feed"
+        );
+        for inst in &nse_eq {
+            assert_eq!(
+                inst.feed_mode,
+                FeedMode::Quote,
+                "NSE_EQ {} must subscribe in Quote mode (prev_close in bytes 38-41)",
+                inst.display_label,
+            );
+        }
+    }
+
+    #[test]
+    fn test_indices_underlyings_only_planner_filters_display_to_vix_only() {
+        let universe = make_test_universe();
+        let cfg = phase_0_config();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(
+            &universe,
+            &cfg,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
+
+        let display: Vec<_> = plan
+            .registry
+            .iter()
+            .filter(|i| i.category == SubscriptionCategory::DisplayIndex)
+            .collect();
+        assert_eq!(
+            display.len(),
+            1,
+            "Phase 0 plan must contain exactly ONE display index (INDIA VIX)"
+        );
+        assert_eq!(display[0].display_label, "INDIA VIX");
+        assert_eq!(
+            display[0].security_id,
+            tickvault_common::constants::INDIA_VIX_SECURITY_ID
+        );
+        assert_eq!(display[0].exchange_segment, ExchangeSegment::IdxI);
+    }
+
+    #[test]
+    fn test_indices_underlyings_only_plan_under_phase_0_target() {
+        // Synthetic universe is tiny (1 NIFTY + 1 RELIANCE + 1 VIX), so the
+        // exact count is small. The ratchet here is qualitative: Phase 0 must
+        // never exceed the 230-SID target (PHASE_0_TOTAL_SIDS_TARGET).
+        let universe = make_test_universe();
+        let cfg = phase_0_config();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(
+            &universe,
+            &cfg,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
+
+        assert!(
+            plan.summary.total <= tickvault_common::constants::PHASE_0_TOTAL_SIDS_TARGET,
+            "Phase 0 plan total {} exceeded PHASE_0_TOTAL_SIDS_TARGET",
+            plan.summary.total,
+        );
+        // Sanity: composition exactly matches the documented buckets.
+        assert_eq!(
+            plan.summary.total,
+            plan.summary.major_index_values
+                + plan.summary.display_indices
+                + plan.summary.stock_equities,
+            "Phase 0 total must equal idx + display + cash; derivatives must be zero",
+        );
+    }
+
+    #[test]
+    fn test_indices_underlyings_only_planner_emits_all_three_idx_i_full_chain() {
+        // Hostile-review M1 fix (2026-05-13): pin that the Phase 0 planner
+        // emits NIFTY (SID 13) + BANKNIFTY (SID 25) + SENSEX (SID 51) from
+        // FULL_CHAIN_INDEX_SYMBOLS Section 1. Without this ratchet a future
+        // change could silently drop one of the 3 majors and Phase 0 would
+        // proceed with broken coverage.
+        let universe = make_test_universe();
+        let cfg = phase_0_config();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(
+            &universe,
+            &cfg,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
+
+        let majors: std::collections::HashSet<u32> = plan
+            .registry
+            .iter()
+            .filter(|i| i.category == SubscriptionCategory::MajorIndexValue)
+            .map(|i| i.security_id)
+            .collect();
+        for required_sid in [13, 25, 51] {
+            assert!(
+                majors.contains(&required_sid),
+                "Phase 0 plan must include major IDX_I SID {required_sid} \
+                 (NIFTY=13, BANKNIFTY=25, SENSEX=51); got {majors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_indices_underlyings_only_planner_lower_bound_floor() {
+        // Hostile-review H1 fix (2026-05-13, unit-level lower bound):
+        // ratchets that the Phase 0 plan is never silently empty. Combined
+        // count of major IDX_I + display indices must be >= 4 (the 4 Phase 0
+        // IDX_I SIDs: NIFTY, BANKNIFTY, SENSEX, INDIA VIX). Boot-time runtime
+        // Telegram floor alert is wired in PR-3 / Item 22c
+        // (BootReadyConfirmation positive ping).
+        let universe = make_test_universe();
+        let cfg = phase_0_config();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(
+            &universe,
+            &cfg,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
+
+        let idx_i = plan.summary.major_index_values + plan.summary.display_indices;
+        assert!(
+            idx_i >= tickvault_common::constants::PHASE_0_IDX_I_COUNT,
+            "Phase 0 plan IDX_I count {} below PHASE_0_IDX_I_COUNT floor {}",
+            idx_i,
+            tickvault_common::constants::PHASE_0_IDX_I_COUNT,
+        );
+        assert!(
+            plan.summary.total > 0,
+            "Phase 0 plan must never emit zero instruments (false-OK guard)",
+        );
+    }
+
+    #[test]
+    fn test_india_vix_security_id_constant_pinned_at_21() {
+        assert_eq!(
+            tickvault_common::constants::INDIA_VIX_SECURITY_ID,
+            21,
+            "INDIA VIX SID must remain pinned at 21 (Dhan instrument master)",
+        );
+    }
+
+    #[test]
+    fn test_phase_0_idx_i_symbols_contain_required_four() {
+        let syms: std::collections::HashSet<&str> =
+            tickvault_common::constants::PHASE_0_IDX_I_SYMBOLS
+                .iter()
+                .copied()
+                .collect();
+        for required in ["NIFTY", "BANKNIFTY", "SENSEX", "INDIA VIX"] {
+            assert!(
+                syms.contains(required),
+                "PHASE_0_IDX_I_SYMBOLS must contain {required}",
+            );
+        }
+        assert_eq!(
+            tickvault_common::constants::PHASE_0_IDX_I_SYMBOLS.len(),
+            tickvault_common::constants::PHASE_0_IDX_I_COUNT,
         );
     }
 }
