@@ -778,6 +778,111 @@ CREATE TABLE IF NOT EXISTS decision_audit (
 
 ---
 
+### 28. Cross-verify mismatch — Dhan historical OVERWRITES local (RAM + DB), operator-locked 2026-05-13
+
+**The mechanical rule:**
+
+> **Dhan historical is the SOURCE OF TRUTH at cross-verify time. Any mismatch found by cross-verify (09:16:05 AM IST for the 09:15 bar, or 15:31 IST EOD for all bars) results in: (a) DEDUP UPSERT overwrite of `candles_1m` row with Dhan's version, (b) overwrite of in-memory RAM bar cache with Dhan's version, (c) Telegram CRITICAL `BarMismatchCorrectedFromHistorical`, (d) audit row in `bar_correction_audit`.**
+
+**Two trigger paths:**
+
+| When | What's checked | Source of truth |
+|---|---|---|
+| **09:16:05 AM IST** | The 09:15 1m bar across all 222 SIDs (open-price correctness focus) | Dhan `/v2/charts/intraday` |
+| **15:31 IST EOD** | ALL 1m bars of the trading day across all 222 SIDs | Dhan `/v2/charts/intraday` |
+
+**Correction flow per mismatched SID:**
+
+```
+For each SID where local.candle_1m[ts] != dhan_historical.candle_1m[ts]:
+  1. DEDUP UPSERT into candles_1m with Dhan's (open, high, low, close, volume)
+     - DEDUP KEYS (security_id, exchange_segment, ts) already exist
+     - source column set to "dhan_historical_overwrite"
+  2. Update RAM bar_cache: papaya::HashMap<(security_id, segment, ts), Bar>
+     - Atomic replace — concurrent readers see either old or new, never torn
+  3. Write to bar_correction_audit:
+     (ts_corrected, security_id, segment, bar_ts, field, old_value, new_value, source_of_correction)
+  4. Telegram CRITICAL BarMismatchCorrectedFromHistorical with up to 10 sample deltas
+  5. Counter tv_bar_corrections_total{field} increment
+```
+
+**`bar_correction_audit` table schema:**
+
+```sql
+CREATE TABLE IF NOT EXISTS bar_correction_audit (
+  ts_corrected TIMESTAMP,             -- when correction was applied
+  trading_date_ist STRING,
+  bar_ts TIMESTAMP,                   -- the affected bar minute (e.g. 09:15)
+  security_id INT,
+  exchange_segment SYMBOL,
+  field STRING,                       -- open | high | low | close | volume
+  old_value DOUBLE,
+  new_value DOUBLE,
+  source_of_correction STRING,        -- "cross_verify_09_16" | "cross_verify_eod" | "gap_fill"
+  cross_check_id STRING
+) DEDUP UPSERT KEYS(trading_date_ist, bar_ts, security_id, exchange_segment, field, source_of_correction);
+```
+
+**Strategy decision gate for the 09:15 bar (anti-stale-signal):**
+
+The 09:15 bar seals at 09:16:00.005 IST; cross-verify completes around 09:16:50 IST. To prevent strategy firing on an unverified 09:15 bar that may be wrong:
+
+- Constant `STRATEGY_GATE_FOR_09_15_BAR_UNTIL_IST = 09:16:55` (5s safety margin after cross-verify)
+- Strategy evaluator MUST skip signals based on the 09:15 bar until 09:16:55 IST
+- After 09:16:55: strategy reads the (possibly corrected) bar and decides
+- For all other bars (09:16, 09:17, ...): no gate — strategy fires immediately on bar seal
+
+**Why this rule is safe:**
+
+| Concern | Resolution |
+|---|---|
+| Strategy misses early signal | 09:15 bar gate is only 55 seconds. Pre-09:15 underlying ticks already captured. Other entry timeframes (5m/15m/1h) unaffected. |
+| Dhan historical itself is wrong | Two cross-verify points (09:16 + 15:31) catch mistake. EOD cross-verify hits ALL bars including 09:15 — if 09:16 overwrite was wrong, 15:31 re-overwrites with the consensus. |
+| Race: correction happens DURING strategy read | papaya HashMap is lock-free; reader sees consistent snapshot (atomic pointer swap). DB DEDUP UPSERT is ACID per QuestDB. |
+| Concurrent corrections on same bar | DEDUP UPSERT KEYS include `source_of_correction` — both 09:16 and EOD corrections preserved as separate audit rows; last write wins in `candles_1m`. |
+
+**Constants pinned:**
+
+| Constant | Value |
+|---|---|
+| `BAR_CORRECTION_LATENCY_BUDGET_SECS` | 50 (cross-verify must finish within 50s after bar seal at 09:16:05) |
+| `STRATEGY_GATE_FOR_09_15_BAR_UNTIL_IST` | 09:16:55 |
+| `MAX_BAR_CORRECTIONS_PER_DAY_THRESHOLD` | 5 (above this, alert operator that something systematic is wrong) |
+
+**New Telegram events:**
+
+| Event | Severity | Trigger |
+|---|---|---|
+| `BarMismatchCorrectedFromHistorical` | Critical | Any single bar overwritten — payload: SID list, field deltas, count |
+| `BarCorrectionRateAbove5PerDay` | High | More than 5 corrections in a single trading day — systemic issue |
+| `CrossVerifyMissingDhanHistorical` | High | Dhan REST returned 0 rows for an SID at cross-verify — can't compare; flag for next day |
+
+**Ratchet tests (mandatory):**
+
+| Test | Pins |
+|---|---|
+| `test_bar_correction_overwrites_candles_1m_via_dedup_upsert` | DB write path |
+| `test_bar_correction_overwrites_ram_bar_cache` | RAM cache update |
+| `test_bar_correction_audit_row_written_per_corrected_field` | Per-field forensic granularity |
+| `test_strategy_gate_blocks_09_15_signals_until_09_16_55_ist` | Anti-stale-signal |
+| `test_bar_correction_concurrent_writes_dont_tear_data` | loom concurrency |
+| `test_more_than_5_corrections_per_day_fires_high_telegram` | Systemic alert |
+| `test_eod_cross_verify_also_uses_overwrite_path` | Both trigger points share path |
+
+**LoC: ~200 across 3 files.**
+
+**Total Friday + Saturday + Sunday build (FINAL FINAL FINAL): ~5,170 LoC across 27 active items + 8 docs.**
+
+---
+
+## NOT IN PHASE 0 — Phase B (Backtest brute-force) discussion PARKED 2026-05-13
+
+The Phase B (Mac-side brute-force backtest using `/charts/intraday` + `/charts/rollingoption` expired options data, 5-year history, extreme permutation engine) discussion was opened and parked tonight. Operator decision: **finish Phase 0 LIVE phase first, then move to Phase B.**
+
+Phase B will be its own LOCKED plan file (`topic-PHASE-B-BACKTEST-LOCKED.md`) when we re-open the topic post-Phase-0. Do NOT mix Phase B work into Phase 0 build (anti-scope-creep).
+
+---
+
 ## Honest envelope (the 100% claim)
 
 > "100% inside the tested envelope for Phase 0:
