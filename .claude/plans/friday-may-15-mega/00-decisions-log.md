@@ -991,3 +991,26 @@ Operator decision after live disconnect storm 09:16-09:29 IST:
 - Phase 1 monitoring: 22 trading days
 - Phase 2A live trading: after Phase 1 decision gate
 - Phase B (brute-force backtest): AFTER Phase 0 completion
+
+## 2026-05-13 (after-final session) — Schema item 29 + checkbox defense protocol
+
+### Three fixes locked
+
+1. **AWS schedule confirmed at 08:30-17:30 IST** (06:30 was GIFT-driven, already reverted on GIFT drop)
+2. **REST prev_close boot fetch time corrected** — was wrongly written as `06:30 IST` constant in item 23. Fixed to `PREV_CLOSE_BOOT_FETCH_AT_APP_BOOT = true` — fires ~30-60s after AWS instance start (~08:31 IST), must complete by `PREV_CLOSE_FALLBACK_DEADLINE_IST = 09:14:55`. ~40 min headroom.
+3. **Item 29 ADDED — QuestDB schema changes** (no new columns on `ticks`; ADD `source SYMBOL` column on candles_1m/_5m/_15m/_1h/_1d via idempotent ALTER ADD COLUMN IF NOT EXISTS; 15 new audit tables with DEDUP UPSERT KEYS). LoC ~250.
+
+### Checkbox defense protocol LOCKED
+- Every active Phase 0 item gets `- [ ]` checkbox in plan file
+- Mark `- [x]` ONLY when ALL 4 criteria met: code merged, ratchet tests green in CI, 7-layer observability wired, PR closed
+- 36 total checkboxes (28 active items, item 27 has 8 sub-doc boxes)
+- NEW SessionStart hook `.claude/hooks/phase-0-progress-check.sh` runs at every Claude Code session start, parses checkboxes, prints `Phase 0 progress: N/36 complete` + next pending item
+- Pre-push gate `plan-verify.sh` rejects "Phase 0 complete" PR claim if any `- [ ]` remain
+
+### Phase 0 TRUE FINAL FINAL TALLY (after items 29 + checkbox protocol)
+- 28 active items (item 22 GIFT NIFTY PARKED)
+- 36 checkboxes total (27 single-item + 8 sub-doc + 1 item 29 = 36)
+- ~5,420 LoC + ~10,000 words across 8 docs
+- 3-day build window (Fri+Sat+Sun) — unchanged
+- 222 SIDs, mixed-mode (IDX_I=Ticker, NSE_EQ=Quote)
+- AWS t3.medium 08:30-17:30 IST Mon-Fri ~rupees-1,252/mo
