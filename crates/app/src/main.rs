@@ -5624,8 +5624,17 @@ async fn main() -> Result<()> {
 
     // -----------------------------------------------------------------------
     // Step 9.6: Background greeks pipeline (option chain fetch → compute → persist)
+    //
+    // Phase 0 Item 7 follow-up (operator-locked 2026-05-13): this second
+    // greeks spawn site (mid-market / fast-boot branch) was missed in PR-3.
+    // Under `SubscriptionScope::IndicesUnderlyingsOnly` the greeks pipeline
+    // MUST stay parked regardless of the boot path taken. Reuses the same
+    // `should_spawn_greeks_pipeline` helper as the slow-boot site at ~1695.
     // -----------------------------------------------------------------------
-    if config.greeks.enabled {
+    if tickvault_app::phase2_recovery::should_spawn_greeks_pipeline(
+        config.subscription.scope,
+        config.greeks.enabled,
+    ) {
         let greeks_token = token_handle.clone();
         let greeks_client_id = ws_client_id.clone();
         let greeks_base_url = config.dhan.rest_api_base_url.clone();
@@ -8122,8 +8131,20 @@ fn build_inline_greeks_enricher(
     config: &ApplicationConfig,
     subscription_plan: &Option<SubscriptionPlan>,
 ) -> Option<InlineGreeksComputer> {
-    if !config.greeks.enabled {
-        info!("inline Greeks enricher disabled in config");
+    // Phase 0 Item 7 follow-up (operator-locked 2026-05-13): scope-gate
+    // the inline Greeks enricher too. Under `IndicesUnderlyingsOnly` the
+    // tick-processor hot path skips Greeks enrichment entirely — operator's
+    // strategy uses underlying spot indicators, not streaming Delta/Theta/
+    // Vega per tick.
+    if !tickvault_app::phase2_recovery::should_spawn_greeks_pipeline(
+        config.subscription.scope,
+        config.greeks.enabled,
+    ) {
+        info!(
+            scope = config.subscription.scope.as_str(),
+            greeks_enabled = config.greeks.enabled,
+            "inline Greeks enricher disabled (config flag OFF or Phase 0 scope)"
+        );
         return None;
     }
 
