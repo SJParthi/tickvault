@@ -909,7 +909,7 @@ The 09:15 bar seals at 09:16:00.005 IST; cross-verify completes around 09:16:50 
 
 **Mat views removed entirely:** Wave-5 matviews `candles_1m/5m/15m/30m/1h/2h/3h/4h/1d` and `candles_1s` base table are **DROPPED** in Phase 0 boot. Replaced by 6 native base tables (1m/3m/5m/15m/1h/1d) written directly by the in-RAM aggregator. `movers_1s`/`_1m`/`option_movers` matviews stay DROPPED (no use case in Phase 0; reintroduce only when derivatives come back).
 
-**6-table column contract (identical schema for all 6 candle tables):**
+**6-table column contract (identical schema for all 6 candle tables — folds Z+ items M8 + L2):**
 
 ```
 segment              SYMBOL
@@ -917,17 +917,33 @@ security_id          LONG
 open / high / low / close   DOUBLE
 volume               LONG
 oi                   LONG       -- always 0 for NSE_EQ in Phase 0 (no derivatives subscribed)
-tick_count           INT
+tick_count           LONG       -- Z+ M8: was INT; LONG avoids 2.1B i32 wrap on multi-month re-aggregation
 volume_cum_day_at_end        LONG
 prev_day_close               DOUBLE
 prev_day_oi                  LONG
-phase                SYMBOL
+phase                SYMBOL CAPACITY 16   -- Z+ M1/H2: values include live, market_open_partial, boot_partial, eod
 close_pct_from_prev_day      DOUBLE     -- item 30 (Wave-5 naming kept)
-oi_pct_from_prev_day         DOUBLE     -- NULL in Phase 0
+oi_pct_from_prev_day         DOUBLE     -- NULL in Phase 0; downstream must COALESCE (Z+ C4)
 volume_pct_from_prev_day     DOUBLE
-source               SYMBOL              -- live_aggregated | dhan_historical_overwrite | gap_fill_backfill
+source               SYMBOL CAPACITY 8    -- Z+ L2: live_aggregated | dhan_historical_overwrite | gap_fill_backfill
 ts                   TIMESTAMP    (designated, IST)
 ```
+
+**Bucket boundary rule LOCKED (Z+ C2):**
+- `BUCKET_BOUNDARY_RULE = "[start, end)"` (half-open right) — a tick at exactly 09:16:00.000 lands in the 09:16 bucket, NOT the 09:15 bucket
+- Constant: `crates/common/src/constants.rs::BUCKET_BOUNDARY_RULE`
+
+**Close-of-session forced seal LOCKED (Z+ C1):**
+- `MARKET_CLOSE_FORCED_SEAL_IST = "15:30:00"` — every TF (including 1h's 15:15-15:30 partial bar) gets force-sealed at 15:30:00 IST exchange-ts, NOT at its nominal bar-end (would be 16:15 for 1h)
+- Applies to all 6 TFs
+
+**Alignment offset constants LOCKED (Z+ L1):**
+- `CANDLE_1H_ALIGN_OFFSET = "00:15"` — NSE market-open aligned, matches Dhan `/charts/intraday?interval=60`
+- `CANDLE_DEFAULT_ALIGN_OFFSET = "00:00"` — IST midnight, used by 1m/3m/5m/15m/1d
+
+**Boot ordering constraint LOCKED (Z+ H4):**
+- All 24 ALTER ADD COLUMN statements MUST complete BEFORE the in-RAM aggregator + ILP-writer task spawns
+- Boot sequence: QuestDB ready → DDL block → ALTER block → instrument master load → aggregator spawn → WebSocket subscribe
 
 **DEDUP UPSERT KEYS (6 candle tables):** `(ts, security_id, segment)` — identical across all 6. **No `timeframe` column** because each TF lives in its own table; the table name IS the timeframe.
 
@@ -967,6 +983,52 @@ Every sealed bar (1m/3m/5m/15m/1h/1d) gets `close_pct_from_prev_day` computed at
 
 **Boot-time cache loader** (PREVCLOSE-04 / Wave-5 §K-L13): `populate_prev_day_cache_at_boot` reads `previous_close` table from QuestDB (7-day lookback) so RAM cache is warm BEFORE first tick. Live packets overwrite stale cache within seconds of subscribe.
 
+**Cache primitive LOCKED (Z+ H6 + H8 + M9):**
+- `prev_close_cache: Arc<papaya::HashMap<(u32, ExchangeSegment), f64>>` — composite key per I-P1-11 (no `HashMap<u32, _>`), lock-free read via `papaya`, NOT `Mutex` / `RwLock`
+- Existing buggy `index_prev_close_cache: HashMap<u32, f32>` at `tick_processor.rs:537` REPLACED with composite key
+- Banned-pattern hook category 5 explicitly scans this site
+
+**Per-tick aggregator bucket structure LOCKED (Z+ M9):**
+- `aggregator_state: Arc<papaya::HashMap<(u32, ExchangeSegment), [Bucket; 6]>>` — fixed-array indexed by `TimeframeIdx as usize`, not 6 hash probes per tick
+- `TimeframeIdx`: `M1=0, M3=1, M5=2, M15=3, H1=4, D1=5`
+
+**ILP writer fan-out LOCKED (Z+ C5):**
+- Per-SID seal writes via bounded `mpsc::channel(SEAL_BURST_CHANNEL_CAPACITY = 2048)` to a dedicated ILP-writer tokio task
+- Reused `questdb_rs::Buffer` (no per-row allocation)
+- Backpressure: rescue ring overflow path per `aws-budget.md` rule (5M-tick capacity)
+- Criterion bench `bench_seal_burst_892_rows_p99_under_5ms` enforces 5ms budget at 09:30:00 IST worst-case fan-out
+
+**Prev-close bounds guard LOCKED (Z+ H9):**
+- BEFORE writing prev_close to RAM cache OR `previous_close` ILP table: reject if `!is_finite() OR <= 0.0 OR > 10_000_000.0`
+- Applies to both IDX_I code-6 packet path and NSE_EQ first-Quote-tick path
+
+**NSE_EQ first-tick poisoning guard LOCKED (Z+ C3):**
+- `NSE_EQ_FIRST_TICK_PREV_CLOSE_DRIFT_LIMIT = 10.0` (10× drift from boot-loaded QuestDB value)
+- If first-tick `close` field is `< 1e-9` OR `> 10×` the boot-loader value: REJECT (do not lock cache); wait for next tick
+- Counter: `tv_nse_eq_first_tick_rejected_total{reason="zero"|"implausible"}`
+
+**Cross-verify recompute LOCKED (Z+ H5):**
+- When item 28 cross-verify corrects a bar's `close`, it ALSO revalidates `prev_close` against Dhan historical's previous-trading-day `_1d.close`
+- If prev_close drifted: overwrite cache + `previous_close` table + recompute pct
+
+**1d self-referential lookup LOCKED (Z+ H7 + M4):**
+- `candles_1d` pct at seal time reads ONLY from `prev_close_cache` (RAM); NO QuestDB SELECT during business hours
+- Yesterday's `_1d.close` rehydrated into the same cache at boot via `populate_prev_day_cache_at_boot`
+
+**EOD `previous_close` write window LOCKED (Z+ H3 + M6):**
+- Write window: `[15:30:30, 15:31:30]` IST — single edge-trigger fire
+- DEDUP UPSERT KEYS `(trading_date_ist, security_id, exchange_segment)` guarantees idempotency
+- Writer spawned exactly once from main.rs BEFORE any parallel task; ratchet `test_prev_close_writer_spawned_exactly_once_at_boot`
+
+**INDIA VIX code-6 verification LOCKED (Z+ H1):**
+- Pre-Friday smoke test: subscribe VIX (security_id TBD from CSV) alone, verify code-6 packet receipt within 60s
+- If verified: continue with same IDX_I routing as NIFTY/BANKNIFTY/SENSEX
+- If NOT verified: fallback to QuestDB `previous_close` row only; flag `VIX_PREV_CLOSE_SOURCE = "questdb_fallback"` in the cache entry
+- Smoke test ratchet wired into CI; result captured in `vix_code6_smoke_audit` table
+
+**DDL error escalation LOCKED (Z+ M7):**
+- `ensure_previous_close_table` DDL failures upgrade `warn!` → `error!(code = ErrorCode::PrevCloseDdl04.code_str(), ...)` to route through Telegram per `error_level_meta_guard.rs` Rule 5
+
 **Computation:**
 
 ```
@@ -985,7 +1047,9 @@ close_pct_from_prev_day = (bar.close - prev_close_cache[(sid, segment)]) / prev_
 - `PCT_FROM_PREV_CLOSE_DEGENERATE_THRESHOLD = 1e-9`
 - `CANDLE_TIMEFRAMES_LOCKED = ["1m", "3m", "5m", "15m", "1h", "1d"]` (6 entries — adding/removing fails build)
 
-**Ratchet tests (mandatory):**
+**Ratchet tests (mandatory — 44 total: 17 base + 27 from Z+ review item 31):**
+
+Base 17 (pct + routing + dedup invariants):
 - `test_pct_computed_at_bar_seal_for_1m`
 - `test_pct_computed_for_all_6_timeframes`
 - `test_pct_recomputed_after_cross_verify_overwrite_item_28`
@@ -1003,6 +1067,41 @@ close_pct_from_prev_day = (bar.close - prev_close_cache[(sid, segment)]) / prev_
 - `test_no_db_select_in_indicator_strategy_risk_hot_path` (banned-pattern category extension)
 - `test_exactly_six_candle_base_tables_exist`
 - `test_candle_1h_uses_0915_ist_offset_for_dhan_parity`
+
+Z+ CRITICAL fixes (5):
+- `test_candles_1h_final_bar_seals_at_15_30_not_16_15` (C1)
+- `test_tick_at_exact_boundary_falls_into_next_bucket` (C2)
+- `test_nse_eq_first_tick_rejects_zero_or_implausible_value` (C3)
+- `test_no_strategy_or_dashboard_query_references_oi_pct_without_coalesce` (C4)
+- `test_minute_boundary_burst_does_not_block_ws_read_loop` + Criterion `bench_seal_burst_892_rows_p99_under_5ms` (C5)
+
+Z+ HIGH fixes (9):
+- `test_vix_code6_smoke_or_fallback_path` (H1)
+- `test_partial_boot_bars_marked_boot_partial` (H2)
+- `test_previous_close_eod_writes_exactly_once_per_day` (H3)
+- `test_alter_block_completes_before_aggregator_spawn` (H4)
+- `test_cross_verify_revalidates_prev_close_not_just_bar_close` (H5)
+- `test_prev_close_cache_uses_papaya_not_mutex` (H6)
+- `test_candles_1d_self_referential_does_not_select_at_seal_time` (H7)
+- `test_index_prev_close_cache_uses_composite_key_not_u32_alone` (H8)
+- `test_prev_close_rejects_nan_inf_zero_and_extreme` (H9)
+
+Z+ MEDIUM fixes (9):
+- `test_3m_bucket_spanning_market_open_either_empty_or_phase_marked` (M1)
+- `test_quote_packet_sequence_number_field_exists_or_dedup_key_uses_tick_count` (M2)
+- `test_per_sid_seal_emission_watchdog_alert_wired` (M3)
+- (M4 subsumed by H7)
+- `test_vix_pct_used_only_by_regime_filter_never_by_ranker` (M5)
+- `test_prev_close_writer_spawned_exactly_once_at_boot` (M6)
+- `test_prev_close_ddl_failure_logs_at_error_level_with_code` (M7)
+- `test_candle_tick_count_column_is_long_not_int` (M8)
+- `test_aggregator_bucket_lookup_uses_fixed_array_indexed_by_tf_idx` (M9)
+
+Z+ LOW fixes (4):
+- `test_candle_1h_align_offset_constant_pinned_at_0015` (L1)
+- `test_source_column_symbol_capacity_pinned_at_8` (L2)
+- `test_drop_matview_idempotent_when_view_absent_or_present` (L3)
+- (L4 subsumed by M8)
 
 **LoC: ~480 (6 ALTER × 3 cols + bar-seal computation × 6 timeframes + cross-verify recompute hook + daily-candle lookup + Telegram + 17 ratchets + matview cleanup at boot).**
 

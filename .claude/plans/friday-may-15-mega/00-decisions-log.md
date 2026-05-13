@@ -1107,3 +1107,35 @@ Operator decision after live disconnect storm 09:16-09:29 IST:
 - 223 SIDs (4 IDX_I + 218 NSE_EQ)
 - 6 candle base tables, ZERO matviews, ZERO `candles_1s`
 - 17 ratchets in item 30 + 27 new ratchets in item 31 = 44 build-failing guards on the candle subsystem alone
+
+## 2026-05-13 late-evening — Z+ fixes folded INTO items 29 + 30
+
+### Item 29 (schema) now carries inline:
+- C1: `MARKET_CLOSE_FORCED_SEAL_IST = "15:30:00"` constant
+- C2: `BUCKET_BOUNDARY_RULE = "[start, end)"` constant
+- C4: `oi_pct_from_prev_day` NULL → downstream MUST COALESCE
+- H4: boot ordering — ALTER block before aggregator spawn
+- L1: `CANDLE_1H_ALIGN_OFFSET = "00:15"` + `CANDLE_DEFAULT_ALIGN_OFFSET = "00:00"`
+- L2: `source SYMBOL CAPACITY 8`, `phase SYMBOL CAPACITY 16`
+- M8: `tick_count LONG` (was INT)
+
+### Item 30 (pct column) now carries inline:
+- C3: NSE_EQ first-tick poisoning guard with `NSE_EQ_FIRST_TICK_PREV_CLOSE_DRIFT_LIMIT = 10.0`
+- C5: ILP fan-out — `mpsc::channel(SEAL_BURST_CHANNEL_CAPACITY = 2048)` + Criterion bench
+- H1: VIX code-6 pre-Friday smoke + `vix_code6_smoke_audit` table
+- H3: `previous_close` EOD write window `[15:30:30, 15:31:30]` IST single-fire
+- H5: cross-verify revalidates prev_close (not just bar.close)
+- H6: `prev_close_cache: Arc<papaya::HashMap<(u32, ExchangeSegment), f64>>`
+- H7: 1d self-referential reads RAM only
+- H8: I-P1-11 cache migration — `tick_processor.rs:537` HashMap<u32, f32> → composite
+- H9: bounds guard `!is_finite() OR <= 0.0 OR > 10_000_000.0` before any prev_close write
+- M9: aggregator state `Arc<papaya::HashMap<(u32, ExchangeSegment), [Bucket; 6]>>` (fixed array)
+- M6: spawn-exactly-once ratchet
+- M7: DDL warn! → error! escalation
+
+### Item 31 retained as the audit batch (lists all 44 ratchets including the 17 base + 27 Z+ fixes)
+
+### Phase 0 TRUE-TRUE-TRUE-FINAL tally (after all Z+ fixes folded inline)
+- 30 active items, ~6,520 LoC, 9 docs
+- 44 build-failing ratchets on the candle subsystem (17 base + 5 CRITICAL + 9 HIGH + 9 MEDIUM + 4 LOW)
+- All Z+ findings have BOTH a named ratchet AND a concrete design lock in items 29-30
