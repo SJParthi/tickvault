@@ -8,10 +8,13 @@
 **No implementation rule:** STILL ACTIVE. Brainstorm + design only. Code lands Friday.
 
 **CANONICAL REFERENCE FILES (read in order):**
-1. `.claude/rules/project/operator-charter-forever.md` — **FOREVER CHARTER** (auto-loaded every session, permanent contract)
-2. `.claude/plans/friday-may-15-mega/00-HIGH-LEVEL-PLAN.md` — **5-MINUTE READABLE SUMMARY** of everything (NEW Mon 23:25 IST)
-3. `.claude/plans/friday-may-15-mega/step-1-honest-envelope.md` — Mon eve honest envelope (canonical reference for tickvault-specific envelope)
-4. `.claude/plans/friday-may-15-mega/topic-telegram-message-style-rules.md` — Telegram style rules (auto-driver-level only)
+1. **`topic-PHASE-0-LEAN-LOCKED.md`** — **🔒 LOCKED PHASE 0 PLAN** (operator decision 2026-05-13 ~10:30 IST) — supersedes everything below for Friday build scope
+2. `.claude/rules/project/operator-charter-forever.md` — **FOREVER CHARTER** (auto-loaded every session, permanent contract)
+3. `.claude/plans/friday-may-15-mega/00-HIGH-LEVEL-PLAN.md` — 5-minute readable summary of pre-lean discussions
+4. `.claude/plans/friday-may-15-mega/step-1-honest-envelope.md` — Mon eve honest envelope (canonical reference for tickvault-specific envelope)
+5. `.claude/plans/friday-may-15-mega/topic-telegram-message-style-rules.md` — Telegram style rules (auto-driver-level only)
+
+**EVERYTHING ELSE in this directory is now Phase 2 reference material.** Don't load it for Friday build. Phase 0 is self-contained in the LOCKED file above.
 
 ---
 
