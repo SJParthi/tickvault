@@ -54,6 +54,44 @@ pub const WATCHDOG_POLL_INTERVAL_SECS: u64 = 5;
 /// close an idle socket.
 pub const WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS: u64 = 50;
 
+// ---------------------------------------------------------------------------
+// Phase 0 Item 4 (operator-locked 2026-05-13) — tightened per-segment
+// activity watchdog thresholds. Under `SubscriptionScope::IndicesUnderlyingsOnly`
+// the universe is ~222 SIDs (4 IDX_I + ~218 NSE_EQ) producing 113-448
+// frames/sec aggregate on the SINGLE main-feed conn. The 50s legacy
+// threshold is wasteful for this density; we tighten to 3s (IDX_I's
+// expected 1-3 ticks/sec window) so a silent socket is detected in <5s
+// instead of ~55s.
+//
+// The 3/10/30 split below is segment-aware design space (the plan's
+// long-term vision per `topic-PHASE-0-LEAN-LOCKED.md` §10). The current
+// connection-level watchdog cannot enforce per-segment thresholds (the
+// counter aggregates all frames across all SIDs on the conn), so the
+// effective Phase 0 conn-level threshold is the MOST AGGRESSIVE of the
+// per-segment values that the conn carries — i.e. 3s (IDX_I).
+// Per-segment counters are a Phase 2 refactor.
+// ---------------------------------------------------------------------------
+
+/// Per-segment threshold for IDX_I (Phase 0 LEAN MVP): index value feeds
+/// produce 1-3 ticks/sec; 3s without a frame = 3-9 missed ticks =
+/// silent socket. Used as the effective conn-level threshold for the
+/// Phase 0 main-feed pool (single conn carrying all 4 IDX_I SIDs).
+pub const WATCHDOG_THRESHOLD_IDX_I_SECS: u64 = 3;
+
+/// Per-segment threshold for NSE_EQ cash equities (Phase 0 LEAN MVP):
+/// each F&O underlying stock produces 0.5-2 ticks/sec; with 218 SIDs
+/// the aggregate is 109-436 ticks/sec. 10s without ANY NSE_EQ frame =
+/// the entire NSE_EQ stream is silent (the conn-level IDX_I threshold
+/// would fire first at 3s under Phase 0). Reserved for future
+/// per-segment counter refactor.
+pub const WATCHDOG_THRESHOLD_NSE_EQ_SECS: u64 = 10;
+
+/// Per-segment threshold for INDIA VIX (Phase 0 LEAN MVP): VIX produces
+/// ~1 tick / 10s in normal conditions; 30s without a VIX frame
+/// indicates the regime-filter signal is stale. Reserved for future
+/// per-segment counter refactor.
+pub const WATCHDOG_THRESHOLD_VIX_SECS: u64 = 30;
+
 /// Watchdog threshold for live order update. The order update WebSocket
 /// is expected to be silent for long stretches during no-order windows —
 /// production evidence shows Dhan's order-update server does NOT reliably
@@ -443,6 +481,40 @@ mod tests {
         // (matches order-update). Live incident: depth-200 deferred slots
         // reconnect-stormed at 50s threshold every cycle.
         assert_eq!(WATCHDOG_THRESHOLD_DEPTH_DEFERRED_SECS, 14400);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 0 Item 4 — per-segment watchdog threshold constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn phase_0_watchdog_thresholds_match_plan_spec() {
+        // Per topic-PHASE-0-LEAN-LOCKED.md §10 (operator-locked 2026-05-13):
+        // IDX_I = 3s (1-3 ticks/sec; 3-9 missed ticks worth of silence).
+        // NSE_EQ = 10s (0.5-2 ticks/sec; reserved for per-segment refactor).
+        // VIX = 30s (~1 tick / 10s normal cadence).
+        assert_eq!(WATCHDOG_THRESHOLD_IDX_I_SECS, 3);
+        assert_eq!(WATCHDOG_THRESHOLD_NSE_EQ_SECS, 10);
+        assert_eq!(WATCHDOG_THRESHOLD_VIX_SECS, 30);
+    }
+
+    #[test]
+    fn phase_0_idx_i_threshold_strictly_below_legacy() {
+        // Ratchet: Phase 0 IDX_I threshold must be strictly faster than
+        // the legacy 50s threshold (it's the whole point of the tighter
+        // bound under dense Phase 0 data rates). Compile-fail if the
+        // ordering ever inverts.
+        assert!(WATCHDOG_THRESHOLD_IDX_I_SECS < WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS);
+    }
+
+    #[test]
+    fn websocket_config_default_threshold_matches_legacy_const() {
+        // Cross-crate ratchet referenced by
+        // `tickvault_common::config::default_activity_watchdog_threshold_secs`.
+        // If WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS ever changes, the
+        // common-crate hard-pinned default must move in lockstep.
+        let common_default: u64 = 50;
+        assert_eq!(common_default, WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS);
     }
 
     // -----------------------------------------------------------------------

@@ -226,6 +226,33 @@ pub const fn should_spawn_greeks_pipeline(
     }
 }
 
+/// Phase 0 Item 4 (operator-locked 2026-05-13) — returns the effective
+/// per-conn activity-watchdog threshold for the main-feed WebSocket
+/// pool. Under `IndicesUnderlyingsOnly` the data rate is dense (113-448
+/// frames/sec aggregate across the single conn — 4 IDX_I + 218 NSE_EQ),
+/// so we tighten to `WATCHDOG_THRESHOLD_IDX_I_SECS = 3` (silent-socket
+/// detection in <5s instead of the legacy ~55s). Under legacy / Wave 5
+/// scopes the conn count is up to 5 with potentially sparser per-conn
+/// traffic, so we preserve `WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS = 50`
+/// (above Dhan's 40s server ping timeout per the original P2.1 plan).
+///
+/// Pure `const fn`; tested by
+/// `test_effective_main_feed_watchdog_threshold_*`.
+#[must_use]
+pub const fn effective_main_feed_watchdog_threshold_secs(
+    scope: tickvault_common::config::SubscriptionScope,
+) -> u64 {
+    match scope {
+        tickvault_common::config::SubscriptionScope::IndicesUnderlyingsOnly => {
+            tickvault_core::websocket::activity_watchdog::WATCHDOG_THRESHOLD_IDX_I_SECS
+        }
+        tickvault_common::config::SubscriptionScope::IndicesOnlyAllExpiries
+        | tickvault_common::config::SubscriptionScope::FullUniverse => {
+            tickvault_core::websocket::activity_watchdog::WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS
+        }
+    }
+}
+
 /// Returns the current IST date and seconds-since-IST-midnight for the
 /// recovery decision. Uses `tickvault_common::trading_calendar::ist_offset`
 /// so the definition of "IST" lives in one place.
@@ -466,6 +493,60 @@ mod tests {
         ] {
             assert!(should_spawn_greeks_pipeline(scope, true));
             assert!(!should_spawn_greeks_pipeline(scope, false));
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // Phase 0 Item 4 — main-feed activity watchdog threshold scope gate
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn test_effective_main_feed_watchdog_threshold_under_phase_0_is_three_secs() {
+        assert_eq!(
+            effective_main_feed_watchdog_threshold_secs(
+                tickvault_common::config::SubscriptionScope::IndicesUnderlyingsOnly,
+            ),
+            tickvault_core::websocket::activity_watchdog::WATCHDOG_THRESHOLD_IDX_I_SECS,
+        );
+        assert_eq!(
+            effective_main_feed_watchdog_threshold_secs(
+                tickvault_common::config::SubscriptionScope::IndicesUnderlyingsOnly,
+            ),
+            3,
+            "Phase 0 effective threshold must match WATCHDOG_THRESHOLD_IDX_I_SECS = 3",
+        );
+    }
+
+    #[test]
+    fn test_effective_main_feed_watchdog_threshold_under_legacy_is_fifty_secs() {
+        for scope in [
+            tickvault_common::config::SubscriptionScope::IndicesOnlyAllExpiries,
+            tickvault_common::config::SubscriptionScope::FullUniverse,
+        ] {
+            assert_eq!(
+                effective_main_feed_watchdog_threshold_secs(scope),
+                tickvault_core::websocket::activity_watchdog::WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
+            );
+            assert_eq!(
+                effective_main_feed_watchdog_threshold_secs(scope),
+                50,
+                "Legacy effective threshold must match WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS = 50",
+            );
+        }
+    }
+
+    #[test]
+    fn test_effective_main_feed_watchdog_threshold_covers_every_scope_variant() {
+        // Compile-fail ratchet — adding a 4th SubscriptionScope variant
+        // without updating effective_main_feed_watchdog_threshold_secs
+        // fails the const-fn match exhaustiveness check.
+        let variants = [
+            tickvault_common::config::SubscriptionScope::IndicesOnlyAllExpiries,
+            tickvault_common::config::SubscriptionScope::FullUniverse,
+            tickvault_common::config::SubscriptionScope::IndicesUnderlyingsOnly,
+        ];
+        for v in variants {
+            let _ = effective_main_feed_watchdog_threshold_secs(v);
         }
     }
 }

@@ -6407,6 +6407,26 @@ fn create_websocket_pool(
     }
     ws_config.connection_stagger_ms = stagger;
 
+    // Phase 0 Item 4 (operator-locked 2026-05-13): scope-aware activity
+    // watchdog threshold. Under IndicesUnderlyingsOnly the data rate is
+    // dense (113-448 frames/sec aggregate across a single conn) so the
+    // legacy 50s threshold is wasteful — tighten to 3s (IDX_I's expected
+    // 1-3 ticks/sec window). Under legacy scopes preserve 50s.
+    let configured_watchdog_threshold = ws_config.activity_watchdog_threshold_secs;
+    let effective_watchdog_threshold =
+        tickvault_app::phase2_recovery::effective_main_feed_watchdog_threshold_secs(
+            config.subscription.scope,
+        );
+    if effective_watchdog_threshold != configured_watchdog_threshold {
+        info!(
+            scope = config.subscription.scope.as_str(),
+            configured_secs = configured_watchdog_threshold,
+            effective_secs = effective_watchdog_threshold,
+            "Phase 0 Item 4: main-feed activity-watchdog threshold clamped by scope"
+        );
+        ws_config.activity_watchdog_threshold_secs = effective_watchdog_threshold;
+    }
+
     info!("building WebSocket connection pool");
 
     let mut instruments: Vec<InstrumentSubscription> = plan
