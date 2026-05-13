@@ -851,3 +851,40 @@ Operator decision after live disconnect storm 09:16-09:29 IST:
 - AUDIT: new `open_price_audit` table — per-SID daily row with `(our_open, dhan_open, source, mismatch_pct, result)`. DEDUP UPSERT KEYS `(trading_date_ist, security_id, exchange_segment)`.
 - 3 new typed Telegram events + 8 ratchet tests.
 - Phase 0 Friday build revised: ~2,030 LoC across 18 changes (was ~1,330 LoC across 14).
+
+## 2026-05-13 (night) — Tightened timings + 12 missed P0 items + GIFT NIFTY
+
+### Tightened timings (item 10 in plan)
+- First reconnect attempt: 0ms (instant)
+- IDX_I activity watchdog: 3s (was 15s)
+- NSE_EQ activity watchdog: 10s (was 30s)
+- VIX activity watchdog: 30s
+- Subscribe-ACK first frame: 2s (was 5s)
+- WS handshake deadline: 5s
+- Order placement REST timeout: 5s
+
+### 12 P0 items previously missed (items 11-21 in plan)
+- 11: SEBI 24h JWT daily renewal observability + auth_renewal_audit table + JwtRenewalCompleted Telegram (Info)
+- 12: Static IP boot check via /v2/ip/getIP, verify ordersAllowed=true, HALT if false
+- 13: Dual-instance lock (RESILIENCE-01) via QuestDB live_instance_lock table; refuse boot if another instance < 60s old
+- 14: Orphan position 15:25 IST watchdog — auto-close any open positions 5min before market close
+- 15: NaN / division-by-zero guards in indicator engine — wrap every indicator update, reset state on NaN, Telegram alert
+- 16: Order placement 5s REST timeout + DH-904 exponential backoff + DH-905/906 never-retry policy
+- 17: Stop-loss-leg-cancelled detection — order-update WS Source=N+LegNo=2+status=CANCELLED → auto-place fresh SL within 30s
+- 18: Boot-success Telegram positive ping at 09:14:55 IST (BootReadyConfirmation Info / BootDegraded Critical)
+- 19: End-of-day Telegram digest at 15:31:30 IST — P&L, signals, fills, disconnects, gap-fills, cross-verify result
+- 20: Tick-level integrity guards — reject price<=0, price>10M, oi<0; aggregator high>=low && open/close in [low,high] at seal
+- 21: Self-trade prevention — refuse SELL within 60s of BUY on same SID+ProductType (SEBI wash-trade rule)
+
+### GIFT NIFTY (item 22, with 7 sub-items)
+- GIFT NIFTY = NIFTY 50 futures on NSE IX (GIFT City), USD-denominated, ~21h/day across 2 sessions
+- Operator chose Option B: extend AWS to 06:30-15:45 IST Mon-Fri (captures Session 1 + overnight close via REST at boot)
+- Per-segment market-hours table replaces single [09:15, 15:30) constant
+- NSE_IFSC segment added to ExchangeSegment enum (pending Dhan support verification)
+- AWS cost delta: +~₹20/mo (still under ₹5K cap)
+- Pre-flight verification mandatory before Friday: confirm Dhan supports GIFT NIFTY via WS + /charts/intraday; operator to grep instrument master CSV on Thu 2026-05-14
+
+### Phase 0 LOCKED total
+- 22 top-level items (with sub-items in #22) = ~4,120 LoC
+- 1.5-2 focused days (Friday + Saturday morning)
+- AWS cost: ~₹1,275/mo (75% under budget)
