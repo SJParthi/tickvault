@@ -1125,6 +1125,14 @@ pub enum SubscriptionScope {
     IndicesOnlyAllExpiries,
     /// Legacy Wave 4 universe (kept as escape hatch for ops only).
     FullUniverse,
+    /// Phase 0 LEAN MVP (operator decision 2026-05-13) — subscribe only
+    /// the 4 IDX_I (NIFTY/BANKNIFTY/SENSEX/INDIA VIX) + ~218 NSE_EQ F&O
+    /// underlying stocks. NO derivatives, NO sectoral display indices.
+    /// Target: ~222 SIDs on a single main-feed WebSocket connection.
+    ///
+    /// See `topic-PHASE-0-LEAN-LOCKED.md` items 1 + 23 for the full
+    /// scope contract and mode mix (IDX_I=Ticker, NSE_EQ=Quote).
+    IndicesUnderlyingsOnly,
 }
 
 impl SubscriptionScope {
@@ -1135,6 +1143,7 @@ impl SubscriptionScope {
         match self {
             Self::IndicesOnlyAllExpiries => "indices_only_all_expiries",
             Self::FullUniverse => "full_universe",
+            Self::IndicesUnderlyingsOnly => "indices_underlyings_only",
         }
     }
 }
@@ -2486,6 +2495,42 @@ mod tests {
         assert_eq!(
             wrapper.subscription.scope,
             SubscriptionScope::IndicesOnlyAllExpiries
+        );
+    }
+
+    // Phase 0 Item 1 — IndicesUnderlyingsOnly scope variant.
+    #[test]
+    fn test_subscription_scope_indices_underlyings_only_round_trip() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let toml_phase_0 = r#"
+            [subscription]
+            scope = "indices_underlyings_only"
+            feed_mode = "Ticker"
+            subscribe_index_derivatives = true
+            subscribe_stock_derivatives = true
+            subscribe_display_indices = true
+            subscribe_stock_equities = true
+            stock_atm_strikes_above = 25
+            stock_atm_strikes_below = 25
+            stock_default_atm_fallback_enabled = true
+        "#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            subscription: SubscriptionConfig,
+        }
+        let wrapper: Wrapper = Figment::new()
+            .merge(Toml::string(toml_phase_0))
+            .extract()
+            .expect("indices_underlyings_only scope must round-trip");
+        assert_eq!(
+            wrapper.subscription.scope,
+            SubscriptionScope::IndicesUnderlyingsOnly
+        );
+        assert_eq!(
+            wrapper.subscription.scope.as_str(),
+            "indices_underlyings_only"
         );
     }
 
