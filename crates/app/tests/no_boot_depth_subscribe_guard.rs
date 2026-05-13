@@ -95,5 +95,75 @@ fn run_two_hundred_depth_takes_optional_security_id() {
 }
 
 // -----------------------------------------------------------------------
+// Phase 0 Item 7 (operator-locked 2026-05-13) — scope-gate ratchets
+//
+// The deferred-mode ratchets above pin the "depth conns stay idle until
+// the 09:13 dispatcher fires Initial Subscribe" invariant for legacy
+// scopes. Phase 0 LEAN MVP goes one step further: depth-20 + depth-200
+// pipelines are PARKED ENTIRELY under `IndicesUnderlyingsOnly` scope.
+// PR-3 wired the scope gate via `should_spawn_depth_dynamic_pipeline`.
+// These ratchets pin that main.rs ACTUALLY CALLS the helper at the
+// depth-spawn site (Rule 13 — defined-but-never-called is a bug).
+// -----------------------------------------------------------------------
+
+#[test]
+fn main_rs_consults_should_spawn_depth_dynamic_pipeline_helper() {
+    let src = read_main_rs();
+
+    // Positive ratchet — main.rs MUST call the scope helper before the
+    // depth pipeline_v2 spawn block.
+    let helper_call = "should_spawn_depth_dynamic_pipeline";
+    assert!(
+        src.contains(helper_call),
+        "Phase 0 Item 7 regression: main.rs no longer consults \
+         `{helper_call}` before spawning the depth-20 + depth-200 \
+         pipelines. Under `SubscriptionScope::IndicesUnderlyingsOnly` \
+         the depth pipelines MUST stay parked. See PR-3 + \
+         phase2_recovery.rs::should_spawn_depth_dynamic_pipeline.",
+    );
+
+    // Positive ratchet — the legacy raw-flag read MUST NOT be the gate.
+    // (The flag may still appear as an ARG to the helper; what we
+    // forbid is `let pipeline_v2_active = config.features.depth_dynamic_pipeline_v2;`
+    // as the standalone gate condition.)
+    let legacy_gate = "let pipeline_v2_active = config.features.depth_dynamic_pipeline_v2;";
+    assert!(
+        !src.contains(legacy_gate),
+        "Phase 0 Item 7 regression: main.rs reverted to the legacy \
+         direct flag read `{legacy_gate}` — this bypasses the Phase 0 \
+         scope gate. Use `should_spawn_depth_dynamic_pipeline(scope, \
+         flag)` so `IndicesUnderlyingsOnly` parks depth pipelines \
+         regardless of flag state.",
+    );
+}
+
+#[test]
+fn main_rs_consults_should_spawn_greeks_pipeline_helper() {
+    let src = read_main_rs();
+
+    // Positive ratchet — main.rs MUST call the scope helper before the
+    // greeks pipeline spawn.
+    let helper_call = "should_spawn_greeks_pipeline";
+    assert!(
+        src.contains(helper_call),
+        "Phase 0 Item 7 regression (companion): main.rs no longer \
+         consults `{helper_call}` before spawning the greeks pipeline. \
+         Under Phase 0 the greeks pipeline MUST stay parked (operator's \
+         strategy uses underlying spot ticks only).",
+    );
+
+    // Negative ratchet — the legacy raw `if config.greeks.enabled` gate
+    // MUST NOT be the sole condition.
+    let legacy_gate = "if config.greeks.enabled {";
+    assert!(
+        !src.contains(legacy_gate),
+        "Phase 0 Item 7 regression: main.rs reverted to the legacy \
+         direct flag read `{legacy_gate}` — this bypasses the Phase 0 \
+         scope gate. Use `should_spawn_greeks_pipeline(scope, \
+         greeks_enabled)`.",
+    );
+}
+
+// -----------------------------------------------------------------------
 // B.2 ratchets — main.rs boot code
 // -----------------------------------------------------------------------
