@@ -4532,4 +4532,45 @@ mod tests {
             "set_market_calendar must be idempotent (at most one Ok)"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 0 Item 5 (operator-locked 2026-05-13) — SubscribeRxGuard
+    // production wiring source-scan ratchet (Rule 13 — method-defined-
+    // but-never-called is a bug). The drop-semantics tests above cover
+    // the guard's contract in isolation; this test verifies the guard
+    // is ACTUALLY ACQUIRED inside `run_read_loop` so a future refactor
+    // can't silently remove the call site (which would resurrect the
+    // 10:11/10:15 IST 2026-04-24 silent-socket reconnect cascade).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_subscribe_rx_guard_acquired_in_run_read_loop() {
+        // Read this file at test time and assert the production call site
+        // is present. If a future refactor removes it, this ratchet fails
+        // and the operator must consciously decide what replaces it.
+        let source = include_str!("connection.rs");
+        let call_site = "SubscribeRxGuard::acquire(&self.subscribe_cmd_rx)";
+        assert!(
+            source.contains(call_site),
+            "Phase 0 Item 5: production `run_read_loop` MUST acquire \
+             SubscribeRxGuard so reconnect cycles preserve the subscribe \
+             command channel. Required call site: `{call_site}`. \
+             See PR #337 fix-3 + .claude/rules/project/depth-subscription.md \
+             2026-04-24 Updates §5 for the root-cause writeup.",
+        );
+    }
+
+    #[test]
+    fn test_subscribe_rx_guard_has_drop_impl() {
+        // Pin the Drop impl by source-scan. Without `impl Drop for
+        // SubscribeRxGuard`, the reinstall-on-drop semantic is lost.
+        let source = include_str!("connection.rs");
+        assert!(
+            source.contains("impl Drop for SubscribeRxGuard"),
+            "Phase 0 Item 5: SubscribeRxGuard MUST have a Drop impl \
+             that reinstalls the Option<Receiver> into the slot. \
+             Removing this impl breaks the contract that the next \
+             reconnect cycle can take the receiver again.",
+        );
+    }
 }
