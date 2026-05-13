@@ -95,18 +95,29 @@ All of these stay in the codebase but gated `false` in `config/base.toml`:
 │  ├─ ticks (live, 222 SIDs × ~1 tick/s × 6.25h = ~5M rows/day) │
 │  ├─ candles_1m, _5m, _15m, _1h, _1d (sealed)                  │
 │  ├─ historical_candles (Dhan REST, daily refresh)             │
-│  └─ 15 audit tables (boot, ws_reconnect, order, etc.)         │
-└──────────────────────┬───────────────────────────────────────┘
-                       │
-                       ▼
-┌──────────────────────────────────────────────────────────────┐
-│  GRAFANA + PROMETHEUS — single-page operator dashboard        │
-│  └─ tick rate, indicator state, disconnect counter, P&L       │
+│  ├─ 15 audit tables (boot, ws_reconnect, order, etc.)         │
+│  └─ Built-in web UI at port 9000 = the operator dashboard     │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-**Total Docker services on AWS:** 5 (app + questdb + grafana + prometheus + valkey)
+**Total Docker services on AWS:** 2 (Tickvault app + QuestDB)
 **Total WebSocket connections:** 2 (main feed + order update)
+**Dashboard:** QuestDB built-in UI at port 9000 (SQL queries against live tables)
+**Alerting:** Telegram via teloxide direct from app — no Grafana, no Prometheus, no Alertmanager
+**Cache:** in-app `arc-swap` for token + `papaya` HashMap for instruments — no Valkey
+**Gateway:** AWS ALB free tier or direct port — no Traefik
+
+---
+
+## Phase 0 memory budget on t3.medium (4 GB total)
+
+| Component | RAM | Reason |
+|---|---|---|
+| **QuestDB** | **1.5 GB** | Minute-boundary candle seal bursts + 5M tick/day ingestion + query cache |
+| **Tickvault app** | **1.0 GB** | 5M-tick rescue ring + today/yesterday sealed bars in RAM + indicator state for 222 SIDs + future strategy headroom |
+| **OS + FS cache** | **500 MB** | Linux page cache, kernel TCP buffers, tracing log writes, Docker daemon |
+| **Total used** | **3.0 GB** | |
+| **Headroom (hard floor)** | **1.0 GB** | OOM safety margin (kswapd needs ≥1 GB free) |
 
 ---
 
