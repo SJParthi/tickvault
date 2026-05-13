@@ -182,6 +182,50 @@ pub const fn should_spawn_phase2_scheduler(
     }
 }
 
+/// Phase 0 Item 3 (operator-locked 2026-05-13) — returns `true` iff the
+/// configured scope ALLOWS the depth dynamic pipeline (depth-20 + depth-200
+/// pools) AND the `[features].depth_dynamic_pipeline_v2` flag is on. Under
+/// `IndicesUnderlyingsOnly` the depth pipelines are PARKED entirely
+/// (Phase 0 LEAN MVP per `topic-PHASE-0-LEAN-LOCKED.md`) — operator's
+/// option-buying strategy uses underlying ticks only, not order-book
+/// depth. The feature flag stays in `config/base.toml` so legacy /
+/// FullUniverse + Wave 5 production can flip the v2 cutover.
+///
+/// Pure `const fn`; tested by
+/// `test_should_spawn_depth_dynamic_pipeline_*` ratchets.
+#[must_use]
+pub const fn should_spawn_depth_dynamic_pipeline(
+    scope: tickvault_common::config::SubscriptionScope,
+    feature_flag: bool,
+) -> bool {
+    match scope {
+        // Phase 0 LEAN MVP — depth feeds parked entirely.
+        tickvault_common::config::SubscriptionScope::IndicesUnderlyingsOnly => false,
+        tickvault_common::config::SubscriptionScope::IndicesOnlyAllExpiries
+        | tickvault_common::config::SubscriptionScope::FullUniverse => feature_flag,
+    }
+}
+
+/// Phase 0 Item 3 (operator-locked 2026-05-13) — returns `true` iff the
+/// configured scope ALLOWS the greeks pipeline AND the `[greeks].enabled`
+/// flag is on. Under `IndicesUnderlyingsOnly` the greeks pipeline is
+/// PARKED entirely (Phase 0 LEAN MVP) — operator's option-buying strategy
+/// computes indicators on underlying spot ticks; streaming Delta/Theta/
+/// Vega is Phase 2 territory.
+///
+/// Pure `const fn`; tested by `test_should_spawn_greeks_pipeline_*`.
+#[must_use]
+pub const fn should_spawn_greeks_pipeline(
+    scope: tickvault_common::config::SubscriptionScope,
+    greeks_enabled: bool,
+) -> bool {
+    match scope {
+        tickvault_common::config::SubscriptionScope::IndicesUnderlyingsOnly => false,
+        tickvault_common::config::SubscriptionScope::IndicesOnlyAllExpiries
+        | tickvault_common::config::SubscriptionScope::FullUniverse => greeks_enabled,
+    }
+}
+
 /// Returns the current IST date and seconds-since-IST-midnight for the
 /// recovery decision. Uses `tickvault_common::trading_calendar::ist_offset`
 /// so the definition of "IST" lives in one place.
@@ -376,5 +420,52 @@ mod tests {
         assert!(!should_spawn_phase2_scheduler(
             tickvault_common::config::SubscriptionScope::IndicesUnderlyingsOnly,
         ));
+    }
+
+    // ----------------------------------------------------------------------
+    // Phase 0 Item 3 — depth dynamic pipeline + greeks pipeline scope gates
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_spawn_depth_dynamic_pipeline_skipped_under_phase_0_regardless_of_flag() {
+        // Phase 0 LEAN MVP: depth feeds parked entirely. Flag state IGNORED.
+        for flag in [true, false] {
+            assert!(!should_spawn_depth_dynamic_pipeline(
+                tickvault_common::config::SubscriptionScope::IndicesUnderlyingsOnly,
+                flag,
+            ));
+        }
+    }
+
+    #[test]
+    fn test_should_spawn_depth_dynamic_pipeline_honours_flag_under_other_scopes() {
+        for scope in [
+            tickvault_common::config::SubscriptionScope::IndicesOnlyAllExpiries,
+            tickvault_common::config::SubscriptionScope::FullUniverse,
+        ] {
+            assert!(should_spawn_depth_dynamic_pipeline(scope, true));
+            assert!(!should_spawn_depth_dynamic_pipeline(scope, false));
+        }
+    }
+
+    #[test]
+    fn test_should_spawn_greeks_pipeline_skipped_under_phase_0_regardless_of_flag() {
+        for greeks_enabled in [true, false] {
+            assert!(!should_spawn_greeks_pipeline(
+                tickvault_common::config::SubscriptionScope::IndicesUnderlyingsOnly,
+                greeks_enabled,
+            ));
+        }
+    }
+
+    #[test]
+    fn test_should_spawn_greeks_pipeline_honours_flag_under_other_scopes() {
+        for scope in [
+            tickvault_common::config::SubscriptionScope::IndicesOnlyAllExpiries,
+            tickvault_common::config::SubscriptionScope::FullUniverse,
+        ] {
+            assert!(should_spawn_greeks_pipeline(scope, true));
+            assert!(!should_spawn_greeks_pipeline(scope, false));
+        }
     }
 }
