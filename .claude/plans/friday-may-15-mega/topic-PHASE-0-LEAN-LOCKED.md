@@ -570,6 +570,214 @@ GIFT NIFTY = NIFTY 50 futures on NSE IX (GIFT City), USD-denominated, ~21h/day a
 
 ---
 
+### 24. Order Update WebSocket — 7-layer observability (operator-locked 2026-05-13)
+
+`wss://api-order-update.dhan.co` is a separate WS endpoint streaming JSON order events (MsgCode 42). Today it's connected but has zero disconnect-class observability — same gap main-feed had before this session. Phase 0 closes that gap.
+
+**Components:**
+
+| Layer | Spec |
+|---|---|
+| L1 Prom counters | `tv_order_update_disconnects_total{reason}`, `tv_order_update_reconnect_attempts_total`, `tv_order_update_messages_received_total{msg_code}`, `tv_order_update_source_filter_total{source}` |
+| L2 Prom gauges | `tv_order_update_connected` (0/1), `tv_order_update_last_message_age_secs` |
+| L3 Tracing spans | `#[instrument]` on connect, read_loop, parse_message, route_by_source |
+| L4 Loki logs | `error!(code=ORDER-UPDATE-WS-01, ...)` on disconnect; `info!(code=ORDER-UPDATE-RECV-01, ...)` on every message |
+| L5 Telegram | `OrderUpdateWsDisconnected` (High in-market, Low off-hours), `OrderUpdateWsReconnected` (Info), `OrderUpdateActivityWatchdogTrip` (High) |
+| L6 Grafana | panel cites `increase(tv_order_update_disconnects_total[5m])` + message rate panel |
+| L7 Audit | `order_update_ws_audit` table with `(ts, event, attempt_num, reason_code, duration_ms)` — DEDUP UPSERT KEYS `(ts, event)` |
+
+**Activity watchdog:** Dhan goes silent on idle accounts. Watchdog fires `OrderUpdateActivityWatchdogTrip` if no message in 4h (per `live-order-update.md` rule); during dry_run this will fire frequently — that's expected because we don't place orders.
+
+**Source filter (Source=P vs Source=N):**
+- `Source=P` = our API orders → process
+- `Source=N` = orders placed on Dhan web/app → log to `external_order_audit` table + Telegram `ExternalOrderDetected` (High) so operator knows
+- Anti-conflict: if `Source=N` order modifies a SID we have a strategy position on → CRITICAL alert
+
+**Ratchet tests (mandatory):**
+- `test_order_update_disconnect_writes_audit_row`
+- `test_order_update_source_p_routes_to_strategy_tracker`
+- `test_order_update_source_n_routes_to_external_audit`
+- `test_order_update_activity_watchdog_4h_threshold`
+- `test_order_update_reconnect_with_subscribe_rx_guard_preservation`
+- `test_msg_code_42_required_for_auth_message`
+
+**LoC: ~350 across 4 files.**
+
+---
+
+### 25. P&L tracker scaffolding (operator-locked 2026-05-13)
+
+In-memory P&L state. In dry_run, every "would-be order" runs through tracker and logs hypothetical P&L; in live mode (Phase 2A) the same code path uses real fills.
+
+**State shape:**
+
+```rust
+pub struct PnlState {
+    realized_today: f64,           // sum of all closed positions' P&L
+    unrealized_open: HashMap<(u32, ExchangeSegment), OpenPosition>,
+    daily_total: f64,              // realized + sum(unrealized)
+    daily_loss_floor: f64,         // operator-configured kill trigger
+    daily_profit_target: Option<f64>,
+    high_water_mark: f64,
+    drawdown_from_hwm: f64,
+}
+
+pub struct OpenPosition {
+    entry_price: f64,
+    entry_ts: i64,
+    quantity: u32,
+    lot_size: u32,
+    side: Side,
+    correlation_id: String,
+    sl_price: f64,
+    target_price: f64,
+}
+```
+
+**Hot-path math** (called on every tick for SIDs we have open positions on):
+
+```rust
+fn mark_to_market(&mut self, sid: u32, segment: ExchangeSegment, ltp: f64) {
+    if let Some(pos) = self.unrealized_open.get_mut(&(sid, segment)) {
+        let pnl = (ltp - pos.entry_price) * pos.quantity as f64 * pos.lot_size as f64
+                * match pos.side { Side::Long => 1.0, Side::Short => -1.0 };
+        // O(1), zero allocation
+    }
+}
+```
+
+**Dry-run behavior:** every strategy signal computes hypothetical entry/SL/target, registers as `unrealized_open` row, marks-to-market on every tick, logs to `dry_run_pnl_audit` table at 15:31:30 IST EOD.
+
+**Live behavior (Phase 2A):** flip `dry_run = false` config flag — same code path, real fills update `realized_today`.
+
+**EOD audit table** `pnl_audit`:
+```sql
+CREATE TABLE IF NOT EXISTS pnl_audit (
+  ts TIMESTAMP,
+  trading_date_ist STRING,
+  realized DOUBLE,
+  unrealized DOUBLE,
+  daily_total DOUBLE,
+  high_water_mark DOUBLE,
+  drawdown_pct DOUBLE,
+  mode STRING                    -- dry_run | live
+) DEDUP UPSERT KEYS(trading_date_ist, mode);
+```
+
+**Telegram variants:**
+- `DailyPnlSnapshot` (Info, daily EOD)
+- `DailyLossFloorBreached` (Critical — fires once when daily_total < daily_loss_floor; in live mode triggers kill switch)
+- `DailyProfitTargetHit` (High — operator-info)
+- `DrawdownFromHwmExceeded` (High — 5% drawdown threshold)
+
+**Ratchet tests:**
+- `test_pnl_mark_to_market_is_o1_per_tick`
+- `test_dry_run_pnl_audit_writes_eod_snapshot`
+- `test_daily_loss_floor_breach_fires_critical`
+- `test_pnl_state_resets_at_ist_midnight`
+- `test_high_water_mark_monotonic`
+
+**LoC: ~250 across 3 files.**
+
+---
+
+### 26. Signal + decision audit tables (operator-locked 2026-05-13)
+
+Phase 1 monitoring (22 trading days) needs DATA to prove the strategy works. Today: strategy generates signals but no persistent audit. Fix:
+
+**Two audit tables:**
+
+```sql
+CREATE TABLE IF NOT EXISTS signal_audit (
+  ts TIMESTAMP,                        -- signal fire time
+  trading_date_ist STRING,
+  security_id INT,
+  exchange_segment SYMBOL,
+  strategy_id STRING,
+  indicator_state STRING,              -- JSON snapshot: rsi=58.3, macd_hist=2.1, ...
+  spot_price DOUBLE,                   -- LTP at signal time
+  would_be_action STRING,              -- BUY_CE | BUY_PE | EXIT | HOLD
+  would_be_strike DOUBLE,
+  would_be_entry_price DOUBLE,         -- from /optionchain
+  would_be_sl_price DOUBLE,
+  would_be_target_price DOUBLE,
+  reason STRING                        -- text explanation
+) DEDUP UPSERT KEYS(ts, security_id, strategy_id);
+
+CREATE TABLE IF NOT EXISTS decision_audit (
+  ts TIMESTAMP,
+  trading_date_ist STRING,
+  security_id INT,
+  exchange_segment SYMBOL,
+  strategy_id STRING,
+  no_signal_reason STRING              -- "vix_too_high" | "stale_tick" | "outside_session" | "indicator_not_ready" | "self_trade_cooldown"
+) DEDUP UPSERT KEYS(ts, security_id, strategy_id, no_signal_reason);
+```
+
+**Sampling rule for `decision_audit`:** writing every "no signal" decision = ~5M rows/day. Instead: sample 1 row per minute per SID per strategy (~10K rows/day across 218 stocks × 1 strategy × 60 min × 7.5h = ~98K — still manageable).
+
+**`signal_audit` writes ONLY on signal fire** — naturally bounded to actual signals.
+
+**Phase 1 monitoring queries** these tables answer:
+- "How many BUY_CE signals fired in 22 days?"
+- "What was avg `spot_price` at entry vs the next 30m price?"
+- "Which strategy fires most often?"
+- "What's the top no_signal_reason? (tells us where strategy is being too strict)"
+
+**Ratchet tests:**
+- `test_signal_audit_dedup_includes_strategy_id`
+- `test_decision_audit_sampled_at_one_per_minute_per_sid_strategy`
+- `test_dry_run_writes_to_signal_audit_even_without_orders`
+
+**LoC: ~200 across 2 files.**
+
+---
+
+### 27. Phase 0 documentation bundle (operator-locked 2026-05-13)
+
+8 markdown files. Total ~10,000 words. Sunday afternoon work after code lands.
+
+| # | File | Purpose | Words |
+|---|---|---|---:|
+| 27a | `docs/phases/phase-0-readme.md` | Architecture overview for any new operator / Claude session | ~1,500 |
+| 27b | `docs/runbooks/aws-deployment.md` | Terraform setup, EC2 t3.medium provision, EIP attach, EBS gp3 30GB, IAM role, EventBridge cron 08:30-17:30 IST, security group rules | ~2,000 |
+| 27c | `docs/runbooks/operator-daily-startup.md` | 08:30 IST checklist: check Telegram for BootReadyConfirmation, glance Grafana dashboard, confirm 222/222 SIDs subscribed, confirm prev_close populated | ~800 |
+| 27d | `docs/runbooks/troubleshooting.md` | "What to do when X fails" — one section per ErrorCode (BOOT-01, WS-GAP-01, PHASE2-01, AUTH-GAP-01, PREVCLOSE-01, GAP-FILL-01, OPEN-PRICE-WARN, SELF-TRADE-01, etc.) | ~2,500 |
+| 27e | `docs/runbooks/kill-switch.md` | When/how to activate emergency halt: Phase 2A only; manual flag flip in config + Telegram notify; SEBI implications | ~600 |
+| 27f | `docs/runbooks/backtest-runner.md` | Mac-side workflow: fetch Dhan historical → import QuestDB → sweep strategy params → walk-forward validate → commit winning params | ~1,200 |
+| 27g | `docs/runbooks/phase-1-monitoring-rubric.md` | 22-day dry_run pass/fail criteria: disconnect rate < 5/day, gap-fill success > 99%, cross-verify match > 99.5%, signal fire rate within expected range, no NaN resets, no orphan positions | ~800 |
+| 27h | `.claude/rules/project/phase-0-architecture.md` | Auto-loaded rule for future Claude Code sessions: "Phase 0 is mixed-mode (IDX_I Ticker + NSE_EQ Quote), single-window market hours [09:15, 15:30) + 60s grace, 222 SIDs, dual-gate, seal-then-fetch gap-fill, etc. Do NOT add depth/greeks/movers — they're Phase 2." | ~600 |
+
+**Total: ~10,000 words across 8 files.**
+
+**Mechanical enforcement:** new banned-pattern hook checks `.claude/plans/active-plan-phase-0*.md` exists during Friday build; if not, plan-verify fails.
+
+**Documentation ratchets** (yes, even docs get ratchets):
+- `test_phase_0_readme_mentions_all_22_active_items`
+- `test_troubleshooting_runbook_has_section_for_every_error_code_in_phase_0`
+- `test_aws_deployment_runbook_lists_all_terraform_resources`
+
+---
+
+**Total Friday + Saturday + Sunday build (FINAL FINAL): ~4,970 LoC across 26 top-level items + ~10,000 words across 8 docs.**
+
+## Phase 0 — TRUE FINAL summary (after items 24-27 added)
+
+| Metric | Value |
+|---|---|
+| **Top-level items** | **26** (22 active + 1 PARKED-GIFT + 3 new = items 24/25/26 + 27 docs) |
+| **Total LoC** | **~4,970** |
+| **Total docs** | **8 files, ~10,000 words** |
+| **Total SIDs** | **222** |
+| **Mode mix** | IDX_I Ticker + NSE_EQ Quote |
+| **AWS** | t3.medium, 08:30-17:30 IST Mon-Fri, EIP, gp3 30GB |
+| **AWS cost** | ~₹1,252/mo (75% under cap) |
+| **Effort** | Friday 8h + Saturday 9h + Sunday AM 4h code + PM 6h docs = ~27 focused hours over 3 days |
+| **AWS deploy** | Monday 2026-05-18 |
+| **Phase 1 monitoring** | Mon 2026-05-19 → Mon 2026-06-13 (22 trading days) |
+
+---
+
 ## Honest envelope (the 100% claim)
 
 > "100% inside the tested envelope for Phase 0:

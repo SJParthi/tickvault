@@ -923,3 +923,43 @@ Operator decision after live disconnect storm 09:16-09:29 IST:
 - GIFT NIFTY design remains documented in plan file as PARKED (item 22-OLD) for Phase 2 re-evaluation.
 - Re-eval trigger: Phase 1 monitoring data shows clear demand for overnight gap signal.
 - Phase 0 LOCKED is now 22 items (1-21 + 23, where 23 is prev-close mode mix), 4,170 LoC, 1.5-2 days.
+
+## 2026-05-13 (final-final-final) — Items 24-27 added; real live order placement deferred
+
+### Items 24-27 ADDED to Phase 0 (operator-locked)
+- 24: Order Update WS 7-layer observability — connection + disconnect/reconnect/Source filter + activity watchdog 4h + order_update_ws_audit table + 4 Telegram + 6 ratchets. ~350 LoC.
+- 25: P&L tracker scaffolding — in-memory state (realized/unrealized/daily/HWM/drawdown), dry_run hypothetical P&L on every "would-be" signal, pnl_audit EOD snapshot table, daily-loss-floor / profit-target / drawdown Telegram. ~250 LoC.
+- 26: signal_audit + decision_audit tables with DEDUP UPSERT KEYS, decision_audit sampled at 1 row per minute per SID per strategy (~98K rows/day bounded). ~200 LoC.
+- 27: Phase 0 documentation bundle — 8 markdown files, ~10,000 words total, Sunday afternoon work after code lands.
+  - 27a: docs/phases/phase-0-readme.md
+  - 27b: docs/runbooks/aws-deployment.md
+  - 27c: docs/runbooks/operator-daily-startup.md
+  - 27d: docs/runbooks/troubleshooting.md
+  - 27e: docs/runbooks/kill-switch.md
+  - 27f: docs/runbooks/backtest-runner.md
+  - 27g: docs/runbooks/phase-1-monitoring-rubric.md
+  - 27h: .claude/rules/project/phase-0-architecture.md
+
+### EXPLICITLY DEFERRED to Phase 2A (real live order placement)
+- Order placement REST POST /orders + /super/orders engine wiring (full flow)
+- Pre-trade margin check /v2/margincalculator
+- Order book reconcile every 60s vs /v2/orders
+- Trade book reconcile vs /v2/trades
+- order_audit + trade_audit table population (tables defined in Phase 0, populated only in 2A)
+- Kill switch wiring to real Dhan /v2/killswitch API
+- Drawdown circuit breaker (live mode auto-halt)
+- Position concentration limit enforcement
+- Multi-strategy conflict resolution
+- These ship in Phase 2A (post 22-day dry_run monitoring window)
+
+### Phase 0 TRUE FINAL TALLY (after 24-27)
+- 26 top-level items (1-23 from earlier + 24-27 new; item 22 GIFT NIFTY PARKED)
+- ~4,970 LoC
+- ~10,000 words across 8 docs
+- 3-day build window: Friday 8h + Saturday 9h + Sunday AM 4h code + PM 6h docs = ~27 focused hours
+- 222 SIDs (3 IDX_I + INDIA VIX + 218 NSE_EQ F&O underlyings)
+- Mixed-mode subscription: IDX_I=Ticker, NSE_EQ=Quote
+- AWS t3.medium 08:30-17:30 IST Mon-Fri, EIP, gp3 30GB, ~₹1,252/mo
+- AWS deploy: Mon 2026-05-18
+- Phase 1 monitoring: Mon 2026-05-19 → Mon 2026-06-13 (22 trading days dry_run=true)
+- Phase 2A live trading kickoff: Tue 2026-06-16 (after Phase 1 decision gate)
