@@ -21,7 +21,7 @@
 | Component | Scope | Status |
 |---|---|---|
 | Main feed WebSocket | **1 connection** | Active |
-| Subscribed instruments | **3 indices (NIFTY 13, BANKNIFTY 25, SENSEX 51) + ~218 F&O underlying stocks (NSE_EQ)** | Active |
+| Subscribed instruments | **4 indices (NIFTY 13, BANKNIFTY 25, SENSEX 51, INDIA VIX) + ~218 F&O underlying stocks (NSE_EQ)** = **~222 SIDs total** | Active |
 | Subscription mode | **Ticker only (16-byte packets)** | Active |
 | Order Update WebSocket | 1 connection | Active (separate endpoint, already wired) |
 | Tick processor | Tick → indicator engine → strategy evaluator | Active |
@@ -31,7 +31,7 @@
 | Telegram alerts | Boot, market-open self-test, disconnect/reconnect, daily P&L | Active |
 | Order placement | Super Orders (entry + target + SL + trailing) via REST | Active (dry_run gates) |
 | Option chain lookup | One-shot REST `/v2/optionchain` at entry decision | Active |
-| Historical fetch | Daily post-market 1m candles for 221 SIDs | Active |
+| Historical fetch | Daily post-market 1m candles for 222 SIDs | Active |
 | Cross-verify | Compare live candles vs Dhan historical at 15:31 IST | Active |
 | Backtest runner (Mac) | Offline brute-force on Dhan historical | Active |
 
@@ -51,7 +51,7 @@ All of these stay in the codebase but gated `false` in `config/base.toml`:
 | Phase 2 dispatcher (09:13 IST) | n/a — no stock F&O subscribed | Stock F&O strategies |
 | Depth rebalancer (ATM drift) | n/a — no depth | Same as depth |
 | 4 of 5 main-feed WS conns | n/a — only 1 needed | Total SIDs > 5,000 |
-| Volume monotonicity guard | unchanged (still active, defends 221 SIDs) | — |
+| Volume monotonicity guard | unchanged (still active, defends 222 SIDs) | — |
 | Cross-segment uniqueness (I-P1-11) | unchanged (still active) | — |
 | 15 audit tables | unchanged (still active) | — |
 
@@ -64,7 +64,7 @@ All of these stay in the codebase but gated `false` in `config/base.toml`:
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  DHAN                                                          │
-│  ├─ wss://api-feed.dhan.co     (1 conn, ticker, 221 SIDs)     │
+│  ├─ wss://api-feed.dhan.co     (1 conn, ticker, 222 SIDs)     │
 │  ├─ wss://api-order-update.dhan.co  (1 conn)                   │
 │  ├─ REST /v2/optionchain         (call at entry decision)     │
 │  ├─ REST /v2/super/orders        (place order)                 │
@@ -92,7 +92,7 @@ All of these stay in the codebase but gated `false` in `config/base.toml`:
                        ▼
 ┌──────────────────────────────────────────────────────────────┐
 │  QUESTDB (1.5 GB, t3.medium)                                  │
-│  ├─ ticks (live, 221 SIDs × ~1 tick/s × 6.25h = ~5M rows/day) │
+│  ├─ ticks (live, 222 SIDs × ~1 tick/s × 6.25h = ~5M rows/day) │
 │  ├─ candles_1m, _5m, _15m, _1h, _1d (sealed)                  │
 │  ├─ historical_candles (Dhan REST, daily refresh)             │
 │  └─ 15 audit tables (boot, ws_reconnect, order, etc.)         │
@@ -112,11 +112,12 @@ All of these stay in the codebase but gated `false` in `config/base.toml`:
 
 ## Why this works for the strategy
 
-The operator's strategy: **intraday option BUYING + Fibonacci + multiple indicators + tight stop loss.**
+The operator's strategy: **intraday option BUYING + Fibonacci + multiple indicators + tight stop loss + VIX regime filter.**
 
 | Strategy need | Phase 0 supplies it? |
 |---|---|
-| Underlying direction (RSI/MACD/EMA/Fib on spot) | ✅ Live ticks on 221 underlyings, ticker mode |
+| Underlying direction (RSI/MACD/EMA/Fib on spot) | ✅ Live ticks on 222 underlyings (incl. VIX), ticker mode |
+| **Volatility regime filter (VIX-based gate on entry)** | ✅ INDIA VIX tick stream — high VIX → skip trade or smaller size; low VIX → favorable |
 | Strike selection at entry | ✅ One REST `/optionchain` call |
 | Super Order placement (target + SL + trailing) | ✅ Already wired |
 | Fill / status updates | ✅ Order-update WS (Dhan→us, MsgCode 42) |
@@ -149,7 +150,7 @@ The operator's strategy: **intraday option BUYING + Fibonacci + multiple indicat
 
 | Step | Tool | Time |
 |---|---|---|
-| 1. Pull Dhan historical (CSV cache) | `dhan_historical_fetch` binary | One-time, ~30 min for 5y × 221 SIDs |
+| 1. Pull Dhan historical (CSV cache) | `dhan_historical_fetch` binary | One-time, ~30 min for 5y × 222 SIDs |
 | 2. Bulk import to local QuestDB (Docker) | ILP writer | ~10 min |
 | 3. Run strategy sweep | `backtest_runner` (in-repo binary, same indicator crate) | 5 min → 12h depending on sweep |
 | 4. Walk-forward validate top N | `walk_forward_validator` | ~30 min |
@@ -191,7 +192,7 @@ These came from the disconnect-storm analysis on 2026-05-13. They are universal 
 ## Honest envelope (the 100% claim)
 
 > "100% inside the tested envelope for Phase 0:
-> - 1 WebSocket connection streaming 221 SIDs in Ticker mode
+> - 1 WebSocket connection streaming 222 SIDs in Ticker mode
 > - ≤2s reconnect with subscribe preservation
 > - ≤30s detection of stalled feed (15s for IDX_I)
 > - REST gap-fill keeps 1m candles complete during WS outages ≤5 min
