@@ -272,6 +272,54 @@ CREATE TABLE IF NOT EXISTS gap_fill_audit (
 
 **Total Friday build: ~1,330 LoC. Still achievable in one focused day.**
 
+### 9. Pre-open equilibrium → 09:15 candle.open wiring (operator-locked 2026-05-13)
+
+**Bug observed:** today we treat the **first WS tick after 09:15:00** as the OPEN price for the 09:15 1m candle. WRONG — NSE's OFFICIAL OPEN is the pre-open call-auction equilibrium price frozen at **09:08:00 IST**. The first post-09:15 trade is just the first POST-OPEN trade, not the OPEN.
+
+**Concrete impact:** ₹2-5 silent drift per stock per day on the daily candle's OPEN field. Compounds over backtests. Strategies that use gap-up/gap-down logic see different signals than NSE truth.
+
+**NSE pre-open mechanics:**
+
+| Phase | IST window | Outcome |
+|---|---|---|
+| Order entry | 09:00:00 – 09:07:30 | Buy/sell orders submitted |
+| Call-auction matching | 09:07:30 – 09:08:00 | NSE computes single equilibrium price |
+| Buffer / freeze | 09:08:00 – 09:15:00 | Price locked; this IS the official open |
+| Continuous trading | 09:15:00 onwards | First matched trade is just first post-open trade |
+
+**The fix — per-instrument-class open-price source:**
+
+| Class | 09:15 candle.open source | Fallback chain |
+|---|---|---|
+| IDX_I NIFTY (13) / BANKNIFTY (25) | Pre-open buffer last slot | First WS tick + `OPEN-PRICE-WARN` |
+| IDX_I SENSEX (51) — BSE | BSE pre-open (not in our NSE buffer) | First WS tick + cross-verify flag |
+| IDX_I INDIA VIX | NO pre-open (option-chain-derived) | First WS tick (acceptable) |
+| NSE_EQ (218 F&O stocks) | Pre-open buffer last slot | REST `/v2/marketfeed/quote` `day_open` → first WS tick + warn |
+
+**Mechanical flow at 09:15:00.000 IST:**
+- Aggregator initializes `candle_1m[09:15].open` from buffer (or fallback chain)
+- After 09:15:00.001 ticks update HIGH / LOW / CLOSE / VOLUME only — OPEN is FROZEN
+- 09:16:05 IST: fetch Dhan `/v2/charts/intraday` 09:15 bar across all 222 SIDs; compare our `open` vs Dhan's `open`; mismatch → Telegram CRITICAL `OpenPriceMismatchVsDhan`
+
+**Constants pinned:**
+- `PREOPEN_FREEZE_TIME_IST = 09:08:00.000`
+- `PREOPEN_BUFFER_READ_TIME_IST = 09:14:59.900` (read just before seal)
+- `OPEN_PRICE_REST_FALLBACK_TIME_IST = 09:14:55.000`
+- `OPEN_PRICE_CROSS_CHECK_TIME_IST = 09:16:05.000`
+
+**New audit table `open_price_audit`** — per-SID daily row with `(our_open, dhan_open, source, mismatch_pct, result)`. DEDUP UPSERT KEYS `(trading_date_ist, security_id, exchange_segment)`.
+
+**3 new typed Telegram events:**
+- `OpenPriceFromPreopenBuffer` (Info, daily 09:16:55 summary)
+- `OpenPriceFallbackToFirstTick` (High, per-SID buffer-empty path)
+- `OpenPriceMismatchVsDhan` (Critical, 09:16:05 cross-check failure)
+
+**8 ratchet tests:** open uses buffer for NSE_EQ + NIFTY/BANKNIFTY, falls back to REST then first-tick, OPEN field frozen after 09:15:00.000, first tick only updates close/high/low, Dhan cross-check accuracy, audit DEDUP key invariant.
+
+**LoC: ~700 across 4 files.**
+
+**Total Friday build: ~2,030 LoC across 18 changes.**
+
 ---
 
 ## Honest envelope (the 100% claim)

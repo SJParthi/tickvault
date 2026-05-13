@@ -840,3 +840,14 @@ Operator decision after live disconnect storm 09:16-09:29 IST:
 - Banned-pattern hook category added: any `is_within_market_hours.*now\(\)` → REJECT at commit.
 - Phase 0 Friday build revised: ~1,330 LoC across 14 changes (was ~620 LoC across 8).
 - Post-15:30 cross-verify (live vs Dhan historical, zero tolerance) is unchanged — existing `historical-candles-cross-verify.md` rule continues to apply, runs at 15:31:05 IST after the final bar seals.
+
+## 2026-05-13 (evening) — Pre-open equilibrium = 09:15 candle open
+
+- BUG locked: we currently treat first WS tick after 09:15:00 as the OPEN of the 09:15 1m candle. WRONG. NSE's OFFICIAL OPEN is the pre-open call-auction equilibrium price FROZEN at 09:08:00 IST. The first post-open trade is just the first post-open trade, not the OPEN.
+- IMPACT: ₹2-5 silent drift per stock per day on the daily candle OPEN. Compounds in backtests. Gap-up/gap-down signals differ from NSE truth.
+- FIX: aggregator initializes 09:15 candle.open from preopen_buffer last slot for IDX_I NIFTY/BANKNIFTY + NSE_EQ 218 F&O stocks. SENSEX (BSE) uses first tick + cross-verify flag. VIX (no pre-open) uses first tick. NSE_EQ fallback chain: buffer → REST `/v2/marketfeed/quote.day_open` (at 09:14:55) → first WS tick + warn.
+- INVARIANT: after 09:15:00.000, OPEN field is FROZEN. Ticks only update HIGH/LOW/CLOSE/VOLUME.
+- CROSS-CHECK: at 09:16:05 IST, fetch Dhan `/v2/charts/intraday` 09:15 bar across all 222 SIDs and compare our.open vs dhan.open. Mismatch fires `OpenPriceMismatchVsDhan` (Critical).
+- AUDIT: new `open_price_audit` table — per-SID daily row with `(our_open, dhan_open, source, mismatch_pct, result)`. DEDUP UPSERT KEYS `(trading_date_ist, security_id, exchange_segment)`.
+- 3 new typed Telegram events + 8 ratchet tests.
+- Phase 0 Friday build revised: ~2,030 LoC across 18 changes (was ~1,330 LoC across 14).
