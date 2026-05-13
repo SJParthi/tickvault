@@ -6358,13 +6358,43 @@ fn create_websocket_pool(
     // stock equities → stock derivatives. So truncating the tail drops
     // the lowest-priority items first (typically stock options far from
     // ATM that Phase 2 would otherwise add post-09:12 IST).
-    let effective_capacity = config
-        .dhan
+    // Phase 0 Item 2 (operator-locked 2026-05-13): under
+    // `SubscriptionScope::IndicesUnderlyingsOnly` the planner emits ~222
+    // SIDs (well below the 5000-per-conn Dhan cap). Spinning up 5
+    // main-feed connections would waste 4 idle slots, fragment the
+    // token/IP budget, and trip the pool watchdog with false-positive
+    // "connection idle" signals. `effective_main_feed_pool_size` clamps
+    // the count to `PHASE_0_MAIN_FEED_CONNECTION_COUNT = 1` under that
+    // scope; legacy + Wave 5 scopes honour the configured value.
+    //
+    // Security-review MEDIUM fix (2026-05-13): compute the pool clamp
+    // BEFORE the capacity check so `effective_capacity` and the actual
+    // pool size agree. Pre-fix the capacity check used the configured
+    // (unclamped) value, allowing a future >5000-SID Phase 0 plan to
+    // slip past truncation and then fail `CapacityExceeded` at pool
+    // construction. Harmless today (222 SIDs ≪ 5000) but a logical
+    // inconsistency we close now.
+    let mut dhan_for_pool = config.dhan.clone();
+    let configured_pool_size = dhan_for_pool.max_websocket_connections;
+    let effective_pool_size = tickvault_common::config::effective_main_feed_pool_size(
+        config.subscription.scope,
+        configured_pool_size,
+    );
+    if effective_pool_size != configured_pool_size {
+        info!(
+            scope = config.subscription.scope.as_str(),
+            configured = configured_pool_size,
+            effective = effective_pool_size,
+            "Phase 0 Item 2: main-feed pool size clamped by scope"
+        );
+        dhan_for_pool.max_websocket_connections = effective_pool_size;
+    }
+
+    let effective_capacity = dhan_for_pool
         .max_instruments_per_connection
         .min(tickvault_common::constants::MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION)
         .saturating_mul(
-            config
-                .dhan
+            dhan_for_pool
                 .max_websocket_connections
                 .min(tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS),
         );
@@ -6387,7 +6417,7 @@ fn create_websocket_pool(
     let mut pool = match WebSocketConnectionPool::new_with_optional_wal(
         token_handle.clone(),
         client_id.to_string(),
-        config.dhan.clone(),
+        dhan_for_pool,
         ws_config,
         instruments,
         feed_mode,

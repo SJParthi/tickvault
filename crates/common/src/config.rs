@@ -1148,6 +1148,35 @@ impl SubscriptionScope {
     }
 }
 
+/// Phase 0 Item 2 (operator-locked 2026-05-13) — returns the effective
+/// main-feed WebSocket connection pool size given the configured scope
+/// and the operator's configured `dhan.max_websocket_connections`.
+///
+/// Under `IndicesUnderlyingsOnly` (Phase 0 LEAN MVP, ~222 SIDs) only ONE
+/// main-feed connection is spawned regardless of the configured value;
+/// the remaining 4 slots stay defined in code + ratchets but are never
+/// started. This avoids 4 idle-with-zero-instruments connections that
+/// would waste token/IP budget and produce false-positive watchdog
+/// signals.
+///
+/// Under `IndicesOnlyAllExpiries` and `FullUniverse` the configured
+/// value is honoured (already capped at `MAX_WEBSOCKET_CONNECTIONS = 5`
+/// in `connection_pool.rs::new_with_optional_wal`).
+///
+/// Pure function. Tested by
+/// `test_effective_main_feed_pool_size_under_phase_0_returns_one` +
+/// `test_effective_main_feed_pool_size_under_non_phase_0_returns_configured`.
+#[inline]
+#[must_use]
+pub const fn effective_main_feed_pool_size(scope: SubscriptionScope, configured: usize) -> usize {
+    match scope {
+        SubscriptionScope::IndicesUnderlyingsOnly => {
+            crate::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT
+        }
+        SubscriptionScope::IndicesOnlyAllExpiries | SubscriptionScope::FullUniverse => configured,
+    }
+}
+
 /// Subscription planner configuration.
 ///
 /// Controls which instruments are subscribed and at what feed mode.
@@ -2532,6 +2561,54 @@ mod tests {
             wrapper.subscription.scope.as_str(),
             "indices_underlyings_only"
         );
+    }
+
+    // Phase 0 Item 2 — effective_main_feed_pool_size helper.
+
+    #[test]
+    fn test_effective_main_feed_pool_size_under_phase_0_returns_one() {
+        // Configured value is IGNORED under IndicesUnderlyingsOnly — the
+        // Phase 0 plan emits ~222 SIDs which fit on a single connection,
+        // and the other 4 slots stay dormant.
+        for configured in [0, 1, 2, 3, 4, 5, 10, 100] {
+            assert_eq!(
+                effective_main_feed_pool_size(
+                    SubscriptionScope::IndicesUnderlyingsOnly,
+                    configured
+                ),
+                crate::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT,
+                "Phase 0 must always emit {} main-feed conn regardless of configured value {configured}",
+                crate::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT,
+            );
+        }
+    }
+
+    #[test]
+    fn test_effective_main_feed_pool_size_under_non_phase_0_returns_configured() {
+        // Wave 5 + FullUniverse scopes honour the operator's configured value
+        // (the connection_pool constructor still caps at MAX_WEBSOCKET_CONNECTIONS=5).
+        for configured in [1, 2, 3, 4, 5] {
+            assert_eq!(
+                effective_main_feed_pool_size(
+                    SubscriptionScope::IndicesOnlyAllExpiries,
+                    configured
+                ),
+                configured,
+            );
+            assert_eq!(
+                effective_main_feed_pool_size(SubscriptionScope::FullUniverse, configured),
+                configured,
+            );
+        }
+    }
+
+    #[test]
+    fn test_phase_0_main_feed_connection_count_constant_pinned_at_1() {
+        // Defensive ratchet — Phase 0 LEAN MVP locks this at 1. Changing
+        // to >1 means the Phase 0 scope is no longer "lean" by definition;
+        // operator must re-approve and update PHASE_0_TOTAL_SIDS_TARGET
+        // capacity math.
+        assert_eq!(crate::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT, 1);
     }
 
     #[test]
