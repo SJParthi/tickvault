@@ -815,3 +815,18 @@ Category D — Nightly EBS snapshot: FALSE alarm (AWS Backup is server-side)
 **Plan files needing edits in Friday work: 8 files, ~30 line changes total.**
 
 Discussion mode continues. NO IMPLEMENTATION.
+
+2026-05-13 ~10:30 IST — PHASE 0 LEAN PLAN LOCKED
+================================================
+Operator decision after live disconnect storm 09:16-09:29 IST:
+- Scope shrinks from full universe (10K instruments, 11 WS conns) to lean MVP (~221 instruments, 2 WS conns)
+- Only 3 indices + 218 F&O underlying stocks in Ticker mode on 1 main-feed WS conn
+- Order Update WS stays (already separate endpoint)
+- Depth-20, Depth-200, Greeks pipeline, Movers pipeline, dynamic selectors, Phase 2 dispatcher, depth rebalancer — ALL PARKED to Phase 2 via feature flags
+- AWS tier drops from c7i.xlarge (8GB / ~Rs 3530/mo) to t3.medium (4GB / ~Rs 700/mo) — total infra ~Rs 1252/mo (75% under Rs 5K budget)
+- Mac dev + Mac backtest (Dhan historical alone, no Groww needed)
+- Friday 2026-05-15 build: 3 subscription/conn changes + 5 hardening changes from disconnect-storm analysis = ~620 LoC
+- 6-week path: build (Fri) → backtest validate (weekend) → AWS deploy (Mon) → Phase 1 dry_run 22 trading days → Phase 2A 1 strategy live 2 weeks → Phase 2B feature re-enable per data
+- All other 35+ topic files in friday-may-15-mega/ are now Phase 2 reference material; LOCKED file is self-contained for Friday build
+- Canonical file: topic-PHASE-0-LEAN-LOCKED.md
+
