@@ -812,6 +812,27 @@ pub struct WebSocketConfig {
     /// Prevents all connections from hitting Dhan's server simultaneously at startup.
     /// 0 = no stagger (all spawn immediately). Only affects initial startup, not reconnects.
     pub connection_stagger_ms: u64,
+
+    /// Phase 0 Item 4 (operator-locked 2026-05-13) — per-conn activity
+    /// watchdog threshold in seconds. Defaults to the legacy
+    /// `WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS = 50` value when unset
+    /// in TOML; main.rs overrides this at boot under
+    /// `SubscriptionScope::IndicesUnderlyingsOnly` to
+    /// `WATCHDOG_THRESHOLD_IDX_I_SECS = 3` via the helper
+    /// `effective_main_feed_watchdog_threshold_secs`. Connection-level
+    /// reads this field in place of the const so the override flows
+    /// through.
+    #[serde(default = "default_activity_watchdog_threshold_secs")]
+    pub activity_watchdog_threshold_secs: u64,
+}
+
+fn default_activity_watchdog_threshold_secs() -> u64 {
+    // Mirror of WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS in the core crate.
+    // We can't import it here (common is below core in the dep graph) so
+    // we hard-pin and ratchet the equality via
+    // `crates/core/src/websocket/activity_watchdog.rs::tests::
+    //  test_legacy_threshold_default_matches_websocket_config_default`.
+    50
 }
 
 /// QuestDB connection configuration.
@@ -1879,6 +1900,7 @@ mod tests {
                 reconnect_max_attempts: 10,
                 subscription_batch_size: 100,
                 connection_stagger_ms: 10000,
+                activity_watchdog_threshold_secs: default_activity_watchdog_threshold_secs(),
             },
             questdb: QuestDbConfig {
                 host: "tv-questdb".to_string(),
