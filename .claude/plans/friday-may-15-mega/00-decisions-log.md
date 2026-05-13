@@ -1014,3 +1014,23 @@ Operator decision after live disconnect storm 09:16-09:29 IST:
 - 3-day build window (Fri+Sat+Sun) — unchanged
 - 222 SIDs, mixed-mode (IDX_I=Ticker, NSE_EQ=Quote)
 - AWS t3.medium 08:30-17:30 IST Mon-Fri ~rupees-1,252/mo
+
+## 2026-05-13 (after-after-final) — Item 30 % from prev_close column
+
+### Item 30 ADDED — per-minute pct_from_prev_close in candles tables
+- ALTER ADD COLUMN IF NOT EXISTS `pct_from_prev_close DOUBLE` on candles_1m/_5m/_15m/_1h/_1d
+- Computed at every bar seal: (close - prev_close_cache[sid,segment]) / prev_close * 100.0
+- DEDUP UPSERT KEYS UNCHANGED — composite (security_id, exchange_segment, ts, timeframe) already uniquely identifies each row (per I-P1-11 rule). The new pct field is just a new attribute on the existing row, NOT a new identity dimension.
+- Cross-verify overwrite (item 28) also triggers pct recompute on corrected bars
+- Daily candle (candles_1d) uses self-referential lookup: prev_close = yesterday's candles_1d.close
+- Edge cases: prev_close < 1e-9 → skip (degenerate); cache miss → skip + Telegram Low
+- 8 ratchet tests pin the invariants including `test_candle_dedup_key_unchanged_security_segment_ts_timeframe`
+- LoC: ~400
+
+### Phase 0 TRUE FINAL FINAL FINAL TALLY (after item 30)
+- 29 active items (item 22 GIFT NIFTY PARKED)
+- 37 checkboxes
+- ~5,820 LoC + ~10,000 words across 8 docs
+- 3-day build window unchanged
+- 222 SIDs, mixed-mode (IDX_I=Ticker, NSE_EQ=Quote)
+- AWS t3.medium 08:30-17:30 IST Mon-Fri ~rupees-1,252/mo
