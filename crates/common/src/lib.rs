@@ -22,6 +22,7 @@ pub mod formulas;
 pub mod instrument_registry;
 pub mod instrument_types;
 pub mod market_hours;
+pub mod open_price_source;
 pub mod order_types;
 pub mod phase;
 pub mod sanitize;
