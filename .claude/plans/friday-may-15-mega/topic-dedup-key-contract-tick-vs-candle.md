@@ -12,14 +12,20 @@
 
 ---
 
-## The two contracts
+## The two contracts (REVISED 2026-05-13 late-evening — 6 TFs, no 1s, no matviews)
 
 | Table family | DEDUP UPSERT KEYS | Purpose |
 |---|---|---|
-| `ticks` (one table) | `(security_id, exchange_segment, ts, sequence_number)` | every WebSocket tick stored exactly once |
-| `candles_1m` / `_5m` / `_15m` / `_1h` / `_1d` (5 tables) | `(security_id, exchange_segment, ts, timeframe)` | every sealed bar stored exactly once |
-| `historical_candles` (cold path) | `(security_id, exchange_segment, ts, timeframe)` | Dhan REST snapshots |
-| `previous_close` | `(security_id, exchange_segment, trading_date_ist)` | end-of-day close per SID |
+| `ticks` (one table) | `(ts, security_id, exchange_segment, sequence_number)` | every WebSocket tick stored exactly once |
+| **6 candle base tables**: `candles_1m`, `candles_3m`, `candles_5m`, `candles_15m`, `candles_1h`, `candles_1d` | `(ts, security_id, segment)` per table | every sealed bar stored exactly once; table name IS the timeframe |
+| `historical_candles` (cold path) | `(ts, security_id, exchange_segment, timeframe)` | Dhan REST snapshots — single table holds multiple TFs, hence `timeframe` IS in the key |
+| `previous_close` | `(trading_date_ist, security_id, exchange_segment)` | end-of-day close per SID |
+
+**Removed from Phase 0:**
+- `candles_1s` base table — DELETED. Aggregator computes 1m directly from ticks in RAM.
+- All `candles_*` materialized views — DELETED. Each TF is its own native base table written by the in-RAM aggregator.
+
+**Why no `timeframe` column on the 6 live candle tables:** each TF lives in its own table; the table name IS the timeframe. Including a redundant `timeframe` column would be dead weight. (Contrast with `historical_candles`, which is a single table holding all 6 TFs — there `timeframe` must be in the key.)
 
 ---
 
@@ -34,14 +40,19 @@
 | `ts` | Identifies when the tick happened | Earlier ticks overwritten by later ones — silent history loss |
 | `sequence_number` | Disambiguates **same-microsecond** ticks for the same SID | Burst-quote ticks collapse onto one row — silent data loss |
 
-### Candles — `(security_id, exchange_segment, ts, timeframe)`
+### Candles — `(ts, security_id, segment)` per table (6 tables, no timeframe column)
 
 | Component | Why it's needed | What breaks without it |
 |---|---|---|
+| `ts` | Identifies the bar's start instant (1m: minute; 3m/5m/15m: bucket start; 1h: hour; 1d: midnight IST) | Adjacent bars collapse |
 | `security_id` | Identifies the instrument | Cross-stock collision |
-| `exchange_segment` | Same I-P1-11 rule | Cross-segment collision |
-| `ts` | Identifies the bar's start minute (or day for `_1d`) | Adjacent bars collapse |
-| `timeframe` | Belt-and-suspenders — even though tables are segregated by TF, having it in the key is harmless and survives any future refactor that merges tables | If tables ever merge, 09:15 1-min + 09:15 5-min collide |
+| `segment` | I-P1-11 rule: same SID can exist on IDX_I (e.g. FINNIFTY=27) AND NSE_EQ (=27) | Cross-segment collision (the 2026-04-17 prod bug) |
+
+**No `timeframe` column** because each TF is its own base table. `candles_1m` holds only 1m bars, `candles_3m` only 3m, etc. The table name IS the timeframe. Adding a redundant column would waste storage and create a fake-uniqueness invariant.
+
+### Historical candles (cold path) — `(ts, security_id, exchange_segment, timeframe)`
+
+Different from live candles: `historical_candles` is a SINGLE table holding all 6 TFs from Dhan REST. Therefore `timeframe` MUST be in the key — otherwise the same SID's 1m bar and 5m bar at the same `ts` would collide.
 
 ---
 

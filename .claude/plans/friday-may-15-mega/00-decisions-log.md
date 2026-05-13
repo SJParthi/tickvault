@@ -1047,3 +1047,38 @@ Operator decision after live disconnect storm 09:16-09:29 IST:
 - Mechanical ratchets named (7 tests including item 30's no-op guarantee)
 - Auto-driver explanation + cross-refs to security-id-uniqueness.md, wave-2/6 error codes
 - Locks item 30's "no DEDUP change" promise as a build-failing test
+
+## 2026-05-13 late evening — 6-TF + no-1s + no-matview lock
+
+### CANDLE SCHEMA RESHAPED
+- Timeframes LOCKED at **6 base tables**: `1m`, `3m`, `5m`, `15m`, `1h`, `1d`
+- **NO `candles_1s` base table** — wasteful and never read on hot path
+- **NO matviews anywhere** — every TF is its own base table fed by in-RAM aggregator
+- 1h uses `'00:15'` IST offset (NSE market-open aligned, matches Dhan `/charts/intraday?interval=60`)
+- All other TFs use `'00:00'` IST midnight alignment
+- DEDUP UPSERT KEYS per candle table: `(ts, security_id, segment)` — NO `timeframe` column (each TF has its own table; table name IS the timeframe)
+- Historical candles table keeps `timeframe` in key (single table, multiple TFs)
+
+### PREV-CLOSE TWO-SOURCE ROUTING LOCKED (Dhan Ticket #5525125)
+- **IDX_I** (4 SIDs: NIFTY, BANKNIFTY, SENSEX, INDIA VIX) → standalone PrevClose packet code 6, `buf[8..12]` f32 LE, auto-fires at subscribe
+- **NSE_EQ** (218 F&O stocks) → Quote packet `close` field bytes 38-41 (Dhan-mislabeled — it's previous session's close, NOT today's running close); read on first tick, cache for the day
+- INDIA VIX explicitly part of IDX_I routing (operator confirmed needed for vol-regime gate)
+- Cold-boot loader (`populate_prev_day_cache_at_boot`) reads `previous_close` table from QuestDB so RAM cache is warm before first tick
+
+### RAM-FIRST CHARTER REAFFIRMED
+- Today's sealed bars (all 6 TFs) stay in RAM — strategy/indicator/risk read RAM ONLY
+- Yesterday's sealed bars in RAM for continuity
+- QuestDB is write-only on hot path (cold path: cross-verify, dashboards, boot rehydration)
+- Banned-pattern guard: `SELECT` from indicator/strategy/risk paths fails build
+
+### ITEM 30 REVISED
+- Column name kept as Wave-5 naming: `close_pct_from_prev_day` (NOT `pct_from_prev_close`)
+- Sister columns added: `oi_pct_from_prev_day` (NULL in Phase 0), `volume_pct_from_prev_day`
+- ALTER ADD COLUMN on 6 tables (not 5 — added 3m)
+- 17 ratchet tests including `test_no_candles_1s_base_table_in_ddl` and `test_no_materialized_views_in_storage_crate`
+
+### Phase 0 TRUE-FINAL TALLY (after late-evening reshape)
+- 29 active items, 37 checkboxes, ~5,900 LoC
+- 223 SIDs subscribed: 4 indices (Ticker) + 218 stocks (Quote)
+- 6 candle base tables + 1 ticks table + 15 audit tables
+- ZERO matviews, ZERO `candles_1s`
