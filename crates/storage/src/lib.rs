@@ -82,6 +82,7 @@ pub mod greeks_persistence;
 pub mod historical_fetch_marker;
 pub mod indicator_snapshot_persistence;
 pub mod instrument_persistence;
+pub mod last_tick_audit_persistence;
 pub mod materialized_views;
 // 2026-05-09 PR 5c.5-final (Bug 3 — movers retirement): the
 // `movers_base_persistence` + `movers_writer` modules are DELETED.
