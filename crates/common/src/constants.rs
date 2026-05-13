@@ -877,6 +877,82 @@ pub const STOCK_OPTION_ATM_STRIKES_EACH_SIDE: usize = 25;
 pub const MAX_TOTAL_SUBSCRIPTIONS_TARGET: usize = 24_500;
 
 // ---------------------------------------------------------------------------
+// Phase 0 LEAN MVP — locked universe pins (2026-05-13 operator decision)
+// ---------------------------------------------------------------------------
+
+/// INDIA VIX SecurityId on the IDX_I segment.
+///
+/// Pinned from the Dhan instrument master CSV — cross-checked against
+/// `DISPLAY_INDICES` entry `("INDIA VIX", 21, "Volatility")` above. Used by
+/// Phase 0 planner to filter display indices to VIX only under the
+/// `IndicesUnderlyingsOnly` scope (Item 1 of `topic-PHASE-0-LEAN-LOCKED.md`).
+pub const INDIA_VIX_SECURITY_ID: u32 = 21;
+
+/// Phase 0 IDX_I subscription whitelist (4 SIDs in Ticker mode):
+/// NIFTY (13) + BANKNIFTY (25) + SENSEX (51) + INDIA VIX (21).
+///
+/// Source of truth for the Phase 0 LEAN scope per
+/// `topic-PHASE-0-LEAN-LOCKED.md` line 24. Adding/removing entries must
+/// also update `PHASE_0_IDX_I_COUNT` (compile-time enforced below).
+pub const PHASE_0_IDX_I_SYMBOLS: &[&str] = &["NIFTY", "BANKNIFTY", "SENSEX", "INDIA VIX"];
+
+/// Phase 0 IDX_I count: 4 (= NIFTY + BANKNIFTY + SENSEX + INDIA VIX).
+pub const PHASE_0_IDX_I_COUNT: usize = 4;
+
+/// Phase 0 total subscription target: ~222 SIDs
+/// (4 IDX_I + ~218 NSE_EQ F&O underlyings).
+///
+/// Hard ceiling — Telegram WARN if planner output exceeds this under the
+/// `IndicesUnderlyingsOnly` scope. The 218 NSE_EQ count varies day-to-day
+/// with the F&O underlying list (NSE adds/removes stocks); 230 leaves
+/// headroom without admitting drift past the lean-MVP target.
+pub const PHASE_0_TOTAL_SIDS_TARGET: usize = 230;
+
+const _: () = assert!(
+    PHASE_0_IDX_I_COUNT == PHASE_0_IDX_I_SYMBOLS.len(),
+    "PHASE_0_IDX_I_COUNT does not match PHASE_0_IDX_I_SYMBOLS.len()"
+);
+
+/// Compile-time cross-check (Phase 0 Item 1 hostile-review H3 fix,
+/// 2026-05-13): `INDIA_VIX_SECURITY_ID` MUST match the SID of the
+/// `"INDIA VIX"` entry in `DISPLAY_INDEX_ENTRIES`. Without this assert
+/// a future edit to `DISPLAY_INDEX_ENTRIES` (e.g. Dhan re-issues VIX
+/// to a different SID and someone updates only the entries table)
+/// would silently desync the constant from the universe builder's
+/// view of VIX, causing the Phase 0 planner to drop VIX entirely.
+const _: () = {
+    // Linear scan — compile-time, ~24 iterations, free at runtime.
+    let mut i = 0;
+    let mut found = false;
+    while i < DISPLAY_INDEX_ENTRIES.len() {
+        let (name, sid, _) = DISPLAY_INDEX_ENTRIES[i];
+        // const fn-safe byte compare for "INDIA VIX".
+        if name.len() == 9
+            && name.as_bytes()[0] == b'I'
+            && name.as_bytes()[1] == b'N'
+            && name.as_bytes()[2] == b'D'
+            && name.as_bytes()[3] == b'I'
+            && name.as_bytes()[4] == b'A'
+            && name.as_bytes()[5] == b' '
+            && name.as_bytes()[6] == b'V'
+            && name.as_bytes()[7] == b'I'
+            && name.as_bytes()[8] == b'X'
+        {
+            assert!(
+                sid == INDIA_VIX_SECURITY_ID,
+                "INDIA_VIX_SECURITY_ID must match DISPLAY_INDEX_ENTRIES INDIA VIX SID"
+            );
+            found = true;
+        }
+        i += 1;
+    }
+    assert!(
+        found,
+        "DISPLAY_INDEX_ENTRIES must contain an INDIA VIX entry — Phase 0 depends on it"
+    );
+};
+
+// ---------------------------------------------------------------------------
 // F&O Universe — Index Aliases (FNO symbol → IDX_I symbol)
 // ---------------------------------------------------------------------------
 
