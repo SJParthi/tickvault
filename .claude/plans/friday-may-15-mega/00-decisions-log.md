@@ -888,3 +888,28 @@ Operator decision after live disconnect storm 09:16-09:29 IST:
 - 22 top-level items (with sub-items in #22) = ~4,120 LoC
 - 1.5-2 focused days (Friday + Saturday morning)
 - AWS cost: ~₹1,275/mo (75% under budget)
+
+## 2026-05-13 (final session) — Prev-close mode mix + Phase 0 FINALIZED
+
+### Bug found and fixed (item 23)
+- Ticker-only mode CANNOT fetch prev_close for NSE_EQ stocks. Code 6 PrevClose packet is IDX_I-only. NSE_EQ requires Quote (bytes 38-41) or Full (bytes 50-53).
+- Mixed-mode locked: IDX_I=Ticker (gets code 6), NSE_EQ 218 stocks=Quote (gets bytes 38-41), GIFT NIFTY=Ticker (pending).
+- Bandwidth: ~250 MB/day vs ~78 MB/day. Trivial on t3.medium.
+- Belt-and-suspenders: REST /v2/charts/historical interval=1d fetch at 06:30 IST boot for all 222 SIDs. Populates RAM cache BEFORE market opens.
+- PrevCloseMissingAtMarketOpen Critical Telegram at 09:14:55 if any SID lacks data.
+- Banned-pattern hook: Ticker subscription on NSE_EQ → REJECT at commit.
+
+### Phase 0 LOCKED FINAL TALLY
+- Top-level items: 23
+- Total LoC: ~4,750
+- Friday + Saturday: ~2 focused days
+- Total SIDs: 223 (222 NSE/IDX_I + 1 GIFT NIFTY pending)
+- Mode mix: IDX_I Ticker + NSE_EQ Quote + GIFT Ticker
+- AWS cost: ~₹1,275/mo (75% under ₹5K cap)
+- AWS schedule: 06:30-15:45 IST Mon-Fri (revised for GIFT NIFTY)
+- Branch: claude/trading-tick-vault-BkvpS
+- Phase 0 LOCKED is COMPLETE pending operator pre-flight verification on Thu 2026-05-14:
+  1. GIFT NIFTY in Dhan instrument master CSV
+  2. SENSEX code 6 packet behavior
+  3. NSE_EQ Quote mode bytes 38-41 prev_close verification
+  4. /v2/charts/historical interval=1d format verification

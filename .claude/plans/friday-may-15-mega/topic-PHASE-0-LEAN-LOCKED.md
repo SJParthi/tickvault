@@ -479,6 +479,56 @@ GIFT NIFTY = NIFTY 50 futures on NSE IX (GIFT City), USD-denominated, ~21h/day a
 
 **Total Friday + Saturday build: ~4,120 LoC across 22 top-level items (with 7 sub-items in #22). Approximately 1.5-2 focused days.**
 
+### 23. Prev-close mode mix — fix Ticker-only blind spot (operator-locked 2026-05-13)
+
+**Bug:** Phase 0 was Ticker-only for all 222 SIDs. Per Dhan Ticket #5525125 binary protocol:
+
+| Segment | Ticker | Quote | Full | Code 6 standalone |
+|---|:---:|:---:|:---:|:---:|
+| IDX_I (NIFTY/BANKNIFTY/SENSEX/VIX) | ❌ no field | ❌ Dhan rejects on IDX_I | ❌ Dhan rejects on IDX_I | ✅ bytes 8-11 f32 (auto-fires) |
+| **NSE_EQ (218 F&O stocks)** | ❌ no field | ✅ **bytes 38-41 f32 (`close`=prev day)** | ✅ bytes 50-53 | ❌ never sent |
+| NSE_FNO | ❌ no field | ✅ bytes 38-41 | ✅ bytes 50-53 | ❌ never sent |
+
+**Impact:** 218 stocks would have NO prev_close in Phase 0. Gap detection / % change / risk filter all broken on stocks.
+
+**Fix — MIXED-MODE subscription:**
+
+| Segment | NEW Phase 0 mode | Source of prev_close |
+|---|---|---|
+| IDX_I (4 SIDs) | Ticker | Code 6 packet (auto-fires) |
+| **NSE_EQ (218 SIDs)** | **Quote (50-byte)** | bytes 38-41 of every Quote packet |
+| NSE_IFSC GIFT NIFTY (1 SID) | Ticker (default; verify Thu) | TBD |
+
+**Bandwidth impact:** ~78 MB/day (Ticker only) → ~250 MB/day (mixed). Trivial on t3.medium. AWS egress unchanged (we receive, not send).
+
+**Belt-and-suspenders — REST boot-time prev_close fetch:**
+
+- `/v2/charts/historical?interval=1d` for previous trading day, all 222 SIDs
+- One-shot at 06:30 IST boot
+- ~222 calls @ 5/sec = ~45s
+- Populates RAM `prev_close_cache` BEFORE market opens
+- Source field: `PrevCloseSource::{ Code6Packet, QuotePacket, RestHistorical, Fallback }`
+- New Telegram `PrevCloseMissingAtMarketOpen` (Critical) at 09:14:55 IST if any SID lacks prev_close → skip strategy on that SID
+
+**Constants pinned:**
+- `PREV_CLOSE_BOOT_FETCH_TIME_IST = 06:30:00`
+- `PREV_CLOSE_FALLBACK_DEADLINE_IST = 09:14:55`
+
+**Banned-pattern hook:** Ticker subscription on NSE_EQ → REJECT at commit (anti-regression).
+
+**Audit table** `prev_close_audit` extended with `source` column. DEDUP UPSERT KEYS `(trading_date_ist, security_id, exchange_segment)`.
+
+**Ratchet tests (mandatory):**
+- `test_prev_close_source_for_idx_i_is_code_6_packet`
+- `test_prev_close_source_for_nse_eq_is_quote_bytes_38_41`
+- `test_rest_historical_fetch_populates_cache_at_boot`
+- `test_prev_close_missing_at_market_open_fires_critical_telegram`
+- `test_banned_pattern_rejects_ticker_mode_on_nse_eq`
+
+**LoC: ~630 across 6 sub-items.**
+
+**Total Friday + Saturday build: ~4,750 LoC across 23 top-level items. ~2 focused days.**
+
 ---
 
 ## Honest envelope (the 100% claim)
