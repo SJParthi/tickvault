@@ -2318,6 +2318,129 @@ pub const fn is_bar_eligible_for_gap_fill(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 0 Item 11 — Dual-Gate Market-Hours (operator-locked 2026-05-13)
+// ---------------------------------------------------------------------------
+//
+// Per `topic-PHASE-0-LEAN-LOCKED.md` §8: split market-hours filtering
+// into TWO independent gates so a tick stamped `exchange_timestamp =
+// 15:29:59.586 IST` is NOT rejected just because the local wall-clock
+// has advanced to `15:30:00.100 IST` by the time the gate evaluates.
+//
+//   G1 EXCHANGE GATE (the truth)
+//     Source:    tick.exchange_timestamp_ist (Dhan-stamped, IST)
+//     Boundary:  [09:15:00.000, 15:30:00.000) — EXCLUSIVE on close
+//     Decides:   whether the tick belongs to the current trading session.
+//                The 15:29:59.999 tick is accepted; the 15:30:00.000 tick
+//                is rejected.
+//
+//   G2 WALL-CLOCK GATE (wait window)
+//     Source:    local now_ist()
+//     Boundary:  open until 15:31:00 IST (60s grace after session close)
+//     Decides:   when to close the WebSocket socket / seal the final bar.
+//                The grace covers Dhan ingestion + network delay tail —
+//                a tick stamped 15:29:59 that arrives at 15:30:30 wall-
+//                clock IS still in scope; only after 15:31:00 IST does
+//                the socket close.
+//
+// Why 60s grace and not 5s: Dhan ingestion + network at close-of-day
+// spike can delay last ticks up to ~45s. 60s safely covers; matches
+// T+1-minute industry trade-reporting tail.
+//
+// Banned-pattern hook (to be added in follow-up): rejects any
+// `is_within_market_hours.*now()` — code must use
+// `tick.exchange_timestamp_ist` not `now_ist()` for the G1 gate.
+
+/// G1 Exchange Gate — session open in IST nanoseconds-of-day.
+/// 09:15:00.000 IST = 9*3600*1e9 + 15*60*1e9 = 33_300 * 1e9.
+pub const MARKET_OPEN_IST_NANOS: i64 = 33_300_000_000_000;
+
+/// G1 Exchange Gate — session close in IST nanoseconds-of-day.
+/// 15:30:00.000 IST = 55_800 * 1e9. **EXCLUSIVE** — a tick at exactly
+/// 15:30:00.000 is REJECTED (matches the existing
+/// `TICK_PERSIST_END_SECS_OF_DAY_IST = 55_800` exclusive contract).
+pub const MARKET_CLOSE_IST_NANOS: i64 = 55_800_000_000_000;
+
+/// G2 Wall-Clock Gate — grace period in seconds AFTER `MARKET_CLOSE_IST`
+/// during which the WebSocket socket stays open to absorb late-arriving
+/// ticks stamped before close.
+pub const WS_GRACE_AFTER_CLOSE_SECS: u64 = 60;
+
+/// G2 Wall-Clock Gate — number of seconds AFTER session-end bar
+/// (15:29-15:30) before forcing the seal. Matches `WS_GRACE_AFTER_CLOSE_SECS`
+/// by design: the 15:29 bar seals at 15:31:00 IST exchange-ts so any
+/// late-arriving tick within the 60s grace lands in its true bar.
+pub const BAR_FINAL_SEAL_OFFSET_SECS: u64 = 60;
+
+/// Soft anomaly threshold — if a tick arrives with `exchange_ts` more
+/// than `LATE_TICK_ANOMALY_THRESHOLD_MS` BEHIND the local wall-clock
+/// receive time, emit a `LastTickAfterBoundary` Info Telegram event.
+/// Helps operators spot Dhan-side ingestion lag or our own clock skew
+/// without halting tick acceptance.
+pub const LATE_TICK_ANOMALY_THRESHOLD_MS: u64 = 30_000;
+
+// Compile-time consistency: BAR_FINAL_SEAL_OFFSET_SECS must equal
+// WS_GRACE_AFTER_CLOSE_SECS — they're two views of the same 60s
+// grace window. Drift would let the socket close before the final
+// seal fires (or vice versa), leaving an inconsistent state.
+const _: () = assert!(
+    BAR_FINAL_SEAL_OFFSET_SECS == WS_GRACE_AFTER_CLOSE_SECS,
+    "BAR_FINAL_SEAL_OFFSET_SECS and WS_GRACE_AFTER_CLOSE_SECS must be equal — \
+     they describe the same 60s grace window in two roles"
+);
+
+// Compile-time consistency: MARKET_CLOSE_IST_NANOS must equal
+// TICK_PERSIST_END_SECS_OF_DAY_IST converted to nanos. If anyone
+// shifts one without the other, the G1 gate disagrees with the
+// existing persist gate.
+const _: () = assert!(
+    MARKET_CLOSE_IST_NANOS == (TICK_PERSIST_END_SECS_OF_DAY_IST as i64) * 1_000_000_000,
+    "MARKET_CLOSE_IST_NANOS must match TICK_PERSIST_END_SECS_OF_DAY_IST × 1e9"
+);
+
+const _: () = assert!(
+    MARKET_OPEN_IST_NANOS < MARKET_CLOSE_IST_NANOS,
+    "Session open must be strictly before session close"
+);
+
+/// Phase 0 Item 11 — G1 Exchange Gate. Returns `true` iff the tick's
+/// `exchange_timestamp_ist` (IST nanoseconds-of-day) is within the
+/// half-open session window `[09:15:00.000, 15:30:00.000)`.
+///
+/// This is the SOLE source-of-truth gate for "does this tick belong
+/// to the trading session?". Local wall-clock is irrelevant here —
+/// only the Dhan-stamped timestamp matters. The dual-gate fix
+/// (`topic-PHASE-0-LEAN-LOCKED.md` §8) cured the bug where a tick at
+/// `exchange_ts = 15:29:59.586` was rejected because the local clock
+/// had advanced to `15:30:00.100`.
+///
+/// Pure `const fn`; tested by `test_g1_exchange_gate_*` ratchets.
+#[inline]
+#[must_use]
+pub const fn g1_exchange_gate_accepts(exchange_ts_nanos_of_day: i64) -> bool {
+    exchange_ts_nanos_of_day >= MARKET_OPEN_IST_NANOS
+        && exchange_ts_nanos_of_day < MARKET_CLOSE_IST_NANOS
+}
+
+/// Phase 0 Item 11 — G2 Wall-Clock Gate. Returns `true` iff the local
+/// wall-clock IST nanoseconds-of-day is within
+/// `[09:15:00.000, 15:31:00.000)` — the session window PLUS the 60s
+/// grace tail.
+///
+/// Used to decide when to close the WebSocket socket / seal the final
+/// bar. NEVER used to decide whether a tick belongs to the session
+/// (that's G1's job).
+///
+/// Pure `const fn`; tested by `test_g2_wall_clock_gate_*` ratchets.
+#[inline]
+#[must_use]
+pub const fn g2_wall_clock_gate_accepts(wall_clock_ts_nanos_of_day: i64) -> bool {
+    let grace_close_nanos = MARKET_CLOSE_IST_NANOS
+        .saturating_add((WS_GRACE_AFTER_CLOSE_SECS as i64).saturating_mul(1_000_000_000));
+    wall_clock_ts_nanos_of_day >= MARKET_OPEN_IST_NANOS
+        && wall_clock_ts_nanos_of_day < grace_close_nanos
+}
+
+// ---------------------------------------------------------------------------
 // Tests — Market Hours Constants
 // ---------------------------------------------------------------------------
 
@@ -3136,5 +3259,151 @@ mod tests {
             outage_end,
             market_close
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 0 Item 11 — Dual-gate market-hours ratchets (operator-locked 2026-05-13)
+    // -----------------------------------------------------------------------
+
+    /// Constant pin — MARKET_OPEN_IST_NANOS = 09:15:00.000 IST.
+    #[test]
+    fn test_market_open_ist_nanos_pinned_at_0915() {
+        // 9h * 3600s/h + 15m * 60s/m = 33_300 secs = 33_300 * 1e9 nanos.
+        assert_eq!(MARKET_OPEN_IST_NANOS, 33_300_000_000_000);
+    }
+
+    /// Constant pin — MARKET_CLOSE_IST_NANOS = 15:30:00.000 IST (exclusive).
+    #[test]
+    fn test_market_close_ist_nanos_pinned_at_1530_exclusive() {
+        // 15h * 3600 + 30m * 60 = 55_800 secs.
+        assert_eq!(MARKET_CLOSE_IST_NANOS, 55_800_000_000_000);
+    }
+
+    /// Constant pin — 60s grace after close.
+    #[test]
+    fn test_ws_grace_after_close_secs_pinned_at_60() {
+        assert_eq!(WS_GRACE_AFTER_CLOSE_SECS, 60);
+    }
+
+    /// Constant pin — final seal offset matches grace by design.
+    #[test]
+    fn test_bar_final_seal_offset_matches_grace() {
+        assert_eq!(BAR_FINAL_SEAL_OFFSET_SECS, WS_GRACE_AFTER_CLOSE_SECS);
+    }
+
+    /// Constant pin — late-tick anomaly threshold.
+    #[test]
+    fn test_late_tick_anomaly_threshold_ms_pinned_at_30000() {
+        assert_eq!(LATE_TICK_ANOMALY_THRESHOLD_MS, 30_000);
+    }
+
+    /// Plan §8 row 1: a tick stamped `exchange_ts = 15:29:59.586` must
+    /// be ACCEPTED by G1 even if the local clock has advanced past
+    /// 15:30:00.x. The G1 gate looks ONLY at exchange_ts; the wall
+    /// clock is irrelevant. This was the original bug yesterday.
+    #[test]
+    fn test_tick_with_exchange_ts_15_29_59_586_accepted_even_if_local_recv_15_30_00_100() {
+        // exchange_ts = 15:29:59.586 IST nanoseconds-of-day.
+        // 15h*3600 + 29m*60 + 59s = 55_799 secs, + 0.586s = 55_799_586 ms = 55_799_586_000_000 nanos.
+        let exchange_ts = 55_799_586_000_000_i64;
+        assert!(
+            g1_exchange_gate_accepts(exchange_ts),
+            "Plan §8: tick stamped 15:29:59.586 MUST be accepted by G1, \
+             regardless of local wall-clock — this was the bug",
+        );
+    }
+
+    /// Plan §8 row 2: a tick stamped exactly at 15:30:00.000 IST must
+    /// be REJECTED by G1 (close is EXCLUSIVE).
+    #[test]
+    fn test_tick_with_exchange_ts_15_30_00_000_rejected() {
+        let exchange_ts = MARKET_CLOSE_IST_NANOS;
+        assert!(
+            !g1_exchange_gate_accepts(exchange_ts),
+            "MARKET_CLOSE is EXCLUSIVE — a tick at 15:30:00.000 must be rejected",
+        );
+    }
+
+    /// Plan §8 row 1 negative: pre-09:15 ticks are REJECTED.
+    #[test]
+    fn test_g1_exchange_gate_rejects_pre_market_open() {
+        // 09:14:59.999 IST.
+        let exchange_ts = MARKET_OPEN_IST_NANOS - 1;
+        assert!(!g1_exchange_gate_accepts(exchange_ts));
+    }
+
+    /// G1 boundary inclusivity — exactly 09:15:00.000 is ACCEPTED.
+    #[test]
+    fn test_g1_exchange_gate_accepts_exact_market_open() {
+        assert!(g1_exchange_gate_accepts(MARKET_OPEN_IST_NANOS));
+    }
+
+    /// G1 boundary exclusivity — 15:29:59.999_999_999 is the last
+    /// accepted nano. 15:30:00.000_000_000 is the first rejected.
+    #[test]
+    fn test_g1_exchange_gate_boundary_exclusive_on_close() {
+        assert!(g1_exchange_gate_accepts(MARKET_CLOSE_IST_NANOS - 1));
+        assert!(!g1_exchange_gate_accepts(MARKET_CLOSE_IST_NANOS));
+    }
+
+    /// Plan §8 row 3: WS socket stays open until 15:31:00. G2 accepts
+    /// 15:30:30 (during grace).
+    #[test]
+    fn test_ws_socket_stays_open_until_15_31_00() {
+        // 15:30:30 IST = 55_830 secs = 55_830_000_000_000 nanos.
+        let wall_clock = 55_830_000_000_000_i64;
+        assert!(
+            g2_wall_clock_gate_accepts(wall_clock),
+            "G2 must accept wall-clock 15:30:30 (30s into the 60s grace tail)",
+        );
+    }
+
+    /// G2 rejects after 15:31:00.
+    #[test]
+    fn test_g2_wall_clock_gate_rejects_after_grace_close() {
+        // 15:31:00 IST exactly = grace boundary (exclusive on close).
+        let grace_close = MARKET_CLOSE_IST_NANOS + (60_i64 * 1_000_000_000);
+        assert!(!g2_wall_clock_gate_accepts(grace_close));
+        // 15:31:00.001 → also rejected.
+        assert!(!g2_wall_clock_gate_accepts(grace_close + 1_000_000));
+    }
+
+    /// Plan §8 row 4 ("final bar seals at 15:31:00 not 15:30:00") —
+    /// BAR_FINAL_SEAL_OFFSET_SECS = 60 means the 15:29 bar's forced
+    /// seal happens 60s past `MARKET_CLOSE_IST_NANOS`.
+    #[test]
+    fn test_final_bar_seals_at_15_31_00_not_15_30_00() {
+        let seal_offset_nanos = (BAR_FINAL_SEAL_OFFSET_SECS as i64) * 1_000_000_000;
+        let forced_seal_at = MARKET_CLOSE_IST_NANOS + seal_offset_nanos;
+        let expected_15_31_00 = 55_860_000_000_000_i64;
+        assert_eq!(forced_seal_at, expected_15_31_00);
+    }
+
+    /// Plan §8: G1 gate function MUST NOT call local-clock helpers.
+    /// Source-scan verifies the helper body uses only the
+    /// `exchange_ts_nanos_of_day` argument.
+    #[test]
+    fn test_market_gate_does_not_call_local_now() {
+        let src = include_str!("constants.rs");
+        // Find the g1_exchange_gate_accepts function body.
+        let fn_marker = "pub const fn g1_exchange_gate_accepts(";
+        let start = src
+            .find(fn_marker)
+            .expect("g1_exchange_gate_accepts must exist");
+        // Take ~500 chars after — the body is small.
+        let body_end = (start + 500).min(src.len());
+        let body = &src[start..body_end];
+        assert!(
+            !body.contains("Utc::now"),
+            "G1 gate body MUST NOT call Utc::now — that was the bug",
+        );
+        assert!(
+            !body.contains("now_ist"),
+            "G1 gate body MUST NOT call now_ist — must use exchange_ts param",
+        );
+        assert!(
+            !body.contains("SystemTime"),
+            "G1 gate body MUST NOT call SystemTime — pure const fn",
+        );
     }
 }
