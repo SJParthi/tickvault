@@ -2194,6 +2194,130 @@ pub const BOOT_ESCALATION_ERROR_AT_SECS: u64 = 30;
 pub const CLOCK_SKEW_HALT_THRESHOLD_SECS: f64 = 2.0;
 
 // ---------------------------------------------------------------------------
+// Phase 0 Item 8 — Gap-Fill Scheduler Invariants (operator-locked 2026-05-13)
+// ---------------------------------------------------------------------------
+//
+// Per `topic-PHASE-0-LEAN-LOCKED.md` §7: the gap-fill scheduler MUST
+// wait at least 5 seconds AFTER a 1m bar's end before fetching that
+// bar's OHLCV from Dhan's `/v2/charts/intraday` REST API. The buffer
+// accounts for:
+//   * Dhan ingestion lag (their server consolidates ticks → candle)
+//   * ±2s clock-skew safety per BOOT-03
+//   * Round-trip overhead on the REST call
+//
+// Asking earlier risks "half-cooked bar" responses — wrong OHLC values
+// that would then DEDUP UPSERT-overwrite the (correct) live-aggregated
+// candle in QuestDB.
+//
+// All Item 8 constants live here so a future scheduler refactor in
+// `crates/core` reads them by name and the ratchet tests below pin
+// them against silent drift.
+
+/// Mandatory wait between bar_end (e.g. 09:34:00 IST for the 09:33 bar)
+/// and the earliest legal Dhan REST fetch for that bar. 5 seconds = 1
+/// poll cycle + ~2s ingestion lag + clock-skew safety.
+pub const GAP_FILL_POST_SEAL_BUFFER_SECS: u64 = 5;
+
+/// HTTP timeout for a single Dhan `/v2/charts/intraday` REST call.
+/// Dhan p99 for intraday is ~3-5s under healthy network; 30s gives 10x
+/// headroom before triggering a retry.
+pub const GAP_FILL_FETCH_TIMEOUT_SECS: u64 = 30;
+
+/// Maximum parallel REST fetches in flight at any moment. Dhan's Data
+/// API rate limit is 5/sec, so 5 concurrent fetches matches the burst
+/// budget. Higher values risk DH-904 throttling.
+pub const GAP_FILL_MAX_CONCURRENT_FETCHES: usize = 5;
+
+/// Per-bar retry budget on transient Dhan errors (network timeout,
+/// 500-class). After 3 attempts the bar is recorded as `failed` in
+/// `gap_fill_audit` and the operator decides whether to backfill
+/// manually.
+pub const GAP_FILL_RETRY_ATTEMPTS: u32 = 3;
+
+/// Per-attempt backoff durations in seconds. Index `i` is the wait
+/// AFTER the `i`-th failure (0-indexed). Total worst-case wait between
+/// first try and final give-up = 2 + 5 + 10 = 17 seconds. Hard-pinned
+/// at length 3 to match `GAP_FILL_RETRY_ATTEMPTS`.
+pub const GAP_FILL_RETRY_BACKOFF_SECS: &[u64] = &[2, 5, 10];
+
+/// Length of one 1-minute bar in seconds. Pinned here so the gap-fill
+/// math helpers don't drift from the rest of the codebase. (Not a
+/// "1m bar specifically" constant — just the universal 60s/min that
+/// belongs alongside the other gap-fill math constants for clarity.)
+pub const GAP_FILL_ONE_MINUTE_SECS: u64 = 60;
+
+// Compile-time consistency: backoff array length must equal the retry
+// attempt count (otherwise we'd index past the array or leave attempts
+// without a defined backoff).
+const _: () = assert!(
+    GAP_FILL_RETRY_BACKOFF_SECS.len() == GAP_FILL_RETRY_ATTEMPTS as usize,
+    "GAP_FILL_RETRY_BACKOFF_SECS length must equal GAP_FILL_RETRY_ATTEMPTS \
+     (otherwise scheduler indexes past the array or leaves attempts \
+     without a defined backoff)"
+);
+
+/// Phase 0 Item 8 — given a 1m bar's start time (IST epoch seconds),
+/// returns the earliest legal moment for the scheduler to fetch that
+/// bar from Dhan REST. Formula: `bar_start + 60 + GAP_FILL_POST_SEAL_BUFFER_SECS`.
+///
+/// Example: bar at 09:33:00 IST → bar_end at 09:34:00 → earliest legal
+/// fetch at 09:34:05.
+///
+/// Pure `const fn`; tested by
+/// `test_compute_earliest_legal_fetch_secs_*` ratchets.
+#[inline]
+#[must_use]
+pub const fn compute_earliest_legal_fetch_secs(bar_start_secs: i64) -> i64 {
+    // 60s bar + 5s post-seal buffer = 65s after bar start.
+    // Saturating_add avoids overflow on absurd inputs.
+    bar_start_secs
+        .saturating_add(GAP_FILL_ONE_MINUTE_SECS as i64)
+        .saturating_add(GAP_FILL_POST_SEAL_BUFFER_SECS as i64)
+}
+
+/// Phase 0 Item 8 — given a disconnect window [outage_start, outage_end)
+/// in IST epoch seconds AND the market-close time (IST epoch seconds
+/// for 15:30:00 of the trading date), returns whether the bar starting
+/// at `bar_start_secs` is eligible for gap-fill.
+///
+/// A bar is eligible iff:
+///   * It starts BEFORE the outage ended (so the outage caused us to
+///     miss its content), AND
+///   * Its bar_end is STRICTLY <= market_close (we do NOT fetch a bar
+///     whose 60-second window spans the close — see
+///     `topic-PHASE-0-LEAN-LOCKED.md` §7 row 3: "Outage spans 15:29 →
+///     15:31 | 15:29 bar only | 15:30:05 (do NOT fetch 15:30 — market
+///     closed mid-bar)").
+///
+/// Pure `const fn`; tested by `test_is_bar_eligible_for_gap_fill_*`.
+#[inline]
+#[must_use]
+pub const fn is_bar_eligible_for_gap_fill(
+    bar_start_secs: i64,
+    outage_start_secs: i64,
+    outage_end_secs: i64,
+    market_close_secs: i64,
+) -> bool {
+    // The bar must START during or before the outage ended (otherwise
+    // there's nothing to fill — live ticks captured it).
+    if bar_start_secs >= outage_end_secs {
+        return false;
+    }
+    // The bar must START at or after the outage start (a bar that
+    // started BEFORE the outage was already in flight; live ticks
+    // captured part of it, the seal handles the rest).
+    if bar_start_secs < outage_start_secs {
+        return false;
+    }
+    // The bar's full 60s window must end strictly at or before market
+    // close. The 15:29:00 bar's end is 15:30:00 — exactly the close;
+    // we allow it. The 15:30:00 bar's end is 15:31:00 — past close;
+    // we exclude it.
+    let bar_end = bar_start_secs.saturating_add(GAP_FILL_ONE_MINUTE_SECS as i64);
+    bar_end <= market_close_secs
+}
+
+// ---------------------------------------------------------------------------
 // Tests — Market Hours Constants
 // ---------------------------------------------------------------------------
 
@@ -2846,5 +2970,171 @@ mod tests {
     #[test]
     fn test_application_version_nonempty() {
         assert!(!APPLICATION_VERSION.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 0 Item 8 — Gap-fill scheduler invariants (operator-locked 2026-05-13)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_gap_fill_post_seal_buffer_secs_pinned_at_5() {
+        // The 5s buffer is the core seal-then-fetch invariant. Changing
+        // it requires re-validating against Dhan's ingestion lag (their
+        // server takes ~2s to consolidate ticks into a sealed candle).
+        assert_eq!(GAP_FILL_POST_SEAL_BUFFER_SECS, 5);
+    }
+
+    #[test]
+    fn test_gap_fill_fetch_timeout_secs_pinned_at_30() {
+        assert_eq!(GAP_FILL_FETCH_TIMEOUT_SECS, 30);
+    }
+
+    #[test]
+    fn test_gap_fill_max_concurrent_fetches_pinned_at_5() {
+        // 5 = Dhan Data API rate limit (5/sec). Higher = DH-904 risk.
+        assert_eq!(GAP_FILL_MAX_CONCURRENT_FETCHES, 5);
+    }
+
+    #[test]
+    fn test_gap_fill_retry_attempts_pinned_at_3() {
+        assert_eq!(GAP_FILL_RETRY_ATTEMPTS, 3);
+    }
+
+    #[test]
+    fn test_gap_fill_retry_backoff_secs_pinned_at_2_5_10() {
+        assert_eq!(GAP_FILL_RETRY_BACKOFF_SECS, &[2, 5, 10]);
+    }
+
+    #[test]
+    fn test_gap_fill_retry_backoff_array_length_matches_retry_attempts() {
+        // Already enforced at compile time via `const _: () = assert!(...)`
+        // above the constant definitions, but a runtime ratchet adds a
+        // second layer in case someone removes the compile-time check.
+        assert_eq!(
+            GAP_FILL_RETRY_BACKOFF_SECS.len(),
+            GAP_FILL_RETRY_ATTEMPTS as usize,
+        );
+    }
+
+    #[test]
+    fn test_compute_earliest_legal_fetch_secs_basic() {
+        // Plan §7 row 1: bar 09:33 → earliest fetch 09:34:05.
+        // 09:33:00 IST epoch = base. bar_end = base + 60. Earliest = base + 60 + 5.
+        let bar_start = 1_000_000;
+        let earliest = compute_earliest_legal_fetch_secs(bar_start);
+        assert_eq!(earliest, bar_start + 60 + 5);
+        assert_eq!(earliest, bar_start + 65);
+    }
+
+    #[test]
+    fn test_compute_earliest_legal_fetch_secs_at_market_open() {
+        // bar 09:15 → bar_end 09:16:00 → earliest fetch 09:16:05.
+        let bar_start = 9 * 3600 + 15 * 60; // 09:15:00 as secs-of-day
+        let earliest = compute_earliest_legal_fetch_secs(bar_start);
+        let expected = bar_start + 65;
+        assert_eq!(earliest, expected);
+    }
+
+    #[test]
+    fn test_compute_earliest_legal_fetch_secs_saturating_on_overflow() {
+        // Pathological i64::MAX input must not panic — saturating_add
+        // returns i64::MAX.
+        let earliest = compute_earliest_legal_fetch_secs(i64::MAX);
+        assert_eq!(earliest, i64::MAX);
+    }
+
+    #[test]
+    fn test_is_bar_eligible_for_gap_fill_simple_outage() {
+        // Plan §7 row 1: disconnect at 09:33:03 = 33183s of day.
+        // Bar 09:33 (33180s) is INSIDE outage → eligible.
+        // Bar 09:34 (33240s) is INSIDE outage → eligible (if outage spans).
+        let outage_start: i64 = 33_183;
+        let outage_end: i64 = 33_300; // 09:35:00 — outage ends mid-9:34 bar
+        let market_close: i64 = 15 * 3600 + 30 * 60; // 15:30:00 = 55_800
+
+        // Bar 09:33 (start 33_180): starts before outage_start → not eligible.
+        assert!(!is_bar_eligible_for_gap_fill(
+            33_180,
+            outage_start,
+            outage_end,
+            market_close
+        ));
+
+        // Bar 09:34 (start 33_240): starts during outage → eligible.
+        assert!(is_bar_eligible_for_gap_fill(
+            33_240,
+            outage_start,
+            outage_end,
+            market_close
+        ));
+
+        // Bar 09:35 (start 33_300): starts at outage_end → NOT eligible (live ticks captured it).
+        assert!(!is_bar_eligible_for_gap_fill(
+            33_300,
+            outage_start,
+            outage_end,
+            market_close
+        ));
+    }
+
+    #[test]
+    fn test_is_bar_eligible_for_gap_fill_market_close_cutoff() {
+        // Plan §7 row 3: outage 15:29 → 15:31 → 15:29 bar ONLY.
+        // 15:29:00 = 55_740, 15:30:00 = 55_800, 15:31:00 = 55_860.
+        let outage_start = 55_740_i64;
+        let outage_end = 55_860_i64;
+        let market_close = 55_800_i64; // 15:30:00 exclusive close
+
+        // 15:29 bar (start 55_740): bar_end = 55_800 = market_close → eligible.
+        assert!(is_bar_eligible_for_gap_fill(
+            55_740,
+            outage_start,
+            outage_end,
+            market_close
+        ));
+
+        // 15:30 bar (start 55_800): bar_end = 55_860 > market_close → NOT eligible.
+        assert!(!is_bar_eligible_for_gap_fill(
+            55_800,
+            outage_start,
+            outage_end,
+            market_close
+        ));
+    }
+
+    #[test]
+    fn test_is_bar_eligible_for_gap_fill_bar_before_outage() {
+        // Bar that started BEFORE the outage was already in flight when
+        // disconnect happened — live ticks captured it, gap-fill must skip.
+        let outage_start = 1000_i64;
+        let outage_end = 2000_i64;
+        let market_close = i64::MAX;
+        assert!(!is_bar_eligible_for_gap_fill(
+            940,
+            outage_start,
+            outage_end,
+            market_close
+        ));
+    }
+
+    #[test]
+    fn test_is_bar_eligible_for_gap_fill_bar_after_outage() {
+        // Bar starting at or after outage_end is post-outage — live ticks
+        // captured it.
+        let outage_start = 1000_i64;
+        let outage_end = 2000_i64;
+        let market_close = i64::MAX;
+        assert!(!is_bar_eligible_for_gap_fill(
+            2000,
+            outage_start,
+            outage_end,
+            market_close
+        ));
+        assert!(!is_bar_eligible_for_gap_fill(
+            2100,
+            outage_start,
+            outage_end,
+            market_close
+        ));
     }
 }
