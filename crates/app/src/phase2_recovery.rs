@@ -165,16 +165,19 @@ pub fn plan_recovery(
 /// PR-E indices-only ratchet helper. Returns `true` iff the operator's
 /// configured subscription scope makes Phase 2 stock-F&O dispatch
 /// meaningful. Under `IndicesOnlyAllExpiries` (the default since Wave
-/// 5), the subscription planner already drops stock derivatives, so
-/// running Phase 2 would silently no-op and waste the 09:13 wakeup +
-/// preopen-buffer cloning + REST fallback HTTP work. main.rs gates the
+/// 5) AND `IndicesUnderlyingsOnly` (Phase 0 LEAN MVP, 2026-05-13), the
+/// subscription planner already drops stock derivatives, so running
+/// Phase 2 would silently no-op and waste the 09:13 wakeup + preopen-
+/// buffer cloning + REST fallback HTTP work. main.rs gates the
 /// scheduler spawn AND the snapshot-recovery dispatch on this function.
 #[must_use]
 pub const fn should_spawn_phase2_scheduler(
     scope: tickvault_common::config::SubscriptionScope,
 ) -> bool {
     match scope {
+        // No stock F&O subscribed under these scopes → Phase 2 is a no-op.
         tickvault_common::config::SubscriptionScope::IndicesOnlyAllExpiries => false,
+        tickvault_common::config::SubscriptionScope::IndicesUnderlyingsOnly => false,
         tickvault_common::config::SubscriptionScope::FullUniverse => true,
     }
 }
@@ -352,16 +355,26 @@ mod tests {
     /// variants so a silent renaming doesn't slip through.
     #[test]
     fn test_should_spawn_phase2_scheduler_covers_every_scope_variant() {
-        // Two known variants today. If a third is added, this test
+        // Three known variants today. If a fourth is added, this test
         // breaks and the operator must consciously decide its semantics.
         let variants = [
             tickvault_common::config::SubscriptionScope::IndicesOnlyAllExpiries,
             tickvault_common::config::SubscriptionScope::FullUniverse,
+            tickvault_common::config::SubscriptionScope::IndicesUnderlyingsOnly,
         ];
-        // Just exercise both — the assertions in the two prior tests
-        // pin actual values.
+        // Just exercise all — the assertions in the prior tests pin
+        // actual values.
         for v in variants {
             let _ = should_spawn_phase2_scheduler(v);
         }
+    }
+
+    /// Phase 0 Item 1 (2026-05-13): IndicesUnderlyingsOnly drops stock F&O
+    /// → Phase 2 scheduler must NOT spawn (same as IndicesOnlyAllExpiries).
+    #[test]
+    fn test_should_spawn_phase2_scheduler_skipped_under_phase_0_scope() {
+        assert!(!should_spawn_phase2_scheduler(
+            tickvault_common::config::SubscriptionScope::IndicesUnderlyingsOnly,
+        ));
     }
 }
