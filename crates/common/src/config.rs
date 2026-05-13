@@ -1899,7 +1899,13 @@ mod tests {
                 reconnect_max_delay_ms: 30000,
                 reconnect_max_attempts: 10,
                 subscription_batch_size: 100,
-                connection_stagger_ms: 10000,
+                // Phase 0 Item 6 (operator-locked 2026-05-13): reduced from
+                // 10000ms to 2000ms. Under Phase 0 LEAN MVP (1 main-feed
+                // conn) the stagger is a no-op; under legacy / Wave 5
+                // scopes (up to 5 conns) 2s × 4 = 8s startup delay still
+                // safely under Dhan's burst-rate thresholds while
+                // shrinking boot time from 40s to 8s.
+                connection_stagger_ms: 2000,
                 activity_watchdog_threshold_secs: default_activity_watchdog_threshold_secs(),
             },
             questdb: QuestDbConfig {
@@ -2631,6 +2637,18 @@ mod tests {
         // operator must re-approve and update PHASE_0_TOTAL_SIDS_TARGET
         // capacity math.
         assert_eq!(crate::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT, 1);
+    }
+
+    // Phase 0 Item 6 (operator-locked 2026-05-13) — stagger default pin.
+    #[test]
+    fn test_connection_stagger_ms_default_pinned_at_2000() {
+        // 2000ms = 2s × (N-1) staggers between conns. Under Phase 0 with
+        // 1 conn the stagger is a no-op; under legacy with 5 conns it's
+        // 8s total. The previous 10000ms (10s × 4 = 40s) caused needless
+        // boot delay. Changing this constant requires re-approving the
+        // Dhan burst-rate calc.
+        let cfg = make_valid_config();
+        assert_eq!(cfg.websocket.connection_stagger_ms, 2000);
     }
 
     #[test]
