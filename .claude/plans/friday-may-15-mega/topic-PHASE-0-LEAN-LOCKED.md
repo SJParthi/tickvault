@@ -448,7 +448,31 @@ SEBI rule: no wash trades. Within single account:
 
 **LoC: ~100.**
 
-### 22. GIFT NIFTY — per-segment market hours + overnight close fetch (operator-locked 2026-05-13)
+### 22. GIFT NIFTY — DEFERRED TO PHASE 2 (operator-locked 2026-05-13, dropped same day)
+
+**Decision:** drop from Phase 0. Re-evaluate during Phase 1 monitoring window or Phase 2A planning.
+
+**Why dropped:**
+- Dhan support unverified — adds Thu pre-flight risk to Friday build
+- Per-segment market-hours table (`HashMap<ExchangeSegment, MarketHoursSchedule>`) adds ~150 LoC of complexity
+- AWS schedule rewrite (08:30-17:30 → 06:30-15:45 IST) was reversible noise
+- Overnight close can be inferred from morning gap on NIFTY itself once live — marginal alpha
+- Lean MVP principle: ship 222 SIDs Friday, prove the architecture, then add GIFT in a clean PR after Phase 1 data validates the need
+
+**What gets reverted:**
+- AWS schedule stays at **08:30-17:30 IST Mon-Fri** (original plan)
+- Single market-hours window `[09:15:00.000, 15:30:00.000)` for all 222 SIDs (no per-segment table)
+- NSE_IFSC segment NOT added to `ExchangeSegment` enum
+- No overnight close fetch
+- Total SIDs: **222** (was 223)
+
+**Re-evaluation trigger:** Phase 1 monitoring (22 trading days) shows operator wants gap-direction signal that NIFTY's own pre-open buffer doesn't already provide.
+
+**LoC saved: ~580. Friday + Saturday build now: ~4,170 LoC across 22 items.**
+
+---
+
+### 22-OLD (PARKED — original GIFT NIFTY design, kept for future Phase 2 reference)
 
 GIFT NIFTY = NIFTY 50 futures on NSE IX (GIFT City), USD-denominated, ~21h/day across 2 sessions.
 
@@ -475,9 +499,9 @@ GIFT NIFTY = NIFTY 50 futures on NSE IX (GIFT City), USD-denominated, ~21h/day a
 
 **Schedule choice locked: Option B — extend AWS to 06:30-15:45 IST. Captures Session 1 (overlaps NSE) + overnight close fetched once at boot via REST. Skips Session 2 (17:00-02:45 IST). AWS cost delta: +~₹20/mo.**
 
-**LoC: ~580 across 7 sub-items.**
+**LoC: ~580 across 7 sub-items. [PARKED — see decision above; not part of Phase 0 Friday build.]**
 
-**Total Friday + Saturday build: ~4,120 LoC across 22 top-level items (with 7 sub-items in #22). Approximately 1.5-2 focused days.**
+**Total Friday + Saturday build (AFTER GIFT NIFTY DROP): ~4,170 LoC across 22 top-level items. Approximately 1.5-2 focused days.**
 
 ### 23. Prev-close mode mix — fix Ticker-only blind spot (operator-locked 2026-05-13)
 
@@ -527,7 +551,22 @@ GIFT NIFTY = NIFTY 50 futures on NSE IX (GIFT City), USD-denominated, ~21h/day a
 
 **LoC: ~630 across 6 sub-items.**
 
-**Total Friday + Saturday build: ~4,750 LoC across 23 top-level items. ~2 focused days.**
+**Total Friday + Saturday build (FINAL, after GIFT NIFTY drop): ~4,170 LoC across 22 top-level items (item 22 = GIFT NIFTY, PARKED). ~1.5-2 focused days.**
+
+---
+
+## Phase 0 FINAL summary (after GIFT NIFTY drop, 2026-05-13 final lock)
+
+| Metric | Value |
+|---|---|
+| Top-level items | **22** (item 22 PARKED, items 1-21 + 23 = 22 active) |
+| Total LoC | **~4,170** |
+| Friday + Saturday | **1.5-2 focused days** |
+| Total SIDs subscribed | **222** (3 IDX_I + INDIA VIX + 218 NSE_EQ F&O underlyings) |
+| Mode mix | IDX_I Ticker + NSE_EQ Quote |
+| AWS schedule | **08:30-17:30 IST Mon-Fri** (original — GIFT-driven revision reverted) |
+| AWS cost | **~₹1,252/mo** (original — 75% under cap) |
+| Market hours | **Single window** `[09:15:00.000, 15:30:00.000)` with 60s wall-clock grace |
 
 ---
 
