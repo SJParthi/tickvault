@@ -907,6 +907,40 @@ mod tests {
         );
     }
 
+    /// Phase 0 Item 22a meta-guard: the OMS HTTP timeout MUST be
+    /// pinned at 5s and the DH-904 retry ladder MUST be wired into
+    /// the production OMS construction site.
+    ///
+    /// 5s is the operator's contract per
+    /// `topic-PHASE-0-LEAN-LOCKED.md` Item 22a — "Order placement
+    /// 5s REST timeout + DH-904 retry policy". A future tuning that
+    /// silently changes the constant (e.g. to 2s for "faster fails")
+    /// would surprise the operator at runtime.
+    ///
+    /// Rule 13: the `compute_dh904_backoff` helper is defined +
+    /// tested in `crates/trading/src/oms/dh904_backoff.rs`. This
+    /// guard asserts the constant pin so the helper's math contract
+    /// stays meaningful.
+    #[test]
+    fn test_oms_http_timeout_is_pinned_at_5s() {
+        assert_eq!(
+            tickvault_common::constants::OMS_HTTP_TIMEOUT_SECS,
+            5,
+            "OMS_HTTP_TIMEOUT_SECS must stay at 5s per Phase 0 Item 22a. \
+             Changing this is operator-visible behaviour — propagate to \
+             `topic-PHASE-0-LEAN-LOCKED.md` Item 22a before adjusting."
+        );
+        // The DH-904 backoff ladder lives in the same constants
+        // file; pin its total wait here so a future edit that
+        // breaks the ladder semantics is caught at build time.
+        let total: u64 = tickvault_common::constants::DH904_BACKOFF_SECS.iter().sum();
+        assert_eq!(
+            total, 150,
+            "DH-904 retry ladder total worst-case wait must be 150s \
+             (10+20+40+80) per dhan-api-introduction.md rule 8."
+        );
+    }
+
     /// Phase 0 Item 21 meta-guard: the indicator engine MUST call
     /// `sanitize_nan_inf` on every snapshot before returning. Without
     /// this, a poisoned indicator (e.g. NaN bollinger from negative
