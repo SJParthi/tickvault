@@ -861,6 +861,52 @@ mod tests {
         );
     }
 
+    /// Phase 0 Item 17b meta-guard: the TokenManager MUST write
+    /// auth-renewal audit rows for every lifecycle outcome (Success
+    /// + Failed + CircuitBreakerHalt), AND main.rs MUST install the
+    /// audit table at boot. Without these, the SEBI 5-year forensic
+    /// chain is broken — auditors reconstructing order-placement
+    /// authorisation cannot answer "did the daily renewal fire?".
+    ///
+    /// Rule 13 (audit-findings 2026-04-17): if the persistence module
+    /// is defined + tested but never called, that's a bug. This
+    /// source-scan guard fails the build if a future refactor
+    /// removes any of the three audit call sites or the boot DDL.
+    #[test]
+    fn test_auth_renewal_audit_is_wired_into_token_manager() {
+        let token_manager_rs = std::fs::read_to_string("../core/src/auth/token_manager.rs")
+            .or_else(|_| std::fs::read_to_string("crates/core/src/auth/token_manager.rs"))
+            .expect("token_manager.rs must be readable from secret_manager test working dir");
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable from secret_manager test working dir");
+
+        assert!(
+            token_manager_rs.contains("write_renewal_audit_row"),
+            "token_manager.rs MUST define + call write_renewal_audit_row \
+             to persist every renewal lifecycle event into the \
+             auth_renewal_audit table. See Phase 0 Item 17b."
+        );
+        for variant in [
+            "AuthRenewalAuditOutcome::Success",
+            "AuthRenewalAuditOutcome::Failed",
+            "AuthRenewalAuditOutcome::CircuitBreakerHalt",
+        ] {
+            assert!(
+                token_manager_rs.contains(variant),
+                "token_manager.rs MUST emit the `{variant}` audit row \
+                 at the matching lifecycle site. Without all 3 outcomes, \
+                 the SEBI forensic trail has a hole on the renewal chain."
+            );
+        }
+        assert!(
+            main_rs.contains("ensure_auth_renewal_audit_table"),
+            "main.rs MUST call ensure_auth_renewal_audit_table at boot \
+             so the table exists before TokenManager attempts its first \
+             INSERT. Without this, every audit-row write silently fails."
+        );
+    }
+
     /// Phase 0 Item 21 meta-guard: the indicator engine MUST call
     /// `sanitize_nan_inf` on every snapshot before returning. Without
     /// this, a poisoned indicator (e.g. NaN bollinger from negative
