@@ -861,6 +861,40 @@ mod tests {
         );
     }
 
+    /// Phase 0 Item 21 meta-guard: the indicator engine MUST call
+    /// `sanitize_nan_inf` on every snapshot before returning. Without
+    /// this, a poisoned indicator (e.g. NaN bollinger from negative
+    /// Welford variance accumulation) silently breaks every downstream
+    /// strategy because `close < NaN` is always false.
+    ///
+    /// Rule 13 (audit-findings 2026-04-17): "if a method is defined +
+    /// tested but never called, it is a bug". This source-scan guard
+    /// fails the build if a future refactor removes the call site in
+    /// `crates/trading/src/indicator/engine.rs`.
+    #[test]
+    fn test_indicator_snapshot_nan_guard_is_wired_into_engine() {
+        let engine_rs = std::fs::read_to_string("../trading/src/indicator/engine.rs")
+            .or_else(|_| std::fs::read_to_string("crates/trading/src/indicator/engine.rs"))
+            .expect("engine.rs must be readable from secret_manager test working dir");
+
+        assert!(
+            engine_rs.contains("sanitize_nan_inf"),
+            "indicator/engine.rs MUST call `IndicatorSnapshot::sanitize_nan_inf` \
+             on every snapshot before returning. Without this clamp, a poisoned \
+             indicator (NaN from Welford variance, EMA seeded from corrupt state, \
+             missed upstream div-by-zero guard) silently breaks every downstream \
+             strategy because `close < NaN` is always false. See Phase 0 Item 21 \
+             in .claude/plans/friday-may-15-mega/topic-PHASE-0-LEAN-LOCKED.md."
+        );
+        assert!(
+            engine_rs.contains("tv_indicator_nan_guard_fired_total"),
+            "indicator/engine.rs MUST emit the `tv_indicator_nan_guard_fired_total` \
+             counter when sanitize_nan_inf clears > 0 fields. Without the counter, \
+             a NaN bug elsewhere in the engine math is silently absorbed without \
+             operator visibility."
+        );
+    }
+
     /// Phase 0 Item 22d meta-guard: main.rs MUST wire the end-of-day
     /// digest scheduler that fires the `EndOfDayDigest` Telegram
     /// once per trading day at 15:31:30 IST.

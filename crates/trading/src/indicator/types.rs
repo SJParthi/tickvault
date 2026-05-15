@@ -156,6 +156,78 @@ pub struct IndicatorSnapshot {
     pub is_warm: bool,
 }
 
+impl IndicatorSnapshot {
+    /// Phase 0 Item 21 (2026-05-15): final-stage NaN / Inf sanitizer.
+    ///
+    /// Returns the count of f64 fields that were NOT finite (NaN, +Inf,
+    /// -Inf) and have been clamped to `0.0` in-place. The engine calls
+    /// this after every snapshot construction so downstream strategy
+    /// evaluators NEVER observe a NaN — strategies that compare against
+    /// NaN silently return false on every comparison, which becomes a
+    /// "strategy mysteriously stopped firing" debugging trap.
+    ///
+    /// **What this prevents:**
+    ///
+    ///   * Welford's algorithm in Bollinger variance accumulates slight
+    ///     negative `bb_m2` for nearly-constant prices → `sqrt` returns
+    ///     NaN → `bollinger_upper/lower` is NaN → every
+    ///     `close < bollinger_lower` strategy check returns false.
+    ///   * EMA seeded from an earlier-corrupted state propagates NaN
+    ///     through every subsequent tick (`x * a + NaN * (1-a) = NaN`).
+    ///   * Division by a denominator that the upstream guard missed
+    ///     (e.g. new indicator added without the `if denom > 0.0` gate).
+    ///
+    /// **What this is NOT:**
+    ///
+    /// A fix for the root cause. If this method clamps > 0 fields per
+    /// tick, that's a signal to investigate the upstream math — the
+    /// `tv_indicator_nan_guard_fired_total` counter incremented by the
+    /// engine wires it into Telegram + Loki for operator visibility.
+    ///
+    /// **Why 0.0 instead of leaving as NaN:**
+    ///
+    /// `f64::NAN` poisons every downstream comparison silently. `0.0`
+    /// is the same default value the snapshot uses for cold-start
+    /// indicators (line 281 `bb_variance = 0.0`, line 287 `vwap = 0.0`)
+    /// — the strategy's `is_warm` gate filters cold-start zeros, so
+    /// clamping NaN to 0.0 routes the value through the same already-
+    /// tested cold-start path.
+    pub fn sanitize_nan_inf(&mut self) -> u32 {
+        let mut cleared: u32 = 0;
+        // Each scalar f64 field is a candidate. `is_warm` (bool) and
+        // `supertrend_bullish` (bool) and `security_id` (u32) cannot be
+        // NaN/Inf so they are intentionally skipped.
+        for field in [
+            &mut self.ema_fast,
+            &mut self.ema_slow,
+            &mut self.sma,
+            &mut self.vwap,
+            &mut self.rsi,
+            &mut self.macd_line,
+            &mut self.macd_signal,
+            &mut self.macd_histogram,
+            &mut self.bollinger_upper,
+            &mut self.bollinger_middle,
+            &mut self.bollinger_lower,
+            &mut self.atr,
+            &mut self.supertrend,
+            &mut self.adx,
+            &mut self.obv,
+            &mut self.last_traded_price,
+            &mut self.previous_close,
+            &mut self.day_high,
+            &mut self.day_low,
+            &mut self.volume,
+        ] {
+            if !field.is_finite() {
+                *field = 0.0;
+                cleared = cleared.saturating_add(1);
+            }
+        }
+        cleared
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Indicator State — mutable per-instrument state for O(1) updates
 // ---------------------------------------------------------------------------
@@ -750,5 +822,147 @@ mod tests {
         // Fields not set should remain zero
         assert_eq!(snap.ema_slow, 0.0);
         assert_eq!(snap.obv, 0.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 0 Item 21 — sanitize_nan_inf (NaN / Inf guard)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sanitize_nan_inf_smoke_pin() {
+        // Pub-fn-test guard pins the symbol by name. The functional
+        // assertions below cover the actual behaviour; this is just
+        // the regex-matched smoke test.
+        let _ = IndicatorSnapshot::sanitize_nan_inf;
+    }
+
+    #[test]
+    fn test_sanitize_clears_nan_in_every_f64_field() {
+        // Every f64 field on the snapshot must be sanitized. If a new
+        // field is added without a corresponding clamp, the count will
+        // not match and this test fails — forcing the next contributor
+        // to either include the field in `sanitize_nan_inf` or remove
+        // it from this test.
+        let mut snap = IndicatorSnapshot {
+            security_id: 13,
+            ema_fast: f64::NAN,
+            ema_slow: f64::NAN,
+            sma: f64::NAN,
+            vwap: f64::NAN,
+            rsi: f64::NAN,
+            macd_line: f64::NAN,
+            macd_signal: f64::NAN,
+            macd_histogram: f64::NAN,
+            bollinger_upper: f64::NAN,
+            bollinger_middle: f64::NAN,
+            bollinger_lower: f64::NAN,
+            atr: f64::NAN,
+            supertrend: f64::NAN,
+            supertrend_bullish: true, // bool — not sanitized
+            adx: f64::NAN,
+            obv: f64::NAN,
+            last_traded_price: f64::NAN,
+            previous_close: f64::NAN,
+            day_high: f64::NAN,
+            day_low: f64::NAN,
+            volume: f64::NAN,
+            is_warm: true, // bool — not sanitized
+        };
+        let cleared = snap.sanitize_nan_inf();
+        // 20 f64 fields × 1 = 20 clears expected.
+        assert_eq!(cleared, 20, "every f64 field must be cleared from NaN");
+        // Every f64 field is now 0.0; bools untouched.
+        assert_eq!(snap.ema_fast, 0.0);
+        assert_eq!(snap.volume, 0.0);
+        assert!(snap.is_warm);
+        assert!(snap.supertrend_bullish);
+        // security_id is u32 — not sanitized either.
+        assert_eq!(snap.security_id, 13);
+    }
+
+    #[test]
+    fn test_sanitize_clears_positive_infinity() {
+        let mut snap = IndicatorSnapshot {
+            ema_fast: f64::INFINITY,
+            sma: 100.0,
+            ..Default::default()
+        };
+        let cleared = snap.sanitize_nan_inf();
+        assert_eq!(cleared, 1);
+        assert_eq!(snap.ema_fast, 0.0);
+        // Healthy field untouched.
+        assert_eq!(snap.sma, 100.0);
+    }
+
+    #[test]
+    fn test_sanitize_clears_negative_infinity() {
+        let mut snap = IndicatorSnapshot {
+            bollinger_lower: f64::NEG_INFINITY,
+            bollinger_upper: 200.0,
+            ..Default::default()
+        };
+        let cleared = snap.sanitize_nan_inf();
+        assert_eq!(cleared, 1);
+        assert_eq!(snap.bollinger_lower, 0.0);
+        // Healthy field untouched.
+        assert_eq!(snap.bollinger_upper, 200.0);
+    }
+
+    #[test]
+    fn test_sanitize_zero_clears_on_healthy_snapshot() {
+        // The hot path runs sanitize on every tick; for a healthy
+        // snapshot it MUST return 0 (and the counter increment in the
+        // engine MUST therefore be skipped).
+        let mut snap = IndicatorSnapshot {
+            ema_fast: 100.0,
+            sma: 99.5,
+            rsi: 50.0,
+            is_warm: true,
+            ..Default::default()
+        };
+        let cleared = snap.sanitize_nan_inf();
+        assert_eq!(cleared, 0);
+        // No values were touched.
+        assert_eq!(snap.ema_fast, 100.0);
+        assert_eq!(snap.sma, 99.5);
+        assert_eq!(snap.rsi, 50.0);
+    }
+
+    #[test]
+    fn test_sanitize_preserves_negative_zero_and_normal_values() {
+        // Negative zero is finite (IEEE 754) — must be preserved.
+        // Very small + very large finite values must also be preserved
+        // (e.g., subnormals near f64::MIN_POSITIVE).
+        let mut snap = IndicatorSnapshot {
+            ema_fast: -0.0,
+            macd_histogram: f64::MIN_POSITIVE,
+            volume: f64::MAX,
+            ..Default::default()
+        };
+        let cleared = snap.sanitize_nan_inf();
+        assert_eq!(cleared, 0);
+        assert_eq!(snap.ema_fast, -0.0);
+        assert_eq!(snap.macd_histogram, f64::MIN_POSITIVE);
+        assert_eq!(snap.volume, f64::MAX);
+    }
+
+    #[test]
+    fn test_sanitize_mixed_nan_inf_finite_counts_correctly() {
+        // 3 of the 20 f64 fields are non-finite — count must be 3.
+        let mut snap = IndicatorSnapshot {
+            ema_fast: f64::NAN,
+            ema_slow: 100.0,
+            sma: f64::INFINITY,
+            vwap: 99.5,
+            rsi: f64::NEG_INFINITY,
+            ..Default::default()
+        };
+        let cleared = snap.sanitize_nan_inf();
+        assert_eq!(cleared, 3);
+        assert_eq!(snap.ema_fast, 0.0);
+        assert_eq!(snap.ema_slow, 100.0);
+        assert_eq!(snap.sma, 0.0);
+        assert_eq!(snap.vwap, 99.5);
+        assert_eq!(snap.rsi, 0.0);
     }
 }
