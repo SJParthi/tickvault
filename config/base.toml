@@ -231,16 +231,29 @@ allowed_origins = ["http://localhost:3000", "http://localhost:3001"]
 auto_open_portal = true
 
 [subscription]
-scope = "indices_only_all_expiries"
+# Phase 0 LEAN MVP (operator lock 2026-05-15) — 222 SIDs ONLY.
+# 4 IDX_I (NIFTY=13, BANKNIFTY=25, SENSEX=51, INDIA VIX=21) in Ticker mode +
+# 218 NSE_EQ F&O underlying stocks in Quote mode. NO derivatives, NO greeks,
+# NO depth-20, NO depth-200, NO movers pipeline, NO Phase 2 dispatcher.
+#
+# Scope is the SOURCE OF TRUTH for the 2-WS lock per
+# `.claude/rules/project/websocket-connection-scope-lock.md` and charter §I.
+# Flipping back to "indices_only_all_expiries" or "full_universe" requires
+# operator re-approval recorded in the rule file with a dated quote.
+scope = "indices_underlyings_only"
 feed_mode = "Full"
-subscribe_index_derivatives = true
-subscribe_stock_derivatives = true
+subscribe_index_derivatives = false
+subscribe_stock_derivatives = false
 subscribe_display_indices = true
 subscribe_stock_equities = true
 stock_atm_strikes_above = 25
 stock_atm_strikes_below = 25
 stock_default_atm_fallback_enabled = true
-enable_twenty_depth = true
+# Phase 0 lock — depth-20 stays defined but NEVER spawns per the 2-WS rule.
+# Scope = `indices_underlyings_only` would already gate this off, but
+# belt-and-suspenders default-off prevents a future scope flip from
+# accidentally re-enabling depth.
+enable_twenty_depth = false
 twenty_depth_max_instruments = 50
 
 [notification]
@@ -306,8 +319,11 @@ audit_tables_enabled = true
 telegram_bucket_coalescer = true
 market_open_self_test = true
 realtime_guarantee_score = true
-depth_dynamic_top_volume = true
-depth_dynamic_pipeline_v2 = true
+# Phase 0 lock — depth-dynamic pipelines (depth-20 + depth-200) NEVER spawn
+# per the 2-WS rule. Scope gate already blocks them; default-off is
+# belt-and-suspenders.
+depth_dynamic_top_volume = false
+depth_dynamic_pipeline_v2 = false
 historical_fetch_enabled = false
 
 [depth_20.dynamic]
