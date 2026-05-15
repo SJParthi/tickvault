@@ -691,6 +691,21 @@ pub const PUBLIC_IP_CHECK_TIMEOUT_SECS: u64 = 10;
 /// Maximum retry attempts for public IP detection (primary + fallback).
 pub const PUBLIC_IP_CHECK_MAX_RETRIES: u32 = 3;
 
+/// Phase 0 Item 18b — Max retry attempts for the boot-time Dhan static
+/// IP gate (`/v2/ip/getIP`) when `orders_allowed = false`. Bounds the
+/// worst-case boot blocking time to `MAX_ATTEMPTS * INTERVAL_SECS`.
+///
+/// 30 attempts x 60 s = 30 min — long enough to absorb Dhan's
+/// IP-whitelist propagation delay after an operator-side modify on
+/// web.dhan.co, short enough that an unattended boot eventually
+/// surfaces the failure for operator action.
+pub const STATIC_IP_BOOT_RETRY_MAX_ATTEMPTS: u32 = 30;
+
+/// Phase 0 Item 18b — Interval between retry attempts during the boot
+/// gate. Dhan's API rate limit is 5 req/sec on data endpoints, so
+/// 60 s is comfortably below any throttling threshold.
+pub const STATIC_IP_BOOT_RETRY_INTERVAL_SECS: u64 = 60;
+
 // ---------------------------------------------------------------------------
 // Docker Container Naming
 // ---------------------------------------------------------------------------
@@ -2979,6 +2994,32 @@ mod tests {
     fn test_public_ip_check_urls_are_https() {
         assert!(PUBLIC_IP_CHECK_PRIMARY_URL.starts_with("https://"));
         assert!(PUBLIC_IP_CHECK_FALLBACK_URL.starts_with("https://"));
+    }
+
+    #[test]
+    fn test_static_ip_boot_retry_constants_pinned() {
+        // Phase 0 Item 18b — operator-locked 30 attempts x 60 s.
+        // Worst-case boot blocking = 30 min, bounded by these constants.
+        // Any future change MUST come with explicit operator approval
+        // because EventBridge starts the AWS instance at 8:30 IST and a
+        // boot blocked beyond 30 min would miss the 09:00 IST market
+        // open.
+        assert_eq!(STATIC_IP_BOOT_RETRY_MAX_ATTEMPTS, 30);
+        assert_eq!(STATIC_IP_BOOT_RETRY_INTERVAL_SECS, 60);
+    }
+
+    #[test]
+    fn test_static_ip_boot_retry_worst_case_under_30_min() {
+        // Sanity bound — if both constants are bumped beyond reason
+        // (e.g. someone makes attempts u32::MAX) this catches it as a
+        // unit-test failure rather than at boot time.
+        let worst_case_secs =
+            u64::from(STATIC_IP_BOOT_RETRY_MAX_ATTEMPTS) * STATIC_IP_BOOT_RETRY_INTERVAL_SECS;
+        // 30 min = 1800 s. Use <= to allow exact value, < would be off-by-one.
+        assert!(
+            worst_case_secs <= 1800,
+            "boot retry budget must stay <= 30 min, got {worst_case_secs} s"
+        );
     }
 
     // --- Ring Buffer Constants ---

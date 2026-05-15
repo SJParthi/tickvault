@@ -975,6 +975,23 @@ pub enum NotificationEvent {
         /// Literal `ipMatchStatus` Dhan returned. Empty if response was
         /// empty.
         ip_match_status: String,
+        /// Phase 0 Item 18b — how many attempts the retry loop made
+        /// before declaring failure. `1` means immediate halt (e.g.
+        /// `empty_response` did not warrant retry); `> 1` means we
+        /// waited through the propagation window and Dhan still
+        /// reported denied.
+        attempts_made: u32,
+    },
+
+    /// Phase 0 Item 18b — boot-time static-IP gate is retrying because
+    /// Dhan returned `orders_allowed = false`. Bucket-coalesced
+    /// `Severity::Low` so the operator sees occasional progress
+    /// without being paged.
+    StaticIpBootCheckRetrying {
+        /// 1-indexed current attempt number.
+        attempt: u32,
+        /// Total attempts the boot loop will make before halting.
+        max_attempts: u32,
     },
 
     /// Boot health check completed — infrastructure services verified.
@@ -2207,6 +2224,7 @@ impl NotificationEvent {
                 reason,
                 orders_allowed,
                 ip_match_status,
+                attempts_made,
             } => {
                 let plain_reason = match reason.as_str() {
                     "empty_response" => {
@@ -2220,8 +2238,24 @@ impl NotificationEvent {
                     }
                     _ => "Static IP boot check failed.",
                 };
+                let attempt_line = if *attempts_made > 1 {
+                    format!(
+                        "\nWaited through {attempts_made} retry attempts (~{} minutes) before giving up.",
+                        attempts_made.saturating_sub(1)
+                    )
+                } else {
+                    String::new()
+                };
                 format!(
-                    "<b>STATIC IP BOOT CHECK FAILED</b>\n{plain_reason}\n\nDhan reply: ordersAllowed={orders_allowed}, ipMatchStatus=\"{ip_match_status}\"\n\nBoot blocked — no orders will be placed until this is fixed."
+                    "<b>STATIC IP BOOT CHECK FAILED</b>\n{plain_reason}{attempt_line}\n\nDhan reply: ordersAllowed={orders_allowed}, ipMatchStatus=\"{ip_match_status}\"\n\nBoot blocked — no orders will be placed until this is fixed."
+                )
+            }
+            Self::StaticIpBootCheckRetrying {
+                attempt,
+                max_attempts,
+            } => {
+                format!(
+                    "<b>Static IP check waiting</b>\nDhan still reports this IP as not allowed for orders. Retry {attempt} of {max_attempts} (every minute)."
                 )
             }
             Self::BootHealthCheck {
@@ -2567,6 +2601,7 @@ impl NotificationEvent {
             Self::IpVerificationSuccess { .. } => "IpVerificationSuccess",
             Self::StaticIpBootCheckPassed { .. } => "StaticIpBootCheckPassed",
             Self::StaticIpBootCheckFailed { .. } => "StaticIpBootCheckFailed",
+            Self::StaticIpBootCheckRetrying { .. } => "StaticIpBootCheckRetrying",
             Self::BootHealthCheck { .. } => "BootHealthCheck",
             Self::BootDeadlineMissed { .. } => "BootDeadlineMissed",
             Self::BootClockSkewExceeded { .. } => "BootClockSkewExceeded",
@@ -2717,6 +2752,7 @@ impl NotificationEvent {
             Self::TokenRenewed => Severity::Low,
             Self::IpVerificationSuccess { .. } => Severity::Low,
             Self::StaticIpBootCheckPassed { .. } => Severity::Low,
+            Self::StaticIpBootCheckRetrying { .. } => Severity::Low,
             // Wave-Holiday-Gate (2026-05-09): bumped from Low → Medium so
             // these once-per-boot positive signals dispatch immediately
             // (Low coalesces in 60s window). Operator's 2026-05-09 complaint:
@@ -3924,6 +3960,7 @@ mod tests {
             reason: "orders_not_allowed".to_string(),
             orders_allowed: false,
             ip_match_status: "MATCH".to_string(),
+            attempts_made: 1,
         };
         let msg = event.to_message();
         assert!(msg.contains("STATIC IP BOOT CHECK FAILED"));
@@ -3941,6 +3978,7 @@ mod tests {
             reason: "empty_response".to_string(),
             orders_allowed: false,
             ip_match_status: String::new(),
+            attempts_made: 1,
         };
         assert_eq!(event.severity(), Severity::Critical);
     }
@@ -3956,6 +3994,7 @@ mod tests {
                 reason: reason.to_string(),
                 orders_allowed: false,
                 ip_match_status: String::new(),
+                attempts_made: 1,
             };
             let msg = event.to_message();
             assert!(
@@ -3963,6 +4002,47 @@ mod tests {
                 "reason={reason} should produce {expected_phrase:?}, got: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn test_static_ip_boot_check_failed_message_after_exhausted_retry() {
+        // Phase 0 Item 18b — when the loop exhausts its retry budget
+        // the operator sees how long we waited before giving up.
+        let event = NotificationEvent::StaticIpBootCheckFailed {
+            reason: "orders_not_allowed".to_string(),
+            orders_allowed: false,
+            ip_match_status: "MISMATCH".to_string(),
+            attempts_made: 30,
+        };
+        let msg = event.to_message();
+        assert!(
+            msg.contains("30 retry attempts"),
+            "expected attempts_made count in message, got: {msg}"
+        );
+        assert!(msg.contains("minutes"));
+    }
+
+    #[test]
+    fn test_static_ip_boot_check_retrying_message_mentions_count() {
+        let event = NotificationEvent::StaticIpBootCheckRetrying {
+            attempt: 7,
+            max_attempts: 30,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Static IP check waiting"));
+        assert!(msg.contains("Retry 7 of 30"));
+        assert!(msg.contains("every minute"));
+    }
+
+    #[test]
+    fn test_static_ip_boot_check_retrying_is_low_severity() {
+        // Severity::Low coalesces into 60s windows — the operator
+        // sees one summary per minute instead of 30 individual pages.
+        let event = NotificationEvent::StaticIpBootCheckRetrying {
+            attempt: 1,
+            max_attempts: 30,
+        };
+        assert_eq!(event.severity(), Severity::Low);
     }
 
     #[test]
@@ -3980,9 +4060,18 @@ mod tests {
                 reason: "empty_response".to_string(),
                 orders_allowed: false,
                 ip_match_status: String::new(),
+                attempts_made: 1,
             }
             .topic(),
             "StaticIpBootCheckFailed"
+        );
+        assert_eq!(
+            NotificationEvent::StaticIpBootCheckRetrying {
+                attempt: 1,
+                max_attempts: 30,
+            }
+            .topic(),
+            "StaticIpBootCheckRetrying"
         );
     }
 
