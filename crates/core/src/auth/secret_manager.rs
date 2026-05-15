@@ -861,6 +861,49 @@ mod tests {
         );
     }
 
+    /// Phase 0 Item 19f meta-guard: main.rs MUST wire the
+    /// `shutdown_notify` -> heartbeat-`Notify` bridge so the
+    /// `GracefulRelease` lifecycle audit row + the Valkey DEL run
+    /// on Ctrl-C / 15:30 IST close instead of leaving the lock to
+    /// expire silently after 90s TTL.
+    ///
+    /// The bridge takes `instance_lock_shutdown_chain` (an
+    /// `Option<Arc<Notify>>`), spawns a small bridge task that
+    /// awaits the broader `shutdown_notify`, and triggers the
+    /// heartbeat's own Notify. Without this chain, a graceful
+    /// shutdown would not surface the heartbeat exit path; the lock
+    /// would only get released by TTL expiry, and the
+    /// `live_instance_lock` audit table would be missing the
+    /// `GracefulRelease` row for every clean exit.
+    #[test]
+    fn test_instance_lock_shutdown_chain_is_wired() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable from secret_manager test working dir");
+
+        let calls_spawn_heartbeat = main_rs.contains("spawn_instance_lock_heartbeat");
+        let declares_chain = main_rs.contains("instance_lock_shutdown_chain");
+        let takes_chain = main_rs.contains("instance_lock_shutdown_chain.take()");
+
+        if calls_spawn_heartbeat {
+            assert!(
+                declares_chain,
+                "main.rs spawns the instance-lock heartbeat but does NOT declare \
+                 `instance_lock_shutdown_chain` — the broader shutdown_notify cannot \
+                 bridge into the heartbeat's own Notify, so Ctrl-C / 15:30 IST close \
+                 will leave the lock to TTL-expire silently. Wire the bridge per \
+                 Phase 0 Item 19f."
+            );
+            assert!(
+                takes_chain,
+                "main.rs declares `instance_lock_shutdown_chain` but does not call \
+                 `.take()` to spawn the bridge task. The chain must be consumed \
+                 once at the point `shutdown_notify` is constructed; otherwise the \
+                 heartbeat never observes the shutdown signal."
+            );
+        }
+    }
+
     /// Phase 0 Item 19e meta-guard: main.rs MUST persist every
     /// boot-time instance-lock outcome via the audit row helper.
     ///
