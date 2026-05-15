@@ -437,6 +437,13 @@ pub enum ErrorCode {
     /// Audit tables are SEBI-relevant forensic records; write failures
     /// must surface immediately. Severity::Medium.
     AggregatorAudit01WriteFailed,
+    /// RESILIENCE-01: another `tickvault` process holds the Valkey
+    /// dual-instance lock for this client-id. Two processes running
+    /// against the same Dhan account fight over static-IP enforcement
+    /// and fragment the WebSocket connection budget. Boot HALTS until
+    /// the other instance shuts down (or its 90 s TTL expires after
+    /// a hard crash). Severity::Critical.
+    Resilience01DualInstanceDetected,
 }
 
 impl ErrorCode {
@@ -569,6 +576,7 @@ impl ErrorCode {
             Self::AggregatorHb01Heartbeat => "AGGREGATOR-HB-01",
             Self::Boundary01CatchupSeal => "BOUNDARY-01",
             Self::AggregatorAudit01WriteFailed => "AGGREGATOR-AUDIT-01",
+            Self::Resilience01DualInstanceDetected => "RESILIENCE-01",
         }
     }
 
@@ -596,7 +604,8 @@ impl ErrorCode {
             | Self::PrevClose03BootRoutingAssertion
             | Self::Depth200Smoke01NoFramesAtBoot
             | Self::Phase2Ready01PreflightFailed
-            | Self::AggregatorDrop01 => Severity::Critical,
+            | Self::AggregatorDrop01
+            | Self::Resilience01DualInstanceDetected => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
             Self::Selftest01Passed | Self::Slo01Healthy | Self::AggregatorHb01Heartbeat => {
                 Severity::Info
@@ -795,6 +804,7 @@ impl ErrorCode {
             | Self::AggregatorHb01Heartbeat
             | Self::Boundary01CatchupSeal
             | Self::AggregatorAudit01WriteFailed => ".claude/rules/project/wave-6-error-codes.md",
+            Self::Resilience01DualInstanceDetected => ".claude/rules/project/wave-4-error-codes.md",
         }
     }
 
@@ -917,6 +927,8 @@ impl ErrorCode {
             Self::AggregatorHb01Heartbeat,
             Self::Boundary01CatchupSeal,
             Self::AggregatorAudit01WriteFailed,
+            // Wave 4 — Item 19 dual-instance lock
+            Self::Resilience01DualInstanceDetected,
         ]
     }
 }
@@ -1115,7 +1127,7 @@ mod tests {
         // 93 -> 99 for AGGREGATOR-DROP-01, AGGREGATOR-LATE-01,
         // AGGREGATOR-SEAL-01, AGGREGATOR-HB-01, BOUNDARY-01,
         // AGGREGATOR-AUDIT-01.
-        assert_eq!(ErrorCode::all().len(), 99);
+        assert_eq!(ErrorCode::all().len(), 100);
     }
 
     #[test]
@@ -1162,7 +1174,9 @@ mod tests {
                 || s.starts_with("PREVOI-")
                 // Wave 6 Sub-PR #1: multi-TF aggregator + boundary timer.
                 || s.starts_with("AGGREGATOR-")
-                || s.starts_with("BOUNDARY-");
+                || s.starts_with("BOUNDARY-")
+                // Wave 4 Item 19 (Phase 0): dual-instance lock.
+                || s.starts_with("RESILIENCE-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
