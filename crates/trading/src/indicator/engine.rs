@@ -293,7 +293,7 @@ impl IndicatorEngine {
             state.supertrend_upper
         };
 
-        IndicatorSnapshot {
+        let mut snapshot = IndicatorSnapshot {
             security_id: tick.security_id,
             ema_fast: state.ema_fast,
             ema_slow: state.ema_slow,
@@ -317,7 +317,22 @@ impl IndicatorEngine {
             day_low: low,
             volume,
             is_warm: state.is_warm(),
+        };
+        // Phase 0 Item 21 (2026-05-15): final-stage NaN / Inf guard.
+        // Strategies silently break when fed NaN — `close < NaN` is
+        // false, so a poisoned indicator stops firing. Clamp every
+        // non-finite field to 0.0 in-place; emit a counter so the
+        // operator sees the issue immediately if it ever fires.
+        let nan_fields_cleared = snapshot.sanitize_nan_inf();
+        if nan_fields_cleared > 0 {
+            // Zero-alloc hot-path counter — static label, no
+            // formatting at emission. The operator watches
+            // `tv_indicator_nan_guard_fired_total` rate; a non-zero
+            // rate is a bug elsewhere in the engine math.
+            metrics::counter!("tv_indicator_nan_guard_fired_total")
+                .increment(u64::from(nan_fields_cleared));
         }
+        snapshot
     }
 
     /// Resets VWAP accumulators for all instruments (call at market open).
