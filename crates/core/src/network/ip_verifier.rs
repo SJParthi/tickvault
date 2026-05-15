@@ -549,6 +549,51 @@ pub fn classify_static_ip_boot_outcome(
     StaticIpBootOutcome::Pass
 }
 
+/// Phase 0 Item 18b — Action for the boot-time retry loop after
+/// receiving a `StaticIpBootOutcome`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StaticIpBootRetryAction {
+    /// Boot may proceed — gate passed.
+    Pass,
+    /// Sleep `interval_secs` and retry. Carries the (1-indexed)
+    /// upcoming attempt number for the operator-facing event.
+    Retry { next_attempt: u32 },
+    /// Halt boot. Carries the stable failure-reason wire string.
+    Halt { reason: &'static str },
+}
+
+/// Pure retry policy: given the just-observed outcome, the
+/// 1-indexed attempt number that produced it, and the configured
+/// max attempts, return the next action.
+///
+/// Only `OrdersNotAllowed` is retryable. Everything else halts
+/// immediately, because retrying an empty response or a non-MATCH
+/// status would just burn API quota — those are structural failures.
+#[must_use]
+pub fn classify_static_ip_boot_retry_action(
+    outcome: &StaticIpBootOutcome,
+    attempts_made: u32,
+    max_attempts: u32,
+) -> StaticIpBootRetryAction {
+    match outcome {
+        StaticIpBootOutcome::Pass => StaticIpBootRetryAction::Pass,
+        StaticIpBootOutcome::Fail(StaticIpBootFailureReason::OrdersNotAllowed) => {
+            if attempts_made < max_attempts {
+                StaticIpBootRetryAction::Retry {
+                    next_attempt: attempts_made.saturating_add(1),
+                }
+            } else {
+                StaticIpBootRetryAction::Halt {
+                    reason: StaticIpBootFailureReason::OrdersNotAllowed.as_str(),
+                }
+            }
+        }
+        StaticIpBootOutcome::Fail(reason) => StaticIpBootRetryAction::Halt {
+            reason: reason.as_str(),
+        },
+    }
+}
+
 /// Calls `GET /v2/ip/getIP` and returns the boot outcome.
 ///
 /// This is the thin live-API wrapper around `classify_static_ip_boot_outcome`.
@@ -1418,6 +1463,105 @@ mod tests {
             StaticIpBootOutcome::Fail(StaticIpBootFailureReason::EmptyResponse) => {}
             other => panic!("expected EmptyResponse, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 0 Item 18b — classify_static_ip_boot_retry_action
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_static_ip_boot_retry_action_smoke() {
+        // Smoke check that the public symbol `classify_static_ip_boot_retry_action`
+        // is callable. The six `test_retry_action_*` cases below exercise
+        // every branch (Pass / Retry budget remaining / Halt at exhaustion /
+        // Halt on structural failure / boundary walk / zero-budget edge).
+        assert_eq!(
+            classify_static_ip_boot_retry_action(&StaticIpBootOutcome::Pass, 1, 30),
+            StaticIpBootRetryAction::Pass
+        );
+    }
+
+    #[test]
+    fn test_retry_action_on_pass_is_pass() {
+        let action = classify_static_ip_boot_retry_action(&StaticIpBootOutcome::Pass, 1, 30);
+        assert_eq!(action, StaticIpBootRetryAction::Pass);
+    }
+
+    #[test]
+    fn test_retry_action_on_orders_not_allowed_retries_when_budget_remains() {
+        let outcome = StaticIpBootOutcome::Fail(StaticIpBootFailureReason::OrdersNotAllowed);
+        let action = classify_static_ip_boot_retry_action(&outcome, 1, 30);
+        assert_eq!(action, StaticIpBootRetryAction::Retry { next_attempt: 2 });
+    }
+
+    #[test]
+    fn test_retry_action_on_orders_not_allowed_halts_at_budget_exhaustion() {
+        // attempts_made == max_attempts is the boundary: 30/30 means
+        // we already used the last attempt; halt immediately.
+        let outcome = StaticIpBootOutcome::Fail(StaticIpBootFailureReason::OrdersNotAllowed);
+        let action = classify_static_ip_boot_retry_action(&outcome, 30, 30);
+        assert_eq!(
+            action,
+            StaticIpBootRetryAction::Halt {
+                reason: "orders_not_allowed"
+            }
+        );
+    }
+
+    #[test]
+    fn test_retry_action_on_empty_response_halts_immediately() {
+        // Structural failure — no point retrying.
+        let outcome = StaticIpBootOutcome::Fail(StaticIpBootFailureReason::EmptyResponse);
+        let action = classify_static_ip_boot_retry_action(&outcome, 1, 30);
+        assert_eq!(
+            action,
+            StaticIpBootRetryAction::Halt {
+                reason: "empty_response"
+            }
+        );
+    }
+
+    #[test]
+    fn test_retry_action_on_match_status_not_ok_halts_immediately() {
+        let outcome = StaticIpBootOutcome::Fail(StaticIpBootFailureReason::MatchStatusNotOk {
+            observed: "MISMATCH".to_string(),
+        });
+        let action = classify_static_ip_boot_retry_action(&outcome, 1, 30);
+        assert_eq!(
+            action,
+            StaticIpBootRetryAction::Halt {
+                reason: "match_status_not_ok"
+            }
+        );
+    }
+
+    #[test]
+    fn test_retry_action_orders_not_allowed_walks_full_budget() {
+        // Walk the full retry budget and confirm the boundary fires
+        // exactly on attempt 30, not 29 or 31.
+        let outcome = StaticIpBootOutcome::Fail(StaticIpBootFailureReason::OrdersNotAllowed);
+        for attempt in 1..30 {
+            let action = classify_static_ip_boot_retry_action(&outcome, attempt, 30);
+            match action {
+                StaticIpBootRetryAction::Retry { next_attempt } => {
+                    assert_eq!(next_attempt, attempt + 1);
+                }
+                other => panic!("attempt {attempt} expected Retry, got {other:?}"),
+            }
+        }
+        // At attempt 30 (last attempt used) we must halt.
+        let final_action = classify_static_ip_boot_retry_action(&outcome, 30, 30);
+        assert!(matches!(final_action, StaticIpBootRetryAction::Halt { .. }));
+    }
+
+    #[test]
+    fn test_retry_action_handles_zero_budget_edge_case() {
+        // Defensive: if a future operator drops max_attempts to 1, the
+        // very first orders-not-allowed observation must halt — the
+        // loop has already used its sole attempt.
+        let outcome = StaticIpBootOutcome::Fail(StaticIpBootFailureReason::OrdersNotAllowed);
+        let action = classify_static_ip_boot_retry_action(&outcome, 1, 1);
+        assert!(matches!(action, StaticIpBootRetryAction::Halt { .. }));
     }
 
     #[test]

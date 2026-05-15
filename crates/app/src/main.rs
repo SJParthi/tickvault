@@ -2347,7 +2347,7 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 6a: Dhan-side static IP boot gate (Phase 0 Item 18)
+    // Step 6a: Dhan-side static IP boot gate (Phase 0 Item 18 + 18b)
     // -----------------------------------------------------------------------
     // Step 5.5 above already confirmed our egress IP matches the SSM
     // value (public IP-echo vs SSM). This second gate asks Dhan itself
@@ -2357,10 +2357,20 @@ async fn main() -> Result<()> {
     // Dhan's whitelist would let boot proceed and then orders would
     // silently be rejected at trade time.
     //
+    // Item 18b: when Dhan returns `orders_allowed = false` we retry up
+    // to STATIC_IP_BOOT_RETRY_MAX_ATTEMPTS times with a 60s interval
+    // (max 30 min). Structural failures (empty response,
+    // match_status_not_ok) halt immediately — retrying them would just
+    // burn API quota.
+    //
     // Skipped outside live mode for the same reason as Step 5.5
     // (sandbox + paper modes do not place real orders).
     if trading_mode.is_live() {
-        info!("Phase 0 Item 18: verifying Dhan-side static IP whitelist (/v2/ip/getIP)");
+        info!(
+            max_attempts = tickvault_common::constants::STATIC_IP_BOOT_RETRY_MAX_ATTEMPTS,
+            interval_secs = tickvault_common::constants::STATIC_IP_BOOT_RETRY_INTERVAL_SECS,
+            "Phase 0 Item 18+18b: verifying Dhan-side static IP whitelist (/v2/ip/getIP)"
+        );
         let access_token = {
             use secrecy::ExposeSecret;
             let guard = token_manager.token_handle().load();
@@ -2381,77 +2391,105 @@ async fn main() -> Result<()> {
                         reason: "empty_response".to_string(),
                         orders_allowed: false,
                         ip_match_status: String::new(),
+                        attempts_made: 1,
                     });
                     return Ok(());
                 }
             }
         };
 
-        match ip_verifier::verify_static_ip_at_boot(&config.dhan.rest_api_base_url, &access_token)
-            .await
-        {
-            Ok(ip_verifier::StaticIpBootOutcome::Pass) => {
-                info!("Phase 0 Item 18: Dhan reports orders allowed from this IP");
-                let ip_flag = {
-                    // Grab the slot string from a follow-up get_ip call so
-                    // the Telegram event carries the operator-facing slot
-                    // label. Best-effort — failure here does NOT block
-                    // boot (we already have a Pass verdict).
-                    match ip_verifier::get_ip(&config.dhan.rest_api_base_url, &access_token).await {
-                        Ok(resp) => resp.ip_flag,
-                        Err(_) => String::new(),
-                    }
-                };
-                notifier.notify(NotificationEvent::StaticIpBootCheckPassed { ip_flag });
+        let max_attempts = tickvault_common::constants::STATIC_IP_BOOT_RETRY_MAX_ATTEMPTS;
+        let retry_interval = std::time::Duration::from_secs(
+            tickvault_common::constants::STATIC_IP_BOOT_RETRY_INTERVAL_SECS,
+        );
+        let mut attempts_made: u32 = 0;
+        let halt_reason: Option<&'static str> = loop {
+            attempts_made = attempts_made.saturating_add(1);
+            let outcome_result = ip_verifier::verify_static_ip_at_boot(
+                &config.dhan.rest_api_base_url,
+                &access_token,
+            )
+            .await;
+            let outcome = match outcome_result {
+                Ok(o) => o,
+                Err(err) => {
+                    error!(
+                        code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
+                        severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
+                            .severity()
+                            .as_str(),
+                        error = %err,
+                        attempts_made,
+                        "Phase 0 Item 18: /v2/ip/getIP request failed — BLOCKING BOOT"
+                    );
+                    break Some("empty_response");
+                }
+            };
+
+            let action = ip_verifier::classify_static_ip_boot_retry_action(
+                &outcome,
+                attempts_made,
+                max_attempts,
+            );
+            match action {
+                ip_verifier::StaticIpBootRetryAction::Pass => {
+                    info!(
+                        attempts_made,
+                        "Phase 0 Item 18: Dhan reports orders allowed from this IP"
+                    );
+                    let ip_flag =
+                        match ip_verifier::get_ip(&config.dhan.rest_api_base_url, &access_token)
+                            .await
+                        {
+                            Ok(resp) => resp.ip_flag,
+                            Err(_) => String::new(),
+                        };
+                    notifier.notify(NotificationEvent::StaticIpBootCheckPassed { ip_flag });
+                    break None;
+                }
+                ip_verifier::StaticIpBootRetryAction::Retry { next_attempt } => {
+                    info!(
+                        next_attempt,
+                        max_attempts,
+                        "Phase 0 Item 18b: Dhan reports orders not allowed — sleeping before retry"
+                    );
+                    notifier.notify(NotificationEvent::StaticIpBootCheckRetrying {
+                        attempt: next_attempt,
+                        max_attempts,
+                    });
+                    tokio::time::sleep(retry_interval).await;
+                }
+                ip_verifier::StaticIpBootRetryAction::Halt { reason } => {
+                    error!(
+                        code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
+                        severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
+                            .severity()
+                            .as_str(),
+                        reason,
+                        attempts_made,
+                        "Phase 0 Item 18: Dhan static IP check FAILED — BLOCKING BOOT"
+                    );
+                    break Some(reason);
+                }
             }
-            Ok(ip_verifier::StaticIpBootOutcome::Fail(reason)) => {
-                let reason_label = reason.as_str().to_string();
-                // Pull the raw fields one more time for the Telegram
-                // event — same best-effort caveat as above; if the
-                // second call also fails the operator still sees the
-                // typed reason which is the actionable signal.
-                let (orders_allowed, ip_match_status) = match ip_verifier::get_ip(
-                    &config.dhan.rest_api_base_url,
-                    &access_token,
-                )
-                .await
-                {
+        };
+
+        if let Some(reason_label) = halt_reason {
+            // Best-effort re-read of the raw fields for the Telegram
+            // payload. If this also fails the operator still sees the
+            // typed reason which is the actionable signal.
+            let (orders_allowed, ip_match_status) =
+                match ip_verifier::get_ip(&config.dhan.rest_api_base_url, &access_token).await {
                     Ok(resp) => (resp.orders_allowed, resp.ip_match_status),
                     Err(_) => (false, String::new()),
                 };
-                error!(
-                    code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
-                    severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
-                        .severity()
-                        .as_str(),
-                    reason = %reason_label,
-                    orders_allowed,
-                    ip_match_status = %ip_match_status,
-                    "Phase 0 Item 18: Dhan static IP check FAILED — BLOCKING BOOT"
-                );
-                notifier.notify(NotificationEvent::StaticIpBootCheckFailed {
-                    reason: reason_label,
-                    orders_allowed,
-                    ip_match_status,
-                });
-                return Ok(());
-            }
-            Err(err) => {
-                error!(
-                    code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
-                    severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
-                        .severity()
-                        .as_str(),
-                    error = %err,
-                    "Phase 0 Item 18: /v2/ip/getIP request failed — BLOCKING BOOT"
-                );
-                notifier.notify(NotificationEvent::StaticIpBootCheckFailed {
-                    reason: "empty_response".to_string(),
-                    orders_allowed: false,
-                    ip_match_status: String::new(),
-                });
-                return Ok(());
-            }
+            notifier.notify(NotificationEvent::StaticIpBootCheckFailed {
+                reason: reason_label.to_string(),
+                orders_allowed,
+                ip_match_status,
+                attempts_made,
+            });
+            return Ok(());
         }
     } else {
         info!(
