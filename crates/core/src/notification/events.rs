@@ -398,6 +398,38 @@ pub enum NotificationEvent {
         token_remaining_secs: u64,
     },
 
+    /// Phase 0 Item 22d (2026-05-15): once-per-trading-day end-of-day
+    /// digest. Fires at 15:31:30 IST — 90s after the 15:30 close so the
+    /// market-close shutdown signal has settled but before the operator
+    /// goes to sleep. Reports the final state of the live feed
+    /// connection + the JWT token headroom so the operator can answer
+    /// two questions at a glance:
+    ///
+    ///   1. "Did the feed stay up through close?" — non-zero
+    ///      `main_feed_active` confirms yes.
+    ///   2. "Do I need to refresh TOTP before tomorrow?" — if
+    ///      `token_remaining_hours < 12` the next session will boot
+    ///      with stale credentials.
+    ///
+    /// Severity = Info so it never pages (it is a daily positive
+    /// signal, not an alert). Edge-trigger: fires exactly once per
+    /// trading day, never on mid-evening boot past 15:31:30 IST.
+    EndOfDayDigest {
+        /// Trading date in `YYYY-MM-DD` IST format. Stamped into the
+        /// Telegram body so the operator can correlate against
+        /// historical digests.
+        trading_date_ist: String,
+        /// Final main-feed connection count at 15:31:30 IST.
+        main_feed_active: usize,
+        /// Operator's expected total — same `effective_main_feed_pool_size`
+        /// value as `MarketOpenReadinessConfirmation` for parity.
+        main_feed_total: usize,
+        /// JWT remaining lifetime in whole hours. The 24h SEBI cycle
+        /// means anything < 12h after market close needs a TOTP-driven
+        /// refresh before the next opening bell.
+        token_remaining_hours: u64,
+    },
+
     /// Option C (2026-04-17): Depth setup dropped a specific underlying —
     /// the grace window expired without a valid spot price OR the option
     /// chain was missing. Complements `DepthIndexLtpTimeout` which fires
@@ -1711,6 +1743,33 @@ impl NotificationEvent {
                      Bell rings in 60s."
                 )
             }
+            Self::EndOfDayDigest {
+                trading_date_ist,
+                main_feed_active,
+                main_feed_total,
+                token_remaining_hours,
+            } => {
+                // Operator-facing wording per operator-charter §G: no
+                // library names, no file paths, plain English action
+                // when the token headroom is low.
+                let token_warning = if *token_remaining_hours < 12 {
+                    "\nToken expires before tomorrow's open — refresh TOTP before 09:00 IST."
+                } else {
+                    ""
+                };
+                let close_status = if *main_feed_active > 0 {
+                    "Feed stayed up through close."
+                } else {
+                    "Feed was disconnected at close — check overnight logs."
+                };
+                format!(
+                    "<b>End-of-day digest @ 15:31:30 IST</b>\n\
+                     Trading date: {trading_date_ist}\n\
+                     Main feed: {main_feed_active}/{main_feed_total}\n\
+                     Token headroom: {token_remaining_hours}h\n\
+                     {close_status}{token_warning}"
+                )
+            }
             Self::DepthIndexLtpTimeout { waited_secs } => {
                 format!(
                     "<b>Depth ATM timeout</b>\nWaited {waited_secs}s for index LTPs \
@@ -2584,6 +2643,7 @@ impl NotificationEvent {
             Self::MarketOpenStreamingConfirmation { .. } => "MarketOpenStreamingConfirmation",
             Self::MarketOpenStreamingFailed { .. } => "MarketOpenStreamingFailed",
             Self::MarketOpenReadinessConfirmation { .. } => "MarketOpenReadinessConfirmation",
+            Self::EndOfDayDigest { .. } => "EndOfDayDigest",
             Self::DepthUnderlyingMissing { .. } => "DepthUnderlyingMissing",
             Self::DepthSpotPriceStale { .. } => "DepthSpotPriceStale",
             Self::Phase2Started { .. } => "Phase2Started",
@@ -2738,6 +2798,7 @@ impl NotificationEvent {
             Self::MarketOpenStreamingConfirmation { .. } => Severity::Info,
             Self::MarketOpenStreamingFailed { .. } => Severity::High,
             Self::MarketOpenReadinessConfirmation { .. } => Severity::Info,
+            Self::EndOfDayDigest { .. } => Severity::Info,
             Self::SelfTestPassed { .. } => Severity::Info,
             Self::SelfTestDegraded { .. } => Severity::High,
             Self::RealtimeGuaranteeHealthy { .. } => Severity::Info,
@@ -5421,5 +5482,93 @@ mod tests {
             lock_key: String::new(),
         };
         assert_eq!(event.topic(), "DualInstanceDetected");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 0 Item 22d — EndOfDayDigest (2026-05-15)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_end_of_day_digest_topic_and_severity_pinned() {
+        let event = NotificationEvent::EndOfDayDigest {
+            trading_date_ist: "2026-05-15".to_string(),
+            main_feed_active: 1,
+            main_feed_total: 1,
+            token_remaining_hours: 20,
+        };
+        assert_eq!(event.topic(), "EndOfDayDigest");
+        assert_eq!(event.severity(), Severity::Info);
+    }
+
+    #[test]
+    fn test_end_of_day_digest_happy_path_message() {
+        // Feed up, token headroom > 12h — no warning lines.
+        let event = NotificationEvent::EndOfDayDigest {
+            trading_date_ist: "2026-05-15".to_string(),
+            main_feed_active: 1,
+            main_feed_total: 1,
+            token_remaining_hours: 20,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("End-of-day digest @ 15:31:30 IST"));
+        assert!(msg.contains("Trading date: 2026-05-15"));
+        assert!(msg.contains("Main feed: 1/1"));
+        assert!(msg.contains("Token headroom: 20h"));
+        assert!(msg.contains("Feed stayed up through close."));
+        // No token warning when headroom is healthy.
+        assert!(!msg.contains("refresh TOTP"));
+    }
+
+    #[test]
+    fn test_end_of_day_digest_low_token_headroom_adds_action_line() {
+        // < 12h until expiry — must instruct operator to refresh TOTP.
+        let event = NotificationEvent::EndOfDayDigest {
+            trading_date_ist: "2026-05-15".to_string(),
+            main_feed_active: 1,
+            main_feed_total: 1,
+            token_remaining_hours: 8,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Token headroom: 8h"));
+        assert!(msg.contains("refresh TOTP before 09:00 IST"));
+    }
+
+    #[test]
+    fn test_end_of_day_digest_feed_down_at_close_swaps_status_line() {
+        // Critical-looking signal in a Severity::Info envelope —
+        // operator must SEE "check overnight logs" but never get
+        // paged (that's what MarketOpenStreamingFailed at next open
+        // is for).
+        let event = NotificationEvent::EndOfDayDigest {
+            trading_date_ist: "2026-05-15".to_string(),
+            main_feed_active: 0,
+            main_feed_total: 1,
+            token_remaining_hours: 20,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Main feed: 0/1"));
+        assert!(msg.contains("check overnight logs"));
+        assert!(!msg.contains("stayed up"));
+    }
+
+    #[test]
+    fn test_end_of_day_digest_boundary_12h_uses_warning_path() {
+        // The boundary `< 12` is strict — exactly 12h passes the
+        // healthy check (operator does NOT need to refresh until
+        // less than 12h are left).
+        let healthy = NotificationEvent::EndOfDayDigest {
+            trading_date_ist: "2026-05-15".to_string(),
+            main_feed_active: 1,
+            main_feed_total: 1,
+            token_remaining_hours: 12,
+        };
+        assert!(!healthy.to_message().contains("refresh TOTP"));
+        let warn = NotificationEvent::EndOfDayDigest {
+            trading_date_ist: "2026-05-15".to_string(),
+            main_feed_active: 1,
+            main_feed_total: 1,
+            token_remaining_hours: 11,
+        };
+        assert!(warn.to_message().contains("refresh TOTP"));
     }
 }
