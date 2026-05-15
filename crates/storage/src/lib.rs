@@ -97,6 +97,7 @@ pub mod materialized_views;
 pub mod obi_persistence;
 pub mod open_price_audit_persistence;
 pub mod order_audit_persistence;
+pub mod order_update_ws_audit_persistence;
 pub mod partition_manager;
 pub mod phase2_audit_persistence;
 pub mod phase2_subscription_marker;
