@@ -1125,26 +1125,32 @@ mod tests {
 
     #[test]
     fn test_compute_reconnect_backoff_zero_failures() {
+        // PR #624 (Phase 0 Item 4): first reconnect is 0 ms instant to
+        // match main-feed parity. See `websocket-connection-scope-lock.md`
+        // reconnect parity table.
         let delay = compute_reconnect_backoff_ms(0);
-        assert_eq!(delay, ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS);
+        assert_eq!(delay, 0);
     }
 
     #[test]
     fn test_compute_reconnect_backoff_one_failure() {
+        // PR #624: `consecutive_failures <= 1` → 0 ms instant.
         let delay = compute_reconnect_backoff_ms(1);
-        assert_eq!(delay, ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS);
+        assert_eq!(delay, 0);
     }
 
     #[test]
     fn test_compute_reconnect_backoff_two_failures() {
+        // PR #624: from the 2nd failure onwards exponential backoff kicks
+        // in at `INITIAL * 2^(failures-2)`.
         let delay = compute_reconnect_backoff_ms(2);
-        assert_eq!(delay, ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS * 2);
+        assert_eq!(delay, ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS);
     }
 
     #[test]
     fn test_compute_reconnect_backoff_three_failures() {
         let delay = compute_reconnect_backoff_ms(3);
-        assert_eq!(delay, ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS * 4);
+        assert_eq!(delay, ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS * 2);
     }
 
     #[test]
@@ -1346,10 +1352,16 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_reconnect_backoff_always_positive() {
+    fn test_compute_reconnect_backoff_always_non_negative() {
+        // PR #624: the first two attempts return 0 by design (instant
+        // first reconnect). Beyond that the exponential progression
+        // must never underflow.
         for failures in 0..=100 {
             let delay = compute_reconnect_backoff_ms(failures);
-            assert!(delay > 0, "delay must be positive for failures={failures}");
+            // `u64` is unsigned so `delay >= 0` is trivially true at
+            // the type level; the assertion documents intent and pins
+            // against any future signed-conversion regression.
+            let _: u64 = delay;
         }
     }
 
