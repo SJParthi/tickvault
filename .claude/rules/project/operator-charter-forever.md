@@ -177,6 +177,50 @@ For every plan item / new feature / Telegram message / docs:
 | 9 | Market-hours-aware tokio tasks (audit-findings Rule 3) | `audit-findings-2026-04-17.md` |
 | 10 | Edge-triggered alerts only (audit-findings Rule 4) | `audit-findings-2026-04-17.md` |
 | 11 | NO false-OK signals — gate success notifications on positive progress (audit-findings Rule 11) | `audit-findings-2026-04-17.md` |
+| 12 | One PR open at a time — finish + merge current before starting next (operator lock 2026-05-15) | `.claude/rules/project/pr-completion-protocol.md` |
+
+---
+
+## H. PR Completion Protocol (MANDATORY, every PR — operator lock 2026-05-15)
+
+> Operator verbatim 2026-05-15:
+> "always ensure to make it ready for merge once branch pr is created and finished and even always monitor the current PR until it gets merged successfully to main after doing this alone only go ahead with the remaining process always dude okay? always save this bro okay?"
+
+**The serial-completion rule:** Claude MUST finish + merge the current PR to `main` BEFORE starting the next item. No parallel branches. No "stack 3 PRs in flight". One PR at a time, monitored to merge.
+
+### The 10-step loop (every PR)
+
+| Step | Mandatory action | Tool |
+|---|---|---|
+| 1 | Code complete + local verify (`cargo test`, banned-pattern, pub-fn guards, plan-verify) | Bash |
+| 2 | Push branch (`git push -u origin <branch>` with retry on network err) | Bash |
+| 3 | Open PR as **draft**; body contains 9-box + 15-row + 7-row matrices + honest 100% claim | `mcp__github__create_pull_request` |
+| 4 | Tick the plan checkbox `[ ]` → `[x]` for every item this PR completes — INSIDE this PR's diff, same commit | Edit |
+| 5 | Mark PR **ready for review** once CI starts green | `mcp__github__update_pull_request` |
+| 6 | Enable **auto-merge** (squash) so merge fires the moment branch protection signals pass | `mcp__github__enable_pr_auto_merge` |
+| 7 | **Subscribe** to PR activity (CI status + review comments) | `mcp__github__subscribe_pr_activity` |
+| 8 | On CI red → diagnose → push fix → re-monitor. On reviewer comment → fix or reply with grep evidence. | event-driven |
+| 9 | Verify merge to `main`: `pull_request_read` returns `state=closed, merged=true` | `mcp__github__pull_request_read` |
+| 10 | Unsubscribe; ONLY THEN start the next item (next PR) | `mcp__github__unsubscribe_pr_activity` |
+
+### What this rule FORBIDS
+
+| Banned pattern | Why |
+|---|---|
+| Opening PR #2 before PR #1 is merged to main | Violates serial completion |
+| Marking plan checkbox `[x]` BEFORE PR merges | The merge IS the completion signal |
+| Closing the session while a PR is mid-flight without subscribing | Operator loses visibility |
+| Manual merge skipping CI | Branch protection blocks; auto-merge respects gates |
+| Bypassing `--no-verify` on push or `--no-gpg-sign` | Operator never authorized this |
+
+### Auto-driver one-liner
+
+> "Sir, one juice at a time. Make the orange juice → squeeze it → pour it → hand it to customer → wait until they pay → only then start the next mango juice. No making three juices at once."
+
+### Mechanical ratchet (to be wired)
+
+- New hook `.claude/hooks/serial-pr-guard.sh` runs at session start; refuses code commits if an open PR authored by this branch exists on the operator's repo without merge.
+- Tag-guard meta-test `crates/storage/tests/serial_pr_protocol_guard.rs` greps for the canonical phrases in this section so the rule cannot be silently deleted.
 
 ---
 
