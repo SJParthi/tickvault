@@ -827,6 +827,40 @@ mod tests {
         // else: vacuous pass — Valkey is not yet wired in production
     }
 
+    /// Phase 0 Item 19d meta-guard: main.rs MUST wire the
+    /// instance-lock boot gate + heartbeat together.
+    ///
+    /// If a future refactor splits the gate from the heartbeat (e.g.,
+    /// removes `spawn_instance_lock_heartbeat` while keeping
+    /// `try_acquire_instance_lock`), the lock would expire after 90s
+    /// and the next process would silently acquire — defeating the
+    /// dual-instance protection. This test blocks that regression.
+    ///
+    /// Symmetrically, removing the boot gate while keeping the
+    /// heartbeat would leave a dormant heartbeat task running with
+    /// nothing to renew, churning Valkey for no reason. Also blocked.
+    #[test]
+    fn test_instance_lock_boot_gate_and_heartbeat_are_wired_together() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable from secret_manager test working dir");
+
+        let calls_try_acquire = main_rs.contains("try_acquire_instance_lock");
+        let calls_spawn_heartbeat = main_rs.contains("spawn_instance_lock_heartbeat");
+
+        // Either both or neither — splitting them is the regression class.
+        assert_eq!(
+            calls_try_acquire, calls_spawn_heartbeat,
+            "main.rs wires the instance-lock boot gate and heartbeat \
+             asymmetrically: try_acquire_instance_lock = {calls_try_acquire}, \
+             spawn_instance_lock_heartbeat = {calls_spawn_heartbeat}. They must \
+             be wired together — the gate without the heartbeat lets the lock \
+             expire after 90 s (TTL); the heartbeat without the gate runs against \
+             a key we never claimed. See \
+             .claude/rules/project/wave-4-error-codes.md::RESILIENCE-01."
+        );
+    }
+
     // -----------------------------------------------------------------------
     // fetch_secret — error path (no real SSM available)
     // -----------------------------------------------------------------------
