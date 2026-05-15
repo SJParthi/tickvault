@@ -953,6 +953,30 @@ pub enum NotificationEvent {
         verified_ip: String,
     },
 
+    /// Phase 0 Item 18 — Dhan-side static-IP boot gate passed:
+    /// `/v2/ip/getIP` reported `ordersAllowed = true` and `MATCH`.
+    /// Fired once at boot. Severity::Low.
+    StaticIpBootCheckPassed {
+        /// Whitelisted IP slot Dhan returned (`PRIMARY` or `SECONDARY`).
+        ip_flag: String,
+    },
+
+    /// Phase 0 Item 18 — Dhan-side static-IP boot gate FAILED.
+    /// Boot must halt because exchange will reject orders from this IP.
+    /// Severity::Critical.
+    StaticIpBootCheckFailed {
+        /// Stable wire-format reason (`empty_response`,
+        /// `orders_not_allowed`, `match_status_not_ok`). Maps directly
+        /// to `StaticIpBootFailureReason::as_str()`.
+        reason: String,
+        /// Whether Dhan reported `ordersAllowed = true`. Surfaced for
+        /// operator triage clarity even though it's redundant with `reason`.
+        orders_allowed: bool,
+        /// Literal `ipMatchStatus` Dhan returned. Empty if response was
+        /// empty.
+        ip_match_status: String,
+    },
+
     /// Boot health check completed — infrastructure services verified.
     BootHealthCheck {
         /// Number of services that passed health check.
@@ -2174,6 +2198,32 @@ impl NotificationEvent {
                 let masked = mask_ip_for_notification(verified_ip);
                 format!("<b>IP verified</b> — {masked}")
             }
+            Self::StaticIpBootCheckPassed { ip_flag } => {
+                format!(
+                    "<b>Static IP boot check passed</b>\nDhan reports orders allowed from this IP ({ip_flag} slot)."
+                )
+            }
+            Self::StaticIpBootCheckFailed {
+                reason,
+                orders_allowed,
+                ip_match_status,
+            } => {
+                let plain_reason = match reason.as_str() {
+                    "empty_response" => {
+                        "Dhan returned an empty IP response. Check your account on the Dhan portal."
+                    }
+                    "orders_not_allowed" => {
+                        "Dhan marked this IP as NOT ALLOWED for orders. Set or refresh the static IP on web.dhan.co."
+                    }
+                    "match_status_not_ok" => {
+                        "Dhan's IP match check did not return MATCH. Confirm the registered IP on the Dhan portal."
+                    }
+                    _ => "Static IP boot check failed.",
+                };
+                format!(
+                    "<b>STATIC IP BOOT CHECK FAILED</b>\n{plain_reason}\n\nDhan reply: ordersAllowed={orders_allowed}, ipMatchStatus=\"{ip_match_status}\"\n\nBoot blocked — no orders will be placed until this is fixed."
+                )
+            }
             Self::BootHealthCheck {
                 services_healthy,
                 services_total,
@@ -2515,6 +2565,8 @@ impl NotificationEvent {
             Self::CandleCrossMatchSkipped { .. } => "CandleCrossMatchSkipped",
             Self::IpVerificationFailed { .. } => "IpVerificationFailed",
             Self::IpVerificationSuccess { .. } => "IpVerificationSuccess",
+            Self::StaticIpBootCheckPassed { .. } => "StaticIpBootCheckPassed",
+            Self::StaticIpBootCheckFailed { .. } => "StaticIpBootCheckFailed",
             Self::BootHealthCheck { .. } => "BootHealthCheck",
             Self::BootDeadlineMissed { .. } => "BootDeadlineMissed",
             Self::BootClockSkewExceeded { .. } => "BootClockSkewExceeded",
@@ -2549,6 +2601,7 @@ impl NotificationEvent {
     pub fn severity(&self) -> Severity {
         match self {
             Self::IpVerificationFailed { .. } => Severity::Critical,
+            Self::StaticIpBootCheckFailed { .. } => Severity::Critical,
             Self::BootDeadlineMissed { .. } => Severity::Critical,
             Self::BootClockSkewExceeded { .. } => Severity::Critical,
             Self::AuthenticationFailed { .. } => Severity::Critical,
@@ -2663,6 +2716,7 @@ impl NotificationEvent {
             Self::OrderUpdateAuthenticated => Severity::Medium,
             Self::TokenRenewed => Severity::Low,
             Self::IpVerificationSuccess { .. } => Severity::Low,
+            Self::StaticIpBootCheckPassed { .. } => Severity::Low,
             // Wave-Holiday-Gate (2026-05-09): bumped from Low → Medium so
             // these once-per-boot positive signals dispatch immediately
             // (Low coalesces in 60s window). Operator's 2026-05-09 complaint:
@@ -3839,6 +3893,97 @@ mod tests {
             verified_ip: "10.0.0.1".to_string(),
         };
         assert_eq!(event.severity(), Severity::Low);
+    }
+
+    // -- Phase 0 Item 18 — StaticIpBootCheck event tests --
+
+    #[test]
+    fn test_static_ip_boot_check_passed_message_mentions_orders() {
+        let event = NotificationEvent::StaticIpBootCheckPassed {
+            ip_flag: "PRIMARY".to_string(),
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Static IP boot check passed"));
+        assert!(msg.contains("orders allowed"));
+        assert!(msg.contains("PRIMARY"));
+    }
+
+    #[test]
+    fn test_static_ip_boot_check_passed_is_low() {
+        let event = NotificationEvent::StaticIpBootCheckPassed {
+            ip_flag: "PRIMARY".to_string(),
+        };
+        assert_eq!(event.severity(), Severity::Low);
+    }
+
+    #[test]
+    fn test_static_ip_boot_check_failed_message_uses_plain_english() {
+        // operator-charter §G: every Telegram message must be readable
+        // by an auto-driver. Verify the reason maps to plain language.
+        let event = NotificationEvent::StaticIpBootCheckFailed {
+            reason: "orders_not_allowed".to_string(),
+            orders_allowed: false,
+            ip_match_status: "MATCH".to_string(),
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("STATIC IP BOOT CHECK FAILED"));
+        assert!(msg.contains("NOT ALLOWED for orders"));
+        assert!(msg.contains("web.dhan.co"));
+        assert!(msg.contains("Boot blocked"));
+        // Surface the raw API reply so triage has the literal Dhan response.
+        assert!(msg.contains("ordersAllowed=false"));
+        assert!(msg.contains("ipMatchStatus=\"MATCH\""));
+    }
+
+    #[test]
+    fn test_static_ip_boot_check_failed_is_critical() {
+        let event = NotificationEvent::StaticIpBootCheckFailed {
+            reason: "empty_response".to_string(),
+            orders_allowed: false,
+            ip_match_status: String::new(),
+        };
+        assert_eq!(event.severity(), Severity::Critical);
+    }
+
+    #[test]
+    fn test_static_ip_boot_check_failed_message_branches_by_reason() {
+        for (reason, expected_phrase) in [
+            ("empty_response", "empty IP response"),
+            ("orders_not_allowed", "NOT ALLOWED for orders"),
+            ("match_status_not_ok", "match check did not return MATCH"),
+        ] {
+            let event = NotificationEvent::StaticIpBootCheckFailed {
+                reason: reason.to_string(),
+                orders_allowed: false,
+                ip_match_status: String::new(),
+            };
+            let msg = event.to_message();
+            assert!(
+                msg.contains(expected_phrase),
+                "reason={reason} should produce {expected_phrase:?}, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_static_ip_boot_check_topics_stable() {
+        // Wire-format names used by structured log + audit pipelines.
+        assert_eq!(
+            NotificationEvent::StaticIpBootCheckPassed {
+                ip_flag: "PRIMARY".to_string()
+            }
+            .topic(),
+            "StaticIpBootCheckPassed"
+        );
+        assert_eq!(
+            NotificationEvent::StaticIpBootCheckFailed {
+                reason: "empty_response".to_string(),
+                orders_allowed: false,
+                ip_match_status: String::new(),
+            }
+            .topic(),
+            "StaticIpBootCheckFailed"
+        );
     }
 
     #[test]

@@ -446,6 +446,140 @@ pub async fn get_ip(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 0 Item 18 — Dhan-side static IP boot gate
+// ---------------------------------------------------------------------------
+//
+// `verify_public_ip()` at Step 5.5 confirms our egress IP matches the
+// value SSM has for us. That tells us "we look right to the world", but
+// NOT "Dhan considers this IP whitelisted for the order endpoints".
+// Dhan's `/v2/ip/getIP` is the authoritative answer for the second
+// question — the `ordersAllowed` flag is the SAME flag the exchange
+// reads at order-acceptance time.
+//
+// Effective 2026-04-01, orders from unregistered IPs are REJECTED with
+// no grace period. Boot MUST refuse to spawn the order path unless
+// this check returns Pass.
+
+/// Verdict of a static-IP boot check against Dhan's `/v2/ip/getIP`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StaticIpBootOutcome {
+    /// IP matches AND Dhan reports `ordersAllowed = true`. Safe to spawn
+    /// the order path.
+    Pass,
+    /// Boot must halt. Carries a typed reason for the operator-facing
+    /// Telegram + the JSONL audit row.
+    Fail(StaticIpBootFailureReason),
+}
+
+/// Typed failure reasons. Precedence matters: when more than one
+/// condition is violated, the operator sees the MOST actionable one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StaticIpBootFailureReason {
+    /// `/v2/ip/getIP` returned an effectively-empty body. Either the API
+    /// is broken, our token does not have IP-API entitlement, or the
+    /// account has no whitelisted IP at all. Operator must check the
+    /// Dhan web portal.
+    EmptyResponse,
+    /// Dhan flipped `orders_allowed = false`. This is the AUTHORITATIVE
+    /// pre-trade signal — see `GetIpResponse::orders_allowed`. Operator
+    /// likely needs to (re-)set the static IP on the Dhan portal, or
+    /// wait out the 7-day cooldown after a recent modify.
+    OrdersNotAllowed,
+    /// `ip_match_status` is not `"MATCH"`. Treated as a separate
+    /// failure mode for diagnostics — in practice Dhan always pairs
+    /// MISMATCH with `orders_allowed = false`, but we surface the
+    /// raw string to help triage protocol drift.
+    MatchStatusNotOk {
+        /// The literal string Dhan returned (`"MISMATCH"`, empty, or
+        /// unknown). Helps spot Dhan-side API changes.
+        observed: String,
+    },
+}
+
+impl StaticIpBootFailureReason {
+    /// Stable wire-format string for Telegram + audit rows. Lowercase
+    /// snake_case so it doubles as a Prometheus label value.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::EmptyResponse => "empty_response",
+            Self::OrdersNotAllowed => "orders_not_allowed",
+            Self::MatchStatusNotOk { .. } => "match_status_not_ok",
+        }
+    }
+}
+
+/// Pure classifier: given a `GetIpResponse` body, return the boot
+/// outcome.
+///
+/// Precedence (most operator-actionable first):
+///   1. Empty response   → `EmptyResponse`
+///   2. `orders_allowed = false` → `OrdersNotAllowed` (authoritative)
+///   3. `ip_match_status != "MATCH"` → `MatchStatusNotOk`
+///   4. Otherwise → `Pass`
+///
+/// Fail-closed by construction: any unknown / absent field flows into
+/// a Fail branch.
+#[must_use]
+pub fn classify_static_ip_boot_outcome(
+    response: &crate::auth::types::GetIpResponse,
+) -> StaticIpBootOutcome {
+    // (1) Empty-response check: both the registered IP and the
+    // detected IP missing means Dhan returned `{}` (or a parse-defaulted
+    // body). Treat the absence as "do not trust this for orders".
+    if response.ip.is_empty() && response.detected_ip.is_empty() {
+        return StaticIpBootOutcome::Fail(StaticIpBootFailureReason::EmptyResponse);
+    }
+
+    // (2) Authoritative gate per
+    // `.claude/rules/dhan/authentication.md` rule 7 + Item 18 charter.
+    if !response.orders_allowed {
+        return StaticIpBootOutcome::Fail(StaticIpBootFailureReason::OrdersNotAllowed);
+    }
+
+    // (3) Defensive secondary check — if Dhan ever de-couples
+    // `orders_allowed` from `ip_match_status`, we still refuse to boot
+    // on a non-MATCH status.
+    if response.ip_match_status != "MATCH" {
+        return StaticIpBootOutcome::Fail(StaticIpBootFailureReason::MatchStatusNotOk {
+            observed: response.ip_match_status.clone(),
+        });
+    }
+
+    StaticIpBootOutcome::Pass
+}
+
+/// Calls `GET /v2/ip/getIP` and returns the boot outcome.
+///
+/// This is the thin live-API wrapper around `classify_static_ip_boot_outcome`.
+/// Boot wiring in `main.rs` calls this once after Step 6 (auth) and
+/// before any order-path WS/REST call.
+///
+/// # Errors
+///
+/// Returns `ApplicationError::IpVerificationFailed` if the HTTP call
+/// itself fails (network error, non-2xx, parse error). A `Fail`
+/// `StaticIpBootOutcome` is an `Ok(Fail(_))` — the caller decides
+/// whether to halt boot; the function does not panic.
+#[instrument(skip_all, name = "verify_static_ip_at_boot")]
+// TEST-EXEMPT: thin live-API wrapper; `get_ip` + `classify_static_ip_boot_outcome` are independently tested.
+pub async fn verify_static_ip_at_boot(
+    rest_api_base_url: &str,
+    access_token: &str,
+) -> Result<StaticIpBootOutcome, ApplicationError> {
+    let response = get_ip(rest_api_base_url, access_token).await?;
+    info!(
+        ip_masked = %mask_ip(&response.ip),
+        detected_masked = %mask_ip(&response.detected_ip),
+        ip_match_status = %response.ip_match_status,
+        orders_allowed = response.orders_allowed,
+        ip_flag = %response.ip_flag,
+        "static IP boot check: response received"
+    );
+    Ok(classify_static_ip_boot_outcome(&response))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1169,5 +1303,141 @@ mod tests {
     #[test]
     fn test_mask_ip_empty_string() {
         assert_eq!(mask_ip(""), "XXX.XXX.XXX.XXX");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 0 Item 18 — classify_static_ip_boot_outcome
+    // -----------------------------------------------------------------------
+
+    use crate::auth::types::GetIpResponse;
+
+    fn make_get_ip_response(
+        ip: &str,
+        detected_ip: &str,
+        ip_match_status: &str,
+        orders_allowed: bool,
+    ) -> GetIpResponse {
+        GetIpResponse {
+            ip: ip.to_string(),
+            ip_flag: "PRIMARY".to_string(),
+            modify_date_primary: String::new(),
+            modify_date_secondary: String::new(),
+            detected_ip: detected_ip.to_string(),
+            ip_match_status: ip_match_status.to_string(),
+            orders_allowed,
+        }
+    }
+
+    #[test]
+    fn test_classify_static_ip_boot_outcome_smoke() {
+        // Smoke check that the public symbol `classify_static_ip_boot_outcome`
+        // is callable and returns the expected discriminant; the seven
+        // `test_classify_static_ip_*` cases below exercise every branch.
+        let response = make_get_ip_response("203.0.113.42", "203.0.113.42", "MATCH", true);
+        assert_eq!(
+            classify_static_ip_boot_outcome(&response),
+            StaticIpBootOutcome::Pass
+        );
+    }
+
+    #[test]
+    fn test_classify_static_ip_pass_on_match_and_orders_allowed() {
+        let response = make_get_ip_response("203.0.113.42", "203.0.113.42", "MATCH", true);
+        assert_eq!(
+            classify_static_ip_boot_outcome(&response),
+            StaticIpBootOutcome::Pass
+        );
+    }
+
+    #[test]
+    fn test_classify_static_ip_fail_when_orders_not_allowed() {
+        // Even with a MATCH the orders_allowed flag is authoritative.
+        let response = make_get_ip_response("203.0.113.42", "203.0.113.42", "MATCH", false);
+        assert_eq!(
+            classify_static_ip_boot_outcome(&response),
+            StaticIpBootOutcome::Fail(StaticIpBootFailureReason::OrdersNotAllowed)
+        );
+    }
+
+    #[test]
+    fn test_classify_static_ip_fail_on_mismatch_status() {
+        // Belt-and-suspenders: if Dhan ever decouples orders_allowed
+        // from ip_match_status, MISMATCH alone still blocks boot.
+        let response = make_get_ip_response("203.0.113.42", "198.51.100.7", "MISMATCH", true);
+        match classify_static_ip_boot_outcome(&response) {
+            StaticIpBootOutcome::Fail(StaticIpBootFailureReason::MatchStatusNotOk { observed }) => {
+                assert_eq!(observed, "MISMATCH");
+            }
+            other => panic!("expected MatchStatusNotOk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_static_ip_fail_on_unknown_status_value() {
+        // Dhan returns something we have never seen — fail closed and
+        // surface the literal so triage knows what to look for.
+        let response = make_get_ip_response("203.0.113.42", "203.0.113.42", "UNKNOWN_FOO", true);
+        match classify_static_ip_boot_outcome(&response) {
+            StaticIpBootOutcome::Fail(StaticIpBootFailureReason::MatchStatusNotOk { observed }) => {
+                assert_eq!(observed, "UNKNOWN_FOO");
+            }
+            other => panic!("expected MatchStatusNotOk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_static_ip_fail_on_empty_response() {
+        // Dhan returned `{}` — both ip + detected_ip are absent.
+        let response = make_get_ip_response("", "", "", false);
+        assert_eq!(
+            classify_static_ip_boot_outcome(&response),
+            StaticIpBootOutcome::Fail(StaticIpBootFailureReason::EmptyResponse)
+        );
+    }
+
+    #[test]
+    fn test_classify_static_ip_orders_not_allowed_wins_over_mismatch() {
+        // Precedence: orders_allowed=false is more actionable than the
+        // status string — operator action is the same (fix the IP),
+        // but the OrdersNotAllowed reason maps to the docs/runbook
+        // bullet operators were trained on.
+        let response = make_get_ip_response("203.0.113.42", "198.51.100.7", "MISMATCH", false);
+        assert_eq!(
+            classify_static_ip_boot_outcome(&response),
+            StaticIpBootOutcome::Fail(StaticIpBootFailureReason::OrdersNotAllowed)
+        );
+    }
+
+    #[test]
+    fn test_classify_static_ip_empty_wins_over_orders_not_allowed() {
+        // Empty response: `orders_allowed` defaults to false (serde
+        // default), so without this precedence rule we'd report the
+        // wrong failure mode. Surface the API-broken state first.
+        let response = make_get_ip_response("", "", "", false);
+        match classify_static_ip_boot_outcome(&response) {
+            StaticIpBootOutcome::Fail(StaticIpBootFailureReason::EmptyResponse) => {}
+            other => panic!("expected EmptyResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_static_ip_failure_reason_as_str_stable() {
+        // Stable strings — Telegram parsing, Prometheus labels, and
+        // audit-table rows all depend on these literals.
+        assert_eq!(
+            StaticIpBootFailureReason::EmptyResponse.as_str(),
+            "empty_response"
+        );
+        assert_eq!(
+            StaticIpBootFailureReason::OrdersNotAllowed.as_str(),
+            "orders_not_allowed"
+        );
+        assert_eq!(
+            StaticIpBootFailureReason::MatchStatusNotOk {
+                observed: "MISMATCH".to_string()
+            }
+            .as_str(),
+            "match_status_not_ok"
+        );
     }
 }

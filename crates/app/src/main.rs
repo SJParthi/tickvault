@@ -2347,6 +2347,121 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
+    // Step 6a: Dhan-side static IP boot gate (Phase 0 Item 18)
+    // -----------------------------------------------------------------------
+    // Step 5.5 above already confirmed our egress IP matches the SSM
+    // value (public IP-echo vs SSM). This second gate asks Dhan itself
+    // — `/v2/ip/getIP` reports `ordersAllowed` which is the same flag
+    // the exchange reads at order-acceptance time. Without this check
+    // an IP that looks correct to the world but hasn't propagated to
+    // Dhan's whitelist would let boot proceed and then orders would
+    // silently be rejected at trade time.
+    //
+    // Skipped outside live mode for the same reason as Step 5.5
+    // (sandbox + paper modes do not place real orders).
+    if trading_mode.is_live() {
+        info!("Phase 0 Item 18: verifying Dhan-side static IP whitelist (/v2/ip/getIP)");
+        let access_token = {
+            use secrecy::ExposeSecret;
+            let guard = token_manager.token_handle().load();
+            match guard.as_ref().as_ref() {
+                Some(state) => state.access_token().expose_secret().to_string(),
+                None => {
+                    // The auth step above succeeded, so the token MUST be
+                    // present here. If it isn't, fail boot loudly rather
+                    // than skip the check.
+                    error!(
+                        code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
+                        severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
+                            .severity()
+                            .as_str(),
+                        "Phase 0 Item 18: token unavailable immediately after auth — BLOCKING BOOT"
+                    );
+                    notifier.notify(NotificationEvent::StaticIpBootCheckFailed {
+                        reason: "empty_response".to_string(),
+                        orders_allowed: false,
+                        ip_match_status: String::new(),
+                    });
+                    return Ok(());
+                }
+            }
+        };
+
+        match ip_verifier::verify_static_ip_at_boot(&config.dhan.rest_api_base_url, &access_token)
+            .await
+        {
+            Ok(ip_verifier::StaticIpBootOutcome::Pass) => {
+                info!("Phase 0 Item 18: Dhan reports orders allowed from this IP");
+                let ip_flag = {
+                    // Grab the slot string from a follow-up get_ip call so
+                    // the Telegram event carries the operator-facing slot
+                    // label. Best-effort — failure here does NOT block
+                    // boot (we already have a Pass verdict).
+                    match ip_verifier::get_ip(&config.dhan.rest_api_base_url, &access_token).await {
+                        Ok(resp) => resp.ip_flag,
+                        Err(_) => String::new(),
+                    }
+                };
+                notifier.notify(NotificationEvent::StaticIpBootCheckPassed { ip_flag });
+            }
+            Ok(ip_verifier::StaticIpBootOutcome::Fail(reason)) => {
+                let reason_label = reason.as_str().to_string();
+                // Pull the raw fields one more time for the Telegram
+                // event — same best-effort caveat as above; if the
+                // second call also fails the operator still sees the
+                // typed reason which is the actionable signal.
+                let (orders_allowed, ip_match_status) = match ip_verifier::get_ip(
+                    &config.dhan.rest_api_base_url,
+                    &access_token,
+                )
+                .await
+                {
+                    Ok(resp) => (resp.orders_allowed, resp.ip_match_status),
+                    Err(_) => (false, String::new()),
+                };
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
+                    severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
+                        .severity()
+                        .as_str(),
+                    reason = %reason_label,
+                    orders_allowed,
+                    ip_match_status = %ip_match_status,
+                    "Phase 0 Item 18: Dhan static IP check FAILED — BLOCKING BOOT"
+                );
+                notifier.notify(NotificationEvent::StaticIpBootCheckFailed {
+                    reason: reason_label,
+                    orders_allowed,
+                    ip_match_status,
+                });
+                return Ok(());
+            }
+            Err(err) => {
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
+                    severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
+                        .severity()
+                        .as_str(),
+                    error = %err,
+                    "Phase 0 Item 18: /v2/ip/getIP request failed — BLOCKING BOOT"
+                );
+                notifier.notify(NotificationEvent::StaticIpBootCheckFailed {
+                    reason: "empty_response".to_string(),
+                    orders_allowed: false,
+                    ip_match_status: String::new(),
+                });
+                return Ok(());
+            }
+        }
+    } else {
+        info!(
+            mode = trading_mode.as_str(),
+            "Phase 0 Item 18: Dhan static IP check skipped — not required for {} mode",
+            trading_mode.as_str()
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Step 6b: Set up QuestDB tick persistence (best-effort)
     // -----------------------------------------------------------------------
     info!(
