@@ -142,6 +142,59 @@ async fn probe_selftest_already_fired_today(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 0 Item 18c — static IP audit row helper
+// ---------------------------------------------------------------------------
+
+/// Writes one row to the `static_ip_audit` QuestDB table capturing the
+/// final outcome of the boot-time Dhan static IP gate.
+///
+/// Best-effort: a failure here NEVER halts boot. The Pass/Fail
+/// decision is already routed to Telegram via `NotificationService`
+/// and to Loki via the structured `error!`/`info!` log; the audit
+/// row is the SQL-queryable forensic trail for SEBI's 5-year window.
+// TEST-EXEMPT: thin async wrapper over the storage helper; the
+// storage helper itself + its tests pin the SQL shape.
+async fn write_static_ip_audit_row(
+    questdb_config: &tickvault_common::config::QuestDbConfig,
+    outcome: tickvault_storage::static_ip_audit_persistence::StaticIpAuditOutcome,
+    reason: &str,
+    ip_flag: &str,
+    ip_match_status: &str,
+    attempts_made: u32,
+    orders_allowed: bool,
+) {
+    let now_ist_nanos = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or(0)
+        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+    // Truncate today's IST nanos to IST midnight for trading_date_ist
+    // — matches the pattern selftest/boot audit writers use.
+    let trading_date_ist = now_ist_nanos - now_ist_nanos.rem_euclid(86_400_000_000_000);
+    let attempts_i64 = i64::from(attempts_made);
+    if let Err(e) = tickvault_storage::static_ip_audit_persistence::append_static_ip_audit_row(
+        questdb_config,
+        now_ist_nanos,
+        trading_date_ist,
+        outcome,
+        reason,
+        ip_flag,
+        ip_match_status,
+        attempts_i64,
+        orders_allowed,
+    )
+    .await
+    {
+        // Audit-write failure is observable but non-fatal: the Pass /
+        // Fail decision has already been delivered via Telegram + Loki.
+        tracing::warn!(
+            error = ?e,
+            outcome = outcome.as_str(),
+            "static_ip_audit row write failed (boot continues — Telegram/Loki already carry the outcome)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -2371,6 +2424,13 @@ async fn main() -> Result<()> {
             interval_secs = tickvault_common::constants::STATIC_IP_BOOT_RETRY_INTERVAL_SECS,
             "Phase 0 Item 18+18b: verifying Dhan-side static IP whitelist (/v2/ip/getIP)"
         );
+        // Phase 0 Item 18c — ensure the audit table exists BEFORE the
+        // Pass/Fail row writes below. Idempotent CREATE TABLE IF NOT
+        // EXISTS; failures log inside the helper and do NOT halt boot.
+        tickvault_storage::static_ip_audit_persistence::ensure_static_ip_audit_table(
+            &config.questdb,
+        )
+        .await;
         let access_token = {
             use secrecy::ExposeSecret;
             let guard = token_manager.token_handle().load();
@@ -2393,6 +2453,16 @@ async fn main() -> Result<()> {
                         ip_match_status: String::new(),
                         attempts_made: 1,
                     });
+                    write_static_ip_audit_row(
+                        &config.questdb,
+                        tickvault_storage::static_ip_audit_persistence::StaticIpAuditOutcome::Fail,
+                        "empty_response",
+                        "",
+                        "",
+                        1,
+                        false,
+                    )
+                    .await;
                     return Ok(());
                 }
             }
@@ -2444,7 +2514,26 @@ async fn main() -> Result<()> {
                             Ok(resp) => resp.ip_flag,
                             Err(_) => String::new(),
                         };
-                    notifier.notify(NotificationEvent::StaticIpBootCheckPassed { ip_flag });
+                    let ip_match_status =
+                        match ip_verifier::get_ip(&config.dhan.rest_api_base_url, &access_token)
+                            .await
+                        {
+                            Ok(resp) => resp.ip_match_status,
+                            Err(_) => String::new(),
+                        };
+                    notifier.notify(NotificationEvent::StaticIpBootCheckPassed {
+                        ip_flag: ip_flag.clone(),
+                    });
+                    write_static_ip_audit_row(
+                        &config.questdb,
+                        tickvault_storage::static_ip_audit_persistence::StaticIpAuditOutcome::Pass,
+                        "",
+                        &ip_flag,
+                        &ip_match_status,
+                        attempts_made,
+                        true,
+                    )
+                    .await;
                     break None;
                 }
                 ip_verifier::StaticIpBootRetryAction::Retry { next_attempt } => {
@@ -2476,19 +2565,30 @@ async fn main() -> Result<()> {
 
         if let Some(reason_label) = halt_reason {
             // Best-effort re-read of the raw fields for the Telegram
-            // payload. If this also fails the operator still sees the
-            // typed reason which is the actionable signal.
-            let (orders_allowed, ip_match_status) =
+            // payload + audit row. If this also fails the operator
+            // still sees the typed reason which is the actionable
+            // signal.
+            let (orders_allowed, ip_match_status, ip_flag) =
                 match ip_verifier::get_ip(&config.dhan.rest_api_base_url, &access_token).await {
-                    Ok(resp) => (resp.orders_allowed, resp.ip_match_status),
-                    Err(_) => (false, String::new()),
+                    Ok(resp) => (resp.orders_allowed, resp.ip_match_status, resp.ip_flag),
+                    Err(_) => (false, String::new(), String::new()),
                 };
             notifier.notify(NotificationEvent::StaticIpBootCheckFailed {
                 reason: reason_label.to_string(),
                 orders_allowed,
-                ip_match_status,
+                ip_match_status: ip_match_status.clone(),
                 attempts_made,
             });
+            write_static_ip_audit_row(
+                &config.questdb,
+                tickvault_storage::static_ip_audit_persistence::StaticIpAuditOutcome::Fail,
+                reason_label,
+                &ip_flag,
+                &ip_match_status,
+                attempts_made,
+                orders_allowed,
+            )
+            .await;
             return Ok(());
         }
     } else {
