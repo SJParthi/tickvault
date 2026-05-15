@@ -5218,6 +5218,73 @@ async fn main() -> Result<()> {
                 });
             }
 
+            // Phase 0 Item 22d (2026-05-15): End-of-day digest at
+            // 15:31:30 IST — 90s after the 15:30 close so the
+            // market-close shutdown signal has settled. Severity::Info
+            // — never pages, only a daily positive ping that the feed
+            // stayed up + token has overnight headroom.
+            //
+            // Audit-findings Rule 3 (market-hours-aware): trading-day
+            // check + skip silently if past 15:31:30 IST (mid-evening
+            // boot legitimately runs past this point).
+            //
+            // Operator-charter §G: plain-English action line when the
+            // JWT will expire before tomorrow's opening bell.
+            {
+                let eod_notifier = notifier.clone();
+                let eod_health = health_status.clone();
+                let eod_calendar = std::sync::Arc::clone(&trading_calendar);
+                let eod_main_feed_total = tickvault_common::config::effective_main_feed_pool_size(
+                    config.subscription.scope,
+                    config.dhan.max_websocket_connections,
+                );
+                tokio::spawn(async move {
+                    use chrono::{FixedOffset, NaiveTime, TimeZone, Utc};
+                    use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+                    let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+                        return;
+                    };
+                    let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+                    let today_ist = now_ist.date_naive();
+                    if !eod_calendar.is_trading_day(today_ist) {
+                        info!("end-of-day digest: skipping (non-trading day)");
+                        return;
+                    }
+                    let Some(target) = NaiveTime::from_hms_opt(15, 31, 30) else {
+                        return;
+                    };
+                    let now_time = now_ist.time();
+                    if now_time >= target {
+                        // Mid-evening boot past 15:31:30 — skip silently
+                        // (audit-findings Rule 3).
+                        debug!(
+                            now = %now_time,
+                            "end-of-day digest: skipping (past 15:31:30 — mid-evening boot)"
+                        );
+                        return;
+                    }
+                    let secs_until = (target - now_time).num_seconds().max(0) as u64;
+                    info!(secs_until, "end-of-day digest: sleeping until 15:31:30 IST");
+                    tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+
+                    let main_active = eod_health.websocket_connections() as usize;
+                    let token_hours = eod_health.token_remaining_secs() / 3600;
+                    let trading_date_ist = today_ist.format("%Y-%m-%d").to_string();
+                    info!(
+                        main_feed = main_active,
+                        token_remaining_hours = token_hours,
+                        trading_date = %trading_date_ist,
+                        "PROOF: end-of-day digest fired @ 15:31:30 IST"
+                    );
+                    eod_notifier.notify(NotificationEvent::EndOfDayDigest {
+                        trading_date_ist,
+                        main_feed_active: main_active,
+                        main_feed_total: eod_main_feed_total,
+                        token_remaining_hours: token_hours,
+                    });
+                });
+            }
+
             // Wave 3-C Item 12 (2026-04-28): market-open self-test at
             // 09:16:00 IST — a single tri-state verdict
             // (Passed / Degraded / Critical) over 7 sub-checks. Fires
