@@ -634,10 +634,30 @@ fn is_time_within_data_collection_window(ist_time: NaiveTime) -> bool {
 
 /// Computes exponential backoff delay in milliseconds for order update reconnection.
 ///
-/// Formula: `initial * 2^(failures-1)`, capped at `max_delay_ms`.
-/// Pure function — no I/O.
+/// Phase 0 Item 4 (operator-locked 2026-05-15): the FIRST retry attempt
+/// (`consecutive_failures == 1`) fires INSTANTLY (0ms) to mirror the
+/// main-feed `compute_reconnect_base_delay_ms` pattern. The TCP socket
+/// is already in `Err` state when this is called, so adding 500ms of
+/// initial delay was pure unnecessary downtime — the operator's
+/// 2026-05-15 lock makes order-update the second of the only two
+/// WebSocket types this product will ever use, so its reconnect
+/// behaviour must match main-feed parity.
+///
+/// Formula (after Phase 0 Item 4 fix):
+/// - `consecutive_failures <= 1` → `0` ms (instant)
+/// - `consecutive_failures >= 2` → `initial * 2^(failures-2)`, capped at `max_delay_ms`
+///
+/// Pure function — no I/O. Tested by `test_backoff_calculation` +
+/// `test_first_reconnect_attempt_is_zero_ms_instant`.
 fn compute_reconnect_backoff_ms(consecutive_failures: u32) -> u64 {
-    let shift = consecutive_failures.saturating_sub(1).min(63);
+    // Phase 0 Item 4 — first retry attempt is instant.
+    if consecutive_failures <= 1 {
+        return 0;
+    }
+    // Subsequent retries: initial * 2^(failures-2), so failures=2 → initial,
+    // failures=3 → 2*initial, etc. Matches the pre-fix exponential curve
+    // but shifted by one to make room for the 0ms first attempt.
+    let shift = consecutive_failures.saturating_sub(2).min(63);
     ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS
         .saturating_mul(1_u64 << shift)
         .min(ORDER_UPDATE_RECONNECT_MAX_DELAY_MS)
@@ -974,21 +994,40 @@ mod tests {
 
     #[test]
     fn test_backoff_calculation() {
-        // Verify the exponential backoff formula used in the connection loop.
+        // Phase 0 Item 4 (operator-locked 2026-05-15): post-fix curve.
+        // consecutive_failures=0 OR 1 → 0ms (instant).
+        // consecutive_failures=2 → initial (500ms first non-zero attempt).
+        // consecutive_failures=3 → 2*initial. Etc.
         let initial = ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS;
         let max = ORDER_UPDATE_RECONNECT_MAX_DELAY_MS;
 
-        // Attempt 1: initial * 2^0 = initial
-        let delay = initial.saturating_mul(1_u64 << 0);
-        assert_eq!(delay.min(max), initial);
+        assert_eq!(compute_reconnect_backoff_ms(0), 0);
+        assert_eq!(compute_reconnect_backoff_ms(1), 0);
+        assert_eq!(compute_reconnect_backoff_ms(2), initial);
+        assert_eq!(compute_reconnect_backoff_ms(3), initial.saturating_mul(2));
+        assert_eq!(compute_reconnect_backoff_ms(4), initial.saturating_mul(4));
 
-        // Attempt 2: initial * 2^1 = 2 * initial
-        let delay = initial.saturating_mul(1_u64 << 1);
-        assert_eq!(delay.min(max), initial.saturating_mul(2));
+        // Large failure count: caps at max.
+        assert_eq!(compute_reconnect_backoff_ms(30), max);
+        assert_eq!(compute_reconnect_backoff_ms(100), max);
+    }
 
-        // Attempt 10: capped at max
-        let delay = initial.saturating_mul(1_u64 << 9);
-        assert_eq!(delay.min(max), max);
+    // Phase 0 Item 4 (operator-locked 2026-05-15) — order-update first
+    // reconnect 0ms ratchet. Operator lock pins parity with main-feed
+    // `compute_reconnect_base_delay_ms(0, _, _) == 0`. Changing this
+    // requires operator re-approval. Anti-regression: locks the 2026-05-15
+    // fix in place so no future PR can silently restore 500ms first-retry
+    // latency on the only-two-WS-types-ever-allowed product.
+    #[test]
+    fn test_first_reconnect_attempt_is_zero_ms_instant() {
+        assert_eq!(
+            compute_reconnect_backoff_ms(1),
+            0,
+            "First retry (consecutive_failures=1) must be 0ms instant — \
+             see Phase 0 Item 4, operator lock 2026-05-15. SubscribeRxGuard-equivalent \
+             state is preserved by the order-update WS itself across reconnects, \
+             so any non-zero first-attempt delay is pure downtime."
+        );
     }
 
     #[test]
@@ -1018,16 +1057,16 @@ mod tests {
 
     #[test]
     fn test_backoff_does_not_overflow() {
-        // Ensure backoff calculation handles large failure counts
-        let initial = ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS;
+        // Ensure backoff calculation handles large failure counts. Phase 0
+        // Item 4 (2026-05-15): the lower-bound `delay > 0` invariant was
+        // relaxed to `delay >= 0` because consecutive_failures <= 1 now
+        // returns 0ms (instant first retry). Upper bound + non-panic
+        // properties are unchanged.
         let max = ORDER_UPDATE_RECONNECT_MAX_DELAY_MS;
 
-        // Simulate many failures — must not panic or overflow
         for failures in 0..100_u32 {
-            let shift = failures.min(63);
-            let delay = initial.saturating_mul(1_u64 << shift).min(max);
+            let delay = compute_reconnect_backoff_ms(failures);
             assert!(delay <= max, "delay exceeded max for failures={failures}");
-            assert!(delay > 0, "delay must be positive for failures={failures}");
         }
     }
 
