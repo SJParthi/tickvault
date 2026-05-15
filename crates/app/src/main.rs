@@ -2470,6 +2470,11 @@ async fn main() -> Result<()> {
     // Like the static IP gate, this is live-mode only — sandbox/paper
     // modes don't subscribe to depth or place real orders, so a second
     // sandbox instance is not a regulatory hazard.
+    // Phase 0 Item 19f — chain bridge from the broader `shutdown_notify`
+    // (constructed at Step 8b below) to the heartbeat's own `Notify`.
+    // `None` outside live mode or when the lock acquire path skips the
+    // heartbeat spawn.
+    let mut instance_lock_shutdown_chain: Option<std::sync::Arc<tokio::sync::Notify>> = None;
     let instance_lock_handle: Option<tokio::task::JoinHandle<()>> = if trading_mode.is_live() {
         info!("Phase 0 Item 19: acquiring dual-instance Valkey lock");
 
@@ -2665,19 +2670,24 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Lock held — spawn the heartbeat. The boot-wide
-        // `shutdown_notify` is constructed later in main.rs, so we
-        // create the heartbeat's own Notify here and let main wire
-        // the broader shutdown chain to it in Item 19e (audit table
-        // + chained shutdown). For now the heartbeat lives until
-        // process exit — Item 19e adds graceful release.
-        let heartbeat_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        // Lock held — spawn the heartbeat. The heartbeat owns its
+        // own `Notify` shutdown source; main.rs's broader
+        // `shutdown_notify` (constructed at the Step 8b stage) is
+        // chained into it via the bridge task installed further
+        // down (Item 19f). On the bridge firing, the heartbeat
+        // releases the lock + writes a `GracefulRelease` audit row
+        // before returning.
+        let heartbeat_shutdown_inner = std::sync::Arc::new(tokio::sync::Notify::new());
+        let heartbeat_shutdown_for_chain = heartbeat_shutdown_inner.clone();
         let heartbeat_handle = tickvault_core::instance_lock::spawn_instance_lock_heartbeat(
             valkey_pool,
             env,
             host_id,
-            heartbeat_shutdown,
+            lock_key,
+            config.questdb.clone(),
+            heartbeat_shutdown_inner,
         );
+        instance_lock_shutdown_chain = Some(heartbeat_shutdown_for_chain);
         Some(heartbeat_handle)
     } else {
         info!(
@@ -4589,6 +4599,21 @@ async fn main() -> Result<()> {
     // Step 8b: NOW spawn WebSocket connections (tick processor is already consuming).
     // S4-T1a/T1b: shared shutdown_notify for pool watchdog + graceful shutdown.
     let shutdown_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+
+    // Phase 0 Item 19f — chain `shutdown_notify` into the instance-lock
+    // heartbeat's own Notify. Without this bridge the heartbeat would
+    // only see the broader shutdown when its own Notify fires (never,
+    // in practice); now Ctrl-C / 15:30 IST close / pool-halt all
+    // trigger the heartbeat's `GracefulRelease` audit row + lock
+    // release before the process exits.
+    if let Some(heartbeat_shutdown) = instance_lock_shutdown_chain.take() {
+        let shutdown_signal = shutdown_notify.clone();
+        tokio::spawn(async move {
+            shutdown_signal.notified().await;
+            heartbeat_shutdown.notify_one();
+        });
+    }
+
     let (ws_handles, ws_pool_arc) = if let Some(pool) = ws_pool_ready {
         let pool_arc = std::sync::Arc::new(pool);
         // O1-B (2026-04-17): install per-connection runtime subscribe
