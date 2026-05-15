@@ -871,6 +871,14 @@ impl TokenManager {
                             expires_at = %self.current_expiry_display(),
                             "token renewed successfully"
                         );
+                        // Phase 0 Item 17b — Success audit row.
+                        self.write_renewal_audit_row(
+                            tickvault_storage::auth_renewal_audit_persistence::AuthRenewalAuditOutcome::Success,
+                            attempts,
+                            "scheduled",
+                            "",
+                        )
+                        .await;
                         succeeded = true;
                         break;
                     }
@@ -912,6 +920,19 @@ impl TokenManager {
                         tickvault_common::constants::TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES,
                     ),
                 });
+                // Phase 0 Item 17b — Failed audit row (cycle-level —
+                // all retries within this cycle exhausted).
+                self.write_renewal_audit_row(
+                    tickvault_storage::auth_renewal_audit_persistence::AuthRenewalAuditOutcome::Failed,
+                    attempts,
+                    "scheduled",
+                    &format!(
+                        "cycle {}/{} exhausted",
+                        consecutive_circuit_breaker_cycles,
+                        tickvault_common::constants::TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES,
+                    ),
+                )
+                .await;
 
                 if consecutive_circuit_breaker_cycles
                     >= tickvault_common::constants::TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES
@@ -926,6 +947,16 @@ impl TokenManager {
                             "HALTED: token renewal permanently failed — manual restart required"
                                 .to_string(),
                     });
+                    // Phase 0 Item 17b — CircuitBreakerHalt audit row
+                    // BEFORE the return so the SEBI forensic trail
+                    // captures the terminal state.
+                    self.write_renewal_audit_row(
+                        tickvault_storage::auth_renewal_audit_persistence::AuthRenewalAuditOutcome::CircuitBreakerHalt,
+                        consecutive_circuit_breaker_cycles,
+                        "scheduled",
+                        "HALTED: token renewal permanently failed — manual restart required",
+                    )
+                    .await;
                     return;
                 }
 
@@ -964,6 +995,69 @@ impl TokenManager {
         match guard.as_ref().as_ref() {
             Some(state) => state.expires_at().to_string(),
             None => "no token".to_string(),
+        }
+    }
+
+    /// Phase 0 Item 17b (2026-05-15): best-effort audit-row writer for
+    /// every renewal lifecycle event. Pulls the QuestDB config from the
+    /// process-wide `global_questdb_config()` (Wave 2 — see
+    /// `crates/storage/src/lib.rs`); silently no-ops if the global
+    /// wasn't installed (e.g. tests, dry-run mode).
+    ///
+    /// Failures of the audit write are logged at WARN and ignored —
+    /// the audit row is the SEBI forensic trail, but blocking the
+    /// renewal task on its persistence would defeat the resilience
+    /// goal. The Telegram notification chain via `TokenRenewalFailed`
+    /// is the operator-facing signal regardless.
+    // TEST-EXEMPT: live QuestDB instance required for the HTTP /exec
+    // round trip; the storage helper itself is unit-tested in
+    // `auth_renewal_audit_persistence::tests`. The skip-on-no-global
+    // branch is covered by inspection.
+    async fn write_renewal_audit_row(
+        &self,
+        outcome: tickvault_storage::auth_renewal_audit_persistence::AuthRenewalAuditOutcome,
+        attempts_made: u32,
+        trigger_source: &str,
+        error_detail: &str,
+    ) {
+        let Some(qcfg) = tickvault_storage::global_questdb_config() else {
+            // The global isn't installed (sandbox/paper or test). Skip
+            // silently — the renewal still completes and the Telegram
+            // chain still fires.
+            return;
+        };
+        let now_ist_nanos = chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or(0)
+            .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+        let trading_date_ist = now_ist_nanos - now_ist_nanos.rem_euclid(86_400_000_000_000);
+        // Token headroom at the time of the attempt — captures how
+        // close we cut it. Reads from arc-swap so it's lock-free.
+        let token_remaining_secs = {
+            let guard = self.token.load();
+            match guard.as_ref().as_ref() {
+                Some(state) => i64::try_from(state.time_until_refresh(0).as_secs()).unwrap_or(0),
+                None => 0,
+            }
+        };
+        if let Err(err) =
+            tickvault_storage::auth_renewal_audit_persistence::append_auth_renewal_audit_row(
+                qcfg,
+                now_ist_nanos,
+                trading_date_ist,
+                outcome,
+                i64::from(attempts_made),
+                token_remaining_secs,
+                trigger_source,
+                error_detail,
+            )
+            .await
+        {
+            warn!(
+                error = %err,
+                outcome = outcome.as_str(),
+                "auth_renewal_audit row write failed (renewal continues — Telegram/Loki already carry the outcome)"
+            );
         }
     }
 
