@@ -506,6 +506,14 @@ pub struct ModifyIpResponse {
 }
 
 /// Response from `GET /v2/ip/getIP` — retrieves current IP configuration.
+///
+/// Per Dhan auth API: response includes the registered whitelist IP plus
+/// the server-detected source IP for the current request, a match status,
+/// and an `ordersAllowed` flag. Per `.claude/rules/dhan/authentication.md`
+/// rule 7, the static-IP enforcement effective 2026-04-01 means orders
+/// from unregistered IPs are REJECTED by the exchange — the pre-market
+/// boot gate MUST verify `orders_allowed == true` before spawning the
+/// order path.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetIpResponse {
@@ -521,6 +529,28 @@ pub struct GetIpResponse {
     /// Last modification date for secondary IP.
     #[serde(default)]
     pub modify_date_secondary: String,
+    /// Server-detected source IP for the current request.
+    ///
+    /// Field name in Dhan JSON is `detectedIP` (uppercase IP),
+    /// inconsistent with the camelCase convention used elsewhere
+    /// in the response — explicit `rename` required.
+    #[serde(default, rename = "detectedIP")]
+    pub detected_ip: String,
+    /// Match status between `ip` and `detected_ip`.
+    ///
+    /// Observed values: `"MATCH"`, `"MISMATCH"`. Treat any unknown
+    /// value as MISMATCH for safety (orders MUST NOT be placed when
+    /// the match status is ambiguous).
+    #[serde(default)]
+    pub ip_match_status: String,
+    /// Whether orders may be placed from the current IP.
+    ///
+    /// Effective 2026-04-01 the exchange REJECTS orders from
+    /// unregistered IPs. This flag is the authoritative pre-trade
+    /// gate; do NOT infer order eligibility from `ip_match_status`
+    /// alone.
+    #[serde(default)]
+    pub orders_allowed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1206,13 +1236,57 @@ mod tests {
             "ip": "203.0.113.42",
             "ipFlag": "PRIMARY",
             "modifyDatePrimary": "2026-01-15",
-            "modifyDateSecondary": ""
+            "modifyDateSecondary": "",
+            "detectedIP": "203.0.113.42",
+            "ipMatchStatus": "MATCH",
+            "ordersAllowed": true
         }"#;
 
         let response: GetIpResponse = serde_json::from_str(json).expect("should deserialize");
         assert_eq!(response.ip, "203.0.113.42");
         assert_eq!(response.ip_flag, "PRIMARY");
         assert_eq!(response.modify_date_primary, "2026-01-15");
+        assert_eq!(response.detected_ip, "203.0.113.42");
+        assert_eq!(response.ip_match_status, "MATCH");
+        assert!(response.orders_allowed);
+    }
+
+    #[test]
+    fn test_get_ip_response_mismatch_blocks_orders() {
+        let json = r#"{
+            "ip": "203.0.113.42",
+            "ipFlag": "PRIMARY",
+            "modifyDatePrimary": "2026-01-15",
+            "modifyDateSecondary": "",
+            "detectedIP": "198.51.100.7",
+            "ipMatchStatus": "MISMATCH",
+            "ordersAllowed": false
+        }"#;
+
+        let response: GetIpResponse = serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(response.ip, "203.0.113.42");
+        assert_eq!(response.detected_ip, "198.51.100.7");
+        assert_eq!(response.ip_match_status, "MISMATCH");
+        assert!(!response.orders_allowed);
+    }
+
+    #[test]
+    fn test_get_ip_response_detected_ip_uses_uppercase_rename() {
+        // Sanity check: the Dhan field is `detectedIP` (uppercase IP),
+        // not `detectedIp` (camelCase). If serde stops honouring the
+        // explicit rename, this test breaks loudly instead of silently
+        // returning an empty string at boot.
+        let json = r#"{"detectedIP": "10.0.0.1"}"#;
+        let response: GetIpResponse = serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(response.detected_ip, "10.0.0.1");
+
+        let json_wrong_case = r#"{"detectedIp": "10.0.0.1"}"#;
+        let response: GetIpResponse =
+            serde_json::from_str(json_wrong_case).expect("should deserialize");
+        assert_eq!(
+            response.detected_ip, "",
+            "the lowercase variant must NOT bind to detected_ip — Dhan uses uppercase IP"
+        );
     }
 
     #[test]
@@ -1351,6 +1425,12 @@ mod tests {
         assert_eq!(response.ip_flag, "");
         assert_eq!(response.modify_date_primary, "");
         assert_eq!(response.modify_date_secondary, "");
+        assert_eq!(response.detected_ip, "");
+        assert_eq!(response.ip_match_status, "");
+        // SAFETY: when Dhan omits `ordersAllowed` we default to `false`.
+        // The boot gate MUST treat "absent" identically to "denied" so
+        // a malformed response cannot accidentally allow order flow.
+        assert!(!response.orders_allowed);
     }
 
     #[test]
