@@ -1584,6 +1584,27 @@ pub const OMS_HTTP_CONNECT_TIMEOUT_SECS: u64 = 3;
 /// dropped after this duration to avoid stale sockets.
 pub const OMS_HTTP_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
 
+/// Phase 0 Item 22a (2026-05-15) — DH-904 (rate-limited) exponential
+/// backoff ladder for order placement / modify / cancel. Per
+/// `.claude/rules/dhan/api-introduction.md` rule 8: "DH-904 must
+/// trigger exponential backoff. 10s → 20s → 40s → 80s → give up +
+/// CRITICAL alert. Never immediate retry."
+///
+/// Index `i` (0-based) is the wait AFTER the `i`-th rate-limit
+/// response, BEFORE the next retry. Length is the maximum retry
+/// budget — exceeded means escalate to CRITICAL.
+///
+/// Total worst-case wait between first rate-limit response and final
+/// give-up: 10 + 20 + 40 + 80 = 150 seconds. After that, the
+/// operator gets a CRITICAL Telegram + the OMS order is rejected to
+/// the caller.
+pub const DH904_BACKOFF_SECS: &[u64] = &[10, 20, 40, 80];
+
+/// Maximum retry attempts for DH-904 — derived from the backoff
+/// ladder length so the two cannot drift apart. Set as a separate
+/// `usize` constant for ergonomic use in loop conditions.
+pub const DH904_MAX_RETRY_ATTEMPTS: usize = DH904_BACKOFF_SECS.len();
+
 /// Broadcast channel capacity for cold-path tick consumers (trading pipeline,
 /// tick persistence, candle aggregation). Must be large enough to absorb bursts
 /// during high-volatility events without lagging cold-path consumers.
