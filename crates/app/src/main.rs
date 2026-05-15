@@ -195,6 +195,59 @@ async fn write_static_ip_audit_row(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 0 Item 19e — live_instance_lock audit row helper
+// ---------------------------------------------------------------------------
+
+/// Writes one row to the `live_instance_lock` QuestDB table capturing
+/// a lock-lifecycle event (Acquired / AlreadyHeld / ValkeyError at
+/// boot; LostOwnership / GracefulRelease wired in Item 19f).
+///
+/// Best-effort: a failure here NEVER halts boot. The
+/// Acquire/Halt decision is already routed to Telegram via
+/// `NotificationService` and to Loki via the structured `info!` /
+/// `error!` log; the audit row is the SQL-queryable forensic trail
+/// for SEBI's 5-year window.
+// TEST-EXEMPT: thin async wrapper over the storage helper; the
+// storage helper itself + its tests pin the SQL shape.
+// APPROVED: 7 wire-format fields plus QuestDB config — same shape as sibling audit-row writers (static_ip_audit, boot_audit).
+#[allow(clippy::too_many_arguments)]
+async fn write_live_instance_lock_row(
+    questdb_config: &tickvault_common::config::QuestDbConfig,
+    outcome: tickvault_storage::live_instance_lock_persistence::LiveInstanceLockOutcome,
+    host_id: &str,
+    peer_holder: &str,
+    env: &str,
+    lock_key: &str,
+    error_detail: &str,
+) {
+    let now_ist_nanos = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or(0)
+        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+    let trading_date_ist = now_ist_nanos - now_ist_nanos.rem_euclid(86_400_000_000_000);
+    if let Err(e) =
+        tickvault_storage::live_instance_lock_persistence::append_live_instance_lock_row(
+            questdb_config,
+            now_ist_nanos,
+            trading_date_ist,
+            outcome,
+            host_id,
+            peer_holder,
+            env,
+            lock_key,
+            error_detail,
+        )
+        .await
+    {
+        tracing::warn!(
+            error = ?e,
+            outcome = outcome.as_str(),
+            "live_instance_lock row write failed (boot continues — Telegram/Loki already carry the outcome)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -2420,6 +2473,15 @@ async fn main() -> Result<()> {
     let instance_lock_handle: Option<tokio::task::JoinHandle<()>> = if trading_mode.is_live() {
         info!("Phase 0 Item 19: acquiring dual-instance Valkey lock");
 
+        // Phase 0 Item 19e — ensure the audit table exists BEFORE
+        // the lifecycle event INSERTs below. Idempotent CREATE TABLE
+        // IF NOT EXISTS; failures log inside the helper and do NOT
+        // halt boot.
+        tickvault_storage::live_instance_lock_persistence::ensure_live_instance_lock_table(
+            &config.questdb,
+        )
+        .await;
+
         // SSM is the only authorized source for the Valkey password
         // per rust-code.md. The boot-time fetch hard-fails on any SSM
         // error — running with no Valkey AUTH would let an attacker
@@ -2459,15 +2521,30 @@ async fn main() -> Result<()> {
                     error = %err,
                     "Phase 0 Item 19: Valkey pool construction failed — BLOCKING BOOT"
                 );
+                let env_for_audit = tickvault_core::auth::secret_manager::resolve_environment()
+                    .unwrap_or_else(|_| "unknown".to_string());
+                let lock_key_for_audit =
+                    tickvault_core::instance_lock::compute_instance_lock_key(&env_for_audit);
                 notifier.notify(
                     tickvault_core::notification::events::NotificationEvent::DualInstanceDetected {
                         holder: format!("(valkey-pool-build-error: {err})"),
-                        lock_key: tickvault_core::instance_lock::compute_instance_lock_key(
-                            &tickvault_core::auth::secret_manager::resolve_environment()
-                                .unwrap_or_else(|_| "unknown".to_string()),
-                        ),
+                        lock_key: lock_key_for_audit.clone(),
                     },
                 );
+                // Phase 0 Item 19e — persist the boot-halt outcome.
+                // host_id is unavailable at this site (it's derived
+                // after the pool builds), so the audit row uses an
+                // empty host_id; the error_detail captures the cause.
+                write_live_instance_lock_row(
+                    &config.questdb,
+                    tickvault_storage::live_instance_lock_persistence::LiveInstanceLockOutcome::ValkeyError,
+                    "",
+                    "",
+                    &env_for_audit,
+                    &lock_key_for_audit,
+                    &format!("valkey-pool-build-error: {err}"),
+                )
+                .await;
                 return Ok(());
             }
         };
@@ -2503,6 +2580,17 @@ async fn main() -> Result<()> {
                     ttl_secs = tickvault_core::instance_lock::INSTANCE_LOCK_TTL_SECS,
                     "Phase 0 Item 19: dual-instance lock acquired"
                 );
+                // Phase 0 Item 19e — persist Acquired outcome.
+                write_live_instance_lock_row(
+                    &config.questdb,
+                    tickvault_storage::live_instance_lock_persistence::LiveInstanceLockOutcome::Acquired,
+                    &host_id,
+                    "",
+                    &env,
+                    &lock_key,
+                    "",
+                )
+                .await;
             }
             Ok(tickvault_core::instance_lock::AcquireOutcome::AlreadyHeld { holder }) => {
                 error!(
@@ -2517,6 +2605,21 @@ async fn main() -> Result<()> {
                     peer = %holder,
                     "Phase 0 Item 19: another tickvault process holds the lock — BLOCKING BOOT"
                 );
+                // Phase 0 Item 19e — persist the AlreadyHeld outcome
+                // BEFORE the Telegram + return so the audit row exists
+                // even if the notifier path errors. Clone host_id /
+                // env / lock_key for the audit (the values flow into
+                // the notifier afterwards by move).
+                write_live_instance_lock_row(
+                    &config.questdb,
+                    tickvault_storage::live_instance_lock_persistence::LiveInstanceLockOutcome::AlreadyHeld,
+                    &host_id,
+                    &holder,
+                    &env,
+                    &lock_key,
+                    "",
+                )
+                .await;
                 notifier.notify(
                     tickvault_core::notification::events::NotificationEvent::DualInstanceDetected {
                         holder,
@@ -2541,6 +2644,17 @@ async fn main() -> Result<()> {
                     lock_key = %lock_key,
                     "Phase 0 Item 19: Valkey acquire-attempt failed — BLOCKING BOOT"
                 );
+                // Phase 0 Item 19e — persist the ValkeyError outcome.
+                write_live_instance_lock_row(
+                    &config.questdb,
+                    tickvault_storage::live_instance_lock_persistence::LiveInstanceLockOutcome::ValkeyError,
+                    &host_id,
+                    "",
+                    &env,
+                    &lock_key,
+                    &format!("valkey-acquire-error: {err}"),
+                )
+                .await;
                 notifier.notify(
                     tickvault_core::notification::events::NotificationEvent::DualInstanceDetected {
                         holder: format!("(valkey-error: {err})"),

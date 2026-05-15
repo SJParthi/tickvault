@@ -861,6 +861,53 @@ mod tests {
         );
     }
 
+    /// Phase 0 Item 19e meta-guard: main.rs MUST persist every
+    /// boot-time instance-lock outcome via the audit row helper.
+    ///
+    /// The boot wiring (Item 19d) has three terminal sites — Acquired,
+    /// AlreadyHeld, and ValkeyError (the last covers both the
+    /// pool-build error path and the SET-NX-EX error path). Each MUST
+    /// be paired with a `write_live_instance_lock_row` call so the
+    /// `live_instance_lock` QuestDB table is a complete forensic
+    /// record for SEBI 5-year retention. Without the audit row, an
+    /// operator querying for "did host i-X boot successfully on
+    /// 2026-05-15?" gets a false negative.
+    ///
+    /// This test asserts the wiring is symmetric:
+    ///   * If `try_acquire_instance_lock` is called (boot gate wired),
+    ///     the audit-row helper MUST also be called.
+    ///   * Removing the audit helper while keeping the boot gate is a
+    ///     regression (every other audit table — static_ip_audit,
+    ///     phase2_audit, boot_audit — uses the same pattern).
+    #[test]
+    fn test_instance_lock_acquired_outcome_is_audited() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable from secret_manager test working dir");
+
+        let calls_try_acquire = main_rs.contains("try_acquire_instance_lock");
+        let calls_audit_helper = main_rs.contains("write_live_instance_lock_row");
+        let ensures_audit_table = main_rs.contains("ensure_live_instance_lock_table");
+
+        if calls_try_acquire {
+            assert!(
+                calls_audit_helper,
+                "main.rs wires the instance-lock boot gate but does NOT call \
+                 write_live_instance_lock_row() — every boot outcome must persist \
+                 to the live_instance_lock QuestDB table for SEBI forensic \
+                 reconstruction. See \
+                 .claude/rules/project/wave-4-error-codes.md::RESILIENCE-01."
+            );
+            assert!(
+                ensures_audit_table,
+                "main.rs wires the instance-lock boot gate but does NOT call \
+                 ensure_live_instance_lock_table() — the audit table must be \
+                 created (idempotent CREATE TABLE IF NOT EXISTS) before the \
+                 first INSERT, otherwise every audit row silently fails."
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // fetch_secret — error path (no real SSM available)
     // -----------------------------------------------------------------------
