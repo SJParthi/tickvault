@@ -1178,9 +1178,9 @@ Z+ LOW fixes (4):
 
 **Mandatory rule:** Every Claude Code session MUST check these boxes at session start. Only mark `- [x]` when ALL 4 criteria met: (1) code merged, (2) ratchet tests green in CI, (3) 7-layer observability wired, (4) PR closed.
 
-- [ ] **Item 1** — Subscription planner mode mix (IDX_I Ticker + NSE_EQ Quote)
-- [ ] **Item 2** — Connection pool: 1 main-feed WS conn (others dormant)
-- [ ] **Item 3** — Config feature flags (depth-20/200/greeks/movers/Phase 2 dispatcher all `false`)
+- [x] **Item 1** — Subscription planner mode mix (IDX_I Ticker + NSE_EQ Quote) — `SubscriptionScope::IndicesUnderlyingsOnly` in `crates/common/src/config.rs:1143`; planner branches at `subscription_planner.rs:247/265/298`; 13+ ratchet tests under `tests` module (line 4570 onward) incl. `test_indices_underlyings_only_planner_emits_zero_derivatives`, `_nse_eq_uses_quote_mode`, `_emits_all_three_idx_i_full_chain`, `_lower_bound_floor`, `test_phase_0_idx_i_symbols_contain_required_four`, `test_india_vix_security_id_constant_pinned_at_21`.
+- [x] **Item 2** — Connection pool: 1 main-feed WS conn (others dormant) — `effective_main_feed_pool_size(IndicesUnderlyingsOnly, _) → 1` in `crates/common/src/config.rs:1192`; consumed at boot in `crates/app/src/main.rs:6480`; ratchets `test_effective_main_feed_pool_size_under_phase_0_returns_one` + `test_phase_0_main_feed_connection_count_constant_pinned_at_1`.
+- [x] **Item 3** — Config feature flags (depth-20/200/greeks/movers/Phase 2 dispatcher all `false` under Phase 0 scope) — scope-aware spawn helpers in `crates/app/src/phase2_recovery.rs::should_spawn_phase2_scheduler/_depth_dynamic_pipeline/_greeks_pipeline` return `false` for `IndicesUnderlyingsOnly` **regardless of flag value**; ratchets `test_should_spawn_*_skipped_under_phase_0_regardless_of_flag` (lines 407/457/479). Movers pipeline already DELETED (`main.rs:1456` confirms).
 - [ ] **Item 4** — Watchdog timings: IDX_I 3s / NSE_EQ 10s / VIX 30s / Subscribe-ACK 2s / first reconnect 0ms
 - [ ] **Item 5** — SubscribeRxGuard preservation (existing, verify wired)
 - [ ] **Item 6** — Stagger init conns 2s
@@ -1190,8 +1190,8 @@ Z+ LOW fixes (4):
 - [ ] **Item 10** — Disconnect-chain 7-layer observability (5 counters + 2 gauges + 2 audit + 5 Telegram + ratchets)
 - [ ] **Item 11** — Dual-gate market-hours fix (G1 exchange_ts + G2 wall-clock 60s grace)
 - [ ] **Item 12** — `last_tick_audit` + `LastTickAfterBoundary` Telegram + banned-pattern hook
-- [ ] **Item 13** — Pre-open buffer → 09:15 candle.open wiring (IDX_I + NSE_EQ)
-- [ ] **Item 14** — REST `/marketfeed/quote.day_open` fallback at 09:14:55 IST
+- [x] **Item 13** — Pre-open buffer → 09:15 candle.open wiring (IDX_I + NSE_EQ) — merged via PR #619 (`open-price source-selection primitives`); see `crates/common/src/open_price_source.rs` + `commit c2b1201`.
+- [x] **Item 14** — REST `/marketfeed/quote.day_open` fallback at 09:14:55 IST — merged at `commit 6e9b4ce` (PR-14 ratchets bumped test-count baseline 9396→9423 in `6a1d35a`).
 - [ ] **Item 15** — 09:16:05 IST cross-check vs Dhan `/charts/intraday` 09:15 bar
 - [ ] **Item 16** — `open_price_audit` + 3 Telegram variants + 8 ratchets
 - [ ] **Item 17** — SEBI 24h JWT daily renewal observability + `auth_renewal_audit`
