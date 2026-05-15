@@ -109,6 +109,7 @@ pub mod seal_spill;
 pub mod seal_writer_loop;
 pub mod seal_writer_runner;
 pub mod seal_writer_task;
+pub mod self_trade_audit_persistence;
 pub mod selftest_audit_persistence;
 pub mod shadow_candle_writer;
 pub mod shadow_persistence;

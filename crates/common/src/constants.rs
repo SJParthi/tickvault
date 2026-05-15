@@ -1605,6 +1605,20 @@ pub const DH904_BACKOFF_SECS: &[u64] = &[10, 20, 40, 80];
 /// `usize` constant for ergonomic use in loop conditions.
 pub const DH904_MAX_RETRY_ATTEMPTS: usize = DH904_BACKOFF_SECS.len();
 
+/// Phase 0 Item 22f (2026-05-15) — Self-trade prevention cooldown
+/// window in seconds. Per SEBI Circular SEBI/HO/MIRSD/DOP/CIR/P/2018/153
+/// (wash-trade prevention), an account placing both legs of a trade
+/// within a tight time window creates a regulatory risk that the
+/// trade is classified as artificial / non-bona-fide. The 60s cooldown
+/// applies AFTER a fill on the same `(security_id, exchange_segment)`:
+/// subsequent orders on the opposite side are blocked at the OMS
+/// pre-trade gate until the window expires.
+///
+/// One value applies to all instruments. Different exchanges may have
+/// slightly different definitions; 60s is the safe upper bound across
+/// NSE / BSE per industry convention.
+pub const SELF_TRADE_COOLDOWN_SECS: u64 = 60;
+
 /// Broadcast channel capacity for cold-path tick consumers (trading pipeline,
 /// tick persistence, candle aggregation). Must be large enough to absorb bursts
 /// during high-volatility events without lagging cold-path consumers.
