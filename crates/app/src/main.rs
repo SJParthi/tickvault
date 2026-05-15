@@ -3034,6 +3034,13 @@ async fn main() -> Result<()> {
         tickvault_storage::ws_reconnect_audit_persistence::ensure_ws_reconnect_audit_table(
             &config.questdb
         ),
+        // Phase 0 Item 17b (2026-05-15) — SEBI 24h JWT renewal audit
+        // table. TokenManager writes one row per renewal lifecycle
+        // event via the process-wide `global_questdb_config()`. DDL
+        // is idempotent CREATE TABLE IF NOT EXISTS.
+        tickvault_storage::auth_renewal_audit_persistence::ensure_auth_renewal_audit_table(
+            &config.questdb
+        ),
         tickvault_storage::boot_audit_persistence::ensure_boot_audit_table(&config.questdb),
         tickvault_storage::selftest_audit_persistence::ensure_selftest_audit_table(&config.questdb),
         tickvault_storage::order_audit_persistence::ensure_order_audit_table(&config.questdb),
