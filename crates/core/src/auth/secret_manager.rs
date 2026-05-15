@@ -861,6 +861,39 @@ mod tests {
         );
     }
 
+    /// Phase 0 Item 22d meta-guard: main.rs MUST wire the end-of-day
+    /// digest scheduler that fires the `EndOfDayDigest` Telegram
+    /// once per trading day at 15:31:30 IST.
+    ///
+    /// The variant exists in `NotificationEvent` and the test suite
+    /// already pins its message + severity, but defining the event
+    /// without emitting it is exactly Rule 13 (audit-findings 2026-04-17):
+    /// "If a method exists + is tested but is never called, it IS a bug."
+    /// This source-scan guard fails the build if a future refactor
+    /// removes the call site in main.rs.
+    #[test]
+    fn test_end_of_day_digest_is_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable from secret_manager test working dir");
+
+        assert!(
+            main_rs.contains("NotificationEvent::EndOfDayDigest {"),
+            "main.rs MUST emit `NotificationEvent::EndOfDayDigest` from the \
+             scheduler spawned in the boot path. The variant defined in \
+             `crates/core/src/notification/events.rs` is dead code without it. \
+             See Phase 0 Item 22d in \
+             .claude/plans/friday-may-15-mega/topic-PHASE-0-LEAN-LOCKED.md."
+        );
+        assert!(
+            main_rs.contains("15, 31, 30"),
+            "main.rs MUST schedule the end-of-day digest at 15:31:30 IST. \
+             Earlier/later timings break the contract: the 90s offset after \
+             15:30 close lets the market-close shutdown signal settle before \
+             the digest reads final connection state."
+        );
+    }
+
     /// Phase 0 Item 19f meta-guard: main.rs MUST wire the
     /// `shutdown_notify` -> heartbeat-`Notify` bridge so the
     /// `GracefulRelease` lifecycle audit row + the Valkey DEL run
