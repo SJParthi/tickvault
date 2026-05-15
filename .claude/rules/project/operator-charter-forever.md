@@ -178,6 +178,7 @@ For every plan item / new feature / Telegram message / docs:
 | 10 | Edge-triggered alerts only (audit-findings Rule 4) | `audit-findings-2026-04-17.md` |
 | 11 | NO false-OK signals — gate success notifications on positive progress (audit-findings Rule 11) | `audit-findings-2026-04-17.md` |
 | 12 | One PR open at a time — finish + merge current before starting next (operator lock 2026-05-15) | `.claude/rules/project/pr-completion-protocol.md` |
+| 13 | Only 2 WebSocket connections EVER — 1 main-feed + 1 order-update; never depth-20, depth-200, or any 2nd main-feed conn (operator lock 2026-05-15) | `.claude/rules/project/websocket-connection-scope-lock.md` |
 
 ---
 
@@ -221,6 +222,44 @@ For every plan item / new feature / Telegram message / docs:
 
 - New hook `.claude/hooks/serial-pr-guard.sh` runs at session start; refuses code commits if an open PR authored by this branch exists on the operator's repo without merge.
 - Tag-guard meta-test `crates/storage/tests/serial_pr_protocol_guard.rs` greps for the canonical phrases in this section so the rule cannot be silently deleted.
+
+---
+
+## I. WebSocket connection scope lock (MANDATORY, FOREVER — operator lock 2026-05-15)
+
+> Operator verbatim 2026-05-15:
+> "except [for] this 1 connection main feed websocket and order update websocket we will never ever use anything else"
+
+**The only WebSocket connections this product will EVER open:**
+
+| WS type | Count | Allowed instruments | Mode |
+|---|---|---|---|
+| **Main feed** (`wss://api-feed.dhan.co`) | **1 conn** | 4 IDX_I (NIFTY=13, BANKNIFTY=25, SENSEX=51, INDIA VIX=21) + 218 NSE_EQ F&O underlying stocks = **222 SIDs** | Ticker for IDX_I + Quote for NSE_EQ |
+| **Order update** (`wss://api-order-update.dhan.co`) | **1 conn** | n/a (receives order events for orders we place) | JSON, MsgCode 42, filter `Source=P` |
+
+**Forbidden FOREVER (until operator explicitly re-approves):**
+
+| ❌ Banned WS type | Why |
+|---|---|
+| Depth-20 (`depth-api-feed.dhan.co/twentydepth`) | Operator lock — not in scope for any phase |
+| Depth-200 (`full-depth-api.dhan.co/?token=...`) | Same |
+| Any 2nd/3rd/4th/5th main-feed conn | 222 SIDs fit on 1 conn (Dhan cap = 5000/conn). More conns = wasted token + IP budget |
+| Any new WS endpoint Dhan ships in future | Not in scope without operator re-approval |
+
+**Reconnect parity (both allowed WS types):**
+
+- First reconnect attempt: **0 ms (instant)** on both. Main feed via `compute_reconnect_base_delay_ms(0, _, _) → 0` (`connection.rs:1666`); order-update via `compute_reconnect_backoff_ms(1) → 0` (`order_update_connection.rs:639`, Phase 0 Item 4 fix 2026-05-15).
+- Subsequent attempts: exponential backoff capped at `*_MAX_MS`.
+
+**Mechanical guards:**
+
+- `should_spawn_depth_dynamic_pipeline(IndicesUnderlyingsOnly, _) → false` in `crates/app/src/phase2_recovery.rs:197` (ratcheted at `phase2_recovery.rs:457`).
+- `effective_main_feed_pool_size(IndicesUnderlyingsOnly, _) → 1` in `crates/common/src/config.rs:1192` (ratcheted at `config.rs:2634`).
+- Greeks/movers pipelines deleted or gated to `false`.
+
+**Auto-driver one-liner:**
+
+> "Sir, only 2 phone lines to Dhan EVER. Line 1: live price feed for 4 indices + 218 stocks = 222 wires. Line 2: order update notifications. NOTHING else. No depth phone line. No second feed phone line. EVER. If anyone tries to add a 3rd phone, this rule file rejects the PR."
 
 ---
 
