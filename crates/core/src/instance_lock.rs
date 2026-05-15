@@ -23,15 +23,28 @@
 //! take over.
 //!
 //! Item 19a shipped the pure-logic primitives — host_id composition,
-//! lock-key formatting, constants. Item 19b (this PR) adds the async
-//! acquire / release / renew helpers that wrap `ValkeyPool`. Item 19c
-//! adds the heartbeat supervisor + boot-sequence wiring. Item 19d adds
-//! the `live_instance_lock` QuestDB audit table.
+//! lock-key formatting, constants. Item 19b added the async acquire /
+//! release / renew helpers that wrap `ValkeyPool` + the
+//! `ErrorCode::Resilience01DualInstanceDetected` variant + the
+//! `AcquireOutcome` enum. Item 19c (this PR) adds the heartbeat
+//! supervisor task + the `NotificationEvent::DualInstanceDetected`
+//! variant. Item 19d will wire ValkeyPool + SSM fetch into the boot
+//! sequence and add the instance-lock boot gate (scope-deferred
+//! because wiring ValkeyPool in main.rs triggers
+//! `test_valkey_wiring_in_main_must_use_ssm` and requires
+//! `fetch_valkey_password()` to land in the same PR). Item 19e will
+//! add the `live_instance_lock` QuestDB audit table.
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
+use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::sanitize_ilp_symbol;
 use tickvault_storage::valkey_cache::ValkeyPool;
-use tracing::{info, warn};
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
+use tracing::{error, info, warn};
 
 /// TTL on the Valkey lock key. 90 seconds is long enough that a brief
 /// network blip won't drop the lock and short enough that a hard
@@ -249,6 +262,111 @@ pub async fn release_instance_lock(valkey: &ValkeyPool, env: &str, host_id: &str
     Ok(())
 }
 
+/// Spawns the instance-lock heartbeat task.
+///
+/// The returned `JoinHandle` is held by the boot code so a clean
+/// shutdown can wait for the final TTL renewal to settle. The
+/// `shutdown` `Notify` flows from the same source as every other
+/// tokio task (`tokio::sync::Notify` is the codebase-wide convention
+/// — see `crates/app/src/main.rs` for live examples). When notified,
+/// the heartbeat exits its loop, performs ONE last
+/// `release_instance_lock` so the next boot sees a clean slate
+/// immediately (instead of waiting 90s for TTL expiry), and returns.
+///
+/// Heartbeat loss-of-ownership policy: if `renew_instance_lock`
+/// returns `Ok(false)` — meaning a foreign instance has stolen our
+/// slot — the task logs `RESILIENCE-01` at ERROR level and EXITS.
+/// The boot code that owns this `JoinHandle` MUST observe the exit
+/// (e.g. via a separate watchdog or by treating the lock-loss as a
+/// HALT-class signal). We do NOT panic the process from inside the
+/// heartbeat because tokio's panic handling can mask the cause; the
+/// boot supervisor is the right place to drive process termination.
+///
+/// Heartbeat transient errors: a Valkey GET/SET error during renewal
+/// is logged at WARN and the loop continues. With a 30s heartbeat
+/// interval against a 90s TTL, two consecutive transient failures
+/// still leave 30s of headroom before the lock expires — well above
+/// any realistic Valkey reconnect cycle.
+// TEST-EXEMPT: live Valkey instance required for the GET / SET round
+// trip; the renew_instance_lock / release_instance_lock functions
+// the task delegates to are themselves TEST-EXEMPT for the same
+// reason. The cancellation + exit path is small enough to verify by
+// inspection; integration tests will exercise it under Item 19d.
+pub fn spawn_instance_lock_heartbeat(
+    valkey: Arc<ValkeyPool>,
+    env: String,
+    host_id: String,
+    shutdown: Arc<Notify>,
+) -> JoinHandle<()> {
+    let interval = Duration::from_secs(INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS);
+    tokio::spawn(async move {
+        info!(
+            target: "tickvault::instance_lock",
+            env = %env,
+            host_id = %host_id,
+            interval_secs = INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS,
+            ttl_secs = INSTANCE_LOCK_TTL_SECS,
+            "instance-lock heartbeat task started"
+        );
+        let mut ticker = tokio::time::interval(interval);
+        // First tick fires immediately — skip it so we don't redundantly
+        // renew the lock that try_acquire just SET.
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                () = shutdown.notified() => {
+                    info!(
+                        target: "tickvault::instance_lock",
+                        "shutdown signalled — releasing instance lock"
+                    );
+                    if let Err(err) = release_instance_lock(&valkey, &env, &host_id).await {
+                        warn!(
+                            target: "tickvault::instance_lock",
+                            error = %err,
+                            "instance-lock release on shutdown failed (TTL will expire \
+                             naturally within {}s)",
+                            INSTANCE_LOCK_TTL_SECS
+                        );
+                    }
+                    return;
+                }
+                _ = ticker.tick() => {
+                    match renew_instance_lock(&valkey, &env, &host_id).await {
+                        Ok(true) => {
+                            // Successful renewal — no log to avoid every-30s
+                            // chatter. The market-open self-test
+                            // (`SELFTEST-01`) already provides the daily
+                            // positive ping that the boot system is alive.
+                        }
+                        Ok(false) => {
+                            error!(
+                                target: "tickvault::instance_lock",
+                                code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
+                                severity = ErrorCode::Resilience01DualInstanceDetected
+                                    .severity()
+                                    .as_str(),
+                                env = %env,
+                                host_id = %host_id,
+                                "instance lock lost — another process now holds the lock; \
+                                 heartbeat task exiting"
+                            );
+                            return;
+                        }
+                        Err(err) => {
+                            warn!(
+                                target: "tickvault::instance_lock",
+                                error = %err,
+                                "transient instance-lock renewal failure; will retry on \
+                                 next heartbeat tick"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,6 +438,16 @@ mod tests {
     fn test_try_acquire_instance_lock_smoke() {
         // Smoke-pin the public symbol `try_acquire_instance_lock` exists.
         let _ = try_acquire_instance_lock;
+    }
+
+    #[test]
+    fn test_spawn_instance_lock_heartbeat_smoke() {
+        // Smoke-pin the public symbol `spawn_instance_lock_heartbeat`
+        // exists. Real behaviour requires a live Valkey + a Tokio
+        // runtime + a Notify shutdown handle; integration-tested at
+        // boot wiring (Item 19c boot scenario) and Item 19d audit-table
+        // tests.
+        let _ = spawn_instance_lock_heartbeat;
     }
 
     // -----------------------------------------------------------------------

@@ -994,6 +994,28 @@ pub enum NotificationEvent {
         max_attempts: u32,
     },
 
+    /// Phase 0 Item 19 — another `tickvault` process holds the Valkey
+    /// dual-instance lock for this client-id at boot time. Two processes
+    /// running against the same Dhan account fight over static-IP
+    /// enforcement and fragment the WebSocket connection budget — boot
+    /// must HALT. The lock has a 90s TTL so a hard-crashed peer's lock
+    /// expires automatically; this event fires only when a LIVE peer is
+    /// holding the lock. Severity::Critical.
+    DualInstanceDetected {
+        /// Best-effort holder identity (e.g.,
+        /// `i-0123abc:42:deadbeefcafef00d` or `local:42:...`). Empty
+        /// string is a valid value: the Valkey GET fallback may race
+        /// with the other instance's release between our SET-NX-EX and
+        /// the diagnostic read. The boot-halt decision is correct
+        /// regardless; operator uses `make doctor` / direct Valkey to
+        /// identify the winner in that case.
+        holder: String,
+        /// The env-qualified lock key (e.g. `tickvault:instance:lock:prod`).
+        /// Surfaced so the operator can run `valkey-cli GET <key>` to
+        /// triage without needing to know the key construction rule.
+        lock_key: String,
+    },
+
     /// Boot health check completed — infrastructure services verified.
     BootHealthCheck {
         /// Number of services that passed health check.
@@ -2258,6 +2280,17 @@ impl NotificationEvent {
                     "<b>Static IP check waiting</b>\nDhan still reports this IP as not allowed for orders. Retry {attempt} of {max_attempts} (every minute)."
                 )
             }
+            Self::DualInstanceDetected { holder, lock_key } => {
+                let holder_line = if holder.is_empty() {
+                    "(holder identity not retrievable — Valkey may have raced; check `make doctor` or `valkey-cli GET <key>`)"
+                        .to_string()
+                } else {
+                    format!("Live peer: {holder}")
+                };
+                format!(
+                    "<b>DUAL-INSTANCE DETECTED</b>\nAnother tickvault process is already running for this Dhan account.\n{holder_line}\nLock key: {lock_key}\n\nBoot blocked — running two instances against one client-id breaks order auth, depth state, and reconciliation. Stop the other instance, then restart this one."
+                )
+            }
             Self::BootHealthCheck {
                 services_healthy,
                 services_total,
@@ -2602,6 +2635,7 @@ impl NotificationEvent {
             Self::StaticIpBootCheckPassed { .. } => "StaticIpBootCheckPassed",
             Self::StaticIpBootCheckFailed { .. } => "StaticIpBootCheckFailed",
             Self::StaticIpBootCheckRetrying { .. } => "StaticIpBootCheckRetrying",
+            Self::DualInstanceDetected { .. } => "DualInstanceDetected",
             Self::BootHealthCheck { .. } => "BootHealthCheck",
             Self::BootDeadlineMissed { .. } => "BootDeadlineMissed",
             Self::BootClockSkewExceeded { .. } => "BootClockSkewExceeded",
@@ -2637,6 +2671,7 @@ impl NotificationEvent {
         match self {
             Self::IpVerificationFailed { .. } => Severity::Critical,
             Self::StaticIpBootCheckFailed { .. } => Severity::Critical,
+            Self::DualInstanceDetected { .. } => Severity::Critical,
             Self::BootDeadlineMissed { .. } => Severity::Critical,
             Self::BootClockSkewExceeded { .. } => Severity::Critical,
             Self::AuthenticationFailed { .. } => Severity::Critical,
@@ -5330,5 +5365,61 @@ mod tests {
             !stripped.contains('>'),
             "Telegram HTML mode rejects unescaped '>' — body was: {body}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 0 Item 19c — DualInstanceDetected notification variant
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dual_instance_detected_message_includes_holder_and_key() {
+        let event = NotificationEvent::DualInstanceDetected {
+            holder: "i-0123abc:42:deadbeefcafef00d".to_string(),
+            lock_key: "tickvault:instance:lock:prod".to_string(),
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("DUAL-INSTANCE DETECTED"));
+        assert!(msg.contains("i-0123abc"));
+        assert!(msg.contains("tickvault:instance:lock:prod"));
+        assert!(msg.contains("Boot blocked"));
+    }
+
+    #[test]
+    fn test_dual_instance_detected_empty_holder_uses_fallback_text() {
+        // The Valkey GET fallback can return an empty holder (race
+        // between SET-NX-EX and the diagnostic GET). The Telegram
+        // payload must still be operator-readable in that case —
+        // pin the fallback phrasing.
+        let event = NotificationEvent::DualInstanceDetected {
+            holder: String::new(),
+            lock_key: "tickvault:instance:lock:dev".to_string(),
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("not retrievable"));
+        assert!(msg.contains("tickvault:instance:lock:dev"));
+        // No "Live peer:" line on the empty-holder path (would read
+        // weird with an empty identity).
+        assert!(!msg.contains("Live peer:"));
+    }
+
+    #[test]
+    fn test_dual_instance_detected_severity_is_critical() {
+        let event = NotificationEvent::DualInstanceDetected {
+            holder: "x".to_string(),
+            lock_key: "y".to_string(),
+        };
+        assert_eq!(event.severity(), Severity::Critical);
+    }
+
+    #[test]
+    fn test_dual_instance_detected_topic_is_stable() {
+        // operator-charter forbids renaming wire-format identifiers
+        // without explicit migration; the topic flows into Telegram
+        // coalescer bucket keys + log lines + audit rows.
+        let event = NotificationEvent::DualInstanceDetected {
+            holder: String::new(),
+            lock_key: String::new(),
+        };
+        assert_eq!(event.topic(), "DualInstanceDetected");
     }
 }
