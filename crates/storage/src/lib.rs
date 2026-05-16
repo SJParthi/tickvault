@@ -101,6 +101,7 @@ pub mod order_update_ws_audit_persistence;
 pub mod partition_manager;
 pub mod phase2_audit_persistence;
 pub mod phase2_subscription_marker;
+pub mod pnl_audit_persistence;
 pub mod previous_close_persistence;
 pub mod questdb_health;
 pub mod seal_absorption;
