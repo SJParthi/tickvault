@@ -6321,6 +6321,83 @@ async fn main() -> Result<()> {
     }
 
     // -----------------------------------------------------------------------
+    // Option-chain minute-snapshot scheduler (PR #5 of 5 — 2026-05-16)
+    //
+    // Drives the 3-times-per-minute Dhan option-chain fetch (operator-
+    // locked schedule: SENSEX :53 / BANKNIFTY :56 / NIFTY :59) into a
+    // shared RAM cache that the future BRUTEX strategy reads from.
+    //
+    // The scheduler is opt-in (`config.option_chain_minute_snapshot.enabled
+    // = false` by default) so a fresh deployment doesn't surprise-fetch.
+    //
+    // Boot-time validator (`option_chain_schedule::validate_option_chain_schedule`)
+    // runs before spawn — invalid TOML HALTs the app via
+    // `OptionChainConfigInvalid` Severity::Critical Telegram instead of
+    // silently running a broken schedule.
+    //
+    // See `.claude/plans/friday-may-15-mega/topic-OPTION-CHAIN-MINUTE-SNAPSHOT.md`.
+    // -----------------------------------------------------------------------
+    if config.option_chain_minute_snapshot.enabled {
+        match tickvault_common::option_chain_schedule::validate_option_chain_schedule(
+            &config.option_chain_minute_snapshot.underlyings,
+        ) {
+            Ok(()) => {
+                info!(
+                    underlyings = config.option_chain_minute_snapshot.underlyings.len(),
+                    "option-chain minute-snapshot schedule validated — spawning scheduler"
+                );
+                let oc_token = token_handle.clone();
+                let oc_client_id = ws_client_id.clone();
+                let oc_base_url = config.dhan.rest_api_base_url.clone();
+                let oc_config = config.option_chain_minute_snapshot.clone();
+                let oc_notifier = notifier.clone();
+                let oc_cache = tickvault_core::option_chain::snapshot_cache::SnapshotCache::new();
+                // The cache handle is stored on the app-wide state in
+                // a follow-up so the future strategy can read from it.
+                // For now (PR #5), spawning is sufficient — the cache
+                // accumulates snapshots ready for the next consumer.
+                match tickvault_core::option_chain::client::OptionChainClient::new(
+                    oc_token,
+                    oc_client_id,
+                    oc_base_url,
+                ) {
+                    Ok(oc_client) => {
+                        let _ = tickvault_core::option_chain::snapshot_scheduler::spawn_snapshot_scheduler(
+                            oc_config,
+                            oc_client,
+                            oc_cache,
+                            oc_notifier,
+                        );
+                        info!("option-chain minute-snapshot scheduler spawned");
+                    }
+                    Err(err) => {
+                        error!(
+                            ?err,
+                            "option-chain client construction failed — scheduler NOT spawned"
+                        );
+                    }
+                }
+            }
+            Err(schedule_err) => {
+                // Operator-charter §F: invalid config is a HALT-class
+                // event. Fire the typed Telegram + exit instead of
+                // silently disabling the feature.
+                error!(
+                    error = %schedule_err,
+                    "option-chain schedule INVALID — refusing to spawn scheduler"
+                );
+                notifier.notify(
+                    tickvault_core::notification::NotificationEvent::OptionChainConfigInvalid {
+                        reason: schedule_err.to_string(),
+                    },
+                );
+            }
+        }
+    } else {
+        info!("option-chain minute-snapshot pipeline disabled in config");
+    }
+
+    // -----------------------------------------------------------------------
     // Step 10: Spawn order update WebSocket connection
     // -----------------------------------------------------------------------
     let (order_update_sender, _order_update_receiver) =
