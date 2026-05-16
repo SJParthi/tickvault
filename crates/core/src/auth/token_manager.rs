@@ -1145,7 +1145,21 @@ impl TokenManager {
         .increment(1);
 
         match self.renew_with_fallback().await {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                // Phase 0 Item 17c — Success audit row for the
+                // post-sleep wake force-renewal path. Preserves the
+                // SEBI forensic trail symmetry: every renewal attempt
+                // (scheduled OR forced) lands a row in
+                // `auth_renewal_audit`.
+                self.write_renewal_audit_row(
+                    tickvault_storage::auth_renewal_audit_persistence::AuthRenewalAuditOutcome::Success,
+                    1,
+                    "force_if_stale_ws_wake",
+                    "",
+                )
+                .await;
+                Ok(true)
+            }
             Err(e) => {
                 tracing::error!(
                     ?e,
@@ -1154,6 +1168,17 @@ impl TokenManager {
                             .code_str(),
                     "AUTH-GAP-03 force renewal failed — caller should still try reconnect"
                 );
+                // Phase 0 Item 17c — Failed audit row for the
+                // post-sleep wake force-renewal path. Captures the
+                // failure even though the caller is responsible for
+                // retry policy.
+                self.write_renewal_audit_row(
+                    tickvault_storage::auth_renewal_audit_persistence::AuthRenewalAuditOutcome::Failed,
+                    1,
+                    "force_if_stale_ws_wake",
+                    &e.to_string(),
+                )
+                .await;
                 Err(e)
             }
         }
@@ -1177,7 +1202,32 @@ impl TokenManager {
             "trigger" => "explicit"
         )
         .increment(1);
-        self.renew_with_fallback().await
+        let result = self.renew_with_fallback().await;
+        // Phase 0 Item 17c — audit row for the explicit force-renewal
+        // path (e.g. 807 disconnect / DH-901 from REST). Captures both
+        // success and failure so the SEBI forensic chain is symmetric
+        // with the scheduled (17b) and post-sleep wake (17c) paths.
+        match &result {
+            Ok(()) => {
+                self.write_renewal_audit_row(
+                    tickvault_storage::auth_renewal_audit_persistence::AuthRenewalAuditOutcome::Success,
+                    1,
+                    "force_explicit",
+                    "",
+                )
+                .await;
+            }
+            Err(e) => {
+                self.write_renewal_audit_row(
+                    tickvault_storage::auth_renewal_audit_persistence::AuthRenewalAuditOutcome::Failed,
+                    1,
+                    "force_explicit",
+                    &e.to_string(),
+                )
+                .await;
+            }
+        }
+        result
     }
 
     /// Wave 2 Item 5.4 (G1) — current token expiry timestamp.
@@ -3217,6 +3267,57 @@ mod tests {
             result.is_err(),
             "force_renewal must propagate the underlying network error \
              when no Dhan endpoint is reachable, proving it always tries"
+        );
+    }
+
+    /// Phase 0 Item 17c — source-scan meta-guard pinning the audit
+    /// wiring on the two force-renewal paths. Without these audit
+    /// rows the SEBI forensic chain is asymmetric: scheduled renewals
+    /// (17b) leave a row, but post-sleep wake renewals + explicit
+    /// 807-triggered renewals don't.
+    ///
+    /// Both force paths must produce both outcomes:
+    ///   - `Success` on a successful renew_with_fallback
+    ///   - `Failed`  on a propagated error
+    /// with distinct trigger labels (`force_if_stale_ws_wake` vs
+    /// `force_explicit`) so the operator can split the audit table
+    /// by trigger source post-hoc.
+    #[test]
+    fn test_force_renewal_paths_write_audit_rows() {
+        let source = include_str!("token_manager.rs");
+
+        assert!(
+            source.contains("\"force_if_stale_ws_wake\""),
+            "token_manager.rs force_renewal_if_stale MUST tag audit \
+             rows with trigger_source = \"force_if_stale_ws_wake\". \
+             See Phase 0 Item 17c."
+        );
+        assert!(
+            source.contains("\"force_explicit\""),
+            "token_manager.rs force_renewal MUST tag audit rows with \
+             trigger_source = \"force_explicit\". See Phase 0 Item 17c."
+        );
+        // Each force path must reach both Success and Failed outcomes.
+        // Counting the AuthRenewalAuditOutcome::Success references is
+        // a cheap proxy for "the success branch writes an audit row";
+        // 17b already writes 1 Success row in renewal_loop, 17c adds
+        // 2 more (one per force path), so the workspace MUST contain
+        // at least 3 Success references in this file.
+        let success_count = source.matches("AuthRenewalAuditOutcome::Success").count();
+        assert!(
+            success_count >= 3,
+            "token_manager.rs must contain ≥ 3 \
+             AuthRenewalAuditOutcome::Success references (1 scheduled \
+             + 1 force_if_stale_ws_wake + 1 force_explicit); found {}",
+            success_count
+        );
+        let failed_count = source.matches("AuthRenewalAuditOutcome::Failed").count();
+        assert!(
+            failed_count >= 3,
+            "token_manager.rs must contain ≥ 3 \
+             AuthRenewalAuditOutcome::Failed references (1 scheduled \
+             + 1 force_if_stale_ws_wake + 1 force_explicit); found {}",
+            failed_count
         );
     }
 }
