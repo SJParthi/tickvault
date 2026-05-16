@@ -154,15 +154,24 @@ impl OptionChainClient {
                     %status,
                     "expiry list API server error — retrying"
                 );
-                debug!(resp_body, "server error response body");
+                // security-reviewer 2026-05-16: cap body length before
+                // logging — Dhan may echo a truncated JWT prefix in an
+                // auth-error response body. 200 chars is enough for
+                // operator debugging without leaking the full token if
+                // present.
+                let body_trunc: String = resp_body.chars().take(200).collect();
+                debug!(resp_body = %body_trunc, "server error response body");
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 delay_ms = delay_ms.saturating_mul(2);
                 continue;
             }
 
-            // Non-retryable error or retries exhausted.
+            // Non-retryable error or retries exhausted. Cap body length
+            // before embedding in the anyhow error — same security
+            // rationale as the debug log site above.
             let resp_body = response.text().await.unwrap_or_default();
-            bail!("expiry list API returned {status}: {resp_body}");
+            let body_trunc: String = resp_body.chars().take(200).collect();
+            bail!("expiry list API returned {status}: {body_trunc}");
         }
 
         bail!("expiry list request failed after {MAX_RETRIES} retries")
@@ -246,15 +255,23 @@ impl OptionChainClient {
                     %status,
                     "option chain API server error — retrying"
                 );
-                debug!(resp_body, "server error response body");
+                // security-reviewer 2026-05-16: cap body length before
+                // logging — Dhan may echo a truncated JWT prefix in an
+                // auth-error response body. 200 chars is enough for
+                // operator debugging without leaking the full token if
+                // present.
+                let body_trunc: String = resp_body.chars().take(200).collect();
+                debug!(resp_body = %body_trunc, "server error response body");
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 delay_ms = delay_ms.saturating_mul(2);
                 continue;
             }
 
-            // Non-retryable error or retries exhausted.
+            // Non-retryable error or retries exhausted. Same 200-char
+            // truncation as the expiry-list path above.
             let resp_body = response.text().await.unwrap_or_default();
-            bail!("option chain API returned {status}: {resp_body}");
+            let body_trunc: String = resp_body.chars().take(200).collect();
+            bail!("option chain API returned {status}: {body_trunc}");
         }
 
         bail!("option chain request failed after {MAX_RETRIES} retries")
