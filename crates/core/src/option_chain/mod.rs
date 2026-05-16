@@ -20,4 +20,8 @@ pub mod prev_oi;
 // fetch cold path. See plan
 // `.claude/plans/friday-may-15-mega/topic-OPTION-CHAIN-MINUTE-SNAPSHOT.md`.
 pub mod snapshot_cache;
+// Option-chain minute-snapshot pipeline (PR #4b of 5, 2026-05-16) —
+// per-slot tokio scheduler that fires fetch + cache-insert + 4
+// Prometheus counters + edge-triggered Telegram on failure.
+pub mod snapshot_scheduler;
 pub mod types;
