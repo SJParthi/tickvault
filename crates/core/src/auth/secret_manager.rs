@@ -1008,6 +1008,45 @@ mod tests {
         );
     }
 
+    /// Phase 0 Item 22c meta-guard: main.rs MUST emit
+    /// `NotificationEvent::MarketOpenReadinessConfirmation` from the
+    /// once-per-trading-day pre-open scheduler. This is the operator's
+    /// positive "we are READY for the open" Telegram that closes the
+    /// false-OK gap from audit-findings-2026-04-17.md Rule 11.
+    ///
+    /// Operator-facing runbook `docs/runbooks/operator-daily-startup.md`
+    /// names this Telegram as check #1 of the 5 mandatory pre-market
+    /// checks. If the wiring is removed, the operator's 08:30 IST
+    /// checklist breaks silently — no error, just a missing positive
+    /// signal that takes 45 minutes (until 09:15:30 IST
+    /// `MarketOpenStreamingConfirmation`) to escalate as a gap.
+    ///
+    /// This source-scan guard fails the build if a future refactor
+    /// removes the call site in main.rs.
+    #[test]
+    fn test_market_open_readiness_confirmation_is_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable from secret_manager test working dir");
+
+        assert!(
+            main_rs.contains("NotificationEvent::MarketOpenReadinessConfirmation {"),
+            "main.rs MUST emit `NotificationEvent::MarketOpenReadinessConfirmation` \
+             from the pre-open scheduler spawned in the boot path. The variant \
+             defined in `crates/core/src/notification/events.rs` is dead code \
+             without it. See Phase 0 Item 22c in \
+             .claude/plans/friday-may-15-mega/topic-PHASE-0-LEAN-LOCKED.md and \
+             `docs/runbooks/operator-daily-startup.md` check #1."
+        );
+        assert!(
+            main_rs.contains("readiness_notifier"),
+            "main.rs MUST hold a `readiness_notifier` handle for the pre-open \
+             scheduler task. Removing the handle decouples the scheduler from \
+             the notification service and would silently lose the readiness \
+             Telegram for every trading day."
+        );
+    }
+
     /// Phase 0 Item 19f meta-guard: main.rs MUST wire the
     /// `shutdown_notify` -> heartbeat-`Notify` bridge so the
     /// `GracefulRelease` lifecycle audit row + the Valkey DEL run
