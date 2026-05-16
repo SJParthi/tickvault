@@ -115,6 +115,7 @@ pub mod selftest_audit_persistence;
 pub mod shadow_candle_writer;
 pub mod shadow_persistence;
 pub mod shadow_seal_columns;
+pub mod signal_audit_persistence;
 pub mod sl_replacement_audit_persistence;
 pub mod static_ip_audit_persistence;
 pub mod tick_persistence;
