@@ -97,6 +97,7 @@ pub mod materialized_views;
 // PR 5c.4-narrow's movers_unified_query helper) is fully retired.
 pub mod obi_persistence;
 pub mod open_price_audit_persistence;
+pub mod option_chain_minute_snapshot_persistence;
 pub mod order_audit_persistence;
 pub mod order_update_ws_audit_persistence;
 pub mod partition_manager;

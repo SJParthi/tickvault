@@ -3053,6 +3053,16 @@ async fn main() -> Result<()> {
         tickvault_storage::last_tick_audit_persistence::ensure_last_tick_audit_table(
             &config.questdb
         ),
+        // Option-chain minute-snapshot pipeline (2026-05-16, PR #2 of 5).
+        // Forensic table for the 3-times-per-minute Dhan option chain
+        // fetches that feed BRUTEX strike-selection. One row per
+        // (underlying, strike, side, minute). SEBI 5y retention; same
+        // 90d-hot → S3 IT → Glacier lifecycle as the other audit tables.
+        // Idempotent CREATE TABLE IF NOT EXISTS — safe to call every boot.
+        // See `.claude/plans/friday-may-15-mega/topic-OPTION-CHAIN-MINUTE-SNAPSHOT.md`.
+        tickvault_storage::option_chain_minute_snapshot_persistence::ensure_option_chain_minute_snapshot_table(
+            &config.questdb
+        ),
         // Wave 6 Sub-PR #1 item 1.4a — shadow candle tables (9 timeframes)
         // + aggregator_seal_audit forensic table. The future writer task
         // (item 1.4b) writes sealed candles into these tables; the boot
