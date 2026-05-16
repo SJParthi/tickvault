@@ -1047,6 +1047,43 @@ mod tests {
         );
     }
 
+    /// Phase 0 Item 12 meta-guard: main.rs MUST include
+    /// `last_tick_audit_persistence::ensure_last_tick_audit_table` in
+    /// the boot-time DDL `tokio::join!`. Without the DDL, the future
+    /// runtime wiring (Phase 0 Item 12 follow-up) that writes
+    /// per-SID last-tick rows will hit a 404 on the QuestDB ILP
+    /// `last_tick_audit` table.
+    ///
+    /// Also pins the `LastTickAfterBoundary` Telegram variant
+    /// definition so future refactors don't accidentally delete it
+    /// while the event-emission site (also pending Phase 0 Item 12
+    /// follow-up) is still in flight.
+    #[test]
+    fn test_last_tick_audit_table_is_wired_into_boot_ddl() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable from secret_manager test working dir");
+
+        assert!(
+            main_rs.contains("ensure_last_tick_audit_table"),
+            "main.rs MUST call \
+             `last_tick_audit_persistence::ensure_last_tick_audit_table` \
+             inside the boot DDL `tokio::join!`. Phase 0 Item 12 — \
+             without this DDL the future runtime wiring would hit a \
+             404 on the QuestDB ILP `last_tick_audit` table."
+        );
+
+        let events_rs = std::fs::read_to_string("src/notification/events.rs")
+            .or_else(|_| std::fs::read_to_string("crates/core/src/notification/events.rs"))
+            .expect("events.rs must be readable");
+        assert!(
+            events_rs.contains("LastTickAfterBoundary {"),
+            "events.rs MUST define the `LastTickAfterBoundary` variant. \
+             Phase 0 Item 12 — this is the Info-severity Telegram that \
+             fires when a tick arrives with exchange_ts >= 15:30:00.000."
+        );
+    }
+
     /// Phase 0 Item 19f meta-guard: main.rs MUST wire the
     /// `shutdown_notify` -> heartbeat-`Notify` bridge so the
     /// `GracefulRelease` lifecycle audit row + the Valkey DEL run

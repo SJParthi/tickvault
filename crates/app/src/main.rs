@@ -3044,6 +3044,15 @@ async fn main() -> Result<()> {
         tickvault_storage::boot_audit_persistence::ensure_boot_audit_table(&config.questdb),
         tickvault_storage::selftest_audit_persistence::ensure_selftest_audit_table(&config.questdb),
         tickvault_storage::order_audit_persistence::ensure_order_audit_table(&config.questdb),
+        // Phase 0 Item 12 — `last_tick_audit` forensic table. Captures
+        // per-SID last-tick exchange_ts at each minute seal so the
+        // operator can answer "what was the last tick BANKNIFTY received
+        // before the 09:34 seal?" in one SQL query. SEBI-relevant; same
+        // 90d-hot → S3 IT → Glacier lifecycle as the other audit tables.
+        // Idempotent CREATE TABLE IF NOT EXISTS.
+        tickvault_storage::last_tick_audit_persistence::ensure_last_tick_audit_table(
+            &config.questdb
+        ),
         // Wave 6 Sub-PR #1 item 1.4a — shadow candle tables (9 timeframes)
         // + aggregator_seal_audit forensic table. The future writer task
         // (item 1.4b) writes sealed candles into these tables; the boot
