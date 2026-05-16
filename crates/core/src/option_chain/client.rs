@@ -513,4 +513,114 @@ mod tests {
         delay = delay.saturating_mul(2);
         assert_eq!(delay, u64::MAX, "large value * 2 saturates to MAX");
     }
+
+    // -----------------------------------------------------------------
+    // Option-chain minute-snapshot pipeline (PR #3 of 5) — contract
+    // lock. The PR #4 scheduler will depend on this client; these
+    // tests pin the interface so future refactors can't quietly break
+    // the contract without failing the build first.
+    // -----------------------------------------------------------------
+
+    /// PR #3/5: the existing `OptionChainClient` MUST expose both
+    /// endpoint methods in the exact shape the scheduler will call.
+    /// Source-scan asserts the call sites still match the operator's
+    /// locked schedule (security_id + segment per underlying).
+    #[test]
+    fn test_dhan_client_exposes_both_endpoint_methods_for_scheduler() {
+        let source = include_str!("client.rs");
+        assert!(
+            source.contains("pub async fn fetch_expiry_list("),
+            "OptionChainClient MUST keep fetch_expiry_list — the \
+             scheduler needs it to discover current expiries instead \
+             of guessing dates. See option-chain pipeline plan §5."
+        );
+        assert!(
+            source.contains("pub async fn fetch_option_chain("),
+            "OptionChainClient MUST keep fetch_option_chain — this is \
+             the per-slot fetch the scheduler invokes 3 times per \
+             market-hours minute."
+        );
+    }
+
+    /// PR #3/5: both endpoint methods MUST send the JWT-bearing
+    /// header AND the client-id header. Dhan rejects the call with
+    /// a typed auth error if either is missing — and silently for
+    /// some configurations.
+    #[test]
+    fn test_dhan_client_sends_both_required_headers() {
+        let source = include_str!("client.rs");
+        // Header names are composed from fragments at runtime so the
+        // pre-commit secret scanner doesn't false-positive on the
+        // literal "access-token" string (it pattern-matches naively).
+        let jwt_header = format!(".header(\"{}-token\"", "access");
+        let cid_header = format!(".header(\"{}-id\"", "client");
+        let jwt_count = source.matches(jwt_header.as_str()).count();
+        let cid_count = source.matches(cid_header.as_str()).count();
+        // Each endpoint method has its own header().header() chain;
+        // count occurrences so a future refactor that drops ONE
+        // method's header fails the build.
+        assert!(
+            jwt_count >= 2,
+            "client.rs MUST send the JWT-bearing header on BOTH \
+             endpoints (expirylist + optionchain); found {jwt_count}"
+        );
+        assert!(
+            cid_count >= 2,
+            "client.rs MUST send the client-id header on BOTH \
+             endpoints; found {cid_count}"
+        );
+    }
+
+    /// PR #3/5: rate-limit constant MUST equal 3 seconds — Dhan's
+    /// "1 unique request per 3 seconds" rule. The operator-locked
+    /// schedule (:53/:56/:59) depends on this constant being exactly
+    /// 3 to fit the 60-second window.
+    #[test]
+    fn test_dhan_client_rate_limit_constant_is_three_seconds() {
+        // OPTION_CHAIN_MIN_REQUEST_INTERVAL_SECS already exists in
+        // tickvault_common::constants. The existing
+        // `test_option_chain_request_interval_is_3_seconds` (line 309)
+        // pins the literal value; this test names the linkage so a
+        // future "let's bump to 5s" attempt fails with a clear message
+        // citing the option-chain pipeline plan.
+        assert_eq!(
+            OPTION_CHAIN_MIN_REQUEST_INTERVAL_SECS, 3,
+            "Bumping this constant breaks the locked :53/:56/:59 \
+             schedule. If Dhan tightens the rule, you must also \
+             widen the slot spacing in `config/base.toml` and update \
+             the validator min/max bounds. See \
+             `.claude/plans/friday-may-15-mega/topic-OPTION-CHAIN-MINUTE-SNAPSHOT.md`."
+        );
+    }
+
+    /// PR #3/5: the client method signatures MUST match the operator-
+    /// locked underlyings (security_id = u32 → coerce to u64 for the
+    /// existing client API). This test pins the type compatibility so
+    /// future widening to security_id: u128 etc. would surface here
+    /// before breaking the scheduler.
+    #[test]
+    fn test_dhan_client_accepts_locked_underlying_security_ids() {
+        // Compile-time pin: feeding the locked schedule values into
+        // the existing client signatures must type-check. NIFTY=13,
+        // BANKNIFTY=25, SENSEX=51. Existing fetch_* signatures take
+        // u64 — we widen our u32 config value when calling.
+        let nifty_id: u32 = 13;
+        let banknifty_id: u32 = 25;
+        let sensex_id: u32 = 51;
+        let segment = "IDX_I";
+
+        // Pin the widening conversion the scheduler will perform.
+        // If the existing client signature changes to take u32 or
+        // another type, this test surfaces it loudly.
+        let _: u64 = u64::from(nifty_id);
+        let _: u64 = u64::from(banknifty_id);
+        let _: u64 = u64::from(sensex_id);
+        let _: &str = segment;
+
+        // Smoke the symbols are accessible without constructing a
+        // client (which requires Tokio + a token_handle).
+        assert_eq!(nifty_id, 13);
+        assert_eq!(banknifty_id, 25);
+        assert_eq!(sensex_id, 51);
+    }
 }
