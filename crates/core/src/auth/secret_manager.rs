@@ -1084,6 +1084,29 @@ mod tests {
         );
     }
 
+    /// Option-chain pipeline PR #2/5 meta-guard: main.rs MUST include
+    /// `option_chain_minute_snapshot_persistence::ensure_option_chain_minute_snapshot_table`
+    /// in the boot-time DDL `tokio::join!`. Without the DDL, the future
+    /// runtime fetcher (PR #4 in this rollout) writes will 404 against
+    /// QuestDB ILP. See
+    /// `.claude/plans/friday-may-15-mega/topic-OPTION-CHAIN-MINUTE-SNAPSHOT.md`.
+    #[test]
+    fn test_option_chain_minute_snapshot_table_is_wired_into_boot_ddl() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable from secret_manager test working dir");
+
+        assert!(
+            main_rs.contains("ensure_option_chain_minute_snapshot_table"),
+            "main.rs MUST call \
+             `option_chain_minute_snapshot_persistence::ensure_option_chain_minute_snapshot_table` \
+             inside the boot DDL `tokio::join!`. Without this DDL the \
+             scheduled fetch task (PR #4) will hit a 404 on the QuestDB \
+             ILP `option_chain_minute_snapshot` table. See plan doc at \
+             `.claude/plans/friday-may-15-mega/topic-OPTION-CHAIN-MINUTE-SNAPSHOT.md`."
+        );
+    }
+
     /// Phase 0 Item 19f meta-guard: main.rs MUST wire the
     /// `shutdown_notify` -> heartbeat-`Notify` bridge so the
     /// `GracefulRelease` lifecycle audit row + the Valkey DEL run
