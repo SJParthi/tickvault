@@ -530,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn test_smoke_pin_pub_fn_visible() {
+    fn test_ensure_option_chain_minute_snapshot_table_pub_fn_visible() {
         // Cheap smoke that the public surface compiles. The fn is async
         // and elides a lifetime; reference-coerce it to a plain fn item
         // pointer (zero-sized) so the test catches signature changes
