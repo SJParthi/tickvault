@@ -15,4 +15,9 @@ pub mod client;
 // from Option Chain REST responses for the unified /api/movers
 // Dhan-parity OI Change calculations.
 pub mod prev_oi;
+// Option-chain minute-snapshot pipeline (PR #4a of 5, 2026-05-16) —
+// RAM cache that decouples the strategy hot path from the network
+// fetch cold path. See plan
+// `.claude/plans/friday-may-15-mega/topic-OPTION-CHAIN-MINUTE-SNAPSHOT.md`.
+pub mod snapshot_cache;
 pub mod types;
