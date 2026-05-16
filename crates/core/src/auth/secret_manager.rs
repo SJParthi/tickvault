@@ -1091,6 +1091,31 @@ mod tests {
     /// QuestDB ILP. See
     /// `.claude/plans/friday-may-15-mega/topic-OPTION-CHAIN-MINUTE-SNAPSHOT.md`.
     #[test]
+    fn test_option_chain_minute_snapshot_scheduler_is_wired_into_main() {
+        // Option-chain pipeline PR #5/5 meta-guard. main.rs MUST spawn
+        // `option_chain::snapshot_scheduler::spawn_snapshot_scheduler`
+        // when `config.option_chain_minute_snapshot.enabled == true`.
+        // Without the boot wiring, the scheduler module + cache + 4
+        // Telegram variants + 4 Prometheus counters all exist as dead
+        // code (per audit-findings Rule 13).
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        assert!(
+            main_rs.contains("spawn_snapshot_scheduler("),
+            "main.rs MUST call `option_chain::snapshot_scheduler::spawn_snapshot_scheduler` \
+             from the boot path. See plan doc \
+             `.claude/plans/friday-may-15-mega/topic-OPTION-CHAIN-MINUTE-SNAPSHOT.md` PR #5."
+        );
+        assert!(
+            main_rs.contains("validate_option_chain_schedule"),
+            "main.rs MUST call `validate_option_chain_schedule` BEFORE spawning the \
+             scheduler. Invalid TOML must HALT boot via `OptionChainConfigInvalid` \
+             Telegram, not silently run a broken schedule."
+        );
+    }
+
+    #[test]
     fn test_option_chain_minute_snapshot_table_is_wired_into_boot_ddl() {
         let main_rs = std::fs::read_to_string("../app/src/main.rs")
             .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
