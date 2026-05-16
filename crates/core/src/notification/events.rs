@@ -1218,6 +1218,30 @@ pub enum NotificationEvent {
         /// Authoritative count of Remove ops from the diff state machine.
         stats_removed: usize,
     },
+
+    /// Phase 0 Item 12 — Info-severity Telegram fired when a tick arrives
+    /// with an exchange_timestamp at or after `MARKET_CLOSE_IST_NANOS`
+    /// (15:30:00.000 IST). This SHOULD be zero — Dhan's session ends at
+    /// 15:30:00.000 exclusive — but if it happens, the operator wants
+    /// to know so they can correlate against Dhan-side ingestion lag
+    /// or our own clock skew. Edge-triggered: fires at most once per
+    /// trading day per `(security_id, exchange_segment)` to avoid spam
+    /// if Dhan ever ships a 5-minute post-close burst.
+    ///
+    /// Coalesces with the 60s Telegram bucket per
+    /// `.claude/rules/project/wave-3-error-codes.md::TELEGRAM-01`.
+    LastTickAfterBoundary {
+        /// Dhan SecurityId (string form for Telegram readability).
+        security_id: u32,
+        /// Exchange segment (NSE_EQ / NSE_FNO / IDX_I / ...).
+        exchange_segment: String,
+        /// The offending exchange timestamp, IST nanoseconds-of-day.
+        exchange_ts_nanos_of_day: i64,
+        /// Number of nanoseconds past `MARKET_CLOSE_IST_NANOS`. Always
+        /// positive; > 0 by definition (the variant only fires when
+        /// `exchange_ts >= MARKET_CLOSE_IST_NANOS`).
+        nanos_past_close: i64,
+    },
 }
 
 /// One symbol-level entry inside [`NotificationEvent::DepthDynamicV2DiffApplied`].
@@ -2610,6 +2634,20 @@ impl NotificationEvent {
                 }
                 joined
             }
+            Self::LastTickAfterBoundary {
+                security_id,
+                exchange_segment,
+                exchange_ts_nanos_of_day,
+                nanos_past_close,
+            } => format!(
+                "<b>Tick arrived after 15:30 close</b>\n\
+                 security_id: <code>{security_id}</code>\n\
+                 segment: <code>{exchange_segment}</code>\n\
+                 exchange_ts_nanos_of_day: <code>{exchange_ts_nanos_of_day}</code>\n\
+                 nanos past close: <code>{nanos_past_close}</code>\n\
+                 (informational — should be zero; correlates Dhan-side \
+                 ingestion lag or local clock skew)"
+            ),
         }
     }
 
@@ -2719,6 +2757,7 @@ impl NotificationEvent {
             Self::Depth20DynamicSwapChannelBroken { .. } => "Depth20DynamicSwapChannelBroken",
             Self::Depth20DynamicSwapApplied { .. } => "Depth20DynamicSwapApplied",
             Self::DepthDynamicV2DiffApplied { .. } => "DepthDynamicV2DiffApplied",
+            Self::LastTickAfterBoundary { .. } => "LastTickAfterBoundary",
         }
     }
 
@@ -2872,6 +2911,7 @@ impl NotificationEvent {
             Self::Depth20DynamicSwapChannelBroken { .. } => Severity::Critical,
             Self::Depth20DynamicSwapApplied { .. } => Severity::Low,
             Self::DepthDynamicV2DiffApplied { .. } => Severity::Low,
+            Self::LastTickAfterBoundary { .. } => Severity::Info,
         }
     }
 
