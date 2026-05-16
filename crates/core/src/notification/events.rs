@@ -1242,6 +1242,71 @@ pub enum NotificationEvent {
         /// `exchange_ts >= MARKET_CLOSE_IST_NANOS`).
         nanos_past_close: i64,
     },
+
+    /// Option-chain minute-snapshot pipeline (PR #4a 2026-05-16) —
+    /// first failure of a scheduled slot per minute. Edge-triggered:
+    /// fires ONCE per `(underlying, minute)` to prevent storms when
+    /// Dhan has a sustained outage. Severity::High pages the operator
+    /// because BRUTEX strike-selection degrades to the RAM cache.
+    ///
+    /// See plan doc
+    /// `.claude/plans/friday-may-15-mega/topic-OPTION-CHAIN-MINUTE-SNAPSHOT.md` §7.
+    OptionChainFetchFailed {
+        /// Operator-visible label (e.g. "SENSEX", "NIFTY"). Matches
+        /// `OptionChainUnderlyingEntry::symbol` from config.
+        underlying: String,
+        /// Number of attempts made within this minute's retry budget
+        /// (`fetch_retry_max_attempts` from config — default 2).
+        attempts_made: u32,
+        /// Truncated reason string. ILP-safe via sanitize_audit_string
+        /// at the persistence site; this field is operator-readable
+        /// (e.g. "DH-904 rate limit", "timeout 10s", "5xx server").
+        reason: String,
+    },
+
+    /// Option-chain minute-snapshot pipeline (PR #4a) — strategy read
+    /// the RAM cache instead of a fresh fetch. Severity::Medium —
+    /// informational; the strategy IS still making decisions, but on
+    /// data 60+ seconds old. Operator should investigate sustained
+    /// occurrence (> 3/min indicates Dhan-side problem).
+    OptionChainCacheFallback {
+        /// Which underlying's cache was read.
+        underlying: String,
+        /// How old the cache was at read time, in whole seconds.
+        cache_age_secs: u32,
+    },
+
+    /// Option-chain minute-snapshot pipeline (PR #4a) — cache age
+    /// exceeded the hard-halt threshold (`cache_max_stale_secs` —
+    /// default 300 = 5 min). Strategy refuses new entries until the
+    /// cache refreshes. Severity::Critical — pages the operator
+    /// immediately because real money may be on the table.
+    ///
+    /// Existing positions are held; only NEW entries are blocked.
+    /// Operator decides go/no-go per `docs/runbooks/kill-switch.md`.
+    OptionChainStaleHalt {
+        /// Which underlying's cache went stale.
+        underlying: String,
+        /// Actual cache age at the moment of halt detection.
+        cache_age_secs: u32,
+        /// Configured threshold the cache crossed
+        /// (`cache_max_stale_secs`).
+        threshold_secs: u32,
+    },
+
+    /// Option-chain minute-snapshot pipeline (PR #4a) — boot-time
+    /// validator REJECTED the operator's `[option_chain_minute_snapshot]`
+    /// TOML config. App HALTS — strategy would otherwise run blind
+    /// on the wrong underlyings or with the wrong schedule.
+    ///
+    /// The `reason` field carries the `Display` impl of `ScheduleError`
+    /// from `option_chain_schedule.rs` (always names the offending
+    /// TOML section + line). Severity::Critical.
+    OptionChainConfigInvalid {
+        /// Display-formatted `ScheduleError` — actionable by operator
+        /// to fix the TOML directly.
+        reason: String,
+    },
 }
 
 /// One symbol-level entry inside [`NotificationEvent::DepthDynamicV2DiffApplied`].
@@ -2648,6 +2713,46 @@ impl NotificationEvent {
                  (informational — should be zero; correlates Dhan-side \
                  ingestion lag or local clock skew)"
             ),
+            Self::OptionChainFetchFailed {
+                underlying,
+                attempts_made,
+                reason,
+            } => format!(
+                "<b>Option-chain fetch FAILED</b>\n\
+                 underlying: <code>{underlying}</code>\n\
+                 attempts: <code>{attempts_made}</code>\n\
+                 reason: <code>{reason}</code>\n\
+                 Strategy reading RAM cache fallback. \
+                 Investigate Dhan-side if sustained > 3min."
+            ),
+            Self::OptionChainCacheFallback {
+                underlying,
+                cache_age_secs,
+            } => format!(
+                "<b>Option-chain cache fallback</b>\n\
+                 underlying: <code>{underlying}</code>\n\
+                 cache age: <code>{cache_age_secs}s</code>\n\
+                 (informational — strategy still trading on cached chain)"
+            ),
+            Self::OptionChainStaleHalt {
+                underlying,
+                cache_age_secs,
+                threshold_secs,
+            } => format!(
+                "<b>🆘 Option-chain STRATEGY HALTED</b>\n\
+                 underlying: <code>{underlying}</code>\n\
+                 cache age: <code>{cache_age_secs}s</code>\n\
+                 threshold: <code>{threshold_secs}s</code>\n\
+                 NEW entries blocked. Existing positions held. \
+                 Operator action: investigate Dhan-side; \
+                 decide go/no-go per kill-switch runbook."
+            ),
+            Self::OptionChainConfigInvalid { reason } => format!(
+                "<b>🆘 Option-chain CONFIG INVALID — BOOT HALTED</b>\n\
+                 {reason}\n\
+                 Fix `[option_chain_minute_snapshot]` in config/base.toml \
+                 + restart."
+            ),
         }
     }
 
@@ -2758,6 +2863,10 @@ impl NotificationEvent {
             Self::Depth20DynamicSwapApplied { .. } => "Depth20DynamicSwapApplied",
             Self::DepthDynamicV2DiffApplied { .. } => "DepthDynamicV2DiffApplied",
             Self::LastTickAfterBoundary { .. } => "LastTickAfterBoundary",
+            Self::OptionChainFetchFailed { .. } => "OptionChainFetchFailed",
+            Self::OptionChainCacheFallback { .. } => "OptionChainCacheFallback",
+            Self::OptionChainStaleHalt { .. } => "OptionChainStaleHalt",
+            Self::OptionChainConfigInvalid { .. } => "OptionChainConfigInvalid",
         }
     }
 
@@ -2912,6 +3021,10 @@ impl NotificationEvent {
             Self::Depth20DynamicSwapApplied { .. } => Severity::Low,
             Self::DepthDynamicV2DiffApplied { .. } => Severity::Low,
             Self::LastTickAfterBoundary { .. } => Severity::Info,
+            Self::OptionChainFetchFailed { .. } => Severity::High,
+            Self::OptionChainCacheFallback { .. } => Severity::Medium,
+            Self::OptionChainStaleHalt { .. } => Severity::Critical,
+            Self::OptionChainConfigInvalid { .. } => Severity::Critical,
         }
     }
 
