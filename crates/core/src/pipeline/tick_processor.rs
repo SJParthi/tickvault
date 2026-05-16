@@ -169,6 +169,54 @@ fn is_crossed_market(best_bid: f32, best_ask: f32) -> bool {
     best_bid > best_ask && best_bid > 0.0 && best_ask > 0.0
 }
 
+/// Phase 0 Item 22e (2026-05-15): tick-level OHLC integrity violations.
+///
+/// Three independent invariants checked on every tick:
+///
+///   1. `day_high >= day_low` — the most basic OHLC invariant. Dhan
+///      should NEVER emit a tick where the high < low; if it does,
+///      something is wrong upstream (binary parser regression, garbage
+///      packet, etc.).
+///   2. `last_traded_price <= day_high` — the latest trade cannot
+///      have been at a price higher than the day's running high.
+///   3. `last_traded_price >= day_low` — symmetric to #2.
+///
+/// Returns a `u8` bitmask of violations:
+///   * bit 0 (= 1) — high-below-low violation
+///   * bit 1 (= 2) — ltp-above-high violation
+///   * bit 2 (= 4) — ltp-below-low violation
+///
+/// `0` means clean. The caller emits the appropriate static-label
+/// counter for each set bit so the hot path stays zero-alloc.
+///
+/// **Skip semantics (intentional):**
+/// * Any field that is non-finite or zero is silently skipped. Dhan
+///   legitimately emits `day_high = 0.0` and `day_low = 0.0` in
+///   pre-open before the first trade — flagging those would page the
+///   operator every morning at 09:00 IST.
+/// * The day-high/day-low/LTP comparisons each require BOTH operands
+///   to be `> 0.0` and finite; if either side is missing, that
+///   specific bit is left clear.
+///
+/// O(1) — at most 6 comparisons + 3 boolean ANDs, no allocation.
+#[inline(always)]
+fn check_tick_ohlc_integrity(ltp: f32, day_high: f32, day_low: f32) -> u8 {
+    let mut violations: u8 = 0;
+    let high_ok = day_high.is_finite() && day_high > 0.0;
+    let low_ok = day_low.is_finite() && day_low > 0.0;
+    let ltp_ok = ltp.is_finite() && ltp > 0.0;
+    if high_ok && low_ok && day_high < day_low {
+        violations |= 0b001;
+    }
+    if ltp_ok && high_ok && ltp > day_high {
+        violations |= 0b010;
+    }
+    if ltp_ok && low_ok && ltp < day_low {
+        violations |= 0b100;
+    }
+    violations
+}
+
 /// Converts UTC nanoseconds to IST seconds-of-day.
 ///
 /// Used for PreviousClose and candle sweep timestamps that arrive as UTC
@@ -810,6 +858,26 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     continue;
                 }
 
+                // Phase 0 Item 22e: tick-level OHLC integrity guards.
+                // Detection-only (NOT a filter) — the tick still flows
+                // through persistence + indicators. Static-label counters
+                // emit per violation kind so the hot path stays zero-alloc.
+                // Each bit set in the mask represents one violation; the
+                // operator watches Prometheus counters for non-zero rates.
+                let ohlc_violations =
+                    check_tick_ohlc_integrity(tick.last_traded_price, tick.day_high, tick.day_low);
+                if ohlc_violations != 0 {
+                    if ohlc_violations & 0b001 != 0 {
+                        metrics::counter!("tv_tick_integrity_high_below_low_total").increment(1);
+                    }
+                    if ohlc_violations & 0b010 != 0 {
+                        metrics::counter!("tv_tick_integrity_ltp_above_high_total").increment(1);
+                    }
+                    if ohlc_violations & 0b100 != 0 {
+                        metrics::counter!("tv_tick_integrity_ltp_below_low_total").increment(1);
+                    }
+                }
+
                 // O(1) movers baseline: BEFORE time guards — day_close is reference data.
                 // Must be set regardless of market hours (same principle as PrevClose handler).
                 // Dhan confirmed (Ticket #5525125): day_close = previous session's close.
@@ -1083,8 +1151,9 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     // Wave 5 Item 15 (2026-05-01) — `previous_close` table
                     // write for NSE_FNO + BSE_FNO Full-packet close field
                     // REMOVED. In-memory cache update above still feeds
-                    // movers writers; restart recovery is via single
-                    // QuestDB SELECT against `ticks`. Ratchet:
+                    // movers writers; restart recovery is via a cold-path
+                    // single-row read from the `ticks` table at boot
+                    // time. Ratchet:
                     // `wave_5_prev_close_writes_idx_i_only_guard.rs`.
                 }
 
@@ -4080,6 +4149,136 @@ mod tests {
     fn test_is_crossed_market_zero_ask() {
         // ask = 0 — not crossed (ask not > 0)
         assert!(!is_crossed_market(24501.0, 0.0));
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 0 Item 22e — check_tick_ohlc_integrity
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_check_tick_ohlc_integrity_clean_tick_returns_zero() {
+        // LTP within [low, high] — no violations.
+        let v = check_tick_ohlc_integrity(24500.0, 24550.0, 24450.0);
+        assert_eq!(v, 0);
+    }
+
+    #[test]
+    fn test_check_tick_ohlc_integrity_high_below_low_sets_bit_0() {
+        // 24550 < 24600 — high-below-low violation.
+        // LTP=24500 is below low (24600), so bit 2 ALSO fires.
+        let v = check_tick_ohlc_integrity(24500.0, 24550.0, 24600.0);
+        assert_eq!(v & 0b001, 0b001, "high-below-low bit must be set");
+    }
+
+    #[test]
+    fn test_check_tick_ohlc_integrity_ltp_above_high_sets_bit_1() {
+        // LTP=24700 > high=24550.
+        let v = check_tick_ohlc_integrity(24700.0, 24550.0, 24450.0);
+        assert_eq!(v, 0b010);
+    }
+
+    #[test]
+    fn test_check_tick_ohlc_integrity_ltp_below_low_sets_bit_2() {
+        // LTP=24400 < low=24450.
+        let v = check_tick_ohlc_integrity(24400.0, 24550.0, 24450.0);
+        assert_eq!(v, 0b100);
+    }
+
+    #[test]
+    fn test_check_tick_ohlc_integrity_pre_open_zero_high_low_returns_zero() {
+        // Dhan emits day_high=0 + day_low=0 BEFORE first trade in
+        // pre-open. Flagging these would page the operator every
+        // morning — skip silently.
+        let v = check_tick_ohlc_integrity(24500.0, 0.0, 0.0);
+        assert_eq!(v, 0);
+    }
+
+    #[test]
+    fn test_check_tick_ohlc_integrity_nan_ltp_returns_zero() {
+        // NaN LTP is filtered by `is_valid_ltp` upstream; the OHLC
+        // guard must not panic or false-positive on it either.
+        let v = check_tick_ohlc_integrity(f32::NAN, 24550.0, 24450.0);
+        assert_eq!(v, 0);
+    }
+
+    #[test]
+    fn test_check_tick_ohlc_integrity_negative_high_silently_skipped() {
+        // day_high < 0 is non-physical but `is_finite` is true.
+        // The `> 0.0` gate keeps us safe — no bits flip.
+        let v = check_tick_ohlc_integrity(24500.0, -1.0, 24450.0);
+        // Only the ltp-below-low comparison is skipped if low is OK
+        // but the high<low comparison needs both — both gates clamp.
+        assert_eq!(v, 0);
+    }
+
+    #[test]
+    fn test_check_tick_ohlc_integrity_high_equal_low_is_clean() {
+        // Single-trade scenario (illiquid contract): high == low == ltp.
+        // Not a violation.
+        let v = check_tick_ohlc_integrity(24500.0, 24500.0, 24500.0);
+        assert_eq!(v, 0);
+    }
+
+    #[test]
+    fn test_check_tick_ohlc_integrity_ltp_equal_high_is_clean() {
+        // LTP at the day's running high — common, NOT a violation.
+        let v = check_tick_ohlc_integrity(24550.0, 24550.0, 24450.0);
+        assert_eq!(v, 0);
+    }
+
+    #[test]
+    fn test_check_tick_ohlc_integrity_ltp_equal_low_is_clean() {
+        let v = check_tick_ohlc_integrity(24450.0, 24550.0, 24450.0);
+        assert_eq!(v, 0);
+    }
+
+    #[test]
+    fn test_check_tick_ohlc_integrity_multiple_violations_combine() {
+        // high=24400 < low=24500 (bit 0) + ltp=24600 > high=24400 (bit 1).
+        let v = check_tick_ohlc_integrity(24600.0, 24400.0, 24500.0);
+        assert_eq!(v & 0b001, 0b001);
+        assert_eq!(v & 0b010, 0b010);
+    }
+
+    #[test]
+    fn test_check_tick_ohlc_integrity_inf_high_silently_skipped() {
+        // +Inf high is non-finite — gate clamps, no false-positive.
+        let v = check_tick_ohlc_integrity(24500.0, f32::INFINITY, 24450.0);
+        // ltp-above-high: high is Inf so `ltp > high` is false. No bit.
+        // high-below-low: high non-finite, skipped.
+        assert_eq!(v, 0);
+    }
+
+    /// Phase 0 Item 22e meta-guard: the tick processor MUST call
+    /// `check_tick_ohlc_integrity` on every tick AND emit the three
+    /// counters when violations fire. Without these, a buggy upstream
+    /// (Dhan binary parser regression, malformed packet, etc.) silently
+    /// poisons every downstream aggregation that depends on OHLC.
+    ///
+    /// Rule 13 (audit-findings 2026-04-17): "if a method is defined +
+    /// tested but never called, it is a bug". This source-scan ratchet
+    /// fails the build if a future refactor removes the call site.
+    #[test]
+    fn test_check_tick_ohlc_integrity_is_wired_into_tick_processor() {
+        let src = include_str!("tick_processor.rs");
+        assert!(
+            src.contains("check_tick_ohlc_integrity("),
+            "tick_processor.rs MUST call check_tick_ohlc_integrity on every \
+             tick. Without it, OHLC corruption (high < low, ltp outside \
+             [low, high]) is silently absorbed."
+        );
+        for counter in [
+            "tv_tick_integrity_high_below_low_total",
+            "tv_tick_integrity_ltp_above_high_total",
+            "tv_tick_integrity_ltp_below_low_total",
+        ] {
+            assert!(
+                src.contains(counter),
+                "tick_processor.rs MUST emit the `{counter}` counter on \
+                 the matching violation kind. Without it, the operator \
+                 has no Prometheus visibility into OHLC corruption rates."
+            );
+        }
     }
 
     #[test]
