@@ -13,15 +13,12 @@ Wire the gap-fill scheduler task that consumes the existing pure-function planne
 ## Plan Items
 
 - [ ] **Item 1** — Add 6 constants to `crates/common/src/constants.rs`
-  - **REVISED post-agent-10**: buffer bumped 5→10s to absorb BOOT-03 ±2s clock skew envelope
-  - `GAP_FILL_POST_SEAL_BUFFER_SECS: u32 = 10` (was 5; 5s seal lag + 2s clock skew + 3s safety = 10s)
-  - `GAP_FILL_FETCH_TIMEOUT_SECS: u64 = 30`
-  - `GAP_FILL_MAX_CONCURRENT_FETCHES: usize = 5`
-  - `GAP_FILL_RETRY_ATTEMPTS: u32 = 3`
-  - `GAP_FILL_RETRY_BACKOFF_SECS: [u64; 3] = [2, 5, 10]` (generic 5xx)
-  - `GAP_FILL_DH904_BACKOFF_SECS: [u64; 4] = [10, 20, 40, 80]` (rate-limit specific per `compute_dh904_backoff`)
-  - `GAP_FILL_SCHEDULER_HEARTBEAT_SECS: u64 = 60` (positive liveness signal per Rule 11)
-  - Tests: constants pinned + `test_buffer_envelope_covers_boot03_clock_skew`
+  - **REVISED**: 6 of 7 base constants already exist. Buffer stays 5s (changing breaks Phase 0 LOCKED §7 doc + 6 existing tests). Agent-10 concern addressed via enhanced doc comment citing BOOT-03 relationship.
+  - EXISTING: `GAP_FILL_POST_SEAL_BUFFER_SECS=5`, `GAP_FILL_FETCH_TIMEOUT_SECS=30`, `GAP_FILL_MAX_CONCURRENT_FETCHES=5`, `GAP_FILL_RETRY_ATTEMPTS=3`, `GAP_FILL_RETRY_BACKOFF_SECS=[2,5,10]`, `GAP_FILL_ONE_MINUTE_SECS=60`
+  - NEW: `GAP_FILL_DH904_BACKOFF_SECS: &[u64] = &[10, 20, 40, 80]` (rate-limit specific per `compute_dh904_backoff`)
+  - NEW: `GAP_FILL_SCHEDULER_HEARTBEAT_SECS: u64 = 60` (positive liveness signal per Rule 11)
+  - DOC: enhance `GAP_FILL_POST_SEAL_BUFFER_SECS` doc with explicit BOOT-03 ±2s envelope mention
+  - Tests: 2 new pinned + 1 ratchet verifying DH-904 ladder matches `api-introduction.md` rule 8
 
 - [ ] **Item 2** — Add 4 ErrorCode variants to `crates/common/src/error_code.rs`
   - `GapFill01SchedulerFailed` — Severity::Critical (scheduler task panicked / supervisor caught)

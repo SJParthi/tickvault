@@ -444,6 +444,31 @@ pub enum ErrorCode {
     /// the other instance shuts down (or its 90 s TTL expires after
     /// a hard crash). Severity::Critical.
     Resilience01DualInstanceDetected,
+    /// GAP-FILL-01: gap-fill scheduler supervisor task caught a panic
+    /// in the inner scheduler loop or the broadcast channel closed
+    /// unexpectedly. Severity::Critical — the bounded-zero-loss
+    /// envelope is breached until the supervisor re-spawns the inner
+    /// task. Post-market `cross_verify.rs` is the L3 safety net.
+    GapFill01SchedulerFailed,
+    /// GAP-FILL-02: a per-bar Dhan REST `/v2/charts/intraday` fetch
+    /// failed after exhausting `GAP_FILL_RETRY_ATTEMPTS` (3 generic
+    /// retries) or the DH-904 backoff ladder (4 attempts: 10/20/40/80s).
+    /// The bar's audit row is written with `result=failed` and the
+    /// operator decides whether to backfill manually. Severity::High.
+    GapFill02RestFetchFailed,
+    /// GAP-FILL-03: a per-bar fetch succeeded but the QuestDB UPSERT
+    /// into `candles_1m` failed. The audit row already reflects the
+    /// REST success — operator must reconcile manually OR rely on
+    /// post-market cross-verify. Severity::High.
+    GapFill03UpsertFailed,
+    /// GAP-FILL-04: the gap-fill scheduler's broadcast receiver lagged
+    /// behind and `tokio::sync::broadcast::Receiver::recv()` returned
+    /// `Err(Lagged(n))` — meaning `n` disconnect-resolved events were
+    /// dropped silently before the scheduler could observe them.
+    /// Severity::Critical — n bars may have been missed entirely.
+    /// The scheduler runs a full reconciliation pass (SELECT on
+    /// `candles_1m` over the suspected window) before continuing.
+    GapFill04EventChannelLagged,
 }
 
 impl ErrorCode {
@@ -577,6 +602,11 @@ impl ErrorCode {
             Self::Boundary01CatchupSeal => "BOUNDARY-01",
             Self::AggregatorAudit01WriteFailed => "AGGREGATOR-AUDIT-01",
             Self::Resilience01DualInstanceDetected => "RESILIENCE-01",
+            // Phase 0 Items 8+9 — gap-fill scheduler
+            Self::GapFill01SchedulerFailed => "GAP-FILL-01",
+            Self::GapFill02RestFetchFailed => "GAP-FILL-02",
+            Self::GapFill03UpsertFailed => "GAP-FILL-03",
+            Self::GapFill04EventChannelLagged => "GAP-FILL-04",
         }
     }
 
@@ -605,7 +635,9 @@ impl ErrorCode {
             | Self::Depth200Smoke01NoFramesAtBoot
             | Self::Phase2Ready01PreflightFailed
             | Self::AggregatorDrop01
-            | Self::Resilience01DualInstanceDetected => Severity::Critical,
+            | Self::Resilience01DualInstanceDetected
+            | Self::GapFill01SchedulerFailed
+            | Self::GapFill04EventChannelLagged => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
             Self::Selftest01Passed | Self::Slo01Healthy | Self::AggregatorHb01Heartbeat => {
                 Severity::Info
@@ -631,7 +663,9 @@ impl ErrorCode {
             | Self::Depth20Dyn03TopGainersEmpty
             | Self::Depth200Dyn01TopGainersEmpty
             | Self::Volume01MonotonicityBreach
-            | Self::AggregatorLate01 => Severity::High,
+            | Self::AggregatorLate01
+            | Self::GapFill02RestFetchFailed
+            | Self::GapFill03UpsertFailed => Severity::High,
             // Medium: data pipeline correctness
             Self::InstrumentP0DuplicateSecurityId
             | Self::InstrumentP0CountConsistency
@@ -805,6 +839,12 @@ impl ErrorCode {
             | Self::Boundary01CatchupSeal
             | Self::AggregatorAudit01WriteFailed => ".claude/rules/project/wave-6-error-codes.md",
             Self::Resilience01DualInstanceDetected => ".claude/rules/project/wave-4-error-codes.md",
+            Self::GapFill01SchedulerFailed
+            | Self::GapFill02RestFetchFailed
+            | Self::GapFill03UpsertFailed
+            | Self::GapFill04EventChannelLagged => {
+                ".claude/rules/project/phase-0-gap-fill-error-codes.md"
+            }
         }
     }
 
@@ -929,6 +969,11 @@ impl ErrorCode {
             Self::AggregatorAudit01WriteFailed,
             // Wave 4 — Item 19 dual-instance lock
             Self::Resilience01DualInstanceDetected,
+            // Phase 0 Items 8+9 — gap-fill scheduler
+            Self::GapFill01SchedulerFailed,
+            Self::GapFill02RestFetchFailed,
+            Self::GapFill03UpsertFailed,
+            Self::GapFill04EventChannelLagged,
         ]
     }
 }
@@ -1127,7 +1172,9 @@ mod tests {
         // 93 -> 99 for AGGREGATOR-DROP-01, AGGREGATOR-LATE-01,
         // AGGREGATOR-SEAL-01, AGGREGATOR-HB-01, BOUNDARY-01,
         // AGGREGATOR-AUDIT-01.
-        assert_eq!(ErrorCode::all().len(), 100);
+        // 2026-05-17 (Phase 0 Items 8+9 — gap-fill scheduler): bumped
+        // 100 -> 104 for GAP-FILL-01/02/03/04.
+        assert_eq!(ErrorCode::all().len(), 104);
     }
 
     #[test]

@@ -2264,8 +2264,17 @@ pub const CLOCK_SKEW_HALT_THRESHOLD_SECS: f64 = 2.0;
 // them against silent drift.
 
 /// Mandatory wait between bar_end (e.g. 09:34:00 IST for the 09:33 bar)
-/// and the earliest legal Dhan REST fetch for that bar. 5 seconds = 1
-/// poll cycle + ~2s ingestion lag + clock-skew safety.
+/// and the earliest legal Dhan REST fetch for that bar.
+///
+/// Budget breakdown (5 seconds total):
+///   * ~2s Dhan-side ingestion lag (server consolidates ticks into sealed bar)
+///   * ~2s wall-clock skew envelope (BOOT-03 halts boot if skew >= 2s,
+///     so runtime skew is provably bounded; reference:
+///     `.claude/rules/project/wave-2-c-error-codes.md::BOOT-03`)
+///   * ~1s round-trip + safety margin
+///
+/// Asking earlier risks a half-cooked bar response that would
+/// DEDUP UPSERT-overwrite the (correct) live-aggregated candle.
 pub const GAP_FILL_POST_SEAL_BUFFER_SECS: u64 = 5;
 
 /// HTTP timeout for a single Dhan `/v2/charts/intraday` REST call.
@@ -2295,6 +2304,32 @@ pub const GAP_FILL_RETRY_BACKOFF_SECS: &[u64] = &[2, 5, 10];
 /// "1m bar specifically" constant — just the universal 60s/min that
 /// belongs alongside the other gap-fill math constants for clarity.)
 pub const GAP_FILL_ONE_MINUTE_SECS: u64 = 60;
+
+/// Phase 0 Item 8 (scheduler) — DH-904 (Dhan rate-limit) specific
+/// backoff ladder. Distinct from `GAP_FILL_RETRY_BACKOFF_SECS` (which
+/// covers generic 5xx) because DH-904 means "we exceeded the per-second
+/// or per-day budget" and a tighter retry would just compound the
+/// violation. Mirrors `compute_dh904_backoff` per
+/// `.claude/rules/dhan/api-introduction.md` rule 8.
+///
+/// Total worst-case wait between first 904 and final give-up:
+/// 10 + 20 + 40 + 80 = 150 seconds. After the 4th 904 the per-bar
+/// task records `failed` in `gap_fill_audit` and emits a Critical
+/// Telegram so the operator can investigate the rate-limit budget.
+pub const GAP_FILL_DH904_BACKOFF_SECS: &[u64] = &[10, 20, 40, 80];
+
+/// Phase 0 Item 8 (scheduler) — interval between positive-liveness
+/// heartbeats emitted by the gap-fill scheduler supervisor task.
+///
+/// Audit-findings Rule 11 ("no false-OK signals") requires every
+/// long-running task to emit a positive progress signal that downstream
+/// monitoring can stale-out on. The scheduler increments
+/// `tv_gap_fill_scheduler_heartbeat_total` every
+/// `GAP_FILL_SCHEDULER_HEARTBEAT_SECS`. A Prometheus alert fires when
+/// `increase(tv_gap_fill_scheduler_heartbeat_total[3m]) == 0` —
+/// meaning the supervisor task died silently (no heartbeat for 3
+/// consecutive 60s windows).
+pub const GAP_FILL_SCHEDULER_HEARTBEAT_SECS: u64 = 60;
 
 // Compile-time consistency: backoff array length must equal the retry
 // attempt count (otherwise we'd index past the array or leave attempts
@@ -3213,6 +3248,38 @@ mod tests {
             GAP_FILL_RETRY_BACKOFF_SECS.len(),
             GAP_FILL_RETRY_ATTEMPTS as usize,
         );
+    }
+
+    #[test]
+    fn test_gap_fill_dh904_backoff_secs_pinned_at_10_20_40_80() {
+        // Mirrors the rate-limit recovery ladder from
+        // `.claude/rules/dhan/api-introduction.md` rule 8 and
+        // `compute_dh904_backoff`. Changing these values requires
+        // re-validating against Dhan's posted backoff guidance.
+        assert_eq!(GAP_FILL_DH904_BACKOFF_SECS, &[10, 20, 40, 80]);
+    }
+
+    #[test]
+    fn test_gap_fill_dh904_backoff_secs_monotonically_increasing() {
+        // Exponential ladder: each step >= 2x the previous step.
+        // Violating this would defeat the back-off intent.
+        for pair in GAP_FILL_DH904_BACKOFF_SECS.windows(2) {
+            assert!(
+                pair[1] >= pair[0] * 2,
+                "DH-904 backoff must be exponential: {} -> {}",
+                pair[0],
+                pair[1],
+            );
+        }
+    }
+
+    #[test]
+    fn test_gap_fill_scheduler_heartbeat_secs_pinned_at_60() {
+        // 60s is the standard observability cadence — every Prom
+        // alert query uses `increase(...[3m])` (3 × heartbeat-interval)
+        // as the stale threshold. Changing this requires updating the
+        // alert rule's [3m] window.
+        assert_eq!(GAP_FILL_SCHEDULER_HEARTBEAT_SECS, 60);
     }
 
     #[test]
