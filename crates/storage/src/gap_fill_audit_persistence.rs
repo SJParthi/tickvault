@@ -27,9 +27,10 @@
 use std::time::Duration;
 
 use reqwest::Client;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use tickvault_common::config::QuestDbConfig;
+use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::sanitize_audit_string;
 
 pub const QUESTDB_TABLE_GAP_FILL_AUDIT: &str = "gap_fill_audit";
@@ -84,7 +85,13 @@ pub async fn ensure_gap_fill_audit_table(questdb_config: &QuestDbConfig) {
             info!(table = QUESTDB_TABLE_GAP_FILL_AUDIT, "audit table ready");
         }
         Ok(resp) => {
-            warn!(
+            // Security agent MEDIUM #1 (2026-05-17): upgrade warn!→error! +
+            // attach ErrorCode. A failed `ensure_*_table` means EVERY
+            // subsequent `append_gap_fill_audit_row` call silently fails
+            // → audit-table availability is at stake → must route to
+            // Telegram via Loki per error_level_meta_guard.rs Rule 5.
+            error!(
+                code = ErrorCode::GapFill03UpsertFailed.code_str(),
                 table = QUESTDB_TABLE_GAP_FILL_AUDIT,
                 status = %resp.status(),
                 "DDL non-2xx"
@@ -92,6 +99,7 @@ pub async fn ensure_gap_fill_audit_table(questdb_config: &QuestDbConfig) {
         }
         Err(err) => {
             error!(
+                code = ErrorCode::GapFill03UpsertFailed.code_str(),
                 table = QUESTDB_TABLE_GAP_FILL_AUDIT,
                 ?err,
                 "DDL request failed"
@@ -159,8 +167,21 @@ pub async fn append_gap_fill_audit_row(
         .await?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("gap_fill audit insert non-2xx ({status}): {body}");
+        // Security agent MEDIUM #2 (2026-05-17): cap response body at
+        // 200 chars before embedding in the error message. QuestDB's
+        // /exec endpoint can echo the offending SQL string in some
+        // error responses; an uncapped body would propagate the full
+        // SQL up the call stack and into a tracing span or Telegram
+        // body. Truncate to a safe prefix for operator visibility.
+        const MAX_BODY_CHARS: usize = 200;
+        let body_raw = resp.text().await.unwrap_or_default();
+        let body: String = body_raw.chars().take(MAX_BODY_CHARS).collect();
+        let suffix = if body_raw.chars().count() > MAX_BODY_CHARS {
+            "...(truncated)"
+        } else {
+            ""
+        };
+        anyhow::bail!("gap_fill audit insert non-2xx ({status}): {body}{suffix}");
     }
     Ok(())
 }
