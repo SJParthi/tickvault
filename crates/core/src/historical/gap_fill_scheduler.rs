@@ -81,6 +81,7 @@ use crate::websocket::disconnect_event::DisconnectResolvedEvent;
 /// Returns when `shutdown_notify.notify_waiters()` fires AND the task
 /// is parked on `shutdown.notified()` (per Rule 16). Both conditions
 /// hold because the `tokio::select!` arm parks on every iteration.
+// TEST-EXEMPT: lifecycle covered by `test_scheduler_returns_on_shutdown_signal`, `test_scheduler_exits_on_channel_close`, `test_scheduler_processes_event_then_returns_on_shutdown` in this module
 pub async fn run_gap_fill_scheduler(
     mut disconnect_rx: broadcast::Receiver<DisconnectResolvedEvent>,
     shutdown_notify: Arc<Notify>,

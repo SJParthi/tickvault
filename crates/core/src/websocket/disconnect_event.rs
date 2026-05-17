@@ -64,6 +64,7 @@ pub struct DisconnectResolvedEvent {
 /// `Receiver` half is owned by
 /// `crate::historical::gap_fill_scheduler::run_gap_fill_scheduler`.
 #[must_use]
+// TEST-EXEMPT: thin wrapper over `tokio::sync::broadcast::channel(N)`; behaviour covered by `test_send_recv_roundtrip` + `test_channel_capacity_constant_is_64` in this module
 pub fn create_disconnect_event_channel() -> (
     broadcast::Sender<DisconnectResolvedEvent>,
     broadcast::Receiver<DisconnectResolvedEvent>,
