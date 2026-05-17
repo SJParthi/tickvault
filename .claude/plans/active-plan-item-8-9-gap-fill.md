@@ -682,6 +682,55 @@ Introduces `LastSeenLttCache` — a lock-free `Arc<papaya::HashMap<(u32, u8), i6
 
 - `GapFill04EventChannelLagged` reconciliation SELECT pass + audit row
 
+## PR-D9 Status — THIS PR (final — Lagged catchup audit + Telegram)
+
+### What PR-D9 ships
+
+Wires the `Err(RecvError::Lagged(dropped))` arm of the broadcast
+receiver to:
+1. Emit a `gap_fill_audit` row with `trigger_event = scheduler_catchup` carrying `(dropped_event_count, lagged_window_ms)` for SEBI reconstruction.
+2. Fire the previously-defined `NotificationEvent::GapFillEventChannelLagged` (Severity::Critical) so the operator is paged.
+
+Closes the Phase 0 Items 8+9 gap-fill series.
+
+| Item | Detail |
+|---|---|
+| `last_successful_event_at: Instant` | Tracked in scheduler loop; refreshed on every Ok(event) |
+| Audit row on Lagged | Spawned via `tokio::spawn` — best-effort, doesn't block scheduler. `bar_minute = "scheduler-catchup"` (sentinel), `sids_requested = sids_failed = dropped_event_count`, `duration_ms = lagged_window_ms`, `result = RESULT_FAILED` |
+| Telegram event | `GapFillEventChannelLagged { dropped_event_count }` — previously defined + tested but never emitted (Rule 13 violation); now wired |
+| Error log | Updated to include `lagged_window_ms` field + PR-D9 marker |
+
+### Architectural decision (locked)
+
+| # | Decision | Why |
+|---|---|---|
+| 1 | **Audit + Telegram only, no synthetic dispatch** | Per-conn info is lost in `Lagged(n)`; without knowing which conns dropped we can't reconstruct the eligible SID set. Operator-readable audit row + Critical Telegram + magnitude in payload is enough for SEBI reconstruction + manual cross-verify decision. Synthetic dispatch with global fan-out would risk DH-904 storm and isn't a clean vertical slice. |
+
+### Ratchet tests added (3)
+
+- `test_trigger_event_scheduler_catchup_constant_is_imported` — pins the storage-side constant import
+- `test_lagged_handler_source_emits_audit_row_and_telegram` — source-scan ratchet per Rule 13: Lagged branch MUST contain `TRIGGER_EVENT_SCHEDULER_CATCHUP`, `append_gap_fill_audit_row`, `GapFillEventChannelLagged`, `lagged_window_ms`
+- `test_last_successful_event_at_refreshed_on_ok_branch` — source-scan ratchet: Ok branch MUST refresh the catchup-window anchor
+
+### Verification
+
+- 39/39 `gap_fill_scheduler` tests green (3 new + 36 existing)
+- `cargo check -p tickvault-core` green
+- `cargo fmt --check` clean
+- `banned-pattern-scanner.sh` clean
+- `pub-fn-test-guard.sh` clean (untested pub fn count stable at 143)
+- `pub-fn-wiring-guard.sh` clean
+
+## Series-complete summary (Phase 0 Items 8+9)
+
+PR-A → PR-D9 = 11 PRs. All deferred items from the original plan are now shipped:
+
+- Indices fan-out + audit + Telegram ✅
+- NSE_EQ fan-out + Semaphore parallelism ✅
+- Per-conn precision via event payload extension ✅
+- `outage_start_secs` refinement via shared last-seen LTT cache ✅
+- `GapFill04EventChannelLagged` catchup audit + Telegram ✅
+
 ## Original plan items mapped to PR series
 
 | Plan Item | PR |
