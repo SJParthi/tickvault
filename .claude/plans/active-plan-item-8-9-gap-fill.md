@@ -316,22 +316,136 @@ Total candle_fetcher tests: 232 (was 220) — all passing.
 PR-D1 promoted 6 primitives in `candle_fetcher.rs` to `pub(crate)`.
 ZERO behavioural change. 220 existing tests pass without modification.
 
-## PR-D3 Status — QUEUED for fresh session
+## PR-D3 Status — LOCKED design (2026-05-17) — QUEUED for fresh session
 
-PR-D2 (next session) ships:
+This PR-D3 design is **locked** after PR-D2 (#673) merged the
+`fetch_gap_fill_intraday_window` pub fn. PR-D3 wires that fn into the
+production scheduler. Fresh focused session implements it per the
+contract below — zero TBDs.
 
-1. NEW `pub async fn fetch_intraday_window_for_gap_fill` in `candle_fetcher.rs`
-   that uses the now-pub(crate) primitives. Takes `(http_client, token,
-   client_id, dhan_config, security_id, segment, from_secs, to_secs)`,
-   returns `Result<Vec<HistoricalCandle>, GapFillFetchError>`. NO writer
-   coupling — caller writes.
-2. Update `run_gap_fill_scheduler` signature to accept the deps
-   (`Arc<TokenHandle>`, `SecretString`, `Arc<DhanConfig>`, `Arc<reqwest::Client>`,
-   `Arc<Mutex<CandlePersistenceWriter>>`).
-3. Per-event work in scheduler: receive event → call planner → for each
-   planned bar, fetch via the new pub fn → UPSERT via existing writer →
-   write `gap_fill_audit` row.
-4. Boot wiring in `main.rs` to thread the deps through.
+### What PR-D3 implements
+
+1. **NEW `GapFillExecutorDeps` struct** in `gap_fill_scheduler.rs`:
+   ```rust
+   pub struct GapFillExecutorDeps {
+       pub http_client: Arc<reqwest::Client>,
+       pub endpoint: String,           // Dhan intraday endpoint URL
+       pub token_handle: TokenHandle,  // Arc<ArcSwap<Option<TokenState>>>
+       pub client_id: SecretString,
+       pub candle_writer: Arc<tokio::sync::Mutex<CandlePersistenceWriter>>,
+       pub max_retries: u32,
+   }
+   ```
+
+2. **RENAME `run_gap_fill_scheduler` → `run_gap_fill_executor`** —
+   signature gains `deps: GapFillExecutorDeps` parameter. The 8 PR-C
+   lifecycle tests are updated to construct deps with
+   `reqwest::Client::new()` + a fresh `CandlePersistenceWriter` pointed
+   at the test QuestDB instance (or `cfg(test)` no-op writer).
+
+3. **Per-event executor logic** inside the renamed fn:
+   ```rust
+   // On receive event:
+   let bars = compute_planned_bars(&event);
+   for bar_start_secs in bars {
+       let bar_end_secs = bar_start_secs + GAP_FILL_ONE_MINUTE_SECS as i64;
+       // Wait bar_end + 10s seal buffer (BOOT-03 envelope)
+       tokio::time::sleep_until(...).await;
+       // Fetch via PR-D2 pub fn
+       match fetch_gap_fill_intraday_window(
+           &deps.http_client,
+           &deps.endpoint,
+           &load_access_token(&deps.token_handle)?,
+           &deps.client_id,
+           NIFTY_SECURITY_ID, // PR-D3a: hardcoded; PR-D3b iterates affected pool conn's instruments
+           SEGMENT_CODE_IDX_I,
+           "INDEX",
+           bar_start_secs,
+           bar_end_secs,
+           false,
+           deps.max_retries,
+       ).await {
+           Ok(candles) => {
+               let mut writer = deps.candle_writer.lock().await;
+               for c in &candles {
+                   writer.append_candle(c)?;
+               }
+               writer.flush_if_needed()?;
+               // Audit row + Telegram GapFillCompleted
+           }
+           Err(GapFillFetchError::TooManyConnections) => {
+               tokio::time::sleep(Duration::from_secs(60)).await;
+           }
+           Err(GapFillFetchError::TokenExpired) => {
+               // Token refresh handled elsewhere; skip + retry next event
+           }
+           Err(e) => {
+               // Telegram GapFillFailed { error, attempt }
+           }
+       }
+   }
+   ```
+
+4. **Boot wiring in `main.rs`**:
+   - The existing `http_client`, `token_handle`, `dhan_config`,
+     `client_id` handles are already constructed during boot for
+     `fetch_historical_candles`.
+   - PR-D3 creates a **dedicated** `CandlePersistenceWriter` for
+     gap-fill (NOT shared with the boot-time historical fetcher to
+     avoid lifetime conflicts). Wrapped in `Arc<tokio::sync::Mutex>`
+     for future per-bar concurrent task spawning.
+   - Build `GapFillExecutorDeps` and pass to `run_gap_fill_executor`
+     via the existing spawn block.
+
+5. **Telegram + audit wiring**:
+   - On success per bar: write `gap_fill_audit` row with
+     `result="success"`, `attempt=N`. Emit `GapFillCompleted` Info.
+   - On retry-exhausted per bar: write `result="failed"`,
+     `attempt=max`. Emit `GapFillFailed` Critical with the
+     `GapFillFetchError` Display text.
+   - Existing `append_gap_fill_audit_row` writer from PR-A is the
+     persistence helper.
+
+### What PR-D3 does NOT include (deferred to PR-D4)
+
+- Per-instrument iteration. PR-D3 hardcodes NIFTY (security_id=13,
+  IDX_I) as the only instrument fetched. This is acceptable for an
+  MVP slice because:
+  1. NIFTY is the most important index for trading decisions.
+  2. The full call chain WS reconnect → broadcast → scheduler →
+     fetch → UPSERT → audit is exercised end-to-end with one
+     instrument, validating every wiring layer.
+  3. PR-D4 generalises to iterate the affected connection's
+     `instruments` list (requires `WebSocketConnection::instruments`
+     getter — a 5-LoC change).
+- Grafana panel + alert (PR-D4 or PR-D5).
+- Rate limiting across N concurrent fetches (PR-D4 — `tokio::sync::Semaphore(GAP_FILL_MAX_CONCURRENT_FETCHES)`).
+- `outage_start_secs` refinement using last-seen-tick timestamps
+  (currently uses `now - 10s` placeholder per PR-C send-site).
+
+### Estimated scope
+
+~500-700 LoC across:
+- `crates/core/src/historical/gap_fill_scheduler.rs` (~250 LoC)
+- `crates/app/src/main.rs` (~50 LoC boot wiring)
+- 8 PR-C lifecycle tests updated (~50 LoC)
+- 5 new integration tests (~150 LoC)
+- Plan file update
+
+### Adversarial review checklist (run BEFORE commit per charter §E)
+
+- [ ] hot-path-reviewer — verify the per-bar loop does NOT add hot-path allocations (cold path, ~5 bars/disconnect, ~5 disconnects/day)
+- [ ] security-reviewer — verify access_token + client_id never appear in tracing labels or error messages
+- [ ] general-purpose (hostile) — verify the writer Mutex doesn't deadlock with the boot-time historical writer; verify the dedicated writer's rescue-ring is separate from the live writer's
+
+### Why this design respects all 17 audit-findings rules
+
+- Rule 14 (no skeleton): every pub fn has a real call site (boot wires `run_gap_fill_executor`)
+- Rule 15 (locked decisions): every decision above is fixed in this plan file
+- Rule 16 (Arc<Notify> shutdown): inherited from PR-C; not changed
+- Rule 17 (front-loaded investigation): PR-D1 + PR-D2 + this plan section did the investigation; PR-D3 is pure implementation
+
+## PR-D4 Status — QUEUED (per-instrument iteration + Grafana)
 5. Telegram event emission via `GapFillCompleted`/`Partial`/`Failed`.
 
 PR-D2 will be ~600-1000 LoC across `candle_fetcher.rs`, `gap_fill_scheduler.rs`,
