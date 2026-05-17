@@ -454,8 +454,7 @@ impl WebSocketConnection {
     /// Tests do NOT call this builder — the field stays `None` and the
     /// send site short-circuits.
     #[must_use]
-    // TEST-EXEMPT: builder pass-through; covered indirectly by the post-reconnect
-    // send-site coverage which is itself exercised via the connection_pool wiring.
+    // TEST-EXEMPT: builder pass-through; covered indirectly by the post-reconnect send-site, itself exercised via the connection_pool wiring
     pub fn with_disconnect_event_sender(
         mut self,
         sender: tokio::sync::broadcast::Sender<
