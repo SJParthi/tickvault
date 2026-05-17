@@ -265,6 +265,15 @@ pub struct WebSocketConnection {
         tokio::sync::broadcast::Sender<crate::websocket::disconnect_event::DisconnectResolvedEvent>,
     >,
 
+    /// PR-D7 (2026-05-17) — per-conn snapshot of `(security_id,
+    /// segment_binary_code)` tuples computed once at construction
+    /// from `instruments`. Sent verbatim (via Arc::clone) on every
+    /// `DisconnectResolvedEvent` so the gap-fill scheduler can fan
+    /// out ONLY across the SIDs this conn had subscribed, not the
+    /// entire registry. Memory bounded by Dhan's 5,000 instruments-
+    /// per-conn cap.
+    subscribed_sec_ids: Arc<Vec<(u32, u8)>>,
+
     /// A5: Graceful shutdown flag. When `true`, the outer `run()` loop exits
     /// without attempting reconnect after the read loop returns. Set by
     /// `request_graceful_shutdown()`.
@@ -395,6 +404,39 @@ impl WebSocketConnection {
             ));
         }
 
+        // PR-D7 (2026-05-17): Pre-compute the per-conn snapshot of
+        // `(security_id, segment_binary_code)` tuples now, while we
+        // still have the typed inputs. The string-parse happens once
+        // at construction (O(1) EXEMPT — runs once at startup, not
+        // per tick) and the resulting Arc<Vec<...>> is reused on
+        // every disconnect-resolved broadcast. Unknown segments fall
+        // back to 255 so the consumer's segment filter (which keeps
+        // only 0=IDX_I and 1=NSE_EQ) naturally skips them.
+        // O(1) EXEMPT: begin
+        // PR-D7 constructor-only allocation. Runs once at startup per
+        // connection (≤5 main-feed conns total). Snapshot is then
+        // reused by Arc::clone on every disconnect-resolved broadcast.
+        let snapshot: Vec<(u32, u8)> = instruments
+            .iter()
+            .filter_map(|inst| {
+                let sid = inst.security_id.parse::<u32>().ok()?;
+                let seg_code = match inst.exchange_segment.as_str() {
+                    "IDX_I" => 0_u8,
+                    "NSE_EQ" => 1,
+                    "NSE_FNO" => 2,
+                    "NSE_CURRENCY" => 3,
+                    "BSE_EQ" => 4,
+                    "MCX_COMM" => 5,
+                    "BSE_CURRENCY" => 7,
+                    "BSE_FNO" => 8,
+                    _ => 255,
+                };
+                Some((sid, seg_code))
+            })
+            .collect();
+        let subscribed_sec_ids = Arc::new(snapshot);
+        // O(1) EXEMPT: end
+
         Self {
             connection_id,
             token_handle,
@@ -409,6 +451,7 @@ impl WebSocketConnection {
             cached_subscription_messages,
             notifier,
             disconnect_event_sender: None,
+            subscribed_sec_ids,
             shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             wal_spill: None,
@@ -631,6 +674,7 @@ impl WebSocketConnection {
                                     connection_index: u8::from(self.connection_id),
                                     outage_start_secs,
                                     outage_end_secs: now_secs_ist,
+                                    subscribed: Arc::clone(&self.subscribed_sec_ids),
                                 };
                             if let Err(send_err) = tx.send(event) {
                                 // Per audit-findings Rule 5: broadcast send

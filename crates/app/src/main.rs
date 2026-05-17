@@ -3566,31 +3566,13 @@ async fn main() -> Result<()> {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new()),
     );
-    // Phase 0 PR-D6 (2026-05-17) — snapshot the NSE_EQ SecurityId set
-    // from the active SubscriptionPlan's InstrumentRegistry so the
-    // gap-fill scheduler can fan out per-bar fetches across both the
-    // 4 IDX_I indices AND every subscribed cash equity. The snapshot
-    // is Arc-wrapped — immutable for the scheduler's lifetime per
-    // the locked architectural decision (process restart on daily
-    // instrument rebuild keeps drift bounded by JWT 24h lifetime).
-    // If no subscription plan exists yet (skipped boot path), pass
-    // an empty Arc — fan-out degrades to indices-only.
-    let gap_fill_nse_eq_sids: std::sync::Arc<Vec<u32>> = std::sync::Arc::new(
-        subscription_plan
-            .as_ref()
-            .map(|plan| {
-                plan.registry
-                    .by_exchange_segment()
-                    .get(&tickvault_common::types::ExchangeSegment::NseEquity)
-                    .cloned()
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default(),
-    );
-    info!(
-        nse_eq_snapshot_count = gap_fill_nse_eq_sids.len(),
-        "gap-fill: NSE_EQ SecurityId snapshot captured from registry for fan-out"
-    );
+    // Phase 0 PR-D7 (2026-05-17) — per-conn precision. The gap-fill
+    // scheduler iterates the SID snapshot the WebSocket producer
+    // attached to each `DisconnectResolvedEvent`, so no boot-time
+    // registry snapshot is needed here. PR-D6's boot-side
+    // `nse_eq_sids: Arc<Vec<u32>>` was removed because it duplicated
+    // the per-conn payload and caused fan-out across SIDs other
+    // conns owned.
     let gap_fill_writer_result =
         tickvault_storage::candle_persistence::CandlePersistenceWriter::new(&config.questdb);
     match gap_fill_writer_result {
@@ -3608,7 +3590,6 @@ async fn main() -> Result<()> {
                 writer_arc,
                 config.questdb.clone(),
                 std::sync::Arc::clone(&notifier),
-                std::sync::Arc::clone(&gap_fill_nse_eq_sids),
             );
             tokio::spawn(async move {
                 tickvault_core::historical::gap_fill_scheduler::run_gap_fill_scheduler(

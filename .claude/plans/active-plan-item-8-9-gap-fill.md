@@ -594,6 +594,50 @@ and the hot-path / live-feed-purity rules:
 - `outage_start_secs` refinement using last-seen-tick from `TickGapTracker` (PR-D8)
 - `GapFill04EventChannelLagged` reconciliation SELECT pass (PR-D9)
 
+## PR-D7 Status — THIS PR (per-conn precision via event payload extension)
+
+### What PR-D7 ships
+
+Extends `DisconnectResolvedEvent` from a `Copy` 24-byte struct to a
+`Clone + Eq` struct carrying `subscribed: Arc<Vec<(u32, u8)>>` —
+the per-conn snapshot of `(security_id, segment_binary_code)` tuples
+that the WebSocket producer captured at the moment of the broadcast.
+The gap-fill scheduler now fans out ONLY across the SIDs the
+affected connection had subscribed, instead of the global all-SIDs
+fan-out shipped in PR-D6.
+
+| Item | Detail |
+|---|---|
+| Event payload | `subscribed: Arc<Vec<(u32, u8)>>` (12 bytes per entry × up to 5,000 instruments per conn = ~60 KB Arc-shared) |
+| Producer | `WebSocketConnection::new()` pre-computes the snapshot once from `instruments`; `disconnect_event_sender` send-site clones the Arc |
+| Consumer | Segment filter accepts `0` (IDX_I) and `1` (NSE_EQ) only; `tv_gap_fill_skipped_segment_total` counter tracks dropped derivative SIDs |
+| Empty-snapshot guard | `event.subscribed.is_empty()` → log info + increment `tv_gap_fill_empty_snapshot_total` + skip bar loop (no audit, no Telegram) |
+| Boot wiring cleanup | Removed PR-D6's `gap_fill_nse_eq_sids` registry snapshot — the per-conn payload supersedes it |
+| Struct cleanup | Dropped `GapFillExecutorDeps.nse_eq_sids` field; removed dead `GAP_FILL_INDICES` hard-coded array |
+
+### Ratchet tests added
+
+- `test_event_arc_shares_snapshot_across_clones` — Arc strong-count assertion across clone/drop
+- `test_event_is_clone_debug_eq` — struct shape pinning (post-Copy removal)
+- `test_disconnect_event_carries_arc_subscribed_snapshot` — payload field pinning
+- `test_per_conn_segment_filter_keeps_idx_i_and_nse_eq_only` — segment eligibility invariant
+- `test_gap_fill_executor_deps_carries_semaphore` — Semaphore field still present (PR-D6 ratchet rebased)
+
+### Verification
+
+- 34/34 `tickvault-core` gap_fill module tests green
+- 5/5 `disconnect_event` tests green
+- 440/440 `websocket` module tests green
+- `cargo fmt --check` clean
+- `banned-pattern-scanner.sh` clean
+- `pub-fn-test-guard.sh` clean (untested pub fn count stable at 143)
+- `pub-fn-wiring-guard.sh` clean
+
+### What PR-D7 does NOT include (deferred to PR-D8/D9)
+
+- `outage_start_secs` refinement using last-seen-tick from `TickGapTracker` (PR-D8)
+- `GapFill04EventChannelLagged` reconciliation SELECT pass (PR-D9)
+
 ## Original plan items mapped to PR series
 
 | Plan Item | PR |

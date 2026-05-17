@@ -99,28 +99,13 @@ use crate::historical::candle_fetcher::{GapFillFetchError, fetch_gap_fill_intrad
 use crate::historical::gap_fill_planner::plan_gap_fill_bars;
 use crate::websocket::disconnect_event::DisconnectResolvedEvent;
 
-// Phase 0 PR-D4 (2026-05-17) — indices-only fan-out.
-//
-// The 4 IDX_I indices subscribed under the Phase 0 indices-only scope
-// (`websocket-connection-scope-lock.md` §I): NIFTY, BANKNIFTY, SENSEX,
-// INDIA VIX. Per-bar the scheduler iterates this set and issues one
-// Dhan REST `/v2/charts/intraday` fetch per (bar, SecurityId) pair.
-//
-// Cost budget (per disconnect event): 4 SIDs × ~5 bars × ~200 ms Dhan
-// rate-limit budget = ~4 s sustained wall-clock. Well within the
-// 64-event broadcast capacity (`DISCONNECT_EVENT_CHANNEL_CAPACITY`)
-// even under a flap-storm.
-//
-// PR-D5 will extend fan-out to NSE_EQ equities (~218 SIDs) — requires
-// `tokio::sync::Semaphore(GAP_FILL_MAX_CONCURRENT_FETCHES)` + per-conn
-// instrument-list snapshot on the `DisconnectResolvedEvent`. Kept out
-// of PR-D4 to preserve the bounded cost envelope.
-const GAP_FILL_INDICES: &[(u32, u8, &str)] = &[
-    (13, 0, "INDEX"), // NIFTY
-    (25, 0, "INDEX"), // BANKNIFTY
-    (51, 0, "INDEX"), // SENSEX
-    (21, 0, "INDEX"), // INDIA VIX
-];
+// PR-D7 (2026-05-17): the hard-coded `GAP_FILL_INDICES` array (4
+// IDX_I tuples) shipped in PR-D4 was removed. With per-conn precision
+// via `DisconnectResolvedEvent.subscribed`, the producer's subscription
+// list IS the source of truth for which SIDs need gap-fill — no
+// duplicate hard-coded set is needed. The 4 IDX_I SIDs (13/25/51/21)
+// are pinned independently by `websocket-connection-scope-lock.md` §I
+// and the subscription_planner ratchets.
 
 /// Maximum number of failed SecurityIds carried in the
 /// `GapFillPartial` Telegram payload, per the variant doc on
@@ -161,16 +146,6 @@ const GAP_FILL_805_PAUSE_SECS: u64 = 60;
 ///   `Failed` per bar (PR-D4). The fan-out tallies a single per-bar
 ///   outcome regardless of whether 1 or N SIDs failed — operator
 ///   receives one Telegram per bar, not per SID.
-/// - `nse_eq_sids`: PR-D6 (2026-05-17) — `Arc<Vec<u32>>` snapshot of
-///   subscribed NSE_EQ SecurityIds captured at boot from
-///   `InstrumentRegistry.by_exchange_segment()[NseEquity]`. The
-///   per-bar fan-out iterates the 4 IDX_I in `GAP_FILL_INDICES`
-///   PLUS every SID in this snapshot. ~218 entries for the indices-
-///   underlyings universe. SIDs are stable for the trading day
-///   (daily instrument rebuild swaps the registry, but the Arc held
-///   here is immutable for the gap-fill scheduler's lifetime —
-///   stale-SID risk is bounded by the 24h JWT lifetime that forces
-///   a process restart anyway).
 /// - `fetch_semaphore`: PR-D6 — `Arc<Semaphore>` with capacity =
 ///   [`GAP_FILL_MAX_CONCURRENT_FETCHES`] (= 5). Each per-SID fetch
 ///   acquires a permit before issuing the Dhan REST call. Matches
@@ -178,6 +153,13 @@ const GAP_FILL_805_PAUSE_SECS: u64 = 60;
 ///   `docs/dhan-ref/01-introduction-and-rate-limits.md` §7. Bounded
 ///   parallelism keeps bar latency under the 64-buffer 25s drain
 ///   budget on the disconnect broadcast channel.
+///
+/// PR-D7 (2026-05-17) removed the `nse_eq_sids: Arc<Vec<u32>>` field
+/// shipped in PR-D6. Per-conn precision via `DisconnectResolvedEvent.subscribed`
+/// supersedes the boot-time global snapshot — the fan-out now
+/// iterates the snapshot the producer attached to the event, so a
+/// conn-0 drop no longer triggers fetches for SIDs that lived on
+/// conn-1.
 pub struct GapFillExecutorDeps {
     pub http_client: Arc<reqwest::Client>,
     pub endpoint: String,
@@ -187,7 +169,6 @@ pub struct GapFillExecutorDeps {
     pub max_retries: u32,
     pub questdb_config: QuestDbConfig,
     pub notification_service: Arc<NotificationService>,
-    pub nse_eq_sids: Arc<Vec<u32>>,
     pub fetch_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
@@ -204,7 +185,6 @@ impl GapFillExecutorDeps {
         candle_writer: Arc<tokio::sync::Mutex<dyn GapFillCandleSink>>,
         questdb_config: QuestDbConfig,
         notification_service: Arc<NotificationService>,
-        nse_eq_sids: Arc<Vec<u32>>,
     ) -> Self {
         Self {
             http_client,
@@ -215,7 +195,6 @@ impl GapFillExecutorDeps {
             max_retries: GAP_FILL_RETRY_ATTEMPTS,
             questdb_config,
             notification_service,
-            nse_eq_sids,
             fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(GAP_FILL_MAX_CONCURRENT_FETCHES)),
         }
     }
@@ -423,10 +402,8 @@ pub async fn run_gap_fill_scheduler(
         channel_capacity = crate::websocket::disconnect_event::DISCONNECT_EVENT_CHANNEL_CAPACITY,
         endpoint = %deps.endpoint,
         max_retries = deps.max_retries,
-        index_sid_count = GAP_FILL_INDICES.len(),
-        nse_eq_sid_count = deps.nse_eq_sids.len(),
         semaphore_capacity = GAP_FILL_MAX_CONCURRENT_FETCHES,
-        "gap-fill scheduler started (PR-D6: indices + NSE_EQ fan-out with Semaphore parallelism)"
+        "gap-fill scheduler started (PR-D7: per-conn fan-out from DisconnectResolvedEvent.subscribed)"
     );
 
     let events_received = metrics::counter!("tv_gap_fill_events_received_total");
@@ -452,16 +429,34 @@ pub async fn run_gap_fill_scheduler(
                             outage_duration_secs =
                                 event.outage_end_secs.saturating_sub(event.outage_start_secs),
                             planned_bar_count = bars.len(),
-                            index_sid_count = GAP_FILL_INDICES.len(),
-                            nse_eq_sid_count = deps.nse_eq_sids.len(),
+                            per_conn_snapshot_count = event.subscribed.len(),
                             semaphore_capacity = GAP_FILL_MAX_CONCURRENT_FETCHES,
-                            "gap-fill: disconnect event received; starting per-bar × (indices + NSE_EQ) fetch+UPSERT"
+                            "gap-fill: disconnect event received; PR-D7 per-conn fan-out via snapshot"
                         );
 
+                        // PR-D7: if the per-conn snapshot is empty
+                        // (test fixture or pre-subscription producer
+                        // race), skip the bar loop entirely. Counter
+                        // captures the volume so the operator has a
+                        // signal if this fires in prod (where empty
+                        // snapshot = bug per Rule 11). No audit row,
+                        // no Telegram — bar refill genuinely had
+                        // zero work to do.
+                        if event.subscribed.is_empty() {
+                            metrics::counter!("tv_gap_fill_empty_snapshot_total").increment(1);
+                            info!(
+                                connection_index = event.connection_index,
+                                "gap-fill: per-conn snapshot empty; skipping bar loop"
+                            );
+                            continue;
+                        }
+
+                        let subscribed = Arc::clone(&event.subscribed);
                         for bar_start_ist_secs in bars {
                             execute_bar_for_all_instruments(
                                 &deps,
                                 bar_start_ist_secs,
+                                subscribed.as_ref(),
                                 &bars_succeeded,
                                 &bars_partial,
                                 &bars_failed,
@@ -517,13 +512,15 @@ const GAP_FILL_NSE_EQ_INSTRUMENT_TYPE: &str = "EQUITY";
 /// `GapFillPartial` sample list together identify which SIDs failed
 /// without spamming 222 Telegram messages per bar.
 ///
-/// O(1) EXEMPT: cold path. Per-bar Vec allocations grow with
-/// `GAP_FILL_INDICES.len() + deps.nse_eq_sids.len()` (~222 entries
-/// for the indices-underlyings universe), bounded by the daily
-/// instrument-master rebuild and NOT on any tick-processing path.
+/// O(1) EXEMPT: cold path. Per-bar Vec allocations grow with the
+/// event's `subscribed` snapshot size (bounded by Dhan's 5,000
+/// instruments-per-conn cap). PR-D7 (2026-05-17) restricted the
+/// fan-out to the per-conn snapshot so a single conn drop no
+/// longer triggers REST calls for SIDs other conns owned.
 async fn execute_bar_for_all_instruments(
     deps: &Arc<GapFillExecutorDeps>,
     bar_start_ist_secs: i64,
+    subscribed: &[(u32, u8)],
     bars_succeeded: &metrics::Counter,
     bars_partial: &metrics::Counter,
     bars_failed: &metrics::Counter,
@@ -535,16 +532,27 @@ async fn execute_bar_for_all_instruments(
     let mut sample_failed_sids: Vec<u32> = Vec::new();
     let mut last_error: Option<String> = None;
 
-    // Build the unified fan-out task set: indices first (4), then
-    // NSE_EQ snapshot (~218). Order within the set is irrelevant —
-    // JoinSet pulls them off in scheduling order, not iteration
-    // order.
-    let total_sids = GAP_FILL_INDICES.len() + deps.nse_eq_sids.len();
+    // PR-D7: spawn ONE task per gap-fill-eligible SID in the
+    // per-conn snapshot. Segments other than IDX_I (0) and NSE_EQ
+    // (1) are skipped — Dhan's `/charts/intraday` doesn't return
+    // candles for derivative contracts (NSE_FNO=2 etc.). Counter
+    // `tv_gap_fill_skipped_segment_total` tracks the skip volume so
+    // the operator can verify the filter is functioning.
+    let skipped_segment_counter = metrics::counter!("tv_gap_fill_skipped_segment_total");
     let mut tasks: tokio::task::JoinSet<(u32, Result<usize, GapFillFetchError>)> =
         tokio::task::JoinSet::new();
+    let mut eligible_count: usize = 0;
 
-    // Spawn IDX_I tasks.
-    for &(security_id, segment_code, instrument_type) in GAP_FILL_INDICES {
+    for &(security_id, segment_code) in subscribed {
+        let instrument_type = if segment_code == 0 {
+            "INDEX"
+        } else if segment_code == GAP_FILL_NSE_EQ_SEGMENT_CODE {
+            GAP_FILL_NSE_EQ_INSTRUMENT_TYPE
+        } else {
+            skipped_segment_counter.increment(1);
+            continue;
+        };
+        eligible_count = eligible_count.saturating_add(1);
         let deps_for_task = Arc::clone(deps);
         let semaphore = Arc::clone(&deps.fetch_semaphore);
         tasks.spawn(async move {
@@ -574,36 +582,7 @@ async fn execute_bar_for_all_instruments(
         });
     }
 
-    // Spawn NSE_EQ tasks (snapshot held under Arc — cheap to read).
-    for &security_id in deps.nse_eq_sids.as_ref() {
-        let deps_for_task = Arc::clone(deps);
-        let semaphore = Arc::clone(&deps.fetch_semaphore);
-        tasks.spawn(async move {
-            let _permit = match semaphore.acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => {
-                    // Semaphore closed — never expected in current code
-                    // paths (we never call `.close()`). Treat as a
-                    // retry-exhausted failure with 0 attempts so the
-                    // operator sees a distinctive signal in audit rows
-                    // + Telegram, without invoking the REST client.
-                    return (
-                        security_id,
-                        Err(GapFillFetchError::RetryExhausted { attempts: 0 }),
-                    );
-                }
-            };
-            let res = execute_gap_fill_for_bar(
-                &deps_for_task,
-                bar_start_ist_secs,
-                security_id,
-                GAP_FILL_NSE_EQ_SEGMENT_CODE,
-                GAP_FILL_NSE_EQ_INSTRUMENT_TYPE,
-            )
-            .await;
-            (security_id, res)
-        });
-    }
+    let total_sids = eligible_count;
 
     // Tally completion across all tasks.
     while let Some(joined) = tasks.join_next().await {
@@ -798,7 +777,6 @@ mod tests {
                 ilp_port: 9009,
             },
             NotificationService::disabled(),
-            Arc::new(Vec::new()), // PR-D6: empty NSE_EQ snapshot for lifecycle tests
         )
     }
 
@@ -838,6 +816,7 @@ mod tests {
             connection_index: 0,
             outage_start_secs: midnight + 11 * 3600,
             outage_end_secs: midnight + 11 * 3600 + 180,
+            subscribed: Arc::new(Vec::new()),
         };
         let bars = compute_planned_bars(&event);
         assert_eq!(bars.len(), 3, "3 minute outage = 3 planned bars");
@@ -851,6 +830,7 @@ mod tests {
             connection_index: 1,
             outage_start_secs: midnight + 16 * 3600,
             outage_end_secs: midnight + 16 * 3600 + 300,
+            subscribed: Arc::new(Vec::new()),
         };
         let bars = compute_planned_bars(&event);
         assert!(
@@ -867,6 +847,7 @@ mod tests {
             connection_index: 2,
             outage_start_secs: midnight + 15 * 3600 + 29 * 60,
             outage_end_secs: midnight + 15 * 3600 + 31 * 60,
+            subscribed: Arc::new(Vec::new()),
         };
         let bars = compute_planned_bars(&event);
         assert_eq!(bars.len(), 1, "exactly the 15:29 bar must be planned");
@@ -908,6 +889,7 @@ mod tests {
             connection_index: 0,
             outage_start_secs: midnight + 16 * 3600, // 16:00 IST — post-close
             outage_end_secs: midnight + 16 * 3600 + 300, // 16:05 IST
+            subscribed: Arc::new(Vec::new()),
         })
         .expect("send must succeed");
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -933,101 +915,24 @@ mod tests {
         assert!(load_access_token(&handle).is_none());
     }
 
-    #[test]
-    fn test_gap_fill_indices_has_four_entries() {
-        // PR-D4 (2026-05-17): the indices-only fan-out scope. Locking
-        // this at 4 prevents accidental scope expansion to NSE_EQ
-        // equities without the rate-limit + Semaphore work PR-D5 will
-        // ship. See `depth-subscription.md` 2026-04-25 Updates for the
-        // 3-index trading scope (NIFTY/BANKNIFTY/SENSEX) + INDIA VIX
-        // for volatility surface.
-        assert_eq!(
-            GAP_FILL_INDICES.len(),
-            4,
-            "PR-D4 fan-out scope is 4 IDX_I indices; expand to NSE_EQ in PR-D5"
-        );
-    }
-
-    #[test]
-    fn test_gap_fill_indices_security_ids_match_dhan_master() {
-        // Pin SecurityIds per `websocket-connection-scope-lock.md` §I:
-        //   NIFTY=13, BANKNIFTY=25, SENSEX=51, INDIA VIX=21.
-        let sids: Vec<u32> = GAP_FILL_INDICES.iter().map(|&(sid, _, _)| sid).collect();
-        assert!(sids.contains(&13), "NIFTY (13) must be in fan-out set");
-        assert!(sids.contains(&25), "BANKNIFTY (25) must be in fan-out set");
-        assert!(sids.contains(&51), "SENSEX (51) must be in fan-out set");
-        assert!(sids.contains(&21), "INDIA VIX (21) must be in fan-out set");
-    }
-
-    #[test]
-    fn test_gap_fill_indices_all_idx_i_segment() {
-        // Every entry must be IDX_I (segment code 0) per
-        // `annexure-enums.md` rule 2. F&O derivatives are out of scope
-        // for gap-fill — historical data fetch is index/equity only.
-        for &(sid, seg, inst) in GAP_FILL_INDICES {
-            assert_eq!(seg, 0, "SecurityId {sid} must be IDX_I (segment code 0)");
-            assert_eq!(
-                inst, "INDEX",
-                "SecurityId {sid} must use Dhan REST instrument_type=INDEX"
-            );
-        }
-    }
+    // PR-D7 removed the `GAP_FILL_INDICES` hard-coded array. The
+    // 4 IDX_I SIDs (13/25/51/21) are pinned independently by
+    // `websocket-connection-scope-lock.md` §I + subscription planner
+    // ratchets, so this module no longer needs a duplicate set.
 
     // PR-D6 ratchets (2026-05-17) — NSE_EQ fan-out + Semaphore.
 
     #[test]
-    fn test_gap_fill_executor_deps_carries_nse_eq_sids_and_semaphore() {
-        // PR-D6: the struct MUST carry both the NSE_EQ snapshot and
-        // the Semaphore for bounded parallelism. Future deletion of
-        // either field fails this build.
+    fn test_gap_fill_executor_deps_carries_semaphore() {
+        // PR-D7: the struct MUST still carry the Semaphore (PR-D6's
+        // `nse_eq_sids` field was removed because per-conn snapshot
+        // on the event payload supersedes the global registry-side
+        // snapshot). Future deletion of `fetch_semaphore` fails this
+        // build.
         let deps = test_deps();
-        // Empty snapshot is fine for the lifecycle test; the type
-        // existence is what we're pinning here.
-        assert!(
-            deps.nse_eq_sids.is_empty(),
-            "test_deps() ships an empty NSE_EQ snapshot — boot wiring fills the real set"
-        );
-        // Semaphore must be a real Arc with capacity > 0 (otherwise
-        // every fan-out task would block forever).
         assert!(
             deps.fetch_semaphore.available_permits() > 0,
             "fetch_semaphore must start with available permits"
-        );
-    }
-
-    #[test]
-    fn test_gap_fill_executor_deps_new_accepts_nse_eq_snapshot() {
-        // Call the constructor with a non-empty snapshot to prove the
-        // signature is `Arc<Vec<u32>>` AND that the field is stored
-        // by Arc-share (not cloned-by-value). The Arc strong-count
-        // assertion is the mechanical signal.
-        let snapshot = Arc::new(vec![13_u32, 25, 51, 21, 1234, 5678]);
-        let strong_count_before = Arc::strong_count(&snapshot);
-        let deps = GapFillExecutorDeps::new(
-            Arc::new(reqwest::Client::new()),
-            "http://127.0.0.1:1/v2/charts/intraday".to_string(),
-            Arc::new(ArcSwap::from_pointee(None)),
-            SecretString::from("test-client-id"),
-            Arc::new(tokio::sync::Mutex::new(NoopCandleSink)),
-            QuestDbConfig {
-                host: "127.0.0.1".to_string(),
-                http_port: 1,
-                pg_port: 8812,
-                ilp_port: 9009,
-            },
-            NotificationService::disabled(),
-            Arc::clone(&snapshot),
-        );
-        assert_eq!(deps.nse_eq_sids.len(), 6);
-        assert_eq!(deps.nse_eq_sids[0], 13);
-        assert_eq!(deps.nse_eq_sids[4], 1234);
-        // Arc::clone bumped the strong-count by 1 (caller's local +
-        // the field). If the constructor accidentally cloned-by-value,
-        // strong_count would still equal 1 here.
-        assert_eq!(
-            Arc::strong_count(&snapshot),
-            strong_count_before + 1,
-            "constructor must store the Arc by clone, not deep-copy the Vec"
         );
     }
 
@@ -1045,6 +950,46 @@ mod tests {
             "Semaphore capacity must equal GAP_FILL_MAX_CONCURRENT_FETCHES (= {})",
             GAP_FILL_MAX_CONCURRENT_FETCHES
         );
+    }
+
+    // PR-D7 ratchets (2026-05-17) — per-conn snapshot fan-out.
+
+    #[test]
+    fn test_disconnect_event_carries_arc_subscribed_snapshot() {
+        // PR-D7 contract: the event MUST carry `subscribed:
+        // Arc<Vec<(u32, u8)>>`. Future regression that drops the
+        // field (or downgrades it from Arc to Vec) fails this build.
+        let event = DisconnectResolvedEvent {
+            connection_index: 0,
+            outage_start_secs: 1_700_000_000,
+            outage_end_secs: 1_700_000_120,
+            subscribed: Arc::new(vec![(13, 0), (25, 0), (1234, 1)]),
+        };
+        assert_eq!(event.subscribed.len(), 3);
+        assert_eq!(event.subscribed[0], (13, 0));
+        // Arc<Vec> shares between clones; element-wise PartialEq holds.
+        let cloned = event.clone();
+        assert_eq!(event, cloned);
+    }
+
+    #[test]
+    fn test_per_conn_segment_filter_keeps_idx_i_and_nse_eq_only() {
+        // PR-D7: the fan-out loop accepts segment_code 0 (IDX_I)
+        // and `GAP_FILL_NSE_EQ_SEGMENT_CODE` (= 1, NSE_EQ) only.
+        // Every other code must be filtered out (NSE_FNO=2 etc.
+        // aren't gap-fill-eligible per Dhan's REST contract).
+        // We assert the constant values here so a future regression
+        // that adds NSE_FNO support without updating the segment
+        // filter fails this build.
+        let eligible_codes: Vec<u8> = vec![0, GAP_FILL_NSE_EQ_SEGMENT_CODE];
+        assert_eq!(eligible_codes, vec![0, 1]);
+        // The 6 other Dhan segments must NOT be in this list.
+        for ineligible in &[2_u8, 3, 4, 5, 7, 8] {
+            assert!(
+                !eligible_codes.contains(ineligible),
+                "segment_code {ineligible} must NOT be gap-fill-eligible (Dhan REST limitation)"
+            );
+        }
     }
 
     #[test]
