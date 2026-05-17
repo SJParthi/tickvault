@@ -58,6 +58,7 @@ use tokio::sync::{Notify, broadcast};
 use tracing::{error, info, warn};
 use zeroize::Zeroizing;
 
+use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
     GAP_FILL_FETCH_TIMEOUT_SECS, GAP_FILL_RETRY_ATTEMPTS, SECONDS_PER_DAY,
     TICK_PERSIST_END_SECS_OF_DAY_IST,
@@ -65,6 +66,12 @@ use tickvault_common::constants::{
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::tick_types::HistoricalCandle;
 use tickvault_storage::candle_persistence::CandlePersistenceWriter;
+use tickvault_storage::gap_fill_audit_persistence::{
+    RESULT_FAILED, RESULT_PARTIAL, RESULT_SUCCESS, TRIGGER_EVENT_WS_DISCONNECT,
+    append_gap_fill_audit_row,
+};
+
+use crate::notification::{NotificationEvent, NotificationService};
 
 use crate::auth::token_manager::TokenHandle;
 
@@ -92,11 +99,35 @@ use crate::historical::candle_fetcher::{GapFillFetchError, fetch_gap_fill_intrad
 use crate::historical::gap_fill_planner::plan_gap_fill_bars;
 use crate::websocket::disconnect_event::DisconnectResolvedEvent;
 
-// Phase 0 PR-D3-impl (2026-05-17) — MVP slice fetches NIFTY index only.
-// PR-D4 generalises to iterate the affected connection's instruments list.
-const MVP_NIFTY_SECURITY_ID: u32 = 13;
-const MVP_NIFTY_SEGMENT_CODE: u8 = 0; // IDX_I per annexure-enums.md rule 2
-const MVP_NIFTY_INSTRUMENT_TYPE: &str = "INDEX";
+// Phase 0 PR-D4 (2026-05-17) — indices-only fan-out.
+//
+// The 4 IDX_I indices subscribed under the Phase 0 indices-only scope
+// (`websocket-connection-scope-lock.md` §I): NIFTY, BANKNIFTY, SENSEX,
+// INDIA VIX. Per-bar the scheduler iterates this set and issues one
+// Dhan REST `/v2/charts/intraday` fetch per (bar, SecurityId) pair.
+//
+// Cost budget (per disconnect event): 4 SIDs × ~5 bars × ~200 ms Dhan
+// rate-limit budget = ~4 s sustained wall-clock. Well within the
+// 64-event broadcast capacity (`DISCONNECT_EVENT_CHANNEL_CAPACITY`)
+// even under a flap-storm.
+//
+// PR-D5 will extend fan-out to NSE_EQ equities (~218 SIDs) — requires
+// `tokio::sync::Semaphore(GAP_FILL_MAX_CONCURRENT_FETCHES)` + per-conn
+// instrument-list snapshot on the `DisconnectResolvedEvent`. Kept out
+// of PR-D4 to preserve the bounded cost envelope.
+const GAP_FILL_INDICES: &[(u32, u8, &str)] = &[
+    (13, 0, "INDEX"), // NIFTY
+    (25, 0, "INDEX"), // BANKNIFTY
+    (51, 0, "INDEX"), // SENSEX
+    (21, 0, "INDEX"), // INDIA VIX
+];
+
+/// Maximum number of failed SecurityIds carried in the
+/// `GapFillPartial` Telegram payload, per the variant doc on
+/// `NotificationEvent::GapFillPartial` (capped here to keep the bar
+/// loop allocation-bounded — the formatter ALSO caps at 5 so this is
+/// belt-and-suspenders).
+const TELEGRAM_FAILED_SID_SAMPLE_CAP: usize = 5;
 
 /// Pause duration after Dhan returns 805 "too many connections".
 /// Mirrors `candle_fetcher::ERROR_805_PAUSE_SECS` per
@@ -122,6 +153,14 @@ const GAP_FILL_805_PAUSE_SECS: u64 = 60;
 ///   future per-bar concurrent task spawning.
 /// - `max_retries`: retry budget per bar. Defaults to
 ///   `GAP_FILL_RETRY_ATTEMPTS = 3`.
+/// - `questdb_config`: connection config for `append_gap_fill_audit_row`
+///   (PR-D4) — gap-fill writes one audit row per bar carrying
+///   `(sids_requested, sids_completed, sids_failed, duration_ms,
+///   result)`.
+/// - `notification_service`: emits `GapFillCompleted` / `Partial` /
+///   `Failed` per bar (PR-D4). The 4-SID fan-out tallies a single
+///   per-bar outcome regardless of whether 1 or 4 SIDs failed —
+///   operator receives one Telegram per bar, not per SID.
 pub struct GapFillExecutorDeps {
     pub http_client: Arc<reqwest::Client>,
     pub endpoint: String,
@@ -129,6 +168,8 @@ pub struct GapFillExecutorDeps {
     pub client_id: SecretString,
     pub candle_writer: Arc<tokio::sync::Mutex<dyn GapFillCandleSink>>,
     pub max_retries: u32,
+    pub questdb_config: QuestDbConfig,
+    pub notification_service: Arc<NotificationService>,
 }
 
 impl GapFillExecutorDeps {
@@ -141,6 +182,8 @@ impl GapFillExecutorDeps {
         token_handle: TokenHandle,
         client_id: SecretString,
         candle_writer: Arc<tokio::sync::Mutex<dyn GapFillCandleSink>>,
+        questdb_config: QuestDbConfig,
+        notification_service: Arc<NotificationService>,
     ) -> Self {
         Self {
             http_client,
@@ -149,6 +192,8 @@ impl GapFillExecutorDeps {
             client_id,
             candle_writer,
             max_retries: GAP_FILL_RETRY_ATTEMPTS,
+            questdb_config,
+            notification_service,
         }
     }
 }
@@ -165,25 +210,30 @@ fn load_access_token(handle: &TokenHandle) -> Option<Zeroizing<String>> {
     ))
 }
 
-/// Execute a single gap-fill bar fetch + UPSERT cycle for the MVP
-/// NIFTY index slice.
+/// Execute a single gap-fill bar fetch + UPSERT cycle for one
+/// `(security_id, segment_code, instrument_type)` tuple.
 ///
 /// On success returns `Ok(candles_written)`. On non-fatal error
 /// (Token expired, too many connections) returns Ok(0) and logs —
 /// the caller decides whether to retry the whole event. On fatal
 /// error returns the typed `GapFillFetchError`.
 ///
-/// PR-D4 generalises to per-instrument iteration.
+/// PR-D4 (2026-05-17) generalised from the PR-D3 NIFTY-only MVP to
+/// accept the SecurityId tuple — per-instrument fan-out happens in
+/// `run_gap_fill_scheduler` iterating `GAP_FILL_INDICES`.
 async fn execute_gap_fill_for_bar(
     deps: &GapFillExecutorDeps,
     bar_start_ist_secs: i64,
+    security_id: u32,
+    segment_code: u8,
+    instrument_type: &str,
 ) -> Result<usize, GapFillFetchError> {
     let bar_end_ist_secs = bar_start_ist_secs.saturating_add(60);
 
     let Some(access_token) = load_access_token(&deps.token_handle) else {
         warn!(
             bar_start_ist_secs,
-            "gap-fill: token handle empty — auth incomplete; skipping bar"
+            security_id, "gap-fill: token handle empty — auth incomplete; skipping bar"
         );
         return Ok(0);
     };
@@ -195,9 +245,9 @@ async fn execute_gap_fill_for_bar(
             &deps.endpoint,
             &access_token,
             &deps.client_id,
-            MVP_NIFTY_SECURITY_ID,
-            MVP_NIFTY_SEGMENT_CODE,
-            MVP_NIFTY_INSTRUMENT_TYPE,
+            security_id,
+            segment_code,
+            instrument_type,
             bar_start_ist_secs,
             bar_end_ist_secs,
             false, // No OI for index
@@ -210,13 +260,14 @@ async fn execute_gap_fill_for_bar(
         Ok(Err(GapFillFetchError::TokenExpired)) => {
             warn!(
                 bar_start_ist_secs,
-                "gap-fill: token expired during fetch; will retry on next event"
+                security_id, "gap-fill: token expired during fetch; will retry on next event"
             );
             return Ok(0);
         }
         Ok(Err(GapFillFetchError::TooManyConnections)) => {
             warn!(
                 bar_start_ist_secs,
+                security_id,
                 "gap-fill: Dhan 805 too-many-connections; sleeping 60s before next bar"
             );
             tokio::time::sleep(Duration::from_secs(GAP_FILL_805_PAUSE_SECS)).await;
@@ -233,15 +284,15 @@ async fn execute_gap_fill_for_bar(
     if candles.is_empty() {
         info!(
             bar_start_ist_secs,
-            "gap-fill: Dhan returned 0 candles for bar; skipping UPSERT"
+            security_id, "gap-fill: Dhan returned 0 candles for bar; skipping UPSERT"
         );
         return Ok(0);
     }
 
-    // UPSERT via the dedicated writer Mutex. The Mutex is uncontested
-    // in PR-D3-impl (sequential per-event execution); PR-D4 may add
-    // concurrent per-bar tasks, at which point this serialisation
-    // becomes useful.
+    // UPSERT via the dedicated writer Mutex. The Mutex serialises the
+    // 4 per-SID UPSERTs within one bar — uncontested since
+    // `execute_gap_fill_for_bar` is awaited sequentially in
+    // `run_gap_fill_scheduler`.
     let mut writer = deps.candle_writer.lock().await;
     let mut written = 0_usize;
     for candle in &candles {
@@ -262,12 +313,54 @@ async fn execute_gap_fill_for_bar(
         error!(
             code = ErrorCode::GapFill03UpsertFailed.code_str(),
             bar_start_ist_secs,
+            security_id,
             ?err,
             "GAP-FILL-03: force_flush failed; rows buffered to spill ring"
         );
     }
     drop(writer);
     Ok(written)
+}
+
+/// Format the IST trading date `YYYY-MM-DD` from an IST epoch seconds
+/// value. Used as the `trading_date_ist` audit column.
+///
+/// Per `data-integrity.md` "WebSocket Timestamp Rule": Dhan-derived
+/// IST seconds are interpreted as if they were UTC by chrono, which
+/// is the standard tickvault pattern (the value is already in IST
+/// wall-clock, NO offset is added). Always returns a non-empty
+/// string; an unconvertible input falls back to epoch 0 ("1970-01-01").
+fn trading_date_ist_string(ist_secs: i64) -> String {
+    use chrono::TimeZone;
+    chrono::Utc
+        .timestamp_opt(ist_secs, 0)
+        .single()
+        .unwrap_or_else(|| {
+            chrono::Utc
+                .timestamp_opt(0, 0)
+                .single()
+                .unwrap_or_else(chrono::Utc::now)
+        })
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+/// Format the IST bar minute `HH:MM` from an IST epoch seconds value.
+/// Used as the `bar_minute` audit column AND the `bar_minute_ist`
+/// field on `GapFillCompleted` / `Partial` / `Failed` events.
+fn bar_minute_ist_string(ist_secs: i64) -> String {
+    use chrono::TimeZone;
+    chrono::Utc
+        .timestamp_opt(ist_secs, 0)
+        .single()
+        .unwrap_or_else(|| {
+            chrono::Utc
+                .timestamp_opt(0, 0)
+                .single()
+                .unwrap_or_else(chrono::Utc::now)
+        })
+        .format("%H:%M")
+        .to_string()
 }
 
 /// Run the gap-fill scheduler receive loop until shutdown.
@@ -301,13 +394,15 @@ pub async fn run_gap_fill_scheduler(
         channel_capacity = crate::websocket::disconnect_event::DISCONNECT_EVENT_CHANNEL_CAPACITY,
         endpoint = %deps.endpoint,
         max_retries = deps.max_retries,
-        "gap-fill scheduler started (PR-D3-impl: NIFTY MVP slice — fetch + UPSERT live)"
+        index_sid_count = GAP_FILL_INDICES.len(),
+        "gap-fill scheduler started (PR-D4: 4 IDX_I fan-out + audit + Telegram)"
     );
 
     let events_received = metrics::counter!("tv_gap_fill_events_received_total");
     let events_lagged = metrics::counter!("tv_gap_fill_event_channel_lagged_total");
     let planned_bars_counter = metrics::counter!("tv_gap_fill_planned_bars_total");
     let bars_succeeded = metrics::counter!("tv_gap_fill_bars_succeeded_total");
+    let bars_partial = metrics::counter!("tv_gap_fill_bars_partial_total");
     let bars_failed = metrics::counter!("tv_gap_fill_bars_failed_total");
     let candles_written = metrics::counter!("tv_gap_fill_candles_written_total");
 
@@ -326,30 +421,20 @@ pub async fn run_gap_fill_scheduler(
                             outage_duration_secs =
                                 event.outage_end_secs.saturating_sub(event.outage_start_secs),
                             planned_bar_count = bars.len(),
-                            "gap-fill: disconnect event received; starting per-bar fetch+UPSERT (NIFTY MVP slice)"
+                            index_sid_count = GAP_FILL_INDICES.len(),
+                            "gap-fill: disconnect event received; starting per-bar × 4-SID fetch+UPSERT"
                         );
 
                         for bar_start_ist_secs in bars {
-                            match execute_gap_fill_for_bar(&deps, bar_start_ist_secs).await {
-                                Ok(written) => {
-                                    bars_succeeded.increment(1);
-                                    candles_written.increment(written as u64);
-                                    info!(
-                                        bar_start_ist_secs,
-                                        candles_written = written,
-                                        "gap-fill: bar UPSERTed for NIFTY"
-                                    );
-                                }
-                                Err(err) => {
-                                    bars_failed.increment(1);
-                                    error!(
-                                        code = ErrorCode::GapFill02RestFetchFailed.code_str(),
-                                        bar_start_ist_secs,
-                                        err = %err,
-                                        "GAP-FILL-02: per-bar fetch failed; skipping"
-                                    );
-                                }
-                            }
+                            execute_bar_for_all_indices(
+                                &deps,
+                                bar_start_ist_secs,
+                                &bars_succeeded,
+                                &bars_partial,
+                                &bars_failed,
+                                &candles_written,
+                            )
+                            .await;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(dropped)) => {
@@ -357,7 +442,7 @@ pub async fn run_gap_fill_scheduler(
                         error!(
                             code = ErrorCode::GapFill04EventChannelLagged.code_str(),
                             dropped_event_count = dropped,
-                            "GAP-FILL-04: disconnect event broadcast lagged; events dropped — reconciliation pass deferred to PR-D4"
+                            "GAP-FILL-04: disconnect event broadcast lagged; events dropped — reconciliation pass deferred to PR-D5"
                         );
                     }
                     Err(broadcast::error::RecvError::Closed) => {
@@ -372,6 +457,145 @@ pub async fn run_gap_fill_scheduler(
             }
         }
     }
+}
+
+/// Execute one planned bar across all 4 IDX_I indices: per-SID fetch +
+/// UPSERT, tally the (`sids_completed`, `sids_failed`) split, write
+/// one `gap_fill_audit` row, and emit one Telegram event per bar.
+///
+/// Per-bar (not per-SID) audit row + Telegram is intentional: the
+/// operator's "did this bar refill" question is bar-scoped, not
+/// SID-scoped. The audit row's `sids_failed` count + the
+/// `GapFillPartial` sample list together identify which SIDs failed
+/// without spamming 4 Telegram messages per bar.
+///
+/// O(1) EXEMPT: cold path. Fixed 4-element loop per disconnect
+/// event (~5 disconnects/day under healthy market conditions). String
+/// allocations for `trading_date_ist` / `bar_minute_ist` are bounded
+/// by `GAP_FILL_INDICES.len()` × bars_per_event and are NOT on any
+/// tick-processing path.
+async fn execute_bar_for_all_indices(
+    deps: &GapFillExecutorDeps,
+    bar_start_ist_secs: i64,
+    bars_succeeded: &metrics::Counter,
+    bars_partial: &metrics::Counter,
+    bars_failed: &metrics::Counter,
+    candles_written: &metrics::Counter,
+) {
+    let bar_started_at = std::time::Instant::now();
+    let mut sids_completed: u32 = 0;
+    let mut sids_failed: u32 = 0;
+    let mut sample_failed_sids: Vec<u32> = Vec::new();
+    let mut last_error: Option<String> = None;
+
+    for &(security_id, segment_code, instrument_type) in GAP_FILL_INDICES {
+        match execute_gap_fill_for_bar(
+            deps,
+            bar_start_ist_secs,
+            security_id,
+            segment_code,
+            instrument_type,
+        )
+        .await
+        {
+            Ok(written) => {
+                sids_completed = sids_completed.saturating_add(1);
+                candles_written.increment(written as u64);
+                info!(
+                    bar_start_ist_secs,
+                    security_id,
+                    candles_written = written,
+                    "gap-fill: bar UPSERTed"
+                );
+            }
+            Err(err) => {
+                sids_failed = sids_failed.saturating_add(1);
+                if sample_failed_sids.len() < TELEGRAM_FAILED_SID_SAMPLE_CAP {
+                    sample_failed_sids.push(security_id);
+                }
+                let err_text = format!("{err}");
+                last_error = Some(err_text.clone());
+                error!(
+                    code = ErrorCode::GapFill02RestFetchFailed.code_str(),
+                    bar_start_ist_secs,
+                    security_id,
+                    err = %err,
+                    "GAP-FILL-02: per-SID fetch failed within bar"
+                );
+            }
+        }
+    }
+
+    let duration_ms_u32: u32 =
+        u32::try_from(bar_started_at.elapsed().as_millis()).unwrap_or(u32::MAX);
+    let sids_requested: u32 = u32::try_from(GAP_FILL_INDICES.len()).unwrap_or(u32::MAX);
+
+    let (result_label, severity_counter) = if sids_failed == 0 && sids_completed > 0 {
+        (RESULT_SUCCESS, bars_succeeded)
+    } else if sids_completed == 0 {
+        (RESULT_FAILED, bars_failed)
+    } else {
+        (RESULT_PARTIAL, bars_partial)
+    };
+    severity_counter.increment(1);
+
+    let bar_minute_str = bar_minute_ist_string(bar_start_ist_secs);
+    let trading_date_str = trading_date_ist_string(bar_start_ist_secs);
+    let bar_ts_nanos = bar_start_ist_secs.saturating_mul(1_000_000_000);
+
+    if let Err(err) = append_gap_fill_audit_row(
+        &deps.questdb_config,
+        bar_ts_nanos,
+        &trading_date_str,
+        &bar_minute_str,
+        TRIGGER_EVENT_WS_DISCONNECT,
+        i32::try_from(sids_requested).unwrap_or(i32::MAX),
+        i32::try_from(sids_completed).unwrap_or(i32::MAX),
+        i32::try_from(sids_failed).unwrap_or(i32::MAX),
+        i64::from(duration_ms_u32),
+        result_label,
+    )
+    .await
+    {
+        // Audit-row failure is data-point lost, not data-corrupted —
+        // the bar's candles are already UPSERTed in `historical_candles`.
+        // Per `phase-0-architecture.md` PILLAR 3 + Wave-2-D AUDIT-NN
+        // family, audit failures are Medium severity (NOT Critical).
+        error!(
+            code = ErrorCode::GapFill03UpsertFailed.code_str(),
+            bar_minute_ist = %bar_minute_str,
+            trading_date_ist = %trading_date_str,
+            ?err,
+            "gap_fill_audit row insert failed; bar candles already persisted"
+        );
+    }
+
+    let event = match result_label {
+        RESULT_SUCCESS => NotificationEvent::GapFillCompleted {
+            bar_minute_ist: bar_minute_str,
+            sids_completed,
+            sids_failed,
+            duration_ms: duration_ms_u32,
+        },
+        RESULT_PARTIAL => NotificationEvent::GapFillPartial {
+            bar_minute_ist: bar_minute_str,
+            sids_completed,
+            sids_failed,
+            sample_failed_sids,
+        },
+        // RESULT_FAILED covers (sids_completed == 0) — including the
+        // degenerate "Dhan returned 0 candles for every SID" path
+        // where `last_error` is None. Emit a descriptive fallback so
+        // the operator's Telegram has a non-empty `error` field.
+        _ => NotificationEvent::GapFillFailed {
+            bar_minute_ist: bar_minute_str,
+            error: last_error.unwrap_or_else(|| {
+                "all 4 indices returned zero candles or failed retries".to_string()
+            }),
+            attempt: deps.max_retries,
+        },
+    };
+    deps.notification_service.notify(event);
 }
 
 /// Compute the planned bar timestamps for a disconnect-resolved event.
@@ -432,9 +656,10 @@ mod tests {
     }
 
     /// Construct test deps with a no-op writer + empty token handle +
-    /// unreachable endpoint. Used by lifecycle tests that send events
-    /// resulting in EMPTY planned bars (post-market or sub-minute) so
-    /// the executor never actually invokes the HTTP fetch.
+    /// unreachable endpoint + disabled notifier + unreachable QuestDB.
+    /// Used by lifecycle tests that send events resulting in EMPTY
+    /// planned bars (post-market or sub-minute) so the executor never
+    /// actually invokes the HTTP fetch or the audit-row writer.
     fn test_deps() -> GapFillExecutorDeps {
         GapFillExecutorDeps::new(
             Arc::new(reqwest::Client::new()),
@@ -442,6 +667,13 @@ mod tests {
             Arc::new(ArcSwap::from_pointee(None)),
             SecretString::from("test-client-id"),
             Arc::new(tokio::sync::Mutex::new(NoopCandleSink)),
+            QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: 1, // unreachable — audit writes will fail-and-log
+                pg_port: 8812,
+                ilp_port: 9009,
+            },
+            NotificationService::disabled(),
         )
     }
 
@@ -577,22 +809,79 @@ mod tests {
     }
 
     #[test]
-    fn test_mvp_nifty_constants_pinned() {
-        // PR-D3-impl MVP slice: NIFTY-only fetch. Pin the constants
-        // so a future refactor must explicitly approve the change.
-        // PR-D4 generalises to per-instrument iteration.
+    fn test_gap_fill_indices_has_four_entries() {
+        // PR-D4 (2026-05-17): the indices-only fan-out scope. Locking
+        // this at 4 prevents accidental scope expansion to NSE_EQ
+        // equities without the rate-limit + Semaphore work PR-D5 will
+        // ship. See `depth-subscription.md` 2026-04-25 Updates for the
+        // 3-index trading scope (NIFTY/BANKNIFTY/SENSEX) + INDIA VIX
+        // for volatility surface.
         assert_eq!(
-            MVP_NIFTY_SECURITY_ID, 13,
-            "NIFTY index SecurityId per Dhan instrument master"
+            GAP_FILL_INDICES.len(),
+            4,
+            "PR-D4 fan-out scope is 4 IDX_I indices; expand to NSE_EQ in PR-D5"
         );
+    }
+
+    #[test]
+    fn test_gap_fill_indices_security_ids_match_dhan_master() {
+        // Pin SecurityIds per `websocket-connection-scope-lock.md` §I:
+        //   NIFTY=13, BANKNIFTY=25, SENSEX=51, INDIA VIX=21.
+        let sids: Vec<u32> = GAP_FILL_INDICES.iter().map(|&(sid, _, _)| sid).collect();
+        assert!(sids.contains(&13), "NIFTY (13) must be in fan-out set");
+        assert!(sids.contains(&25), "BANKNIFTY (25) must be in fan-out set");
+        assert!(sids.contains(&51), "SENSEX (51) must be in fan-out set");
+        assert!(sids.contains(&21), "INDIA VIX (21) must be in fan-out set");
+    }
+
+    #[test]
+    fn test_gap_fill_indices_all_idx_i_segment() {
+        // Every entry must be IDX_I (segment code 0) per
+        // `annexure-enums.md` rule 2. F&O derivatives are out of scope
+        // for gap-fill — historical data fetch is index/equity only.
+        for &(sid, seg, inst) in GAP_FILL_INDICES {
+            assert_eq!(seg, 0, "SecurityId {sid} must be IDX_I (segment code 0)");
+            assert_eq!(
+                inst, "INDEX",
+                "SecurityId {sid} must use Dhan REST instrument_type=INDEX"
+            );
+        }
+    }
+
+    #[test]
+    fn test_trading_date_ist_string_formats_yyyy_mm_dd() {
+        // 2026-05-17 00:00 IST = ist_midnight_secs(2026, 5, 17).
+        let midnight = ist_midnight_secs(2026, 5, 17);
+        assert_eq!(trading_date_ist_string(midnight), "2026-05-17");
+        // 13:33 IST same day → still 2026-05-17.
         assert_eq!(
-            MVP_NIFTY_SEGMENT_CODE, 0,
-            "IDX_I segment code per annexure-enums.md"
+            trading_date_ist_string(midnight + 13 * 3600 + 33 * 60),
+            "2026-05-17"
         );
+    }
+
+    #[test]
+    fn test_bar_minute_ist_string_formats_hh_mm() {
+        let midnight = ist_midnight_secs(2026, 5, 17);
+        // 09:33 IST
         assert_eq!(
-            MVP_NIFTY_INSTRUMENT_TYPE, "INDEX",
-            "Dhan REST intraday instrument_type for indices"
+            bar_minute_ist_string(midnight + 9 * 3600 + 33 * 60),
+            "09:33"
         );
+        // 15:29 IST
+        assert_eq!(
+            bar_minute_ist_string(midnight + 15 * 3600 + 29 * 60),
+            "15:29"
+        );
+        // 00:00 IST
+        assert_eq!(bar_minute_ist_string(midnight), "00:00");
+    }
+
+    #[test]
+    fn test_telegram_failed_sid_sample_cap_matches_variant_doc() {
+        // `NotificationEvent::GapFillPartial` doc says formatter caps
+        // at 5; this constant pins the buffer-side cap belt-and-suspenders.
+        assert_eq!(TELEGRAM_FAILED_SID_SAMPLE_CAP, 5);
     }
 
     #[tokio::test]
