@@ -251,7 +251,86 @@ focused session.
 - ✅ Plan-file PR-B abort logged with reference to Rule 14
 - ❌ No production code changes — docs only
 
-## PR-C Status — QUEUED for fresh session
+## PR-C Status (2026-05-17) — MERGED (#671)
+
+PR-C shipped the vertical-slice broadcast plumbing: `DisconnectResolvedEvent`
+type + `WebSocketConnection::with_disconnect_event_sender()` builder + canonical
+post-reconnect send-site + `run_gap_fill_scheduler` task with planner + 3 Prom
+counters + boot wiring in `main.rs`. 3-agent review NO CRITICAL/NO HIGH. 11
+tests pass.
+
+## PR-D1 Status (2026-05-17) — THIS PR (visibility promotion)
+
+Minimal visibility-promotion PR to unblock PR-D2 (the actual REST fetch + UPSERT).
+Promotes 6 private items in `candle_fetcher.rs` to `pub(crate)` so PR-D2's
+per-bar fetch helper can reuse the existing retry/backoff/error-classification
+logic without duplicating it.
+
+Items promoted:
+
+| Item | From | To | Why PR-D2 needs it |
+|---|---|---|---|
+| `ErrorAction` enum | private | `pub(crate)` | Classify Dhan error response for retry decisions |
+| `classify_error()` | private | `pub(crate)` | Run the classification logic |
+| `compute_dh904_backoff_secs()` | private | `pub(crate)` | DH-904 ladder: 10s, 20s, 40s, 80s |
+| `is_dh904_exhausted()` | private | `pub(crate)` | Decide when to give up |
+| `compute_retry_delay_ms()` | private | `pub(crate)` | 5xx linear backoff |
+| `IntradayRequest` struct | private | `pub(crate)` | Construct Dhan REST request body |
+
+Plus: every field of `IntradayRequest` is now `pub` (was implicit `private`)
+so the scheduler module can construct it.
+
+ZERO behavioural change — only visibility keywords. 220 existing
+`candle_fetcher` tests pass without modification. No new pub fns (Rule 14
+compliant). No new call sites needed in this PR — call sites land in PR-D2.
+
+## PR-D2 Status — QUEUED for fresh session
+
+PR-D2 (next session) ships:
+
+1. NEW `pub async fn fetch_intraday_window_for_gap_fill` in `candle_fetcher.rs`
+   that uses the now-pub(crate) primitives. Takes `(http_client, token,
+   client_id, dhan_config, security_id, segment, from_secs, to_secs)`,
+   returns `Result<Vec<HistoricalCandle>, GapFillFetchError>`. NO writer
+   coupling — caller writes.
+2. Update `run_gap_fill_scheduler` signature to accept the deps
+   (`Arc<TokenHandle>`, `SecretString`, `Arc<DhanConfig>`, `Arc<reqwest::Client>`,
+   `Arc<Mutex<CandlePersistenceWriter>>`).
+3. Per-event work in scheduler: receive event → call planner → for each
+   planned bar, fetch via the new pub fn → UPSERT via existing writer →
+   write `gap_fill_audit` row.
+4. Boot wiring in `main.rs` to thread the deps through.
+5. Telegram event emission via `GapFillCompleted`/`Partial`/`Failed`.
+
+PR-D2 will be ~600-1000 LoC across `candle_fetcher.rs`, `gap_fill_scheduler.rs`,
+`main.rs`. Best done in a fresh focused session.
+
+## PR-D3 Status — QUEUED for fresh session
+
+PR-D3 ships the observability layer:
+
+- Grafana panel + alert rule for the 3 Prom counters
+- DH-904 backoff observability counters
+- `tv_gap_fill_rest_latency_ms` histogram (Item 8 of original plan)
+
+## Original plan items mapped to PR series
+
+| Plan Item | PR |
+|---|---|
+| Item 1 (constants) | PR-A (#668) ✅ |
+| Item 2 (ErrorCodes) | PR-A (#668) ✅ |
+| Item 3 (Telegram events) | PR-A (#668) ✅ |
+| Item 4 (target table decision) | PR-B' (#670) ✅ locked |
+| Item 5 (scheduler skeleton + supervisor) | PR-C (#671) ✅ |
+| Item 5b (broadcast wiring) | PR-C (#671) ✅ |
+| Item 6 (pub mod) | PR-C (#671) ✅ |
+| Item 7 (boot wiring) | PR-C (#671) ✅ |
+| Item 8 (Prom counters) | partial PR-C (3 counters); PR-D3 adds histogram |
+| Item 9 (Grafana panel + alert) | PR-D3 |
+| Item 10 (runbook) | PR-A (#668) ✅ |
+| Item 11 (integration tests) | PR-C (#671) ✅ partial; PR-D2 adds REST tests |
+| NEW: visibility promotion | PR-D1 (this PR) |
+| NEW: REST fetch + UPSERT | PR-D2 |
 
 ## Verification before PR (PR-A)
 
