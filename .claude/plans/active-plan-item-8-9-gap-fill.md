@@ -560,17 +560,39 @@ session per Rules 15 + 17.
 - `gap_fill_audit_boot_wiring_guard` 1/1 test green
 - Dashboard JSON + alerts YAML both parse clean
 
-## PR-D6 Status — QUEUED for fresh session
+## PR-D6 Status — THIS PR (NSE_EQ fan-out + Semaphore parallelism)
 
-PR-D6 covers the remaining items deferred from PR-D5:
-- NSE_EQ equities fan-out (~218 SIDs) gated by Semaphore
-- Per-conn instrument-snapshot extension to `DisconnectResolvedEvent`
-- `outage_start_secs` refinement (last-seen-tick wiring)
-- `GapFill04EventChannelLagged` reconciliation SELECT pass
+### Locked architectural decisions (Rule 15, 2026-05-17)
 
-The first three items share an architectural decision (event payload
-shape + Semaphore capacity + outage-start computation) that should be
-locked in a plan-file update BEFORE the PR-D6 session opens (Rule 15).
+The operator delegated all 4 decisions. Locked as follows after engineering
+review against Rules 14 (skeleton anti-pattern), 17 (front-load investigation),
+and the hot-path / live-feed-purity rules:
+
+| # | Decision | Rationale |
+|---|---|---|
+| 1 | **PR-D6 ships all-SIDs fan-out (no per-conn precision).** Every disconnect event triggers gap-fill across both 4 IDX_I + NSE_EQ snapshot. | Per-conn precision requires extending `DisconnectResolvedEvent` from `Copy 24 bytes` to a non-Copy struct carrying `Arc<Vec<u32>>` — that's a separate vertical slice. PR-D6 ships the meaty NSE_EQ slice without the event-payload refactor. Cost: 218 extra REST calls per disconnect (vs ~50 typical per-conn). At ~5 disconnects/day expected, that's ~1100 calls/day — well under Dhan's 100K/day Data API budget. |
+| 2 | **Semaphore capacity = `GAP_FILL_MAX_CONCURRENT_FETCHES = 5`.** | Matches Dhan Data API hard limit of 5/sec. Constant already exists from PR-A. |
+| 3 | **Within-bar parallelism via `tokio::task::JoinSet` + Semaphore permits.** Each per-SID fetch spawned as task, gated by `acquire()`. | Sequential 222-SID loop = 44 sec per bar. Parallel cap 5 = ~9 sec per bar. Bar throughput stays under the broadcast 64-buffer 25s drain window even under flap-storm. |
+| 4 | **Defer per-conn precision (event payload extension) to PR-D7.** | Vertical slice — requires `DisconnectResolvedEvent` refactor across producer + consumer + 5 test sites + boot wiring. |
+| 5 | **Defer `outage_start_secs` refinement (TickGapTracker wiring) to PR-D8.** | Requires plumbing `Arc<TickGapTracker>` reference into `WebSocketConnection` — separate refactor. |
+| 6 | **Defer `GapFill04EventChannelLagged` reconciliation pass to PR-D9.** | Audit-row-only without reconciliation = Rule 14 false-OK anti-pattern. Full reconciliation needs SELECT against `historical_candles`, gap-detection logic, synthetic plan dispatch — its own vertical slice. |
+
+### What PR-D6 ships
+
+- `GapFillExecutorDeps`: 2 new fields — `nse_eq_sids: Arc<Vec<u32>>` (snapshot from `InstrumentRegistry.by_exchange_segment()[NseEquity]` at boot), `fetch_semaphore: Arc<Semaphore>` (capacity = `GAP_FILL_MAX_CONCURRENT_FETCHES`).
+- `execute_bar_for_all_indices` renamed to `execute_bar_for_all_instruments`; iterates `GAP_FILL_INDICES` + `nse_eq_sids` via `JoinSet`; each task acquires a permit before fetching.
+- Boot wiring in `main.rs` Step 8.x: snapshot NSE_EQ sec_ids from registry before constructing `GapFillExecutorDeps`. Logged via `info!` with count + bytes for forensics.
+- Audit row's `sids_requested` now reflects the bigger count (4 + |nse_eq_sids|).
+- 3 ratchet tests:
+  - `test_gap_fill_executor_deps_carries_nse_eq_sids_and_semaphore` — struct shape pinning
+  - `test_gap_fill_executor_deps_new_accepts_nse_eq_snapshot` — constructor wiring
+  - `test_semaphore_capacity_equals_gap_fill_max_concurrent_fetches_constant` — capacity invariant
+
+### What PR-D6 does NOT include (deferred to PR-D7/D8/D9)
+
+- Per-conn precision via `DisconnectResolvedEvent.sec_ids: Arc<Vec<u32>>` (PR-D7)
+- `outage_start_secs` refinement using last-seen-tick from `TickGapTracker` (PR-D8)
+- `GapFill04EventChannelLagged` reconciliation SELECT pass (PR-D9)
 
 ## Original plan items mapped to PR series
 
