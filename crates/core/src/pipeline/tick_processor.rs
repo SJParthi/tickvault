@@ -371,6 +371,55 @@ fn derive_depth_timestamp_secs(
     }
 }
 
+/// Phase 0 Item 12 helper — format the trading date (`YYYY-MM-DD` in
+/// IST) from a UTC `received_at_nanos`. Used by the LATE-TICK audit
+/// row write at the G1 reject site.
+///
+/// Cold path — runs only when a tick stamps at or after 15:30:00 IST.
+fn format_trading_date_ist(received_at_nanos: i64) -> String {
+    let utc_secs = received_at_nanos / 1_000_000_000;
+    let ist_secs = utc_secs.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+    let day_number = ist_secs.div_euclid(i64::from(SECONDS_PER_DAY));
+    // Anchor: epoch day 0 = 1970-01-01.
+    let dt = chrono::NaiveDate::from_num_days_from_ce_opt(
+        i32::try_from(day_number)
+            .unwrap_or(0)
+            .saturating_add(719_163),
+    )
+    .unwrap_or_else(|| {
+        // Fallback only if div_euclid produced something pathological
+        // (impossible for any valid timestamp post-1970). Use today
+        // 2026-05-17 as a defensive sentinel that's still parseable.
+        chrono::NaiveDate::from_ymd_opt(2026, 5, 17).unwrap_or_default()
+    });
+    dt.format("%Y-%m-%d").to_string()
+}
+
+/// Phase 0 Item 12 helper — format the bar minute (`HH:MM`) from an
+/// IST seconds-of-day value. Used by the LATE-TICK audit row write.
+fn format_bar_minute_ist(secs_of_day_ist: u32) -> String {
+    let h = secs_of_day_ist / 3600;
+    let m = (secs_of_day_ist % 3600) / 60;
+    format!("{h:02}:{m:02}")
+}
+
+/// Phase 0 Item 12 helper — return the static segment-string label for
+/// a Dhan binary segment code. Returns `"UNKNOWN"` for unmapped codes
+/// so the audit writer never has to allocate a transient String.
+fn exchange_segment_label_static(code: u8) -> &'static str {
+    match code {
+        0 => "IDX_I",
+        1 => "NSE_EQ",
+        2 => "NSE_FNO",
+        3 => "NSE_CURRENCY",
+        4 => "BSE_EQ",
+        5 => "MCX_COMM",
+        7 => "BSE_CURRENCY",
+        8 => "BSE_FNO",
+        _ => "UNKNOWN",
+    }
+}
+
 /// Converts UTC nanoseconds to IST epoch seconds (for stale-day check on wall-clock time).
 ///
 /// O(1) — 2 arithmetic ops.
@@ -948,6 +997,65 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     continue;
                 }
                 if !is_within_persist_window(tick.exchange_timestamp) {
+                    // Phase 0 Item 12 (2026-05-17) — `last_tick_audit` LATE-TICK
+                    // anomaly path. Before dropping the tick, if its
+                    // `exchange_timestamp` stamps at or after the session
+                    // close boundary (15:30:00 IST), record a forensic
+                    // audit row + increment the diagnostic counter. The
+                    // audit row's DEDUP key
+                    // `(trading_date_ist, bar_minute, security_id, exchange_segment)`
+                    // collapses bursts to one row per minute-bar per SID
+                    // so the operator can query "did Dhan ever stamp a
+                    // tick after 15:30:00 today?" without per-tick noise.
+                    let exchange_secs_of_day = tick.exchange_timestamp % SECONDS_PER_DAY;
+                    if exchange_secs_of_day >= TICK_PERSIST_END_SECS_OF_DAY_IST {
+                        metrics::counter!("tv_late_tick_after_boundary_total").increment(1);
+                        if let Some(qcfg) = tickvault_storage::global_questdb_config() {
+                            let qcfg = qcfg.clone();
+                            let security_id = tick.security_id;
+                            let exchange_ts = tick.exchange_timestamp;
+                            let exchange_segment_code = tick.exchange_segment_code;
+                            let received_at_nanos = tick.received_at_nanos;
+                            tokio::spawn(async move {
+                                // O(1) EXEMPT: cold path — runs only on
+                                // post-15:30 ticks (should be zero in
+                                // steady state).
+                                let trading_date_str = format_trading_date_ist(received_at_nanos);
+                                let bar_minute_str = format_bar_minute_ist(exchange_secs_of_day);
+                                let segment_str =
+                                    exchange_segment_label_static(exchange_segment_code);
+                                let ts_nanos_ist =
+                                    i64::from(exchange_ts).saturating_mul(1_000_000_000);
+                                let last_tick_exchange_ts_nanos = ts_nanos_ist;
+                                // Late-by: signed ms between received-at
+                                // and exchange_ts. Positive = tick is
+                                // BEHIND wall-clock arrival.
+                                let received_ms = received_at_nanos / 1_000_000;
+                                let exchange_ms = i64::from(exchange_ts).saturating_mul(1_000);
+                                let late_arrival_ms = received_ms.saturating_sub(exchange_ms);
+                                if let Err(err) =
+                                    tickvault_storage::last_tick_audit_persistence::append_last_tick_audit_row(
+                                        &qcfg,
+                                        ts_nanos_ist,
+                                        &trading_date_str,
+                                        &bar_minute_str,
+                                        security_id,
+                                        segment_str,
+                                        last_tick_exchange_ts_nanos,
+                                        late_arrival_ms,
+                                    )
+                                    .await
+                                {
+                                    error!(
+                                        security_id,
+                                        exchange_ts,
+                                        ?err,
+                                        "last_tick_audit row insert failed"
+                                    );
+                                }
+                            });
+                        }
+                    }
                     outside_hours_filtered = outside_hours_filtered.saturating_add(1);
                     m_outside_hours.increment(1);
                     continue;
@@ -3762,6 +3870,68 @@ mod tests {
             !body.contains("SystemTime"),
             "G1 body MUST NOT call SystemTime — pure function on the param"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 0 Item 12 — last_tick_audit late-tick anomaly ratchets (2026-05-17)
+    // -----------------------------------------------------------------------
+
+    /// Source-scan ratchet (Rule 13): the G1 reject site MUST call
+    /// `append_last_tick_audit_row` for ticks stamped at or after
+    /// session close. Without this call, the writer is defined but
+    /// never invoked in production.
+    #[test]
+    fn test_late_tick_calls_append_last_tick_audit_row() {
+        let source = include_str!("tick_processor.rs");
+        assert!(
+            source.contains("append_last_tick_audit_row"),
+            "tick_processor.rs MUST call append_last_tick_audit_row — \
+             Phase 0 Item 12 LATE-TICK forensic path"
+        );
+        assert!(
+            source.contains("tv_late_tick_after_boundary_total"),
+            "tick_processor.rs MUST emit tv_late_tick_after_boundary_total counter — \
+             Phase 0 Item 12 LATE-TICK observability"
+        );
+    }
+
+    /// `format_bar_minute_ist` ratchet — well-known boundaries.
+    #[test]
+    fn test_format_bar_minute_ist_at_15_30_returns_15_30() {
+        assert_eq!(format_bar_minute_ist(15 * 3600 + 30 * 60), "15:30");
+    }
+
+    #[test]
+    fn test_format_bar_minute_ist_at_15_29_59_returns_15_29() {
+        assert_eq!(format_bar_minute_ist(15 * 3600 + 29 * 60 + 59), "15:29");
+    }
+
+    #[test]
+    fn test_format_bar_minute_ist_at_09_15_returns_09_15() {
+        assert_eq!(format_bar_minute_ist(9 * 3600 + 15 * 60), "09:15");
+    }
+
+    /// `exchange_segment_label_static` ratchet — the 8 known Dhan codes.
+    #[test]
+    fn test_exchange_segment_label_static_known_codes() {
+        assert_eq!(exchange_segment_label_static(0), "IDX_I");
+        assert_eq!(exchange_segment_label_static(1), "NSE_EQ");
+        assert_eq!(exchange_segment_label_static(2), "NSE_FNO");
+        assert_eq!(exchange_segment_label_static(3), "NSE_CURRENCY");
+        assert_eq!(exchange_segment_label_static(4), "BSE_EQ");
+        assert_eq!(exchange_segment_label_static(5), "MCX_COMM");
+        assert_eq!(exchange_segment_label_static(7), "BSE_CURRENCY");
+        assert_eq!(exchange_segment_label_static(8), "BSE_FNO");
+    }
+
+    /// `exchange_segment_label_static` ratchet — unknown / gap (6) →
+    /// "UNKNOWN" (NEVER panics). Dhan's enum table has no code 6;
+    /// regression-class fix from I-P1-11 audit.
+    #[test]
+    fn test_exchange_segment_label_static_unknown_codes_return_unknown() {
+        assert_eq!(exchange_segment_label_static(6), "UNKNOWN");
+        assert_eq!(exchange_segment_label_static(255), "UNKNOWN");
+        assert_eq!(exchange_segment_label_static(99), "UNKNOWN");
     }
 
     // -----------------------------------------------------------------------
