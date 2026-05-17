@@ -19,6 +19,7 @@ use crate::parser::types::ParsedFrame;
 use tickvault_common::constants::{
     DEDUP_RING_BUFFER_POWER, IST_UTC_OFFSET_SECONDS, MINIMUM_VALID_EXCHANGE_TIMESTAMP,
     SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST, TICK_PERSIST_START_SECS_OF_DAY_IST,
+    WS_GRACE_AFTER_CLOSE_SECS_U32,
 };
 use tickvault_common::tick_types::{GreeksEnricher, ParsedTick};
 
@@ -280,13 +281,25 @@ fn current_received_at_nanos() -> i64 {
 }
 
 /// Returns `true` if the wall-clock time (received_at_nanos) falls within
-/// the tick persist window [09:00, 15:30) IST.
+/// the tick persist window `[09:00, 15:31) IST`.
 ///
 /// Defense-in-depth: rejects stale snapshot ticks that arrive after market
 /// close. The WebSocket continues to stream snapshot data post-market with
 /// exchange_timestamp from during market hours. Without this check, those
 /// stale ticks pass `is_within_persist_window` (which only checks the
 /// exchange_timestamp) and pollute the `ticks` table.
+///
+/// ## Phase 0 Item 11 — G2 wall-clock grace (2026-05-17)
+///
+/// The upper bound is `TICK_PERSIST_END_SECS_OF_DAY_IST +
+/// WS_GRACE_AFTER_CLOSE_SECS` = `15:30:00 + 60s = 15:31:00` IST. This
+/// cures the **dual-gate bug** documented in `topic-PHASE-0-LEAN-LOCKED.md`
+/// §8: a tick with `exchange_timestamp = 15:29:59.586` was REJECTED
+/// because local wall-clock had advanced to `15:30:00.100` by the time
+/// the gate evaluated. With the 60s grace tail, that tick is now
+/// accepted (G1 says exchange-ts is in-window; G2 says wall-clock is
+/// within the grace tail). The 60s window matches Dhan's worst-case
+/// ingestion + network delay at close-of-day.
 ///
 /// I-P1-AUDIT-11 (2026-04-17): also monitors NTP clock skew. If the
 /// wall-clock goes BACKWARD by more than `CLOCK_SKEW_BACKWARD_THRESHOLD_NANOS`
@@ -326,8 +339,13 @@ fn is_wall_clock_within_persist_window(received_at_nanos: i64) -> bool {
     }
 
     let wall_clock_ist_secs_of_day = utc_nanos_to_ist_secs_of_day(received_at_nanos);
-    (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
-        .contains(&wall_clock_ist_secs_of_day)
+    // Phase 0 Item 11: G2 grace tail. Use `TICK_PERSIST_END +
+    // WS_GRACE_AFTER_CLOSE_SECS` (= 15:31:00) as the upper bound so a
+    // tick stamped at 15:29:59.x with wall-clock 15:30:00.x is not
+    // wrongly rejected.
+    let grace_upper_bound =
+        TICK_PERSIST_END_SECS_OF_DAY_IST.saturating_add(WS_GRACE_AFTER_CLOSE_SECS_U32);
+    (TICK_PERSIST_START_SECS_OF_DAY_IST..grace_upper_bound).contains(&wall_clock_ist_secs_of_day)
 }
 
 /// Selects the depth timestamp: exchange_timestamp if valid, else wall-clock.
@@ -3627,6 +3645,123 @@ mod tests {
         assert!(is_within_persist_window(
             TICK_PERSIST_END_SECS_OF_DAY_IST - 1
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 0 Item 11 — G1/G2 dual-gate market-hours ratchets (2026-05-17)
+    // -----------------------------------------------------------------------
+
+    /// Helper: convert IST `(h, m, s)` to a UTC wall-clock nanosecond
+    /// value that, when passed through `utc_nanos_to_ist_secs_of_day`,
+    /// rounds to the same `secs-of-day` as the input (h:m:s).
+    ///
+    /// We back-compute UTC nanos by taking IST secs-of-day, subtracting
+    /// the IST offset to get UTC secs-of-day, then anchoring to the
+    /// arbitrary day 2026-05-17 (the day in which the original bug
+    /// was reproduced).
+    fn ist_hms_to_utc_received_at_nanos(h: u32, m: u32, s: u32, sub_ms: u32) -> i64 {
+        // Anchor at any UTC midnight that is a clean multiple of 86400.
+        // `utc_nanos_to_ist_secs_of_day` extracts the IST seconds-of-day
+        // via `(utc_secs + IST_OFFSET) % SECONDS_PER_DAY` — so the day
+        // anchor is irrelevant as long as it lands on a UTC midnight.
+        // Day 20598 UTC midnight = 20598 * 86400 = 1_779_667_200.
+        let day_anchor_utc_secs: i64 = 20_598_i64.saturating_mul(86_400);
+        let ist_secs_of_day: i64 = i64::from(h) * 3600 + i64::from(m) * 60 + i64::from(s);
+        let utc_secs_of_day: i64 =
+            ist_secs_of_day.saturating_sub(i64::from(IST_UTC_OFFSET_SECONDS));
+        let utc_secs = day_anchor_utc_secs.saturating_add(utc_secs_of_day);
+        let extra_ms: i64 = i64::from(sub_ms);
+        utc_secs.saturating_mul(1_000_000_000) + extra_ms * 1_000_000
+    }
+
+    /// Item 11 scenario test: tick with `exchange_ts = 15:29:59.586` IST
+    /// MUST be accepted even when local wall-clock has advanced to
+    /// `15:30:00.100` IST.
+    ///
+    /// Reproduces the original yesterday-bug: the legacy gate rejected
+    /// this tick because the wall-clock had crossed 15:30:00 by the
+    /// time the gate evaluated. With the 60s G2 grace window, the gate
+    /// now accepts it.
+    #[test]
+    fn test_tick_with_exchange_ts_15_29_59_586_accepted_even_if_local_recv_15_30_00_100() {
+        // G1 — exchange-ts gate: 15:29:59 IST is in [09:15:00, 15:30:00).
+        let exchange_ts_secs = 15 * 3600 + 29 * 60 + 59; // 15:29:59 IST
+        assert!(
+            is_within_persist_window(exchange_ts_secs),
+            "G1 must accept exchange_ts inside [09:00, 15:30) — 15:29:59 is in-session"
+        );
+        // G2 — wall-clock gate: 15:30:00.100 IST is in [09:00, 15:31)
+        // because of the 60s grace tail.
+        let recv_at_nanos = ist_hms_to_utc_received_at_nanos(15, 30, 0, 100);
+        assert!(
+            is_wall_clock_within_persist_window(recv_at_nanos),
+            "G2 grace tail (PR-Item-11) must accept wall-clock 15:30:00.100"
+        );
+    }
+
+    /// Item 11 scenario test: a tick stamped exactly at session close
+    /// (`exchange_ts = 15:30:00.000` IST) MUST be REJECTED by G1 — the
+    /// market window is half-open `[09:15, 15:30)`.
+    #[test]
+    fn test_tick_with_exchange_ts_15_30_00_000_rejected() {
+        let exchange_ts_secs = 15 * 3600 + 30 * 60; // 15:30:00 IST
+        assert!(
+            !is_within_persist_window(exchange_ts_secs),
+            "G1 must reject exchange_ts at exactly 15:30:00 — interval is half-open"
+        );
+    }
+
+    /// Item 11 scenario test: G2 wall-clock gate MUST stay open until
+    /// 15:31:00 IST (60s grace tail), then close.
+    #[test]
+    fn test_ws_socket_stays_open_until_15_31_00() {
+        // At 15:30:59 wall-clock — STILL inside the grace tail.
+        let recv_15_30_59 = ist_hms_to_utc_received_at_nanos(15, 30, 59, 0);
+        assert!(
+            is_wall_clock_within_persist_window(recv_15_30_59),
+            "G2 must remain open at wall-clock 15:30:59 (inside 60s grace)"
+        );
+        // At 15:31:00 wall-clock — boundary, gate closes.
+        let recv_15_31_00 = ist_hms_to_utc_received_at_nanos(15, 31, 0, 0);
+        assert!(
+            !is_wall_clock_within_persist_window(recv_15_31_00),
+            "G2 must close at wall-clock 15:31:00 sharp — grace window is half-open"
+        );
+    }
+
+    /// Item 11 source-scan ratchet: the G1 exchange-ts gate body
+    /// (`is_within_persist_window`) MUST NOT call any local-clock
+    /// helper. The bug spec verbatim: "market-hours gate evaluates
+    /// `is_within_market_hours_ist(now())` — checks LOCAL clock instead
+    /// of the tick's stamped time."
+    #[test]
+    fn test_market_gate_does_not_call_local_now() {
+        let source = include_str!("tick_processor.rs");
+        let fn_marker = "fn is_within_persist_window(";
+        let start = source
+            .find(fn_marker)
+            .expect("is_within_persist_window must exist");
+        // Function body extends through the next blank-line + closing
+        // brace. Use the next `fn ` declaration as the upper bound —
+        // far more than enough.
+        let after = &source[start..];
+        let next_fn = after
+            .find("\nfn ")
+            .map(|i| start + i)
+            .unwrap_or(source.len());
+        let body = &source[start..next_fn];
+        assert!(
+            !body.contains("Utc::now"),
+            "G1 (is_within_persist_window) body MUST NOT call Utc::now — that was the bug"
+        );
+        assert!(
+            !body.contains("now_ist"),
+            "G1 body MUST NOT call now_ist — must use exchange_timestamp param"
+        );
+        assert!(
+            !body.contains("SystemTime"),
+            "G1 body MUST NOT call SystemTime — pure function on the param"
+        );
     }
 
     // -----------------------------------------------------------------------

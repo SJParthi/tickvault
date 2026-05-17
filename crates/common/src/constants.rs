@@ -2450,6 +2450,18 @@ pub const MARKET_CLOSE_IST_NANOS: i64 = 55_800_000_000_000;
 /// ticks stamped before close.
 pub const WS_GRACE_AFTER_CLOSE_SECS: u64 = 60;
 
+/// Same value as [`WS_GRACE_AFTER_CLOSE_SECS`] but typed `u32` for use
+/// with the `secs-of-day` arithmetic in tick-processor gate functions
+/// where `TICK_PERSIST_END_SECS_OF_DAY_IST` is also `u32`. A compile-time
+/// assert below pins the two to the same numeric value.
+pub const WS_GRACE_AFTER_CLOSE_SECS_U32: u32 = 60;
+
+const _: () = assert!(
+    WS_GRACE_AFTER_CLOSE_SECS_U32 as u64 == WS_GRACE_AFTER_CLOSE_SECS,
+    "WS_GRACE_AFTER_CLOSE_SECS_U32 must equal WS_GRACE_AFTER_CLOSE_SECS — \
+     they describe the same 60s grace window in two integer widths"
+);
+
 /// G2 Wall-Clock Gate — number of seconds AFTER session-end bar
 /// (15:29-15:30) before forcing the seal. Matches `WS_GRACE_AFTER_CLOSE_SECS`
 /// by design: the 15:29 bar seals at 15:31:00 IST exchange-ts so any
