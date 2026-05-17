@@ -3534,13 +3534,68 @@ async fn main() -> Result<()> {
     let (gap_fill_event_tx, gap_fill_event_rx) =
         tickvault_core::websocket::disconnect_event::create_disconnect_event_channel();
     let gap_fill_shutdown_notify = std::sync::Arc::new(tokio::sync::Notify::new());
-    tokio::spawn(async move {
-        tickvault_core::historical::gap_fill_scheduler::run_gap_fill_scheduler(
-            gap_fill_event_rx,
-            gap_fill_shutdown_notify,
-        )
-        .await;
-    });
+
+    // Phase 0 PR-D3-impl (2026-05-17) — build the executor deps and
+    // pass them to the scheduler. The scheduler now performs the
+    // actual REST fetch + UPSERT for NIFTY index gap-fill bars
+    // (MVP slice; PR-D4 generalises to per-instrument iteration).
+    //
+    // The dedicated CandlePersistenceWriter is constructed fresh here
+    // (NOT shared with the boot-time historical fetcher) to avoid
+    // mutable-borrow conflicts. If QuestDB is unreachable, log error
+    // and DO NOT spawn the executor — the scheduler stays inert
+    // (broadcast receiver drops eventually on shutdown).
+    let gap_fill_endpoint = format!(
+        "{}/charts/intraday",
+        config.dhan.rest_api_base_url.trim_end_matches('/')
+    );
+    let gap_fill_http_client = std::sync::Arc::new(
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(
+                tickvault_common::constants::GAP_FILL_FETCH_TIMEOUT_SECS,
+            ))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new()),
+    );
+    let gap_fill_writer_result =
+        tickvault_storage::candle_persistence::CandlePersistenceWriter::new(&config.questdb);
+    match gap_fill_writer_result {
+        Ok(writer) => {
+            let writer_arc: std::sync::Arc<
+                tokio::sync::Mutex<
+                    dyn tickvault_core::historical::gap_fill_scheduler::GapFillCandleSink,
+                >,
+            > = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
+            let deps = tickvault_core::historical::gap_fill_scheduler::GapFillExecutorDeps::new(
+                gap_fill_http_client,
+                gap_fill_endpoint,
+                token_handle.clone(),
+                ws_client_id.clone().into(),
+                writer_arc,
+            );
+            tokio::spawn(async move {
+                tickvault_core::historical::gap_fill_scheduler::run_gap_fill_scheduler(
+                    gap_fill_event_rx,
+                    gap_fill_shutdown_notify,
+                    deps,
+                )
+                .await;
+            });
+        }
+        Err(err) => {
+            error!(
+                ?err,
+                "gap-fill scheduler: failed to construct dedicated CandlePersistenceWriter — \
+                 gap-fill subsystem disabled this session; broadcast receiver will drain on \
+                 shutdown"
+            );
+            // Explicitly drop the receiver so the broadcast Sender's
+            // `tx.send()` from connection.rs returns `Err(NoReceivers)`
+            // and the connection-side warn! fires (visible degradation
+            // per audit-findings Rule 5).
+            drop(gap_fill_event_rx);
+        }
+    }
 
     let (pool_receiver, ws_pool_ready) = if should_connect_ws {
         match create_websocket_pool(
