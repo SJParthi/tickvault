@@ -445,19 +445,71 @@ contract below — zero TBDs.
 - Rule 16 (Arc<Notify> shutdown): inherited from PR-C; not changed
 - Rule 17 (front-loaded investigation): PR-D1 + PR-D2 + this plan section did the investigation; PR-D3 is pure implementation
 
-## PR-D4 Status — QUEUED (per-instrument iteration + Grafana)
-5. Telegram event emission via `GapFillCompleted`/`Partial`/`Failed`.
+## PR-D4 Status — SHIPPED 2026-05-17 (indices fan-out + audit + Telegram)
 
-PR-D2 will be ~600-1000 LoC across `candle_fetcher.rs`, `gap_fill_scheduler.rs`,
-`main.rs`. Best done in a fresh focused session.
+Branch: `claude/phase-0-gap-fill-pr-d4-indices-fanout`.
 
-## PR-D3 Status — QUEUED for fresh session
+### What PR-D4 shipped
 
-PR-D3 ships the observability layer:
+1. **Indices-only fan-out** — replaced PR-D3's hardcoded NIFTY with
+   `GAP_FILL_INDICES: &[(u32, u8, &str); 4]` covering NIFTY=13,
+   BANKNIFTY=25, SENSEX=51, INDIA VIX=21. Scope locked per
+   `websocket-connection-scope-lock.md` §I.
+2. **`execute_gap_fill_for_bar` generalised** — accepts
+   `(security_id, segment_code, instrument_type)` parameters.
+3. **New per-bar driver `execute_bar_for_all_indices`** — iterates
+   the 4 SIDs, tallies `(sids_completed, sids_failed)`, emits one
+   audit row + one Telegram per bar (NOT per SID — operator wants
+   bar-scoped, not noise).
+4. **`gap_fill_audit` row writes** — `(trading_date_ist, bar_minute,
+   sids_requested=4, sids_completed, sids_failed, duration_ms,
+   result ∈ {success,partial,failed})` per bar. Audit-row write
+   failure logs `GAP-FILL-03` but does NOT fail the bar (candles
+   already UPSERTed).
+5. **Telegram emission** — `GapFillCompleted` Info on full success,
+   `GapFillPartial` High with sample-of-5 failed SIDs on mixed
+   outcome, `GapFillFailed` Critical with last error + attempt count
+   when zero SIDs succeed.
+6. **`GapFillExecutorDeps` extended** with `questdb_config` +
+   `notification_service`. Boot wiring in `main.rs` passes
+   `config.questdb.clone()` + `Arc::clone(&notifier)`.
+7. **New metric** — `tv_gap_fill_bars_partial_total`. Semantics
+   tightened: `bars_succeeded` now = ALL 4 SIDs ok per bar (was: per
+   bar regardless of NIFTY-only outcome under PR-D3).
 
-- Grafana panel + alert rule for the 3 Prom counters
+### What PR-D4 does NOT include (deferred to PR-D5)
+
+- NSE_EQ equities fan-out (~218 SIDs) — needs
+  `tokio::sync::Semaphore(GAP_FILL_MAX_CONCURRENT_FETCHES)` +
+  per-conn instrument snapshot on `DisconnectResolvedEvent`.
+- `outage_start_secs` refinement (still uses PR-C's
+  `now - estimated_outage_secs` placeholder).
+- `GapFill04EventChannelLagged` reconciliation pass (logged today;
+  scheduler-catchup audit-row emission deferred).
+- Grafana panel + alert rule for the 4 gap-fill counters (PR-D5/D6).
+
+### Ratchet tests added (6 new)
+
+- `test_gap_fill_indices_has_four_entries` — pins 4-SID scope
+- `test_gap_fill_indices_security_ids_match_dhan_master` — pins SIDs
+- `test_gap_fill_indices_all_idx_i_segment` — pins IDX_I segment
+- `test_trading_date_ist_string_formats_yyyy_mm_dd` — date helper
+- `test_bar_minute_ist_string_formats_hh_mm` — minute helper
+- `test_telegram_failed_sid_sample_cap_matches_variant_doc` — cap
+
+Replaced: `test_mvp_nifty_constants_pinned` (PR-D3 constant retired).
+
+Total: 16/16 scheduler tests + 9/9 audit-persistence tests green.
+
+## PR-D5 Status — QUEUED for fresh session
+
+PR-D5 covers:
+- NSE_EQ equities fan-out (~218 SIDs) gated by Semaphore
+- Per-conn instrument-snapshot extension to `DisconnectResolvedEvent`
+- Grafana panel + alert rule for the 4 gap-fill counters
 - DH-904 backoff observability counters
 - `tv_gap_fill_rest_latency_ms` histogram (Item 8 of original plan)
+- Scheduler-catchup audit-row emission for `Lagged(n)` events
 
 ## Original plan items mapped to PR series
 

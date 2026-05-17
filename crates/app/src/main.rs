@@ -3572,6 +3572,8 @@ async fn main() -> Result<()> {
                 token_handle.clone(),
                 ws_client_id.clone().into(),
                 writer_arc,
+                config.questdb.clone(),
+                std::sync::Arc::clone(&notifier),
             );
             tokio::spawn(async move {
                 tickvault_core::historical::gap_fill_scheduler::run_gap_fill_scheduler(
