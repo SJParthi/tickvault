@@ -16,6 +16,11 @@ pub mod activity_watchdog;
 pub mod connection;
 pub mod connection_pool;
 pub mod depth_connection;
+// Phase 0 Item 8+9 (PR-C, 2026-05-17) — typed broadcast payload from the
+// connection layer to the gap-fill subsystem. See
+// `.claude/plans/active-plan-item-8-9-gap-fill.md` "Locked architectural
+// decisions" + `audit-findings-2026-04-17.md` Rule 15.
+pub mod disconnect_event;
 pub mod market_hours_gate;
 pub mod order_update_connection;
 pub mod pool_watchdog;

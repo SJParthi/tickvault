@@ -151,6 +151,45 @@ impl WebSocketConnectionPool {
         notifier: Option<std::sync::Arc<crate::notification::NotificationService>>,
         wal_spill: Option<Arc<WsFrameSpill>>,
     ) -> Result<Self, WebSocketError> {
+        Self::new_with_optional_wal_and_disconnect_events(
+            token_handle,
+            client_id,
+            dhan_config,
+            ws_config,
+            instruments,
+            feed_mode,
+            notifier,
+            wal_spill,
+            None,
+        )
+    }
+
+    /// Phase 0 Item 8+9 (PR-C, 2026-05-17) — pool constructor variant
+    /// that additionally accepts a disconnect-event broadcast Sender.
+    ///
+    /// The Sender is cloned into each `WebSocketConnection` via
+    /// `with_disconnect_event_sender()`. Per architectural lock in
+    /// `audit-findings-2026-04-17.md` Rule 15: pass `Some(tx)` only
+    /// from the boot path that also spawns the gap-fill scheduler
+    /// receiver; pass `None` from tests + any production path that
+    /// doesn't wire gap-fill.
+    #[allow(clippy::too_many_arguments)] // APPROVED: Phase 0 Item 8+9 PR-C — adds disconnect-event Sender to existing 8-arg constructor
+    // TEST-EXEMPT: integration-level — requires live Dhan WebSocket endpoint; thin delegate over per-conn builder which IS tested
+    pub fn new_with_optional_wal_and_disconnect_events(
+        token_handle: TokenHandle,
+        client_id: String,
+        dhan_config: DhanConfig,
+        ws_config: WebSocketConfig,
+        instruments: Vec<InstrumentSubscription>,
+        feed_mode: FeedMode,
+        notifier: Option<std::sync::Arc<crate::notification::NotificationService>>,
+        wal_spill: Option<Arc<WsFrameSpill>>,
+        disconnect_event_sender: Option<
+            tokio::sync::broadcast::Sender<
+                crate::websocket::disconnect_event::DisconnectResolvedEvent,
+            >,
+        >,
+    ) -> Result<Self, WebSocketError> {
         let total = instruments.len();
 
         // Compute connection parameters first — needed for dynamic capacity check.
@@ -206,6 +245,9 @@ impl WebSocketConnectionPool {
                 );
                 if let Some(spill) = wal_spill.clone() {
                     conn = conn.with_wal_spill(spill);
+                }
+                if let Some(tx) = disconnect_event_sender.clone() {
+                    conn = conn.with_disconnect_event_sender(tx);
                 }
                 Arc::new(conn)
             })
