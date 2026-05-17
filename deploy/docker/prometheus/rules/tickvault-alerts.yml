@@ -171,6 +171,22 @@ groups:
           summary: "Parse error rate > 1/sec"
           description: "Binary frame parse errors averaging {{ $value }}/sec over 5 minutes."
 
+      # Phase 0 Item 8+9 (PR-D5, 2026-05-17) — Gap-fill bar-failure
+      # surveillance. Fires when >= 1 gap-fill bar has fully failed
+      # (zero SIDs succeeded across all 4 IDX_I indices) in the last
+      # 5 minutes. Edge-triggered semantics: the `increase()[5m] > 0`
+      # window keeps the alert open until the failing bar ages out,
+      # which is fine — operator wants visibility into recurring
+      # bar-level failures, not single transients.
+      - alert: GapFillBarsFailedHigh
+        expr: increase(tv_gap_fill_bars_failed_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gap-fill bars failing — disconnect data may be permanently lost"
+          description: "{{ $value }} gap-fill bar(s) fully failed in the last 5 minutes (all 4 IDX_I indices errored). Inspect gap_fill_audit table for the (trading_date_ist, bar_minute) tuples and the matching GAP-FILL-02 error chain in errors.jsonl."
+
       - alert: HighStorageErrorRate
         expr: rate(tv_storage_errors_total[5m]) > 0.1
         for: 3m

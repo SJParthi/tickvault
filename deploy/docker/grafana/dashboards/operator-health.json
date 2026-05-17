@@ -2250,6 +2250,102 @@
         "graphMode": "area",
         "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" }
       }
+    },
+    {
+      "type": "stat",
+      "id": 57,
+      "title": "Gap-fill bars (5m, by outcome)",
+      "description": "Phase 0 Item 8+9 (PR-D5, 2026-05-17). Per-bar gap-fill outcomes for the 4 IDX_I indices fan-out: succeeded = all 4 SIDs ok; partial = some SIDs failed; failed = zero SIDs succeeded (bar permanently lost until post-market cross-verify catches it). Companion alert: GapFillBarsFailedHigh fires Critical when failed > 0. All series wrapped in increase() per audit-findings Rule 12. Runbook: .claude/rules/project/wave-1-error-codes.md::PHASE2-01 + GAP-FILL-02 in candle_fetcher.rs. Source: crates/core/src/historical/gap_fill_scheduler.rs::execute_bar_for_all_indices.",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 100 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "increase(tv_gap_fill_bars_succeeded_total[5m])",
+          "legendFormat": "succeeded",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "increase(tv_gap_fill_bars_partial_total[5m])",
+          "legendFormat": "partial",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "increase(tv_gap_fill_bars_failed_total[5m])",
+          "legendFormat": "failed",
+          "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "increase(tv_gap_fill_candles_written_total[5m])",
+          "legendFormat": "candles written",
+          "refId": "D"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green" },
+              { "color": "orange", "value": 1 },
+              { "color": "red", "value": 10 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background_solid",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" }
+      }
+    },
+    {
+      "type": "stat",
+      "id": 58,
+      "title": "Gap-fill REST latency p99 / DH-904 retries (5m)",
+      "description": "Phase 0 Item 8+9 (PR-D5, 2026-05-17). Two diagnostic signals for the gap-fill REST path: (1) p99 wall-clock latency of /v2/charts/intraday per attempt (includes both success and error attempts — surfaces Dhan REST tail latency), (2) DH-904 (rate-limit) retry counter split by outcome (retry = backoff fired and we retried; exhausted = retry budget hit and the bar was abandoned). Both increase() per audit-findings Rule 12. Source: crates/core/src/historical/candle_fetcher.rs::fetch_gap_fill_intraday_window. Runbook: .claude/rules/dhan/api-introduction.md rule 8 (DH-904 backoff ladder 10→20→40→80s).",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 100 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(tv_gap_fill_rest_latency_ms_bucket[5m])))",
+          "legendFormat": "latency p99 (ms)",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (outcome) (increase(tv_gap_fill_dh904_retries_total[5m]))",
+          "legendFormat": "DH-904 {{outcome}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green" },
+              { "color": "orange", "value": 500 },
+              { "color": "red", "value": 2000 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background_solid",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" }
+      }
     }
   ]
 }

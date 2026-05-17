@@ -501,15 +501,76 @@ Replaced: `test_mvp_nifty_constants_pinned` (PR-D3 constant retired).
 
 Total: 16/16 scheduler tests + 9/9 audit-persistence tests green.
 
-## PR-D5 Status — QUEUED for fresh session
+## PR-D5 Status — SHIPPED 2026-05-17 (observability + silent-DDL fix)
 
-PR-D5 covers:
+Branch: `claude/phase-0-gap-fill-pr-d5-observability`.
+
+### What PR-D5 shipped
+
+1. **`ensure_gap_fill_audit_table` wired at boot** — added to the DDL
+   `tokio::join!` in `main.rs` alongside the other audit-table helpers.
+   This fixes a silent bug introduced by PR-A: the helper was defined +
+   unit-tested but never called from production, so PR-D4's per-bar
+   `append_gap_fill_audit_row` writes would fail "table not found"
+   until something else happened to create the table. Rule 13 violation
+   fixed.
+2. **`tv_gap_fill_rest_latency_ms` histogram** — per-attempt wall-clock
+   recorded in `fetch_gap_fill_intraday_window` (covers both happy-path
+   and error-path attempts; surfaces Dhan REST tail latency).
+3. **`tv_gap_fill_dh904_retries_total{outcome}`** — counter incremented
+   in the DH-904 RateLimited branch, split by `outcome=retry|exhausted`.
+4. **2 new Grafana panels** in operator-health.json (`y=100`):
+   - "Gap-fill bars (5m, by outcome)" — 4 series wrapped in `increase()`
+     per Rule 12 (succeeded/partial/failed/candles written).
+   - "Gap-fill REST latency p99 / DH-904 retries (5m)" —
+     `histogram_quantile(0.99, ...)` + DH-904 outcome breakdown.
+5. **`GapFillBarsFailedHigh` Prometheus alert** — Critical, fires when
+   `increase(tv_gap_fill_bars_failed_total[5m]) > 0` for ≥ 1 min.
+   Pinned in `resilience_sla_alert_guard::REQUIRED_ALERT_NAMES`.
+6. **`tv_gap_fill_` prefix added** to
+   `grafana_dashboard_snapshot_filter_guard::REQUIRED_DASHBOARD_METRIC_PREFIXES`
+   — future deletion of all gap-fill panels fails the build.
+7. **`gap_fill_audit_boot_wiring_guard` ratchet test** — source-scans
+   `main.rs` for `ensure_gap_fill_audit_table` to block Rule 13
+   regression.
+
+### What PR-D5 does NOT include (deferred to PR-D6)
+
+- NSE_EQ equities fan-out (~218 SIDs) gated by
+  `tokio::sync::Semaphore(GAP_FILL_MAX_CONCURRENT_FETCHES)`
+- Per-conn instrument-snapshot extension to `DisconnectResolvedEvent`
+  (Arc<Vec<InstrumentRef>> payload)
+- `outage_start_secs` refinement using last-seen-tick timestamps
+- Scheduler-catchup audit-row emission on `Lagged(n)` events
+  (currently logged Critical only)
+
+Each of these has architectural decisions that need a focused plan
+session per Rules 15 + 17.
+
+### Verification
+
+- 1841/1841 `tickvault-storage` tests green
+- 469/469 `tickvault-core` historical tests green
+- `cargo fmt --check` clean
+- `banned-pattern-scanner.sh` clean
+- `pub-fn-test-guard.sh` clean (untested pub fn count stable at 143)
+- `pub-fn-wiring-guard.sh` clean
+- `grafana_dashboard_snapshot_filter_guard` 41/41 tests green
+- `resilience_sla_alert_guard` 5/5 tests green
+- `gap_fill_audit_boot_wiring_guard` 1/1 test green
+- Dashboard JSON + alerts YAML both parse clean
+
+## PR-D6 Status — QUEUED for fresh session
+
+PR-D6 covers the remaining items deferred from PR-D5:
 - NSE_EQ equities fan-out (~218 SIDs) gated by Semaphore
 - Per-conn instrument-snapshot extension to `DisconnectResolvedEvent`
-- Grafana panel + alert rule for the 4 gap-fill counters
-- DH-904 backoff observability counters
-- `tv_gap_fill_rest_latency_ms` histogram (Item 8 of original plan)
-- Scheduler-catchup audit-row emission for `Lagged(n)` events
+- `outage_start_secs` refinement (last-seen-tick wiring)
+- `GapFill04EventChannelLagged` reconciliation SELECT pass
+
+The first three items share an architectural decision (event payload
+shape + Semaphore capacity + outage-start computation) that should be
+locked in a plan-file update BEFORE the PR-D6 session opens (Rule 15).
 
 ## Original plan items mapped to PR series
 
