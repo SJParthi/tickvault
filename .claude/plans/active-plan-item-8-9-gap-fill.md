@@ -638,6 +638,50 @@ fan-out shipped in PR-D6.
 - `outage_start_secs` refinement using last-seen-tick from `TickGapTracker` (PR-D8)
 - `GapFill04EventChannelLagged` reconciliation SELECT pass (PR-D9)
 
+## PR-D8 Status — THIS PR (outage_start refinement via shared last-seen LTT cache)
+
+### What PR-D8 ships
+
+Introduces `LastSeenLttCache` — a lock-free `Arc<papaya::HashMap<(u32, u8), i64>>` keyed by `(security_id, segment_code)` per I-P1-11. tick_processor writes the last-seen `exchange_timestamp` for every parsed tick; the gap-fill scheduler reads at disconnect-event handling time to refine `event.outage_start_secs` from the producer's conservative `now - 10s` to the OLDEST last-seen LTT across the conn's subscribed SIDs.
+
+| Item | Detail |
+|---|---|
+| New module | `crates/core/src/pipeline/last_seen_ltt_cache.rs` — `LastSeenLttCache` type mirrors `PrevOiCache` pattern |
+| Hot-path write | tick_processor sites in `run_tick_persistence_consumer` + `run_slow_boot_observability` call `cache.record(sid, segment, ltt)` per tick |
+| Cold-path read | `gap_fill_scheduler` calls `deps.last_seen_ltt_cache.refine_outage_start(event.outage_start_secs, event.subscribed)` before `compute_planned_bars` |
+| Refinement semantics | `min(producer_estimate, min(last_seen for each subscribed sid))` — picks the OLDER bound so any gap > 10s is detected |
+| New counter | `tv_gap_fill_outage_start_refined_total` increments when the refinement changes the estimate |
+| Boot wiring | Slow boot constructs the cache once, clones into `run_slow_boot_observability` + `GapFillExecutorDeps`; fast boot passes a disposable empty cache |
+
+### Architectural decisions (locked)
+
+| # | Decision | Why |
+|---|---|---|
+| 1 | **Scheduler-side refinement, not producer-side** | Producer (`WebSocketConnection`) doesn't own the tick stream; routing every tick through the conn would double hot-path cost |
+| 2 | **`Arc<papaya::HashMap<(u32, u8), i64>>` for storage** | Lock-free; mirrors existing `PrevOiCache` pattern in codebase |
+| 3 | **`i64` storage, not `AtomicI64`** | LTT updates monotonically; race-on-insert produces at most a few seconds of skew, well within refinement tolerance |
+| 4 | **Composite `(u32, u8)` key per I-P1-11** | `security_id` alone is NOT unique across segments |
+| 5 | **`min` not `max` for refinement** | Conservative — the OLDER last-seen bounds the outage window; refilling from `T` ensures no gap is missed |
+
+### Ratchet tests added (12)
+
+- 10 in `last_seen_ltt_cache::tests` covering empty cache, record/get roundtrip, I-P1-11 segment distinction, overwrite, all 6 refinement paths, Arc-share semantics
+- 2 in `gap_fill_scheduler::tests`: `test_gap_fill_executor_deps_carries_last_seen_ltt_cache`, `test_refine_outage_start_picks_older_cache_value_over_producer_estimate`
+
+### Verification
+
+- 12/12 `last_seen_ltt_cache` tests green
+- 36/36 `gap_fill_scheduler` tests green
+- `cargo check -p tickvault-core -p tickvault-app` green
+- `cargo fmt --check` clean
+- `banned-pattern-scanner.sh` clean
+- `pub-fn-test-guard.sh` clean (untested pub fn count stable at 143)
+- `pub-fn-wiring-guard.sh` clean
+
+### What PR-D8 does NOT include (deferred to PR-D9)
+
+- `GapFill04EventChannelLagged` reconciliation SELECT pass + audit row
+
 ## Original plan items mapped to PR series
 
 | Plan Item | PR |

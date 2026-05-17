@@ -20,6 +20,7 @@ pub mod option_movers;
 // `movers_1s.phase` SYMBOL column populated by `movers_pipeline`.
 // The legacy `stock_movers` table it wrote into is dropped by the
 // one-shot migration in `movers_base_persistence`.
+pub mod last_seen_ltt_cache;
 pub mod prev_close_persist;
 pub mod prev_close_writer;
 pub mod prev_day_close_stamper;
