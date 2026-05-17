@@ -3054,6 +3054,15 @@ async fn main() -> Result<()> {
         tickvault_storage::boot_audit_persistence::ensure_boot_audit_table(&config.questdb),
         tickvault_storage::selftest_audit_persistence::ensure_selftest_audit_table(&config.questdb),
         tickvault_storage::order_audit_persistence::ensure_order_audit_table(&config.questdb),
+        // Phase 0 Item 8+9 (PR-D5, 2026-05-17) — gap_fill_audit forensic
+        // table. PR-D4 began writing rows via `append_gap_fill_audit_row`
+        // but the DDL helper was previously not wired; first INSERT would
+        // fail until this table existed. Same 90d-hot → S3 IT → Glacier
+        // lifecycle as the other audit tables. Idempotent CREATE TABLE
+        // IF NOT EXISTS — safe to call every boot.
+        tickvault_storage::gap_fill_audit_persistence::ensure_gap_fill_audit_table(
+            &config.questdb
+        ),
         // Phase 0 Item 12 — `last_tick_audit` forensic table. Captures
         // per-SID last-tick exchange_ts at each minute seal so the
         // operator can answer "what was the last tick BANKNIFTY received

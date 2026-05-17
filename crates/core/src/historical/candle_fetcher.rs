@@ -1718,11 +1718,27 @@ pub async fn fetch_gap_fill_intraday_window(
         http_status: 400, // Pre-flight rejection (gap-at-6 or unknown segment)
     })?;
 
+    // PR-D5 (2026-05-17) — per-attempt latency histogram + DH-904 retry
+    // counter. Both metrics are gap-fill-specific (NOT shared with the
+    // boot-time historical fetcher in `fetch_intraday_with_retry`) so
+    // the operator can isolate WebSocket-disconnect-driven REST traffic
+    // from boot-time backfill traffic.
+    let latency_histogram = metrics::histogram!("tv_gap_fill_rest_latency_ms");
+    let dh904_retries_exhausted = metrics::counter!(
+        "tv_gap_fill_dh904_retries_total",
+        "outcome" => "exhausted"
+    );
+    let dh904_retries_retry = metrics::counter!(
+        "tv_gap_fill_dh904_retries_total",
+        "outcome" => "retry"
+    );
+
     for attempt in 0..=max_retries {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(compute_retry_delay_ms(attempt))).await;
         }
 
+        let attempt_started_at = std::time::Instant::now();
         let result = http_client
             .post(endpoint)
             .header("access-token", access_token.as_str())
@@ -1732,6 +1748,17 @@ pub async fn fetch_gap_fill_intraday_window(
             .json(&request_body)
             .send()
             .await;
+        // Record the per-attempt wall-clock latency exactly once, before
+        // we branch on the result. Includes both happy-path and
+        // error-path attempts so the histogram reflects true Dhan REST
+        // tail latency, not just successful attempts.
+        let elapsed_ms = attempt_started_at.elapsed().as_millis();
+        // O(1) EXEMPT: cold path (~5 REST calls/disconnect, ~5
+        // disconnects/day). `as f64` cast saturates at f64::MAX for
+        // inputs > 2^53 ms (~285k years) — outside any realistic
+        // latency range.
+        #[allow(clippy::cast_precision_loss)] // APPROVED: see comment above
+        latency_histogram.record(elapsed_ms as f64);
 
         match result {
             Ok(response) => {
@@ -1744,10 +1771,12 @@ pub async fn fetch_gap_fill_intraday_window(
                         }
                         ErrorAction::RateLimited => {
                             if is_dh904_exhausted(attempt) {
+                                dh904_retries_exhausted.increment(1);
                                 return Err(GapFillFetchError::RateLimitExhausted {
                                     attempts: attempt.saturating_add(1),
                                 });
                             }
+                            dh904_retries_retry.increment(1);
                             let backoff = compute_dh904_backoff_secs(attempt);
                             tokio::time::sleep(Duration::from_secs(backoff)).await;
                             continue;

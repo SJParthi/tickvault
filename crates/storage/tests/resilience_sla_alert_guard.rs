@@ -66,6 +66,12 @@ const REQUIRED_ALERT_NAMES: &[&str] = &[
     "AuthCircuitBreakerOpen",
     "IpMismatchDetected",
     "InstrumentRegistryCollisionDrift",
+    // Phase 0 Item 8+9 (PR-D5, 2026-05-17) — gap-fill bar-failure
+    // surveillance. Fires when any disconnect-driven gap-fill bar
+    // fully fails across all 4 IDX_I indices. Without this alert
+    // the operator only learns about a permanently-lost bar via
+    // post-market cross-verify at ~17:00 IST — too late to act.
+    "GapFillBarsFailedHigh",
 ];
 
 #[test]
