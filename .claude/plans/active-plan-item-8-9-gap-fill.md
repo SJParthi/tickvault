@@ -284,7 +284,39 @@ ZERO behavioural change — only visibility keywords. 220 existing
 `candle_fetcher` tests pass without modification. No new pub fns (Rule 14
 compliant). No new call sites needed in this PR — call sites land in PR-D2.
 
-## PR-D2 Status — QUEUED for fresh session
+## PR-D2 Status (2026-05-17) — THIS PR (REST fetch pub helper)
+
+Ships the new `pub async fn fetch_gap_fill_intraday_window` in
+`candle_fetcher.rs` plus 3 pure-function helpers (`format_dhan_ist_datetime`,
+`dhan_segment_string_from_code`, `build_gap_fill_intraday_request`) and
+the typed `GapFillFetchError` enum.
+
+The async fetch fn reuses the pub(crate) primitives promoted in PR-D1
+(#672) — `classify_error`, `compute_dh904_backoff_secs`, `is_dh904_exhausted`,
+`compute_retry_delay_ms`, `IntradayRequest` — so gap-fill follows the
+SAME DH-904 ladder + 5xx retry + error classification as the boot-time
+historical fetch.
+
+NO writer coupling — caller UPSERTs the returned `Vec<HistoricalCandle>`
+via the existing `CandlePersistenceWriter::write_candle()` per the
+Item 4 architectural lock (target table: `historical_candles`).
+
+NO scheduler wiring in this PR — that lands in PR-D3.
+
+**Tests added (12):**
+- 4 datetime formatter tests (epoch zero, one minute, full day, typical trading minute)
+- 3 segment string tests (8 known + gap-at-6 + 9-255 unknown)
+- 3 request builder tests (NIFTY IDX_I, gap-at-6 short-circuit, OI propagation)
+- 2 error enum tests (Display includes diagnostic context, Send+Sync+'static)
+
+Total candle_fetcher tests: 232 (was 220) — all passing.
+
+## PR-D2 status archived (visibility promotion) — PR-D1 (#672 merged)
+
+PR-D1 promoted 6 primitives in `candle_fetcher.rs` to `pub(crate)`.
+ZERO behavioural change. 220 existing tests pass without modification.
+
+## PR-D3 Status — QUEUED for fresh session
 
 PR-D2 (next session) ships:
 
