@@ -36,7 +36,8 @@ Wire the gap-fill scheduler task that consumes the existing pure-function planne
   - Tests: format-string ratchets; Telegram body MUST cap `sample_failed_sids.len() <= 5` per security agent Low #3
 
 - [ ] **Item 4** — Add `upsert_gap_fill_bar()` to `crates/storage/src/candle_persistence.rs`
-  - Accepts `Candle1m` + `source: &str` ("gap_fill_backfill"), DEDUP UPSERT on `candles_1m`
+  - **DEFERRED to PR-B (2026-05-17)**: `candles_1m` exists today as a materialized view, NOT a writable base table. The Phase 0 LOCKED plan calls for native base tables (mat views removed) but Wave 6 (`candles_1m_shadow` → native rename) hasn't landed. Target-table decision needs to be made in PR-B with full scheduler design.
+  - When unblocked: accepts `Candle1m` + `source: &str` ("gap_fill_backfill"), DEDUP UPSERT
   - Must populate `source` SYMBOL column per `topic-PHASE-0-LEAN-LOCKED.md` §6-table contract
   - Tests: `test_upsert_gap_fill_bar_sets_source_column`, `test_upsert_idempotent_on_same_key`
 
@@ -174,7 +175,19 @@ Wire the gap-fill scheduler task that consumes the existing pure-function planne
 | 13 | Clock skew +1.9s (within BOOT-03 envelope) | 10s buffer absorbs; fetch still gets fully-cooked bar. |
 | 14 | Live aggregator vs gap-fill race | Planner excludes in-flight bars → no collision in normal case. If aggregator sealed empty bar (zero ticks) it would be a bug in aggregator (separate fix). |
 
-## Verification before PR
+## PR-A Status (2026-05-17)
+
+**Items 1, 2, 3 + security fixes** complete and committed:
+- ✅ Item 1 (constants) — commit `5f93f1a`
+- ✅ Item 2 (ErrorCode + rule file) — commit `5f93f1a`
+- ✅ Item 3 (Telegram event variants) — commit `fee4f60`
+- ✅ Security agent MEDIUM #1 + #2 (DDL `error!` + body cap) — commit `fee4f60`
+- 🔄 Item 4 (UPSERT helper) — DEFERRED to PR-B
+- 🔄 Items 5-11 — PR-B + PR-C
+
+**Why split:** Item 4 needs target-table decision (`candles_1m` is currently a matview, Phase 0 native-base migration in flight). Items 1-3 + security fixes are pure additive — zero behavior change, low review risk.
+
+## Verification before PR (PR-A)
 
 - [ ] `cargo check -p tickvault-core -p tickvault-common -p tickvault-storage -p tickvault-app`
 - [ ] `cargo test -p tickvault-core` (scheduler module + integration test)
