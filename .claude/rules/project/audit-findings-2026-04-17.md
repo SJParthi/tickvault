@@ -334,6 +334,145 @@ false alarm on this pass.
 post-market or without market-hours awareness". Rule 3 above exists
 specifically because this kept recurring.
 
+## Rule 14 — Skeleton-PR anti-pattern (NEW 2026-05-17)
+
+**Trigger:** PR-B of the Phase 0 Item 8+9 gap-fill series. Aborted by
+3-agent adversarial review with 2 CRITICAL + 4 HIGH findings before
+commit; lessons captured here so future Claude sessions do NOT repeat.
+
+**The anti-pattern:** when a multi-PR feature series feels too large for
+one session, the temptation is to ship a "skeleton" PR — pub fns + types
++ struct definitions + supervisor lifecycle, with the actual work stubbed
+to `// TODO PR-C`. This LOOKS like a defensible incremental milestone.
+In tickvault it is forbidden because it creates:
+
+1. **`pub-fn-wiring-guard.sh` failure** — every new `pub fn` MUST have a
+   call site in the same PR (pre-push gate 11). A skeleton ships pub fns
+   that PR-C/PR-D would later call. The hook blocks the PR immediately.
+2. **False-OK observability** — a "heartbeat counter" on an inert
+   subsystem makes Grafana panels green for code that does nothing.
+   Rule 11 (no false-OK signals) is directly violated.
+3. **Dead runbooks** — error-code runbooks added in the skeleton PR
+   reference reconciliation passes / audit-row formats / retry ladders
+   that exist only in TODOs. Operator reading the runbook during an
+   incident finds code that isn't there.
+4. **`enabled=false` traps** — a config flag that GUARDS the inert code
+   creates a trap: future operator (or future Claude session) flips
+   the flag to `true` expecting the documented behaviour, gets a
+   silent no-op (same INFO logs as disabled) plus a heartbeat counter
+   that still claims "alive". Bug stays hidden until operator confirms
+   missing bars in cross-verify.
+5. **CLAUDE.md "no half-finished implementations"** — the rule exists
+   specifically to prevent this pattern. A skeleton with `// TODO PR-C`
+   stubs is the canonical half-finished implementation.
+
+**Correct alternative:** ship the feature as a vertical slice — even
+if narrower — that has a REAL call site, doing REAL work, with no
+inert pub surface and no false-OK observability. If the vertical
+slice still feels too large for one session, the right move is to
+WAIT for a focused session, not to fragment into skeleton + impl.
+
+**Mechanical signals the skeleton anti-pattern is in play:**
+- Doc comment says `// PR-C will wire ...` or `// PR-D will add ...`
+- A heartbeat / liveness counter exists with no work loop attached
+- Config flag defaults `enabled = false` with no flip-to-true plan in this PR
+- Tests assert `supervisor.len() == 2` (or similar exact-task-count
+  invariants that PR-C will violate)
+- ErrorCode variant exists with a runbook that describes future code
+
+**Origin (this session — aborted):** branch
+`claude/phase-0-gap-fill-scheduler-skeleton`, never merged. 3-agent
+adversarial verdict synthesized in PR description of this PR (B').
+
+## Rule 15 — Architectural decisions belong in the plan file BEFORE PR-B (NEW 2026-05-17)
+
+**Companion to Rule 14.** When a multi-PR feature series defers an
+"architectural decision" to a later PR (e.g. "target table TBD"), that
+decision MUST be captured in the plan file BEFORE PR-A merges. Otherwise
+PR-B opens with the decision still pending, and every subsequent
+sub-PR design discussion has to re-litigate it.
+
+**Phase 0 Items 8+9 example.** PR-A merged 2026-05-17 with Item 4
+"DEFERRED to PR-B: target-table decision needed". This forced the
+PR-B session to:
+- Investigate `candles_1m` (it's a materialized view, not writable).
+- Investigate `candles_1m_shadow` (Wave 6 rename not yet shipped).
+- Discover `historical_candles` (correct target — see
+  `live-feed-purity.md` rule: "Historical data lives in two places
+  only: `historical_candles` table — Dhan REST /charts/historical
+  results").
+- Note: existing `historical_candles` DEDUP key is
+  `(ts, security_id, timeframe, segment)` — already I-P1-11 compliant.
+
+**Decision (locked 2026-05-17):** Gap-fill writes go to
+`historical_candles` table, NOT a new shadow column. Reasons:
+
+1. Matches existing rule (`live-feed-purity.md`: REST data →
+   `historical_candles`).
+2. DEDUP key already segment-aware.
+3. `candle_persistence.rs::ensure_candle_table_dedup_keys()` already
+   creates the table at boot — no new schema migration needed.
+4. Cross-verify (`cross_verify.rs`) already READS this table — gap-fill
+   rows flow into the existing read path naturally.
+5. A `source` SYMBOL column (as proposed in the original LEAN plan
+   §6) is NOT needed for write-side correctness. Gap-fill rows are
+   distinguishable from boot-time backfill by their `(ts,
+   timeframe='1m')` window in a 1-3 minute window after a disconnect
+   event. If forensic distinction is needed later, add `source` SYMBOL
+   via `ALTER ADD COLUMN IF NOT EXISTS` in a follow-up PR.
+
+## Rule 16 — Shutdown convention is `Arc<Notify>`, not `CancellationToken` (NEW 2026-05-17)
+
+**Codebase convention.** Search
+`crates/core/src/instance_lock.rs` for the canonical pattern:
+`shutdown: Arc<Notify>` flows from a single boot-time source through
+every long-running tokio task, awaited via `tokio::select!` on
+`shutdown.notified()`.
+
+**Trap.** `tokio::sync::Notify::notify_waiters()` only wakes futures
+that are CURRENTLY parked on `.notified()`. If `notify_waiters()`
+fires BEFORE the task has reached its `select!` arm, the wake is
+lost. Affected code patterns:
+
+- Spawning a task and immediately calling `cancel.notify_waiters()`
+  — the spawned task may not yet have reached the `select!` arm.
+- Pre-cancelled tests that pass `notify_waiters()` to a freshly-spawned
+  task and assert clean exit within 2s — passes by luck on fast
+  hardware, FAILS under sanitizers or scheduler perturbation.
+
+**Correct usage:**
+
+- Spawn the task first, give it a tick to reach `select!`, then notify.
+- For tests: use `notify_one()` after a small `tokio::time::sleep`
+  OR add an additional `AtomicBool` flag that the task checks before
+  parking.
+
+**Do NOT use `tokio_util::sync::CancellationToken`** in tickvault
+without explicit operator approval. The crate is not in `Cargo.toml`'s
+workspace deps; adding it requires Parthiban's review per the
+version-pin policy.
+
+## Rule 17 — Multi-PR feature plans must front-load investigation (NEW 2026-05-17)
+
+**Companion to Rule 15.** Before plan-file Status flips to APPROVED,
+the architect MUST have answered every architecturally-significant
+question. For Phase 0 Items 8+9 the unanswered questions that
+surfaced during PR-B included:
+
+| Question | Should have been in plan PRE-PR-A |
+|---|---|
+| Which table do gap-fill rows write to? | YES — see Rule 15 |
+| What shutdown convention for the supervisor task? | YES — see Rule 16 |
+| Is `fetch_intraday_with_retry` pub or private? | YES (it's private — needs pub wrapper refactor in PR-C) |
+| Does `WebSocketConnection::new()` accept a Sender? | YES — affects all 5+ call sites in pool wiring |
+| Does the heartbeat counter increment when the work loop is idle? | YES — affects observability semantics |
+
+**Mechanical signal:** if a plan-file item has a line that reads
+"DEFERRED to PR-B because X TBD", the plan is NOT APPROVED — it is
+DRAFT until X is decided. Future Claude sessions should refuse to
+start work on a plan whose architectural-decision section has any
+TBD entries.
+
 ## Checkpoints for every new feature / edit
 
 Before merging any edit touching the paths in this file's frontmatter:
