@@ -661,6 +661,19 @@ scan_ram_first_hot_path '\.fetch_(one|all|optional)\b[[:space:]]*\(' \
   "$STAGED_FILES"
 
 # ─────────────────────────────────────────────
+# CATEGORY 11: G1 dual-gate market-hours rule (Phase 0 Item 11/12, 2026-05-17)
+# ─────────────────────────────────────────────
+#
+# Per `topic-PHASE-0-LEAN-LOCKED.md` §8: the G1 exchange-gate decides
+# "does this tick belong to the session?" — it MUST use the tick's
+# `exchange_timestamp_ist`, NEVER the local wall-clock. The
+# `is_within_market_hours_ist(now())` pattern was the root cause of
+# the 2026-05-13 15:29:59.586 skipped-tick incident.
+scan_prod_code 'is_within_market_hours[A-Za-z_]*[(][^)]*now[(][)]' \
+  'G1-GATE: passing now() to is_within_market_hours_ist is the 2026-05-13 dual-gate bug (Phase 0 Item 11). Use tick.exchange_timestamp_ist for G1.' \
+  "$STAGED_FILES"
+
+# ─────────────────────────────────────────────
 # RESULT
 # ─────────────────────────────────────────────
 
