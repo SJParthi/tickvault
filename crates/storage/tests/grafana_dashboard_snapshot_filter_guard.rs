@@ -88,6 +88,17 @@ const REQUIRED_DASHBOARD_METRIC_PREFIXES: &[&str] = &[
     // `tv_realtime_guarantee_dimension`, and
     // `tv_realtime_guarantee_evaluations_total`.
     "tv_realtime_guarantee_",
+    // Phase 0 Item 8+9 (PR-D5, 2026-05-17): gap-fill scheduler health.
+    // Matches `tv_gap_fill_events_received_total`,
+    // `tv_gap_fill_event_channel_lagged_total`,
+    // `tv_gap_fill_planned_bars_total`,
+    // `tv_gap_fill_bars_succeeded_total`,
+    // `tv_gap_fill_bars_partial_total`,
+    // `tv_gap_fill_bars_failed_total`,
+    // `tv_gap_fill_candles_written_total`,
+    // `tv_gap_fill_rest_latency_ms_bucket`,
+    // `tv_gap_fill_dh904_retries_total`.
+    "tv_gap_fill_",
 ];
 
 const CROSS_SEGMENT_TABLES: &[&str] = &[
