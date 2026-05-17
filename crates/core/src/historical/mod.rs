@@ -40,3 +40,9 @@ pub mod cross_verify;
 // or synthesize ticks (compliant with live-feed-purity rule). The
 // scheduler task that consumes this plan lands in a follow-up PR.
 pub mod gap_fill_planner;
+// Phase 0 Item 8+9 (PR-C, 2026-05-17) — consumer side of the
+// disconnect-event broadcast channel. Subscribes to events from
+// `crate::websocket::connection`, calls `gap_fill_planner` to compute
+// missing 1m bars, and emits Prometheus counters. PR-D adds REST fetch
+// + `historical_candles` UPSERT.
+pub mod gap_fill_scheduler;

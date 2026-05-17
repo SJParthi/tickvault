@@ -1390,6 +1390,16 @@ async fn main() -> Result<()> {
             true,
             Some(fast_notifier.clone()),
             ws_frame_spill.clone(),
+            // FAST boot path does NOT wire gap-fill — this is the
+            // pre-market emergency boot variant. The fast-boot pool
+            // is torn down BEFORE the regular boot path at line ~3500
+            // resumes, so any reconnect events during fast-boot would
+            // be orphaned anyway. Once the regular boot resumes the
+            // gap-fill scheduler IS wired and catches all events. If
+            // fast-boot ever changes to stay live into trading hours,
+            // wire `Some(tx)` here using the same broadcast channel
+            // pattern used at the regular-boot site.
+            None,
         ) {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
             None => (None, None),
@@ -3498,6 +3508,40 @@ async fn main() -> Result<()> {
     // Order update WS stays alive until app shutdown.
     let should_connect_ws =
         subscription_plan.is_some() && (is_trading || is_mock_trading || is_muhurat);
+    // Phase 0 Item 8+9 (PR-C, 2026-05-17) — create the disconnect-event
+    // broadcast channel + spawn the gap-fill scheduler BEFORE the WS
+    // pool creates connections. The Sender is cloned into each
+    // `WebSocketConnection` via the pool constructor; the Receiver
+    // is owned by the scheduler task spawned below.
+    //
+    // SHUTDOWN DESIGN (post 3-agent adversarial review):
+    // The dedicated `gap_fill_shutdown_notify` `Arc<Notify>` is kept
+    // as a future-proofing handle for PR-D, where it will be wired
+    // into the global SIGTERM handler so the scheduler can drain
+    // in-flight per-bar tasks gracefully before exit. In PR-C the
+    // scheduler exits cleanly via `broadcast::Receiver::recv()`
+    // returning `Err(Closed)` once all Sender halves drop at process
+    // teardown — that path IS tested
+    // (`test_scheduler_exits_on_channel_close` in
+    // `gap_fill_scheduler.rs`). The `Notify`-arm of the `select!` is
+    // NOT dead code; it is the future PR-D shutdown surface.
+    //
+    // The regular-boot `shutdown_notify` is declared further down in
+    // `main()` (line ~4649) and is out of scope here. PR-D's
+    // refactor will hoist that declaration to make `Arc::clone` work
+    // at this point; until then the dedicated `Notify` is the right
+    // contract.
+    let (gap_fill_event_tx, gap_fill_event_rx) =
+        tickvault_core::websocket::disconnect_event::create_disconnect_event_channel();
+    let gap_fill_shutdown_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    tokio::spawn(async move {
+        tickvault_core::historical::gap_fill_scheduler::run_gap_fill_scheduler(
+            gap_fill_event_rx,
+            gap_fill_shutdown_notify,
+        )
+        .await;
+    });
+
     let (pool_receiver, ws_pool_ready) = if should_connect_ws {
         match create_websocket_pool(
             &token_handle,
@@ -3507,6 +3551,8 @@ async fn main() -> Result<()> {
             is_market_hours,
             Some(notifier.clone()),
             ws_frame_spill.clone(),
+            // Phase 0 Item 8+9 PR-C — wire the gap-fill scheduler.
+            Some(gap_fill_event_tx.clone()),
         ) {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
             None => (None, None),
@@ -7125,7 +7171,7 @@ async fn load_instruments(
 /// WITHOUT spawning connections. This allows the tick processor to start
 /// consuming frames BEFORE connections begin sending data, preventing
 /// frame send timeouts during the stagger period.
-#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill param
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill + Phase 0 PR-C added disconnect_event_sender
 fn create_websocket_pool(
     token_handle: &TokenHandle,
     client_id: &str,
@@ -7134,6 +7180,14 @@ fn create_websocket_pool(
     is_market_hours: bool,
     notifier: Option<std::sync::Arc<NotificationService>>,
     wal_spill: Option<std::sync::Arc<tickvault_storage::ws_frame_spill::WsFrameSpill>>,
+    // Phase 0 Item 8+9 (PR-C, 2026-05-17) — typed disconnect-event Sender
+    // for the gap-fill scheduler. `Some(tx)` from boot when gap-fill is
+    // wired; `None` from any path that doesn't subscribe to events.
+    disconnect_event_sender: Option<
+        tokio::sync::broadcast::Sender<
+            tickvault_core::websocket::disconnect_event::DisconnectResolvedEvent,
+        >,
+    >,
 ) -> Option<(
     tokio::sync::mpsc::Receiver<bytes::Bytes>,
     WebSocketConnectionPool,
@@ -7257,7 +7311,7 @@ fn create_websocket_pool(
         metrics::gauge!("tv_subscription_plan_dropped_instruments").set(dropped as f64);
     }
 
-    let mut pool = match WebSocketConnectionPool::new_with_optional_wal(
+    let mut pool = match WebSocketConnectionPool::new_with_optional_wal_and_disconnect_events(
         token_handle.clone(),
         client_id.to_string(),
         dhan_for_pool,
@@ -7266,6 +7320,7 @@ fn create_websocket_pool(
         feed_mode,
         notifier,
         wal_spill,
+        disconnect_event_sender,
     ) {
         Ok(pool) => pool,
         Err(err) => {
