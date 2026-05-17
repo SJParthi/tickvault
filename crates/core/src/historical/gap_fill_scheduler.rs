@@ -170,6 +170,11 @@ pub struct GapFillExecutorDeps {
     pub questdb_config: QuestDbConfig,
     pub notification_service: Arc<NotificationService>,
     pub fetch_semaphore: Arc<tokio::sync::Semaphore>,
+    /// PR-D8 (2026-05-17) — shared last-seen LTT cache. Written by
+    /// `tick_processor` on every tick, read here at disconnect-event
+    /// handling time to refine `event.outage_start_secs` beyond the
+    /// producer's conservative `now - 10s` default. Lock-free.
+    pub last_seen_ltt_cache: crate::pipeline::last_seen_ltt_cache::LastSeenLttCache,
 }
 
 impl GapFillExecutorDeps {
@@ -185,6 +190,7 @@ impl GapFillExecutorDeps {
         candle_writer: Arc<tokio::sync::Mutex<dyn GapFillCandleSink>>,
         questdb_config: QuestDbConfig,
         notification_service: Arc<NotificationService>,
+        last_seen_ltt_cache: crate::pipeline::last_seen_ltt_cache::LastSeenLttCache,
     ) -> Self {
         Self {
             http_client,
@@ -196,6 +202,7 @@ impl GapFillExecutorDeps {
             questdb_config,
             notification_service,
             fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(GAP_FILL_MAX_CONCURRENT_FETCHES)),
+            last_seen_ltt_cache,
         }
     }
 }
@@ -420,6 +427,35 @@ pub async fn run_gap_fill_scheduler(
                 match recv_result {
                     Ok(event) => {
                         events_received.increment(1);
+                        // PR-D8 (2026-05-17): refine outage_start using
+                        // the last-seen LTT cache. The producer's
+                        // estimate is a conservative `now - 10s`;
+                        // the refined value picks the OLDER of
+                        // (producer_estimate, min last_seen across
+                        // event.subscribed) so any gap >10s is
+                        // detected. Refinement is a no-op when the
+                        // cache has no entry for the conn's SIDs
+                        // (fresh boot, instrument never seen).
+                        let refined_outage_start_secs =
+                            deps.last_seen_ltt_cache.refine_outage_start(
+                                event.outage_start_secs,
+                                event.subscribed.as_ref(),
+                            );
+                        let refined_event = if refined_outage_start_secs
+                            == event.outage_start_secs
+                        {
+                            event.clone()
+                        } else {
+                            metrics::counter!("tv_gap_fill_outage_start_refined_total")
+                                .increment(1);
+                            crate::websocket::disconnect_event::DisconnectResolvedEvent {
+                                connection_index: event.connection_index,
+                                outage_start_secs: refined_outage_start_secs,
+                                outage_end_secs: event.outage_end_secs,
+                                subscribed: Arc::clone(&event.subscribed),
+                            }
+                        };
+                        let event = refined_event;
                         let bars = compute_planned_bars(&event);
                         planned_bars_counter.increment(bars.len() as u64);
                         info!(
@@ -431,7 +467,7 @@ pub async fn run_gap_fill_scheduler(
                             planned_bar_count = bars.len(),
                             per_conn_snapshot_count = event.subscribed.len(),
                             semaphore_capacity = GAP_FILL_MAX_CONCURRENT_FETCHES,
-                            "gap-fill: disconnect event received; PR-D7 per-conn fan-out via snapshot"
+                            "gap-fill: disconnect event received; PR-D8 outage_start refined via last_seen_ltt_cache"
                         );
 
                         // PR-D7: if the per-conn snapshot is empty
@@ -777,6 +813,7 @@ mod tests {
                 ilp_port: 9009,
             },
             NotificationService::disabled(),
+            crate::pipeline::last_seen_ltt_cache::LastSeenLttCache::new(),
         )
     }
 
@@ -990,6 +1027,36 @@ mod tests {
                 "segment_code {ineligible} must NOT be gap-fill-eligible (Dhan REST limitation)"
             );
         }
+    }
+
+    // PR-D8 ratchets (2026-05-17) — outage_start refinement via
+    // last-seen LTT cache.
+
+    #[test]
+    fn test_gap_fill_executor_deps_carries_last_seen_ltt_cache() {
+        // PR-D8 contract: the struct MUST carry the shared cache so
+        // the scheduler can refine outage_start from per-conn SID
+        // last-seen LTTs. Future deletion of the field fails this
+        // build.
+        let deps = test_deps();
+        // The default cache is empty — no entries until tick_processor
+        // populates it. We exercise the lookup API to pin the type
+        // shape.
+        assert!(deps.last_seen_ltt_cache.get(13, 0).is_none());
+        deps.last_seen_ltt_cache.record(13, 0, 1_700_000_000);
+        assert_eq!(deps.last_seen_ltt_cache.get(13, 0), Some(1_700_000_000));
+    }
+
+    #[test]
+    fn test_refine_outage_start_picks_older_cache_value_over_producer_estimate() {
+        // Pin the integration between scheduler-side refinement and
+        // the cache. Producer estimated outage_start = 500.
+        // Cache says SID 13 was last seen at 480. The refined value
+        // must be 480.
+        let cache = crate::pipeline::last_seen_ltt_cache::LastSeenLttCache::new();
+        cache.record(13, 0, 1_700_000_480);
+        let refined = cache.refine_outage_start(1_700_000_500, &[(13, 0)]);
+        assert_eq!(refined, 1_700_000_480);
     }
 
     #[test]

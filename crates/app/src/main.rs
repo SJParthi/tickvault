@@ -1780,12 +1780,20 @@ async fn main() -> Result<()> {
             let questdb_cfg = config.questdb.clone();
             let hs = health_status.clone();
             let persist_notifier = std::sync::Arc::clone(&notifier);
+            // PR-D8: fast-boot path has no gap-fill scheduler reader yet,
+            // but we still pass a disposable LastSeenLttCache so the
+            // consumer's write path stays uniform across both boot
+            // modes. Future PR can wire the gap-fill scheduler into
+            // fast-boot too without changing this signature.
+            let fast_boot_last_seen_cache =
+                tickvault_core::pipeline::last_seen_ltt_cache::LastSeenLttCache::new();
             tokio::spawn(async move {
                 run_tick_persistence_consumer(
                     tick_persistence_rx,
                     questdb_cfg,
                     Some(hs),
                     Some(persist_notifier),
+                    fast_boot_last_seen_cache,
                 )
                 .await;
             });
@@ -3544,6 +3552,15 @@ async fn main() -> Result<()> {
         tickvault_core::websocket::disconnect_event::create_disconnect_event_channel();
     let gap_fill_shutdown_notify = std::sync::Arc::new(tokio::sync::Notify::new());
 
+    // PR-D8 (2026-05-17) — construct the shared last-seen LTT cache
+    // before the gap-fill scheduler is spawned. The cache is cloned
+    // into both the slow-boot observability consumer (write side, on
+    // every tick) and into GapFillExecutorDeps (read side, at
+    // disconnect-event handling time for outage_start refinement).
+    // Lock-free internally — clones share the underlying papaya map.
+    let last_seen_ltt_cache =
+        tickvault_core::pipeline::last_seen_ltt_cache::LastSeenLttCache::new();
+
     // Phase 0 PR-D3-impl (2026-05-17) — build the executor deps and
     // pass them to the scheduler. The scheduler now performs the
     // actual REST fetch + UPSERT for NIFTY index gap-fill bars
@@ -3590,6 +3607,7 @@ async fn main() -> Result<()> {
                 writer_arc,
                 config.questdb.clone(),
                 std::sync::Arc::clone(&notifier),
+                last_seen_ltt_cache.clone(),
             );
             tokio::spawn(async move {
                 tickvault_core::historical::gap_fill_scheduler::run_gap_fill_scheduler(
@@ -3725,8 +3743,9 @@ async fn main() -> Result<()> {
     {
         let obs_rx = tick_broadcast_sender.subscribe();
         let questdb_cfg = config.questdb.clone();
+        let obs_cache = last_seen_ltt_cache.clone();
         tokio::spawn(async move {
-            run_slow_boot_observability(obs_rx, questdb_cfg).await;
+            run_slow_boot_observability(obs_rx, questdb_cfg, obs_cache).await;
         });
         info!("slow-boot observability consumer started");
     }
@@ -8303,6 +8322,7 @@ async fn run_tick_persistence_consumer(
     questdb_config: tickvault_common::config::QuestDbConfig,
     health_status: Option<SharedHealthStatus>,
     notifier: Option<std::sync::Arc<NotificationService>>,
+    last_seen_ltt_cache: tickvault_core::pipeline::last_seen_ltt_cache::LastSeenLttCache,
 ) {
     let mut tick_writer = match TickPersistenceWriter::new(&questdb_config) {
         Ok(writer) => {
@@ -8362,6 +8382,14 @@ async fn run_tick_persistence_consumer(
                 // its own log/metric on gap thresholds; we do NOT publish
                 // any backfill request (in-market backfill disabled).
                 let _ = tick_gap_tracker.record_tick(tick.security_id, tick.exchange_timestamp);
+                // PR-D8: also update the shared last-seen-LTT cache so
+                // the gap-fill scheduler can refine outage_start at
+                // disconnect-event handling time. Lock-free O(1).
+                last_seen_ltt_cache.record(
+                    tick.security_id,
+                    tick.exchange_segment_code,
+                    i64::from(tick.exchange_timestamp),
+                );
 
                 if let Err(err) = tick_writer.append_tick(&tick) {
                     // Phase 0 / Rule 5: persistence failures are ERROR (route to Telegram).
@@ -8465,6 +8493,7 @@ async fn run_tick_persistence_consumer(
 async fn run_slow_boot_observability(
     mut tick_rx: tokio::sync::broadcast::Receiver<tickvault_common::tick_types::ParsedTick>,
     questdb_config: tickvault_common::config::QuestDbConfig,
+    last_seen_ltt_cache: tickvault_core::pipeline::last_seen_ltt_cache::LastSeenLttCache,
 ) {
     info!("S4-T1d: slow-boot observability task started");
 
@@ -8519,6 +8548,14 @@ async fn run_slow_boot_observability(
                 // no backfill request is published (in-market backfill
                 // disabled by user policy).
                 let _ = tick_gap_tracker.record_tick(tick.security_id, tick.exchange_timestamp);
+                // PR-D8: also update the shared last-seen-LTT cache so
+                // the gap-fill scheduler can refine outage_start at
+                // disconnect-event handling time. Lock-free O(1).
+                last_seen_ltt_cache.record(
+                    tick.security_id,
+                    tick.exchange_segment_code,
+                    i64::from(tick.exchange_timestamp),
+                );
 
                 // Audit finding #2 (2026-04-24): periodic per-instrument stall
                 // scan every 30 s. Returns the count of newly-stale instruments;
