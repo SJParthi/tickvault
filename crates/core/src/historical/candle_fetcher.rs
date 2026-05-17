@@ -100,8 +100,16 @@ struct DataApiErrorResponse {
 }
 
 /// Classifies a Dhan error response for retry/backoff decisions.
+///
+/// Phase 0 PR-D1 (2026-05-17): visibility promoted to `pub(crate)` so
+/// the gap-fill scheduler (in sibling module `gap_fill_scheduler`) can
+/// reuse the same classification logic for its per-bar REST fetches.
+/// Per `audit-findings-2026-04-17.md` Rule 15 (locked architectural
+/// decisions): gap-fill MUST follow the same DH-904 backoff ladder +
+/// 5xx retry policy as the boot-time historical fetch — pub(crate)
+/// reuse avoids the duplicate-logic anti-pattern.
 #[derive(Debug, PartialEq)]
-enum ErrorAction {
+pub(crate) enum ErrorAction {
     /// Rate limited (DH-904 or HTTP 429) — exponential backoff
     RateLimited,
     /// Too many connections (805) — pause all requests 60s
@@ -115,7 +123,10 @@ enum ErrorAction {
 }
 
 /// Parses error response bytes and classifies the error for retry decisions.
-fn classify_error(status: reqwest::StatusCode, body: &[u8]) -> ErrorAction {
+///
+/// Phase 0 PR-D1 (2026-05-17): visibility promoted to `pub(crate)` —
+/// see [`ErrorAction`] for rationale.
+pub(crate) fn classify_error(status: reqwest::StatusCode, body: &[u8]) -> ErrorAction {
     // HTTP 429 is always rate limiting
     if status.as_u16() == 429 {
         return ErrorAction::RateLimited;
@@ -290,18 +301,27 @@ fn format_intraday_date_range(
 
 /// Computes the DH-904 exponential backoff delay for a given attempt number.
 /// Sequence: 10s, 20s, 40s, 80s (base * 2^attempt).
-fn compute_dh904_backoff_secs(attempt: u32) -> u64 {
+///
+/// Phase 0 PR-D1 (2026-05-17): `pub(crate)` so the gap-fill scheduler
+/// can reuse the same backoff ladder. Per `audit-findings-2026-04-17.md`
+/// Rule 15: gap-fill MUST follow the same DH-904 policy as the
+/// boot-time historical fetch.
+pub(crate) fn compute_dh904_backoff_secs(attempt: u32) -> u64 {
     DH_904_BACKOFF_BASE_SECS.saturating_mul(1_u64.wrapping_shl(attempt))
 }
 
 /// Returns true if the DH-904 attempt count has exceeded the maximum.
-fn is_dh904_exhausted(attempt: u32) -> bool {
+///
+/// Phase 0 PR-D1 (2026-05-17): `pub(crate)` for gap-fill scheduler reuse.
+pub(crate) fn is_dh904_exhausted(attempt: u32) -> bool {
     attempt >= DH_904_MAX_BACKOFF_ATTEMPTS
 }
 
 /// Computes the retry delay in milliseconds for a given attempt number.
 /// Linear backoff: 1000ms * attempt.
-fn compute_retry_delay_ms(attempt: u32) -> u64 {
+///
+/// Phase 0 PR-D1 (2026-05-17): `pub(crate)` for gap-fill scheduler reuse.
+pub(crate) fn compute_retry_delay_ms(attempt: u32) -> u64 {
     1000_u64.saturating_mul(u64::from(attempt))
 }
 
@@ -521,16 +541,21 @@ fn build_failure_reasons(
 // ---------------------------------------------------------------------------
 
 /// Request body for Dhan intraday charts API.
+///
+/// Phase 0 PR-D1 (2026-05-17): visibility promoted to `pub(crate)` so
+/// the gap-fill scheduler can construct intraday-fetch requests for
+/// per-bar gap-fill windows. Field types/serde attrs unchanged — see
+/// `docs/dhan-ref/05-historical-data.md` for the wire contract.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct IntradayRequest {
-    security_id: String,
-    exchange_segment: String,
-    instrument: String,
-    interval: String,
-    oi: bool,
-    from_date: String,
-    to_date: String,
+pub(crate) struct IntradayRequest {
+    pub security_id: String,
+    pub exchange_segment: String,
+    pub instrument: String,
+    pub interval: String,
+    pub oi: bool,
+    pub from_date: String,
+    pub to_date: String,
 }
 
 /// Request body for Dhan daily charts API.
