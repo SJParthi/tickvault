@@ -67,8 +67,8 @@ use tickvault_common::error_code::ErrorCode;
 use tickvault_common::tick_types::HistoricalCandle;
 use tickvault_storage::candle_persistence::CandlePersistenceWriter;
 use tickvault_storage::gap_fill_audit_persistence::{
-    RESULT_FAILED, RESULT_PARTIAL, RESULT_SUCCESS, TRIGGER_EVENT_WS_DISCONNECT,
-    append_gap_fill_audit_row,
+    RESULT_FAILED, RESULT_PARTIAL, RESULT_SUCCESS, TRIGGER_EVENT_SCHEDULER_CATCHUP,
+    TRIGGER_EVENT_WS_DISCONNECT, append_gap_fill_audit_row,
 };
 
 use crate::notification::{NotificationEvent, NotificationService};
@@ -421,12 +421,24 @@ pub async fn run_gap_fill_scheduler(
     let bars_failed = metrics::counter!("tv_gap_fill_bars_failed_total");
     let candles_written = metrics::counter!("tv_gap_fill_candles_written_total");
 
+    // PR-D9 (2026-05-17) — track the wall-clock of the last
+    // successfully-received broadcast event. On `Lagged(n)`, the
+    // elapsed delta is the conservative lagged-window length used
+    // for the `scheduler_catchup` audit row's `duration_ms` field.
+    // Initialised to "now" so the very first Lagged (rare, requires
+    // 64 dropped events from a fresh scheduler) reports a non-zero
+    // — though small — window rather than wrap-around.
+    let mut last_successful_event_at = std::time::Instant::now();
+
     loop {
         tokio::select! {
             recv_result = disconnect_rx.recv() => {
                 match recv_result {
                     Ok(event) => {
                         events_received.increment(1);
+                        // PR-D9: refresh the catchup-window anchor on
+                        // every successfully-received event.
+                        last_successful_event_at = std::time::Instant::now();
                         // PR-D8 (2026-05-17): refine outage_start using
                         // the last-seen LTT cache. The producer's
                         // estimate is a conservative `now - 10s`;
@@ -503,10 +515,58 @@ pub async fn run_gap_fill_scheduler(
                     }
                     Err(broadcast::error::RecvError::Lagged(dropped)) => {
                         events_lagged.increment(dropped);
+                        let lagged_window_ms = i64::try_from(
+                            last_successful_event_at.elapsed().as_millis(),
+                        )
+                        .unwrap_or(i64::MAX);
                         error!(
                             code = ErrorCode::GapFill04EventChannelLagged.code_str(),
                             dropped_event_count = dropped,
-                            "GAP-FILL-04: disconnect event broadcast lagged; events dropped — reconciliation pass deferred to PR-D5"
+                            lagged_window_ms,
+                            "GAP-FILL-04: disconnect event broadcast lagged; PR-D9 scheduler-catchup audit row + Telegram"
+                        );
+
+                        // PR-D9: emit a `scheduler_catchup` audit row
+                        // for SEBI reconstruction. Best-effort —
+                        // spawned so audit write failures don't
+                        // block the next event. `sids_failed`
+                        // carries the dropped event count as an
+                        // operator-readable proxy for "things we
+                        // could not reconcile".
+                        let dropped_for_audit = i32::try_from(dropped).unwrap_or(i32::MAX);
+                        let qcfg = deps.questdb_config.clone();
+                        let now_secs_ist = chrono::Utc::now().timestamp().saturating_add(
+                            i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS),
+                        );
+                        let trading_date_str = trading_date_ist_string(now_secs_ist);
+                        let now_nanos = now_secs_ist.saturating_mul(1_000_000_000);
+                        tokio::spawn(async move {
+                            if let Err(err) = append_gap_fill_audit_row(
+                                &qcfg,
+                                now_nanos,
+                                &trading_date_str,
+                                "scheduler-catchup",
+                                TRIGGER_EVENT_SCHEDULER_CATCHUP,
+                                dropped_for_audit,
+                                0,
+                                dropped_for_audit,
+                                lagged_window_ms,
+                                RESULT_FAILED,
+                            )
+                            .await
+                            {
+                                error!(
+                                    code = ErrorCode::GapFill03UpsertFailed.code_str(),
+                                    ?err,
+                                    "GAP-FILL-D9: scheduler_catchup audit row insert failed"
+                                );
+                            }
+                        });
+
+                        deps.notification_service.notify(
+                            NotificationEvent::GapFillEventChannelLagged {
+                                dropped_event_count: dropped,
+                            },
                         );
                     }
                     Err(broadcast::error::RecvError::Closed) => {
@@ -1027,6 +1087,78 @@ mod tests {
                 "segment_code {ineligible} must NOT be gap-fill-eligible (Dhan REST limitation)"
             );
         }
+    }
+
+    // PR-D9 ratchets (2026-05-17) — Lagged(n) catchup audit + Telegram.
+
+    #[test]
+    fn test_trigger_event_scheduler_catchup_constant_is_imported() {
+        // PR-D9 contract: the scheduler module MUST import the
+        // `TRIGGER_EVENT_SCHEDULER_CATCHUP` constant from storage so
+        // the Lagged handler can stamp audit rows with the correct
+        // SYMBOL value. Future regression that drops the import
+        // fails this build via the source-scan below.
+        assert_eq!(TRIGGER_EVENT_SCHEDULER_CATCHUP, "scheduler_catchup");
+    }
+
+    #[test]
+    fn test_lagged_handler_source_emits_audit_row_and_telegram() {
+        // Source-scan ratchet per Rule 13: the Lagged(dropped) branch
+        // MUST emit an audit row (via append_gap_fill_audit_row with
+        // TRIGGER_EVENT_SCHEDULER_CATCHUP) AND a Telegram event (via
+        // notification_service.notify with GapFillEventChannelLagged).
+        let source = include_str!("gap_fill_scheduler.rs");
+        // Find the Lagged branch body.
+        let lagged_start = source
+            .find("RecvError::Lagged(dropped))")
+            .expect("Lagged branch must exist in source");
+        let lagged_end = source[lagged_start..]
+            .find("RecvError::Closed")
+            .map(|rel| lagged_start + rel)
+            .expect("Lagged branch must precede Closed branch");
+        let lagged_body = &source[lagged_start..lagged_end];
+
+        assert!(
+            lagged_body.contains("TRIGGER_EVENT_SCHEDULER_CATCHUP"),
+            "Lagged handler MUST stamp audit row with TRIGGER_EVENT_SCHEDULER_CATCHUP \
+             (currently missing — false-OK regression risk per audit-findings Rule 11)"
+        );
+        assert!(
+            lagged_body.contains("append_gap_fill_audit_row"),
+            "Lagged handler MUST call append_gap_fill_audit_row for SEBI reconstruction"
+        );
+        assert!(
+            lagged_body.contains("GapFillEventChannelLagged"),
+            "Lagged handler MUST emit NotificationEvent::GapFillEventChannelLagged (Critical) \
+             so operator is paged"
+        );
+        assert!(
+            lagged_body.contains("lagged_window_ms"),
+            "Lagged handler MUST compute lagged_window_ms from last_successful_event_at \
+             for the audit row's duration_ms field"
+        );
+    }
+
+    #[test]
+    fn test_last_successful_event_at_refreshed_on_ok_branch() {
+        // Source-scan: the Ok(event) branch MUST refresh
+        // `last_successful_event_at` so the next Lagged event
+        // computes a tight window. Without this, the lagged window
+        // could be hours stale (the boot-time Instant) and the
+        // audit row would lie about the catchup duration.
+        let source = include_str!("gap_fill_scheduler.rs");
+        let ok_start = source
+            .find("Ok(event) => {")
+            .expect("Ok(event) branch must exist");
+        let ok_end = source[ok_start..]
+            .find("RecvError::Lagged")
+            .map(|rel| ok_start + rel)
+            .expect("Ok branch must precede Lagged branch");
+        let ok_body = &source[ok_start..ok_end];
+        assert!(
+            ok_body.contains("last_successful_event_at = std::time::Instant::now()"),
+            "Ok branch MUST refresh last_successful_event_at on every event"
+        );
     }
 
     // PR-D8 ratchets (2026-05-17) — outage_start refinement via
