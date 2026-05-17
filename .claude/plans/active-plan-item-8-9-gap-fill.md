@@ -35,11 +35,29 @@ Wire the gap-fill scheduler task that consumes the existing pure-function planne
   - `GapFillEventChannelLagged { dropped_event_count }` — Severity::Critical (post-agent-3 broadcast Lagged handler)
   - Tests: format-string ratchets; Telegram body MUST cap `sample_failed_sids.len() <= 5` per security agent Low #3
 
-- [ ] **Item 4** — Add `upsert_gap_fill_bar()` to `crates/storage/src/candle_persistence.rs`
-  - **DEFERRED to PR-B (2026-05-17)**: `candles_1m` exists today as a materialized view, NOT a writable base table. The Phase 0 LOCKED plan calls for native base tables (mat views removed) but Wave 6 (`candles_1m_shadow` → native rename) hasn't landed. Target-table decision needs to be made in PR-B with full scheduler design.
-  - When unblocked: accepts `Candle1m` + `source: &str` ("gap_fill_backfill"), DEDUP UPSERT
-  - Must populate `source` SYMBOL column per `topic-PHASE-0-LEAN-LOCKED.md` §6-table contract
-  - Tests: `test_upsert_gap_fill_bar_sets_source_column`, `test_upsert_idempotent_on_same_key`
+- [ ] **Item 4** — Gap-fill writes target `historical_candles` table (LOCKED 2026-05-17)
+  - **DECISION (locked PR-B session, see `audit-findings-2026-04-17.md` Rule 15):**
+    Gap-fill REST-fetched 1m bars write to the EXISTING `historical_candles`
+    table via the EXISTING `candle_persistence.rs` writer. NO new shadow
+    column, NO new table, NO new helper fn — reuse `CandlePersistenceWriter`
+    as-is.
+  - **Why historical_candles:**
+    - Matches `live-feed-purity.md` rule: "Historical data lives in two
+      places only: `historical_candles` table — Dhan REST /charts/historical
+      results". Gap-fill IS REST-fetched historical data.
+    - DEDUP key `(ts, security_id, timeframe, segment)` already segment-aware
+      per I-P1-11 (see `crates/storage/src/candle_persistence.rs::DEDUP_KEY_CANDLES`).
+    - `ensure_candle_table_dedup_keys()` already runs at boot — no schema
+      migration needed.
+    - `cross_verify.rs` already READS this table — gap-fill rows flow into
+      the existing read path naturally.
+  - **`source` SYMBOL column NOT added in this series** — gap-fill rows
+    are distinguishable from boot-time backfill by `(ts, timeframe='1m')`
+    inside the 1-3 minute window after a disconnect event. If forensic
+    distinction is later needed, add `source` SYMBOL via
+    `ALTER ADD COLUMN IF NOT EXISTS` in a follow-up PR.
+  - PR-C uses `CandlePersistenceWriter::write_candle()` directly; no new
+    storage-crate helper needed.
 
 - [ ] **Item 5** — NEW file `crates/core/src/historical/gap_fill_scheduler.rs` (~450 LoC, was ~350)
   - **REVISED post-agent**: full mechanism overhaul
@@ -175,6 +193,24 @@ Wire the gap-fill scheduler task that consumes the existing pure-function planne
 | 13 | Clock skew +1.9s (within BOOT-03 envelope) | 10s buffer absorbs; fetch still gets fully-cooked bar. |
 | 14 | Live aggregator vs gap-fill race | Planner excludes in-flight bars → no collision in normal case. If aggregator sealed empty bar (zero ticks) it would be a bug in aggregator (separate fix). |
 
+## Locked architectural decisions (PR-B' session, 2026-05-17)
+
+These decisions resolve the deferrals from PR-A so PR-C opens with zero
+TBDs (per `audit-findings-2026-04-17.md` Rule 17):
+
+| Question | Locked decision | Reason / source |
+|---|---|---|
+| Gap-fill write target table | `historical_candles` (existing) | `live-feed-purity.md` rule: REST data → `historical_candles` |
+| Write helper | EXISTING `CandlePersistenceWriter::write_candle()` | No new storage-crate fn needed; existing DEDUP key is segment-aware |
+| `source` SYMBOL column | NOT added in this PR series | `(ts, timeframe='1m')` window in 1-3 min post-disconnect is sufficient identifier; ALTER ADD later if forensic distinction needed |
+| Shutdown signal type | `Arc<Notify>` (existing codebase convention) | `instance_lock.rs` is the canonical reference; `tokio_util::sync::CancellationToken` is BANNED without operator approval per Rule 16 |
+| `Notify::notify_waiters()` timing | Tasks MUST be parked on `.notified()` BEFORE the wake fires | Rule 16 trap — wakes lost if signal arrives before `select!` parks |
+| REST fetch fn visibility | `fetch_intraday_with_retry` is currently private; PR-C MUST refactor to a pub wrapper or accept a Sender-pattern handoff | See `crates/core/src/historical/candle_fetcher.rs:1276` |
+| Connection-layer broadcast Sender | Threaded through `WebSocketConnection::new()` constructor; one canonical post-reconnect send site at `connection.rs:~580` (next to existing `ws_reconnect_audit` write) | Only ONE site emits; do NOT spread Sender::send() across multiple reconnect-handler arms |
+| Pool size + channel capacity | `broadcast::channel(64)` — 5 conns × 2s flap × 25s drain budget | Documented; Lagged fires `GapFill04EventChannelLagged` Critical per audit-findings Rule 11 |
+| Heartbeat counter | NOT shipped in PR-B'. Only ship when an ACTUAL work-loop exists for it to claim alive about | Rule 14 — false-OK heartbeat anti-pattern |
+| Skeleton PR pattern | BANNED (Rule 14). PR-C ships as a vertical slice with REAL call sites + REAL work, OR ships in a fresh focused session — no fragmenting | Two CRITICAL + four HIGH findings from PR-B 3-agent review |
+
 ## PR-A Status (2026-05-17)
 
 **Items 1, 2, 3 + security fixes** complete and committed:
@@ -186,6 +222,36 @@ Wire the gap-fill scheduler task that consumes the existing pure-function planne
 - 🔄 Items 5-11 — PR-B + PR-C
 
 **Why split:** Item 4 needs target-table decision (`candles_1m` is currently a matview, Phase 0 native-base migration in flight). Items 1-3 + security fixes are pure additive — zero behavior change, low review risk.
+
+## PR-B Status (2026-05-17) — ABORTED
+
+PR-B was attempted twice in the 2026-05-17 session:
+
+1. **Original PR-B (Items 4-11 all-at-once)** — abandoned as too large
+   for one session (1500-2500 LoC across `connection.rs` + `main.rs` +
+   new scheduler module + config + tests + Grafana panel).
+2. **Re-scoped PR-B (scheduler skeleton only)** — built on branch
+   `claude/phase-0-gap-fill-scheduler-skeleton`, ~450 LoC. Aborted by
+   3-agent adversarial review with **2 CRITICAL + 4 HIGH** findings
+   BEFORE any commit. Branch never pushed. See `audit-findings-2026-04-17.md`
+   Rule 14 (Skeleton-PR anti-pattern) for the full lesson.
+
+PR-B' (this PR) captures the architectural decisions that resolve all
+PR-A deferrals so PR-C opens with zero TBDs. PR-C ships the full
+vertical slice — REAL Sender::send() wired in `connection.rs`, REAL
+scheduler that consumes events + calls planner + fetches via existing
+candle_fetcher + UPSERTs to existing `historical_candles` table + writes
+audit row, REAL boot wiring, REAL integration tests — in a fresh
+focused session.
+
+## PR-B' Status (2026-05-17) — THIS PR (docs only)
+
+- ✅ `audit-findings-2026-04-17.md` Rules 14, 15, 16, 17 added
+- ✅ Plan-file "Locked architectural decisions" table added
+- ✅ Plan-file PR-B abort logged with reference to Rule 14
+- ❌ No production code changes — docs only
+
+## PR-C Status — QUEUED for fresh session
 
 ## Verification before PR (PR-A)
 
