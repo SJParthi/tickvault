@@ -24,6 +24,20 @@ if echo "$COMMAND" | grep -qE '(&&|\|\||;)\s*(git (commit|push)|gh pr (create|me
   exit 2
 fi
 
+# SAFETY: Block bypass tactics (--no-verify, git stash, force-push to main,
+# --dangerously-skip-permissions, --no-gpg-sign, gh pr merge --admin).
+# Patterns the settings.json deny-list cannot express via prefix matching.
+# See .claude/hooks/block-bypass.sh for full pattern list + rationale.
+#
+# NOTE: This is a best-effort string-matching guard. It can be defeated by
+# shell variable substitution (`X=--no-verify; git commit $X`), subshells
+# (`bash -c 'git commit --no-verify'`), or aliases. Authoritative protection
+# lives in the upstream gate scripts; this layer catches the easy paths
+# Claude Code itself would otherwise emit.
+if ! "$HOOKS_DIR/block-bypass.sh" "$COMMAND"; then
+  exit 2
+fi
+
 # Route to the correct gate based on command content.
 # Only ONE gate runs per command — no wasted work.
 if echo "$COMMAND" | grep -qE '^\s*gh\s+pr\s+merge'; then
