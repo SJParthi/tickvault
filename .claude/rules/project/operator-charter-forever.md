@@ -282,9 +282,20 @@ For every plan item / new feature / Telegram message / docs:
 | `error_level_meta_guard.rs` | `cargo test` | flush/persist failures use `error!` not `warn!` |
 | `scripts/bench-gate.sh` | post-merge | 5% regression budget on hot-path benches |
 | `scripts/coverage-gate.sh` | post-merge | 100% line coverage per crate |
+| `block-bypass.sh` (wired via `pre-tool-dispatch.sh`) | pre-bash | `--no-verify`, `git stash push/pop/apply/save`, `--dangerously-skip-permissions`, `gh pr merge --admin`, force-push to main/master |
 | GitHub Actions CI | every PR | full 22-test battery + mutation + fuzz |
 
 **Anything that needs to be true must be machine-checked. Hand-wave = REJECT.**
+
+## Advisory automation (NOT gates — opt-in helpers)
+
+Distinct from the build-failing chain above. These do NOT block commits/pushes/merges — they are slash-command tools or model-invoked skills that augment reasoning. Listed here so future sessions know they exist.
+
+| Tool | Invocation | What it does |
+|---|---|---|
+| `/nse-fact-checker` skill (`.claude/skills/nse-fact-checker/`) | manual slash-command | Verifies NSE/Dhan/SEBI/Income-Tax rates against authoritative sources; recommends 5-line citation metadata for NEW rate/cost/regulatory constants. Trigger surface limited to external regulatory facts; pure protocol constants are covered by the gates above. |
+| `/quality` skill | manual slash-command | Runs the 8-check quality pipeline locally (fmt/clippy/test/docs/banned-patterns/test-count/audit/deny) |
+| `/health` skill | manual slash-command | Runs `make doctor` + `make validate-automation` for the 30-check observability sweep |
 
 ---
 
