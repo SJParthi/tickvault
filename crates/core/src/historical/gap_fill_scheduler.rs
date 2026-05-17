@@ -60,8 +60,8 @@ use zeroize::Zeroizing;
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
-    GAP_FILL_FETCH_TIMEOUT_SECS, GAP_FILL_RETRY_ATTEMPTS, SECONDS_PER_DAY,
-    TICK_PERSIST_END_SECS_OF_DAY_IST,
+    GAP_FILL_FETCH_TIMEOUT_SECS, GAP_FILL_MAX_CONCURRENT_FETCHES, GAP_FILL_RETRY_ATTEMPTS,
+    SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST,
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::tick_types::HistoricalCandle;
@@ -158,9 +158,26 @@ const GAP_FILL_805_PAUSE_SECS: u64 = 60;
 ///   `(sids_requested, sids_completed, sids_failed, duration_ms,
 ///   result)`.
 /// - `notification_service`: emits `GapFillCompleted` / `Partial` /
-///   `Failed` per bar (PR-D4). The 4-SID fan-out tallies a single
-///   per-bar outcome regardless of whether 1 or 4 SIDs failed —
-///   operator receives one Telegram per bar, not per SID.
+///   `Failed` per bar (PR-D4). The fan-out tallies a single per-bar
+///   outcome regardless of whether 1 or N SIDs failed — operator
+///   receives one Telegram per bar, not per SID.
+/// - `nse_eq_sids`: PR-D6 (2026-05-17) — `Arc<Vec<u32>>` snapshot of
+///   subscribed NSE_EQ SecurityIds captured at boot from
+///   `InstrumentRegistry.by_exchange_segment()[NseEquity]`. The
+///   per-bar fan-out iterates the 4 IDX_I in `GAP_FILL_INDICES`
+///   PLUS every SID in this snapshot. ~218 entries for the indices-
+///   underlyings universe. SIDs are stable for the trading day
+///   (daily instrument rebuild swaps the registry, but the Arc held
+///   here is immutable for the gap-fill scheduler's lifetime —
+///   stale-SID risk is bounded by the 24h JWT lifetime that forces
+///   a process restart anyway).
+/// - `fetch_semaphore`: PR-D6 — `Arc<Semaphore>` with capacity =
+///   [`GAP_FILL_MAX_CONCURRENT_FETCHES`] (= 5). Each per-SID fetch
+///   acquires a permit before issuing the Dhan REST call. Matches
+///   Dhan's 5/sec Data API hard limit per
+///   `docs/dhan-ref/01-introduction-and-rate-limits.md` §7. Bounded
+///   parallelism keeps bar latency under the 64-buffer 25s drain
+///   budget on the disconnect broadcast channel.
 pub struct GapFillExecutorDeps {
     pub http_client: Arc<reqwest::Client>,
     pub endpoint: String,
@@ -170,11 +187,14 @@ pub struct GapFillExecutorDeps {
     pub max_retries: u32,
     pub questdb_config: QuestDbConfig,
     pub notification_service: Arc<NotificationService>,
+    pub nse_eq_sids: Arc<Vec<u32>>,
+    pub fetch_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl GapFillExecutorDeps {
     /// Construct with the default retry budget
-    /// ([`GAP_FILL_RETRY_ATTEMPTS`]).
+    /// ([`GAP_FILL_RETRY_ATTEMPTS`]) and a fresh Semaphore at
+    /// [`GAP_FILL_MAX_CONCURRENT_FETCHES`] capacity.
     #[must_use]
     pub fn new(
         http_client: Arc<reqwest::Client>,
@@ -184,6 +204,7 @@ impl GapFillExecutorDeps {
         candle_writer: Arc<tokio::sync::Mutex<dyn GapFillCandleSink>>,
         questdb_config: QuestDbConfig,
         notification_service: Arc<NotificationService>,
+        nse_eq_sids: Arc<Vec<u32>>,
     ) -> Self {
         Self {
             http_client,
@@ -194,6 +215,8 @@ impl GapFillExecutorDeps {
             max_retries: GAP_FILL_RETRY_ATTEMPTS,
             questdb_config,
             notification_service,
+            nse_eq_sids,
+            fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(GAP_FILL_MAX_CONCURRENT_FETCHES)),
         }
     }
 }
@@ -390,12 +413,20 @@ pub async fn run_gap_fill_scheduler(
     shutdown_notify: Arc<Notify>,
     deps: GapFillExecutorDeps,
 ) {
+    // PR-D6 (2026-05-17): wrap deps in Arc so per-SID spawned tasks
+    // can hold cheap clones without re-cloning every Arc-typed field
+    // individually. The scheduler loop holds a single Arc; each
+    // JoinSet task `Arc::clone`s before spawn.
+    let deps = Arc::new(deps);
+
     info!(
         channel_capacity = crate::websocket::disconnect_event::DISCONNECT_EVENT_CHANNEL_CAPACITY,
         endpoint = %deps.endpoint,
         max_retries = deps.max_retries,
         index_sid_count = GAP_FILL_INDICES.len(),
-        "gap-fill scheduler started (PR-D4: 4 IDX_I fan-out + audit + Telegram)"
+        nse_eq_sid_count = deps.nse_eq_sids.len(),
+        semaphore_capacity = GAP_FILL_MAX_CONCURRENT_FETCHES,
+        "gap-fill scheduler started (PR-D6: indices + NSE_EQ fan-out with Semaphore parallelism)"
     );
 
     let events_received = metrics::counter!("tv_gap_fill_events_received_total");
@@ -422,11 +453,13 @@ pub async fn run_gap_fill_scheduler(
                                 event.outage_end_secs.saturating_sub(event.outage_start_secs),
                             planned_bar_count = bars.len(),
                             index_sid_count = GAP_FILL_INDICES.len(),
-                            "gap-fill: disconnect event received; starting per-bar × 4-SID fetch+UPSERT"
+                            nse_eq_sid_count = deps.nse_eq_sids.len(),
+                            semaphore_capacity = GAP_FILL_MAX_CONCURRENT_FETCHES,
+                            "gap-fill: disconnect event received; starting per-bar × (indices + NSE_EQ) fetch+UPSERT"
                         );
 
                         for bar_start_ist_secs in bars {
-                            execute_bar_for_all_indices(
+                            execute_bar_for_all_instruments(
                                 &deps,
                                 bar_start_ist_secs,
                                 &bars_succeeded,
@@ -459,23 +492,37 @@ pub async fn run_gap_fill_scheduler(
     }
 }
 
-/// Execute one planned bar across all 4 IDX_I indices: per-SID fetch +
-/// UPSERT, tally the (`sids_completed`, `sids_failed`) split, write
-/// one `gap_fill_audit` row, and emit one Telegram event per bar.
+/// NSE_EQ segment numeric code for the Dhan binary protocol. See
+/// `crates/common/src/types.rs::ExchangeSegment::numeric()`. Used
+/// when constructing the per-bar fan-out task list — equities flow
+/// through Dhan's `/v2/charts/intraday` REST endpoint with
+/// `instrument_type = "EQUITY"` and `segment_code = 1`.
+const GAP_FILL_NSE_EQ_SEGMENT_CODE: u8 = 1;
+
+/// Dhan REST `instrument` value for NSE_EQ stocks per
+/// `docs/dhan-ref/05-historical-data.md` §4.
+const GAP_FILL_NSE_EQ_INSTRUMENT_TYPE: &str = "EQUITY";
+
+/// Execute one planned bar across all eligible SecurityIds: 4 IDX_I
+/// indices (`GAP_FILL_INDICES`) + every NSE_EQ SID in
+/// `deps.nse_eq_sids` (PR-D6, 2026-05-17). Per-SID fetch + UPSERT
+/// is dispatched via `tokio::task::JoinSet` with concurrency capped
+/// at `deps.fetch_semaphore` permits. Tally aggregated after all
+/// tasks complete, then write one `gap_fill_audit` row + emit one
+/// Telegram event per bar.
 ///
 /// Per-bar (not per-SID) audit row + Telegram is intentional: the
 /// operator's "did this bar refill" question is bar-scoped, not
 /// SID-scoped. The audit row's `sids_failed` count + the
 /// `GapFillPartial` sample list together identify which SIDs failed
-/// without spamming 4 Telegram messages per bar.
+/// without spamming 222 Telegram messages per bar.
 ///
-/// O(1) EXEMPT: cold path. Fixed 4-element loop per disconnect
-/// event (~5 disconnects/day under healthy market conditions). String
-/// allocations for `trading_date_ist` / `bar_minute_ist` are bounded
-/// by `GAP_FILL_INDICES.len()` × bars_per_event and are NOT on any
-/// tick-processing path.
-async fn execute_bar_for_all_indices(
-    deps: &GapFillExecutorDeps,
+/// O(1) EXEMPT: cold path. Per-bar Vec allocations grow with
+/// `GAP_FILL_INDICES.len() + deps.nse_eq_sids.len()` (~222 entries
+/// for the indices-underlyings universe), bounded by the daily
+/// instrument-master rebuild and NOT on any tick-processing path.
+async fn execute_bar_for_all_instruments(
+    deps: &Arc<GapFillExecutorDeps>,
     bar_start_ist_secs: i64,
     bars_succeeded: &metrics::Counter,
     bars_partial: &metrics::Counter,
@@ -488,16 +535,93 @@ async fn execute_bar_for_all_indices(
     let mut sample_failed_sids: Vec<u32> = Vec::new();
     let mut last_error: Option<String> = None;
 
+    // Build the unified fan-out task set: indices first (4), then
+    // NSE_EQ snapshot (~218). Order within the set is irrelevant —
+    // JoinSet pulls them off in scheduling order, not iteration
+    // order.
+    let total_sids = GAP_FILL_INDICES.len() + deps.nse_eq_sids.len();
+    let mut tasks: tokio::task::JoinSet<(u32, Result<usize, GapFillFetchError>)> =
+        tokio::task::JoinSet::new();
+
+    // Spawn IDX_I tasks.
     for &(security_id, segment_code, instrument_type) in GAP_FILL_INDICES {
-        match execute_gap_fill_for_bar(
-            deps,
-            bar_start_ist_secs,
-            security_id,
-            segment_code,
-            instrument_type,
-        )
-        .await
-        {
+        let deps_for_task = Arc::clone(deps);
+        let semaphore = Arc::clone(&deps.fetch_semaphore);
+        tasks.spawn(async move {
+            let _permit = match semaphore.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    // Semaphore closed — never expected in current code
+                    // paths (we never call `.close()`). Treat as a
+                    // retry-exhausted failure with 0 attempts so the
+                    // operator sees a distinctive signal in audit rows
+                    // + Telegram, without invoking the REST client.
+                    return (
+                        security_id,
+                        Err(GapFillFetchError::RetryExhausted { attempts: 0 }),
+                    );
+                }
+            };
+            let res = execute_gap_fill_for_bar(
+                &deps_for_task,
+                bar_start_ist_secs,
+                security_id,
+                segment_code,
+                instrument_type,
+            )
+            .await;
+            (security_id, res)
+        });
+    }
+
+    // Spawn NSE_EQ tasks (snapshot held under Arc — cheap to read).
+    for &security_id in deps.nse_eq_sids.as_ref() {
+        let deps_for_task = Arc::clone(deps);
+        let semaphore = Arc::clone(&deps.fetch_semaphore);
+        tasks.spawn(async move {
+            let _permit = match semaphore.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    // Semaphore closed — never expected in current code
+                    // paths (we never call `.close()`). Treat as a
+                    // retry-exhausted failure with 0 attempts so the
+                    // operator sees a distinctive signal in audit rows
+                    // + Telegram, without invoking the REST client.
+                    return (
+                        security_id,
+                        Err(GapFillFetchError::RetryExhausted { attempts: 0 }),
+                    );
+                }
+            };
+            let res = execute_gap_fill_for_bar(
+                &deps_for_task,
+                bar_start_ist_secs,
+                security_id,
+                GAP_FILL_NSE_EQ_SEGMENT_CODE,
+                GAP_FILL_NSE_EQ_INSTRUMENT_TYPE,
+            )
+            .await;
+            (security_id, res)
+        });
+    }
+
+    // Tally completion across all tasks.
+    while let Some(joined) = tasks.join_next().await {
+        let (security_id, result) = match joined {
+            Ok(pair) => pair,
+            Err(join_err) => {
+                // Task panicked — treat as a SID failure but log
+                // separately so we don't lose the panic backtrace.
+                error!(
+                    bar_start_ist_secs,
+                    ?join_err,
+                    "gap-fill: per-SID task join failed (panic or cancellation)"
+                );
+                sids_failed = sids_failed.saturating_add(1);
+                continue;
+            }
+        };
+        match result {
             Ok(written) => {
                 sids_completed = sids_completed.saturating_add(1);
                 candles_written.increment(written as u64);
@@ -528,7 +652,7 @@ async fn execute_bar_for_all_indices(
 
     let duration_ms_u32: u32 =
         u32::try_from(bar_started_at.elapsed().as_millis()).unwrap_or(u32::MAX);
-    let sids_requested: u32 = u32::try_from(GAP_FILL_INDICES.len()).unwrap_or(u32::MAX);
+    let sids_requested: u32 = u32::try_from(total_sids).unwrap_or(u32::MAX);
 
     let (result_label, severity_counter) = if sids_failed == 0 && sids_completed > 0 {
         (RESULT_SUCCESS, bars_succeeded)
@@ -674,6 +798,7 @@ mod tests {
                 ilp_port: 9009,
             },
             NotificationService::disabled(),
+            Arc::new(Vec::new()), // PR-D6: empty NSE_EQ snapshot for lifecycle tests
         )
     }
 
@@ -846,6 +971,97 @@ mod tests {
                 "SecurityId {sid} must use Dhan REST instrument_type=INDEX"
             );
         }
+    }
+
+    // PR-D6 ratchets (2026-05-17) — NSE_EQ fan-out + Semaphore.
+
+    #[test]
+    fn test_gap_fill_executor_deps_carries_nse_eq_sids_and_semaphore() {
+        // PR-D6: the struct MUST carry both the NSE_EQ snapshot and
+        // the Semaphore for bounded parallelism. Future deletion of
+        // either field fails this build.
+        let deps = test_deps();
+        // Empty snapshot is fine for the lifecycle test; the type
+        // existence is what we're pinning here.
+        assert!(
+            deps.nse_eq_sids.is_empty(),
+            "test_deps() ships an empty NSE_EQ snapshot — boot wiring fills the real set"
+        );
+        // Semaphore must be a real Arc with capacity > 0 (otherwise
+        // every fan-out task would block forever).
+        assert!(
+            deps.fetch_semaphore.available_permits() > 0,
+            "fetch_semaphore must start with available permits"
+        );
+    }
+
+    #[test]
+    fn test_gap_fill_executor_deps_new_accepts_nse_eq_snapshot() {
+        // Call the constructor with a non-empty snapshot to prove the
+        // signature is `Arc<Vec<u32>>` AND that the field is stored
+        // by Arc-share (not cloned-by-value). The Arc strong-count
+        // assertion is the mechanical signal.
+        let snapshot = Arc::new(vec![13_u32, 25, 51, 21, 1234, 5678]);
+        let strong_count_before = Arc::strong_count(&snapshot);
+        let deps = GapFillExecutorDeps::new(
+            Arc::new(reqwest::Client::new()),
+            "http://127.0.0.1:1/v2/charts/intraday".to_string(),
+            Arc::new(ArcSwap::from_pointee(None)),
+            SecretString::from("test-client-id"),
+            Arc::new(tokio::sync::Mutex::new(NoopCandleSink)),
+            QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: 1,
+                pg_port: 8812,
+                ilp_port: 9009,
+            },
+            NotificationService::disabled(),
+            Arc::clone(&snapshot),
+        );
+        assert_eq!(deps.nse_eq_sids.len(), 6);
+        assert_eq!(deps.nse_eq_sids[0], 13);
+        assert_eq!(deps.nse_eq_sids[4], 1234);
+        // Arc::clone bumped the strong-count by 1 (caller's local +
+        // the field). If the constructor accidentally cloned-by-value,
+        // strong_count would still equal 1 here.
+        assert_eq!(
+            Arc::strong_count(&snapshot),
+            strong_count_before + 1,
+            "constructor must store the Arc by clone, not deep-copy the Vec"
+        );
+    }
+
+    #[test]
+    fn test_semaphore_capacity_equals_gap_fill_max_concurrent_fetches_constant() {
+        // PR-D6 contract: the constructor wires the Semaphore at
+        // exactly `GAP_FILL_MAX_CONCURRENT_FETCHES` permits — that
+        // constant is the single source of truth (matches Dhan Data
+        // API 5/sec hard limit per
+        // `docs/dhan-ref/01-introduction-and-rate-limits.md` §7).
+        let deps = test_deps();
+        assert_eq!(
+            deps.fetch_semaphore.available_permits(),
+            GAP_FILL_MAX_CONCURRENT_FETCHES,
+            "Semaphore capacity must equal GAP_FILL_MAX_CONCURRENT_FETCHES (= {})",
+            GAP_FILL_MAX_CONCURRENT_FETCHES
+        );
+    }
+
+    #[test]
+    fn test_nse_eq_constants_match_dhan_protocol() {
+        // PR-D6: NSE_EQ segment code must equal 1 per
+        // `crates/common/src/types.rs::ExchangeSegment::numeric()`;
+        // instrument_type must be "EQUITY" per
+        // `docs/dhan-ref/05-historical-data.md` §4. Any drift in
+        // either of these silently breaks Dhan's intraday endpoint.
+        assert_eq!(
+            GAP_FILL_NSE_EQ_SEGMENT_CODE, 1,
+            "NSE_EQ segment code must match ExchangeSegment::NseEquity numeric value"
+        );
+        assert_eq!(
+            GAP_FILL_NSE_EQ_INSTRUMENT_TYPE, "EQUITY",
+            "Dhan REST instrument_type for stocks must be EQUITY"
+        );
     }
 
     #[test]
