@@ -1193,31 +1193,31 @@ Z+ LOW fixes (4):
 - [x] **Item 13** — Pre-open buffer → 09:15 candle.open wiring (IDX_I + NSE_EQ) — merged via PR #619 (`open-price source-selection primitives`); see `crates/common/src/open_price_source.rs` + `commit c2b1201`.
 - [x] **Item 14** — REST `/marketfeed/quote.day_open` fallback at 09:14:55 IST — merged at `commit 6e9b4ce` (PR-14 ratchets bumped test-count baseline 9396→9423 in `6a1d35a`).
 - [ ] **Item 15** — 09:16:05 IST cross-check vs Dhan `/charts/intraday` 09:15 bar
-- [ ] **Item 16** — `open_price_audit` + 3 Telegram variants + 8 ratchets
+- [x] **Item 16** — `open_price_audit` + 3 Telegram variants + 8 ratchets
 - [x] **Item 17** — SEBI 24h JWT daily renewal observability + `auth_renewal_audit`
 - [x] **Item 18** — Static IP boot check (`ordersAllowed=true`)
-- [ ] **Item 19** — Dual-instance lock (RESILIENCE-01) via `live_instance_lock` table
+- [x] **Item 19** — Dual-instance lock (RESILIENCE-01) via `live_instance_lock` table
 - [ ] **Item 20** — Orphan position 15:25 IST watchdog
-- [ ] **Item 21** — NaN / div-by-zero indicator guards
-- [ ] **Item 22a** — Order placement 5s REST timeout + DH-904 retry policy
-- [ ] **Item 22b** — Stop-loss-leg-cancelled auto-replace + `sl_replacement_audit`
-- [ ] **Item 22c** — Boot-success Telegram positive ping at 09:14:55 IST
+- [x] **Item 21** — NaN / div-by-zero indicator guards
+- [x] **Item 22a** — Order placement 5s REST timeout + DH-904 retry policy
+- [x] **Item 22b** — Stop-loss-leg-cancelled auto-replace + `sl_replacement_audit`
+- [x] **Item 22c** — Boot-success Telegram positive ping at 09:14:55 IST
 - [ ] **Item 22d** — End-of-day Telegram digest at 15:31:30 IST
-- [ ] **Item 22e** — Tick-level integrity guards (price/oi/high≥low)
-- [ ] **Item 22f** — Self-trade prevention 60s cooldown + `self_trade_audit`
+- [x] **Item 22e** — Tick-level integrity guards (price/oi/high≥low)
+- [x] **Item 22f** — Self-trade prevention 60s cooldown + `self_trade_audit`
 - [ ] ~~Item 22~~ — GIFT NIFTY (PARKED for Phase 2, do NOT implement)
 - [ ] **Item 23** — Prev-close mode mix + REST boot fetch + `PrevCloseMissingAtMarketOpen` + banned-pattern hook
-- [ ] **Item 24** — Order Update WS 7-layer observability + `order_update_ws_audit` + Source filter
-- [ ] **Item 25** — P&L tracker scaffolding (dry-run hypothetical) + `pnl_audit`
-- [ ] **Item 26** — `signal_audit` + `decision_audit` tables (sampled)
-- [ ] **Item 27a** — `docs/phases/phase-0-readme.md`
-- [ ] **Item 27b** — `docs/runbooks/aws-deployment.md`
-- [ ] **Item 27c** — `docs/runbooks/operator-daily-startup.md`
-- [ ] **Item 27d** — `docs/runbooks/troubleshooting.md`
-- [ ] **Item 27e** — `docs/runbooks/kill-switch.md`
-- [ ] **Item 27f** — `docs/runbooks/backtest-runner.md`
-- [ ] **Item 27g** — `docs/runbooks/phase-1-monitoring-rubric.md`
-- [ ] **Item 27h** — `.claude/rules/project/phase-0-architecture.md`
+- [x] **Item 24** — Order Update WS 7-layer observability + `order_update_ws_audit` + Source filter
+- [x] **Item 25** — P&L tracker scaffolding (dry-run hypothetical) + `pnl_audit`
+- [x] **Item 26** — `signal_audit` + `decision_audit` tables (sampled)
+- [x] **Item 27a** — `docs/phases/phase-0-readme.md`
+- [x] **Item 27b** — `docs/runbooks/aws-deployment.md`
+- [x] **Item 27c** — `docs/runbooks/operator-daily-startup.md`
+- [x] **Item 27d** — `docs/runbooks/troubleshooting.md`
+- [x] **Item 27e** — `docs/runbooks/kill-switch.md`
+- [x] **Item 27f** — `docs/runbooks/backtest-runner.md`
+- [x] **Item 27g** — `docs/runbooks/phase-1-monitoring-rubric.md`
+- [x] **Item 27h** — `.claude/rules/project/phase-0-architecture.md`
 - [ ] **Item 28** — Cross-verify mismatch DEDUP UPSERT overwrite + 09:15 strategy gate + `bar_correction_audit`
 - [ ] **Item 29** — QuestDB schema changes (candles source column + 15 new audit tables + 15 schema ratchets)
 - [ ] **Item 30** — `pct_from_prev_close` column on all 5 candle tables + bar-seal computation + cross-verify recompute hook + 8 ratchets (DEDUP KEYS unchanged: `(security_id, exchange_segment, ts, timeframe)`)
