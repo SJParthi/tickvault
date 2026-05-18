@@ -1056,6 +1056,35 @@ pub enum NotificationEvent {
         services_total: usize,
     },
 
+    /// Phase 0 Item 20 — orphan position 15:25 IST watchdog observed
+    /// one or more open positions (`net_qty != 0`) at 15:25:00 IST.
+    /// Strategy is intraday option-buying — overnight positions are
+    /// NOT allowed. Severity::Critical. In Phase 0 (dry-run) this is
+    /// the terminal signal; operator MUST manually exit before 15:30.
+    /// In Phase 1+ the watchdog auto-exits and this Telegram is
+    /// supplemented by `OrphanPositionAutoClosed` / `OrphanPositionExitFailed`.
+    OrphanPositionDetected {
+        /// Count of open positions found.
+        count: usize,
+        /// Sum of `|net_qty|` across all orphans.
+        total_abs_net_qty: i64,
+        /// Up to 5 sample trading symbols for the Telegram body.
+        /// Full list lives in the `orphan_position_audit` QuestDB
+        /// table — operator queries `SELECT * FROM orphan_position_audit
+        /// WHERE trading_date_ist = today()`.
+        sample_symbols: Vec<String>,
+        /// Whether `[strategy] dry_run = true` was set when the
+        /// watchdog ran. In Phase 0 this is always `true` and the
+        /// Telegram body warns the operator to exit manually.
+        dry_run: bool,
+    },
+
+    /// Phase 0 Item 20 — watchdog confirms account is flat at 15:25
+    /// IST. Severity::Info. Positive-ping per audit-findings Rule 11
+    /// — without this the operator can't tell whether the watchdog
+    /// ran (the absence of `OrphanPositionDetected` is ambiguous).
+    OrphanPositionsClean,
+
     /// Boot deadline missed — system did not complete startup within allowed time.
     BootDeadlineMissed {
         /// Deadline in seconds that was exceeded.
@@ -2517,6 +2546,33 @@ impl NotificationEvent {
             } => {
                 format!("<b>Boot health check</b>\nHealthy: {services_healthy}/{services_total}")
             }
+            Self::OrphanPositionDetected {
+                count,
+                total_abs_net_qty,
+                sample_symbols,
+                dry_run,
+            } => {
+                let sample = if sample_symbols.is_empty() {
+                    "(no sample symbols captured)".to_string()
+                } else {
+                    sample_symbols.join(", ")
+                };
+                let action = if *dry_run {
+                    "DRY-RUN: no auto-exit attempted. EXIT MANUALLY via Dhan web UI before 15:30 IST close."
+                } else {
+                    "Auto-exit attempted — see follow-up Telegram for per-position outcome."
+                };
+                format!(
+                    "<b>ORPHAN POSITIONS AT 15:25 IST</b>\n\
+                     Open positions: {count}\n\
+                     Total |net_qty|: {total_abs_net_qty}\n\
+                     Sample: {sample}\n\n\
+                     {action}"
+                )
+            }
+            Self::OrphanPositionsClean => {
+                "<b>Orphan-position watchdog</b>\n15:25 IST: account is flat. \u{2705}".to_string()
+            }
             Self::BootDeadlineMissed {
                 deadline_secs,
                 step,
@@ -2985,6 +3041,8 @@ impl NotificationEvent {
             Self::StaticIpBootCheckRetrying { .. } => "StaticIpBootCheckRetrying",
             Self::DualInstanceDetected { .. } => "DualInstanceDetected",
             Self::BootHealthCheck { .. } => "BootHealthCheck",
+            Self::OrphanPositionDetected { .. } => "OrphanPositionDetected",
+            Self::OrphanPositionsClean => "OrphanPositionsClean",
             Self::BootDeadlineMissed { .. } => "BootDeadlineMissed",
             Self::BootClockSkewExceeded { .. } => "BootClockSkewExceeded",
             Self::OrderRejected { .. } => "OrderRejected",
@@ -3163,6 +3221,8 @@ impl NotificationEvent {
             Self::AuthenticationSuccess => Severity::Low,
             Self::InstrumentBuildSuccess { .. } => Severity::Low,
             Self::BootHealthCheck { .. } => Severity::Low,
+            Self::OrphanPositionDetected { .. } => Severity::Critical,
+            Self::OrphanPositionsClean => Severity::Info,
             Self::StartupComplete { .. } => Severity::Info,
             Self::ShutdownComplete => Severity::Info,
             Self::Depth20DynamicTopSetEmpty { .. } => Severity::High,
@@ -5788,6 +5848,92 @@ mod tests {
             lock_key: String::new(),
         };
         assert_eq!(event.topic(), "DualInstanceDetected");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 0 Item 20 — OrphanPositionDetected / OrphanPositionsClean
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_orphan_position_detected_is_critical() {
+        let event = NotificationEvent::OrphanPositionDetected {
+            count: 1,
+            total_abs_net_qty: 50,
+            sample_symbols: vec!["NIFTY-Mar2026-24500-CE".to_string()],
+            dry_run: true,
+        };
+        assert_eq!(event.severity(), Severity::Critical);
+    }
+
+    #[test]
+    fn test_orphan_positions_clean_is_info() {
+        let event = NotificationEvent::OrphanPositionsClean;
+        assert_eq!(event.severity(), Severity::Info);
+    }
+
+    #[test]
+    fn test_orphan_position_topics_are_stable() {
+        // operator-charter forbids renaming wire-format identifiers.
+        let detected = NotificationEvent::OrphanPositionDetected {
+            count: 0,
+            total_abs_net_qty: 0,
+            sample_symbols: vec![],
+            dry_run: true,
+        };
+        assert_eq!(detected.topic(), "OrphanPositionDetected");
+        let clean = NotificationEvent::OrphanPositionsClean;
+        assert_eq!(clean.topic(), "OrphanPositionsClean");
+    }
+
+    #[test]
+    fn test_orphan_position_detected_message_includes_manual_exit_instruction_in_dry_run() {
+        let event = NotificationEvent::OrphanPositionDetected {
+            count: 2,
+            total_abs_net_qty: 75,
+            sample_symbols: vec![
+                "NIFTY-Mar2026-24500-CE".to_string(),
+                "BANKNIFTY-Mar2026-52000-PE".to_string(),
+            ],
+            dry_run: true,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("ORPHAN POSITIONS AT 15:25 IST"));
+        assert!(msg.contains("Open positions: 2"));
+        assert!(msg.contains("Total |net_qty|: 75"));
+        assert!(msg.contains("NIFTY-Mar2026-24500-CE"));
+        assert!(msg.contains("BANKNIFTY-Mar2026-52000-PE"));
+        assert!(
+            msg.contains("DRY-RUN"),
+            "Phase 0 message MUST flag dry-run mode so operator exits manually"
+        );
+        assert!(
+            msg.contains("EXIT MANUALLY"),
+            "Phase 0 message MUST instruct operator to exit before 15:30"
+        );
+    }
+
+    #[test]
+    fn test_orphan_position_detected_message_in_live_mode_says_auto_exit_attempted() {
+        let event = NotificationEvent::OrphanPositionDetected {
+            count: 1,
+            total_abs_net_qty: 50,
+            sample_symbols: vec!["NIFTY-Mar2026-24500-CE".to_string()],
+            dry_run: false,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Auto-exit attempted"));
+        assert!(
+            !msg.contains("DRY-RUN"),
+            "live-mode message MUST NOT mention dry-run"
+        );
+    }
+
+    #[test]
+    fn test_orphan_positions_clean_message_is_positive_ping() {
+        let event = NotificationEvent::OrphanPositionsClean;
+        let msg = event.to_message();
+        assert!(msg.contains("15:25 IST"));
+        assert!(msg.contains("flat"));
     }
 
     // -----------------------------------------------------------------------

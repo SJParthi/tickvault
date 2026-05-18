@@ -3080,6 +3080,16 @@ async fn main() -> Result<()> {
         tickvault_storage::last_tick_audit_persistence::ensure_last_tick_audit_table(
             &config.questdb
         ),
+        // Phase 0 Item 20 (2026-05-18) — `orphan_position_audit` forensic
+        // table. The watchdog evaluator + Telegram variants ship today
+        // (dry-run scaffolding); the Phase 1+ runtime spawner will use
+        // this DDL once the OMS API client is wired into boot. Idempotent
+        // CREATE TABLE IF NOT EXISTS — safe to call every boot. DEDUP key
+        // `(trading_date_ist, security_id, exchange_segment, ts)` per
+        // I-P1-11 composite identity rule.
+        tickvault_storage::orphan_position_audit_persistence::ensure_orphan_position_audit_table(
+            &config.questdb
+        ),
         // Option-chain minute-snapshot pipeline (2026-05-16, PR #2 of 5).
         // Forensic table for the 3-times-per-minute Dhan option chain
         // fetches that feed BRUTEX strike-selection. One row per

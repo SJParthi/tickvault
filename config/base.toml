@@ -228,6 +228,9 @@ build_window_end = "15:30:00"
 host = "0.0.0.0"
 port = 3001
 allowed_origins = ["http://localhost:3000", "http://localhost:3001"]
+# Audit Finding #9: when true (dev default), boot auto-opens the operator
+# DLT Control Panel in the local browser. Set to false for AWS / headless
+# production deployments where there is no display server to open.
 auto_open_portal = true
 
 [subscription]
