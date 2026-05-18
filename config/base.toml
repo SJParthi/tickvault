@@ -295,24 +295,15 @@ inter_batch_delay_ms = 0
 [infrastructure]
 auto_start_docker = true
 
-[movers]
-stocks_min_volume = 0
-indices_min_volume = 0
-index_futures_min_volume = 1
-stock_futures_min_volume = 1
-index_options_min_volume = 1
-index_options_min_oi = 100
-stock_options_min_volume = 1
-stock_options_min_oi = 100
-snapshot_cadence_secs = 5
-persistence_cadence_secs = 1
-top_n = 20
+# [movers] section retired in PR #2 (2026-05-18) alongside the deleted
+# movers pipeline. Under the 4-IDX_I-only universe top-N gainers/losers/
+# most-active queries are meaningless.
 
 [features]
 hotpath_async_writers = true
 phase2_emit_guard = true
-stock_movers_full_universe = true
-option_movers_5s = true
+# stock_movers_full_universe + option_movers_5s retired in PR #2
+# (2026-05-18) alongside the deleted movers pipeline.
 previous_close_persist = true
 ws_main_sleep_until_open = true
 ws_depth_ou_sleep_until_open = true

@@ -1,9 +1,15 @@
 //! Wave-5 in-memory store — Plan §K-L9 / L10 / L11.
 //!
 //! Ships the in-RAM **tick ring per instrument** that downstream
-//! consumers (depth-dynamic selector, top-N movers query, future
-//! `/api/movers/v2` read flip in #505) need to bypass QuestDB on
+//! consumers (depth-dynamic selector, etc.) need to bypass QuestDB on
 //! the hot read path.
+//!
+//! ## Movers retirement
+//!
+//! The `top_n` module (`top_n_by_bars` / `TopNQuery` / `Category` /
+//! `Scope`) was deleted in PR #2 of the AWS-lifecycle 14-PR sequence
+//! alongside the movers pipeline (operator-locked 2026-05-18). Under
+//! the 4-IDX_I-only universe, top-N queries return meaningless results.
 //!
 //! ## What this module ships (PR #504d)
 //!
@@ -16,7 +22,6 @@
 //!
 //! - The bar storage map (`CascadeFanout` already exists from
 //!   Phase 3 / #504c — L11's "bar storage" requirement is met by it).
-//! - The `/api/movers/v2` read flip (#505).
 //! - The seal-time % stamping (#504e — populates the 5 fields shipped
 //!   in #504b).
 //! - The 1s engine retirement per L17 (separate cleanup PR).
@@ -47,7 +52,6 @@ pub mod day_ohlc_tracker;
 pub mod prev_day_cache;
 pub mod reset_scheduler;
 pub mod tick_storage;
-pub mod top_n;
 
 pub use bar_cache::{BarCache, CompactBar, bar_cache_clear_before_threshold};
 pub use consumer::run_tick_storage_consumer;
@@ -55,4 +59,3 @@ pub use day_ohlc_tracker::{DayOhlc, DayOhlcTracker};
 pub use prev_day_cache::PrevDayCache;
 pub use reset_scheduler::{run_tick_storage_daily_reset, secs_until_next_market_open_ist};
 pub use tick_storage::{DEFAULT_PER_INSTRUMENT_CAPACITY, TickStorage};
-pub use top_n::{Category, Scope, TopNQuery, top_n_by_bars};

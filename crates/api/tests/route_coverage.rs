@@ -39,7 +39,6 @@ fn test_state() -> SharedAppState {
             build_window_end: "09:15:00".to_string(),
         },
         std::sync::Arc::new(std::sync::RwLock::new(None)),
-        std::sync::Arc::new(std::sync::RwLock::new(None)),
         std::sync::Arc::new(SystemHealthStatus::new()),
     )
 }
@@ -60,21 +59,8 @@ async fn test_get_stats_returns_200() {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
-/// `GET /api/top-movers` must return 200 (handler returns `available: false`
-/// when the snapshot is empty — never errors).
-#[tokio::test]
-async fn test_get_top_movers_returns_200() {
-    let router = build_router(test_state(), &[], true);
-    let request = Request::builder()
-        .uri("/api/top-movers")
-        .body(Body::empty())
-        .expect("request build should succeed"); // APPROVED: test-only
-    let response = router
-        .oneshot(request)
-        .await
-        .expect("router should respond"); // APPROVED: test-only
-    assert_eq!(response.status(), StatusCode::OK);
-}
+// PR #2 (2026-05-18): `test_get_top_movers_returns_200` removed
+// alongside the deleted `/api/top-movers` route family.
 
 /// `GET /api/index-constituency` must return 200 (handler returns
 /// `available: false` when the constituency map is empty — never errors).

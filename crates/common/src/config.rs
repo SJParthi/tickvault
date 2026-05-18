@@ -43,9 +43,9 @@ pub struct ApplicationConfig {
     pub infrastructure: InfrastructureConfig,
     #[serde(default)]
     pub partition_retention: PartitionRetentionConfig,
-    /// Plan item E1 (2026-04-22): 6-bucket movers tracker filter + cadence config.
-    #[serde(default)]
-    pub movers: MoversConfig,
+    // PR #2 (2026-05-18): `movers: MoversConfig` retired alongside the
+    // deleted movers pipeline. The [movers] section in base.toml was
+    // also removed.
     /// Wave 1 C9 feature flags — operator-flippable rollback toggles.
     /// 14 flags spanning Wave 1, Wave 2 and Wave 3 items.
     #[serde(default)]
@@ -501,10 +501,9 @@ pub struct FeaturesConfig {
     pub hotpath_async_writers: bool,
     /// Wave 1 Item 1 — Phase2EmitGuard panic-on-drop in debug, ERROR in release.
     pub phase2_emit_guard: bool,
-    /// Wave 1 Item 2 — stock movers persist ALL ranks (no top-N truncation).
-    pub stock_movers_full_universe: bool,
-    /// Wave 1 Item 3 — option movers snapshot every 5s for ~22K contracts.
-    pub option_movers_5s: bool,
+    // PR #2 (2026-05-18): `stock_movers_full_universe` and
+    // `option_movers_5s` flags retired alongside the deleted movers
+    // pipeline.
     /// Wave 1 Item 4 — `previous_close` un-deprecate + segment-routed persist.
     pub previous_close_persist: bool,
     /// Wave 2 Item 5 — main-feed WS idle-sleep until 09:00 IST.
@@ -566,8 +565,6 @@ impl Default for FeaturesConfig {
         Self {
             hotpath_async_writers: true,
             phase2_emit_guard: true,
-            stock_movers_full_universe: true,
-            option_movers_5s: true,
             previous_close_persist: true,
             ws_main_sleep_until_open: true,
             ws_depth_ou_sleep_until_open: true,
@@ -602,68 +599,9 @@ impl Default for FeaturesConfig {
     }
 }
 
-/// Plan item E1 (2026-04-22): tuning knobs for the 6-bucket `MoversTrackerV2`.
-///
-/// Defaults match the plan spec. Operators can override via `config/base.toml`
-/// `[movers]` section. Units are documented per-field.
-///
-/// # Filter rationale
-///
-/// Without `index_options_min_oi` / `stock_options_min_oi`, the leaderboard is
-/// dominated by deep-OTM strikes (0.05 → 0.10 = +100% noise) that nobody
-/// trades. Setting minimums in the low-hundreds suppresses this while still
-/// allowing thin-but-real options through.
-///
-/// # Cadence rationale
-///
-/// `snapshot_cadence_secs` controls in-memory recompute (humans poll at 1 Hz).
-/// `persistence_cadence_secs` controls QuestDB write (1 Hz = ~134 rows/sec =
-/// ~2.9M rows/day = comfortable for WAL).
-#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
-#[serde(default)]
-pub struct MoversConfig {
-    /// Minimum traded volume to qualify for stock ranking. Default 0 (no filter).
-    pub stocks_min_volume: u32,
-    /// Minimum traded volume for index ranking. Default 0.
-    pub indices_min_volume: u32,
-    /// Minimum traded volume for index-future ranking. Default 1.
-    pub index_futures_min_volume: u32,
-    /// Minimum traded volume for stock-future ranking. Default 1.
-    pub stock_futures_min_volume: u32,
-    /// Minimum traded volume for index-option ranking. Default 1.
-    pub index_options_min_volume: u32,
-    /// Minimum open interest for index-option ranking. Default 100.
-    /// Suppresses deep-OTM 0.05→0.10 = +100% noise.
-    pub index_options_min_oi: u32,
-    /// Minimum traded volume for stock-option ranking. Default 1.
-    pub stock_options_min_volume: u32,
-    /// Minimum open interest for stock-option ranking. Default 100.
-    pub stock_options_min_oi: u32,
-    /// In-memory snapshot recompute period. Default 5 seconds.
-    pub snapshot_cadence_secs: u32,
-    /// QuestDB persistence write period. Default 1 second.
-    pub persistence_cadence_secs: u32,
-    /// Top-N ranks emitted per category per bucket. Default 20.
-    pub top_n: u32,
-}
-
-impl Default for MoversConfig {
-    fn default() -> Self {
-        Self {
-            stocks_min_volume: 0,
-            indices_min_volume: 0,
-            index_futures_min_volume: 1,
-            stock_futures_min_volume: 1,
-            index_options_min_volume: 1,
-            index_options_min_oi: 100,
-            stock_options_min_volume: 1,
-            stock_options_min_oi: 100,
-            snapshot_cadence_secs: 5,
-            persistence_cadence_secs: 1,
-            top_n: 20,
-        }
-    }
-}
+// PR #2 (2026-05-18): `MoversConfig` struct retired alongside the
+// deleted movers pipeline. Under the 4-IDX_I-only universe top-N
+// gainers/losers/most-active queries are meaningless.
 
 /// Trading execution mode — controls how orders are routed.
 ///
@@ -2057,7 +1995,7 @@ mod tests {
             greeks: GreeksConfig::default(),
             infrastructure: InfrastructureConfig::default(),
             partition_retention: PartitionRetentionConfig::default(),
-            movers: MoversConfig::default(),
+            // movers: MoversConfig retired in PR #2 (2026-05-18).
             features: FeaturesConfig::default(),
             depth_20: Depth20RootConfig::default(),
             depth_200: Depth200RootConfig::default(),
@@ -3218,41 +3156,8 @@ mod tests {
         );
     }
 
-    // Plan item E1 (2026-04-22) — MoversConfig defaults guard
-    #[test]
-    fn test_movers_config_default_min_oi_is_100_for_options() {
-        let cfg = MoversConfig::default();
-        assert_eq!(cfg.index_options_min_oi, 100);
-        assert_eq!(cfg.stock_options_min_oi, 100);
-    }
-
-    #[test]
-    fn test_movers_config_default_cadences_are_5s_and_1s() {
-        let cfg = MoversConfig::default();
-        assert_eq!(cfg.snapshot_cadence_secs, 5);
-        assert_eq!(cfg.persistence_cadence_secs, 1);
-    }
-
-    #[test]
-    fn test_movers_config_default_top_n_is_20() {
-        assert_eq!(MoversConfig::default().top_n, 20);
-    }
-
-    #[test]
-    fn test_movers_config_default_stocks_and_indices_have_no_volume_filter() {
-        let cfg = MoversConfig::default();
-        assert_eq!(cfg.stocks_min_volume, 0);
-        assert_eq!(cfg.indices_min_volume, 0);
-    }
-
-    #[test]
-    fn test_movers_config_default_derivatives_require_at_least_one_trade() {
-        let cfg = MoversConfig::default();
-        assert_eq!(cfg.index_futures_min_volume, 1);
-        assert_eq!(cfg.stock_futures_min_volume, 1);
-        assert_eq!(cfg.index_options_min_volume, 1);
-        assert_eq!(cfg.stock_options_min_volume, 1);
-    }
+    // PR #2 (2026-05-18): MoversConfig defaults guard tests retired
+    // alongside the deleted MoversConfig struct and movers pipeline.
 
     // -----------------------------------------------------------------------
     // PR-C2 — DepthDynamicConfig invariants

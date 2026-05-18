@@ -128,9 +128,8 @@ mod tests {
         assert!(result.is_none());
     }
 
-    fn empty_snapshot() -> tickvault_core::pipeline::top_movers::SharedTopMoversSnapshot {
-        std::sync::Arc::new(std::sync::RwLock::new(None))
-    }
+    // PR #2 (2026-05-18): empty_snapshot() removed alongside the
+    // deleted SharedTopMoversSnapshot type.
 
     #[tokio::test]
     async fn test_get_stats_returns_unreachable_when_questdb_down() {
@@ -164,7 +163,6 @@ mod tests {
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
             },
-            empty_snapshot(),
             std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(crate::state::SystemHealthStatus::new()),
         );
@@ -529,7 +527,6 @@ mod tests {
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
             },
-            empty_snapshot(),
             std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(crate::state::SystemHealthStatus::new()),
         );

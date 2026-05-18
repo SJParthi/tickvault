@@ -111,16 +111,14 @@ pub fn build_router_with_auth(
             "/api/quote/{security_id}",
             axum::routing::get(handlers::quote::get_quote),
         )
-        // 2026-05-09 cleanup (PR 5a): the V1 `/api/movers` and
-        // `/api/movers/expiries` routes have been removed. The unified
-        // V2 endpoint `/api/movers/v2` (registered conditionally below
-        // when AppState carries `cascade_fanout`) is the single source
-        // of truth for the Dhan-parity movers UI. The V1 handlers had
-        // zero frontend consumers (verified by grepping
-        // `crates/api/static/`). The V1 SQL-backed implementation
-        // queried `movers_*` matviews — that infrastructure is being
-        // retired in subsequent PRs (5b/c/d) to match plan §P operator
-        // directive: "ticks and candles alone".
+        // PR #2 (2026-05-18): the entire movers route family — V1
+        // `/api/movers`, V1 `/api/movers/expiries`, V2 `/api/movers/v2`,
+        // legacy `/api/market/stock-movers`, legacy
+        // `/api/market/option-movers` — is now retired. Under the
+        // 4-IDX_I-only universe top-N gainers/losers/most-active
+        // queries are meaningless. The handlers, the `top_movers` /
+        // `option_movers` modules, and the `movers_v2` REST handler
+        // were deleted alongside the movers pipeline.
         .route(
             "/api/instruments/diagnostic",
             axum::routing::get(handlers::instruments::instrument_diagnostic),
@@ -154,13 +152,6 @@ pub fn build_router_with_auth(
             "/api/market/indices",
             axum::routing::get(handlers::market_data::get_indices),
         )
-        // 2026-05-09 PR 5b2: legacy `/api/market/stock-movers` and
-        // `/api/market/option-movers` routes deleted. The 3 static
-        // dashboards (markets-stocks.html, markets-options.html,
-        // market-dashboard.html) now consume `/api/movers/v2`
-        // (in-RAM CascadeFanout reads — no `movers_*` matview
-        // dependency). Backing handlers + `movers_questdb.rs` deleted
-        // in the same commit.
         .route(
             "/portal/market-dashboard",
             axum::routing::get(handlers::static_file::market_dashboard),
@@ -208,28 +199,11 @@ pub fn build_router_with_auth(
             axum::routing::get(handlers::debug::spill_status),
         );
 
-    // Phase 4a (2026-05-05) — DORMANT BY DEFAULT.
-    // Register `/api/movers/v2` ONLY when AppState was constructed via
-    // `new_with_cascade_fanout()` AND `config.api.movers_v2_enabled` was
-    // `true` at boot. With the default config flag (false), main.rs
-    // calls the regular `new()` constructor → `cascade_fanout()` returns
-    // `None` → the v2 route is NOT registered → the route does not
-    // exist on the running server (404 instead of any response).
-    //
-    // We use a separate `/api/movers/v2` path rather than a `?v=2` query
-    // parameter on `/api/movers` because axum routes by path not query;
-    // mounting v2 alongside v1 keeps both reachable for the 24h dual-path
-    // soak per active-plan §6 row 4.
-    let routes = public_routes.merge(protected_routes);
-    let routes = if state.cascade_fanout().is_some() {
-        routes.route(
-            "/api/movers/v2",
-            axum::routing::get(handlers::movers_v2::get_movers_v2),
-        )
-    } else {
-        routes
-    };
-    routes
+    // PR #2 (2026-05-18): conditional `/api/movers/v2` route + the
+    // `cascade_fanout` accessor on AppState retired. See above comment
+    // on the merged routes block.
+    public_routes
+        .merge(protected_routes)
         .layer(axum::middleware::from_fn(request_tracing))
         .layer(cors)
         .with_state(state)
@@ -361,7 +335,6 @@ mod tests {
                 build_window_end: "08:55:00".to_string(),
             },
             std::sync::Arc::new(std::sync::RwLock::new(None)),
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(state::SystemHealthStatus::new()),
         );
         // Production-style call: SecretString → from_token → build_router_with_auth.
@@ -400,7 +373,6 @@ mod tests {
                 build_window_end: "08:55:00".to_string(),
             },
             std::sync::Arc::new(std::sync::RwLock::new(None)),
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(state::SystemHealthStatus::new()),
         );
         // dry_run=true → TV_API_TOKEN not needed
@@ -435,7 +407,6 @@ mod tests {
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
             },
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(state::SystemHealthStatus::new()),
         );
@@ -482,7 +453,6 @@ mod tests {
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
             },
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(state::SystemHealthStatus::new()),
         );
@@ -538,7 +508,6 @@ mod tests {
                 build_window_end: "08:55:00".to_string(),
             },
             std::sync::Arc::new(std::sync::RwLock::new(None)),
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(state::SystemHealthStatus::new()),
         );
         let router = build_router(state, &[], true);
@@ -589,7 +558,6 @@ mod tests {
                 build_window_end: "08:55:00".to_string(),
             },
             std::sync::Arc::new(std::sync::RwLock::new(None)),
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(state::SystemHealthStatus::new()),
         );
         let origins = vec!["http://localhost:3000".to_string()];
@@ -629,7 +597,6 @@ mod tests {
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
             },
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(state::SystemHealthStatus::new()),
         );

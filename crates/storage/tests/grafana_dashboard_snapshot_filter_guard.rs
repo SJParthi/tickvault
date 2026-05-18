@@ -79,10 +79,9 @@ const REQUIRED_DASHBOARD_METRIC_PREFIXES: &[&str] = &[
     // tv_phase2_runs_total and tv_phase2_preopen_buffer_entries and
     // tv_phase2_trigger_latency_ms.
     "tv_phase2_",
-    // Plan item F2 (2026-04-22): 6-bucket movers dashboard panels on
-    // market-movers.json. Prefix matches tv_movers_snapshot_duration_ms
-    // and tv_movers_tracked_total.
-    "tv_movers_",
+    // PR #2 (2026-05-18): `tv_movers_` prefix retired alongside the
+    // deleted movers pipeline + market-movers.json + movers-22tf.json
+    // dashboards.
     // Wave 3-D Item 13: composite real-time guarantee score gauge.
     // Matches `tv_realtime_guarantee_score`,
     // `tv_realtime_guarantee_dimension`, and

@@ -375,7 +375,6 @@ mod tests {
                 build_window_end: "08:55:00".to_string(),
             },
             std::sync::Arc::new(std::sync::RwLock::new(None)),
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(crate::state::SystemHealthStatus::new()),
         )
     }
