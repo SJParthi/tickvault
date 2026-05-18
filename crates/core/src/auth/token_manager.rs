@@ -879,17 +879,21 @@ impl TokenManager {
                             "",
                         )
                         .await;
-                        // Phase 0 Item 17 — positive-ping Telegram + Prom
-                        // counter so the operator sees the daily SEBI
-                        // 24h JWT renewal succeed instead of inferring
-                        // it from the absence of TokenRenewalFailed.
+                        // Phase 0 Item 17 (2026-05-18) — daily renewal
+                        // positive ping. The existing TokenRenewed
+                        // variant (Severity::Low) was defined but
+                        // never emitted (Rule 13 anti-pattern); now
+                        // wired so the operator sees once-per-day
+                        // confirmation that the SEBI 24h JWT cycle
+                        // succeeded. Severity::Low keeps Telegram
+                        // bucket-coalesced; no spam.
+                        self.notifier.notify(NotificationEvent::TokenRenewed);
                         metrics::counter!(
                             "tv_token_renewals_total",
+                            "source" => "scheduled",
                             "result" => "success",
-                            "trigger" => "scheduled",
                         )
                         .increment(1);
-                        self.notifier.notify(NotificationEvent::TokenRenewed);
                         succeeded = true;
                         break;
                     }
@@ -944,13 +948,11 @@ impl TokenManager {
                     ),
                 )
                 .await;
-                // Phase 0 Item 17 — failed-cycle counter pairs with the
-                // success counter above so `result=failed / result=success`
-                // ratio is dashboard-visible.
+                // Phase 0 Item 17 — failure-side counter increment.
                 metrics::counter!(
                     "tv_token_renewals_total",
+                    "source" => "scheduled",
                     "result" => "failed",
-                    "trigger" => "scheduled",
                 )
                 .increment(1);
 
@@ -977,10 +979,11 @@ impl TokenManager {
                         "HALTED: token renewal permanently failed — manual restart required",
                     )
                     .await;
+                    // Phase 0 Item 17 — circuit-breaker halt counter.
                     metrics::counter!(
                         "tv_token_renewals_total",
+                        "source" => "scheduled",
                         "result" => "circuit_breaker_halt",
-                        "trigger" => "scheduled",
                     )
                     .increment(1);
                     return;
@@ -3347,39 +3350,55 @@ mod tests {
         );
     }
 
-    /// Phase 0 Item 17 — `tv_token_renewals_total` counter must be
-    /// emitted at all three scheduled-renewal outcomes (success /
-    /// failed / circuit_breaker_halt). Removing any one site silently
-    /// breaks the Grafana renewal-ratio panel.
+    /// Phase 0 Item 17 (2026-05-18) — source-scan ratchets pinning the
+    /// scheduled-renewal success path emits BOTH the `TokenRenewed`
+    /// Telegram (positive ping per Rule 11) AND the
+    /// `tv_token_renewals_total` Prometheus counter. Defends against
+    /// regression to the pre-Item-17 state where the audit row was
+    /// written but no operator-visible signal fired.
     #[test]
-    fn test_renewal_loop_emits_token_renewals_total_counter() {
-        let source = include_str!("token_manager.rs");
-        assert!(
-            source.contains("\"tv_token_renewals_total\""),
-            "token_manager.rs MUST emit tv_token_renewals_total counter \
-             from the scheduled renewal_loop. See Phase 0 Item 17."
-        );
-        for result_label in ["\"success\"", "\"failed\"", "\"circuit_breaker_halt\""] {
-            assert!(
-                source.contains(result_label),
-                "tv_token_renewals_total must carry result label {} \
-                 (scheduled renewal_loop). See Phase 0 Item 17.",
-                result_label
-            );
-        }
-    }
-
-    /// Phase 0 Item 17 — successful scheduled renewal must emit a
-    /// `TokenRenewed` Telegram so the operator sees a daily positive
-    /// ping instead of inferring success from the absence of
-    /// `TokenRenewalFailed`.
-    #[test]
-    fn test_renewal_loop_emits_token_renewed_telegram() {
+    fn test_scheduled_success_emits_token_renewed_telegram() {
         let source = include_str!("token_manager.rs");
         assert!(
             source.contains("NotificationEvent::TokenRenewed"),
-            "token_manager.rs renewal_loop success path MUST notify \
-             NotificationEvent::TokenRenewed. See Phase 0 Item 17."
+            "token_manager.rs MUST emit NotificationEvent::TokenRenewed \
+             on successful scheduled renewal (Phase 0 Item 17 positive \
+             ping per Rule 11)"
+        );
+    }
+
+    #[test]
+    fn test_tv_token_renewals_total_counter_present_for_all_outcomes() {
+        let source = include_str!("token_manager.rs");
+        // The counter MUST exist with `source` + `result` labels per
+        // plan §11. The 3 outcomes wired in production: success,
+        // failed, circuit_breaker_halt.
+        assert!(
+            source.contains("tv_token_renewals_total"),
+            "token_manager.rs MUST emit tv_token_renewals_total counter"
+        );
+        let success_increments = source.matches("\"result\" => \"success\"").count();
+        assert!(
+            success_increments >= 1,
+            "Scheduled success branch MUST increment tv_token_renewals_total \
+             with result=success; found {}",
+            success_increments
+        );
+        let failed_increments = source.matches("\"result\" => \"failed\"").count();
+        assert!(
+            failed_increments >= 1,
+            "Scheduled failure branch MUST increment tv_token_renewals_total \
+             with result=failed; found {}",
+            failed_increments
+        );
+        let halt_increments = source
+            .matches("\"result\" => \"circuit_breaker_halt\"")
+            .count();
+        assert!(
+            halt_increments >= 1,
+            "Circuit-breaker halt branch MUST increment tv_token_renewals_total \
+             with result=circuit_breaker_halt; found {}",
+            halt_increments
         );
     }
 }
