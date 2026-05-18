@@ -1,5 +1,20 @@
 # AWS Cost Floor Analysis — Can We Reach <₹1K/mo?
 
+> **⚠️ SUPERSEDED 2026-05-18 ⚠️**
+>
+> This doc compared multiple instance candidates to find <₹1K achievability. The operator's AWS console screenshot revealed the agent had hallucinated ap-south-1 pricing by ~43%. With CORRECTED Mumbai pricing:
+> - **t4g.medium ap-south-1 = $0.0224/hr (not $0.0392)**
+> - **t4g.medium every-day 9hr × 30 = ~₹1,022/mo** ✓ essentially at <₹1K target
+> - **Tenancy: Default (Shared) LOCKED** (Dedicated saves nothing, costs ₹1,500/mo extra)
+>
+> **THE FINAL LOCK:** t4g.medium ARM ap-south-1, Shared tenancy, on-demand, every-day 08:00–17:00 IST = ~₹1,022/mo.
+>
+> Read this only for historical reasoning. **For the locked architecture, read `aws-indices-only-locked-architecture.md`.**
+
+---
+
+# AWS Cost Floor Analysis — Can We Reach <₹1K/mo? (historical)
+
 > **Status:** DESIGN DOC (no code shipped). Honest envelope analysis per operator-charter §F.
 > **Created:** 2026-05-18 in response to operator LOCK-2 ("<₹1K/mo, accept compromises TBD").
 > **Companion:** `docs/architecture/aws-daily-lifecycle.md`, `.claude/rules/project/aws-budget.md`.
