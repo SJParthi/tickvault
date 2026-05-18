@@ -1194,7 +1194,7 @@ Z+ LOW fixes (4):
 - [x] **Item 14** — REST `/marketfeed/quote.day_open` fallback at 09:14:55 IST — merged at `commit 6e9b4ce` (PR-14 ratchets bumped test-count baseline 9396→9423 in `6a1d35a`).
 - [ ] **Item 15** — 09:16:05 IST cross-check vs Dhan `/charts/intraday` 09:15 bar
 - [ ] **Item 16** — `open_price_audit` + 3 Telegram variants + 8 ratchets
-- [ ] **Item 17** — SEBI 24h JWT daily renewal observability + `auth_renewal_audit`
+- [x] **Item 17** — SEBI 24h JWT daily renewal observability + `auth_renewal_audit`
 - [ ] **Item 18** — Static IP boot check (`ordersAllowed=true`)
 - [ ] **Item 19** — Dual-instance lock (RESILIENCE-01) via `live_instance_lock` table
 - [ ] **Item 20** — Orphan position 15:25 IST watchdog

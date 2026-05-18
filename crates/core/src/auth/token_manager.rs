@@ -879,6 +879,17 @@ impl TokenManager {
                             "",
                         )
                         .await;
+                        // Phase 0 Item 17 — positive-ping Telegram + Prom
+                        // counter so the operator sees the daily SEBI
+                        // 24h JWT renewal succeed instead of inferring
+                        // it from the absence of TokenRenewalFailed.
+                        metrics::counter!(
+                            "tv_token_renewals_total",
+                            "result" => "success",
+                            "trigger" => "scheduled",
+                        )
+                        .increment(1);
+                        self.notifier.notify(NotificationEvent::TokenRenewed);
                         succeeded = true;
                         break;
                     }
@@ -933,6 +944,15 @@ impl TokenManager {
                     ),
                 )
                 .await;
+                // Phase 0 Item 17 — failed-cycle counter pairs with the
+                // success counter above so `result=failed / result=success`
+                // ratio is dashboard-visible.
+                metrics::counter!(
+                    "tv_token_renewals_total",
+                    "result" => "failed",
+                    "trigger" => "scheduled",
+                )
+                .increment(1);
 
                 if consecutive_circuit_breaker_cycles
                     >= tickvault_common::constants::TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES
@@ -957,6 +977,12 @@ impl TokenManager {
                         "HALTED: token renewal permanently failed — manual restart required",
                     )
                     .await;
+                    metrics::counter!(
+                        "tv_token_renewals_total",
+                        "result" => "circuit_breaker_halt",
+                        "trigger" => "scheduled",
+                    )
+                    .increment(1);
                     return;
                 }
 
@@ -3318,6 +3344,42 @@ mod tests {
              AuthRenewalAuditOutcome::Failed references (1 scheduled \
              + 1 force_if_stale_ws_wake + 1 force_explicit); found {}",
             failed_count
+        );
+    }
+
+    /// Phase 0 Item 17 — `tv_token_renewals_total` counter must be
+    /// emitted at all three scheduled-renewal outcomes (success /
+    /// failed / circuit_breaker_halt). Removing any one site silently
+    /// breaks the Grafana renewal-ratio panel.
+    #[test]
+    fn test_renewal_loop_emits_token_renewals_total_counter() {
+        let source = include_str!("token_manager.rs");
+        assert!(
+            source.contains("\"tv_token_renewals_total\""),
+            "token_manager.rs MUST emit tv_token_renewals_total counter \
+             from the scheduled renewal_loop. See Phase 0 Item 17."
+        );
+        for result_label in ["\"success\"", "\"failed\"", "\"circuit_breaker_halt\""] {
+            assert!(
+                source.contains(result_label),
+                "tv_token_renewals_total must carry result label {} \
+                 (scheduled renewal_loop). See Phase 0 Item 17.",
+                result_label
+            );
+        }
+    }
+
+    /// Phase 0 Item 17 — successful scheduled renewal must emit a
+    /// `TokenRenewed` Telegram so the operator sees a daily positive
+    /// ping instead of inferring success from the absence of
+    /// `TokenRenewalFailed`.
+    #[test]
+    fn test_renewal_loop_emits_token_renewed_telegram() {
+        let source = include_str!("token_manager.rs");
+        assert!(
+            source.contains("NotificationEvent::TokenRenewed"),
+            "token_manager.rs renewal_loop success path MUST notify \
+             NotificationEvent::TokenRenewed. See Phase 0 Item 17."
         );
     }
 }
