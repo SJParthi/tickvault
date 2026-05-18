@@ -558,6 +558,32 @@ pub enum ErrorCode {
     /// CROSS-VERIFY-04: 08:05 IST morning cross-check could not reach
     /// Dhan REST. Severity::High. Transient.
     CrossVerify04Morning1dHistUnreachable,
+
+    // -----------------------------------------------------------------------
+    // PR #2.5 (AWS-lifecycle 14-PR sequence): Day OHLC tracker for IDX_I
+    // indices. Stays with Ticker mode subscription (Dhan ignores Quote/Full
+    // for IDX_I per documented restriction). Uses pre-market finalised close
+    // as the 09:15:00 IST open price; tracks day high/low/close from LTP
+    // stream. Volume intentionally NOT tracked (Dhan historical has none
+    // for indices; BRUTEX doesn't use it).
+    //
+    // See:
+    // - crates/trading/src/in_mem/day_ohlc_tracker.rs
+    // - .claude/rules/project/index-day-ohlc-tracker-error-codes.md
+    // -----------------------------------------------------------------------
+    /// INDEX-OHLC-01: at 09:15:00 IST boundary, the pre-market buffer
+    /// (`PREOPEN_INDEX_UNDERLYINGS`) has no captured close for an SID.
+    /// Aggregator falls back to using the first post-open tick's last_price
+    /// (NOT the official NSE equilibrium) — degraded but not data-loss.
+    /// Operator paged via Telegram. Severity::Critical because the day's
+    /// open price will fail 15:31 IST cross-verify against Dhan REST.
+    IndexOhlc01PreopenEmptyAt0915,
+    /// INDEX-OHLC-02: daily reset at IST midnight failed for one or more
+    /// SIDs (e.g., parking_lot mutex panic, tracker handle dropped).
+    /// Day high/low/close carry over to next trading day — incorrect.
+    /// Severity::High. Operator inspects + manually resets via REST or
+    /// restart.
+    IndexOhlc02DailyResetFailed,
 }
 
 impl ErrorCode {
@@ -713,6 +739,9 @@ impl ErrorCode {
             Self::CrossVerify021531HistUnreachable => "CROSS-VERIFY-02",
             Self::CrossVerify03Morning1dMismatch => "CROSS-VERIFY-03",
             Self::CrossVerify04Morning1dHistUnreachable => "CROSS-VERIFY-04",
+            // PR #2.5 — Day OHLC tracker for IDX_I
+            Self::IndexOhlc01PreopenEmptyAt0915 => "INDEX-OHLC-01",
+            Self::IndexOhlc02DailyResetFailed => "INDEX-OHLC-02",
         }
     }
 
@@ -752,7 +781,9 @@ impl ErrorCode {
             | Self::OptionChain05CacheStaleHaltStrategy
             | Self::OptionChain08TokenExpiredMidCycle
             | Self::CrossVerify011531Mismatch
-            | Self::CrossVerify03Morning1dMismatch => Severity::Critical,
+            | Self::CrossVerify03Morning1dMismatch
+            // PR #2.5 — INDEX-OHLC-01 is Critical (open price wrong = cross-verify fails)
+            | Self::IndexOhlc01PreopenEmptyAt0915 => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
             Self::Selftest01Passed
             | Self::Slo01Healthy
@@ -788,7 +819,9 @@ impl ErrorCode {
             | Self::OptionChain02Dh904Exhausted
             | Self::OptionChain06CycleOverlapSkip
             | Self::CrossVerify021531HistUnreachable
-            | Self::CrossVerify04Morning1dHistUnreachable => Severity::High,
+            | Self::CrossVerify04Morning1dHistUnreachable
+            // PR #2.5 — INDEX-OHLC-02 is High (carry-over wrong but recoverable)
+            | Self::IndexOhlc02DailyResetFailed => Severity::High,
             // Medium: data pipeline correctness
             Self::InstrumentP0DuplicateSecurityId
             | Self::InstrumentP0CountConsistency
@@ -994,6 +1027,10 @@ impl ErrorCode {
             | Self::CrossVerify04Morning1dHistUnreachable => {
                 ".claude/rules/project/option-chain-cross-verify-error-codes.md"
             }
+            // PR #2.5 — Day OHLC tracker for IDX_I
+            Self::IndexOhlc01PreopenEmptyAt0915 | Self::IndexOhlc02DailyResetFailed => {
+                ".claude/rules/project/index-day-ohlc-tracker-error-codes.md"
+            }
         }
     }
 
@@ -1142,6 +1179,9 @@ impl ErrorCode {
             Self::CrossVerify021531HistUnreachable,
             Self::CrossVerify03Morning1dMismatch,
             Self::CrossVerify04Morning1dHistUnreachable,
+            // PR #2.5 — Day OHLC tracker for IDX_I (Ticker mode + pre-market open)
+            Self::IndexOhlc01PreopenEmptyAt0915,
+            Self::IndexOhlc02DailyResetFailed,
         ]
     }
 }
@@ -1348,7 +1388,9 @@ mod tests {
         // bumped 105 -> 108 for BAR-MISMATCH-01/02/03.
         // 2026-05-18 (PR #1 of AWS-lifecycle 14-PR sequence — contract stubs):
         // bumped 108 -> 120 for OPTION-CHAIN-01..08 + CROSS-VERIFY-01..04.
-        assert_eq!(ErrorCode::all().len(), 120);
+        // 2026-05-18 (PR #2.5 of AWS-lifecycle — Day OHLC tracker for IDX_I):
+        // bumped 120 -> 122 for INDEX-OHLC-01 + INDEX-OHLC-02.
+        assert_eq!(ErrorCode::all().len(), 122);
     }
 
     #[test]
@@ -1404,7 +1446,9 @@ mod tests {
                 || s.starts_with("BAR-MISMATCH-")
                 // PR #1 (AWS-lifecycle 14-PR sequence): option_chain + cross_verify stubs
                 || s.starts_with("OPTION-CHAIN-")
-                || s.starts_with("CROSS-VERIFY-");
+                || s.starts_with("CROSS-VERIFY-")
+                // PR #2.5 (AWS-lifecycle): Day OHLC tracker for IDX_I
+                || s.starts_with("INDEX-OHLC-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
