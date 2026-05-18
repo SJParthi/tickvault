@@ -300,7 +300,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_returns_err_when_questdb_unreachable() {
+    async fn test_append_orphan_position_audit_row_returns_err_when_questdb_unreachable() {
         // Port 1 is reserved — guaranteed connection refusal.
         let cfg = test_cfg(1);
         let result = append_orphan_position_audit_row(
@@ -328,7 +328,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_no_orphans_green_path_row() {
+    async fn test_append_orphan_position_audit_row_no_orphans_green_path() {
         // The green-path daily marker carries security_id = 0 so the
         // Grafana panel can SELECT last(outcome) WHERE security_id = 0
         // to confirm the watchdog ran today.

@@ -211,13 +211,13 @@ mod tests {
     }
 
     #[test]
-    fn test_evaluate_empty_returns_no_orphans() {
+    fn test_evaluate_orphan_positions_empty_returns_no_orphans() {
         let verdict = evaluate_orphan_positions(&[]);
         assert_eq!(verdict, OrphanPositionVerdict::NoOrphans);
     }
 
     #[test]
-    fn test_evaluate_all_closed_returns_no_orphans() {
+    fn test_evaluate_orphan_positions_all_closed_returns_no_orphans() {
         let positions = vec![
             position("72271", "NSE_FNO", 0),
             position("72272", "NSE_FNO", 0),
@@ -227,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn test_evaluate_one_long_orphan_detected() {
+    fn test_evaluate_orphan_positions_one_long_detected() {
         let positions = vec![position("72271", "NSE_FNO", 50)];
         match evaluate_orphan_positions(&positions) {
             OrphanPositionVerdict::OrphansDetected {
@@ -309,7 +309,7 @@ mod tests {
     // --- clock helpers ---
 
     #[test]
-    fn test_seconds_until_watchdog_at_midnight() {
+    fn test_seconds_until_orphan_watchdog_ist_at_midnight() {
         // 00:00:00 IST → 15:25:00 IST = 15*3600 + 25*60 = 55_500.
         assert_eq!(seconds_until_orphan_watchdog_ist(0), 55_500);
     }
@@ -343,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ist_seconds_of_day_at_utc_midnight() {
+    fn test_ist_seconds_of_day_from_utc_at_utc_midnight() {
         // UTC 00:00 → IST 05:30 = 5*3600 + 30*60 = 19_800.
         assert_eq!(ist_seconds_of_day_from_utc(0), 19_800);
     }
@@ -356,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sleep_duration_at_known_clock() {
+    fn test_sleep_duration_until_orphan_watchdog_at_known_clock() {
         // UTC 04:25 → IST 09:55. Next IST 15:25 = 5h30m = 19_800s.
         let utc = 4 * 3600 + 25 * 60;
         let dur = sleep_duration_until_orphan_watchdog(utc);
