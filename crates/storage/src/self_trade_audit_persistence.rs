@@ -40,7 +40,11 @@ pub const QUESTDB_TABLE_SELF_TRADE_AUDIT: &str = "self_trade_audit";
 // chain is keyed by the order that started the window. Multiple
 // Blocked rows can share the same trigger; the `outcome` column
 // discriminates Started -> Blocked -> Completed.
-pub const DEDUP_KEY_SELF_TRADE_AUDIT: &str = "trading_date_ist, security_id, exchange_segment, trigger_order_id, outcome, blocked_correlation_id";
+// `ts` MUST appear in DEDUP UPSERT KEYS — QuestDB requires the
+// designated timestamp column. Without it the boot-time DDL returns
+// HTTP 400; same bug class as the 2026-05-18 gap_fill_audit +
+// last_tick_audit failures.
+pub const DEDUP_KEY_SELF_TRADE_AUDIT: &str = "ts, trading_date_ist, security_id, exchange_segment, trigger_order_id, outcome, blocked_correlation_id";
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
