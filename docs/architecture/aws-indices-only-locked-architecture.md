@@ -51,12 +51,12 @@
 | L3 | Drop ALL local observability tools except QuestDB | Out: Grafana, Prometheus, Alertmanager, Valkey, Loki, Alloy, Traefik. In: CloudWatch Logs + Metrics + Alarms |
 | L4 | Notification = logging + SMS + call + Telegram | "the 4-channel deadman" via CloudWatch Alarm → SNS fan-out. ("call" interpreted as a fallback if SMS/Telegram fail — see §6) |
 | L5 | RAM-first hot path | All timeframes, indicator state, option-chain snapshots in RAM. Periodic async flush to QuestDB. Trading decisions NEVER touch DB. DB is for replay + historical only. |
-| L6 | Timeframes initially | live ticks + 1m, 3m, 5m, 15m, 1h, 1d (6 TFs). Expandable to 1m/2m/.../15m/30m/1h/2h/3h/4h/1d (~13 TFs) post-backtest. |
+| L6 | Timeframes initially | **TICKS (raw, persisted) + 1m, 3m, 5m, 15m, 1h, 1d** = 1 raw + 6 derived TFs. Expandable to 1m/2m/.../15m/30m/1h/2h/3h/4h/1d post-backtest. Ticks land in `ticks` table via ring-buffered ILP flush; sealed candles land in `candles_<tf>` tables. |
 | L7 | Option chain REST every 50s | 3 underlyings (NIFTY/BANKNIFTY/SENSEX) nearest-expiry only. Concurrent calls OK per Dhan rule (1 unique req per 3s). RAM cache + DB flush. |
 | L8 | WebSockets | 1 main-feed (4 SIDs) + 1 order-update. Operator-charter §I unchanged. |
 | L9 | AWS instance budget | <₹1K/mo HARD priority. Mumbai network MUST not be compromised. |
 | L10 | RAM honesty | Be explicit about what fits where. No hand-waving. |
-| L11 | Schedule | 08:00 / 17:00 IST (locked earlier this session) |
+| L11 | Schedule (UPDATED 2026-05-18) | **08:00 / 17:00 IST EVERY DAY (Mon-Sun, ~30 days/mo)** — operator clarified "every day starting every entire month 8 am to 5 pm". Includes weekends for backtest / BRUTEX / strategy tuning work. Replaces earlier weekday-only lock. |
 | L12 | Common runtime / dynamic / scalable / automated | All operator-charter §A demands carried forward |
 
 ---
@@ -228,10 +228,10 @@ Tickvault writes JSON-structured logs to disk → CloudWatch Logs agent ships to
 | t4g.medium (4GB) | 4 GB | ~₹1,380/mo | ~₹1,250/mo | YES with 2GB headroom | same |
 | c7g.medium (1 vCPU, 2GB, non-burstable) | 2 GB | ~₹1,143/mo | ~₹990/mo | YES with 0 headroom; 1 vCPU may be tight | same |
 
-### Cost breakdown — t4g.medium weekday-only 9hr/day (LOCKED 2026-05-18, Option A)
+### Cost breakdown — t4g.medium EVERY DAY 9hr (LOCKED 2026-05-18)
 
 ```
-EC2 t4g.medium:   $0.0224/hr × 9hr × 22 days × ₹85   = ₹377   ← CORRECTED via console
+EC2 t4g.medium:   $0.0224/hr × 9hr × 30 days × ₹85   = ₹514   ← every day, not just weekday
 EIP (24/7):       $0.005/hr × 24h × 30d × ₹85        = ₹306   ← dominant fixed cost
 EBS gp3 10GB:     $0.0912 × 10 × ₹85                 = ₹78
 S3 cold storage:  (tiny dataset, 4 SIDs)             = ₹15
@@ -242,12 +242,21 @@ SNS HTTPS Telegram: free                             = ₹0
 Lambda (sns→tg):  free tier (96 invokes/day)         = ₹0
 Data transfer:    ~10GB outbound                     = ₹85
 ──────────────────────────────────────────────────────────
-TOTAL:                                                ~₹885/mo  ✓ UNDER <₹1K with ₹115 headroom
-                                                                ✓ Z+ safe — 2GB RAM headroom
-                                                                ✓ Future-proof for BRUTEX (§13)
+TOTAL:                                                ~₹1,022/mo  ✘ ₹22 over <₹1K target
+                                                                  ✓ Z+ safe — 2GB RAM headroom
+                                                                  ✓ Future-proof for BRUTEX (§13)
+                                                                  ✓ Includes weekends for BRUTEX work
 ```
 
-**Honest envelope:** ₹885/mo is the operator-Z+-safe AND budget-meeting floor. Operator's pivot to t4g.medium AND <₹1K target are BOTH satisfied. The pricing correction (via operator's AWS console screenshot) showed my earlier research agent was wrong by 43% on Mumbai pricing.
+**Honest envelope:** ₹1,022/mo is ~₹22 over the <₹1K target with every-day schedule. **LOCKED 2026-05-18: Operator picked Option A** — accept ₹22 overage for weekend BRUTEX availability. The <₹1K was a target, not a hard wall; ₹22 is rounding noise on the principle of having the instance available 7 days/week.
+
+| Option | Action | Cost |
+|---|---|---|
+| **A (LOCKED)** Accept ₹22 over budget | Honest acceptance for weekend BRUTEX availability | **~₹1,022/mo** |
+| ~~B~~ Drop EBS 10GB→5GB | (not selected) | ~₹983/mo |
+| ~~C~~ Shorten hours 9hr→8hr (08:00–16:00) | (not selected) | ~₹965/mo |
+
+**Pricing correction note (kept for record):** the operator's AWS console screenshot revealed real Mumbai t4g.medium = $0.0224/hr (not $0.0392 quoted by my earlier research agent — 43% error). Without that correction we'd be looking at ~₹1,400/mo.
 
 ### Risks accepted (LOCKED t4g.medium)
 
@@ -526,6 +535,157 @@ If ANY of the 5 fails → halt boot, fire CloudWatch `boot-iam-failure` alarm vi
 
 ---
 
+## §14. Daily data-integrity cross-verify — "without this we never know if ticks were missed"
+
+> Operator demand 2026-05-18 verbatim: *"every day after precisely 3:31 pm our cross verification of live candle 1m, 5m, 15m, 1h vs historical data of 1m, 5m, 15m and 1h should be cross-verified... only then we will always get to know our live ticks captured the real precise timeframe OHLCV for that particular timestamp or not... without that we will never know what is the gap missing or any ticks missed or any mismatch."*
+
+This is the Z+ L3 RECONCILE layer for the WHOLE pipeline. Without it, missed ticks are invisible.
+
+### §14.1 The 15:31 IST same-day cross-verify (intraday)
+
+```
+   15:30:00 IST — NSE closes
+       │
+       ▼ wait 60 seconds (let Dhan publish final 15:29-15:30 bar)
+   15:31:00 IST — scheduler fires
+       │
+       ▼ for each (instrument, timeframe) in cross product:
+       │     instruments: [NIFTY, BANKNIFTY, SENSEX, INDIA VIX]
+       │     timeframes:  [1m, 5m, 15m, 1h]
+       │     → 4 × 4 = 16 verifications
+       │
+       ▼ For each pair:
+       │   1. Fetch live: SELECT * FROM candles_<tf> WHERE security_id = X AND ts BETWEEN today_0915_ist AND today_1530_ist
+       │   2. Fetch historical: POST /v2/charts/intraday {securityId, IDX_I, "1"/"5"/"15"/"60", today, tomorrow}
+       │   3. Compare candle-by-candle: OHLCV must match EXACTLY (zero tolerance per historical-candles-cross-verify.md)
+       │
+       ▼ Verdict:
+       │   ✅ All match → emit Severity::Info Telegram
+       │      "Cross-match OK | TFs: 4 | Candles: <N> | All OHLCV exact"
+       │   ✘ Mismatches → emit Severity::Critical Telegram
+       │      "Cross-match FAILED | Compared: <N> | Mismatches: <M>"
+       │      "RELIANCE NSE_EQ 1m 2026-05-18 10:15 — open: hist=24710.50 live=24710.00"
+       │      "+ N more mismatches"
+       │
+       ▼ Audit:
+       │   INSERT into candle_cross_verify_audit table
+       │   (date, instrument, timeframe, candles_compared, mismatches, ts_run)
+       │
+       ▼ S3 archive after 14d via partition manager lifecycle
+```
+
+### §14.2 The morning 1d cross-check (overnight rollover integrity)
+
+```
+   ~07:55 IST every trading day (before 08:00 IST EventBridge start)
+       │ wait — 08:00 IST is when instance boots. So this runs at ~08:30 IST
+       │ AFTER boot is done. New scheduler step:
+       ▼
+   08:05 IST (configurable) — fire morning_1d_cross_check
+       │
+       ▼ for each instrument in [NIFTY, BANKNIFTY, SENSEX, INDIA VIX]:
+       │   1. Read our derived 1d candle: SELECT * FROM candles_1d WHERE security_id = X AND ts = yesterday_ist
+       │   2. Fetch authoritative: POST /v2/charts/historical {securityId, IDX_I, fromDate=yesterday, toDate=today}
+       │      → response has columnar OHLCV arrays for yesterday's daily bar
+       │   3. Compare OHLCV exactly (zero tolerance)
+       │
+       ▼ Verdict:
+       │   ✅ All 4 match → Severity::Info Telegram "Morning 1d cross-check OK"
+       │   ✘ Mismatch → Severity::Critical Telegram + strategy halt for the day until operator OKs
+       │
+       ▼ Audit:
+           INSERT into morning_1d_cross_check_audit table
+```
+
+### §14.3 What this catches (the bugs that would otherwise be invisible)
+
+| Bug class | How cross-verify catches it |
+|---|---|
+| Single missed tick during a 1m window | 1m OHLCV will differ; H/L/V most likely |
+| WebSocket silently dropped a packet | Same — H/L/V diverge |
+| Aggregator boundary off by 1ms | First/last candle of session will mismatch |
+| Clock skew on host (BOOT-03) | All candles offset by the skew amount |
+| Dhan-side bar published late | Historical may match our LATER bar's ts — flagged as off-by-one |
+| Parser regression (byte-offset bug) | OHLCV values garbled — flagged as severe mismatch |
+| Strike/expiry routed to wrong instrument | Cross-check finds the candle for security_id X has wrong data |
+| Yesterday's 1d derivation used stale ticks | Morning 1d check catches it before market open |
+| QuestDB write reordered ticks | Same — affects candle aggregation |
+
+**Without these cross-checks, ALL of these bugs silently corrupt the data we trade on.**
+
+### §14.4 The 4 new ErrorCode variants
+
+| Code | Severity | Auto-triage? |
+|---|---|---|
+| `CROSS-VERIFY-01-1531-MISMATCH` | Critical | No (data integrity — operator review) |
+| `CROSS-VERIFY-02-1531-HIST-UNREACHABLE` | High | Yes (transient; retry next day) |
+| `CROSS-VERIFY-03-MORNING-1D-MISMATCH` | Critical | No (block trading until operator OKs) |
+| `CROSS-VERIFY-04-MORNING-1D-HIST-UNREACHABLE` | High | Yes (transient; allow trading with warning) |
+
+### §14.5 The 3 new audit tables (DEDUP UPSERT KEYS)
+
+| Table | Columns | DEDUP key |
+|---|---|---|
+| `candle_cross_verify_audit` | trading_date_ist, instrument_id, exchange_segment, timeframe, candles_compared, mismatches_count, outcome (Passed/Failed/HistUnreachable), ts_run | `(trading_date_ist, instrument_id, exchange_segment, timeframe)` |
+| `candle_cross_verify_mismatches` | trading_date_ist, instrument_id, timeframe, candle_ts, field (open/high/low/close/volume), live_value, hist_value | `(trading_date_ist, instrument_id, timeframe, candle_ts, field)` |
+| `morning_1d_cross_check_audit` | trading_date_ist, instrument_id, exchange_segment, outcome, ts_run, hist_open, hist_high, hist_low, hist_close, hist_volume, live_open, live_high, live_low, live_close, live_volume | `(trading_date_ist, instrument_id, exchange_segment)` |
+
+### §14.6 The 4 new CloudWatch alarms
+
+| Alarm | Trigger | Severity | Routing |
+|---|---|---|---|
+| `tv-cross-verify-1531-not-fired` | Counter `tv_cross_verify_1531_runs_total` did NOT increment between 15:31:00 and 15:35:00 IST | Critical | SNS 3-leg |
+| `tv-cross-verify-1531-mismatch` | `tv_cross_verify_mismatches_total > 0` for any tf+instrument | Critical | SNS 3-leg |
+| `tv-cross-verify-morning-not-fired` | Counter `tv_cross_verify_morning_runs_total` did NOT increment between 08:05:00 and 08:15:00 IST | Critical | SNS 3-leg |
+| `tv-cross-verify-morning-mismatch` | `tv_cross_verify_morning_mismatches_total > 0` | Critical + auto-halt strategy | SNS + kill switch |
+
+### §14.7 Where existing code already covers this (KEEP, narrow scope to 4 SIDs)
+
+| Existing file | What it does today | Action for indices-only scope |
+|---|---|---|
+| `crates/core/src/historical/cross_verify.rs` | Already runs zero-tolerance cross-match between live `candles_*` and historical fetch | **KEEP** — narrow scope to 4 SIDs only |
+| `crates/core/src/historical/candle_fetcher.rs` | Fetches 90-day history + intraday | **KEEP + MODIFY** — only fetch for 4 SIDs; drop the 218 stock fetch loop |
+| `crates/core/src/notification/events.rs::CandleCrossMatchPassed` / `Failed` | Existing Telegram variants | **KEEP** |
+| `historical-candles-cross-verify.md` rule file | Already documents zero-tolerance + ZERO `CROSS_MATCH_PRICE_EPSILON` | **KEEP + ADD morning 1d section** |
+
+**This means cross-verify is ~80% already built.** What's missing:
+1. The 15:31 IST scheduler hookup (today it runs post-market historical fetch, but not pinned to 15:31)
+2. The morning 1d cross-check scheduler (NEW)
+3. The 3 new audit tables (NEW)
+4. The 4 new CloudWatch alarms (NEW)
+5. Scope narrowing from ~11K instruments down to 4 SIDs
+
+Plan effort: 1 medium PR (~300 LoC + 4 ratchet tests + 4 alarm Terraform stanzas).
+
+### §14.8 Strategy fail-closed integration
+
+The morning 1d cross-check is a GATE on the trading day:
+
+```
+   08:05 IST: morning cross-check fires
+       │
+       ├─ All 4 match → strategy_armed = true → market open at 09:15 → trading allowed
+       │
+       └─ Mismatch → strategy_armed = false → Critical Telegram
+              "Morning 1d cross-check FAILED for NIFTY: hist=24710.50 live=24710.00"
+              "Trading HALTED for today. Operator must investigate + manual /strategy-arm to resume."
+              │
+              └─ Operator reviews:
+                   - SSM session into instance
+                   - Read candle_cross_verify_mismatches table
+                   - If our derivation was wrong: manual recompute or accept Dhan's value
+                   - Run `aws sns publish --topic tv-prod-ack --message strategy-arm`
+                   - Strategy resumes
+```
+
+This is the Z+ L4 PREVENT layer — refuses to start trading on suspect data.
+
+### §14.9 Honest envelope claim
+
+> "Inside the tested envelope: every trading day at 15:31 IST, 16 cross-verify pairs run (4 SIDs × 4 TFs); zero tolerance OHLCV match required. Every morning at 08:05 IST, 4 daily cross-checks run before strategy arms. Failure → Critical Telegram via 3 SNS legs within 60s + audit row + strategy halt. Beyond envelope (Dhan historical API extended outage, ~24h+): operator manual decision whether to trade without same-day verification."
+
+---
+
 ## §13. Future BRUTEX strategy load — DOES t4g.medium STILL FIT?
 
 > Operator demand 2026-05-18: *"even in the future after finalising the strategies and indicators from BRUTEX then we need to run those strategies or indicators also right dude so consider this also."*
@@ -567,10 +727,26 @@ Strategy evaluation (per-minute boundary):
 = 0.004% of 1 vCPU
 ```
 
-OMS order placement (when live trading active):
+OMS order placement (when live trading active) — HONEST LATENCY BUDGET:
+
+| Stage | Latency (typical) | Latency (p99) | We control? |
+|---|---|---|---|
+| Tick → decision → order constructed → bytes on TCP socket | **<1 ms** | <2 ms | **YES (locked target)** |
+| TCP packet → Dhan API ingress (AWS Mumbai → AWS Mumbai) | 0.5–2 ms | 5 ms | network (mostly us) |
+| Dhan API validation + OMS routing + exchange forwarding | 5–20 ms | 50–100 ms | **NO (Dhan-side)** |
+| Exchange ACK back to us | included above | included | NO |
+| **Total wire-to-ACK** | **5–30 ms** | **50–100 ms** | mixed |
+
+**The <1ms lock applies to OUR hot path** (the part we engineer). Dhan-side round-trip is bounded by Dhan's server, NOT something AWS Mumbai or t4g.medium can accelerate further. The AWS Mumbai choice already minimizes the network leg (Dhan's api.dhan.co is also AWS ap-south-1 — same region, ~0.5–2ms RTT).
+
+Adversarial sanity check:
 ```
-Worst case 100 orders/day × 100 ms each = 10 seconds/day = 0.0001% sustained
+Worst case 100 orders/day × 30 ms each = 3 seconds/day = 0.003% sustained CPU
+Even with 500 orders/day × 50 ms each = 25 sec/day = 0.03% — still trivial
 ```
+
+**Slippage envelope (honest, per operator-charter §F):**
+> "<1 ms decision-to-wire on our side; 5–30 ms wire-to-Dhan-ACK typical (50–100 ms p99). AWS Mumbai chosen specifically to minimize network leg. Beyond envelope (Dhan-side outage or congestion): order may queue server-side; we detect via Order Update WebSocket timeout and re-place if no ACK within 5 s."
 
 **Combined future CPU usage: <1% of 1 vCPU on t4g.medium (2 vCPU available).**
 
