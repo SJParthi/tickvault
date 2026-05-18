@@ -1085,6 +1085,44 @@ pub enum NotificationEvent {
     /// ran (the absence of `OrphanPositionDetected` is ambiguous).
     OrphanPositionsClean,
 
+    /// Phase 0 Items 15+28+29 — 09:16:05 IST post-open cross-check
+    /// found mismatched 09:15 bar(s) vs Dhan REST `/v2/charts/intraday`
+    /// and corrected them. Authoritative Dhan values written to
+    /// `candles_1m_shadow` + `historical_candles` (mirror) +
+    /// `bar_correction_audit`. Strategy gate has flipped to OPEN.
+    /// Severity::Critical so operator sees the corrections before
+    /// trading. Coalesced — ONE event per 09:16:05 run regardless of
+    /// how many SIDs were corrected.
+    BarMismatchCorrectedFromHistorical {
+        /// Total bars compared this pass (out of 222 universe).
+        compared_count: usize,
+        /// Bars that disagreed and were corrected.
+        mismatches_count: usize,
+        /// Up to 10 sample mismatches for the Telegram body
+        /// (`field_label`, `local_value`, `dhan_value`, `trading_symbol`).
+        /// Full list lives in `bar_correction_audit` for operator query.
+        sample_symbols: Vec<String>,
+        /// Cross-check pass label — `post_open_09_16_05` or
+        /// `boot_catch_up` for mid-day startup catch-up runs.
+        cross_check_pass: &'static str,
+    },
+
+    /// Phase 0 Items 15+28+29 — 09:16:05 IST cross-check INCONCLUSIVE.
+    /// Dhan REST returned valid data for fewer than 200/222 SIDs.
+    /// Strategy gate stays CLOSED for the trading day. Severity::Critical.
+    BarMismatchCrossCheckInconclusive {
+        compared_count: usize,
+        expected_count: usize,
+    },
+
+    /// Phase 0 Items 15+28+29 — 09:16:05 IST cross-check HARD-FAILED.
+    /// All 222 Dhan REST fetches errored. Strategy gate stays CLOSED.
+    /// Severity::Critical. Operator must diagnose Dhan REST health.
+    BarMismatchCrossCheckFailed {
+        /// Typed failure reason from `CrossCheckOutcome::Failed`.
+        reason: String,
+    },
+
     /// Boot deadline missed — system did not complete startup within allowed time.
     BootDeadlineMissed {
         /// Deadline in seconds that was exceeded.
@@ -2573,6 +2611,47 @@ impl NotificationEvent {
             Self::OrphanPositionsClean => {
                 "<b>Orphan-position watchdog</b>\n15:25 IST: account is flat. \u{2705}".to_string()
             }
+            Self::BarMismatchCorrectedFromHistorical {
+                compared_count,
+                mismatches_count,
+                sample_symbols,
+                cross_check_pass,
+            } => {
+                let sample = if sample_symbols.is_empty() {
+                    "(no samples captured)".to_string()
+                } else {
+                    sample_symbols.join(", ")
+                };
+                format!(
+                    "<b>09:15 BAR CORRECTED FROM DHAN HISTORICAL</b>\n\
+                     Pass: {cross_check_pass}\n\
+                     Compared: {compared_count} / Mismatched: {mismatches_count}\n\
+                     Sample: {sample}\n\n\
+                     Authoritative Dhan values written to candles_1m_shadow + \
+                     historical_candles. Strategy gate is OPEN. Full forensic \
+                     chain in bar_correction_audit."
+                )
+            }
+            Self::BarMismatchCrossCheckInconclusive {
+                compared_count,
+                expected_count,
+            } => {
+                format!(
+                    "<b>09:16:05 CROSS-CHECK INCONCLUSIVE — TRADING BLOCKED</b>\n\
+                     Compared: {compared_count} / Expected: {expected_count}\n\
+                     Coverage below 200/222 threshold. Dhan REST appears \
+                     degraded. Strategy gate stays CLOSED for the day. \
+                     Inspect Dhan REST health + manually authorize if safe."
+                )
+            }
+            Self::BarMismatchCrossCheckFailed { reason } => {
+                format!(
+                    "<b>09:16:05 CROSS-CHECK HARD-FAILED — TRADING BLOCKED</b>\n\
+                     Reason: {reason}\n\
+                     All Dhan REST fetches errored. Strategy gate CLOSED. \
+                     Inspect token expiry + DH-904 backoff + network."
+                )
+            }
             Self::BootDeadlineMissed {
                 deadline_secs,
                 step,
@@ -3043,6 +3122,9 @@ impl NotificationEvent {
             Self::BootHealthCheck { .. } => "BootHealthCheck",
             Self::OrphanPositionDetected { .. } => "OrphanPositionDetected",
             Self::OrphanPositionsClean => "OrphanPositionsClean",
+            Self::BarMismatchCorrectedFromHistorical { .. } => "BarMismatchCorrectedFromHistorical",
+            Self::BarMismatchCrossCheckInconclusive { .. } => "BarMismatchCrossCheckInconclusive",
+            Self::BarMismatchCrossCheckFailed { .. } => "BarMismatchCrossCheckFailed",
             Self::BootDeadlineMissed { .. } => "BootDeadlineMissed",
             Self::BootClockSkewExceeded { .. } => "BootClockSkewExceeded",
             Self::OrderRejected { .. } => "OrderRejected",
@@ -3223,6 +3305,9 @@ impl NotificationEvent {
             Self::BootHealthCheck { .. } => Severity::Low,
             Self::OrphanPositionDetected { .. } => Severity::Critical,
             Self::OrphanPositionsClean => Severity::Info,
+            Self::BarMismatchCorrectedFromHistorical { .. } => Severity::Critical,
+            Self::BarMismatchCrossCheckInconclusive { .. } => Severity::Critical,
+            Self::BarMismatchCrossCheckFailed { .. } => Severity::Critical,
             Self::StartupComplete { .. } => Severity::Info,
             Self::ShutdownComplete => Severity::Info,
             Self::Depth20DynamicTopSetEmpty { .. } => Severity::High,
@@ -5934,6 +6019,81 @@ mod tests {
         let msg = event.to_message();
         assert!(msg.contains("15:25 IST"));
         assert!(msg.contains("flat"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 0 Items 15+28+29 — BarMismatch* (2026-05-18)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bar_mismatch_corrected_topic_and_severity() {
+        let event = NotificationEvent::BarMismatchCorrectedFromHistorical {
+            compared_count: 222,
+            mismatches_count: 5,
+            sample_symbols: vec!["SENSEX".to_string()],
+            cross_check_pass: "post_open_09_16_05",
+        };
+        assert_eq!(event.topic(), "BarMismatchCorrectedFromHistorical");
+        assert_eq!(event.severity(), Severity::Critical);
+    }
+
+    #[test]
+    fn test_bar_mismatch_corrected_message_includes_counts_and_sample() {
+        let event = NotificationEvent::BarMismatchCorrectedFromHistorical {
+            compared_count: 222,
+            mismatches_count: 5,
+            sample_symbols: vec!["SENSEX".to_string(), "NIFTY".to_string()],
+            cross_check_pass: "post_open_09_16_05",
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("222"));
+        assert!(msg.contains("5"));
+        assert!(msg.contains("SENSEX"));
+        assert!(msg.contains("post_open_09_16_05"));
+        assert!(msg.contains("Strategy gate is OPEN"));
+    }
+
+    #[test]
+    fn test_bar_mismatch_inconclusive_topic_and_severity() {
+        let event = NotificationEvent::BarMismatchCrossCheckInconclusive {
+            compared_count: 150,
+            expected_count: 222,
+        };
+        assert_eq!(event.topic(), "BarMismatchCrossCheckInconclusive");
+        assert_eq!(event.severity(), Severity::Critical);
+    }
+
+    #[test]
+    fn test_bar_mismatch_inconclusive_message_says_trading_blocked() {
+        let event = NotificationEvent::BarMismatchCrossCheckInconclusive {
+            compared_count: 150,
+            expected_count: 222,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("INCONCLUSIVE"));
+        assert!(msg.contains("TRADING BLOCKED"));
+        assert!(msg.contains("150"));
+        assert!(msg.contains("222"));
+    }
+
+    #[test]
+    fn test_bar_mismatch_failed_topic_and_severity() {
+        let event = NotificationEvent::BarMismatchCrossCheckFailed {
+            reason: "all 222 Dhan REST fetches failed".to_string(),
+        };
+        assert_eq!(event.topic(), "BarMismatchCrossCheckFailed");
+        assert_eq!(event.severity(), Severity::Critical);
+    }
+
+    #[test]
+    fn test_bar_mismatch_failed_message_includes_reason() {
+        let event = NotificationEvent::BarMismatchCrossCheckFailed {
+            reason: "all 222 Dhan REST fetches failed".to_string(),
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("HARD-FAILED"));
+        assert!(msg.contains("all 222 Dhan REST fetches failed"));
+        assert!(msg.contains("TRADING BLOCKED"));
     }
 
     // -----------------------------------------------------------------------

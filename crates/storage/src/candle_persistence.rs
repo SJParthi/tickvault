@@ -1198,7 +1198,51 @@ pub async fn ensure_candle_table_dedup_keys(questdb_config: &QuestDbConfig) {
         }
     }
 
-    info!("historical candle tables setup complete (DDL + DEDUP UPSERT KEYS)");
+    // Phase 0 Item 29 — `candles_source` SYMBOL column ALTER on
+    // `historical_candles` via `ALTER ADD COLUMN IF NOT EXISTS` per the
+    // PR #690 schema self-heal pattern. Values: `dhan_rest` (default for
+    // legacy + gap-fill writes per `live-feed-purity.md` rule 4),
+    // `cross_check_correction` (Item 28 bar-correction mirror writes).
+    //
+    // Column is OUTSIDE the DEDUP key (Items 15+28+29 hot-path-reviewer
+    // C1) so corrections REPLACE the wrong row instead of APPENDING a
+    // sibling row — DEDUP tuple unchanged.
+    let alter_historical = format!(
+        "ALTER TABLE {QUESTDB_TABLE_HISTORICAL_CANDLES} \
+         ADD COLUMN IF NOT EXISTS candles_source SYMBOL"
+    );
+    match client
+        .get(&base_url)
+        .query(&[("query", alter_historical.as_str())])
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            info!(
+                table = QUESTDB_TABLE_HISTORICAL_CANDLES,
+                "candles_source SYMBOL column ensured"
+            );
+        }
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            warn!(
+                %status,
+                body = body.chars().take(200).collect::<String>(),
+                "historical_candles candles_source ALTER non-success"
+            );
+        }
+        Err(err) => {
+            warn!(
+                ?err,
+                "historical_candles candles_source ALTER request failed"
+            );
+        }
+    }
+
+    info!(
+        "historical candle tables setup complete (DDL + DEDUP UPSERT KEYS + candles_source ALTER)"
+    );
 }
 
 // ---------------------------------------------------------------------------
