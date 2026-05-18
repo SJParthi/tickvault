@@ -1,0 +1,385 @@
+# THE FINAL LOCKED PLAN — Tickvault Indices-Only Production Deployment
+
+> **Status:** LOCKED 2026-05-18. Single source of truth for the next phase of work.
+> **Authority:** CLAUDE.md > operator-charter-forever.md > this file > all other docs.
+> **Companion docs:** all 9 prior session design docs roll up into this plan.
+> **Scope:** Production deployment of locked indices-only architecture. NOT yet covering: strategy design, BRUTEX, risk engine wiring (deferred per operator "only this is needed as of now").
+
+---
+
+## §0. Auto-driver one-liner
+
+> "Sir, this is the ONE plan. We have everything designed: 4 indices in head/RAM, 21 charts updating every tick, 50-second option chain refresh, 30 days history, 4-alarm phone (SMS + Telegram + Email + Call), automatic 8 AM to 5 PM daily startup. Now we BUILD it. 14 numbered PRs in order. Each PR ships, then next starts. Total ~6 weeks. You watch Telegram, that's all."
+
+---
+
+## §1. The LOCKED scope (frozen 2026-05-18)
+
+| Element | Locked value |
+|---|---|
+| Universe (live feed) | NIFTY=13, BANKNIFTY=25, SENSEX=51, INDIA VIX=21 — **4 IDX_I SIDs only** |
+| Option chain (REST every 50s) | NIFTY + BANKNIFTY + SENSEX nearest expiry only — **3 underlyings** (VIX has no options) |
+| Timeframes | **21 dynamic IST wall-clock TFs** (1m..15m + 30m + 1h/2h/3h/4h + 1d) |
+| Historical window in RAM | **30 trading days rolling** |
+| RAM-first hot path | All TFs + indicators + option chain in RAM. DB = replay/audit ONLY. Trading decisions NEVER hit DB. |
+| Materialized views | **ZERO** — tickvault aggregator computes everything in RAM, sends sealed bars directly to QuestDB |
+| Pre-open data | Capture NIFTY+BANKNIFTY+SENSEX+INDIA VIX ticks during 09:00–09:15 IST (pre-open session); use for indicator warm-up |
+| Live open data | 09:15:00 IST first tick → first 1m bar precision proven by 15:31 IST cross-verify (zero tolerance) |
+| WebSockets | 1 main-feed (4 SIDs) + 1 order-update — **2 connections forever** |
+| Cross-verify | 15:31 IST same-day (1m/5m/15m/1h × 4 SIDs = 16 pairs) + 08:05 IST morning 1d |
+| Reconnect policy | **REAL reconnect = new TCP + re-auth + re-subscribe (NOT silent socket reuse)** — see §6 |
+| Tick loss policy | Bounded zero-loss inside 100K rescue ring envelope; cross-verify catches gaps; REST backfill on detected gap |
+| AWS instance | t4g.medium ARM ap-south-1, Default tenancy, on-demand |
+| Schedule | 08:00–17:00 IST EVERY DAY (Mon–Sun) |
+| Docker stack | tickvault + QuestDB only (2 containers) |
+| Observability | CloudWatch (Logs + Metrics + Alarms) — single sink |
+| Notification | **4-channel**: SMS + Telegram + Email + Phone CALL (Amazon Connect outbound voice for Critical) |
+| Monthly cost | ~₹1,037/mo (₹1,022 base + ₹15 Connect) |
+| Bootstrap path | **Cowork prompt** (LOCKED — see §10) |
+| Mac dev workflow | IntelliJ → cargo on Mac → docker compose up locally → git push → GitHub Actions → SSM deploy → AWS (LOCKED) |
+
+---
+
+## §2. The trading session timing (pre-open + live open, locked)
+
+```
+   IST                  Activity                                   Tickvault state
+   ───                  ────────                                   ──────────────
+   00:00:01            IST midnight roll                          bar_cache evicts oldest day; 30d window slides
+   08:00:00            EventBridge cron fires                     AWS StartInstances
+   08:00:30            Instance running, cloud-init starts        systemd boots tickvault.service
+   08:03:00            Boot complete, all 8 steps green           BootReadyConfirmation Telegram fires ✅
+   08:05:00            Morning 1d cross-check fires              compares yesterday's derived 1d candle vs Dhan REST
+   08:05:30            If match → strategy_armed=true            If mismatch → CROSS-VERIFY-03 Critical (Phone+SMS+TG+Email)
+   08:30:00            (operator wakes, checks Telegram)         operator scrolls phone
+   09:00:00            **PRE-OPEN SESSION BEGINS**               Tickvault starts capturing pre-open ticks
+   09:00:01–09:08:00   Pre-open price discovery                  Ticks captured to RAM aggregator (1m TF starts)
+   09:08:01–09:14:59   Final pre-open (order matching)           Ticks continue; pre-open buffer fills
+   09:13:00            (in old design Phase 2 fired here)        In new indices-only design: NOTHING (no stock F&O)
+   09:14:30            Phase 2 readiness pre-check               (Wave 5 Item 9 — verify all 11 gates green pre-open)
+   09:15:00            **MARKET OPEN — continuous trading**      First REAL trade tick arrives
+   09:15:30            MarketOpenStreamingConfirmation           Telegram ✅ "Streaming live | WS:1/1 | SIDs:4/4"
+   09:16:30            SelfTestPassed (7 sub-checks all green)   Telegram ✅
+   12:00–15:30         Continuous trading (no lunch break)       Ticks flow; 21 TFs update in RAM; option chain every 50s
+   15:30:00            **MARKET CLOSE**                          Live tick flow stops
+   15:31:00            Daily intraday cross-verify fires         16 pairs (4 SIDs × 4 TFs) zero-tolerance OHLCV match
+   15:31:30            Cross-verify outcome → Telegram           ✅ Pass OR ✘ Fail Critical with mismatch details
+   15:45:00            EOD digest Telegram                       P&L + order count + alarms summary
+   17:00:00            EventBridge stops instance                AWS StopInstances; tickvault clean shutdown
+```
+
+### Pre-open + live open precision proof (§14 of locked architecture doc)
+
+The pre-open and live-open ticks are subject to the SAME 15:31 IST cross-verify. If we miss a pre-open tick, the 09:15 first 1m bar OHLCV will mismatch Dhan REST → CROSS-VERIFY-01 Critical fires. **This is the proof we captured the open precisely.**
+
+---
+
+## §3. REAL reconnect with REAL resubscribe (operator demand 2026-05-18)
+
+Operator: *"fast boot crash or slow boot crash it can act like working but failing reconnect or disconnect should real reconnect with real resubscribe."*
+
+### The "fake working" problem
+
+| Problem | Detection today | Action today | NEW required action |
+|---|---|---|---|
+| TCP socket says ESTABLISHED but no data flows (Dhan-side silent drop) | WS-GAP-06 tick-gap detector @ 30s | logs ERROR; existing reconnect attempt | **FORCE close socket → NEW TCP connection → fresh handshake → re-auth → RE-SUBSCRIBE** |
+| Process running but main feed task hung | watchdog on task completion | logs ERROR | **systemd Restart=always; supervisor respawns task within 5s** |
+| Process boots but key subsystem silently dead (e.g., option chain scheduler hung) | per-subsystem heartbeat counter | varies by subsystem | **CloudWatch alarm on missing heartbeat → forced systemctl restart via SSM RunCommand** |
+| WS reconnected but subscribe-command channel dropped | SubscribeRxGuard (PR #337) | guard re-installs | already correct ✅ |
+| Reconnect happened but Dhan never sends ack | no current detection | none | **NEW: wait 5s for first tick post-resubscribe; if absent, RECONNECT AGAIN with fresh TCP** |
+
+### The REAL reconnect algorithm (LOCKED)
+
+```rust
+// PSEUDOCODE — pattern locked, implementation in PR #5 below
+async fn detect_and_reconnect() {
+    loop {
+        tokio::select! {
+            _ = tick_gap_detector.wait_for_gap(Duration::from_secs(30)) => {
+                if is_within_market_hours_ist() {
+                    error!(code = "WS-GAP-06", "Silent socket detected — forcing real reconnect");
+                    
+                    // 1. Force-close existing TCP — do NOT trust polite shutdown
+                    let _ = ws_writer.close_immediately().await;
+                    drop(ws_reader);
+                    
+                    // 2. Establish NEW TCP connection
+                    let new_ws = connect_with_fresh_tcp().await?;
+                    
+                    // 3. Re-authenticate with current JWT
+                    let token = token_manager.get().await;
+                    new_ws.send(build_auth_message(&token)).await?;
+                    
+                    // 4. RE-SUBSCRIBE all 4 SIDs (do NOT rely on session continuity)
+                    for sid in [NIFTY, BANKNIFTY, SENSEX, INDIA_VIX] {
+                        new_ws.send(build_subscribe_ticker(*sid)).await?;
+                    }
+                    
+                    // 5. Verify first tick arrives within 5s — else RECONNECT AGAIN
+                    match timeout(Duration::from_secs(5), new_ws.next_tick()).await {
+                        Ok(Some(_)) => info!("Real reconnect confirmed — ticks flowing"),
+                        _ => {
+                            error!(code = "WS-GAP-07-NEW", "Reconnect succeeded but no tick — retrying");
+                            continue; // tight loop with exponential backoff
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+### What this catches that the old code didn't
+
+| Failure mode | Old behavior | New behavior |
+|---|---|---|
+| Dhan kills TCP silently | Watchdog → reconnect, but old socket lingered → race | Force-close BEFORE reconnect; no race |
+| Reconnect succeeds but no resubscribe sent | Possibly missed subscribes for some SIDs | Always re-send all 4 SID subscribes |
+| Reconnect happens but Dhan doesn't ack | Sit there forever pretending to work | 5s timeout → reconnect again |
+| Multiple reconnects in rapid succession | Could fork connections | Single-task ownership; exponential backoff |
+
+### 4 new ErrorCode variants
+
+| Code | Severity | Trigger |
+|---|---|---|
+| `WS-GAP-07-FORCED-RECONNECT` | High | Silent socket detected, forced reconnect initiated |
+| `WS-GAP-08-RESUBSCRIBE-NO-TICK` | Critical | Resubscribe sent but no tick in 5s |
+| `WS-GAP-09-RECONNECT-STORM` | Critical | >5 reconnect attempts in 60s |
+| `WS-GAP-10-ZOMBIE-PROCESS` | Critical | tickvault process running but main feed task missing heartbeat 60s |
+
+---
+
+## §4. Worst-case tick crash recovery (operator demand 2026-05-18)
+
+Operator: *"in worst case if any ticks fail due to any crash means everything needs to be considered."*
+
+### The crash + recovery chain
+
+```
+   tickvault crashes mid-market at T+0 (say 11:23:47 IST)
+       │
+       ▼
+   systemd Restart=on-failure RestartSec=3 detects exit, waits 3s
+       │
+       ▼
+   T+3s: systemd starts tickvault again
+       │
+       ▼
+   Boot Step 1-7: config, observability, auth (TOTP from SSM), QuestDB DDL, bar_cache rehydration
+       │
+       ▼
+   Boot Step 4a: bar_cache loads last 30 days from QuestDB (~84 SELECT queries, async parallel, ~2s)
+       │
+       ▼
+   T+15s: bar_cache fully rehydrated INCLUDING all bars sealed before the crash today
+       │
+       ▼
+   T+18s: Main feed WS reconnects with fresh TCP + re-auth + re-subscribe (§3 algorithm)
+       │
+       ▼
+   T+20s: First post-crash tick arrives → aggregator resumes
+       │
+       ▼
+   THE GAP: from crash at 11:23:47 to first new tick at 11:24:07 = 20 seconds of TICKS LOST
+       │
+       ▼
+   15:31 IST cross-verify CATCHES this:
+   - Compares our derived candles_1m for 11:23:00 and 11:24:00 vs Dhan REST
+   - Mismatch detected on those 2 candles
+   - CROSS-VERIFY-01 Critical Telegram fires (Phone+SMS+TG+Email)
+   - Audit row in candle_cross_verify_mismatches naming exact fields that differ
+       │
+       ▼
+   Optional recovery (NEW — see below):
+   - Auto-backfill via Dhan REST /v2/charts/intraday for the gap window
+   - Re-derive missed candles from REST OHLCV
+   - Overwrite candles_1m for affected timestamps
+   - Re-run cross-verify; should now pass
+```
+
+### The auto-backfill on crash detection (NEW design)
+
+```rust
+// PSEUDOCODE — pattern locked, implementation in PR #6 below
+async fn on_boot_after_crash(crash_time: i64) {
+    if was_a_crash_today(crash_time) {
+        let gap_start = crash_time;
+        let gap_end = first_post_crash_tick_time;
+        
+        // Backfill via REST for each TF
+        for tf in [_1m, _5m, _15m, _1h] {
+            let rest_bars = fetch_intraday_rest(NIFTY, tf, gap_start, gap_end).await?;
+            for bar in rest_bars {
+                bar_cache.upsert(bar);  // overwrites any partial derived bars
+                questdb_writer.upsert(bar);  // overwrites candles_1m/5m/15m/1h
+            }
+        }
+        
+        // Same for BANKNIFTY, SENSEX, INDIA VIX
+        // Emit Telegram: "Crash recovery: backfilled <N> bars from <gap_start> to <gap_end>"
+        emit_telegram_info(format!("Crash recovery: backfilled {} bars", n));
+    }
+}
+```
+
+### Worst-case scenarios covered
+
+| Scenario | RTO | Recovery mechanism |
+|---|---|---|
+| Process crash, systemd restart succeeds in 20s | 20s gap → 100% recovered via REST backfill | bar_cache rehydration + REST backfill |
+| Process crash, systemd 3-retry exhausts | 60s+ → alarm fires (BOOT-02) | Operator manual restart; same backfill on next boot |
+| EC2 instance reboot (kernel panic) | ~3 min (instance reboot + boot) | Cross-verify catches the gap; backfill runs on next boot |
+| EC2 instance crash, AWS needs to reschedule | ~10 min | Same |
+| QuestDB crash mid-write | Rescue ring absorbs ticks; QuestDB restart auto via Docker | No tick loss inside 100K ring envelope |
+| Both tickvault + QuestDB crash simultaneously | 100K rescue ring → NDJSON spill → DLQ NDJSON | Bounded zero-loss inside spill capacity |
+| Disk full (EBS gp3 hit limit) | Storage-gap-05 alarm; rescue ring fills; eventual DLQ | Operator pages, expands EBS |
+| AWS region outage > 60s | Outside envelope per operator-charter §F | Accept; CloudWatch alarm fires when region returns |
+
+---
+
+## §5. THE 14 PR SEQUENCE (operator-charter §H serial completion)
+
+| # | PR | What ships | Effort | Files |
+|---|---|---|---|---|
+| 1 | **Prep: config blocks + ErrorCode skeletons + ratchet tests** | Cement new contracts BEFORE deletions | Small | `[option_chain]`, `[cross_verify]`, `[telemetry]` TOML; 12 new ErrorCode stubs; ratchet test skeletons |
+| 2 | **Delete movers pipeline + tables** | Lowest risk; already mostly retired | Small | `MoversWriter`, `option_movers`, 25 matviews |
+| 3 | **Delete Greeks inline pipeline (keep black_scholes lib)** | Decoupled | Medium | `inline_computer.rs`, `aggregator.rs`, pipeline task |
+| 4 | **Delete depth-20 / depth-200 dynamic infrastructure** | Big chunk; ~3K LoC | Large | All depth subdirs |
+| 5 | **Delete Phase 2 scheduler + emit guard + bhavcopy + prev_OI + live_tick_atm_resolver** | Stock F&O orchestration out | Large | Phase 2 module entire |
+| 6 | **Replace universe builder + CSV + rkyv cache → 4-line `LOCKED_UNIVERSE` const** | Largest LoC single chunk (~12K removed → 50 added) | Large | `instrument/` dir gutted |
+| 7 | **Tighten SubscriptionScope to `Indices4Only`; drop 218 NSE_EQ + 25 sectoral display indices** | Final universe lock | Small | Config + planner |
+| 8 | **Build `option_chain/` module (REST fetcher, 50s scheduler, RAM cache, full-day request+response history, audit writer)** | Heart-piece live | Medium | NEW module |
+| 9 | **Build `cross_verify/` module (15:31 IST + 08:05 IST schedulers + comparator + 3 audit tables + auto-backfill)** | Z+ L3 reconcile + crash recovery | Medium | NEW module |
+| 10 | **Cutover observability: delete Grafana/Prom/Alertmanager/Loki/Alloy/Traefik/Valkey from docker-compose; add CloudWatch agent config + 10 alarm Terraform stanzas** | Big visible change | Large | Docker + Terraform |
+| 11 | **REAL reconnect algorithm (§3 spec) — force-close TCP, re-auth, re-subscribe, 5s tick verify** | Catches the fake-working bug | Medium | `websocket/connection.rs` |
+| 12 | **Rescue ring resize 5M → 100K; per-subsystem heartbeat gauges; zombie-process detection (WS-GAP-10)** | Right-size + fake-working detection L1 | Medium | constants + observability |
+| 13 | **Terraform: switch instance type to t4g.medium ARM; schedule every-day 08:00/17:00; new alarms; Amazon Connect outbound voice Lambda for Critical phone CALL** | AWS-side cutover + 4-channel notification | Large | Terraform + Lambda |
+| 14 | **Mac dev parity ratchet test + GitHub Actions deploy.yml + market-hours guard + auto-rollback** | Production deploy pipeline live | Medium | `.github/workflows/deploy.yml`; ratchet test |
+
+**Total: 14 PRs. Estimated 6-8 weeks at 1 PR/session per operator-charter §H serial completion. ~36K LoC removed, ~6K LoC added, net -30K LoC.**
+
+---
+
+## §6. Bootstrap path — LOCKED to Cowork prompt
+
+Operator: *"Choose bootstrap path (script OR Cowork prompt)."*
+
+**LOCKED: Cowork prompt.** Reasoning:
+
+| Reason | Detail |
+|---|---|
+| Operator stated "I don't even have idea about how to buy or launch instance" | Cowork has Claude environment + AWS CLI + Terraform pre-installed; operator only needs AWS signup + credit card |
+| `aws-bootstrap.sh` requires local Mac to have AWS CLI + Terraform + jq installed | Adds friction; Cowork avoids this |
+| Cowork can pause + ask operator interactively when secrets needed | Script can prompt too, but Cowork has richer UX |
+| Cowork can self-correct on errors via tool calls | Script needs operator to debug bash |
+| Cowork session can hand off to long-running monitoring loop | Script exits after run |
+
+**The Cowork prompt is in `docs/runbooks/operator-end-to-end-automation.md` §11 — paste it verbatim into a fresh Claude Cowork window.**
+
+`scripts/aws-bootstrap.sh` design stays in the doc as a REFERENCE for what Cowork should do — Cowork can use it as a checklist OR write it on the fly.
+
+---
+
+## §7. Mac dev workflow — LOCKED
+
+Operator: *"Mac dev workflow — IntelliJ → cargo → docker-compose → git push → AWS deploy."*
+
+```
+   On Mac (operator's laptop):
+   ─────
+   1. IntelliJ open
+   2. Edit code
+   3. `make docker-up` brings up tickvault + QuestDB locally
+   4. `cargo test -p tickvault-<crate>` runs scoped tests
+   5. `make doctor` verifies local health
+   6. Commit on feature branch
+   7. `git push -u origin feature-xyz`
+   8. GitHub PR opened — CI runs 22-test battery
+   9. CI green → operator merges to main
+   ──── Mac side done. AWS side begins automatically ────
+   10. GitHub Actions `deploy.yml` triggers on main merge
+   11. IST clock guard: refuses 09:14–15:31 IST
+   12. Outside market hours → AWS OIDC AssumeRole
+   13. SSM RunCommand: stop tickvault, swap binary, start
+   14. Wait 180s for BootReadyConfirmation Telegram
+   15. If received: ✅ deploy success
+   16. If timeout: auto-rollback to previous binary; Critical Telegram
+```
+
+### What operator NEVER needs to do
+
+- Install AWS CLI on Mac
+- Install Terraform on Mac
+- SSH into AWS instance (use SSM Session Manager instead — accessed via browser or `aws ssm start-session` if installed)
+- Manually start/stop EC2 (EventBridge cron does it)
+- Manually run cron jobs (CloudWatch alarms fire automatically)
+
+### What operator DOES on Mac
+
+- Edit code in IntelliJ
+- Run `cargo test` to validate locally
+- `git push` to deploy
+- Read Telegram for daily proof-of-life
+
+**Total Mac toolchain: IntelliJ + Rust + Docker Desktop + Git. Nothing else.**
+
+---
+
+## §8. Quick-wins to do TODAY (5 actions, all <30 min total)
+
+After AWS account is created + before bootstrap:
+
+| # | Action | Time | Cost |
+|---|---|---|---|
+| 1 | Enable MFA on AWS root user | 5 min | Free |
+| 2 | Create AWS billing alarm at ₹1,500/mo | 5 min | Free |
+| 3 | Enable GitHub Dependabot on `SJParthi/tickvault` repo | 1 click | Free |
+| 4 | Enable AWS Compute Optimizer | 1 click | Free |
+| 5 | Subscribe to AWS Health Dashboard email + RSS feed | 5 min | Free |
+
+---
+
+## §9. The 4 daily Telegrams (proof of life — operator scrolls phone)
+
+| IST | Telegram | What it proves | If MISSING |
+|---|---|---|---|
+| 08:03 | ✅ `tickvault started \| boot_id: X` | Boot complete | Investigate immediately; Phone Call already fired |
+| 09:15:30 | ✅ `Streaming live \| WS:1/1 \| Order-WS:1/1 \| SIDs:4/4 \| Token:23h45m` | Market open, feed flowing | Cross-verify will catch any gap; ack alert |
+| 15:31:30 | ✅ `Cross-match OK \| TFs:4 \| Candles:N \| All OHLCV exact` | Same-day data integrity proven | CRITICAL — strategy data suspect; investigate |
+| 15:45 | EOD digest: P&L + order count + alarms summary | Day complete | Means EOD task didn't run; manual review |
+
+**Total operator daily effort: ~30 seconds scrolling Telegram.**
+
+---
+
+## §10. Honest envelope (operator-charter §F mandatory wording)
+
+> "100% inside the LOCKED envelope:
+> - 4 SIDs (NIFTY/BANKNIFTY/SENSEX/INDIA VIX) main feed
+> - 3 underlyings option chain
+> - 21 timeframes IST wall-clock
+> - 30 days rolling RAM history
+> - 100K rescue ring + REST backfill on detected gap
+> - REAL reconnect (force-close TCP, re-auth, re-subscribe, 5s tick verify)
+> - 15:31 IST + 08:05 IST cross-verify zero-tolerance
+> - 4-channel notification (SMS + Telegram + Email + Phone Call) for Critical
+> - CloudWatch single-sink observability
+> - t4g.medium ARM ap-south-1 Default tenancy on-demand
+> - Schedule 08:00–17:00 IST every day Mon–Sun
+> - ~₹1,037/mo
+>
+> Every claim above is pinned by a ratchet test that fails the build on regression.
+>
+> Beyond envelope: AWS region outage > 60s, simultaneous failure of all 4 SNS legs, operator phone destroyed, Dhan API extended outage > 24h. These are documented as honest limitations — not promised."
+
+---
+
+## §11. Trigger / auto-load
+
+Always loaded — this is the canonical plan. Activates when editing:
+- Any file under `crates/`
+- `deploy/`
+- `.github/workflows/`
+- `.claude/plans/aws-lifecycle/`
+- `config/base.toml`
