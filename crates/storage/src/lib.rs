@@ -100,6 +100,7 @@ pub mod open_price_audit_persistence;
 pub mod option_chain_minute_snapshot_persistence;
 pub mod order_audit_persistence;
 pub mod order_update_ws_audit_persistence;
+pub mod orphan_position_audit_persistence;
 pub mod partition_manager;
 pub mod phase2_audit_persistence;
 pub mod phase2_subscription_marker;

@@ -1093,6 +1093,13 @@ pub const TICK_PERSIST_END_SECS_OF_DAY_IST: u32 = 55_800;
 /// Seconds in a day (86,400). Used for modulo arithmetic in persist window check.
 pub const SECONDS_PER_DAY: u32 = 86_400;
 
+/// Phase 0 Item 20 — seconds-of-day (IST) at which the orphan-position
+/// watchdog fires: 15:25:00 = 15 × 3600 + 25 × 60 = 55_500. The 5-minute
+/// headroom before the 15:30 close lets the DETECT → AUDIT → Telegram
+/// chain complete (Phase 0 dry-run) AND lets a Phase 1+ live exit
+/// attempt complete before the exchange rejects late orders.
+pub const ORPHAN_POSITION_WATCHDOG_TIME_SECS_IST: u32 = 55_500;
+
 /// Drain buffer (seconds) after market close before aborting WebSocket handles.
 /// Allows in-flight ticks (last 15:29 candle) to reach the tick processor channel
 /// before the WebSocket read loop is killed.
@@ -1944,6 +1951,20 @@ const _: () = assert!(
 const _: () = assert!(
     TICK_PERSIST_END_SECS_OF_DAY_IST < SECONDS_PER_DAY,
     "TICK_PERSIST_END must be within a single day"
+);
+// Phase 0 Item 20 — orphan-position watchdog timing invariants.
+const _: () = assert!(
+    ORPHAN_POSITION_WATCHDOG_TIME_SECS_IST == 15 * 3600 + 25 * 60,
+    "ORPHAN_POSITION_WATCHDOG_TIME must equal 15:25 IST (55500)"
+);
+const _: () = assert!(
+    ORPHAN_POSITION_WATCHDOG_TIME_SECS_IST < TICK_PERSIST_END_SECS_OF_DAY_IST,
+    "Watchdog must fire BEFORE 15:30 IST close (Phase 1+ exit must \
+     land before NSE rejects late orders)"
+);
+const _: () = assert!(
+    TICK_PERSIST_END_SECS_OF_DAY_IST - ORPHAN_POSITION_WATCHDOG_TIME_SECS_IST == 300,
+    "Watchdog must fire exactly 5 minutes (300s) before close"
 );
 const _: () = assert!(SECONDS_PER_DAY == 86_400, "SECONDS_PER_DAY must be 86400");
 
