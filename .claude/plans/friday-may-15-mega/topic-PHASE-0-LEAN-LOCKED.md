@@ -1197,7 +1197,7 @@ Z+ LOW fixes (4):
 - [x] **Item 17** — SEBI 24h JWT daily renewal observability + `auth_renewal_audit`
 - [x] **Item 18** — Static IP boot check (`ordersAllowed=true`)
 - [x] **Item 19** — Dual-instance lock (RESILIENCE-01) via `live_instance_lock` table
-- [ ] **Item 20** — Orphan position 15:25 IST watchdog
+- [x] **Item 20** — Orphan position 15:25 IST watchdog (scaffolding; Phase 1+ supervisor wires the OMS API client once it lands in main.rs)
 - [x] **Item 21** — NaN / div-by-zero indicator guards
 - [x] **Item 22a** — Order placement 5s REST timeout + DH-904 retry policy
 - [x] **Item 22b** — Stop-loss-leg-cancelled auto-replace + `sl_replacement_audit`
