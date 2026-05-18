@@ -1189,7 +1189,9 @@ mod tests {
         // AGGREGATOR-AUDIT-01.
         // 2026-05-17 (Phase 0 Items 8+9 — gap-fill scheduler): bumped
         // 100 -> 104 for GAP-FILL-01/02/03/04.
-        assert_eq!(ErrorCode::all().len(), 104);
+        // 2026-05-18 (Phase 0 Item 20 — orphan position watchdog):
+        // bumped 104 -> 105 for ORPHAN-POSITION-01.
+        assert_eq!(ErrorCode::all().len(), 105);
     }
 
     #[test]
@@ -1238,7 +1240,9 @@ mod tests {
                 || s.starts_with("AGGREGATOR-")
                 || s.starts_with("BOUNDARY-")
                 // Wave 4 Item 19 (Phase 0): dual-instance lock.
-                || s.starts_with("RESILIENCE-");
+                || s.starts_with("RESILIENCE-")
+                // Phase 0 Item 20: orphan position 15:25 IST watchdog.
+                || s.starts_with("ORPHAN-POSITION-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
