@@ -59,6 +59,34 @@ const KNOWN_BROKEN_ALLOWLIST: &[&str] = &[
     // was never authored. TODO: write docs/templates/override_log.md
     // or remove the reference.
     "docs/templates/override_log.md",
+    // 2026-05-18 PR #1 (AWS-lifecycle 14-PR sequence) entries —
+    // pre-existing stale references from main that surfaced when PR #1
+    // landed the option_chain_cross_verify rule file. None caused by
+    // PR #1 itself. Each will be cleaned up by the matching deletion
+    // PR in the 14-PR sequence per `.claude/plans/aws-lifecycle/THE-FINAL-PLAN.md`.
+    //
+    // phase2-empty-plan.md references a deleted source file.
+    // TODO: PR #5 (delete Phase 2 dispatcher) will also update this
+    // runbook to point at the indices-only architecture instead.
+    "crates/core/src/instrument/phase2_scheduler.rs",
+    // movers.md + phase-4b-movers-cleanup.md reference a deleted source
+    // file. TODO: PR #2 (delete movers pipeline) will mark both runbooks
+    // as superseded.
+    "crates/storage/src/movers_persistence.rs",
+    // phase-1-monitoring-rubric.md references a plan doc that was
+    // archived. TODO: PR #11 docs cleanup updates this runbook.
+    ".claude/plans/friday-may-15-mega/topic-PHASE-1-RUBRIC-VERDICT.md",
+    // aws-deployment.md references files that exist only after
+    // `terraform init` runs locally (gitignored) and a per-rule TF file
+    // that was consolidated into main.tf. TODO: PR #13 (Terraform
+    // t4g.medium + Amazon Connect Lambda) refreshes this runbook to
+    // reflect the consolidated main.tf layout.
+    "deploy/aws/terraform/terraform.tfvars",
+    "deploy/aws/terraform/eventbridge.tf",
+    // operator-end-to-end-automation.md references a bootstrap script
+    // designed in the runbook §4 but not yet implemented. TODO: PR #13
+    // commits `scripts/aws-bootstrap.sh` per the design in the runbook.
+    "scripts/aws-bootstrap.sh",
 ];
 
 #[test]

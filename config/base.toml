@@ -402,3 +402,81 @@ symbol      = "NIFTY"
 security_id = 13
 segment     = "IDX_I"
 slot_sec    = 59
+
+# ===========================================================================
+# PR #1 (AWS-lifecycle 14-PR sequence) — CONTRACT STUB sections.
+#
+# These two sections define the configuration shape for PR #8 (option_chain
+# module) and PR #9 (cross_verify module). No Rust consumer reads them yet
+# — the current `ApplicationConfig` struct has no fields for them, so they
+# are silently ignored by the TOML parser (deny_unknown_fields is NOT set).
+#
+# When PR #8 lands, it adds `#[serde] struct OptionChainConfig` and wires
+# it via `ApplicationConfig::option_chain: OptionChainConfig`. Same for PR #9.
+#
+# See:
+# - docs/architecture/option-chain-z-plus-heart-piece.md §7 + §8
+# - docs/architecture/aws-indices-only-locked-architecture.md §14
+# - .claude/plans/aws-lifecycle/THE-FINAL-PLAN.md §5 (14-PR sequence)
+# ===========================================================================
+
+[option_chain]
+# Operator-locked 2026-05-18: 50-60s cadence window. Strategy fail-closes
+# if cache age exceeds `max_cache_age_secs`.
+cadence_secs            = 50
+max_cycle_latency_secs  = 60   # alarm if cycle exceeds this
+max_cache_age_secs      = 60   # strategy fail-closed threshold
+fetch_timeout_secs      = 5
+retry_count             = 1
+backoff_ladder_secs     = [10, 20, 40, 80]   # DH-904 backoff per dhan-annexure-enums rule 11
+verify_ltp_tolerance_pct = 0.005             # 0.5% LTP-vs-WS tolerance (OPTION-CHAIN-04)
+stale_cycles_before_telegram = 3
+expirylist_refresh_ist  = "15:31:00"          # daily Thursday rollover detection
+
+# 3 underlyings (NIFTY/BANKNIFTY/SENSEX). INDIA VIX has NO option chain.
+[[option_chain.underlyings]]
+security_id = 13
+name        = "NIFTY"
+segment     = "IDX_I"
+
+[[option_chain.underlyings]]
+security_id = 25
+name        = "BANKNIFTY"
+segment     = "IDX_I"
+
+[[option_chain.underlyings]]
+security_id = 51
+name        = "SENSEX"
+segment     = "IDX_I"
+
+[cross_verify]
+# Operator-locked 2026-05-18:
+#   - 15:31 IST: 1-minute buffer after market close so final 15:29 bar settles.
+#   - 08:05 IST: morning 1d cross-check; alert-only, does NOT block trading.
+#   - Zero-tolerance OHLCV match required (per historical-candles-cross-verify.md).
+intraday_run_ist          = "15:31:00"
+morning_run_ist           = "08:05:00"
+timeframes_intraday       = ["1m", "5m", "15m"]   # 1h dropped — operator narrowed 2026-05-18
+tolerance_price           = 0.0
+tolerance_volume          = 0.0
+block_trading_on_mismatch = false                  # alert-only per operator lock
+# Subjects of cross-verify — all 4 main feed SIDs
+[[cross_verify.subjects]]
+security_id = 13
+name        = "NIFTY"
+segment     = "IDX_I"
+
+[[cross_verify.subjects]]
+security_id = 25
+name        = "BANKNIFTY"
+segment     = "IDX_I"
+
+[[cross_verify.subjects]]
+security_id = 51
+name        = "SENSEX"
+segment     = "IDX_I"
+
+[[cross_verify.subjects]]
+security_id = 21
+name        = "INDIA VIX"
+segment     = "IDX_I"

@@ -1,0 +1,140 @@
+# Option Chain + Cross-Verify Error Codes (PR #1 stubs)
+
+> **Status:** CONTRACT STUBS. Production emit sites land in PR #8 (option_chain module) and PR #9 (cross_verify module) of the AWS-lifecycle 14-PR sequence per `.claude/plans/aws-lifecycle/THE-FINAL-PLAN.md` §5.
+> **Authority:** CLAUDE.md > operator-charter-forever.md > this file.
+> **Companion docs:**
+> - `docs/architecture/option-chain-z-plus-heart-piece.md` §8 — 8 OPTION-CHAIN codes
+> - `docs/architecture/aws-indices-only-locked-architecture.md` §14.4 — 4 CROSS-VERIFY codes
+> - `docs/architecture/dhan-api-coverage-map.md` — Dhan v2.5 compliance
+> **Cross-ref:** `crates/common/tests/error_code_rule_file_crossref.rs` requires each variant to be mentioned in at least one rule file. This file serves that contract for the 12 variants below.
+
+---
+
+## §0. Why these codes exist
+
+When the option_chain REST fetch loop (every 50s for NIFTY/BANKNIFTY/SENSEX) and the cross_verify daily gates (15:31 IST same-day + 08:05 IST morning 1d) land in PRs #8 and #9, those subsystems will emit `error!`/`warn!`/`info!` macros with `code = ErrorCode::X.code_str()` fields. The pre-merge tag-guard (`crates/common/tests/error_code_tag_guard.rs`) rejects any emit without a matching variant. Stubbing the variants in PR #1 means PRs #8 and #9 can compile cleanly without circular dependencies.
+
+---
+
+## §1. Option Chain codes (8 variants — Z+ heart-piece)
+
+Per `option-chain-z-plus-heart-piece.md` §8. The option_chain REST fetcher runs every 50s for 3 underlyings concurrently, populates a RAM cache, async-flushes to QuestDB. Strategy fail-closes if cache age > 60s.
+
+### OPTION-CHAIN-01 — REST fetch failed (network timeout / 5xx)
+
+**Severity:** High.
+**Auto-triage:** Yes (transient).
+**Trigger:** `reqwest::post("/v2/optionchain")` returned non-2xx or timed out. The fetch retries ONCE with 2s delay; if still failing, the underlying is marked STALE for this cycle. RAM cache keeps the previous snapshot; strategy fail-closes if `cache_age_seconds > 60`.
+**Triage:** transient — next 50s cycle retries. Sustained failure → cross-check `/v2/profile` reachability and Dhan status.
+
+### OPTION-CHAIN-02 — DH-904 backoff ladder exhausted
+
+**Severity:** High.
+**Auto-triage:** Yes (will retry on next non-backoff window).
+**Trigger:** Dhan rate-limited us. Backoff ladder 10→20→40→80s per `dhan-annexure-enums.md` rule 11. After 80s exhaustion, the cycle is skipped and the alarm fires.
+**Triage:** confirm we're not exceeding 1 unique request per 3s per underlying. Check `tv_option_chain_cycle_overlap_total` counter.
+
+### OPTION-CHAIN-03 — response parse failure
+
+**Severity:** Medium.
+**Auto-triage:** Yes (retry once).
+**Trigger:** Dhan returned 2xx but body is malformed JSON, missing `oc` map, or field types disagree with `dhan/option-chain.md` schema. Retry once with same expiry; mark stale on repeat. Possible Dhan-side API regression.
+**Triage:** compare raw body in `option_chain_raw` table to expected schema. Open Dhan support ticket if persistent.
+
+### OPTION-CHAIN-04 — LTP disagrees with WS LTP
+
+**Severity:** Medium.
+**Auto-triage:** No (data integrity).
+**Trigger:** option-chain `data.last_price` of the underlying disagrees with the live WebSocket index LTP beyond 0.5% tolerance. Either our parser is wrong or Dhan-side data is anomalous. Operator inspection required.
+
+### OPTION-CHAIN-05 — cache stale, strategy halted
+
+**Severity:** Critical.
+**Auto-triage:** No (operator paged via 4-channel SNS).
+**Trigger:** `option_chain_cache.age_seconds(underlying) > 60` during market hours. Strategy refuses to emit any signal. Operator paged via SMS + Telegram + Email + Amazon Connect outbound voice CALL.
+**Triage:** open `option_chain_request_audit` table to see latency + failure history for the last 5 minutes. Likely upstream Dhan REST is slow or down.
+
+### OPTION-CHAIN-06 — cycle overlap, skip-next
+
+**Severity:** High.
+**Auto-triage:** Yes (mutex skips next 50s window).
+**Trigger:** previous cycle still running when next 50s tick fires. Mutex-guarded skip-next-cycle policy. If 2 skips in a row, alarm escalates.
+**Triage:** check per-call latency in `option_chain_request_audit`. If a single underlying is consistently slow, isolate via per-underlying alarm threshold.
+
+### OPTION-CHAIN-07 — Thursday expiry rollover detected
+
+**Severity:** Info.
+**Auto-triage:** Yes (informational).
+**Trigger:** at 15:31 IST on Thursday (or whenever NSE expiry rolls), the expiry-list fetch returns a different nearest expiry than was active during the day. RAM cache is rebuilt for the new expiry; next 50s cycle uses the new expiry. No action required.
+
+### OPTION-CHAIN-08 — JWT expired mid-cycle (HTTP 401)
+
+**Severity:** Critical.
+**Auto-triage:** No.
+**Trigger:** HTTP 401 from Dhan mid-cycle indicates the 24h JWT expired between cycles. The token-manager force-refresh fires, but if the token can't be refreshed (TOTP secret rotated, SSM unreachable), the strategy cannot operate. Operator paged.
+**Triage:** verify SSM `/tickvault/prod/dhan_totp_secret` matches Dhan web UI. Re-register TOTP if rotated.
+
+---
+
+## §2. Cross-Verify codes (4 variants — Z+ L3 RECONCILE)
+
+Per `aws-indices-only-locked-architecture.md` §14. Two daily gates: 15:31 IST same-day intraday verify + 08:05 IST morning 1d check.
+
+### CROSS-VERIFY-01 — 15:31 IST same-day mismatch
+
+**Severity:** Critical.
+**Auto-triage:** No (operator review).
+**Behavior:** alert + audit row only — does **NOT** block trading the next day (operator-locked 2026-05-18).
+**Trigger:** at 15:31 IST after market close, the cross-verify scheduler runs 12 pairs (4 SIDs × 3 TFs: 1m, 5m, 15m). For each pair, our derived `candles_<tf>` is compared against Dhan REST `/v2/charts/intraday` for the same trading-date timestamps. Zero-tolerance OHLCV match required. Any mismatch fires this code.
+**Triage:** inspect `cross_verify_mismatches` table for the affected candle timestamps. Verify whether our aggregator missed ticks during a known disconnect window (check `ws_reconnect_audit`).
+
+### CROSS-VERIFY-02 — 15:31 IST historical REST unreachable
+
+**Severity:** High.
+**Auto-triage:** Yes (retry next trading day).
+**Trigger:** the 15:31 IST cross-verify could not reach `/v2/charts/intraday` (network timeout, persistent 5xx). The day's verification is skipped; alert fires. Next trading day's 08:05 IST morning check covers yesterday's full-day candle via `/v2/charts/historical`.
+**Triage:** confirm Dhan REST endpoint health. Schedule a one-shot manual verify when REST recovers if integrity is operator-critical.
+
+### CROSS-VERIFY-03 — 08:05 IST morning 1d mismatch
+
+**Severity:** Critical.
+**Auto-triage:** No (operator review).
+**Behavior:** alert + audit row only — does **NOT** block trading the day (operator-locked 2026-05-18).
+**Trigger:** at 08:05 IST every trading day, fetch yesterday's 1d candle via `/v2/charts/historical` and compare against our derived `candles_1d` row. Zero-tolerance OHLCV match. Mismatch fires this code.
+**Triage:** inspect `cross_verify_audit` table. If our 1d derivation used incorrect day-boundary alignment, fix the boundary logic and re-derive. Yesterday's close becomes part of strategy decisions — operator must decide whether to trade today based on suspect data.
+
+### CROSS-VERIFY-04 — 08:05 IST historical REST unreachable
+
+**Severity:** High.
+**Auto-triage:** Yes (retry next trading day).
+**Trigger:** the 08:05 IST morning check could not reach `/v2/charts/historical`. The day's verification is skipped; alert fires. Trading is NOT blocked (operator-locked).
+**Triage:** same as CROSS-VERIFY-02 — confirm Dhan REST endpoint health.
+
+---
+
+## §3. Mechanical guarantee mapping (operator-charter §C)
+
+| Charter demand | How these stubs satisfy |
+|---|---|
+| 100% audit coverage | Every code maps to a future `option_chain_request_audit` or `cross_verify_audit` row when consumers land |
+| 100% logging | Each code carries a `Severity` so tracing macros route correctly to CloudWatch |
+| 100% alerting | Critical-severity codes auto-route to SNS 4-leg fan-out (SMS + TG + Email + Connect call) |
+| 100% extreme check | `error_code_tag_guard.rs` enforces `code = ErrorCode::X.code_str()` field on every emit; `error_code_rule_file_crossref.rs` enforces this file's existence + cross-references |
+
+---
+
+## §4. Honest envelope (operator-charter §F)
+
+> "PR #1 ships ONLY contract stubs — no consumer code, no emit sites. The 12 variants exist so PRs #8 (option_chain module) and #9 (cross_verify module) can compile their emit calls against stable identifiers when they land in 2-4 weeks. Until those PRs merge, ZERO production code emits these codes. This is intentional per the 14-PR sequence in `THE-FINAL-PLAN.md` §5 — cement contracts first, then add the implementations behind them."
+
+---
+
+## §5. Trigger / auto-load
+
+This rule activates when editing:
+- `crates/common/src/error_code.rs` (when adding/modifying any `OptionChain*` or `CrossVerify*` variant)
+- Future `crates/core/src/option_chain/*.rs` (when PR #8 lands)
+- Future `crates/core/src/cross_verify/*.rs` (when PR #9 lands)
+- `docs/architecture/option-chain-z-plus-heart-piece.md`
+- `docs/architecture/aws-indices-only-locked-architecture.md` §14
+- Any file containing `OPTION-CHAIN-` or `CROSS-VERIFY-` or `OptionChain0` or `CrossVerify0`
