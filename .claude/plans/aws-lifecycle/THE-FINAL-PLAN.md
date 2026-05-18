@@ -27,10 +27,12 @@
 | Live open data | 09:15:00 IST first tick → first 1m bar precision proven by 15:31 IST cross-verify (zero tolerance) |
 | WebSockets | 1 main-feed (4 SIDs) + 1 order-update — **2 connections forever** |
 | Cross-verify | 15:31 IST same-day (1m/5m/15m/1h × 4 SIDs = 16 pairs) + 08:05 IST morning 1d |
-| Reconnect policy | **REAL reconnect = new TCP + re-auth + re-subscribe (NOT silent socket reuse)** — see §6 |
+| Reconnect policy | **REAL reconnect = new TCP + re-auth + re-subscribe** — target ≤100 ms end-to-end (NOT literal 0 ms — physically impossible per `precision-realism-and-table-redesign.md` §1.1). Force-close old socket; verify first tick within 5s of resubscribe |
+| Crash recovery target | **~3 seconds** end-to-end (systemd RestartSec=0 + tmpfs cached JWT + lazy bar_cache hydration) per `precision-realism-and-table-redesign.md` §1.2 |
+| Tables | **31 locked** — fresh redesign, precise columns only; `previous_close` table DROPPED (morning 1d fetch provides it); PrevClose packet parser DROPPED |
 | Tick loss policy | Bounded zero-loss inside 100K rescue ring envelope; cross-verify catches gaps; REST backfill on detected gap |
 | AWS instance | t4g.medium ARM ap-south-1, Default tenancy, on-demand |
-| Schedule | 08:00–17:00 IST EVERY DAY (Mon–Sun) |
+| Schedule | **08:00–16:00 IST EVERY DAY (Mon–Sun)** — UPDATED 2026-05-18 (saves ~₹57/mo; 16:00 gives 30 min buffer after 15:30 close + 15:31 cross-verify + 15:45 EOD digest) |
 | Docker stack | tickvault + QuestDB only (2 containers) |
 | Observability | CloudWatch (Logs + Metrics + Alarms) — single sink |
 | Notification | **4-channel**: SMS + Telegram + Email + Phone CALL (Amazon Connect outbound voice for Critical) |
@@ -50,7 +52,7 @@
    08:00:30            Instance running, cloud-init starts        systemd boots tickvault.service
    08:03:00            Boot complete, all 8 steps green           BootReadyConfirmation Telegram fires ✅
    08:05:00            Morning 1d cross-check fires              compares yesterday's derived 1d candle vs Dhan REST
-   08:05:30            If match → strategy_armed=true            If mismatch → CROSS-VERIFY-03 Critical (Phone+SMS+TG+Email)
+   08:05:30            Match OR mismatch → both continue trading. CROSS-VERIFY-03 Critical fires on mismatch but does NOT block trading. Operator decides whether to manually pause.
    08:30:00            (operator wakes, checks Telegram)         operator scrolls phone
    09:00:00            **PRE-OPEN SESSION BEGINS**               Tickvault starts capturing pre-open ticks
    09:00:01–09:08:00   Pre-open price discovery                  Ticks captured to RAM aggregator (1m TF starts)
@@ -62,10 +64,12 @@
    09:16:30            SelfTestPassed (7 sub-checks all green)   Telegram ✅
    12:00–15:30         Continuous trading (no lunch break)       Ticks flow; 21 TFs update in RAM; option chain every 50s
    15:30:00            **MARKET CLOSE**                          Live tick flow stops
-   15:31:00            Daily intraday cross-verify fires         16 pairs (4 SIDs × 4 TFs) zero-tolerance OHLCV match
-   15:31:30            Cross-verify outcome → Telegram           ✅ Pass OR ✘ Fail Critical with mismatch details
+   15:31:00            Daily intraday cross-verify fires         **12 pairs (4 SIDs × 3 TFs: 1m, 5m, 15m only)** zero-tolerance OHLCV match. 1-min buffer ensures the final 15:29:00–15:29:59 candle has settled in our aggregator before comparison.
+   15:31:30            Cross-verify outcome → Telegram           ✅ Pass OR ✘ Fail Critical with mismatch details. **Does NOT block trading the next day** — operator decides.
    15:45:00            EOD digest Telegram                       P&L + order count + alarms summary
-   17:00:00            EventBridge stops instance                AWS StopInstances; tickvault clean shutdown
+   16:00:00            EventBridge stops instance                AWS StopInstances; tickvault clean shutdown (UPDATED 2026-05-18)
+   
+   Next morning 08:05  1d cross-verify catches yesterday's full-day candle vs Dhan REST /v2/charts/historical interval=DAY
 ```
 
 ### Pre-open + live open precision proof (§14 of locked architecture doc)
