@@ -192,7 +192,6 @@ mod tests {
                 build_window_end: "08:55:00".to_string(),
             },
             Arc::new(std::sync::RwLock::new(None)),
-            Arc::new(std::sync::RwLock::new(None)),
             health,
         )
     }

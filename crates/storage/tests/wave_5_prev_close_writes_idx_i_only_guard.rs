@@ -96,25 +96,25 @@ fn test_prev_close_table_only_contains_idx_i_rows() {
 }
 
 #[test]
-fn test_movers_writer_reads_day_close_from_ticks_via_in_memory_cache() {
-    // Source-scan: the in-memory cache update on the Quote/Full paths
-    // is preserved. `update_prev_close` calls on `top_movers` /
-    // `option_movers` are the runtime-cache hand-off; if these get
-    // deleted, the movers writer's change_pct computation breaks.
+fn test_movers_update_prev_close_calls_are_gone() {
+    // PR #2 (2026-05-18): the movers pipeline is retired. The old
+    // assertion required `top_movers.update_prev_close` /
+    // `opt_movers.update_prev_close` to appear ≥2 times each on the
+    // Quote + Full paths — those tracker types no longer exist, so
+    // the ratchet now INVERTS: the call sites MUST NOT reappear.
     let src = tick_processor_source();
     let movers_updates = src.matches("movers.update_prev_close").count();
     let opt_movers_updates = src.matches("opt_movers.update_prev_close").count();
-    assert!(
-        movers_updates >= 2,
-        "Wave 5 Item 15: `top_movers.update_prev_close` must appear on \
-         BOTH the Quote + Full code paths (≥2 occurrences) so the \
-         in-memory cache stays fed for change_pct queries. Found \
-         {movers_updates}."
+    assert_eq!(
+        movers_updates, 0,
+        "PR #2: `movers.update_prev_close` was retired alongside the \
+         deleted top_movers module — must not reappear. Found \
+         {movers_updates} call site(s)."
     );
-    assert!(
-        opt_movers_updates >= 2,
-        "Wave 5 Item 15: `option_movers.update_prev_close` must appear \
-         on BOTH the Quote + Full code paths (≥2 occurrences). Found \
-         {opt_movers_updates}."
+    assert_eq!(
+        opt_movers_updates, 0,
+        "PR #2: `opt_movers.update_prev_close` was retired alongside \
+         the deleted option_movers module — must not reappear. Found \
+         {opt_movers_updates} call site(s)."
     );
 }

@@ -43,31 +43,11 @@ const HOUR_PARTITIONED_TABLES: &[&str] = &[
     "greeks_verification",
     "pcr_snapshots",
     "indicator_snapshots",
-    "stock_movers",
-    "option_movers",
-    // Phase 8 (Movers 22-tf): 22 tables, one per timeframe.
-    "movers_1s",
-    "movers_5s",
-    "movers_10s",
-    "movers_15s",
-    "movers_30s",
-    "movers_1m",
-    "movers_2m",
-    "movers_3m",
-    "movers_4m",
-    "movers_5m",
-    "movers_6m",
-    "movers_7m",
-    "movers_8m",
-    "movers_9m",
-    "movers_10m",
-    "movers_11m",
-    "movers_12m",
-    "movers_13m",
-    "movers_14m",
-    "movers_15m",
-    "movers_30m",
-    "movers_1h",
+    // PR #2 (2026-05-18): `stock_movers`, `option_movers`, and the
+    // 22 `movers_*` matview-source tables retired alongside the
+    // deleted movers pipeline. Their HOUR partitions will be dropped
+    // by the `migrations/0001-drop-movers-tables.sql` one-shot
+    // migration shipped in the same PR.
 ];
 
 /// Tables with DAY partitioning (lower-frequency data).
