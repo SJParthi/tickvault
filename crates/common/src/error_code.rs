@@ -498,6 +498,66 @@ pub enum ErrorCode {
     /// The scheduler runs a full reconciliation pass (SELECT on
     /// `candles_1m` over the suspected window) before continuing.
     GapFill04EventChannelLagged,
+
+    // -----------------------------------------------------------------------
+    // PR #1 (AWS-lifecycle 14-PR sequence): contract stubs for the future
+    // option_chain + cross_verify modules. Variants exist so downstream
+    // PRs (#8 option_chain, #9 cross_verify) can wire their emit sites
+    // against stable identifiers. NO production emit sites yet —
+    // pub-fn-test guards apply when consumers land.
+    //
+    // See:
+    // - docs/architecture/option-chain-z-plus-heart-piece.md §8
+    // - docs/architecture/aws-indices-only-locked-architecture.md §14.4
+    // -----------------------------------------------------------------------
+    /// OPTION-CHAIN-01: REST fetch failed (network timeout / 5xx). Retried
+    /// once with 2s delay; if still failing, the cycle marks that underlying
+    /// stale. Severity::High. Strategy fail-closed if cache age > 60s.
+    OptionChain01FetchFailed,
+    /// OPTION-CHAIN-02: DH-904 backoff ladder exhausted (10s → 80s).
+    /// Sustained rate-limit signal from Dhan. Severity::High.
+    OptionChain02Dh904Exhausted,
+    /// OPTION-CHAIN-03: response parse failure (malformed JSON, missing
+    /// `oc` map, wrong types). Retry once; mark underlying stale on repeat.
+    /// Severity::Medium.
+    OptionChain03ParseFailed,
+    /// OPTION-CHAIN-04: option-chain `last_price` of underlying disagrees
+    /// with live WebSocket index LTP beyond 0.5% tolerance. Possible parser
+    /// bug or Dhan-side data anomaly. Severity::Medium.
+    OptionChain04VerifyFailedVsWs,
+    /// OPTION-CHAIN-05: cache age > 60s during market hours. Strategy
+    /// fail-closes (refuses to emit signals). Severity::Critical.
+    /// Operator paged via 4-channel SNS fan-out.
+    OptionChain05CacheStaleHaltStrategy,
+    /// OPTION-CHAIN-06: previous cycle still running when next 50s tick
+    /// fires. Mutex-guarded skip-next-cycle policy. Severity::High.
+    OptionChain06CycleOverlapSkip,
+    /// OPTION-CHAIN-07: Thursday 15:30 IST expiry rollover detected mid-day;
+    /// expiry-list re-fetched and RAM cache rebuilt for new nearest expiry.
+    /// Severity::Info — operational signal, no action required.
+    OptionChain07ExpiryRollover,
+    /// OPTION-CHAIN-08: HTTP 401 mid-cycle — JWT expired between cycles.
+    /// Token-manager force-refresh; retry within same cycle. Severity::Critical
+    /// because option chain freshness is strategy-blocking.
+    OptionChain08TokenExpiredMidCycle,
+
+    /// CROSS-VERIFY-01: 15:31 IST same-day OHLCV cross-verify found a
+    /// mismatch between our derived `candles_<tf>` and Dhan REST
+    /// `/v2/charts/intraday`. Zero-tolerance match required.
+    /// Severity::Critical. Alert+audit only — does NOT block trading
+    /// (operator decides next-day action).
+    CrossVerify011531Mismatch,
+    /// CROSS-VERIFY-02: 15:31 IST cross-verify could not reach Dhan REST.
+    /// Severity::High. Transient — retry next trading day.
+    CrossVerify021531HistUnreachable,
+    /// CROSS-VERIFY-03: 08:05 IST morning 1d cross-check found yesterday's
+    /// derived 1d candle disagrees with Dhan REST authoritative daily bar.
+    /// Severity::Critical. Alert+audit only — does NOT block trading
+    /// (operator-locked 2026-05-18).
+    CrossVerify03Morning1dMismatch,
+    /// CROSS-VERIFY-04: 08:05 IST morning cross-check could not reach
+    /// Dhan REST. Severity::High. Transient.
+    CrossVerify04Morning1dHistUnreachable,
 }
 
 impl ErrorCode {
@@ -640,6 +700,19 @@ impl ErrorCode {
             Self::GapFill02RestFetchFailed => "GAP-FILL-02",
             Self::GapFill03UpsertFailed => "GAP-FILL-03",
             Self::GapFill04EventChannelLagged => "GAP-FILL-04",
+            // PR #1 (AWS-lifecycle): option_chain + cross_verify stubs
+            Self::OptionChain01FetchFailed => "OPTION-CHAIN-01",
+            Self::OptionChain02Dh904Exhausted => "OPTION-CHAIN-02",
+            Self::OptionChain03ParseFailed => "OPTION-CHAIN-03",
+            Self::OptionChain04VerifyFailedVsWs => "OPTION-CHAIN-04",
+            Self::OptionChain05CacheStaleHaltStrategy => "OPTION-CHAIN-05",
+            Self::OptionChain06CycleOverlapSkip => "OPTION-CHAIN-06",
+            Self::OptionChain07ExpiryRollover => "OPTION-CHAIN-07",
+            Self::OptionChain08TokenExpiredMidCycle => "OPTION-CHAIN-08",
+            Self::CrossVerify011531Mismatch => "CROSS-VERIFY-01",
+            Self::CrossVerify021531HistUnreachable => "CROSS-VERIFY-02",
+            Self::CrossVerify03Morning1dMismatch => "CROSS-VERIFY-03",
+            Self::CrossVerify04Morning1dHistUnreachable => "CROSS-VERIFY-04",
         }
     }
 
@@ -674,11 +747,18 @@ impl ErrorCode {
             | Self::BarMismatch02CrossCheckInconclusive
             | Self::BarMismatch03CrossCheckFailed
             | Self::GapFill01SchedulerFailed
-            | Self::GapFill04EventChannelLagged => Severity::Critical,
+            | Self::GapFill04EventChannelLagged
+            // PR #1 (AWS-lifecycle) — Critical option-chain + cross-verify
+            | Self::OptionChain05CacheStaleHaltStrategy
+            | Self::OptionChain08TokenExpiredMidCycle
+            | Self::CrossVerify011531Mismatch
+            | Self::CrossVerify03Morning1dMismatch => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
-            Self::Selftest01Passed | Self::Slo01Healthy | Self::AggregatorHb01Heartbeat => {
-                Severity::Info
-            }
+            Self::Selftest01Passed
+            | Self::Slo01Healthy
+            | Self::AggregatorHb01Heartbeat
+            // PR #1 (AWS-lifecycle) — Info option-chain rollover signal
+            | Self::OptionChain07ExpiryRollover => Severity::Info,
             // High: composite SLO degradation summary signal
             Self::Slo02Degraded => Severity::High,
             // High: regulatory / order / risk / rate-limit
@@ -702,7 +782,13 @@ impl ErrorCode {
             | Self::Volume01MonotonicityBreach
             | Self::AggregatorLate01
             | Self::GapFill02RestFetchFailed
-            | Self::GapFill03UpsertFailed => Severity::High,
+            | Self::GapFill03UpsertFailed
+            // PR #1 (AWS-lifecycle) — High option-chain + cross-verify
+            | Self::OptionChain01FetchFailed
+            | Self::OptionChain02Dh904Exhausted
+            | Self::OptionChain06CycleOverlapSkip
+            | Self::CrossVerify021531HistUnreachable
+            | Self::CrossVerify04Morning1dHistUnreachable => Severity::High,
             // Medium: data pipeline correctness
             Self::InstrumentP0DuplicateSecurityId
             | Self::InstrumentP0CountConsistency
@@ -750,7 +836,10 @@ impl ErrorCode {
             | Self::CorePin02WorkerDrifted
             | Self::AggregatorSeal01IlpFailed
             | Self::Boundary01CatchupSeal
-            | Self::AggregatorAudit01WriteFailed => Severity::Medium,
+            | Self::AggregatorAudit01WriteFailed
+            // PR #1 (AWS-lifecycle) — Medium option-chain
+            | Self::OptionChain03ParseFailed
+            | Self::OptionChain04VerifyFailedVsWs => Severity::Medium,
             // Low: scheduler / field coverage / trading-day / Dhan other
             Self::InstrumentP1DailyScheduler
             | Self::InstrumentP1DeltaFieldCoverage
@@ -890,6 +979,21 @@ impl ErrorCode {
             | Self::GapFill04EventChannelLagged => {
                 ".claude/rules/project/phase-0-gap-fill-error-codes.md"
             }
+            // PR #1 (AWS-lifecycle): option_chain + cross_verify stubs
+            Self::OptionChain01FetchFailed
+            | Self::OptionChain02Dh904Exhausted
+            | Self::OptionChain03ParseFailed
+            | Self::OptionChain04VerifyFailedVsWs
+            | Self::OptionChain05CacheStaleHaltStrategy
+            | Self::OptionChain06CycleOverlapSkip
+            | Self::OptionChain07ExpiryRollover
+            | Self::OptionChain08TokenExpiredMidCycle
+            | Self::CrossVerify011531Mismatch
+            | Self::CrossVerify021531HistUnreachable
+            | Self::CrossVerify03Morning1dMismatch
+            | Self::CrossVerify04Morning1dHistUnreachable => {
+                ".claude/rules/project/option-chain-cross-verify-error-codes.md"
+            }
         }
     }
 
@@ -1025,6 +1129,19 @@ impl ErrorCode {
             Self::GapFill02RestFetchFailed,
             Self::GapFill03UpsertFailed,
             Self::GapFill04EventChannelLagged,
+            // PR #1 (AWS-lifecycle 14-PR sequence) — option_chain + cross_verify stubs
+            Self::OptionChain01FetchFailed,
+            Self::OptionChain02Dh904Exhausted,
+            Self::OptionChain03ParseFailed,
+            Self::OptionChain04VerifyFailedVsWs,
+            Self::OptionChain05CacheStaleHaltStrategy,
+            Self::OptionChain06CycleOverlapSkip,
+            Self::OptionChain07ExpiryRollover,
+            Self::OptionChain08TokenExpiredMidCycle,
+            Self::CrossVerify011531Mismatch,
+            Self::CrossVerify021531HistUnreachable,
+            Self::CrossVerify03Morning1dMismatch,
+            Self::CrossVerify04Morning1dHistUnreachable,
         ]
     }
 }
@@ -1229,7 +1346,9 @@ mod tests {
         // bumped 104 -> 105 for ORPHAN-POSITION-01.
         // 2026-05-18 (Phase 0 Items 15+28+29 — post-open cross-check):
         // bumped 105 -> 108 for BAR-MISMATCH-01/02/03.
-        assert_eq!(ErrorCode::all().len(), 108);
+        // 2026-05-18 (PR #1 of AWS-lifecycle 14-PR sequence — contract stubs):
+        // bumped 108 -> 120 for OPTION-CHAIN-01..08 + CROSS-VERIFY-01..04.
+        assert_eq!(ErrorCode::all().len(), 120);
     }
 
     #[test]
@@ -1282,7 +1401,10 @@ mod tests {
                 // Phase 0 Item 20: orphan position 15:25 IST watchdog.
                 || s.starts_with("ORPHAN-POSITION-")
                 // Phase 0 Items 15+28+29: 09:16:05 IST post-open cross-check.
-                || s.starts_with("BAR-MISMATCH-");
+                || s.starts_with("BAR-MISMATCH-")
+                // PR #1 (AWS-lifecycle 14-PR sequence): option_chain + cross_verify stubs
+                || s.starts_with("OPTION-CHAIN-")
+                || s.starts_with("CROSS-VERIFY-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

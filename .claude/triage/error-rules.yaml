@@ -832,41 +832,11 @@ rules:
       Not currently emitted; if it ever fires, escalate so the
       operator can investigate the IST-midnight reset task.
 
-  - name: movers-01-stock-persist-failed-escalate
-    match:
-      code: MOVERS-01
-    action: escalate
-    runbook_path: .claude/rules/project/wave-1-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 3600
-    justification: >-
-      MOVERS-01 means stock_movers ILP flush failed. Cosmetic for
-      the dashboard but indicative of QuestDB unreachable.
-
-  - name: movers-02-option-persist-failed-escalate
-    match:
-      code: MOVERS-02
-    action: escalate
-    runbook_path: .claude/rules/project/wave-1-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 3600
-    justification: >-
-      MOVERS-02 means option_movers ILP flush failed. Same
-      diagnosis path as MOVERS-01 but the table is option_movers.
-
-  - name: movers-03-preopen-persist-failed-escalate
-    match:
-      code: MOVERS-03
-    action: escalate
-    runbook_path: .claude/rules/project/wave-1-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 3600
-    justification: >-
-      MOVERS-03 means the pre-open (09:00-09:13 IST) movers snapshot
-      failed to persist to stock_movers with phase='PREOPEN'. The
-      audit trail for that morning's pre-open spread is lost — escalate
-      so operator can confirm QuestDB ILP TCP port is reachable before
-      the next trading day.
+  # MOVERS-01/02/03 rules removed 2026-05-18 (PR #1 of AWS-lifecycle):
+  # movers ErrorCode variants were deleted in PR 5c.5 (2026-05-09) but
+  # their YAML rules were left orphaned. Cleaning up the stale entries
+  # so `every_code_in_rules_yaml_matches_an_error_code_variant` passes.
+  # If movers ever returns, re-add the rules with the new enum variants.
 
   # -----------------------------------------------------------------------
   # Wave 2 — resilience (Items 5–9)
@@ -1346,3 +1316,502 @@ rules:
       bug that no respawn can heal. Severity::High; operator inspects
       data/logs/errors.jsonl.* for the panic backtrace immediately
       preceding the respawn.
+
+  # -----------------------------------------------------------------------
+  # PR #1 (AWS-lifecycle 14-PR sequence) — option_chain + cross_verify stubs
+  # -----------------------------------------------------------------------
+
+  - name: option-chain-01-fetch-failed-escalate
+    match:
+      code: OPTION-CHAIN-01
+    action: escalate
+    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
+    confidence: 0.9
+    cooldown_secs: 60
+    justification: >-
+      OPTION-CHAIN-01 = REST fetch failed (network timeout / 5xx).
+      Severity::High. Transient — next 50s cycle retries automatically.
+      Escalate via Telegram if sustained > 3 cycles. Cross-check Dhan
+      /v2/profile reachability if persistent.
+
+  - name: option-chain-02-dh904-exhausted-escalate
+    match:
+      code: OPTION-CHAIN-02
+    action: escalate
+    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 60
+    justification: >-
+      OPTION-CHAIN-02 = DH-904 backoff ladder (10→20→40→80s) exhausted.
+      Severity::High. Sustained rate-limit signal from Dhan; cycle
+      skipped. Operator checks cycle-overlap counter + ensures we're
+      not exceeding 1 unique request per 3s per underlying.
+
+  - name: option-chain-03-parse-failed-escalate
+    match:
+      code: OPTION-CHAIN-03
+    action: escalate
+    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
+    confidence: 0.8
+    cooldown_secs: 60
+    justification: >-
+      OPTION-CHAIN-03 = response parse failure (malformed JSON / missing
+      oc map). Severity::Medium. Retry once; mark stale on repeat.
+      Operator compares raw body in option_chain_raw table to expected
+      schema; opens Dhan support ticket if persistent.
+
+  - name: option-chain-04-verify-failed-vs-ws-escalate
+    match:
+      code: OPTION-CHAIN-04
+    action: escalate
+    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
+    confidence: 0.7
+    cooldown_secs: 60
+    justification: >-
+      OPTION-CHAIN-04 = option-chain LTP disagrees with live WS LTP
+      beyond 0.5% tolerance. Severity::Medium. Possible parser bug
+      OR Dhan-side data anomaly. Operator inspection required —
+      data-integrity issue.
+
+  - name: option-chain-05-cache-stale-escalate
+    match:
+      code: OPTION-CHAIN-05
+    action: escalate
+    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      OPTION-CHAIN-05 = cache age > 60s during market hours; strategy
+      fail-closed. Severity::Critical. Operator paged via 4-channel
+      SNS fan-out (SMS + Telegram + Email + Amazon Connect call).
+      Operator inspects option_chain_request_audit for upstream
+      failure history. NEVER auto-action — strategy halt requires
+      operator confirmation.
+
+  - name: option-chain-06-cycle-overlap-escalate
+    match:
+      code: OPTION-CHAIN-06
+    action: escalate
+    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
+    confidence: 0.8
+    cooldown_secs: 60
+    justification: >-
+      OPTION-CHAIN-06 = previous cycle still running when next 50s
+      tick fires. Severity::High. Mutex-guarded skip-next-cycle
+      policy. If 2 skips in a row, alarm escalates. Operator checks
+      per-call latency in option_chain_request_audit.
+
+  - name: option-chain-07-expiry-rollover-silence
+    match:
+      code: OPTION-CHAIN-07
+    action: silence
+    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      OPTION-CHAIN-07 = Thursday expiry rollover detected; RAM cache
+      rebuilt for new nearest expiry. Severity::Info. Operational
+      signal only — no action required. Silenced from Telegram
+      noise; available in CloudWatch Logs for audit.
+
+  - name: option-chain-08-token-expired-mid-cycle-escalate
+    match:
+      code: OPTION-CHAIN-08
+    action: escalate
+    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      OPTION-CHAIN-08 = HTTP 401 mid-cycle. JWT expired between cycles.
+      Severity::Critical. Token-manager force-refresh fires; if refresh
+      itself fails (TOTP rotated, SSM unreachable), strategy cannot
+      operate. Operator verifies SSM /tickvault/prod/dhan_totp_secret
+      matches Dhan web UI. Re-registers TOTP if rotated.
+
+  - name: cross-verify-01-1531-mismatch-escalate
+    match:
+      code: CROSS-VERIFY-01
+    action: escalate
+    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      CROSS-VERIFY-01 = 15:31 IST same-day OHLCV mismatch vs Dhan REST
+      /v2/charts/intraday. Severity::Critical. Operator-locked
+      2026-05-18 — does NOT block trading (alert+audit only).
+      Operator inspects cross_verify_mismatches table; verifies
+      whether aggregator missed ticks during known disconnect
+      (ws_reconnect_audit). Auto-backfill via REST is the recovery
+      mechanism for the candles_<tf> tables.
+
+  - name: cross-verify-02-1531-hist-unreachable-escalate
+    match:
+      code: CROSS-VERIFY-02
+    action: escalate
+    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
+    confidence: 0.9
+    cooldown_secs: 60
+    justification: >-
+      CROSS-VERIFY-02 = 15:31 IST historical REST unreachable; cross-
+      verify skipped. Severity::High. Transient. Operator confirms
+      Dhan REST endpoint health; the next morning's 08:05 IST 1d
+      check covers yesterday's full-day candle as backup.
+
+  - name: cross-verify-03-morning-1d-mismatch-escalate
+    match:
+      code: CROSS-VERIFY-03
+    action: escalate
+    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      CROSS-VERIFY-03 = 08:05 IST morning 1d mismatch vs Dhan REST
+      /v2/charts/historical. Severity::Critical. Operator-locked
+      2026-05-18 — does NOT block trading (alert+audit only).
+      Operator inspects cross_verify_audit for yesterday's derivation;
+      if our day-boundary alignment is wrong, fix the boundary logic
+      and re-derive. Operator decides whether to trade today on
+      suspect data.
+
+  - name: cross-verify-04-morning-1d-hist-unreachable-escalate
+    match:
+      code: CROSS-VERIFY-04
+    action: escalate
+    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
+    confidence: 0.9
+    cooldown_secs: 60
+    justification: >-
+      CROSS-VERIFY-04 = 08:05 IST historical REST unreachable; morning
+      check skipped. Severity::High. Transient — same diagnosis path
+      as CROSS-VERIFY-02. Trading NOT blocked (operator-locked).
+
+  # -----------------------------------------------------------------------
+  # Pre-existing variants missing triage rules (surfaced by PR #1 meta-guard)
+  # TODO: future PRs may add per-variant fan-out — these are baseline entries.
+  # -----------------------------------------------------------------------
+
+  - name: prev-oi-01-cache-empty-at-boot-escalate
+    match:
+      code: PREVOI-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-1-error-codes.md
+    confidence: 0.9
+    cooldown_secs: 0
+    justification: >-
+      PREVOI-01 = boot-time prev_oi cache empty. Severity::Medium —
+      visibility WARN gated once-per-process per Wave-4 charter Rule 11
+      "no false-OK signals". OI Change columns on /api/movers compute
+      misleading values until PR #452 (8:15 AM ready boot orchestrator)
+      lands. Escalate so operator knows.
+
+  - name: prev-close-04-cache-empty-at-boot-escalate
+    match:
+      code: PREVCLOSE-04
+    action: escalate
+    runbook_path: .claude/rules/project/wave-1-error-codes.md
+    confidence: 0.9
+    cooldown_secs: 0
+    justification: >-
+      PREVCLOSE-04 = F2 PrevDayCache boot loader degraded. Severity::Medium.
+      QuestDB previous_close table empty or unreachable at boot.
+      Cascade seal-time pct-stamping path falls back to 0.0 for the 3
+      % fields. No tick dropped. Operator inspects QuestDB health +
+      previous_close row count for last 7 trading days.
+
+  - name: boundary-01-catchup-seal-escalate
+    match:
+      code: BOUNDARY-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-6-error-codes.md
+    confidence: 0.9
+    cooldown_secs: 60
+    justification: >-
+      BOUNDARY-01 = missed-boundary catch-up seal fired. Severity::Medium.
+      One or more minute boundaries skipped (OS scheduler preemption,
+      clock slew, or slow consumer). The catch-up walks forward and
+      seals each missed bucket with the in-cell state. Repeated firing
+      within a single minute window indicates wall-clock instability.
+
+  - name: resilience-01-dual-instance-detected-escalate
+    match:
+      code: RESILIENCE-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-4-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      RESILIENCE-01 = dual-instance detected. Severity::Critical. Two
+      tickvault instances running against the same Dhan client_id will
+      fight over static-IP enforcement and fragment the WebSocket
+      connection budget. Operator inspects live_instance_lock table
+      and stops one of the instances immediately.
+
+  # -----------------------------------------------------------------------
+  # Fan-out rules for high-frequency codes — bring rule_count up to
+  # >= variant_count per `triage_rules_full_coverage_guard.rs::rule_count_matches_or_exceeds_variant_count`.
+  # Each fan-out has a different `message_substring` for finer-grained
+  # auto-triage decisions on the same underlying ErrorCode.
+  # -----------------------------------------------------------------------
+
+  - name: dh904-rate-limit-during-option-chain-cycle-escalate
+    match:
+      code: DH-904
+      message_substring: "option_chain"
+    action: escalate
+    runbook_path: .claude/rules/dhan/api-introduction.md
+    confidence: 0.95
+    cooldown_secs: 30
+    justification: >-
+      DH-904 fan-out: rate-limit hit during option_chain 50s cycle.
+      Distinguishes from order-API DH-904 (different runbook).
+      Severity::High — option chain may not refresh; strategy may
+      fail-closed if cache age exceeds 60s.
+
+  - name: dh904-rate-limit-during-historical-fetch-escalate
+    match:
+      code: DH-904
+      message_substring: "charts/intraday"
+    action: escalate
+    runbook_path: .claude/rules/dhan/api-introduction.md
+    confidence: 0.95
+    cooldown_secs: 60
+    justification: >-
+      DH-904 fan-out: rate-limit hit during cross-verify intraday
+      fetch at 15:31 IST. Different impact than option-chain DH-904 —
+      cross-verify is daily, not 50s cycle. CROSS-VERIFY-02 fires
+      next.
+
+  - name: oms-gap-state-machine-during-place-escalate
+    match:
+      code: OMS-GAP-01
+      message_substring: "place_order"
+    action: escalate
+    runbook_path: .claude/rules/project/gap-enforcement.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      OMS-GAP-01 fan-out: state machine violated during order placement.
+      Severity::High. Phase 1.5 wiring; once live trading enables,
+      a state machine violation is operator-critical.
+
+  - name: audit-01-phase2-write-failed-during-1531-escalate
+    match:
+      code: AUDIT-01
+      message_substring: "15:31"
+    action: escalate
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 0.9
+    cooldown_secs: 60
+    justification: >-
+      AUDIT-01 fan-out: Phase 2 audit write failed during 15:31 IST
+      cross-verify run. Indicates QuestDB unreachable during the
+      daily integrity gate.
+
+  - name: ws-gap-04-post-close-sleep-friday-escalate
+    match:
+      code: WS-GAP-04
+      message_substring: "Friday"
+    action: silence
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      WS-GAP-04 fan-out: post-close sleep entered on Friday. Expected
+      behavior — next wake is Monday market open (65h dormant).
+      Operator-visible but not actionable; silenced from Telegram.
+
+  - name: tick-gap-summary-during-market-open-burst-escalate
+    match:
+      code: WS-GAP-06
+      message_substring: "09:15"
+    action: escalate
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 0.9
+    cooldown_secs: 30
+    justification: >-
+      WS-GAP-06 fan-out: tick-gap summary during 09:15 market-open
+      burst window. Distinguishes from mid-day silent socket — the
+      09:15 burst is high-volume so silence here is more alarming.
+
+  - name: storage-gap-03-audit-write-failed-during-cross-verify-escalate
+    match:
+      code: STORAGE-GAP-03
+      message_substring: "cross_verify"
+    action: escalate
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 0.95
+    cooldown_secs: 60
+    justification: >-
+      STORAGE-GAP-03 fan-out: audit-table write failed during cross-verify
+      run. Cross-verify integrity record cannot be persisted —
+      operator must manually re-run verify after QuestDB recovers.
+
+  - name: aggregator-drop-01-sealed-candle-lost-escalate
+    match:
+      code: AGGREGATOR-DROP-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-6-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      AGGREGATOR-DROP-01 = sealed candle dropped after ring + spill +
+      DLQ all failed. Severity::Critical. By definition host is out
+      of memory AND out of disk AND data/dlq/ unwritable — catastrophic.
+      Operator runs mcp__tickvault-logs__docker_status, df -h /data,
+      ls -la data/spill/ data/dlq/. Restart after remediation.
+
+  - name: aggregator-late-01-tick-discarded-escalate
+    match:
+      code: AGGREGATOR-LATE-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-6-error-codes.md
+    confidence: 0.9
+    cooldown_secs: 60
+    justification: >-
+      AGGREGATOR-LATE-01 = tick arrived after its bucket sealed.
+      Severity::High. Discarded by aggregator. Sustained > 1/sec
+      indicates clock drift or slow consumer keeping ticks in
+      pipeline channel longer than boundary period.
+
+  - name: aggregator-seal-01-ilp-failed-ring-caught-escalate
+    match:
+      code: AGGREGATOR-SEAL-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-6-error-codes.md
+    confidence: 0.95
+    cooldown_secs: 60
+    justification: >-
+      AGGREGATOR-SEAL-01 = seal-time ILP write to shadow table failed;
+      ring buffer caught the row. Severity::Medium. Data NOT lost.
+      Telegram alerts operator. Inspect QuestDB ILP health.
+
+  - name: aggregator-hb-01-heartbeat-silence
+    match:
+      code: AGGREGATOR-HB-01
+    action: silence
+    runbook_path: .claude/rules/project/wave-6-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      AGGREGATOR-HB-01 = per-minute seal-burst heartbeat (positive signal).
+      Severity::Info. Operational lifecycle ping — no Telegram. Available
+      in CloudWatch Logs for audit.
+
+  - name: aggregator-audit-01-write-failed-escalate
+    match:
+      code: AGGREGATOR-AUDIT-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-6-error-codes.md
+    confidence: 0.95
+    cooldown_secs: 60
+    justification: >-
+      AGGREGATOR-AUDIT-01 = aggregator_seal_audit write failed.
+      Severity::Medium. SEBI-relevant forensic record loss; surface
+      immediately. Same triage as AUDIT-01 — check QuestDB ILP TCP
+      port + disk-full state.
+
+  - name: orphan-position-01-detected-escalate
+    match:
+      code: ORPHAN-POSITION-01
+    action: escalate
+    runbook_path: .claude/rules/project/phase-0-item-20-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      ORPHAN-POSITION-01 = open position observed at 15:25 IST.
+      Severity::Critical. Overnight derivative position exposes
+      account to gap risk. Phase 0 = dry-run alert; Phase 1+ = auto
+      cancel-and-exit. Operator MUST verify each exit before 15:30
+      NSE close.
+
+  - name: bar-mismatch-01-corrected-from-historical-escalate
+    match:
+      code: BAR-MISMATCH-01
+    action: escalate
+    runbook_path: .claude/rules/project/phase-0-items-15-28-29-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      BAR-MISMATCH-01 = 09:15 bar(s) corrected from Dhan REST.
+      Severity::Critical. Post-open cross-check found mismatched
+      09:15 1m bars; Dhan's authoritative values written to
+      candles_1m_shadow + historical_candles + bar_correction_audit.
+      Operator confirms top 10 mismatches manually against Dhan
+      TradingView chart.
+
+  - name: bar-mismatch-02-cross-check-inconclusive-escalate
+    match:
+      code: BAR-MISMATCH-02
+    action: escalate
+    runbook_path: .claude/rules/project/phase-0-items-15-28-29-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      BAR-MISMATCH-02 = cross-check inconclusive (low coverage).
+      Severity::Critical. Dhan REST returned valid data for < 200 of
+      222 SIDs. Strategy gate stays CLOSED for the trading day.
+      Fail-closed by design.
+
+  - name: bar-mismatch-03-cross-check-failed-escalate
+    match:
+      code: BAR-MISMATCH-03
+    action: escalate
+    runbook_path: .claude/rules/project/phase-0-items-15-28-29-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      BAR-MISMATCH-03 = cross-check hard-failed. Severity::Critical.
+      All 222 Dhan REST fetches errored. Strategy gate stays CLOSED.
+      Operator runs mcp__tickvault-logs__tail_errors for DH-* codes;
+      check token validity (DH-901) or rate-limit ladder (DH-904).
+
+  - name: gap-fill-01-scheduler-failed-escalate
+    match:
+      code: GAP-FILL-01
+    action: escalate
+    runbook_path: .claude/rules/project/phase-0-gap-fill-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      GAP-FILL-01 = scheduler supervisor caught panic / channel closed.
+      Severity::Critical. Bounded-zero-loss envelope breached until
+      supervisor respawns inner task. Post-market cross_verify is the
+      L3 safety net.
+
+  - name: gap-fill-02-rest-fetch-failed-escalate
+    match:
+      code: GAP-FILL-02
+    action: escalate
+    runbook_path: .claude/rules/project/phase-0-gap-fill-error-codes.md
+    confidence: 0.9
+    cooldown_secs: 60
+    justification: >-
+      GAP-FILL-02 = per-bar REST fetch failed after all retries.
+      Severity::High. Audit row written with result=failed. Operator
+      decides whether to backfill manually via bhavcopy EOD
+      reconciliation.
+
+  - name: gap-fill-03-upsert-failed-escalate
+    match:
+      code: GAP-FILL-03
+    action: escalate
+    runbook_path: .claude/rules/project/phase-0-gap-fill-error-codes.md
+    confidence: 0.9
+    cooldown_secs: 60
+    justification: >-
+      GAP-FILL-03 = QuestDB UPSERT failed after successful REST fetch.
+      Severity::High. Audit row reflects REST success but QuestDB row
+      NOT written. Rescue-ring writer retries on next flush.
+
+  - name: gap-fill-04-event-channel-lagged-escalate
+    match:
+      code: GAP-FILL-04
+    action: escalate
+    runbook_path: .claude/rules/project/phase-0-gap-fill-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      GAP-FILL-04 = broadcast receiver lagged; disconnect events dropped.
+      Severity::Critical. Up to N outages may have been missed
+      entirely. Scheduler runs full reconciliation pass with
+      trigger_event=scheduler_catchup.
