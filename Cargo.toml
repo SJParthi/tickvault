@@ -28,7 +28,7 @@ enum_dispatch = "0.3.13"
 
 # ---- Section 3: Data Pipeline ----
 papaya = "0.2.4"
-dashmap = "6.1.0"
+dashmap = "6.2.1"
 crossbeam-channel = "0.5.15"
 rtrb = "0.3.4"
 ringbuf = "0.4.8"
