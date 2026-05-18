@@ -46,3 +46,9 @@ pub mod gap_fill_planner;
 // missing 1m bars, and emits Prometheus counters. PR-D adds REST fetch
 // + `historical_candles` UPSERT.
 pub mod gap_fill_scheduler;
+
+// Phase 0 Item 15 (2026-05-18) — 09:16:05 IST post-open cross-check
+// primitives. Pure-function comparator + clock helpers + outcome
+// types. Scheduler wiring (REST fan-out + audit writes + strategy
+// gate) lands in sub-deliverable 4. See plan §785.
+pub mod post_open_cross_check;
