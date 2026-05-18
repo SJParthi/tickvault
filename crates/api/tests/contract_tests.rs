@@ -48,7 +48,6 @@ fn test_state() -> SharedAppState {
             build_window_end: "08:55:00".to_string(),
         },
         Arc::new(RwLock::new(None)),
-        Arc::new(RwLock::new(None)),
         Arc::new(SystemHealthStatus::new()),
     )
 }

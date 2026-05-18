@@ -8,8 +8,6 @@ const QUESTDB_HTTP_CLIENT_TIMEOUT_SECS: u64 = 10;
 
 use tickvault_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 use tickvault_common::instrument_types::IndexConstituencyMap;
-use tickvault_core::pipeline::top_movers::SharedTopMoversSnapshot;
-use tickvault_trading::candles::CascadeFanout;
 
 /// Shared handle to the index constituency map (Arc<RwLock<Option<...>>>).
 pub type SharedConstituencyMap = Arc<RwLock<Option<IndexConstituencyMap>>>;
@@ -252,6 +250,10 @@ pub struct SharedAppState {
     inner: Arc<AppStateInner>,
 }
 
+// PR #2 (2026-05-18): movers pipeline retired. `top_movers_snapshot`,
+// `cascade_fanout`, and `new_with_cascade_fanout()` constructor were
+// removed alongside the deleted `/api/movers/v2` route + the
+// `top_movers` / `option_movers` core modules.
 struct AppStateInner {
     /// QuestDB config for SQL queries (stats endpoint) and instrument persistence.
     questdb_config: QuestDbConfig,
@@ -261,11 +263,6 @@ struct AppStateInner {
     instrument_config: InstrumentConfig,
     /// Concurrency guard: prevents concurrent instrument rebuilds.
     rebuild_in_progress: AtomicBool,
-    /// Shared top movers snapshot from the tick pipeline.
-    top_movers_snapshot: SharedTopMoversSnapshot,
-    // PR #450 commit 6 (2026-05-03): movers_snapshot_v2 field DELETED.
-    // The legacy /api/movers (V2) handler + in-memory tracker are gone.
-    // The new unified /api/movers handler reads QuestDB SQL directly.
     /// Shared index constituency map.
     constituency_map: SharedConstituencyMap,
     /// Subsystem health status for the `/health` endpoint.
@@ -273,13 +270,6 @@ struct AppStateInner {
     /// Shared HTTP client for QuestDB queries (connection pooling + keep-alive).
     /// Reused across all handler invocations instead of creating per-request.
     questdb_http_client: reqwest::Client,
-    /// Phase 4a (2026-05-05) — DORMANT BY DEFAULT. The 29-TF in-RAM
-    /// `CascadeFanout` handle, set by main.rs ONLY when
-    /// `config.api.movers_v2_enabled == true`. When `None`, the
-    /// `/api/movers?v=2` route is NOT registered (route gating
-    /// happens in `lib.rs`). When `Some`, the v2 handler reads OHLCV
-    /// from RAM via the 28 read accessors per active-plan §6 row 3.
-    cascade_fanout: Option<Arc<CascadeFanout>>,
 }
 
 impl SharedAppState {
@@ -288,7 +278,6 @@ impl SharedAppState {
         questdb_config: QuestDbConfig,
         dhan_config: DhanConfig,
         instrument_config: InstrumentConfig,
-        top_movers_snapshot: SharedTopMoversSnapshot,
         constituency_map: SharedConstituencyMap,
         health_status: SharedHealthStatus,
     ) -> Self {
@@ -307,72 +296,12 @@ impl SharedAppState {
                 dhan_config,
                 instrument_config,
                 rebuild_in_progress: AtomicBool::new(false),
-                top_movers_snapshot,
                 constituency_map,
                 health_status,
                 questdb_http_client,
-                cascade_fanout: None,
             }),
         }
     }
-
-    /// Phase 4a constructor — variant of `new()` that ALSO installs
-    /// the 29-TF `CascadeFanout` handle so the dormant
-    /// `/api/movers?v=2` handler can read OHLCV from RAM instead of
-    /// QuestDB matviews. Called by main.rs ONLY when
-    /// `config.api.movers_v2_enabled == true`. When the flag is
-    /// `false`, the regular `new()` is used and `cascade_fanout()`
-    /// returns `None`, which causes `lib.rs` to skip the v2 route
-    /// registration entirely.
-    // 7 args matches the existing `new()` plus the Phase 4a
-    // optional CascadeFanout. Refactoring into a builder would
-    // require touching every call site; the symmetry between
-    // `new()` and `new_with_cascade_fanout()` keeps the boot wiring
-    // legible.
-    // APPROVED: parallels `new()` arg shape; builder rewrite blocked on Phase 4b cleanup.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_cascade_fanout(
-        questdb_config: QuestDbConfig,
-        dhan_config: DhanConfig,
-        instrument_config: InstrumentConfig,
-        top_movers_snapshot: SharedTopMoversSnapshot,
-        constituency_map: SharedConstituencyMap,
-        health_status: SharedHealthStatus,
-        cascade_fanout: Arc<CascadeFanout>,
-    ) -> Self {
-        let questdb_http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(
-                QUESTDB_HTTP_CLIENT_TIMEOUT_SECS,
-            ))
-            .pool_max_idle_per_host(4)
-            .build()
-            .unwrap_or_default();
-        Self {
-            inner: Arc::new(AppStateInner {
-                questdb_config,
-                dhan_config,
-                instrument_config,
-                rebuild_in_progress: AtomicBool::new(false),
-                top_movers_snapshot,
-                constituency_map,
-                health_status,
-                questdb_http_client,
-                cascade_fanout: Some(cascade_fanout),
-            }),
-        }
-    }
-
-    /// Returns the 29-TF `CascadeFanout` handle if Phase 4a is
-    /// enabled. Used by the v2 movers handler + by `lib.rs` to gate
-    /// route registration.
-    pub fn cascade_fanout(&self) -> Option<&Arc<CascadeFanout>> {
-        self.inner.cascade_fanout.as_ref()
-    }
-
-    // PR #450 commit 6 (2026-05-03): with_movers_snapshot_v2 builder
-    // DELETED. The legacy /api/movers (V2) handler is gone — boot
-    // no longer needs to plumb a V2 snapshot handle into the api
-    // state.
 
     /// Returns the QuestDB config for making SQL queries.
     pub fn questdb_config(&self) -> &QuestDbConfig {
@@ -399,14 +328,6 @@ impl SharedAppState {
     pub fn rebuild_in_progress(&self) -> &AtomicBool {
         &self.inner.rebuild_in_progress
     }
-
-    /// Returns the shared top movers snapshot handle.
-    pub fn top_movers_snapshot(&self) -> &SharedTopMoversSnapshot {
-        &self.inner.top_movers_snapshot
-    }
-
-    // PR #450 commit 6 (2026-05-03): movers_snapshot_v2() accessor
-    // DELETED. The new unified /api/movers handler reads QuestDB SQL.
 
     /// Returns the shared index constituency map handle.
     pub fn constituency_map(&self) -> &SharedConstituencyMap {
@@ -451,9 +372,8 @@ mod tests {
         }
     }
 
-    fn empty_snapshot() -> SharedTopMoversSnapshot {
-        std::sync::Arc::new(std::sync::RwLock::new(None))
-    }
+    // PR #2 (2026-05-18): empty_snapshot() helper retired alongside
+    // the deleted SharedTopMoversSnapshot type.
 
     fn empty_constituency() -> SharedConstituencyMap {
         std::sync::Arc::new(std::sync::RwLock::new(None))
@@ -475,7 +395,6 @@ mod tests {
             config,
             test_dhan_config(),
             test_instrument_config(),
-            empty_snapshot(),
             empty_constituency(),
             test_health_status(),
         );
@@ -498,7 +417,6 @@ mod tests {
             config,
             test_dhan_config(),
             test_instrument_config(),
-            empty_snapshot(),
             empty_constituency(),
             test_health_status(),
         );
@@ -645,7 +563,6 @@ mod tests {
             },
             test_dhan_config(),
             test_instrument_config(),
-            empty_snapshot(),
             empty_constituency(),
             test_health_status(),
         );
@@ -664,7 +581,6 @@ mod tests {
             },
             test_dhan_config(),
             test_instrument_config(),
-            empty_snapshot(),
             empty_constituency(),
             test_health_status(),
         );
@@ -682,7 +598,6 @@ mod tests {
             },
             test_dhan_config(),
             test_instrument_config(),
-            empty_snapshot(),
             empty_constituency(),
             test_health_status(),
         );
@@ -709,7 +624,6 @@ mod tests {
             },
             test_dhan_config(),
             test_instrument_config(),
-            empty_snapshot(),
             empty_constituency(),
             health,
         );
@@ -717,24 +631,9 @@ mod tests {
         assert_eq!(state.health_status().websocket_connections(), 2);
     }
 
-    #[test]
-    fn test_shared_app_state_top_movers_snapshot_accessor() {
-        let state = SharedAppState::new(
-            QuestDbConfig {
-                host: "test".to_string(),
-                http_port: 9000,
-                pg_port: 8812,
-                ilp_port: 9009,
-            },
-            test_dhan_config(),
-            test_instrument_config(),
-            empty_snapshot(),
-            empty_constituency(),
-            test_health_status(),
-        );
-        let snapshot = state.top_movers_snapshot();
-        assert!(snapshot.read().unwrap().is_none());
-    }
+    // PR #2 (2026-05-18): test_shared_app_state_top_movers_snapshot_accessor
+    // removed alongside the deleted accessor and the SharedTopMoversSnapshot
+    // type.
 
     #[test]
     fn test_shared_app_state_constituency_map_accessor() {
@@ -747,7 +646,6 @@ mod tests {
             },
             test_dhan_config(),
             test_instrument_config(),
-            empty_snapshot(),
             empty_constituency(),
             test_health_status(),
         );

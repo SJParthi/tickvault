@@ -1485,8 +1485,8 @@ async fn main() -> Result<()> {
         let shutdown_notify = std::sync::Arc::new(tokio::sync::Notify::new());
 
         // --- Tick processor: start BEFORE WS connections spawn ---
-        let shared_movers: tickvault_core::pipeline::SharedTopMoversSnapshot =
-            std::sync::Arc::new(std::sync::RwLock::new(None));
+        // PR #2 (2026-05-18): `shared_movers` snapshot retired alongside
+        // the deleted `top_movers` / `option_movers` modules.
 
         // Tick broadcast for trading pipeline (cold path consumer).
         // A2: Use constant capacity (65536) to absorb high-volatility bursts without lagging.
@@ -1516,8 +1516,6 @@ async fn main() -> Result<()> {
 
         let processor_handle = if let Some(receiver) = pool_receiver {
             let candle_agg = Some(tickvault_core::pipeline::CandleAggregator::new());
-            let movers = Some(tickvault_core::pipeline::TopMoversTracker::new());
-            let snapshot_handle = Some(shared_movers.clone());
             let tick_broadcast_for_processor = Some(fast_tick_broadcast_sender.clone());
 
             // Parthiban directive (2026-04-21): no-tick-during-market-hours
@@ -1556,6 +1554,7 @@ async fn main() -> Result<()> {
                 ),
             );
 
+            let _ = fast_registry; // PR #2: instrument_registry was used by deleted movers persistence helpers
             let handle = tokio::spawn(async move {
                 run_tick_processor(
                     receiver,
@@ -1564,16 +1563,7 @@ async fn main() -> Result<()> {
                     tick_broadcast_for_processor,
                     candle_agg,
                     None, // live_candle_writer — QuestDB reconnects in background
-                    movers,
-                    snapshot_handle,
                     greeks_enricher,
-                    // 2026-05-09 PR 5c.5-final: movers infrastructure
-                    // RETIRED — `movers_1s` base + 25 matviews dropped,
-                    // `MoversWriter` / `movers_pipeline` deleted.
-                    // Operator directive: "only ticks and our 9 needed
-                    // candle timeframes are available".
-                    None, // option_movers — created in slow boot only
-                    fast_registry,
                     Some(fast_tick_heartbeat),
                     None, // tick_enricher — Phase 2.5 wiring deferred until prev_oi_cache + boot ordering gate land in slow boot
                 )
@@ -2237,7 +2227,6 @@ async fn main() -> Result<()> {
             config.questdb.clone(),
             config.dhan.clone(),
             config.instrument.clone(),
-            shared_movers.clone(),
             bg_shared_constituency,
             health_status,
         );
@@ -2320,7 +2309,6 @@ async fn main() -> Result<()> {
             otel_provider,
             &notifier,
             &config,
-            shared_movers,
             post_market_signal,
             ws_pool_arc,
             shutdown_notify,
@@ -3725,8 +3713,8 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 9: Spawn tick processor FIRST (before WS connections send frames)
     // -----------------------------------------------------------------------
-    let shared_movers: tickvault_core::pipeline::SharedTopMoversSnapshot =
-        std::sync::Arc::new(std::sync::RwLock::new(None));
+    // PR #2 (2026-05-18): `shared_movers` snapshot retired alongside
+    // the deleted `top_movers` / `option_movers` modules.
 
     // Tick broadcast: fan-out parsed ticks to the trading pipeline (cold path consumer).
     // A2: Use constant capacity (65536) to absorb bursts without lagging cold-path consumers.
@@ -3880,19 +3868,14 @@ async fn main() -> Result<()> {
                     None
                 }
             };
-        let movers = Some(tickvault_core::pipeline::TopMoversTracker::new());
-        let snapshot_handle = Some(shared_movers.clone());
+        // PR #2 (2026-05-18): TopMoversTracker / OptionMoversTracker
+        // / shared_movers snapshot retired alongside the deleted movers
+        // pipeline. Under the 4-IDX_I-only universe a top-N gainers/
+        // losers/most-active snapshot is meaningless.
         let tick_broadcast_for_processor = Some(tick_broadcast_sender.clone());
 
         // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
         let greeks_enricher = build_inline_greeks_enricher(&config, &subscription_plan);
-
-        // 2026-05-09 PR 5c.5-final: movers infrastructure RETIRED.
-        // `MoversWriter` / `movers_pipeline` / `movers_base_persistence`
-        // modules deleted. The in-memory `OptionMoversTracker` /
-        // `TopMoversTracker` are unaffected — they feed the depth-
-        // dynamic cohort selector via `Bar` snapshots, not QuestDB.
-        let option_movers_tracker = Some(tickvault_core::pipeline::OptionMoversTracker::new());
 
         // O(1) EXEMPT: cold path — clone registry once for tick processor enrichment.
         let slow_registry = subscription_plan
@@ -4708,6 +4691,7 @@ async fn main() -> Result<()> {
              5min poll for fresh-deploy / matview-catchup recovery)"
         );
 
+        let _ = slow_registry; // PR #2: instrument_registry was used by deleted movers persistence helpers
         let handle = tokio::spawn(async move {
             run_tick_processor(
                 receiver,
@@ -4716,11 +4700,7 @@ async fn main() -> Result<()> {
                 tick_broadcast_for_processor,
                 candle_agg,
                 live_candle_writer,
-                movers,
-                snapshot_handle,
                 greeks_enricher,
-                option_movers_tracker,
-                slow_registry,
                 Some(slow_tick_heartbeat),
                 // 29-tf engine Phase 2.6 — production-attach the
                 // lifecycle enricher. The prev_oi_cache was loaded
@@ -4734,9 +4714,7 @@ async fn main() -> Result<()> {
             )
             .await;
         });
-        info!(
-            "tick processor started (with candle aggregation + top movers + option movers + trading broadcast)"
-        );
+        info!("tick processor started (with candle aggregation + trading broadcast)");
         // Phase 2.12 (hostile L1 fix): boot-mode gauge for slow boot.
         // value=1 indicates the lifecycle enricher is attached and the
         // 4 ticks-table lifecycle columns will be populated this
@@ -6765,52 +6743,17 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 11: Start axum API server
     // -----------------------------------------------------------------------
-    // Phase 4a (2026-05-05) — DORMANT BY DEFAULT (active-plan §6 row 3).
-    // When `config.api.movers_v2_enabled` is `true` AND the cascade
-    // fanout was constructed earlier in slow-boot, install the fanout
-    // handle on AppState so the v2 movers route can be registered by
-    // `build_router_with_auth`. Default flag is `false`, so this branch
-    // is normally skipped and the v2 endpoint stays unregistered.
-    let api_state = if config.api.movers_v2_enabled {
-        // Hostile review M1 fix (2026-05-05): elevated to `warn!` so
-        // the operator sees an explicit signal in the audit trail
-        // every time the dormant flag is flipped on. `error!` would
-        // page Telegram on every boot which is too aggressive for a
-        // valid operator-driven flag flip; `warn!` strikes the right
-        // balance — visible in errors.log + summary.md but does not
-        // route to Telegram unless coalesced.
-        warn!(
-            phase4a_movers_v2_enabled = true,
-            "Phase 4a movers_v2_enabled = true — installing CascadeFanout \
-             on AppState. The /api/movers/v2 route will be registered. \
-             Operator MUST have cleared the 14-day RAM=DB parity soak \
-             (active-plan §6 row 3) before flipping this flag. If you \
-             see this without having cleared the soak gate, set \
-             config.api.movers_v2_enabled = false and restart."
-        );
-        SharedAppState::new_with_cascade_fanout(
-            config.questdb.clone(),
-            config.dhan.clone(),
-            config.instrument.clone(),
-            shared_movers.clone(),
-            shared_constituency.clone(),
-            health_status,
-            std::sync::Arc::new(cascade_fanout.clone()),
-        )
-    } else {
-        SharedAppState::new(
-            config.questdb.clone(),
-            config.dhan.clone(),
-            config.instrument.clone(),
-            shared_movers.clone(),
-            shared_constituency.clone(),
-            health_status,
-        )
-    };
-
-    // PR #450 commit 6 (2026-05-03): V2 snapshot api_state plumbing
-    // DELETED. The new unified /api/movers handler reads QuestDB
-    // SQL directly — no in-memory snapshot needed.
+    // PR #2 (2026-05-18): the Phase 4a `movers_v2_enabled` gate and
+    // the `new_with_cascade_fanout` constructor were removed alongside
+    // the deleted `/api/movers/v2` route. AppState is constructed
+    // unconditionally via `new()`.
+    let api_state = SharedAppState::new(
+        config.questdb.clone(),
+        config.dhan.clone(),
+        config.instrument.clone(),
+        shared_constituency.clone(),
+        health_status,
+    );
 
     // 2026-04-25 security audit (PR #357): API bearer token sourced from AWS
     // SSM Parameter Store ONLY — `/tickvault/<env>/api/bearer-token`. Same
@@ -7149,7 +7092,6 @@ async fn main() -> Result<()> {
         otel_provider,
         &notifier,
         &config,
-        shared_movers,
         post_market_signal,
         ws_pool_arc,
         shutdown_notify,
@@ -8767,7 +8709,6 @@ async fn run_shutdown_fast(
     otel_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
     notifier: &std::sync::Arc<NotificationService>,
     config: &ApplicationConfig,
-    shared_movers: tickvault_core::pipeline::SharedTopMoversSnapshot,
     post_market_signal: std::sync::Arc<tokio::sync::Notify>,
     // S4-T1b: shared pool handle + shutdown notifier. `ws_pool_arc` is
     // None when no WebSocket pool was spawned (e.g., historical-replay
@@ -8987,7 +8928,6 @@ async fn run_shutdown_fast(
 
     // 7. Flush OpenTelemetry.
     drop(otel_provider);
-    drop(shared_movers);
 
     info!("tickvault stopped");
     Ok(())

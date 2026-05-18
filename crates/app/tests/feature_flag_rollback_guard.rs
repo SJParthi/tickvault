@@ -48,18 +48,17 @@ use tickvault_common::config::{ApplicationConfig, FeaturesConfig};
 /// `depth_dynamic_pipeline_v2`, `historical_fetch_enabled` (back up
 /// to 16) without updating this list — pre-existing drift that
 /// blocked the build when the test harness compiled this file.
-const EXPECTED_FLAGS: [&str; 16] = [
+// PR #2 (2026-05-18): `stock_movers_full_universe` + `option_movers_5s`
+// retired alongside the deleted movers pipeline; count is now 14.
+const EXPECTED_FLAGS: [&str; 14] = [
     "hotpath_async_writers",
     "phase2_emit_guard",
-    "stock_movers_full_universe",
-    "option_movers_5s",
     "previous_close_persist",
     "ws_main_sleep_until_open",
     "ws_depth_ou_sleep_until_open",
     "fast_boot_60s_deadline",
     "tick_gap_detector_60s_coalesce",
     "audit_tables_enabled",
-    // "preopen_movers" retired 2026-05-03 (functionality folded into movers_1s.phase).
     "telegram_bucket_coalescer",
     "market_open_self_test",
     "realtime_guarantee_score",
@@ -136,50 +135,9 @@ fn test_phase2_emit_guard_default_is_safe() {
     assert_default_is_true(|c| c.phase2_emit_guard, "phase2_emit_guard");
 }
 
-// ---------------------------------------------------------------------------
-// Item 2 — stock_movers_full_universe
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_stock_movers_full_universe_off_disables_path() {
-    let cfg = parse_features("stock_movers_full_universe = false");
-    assert!(!cfg.stock_movers_full_universe);
-}
-
-#[test]
-fn test_stock_movers_full_universe_on_enables_path() {
-    let cfg = parse_features("stock_movers_full_universe = true");
-    assert!(cfg.stock_movers_full_universe);
-}
-
-#[test]
-fn test_stock_movers_full_universe_default_is_safe() {
-    assert_default_is_true(
-        |c| c.stock_movers_full_universe,
-        "stock_movers_full_universe",
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Item 3 — option_movers_5s
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_option_movers_5s_off_disables_path() {
-    let cfg = parse_features("option_movers_5s = false");
-    assert!(!cfg.option_movers_5s);
-}
-
-#[test]
-fn test_option_movers_5s_on_enables_path() {
-    let cfg = parse_features("option_movers_5s = true");
-    assert!(cfg.option_movers_5s);
-}
-
-#[test]
-fn test_option_movers_5s_default_is_safe() {
-    assert_default_is_true(|c| c.option_movers_5s, "option_movers_5s");
-}
+// PR #2 (2026-05-18): Item 2 (stock_movers_full_universe) and Item 3
+// (option_movers_5s) test blocks retired alongside the deleted movers
+// pipeline.
 
 // ---------------------------------------------------------------------------
 // Item 4 — previous_close_persist
@@ -399,8 +357,8 @@ fn test_all_features_default_to_true_no_silent_drift() {
     let d = FeaturesConfig::default();
     assert!(d.hotpath_async_writers);
     assert!(d.phase2_emit_guard);
-    assert!(d.stock_movers_full_universe);
-    assert!(d.option_movers_5s);
+    // PR #2 (2026-05-18): stock_movers_full_universe + option_movers_5s
+    // assertions removed alongside the deleted flags.
     assert!(d.previous_close_persist);
     assert!(d.ws_main_sleep_until_open);
     assert!(d.ws_depth_ou_sleep_until_open);
@@ -515,15 +473,14 @@ fn test_config_base_toml_lists_every_feature_flag() {
     for flag in [
         "hotpath_async_writers",
         "phase2_emit_guard",
-        "stock_movers_full_universe",
-        "option_movers_5s",
+        // PR #2 (2026-05-18): stock_movers_full_universe + option_movers_5s
+        // retired alongside the deleted movers pipeline.
         "previous_close_persist",
         "ws_main_sleep_until_open",
         "ws_depth_ou_sleep_until_open",
         "fast_boot_60s_deadline",
         "tick_gap_detector_60s_coalesce",
         "audit_tables_enabled",
-        // "preopen_movers" retired 2026-05-03 — folded into movers_1s.phase.
         "telegram_bucket_coalescer",
         "market_open_self_test",
         "realtime_guarantee_score",

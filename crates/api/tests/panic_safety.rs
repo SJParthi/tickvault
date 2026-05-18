@@ -56,9 +56,8 @@ fn test_instrument_config() -> InstrumentConfig {
     }
 }
 
-fn empty_snapshot() -> tickvault_core::pipeline::top_movers::SharedTopMoversSnapshot {
-    Arc::new(RwLock::new(None))
-}
+// PR #2 (2026-05-18): `empty_snapshot` retired alongside the deleted
+// `SharedTopMoversSnapshot` type.
 
 fn empty_constituency() -> tickvault_api::state::SharedConstituencyMap {
     Arc::new(RwLock::new(None))
@@ -69,7 +68,6 @@ fn make_test_state(questdb: QuestDbConfig) -> SharedAppState {
         questdb,
         test_dhan_config(),
         test_instrument_config(),
-        empty_snapshot(),
         empty_constituency(),
         Arc::new(SystemHealthStatus::new()),
     )
@@ -203,7 +201,6 @@ fn no_panic_shared_app_state_construction() {
     let _ = state.questdb_config();
     let _ = state.dhan_config();
     let _ = state.instrument_config();
-    let _ = state.top_movers_snapshot();
     let _ = state.constituency_map();
 }
 
