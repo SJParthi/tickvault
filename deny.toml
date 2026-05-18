@@ -101,6 +101,20 @@ skip = [
     { crate = "rand_core", reason = "follows rand version split" },
     { crate = "redis", reason = "deadpool-redis may pull different redis version" },
     { crate = "untrusted", reason = "aws-lc-rs 1.16.3 pins untrusted 0.7.x while ring/aws-credential-types use 0.9.x" },
+    # --- aws-lc dual-version while AWS SDK is on rustls 0.23.x + aws-lc-rs 1.16.3 ---
+    # Dependabot bumps `aws-lc-sys 0.40 → 0.41` (PR #686) and
+    # `aws-lc-rs 1.16.3 → 1.17.0` (PR #685) but the AWS SDK suite
+    # (aws-smithy-http-client 1.1.12 → rustls 0.23.40) still pins the
+    # older aws-lc-rs 1.16.3 → aws-lc-sys 0.40.0. Cargo.lock ends up
+    # with TWO versions of each crate, which `multiple-versions = "deny"`
+    # rejects. The dependabot bumps still ship the CVE fixes for new
+    # call sites on our primary TLS path (rustls 0.23.x → webpki 0.103.13);
+    # the AWS SDK transitive copy is on its own quarantined TLS path.
+    # Skip the duplicate-version error here until the AWS SDK suite
+    # bump lands (which will retire the four `RUSTSEC-2026-009*`
+    # ignores above in one sweep — see comments at lines 36-40).
+    { crate = "aws-lc-sys", reason = "dual-version while AWS SDK still pulls aws-lc-rs 1.16.3" },
+    { crate = "aws-lc-rs", reason = "dual-version while AWS SDK pins 1.16.3 transitively" },
     { crate = "serde_spanned", reason = "figment + toml crate version split" },
     { crate = "toml", reason = "figment uses older toml, we pin newer" },
     { crate = "toml_datetime", reason = "follows toml version split" },
