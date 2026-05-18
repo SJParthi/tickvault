@@ -195,40 +195,22 @@ Tickvault writes JSON-structured logs to disk → CloudWatch Logs agent ships to
 
 ---
 
-## §5. The new instance choice — OPERATOR PIVOTED TO t4g.medium 2026-05-18
+## §5. The instance — t4g.medium LOCKED 2026-05-18 (FINAL, NO COMPARISONS)
 
-**Operator lock 2026-05-18:** "why not t4g.medium dude?" — pivoting from t4g.small (which had zero RAM headroom) to **t4g.medium (4GB ARM, 2 vCPU)**. This is the right Z+ choice — 2GB headroom buys safety against OOM, transient memory spikes, and growth.
+**Single spec, no alternatives, no comparison tables:**
 
-**PRICING CORRECTION 2026-05-18:** Operator's AWS console screenshot revealed my earlier research-agent's ap-south-1 multiplier was wrong by 43%. REAL Mumbai t4g.medium = **$0.0224/hr** (not $0.0392). Full corrected table:
+| Spec | Value |
+|---|---|
+| Instance | **t4g.medium** — ARM Graviton, 2 vCPU, 4 GiB RAM |
+| Region | ap-south-1 (Mumbai) |
+| Tenancy | Default (Shared) — Dedicated would add ₹1,500/mo for zero benefit |
+| Pricing | On-demand $0.0224/hr — no Reserved / Savings Plan / Spot for now |
+| Schedule | 08:00–17:00 IST every day Mon–Sun |
+| EBS | gp3 10 GB |
+| EIP | 1 (24/7, Dhan static-IP mandate) |
+| Network | ENA enabled by default |
 
-| Instance | vCPU | RAM | REAL ap-south-1 $/hr | Weekday 9hr×22 ₹/mo (just EC2) |
-|---|---|---|---|---|
-| t4g.nano | 2 | 0.5 GiB | $0.0028 | ₹47 |
-| t4g.micro | 2 | 1 GiB | $0.0056 | ₹94 |
-| t4g.small | 2 | 2 GiB | $0.0112 | ₹189 |
-| **t4g.medium** | **2** | **4 GiB** | **$0.0224** | **₹377** |
-| t4g.large | 2 | 8 GiB | $0.0448 | ₹754 |
-| t4g.xlarge | 4 | 16 GiB | $0.0896 | ₹1,507 |
-
-**Honest cost on REAL pricing:** t4g.medium weekday-only is ~**₹885/mo**, which is **UNDER <₹1K WITH ₹115 HEADROOM**. The operator's pivot is the right call AND under budget. The earlier "₹250 over" claim was based on agent-hallucinated US pricing scaled by an invented multiplier — corrected with the Mumbai console screenshot.
-
-| Option | Cost | Trade-off |
-|---|---|---|
-| **A — t4g.medium weekday-only 9hr/day (LOCKED)** | **₹885/mo** | ✓ Under ₹1K. 2GB RAM headroom. Future-proof for BRUTEX strategy load (see §13). |
-| B — t4g.medium full schedule (incl. weekends) | ₹961/mo | Still under ₹1K. Weekend prep + manual backtesting possible. |
-| C — t4g.large for deep future strategy farm (20+ strategies) | ₹1,262/mo | Over ₹1K. Only if BRUTEX-finalised list grows beyond 10 strategies. Cross this bridge later. |
-
-**Recommendation: LOCK Option A.** Operator can flip to Option B for full schedule at +₹76/mo if weekend prep is wanted.
-
-| Candidate | RAM | Cost full-sched | Cost weekday-only | Fits stack? | Network reliability |
-|---|---|---|---|---|---|
-| t4g.nano (0.5GB) | 0.5 GB | low | very low | NO — QuestDB alone needs >0.5GB | n/a |
-| t4g.micro (1GB) | 1 GB | low | very low | NO — full stack ~1.4GB | n/a |
-| **t4g.small (2GB)** | 2 GB | ~₹1,150/mo | **~₹920/mo** | **YES with 0 headroom** | ap-south-1 99.99% region SLA |
-| t4g.medium (4GB) | 4 GB | ~₹1,380/mo | ~₹1,250/mo | YES with 2GB headroom | same |
-| c7g.medium (1 vCPU, 2GB, non-burstable) | 2 GB | ~₹1,143/mo | ~₹990/mo | YES with 0 headroom; 1 vCPU may be tight | same |
-
-### Cost breakdown — t4g.medium EVERY DAY 9hr (LOCKED 2026-05-18)
+### Cost breakdown — t4g.medium on-demand, every day 08:00–17:00 IST
 
 ```
 EC2 t4g.medium:   $0.0224/hr × 9hr × 30 days × ₹85   = ₹514   ← every day, not just weekday
@@ -816,6 +798,152 @@ When the BRUTEX work lands, add these tests:
 | What gets deleted in the scope reduction? | `.claude/plans/aws-lifecycle/deletion-surface-map.md` |
 | What's the schedule? | this file §1 L11 (08:00/17:00 IST) |
 | Can we hit <₹1K/mo? | `aws-cost-floor-analysis.md` + this file §5 (answer: no, ₹1,168 is the safe floor) |
+
+---
+
+## §15. Market hours + pre-open + open price data (operator question 2026-05-18)
+
+### NSE / BSE market session timing (IST, all in `crates/common/src/trading_calendar.rs`)
+
+| Window | IST | Activity for our 4 SIDs |
+|---|---|---|
+| 08:00 IST | Instance boots, tickvault starts | Step 1-8 boot per §1 L11 |
+| 08:05 IST | **Morning 1d cross-check fires** | §14.2 — yesterday's daily candle verified |
+| 09:00–09:08 IST | **Pre-open session** (order entry, modify, cancel) | We capture pre-open ticks if Dhan emits |
+| 09:08–09:15 IST | **Final pre-open** (order matching, no new entries) | We capture |
+| 09:15:00 IST | **Market opens** — continuous trading begins | Live ticks flow; strategy can arm |
+| 09:15:30 IST | `MarketOpenStreamingConfirmation` Telegram fires | Positive signal — boot+WS healthy |
+| 09:16:30 IST | `SelfTestPassed` Telegram fires | Z+ L1 daily heartbeat |
+| 12:00–12:35 IST | (No lunch break on NSE/BSE since 2010 — continuous) | Continuous |
+| 15:00 IST | Last 30 min: order book aggressively volatile | Strategy may de-risk |
+| 15:30:00 IST | **Market closes** — no new orders matched | Live tick flow stops |
+| 15:31:00 IST | **Daily intraday cross-verify fires** | §14.1 — 16 cross-checks |
+| 15:45 IST | EOD digest Telegram (P&L, order count, alerts) | Operator daily summary |
+| 17:00 IST | Instance auto-stops (EventBridge) | No further activity |
+
+### Pre-open price data capture (existing infra, narrowed to 4 SIDs)
+
+The existing pre-open buffer per `live-market-feed-subscription.md` 2026-04-22 Updates §5 captures 09:00–09:12 IST close prices into an in-RAM `PREOPEN_INDEX_UNDERLYINGS` map. For our 4-SID universe, this captures:
+
+| SID | Symbol | Pre-open data | Used for |
+|---|---|---|---|
+| 13 | NIFTY | yes (IDX_I emits) | Indicator warm-up; first 1m candle accuracy |
+| 25 | BANKNIFTY | yes | Same |
+| 51 | SENSEX | yes | Same |
+| 21 | INDIA VIX | yes | Volatility regime detection |
+
+### Open price data — capturing the 09:15:00 IST open candle precisely
+
+This is the heart of the 15:31 cross-verify check (§14):
+- Our derived `candles_1m[09:15:00–09:15:59]` MUST match Dhan REST `/v2/charts/intraday` interval=1 for the same timestamp
+- Zero tolerance match
+- If mismatch → CROSS-VERIFY-01 Critical Telegram + audit row naming the field that differs (open/high/low/close/volume)
+
+**Without this, we'd never know if we missed the opening tick.** The cross-verify is the proof.
+
+### "Will market hours code still work after the slim-down?"
+
+YES. `crates/common/src/trading_calendar.rs::is_within_market_hours_ist()` is scope-agnostic — it works the same whether we have 4 SIDs or 11,000. KEEP this module.
+
+---
+
+## §16. TOTP — extreme complete automated authentication
+
+Operator question 2026-05-18: *"what about TOTP extreme complete automated authentication?"*
+
+### What exists today (works identically in indices-only scope)
+
+`crates/core/src/auth/token_manager.rs` (KEEP — unchanged by scope reduction):
+
+| Step | Action | Source |
+|---|---|---|
+| Boot Step 3 | Check in-memory token cache (was Valkey — now `Arc<Secret<String>>`) | `token_manager::get_or_refresh()` |
+| If miss / expired | Fetch TOTP secret from AWS SSM `/tickvault/prod/dhan_totp_secret` | `secret_manager::fetch_totp_secret()` |
+| Generate code | `totp-rs` crate, RFC 6238, 6 digits, 30s window | `totp_generator::generate_now()` |
+| Build URL | `POST https://auth.dhan.co/app/generateAccessToken?dhanClientId=...&pin=...&totp=<code>` | `auth::generate_access_token()` |
+| Cache JWT in memory | `Arc<ArcSwap<Secret<String>>>` for lock-free reads | hot-path safe |
+| Schedule renewal | 23h after issue (1h before expiry) | tokio interval task |
+| AUTH-GAP-03 wake | On WS reconnect after sleep, if token < 4h remaining → force-renew BEFORE reconnect attempt | already shipped Wave-2 |
+
+### The TOTP automation chain (zero operator action after bootstrap)
+
+```
+   Operator action ONCE during bootstrap:
+       ─ paste TOTP secret to scripts/aws-bootstrap.sh
+       ─ script writes to AWS SSM /tickvault/prod/dhan_totp_secret as SecureString
+       ─ script exits
+
+   FROM THAT MOMENT FOREVER:
+       ─ Every day at 08:00 IST tickvault boots
+       ─ Boot Step 3 reads SSM, generates TOTP, gets JWT
+       ─ Operator never sees / never touches TOTP again
+       ─ 23h proactive renewal continues automatically
+       ─ Wake-from-sleep force-renewal continues automatically
+```
+
+### Failure modes already covered
+
+| Failure | Detection | Recovery |
+|---|---|---|
+| TOTP secret rotated externally (operator regen via Dhan UI without updating SSM) | DH-901 on auth call | AUTH-GAP-04 ErrorCode → Critical Telegram → operator updates SSM via 1 command, instance restarts |
+| SSM unreachable | timeout | retry 3× with 5s backoff; HALT if persistent |
+| TOTP code rejected (clock skew vs Dhan server) | DH-901 from token endpoint | BOOT-03 clock-skew probe catches this BEFORE auth attempt (already shipped Wave-2-C) |
+| JWT expires mid-session | 24h watchdog | token-manager 23h pre-emptive renewal |
+
+### "Is this extreme complete automation?"
+
+Yes. After bootstrap, operator NEVER manually generates a TOTP code. The system handles:
+- Daily token generation
+- 23h proactive refresh
+- Wake-from-sleep force-refresh
+- Error recovery (cache → SSM → TOTP cascade)
+
+The only manual action is the one-time SSM secret seed during `aws-bootstrap.sh`.
+
+---
+
+## §17. The simple operator promise — "8 AM to 5 PM, no issues, track + log + monitor + alert"
+
+Operator verbatim 2026-05-18: *"starting 8 am till 5 pm without any issues outage reconnect disconnect it should work always track log monitor alert telegrams sms call everything dude okay?"*
+
+### What we promise (plain English, no jargon)
+
+| Operator demand | What we promise | Honest envelope |
+|---|---|---|
+| 08:00–17:00 IST every day | Instance auto-starts at 08:00 IST every day (Mon-Sun), auto-stops at 17:00 IST | If EventBridge fails, operator paged within 7 min via 3-leg SNS + phone call |
+| "No issues" | Boot complete + BootReadyConfirmation Telegram by 08:03 IST | If boot fails by 08:04 IST, alarm fires within 60s, 4-channel notify |
+| "No outage" | Single instance ap-south-1 99.99% region SLA = ~4.3 min/mo expected | If outage > 4 min, alarm fires, operator paged. Beyond envelope: accept |
+| "No reconnect / disconnect" | WS reconnects with SubscribeRxGuard ≤5s; sleep-until-open post-close | SEBI 24h JWT forces ≥1 reconnect/day BY LAW. We make it invisible (≤5s) but cannot eliminate |
+| "Tracked always" | Every tick → ticks table; every order → order_audit; every alarm → SNS topic | 7 audit tables; SEBI 5y retention for order_audit |
+| "Logged always" | CloudWatch Logs 14d retention + S3 lifecycle for 5y | Every `error!` carries `code = ErrorCode::X.code_str()` field |
+| "Monitored always" | 10 CloudWatch metrics, scrape every 60s | Free tier; CloudWatch agent auto-installed |
+| "Alerted always" | 10 CloudWatch alarms; TreatMissingData=breaching | Edge-triggered; coalesced; never silent |
+| "Telegram + SMS + Call everything" | SNS topic → SMS leg + Telegram-bot-Lambda leg + Email leg + Amazon Connect outbound voice for Critical | 4-channel deadman; one fails, others still fire |
+
+### The 4 daily positive Telegram pings (proof of life)
+
+Each is operator-readable on phone in 5 seconds:
+
+| IST time | Telegram | What it proves |
+|---|---|---|
+| 08:03 | `✅ tickvault started \| boot_id: <X>` | Boot completed; all 18 gates passed |
+| 09:15:30 | `✅ Streaming live \| WS:1/1 \| Order-WS:1/1 \| SIDs:4/4 \| Token:23h45m` | Market opened, feed flowing |
+| 15:31 | `✅ Cross-match OK \| TFs: 4 \| Candles: <N> \| All OHLCV exact` | Same-day data integrity proven |
+| 15:45 | EOD digest: P&L + order count + alarms summary + tomorrow's expiry | Day complete |
+
+**If any of these 4 is missing on a trading day → operator MUST investigate.** They are the positive heartbeat per audit-findings Rule 11 (no false-OK).
+
+### What we cannot promise (per operator-charter §F honest envelope)
+
+| Literal demand | Physical truth | What we substitute |
+|---|---|---|
+| "Never disconnect" | SEBI 24h JWT forces reconnect | Invisible reconnect ≤5s |
+| "Never outage" | AWS region 99.99% SLA = 4.3min/mo possible | Telegram + SMS + Call within 60s of detection |
+| "Never miss a tick" | Network packets can drop | 100K-tick rescue ring → NDJSON spill → DLQ catches all |
+| "Never fail" | QuestDB is third-party | Absorbs via 3-tier; alarm within 30s |
+| "100% guarantee no hallucination" | Words are not proof | Every claim has a ratchet test that fails build on regression |
+
+**This is the honest 100%.** Anything stronger would be a lie.
 
 ---
 
