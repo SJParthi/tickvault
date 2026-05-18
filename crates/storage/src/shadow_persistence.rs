@@ -267,6 +267,42 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
         &audit_ddl,
     )
     .await;
+
+    // Phase 0 Item 29 — `candles_source` SYMBOL column ALTER on all 9
+    // shadow candle tables via `ALTER ADD COLUMN IF NOT EXISTS` per the
+    // PR #690 schema self-heal pattern. Values: `live_ws` (default,
+    // implicit for legacy rows), `cross_check_correction` (Item 28
+    // bar-correction writer), `gap_fill_rest` (Items 8+9 — written into
+    // historical_candles, mirrored here for boot-cache parity).
+    //
+    // Column is OUTSIDE the DEDUP key (Items 15+28+29 hot-path-reviewer
+    // C1) so corrections REPLACE the wrong row instead of APPENDING a
+    // sibling row — `(ts, security_id, exchange_segment)` stays the
+    // canonical dedup tuple.
+    for table in shadow_candle_table_names() {
+        let alter_sql =
+            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS candles_source SYMBOL");
+        match client
+            .get(&base_url)
+            .query(&[("query", alter_sql.as_str())])
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                info!(table, "candles_source SYMBOL column ensured");
+            }
+            Ok(resp) => {
+                warn!(
+                    table,
+                    status = %resp.status(),
+                    "ALTER candles_source non-2xx"
+                );
+            }
+            Err(err) => {
+                error!(table, ?err, "ALTER candles_source request failed");
+            }
+        }
+    }
 }
 
 async fn run_ddl(client: &Client, base_url: &str, table: &str, ddl: &str) {
@@ -290,6 +326,45 @@ async fn run_ddl(client: &Client, base_url: &str, table: &str, ddl: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Phase 0 Item 29 — source-scan ratchet: `ensure_shadow_candle_tables`
+    /// MUST emit `ALTER TABLE ... ADD COLUMN IF NOT EXISTS candles_source
+    /// SYMBOL` per the PR #690 schema self-heal pattern. Items 15+28+29
+    /// hot-path-reviewer C1 requires the column be added OUTSIDE the
+    /// DEDUP UPSERT KEY (verified by `dedup_segment_meta_guard.rs` which
+    /// scans the constant — `candles_source` does NOT appear in any
+    /// DEDUP_KEY_* constant).
+    #[test]
+    fn test_shadow_tables_alter_in_candles_source_column() {
+        let src = include_str!("shadow_persistence.rs");
+        assert!(
+            src.contains("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS candles_source SYMBOL"),
+            "ensure_shadow_candle_tables MUST ALTER ADD COLUMN IF NOT \
+             EXISTS candles_source SYMBOL on all 9 shadow tables. \
+             See Phase 0 Item 29 + hot-path-reviewer C1."
+        );
+    }
+
+    /// Phase 0 Item 29 — `candles_source` MUST NOT appear in any DEDUP
+    /// key (cross-check correction MUST replace the wrong row, not
+    /// append a sibling row). Verified by both this source-scan AND
+    /// `dedup_segment_meta_guard.rs` workspace scan.
+    #[test]
+    fn test_candles_source_not_in_dedup_key() {
+        let src = include_str!("shadow_persistence.rs");
+        // Walk every DEDUP_KEY_* constant declaration and confirm none
+        // mention candles_source.
+        for line in src.lines() {
+            if line.trim_start().starts_with("pub const DEDUP_KEY_") {
+                assert!(
+                    !line.contains("candles_source"),
+                    "candles_source MUST NOT appear in DEDUP_KEY_* — \
+                     corrections must REPLACE not APPEND. Offending \
+                     line: {line}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_all_shadow_table_names_distinct() {
