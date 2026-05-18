@@ -113,7 +113,7 @@ Bucket: `instrument_master_*`, `derivative_contracts`, `instrument_build_metadat
 | `auth/` | Token manager, TOTP, SSM | KEEP (drop Valkey path) |
 | **`option_chain/`** | **NEW — REST fetcher, 50s scheduler, RAM cache, audit writer** | NEW |
 | **`cross_verify/`** | **NEW — 15:31 IST scheduler, morning 1d scheduler, comparator** | NEW |
-| `pipeline/` | Tick processor (SPSC 100K buffer), candle aggregator (6 TFs only) | MODIFY (slim TFs, resize ring) |
+| `pipeline/` | Tick processor (SPSC 100K buffer), candle aggregator (21 TFs locked) | MODIFY (slim TFs, resize ring) |
 | `notification/` | Telegram events, NotificationService | KEEP (drop deleted event variants) |
 
 **Deleted:** `instrument/` (entire dir — bhavcopy, csv_downloader, universe_builder, depth_strike_selector, depth_rebalancer, live_tick_atm_resolver, prev_oi loader, phase2_scheduler, market_open_self_test stock checks, depth_20_dynamic_subscriber, depth_200_dynamic_subscriber, depth_dynamic_top_volume_selector), `historical/` (cross_verify lives in new `cross_verify/`; candle_fetcher kept but moved inside new dir; backfill already deleted), `index_constituency/`, `network/` (IP monitor + verifier — keep ONLY the boot-time IP check).
@@ -124,7 +124,7 @@ Bucket: `instrument_master_*`, `derivative_contracts`, `instrument_build_metadat
 |---|---|---|
 | `oms/` | Engine, API client, state machine, rate limiter, idempotency, **<1ms decision-to-wire latency target** | KEEP + tighten |
 | `risk/` | Pre-trade checks, P&L tracker, kill switch | KEEP |
-| `indicator/` | O(1) yata-based engine (RSI/MACD/BB/SMA/EMA × 6 TFs) | KEEP + wire to bar_cache (Wave-7A4 scaffold) |
+| `indicator/` | O(1) yata-based engine (RSI/MACD/BB/SMA/EMA × 21 TFs) | KEEP + wire to bar_cache (Wave-7A4 scaffold) |
 | `strategy/` | FSM evaluator, **strategy fail-closed gate** on option chain staleness | KEEP + add gate |
 | **`in_mem/`** | **bar_cache (today + yesterday sealed bars in RAM), option_chain_cache (3 underlyings × strikes), indicator_state** | NEW (consolidates Wave-7A4 scaffold) |
 
