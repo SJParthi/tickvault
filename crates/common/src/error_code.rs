@@ -452,6 +452,27 @@ pub enum ErrorCode {
     /// it cancels Super Order legs and places market exits before
     /// the 15:30 IST close.
     OrphanPosition01Detected,
+    /// BAR-MISMATCH-01: at 09:16:05 IST the post-open cross-check
+    /// fetched Dhan REST `/v2/charts/intraday` for the 09:15 1m bar
+    /// across all 222 SIDs and found at least one bar whose OHLCV
+    /// disagreed with our `candles_1m_shadow` row outside the
+    /// `PRICE_TOLERANCE_RUPEES` (0.01) tolerance. The mismatched bars
+    /// were CORRECTED — Dhan's authoritative values written to
+    /// `candles_1m_shadow` + `historical_candles` (mirror) + audit
+    /// row in `bar_correction_audit`. Severity::Critical so the
+    /// operator sees the correction summary before the strategy gate
+    /// opens.
+    BarMismatch01CorrectedFromHistorical,
+    /// BAR-MISMATCH-02: 09:16:05 IST cross-check completed but with
+    /// fewer than `MIN_COMPARED_COUNT_FOR_PASS` (200/222) Dhan REST
+    /// responses. Cross-check is INCONCLUSIVE — strategy gate stays
+    /// CLOSED for the trading day. Operator must inspect Dhan REST
+    /// health + manually authorize trading. Severity::Critical.
+    BarMismatch02CrossCheckInconclusive,
+    /// BAR-MISMATCH-03: 09:16:05 IST cross-check HARD-FAILED (auth
+    /// error, network failure, all 222 REST fetches errored). Strategy
+    /// gate stays CLOSED. Operator must intervene. Severity::Critical.
+    BarMismatch03CrossCheckFailed,
     /// GAP-FILL-01: gap-fill scheduler supervisor task caught a panic
     /// in the inner scheduler loop or the broadcast channel closed
     /// unexpectedly. Severity::Critical — the bounded-zero-loss
@@ -611,6 +632,9 @@ impl ErrorCode {
             Self::AggregatorAudit01WriteFailed => "AGGREGATOR-AUDIT-01",
             Self::Resilience01DualInstanceDetected => "RESILIENCE-01",
             Self::OrphanPosition01Detected => "ORPHAN-POSITION-01",
+            Self::BarMismatch01CorrectedFromHistorical => "BAR-MISMATCH-01",
+            Self::BarMismatch02CrossCheckInconclusive => "BAR-MISMATCH-02",
+            Self::BarMismatch03CrossCheckFailed => "BAR-MISMATCH-03",
             // Phase 0 Items 8+9 — gap-fill scheduler
             Self::GapFill01SchedulerFailed => "GAP-FILL-01",
             Self::GapFill02RestFetchFailed => "GAP-FILL-02",
@@ -646,6 +670,9 @@ impl ErrorCode {
             | Self::AggregatorDrop01
             | Self::Resilience01DualInstanceDetected
             | Self::OrphanPosition01Detected
+            | Self::BarMismatch01CorrectedFromHistorical
+            | Self::BarMismatch02CrossCheckInconclusive
+            | Self::BarMismatch03CrossCheckFailed
             | Self::GapFill01SchedulerFailed
             | Self::GapFill04EventChannelLagged => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
@@ -852,6 +879,11 @@ impl ErrorCode {
             Self::OrphanPosition01Detected => {
                 ".claude/rules/project/phase-0-item-20-error-codes.md"
             }
+            Self::BarMismatch01CorrectedFromHistorical
+            | Self::BarMismatch02CrossCheckInconclusive
+            | Self::BarMismatch03CrossCheckFailed => {
+                ".claude/rules/project/phase-0-items-15-28-29-error-codes.md"
+            }
             Self::GapFill01SchedulerFailed
             | Self::GapFill02RestFetchFailed
             | Self::GapFill03UpsertFailed
@@ -984,6 +1016,10 @@ impl ErrorCode {
             Self::Resilience01DualInstanceDetected,
             // Phase 0 Item 20 — orphan position 15:25 IST watchdog
             Self::OrphanPosition01Detected,
+            // Phase 0 Items 15+28+29 — 09:16:05 IST post-open cross-check
+            Self::BarMismatch01CorrectedFromHistorical,
+            Self::BarMismatch02CrossCheckInconclusive,
+            Self::BarMismatch03CrossCheckFailed,
             // Phase 0 Items 8+9 — gap-fill scheduler
             Self::GapFill01SchedulerFailed,
             Self::GapFill02RestFetchFailed,
@@ -1191,7 +1227,9 @@ mod tests {
         // 100 -> 104 for GAP-FILL-01/02/03/04.
         // 2026-05-18 (Phase 0 Item 20 — orphan position watchdog):
         // bumped 104 -> 105 for ORPHAN-POSITION-01.
-        assert_eq!(ErrorCode::all().len(), 105);
+        // 2026-05-18 (Phase 0 Items 15+28+29 — post-open cross-check):
+        // bumped 105 -> 108 for BAR-MISMATCH-01/02/03.
+        assert_eq!(ErrorCode::all().len(), 108);
     }
 
     #[test]
@@ -1242,7 +1280,9 @@ mod tests {
                 // Wave 4 Item 19 (Phase 0): dual-instance lock.
                 || s.starts_with("RESILIENCE-")
                 // Phase 0 Item 20: orphan position 15:25 IST watchdog.
-                || s.starts_with("ORPHAN-POSITION-");
+                || s.starts_with("ORPHAN-POSITION-")
+                // Phase 0 Items 15+28+29: 09:16:05 IST post-open cross-check.
+                || s.starts_with("BAR-MISMATCH-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
