@@ -69,6 +69,7 @@ mod global_qcfg_tests {
 
 pub mod aggregator_seal_audit_persistence;
 pub mod auth_renewal_audit_persistence;
+pub mod bar_correction_audit_persistence;
 pub mod boot_audit_persistence;
 pub mod boot_probe;
 pub mod calendar_persistence;
