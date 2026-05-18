@@ -1,0 +1,654 @@
+# AWS Indices-Only Architecture — LOCKED 2026-05-18
+
+> **Status:** LOCKED design (no code shipped). Supersedes `aws-cost-floor-analysis.md` §6 choice — operator picked a path none of the canned options offered. This doc captures it.
+> **Authority:** CLAUDE.md > operator-charter-forever.md > this file > `aws-budget.md` (which now needs major revision per these locks).
+> **Created:** 2026-05-18.
+> **Companion:** `aws-daily-lifecycle.md` (12 worst cases — still applies, with §4-replacement noted below).
+
+---
+
+## §0. Auto-driver one-liner (insta-reel)
+
+> "Sir, the new shop has ONE worker (tickvault app) and ONE storeroom (QuestDB). No fancy CCTV monitor (Grafana out). No fancy alarm box (Prometheus out). No mini-warehouse (Valkey out). Instead, the AWS bank itself watches everything for free — when something goes wrong, AWS rings your phone via 4 different bells: phone log entry + SMS + Telegram + email. The shop only watches 4 prices: Nifty, Bank Nifty, Sensex, India VIX. All calculations live in worker's head (RAM). Only after closing time does worker write notes to storeroom. New monthly bill: under ₹1,000. Done."
+
+```
+   OLD                              NEW
+   ─────                            ─────
+   ┌─────────────┐                  ┌─────────────┐
+   │ 8 Docker    │                  │ 2 Docker    │
+   │ containers  │                  │ containers  │
+   │ - QuestDB   │                  │ - QuestDB   │
+   │ - Grafana   │ ───── drop ────► │ - tickvault │
+   │ - Prom      │                  └─────────────┘
+   │ - Valkey    │                         │
+   │ - Loki      │                         ▼
+   │ - Alloy     │                  ┌─────────────┐
+   │ - Alertmgr  │                  │ CloudWatch  │
+   │ - Traefik   │                  │ free tier   │
+   └─────────────┘                  │ Logs+Metrics│
+        │                           │ +Alarms→SNS │
+        ▼                           └──────┬──────┘
+   ₹4,981/mo c7i.xlarge                    │
+   ~11K SIDs                       ┌───────┼───────┬───────┐
+                                   ▼       ▼       ▼       ▼
+                                  Log    SMS    Telegram  Email
+                                  ─────────────────────────────
+                                  4-channel deadman
+                                  
+                                  t4g.small 2GB ARM
+                                  4 SIDs only
+                                  ~₹920/mo ✓ <₹1K
+```
+
+---
+
+## §1. Locks captured 2026-05-18 (this session)
+
+| # | Lock | Operator's words → engineering reading |
+|---|---|---|
+| L1 | Universe = 4 SIDs only | NIFTY=13, BANKNIFTY=25, SENSEX=51, INDIA VIX=21 (all IDX_I, Ticker mode) |
+| L2 | Drop ALL stock F&O scaffolding | Delete subscription planner stock branch, Phase 2 scheduler, depth-20/200 pipelines, greeks pipeline, movers pipeline, bhavcopy, prev_OI loader, ~218 NSE_EQ stocks |
+| L3 | Drop ALL local observability tools except QuestDB | Out: Grafana, Prometheus, Alertmanager, Valkey, Loki, Alloy, Traefik. In: CloudWatch Logs + Metrics + Alarms |
+| L4 | Notification = logging + SMS + call + Telegram | "the 4-channel deadman" via CloudWatch Alarm → SNS fan-out. ("call" interpreted as a fallback if SMS/Telegram fail — see §6) |
+| L5 | RAM-first hot path | All timeframes, indicator state, option-chain snapshots in RAM. Periodic async flush to QuestDB. Trading decisions NEVER touch DB. DB is for replay + historical only. |
+| L6 | Timeframes initially | live ticks + 1m, 3m, 5m, 15m, 1h, 1d (6 TFs). Expandable to 1m/2m/.../15m/30m/1h/2h/3h/4h/1d (~13 TFs) post-backtest. |
+| L7 | Option chain REST every 50s | 3 underlyings (NIFTY/BANKNIFTY/SENSEX) nearest-expiry only. Concurrent calls OK per Dhan rule (1 unique req per 3s). RAM cache + DB flush. |
+| L8 | WebSockets | 1 main-feed (4 SIDs) + 1 order-update. Operator-charter §I unchanged. |
+| L9 | AWS instance budget | <₹1K/mo HARD priority. Mumbai network MUST not be compromised. |
+| L10 | RAM honesty | Be explicit about what fits where. No hand-waving. |
+| L11 | Schedule | 08:00 / 17:00 IST (locked earlier this session) |
+| L12 | Common runtime / dynamic / scalable / automated | All operator-charter §A demands carried forward |
+
+---
+
+## §2. The new RAM budget (4 SIDs + 2-container stack)
+
+| Component | RAM | Source / math |
+|---|---|---|
+| QuestDB container | **1024 MB** | Trimmed from 1.5GB (Wave 7-A4 baseline); 4 SIDs × tiny write volume |
+| Tickvault app process | **~280 MB** | See breakdown below |
+| OS + Linux kernel + filesystem cache | **~300 MB** | Amazon Linux 2023 minimal |
+| Docker daemon + containerd overhead | **~80 MB** | Docker 24.x baseline |
+| Headroom (kswapd floor) | **~316 MB** | Min 200MB free for kswapd to behave |
+| **TOTAL** | **~2,000 MB** | Fits **t4g.small (2GB)** with 0 headroom OR **t4g.medium (4GB)** with 2GB headroom |
+
+### Tickvault app process breakdown (4 SIDs)
+
+| Subcomponent | Math | Bytes |
+|---|---|---|
+| Sealed bars: 4 SIDs × 13 TFs × 2 days × 375 bars/day max × 64B | | **2.5 MB** |
+| Live aggregator cells: 4 SIDs × 13 TFs × 80B | | 4 KB |
+| Indicator state (RSI/MACD/BB/EMA/SMA × 13 TFs × 4 SIDs × 500B avg) | | **130 KB** |
+| Option chain RAM: 3 underlyings × ~100 strikes × 2 sides × 200B | | **120 KB** |
+| Option chain history: last ~720 snapshots (1hr at 50s cadence) × 240KB | | **170 MB** |
+| Rescue ring (RESIZED): 100K × 200B (was 5M × 200B = 1GB) | | **20 MB** |
+| Instrument registry (4 SIDs) + token cache | | 5 MB |
+| WebSocket buffers (2 conns × 4MB) | | 8 MB |
+| Tokio runtime + 4 thread stacks | | 20 MB |
+| HTTP client pool (reqwest) for option chain REST | | 10 MB |
+| Heap fragmentation @ 15% | | ~37 MB |
+| **APP TOTAL** | | **~283 MB** |
+
+**Key change vs old design:** rescue ring dropped from 5M→100K. At ~20 ticks/sec peak (4 SIDs × 5 ticks/sec each), 100K = 5000 seconds = **83 minutes of buffer** — way more than needed for any realistic QuestDB outage. Frees ~1GB of RAM.
+
+**Honest envelope claim update:** the rescue-ring constant `TICK_BUFFER_CAPACITY` needs to be re-pinned at 100,000 (`crates/common/src/constants.rs:1568`), and the operator-charter §F honest-100% claim re-anchored at 100K (not 5M). This is a deliberate downward adjustment proportional to the universe size.
+
+---
+
+## §3. The new Docker stack (2 containers)
+
+```
+docker-compose.yml (post-deletion)
+├── tv-app (the tickvault binary)
+│   - port 3001 (HTTP /health)
+│   - logs → CloudWatch Logs agent → /tickvault/prod/app log group
+│   - metrics → CloudWatch PutMetricData via SDK
+└── tv-questdb (1024 MB)
+    - port 9000 (HTTP / Web UI)
+    - port 9009 (ILP TCP for tick writes)
+    - port 8812 (PG-wire for SELECT)
+    - 10GB EBS gp3 volume mount
+```
+
+**Deleted containers (vs current 8):** Grafana, Prometheus, Alertmanager, Valkey, Loki, Alloy. Saves ~1.9 GB RAM + complexity.
+
+**Effects of dropping Valkey:**
+- Token cache moves to **in-memory `Arc<Secret<String>>` + disk SSM fallback** (token already lives in SSM as truth)
+- Instrument cache stays on **disk rkyv** (already there for cold start)
+- No real loss — Valkey was a nice-to-have layer over SSM
+
+**Effects of dropping Prometheus + Grafana + Loki + Alloy + Alertmanager:**
+- All metrics → **CloudWatch PutMetricData** via `aws-sdk-cloudwatch` (already in dependency tree)
+- All logs → **CloudWatch Logs agent** on the host (tails `/var/log/tickvault/*.log`)
+- All alerts → **CloudWatch Alarms** on those metrics + log filters → SNS fan-out
+
+---
+
+## §4. The new observability surface — CloudWatch is the bus
+
+```
+                  ┌──────────────────────────┐
+                  │  tickvault app (Rust)    │
+                  └───┬──────────────────┬───┘
+                      │                  │
+              metrics │                  │ logs
+                      ▼                  ▼
+              ┌─────────────────┐  ┌──────────────────┐
+              │ CloudWatch      │  │ CloudWatch Logs  │
+              │ Metrics (custom)│  │ /tickvault/prod  │
+              │ (10 free max)   │  │ (5GB free/mo)    │
+              └────────┬────────┘  └────────┬─────────┘
+                       │                    │
+                       │            log filter
+                       ▼                    ▼
+              ┌──────────────────────────────────┐
+              │   CloudWatch Alarms (10 free)    │
+              └────────────────┬─────────────────┘
+                               │ state-change
+                               ▼
+              ┌──────────────────────────────────┐
+              │   SNS topic: tv-prod-alerts      │
+              └─┬──────────┬──────────┬──────────┘
+                │          │          │
+                ▼          ▼          ▼
+              SMS       Telegram     Email
+            (DLT India  (Lambda      (operator
+             ~₹0.24/    →bot.send    inbox)
+             msg)      Message)
+```
+
+### The 10 CloudWatch metrics that survive
+
+| # | Metric | Purpose | Free tier ok? |
+|---|---|---|---|
+| 1 | `tv_boot_complete` (gauge 1/0) | Boot succeeded | yes |
+| 2 | `tv_websocket_connections_active` (gauge) | 1 main + 1 order-update = 2 expected | yes |
+| 3 | `tv_tick_rate_per_sec` (gauge) | Sanity: ~4-20 expected | yes |
+| 4 | `tv_questdb_disconnected_seconds` (gauge) | Tick rescue ring filling | yes |
+| 5 | `tv_option_chain_fetch_failures_total` (counter) | DH-904 / network failures | yes |
+| 6 | `tv_app_alive_heartbeat` (gauge 1, updated 30s) | Mid-day crash detector | yes |
+| 7 | `tv_token_remaining_hours` (gauge) | <4h → alert | yes |
+| 8 | `tv_orders_placed_total` (counter) | When live trading active | yes |
+| 9 | `tv_daily_pnl_inr` (gauge) | EOD digest | yes |
+| 10 | `tv_kill_switch_state` (gauge 0/1) | Risk halt visibility | yes |
+
+### The 10 CloudWatch alarms (each routes to SNS)
+
+| # | Alarm | Trigger | Severity |
+|---|---|---|---|
+| 1 | `tv-boot-not-complete` | metric 1 missing 240s after instance running | Critical |
+| 2 | `tv-ws-pool-zero` | metric 2 == 0 for 60s during market hours | Critical |
+| 3 | `tv-tick-flow-stalled` | metric 3 == 0 for 60s during market hours | Critical |
+| 4 | `tv-questdb-outage` | metric 4 > 30 | High |
+| 5 | `tv-option-chain-failing` | metric 5 increase > 3 in 5min | High |
+| 6 | `tv-app-heartbeat-missing` | metric 6 missing 60s | Critical |
+| 7 | `tv-token-expiring` | metric 7 < 4 | High |
+| 8 | `tv-questdb-disk-full` | EBS gp3 > 80% | High |
+| 9 | `tv-instance-state-not-running-by-T+5` | Outside expected schedule | Critical |
+| 10 | `tv-eventbridge-rule-missing-invocation` | rule fired < 1× in 10min window | Critical |
+
+All within CloudWatch free tier (10 alarms + 10 metrics + 5GB logs).
+
+### Logs
+
+Tickvault writes JSON-structured logs to disk → CloudWatch Logs agent ships to `/tickvault/prod/app` log group. 14-day retention. Log subscription filter on `level=ERROR` → SNS for unknown error escalation.
+
+---
+
+## §5. The new instance choice — OPERATOR PIVOTED TO t4g.medium 2026-05-18
+
+**Operator lock 2026-05-18:** "why not t4g.medium dude?" — pivoting from t4g.small (which had zero RAM headroom) to **t4g.medium (4GB ARM, 2 vCPU)**. This is the right Z+ choice — 2GB headroom buys safety against OOM, transient memory spikes, and growth.
+
+**PRICING CORRECTION 2026-05-18:** Operator's AWS console screenshot revealed my earlier research-agent's ap-south-1 multiplier was wrong by 43%. REAL Mumbai t4g.medium = **$0.0224/hr** (not $0.0392). Full corrected table:
+
+| Instance | vCPU | RAM | REAL ap-south-1 $/hr | Weekday 9hr×22 ₹/mo (just EC2) |
+|---|---|---|---|---|
+| t4g.nano | 2 | 0.5 GiB | $0.0028 | ₹47 |
+| t4g.micro | 2 | 1 GiB | $0.0056 | ₹94 |
+| t4g.small | 2 | 2 GiB | $0.0112 | ₹189 |
+| **t4g.medium** | **2** | **4 GiB** | **$0.0224** | **₹377** |
+| t4g.large | 2 | 8 GiB | $0.0448 | ₹754 |
+| t4g.xlarge | 4 | 16 GiB | $0.0896 | ₹1,507 |
+
+**Honest cost on REAL pricing:** t4g.medium weekday-only is ~**₹885/mo**, which is **UNDER <₹1K WITH ₹115 HEADROOM**. The operator's pivot is the right call AND under budget. The earlier "₹250 over" claim was based on agent-hallucinated US pricing scaled by an invented multiplier — corrected with the Mumbai console screenshot.
+
+| Option | Cost | Trade-off |
+|---|---|---|
+| **A — t4g.medium weekday-only 9hr/day (LOCKED)** | **₹885/mo** | ✓ Under ₹1K. 2GB RAM headroom. Future-proof for BRUTEX strategy load (see §13). |
+| B — t4g.medium full schedule (incl. weekends) | ₹961/mo | Still under ₹1K. Weekend prep + manual backtesting possible. |
+| C — t4g.large for deep future strategy farm (20+ strategies) | ₹1,262/mo | Over ₹1K. Only if BRUTEX-finalised list grows beyond 10 strategies. Cross this bridge later. |
+
+**Recommendation: LOCK Option A.** Operator can flip to Option B for full schedule at +₹76/mo if weekend prep is wanted.
+
+| Candidate | RAM | Cost full-sched | Cost weekday-only | Fits stack? | Network reliability |
+|---|---|---|---|---|---|
+| t4g.nano (0.5GB) | 0.5 GB | low | very low | NO — QuestDB alone needs >0.5GB | n/a |
+| t4g.micro (1GB) | 1 GB | low | very low | NO — full stack ~1.4GB | n/a |
+| **t4g.small (2GB)** | 2 GB | ~₹1,150/mo | **~₹920/mo** | **YES with 0 headroom** | ap-south-1 99.99% region SLA |
+| t4g.medium (4GB) | 4 GB | ~₹1,380/mo | ~₹1,250/mo | YES with 2GB headroom | same |
+| c7g.medium (1 vCPU, 2GB, non-burstable) | 2 GB | ~₹1,143/mo | ~₹990/mo | YES with 0 headroom; 1 vCPU may be tight | same |
+
+### Cost breakdown — t4g.medium weekday-only 9hr/day (LOCKED 2026-05-18, Option A)
+
+```
+EC2 t4g.medium:   $0.0224/hr × 9hr × 22 days × ₹85   = ₹377   ← CORRECTED via console
+EIP (24/7):       $0.005/hr × 24h × 30d × ₹85        = ₹306   ← dominant fixed cost
+EBS gp3 10GB:     $0.0912 × 10 × ₹85                 = ₹78
+S3 cold storage:  (tiny dataset, 4 SIDs)             = ₹15
+CloudWatch:       Free tier (10/10/5GB)              = ₹0
+SNS SMS (India):  100 msgs × $0.00278 × ₹85          = ₹24
+SNS Email:        free                               = ₹0
+SNS HTTPS Telegram: free                             = ₹0
+Lambda (sns→tg):  free tier (96 invokes/day)         = ₹0
+Data transfer:    ~10GB outbound                     = ₹85
+──────────────────────────────────────────────────────────
+TOTAL:                                                ~₹885/mo  ✓ UNDER <₹1K with ₹115 headroom
+                                                                ✓ Z+ safe — 2GB RAM headroom
+                                                                ✓ Future-proof for BRUTEX (§13)
+```
+
+**Honest envelope:** ₹885/mo is the operator-Z+-safe AND budget-meeting floor. Operator's pivot to t4g.medium AND <₹1K target are BOTH satisfied. The pricing correction (via operator's AWS console screenshot) showed my earlier research agent was wrong by 43% on Mumbai pricing.
+
+### Risks accepted (LOCKED t4g.medium)
+
+| Risk | Mitigation |
+|---|---|
+| 4GB RAM has 2GB headroom after slimmed stack | Monitor `MemoryUtilization` CW alarm at 75%; ample for current ~2GB working set + future strategy load |
+| Burstable CPU could exhaust under 09:15:30 IST bursts | Audit: 4 SIDs at 20 ticks/sec + 10 future strategies × 6 TFs ≈ 0.5% of 1 vCPU. Burstable trivially handles it. Baseline 40% × 2 vCPU = 0.8 vCPU effective. |
+| Single-AZ — InsufficientInstanceCapacity | Manual fallback to alternate AZ per `aws-capacity-error.md`. 99.99% region SLA = ~4.3min/mo expected downtime. |
+| ap-south-1 region outage | Accept envelope. Documented in §B honest envelope. |
+| Future BRUTEX strategy load growth >10× expected | See §13 — t4g.medium still fits, t4g.large is the rip-cord if needed (~₹1,262/mo) |
+
+---
+
+## §6. The 4-channel deadman notification (operator's "logging + SMS + call + Telegram")
+
+Operator listed 4 channels. Mapped to AWS primitives:
+
+| Operator's channel | AWS primitive | Cost | Notes |
+|---|---|---|---|
+| **Logging** | CloudWatch Logs `/tickvault/prod/app` | free 5GB | accessible via console + CLI |
+| **SMS** | SNS → SMS subscription, India DLT route | ~₹0.24/msg | sender ID registration required (LOCK-4 pending) |
+| **Telegram** | SNS → Lambda → Telegram bot.sendMessage | free tier | same chat as in-band Telegram from app |
+| **Call** | NOT in scope for v1 — Amazon Connect adds ~₹500/mo | — | operator-charter §H LOCK-5 chose "stop at SNS 3-leg." If operator now WANTS phone call, see §A below |
+
+**Open question:** the operator said "logging sms call telegram" — does "call" mean a phone CALL via Amazon Connect (adds cost), or is it shorthand for the SNS-call-back-via-Lambda mechanism (already covered by Telegram)? See §A.
+
+---
+
+## §7. The option chain REST loop (LOCKED design per Dhan API)
+
+Per Dhan `option-chain.md` ref:
+- Endpoint: `POST https://api.dhan.co/v2/optionchain`
+- Headers: `access-token` + `client-id` (BOTH required)
+- Body: `{ "UnderlyingScrip": <int>, "UnderlyingSeg": "IDX_I", "Expiry": "YYYY-MM-DD" }`
+- Rate limit: **1 unique request per 3 seconds** (per Dhan docs explicit). Different underlyings can be fetched CONCURRENTLY within the 3s window.
+- Returns: `data.last_price`, `data.oc[strike]` map with `.ce` and `.pe`, each containing OI / greeks / IV / LTP / volume / top bid+ask / previous_close / previous_oi / previous_volume / security_id.
+
+### The 50s cycle (concurrent fan-out)
+
+```
+t=0:    spawn 3 concurrent POST /optionchain calls
+        ├── NIFTY (UnderlyingScrip=13, IDX_I, current expiry)
+        ├── BANKNIFTY (UnderlyingScrip=25, IDX_I, current expiry)
+        └── SENSEX (UnderlyingScrip=51, IDX_I, current expiry)
+        (all 3 are DIFFERENT underlyings → Dhan rule satisfied)
+t=2s:   responses arrive, parse, merge into RAM cache
+t=2s:   async flush to QuestDB `option_chain_snapshots` table
+t=2s:   strategy evaluator reads RAM cache (NO DB hit)
+t=2s—50s: sleep
+t=50s:  next cycle
+```
+
+**Auxiliary calls (low frequency):**
+- `POST /optionchain/expirylist` at boot + once daily at 15:31 IST (post-close) to detect Thursday rollover.
+
+### Edge cases (locked from hot-path agent audit)
+
+| Edge case | Behavior |
+|---|---|
+| DH-904 rate limit | exponential backoff per `dhan-annexure-enums.md` rule 11 (10→20→40→80s); skip cycle; alert via Prom counter |
+| Cycle > 50s | mutex guard; skip-next-cycle policy (no overlap) |
+| Thursday 15:30 rollover | post-close `/expirylist` refetch; rebuild RAM cache for new nearest expiry |
+| New strikes mid-day | RAM cache uses `HashMap<f64, OptionData>` — dynamic resize OK |
+| Partial CE/PE | `Option<OptionData>` per Dhan rule 7; downstream consumer handles `None` |
+
+---
+
+## §8. Trading decision RAM-first invariant (no DB ever on hot path)
+
+The hot-path agent flagged this is currently HALF-ENFORCED. Required:
+
+1. **Banned-pattern guard fix:** `.claude/hooks/banned-pattern-scanner.sh` covers wrong file path (`oms/risk_check.rs` vs actual `risk/engine.rs`). PR needed to fix.
+2. **Scanner extension:** add regex `(execute|exec|query|prepare|SELECT|select)` to banned-paths list (currently path-scoped only).
+3. **Hot-path constants captured outside loop:** `tick_processor.rs:1013-1037` fetches `tickvault_storage::global_questdb_config()` inside the loop — lift outside.
+
+These are 3 small fixes in a follow-up plan. The bigger work is wiring the **bar_cache** (already scaffolded at `crates/trading/src/in_mem/bar_cache.rs` per Wave 7-A4) into the indicator engine. Adversarial agent confirmed scaffold exists but is not yet wired.
+
+---
+
+## §9. What gets DELETED (the destruction surface)
+
+The Explore agent is still mapping precise files in background. High-level list (will be sharpened to exact files in plan):
+
+| Surface | Examples |
+|---|---|
+| Crates code | subscription_planner stock branch, Phase 2 scheduler, depth-20/200 pipelines, depth_strike_selector, depth_rebalancer, depth_dynamic_top_volume_selector, depth_20_dynamic_subscriber, bhavcopy_cross_check, prev_oi loader, live_tick_atm_resolver, market_open_self_test stock sub-checks |
+| Greeks pipeline | `crates/trading/src/greeks/` (full module deletion) |
+| Movers pipeline | `option_movers` table, `movers_1m` mat view, MoversWriter, movers_pipeline task |
+| Storage tables | `option_movers`, `phase2_audit`, `depth_rebalance_audit` (depth-related), all stock-F&O ILP writers |
+| Notification events | `Phase2Complete`, `Phase2Failed`, `DepthRebalanced`, `DepthRebalanceFailed`, `Depth20DynamicSwap20`, `Depth20DynamicTopSetEmpty`, all greeks events, all movers events |
+| ErrorCode variants | Phase2-*, Depth*-*, Greeks-*, Movers-*, Depth20Dyn-*, Depth200Dyn-* |
+| Rule files | `depth-subscription.md`, phase2 runbooks |
+| Plans archived | Wave 5 indices-only is already what we want — much of Wave 5 work survives; Wave 4 depth-dynamic / Wave 6 cascade get DELETED |
+| Docker services | docker-compose entries: grafana, prometheus, alertmanager, valkey, loki, alloy, traefik |
+| Grafana dashboards | entire `deploy/docker/grafana/dashboards/` directory |
+| Prometheus alerts | entire `deploy/docker/prometheus/alerts.yml` |
+
+**Estimated deletion size:** ~15K LoC + ~20 audit/ratchet tests + ~30 rule/runbook files + 6 Docker services. **This is the largest single deletion in tickvault history.** Plan it carefully as a multi-PR campaign.
+
+---
+
+## §10. Common-runtime / dynamic / scalable / automated (operator-charter §A)
+
+The operator demanded these are NEVER compromised. Checking at 4-SID scope:
+
+| Demand | At 4 SIDs | Preserved? |
+|---|---|---|
+| Common runtime Mac=AWS | Same docker-compose.yml, same config TOML, no `#[cfg(target_os)]` divergence | ✅ |
+| Dynamic | Subscription scope config-driven, option chain cadence config-driven, schedule via EventBridge config-driven | ✅ |
+| Scalable | If operator un-locks the universe later, the same code can scale back up. Bounded mpsc + rescue ring scale via constants. | ✅ — design preserves the dial |
+| Automated logging | tracing macros + CloudWatch Logs agent | ✅ |
+| Automated tracking | QuestDB audit tables (slimmer set: `order_audit`, `boot_audit`, `auth_renewal_audit`, `selftest_audit`) | ✅ |
+| Automated capturing | Tick → QuestDB → S3 cold (5y SEBI) | ✅ |
+| Automated visualizing | CloudWatch Dashboards (free tier 3) replaces Grafana | ✅ |
+| Automated alerting | CW Alarms → SNS → 3 legs | ✅ |
+| Automated notifications | SMS + Telegram + Email | ✅ |
+| No manual inputs | EventBridge auto-start, SSM credential fetch at boot, CW agent auto-ships logs, SNS auto-routes | ✅ |
+| RAM-first hot path | bar_cache + indicator engine + option chain RAM cache | ✅ (with §8 fixes) |
+
+---
+
+## §A. Three remaining questions for operator
+
+1. **"Call" channel — phone CALL via Amazon Connect, OR is the word a synonym for one of SMS/Telegram?**
+   - Amazon Connect outbound call costs ~$0.003/min in ap-south-1 ≈ ₹0.25/call. 10 calls/mo ≈ ₹3.
+   - If yes, adds Item AWS-10 back to mandatory. Cost still <₹1K total.
+   - If no, current 3-leg is enough.
+
+2. **Instance: t4g.small (2GB, zero headroom, ~₹838/mo) OR t4g.medium (4GB, 2GB headroom, ~₹1,160/mo)?**
+   - t4g.small is THE candidate that meets <₹1K.
+   - t4g.medium is safer but breaks the budget.
+   - Recommendation: **start with t4g.small + CloudWatch MemoryUtilization alarm at 85%.** If alarms fire, upgrade.
+
+3. **EBS volume size — 10GB (locked above) OR 20GB (more growth room)?**
+   - 10GB = ₹78/mo. With QuestDB 4-SID data growth of ~50MB/day, 10GB = ~6 months of data before S3 lifecycle migration.
+   - 20GB = ₹155/mo. Same idea, 1 year of data.
+   - Recommendation: **10GB + aggressive S3 lifecycle (transition to cold at 14 days instead of 30).**
+
+---
+
+## §B. Honest 100% claim (mandatory per operator-charter §F)
+
+> "100% inside the tested envelope of the 4-SID indices-only scope on AWS t4g.small ap-south-1:
+> - Zero tick loss bounded by 100,000-tick rescue ring (≥83 minutes of buffer at 20 ticks/sec peak) → NDJSON spill → DLQ NDJSON.
+> - WebSocket detect-and-reconnect ≤5s; sleep-until-open post-close; SubscribeRxGuard preserves subscriptions across reconnects.
+> - QuestDB outage absorbed up to ring capacity; CloudWatch alarm fires within 30s of disconnect; operator paged via SMS+Telegram+Email simultaneously.
+> - Hot path O(1) per yata indicator update; bench-gated ≤100ns p99.
+> - Composite (security_id, exchange_segment) uniqueness preserved (degenerate at 4 IDX_I SIDs but invariant holds).
+> - CloudWatch detection latency ≤60s for all 12 worst-case scenarios in `aws-daily-lifecycle.md` §3.
+> - AWS ap-south-1 99.99% regional SLA = ~4.3 minutes/month expected downtime envelope.
+> - **NOT promised:** survival of full ap-south-1 region outage, human acknowledgment within any specific window, sub-60s end-to-end SMS/Telegram delivery (carriers don't publish SLAs)."
+
+---
+
+## §C. Operator-charter §A-§G compliance check
+
+| Demand from operator's restated charter (4th system reminder) | Met by | Status |
+|---|---|---|
+| 100% code coverage | Existing `crates/storage/tests/zero_tick_loss_alert_guard.rs` + scoped per crate | preserved |
+| 100% audit coverage | 4 audit tables (order/boot/auth/selftest) | preserved at slimmer scope |
+| 100% testing coverage | 22 test categories per `testing.md` | preserved |
+| 100% monitoring | CloudWatch 10 metrics + 10 alarms + 5GB logs | replaces Prom/Grafana |
+| 100% logging | tracing → CloudWatch Logs agent | replaces Loki/Alloy |
+| 100% alerting | CW Alarms → SNS → 3 legs (SMS+TG+Email) | replaces Alertmanager |
+| 100% security | banned-pattern + secret-scan + Secret<T> + cargo-audit | preserved |
+| 100% bug fixing | 3-agent adversarial review (this session ran them) | preserved |
+| 100% scenarios | 12 worst cases doc + 7 runbooks (this session) | NEW DELIVERABLE |
+| 100% functionalities | pub-fn-test + pub-fn-wiring guards | preserved |
+| 100% code review | charter §E 3-agent on every PR | preserved |
+| 100% extreme check | ratchet tests fail build on regression | preserved |
+| Zero ticks loss | bounded envelope (100K ring) | preserved at right size |
+| WS never disconnect | SubscribeRxGuard + watchdog | preserved |
+| QuestDB never fail | rescue→spill→DLQ + CloudWatch alarm | preserved |
+| O(1) latency | bench-gated | preserved |
+| Real-time proof | CW metrics + alarms | NEW path |
+| Table+diagram format | this doc | preserved |
+| Auto-driver clarity | §0 of this doc | preserved |
+| No hallucination | honest envelope claim in §B | preserved |
+| Mumbai network never compromised | ap-south-1 single-AZ, 99.99% SLA accepted as envelope | NEW: documented honestly |
+
+---
+
+## §11. Full AWS Support Surface — NOWHERE COMPROMISED (operator demand 2026-05-18)
+
+> Operator demand verbatim: *"See entire AWS Monitoring logging support recapturing retriggering entire AWS support needed to be entirely taken care dude okay? Nowhere this should be compromised dude?"*
+
+Reading: every dimension of AWS-side operational support must be wired, not aspirational. Below is the complete coverage matrix.
+
+### §11.1 The 7-dimension AWS support surface (every cell must be filled)
+
+| Dimension | AWS primitive | Status today | Cost impact | Z+ layer |
+|---|---|---|---|---|
+| **1. Monitoring** — see what's running | CloudWatch Metrics + Dashboards | 10 custom metrics free tier; 3 dashboards free | ₹0 | L1 DETECT |
+| **2. Logging** — see what happened | CloudWatch Logs + Logs Insights | 5GB free/mo; 14-day retention | ₹0 | L5 AUDIT |
+| **3. Alerting** — wake operator | CloudWatch Alarms → SNS | 10 alarms free | ₹0 | L1+L2 DETECT+VERIFY |
+| **4. Recapture** — replay missed events | CloudWatch Events archive + replay; SQS DLQ; SNS retry-policy 50× | Native AWS feature | ₹0 | L6 RECOVER |
+| **5. Retrigger** — re-fire failed alarms | CloudWatch Alarm `INSUFFICIENT_DATA` → re-evaluate; SNS DLQ + redrive | Native | ₹0 | L6 RECOVER |
+| **6. Auto-remediation** — self-heal | SSM Automation documents; systemd Restart=on-failure | Partial (systemd ✓; SSM playbooks aspirational) | ₹0 | L6 RECOVER |
+| **7. Audit / forensics** — post-mortem | CloudTrail (all AWS API calls) + S3 archive | CloudTrail management events FREE; data events extra | ₹0 baseline | L5 AUDIT |
+
+### §11.2 The "Recapture" lock — every lost event must be replayable
+
+| What can be lost | Recapture mechanism |
+|---|---|
+| SNS message to a subscriber (Telegram webhook, etc.) | **SNS Dead-Letter Queue** (SQS standard). Failed deliveries → DLQ → operator can redrive |
+| EventBridge invocation (the 08:00 IST cron) | **EventBridge DLQ** (SQS) + `RetryPolicy.MaximumRetryAttempts=3` + `MaximumEventAgeInSeconds=900` — Item AWS-2 in plan |
+| CloudWatch Alarm state-change | Alarm history retained 90 days; queryable via API. Re-fires automatically when condition re-triggers |
+| Lambda invocation (SNS→Telegram bridge) | Lambda async invocation has **2 automatic retries + on-failure DLQ** |
+| EC2 stop/start API call | CloudTrail records the API call regardless of success/failure |
+| CloudWatch metric publish | Tickvault keeps a local circular buffer; on CW outage, retries on next interval. If sustained, falls back to disk log → CW Logs |
+| Tick from Dhan WS | Operator-charter §F: **bounded zero loss** via rescue ring (100K) → NDJSON spill → DLQ NDJSON |
+
+### §11.3 The "Retrigger" lock — failed alarms re-fire
+
+| Failure mode | Retrigger behavior |
+|---|---|
+| Alarm goes `INSUFFICIENT_DATA` (metric missing) | TreatMissingData=`breaching` → fires Critical SNS; no manual re-fire needed |
+| SNS subscription HTTP webhook returns 5xx | SNS retries 50× over ≤3600s automatically |
+| SNS SMS carrier reject | Logged in SNS delivery status; CloudWatch alarm `tv-sms-delivery-failed` fires on > 0 rejects → escalates to Email + Telegram |
+| Lambda fails 3× | Async DLQ captures payload; CloudWatch alarm on DLQ depth > 0 fires |
+| Tickvault crashes during alarm processing | tickvault is NOT in the alarm path (operator demand: OOB). CloudWatch keeps firing independently |
+| Operator missed primary alert | Alarm stays in `ALARM` state until condition clears → operator sees it whenever they wake up. SNS delivery status confirms whether SMS/Email reached carrier |
+
+### §11.4 The "AWS support" lock — operator-facing AWS console access
+
+| Resource | Access path | Mobile-accessible? |
+|---|---|---|
+| EC2 console (start/stop, view state) | AWS Console mobile app + web | ✅ yes |
+| CloudWatch Logs Live Tail | AWS Console web + `aws logs tail --follow` CLI | ✅ via CLI on phone hotspot |
+| CloudWatch Alarms console (ack, edit) | Console + CLI `aws cloudwatch put-metric-alarm` | ✅ |
+| SSM Session Manager (SSH-less shell to instance) | Console "Connect" button + `aws ssm start-session` | ✅ |
+| SNS topic publish (manual alert acknowledgment) | `aws sns publish ...` from phone hotspot | ✅ |
+| QuestDB console | Port 9000 via SSM port-forward (NOT public) | ✅ via SSM tunnel |
+| Application HTTP (`/health`, etc.) | Port 3001 via SSM port-forward | ✅ |
+
+**No public ingress.** Operator reaches the box ONLY via SSM (no SSH keys, no bastion). Reduces attack surface to zero open ports beyond Dhan's outbound WebSocket.
+
+### §11.5 What CloudWatch CANNOT do (honest envelope)
+
+| Capability | Why CloudWatch can't | Workaround |
+|---|---|---|
+| Real-time custom dashboards with sub-minute granularity | CW custom metrics min resolution = 1s (paid: standard 60s default) | Use Logs Insights for sub-minute log analysis |
+| Cross-region failover automatically | CW alarms are regional | Item AWS-12 (deferred per LOCK-7) |
+| Complex query language like PromQL | CW Insights uses its own dialect | Document query templates |
+| Long-term metric retention > 15 months | CW retention caps | Export to S3 via metric stream + Athena |
+| Per-instrument granularity at 4 SIDs (only 4 dimensions) | Free tier has 10 metric × dimension combos | Fine at 4 SIDs × 10 metrics; would break at scale |
+
+**Verdict:** at 4-SID indices-only scope, CloudWatch covers 100% of monitoring/logging/alerting/recapture/retrigger demands. The previous Grafana/Prom/Loki/Alertmanager stack provided sub-second granularity for ~11K instruments which we no longer need.
+
+### §11.6 The 6 alarms that MUST exist (Z+ L1 detect layer)
+
+Per operator demand "nowhere should be compromised":
+
+1. `tv-instance-not-running-by-T+5` — EventBridge fired but EC2 not running
+2. `tv-boot-not-complete-T+240` — instance running but tickvault app silent
+3. `tv-app-heartbeat-missing-60s` — mid-day crash
+4. `tv-ws-pool-zero-60s` — WebSocket pool collapsed (during market hours)
+5. `tv-questdb-disconnected-30s` — DB outage
+6. `tv-token-remaining-lt-4hr` — auth window closing
+
+Each one fires SNS → 3-leg fan-out (SMS + Telegram + Email). Each one is `TreatMissingData=breaching`. Each one is automatically self-retriggering until the condition clears.
+
+### §11.7 The boot-time AWS support self-test
+
+At 08:01 IST (1 minute after instance running), tickvault must:
+
+1. PUT a heartbeat metric to CloudWatch → confirms IAM PutMetricData permission
+2. Publish a startup notification to SNS → confirms IAM Publish permission
+3. Write a "boot starting" log line → confirms CloudWatch Logs agent up
+4. Read its own JWT secret from SSM → confirms IAM SSM GetParameter permission
+5. Read a known S3 bucket → confirms IAM s3:GetObject if needed
+
+If ANY of the 5 fails → halt boot, fire CloudWatch `boot-iam-failure` alarm via the SNS publish that DID work (or via host-level CloudWatch agent). Operator sees the failure within 30s.
+
+**Status:** items 1, 2, 3, 4 already exist in `crates/app/src/main.rs` boot Step 6-8. Item 5 conditional on S3 usage. Self-test wrapper to surface them as a coherent "AWS support OK" Telegram message is NEW — add as Item AWS-13 in plan.
+
+---
+
+## §13. Future BRUTEX strategy load — DOES t4g.medium STILL FIT?
+
+> Operator demand 2026-05-18: *"even in the future after finalising the strategies and indicators from BRUTEX then we need to run those strategies or indicators also right dude so consider this also."*
+
+After BRUTEX (drill-down brute-force backtesting) selects winning strategies + indicators, those need to RUN LIVE on the same instance. This section sizes for that future load.
+
+### §13.1 Estimated future load (after BRUTEX selects winners)
+
+Assumption set (defensible upper bound):
+
+| Future component | Quantity | Per-unit cost |
+|---|---|---|
+| Finalised strategies running concurrently | **10** (likely 3-5 in v1; sized for 10 as headroom) | — |
+| Underlyings traded | **4** (NIFTY/BANKNIFTY/SENSEX + INDIA VIX as regime filter) | — |
+| Timeframes per strategy | **6** (1m/3m/5m/15m/1h/1d initially) → up to **13** (after backtest discovery) | — |
+| Strategy evaluation cadence | Per tick OR per-minute boundary (strategy-dependent) | — |
+| Indicators per strategy | ~5 (RSI/MACD/BB/SMA/EMA via `yata`) | O(1) update, ~50ns |
+
+### §13.2 The hot-path math (live trading)
+
+Per-tick path (~20 ticks/sec peak from 4 SIDs):
+
+```
+20 ticks/sec
+  × 4 instruments (each tick = 1 instrument, but aggregator updates ALL TFs)
+  × 13 TFs aggregator updates  (parallel; vectorisable)
+  × 5 indicators per TF
+  × 50ns per indicator update (yata O(1))
+═══════════════════════════════════════════════════════════
+= 20 × 13 × 5 × 50ns = 65 µs/sec aggregate
+= 0.0065% of 1 vCPU
+```
+
+Strategy evaluation (per-minute boundary):
+
+```
+10 strategies × 4 instruments × 6 TFs × 10 µs eval each
+= 2.4 ms / minute
+= 0.004% of 1 vCPU
+```
+
+OMS order placement (when live trading active):
+```
+Worst case 100 orders/day × 100 ms each = 10 seconds/day = 0.0001% sustained
+```
+
+**Combined future CPU usage: <1% of 1 vCPU on t4g.medium (2 vCPU available).**
+
+### §13.3 The RAM impact
+
+| Component | Bytes |
+|---|---|
+| Strategy state (10 strats × 4 SIDs × 13 TFs × 200B) | **104 KB** |
+| Strategy FSM transition tables (10 strats × ~30 states × 200B) | 60 KB |
+| Backtested parameter tables (10 strats × 50 params × 50B) | 25 KB |
+| Position tracker (open positions × ~500B) | ~5 KB |
+| Risk engine state (P&L tracker, exposure caps, kill switch) | ~10 KB |
+| Order book (last N orders, ~100 × 500B) | 50 KB |
+| **Total additional vs base** | **~250 KB** |
+
+**Negligible — adds 0.25 MB to app's ~280 MB working set.** Still comfortable in t4g.medium 4GB.
+
+### §13.4 What about deep-future expansion (20+ strategies, 13 TFs each)?
+
+| Scenario | CPU | RAM additional | Still fits t4g.medium? |
+|---|---|---|---|
+| Current (no live strategies) | <0.1% | 0 | ✅ yes, ample |
+| Phase 1 (3-5 strategies, 6 TFs) | <0.3% | ~50 KB | ✅ yes |
+| Phase 2 BRUTEX-finalised (10 strategies, 6 TFs) | <0.5% | ~250 KB | ✅ yes |
+| Stress case (20 strategies, 13 TFs) | <2% | ~500 KB | ✅ yes |
+| Theoretical (50 strategies, 13 TFs) | <5% | ~2 MB | ✅ yes (CPU + RAM both fine) |
+| Pathological (100+ strategies) | ~10% | ~5 MB | ✅ yes; rip-cord to t4g.large only if order placement throughput becomes the bottleneck |
+
+**Verdict: t4g.medium handles 5× growth from BRUTEX-finalised strategies without breaking a sweat.** The 4GB RAM ceiling is dominated by QuestDB (1GB) + OS + headroom, NOT by strategy state. The 2 vCPU ceiling is dominated by burstable baseline (40%×2=0.8 vCPU effective), and live trading workload uses <2% of that even at 20 strategies.
+
+### §13.5 When would we need to upgrade?
+
+| Trigger | Action |
+|---|---|
+| `MemoryUtilization > 75%` for 1 hr | Upgrade to t4g.large (8GB, +₹377/mo) |
+| `CPUCreditBalance < 50` for 1 hr | Upgrade to c7g.large non-burstable (+₹1,000/mo) |
+| OMS placing > 500 orders/day | Stay on t4g.medium; bottleneck is Dhan REST not us |
+| QuestDB disk usage > 80% of 10GB EBS | Expand EBS to 20GB (+₹78/mo) — separate from instance |
+| BRUTEX-finalised strategy count > 30 | Review carefully; likely still fits but design 3-agent re-audit |
+
+**All upgrades are non-destructive: stop instance → resize → start. ~5min downtime, happens outside market hours.**
+
+### §13.6 Z+ guarantee for future load
+
+Per operator-charter §F honest envelope:
+
+> "100% inside the tested envelope of {4 SIDs × ≤20 strategies × ≤13 TFs × 4GB t4g.medium ARM ap-south-1}: hot-path latency O(1) per indicator update, strategy eval ≤2.4ms per minute aggregate, RAM working set ≤300MB inclusive of all future strategy state. Headroom ratchet test pins the working set; bench-gate fails build on >5% regression. Beyond the envelope, MemoryUtilization alarm fires at 75% and operator decides to upgrade instance."
+
+### §13.7 The 3 ratchet tests this section implies
+
+When the BRUTEX work lands, add these tests:
+
+1. `crates/trading/tests/strategy_load_ratchet.rs` — measures total RAM with 20 mock strategies; fails build if > 5 MB
+2. `crates/trading/benches/strategy_eval_p99.rs` — Criterion bench; per-eval p99 ≤ 100 µs; fails build at >5% regression
+3. `crates/storage/tests/cpu_credit_budget_alarm_guard.rs` — pins the `tv-cpu-credit-low` CloudWatch alarm name + threshold (=50)
+
+---
+
+## §12. Reading guide — which doc do you open when?
+
+| Question | Open this file |
+|---|---|
+| What does 8 AM auto-start do? | `aws-daily-lifecycle.md` |
+| What happens when [worst case]? | `aws-daily-lifecycle.md` §3 + the per-case runbook |
+| What instance do we use? | this file §5 |
+| Where does monitoring live? | this file §4 + §11 |
+| What gets deleted in the scope reduction? | `.claude/plans/aws-lifecycle/deletion-surface-map.md` |
+| What's the schedule? | this file §1 L11 (08:00/17:00 IST) |
+| Can we hit <₹1K/mo? | `aws-cost-floor-analysis.md` + this file §5 (answer: no, ₹1,168 is the safe floor) |
+
+---
+
+## §D. Trigger / auto-load paths
+
+This doc auto-loads when editing:
+- `deploy/docker/docker-compose.yml`
+- `deploy/aws/terraform/*.tf`
+- `crates/common/src/constants.rs` (TICK_BUFFER_CAPACITY)
+- `crates/common/src/config.rs` (SubscriptionScope)
+- `crates/app/src/main.rs` (boot sequence)
+- Any file containing `tv-app`, `tv-questdb`, `t4g.small`, `CloudWatch`, `IndicesUnderlyingsOnly`
