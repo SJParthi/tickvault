@@ -1202,7 +1202,7 @@ Z+ LOW fixes (4):
 - [x] **Item 22a** — Order placement 5s REST timeout + DH-904 retry policy
 - [x] **Item 22b** — Stop-loss-leg-cancelled auto-replace + `sl_replacement_audit`
 - [x] **Item 22c** — Boot-success Telegram positive ping at 09:14:55 IST
-- [ ] **Item 22d** — End-of-day Telegram digest at 15:31:30 IST
+- [x] **Item 22d** — End-of-day Telegram digest at 15:31:30 IST
 - [x] **Item 22e** — Tick-level integrity guards (price/oi/high≥low)
 - [x] **Item 22f** — Self-trade prevention 60s cooldown + `self_trade_audit`
 - [ ] ~~Item 22~~ — GIFT NIFTY (PARKED for Phase 2, do NOT implement)
