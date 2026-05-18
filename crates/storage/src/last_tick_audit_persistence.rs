@@ -42,8 +42,13 @@ use tickvault_common::config::QuestDbConfig;
 use tickvault_common::sanitize::sanitize_audit_string;
 
 pub const QUESTDB_TABLE_LAST_TICK_AUDIT: &str = "last_tick_audit";
+// QuestDB requires the designated timestamp column to be part of every
+// DEDUP UPSERT KEYS clause. The 2026-05-18 production boot returned
+// HTTP 400 from `/exec` because `ts` was missing here; without `ts`
+// the table never created and every `append_last_tick_audit_row`
+// silently failed.
 pub const DEDUP_KEY_LAST_TICK_AUDIT: &str =
-    "trading_date_ist, bar_minute, security_id, exchange_segment";
+    "ts, trading_date_ist, bar_minute, security_id, exchange_segment";
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
@@ -175,9 +180,13 @@ mod tests {
         // Plan §8: per-SID per-bar forensic table. DEDUP key MUST
         // include security_id + exchange_segment (I-P1-11) AND
         // trading_date_ist + bar_minute for per-day per-bar identity.
+        //
+        // 2026-05-18: `ts` prepended after production HTTP 400 — QuestDB
+        // requires the designated timestamp column to be part of every
+        // `DEDUP UPSERT KEYS(...)` clause.
         assert_eq!(
             DEDUP_KEY_LAST_TICK_AUDIT,
-            "trading_date_ist, bar_minute, security_id, exchange_segment",
+            "ts, trading_date_ist, bar_minute, security_id, exchange_segment",
         );
     }
 

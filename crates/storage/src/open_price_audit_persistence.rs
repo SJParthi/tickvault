@@ -38,7 +38,11 @@ pub const QUESTDB_TABLE_OPEN_PRICE_AUDIT: &str = "open_price_audit";
 // Composite DEDUP per I-P1-11 (security_id + segment) plus
 // trading_date_ist for per-day idempotency. Re-seal on mid-session
 // boot overwrites the prior row.
-pub const DEDUP_KEY_OPEN_PRICE_AUDIT: &str = "trading_date_ist, security_id, exchange_segment";
+// `ts` MUST appear in DEDUP UPSERT KEYS — QuestDB requires the
+// designated timestamp column. Without it the boot-time DDL returns
+// HTTP 400; same bug class as the 2026-05-18 gap_fill_audit +
+// last_tick_audit failures.
+pub const DEDUP_KEY_OPEN_PRICE_AUDIT: &str = "ts, trading_date_ist, security_id, exchange_segment";
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
