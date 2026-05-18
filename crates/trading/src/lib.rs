@@ -29,6 +29,7 @@ pub mod greeks;
 pub mod in_mem;
 pub mod indicator;
 pub mod oms;
+pub mod orphan_position_watchdog;
 pub mod risk;
 pub mod strategy;
 

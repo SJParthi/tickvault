@@ -444,6 +444,14 @@ pub enum ErrorCode {
     /// the other instance shuts down (or its 90 s TTL expires after
     /// a hard crash). Severity::Critical.
     Resilience01DualInstanceDetected,
+    /// ORPHAN-POSITION-01: at 15:25:00 IST the orphan-position
+    /// watchdog observed one or more open positions (`net_qty != 0`)
+    /// in the account. Strategy is intraday option-buying — NO
+    /// overnight positions allowed. Severity::Critical. In Phase 0
+    /// (dry-run) the watchdog logs + audits + Telegrams; in Phase 1+
+    /// it cancels Super Order legs and places market exits before
+    /// the 15:30 IST close.
+    OrphanPosition01Detected,
     /// GAP-FILL-01: gap-fill scheduler supervisor task caught a panic
     /// in the inner scheduler loop or the broadcast channel closed
     /// unexpectedly. Severity::Critical — the bounded-zero-loss
@@ -602,6 +610,7 @@ impl ErrorCode {
             Self::Boundary01CatchupSeal => "BOUNDARY-01",
             Self::AggregatorAudit01WriteFailed => "AGGREGATOR-AUDIT-01",
             Self::Resilience01DualInstanceDetected => "RESILIENCE-01",
+            Self::OrphanPosition01Detected => "ORPHAN-POSITION-01",
             // Phase 0 Items 8+9 — gap-fill scheduler
             Self::GapFill01SchedulerFailed => "GAP-FILL-01",
             Self::GapFill02RestFetchFailed => "GAP-FILL-02",
@@ -636,6 +645,7 @@ impl ErrorCode {
             | Self::Phase2Ready01PreflightFailed
             | Self::AggregatorDrop01
             | Self::Resilience01DualInstanceDetected
+            | Self::OrphanPosition01Detected
             | Self::GapFill01SchedulerFailed
             | Self::GapFill04EventChannelLagged => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
@@ -839,6 +849,9 @@ impl ErrorCode {
             | Self::Boundary01CatchupSeal
             | Self::AggregatorAudit01WriteFailed => ".claude/rules/project/wave-6-error-codes.md",
             Self::Resilience01DualInstanceDetected => ".claude/rules/project/wave-4-error-codes.md",
+            Self::OrphanPosition01Detected => {
+                ".claude/rules/project/phase-0-item-20-error-codes.md"
+            }
             Self::GapFill01SchedulerFailed
             | Self::GapFill02RestFetchFailed
             | Self::GapFill03UpsertFailed
@@ -969,6 +982,8 @@ impl ErrorCode {
             Self::AggregatorAudit01WriteFailed,
             // Wave 4 — Item 19 dual-instance lock
             Self::Resilience01DualInstanceDetected,
+            // Phase 0 Item 20 — orphan position 15:25 IST watchdog
+            Self::OrphanPosition01Detected,
             // Phase 0 Items 8+9 — gap-fill scheduler
             Self::GapFill01SchedulerFailed,
             Self::GapFill02RestFetchFailed,

@@ -1084,6 +1084,73 @@ mod tests {
         );
     }
 
+    /// Phase 0 Item 20 meta-guard: main.rs MUST include
+    /// `orphan_position_audit_persistence::ensure_orphan_position_audit_table`
+    /// in the boot-time DDL `tokio::join!`. Without the DDL, the
+    /// Phase 1+ supervisor task (which writes one audit row per
+    /// detected orphan position at 15:25:00 IST) will 404 against
+    /// the QuestDB ILP `orphan_position_audit` table.
+    ///
+    /// Also pins the `OrphanPositionDetected` / `OrphanPositionsClean`
+    /// Telegram variants and the `OrphanPosition01Detected` ErrorCode
+    /// so future refactors can't accidentally delete them while the
+    /// Phase 1+ runtime wiring is still in flight.
+    #[test]
+    fn test_orphan_position_audit_table_is_wired_into_boot_ddl() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable from secret_manager test working dir");
+
+        assert!(
+            main_rs.contains("ensure_orphan_position_audit_table"),
+            "main.rs MUST call \
+             `orphan_position_audit_persistence::ensure_orphan_position_audit_table` \
+             inside the boot DDL `tokio::join!`. Phase 0 Item 20 — \
+             without this DDL the Phase 1+ runtime wiring would hit a \
+             404 on the QuestDB ILP `orphan_position_audit` table."
+        );
+
+        let events_rs = std::fs::read_to_string("src/notification/events.rs")
+            .or_else(|_| std::fs::read_to_string("crates/core/src/notification/events.rs"))
+            .expect("events.rs must be readable");
+        assert!(
+            events_rs.contains("OrphanPositionDetected {"),
+            "events.rs MUST define the `OrphanPositionDetected` variant. \
+             Phase 0 Item 20 — this is the Critical-severity Telegram \
+             that fires at 15:25:00 IST when any position has \
+             `net_qty != 0`."
+        );
+        assert!(
+            events_rs.contains("OrphanPositionsClean"),
+            "events.rs MUST define the `OrphanPositionsClean` variant. \
+             Phase 0 Item 20 — this is the Info-severity positive-ping \
+             that confirms the account is flat at 15:25 IST (audit-\
+             findings Rule 11 — no false-OK gap)."
+        );
+
+        let error_code_rs = std::fs::read_to_string("../common/src/error_code.rs")
+            .or_else(|_| std::fs::read_to_string("crates/common/src/error_code.rs"))
+            .expect("error_code.rs must be readable");
+        assert!(
+            error_code_rs.contains("OrphanPosition01Detected"),
+            "error_code.rs MUST define the `OrphanPosition01Detected` \
+             variant. Phase 0 Item 20 — every Telegram error path \
+             carries `code = ErrorCode::OrphanPosition01Detected.code_str()` \
+             per the tag-guard contract."
+        );
+
+        let watchdog_rs = std::fs::read_to_string("../trading/src/orphan_position_watchdog.rs")
+            .or_else(|_| std::fs::read_to_string("crates/trading/src/orphan_position_watchdog.rs"))
+            .expect("orphan_position_watchdog.rs must exist");
+        assert!(
+            watchdog_rs.contains("pub fn evaluate_orphan_positions"),
+            "orphan_position_watchdog.rs MUST export the pure-function \
+             evaluator `evaluate_orphan_positions`. Phase 0 Item 20 — \
+             the Phase 1+ supervisor task drives audit-row write + \
+             Telegram emit off this function's verdict."
+        );
+    }
+
     /// Option-chain pipeline PR #2/5 meta-guard: main.rs MUST include
     /// `option_chain_minute_snapshot_persistence::ensure_option_chain_minute_snapshot_table`
     /// in the boot-time DDL `tokio::join!`. Without the DDL, the future
