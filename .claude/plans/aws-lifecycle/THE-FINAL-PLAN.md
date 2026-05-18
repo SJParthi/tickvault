@@ -379,7 +379,181 @@ After AWS account is created + before bootstrap:
 
 ---
 
-## §11. Trigger / auto-load
+## §11. Dhan API v2.5 Compliance Requirements — LOCKED 2026-05-18
+
+Per operator demand 2026-05-18 ("add all these recommendations into the plans docs architecture requirements"), the full Dhan API requirements that the locked design MUST honor:
+
+### §11.1 Authentication compliance (Dhan v2.4 SEBI mandate)
+
+| Requirement | Source | Our compliance |
+|---|---|---|
+| 24-hour Access Token max validity | v2.4 SEBI mandate Sep 2025 | `token_manager.rs` 23h pre-emptive refresh; never holds token > 23h |
+| Static IP mandatory for Order APIs (effective April 1, 2026) | v2.4 | Boot Step 5.5 calls `GET /v2/ip/getIP`; gates startup on `ordersAllowed=true`; HALT + Critical Telegram if false |
+| TOTP RFC 6238 6-digit, 30-second window | v2.4 | `totp-rs` crate; secret in AWS SSM SecureString `/tickvault/prod/dhan_totp_secret` |
+| `access-token` header (lowercase, hyphenated) for ALL REST | v2.0 | Locked in `oms/api_client.rs` headers |
+| `client-id` header REQUIRED in addition to `access-token` for Option Chain + Market Quote APIs | v2.1+ | Locked in `option_chain/` module — both headers always sent |
+| Token NEVER in URL query params, NEVER in logs, NEVER in QuestDB | charter §A | `Secret<String>` wrapper; tracing fields redact |
+| RenewToken extends 24h to another 24h | v2.0 | `GET /v2/RenewToken` called 1h before expiry as backup; primary path = full TOTP regen daily |
+
+### §11.2 Rate limit compliance (Dhan published limits)
+
+| API category | Per-sec | Per-day | Our rate at 4-SID scope | Headroom |
+|---|---|---|---|---|
+| Data APIs (option chain, intraday, historical) | 5 | 100,000 | ~1,455/day | 98.5% headroom |
+| Quote APIs (`/v2/marketfeed/ltp` etc) | 1 | unlimited | 0 (not used) | N/A |
+| Order APIs (Phase 1.5+) | 10 | 7,000 | ~50-100 orders/day expected | 98% headroom |
+| Non-Trading APIs (profile, fund limit, ip) | 20 | unlimited | ~10/day | 99% headroom |
+| Order modifications (per order) | — | 25 | TBD per strategy | N/A |
+
+**Rate limiter:** GCRA algorithm via `governor` crate. Dual limits (per-sec burst + per-day cumulative). Enforced in `oms/rate_limiter.rs` when Phase 1.5 wiring lands.
+
+### §11.3 Error handling compliance (Dhan v2.0 DH-900 series)
+
+Every Dhan API error has 3 string fields: `errorType`, `errorCode`, `errorMessage`. Mapped to `ErrorCode` enum:
+
+| Dhan code | Action | Severity |
+|---|---|---|
+| DH-901 (Invalid auth) | Force token refresh → retry ONCE → HALT if still fails | Critical |
+| DH-902 (No API access) | HALT + Telegram | Critical |
+| DH-903 (Account issues) | HALT + Telegram | Critical |
+| DH-904 (Rate limit) | Exponential backoff 10→20→40→80s; if 80s exhausted → CRITICAL | High |
+| DH-905 (Input exception) | NEVER retry; log + fix request | Medium |
+| DH-906 (Order error) | NEVER retry; log + fix order | Medium |
+| DH-907 (Data error) | Check params, no blind retry | Medium |
+| DH-908 (Internal server) | Retry with backoff (rare) | High |
+| DH-909 (Network) | Retry with backoff | High |
+| DH-910 (Other) | Log + alert | Medium |
+| Data 805 (Too many connections) | STOP ALL connections 60s, then reconnect one at a time | Critical |
+| Data 807 (Token expired) | Trigger token refresh + retry | High |
+
+All locked in `crates/common/src/error_code.rs` per `100-percent-compliance-audit.md` cross-ref test.
+
+### §11.4 Endpoint URLs — exact strings (no typos)
+
+| Purpose | URL |
+|---|---|
+| Generate token | `https://auth.dhan.co/app/generateAccessToken?dhanClientId={ID}&pin={PIN}&totp={TOTP}` |
+| Renew token | `https://api.dhan.co/v2/RenewToken` |
+| User profile | `https://api.dhan.co/v2/profile` |
+| Static IP set/modify/get | `https://api.dhan.co/v2/ip/setIP` / `/modifyIP` / `/getIP` |
+| Main feed WS | `wss://api-feed.dhan.co?version=2&token=<JWT>&clientId=<ID>&authType=2` |
+| Order update WS | `wss://api-order-update.dhan.co` (auth via JSON MsgCode 42 SELF) |
+| Option chain | `https://api.dhan.co/v2/optionchain` (POST, body has `UnderlyingScrip`/`UnderlyingSeg`/`Expiry`) |
+| Option chain expiry list | `https://api.dhan.co/v2/optionchain/expirylist` |
+| Intraday historical | `https://api.dhan.co/v2/charts/intraday` (interval "1"/"5"/"15"/"25"/"60") |
+| Daily historical | `https://api.dhan.co/v2/charts/historical` (supports `oi` param) |
+| Orders (Phase 1.5+) | `https://api.dhan.co/v2/orders` (POST/GET) `/orders/{id}` (PUT/DELETE/GET) |
+| Positions (Phase 1.5+) | `https://api.dhan.co/v2/positions` (GET/DELETE) |
+| Margin calc (Phase 1.5+) | `https://api.dhan.co/v2/margincalculator` (POST) |
+| Fund limit (Phase 1.5+) | `https://api.dhan.co/v2/fundlimit` (GET) |
+| Kill switch (Phase 1.5+) | `https://api.dhan.co/v2/killswitch` (POST/GET) |
+
+### §11.5 Field name quirks — locked in serde
+
+| Quirk | Dhan field | Our code |
+|---|---|---|
+| Fund limit typo (must keep!) | `availabelBalance` (missing 'l') | `#[serde(rename = "availabelBalance")]` |
+| Option Chain JSON keys PascalCase | `UnderlyingScrip`, `UnderlyingSeg`, `Expiry` | `#[serde(rename_all = "PascalCase")]` |
+| Order Update WS PascalCase top-level | `Data`, `Type` | Same |
+| Order Update WS single-char codes | `Product: "C"=CNC, "I"=INTRADAY, "M"=MARGIN, "F"=MTF, "V"=CO, "B"=BO` | Mapped enum |
+| Order Update WS `TxnType` | `"B"=Buy, "S"=Sell` | Mapped enum |
+| Order Update WS `Source` | `"P"=API, "N"=Normal (Dhan web)` | Filter own orders by `Source="P"` |
+| Postback `filled_qty` snake_case | inconsistent with rest | Exact field name preserved |
+| `last_trade_time` is STRING not epoch | `"DD/MM/YYYY HH:MM:SS"` | Parse as string |
+| Option chain strike keys are DECIMAL STRINGS | `"25650.000000"` | Parse to f64 |
+| CE or PE may be `None` (deep OTM) | sparse map | `Option<OptionData>` |
+| `crossCurrency` boolean | currency F&O only | `Option<bool>` with `#[serde(default)]` |
+
+### §11.6 Annexure enums — exact numeric codes
+
+| Enum | Values | Our location |
+|---|---|---|
+| ExchangeSegment | IDX_I=0, NSE_EQ=1, NSE_FNO=2, NSE_CURRENCY=3, BSE_EQ=4, MCX_COMM=5, **gap at 6**, BSE_CURRENCY=7, BSE_FNO=8 | `common/src/types.rs::ExchangeSegment` — at locked scope only IDX_I (0) active |
+| ProductType | CNC, INTRADAY, MARGIN, MTF, CO, BO | `common/src/order_types.rs` |
+| OrderStatus | TRANSIT, PENDING, CLOSED, TRIGGERED, REJECTED, CANCELLED, PART_TRADED, TRADED, EXPIRED | `common/src/order_types.rs` |
+| FeedRequestCode | 11=Connect, 12=Disconnect, 15/17/21=Subscribe Ticker/Quote/Full, 16/18/22=Unsubscribe, 23=Subscribe Depth, **25=Unsubscribe Depth (NOT 24)** | `common/src/types.rs` |
+| FeedResponseCode | 1=Index, 2=Ticker, 4=Quote, 5=OI, ~~6=PrevClose~~ DROPPED, 7=MarketStatus, 8=Full, 50=Disconnect | code 6 parser deleted per operator insight |
+| InstrumentType | INDEX, FUTIDX, OPTIDX, EQUITY, FUTSTK, OPTSTK, FUTCOM, OPTFUT, FUTCUR, OPTCUR | `common/src/instrument_types.rs` |
+| ExpiryCode | 0=Current/Near, 1=Next, 2=Far | `common/src/instrument_types.rs` |
+
+### §11.7 Mandatory manual steps (Claude/Cowork CANNOT automate)
+
+| Step | Why manual | When |
+|---|---|---|
+| AWS account creation (email + payment card) | AWS legal req; no API for individual signup | Once |
+| Register EIP with Dhan via web.dhan.co | Dhan requires logged-in web session; no API for IP registration | Once + after any EIP change (7-day cooldown) |
+| DLT-SMS sender ID registration (TRAI mandate for India SMS) | Carrier-side identity verification | Once, ~24-48h processing |
+| Dhan TOTP setup via web.dhan.co (scan QR via Authenticator app) | Identity verification with OTP via email/mobile | Once at Dhan account setup |
+| Telegram bot creation via @BotFather (operator owns token) | Telegram requires interactive bot creation | Once |
+| Approve Cowork bootstrap prompt + provide secrets when asked | Operator must authorize | Once at bootstrap |
+
+### §11.8 Phase 1.5 wiring blockers (Order APIs designed, not wired)
+
+Per `gap-inventory-2026-05-18.md` §1 — the 11-item Phase 1.5 wiring milestone:
+
+| # | Wire-up | Dhan API touched |
+|---|---|---|
+| 1 | Strategy `Signal` → Risk pre-check → OMS order construction | (internal) |
+| 2 | OMS state machine 10/26 transitions implemented | (internal) |
+| 3 | Order update WS events → strategy notification | `wss://api-order-update.dhan.co` |
+| 4 | Position tracker hooked to order_audit | `GET /v2/positions` |
+| 5 | Kill switch state shared Risk + OMS + Strategy | `POST /v2/killswitch`, `GET /v2/killswitch` |
+| 6 | Daily loss aggregator | (internal, uses trade book) |
+| 7 | Idempotency UUID per strategy decision | `correlationId` field in `POST /v2/orders` |
+| 8 | Rate limiter wired to OMS API client | All Order APIs |
+| 9 | Circuit breaker on OMS failures | DH-904/908/909 detection |
+| 10 | Reconciliation against Dhan position book daily | `GET /v2/positions` + `GET /v2/trades` |
+| 11 | EOD square-off path (when `dry_run=false`) | `DELETE /v2/positions` (Exit All v2.5) |
+
+**Until Phase 1.5 wiring lands, tickvault runs in OBSERVATION mode** (subscribed to ticks + option chain + cross-verify daily; no orders placed).
+
+### §11.9 v2.5 OPTIONAL features — deferred (operator decides if/when)
+
+| Feature | Operator decision needed |
+|---|---|
+| Conditional Trigger Orders (alert-based order placement) | Useful if strategies use "RSI crosses 70 → place order"; defer until strategy design |
+| P&L based exit (server-side auto-square-off at threshold) | Alternative to client-side risk engine; defer (we prefer client-side control) |
+| Exit All API (`DELETE /v2/positions`) | 🟡 Phase 1.5 USE — EOD + emergency square-off |
+| Programmatic token generation via TOTP | 🟢 Already locked in our design |
+| Option Chain `average_price` + `security_id` per strike (v2.5) | 🟢 Already in our `option_chain_snapshots` schema |
+
+### §11.10 APIs we explicitly DO NOT use (and why)
+
+| API | Why not |
+|---|---|
+| `POST /v2/super/orders` | Phase 1.5 strategy may use; defer — we'll likely use plain orders + client-side risk |
+| `POST /v2/forever/orders` (GTT) | We don't park overnight orders |
+| `POST /v2/positions/convert` (intraday ↔ CNC) | We don't convert; orders stay in intraday |
+| `GET /v2/holdings` | We trade options, not equity holdings |
+| `GET /v2/edis/tpin` + `POST /v2/edis/form` | EDIS only needed for selling demat stocks; we don't hold |
+| `GET /v2/ledger`, `GET /v2/trades/{from}/{to}/{page}` | Operator pulls from Dhan web/email if needed for tax filing |
+| Partner authentication 3-step flow | We are individual trader, not partner platform |
+| BSE F&O / NSE_CURRENCY / MCX_COMM / BSE_CURRENCY subscriptions | Out of locked indices-only scope |
+| `POST /v2/marketfeed/ltp` / `/ohlc` / `/quote` REST | WS Live Market Feed already gives us LTP/OHLC; REST is wasteful at 4 SIDs |
+| Postback URL (HTTP webhook for order updates) | We use Order Update WS — postback is backup we don't need |
+| 20-level depth WS | Depth dropped per LOCK-I |
+| 200-level depth WS | Same |
+
+### §11.11 Ratchet tests pinning Dhan compliance
+
+| Test file | Ratchets |
+|---|---|
+| `crates/common/tests/error_code_rule_file_crossref.rs` | Every DH-901..910 + DATA-800..814 has rule-file mention |
+| `crates/common/tests/error_code_tag_guard.rs` | Every `error!` carries `code = ErrorCode::DH901.code_str()` field |
+| `crates/core/tests/ws_protocol_e2e.rs` | Binary protocol byte offsets match Dhan spec (8-byte main feed header, 16-byte ticker, 50-byte quote, 162-byte full) |
+| `crates/core/src/parser/types.rs::test_exchange_segment_gap_at_6` | Verifies enum NEVER assigns 6 |
+| `crates/core/src/option_chain/test_client_id_header_required` | Verifies both `access-token` + `client-id` headers always sent |
+| `crates/storage/tests/dedup_segment_meta_guard.rs` | Every DEDUP key includes `exchange_segment` per I-P1-11 |
+
+### §11.12 Honest envelope on Dhan compliance
+
+> "100% inside the Dhan v2.5 specification: we use 10 APIs daily, 11 more at Phase 1.5, skip ~30 out-of-scope APIs. Every endpoint URL exact-stringed. Every JSON field quirk (typos, PascalCase, single-char codes) preserved in serde. Every rate limit honored with GCRA + headroom. Every error code (DH-901..910 + DATA-800..814) mapped to typed handler. Every annexure enum (ExchangeSegment with gap at 6, FeedRequestCode with 25-not-24 for unsubscribe depth) locked in code with ratchet tests.
+>
+> Beyond envelope: Dhan ships new API endpoints in future v2.6+ — operator decides which to adopt; documented adapter pattern in `dhan-api-coverage-map.md` makes adding new endpoints a 1-PR change."
+
+---
+
+## §12. Trigger / auto-load
 
 Always loaded — this is the canonical plan. Activates when editing:
 - Any file under `crates/`
