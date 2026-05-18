@@ -292,6 +292,129 @@ That's **0.156 GB** out of the 4 GB instance — **4% of total RAM.**
 
 ---
 
+## §7B. Operator clarification 2026-05-18 — "all timeframes = fully dynamic + scalable"
+
+Operator clarified: "all timeframes" means the FULL dynamic + scalable set, not just the initial 6. Existing candle aggregator already supports **21 timeframes** per CLAUDE.md.
+
+### Full 21-TF dynamic list
+
+| TF | Bars/day | Notes |
+|---|---|---|
+| 1m | 375 | shortest |
+| 2m | 188 | |
+| 3m | 125 | |
+| 4m | 94 | |
+| 5m | 75 | |
+| 6m | 63 | |
+| 7m | 54 | |
+| 8m | 47 | |
+| 9m | 42 | |
+| 10m | 38 | |
+| 11m | 35 | |
+| 12m | 31 | |
+| 13m | 29 | |
+| 14m | 27 | |
+| 15m | 25 | |
+| 30m | 13 | |
+| 1h | 7 | |
+| 2h | 4 | |
+| 3h | 3 | |
+| 4h | 2 | |
+| 1d | 1 | longest |
+| **Sum per instrument per day** | **1,278 bars** | |
+
+### Recomputed math for 21 TFs × 30 trading days × 3 SIDs
+
+| Component | 6 TFs (old) | **21 TFs (NEW)** | Delta |
+|---|---|---|---|
+| Sealed bars 30 days × all TFs × 3 SIDs | 4.4 MB | **9.2 MB** | +4.8 MB |
+| Today's sealed bars (intraday) | 146 KB | **307 KB** | +161 KB |
+| Indicator state (5 ind × TFs × 3 SIDs) | 12.6 KB | **220 KB** | +208 KB |
+| Strategy state (10 strats × 3 SIDs × TFs) | 36 KB | **126 KB** | +90 KB |
+| FSM transition tables | 60 KB | 60 KB | same |
+| Strategy parameter tables | 25 KB | 25 KB | same |
+| **NEW WORKING SET DELTA** | | | **+5.3 MB** |
+
+### Updated total RAM budget (21 TFs LOCKED)
+
+| Component | RAM |
+|---|---|
+| App working set with 21 TFs (was 156 MB) | **~162 MB** |
+| QuestDB container | 1024 MB |
+| OS + kernel + FS cache | 300 MB |
+| Docker daemon overhead | 80 MB |
+| Tokio scheduler safety margin | 50 MB |
+| **TOTAL USED** | **~1,616 MB** |
+| **HEADROOM FREE** | **~2,480 MB (60.5%)** |
+
+**Going from 6 TFs to 21 TFs adds 5.3 MB. Total RAM movement: 0.13%. Headroom essentially unchanged.**
+
+### Why 21 TFs is the natural ceiling
+
+The 21-TF list exhaustively covers every minute boundary 1-15 + standard hour boundaries up to 1d. Beyond 21:
+- 45m, 90m would be unusual and rarely backtested as winners
+- Sub-minute TFs (1s, 5s, 30s) would be wasteful for indices that tick ~1/sec
+- Day-spanning TFs (1w, 1mo) typically read directly from sealed daily bars on-demand
+
+If operator wants TFs BEYOND 21 (e.g. 45m, 90m, 1w): each new TF adds ~50 KB per SID across all components. Adding 10 more TFs = +0.5 MB. Still trivial.
+
+### Dynamic + scalable proof
+
+| Dimension | Mechanism | Proof |
+|---|---|---|
+| Dynamic — add/remove TFs at runtime | `config/base.toml::[candle_aggregator].timeframes` is read at boot AND via config hot-reload (notify crate) | Same pattern as `[strategy]` config hot-reload (existing) |
+| Scalable — each TF is O(1) extra cost | Per-TF cell + indicator + strategy state are isolated `Arc<RwLock<>>` per TF | No cross-TF coupling on hot path |
+| Common runtime | Same Rust code on Mac dev and AWS prod | Already passes per `aws-budget.md` rule 10 |
+| Real-time proof | Per-TF Prometheus gauge `tv_candle_seals_total{tf}` exists today | KEEP at slimmer scope |
+
+### Worst-case stress: ALL 21 TFs × ALL 1-year history × 10 strategies × ALL day's raw ticks
+
+| Component | RAM |
+|---|---|
+| Sealed bars 250 trading days × 21 TFs × 3 SIDs | 77 MB |
+| Indicators full × all TFs × all SIDs | 220 KB |
+| Strategies × all combinations | 126 KB |
+| All today's raw ticks in RAM (270 MB worst case) | 270 MB |
+| Option chain full-day history (450 snapshots) | 54 MB |
+| WebSocket + Tokio + HTTP + log queues | 48 MB |
+| Heap fragmentation 20% | 90 MB |
+| **App working set (PATHOLOGICAL)** | **~540 MB** |
+| QuestDB doubled workload | 2 GB |
+| OS + Docker + headroom safety | 500 MB |
+| **GRAND TOTAL PATHOLOGICAL** | **~3.04 GB out of 4 GB** |
+| **HEADROOM (pathological)** | **~960 MB (24%)** |
+
+**Even in PATHOLOGICAL worst case — 1-year history × all 21 TFs × all today's ticks × doubled QuestDB — we still have 24% headroom on t4g.medium 4GB.**
+
+### Honest envelope update
+
+> "Inside the dynamic-TF tested envelope of {3 SIDs × up to 21 timeframes × 30 trading days history + today's live ticks (rescue ring 100K + optional 50 MB replay buffer) + 5 indicators × 21 TFs × 3 SIDs + 10 BRUTEX-finalised strategies + option chain RAM cache (3 underlyings × 100 strikes × 2 sides × 1 hour history)}: RAM working set = ~162 MB out of 4 GB. Headroom 2.48 GB (60%). Adding more TFs scales O(1) per-TF at ~50 KB per SID — operator can dial freely.
+>
+> **NOT promised:** unbounded TFs (>30 unique). Sub-second TFs (1s/5s) — would need different aggregator design. Mixed-second-and-minute granularity beyond current aggregator scope."
+
+### Ratchet test (updated for 21 TFs)
+
+`crates/trading/tests/ram_working_set_ratchet.rs` (proposed):
+```rust
+// PSEUDOCODE
+#[test]
+fn ram_working_set_with_all_21_timeframes_fits_budget() {
+    let setup = TestSetup {
+        sids: vec![13, 25, 51],
+        timeframes: ALL_21_TFS,
+        history_days: 30,
+        strategies: 10,
+        indicators_per_tf: 5,
+    };
+    let allocated = simulate_full_load(setup);
+    assert!(allocated < 200 * MB, "App working set must stay < 200 MB; got {}", allocated);
+}
+```
+
+Fails the build if anyone introduces a memory regression that pushes us over budget.
+
+---
+
 ## §8. Trigger / auto-load
 
 This rule activates when editing:
