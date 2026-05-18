@@ -34,7 +34,12 @@ use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::sanitize_audit_string;
 
 pub const QUESTDB_TABLE_GAP_FILL_AUDIT: &str = "gap_fill_audit";
-pub const DEDUP_KEY_GAP_FILL_AUDIT: &str = "trading_date_ist, bar_minute, trigger_event";
+// QuestDB requires the designated timestamp column to be part of every
+// DEDUP UPSERT KEYS clause. The 2026-05-18 production boot returned
+// HTTP 400 from `/exec` because `ts` was missing here; without `ts`
+// the table never created, every `append_gap_fill_audit_row` silently
+// failed, and the SEBI forensic chain was audit-blind.
+pub const DEDUP_KEY_GAP_FILL_AUDIT: &str = "ts, trading_date_ist, bar_minute, trigger_event";
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
@@ -211,9 +216,14 @@ mod tests {
         // Same-day re-attempt of the SAME bar under the SAME trigger
         // overwrites the previous row — operator can re-run gap-fill
         // without DUP'd rows.
+        //
+        // 2026-05-18: `ts` prepended after production HTTP 400 — QuestDB
+        // requires the designated timestamp column to be part of every
+        // `DEDUP UPSERT KEYS(...)` clause. Same-bar/same-trigger rows
+        // remain unique because `ts` is constant within a single bar.
         assert_eq!(
             DEDUP_KEY_GAP_FILL_AUDIT,
-            "trading_date_ist, bar_minute, trigger_event",
+            "ts, trading_date_ist, bar_minute, trigger_event",
         );
     }
 

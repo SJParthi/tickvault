@@ -161,6 +161,74 @@ fn every_dedup_key_is_listed_here_for_auditing() {
 }
 
 // ============================================================================
+// Meta-guard — every audit-table DEDUP key MUST include the designated
+// timestamp column `ts` (regression: 2026-05-18 production boot)
+// ============================================================================
+//
+// QuestDB requires the designated timestamp column to be part of every
+// `DEDUP UPSERT KEYS(...)` clause. On 2026-05-18 the production boot
+// returned HTTP 400 for `gap_fill_audit` (ERROR) and `last_tick_audit`
+// (WARN) because their DEDUP key constants omitted `ts` and the DDL
+// format string did not prepend it. The 4 latent siblings
+// (`order_update_ws_audit`, `sl_replacement_audit`, `open_price_audit`,
+// `self_trade_audit`) carried the same omission but had not yet been
+// wired into the boot path.
+//
+// This guard scans every `DEDUP_KEY_*_AUDIT` constant in the storage
+// crate and fails the build if any of them omits `ts`. Tables whose
+// DDL prepends `ts` at format time (e.g. `aggregator_seal_audit` —
+// `DEDUP UPSERT KEYS(ts, {DEDUP_KEY_AGGREGATOR_SEAL_AUDIT})`) are
+// explicitly listed in `DDL_PREPENDS_TS_AT_FORMAT_TIME` so the guard
+// allows them. Any new audit-table constant added without `ts` (and
+// without an explicit format-time prepend) blocks the build.
+
+const DDL_PREPENDS_TS_AT_FORMAT_TIME: &[&str] = &[
+    // `shadow_persistence.rs` emits `DEDUP UPSERT KEYS(ts, {DEDUP_KEY_AGGREGATOR_SEAL_AUDIT})`.
+    "DEDUP_KEY_AGGREGATOR_SEAL_AUDIT",
+];
+
+#[test]
+fn every_audit_dedup_key_must_include_designated_timestamp_ts() {
+    let decls = collect_dedup_key_declarations();
+    let mut violations: Vec<String> = Vec::new();
+
+    for (path, line, name, body) in &decls {
+        if !name.ends_with("_AUDIT") {
+            continue;
+        }
+        if DDL_PREPENDS_TS_AT_FORMAT_TIME.contains(&name.as_str()) {
+            continue;
+        }
+        // Match `ts` as a whole token (avoid false positives like
+        // `candle_ts` or `last_seen_ltt`).
+        let has_ts_token = body.split([',', ' ']).map(str::trim).any(|tok| tok == "ts");
+        if !has_ts_token {
+            violations.push(format!(
+                "{}:{} — {} = \"{}\" omits the designated timestamp column `ts`. \
+                 QuestDB returns HTTP 400 from `/exec` at boot when the DDL's \
+                 `DEDUP UPSERT KEYS(...)` clause does not include the designated \
+                 timestamp column. Fix by prepending `ts, ` to the constant body, \
+                 OR add the constant name to `DDL_PREPENDS_TS_AT_FORMAT_TIME` if \
+                 the DDL format string explicitly prepends `ts`.",
+                path.display(),
+                line,
+                name,
+                body
+            ));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "Audit-table DEDUP key missing `ts` (2026-05-18 production regression):\n\n{}\n\n\
+         Cause: gap_fill_audit + last_tick_audit returned HTTP 400 at boot because \
+         their DEDUP keys lacked the designated timestamp column. See \
+         .claude/rules/project/phase-0-architecture.md (audit-table template).",
+        violations.join("\n\n"),
+    );
+}
+
+// ============================================================================
 // Self-tests for the helpers
 // ============================================================================
 

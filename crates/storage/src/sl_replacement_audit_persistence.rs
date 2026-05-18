@@ -52,8 +52,12 @@ pub const QUESTDB_TABLE_SL_REPLACEMENT_AUDIT: &str = "sl_replacement_audit";
 // `outcome` in the key, the Replaced row would silently overwrite
 // the Detected row and the operator would lose the timing of
 // detection vs the timing of the API call.
+// `ts` MUST appear in DEDUP UPSERT KEYS — QuestDB requires the
+// designated timestamp column. Without it the boot-time DDL returns
+// HTTP 400; same bug class as the 2026-05-18 gap_fill_audit +
+// last_tick_audit failures.
 pub const DEDUP_KEY_SL_REPLACEMENT_AUDIT: &str =
-    "trading_date_ist, parent_order_id, cancelled_leg_order_id, outcome";
+    "ts, trading_date_ist, parent_order_id, cancelled_leg_order_id, outcome";
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 

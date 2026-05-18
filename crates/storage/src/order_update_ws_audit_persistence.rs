@@ -37,7 +37,11 @@ pub const QUESTDB_TABLE_ORDER_UPDATE_WS_AUDIT: &str = "order_update_ws_audit";
 // Pending -> Traded within the same day; both rows must survive. The
 // `status` discriminator prevents same-second duplicates from
 // fragmenting the audit history.
-pub const DEDUP_KEY_ORDER_UPDATE_WS_AUDIT: &str = "trading_date_ist, order_no, status";
+// `ts` MUST appear in DEDUP UPSERT KEYS — QuestDB requires the
+// designated timestamp column. Without it the boot-time DDL returns
+// HTTP 400; same bug class as the 2026-05-18 gap_fill_audit +
+// last_tick_audit failures.
+pub const DEDUP_KEY_ORDER_UPDATE_WS_AUDIT: &str = "ts, trading_date_ist, order_no, status";
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
