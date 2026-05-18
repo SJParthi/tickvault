@@ -245,7 +245,7 @@ TOTAL:                                                ~₹1,022/mo  ✘ ₹22 ov
 | Risk | Mitigation |
 |---|---|
 | 4GB RAM has 2GB headroom after slimmed stack | Monitor `MemoryUtilization` CW alarm at 75%; ample for current ~2GB working set + future strategy load |
-| Burstable CPU could exhaust under 09:15:30 IST bursts | Audit: 4 SIDs at 20 ticks/sec + 10 future strategies × 6 TFs ≈ 0.5% of 1 vCPU. Burstable trivially handles it. Baseline 40% × 2 vCPU = 0.8 vCPU effective. |
+| Burstable CPU could exhaust under 09:15:30 IST bursts | Audit: 4 SIDs at 20 ticks/sec + 10 future strategies × 21 TFs ≈ 0.5% of 1 vCPU. Burstable trivially handles it. Baseline 40% × 2 vCPU = 0.8 vCPU effective. |
 | Single-AZ — InsufficientInstanceCapacity | Manual fallback to alternate AZ per `aws-capacity-error.md`. 99.99% region SLA = ~4.3min/mo expected downtime. |
 | ap-south-1 region outage | Accept envelope. Documented in §B honest envelope. |
 | Future BRUTEX strategy load growth >10× expected | See §13 — t4g.medium still fits, t4g.large is the rip-cord if needed (~₹1,262/mo) |
@@ -704,7 +704,7 @@ Per-tick path (~20 ticks/sec peak from 4 SIDs):
 Strategy evaluation (per-minute boundary):
 
 ```
-10 strategies × 4 instruments × 6 TFs × 10 µs eval each
+10 strategies × 4 instruments × 21 TFs × 10 µs eval each
 = 2.4 ms / minute
 = 0.004% of 1 vCPU
 ```
@@ -751,8 +751,8 @@ Even with 500 orders/day × 50 ms each = 25 sec/day = 0.03% — still trivial
 | Scenario | CPU | RAM additional | Still fits t4g.medium? |
 |---|---|---|---|
 | Current (no live strategies) | <0.1% | 0 | ✅ yes, ample |
-| Phase 1 (3-5 strategies, 6 TFs) | <0.3% | ~50 KB | ✅ yes |
-| Phase 2 BRUTEX-finalised (10 strategies, 6 TFs) | <0.5% | ~250 KB | ✅ yes |
+| Phase 1 (3-5 strategies, 21 TFs) | <0.3% | ~50 KB | ✅ yes |
+| Phase 2 BRUTEX-finalised (10 strategies, 21 TFs) | <0.5% | ~250 KB | ✅ yes |
 | Stress case (20 strategies, 13 TFs) | <2% | ~500 KB | ✅ yes |
 | Theoretical (50 strategies, 13 TFs) | <5% | ~2 MB | ✅ yes (CPU + RAM both fine) |
 | Pathological (100+ strategies) | ~10% | ~5 MB | ✅ yes; rip-cord to t4g.large only if order placement throughput becomes the bottleneck |
