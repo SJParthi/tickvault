@@ -56,12 +56,30 @@ use tokio::sync::RwLock;
 /// that traded at all during pre-open gets captured.
 pub const PREOPEN_MINUTE_SLOTS: usize = 13;
 
-/// Pre-open index underlyings whose 09:12 close is used to pick depth-20 +
-/// depth-200 ATM strikes at 09:13:00 IST (mirror of the stock F&O dispatch
-/// path — see `phase2_scheduler.rs` and `.claude/plans/active-plan.md`
-/// items A + C). The security IDs come from Dhan's instrument master and are
-/// fixed per `.claude/rules/project/depth-subscription.md`.
-pub const PREOPEN_INDEX_UNDERLYINGS: &[(&str, u32)] = &[("NIFTY", 13), ("BANKNIFTY", 25)];
+/// Pre-open index underlyings whose pre-market finalised close (backtracked
+/// from minutes 09:00–09:12 IST) is the AUTHORITATIVE 09:15:00 IST OPEN PRICE
+/// for the index. The aggregator's seal_bar() at the 09:15:00 boundary
+/// uses `backtrack_latest()` from this buffer instead of the first post-open
+/// tick's last_price (which would be the first TRADED price, NOT the NSE
+/// equilibrium open).
+///
+/// 2026-05-18 (PR #2.5 of AWS-lifecycle 14-PR sequence) — extended from 2
+/// IDX_I SIDs (NIFTY, BANKNIFTY) to all 4 IDX_I SIDs (adds SENSEX = 51 +
+/// INDIA VIX = 21) per operator-locked indices-only scope. The legacy
+/// depth-20/200 ATM strike-selection use-case (which only needed NIFTY +
+/// BANKNIFTY) is deprecated: depth is being deleted in PR #4, and SENSEX +
+/// INDIA VIX never had depth subscriptions. The pre-market buffer now exists
+/// SOLELY to provide the 09:15:00 IST open price for the 4-SID indices-only
+/// universe.
+///
+/// Security IDs verified from Dhan's instrument master per
+/// `.claude/rules/project/live-market-feed-subscription.md` (Wave 5 Update).
+pub const PREOPEN_INDEX_UNDERLYINGS: &[(&str, u32)] = &[
+    ("NIFTY", 13),
+    ("BANKNIFTY", 25),
+    ("SENSEX", 51),
+    ("INDIA VIX", 21),
+];
 
 /// First captured minute, as seconds since IST midnight (09:00:00 IST).
 ///
@@ -637,10 +655,30 @@ mod tests {
     }
 
     #[test]
-    fn test_build_preopen_index_lookup_contains_exactly_two_entries() {
+    fn test_build_preopen_index_lookup_contains_exactly_four_entries() {
+        // 2026-05-18 (PR #2.5 of AWS-lifecycle 14-PR sequence):
+        // PREOPEN_INDEX_UNDERLYINGS extended from 2 SIDs (NIFTY, BANKNIFTY)
+        // to 4 SIDs (adds SENSEX = 51, INDIA VIX = 21). The 4 IDX_I SIDs
+        // are the LOCKED indices-only universe per operator-charter §I.
+        // The pre-market buffer now provides the 09:15:00 IST open price
+        // for ALL 4 SIDs via `backtrack_latest()`.
         let lookup = build_preopen_index_lookup();
         assert_eq!(lookup.len(), PREOPEN_INDEX_UNDERLYINGS.len());
-        assert_eq!(lookup.len(), 2, "today we subscribe NIFTY + BANKNIFTY only");
+        assert_eq!(
+            lookup.len(),
+            4,
+            "PR #2.5 locked 4 IDX_I SIDs: NIFTY + BANKNIFTY + SENSEX + INDIA VIX"
+        );
+        // Ratchet: confirm each of the 4 expected SIDs is in the lookup
+        // by composite (security_id, IDX_I segment) key.
+        use tickvault_common::types::ExchangeSegment;
+        for sid in [13_u32, 25, 51, 21] {
+            let key = (sid, ExchangeSegment::IdxI);
+            assert!(
+                lookup.contains_key(&key),
+                "expected SID {sid} (IDX_I) in PREOPEN_INDEX_UNDERLYINGS lookup"
+            );
+        }
     }
 
     #[test]
