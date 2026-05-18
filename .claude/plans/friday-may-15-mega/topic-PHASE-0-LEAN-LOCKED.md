@@ -1195,7 +1195,7 @@ Z+ LOW fixes (4):
 - [ ] **Item 15** — 09:16:05 IST cross-check vs Dhan `/charts/intraday` 09:15 bar
 - [ ] **Item 16** — `open_price_audit` + 3 Telegram variants + 8 ratchets
 - [x] **Item 17** — SEBI 24h JWT daily renewal observability + `auth_renewal_audit`
-- [ ] **Item 18** — Static IP boot check (`ordersAllowed=true`)
+- [x] **Item 18** — Static IP boot check (`ordersAllowed=true`)
 - [ ] **Item 19** — Dual-instance lock (RESILIENCE-01) via `live_instance_lock` table
 - [ ] **Item 20** — Orphan position 15:25 IST watchdog
 - [ ] **Item 21** — NaN / div-by-zero indicator guards
