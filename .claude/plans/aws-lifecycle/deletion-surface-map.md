@@ -232,8 +232,97 @@
 
 1. **218 NSE_EQ cash equities — really delete?** They were not in the operator's 2026-05-18 verbatim list (operator said only NIFTY/BANKNIFTY/SENSEX/VIX). Confirming: yes, drop them.
 2. **Display indices (26 sectoral) — really delete?** Operator's list had only INDIA VIX. Confirming: yes, drop the other 25.
-3. **Timeframe table for ticks-storage — what TFs are kept persisted?** Locked initial: 1m/3m/5m/15m/1h/1d. Drop everything else from `candles_*` tables?
+3. **Timeframe table for ticks-storage — what TFs are kept persisted?** Locked initial: ticks + 1m/3m/5m/15m/1h/1d. Drop everything else from `candles_*` tables.
 4. **Currently archived audit tables (boot_audit, order_audit, etc) — keep at slimmer scope?** Yes, keep — they're scope-agnostic.
+
+---
+
+## 2026-05-18 UPDATE — Cross-verify EXPLICITLY KEPT + Heavy loaders DELETED
+
+### Cross-verify subsystem (Z+ L3 RECONCILE — MUST stay)
+
+Per operator demand 2026-05-18 ("every day after precisely 3:31 pm our cross verification of live candle 1m, 5m, 15m, 1h vs historical data... only then we will know if any ticks missed") + `aws-indices-only-locked-architecture.md` §14:
+
+| Element | Action | Reason |
+|---|---|---|
+| `crates/core/src/historical/cross_verify.rs` | **KEEP (explicit)** | Zero-tolerance candle cross-match — the ONLY way to know if ticks were missed |
+| `crates/core/src/historical/candle_fetcher.rs` | **KEEP + MODIFY** | Narrow scope: fetch ONLY for 4 SIDs (NIFTY/BANKNIFTY/SENSEX/INDIA VIX); drop the 218-stock loop + index F&O loop |
+| `NotificationEvent::CandleCrossMatchPassed` / `CandleCrossMatchFailed` | **KEEP** | Telegram routing already wired |
+| `historical-candles-cross-verify.md` rule file | **KEEP + MODIFY** | Add morning-1d section per §14 of new design doc |
+| Add: `candle_cross_verify_audit` table (DEDUP key: trading_date_ist, instrument_id, exchange_segment, timeframe) | **ADD** | New audit trail per §14.5 |
+| Add: `candle_cross_verify_mismatches` table | **ADD** | Per-mismatch detail |
+| Add: `morning_1d_cross_check_audit` table | **ADD** | Pre-market integrity gate |
+| Add: 4 new CW alarms (1531-not-fired, 1531-mismatch, morning-not-fired, morning-mismatch) | **ADD** | Z+ L1 DETECT for the gates |
+| Add: 4 new ErrorCode variants (CROSS-VERIFY-01..04) | **ADD** | Per §14.4 |
+| Add: 08:05 IST scheduler in main.rs boot step (NEW) | **ADD** | Morning gate runs before market opens |
+| Add: 15:31 IST scheduler hookup | **ADD** | Pin existing cross_verify to 15:31 IST trigger |
+
+### Heavy loaders DELETION confirmation (operator 2026-05-18)
+
+Operator verbatim: *"nse or bse bhavcopy should be entirely removed dude see entire heavy instruments or heavy loading remove everything entirely."*
+
+| Heavy element | Action | Reason |
+|---|---|---|
+| NSE bhavcopy download + parse (`bhavcopy_scheduler.rs`, `bhavcopy_fetcher.rs`, `bhavcopy_cross_check.rs`, `csv_parser.rs`) | **DELETE** (already in Category 1) | No stock F&O; bhavcopy only useful for delivery contracts |
+| BSE bhavcopy | **DELETE** | Same reason |
+| `prev_oi cache from bhavcopy` (`build_prev_oi_cache_from_bhavcopy`) | **DELETE** | No stock F&O OI tracking |
+| Full instrument master CSV download (~25K rows) | **DELETE** | Replaced by `const INSTRUMENTS: &[(u32, &str)] = &[(13,"NIFTY"), (25,"BANKNIFTY"), (51,"SENSEX"), (21,"INDIA VIX")];` — 4-line replacement |
+| `csv_downloader.rs`, `csv_parser.rs`, `universe_builder.rs` | **DELETE** | Universe = compile-time constant |
+| rkyv binary cache for instrument master | **DELETE** | No CSV to cache |
+| Daily scheduler for instrument refresh | **DELETE** | Static universe |
+| `S3 backup of instrument master` | **DELETE** | No master to back up |
+| `validation.rs` for instrument fields | **MODIFY** — keep IDX_I checks only | Stocks gone |
+| `delta_detector.rs` for daily instrument changes | **DELETE** | Static universe never changes |
+
+### What "heavy" replacement looks like (~50 LoC vs ~12K LoC removed)
+
+```rust
+// crates/common/src/locked_universe.rs (NEW, ~50 LoC)
+//
+// THE 4-INSTRUMENT LOCKED UNIVERSE per operator-charter §I 2026-05-18.
+// Adding/removing entries requires operator-charter edit + ratchet test update.
+
+use crate::types::ExchangeSegment;
+
+pub const LOCKED_UNIVERSE: &[(u32, &str, ExchangeSegment)] = &[
+    (13, "NIFTY",      ExchangeSegment::IdxI),
+    (25, "BANKNIFTY",  ExchangeSegment::IdxI),
+    (51, "SENSEX",     ExchangeSegment::IdxI),
+    (21, "INDIA VIX",  ExchangeSegment::IdxI),
+];
+
+pub const OPTION_CHAIN_UNDERLYINGS: &[(u32, &str)] = &[
+    (13, "NIFTY"),
+    (25, "BANKNIFTY"),
+    (51, "SENSEX"),
+];  // INDIA VIX has no option chain
+```
+
+That's it. No more 12K LoC of CSV download / parse / dedup / cache / refresh / S3 / bhavcopy / prev_OI / cross-check / validation / delta-detection. **One static slice.**
+
+### Updated deletion metric
+
+| Category | DELETE LoC (was) | DELETE LoC (after 2026-05-18 lock) |
+|---|---|---|
+| Heavy instrument loading (bhavcopy + CSV + universe builder) | ~2,800 | **~12,000** (entire instrument subsystem except 4-line const) |
+| Stock F&O scaffolding | ~5,000 | unchanged |
+| Greeks pipeline | ~2,200 | unchanged |
+| Movers pipeline | ~1,500 | unchanged |
+| Phase 2 | ~1,100 | unchanged |
+| Tests | ~4,200 | ~6,000 (more tests linked to deleted code) |
+| Docker observability stack | ~8,000 | unchanged |
+| **TOTAL** | **~23,500** | **~36,000 LoC** |
+
+### Updated PR sequencing (insert new PRs for cross-verify + heavy loader)
+
+The 11-PR sequence in the main plan now becomes 12 PRs. New PR 6.5 (between scope-tighten and observability cutover):
+
+| # | PR | Why |
+|---|---|---|
+| 6.5 | Delete heavy instrument loading; replace with 4-line `LOCKED_UNIVERSE` const | Removes the largest single LoC chunk; pre-requisite for narrowing cross-verify scope |
+| 6.6 | Add 15:31 IST scheduler + morning 1d cross-check scheduler + 3 audit tables + 4 alarms | Cross-verify hardening (the heart-piece L3 layer) |
+
+The other 10 PRs in the original sequence shift one slot.
 
 ---
 
