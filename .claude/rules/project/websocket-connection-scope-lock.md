@@ -15,7 +15,7 @@ And the immediate follow-up:
 
 > "only these indices and equities will be subscribed and connected right dude?"
 
-(Answered YES — 4 IDX_I + 218 NSE_EQ F&O underlying stocks = 222 SIDs on the 1 main-feed connection.)
+(Originally answered YES with 4 IDX_I + 218 NSE_EQ F&O underlying stocks = 222 SIDs. **AWS-lifecycle PR #6/#7 (2026-05-19) narrowed further:** the 218 NSE_EQ stocks dropped, leaving **only the 4 IDX_I SIDs** on the 1 main-feed connection. `SubscriptionScope` is now a single-variant enum — compile-time prevention of accidental expansion.)
 
 ---
 
@@ -29,10 +29,12 @@ And the immediate follow-up:
 
 | WebSocket | Count | Endpoint | Allowed instruments | Mode |
 |---|---|---|---|---|
-| **Main feed** | **1** | `wss://api-feed.dhan.co?version=2&token=<JWT>&clientId=<ID>&authType=2` | **4 IDX_I** (NIFTY=13, BANKNIFTY=25, SENSEX=51, INDIA VIX=21) + **218 NSE_EQ** F&O underlying stocks = **222 SIDs total** | Ticker for IDX_I (16-byte packets) + Quote for NSE_EQ (50-byte packets) |
+| **Main feed** | **1** | `wss://api-feed.dhan.co?version=2&token=<JWT>&clientId=<ID>&authType=2` | **4 IDX_I SIDs ONLY**: NIFTY=13, BANKNIFTY=25, SENSEX=51, INDIA VIX=21 (per `LOCKED_UNIVERSE` in `crates/common/src/locked_universe.rs`) | Ticker for IDX_I (16-byte packets) |
 | **Order update** | **1** | `wss://api-order-update.dhan.co` | Receives order events for orders WE place; filter `Source=P` | JSON, MsgCode 42 auth |
 
 **Total live WebSocket connections to Dhan ever: 2.**
+
+**AWS-lifecycle PR #7 (2026-05-19) update:** the original lock allowed 4 IDX_I + 218 NSE_EQ F&O underlying stocks (= 222 SIDs). The 218 NSE_EQ stocks were dropped from the live universe in PRs #6a/#6b/#7a/#7b as the trading strategy narrowed to indices-only. `SubscriptionScope` is now a **single-variant enum** (`Indices4Only`); a new scope variant cannot be added without a rule-file edit + ratchet update.
 
 ---
 
@@ -40,14 +42,15 @@ And the immediate follow-up:
 
 | ❌ Forbidden FOREVER | Why |
 |---|---|
-| Depth-20 connections (`wss://depth-api-feed.dhan.co/twentydepth`) | Operator lock 2026-05-15; depth not in product scope for any phase |
+| Depth-20 connections (`wss://depth-api-feed.dhan.co/twentydepth`) | Operator lock 2026-05-15; depth not in product scope for any phase. Modules deleted in PR #4 (#707). |
 | Depth-200 connections (`wss://full-depth-api.dhan.co/?token=...`) | Same |
-| Any 2nd/3rd/4th/5th main-feed conn | 222 SIDs fit comfortably on 1 conn (Dhan cap = 5,000/conn); more conns waste token+IP budget |
+| Any 2nd/3rd/4th/5th main-feed conn | 4 SIDs fit comfortably on 1 conn (Dhan cap = 5,000/conn); more conns waste token+IP budget. `effective_main_feed_pool_size` returns constant 1. |
 | Any new WebSocket endpoint Dhan introduces in future | Not in scope without operator explicit re-approval |
+| NSE_EQ / BSE_EQ subscriptions (including F&O underlying cash equities) | AWS-lifecycle PR #7 dropped the 218 NSE_EQ universe; `SubscriptionScope::Indices4Only` has no path to emit them. |
 | BSE F&O / commodity / currency feeds | Same |
-| Stock F&O derivative subscriptions on the main-feed conn | Phase 0 lock — `should_spawn_phase2_scheduler` returns false for `IndicesUnderlyingsOnly` scope |
-| Index F&O full-chain derivative subscriptions | Same |
-| Display-only indices beyond INDIA VIX (sectoral, INDIA VOL, etc.) | Phase 0 filter — only VIX kept |
+| Stock F&O derivative subscriptions on the main-feed conn | Phase 2 dispatcher chain deleted in PR #5 (#708). Planner returns `false` from `should_subscribe_stock_derivatives` unconditionally. |
+| Index F&O full-chain derivative subscriptions | Same — planner returns `false` from `should_subscribe_index_derivatives` unconditionally. |
+| Display-only indices beyond INDIA VIX (sectoral, INDIA VOL, etc.) | `is_display_index_allowed_under_scope` returns `true` only for SID 21 (INDIA VIX). |
 
 ---
 
@@ -67,28 +70,30 @@ The 2026-05-13 disconnect storm (09:16-09:29 IST) showed that 500ms first-reconn
 
 ---
 
-## Mechanical guards (existing — verify each PR they remain)
+## Mechanical guards (post-PR #7b — verify each PR they remain)
 
 | Guard | What it enforces |
 |---|---|
-| `phase2_recovery::should_spawn_depth_dynamic_pipeline(IndicesUnderlyingsOnly, _) → false` (`crates/app/src/phase2_recovery.rs:197`) | Depth-20 + depth-200 pipelines NEVER spawn under Phase 0 scope |
-| `phase2_recovery::should_spawn_greeks_pipeline(IndicesUnderlyingsOnly, _) → false` (`phase2_recovery.rs:218`) | Greeks pipeline never spawns |
-| `phase2_recovery::should_spawn_phase2_scheduler(IndicesUnderlyingsOnly, _) → false` (`phase2_recovery.rs:174`) | Stock F&O Phase 2 dispatcher never spawns |
-| `effective_main_feed_pool_size(IndicesUnderlyingsOnly, _) → 1` (`crates/common/src/config.rs:1192`) | Main-feed pool always has exactly 1 conn under Phase 0 scope |
-| Test: `test_should_spawn_*_skipped_under_phase_0_regardless_of_flag` | All three spawn helpers return false regardless of TOML flag value |
-| Test: `test_effective_main_feed_pool_size_under_phase_0_returns_one` | Pool size is clamped to 1, no exceptions |
-| Test: `test_first_reconnect_attempt_is_zero_ms_instant` (order_update_connection.rs) | Order-update first retry is 0ms (Phase 0 Item 4 fix, this commit) |
+| `SubscriptionScope` is a single-variant enum (`Indices4Only`) in `crates/common/src/config.rs` | Compile-time prevention — no new scope can be added without a rule-file edit |
+| `effective_main_feed_pool_size(_, _) → PHASE_0_MAIN_FEED_CONNECTION_COUNT = 1` constant in `crates/common/src/config.rs` | Main-feed pool always has exactly 1 conn |
+| `should_subscribe_stock_derivatives(_) → false`, `should_subscribe_index_derivatives(_) → false`, `is_display_index_allowed_under_scope(_, sid)` returns true only for `INDIA_VIX_SECURITY_ID = 21` (`crates/core/src/instrument/subscription_planner.rs`) | Compile-time impossibility of derivative or sectoral subscriptions |
+| Source-scan ratchet `crates/core/tests/indices4only_scope_lock_guard.rs` (3 tests) | Blocks reappearance of retired `SubscriptionScope` variants OR retired `subscribe_*` flags anywhere in `crates/` |
+| Test: `test_subscription_scope_has_exactly_one_variant` (`config.rs`) | Match expression in the test must remain exhaustive over the single variant — adding a variant fails the build |
+| Test: `test_effective_main_feed_pool_size_is_always_one_under_indices4only` | Pool size is constant 1, no exceptions |
+| Test: `test_first_reconnect_attempt_is_zero_ms_instant` (order_update_connection.rs) | Order-update first retry is 0ms |
+| Depth / Phase 2 / movers / greeks modules: deleted in PRs #2-#6b | No code path exists to spawn them; module-level deletion is the strongest guard |
 
 ---
 
 ## What a PR that violates this lock looks like (REJECT)
 
-- Adds a `spawn_twenty_depth_connection` or `spawn_two_hundred_depth_connection` call site in `main.rs`.
-- Flips `should_spawn_depth_dynamic_pipeline` to return `true` for `IndicesUnderlyingsOnly`.
+- Adds a new variant to the `SubscriptionScope` enum without a rule-file edit + dated operator quote.
+- Re-introduces any of the 3 deleted `subscribe_*` config flags (`subscribe_index_derivatives`, `subscribe_stock_derivatives`, `subscribe_display_indices`).
+- Adds a `spawn_twenty_depth_connection` or `spawn_two_hundred_depth_connection` call site (the modules are deleted; re-creating them would require restoring whole subtrees).
 - Adds a new WebSocket type / endpoint without operator explicit re-approval recorded in this file or charter §I.
 - Subscribes to derivative contracts on the main-feed conn (stock F&O, index F&O full chain).
-- Subscribes to BSE_EQ / NSE_FNO / BSE_FNO / NSE_CURRENCY / MCX_COMM SIDs.
-- Increases `effective_main_feed_pool_size(IndicesUnderlyingsOnly, _)` to anything > 1.
+- Subscribes to NSE_EQ / BSE_EQ / NSE_FNO / BSE_FNO / NSE_CURRENCY / MCX_COMM SIDs.
+- Changes `effective_main_feed_pool_size(_, _)` to return anything other than `PHASE_0_MAIN_FEED_CONNECTION_COUNT = 1`.
 
 **Any such PR MUST be rejected in review even if operator explicitly approves verbally** — the operator must update this rule file FIRST, with a dated quote, and only then can the PR land. This prevents accidental scope creep through casual approvals.
 
@@ -110,7 +115,7 @@ To add a new WS type or instrument class in a future phase:
 
 ## Auto-driver / Insta-reel explanation
 
-> "Sir, imagine your juice shop has only TWO phone lines. One phone is for customers to place juice orders (this is the order-update line). The other phone is for the daily price list from the fruit market — 4 fruit categories and 218 fruit types = 222 prices. That's it. We will NEVER install a third phone. No phone for vegetable prices. No phone for grocery prices. No second phone for fruits. Two phones forever. If anyone says 'sir, let's add one more phone for spices,' you tell them: NO, this rule file forbids it. Two phones is enough. Two phones forever."
+> "Sir, imagine your juice shop has only TWO phone lines. One phone is for customers to place juice orders (this is the order-update line). The other phone is for the daily price list from the fruit market — just 4 fruits: NIFTY, BANKNIFTY, SENSEX, INDIA VIX. That's it. We will NEVER install a third phone. No phone for vegetable prices. No phone for grocery prices. No phone for the 200 individual fruit stalls. No second phone for fruits. Two phones forever. If anyone says 'sir, let's add one more phone for spices,' you tell them: NO, this rule file AND the compiler both forbid it — the enum has only 1 slot, there is nowhere to add a 3rd phone. Two phones is enough. Two phones forever."
 
 ---
 

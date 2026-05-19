@@ -4,123 +4,57 @@
 > **Scope:** Any file touching main WebSocket connection pool, subscription planning, or instrument distribution.
 > **Ground truth:** `docs/dhan-ref/03-live-market-feed-websocket.md`, `docs/dhan-ref/08-annexure-enums.md`
 
-## 2026-05-05 Update — Wave 5 default scope = `indices_only_all_expiries`
+## 2026-05-19 Update — AWS-lifecycle PR #7 LOCKED (`indices_4_only`)
 
-The default `[subscription] scope` in `config/base.toml:270` is
-`indices_only_all_expiries`. Stock F&O is NOT subscribed; index F&O
-expands to ALL expiries (not just the current one) so the universe
-math is different from the older `FullUniverse`-era doc below.
+The default `[subscription] scope` in `config/base.toml` is
+`indices_4_only`. This is the ONLY legal scope — `SubscriptionScope`
+is a single-variant enum after PR #7b (#712). The 3 legacy scope
+variants (`FullUniverse`, `IndicesOnlyAllExpiries`,
+`IndicesUnderlyingsOnly`) and the 3 dead `subscribe_*` flags have
+been retired. See
+`.claude/rules/project/websocket-connection-scope-lock.md` +
+operator-charter §I.
 
-### Wave 5 indices-only universe (LIVE DEFAULT, ~11K instruments)
-
-| Slot | Subscription | Mode | Count |
-|---|---|---|---|
-| Index values IDX_I | NIFTY=13, BANKNIFTY=25, SENSEX=51 | Ticker | 3 |
-| Display indices | sectoral + INDIA VIX | Ticker | ~26 |
-| Cash equities NSE_EQ | one per F&O stock | Quote/Full | ~216 |
-| Index F&O — **all expiries** (NIFTY + BANKNIFTY + SENSEX) | every weekly + monthly + far-month chain | Quote/Full | ~10,789 |
-| Stock F&O | **gated off** under indices-only scope | — | 0 |
-| **TOTAL** | verified live 2026-05-05 | | **~11,034** ≤ 25,000 |
-
-Rationale: Wave 5 narrowed the trading universe to the 3 indices
-because (a) the greeks pipeline runs on those 3 underlyings only
-(`MAX_UNDERLYINGS = 3`), (b) depth-20/200 dynamic feeds operate on
-NIFTY + BANKNIFTY exclusively, and (c) ~11K instruments fits
-comfortably under the per-component `tv-rss-per-subsystem-high`
-Prometheus alert (Wave-5 plan §AA L122, retired the legacy
-`MEMORY_RSS_ALERT_MB = 1024 MB` 2026-05-08 because the in-memory-store
-design exceeds it by design — see `crates/app/src/subsystem_memory.rs`).
-Phase 2 scheduler
-is intentionally NOT spawned (`phase2_recovery::should_spawn_phase2_scheduler`
-returns false). SLO-02 phase2_health dimension is pinned to 1.0 in
-the SLO scheduler when this scope is active (live operator incident
-2026-05-05 13:14 IST: composite = 0 / weakest = phase2_health was a
-false-CRITICAL).
-
-### LEGACY (pre-Wave-5) `FullUniverse` scope (~24K instruments)
-
-Retained for documentation only — describes the scope when
-`[subscription] scope = "full_universe"` (the operator deliberately
-flips the config). NOTE: under FullUniverse the live-tick ATM resolver
-(`live_tick_atm_resolver::resolve_stock_atm_from_live_ticks`) is
-defined but NOT wired into boot orchestration, so mid-day FullUniverse
-boots after 09:13 IST will under-fill stock F&O ATM±25 — see
-disaster-recovery Scenario 1. Wiring the resolver is a separate PR.
-
-## 2026-04-25 Updates — F&O Universe Rebuild (3-index policy + 4-mode boot)
-
-Mandatory for any new subscription/boot work. Shipped on branch
-`claude/build-fno-universe-Tlb9d`:
-
-### Subscription scope (the FullUniverse universe — see Wave-5 update above)
+### LOCKED universe (4 SIDs)
 
 | Slot | Subscription | Mode | Count |
 |---|---|---|---|
 | Index values IDX_I | NIFTY=13, BANKNIFTY=25, SENSEX=51 | Ticker | 3 |
-| Display indices | sectoral + INDIA VIX | Ticker | 26 |
-| Cash equities NSE_EQ | one per F&O stock | Quote/Full | ~216 |
-| Index F&O — full current expiry | NIFTY + BANKNIFTY + SENSEX | Quote/Full | ~2,037 |
-| Stock F&O — ATM±25 of current expiry | 216 stocks × 51 CE + 51 PE + 1 FUT | Quote/Full | ~22,042 |
-| **TOTAL (FullUniverse)** | verified live 2026-04-25 | | **~24,324** ≤ 25,000 |
+| Display index IDX_I | INDIA VIX=21 (only allowed display SID) | Ticker | 1 |
+| Stock F&O / Index F&O / Cash equities / Sectoral indices | **gated off** — code paths deleted | — | 0 |
+| **TOTAL** | locked in `LOCKED_UNIVERSE` (`crates/common/src/locked_universe.rs`) | | **4** |
 
-### What changed vs pre-2026-04-25
+The 4 IDX_I SIDs fit on a single main-feed WebSocket connection
+(Dhan cap = 5,000 SIDs/conn), so `effective_main_feed_pool_size`
+returns the constant `PHASE_0_MAIN_FEED_CONNECTION_COUNT = 1`.
 
-| Old (≤ 5 indices) | New (3 indices) |
-|---|---|
-| FINNIFTY + MIDCPNIFTY full chain | DROPPED entirely |
-| Index F&O all expiries | Current expiry only (per index) |
-| Stock F&O Stage 1 ATM±N + Stage 2 progressive fill | Stage 1 ATM±25 only (Stage 2 still wired but rarely fires) |
-| Greeks pipeline `MAX_UNDERLYINGS = 4` | `MAX_UNDERLYINGS = 3` (NIFTY/BANKNIFTY/SENSEX) |
-| Spot updater handled 4 indices via inline match | Uses `classify_tick_for_spot_update` helper + adds NSE_EQ cash equities for 216 F&O stocks |
+### Why this narrowed
 
-### 4-mode bootstrap (`crates/core/src/instrument/boot_mode.rs`)
+- Depth-20 + depth-200 modules deleted in PR #4 (#707).
+- Phase 2 stock-F&O dispatcher deleted in PR #5 (#708).
+- Bhavcopy + universe-builder + 6 helper modules deleted in PRs #6a/#6b (#709, #710).
+- Greeks pipeline + movers pipeline deleted in PRs #2/#3 (#705, #706).
+- The trading strategy is intraday option-buying on the 3 major indices.
+  None of the dropped surface contributed to the live decision path.
 
-| Mode | IST window | Stock-ATM source | Latency to full subscribe |
-|---|---|---|---|
-| **PreMarket** | < 09:00 | Pre-open buffer (09:00–09:12) | At 09:13:00 |
-| **MidPreMarket** | 09:00–09:13 | Partial buffer + REST at 09:12:55 | At 09:13:00 |
-| **MidMarket** | 09:13–15:30 | **Live cash-equity ticks** (primary) → REST stragglers → QuestDB last resort | ~30s after boot |
-| **PostMarket** | 15:30–next 09:00 | QuestDB previous close | At boot |
+### Mechanical guards (post-PR #7b)
 
-Mode is detected by `detect_boot_mode(now_ist_secs_of_day)` — a pure
-function with 21 unit tests covering every minute boundary.
+- `SubscriptionScope` single-variant enum (compile-time prevention).
+- `should_subscribe_stock_derivatives(_) → false`, `should_subscribe_index_derivatives(_) → false` (planner helpers).
+- `is_display_index_allowed_under_scope(_, sid)` returns `true` ONLY for `INDIA_VIX_SECURITY_ID = 21`.
+- Source-scan ratchet `crates/core/tests/indices4only_scope_lock_guard.rs` (3 tests) blocks reappearance of any retired identifier in `crates/`.
 
-### Live-tick ATM resolver (`live_tick_atm_resolver.rs`)
+### Historical narrative (deleted code paths — for context only)
 
-- **Primary source for Mode C** — polls `SharedSpotPrices` at 5/10/15/20/25s
-  intervals; exits early when all 216 F&O stocks have ticked.
-- **Stragglers fall through** to existing `preopen_rest_fallback`
-  (`/v2/marketfeed/ltp`) and finally to QuestDB previous close.
-- **`SharedSpotPrices` is now populated for cash equities too** — the
-  spot updater spawn at `main.rs:2087` now uses
-  `classify_tick_for_spot_update` and writes both IDX_I and NSE_EQ ticks.
-
-### New constants (in `crates/common/src/constants.rs`)
-
-- `STOCK_OPTION_ATM_STRIKES_EACH_SIDE = 25` — NSE 20% circuit covers ATM±25
-- `MAX_TOTAL_SUBSCRIPTIONS_TARGET = 24_500` — warn threshold (hard cap stays 25K)
-
-### New notification event
-
-- `MidMarketBootComplete { stocks_live_tick, stocks_rest, stocks_quest_db,
-  stocks_skipped, total_subscribed, latency_ms }` — Severity::Info, fires
-  once after Mode C resolution completes.
-
-### Ratchet tests added
-
-| Test | File | Pins |
-|---|---|---|
-| `test_full_chain_index_symbols_is_exactly_three` | `constants.rs` | 3-index policy |
-| `test_stock_option_atm_strikes_each_side_is_25` | `constants.rs` | Stock cap |
-| `test_max_total_subscriptions_target_below_hard_limit` | `constants.rs` | Capacity targets |
-| `test_only_three_indices_in_full_chain_set` | `subscription_planner.rs` | Same as above (planner-side) |
-| `test_finnifty_midcpnifty_dropped_from_index_set` | `subscription_planner.rs` | Hard regression block |
-| `test_index_derivatives_use_current_expiry_only` | `subscription_planner.rs` | Far-month exclusion |
-| `test_total_subscription_count_below_25k_hard_limit` | `subscription_planner.rs` | Capacity assertion |
-| `test_boot_mode_*_at_*` (15 tests) | `boot_mode.rs` | Time partition |
-| `test_partition_*` + `test_resolver_*` (29 tests) | `live_tick_atm_resolver.rs` | Mode C resolver |
-| `test_classify_*` (8 tests) | `live_tick_atm_resolver.rs` | Tick→symbol classification |
-| `test_midmarket_boot_complete_*` (2 tests) | `events.rs` | Telegram event |
+Prior to AWS-lifecycle (PRs #2-#7b), the universe expanded from 222
+SIDs (4 IDX_I + 218 NSE_EQ underlyings, "Phase 0 LEAN MVP" 2026-05-13)
+to ~11K SIDs ("Wave 5 indices-only" 2026-05-05) to ~24,324 SIDs
+("FullUniverse" 2026-04-25 — 3 indices + 26 display + 216 cash +
+2,037 index F&O + 22,042 stock F&O). The boot orchestration had a
+4-mode bootstrap (PreMarket / MidPreMarket / MidMarket / PostMarket),
+a live-tick ATM resolver, and a Phase 2 stock-F&O dispatcher chain.
+All of that infrastructure is **deleted** as of PR #6b. The current
+boot path subscribes the 4 SIDs in a single message and is done.
 
 ## 2026-04-24 Updates (PR #337)
 
@@ -187,14 +121,22 @@ Applies to Phase 2 scheduler + main-feed reconnect path:
 
 8. **Items still pending** (do NOT pretend these are done): B (defer boot depth subscribe), real C (re-dispatch using InitialSubscribe variants), E (rebalancer 09:15 first-check gate), F (snapshot schema for depth), I (no-boot-depth-subscribe guard test), J (Phase2DispatchSource enum), K (edge-triggered Phase 2 alerts), L (audit log table), M (Grafana panels), N (tracing spans), Q (benchmark), R (runbooks).
 
-## Architecture
+## Architecture (POST-AWS-LIFECYCLE, PR #7b 2026-05-19)
 
-### Connection Pool
+> **The sections below describe the legacy FullUniverse / Wave 5 / Phase 0 architecture as it existed before PRs #2-#7b. The live code path is now far simpler:** boot subscribes the 4 IDX_I SIDs from `LOCKED_UNIVERSE` in a single message on 1 main-feed connection. No Phase 2 dispatcher, no depth-20/200 pools, no live-tick ATM resolver, no two-phase boot. The historical text is retained for context (audit reconstruction, reading old commits) but operators should treat the "2026-05-19 Update" section above as the canonical live state.
+
+### Connection Pool (post-PR #7b)
+- **1 main-feed connection** (constant — `effective_main_feed_pool_size` returns 1).
+- **1 order-update connection** (the only other allowed WS — see `websocket-connection-scope-lock.md`).
+- **5,000 instruments per connection** (Dhan cap — we use 4 of those 5,000).
+- **Endpoint:** `wss://api-feed.dhan.co?version=2&token=<TOKEN>&clientId=<CLIENT_ID>&authType=2`
+
+### Legacy Connection Pool (pre-PR #7b, retained for context)
 - **5 connections** (max per Dhan account, independent from depth pools)
 - **5,000 instruments per connection** (max per Dhan docs)
 - **25,000 total capacity** (5 x 5,000)
 - **Distribution:** Round-robin at boot (static, pre-allocated)
-- **Endpoint:** `wss://api-feed.dhan.co?version=2&token=<TOKEN>&clientId=<CLIENT_ID>&authType=2`
+- **Endpoint:** same as above
 
 ### Subscription Strategy (Two-Phase)
 
