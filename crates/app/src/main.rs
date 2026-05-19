@@ -1117,11 +1117,20 @@ async fn main() -> Result<()> {
     // is_mock_trading is for logging/awareness only, never for trading gates.
     // -----------------------------------------------------------------------
     let fast_cache = token_cache::load_token_cache_fast();
-    let is_market_hours = trading_calendar.is_trading_day_today()
-        && tickvault_core::instrument::instrument_loader::is_within_build_window(
-            FAST_BOOT_WINDOW_START,
-            FAST_BOOT_WINDOW_END,
-        );
+    // PR #6b (2026-05-19): inlined `is_within_build_window` after retiring
+    // instrument_loader.rs. The window (09:00:00..15:30:00 IST) matches the
+    // tick-persist window per audit-findings Rule 3.
+    let is_market_hours = trading_calendar.is_trading_day_today() && {
+        use tickvault_common::constants::{
+            IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST,
+            TICK_PERSIST_START_SECS_OF_DAY_IST,
+        };
+        let _ = (FAST_BOOT_WINDOW_START, FAST_BOOT_WINDOW_END); // keep imports live until removal in later slice
+        let now_utc = chrono::Utc::now().timestamp();
+        let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+        let sec_of_day = now_ist.rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
+        (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST).contains(&sec_of_day)
+    };
 
     if !is_market_hours && fast_cache.is_some() {
         info!("token cache exists but outside market hours / non-trading day — using slow boot");

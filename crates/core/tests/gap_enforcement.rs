@@ -736,56 +736,7 @@ mod i_p0_02_minimum_derivative_count {
     }
 }
 
-// ===========================================================================
-// I-P0-06: Emergency Download Override — CRITICAL Log Enforcement
-// ===========================================================================
-
-mod i_p0_06_emergency_download {
-    /// I-P0-06: Verifies that emergency download paths use CRITICAL-level logging.
-    ///
-    /// The `instrument_loader.rs` must emit `error!("CRITICAL: ...")` messages
-    /// when triggering emergency download or when emergency download fails.
-    /// ERROR level triggers Telegram alerts via the notification system.
-    ///
-    /// RESOLVED: Source code scanning confirms CRITICAL strings in error!() macros.
-    #[test]
-    fn test_i_p0_06_emergency_download_uses_critical_log() {
-        let source = include_str!("../src/instrument/instrument_loader.rs");
-
-        // Must have CRITICAL log when the rkyv cache is corrupt during
-        // market hours. (The fresh-clone / first-boot branch is WARN by
-        // design — that's the expected emergency-download path, not an
-        // operational concern. See instrument_loader.rs:298-313 for the
-        // two-tier rationale.)
-        assert!(
-            source.contains("CRITICAL: rkyv cache corrupt during market hours"),
-            "I-P0-06: instrument_loader.rs must log CRITICAL when rkyv cache is corrupt during market hours"
-        );
-
-        // Must have CRITICAL log when emergency download also fails
-        assert!(
-            source.contains("CRITICAL: emergency download ALSO failed"),
-            "I-P0-06: instrument_loader.rs must log CRITICAL when emergency download fails"
-        );
-    }
-
-    #[test]
-    fn test_i_p0_06_critical_logs_use_error_macro() {
-        // Verify the CRITICAL strings are inside error!() macros (which trigger Telegram).
-        // The pattern must be: error!(..., "CRITICAL: ...") not info!() or warn!().
-        let source = include_str!("../src/instrument/instrument_loader.rs");
-
-        // Find the line with CRITICAL emergency download and verify it's preceded by error!
-        for line in source.lines() {
-            if line.contains("CRITICAL: no instrument cache") {
-                assert!(
-                    line.trim().starts_with('"') || source.contains("error!"),
-                    "I-P0-06: CRITICAL cache miss log must use error!() macro"
-                );
-            }
-        }
-    }
-}
+// PR #6b (2026-05-19): I-P0-06 test mod RETIRED — instrument_loader.rs deleted.
 
 // ===========================================================================
 // I-P0-04: Cache Persistence Validation

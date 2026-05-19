@@ -18,7 +18,7 @@ pub mod csv_parser;
 // PR #6a (2026-05-19): diagnostic module RETIRED (no CSV download/parse/validate cycle).
 // PR #4 (2026-05-19): `dynamic_subscription_state` module DELETED
 // (depth-only diff state machine; no consumers under 4-IDX_I scope).
-pub mod instrument_loader;
+// PR #6b (2026-05-19): instrument_loader module RETIRED (boot uses FnoUniverse::locked_4_idx_i).
 pub mod market_open_self_test;
 pub mod preopen_price_buffer;
 pub mod slo_score;
@@ -29,8 +29,7 @@ pub mod validation;
 
 pub use binary_cache::MappedUniverse;
 // PR #6a (2026-05-19): pub use diagnostic::run_instrument_diagnostic RETIRED.
-pub use instrument_loader::{
-    InstrumentLoadResult, load_or_build_instruments, try_rebuild_instruments,
-};
+// PR #6b (2026-05-19): instrument_loader re-exports RETIRED — boot uses
+// FnoUniverse::locked_4_idx_i() instead of the dynamic loader.
 pub use subscription_planner::{build_subscription_plan, build_subscription_plan_from_archived};
 pub use universe_builder::{build_fno_universe, build_fno_universe_from_csv};
