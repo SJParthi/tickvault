@@ -3829,69 +3829,13 @@ async fn main() -> Result<()> {
             );
         }
 
-        // Wave 5 Item 26 L2 LIVE — 16:30 IST bhavcopy cross-check task.
-        // Post-market only (TradingCalendar gated); reads `movers_1s`
-        // for our captured EOD volumes, downloads NSE bhavcopy ZIP via
-        // `unzip` shell, parses, cross-checks with 0.1% tolerance, writes
-        // audit rows to `volume_nse_audit`, emits Telegram summary.
-        let bhavcopy_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-        let bhavcopy_registry =
-            std::sync::Arc::clone(slow_registry.as_ref().unwrap_or_else(|| {
-                // Fallback: if slow_registry is None (boot-bypass scenarios),
-                // use a fresh empty Arc — the supplier returns empty contracts
-                // and the cycle reports MISSING_OUR for every NSE row.
-                // Operator triages the empty universe via dashboards.
-                unreachable!("slow_registry is required for slow-boot path")
-            }));
-        let _bhavcopy_handle = tickvault_app::bhavcopy_pipeline::spawn_bhavcopy_scheduler_task(
-            config.questdb.clone(),
-            {
-                let reg = std::sync::Arc::clone(&bhavcopy_registry);
-                move || {
-                    // Snapshot the registry's derivative contracts at
-                    // each 16:30 IST cycle. Builds `DerivativeContract`
-                    // from `SubscribedInstrument` fields. Filters to
-                    // future/option derivatives only (skips IDX_I and
-                    // NSE_EQ since bhavcopy is NSE_FNO-only). Empty
-                    // Vec if registry empty — bhavcopy reports
-                    // MISSING_OUR for every NSE row, which is correct.
-                    use tickvault_common::instrument_types::{
-                        DerivativeContract, DhanInstrumentKind,
-                    };
-                    reg.iter()
-                        .filter_map(|inst| {
-                            let kind = inst.instrument_kind?;
-                            // Bhavcopy is F&O — skip indices + cash equities.
-                            match kind {
-                                DhanInstrumentKind::FutureIndex
-                                | DhanInstrumentKind::FutureStock
-                                | DhanInstrumentKind::OptionIndex
-                                | DhanInstrumentKind::OptionStock => {}
-                            }
-                            let expiry_date = inst.expiry_date?;
-                            Some(DerivativeContract {
-                                security_id: inst.security_id,
-                                underlying_symbol: inst.underlying_symbol.clone(),
-                                instrument_kind: kind,
-                                exchange_segment: inst.exchange_segment,
-                                expiry_date,
-                                strike_price: inst.strike_price.unwrap_or(0.0),
-                                option_type: inst.option_type,
-                                // Bhavcopy lookup only uses underlying_symbol +
-                                // expiry_date + strike_price + option_type.
-                                // Fill the rest with safe defaults.
-                                lot_size: 0,
-                                tick_size: 0.0,
-                                symbol_name: inst.display_label.clone(),
-                                display_name: inst.display_label.clone(),
-                            })
-                        })
-                        .collect()
-                }
-            },
-            std::sync::Arc::clone(&notifier),
-            std::sync::Arc::clone(&bhavcopy_shutdown),
-        );
+        // PR #6a (2026-05-19): bhavcopy 16:30 IST cross-check task RETIRED.
+        // Under 4-IDX_I LOCKED_UNIVERSE (operator lock 2026-05-15) there are
+        // no F&O subscriptions to cross-check against NSE bhavcopy. The
+        // bhavcopy_cross_check + bhavcopy_fetcher + bhavcopy_scheduler modules
+        // and the bhavcopy_pipeline.rs app-side runner are all deleted.
+        // volume_nse_audit QuestDB table is KEPT on disk per SEBI 5-year
+        // retention pending operator-triggered DROP TABLE migration.
 
         // Parthiban directive (2026-04-21): no-tick-during-market-hours
         // watchdog (slow boot path). Same pattern as fast boot above.

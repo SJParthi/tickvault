@@ -14,7 +14,9 @@
 #![cfg_attr(test, allow(clippy::field_reassign_with_default))]
 
 pub mod bar_cache_loader;
-pub mod bhavcopy_pipeline;
+// PR #6a (2026-05-19): bhavcopy_pipeline DELETED — 16:30 IST NSE bhavcopy
+// cross-check retired under 4-IDX_I LOCKED_UNIVERSE (operator lock 2026-05-15).
+// Bhavcopy is NSE_FNO-only; no F&O subscriptions remain to cross-check.
 pub mod boot_helpers;
 pub mod core_pinning;
 // PR #4 (2026-05-19): depth-20 / depth-200 modules DELETED (operator-locked
