@@ -930,15 +930,30 @@ impl Default for ObservabilityConfig {
 /// requirement). Production count varies day-to-day with weekly expiry
 /// roll + new strike addition; range observed 9.5K–11.5K.
 ///
-/// Default: `IndicesOnlyAllExpiries` — production default per
-/// `.claude/plans/archive/2026-05-02-wave-5-indices-only-superseded-by-pr-c2.md`.
+/// Default: `Indices4Only` — AWS-lifecycle PR #7 LOCKED scope per
+/// `.claude/plans/active-plan-pr-7-subscription-scope-lock.md` and
+/// `.claude/rules/project/websocket-connection-scope-lock.md`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubscriptionScope {
-    /// Wave 5 default — drop the 216-stock F&O block.
+    /// AWS-lifecycle LOCKED scope (operator lock 2026-05-15 §I).
+    /// Subscribe ONLY the 4 IDX_I SIDs: NIFTY=13, BANKNIFTY=25,
+    /// SENSEX=51, INDIA VIX=21. NO derivatives, NO sectoral display
+    /// indices, NO NSE_EQ. Target: 4 SIDs on a single main-feed
+    /// WebSocket connection.
+    ///
+    /// This is the only LOCKED scope per
+    /// `websocket-connection-scope-lock.md`. Slice 5 of PR #7 retires
+    /// every other variant. Until then, legacy variants remain only
+    /// for in-flight test sites.
     #[default]
+    #[serde(rename = "indices_4_only")]
+    Indices4Only,
+    /// Wave 5 default — drop the 216-stock F&O block. Legacy: PR #7
+    /// Slice 5 retires this variant.
     IndicesOnlyAllExpiries,
     /// Legacy Wave 4 universe (kept as escape hatch for ops only).
+    /// Legacy: PR #7 Slice 5 retires this variant.
     FullUniverse,
     /// Phase 0 LEAN MVP (operator decision 2026-05-13) — subscribe only
     /// the 4 IDX_I (NIFTY/BANKNIFTY/SENSEX/INDIA VIX) + ~218 NSE_EQ F&O
@@ -947,6 +962,9 @@ pub enum SubscriptionScope {
     ///
     /// See `topic-PHASE-0-LEAN-LOCKED.md` items 1 + 23 for the full
     /// scope contract and mode mix (IDX_I=Ticker, NSE_EQ=Quote).
+    /// Legacy: PR #7 Slice 5 retires this variant — `Indices4Only`
+    /// supersedes it (the 218 NSE_EQ stocks are dropped as part of
+    /// the AWS-lifecycle universe lock).
     IndicesUnderlyingsOnly,
 }
 
@@ -956,6 +974,7 @@ impl SubscriptionScope {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Indices4Only => "indices_4_only",
             Self::IndicesOnlyAllExpiries => "indices_only_all_expiries",
             Self::FullUniverse => "full_universe",
             Self::IndicesUnderlyingsOnly => "indices_underlyings_only",
@@ -985,7 +1004,9 @@ impl SubscriptionScope {
 #[must_use]
 pub const fn effective_main_feed_pool_size(scope: SubscriptionScope, configured: usize) -> usize {
     match scope {
-        SubscriptionScope::IndicesUnderlyingsOnly => {
+        // AWS-lifecycle LOCKED (PR #7): 4 IDX_I SIDs fit on a single
+        // main-feed connection; pool size is always 1.
+        SubscriptionScope::Indices4Only | SubscriptionScope::IndicesUnderlyingsOnly => {
             crate::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT
         }
         SubscriptionScope::IndicesOnlyAllExpiries | SubscriptionScope::FullUniverse => configured,
@@ -2281,15 +2302,67 @@ mod tests {
         assert!(config.parsed_feed_mode().is_ok());
     }
 
-    // Wave 5 Item 1 — subscription.scope config gate.
+    // AWS-lifecycle PR #7 Slice 1 — subscription.scope default is
+    // Indices4Only (LOCKED scope, 4 IDX_I SIDs only).
     #[test]
-    fn test_subscription_scope_enum_indices_only_all_expiries_default() {
+    fn test_subscription_scope_default_is_indices4only() {
         let scope = SubscriptionScope::default();
-        assert_eq!(scope, SubscriptionScope::IndicesOnlyAllExpiries);
-        assert_eq!(scope.as_str(), "indices_only_all_expiries");
-        // Pinned default carries through SubscriptionConfig::default().
+        assert_eq!(scope, SubscriptionScope::Indices4Only);
+        assert_eq!(scope.as_str(), "indices_4_only");
         let cfg = SubscriptionConfig::default();
-        assert_eq!(cfg.scope, SubscriptionScope::IndicesOnlyAllExpiries);
+        assert_eq!(cfg.scope, SubscriptionScope::Indices4Only);
+    }
+
+    // AWS-lifecycle PR #7 Slice 1 — `indices_4_only` round-trips via figment.
+    #[test]
+    fn test_indices4only_serde_roundtrip() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let toml_indices4 = r#"
+            [subscription]
+            scope = "indices_4_only"
+            feed_mode = "Ticker"
+            subscribe_index_derivatives = false
+            subscribe_stock_derivatives = false
+            subscribe_display_indices = false
+            subscribe_stock_equities = false
+            stock_atm_strikes_above = 25
+            stock_atm_strikes_below = 25
+            stock_default_atm_fallback_enabled = true
+        "#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            subscription: SubscriptionConfig,
+        }
+        let wrapper: Wrapper = Figment::new()
+            .merge(Toml::string(toml_indices4))
+            .extract()
+            .expect("indices_4_only scope must round-trip");
+        assert_eq!(wrapper.subscription.scope, SubscriptionScope::Indices4Only);
+        assert_eq!(wrapper.subscription.scope.as_str(), "indices_4_only");
+    }
+
+    // AWS-lifecycle PR #7 Slice 1 — Indices4Only pool size always 1
+    // (4 SIDs fit on a single main-feed connection).
+    #[test]
+    fn test_effective_main_feed_pool_size_is_always_one_under_indices4only() {
+        for configured in [0, 1, 2, 3, 4, 5, 10, 100] {
+            assert_eq!(
+                effective_main_feed_pool_size(SubscriptionScope::Indices4Only, configured),
+                crate::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT,
+                "Indices4Only must emit exactly {} main-feed conn regardless of configured={configured}",
+                crate::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT,
+            );
+        }
+    }
+
+    // Wave 5 Item 1 — subscription.scope config gate (LEGACY — kept
+    // until PR #7 Slice 5 retires IndicesOnlyAllExpiries).
+    #[test]
+    fn test_subscription_scope_enum_indices_only_all_expiries_legacy_variant_exists() {
+        let scope = SubscriptionScope::IndicesOnlyAllExpiries;
+        assert_eq!(scope.as_str(), "indices_only_all_expiries");
     }
 
     #[test]
@@ -2335,17 +2408,15 @@ mod tests {
         assert_eq!(wrapper.subscription.scope, SubscriptionScope::FullUniverse);
         assert_eq!(wrapper.subscription.scope.as_str(), "full_universe");
 
-        // Missing scope key falls back to the Default impl (indices-only).
+        // Missing scope key falls back to the Default impl
+        // (PR #7 Slice 1: default is now Indices4Only).
         let toml_no_scope =
             toml_default.replace("scope = \"indices_only_all_expiries\"\n            ", "");
         let wrapper: Wrapper = Figment::new()
             .merge(Toml::string(&toml_no_scope))
             .extract()
             .expect("missing scope must default");
-        assert_eq!(
-            wrapper.subscription.scope,
-            SubscriptionScope::IndicesOnlyAllExpiries
-        );
+        assert_eq!(wrapper.subscription.scope, SubscriptionScope::Indices4Only);
     }
 
     // Phase 0 Item 1 — IndicesUnderlyingsOnly scope variant.

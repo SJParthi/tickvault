@@ -241,6 +241,8 @@ pub fn select_stock_expiry_with_rollover(
 #[must_use]
 pub const fn should_subscribe_stock_derivatives(config: &SubscriptionConfig) -> bool {
     match config.scope {
+        // AWS-lifecycle LOCKED (PR #7) — 4 IDX_I SIDs only, no stock F&O.
+        SubscriptionScope::Indices4Only => false,
         // Wave 5 default — stock F&O dropped to free capacity for index full chain.
         SubscriptionScope::IndicesOnlyAllExpiries => false,
         // Phase 0 LEAN MVP — derivatives parked, only IDX_I + NSE_EQ subscribed.
@@ -262,6 +264,8 @@ pub const fn should_subscribe_stock_derivatives(config: &SubscriptionConfig) -> 
 #[must_use]
 pub const fn should_subscribe_index_derivatives(config: &SubscriptionConfig) -> bool {
     match config.scope {
+        // AWS-lifecycle LOCKED (PR #7) — 4 IDX_I SIDs only, no index F&O.
+        SubscriptionScope::Indices4Only => false,
         SubscriptionScope::IndicesUnderlyingsOnly => false,
         SubscriptionScope::IndicesOnlyAllExpiries | SubscriptionScope::FullUniverse => {
             config.subscribe_index_derivatives
@@ -295,6 +299,12 @@ pub const fn is_display_index_allowed_under_scope(
     security_id: u32,
 ) -> bool {
     match config.scope {
+        // AWS-lifecycle LOCKED (PR #7) — INDIA VIX is one of the 4 IDX_I
+        // SIDs, allowed by SecurityId match. All other display indices
+        // are sectoral / broad-market and are PARKED.
+        SubscriptionScope::Indices4Only => {
+            security_id == tickvault_common::constants::INDIA_VIX_SECURITY_ID
+        }
         SubscriptionScope::IndicesUnderlyingsOnly => {
             security_id == tickvault_common::constants::INDIA_VIX_SECURITY_ID
         }
@@ -1577,7 +1587,7 @@ mod tests {
     #[test]
     fn test_index_derivatives_all_subscribed() {
         let universe = make_test_universe();
-        let config = SubscriptionConfig::default();
+        let config = legacy_full_universe_config();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
         let plan = build_subscription_plan(
@@ -1656,7 +1666,7 @@ mod tests {
         let universe = make_test_universe();
         let config = SubscriptionConfig {
             subscribe_display_indices: false,
-            ..Default::default()
+            ..legacy_full_universe_config()
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
@@ -1739,7 +1749,7 @@ mod tests {
     #[test]
     fn test_registry_o1_lookup() {
         let universe = make_test_universe();
-        let config = SubscriptionConfig::default();
+        let config = legacy_full_universe_config();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
         let plan = build_subscription_plan(
@@ -1912,7 +1922,7 @@ mod tests {
     #[test]
     fn test_by_exchange_segment_grouping() {
         let universe = make_test_universe();
-        let config = SubscriptionConfig::default();
+        let config = legacy_full_universe_config();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
         let plan = build_subscription_plan(
@@ -2334,6 +2344,7 @@ mod tests {
     fn test_plan_with_all_subscriptions_disabled() {
         let universe = make_test_universe();
         let config = SubscriptionConfig {
+            scope: SubscriptionScope::FullUniverse,
             subscribe_index_derivatives: false,
             subscribe_display_indices: false,
             subscribe_stock_equities: false,
@@ -3106,7 +3117,7 @@ mod tests {
     #[test]
     fn test_index_derivative_uses_nse_fno_segment() {
         let universe = make_test_universe();
-        let config = SubscriptionConfig::default();
+        let config = legacy_full_universe_config();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
         let plan = build_subscription_plan(
@@ -3432,7 +3443,7 @@ mod tests {
     #[test]
     fn test_underlying_symbol_propagated_to_instruments() {
         let universe = make_test_universe();
-        let config = SubscriptionConfig::default();
+        let config = legacy_full_universe_config();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
         let plan = build_subscription_plan(
@@ -3463,7 +3474,7 @@ mod tests {
     #[test]
     fn test_index_option_classified_as_index_derivative() {
         let universe = make_test_universe();
-        let config = SubscriptionConfig::default();
+        let config = legacy_full_universe_config();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
         let plan = build_subscription_plan(
@@ -3912,6 +3923,7 @@ mod tests {
         };
 
         let config = SubscriptionConfig {
+            scope: SubscriptionScope::IndicesOnlyAllExpiries,
             feed_mode: "Full".to_string(),
             subscribe_index_derivatives: true,
             subscribe_stock_derivatives: false,
@@ -4317,7 +4329,7 @@ mod tests {
         // prev_close (bytes 50-53) AND OI (bytes 34-37) AND 5-level depth
         // (bytes 62-161) needed by Greeks pipeline + option chain UI.
         let universe = make_test_universe();
-        let config = SubscriptionConfig::default();
+        let config = legacy_full_universe_config();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
         let plan = build_subscription_plan(
             &universe,
@@ -4495,11 +4507,15 @@ mod tests {
     #[test]
     fn test_indices_only_scope_filters_to_three_underlyings() {
         // Build a universe that contains BOTH index F&O (NIFTY) and stock
-        // F&O (RELIANCE). Under default IndicesOnlyAllExpiries scope, the
-        // RELIANCE F&O block must NOT appear in the plan; the cash equity
-        // feed survives independently.
+        // F&O (RELIANCE). Under IndicesOnlyAllExpiries scope (legacy
+        // Wave 5 escape hatch — PR #7 Slice 5 retires it), the RELIANCE
+        // F&O block must NOT appear in the plan; the cash equity feed
+        // survives independently.
         let universe = make_test_universe();
-        let config = SubscriptionConfig::default();
+        let config = SubscriptionConfig {
+            scope: SubscriptionScope::IndicesOnlyAllExpiries,
+            ..SubscriptionConfig::default()
+        };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
         let plan = build_subscription_plan(
