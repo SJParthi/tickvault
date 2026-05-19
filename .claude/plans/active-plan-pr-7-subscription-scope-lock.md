@@ -1,11 +1,18 @@
 # Implementation Plan: PR #7 — Tighten SubscriptionScope to `Indices4Only`
 
-**Status:** DRAFT
+**Status:** IN_PROGRESS (PR #7a = Slices 1+2 ready for review; PR #7b will follow with Slices 3-8)
 **Date:** 2026-05-19
-**Approved by:** pending
-**Branch:** `claude/aws-lifecycle-pr-7-indices4only-scope`
+**Approved by:** Parthiban
+**Branch:** `claude/aws-lifecycle-pr-7-indices4only-scope` (PR #7a)
 **Predecessor:** PR #6b (#710 merged) — `LOCKED_UNIVERSE` static = 4 IDX_I SIDs
 **Successor in 14-PR sequence:** PR #8 — option_chain module (heart-piece)
+
+## Sub-PR split (operator-charter §H serial completion)
+
+- **PR #7a** (this PR) — Slices 1 + 2: introduce `Indices4Only` LOCKED variant, switch default, wire planner + watchdog arms, 3 new ratchet tests, 11 legacy-coverage tests preserved via `legacy_full_universe_config()` helper. Workspace 7,211/7,211 green.
+- **PR #7b** (follow-up after merge) — Slices 3 + 4: delete dead `subscribe_*_derivatives` / `subscribe_display_indices` flags; collapse `effective_main_feed_pool_size` signature.
+- **PR #7c** — Slices 5 + 6: retire legacy SubscriptionScope variants entirely; add source-scan ratchet meta-guard.
+- **PR #7d** — Slices 7 + 8: update CLAUDE.md + rule files; bump test-count baseline.
 
 ---
 
