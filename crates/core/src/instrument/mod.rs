@@ -12,7 +12,7 @@
 pub mod binary_cache;
 pub mod csv_downloader;
 pub mod csv_parser;
-pub mod daily_scheduler;
+// PR #6a (2026-05-19): daily_scheduler RETIRED (4-IDX_I LOCKED_UNIVERSE — no CSV refresh needed).
 pub mod delta_detector;
 // PR #4 (2026-05-19): 6 depth modules DELETED.
 pub mod diagnostic;
