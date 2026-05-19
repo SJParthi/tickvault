@@ -30,7 +30,7 @@
 
 pub mod auth;
 pub mod historical;
-pub mod index_constituency;
+// PR #6a (2026-05-19): index_constituency module RETIRED (4-IDX_I LOCKED_UNIVERSE).
 pub mod instance_lock;
 pub mod instrument;
 pub mod network;

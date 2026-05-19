@@ -3,7 +3,7 @@
 //! Verifies that API handlers never panic with invalid, extreme, or missing inputs.
 //! Critical for a trading system where an unhandled panic = process crash.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::State;
@@ -59,16 +59,13 @@ fn test_instrument_config() -> InstrumentConfig {
 // PR #2 (2026-05-18): `empty_snapshot` retired alongside the deleted
 // `SharedTopMoversSnapshot` type.
 
-fn empty_constituency() -> tickvault_api::state::SharedConstituencyMap {
-    Arc::new(RwLock::new(None))
-}
+// PR #6a (2026-05-19): empty_constituency() helper retired.
 
 fn make_test_state(questdb: QuestDbConfig) -> SharedAppState {
     SharedAppState::new(
         questdb,
         test_dhan_config(),
         test_instrument_config(),
-        empty_constituency(),
         Arc::new(SystemHealthStatus::new()),
     )
 }
@@ -201,7 +198,7 @@ fn no_panic_shared_app_state_construction() {
     let _ = state.questdb_config();
     let _ = state.dhan_config();
     let _ = state.instrument_config();
-    let _ = state.constituency_map();
+    // PR #6a (2026-05-19): constituency_map() accessor retired.
 }
 
 #[test]

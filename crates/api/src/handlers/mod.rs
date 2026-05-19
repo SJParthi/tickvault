@@ -10,7 +10,7 @@
 
 pub mod debug;
 pub mod health;
-pub mod index_constituency;
+// PR #6a (2026-05-19): index_constituency handler retired (4-IDX_I LOCKED_UNIVERSE).
 pub mod instruments;
 pub mod market_data;
 pub mod option_chain;

@@ -38,7 +38,6 @@ fn test_state() -> SharedAppState {
             build_window_start: "06:00:00".to_string(),
             build_window_end: "09:15:00".to_string(),
         },
-        std::sync::Arc::new(std::sync::RwLock::new(None)),
         std::sync::Arc::new(SystemHealthStatus::new()),
     )
 }
@@ -62,44 +61,9 @@ async fn test_get_stats_returns_200() {
 // PR #2 (2026-05-18): `test_get_top_movers_returns_200` removed
 // alongside the deleted `/api/top-movers` route family.
 
-/// `GET /api/index-constituency` must return 200 (handler returns
-/// `available: false` when the constituency map is empty — never errors).
-#[tokio::test]
-async fn test_get_index_constituency_returns_200() {
-    let router = build_router(test_state(), &[], true);
-    let request = Request::builder()
-        .uri("/api/index-constituency")
-        .body(Body::empty())
-        .expect("request build should succeed"); // APPROVED: test-only
-    let response = router
-        .oneshot(request)
-        .await
-        .expect("router should respond"); // APPROVED: test-only
-    assert_eq!(response.status(), StatusCode::OK);
-}
-
-/// `GET /api/stock-indices/{symbol}` must return 200 with `found: false`
-/// when the constituency map is empty (no data loaded).
-#[tokio::test]
-async fn test_get_stock_indices_returns_200_or_404() {
-    let router = build_router(test_state(), &[], true);
-    let request = Request::builder()
-        .uri("/api/stock-indices/RELIANCE")
-        .body(Body::empty())
-        .expect("request build should succeed"); // APPROVED: test-only
-    let response = router
-        .oneshot(request)
-        .await
-        .expect("router should respond"); // APPROVED: test-only
-    // Handler always returns 200 with `found: false` when the map is empty.
-    // A 404 would only come from axum itself (route not found), which we're
-    // also willing to accept here per the test contract.
-    let status = response.status();
-    assert!(
-        status == StatusCode::OK || status == StatusCode::NOT_FOUND,
-        "expected 200 or 404, got {status}"
-    );
-}
+// PR #6a (2026-05-19): test_get_index_constituency_returns_200 +
+// test_get_stock_indices_returns_200_or_404 retired with the 3 index-constituency
+// routes under 4-IDX_I LOCKED_UNIVERSE.
 
 /// `POST /api/instruments/rebuild` must be reachable and return 200.
 ///
