@@ -77,25 +77,13 @@ fn locked_ticket_5519522_depth_hosts_are_separate() {
 /// bug. Any depth-200 subscription must route through the ATM strike
 /// selector.
 ///
-/// We don't have a single bounded constant here because depth_rebalancer and
-/// depth_strike_selector handle the logic. Instead, we grep the production
-/// source to ensure the ATM selector is actually invoked on the 200-level
-/// path. Deleting the invocation silently would regress the fix.
-#[test]
-fn locked_ticket_5519522_depth_200_uses_atm_strike_selector() {
-    let depth_conn = include_str!("../../core/src/websocket/depth_connection.rs");
-    let depth_rebalancer = include_str!("../../core/src/instrument/depth_rebalancer.rs");
-
-    assert!(
-        depth_conn.contains("200-level") || depth_conn.contains("twohundreddepth"),
-        "LOCKED FACT: depth_connection.rs must reference 200-level path"
-    );
-    assert!(
-        depth_rebalancer.contains("ATM") || depth_rebalancer.contains("atm"),
-        "LOCKED FACT (Ticket #5519522): depth_rebalancer.rs must implement \
-         ATM strike selection for 200-level depth"
-    );
-}
+// PR #4 (2026-05-19): `locked_ticket_5519522_depth_200_uses_atm_strike_selector`
+// test retired alongside the deleted depth-20 / depth-200 WebSocket
+// infrastructure. Operator-locked per
+// `.claude/rules/project/websocket-connection-scope-lock.md`: under the
+// 4-IDX_I LOCKED_UNIVERSE we use ONLY 1 main-feed conn + 1 order-update
+// conn forever — no depth feeds, so Ticket #5519522's 200-depth ATM
+// invariant has no production code to assert against.
 
 // ===========================================================================
 // LOCKED FACT 2 — Previous-day close routing
