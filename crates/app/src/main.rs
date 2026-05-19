@@ -2067,50 +2067,16 @@ async fn main() -> Result<()> {
         // --- Background: Index constituency (best-effort) ---
         // During market hours, skip network downloads to niftyindices.com
         // (they often return HTML instead of CSV) and use the cached JSON.
-        // Fresh download happens on non-market-hours boot or post-market.
-        let bg_constituency = if is_market_hours {
-            info!(
-                "market hours — using cached constituency data (skipping niftyindices.com download)"
-            );
-            tickvault_core::index_constituency::try_load_cache(
-                &config.instrument.csv_cache_directory,
-            )
-            .await
-        } else {
-            tickvault_core::index_constituency::download_and_build_constituency_map(
-                &config.index_constituency,
-                &config.instrument.csv_cache_directory,
-            )
-            .await
-        };
-
-        // Persist constituency to QuestDB for Grafana (best-effort, non-blocking).
-        // Enrich with security_ids from instrument master for news-based trading.
-        if let Some(ref map) = bg_constituency {
-            match tickvault_storage::constituency_persistence::persist_constituency(
-                map,
-                &config.questdb,
-                fresh_universe.as_ref(),
-            ) {
-                Ok(()) => {}
-                Err(err) => {
-                    tracing::warn!(
-                        ?err,
-                        "index constituency QuestDB persistence failed (best-effort)"
-                    );
-                }
-            }
-        }
-
-        let bg_shared_constituency: tickvault_api::state::SharedConstituencyMap =
-            std::sync::Arc::new(std::sync::RwLock::new(bg_constituency));
+        // PR #6a (2026-05-19): index-constituency loader RETIRED under
+        // 4-IDX_I LOCKED_UNIVERSE (operator lock 2026-05-15). NSE index
+        // composition (which stocks are in NIFTY, etc.) isn't needed when
+        // only the 4 indices themselves are tracked.
 
         // --- Background: API server ---
         let api_state = SharedAppState::new(
             config.questdb.clone(),
             config.dhan.clone(),
             config.instrument.clone(),
-            bg_shared_constituency,
             health_status,
         );
 
@@ -5351,78 +5317,19 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 10.5: Index constituency data (best-effort, NON-BLOCKING)
     // -----------------------------------------------------------------------
-    // Constituency downloads are moved to background to prevent boot timeout.
-    // niftyindices.com often returns HTML instead of CSV, causing 91s+ retries
-    // that pushed boot past the 120s deadline.
-    let shared_constituency: tickvault_api::state::SharedConstituencyMap =
-        std::sync::Arc::new(std::sync::RwLock::new(None));
-
-    // During market hours: load from cache synchronously (fast, no network).
-    // Outside market hours: spawn background download (non-blocking).
-    if is_market_hours {
-        info!("market hours — using cached constituency data (skipping niftyindices.com download)");
-        let cached = tickvault_core::index_constituency::try_load_cache(
-            &config.instrument.csv_cache_directory,
-        )
-        .await;
-        if let Some(ref map) = cached
-            && let Err(err) = tickvault_storage::constituency_persistence::persist_constituency(
-                map,
-                &config.questdb,
-                slow_boot_universe.as_ref(),
-            )
-        {
-            tracing::warn!(
-                ?err,
-                "index constituency QuestDB persistence failed (best-effort)"
-            );
-        }
-        if let Ok(mut lock) = shared_constituency.write() {
-            *lock = cached;
-        }
-    } else {
-        // Background download — does not block boot sequence.
-        let bg_constituency = shared_constituency.clone();
-        let bg_index_config = config.index_constituency.clone();
-        let bg_cache_dir = config.instrument.csv_cache_directory.clone();
-        let bg_questdb_config = config.questdb.clone();
-        let bg_universe = slow_boot_universe.clone();
-        tokio::spawn(async move {
-            let map = tickvault_core::index_constituency::download_and_build_constituency_map(
-                &bg_index_config,
-                &bg_cache_dir,
-            )
-            .await;
-            if let Some(ref m) = map
-                && let Err(err) = tickvault_storage::constituency_persistence::persist_constituency(
-                    m,
-                    &bg_questdb_config,
-                    bg_universe.as_ref(),
-                )
-            {
-                tracing::warn!(
-                    ?err,
-                    "index constituency QuestDB persistence failed (best-effort)"
-                );
-            }
-            if let Ok(mut lock) = bg_constituency.write() {
-                *lock = map;
-            }
-        });
-    }
+    // PR #6a (2026-05-19): index-constituency loader RETIRED under
+    // 4-IDX_I LOCKED_UNIVERSE. NSE index composition (which stocks are in
+    // NIFTY, etc.) isn't needed when only the 4 indices themselves are
+    // tracked. The niftyindices.com download was previously gated behind
+    // is_market_hours to avoid blocking boot; both paths now removed.
 
     // -----------------------------------------------------------------------
     // Step 11: Start axum API server
     // -----------------------------------------------------------------------
-    // PR #2 (2026-05-18): the Phase 4a `movers_v2_enabled` gate and
-    // the `new_with_cascade_fanout` constructor were removed alongside
-    // the deleted `/api/movers/v2` route. AppState is constructed
-    // unconditionally via `new()`.
     let api_state = SharedAppState::new(
         config.questdb.clone(),
         config.dhan.clone(),
         config.instrument.clone(),
-        shared_constituency.clone(),
         health_status,
     );
 

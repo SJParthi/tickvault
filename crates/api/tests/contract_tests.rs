@@ -4,7 +4,7 @@
 //! that match the documented schema. Any change to response structure
 //! breaks downstream consumers (frontend portal, Grafana dashboards).
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -47,7 +47,6 @@ fn test_state() -> SharedAppState {
             build_window_start: "08:25:00".to_string(),
             build_window_end: "08:55:00".to_string(),
         },
-        Arc::new(RwLock::new(None)),
         Arc::new(SystemHealthStatus::new()),
     )
 }
