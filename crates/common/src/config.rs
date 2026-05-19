@@ -766,16 +766,6 @@ pub struct ApiConfig {
     /// Allowed CORS origins. Defaults to localhost dev origins.
     #[serde(default = "default_allowed_origins")]
     pub allowed_origins: Vec<String>,
-    /// Audit Finding #9 (2026-05-03): on boot, auto-open the Options
-    /// Chain portal at `http://localhost:3001/portal/options-chain`
-    /// in the operator's default browser. Default: `true` for local
-    /// dev (preserves the existing zero-config experience). MUST be
-    /// set to `false` in production / AWS / headless environments
-    /// where there is no browser to open and the failed
-    /// `xdg-open`/`open` shell-out only adds noise to the logs.
-    #[serde(default = "default_auto_open_portal")]
-    pub auto_open_portal: bool,
-
     /// **Phase 4a (2026-05-05) — DORMANT BY DEFAULT.** When `true`,
     /// expose `/api/movers?v=2` reading OHLCV from the in-RAM
     /// 29-TF `CascadeFanout` instead of the QuestDB `stock_movers` /
@@ -792,11 +782,6 @@ pub struct ApiConfig {
     /// post-deploy clean operation per §6 row 4.
     #[serde(default = "default_movers_v2_enabled")]
     pub movers_v2_enabled: bool,
-}
-
-// TEST-EXEMPT: trivial serde default returning the constant true; covered indirectly by portal_auto_open_flag_guard.rs.
-pub fn default_auto_open_portal() -> bool {
-    true
 }
 
 /// Phase 4a default — `false` so the dormant `/api/movers?v=2`
@@ -1720,7 +1705,6 @@ mod tests {
                 host: "0.0.0.0".to_string(),
                 port: 3001,
                 allowed_origins: default_allowed_origins(),
-                auto_open_portal: default_auto_open_portal(),
                 movers_v2_enabled: default_movers_v2_enabled(),
             },
             subscription: SubscriptionConfig::default(),
