@@ -5762,7 +5762,11 @@ fn create_websocket_pool(
     // helper inlined here after `phase2_recovery` module retirement
     // (operator lock 2026-05-15, websocket-connection-scope-lock.md).
     let effective_watchdog_threshold = match config.subscription.scope {
-        tickvault_common::config::SubscriptionScope::IndicesUnderlyingsOnly => {
+        // AWS-lifecycle LOCKED (PR #7) — 4 IDX_I SIDs only, same idle
+        // tolerance as the Phase 0 LEAN MVP (no derivative chains to
+        // refresh during quiet windows).
+        tickvault_common::config::SubscriptionScope::Indices4Only
+        | tickvault_common::config::SubscriptionScope::IndicesUnderlyingsOnly => {
             tickvault_core::websocket::activity_watchdog::WATCHDOG_THRESHOLD_IDX_I_SECS
         }
         tickvault_common::config::SubscriptionScope::IndicesOnlyAllExpiries
