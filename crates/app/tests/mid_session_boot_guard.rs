@@ -136,14 +136,11 @@ fn test_instrument_build_success_event_is_emitted_on_both_boot_paths() {
     );
 }
 
-// `test_depth_200_main_rs_increments_spawn_counter` retired with the
-// legacy spawn loop in the v2-only refactor (PR <TBD>). The literal
-// `depth_200_spawn_index` lived inside the deleted legacy `else if`
-// arm. Under v2 the depth-200 spawn is owned by `depth_dynamic_pipeline_v2.rs`
-// which uses its own staggering scheme (see `200-level depth: staggering
-// initial connect to avoid concurrent-auth reset` log + the
-// `DEPTH_200_INITIAL_STAGGER_MS` constant referenced from the v2
-// spawn block at main.rs:3166 / :3389).
+// PR #4 (2026-05-19): legacy `test_depth_200_main_rs_increments_spawn_counter`
+// and the v2 depth-200 spawn counter test are both retired alongside the
+// deleted 20/200-level depth WebSocket pipelines. Under the 4-IDX_I
+// LOCKED_UNIVERSE only 1 main-feed + 1 order-update conn run forever
+// (.claude/rules/project/websocket-connection-scope-lock.md).
 
 #[test]
 fn test_per_instrument_stall_poller_is_wired() {

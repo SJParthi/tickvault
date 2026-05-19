@@ -50,7 +50,9 @@ use tickvault_common::config::{ApplicationConfig, FeaturesConfig};
 /// blocked the build when the test harness compiled this file.
 // PR #2 (2026-05-18): `stock_movers_full_universe` + `option_movers_5s`
 // retired alongside the deleted movers pipeline; count is now 14.
-const EXPECTED_FLAGS: [&str; 14] = [
+// PR #4 (2026-05-19): `depth_dynamic_top_volume` + `depth_dynamic_pipeline_v2`
+// retired alongside the depth-20 + depth-200 pipelines; count is now 12.
+const EXPECTED_FLAGS: [&str; 12] = [
     "hotpath_async_writers",
     "phase2_emit_guard",
     "previous_close_persist",
@@ -62,8 +64,6 @@ const EXPECTED_FLAGS: [&str; 14] = [
     "telegram_bucket_coalescer",
     "market_open_self_test",
     "realtime_guarantee_score",
-    "depth_dynamic_top_volume",
-    "depth_dynamic_pipeline_v2",
     "historical_fetch_enabled",
 ];
 

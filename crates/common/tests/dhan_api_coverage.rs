@@ -29,12 +29,14 @@ use tickvault_common::constants::{
     DHAN_POSITIONS_PATH,
     DHAN_RENEW_TOKEN_PATH,
     DHAN_SET_IP_PATH,
-    // WebSocket depth (2)
-    DHAN_TWENTY_DEPTH_WS_BASE_URL,
-    DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL,
     // User profile (1)
     DHAN_USER_PROFILE_PATH,
 };
+
+// PR #4 (2026-05-19): The `DHAN_TWENTY_DEPTH_WS_BASE_URL` +
+// `DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL` constants were deleted alongside the
+// 20/200-level depth WebSocket infrastructure per the 4-IDX_I LOCKED_UNIVERSE
+// operator lock (.claude/rules/project/websocket-connection-scope-lock.md).
 
 // ---------------------------------------------------------------------------
 // Test: All Dhan REST endpoint constants are defined and have correct paths
@@ -175,55 +177,21 @@ fn test_all_dhan_rest_endpoint_constants_defined() {
 }
 
 // ---------------------------------------------------------------------------
-// Test: All 4 WebSocket endpoint URLs are defined
+// Test: The two remaining WebSocket endpoint URLs are defined
 // ---------------------------------------------------------------------------
 
-/// Verifies constants exist for all 4 Dhan WebSocket endpoints:
-/// 1. Market feed (config-based): wss://api-feed.dhan.co
-/// 2. Order update (config-based): wss://api-order-update.dhan.co
-/// 3. 20-level depth (constant): wss://depth-api-feed.dhan.co/twentydepth
-/// 4. 200-level depth (constant): wss://full-depth-api.dhan.co/
-///    NOTE: ROOT path `/` is the working URL — verified 2026-04-23 via Dhan's
-///    official Python SDK `dhanhq==2.2.0rc1`. Reverses ticket #5519522's
-///    earlier `/twohundreddepth` advice (caused ResetWithoutClosingHandshake).
+/// PR #4 (2026-05-19) — under the 4-IDX_I LOCKED_UNIVERSE only two WebSocket
+/// connections are spawned forever (see
+/// `.claude/rules/project/websocket-connection-scope-lock.md`):
+/// 1. Market feed (config-based): `wss://api-feed.dhan.co`
+/// 2. Order update (config-based): `wss://api-order-update.dhan.co`
 ///
-/// Market feed and order update WS URLs are in DhanConfig (not constants)
-/// because they share the same config pattern as rest_api_base_url. The depth
-/// WS URLs are constants because they have fixed paths.
+/// The previously-tested 20/200-level depth WS URL constants were deleted
+/// alongside the depth pipelines. The two URLs below live in `DhanConfig`
+/// (not in `constants.rs`) because they are per-environment configurable,
+/// so we verify them via a source scan of `config.rs`.
 #[test]
 fn test_all_websocket_urls_defined() {
-    // --- Depth WebSocket constants (docs/dhan-ref/04-full-market-depth-websocket.md) ---
-    assert_eq!(
-        DHAN_TWENTY_DEPTH_WS_BASE_URL, "wss://depth-api-feed.dhan.co/twentydepth",
-        "20-level depth WS base URL"
-    );
-    // 200-level uses ROOT path `/` — verified 2026-04-23 by running Dhan's
-    // official Python SDK `dhanhq==2.2.0rc1` on our account at SecurityId
-    // 72271. The SDK streams 30+ minutes on root path, while Rust at
-    // `/twohundreddepth` (the path Dhan ticket #5519522 had advised) got
-    // Protocol(ResetWithoutClosingHandshake). This reverses ticket #5519522.
-    assert_eq!(
-        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, "wss://full-depth-api.dhan.co",
-        "200-level depth WS base URL — ROOT path (Python SDK verified 2026-04-23)"
-    );
-
-    // Both must use wss:// (TLS required)
-    assert!(
-        DHAN_TWENTY_DEPTH_WS_BASE_URL.starts_with("wss://"),
-        "20-depth WS must use TLS"
-    );
-    assert!(
-        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.starts_with("wss://"),
-        "200-depth WS must use TLS"
-    );
-
-    // --- Config-based WebSocket URLs (verified via config source scan) ---
-    // Market feed: wss://api-feed.dhan.co (docs/dhan-ref/03-live-market-feed-websocket.md)
-    // Order update: wss://api-order-update.dhan.co (docs/dhan-ref/10-live-order-update-websocket.md)
-    //
-    // These URLs live in DhanConfig (not constants) because they are
-    // configurable per environment. We verify the default values by scanning
-    // the config source to confirm they exist with the correct values.
     let config_source = include_str!("../src/config.rs");
 
     // Market feed WS default
@@ -240,23 +208,14 @@ fn test_all_websocket_urls_defined() {
         "Order update WS URL '{order_update_ws}' must appear in config.rs defaults"
     );
 
-    // All 4 WebSocket URLs must point to different hosts/paths
-    let ws_urls: &[&str] = &[
-        market_feed_ws,
-        order_update_ws,
-        DHAN_TWENTY_DEPTH_WS_BASE_URL,
-        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL,
-    ];
-    for (i, a) in ws_urls.iter().enumerate() {
-        for (j, b) in ws_urls.iter().enumerate() {
-            if i != j {
-                assert_ne!(a, b, "WebSocket URLs must be unique: {a} == {b}");
-            }
-        }
-    }
+    // Both must point at different hosts.
+    assert_ne!(
+        market_feed_ws, order_update_ws,
+        "Main feed and order update WebSockets must use distinct hosts"
+    );
 
-    // All 4 must use wss:// (TLS required)
-    for url in ws_urls {
+    // Both must use wss:// (TLS required).
+    for url in [market_feed_ws, order_update_ws] {
         assert!(
             url.starts_with("wss://"),
             "WebSocket URL must use TLS (wss://): {url}"
@@ -590,41 +549,6 @@ fn test_path_constants_are_paths_not_full_urls() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Test: WebSocket depth URLs contain expected hostnames
-// ---------------------------------------------------------------------------
-
-/// Verifies the depth WebSocket URLs use the correct Dhan hostnames
-/// and paths. These are separate from the market feed WebSocket.
-#[test]
-fn test_depth_websocket_urls_correct_hostnames() {
-    assert!(
-        DHAN_TWENTY_DEPTH_WS_BASE_URL.contains("depth-api-feed.dhan.co"),
-        "20-depth must use depth-api-feed.dhan.co"
-    );
-    assert!(
-        DHAN_TWENTY_DEPTH_WS_BASE_URL.contains("/twentydepth"),
-        "20-depth must have /twentydepth path"
-    );
-    assert!(
-        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.contains("full-depth-api.dhan.co"),
-        "200-depth must use full-depth-api.dhan.co"
-    );
-    // 200-depth uses ROOT path `/` — verified 2026-04-23 by Python SDK
-    // `dhanhq==2.2.0rc1`. Reverses Dhan ticket #5519522 which had told us
-    // to use `/twohundreddepth` (caused ResetWithoutClosingHandshake in Rust).
-    assert!(
-        !DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.contains("/twohundreddepth"),
-        "200-depth must NOT use /twohundreddepth (reversed 2026-04-23)"
-    );
-    assert_eq!(
-        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, "wss://full-depth-api.dhan.co",
-        "200-depth full URL check"
-    );
-
-    // 20-depth and 200-depth use DIFFERENT hosts
-    assert_ne!(
-        DHAN_TWENTY_DEPTH_WS_BASE_URL, DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL,
-        "20-depth and 200-depth must be different URLs"
-    );
-}
+// PR #4 (2026-05-19): `test_depth_websocket_urls_correct_hostnames` retired
+// alongside the deleted 20/200-level depth WebSocket constants. See the
+// header comment after the imports for the operator lock reference.

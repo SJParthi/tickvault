@@ -200,8 +200,7 @@ fi
 echo "  [9/9] S6 invariants — DEDUP + depth + Bible lockdown..." >&2
 INVARIANT_FAILED=0
 for INV_TEST in dedup_uniqueness_proptest:tickvault-storage \
-                bible_deletion_lockdown:tickvault-common \
-                depth_invariants_proptest:tickvault-common; do
+                bible_deletion_lockdown:tickvault-common; do
   TEST_NAME="${INV_TEST%%:*}"
   CRATE="${INV_TEST##*:}"
   INV_OUT=$(timeout 60 cargo test -p "$CRATE" --test "$TEST_NAME" 2>&1)
@@ -215,7 +214,7 @@ done
 if [ "$INVARIANT_FAILED" -ne 0 ]; then
   FAILED=1
 else
-  echo "  PASS: 3 commit-time invariants green (~10k+8k random cases verified)" >&2
+  echo "  PASS: 2 commit-time invariants green (depth_invariants_proptest retired with PR #4)" >&2
 fi
 
 # ─────────────────────────────────────────────

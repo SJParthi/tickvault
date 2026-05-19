@@ -20,70 +20,24 @@
 //! Purpose: guarantee + assurance + proof that we don't lose these facts.
 
 use tickvault_common::constants::{
-    DHAN_TWENTY_DEPTH_WS_BASE_URL, DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, FULL_QUOTE_PACKET_SIZE,
-    PREV_CLOSE_OFFSET_OI, PREV_CLOSE_OFFSET_PRICE, PREVIOUS_CLOSE_PACKET_SIZE, QUOTE_PACKET_SIZE,
-    RESPONSE_CODE_FULL, RESPONSE_CODE_PREVIOUS_CLOSE, RESPONSE_CODE_QUOTE,
+    FULL_QUOTE_PACKET_SIZE, PREV_CLOSE_OFFSET_OI, PREV_CLOSE_OFFSET_PRICE,
+    PREVIOUS_CLOSE_PACKET_SIZE, QUOTE_PACKET_SIZE, RESPONSE_CODE_FULL,
+    RESPONSE_CODE_PREVIOUS_CLOSE, RESPONSE_CODE_QUOTE,
 };
 
 // ===========================================================================
-// LOCKED FACT 1 — 200-level depth WebSocket path
-// Source: Dhan support Ticket #5519522 (2026-04-10)
-// Reference: .claude/rules/dhan/full-market-depth.md rule 2
-// ===========================================================================
-
-/// 2026-04-23 REVERSAL of ticket #5519522: the 200-level depth WebSocket
-/// uses the ROOT path `/` on host `full-depth-api.dhan.co`. Verified by
-/// running Dhan's official Python SDK `dhanhq==2.2.0rc1` on our account at
-/// SecurityId 72271 — SDK streamed 30+ minutes on root path, while our Rust
-/// client at `/twohundreddepth` had been getting
-/// `Protocol(ResetWithoutClosingHandshake)` for 2+ weeks. This test now
-/// guards the REVERSED invariant — if you ever need to switch back to
-/// `/twohundreddepth`, re-open ticket #5519522 and cite the response.
-#[test]
-fn locked_200_depth_uses_root_path_verified_2026_04_23() {
-    assert_eq!(
-        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, "wss://full-depth-api.dhan.co",
-        "LOCKED FACT (Python SDK 2026-04-23): 200-depth URL uses ROOT path. \
-         The /twohundreddepth path that ticket #5519522 had advised caused \
-         TCP resets in our Rust client. To revert, open a new Dhan ticket."
-    );
-    assert!(
-        !DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.contains("/twohundreddepth"),
-        "LOCKED FACT: 200-depth URL must NOT use /twohundreddepth (reversed 2026-04-23)"
-    );
-}
-
-/// Ticket #5519522: 20-level and 200-level depth WebSockets are DIFFERENT
-/// hosts. Do not unify. Do not use the same base URL.
-#[test]
-fn locked_ticket_5519522_depth_hosts_are_separate() {
-    assert!(
-        DHAN_TWENTY_DEPTH_WS_BASE_URL.contains("depth-api-feed.dhan.co"),
-        "LOCKED FACT: 20-depth host is depth-api-feed.dhan.co"
-    );
-    assert!(
-        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.contains("full-depth-api.dhan.co"),
-        "LOCKED FACT: 200-depth host is full-depth-api.dhan.co"
-    );
-    assert_ne!(
-        DHAN_TWENTY_DEPTH_WS_BASE_URL, DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL,
-        "LOCKED FACT: 20-depth and 200-depth use different hosts"
-    );
-}
-
-/// Ticket #5519522: 200-level depth returns consistent data ONLY for
-/// at-the-money (ATM) security IDs. Far OTM contracts get no data even when
-/// the subscription succeeds. This is server-side filtering, not a client
-/// bug. Any depth-200 subscription must route through the ATM strike
-/// selector.
-///
-// PR #4 (2026-05-19): `locked_ticket_5519522_depth_200_uses_atm_strike_selector`
-// test retired alongside the deleted depth-20 / depth-200 WebSocket
+// LOCKED FACT 1 — 20-level / 200-level depth WebSocket invariants
+//
+// PR #4 (2026-05-19): All Ticket #5519522 / 2026-04-23 depth-URL ratchets
+// retired alongside the deleted depth-20 / depth-200 WebSocket
 // infrastructure. Operator-locked per
 // `.claude/rules/project/websocket-connection-scope-lock.md`: under the
 // 4-IDX_I LOCKED_UNIVERSE we use ONLY 1 main-feed conn + 1 order-update
-// conn forever — no depth feeds, so Ticket #5519522's 200-depth ATM
-// invariant has no production code to assert against.
+// conn forever — no separate depth feeds. The dependent URL constants
+// (`DHAN_TWENTY_DEPTH_WS_BASE_URL`, `DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL`)
+// no longer exist; if depth ever returns, re-open Ticket #5519522 and
+// restore both the constants and these ratchets together.
+// ===========================================================================
 
 // ===========================================================================
 // LOCKED FACT 2 — Previous-day close routing
@@ -179,69 +133,7 @@ fn locked_rule_file_cites_ticket_5525125() {
     );
 }
 
-/// Ensures `full-market-depth.md` documents the 2026-04-23 reversal of
-/// ticket #5519522 — root path is the working URL, NOT `/twohundreddepth`.
-/// The file must cite the Python SDK verification so anyone reading it in
-/// the future understands why the original ticket advice was dropped.
-#[test]
-fn locked_rule_file_documents_2026_04_23_reversal() {
-    let rule_file = include_str!("../../../.claude/rules/dhan/full-market-depth.md");
-    assert!(
-        rule_file.contains("Ticket #5519522"),
-        "LOCKED FACT: full-market-depth.md must cite Dhan Ticket #5519522"
-    );
-    assert!(
-        rule_file.contains("2026-04-23"),
-        "LOCKED FACT: full-market-depth.md must document the 2026-04-23 \
-         Python SDK verification of root path"
-    );
-    assert!(
-        rule_file.contains("Python SDK") || rule_file.contains("dhanhq"),
-        "LOCKED FACT: full-market-depth.md must cite the Python SDK \
-         as the source of truth for 200-depth root path"
-    );
-    assert!(
-        rule_file.contains("ATM") || rule_file.contains("at-the-money"),
-        "LOCKED FACT: full-market-depth.md must document the ATM strike \
-         requirement for 200-level depth subscriptions"
-    );
-}
-
-// ===========================================================================
-// LOCKED FACT 4 — Banned patterns in the current tree
-// These string patterns must NEVER appear in production source code because
-// they represent reverted or known-broken configurations.
-// ===========================================================================
-
-/// Reversed 2026-04-23: the `/twohundreddepth` path for 200-level depth
-/// (what Dhan ticket #5519522 originally told us to use) must NOT appear
-/// on any non-comment line of `crates/common/src/constants.rs`. Python SDK
-/// verified 2026-04-23 that root path `/` is the actually-working URL.
-///
-/// This scan is deliberately crude — it trips on any suspicious literal,
-/// not just the exact byte pattern. False positives are recoverable (you
-/// rename the variable or add a `// LOCKED FACT` comment); false negatives
-/// would drop us back into the 2-week TCP-reset loop.
-#[test]
-fn locked_no_twohundreddepth_path_in_200_depth_url_source() {
-    let constants = include_str!("../src/constants.rs");
-    for (idx, line) in constants.lines().enumerate() {
-        // Only scan lines that mention full-depth-api.dhan.co — i.e. the
-        // 200-depth URL assignment line. 20-depth uses a different host
-        // (depth-api-feed.dhan.co), so we do NOT trip on its /twentydepth.
-        if line.contains("full-depth-api.dhan.co") && line.contains("/twohundreddepth") {
-            // Allowed: comments citing the old path for historical context.
-            // Require an explicit // LOCKED FACT citation if someone needs
-            // to mention it.
-            if !line.contains("LOCKED FACT") && !line.trim_start().starts_with("//") {
-                panic!(
-                    "LOCKED FACT VIOLATION at constants.rs:{}: 200-depth URL \
-                     contains '/twohundreddepth' — did you revert the 2026-04-23 \
-                     Python-SDK-verified root-path fix? Re-open Dhan ticket \
-                     #5519522 if this path really needs to come back.\nLine: {line}",
-                    idx + 1
-                );
-            }
-        }
-    }
-}
+// PR #4 (2026-05-19): `locked_rule_file_documents_2026_04_23_reversal` +
+// `locked_no_twohundreddepth_path_in_200_depth_url_source` retired alongside
+// the deleted depth-20 / depth-200 WebSocket infrastructure + the deletion
+// of `.claude/rules/dhan/full-market-depth.md`. See LOCKED FACT 1 above.
