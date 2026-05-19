@@ -158,8 +158,8 @@ pub fn build_category_targets(cat: LogCategory) -> &'static [&'static str] {
         ],
         LogCategory::OptionChain => &[
             "tickvault_core::option_chain",
-            "tickvault_trading::greeks",
-            "tickvault_storage::greeks_persistence",
+            // PR #3 (2026-05-19): `tickvault_trading::greeks` and
+            // `tickvault_storage::greeks_persistence` modules retired.
         ],
     }
 }

@@ -15,17 +15,19 @@
 //!
 //! # Modules
 //! - `candles` — In-memory `CandleEngine<TF>` (29-timeframes plan, Phase 3)
-//! - `greeks` — Options Greeks engine: Black-Scholes, IV solver, PCR, Buildup classification
 //! - `indicator` — O(1) per-tick indicator engine (EMA, RSI, MACD, ATR, Bollinger, etc.)
 //! - `strategy` — FSM-based strategy evaluator with declarative conditions
 //! - `risk` — Risk engine: max daily loss, position limits, P&L tracking, auto-halt
 //! - `oms` — Order Management System: lifecycle FSM, rate limiting, circuit breaker, reconciliation
 //!
 //! # Pipeline Position
-//! ParsedTick → **IndicatorEngine → GreeksEngine → StrategyEvaluator** → OMS → Risk → Execute → Persist
+//! ParsedTick → **IndicatorEngine → StrategyEvaluator** → OMS → Risk → Execute → Persist
 
 pub mod candles;
-pub mod greeks;
+// PR #3 (2026-05-19): `greeks` module DELETED. Under the 4-IDX_I-only
+// LOCKED_UNIVERSE there are no live option contracts on the WebSocket
+// to compute Greeks from. Option Chain REST overlay (PR #8) ships
+// Dhan-computed greeks separately.
 pub mod in_mem;
 pub mod indicator;
 pub mod oms;

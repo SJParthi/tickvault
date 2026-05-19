@@ -23,7 +23,9 @@ pub mod depth_20_single_side_planner;
 pub mod depth_bridge_state_writer;
 pub mod depth_dynamic_pipeline;
 pub mod depth_dynamic_pipeline_v2;
-pub mod greeks_pipeline;
+// PR #3 (2026-05-19): `greeks_pipeline` module DELETED. Greeks
+// pipeline retired alongside the indices-only universe. Option Chain
+// REST overlay (PR #8) ships Dhan-computed greeks separately.
 pub mod infra;
 // 2026-05-09 PR 5c.5-final (Bug 3 — movers retirement): the
 // `movers_pipeline` orchestrator is DELETED. Operator directive:
