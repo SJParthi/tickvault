@@ -174,10 +174,10 @@ pub enum ErrorCode {
     HotPath01SyncFsFailed,
     /// HOT-PATH-02: hot-path writer queue full / closed / uninitialized.
     HotPath02WriterQueueDrop,
-    /// PHASE2-01: Phase 2 dispatch failed (Failed event emitted).
-    Phase201DispatchFailed,
-    /// PHASE2-02: Phase2EmitGuard dropped without firing an outcome.
-    Phase202EmitGuardDropped,
+    // PR #5 (2026-05-19): PHASE2-01 + PHASE2-02 variants RETIRED.
+    // Phase 2 dispatcher chain (phase2_scheduler + phase2_delta +
+    // phase2_emit_guard + phase2_readiness_check + phase2_recovery) is
+    // deleted under operator-locked 4-IDX_I LOCKED_UNIVERSE.
     /// PREVCLOSE-01: previous_close ILP append or flush failed.
     PrevClose01IlpFailed,
     /// PREVCLOSE-02: first_seen_set inconsistency (reserved for future use).
@@ -213,8 +213,8 @@ pub enum ErrorCode {
     Boot02DeadlineExceeded,
     /// BOOT-03: wall-clock skew vs trusted source exceeded threshold — HALTING.
     Boot03ClockSkewExceeded,
-    /// AUDIT-01: Phase 2 audit row write failed.
-    Audit01Phase2WriteFailed,
+    // PR #5 (2026-05-19): AUDIT-01 variant RETIRED. phase2_audit_persistence.rs
+    // deleted; the only ILP writer that could fire this code is gone.
     /// AUDIT-02: depth-rebalance audit row write failed.
     Audit02DepthRebalanceWriteFailed,
     /// AUDIT-03: WS reconnect audit row write failed.
@@ -333,15 +333,9 @@ pub enum ErrorCode {
     /// semantic mid-session (escalate to Item 26 L3 ticket) or our parser
     /// regressed on the byte offset. Severity::High.
     Volume01MonotonicityBreach,
-    /// Phase 2 readiness pre-flight failed at 09:13:01 IST. Fires
-    /// 1 second after `Phase2Complete` if any of the 11 forward-looking
-    /// pre-conditions for the 09:15 / 09:15:30 / 09:16:30 milestones
-    /// fails: token expiry headroom, main feed pool, depth-20 pool,
-    /// depth-200 pool, order update WS, QuestDB ILP, pre-open buffer
-    /// coverage, Phase 2 plan quality, subscribe ack rate, rescue ring
-    /// health, composite SLO score. Severity::Critical — operator has
-    /// ~2 minutes (until 09:15) to act before market open.
-    Phase2Ready01PreflightFailed,
+    // PR #5 (2026-05-19): PHASE2-READY-01 variant RETIRED. The 09:13:01 IST
+    // pre-flight readiness check is deleted alongside the Phase 2 dispatcher
+    // chain under operator-locked 4-IDX_I LOCKED_UNIVERSE.
     /// Wave 5 Item 13 — boot-time prev-close routing assertion failed.
     /// The subscription plan contains an instrument whose `(segment,
     /// feed_mode)` pair cannot deliver previous-day close per the
@@ -602,8 +596,7 @@ impl ErrorCode {
             // Wave 1 (PR #393)
             Self::HotPath01SyncFsFailed => "HOT-PATH-01",
             Self::HotPath02WriterQueueDrop => "HOT-PATH-02",
-            Self::Phase201DispatchFailed => "PHASE2-01",
-            Self::Phase202EmitGuardDropped => "PHASE2-02",
+            // PR #5 (2026-05-19): PHASE2-01 / PHASE2-02 retired.
             Self::PrevClose01IlpFailed => "PREVCLOSE-01",
             Self::PrevClose02FirstSeenInconsistency => "PREVCLOSE-02",
             // Phase 4b cleanup (2026-05-05): MOVERS-01/02/03 retired.
@@ -616,7 +609,7 @@ impl ErrorCode {
             Self::Boot01QuestDbSlow => "BOOT-01",
             Self::Boot02DeadlineExceeded => "BOOT-02",
             Self::Boot03ClockSkewExceeded => "BOOT-03",
-            Self::Audit01Phase2WriteFailed => "AUDIT-01",
+            // PR #5 (2026-05-19): AUDIT-01 retired with phase2_audit_persistence.rs.
             Self::Audit02DepthRebalanceWriteFailed => "AUDIT-02",
             Self::Audit03WsReconnectWriteFailed => "AUDIT-03",
             Self::Audit04BootWriteFailed => "AUDIT-04",
@@ -666,7 +659,7 @@ impl ErrorCode {
             Self::PrevClose04CacheEmptyAtBoot => "PREVCLOSE-04",
             // Wave 5 Item 26 L1 — volume cumulative-monotonicity guard
             Self::Volume01MonotonicityBreach => "VOLUME-MONO-01",
-            Self::Phase2Ready01PreflightFailed => "PHASE2-READY-01",
+            // PR #5 (2026-05-19): PHASE2-READY-01 retired with phase2_readiness_check.
             // Wave 6 — Multi-TF aggregator
             Self::AggregatorDrop01 => "AGGREGATOR-DROP-01",
             Self::AggregatorLate01 => "AGGREGATOR-LATE-01",
@@ -724,7 +717,6 @@ impl ErrorCode {
             | Self::Boot03ClockSkewExceeded
             | Self::Selftest02Failed
             | Self::PrevClose03BootRoutingAssertion
-            | Self::Phase2Ready01PreflightFailed
             | Self::AggregatorDrop01
             | Self::Resilience01DualInstanceDetected
             | Self::OrphanPosition01Detected
@@ -760,7 +752,6 @@ impl ErrorCode {
             | Self::RiskGapPositionPnl
             | Self::InstrumentP0ExpiryAtGate4
             | Self::Data807TokenExpired
-            | Self::Phase202EmitGuardDropped
             | Self::Boot01QuestDbSlow
             | Self::CorePin01PinningFailedAtBoot
             | Self::Volume01MonotonicityBreach
@@ -804,13 +795,11 @@ impl ErrorCode {
             | Self::Data813InvalidSecurityId
             | Self::Data814InvalidRequest
             | Self::HotPath01SyncFsFailed
-            | Self::Phase201DispatchFailed
             | Self::PrevClose01IlpFailed
             | Self::PrevClose02FirstSeenInconsistency
             | Self::PrevOi01CacheEmptyAtBoot
             | Self::PrevClose04CacheEmptyAtBoot
             | Self::WsGap06TickGapSummary
-            | Self::Audit01Phase2WriteFailed
             | Self::Audit02DepthRebalanceWriteFailed
             | Self::Audit03WsReconnectWriteFailed
             | Self::Audit04BootWriteFailed
@@ -881,8 +870,6 @@ impl ErrorCode {
             | Self::StorageGapF32F64Precision => ".claude/rules/project/gap-enforcement.md",
             Self::HotPath01SyncFsFailed
             | Self::HotPath02WriterQueueDrop
-            | Self::Phase201DispatchFailed
-            | Self::Phase202EmitGuardDropped
             | Self::PrevClose01IlpFailed
             | Self::PrevClose02FirstSeenInconsistency
             | Self::PrevOi01CacheEmptyAtBoot
@@ -893,7 +880,6 @@ impl ErrorCode {
             | Self::AuthGap03TokenForceRenewedOnWake
             | Self::Boot01QuestDbSlow
             | Self::Boot02DeadlineExceeded
-            | Self::Audit01Phase2WriteFailed
             | Self::Audit02DepthRebalanceWriteFailed
             | Self::Audit03WsReconnectWriteFailed
             | Self::Audit04BootWriteFailed
@@ -936,8 +922,7 @@ impl ErrorCode {
             Self::CorePin01PinningFailedAtBoot
             | Self::CorePin02WorkerDrifted
             | Self::PrevClose03BootRoutingAssertion
-            | Self::Volume01MonotonicityBreach
-            | Self::Phase2Ready01PreflightFailed => ".claude/rules/project/wave-5-error-codes.md",
+            | Self::Volume01MonotonicityBreach => ".claude/rules/project/wave-5-error-codes.md",
             Self::AggregatorDrop01
             | Self::AggregatorLate01
             | Self::AggregatorSeal01IlpFailed
@@ -1056,8 +1041,7 @@ impl ErrorCode {
             Self::Data814InvalidRequest,
             Self::HotPath01SyncFsFailed,
             Self::HotPath02WriterQueueDrop,
-            Self::Phase201DispatchFailed,
-            Self::Phase202EmitGuardDropped,
+            // PR #5 (2026-05-19): Phase201DispatchFailed + Phase202EmitGuardDropped retired.
             Self::PrevClose01IlpFailed,
             Self::PrevClose02FirstSeenInconsistency,
             Self::PrevOi01CacheEmptyAtBoot,
@@ -1069,7 +1053,7 @@ impl ErrorCode {
             Self::Boot01QuestDbSlow,
             Self::Boot02DeadlineExceeded,
             Self::Boot03ClockSkewExceeded,
-            Self::Audit01Phase2WriteFailed,
+            // PR #5 (2026-05-19): Audit01Phase2WriteFailed retired.
             Self::Audit02DepthRebalanceWriteFailed,
             Self::Audit03WsReconnectWriteFailed,
             Self::Audit04BootWriteFailed,
@@ -1087,7 +1071,7 @@ impl ErrorCode {
             Self::CorePin02WorkerDrifted,
             Self::PrevClose03BootRoutingAssertion,
             Self::Volume01MonotonicityBreach,
-            Self::Phase2Ready01PreflightFailed,
+            // PR #5 (2026-05-19): Phase2Ready01PreflightFailed retired.
             // Wave 6 — Multi-TF aggregator (Sub-PR #1)
             Self::AggregatorDrop01,
             Self::AggregatorLate01,
@@ -1336,7 +1320,11 @@ mod tests {
         // bumped 122 -> 117 by removing DEPTH-DYN-01/02, DEPTH-20-DYN-03,
         // DEPTH-200-DYN-01, DEPTH200-SMOKE-01 (depth feeds retired
         // entirely; only main-feed + order-update WSes remain).
-        assert_eq!(ErrorCode::all().len(), 117);
+        // 2026-05-19 (PR #5 of AWS-lifecycle — Phase 2 dispatcher retirement):
+        // bumped 117 -> 113 by removing PHASE2-01, PHASE2-02, PHASE2-READY-01,
+        // AUDIT-01 (Phase 2 stock-F&O dispatcher chain retired alongside
+        // phase2_audit_persistence under operator-locked 4-IDX_I scope).
+        assert_eq!(ErrorCode::all().len(), 113);
     }
 
     #[test]
