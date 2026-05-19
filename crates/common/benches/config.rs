@@ -159,9 +159,6 @@ port = 3001
 
 [subscription]
 feed_mode = "Full"
-subscribe_index_derivatives = true
-subscribe_stock_derivatives = true
-subscribe_display_indices = true
 subscribe_stock_equities = true
 stock_atm_strikes_above = 10
 stock_atm_strikes_below = 10

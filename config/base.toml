@@ -241,13 +241,12 @@ auto_open_portal = true
 #
 # Scope is the SOURCE OF TRUTH for the 2-WS lock per
 # `.claude/rules/project/websocket-connection-scope-lock.md` and charter §I.
-# Flipping back to "indices_only_all_expiries" or "full_universe" requires
-# operator re-approval recorded in the rule file with a dated quote.
+# `indices_4_only` is the ONLY legal value after PR #7b — the legacy
+# `full_universe` / `indices_only_all_expiries` / `indices_underlyings_only`
+# variants have been retired. Adding a new scope requires operator
+# re-approval recorded in the rule file with a dated quote.
 scope = "indices_4_only"
 feed_mode = "Full"
-subscribe_index_derivatives = false
-subscribe_stock_derivatives = false
-subscribe_display_indices = true
 subscribe_stock_equities = true
 stock_atm_strikes_above = 25
 stock_atm_strikes_below = 25

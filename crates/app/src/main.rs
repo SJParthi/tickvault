@@ -5762,16 +5762,11 @@ fn create_websocket_pool(
     // helper inlined here after `phase2_recovery` module retirement
     // (operator lock 2026-05-15, websocket-connection-scope-lock.md).
     let effective_watchdog_threshold = match config.subscription.scope {
-        // AWS-lifecycle LOCKED (PR #7) — 4 IDX_I SIDs only, same idle
-        // tolerance as the Phase 0 LEAN MVP (no derivative chains to
-        // refresh during quiet windows).
-        tickvault_common::config::SubscriptionScope::Indices4Only
-        | tickvault_common::config::SubscriptionScope::IndicesUnderlyingsOnly => {
+        // AWS-lifecycle LOCKED (PR #7b) — single-variant enum; 4 IDX_I
+        // SIDs only, IDX_I idle tolerance applies (3s — the expected
+        // 1-3 tick/sec window).
+        tickvault_common::config::SubscriptionScope::Indices4Only => {
             tickvault_core::websocket::activity_watchdog::WATCHDOG_THRESHOLD_IDX_I_SECS
-        }
-        tickvault_common::config::SubscriptionScope::IndicesOnlyAllExpiries
-        | tickvault_common::config::SubscriptionScope::FullUniverse => {
-            tickvault_core::websocket::activity_watchdog::WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS
         }
     };
     if effective_watchdog_threshold != configured_watchdog_threshold {
@@ -5807,14 +5802,13 @@ fn create_websocket_pool(
     // stock equities → stock derivatives. So truncating the tail drops
     // the lowest-priority items first (typically stock options far from
     // ATM that Phase 2 would otherwise add post-09:12 IST).
-    // Phase 0 Item 2 (operator-locked 2026-05-13): under
-    // `SubscriptionScope::IndicesUnderlyingsOnly` the planner emits ~222
-    // SIDs (well below the 5000-per-conn Dhan cap). Spinning up 5
-    // main-feed connections would waste 4 idle slots, fragment the
-    // token/IP budget, and trip the pool watchdog with false-positive
-    // "connection idle" signals. `effective_main_feed_pool_size` clamps
-    // the count to `PHASE_0_MAIN_FEED_CONNECTION_COUNT = 1` under that
-    // scope; legacy + Wave 5 scopes honour the configured value.
+    // AWS-lifecycle LOCKED (PR #7b): under the single-variant scope the
+    // planner emits exactly 4 IDX_I SIDs (well below the 5000-per-conn
+    // Dhan cap). Spinning up 5 main-feed connections would waste 4 idle
+    // slots, fragment the token/IP budget, and trip the pool watchdog
+    // with false-positive "connection idle" signals.
+    // `effective_main_feed_pool_size` always returns
+    // `PHASE_0_MAIN_FEED_CONNECTION_COUNT = 1`.
     //
     // Security-review MEDIUM fix (2026-05-13): compute the pool clamp
     // BEFORE the capacity check so `effective_capacity` and the actual

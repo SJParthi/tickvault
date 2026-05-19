@@ -338,7 +338,7 @@ fn test_config_default_values() {
 
     // SubscriptionConfig defaults.
     assert_eq!(config.subscription.feed_mode, "Full");
-    assert!(config.subscription.subscribe_index_derivatives);
+    assert!(config.subscription.subscribe_stock_equities);
     assert_eq!(config.subscription.stock_atm_strikes_above, 25);
 
     // StrategyConfig defaults.
