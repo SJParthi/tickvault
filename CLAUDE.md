@@ -148,7 +148,7 @@ crates/
 | `infra.rs` | Docker health checks, service readiness |
 | `trading_pipeline.rs` | Pipeline wiring & channel setup |
 
-## BOOT SEQUENCE (15 steps)
+## BOOT SEQUENCE
 
 ```
 CryptoProvider → Config → Observability → Logging →
@@ -156,12 +156,21 @@ CryptoProvider → Config → Observability → Logging →
 [Parallel: IP verification] →
 Auth (cache → SSM → TOTP → JWT) →
 [Parallel: QuestDB DDL] →
-Universe (CSV → parse → filter → cache) →
-WebSocket pool → Tick processor →
+Universe = LOCKED_UNIVERSE const (4 IDX_I SIDs, no CSV parse) →
+WebSocket pool (1 main-feed conn) → Tick processor →
 Historical candles (cold path) →
-Order update WS → API server →
+Order update WS (1 conn) → API server →
 Token renewal → Shutdown signal
 ```
+
+Post-AWS-lifecycle (PRs #2-#7b, 2026-05-19): the universe is a static
+`LOCKED_UNIVERSE` const in `crates/common/src/locked_universe.rs`
+(4 IDX_I SIDs: NIFTY=13, BANKNIFTY=25, SENSEX=51, INDIA VIX=21).
+CSV download/parse, Phase 2 stock-F&O dispatcher, depth-20/200 pools,
+greeks pipeline, movers pipeline are all DELETED — boot is now a
+linear flow with one main-feed + one order-update WebSocket. See
+`.claude/rules/project/websocket-connection-scope-lock.md` for the
+2-WS lock.
 
 ## KEY ARCHITECTURAL PATTERNS
 
@@ -414,6 +423,8 @@ Tests in `crates/*/tests/gap_enforcement.rs` verify:
 ## CONFIGURATION
 
 `config/base.toml` — 17 sections: `trading` (incl. nse_holidays), `dhan`, `questdb`, `valkey`, `prometheus`, `websocket`, `network`, `token`, `risk`, `strategy` (**`dry_run = true` by default**), `logging`, `instrument`, `api` (port 3001), `subscription`, `notification`, `observability`, `historical`
+
+`[subscription]` post-AWS-lifecycle (PR #7b): `scope = "indices_4_only"` is the only legal value. The 3 dead `subscribe_*_derivatives` / `subscribe_display_indices` flags have been deleted from `SubscriptionConfig`. `SubscriptionScope` is a single-variant enum — any future scope expansion requires a rule-file edit + new enum variant per `.claude/rules/project/websocket-connection-scope-lock.md`.
 
 Override per environment via `config/{env}.toml` or env vars.
 

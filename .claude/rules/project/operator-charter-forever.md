@@ -234,8 +234,10 @@ For every plan item / new feature / Telegram message / docs:
 
 | WS type | Count | Allowed instruments | Mode |
 |---|---|---|---|
-| **Main feed** (`wss://api-feed.dhan.co`) | **1 conn** | 4 IDX_I (NIFTY=13, BANKNIFTY=25, SENSEX=51, INDIA VIX=21) + 218 NSE_EQ F&O underlying stocks = **222 SIDs** | Ticker for IDX_I + Quote for NSE_EQ |
+| **Main feed** (`wss://api-feed.dhan.co`) | **1 conn** | 4 IDX_I SIDs ONLY: NIFTY=13, BANKNIFTY=25, SENSEX=51, INDIA VIX=21 (per `LOCKED_UNIVERSE` in `crates/common/src/locked_universe.rs`) | Ticker for IDX_I (16-byte packets) |
 | **Order update** (`wss://api-order-update.dhan.co`) | **1 conn** | n/a (receives order events for orders we place) | JSON, MsgCode 42, filter `Source=P` |
+
+**AWS-lifecycle PR #7 (2026-05-19) update:** the 218 NSE_EQ F&O underlying stocks dropped from the live universe. `SubscriptionScope` collapsed to a single-variant enum (`Indices4Only`). Compile-time prevention of any scope expansion. See `.claude/rules/project/websocket-connection-scope-lock.md` for the full LOCKED contract.
 
 **Forbidden FOREVER (until operator explicitly re-approves):**
 
@@ -243,23 +245,25 @@ For every plan item / new feature / Telegram message / docs:
 |---|---|
 | Depth-20 (`depth-api-feed.dhan.co/twentydepth`) | Operator lock — not in scope for any phase |
 | Depth-200 (`full-depth-api.dhan.co/?token=...`) | Same |
-| Any 2nd/3rd/4th/5th main-feed conn | 222 SIDs fit on 1 conn (Dhan cap = 5000/conn). More conns = wasted token + IP budget |
+| Any 2nd/3rd/4th/5th main-feed conn | 4 SIDs fit on 1 conn (Dhan cap = 5,000/conn). More conns = wasted token + IP budget |
 | Any new WS endpoint Dhan ships in future | Not in scope without operator re-approval |
+| NSE_EQ / NSE_FNO / BSE_FNO / MCX / currency subscriptions | Compile-time impossible — `SubscriptionScope` is a single-variant enum |
 
 **Reconnect parity (both allowed WS types):**
 
 - First reconnect attempt: **0 ms (instant)** on both. Main feed via `compute_reconnect_base_delay_ms(0, _, _) → 0` (`connection.rs:1666`); order-update via `compute_reconnect_backoff_ms(1) → 0` (`order_update_connection.rs:639`, Phase 0 Item 4 fix 2026-05-15).
 - Subsequent attempts: exponential backoff capped at `*_MAX_MS`.
 
-**Mechanical guards:**
+**Mechanical guards (post-PR #7b):**
 
-- `should_spawn_depth_dynamic_pipeline(IndicesUnderlyingsOnly, _) → false` in `crates/app/src/phase2_recovery.rs:197` (ratcheted at `phase2_recovery.rs:457`).
-- `effective_main_feed_pool_size(IndicesUnderlyingsOnly, _) → 1` in `crates/common/src/config.rs:1192` (ratcheted at `config.rs:2634`).
-- Greeks/movers pipelines deleted or gated to `false`.
+- `SubscriptionScope` is a single-variant enum (`Indices4Only`) in `crates/common/src/config.rs`. Adding a new variant requires a rule-file edit + ratchet update.
+- `effective_main_feed_pool_size(_, _) → PHASE_0_MAIN_FEED_CONNECTION_COUNT = 1` (constant) in `crates/common/src/config.rs`. No path increases this.
+- Source-scan ratchet `crates/core/tests/indices4only_scope_lock_guard.rs` (3 tests) blocks reappearance of the retired `FullUniverse` / `IndicesOnlyAllExpiries` / `IndicesUnderlyingsOnly` variants and the 3 retired `subscribe_*` flags anywhere in `crates/`.
+- Depth-20 / depth-200 / Phase 2 / movers / greeks pipelines: all deleted from the codebase in earlier AWS-lifecycle PRs (#2, #3, #4, #5, #6a, #6b).
 
 **Auto-driver one-liner:**
 
-> "Sir, only 2 phone lines to Dhan EVER. Line 1: live price feed for 4 indices + 218 stocks = 222 wires. Line 2: order update notifications. NOTHING else. No depth phone line. No second feed phone line. EVER. If anyone tries to add a 3rd phone, this rule file rejects the PR."
+> "Sir, only 2 phone lines to Dhan EVER. Line 1: live price feed for 4 fruits (NIFTY, BANKNIFTY, SENSEX, INDIA VIX). Line 2: order confirmation notifications. NOTHING else. No phone for vegetable prices. No phone for 200 individual fruit stalls. EVER. If anyone tries to add a 3rd phone, this rule file + the compiler both reject the PR — the enum has only 1 variant; there is no place to put a 3rd phone line."
 
 ---
 
