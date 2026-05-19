@@ -3012,86 +3012,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Archived vs non-archived planner parity
+    // PR #6b (2026-05-19): test_archived_planner_produces_identical_summary
+    // RETIRED — binary_cache module deleted under 4-IDX_I LOCKED_UNIVERSE.
+    // The build_subscription_plan_from_archived path is kept for now (still
+    // pub-used by mod.rs) but loses its parity test; a future PR may retire
+    // the archived variant entirely.
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_archived_planner_produces_identical_summary() {
-        use crate::instrument::binary_cache::{MappedUniverse, write_binary_cache};
-
-        let universe = make_test_universe();
-        let config = SubscriptionConfig::default();
-        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(); // APPROVED: test constant
-
-        // Build plan from owned types
-        let plan_owned = build_subscription_plan(
-            &universe,
-            &config,
-            today,
-            &std::collections::HashMap::new(),
-            None,
-        );
-
-        // Serialize → load as archived → build plan from archived types
-        let dir = std::env::temp_dir().join(format!(
-            "tv-test-planner-parity-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        let cache_dir = dir.to_str().unwrap(); // APPROVED: test-only path
-        write_binary_cache(&universe, cache_dir).unwrap(); // APPROVED: test assertion
-
-        let mapped = MappedUniverse::load(cache_dir).unwrap().unwrap(); // APPROVED: test assertion
-        let archived = mapped.archived();
-        let plan_archived = build_subscription_plan_from_archived(archived, &config, today);
-
-        // Summaries must be identical
-        assert_eq!(
-            plan_owned.summary.major_index_values, plan_archived.summary.major_index_values,
-            "major_index_values mismatch"
-        );
-        assert_eq!(
-            plan_owned.summary.display_indices, plan_archived.summary.display_indices,
-            "display_indices mismatch"
-        );
-        assert_eq!(
-            plan_owned.summary.index_derivatives, plan_archived.summary.index_derivatives,
-            "index_derivatives mismatch"
-        );
-        assert_eq!(
-            plan_owned.summary.stock_equities, plan_archived.summary.stock_equities,
-            "stock_equities mismatch"
-        );
-        assert_eq!(
-            plan_owned.summary.stock_derivatives, plan_archived.summary.stock_derivatives,
-            "stock_derivatives mismatch"
-        );
-        assert_eq!(
-            plan_owned.summary.total, plan_archived.summary.total,
-            "total mismatch"
-        );
-        assert_eq!(
-            plan_owned.summary.feed_mode, plan_archived.summary.feed_mode,
-            "feed_mode mismatch"
-        );
-
-        // Registry security IDs must be identical sets
-        let mut ids_owned: Vec<u32> = plan_owned.registry.iter().map(|i| i.security_id).collect();
-        let mut ids_archived: Vec<u32> = plan_archived
-            .registry
-            .iter()
-            .map(|i| i.security_id)
-            .collect();
-        ids_owned.sort();
-        ids_archived.sort();
-        assert_eq!(
-            ids_owned, ids_archived,
-            "archived planner produced different security_id set"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     // -----------------------------------------------------------------------
     // Coverage: IDX_I ticker-only routing — major indices use IdxI segment
