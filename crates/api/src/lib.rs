@@ -78,16 +78,13 @@ pub fn build_router_with_auth(
 ) -> Router {
     let cors = build_cors_layer(allowed_origins);
 
-    // Protected routes — mutating endpoints behind bearer token auth
-    let protected_routes = Router::new()
-        .route(
-            "/api/instruments/rebuild",
-            axum::routing::post(handlers::instruments::rebuild_instruments),
-        )
-        .layer(axum::middleware::from_fn_with_state(
-            auth_config,
-            require_bearer_auth,
-        ));
+    // PR #6b (2026-05-19): /api/instruments/rebuild route RETIRED.
+    // Under 4-IDX_I LOCKED_UNIVERSE there is no CSV to rebuild — the
+    // universe is a compile-time constant. The endpoint and its handler
+    // (handlers::instruments::rebuild_instruments) are deleted.
+    let protected_routes: Router<SharedAppState> = Router::new().layer(
+        axum::middleware::from_fn_with_state(auth_config, require_bearer_auth),
+    );
 
     // Public routes — read-only GET endpoints (no auth required)
     let public_routes = Router::new()
