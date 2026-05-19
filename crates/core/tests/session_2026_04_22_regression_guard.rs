@@ -111,20 +111,9 @@ fn guard_depth_command_initial_subscribe_variants_exist() {
     );
 }
 
-#[test]
-fn guard_phase2_complete_includes_depth_counts() {
-    // Commit 6fd9c2a — Phase2Complete event extended with depth_20_underlyings
-    // + depth_200_contracts fields for the unified dispatch flow.
-    let src = read_file("crates/core/src/notification/events.rs");
-    assert!(
-        src.contains("depth_20_underlyings"),
-        "Phase2Complete must include depth_20_underlyings field (commit 6fd9c2a)."
-    );
-    assert!(
-        src.contains("depth_200_contracts"),
-        "Phase2Complete must include depth_200_contracts field (commit 6fd9c2a)."
-    );
-}
+// PR #5 (2026-05-19): guard_phase2_complete_includes_depth_counts retired.
+// Phase2Complete event removed alongside the Phase 2 dispatcher chain
+// under operator-locked 4-IDX_I LOCKED_UNIVERSE.
 
 // `guard_phase2_emits_trigger_latency_histogram` and
 // `guard_phase2_emits_preopen_buffer_entries_gauge` retired in PR
