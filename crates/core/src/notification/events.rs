@@ -437,75 +437,12 @@ pub enum NotificationEvent {
     /// see exactly which ones were skipped (e.g. FINNIFTY).
     DepthUnderlyingMissing { underlying: String, reason: String },
 
-    /// O3 (2026-04-17): The depth rebalancer detected a stale spot price
-    /// for this underlying and skipped the rebalance decision. A stale
-    /// price likely means the main-feed WebSocket isn't delivering index
-    /// LTPs for this symbol — acting on it would swap the 200-level
-    /// connection to the wrong ATM strike. `age_secs` is the observed age
-    /// at the moment of detection.
-    DepthSpotPriceStale { underlying: String, age_secs: u64 },
-
-    /// O1 (2026-04-17): The Phase 2 scheduler woke up to do its run.
-    /// `minutes_late` = 0 on the normal 09:12 path, > 0 when fired via the
-    /// `RunImmediate` recovery path (crash mid-market or fresh late start).
-    Phase2Started { minutes_late: u64 },
-
-    /// O1: The Phase 2 scheduler fired via the `RunImmediate` path instead
-    /// of the normal 09:12 schedule — this is informational so operators
-    /// know the system crashed or started late and is catching up.
-    Phase2RunImmediate { minutes_late: u64 },
-
-    /// O1: Phase 2 completed — unified 09:12:30 IST dispatch for stock
-    /// F&O + depth-20 + depth-200 (plan item G, 2026-04-22). Counts are
-    /// zero when the respective feed wasn't dispatched this run (e.g.
-    /// depth underlyings that had no 09:12 tick).
-    Phase2Complete {
-        added_count: usize,
-        duration_ms: u64,
-        /// Plan item G: number of depth-20 underlyings subscribed at
-        /// 09:12:30. Zero on recovery from snapshot that predates
-        /// depth-in-Phase-2 wiring.
-        depth_20_underlyings: usize,
-        /// Plan item G: number of depth-200 contracts subscribed at
-        /// 09:12:30. Max 4 today (NIFTY CE/PE + BANKNIFTY CE/PE).
-        depth_200_contracts: usize,
-    },
-
-    /// O1: Phase 2 failed — LTPs never arrived within `MAX_LTP_ATTEMPTS`
-    /// × `LTP_WAIT_SECS_PER_ATTEMPT`. Stock F&O remains unsubscribed for
-    /// this session. Operator should investigate the main-feed WebSocket.
-    Phase2Failed { reason: String, attempts: u32 },
-
-    /// O1: Phase 2 was skipped today (weekend, holiday, or post-market
-    /// restart). Low-noise — informational only.
-    Phase2Skipped { reason: String },
-
-    /// PR-G (2026-05-02): Phase 2 readiness pre-flight PASSED at 09:13:01 IST.
-    /// All 11 forward-looking pre-conditions for the 09:15 / 09:15:30 /
-    /// 09:16:30 milestones are met. Severity::Info — single positive ping
-    /// telling the operator the next 4 minutes are pre-validated.
-    Phase2ReadinessPassed {
-        /// Number of checks that passed (always 11 on this variant).
-        checks_passed: u8,
-        /// Composite SLO score at the time of the check (0.0..=1.0).
-        slo_score: f64,
-    },
-
-    /// PR-G (2026-05-02): Phase 2 readiness pre-flight FAILED at 09:13:01 IST.
-    /// One or more pre-conditions for the upcoming market-open milestones
-    /// are not met. Severity::Critical — operator has ~2 minutes (until
-    /// 09:15) to act before market open.
-    /// `code = ErrorCode::Phase2Ready01PreflightFailed`.
-    Phase2ReadinessFailed {
-        /// Names of failing checks (e.g. `["main_feed_pool", "depth_200_pool"]`).
-        failed: Vec<String>,
-        /// Per-check `name=expected/observed` strings, in same order as
-        /// `failed`. Operator-readable; not parsed elsewhere.
-        details: Vec<String>,
-        /// Whole-number minutes until NSE market open (always 2 at 09:13:01).
-        minutes_to_market_open: u32,
-    },
-
+    // PR #4 (2026-05-19): DepthSpotPriceStale variant retired alongside
+    // the deleted depth-20/200 infrastructure (operator lock 2026-05-15).
+    // PR #5 (2026-05-19): 7 Phase2* variants retired alongside the
+    // deleted Phase 2 stock-F&O dispatcher chain (operator lock 2026-05-15):
+    // Phase2Started, Phase2RunImmediate, Phase2Complete, Phase2Failed,
+    // Phase2Skipped, Phase2ReadinessPassed, Phase2ReadinessFailed.
     /// Wave 5 Item 26 L2 — NSE bhavcopy daily volume cross-check completed.
     /// Fires once at 16:30 IST after the post-market scheduler drains the
     /// bhavcopy diff into `volume_nse_audit`. Counts MUST sum to total
@@ -2013,84 +1950,8 @@ impl NotificationEvent {
                      {underlying} until the next restart."
                 )
             }
-            Self::DepthSpotPriceStale {
-                underlying,
-                age_secs,
-            } => {
-                format!(
-                    "<b>Depth spot price STALE</b>\nUnderlying: {underlying}\n\
-                     Age: {age_secs}s (threshold 180s). Depth rebalance skipped — \
-                     main-feed LTP feed may be stalled for this symbol."
-                )
-            }
-            Self::Phase2Started { minutes_late } => {
-                if *minutes_late == 0 {
-                    "<b>Phase 2 started</b>\nSubscribing stock F&O (09:12 IST trigger).".to_string()
-                } else {
-                    format!(
-                        "<b>Phase 2 started</b>\nSubscribing stock F&O — {minutes_late} min late \
-                         (crash-recovery or late-start path)."
-                    )
-                }
-            }
-            Self::Phase2RunImmediate { minutes_late } => {
-                format!(
-                    "<b>Phase 2 RunImmediate</b>\n{minutes_late} min past 09:12 IST — \
-                     running now to catch up after restart."
-                )
-            }
-            Self::Phase2Complete {
-                added_count,
-                duration_ms,
-                depth_20_underlyings,
-                depth_200_contracts,
-            } => {
-                format!(
-                    "<b>Phase 2 complete @ 09:12:30</b>\n\
-                     Stock F&O: +{added_count}\n\
-                     Depth-20: {depth_20_underlyings} underlyings\n\
-                     Depth-200: {depth_200_contracts} contracts\n\
-                     Duration: {duration_ms} ms"
-                )
-            }
-            Self::Phase2Failed { reason, attempts } => {
-                format!(
-                    "<b>Phase 2 FAILED</b> after {attempts} attempts\n{reason}\n\
-                     Stock F&O remains unsubscribed for this session — investigate main feed."
-                )
-            }
-            Self::Phase2Skipped { reason } => {
-                format!("<b>Phase 2 skipped</b>\n{reason}")
-            }
-            Self::Phase2ReadinessPassed {
-                checks_passed,
-                slo_score,
-            } => {
-                format!(
-                    "<b>Phase 2 readiness PASSED</b>\n\
-                     {checks_passed}/11 pre-flight checks green\n\
-                     SLO score: {slo_score:.3}\n\
-                     09:15 / 09:15:30 / 09:16:30 milestones pre-validated"
-                )
-            }
-            Self::Phase2ReadinessFailed {
-                failed,
-                details,
-                minutes_to_market_open,
-            } => {
-                let failed_list = failed.join(", ");
-                let details_list = details.join("\n  ");
-                format!(
-                    "<b>Phase 2 readiness FAILED</b>\n\
-                     code: <code>PHASE2-READY-01</code>\n\
-                     failed: <code>[{failed_list}]</code>\n\
-                     details:\n  {details_list}\n\
-                     minutes_to_market_open: <code>{minutes_to_market_open}</code>\n\
-                     ACTION: read failing-check details + follow runbook \
-                     <code>.claude/rules/project/wave-5-error-codes.md</code> \
-                     before 09:15 IST"
-                )
-            }
+            // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
+            // Display arms retired with their variants.
             Self::NseBhavcopyCheckComplete {
                 matched,
                 mismatched,
@@ -3068,14 +2929,8 @@ impl NotificationEvent {
             Self::MarketOpenReadinessConfirmation { .. } => "MarketOpenReadinessConfirmation",
             Self::EndOfDayDigest { .. } => "EndOfDayDigest",
             Self::DepthUnderlyingMissing { .. } => "DepthUnderlyingMissing",
-            Self::DepthSpotPriceStale { .. } => "DepthSpotPriceStale",
-            Self::Phase2Started { .. } => "Phase2Started",
-            Self::Phase2RunImmediate { .. } => "Phase2RunImmediate",
-            Self::Phase2Complete { .. } => "Phase2Complete",
-            Self::Phase2Failed { .. } => "Phase2Failed",
-            Self::Phase2Skipped { .. } => "Phase2Skipped",
-            Self::Phase2ReadinessPassed { .. } => "Phase2ReadinessPassed",
-            Self::Phase2ReadinessFailed { .. } => "Phase2ReadinessFailed",
+            // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
+            // name arms retired.
             Self::NseBhavcopyCheckComplete { .. } => "NseBhavcopyCheckComplete",
             Self::NseBhavcopyCheckFailed { .. } => "NseBhavcopyCheckFailed",
             Self::WebSocketDisconnected { .. } => "WebSocketDisconnected",
@@ -3262,16 +3117,8 @@ impl NotificationEvent {
             Self::SelfTestCritical { .. } => Severity::Critical,
             Self::DepthIndexLtpTimeout { .. } => Severity::High,
             Self::DepthUnderlyingMissing { .. } => Severity::High,
-            Self::DepthSpotPriceStale { .. } => Severity::High,
-            Self::Phase2Started { .. } => Severity::Medium,
-            Self::Phase2RunImmediate { .. } => Severity::Medium,
-            // 2026-05-09: demoted Medium → Low so Phase 2 success renders
-            // as ✅ [LOW] (green). Immediate dispatch via `dispatch_policy()`.
-            Self::Phase2Complete { .. } => Severity::Low,
-            Self::Phase2Failed { .. } => Severity::High,
-            Self::Phase2Skipped { .. } => Severity::Low,
-            Self::Phase2ReadinessPassed { .. } => Severity::Info,
-            Self::Phase2ReadinessFailed { .. } => Severity::Critical,
+            // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
+            // severity arms retired.
             // Wave 5 Item 26 L2 — operator triages FAIL/MISSING_OUR rows
             // via the audit table; the summary itself is Info on the
             // happy path. The dedicated `NseBhavcopyCheckFailed` variant
@@ -3355,7 +3202,7 @@ impl NotificationEvent {
             | Self::InstrumentBuildSuccess { .. }
             | Self::WebSocketPoolOnline { .. }
             | Self::WebSocketPoolDeferredOffHours { .. }
-            | Self::Phase2Complete { .. }
+            // PR #5 (2026-05-19): Phase2Complete retired.
             | Self::DepthTwentyConnected { .. }
             | Self::DepthTwoHundredConnected { .. }
             | Self::OrderUpdateConnected => DispatchPolicy::Immediate,
@@ -5570,35 +5417,9 @@ mod tests {
         assert_eq!(ev.severity(), Severity::High);
     }
 
-    #[test]
-    fn test_phase2_complete_message_includes_depth_counts() {
-        // Plan item G (2026-04-22): unified 09:12 dispatch message must show
-        // all three feed counts so the operator knows the full scope of
-        // what subscribed at market open.
-        let ev = NotificationEvent::Phase2Complete {
-            added_count: 6123,
-            duration_ms: 450,
-            depth_20_underlyings: 4,
-            depth_200_contracts: 4,
-        };
-        let msg = ev.to_message();
-        assert!(
-            msg.contains("Stock F&O: +6123"),
-            "must show stock F&O count; got: {msg}"
-        );
-        assert!(
-            msg.contains("Depth-20: 4 underlyings"),
-            "must show depth-20 count; got: {msg}"
-        );
-        assert!(
-            msg.contains("Depth-200: 4 contracts"),
-            "must show depth-200 count; got: {msg}"
-        );
-        assert!(
-            msg.contains("09:12:30"),
-            "must reference the unified trigger time; got: {msg}"
-        );
-    }
+    // PR #5 (2026-05-19): test_phase2_complete_message_includes_depth_counts
+    // retired — Phase2Complete event removed with the Phase 2 dispatcher
+    // chain under operator-locked 4-IDX_I LOCKED_UNIVERSE.
 
     #[test]
     fn test_market_open_streaming_confirmation_severity_is_info() {
