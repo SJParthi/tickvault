@@ -313,34 +313,14 @@ audit_tables_enabled = true
 telegram_bucket_coalescer = true
 market_open_self_test = true
 realtime_guarantee_score = true
-# Phase 0 lock — depth-dynamic pipelines (depth-20 + depth-200) NEVER spawn
-# per the 2-WS rule. Scope gate already blocks them; default-off is
-# belt-and-suspenders.
-depth_dynamic_top_volume = false
-depth_dynamic_pipeline_v2 = false
+# PR #4 (2026-05-19): depth_dynamic_top_volume + depth_dynamic_pipeline_v2
+# flags retired alongside the 20/200-level depth WebSocket pipelines per
+# the 4-IDX_I LOCKED_UNIVERSE operator lock
+# (.claude/rules/project/websocket-connection-scope-lock.md).
 historical_fetch_enabled = false
 
-[depth_20.dynamic]
-conns = 5
-sids_per_conn = 50
-
-[depth_20.dynamic.universe]
-exchange_segments = ["NSE_FNO"]
-instrument_types = ["OPTIDX"]
-min_liquidity_volume = 10000
-rerank_metric = "change_pct_desc"
-window_secs = 60
-
-[depth_200.dynamic]
-conns = 5
-sids_per_conn = 1
-
-[depth_200.dynamic.universe]
-exchange_segments = ["NSE_FNO"]
-instrument_types = ["OPTIDX"]
-min_liquidity_volume = 10000
-rerank_metric = "change_pct_desc"
-window_secs = 60
+# PR #4 (2026-05-19): [depth_20.dynamic] and [depth_200.dynamic] sections
+# retired with the pipelines they configured.
 
 # PR #517 (Wave-5 TF reduction) — 9 TFs. Retired the 12 sub-15-minute
 # non-canonical TFs (2m/3m/4m/6m/7m/8m/9m/10m/11m/12m/13m/14m). Re-add

@@ -183,11 +183,10 @@ fn chaos_rapid_disk_io_cycles_no_panic() {
         for i in 0..500 {
             let frame = vec![0u8; 64];
             let _ = spill.append(
-                match i % 4 {
-                    0 => WsType::LiveFeed,
-                    1 => WsType::Depth20,
-                    2 => WsType::Depth200,
-                    _ => WsType::OrderUpdate,
+                if i % 2 == 0 {
+                    WsType::LiveFeed
+                } else {
+                    WsType::OrderUpdate
                 },
                 frame,
             );

@@ -114,19 +114,14 @@ fn chaos_healthy_ops_burst_100k_frames_zero_drops() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// **P7.4 mixed-type burst** — interleave all 4 WsType variants in a
+/// **P7.4 mixed-type burst** — interleave the surviving WsType variants
+/// (LiveFeed + OrderUpdate, after PR #4 retired Depth20/Depth200) in a
 /// single burst. Every frame lands, nothing drops, replay returns
-/// frames with the correct type tags in FIFO order. This covers the
-/// "one WAL, four WS types" property in Section D of the plan.
+/// frames with the correct type tags in FIFO order.
 #[test]
 fn chaos_mixed_type_burst_preserves_every_frame_across_types() {
     let dir = chaos_tmp("mixed-20k");
-    let types = [
-        WsType::LiveFeed,
-        WsType::Depth20,
-        WsType::Depth200,
-        WsType::OrderUpdate,
-    ];
+    let types = [WsType::LiveFeed, WsType::OrderUpdate];
 
     const N: usize = 20_000;
 
@@ -160,16 +155,17 @@ fn chaos_mixed_type_burst_preserves_every_frame_across_types() {
         "replay must return every persisted frame"
     );
 
-    // Per-type counts must each be exactly N/4 (± 1 if N is not a
-    // multiple of 4; here 20000 / 4 = 5000 exactly).
-    let mut counts = [0usize; 4];
+    // Per-type counts must each be exactly N/2 (here 20000 / 2 = 10000).
+    let mut live = 0usize;
+    let mut ord = 0usize;
     for rec in &recovered {
-        counts[rec.ws_type.as_u8() as usize - 1] += 1;
+        match rec.ws_type {
+            WsType::LiveFeed => live += 1,
+            WsType::OrderUpdate => ord += 1,
+        }
     }
-    assert_eq!(counts[0], 5000, "LiveFeed count");
-    assert_eq!(counts[1], 5000, "Depth20 count");
-    assert_eq!(counts[2], 5000, "Depth200 count");
-    assert_eq!(counts[3], 5000, "OrderUpdate count");
+    assert_eq!(live, 10_000, "LiveFeed count");
+    assert_eq!(ord, 10_000, "OrderUpdate count");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

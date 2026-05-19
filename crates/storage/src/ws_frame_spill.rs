@@ -30,8 +30,6 @@ use tracing::{error, info, warn};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WsType {
     LiveFeed = 1,
-    Depth20 = 2,
-    Depth200 = 3,
     OrderUpdate = 4,
 }
 
@@ -40,8 +38,6 @@ impl WsType {
     pub fn from_u8(b: u8) -> Option<Self> {
         match b {
             1 => Some(Self::LiveFeed),
-            2 => Some(Self::Depth20),
-            3 => Some(Self::Depth200),
             4 => Some(Self::OrderUpdate),
             _ => None,
         }
@@ -56,8 +52,6 @@ impl WsType {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::LiveFeed => "live_feed",
-            Self::Depth20 => "depth_20",
-            Self::Depth200 => "depth_200",
             Self::OrderUpdate => "order_update",
         }
     }
@@ -469,15 +463,12 @@ mod tests {
 
     #[test]
     fn test_ws_type_roundtrip() {
-        for t in [
-            WsType::LiveFeed,
-            WsType::Depth20,
-            WsType::Depth200,
-            WsType::OrderUpdate,
-        ] {
+        for t in [WsType::LiveFeed, WsType::OrderUpdate] {
             assert_eq!(WsType::from_u8(t.as_u8()), Some(t));
         }
         assert_eq!(WsType::from_u8(0), None);
+        assert_eq!(WsType::from_u8(2), None);
+        assert_eq!(WsType::from_u8(3), None);
         assert_eq!(WsType::from_u8(99), None);
     }
 
@@ -494,23 +485,18 @@ mod tests {
         {
             let spill = WsFrameSpill::new(&dir).unwrap();
             spill.append(WsType::LiveFeed, vec![1, 2, 3, 4]);
-            spill.append(WsType::Depth20, vec![9, 9, 9]);
-            spill.append(WsType::Depth200, b"payload".to_vec());
             spill.append(WsType::OrderUpdate, b"{\"k\":1}".to_vec());
-            wait_until_persisted(&spill, 4);
+            wait_until_persisted(&spill, 2);
         } // drop spill → writer thread drains and exits
 
         // Give writer thread time to exit cleanly.
         std::thread::sleep(Duration::from_millis(50));
 
         let frames = replay_all(&dir).unwrap();
-        assert_eq!(frames.len(), 4);
+        assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].ws_type, WsType::LiveFeed);
         assert_eq!(frames[0].frame, vec![1, 2, 3, 4]);
-        assert_eq!(frames[1].ws_type, WsType::Depth20);
-        assert_eq!(frames[2].ws_type, WsType::Depth200);
-        assert_eq!(frames[2].frame, b"payload".to_vec());
-        assert_eq!(frames[3].ws_type, WsType::OrderUpdate);
+        assert_eq!(frames[1].ws_type, WsType::OrderUpdate);
 
         // Second replay must be empty (segments archived).
         let frames2 = replay_all(&dir).unwrap();

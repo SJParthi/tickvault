@@ -14,9 +14,9 @@
 //! This test pins that contract end-to-end:
 //!
 //! 1. Boot a fresh `WsFrameSpill` against a tempdir (`data/wal/` analogue).
-//! 2. Hammer it with N frames across all 4 `WsType` variants — simulates
-//!    a real session where main-feed, depth-20, depth-200 and order-update
-//!    frames interleave on the way to the spill.
+//! 2. Hammer it with N frames across both `WsType` variants — simulates
+//!    a real session where main-feed and order-update frames interleave
+//!    on the way to the spill.
 //! 3. Wait for `persisted_count()` to reach N (the writer thread flushes
 //!    batches asynchronously).
 //! 4. Drop the spill — simulates a hard crash (no graceful shutdown).
@@ -85,12 +85,7 @@ fn test_zero_tick_loss_spill_survives_crash_and_replay_recovers_all_frames() {
 
     // ---- Phase 1: write N frames across all WsTypes ---------------------
     const N_PER_TYPE: u32 = 250;
-    let ws_types = [
-        WsType::LiveFeed,
-        WsType::Depth20,
-        WsType::Depth200,
-        WsType::OrderUpdate,
-    ];
+    let ws_types = [WsType::LiveFeed, WsType::OrderUpdate];
     let expected_total: u64 = u64::from(N_PER_TYPE) * ws_types.len() as u64;
 
     // Scope spill to drop before replay_all — mimics process crash.
@@ -190,31 +185,26 @@ fn test_zero_tick_loss_ws_type_tags_preserved_across_crash() {
     let wal_dir = fresh_wal_dir("ws-types");
     {
         let spill = WsFrameSpill::new(&wal_dir).expect("new spill");
-        // Interleave 4 types, 10 each → 40 frames.
+        // Interleave 2 types, 10 each → 20 frames.
         for i in 0..10 {
-            for &ws_type in &[
-                WsType::LiveFeed,
-                WsType::Depth20,
-                WsType::Depth200,
-                WsType::OrderUpdate,
-            ] {
+            for &ws_type in &[WsType::LiveFeed, WsType::OrderUpdate] {
                 let outcome = spill.append(ws_type, build_frame(ws_type, i));
                 assert!(matches!(outcome, AppendOutcome::Spilled));
             }
         }
-        assert!(!wait_until_persisted(&spill, 40));
+        assert!(!wait_until_persisted(&spill, 20));
         assert_eq!(spill.drop_critical_count(), 0);
     }
     let frames = replay_all(&wal_dir).expect("replay");
-    assert_eq!(frames.len(), 40);
-    // First 4 entries must be 4 distinct ws_types (one per variant).
-    let first_four: std::collections::HashSet<u8> =
-        frames.iter().take(4).map(|f| f.ws_type as u8).collect();
+    assert_eq!(frames.len(), 20);
+    // First 2 entries must be 2 distinct ws_types (one per variant).
+    let first_two: std::collections::HashSet<u8> =
+        frames.iter().take(2).map(|f| f.ws_type as u8).collect();
     assert_eq!(
-        first_four.len(),
-        4,
-        "first 4 replayed frames must span all 4 ws_types (interleaved write order); \
+        first_two.len(),
+        2,
+        "first 2 replayed frames must span both ws_types (interleaved write order); \
          got ws_types: {:?}",
-        frames.iter().take(4).map(|f| f.ws_type).collect::<Vec<_>>()
+        frames.iter().take(2).map(|f| f.ws_type).collect::<Vec<_>>()
     );
 }

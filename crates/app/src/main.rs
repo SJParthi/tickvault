@@ -593,8 +593,6 @@ async fn main() -> Result<()> {
                             ord += 1;
                             ws_wal_replay_order_update.push(rec.frame);
                         }
-                        // Depth retired — drop any residual frames.
-                        _ => {}
                     }
                 }
                 info!(
@@ -8118,15 +8116,19 @@ mod tests {
     /// call site to protect because the depth pipelines are gone.
     #[test]
     fn test_depth_200_deferred_spawn_retired() {
+        // Build the banned literal at runtime so the assertion itself
+        // doesn't trip the source scan against `main.rs`.
+        let banned = format!("{}{}", "spawn_depth_200", "_minimal_conn");
         let src = include_str!("main.rs");
-        assert!(
-            !src.contains("spawn_depth_200_minimal_conn"),
-            "PR #4 (2026-05-19) retired the depth-200 spawn — \
-             spawn_depth_200_minimal_conn must NOT reappear without operator approval"
+        // Count occurrences — the runtime-built `banned` string appears
+        // once (here) by virtue of the `format!` arguments, so the
+        // tolerated baseline is "no real call sites" not "zero matches".
+        let occurrences = src.matches(banned.as_str()).count();
+        assert_eq!(
+            occurrences, 0,
+            "PR #4 (2026-05-19) retired the depth-200 spawn — that helper \
+             function must NOT reappear without operator approval"
         );
-        // Cheap stub — keep the test name shape so the ratchet count
-        // doesn't regress; the assertion above is the operator's lock.
-        let _ = src;
     }
 }
 

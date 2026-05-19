@@ -40,22 +40,12 @@ fn mutation_ws_type_from_u8_zero_returns_none() {
 }
 
 #[test]
-fn mutation_ws_type_from_u8_one_returns_live_feed_not_depth() {
-    // If a mutant swaps variant arms (e.g. Depth20 → LiveFeed), this fails.
+fn mutation_ws_type_from_u8_one_returns_live_feed_not_order_update() {
+    // PR #4 (2026-05-19): Depth20/Depth200 retired alongside the 4-IDX_I
+    // LOCKED_UNIVERSE WS scope lock. Only LiveFeed (1) + OrderUpdate (4)
+    // remain. Mutants that swap these arms are caught here.
     assert_eq!(WsType::from_u8(1), Some(WsType::LiveFeed));
-    assert_ne!(WsType::from_u8(1), Some(WsType::Depth20));
-}
-
-#[test]
-fn mutation_ws_type_from_u8_two_returns_depth20_not_depth200() {
-    assert_eq!(WsType::from_u8(2), Some(WsType::Depth20));
-    assert_ne!(WsType::from_u8(2), Some(WsType::Depth200));
-}
-
-#[test]
-fn mutation_ws_type_from_u8_three_returns_depth200_not_order_update() {
-    assert_eq!(WsType::from_u8(3), Some(WsType::Depth200));
-    assert_ne!(WsType::from_u8(3), Some(WsType::OrderUpdate));
+    assert_ne!(WsType::from_u8(1), Some(WsType::OrderUpdate));
 }
 
 #[test]
@@ -65,25 +55,24 @@ fn mutation_ws_type_from_u8_four_returns_order_update_not_live_feed() {
 }
 
 #[test]
-fn mutation_ws_type_from_u8_five_returns_none_not_live_feed() {
-    // Mutant swapping the unknown arm to Some(LiveFeed) is caught here.
+fn mutation_ws_type_from_u8_unknown_values_return_none() {
+    // PR #4: codes 2 + 3 (former Depth20/Depth200 tags) are now unknown,
+    // along with the original out-of-range 0 / 5 / 255 inputs.
+    assert_eq!(WsType::from_u8(0), None);
+    assert_eq!(WsType::from_u8(2), None);
+    assert_eq!(WsType::from_u8(3), None);
     assert_eq!(WsType::from_u8(5), None);
     assert_eq!(WsType::from_u8(255), None);
 }
 
 #[test]
 fn mutation_ws_type_as_u8_values_do_not_collide() {
-    // Any mutation that flips the discriminant so two variants share
-    // a value would break dedup + replay. Assert all 4 are distinct.
-    let vals = [
-        WsType::LiveFeed.as_u8(),
-        WsType::Depth20.as_u8(),
-        WsType::Depth200.as_u8(),
-        WsType::OrderUpdate.as_u8(),
-    ];
+    // PR #4: only 2 variants remain; assert their discriminants are
+    // distinct so dedup + replay tag routing cannot accidentally merge.
+    let vals = [WsType::LiveFeed.as_u8(), WsType::OrderUpdate.as_u8()];
     let mut sorted = vals;
     sorted.sort_unstable();
-    assert_eq!(sorted, [1, 2, 3, 4]);
+    assert_eq!(sorted, [1, 4]);
 }
 
 // ============================================================================
@@ -159,10 +148,10 @@ fn mutation_replay_preserves_ws_type_tag_not_swapped() {
     }
     let recovered = replay_all(&dir).unwrap();
     assert_eq!(recovered.len(), 1);
-    // A mutant tag swap (OrderUpdate → Depth20) would silently mis-
+    // A mutant tag swap (OrderUpdate → LiveFeed) would silently mis-
     // route the replay into the wrong drain helper.
     assert_eq!(recovered[0].ws_type, WsType::OrderUpdate);
-    assert_ne!(recovered[0].ws_type, WsType::Depth20);
+    assert_ne!(recovered[0].ws_type, WsType::LiveFeed);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

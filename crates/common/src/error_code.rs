@@ -305,21 +305,7 @@ pub enum ErrorCode {
     Data814InvalidRequest,
 
     // -----------------------------------------------------------------------
-    // Depth-20 dynamic top-150 selector (Phase 7, 2026-04-28 — see
-    // `.claude/plans/v2-architecture.md` Section I)
-    // -----------------------------------------------------------------------
-    /// Top-150 dynamic selector returned an empty (or sub-50) set —
-    /// `option_movers` table stale, market closed, or no contracts had
-    /// `change_pct > 0` in the last 90 seconds. Severity::High.
-    Depth20Dyn01TopSetEmpty,
-    /// `mpsc::Sender<DepthCommand>::send` returned `SendError` for one of
-    /// the three dynamic depth-20 connection slots. Receiver task panicked
-    /// or was deallocated. Pool supervisor (WS-GAP-05) respawn should
-    /// recover within 5s. Severity::Critical.
-    Depth20Dyn02SwapChannelBroken,
-
-    // -----------------------------------------------------------------------
-    // Wave 5 — core_affinity pinning + dynamic top-gainer selectors
+    // Wave 5 — core_affinity pinning (depth-20/200 codes retired by PR #4)
     // (`.claude/plans/active-plan-wave-5-indices-only.md` Items 4/5/6/9)
     // -----------------------------------------------------------------------
     /// `core_affinity::set_for_current` returned `false` for one or more of
@@ -336,19 +322,6 @@ pub enum ErrorCode {
     /// increments per detected drift. Severity::Medium — the worker is
     /// still doing work, just not on the dedicated core.
     CorePin02WorkerDrifted,
-    /// Wave 5 Item 4 — depth-20 connection 5 (the "top-50 dynamic" slot)
-    /// queried `option_movers` filtered to `category = 'TOP_VOLUME'` sorted
-    /// by `change_pct DESC`, with SENSEX (BSE_FNO) skipped, and got back
-    /// fewer than 50 contracts (or zero). Severity::High. Surviving
-    /// 4 single-side index conns keep the last-good top-50 set; selector
-    /// retries every 60s. Distinct from `Depth20Dyn01TopSetEmpty` which
-    /// belongs to the merged Phase-7 top-150 selector that Wave 5 reverts.
-    Depth20Dyn03TopGainersEmpty,
-    /// Wave 5 Item 5 — depth-200 dynamic top-5 selector returned fewer
-    /// than 5 contracts after the same SENSEX-skipped TOP_VOLUME +
-    /// `change_pct DESC` query. Severity::High. The 5 depth-200 conns
-    /// keep their last-good gainer set; selector retries every 60s.
-    Depth200Dyn01TopGainersEmpty,
 
     /// Wave 5 Item 26 L1 — volume monotonicity breach at runtime. The Dhan
     /// volume field at bytes 22-25 of the Quote/Full packet is cumulative
@@ -360,15 +333,6 @@ pub enum ErrorCode {
     /// semantic mid-session (escalate to Item 26 L3 ticket) or our parser
     /// regressed on the byte offset. Severity::High.
     Volume01MonotonicityBreach,
-    /// Boot-time depth-200 smoke test: zero frames received from
-    /// `wss://full-depth-api.dhan.co` within the smoke-test window
-    /// during market hours. Indicates the auth handshake succeeded
-    /// (no `WebSocketDisconnected` fired) but Dhan never streamed a
-    /// frame — most often a SecurityId that's far OTM (per-rule
-    /// server-side filtering) or a regression in the new APP-token
-    /// path (Ticket #5610706 reverted server-side?). Severity::Critical
-    /// — operator should investigate before next market open.
-    Depth200Smoke01NoFramesAtBoot,
     /// Phase 2 readiness pre-flight failed at 09:13:01 IST. Fires
     /// 1 second after `Phase2Complete` if any of the 11 forward-looking
     /// pre-conditions for the 09:15 / 09:15:30 / 09:16:30 milestones
@@ -693,21 +657,15 @@ impl ErrorCode {
             Self::Data812InvalidDateFormat => "DATA-812",
             Self::Data813InvalidSecurityId => "DATA-813",
             Self::Data814InvalidRequest => "DATA-814",
-            // Depth-20 dynamic top-150 selector (Phase 7, 2026-04-28)
-            Self::Depth20Dyn01TopSetEmpty => "DEPTH-DYN-01",
-            Self::Depth20Dyn02SwapChannelBroken => "DEPTH-DYN-02",
-            // Wave 5 — core_affinity + dynamic top-gainer selectors
+            // Wave 5 — core_affinity (depth-20/200 codes retired by PR #4)
             Self::CorePin01PinningFailedAtBoot => "CORE-PIN-01",
             Self::CorePin02WorkerDrifted => "CORE-PIN-02",
-            Self::Depth20Dyn03TopGainersEmpty => "DEPTH-20-DYN-03",
-            Self::Depth200Dyn01TopGainersEmpty => "DEPTH-200-DYN-01",
             // Wave 5 Item 13 — prev-close routing
             Self::PrevClose03BootRoutingAssertion => "PREVCLOSE-03",
             // F2 (Wave-5 #504e follow-up) — PrevDayCache boot loader
             Self::PrevClose04CacheEmptyAtBoot => "PREVCLOSE-04",
             // Wave 5 Item 26 L1 — volume cumulative-monotonicity guard
             Self::Volume01MonotonicityBreach => "VOLUME-MONO-01",
-            Self::Depth200Smoke01NoFramesAtBoot => "DEPTH200-SMOKE-01",
             Self::Phase2Ready01PreflightFailed => "PHASE2-READY-01",
             // Wave 6 — Multi-TF aggregator
             Self::AggregatorDrop01 => "AGGREGATOR-DROP-01",
@@ -765,9 +723,7 @@ impl ErrorCode {
             | Self::Boot02DeadlineExceeded
             | Self::Boot03ClockSkewExceeded
             | Self::Selftest02Failed
-            | Self::Depth20Dyn02SwapChannelBroken
             | Self::PrevClose03BootRoutingAssertion
-            | Self::Depth200Smoke01NoFramesAtBoot
             | Self::Phase2Ready01PreflightFailed
             | Self::AggregatorDrop01
             | Self::Resilience01DualInstanceDetected
@@ -806,10 +762,7 @@ impl ErrorCode {
             | Self::Data807TokenExpired
             | Self::Phase202EmitGuardDropped
             | Self::Boot01QuestDbSlow
-            | Self::Depth20Dyn01TopSetEmpty
             | Self::CorePin01PinningFailedAtBoot
-            | Self::Depth20Dyn03TopGainersEmpty
-            | Self::Depth200Dyn01TopGainersEmpty
             | Self::Volume01MonotonicityBreach
             | Self::AggregatorLate01
             | Self::GapFill02RestFetchFailed
@@ -980,16 +933,10 @@ impl ErrorCode {
             | Self::Data812InvalidDateFormat
             | Self::Data813InvalidSecurityId
             | Self::Data814InvalidRequest => ".claude/rules/dhan/annexure-enums.md",
-            Self::Depth20Dyn01TopSetEmpty | Self::Depth20Dyn02SwapChannelBroken => {
-                ".claude/rules/project/wave-4-error-codes.md"
-            }
             Self::CorePin01PinningFailedAtBoot
             | Self::CorePin02WorkerDrifted
-            | Self::Depth20Dyn03TopGainersEmpty
-            | Self::Depth200Dyn01TopGainersEmpty
             | Self::PrevClose03BootRoutingAssertion
             | Self::Volume01MonotonicityBreach
-            | Self::Depth200Smoke01NoFramesAtBoot
             | Self::Phase2Ready01PreflightFailed => ".claude/rules/project/wave-5-error-codes.md",
             Self::AggregatorDrop01
             | Self::AggregatorLate01
@@ -1136,15 +1083,10 @@ impl ErrorCode {
             Self::Selftest02Failed,
             Self::Slo01Healthy,
             Self::Slo02Degraded,
-            Self::Depth20Dyn01TopSetEmpty,
-            Self::Depth20Dyn02SwapChannelBroken,
             Self::CorePin01PinningFailedAtBoot,
             Self::CorePin02WorkerDrifted,
-            Self::Depth20Dyn03TopGainersEmpty,
-            Self::Depth200Dyn01TopGainersEmpty,
             Self::PrevClose03BootRoutingAssertion,
             Self::Volume01MonotonicityBreach,
-            Self::Depth200Smoke01NoFramesAtBoot,
             Self::Phase2Ready01PreflightFailed,
             // Wave 6 — Multi-TF aggregator (Sub-PR #1)
             Self::AggregatorDrop01,
@@ -1390,7 +1332,11 @@ mod tests {
         // bumped 108 -> 120 for OPTION-CHAIN-01..08 + CROSS-VERIFY-01..04.
         // 2026-05-18 (PR #2.5 of AWS-lifecycle — Day OHLC tracker for IDX_I):
         // bumped 120 -> 122 for INDEX-OHLC-01 + INDEX-OHLC-02.
-        assert_eq!(ErrorCode::all().len(), 122);
+        // 2026-05-19 (PR #4 of AWS-lifecycle — depth pipelines retirement):
+        // bumped 122 -> 117 by removing DEPTH-DYN-01/02, DEPTH-20-DYN-03,
+        // DEPTH-200-DYN-01, DEPTH200-SMOKE-01 (depth feeds retired
+        // entirely; only main-feed + order-update WSes remain).
+        assert_eq!(ErrorCode::all().len(), 117);
     }
 
     #[test]
@@ -1420,19 +1366,11 @@ mod tests {
                 || s.starts_with("SELFTEST-")
                 // Wave 3-D: composite real-time guarantee score
                 || s.starts_with("SLO-")
-                // Phase 7 (2026-04-28): depth-20 dynamic top-150 selector
-                || s.starts_with("DEPTH-DYN-")
-                // Wave 5 (2026-05-01): core_affinity pinning + new dynamic
-                // depth selectors. Note CORE-PIN- and DEPTH-20-DYN- /
-                // DEPTH-200-DYN- are distinct from the earlier DEPTH-DYN-
-                // (Phase 7 merged top-150 selector that Wave 5 reverts).
+                // Wave 5 (2026-05-01): core_affinity pinning.
+                // (Depth-20/200 dynamic selector prefixes retired by PR #4.)
                 || s.starts_with("CORE-PIN-")
-                || s.starts_with("DEPTH-20-DYN-")
-                || s.starts_with("DEPTH-200-DYN-")
                 // Wave 5 Item 26 L1: volume cumulative-monotonicity guard.
                 || s.starts_with("VOLUME-")
-                // PR-B (2026-05-02): boot-time depth-200 smoke test.
-                || s.starts_with("DEPTH200-SMOKE-")
                 // PR #450 commit 8b (2026-05-03): prev_oi cache state.
                 || s.starts_with("PREVOI-")
                 // Wave 6 Sub-PR #1: multi-TF aggregator + boundary timer.
