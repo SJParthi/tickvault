@@ -843,9 +843,9 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------
-    // Phase 0 Item 2 (operator-locked 2026-05-13) — 1-conn main-feed pool.
+    // AWS-lifecycle LOCKED (PR #7b) — 1-conn main-feed pool.
     //
-    // Under `SubscriptionScope::IndicesUnderlyingsOnly`, main.rs overrides
+    // Under the only legal scope (`Indices4Only`), main.rs overrides
     // `dhan_config.max_websocket_connections` via
     // `effective_main_feed_pool_size(scope, configured)` to
     // `PHASE_0_MAIN_FEED_CONNECTION_COUNT = 1` BEFORE calling the pool

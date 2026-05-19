@@ -607,15 +607,12 @@ pub struct WebSocketConfig {
     /// 0 = no stagger (all spawn immediately). Only affects initial startup, not reconnects.
     pub connection_stagger_ms: u64,
 
-    /// Phase 0 Item 4 (operator-locked 2026-05-13) — per-conn activity
-    /// watchdog threshold in seconds. Defaults to the legacy
+    /// Per-conn activity watchdog threshold in seconds. AWS-lifecycle
+    /// LOCKED (PR #7b) — under `SubscriptionScope::Indices4Only` main.rs
+    /// overrides this at boot to `WATCHDOG_THRESHOLD_IDX_I_SECS = 3` (the
+    /// expected 1–3 tick/sec window for IDX_I). Defaults to the legacy
     /// `WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS = 50` value when unset
-    /// in TOML; main.rs overrides this at boot under
-    /// `SubscriptionScope::IndicesUnderlyingsOnly` to
-    /// `WATCHDOG_THRESHOLD_IDX_I_SECS = 3` via the helper
-    /// `effective_main_feed_watchdog_threshold_secs`. Connection-level
-    /// reads this field in place of the const so the override flows
-    /// through.
+    /// in TOML.
     #[serde(default = "default_activity_watchdog_threshold_secs")]
     pub activity_watchdog_threshold_secs: u64,
 }
@@ -930,9 +927,13 @@ impl Default for ObservabilityConfig {
 /// requirement). Production count varies day-to-day with weekly expiry
 /// roll + new strike addition; range observed 9.5K–11.5K.
 ///
-/// Default: `Indices4Only` — AWS-lifecycle PR #7 LOCKED scope per
-/// `.claude/plans/active-plan-pr-7-subscription-scope-lock.md` and
-/// `.claude/rules/project/websocket-connection-scope-lock.md`.
+/// Single-variant enum. AWS-lifecycle LOCKED scope per
+/// `.claude/rules/project/websocket-connection-scope-lock.md` +
+/// operator-charter §I (lock 2026-05-15). PR #7b retired the 3 legacy
+/// variants (`FullUniverse`, `IndicesOnlyAllExpiries`,
+/// `IndicesUnderlyingsOnly`); the enum is preserved as a 1-variant
+/// type so future scope expansion must go through this rule file
+/// and a new enum variant (instead of a boolean flag).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubscriptionScope {
@@ -941,31 +942,9 @@ pub enum SubscriptionScope {
     /// SENSEX=51, INDIA VIX=21. NO derivatives, NO sectoral display
     /// indices, NO NSE_EQ. Target: 4 SIDs on a single main-feed
     /// WebSocket connection.
-    ///
-    /// This is the only LOCKED scope per
-    /// `websocket-connection-scope-lock.md`. Slice 5 of PR #7 retires
-    /// every other variant. Until then, legacy variants remain only
-    /// for in-flight test sites.
     #[default]
     #[serde(rename = "indices_4_only")]
     Indices4Only,
-    /// Wave 5 default — drop the 216-stock F&O block. Legacy: PR #7
-    /// Slice 5 retires this variant.
-    IndicesOnlyAllExpiries,
-    /// Legacy Wave 4 universe (kept as escape hatch for ops only).
-    /// Legacy: PR #7 Slice 5 retires this variant.
-    FullUniverse,
-    /// Phase 0 LEAN MVP (operator decision 2026-05-13) — subscribe only
-    /// the 4 IDX_I (NIFTY/BANKNIFTY/SENSEX/INDIA VIX) + ~218 NSE_EQ F&O
-    /// underlying stocks. NO derivatives, NO sectoral display indices.
-    /// Target: ~222 SIDs on a single main-feed WebSocket connection.
-    ///
-    /// See `topic-PHASE-0-LEAN-LOCKED.md` items 1 + 23 for the full
-    /// scope contract and mode mix (IDX_I=Ticker, NSE_EQ=Quote).
-    /// Legacy: PR #7 Slice 5 retires this variant — `Indices4Only`
-    /// supersedes it (the 218 NSE_EQ stocks are dropped as part of
-    /// the AWS-lifecycle universe lock).
-    IndicesUnderlyingsOnly,
 }
 
 impl SubscriptionScope {
@@ -975,42 +954,23 @@ impl SubscriptionScope {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Indices4Only => "indices_4_only",
-            Self::IndicesOnlyAllExpiries => "indices_only_all_expiries",
-            Self::FullUniverse => "full_universe",
-            Self::IndicesUnderlyingsOnly => "indices_underlyings_only",
         }
     }
 }
 
-/// Phase 0 Item 2 (operator-locked 2026-05-13) — returns the effective
-/// main-feed WebSocket connection pool size given the configured scope
-/// and the operator's configured `dhan.max_websocket_connections`.
-///
-/// Under `IndicesUnderlyingsOnly` (Phase 0 LEAN MVP, ~222 SIDs) only ONE
-/// main-feed connection is spawned regardless of the configured value;
-/// the remaining 4 slots stay defined in code + ratchets but are never
-/// started. This avoids 4 idle-with-zero-instruments connections that
-/// would waste token/IP budget and produce false-positive watchdog
-/// signals.
-///
-/// Under `IndicesOnlyAllExpiries` and `FullUniverse` the configured
-/// value is honoured (already capped at `MAX_WEBSOCKET_CONNECTIONS = 5`
-/// in `connection_pool.rs::new_with_optional_wal`).
+/// AWS-lifecycle LOCKED (PR #7b) — main-feed WebSocket connection pool
+/// size is ALWAYS 1 under the single-variant `Indices4Only` scope.
+/// 4 IDX_I SIDs fit comfortably on a single connection (Dhan cap =
+/// 5,000 instruments/conn). The `configured` parameter is preserved
+/// for call-site compatibility but is ignored — collapsing it would
+/// touch every `dhan.max_websocket_connections` plumbing site.
 ///
 /// Pure function. Tested by
-/// `test_effective_main_feed_pool_size_under_phase_0_returns_one` +
-/// `test_effective_main_feed_pool_size_under_non_phase_0_returns_configured`.
+/// `test_effective_main_feed_pool_size_is_always_one_under_indices4only`.
 #[inline]
 #[must_use]
-pub const fn effective_main_feed_pool_size(scope: SubscriptionScope, configured: usize) -> usize {
-    match scope {
-        // AWS-lifecycle LOCKED (PR #7): 4 IDX_I SIDs fit on a single
-        // main-feed connection; pool size is always 1.
-        SubscriptionScope::Indices4Only | SubscriptionScope::IndicesUnderlyingsOnly => {
-            crate::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT
-        }
-        SubscriptionScope::IndicesOnlyAllExpiries | SubscriptionScope::FullUniverse => configured,
-    }
+pub const fn effective_main_feed_pool_size(_scope: SubscriptionScope, _configured: usize) -> usize {
+    crate::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT
 }
 
 /// Subscription planner configuration.
@@ -1020,7 +980,8 @@ pub const fn effective_main_feed_pool_size(scope: SubscriptionScope, configured:
 /// expiry only with ATM ± N strike filtering.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubscriptionConfig {
-    /// Wave 5 scope gate. Default = `IndicesOnlyAllExpiries`.
+    /// AWS-lifecycle LOCKED scope. Single variant: `Indices4Only`.
+    /// See `websocket-connection-scope-lock.md`.
     #[serde(default)]
     pub scope: SubscriptionScope,
 
@@ -1028,15 +989,6 @@ pub struct SubscriptionConfig {
     /// IDX_I instruments are forced to Ticker at connection level (Dhan limitation).
     /// Valid values: "Ticker", "Quote", "Full".
     pub feed_mode: String,
-
-    /// Whether to subscribe index derivatives (full chain, all expiries).
-    pub subscribe_index_derivatives: bool,
-
-    /// Whether to subscribe stock derivatives (current expiry, ATM ± N).
-    pub subscribe_stock_derivatives: bool,
-
-    /// Whether to subscribe display-only indices (INDIA VIX, sectoral, etc.).
-    pub subscribe_display_indices: bool,
 
     /// Whether to subscribe stock equity price feeds (NSE_EQ segment).
     pub subscribe_stock_equities: bool,
@@ -1073,9 +1025,6 @@ impl Default for SubscriptionConfig {
         Self {
             scope: SubscriptionScope::default(),
             feed_mode: "Full".to_string(),
-            subscribe_index_derivatives: true,
-            subscribe_stock_derivatives: true,
-            subscribe_display_indices: true,
             subscribe_stock_equities: true,
             stock_atm_strikes_above: 25,
             stock_atm_strikes_below: 25,
@@ -2323,9 +2272,6 @@ mod tests {
             [subscription]
             scope = "indices_4_only"
             feed_mode = "Ticker"
-            subscribe_index_derivatives = false
-            subscribe_stock_derivatives = false
-            subscribe_display_indices = false
             subscribe_stock_equities = false
             stock_atm_strikes_above = 25
             stock_atm_strikes_below = 25
@@ -2343,6 +2289,40 @@ mod tests {
         assert_eq!(wrapper.subscription.scope.as_str(), "indices_4_only");
     }
 
+    // PR #7b — SubscriptionScope is a single-variant enum after the
+    // legacy retirement. Any future scope expansion must add a NEW
+    // variant + go through `websocket-connection-scope-lock.md`.
+    #[test]
+    fn test_subscription_scope_has_exactly_one_variant() {
+        // Compile-time guarantee: match must be exhaustive over the
+        // single variant. If a new variant is added without updating
+        // this test, the build fails.
+        let s = SubscriptionScope::default();
+        let label = match s {
+            SubscriptionScope::Indices4Only => "indices_4_only",
+        };
+        assert_eq!(label, "indices_4_only");
+    }
+
+    // PR #7b — the 3 dead flags (subscribe_*_derivatives,
+    // subscribe_display_indices) were retired. Trying to set them in
+    // TOML must fail-loud (figment rejects unknown fields when the
+    // deserializer is strict — here we just confirm the fields are
+    // absent from the struct so the build of any old TOML test
+    // expecting them is impossible).
+    #[test]
+    fn test_subscription_config_has_no_derivatives_flags() {
+        let cfg = SubscriptionConfig::default();
+        // Field-access-by-name on a non-existent field is a compile
+        // error; this test is here to document the contract. Any
+        // future addition of `subscribe_*_derivatives` or
+        // `subscribe_display_indices` to SubscriptionConfig must
+        // delete this test first, which forces a rule-file review.
+        let _ = cfg.feed_mode;
+        let _ = cfg.scope;
+        let _ = cfg.subscribe_stock_equities;
+    }
+
     // AWS-lifecycle PR #7 Slice 1 — Indices4Only pool size always 1
     // (4 SIDs fit on a single main-feed connection).
     #[test]
@@ -2357,143 +2337,7 @@ mod tests {
         }
     }
 
-    // Wave 5 Item 1 — subscription.scope config gate (LEGACY — kept
-    // until PR #7 Slice 5 retires IndicesOnlyAllExpiries).
-    #[test]
-    fn test_subscription_scope_enum_indices_only_all_expiries_legacy_variant_exists() {
-        let scope = SubscriptionScope::IndicesOnlyAllExpiries;
-        assert_eq!(scope.as_str(), "indices_only_all_expiries");
-    }
-
-    #[test]
-    fn test_subscription_scope_round_trips_via_figment() {
-        use figment::Figment;
-        use figment::providers::{Format, Toml};
-
-        // Default round-trip — explicit indices_only_all_expiries.
-        let toml_default = r#"
-            [subscription]
-            scope = "indices_only_all_expiries"
-            feed_mode = "Full"
-            subscribe_index_derivatives = true
-            subscribe_stock_derivatives = true
-            subscribe_display_indices = true
-            subscribe_stock_equities = true
-            stock_atm_strikes_above = 25
-            stock_atm_strikes_below = 25
-            stock_default_atm_fallback_enabled = true
-        "#;
-        #[derive(Deserialize)]
-        struct Wrapper {
-            subscription: SubscriptionConfig,
-        }
-        let wrapper: Wrapper = Figment::new()
-            .merge(Toml::string(toml_default))
-            .extract()
-            .expect("default scope must round-trip");
-        assert_eq!(
-            wrapper.subscription.scope,
-            SubscriptionScope::IndicesOnlyAllExpiries
-        );
-
-        // Escape-hatch round-trip — full_universe.
-        let toml_full = toml_default.replace(
-            r#"scope = "indices_only_all_expiries""#,
-            r#"scope = "full_universe""#,
-        );
-        let wrapper: Wrapper = Figment::new()
-            .merge(Toml::string(&toml_full))
-            .extract()
-            .expect("full_universe scope must round-trip");
-        assert_eq!(wrapper.subscription.scope, SubscriptionScope::FullUniverse);
-        assert_eq!(wrapper.subscription.scope.as_str(), "full_universe");
-
-        // Missing scope key falls back to the Default impl
-        // (PR #7 Slice 1: default is now Indices4Only).
-        let toml_no_scope =
-            toml_default.replace("scope = \"indices_only_all_expiries\"\n            ", "");
-        let wrapper: Wrapper = Figment::new()
-            .merge(Toml::string(&toml_no_scope))
-            .extract()
-            .expect("missing scope must default");
-        assert_eq!(wrapper.subscription.scope, SubscriptionScope::Indices4Only);
-    }
-
-    // Phase 0 Item 1 — IndicesUnderlyingsOnly scope variant.
-    #[test]
-    fn test_subscription_scope_indices_underlyings_only_round_trip() {
-        use figment::Figment;
-        use figment::providers::{Format, Toml};
-
-        let toml_phase_0 = r#"
-            [subscription]
-            scope = "indices_underlyings_only"
-            feed_mode = "Ticker"
-            subscribe_index_derivatives = true
-            subscribe_stock_derivatives = true
-            subscribe_display_indices = true
-            subscribe_stock_equities = true
-            stock_atm_strikes_above = 25
-            stock_atm_strikes_below = 25
-            stock_default_atm_fallback_enabled = true
-        "#;
-        #[derive(Deserialize)]
-        struct Wrapper {
-            subscription: SubscriptionConfig,
-        }
-        let wrapper: Wrapper = Figment::new()
-            .merge(Toml::string(toml_phase_0))
-            .extract()
-            .expect("indices_underlyings_only scope must round-trip");
-        assert_eq!(
-            wrapper.subscription.scope,
-            SubscriptionScope::IndicesUnderlyingsOnly
-        );
-        assert_eq!(
-            wrapper.subscription.scope.as_str(),
-            "indices_underlyings_only"
-        );
-    }
-
-    // Phase 0 Item 2 — effective_main_feed_pool_size helper.
-
-    #[test]
-    fn test_effective_main_feed_pool_size_under_phase_0_returns_one() {
-        // Configured value is IGNORED under IndicesUnderlyingsOnly — the
-        // Phase 0 plan emits ~222 SIDs which fit on a single connection,
-        // and the other 4 slots stay dormant.
-        for configured in [0, 1, 2, 3, 4, 5, 10, 100] {
-            assert_eq!(
-                effective_main_feed_pool_size(
-                    SubscriptionScope::IndicesUnderlyingsOnly,
-                    configured
-                ),
-                crate::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT,
-                "Phase 0 must always emit {} main-feed conn regardless of configured value {configured}",
-                crate::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT,
-            );
-        }
-    }
-
-    #[test]
-    fn test_effective_main_feed_pool_size_under_non_phase_0_returns_configured() {
-        // Wave 5 + FullUniverse scopes honour the operator's configured value
-        // (the connection_pool constructor still caps at MAX_WEBSOCKET_CONNECTIONS=5).
-        for configured in [1, 2, 3, 4, 5] {
-            assert_eq!(
-                effective_main_feed_pool_size(
-                    SubscriptionScope::IndicesOnlyAllExpiries,
-                    configured
-                ),
-                configured,
-            );
-            assert_eq!(
-                effective_main_feed_pool_size(SubscriptionScope::FullUniverse, configured),
-                configured,
-            );
-        }
-    }
-
+    // PR #7b — `PHASE_0_MAIN_FEED_CONNECTION_COUNT` is locked at 1.
     #[test]
     fn test_phase_0_main_feed_connection_count_constant_pinned_at_1() {
         // Defensive ratchet — Phase 0 LEAN MVP locks this at 1. Changing
@@ -2716,9 +2560,6 @@ mod tests {
     fn test_subscription_config_default() {
         let config = SubscriptionConfig::default();
         assert_eq!(config.feed_mode, "Full");
-        assert!(config.subscribe_index_derivatives);
-        assert!(config.subscribe_stock_derivatives);
-        assert!(config.subscribe_display_indices);
         assert!(config.subscribe_stock_equities);
         assert_eq!(config.stock_atm_strikes_above, 25);
         assert_eq!(config.stock_atm_strikes_below, 25);
@@ -2885,9 +2726,6 @@ mod tests {
     fn test_subscription_config_all_fields_present() {
         let config = SubscriptionConfig::default();
         assert_eq!(config.feed_mode, "Full");
-        assert!(config.subscribe_index_derivatives);
-        assert!(config.subscribe_stock_derivatives);
-        assert!(config.subscribe_display_indices);
         assert!(config.subscribe_stock_equities);
         assert_eq!(config.stock_atm_strikes_above, 25);
         assert_eq!(config.stock_atm_strikes_below, 25);

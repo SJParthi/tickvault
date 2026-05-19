@@ -55,13 +55,11 @@ pub const WATCHDOG_POLL_INTERVAL_SECS: u64 = 5;
 pub const WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS: u64 = 50;
 
 // ---------------------------------------------------------------------------
-// Phase 0 Item 4 (operator-locked 2026-05-13) — tightened per-segment
-// activity watchdog thresholds. Under `SubscriptionScope::IndicesUnderlyingsOnly`
-// the universe is ~222 SIDs (4 IDX_I + ~218 NSE_EQ) producing 113-448
-// frames/sec aggregate on the SINGLE main-feed conn. The 50s legacy
-// threshold is wasteful for this density; we tighten to 3s (IDX_I's
-// expected 1-3 ticks/sec window) so a silent socket is detected in <5s
-// instead of ~55s.
+// AWS-lifecycle LOCKED (PR #7b) — tightened per-segment activity watchdog
+// thresholds. Under the single-variant Indices4Only scope the universe is
+// 4 IDX_I SIDs producing 1-3 ticks/sec per SID. The 50s legacy threshold
+// is wasteful for this density; we tighten to 3s so a silent socket is
+// detected in <5s instead of ~55s.
 //
 // The 3/10/30 split below is segment-aware design space (the plan's
 // long-term vision per `topic-PHASE-0-LEAN-LOCKED.md` §10). The current

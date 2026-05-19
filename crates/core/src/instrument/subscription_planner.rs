@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::NaiveDate;
 use tracing::{debug, info, warn};
 
-use tickvault_common::config::{SubscriptionConfig, SubscriptionScope};
+use tickvault_common::config::SubscriptionConfig;
 use tickvault_common::constants::{FULL_CHAIN_INDEX_SYMBOLS, MAX_TOTAL_SUBSCRIPTIONS};
 use tickvault_common::instrument_registry::{
     InstrumentRegistry, SubscribedInstrument, SubscriptionCategory, make_derivative_instrument,
@@ -223,95 +223,43 @@ pub fn select_stock_expiry_with_rollover(
 /// ONLY when today IS the expiry day (0 trading days remaining). When
 /// `None`, nearest expiry is always used (legacy behaviour —
 /// pre-2026-04-24).
-/// Wave 5 Item 2 — returns `true` when the planner SHOULD subscribe stock
-/// derivatives (NSE_FNO + BSE_FNO contracts on `UnderlyingKind::Stock`
-/// underlyings). Combines the legacy `config.subscribe_stock_derivatives`
-/// boolean AND the new `config.subscription.scope` gate:
-///
-/// - `IndicesOnlyAllExpiries` (Wave 5 default) → returns `false`. The 216
-///   F&O stocks contribute zero contracts to the plan; the saved ~22K
-///   subscription slots fan out to NIFTY + BANKNIFTY + SENSEX full chain
-///   plus the cash-equity feeds.
-/// - `FullUniverse` (legacy escape hatch) → falls through to the legacy
-///   `subscribe_stock_derivatives` boolean.
-///
-/// Pure function; tested by `test_indices_only_scope_filters_to_three_underlyings`,
-/// `test_universe_count_pinned_at_11018`, etc.
+/// AWS-lifecycle LOCKED (PR #7b) — under `SubscriptionScope::Indices4Only`
+/// (the only remaining variant) stock derivatives are NEVER subscribed.
+/// Pure function, always returns `false`. Retained as a gate point so
+/// existing call sites in the planner read naturally; downstream PRs
+/// may inline + delete once the planner is restructured.
 #[inline]
 #[must_use]
-pub const fn should_subscribe_stock_derivatives(config: &SubscriptionConfig) -> bool {
-    match config.scope {
-        // AWS-lifecycle LOCKED (PR #7) — 4 IDX_I SIDs only, no stock F&O.
-        SubscriptionScope::Indices4Only => false,
-        // Wave 5 default — stock F&O dropped to free capacity for index full chain.
-        SubscriptionScope::IndicesOnlyAllExpiries => false,
-        // Phase 0 LEAN MVP — derivatives parked, only IDX_I + NSE_EQ subscribed.
-        SubscriptionScope::IndicesUnderlyingsOnly => false,
-        SubscriptionScope::FullUniverse => config.subscribe_stock_derivatives,
-    }
+pub const fn should_subscribe_stock_derivatives(_config: &SubscriptionConfig) -> bool {
+    false
 }
 
-/// Phase 0 Item 1 — gate on whether to emit index F&O derivatives.
-///
-/// Under `IndicesUnderlyingsOnly` (Phase 0 LEAN MVP), index derivatives are
-/// PARKED — only the 4 IDX_I price feeds + ~218 NSE_EQ underlyings are
-/// subscribed. Under the Wave 5 / legacy scopes, falls through to the
-/// existing `subscribe_index_derivatives` boolean.
-///
-/// Pure function; tested by
-/// `test_indices_underlyings_only_scope_skips_index_derivatives`.
+/// AWS-lifecycle LOCKED (PR #7b) — under `SubscriptionScope::Indices4Only`
+/// index derivatives are NEVER subscribed. Pure function, always
+/// returns `false`.
 #[inline]
 #[must_use]
-pub const fn should_subscribe_index_derivatives(config: &SubscriptionConfig) -> bool {
-    match config.scope {
-        // AWS-lifecycle LOCKED (PR #7) — 4 IDX_I SIDs only, no index F&O.
-        SubscriptionScope::Indices4Only => false,
-        SubscriptionScope::IndicesUnderlyingsOnly => false,
-        SubscriptionScope::IndicesOnlyAllExpiries | SubscriptionScope::FullUniverse => {
-            config.subscribe_index_derivatives
-        }
-    }
+pub const fn should_subscribe_index_derivatives(_config: &SubscriptionConfig) -> bool {
+    false
 }
 
-/// Phase 0 Item 1 — gate on whether a given display-index is allowed.
+/// AWS-lifecycle LOCKED (PR #7b) — under `SubscriptionScope::Indices4Only`
+/// the ONLY allowed display index is INDIA VIX (one of the 4 LOCKED
+/// IDX_I SIDs). All sectoral / broad-market indices are PARKED.
 ///
-/// Under `IndicesUnderlyingsOnly` (Phase 0 LEAN MVP), the display-index
-/// section is filtered to INDIA VIX ONLY — sectoral / broad-market indices
-/// are PARKED. INDIA VIX stays in because the operator's option-buying
-/// strategy uses VIX as a volatility-regime filter on entry
-/// (`topic-PHASE-0-LEAN-LOCKED.md` line 131). Under the Wave 5 / legacy
-/// scopes, falls through to the existing `subscribe_display_indices`
-/// boolean (all display indices in or none).
-///
-/// **Hostile-review HIGH H2 fix (2026-05-13):** gates by stable Dhan
-/// `SecurityId` (`INDIA_VIX_SECURITY_ID = 21`), NOT the display name.
-/// Filtering on `"INDIA VIX"` string literal was brittle against Dhan
-/// CSV name drift (case / whitespace / minor spelling changes); the
-/// numeric SID is the contract Dhan supports for legacy compatibility
-/// and is cross-checked at compile time in `constants.rs`.
+/// Gates by stable Dhan `SecurityId` (`INDIA_VIX_SECURITY_ID = 21`),
+/// NOT the display name — filtering on `"INDIA VIX"` string was brittle
+/// against Dhan CSV name drift.
 ///
 /// Pure `const fn`; tested by
 /// `test_is_display_index_allowed_under_scope_keeps_only_india_vix`.
 #[inline]
 #[must_use]
 pub const fn is_display_index_allowed_under_scope(
-    config: &SubscriptionConfig,
+    _config: &SubscriptionConfig,
     security_id: u32,
 ) -> bool {
-    match config.scope {
-        // AWS-lifecycle LOCKED (PR #7) — INDIA VIX is one of the 4 IDX_I
-        // SIDs, allowed by SecurityId match. All other display indices
-        // are sectoral / broad-market and are PARKED.
-        SubscriptionScope::Indices4Only => {
-            security_id == tickvault_common::constants::INDIA_VIX_SECURITY_ID
-        }
-        SubscriptionScope::IndicesUnderlyingsOnly => {
-            security_id == tickvault_common::constants::INDIA_VIX_SECURITY_ID
-        }
-        SubscriptionScope::IndicesOnlyAllExpiries | SubscriptionScope::FullUniverse => {
-            config.subscribe_display_indices
-        }
-    }
+    security_id == tickvault_common::constants::INDIA_VIX_SECURITY_ID
 }
 
 pub fn build_subscription_plan(
@@ -1228,16 +1176,14 @@ mod tests {
     use tickvault_common::instrument_types::*;
     use tickvault_common::types::{Exchange, ExchangeSegment, OptionType, SecurityId};
 
-    /// Builds a minimal FnoUniverse for testing.
-    /// Wave 5 Item 2: `SubscriptionConfig::default()` now ships with
-    /// `scope = IndicesOnlyAllExpiries`, which intentionally drops the
-    /// 216-stock F&O block. Tests that exercise the legacy stock-F&O
-    /// pipeline use this helper to force the FullUniverse escape hatch.
+    /// PR #7b — after legacy-variant retirement the helper simply
+    /// returns the default LOCKED config (`Indices4Only`). Retained
+    /// so the dozens of call sites compile; tests that historically
+    /// asserted legacy stock-F&O behavior under `FullUniverse` have
+    /// been deleted or rewritten to assert the LOCKED contract
+    /// (zero stock F&O, zero index F&O, 4 IDX_I + INDIA VIX only).
     fn legacy_full_universe_config() -> SubscriptionConfig {
-        SubscriptionConfig {
-            scope: SubscriptionScope::FullUniverse,
-            ..SubscriptionConfig::default()
-        }
+        SubscriptionConfig::default()
     }
 
     fn make_test_universe() -> FnoUniverse {
@@ -1553,7 +1499,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_build_plan_default_config() {
         let universe = make_test_universe();
         let config = legacy_full_universe_config();
@@ -1584,7 +1530,7 @@ mod tests {
         assert!(!plan.summary.exceeds_capacity);
     }
 
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_index_derivatives_all_subscribed() {
         let universe = make_test_universe();
         let config = legacy_full_universe_config();
@@ -1602,7 +1548,7 @@ mod tests {
         assert_eq!(plan.summary.index_derivatives, 11);
     }
 
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_stock_derivatives_current_expiry_only() {
         let universe = make_test_universe();
         let config = legacy_full_universe_config();
@@ -1620,7 +1566,7 @@ mod tests {
         assert_eq!(plan.summary.stock_derivatives, 11);
     }
 
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_stock_past_expiry_skipped() {
         let universe = make_test_universe();
         let config = legacy_full_universe_config();
@@ -1640,91 +1586,12 @@ mod tests {
         assert_eq!(plan.summary.stocks_skipped_no_chain, 1);
     }
 
-    #[test]
-    fn test_disable_stock_derivatives() {
-        let universe = make_test_universe();
-        let config = SubscriptionConfig {
-            subscribe_stock_derivatives: false,
-            ..Default::default()
-        };
-        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
-
-        let plan = build_subscription_plan(
-            &universe,
-            &config,
-            today,
-            &std::collections::HashMap::new(),
-            None,
-        );
-
-        assert_eq!(plan.summary.stock_derivatives, 0);
-        assert_eq!(plan.summary.stock_equities, 1); // Equity feed still subscribed
-    }
-
-    #[test]
-    fn test_disable_display_indices() {
-        let universe = make_test_universe();
-        let config = SubscriptionConfig {
-            subscribe_display_indices: false,
-            ..legacy_full_universe_config()
-        };
-        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
-
-        let plan = build_subscription_plan(
-            &universe,
-            &config,
-            today,
-            &std::collections::HashMap::new(),
-            None,
-        );
-
-        assert_eq!(plan.summary.display_indices, 0);
-    }
-
-    #[test]
-    fn test_disable_index_derivatives() {
-        let universe = make_test_universe();
-        let config = SubscriptionConfig {
-            subscribe_index_derivatives: false,
-            ..Default::default()
-        };
-        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
-
-        let plan = build_subscription_plan(
-            &universe,
-            &config,
-            today,
-            &std::collections::HashMap::new(),
-            None,
-        );
-
-        assert_eq!(plan.summary.index_derivatives, 0);
-        // Phase 0 Item 1 (2026-05-13): fixture now contains NIFTY + BANKNIFTY + SENSEX.
-        assert_eq!(plan.summary.major_index_values, 3); // All 3 IDX_I value feeds still subscribed
-    }
-
-    #[test]
-    fn test_disable_stock_equities() {
-        let universe = make_test_universe();
-        let config = SubscriptionConfig {
-            scope: SubscriptionScope::FullUniverse,
-            subscribe_stock_equities: false,
-            ..Default::default()
-        };
-        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
-
-        let plan = build_subscription_plan(
-            &universe,
-            &config,
-            today,
-            &std::collections::HashMap::new(),
-            None,
-        );
-
-        assert_eq!(plan.summary.stock_equities, 0);
-        // Stock derivatives still subscribed
-        assert!(plan.summary.stock_derivatives > 0);
-    }
+    // PR #7b — `test_disable_*_derivatives` + `test_disable_display_indices`
+    // + `test_disable_stock_equities` retired. The flags (subscribe_*) and
+    // the FullUniverse variant they exercised no longer exist; the only
+    // scope (`Indices4Only`) ALWAYS emits zero derivatives and zero stock
+    // equities by construction. Coverage is provided by
+    // `test_indices4only_planner_emits_zero_derivatives` below.
 
     #[test]
     fn test_no_duplicate_security_ids() {
@@ -1746,7 +1613,7 @@ mod tests {
         assert_eq!(ids.len(), unique.len(), "Duplicate security_ids in plan");
     }
 
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_registry_o1_lookup() {
         let universe = make_test_universe();
         let config = legacy_full_universe_config();
@@ -1845,56 +1712,11 @@ mod tests {
         assert_eq!(plan.summary.feed_mode, FeedMode::Ticker);
     }
 
-    #[test]
-    fn test_atm_strike_range_narrow() {
-        let universe = make_test_universe();
-        let config = SubscriptionConfig {
-            scope: SubscriptionScope::FullUniverse,
-            stock_atm_strikes_above: 1,
-            stock_atm_strikes_below: 1,
-            ..Default::default()
-        };
-        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
-
-        let plan = build_subscription_plan(
-            &universe,
-            &config,
-            today,
-            &std::collections::HashMap::new(),
-            None,
-        );
-
-        // Stage 1: RELIANCE 1 future + 3 CE (mid+-1) + 3 PE (mid+-1) = 7
-        // Stage 2: remaining 4 CE + 4 PE = 8 (progressive fill adds the rest)
-        // Total stock derivatives: 7 + 4 = 11 (all RELIANCE)
-        // But actually Stage 2 adds whatever wasn't in Stage 1
-        assert_eq!(plan.summary.stock_derivatives, 11);
-    }
-
-    #[test]
-    fn test_atm_strike_range_zero() {
-        let universe = make_test_universe();
-        let config = SubscriptionConfig {
-            scope: SubscriptionScope::FullUniverse,
-            stock_atm_strikes_above: 0,
-            stock_atm_strikes_below: 0,
-            ..Default::default()
-        };
-        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
-
-        let plan = build_subscription_plan(
-            &universe,
-            &config,
-            today,
-            &std::collections::HashMap::new(),
-            None,
-        );
-
-        // Stage 1: RELIANCE 1 future + 1 CE (ATM only) + 1 PE (ATM only) = 3
-        // Stage 2: remaining 4 CE + 4 PE = 8 (progressive fill adds the rest)
-        // Total stock derivatives: 3 + 8 = 11 (all RELIANCE)
-        assert_eq!(plan.summary.stock_derivatives, 11);
-    }
+    // PR #7b — `test_atm_strike_range_narrow` + `test_atm_strike_range_zero`
+    // retired. Both exercised the stock-F&O ATM filter on the legacy
+    // FullUniverse scope. Under `Indices4Only` stock F&O is never
+    // subscribed and the ATM-strike config fields no longer affect
+    // the plan output.
 
     #[test]
     fn test_total_instrument_count() {
@@ -1919,7 +1741,7 @@ mod tests {
         assert_eq!(plan.registry.len(), expected_total);
     }
 
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_by_exchange_segment_grouping() {
         let universe = make_test_universe();
         let config = legacy_full_universe_config();
@@ -2049,7 +1871,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_plan_stage2_does_not_add_far_month_stock_derivatives() {
         // 2026-04-25: Updated semantics. Previously Stage 2 progressively
         // filled far-month stock derivatives until 25K capacity. Under the
@@ -2136,7 +1958,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_plan_stock_option_chain_calls_only() {
         // Chain with calls but empty puts
         let mut universe = make_test_universe();
@@ -2248,7 +2070,7 @@ mod tests {
 
     // --- Additional coverage tests ---
 
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_stock_with_no_option_chain_for_expiry_skipped() {
         // Stock has an expiry calendar entry but no option chain for that date
         let mut universe = make_test_universe();
@@ -2301,7 +2123,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_stock_with_no_expiry_calendar_skipped() {
         // Stock has no expiry calendar at all — should skip derivatives
         let mut universe = make_test_universe();
@@ -2340,35 +2162,13 @@ mod tests {
         assert!(plan.summary.stocks_skipped_no_chain >= 1);
     }
 
-    #[test]
-    fn test_plan_with_all_subscriptions_disabled() {
-        let universe = make_test_universe();
-        let config = SubscriptionConfig {
-            scope: SubscriptionScope::FullUniverse,
-            subscribe_index_derivatives: false,
-            subscribe_display_indices: false,
-            subscribe_stock_equities: false,
-            subscribe_stock_derivatives: false,
-            ..Default::default()
-        };
-        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
-
-        let plan = build_subscription_plan(
-            &universe,
-            &config,
-            today,
-            &std::collections::HashMap::new(),
-            None,
-        );
-
-        // Only major index values should remain
-        assert_eq!(plan.summary.display_indices, 0);
-        assert_eq!(plan.summary.index_derivatives, 0);
-        assert_eq!(plan.summary.stock_equities, 0);
-        assert_eq!(plan.summary.stock_derivatives, 0);
-        // Major index values are always subscribed
-        assert!(plan.summary.major_index_values > 0);
-    }
+    // PR #7b — `test_plan_with_all_subscriptions_disabled` retired. The
+    // 4 `subscribe_*` booleans and the FullUniverse variant were
+    // deleted; under `Indices4Only` the planner ALWAYS emits zero
+    // index/stock derivatives and zero NSE_EQ when
+    // `subscribe_stock_equities = false`. Equivalent coverage lives
+    // in `test_indices4only_planner_emits_zero_derivatives` (Slice 6
+    // ratchet) and the default-config assertion in this file.
 
     #[test]
     fn test_plan_summary_capacity_utilization_non_negative() {
@@ -2458,7 +2258,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_plan_stock_derivatives_with_future_only_no_options() {
         // Stock with future but no option chain — future should still be subscribed
         let mut universe = make_test_universe();
@@ -2541,7 +2341,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_plan_stock_expired_all_expiries_skipped() {
         // Stock where ALL expiries are in the past — should skip derivatives
         let mut universe = make_test_universe();
@@ -2609,7 +2409,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_plan_today_equals_expiry_still_included() {
         // When today == expiry date, the contract should still be included
         let universe = make_test_universe();
@@ -2700,7 +2500,7 @@ mod tests {
         assert!(!plan.summary.exceeds_capacity);
     }
 
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_plan_exceeds_capacity_triggers_warning() {
         // Build a universe with > 25,000 stock derivative contracts to trigger
         // the capacity limit (line 316: break) and warning (lines 346-347).
@@ -2882,7 +2682,7 @@ mod tests {
     // Single-element option chain (call_count=1, put_count=1)
     // -----------------------------------------------------------------------
 
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_plan_single_element_option_chain() {
         let mut universe = make_test_universe();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
@@ -2933,7 +2733,7 @@ mod tests {
     // Option chain with future_security_id = None
     // -----------------------------------------------------------------------
 
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_plan_option_chain_without_future_still_has_options() {
         let mut universe = make_test_universe();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
@@ -3114,7 +2914,7 @@ mod tests {
     // Coverage: Index derivatives use NSE_FNO segment
     // -----------------------------------------------------------------------
 
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_index_derivative_uses_nse_fno_segment() {
         let universe = make_test_universe();
         let config = legacy_full_universe_config();
@@ -3221,7 +3021,7 @@ mod tests {
     // Coverage: Capacity limit — plan total capped at MAX_TOTAL_SUBSCRIPTIONS
     // -----------------------------------------------------------------------
 
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_capacity_limit_stage2_break_path() {
         // Build a universe with enough stock derivatives to trigger the
         // `instruments.len() >= MAX_TOTAL_SUBSCRIPTIONS` break in Stage 2.
@@ -3413,7 +3213,7 @@ mod tests {
     // Coverage: Stock derivative category assignment
     // -----------------------------------------------------------------------
 
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_stock_derivative_category_assignment() {
         let universe = make_test_universe();
         let config = legacy_full_universe_config();
@@ -3440,7 +3240,7 @@ mod tests {
     // Coverage: underlying_symbol propagated correctly
     // -----------------------------------------------------------------------
 
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_underlying_symbol_propagated_to_instruments() {
         let universe = make_test_universe();
         let config = legacy_full_universe_config();
@@ -3471,7 +3271,7 @@ mod tests {
     // Coverage: Index option is classified as IndexDerivative
     // -----------------------------------------------------------------------
 
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_index_option_classified_as_index_derivative() {
         let universe = make_test_universe();
         let config = legacy_full_universe_config();
@@ -3781,7 +3581,6 @@ mod tests {
         // emit index contracts.
         let today = NaiveDate::from_ymd_opt(2026, 3, 26).unwrap();
         let mut config = SubscriptionConfig::default();
-        config.subscribe_stock_derivatives = true;
         config.subscribe_stock_equities = true;
 
         let plan = build_subscription_plan(
@@ -3832,15 +3631,12 @@ mod tests {
         );
     }
 
-    /// 2026-04-25 ratchet: index F&O subscribes ONLY the current (nearest)
-    /// expiry. Far-month index contracts must be excluded. Build a NIFTY
-    /// universe with 3 expiries (nearest, mid, far) and assert only the
-    /// 2026-05-02 (operator-confirmed restore): all-future-expiry contracts
-    /// are in the plan. Was `test_index_derivatives_use_current_expiry_only`
-    /// pre-2026-05-02 (asserted only nearest expiry); reverted to match the
-    /// new "subscribe every future expiry of NIFTY/BANKNIFTY/SENSEX" behavior
-    /// which yields ~10-11K instruments under the indices-only scope.
-    #[test]
+    /// PR #7b — `test_index_derivatives_subscribe_all_future_expiries`
+    /// retired. The test exercised the legacy `IndicesOnlyAllExpiries`
+    /// scope's "subscribe every NIFTY/BANKNIFTY/SENSEX expiry" path,
+    /// which no longer exists. Under `Indices4Only` index F&O is never
+    /// subscribed.
+    #[cfg(any())]
     fn test_index_derivatives_subscribe_all_future_expiries() {
         let nearest = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
         let mid = NaiveDate::from_ymd_opt(2026, 5, 28).unwrap();
@@ -4041,7 +3837,7 @@ mod tests {
     /// other must too. Set up RELIANCE on T-0 (expiry day, the ONLY case
     /// that triggers rollover under T-only rule), assert that BOTH the
     /// future and the options rolled to the next expiry.
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_stock_rollover_applies_to_both_optstk_and_futstk() {
         // Build a 2-expiry RELIANCE universe: nearest is T-0, next is +28d.
         let nearest = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
@@ -4323,7 +4119,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_nse_fno_bse_fno_subscriptions_use_full_mode() {
         // Default config = Full. NSE_FNO + BSE_FNO MUST be Full to carry
         // prev_close (bytes 50-53) AND OI (bytes 34-37) AND 5-level depth
@@ -4504,59 +4300,11 @@ mod tests {
     // cash equities, and IDX_I are subscribed.
     // ----------------------------------------------------------------------
 
-    #[test]
-    fn test_indices_only_scope_filters_to_three_underlyings() {
-        // Build a universe that contains BOTH index F&O (NIFTY) and stock
-        // F&O (RELIANCE). Under IndicesOnlyAllExpiries scope (legacy
-        // Wave 5 escape hatch — PR #7 Slice 5 retires it), the RELIANCE
-        // F&O block must NOT appear in the plan; the cash equity feed
-        // survives independently.
-        let universe = make_test_universe();
-        let config = SubscriptionConfig {
-            scope: SubscriptionScope::IndicesOnlyAllExpiries,
-            ..SubscriptionConfig::default()
-        };
-        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
-
-        let plan = build_subscription_plan(
-            &universe,
-            &config,
-            today,
-            &std::collections::HashMap::new(),
-            None,
-        );
-
-        // Stock derivatives count must be ZERO.
-        assert_eq!(
-            plan.summary.stock_derivatives, 0,
-            "indices-only scope must drop ALL stock derivatives"
-        );
-
-        // Index derivatives still subscribed (NIFTY full chain).
-        assert!(
-            plan.summary.index_derivatives > 0,
-            "index derivatives must remain subscribed"
-        );
-
-        // Cash equities (NSE_EQ) UNCHANGED — RELIANCE price feed still subscribed.
-        assert_eq!(
-            plan.summary.stock_equities, 1,
-            "NSE_EQ cash feeds are independent of stock-derivatives gate"
-        );
-
-        // No instrument with `instrument_kind = OptionStock` or `FutureStock`.
-        for inst in plan.registry.iter() {
-            assert!(
-                !matches!(
-                    inst.instrument_kind,
-                    Some(DhanInstrumentKind::OptionStock) | Some(DhanInstrumentKind::FutureStock)
-                ),
-                "stock derivative leaked under IndicesOnlyAllExpiries scope: {} {}",
-                inst.security_id,
-                inst.display_label
-            );
-        }
-    }
+    // PR #7b — `test_indices_only_scope_filters_to_three_underlyings`
+    // retired. The IndicesOnlyAllExpiries variant was deleted; under
+    // `Indices4Only` index F&O is ALSO zero, so the test's "index F&O
+    // still subscribed" assertion no longer holds. Equivalent coverage
+    // in `test_indices4only_planner_emits_zero_derivatives` (Slice 6).
 
     #[test]
     fn test_universe_count_pinned_at_11018() {
@@ -4623,7 +4371,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[cfg(any())] // PR #7b — retired (tested legacy scope behavior)
     fn test_stock_fno_excluded_under_indices_only_scope() {
         // Symmetric to test_indices_only_scope_filters_to_three_underlyings
         // but explicitly checks the NSE_FNO + BSE_FNO segment counts of
@@ -4682,66 +4430,53 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------
-    // Phase 0 Item 1 — IndicesUnderlyingsOnly scope (operator-locked 2026-05-13)
+    // AWS-lifecycle LOCKED — Indices4Only scope contract
     //
-    // Contract: under `IndicesUnderlyingsOnly` the planner emits ONLY
+    // Under the only legal scope (`SubscriptionScope::Indices4Only`) the
+    // planner emits:
     //   - NIFTY / BANKNIFTY / SENSEX IDX_I value feeds (Ticker)
     //   - INDIA VIX IDX_I display-index feed (Ticker)
-    //   - NSE_EQ cash-equity feeds for the F&O underlying stocks (Quote)
-    // and PARKS index derivatives + stock derivatives + sectoral/broad-market
-    // display indices. Target ~222 SIDs.
+    //   - NSE_EQ cash-equity feeds for any underlying stocks present
+    //     in the universe (Quote)
+    // and NEVER emits index derivatives, stock derivatives, or
+    // sectoral / broad-market display indices.
     // ----------------------------------------------------------------------
 
+    /// PR #7b — renamed from `phase_0_config()`; now just returns the
+    /// LOCKED default config since `Indices4Only` is the only scope.
     fn phase_0_config() -> SubscriptionConfig {
-        SubscriptionConfig {
-            scope: SubscriptionScope::IndicesUnderlyingsOnly,
-            ..SubscriptionConfig::default()
-        }
+        SubscriptionConfig::default()
     }
 
     #[test]
-    fn test_should_subscribe_index_derivatives_false_under_phase_0_scope() {
-        let cfg = phase_0_config();
+    fn test_should_subscribe_index_derivatives_false_under_indices4only() {
+        let cfg = SubscriptionConfig::default();
         assert!(
             !should_subscribe_index_derivatives(&cfg),
-            "Phase 0 scope must skip index derivatives regardless of \
-             subscribe_index_derivatives flag"
-        );
-        // Sanity: other scopes still honour the flag.
-        let legacy = legacy_full_universe_config();
-        assert_eq!(
-            should_subscribe_index_derivatives(&legacy),
-            legacy.subscribe_index_derivatives
+            "Indices4Only scope must never subscribe index derivatives"
         );
     }
 
     #[test]
-    fn test_indices_underlyings_only_scope_skips_stock_derivatives() {
-        let cfg = phase_0_config();
+    fn test_indices4only_scope_skips_stock_derivatives() {
+        let cfg = SubscriptionConfig::default();
         assert!(
             !should_subscribe_stock_derivatives(&cfg),
-            "Phase 0 scope must skip stock derivatives"
+            "Indices4Only scope must never subscribe stock derivatives"
         );
     }
 
     #[test]
     fn test_is_display_index_allowed_under_scope_keeps_only_india_vix() {
-        let cfg = phase_0_config();
+        let cfg = SubscriptionConfig::default();
         let vix_sid = tickvault_common::constants::INDIA_VIX_SECURITY_ID;
-        // INDIA VIX (SID 21) — allowed under Phase 0.
+        // INDIA VIX (SID 21) — the ONLY allowed display index.
         assert!(is_display_index_allowed_under_scope(&cfg, vix_sid));
-        // Other display indices (sectoral / broad-market) — PARKED.
+        // Sectoral / broad-market display indices — PARKED.
         assert!(!is_display_index_allowed_under_scope(&cfg, 17)); // NIFTY 100
         assert!(!is_display_index_allowed_under_scope(&cfg, 19)); // NIFTY 500
         assert!(!is_display_index_allowed_under_scope(&cfg, 14)); // NIFTY AUTO
         assert!(!is_display_index_allowed_under_scope(&cfg, 0));
-        // Sanity: under Wave 5 / legacy scope, falls through to flag.
-        let mut legacy = legacy_full_universe_config();
-        legacy.subscribe_display_indices = true;
-        assert!(is_display_index_allowed_under_scope(&legacy, vix_sid));
-        assert!(is_display_index_allowed_under_scope(&legacy, 17));
-        legacy.subscribe_display_indices = false;
-        assert!(!is_display_index_allowed_under_scope(&legacy, vix_sid));
     }
 
     #[test]
