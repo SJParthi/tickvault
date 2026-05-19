@@ -215,6 +215,10 @@ fn every_cited_guard_test_exists_in_tree() {
         "crates/api/tests/api_auth_middleware_guard.rs", // rename candidate; actual path auth_middleware.rs
         "crates/api/src/middleware.rs", // mentioned but the test file is tests/auth_middleware.rs
         "crates/storage/tests/f32_precision_regression.rs", // planned rename
+        // AWS-lifecycle PR #3 (#706) retired the greeks pipeline + tests.
+        // Tracker doc still cites the deleted proptest file; allowlisted
+        // until the 100pct-audit-tracker.md is regenerated post-AWS-lock.
+        "crates/core/tests/proptest_greeks_core.rs",
     ];
     let real_missing: Vec<&String> = missing
         .iter()

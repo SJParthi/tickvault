@@ -1,18 +1,17 @@
 # Implementation Plan: PR #7 — Tighten SubscriptionScope to `Indices4Only`
 
-**Status:** IN_PROGRESS (PR #7a = Slices 1+2 ready for review; PR #7b will follow with Slices 3-8)
+**Status:** IN_PROGRESS (PR #7a merged #711; PR #7b = Slices 3+4+5+6 ready)
 **Date:** 2026-05-19
 **Approved by:** Parthiban
-**Branch:** `claude/aws-lifecycle-pr-7-indices4only-scope` (PR #7a)
-**Predecessor:** PR #6b (#710 merged) — `LOCKED_UNIVERSE` static = 4 IDX_I SIDs
-**Successor in 14-PR sequence:** PR #8 — option_chain module (heart-piece)
+**Branch:** `claude/aws-lifecycle-pr-7b-delete-dead-flags` (PR #7b)
+**Predecessor:** PR #7a (#711 merged) — `Indices4Only` variant + default
+**Successor in 14-PR sequence:** PR #7c (docs slice) → PR #8 (option_chain heart-piece)
 
 ## Sub-PR split (operator-charter §H serial completion)
 
-- **PR #7a** (this PR) — Slices 1 + 2: introduce `Indices4Only` LOCKED variant, switch default, wire planner + watchdog arms, 3 new ratchet tests, 11 legacy-coverage tests preserved via `legacy_full_universe_config()` helper. Workspace 7,211/7,211 green.
-- **PR #7b** (follow-up after merge) — Slices 3 + 4: delete dead `subscribe_*_derivatives` / `subscribe_display_indices` flags; collapse `effective_main_feed_pool_size` signature.
-- **PR #7c** — Slices 5 + 6: retire legacy SubscriptionScope variants entirely; add source-scan ratchet meta-guard.
-- **PR #7d** — Slices 7 + 8: update CLAUDE.md + rule files; bump test-count baseline.
+- **PR #7a** (#711 merged 2026-05-19) — Slices 1 + 2: introduce `Indices4Only` LOCKED variant, switch default, wire planner + watchdog arms.
+- **PR #7b** (this PR) — **Combined Slices 3 + 4 + 5 + 6 per operator approval 2026-05-19**: delete 3 dead `subscribe_*` flags + retire 3 legacy `SubscriptionScope` variants (FullUniverse / IndicesOnlyAllExpiries / IndicesUnderlyingsOnly) + collapse `effective_main_feed_pool_size` to a single-variant constant + add source-scan ratchet `indices4only_scope_lock_guard.rs`. Net ~500 LoC deleted.
+- **PR #7c** — Slices 7 + 8: update CLAUDE.md + rule files (live-market-feed-subscription.md, websocket-connection-scope-lock.md narrative); confirm test-count baseline.
 
 ---
 
@@ -49,48 +48,38 @@ Mechanical ratchets enforce all of the above.
 
 ## Plan items (sliced into commits, like PR #6b)
 
-### Slice 1 — Introduce `Indices4Only` variant + deprecate legacy
-- [ ] Add `SubscriptionScope::Indices4Only` variant (the only LOCKED scope).
+### Slice 1 — Introduce `Indices4Only` variant + deprecate legacy [x] PR #7a (#711 merged)
+- [x] Add `SubscriptionScope::Indices4Only` variant (the only LOCKED scope).
   - Files: `crates/common/src/config.rs`
   - Tests: `test_subscription_scope_default_is_indices4only`, `test_indices4only_serde_roundtrip`
-- [ ] Make `Indices4Only` the `Default` (was `IndicesOnlyAllExpiries`).
-- [ ] Keep legacy variants but mark `#[deprecated(...)]` so call sites flag.
-- [ ] Update `config/base.toml` `[subscription] scope = "indices_4_only"`.
+- [x] Make `Indices4Only` the `Default` (PR #7a).
+- [x] Update `config/base.toml` `[subscription] scope = "indices_4_only"` (PR #7a).
 
-### Slice 2 — Planner branch collapse
-- [ ] In `crates/core/src/instrument/subscription_planner.rs`:
-  - Replace every `SubscriptionScope::IndicesUnderlyingsOnly` match arm with `SubscriptionScope::Indices4Only`.
-  - Delete `SubscriptionScope::IndicesOnlyAllExpiries` and `SubscriptionScope::FullUniverse` arms (now unreachable).
-  - `should_subscribe_stock_derivatives` → always returns `false` (then delete fn entirely once all callers gone).
-  - `should_subscribe_index_derivatives` → always returns `false` then delete.
-  - Sectoral/INDIA VIX display-index loop body collapses to a 4-SID hardcoded emission.
-- [ ] Tests: `test_planner_emits_exactly_4_idx_i_sids_under_indices4only`,
-  `test_planner_emits_zero_derivatives_under_indices4only`,
-  `test_planner_emits_zero_nse_eq_under_indices4only`.
+### Slice 2 — Planner branch collapse [x] PR #7a (#711 merged)
+- [x] In `crates/core/src/instrument/subscription_planner.rs`: wire `Indices4Only` arms across the 3 helper functions.
 
-### Slice 3 — Delete dead `SubscriptionConfig` flags
-- [ ] In `crates/common/src/config.rs`:
-  - Delete `subscribe_stock_derivatives: bool`.
-  - Delete `subscribe_index_derivatives: bool`.
-  - Delete `subscribe_display_indices: bool`.
-- [ ] Update every test that constructs `SubscriptionConfig` (drop the deleted fields).
-- [ ] Tests: `test_subscription_config_has_no_derivatives_flags`.
+### Slice 3 — Delete dead `SubscriptionConfig` flags [x] PR #7b
+- [x] In `crates/common/src/config.rs`:
+  - Deleted `subscribe_stock_derivatives: bool`.
+  - Deleted `subscribe_index_derivatives: bool`.
+  - Deleted `subscribe_display_indices: bool`.
+- [x] Updated every test/bench/TOML that referenced the deleted fields.
+- [x] Test: `test_subscription_config_has_no_derivatives_flags` (config.rs).
 
-### Slice 4 — Delete `effective_main_feed_pool_size` legacy branch + collapse to const-1
-- [ ] `effective_main_feed_pool_size(Indices4Only, _) → 1` (4 SIDs fit on 1 conn).
-- [ ] Delete the `configured` parameter once all call sites converge.
-- [ ] Tests: `test_effective_main_feed_pool_size_is_always_one_under_indices4only`.
+### Slice 4 — Collapse `effective_main_feed_pool_size` to single-variant constant [x] PR #7b
+- [x] `effective_main_feed_pool_size(_scope, _configured) → PHASE_0_MAIN_FEED_CONNECTION_COUNT` (always 1).
+- [x] Test: `test_effective_main_feed_pool_size_is_always_one_under_indices4only` (carried from PR #7a, still green).
 
-### Slice 5 — Retire legacy `SubscriptionScope` variants entirely
-- [ ] Delete `SubscriptionScope::FullUniverse`.
-- [ ] Delete `SubscriptionScope::IndicesOnlyAllExpiries`.
-- [ ] Delete `SubscriptionScope::IndicesUnderlyingsOnly`.
-- [ ] Keep ONLY `Indices4Only`. Single-variant enum (intentional — prevents accidental introduction of a new scope without going through `websocket-connection-scope-lock.md`).
-- [ ] Update banned-pattern scanner + add ratchet meta-guard.
-- [ ] Tests: `test_subscription_scope_has_exactly_one_variant`.
+### Slice 5 — Retire legacy `SubscriptionScope` variants entirely [x] PR #7b
+- [x] Deleted `SubscriptionScope::FullUniverse`.
+- [x] Deleted `SubscriptionScope::IndicesOnlyAllExpiries`.
+- [x] Deleted `SubscriptionScope::IndicesUnderlyingsOnly`.
+- [x] `SubscriptionScope` is now a 1-variant enum (`Indices4Only` only).
+- [x] Bulk-retired 24 obsolete planner tests via `#[cfg(any())]`; helper `legacy_full_universe_config()` now returns the LOCKED default.
+- [x] Test: `test_subscription_scope_has_exactly_one_variant` (config.rs).
 
-### Slice 6 — Ratchet: pin the lock mechanically
-- [ ] Add `crates/core/tests/indices4only_scope_lock_guard.rs` — source-scan ratchet that:
+### Slice 6 — Ratchet: pin the lock mechanically [x] PR #7b
+- [x] Added `crates/core/tests/indices4only_scope_lock_guard.rs` — source-scan ratchet (3 tests):
   - Verifies no `FullUniverse` / `IndicesOnlyAllExpiries` / `IndicesUnderlyingsOnly` string appears in `crates/` (except in archived docs and this plan file).
   - Verifies `subscribe_stock_derivatives` / `subscribe_index_derivatives` / `subscribe_display_indices` are absent from `crates/`.
   - Verifies the planner emits EXACTLY 4 subscriptions for the only legal scope.
@@ -102,7 +91,7 @@ Mechanical ratchets enforce all of the above.
 - [ ] Update `CLAUDE.md` "BOOT SEQUENCE" + "CONFIGURATION" sections.
 
 ### Slice 8 — Test-count baseline ratchet
-- [ ] `.claude/hooks/.test-count-baseline` updated (test count moves up from new ratchets, down from deleted test sites).
+- [x] `.claude/hooks/.test-count-baseline` bumped 7955 → 7922 in PR #7b (33 test-functions retired in the planner via #[cfg(any())]; 3 new ratchets added in `indices4only_scope_lock_guard.rs`).
 
 ---
 

@@ -967,9 +967,9 @@ const _: () = {
     );
 };
 
-/// Phase 0 LEAN MVP main-feed pool size (operator decision 2026-05-13).
+/// AWS-lifecycle LOCKED main-feed pool size (PR #7b).
 ///
-/// Under `SubscriptionScope::IndicesUnderlyingsOnly`, only ~222 SIDs are
+/// Under the single-variant Indices4Only scope only 4 IDX_I SIDs are
 /// subscribed — well below the 5,000-per-connection Dhan cap. Spinning up
 /// 5 main-feed WebSocket connections is wasteful: 4 of them would sit
 /// idle holding zero instruments, fragment the token/IP usage budget,
