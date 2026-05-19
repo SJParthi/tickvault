@@ -18,11 +18,9 @@ pub mod bhavcopy_pipeline;
 pub mod boot_helpers;
 pub mod boot_smoke_test;
 pub mod core_pinning;
-pub mod depth_20_conn_spawner;
-pub mod depth_20_single_side_planner;
-pub mod depth_bridge_state_writer;
-pub mod depth_dynamic_pipeline;
-pub mod depth_dynamic_pipeline_v2;
+// PR #4 (2026-05-19): depth-20 / depth-200 modules DELETED (operator-locked
+// per websocket-connection-scope-lock.md — 4-IDX_I uses 1 main-feed conn
+// + 1 order-update conn only).
 // PR #3 (2026-05-19): `greeks_pipeline` module DELETED. Greeks
 // pipeline retired alongside the indices-only universe. Option Chain
 // REST overlay (PR #8) ships Dhan-computed greeks separately.

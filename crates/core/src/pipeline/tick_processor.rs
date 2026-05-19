@@ -771,8 +771,8 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     // Prometheus counters (holes / duplicates / rollbacks) so operators
     // can build dashboards that distinguish real packet loss from
     // benign reconnect replay.
-    // O(1) EXEMPT: allocated once at task start, NOT per tick.
-    let depth_seq_tracker = crate::pipeline::DepthSequenceTracker::new();
+    // PR #4 (2026-05-19): `depth_seq_tracker` retired alongside the
+    // deleted depth_sequence_tracker module. Depth feeds are gone.
 
     while let Some(raw_frame) = frame_receiver.recv().await {
         let tick_start = Instant::now();
@@ -1518,62 +1518,8 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 m_market_status_updates.increment(1);
                 info!(exchange_segment_code, security_id, "market status update");
             }
-            ParsedFrame::DeepDepth {
-                security_id,
-                exchange_segment_code,
-                side,
-                message_sequence,
-                ..
-            } => {
-                // PR #288 (§10.2): segment-aware sequence-hole detection.
-                // `ExchangeSegment::from_byte()` maps the binary wire code
-                // to the typed enum; unknown codes fall back to NseFno
-                // (the only segment the 20-level depth feed emits per
-                // dhan-ref rule 13, so misidentification is impossible in
-                // practice but we stay defensive).
-                let segment =
-                    tickvault_common::types::ExchangeSegment::from_byte(exchange_segment_code)
-                        .unwrap_or(tickvault_common::types::ExchangeSegment::NseFno);
-                let outcome =
-                    depth_seq_tracker.observe(security_id, segment, side, message_sequence);
-                match outcome {
-                    crate::pipeline::SequenceOutcome::HoleDetected { missed } => {
-                        warn!(
-                            security_id,
-                            exchange_segment_code,
-                            ?side,
-                            current_seq = message_sequence,
-                            missed,
-                            "20-level depth sequence hole detected"
-                        );
-                    }
-                    crate::pipeline::SequenceOutcome::Rollback => {
-                        // Most likely a server-side reconnect; not necessarily
-                        // tick loss. Emit a non-alerting INFO; the counter
-                        // tv_depth_sequence_rollbacks_total is already bumped
-                        // inside the tracker for dashboard observability.
-                        tracing::info!(
-                            security_id,
-                            exchange_segment_code,
-                            ?side,
-                            new_seq = message_sequence,
-                            "20-level depth sequence rolled back (likely server reconnect)"
-                        );
-                    }
-                    crate::pipeline::SequenceOutcome::FirstSeen
-                    | crate::pipeline::SequenceOutcome::Monotonic
-                    | crate::pipeline::SequenceOutcome::Duplicate => {}
-                }
-
-                trace!(
-                    security_id,
-                    exchange_segment_code,
-                    ?side,
-                    message_sequence,
-                    ?outcome,
-                    "deep depth frame received"
-                );
-            }
+            // PR #4 (2026-05-19): `ParsedFrame::DeepDepth` arm retired
+            // alongside the deleted depth feeds.
             ParsedFrame::Disconnect(code) => {
                 m_disconnects.increment(1);
                 error!(
