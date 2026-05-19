@@ -16,7 +16,6 @@
 pub mod bar_cache_loader;
 pub mod bhavcopy_pipeline;
 pub mod boot_helpers;
-pub mod boot_smoke_test;
 pub mod core_pinning;
 // PR #4 (2026-05-19): depth-20 / depth-200 modules DELETED (operator-locked
 // per websocket-connection-scope-lock.md — 4-IDX_I uses 1 main-feed conn
