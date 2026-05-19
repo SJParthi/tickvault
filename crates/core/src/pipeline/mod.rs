@@ -16,7 +16,7 @@
 
 pub mod boot_ordering_gate;
 pub mod candle_aggregator;
-pub mod depth_sequence_tracker;
+// PR #4 (2026-05-19): `depth_sequence_tracker` module DELETED.
 pub mod first_seen_set;
 pub mod last_seen_ltt_cache;
 pub mod no_tick_watchdog;
@@ -31,7 +31,7 @@ pub mod volume_delta_tracker;
 pub mod volume_monotonicity_guard;
 
 pub use candle_aggregator::CandleAggregator;
-pub use depth_sequence_tracker::{DepthSequenceTracker, SequenceOutcome};
+// PR #4 (2026-05-19): depth_sequence_tracker re-exports retired.
 pub use tick_gap_detector::{
     SharedTickGapDetector, TICK_GAP_COALESCE_WINDOW_SECS_DEFAULT, TICK_GAP_THRESHOLD_SECS_DEFAULT,
     TickGapDetector, TickGapKey,

@@ -15,14 +15,10 @@ pub mod csv_downloader;
 pub mod csv_parser;
 pub mod daily_scheduler;
 pub mod delta_detector;
-pub mod depth_200_dynamic_subscriber;
-pub mod depth_20_dynamic_subscriber;
-pub mod depth_dynamic_top_volume_selector;
-pub mod depth_rebalancer;
-pub mod depth_strike_selector;
-pub mod depth_top_volume_selector;
+// PR #4 (2026-05-19): 6 depth modules DELETED.
 pub mod diagnostic;
-pub mod dynamic_subscription_state;
+// PR #4 (2026-05-19): `dynamic_subscription_state` module DELETED
+// (depth-only diff state machine; no consumers under 4-IDX_I scope).
 pub mod instrument_loader;
 pub mod market_open_self_test;
 pub mod phase2_readiness_check;

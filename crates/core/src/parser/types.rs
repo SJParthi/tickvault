@@ -3,9 +3,10 @@
 //! These types are internal to the parser module. The `ParsedTick` and
 //! `MarketDepthLevel` types live in `common::tick_types` for cross-crate use.
 
-use tickvault_common::tick_types::{DeepDepthLevel, MarketDepthLevel, ParsedTick};
+// PR #4 (2026-05-19): DeepDepthLevel + DepthSide imports retired alongside
+// deleted parser::deep_depth + parser::market_depth modules.
+use tickvault_common::tick_types::{MarketDepthLevel, ParsedTick};
 
-use crate::parser::deep_depth::DepthSide;
 use crate::websocket::types::DisconnectCode;
 
 // ---------------------------------------------------------------------------
@@ -58,15 +59,7 @@ pub enum ParsedFrame {
         security_id: u32,
         exchange_segment_code: u8,
     },
-    /// Deep depth packet (20-level or 200-level) — one side (bid or ask).
-    DeepDepth {
-        security_id: u32,
-        exchange_segment_code: u8,
-        side: DepthSide,
-        levels: Vec<DeepDepthLevel>,
-        message_sequence: u32,
-        received_at_nanos: i64,
-    },
+    // PR #4 (2026-05-19): `DeepDepth` variant retired.
     /// Server-initiated disconnect with reason code.
     Disconnect(DisconnectCode),
 }
@@ -110,35 +103,7 @@ mod tests {
         assert_eq!(err.to_string(), "unknown response code: 99");
     }
 
-    #[test]
-    fn test_parsed_frame_deep_depth_variant() {
-        let frame = ParsedFrame::DeepDepth {
-            security_id: 52432,
-            exchange_segment_code: 2,
-            side: DepthSide::Bid,
-            levels: vec![DeepDepthLevel {
-                price: 24500.0,
-                quantity: 1000,
-                orders: 50,
-            }],
-            message_sequence: 1,
-            received_at_nanos: 999,
-        };
-        match frame {
-            ParsedFrame::DeepDepth {
-                security_id,
-                side,
-                levels,
-                ..
-            } => {
-                assert_eq!(security_id, 52432);
-                assert_eq!(side, DepthSide::Bid);
-                assert_eq!(levels.len(), 1);
-                assert!((levels[0].price - 24500.0).abs() < f64::EPSILON);
-            }
-            other => panic!("expected DeepDepth, got {other:?}"),
-        }
-    }
+    // PR #4 (2026-05-19): `test_parsed_frame_deep_depth_variant` retired.
 
     #[test]
     fn test_packet_header_is_copy() {
@@ -430,21 +395,7 @@ mod tests {
         assert!(debug.contains("ExceededActiveConnections"));
     }
 
-    #[test]
-    fn test_parsed_frame_deep_depth_debug() {
-        let frame = ParsedFrame::DeepDepth {
-            security_id: 100,
-            exchange_segment_code: 2,
-            side: DepthSide::Ask,
-            levels: vec![],
-            message_sequence: 42,
-            received_at_nanos: 12345,
-        };
-        let debug = format!("{frame:?}");
-        assert!(debug.contains("DeepDepth"));
-        assert!(debug.contains("100"));
-        assert!(debug.contains("Ask"));
-    }
+    // PR #4 (2026-05-19): `test_parsed_frame_deep_depth_debug` retired.
 
     #[test]
     fn test_parsed_frame_tick_debug() {
@@ -470,23 +421,7 @@ mod tests {
         assert!(std::error::Error::source(&err).is_none());
     }
 
-    #[test]
-    fn test_parsed_frame_deep_depth_empty_levels() {
-        let frame = ParsedFrame::DeepDepth {
-            security_id: 1,
-            exchange_segment_code: 1,
-            side: DepthSide::Ask,
-            levels: vec![],
-            message_sequence: 0,
-            received_at_nanos: 0,
-        };
-        match frame {
-            ParsedFrame::DeepDepth { levels, .. } => {
-                assert!(levels.is_empty());
-            }
-            other => panic!("expected DeepDepth, got {other:?}"),
-        }
-    }
+    // PR #4 (2026-05-19): `test_parsed_frame_deep_depth_empty_levels` retired.
 
     #[test]
     fn test_parse_error_insufficient_bytes_source_is_none() {
@@ -542,34 +477,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_parsed_frame_deep_depth_bid_side() {
-        let frame = ParsedFrame::DeepDepth {
-            security_id: 42,
-            exchange_segment_code: 2,
-            side: DepthSide::Bid,
-            levels: vec![DeepDepthLevel {
-                price: 100.0,
-                quantity: 500,
-                orders: 10,
-            }],
-            message_sequence: 99,
-            received_at_nanos: 123456,
-        };
-        match frame {
-            ParsedFrame::DeepDepth {
-                side,
-                message_sequence,
-                received_at_nanos,
-                ..
-            } => {
-                assert_eq!(side, DepthSide::Bid);
-                assert_eq!(message_sequence, 99);
-                assert_eq!(received_at_nanos, 123456);
-            }
-            other => panic!("expected DeepDepth, got {other:?}"),
-        }
-    }
+    // PR #4 (2026-05-19): `test_parsed_frame_deep_depth_bid_side` retired.
 
     #[test]
     fn test_packet_header_max_message_length() {
