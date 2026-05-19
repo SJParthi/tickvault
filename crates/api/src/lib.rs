@@ -119,10 +119,7 @@ pub fn build_router_with_auth(
         // queries are meaningless. The handlers, the `top_movers` /
         // `option_movers` modules, and the `movers_v2` REST handler
         // were deleted alongside the movers pipeline.
-        .route(
-            "/api/instruments/diagnostic",
-            axum::routing::get(handlers::instruments::instrument_diagnostic),
-        )
+        // PR #6a (2026-05-19): /api/instruments/diagnostic route RETIRED with diagnostic module.
         .route("/portal", axum::routing::get(handlers::static_file::portal))
         .route(
             "/portal/options-chain",

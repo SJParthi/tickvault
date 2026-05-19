@@ -58,7 +58,6 @@ use tickvault_core::instrument::binary_cache::read_binary_cache;
 use tickvault_core::instrument::subscription_planner::SubscriptionPlan;
 use tickvault_core::instrument::{
     InstrumentLoadResult, build_subscription_plan, load_or_build_instruments,
-    run_instrument_diagnostic,
 };
 use tickvault_core::network::ip_verifier;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
@@ -1104,41 +1103,9 @@ async fn main() -> Result<()> {
     }
 
     // -----------------------------------------------------------------------
-    // CLI: --instrument-diagnostic (run diagnostic and exit)
-    // -----------------------------------------------------------------------
-    if std::env::args().any(|arg| arg == "--instrument-diagnostic") {
-        info!("running instrument diagnostic (--instrument-diagnostic flag detected)");
-        let report = run_instrument_diagnostic(
-            &config.dhan.instrument_csv_url,
-            &config.dhan.instrument_csv_fallback_url,
-            &config.instrument,
-        )
-        .await;
-
-        let json = serde_json::to_string_pretty(&report)
-            .unwrap_or_else(|err| format!("{{\"error\": \"serialization failed: {err}\"}}"));
-        #[allow(clippy::print_stdout)] // APPROVED: CLI diagnostic output to stdout, not logging
-        {
-            println!("{json}"); // APPROVED: CLI diagnostic requires stdout output
-        }
-
-        if report.healthy {
-            info!("instrument diagnostic: ALL CHECKS PASSED");
-        } else {
-            let failed: Vec<_> = report
-                .checks
-                .iter()
-                .filter(|c| !c.passed)
-                .map(|c| c.name.as_str())
-                .collect();
-            error!(
-                failed_checks = ?failed,
-                "instrument diagnostic: SOME CHECKS FAILED"
-            );
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
+    // PR #6a (2026-05-19): --instrument-diagnostic CLI flag RETIRED
+    // (4-IDX_I LOCKED_UNIVERSE — diagnostic.rs module deleted; no CSV
+    // download/parse/validate cycle to diagnose).
 
     // -----------------------------------------------------------------------
     // Two-Phase Boot: fast path ONLY during market hours on trading days.
