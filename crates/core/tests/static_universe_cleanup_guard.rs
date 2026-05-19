@@ -157,12 +157,13 @@ fn test_no_pub_mod_phase2_dispatcher_in_instrument_mod() {
 }
 
 #[test]
-fn test_phase2_readiness_check_kept() {
+fn test_phase2_readiness_check_file_does_not_exist() {
     let path = workspace_root().join("crates/core/src/instrument/phase2_readiness_check.rs");
     assert!(
-        path.exists(),
-        "phase2_readiness_check.rs MUST remain (PR #509d KEEPS this file). \
-         The 09:13:01 IST pre-flight readiness check is retained per plan §R.1 row 5."
+        !path.exists(),
+        "phase2_readiness_check.rs MUST be deleted (PR #5, AWS-lifecycle 2026-05-19). \
+         The 09:13:01 IST pre-flight readiness check is retired under the 4-IDX_I LOCKED_UNIVERSE: \
+         Phase 2 stock-F&O dispatcher is dead weight (operator lock 2026-05-15)."
     );
 }
 
