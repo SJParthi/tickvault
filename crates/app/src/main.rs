@@ -54,11 +54,10 @@ use tickvault_core::historical::candle_fetcher::fetch_historical_candles;
 use tickvault_core::historical::cross_verify::{
     cross_match_historical_vs_live, verify_candle_integrity,
 };
-use tickvault_core::instrument::binary_cache::read_binary_cache;
+// PR #6b (2026-05-19): binary_cache, InstrumentLoadResult,
+// load_or_build_instruments imports retired — universe is now static.
+use tickvault_core::instrument::build_subscription_plan;
 use tickvault_core::instrument::subscription_planner::SubscriptionPlan;
-use tickvault_core::instrument::{
-    InstrumentLoadResult, build_subscription_plan, load_or_build_instruments,
-};
 use tickvault_core::network::ip_verifier;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
 use tickvault_core::pipeline::run_tick_processor;
@@ -1118,11 +1117,20 @@ async fn main() -> Result<()> {
     // is_mock_trading is for logging/awareness only, never for trading gates.
     // -----------------------------------------------------------------------
     let fast_cache = token_cache::load_token_cache_fast();
-    let is_market_hours = trading_calendar.is_trading_day_today()
-        && tickvault_core::instrument::instrument_loader::is_within_build_window(
-            FAST_BOOT_WINDOW_START,
-            FAST_BOOT_WINDOW_END,
-        );
+    // PR #6b (2026-05-19): inlined `is_within_build_window` after retiring
+    // instrument_loader.rs. The window (09:00:00..15:30:00 IST) matches the
+    // tick-persist window per audit-findings Rule 3.
+    let is_market_hours = trading_calendar.is_trading_day_today() && {
+        use tickvault_common::constants::{
+            IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST,
+            TICK_PERSIST_START_SECS_OF_DAY_IST,
+        };
+        let _ = (FAST_BOOT_WINDOW_START, FAST_BOOT_WINDOW_END); // keep imports live until removal in later slice
+        let now_utc = chrono::Utc::now().timestamp();
+        let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+        let sec_of_day = now_ist.rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
+        (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST).contains(&sec_of_day)
+    };
 
     if !is_market_hours && fast_cache.is_some() {
         info!("token cache exists but outside market hours / non-trading day — using slow boot");
@@ -5649,105 +5657,48 @@ async fn main() -> Result<()> {
 // Helper: Load instruments (shared by fast and slow boot paths)
 // ---------------------------------------------------------------------------
 
-/// Loads instruments and returns (plan, optional universe for re-persistence).
+/// Loads instruments from the static `FnoUniverse::locked_4_idx_i()`.
 ///
-/// The `FnoUniverse` is returned on fresh builds so the caller can re-persist
-/// instrument data to QuestDB after Docker infra starts (fast boot path).
+/// PR #6b (2026-05-19): the entire CSV download/parse/validate pipeline is
+/// retired under the operator-locked 4-IDX_I scope (operator lock 2026-05-15
+/// per `websocket-connection-scope-lock.md`). The universe is now a 4-SID
+/// compile-time constant via `LOCKED_UNIVERSE` (NIFTY/BANKNIFTY/SENSEX/INDIA
+/// VIX). No CSV download, no parse, no validate, no rkyv cache, no daily
+/// refresh — every boot reads the same 4 SIDs.
 ///
-/// `is_trading_day` ensures non-trading days (weekends/holidays) always
-/// download fresh instruments instead of using potentially stale cache.
-/// Returns (plan, universe, needs_persist).
-/// `needs_persist` is true for CachedPlan (not yet persisted) and false for
-/// FreshBuild (already persisted inside load_or_build_instruments).
+/// Returns (plan, universe, needs_persist). `needs_persist` is always
+/// `false` because the synthetic universe has no F&O contracts to persist;
+/// the 4 IDX_I rows are written via the standard instrument-master DDL
+/// idempotency path.
+#[allow(clippy::unused_async)] // APPROVED: signature preserved for symmetry with prior async impl + call sites
 async fn load_instruments(
     config: &ApplicationConfig,
-    is_trading_day: bool,
+    _is_trading_day: bool,
     trading_calendar: &TradingCalendar,
 ) -> (Option<SubscriptionPlan>, Option<FnoUniverse>, bool) {
-    info!("checking instrument build eligibility");
+    info!("loading 4-IDX_I LOCKED_UNIVERSE (no CSV download / parse / validate)");
 
-    match load_or_build_instruments(
-        &config.dhan.instrument_csv_url,
-        &config.dhan.instrument_csv_fallback_url,
-        &config.instrument,
-        &config.questdb,
+    let universe = FnoUniverse::locked_4_idx_i();
+    let today = Utc::now().with_timezone(&ist_offset()).date_naive();
+    // Empty spot prices — no F&O underlyings to ATM-select.
+    let empty_spot_prices = std::collections::HashMap::new();
+    let plan = build_subscription_plan(
+        &universe,
         &config.subscription,
-        is_trading_day,
-    )
-    .await
-    {
-        Ok(InstrumentLoadResult::FreshBuild(universe)) => {
-            let today = Utc::now().with_timezone(&ist_offset()).date_naive();
-            // Boot-time: pass empty spot prices — stock F&O will be subscribed
-            // at 9:13 AM once pre-market finalized prices are available.
-            // Indices get ALL contracts regardless. Stock equities subscribe immediately.
-            //
-            // Fix #6 (2026-04-24): pass the trading calendar so stock F&O
-            // expiries roll forward when nearest is T or T-1. Indices are
-            // unaffected — the planner ignores rollover for index kinds.
-            let empty_spot_prices = std::collections::HashMap::new();
-            let plan = build_subscription_plan(
-                &universe,
-                &config.subscription,
-                today,
-                &empty_spot_prices,
-                Some(trading_calendar),
-            );
+        today,
+        &empty_spot_prices,
+        Some(trading_calendar),
+    );
 
-            info!(
-                total = plan.summary.total,
-                feed_mode = %plan.summary.feed_mode,
-                "subscription plan ready (fresh build)"
-            );
-            (Some(plan), Some(universe), false) // FreshBuild already persisted internally
-        }
-        Ok(InstrumentLoadResult::CachedPlan(plan)) => {
-            info!(
-                total = plan.summary.total,
-                feed_mode = %plan.summary.feed_mode,
-                "subscription plan ready (zero-copy rkyv cache)"
-            );
-            // Load owned universe from rkyv cache for QuestDB persistence.
-            // Zero-copy MappedUniverse built the plan; persist_instrument_snapshot
-            // needs owned FnoUniverse. One-time ~5-15ms startup cost, not hot path.
-            let universe = match read_binary_cache(&config.instrument.csv_cache_directory) {
-                Ok(Some(u)) => {
-                    info!(
-                        underlyings = u.underlyings.len(),
-                        derivatives = u.derivative_contracts.len(),
-                        "owned universe loaded from rkyv cache for QuestDB persistence"
-                    );
-                    Some(u)
-                }
-                Ok(None) => {
-                    warn!("rkyv cache not found for persistence — instrument tables will be empty");
-                    None
-                }
-                Err(err) => {
-                    warn!(%err, "rkyv cache read failed for persistence — instrument tables will be empty");
-                    None
-                }
-            };
-            (Some(plan), universe, true) // CachedPlan needs explicit persistence
-        }
-        Ok(InstrumentLoadResult::Unavailable) => {
-            // I-P0-06: This should only trigger if emergency download also failed
-            error!(
-                "CRITICAL: instruments unavailable — emergency download failed, system has ZERO instruments"
-            );
-            (None, None, false)
-        }
-        Err(err) => {
-            // Gap 3 fix: ERROR level triggers Telegram via Loki → Grafana.
-            // Previously WARN — operator unaware system has zero instruments.
-            error!(
-                error = %err,
-                "CRITICAL: instrument build failed — system has ZERO instruments to \
-                 subscribe. No ticks, no trading. Investigate immediately."
-            );
-            (None, None, false)
-        }
-    }
+    info!(
+        total = plan.summary.total,
+        feed_mode = %plan.summary.feed_mode,
+        "subscription plan ready (LOCKED_UNIVERSE — 4 IDX_I SIDs)"
+    );
+
+    // needs_persist=false: synthetic universe has no F&O derivative rows to
+    // write to QuestDB beyond the 4 IDX_I entries handled by the DDL path.
+    (Some(plan), Some(universe), false)
 }
 
 // create_log_file_writer is now in boot_helpers module (lib.rs).
