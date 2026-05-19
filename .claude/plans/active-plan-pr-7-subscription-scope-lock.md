@@ -10,8 +10,9 @@
 ## Sub-PR split (operator-charter §H serial completion)
 
 - **PR #7a** (#711 merged 2026-05-19) — Slices 1 + 2: introduce `Indices4Only` LOCKED variant, switch default, wire planner + watchdog arms.
-- **PR #7b** (this PR) — **Combined Slices 3 + 4 + 5 + 6 per operator approval 2026-05-19**: delete 3 dead `subscribe_*` flags + retire 3 legacy `SubscriptionScope` variants (FullUniverse / IndicesOnlyAllExpiries / IndicesUnderlyingsOnly) + collapse `effective_main_feed_pool_size` to a single-variant constant + add source-scan ratchet `indices4only_scope_lock_guard.rs`. Net ~500 LoC deleted.
-- **PR #7c** — Slices 7 + 8: update CLAUDE.md + rule files (live-market-feed-subscription.md, websocket-connection-scope-lock.md narrative); confirm test-count baseline.
+- **PR #7b** (#712 merged 2026-05-19) — Combined Slices 3 + 4 + 5 + 6: delete 3 dead `subscribe_*` flags + retire 3 legacy `SubscriptionScope` variants + collapse `effective_main_feed_pool_size` to constant + add source-scan ratchet.
+- **PR #7c** (this PR) — Slices 7 + 8: update CLAUDE.md + rule files (`live-market-feed-subscription.md`, `websocket-connection-scope-lock.md`, `operator-charter-forever.md` §I); confirm test-count baseline at 7922.
+- **PR #7d** (net-new, operator-locked 2026-05-19) — Retire the frontend surface: delete `crates/api/static/*.html` (8 HTML files), `crates/api/src/handlers/static_file.rs`, `/portal/*` routes, and the dead `/api/movers` + `/api/option-chain` + `/api/pcr` endpoints (whose only consumers are the HTML pages). Replacement coverage: Grafana dashboards, Telegram, MCP tools, QuestDB Console.
 
 ---
 
