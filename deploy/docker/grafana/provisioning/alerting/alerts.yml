@@ -1128,41 +1128,8 @@ groups:
         labels:
           severity: medium
 
-      # Wave 1 / PHASE2-02: Phase2EmitGuard dropped without firing.
-      - uid: tv-phase2-02-emit-guard-dropped
-        title: "Wave 1 PHASE2-02: Phase2EmitGuard dropped without emit"
-        condition: C
-        data:
-          - refId: A
-            relativeTimeRange: { from: 86400, to: 0 }
-            datasourceUid: prometheus
-            model:
-              expr: "increase(tv_phase2_emit_guard_dropped_total[1d])"
-              intervalMs: 60000
-              maxDataPoints: 43200
-          - refId: B
-            relativeTimeRange: { from: 86400, to: 0 }
-            datasourceUid: __expr__
-            model:
-              type: reduce
-              expression: A
-              reducer: last
-          - refId: C
-            relativeTimeRange: { from: 86400, to: 0 }
-            datasourceUid: __expr__
-            model:
-              type: threshold
-              expression: B
-              conditions:
-                - evaluator: { type: gt, params: [0] }
-        noDataState: OK
-        execErrState: Alerting
-        for: 1m
-        annotations:
-          summary: "PHASE2-02: Phase 2 dispatcher returned without firing outcome"
-          description: "tv_phase2_emit_guard_dropped_total incremented. The Phase 2 dispatcher returned without calling emit_complete/emit_failed/emit_skipped — operator missed the daily Phase 2 outcome notification. Regression in main.rs phase2_scheduler. Runbook: .claude/rules/project/wave-1-error-codes.md (PHASE2-02)."
-        labels:
-          severity: high
+      # PR #5 (2026-05-19): tv-phase2-02-emit-guard-dropped retired.
+      # Phase 2 dispatcher chain deleted under operator-locked 4-IDX_I scope.
 
       # Wave 1 / PREVCLOSE-01: previous_close ILP write or flush failed.
       - uid: tv-prev-close-01-ilp-failed
