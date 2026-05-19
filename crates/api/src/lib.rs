@@ -1,13 +1,18 @@
-//! HTTP API server — axum endpoints for health, stats, portal, and instruments.
+//! HTTP API server — axum endpoints for health, stats, quote, and debug.
 //!
 //! # Endpoints
 //! - `GET /health` — health check
 //! - `GET /api/stats` — QuestDB table counts
 //! - `GET /api/quote/{security_id}` — latest tick for a security (from QuestDB)
-//! - `GET /api/top-movers` — top gainers, losers, most active
-//! - `GET /portal` — DLT Control Panel (links to all monitoring services)
-//! - `POST /api/instruments/rebuild` — one-shot instrument rebuild
-//! - `GET /api/instruments/diagnostic` — full instrument system health check
+//! - `GET /api/debug/logs/summary` — Claude MCP read-only log summary
+//! - `GET /api/debug/logs/jsonl/latest` — Claude MCP read-only error JSONL
+//! - `GET /api/debug/spill/status` — spill disk-health snapshot
+//!
+//! # AWS-lifecycle PR #7d (2026-05-19) — frontend retired
+//! Every `/portal/*` HTML route + the dead `/api/option-chain`,
+//! `/api/pcr`, `/api/market/indices` endpoints were deleted. The
+//! replacement surface is Grafana + Telegram + MCP tools + the
+//! QuestDB Console at `localhost:9000`.
 //!
 //! # Boot Sequence Position
 //! Pipeline → **API Server**
@@ -86,92 +91,30 @@ pub fn build_router_with_auth(
         axum::middleware::from_fn_with_state(auth_config, require_bearer_auth),
     );
 
-    // Public routes — read-only GET endpoints (no auth required)
+    // Public routes — read-only GET endpoints (no auth required).
+    //
+    // PR #7d (2026-05-19): the entire `/portal/*` HTML route family +
+    // `/api/option-chain` + `/api/pcr` + `/api/market/indices` routes
+    // have been retired. Their handlers (`static_file`, `option_chain`,
+    // `market_data`) are deleted. Replacement surface: Grafana
+    // dashboards, Telegram alerts, MCP tools, QuestDB Console.
+    //
+    // Earlier retirements:
+    // - PR #2 (2026-05-18): movers route family.
+    // - PR #6a (2026-05-19): 3 index-constituency routes + diagnostic route.
+    // - PR #6b (2026-05-19): /api/instruments/rebuild route.
     let public_routes = Router::new()
         .route(
             "/health",
             axum::routing::get(handlers::health::health_check),
-        )
-        // Browsers auto-fetch /favicon.ico on every portal page load. Without
-        // an explicit handler, axum's merge of public + protected routers
-        // routes unmatched paths through the protected router's auth-layer
-        // fallback, producing a `WARN GAP-SEC-01: missing Authorization`
-        // entry per page load. Returning 204 No Content here short-circuits
-        // before that fallback. Browsers cache the empty response, so the
-        // request usually fires once per session.
-        .route(
-            "/favicon.ico",
-            axum::routing::get(handlers::static_file::favicon),
         )
         .route("/api/stats", axum::routing::get(handlers::stats::get_stats))
         .route(
             "/api/quote/{security_id}",
             axum::routing::get(handlers::quote::get_quote),
         )
-        // PR #2 (2026-05-18): the entire movers route family — V1
-        // `/api/movers`, V1 `/api/movers/expiries`, V2 `/api/movers/v2`,
-        // legacy `/api/market/stock-movers`, legacy
-        // `/api/market/option-movers` — is now retired. Under the
-        // 4-IDX_I-only universe top-N gainers/losers/most-active
-        // queries are meaningless. The handlers, the `top_movers` /
-        // `option_movers` modules, and the `movers_v2` REST handler
-        // were deleted alongside the movers pipeline.
-        // PR #6a (2026-05-19): /api/instruments/diagnostic route RETIRED with diagnostic module.
-        .route("/portal", axum::routing::get(handlers::static_file::portal))
-        .route(
-            "/portal/options-chain",
-            axum::routing::get(handlers::static_file::options_chain),
-        )
-        // PR #6a (2026-05-19): 3 index-constituency routes RETIRED under
-        // 4-IDX_I LOCKED_UNIVERSE. NSE index composition (which stocks are
-        // in NIFTY, etc.) isn't needed when only the 4 indices themselves
-        // are tracked.
-        .route(
-            "/api/option-chain",
-            axum::routing::get(handlers::option_chain::get_option_chain),
-        )
-        .route(
-            "/api/pcr",
-            axum::routing::get(handlers::option_chain::get_pcr),
-        )
-        .route(
-            "/api/market/indices",
-            axum::routing::get(handlers::market_data::get_indices),
-        )
-        .route(
-            "/portal/market-dashboard",
-            axum::routing::get(handlers::static_file::market_dashboard),
-        )
-        .route(
-            "/portal/ws-dashboard",
-            axum::routing::get(handlers::static_file::ws_dashboard),
-        )
-        .route(
-            "/portal/markets/options",
-            axum::routing::get(handlers::static_file::markets_options),
-        )
-        .route(
-            "/portal/markets/stocks",
-            axum::routing::get(handlers::static_file::markets_stocks),
-        )
-        .route(
-            "/portal/markets/index",
-            axum::routing::get(handlers::static_file::markets_index),
-        )
-        .route(
-            "/portal/option-chain-v2",
-            axum::routing::get(handlers::static_file::options_chain_v2),
-        )
-        // Design-system static assets: serves ui_kits/ (dashboard mockups, CSS, SVGs).
-        // Path is resolved relative to the process cwd at runtime.
-        .nest_service(
-            "/portal/design",
-            tower_http::services::ServeDir::new("ui_kits"),
-        )
         // Autonomous-ops Layer 1 (observability): read-only log access
-        // for Claude MCP / remote sessions. See
-        // `.claude/plans/autonomous-operations-100pct.md` + the
-        // claude-mcp-access runbook.
+        // for Claude MCP / remote sessions.
         .route(
             "/api/debug/logs/summary",
             axum::routing::get(handlers::debug::logs_summary),
@@ -453,58 +396,10 @@ mod tests {
         assert_eq!(response.status(), axum::http::StatusCode::OK);
     }
 
-    // -------------------------------------------------------------------
-    // build_router: portal endpoint returns 200
-    // -------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_build_router_portal_endpoint_returns_200() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let state = state::SharedAppState::new(
-            tickvault_common::config::QuestDbConfig {
-                host: "127.0.0.1".to_string(),
-                http_port: 1,
-                pg_port: 1,
-                ilp_port: 1,
-            },
-            tickvault_common::config::DhanConfig {
-                websocket_url: "wss://test".to_string(),
-                order_update_websocket_url: "wss://test".to_string(),
-                rest_api_base_url: "https://test".to_string(),
-                auth_base_url: "https://test".to_string(),
-                instrument_csv_url: "https://test".to_string(),
-                instrument_csv_fallback_url: "https://test".to_string(),
-                max_instruments_per_connection: 5000,
-                max_websocket_connections: 5,
-                sandbox_base_url: String::new(),
-            },
-            tickvault_common::config::InstrumentConfig {
-                daily_download_time: "08:55:00".to_string(),
-                csv_cache_directory: "/tmp/tv-cache".to_string(),
-                csv_cache_filename: "instruments.csv".to_string(),
-                csv_download_timeout_secs: 120,
-                build_window_start: "08:25:00".to_string(),
-                build_window_end: "08:55:00".to_string(),
-            },
-            std::sync::Arc::new(state::SystemHealthStatus::new()),
-        );
-        let router = build_router(state, &[], true);
-
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/portal")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
-    }
+    // PR #7d (2026-05-19): `test_build_router_portal_endpoint_returns_200`
+    // retired. The `/portal` route + every `/portal/*` HTML route was
+    // deleted alongside the static_file handler. The 404 case is still
+    // exercised by `test_build_router_unknown_route_returns_404` below.
 
     // -------------------------------------------------------------------
     // build_router: unknown route returns 404

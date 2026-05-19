@@ -126,16 +126,19 @@ crates/
 
 ### crates/api — HTTP Server (12 routes)
 
+Post-AWS-lifecycle (PRs #2-#7d, 2026-05-19) the API surface narrowed
+to operator/observability endpoints. The entire `/portal/*` HTML
+frontend + `/api/option-chain` + `/api/pcr` + `/api/market/indices`
++ `/api/movers*` + `/api/instruments/*` + `/api/index-constituency*`
+routes were retired (replacement: Grafana / Telegram / MCP /
+QuestDB Console).
+
 | File | Contains |
 |------|----------|
 | `handlers/health.rs` | `GET /health` — health check |
 | `handlers/quote.rs` | `GET /api/quote/{security_id}` — latest tick |
 | `handlers/stats.rs` | `GET /api/stats` — QuestDB table counts |
-| `handlers/movers.rs` | `GET /api/movers` — Dhan-parity unified movers endpoint (7 categories × 4 instrument-types × NSE/BSE × expiry filter); `GET /api/movers/expiries` — sorted available derivative expiry dates for the frontend dropdown |
-| `handlers/instruments.rs` | `POST /api/instruments/rebuild`, `GET /api/instruments/diagnostic` |
-| `handlers/index_constituency.rs` | `GET /api/index-constituency`, `GET /api/index-constituency/{index_name}`, `GET /api/stock-indices/{symbol}` |
-| `handlers/option_chain.rs` | `GET /api/option-chain`, `GET /api/pcr` — option chain + PCR from QuestDB |
-| `handlers/static_file.rs` | `GET /portal` — DLT Control Panel, `GET /portal/options-chain` — live options chain |
+| `handlers/debug.rs` | `GET /api/debug/logs/summary`, `GET /api/debug/logs/jsonl/latest`, `GET /api/debug/spill/status` — MCP read-only observability |
 | `middleware.rs` | Auth middleware, request tracing |
 | `state.rs` | Shared application state |
 

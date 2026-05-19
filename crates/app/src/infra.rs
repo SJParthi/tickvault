@@ -83,18 +83,16 @@ const LOCAL_HOST: &str = "127.0.0.1";
 
 /// Dashboard URLs and ports — auto-opened in browser after infrastructure starts.
 /// Each entry: (service name, URL, host, port).
+///
+/// PR #7d (2026-05-19): the `Portal` + `Market Dashboard` entries were
+/// removed alongside the `/portal/*` HTML retirement. The replacement
+/// surface for operator UX is Grafana (top of list), QuestDB Console,
+/// Prometheus, and Telegram alerts.
 const DASHBOARD_SERVICES: &[(&str, &str, &str, u16)] = &[
     ("Grafana", "http://localhost:3000", LOCAL_HOST, 3000),
     ("QuestDB", "http://localhost:9000", LOCAL_HOST, 9000),
     ("Prometheus", "http://localhost:9090", LOCAL_HOST, 9090),
     ("Traefik", "http://localhost:8080", LOCAL_HOST, 8080),
-    ("Portal", "http://localhost:3001/portal", LOCAL_HOST, 3001),
-    (
-        "Market Dashboard",
-        "http://localhost:3001/portal/market-dashboard",
-        LOCAL_HOST,
-        3001,
-    ),
 ];
 
 /// Grafana host for TCP reachability probe (kept for backward compat in tests).
@@ -1601,20 +1599,28 @@ mod tests {
     }
 
     #[test]
-    fn test_dashboard_services_includes_portal() {
+    fn test_dashboard_services_excludes_portal_after_pr_7d() {
+        // PR #7d (2026-05-19): /portal/* HTML frontend retired. Portal +
+        // Market Dashboard entries removed from DASHBOARD_SERVICES.
+        // Replacement surface is Grafana / Telegram / MCP / QuestDB
+        // Console.
         assert!(
             DASHBOARD_SERVICES
                 .iter()
-                .any(|&(name, _, _, _)| name == "Portal"),
-            "Portal must be in DASHBOARD_SERVICES"
+                .all(|&(name, _, _, _)| name != "Portal" && name != "Market Dashboard"),
+            "Portal + Market Dashboard MUST NOT be in DASHBOARD_SERVICES post-PR-#7d"
         );
     }
 
     #[test]
     fn test_dashboard_services_count() {
-        // 6 services: Grafana, QuestDB, Prometheus, Traefik, Portal, Market Dashboard
-        // Jaeger removed per aws-budget.md (saves 2.5GB RAM on c7i.xlarge)
-        assert_eq!(DASHBOARD_SERVICES.len(), 6, "expected 6 dashboard services");
+        // PR #7d (2026-05-19): 4 services remain after frontend retirement:
+        // Grafana, QuestDB, Prometheus, Traefik.
+        assert_eq!(
+            DASHBOARD_SERVICES.len(),
+            4,
+            "expected 4 dashboard services post-PR-#7d"
+        );
     }
 
     #[tokio::test]
