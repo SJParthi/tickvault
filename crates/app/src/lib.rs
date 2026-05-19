@@ -14,6 +14,10 @@
 #![cfg_attr(test, allow(clippy::field_reassign_with_default))]
 
 pub mod bar_cache_loader;
+// PR #8a (2026-05-19) — Slice 1: 09:15:00 IST `DayOhlcTracker::arm_sid()`
+// boot wiring per `index-day-ohlc-tracker-error-codes.md`. Closes the
+// operator-locked pre-open equilibrium open-price gap.
+pub mod day_ohlc_orchestrator;
 // PR #6a (2026-05-19): bhavcopy_pipeline DELETED — 16:30 IST NSE bhavcopy
 // cross-check retired under 4-IDX_I LOCKED_UNIVERSE (operator lock 2026-05-15).
 // Bhavcopy is NSE_FNO-only; no F&O subscriptions remain to cross-check.

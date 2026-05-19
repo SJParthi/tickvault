@@ -4167,6 +4167,54 @@ async fn main() -> Result<()> {
                 });
             }
 
+            // -----------------------------------------------------------------
+            // PR #8a Slice 1 (2026-05-19): DayOhlcTracker boot wiring.
+            //
+            // Closes the operator-locked pre-open equilibrium open-price
+            // gap per `.claude/rules/project/index-day-ohlc-tracker-error-codes.md`:
+            //
+            //   "09:15:00 IST open price MUST = NSE equilibrium open —
+            //    NOT the first post-open tick LTP."
+            //
+            // Three tokio tasks spawned here:
+            //   1. arm task     — at 09:15:00 IST iterate the 4 LOCKED
+            //                     IDX_I SIDs, arm each from
+            //                     PreOpenCloses::backtrack_latest().
+            //                     Empty buffer → INDEX-OHLC-01 Critical.
+            //   2. tick consumer — drain tick broadcast, route IDX_I ticks
+            //                     to update_tick() for day_high/low/close.
+            //   3. midnight reset — IST 00:00:00 clears prev-day state.
+            // -----------------------------------------------------------------
+            let day_ohlc_tracker =
+                std::sync::Arc::new(tickvault_trading::in_mem::DayOhlcTracker::new());
+            {
+                let arm_tracker = std::sync::Arc::clone(&day_ohlc_tracker);
+                let arm_buffer = std::sync::Arc::clone(&preopen_buffer);
+                let arm_calendar = std::sync::Arc::clone(&trading_calendar);
+                let _arm_handle = tickvault_app::day_ohlc_orchestrator::spawn_market_open_arm_task(
+                    arm_tracker,
+                    arm_buffer,
+                    arm_calendar,
+                );
+            }
+            {
+                let consumer_tracker = std::sync::Arc::clone(&day_ohlc_tracker);
+                let consumer_rx = tick_broadcast_sender.subscribe();
+                let _consumer_handle =
+                    tickvault_app::day_ohlc_orchestrator::spawn_day_ohlc_tick_consumer(
+                        consumer_tracker,
+                        consumer_rx,
+                    );
+            }
+            {
+                let reset_tracker = std::sync::Arc::clone(&day_ohlc_tracker);
+                let _reset_handle =
+                    tickvault_app::day_ohlc_orchestrator::spawn_midnight_reset_task(reset_tracker);
+            }
+            info!(
+                "PR #8a Slice 1: DayOhlcTracker boot wired (arm at 09:15:00 IST + tick consumer + midnight reset)"
+            );
+
             // PR #5 (2026-05-19): Phase 2 crash-recovery RETIRED.
             //
             // The crash-recovery block read the 09:13 IST stock-F&O ATM

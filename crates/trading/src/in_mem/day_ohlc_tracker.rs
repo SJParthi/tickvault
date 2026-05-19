@@ -282,6 +282,64 @@ impl Default for DayOhlcTracker {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Boot orchestration helpers (PR #8a Slice 1)
+// ---------------------------------------------------------------------------
+
+/// Number of seconds from `now` (IST) until the next occurrence of the given
+/// (hour, minute, second) in IST. Returns 0 if the target is in the past for
+/// today (caller must handle by waiting 24h or skipping).
+///
+/// Pure helper. Tested by `test_secs_until_next_ist_*`.
+#[must_use]
+pub fn secs_until_next_ist(target_h: u32, target_m: u32, target_s: u32, now_ist_secs: u32) -> u32 {
+    let target_secs = target_h * 3600 + target_m * 60 + target_s;
+    if now_ist_secs < target_secs {
+        target_secs - now_ist_secs
+    } else {
+        // Already past today's target — wait until tomorrow's same time.
+        (24 * 3600) - (now_ist_secs - target_secs)
+    }
+}
+
+/// Returns the current IST second-of-day [0, 86_400). Uses `chrono::Utc::now()`.
+#[must_use]
+pub fn ist_seconds_of_day() -> u32 {
+    use chrono::Utc;
+    use tickvault_common::constants::{IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY};
+    let now_utc = Utc::now().timestamp();
+    let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+    let sec = now_ist.rem_euclid(i64::from(SECONDS_PER_DAY));
+    u32::try_from(sec).unwrap_or(0)
+}
+
+/// Outcome of one arm-attempt at 09:15:00 IST for one IDX_I SID. Pure data
+/// type — the caller (boot task) decides how to react (emit Telegram, etc.).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ArmOutcome {
+    /// Pre-open buffer had a value — `day_open` armed successfully.
+    Armed { security_id: u32, day_open: f64 },
+    /// Buffer was empty for this SID — INDEX-OHLC-01 condition. Caller
+    /// emits Critical Telegram + falls back to first-trade LTP.
+    EmptyBuffer { security_id: u32 },
+}
+
+/// Pure-function evaluator: given a pre-open backtrack lookup function,
+/// decide the arm outcome for one SID. Lets boot wiring + tests share the
+/// same logic without spawning tasks.
+///
+/// Tested by `test_evaluate_arm_outcome_*`.
+#[must_use]
+pub fn evaluate_arm_outcome(security_id: u32, backtrack_result: Option<f64>) -> ArmOutcome {
+    match backtrack_result {
+        Some(day_open) => ArmOutcome::Armed {
+            security_id,
+            day_open,
+        },
+        None => ArmOutcome::EmptyBuffer { security_id },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,5 +505,95 @@ mod tests {
         tracker.arm_sid(sid, seg, 25_650.5);
         assert!(!tracker.is_empty());
         assert_eq!(tracker.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // PR #8a Slice 1 — boot orchestration helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_secs_until_next_ist_target_in_future() {
+        // 09:15:00 IST = 33_300 secs of day. now = 08:00:00 = 28_800.
+        assert_eq!(
+            secs_until_next_ist(9, 15, 0, 28_800),
+            33_300 - 28_800,
+            "future target should return positive seconds until target"
+        );
+    }
+
+    #[test]
+    fn test_secs_until_next_ist_target_in_past_wraps_to_tomorrow() {
+        // 09:15:00 IST target, now = 10:00:00 = 36_000. Already past.
+        // Should wrap to tomorrow's 09:15 = (86_400 - 36_000) + 33_300 = 83_700.
+        assert_eq!(
+            secs_until_next_ist(9, 15, 0, 36_000),
+            86_400 - (36_000 - 33_300),
+        );
+    }
+
+    #[test]
+    fn test_secs_until_next_ist_exact_target_returns_full_day() {
+        // now == target → wait 24h until next occurrence.
+        assert_eq!(secs_until_next_ist(9, 15, 0, 33_300), 86_400);
+    }
+
+    #[test]
+    fn test_secs_until_next_ist_midnight() {
+        // 00:00:00 target, now = 23:59:00 = 86_340. Wait 60s.
+        assert_eq!(secs_until_next_ist(0, 0, 0, 86_340), 60);
+    }
+
+    #[test]
+    fn test_secs_until_next_ist_1530_seal() {
+        // 15:30:00 IST = 55_800. now = 09:15:00 = 33_300. Wait 22_500s.
+        assert_eq!(secs_until_next_ist(15, 30, 0, 33_300), 55_800 - 33_300);
+    }
+
+    #[test]
+    fn test_ist_seconds_of_day_within_bounds() {
+        let sec = ist_seconds_of_day();
+        assert!(
+            sec < 86_400,
+            "second-of-day must be in [0, 86_400), got {sec}"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_arm_outcome_some_returns_armed() {
+        match evaluate_arm_outcome(13, Some(25_650.5)) {
+            ArmOutcome::Armed {
+                security_id,
+                day_open,
+            } => {
+                assert_eq!(security_id, 13);
+                assert!((day_open - 25_650.5).abs() < f64::EPSILON);
+            }
+            ArmOutcome::EmptyBuffer { .. } => panic!("expected Armed, got EmptyBuffer"),
+        }
+    }
+
+    #[test]
+    fn test_evaluate_arm_outcome_none_returns_empty_buffer() {
+        match evaluate_arm_outcome(51, None) {
+            ArmOutcome::EmptyBuffer { security_id } => assert_eq!(security_id, 51),
+            ArmOutcome::Armed { .. } => panic!("expected EmptyBuffer, got Armed"),
+        }
+    }
+
+    #[test]
+    fn test_evaluate_arm_outcome_preserves_security_id_for_all_4_locked_sids() {
+        // The 4 LOCKED_UNIVERSE SIDs: NIFTY=13, BANKNIFTY=25, SENSEX=51, INDIA VIX=21
+        for sid in [13_u32, 25, 51, 21] {
+            let armed = evaluate_arm_outcome(sid, Some(100.0));
+            match armed {
+                ArmOutcome::Armed { security_id, .. } => assert_eq!(security_id, sid),
+                ArmOutcome::EmptyBuffer { .. } => panic!("expected Armed"),
+            }
+            let empty = evaluate_arm_outcome(sid, None);
+            match empty {
+                ArmOutcome::EmptyBuffer { security_id } => assert_eq!(security_id, sid),
+                ArmOutcome::Armed { .. } => panic!("expected EmptyBuffer"),
+            }
+        }
     }
 }
