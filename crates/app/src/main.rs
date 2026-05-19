@@ -4012,8 +4012,12 @@ async fn main() -> Result<()> {
         // loop. The 30s prev_oi_cache timeout caps the worst-case wait
         // before this fires.
         if !boot_ordering_gate.try_authorize_subscribe() {
+            // PR #5 (2026-05-19): retagged from Phase2Ready01PreflightFailed
+            // (retired with the Phase 2 dispatcher) to PrevClose01IlpFailed
+            // which matches the message's "PREVCLOSE-01" reference per the
+            // error_code_tag_guard meta-test invariant.
             tracing::error!(
-                code = tickvault_common::error_code::ErrorCode::Phase2Ready01PreflightFailed.code_str(),
+                code = tickvault_common::error_code::ErrorCode::PrevClose01IlpFailed.code_str(),
                 readiness = ?boot_ordering_gate.readiness(),
                 "L14 boot-ordering gate refused to authorize subscribe — \
                  prev_oi_cache load likely failed (see PREVCLOSE-01 above). \
