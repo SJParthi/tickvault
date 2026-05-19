@@ -138,30 +138,28 @@ fn main_rs_consults_should_spawn_depth_dynamic_pipeline_helper() {
 }
 
 #[test]
-fn main_rs_consults_should_spawn_greeks_pipeline_helper() {
+fn main_rs_does_not_spawn_greeks_pipeline() {
+    // PR #3 (2026-05-19): the greeks pipeline was DELETED. The previous
+    // ratchet (`main_rs_consults_should_spawn_greeks_pipeline_helper`)
+    // verified that the spawn site was gated by the scope helper; this
+    // replacement ratchet verifies the spawn site no longer exists at all.
     let src = read_main_rs();
 
-    // Positive ratchet — main.rs MUST call the scope helper before the
-    // greeks pipeline spawn.
-    let helper_call = "should_spawn_greeks_pipeline";
-    assert!(
-        src.contains(helper_call),
-        "Phase 0 Item 7 regression (companion): main.rs no longer \
-         consults `{helper_call}` before spawning the greeks pipeline. \
-         Under Phase 0 the greeks pipeline MUST stay parked (operator's \
-         strategy uses underlying spot ticks only).",
-    );
+    let forbidden = [
+        "tickvault_app::greeks_pipeline::run_greeks_pipeline",
+        "InlineGreeksComputer::new",
+        "ensure_greeks_tables(",
+    ];
 
-    // Negative ratchet — the legacy raw `if config.greeks.enabled` gate
-    // MUST NOT be the sole condition.
-    let legacy_gate = "if config.greeks.enabled {";
-    assert!(
-        !src.contains(legacy_gate),
-        "Phase 0 Item 7 regression: main.rs reverted to the legacy \
-         direct flag read `{legacy_gate}` — this bypasses the Phase 0 \
-         scope gate. Use `should_spawn_greeks_pipeline(scope, \
-         greeks_enabled)`.",
-    );
+    for needle in forbidden {
+        assert!(
+            !src.contains(needle),
+            "PR #3 regression: main.rs still references `{needle}` — the \
+             greeks pipeline was retired alongside the indices-only universe. \
+             Option Chain REST overlay (PR #8) ships Dhan-computed greeks \
+             separately.",
+        );
+    }
 }
 
 // -----------------------------------------------------------------------
