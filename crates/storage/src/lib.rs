@@ -81,7 +81,10 @@ pub mod depth_dynamic_diff_audit_persistence;
 pub mod depth_rebalance_audit_persistence;
 pub mod disk_health_watcher;
 pub mod gap_fill_audit_persistence;
-pub mod greeks_persistence;
+// PR #3 (2026-05-19): `greeks_persistence` module DELETED. greeks
+// pipeline retired alongside the indices-only universe. The
+// option_greeks / pcr_snapshots / dhan_option_chain_raw / greeks_verification
+// QuestDB tables are dropped by scripts/migrate-drop-greeks-tables.sql.
 pub mod historical_fetch_marker;
 pub mod indicator_snapshot_persistence;
 pub mod instrument_persistence;

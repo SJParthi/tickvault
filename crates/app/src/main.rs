@@ -71,7 +71,9 @@ use tickvault_storage::calendar_persistence;
 use tickvault_storage::candle_persistence::{
     CandlePersistenceWriter, ensure_candle_table_dedup_keys,
 };
-use tickvault_storage::greeks_persistence::ensure_greeks_tables;
+// PR #3 (2026-05-19): `greeks_persistence` retired. Migration SQL
+// `scripts/migrate-drop-greeks-tables.sql` drops the option_greeks /
+// pcr_snapshots / dhan_option_chain_raw / greeks_verification tables.
 use tickvault_storage::instrument_persistence::{
     ensure_instrument_tables, persist_instrument_snapshot,
 };
@@ -80,7 +82,11 @@ use tickvault_storage::tick_persistence::{
     ensure_tick_table_dedup_keys,
 };
 
-use tickvault_trading::greeks::inline_computer::InlineGreeksComputer;
+// PR #3 (2026-05-19): `InlineGreeksComputer` retired alongside the
+// trading::greeks module. `build_inline_greeks_enricher` below now
+// returns `Option<NoopGreeksEnricher>::None` so the tick processor's
+// generic over `GreeksEnricher` keeps compiling without computing.
+use tickvault_common::tick_types::NoopGreeksEnricher;
 
 // `build_router` was the legacy entry point; both boot paths now use
 // `build_router_with_auth` directly with an SSM-resolved `ApiAuthConfig`
@@ -1670,7 +1676,7 @@ async fn main() -> Result<()> {
                         &config.questdb
                     ),
                     tickvault_storage::materialized_views::ensure_candle_views(&config.questdb),
-                    ensure_greeks_tables(&config.questdb),
+                    // PR #3 (2026-05-19): `ensure_greeks_tables` retired.
                 );
                 // Persist trading calendar to QuestDB (best-effort, non-blocking).
                 // Gap 5: log on failure instead of silent drop.
@@ -1807,33 +1813,11 @@ async fn main() -> Result<()> {
 
         // --- Background: Greeks pipeline (option chain fetch → compute → persist) ---
         //
-        // Phase 0 Item 3 (operator-locked 2026-05-13): under `IndicesUnderlyingsOnly`
-        // the greeks pipeline is PARKED — option-buying strategy computes
-        // indicators on underlying spot ticks; streaming Delta/Theta/Vega
-        // is Phase 2 territory.
-        if tickvault_app::phase2_recovery::should_spawn_greeks_pipeline(
-            config.subscription.scope,
-            config.greeks.enabled,
-        ) {
-            let greeks_token = token_handle.clone();
-            let greeks_client_id = client_id.clone();
-            let greeks_base_url = config.dhan.rest_api_base_url.clone();
-            let greeks_config = config.greeks.clone();
-            let greeks_questdb = config.questdb.clone();
-            tokio::spawn(async move {
-                tickvault_app::greeks_pipeline::run_greeks_pipeline(
-                    greeks_token,
-                    greeks_client_id,
-                    greeks_base_url,
-                    greeks_config,
-                    greeks_questdb,
-                )
-                .await;
-            });
-            info!("background greeks pipeline started (cold path)");
-        } else {
-            info!("greeks pipeline disabled in config");
-        }
+        // PR #3 (2026-05-19): greeks pipeline RETIRED. Under the 4-IDX_I
+        // LOCKED_UNIVERSE there are no live option contracts on the
+        // WebSocket to compute Greeks from. Option Chain REST overlay
+        // (PR #8) ships Dhan-computed greeks separately.
+        info!("greeks pipeline retired (PR #3)");
 
         // --- Background: Order update WebSocket ---
         let (order_update_sender, _order_update_receiver) =
@@ -3008,7 +2992,8 @@ async fn main() -> Result<()> {
         calendar_persistence::ensure_calendar_table(&config.questdb),
         tickvault_storage::constituency_persistence::ensure_constituency_table(&config.questdb),
         tickvault_storage::materialized_views::ensure_candle_views(&config.questdb),
-        ensure_greeks_tables(&config.questdb),
+        // PR #3 (2026-05-19): `ensure_greeks_tables` retired alongside
+        // the deleted greeks_persistence module.
         // 2026-05-09 PR 5c.5-final (Bug 3 — movers retirement): the
         // `movers_1s` base table + 25 `movers_*` materialized views are
         // RETIRED. Operator directive: "only ticks and our 9 needed
@@ -6417,34 +6402,10 @@ async fn main() -> Result<()> {
     // Step 9.6: Background greeks pipeline (option chain fetch → compute → persist)
     //
     // Phase 0 Item 7 follow-up (operator-locked 2026-05-13): this second
-    // greeks spawn site (mid-market / fast-boot branch) was missed in PR-3.
-    // Under `SubscriptionScope::IndicesUnderlyingsOnly` the greeks pipeline
-    // MUST stay parked regardless of the boot path taken. Reuses the same
-    // `should_spawn_greeks_pipeline` helper as the slow-boot site at ~1695.
+    // PR #3 (2026-05-19): greeks pipeline RETIRED — see slow-boot site
+    // earlier in this file for the full rationale.
     // -----------------------------------------------------------------------
-    if tickvault_app::phase2_recovery::should_spawn_greeks_pipeline(
-        config.subscription.scope,
-        config.greeks.enabled,
-    ) {
-        let greeks_token = token_handle.clone();
-        let greeks_client_id = ws_client_id.clone();
-        let greeks_base_url = config.dhan.rest_api_base_url.clone();
-        let greeks_config = config.greeks.clone();
-        let greeks_questdb = config.questdb.clone();
-        tokio::spawn(async move {
-            tickvault_app::greeks_pipeline::run_greeks_pipeline(
-                greeks_token,
-                greeks_client_id,
-                greeks_base_url,
-                greeks_config,
-                greeks_questdb,
-            )
-            .await;
-        });
-        info!("background greeks pipeline started (cold path)");
-    } else {
-        info!("greeks pipeline disabled in config");
-    }
+    info!("greeks pipeline retired (PR #3)");
 
     // -----------------------------------------------------------------------
     // Option-chain minute-snapshot scheduler (PR #5 of 5 — 2026-05-16)
@@ -8976,66 +8937,18 @@ async fn wait_for_shutdown_signal() -> &'static str {
 // Helper: Build inline Greeks enricher for tick processor
 // ---------------------------------------------------------------------------
 
-/// Constructs an `InlineGreeksComputer` for injection into the tick processor.
-///
-/// A5: Returns the concrete type (not `Box<dyn>`) so the compiler monomorphizes
-/// `run_tick_processor<InlineGreeksComputer>`, eliminating vtable indirection
-/// on the hot path (~20-40ns savings per tick).
-///
-/// Returns `None` if Greeks are disabled or no subscription plan is available.
+/// PR #3 (2026-05-19): Greeks enricher RETIRED. Under the 4-IDX_I
+/// LOCKED_UNIVERSE there are no live option contracts on the WebSocket
+/// to compute Greeks from. This stub returns `Option<NoopGreeksEnricher>::None`
+/// so the tick processor's generic over `GreeksEnricher` keeps compiling
+/// (concrete type provided; value is None so the enrich branch is dead code).
 /// O(1) EXEMPT: cold path — called once at startup.
 fn build_inline_greeks_enricher(
-    config: &ApplicationConfig,
-    subscription_plan: &Option<SubscriptionPlan>,
-) -> Option<InlineGreeksComputer> {
-    // Phase 0 Item 7 follow-up (operator-locked 2026-05-13): scope-gate
-    // the inline Greeks enricher too. Under `IndicesUnderlyingsOnly` the
-    // tick-processor hot path skips Greeks enrichment entirely — operator's
-    // strategy uses underlying spot indicators, not streaming Delta/Theta/
-    // Vega per tick.
-    if !tickvault_app::phase2_recovery::should_spawn_greeks_pipeline(
-        config.subscription.scope,
-        config.greeks.enabled,
-    ) {
-        info!(
-            scope = config.subscription.scope.as_str(),
-            greeks_enabled = config.greeks.enabled,
-            "inline Greeks enricher disabled (config flag OFF or Phase 0 scope)"
-        );
-        return None;
-    }
-
-    let plan = match subscription_plan.as_ref() {
-        Some(p) => p,
-        None => {
-            info!("inline Greeks enricher skipped — no subscription plan");
-            return None;
-        }
-    };
-
-    // Compute today's date in IST for time-to-expiry calculation.
-    let today = (Utc::now()
-        + chrono::TimeDelta::seconds(tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64))
-    .date_naive();
-
-    // O(1) EXEMPT: cold path — clone registry once at startup for enricher.
-    let enricher = InlineGreeksComputer::new(
-        plan.registry.clone(),
-        config.greeks.risk_free_rate,
-        config.greeks.dividend_yield,
-        config.greeks.day_count,
-        today,
-    );
-
-    info!(
-        rate = config.greeks.risk_free_rate,
-        div = config.greeks.dividend_yield,
-        day_count = config.greeks.day_count,
-        %today,
-        "inline Greeks enricher created for tick processor"
-    );
-
-    Some(enricher)
+    _config: &ApplicationConfig,
+    _subscription_plan: &Option<SubscriptionPlan>,
+) -> Option<NoopGreeksEnricher> {
+    info!("inline Greeks enricher retired (PR #3) — tick processor runs without greeks");
+    None
 }
 
 // All pure helper function tests are in boot_helpers.rs (lib.rs target).
@@ -9307,15 +9220,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_greeks_pipeline_adds_ist_offset() {
-        // Greeks pipeline uses Utc::now() → must add IST offset.
-        let source = include_str!("greeks_pipeline.rs");
-        assert!(
-            source.contains("saturating_add(IST_UTC_OFFSET_NANOS)"),
-            "greeks pipeline MUST add IST_UTC_OFFSET_NANOS to Utc::now() timestamps"
-        );
-    }
+    // PR #3 (2026-05-19): `test_greeks_pipeline_adds_ist_offset` retired
+    // alongside the deleted `greeks_pipeline.rs` file.
 
     /// I12 ratchet: the HALT branch must embed `/v2/profile` +
     /// `/v2/ip/getIP` diagnostics in the Telegram message.
