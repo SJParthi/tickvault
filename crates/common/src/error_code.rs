@@ -86,12 +86,8 @@ pub enum ErrorCode {
     // -----------------------------------------------------------------------
     // Instrument — Priority 1
     // -----------------------------------------------------------------------
-    /// Daily CSV refresh scheduler boundary violation.
-    InstrumentP1DailyScheduler,
-    /// Delta detector missed a mutable field.
-    InstrumentP1DeltaFieldCoverage,
-    /// security_id reused across underlyings (add + expire collision).
-    InstrumentP1SecurityIdReuse,
+    // PR #6a (2026-05-19): I-P1-01 / I-P1-02 / I-P1-03 retired
+    // (daily_scheduler + delta_detector modules deleted under 4-IDX_I scope).
     /// Compound DEDUP key missing underlying_symbol.
     InstrumentP1CompoundDedupKey,
     /// Tick DEDUP key missing segment.
@@ -559,10 +555,7 @@ impl ErrorCode {
             Self::InstrumentP0CachePersistence => "I-P0-04",
             Self::InstrumentP0S3Backup => "I-P0-05",
             Self::InstrumentP0EmergencyDownload => "I-P0-06",
-            // Instrument P1
-            Self::InstrumentP1DailyScheduler => "I-P1-01",
-            Self::InstrumentP1DeltaFieldCoverage => "I-P1-02",
-            Self::InstrumentP1SecurityIdReuse => "I-P1-03",
+            // Instrument P1 — PR #6a (2026-05-19): I-P1-01 / I-P1-02 / I-P1-03 retired
             Self::InstrumentP1CompoundDedupKey => "I-P1-05",
             Self::InstrumentP1SegmentInTickDedup => "I-P1-06",
             Self::InstrumentP1SingleRowLifecycle => "I-P1-08",
@@ -771,7 +764,6 @@ impl ErrorCode {
             | Self::InstrumentP0CountConsistency
             | Self::InstrumentP0CachePersistence
             | Self::InstrumentP0S3Backup
-            | Self::InstrumentP1SecurityIdReuse
             | Self::InstrumentP1CrossSegmentCollision
             | Self::InstrumentP1SegmentInTickDedup
             | Self::InstrumentP1CompoundDedupKey
@@ -815,10 +807,9 @@ impl ErrorCode {
             // PR #1 (AWS-lifecycle) — Medium option-chain
             | Self::OptionChain03ParseFailed
             | Self::OptionChain04VerifyFailedVsWs => Severity::Medium,
-            // Low: scheduler / field coverage / trading-day / Dhan other
-            Self::InstrumentP1DailyScheduler
-            | Self::InstrumentP1DeltaFieldCoverage
-            | Self::InstrumentP2TradingDayGuard
+            // Low: trading-day / Dhan other
+            // PR #6a (2026-05-19): I-P1-01 (DailyScheduler) + I-P1-02 (DeltaFieldCoverage) retired
+            Self::InstrumentP2TradingDayGuard
             | Self::Dh910Other
             | Self::HotPath02WriterQueueDrop
             | Self::WsGap04PostCloseSleep
@@ -842,9 +833,7 @@ impl ErrorCode {
             | Self::InstrumentP0CachePersistence
             | Self::InstrumentP0S3Backup
             | Self::InstrumentP0EmergencyDownload
-            | Self::InstrumentP1DailyScheduler
-            | Self::InstrumentP1DeltaFieldCoverage
-            | Self::InstrumentP1SecurityIdReuse
+            // PR #6a (2026-05-19): I-P1-01 / I-P1-02 / I-P1-03 retired
             | Self::InstrumentP1CompoundDedupKey
             | Self::InstrumentP1SegmentInTickDedup
             | Self::InstrumentP1SingleRowLifecycle
@@ -991,9 +980,7 @@ impl ErrorCode {
             Self::InstrumentP0CachePersistence,
             Self::InstrumentP0S3Backup,
             Self::InstrumentP0EmergencyDownload,
-            Self::InstrumentP1DailyScheduler,
-            Self::InstrumentP1DeltaFieldCoverage,
-            Self::InstrumentP1SecurityIdReuse,
+            // PR #6a (2026-05-19): I-P1-01 / I-P1-02 / I-P1-03 retired
             Self::InstrumentP1CompoundDedupKey,
             Self::InstrumentP1SegmentInTickDedup,
             Self::InstrumentP1SingleRowLifecycle,
@@ -1324,7 +1311,11 @@ mod tests {
         // bumped 117 -> 113 by removing PHASE2-01, PHASE2-02, PHASE2-READY-01,
         // AUDIT-01 (Phase 2 stock-F&O dispatcher chain retired alongside
         // phase2_audit_persistence under operator-locked 4-IDX_I scope).
-        assert_eq!(ErrorCode::all().len(), 113);
+        // 2026-05-19 (PR #6a of AWS-lifecycle — universe support files retirement):
+        // bumped 113 -> 110 by removing I-P1-01 (DailyScheduler), I-P1-02
+        // (DeltaFieldCoverage), I-P1-03 (SecurityIdReuse) — daily_scheduler
+        // and delta_detector modules deleted under 4-IDX_I LOCKED_UNIVERSE.
+        assert_eq!(ErrorCode::all().len(), 110);
     }
 
     #[test]
