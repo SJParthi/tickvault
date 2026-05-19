@@ -137,6 +137,52 @@ fn indices4only_lock_no_retired_flag_in_crates() {
     );
 }
 
+/// Hotfix regression test (2026-05-19): `FnoUniverse::locked_4_idx_i()`
+/// fed through the planner MUST emit exactly the 4 LOCKED_UNIVERSE SIDs
+/// (NIFTY=13 + BANKNIFTY=25 + SENSEX=51 as MajorIndexValue, INDIA VIX=21
+/// as DisplayIndex). Before the hotfix the planner emitted only INDIA VIX
+/// (total=1) because the 3 majors live in `subscribed_indices` with
+/// `category=FnoUnderlying`, not in the empty `underlyings` HashMap.
+#[test]
+fn hotfix_locked_universe_planner_emits_all_4_idx_i_sids() {
+    use chrono::NaiveDate;
+    use std::collections::HashMap;
+    use tickvault_common::config::SubscriptionConfig;
+    use tickvault_common::instrument_types::FnoUniverse;
+    use tickvault_core::instrument::subscription_planner::build_subscription_plan;
+
+    let universe = FnoUniverse::locked_4_idx_i();
+    let cfg = SubscriptionConfig::default();
+    let today = NaiveDate::from_ymd_opt(2026, 5, 19).unwrap();
+    let plan = build_subscription_plan(&universe, &cfg, today, &HashMap::new(), None);
+
+    let emitted: std::collections::HashSet<u32> =
+        plan.registry.iter().map(|i| i.security_id).collect();
+
+    for sid in [13_u32, 25, 51, 21] {
+        assert!(
+            emitted.contains(&sid),
+            "LOCKED_UNIVERSE SID {sid} missing from plan — got {emitted:?}; \
+             total={}, major_index_values={}, display_indices={}",
+            plan.summary.total,
+            plan.summary.major_index_values,
+            plan.summary.display_indices,
+        );
+    }
+    assert_eq!(
+        plan.summary.total, 4,
+        "LOCK: planner must emit exactly 4 SIDs from LOCKED_UNIVERSE"
+    );
+    assert_eq!(
+        plan.summary.major_index_values, 3,
+        "LOCK: NIFTY + BANKNIFTY + SENSEX must be MajorIndexValue"
+    );
+    assert_eq!(
+        plan.summary.display_indices, 1,
+        "LOCK: INDIA VIX must be the only DisplayIndex"
+    );
+}
+
 #[test]
 fn indices4only_lock_planner_emits_4_idx_i_only() {
     // Verify the planner's helper functions return the LOCKED contract

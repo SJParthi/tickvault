@@ -290,13 +290,18 @@ pub fn build_subscription_plan(
     let full_chain_set: HashSet<&str> = FULL_CHAIN_INDEX_SYMBOLS.iter().copied().collect();
 
     // -----------------------------------------------------------------------
-    // 1. Major index value feeds (IDX_I) — 5 symbols
+    // 1a. Major index value feeds (IDX_I) — from `underlyings` HashMap
+    //
+    // Legacy path: pre-AWS-lifecycle the universe-builder populated
+    // `underlyings` for every F&O underlying (3 indices + 216 stocks). PR
+    // #6b retired the builder, so this HashMap is now empty under
+    // `FnoUniverse::locked_4_idx_i()`. The post-PR #6b path lives in
+    // section 1b below.
     // -----------------------------------------------------------------------
     for underlying in universe.underlyings.values() {
         if !full_chain_set.contains(underlying.underlying_symbol.as_str()) {
             continue;
         }
-        // Index value feed (IDX_I segment)
         if seen_ids.insert((underlying.price_feed_security_id, ExchangeSegment::IdxI)) {
             instruments.push(make_major_index_instrument(
                 underlying.price_feed_security_id,
@@ -307,11 +312,39 @@ pub fn build_subscription_plan(
     }
 
     // -----------------------------------------------------------------------
-    // 2. Display indices (IDX_I) — 23 symbols
+    // 1b. Major index value feeds (IDX_I) — from `subscribed_indices`
     //
-    // Phase 0 Item 1 (2026-05-13): under `IndicesUnderlyingsOnly` scope this
-    // loop is filtered to INDIA VIX only via `is_display_index_allowed_under_scope`.
-    // The other 22 sectoral/broad-market indices are PARKED until Phase 2.
+    // POST-AWS-LIFECYCLE FIX (hotfix 2026-05-19): `FnoUniverse::locked_4_idx_i()`
+    // populates `subscribed_indices` (not `underlyings`) for the 3 majors
+    // with `category = IndexCategory::FnoUnderlying`. Without this loop the
+    // planner emitted only INDIA VIX (the sole `DisplayIndex` in the LOCKED
+    // universe), shipping a 1-SID subscription instead of 4. Boot log:
+    //   "major_index_values":0, "display_indices":1, "total":1
+    // The planner now drains BOTH paths so legacy builder-populated runs
+    // (section 1a) AND the LOCKED-universe path (this section) both work.
+    // -----------------------------------------------------------------------
+    for index in &universe.subscribed_indices {
+        if index.category != IndexCategory::FnoUnderlying {
+            continue;
+        }
+        if !full_chain_set.contains(index.symbol.as_str()) {
+            continue;
+        }
+        if seen_ids.insert((index.security_id, ExchangeSegment::IdxI)) {
+            instruments.push(make_major_index_instrument(
+                index.security_id,
+                &index.symbol,
+                feed_mode,
+            ));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 2. Display indices (IDX_I)
+    //
+    // Under `Indices4Only` scope this loop is filtered to INDIA VIX only
+    // via `is_display_index_allowed_under_scope`. All other sectoral /
+    // broad-market display indices are PARKED.
     // -----------------------------------------------------------------------
     for index in &universe.subscribed_indices {
         if index.category == IndexCategory::DisplayIndex
@@ -781,7 +814,8 @@ pub fn build_subscription_plan_from_archived(
     }
 
     // -----------------------------------------------------------------------
-    // 1. Major index value feeds (IDX_I)
+    // 1a. Major index value feeds (IDX_I) — from `underlyings` HashMap
+    //     (legacy builder path; empty under post-PR #6b LOCKED universe)
     // -----------------------------------------------------------------------
     for underlying in universe.underlyings.values() {
         let symbol = underlying.underlying_symbol.as_str();
@@ -795,11 +829,30 @@ pub fn build_subscription_plan_from_archived(
     }
 
     // -----------------------------------------------------------------------
+    // 1b. Major index value feeds (IDX_I) — from `subscribed_indices`
+    //     (POST-AWS-LIFECYCLE hotfix 2026-05-19 — see sibling planner
+    //     section 1b for rationale)
+    // -----------------------------------------------------------------------
+    for index in universe.subscribed_indices.iter() {
+        let cat = IndexCategory::from(&index.category);
+        if cat != IndexCategory::FnoUnderlying {
+            continue;
+        }
+        let symbol = index.symbol.as_str();
+        if !full_chain_set.contains(symbol) {
+            continue;
+        }
+        let sec_id = index.security_id.to_native();
+        if seen_ids.insert((sec_id, ExchangeSegment::IdxI)) {
+            instruments.push(make_major_index_instrument(sec_id, symbol, feed_mode));
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // 2. Display indices (IDX_I)
     //
-    // Phase 0 Item 1 (archived path mirror): filtered to INDIA VIX only
-    // under `IndicesUnderlyingsOnly` scope via
-    // `is_display_index_allowed_under_scope`.
+    // Under `Indices4Only` scope this loop is filtered to INDIA VIX only
+    // via `is_display_index_allowed_under_scope`.
     // -----------------------------------------------------------------------
     for index in universe.subscribed_indices.iter() {
         let cat = IndexCategory::from(&index.category);
