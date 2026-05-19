@@ -5339,21 +5339,11 @@ async fn main() -> Result<()> {
 
     info!(address = %bind_addr, "API server listening");
 
-    // Auto-open Portal and Market Dashboard in browser (API server now ready).
-    // Best-effort: non-blocking, logged on failure.
-    //
-    // Audit Finding #9 (2026-05-03): gated on `cfg.api.auto_open_portal`
-    // so AWS / headless deployments can disable the spurious browser
-    // shell-out. Default `true` preserves the local-dev experience.
-    if config.api.auto_open_portal {
-        tokio::spawn(async {
-            crate::infra::open_in_browser("http://localhost:3001/portal/options-chain").await;
-        });
-    } else {
-        info!(
-            "skipping portal auto-open (api.auto_open_portal = false; expected on AWS / headless deploy)"
-        );
-    }
+    // PR #7d (2026-05-19): `/portal/*` HTML frontend retired. The
+    // post-boot browser auto-open + `api.auto_open_portal` config flag
+    // are both gone. Replacement surface for operator UX is Grafana
+    // (auto-opened above by the infra block), Telegram alerts, MCP
+    // tools, and the QuestDB Console at `localhost:9000`.
 
     let api_handle = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, router).await {

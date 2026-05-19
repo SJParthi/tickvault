@@ -65,25 +65,6 @@ async fn test_get_stats_returns_200() {
 // test_get_stock_indices_returns_200_or_404 retired with the 3 index-constituency
 // routes under 4-IDX_I LOCKED_UNIVERSE.
 
-/// `POST /api/instruments/rebuild` must be reachable and return 200.
-///
-/// NOTE: GAP-SEC-01 bearer token auth middleware exists in `middleware.rs`
-/// but is not yet wired into `build_router`. When wired, this test should
-/// be updated to verify 401 without auth and 200 with valid bearer token.
-#[tokio::test]
-async fn test_post_rebuild_returns_200() {
-    let router = build_router(test_state(), &[], true);
-
-    let request = Request::builder()
-        .method("POST")
-        .uri("/api/instruments/rebuild")
-        .body(Body::empty())
-        .expect("request build should succeed"); // APPROVED: test-only
-
-    let response = router
-        .oneshot(request)
-        .await
-        .expect("router should respond"); // APPROVED: test-only
-
-    assert_eq!(response.status(), StatusCode::OK);
-}
+// PR #6b (2026-05-19): `test_post_rebuild_returns_200` retired with
+// the /api/instruments/rebuild route + instruments handler.
+// PR #7d (2026-05-19) cleanup: this comment formalises the retirement.

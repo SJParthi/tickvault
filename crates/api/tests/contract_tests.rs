@@ -2,7 +2,7 @@
 //!
 //! These tests ensure the API endpoints return well-formed responses
 //! that match the documented schema. Any change to response structure
-//! breaks downstream consumers (frontend portal, Grafana dashboards).
+//! breaks downstream consumers (Grafana dashboards, MCP tools).
 
 use std::sync::Arc;
 

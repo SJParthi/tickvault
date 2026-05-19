@@ -64,13 +64,6 @@ async fn unknown_route_returns_404() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
-#[tokio::test]
-async fn portal_endpoint_returns_200() {
-    let router = build_router(test_state(), &[], true);
-    let request = Request::builder()
-        .uri("/portal")
-        .body(Body::empty())
-        .unwrap();
-    let response = router.oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-}
+// PR #7d (2026-05-19): `portal_endpoint_returns_200` retired with the
+// /portal/* frontend deletion. Operator-locked replacement surface is
+// Grafana / Telegram / MCP / QuestDB Console.

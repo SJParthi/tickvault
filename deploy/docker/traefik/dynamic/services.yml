@@ -47,9 +47,10 @@ http:
       entryPoints: [web]
       priority: 70
 
-    # All other app routes: /api/*, /portal/* — protected with basicAuth
+    # PR #7d (2026-05-19): /portal/* HTML frontend retired. Only /api/*
+    # routes remain (health, stats, quote, debug). Protected with basicAuth.
     app-api:
-      rule: "PathPrefix(`/api`) || PathPrefix(`/portal`)"
+      rule: "PathPrefix(`/api`)"
       service: app
       entryPoints: [web]
       middlewares: [dev-basic-auth]
