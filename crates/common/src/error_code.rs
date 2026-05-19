@@ -70,18 +70,11 @@ pub enum ErrorCode {
     // -----------------------------------------------------------------------
     // Instrument — Priority 0 (data-loss / correctness)
     // -----------------------------------------------------------------------
-    /// Duplicate security_id rejected at CSV parse.
-    InstrumentP0DuplicateSecurityId,
-    /// Derivative count below minimum threshold post-build.
-    InstrumentP0CountConsistency,
+    // PR #6b (2026-05-19): I-P0-01 / I-P0-02 / I-P0-04 / I-P0-05 / I-P0-06 RETIRED
+    // (universe_builder + validation + binary_cache + s3_backup + instrument_loader
+    // modules deleted under 4-IDX_I LOCKED_UNIVERSE).
     /// Expired contract reached OMS submit Gate 4.
     InstrumentP0ExpiryAtGate4,
-    /// Cache directory on tmpfs — not persistent.
-    InstrumentP0CachePersistence,
-    /// S3 remote backup configuration invalid.
-    InstrumentP0S3Backup,
-    /// Emergency download override triggered during market hours.
-    InstrumentP0EmergencyDownload,
 
     // -----------------------------------------------------------------------
     // Instrument — Priority 1
@@ -548,13 +541,8 @@ impl ErrorCode {
     #[must_use]
     pub const fn code_str(self) -> &'static str {
         match self {
-            // Instrument P0
-            Self::InstrumentP0DuplicateSecurityId => "I-P0-01",
-            Self::InstrumentP0CountConsistency => "I-P0-02",
+            // Instrument P0 — PR #6b (2026-05-19): I-P0-01/02/04/05/06 retired
             Self::InstrumentP0ExpiryAtGate4 => "I-P0-03",
-            Self::InstrumentP0CachePersistence => "I-P0-04",
-            Self::InstrumentP0S3Backup => "I-P0-05",
-            Self::InstrumentP0EmergencyDownload => "I-P0-06",
             // Instrument P1 — PR #6a (2026-05-19): I-P1-01 / I-P1-02 / I-P1-03 retired
             Self::InstrumentP1CompoundDedupKey => "I-P1-05",
             Self::InstrumentP1SegmentInTickDedup => "I-P1-06",
@@ -705,7 +693,6 @@ impl ErrorCode {
             | Self::AuthGapDisconnectTokenMap
             | Self::OmsGapCircuitBreaker
             | Self::OmsGapDryRunSafety
-            | Self::InstrumentP0EmergencyDownload
             | Self::Boot02DeadlineExceeded
             | Self::Boot03ClockSkewExceeded
             | Self::Selftest02Failed
@@ -760,11 +747,8 @@ impl ErrorCode {
             // PR #2.5 — INDEX-OHLC-02 is High (carry-over wrong but recoverable)
             | Self::IndexOhlc02DailyResetFailed => Severity::High,
             // Medium: data pipeline correctness
-            Self::InstrumentP0DuplicateSecurityId
-            | Self::InstrumentP0CountConsistency
-            | Self::InstrumentP0CachePersistence
-            | Self::InstrumentP0S3Backup
-            | Self::InstrumentP1CrossSegmentCollision
+            // PR #6b (2026-05-19): I-P0-01/02/04/05 retired with their modules.
+            Self::InstrumentP1CrossSegmentCollision
             | Self::InstrumentP1SegmentInTickDedup
             | Self::InstrumentP1CompoundDedupKey
             | Self::InstrumentP1SingleRowLifecycle
@@ -827,12 +811,8 @@ impl ErrorCode {
     #[must_use]
     pub const fn runbook_path(self) -> &'static str {
         match self {
-            Self::InstrumentP0DuplicateSecurityId
-            | Self::InstrumentP0CountConsistency
-            | Self::InstrumentP0ExpiryAtGate4
-            | Self::InstrumentP0CachePersistence
-            | Self::InstrumentP0S3Backup
-            | Self::InstrumentP0EmergencyDownload
+            // PR #6b (2026-05-19): I-P0-01/02/04/05/06 retired with their modules.
+            Self::InstrumentP0ExpiryAtGate4
             // PR #6a (2026-05-19): I-P1-01 / I-P1-02 / I-P1-03 retired
             | Self::InstrumentP1CompoundDedupKey
             | Self::InstrumentP1SegmentInTickDedup
@@ -974,12 +954,8 @@ impl ErrorCode {
     #[must_use]
     pub fn all() -> &'static [ErrorCode] {
         &[
-            Self::InstrumentP0DuplicateSecurityId,
-            Self::InstrumentP0CountConsistency,
+            // PR #6b (2026-05-19): I-P0-01/02/04/05/06 retired with their modules.
             Self::InstrumentP0ExpiryAtGate4,
-            Self::InstrumentP0CachePersistence,
-            Self::InstrumentP0S3Backup,
-            Self::InstrumentP0EmergencyDownload,
             // PR #6a (2026-05-19): I-P1-01 / I-P1-02 / I-P1-03 retired
             Self::InstrumentP1CompoundDedupKey,
             Self::InstrumentP1SegmentInTickDedup,
@@ -1315,7 +1291,13 @@ mod tests {
         // bumped 113 -> 110 by removing I-P1-01 (DailyScheduler), I-P1-02
         // (DeltaFieldCoverage), I-P1-03 (SecurityIdReuse) — daily_scheduler
         // and delta_detector modules deleted under 4-IDX_I LOCKED_UNIVERSE.
-        assert_eq!(ErrorCode::all().len(), 110);
+        // 2026-05-19 (PR #6b of AWS-lifecycle — universe machinery deletion):
+        // bumped 110 -> 105 by removing I-P0-01 (DuplicateSecurityId),
+        // I-P0-02 (CountConsistency), I-P0-04 (CachePersistence),
+        // I-P0-05 (S3Backup), I-P0-06 (EmergencyDownload) — universe_builder
+        // + validation + binary_cache + s3_backup + instrument_loader modules
+        // deleted under 4-IDX_I LOCKED_UNIVERSE.
+        assert_eq!(ErrorCode::all().len(), 105);
     }
 
     #[test]
