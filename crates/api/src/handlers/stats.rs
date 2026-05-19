@@ -163,7 +163,6 @@ mod tests {
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
             },
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(crate::state::SystemHealthStatus::new()),
         );
         let result = get_stats(State(state)).await;
@@ -527,7 +526,6 @@ mod tests {
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
             },
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(crate::state::SystemHealthStatus::new()),
         );
         let result = get_stats(axum::extract::State(state)).await;

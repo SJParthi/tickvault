@@ -10,7 +10,7 @@ use axum::extract::State;
 use serde::Serialize;
 use tracing::{info, warn};
 
-use tickvault_core::instrument::run_instrument_diagnostic;
+// PR #6a (2026-05-19): run_instrument_diagnostic import retired with the diagnostic module.
 use tickvault_core::instrument::try_rebuild_instruments;
 
 use crate::state::SharedAppState;
@@ -133,30 +133,8 @@ async fn do_rebuild(state: &SharedAppState) -> Json<RebuildResponse> {
     build_rebuild_response(result)
 }
 
-/// Produces a JSON error object when report serialization fails.
-/// B4: Returns generic message — full error logged server-side, not exposed via API.
-fn diagnostic_serialization_fallback(err: serde_json::Error) -> serde_json::Value {
-    warn!(%err, "instrument diagnostic serialization failed");
-    serde_json::json!({"error": "serialization failed — check server logs"})
-}
-
-/// `GET /api/instruments/diagnostic` — full instrument system health check.
-///
-/// Downloads CSV, validates headers, parses rows, builds universe, and
-/// reports detailed status for each step.
-pub async fn instrument_diagnostic(State(state): State<SharedAppState>) -> Json<serde_json::Value> {
-    let dhan = state.dhan_config();
-    let inst = state.instrument_config();
-
-    let report = run_instrument_diagnostic(
-        &dhan.instrument_csv_url,
-        &dhan.instrument_csv_fallback_url,
-        inst,
-    )
-    .await;
-
-    Json(serde_json::to_value(report).unwrap_or_else(diagnostic_serialization_fallback))
-}
+// PR #6a (2026-05-19): instrument_diagnostic handler + diagnostic_serialization_fallback
+// helper RETIRED with the diagnostic module.
 
 #[cfg(test)]
 mod tests {
@@ -266,7 +244,6 @@ mod tests {
                 build_window_start: "00:00:00".to_string(),
                 build_window_end: "23:59:59".to_string(),
             },
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(crate::state::SystemHealthStatus::new()),
         )
     }
@@ -319,15 +296,8 @@ mod tests {
     // Handler tests: instrument_diagnostic
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_instrument_diagnostic_returns_json_value() {
-        let state = test_state();
-
-        let Json(result) = instrument_diagnostic(State(state)).await;
-
-        // Should always return a JSON value, even when CSV is unreachable
-        assert!(result.is_object());
-    }
+    // PR #6a (2026-05-19): test_instrument_diagnostic_returns_json_value retired
+    // with the instrument_diagnostic handler.
 
     // -----------------------------------------------------------------------
     // Handler tests: do_rebuild inner function directly
@@ -391,7 +361,6 @@ mod tests {
                 build_window_start: "00:00:00".to_string(),
                 build_window_end: "23:59:59".to_string(),
             },
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(crate::state::SystemHealthStatus::new()),
         );
 
@@ -537,40 +506,5 @@ mod tests {
         assert!(resp.message.contains("check server logs"));
     }
 
-    // -----------------------------------------------------------------------
-    // instrument_diagnostic: serde_json::to_value error fallback
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_serde_serialization_error_fallback_format() {
-        // The unwrap_or_else fallback on the diagnostic endpoint handles
-        // serialization errors. We verify the fallback format directly since
-        // serde_json::to_value on a well-formed DiagnosticReport never fails.
-        let err = serde_json::Error::io(std::io::Error::other("simulated"));
-        let fallback = serde_json::json!({"error": format!("serialization failed: {err}")});
-        assert!(fallback.is_object());
-        assert!(
-            fallback
-                .get("error")
-                .unwrap()
-                .as_str()
-                .unwrap()
-                .contains("serialization failed")
-        );
-    }
-
-    #[test]
-    fn test_diagnostic_serialization_fallback_produces_error_json() {
-        let err = serde_json::Error::io(std::io::Error::other("test error"));
-        let result = diagnostic_serialization_fallback(err);
-        assert!(result.is_object());
-        let error_msg = result.get("error").unwrap().as_str().unwrap();
-        assert!(error_msg.contains("serialization failed"));
-        // B4: Internal error details must NOT leak to API response.
-        assert!(
-            !error_msg.contains("test error"),
-            "internal error details must be redacted from API response"
-        );
-        assert!(error_msg.contains("check server logs"));
-    }
+    // PR #6a (2026-05-19): instrument_diagnostic fallback tests retired with the handler.
 }

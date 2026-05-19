@@ -1,16 +1,15 @@
 //! Shared application state for the API server.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 
 /// Timeout for QuestDB HTTP queries from API handlers (seconds).
 const QUESTDB_HTTP_CLIENT_TIMEOUT_SECS: u64 = 10;
 
 use tickvault_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
-use tickvault_common::instrument_types::IndexConstituencyMap;
 
-/// Shared handle to the index constituency map (Arc<RwLock<Option<...>>>).
-pub type SharedConstituencyMap = Arc<RwLock<Option<IndexConstituencyMap>>>;
+// PR #6a (2026-05-19): SharedConstituencyMap + IndexConstituencyMap import RETIRED
+// (4-IDX_I LOCKED_UNIVERSE — NSE index composition not tracked).
 
 /// Shared handle to system health status for the `/health` endpoint.
 pub type SharedHealthStatus = Arc<SystemHealthStatus>;
@@ -263,8 +262,7 @@ struct AppStateInner {
     instrument_config: InstrumentConfig,
     /// Concurrency guard: prevents concurrent instrument rebuilds.
     rebuild_in_progress: AtomicBool,
-    /// Shared index constituency map.
-    constituency_map: SharedConstituencyMap,
+    // PR #6a (2026-05-19): constituency_map field RETIRED (4-IDX_I scope).
     /// Subsystem health status for the `/health` endpoint.
     health_status: SharedHealthStatus,
     /// Shared HTTP client for QuestDB queries (connection pooling + keep-alive).
@@ -278,7 +276,6 @@ impl SharedAppState {
         questdb_config: QuestDbConfig,
         dhan_config: DhanConfig,
         instrument_config: InstrumentConfig,
-        constituency_map: SharedConstituencyMap,
         health_status: SharedHealthStatus,
     ) -> Self {
         // Single shared HTTP client for all QuestDB queries (connection pooling).
@@ -296,7 +293,6 @@ impl SharedAppState {
                 dhan_config,
                 instrument_config,
                 rebuild_in_progress: AtomicBool::new(false),
-                constituency_map,
                 health_status,
                 questdb_http_client,
             }),
@@ -329,10 +325,7 @@ impl SharedAppState {
         &self.inner.rebuild_in_progress
     }
 
-    /// Returns the shared index constituency map handle.
-    pub fn constituency_map(&self) -> &SharedConstituencyMap {
-        &self.inner.constituency_map
-    }
+    // PR #6a (2026-05-19): constituency_map accessor RETIRED (4-IDX_I scope).
 
     /// Returns the shared system health status handle.
     pub fn health_status(&self) -> &SharedHealthStatus {
@@ -375,9 +368,7 @@ mod tests {
     // PR #2 (2026-05-18): empty_snapshot() helper retired alongside
     // the deleted SharedTopMoversSnapshot type.
 
-    fn empty_constituency() -> SharedConstituencyMap {
-        std::sync::Arc::new(std::sync::RwLock::new(None))
-    }
+    // PR #6a (2026-05-19): empty_constituency() helper retired.
 
     fn test_health_status() -> SharedHealthStatus {
         Arc::new(SystemHealthStatus::new())
@@ -395,7 +386,6 @@ mod tests {
             config,
             test_dhan_config(),
             test_instrument_config(),
-            empty_constituency(),
             test_health_status(),
         );
         assert_eq!(state.questdb_config().host, "test-host");
@@ -417,7 +407,6 @@ mod tests {
             config,
             test_dhan_config(),
             test_instrument_config(),
-            empty_constituency(),
             test_health_status(),
         );
         let state2 = state1.clone();
@@ -563,7 +552,6 @@ mod tests {
             },
             test_dhan_config(),
             test_instrument_config(),
-            empty_constituency(),
             test_health_status(),
         );
         assert_eq!(state.dhan_config().websocket_url, "wss://api-feed.dhan.co");
@@ -581,7 +569,6 @@ mod tests {
             },
             test_dhan_config(),
             test_instrument_config(),
-            empty_constituency(),
             test_health_status(),
         );
         assert_eq!(state.instrument_config().csv_download_timeout_secs, 120);
@@ -598,7 +585,6 @@ mod tests {
             },
             test_dhan_config(),
             test_instrument_config(),
-            empty_constituency(),
             test_health_status(),
         );
         // Initially false
@@ -624,7 +610,6 @@ mod tests {
             },
             test_dhan_config(),
             test_instrument_config(),
-            empty_constituency(),
             health,
         );
         assert_eq!(state.health_status().overall_status(), "healthy");
@@ -635,23 +620,7 @@ mod tests {
     // removed alongside the deleted accessor and the SharedTopMoversSnapshot
     // type.
 
-    #[test]
-    fn test_shared_app_state_constituency_map_accessor() {
-        let state = SharedAppState::new(
-            QuestDbConfig {
-                host: "test".to_string(),
-                http_port: 9000,
-                pg_port: 8812,
-                ilp_port: 9009,
-            },
-            test_dhan_config(),
-            test_instrument_config(),
-            empty_constituency(),
-            test_health_status(),
-        );
-        let map = state.constituency_map();
-        assert!(map.read().unwrap().is_none());
-    }
+    // PR #6a (2026-05-19): test_shared_app_state_constituency_map_accessor RETIRED.
 
     // -------------------------------------------------------------------
     // SystemHealthStatus: toggle operations

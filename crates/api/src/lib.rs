@@ -119,27 +119,16 @@ pub fn build_router_with_auth(
         // queries are meaningless. The handlers, the `top_movers` /
         // `option_movers` modules, and the `movers_v2` REST handler
         // were deleted alongside the movers pipeline.
-        .route(
-            "/api/instruments/diagnostic",
-            axum::routing::get(handlers::instruments::instrument_diagnostic),
-        )
+        // PR #6a (2026-05-19): /api/instruments/diagnostic route RETIRED with diagnostic module.
         .route("/portal", axum::routing::get(handlers::static_file::portal))
         .route(
             "/portal/options-chain",
             axum::routing::get(handlers::static_file::options_chain),
         )
-        .route(
-            "/api/index-constituency",
-            axum::routing::get(handlers::index_constituency::get_constituency_summary),
-        )
-        .route(
-            "/api/index-constituency/{index_name}",
-            axum::routing::get(handlers::index_constituency::get_index_constituents),
-        )
-        .route(
-            "/api/stock-indices/{symbol}",
-            axum::routing::get(handlers::index_constituency::get_stock_indices),
-        )
+        // PR #6a (2026-05-19): 3 index-constituency routes RETIRED under
+        // 4-IDX_I LOCKED_UNIVERSE. NSE index composition (which stocks are
+        // in NIFTY, etc.) isn't needed when only the 4 indices themselves
+        // are tracked.
         .route(
             "/api/option-chain",
             axum::routing::get(handlers::option_chain::get_option_chain),
@@ -334,7 +323,6 @@ mod tests {
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
             },
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(state::SystemHealthStatus::new()),
         );
         // Production-style call: SecretString → from_token → build_router_with_auth.
@@ -372,7 +360,6 @@ mod tests {
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
             },
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(state::SystemHealthStatus::new()),
         );
         // dry_run=true → TV_API_TOKEN not needed
@@ -407,7 +394,6 @@ mod tests {
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
             },
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(state::SystemHealthStatus::new()),
         );
         let origins = vec![
@@ -453,7 +439,6 @@ mod tests {
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
             },
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(state::SystemHealthStatus::new()),
         );
         let router = build_router(state, &[], true);
@@ -507,7 +492,6 @@ mod tests {
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
             },
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(state::SystemHealthStatus::new()),
         );
         let router = build_router(state, &[], true);
@@ -557,7 +541,6 @@ mod tests {
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
             },
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(state::SystemHealthStatus::new()),
         );
         let origins = vec!["http://localhost:3000".to_string()];
@@ -597,7 +580,6 @@ mod tests {
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
             },
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(state::SystemHealthStatus::new()),
         );
         let router = build_router(state, &[], true);

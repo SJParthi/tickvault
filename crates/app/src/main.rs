@@ -58,7 +58,6 @@ use tickvault_core::instrument::binary_cache::read_binary_cache;
 use tickvault_core::instrument::subscription_planner::SubscriptionPlan;
 use tickvault_core::instrument::{
     InstrumentLoadResult, build_subscription_plan, load_or_build_instruments,
-    run_instrument_diagnostic,
 };
 use tickvault_core::network::ip_verifier;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
@@ -1104,41 +1103,9 @@ async fn main() -> Result<()> {
     }
 
     // -----------------------------------------------------------------------
-    // CLI: --instrument-diagnostic (run diagnostic and exit)
-    // -----------------------------------------------------------------------
-    if std::env::args().any(|arg| arg == "--instrument-diagnostic") {
-        info!("running instrument diagnostic (--instrument-diagnostic flag detected)");
-        let report = run_instrument_diagnostic(
-            &config.dhan.instrument_csv_url,
-            &config.dhan.instrument_csv_fallback_url,
-            &config.instrument,
-        )
-        .await;
-
-        let json = serde_json::to_string_pretty(&report)
-            .unwrap_or_else(|err| format!("{{\"error\": \"serialization failed: {err}\"}}"));
-        #[allow(clippy::print_stdout)] // APPROVED: CLI diagnostic output to stdout, not logging
-        {
-            println!("{json}"); // APPROVED: CLI diagnostic requires stdout output
-        }
-
-        if report.healthy {
-            info!("instrument diagnostic: ALL CHECKS PASSED");
-        } else {
-            let failed: Vec<_> = report
-                .checks
-                .iter()
-                .filter(|c| !c.passed)
-                .map(|c| c.name.as_str())
-                .collect();
-            error!(
-                failed_checks = ?failed,
-                "instrument diagnostic: SOME CHECKS FAILED"
-            );
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
+    // PR #6a (2026-05-19): --instrument-diagnostic CLI flag RETIRED
+    // (4-IDX_I LOCKED_UNIVERSE — diagnostic.rs module deleted; no CSV
+    // download/parse/validate cycle to diagnose).
 
     // -----------------------------------------------------------------------
     // Two-Phase Boot: fast path ONLY during market hours on trading days.
@@ -2067,50 +2034,16 @@ async fn main() -> Result<()> {
         // --- Background: Index constituency (best-effort) ---
         // During market hours, skip network downloads to niftyindices.com
         // (they often return HTML instead of CSV) and use the cached JSON.
-        // Fresh download happens on non-market-hours boot or post-market.
-        let bg_constituency = if is_market_hours {
-            info!(
-                "market hours — using cached constituency data (skipping niftyindices.com download)"
-            );
-            tickvault_core::index_constituency::try_load_cache(
-                &config.instrument.csv_cache_directory,
-            )
-            .await
-        } else {
-            tickvault_core::index_constituency::download_and_build_constituency_map(
-                &config.index_constituency,
-                &config.instrument.csv_cache_directory,
-            )
-            .await
-        };
-
-        // Persist constituency to QuestDB for Grafana (best-effort, non-blocking).
-        // Enrich with security_ids from instrument master for news-based trading.
-        if let Some(ref map) = bg_constituency {
-            match tickvault_storage::constituency_persistence::persist_constituency(
-                map,
-                &config.questdb,
-                fresh_universe.as_ref(),
-            ) {
-                Ok(()) => {}
-                Err(err) => {
-                    tracing::warn!(
-                        ?err,
-                        "index constituency QuestDB persistence failed (best-effort)"
-                    );
-                }
-            }
-        }
-
-        let bg_shared_constituency: tickvault_api::state::SharedConstituencyMap =
-            std::sync::Arc::new(std::sync::RwLock::new(bg_constituency));
+        // PR #6a (2026-05-19): index-constituency loader RETIRED under
+        // 4-IDX_I LOCKED_UNIVERSE (operator lock 2026-05-15). NSE index
+        // composition (which stocks are in NIFTY, etc.) isn't needed when
+        // only the 4 indices themselves are tracked.
 
         // --- Background: API server ---
         let api_state = SharedAppState::new(
             config.questdb.clone(),
             config.dhan.clone(),
             config.instrument.clone(),
-            bg_shared_constituency,
             health_status,
         );
 
@@ -3829,69 +3762,13 @@ async fn main() -> Result<()> {
             );
         }
 
-        // Wave 5 Item 26 L2 LIVE — 16:30 IST bhavcopy cross-check task.
-        // Post-market only (TradingCalendar gated); reads `movers_1s`
-        // for our captured EOD volumes, downloads NSE bhavcopy ZIP via
-        // `unzip` shell, parses, cross-checks with 0.1% tolerance, writes
-        // audit rows to `volume_nse_audit`, emits Telegram summary.
-        let bhavcopy_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-        let bhavcopy_registry =
-            std::sync::Arc::clone(slow_registry.as_ref().unwrap_or_else(|| {
-                // Fallback: if slow_registry is None (boot-bypass scenarios),
-                // use a fresh empty Arc — the supplier returns empty contracts
-                // and the cycle reports MISSING_OUR for every NSE row.
-                // Operator triages the empty universe via dashboards.
-                unreachable!("slow_registry is required for slow-boot path")
-            }));
-        let _bhavcopy_handle = tickvault_app::bhavcopy_pipeline::spawn_bhavcopy_scheduler_task(
-            config.questdb.clone(),
-            {
-                let reg = std::sync::Arc::clone(&bhavcopy_registry);
-                move || {
-                    // Snapshot the registry's derivative contracts at
-                    // each 16:30 IST cycle. Builds `DerivativeContract`
-                    // from `SubscribedInstrument` fields. Filters to
-                    // future/option derivatives only (skips IDX_I and
-                    // NSE_EQ since bhavcopy is NSE_FNO-only). Empty
-                    // Vec if registry empty — bhavcopy reports
-                    // MISSING_OUR for every NSE row, which is correct.
-                    use tickvault_common::instrument_types::{
-                        DerivativeContract, DhanInstrumentKind,
-                    };
-                    reg.iter()
-                        .filter_map(|inst| {
-                            let kind = inst.instrument_kind?;
-                            // Bhavcopy is F&O — skip indices + cash equities.
-                            match kind {
-                                DhanInstrumentKind::FutureIndex
-                                | DhanInstrumentKind::FutureStock
-                                | DhanInstrumentKind::OptionIndex
-                                | DhanInstrumentKind::OptionStock => {}
-                            }
-                            let expiry_date = inst.expiry_date?;
-                            Some(DerivativeContract {
-                                security_id: inst.security_id,
-                                underlying_symbol: inst.underlying_symbol.clone(),
-                                instrument_kind: kind,
-                                exchange_segment: inst.exchange_segment,
-                                expiry_date,
-                                strike_price: inst.strike_price.unwrap_or(0.0),
-                                option_type: inst.option_type,
-                                // Bhavcopy lookup only uses underlying_symbol +
-                                // expiry_date + strike_price + option_type.
-                                // Fill the rest with safe defaults.
-                                lot_size: 0,
-                                tick_size: 0.0,
-                                symbol_name: inst.display_label.clone(),
-                                display_name: inst.display_label.clone(),
-                            })
-                        })
-                        .collect()
-                }
-            },
-            std::sync::Arc::clone(&notifier),
-            std::sync::Arc::clone(&bhavcopy_shutdown),
-        );
+        // PR #6a (2026-05-19): bhavcopy 16:30 IST cross-check task RETIRED.
+        // Under 4-IDX_I LOCKED_UNIVERSE (operator lock 2026-05-15) there are
+        // no F&O subscriptions to cross-check against NSE bhavcopy. The
+        // bhavcopy_cross_check + bhavcopy_fetcher + bhavcopy_scheduler modules
+        // and the bhavcopy_pipeline.rs app-side runner are all deleted.
+        // volume_nse_audit QuestDB table is KEPT on disk per SEBI 5-year
+        // retention pending operator-triggered DROP TABLE migration.
 
         // Parthiban directive (2026-04-21): no-tick-during-market-hours
         // watchdog (slow boot path). Same pattern as fast boot above.
@@ -5407,78 +5284,19 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 10.5: Index constituency data (best-effort, NON-BLOCKING)
     // -----------------------------------------------------------------------
-    // Constituency downloads are moved to background to prevent boot timeout.
-    // niftyindices.com often returns HTML instead of CSV, causing 91s+ retries
-    // that pushed boot past the 120s deadline.
-    let shared_constituency: tickvault_api::state::SharedConstituencyMap =
-        std::sync::Arc::new(std::sync::RwLock::new(None));
-
-    // During market hours: load from cache synchronously (fast, no network).
-    // Outside market hours: spawn background download (non-blocking).
-    if is_market_hours {
-        info!("market hours — using cached constituency data (skipping niftyindices.com download)");
-        let cached = tickvault_core::index_constituency::try_load_cache(
-            &config.instrument.csv_cache_directory,
-        )
-        .await;
-        if let Some(ref map) = cached
-            && let Err(err) = tickvault_storage::constituency_persistence::persist_constituency(
-                map,
-                &config.questdb,
-                slow_boot_universe.as_ref(),
-            )
-        {
-            tracing::warn!(
-                ?err,
-                "index constituency QuestDB persistence failed (best-effort)"
-            );
-        }
-        if let Ok(mut lock) = shared_constituency.write() {
-            *lock = cached;
-        }
-    } else {
-        // Background download — does not block boot sequence.
-        let bg_constituency = shared_constituency.clone();
-        let bg_index_config = config.index_constituency.clone();
-        let bg_cache_dir = config.instrument.csv_cache_directory.clone();
-        let bg_questdb_config = config.questdb.clone();
-        let bg_universe = slow_boot_universe.clone();
-        tokio::spawn(async move {
-            let map = tickvault_core::index_constituency::download_and_build_constituency_map(
-                &bg_index_config,
-                &bg_cache_dir,
-            )
-            .await;
-            if let Some(ref m) = map
-                && let Err(err) = tickvault_storage::constituency_persistence::persist_constituency(
-                    m,
-                    &bg_questdb_config,
-                    bg_universe.as_ref(),
-                )
-            {
-                tracing::warn!(
-                    ?err,
-                    "index constituency QuestDB persistence failed (best-effort)"
-                );
-            }
-            if let Ok(mut lock) = bg_constituency.write() {
-                *lock = map;
-            }
-        });
-    }
+    // PR #6a (2026-05-19): index-constituency loader RETIRED under
+    // 4-IDX_I LOCKED_UNIVERSE. NSE index composition (which stocks are in
+    // NIFTY, etc.) isn't needed when only the 4 indices themselves are
+    // tracked. The niftyindices.com download was previously gated behind
+    // is_market_hours to avoid blocking boot; both paths now removed.
 
     // -----------------------------------------------------------------------
     // Step 11: Start axum API server
     // -----------------------------------------------------------------------
-    // PR #2 (2026-05-18): the Phase 4a `movers_v2_enabled` gate and
-    // the `new_with_cascade_fanout` constructor were removed alongside
-    // the deleted `/api/movers/v2` route. AppState is constructed
-    // unconditionally via `new()`.
     let api_state = SharedAppState::new(
         config.questdb.clone(),
         config.dhan.clone(),
         config.instrument.clone(),
-        shared_constituency.clone(),
         health_status,
     );
 

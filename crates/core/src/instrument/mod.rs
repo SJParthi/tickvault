@@ -7,16 +7,15 @@
 //! # Boot Sequence Position
 //! Config -> **Instrument Download -> Universe Build** -> Auth -> WebSocket
 
-pub mod bhavcopy_cross_check;
-pub mod bhavcopy_fetcher;
-pub mod bhavcopy_scheduler;
+// PR #6a (2026-05-19): bhavcopy_cross_check + bhavcopy_fetcher + bhavcopy_scheduler
+// DELETED — 16:30 IST NSE bhavcopy cross-check retired under 4-IDX_I LOCKED_UNIVERSE.
 pub mod binary_cache;
 pub mod csv_downloader;
 pub mod csv_parser;
-pub mod daily_scheduler;
-pub mod delta_detector;
+// PR #6a (2026-05-19): daily_scheduler + delta_detector RETIRED
+// (4-IDX_I LOCKED_UNIVERSE — no daily Dhan CSV refresh = no day-over-day delta).
 // PR #4 (2026-05-19): 6 depth modules DELETED.
-pub mod diagnostic;
+// PR #6a (2026-05-19): diagnostic module RETIRED (no CSV download/parse/validate cycle).
 // PR #4 (2026-05-19): `dynamic_subscription_state` module DELETED
 // (depth-only diff state machine; no consumers under 4-IDX_I scope).
 pub mod instrument_loader;
@@ -29,7 +28,7 @@ pub mod universe_builder;
 pub mod validation;
 
 pub use binary_cache::MappedUniverse;
-pub use diagnostic::run_instrument_diagnostic;
+// PR #6a (2026-05-19): pub use diagnostic::run_instrument_diagnostic RETIRED.
 pub use instrument_loader::{
     InstrumentLoadResult, load_or_build_instruments, try_rebuild_instruments,
 };
