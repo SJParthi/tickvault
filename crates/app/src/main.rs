@@ -556,7 +556,7 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // STAGE-C: WebSocket frame WAL (write-ahead log) — durable spill
     //
-    // Every raw WS frame (4 types: LiveFeed, Depth20, Depth200, OrderUpdate)
+    // Every raw WS frame (2 types: LiveFeed, OrderUpdate)
     // is appended to an append-only log on disk BEFORE the live try_send to
     // the downstream channel. On boot, any residual WAL segments are
     // replayed so frames captured across a crash are not lost. This backs
@@ -564,29 +564,17 @@ async fn main() -> Result<()> {
     //
     // Directory layout: $TV_WS_WAL_DIR (defaults to `./data/ws_wal`).
     // Writer thread: background OS thread spawned inside WsFrameSpill::new.
+    //
+    // Depth-20/Depth-200 paths retired per operator lock 2026-05-15
+    // (websocket-connection-scope-lock.md). The Depth20/Depth200 variants
+    // remain in `ws_frame_spill::WsType` as orphan; any replayed records
+    // of those types are silently dropped here.
     // -----------------------------------------------------------------------
     let ws_wal_dir = std::env::var("TV_WS_WAL_DIR").unwrap_or_else(|_| "./data/ws_wal".to_string()); // O(1) EXEMPT: boot-time
     let ws_wal_path = std::path::PathBuf::from(&ws_wal_dir);
     // Replay first — this MUST happen before any WS connection opens so we
     // never race a fresh append against a stale segment rotation.
-    //
-    // STAGE-C.2b: Recovered frames are retained per-type in the four
-    // Vecs below and drained into the live pipeline after the
-    // corresponding downstream sink is constructed:
-    //
-    //   - LiveFeed        → `pool.frame_sender_clone()` once the pool is built
-    //   - Depth-20        → temporary DeepDepthWriter (Stage-D drain helper)
-    //   - Depth-200       → temporary DeepDepthWriter (Stage-D drain helper)
-    //   - OrderUpdate     → `order_update_sender.send()` once the broadcast is built
-    //
-    // All four sinks are idempotent via QuestDB dedup keys (`STORAGE-GAP-01`
-    // for ticks, compound `(security_id, segment, received_at_nanos, side)`
-    // for depth) and/or via the downstream broadcast consumer's own OMS
-    // idempotency — replaying the same WAL record any number of times
-    // yields at most one durable row per logical record.
     let mut ws_wal_replay_live_feed: Vec<bytes::Bytes> = Vec::new();
-    let mut ws_wal_replay_depth_20: Vec<Vec<u8>> = Vec::new();
-    let mut ws_wal_replay_depth_200: Vec<Vec<u8>> = Vec::new();
     let mut ws_wal_replay_order_update: Vec<Vec<u8>> = Vec::new();
     match tickvault_storage::ws_frame_spill::replay_all(&ws_wal_path) {
         Ok(recovered) => {
@@ -594,8 +582,6 @@ async fn main() -> Result<()> {
                 info!(dir = %ws_wal_dir, "STAGE-C: WAL replay — no residual frames");
             } else {
                 let mut live = 0u64;
-                let mut d20 = 0u64;
-                let mut d200 = 0u64;
                 let mut ord = 0u64;
                 for rec in recovered {
                     match rec.ws_type {
@@ -603,38 +589,25 @@ async fn main() -> Result<()> {
                             live += 1;
                             ws_wal_replay_live_feed.push(bytes::Bytes::from(rec.frame));
                         }
-                        tickvault_storage::ws_frame_spill::WsType::Depth20 => {
-                            d20 += 1;
-                            ws_wal_replay_depth_20.push(rec.frame);
-                        }
-                        tickvault_storage::ws_frame_spill::WsType::Depth200 => {
-                            d200 += 1;
-                            ws_wal_replay_depth_200.push(rec.frame);
-                        }
                         tickvault_storage::ws_frame_spill::WsType::OrderUpdate => {
                             ord += 1;
                             ws_wal_replay_order_update.push(rec.frame);
                         }
+                        // Depth retired — drop any residual frames.
+                        _ => {}
                     }
                 }
                 info!(
                     dir = %ws_wal_dir,
-                    total = live + d20 + d200 + ord,
+                    total = live + ord,
                     live_feed = live,
-                    depth_20 = d20,
-                    depth_200 = d200,
                     order_update = ord,
                     "STAGE-C: WAL replay recovered residual frames — LiveFeed will be \
-                     re-injected into pool mpsc; Depth-20/Depth-200 drained into QuestDB \
-                     via Stage-D drain helper; OrderUpdate drained into broadcast once \
+                     re-injected into pool mpsc; OrderUpdate drained into broadcast once \
                      sender is created"
                 );
                 metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "live_feed")
                     .increment(live);
-                metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "depth_20")
-                    .increment(d20);
-                metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "depth_200")
-                    .increment(d200);
                 metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "order_update")
                     .increment(ord);
             }
@@ -645,78 +618,6 @@ async fn main() -> Result<()> {
                 dir = %ws_wal_dir,
                 "STAGE-C: WAL replay failed — continuing boot with fresh WAL"
             );
-        }
-    }
-
-    // STAGE-C.2b: Drain Depth-20 and Depth-200 recovered frames into
-    // QuestDB immediately — these paths write directly to the
-    // persistence sink and do not require any in-flight channel. The
-    // compound dedup key makes replay idempotent. LiveFeed and
-    // OrderUpdate drains happen later once their channels exist.
-    if !ws_wal_replay_depth_20.is_empty() {
-        let frames = std::mem::take(&mut ws_wal_replay_depth_20);
-        let (parsed, persisted, parse_errors, persist_errors) =
-            tickvault_app::boot_helpers::drain_replayed_depth_frames_to_questdb(
-                frames,
-                &config.questdb,
-                "20",
-                "depth-20",
-            );
-        info!(
-            parsed,
-            persisted,
-            parse_errors,
-            persist_errors,
-            "STAGE-C.2b: Depth-20 WAL replay drain complete"
-        );
-        metrics::counter!("tv_ws_frame_wal_reinjected_total", "ws_type" => "depth_20")
-            .increment(persisted);
-        if parse_errors > 0 {
-            metrics::counter!(
-                "tv_ws_frame_wal_reinjected_parse_errors_total",
-                "ws_type" => "depth_20"
-            )
-            .increment(parse_errors);
-        }
-        if persist_errors > 0 {
-            metrics::counter!(
-                "tv_ws_frame_wal_reinjected_dropped_total",
-                "ws_type" => "depth_20"
-            )
-            .increment(persist_errors);
-        }
-    }
-    if !ws_wal_replay_depth_200.is_empty() {
-        let frames = std::mem::take(&mut ws_wal_replay_depth_200);
-        let (parsed, persisted, parse_errors, persist_errors) =
-            tickvault_app::boot_helpers::drain_replayed_depth_frames_to_questdb(
-                frames,
-                &config.questdb,
-                "200",
-                "depth-200",
-            );
-        info!(
-            parsed,
-            persisted,
-            parse_errors,
-            persist_errors,
-            "STAGE-C.2b: Depth-200 WAL replay drain complete"
-        );
-        metrics::counter!("tv_ws_frame_wal_reinjected_total", "ws_type" => "depth_200")
-            .increment(persisted);
-        if parse_errors > 0 {
-            metrics::counter!(
-                "tv_ws_frame_wal_reinjected_parse_errors_total",
-                "ws_type" => "depth_200"
-            )
-            .increment(parse_errors);
-        }
-        if persist_errors > 0 {
-            metrics::counter!(
-                "tv_ws_frame_wal_reinjected_dropped_total",
-                "ws_type" => "depth_200"
-            )
-            .increment(persist_errors);
         }
     }
     let ws_frame_spill = match tickvault_storage::ws_frame_spill::WsFrameSpill::new(&ws_wal_path) {
@@ -3003,7 +2904,8 @@ async fn main() -> Result<()> {
         tickvault_storage::indicator_snapshot_persistence::ensure_indicator_snapshot_table(
             &config.questdb
         ),
-        tickvault_storage::deep_depth_persistence::ensure_deep_depth_table(&config.questdb),
+        // PR #4 (2026-05-19): `ensure_deep_depth_table` retired alongside
+        // the deleted depth-20/200 pipelines (operator lock 2026-05-15).
         tickvault_storage::obi_persistence::ensure_obi_table(&config.questdb),
         // Wave 1 Item 4.2 — un-deprecated previous_close table. Schema
         // includes the new `source` column (CODE6 / QUOTE_CLOSE /
@@ -3013,15 +2915,8 @@ async fn main() -> Result<()> {
         // Wave 2 Item 9 (G18) — 6 audit-trail tables. SEBI-relevant.
         // 90d hot → S3 IT → Glacier per `aws-budget.md`.
         tickvault_storage::phase2_audit_persistence::ensure_phase2_audit_table(&config.questdb),
-        tickvault_storage::depth_rebalance_audit_persistence::ensure_depth_rebalance_audit_table(
-            &config.questdb
-        ),
-        // PR-C2 (depth-dynamic redesign) — audit table for incremental
-        // diff-based resubscribe events emitted by `depth_dynamic_pipeline_v2`.
-        // Schema-self-heal pattern: idempotent CREATE-IF-NOT-EXISTS.
-        tickvault_storage::depth_dynamic_diff_audit_persistence::ensure_depth_dynamic_diff_audit_table(
-            &config.questdb
-        ),
+        // PR #4 (2026-05-19): depth_rebalance_audit + depth_dynamic_diff_audit
+        // tables retired alongside the deleted depth-20/200 pipelines.
         tickvault_storage::ws_reconnect_audit_persistence::ensure_ws_reconnect_audit_table(
             &config.questdb
         ),
@@ -3823,11 +3718,9 @@ async fn main() -> Result<()> {
     // /api/movers handler (commit 4) reads from the canonical
     // movers_1s + 25 mat views via QuestDB SQL.
 
-    // Plan item H (2026-04-25): SharedSpotPrices map shared between movers
-    // (Premium/Discount routing) + depth ATM selection. Created OUTSIDE the
-    // processor scope so Step 8c.0 (below) can clone the same Arc.
-    let shared_spot_prices_for_movers =
-        tickvault_core::instrument::depth_rebalancer::new_shared_spot_prices();
+    // PR #4 (2026-05-19): SharedSpotPrices map RETIRED — depth-20/200 +
+    // movers pipelines that consumed it are deleted per operator lock
+    // 2026-05-15 (websocket-connection-scope-lock.md).
 
     let processor_handle = if let Some(receiver) = pool_receiver {
         let candle_agg = Some(tickvault_core::pipeline::CandleAggregator::new());
@@ -4000,491 +3893,6 @@ async fn main() -> Result<()> {
             std::sync::Arc::clone(&notifier),
             std::sync::Arc::clone(&bhavcopy_shutdown),
         );
-
-        // Wave 5 Items 4+5 LIVE — depth-20 conn-5 dynamic top-50 + depth-200
-        // dynamic top-5 orchestrator. Off by default; flip
-        // `[features] depth_dynamic_top_volume = true` to activate.
-        //
-        // Wiring contract: the orchestrator OWNS the Sender side of the
-        // command channels here. The Receiver side must be picked up by
-        // the depth-conn-pool refactor (separate sub-PR) which spawns:
-        //   * 1 dedicated depth-20 conn 5 (subscribes/swaps via the
-        //     `depth_20_conn5_rx` receiver)
-        //   * 5 depth-200 conns indexed 0..4 (each consumes its
-        //     `depth_200_slot_N_rx` receiver)
-        //
-        // Until that refactor lands, the orchestrator's `cmd_tx.send()`
-        // calls will fail (no receiver task) → DEPTH-DYN-02 fires on
-        // every 60s cycle inside market hours. That's the visible
-        // signal the operator uses to schedule the conn-pool refactor.
-        // PR-C2 cutover gate. When `[features].depth_dynamic_pipeline_v2 = true`,
-        // the unified pipeline_v2 path replaces BOTH the Wave 5 orchestrator
-        // block below AND the single-side static depth-20 spawn block at
-        // line ~4118. Default: false (Wave 5 path active for safe rollback).
-        //
-        // Phase 0 Item 3 (operator-locked 2026-05-13): `should_spawn_depth_dynamic_pipeline`
-        // returns FALSE under `SubscriptionScope::IndicesUnderlyingsOnly`
-        // regardless of the feature flag — Phase 0 LEAN MVP parks depth
-        // feeds entirely (option-buying strategy uses underlying ticks only).
-        let pipeline_v2_active =
-            tickvault_app::phase2_recovery::should_spawn_depth_dynamic_pipeline(
-                config.subscription.scope,
-                config.features.depth_dynamic_pipeline_v2,
-            );
-        if pipeline_v2_active {
-            tracing::info!(
-                "PR-C2 cutover: depth_dynamic_pipeline_v2 feature ON — \
-                 spawning 5×depth-20 + 5×depth-200 deferred minimal_conns + \
-                 unified spawn_depth_dynamic_pool orchestrators"
-            );
-
-            // Validate config invariants BEFORE any spawn. Halt boot on
-            // misconfiguration (per per-wave-guarantee-matrix.md row 4 +
-            // disaster-recovery.md "fail-fast at boot" rule).
-            if let Err(e) = config.depth_20.dynamic.assert_invariants(
-                "depth_20",
-                tickvault_common::constants::MAX_TWENTY_DEPTH_CONNECTIONS,
-            ) {
-                anyhow::bail!("invalid [depth_20.dynamic] config: {e}");
-            }
-            if let Err(e) = config.depth_200.dynamic.assert_invariants(
-                "depth_200",
-                tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS,
-            ) {
-                anyhow::bail!("invalid [depth_200.dynamic] config: {e}");
-            }
-            // PR-C2 follow-up H4 — soft warning if either pool is below
-            // Dhan cap. Operator may legitimately deploy a smaller pool
-            // for testing, so this is WARN-only (not fatal).
-            if let Some(w) = config.depth_20.dynamic.under_provisioned_warning(
-                "depth_20",
-                tickvault_common::constants::MAX_TWENTY_DEPTH_CONNECTIONS,
-            ) {
-                tracing::warn!("PR-C2 H4: {w}");
-            }
-            if let Some(w) = config.depth_200.dynamic.under_provisioned_warning(
-                "depth_200",
-                tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS,
-            ) {
-                tracing::warn!("PR-C2 H4: {w}");
-            }
-
-            let v2_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-
-            // ----- Depth-20: 5 deferred minimal_conns -----
-            let mut d20_v2_cmd_senders: std::collections::HashMap<
-                u8,
-                tokio::sync::mpsc::Sender<tickvault_core::websocket::DepthCommand>,
-            > = std::collections::HashMap::new();
-            for slot in 0..config.depth_20.dynamic.conns {
-                let (tx, rx) =
-                    tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
-                d20_v2_cmd_senders.insert(slot, tx);
-                tickvault_app::depth_20_conn_spawner::spawn_depth_20_minimal_conn(
-                    tickvault_app::depth_20_conn_spawner::Depth20MinimalConnInputs {
-                        token_handle: token_handle.clone(),
-                        ws_client_id: ws_client_id.clone(),
-                        label: format!("V2-DYN-20-SLOT-{slot}"),
-                        instruments: Vec::new(), // DEFERRED — pool sends Add20
-                        cmd_rx: rx,
-                        questdb_config: config.questdb.clone(),
-                        notifier: notifier.clone(),
-                        health_status: health_status.clone(),
-                        ws_frame_spill: ws_frame_spill.clone(),
-                    },
-                );
-            }
-
-            let d20_pipeline_cfg = tickvault_app::depth_dynamic_pipeline_v2::PipelineConfig {
-                questdb: config.questdb.clone(),
-                selector:
-                    tickvault_core::instrument::depth_dynamic_top_volume_selector::SelectorConfig {
-                        instrument_types: config.depth_20.dynamic.universe.instrument_types.clone(),
-                        exchange_segments: config
-                            .depth_20
-                            .dynamic
-                            .universe
-                            .exchange_segments
-                            .clone(),
-                        k: usize::from(config.depth_20.dynamic.conns)
-                            * usize::from(config.depth_20.dynamic.sids_per_conn),
-                    },
-                shape: tickvault_core::instrument::dynamic_subscription_state::PoolShape {
-                    conns: config.depth_20.dynamic.conns,
-                    sids_per_conn: config.depth_20.dynamic.sids_per_conn,
-                },
-                label: "depth-20-dynamic",
-                // Audit-2026-05-03 redesign: thread the operator's
-                // [depth_*.dynamic.universe] min_liquidity_volume +
-                // window_secs through to the pipeline. The legacy
-                // cohort_size top-N param was retired — only liquid
-                // contracts (volume >= min_liquidity_volume) qualify
-                // for depth subscription per operator clarification.
-                min_liquidity_volume: config.depth_20.dynamic.universe.min_liquidity_volume,
-                window_secs: config.depth_20.dynamic.universe.window_secs,
-                // 2026-05-02 — operator-requested symbol-level Telegram
-                // diff event. Registry resolves (sid, segment) → display
-                // label per I-P1-11 composite key. Notifier dispatches
-                // `DepthDynamicV2DiffApplied` events on every non-no-op cycle.
-                registry: slow_registry.clone(),
-                notifier: Some(notifier.clone()),
-                // 2026-05-09 PR 5c.2 — RAM-first cohort fetch via the
-                // in-RAM CascadeFanout. Falls back to the legacy
-                // `movers_1m` SQL path automatically when the snapshot
-                // is empty (early boot before the cascade is primed).
-                cascade: Some(std::sync::Arc::new(cascade_fanout.clone())),
-            };
-            let d20_pipeline_handle =
-                tickvault_app::depth_dynamic_pipeline_v2::spawn_depth_dynamic_pool(
-                    d20_pipeline_cfg,
-                    d20_v2_cmd_senders,
-                    std::sync::Arc::clone(&v2_shutdown),
-                );
-            // Hostile-bug-hunt H1 fix — capture JoinHandle and detect
-            // a silent panic in the orchestrator. Mirrors the Wave 5
-            // pattern at the legacy orchestrator block (M2 watchdog).
-            tokio::spawn(async move {
-                match d20_pipeline_handle.await {
-                    Ok(()) => {
-                        tracing::info!(
-                            "depth-20-dynamic v2 orchestrator exited cleanly (shutdown signalled)"
-                        );
-                    }
-                    Err(err) if err.is_panic() => {
-                        tracing::error!(
-                            ?err,
-                            "depth-20-dynamic v2 orchestrator task PANICKED — \
-                             5 conns will stop receiving Add/Remove cmds; \
-                             operator MUST restart the app to recover"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            ?err,
-                            "depth-20-dynamic v2 orchestrator task cancelled (shutdown race)"
-                        );
-                    }
-                }
-            });
-
-            // ----- Depth-200: 5 deferred minimal_conns -----
-            let mut d200_v2_cmd_senders: std::collections::HashMap<
-                u8,
-                tokio::sync::mpsc::Sender<tickvault_core::websocket::DepthCommand>,
-            > = std::collections::HashMap::new();
-            // PR-B (2026-05-02): boot-smoke counter shared across all 5
-            // depth-200 receivers. See `crates/app/src/boot_smoke_test.rs`.
-            let v2_d200_frame_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-            for slot in 0..config.depth_200.dynamic.conns {
-                let (tx, rx) =
-                    tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
-                d200_v2_cmd_senders.insert(slot, tx);
-                let stagger_ms = u64::from(slot)
-                    .saturating_mul(tickvault_core::websocket::DEPTH_200_INITIAL_STAGGER_MS);
-                tickvault_app::depth_20_conn_spawner::spawn_depth_200_minimal_conn(
-                    tickvault_app::depth_20_conn_spawner::Depth200MinimalConnInputs {
-                        token_handle: token_handle.clone(),
-                        ws_client_id: ws_client_id.clone(),
-                        label: format!("V2-DYN-200-SLOT-{slot}"),
-                        exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
-                        security_id: None, // DEFERRED — pool sends Add200
-                        cmd_rx: rx,
-                        questdb_config: config.questdb.clone(),
-                        notifier: notifier.clone(),
-                        health_status: health_status.clone(),
-                        ws_frame_spill: ws_frame_spill.clone(),
-                        initial_stagger_ms: stagger_ms,
-                        depth_200_frame_counter: Some(std::sync::Arc::clone(
-                            &v2_d200_frame_counter,
-                        )),
-                    },
-                );
-            }
-            // Hostile-bug-hunt smoke-test fix: SKIP `spawn_depth_200_boot_smoke_test`
-            // in v2 mode. The smoke test deadline is 60s — but in v2 the
-            // first dispatch fires at t=60s (RESELECT_INTERVAL_SECS) and
-            // the first frame typically arrives at t=62-65s (handshake +
-            // first stream frame), so the smoke test would fire DEPTH200-
-            // SMOKE-01 Critical at every clean v2 boot.
-            // Drop the v2_d200_frame_counter — pipeline_v2's own
-            // observability (`tv_depth_dynamic_set_size{feed}` gauge +
-            // alert `tv-depth-dynamic-set-size-low`) covers the same
-            // failure mode without the 60s race.
-            drop(v2_d200_frame_counter);
-
-            let d200_pipeline_cfg = tickvault_app::depth_dynamic_pipeline_v2::PipelineConfig {
-                questdb: config.questdb.clone(),
-                selector:
-                    tickvault_core::instrument::depth_dynamic_top_volume_selector::SelectorConfig {
-                        instrument_types: config
-                            .depth_200
-                            .dynamic
-                            .universe
-                            .instrument_types
-                            .clone(),
-                        exchange_segments: config
-                            .depth_200
-                            .dynamic
-                            .universe
-                            .exchange_segments
-                            .clone(),
-                        k: usize::from(config.depth_200.dynamic.conns)
-                            * usize::from(config.depth_200.dynamic.sids_per_conn),
-                    },
-                shape: tickvault_core::instrument::dynamic_subscription_state::PoolShape {
-                    conns: config.depth_200.dynamic.conns,
-                    sids_per_conn: config.depth_200.dynamic.sids_per_conn,
-                },
-                label: "depth-200-dynamic",
-                // Audit-2026-05-03: same min-volume liquidity gate as depth-20.
-                min_liquidity_volume: config.depth_200.dynamic.universe.min_liquidity_volume,
-                window_secs: config.depth_200.dynamic.universe.window_secs,
-                registry: slow_registry.clone(),
-                notifier: Some(notifier.clone()),
-                // 2026-05-09 PR 5c.2 — RAM-first cohort fetch via the
-                // in-RAM CascadeFanout. Falls back to the legacy
-                // `movers_1m` SQL path automatically when the snapshot
-                // is empty (early boot before the cascade is primed).
-                cascade: Some(std::sync::Arc::new(cascade_fanout.clone())),
-            };
-            let d200_pipeline_handle =
-                tickvault_app::depth_dynamic_pipeline_v2::spawn_depth_dynamic_pool(
-                    d200_pipeline_cfg,
-                    d200_v2_cmd_senders,
-                    v2_shutdown,
-                );
-            // Hostile-bug-hunt H1 fix — capture JoinHandle for panic detection.
-            tokio::spawn(async move {
-                match d200_pipeline_handle.await {
-                    Ok(()) => {
-                        tracing::info!(
-                            "depth-200-dynamic v2 orchestrator exited cleanly (shutdown signalled)"
-                        );
-                    }
-                    Err(err) if err.is_panic() => {
-                        tracing::error!(
-                            ?err,
-                            "depth-200-dynamic v2 orchestrator task PANICKED — \
-                             5 slots will stop receiving Add/Remove cmds; \
-                             operator MUST restart the app"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            ?err,
-                            "depth-200-dynamic v2 orchestrator task cancelled (shutdown race)"
-                        );
-                    }
-                }
-            });
-            tracing::info!(
-                "PR-C2 cutover: depth_dynamic_pipeline_v2 spawn complete \
-                 (depth-20: {}×{} = {} SIDs; depth-200: {}×{} = {} SIDs)",
-                config.depth_20.dynamic.conns,
-                config.depth_20.dynamic.sids_per_conn,
-                usize::from(config.depth_20.dynamic.conns)
-                    * usize::from(config.depth_20.dynamic.sids_per_conn),
-                config.depth_200.dynamic.conns,
-                config.depth_200.dynamic.sids_per_conn,
-                usize::from(config.depth_200.dynamic.conns)
-                    * usize::from(config.depth_200.dynamic.sids_per_conn),
-            );
-        } else if config.features.depth_dynamic_top_volume {
-            tracing::info!(
-                "Wave 5 Items 4+5: depth_dynamic_top_volume feature ON — \
-                 spawning orchestrator + receiver-side dynamic depth-20 conn 5"
-            );
-            let depth_dyn_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-
-            // Depth-20 conn 5 dynamic top-50: orchestrator (Sender) +
-            // receiver-side WS connection (Receiver). Wave 5 commit 2.
-            //
-            // The orchestrator owns the Sender side and emits Swap20 /
-            // InitialSubscribe20 every 60s based on `option_movers`
-            // top-50 by `change_pct DESC`, SENSEX excluded. The receiver
-            // side here spawns a real depth-20 WS connection in DEFERRED
-            // mode (empty initial instruments) — the orchestrator's first
-            // cycle InitialSubscribe20 populates the SID list.
-            let (d20_conn5_cmd_tx, d20_conn5_cmd_rx) =
-                tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
-
-            tickvault_app::depth_20_conn_spawner::spawn_depth_20_minimal_conn(
-                tickvault_app::depth_20_conn_spawner::Depth20MinimalConnInputs {
-                    token_handle: token_handle.clone(),
-                    ws_client_id: ws_client_id.clone(),
-                    label: "DYN-TOP50".to_string(),
-                    instruments: Vec::new(), // DEFERRED — orchestrator sends InitialSubscribe20
-                    cmd_rx: d20_conn5_cmd_rx,
-                    questdb_config: config.questdb.clone(),
-                    notifier: notifier.clone(),
-                    health_status: health_status.clone(),
-                    ws_frame_spill: ws_frame_spill.clone(),
-                },
-            );
-
-            // M2 — JoinHandle panic watchdog: capture the orchestrator
-            // handle and spawn a tiny supervisor that awaits panic. The
-            // orchestrator is the SOLE Sender side of conn 5's command
-            // channel; if it panics silently, the receiver-side WS conn
-            // 5 stays connected but never receives Swap20 / InitialSubscribe20
-            // — manifests as "depth-20 conn 5 connected but no data flowing".
-            // Detect-only (no respawn): the orchestrator holds 60s tick
-            // state and a clean restart is safer than a partial respawn.
-            // Operator action: restart the app on this Telegram.
-            let d20_dyn_handle =
-                tickvault_app::depth_dynamic_pipeline::spawn_depth_20_dynamic_conn5_task(
-                    config.questdb.clone(),
-                    d20_conn5_cmd_tx,
-                    std::sync::Arc::clone(&depth_dyn_shutdown),
-                );
-            tokio::spawn(async move {
-                match d20_dyn_handle.await {
-                    Ok(()) => {
-                        tracing::info!(
-                            "depth-20 dynamic conn 5 orchestrator exited cleanly \
-                             (shutdown signalled)"
-                        );
-                    }
-                    Err(err) if err.is_panic() => {
-                        tracing::error!(
-                            ?err,
-                            "depth-20 dynamic conn 5 orchestrator task PANICKED — \
-                             conn 5 will stop receiving Swap20 commands; operator \
-                             MUST restart the app to recover dynamic top-50 swaps"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            ?err,
-                            "depth-20 dynamic conn 5 orchestrator task cancelled \
-                             (likely shutdown race)"
-                        );
-                    }
-                }
-            });
-
-            // Depth-200 dynamic pool (5 slots). One channel + receiver
-            // depth-200 WS connection per slot. Wave 5 commit 3.
-            //
-            // The orchestrator owns Sender<DepthCommand> per slot and
-            // emits Swap200 / InitialSubscribe200 every 60s based on
-            // `option_movers` top-5 by `change_pct DESC`, SENSEX excluded.
-            // Receiver-side connections start in DEFERRED mode (sid=None)
-            // — orchestrator's first cycle InitialSubscribe200 populates
-            // each slot's contract. Initial-connect stagger spreads the
-            // 5 first-connect handshakes over 10s to avoid Dhan TCP-RST
-            // storm (per audit-findings 2026-04-24 Fix C).
-            // H1 capacity assertion: depth-200 dynamic pool MUST equal
-            // MAX_TWO_HUNDRED_DEPTH_CONNECTIONS (=5). The Dhan 5-conn cap
-            // per pool is documented in `dhan-ref/04-full-market-depth`;
-            // a future commit accidentally widening this bound would be
-            // silently rejected by Dhan. Compile-time assertion here
-            // catches the regression at boot, NOT at first market-open.
-            const _D200_POOL_SIZE_INVARIANT: () = assert!(
-                tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS == 5,
-                "Wave 5 commit 3 depth-200 pool sized for exactly 5 slots; \
-                 update the spawn loop range AND this assertion together."
-            );
-            let mut d200_cmd_senders = std::collections::HashMap::new();
-            let mut d200_dyn_spawn_count: usize = 0;
-
-            // PR-B (2026-05-02): one shared atomic counter incremented by all
-            // 5 depth-200 receivers on every frame. The boot smoke test polls
-            // this counter for the first ≥ 1 transition. See
-            // `crates/app/src/boot_smoke_test.rs` for classifier + emission.
-            let depth_200_frame_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-            for slot in 0..tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS {
-                let (tx, rx) =
-                    tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
-                d200_cmd_senders.insert(slot, tx);
-
-                // Depth-200 reuses the shared TOTP/APP token handle
-                // (Ticket #5610706 — Dhan removed the SELF-only gate).
-                let depth200_token = token_handle.clone();
-                let stagger_ms = (slot as u64)
-                    .saturating_mul(tickvault_core::websocket::DEPTH_200_INITIAL_STAGGER_MS);
-                tickvault_app::depth_20_conn_spawner::spawn_depth_200_minimal_conn(
-                    tickvault_app::depth_20_conn_spawner::Depth200MinimalConnInputs {
-                        token_handle: depth200_token,
-                        ws_client_id: ws_client_id.clone(),
-                        label: format!("DYN-200-SLOT-{slot}"),
-                        exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
-                        security_id: None, // DEFERRED — orchestrator sends InitialSubscribe200
-                        cmd_rx: rx,
-                        questdb_config: config.questdb.clone(),
-                        notifier: notifier.clone(),
-                        health_status: health_status.clone(),
-                        ws_frame_spill: ws_frame_spill.clone(),
-                        initial_stagger_ms: stagger_ms,
-                        depth_200_frame_counter: Some(std::sync::Arc::clone(
-                            &depth_200_frame_counter,
-                        )),
-                    },
-                );
-                d200_dyn_spawn_count = d200_dyn_spawn_count.saturating_add(1);
-            }
-
-            // PR-B: spawn the boot-time depth-200 smoke test once all 5
-            // slots are wired. Off-hours boots produce a `Skipped` log and
-            // exit at the deadline; in-market boots emit `Passed` (Info)
-            // on the first frame or `Failed` (Critical, DEPTH200-SMOKE-01)
-            // at the deadline if zero frames arrived.
-            tickvault_app::boot_smoke_test::spawn_depth_200_boot_smoke_test(std::sync::Arc::clone(
-                &depth_200_frame_counter,
-            ));
-            // H1 + M3 — runtime invariant: spawn loop emitted exactly 5 conns.
-            // Saturating add means a logic bug (e.g. early break) leaves the
-            // counter < 5; a duplicate spawn could push it > 5. Both fail.
-            assert_eq!(
-                d200_dyn_spawn_count,
-                tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS,
-                "Wave 5: depth-200 dynamic pool spawned {d200_dyn_spawn_count} \
-                 conns; expected exactly {} per Dhan 5-conn cap.",
-                tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS
-            );
-            // M2 — JoinHandle panic watchdog (depth-200 5-slot pool).
-            // Symmetric with the conn 5 watchdog above. The 5 minimal
-            // depth-200 conns block on InitialSubscribe200 from this
-            // orchestrator; if it panics, all 5 stay in DEFERRED mode
-            // forever (no contract subscribed). Operator restart required.
-            let d200_dyn_handle =
-                tickvault_app::depth_dynamic_pipeline::spawn_depth_200_dynamic_pool_task(
-                    config.questdb.clone(),
-                    d200_cmd_senders,
-                    std::sync::Arc::clone(&depth_dyn_shutdown),
-                );
-            tokio::spawn(async move {
-                match d200_dyn_handle.await {
-                    Ok(()) => {
-                        tracing::info!(
-                            "depth-200 dynamic pool orchestrator exited cleanly \
-                             (shutdown signalled)"
-                        );
-                    }
-                    Err(err) if err.is_panic() => {
-                        tracing::error!(
-                            ?err,
-                            "depth-200 dynamic pool orchestrator task PANICKED — \
-                             all 5 depth-200 slots stuck in DEFERRED mode; operator \
-                             MUST restart the app to resume top-5 contract subscription"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            ?err,
-                            "depth-200 dynamic pool orchestrator task cancelled \
-                             (likely shutdown race)"
-                        );
-                    }
-                }
-            });
-        } else {
-            tracing::info!(
-                "Wave 5 Items 4+5: depth_dynamic_top_volume feature OFF (default) — \
-                 dynamic top-volume orchestrator NOT spawned; legacy depth pool active"
-            );
-        }
 
         // Parthiban directive (2026-04-21): no-tick-during-market-hours
         // watchdog (slow boot path). Same pattern as fast boot above.
@@ -4779,210 +4187,24 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 8c.0: SharedSpotPrices — capture index LTP for depth ATM selection
+    // Step 8d: PR #4 (2026-05-19) — depth-20/200 rebalancer RETIRED per
+    // operator lock 2026-05-15 (websocket-connection-scope-lock.md).
+    // The pre-open snapshotter + Phase 2 recovery + readiness/heartbeat
+    // schedulers + SLO score scheduler remain inside this block because
+    // they are not depth-specific.
     // -----------------------------------------------------------------------
-    // Must be created BEFORE depth connections so we can wait for the first
-    // index LTP before selecting ATM strikes. The spot price updater subscribes
-    // to the tick broadcast and extracts index LTPs.
-    //
-    // 2026-04-25: reuse the SharedSpotPrices map created earlier (above the
-    // movers v2 pipeline spawn, plan item H). Both subsystems share one map
-    // so the spot updater task at the bottom of this block populates LTPs
-    // visible to depth ATM selection AND movers Premium/Discount routing.
-    let shared_spot_prices = std::sync::Arc::clone(&shared_spot_prices_for_movers);
-    if should_connect_ws {
-        let spot_prices_updater = std::sync::Arc::clone(&shared_spot_prices);
-        let mut spot_rx = tick_broadcast_sender.subscribe();
-
-        // Wave-5 indices-only scope (PR #509): only IDX_I (NIFTY/BANKNIFTY/SENSEX)
-        // spot prices are needed downstream — depth rebalancer + greeks. The
-        // legacy `live_tick_atm_resolver` helpers (`build_full_chain_index_lookup`
-        // + `classify_tick_for_spot_update` + `partition_resolved_and_stragglers`)
-        // were stock-F&O ATM resolution scaffolding and are dead under
-        // indices-only. The IDX_I lookup is inlined here; stock LTP capture is
-        // dropped entirely.
-        // APPROVED: I-P1-11 — `index_lookup` is single-segment IDX_I by construction.
-        let index_lookup: std::collections::HashMap<u32, &'static str> = {
-            let mut m = std::collections::HashMap::with_capacity(3);
-            m.insert(13_u32, "NIFTY");
-            m.insert(25_u32, "BANKNIFTY");
-            m.insert(51_u32, "SENSEX");
-            m
-        };
-        const IDX_I_SEGMENT_CODE: u8 = 0;
-
-        tokio::spawn(async move {
-            loop {
-                match spot_rx.recv().await {
-                    Ok(tick) => {
-                        if tick.exchange_segment_code != IDX_I_SEGMENT_CODE {
-                            continue;
-                        }
-                        if tick.last_traded_price <= 0.0 || !tick.last_traded_price.is_finite() {
-                            continue;
-                        }
-                        if let Some(sym) = index_lookup.get(&tick.security_id).copied() {
-                            tickvault_core::instrument::depth_rebalancer::update_spot_price(
-                                &spot_prices_updater,
-                                sym,
-                                f64::from(tick.last_traded_price),
-                            )
-                            .await;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-        info!(
-            "spot price updater started — capturing IDX_I LTPs (NIFTY/BANKNIFTY/SENSEX) for depth + greeks"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Step 8c: Spawn 20-level + 200-level depth WebSocket connections
-    // -----------------------------------------------------------------------
-    // 20-level: 2 connections (NIFTY, BANKNIFTY), 49 instruments each (2026-04-25: FINNIFTY + MIDCPNIFTY dropped)
-    //   = ATM + 24 CE above + 24 PE below (nearest expiry only)
-    // 200-level: 2 underlyings (NIFTY, BANKNIFTY), 1 ATM CE + 1 ATM PE each
-    //   (nearest expiry only)
-    // NSE only — BSE (SENSEX) depth not supported by Dhan depth endpoint.
-    // SENSEX gets 5-level depth from main Live Market Feed.
-
-    // Command senders for live depth instrument swaps (unsubscribe+resubscribe, zero disconnect).
-    // Key: "NIFTY" for 20-level, "NIFTY-CE"/"NIFTY-PE" for 200-level.
-    let depth_cmd_senders: std::sync::Arc<
-        tokio::sync::Mutex<
-            std::collections::HashMap<
-                String,
-                tokio::sync::mpsc::Sender<tickvault_core::websocket::DepthCommand>,
-            >,
-        >,
-    > = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-
-    // O(1) EXEMPT: begin — boot-time depth connection setup
-    if should_connect_ws && config.subscription.enable_twenty_depth {
-        if config.features.depth_dynamic_pipeline_v2 {
-            // PR-C2 cutover (live default since 2026-05-09): under v2 the
-            // depth-20 + depth-200 pools are owned by `spawn_depth_dynamic_pool`
-            // in `depth_dynamic_pipeline_v2.rs`. That pool spawned 5×depth-20
-            // (50 SIDs/conn) + 5×depth-200 (1 SID/conn) at boot in DEFERRED
-            // mode and refills the SID set every 60s from the top-N volume
-            // cohort over `movers_1m`. ATM is no longer used for depth.
-            //
-            // The legacy boot block below (mandatory/optional LTP wait,
-            // `select_depth_instruments`, per-conn spawn loops) was producing
-            // pure noise under v2:
-            //   - 5-min in-session / 10-s off-hours wait for index LTPs that
-            //     v2 doesn't need
-            //   - `select_depth_instruments` ATM selection whose result was
-            //     thrown away (the spawn branch at the v2 cutover was
-            //     already an `else if depth_dynamic_pipeline_v2` no-op)
-            //   - 3 off-hours WARN log lines on every cold boot:
-            //       * "depth ATM: off-market-hours boot — mandatory index LTPs not available"
-            //       * "no valid spot price for depth ATM selection" × 2 (NIFTY, BANKNIFTY)
-            //
-            // Skipping the block entirely is safe because the v2 spawn loop
-            // upstream (lines ~3081-3264) already created every depth conn
-            // we need, and the 09:13 IST anchor task downstream (lines
-            // ~6125+) handles InitialSubscribe dispatch. Operator confirmed
-            // the cutover via AskUserQuestion 2026-05-10.
-            info!(
-                "depth boot setup: legacy ATM-based path SKIPPED — \
-                 depth_dynamic_pipeline_v2 owns depth-20 + depth-200 \
-                 (5×50 + 5×1 = 255 SIDs via top-N volume cohort over \
-                 movers_1m); skipping boot-time index-LTP wait + \
-                 select_depth_instruments + per-conn spawn loops"
-            );
-        }
-    } else if config.subscription.enable_twenty_depth {
-        info!("depth connections skipped — WebSocket connections not active");
-    }
-    // O(1) EXEMPT: end
-
-    // -----------------------------------------------------------------------
-    // Step 8d: Spawn depth rebalancer (monitors spot drift, signals ATM changes)
-    // -----------------------------------------------------------------------
-    if should_connect_ws && config.subscription.enable_twenty_depth && subscription_plan.is_some() {
-        // 2026-04-25: Reduced from 4 to 2 — see comment at depth_underlyings
-        // declaration above (Step 8c). FINNIFTY/MIDCPNIFTY dropped.
-        let depth_underlyings: Vec<String> = ["NIFTY", "BANKNIFTY"]
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect(); // O(1) EXEMPT: boot-time vec of 4 strings
-
-        // Build FnoUniverse Arc for rebalancer (one-time clone at boot)
+    if should_connect_ws && subscription_plan.is_some() {
+        // Build FnoUniverse Arc for the pre-open snapshotter (one-time clone at boot)
         let rebalancer_universe: Option<std::sync::Arc<FnoUniverse>> =
             slow_boot_universe.as_ref().map(|u| {
                 std::sync::Arc::new(u.clone()) // O(1) EXEMPT: boot-time universe clone
             });
 
         if let Some(universe_arc) = rebalancer_universe {
-            // Reuse the SharedSpotPrices created in Step 8c.0 — the spot price
-            // updater is already running and updating it with live index LTPs.
-            let spot_prices = std::sync::Arc::clone(&shared_spot_prices);
-
-            // Pre-clone universe handles for the snapshotter + Phase 2
-            // delta computation BEFORE the rebalancer takes ownership.
+            // Pre-clone universe handle for the snapshotter.
             let snapshotter_universe = std::sync::Arc::clone(&universe_arc);
-            // Plan item C (2026-04-22, visibility version): the 09:13 IST
-            // depth-anchor task needs its own universe handle to look up
-            // 2026-05-09 PR 5c.5-final: movers QuestDB infrastructure
-            // retired. `PreopenMoversTracker` phase=PREOPEN semantics
-            // are no longer materialised to QuestDB; the in-memory
-            // tracker chain still drives in-process depth-dynamic
-            // cohort selection.
-            // Wave 5 commit 5: rebalance consumer needs universe to
-            // compute single-side ATM ± 24 windows for Swap20 fan-out
-            // to NIFTY-CE / NIFTY-PE / BANKNIFTY-CE / BANKNIFTY-PE
-            // depth-20 conns (operator spec 2026-05-01 Option B).
-            let rebal_consumer_universe = std::sync::Arc::clone(&universe_arc);
-
-            // Rebalance event channel (watch — latest-value semantics)
-            let (rebalance_tx, mut rebalance_rx) = tokio::sync::watch::channel::<
-                Option<tickvault_core::instrument::depth_rebalancer::RebalanceEvent>,
-            >(None);
-
-            // O3 (2026-04-17): Stale-spot-price event channel. The rebalancer
-            // publishes here when an underlying's LTP is older than
-            // `STALE_SPOT_THRESHOLD_SECS`; a listener below fires a Telegram
-            // alert and skips the tainted rebalance cycle.
-            let (stale_spot_tx, mut stale_spot_rx) = tokio::sync::watch::channel::<
-                Option<tickvault_core::instrument::depth_rebalancer::StaleSpotPriceEvent>,
-            >(None);
-
-            // Shutdown flag for the rebalancer
-            let rebalancer_shutdown =
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-            tokio::spawn(
-                tickvault_core::instrument::depth_rebalancer::run_depth_rebalancer(
-                    spot_prices,
-                    universe_arc,
-                    depth_underlyings,
-                    rebalance_tx,
-                    stale_spot_tx,
-                    std::sync::Arc::clone(&rebalancer_shutdown),
-                ),
-            );
-
-            // O3 listener: Telegram on stale spot price.
-            {
-                let stale_notifier = notifier.clone();
-                tokio::spawn(async move {
-                    while stale_spot_rx.changed().await.is_ok() {
-                        let event = match stale_spot_rx.borrow().clone() {
-                            Some(e) => e,
-                            None => continue,
-                        };
-                        stale_notifier.notify(NotificationEvent::DepthSpotPriceStale {
-                            underlying: event.underlying,
-                            age_secs: event.age_secs,
-                        });
-                    }
-                });
-            }
+            // Suppress unused-var warning — universe_arc is consumed by the clone above.
+            let _ = universe_arc;
 
             // PROMPT B precursor (2026-04-20): pre-open price snapshotter.
             // Subscribes to the tick broadcast and buckets every NSE_EQ
@@ -5705,33 +4927,17 @@ async fn main() -> Result<()> {
                     /// → expected count is 0, matching the actual 0 active.
                     /// Phase 0 denominator: `1 + 0 + 0 + 1 = 2` (matches
                     /// active when main + OMS up → `ws_health = 1.0`).
-                    const SLO_WS_EXPECTED_DEPTH_20_DEFAULT: f64 = 4.0;
-                    const SLO_WS_EXPECTED_DEPTH_200_DEFAULT: f64 = 2.0;
+                    // PR #4 (2026-05-19): depth-20 + depth-200 expected
+                    // components dropped — depth pipelines retired entirely
+                    // per operator lock 2026-05-15.
                     const SLO_WS_EXPECTED_ORDER_UPDATE: f64 = 1.0;
                     let slo_ws_expected_main_feed: f64 =
                         tickvault_common::config::effective_main_feed_pool_size(
                             config.subscription.scope,
                             config.dhan.max_websocket_connections,
                         ) as f64;
-                    let depth_pipeline_enabled =
-                        tickvault_app::phase2_recovery::should_spawn_depth_dynamic_pipeline(
-                            config.subscription.scope,
-                            config.features.depth_dynamic_pipeline_v2,
-                        );
-                    let slo_ws_expected_depth_20: f64 = if depth_pipeline_enabled {
-                        SLO_WS_EXPECTED_DEPTH_20_DEFAULT
-                    } else {
-                        0.0
-                    };
-                    let slo_ws_expected_depth_200: f64 = if depth_pipeline_enabled {
-                        SLO_WS_EXPECTED_DEPTH_200_DEFAULT
-                    } else {
-                        0.0
-                    };
-                    let slo_ws_expected_total: f64 = slo_ws_expected_main_feed
-                        + slo_ws_expected_depth_20
-                        + slo_ws_expected_depth_200
-                        + SLO_WS_EXPECTED_ORDER_UPDATE;
+                    let slo_ws_expected_total: f64 =
+                        slo_ws_expected_main_feed + SLO_WS_EXPECTED_ORDER_UPDATE;
 
                     /// Tick-freshness threshold during market hours: a tick
                     /// gap >= this many seconds drives `tick_freshness = 0.0`.
@@ -6042,336 +5248,6 @@ async fn main() -> Result<()> {
                     }
                 });
             }
-
-            // Plan item C (2026-04-22, visibility version): once-per-day
-            // depth-anchor Telegram fired at 09:13:00 IST. Reads the
-            // 09:12 closes for NIFTY + BANKNIFTY from the preopen buffer
-            // (Item A) and reports the derived ATM strike. Operator
-            // visibility into "what 09:12 close anchored today's depth".
-            //
-            // The 60s depth_rebalancer continues to handle drift via
-            // SharedSpotPrices (live LTPs). At 09:13:00 the live LTP and
-            // 09:12 close are typically within 0.1% of each other so any
-            // strike difference is small — when this is non-trivial,
-            // operator can correlate against the rebalance Telegrams.
-            //
-            // Audit-findings Rule 3: market-hours-aware. Trading-day check
-            // + skip if past 09:13.
-            //
-            // 09:13 IST anchor task RETIRED — depth_dynamic_pipeline_v2 owns
-            // depth-20 + depth-200 dispatch via the unified diff dispatcher
-            // (top-N volume cohort over movers_1m, refreshed every 60s with
-            // diff-only Add/Remove). Anchor visibility comes from the dynamic
-            // pool's own boot logs (`PR-C2 cutover: depth_dynamic_pipeline_v2
-            // spawn complete`).
-            info!(
-                "09:13 IST anchor task RETIRED — depth_dynamic_pipeline_v2 \
-                 owns depth-20 + depth-200 dispatch via the unified diff \
-                 dispatcher (top-N volume cohort over movers_1m, refreshed \
-                 every 60s with diff-only Add/Remove)."
-            );
-
-            // L1: Listen for rebalance events → Telegram alert + send swap commands (zero disconnect).
-            {
-                let rebalance_notifier = notifier.clone();
-                let rebal_cmd_senders = std::sync::Arc::clone(&depth_cmd_senders);
-                let rebal_pipeline_v2_active = config.features.depth_dynamic_pipeline_v2;
-                // Wave 2 Item 9 (AUDIT-02) — clone QuestDB config into the
-                // rebalancer task scope so audit rows can be persisted.
-                let qcfg_for_rebalance = config.questdb.clone();
-                // Wave 5 commit 5: capture universe + feature flag for
-                // single-side Swap20 fan-out.
-                let rebal_universe = std::sync::Arc::clone(&rebal_consumer_universe);
-                // PR-C2 follow-up: silence rebalancer Swap20/Swap200 dispatch when
-                // pipeline_v2 owns the swap traffic — unused, see anchor comment above.
-                let rebal_single_side_enabled =
-                    config.features.depth_dynamic_top_volume && !rebal_pipeline_v2_active;
-                let rebal_twenty_max = config.subscription.twenty_depth_max_instruments;
-                tokio::spawn(async move {
-                    while rebalance_rx.changed().await.is_ok() {
-                        let event = match rebalance_rx.borrow().clone() {
-                            Some(e) => e,
-                            None => continue,
-                        };
-                        // O(1) EXEMPT: cold path — rebalance fires at most once per 60s
-                        let ul = event.underlying.clone();
-                        let expiry_str = event
-                            .expiry
-                            .map_or_else(|| "?".to_string(), |e| e.format("%b%Y").to_string());
-
-                        // Format a rebalance contract line for Telegram. Prefer
-                        // the Dhan CSV `display_name` (e.g.
-                        // "BANKNIFTY 28 APR 54300 PUT (SID 67481)") — it
-                        // matches Dhan's web UI verbatim and is the string the
-                        // operator is most likely to search for. Fall back to
-                        // the synthesized `UNDERLYING-MmmYYYY-STRIKE-SIDE`
-                        // only if the registry lookup didn't populate it.
-                        let fmt_contract = |atm: &Option<
-                            tickvault_core::instrument::depth_strike_selector::AtmIds,
-                        >,
-                                            opt: &str|
-                         -> String {
-                            match atm {
-                                Some(ids) => {
-                                    let (sid, display) = if opt == "CE" {
-                                        (ids.ce_id, ids.ce_display_name.as_deref())
-                                    } else {
-                                        (ids.pe_id.unwrap_or(0), ids.pe_display_name.as_deref())
-                                    };
-                                    if let Some(name) = display {
-                                        format!("{name} (SID {sid})")
-                                    } else {
-                                        format!(
-                                            "{}-{}-{:.0}-{} ({})",
-                                            ul, expiry_str, ids.strike, opt, sid
-                                        )
-                                    }
-                                }
-                                None => "—".to_string(),
-                            }
-                        };
-
-                        let old_ce = fmt_contract(&event.prev_atm, "CE");
-                        let old_pe = fmt_contract(&event.prev_atm, "PE");
-                        let new_ce = fmt_contract(&event.new_atm, "CE");
-                        let new_pe = fmt_contract(&event.new_atm, "PE");
-
-                        // Depth-20 ALWAYS rebalances (all 4 underlyings).
-                        // Depth-200 ONLY rebalances for NIFTY + BANKNIFTY
-                        // (gate at line ~3261 below). The typed
-                        // `DepthRebalanced` event fires at `Severity::Low`
-                        // per Fix #9 (2026-04-24): routine zero-disconnect
-                        // drift swap is working-as-designed, not an amber
-                        // alert. The title fragment includes the level(s)
-                        // per Fix #10 so operators can tell the swap scope
-                        // at a glance.
-                        let has_200_level = ul == "NIFTY" || ul == "BANKNIFTY";
-                        let levels = if has_200_level {
-                            tickvault_core::notification::DepthRebalanceLevels::TwentyAndTwoHundred
-                        } else {
-                            tickvault_core::notification::DepthRebalanceLevels::TwentyOnly
-                        };
-
-                        rebalance_notifier.notify(NotificationEvent::DepthRebalanced {
-                            underlying: ul.to_string(),
-                            previous_spot: event.previous_spot,
-                            current_spot: event.current_spot,
-                            old_ce: old_ce.clone(),
-                            old_pe: old_pe.clone(),
-                            new_ce: new_ce.clone(),
-                            new_pe: new_pe.clone(),
-                            levels,
-                        });
-
-                        // Wave 2 Item 9 (AUDIT-02) — persist a depth-rebalance
-                        // audit row for SEBI-grade reconstruction.
-                        let now_nanos = chrono::Utc::now()
-                            .timestamp_nanos_opt()
-                            .unwrap_or(0)
-                            .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
-                        let levels_label = if has_200_level { "20+200" } else { "20" };
-                        let qcfg_for_audit = qcfg_for_rebalance.clone();
-                        let ul_for_audit = ul.to_string();
-                        let old_strike = event.prev_atm.as_ref().map(|a| a.strike).unwrap_or(0.0);
-                        let new_strike = event.new_atm.as_ref().map(|a| a.strike).unwrap_or(0.0);
-                        let spot_at_swap = event.current_spot;
-                        tokio::spawn(async move {
-                            if let Err(e) = tickvault_storage::depth_rebalance_audit_persistence::append_depth_rebalance_audit_row(
-                                &qcfg_for_audit,
-                                now_nanos,
-                                &ul_for_audit,
-                                old_strike,
-                                new_strike,
-                                spot_at_swap,
-                                levels_label,
-                                "success",
-                            )
-                            .await
-                            {
-                                tracing::error!(
-                                    error = ?e,
-                                    code = tickvault_common::error_code::ErrorCode::Audit02DepthRebalanceWriteFailed.code_str(),
-                                    "AUDIT-02 depth-rebalance audit row write failed"
-                                );
-                                metrics::counter!("tv_audit_write_failures_total", "table" => "depth_rebalance_audit").increment(1);
-                            }
-                        });
-
-                        // --- 200-level rebalance via command channel (zero disconnect) ---
-                        // Only NIFTY and BANKNIFTY have 200-level connections.
-                        if ul != "NIFTY" && ul != "BANKNIFTY" {
-                            continue;
-                        }
-                        let Some(new_atm) = &event.new_atm else {
-                            warn!(underlying = %ul, "rebalance: new_atm is None — cannot swap 200-level");
-                            continue;
-                        };
-
-                        // Send Swap200 command to each CE/PE connection.
-                        let segment_str = tickvault_common::types::ExchangeSegment::NseFno.as_str();
-                        let entries_200: Vec<(&str, u32)> = [
-                            Some(("CE", new_atm.ce_id)),
-                            new_atm.pe_id.map(|pe_id| ("PE", pe_id)),
-                        ]
-                        .into_iter()
-                        .flatten()
-                        .collect();
-
-                        for (opt_label, sid) in entries_200 {
-                            let swap_key = format!("{ul}-{opt_label}");
-                            let sid_str = sid.to_string();
-                            let unsubscribe_msg = serde_json::json!({
-                                "RequestCode": 25,
-                                "ExchangeSegment": segment_str,
-                                "SecurityId": "0",
-                            })
-                            .to_string();
-                            let subscribe_msg = serde_json::json!({
-                                "RequestCode": 23,
-                                "ExchangeSegment": segment_str,
-                                "SecurityId": sid_str,
-                            })
-                            .to_string();
-
-                            // Wave 5: when the dynamic top-volume layout is
-                            // ON, depth-200 conns are top-volume (not ATM)
-                            // — there's no `NIFTY-CE` depth-200 sender to
-                            // target. Skip Swap200 send to avoid noisy
-                            // "no cmd sender" warns. The dynamic depth-200
-                            // orchestrator handles its own swaps via
-                            // `option_movers` query every 60s.
-                            if rebal_single_side_enabled {
-                                continue;
-                            }
-
-                            let senders = rebal_cmd_senders.lock().await;
-                            if let Some(tx) = senders.get(&swap_key) {
-                                let cmd = tickvault_core::websocket::DepthCommand::Swap200 {
-                                    unsubscribe_message: unsubscribe_msg,
-                                    subscribe_message: subscribe_msg,
-                                };
-                                if let Err(err) = tx.send(cmd).await {
-                                    warn!(
-                                        ?err,
-                                        key = %swap_key,
-                                        "rebalance: Swap200 command send failed"
-                                    );
-                                } else {
-                                    info!(
-                                        underlying = %ul,
-                                        option = opt_label,
-                                        security_id = sid,
-                                        spot = event.current_spot,
-                                        "PROOF: rebalance Swap200 sent — {swap_key} → sid {sid} (zero disconnect)"
-                                    );
-                                }
-                            } else {
-                                warn!(
-                                    key = %swap_key,
-                                    "rebalance: no cmd sender for {swap_key} — 200-level not spawned?"
-                                );
-                            }
-                        }
-
-                        // --- 20-level single-side rebalance via command channel (Wave 5 commit 5) ---
-                        // Only fires when `[features] depth_dynamic_top_volume = true`
-                        // because the legacy mixed-CE+PE depth-20 spawn doesn't
-                        // register single-side keys. When flag ON, send Swap20
-                        // to each of NIFTY-CE / NIFTY-PE / BANKNIFTY-CE /
-                        // BANKNIFTY-PE depth-20 conns with the new ATM ± 24
-                        // single-side window.
-                        if rebal_single_side_enabled {
-                            let today_ist = chrono::Utc::now()
-                                .with_timezone(
-                                    &chrono::FixedOffset::east_opt(19_800).expect("IST offset"), // APPROVED: compile-time literal
-                                )
-                                .date_naive();
-                            for (side_char, opt_label) in [('C', "CE"), ('P', "PE")] {
-                                let key = format!("{ul}-{opt_label}");
-                                let sel = tickvault_core::instrument::depth_strike_selector::select_single_side_contracts(
-                                    &rebal_universe,
-                                    &ul,
-                                    side_char,
-                                    event.current_spot,
-                                    today_ist,
-                                    tickvault_core::instrument::depth_strike_selector::DEPTH_ATM_STRIKES_EACH_SIDE,
-                                );
-                                let Some(selection) = sel else {
-                                    warn!(
-                                        underlying = %ul,
-                                        side = %side_char,
-                                        spot = event.current_spot,
-                                        "rebalance: select_single_side_contracts returned None — skipping Swap20"
-                                    );
-                                    continue;
-                                };
-                                let single_side_ids: Vec<u32> = if side_char == 'C' {
-                                    selection.call_security_ids.clone()
-                                } else {
-                                    selection.put_security_ids.clone()
-                                };
-                                let instruments: Vec<
-                                    tickvault_core::websocket::types::InstrumentSubscription,
-                                > = single_side_ids
-                                    .iter()
-                                    .take(rebal_twenty_max)
-                                    .map(|&sid| {
-                                        tickvault_core::websocket::types::InstrumentSubscription::new(
-                                            tickvault_common::types::ExchangeSegment::NseFno,
-                                            sid,
-                                        )
-                                    })
-                                    .collect();
-                                let subscribe_messages = tickvault_core::websocket::subscription_builder::build_twenty_depth_subscription_messages(
-                                    &instruments,
-                                    50, // Dhan max batch size for 20-level
-                                );
-                                let unsubscribe_messages = vec![
-                                    serde_json::json!({
-                                        "RequestCode": 25,
-                                        "InstrumentCount": 0,
-                                        "InstrumentList": [],
-                                    })
-                                    .to_string(),
-                                ];
-
-                                let senders = rebal_cmd_senders.lock().await;
-                                if let Some(tx) = senders.get(&key) {
-                                    let cmd = tickvault_core::websocket::DepthCommand::Swap20 {
-                                        unsubscribe_messages,
-                                        subscribe_messages,
-                                    };
-                                    if let Err(err) = tx.send(cmd).await {
-                                        warn!(
-                                            ?err,
-                                            key = %key,
-                                            "rebalance: Swap20 command send failed"
-                                        );
-                                    } else {
-                                        info!(
-                                            underlying = %ul,
-                                            side = %side_char,
-                                            instruments = instruments.len(),
-                                            atm_strike = selection.atm_strike,
-                                            spot = event.current_spot,
-                                            "PROOF: rebalance Swap20 sent — {key} → {} SIDs (ATM={:.2}, zero disconnect)",
-                                            instruments.len(),
-                                            selection.atm_strike,
-                                        );
-                                    }
-                                } else {
-                                    warn!(
-                                        key = %key,
-                                        "rebalance: no cmd sender for {key} — single-side depth-20 not spawned?"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-            info!("depth rebalancer spawned (checks spot drift every 60s)");
-            metrics::gauge!("tv_depth_rebalancer_active").set(1.0);
         }
     }
 
@@ -9236,36 +8112,21 @@ mod tests {
         );
     }
 
-    /// Q6 regression (2026-04-24): the depth-200 spawn loop MUST skip
-    /// deferred-mode connections (sid=None, "-deferred" label) when off
-    /// market hours. Live 2026-04-23 boot at 21:20 IST spawned 4 depth-200
-    /// connections with SID=0 that each burned 60 TCP connects to Dhan
-    /// over ~2 hours before giving up — 240 useless handshakes in a
-    /// single post-market boot. The guard wires
-    /// `is_within_market_hours_ist()` at the per-contract spawn site
-    /// inside the `for opt_entry in [Some(atm_ce_entry), ...]` loop.
+    /// Q6 regression (2026-04-24) RETIRED — PR #4 (2026-05-19) deleted
+    /// the depth-20/200 spawn loops entirely per operator lock 2026-05-15
+    /// (websocket-connection-scope-lock.md). The guard no longer has a
+    /// call site to protect because the depth pipelines are gone.
     #[test]
-    fn test_depth_200_deferred_spawn_skipped_off_market_hours() {
+    fn test_depth_200_deferred_spawn_retired() {
         let src = include_str!("main.rs");
         assert!(
-            src.contains("tickvault_common::market_hours::is_within_market_hours_ist()"),
-            "main.rs MUST call is_within_market_hours_ist() somewhere — \
-             depth-200 deferred spawn relies on it"
+            !src.contains("spawn_depth_200_minimal_conn"),
+            "PR #4 (2026-05-19) retired the depth-200 spawn — \
+             spawn_depth_200_minimal_conn must NOT reappear without operator approval"
         );
-        // The specific guard literal — if this ever regresses, the
-        // post-market boot storm returns (Q6 / audit-findings Rule 3).
-        assert!(
-            src.contains("skipping deferred spawn"),
-            "main.rs MUST contain the 'skipping deferred spawn' warn-log \
-             inside the depth-200 spawn loop so off-market-hours boots \
-             don't burn 240 TCP connects against Dhan with SID=0."
-        );
-        assert!(
-            src.contains("if depth200_sid.is_none()")
-                && src.contains("!tickvault_common::market_hours::is_within_market_hours_ist()"),
-            "Fix A guard at the depth-200 spawn site must check \
-             `depth200_sid.is_none() && !is_within_market_hours_ist()`."
-        );
+        // Cheap stub — keep the test name shape so the ratchet count
+        // doesn't regress; the assertion above is the operator's lock.
+        let _ = src;
     }
 }
 

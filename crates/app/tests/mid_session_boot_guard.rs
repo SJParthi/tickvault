@@ -64,16 +64,9 @@ fn test_market_open_heartbeat_skip_is_debug_not_info() {
 // the deleted anchor task body; under v2 the anchor is structurally
 // absent so the skip log no longer exists.
 
-#[test]
-fn test_depth_rebalancer_market_hours_gate_present() {
-    let src = read_file("crates/core/src/instrument/depth_rebalancer.rs");
-    assert!(
-        src.contains("is_within_market_hours_ist"),
-        "2026-04-17 incident regression: depth rebalancer lost its market-hours gate. \
-         Without it, post-market ticks fire stale-spot alerts even though no trading is happening. \
-         See .claude/rules/project/audit-findings-2026-04-17.md Rule 3."
-    );
-}
+// `test_depth_rebalancer_market_hours_gate_present` RETIRED with the
+// PR #4 (2026-05-19) deletion of depth_rebalancer.rs per operator lock
+// 2026-05-15 (websocket-connection-scope-lock.md).
 
 #[test]
 fn test_tick_gap_tracker_has_backlog_before_state_mutation() {
@@ -106,16 +99,9 @@ fn test_tick_gap_error_threshold_is_raised_to_300s() {
     );
 }
 
-#[test]
-fn test_depth_200_has_initial_stagger_constant() {
-    let src = read_file("crates/core/src/websocket/depth_connection.rs");
-    assert!(
-        src.contains("pub const DEPTH_200_INITIAL_STAGGER_MS: u64 = 2000"),
-        "2026-04-24 regression: DEPTH_200_INITIAL_STAGGER_MS missing or changed. \
-         2s stagger was added after 4 concurrent 200-depth auth handshakes all got \
-         Protocol(ResetWithoutClosingHandshake) on 2026-04-24 12:07:54 IST boot."
-    );
-}
+// `test_depth_200_has_initial_stagger_constant` RETIRED with the
+// PR #4 (2026-05-19) deletion of depth_connection.rs per operator lock
+// 2026-05-15 (websocket-connection-scope-lock.md).
 
 #[test]
 fn test_instrument_build_success_event_is_emitted_on_both_boot_paths() {
