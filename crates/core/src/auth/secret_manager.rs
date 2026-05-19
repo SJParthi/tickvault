@@ -1503,4 +1503,39 @@ mod tests {
             assert!(result.is_err(), "must fail without real SSM");
         }
     }
+
+    /// PR #8a Slice 1 source-scan ratchet (audit-findings Rule 13):
+    /// `main.rs` MUST spawn the three `day_ohlc_orchestrator` tasks at boot.
+    /// Without these wires, `DayOhlcTracker::arm_sid()` is dead code and
+    /// the operator-locked "09:15:00 IST open = NSE equilibrium open"
+    /// contract per `.claude/rules/project/index-day-ohlc-tracker-error-codes.md`
+    /// is silently broken — `day_open` falls back to first-trade LTP.
+    #[test]
+    fn test_day_ohlc_orchestrator_is_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        assert!(
+            main_rs.contains("spawn_market_open_arm_task("),
+            "main.rs MUST call `day_ohlc_orchestrator::spawn_market_open_arm_task` \
+             from the boot path. Without it, day_open at 09:15:00 IST falls back \
+             to first-trade LTP instead of the NSE equilibrium open price."
+        );
+        assert!(
+            main_rs.contains("spawn_day_ohlc_tick_consumer("),
+            "main.rs MUST call `day_ohlc_orchestrator::spawn_day_ohlc_tick_consumer` \
+             from the boot path. Without it, day_high/day_low/day_close never advance."
+        );
+        assert!(
+            main_rs.contains("spawn_midnight_reset_task("),
+            "main.rs MUST call `day_ohlc_orchestrator::spawn_midnight_reset_task` \
+             from the boot path. Without it, yesterday's day OHLC carries over \
+             past IST midnight (INDEX-OHLC-02 condition)."
+        );
+        assert!(
+            main_rs.contains("DayOhlcTracker::new()"),
+            "main.rs MUST construct an Arc<DayOhlcTracker> at boot to thread \
+             through the three spawn sites."
+        );
+    }
 }
