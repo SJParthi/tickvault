@@ -21,7 +21,6 @@ pub mod diagnostic;
 // (depth-only diff state machine; no consumers under 4-IDX_I scope).
 pub mod instrument_loader;
 pub mod market_open_self_test;
-pub mod phase2_readiness_check;
 pub mod preopen_price_buffer;
 pub mod slo_score;
 pub mod subscription_distribution;

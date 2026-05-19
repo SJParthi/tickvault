@@ -2910,9 +2910,10 @@ async fn main() -> Result<()> {
         // FULL_CLOSE) and idempotent ALTER ADD COLUMN IF NOT EXISTS so
         // existing deployments auto-migrate.
         tickvault_storage::previous_close_persistence::ensure_previous_close_table(&config.questdb,),
-        // Wave 2 Item 9 (G18) — 6 audit-trail tables. SEBI-relevant.
+        // Wave 2 Item 9 (G18) — audit-trail tables. SEBI-relevant.
         // 90d hot → S3 IT → Glacier per `aws-budget.md`.
-        tickvault_storage::phase2_audit_persistence::ensure_phase2_audit_table(&config.questdb),
+        // PR #5 (2026-05-19): phase2_audit table retired alongside the
+        // deleted Phase 2 stock-F&O dispatcher (operator lock 2026-05-15).
         // PR #4 (2026-05-19): depth_rebalance_audit + depth_dynamic_diff_audit
         // tables retired alongside the deleted depth-20/200 pipelines.
         tickvault_storage::ws_reconnect_audit_persistence::ensure_ws_reconnect_audit_table(
@@ -4011,8 +4012,12 @@ async fn main() -> Result<()> {
         // loop. The 30s prev_oi_cache timeout caps the worst-case wait
         // before this fires.
         if !boot_ordering_gate.try_authorize_subscribe() {
+            // PR #5 (2026-05-19): retagged from Phase2Ready01PreflightFailed
+            // (retired with the Phase 2 dispatcher) to PrevClose01IlpFailed
+            // which matches the message's "PREVCLOSE-01" reference per the
+            // error_code_tag_guard meta-test invariant.
             tracing::error!(
-                code = tickvault_common::error_code::ErrorCode::Phase2Ready01PreflightFailed.code_str(),
+                code = tickvault_common::error_code::ErrorCode::PrevClose01IlpFailed.code_str(),
                 readiness = ?boot_ordering_gate.readiness(),
                 "L14 boot-ordering gate refused to authorize subscribe — \
                  prev_oi_cache load likely failed (see PREVCLOSE-01 above). \
@@ -4277,134 +4282,21 @@ async fn main() -> Result<()> {
                 });
             }
 
-            // PROMPT C (2026-04-20) — Phase 2 crash-recovery.
+            // PR #5 (2026-05-19): Phase 2 crash-recovery RETIRED.
             //
-            // BEFORE spawning the Phase 2 scheduler, consult the on-disk
-            // snapshot written by PROMPT A at 09:13:00 IST. If today's
-            // snapshot is present we re-dispatch the SAME ATM chain the
-            // scheduler picked this morning and SKIP spawning the
-            // scheduler — a mid-market restart at 11:00 IST must resume
-            // the same contracts, not re-pick ATM from drifted live
-            // price. Absent/stale snapshot falls through to the existing
-            // scheduler unchanged.
-            let phase2_action = {
-                let snapshot_path =
-                    std::path::PathBuf::from(tickvault_app::phase2_recovery::PHASE2_SNAPSHOT_PATH);
-                let snapshot = match tickvault_storage::phase2_subscription_marker::read_snapshot(
-                    &snapshot_path,
-                ) {
-                    Ok(snap) => snap,
-                    Err(err) => {
-                        warn!(
-                            ?err,
-                            path = %snapshot_path.display(),
-                            "Phase 2 recovery: snapshot read failed — proceeding without it"
-                        );
-                        None
-                    }
-                };
-                let (today_ist, now_sec) =
-                    tickvault_app::phase2_recovery::current_ist_seconds_of_day();
-                let is_trading_day = trading_calendar.is_trading_day(today_ist);
-                let action = tickvault_app::phase2_recovery::plan_recovery(
-                    today_ist,
-                    now_sec,
-                    is_trading_day,
-                    snapshot.as_ref(),
-                );
-                metrics::counter!(
-                    tickvault_app::phase2_recovery::RECOVERY_METRIC_NAME,
-                    "outcome" => action.outcome_label(),
-                )
-                .increment(1);
-                match &action {
-                    tickvault_app::phase2_recovery::RecoveryAction::DispatchSnapshot {
-                        snapshot_date,
-                        instrument_count,
-                        ..
-                    } => info!(
-                        outcome = action.outcome_label(),
-                        snapshot_date = %snapshot_date,
-                        instrument_count,
-                        "Phase 2 recovery: recovering from snapshot — scheduler will be skipped"
-                    ),
-                    other => info!(
-                        outcome = other.outcome_label(),
-                        today_ist = %today_ist,
-                        now_sec,
-                        is_trading_day,
-                        "Phase 2 recovery: no reusable snapshot — delegating to scheduler path"
-                    ),
-                }
-                action
-            };
-
-            match phase2_action {
-                tickvault_app::phase2_recovery::RecoveryAction::DispatchSnapshot {
-                    snapshot_date: _,
-                    instrument_count,
-                    instruments,
-                } => {
-                    if !tickvault_app::phase2_recovery::should_spawn_phase2_scheduler(
-                        config.subscription.scope,
-                    ) {
-                        // PR-E: stale snapshot from a prior FullUniverse boot. Don't
-                        // re-dispatch its stock F&O contracts — they'd be silently
-                        // dropped by the planner anyway, but dispatching wastes a
-                        // SubscribeCommand round-trip.
-                        info!(
-                            instrument_count,
-                            scope = config.subscription.scope.as_str(),
-                            "PR-E: Phase 2 recovery snapshot dispatch SKIPPED under \
-                             IndicesOnlyAllExpiries scope (prior-boot stock F&O chain ignored)"
-                        );
-                    } else {
-                        match ws_pool_arc.as_ref() {
-                            Some(pool) => {
-                                let cmd =
-                                    tickvault_core::websocket::SubscribeCommand::AddInstruments {
-                                        instruments,
-                                        feed_mode: tickvault_common::types::FeedMode::Quote,
-                                    };
-                                match pool.dispatch_subscribe(cmd) {
-                                    Some(conn_id) => info!(
-                                        target_connection = conn_id,
-                                        instrument_count,
-                                        "Phase 2 recovery: snapshot chain dispatched to pool"
-                                    ),
-                                    None => error!(
-                                        instrument_count,
-                                        "Phase 2 recovery: dispatch_subscribe returned None — \
-                                         snapshot chain will NOT be subscribed this boot"
-                                    ),
-                                }
-                            }
-                            None => warn!(
-                                instrument_count,
-                                "Phase 2 recovery: no WebSocket pool — snapshot chain not dispatched"
-                            ),
-                        }
-                    }
-                }
-                tickvault_app::phase2_recovery::RecoveryAction::SkipOffHours => {
-                    info!("Phase 2 recovery: skip-off-hours — scheduler NOT spawned this boot");
-                }
-                tickvault_app::phase2_recovery::RecoveryAction::RunFreshPhase2
-                | tickvault_app::phase2_recovery::RecoveryAction::WaitForScheduler => {
-                    // PR #509d (Wave-5 §R.1): the Phase 2 dispatcher chain
-                    // (`phase2_scheduler` + `phase2_delta` + `phase2_emit_guard`)
-                    // is RETIRED entirely. Under the indices-only scope the
-                    // dispatcher would silently no-op anyway; under any future
-                    // scope re-enabling stock F&O, dispatch will go through a
-                    // newer in-memory-cascade-driven path, not the legacy
-                    // 09:13 IST scheduler.
-                    info!(
-                        scope = config.subscription.scope.as_str(),
-                        "Phase 2 scheduler RETIRED (#509d) — legacy 09:13 IST dispatcher \
-                         removed; readiness check still runs at 09:13:01 IST"
-                    );
-                }
-            }
+            // The crash-recovery block read the 09:13 IST stock-F&O ATM
+            // snapshot from disk and re-dispatched the same chain on a
+            // mid-market restart. Under the operator-locked 4-IDX_I
+            // LOCKED_UNIVERSE (websocket-connection-scope-lock.md
+            // 2026-05-15), stock-F&O is no longer subscribed — the entire
+            // Phase 2 dispatcher chain (`phase2_scheduler` + `phase2_delta`
+            // + `phase2_emit_guard` + `phase2_readiness_check` +
+            // `phase2_recovery` + `phase2_subscription_marker` +
+            // `phase2_audit_persistence`) is dead weight.
+            //
+            // The pre-open snapshotter ABOVE still runs because it feeds
+            // `preopen_price_buffer`, which `DayOhlcTracker` consumes at
+            // 09:15:00 IST to seed the day's OHLC for the 4 IDX_I SIDs.
 
             // Audit Finding #5 (2026-05-03): Pre-market positive readiness
             // ping at 09:14:00 IST — exactly 60s before the NSE opening bell.
@@ -6097,10 +5989,18 @@ fn create_websocket_pool(
     // legacy 50s threshold is wasteful — tighten to 3s (IDX_I's expected
     // 1-3 ticks/sec window). Under legacy scopes preserve 50s.
     let configured_watchdog_threshold = ws_config.activity_watchdog_threshold_secs;
-    let effective_watchdog_threshold =
-        tickvault_app::phase2_recovery::effective_main_feed_watchdog_threshold_secs(
-            config.subscription.scope,
-        );
+    // PR #5 (2026-05-19): `effective_main_feed_watchdog_threshold_secs`
+    // helper inlined here after `phase2_recovery` module retirement
+    // (operator lock 2026-05-15, websocket-connection-scope-lock.md).
+    let effective_watchdog_threshold = match config.subscription.scope {
+        tickvault_common::config::SubscriptionScope::IndicesUnderlyingsOnly => {
+            tickvault_core::websocket::activity_watchdog::WATCHDOG_THRESHOLD_IDX_I_SECS
+        }
+        tickvault_common::config::SubscriptionScope::IndicesOnlyAllExpiries
+        | tickvault_common::config::SubscriptionScope::FullUniverse => {
+            tickvault_core::websocket::activity_watchdog::WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS
+        }
+    };
     if effective_watchdog_threshold != configured_watchdog_threshold {
         info!(
             scope = config.subscription.scope.as_str(),

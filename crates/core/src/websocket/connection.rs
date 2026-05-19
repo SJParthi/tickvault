@@ -741,8 +741,8 @@ impl WebSocketConnection {
                     let watchdog_label = format!("live-feed-{}", self.connection_id);
                     // Phase 0 Item 4 (2026-05-13): threshold read from ws_config
                     // so main.rs can scope-override (Phase 0 = 3s; legacy = 50s).
-                    // See `effective_main_feed_watchdog_threshold_secs` in
-                    // `phase2_recovery.rs`.
+                    // PR #5 (2026-05-19): scope-override now inlined directly
+                    // in main.rs after `phase2_recovery` module retirement.
                     let watchdog = ActivityWatchdog::new(
                         watchdog_label,
                         Arc::clone(&self.activity_counter),
