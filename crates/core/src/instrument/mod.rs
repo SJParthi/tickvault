@@ -7,9 +7,8 @@
 //! # Boot Sequence Position
 //! Config -> **Instrument Download -> Universe Build** -> Auth -> WebSocket
 
-pub mod bhavcopy_cross_check;
-pub mod bhavcopy_fetcher;
-pub mod bhavcopy_scheduler;
+// PR #6a (2026-05-19): bhavcopy_cross_check + bhavcopy_fetcher + bhavcopy_scheduler
+// DELETED — 16:30 IST NSE bhavcopy cross-check retired under 4-IDX_I LOCKED_UNIVERSE.
 pub mod binary_cache;
 pub mod csv_downloader;
 pub mod csv_parser;
