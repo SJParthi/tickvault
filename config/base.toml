@@ -243,7 +243,7 @@ auto_open_portal = true
 # `.claude/rules/project/websocket-connection-scope-lock.md` and charter §I.
 # Flipping back to "indices_only_all_expiries" or "full_universe" requires
 # operator re-approval recorded in the rule file with a dated quote.
-scope = "indices_underlyings_only"
+scope = "indices_4_only"
 feed_mode = "Full"
 subscribe_index_derivatives = false
 subscribe_stock_derivatives = false
