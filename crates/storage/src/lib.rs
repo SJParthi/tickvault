@@ -76,9 +76,9 @@ pub mod calendar_persistence;
 pub mod candle_persistence;
 pub mod constituency_persistence;
 pub mod decision_audit_persistence;
-pub mod deep_depth_persistence;
-pub mod depth_dynamic_diff_audit_persistence;
-pub mod depth_rebalance_audit_persistence;
+// PR #4 (2026-05-19): deep_depth_persistence + depth_dynamic_diff_audit
+// + depth_rebalance_audit modules DELETED. Audit tables stay on disk
+// per SEBI 5y retention.
 pub mod disk_health_watcher;
 pub mod gap_fill_audit_persistence;
 // PR #3 (2026-05-19): `greeks_persistence` module DELETED. greeks

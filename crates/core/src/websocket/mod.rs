@@ -15,11 +15,7 @@
 pub mod activity_watchdog;
 pub mod connection;
 pub mod connection_pool;
-pub mod depth_connection;
-// Phase 0 Item 8+9 (PR-C, 2026-05-17) — typed broadcast payload from the
-// connection layer to the gap-fill subsystem. See
-// `.claude/plans/active-plan-item-8-9-gap-fill.md` "Locked architectural
-// decisions" + `audit-findings-2026-04-17.md` Rule 15.
+// PR #4 (2026-05-19): `depth_connection` module DELETED.
 pub mod disconnect_event;
 pub mod market_hours_gate;
 pub mod order_update_connection;
@@ -30,10 +26,7 @@ pub mod types;
 
 pub use connection::{SubscribeCommand, WebSocketConnection};
 pub use connection_pool::WebSocketConnectionPool;
-pub use depth_connection::{
-    DEPTH_200_INITIAL_STAGGER_MS, DepthCommand, run_twenty_depth_connection,
-    run_two_hundred_depth_connection,
-};
+// PR #4 (2026-05-19): depth_connection re-exports retired.
 pub use order_update_connection::run_order_update_connection;
 pub use subscription_builder::build_subscription_messages;
 pub use types::{ConnectionId, ConnectionState, DisconnectCode, WebSocketError};

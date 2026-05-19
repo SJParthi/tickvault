@@ -116,19 +116,20 @@ pub struct MarketDepthLevel {
 }
 
 // ---------------------------------------------------------------------------
-// Deep Depth Level — from 20-level / 200-level depth feeds
+// Deep Depth Level — input type for the OBI (Order Book Imbalance) indicator
 // ---------------------------------------------------------------------------
+//
+// PR #4 (2026-05-19) retired the depth-20 + depth-200 WebSocket pipelines.
+// `DeepDepthLevel` is preserved as the input type for the OBI indicator
+// (`crates/trading/src/indicator/obi.rs`), which the 4-IDX_I LOCKED_UNIVERSE
+// strategy can still compute from any future depth source (e.g. 5-level
+// depth from the main feed Full packet, after a thin adaptor).
 
-/// A single level of market depth from the 20-level or 200-level depth feed.
-///
-/// These feeds use f64 prices (unlike the standard 5-level feed which uses f32)
-/// and send bid/ask sides as separate packets. Each level contains
-/// price, quantity, and order count for one side only.
-///
-/// Wire format per level: price(f64 LE, 8 bytes) + quantity(u32 LE, 4 bytes) + orders(u32 LE, 4 bytes) = 16 bytes.
+/// A single level of market depth with f64 prices + u32 quantity + u32 orders.
+/// 16-byte wire layout: price(f64 LE, 8) + quantity(u32 LE, 4) + orders(u32 LE, 4).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct DeepDepthLevel {
-    /// Price at this level (rupees, f64 — higher precision than 5-level f32).
+    /// Price at this level (rupees, f64).
     pub price: f64,
     /// Quantity at this level.
     pub quantity: u32,
@@ -420,39 +421,6 @@ mod tests {
         assert_eq!(level.ask_price, 0.0);
     }
 
-    // --- DeepDepthLevel ---
-
-    #[test]
-    fn test_deep_depth_level_default() {
-        let level = DeepDepthLevel::default();
-        assert_eq!(level.price, 0.0);
-        assert_eq!(level.quantity, 0);
-        assert_eq!(level.orders, 0);
-    }
-
-    #[test]
-    fn test_deep_depth_level_is_copy() {
-        let level = DeepDepthLevel {
-            price: 24500.50,
-            quantity: 1000,
-            orders: 42,
-        };
-        let copy = level; // Copy, not move
-        assert_eq!(level.price, copy.price);
-        assert_eq!(level.quantity, copy.quantity);
-        assert_eq!(level.orders, copy.orders);
-    }
-
-    #[test]
-    fn test_deep_depth_level_f64_precision() {
-        let level = DeepDepthLevel {
-            price: 24500.123456789,
-            quantity: 1,
-            orders: 1,
-        };
-        assert!((level.price - 24500.123456789).abs() < 1e-9);
-    }
-
     // --- DhanIntradayResponse ---
 
     #[test]
@@ -636,17 +604,6 @@ mod tests {
         };
         let b = a;
         assert_eq!(a, b);
-    }
-
-    #[test]
-    fn test_deep_depth_level_f64_precision_preserved() {
-        let level = DeepDepthLevel {
-            price: 24500.05,
-            quantity: 100,
-            orders: 5,
-        };
-        // f64 should preserve this precision exactly
-        assert!((level.price - 24500.05).abs() < f64::EPSILON);
     }
 
     // -----------------------------------------------------------------------
@@ -1008,19 +965,6 @@ mod tests {
         };
         let debug = format!("{:?}", level);
         assert!(debug.contains("MarketDepthLevel"));
-    }
-
-    // --- DeepDepthLevel Debug impl ---
-
-    #[test]
-    fn test_deep_depth_level_debug_output() {
-        let level = DeepDepthLevel {
-            price: 24500.50,
-            quantity: 1000,
-            orders: 42,
-        };
-        let debug = format!("{:?}", level);
-        assert!(debug.contains("DeepDepthLevel"));
     }
 
     // --- OptionGreeksSnapshot Debug impl ---

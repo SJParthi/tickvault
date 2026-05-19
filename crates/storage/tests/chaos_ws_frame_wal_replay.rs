@@ -69,35 +69,6 @@ fn build_live_feed_frame(marker: u32) -> Vec<u8> {
     buf
 }
 
-/// Build one synthetic Depth-20 packet (12-byte header + 320 bytes of
-/// level data). The header byte-order is different from the Live Feed —
-/// matches `docs/dhan-ref/04-full-market-depth-websocket.md` section
-/// 3.1 exactly.
-fn build_depth_20_frame(marker: u32) -> Vec<u8> {
-    let mut buf = vec![0u8; 12 + 320];
-    let len = buf.len() as i16;
-    buf[0..2].copy_from_slice(&len.to_le_bytes()); // message length
-    buf[2] = 41; // Bid
-    buf[3] = 2; // NSE_FNO
-    buf[4..8].copy_from_slice(&marker.to_le_bytes());
-    buf[8..12].copy_from_slice(&(marker + 1).to_le_bytes()); // sequence
-    buf
-}
-
-/// Build one synthetic Depth-200 packet with row_count = 1 so the
-/// replay helper has a well-formed record to parse. Payload beyond the
-/// header is level data the WAL persists verbatim.
-fn build_depth_200_frame(marker: u32) -> Vec<u8> {
-    let mut buf = vec![0u8; 12 + 16]; // header + 1 row
-    let len = buf.len() as i16;
-    buf[0..2].copy_from_slice(&len.to_le_bytes());
-    buf[2] = 51; // Ask
-    buf[3] = 2;
-    buf[4..8].copy_from_slice(&marker.to_le_bytes());
-    buf[8..12].copy_from_slice(&1u32.to_le_bytes()); // row_count
-    buf
-}
-
 /// Build one order-update JSON frame with a recognisable marker in the
 /// orderId field so per-record integrity is easy to assert.
 fn build_order_update_frame(marker: u32) -> Vec<u8> {
@@ -124,16 +95,9 @@ fn chaos_sigkill_ws_frame_wal_recovers_all_four_types() {
                 "LiveFeed append {i} must spill, got {outcome:?}"
             );
         }
-        // 25 Depth-20 frames
-        for i in 0..25u32 {
-            let outcome = spill.append(WsType::Depth20, build_depth_20_frame(1000 + i));
-            assert_eq!(outcome, AppendOutcome::Spilled);
-        }
-        // 25 Depth-200 frames
-        for i in 0..25u32 {
-            let outcome = spill.append(WsType::Depth200, build_depth_200_frame(2000 + i));
-            assert_eq!(outcome, AppendOutcome::Spilled);
-        }
+        // PR #4 (2026-05-19): Depth20/Depth200 frame replay paths retired
+        // alongside the 4-IDX_I LOCKED_UNIVERSE WS scope lock. Only
+        // LiveFeed + OrderUpdate survive in the replay matrix.
         // 10 OrderUpdate frames
         for i in 0..10u32 {
             let outcome = spill.append(WsType::OrderUpdate, build_order_update_frame(3000 + i));
@@ -154,14 +118,12 @@ fn chaos_sigkill_ws_frame_wal_recovers_all_four_types() {
     let recovered = replay_all(&dir).expect("replay_all");
     assert_eq!(
         recovered.len(),
-        110,
-        "must recover 50 LiveFeed + 25 Depth20 + 25 Depth200 + 10 OrderUpdate = 110 frames"
+        60,
+        "must recover 50 LiveFeed + 10 OrderUpdate = 60 frames"
     );
 
     // Partition by ws_type and verify per-type counts + payload integrity.
     let mut live = 0usize;
-    let mut d20 = 0usize;
-    let mut d200 = 0usize;
     let mut ord = 0usize;
     for rec in &recovered {
         match rec.ws_type {
@@ -172,19 +134,6 @@ fn chaos_sigkill_ws_frame_wal_recovers_all_four_types() {
                     "LiveFeed response code must survive replay"
                 );
                 live += 1;
-            }
-            WsType::Depth20 => {
-                assert_eq!(
-                    rec.frame.len(),
-                    12 + 320,
-                    "Depth-20 size must survive replay"
-                );
-                assert_eq!(rec.frame[2], 41, "Depth-20 Bid code must survive replay");
-                d20 += 1;
-            }
-            WsType::Depth200 => {
-                assert_eq!(rec.frame[2], 51, "Depth-200 Ask code must survive replay");
-                d200 += 1;
             }
             WsType::OrderUpdate => {
                 let text = std::str::from_utf8(&rec.frame).expect("order update UTF-8");
@@ -198,8 +147,6 @@ fn chaos_sigkill_ws_frame_wal_recovers_all_four_types() {
         }
     }
     assert_eq!(live, 50, "LiveFeed count");
-    assert_eq!(d20, 25, "Depth-20 count");
-    assert_eq!(d200, 25, "Depth-200 count");
     assert_eq!(ord, 10, "OrderUpdate count");
 
     // Replayed segments are archived, not deleted — a second replay
