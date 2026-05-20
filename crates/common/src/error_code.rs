@@ -380,10 +380,6 @@ pub enum ErrorCode {
     /// within a minute window indicates wall-clock instability;
     /// escalate to BOOT-03 territory.
     Boundary01CatchupSeal,
-    /// AGGREGATOR-AUDIT-01: `aggregator_seal_audit` table write failed.
-    /// Audit tables are SEBI-relevant forensic records; write failures
-    /// must surface immediately. Severity::Medium.
-    AggregatorAudit01WriteFailed,
     /// RESILIENCE-01: another `tickvault` process holds the Valkey
     /// dual-instance lock for this client-id. Two processes running
     /// against the same Dhan account fight over static-IP enforcement
@@ -647,7 +643,6 @@ impl ErrorCode {
             Self::AggregatorSeal01IlpFailed => "AGGREGATOR-SEAL-01",
             Self::AggregatorHb01Heartbeat => "AGGREGATOR-HB-01",
             Self::Boundary01CatchupSeal => "BOUNDARY-01",
-            Self::AggregatorAudit01WriteFailed => "AGGREGATOR-AUDIT-01",
             Self::Resilience01DualInstanceDetected => "RESILIENCE-01",
             Self::OrphanPosition01Detected => "ORPHAN-POSITION-01",
             Self::BarMismatch01CorrectedFromHistorical => "BAR-MISMATCH-01",
@@ -787,7 +782,6 @@ impl ErrorCode {
             | Self::CorePin02WorkerDrifted
             | Self::AggregatorSeal01IlpFailed
             | Self::Boundary01CatchupSeal
-            | Self::AggregatorAudit01WriteFailed
             // PR #1 (AWS-lifecycle) — Medium option-chain
             | Self::OptionChain03ParseFailed
             | Self::OptionChain04VerifyFailedVsWs => Severity::Medium,
@@ -896,8 +890,7 @@ impl ErrorCode {
             | Self::AggregatorLate01
             | Self::AggregatorSeal01IlpFailed
             | Self::AggregatorHb01Heartbeat
-            | Self::Boundary01CatchupSeal
-            | Self::AggregatorAudit01WriteFailed => ".claude/rules/project/wave-6-error-codes.md",
+            | Self::Boundary01CatchupSeal => ".claude/rules/project/wave-6-error-codes.md",
             Self::Resilience01DualInstanceDetected => ".claude/rules/project/wave-4-error-codes.md",
             Self::OrphanPosition01Detected => {
                 ".claude/rules/project/phase-0-item-20-error-codes.md"
@@ -1041,7 +1034,6 @@ impl ErrorCode {
             Self::AggregatorSeal01IlpFailed,
             Self::AggregatorHb01Heartbeat,
             Self::Boundary01CatchupSeal,
-            Self::AggregatorAudit01WriteFailed,
             // Wave 4 — Item 19 dual-instance lock
             Self::Resilience01DualInstanceDetected,
             // Phase 0 Item 20 — orphan position 15:25 IST watchdog
@@ -1297,7 +1289,9 @@ mod tests {
         // I-P0-05 (S3Backup), I-P0-06 (EmergencyDownload) — universe_builder
         // + validation + binary_cache + s3_backup + instrument_loader modules
         // deleted under 4-IDX_I LOCKED_UNIVERSE.
-        assert_eq!(ErrorCode::all().len(), 105);
+        // 2026-05-20 (#T2a — QuestDB table cleanup): bumped 105 -> 104 by
+        // removing AGGREGATOR-AUDIT-01 (aggregator_seal_audit table dropped).
+        assert_eq!(ErrorCode::all().len(), 104);
     }
 
     #[test]

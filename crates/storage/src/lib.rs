@@ -67,15 +67,12 @@ mod global_qcfg_tests {
     }
 }
 
-pub mod aggregator_seal_audit_persistence;
 pub mod auth_renewal_audit_persistence;
-pub mod bar_correction_audit_persistence;
 pub mod boot_audit_persistence;
 pub mod boot_probe;
 pub mod calendar_persistence;
 pub mod candle_persistence;
 pub mod constituency_persistence;
-pub mod decision_audit_persistence;
 // PR #4 (2026-05-19): deep_depth_persistence + depth_dynamic_diff_audit
 // + depth_rebalance_audit modules DELETED. Audit tables stay on disk
 // per SEBI 5y retention.
@@ -99,13 +96,10 @@ pub mod live_instance_lock_persistence;
 // `movers_*` matviews + `movers_1s` base table are no longer recreated
 // either (the old `drop_bug3_retired_views` lived in this module).
 pub mod obi_persistence;
-pub mod open_price_audit_persistence;
 pub mod option_chain_minute_snapshot_persistence;
 pub mod order_audit_persistence;
-pub mod order_update_ws_audit_persistence;
 pub mod orphan_position_audit_persistence;
 pub mod partition_manager;
-pub mod pnl_audit_persistence;
 pub mod previous_close_persistence;
 pub mod questdb_health;
 pub mod seal_absorption;
@@ -114,18 +108,14 @@ pub mod seal_spill;
 pub mod seal_writer_loop;
 pub mod seal_writer_runner;
 pub mod seal_writer_task;
-pub mod self_trade_audit_persistence;
 pub mod selftest_audit_persistence;
 pub mod shadow_candle_writer;
 pub mod shadow_persistence;
 pub mod shadow_seal_columns;
-pub mod signal_audit_persistence;
-pub mod sl_replacement_audit_persistence;
 pub mod static_ip_audit_persistence;
 pub mod tick_persistence;
 pub mod tick_spill_drain;
 pub mod valkey_cache;
-pub mod volume_nse_audit_persistence;
 pub mod ws_frame_spill;
 pub mod ws_reconnect_audit_persistence;
 
