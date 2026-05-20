@@ -1180,11 +1180,12 @@ rules:
     justification: >-
       CROSS-VERIFY-01 = 15:31 IST same-day OHLCV mismatch vs Dhan REST
       /v2/charts/intraday. Severity::Critical. Operator-locked
-      2026-05-18 — does NOT block trading (alert+audit only).
-      Operator inspects cross_verify_mismatches table; verifies
-      whether aggregator missed ticks during known disconnect
-      (ws_reconnect_audit). Auto-backfill via REST is the recovery
-      mechanism for the candles_<tf> tables.
+      2026-05-18 — does NOT block trading (Telegram alert only;
+      cross-verify is table-free per #T5). Operator reads the
+      mismatched fields from the Telegram alert + errors.jsonl;
+      verifies whether the aggregator missed ticks during a known
+      disconnect. Auto-backfill via REST is the recovery mechanism
+      for the candles_<tf> tables.
 
   - name: cross-verify-02-1531-hist-unreachable-escalate
     match:
@@ -1209,8 +1210,9 @@ rules:
     justification: >-
       CROSS-VERIFY-03 = 08:05 IST morning 1d mismatch vs Dhan REST
       /v2/charts/historical. Severity::Critical. Operator-locked
-      2026-05-18 — does NOT block trading (alert+audit only).
-      Operator inspects cross_verify_audit for yesterday's derivation;
+      2026-05-18 — does NOT block trading (Telegram alert only;
+      cross-verify is table-free per #T5). Operator reads yesterday's
+      mismatched derivation from the Telegram alert + errors.jsonl;
       if our day-boundary alignment is wrong, fix the boundary logic
       and re-derive. Operator decides whether to trade today on
       suspect data.

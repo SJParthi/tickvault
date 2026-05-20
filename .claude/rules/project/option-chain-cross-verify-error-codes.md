@@ -80,13 +80,25 @@ Per `option-chain-z-plus-heart-piece.md` §8. The option_chain REST fetcher runs
 
 Per `aws-indices-only-locked-architecture.md` §14. Two daily gates: 15:31 IST same-day intraday verify + 08:05 IST morning 1d check.
 
+> **#T5 table-cleanup lock (2026-05-20):** cross-verify is **table-free**.
+> It compares our derived `candles_<tf>` against Dhan REST and against
+> `historical_candles`, and reports outcomes **via Telegram only** —
+> there is NO `cross_verify_audit` / `cross_verify_mismatches` QuestDB
+> table. The earlier design (`aws-indices-only-locked-architecture.md`
+> §14.4-14.5, `precision-realism-and-table-redesign.md` tables 11-12)
+> proposed audit tables; the QuestDB table-cleanup plan
+> (`.claude/plans/archive/`, item #T5) supersedes that — the result is
+> a Telegram alert + the structured `error!` log in
+> `data/logs/errors.jsonl.*`, nothing more. Future #9b+ schedulers
+> MUST NOT add an audit-table writer.
+
 ### CROSS-VERIFY-01 — 15:31 IST same-day mismatch
 
 **Severity:** Critical.
 **Auto-triage:** No (operator review).
-**Behavior:** alert + audit row only — does **NOT** block trading the next day (operator-locked 2026-05-18).
+**Behavior:** Telegram alert only — does **NOT** block trading the next day (operator-locked 2026-05-18) and writes **no audit table** (#T5).
 **Trigger:** at 15:31 IST after market close, the cross-verify scheduler runs 12 pairs (4 SIDs × 3 TFs: 1m, 5m, 15m). For each pair, our derived `candles_<tf>` is compared against Dhan REST `/v2/charts/intraday` for the same trading-date timestamps. Zero-tolerance OHLCV match required. Any mismatch fires this code.
-**Triage:** inspect `cross_verify_mismatches` table for the affected candle timestamps. Verify whether our aggregator missed ticks during a known disconnect window (check `ws_reconnect_audit`).
+**Triage:** the Telegram alert names every mismatched `(timeframe, candle timestamp, field)`; the same detail is in the structured `error!` log (`data/logs/errors.jsonl.*`). Verify whether our aggregator missed ticks during a known disconnect window (cross-check the WebSocket reconnect log lines).
 
 ### CROSS-VERIFY-02 — 15:31 IST historical REST unreachable
 
@@ -99,9 +111,9 @@ Per `aws-indices-only-locked-architecture.md` §14. Two daily gates: 15:31 IST s
 
 **Severity:** Critical.
 **Auto-triage:** No (operator review).
-**Behavior:** alert + audit row only — does **NOT** block trading the day (operator-locked 2026-05-18).
+**Behavior:** Telegram alert only — does **NOT** block trading the day (operator-locked 2026-05-18) and writes **no audit table** (#T5).
 **Trigger:** at 08:05 IST every trading day, fetch yesterday's 1d candle via `/v2/charts/historical` and compare against our derived `candles_1d` row. Zero-tolerance OHLCV match. Mismatch fires this code.
-**Triage:** inspect `cross_verify_audit` table. If our 1d derivation used incorrect day-boundary alignment, fix the boundary logic and re-derive. Yesterday's close becomes part of strategy decisions — operator must decide whether to trade today based on suspect data.
+**Triage:** the Telegram alert + the `error!` log (`data/logs/errors.jsonl.*`) carry the mismatched fields. If our 1d derivation used incorrect day-boundary alignment, fix the boundary logic and re-derive. Yesterday's close becomes part of strategy decisions — operator must decide whether to trade today based on suspect data.
 
 ### CROSS-VERIFY-04 — 08:05 IST historical REST unreachable
 
@@ -116,7 +128,7 @@ Per `aws-indices-only-locked-architecture.md` §14. Two daily gates: 15:31 IST s
 
 | Charter demand | How these stubs satisfy |
 |---|---|
-| 100% audit coverage | Every code maps to a future `option_chain_request_audit` or `cross_verify_audit` row when consumers land |
+| 100% audit coverage | Each code's full forensic detail is the Telegram alert + the structured `error!` line in `data/logs/errors.jsonl.*` (hourly-rotated, 48h retained). Cross-verify is table-free per #T5 — no QuestDB audit table |
 | 100% logging | Each code carries a `Severity` so tracing macros route correctly to CloudWatch |
 | 100% alerting | Critical-severity codes auto-route to SNS 4-leg fan-out (SMS + TG + Email + Connect call) |
 | 100% extreme check | `error_code_tag_guard.rs` enforces `code = ErrorCode::X.code_str()` field on every emit; `error_code_rule_file_crossref.rs` enforces this file's existence + cross-references |
