@@ -25,7 +25,6 @@ pub mod boot_ordering_gate;
 pub mod first_seen_set;
 pub mod last_seen_ltt_cache;
 pub mod no_tick_watchdog;
-pub mod prev_close_persist;
 pub mod prev_close_writer;
 pub mod prev_day_close_stamper;
 pub mod prev_oi_cache;
