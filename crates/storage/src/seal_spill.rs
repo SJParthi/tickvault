@@ -40,7 +40,7 @@
 //! |---|---|---|
 //! | 0    | 4 | `security_id: u32`              |
 //! | 4    | 1 | `exchange_segment_code: u8`     |
-//! | 5    | 1 | `tf_ordinal: u8` (0..=8 per `TfIndex`) |
+//! | 5    | 1 | `tf_ordinal: u8` (0..=20 per `TfIndex`) |
 //! | 6    | 2 | padding                         |
 //! | 8    | 4 | `bucket_start_ist_secs: u32`    |
 //! | 12   | 4 | `tick_count: u32`               |
@@ -83,9 +83,9 @@ pub const SEAL_SPILL_RECORD_SIZE: usize = 128;
 /// Self-contained binary record for spilled sealed bars.
 ///
 /// Field layout matches the wire-format table above. The
-/// `tf_ordinal` field is the `TfIndex::as_ordinal()` value (0..=8)
-/// from the trading crate; the future glue slice (item 1.2c) will
-/// translate `BufferedSeal::tf` ↔ `tf_ordinal` via a checked
+/// `tf_ordinal` field is the `TfIndex::as_ordinal()` value (0..=20)
+/// from the trading crate; the glue slice translates
+/// `BufferedSeal::tf` ↔ `tf_ordinal` via a checked
 /// `TfIndex::from_ordinal` round-trip.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SerializedSeal {
@@ -822,13 +822,13 @@ mod tests {
     }
 
     #[test]
-    fn test_from_buffered_seal_maps_all_9_tfs_to_correct_ordinal() {
+    fn test_from_buffered_seal_maps_all_21_tfs_to_correct_ordinal() {
         // Verify every TfIndex variant maps to its canonical ordinal
-        // (0..=8). This pins the trading↔storage contract: a future
+        // (0..=20). This pins the trading↔storage contract: a future
         // re-ordering of TfIndex::ALL would silently flip every
         // spilled record's TF assignment.
         let buffered = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0);
-        let mut tested: Vec<u8> = Vec::with_capacity(9);
+        let mut tested: Vec<u8> = Vec::with_capacity(TfIndex::ALL.len());
         for tf in TfIndex::ALL {
             let mut b = buffered;
             b.tf = tf;
@@ -841,7 +841,8 @@ mod tests {
             );
             tested.push(s.tf_ordinal);
         }
-        assert_eq!(tested, vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        let expected: Vec<u8> = (0..TfIndex::ALL.len() as u8).collect();
+        assert_eq!(tested, expected);
     }
 
     #[test]
@@ -858,7 +859,9 @@ mod tests {
     fn test_serialized_seal_tf_returns_none_for_out_of_range_ordinal() {
         let mut s =
             SerializedSeal::from(&mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0));
-        s.tf_ordinal = 9; // out of range
+        // 21 timeframes → valid ordinals are 0..=20; the first
+        // out-of-range ordinal is `TfIndex::ALL.len()` (= 21).
+        s.tf_ordinal = TfIndex::ALL.len() as u8; // out of range
         assert_eq!(s.tf(), None);
         s.tf_ordinal = 255;
         assert_eq!(s.tf(), None);
