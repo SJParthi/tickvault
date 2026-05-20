@@ -37,8 +37,6 @@ volumes:
     name: tv-questdb-data
   tv-valkey-data:
     name: tv-valkey-data
-  tv-grafana-data:
-    name: tv-grafana-data
   tv-prometheus-data:
     name: tv-prometheus-data
   # Phase 3 of active-plan.md — only used when `--profile logs` starts.
@@ -251,65 +249,6 @@ services:
       start_period: 10s
     networks:
       - tv-network
-
-  # ---------------------------------------------------------------------------
-  # Loki + Alloy + Jaeger — REMOVED for memory budget. Saves ~2.5GB RAM.
-  # Logs available via: docker logs tv-app  AND  data/logs/errors.jsonl.*
-  # Tracing available via: Prometheus metrics (tv_tick_processing_duration_ns)
-  # Re-enable on c7i.2xlarge+ by enabling the `logs` profile below.
-  # ---------------------------------------------------------------------------
-
-  # ---------------------------------------------------------------------------
-  # Grafana — Dashboards & Visualization
-  # Bible #27: grafana/grafana-oss:13.0.1
-  # Wave 7-A: 1GB -> 768MB.
-  # ---------------------------------------------------------------------------
-  tv-grafana:
-    image: grafana/grafana-oss:13.0.1@sha256:3625fdfa3cab904abdf9faaff8f40de0639b456ac5c5d322964fe705051d5455
-    container_name: tv-grafana
-    hostname: tv-grafana
-    restart: unless-stopped
-    mem_limit: 768m
-    cpus: 0.5
-    ports:
-      - "3000:3000"
-    volumes:
-      - tv-grafana-data:/var/lib/grafana
-      - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
-    environment:
-      GF_SECURITY_ADMIN_USER: ${TV_GRAFANA_ADMIN_USER:?Run bootstrap.sh first — Grafana credentials must come from AWS SSM}
-      GF_SECURITY_ADMIN_PASSWORD: ${TV_GRAFANA_ADMIN_PASSWORD:?Run bootstrap.sh first — Grafana credentials must come from AWS SSM}
-      # E5 security fix: anonymous users get Viewer role (not Admin).
-      # Admin access requires SSM-sourced credentials above.
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
-      GF_USERS_ALLOW_SIGN_UP: "false"
-      GF_SERVER_ROOT_URL: "http://localhost:3000"
-      GF_ANALYTICS_REPORTING_ENABLED: "false"
-      GF_UNIFIED_ALERTING_ENABLED: "true"
-      GF_DATE_FORMATS_DEFAULT_TIMEZONE: "Asia/Kolkata"
-      # QuestDB credentials for Grafana PostgreSQL datasource provisioning
-      TV_QUESTDB_PG_USER: ${TV_QUESTDB_PG_USER:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
-      TV_QUESTDB_PG_PASSWORD: ${TV_QUESTDB_PG_PASSWORD:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
-    depends_on:
-      tv-prometheus:
-        condition: service_healthy
-    logging:
-      driver: json-file
-      options:
-        max-size: "100m"
-        max-file: "5"
-    healthcheck:
-      # Use wget (always available in Grafana Alpine image; curl may not exist)
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
-    networks:
-      - tv-network
-
   # ---------------------------------------------------------------------------
   # Wave 7-A REMOVED: tv-traefik (traefik reverse proxy)
   # Replacement on AWS: AWS Application Load Balancer (free tier 750 hrs/mo).

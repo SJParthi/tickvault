@@ -12,13 +12,12 @@ use tracing::{info, instrument};
 use tickvault_common::constants::{
     DEFAULT_SSM_ENVIRONMENT, DHAN_CLIENT_ID_SECRET, DHAN_CLIENT_SECRET_SECRET,
     DHAN_SANDBOX_CLIENT_ID_SECRET, DHAN_SANDBOX_TOKEN_SECRET, DHAN_TOTP_SECRET,
-    GRAFANA_ADMIN_PASSWORD_SECRET, GRAFANA_ADMIN_USER_SECRET, QUESTDB_PG_PASSWORD_SECRET,
-    QUESTDB_PG_USER_SECRET, SSM_DHAN_SERVICE, SSM_GRAFANA_SERVICE, SSM_QUESTDB_SERVICE,
+    QUESTDB_PG_PASSWORD_SECRET, QUESTDB_PG_USER_SECRET, SSM_DHAN_SERVICE, SSM_QUESTDB_SERVICE,
     SSM_SECRET_BASE_PATH,
 };
 use tickvault_common::error::ApplicationError;
 
-use super::types::{DhanCredentials, GrafanaCredentials, QuestDbCredentials, TelegramCredentials};
+use super::types::{DhanCredentials, QuestDbCredentials, TelegramCredentials};
 
 // ---------------------------------------------------------------------------
 // SSM Path Construction
@@ -246,48 +245,6 @@ pub async fn fetch_questdb_credentials() -> Result<QuestDbCredentials, Applicati
     Ok(QuestDbCredentials {
         pg_user,
         pg_password,
-    })
-}
-
-/// Fetches Grafana admin credentials from AWS SSM Parameter Store.
-///
-/// Retrieves admin-user and admin-password, both wrapped in `SecretString`.
-/// Injected into docker-compose via environment variables.
-///
-/// # Errors
-///
-/// Returns `ApplicationError::SecretRetrieval` if any secret cannot be fetched.
-#[instrument(skip_all, fields(environment))]
-pub async fn fetch_grafana_credentials() -> Result<GrafanaCredentials, ApplicationError> {
-    let environment = resolve_environment()?;
-    tracing::Span::current().record("environment", environment.as_str());
-
-    let ssm_client = create_ssm_client().await;
-
-    let admin_user_path =
-        build_ssm_path(&environment, SSM_GRAFANA_SERVICE, GRAFANA_ADMIN_USER_SECRET);
-    let admin_password_path = build_ssm_path(
-        &environment,
-        SSM_GRAFANA_SERVICE,
-        GRAFANA_ADMIN_PASSWORD_SECRET,
-    );
-
-    info!(
-        admin_user_path = %admin_user_path,
-        admin_password_path = %admin_password_path,
-        "fetching Grafana credentials from SSM"
-    );
-
-    let (admin_user, admin_password) = tokio::try_join!(
-        fetch_secret(&ssm_client, &admin_user_path),
-        fetch_secret(&ssm_client, &admin_password_path),
-    )?;
-
-    info!("all Grafana credentials fetched successfully from SSM");
-
-    Ok(GrafanaCredentials {
-        admin_user,
-        admin_password,
     })
 }
 
@@ -635,34 +592,6 @@ mod tests {
         assert_eq!(
             build_ssm_path("prod", SSM_QUESTDB_SERVICE, QUESTDB_PG_PASSWORD_SECRET),
             "/tickvault/prod/questdb/pg-password"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // build_ssm_path — Grafana secret paths
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_build_ssm_path_grafana_dev() {
-        assert_eq!(
-            build_ssm_path("dev", SSM_GRAFANA_SERVICE, GRAFANA_ADMIN_USER_SECRET),
-            "/tickvault/dev/grafana/admin-user"
-        );
-        assert_eq!(
-            build_ssm_path("dev", SSM_GRAFANA_SERVICE, GRAFANA_ADMIN_PASSWORD_SECRET),
-            "/tickvault/dev/grafana/admin-password"
-        );
-    }
-
-    #[test]
-    fn test_build_ssm_path_grafana_prod() {
-        assert_eq!(
-            build_ssm_path("prod", SSM_GRAFANA_SERVICE, GRAFANA_ADMIN_USER_SECRET),
-            "/tickvault/prod/grafana/admin-user"
-        );
-        assert_eq!(
-            build_ssm_path("prod", SSM_GRAFANA_SERVICE, GRAFANA_ADMIN_PASSWORD_SECRET),
-            "/tickvault/prod/grafana/admin-password"
         );
     }
 
@@ -1293,16 +1222,6 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_questdb_credentials_returns_error_without_real_ssm() {
         let result = fetch_questdb_credentials().await;
-        if crate::test_support::has_aws_credentials() {
-            assert!(result.is_ok(), "with real AWS creds, fetch should succeed");
-        } else {
-            assert!(result.is_err(), "must fail without real SSM");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_fetch_grafana_credentials_returns_error_without_real_ssm() {
-        let result = fetch_grafana_credentials().await;
         if crate::test_support::has_aws_credentials() {
             assert!(result.is_ok(), "with real AWS creds, fetch should succeed");
         } else {

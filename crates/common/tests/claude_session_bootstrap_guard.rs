@@ -408,22 +408,6 @@ fn prometheus_alerts_include_depth_sequence_rules() {
 }
 
 #[test]
-fn operator_dashboard_has_depth_sequence_and_collision_panels() {
-    // PR #288 (#1): operator-health dashboard must have panels for the
-    // new depth sequence metrics + the collision-pair table so they are
-    // visible without grepping Prometheus.
-    let dash = read("deploy/docker/grafana/dashboards/operator-health.json");
-    assert!(
-        dash.contains("tv_depth_sequence_holes_total"),
-        "operator-health dashboard must visualize tv_depth_sequence_holes_total"
-    );
-    assert!(
-        dash.contains("tv_instrument_registry_collision_pair"),
-        "operator-health dashboard must visualize collision pairs"
-    );
-}
-
-#[test]
 fn chaos_valkey_kill_test_exists() {
     // PR #288 (#3): dedicated Valkey chaos test closes the one gap in the
     // existing 16-file chaos suite.
