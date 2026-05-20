@@ -65,17 +65,13 @@ use tickvault_core::websocket::connection_pool::WebSocketConnectionPool;
 use tickvault_core::websocket::order_update_connection::run_order_update_connection;
 use tickvault_core::websocket::types::{InstrumentSubscription, WebSocketError};
 
-use tickvault_storage::calendar_persistence;
 use tickvault_storage::candle_persistence::{
     CandlePersistenceWriter, ensure_candle_table_dedup_keys,
 };
 // PR #3 (2026-05-19): `greeks_persistence` retired. Migration SQL
 // `scripts/migrate-drop-greeks-tables.sql` drops the option_greeks /
 // pcr_snapshots / dhan_option_chain_raw / greeks_verification tables.
-use tickvault_storage::tick_persistence::{
-    DepthPersistenceWriter, TickPersistenceWriter, ensure_depth_and_prev_close_tables,
-    ensure_tick_table_dedup_keys,
-};
+use tickvault_storage::tick_persistence::{TickPersistenceWriter, ensure_tick_table_dedup_keys};
 
 // PR #3 (2026-05-19): `InlineGreeksComputer` retired alongside the
 // trading::greeks module. `build_inline_greeks_enricher` below now
@@ -99,59 +95,6 @@ use tickvault_api::state::{SharedAppState, SharedHealthStatus, SystemHealthStatu
 // #T2b (2026-05-20): probe_selftest_already_fired_today removed — it
 // SELECTed the deleted selftest_audit table for once-a-day dedup. The
 // market-open self-test scheduler now relies on its own timing.
-
-// ---------------------------------------------------------------------------
-// Phase 0 Item 19e — live_instance_lock audit row helper
-// ---------------------------------------------------------------------------
-
-/// Writes one row to the `live_instance_lock` QuestDB table capturing
-/// a lock-lifecycle event (Acquired / AlreadyHeld / ValkeyError at
-/// boot; LostOwnership / GracefulRelease wired in Item 19f).
-///
-/// Best-effort: a failure here NEVER halts boot. The
-/// Acquire/Halt decision is already routed to Telegram via
-/// `NotificationService` and to Loki via the structured `info!` /
-/// `error!` log; the audit row is the SQL-queryable forensic trail
-/// for SEBI's 5-year window.
-// TEST-EXEMPT: thin async wrapper over the storage helper; the
-// storage helper itself + its tests pin the SQL shape.
-// APPROVED: 7 wire-format fields plus QuestDB config — same shape as sibling audit-row writers (static_ip_audit, boot_audit).
-#[allow(clippy::too_many_arguments)]
-async fn write_live_instance_lock_row(
-    questdb_config: &tickvault_common::config::QuestDbConfig,
-    outcome: tickvault_storage::live_instance_lock_persistence::LiveInstanceLockOutcome,
-    host_id: &str,
-    peer_holder: &str,
-    env: &str,
-    lock_key: &str,
-    error_detail: &str,
-) {
-    let now_ist_nanos = chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .unwrap_or(0)
-        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
-    let trading_date_ist = now_ist_nanos - now_ist_nanos.rem_euclid(86_400_000_000_000);
-    if let Err(e) =
-        tickvault_storage::live_instance_lock_persistence::append_live_instance_lock_row(
-            questdb_config,
-            now_ist_nanos,
-            trading_date_ist,
-            outcome,
-            host_id,
-            peer_holder,
-            env,
-            lock_key,
-            error_detail,
-        )
-        .await
-    {
-        tracing::warn!(
-            error = ?e,
-            outcome = outcome.as_str(),
-            "live_instance_lock row write failed (boot continues — Telegram/Loki already carry the outcome)"
-        );
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Main
@@ -1280,18 +1223,11 @@ async fn main() -> Result<()> {
                     &config.questdb,
                 ),
             );
-            let fast_depth_writer = Some(
-                tickvault_storage::tick_persistence::DepthPersistenceWriter::new_disconnected(
-                    &config.questdb,
-                ),
-            );
-
             let _ = fast_registry; // PR #2: instrument_registry was used by deleted movers persistence helpers
             let handle = tokio::spawn(async move {
                 run_tick_processor(
                     receiver,
                     fast_tick_writer,
-                    fast_depth_writer,
                     tick_broadcast_for_processor,
                     greeks_enricher,
                     Some(fast_tick_heartbeat),
@@ -1397,26 +1333,16 @@ async fn main() -> Result<()> {
                     .await;
                 tokio::join!(
                     ensure_tick_table_dedup_keys(&config.questdb),
-                    ensure_depth_and_prev_close_tables(&config.questdb),
                     ensure_candle_table_dedup_keys(&config.questdb),
-                    calendar_persistence::ensure_calendar_table(&config.questdb),
                     tickvault_storage::shadow_persistence::ensure_shadow_candle_tables(
                         &config.questdb
                     ),
                     // Candle-engine re-architecture #T1b: `ensure_candle_views`
                     // (Engine C matview cascade) RETIRED.
                     // PR #3 (2026-05-19): `ensure_greeks_tables` retired.
+                    // #T4 (2026-05-20): `ensure_depth_and_prev_close_tables`
+                    // + `calendar_persistence` retired.
                 );
-                // Persist trading calendar to QuestDB (best-effort, non-blocking).
-                // Gap 5: log on failure instead of silent drop.
-                if let Err(err) =
-                    calendar_persistence::persist_calendar(&trading_calendar, &config.questdb)
-                {
-                    warn!(
-                        ?err,
-                        "calendar persistence failed (non-critical, best-effort)"
-                    );
-                }
 
                 info!("QuestDB DDL complete (background)");
             },
@@ -1933,15 +1859,6 @@ async fn main() -> Result<()> {
     let instance_lock_handle: Option<tokio::task::JoinHandle<()>> = if trading_mode.is_live() {
         info!("Phase 0 Item 19: acquiring dual-instance Valkey lock");
 
-        // Phase 0 Item 19e — ensure the audit table exists BEFORE
-        // the lifecycle event INSERTs below. Idempotent CREATE TABLE
-        // IF NOT EXISTS; failures log inside the helper and do NOT
-        // halt boot.
-        tickvault_storage::live_instance_lock_persistence::ensure_live_instance_lock_table(
-            &config.questdb,
-        )
-        .await;
-
         // SSM is the only authorized source for the Valkey password
         // per rust-code.md. The boot-time fetch hard-fails on any SSM
         // error — running with no Valkey AUTH would let an attacker
@@ -1991,20 +1908,6 @@ async fn main() -> Result<()> {
                         lock_key: lock_key_for_audit.clone(),
                     },
                 );
-                // Phase 0 Item 19e — persist the boot-halt outcome.
-                // host_id is unavailable at this site (it's derived
-                // after the pool builds), so the audit row uses an
-                // empty host_id; the error_detail captures the cause.
-                write_live_instance_lock_row(
-                    &config.questdb,
-                    tickvault_storage::live_instance_lock_persistence::LiveInstanceLockOutcome::ValkeyError,
-                    "",
-                    "",
-                    &env_for_audit,
-                    &lock_key_for_audit,
-                    &format!("valkey-pool-build-error: {err}"),
-                )
-                .await;
                 return Ok(());
             }
         };
@@ -2040,17 +1943,6 @@ async fn main() -> Result<()> {
                     ttl_secs = tickvault_core::instance_lock::INSTANCE_LOCK_TTL_SECS,
                     "Phase 0 Item 19: dual-instance lock acquired"
                 );
-                // Phase 0 Item 19e — persist Acquired outcome.
-                write_live_instance_lock_row(
-                    &config.questdb,
-                    tickvault_storage::live_instance_lock_persistence::LiveInstanceLockOutcome::Acquired,
-                    &host_id,
-                    "",
-                    &env,
-                    &lock_key,
-                    "",
-                )
-                .await;
             }
             Ok(tickvault_core::instance_lock::AcquireOutcome::AlreadyHeld { holder }) => {
                 error!(
@@ -2065,21 +1957,6 @@ async fn main() -> Result<()> {
                     peer = %holder,
                     "Phase 0 Item 19: another tickvault process holds the lock — BLOCKING BOOT"
                 );
-                // Phase 0 Item 19e — persist the AlreadyHeld outcome
-                // BEFORE the Telegram + return so the audit row exists
-                // even if the notifier path errors. Clone host_id /
-                // env / lock_key for the audit (the values flow into
-                // the notifier afterwards by move).
-                write_live_instance_lock_row(
-                    &config.questdb,
-                    tickvault_storage::live_instance_lock_persistence::LiveInstanceLockOutcome::AlreadyHeld,
-                    &host_id,
-                    &holder,
-                    &env,
-                    &lock_key,
-                    "",
-                )
-                .await;
                 notifier.notify(
                     tickvault_core::notification::events::NotificationEvent::DualInstanceDetected {
                         holder,
@@ -2104,17 +1981,6 @@ async fn main() -> Result<()> {
                     lock_key = %lock_key,
                     "Phase 0 Item 19: Valkey acquire-attempt failed — BLOCKING BOOT"
                 );
-                // Phase 0 Item 19e — persist the ValkeyError outcome.
-                write_live_instance_lock_row(
-                    &config.questdb,
-                    tickvault_storage::live_instance_lock_persistence::LiveInstanceLockOutcome::ValkeyError,
-                    &host_id,
-                    "",
-                    &env,
-                    &lock_key,
-                    &format!("valkey-acquire-error: {err}"),
-                )
-                .await;
                 notifier.notify(
                     tickvault_core::notification::events::NotificationEvent::DualInstanceDetected {
                         holder: format!("(valkey-error: {err})"),
@@ -2138,8 +2004,6 @@ async fn main() -> Result<()> {
             valkey_pool,
             env,
             host_id,
-            lock_key,
-            config.questdb.clone(),
             heartbeat_shutdown_inner,
         );
         instance_lock_shutdown_chain = Some(heartbeat_shutdown_for_chain);
@@ -2317,9 +2181,7 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 6b: Set up QuestDB tick persistence (best-effort)
     // -----------------------------------------------------------------------
-    info!(
-        "setting up QuestDB tables (ticks + instruments + depth + previous_close + historical_candles + materialized views + greeks)"
-    );
+    info!("setting up QuestDB tables (ticks + candles + option_chain + historical_candles)");
 
     // Wave 2 Item 7 (G14) — block until QuestDB is reachable. Escalating
     // logs at +5/+10/+20s; BOOT-01 ERROR @+30s; BOOT-02 HALT @+60s.
@@ -2417,9 +2279,7 @@ async fn main() -> Result<()> {
     // every clean boot until 2026-04-28.
     tokio::join!(
         ensure_tick_table_dedup_keys(&config.questdb),
-        ensure_depth_and_prev_close_tables(&config.questdb),
         ensure_candle_table_dedup_keys(&config.questdb),
-        calendar_persistence::ensure_calendar_table(&config.questdb),
         // Candle-engine re-architecture #T1b: `ensure_candle_views`
         // (Engine C — `candles_1s` matview cascade) RETIRED. The 21
         // plain `candles_<tf>` tables are created by
@@ -2427,17 +2287,13 @@ async fn main() -> Result<()> {
         // dropped by `drop_legacy_candle_objects` before this join.
         // PR #3 (2026-05-19): `ensure_greeks_tables` retired alongside
         // the deleted greeks_persistence module.
-        tickvault_storage::indicator_snapshot_persistence::ensure_indicator_snapshot_table(
-            &config.questdb
-        ),
         // PR #4 (2026-05-19): `ensure_deep_depth_table` retired alongside
         // the deleted depth-20/200 pipelines (operator lock 2026-05-15).
-        tickvault_storage::obi_persistence::ensure_obi_table(&config.questdb),
-        // Wave 1 Item 4.2 — un-deprecated previous_close table. Schema
-        // includes the new `source` column (CODE6 / QUOTE_CLOSE /
-        // FULL_CLOSE) and idempotent ALTER ADD COLUMN IF NOT EXISTS so
-        // existing deployments auto-migrate.
-        tickvault_storage::previous_close_persistence::ensure_previous_close_table(&config.questdb,),
+        // #T4 (2026-05-20): `ensure_depth_and_prev_close_tables`,
+        // `calendar_persistence`, `indicator_snapshot_persistence`,
+        // `obi_persistence`, `previous_close_persistence` ensure_* calls
+        // retired — market_depth / nse_holidays / indicator_snapshots /
+        // obi_snapshots / previous_close tables dropped.
         // #T2b (2026-05-20): the 8 audit-table ensure_* calls
         // (ws_reconnect / auth_renewal / boot / selftest / order /
         // gap_fill / last_tick / orphan_position) were removed with
@@ -2540,14 +2396,6 @@ async fn main() -> Result<()> {
     // #T2b (2026-05-20): the boot_audit row write was removed with the
     // boot_audit table (QuestDB table cleanup).
 
-    // Persist trading calendar to QuestDB (best-effort, non-blocking).
-    if let Err(err) = calendar_persistence::persist_calendar(&trading_calendar, &config.questdb) {
-        warn!(
-            ?err,
-            "calendar persistence failed (non-critical, best-effort)"
-        );
-    }
-
     // Wave 1 Item 0.d — boot-time idempotent init for the index prev_close
     // cache directory. Hoisted out of the tick hot path (was a per-packet
     // `std::fs::create_dir_all` call on every PrevClose code-6 frame).
@@ -2576,7 +2424,6 @@ async fn main() -> Result<()> {
     let first_seen = tickvault_core::pipeline::first_seen_set::init_global();
     let _first_seen_reset_handle =
         tickvault_core::pipeline::first_seen_set::spawn_ist_midnight_reset_task(first_seen);
-    tickvault_core::pipeline::prev_close_persist::init(&config.questdb);
 
     // Wave 1 Item 0.b part 2 — async tick spill drain. Adds an mpsc(8192)
     // layer in front of the existing sync BufWriter spill so the hot path
@@ -2659,46 +2506,8 @@ async fn main() -> Result<()> {
         }
     };
 
-    let depth_writer = match DepthPersistenceWriter::new(&config.questdb) {
-        Ok(mut writer) => {
-            // Recover stale depth spill files from previous crashes.
-            let recovered = writer.recover_stale_spill_files();
-            if recovered > 0 {
-                info!(
-                    recovered,
-                    "recovered stale depth spill files from previous crash"
-                );
-                notifier.notify(NotificationEvent::Custom {
-                    message: format!(
-                        "Startup: recovered {recovered} depth snapshots from previous crash spill files"
-                    ),
-                });
-            }
-            info!("QuestDB depth writer connected");
-            Some(writer)
-        }
-        Err(err) => {
-            error!(
-                ?err,
-                "QuestDB depth writer unavailable at startup — buffering depth in ring buffer + \
-                 disk spill until QuestDB comes back"
-            );
-            // B2: Use disconnected mode instead of None — ensures zero depth data loss.
-            // The writer will auto-reconnect every 30s and drain the buffer on recovery.
-            // B3: CRITICAL Telegram alert for depth writer unavailable at startup.
-            notifier.notify(NotificationEvent::Custom {
-                message: "CRITICAL: QuestDB Depth Writer UNAVAILABLE — \
-                          Depth persistence in disconnected mode. \
-                          All depth data buffered until QuestDB comes back."
-                    .to_owned(),
-            });
-            let mut writer = DepthPersistenceWriter::new_disconnected(&config.questdb);
-            // Attempt recovery even in disconnected mode — spill files may exist
-            // from a previous session where QuestDB was available.
-            let _ = writer.recover_stale_spill_files();
-            Some(writer)
-        }
-    };
+    // #T4 (2026-05-20): depth_writer construction removed — `market_depth`
+    // table dropped; the IDX_I-only universe runs Quote mode (no depth).
 
     // -----------------------------------------------------------------------
     // Step 6c: Pre-market readiness check (Parthiban directive 2026-04-21)
@@ -3177,25 +2986,11 @@ async fn main() -> Result<()> {
                      downstream OI Change is Dhan-precise"
                 );
             }
-            // F2 (Wave-5 §K-L13 / #504e follow-up): populate the
-            // `PrevDayCache` consumed by the cascade seal-time pct-
-            // stamping path (PR #520 / F1). Reads `prev_close` from
-            // QuestDB's `previous_close` table and merges the boot-
-            // loaded `prev_oi_cache` (immediately above). Best-effort
-            // — on QuestDB unreachable / SELECT failure the loader
-            // emits PREVCLOSE-04 and the cascade falls back to 0.0
-            // pct fields per the div-by-zero policy.
-            let f2_questdb = config.questdb.clone();
-            let f2_cache = std::sync::Arc::clone(&prev_day_cache);
-            let f2_prev_oi = std::sync::Arc::clone(&prev_oi_cache);
-            tokio::spawn(async move {
-                tickvault_app::prev_day_cache_loader::populate_and_log(
-                    &f2_questdb,
-                    &f2_cache,
-                    &f2_prev_oi,
-                )
-                .await;
-            });
+            // #T4 (2026-05-20): the `previous_close` QuestDB table was
+            // dropped. The boot-time `prev_day_cache_loader` SELECT
+            // against it is retired — `PrevDayCache` stays empty and
+            // the cascade seal-time pct path falls back to 0.0 pct
+            // fields per the documented div-by-zero policy.
         } else {
             warn!(
                 "prev_oi cache loader NOT spawned — slow_registry is None \
@@ -3410,7 +3205,6 @@ async fn main() -> Result<()> {
             run_tick_processor(
                 receiver,
                 tick_writer,
-                depth_writer,
                 tick_broadcast_for_processor,
                 greeks_enricher,
                 Some(slow_tick_heartbeat),

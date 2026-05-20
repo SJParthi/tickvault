@@ -8,7 +8,7 @@
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::TICK_BUFFER_CAPACITY;
 use tickvault_common::tick_types::ParsedTick;
-use tickvault_storage::tick_persistence::{DepthPersistenceWriter, TickPersistenceWriter};
+use tickvault_storage::tick_persistence::TickPersistenceWriter;
 
 /// Returns a `QuestDbConfig` pointing at a non-existent port so that all
 /// ILP connection attempts fail immediately without network delay.
@@ -197,19 +197,6 @@ fn test_disk_spill_activates_when_buffer_full() {
 
     // Clean up spill file
     let _ = std::fs::remove_dir_all("data/spill");
-}
-
-/// The DepthPersistenceWriter::new_disconnected must start in disconnected
-/// buffering mode, just like the tick writer.
-#[test]
-fn test_depth_writer_new_disconnected_buffers() {
-    let config = test_config();
-    let writer = DepthPersistenceWriter::new_disconnected(&config);
-
-    assert!(
-        !writer.is_connected(),
-        "disconnected depth writer must report is_connected() == false"
-    );
 }
 
 /// force_flush on a disconnected tick writer must not panic or lose data.
