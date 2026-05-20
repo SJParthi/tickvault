@@ -204,11 +204,28 @@ spam from the watchdog disconnect/reconnect cycle that occurs when Dhan sends no
 data after market close. During market hours, infinite retries are maintained
 (Dhan pings every 10s, so consecutive failures = real problem worth retrying).
 
-### IDX_I Special Case
+### IDX_I Special Case — Quote mode (operator directive 2026-05-20)
 
-Indices (segment code 0) are forced to Ticker mode regardless of configured feed
-mode. Dhan silently ignores Quote/Full subscriptions for IDX_I. The subscription
-builder pre-sorts IDX_I instruments into separate Ticker-mode batches.
+Indices (segment code 0) are subscribed in **Quote mode** (`FeedRequestCode`
+17). The `WebSocketConnection` constructor pre-sorts IDX_I instruments into a
+separate Quote-mode subscription batch (`connection.rs`, the
+`idx_instruments` partition).
+
+**Why Quote, not Ticker:** the Quote packet (response code 4, 50 bytes)
+carries `day_open` / `day_high` / `day_low` / `day_close` at fixed offsets
+(parsed by `parse_quote_packet`). That is the exchange-computed session OHLC,
+delivered in every packet — so the index 09:15 open and running day high/low
+come straight from Dhan, with no app-side tracking.
+
+**History:** before 2026-05-20 IDX_I was force-subscribed in Ticker mode
+(LTP-only, 16 bytes) on the *assumption* that "Dhan silently ignores
+Quote/Full for index feeds". That assumption was never live-verified — our
+own code never sent a Quote subscription for an index. The operator directed
+switching to Quote mode to obtain day OHLC directly. Worst case, if Dhan does
+ignore Quote for IDX_I, it still streams Ticker-grade packets, so LTP capture
+is unaffected. Verify against the live `ticks` table after a session: if the
+IDX_I `open`/`high`/`low` columns are non-zero, Dhan honors Quote mode for
+indices and `DayOhlcTracker` is redundant.
 
 ## Key Files
 
@@ -224,7 +241,7 @@ builder pre-sorts IDX_I instruments into separate Ticker-mode batches.
 - Subscribing to wrong instruments (ATM filtering ensures relevance)
 - Exceeding Dhan limits (5 connections, 5000/conn, 100/msg enforced)
 - Numeric SecurityId in JSON (must be string: `"1333"` not `1333`)
-- Wrong feed mode for indices (IDX_I forced to Ticker)
+- Wrong feed mode for indices (IDX_I subscribes in Quote mode for day OHLC)
 - Confusion with depth protocol (main feed = 8-byte header, f32 prices)
 
 ## Trigger

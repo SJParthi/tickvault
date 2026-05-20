@@ -383,8 +383,19 @@ impl WebSocketConnection {
     ) -> Self {
         let websocket_base_url = dhan_config.websocket_url.clone(); // O(1) EXEMPT: constructor — once
 
-        // Pre-build subscription messages once. IDX_I instruments only support Ticker mode —
-        // Dhan silently drops Full/Quote subscriptions for index value feeds.
+        // Pre-build subscription messages once.
+        //
+        // IDX_I (index value) instruments are subscribed in QUOTE mode
+        // (operator directive 2026-05-20). The Quote packet (response
+        // code 4, 50 bytes) carries `day_open` / `day_high` / `day_low`
+        // / `day_close` at fixed offsets — see `parse_quote_packet`.
+        // That is the exchange-computed session OHLC, delivered directly
+        // in every packet, so we do NOT have to derive the index open
+        // ourselves. The prior code force-subscribed IDX_I in Ticker
+        // mode (LTP-only, 16 bytes) on the ASSUMPTION that Dhan ignores
+        // Quote/Full for index feeds — that assumption was never
+        // live-verified. Worst case, if Dhan does ignore it, it still
+        // streams Ticker-grade packets and we lose nothing vs before.
         // O(1) EXEMPT: constructor — runs once at startup, not per tick.
         let (idx_instruments, non_idx_instruments): (Vec<_>, Vec<_>) = instruments
             .iter()
@@ -399,7 +410,7 @@ impl WebSocketConnection {
         if !idx_instruments.is_empty() {
             cached_subscription_messages.extend(build_subscription_messages(
                 &idx_instruments,
-                FeedMode::Ticker,
+                FeedMode::Quote,
                 ws_config.subscription_batch_size,
             ));
         }
@@ -2371,7 +2382,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cached_messages_idx_i_uses_ticker() {
+    fn test_cached_messages_idx_i_uses_quote() {
         let (tx, _rx) = mpsc::channel(100);
         let instruments = vec![
             InstrumentSubscription::new(ExchangeSegment::IdxI, 13),
@@ -2384,13 +2395,14 @@ mod tests {
             make_test_dhan_config(),
             make_test_ws_config(),
             instruments,
-            FeedMode::Full, // Configured as Full, but IDX_I should use Ticker
+            FeedMode::Full, // Configured as Full, but IDX_I uses Quote
             tx,
             None,
         );
-        // All IDX_I → only Ticker messages (request_code 15), NOT Full (21)
+        // All IDX_I → only Quote messages (request_code 17), NOT Full (21).
+        // Operator directive 2026-05-20 — Quote packet carries day OHLC.
         assert_eq!(conn.cached_subscription_messages.len(), 1);
-        assert!(conn.cached_subscription_messages[0].contains("\"RequestCode\":15"));
+        assert!(conn.cached_subscription_messages[0].contains("\"RequestCode\":17"));
         assert!(!conn.cached_subscription_messages[0].contains("\"RequestCode\":21"));
     }
 
@@ -2450,22 +2462,25 @@ mod tests {
             make_test_dhan_config(),
             make_test_ws_config(),
             instruments,
-            FeedMode::Full, // Non-IDX gets Full (21), IDX_I gets Ticker (15)
+            FeedMode::Full, // Non-IDX gets Full (21), IDX_I gets Quote (17)
             tx,
             None,
         );
-        // 2 non-IDX → 1 Full message, 2 IDX_I → 1 Ticker message = 2 total
+        // 2 non-IDX → 1 Full message, 2 IDX_I → 1 Quote message = 2 total
         assert_eq!(conn.cached_subscription_messages.len(), 2);
         let has_full = conn
             .cached_subscription_messages
             .iter()
             .any(|m| m.contains("\"RequestCode\":21"));
-        let has_ticker = conn
+        // IDX_I subscribes in Quote mode (RequestCode 17) per the
+        // 2026-05-20 operator directive — the Quote packet carries
+        // day open/high/low directly.
+        let has_quote = conn
             .cached_subscription_messages
             .iter()
-            .any(|m| m.contains("\"RequestCode\":15"));
+            .any(|m| m.contains("\"RequestCode\":17"));
         assert!(has_full, "Should have Full mode message for NseFno");
-        assert!(has_ticker, "Should have Ticker mode message for IdxI");
+        assert!(has_quote, "Should have Quote mode message for IdxI");
     }
 
     // --- Edge Case: Empty client_id ---
@@ -2792,7 +2807,7 @@ mod tests {
     // --- Only IDX_I instruments with Ticker mode (should still use Ticker) ---
 
     #[test]
-    fn test_connection_only_idx_i_in_ticker_mode() {
+    fn test_connection_only_idx_i_in_quote_mode() {
         let (tx, _rx) = mpsc::channel(100);
         let instruments = vec![InstrumentSubscription::new(ExchangeSegment::IdxI, 13)];
         let conn = WebSocketConnection::new(
@@ -2802,12 +2817,12 @@ mod tests {
             make_test_dhan_config(),
             make_test_ws_config(),
             instruments,
-            FeedMode::Ticker, // Same as forced mode for IDX_I
+            FeedMode::Ticker, // Passed mode applies to non-IDX only; IDX_I uses Quote
             tx,
             None,
         );
         assert_eq!(conn.cached_subscription_messages.len(), 1);
-        assert!(conn.cached_subscription_messages[0].contains("\"RequestCode\":15"));
+        assert!(conn.cached_subscription_messages[0].contains("\"RequestCode\":17"));
     }
 
     // --- Batch size of 1 with multiple instruments ---
@@ -4181,7 +4196,7 @@ mod tests {
     }
 
     #[test]
-    fn test_connection_idx_instruments_use_ticker_mode() {
+    fn test_connection_idx_instruments_use_quote_mode() {
         let (tx, _rx) = mpsc::channel(100);
         let instruments = vec![InstrumentSubscription::new(ExchangeSegment::IdxI, 13)];
         let conn = WebSocketConnection::new(
@@ -4191,16 +4206,16 @@ mod tests {
             make_test_dhan_config(),
             make_test_ws_config(),
             instruments,
-            FeedMode::Full, // Full mode specified but IDX_I should use Ticker
+            FeedMode::Full, // Full mode specified but IDX_I uses Quote
             tx,
             None,
         );
         assert!(!conn.cached_subscription_messages.is_empty());
-        // The subscription message should contain RequestCode 15 (SubscribeTicker)
+        // The subscription message should contain RequestCode 17 (SubscribeQuote).
         let msg = &conn.cached_subscription_messages[0];
         assert!(
-            msg.contains("15"),
-            "IDX_I should subscribe with Ticker mode (code 15): {}",
+            msg.contains("\"RequestCode\":17"),
+            "IDX_I should subscribe with Quote mode (code 17): {}",
             msg
         );
     }
@@ -4366,9 +4381,9 @@ mod tests {
             tx,
             None,
         );
-        // All instruments are IDX, so all use Ticker (code 15), no Full messages
+        // All instruments are IDX, so all use Quote (code 17), no Full messages
         assert_eq!(conn.cached_subscription_messages.len(), 1);
-        assert!(conn.cached_subscription_messages[0].contains("\"RequestCode\":15"));
+        assert!(conn.cached_subscription_messages[0].contains("\"RequestCode\":17"));
         assert!(!conn.cached_subscription_messages[0].contains("\"RequestCode\":21"));
     }
 
