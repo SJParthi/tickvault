@@ -251,10 +251,11 @@ summary file and drives the above flow.
       validate-automation` runs 20 end-to-end checks.
 - [x] **Phase 10.1** — Zero-tick-loss alert guard (4 Prometheus alerts
       pinned, 7 source-invariant tests).
-- [x] **Phase 10.2** — Sequence-hole detector shipped:
-      `crates/core/src/pipeline/depth_sequence_tracker.rs` with
-      `dhat_depth_sequence_tracker.rs` (zero-alloc) and
-      `loom_depth_sequence_tracker.rs` (concurrency) ratchets.
+- [~] **Phase 10.2** — Sequence-hole detector was shipped, then RETIRED
+      when the depth-20/200 feeds were removed (AWS-lifecycle PR #4).
+      Depth WebSockets are forbidden forever per
+      `.claude/rules/project/websocket-connection-scope-lock.md`; the
+      detector module and its DHAT + loom ratchets were deleted too.
 - [x] **Phase 10.3** — Tick-loss chaos test shipped:
       `crates/storage/tests/chaos_zero_tick_loss.rs`.
 - [x] **Phase 11** — WS + QuestDB + Valkey resilience SLA ALERT GUARD
