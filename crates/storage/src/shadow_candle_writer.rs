@@ -1,9 +1,9 @@
-//! Wave 6 Sub-PR #1 item 1.2f.2 — `ShadowCandleWriter` ILP append struct.
+//! Candle-engine re-architecture #T1a — `ShadowCandleWriter` ILP append struct.
 //!
 //! Owns the questdb-rs `Sender` + `Buffer` and exposes
 //! `append_seal(&BufferedSeal)` which fills the ILP buffer for the
-//! correct `candles_*_shadow` table by dispatching through
-//! [`ShadowSealRow::from_buffered_seal`] (item 1.2f.1).
+//! correct plain `candles_<tf>` table by dispatching through
+//! [`ShadowSealRow::from_buffered_seal`].
 //!
 //! ## Mirrors `LiveCandleWriter` connection-management pattern
 //!
@@ -16,13 +16,13 @@
 //! ## What this slice ships
 //!
 //! - [`ShadowCandleWriter`] struct (lazy-connect ILP writer for the
-//!   9 `candles_*_shadow` tables).
+//!   21 plain `candles_<tf>` tables).
 //! - [`ShadowCandleWriter::new`] — production constructor.
 //! - [`ShadowCandleWriter::append_seal`] — fills the ILP buffer for the
-//!   right shadow table; uses [`ShadowSealRow`] for column dispatch.
+//!   right candle table; uses [`ShadowSealRow`] for column dispatch.
 //! - Observability accessors: `is_connected`, `pending_count`,
 //!   `buffer_byte_count`, `buffer_row_count`.
-//! - 16 unit tests covering: lazy disconnect-OK construction; appends
+//! - Unit tests covering: lazy disconnect-OK construction; appends
 //!   fill the buffer; row count grows; bytes contain the expected
 //!   table name + segment string + IST timestamp; multi-TF dispatch;
 //!   I-P1-11 segment isolation in the wire bytes; pending_count
@@ -41,6 +41,7 @@
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
+use secrecy::SecretString;
 use tracing::{debug, warn};
 
 use tickvault_common::config::QuestDbConfig;
@@ -55,27 +56,30 @@ fn build_ilp_conf_string(host: &str, ilp_port: u16) -> String {
     format!("tcp::addr={host}:{ilp_port};")
 }
 
-/// ILP writer for the 9 `candles_*_shadow` tables.
+/// ILP writer for the 21 plain `candles_<tf>` tables.
 ///
-/// Single producer (the future async writer task in item 1.2f.3 is
-/// the sole owner) — `&mut self` methods are sufficient.
+/// Single producer (the async writer task is the sole owner) —
+/// `&mut self` methods are sufficient.
 pub struct ShadowCandleWriter {
     /// Production sender. `None` when QuestDB is unreachable; the
-    /// future writer task slice will retry connection in a throttled
-    /// loop. This slice only flips it from `Some → None` on flush
-    /// failure (item 1.2f.3 will handle reconnect).
+    /// writer task retries connection in a throttled loop. This
+    /// slice only flips it from `Some → None` on flush failure.
     sender: Option<Sender>,
     /// In-memory ILP wire-format buffer. Filled by `append_seal`,
     /// drained by `flush`. Reused across batches to avoid alloc.
     buffer: Buffer,
     /// Number of seals appended since the last successful flush. Used
-    /// by the future writer task to drive batch-size-based flush
-    /// triggers and by tests to verify append behaviour.
+    /// by the writer task to drive batch-size-based flush triggers
+    /// and by tests to verify append behaviour.
     pending_count: usize,
-    /// Retained for the future reconnect logic in item 1.2f.3.
-    // APPROVED: read by item 1.2f.3 reconnect path; no callers in this slice.
+    /// Retained for the reconnect logic. Finding S2 (HIGH): the ILP
+    /// conf string is wrapped in `SecretString` because it carries
+    /// the QuestDB endpoint and (in conf-string-auth deployments)
+    /// could carry credentials — never logged via `Debug`. Read it
+    /// back with `.expose_secret()` only at `Sender` construction.
+    // APPROVED: read by the reconnect path; no callers in this slice.
     #[allow(dead_code)]
-    ilp_conf_string: String,
+    ilp_conf_string: SecretString,
 }
 
 impl ShadowCandleWriter {
@@ -105,7 +109,7 @@ impl ShadowCandleWriter {
             sender,
             buffer,
             pending_count: 0,
-            ilp_conf_string: conf_string,
+            ilp_conf_string: SecretString::from(conf_string),
         })
     }
 
@@ -120,7 +124,7 @@ impl ShadowCandleWriter {
             sender: None,
             buffer: Buffer::new(ProtocolVersion::V1),
             pending_count: 0,
-            ilp_conf_string: String::new(),
+            ilp_conf_string: SecretString::from(String::new()),
         }
     }
 
@@ -163,56 +167,52 @@ impl ShadowCandleWriter {
     }
 
     /// Append one sealed candle to the ILP buffer for its target
-    /// `candles_*_shadow` table.
+    /// plain `candles_<tf>` table.
     ///
     /// Dispatch:
-    /// - `Buffer::table(row.table_name)` — one of the 9 shadow tables
-    ///   per `seal.tf.shadow_table_name()`.
-    /// - `symbol("exchange_segment", row.exchange_segment)` — IDX_I /
-    ///   NSE_EQ / NSE_FNO / etc. per `segment_code_to_str`.
+    /// - `Buffer::table(row.table_name)` — one of the 21 plain candle
+    ///   tables per `seal.tf.table_name()`.
+    /// - `symbol("segment", row.segment)` — IDX_I / NSE_EQ / NSE_FNO /
+    ///   etc. per `segment_code_to_str`.
     /// - `column_i64("security_id", row.security_id)` — composite-key
     ///   part 1 (I-P1-11).
     /// - `column_f64("open" / "high" / "low" / "close")` — OHLC.
     /// - `column_i64("volume" / "oi" / "tick_count")` — non-OHLC ints.
-    /// - `column_f64("close_pct_from_prev_day" / "oi_pct..." /
-    ///   "volume_pct...")` — Wave-5 stamped pct fields.
     /// - `at(TimestampNanos::new(row.timestamp_ist_nanos))` —
     ///   designated timestamp from `bucket_start_ist_secs * 1e9`
     ///   (CRITICAL data-integrity rule: NEVER add IST offset).
     ///
+    /// The 3 `*_pct_from_prev_day` columns of the legacy shadow schema
+    /// are intentionally NOT written — the plain candle tables have a
+    /// 10-column schema with no pct columns.
+    ///
     /// The `Buffer` is reused across calls. After N appends the
-    /// caller (the future writer task) calls [`Self::flush`] to send.
+    /// caller (the writer task) calls [`Self::flush`] to send.
     pub fn append_seal(&mut self, seal: &BufferedSeal) -> Result<()> {
         let row = ShadowSealRow::from_buffered_seal(seal);
         self.buffer
             .table(row.table_name)
-            .with_context(|| format!("shadow append: invalid table name {}", row.table_name))?
-            .symbol("exchange_segment", row.exchange_segment)
-            .with_context(|| "shadow append: symbol(exchange_segment) failed")?
+            .with_context(|| format!("candle append: invalid table name {}", row.table_name))?
+            .symbol("segment", row.segment)
+            .with_context(|| "candle append: symbol(segment) failed")?
             .column_i64("security_id", row.security_id)
-            .with_context(|| "shadow append: column_i64(security_id) failed")?
+            .with_context(|| "candle append: column_i64(security_id) failed")?
             .column_f64("open", row.open)
-            .with_context(|| "shadow append: column_f64(open) failed")?
+            .with_context(|| "candle append: column_f64(open) failed")?
             .column_f64("high", row.high)
-            .with_context(|| "shadow append: column_f64(high) failed")?
+            .with_context(|| "candle append: column_f64(high) failed")?
             .column_f64("low", row.low)
-            .with_context(|| "shadow append: column_f64(low) failed")?
+            .with_context(|| "candle append: column_f64(low) failed")?
             .column_f64("close", row.close)
-            .with_context(|| "shadow append: column_f64(close) failed")?
+            .with_context(|| "candle append: column_f64(close) failed")?
             .column_i64("volume", row.volume)
-            .with_context(|| "shadow append: column_i64(volume) failed")?
+            .with_context(|| "candle append: column_i64(volume) failed")?
             .column_i64("oi", row.oi)
-            .with_context(|| "shadow append: column_i64(oi) failed")?
+            .with_context(|| "candle append: column_i64(oi) failed")?
             .column_i64("tick_count", row.tick_count)
-            .with_context(|| "shadow append: column_i64(tick_count) failed")?
-            .column_f64("close_pct_from_prev_day", row.close_pct_from_prev_day)
-            .with_context(|| "shadow append: column_f64(close_pct_from_prev_day) failed")?
-            .column_f64("oi_pct_from_prev_day", row.oi_pct_from_prev_day)
-            .with_context(|| "shadow append: column_f64(oi_pct_from_prev_day) failed")?
-            .column_f64("volume_pct_from_prev_day", row.volume_pct_from_prev_day)
-            .with_context(|| "shadow append: column_f64(volume_pct_from_prev_day) failed")?
+            .with_context(|| "candle append: column_i64(tick_count) failed")?
             .at(TimestampNanos::new(row.timestamp_ist_nanos))
-            .with_context(|| "shadow append: at(TimestampNanos) failed")?;
+            .with_context(|| "candle append: at(TimestampNanos) failed")?;
         self.pending_count += 1;
         Ok(())
     }
@@ -364,23 +364,27 @@ mod tests {
         let bytes = w.buffer_bytes();
         let s = std::str::from_utf8(bytes).expect("ILP wire format is utf-8");
         assert!(
-            s.contains("candles_1m_shadow"),
-            "expected candles_1m_shadow in buffer, got {s}"
+            s.contains("candles_1m"),
+            "expected candles_1m in buffer, got {s}"
+        );
+        assert!(
+            !s.contains("shadow"),
+            "plain candle table must NOT contain _shadow, got {s}"
         );
     }
 
     #[test]
     fn test_append_seal_dispatches_to_correct_table_for_each_tf() {
         // For each TfIndex, append one seal and verify the buffer
-        // bytes contain the right shadow table name. This pins the
-        // dispatch contract end-to-end.
+        // bytes contain the right plain candle table name. This pins
+        // the dispatch contract end-to-end.
         for tf in TfIndex::ALL {
             let mut w = ShadowCandleWriter::for_test();
             w.append_seal(&mk_seal(13, 0, tf, 1_716_000_900, 100.0))
                 .expect("append");
             let bytes = w.buffer_bytes();
             let s = std::str::from_utf8(bytes).expect("ILP wire format is utf-8");
-            let expected = tf.shadow_table_name();
+            let expected = tf.table_name();
             assert!(
                 s.contains(expected),
                 "TF {tf:?}: expected `{expected}` in ILP bytes, got: {s}"
@@ -462,19 +466,24 @@ mod tests {
     }
 
     #[test]
-    fn test_append_seal_buffer_contains_wave5_pct_columns() {
+    fn test_append_seal_buffer_omits_pct_columns() {
+        // The plain candle tables have a 10-column schema — the 3
+        // legacy `*_pct_from_prev_day` columns are NOT written.
         let mut w = ShadowCandleWriter::for_test();
         w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
             .expect("append");
         let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
         assert!(
-            s.contains("close_pct_from_prev_day="),
-            "close_pct missing in {s}"
+            !s.contains("close_pct_from_prev_day"),
+            "close_pct must NOT be written in {s}"
         );
-        assert!(s.contains("oi_pct_from_prev_day="), "oi_pct missing in {s}");
         assert!(
-            s.contains("volume_pct_from_prev_day="),
-            "volume_pct missing in {s}"
+            !s.contains("oi_pct_from_prev_day"),
+            "oi_pct must NOT be written in {s}"
+        );
+        assert!(
+            !s.contains("volume_pct_from_prev_day"),
+            "volume_pct must NOT be written in {s}"
         );
     }
 

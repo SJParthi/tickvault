@@ -1,7 +1,7 @@
 //! Wave 6 Sub-PR #1 item 1.1 — per-instrument multi-TF cell type.
 //!
 //! Each subscribed `(security_id, exchange_segment)` instrument owns
-//! exactly one [`AggregatorCell`], which contains 9 `Mutex<LiveCandleState>`
+//! exactly one [`AggregatorCell`], which contains 21 `Mutex<LiveCandleState>`
 //! slots indexed by [`TfIndex::as_ordinal`]. Hot-path tick consumption
 //! locks ONE slot at a time; the boundary timer's seal path locks the
 //! same slot to drain + reset.
@@ -31,7 +31,7 @@
 //!
 //! - [`LiveCandleState`] — `Copy` data struct (≤ 96 bytes) with full
 //!   Wave-5 OHLCV+OI+tick_count + 3 pct-stamping fields.
-//! - [`AggregatorCell`] — per-instrument wrapper with 9
+//! - [`AggregatorCell`] — per-instrument wrapper with 21
 //!   `Mutex<LiveCandleState>` slots.
 //! - [`ConsumeOutcome`] — explicit enum result for `consume_tick`:
 //!   `Updated` (folded into open bucket), `Sealed { sealed_state }`
@@ -59,7 +59,7 @@ use parking_lot::Mutex;
 
 use tickvault_common::tick_types::ParsedTick;
 
-use crate::candles::TfIndex;
+use crate::candles::{TF_COUNT, TfIndex};
 
 // ---------------------------------------------------------------------------
 // LiveCandleState — Copy data struct
@@ -227,12 +227,12 @@ pub enum ConsumeOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// AggregatorCell — per-instrument 9-TF wrapper
+// AggregatorCell — per-instrument 21-TF wrapper
 // ---------------------------------------------------------------------------
 
 /// Per-instrument multi-timeframe candle state.
 ///
-/// Layout: `[Mutex<LiveCandleState>; 9]` indexed by
+/// Layout: `[Mutex<LiveCandleState>; 21]` indexed by
 /// [`TfIndex::as_ordinal`]. The `Arc` is exposed to callers because
 /// the planned aggregator container is
 /// `papaya::HashMap<(u32, u8), Arc<AggregatorCell>>` per locked
@@ -246,7 +246,7 @@ pub enum ConsumeOutcome {
 /// at most a handful of ticks.
 #[derive(Debug)]
 pub struct AggregatorCell {
-    slots: [Mutex<LiveCandleState>; 9],
+    slots: [Mutex<LiveCandleState>; TF_COUNT],
 }
 
 impl AggregatorCell {
@@ -317,7 +317,7 @@ impl AggregatorCell {
 
     /// Force-seals the open bucket regardless of whether a new tick
     /// arrived. Used by the boundary-timer task at IST midnight to
-    /// flush all 9 TFs even if no tick crosses the boundary in the
+    /// flush all 21 TFs even if no tick crosses the boundary in the
     /// next minute (e.g. illiquid contracts post-15:30).
     ///
     /// Returns `Some(sealed_state)` if the slot held a non-empty

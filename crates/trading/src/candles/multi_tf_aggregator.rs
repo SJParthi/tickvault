@@ -18,26 +18,27 @@
 //!
 //! 1. Looks up the per-instrument entry (lock-free papaya read).
 //! 2. Reads the last-seen cumulative volume (single atomic load).
-//! 3. Fans the tick out to all 9 TF slots in the cell, calling
+//! 3. Fans the tick out to all 21 TF slots in the cell, calling
 //!    `on_seal(tf, sealed_state)` for each TF whose boundary crossed.
 //!    Late ticks are coalesced into a `late_count` so the caller can
 //!    emit ONE `error!(code = AGGREGATOR-LATE-01)` per tick (per L-C3),
-//!    not 9.
+//!    not 21.
 //! 4. Stores the new last-cumulative for the next tick (atomic store).
 //!
 //! ## Why a separate `last_cumulative` per instrument vs per-TF
 //!
-//! All 9 TFs see the same tick stream. At any instant, the "cumulative
-//! at the end of the previous tick" is identical across all TFs that
-//! crossed simultaneously. One `AtomicU64` per instrument suffices.
-//! Per-TF storage would multiply RAM by 9× without semantic gain.
+//! All 21 TFs see the same tick stream. At any instant, the
+//! "cumulative at the end of the previous tick" is identical across
+//! all TFs that crossed simultaneously. One `AtomicU64` per instrument
+//! suffices. Per-TF storage would multiply RAM by 21× without
+//! semantic gain.
 //!
 //! ## RAM budget per instrument
 //!
-//! `Arc<InstrumentEntry>` ≈ 16 bytes (Arc) + 9 × 64 bytes
+//! `Arc<InstrumentEntry>` ≈ 16 bytes (Arc) + 21 × 64 bytes
 //! (`Mutex<LiveCandleState>`) + 8 bytes (`AtomicU64`) + papaya overhead
-//! ≈ ~600 B per instrument. At 11K Wave-5 instruments → ~6.6 MB
-//! steady-state. Well within the App 2 GB envelope from
+//! ≈ ~1.4 KB per instrument. The locked universe is 4 IDX_I SIDs →
+//! a few KB steady-state. Well within the App 2 GB envelope from
 //! `aws-budget.md`.
 //!
 //! ## What this module does NOT yet ship
@@ -104,15 +105,15 @@ impl InstrumentEntry {
 /// Per locked decision **L-C3**, `late_count` ≥ 1 means the caller
 /// MUST emit one ERROR log + increment
 /// `tv_aggregator_late_tick_total{action="discard"}`. The container
-/// coalesces 9 possible late-discards into one count so the caller
-/// emits ONE log line per tick (not 9).
+/// coalesces 21 possible late-discards into one count so the caller
+/// emits ONE log line per tick (not 21).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ConsumeStats {
     /// Number of TFs that just sealed a bucket and emitted a sealed
     /// state to the `on_seal` callback.
     pub sealed_count: u8,
     /// Number of TFs that received this tick as a late arrival
-    /// (before their open bucket's start). 0..=9.
+    /// (before their open bucket's start). 0..=21.
     pub late_count: u8,
     /// `true` if the instrument was looked up successfully.
     /// `false` if the (security_id, segment) pair was NOT in the
@@ -202,18 +203,18 @@ impl MultiTfAggregator {
         pin.get(&(security_id, exchange_segment_code)).cloned()
     }
 
-    /// Folds a single tick into ALL 9 TF slots for its instrument.
+    /// Folds a single tick into ALL 21 TF slots for its instrument.
     ///
     /// `on_seal(tf, sealed_state)` is called once per TF whose
     /// boundary crossed (i.e. once per [`ConsumeOutcome::Sealed`]).
-    /// Returns [`ConsumeStats`] aggregating the outcome across all 9
+    /// Returns [`ConsumeStats`] aggregating the outcome across all 21
     /// TFs so the caller can emit Prometheus counter increments
-    /// without 9 separate observability hooks.
+    /// without 21 separate observability hooks.
     ///
     /// Hot path. The implementation:
     /// 1. Looks up the entry (one papaya pin + get, ~30 ns).
     /// 2. Loads `last_cumulative` (one atomic load, ~5 ns).
-    /// 3. Calls `cell.consume_tick(tf, ...)` 9 times — each is a
+    /// 3. Calls `cell.consume_tick(tf, ...)` 21 times — each is a
     ///    parking_lot::Mutex lock + scalar update. Average ~30 ns
     ///    uncontended.
     /// 4. Stores the new `last_cumulative` (one atomic store, ~5 ns).
@@ -278,7 +279,7 @@ impl MultiTfAggregator {
     /// open buckets that didn't see a tick crossing the boundary
     /// (e.g. illiquid contracts post-15:30, or weekend close-out).
     ///
-    /// `O(N × 9)` where N = number of instruments. Cold path — runs
+    /// `O(N × 21)` where N = number of instruments. Cold path — runs
     /// at most once per minute boundary, not on the per-tick fast path.
     pub fn force_seal_all<F>(&self, mut on_seal: F)
     where
@@ -395,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn test_consume_tick_first_tick_updates_all_9_tfs_no_seal() {
+    fn test_consume_tick_first_tick_updates_all_21_tfs_no_seal() {
         let agg = MultiTfAggregator::new();
         agg.pre_populate(vec![(13, 0)]);
         let tick = mk_tick(13, 0, 1_716_000_900, 100.0, 50, 1_000);
@@ -405,7 +406,7 @@ mod tests {
         assert_eq!(stats.sealed_count, 0); // first tick — nothing to seal
         assert_eq!(stats.late_count, 0);
         assert_eq!(sealed_callbacks, 0);
-        // Verify all 9 TF slots opened.
+        // Verify all 21 TF slots opened.
         let entry = agg.get(13, 0).expect("present");
         for tf in TfIndex::ALL {
             assert!(
@@ -434,12 +435,14 @@ mod tests {
     fn test_consume_tick_boundary_crossing_seals_only_crossed_tfs() {
         let agg = MultiTfAggregator::new();
         agg.pre_populate(vec![(13, 0)]);
-        // Open all 9 TFs at t=1716000900.
-        let tick1 = mk_tick(13, 0, 1_716_000_900, 100.0, 50, 1_000);
+        // Base aligned to the 1d (86_400 s) boundary so every TF opens
+        // a fresh bucket at `base`. tick1 at base+10, tick2 at base+70:
+        // only M1 (60 s) crosses a boundary; M2 (120 s) and every wider
+        // TF still hold their `base` bucket.
+        let base = 1_715_990_400_u32; // 86_400 * 19_861
+        let tick1 = mk_tick(13, 0, base + 10, 100.0, 50, 1_000);
         agg.consume_tick(&tick1, 0, |_, _| {});
-        // 61 seconds later: M1 boundary crosses, no other TF does
-        // (5m, 15m, etc. are wider).
-        let tick2 = mk_tick(13, 0, 1_716_000_961, 102.0, 80, 1_010);
+        let tick2 = mk_tick(13, 0, base + 70, 102.0, 80, 1_010);
         let mut sealed_tfs: Vec<TfIndex> = Vec::new();
         let stats = agg.consume_tick(&tick2, 0, |tf, _| sealed_tfs.push(tf));
         assert!(stats.instrument_found);
@@ -486,8 +489,8 @@ mod tests {
         agg.force_seal_all(|sid, seg, tf, _| emitted.push((sid, seg, tf)));
         assert_eq!(
             emitted.len(),
-            2 * 9,
-            "expected 2 instruments × 9 TFs = 18 sealed bars; got {}",
+            2 * 21,
+            "expected 2 instruments × 21 TFs = 42 sealed bars; got {}",
             emitted.len()
         );
         // Every slot is now empty.

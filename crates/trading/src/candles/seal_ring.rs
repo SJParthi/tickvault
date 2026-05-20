@@ -9,17 +9,16 @@
 //! ## Why a separate ring (vs reusing tick_persistence's machinery)
 //!
 //! Per locked decision L-C1: sealed candles are NOT ticks. The IST
-//! midnight burst can produce up to ~99K seals (11K instruments × 9
-//! TFs) in a single tokio yield, and the persistence path differs
-//! (9 distinct shadow tables, one ILP `Sender` per TF). A dedicated
-//! ring keeps the seal absorption budget independent of the tick
-//! path's `TICK_BUFFER_CAPACITY`.
+//! midnight burst force-seals every open bucket across all 21 TFs in a
+//! single tokio yield, and the persistence path differs (21 distinct
+//! plain candle tables, one ILP `Sender` per TF). A dedicated ring
+//! keeps the seal absorption budget independent of the tick path's
+//! `TICK_BUFFER_CAPACITY`.
 //!
 //! ## RAM budget
 //!
 //! `SEAL_BUFFER_CAPACITY = 200_000` and `BufferedSeal` ≤ 128 bytes →
-//! ~25 MB worst-case. The IST midnight burst at 99K seals × 128 B =
-//! ~12.7 MB peak. Fits comfortably in the 2 GB App envelope from
+//! ~25 MB worst-case. Fits comfortably in the 2 GB App envelope from
 //! `aws-budget.md`.
 //!
 //! ## Drop semantics on overflow
@@ -55,15 +54,14 @@ use crate::candles::{LiveCandleState, TfIndex};
 /// triggers either a drop (OLDEST evicted, returned to caller) or
 /// disk spill (handled by the storage-crate writer slice).
 ///
-/// Sized to absorb the IST-midnight burst (11K instruments × 9 TFs ≈
-/// 99K seals) plus 2× headroom for downstream backpressure spikes.
-/// Per locked decision L-C1.
+/// Generously sized to absorb the IST-midnight force-seal burst
+/// across all instruments × 21 TFs plus headroom for downstream
+/// backpressure spikes. Per locked decision L-C1.
 pub const SEAL_BUFFER_CAPACITY: usize = 200_000;
 
-/// One sealed bar ready to flush to its `candles_*_shadow` shadow
-/// table. `Copy` so the ring's `VecDeque<BufferedSeal>` does not
-/// need ref-counted entries. Sized ≤ 128 bytes per the const-assert
-/// below.
+/// One sealed bar ready to flush to its `candles_*` plain table.
+/// `Copy` so the ring's `VecDeque<BufferedSeal>` does not need
+/// ref-counted entries. Sized ≤ 128 bytes per the const-assert below.
 ///
 /// The `exchange_segment_code: u8` is the SAME byte as
 /// `ParsedTick::exchange_segment_code`. The writer slice maps this
@@ -71,7 +69,7 @@ pub const SEAL_BUFFER_CAPACITY: usize = 200_000;
 /// `tickvault_common::segment::segment_code_to_str`.
 ///
 /// `tf` is encoded as [`TfIndex`] (1 byte) so the writer slice can
-/// dispatch to one of the 9 ILP `Sender`s by ordinal without lookup.
+/// dispatch to one of the 21 ILP `Sender`s by ordinal without lookup.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BufferedSeal {
     /// Composite-key part 1 (per I-P1-11).
@@ -448,9 +446,9 @@ mod tests {
     }
 
     #[test]
-    fn test_seal_ring_handles_all_9_tfs_distinctly() {
+    fn test_seal_ring_handles_all_21_tfs_distinctly() {
         // Push one seal per TF, drain in FIFO, verify TfIndex preserved.
-        let mut ring = SealRing::with_capacity(9);
+        let mut ring = SealRing::with_capacity(21);
         for tf in TfIndex::ALL {
             ring.try_buffer(mk_seal(13, 0, tf, 1_716_000_900, 100.0));
         }

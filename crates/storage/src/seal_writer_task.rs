@@ -45,8 +45,9 @@
 //! hot-path zero-alloc rule applies to `MultiTfAggregator::consume_tick`
 //! and below, NOT to the storage drain task.
 
-use tracing::warn;
+use tracing::error;
 
+use tickvault_common::error_code::ErrorCode;
 use tickvault_trading::candles::BufferedSeal;
 
 use crate::seal_absorption::{SealAbsorptionPipeline, SubmitOutcome};
@@ -138,10 +139,15 @@ pub fn drain_once(
                     // ILP buffer-fill error (extremely rare — column
                     // type / table-name issue). Rescue this one
                     // immediately and stop draining further.
-                    warn!(
+                    // Finding S3: seal-time ILP append failure is a
+                    // persist failure — logged at `error!` with the
+                    // AGGREGATOR-SEAL-01 code per
+                    // `error_level_meta_guard.rs` Rule 5.
+                    error!(
+                        code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
                         ?append_err,
                         security_id = seal.security_id,
-                        "shadow append_seal failed — rescuing in-flight"
+                        "candle append_seal failed — rescuing in-flight"
                     );
                     rescue_one(pipeline, &mut outcome, seal, now_unix_secs);
                     break;
@@ -168,10 +174,14 @@ pub fn drain_once(
             outcome.flushed_ok = true;
         }
         Err(flush_err) => {
-            warn!(
+            // Finding S3: seal-time ILP flush failure is a persist
+            // failure — logged at `error!` with the AGGREGATOR-SEAL-01
+            // code per `error_level_meta_guard.rs` Rule 5.
+            error!(
+                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
                 ?flush_err,
                 count = popped.len(),
-                "shadow flush failed — rescuing in-flight seals to spill/DLQ"
+                "candle flush failed — rescuing in-flight seals to spill/DLQ"
             );
             for seal in popped {
                 rescue_one(pipeline, &mut outcome, seal, now_unix_secs);

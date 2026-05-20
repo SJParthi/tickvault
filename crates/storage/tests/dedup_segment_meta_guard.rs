@@ -131,19 +131,23 @@ fn every_dedup_key_is_listed_here_for_auditing() {
     // If this count changes, update the assertion AND verify the new key
     // includes `segment` (the test above enforces that independently).
     //
-    // Current set as of 2026-05-10 (≥ 22 keys after Wave 6 Sub-PR #1):
-    //   Existing (≥ 16): DEDUP_KEY_TICKS, DEDUP_KEY_MARKET_DEPTH,
-    //     DEDUP_KEY_PREVIOUS_CLOSE, DEDUP_KEY_DEEP_DEPTH, DEDUP_KEY_CANDLES,
-    //     DEDUP_KEY_CANDLES_1S, DEDUP_KEY_INDICATORS, DEDUP_KEY_OBI,
-    //     DEDUP_KEY_VOLUME_NSE_AUDIT, DEDUP_KEY_OPTION_GREEKS_LIVE,
-    //     DEDUP_KEY_OPTION_GREEKS, DEDUP_KEY_DHAN_OPTION_CHAIN_RAW,
-    //     DEDUP_KEY_GREEKS_VERIFICATION, DEDUP_KEY_DERIVATIVE_CONTRACTS,
-    //     DEDUP_KEY_SUBSCRIBED_INDICES (+ MOVERS / others as added).
-    //   Wave 6 Sub-PR #1 (this commit): +10 keys —
-    //     DEDUP_KEY_CANDLES_{1M,5M,15M,30M,1H,2H,3H,4H,1D}_SHADOW (9)
-    //     + DEDUP_KEY_AGGREGATOR_SEAL_AUDIT (1)
-    //   Total ≥ 26 expected; threshold pinned at 22 with margin so a
-    //   single removal does not silently flip the ratchet.
+    // Candle-engine re-architecture #T1a (2026-05-20): the 9 separate
+    // `DEDUP_KEY_CANDLES_{1M,5M,15M,30M,1H,2H,3H,4H,1D}_SHADOW`
+    // constants of the Wave 6 design were intentionally collapsed into
+    // a SINGLE shared `DEDUP_KEY_CANDLES` constant (all 21 plain
+    // `candles_<tf>` tables share the same `(ts, security_id, segment)`
+    // key shape — see `shadow_persistence.rs`). This is a deliberate
+    // -8 reduction. The threshold is therefore lowered from 22 to 12
+    // with margin so a single accidental removal still flips the
+    // ratchet.
+    //
+    // Current set touching `security_id` (≥ 12): DEDUP_KEY_TICKS,
+    //   DEDUP_KEY_MARKET_DEPTH, DEDUP_KEY_PREVIOUS_CLOSE,
+    //   DEDUP_KEY_CANDLES_1S, DEDUP_KEY_CANDLES (shared by all 21
+    //   plain candle tables), DEDUP_KEY_INDICATORS, DEDUP_KEY_OBI,
+    //   DEDUP_KEY_VOLUME_NSE_AUDIT, DEDUP_KEY_DERIVATIVE_CONTRACTS,
+    //   DEDUP_KEY_SUBSCRIBED_INDICES, DEDUP_KEY_OPEN_PRICE_AUDIT,
+    //   DEDUP_KEY_SELF_TRADE_AUDIT (+ others as added).
     let decls = collect_dedup_key_declarations();
     let keys_with_security_id: Vec<&str> = decls
         .iter()
@@ -151,10 +155,10 @@ fn every_dedup_key_is_listed_here_for_auditing() {
         .map(|(_, _, name, _)| name.as_str())
         .collect();
     assert!(
-        keys_with_security_id.len() >= 22,
-        "expected at least 22 DEDUP_KEY_* constants touching security_id (post Wave 6 Sub-PR #1 \
-         shadow tables), got {}: {:?}. A decrease means a table was removed — verify the \
-         removal was intentional.",
+        keys_with_security_id.len() >= 12,
+        "expected at least 12 DEDUP_KEY_* constants touching security_id (post candle-engine \
+         re-architecture #T1a — 9 shadow keys collapsed into 1 shared DEDUP_KEY_CANDLES), \
+         got {}: {:?}. A decrease means a table was removed — verify the removal was intentional.",
         keys_with_security_id.len(),
         keys_with_security_id,
     );

@@ -70,7 +70,7 @@ const SEAL_DLQ_DIR: &str = "data/dlq";
 ///
 /// Field-by-field correspondence with `SerializedSeal`:
 /// - `security_id`, `exchange_segment_code` — composite key (I-P1-11).
-/// - `tf_ordinal` — `TfIndex::as_ordinal()` (0..=8 today).
+/// - `tf_ordinal` — `TfIndex::as_ordinal()` (0..=20).
 /// - `bucket_start_ist_secs`, `tick_count`, `volume`,
 ///   `bucket_start_cumulative`, `oi`, `open`, `high`, `low`, `close`
 ///   — `LiveCandleState` payload.
