@@ -334,28 +334,8 @@ async fn execute_gap_fill_for_bar(
     Ok(written)
 }
 
-/// Format the IST trading date `YYYY-MM-DD` from an IST epoch seconds
-/// value. Used as the `trading_date_ist` audit column.
-///
-/// Per `data-integrity.md` "WebSocket Timestamp Rule": Dhan-derived
-/// IST seconds are interpreted as if they were UTC by chrono, which
-/// is the standard tickvault pattern (the value is already in IST
-/// wall-clock, NO offset is added). Always returns a non-empty
-/// string; an unconvertible input falls back to epoch 0 ("1970-01-01").
-fn trading_date_ist_string(ist_secs: i64) -> String {
-    use chrono::TimeZone;
-    chrono::Utc
-        .timestamp_opt(ist_secs, 0)
-        .single()
-        .unwrap_or_else(|| {
-            chrono::Utc
-                .timestamp_opt(0, 0)
-                .single()
-                .unwrap_or_else(chrono::Utc::now)
-        })
-        .format("%Y-%m-%d")
-        .to_string()
-}
+// #T2b (2026-05-20): trading_date_ist_string removed — it served only
+// the deleted gap_fill_audit row write.
 
 /// Format the IST bar minute `HH:MM` from an IST epoch seconds value.
 /// Used as the `bar_minute` audit column AND the `bar_minute_ist`
@@ -693,7 +673,7 @@ async fn execute_bar_for_all_instruments(
 
     let duration_ms_u32: u32 =
         u32::try_from(bar_started_at.elapsed().as_millis()).unwrap_or(u32::MAX);
-    let sids_requested: u32 = u32::try_from(total_sids).unwrap_or(u32::MAX);
+    let _sids_requested: u32 = u32::try_from(total_sids).unwrap_or(u32::MAX);
 
     let (result_label, severity_counter) = if sids_failed == 0 && sids_completed > 0 {
         (RESULT_SUCCESS, bars_succeeded)
