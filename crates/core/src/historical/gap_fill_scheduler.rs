@@ -66,12 +66,15 @@ use tickvault_common::constants::{
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::tick_types::HistoricalCandle;
 use tickvault_storage::candle_persistence::CandlePersistenceWriter;
-use tickvault_storage::gap_fill_audit_persistence::{
-    RESULT_FAILED, RESULT_PARTIAL, RESULT_SUCCESS, TRIGGER_EVENT_SCHEDULER_CATCHUP,
-    TRIGGER_EVENT_WS_DISCONNECT, append_gap_fill_audit_row,
-};
 
 use crate::notification::{NotificationEvent, NotificationService};
+
+// #T2b: result-label vocabulary, formerly in the deleted
+// gap_fill_audit_persistence module. The scheduler matches on these to
+// pick the GapFill{Completed,Partial,Failed} notification variant.
+const RESULT_SUCCESS: &str = "success";
+const RESULT_PARTIAL: &str = "partial";
+const RESULT_FAILED: &str = "failed";
 
 use crate::auth::token_manager::TokenHandle;
 
@@ -331,28 +334,8 @@ async fn execute_gap_fill_for_bar(
     Ok(written)
 }
 
-/// Format the IST trading date `YYYY-MM-DD` from an IST epoch seconds
-/// value. Used as the `trading_date_ist` audit column.
-///
-/// Per `data-integrity.md` "WebSocket Timestamp Rule": Dhan-derived
-/// IST seconds are interpreted as if they were UTC by chrono, which
-/// is the standard tickvault pattern (the value is already in IST
-/// wall-clock, NO offset is added). Always returns a non-empty
-/// string; an unconvertible input falls back to epoch 0 ("1970-01-01").
-fn trading_date_ist_string(ist_secs: i64) -> String {
-    use chrono::TimeZone;
-    chrono::Utc
-        .timestamp_opt(ist_secs, 0)
-        .single()
-        .unwrap_or_else(|| {
-            chrono::Utc
-                .timestamp_opt(0, 0)
-                .single()
-                .unwrap_or_else(chrono::Utc::now)
-        })
-        .format("%Y-%m-%d")
-        .to_string()
-}
+// #T2b (2026-05-20): trading_date_ist_string removed — it served only
+// the deleted gap_fill_audit row write.
 
 /// Format the IST bar minute `HH:MM` from an IST epoch seconds value.
 /// Used as the `bar_minute` audit column AND the `bar_minute_ist`
@@ -526,43 +509,6 @@ pub async fn run_gap_fill_scheduler(
                             "GAP-FILL-04: disconnect event broadcast lagged; PR-D9 scheduler-catchup audit row + Telegram"
                         );
 
-                        // PR-D9: emit a `scheduler_catchup` audit row
-                        // for SEBI reconstruction. Best-effort —
-                        // spawned so audit write failures don't
-                        // block the next event. `sids_failed`
-                        // carries the dropped event count as an
-                        // operator-readable proxy for "things we
-                        // could not reconcile".
-                        let dropped_for_audit = i32::try_from(dropped).unwrap_or(i32::MAX);
-                        let qcfg = deps.questdb_config.clone();
-                        let now_secs_ist = chrono::Utc::now().timestamp().saturating_add(
-                            i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS),
-                        );
-                        let trading_date_str = trading_date_ist_string(now_secs_ist);
-                        let now_nanos = now_secs_ist.saturating_mul(1_000_000_000);
-                        tokio::spawn(async move {
-                            if let Err(err) = append_gap_fill_audit_row(
-                                &qcfg,
-                                now_nanos,
-                                &trading_date_str,
-                                "scheduler-catchup",
-                                TRIGGER_EVENT_SCHEDULER_CATCHUP,
-                                dropped_for_audit,
-                                0,
-                                dropped_for_audit,
-                                lagged_window_ms,
-                                RESULT_FAILED,
-                            )
-                            .await
-                            {
-                                error!(
-                                    code = ErrorCode::GapFill03UpsertFailed.code_str(),
-                                    ?err,
-                                    "GAP-FILL-D9: scheduler_catchup audit row insert failed"
-                                );
-                            }
-                        });
-
                         deps.notification_service.notify(
                             NotificationEvent::GapFillEventChannelLagged {
                                 dropped_event_count: dropped,
@@ -727,7 +673,7 @@ async fn execute_bar_for_all_instruments(
 
     let duration_ms_u32: u32 =
         u32::try_from(bar_started_at.elapsed().as_millis()).unwrap_or(u32::MAX);
-    let sids_requested: u32 = u32::try_from(total_sids).unwrap_or(u32::MAX);
+    let _sids_requested: u32 = u32::try_from(total_sids).unwrap_or(u32::MAX);
 
     let (result_label, severity_counter) = if sids_failed == 0 && sids_completed > 0 {
         (RESULT_SUCCESS, bars_succeeded)
@@ -739,35 +685,6 @@ async fn execute_bar_for_all_instruments(
     severity_counter.increment(1);
 
     let bar_minute_str = bar_minute_ist_string(bar_start_ist_secs);
-    let trading_date_str = trading_date_ist_string(bar_start_ist_secs);
-    let bar_ts_nanos = bar_start_ist_secs.saturating_mul(1_000_000_000);
-
-    if let Err(err) = append_gap_fill_audit_row(
-        &deps.questdb_config,
-        bar_ts_nanos,
-        &trading_date_str,
-        &bar_minute_str,
-        TRIGGER_EVENT_WS_DISCONNECT,
-        i32::try_from(sids_requested).unwrap_or(i32::MAX),
-        i32::try_from(sids_completed).unwrap_or(i32::MAX),
-        i32::try_from(sids_failed).unwrap_or(i32::MAX),
-        i64::from(duration_ms_u32),
-        result_label,
-    )
-    .await
-    {
-        // Audit-row failure is data-point lost, not data-corrupted —
-        // the bar's candles are already UPSERTed in `historical_candles`.
-        // Per `phase-0-architecture.md` PILLAR 3 + Wave-2-D AUDIT-NN
-        // family, audit failures are Medium severity (NOT Critical).
-        error!(
-            code = ErrorCode::GapFill03UpsertFailed.code_str(),
-            bar_minute_ist = %bar_minute_str,
-            trading_date_ist = %trading_date_str,
-            ?err,
-            "gap_fill_audit row insert failed; bar candles already persisted"
-        );
-    }
 
     let event = match result_label {
         RESULT_SUCCESS => NotificationEvent::GapFillCompleted {
@@ -1089,26 +1006,16 @@ mod tests {
         }
     }
 
-    // PR-D9 ratchets (2026-05-17) — Lagged(n) catchup audit + Telegram.
+    // #T2b: the Lagged(n) catchup audit-row ratchets were removed with
+    // the gap_fill_audit table. The Telegram-event contract for the
+    // Lagged branch is still covered below.
 
     #[test]
-    fn test_trigger_event_scheduler_catchup_constant_is_imported() {
-        // PR-D9 contract: the scheduler module MUST import the
-        // `TRIGGER_EVENT_SCHEDULER_CATCHUP` constant from storage so
-        // the Lagged handler can stamp audit rows with the correct
-        // SYMBOL value. Future regression that drops the import
-        // fails this build via the source-scan below.
-        assert_eq!(TRIGGER_EVENT_SCHEDULER_CATCHUP, "scheduler_catchup");
-    }
-
-    #[test]
-    fn test_lagged_handler_source_emits_audit_row_and_telegram() {
-        // Source-scan ratchet per Rule 13: the Lagged(dropped) branch
-        // MUST emit an audit row (via append_gap_fill_audit_row with
-        // TRIGGER_EVENT_SCHEDULER_CATCHUP) AND a Telegram event (via
-        // notification_service.notify with GapFillEventChannelLagged).
+    fn test_lagged_handler_emits_telegram() {
+        // The Lagged(dropped) branch MUST still emit a Telegram event
+        // (NotificationEvent::GapFillEventChannelLagged) so the operator
+        // is paged when disconnect events are dropped.
         let source = include_str!("gap_fill_scheduler.rs");
-        // Find the Lagged branch body.
         let lagged_start = source
             .find("RecvError::Lagged(dropped))")
             .expect("Lagged branch must exist in source");
@@ -1119,23 +1026,9 @@ mod tests {
         let lagged_body = &source[lagged_start..lagged_end];
 
         assert!(
-            lagged_body.contains("TRIGGER_EVENT_SCHEDULER_CATCHUP"),
-            "Lagged handler MUST stamp audit row with TRIGGER_EVENT_SCHEDULER_CATCHUP \
-             (currently missing — false-OK regression risk per audit-findings Rule 11)"
-        );
-        assert!(
-            lagged_body.contains("append_gap_fill_audit_row"),
-            "Lagged handler MUST call append_gap_fill_audit_row for SEBI reconstruction"
-        );
-        assert!(
             lagged_body.contains("GapFillEventChannelLagged"),
             "Lagged handler MUST emit NotificationEvent::GapFillEventChannelLagged (Critical) \
              so operator is paged"
-        );
-        assert!(
-            lagged_body.contains("lagged_window_ms"),
-            "Lagged handler MUST compute lagged_window_ms from last_successful_event_at \
-             for the audit row's duration_ms field"
         );
     }
 
