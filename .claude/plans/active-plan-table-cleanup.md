@@ -157,12 +157,17 @@ columns stay empty; greeks live in `option_chain_minute_snapshot`.
 | B (infra) | `ts` `trading_date_ist` `underlying_symbol` `underlying_security_id` `exchange_segment` `security_id` |
 | **C — DROP** | `cache_age_used_secs` `fetch_outcome` |
 
-### Open decision (operator must confirm)
+### Decision — RESOLVED (operator approved 2026-05-20)
 
-The 5 greek columns on `ticks` + candle tables: earlier the operator
-said "track ltp and all greeks". But under the indices-only locked
-universe NO options ride the main feed, so those columns are
-always empty. Greeks of options ARE tracked in
-`option_chain_minute_snapshot`. Recommendation: DROP greeks from
-`ticks` + candles; keep greeks ONLY in the option-chain table.
-Needs explicit operator yes before the column-drop lands in #T1.
+Operator verbatim 2026-05-20: "yes go ahead dude with the table
+cleanup dude and even columns drop also dude."
+
+- Greeks columns (`iv` `delta` `gamma` `theta` `vega`): **DROP** from
+  `ticks` + all candle tables. Confirmed — they are always empty under
+  the 4-IDX_I locked universe (no options on the main feed). Option
+  greeks remain in `option_chain_minute_snapshot`.
+- Full column cleanup (every bucket-C column in the four tables above):
+  **APPROVED** — folds into the relevant #T-PR.
+- Table cleanup #T1–#T5: **APPROVED** — execute serially per §H.
+
+No open decisions remain. The plan is fully unblocked.
