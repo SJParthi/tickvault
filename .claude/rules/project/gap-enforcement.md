@@ -8,53 +8,10 @@ paths:
 Mechanical rules enforcing all instrument and system gaps.
 Every rule here is checked by tests, hooks, or clippy — never by human review alone.
 
-## I-P0-01: Duplicate Security ID = Hard Error
-- `universe_builder.rs` must reject duplicate security_ids (not warn+skip)
-- HashMap insertion must check for existing entry BEFORE overwrite
-- Test: `test_duplicate_security_id_rejected`
-
-## I-P0-02: Count Consistency After Build
-- Post-build validation must check derivative count >= minimum threshold
-- Truncated CSV (< 100 derivatives) = hard error, not silent continue
-- Test: `test_validation_derivative_count_below_minimum_fails`
-
 ## I-P0-03: Expiry Check at Gate 4 (OMS)
 - `engine.rs` Gate 4 must verify `expiry_date >= today` before order submission
 - Stale universe = expired contract order = CRITICAL
 - Test: `test_expired_contract_rejection`
-
-## I-P0-04: Cache Persistence Validation
-- `validate_cache_persistence()` must verify cache dir is not on tmpfs
-- Linux: parse /proc/mounts for mount type
-- Test: `test_cache_persistence_*`
-
-## I-P0-05: S3 Remote Backup
-- `S3BackupConfig` must validate bucket + region are non-empty
-- Whitespace-only values = not configured
-- Key layout: `{prefix}/{date}/filename` and `{prefix}/latest/filename`
-- Test: all `s3_backup::tests::*`
-
-## I-P0-06: Emergency Download Override
-- When all caches missing during market hours, force-download as last resort
-- INFO log is insufficient — must be CRITICAL + Telegram alert
-- Never silently run with zero instruments
-
-## I-P1-01: Daily CSV Refresh Scheduler
-- `compute_next_trigger_time()` must always return positive duration (1..=86400s)
-- `parse_daily_download_time()` requires strict HH:MM:SS format
-- Default config is DISABLED (opt-in, not opt-out)
-- Trading day check before refresh (skip weekends/holidays)
-- Test: all `daily_scheduler::tests::*`
-
-## I-P1-02: Delta Detector Full Field Coverage
-- `delta_detector.rs` must track ALL mutable fields, not just lot_size + expiry
-- Fields: lot_size, expiry_date, strike_price, option_type, tick_size, segment, display_name
-- Test: delta detection tests for each field
-
-## I-P1-03: Security ID Reuse Detection
-- Delta detector must flag when security_id appears in both added and expired sets
-- Compound identity match: symbol + expiry + strike + type
-- Test: `test_delta_detects_security_id_reuse`
 
 ## I-P1-05: Compound DEDUP Key
 - `DEDUP_KEY_DERIVATIVE_CONTRACTS` must include `underlying_symbol`

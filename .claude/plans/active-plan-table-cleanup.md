@@ -7,6 +7,15 @@
 3h, 4h, 1d) + one option-chain table + `historical_candles`. NO
 `candles_1s`. Everything else dropped.
 
+## Per-Item Guarantee Matrix
+
+Every item in this plan (#T1–#T5) is bound by the canonical 15-row
+"100% everything" matrix and the 7-row resilience demand matrix — see
+`.claude/rules/project/per-wave-guarantee-matrix.md`. All 15 + 7 rows
+apply to every #T item. Each lands only inside the tested envelope,
+with ratcheted regression coverage: compile-verified, ratchet-guarded,
+workspace + scoped test suites green before merge.
+
 ## Goal
 
 Cut the QuestDB schema to **24 tables** — only the live data plane the
