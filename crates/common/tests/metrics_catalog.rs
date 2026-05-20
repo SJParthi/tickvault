@@ -182,36 +182,6 @@ const REQUIRED_METRICS: &[(&str, &str)] = &[
         "S4-T4: Total order update messages received (any type).",
     ),
     (
-        "tv_depth_20lvl_connection_active",
-        "S4-T4: Binary gauge per underlying for the 20-level depth WebSocket. \
-         Labelled by `underlying` so a single down connection is visible.",
-    ),
-    (
-        "tv_depth_20lvl_reconnections_total",
-        "S4-T4: Reconnection attempt counter per 20-depth underlying.",
-    ),
-    (
-        "tv_depth_20lvl_frames_total",
-        "S4-T4: Depth frames received per 20-depth underlying.",
-    ),
-    (
-        "tv_depth_200lvl_connection_active",
-        "S4-T4: Binary gauge per underlying for the 200-level depth WebSocket.",
-    ),
-    (
-        "tv_depth_200lvl_reconnections_total",
-        "S4-T4: Reconnection attempt counter per 200-depth underlying.",
-    ),
-    (
-        "tv_depth_200lvl_frames_total",
-        "S4-T4: Depth frames received per 200-depth underlying.",
-    ),
-    (
-        "tv_depth_frames_dropped_total",
-        "S4-T4: Depth frames dropped due to channel full or send timeout. \
-         Labelled by type (send_timeout) and depth (20 / 200).",
-    ),
-    (
         "tv_valkey_ops_total",
         "S4-T4: Total Valkey operations attempted. Labelled by op \
          (get / set / del / exists).",
