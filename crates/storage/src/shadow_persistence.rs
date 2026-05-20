@@ -209,24 +209,13 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
 
 /// Issue one DDL statement to QuestDB's `/exec` endpoint.
 ///
-/// Finding S5: the DDL is sent via HTTP **POST** (was GET). QuestDB's
-/// `/exec` endpoint accepts POST — using POST instead of GET keeps the
-/// (potentially long) DDL statement out of the request line that
-/// intermediary proxies / access-logs record verbatim. The `query`
-/// parameter is form-urlencoded into the POST request body via an
-/// explicit `Content-Type: application/x-www-form-urlencoded` header
-/// (the `reqwest` `form` feature is not enabled in this workspace).
+/// QuestDB's `/exec` endpoint is **GET-only** — it returns
+/// `405 Method Not Allowed` for POST. The `query` parameter is
+/// URL-encoded by reqwest's query-string builder. (The #T1a precursor
+/// briefly switched this to POST to keep DDL out of access logs — that
+/// regressed every candle-table DDL to 405; reverted here.)
 async fn run_ddl(client: &Client, base_url: &str, table: &str, ddl: &str) {
-    // Manual form-urlencoding of the single `query=<ddl>` field.
-    let body = format!("query={}", urlencode(ddl));
-    let request = client
-        .post(base_url)
-        .header(
-            reqwest::header::CONTENT_TYPE,
-            "application/x-www-form-urlencoded",
-        )
-        .body(body);
-    match request.send().await {
+    match client.get(base_url).query(&[("query", ddl)]).send().await {
         Ok(resp) if resp.status().is_success() => {
             info!(table, "candle table ready");
         }
@@ -236,37 +225,6 @@ async fn run_ddl(client: &Client, base_url: &str, table: &str, ddl: &str) {
         Err(err) => {
             error!(table, ?err, "DDL request failed");
         }
-    }
-}
-
-/// Minimal `application/x-www-form-urlencoded` value encoder.
-///
-/// QuestDB DDL only ever contains ASCII identifiers, parentheses,
-/// commas, semicolons and spaces — this percent-encodes every byte
-/// that is not in the unreserved set so the POST body parses
-/// correctly regardless of the statement content.
-fn urlencode(input: &str) -> String {
-    let mut out = String::with_capacity(input.len() * 3);
-    for byte in input.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char);
-            }
-            _ => {
-                out.push('%');
-                out.push(hex_nibble(byte >> 4));
-                out.push(hex_nibble(byte & 0x0F));
-            }
-        }
-    }
-    out
-}
-
-/// Maps a 0-15 nibble to its uppercase hex ASCII character.
-const fn hex_nibble(nibble: u8) -> char {
-    match nibble {
-        0..=9 => (b'0' + nibble) as char,
-        _ => (b'A' + (nibble - 10)) as char,
     }
 }
 
