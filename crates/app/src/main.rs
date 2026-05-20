@@ -146,59 +146,6 @@ async fn probe_selftest_already_fired_today(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 0 Item 18c — static IP audit row helper
-// ---------------------------------------------------------------------------
-
-/// Writes one row to the `static_ip_audit` QuestDB table capturing the
-/// final outcome of the boot-time Dhan static IP gate.
-///
-/// Best-effort: a failure here NEVER halts boot. The Pass/Fail
-/// decision is already routed to Telegram via `NotificationService`
-/// and to Loki via the structured `error!`/`info!` log; the audit
-/// row is the SQL-queryable forensic trail for SEBI's 5-year window.
-// TEST-EXEMPT: thin async wrapper over the storage helper; the
-// storage helper itself + its tests pin the SQL shape.
-async fn write_static_ip_audit_row(
-    questdb_config: &tickvault_common::config::QuestDbConfig,
-    outcome: tickvault_storage::static_ip_audit_persistence::StaticIpAuditOutcome,
-    reason: &str,
-    ip_flag: &str,
-    ip_match_status: &str,
-    attempts_made: u32,
-    orders_allowed: bool,
-) {
-    let now_ist_nanos = chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .unwrap_or(0)
-        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
-    // Truncate today's IST nanos to IST midnight for trading_date_ist
-    // — matches the pattern selftest/boot audit writers use.
-    let trading_date_ist = now_ist_nanos - now_ist_nanos.rem_euclid(86_400_000_000_000);
-    let attempts_i64 = i64::from(attempts_made);
-    if let Err(e) = tickvault_storage::static_ip_audit_persistence::append_static_ip_audit_row(
-        questdb_config,
-        now_ist_nanos,
-        trading_date_ist,
-        outcome,
-        reason,
-        ip_flag,
-        ip_match_status,
-        attempts_i64,
-        orders_allowed,
-    )
-    .await
-    {
-        // Audit-write failure is observable but non-fatal: the Pass /
-        // Fail decision has already been delivered via Telegram + Loki.
-        tracing::warn!(
-            error = ?e,
-            outcome = outcome.as_str(),
-            "static_ip_audit row write failed (boot continues — Telegram/Loki already carry the outcome)"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Phase 0 Item 19e — live_instance_lock audit row helper
 // ---------------------------------------------------------------------------
 
@@ -2651,53 +2598,10 @@ async fn main() -> Result<()> {
         // FULL_CLOSE) and idempotent ALTER ADD COLUMN IF NOT EXISTS so
         // existing deployments auto-migrate.
         tickvault_storage::previous_close_persistence::ensure_previous_close_table(&config.questdb,),
-        // Wave 2 Item 9 (G18) — audit-trail tables. SEBI-relevant.
-        // 90d hot → S3 IT → Glacier per `aws-budget.md`.
-        // PR #5 (2026-05-19): phase2_audit table retired alongside the
-        // deleted Phase 2 stock-F&O dispatcher (operator lock 2026-05-15).
-        // PR #4 (2026-05-19): depth_rebalance_audit + depth_dynamic_diff_audit
-        // tables retired alongside the deleted depth-20/200 pipelines.
-        tickvault_storage::ws_reconnect_audit_persistence::ensure_ws_reconnect_audit_table(
-            &config.questdb
-        ),
-        // Phase 0 Item 17b (2026-05-15) — SEBI 24h JWT renewal audit
-        // table. TokenManager writes one row per renewal lifecycle
-        // event via the process-wide `global_questdb_config()`. DDL
-        // is idempotent CREATE TABLE IF NOT EXISTS.
-        tickvault_storage::auth_renewal_audit_persistence::ensure_auth_renewal_audit_table(
-            &config.questdb
-        ),
-        tickvault_storage::boot_audit_persistence::ensure_boot_audit_table(&config.questdb),
-        tickvault_storage::selftest_audit_persistence::ensure_selftest_audit_table(&config.questdb),
-        tickvault_storage::order_audit_persistence::ensure_order_audit_table(&config.questdb),
-        // Phase 0 Item 8+9 (PR-D5, 2026-05-17) — gap_fill_audit forensic
-        // table. PR-D4 began writing rows via `append_gap_fill_audit_row`
-        // but the DDL helper was previously not wired; first INSERT would
-        // fail until this table existed. Same 90d-hot → S3 IT → Glacier
-        // lifecycle as the other audit tables. Idempotent CREATE TABLE
-        // IF NOT EXISTS — safe to call every boot.
-        tickvault_storage::gap_fill_audit_persistence::ensure_gap_fill_audit_table(
-            &config.questdb
-        ),
-        // Phase 0 Item 12 — `last_tick_audit` forensic table. Captures
-        // per-SID last-tick exchange_ts at each minute seal so the
-        // operator can answer "what was the last tick BANKNIFTY received
-        // before the 09:34 seal?" in one SQL query. SEBI-relevant; same
-        // 90d-hot → S3 IT → Glacier lifecycle as the other audit tables.
-        // Idempotent CREATE TABLE IF NOT EXISTS.
-        tickvault_storage::last_tick_audit_persistence::ensure_last_tick_audit_table(
-            &config.questdb
-        ),
-        // Phase 0 Item 20 (2026-05-18) — `orphan_position_audit` forensic
-        // table. The watchdog evaluator + Telegram variants ship today
-        // (dry-run scaffolding); the Phase 1+ runtime spawner will use
-        // this DDL once the OMS API client is wired into boot. Idempotent
-        // CREATE TABLE IF NOT EXISTS — safe to call every boot. DEDUP key
-        // `(trading_date_ist, security_id, exchange_segment, ts)` per
-        // I-P1-11 composite identity rule.
-        tickvault_storage::orphan_position_audit_persistence::ensure_orphan_position_audit_table(
-            &config.questdb
-        ),
+        // #T2b (2026-05-20): the 8 audit-table ensure_* calls
+        // (ws_reconnect / auth_renewal / boot / selftest / order /
+        // gap_fill / last_tick / orphan_position) were removed with
+        // their persistence modules in the QuestDB table cleanup.
         // Option-chain minute-snapshot pipeline (2026-05-16, PR #2 of 5).
         // Forensic table for the 3-times-per-minute Dhan option chain
         // fetches that feed BRUTEX strike-selection. One row per
