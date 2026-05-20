@@ -37,8 +37,8 @@ structured ERROR event in the last hour.
 
 Every tracked error/invariant lives in `crates/common/src/error_code.rs`:
 
-- **I-P0-01..06** — Instrument priority-0 (data-loss / correctness)
-- **I-P1-01/02/03/05/06/08/11** — Instrument priority-1
+- **I-P0-03** — Instrument priority-0 (expiry check at OMS gate 4)
+- **I-P1-05/06/08/11** — Instrument priority-1
 - **I-P2-02** — Instrument priority-2 (trading-day guard)
 - **GAP-NET-01** — IP monitor ; **GAP-SEC-01** — API auth
 - **OMS-GAP-01..06** — Order Management System
