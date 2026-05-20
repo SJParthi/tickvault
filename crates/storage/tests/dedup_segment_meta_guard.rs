@@ -137,15 +137,17 @@ fn every_dedup_key_is_listed_here_for_auditing() {
     // `*_audit_persistence.rs` modules, removing their `DEDUP_KEY_*`
     // constants (aggregator_seal, bar_correction, decision, open_price,
     // order_update_ws, pnl, self_trade, signal, sl_replacement,
-    // volume_nse). The threshold is lowered to 10 — equal to the
-    // current declaration-site count so a single accidental removal
-    // still flips the ratchet.
+    // volume_nse).
+    // #T3 (2026-05-20): instrument_persistence.rs deleted — removes
+    // DEDUP_KEY_DERIVATIVE_CONTRACTS + DEDUP_KEY_SUBSCRIBED_INDICES.
+    // The threshold is lowered to 8 — equal to the current
+    // declaration-site count so a single accidental removal still
+    // flips the ratchet.
     //
-    // Current set touching `security_id` (10 declaration sites):
+    // Current set touching `security_id` (8 declaration sites):
     //   DEDUP_KEY_TICKS, DEDUP_KEY_MARKET_DEPTH, DEDUP_KEY_PREVIOUS_CLOSE,
     //   DEDUP_KEY_CANDLES (shared by all 21 plain candle tables),
-    //   DEDUP_KEY_INDICATORS, DEDUP_KEY_OBI,
-    //   DEDUP_KEY_DERIVATIVE_CONTRACTS, DEDUP_KEY_SUBSCRIBED_INDICES.
+    //   DEDUP_KEY_INDICATORS, DEDUP_KEY_OBI.
     let decls = collect_dedup_key_declarations();
     let keys_with_security_id: Vec<&str> = decls
         .iter()
@@ -153,9 +155,9 @@ fn every_dedup_key_is_listed_here_for_auditing() {
         .map(|(_, _, name, _)| name.as_str())
         .collect();
     assert!(
-        keys_with_security_id.len() >= 10,
-        "expected at least 10 DEDUP_KEY_* constants touching security_id \
-         (post #T2a audit-table cleanup), got {}: {:?}. A decrease means a \
+        keys_with_security_id.len() >= 8,
+        "expected at least 8 DEDUP_KEY_* constants touching security_id \
+         (post #T3 instrument-table cleanup), got {}: {:?}. A decrease means a \
          table was removed — verify the removal was intentional.",
         keys_with_security_id.len(),
         keys_with_security_id,
