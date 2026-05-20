@@ -25,20 +25,43 @@ audit/instrument/misc sprawl.
 
 = 1 + 21 + 1 + 1 = **24**.
 
-## Candle architecture change — NO `candles_1s` base
+## Candle architecture — RAM-FIRST (operator-locked 2026-05-20)
 
-Today the 9 candle matviews sample from a `candles_1s` base table (a
-2-tier cascade). The operator does not want `candles_1s`. Therefore:
+> **Operator lock 2026-05-20 (verbatim):** "keep everything in RAM
+> memory and periodically flush to db ... for trading decision nowhere
+> we can tolerate ... we cannot touch db and db is only for replay and
+> historical purpose."
+>
+> This supersedes the earlier (WRONG) matview proposal. QuestDB
+> materialized views push the candle aggregation **into the database**
+> — that is a DB-on-hot-path violation of `aws-budget.md` rule 12
+> (RAM-first) and operator-charter §C. **NO materialized views. EVER.**
 
-- Each of the 21 candle timeframe tables becomes a QuestDB
-  **materialized view that samples `ticks` directly**
-  (`SAMPLE BY <tf>` with `first/max/min/last` OHLC + `sum` volume).
-- `candles_1s` is **dropped**.
-- The in-memory 29-TF cascade (`tickvault_trading::candles`), the
-  `candles_1s` writer, and the 9 `candles_*_shadow` tables are all
-  **removed** — superseded by direct `ticks`→matview aggregation.
+The candle architecture is RAM-first:
+
+| Stage | Where | Detail |
+|---|---|---|
+| Tick → live bar update | **RAM** | the Rust in-memory multi-timeframe aggregator updates the open bar for all 21 timeframes per tick — O(1), zero-alloc |
+| Bar seal at TF boundary | **RAM** | sealed bar stays in the RAM bar cache (today + yesterday) AND is queued for async flush |
+| Periodic flush | **async cold path** | a background task ILP-writes sealed bars to the 21 plain QuestDB candle tables |
+| Trading decision / indicator read | **RAM ONLY** | reads the RAM bar cache — **never** `SELECT` from QuestDB |
+| Replay / cross-verify / dashboards | QuestDB (cold) | the only consumers of the QuestDB candle tables |
+
+Therefore:
+
+- The 21 QuestDB candle tables are **plain `CREATE TABLE` tables** —
+  the flush sink. **NOT** materialized views.
+- The **in-memory multi-timeframe aggregator is KEPT** as the RAM
+  source of truth — trimmed/extended to exactly the 21 TFs. (Earlier
+  draft said "remove the in-memory cascade" — that was wrong; it is
+  the heart of the RAM-first design and stays.)
+- `candles_1s` is **dropped** — no QuestDB base table, no QuestDB-side
+  aggregation, no cascade-over-QuestDB.
+- The 9 `candles_*_shadow` tables are **dropped** — the 21 plain
+  candle tables ARE the flush targets now, no separate shadow layer.
 - 12 sub-15m timeframes (`candles_2m,3m,4m,6m,7m,8m,9m,10m,11m,12m,13m,14m`)
-  were retired in PR #517 — they are **re-created** as matviews here.
+  retired in PR #517 — re-created here as RAM aggregator timeframes +
+  plain flush tables.
 
 ## DROP — and rip out the writer code, not just the SQL
 
@@ -63,9 +86,11 @@ its `ErrorCode` variant(s), and its ratchet tests.
 
 ## Sequencing (serial PRs, §H — one at a time)
 
-- [ ] **#T1** — candle re-architecture: 21 matviews sampling `ticks`
-  directly (incl. re-creating the 12 sub-15m TFs); drop `candles_1s`,
-  the 9 shadow tables, the in-memory 29-TF cascade + seal writer.
+- [ ] **#T1** — candle re-architecture (RAM-first): 21 **plain**
+  QuestDB candle tables fed by the in-memory aggregator's periodic
+  async flush; KEEP + extend the RAM aggregator to the 21 TFs (incl.
+  re-adding the 12 sub-15m TFs); drop `candles_1s` + the 9 shadow
+  tables + any QuestDB matview chain. NO materialized views.
 - [ ] **#T2** — drop ~20 audit tables + `*_audit_persistence.rs` modules
   + boot DDL + notification/ErrorCode wiring + ratchets.
 - [ ] **#T3** — drop 5 instrument tables + their persistence surface.
@@ -107,7 +132,7 @@ IS previous-day close per Ticket #5525125. Greeks: indices-only
 universe never carries options on the main feed → the 5 greek
 columns stay empty; greeks live in `option_chain_minute_snapshot`.
 
-### Candle TF tables (new matviews over `ticks`) — project 10 cols
+### Candle TF tables (plain tables, flushed from the RAM aggregator) — 10 cols
 
 | Bucket | Columns |
 |---|---|
