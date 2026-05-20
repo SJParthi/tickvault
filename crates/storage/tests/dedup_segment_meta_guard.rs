@@ -131,23 +131,21 @@ fn every_dedup_key_is_listed_here_for_auditing() {
     // If this count changes, update the assertion AND verify the new key
     // includes `segment` (the test above enforces that independently).
     //
-    // Candle-engine re-architecture #T1a (2026-05-20): the 9 separate
-    // `DEDUP_KEY_CANDLES_{1M,5M,15M,30M,1H,2H,3H,4H,1D}_SHADOW`
-    // constants of the Wave 6 design were intentionally collapsed into
-    // a SINGLE shared `DEDUP_KEY_CANDLES` constant (all 21 plain
-    // `candles_<tf>` tables share the same `(ts, security_id, segment)`
-    // key shape — see `shadow_persistence.rs`). This is a deliberate
-    // -8 reduction. The threshold is therefore lowered from 22 to 12
-    // with margin so a single accidental removal still flips the
-    // ratchet.
+    // #T1a (2026-05-20): the 9 Wave-6 `DEDUP_KEY_CANDLES_*_SHADOW`
+    // constants collapsed into a single shared `DEDUP_KEY_CANDLES`.
+    // #T2a (2026-05-20): the QuestDB audit-table cleanup deleted 10
+    // `*_audit_persistence.rs` modules, removing their `DEDUP_KEY_*`
+    // constants (aggregator_seal, bar_correction, decision, open_price,
+    // order_update_ws, pnl, self_trade, signal, sl_replacement,
+    // volume_nse). The threshold is lowered to 10 — equal to the
+    // current declaration-site count so a single accidental removal
+    // still flips the ratchet.
     //
-    // Current set touching `security_id` (≥ 12): DEDUP_KEY_TICKS,
-    //   DEDUP_KEY_MARKET_DEPTH, DEDUP_KEY_PREVIOUS_CLOSE,
-    //   DEDUP_KEY_CANDLES_1S, DEDUP_KEY_CANDLES (shared by all 21
-    //   plain candle tables), DEDUP_KEY_INDICATORS, DEDUP_KEY_OBI,
-    //   DEDUP_KEY_VOLUME_NSE_AUDIT, DEDUP_KEY_DERIVATIVE_CONTRACTS,
-    //   DEDUP_KEY_SUBSCRIBED_INDICES, DEDUP_KEY_OPEN_PRICE_AUDIT,
-    //   DEDUP_KEY_SELF_TRADE_AUDIT (+ others as added).
+    // Current set touching `security_id` (10 declaration sites):
+    //   DEDUP_KEY_TICKS, DEDUP_KEY_MARKET_DEPTH, DEDUP_KEY_PREVIOUS_CLOSE,
+    //   DEDUP_KEY_CANDLES (shared by all 21 plain candle tables),
+    //   DEDUP_KEY_INDICATORS, DEDUP_KEY_OBI,
+    //   DEDUP_KEY_DERIVATIVE_CONTRACTS, DEDUP_KEY_SUBSCRIBED_INDICES.
     let decls = collect_dedup_key_declarations();
     let keys_with_security_id: Vec<&str> = decls
         .iter()
@@ -155,10 +153,10 @@ fn every_dedup_key_is_listed_here_for_auditing() {
         .map(|(_, _, name, _)| name.as_str())
         .collect();
     assert!(
-        keys_with_security_id.len() >= 12,
-        "expected at least 12 DEDUP_KEY_* constants touching security_id (post candle-engine \
-         re-architecture #T1a — 9 shadow keys collapsed into 1 shared DEDUP_KEY_CANDLES), \
-         got {}: {:?}. A decrease means a table was removed — verify the removal was intentional.",
+        keys_with_security_id.len() >= 10,
+        "expected at least 10 DEDUP_KEY_* constants touching security_id \
+         (post #T2a audit-table cleanup), got {}: {:?}. A decrease means a \
+         table was removed — verify the removal was intentional.",
         keys_with_security_id.len(),
         keys_with_security_id,
     );
@@ -180,16 +178,15 @@ fn every_dedup_key_is_listed_here_for_auditing() {
 //
 // This guard scans every `DEDUP_KEY_*_AUDIT` constant in the storage
 // crate and fails the build if any of them omits `ts`. Tables whose
-// DDL prepends `ts` at format time (e.g. `aggregator_seal_audit` —
-// `DEDUP UPSERT KEYS(ts, {DEDUP_KEY_AGGREGATOR_SEAL_AUDIT})`) are
-// explicitly listed in `DDL_PREPENDS_TS_AT_FORMAT_TIME` so the guard
-// allows them. Any new audit-table constant added without `ts` (and
-// without an explicit format-time prepend) blocks the build.
+// DDL prepends `ts` at format time may be listed in
+// `DDL_PREPENDS_TS_AT_FORMAT_TIME` so the guard allows them. Any new
+// audit-table constant added without `ts` (and without an explicit
+// format-time prepend) blocks the build.
 
-const DDL_PREPENDS_TS_AT_FORMAT_TIME: &[&str] = &[
-    // `shadow_persistence.rs` emits `DEDUP UPSERT KEYS(ts, {DEDUP_KEY_AGGREGATOR_SEAL_AUDIT})`.
-    "DEDUP_KEY_AGGREGATOR_SEAL_AUDIT",
-];
+// #T2a (2026-05-20): the sole entry `DEDUP_KEY_AGGREGATOR_SEAL_AUDIT`
+// was removed when the `aggregator_seal_audit` table was dropped by the
+// QuestDB table cleanup. The allowlist is now empty.
+const DDL_PREPENDS_TS_AT_FORMAT_TIME: &[&str] = &[];
 
 #[test]
 fn every_audit_dedup_key_must_include_designated_timestamp_ts() {
