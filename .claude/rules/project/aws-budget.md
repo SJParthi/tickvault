@@ -66,7 +66,7 @@ S3 archival exports detached partitions before removal (Plan Item 7, needs aws-s
      - Valkey: 512MB
      - Prometheus: 384MB (7d retention)
      - Alertmanager: 256MB (KEPT — independent process for app-crash alerts)
-   - **Host process — Tickvault app: 2.0 GB** (Wave 7-A4 BUMP: today's + yesterday's sealed bars in RAM + indicator state + 5M tick rescue ring; RAM-only hot path for trading decisions)
+   - **Host process — Tickvault app: 2.0 GB cap** (today's + yesterday's sealed bars in RAM + indicator state + 100K tick rescue ring; RAM-only hot path for trading decisions — actual use ~700 MB after the 2026-05-20 ring trim)
    - **OS + filesystem cache: 600 MB** (tracing log writes, audit flush bursts, kernel TCP buffers)
    - **Total used: ~6.0 GB**
    - **Headroom (HARD FLOOR): 2.0 GB** — Linux kswapd needs ≥1 GB free; 2 GB prevents OOM under bursts
@@ -120,7 +120,7 @@ S3 archival exports detached partitions before removal (Plan Item 7, needs aws-s
 
 | Component | RAM | Type | Notes |
 |---|---|---|---|
-| **Tickvault app** | **2.0 GB** | **Host process** | **Today + Yesterday sealed bars in RAM + indicator state + 5M rescue ring + RAM-only hot path** |
+| **Tickvault app** | **2.0 GB cap** | **Host process** | **Today + Yesterday sealed bars in RAM + indicator state + 100K rescue ring + RAM-only hot path (actual ~700 MB)** |
 | QuestDB | 1.5 GB | Docker | Time-series DB (cold-path persistence + cross-verify) |
 | Grafana | 768 MB | Docker | Dashboards |
 | **OS + FS cache** | **600 MB** | **Host kernel** | **tracing log writes + audit bursts** |
@@ -146,10 +146,16 @@ S3 archival exports detached partitions before removal (Plan Item 7, needs aws-s
 | Tracing + log writer queues | bounded | 5 MB |
 | Tokio runtime + 4 thread stacks | 4 × 2 MB + internal | 20 MB |
 | **WORKING SET SUBTOTAL** | | **~540 MB** |
-| **Rescue ring buffer (5M ticks × 200 bytes)** | 5M × 200 | **1.0 GB** |
-| Heap fragmentation (~25% w/ jemalloc tuning) | | 200 MB |
-| **APP TOTAL** | | **~1.74 GB** |
-| **App safety margin inside 2 GB cap** | | **~260 MB** ✅ |
+| **Rescue ring buffer (100K ticks × 200 bytes)** | 100K × 200 | **20 MB** |
+| Heap fragmentation (~25% w/ jemalloc tuning) | | 140 MB |
+| **APP TOTAL** | | **~700 MB** |
+| **App safety margin inside 2 GB cap** | | **~1.35 GB** ✅ |
+
+> **2026-05-20 — rescue ring rightsized 5M → 100K.** The universe
+> narrowed to 4 IDX_I SIDs (~15-20 tps); a 5M ring (1.0 GB) buffered
+> ~130 hours for a feed that needs minutes. Trimmed to 100K (~20 MB),
+> freeing ~980 MB. The 2.0 GB app cap is now generously loose — a full
+> re-budget is a separate follow-up.
 
 ### Why 2 GB Host Headroom Is Non-Negotiable
 
@@ -240,7 +246,7 @@ S3 archival exports detached partitions before removal (Plan Item 7, needs aws-s
 | Dashboards | Grafana operator-health single page | ✅ KEEP |
 | HTTP gateway | AWS ALB (free tier) | ✅ replaces Traefik |
 | Distributed tracing | CloudWatch X-Ray (optional, free tier 100K traces/mo) | ⚠️ optional |
-| Zero tick loss envelope | Rescue ring 5M ticks (Wave 7-A4) | ✅ 30 sec absorbed |
+| Zero tick loss envelope | Rescue ring 100K ticks (4-SID rightsized) | ✅ 60 sec+ absorbed at 4-SID rates |
 | **RAM-first hot path** | **today + yesterday sealed bars in RAM** | ✅ Wave 7-A4 locks |
 
 ## Common Runtime / Dynamic / Scalable / Automated Charter (mandatory)
@@ -267,11 +273,11 @@ notified on Telegram, no manual inputs."
 
 | Change | File | Status |
 |---|---|---|
-| `TICK_BUFFER_CAPACITY: 2_000_000` → `5_000_000` | `crates/common/src/constants.rs` | ⏳ pending Mac commit (sandbox cargo broken) |
+| `TICK_BUFFER_CAPACITY` rightsized 5M → 100K (4-SID universe) | `crates/common/src/constants.rs` | ✅ done 2026-05-20 |
 | Today + yesterday sealed bar cache implementation | `crates/trading/src/indicator/bar_cache.rs` (new) | ⏳ pending Wave 6 sub-PR #1 |
 | Boot-time rehydration of today's bars | `crates/core/src/boot/historical_loader.rs` (new) | ⏳ pending Wave 6 sub-PR #2 |
 | Banned-pattern: SELECT from hot path | `.claude/hooks/banned-pattern-scanner.sh` | ⏳ pending Mac commit |
-| DHAT zero-alloc verify with 5M ring + bar cache | `crates/core/tests/dhat_*.rs` | ⏳ pending |
+| DHAT zero-alloc verify with 100K ring + bar cache | `crates/core/tests/dhat_*.rs` | ⏳ pending |
 | Adversarial 3-agent review | hot-path + security + bug-hunt | ⏳ pending Wave 6 sub-PR rollout |
 
 ## Trigger

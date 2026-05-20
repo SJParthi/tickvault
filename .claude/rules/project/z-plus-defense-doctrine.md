@@ -182,7 +182,7 @@ When any PR / Telegram / commit body says "100% guarantee", it MUST be qualified
 > "100% inside the tested envelope, with ratcheted regression coverage: <list specific envelope bounds with constants + ratchet test files>. Beyond the envelope, <fallback mechanism> catches every payload as recoverable text."
 
 **Examples (good):**
-- "100% inside the tested envelope: ≤80s soft-restart absorbed by 5M-tick rescue ring (constant `TICK_BUFFER_CAPACITY`, ratcheted by `zero_tick_loss_alert_guard.rs`)"
+- "100% inside the tested envelope: ≤80s soft-restart absorbed by 100K-tick rescue ring (constant `TICK_BUFFER_CAPACITY`, ratcheted by `zero_tick_loss_alert_guard.rs`)"
 - "100% inside the tested envelope: 60s QuestDB outage absorbed by 3-tier rescue→spill→DLQ"
 
 **Examples (rejected):**

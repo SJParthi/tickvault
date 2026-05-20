@@ -1532,46 +1532,37 @@ pub const TICK_FLUSH_INTERVAL_MS: u64 = 1000;
 /// Tick ring buffer capacity for QuestDB outage resilience.
 /// Holds ticks in memory when QuestDB is down, drains on recovery.
 ///
-/// Sized for 25K instruments (5 WS connections × 5,000 each):
-/// - 2,000,000 ticks × ~112 bytes = ~224 MB RAM (pre-allocated at boot
-///   via `VecDeque::with_capacity` in `tick_persistence.rs`)
-/// - At 10K ticks/sec (realistic peak) = 200 seconds (3m20s) before disk spill
-/// - At 25K ticks/sec (extreme peak) = 80 seconds before disk spill
-/// - Full-day QuestDB outage: disk spill handles overflow (~23 GB for 10K/sec)
+/// **Rightsized 2026-05-20 for the 4-SID indices-only universe.**
+/// The live universe is 4 IDX_I SIDs (NIFTY, BANKNIFTY, SENSEX,
+/// INDIA VIX) in Quote mode — a tick rate of ~10-20/sec, not the
+/// ~5,000/sec of the old 25K-instrument universe the 5M ring was
+/// sized for.
 ///
-/// **Memory budget audit (2026-05-03 PR #452):** AWS c7i.xlarge has
-/// 8 GB total. Per `aws-budget.md` the Docker containers consume
-/// 7.4 GB (QuestDB 4G + Valkey 1G + Prometheus 512M + Grafana 1G +
-/// Alertmanager 256M + Traefik 512M + Valkey-exporter 128M),
-/// leaving ~600 MB for OS + tickvault binary. The 224 MB ring fits
-/// comfortably with ~376 MB margin for the rest of the binary + OS.
+/// - 100,000 ticks × ~200 bytes = ~20 MB RAM (pre-allocated at boot
+///   via `VecDeque::with_capacity` in `tick_persistence.rs`).
+/// - At a sustained ~20 ticks/sec = ~83 minutes before disk spill.
+/// - At an extreme ~400 ticks/sec burst = ~4 minutes before spill.
+/// - Both far exceed the ≤60-second QuestDB-outage SLA; the disk
+///   spill + DLQ still backstop any overflow beyond that.
 ///
-/// **Why 2M (not 4.5M)**: operator-confirmed cap on c7i.xlarge —
-/// 4.5M / 504 MB ring would leave only ~96 MB for OS + rest of
-/// binary, too tight. Operator chose Option B (2M / 224 MB) over
-/// Option A (1M / 112 MB) for higher outage-survival headroom while
-/// staying within the c7i.xlarge envelope. Bumping to c7i.2xlarge
-/// (16 GB) would cost an extra ₹2,478/mo per `aws-budget.md` and
-/// is explicitly out of scope per "NEVER provision a larger
-/// instance than c7i.xlarge without Parthiban's approval".
-///
-/// **Bump history:**
-/// - 600K → 2M (PR #452, 2026-05-03): operator-spec'd extreme
-///   memory pressure handling. 233% capacity increase. ~3.3× outage
-///   survival window before disk spill kicks in.
-/// - 2M → 5M (Wave 7-A4, 2026-05-11): RAM-first hot-path hardening
-///   per `.claude/rules/project/aws-budget.md` § "Host Memory Budget
-///   — Wave 7-A4 Locked". 5M × ~200B = ~1.0 GB pre-allocated VecDeque,
-///   absorbed inside the app's 2 GB allocation. Absorbs ≤30 sec
-///   QuestDB outage at peak burst (~99K seals/min minute boundary
-///   spike), or ~3 hours at sustained ~470 ticks/sec.
-pub const TICK_BUFFER_CAPACITY: usize = 5_000_000;
+/// **Trim history:**
+/// - 600K → 2M (PR #452, 2026-05-03): extreme-memory-pressure spec
+///   for the old large universe.
+/// - 2M → 5M (Wave 7-A4, 2026-05-11): RAM-first hardening, ~1.0 GB
+///   pre-allocated, sized for the old ~5,000-tick/sec workload.
+/// - 5M → 100K (2026-05-20): the universe narrowed to 4 IDX_I SIDs;
+///   a 5M ring (~1 GB) buffered ~130 hours for a feed that needs
+///   minutes. Trimmed to 100K — frees ~980 MB RAM on the 8 GB host.
+///   Conservative resize: spill + DLQ retained. The deeper
+///   simplification (10K + drop spill/DLQ) is tracked in
+///   `docs/architecture/resilience-simplification-4-sids.md`.
+pub const TICK_BUFFER_CAPACITY: usize = 100_000;
 
 /// High watermark threshold for tick ring buffer (80% of capacity).
 /// When buffer occupancy exceeds this, a WARN-level alert fires once
 /// to signal imminent disk spill. Triggers Telegram via Loki ERROR rule.
-/// 80% of 5,000,000 = 4,000,000 ticks.
-pub const TICK_BUFFER_HIGH_WATERMARK: usize = TICK_BUFFER_CAPACITY * 4 / 5; // 4,000,000
+/// 80% of 100,000 = 80,000 ticks.
+pub const TICK_BUFFER_HIGH_WATERMARK: usize = TICK_BUFFER_CAPACITY * 4 / 5; // 80,000
 
 /// Minimum free disk space (bytes) to log a warning before spill write.
 /// 100 MB — below this, a WARN fires on each spill open to alert operator
