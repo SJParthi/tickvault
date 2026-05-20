@@ -49,7 +49,10 @@ use chrono::{TimeZone, Timelike};
 use tracing::{debug, error, info, warn};
 
 use tickvault_common::config::{OptionChainMinuteSnapshotConfig, OptionChainUnderlyingEntry};
-use tickvault_common::constants::{IST_UTC_OFFSET_SECONDS_I64, SECONDS_PER_DAY};
+use tickvault_common::constants::{
+    IST_UTC_OFFSET_SECONDS_I64, OPTION_CHAIN_COOLDOWN_LADDER_SECS, OPTION_CHAIN_FETCH_CADENCE_SECS,
+    OPTION_CHAIN_STALE_CYCLES_BEFORE_TELEGRAM, SECONDS_PER_DAY,
+};
 use tickvault_common::market_hours::is_within_market_hours_ist;
 
 use crate::notification::{NotificationEvent, NotificationService};
@@ -85,6 +88,66 @@ struct SchedulerState {
     /// IST date the edge-trigger set was last cleared. `i64` so we can
     /// compare against `now_ist / SECONDS_PER_DAY`.
     last_reset_day_ist: i64,
+    /// PR #8e — L7 COOLDOWN failure-streak tracker. Drives the
+    /// cadence ladder (50 → 60 → 90 → 120s) after consecutive fetch
+    /// failures.
+    cooldown: OptionChainCooldown,
+}
+
+/// PR #8e — L7 COOLDOWN state. Tracks the consecutive-failure streak
+/// and computes the effective fetch cadence per
+/// `docs/architecture/option-chain-z-plus-heart-piece.md` §3 (L7):
+/// after 3 consecutive failed cycles, slow down (60 → 90 → 120s) so we
+/// stop hammering a degraded Dhan API and cut operator alert fatigue.
+/// The first success snaps the cadence back to the 50s base.
+///
+/// Pure-logic struct — no clock, no I/O. Fully unit-tested.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct OptionChainCooldown {
+    /// Number of consecutive failed fetch cycles. Reset to 0 on the
+    /// first success.
+    consecutive_failures: u32,
+}
+
+impl OptionChainCooldown {
+    /// Record one failed fetch cycle. Saturating — never overflows.
+    fn record_failure(&mut self) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+    }
+
+    /// Record one successful fetch cycle — resets the streak so the
+    /// cadence snaps back to the base.
+    fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+    }
+
+    /// Effective fetch cadence in seconds given the operator-locked
+    /// `base` (50s). Below the trigger threshold the base is returned
+    /// unchanged; at/above it, the ladder applies, saturating at the
+    /// final (120s) rung.
+    fn effective_cadence_secs(self, base: u64) -> u64 {
+        let trigger = OPTION_CHAIN_STALE_CYCLES_BEFORE_TELEGRAM;
+        if self.consecutive_failures < trigger {
+            return base;
+        }
+        // failures == trigger → ladder[0]; trigger+1 → ladder[1]; etc.
+        let ladder = OPTION_CHAIN_COOLDOWN_LADDER_SECS;
+        let last_idx = ladder.len() - 1;
+        let idx = ((self.consecutive_failures - trigger) as usize).min(last_idx);
+        ladder[idx]
+    }
+
+    /// Extra sleep to add above the slot-based schedule when in
+    /// cooldown — `effective_cadence_secs - base`, saturating to 0
+    /// when not in cooldown.
+    fn extra_cooldown_secs(self, base: u64) -> u64 {
+        self.effective_cadence_secs(base).saturating_sub(base)
+    }
+
+    /// `true` iff the cooldown ladder is currently slowing the cadence.
+    fn is_active(self) -> bool {
+        self.consecutive_failures >= OPTION_CHAIN_STALE_CYCLES_BEFORE_TELEGRAM
+    }
 }
 
 impl SchedulerState {
@@ -93,6 +156,7 @@ impl SchedulerState {
             cache,
             fired_this_minute: HashSet::with_capacity(16),
             last_reset_day_ist: 0,
+            cooldown: OptionChainCooldown::default(),
         }
     }
 
@@ -277,6 +341,25 @@ async fn run_snapshot_loop(
             &config,
         )
         .await;
+
+        // PR #8e — L7 COOLDOWN: if consecutive failures have crossed
+        // the trigger threshold, sleep an extra interval ABOVE the
+        // slot-based schedule before the next loop iteration. This
+        // stops the scheduler hammering a degraded Dhan API and cuts
+        // operator alert fatigue. `extra_cooldown_secs` returns 0 when
+        // the streak is below the threshold, so the happy path is a
+        // no-op.
+        let extra = state
+            .cooldown
+            .extra_cooldown_secs(OPTION_CHAIN_FETCH_CADENCE_SECS);
+        if extra > 0 {
+            warn!(
+                consecutive_failures = state.cooldown.consecutive_failures,
+                extra_cooldown_secs = extra,
+                "option-chain L7 cooldown active — extending cadence"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(extra)).await;
+        }
     }
 }
 
@@ -370,6 +453,17 @@ async fn run_one_slot_fetch(
     )
     .increment(1);
 
+    // PR #8e — L7 COOLDOWN: a successful cycle resets the failure
+    // streak so the cadence snaps back to the 50s base.
+    let was_in_cooldown = state.cooldown.is_active();
+    state.cooldown.record_success();
+    if was_in_cooldown {
+        info!(
+            underlying,
+            "option-chain L7 cooldown cleared — cadence back to base"
+        );
+    }
+
     info!(underlying, expiry, "option-chain snapshot fetched + cached");
 }
 
@@ -383,6 +477,11 @@ fn record_fetch_failure(
     state: &mut SchedulerState,
 ) {
     let reason_trunc: String = reason.chars().take(TELEGRAM_ERROR_REASON_MAX_LEN).collect();
+
+    // PR #8e — L7 COOLDOWN: a failed cycle extends the streak. Single
+    // chokepoint — every failure return in `run_one_slot_fetch` routes
+    // through here, so the streak count stays consistent.
+    state.cooldown.record_failure();
 
     // hot-path-reviewer 2026-05-16: drop the .to_string() on
     // classify_error — it already returns &'static str so the
@@ -726,5 +825,113 @@ mod tests {
         // (UTC+19800) - 36000.
         let now_ist = utc_secs + IST_UTC_OFFSET_SECONDS_I64;
         assert_eq!(midnight_ist, now_ist - 36_000);
+    }
+
+    // -----------------------------------------------------------------
+    // PR #8e — L7 COOLDOWN
+    // -----------------------------------------------------------------
+
+    const BASE: u64 = OPTION_CHAIN_FETCH_CADENCE_SECS; // 50
+
+    #[test]
+    fn test_cooldown_default_is_zero_failures() {
+        let c = OptionChainCooldown::default();
+        assert_eq!(c.consecutive_failures, 0);
+        assert!(!c.is_active());
+    }
+
+    #[test]
+    fn test_cooldown_below_threshold_returns_base_cadence() {
+        let mut c = OptionChainCooldown::default();
+        // 0, 1, 2 failures → base cadence (threshold is 3).
+        for _ in 0..OPTION_CHAIN_STALE_CYCLES_BEFORE_TELEGRAM {
+            assert_eq!(c.effective_cadence_secs(BASE), BASE);
+            assert_eq!(c.extra_cooldown_secs(BASE), 0);
+            assert!(!c.is_active());
+            c.record_failure();
+        }
+    }
+
+    #[test]
+    fn test_cooldown_ladder_60_90_120() {
+        let mut c = OptionChainCooldown::default();
+        // Walk to exactly the trigger threshold (3 failures).
+        for _ in 0..OPTION_CHAIN_STALE_CYCLES_BEFORE_TELEGRAM {
+            c.record_failure();
+        }
+        // failures == 3 → ladder[0] = 60
+        assert_eq!(c.effective_cadence_secs(BASE), 60);
+        assert!(c.is_active());
+        // failures == 4 → ladder[1] = 90
+        c.record_failure();
+        assert_eq!(c.effective_cadence_secs(BASE), 90);
+        // failures == 5 → ladder[2] = 120
+        c.record_failure();
+        assert_eq!(c.effective_cadence_secs(BASE), 120);
+    }
+
+    #[test]
+    fn test_cooldown_saturates_at_final_rung() {
+        let mut c = OptionChainCooldown::default();
+        for _ in 0..50 {
+            c.record_failure();
+        }
+        // Deep into failure streak — saturates at 120s, no panic.
+        assert_eq!(c.effective_cadence_secs(BASE), 120);
+        assert_eq!(c.extra_cooldown_secs(BASE), 120 - BASE);
+    }
+
+    #[test]
+    fn test_cooldown_record_success_resets_streak() {
+        let mut c = OptionChainCooldown::default();
+        for _ in 0..10 {
+            c.record_failure();
+        }
+        assert!(c.is_active());
+        c.record_success();
+        assert_eq!(c.consecutive_failures, 0);
+        assert!(!c.is_active());
+        assert_eq!(c.effective_cadence_secs(BASE), BASE);
+        assert_eq!(c.extra_cooldown_secs(BASE), 0);
+    }
+
+    #[test]
+    fn test_cooldown_extra_secs_is_effective_minus_base() {
+        let mut c = OptionChainCooldown::default();
+        for _ in 0..OPTION_CHAIN_STALE_CYCLES_BEFORE_TELEGRAM {
+            c.record_failure();
+        }
+        // At 3 failures: effective 60, base 50 → extra 10.
+        assert_eq!(c.extra_cooldown_secs(BASE), 60 - BASE);
+    }
+
+    #[test]
+    fn test_cooldown_record_failure_saturates_no_overflow() {
+        let mut c = OptionChainCooldown {
+            consecutive_failures: u32::MAX,
+        };
+        c.record_failure();
+        // saturating_add — stays at u32::MAX, no panic.
+        assert_eq!(c.consecutive_failures, u32::MAX);
+        assert_eq!(c.effective_cadence_secs(BASE), 120);
+    }
+
+    #[test]
+    fn test_cooldown_failure_then_success_then_failure_cycle() {
+        let mut c = OptionChainCooldown::default();
+        // 4 failures → cooldown active.
+        for _ in 0..4 {
+            c.record_failure();
+        }
+        assert!(c.is_active());
+        // One success clears it.
+        c.record_success();
+        assert!(!c.is_active());
+        // A fresh failure streak starts from 0 again.
+        for _ in 0..OPTION_CHAIN_STALE_CYCLES_BEFORE_TELEGRAM {
+            c.record_failure();
+        }
+        assert!(c.is_active());
+        assert_eq!(c.effective_cadence_secs(BASE), 60);
     }
 }

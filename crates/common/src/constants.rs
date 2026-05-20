@@ -1705,6 +1705,24 @@ pub const OPTION_CHAIN_L2_VERIFY_TOLERANCE_PCT: f64 = 0.5;
 /// session's strike count, comfortably above "empty/garbage".
 pub const OPTION_CHAIN_MIN_STRIKES: usize = 30;
 
+/// PR #8e — L7 COOLDOWN cadence ladder in seconds.
+///
+/// Per `docs/architecture/option-chain-z-plus-heart-piece.md` §3 (L7):
+/// after `OPTION_CHAIN_STALE_CYCLES_BEFORE_TELEGRAM` (3) consecutive
+/// failed fetch cycles, the scheduler slows its cadence to stop
+/// hammering a degraded Dhan API and to cut operator alert fatigue:
+///
+/// | consecutive failures | effective cadence |
+/// |---|---|
+/// | 0, 1, 2 | base 50s (`OPTION_CHAIN_FETCH_CADENCE_SECS`) |
+/// | 3 | 60s (ladder[0]) |
+/// | 4 | 90s (ladder[1]) |
+/// | 5+ | 120s (ladder[2], saturating) |
+///
+/// First successful cycle resets the failure count → cadence snaps
+/// back to the 50s base.
+pub const OPTION_CHAIN_COOLDOWN_LADDER_SECS: [u64; 3] = [60, 90, 120];
+
 /// Default depth batch flush size for QuestDB ILP writes.
 /// Each depth snapshot writes 5 rows (one per level), so effective row count = batch × 5.
 pub const DEPTH_FLUSH_BATCH_SIZE: usize = 200;
@@ -3713,5 +3731,42 @@ mod tests {
             "L2 VERIFY tolerance must stay sub-1%; got {}",
             OPTION_CHAIN_L2_VERIFY_TOLERANCE_PCT
         );
+    }
+
+    #[test]
+    fn test_option_chain_min_strikes_pinned_at_30() {
+        assert_eq!(
+            OPTION_CHAIN_MIN_STRIKES, 30,
+            "L2 VERIFY strike-count floor per heart-piece doc §3 row 2."
+        );
+    }
+
+    #[test]
+    fn test_option_chain_cooldown_ladder_pinned() {
+        assert_eq!(
+            OPTION_CHAIN_COOLDOWN_LADDER_SECS,
+            [60, 90, 120],
+            "L7 cooldown cadence ladder per heart-piece doc §3 (L7)."
+        );
+    }
+
+    #[test]
+    fn test_option_chain_cooldown_ladder_monotonic_and_above_base() {
+        let ladder = OPTION_CHAIN_COOLDOWN_LADDER_SECS;
+        // Every rung must exceed the 50s base cadence — a cooldown that
+        // didn't slow anything down would be pointless.
+        for &rung in &ladder {
+            assert!(
+                rung > OPTION_CHAIN_FETCH_CADENCE_SECS,
+                "cooldown rung {rung}s must exceed the {OPTION_CHAIN_FETCH_CADENCE_SECS}s base"
+            );
+        }
+        // Strictly increasing.
+        for i in 1..ladder.len() {
+            assert!(
+                ladder[i] > ladder[i - 1],
+                "cooldown ladder must be strictly increasing"
+            );
+        }
     }
 }
