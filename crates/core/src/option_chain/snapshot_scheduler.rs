@@ -1052,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    fn test_map_option_chain_emits_one_row_per_side_with_data() {
+    fn test_map_option_chain_to_snapshot_rows_emits_one_per_side() {
         let resp: OptionChainResponse =
             serde_json::from_str(sample_chain_json()).expect("sample JSON parses");
         let rows = map_option_chain_to_snapshot_rows(

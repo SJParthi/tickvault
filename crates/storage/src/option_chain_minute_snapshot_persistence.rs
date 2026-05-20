@@ -659,7 +659,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_rows_empty_slice_is_ok() {
+    async fn test_append_option_chain_minute_snapshot_rows_empty_slice_is_ok() {
         let cfg = test_cfg_unreachable();
         let result = append_option_chain_minute_snapshot_rows(&cfg, &[]).await;
         assert!(result.is_ok(), "empty slice must be a no-op Ok");
