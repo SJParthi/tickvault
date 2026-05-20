@@ -201,7 +201,6 @@ fixed.
 
   * Dhan kill switch API: `.claude/rules/dhan/traders-control.md`
   * OMS state machine: `crates/trading/src/oms/state_machine.rs`
-  * Wave 2 audit infrastructure: `crates/storage/src/boot_audit_persistence.rs`
   * Operator daily startup: `docs/runbooks/daily-operations.md`
   * Phase 0 architecture: `.claude/rules/project/phase-0-architecture.md`
   * Operator charter §H: `.claude/rules/project/operator-charter-forever.md`
