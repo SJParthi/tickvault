@@ -964,51 +964,6 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     let exchange_secs_of_day = tick.exchange_timestamp % SECONDS_PER_DAY;
                     if exchange_secs_of_day >= TICK_PERSIST_END_SECS_OF_DAY_IST {
                         metrics::counter!("tv_late_tick_after_boundary_total").increment(1);
-                        if let Some(qcfg) = tickvault_storage::global_questdb_config() {
-                            let qcfg = qcfg.clone();
-                            let security_id = tick.security_id;
-                            let exchange_ts = tick.exchange_timestamp;
-                            let exchange_segment_code = tick.exchange_segment_code;
-                            let received_at_nanos = tick.received_at_nanos;
-                            tokio::spawn(async move {
-                                // O(1) EXEMPT: cold path — runs only on
-                                // post-15:30 ticks (should be zero in
-                                // steady state).
-                                let trading_date_str = format_trading_date_ist(received_at_nanos);
-                                let bar_minute_str = format_bar_minute_ist(exchange_secs_of_day);
-                                let segment_str =
-                                    exchange_segment_label_static(exchange_segment_code);
-                                let ts_nanos_ist =
-                                    i64::from(exchange_ts).saturating_mul(1_000_000_000);
-                                let last_tick_exchange_ts_nanos = ts_nanos_ist;
-                                // Late-by: signed ms between received-at
-                                // and exchange_ts. Positive = tick is
-                                // BEHIND wall-clock arrival.
-                                let received_ms = received_at_nanos / 1_000_000;
-                                let exchange_ms = i64::from(exchange_ts).saturating_mul(1_000);
-                                let late_arrival_ms = received_ms.saturating_sub(exchange_ms);
-                                if let Err(err) =
-                                    tickvault_storage::last_tick_audit_persistence::append_last_tick_audit_row(
-                                        &qcfg,
-                                        ts_nanos_ist,
-                                        &trading_date_str,
-                                        &bar_minute_str,
-                                        security_id,
-                                        segment_str,
-                                        last_tick_exchange_ts_nanos,
-                                        late_arrival_ms,
-                                    )
-                                    .await
-                                {
-                                    error!(
-                                        security_id,
-                                        exchange_ts,
-                                        ?err,
-                                        "last_tick_audit row insert failed"
-                                    );
-                                }
-                            });
-                        }
                     }
                     outside_hours_filtered = outside_hours_filtered.saturating_add(1);
                     m_outside_hours.increment(1);
