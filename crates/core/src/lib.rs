@@ -29,6 +29,9 @@
 //! Config -> Instrument Download -> **Auth** -> WebSocket -> Parse -> Route
 
 pub mod auth;
+// AWS-lifecycle PR #9 (2026-05-20): daily data-integrity cross-verify —
+// Z+ L3 RECONCILE. Compares derived live candles vs Dhan REST.
+pub mod cross_verify;
 pub mod historical;
 // PR #6a (2026-05-19): index_constituency module RETIRED (4-IDX_I LOCKED_UNIVERSE).
 pub mod instance_lock;
