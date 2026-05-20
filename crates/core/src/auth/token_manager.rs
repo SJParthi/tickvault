@@ -3152,56 +3152,9 @@ mod tests {
         );
     }
 
-    /// Phase 0 Item 17c — source-scan meta-guard pinning the audit
-    /// wiring on the two force-renewal paths. Without these audit
-    /// rows the SEBI forensic chain is asymmetric: scheduled renewals
-    /// (17b) leave a row, but post-sleep wake renewals + explicit
-    /// 807-triggered renewals don't.
-    ///
-    /// Both force paths must produce both outcomes:
-    ///   - `Success` on a successful renew_with_fallback
-    ///   - `Failed`  on a propagated error
-    /// with distinct trigger labels (`force_if_stale_ws_wake` vs
-    /// `force_explicit`) so the operator can split the audit table
-    /// by trigger source post-hoc.
-    #[test]
-    fn test_force_renewal_paths_write_audit_rows() {
-        let source = include_str!("token_manager.rs");
-
-        assert!(
-            source.contains("\"force_if_stale_ws_wake\""),
-            "token_manager.rs force_renewal_if_stale MUST tag audit \
-             rows with trigger_source = \"force_if_stale_ws_wake\". \
-             See Phase 0 Item 17c."
-        );
-        assert!(
-            source.contains("\"force_explicit\""),
-            "token_manager.rs force_renewal MUST tag audit rows with \
-             trigger_source = \"force_explicit\". See Phase 0 Item 17c."
-        );
-        // Each force path must reach both Success and Failed outcomes.
-        // Counting the AuthRenewalAuditOutcome::Success references is
-        // a cheap proxy for "the success branch writes an audit row";
-        // 17b already writes 1 Success row in renewal_loop, 17c adds
-        // 2 more (one per force path), so the workspace MUST contain
-        // at least 3 Success references in this file.
-        let success_count = source.matches("AuthRenewalAuditOutcome::Success").count();
-        assert!(
-            success_count >= 3,
-            "token_manager.rs must contain ≥ 3 \
-             AuthRenewalAuditOutcome::Success references (1 scheduled \
-             + 1 force_if_stale_ws_wake + 1 force_explicit); found {}",
-            success_count
-        );
-        let failed_count = source.matches("AuthRenewalAuditOutcome::Failed").count();
-        assert!(
-            failed_count >= 3,
-            "token_manager.rs must contain ≥ 3 \
-             AuthRenewalAuditOutcome::Failed references (1 scheduled \
-             + 1 force_if_stale_ws_wake + 1 force_explicit); found {}",
-            failed_count
-        );
-    }
+    // #T2b (2026-05-20): test_force_renewal_paths_write_audit_rows
+    // removed — the auth_renewal_audit table + write_renewal_audit_row
+    // wiring it guarded were dropped in the QuestDB table cleanup.
 
     /// Phase 0 Item 17 — `tv_token_renewals_total` counter must be
     /// emitted at all three scheduled-renewal outcomes (success /
