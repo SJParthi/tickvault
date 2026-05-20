@@ -67,8 +67,6 @@ mod global_qcfg_tests {
     }
 }
 
-pub mod auth_renewal_audit_persistence;
-pub mod boot_audit_persistence;
 pub mod boot_probe;
 pub mod calendar_persistence;
 pub mod candle_persistence;
@@ -77,7 +75,6 @@ pub mod constituency_persistence;
 // + depth_rebalance_audit modules DELETED. Audit tables stay on disk
 // per SEBI 5y retention.
 pub mod disk_health_watcher;
-pub mod gap_fill_audit_persistence;
 // PR #3 (2026-05-19): `greeks_persistence` module DELETED. greeks
 // pipeline retired alongside the indices-only universe. The
 // option_greeks / pcr_snapshots / dhan_option_chain_raw / greeks_verification
@@ -85,7 +82,6 @@ pub mod gap_fill_audit_persistence;
 pub mod historical_fetch_marker;
 pub mod indicator_snapshot_persistence;
 pub mod instrument_persistence;
-pub mod last_tick_audit_persistence;
 pub mod live_instance_lock_persistence;
 // Candle-engine re-architecture #T1b: `materialized_views` (Engine C —
 // `candles_1s` + the 9 `candles_<tf>` matviews) DELETED. The 21 plain
@@ -97,8 +93,6 @@ pub mod live_instance_lock_persistence;
 // either (the old `drop_bug3_retired_views` lived in this module).
 pub mod obi_persistence;
 pub mod option_chain_minute_snapshot_persistence;
-pub mod order_audit_persistence;
-pub mod orphan_position_audit_persistence;
 pub mod partition_manager;
 pub mod previous_close_persistence;
 pub mod questdb_health;
@@ -108,16 +102,13 @@ pub mod seal_spill;
 pub mod seal_writer_loop;
 pub mod seal_writer_runner;
 pub mod seal_writer_task;
-pub mod selftest_audit_persistence;
 pub mod shadow_candle_writer;
 pub mod shadow_persistence;
 pub mod shadow_seal_columns;
-pub mod static_ip_audit_persistence;
 pub mod tick_persistence;
 pub mod tick_spill_drain;
 pub mod valkey_cache;
 pub mod ws_frame_spill;
-pub mod ws_reconnect_audit_persistence;
 
 /// Test support: re-exports internal functions for DHAT and benchmark tests.
 pub mod tick_persistence_testing {
