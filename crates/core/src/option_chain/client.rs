@@ -18,7 +18,8 @@ use secrecy::ExposeSecret;
 use tracing::{debug, warn};
 
 use tickvault_common::constants::{
-    OPTION_CHAIN_MIN_REQUEST_INTERVAL_SECS, OPTION_CHAIN_REQUEST_TIMEOUT_SECS,
+    OPTION_CHAIN_BACKOFF_LADDER_SECS, OPTION_CHAIN_MIN_REQUEST_INTERVAL_SECS,
+    OPTION_CHAIN_REQUEST_TIMEOUT_SECS,
 };
 
 /// Maximum number of retry attempts for transient server errors (502, 500, 503).
@@ -144,6 +145,22 @@ impl OptionChainClient {
                 return Ok(resp);
             }
 
+            // DH-904 rate limit (HTTP 429) — Dhan-mandated backoff ladder
+            // 10→20→40→80s per dhan-annexure-enums.md rule 11. The `for`
+            // loop bound (0..=MAX_RETRIES) naturally caps the ladder;
+            // after the final rung the loop exhausts and `bail!`s.
+            if is_dh904_rate_limited(status) {
+                let backoff = compute_dh904_backoff(attempt);
+                warn!(
+                    attempt = attempt + 1,
+                    backoff_secs = backoff.as_secs(),
+                    %status,
+                    "DH-904 rate limit on expiry list — backoff ladder"
+                );
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
+
             // Retry on transient server errors (502, 500, 503).
             if is_retryable_status(status) && attempt < MAX_RETRIES {
                 let resp_body = response.text().await.unwrap_or_default();
@@ -245,6 +262,22 @@ impl OptionChainClient {
                 return Ok(resp);
             }
 
+            // DH-904 rate limit (HTTP 429) — Dhan-mandated backoff ladder
+            // 10→20→40→80s per dhan-annexure-enums.md rule 11. The `for`
+            // loop bound (0..=MAX_RETRIES) naturally caps the ladder;
+            // after the final rung the loop exhausts and `bail!`s.
+            if is_dh904_rate_limited(status) {
+                let backoff = compute_dh904_backoff(attempt);
+                warn!(
+                    attempt = attempt + 1,
+                    backoff_secs = backoff.as_secs(),
+                    %status,
+                    "DH-904 rate limit on option chain — backoff ladder"
+                );
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
+
             // Retry on transient server errors (502, 500, 503).
             if is_retryable_status(status) && attempt < MAX_RETRIES {
                 let resp_body = response.text().await.unwrap_or_default();
@@ -308,10 +341,51 @@ impl OptionChainClient {
 /// worth retrying: 500 (Internal Server Error), 502 (Bad Gateway),
 /// 503 (Service Unavailable).
 ///
-/// Does NOT retry on 4xx (client errors) or DH-904 (rate limit — handled
-/// separately with exponential backoff per dhan-api-introduction rule 8).
+/// Does NOT retry on 4xx (client errors). DH-904 (rate limit, wire-level
+/// HTTP 429) is handled separately by [`is_dh904_rate_limited`] +
+/// [`compute_dh904_backoff`] — it has its own Dhan-mandated backoff
+/// ladder rather than the generic exponential doubling.
 fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 500 | 502 | 503)
+}
+
+/// Returns true for HTTP 429 (Too Many Requests) — the wire-level signal
+/// for Dhan error code DH-904.
+///
+/// PR #8c (option_chain heart-piece): before this, `client.rs` claimed in
+/// a comment that "DH-904 is handled separately with exponential backoff"
+/// but 429 was never actually detected — a 429 fell through to the
+/// non-retryable `bail!` path with a generic error. This closes that gap.
+fn is_dh904_rate_limited(status: reqwest::StatusCode) -> bool {
+    status.as_u16() == 429
+}
+
+/// DH-904 backoff ladder. Maps a zero-based retry attempt index to the
+/// Dhan-mandated wait `Duration` per `dhan-annexure-enums.md` rule 11
+/// and `docs/architecture/option-chain-z-plus-heart-piece.md` §3 (L6):
+///
+/// | attempt | wait |
+/// |---|---|
+/// | 0 | 10s |
+/// | 1 | 20s |
+/// | 2 | 40s |
+/// | 3 | 80s |
+///
+/// Attempts beyond the ladder length saturate at the final (80s) rung.
+/// The caller exhausts the ladder then `bail!`s; the scheduler that
+/// consumes the `Err` emits `OPTION-CHAIN-02` (Critical).
+///
+/// Pure function — uses the operator-locked
+/// `OPTION_CHAIN_BACKOFF_LADDER_SECS` constant. Tested by
+/// `test_compute_dh904_backoff_*`.
+#[must_use]
+fn compute_dh904_backoff(attempt: u32) -> Duration {
+    let ladder = OPTION_CHAIN_BACKOFF_LADDER_SECS;
+    // ladder is a fixed `[u64; 4]` — `len()` is never 0, so `len() - 1`
+    // cannot underflow.
+    let last_idx = ladder.len() - 1;
+    let idx = (attempt as usize).min(last_idx);
+    Duration::from_secs(ladder[idx])
 }
 
 // ---------------------------------------------------------------------------
@@ -639,5 +713,77 @@ mod tests {
         assert_eq!(nifty_id, 13);
         assert_eq!(banknifty_id, 25);
         assert_eq!(sensex_id, 51);
+    }
+
+    // -----------------------------------------------------------------
+    // PR #8c — DH-904 backoff ladder
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_is_dh904_rate_limited_detects_429() {
+        assert!(is_dh904_rate_limited(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+    }
+
+    #[test]
+    fn test_is_dh904_rate_limited_rejects_non_429() {
+        for code in [
+            reqwest::StatusCode::OK,
+            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(
+                !is_dh904_rate_limited(code),
+                "{code} must NOT be classified as DH-904"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_dh904_backoff_full_ladder() {
+        // attempt 0→10s, 1→20s, 2→40s, 3→80s per dhan-annexure-enums rule 11.
+        assert_eq!(compute_dh904_backoff(0), Duration::from_secs(10));
+        assert_eq!(compute_dh904_backoff(1), Duration::from_secs(20));
+        assert_eq!(compute_dh904_backoff(2), Duration::from_secs(40));
+        assert_eq!(compute_dh904_backoff(3), Duration::from_secs(80));
+    }
+
+    #[test]
+    fn test_compute_dh904_backoff_saturates_beyond_ladder() {
+        // Attempts past the 4-rung ladder saturate at the final 80s rung —
+        // no panic, no index-out-of-bounds.
+        assert_eq!(compute_dh904_backoff(4), Duration::from_secs(80));
+        assert_eq!(compute_dh904_backoff(100), Duration::from_secs(80));
+        assert_eq!(compute_dh904_backoff(u32::MAX), Duration::from_secs(80));
+    }
+
+    #[test]
+    fn test_compute_dh904_backoff_matches_pinned_constant() {
+        // The ladder MUST be sourced from the operator-locked constant,
+        // not a local literal. If the constant changes, this test moves
+        // with it — proving the wire-through.
+        for (attempt, &expected) in OPTION_CHAIN_BACKOFF_LADDER_SECS.iter().enumerate() {
+            assert_eq!(
+                compute_dh904_backoff(attempt as u32),
+                Duration::from_secs(expected),
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_dh904_backoff_is_monotonic_non_decreasing() {
+        let mut prev = compute_dh904_backoff(0);
+        for attempt in 1..8 {
+            let cur = compute_dh904_backoff(attempt);
+            assert!(
+                cur >= prev,
+                "backoff must never decrease: attempt {attempt} gave {cur:?} < {prev:?}"
+            );
+            prev = cur;
+        }
     }
 }
