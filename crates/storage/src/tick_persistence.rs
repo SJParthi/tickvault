@@ -381,34 +381,34 @@ impl TickPersistenceWriter {
         Ok(())
     }
 
-    /// Like `append_tick` but writes the four Phase 2 lifecycle columns
-    /// from the supplied `TickLifecycle` carrier (29-tf engine plan).
+    /// Like `append_tick`, accepting a `TickLifecycle` carrier from the
+    /// 29-tf engine enricher.
     ///
-    /// Used by the SPSC tick processor after `TickEnricher::enrich_tick`
-    /// produced the lifecycle values. Spill replay continues to call
-    /// `append_tick` (defaults the lifecycle columns to 0/PREMARKET) —
-    /// the enricher state can't be reconstructed from disk, and zero
-    /// lifecycle data is preferable to fabricated values.
+    /// **Candle re-architecture sub-PR #T1c:** the four lifecycle values
+    /// (`volume_delta`, `prev_day_close`, `prev_day_oi`, `phase`) used to be
+    /// persisted into dedicated `ticks` columns; those columns were retired
+    /// in the table cleanup. The carrier is still accepted because the
+    /// `tick_processor` hot path constructs it for the VOLUME-MONO-01
+    /// monotonicity-suppression gate (an independent live consumer). The
+    /// `life` argument is no longer persisted — this method now writes the
+    /// identical 16-column row as `append_tick`.
     ///
     /// O(1) — same characteristics as `append_tick`. The `TickLifecycle`
     /// carrier is `Copy`, no heap allocation.
-    pub fn append_tick_enriched(&mut self, tick: &ParsedTick, life: TickLifecycle) -> Result<()> {
+    pub fn append_tick_enriched(&mut self, tick: &ParsedTick, _life: TickLifecycle) -> Result<()> {
         if self.sender.is_none() {
             match self.try_reconnect_on_error() {
                 Ok(()) => {
                     self.drain_tick_buffer();
                 }
                 Err(_) => {
-                    // Buffer the raw tick — lifecycle values lost on this
-                    // path. Acceptable: this only fires when QuestDB is
-                    // unreachable AND ring buffer drain hasn't recovered.
                     self.buffer_tick(*tick);
                     return Ok(());
                 }
             }
         }
 
-        build_tick_row_enriched(&mut self.buffer, tick, life)?;
+        build_tick_row(&mut self.buffer, tick)?;
 
         self.in_flight.push(*tick);
         self.pending_count = self.pending_count.saturating_add(1);
@@ -1244,17 +1244,11 @@ fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
     buffer
         .table(QUESTDB_TABLE_TICKS)
         .context("table name")?
-        // QuestDB ILP requires ALL symbols before any column_*. Both
-        // `segment` and `phase` are SYMBOL columns — group them at the
-        // top of the row. Phase 2 lifecycle column (29-tf engine plan):
-        // legacy `append_tick` callers write PHASE=PREMARKET as the
-        // safe default. Spill replay restores ticks via this path —
-        // the enricher state is gone after a restart, so the lifecycle
-        // values are unrecoverable; defaults are preferable to fabrication.
+        // QuestDB ILP requires ALL symbols before any column_*. `segment`
+        // is the only SYMBOL column on the `ticks` table after the #T1c
+        // table cleanup retired the `phase` SYMBOL column.
         .symbol("segment", segment_code_to_str(tick.exchange_segment_code))
         .context("segment")?
-        .symbol("phase", PHASE_DEFAULT_STR)
-        .context("phase")?
         .column_i64("security_id", i64::from(tick.security_id))
         .context("security_id")?
         .column_f64("ltp", f32_to_f64_clean(tick.last_traded_price))
@@ -1281,22 +1275,6 @@ fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
         .context("total_sell_qty")?
         .column_i64("exchange_timestamp", i64::from(tick.exchange_timestamp))
         .context("exchange_timestamp")?
-        .column_f64("iv", tick.iv)
-        .context("iv")?
-        .column_f64("delta", tick.delta)
-        .context("delta")?
-        .column_f64("gamma", tick.gamma)
-        .context("gamma")?
-        .column_f64("theta", tick.theta)
-        .context("theta")?
-        .column_f64("vega", tick.vega)
-        .context("vega")?
-        .column_i64("volume_delta", 0_i64)
-        .context("volume_delta")?
-        .column_f64("prev_day_close", 0.0_f64)
-        .context("prev_day_close")?
-        .column_i64("prev_day_oi", 0_i64)
-        .context("prev_day_oi")?
         .column_ts("received_at", received_nanos)
         .context("received_at")?
         .at(ts_nanos)
@@ -1305,139 +1283,27 @@ fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
     Ok(())
 }
 
-/// SYMBOL string written when a tick is appended without explicit
-/// enrichment. PREMARKET is the safest default — formulas.rs treats
-/// `prev_day_close <= 0` as "no prior baseline" and returns 0.0 pct.
-const PHASE_DEFAULT_STR: &str = "PREMARKET";
-
 /// Lifecycle values produced by `crates/core/src/pipeline/tick_enricher.rs`
-/// (29-tf engine plan, Phase 2). Carried into ILP via
-/// `append_tick_enriched` so we don't have to widen the fixed-size
-/// `ParsedTick` spill record.
+/// (29-tf engine plan). Historically these four values were written into
+/// dedicated `ticks` columns; candle re-architecture sub-PR #T1c retired
+/// those columns. The carrier is retained because the `tick_processor`
+/// hot path still constructs it from the enricher — the enricher's
+/// `EnrichedTickFlags` (volume-first-seen / phase) feed the VOLUME-MONO-01
+/// monotonicity-suppression gate, an independent live consumer. The values
+/// here are no longer persisted; `append_tick_enriched` ignores them.
 ///
 /// All fields are `Copy`, zero-allocation. Construction is hot-path-safe.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TickLifecycle {
-    /// Per-tick incremental volume. `0` for the first tick of the day.
-    /// Negative values during PHASE=OPEN trigger VOLUME-MONO-01.
+    /// Per-tick incremental volume. No longer persisted.
     pub volume_delta: i64,
-    /// Frozen prev-day close. `0.0` until the enricher's first-seen
-    /// stamper fires.
+    /// Frozen prev-day close. No longer persisted.
     pub prev_day_close: f32,
-    /// Boot-loaded prev-day OI. `0` if the instrument has no prior-day
-    /// `candles_1d` row (new listing, fresh deploy).
+    /// Boot-loaded prev-day OI. No longer persisted.
     pub prev_day_oi: i64,
-    /// Phase as `repr(u8)` of `tickvault_common::phase::Phase`. Mapped
-    /// to its canonical SYMBOL string by `phase_code_to_str`.
+    /// Phase as `repr(u8)` of `tickvault_common::phase::Phase`. No longer
+    /// persisted.
     pub phase: u8,
-}
-
-/// Map `Phase::as u8` to the canonical SYMBOL string written into
-/// QuestDB. Bounded 6-entry dictionary including the explicit
-/// "UNKNOWN" sentinel.
-///
-/// Phase 2.8 H2 fix (hostile bug-hunt drift hazard): out-of-range
-/// codes return "UNKNOWN" — NOT "PREMARKET". The previous default-to-
-/// PREMARKET behavior silently mislabeled future Phase variants
-/// (e.g. a hypothetical `Phase::Halted = 5`) as PREMARKET, masking
-/// a producer bug as legitimate data. The "UNKNOWN" string is its
-/// own SYMBOL value so dashboards and audits can detect the drift
-/// immediately. Operators see "UNKNOWN" in the panel and trace the
-/// bug; they don't see "PREMARKET" and assume nothing's wrong.
-///
-/// A producer-side counter `tv_phase_code_unknown_total` is
-/// incremented on every UNKNOWN return so the drift surfaces in
-/// metrics + alerts independently of QuestDB.
-#[inline]
-fn phase_code_to_str(code: u8) -> &'static str {
-    match code {
-        0 => "PREMARKET",
-        1 => "PREOPEN",
-        2 => "OPEN",
-        3 => "POSTAUCTION",
-        4 => "CLOSED",
-        _ => {
-            // Increment a counter on the UNKNOWN path so the drift
-            // surfaces in metrics regardless of where the bad code
-            // came from. The counter creation is idempotent — first
-            // call registers, later calls just increment.
-            metrics::counter!("tv_phase_code_unknown_total").increment(1);
-            "UNKNOWN"
-        }
-    }
-}
-
-/// Build an ILP row including the Phase 2 lifecycle columns. Mirrors
-/// `build_tick_row` exactly except it sources the 4 lifecycle values
-/// from the supplied `TickLifecycle` carrier rather than writing
-/// defaults.
-fn build_tick_row_enriched(
-    buffer: &mut Buffer,
-    tick: &ParsedTick,
-    life: TickLifecycle,
-) -> Result<()> {
-    let ts_nanos =
-        TimestampNanos::new(i64::from(tick.exchange_timestamp).saturating_mul(1_000_000_000));
-    let received_nanos =
-        TimestampNanos::new(tick.received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS));
-
-    buffer
-        .table(QUESTDB_TABLE_TICKS)
-        .context("table name")?
-        // ILP wire requires symbols before columns. `segment` and
-        // `phase` are both SYMBOL columns; group them up front.
-        .symbol("segment", segment_code_to_str(tick.exchange_segment_code))
-        .context("segment")?
-        .symbol("phase", phase_code_to_str(life.phase))
-        .context("phase")?
-        .column_i64("security_id", i64::from(tick.security_id))
-        .context("security_id")?
-        .column_f64("ltp", f32_to_f64_clean(tick.last_traded_price))
-        .context("ltp")?
-        .column_f64("open", f32_to_f64_clean(tick.day_open))
-        .context("open")?
-        .column_f64("high", f32_to_f64_clean(tick.day_high))
-        .context("high")?
-        .column_f64("low", f32_to_f64_clean(tick.day_low))
-        .context("low")?
-        .column_f64("close", f32_to_f64_clean(tick.day_close))
-        .context("close")?
-        .column_i64("volume", i64::from(tick.volume))
-        .context("volume")?
-        .column_i64("oi", i64::from(tick.open_interest))
-        .context("oi")?
-        .column_f64("avg_price", f32_to_f64_clean(tick.average_traded_price))
-        .context("avg_price")?
-        .column_i64("last_trade_qty", i64::from(tick.last_trade_quantity))
-        .context("last_trade_qty")?
-        .column_i64("total_buy_qty", i64::from(tick.total_buy_quantity))
-        .context("total_buy_qty")?
-        .column_i64("total_sell_qty", i64::from(tick.total_sell_quantity))
-        .context("total_sell_qty")?
-        .column_i64("exchange_timestamp", i64::from(tick.exchange_timestamp))
-        .context("exchange_timestamp")?
-        .column_f64("iv", tick.iv)
-        .context("iv")?
-        .column_f64("delta", tick.delta)
-        .context("delta")?
-        .column_f64("gamma", tick.gamma)
-        .context("gamma")?
-        .column_f64("theta", tick.theta)
-        .context("theta")?
-        .column_f64("vega", tick.vega)
-        .context("vega")?
-        .column_i64("volume_delta", life.volume_delta)
-        .context("volume_delta")?
-        .column_f64("prev_day_close", f32_to_f64_clean(life.prev_day_close))
-        .context("prev_day_close")?
-        .column_i64("prev_day_oi", life.prev_day_oi)
-        .context("prev_day_oi")?
-        .column_ts("received_at", received_nanos)
-        .context("received_at")?
-        .at(ts_nanos)
-        .context("designated timestamp")?;
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1471,55 +1337,38 @@ const TICKS_CREATE_DDL: &str = "\
         total_buy_qty LONG,\
         total_sell_qty LONG,\
         exchange_timestamp LONG,\
-        iv DOUBLE,\
-        delta DOUBLE,\
-        gamma DOUBLE,\
-        theta DOUBLE,\
-        vega DOUBLE,\
-        volume_delta LONG,\
-        prev_day_close DOUBLE,\
-        prev_day_oi LONG,\
-        phase SYMBOL,\
         received_at TIMESTAMP,\
         ts TIMESTAMP\
     ) TIMESTAMP(ts) PARTITION BY HOUR WAL\
 ";
 
-/// Phase 1 lifecycle columns added to the `ticks` table by the
-/// 29-timeframes-engine plan (`active-plan-29-tf-and-movers-deletion.md`).
+/// Columns dropped from the `ticks` table by candle re-architecture
+/// sub-PR #T1c (table cleanup, operator-approved audit in
+/// `.claude/plans/active-plan-table-cleanup.md` — "`ticks` 25 cols → keep 16").
 ///
-/// Columns sit empty after Phase 1 — Phase 2 wires the populating writers
-/// (`prev_day_close` first-seen stamper, `prev_day_oi` boot cache,
-/// `volume_delta` per-tick derivation, `phase` pure-fn classifier).
+/// - `iv` / `delta` / `gamma` / `theta` / `vega` — greeks pipeline retired;
+///   the 4-IDX_I-index universe has no options on the main feed, so these
+///   were always empty.
+/// - `prev_day_close` — redundant; the Quote `close` field already carries
+///   the previous trading session's close.
+/// - `volume_delta` / `prev_day_oi` / `phase` — derived/operational extras
+///   no longer needed once the 29-tf-engine per-tick enrichment columns are
+///   retired.
 ///
-/// Layout pairs `(column_name, questdb_type)`. The schema-self-heal helper
-/// runs `ALTER TABLE ticks ADD COLUMN <name> <type>` for each row at boot;
-/// QuestDB rejects already-existing columns with a non-fatal error that the
-/// caller safely ignores, making the loop idempotent across restarts.
-///
-/// **Greenfield/brownfield column-order divergence (intentional):**
-/// fresh `CREATE TABLE` lists these columns BEFORE `received_at, ts`. A
-/// brownfield (existing) database picks them up via `ALTER ADD COLUMN`,
-/// which appends at the END — so `received_at, ts` precede the new
-/// columns physically.
-///
-/// This is intentional and SAFE because:
-/// (a) ILP writes name columns explicitly (`build_tick_row` etc.) — never
-/// positional;
-/// (b) SELECT/SQL queries name columns explicitly — never positional;
-/// (c) DEDUP UPSERT KEYS reference column names, not positions;
-/// (d) materialized view DDL projects columns by name via `last(col)`.
-///
-/// The greenfield order is preferred only because it groups lifecycle
-/// columns together visually; the divergence does not affect behavior.
-/// Test `test_ticks_phase1_lifecycle_columns_match_create_ddl` asserts
-/// each (name, type) pair appears in the CREATE DDL; positional order
-/// is deliberately NOT pinned.
-pub(crate) const TICKS_PHASE1_LIFECYCLE_COLUMNS: &[(&str, &str)] = &[
-    ("volume_delta", "LONG"),
-    ("prev_day_close", "DOUBLE"),
-    ("prev_day_oi", "LONG"),
-    ("phase", "SYMBOL"),
+/// The schema-self-heal helper runs `ALTER TABLE ticks DROP COLUMN IF EXISTS
+/// <name>` for each entry at boot so existing (brownfield) databases shed the
+/// columns. QuestDB treats `DROP COLUMN IF EXISTS` as a no-op when the column
+/// is already absent, making the loop idempotent across restarts.
+pub(crate) const TICKS_DROPPED_COLUMNS: &[&str] = &[
+    "iv",
+    "delta",
+    "gamma",
+    "theta",
+    "vega",
+    "volume_delta",
+    "prev_day_close",
+    "prev_day_oi",
+    "phase",
 ];
 
 /// Creates the `ticks` table (if not exists) and enables DEDUP UPSERT KEYS.
@@ -1624,13 +1473,18 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
         }
     }
 
-    // Step 3: Add Greeks columns if missing (schema migration for existing tables).
-    // QuestDB ALTER TABLE ADD COLUMN is idempotent — adding an already-existing
-    // column returns a non-fatal error that we safely ignore.
-    let greeks_columns: &[&str] = &["iv", "delta", "gamma", "theta", "vega"];
-    for col in greeks_columns {
+    // Step 3: Drop the 9 retired columns from existing (brownfield) tables
+    // (candle re-architecture sub-PR #T1c — `ticks` 25 cols → keep 16).
+    // QuestDB `ALTER TABLE ... DROP COLUMN IF EXISTS` is idempotent — when the
+    // column is already absent it is a no-op, so the loop is safe to run every
+    // boot. A fresh (greenfield) table created above never had these columns;
+    // the IF EXISTS guard makes the DROP a harmless no-op there too.
+    // Identifiers are double-quoted (defence-in-depth — these are compile-time
+    // `&'static str` constants today, but the pattern shouldn't rely on
+    // call-site discipline).
+    for col in TICKS_DROPPED_COLUMNS {
         let alter_sql = format!(
-            "ALTER TABLE {} ADD COLUMN {} DOUBLE",
+            "ALTER TABLE \"{}\" DROP COLUMN IF EXISTS \"{}\"",
             QUESTDB_TABLE_TICKS, col
         );
         drop(
@@ -1641,31 +1495,9 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
                 .await,
         );
     }
-    info!("ticks table Greeks columns ensured (idempotent ADD COLUMN)");
+    info!("ticks table retired columns dropped (idempotent DROP COLUMN IF EXISTS)");
 
-    // Step 4: Add Phase 1 lifecycle columns (29-timeframes engine plan).
-    // Columns sit empty until Phase 2 populates them; Phase 1 only widens the
-    // schema. Same idempotent ALTER pattern as Greeks above. Identifiers are
-    // double-quoted (defence-in-depth — these are compile-time `&'static str`
-    // constants today, but the pattern shouldn't rely on call-site discipline).
-    for (col, ty) in TICKS_PHASE1_LIFECYCLE_COLUMNS {
-        let alter_sql = format!(
-            "ALTER TABLE \"{}\" ADD COLUMN \"{}\" {}",
-            QUESTDB_TABLE_TICKS, col, ty
-        );
-        drop(
-            client
-                .get(&base_url)
-                .query(&[("query", &alter_sql)])
-                .send()
-                .await,
-        );
-    }
-    info!("ticks table Phase 1 lifecycle columns ensured (idempotent ADD COLUMN)");
-
-    info!(
-        "ticks table setup complete (DDL + DEDUP UPSERT KEYS + Greeks + Phase 1 lifecycle migration)"
-    );
+    info!("ticks table setup complete (DDL + DEDUP UPSERT KEYS + retired-column cleanup)");
 }
 
 // ---------------------------------------------------------------------------
@@ -3471,126 +3303,55 @@ mod tests {
         assert!(TICKS_CREATE_DDL.contains("IF NOT EXISTS"));
     }
 
+    /// #T1c ratchet: the `ticks` DDL must keep exactly the 16 columns
+    /// retained by the table cleanup. This pins the schema so a future drift
+    /// (re-adding a retired column, or dropping a kept one) fails the build.
     #[test]
-    fn test_ticks_ddl_has_greeks_columns() {
-        // The ticks DDL must include all 5 Greeks columns for new table creation.
-        assert!(TICKS_CREATE_DDL.contains("iv DOUBLE"));
-        assert!(TICKS_CREATE_DDL.contains("delta DOUBLE"));
-        assert!(TICKS_CREATE_DDL.contains("gamma DOUBLE"));
-        assert!(TICKS_CREATE_DDL.contains("theta DOUBLE"));
-        assert!(TICKS_CREATE_DDL.contains("vega DOUBLE"));
-    }
-
-    /// Phase 1 ratchet (29-timeframes engine plan): the four lifecycle columns
-    /// MUST appear in the `ticks` DDL so a fresh QuestDB volume gets the wide
-    /// schema directly, not via boot-time ALTER. This pins the column types so
-    /// a future drift to the wrong storage type fails the build.
-    #[test]
-    fn test_ticks_ddl_has_phase1_lifecycle_columns() {
-        assert!(
-            TICKS_CREATE_DDL.contains("volume_delta LONG"),
-            "ticks DDL must declare volume_delta LONG (per-tick incremental volume)"
-        );
-        assert!(
-            TICKS_CREATE_DDL.contains("prev_day_close DOUBLE"),
-            "ticks DDL must declare prev_day_close DOUBLE (frozen per trading day)"
-        );
-        assert!(
-            TICKS_CREATE_DDL.contains("prev_day_oi LONG"),
-            "ticks DDL must declare prev_day_oi LONG (frozen per trading day)"
-        );
-        assert!(
-            TICKS_CREATE_DDL.contains("phase SYMBOL"),
-            "ticks DDL must declare phase SYMBOL (PREMARKET/PREOPEN/OPEN/POSTAUCTION/CLOSED)"
-        );
-    }
-
-    /// Phase 1 ratchet: the lifecycle column constant MUST list exactly the
-    /// four columns described in the plan, in the order the schema-self-heal
-    /// helper iterates them. Drift here = unmigrated brownfield databases.
-    #[test]
-    fn test_ticks_phase1_lifecycle_column_constant_is_pinned() {
-        let pairs: Vec<(&str, &str)> = TICKS_PHASE1_LIFECYCLE_COLUMNS.to_vec();
-        assert_eq!(
-            pairs,
-            vec![
-                ("volume_delta", "LONG"),
-                ("prev_day_close", "DOUBLE"),
-                ("prev_day_oi", "LONG"),
-                ("phase", "SYMBOL"),
-            ],
-            "TICKS_PHASE1_LIFECYCLE_COLUMNS pinned to the plan-locked column \
-             list — drift would split the brownfield ALTER chain from the \
-             greenfield CREATE"
-        );
-    }
-
-    /// Phase 1 ratchet: every entry in `TICKS_PHASE1_LIFECYCLE_COLUMNS` must
-    /// also appear in the CREATE DDL with the same QuestDB type — otherwise a
-    /// fresh table and an ALTERed table diverge.
-    #[test]
-    fn test_ticks_phase1_lifecycle_columns_match_create_ddl() {
-        for (col, ty) in TICKS_PHASE1_LIFECYCLE_COLUMNS {
-            let needle = format!("{} {}", col, ty);
+    fn test_ticks_ddl_has_kept_columns() {
+        // The 16 columns #T1c keeps must all remain in the CREATE DDL.
+        for col in [
+            "ltp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "oi",
+            "avg_price",
+            "last_trade_qty",
+            "total_buy_qty",
+            "total_sell_qty",
+            "segment",
+            "security_id",
+            "exchange_timestamp",
+            "received_at",
+            "ts",
+        ] {
             assert!(
-                TICKS_CREATE_DDL.contains(&needle),
-                "TICKS_CREATE_DDL must contain '{}' so fresh tables match \
-                 the brownfield ALTER schema",
-                needle
+                TICKS_CREATE_DDL.contains(col),
+                "ticks DDL must keep column `{col}`"
             );
         }
     }
 
-    /// Phase 2 ratchet: `phase_code_to_str` maps the 5 canonical Phase
-    /// repr-u8 codes to their SYMBOL strings exactly. Drift here breaks
-    /// the QuestDB SYMBOL dictionary contract (5 distinct values).
+    /// Ratchet: `TickLifecycle` defaults are all-zero. The carrier is no
+    /// longer persisted (#T1c retired the dedicated columns) but the
+    /// `tick_processor` hot path still constructs it for the VOLUME-MONO-01
+    /// monotonicity gate, so the `Default` contract is still pinned.
     #[test]
-    fn test_phase_code_to_str_pinned() {
-        assert_eq!(phase_code_to_str(0), "PREMARKET");
-        assert_eq!(phase_code_to_str(1), "PREOPEN");
-        assert_eq!(phase_code_to_str(2), "OPEN");
-        assert_eq!(phase_code_to_str(3), "POSTAUCTION");
-        assert_eq!(phase_code_to_str(4), "CLOSED");
-    }
-
-    /// Phase 2.8 H2 ratchet (drift hazard): out-of-range codes return
-    /// "UNKNOWN" — NOT "PREMARKET". The old default-to-PREMARKET
-    /// behavior silently mislabeled future variants (e.g. hypothetical
-    /// `Phase::Halted = 5`) as healthy PREMARKET, masking the bug.
-    /// "UNKNOWN" is its own SYMBOL string so dashboards + audits can
-    /// detect the drift; the producer-side
-    /// `tv_phase_code_unknown_total` counter increments on every
-    /// UNKNOWN return.
-    #[test]
-    fn test_phase_code_to_str_unknown_returns_unknown_not_premarket() {
-        assert_eq!(
-            phase_code_to_str(5),
-            "UNKNOWN",
-            "code 5 must NOT silently map to PREMARKET — H2 fix"
-        );
-        assert_eq!(phase_code_to_str(99), "UNKNOWN");
-        assert_eq!(phase_code_to_str(255), "UNKNOWN");
-    }
-
-    /// Phase 2 ratchet: `TickLifecycle` defaults match the legacy
-    /// `append_tick` path (volume_delta=0, prev_day_close=0.0,
-    /// prev_day_oi=0, phase=PREMARKET). Drift means an unenriched
-    /// fallback no longer matches the documented contract.
-    #[test]
-    fn test_tick_lifecycle_default_is_zero_premarket() {
+    fn test_tick_lifecycle_default_is_zero() {
         let life = TickLifecycle::default();
         assert_eq!(life.volume_delta, 0);
         assert_eq!(life.prev_day_close, 0.0);
         assert_eq!(life.prev_day_oi, 0);
         assert_eq!(life.phase, 0);
-        assert_eq!(phase_code_to_str(life.phase), "PREMARKET");
     }
 
-    /// Phase 2 ratchet: build_tick_row_enriched serializes ALL four
-    /// lifecycle columns into the ILP buffer. Verifies by string match
-    /// against the buffer's wire-format output.
+    /// #T1c ratchet: `append_tick_enriched` no longer persists the retired
+    /// lifecycle columns. The wire output MUST NOT carry any of the 9
+    /// dropped columns, regardless of the `TickLifecycle` carrier values.
     #[test]
-    fn test_build_tick_row_enriched_writes_all_lifecycle_columns() {
+    fn test_build_tick_row_does_not_emit_dropped_columns() {
         use questdb::ingress::{Buffer, ProtocolVersion};
         let mut buf = Buffer::new(ProtocolVersion::V1);
         let tick = ParsedTick {
@@ -3600,34 +3361,14 @@ mod tests {
             received_at_nanos: 1_700_000_000_000_000_000,
             ..ParsedTick::default()
         };
-        let life = TickLifecycle {
-            volume_delta: 42,
-            prev_day_close: 100.5,
-            prev_day_oi: 999_999,
-            phase: 2, // OPEN
-        };
-        build_tick_row_enriched(&mut buf, &tick, life).unwrap();
+        build_tick_row(&mut buf, &tick).unwrap();
         let wire = String::from_utf8_lossy(buf.as_bytes()).to_string();
-        assert!(
-            wire.contains("volume_delta=42i"),
-            "wire missing volume_delta: {}",
-            wire
-        );
-        assert!(
-            wire.contains("prev_day_close=100.5"),
-            "wire missing prev_day_close: {}",
-            wire
-        );
-        assert!(
-            wire.contains("prev_day_oi=999999i"),
-            "wire missing prev_day_oi: {}",
-            wire
-        );
-        assert!(
-            wire.contains("phase=OPEN"),
-            "wire missing phase=OPEN symbol: {}",
-            wire
-        );
+        for col in TICKS_DROPPED_COLUMNS {
+            assert!(
+                !wire.contains(&format!("{col}=")),
+                "wire must not emit dropped column `{col}`: {wire}"
+            );
+        }
     }
 
     /// Phase 2 ratchet (name-matched to `append_tick_enriched`): the
@@ -3670,51 +3411,29 @@ mod tests {
         );
     }
 
-    /// Phase 2 ratchet: legacy `build_tick_row` path emits default
-    /// lifecycle columns (volume_delta=0, prev_day_close=0,
-    /// prev_day_oi=0, phase=PREMARKET) when called without enrichment.
-    /// This is the spill-replay contract: ticks restored from disk
-    /// have no enricher state and degrade to defaults gracefully.
+    /// #T1c ratchet: the `ticks` DDL must NOT declare any of the 9 retired
+    /// columns, and the schema-self-heal DROP list must cover all of them.
     #[test]
-    fn test_build_tick_row_legacy_path_emits_default_lifecycle_columns() {
-        use questdb::ingress::{Buffer, ProtocolVersion};
-        let mut buf = Buffer::new(ProtocolVersion::V1);
-        let tick = ParsedTick {
-            security_id: 1234,
-            exchange_segment_code: 1,
-            exchange_timestamp: 1_700_000_000,
-            received_at_nanos: 1_700_000_000_000_000_000,
-            ..ParsedTick::default()
-        };
-        build_tick_row(&mut buf, &tick).unwrap();
-        let wire = String::from_utf8_lossy(buf.as_bytes()).to_string();
-        assert!(
-            wire.contains("volume_delta=0i"),
-            "legacy path must default volume_delta=0: {}",
-            wire
-        );
-        assert!(
-            wire.contains("prev_day_close=0.0"),
-            "legacy path must default prev_day_close=0.0: {}",
-            wire
-        );
-        assert!(
-            wire.contains("prev_day_oi=0i"),
-            "legacy path must default prev_day_oi=0: {}",
-            wire
-        );
-        assert!(
-            wire.contains("phase=PREMARKET"),
-            "legacy path must default phase=PREMARKET: {}",
-            wire
+    fn test_ticks_ddl_drops_retired_columns() {
+        for col in TICKS_DROPPED_COLUMNS {
+            assert!(
+                !TICKS_CREATE_DDL.contains(&format!("{col} ")),
+                "ticks CREATE DDL must not declare retired column `{col}`"
+            );
+        }
+        assert_eq!(
+            TICKS_DROPPED_COLUMNS.len(),
+            9,
+            "#T1c retires exactly 9 columns from the ticks table"
         );
     }
 
     #[tokio::test]
-    async fn test_ensure_tick_table_greeks_migration_with_mock_http() {
-        // When the mock returns 200 for all requests (CREATE, DEDUP, ALTER),
-        // the function completes without panic. The ALTER TABLE ADD COLUMN
-        // requests for Greeks columns are best-effort and ignored on error.
+    async fn test_ensure_tick_table_drop_column_migration_with_mock_http() {
+        // When the mock returns 200 for all requests (CREATE, DEDUP,
+        // DROP COLUMN), the function completes without panic. The
+        // `DROP COLUMN IF EXISTS` requests for the 9 retired columns are
+        // best-effort and ignored on error (#T1c table cleanup).
         let port = spawn_mock_http_server(MOCK_HTTP_200).await;
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -3722,15 +3441,15 @@ mod tests {
             pg_port: port,
             ilp_port: port,
         };
-        // This exercises: CREATE TABLE + DEDUP + 5x ALTER TABLE ADD COLUMN
+        // This exercises: CREATE TABLE + DEDUP + 9x ALTER TABLE DROP COLUMN.
         ensure_tick_table_dedup_keys(&config).await;
     }
 
     #[tokio::test]
-    async fn test_ensure_tick_table_greeks_migration_non_success() {
+    async fn test_ensure_tick_table_drop_column_migration_non_success() {
         // When the mock returns 400 for the CREATE TABLE, the function returns
-        // early — never reaching the ALTER TABLE ADD COLUMN steps. This is
-        // correct behavior: if the table doesn't exist, columns can't be added.
+        // early — never reaching the ALTER TABLE DROP COLUMN steps. This is
+        // correct behavior: if the table doesn't exist, columns can't be dropped.
         let port = spawn_mock_http_server(MOCK_HTTP_400).await;
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
