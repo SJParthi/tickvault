@@ -2,7 +2,6 @@
 //!
 //! Tests that actual project components handle burst traffic correctly:
 //! - Parser: 1000+ frames without panic or allocation issues
-//! - CandleAggregator: burst from hundreds of securities with stale sweep
 //! - Channel + Parser: real binary frames through bounded mpsc channels
 //!
 //! These test REAL project code, not tokio channel primitives.
@@ -11,9 +10,7 @@ use tickvault_common::constants::{
     EXCHANGE_SEGMENT_NSE_FNO, QUOTE_PACKET_SIZE, RESPONSE_CODE_QUOTE, RESPONSE_CODE_TICKER,
     TICKER_PACKET_SIZE,
 };
-use tickvault_common::tick_types::ParsedTick;
 use tickvault_core::parser::dispatch_frame;
-use tickvault_core::pipeline::candle_aggregator::CandleAggregator;
 
 // ---------------------------------------------------------------------------
 // Helpers — deterministic packet construction
@@ -103,88 +100,6 @@ fn backpressure_parser_mixed_packet_types_burst() {
 
     assert_eq!(ticker_count, 250, "all ticker frames parsed");
     assert_eq!(quote_count, 250, "all quote frames parsed");
-}
-
-// ---------------------------------------------------------------------------
-// CandleAggregator burst: 500 different securities ticking simultaneously
-// ---------------------------------------------------------------------------
-
-#[test]
-fn backpressure_candle_aggregator_burst_500_securities() {
-    let mut agg = CandleAggregator::new();
-
-    // First tick for 500 securities — creates 500 live candles
-    for sec_id in 1..=500_u32 {
-        agg.update(&ParsedTick {
-            security_id: sec_id,
-            exchange_segment_code: EXCHANGE_SEGMENT_NSE_FNO,
-            last_traded_price: 100.0 + (sec_id as f32 * 0.5),
-            exchange_timestamp: 1_700_000_000,
-            volume: sec_id.saturating_mul(100),
-            ..Default::default()
-        });
-    }
-
-    assert_eq!(agg.active_count(), 500, "all 500 securities tracked");
-
-    // Second tick for all — updates existing candles (no new creates)
-    for sec_id in 1..=500_u32 {
-        agg.update(&ParsedTick {
-            security_id: sec_id,
-            exchange_segment_code: EXCHANGE_SEGMENT_NSE_FNO,
-            last_traded_price: 101.0 + (sec_id as f32 * 0.5),
-            exchange_timestamp: 1_700_000_000,
-            volume: sec_id.saturating_mul(200),
-            ..Default::default()
-        });
-    }
-
-    assert_eq!(agg.active_count(), 500, "still 500 after updates");
-}
-
-// ---------------------------------------------------------------------------
-// CandleAggregator sweep under load: stale candles flushed correctly
-// ---------------------------------------------------------------------------
-
-#[test]
-fn backpressure_candle_sweep_stale_under_load() {
-    let mut agg = CandleAggregator::new();
-    let t = 1_700_000_000_u32;
-
-    // Create candles at timestamp T for 100 securities
-    for sec_id in 1..=100_u32 {
-        agg.update(&ParsedTick {
-            security_id: sec_id,
-            exchange_segment_code: EXCHANGE_SEGMENT_NSE_FNO,
-            last_traded_price: 100.0,
-            exchange_timestamp: t,
-            ..Default::default()
-        });
-    }
-    assert_eq!(agg.active_count(), 100);
-
-    // Sweep at T+10 — all candles are stale (>5s threshold)
-    agg.sweep_stale(t.wrapping_add(10));
-    assert_eq!(agg.active_count(), 0, "all candles swept as stale");
-    assert_eq!(
-        agg.completed_slice().len(),
-        100,
-        "100 completed candles emitted"
-    );
-
-    // Clear and verify buffer is reusable
-    agg.clear_completed();
-    assert!(agg.completed_slice().is_empty());
-
-    // Immediately start new candles — verify no state leak
-    agg.update(&ParsedTick {
-        security_id: 9999,
-        exchange_segment_code: EXCHANGE_SEGMENT_NSE_FNO,
-        last_traded_price: 500.0,
-        exchange_timestamp: t.wrapping_add(11),
-        ..Default::default()
-    });
-    assert_eq!(agg.active_count(), 1, "new candle created after sweep");
 }
 
 // ---------------------------------------------------------------------------

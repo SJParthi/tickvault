@@ -90,15 +90,14 @@ pub mod indicator_snapshot_persistence;
 pub mod instrument_persistence;
 pub mod last_tick_audit_persistence;
 pub mod live_instance_lock_persistence;
-pub mod materialized_views;
-// 2026-05-09 PR 5c.5-final (Bug 3 — movers retirement): the
-// `movers_base_persistence` + `movers_writer` modules are DELETED.
-// Operator directive: "only ticks and our 9 needed candle timeframes
-// are available". The 25 `movers_*` matviews + the `movers_1s` base
-// table are dropped at boot by
-// `materialized_views::drop_bug3_retired_views`. All historical
-// movers infrastructure (Phase 4b's StockMoversWriter / OptionMoversWriter,
-// PR 5c.4-narrow's movers_unified_query helper) is fully retired.
+// Candle-engine re-architecture #T1b: `materialized_views` (Engine C —
+// `candles_1s` + the 9 `candles_<tf>` matviews) DELETED. The 21 plain
+// `candles_<tf>` tables are created by
+// `shadow_persistence::ensure_shadow_candle_tables`; legacy candle
+// objects are dropped at boot by
+// `shadow_persistence::drop_legacy_candle_objects`. The 25 retired
+// `movers_*` matviews + `movers_1s` base table are no longer recreated
+// either (the old `drop_bug3_retired_views` lived in this module).
 pub mod obi_persistence;
 pub mod open_price_audit_persistence;
 pub mod option_chain_minute_snapshot_persistence;
