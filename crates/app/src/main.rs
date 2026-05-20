@@ -5153,6 +5153,7 @@ async fn main() -> Result<()> {
                             oc_client,
                             oc_cache,
                             oc_notifier,
+                            config.questdb.clone(),
                         );
                         info!("option-chain minute-snapshot scheduler spawned");
                     }
