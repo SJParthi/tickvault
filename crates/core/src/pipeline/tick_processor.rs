@@ -370,54 +370,9 @@ fn derive_depth_timestamp_secs(
     }
 }
 
-/// Phase 0 Item 12 helper — format the trading date (`YYYY-MM-DD` in
-/// IST) from a UTC `received_at_nanos`. Used by the LATE-TICK audit
-/// row write at the G1 reject site.
-///
-/// Cold path — runs only when a tick stamps at or after 15:30:00 IST.
-fn format_trading_date_ist(received_at_nanos: i64) -> String {
-    let utc_secs = received_at_nanos / 1_000_000_000;
-    let ist_secs = utc_secs.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
-    let day_number = ist_secs.div_euclid(i64::from(SECONDS_PER_DAY));
-    // Anchor: epoch day 0 = 1970-01-01.
-    let dt = chrono::NaiveDate::from_num_days_from_ce_opt(
-        i32::try_from(day_number)
-            .unwrap_or(0)
-            .saturating_add(719_163),
-    )
-    .unwrap_or_else(|| {
-        // Fallback only if div_euclid produced something pathological
-        // (impossible for any valid timestamp post-1970). Use today
-        // 2026-05-17 as a defensive sentinel that's still parseable.
-        chrono::NaiveDate::from_ymd_opt(2026, 5, 17).unwrap_or_default()
-    });
-    dt.format("%Y-%m-%d").to_string()
-}
-
-/// Phase 0 Item 12 helper — format the bar minute (`HH:MM`) from an
-/// IST seconds-of-day value. Used by the LATE-TICK audit row write.
-fn format_bar_minute_ist(secs_of_day_ist: u32) -> String {
-    let h = secs_of_day_ist / 3600;
-    let m = (secs_of_day_ist % 3600) / 60;
-    format!("{h:02}:{m:02}")
-}
-
-/// Phase 0 Item 12 helper — return the static segment-string label for
-/// a Dhan binary segment code. Returns `"UNKNOWN"` for unmapped codes
-/// so the audit writer never has to allocate a transient String.
-fn exchange_segment_label_static(code: u8) -> &'static str {
-    match code {
-        0 => "IDX_I",
-        1 => "NSE_EQ",
-        2 => "NSE_FNO",
-        3 => "NSE_CURRENCY",
-        4 => "BSE_EQ",
-        5 => "MCX_COMM",
-        7 => "BSE_CURRENCY",
-        8 => "BSE_FNO",
-        _ => "UNKNOWN",
-    }
-}
+// #T2b (2026-05-20): format_trading_date_ist / format_bar_minute_ist /
+// exchange_segment_label_static removed — they served only the deleted
+// last_tick_audit row write.
 
 /// Converts UTC nanoseconds to IST epoch seconds (for stale-day check on wall-clock time).
 ///
