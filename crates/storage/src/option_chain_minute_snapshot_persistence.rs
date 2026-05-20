@@ -239,23 +239,69 @@ pub struct OptionChainMinuteSnapshotRow<'a> {
     pub fetch_outcome: FetchOutcome,
 }
 
-/// Appends one option-chain-minute-snapshot row.
+/// Column list shared by the single-row and batch INSERT helpers, in
+/// exact schema order. One constant so the two writers cannot drift.
+const INSERT_COLUMN_LIST: &str = "ts, trading_date_ist, underlying_symbol, \
+     underlying_security_id, exchange_segment, expiry, strike, ce_or_pe, \
+     security_id, last_price, average_price, oi, previous_oi, volume, \
+     previous_volume, previous_close_price, top_bid_price, top_bid_quantity, \
+     top_ask_price, top_ask_quantity, implied_volatility, greek_delta, \
+     greek_theta, greek_gamma, greek_vega, cache_age_used_secs, fetch_outcome";
+
+/// Max rows per multi-row INSERT. QuestDB `/exec` carries the
+/// statement as a URL query parameter, so an unbounded batch would
+/// overflow the HTTP request-line length limit. 15 rows × ~350 chars
+/// stays well under a conservative ~8 KB ceiling.
+const MAX_ROWS_PER_INSERT_BATCH: usize = 15;
+
+/// Formats one row as a QuestDB `VALUES (...)` tuple in schema order.
 ///
-/// All `*_nanos` arguments are IST wall-clock nanoseconds; the
-/// function divides them down to microseconds before embedding in the
-/// INSERT statement because QuestDB `TIMESTAMP` columns store
-/// microseconds since epoch and embedding nanos overflows the
-/// year-9999 range (2026-04-28 regression).
-///
-/// # Errors
-///
-/// Propagates the `reqwest` error if the HTTP transport fails.
-/// Returns `Err` on non-2xx response with the response body in the
-/// error message (truncated by reqwest's default cap).
-pub async fn append_option_chain_minute_snapshot_row(
-    questdb_config: &QuestDbConfig,
-    row: &OptionChainMinuteSnapshotRow<'_>,
-) -> anyhow::Result<()> {
+/// `*_nanos` fields are IST wall-clock nanoseconds; this divides them
+/// to microseconds because QuestDB `TIMESTAMP` columns store
+/// microseconds since epoch — embedding nanos overflows the year-9999
+/// range (2026-04-28 regression).
+fn format_row_values_tuple(row: &OptionChainMinuteSnapshotRow<'_>) -> String {
+    let underlying_symbol = sanitize_audit_string(row.underlying_symbol);
+    let exchange_segment = sanitize_audit_string(row.exchange_segment);
+    let side = row.side.as_str();
+    let fetch_outcome = row.fetch_outcome.as_str();
+    let ts_micros = row.ts_nanos_ist / 1_000;
+    let trading_date_micros = row.trading_date_ist_nanos / 1_000;
+    let expiry_micros = row.expiry_date_nanos / 1_000;
+    let underlying_security_id = row.underlying_security_id;
+    let strike = row.strike;
+    let security_id = row.security_id;
+    let last_price = row.last_price;
+    let average_price = row.average_price;
+    let oi = row.oi;
+    let previous_oi = row.previous_oi;
+    let volume = row.volume;
+    let previous_volume = row.previous_volume;
+    let previous_close_price = row.previous_close_price;
+    let top_bid_price = row.top_bid_price;
+    let top_bid_quantity = row.top_bid_quantity;
+    let top_ask_price = row.top_ask_price;
+    let top_ask_quantity = row.top_ask_quantity;
+    let implied_volatility = row.implied_volatility;
+    let greek_delta = row.greek_delta;
+    let greek_theta = row.greek_theta;
+    let greek_gamma = row.greek_gamma;
+    let greek_vega = row.greek_vega;
+    let cache_age_used_secs = row.cache_age_used_secs;
+    format!(
+        "({ts_micros}, {trading_date_micros}, '{underlying_symbol}', \
+          {underlying_security_id}, '{exchange_segment}', {expiry_micros}, \
+          {strike}, '{side}', {security_id}, {last_price}, {average_price}, \
+          {oi}, {previous_oi}, {volume}, {previous_volume}, \
+          {previous_close_price}, {top_bid_price}, {top_bid_quantity}, \
+          {top_ask_price}, {top_ask_quantity}, {implied_volatility}, \
+          {greek_delta}, {greek_theta}, {greek_gamma}, {greek_vega}, \
+          {cache_age_used_secs}, '{fetch_outcome}')"
+    )
+}
+
+/// Executes one INSERT statement against QuestDB `/exec`.
+async fn exec_insert(questdb_config: &QuestDbConfig, sql: &str) -> anyhow::Result<()> {
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -263,66 +309,68 @@ pub async fn append_option_chain_minute_snapshot_row(
     let client = Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()?;
-
-    let underlying_symbol_esc = sanitize_audit_string(row.underlying_symbol);
-    let exchange_segment_esc = sanitize_audit_string(row.exchange_segment);
-    let side_str = row.side.as_str();
-    let fetch_outcome_str = row.fetch_outcome.as_str();
-
-    // QuestDB TIMESTAMP columns store microseconds since epoch — divide
-    // nanos to micros before embedding so the value stays in range.
-    let ts_micros = row.ts_nanos_ist / 1_000;
-    let trading_date_micros = row.trading_date_ist_nanos / 1_000;
-    let expiry_micros = row.expiry_date_nanos / 1_000;
-
-    let sql = format!(
-        "INSERT INTO {table} \
-         (ts, trading_date_ist, underlying_symbol, underlying_security_id, \
-          exchange_segment, expiry, strike, ce_or_pe, security_id, \
-          last_price, average_price, oi, previous_oi, volume, \
-          previous_volume, previous_close_price, \
-          top_bid_price, top_bid_quantity, top_ask_price, top_ask_quantity, \
-          implied_volatility, greek_delta, greek_theta, greek_gamma, greek_vega, \
-          cache_age_used_secs, fetch_outcome) VALUES \
-         ({ts_micros}, {trading_date_micros}, '{underlying_symbol_esc}', \
-          {underlying_security_id}, '{exchange_segment_esc}', {expiry_micros}, \
-          {strike}, '{side_str}', {security_id}, \
-          {last_price}, {average_price}, {oi}, {previous_oi}, {volume}, \
-          {previous_volume}, {previous_close_price}, \
-          {top_bid_price}, {top_bid_quantity}, {top_ask_price}, {top_ask_quantity}, \
-          {implied_volatility}, {greek_delta}, {greek_theta}, {greek_gamma}, {greek_vega}, \
-          {cache_age_used_secs}, '{fetch_outcome_str}');",
-        table = QUESTDB_TABLE_OPTION_CHAIN_MINUTE_SNAPSHOT,
-        underlying_security_id = row.underlying_security_id,
-        strike = row.strike,
-        security_id = row.security_id,
-        last_price = row.last_price,
-        average_price = row.average_price,
-        oi = row.oi,
-        previous_oi = row.previous_oi,
-        volume = row.volume,
-        previous_volume = row.previous_volume,
-        previous_close_price = row.previous_close_price,
-        top_bid_price = row.top_bid_price,
-        top_bid_quantity = row.top_bid_quantity,
-        top_ask_price = row.top_ask_price,
-        top_ask_quantity = row.top_ask_quantity,
-        implied_volatility = row.implied_volatility,
-        greek_delta = row.greek_delta,
-        greek_theta = row.greek_theta,
-        greek_gamma = row.greek_gamma,
-        greek_vega = row.greek_vega,
-        cache_age_used_secs = row.cache_age_used_secs,
-    );
     let resp = client
         .get(&base_url)
-        .query(&[("query", sql.as_str())])
+        .query(&[("query", sql)])
         .send()
         .await?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         anyhow::bail!("option_chain_minute_snapshot insert non-2xx ({status}): {body}");
+    }
+    Ok(())
+}
+
+/// Appends one option-chain-minute-snapshot row.
+///
+/// # Errors
+///
+/// Propagates the `reqwest` error on transport failure, or returns
+/// `Err` on a non-2xx response.
+pub async fn append_option_chain_minute_snapshot_row(
+    questdb_config: &QuestDbConfig,
+    row: &OptionChainMinuteSnapshotRow<'_>,
+) -> anyhow::Result<()> {
+    let sql = format!(
+        "INSERT INTO {QUESTDB_TABLE_OPTION_CHAIN_MINUTE_SNAPSHOT} \
+         ({INSERT_COLUMN_LIST}) VALUES {tuple};",
+        tuple = format_row_values_tuple(row),
+    );
+    exec_insert(questdb_config, &sql).await
+}
+
+/// Appends a batch of option-chain-minute-snapshot rows.
+///
+/// Rows are written in multi-row INSERTs of up to
+/// [`MAX_ROWS_PER_INSERT_BATCH`] — one HTTP round-trip per chunk
+/// instead of one per row. An empty slice is a no-op (`Ok`). Cold
+/// path — called at most 3 times per minute by the snapshot scheduler.
+///
+/// On a chunk failure earlier chunks may already be committed; the
+/// table's `DEDUP UPSERT KEYS` makes a re-run idempotent.
+///
+/// # Errors
+///
+/// Propagates the `reqwest` error on transport failure, or returns
+/// `Err` on the first non-2xx response.
+pub async fn append_option_chain_minute_snapshot_rows(
+    questdb_config: &QuestDbConfig,
+    rows: &[OptionChainMinuteSnapshotRow<'_>],
+) -> anyhow::Result<()> {
+    for chunk in rows.chunks(MAX_ROWS_PER_INSERT_BATCH) {
+        let mut values = String::with_capacity(chunk.len() * 360);
+        for (idx, row) in chunk.iter().enumerate() {
+            if idx > 0 {
+                values.push_str(", ");
+            }
+            values.push_str(&format_row_values_tuple(row));
+        }
+        let sql = format!(
+            "INSERT INTO {QUESTDB_TABLE_OPTION_CHAIN_MINUTE_SNAPSHOT} \
+             ({INSERT_COLUMN_LIST}) VALUES {values};"
+        );
+        exec_insert(questdb_config, &sql).await?;
     }
     Ok(())
 }
@@ -572,5 +620,69 @@ mod tests {
         row.greek_delta = -0.45;
         let result = append_option_chain_minute_snapshot_row(&cfg, &row).await;
         assert!(result.is_err(), "transport error path must propagate");
+    }
+
+    #[test]
+    fn test_insert_column_list_has_27_columns() {
+        // The shared column list must name every schema column so the
+        // single-row and batch writers stay aligned with the DDL.
+        assert_eq!(
+            INSERT_COLUMN_LIST.matches(',').count() + 1,
+            27,
+            "INSERT column list must name all 27 schema columns"
+        );
+    }
+
+    #[test]
+    fn test_format_row_values_tuple_has_27_fields() {
+        let tuple = format_row_values_tuple(&sample_row());
+        assert!(
+            tuple.starts_with('(') && tuple.ends_with(')'),
+            "tuple must be paren-wrapped"
+        );
+        // No nested parens/commas in any field → comma count is exact:
+        // 27 columns → 26 separating commas.
+        let inner = &tuple[1..tuple.len() - 1];
+        assert_eq!(
+            inner.matches(',').count(),
+            26,
+            "27 columns → 26 separating commas"
+        );
+    }
+
+    #[test]
+    fn test_max_rows_per_insert_batch_is_bounded() {
+        // The chunk size must stay small enough that one chunk's INSERT
+        // fits in QuestDB's /exec URL query parameter.
+        assert!(MAX_ROWS_PER_INSERT_BATCH > 0);
+        assert!(MAX_ROWS_PER_INSERT_BATCH <= 20);
+    }
+
+    #[tokio::test]
+    async fn test_append_option_chain_minute_snapshot_rows_empty_slice_is_ok() {
+        let cfg = test_cfg_unreachable();
+        let result = append_option_chain_minute_snapshot_rows(&cfg, &[]).await;
+        assert!(result.is_ok(), "empty slice must be a no-op Ok");
+    }
+
+    #[tokio::test]
+    async fn test_append_rows_returns_err_when_questdb_unreachable() {
+        let cfg = test_cfg_unreachable();
+        let rows = [sample_row(), sample_row()];
+        let result = append_option_chain_minute_snapshot_rows(&cfg, &rows).await;
+        assert!(result.is_err(), "must propagate transport error");
+    }
+
+    #[tokio::test]
+    async fn test_append_rows_chunks_beyond_batch_size() {
+        // A slice larger than MAX_ROWS_PER_INSERT_BATCH exercises the
+        // chunk loop. Against an unreachable host the first chunk fails
+        // fast — still proves the multi-chunk path returns Err, not Ok.
+        let cfg = test_cfg_unreachable();
+        let rows: Vec<_> = (0..MAX_ROWS_PER_INSERT_BATCH + 5)
+            .map(|_| sample_row())
+            .collect();
+        let result = append_option_chain_minute_snapshot_rows(&cfg, &rows).await;
+        assert!(result.is_err());
     }
 }
