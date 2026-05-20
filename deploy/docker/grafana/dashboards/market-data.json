@@ -12,7 +12,7 @@
       }
     ]
   },
-  "description": "tickvault — Live market data explorer. Ticks, candles, instruments, depth, and trading calendar.",
+  "description": "tickvault — Live market data explorer. Ticks, historical candles, and live aggregated candles. Instrument / depth / calendar panels were retired with the QuestDB table-cleanup (#T1-#T5).",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -35,7 +35,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 1 },
       "id": 1,
       "options": { "colorMode": "background_solid", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Total Ticks",
@@ -60,7 +60,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 1 },
       "id": 2,
       "options": { "colorMode": "background_solid", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Historical Candles",
@@ -81,86 +81,11 @@
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "orange", "value": null }] }
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
-      "id": 3,
-      "options": { "colorMode": "background_solid", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-      "title": "F&O Underlyings",
-      "type": "stat",
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "questdb" },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT count() AS total FROM fno_underlyings WHERE status = 'active';",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "questdb" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "thresholds" },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "purple", "value": null }] }
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
-      "id": 4,
-      "options": { "colorMode": "background_solid", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-      "title": "Derivative Contracts",
-      "type": "stat",
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "questdb" },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT count() AS total FROM derivative_contracts WHERE status = 'active';",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "questdb" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "thresholds" },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "yellow", "value": null }] }
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
-      "id": 5,
-      "options": { "colorMode": "background_solid", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-      "title": "Subscribed Indices",
-      "type": "stat",
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "questdb" },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT count() AS total FROM subscribed_indices WHERE status = 'active';",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "questdb" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "thresholds" },
           "thresholds": { "mode": "absolute", "steps": [{ "color": "semi-dark-red", "value": null }] }
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 1 },
       "id": 6,
       "options": { "colorMode": "background_solid", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Unique Securities (Ticks)",
@@ -380,8 +305,8 @@
         "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
         "sortBy": [{ "desc": true, "displayName": "candle_time" }]
       },
-      "title": "Live 1-Minute Candles (from Materialized View)",
-      "description": "1-minute candles aggregated from live ticks via QuestDB materialized views. All timestamps are IST.",
+      "title": "Live 1-Minute Candles",
+      "description": "1-minute candles aggregated in-memory from live ticks by the multi-timeframe aggregator, flushed to the candles_1m table. All timestamps are IST.",
       "type": "table",
       "targets": [
         {
@@ -390,437 +315,6 @@
           "format": "table",
           "rawQuery": true,
           "rawSql": "SELECT\n  segment,\n  security_id,\n  open,\n  high,\n  low,\n  close,\n  volume,\n  oi,\n  tick_count,\n  to_str(ts, 'yyyy-MM-dd HH:mm:ss') AS candle_time\nFROM candles_1m\nWHERE ts >= dateadd('s', 19800, '${__from:date:iso}')\n  AND ts < dateadd('s', 19800, '${__to:date:iso}')\nORDER BY ts DESC\nLIMIT 500;",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 44 },
-      "id": 500,
-      "title": "F&O Universe",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "questdb" },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "align": "auto",
-            "cellOptions": { "type": "auto" },
-            "filterable": true,
-            "inspect": false
-          },
-          "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 45 },
-      "id": 30,
-      "options": {
-        "showHeader": true,
-        "cellHeight": "sm",
-        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
-        "sortBy": [{ "desc": false, "displayName": "underlying_symbol" }]
-      },
-      "title": "F&O Underlyings",
-      "description": "All F&O underlying instruments loaded from Dhan instrument CSV.",
-      "type": "table",
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "questdb" },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT\n  underlying_symbol,\n  status,\n  underlying_security_id,\n  price_feed_segment,\n  price_feed_security_id,\n  derivative_segment,\n  kind,\n  lot_size,\n  contract_count,\n  to_str(last_seen_date, 'yyyy-MM-dd') AS last_seen,\n  to_str(expired_date, 'yyyy-MM-dd') AS expired_on\nFROM fno_underlyings\nWHERE status = 'active'\nORDER BY underlying_symbol;",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "questdb" },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "align": "auto",
-            "cellOptions": { "type": "auto" },
-            "filterable": true,
-            "inspect": false
-          },
-          "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "strike_price" },
-            "properties": [{ "id": "decimals", "value": 2 }]
-          }
-        ]
-      },
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 55 },
-      "id": 31,
-      "options": {
-        "showHeader": true,
-        "cellHeight": "sm",
-        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
-        "sortBy": [{ "desc": false, "displayName": "underlying_symbol" }]
-      },
-      "title": "Derivative Contracts",
-      "description": "All derivative contracts (options + futures) loaded from Dhan instrument CSV. Filter by underlying, type, expiry.",
-      "type": "table",
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "questdb" },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT\n  underlying_symbol,\n  instrument_kind,\n  status,\n  exchange_segment,\n  security_id,\n  symbol_name,\n  option_type,\n  strike_price,\n  expiry_date,\n  lot_size,\n  display_name,\n  to_str(last_seen_date, 'yyyy-MM-dd') AS last_seen,\n  to_str(expired_date, 'yyyy-MM-dd') AS expired_on\nFROM derivative_contracts\nWHERE status = 'active'\nORDER BY underlying_symbol, expiry_date, strike_price\nLIMIT 1000;",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 67 },
-      "id": 600,
-      "title": "Subscribed Indices",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "questdb" },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "align": "auto",
-            "cellOptions": { "type": "auto" },
-            "filterable": true,
-            "inspect": false
-          },
-          "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 68 },
-      "id": 40,
-      "options": {
-        "showHeader": true,
-        "cellHeight": "sm",
-        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
-        "sortBy": [{ "desc": false, "displayName": "symbol" }]
-      },
-      "title": "Subscribed Indices",
-      "description": "All market indices being tracked for live price feeds.",
-      "type": "table",
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "questdb" },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT\n  symbol,\n  status,\n  security_id,\n  exchange,\n  category,\n  subcategory,\n  to_str(last_seen_date, 'yyyy-MM-dd') AS last_seen,\n  to_str(expired_date, 'yyyy-MM-dd') AS expired_on\nFROM subscribed_indices\nWHERE status = 'active'\nORDER BY symbol;",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 78 },
-      "id": 700,
-      "title": "Market Depth",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "questdb" },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "align": "auto",
-            "cellOptions": { "type": "auto" },
-            "filterable": true,
-            "inspect": false
-          },
-          "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "bid_price" },
-            "properties": [
-              { "id": "decimals", "value": 2 },
-              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
-              { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "ask_price" },
-            "properties": [
-              { "id": "decimals", "value": 2 },
-              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
-              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "bid_qty" },
-            "properties": [
-              { "id": "unit", "value": "locale" },
-              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
-              { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "ask_qty" },
-            "properties": [
-              { "id": "unit", "value": "locale" },
-              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
-              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
-            ]
-          }
-        ]
-      },
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 79 },
-      "id": 50,
-      "options": {
-        "showHeader": true,
-        "cellHeight": "sm",
-        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
-        "sortBy": [{ "desc": true, "displayName": "exchange_time" }]
-      },
-      "title": "Market Depth (Latest)",
-      "description": "5-level bid/ask order book data. Bid in green, ask in red.",
-      "type": "table",
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "questdb" },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  security_id,\n  level,\n  bid_qty,\n  bid_price,\n  ask_price,\n  ask_qty,\n  to_str(ts, 'yyyy-MM-dd HH:mm:ss.SSS') AS exchange_time,\n  to_str(received_at, 'yyyy-MM-dd HH:mm:ss.SSS') AS received_at\nFROM market_depth\nWHERE ts >= dateadd('s', 19800, '${__from:date:iso}')\n  AND ts < dateadd('s', 19800, '${__to:date:iso}')\nORDER BY ts DESC, security_id, level\nLIMIT 500;",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 102 },
-      "id": 900,
-      "title": "Instrument Build Metadata",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "questdb" },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "align": "auto",
-            "cellOptions": { "type": "auto" },
-            "filterable": true,
-            "inspect": false
-          },
-          "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "build_duration_ms" },
-            "properties": [{ "id": "unit", "value": "ms" }]
-          }
-        ]
-      },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 103 },
-      "id": 70,
-      "options": {
-        "showHeader": true,
-        "cellHeight": "sm",
-        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
-        "sortBy": [{ "desc": true, "displayName": "build_time" }]
-      },
-      "title": "Instrument Build History",
-      "description": "Daily instrument CSV parse stats — how many underlyings, derivatives, options were loaded.",
-      "type": "table",
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "questdb" },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT\n  csv_source,\n  csv_row_count,\n  parsed_row_count,\n  index_count,\n  equity_count,\n  underlying_count,\n  derivative_count,\n  option_chain_count,\n  build_duration_ms,\n  timestamp AS build_time\nFROM instrument_build_metadata\nORDER BY timestamp DESC\nLIMIT 50;",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 111 },
-      "id": 1000,
-      "title": "NSE Trading Calendar",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "questdb" },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "align": "auto",
-            "cellOptions": { "type": "auto" },
-            "filterable": true,
-            "inspect": false
-          },
-          "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "holiday_type" },
-            "properties": [
-              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
-              { "id": "mappings", "value": [
-                { "type": "value", "options": { "Holiday": { "color": "red", "index": 0, "text": "Holiday" }, "Muhurat Trading": { "color": "orange", "index": 1, "text": "Muhurat Trading" }, "Mock Trading Session": { "color": "blue", "index": 2, "text": "Mock Trading Session" } } }
-              ] }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "holiday_date" },
-            "properties": [
-              { "id": "custom.width", "value": 150 }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "day_of_week" },
-            "properties": [
-              { "id": "custom.width", "value": 120 }
-            ]
-          }
-        ]
-      },
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 112 },
-      "id": 80,
-      "timeFrom": "1y",
-      "timeShift": null,
-      "hideTimeOverride": true,
-      "options": {
-        "showHeader": true,
-        "cellHeight": "sm",
-        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
-        "sortBy": [{ "desc": false, "displayName": "holiday_date" }]
-      },
-      "title": "NSE Trading Calendar (2026)",
-      "description": "Complete NSE trading calendar: Holidays (red, market closed), Muhurat Trading (orange, special Diwali session), Mock Trading Sessions (blue, Saturday system tests — no real settlement). Source: NSE Circular NSE/CMTR/71775 + NSE Contingency Drill Calendar.",
-      "type": "table",
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "questdb" },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT\n  name,\n  holiday_type,\n  to_str(ts, 'yyyy-MM-dd') AS holiday_date,\n  CASE\n    WHEN day_of_week(ts) = 1 THEN 'Monday'\n    WHEN day_of_week(ts) = 2 THEN 'Tuesday'\n    WHEN day_of_week(ts) = 3 THEN 'Wednesday'\n    WHEN day_of_week(ts) = 4 THEN 'Thursday'\n    WHEN day_of_week(ts) = 5 THEN 'Friday'\n    WHEN day_of_week(ts) = 6 THEN 'Saturday'\n    WHEN day_of_week(ts) = 7 THEN 'Sunday'\n  END AS day_of_week\nFROM nse_holidays\nORDER BY ts;",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "questdb" },
-      "fieldConfig": {
-        "defaults": {
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "index_name" },
-            "properties": [
-              { "id": "custom.width", "value": 250 }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "total_stocks" },
-            "properties": [
-              { "id": "custom.width", "value": 120 }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "with_fno" },
-            "properties": [
-              { "id": "custom.width", "value": 120 }
-            ]
-          }
-        ]
-      },
-      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 124 },
-      "id": 82,
-      "timeFrom": "1y",
-      "timeShift": null,
-      "hideTimeOverride": true,
-      "options": {
-        "showHeader": true,
-        "cellHeight": "sm",
-        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
-        "sortBy": [{ "desc": true, "displayName": "total_stocks" }]
-      },
-      "title": "Index Summary — Stocks Per Index",
-      "description": "How many stocks are in each NSE index, and how many of those have F&O derivatives (security_id > 0). Indices with high F&O coverage are most actionable for trading.",
-      "type": "table",
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "questdb" },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT\n  index_name,\n  count(*) AS total_stocks,\n  count(CASE WHEN security_id > 0 THEN 1 END) AS with_fno\nFROM index_constituents\nWHERE ts = (SELECT max(ts) FROM index_constituents)\nGROUP BY index_name\nORDER BY total_stocks DESC;",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "questdb" },
-      "fieldConfig": {
-        "defaults": {
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "weight" },
-            "properties": [
-              { "id": "unit", "value": "percent" },
-              { "id": "decimals", "value": 2 },
-              { "id": "custom.width", "value": 100 }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "index_name" },
-            "properties": [
-              { "id": "custom.width", "value": 200 }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "symbol" },
-            "properties": [
-              { "id": "custom.width", "value": 150 }
-            ]
-          }
-        ]
-      },
-      "gridPos": { "h": 14, "w": 24, "x": 0, "y": 134 },
-      "id": 81,
-      "timeFrom": "1y",
-      "timeShift": null,
-      "hideTimeOverride": true,
-      "options": {
-        "showHeader": true,
-        "cellHeight": "sm",
-        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
-        "sortBy": [{ "desc": false, "displayName": "index_name" }]
-      },
-      "title": "NSE Index Constituents — All Stocks Tagged To Their Indices",
-      "description": "Every stock tagged to its parent index with security_id. security_id > 0 means the stock has F&O derivatives. Sort by index_name to see stocks per index. Source: niftyindices.com, enriched with Dhan instrument master.",
-      "type": "table",
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "questdb" },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT\n  index_name,\n  symbol,\n  isin,\n  weight,\n  sector,\n  security_id\nFROM index_constituents\nWHERE ts = (SELECT max(ts) FROM index_constituents)\nORDER BY index_name, weight DESC;",
           "refId": "A"
         }
       ]
@@ -837,5 +331,5 @@
   "timezone": "Asia/Kolkata",
   "title": "Market Data Explorer",
   "uid": "tv-market-data",
-  "version": 100
+  "version": 101
 }
