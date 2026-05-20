@@ -191,17 +191,65 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
 const LEGACY_CANDLE_TF_SUFFIXES: [&str; 9] =
     ["1m", "5m", "15m", "30m", "1h", "2h", "3h", "4h", "1d"];
 
-/// Idempotently drop every legacy candle object: the 9 Engine-C
-/// materialized views, the `candles_1s` base table, the 9 legacy
-/// `candles_<tf>_shadow` tables, and the retired `aggregator_seal_audit`
-/// table.
+/// Legacy candle materialized views whose names do NOT collide with any
+/// of the 21 Engine-B `candles_<tf>` tables — the retired sub-minute and
+/// 7-day aggregations from the pre-#T1 (PR #517-era) candle cascade.
+///
+/// The 21 Engine-B names ARE swept for stale matviews separately (every
+/// one is `DROP MATERIALIZED VIEW IF EXISTS`-ed before the `CREATE TABLE`
+/// loop, in case an old deployment squats the name with a matview — this
+/// is exactly the `candles_2m` / `candles_3m` / `candles_10m` 400 bug).
+/// This list covers the names that have NO Engine-B counterpart and so
+/// would otherwise leak forever.
+const LEGACY_EXTRA_CANDLE_MATVIEW_NAMES: [&str; 5] = [
+    "candles_5s",
+    "candles_10s",
+    "candles_15s",
+    "candles_30s",
+    "candles_7d",
+];
+
+/// QuestDB tables retired by the table-cleanup plan (#T3 instrument, #T4
+/// misc) and the PR #3 greeks teardown. The persistence modules + boot
+/// DDL were deleted in those PRs, but pre-existing QuestDB deployments
+/// still physically hold the tables (a Docker volume survives the code
+/// change). This idempotent `DROP TABLE IF EXISTS` sweep converges every
+/// deployment to the 24-table KEEP set with zero manual migration.
+///
+/// Deliberately EXCLUDES every audit table — `order_audit` carries a
+/// SEBI 5-year retention obligation and must never be auto-dropped; the
+/// other audit tables were already retired with their own boot wiring in
+/// #T2. This list is ONLY the instrument / misc / greeks tables.
+const RETIRED_QUESTDB_TABLES: [&str; 12] = [
+    // #T3 — instrument tables
+    "fno_underlyings",
+    "derivative_contracts",
+    "subscribed_indices",
+    "instrument_build_metadata",
+    "index_constituents",
+    // #T4 — misc tables
+    "market_depth",
+    "previous_close",
+    "nse_holidays",
+    // PR #3 — greeks tables
+    "option_greeks",
+    "pcr_snapshots",
+    "dhan_option_chain_raw",
+    "greeks_verification",
+];
+
+/// Idempotently drop every legacy QuestDB object so the live schema
+/// converges to the 24-table KEEP set.
 ///
 /// Drop order is load-bearing:
-/// 1. The 9 materialized views (`candles_1m` … `candles_1d`) — a matview
-///    must be dropped before its base table.
+/// 1. Candle materialized views — every one of the 21 Engine-B
+///    `candles_<tf>` names (a stale matview squatting the name makes
+///    `CREATE TABLE` 400) plus the legacy sub-minute / 7-day matviews.
 /// 2. The `candles_1s` base table.
 /// 3. The 9 `candles_<tf>_shadow` tables.
 /// 4. The `aggregator_seal_audit` table (#T2a table cleanup).
+/// 5. The instrument / misc / greeks tables retired by #T3, #T4 and the
+///    PR #3 greeks teardown (`RETIRED_QUESTDB_TABLES`).
 ///
 /// Each statement is `DROP … IF EXISTS`, so this is safe to call on every
 /// boot regardless of which objects actually exist. Failures are logged at
@@ -224,12 +272,27 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
         .build()
         .unwrap_or_else(|_| Client::new());
 
-    // 1. Drop the 9 Engine-C materialized views FIRST — before the base
-    //    table they cascade from.
-    for sfx in LEGACY_CANDLE_TF_SUFFIXES {
-        let view = format!("candles_{sfx}");
+    // 1. Drop legacy candle MATERIALIZED VIEWS FIRST — before the base
+    //    table they cascade from, AND before `ensure_shadow_candle_tables`
+    //    runs its `CREATE TABLE` loop.
+    //
+    //    Every one of the 21 Engine-B `candles_<tf>` names is swept: the
+    //    pre-#T1 architecture created matviews under those exact names,
+    //    and a matview occupying the name makes `CREATE TABLE IF NOT
+    //    EXISTS candles_<tf>` return `400 Bad Request` (the
+    //    `candles_2m` / `candles_3m` / `candles_10m` bug). `DROP
+    //    MATERIALIZED VIEW IF EXISTS` against a name that is already a
+    //    plain table — or absent — is a safe 2xx no-op, so sweeping all
+    //    21 every boot is idempotent.
+    for view in candle_table_names() {
         let ddl = format!("DROP MATERIALIZED VIEW IF EXISTS {view};");
-        run_drop_ddl(&client, &base_url, &view, &ddl).await;
+        run_drop_ddl(&client, &base_url, view, &ddl).await;
+    }
+    //    Plus the legacy sub-minute / 7-day matviews that have no
+    //    Engine-B counterpart and would otherwise leak forever.
+    for view in LEGACY_EXTRA_CANDLE_MATVIEW_NAMES {
+        let ddl = format!("DROP MATERIALIZED VIEW IF EXISTS {view};");
+        run_drop_ddl(&client, &base_url, view, &ddl).await;
     }
 
     // 2. Drop the Engine-A `candles_1s` base table.
@@ -258,6 +321,16 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
         "DROP TABLE IF EXISTS aggregator_seal_audit;",
     )
     .await;
+
+    // 5. Drop the instrument / misc / greeks tables retired by the
+    //    table-cleanup plan (#T3, #T4) and the PR #3 greeks teardown.
+    //    The persistence code is gone; this sweep removes the physical
+    //    tables on pre-existing deployments so the live QuestDB schema
+    //    converges to the 24-table KEEP set with no manual migration.
+    for table in RETIRED_QUESTDB_TABLES {
+        let ddl = format!("DROP TABLE IF EXISTS {table};");
+        run_drop_ddl(&client, &base_url, table, &ddl).await;
+    }
 }
 
 /// Issue one DROP DDL statement to QuestDB's `/exec` endpoint.
@@ -404,6 +477,59 @@ mod tests {
             assert!(
                 !engine_b.contains(&shadow.as_str()),
                 "legacy shadow table {shadow} must not be an Engine B table"
+            );
+        }
+    }
+
+    #[test]
+    fn test_legacy_extra_matview_names_have_no_engine_b_counterpart() {
+        // The 5 extra legacy matviews (sub-minute + 7d) must NOT name-
+        // collide with any of the 21 Engine-B tables — those 21 are swept
+        // separately. A collision here would mean the name is dropped
+        // twice (harmless) but signals a list-maintenance mistake.
+        let engine_b = candle_table_names();
+        for view in LEGACY_EXTRA_CANDLE_MATVIEW_NAMES {
+            assert!(
+                !engine_b.contains(&view),
+                "legacy extra matview {view} must not be an Engine B table name"
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        for view in LEGACY_EXTRA_CANDLE_MATVIEW_NAMES {
+            assert!(seen.insert(view), "duplicate legacy extra matview: {view}");
+        }
+    }
+
+    #[test]
+    fn test_retired_questdb_tables_count_is_twelve_and_unique() {
+        assert_eq!(RETIRED_QUESTDB_TABLES.len(), 12);
+        let mut seen = std::collections::HashSet::new();
+        for table in RETIRED_QUESTDB_TABLES {
+            assert!(seen.insert(table), "duplicate retired table: {table}");
+        }
+    }
+
+    #[test]
+    fn test_retired_questdb_tables_excludes_keep_set_and_audit() {
+        // The retired-table sweep must NEVER touch a KEEP-24 table or any
+        // audit table — `order_audit` carries a SEBI 5-year retention
+        // obligation and auto-dropping it would be a compliance breach.
+        let engine_b = candle_table_names();
+        for table in RETIRED_QUESTDB_TABLES {
+            assert!(
+                !engine_b.contains(&table),
+                "retired table {table} must not be a KEEP-24 candle table"
+            );
+            assert!(
+                !matches!(
+                    table,
+                    "ticks" | "historical_candles" | "option_chain_minute_snapshot"
+                ),
+                "retired table {table} must not be a KEEP-24 table"
+            );
+            assert!(
+                !table.ends_with("_audit") && table != "order_audit",
+                "retired-table sweep must not drop audit tables (SEBI retention): {table}"
             );
         }
     }
