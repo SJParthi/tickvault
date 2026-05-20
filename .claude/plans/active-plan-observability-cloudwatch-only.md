@@ -67,19 +67,31 @@ ratchets updated, one PR at a time per `pr-completion-protocol.md` §H.
     `crates/storage/tests/resilience_sla_alert_guard.rs`
   - Tests: `cargo test -p tickvault-storage` green.
 
-- [ ] **#O4 — Valkey removal — HIGHEST RISK, design-first**
+- [ ] **#O4 — Valkey removal — UNBLOCKED (operator decision 2026-05-20)**
   - Valkey is LOAD-BEARING: (a) token cache, (b) dual-instance lock.
-  - Token cache: safe to drop — the auth chain is cache → SSM → TOTP;
-    SSM is the source of truth, so cache removal is graceful degradation.
-  - **Dual-instance lock: needs a replacement design BEFORE coding.**
-    The QuestDB `live_instance_lock` table was already dropped (#T4),
-    so the lock must move to a file lock, a QuestDB row, or be retired
-    with operator sign-off. DO NOT start #O4 until this is decided.
-  - Files: `crates/storage/src/valkey_cache.rs`,
-    `crates/core/src/instance_lock.rs`,
-    `crates/core/src/auth/token_cache.rs` (+ callers),
-    `crates/app/src/main.rs` (boot wiring), `deploy/docker/docker-compose.yml`
-  - Tests: `cargo build --workspace`; boot must still succeed.
+  - **Operator decision 2026-05-20 — "Just remove valkey also":** the
+    dual-instance lock is **RETIRED**, not replaced. No file lock, no
+    QuestDB row. Acceptable because sandbox mode already skips the lock
+    and `dry_run = true` is the default — the lock only mattered in
+    live multi-host trading. Re-evaluate before `dry_run = false` if
+    multi-host deployment is ever on the table (note it in the live-go
+    checklist).
+  - Token cache: dropped — the auth chain is cache → SSM → TOTP; SSM
+    is the source of truth, so removal is graceful degradation.
+  - Work: delete `valkey_cache.rs`; delete `instance_lock.rs` + its
+    boot wiring + `Resilience01DualInstanceDetected` emit sites;
+    rip the Valkey token-cache layer out of `token_cache.rs` so the
+    token manager goes straight to SSM; drop the `valkey` service +
+    the Valkey credential fetch (`fetch_valkey_password`).
+  - Files: `crates/storage/src/valkey_cache.rs` (delete),
+    `crates/core/src/instance_lock.rs` (delete),
+    `crates/core/src/auth/token_cache.rs` + `token_manager.rs` callers,
+    `crates/core/src/auth/secret_manager.rs` (`fetch_valkey_password`),
+    `crates/app/src/main.rs` (boot wiring — Step 6a-prime),
+    `deploy/docker/docker-compose.yml`,
+    instance-lock guard tests under `crates/*/tests/`.
+  - Tests: `cargo build --workspace`; boot must still succeed with the
+    token manager reading SSM directly.
 
 - [ ] **#O5 — guard / rule cleanup**
   - Sweep `.claude/rules/` for stale Grafana / Prometheus / Valkey /
@@ -104,10 +116,11 @@ ratchets updated, one PR at a time per `pr-completion-protocol.md` §H.
 | 3 | Operator wants a dashboard | CloudWatch console — no local Grafana |
 | 4 | An `error!` fires | routed to CloudWatch Logs (Telegram path re-pointed off Alertmanager) |
 
-## Open question for the operator (blocks #O4)
+## #O4 lock question — RESOLVED 2026-05-20
 
-The dual-instance lock currently lives in Valkey. The QuestDB
-`live_instance_lock` table was dropped in #T4. Before #O4 starts, the
-operator must choose the replacement: (a) OS file lock, (b) a QuestDB
-row, or (c) retire the dual-instance guard entirely. #O1–#O3 are
-unblocked and can proceed regardless.
+The dual-instance lock lived in Valkey. Operator decision 2026-05-20
+("Just remove valkey also"): **retire the dual-instance guard
+entirely** — option (c). No replacement infra. All 6 items #O1–#O6 are
+now unblocked; execute serially per §H. Carry one note into the
+`dry_run = false` go-live checklist: re-evaluate dual-instance
+protection if multi-host deployment is ever considered.
