@@ -89,28 +89,16 @@ const LOCAL_HOST: &str = "127.0.0.1";
 /// surface for operator UX is Grafana (top of list), QuestDB Console,
 /// Prometheus, and Telegram alerts.
 const DASHBOARD_SERVICES: &[(&str, &str, &str, u16)] = &[
-    ("Grafana", "http://localhost:3000", LOCAL_HOST, 3000),
     ("QuestDB", "http://localhost:9000", LOCAL_HOST, 9000),
     ("Prometheus", "http://localhost:9090", LOCAL_HOST, 9090),
     ("Traefik", "http://localhost:8080", LOCAL_HOST, 8080),
 ];
-
-/// Grafana host for TCP reachability probe (kept for backward compat in tests).
-// O(1) EXEMPT: localhost probe for local Docker infrastructure
-const GRAFANA_HOST: &str = LOCAL_HOST;
-
-/// Grafana HTTP port for TCP reachability probe.
-const GRAFANA_PORT: u16 = 3000;
 
 /// Prometheus HTTP port for TCP reachability probe.
 const PROMETHEUS_PORT: u16 = 9090;
 
 /// Valkey (Redis) port for TCP reachability probe.
 const VALKEY_PORT: u16 = 6379;
-
-/// Grafana dashboard URL (used in tests to validate DASHBOARD_SERVICES consistency).
-#[cfg(test)]
-const GRAFANA_DASHBOARD_URL: &str = "http://localhost:3000";
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -144,23 +132,16 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
     }
 
     // Fetch infra credentials from SSM concurrently.
-    let (questdb_creds, grafana_creds, telegram_creds) = match tokio::join!(
+    let (questdb_creds, telegram_creds) = match tokio::join!(
         secret_manager::fetch_questdb_credentials(),
-        secret_manager::fetch_grafana_credentials(),
         secret_manager::fetch_telegram_credentials(),
     ) {
-        (Ok(q), Ok(g), Ok(t)) => (q, g, t),
-        (q_result, g_result, t_result) => {
+        (Ok(q), Ok(t)) => (q, t),
+        (q_result, t_result) => {
             if let Err(ref err) = q_result {
                 warn!(
                     ?err,
                     "failed to fetch QuestDB credentials from SSM — cannot auto-start Docker"
-                );
-            }
-            if let Err(ref err) = g_result {
-                warn!(
-                    ?err,
-                    "failed to fetch Grafana credentials from SSM — cannot auto-start Docker"
                 );
             }
             if let Err(ref err) = t_result {
@@ -182,14 +163,6 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
         (
             "TV_QUESTDB_PG_PASSWORD",
             questdb_creds.pg_password.expose_secret().to_string(),
-        ),
-        (
-            "TV_GRAFANA_ADMIN_USER",
-            grafana_creds.admin_user.expose_secret().to_string(),
-        ),
-        (
-            "TV_GRAFANA_ADMIN_PASSWORD",
-            grafana_creds.admin_password.expose_secret().to_string(),
         ),
         (
             "TV_TELEGRAM_BOT_TOKEN",
@@ -259,17 +232,6 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
 
     // Wait for all critical services to become healthy.
     wait_for_service_healthy("QuestDB", &questdb_config.host, questdb_config.http_port).await;
-    wait_for_service_healthy("Grafana", GRAFANA_HOST, GRAFANA_PORT).await;
-    // The TCP probe above only proves the port is open — Grafana opens
-    // the listener several seconds before its HTTP server is ready. On
-    // 2026-04-28 boot the TCP probe completed in 0.4s but Grafana was
-    // still 5-10s away from serving requests, leaving the operator
-    // staring at ERR_CONNECTION_REFUSED. Wait for /api/health = 200.
-    wait_for_http_endpoint_healthy(
-        "Grafana",
-        &format!("http://{GRAFANA_HOST}:{GRAFANA_PORT}/api/health"),
-    )
-    .await;
     wait_for_service_healthy("Prometheus", LOCAL_HOST, PROMETHEUS_PORT).await;
     wait_for_service_healthy("Valkey", LOCAL_HOST, VALKEY_PORT).await;
 
@@ -1395,13 +1357,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_grafana_constants_match() {
-        assert_eq!(GRAFANA_PORT, 3000);
-        assert_eq!(GRAFANA_HOST, "127.0.0.1");
-        assert!(GRAFANA_DASHBOARD_URL.contains(&GRAFANA_PORT.to_string()));
-    }
-
-    #[test]
     fn test_docker_compose_path_is_relative() {
         assert!(!DOCKER_COMPOSE_PATH.starts_with('/'));
     }
@@ -1496,23 +1451,6 @@ mod tests {
         assert!(
             INFRA_PROBE_TIMEOUT <= INFRA_HEALTH_POLL_INTERVAL,
             "probe timeout must be <= poll interval"
-        );
-    }
-
-    #[test]
-    fn test_grafana_dashboard_url_has_protocol() {
-        assert!(
-            GRAFANA_DASHBOARD_URL.starts_with("http://")
-                || GRAFANA_DASHBOARD_URL.starts_with("https://"),
-            "Grafana URL must have protocol"
-        );
-    }
-
-    #[test]
-    fn test_grafana_dashboard_url_contains_port() {
-        assert!(
-            GRAFANA_DASHBOARD_URL.contains(&GRAFANA_PORT.to_string()),
-            "Grafana URL must contain the configured port"
         );
     }
 
@@ -2116,15 +2054,6 @@ mod tests {
         // After drop, the port is no longer listening. Due to TIME_WAIT
         // this may or may not fail immediately, so we just verify no panic.
         let _ = is_service_reachable("127.0.0.1", port);
-    }
-
-    #[test]
-    fn test_grafana_dashboard_url_is_localhost() {
-        assert!(
-            GRAFANA_DASHBOARD_URL.contains("localhost")
-                || GRAFANA_DASHBOARD_URL.contains("127.0.0.1"),
-            "Grafana dashboard URL must be a local address"
-        );
     }
 
     #[test]

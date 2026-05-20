@@ -209,37 +209,6 @@ fn test_questdb_credentials_debug_redacts() {
 }
 
 // ---------------------------------------------------------------------------
-// GrafanaCredentials — Debug must redact admin credentials
-// ---------------------------------------------------------------------------
-
-/// Verify that `GrafanaCredentials::Debug` redacts admin_user and admin_password.
-#[test]
-fn test_grafana_credentials_debug_redacts() {
-    use secrecy::SecretString;
-    use tickvault_core::auth::GrafanaCredentials;
-
-    let creds = GrafanaCredentials {
-        admin_user: SecretString::from("grafana-admin".to_string()),
-        admin_password: SecretString::from("grafana-secret-pass".to_string()),
-    };
-
-    let debug_output = format!("{creds:?}");
-
-    assert!(
-        !debug_output.contains("grafana-admin"),
-        "admin_user MUST NOT appear in Debug output: {debug_output}"
-    );
-    assert!(
-        !debug_output.contains("grafana-secret-pass"),
-        "admin_password MUST NOT appear in Debug output: {debug_output}"
-    );
-    assert!(
-        debug_output.matches("[REDACTED]").count() >= 2,
-        "Both credential fields must be [REDACTED]: {debug_output}"
-    );
-}
-
-// ---------------------------------------------------------------------------
 // TelegramCredentials — Debug must redact bot_token and chat_id
 // ---------------------------------------------------------------------------
 
@@ -437,7 +406,6 @@ fn test_credential_types_are_not_display() {
 
     assert_not_display::<tickvault_core::auth::DhanCredentials>();
     assert_not_display::<tickvault_core::auth::QuestDbCredentials>();
-    assert_not_display::<tickvault_core::auth::GrafanaCredentials>();
     assert_not_display::<tickvault_core::auth::TelegramCredentials>();
     assert_not_display::<tickvault_core::auth::TokenState>();
 }
