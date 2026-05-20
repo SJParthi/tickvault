@@ -68,7 +68,6 @@ mod global_qcfg_tests {
 }
 
 pub mod boot_probe;
-pub mod calendar_persistence;
 pub mod candle_persistence;
 // PR #4 (2026-05-19): deep_depth_persistence + depth_dynamic_diff_audit
 // + depth_rebalance_audit modules DELETED. Audit tables stay on disk
@@ -79,8 +78,6 @@ pub mod disk_health_watcher;
 // option_greeks / pcr_snapshots / dhan_option_chain_raw / greeks_verification
 // QuestDB tables are dropped by scripts/migrate-drop-greeks-tables.sql.
 pub mod historical_fetch_marker;
-pub mod indicator_snapshot_persistence;
-pub mod live_instance_lock_persistence;
 // Candle-engine re-architecture #T1b: `materialized_views` (Engine C —
 // `candles_1s` + the 9 `candles_<tf>` matviews) DELETED. The 21 plain
 // `candles_<tf>` tables are created by
@@ -89,10 +86,8 @@ pub mod live_instance_lock_persistence;
 // `shadow_persistence::drop_legacy_candle_objects`. The 25 retired
 // `movers_*` matviews + `movers_1s` base table are no longer recreated
 // either (the old `drop_bug3_retired_views` lived in this module).
-pub mod obi_persistence;
 pub mod option_chain_minute_snapshot_persistence;
 pub mod partition_manager;
-pub mod previous_close_persistence;
 pub mod questdb_health;
 pub mod seal_absorption;
 pub mod seal_dlq;
