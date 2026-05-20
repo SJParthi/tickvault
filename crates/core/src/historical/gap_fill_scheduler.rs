@@ -1101,17 +1101,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_trading_date_ist_string_formats_yyyy_mm_dd() {
-        // 2026-05-17 00:00 IST = ist_midnight_secs(2026, 5, 17).
-        let midnight = ist_midnight_secs(2026, 5, 17);
-        assert_eq!(trading_date_ist_string(midnight), "2026-05-17");
-        // 13:33 IST same day → still 2026-05-17.
-        assert_eq!(
-            trading_date_ist_string(midnight + 13 * 3600 + 33 * 60),
-            "2026-05-17"
-        );
-    }
+    // #T2b: test_trading_date_ist_string_formats_yyyy_mm_dd removed with
+    // the trading_date_ist_string helper.
 
     #[test]
     fn test_bar_minute_ist_string_formats_hh_mm() {

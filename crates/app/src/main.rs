@@ -72,9 +72,6 @@ use tickvault_storage::candle_persistence::{
 // PR #3 (2026-05-19): `greeks_persistence` retired. Migration SQL
 // `scripts/migrate-drop-greeks-tables.sql` drops the option_greeks /
 // pcr_snapshots / dhan_option_chain_raw / greeks_verification tables.
-use tickvault_storage::instrument_persistence::{
-    ensure_instrument_tables, persist_instrument_snapshot,
-};
 use tickvault_storage::tick_persistence::{
     DepthPersistenceWriter, TickPersistenceWriter, ensure_depth_and_prev_close_tables,
     ensure_tick_table_dedup_keys,
@@ -1401,12 +1398,8 @@ async fn main() -> Result<()> {
                 tokio::join!(
                     ensure_tick_table_dedup_keys(&config.questdb),
                     ensure_depth_and_prev_close_tables(&config.questdb),
-                    ensure_instrument_tables(&config.questdb),
                     ensure_candle_table_dedup_keys(&config.questdb),
                     calendar_persistence::ensure_calendar_table(&config.questdb),
-                    tickvault_storage::constituency_persistence::ensure_constituency_table(
-                        &config.questdb
-                    ),
                     tickvault_storage::shadow_persistence::ensure_shadow_candle_tables(
                         &config.questdb
                     ),
@@ -1422,19 +1415,6 @@ async fn main() -> Result<()> {
                     warn!(
                         ?err,
                         "calendar persistence failed (non-critical, best-effort)"
-                    );
-                }
-
-                // Re-persist instrument data ONLY for CachedPlan path.
-                // FreshBuild already persisted inside load_or_build_instruments.
-                // Double-persist creates duplicate rows in QuestDB snapshot tables.
-                if _needs_persist
-                    && let Some(ref universe) = fresh_universe
-                    && let Err(err) = persist_instrument_snapshot(universe, &config.questdb).await
-                {
-                    warn!(
-                        ?err,
-                        "instrument snapshot persistence failed (non-critical)"
                     );
                 }
 
@@ -2438,10 +2418,8 @@ async fn main() -> Result<()> {
     tokio::join!(
         ensure_tick_table_dedup_keys(&config.questdb),
         ensure_depth_and_prev_close_tables(&config.questdb),
-        ensure_instrument_tables(&config.questdb),
         ensure_candle_table_dedup_keys(&config.questdb),
         calendar_persistence::ensure_calendar_table(&config.questdb),
-        tickvault_storage::constituency_persistence::ensure_constituency_table(&config.questdb),
         // Candle-engine re-architecture #T1b: `ensure_candle_views`
         // (Engine C — `candles_1s` matview cascade) RETIRED. The 21
         // plain `candles_<tf>` tables are created by
@@ -2824,16 +2802,6 @@ async fn main() -> Result<()> {
     // Only persist for CachedPlan (not yet persisted). FreshBuild already
     // persisted inside load_or_build_instruments — double-write creates
     // duplicate rows in the same timestamp second.
-    if needs_instrument_persist
-        && let Some(ref universe) = slow_boot_universe
-        && let Err(err) = persist_instrument_snapshot(universe, &config.questdb).await
-    {
-        warn!(
-            ?err,
-            "instrument snapshot persistence failed (non-critical)"
-        );
-    }
-
     // -----------------------------------------------------------------------
     // Step 8: Build WebSocket connection pool (only if authenticated + plan ready)
     // -----------------------------------------------------------------------

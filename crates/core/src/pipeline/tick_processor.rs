@@ -3485,44 +3485,9 @@ mod tests {
         );
     }
 
-    /// `format_bar_minute_ist` ratchet — well-known boundaries.
-    #[test]
-    fn test_format_bar_minute_ist_at_15_30_returns_15_30() {
-        assert_eq!(format_bar_minute_ist(15 * 3600 + 30 * 60), "15:30");
-    }
-
-    #[test]
-    fn test_format_bar_minute_ist_at_15_29_59_returns_15_29() {
-        assert_eq!(format_bar_minute_ist(15 * 3600 + 29 * 60 + 59), "15:29");
-    }
-
-    #[test]
-    fn test_format_bar_minute_ist_at_09_15_returns_09_15() {
-        assert_eq!(format_bar_minute_ist(9 * 3600 + 15 * 60), "09:15");
-    }
-
-    /// `exchange_segment_label_static` ratchet — the 8 known Dhan codes.
-    #[test]
-    fn test_exchange_segment_label_static_known_codes() {
-        assert_eq!(exchange_segment_label_static(0), "IDX_I");
-        assert_eq!(exchange_segment_label_static(1), "NSE_EQ");
-        assert_eq!(exchange_segment_label_static(2), "NSE_FNO");
-        assert_eq!(exchange_segment_label_static(3), "NSE_CURRENCY");
-        assert_eq!(exchange_segment_label_static(4), "BSE_EQ");
-        assert_eq!(exchange_segment_label_static(5), "MCX_COMM");
-        assert_eq!(exchange_segment_label_static(7), "BSE_CURRENCY");
-        assert_eq!(exchange_segment_label_static(8), "BSE_FNO");
-    }
-
-    /// `exchange_segment_label_static` ratchet — unknown / gap (6) →
-    /// "UNKNOWN" (NEVER panics). Dhan's enum table has no code 6;
-    /// regression-class fix from I-P1-11 audit.
-    #[test]
-    fn test_exchange_segment_label_static_unknown_codes_return_unknown() {
-        assert_eq!(exchange_segment_label_static(6), "UNKNOWN");
-        assert_eq!(exchange_segment_label_static(255), "UNKNOWN");
-        assert_eq!(exchange_segment_label_static(99), "UNKNOWN");
-    }
+    // #T2b: the format_bar_minute_ist / exchange_segment_label_static
+    // ratchet tests were removed with those helper fns (deleted along
+    // with the last_tick_audit row write).
 
     // -----------------------------------------------------------------------
     // is_today_ist — stale day filter tests
