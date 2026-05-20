@@ -1,11 +1,32 @@
 # Implementation Plan: PR #8 — option_chain heart-piece + pre-open day_open wiring
 
-**Status:** DRAFT (awaiting operator approval before code)
+**Status:** IN_PROGRESS — sub-PR split per operator-charter §H
 **Date:** 2026-05-19
-**Approved by:** pending Parthiban
-**Branch:** `claude/aws-lifecycle-pr-8-option-chain-heart-piece`
-**Predecessor:** PR #7 series complete (#711/#712/#713/#714/#715 all merged)
+**Approved by:** Parthiban (split + Q5 auto-allow locked via AskUserQuestion)
+**Predecessor:** PR #7 series complete (#711-#715 all merged)
 **Successor in 14-PR sequence:** PR #9 — cross_verify module (15:31 IST + 08:05 IST schedulers)
+
+## Sub-PR split (operator-locked)
+
+- **PR #8a** (#716 MERGED) — Slice 1: DayOhlcTracker 09:15 IST arm wiring.
+  Closed the pre-open equilibrium open-price gap.
+- **PR #8b** (this branch `claude/aws-lifecycle-pr-8b-option-chain-heart-piece`) —
+  Slice 2: option_chain heart-piece constants (5 constants, 8 ratchet tests).
+  Pins the operator-locked values (50s cadence, 60s cache age, DH-904
+  backoff ladder, 3-cycle stale threshold, 0.5% L2-verify tolerance).
+  Mergeable on its own; unblocks every later slice.
+- **PR #8c** (NEXT — needs operator awake) — Slices 3-8: the heart-piece
+  behavior. Deferred from this autonomous session because:
+  - Slice 4 (strategy fail-closed gate) requires wiring `SnapshotCache`
+    into `StrategyInstance::evaluate()` — changes the evaluator signature
+    + threads the cache through the trading pipeline = architecturally
+    significant, needs operator sign-off (charter: no arch decisions
+    while operator asleep).
+  - Slice 3 (8 OPTION-CHAIN-* emit sites) is NOT mechanical — the
+    current `snapshot_scheduler.rs` lacks the DH-904 ladder / parse-
+    failure / L2-verify failure paths the 8 codes describe. Tagging
+    requires implementing those paths first = real heart-piece work.
+  - Slice 8 (alerts) — Prometheus vs CloudWatch is open Q1, deferred.
 
 ---
 

@@ -1657,6 +1657,42 @@ pub const OPTION_CHAIN_MIN_REQUEST_INTERVAL_SECS: u64 = 3;
 /// Option Chain API HTTP request timeout in seconds.
 pub const OPTION_CHAIN_REQUEST_TIMEOUT_SECS: u64 = 10;
 
+/// PR #8b — option_chain heart-piece fetch cadence in seconds.
+///
+/// Operator-locked at 50s per `docs/architecture/option-chain-z-plus-heart-piece.md`
+/// §3. Dhan rate limit is 1 unique request per 3 seconds per
+/// `(underlying, expiry)` pair. We fan out 3 underlyings concurrently
+/// (NIFTY / BANKNIFTY / SENSEX), each on its own 50s timer. 50s is
+/// conservative — actual minimum is 3s per pair.
+pub const OPTION_CHAIN_FETCH_CADENCE_SECS: u64 = 50;
+
+/// PR #8b — strategy fail-closed cache-age threshold in seconds.
+///
+/// If `option_chain_cache.age_seconds(underlying) > 60` for ANY of the 3
+/// `OPTION_CHAIN_UNDERLYINGS` during market hours, the strategy MUST
+/// refuse to emit any signal (per heart-piece doc §5). Operator lock:
+/// "never trade on stale data". DO NOT raise this without operator
+/// re-approval — higher value = trading on data >1 cycle stale.
+pub const OPTION_CHAIN_MAX_CACHE_AGE_SECS: u64 = 60;
+
+/// PR #8b — DH-904 (rate-limit) backoff ladder in seconds.
+///
+/// Per `dhan-annexure-enums.md` rule 11. After 80s exhaustion the cycle
+/// is skipped and `OPTION-CHAIN-02` Critical Telegram fires.
+pub const OPTION_CHAIN_BACKOFF_LADDER_SECS: [u64; 4] = [10, 20, 40, 80];
+
+/// PR #8b — number of consecutive failed cycles before per-underlying
+/// stale-cycle Telegram fires (audit-findings Rule 4: edge-triggered).
+pub const OPTION_CHAIN_STALE_CYCLES_BEFORE_TELEGRAM: u32 = 3;
+
+/// PR #8b — L2 VERIFY tolerance percentage for option-chain
+/// `data.last_price` vs live WS index LTP comparison.
+///
+/// Per heart-piece doc §3 row 2. Tighter risks false positives near
+/// close (NSE settlement window); looser hides parser bugs. 0.5% is
+/// the operator-locked value.
+pub const OPTION_CHAIN_L2_VERIFY_TOLERANCE_PCT: f64 = 0.5;
+
 /// Default depth batch flush size for QuestDB ILP writes.
 /// Each depth snapshot writes 5 rows (one per level), so effective row count = batch × 5.
 pub const DEPTH_FLUSH_BATCH_SIZE: usize = 200;
@@ -3580,6 +3616,90 @@ mod tests {
         assert!(
             !body.contains("SystemTime"),
             "G1 gate body MUST NOT call SystemTime — pure const fn",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // PR #8b — option_chain heart-piece constants pinned
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_option_chain_fetch_cadence_pinned_at_50s() {
+        assert_eq!(
+            OPTION_CHAIN_FETCH_CADENCE_SECS, 50,
+            "Operator-locked at 50s per heart-piece doc §3. Raising hammers Dhan REST; lowering risks DH-904 rate limit."
+        );
+    }
+
+    #[test]
+    fn test_option_chain_max_cache_age_pinned_at_60s() {
+        assert_eq!(
+            OPTION_CHAIN_MAX_CACHE_AGE_SECS, 60,
+            "Operator-locked at 60s per heart-piece doc §5. Higher = trading on stale data."
+        );
+    }
+
+    #[test]
+    fn test_option_chain_max_cache_age_greater_than_fetch_cadence() {
+        // Cache MUST be older than the fetch cadence for the fail-closed
+        // gate to make sense. 60 > 50 = there's a 10s headroom for one
+        // cycle to fail before strategy halts.
+        assert!(
+            OPTION_CHAIN_MAX_CACHE_AGE_SECS > OPTION_CHAIN_FETCH_CADENCE_SECS,
+            "max_cache_age ({}) must exceed fetch_cadence ({}) so the strategy doesn't fail-close on every cycle",
+            OPTION_CHAIN_MAX_CACHE_AGE_SECS,
+            OPTION_CHAIN_FETCH_CADENCE_SECS,
+        );
+    }
+
+    #[test]
+    fn test_option_chain_backoff_ladder_pinned() {
+        assert_eq!(
+            OPTION_CHAIN_BACKOFF_LADDER_SECS,
+            [10, 20, 40, 80],
+            "DH-904 backoff ladder per dhan-annexure-enums.md rule 11. Exponential 10→80s."
+        );
+    }
+
+    #[test]
+    fn test_option_chain_backoff_ladder_is_monotonic_increasing() {
+        let ladder = OPTION_CHAIN_BACKOFF_LADDER_SECS;
+        for i in 1..ladder.len() {
+            assert!(
+                ladder[i] > ladder[i - 1],
+                "backoff ladder must be strictly monotonic increasing"
+            );
+            assert!(
+                ladder[i] >= ladder[i - 1] * 2,
+                "backoff ladder must double each step (or more) per Dhan rule 11"
+            );
+        }
+    }
+
+    #[test]
+    fn test_option_chain_stale_cycles_before_telegram_pinned_at_3() {
+        assert_eq!(
+            OPTION_CHAIN_STALE_CYCLES_BEFORE_TELEGRAM, 3,
+            "3 cycles = 150s grace before Telegram (per audit-findings Rule 4 edge-trigger). Too low = spam; too high = late operator visibility."
+        );
+    }
+
+    #[test]
+    fn test_option_chain_l2_verify_tolerance_pinned_at_05_pct() {
+        assert!(
+            (OPTION_CHAIN_L2_VERIFY_TOLERANCE_PCT - 0.5).abs() < f64::EPSILON,
+            "L2 VERIFY tolerance operator-locked at 0.5% per heart-piece doc §3 row 2."
+        );
+    }
+
+    #[test]
+    fn test_option_chain_l2_verify_tolerance_is_sub_1_percent() {
+        // Sanity: any tolerance >= 1% would routinely hide Dhan parser
+        // bugs (rupee-level errors on a ~25k underlying = 0.4 bps).
+        assert!(
+            OPTION_CHAIN_L2_VERIFY_TOLERANCE_PCT < 1.0,
+            "L2 VERIFY tolerance must stay sub-1%; got {}",
+            OPTION_CHAIN_L2_VERIFY_TOLERANCE_PCT
         );
     }
 }
