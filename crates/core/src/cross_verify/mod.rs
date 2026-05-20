@@ -16,12 +16,22 @@
 //! Without this layer, missed ticks are invisible: a single dropped
 //! WebSocket packet silently corrupts the OHLCV the strategy trades on.
 //!
-//! # PR #9a scope
+//! # Scope
 //!
-//! This sub-PR ships ONLY the pure-logic [`comparator`] — the
-//! zero-tolerance OHLCV comparison engine and its verdict types. The
-//! schedulers, the Dhan REST integration, the QuestDB audit writer and
-//! the boot wiring land in subsequent sub-PRs (#9b onward). The
-//! comparator is fully unit-tested in isolation here.
+//! This module ships the pure-logic [`comparator`] — the zero-tolerance
+//! OHLCV comparison engine and its verdict types. The schedulers, the
+//! Dhan REST integration and the boot wiring land in subsequent
+//! sub-PRs (#9b onward). The comparator is fully unit-tested in
+//! isolation here.
+//!
+//! # Table-free (QuestDB table-cleanup #T5, 2026-05-20)
+//!
+//! Cross-verify is **table-free**. The comparison sources are Dhan
+//! REST and the `historical_candles` table (read-only); the verdict is
+//! reported **via Telegram only** plus the structured `error!` log
+//! (`data/logs/errors.jsonl.*`). There is NO `cross_verify_audit` /
+//! `cross_verify_mismatches` QuestDB table — the #9b+ schedulers MUST
+//! NOT add an audit-table writer. See
+//! `.claude/rules/project/option-chain-cross-verify-error-codes.md` §2.
 
 pub mod comparator;

@@ -1,6 +1,7 @@
 # Implementation Plan: QuestDB Table Cleanup — drop to 24 tables
 
-**Status:** APPROVED
+**Status:** VERIFIED — all items #T1–#T5 merged (PRs #731/#733/#734,
+#737/#738, #739, #740, #741). Archived 2026-05-20.
 **Date:** 2026-05-20
 **Approved by:** Parthiban (operator) — keep list corrected 2026-05-20:
 `ticks` + 21 candle timeframe tables (1m…15m each minute, 30m, 1h, 2h,
@@ -129,8 +130,12 @@ its `ErrorCode` variant(s), and its ratchet tests.
   (market_depth, previous_close, indicator_snapshots, obi_snapshots,
   nse_holidays, live_instance_lock — modules deleted, callers rewired,
   boot DDL trimmed.)
-- [ ] **#T5** — cross-verify (PR #9) lands table-free (Telegram-only)
-  against `historical_candles`.
+- [x] **#T5** — cross-verify (PR #9) lands table-free (Telegram-only)
+  against `historical_candles`. (PR #741 — design lock: the cross-verify
+  subsystem writes NO QuestDB table; `cross_verify/mod.rs` doc +
+  `option-chain-cross-verify-error-codes.md` §2/§3 + `error-rules.yaml`
+  updated; `cross_verify_audit`/`cross_verify_mismatches` table refs
+  removed — Telegram + `errors.jsonl` are the only sinks.)
 
 Supersedes the original AWS-lifecycle PR #10 QuestDB-cleanup scope.
 
