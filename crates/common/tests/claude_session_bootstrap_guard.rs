@@ -359,26 +359,6 @@ fn subscription_planner_emits_per_id_collision_gauge() {
 }
 
 #[test]
-fn tick_processor_uses_segment_aware_sequence_tracker() {
-    // PR #288 (#1 wiring): tick_processor must use DepthSequenceTracker
-    // (segment-aware) instead of the old HashMap<(u32, u8), u32>
-    // (not segment-aware, violates I-P1-11).
-    let src = read("crates/core/src/pipeline/tick_processor.rs");
-    assert!(
-        src.contains("DepthSequenceTracker"),
-        "tick_processor must use DepthSequenceTracker"
-    );
-    assert!(
-        !src.contains("let mut deep_depth_seq_tracker: std::collections::HashMap<(u32, u8), u32>"),
-        "old non-segment-aware HashMap must be removed"
-    );
-    assert!(
-        !src.contains("tv_depth_20lvl_sequence_gaps_total"),
-        "old single-metric name must be removed (replaced by 3 labelled metrics)"
-    );
-}
-
-#[test]
 fn chaos_nightly_workflow_wires_ignored_tests() {
     // PR #288 (#6/#7): the `#[ignore]`d chaos tests already exist
     // (4,723 lines across 16 files) but had no CI wiring. This workflow
@@ -457,36 +437,6 @@ fn chaos_valkey_kill_test_exists() {
     assert!(
         src.contains("#[ignore"),
         "chaos_valkey_kill tests must be #[ignore]'d (weekly workflow)"
-    );
-}
-
-#[test]
-fn loom_depth_sequence_tracker_test_exists() {
-    let p = repo_root().join("crates/core/tests/loom_depth_sequence_tracker.rs");
-    assert!(p.exists(), "loom_depth_sequence_tracker.rs missing");
-    let src = fs::read_to_string(&p).unwrap();
-    assert!(
-        src.contains("loom::model"),
-        "loom test must use loom::model"
-    );
-    assert!(
-        src.contains("concurrent") || src.contains("thread"),
-        "loom test must exercise concurrent access"
-    );
-}
-
-#[test]
-fn dhat_depth_sequence_tracker_test_exists() {
-    let p = repo_root().join("crates/core/tests/dhat_depth_sequence_tracker.rs");
-    assert!(p.exists(), "dhat_depth_sequence_tracker.rs missing");
-    let src = fs::read_to_string(&p).unwrap();
-    assert!(
-        src.contains("dhat::Profiler") || src.contains("dhat::Alloc"),
-        "DHAT test must use dhat profiler"
-    );
-    assert!(
-        src.contains("zero-alloc") || src.contains("zero alloc") || src.contains("bytes_delta, 0"),
-        "DHAT test must assert zero allocation"
     );
 }
 

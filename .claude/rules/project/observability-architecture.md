@@ -37,8 +37,8 @@ structured ERROR event in the last hour.
 
 Every tracked error/invariant lives in `crates/common/src/error_code.rs`:
 
-- **I-P0-01..06** — Instrument priority-0 (data-loss / correctness)
-- **I-P1-01/02/03/05/06/08/11** — Instrument priority-1
+- **I-P0-03** — Instrument priority-0 (expiry check at OMS gate 4)
+- **I-P1-05/06/08/11** — Instrument priority-1
 - **I-P2-02** — Instrument priority-2 (trading-day guard)
 - **GAP-NET-01** — IP monitor ; **GAP-SEC-01** — API auth
 - **OMS-GAP-01..06** — Order Management System
@@ -251,10 +251,11 @@ summary file and drives the above flow.
       validate-automation` runs 20 end-to-end checks.
 - [x] **Phase 10.1** — Zero-tick-loss alert guard (4 Prometheus alerts
       pinned, 7 source-invariant tests).
-- [x] **Phase 10.2** — Sequence-hole detector shipped:
-      `crates/core/src/pipeline/depth_sequence_tracker.rs` with
-      `dhat_depth_sequence_tracker.rs` (zero-alloc) and
-      `loom_depth_sequence_tracker.rs` (concurrency) ratchets.
+- [~] **Phase 10.2** — Sequence-hole detector was shipped, then RETIRED
+      when the depth-20/200 feeds were removed (AWS-lifecycle PR #4).
+      Depth WebSockets are forbidden forever per
+      `.claude/rules/project/websocket-connection-scope-lock.md`; the
+      detector module and its DHAT + loom ratchets were deleted too.
 - [x] **Phase 10.3** — Tick-loss chaos test shipped:
       `crates/storage/tests/chaos_zero_tick_loss.rs`.
 - [x] **Phase 11** — WS + QuestDB + Valkey resilience SLA ALERT GUARD

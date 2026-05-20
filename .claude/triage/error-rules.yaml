@@ -81,21 +81,6 @@ rules:
   # Depth spot stale — auto-restart the rebalancer (market-hours only)
   # -----------------------------------------------------------------------
 
-  - name: depth-spot-stale-auto-restart
-    match:
-      code: I-P1-11       # placeholder until DepthSpotStale code exists
-      message_contains: "Depth spot price STALE"
-    action: auto_restart
-    auto_fix_script: scripts/auto-fix-restart-depth.sh
-    runbook_path: .claude/rules/project/depth-subscription.md
-    confidence: 0.90
-    cooldown_secs: 1800
-    justification: >-
-      Depth rebalancer occasionally stalls when the main feed misses a
-      heartbeat. Restarting the rebalancer subscription is idempotent
-      and resolves the stall 90% of the time. Still escalates if the
-      stall recurs within the cooldown window.
-
   # -----------------------------------------------------------------------
   # Instrument rebuild — auto-fix on SecurityId-invalid data API error
   # -----------------------------------------------------------------------
@@ -286,21 +271,6 @@ rules:
       to Dhan when dry_run=true. HALT trading immediately + operator
       review. Never auto-action, never silence.
 
-  - name: i-p0-06-emergency-download-escalate
-    match:
-      code: I-P0-06
-    action: escalate
-    runbook_path: .claude/rules/project/gap-enforcement.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      I-P0-06 = all instrument caches missing AND live download failed.
-      Trading cannot start without instruments — CRITICAL escalation.
-
-  # -----------------------------------------------------------------------
-  # High — order / risk / rate-limit / regulatory
-  # -----------------------------------------------------------------------
-
   - name: dh-905-input-exception-escalate
     match:
       code: DH-905
@@ -426,66 +396,6 @@ rules:
   # -----------------------------------------------------------------------
   # Medium — data pipeline correctness
   # -----------------------------------------------------------------------
-
-  - name: i-p0-01-duplicate-security-id-escalate
-    match:
-      code: I-P0-01
-    action: escalate
-    runbook_path: .claude/rules/project/gap-enforcement.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      I-P0-01 = duplicate security_id in CSV universe. Data-quality
-      issue from Dhan — operator diagnoses whether to hotfix the
-      universe filter or file a support ticket.
-
-  - name: i-p0-02-count-consistency-escalate
-    match:
-      code: I-P0-02
-    action: escalate
-    runbook_path: .claude/rules/project/gap-enforcement.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      I-P0-02 = post-build derivative count below minimum threshold.
-      CSV truncation or parser regression — operator checks before
-      allowing trading to proceed with sparse universe.
-
-  - name: i-p0-04-cache-persistence-escalate
-    match:
-      code: I-P0-04
-    action: escalate
-    runbook_path: .claude/rules/project/gap-enforcement.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      I-P0-04 = instrument cache dir is on tmpfs or otherwise
-      non-persistent. Cold-boot risk — operator fixes mount before
-      trusting cached universe.
-
-  - name: i-p0-05-s3-backup-silence
-    match:
-      code: I-P0-05
-    action: silence
-    runbook_path: .claude/rules/project/gap-enforcement.md
-    confidence: 1.0
-    cooldown_secs: 86400
-    justification: >-
-      I-P0-05 fires when S3 backup config is missing. Pre-AWS-provision
-      this is expected. Silence daily — re-enable via operator when the
-      S3 bucket is live.
-
-  - name: i-p1-03-security-id-reuse-escalate
-    match:
-      code: I-P1-03
-    action: escalate
-    runbook_path: .claude/rules/project/gap-enforcement.md
-    confidence: 1.0
-    cooldown_secs: 3600
-    justification: >-
-      I-P1-03 = Dhan reassigned a security_id (expired contract id
-      reused for a new contract). Operator reviews delta_detector output
-      before accepting the rebuild.
 
   - name: i-p1-05-compound-dedup-key-escalate
     match:
@@ -709,28 +619,6 @@ rules:
   # Low — scheduler / trading-day / informational / unknown
   # -----------------------------------------------------------------------
 
-  - name: i-p1-01-daily-scheduler-silence
-    match:
-      code: I-P1-01
-    action: silence
-    runbook_path: .claude/rules/project/gap-enforcement.md
-    confidence: 1.0
-    cooldown_secs: 86400
-    justification: >-
-      I-P1-01 = daily scheduler drift event. Observational — scheduler
-      self-corrects on next cycle. Silence daily.
-
-  - name: i-p1-02-delta-field-coverage-silence
-    match:
-      code: I-P1-02
-    action: silence
-    runbook_path: .claude/rules/project/gap-enforcement.md
-    confidence: 1.0
-    cooldown_secs: 86400
-    justification: >-
-      I-P1-02 = delta_detector logged a field change. Informational —
-      useful to diff CSVs but not actionable.
-
   - name: i-p2-02-trading-day-guard-silence
     match:
       code: I-P2-02
@@ -782,31 +670,6 @@ rules:
       cache becomes fresh. Sustained HOT-PATH-02 above 1/min
       indicates a slow disk and should escalate via Prometheus
       alert, not per-event Telegram.
-
-  - name: phase2-01-dispatch-failed-escalate
-    match:
-      code: PHASE2-01
-    action: escalate
-    runbook_path: .claude/rules/project/wave-1-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      PHASE2-01 means the Phase 2 09:13 IST dispatch could not
-      subscribe stock F&O. Operator MUST investigate immediately
-      — F&O ingestion is missing for the day until resolved.
-
-  - name: phase2-02-emit-guard-dropped-escalate
-    match:
-      code: PHASE2-02
-    action: escalate
-    runbook_path: .claude/rules/project/wave-1-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      PHASE2-02 means the Phase2EmitGuard was dropped without firing
-      an outcome — a regression added a return path that doesn't
-      consume guard.emit_*. Always escalate so the regression is
-      caught and reverted before more damage.
 
   - name: prev-close-01-ilp-failed-escalate
     match:
@@ -929,16 +792,6 @@ rules:
       `chronyc -a makestep` and restart. Never auto-action — clock
       drift is symptomatic of NTP / hardware / hypervisor issues
       that need human triage.
-
-  - name: audit-01-phase2-write-failed-escalate
-    match:
-      code: AUDIT-01
-    action: escalate
-    runbook_path: .claude/rules/project/wave-2-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 600
-    justification: >-
-      Phase 2 audit write failure. SEBI-relevant — escalate.
 
   - name: audit-02-depth-rebalance-write-failed-escalate
     match:
@@ -1099,43 +952,6 @@ rules:
   # Phase 7 (2026-04-28) — Depth-20 dynamic top-150 selector
   # -----------------------------------------------------------------------
 
-  - name: depth-dyn-01-top-set-empty-escalate
-    match:
-      code: DEPTH-DYN-01
-    action: escalate
-    runbook_path: .claude/rules/project/wave-4-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 1800
-    justification: >-
-      DEPTH-DYN-01 means the top-150 selector returned an empty (or
-      sub-50) set during market hours. Either option_movers stale,
-      universe empty, or no positive gainers in the last 90s. Operator
-      checks `SELECT count(*) FROM option_movers WHERE ts > now() - 5m`.
-      Severity::High; 30-min cooldown to avoid Telegram spam during
-      sustained low-volume periods. NEVER auto-fix — empty top-150 is
-      symptomatic of upstream failure (movers pipeline / market closed
-      mid-day / Dhan outage), not a fixable selector bug.
-
-  - name: depth-dyn-02-swap-channel-broken-escalate
-    match:
-      code: DEPTH-DYN-02
-    action: escalate
-    runbook_path: .claude/rules/project/wave-4-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 60
-    justification: >-
-      DEPTH-DYN-02 means one of the 3 dynamic depth-20 slots' Swap20
-      mpsc channel returned SendError — receiver task panicked or was
-      deallocated. Pool supervisor (WS-GAP-05) should respawn within
-      5s. Severity::Critical. 60s cooldown — repeated DEPTH-DYN-02
-      within 5 minutes indicates cascading failure that operator must
-      diagnose.
-
-  # -----------------------------------------------------------------------
-  # Wave 5 (2026-05-01) — core_affinity pinning + dynamic top-gainer
-  # selectors + boot prev-close routing assertion + volume monotonicity
-  # -----------------------------------------------------------------------
-
   - name: core-pin-01-pinning-failed-at-boot-escalate
     match:
       code: CORE-PIN-01
@@ -1166,36 +982,6 @@ rules:
       safe per the runbook (the watchdog is the auto-fix). Operator
       only needs to act if `tv_core_pinning_drift_total` rate >1/min
       for 5 min, in which case the dashboard escalates separately.
-
-  - name: depth-20-dyn-03-top-gainers-empty-escalate
-    match:
-      code: DEPTH-20-DYN-03
-    action: escalate
-    runbook_path: .claude/rules/project/wave-5-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 1800
-    justification: >-
-      DEPTH-20-DYN-03 means the depth-20 conn 5 top-50 selector
-      returned < 50 contracts during market hours. Either
-      `option_movers` stale (follow MOVERS-02 runbook), universe-wide
-      bear day (< 50 NSE_FNO contracts with `change_pct > 0`), or
-      writer unhealthy. Severity::High; 30-min cooldown to avoid spam
-      during sustained low-volume periods. Conn 5 keeps the last-good
-      set until next successful query — never auto-fix.
-
-  - name: depth-200-dyn-01-top-gainers-empty-escalate
-    match:
-      code: DEPTH-200-DYN-01
-    action: escalate
-    runbook_path: .claude/rules/project/wave-5-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 1800
-    justification: >-
-      DEPTH-200-DYN-01 means the depth-200 top-5 selector returned
-      < 5 contracts during market hours. Same upstream failure modes
-      as DEPTH-20-DYN-03 (just smaller K). Each conn keeps its
-      last-good gainer set; no Swap200 is issued. Severity::High;
-      30-min cooldown.
 
   - name: prevclose-03-boot-routing-assertion-escalate
     match:
@@ -1238,50 +1024,6 @@ rules:
 
   # -----------------------------------------------------------------------
   # PR-B (2026-05-02) — boot-time depth-200 smoke test
-  # -----------------------------------------------------------------------
-
-  - name: depth200-smoke-01-no-frames-at-boot-escalate
-    match:
-      code: DEPTH200-SMOKE-01
-    action: escalate
-    runbook_path: .claude/rules/project/wave-5-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      DEPTH200-SMOKE-01 = boot-time depth-200 smoke test observed zero
-      frames within the 60s deadline during market hours. Most often
-      means Dhan reverted the Ticket #5610706 server-side gate (depth-200
-      rejecting APP tokens again); next-most-often the 5 SecurityIds
-      are all far-OTM and Dhan's server-side filtering drops them.
-      Severity::Critical; never auto-action — operator decides between
-      `git revert` of PR #427 (restore SELF-token workaround) and
-      Dhan support escalation.
-
-  # -----------------------------------------------------------------------
-  # PR-G (2026-05-02) — Phase 2 readiness pre-flight at 09:13:01 IST
-  # -----------------------------------------------------------------------
-
-  - name: phase2-ready-01-preflight-failed-escalate
-    match:
-      code: PHASE2-READY-01
-    action: escalate
-    runbook_path: .claude/rules/project/wave-5-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      PHASE2-READY-01 = Phase 2 readiness pre-flight failed at 09:13:01
-      IST. One or more of the 11 forward-looking pre-conditions for
-      the upcoming 09:15 / 09:15:30 / 09:16:30 milestones are not met.
-      The Telegram payload names exactly which checks failed (token
-      headroom, WS pool counts, QuestDB reachability, pre-open buffer
-      coverage, Phase 2 plan quality, subscribe ack rate, rescue ring
-      health, composite SLO). Operator has ~120 seconds until NSE
-      market open to act. Severity::Critical; never auto-action —
-      operator follows the per-check runbook section in
-      wave-5-error-codes.md.
-
-  # -----------------------------------------------------------------------
-  # Phase 3 9-box closure (PR §6 Phase 3) — cascade lag + respawn
   # -----------------------------------------------------------------------
 
   - name: cascade-lag-rising-escalate
@@ -1593,19 +1335,6 @@ rules:
       OMS-GAP-01 fan-out: state machine violated during order placement.
       Severity::High. Phase 1.5 wiring; once live trading enables,
       a state machine violation is operator-critical.
-
-  - name: audit-01-phase2-write-failed-during-1531-escalate
-    match:
-      code: AUDIT-01
-      message_substring: "15:31"
-    action: escalate
-    runbook_path: .claude/rules/project/wave-2-error-codes.md
-    confidence: 0.9
-    cooldown_secs: 60
-    justification: >-
-      AUDIT-01 fan-out: Phase 2 audit write failed during 15:31 IST
-      cross-verify run. Indicates QuestDB unreachable during the
-      daily integrity gate.
 
   - name: ws-gap-04-post-close-sleep-friday-escalate
     match:
