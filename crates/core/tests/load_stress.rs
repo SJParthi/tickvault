@@ -133,42 +133,6 @@ fn stress_burst_10k_mixed_packets() {
 }
 
 // ---------------------------------------------------------------------------
-// Sustained: Candle aggregation under load
-// ---------------------------------------------------------------------------
-
-#[test]
-fn stress_candle_aggregator_50k_ticks() {
-    use tickvault_common::tick_types::ParsedTick;
-    use tickvault_core::pipeline::candle_aggregator::CandleAggregator;
-
-    let mut agg = CandleAggregator::new();
-    let start = Instant::now();
-
-    for i in 0..50_000_u32 {
-        let tick = ParsedTick {
-            security_id: 50000 + (i % 100),
-            exchange_segment_code: EXCHANGE_SEGMENT_NSE_FNO,
-            last_traded_price: 100.0 + (i as f32 * 0.01),
-            exchange_timestamp: 1_700_000_000 + (i / 100), // New second every 100 ticks
-            volume: i,
-            ..Default::default()
-        };
-        agg.update(&tick);
-    }
-
-    let elapsed = start.elapsed();
-    if !skip_perf_assertions() {
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "50K candle updates took {elapsed:?} — too slow"
-        );
-    }
-    // Should have produced some completed candles (new seconds)
-    let total_completed = agg.completed_slice().len();
-    assert!(total_completed > 0, "should produce completed candles");
-}
-
-// ---------------------------------------------------------------------------
 // Stress: parse 1 million ticker packets
 // ---------------------------------------------------------------------------
 
@@ -259,62 +223,6 @@ fn test_stress_concurrent_registry_access() {
         assert!(
             elapsed < Duration::from_secs(5),
             "800K concurrent registry lookups took {elapsed:?} — too slow (budget: 5s)"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Stress: candle aggregator burst — 10K ticks in rapid succession
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_stress_candle_aggregator_burst() {
-    use tickvault_common::tick_types::ParsedTick;
-    use tickvault_core::pipeline::candle_aggregator::CandleAggregator;
-
-    let mut agg = CandleAggregator::new();
-    let start = Instant::now();
-
-    // Feed 10K ticks across 50 securities × 200 ticks each, spanning 20 seconds.
-    for i in 0..10_000_u32 {
-        let security_id = 50000 + (i % 50);
-        let timestamp = 1_700_000_000 + (i / 500); // New second every 500 ticks
-        let tick = ParsedTick {
-            security_id,
-            exchange_segment_code: EXCHANGE_SEGMENT_NSE_FNO,
-            last_traded_price: 100.0 + (i as f32 * 0.01),
-            exchange_timestamp: timestamp,
-            volume: i * 10,
-            ..Default::default()
-        };
-        agg.update(&tick);
-    }
-
-    let elapsed = start.elapsed();
-
-    // Verify candle correctness: 10K ticks / 500 per second = 20 seconds.
-    // 50 securities × (20-1) completed transitions = 950 completed candles.
-    let completed_count = agg.total_completed();
-    assert!(
-        completed_count > 0,
-        "should produce completed candles from burst traffic"
-    );
-    // Each security has 20 seconds, so 19 completed candles per security × 50 = 950.
-    assert_eq!(
-        completed_count, 950,
-        "expected 950 completed candles (50 securities × 19 second transitions)"
-    );
-    // 50 securities still have active candles for the last second.
-    assert_eq!(
-        agg.active_count(),
-        50,
-        "50 securities should have active candles"
-    );
-
-    if !skip_perf_assertions() {
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "10K candle burst took {elapsed:?} — too slow (budget: 500ms)"
         );
     }
 }

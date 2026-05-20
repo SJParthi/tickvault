@@ -1395,7 +1395,9 @@ async fn main() -> Result<()> {
         // only; the WebSocket pipeline must contain ONLY live ticks.
 
         let processor_handle = if let Some(receiver) = pool_receiver {
-            let candle_agg = Some(tickvault_core::pipeline::CandleAggregator::new());
+            // Candle-engine re-architecture #T1b: Engine A (the legacy 1s
+            // `CandleAggregator` → `candles_1s` path) DELETED. The
+            // multi-TF aggregator (Engine B) is the only candle engine.
             let tick_broadcast_for_processor = Some(fast_tick_broadcast_sender.clone());
 
             // Parthiban directive (2026-04-21): no-tick-during-market-hours
@@ -1441,8 +1443,6 @@ async fn main() -> Result<()> {
                     fast_tick_writer,
                     fast_depth_writer,
                     tick_broadcast_for_processor,
-                    candle_agg,
-                    None, // live_candle_writer — QuestDB reconnects in background
                     greeks_enricher,
                     Some(fast_tick_heartbeat),
                     None, // tick_enricher — Phase 2.5 wiring deferred until prev_oi_cache + boot ordering gate land in slow boot
@@ -1540,6 +1540,11 @@ async fn main() -> Result<()> {
             // Docker infra + QuestDB DDL
             async {
                 infra::ensure_infra_running(&config.questdb).await;
+                // Candle-engine re-architecture #T1b — drop legacy candle
+                // objects before creating Engine B's plain tables (see the
+                // slow-boot path for the full rationale).
+                tickvault_storage::shadow_persistence::drop_legacy_candle_objects(&config.questdb)
+                    .await;
                 tokio::join!(
                     ensure_tick_table_dedup_keys(&config.questdb),
                     ensure_depth_and_prev_close_tables(&config.questdb),
@@ -1549,7 +1554,11 @@ async fn main() -> Result<()> {
                     tickvault_storage::constituency_persistence::ensure_constituency_table(
                         &config.questdb
                     ),
-                    tickvault_storage::materialized_views::ensure_candle_views(&config.questdb),
+                    tickvault_storage::shadow_persistence::ensure_shadow_candle_tables(
+                        &config.questdb
+                    ),
+                    // Candle-engine re-architecture #T1b: `ensure_candle_views`
+                    // (Engine C matview cascade) RETIRED.
                     // PR #3 (2026-05-19): `ensure_greeks_tables` retired.
                 );
                 // Persist trading calendar to QuestDB (best-effort, non-blocking).
@@ -1670,20 +1679,11 @@ async fn main() -> Result<()> {
             info!("background tick persistence consumer started (cold path)");
         }
 
-        // --- Background: Candle persistence (cold path — aggregates ticks → candles_1s) ---
-        // In fast boot, live_candle_writer is None so the hot-path CandleAggregator
-        // produces candles but can't persist them. This cold-path consumer runs its
-        // own CandleAggregator, subscribes to the tick broadcast, and writes completed
-        // 1-second candles to QuestDB `candles_1s`. Materialized views (1m, 5m, etc.)
-        // automatically aggregate from candles_1s.
-        {
-            let candle_persistence_rx = fast_tick_broadcast_sender.subscribe();
-            let questdb_cfg = config.questdb.clone();
-            tokio::spawn(async move {
-                run_candle_persistence_consumer(candle_persistence_rx, questdb_cfg).await;
-            });
-            info!("background candle persistence consumer started (cold path)");
-        }
+        // Candle-engine re-architecture #T1b: the cold-path Engine-A
+        // candle-persistence consumer (`run_candle_persistence_consumer`
+        // → `candles_1s`) DELETED. Engine B (the multi-TF aggregator
+        // subscriber, wired below) is the sole candle path; it runs in
+        // both fast and slow boot.
 
         // --- Background: Greeks pipeline (option chain fetch → compute → persist) ---
         //
@@ -1821,223 +1821,15 @@ async fn main() -> Result<()> {
             }
         };
 
-        // Wave 6 Sub-PR #1 item 1.4d — MASTER SWITCH.
-        // Spawns the multi-TF aggregator task that subscribes to the
-        // live tick broadcast and produces sealed candles for the
-        // shadow tables. This is the LAST wire — once this task is
-        // running, the full pipeline is live:
-        //
-        //   Dhan WebSocket → tick_processor → fast_tick_broadcast
-        //     → THIS TASK: MultiTfAggregator::consume_tick → BufferedSeal
-        //       → mpsc::Sender (published in 1.4c) → SealWriterRunner
-        //         → SealAbsorptionPipeline (ring → spill → DLQ)
-        //           → ShadowCandleWriter → candles_*_shadow tables
-        //
-        // Producer-side hot-path budget: ~300 ns per tick across all 9 TFs
-        // (per consume_tick docstring). Cold-path drain handles ILP.
-        //
-        // Lazy registration: pre_populate is called on-demand when
-        // consume_tick reports `instrument_found = false` (the first
-        // tick for that (security_id, exchange_segment_code) pair).
-        // Skips pre-loading the entire 11K-instrument registry to keep
-        // this slice narrow and avoid coupling main.rs to the universe
-        // builder. First tick per instrument is dropped; second tick
-        // onwards folds. Acceptable for the shadow-table validation
-        // phase — over the trading session every active instrument
-        // gets registered after its first tick.
-        {
-            use tickvault_storage::seal_writer_runner::global_seal_sender;
-            use tickvault_trading::candles::{
-                AggregatorHeartbeatCounters, BufferedSeal, MultiTfAggregator, stamp_seal_pct_fields,
-            };
-
-            // 11K-instrument capacity (matches MAX_TOTAL_SUBSCRIPTIONS
-            // headroom per `aws-budget.md`). HashMap grows lazily so
-            // this is a hint, not a hard cap.
-            const AGGREGATOR_CAPACITY: usize = 11_000;
-
-            let aggregator =
-                std::sync::Arc::new(MultiTfAggregator::with_capacity(AGGREGATOR_CAPACITY));
-            let agg_clone = std::sync::Arc::clone(&aggregator);
-            // Wave 6 Sub-PR #1 item 1.4g — clone the boot-loaded
-            // `PrevDayCache` (line 673) into the aggregator task so the
-            // seal closure replaces `PrevDayRefs::default()` (all zeros)
-            // with the real day-(N-1) refs. Lookup is O(1) lock-free
-            // (~30 ns on the cold seal path). Returns `None` on cache
-            // miss (newly listed contract or PREVCLOSE-04 cold-boot
-            // empty-table state) — graceful fallback to zeros keeps
-            // the seal valid (compute_*_pct div-by-zero guards per
-            // L-H14 produce 0.0 % values, never NaN).
-            let prev_day_cache_for_agg = std::sync::Arc::clone(&prev_day_cache);
-            // Wave 6 Sub-PR #1 item 1.4h — per-minute aggregator
-            // heartbeat counters. Three AtomicU64 shared between the
-            // subscriber task (writer) and the once-per-minute
-            // heartbeat task (reader-resetter). Provides positive
-            // signal for the AGGREGATOR-HB-01 runbook so the operator
-            // can confirm via `tail -f data/logs/app.YYYY-MM-DD.log
-            // | grep 'aggregator heartbeat'` that the master switch
-            // is producing sealed candles. Counters are SEPARATE from
-            // the existing `metrics::counter!` increments (1.4e) —
-            // those go to Prometheus; these enable a coalesced 60s
-            // structured log without scraping Prometheus.
-            let heartbeat = AggregatorHeartbeatCounters::new();
-            let heartbeat_writer = heartbeat.clone();
-            let heartbeat_reader = heartbeat.clone();
-            let mut tick_rx = fast_tick_broadcast_sender.subscribe();
-
-            tokio::spawn(async move {
-                loop {
-                    match tick_rx.recv().await {
-                        Ok(tick) => {
-                            // OnceLock read is cheap — single atomic load.
-                            // None means the writer task failed to construct;
-                            // drop ticks silently (legacy candles_1s path
-                            // still feeds production trading).
-                            let Some(sender) = global_seal_sender() else {
-                                continue;
-                            };
-                            let stats = agg_clone.consume_tick(
-                                &tick,
-                                tick.exchange_segment_code,
-                                |tf, mut state| {
-                                    // Wave 6 Sub-PR #1 item 1.4g — look up
-                                    // real prev-day refs from the boot-
-                                    // loaded `PrevDayCache` (F2 loader,
-                                    // PR #520). Cache miss → fallback to
-                                    // `PrevDayRefs::default()` (all zeros)
-                                    // for newly listed contracts and
-                                    // PREVCLOSE-04 cold-boot scenarios.
-                                    // div-by-zero guards in compute_*_pct
-                                    // produce 0.0 % values per L-H14, so
-                                    // the seal stays valid either way.
-                                    let refs = prev_day_cache_for_agg
-                                        .lookup(tick.security_id, tick.exchange_segment_code)
-                                        .unwrap_or_default();
-                                    stamp_seal_pct_fields(&mut state, refs);
-                                    let seal = BufferedSeal::new(
-                                        tick.security_id,
-                                        tick.exchange_segment_code,
-                                        tf,
-                                        state,
-                                    );
-                                    // Non-blocking try_send. On full mpsc
-                                    // (writer task fell behind ~20s at peak
-                                    // burst): drop with counter. The
-                                    // producer NEVER blocks on I/O per L-C1.
-                                    if sender.try_send(seal).is_err() {
-                                        metrics::counter!("tv_seal_mpsc_dropped_total")
-                                            .increment(1);
-                                        // Wave 6 Sub-PR #1 item 1.4h — also
-                                        // record into the heartbeat counters
-                                        // for the per-minute structured log.
-                                        heartbeat_writer.record_drop();
-                                    } else {
-                                        // Wave 6 Sub-PR #1 item 1.4e —
-                                        // positive-signal counter so the
-                                        // operator can see in Grafana that
-                                        // the master switch is actually
-                                        // producing seals. Labels are not
-                                        // used here (one global counter)
-                                        // because the per-TF / per-segment
-                                        // breakdown lives in the
-                                        // `aggregator_seal_audit` table.
-                                        metrics::counter!("tv_aggregator_seals_emitted_total")
-                                            .increment(1);
-                                        // Wave 6 Sub-PR #1 item 1.4h — also
-                                        // record into the heartbeat counters.
-                                        heartbeat_writer.record_emit();
-                                    }
-                                },
-                            );
-                            // Wave 6 Sub-PR #1 item 1.4e — emit observability
-                            // counters from `ConsumeStats`. These are the
-                            // operator's first visibility into whether the
-                            // 1.4d master switch is processing live ticks.
-                            if stats.late_count > 0 {
-                                metrics::counter!("tv_aggregator_late_ticks_discarded_total")
-                                    .increment(u64::from(stats.late_count));
-                                // Wave 6 Sub-PR #1 item 1.4h — also record
-                                // into the heartbeat counters.
-                                heartbeat_writer.record_late_ticks(u64::from(stats.late_count));
-                            }
-                            // Lazy registration for first-time instruments.
-                            // pre_populate is idempotent (only inserts when
-                            // key is absent) so the second-tick-onward path
-                            // is a no-op.
-                            if !stats.instrument_found {
-                                agg_clone.pre_populate(std::iter::once((
-                                    tick.security_id,
-                                    tick.exchange_segment_code,
-                                )));
-                                // Wave 6 Sub-PR #1 item 1.4e — count lazy
-                                // registrations so the operator can see the
-                                // ramp-up curve in the first minutes of the
-                                // session as each instrument's first tick
-                                // arrives.
-                                metrics::counter!("tv_aggregator_instruments_lazy_inserted_total")
-                                    .increment(1);
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            // Broadcast channel overflowed — we lost some
-                            // ticks. Increment counter; the legacy path
-                            // also receives the same ticks via its own
-                            // subscriber, so trading is unaffected.
-                            metrics::counter!("tv_aggregator_tick_lag_total").increment(skipped);
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            tracing::info!(
-                                "Wave 6 aggregator subscriber: broadcast closed, exiting"
-                            );
-                            break;
-                        }
-                    }
-                }
-            });
-            tracing::info!(
-                aggregator_capacity = AGGREGATOR_CAPACITY,
-                "Wave 6 Sub-PR #1 item 1.4d — multi-TF aggregator task spawned (master switch ON)"
-            );
-
-            // Wave 6 Sub-PR #1 item 1.4h — per-minute aggregator
-            // heartbeat task. Drains the three counters every 60 s
-            // and emits a structured `info!` log when any counter is
-            // non-zero. Pre-market / post-market silence produces
-            // zero snapshots and stays silent (audit-findings Rule 3
-            // market-hours awareness + Rule 11 false-OK avoidance).
-            // No Telegram emission yet — log-only is the safest first
-            // pass; a Telegram `AggregatorMinuteSealBurst` event can
-            // be wired in a later slice once the operator confirms
-            // the log volume is healthy.
-            const AGGREGATOR_HEARTBEAT_INTERVAL_SECS: u64 = 60;
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                    AGGREGATOR_HEARTBEAT_INTERVAL_SECS,
-                ));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                // First tick fires immediately; skip it so the first
-                // emitted log represents a full 60s window.
-                interval.tick().await;
-                loop {
-                    interval.tick().await;
-                    let snap = heartbeat_reader.drain();
-                    if !snap.is_active() {
-                        continue;
-                    }
-                    tracing::info!(
-                        seals_emitted = snap.seals_emitted,
-                        seals_dropped = snap.seals_dropped,
-                        late_ticks_discarded = snap.late_ticks_discarded,
-                        interval_secs = AGGREGATOR_HEARTBEAT_INTERVAL_SECS,
-                        "aggregator heartbeat (Wave 6 Sub-PR #1 item 1.4h)"
-                    );
-                }
-            });
-            tracing::info!(
-                interval_secs = AGGREGATOR_HEARTBEAT_INTERVAL_SECS,
-                "Wave 6 Sub-PR #1 item 1.4h — aggregator heartbeat task spawned (per-minute summary)"
-            );
-        }
+        // Candle-engine re-architecture #T1b — wire Engine B (the only
+        // candle engine: 21-TF aggregator → 21 plain `candles_<tf>`
+        // tables). Subscriber + heartbeat + IST-midnight force-seal
+        // tasks all live in the shared `spawn_engine_b_aggregator` helper.
+        spawn_engine_b_aggregator(
+            &fast_tick_broadcast_sender,
+            std::sync::Arc::clone(&prev_day_cache),
+            std::sync::Arc::clone(&trading_calendar),
+        );
 
         // --- Background: Index constituency (best-effort) ---
         // During market hours, skip network downloads to niftyindices.com
@@ -2819,6 +2611,16 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Candle-engine re-architecture #T1b — drop the legacy candle objects
+    // (Engine A `candles_1s` base table + Engine C's 9 `candles_<tf>`
+    // materialized views + the retired Wave-6 `candles_<tf>_shadow`
+    // tables) BEFORE `ensure_shadow_candle_tables` creates Engine B's
+    // 21 plain `candles_<tf>` tables. The 9 matviews are NAMED
+    // `candles_1m` … `candles_1d` — the exact plain-table names — so a
+    // surviving matview makes `CREATE TABLE IF NOT EXISTS candles_1m`
+    // a silent no-op. Must run sequentially before the join.
+    tickvault_storage::shadow_persistence::drop_legacy_candle_objects(&config.questdb).await;
+
     // All table creation queries are independent — run in parallel for faster boot.
     // NOTE: the boot audit row for the `questdb_ready` step is appended AFTER this
     // join — `ensure_boot_audit_table` lives inside the join (line ~1985) and
@@ -2831,15 +2633,13 @@ async fn main() -> Result<()> {
         ensure_candle_table_dedup_keys(&config.questdb),
         calendar_persistence::ensure_calendar_table(&config.questdb),
         tickvault_storage::constituency_persistence::ensure_constituency_table(&config.questdb),
-        tickvault_storage::materialized_views::ensure_candle_views(&config.questdb),
+        // Candle-engine re-architecture #T1b: `ensure_candle_views`
+        // (Engine C — `candles_1s` matview cascade) RETIRED. The 21
+        // plain `candles_<tf>` tables are created by
+        // `ensure_shadow_candle_tables` below; the legacy matviews are
+        // dropped by `drop_legacy_candle_objects` before this join.
         // PR #3 (2026-05-19): `ensure_greeks_tables` retired alongside
         // the deleted greeks_persistence module.
-        // 2026-05-09 PR 5c.5-final (Bug 3 — movers retirement): the
-        // `movers_1s` base table + 25 `movers_*` materialized views are
-        // RETIRED. Operator directive: "only ticks and our 9 needed
-        // candle timeframes are available". The DROP for these objects
-        // now lives in `ensure_candle_views` (Step 4e —
-        // `drop_bug3_retired_views`). No CREATE call here.
         tickvault_storage::indicator_snapshot_persistence::ensure_indicator_snapshot_table(
             &config.questdb
         ),
@@ -3568,70 +3368,17 @@ async fn main() -> Result<()> {
         info!("slow-boot observability consumer started");
     }
 
-    // 29-tf engine Phase 3 commit 3: spawn the 1s candle cascade
-    // consumer. Subscribes to the same tick broadcast as persistence +
-    // observability and feeds an in-memory `CandleEngineMap<Tf1s>`
-    // (per plan L12: only the 1s engine sits on the per-tick path —
-    // 28 derived engines + their rtrb SPSC arrive in commit 4).
-    //
-    // Lives entirely off the persistence hot path: the broadcast
-    // channel fans every tick to all subscribers in parallel, so a
-    // slow cascade NEVER blocks tick persistence. Lag is reported via
-    // `tv_candle_cascade_lag_total`.
-    //
-    // Three tasks form the cascade subsystem (per adversarial review):
-    // 1. Supervisor (H3 fix) — re-spawns the cascade on panic/exit.
-    // 2. Midnight rollover (L13 + H1 fix) — seals open bars at IST 00:00
-    //    so day-N state never fuses into day-(N+1)'s first bar.
-    // 3. Lag coalescing (H2 fix, in cascade.rs) — Telegram errors
-    //    rate-limited to 1 per 60s window per task lifetime.
-    let candle_engine_map_1s: std::sync::Arc<
-        tickvault_trading::candles::CandleEngineMap<tickvault_trading::candles::Tf1s>,
-    > = std::sync::Arc::new(tickvault_trading::candles::CandleEngineMap::new());
-    // Phase 3 commit 4: 28-TF cascade fanout. Built once at boot, cloned
-    // into every consumer. Trading bot reads RAM directly via
-    // `cascade_fanout.tf<n>m.latest(security_id, segment_code)`.
-    let cascade_fanout: tickvault_trading::candles::CascadeFanout =
-        tickvault_trading::candles::CascadeFanout::new();
-    {
-        let supervisor_sender = tick_broadcast_sender.clone();
-        let supervisor_map = std::sync::Arc::clone(&candle_engine_map_1s);
-        let supervisor_fanout = cascade_fanout.clone();
-        // F1 (Wave-5 §K-L13 / #504e follow-up): wire the existing
-        // `prev_day_cache` (constructed at line ~663) into the
-        // cascade so every sealed Bar carries the 5 frozen-per-day
-        // % fields. The cache is empty at boot today (F2 will add
-        // the boot-time loader); the `on_*_with_pct` div-by-zero
-        // policy means an empty cache produces 0.0 % fields without
-        // dropping any seal — so wiring this in advance is benign
-        // until F2 lands.
-        let supervisor_pct_cache = std::sync::Arc::clone(&prev_day_cache);
-        tokio::spawn(async move {
-            tickvault_trading::candles::spawn_supervised_cascade_1s(
-                supervisor_sender,
-                supervisor_map,
-                Some(supervisor_fanout),
-                Some(supervisor_pct_cache),
-            )
-            .await;
-        });
-        let rollover_map = std::sync::Arc::clone(&candle_engine_map_1s);
-        let rollover_fanout = cascade_fanout.clone();
-        tokio::spawn(async move {
-            // L13: seal both the 1s engine map AND every derived
-            // fanout engine at IST midnight so day-N state never
-            // fuses into day-(N+1)'s first bar across the 29-TF set.
-            tickvault_trading::candles::run_midnight_rollover_task_with_fanout(
-                rollover_map,
-                Some(rollover_fanout),
-            )
-            .await;
-        });
-        info!(
-            "29-tf candle cascade started: 1s engine + 28-TF fanout + supervisor + midnight rollover"
-        );
-    }
-
+    // Candle-engine re-architecture #T1b — wire Engine B (the only
+    // candle engine). Engine C (`candles_1s` → `CandleEngineMap<Tf1s>`
+    // → `CascadeFanout` matview cascade + `run_midnight_rollover_task_with_fanout`)
+    // DELETED. The shared `spawn_engine_b_aggregator` helper spawns the
+    // subscriber + heartbeat + IST-midnight force-seal tasks (the
+    // force-seal task replaces the deleted cascade midnight rollover).
+    spawn_engine_b_aggregator(
+        &tick_broadcast_sender,
+        std::sync::Arc::clone(&prev_day_cache),
+        std::sync::Arc::clone(&trading_calendar),
+    );
     // L10 (Wave-5 #504d): tick_storage broadcast consumer. Subscribes
     // to the same `tick_broadcast_sender` used by the cascade so every
     // tick lands in the in-RAM ring without coupling the tick_processor
@@ -3663,29 +3410,10 @@ async fn main() -> Result<()> {
     // 2026-05-15 (websocket-connection-scope-lock.md).
 
     let processor_handle = if let Some(receiver) = pool_receiver {
-        let candle_agg = Some(tickvault_core::pipeline::CandleAggregator::new());
-        let live_candle_writer =
-            match tickvault_storage::candle_persistence::LiveCandleWriter::new(&config.questdb) {
-                Ok(mut w) => {
-                    // Recover stale candle spill files from previous crashes.
-                    let recovered = w.recover_stale_spill_files();
-                    if recovered > 0 {
-                        info!(
-                            recovered,
-                            "recovered stale candle spill files from previous crash"
-                        );
-                    }
-                    info!("QuestDB live candle writer connected (candles_1s)");
-                    Some(w)
-                }
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        "live candle writer unavailable — candles_1s will not be persisted"
-                    );
-                    None
-                }
-            };
+        // Candle-engine re-architecture #T1b: Engine A (the legacy 1s
+        // `CandleAggregator` + `LiveCandleWriter` → `candles_1s` path)
+        // DELETED. Engine B (the multi-TF aggregator → 21 plain
+        // `candles_<tf>` tables) is the only candle engine.
         // PR #2 (2026-05-18): TopMoversTracker / OptionMoversTracker
         // / shared_movers snapshot retired alongside the deleted movers
         // pipeline. Under the 4-IDX_I-only universe a top-N gainers/
@@ -3979,8 +3707,6 @@ async fn main() -> Result<()> {
                 tick_writer,
                 depth_writer,
                 tick_broadcast_for_processor,
-                candle_agg,
-                live_candle_writer,
                 greeks_enricher,
                 Some(slow_tick_heartbeat),
                 // 29-tf engine Phase 2.6 — production-attach the
@@ -7093,147 +6819,193 @@ async fn run_slow_boot_observability(
     }
 }
 
+// compute_market_close_sleep is now in boot_helpers module (lib.rs).
+
 // ---------------------------------------------------------------------------
-// Helper: Cold-path candle persistence consumer (fast boot only)
+// Helper: Engine B — multi-TF candle aggregator (shared by fast + slow boot)
 // ---------------------------------------------------------------------------
 
-/// Subscribes to the tick broadcast, aggregates ticks into 1-second candles,
-/// and persists them to QuestDB `candles_1s` via ILP.
+/// Candle-engine re-architecture #T1b — wire Engine B (the only candle
+/// engine).
 ///
-/// This is the cold-path equivalent of the hot-path CandleAggregator + LiveCandleWriter
-/// that runs inside `run_tick_processor`. In fast boot mode, the tick processor starts
-/// with `live_candle_writer = None` (QuestDB not ready), so candles are aggregated
-/// but not persisted. This consumer fills that gap once QuestDB is available.
+/// Spawns three tokio tasks, all driven off the live tick broadcast:
 ///
-/// Materialized views (candles_1m, 5m, 15m, etc.) automatically aggregate from candles_1s.
-async fn run_candle_persistence_consumer(
-    mut tick_rx: tokio::sync::broadcast::Receiver<tickvault_common::tick_types::ParsedTick>,
-    questdb_config: tickvault_common::config::QuestDbConfig,
+/// 1. **Aggregator subscriber** — folds every live tick into the 21-TF
+///    [`MultiTfAggregator`]; on each TF boundary cross the sealed
+///    candle is pct-stamped and pushed into the seal-writer ring (which
+///    drains to the 21 plain `candles_<tf>` tables).
+/// 2. **Per-minute heartbeat** — coalesced 60s structured log of
+///    seals-emitted / dropped / late-discarded (AGGREGATOR-HB-01).
+/// 3. **IST-midnight force-seal** — at IST 00:00:00 each trading day,
+///    force-seals every open bucket of every instrument so day-N state
+///    never fuses into day-(N+1)'s first bar. Replaces the deleted
+///    Engine-C `run_midnight_rollover_task_with_fanout`.
+///
+/// Both boot paths (fast crash-recovery + slow normal start) call this
+/// so candle aggregation is identical regardless of boot mode.
+// WIRING-EXEMPT: call sites are the fast-boot + slow-boot blocks in `main` below.
+fn spawn_engine_b_aggregator(
+    tick_broadcast_sender: &tokio::sync::broadcast::Sender<
+        tickvault_common::tick_types::ParsedTick,
+    >,
+    prev_day_cache: std::sync::Arc<tickvault_trading::in_mem::PrevDayCache>,
+    trading_calendar: std::sync::Arc<TradingCalendar>,
 ) {
-    let mut candle_writer =
-        match tickvault_storage::candle_persistence::LiveCandleWriter::new(&questdb_config) {
-            Ok(writer) => {
-                info!("cold-path live candle writer connected to QuestDB (candles_1s)");
-                writer
-            }
-            Err(err) => {
-                warn!(
-                    ?err,
-                    "cold-path live candle writer unavailable — candles_1s will NOT be persisted"
-                );
-                return;
-            }
-        };
+    use tickvault_storage::seal_writer_runner::global_seal_sender;
+    use tickvault_trading::candles::{
+        AggregatorHeartbeatCounters, BufferedSeal, MultiTfAggregator, stamp_seal_pct_fields,
+    };
 
-    let mut aggregator = tickvault_core::pipeline::CandleAggregator::new();
-    // O(1) EXEMPT: cold path, pipeline setup
-    let sweep_interval = std::time::Duration::from_millis(100);
-    let mut last_sweep = std::time::Instant::now();
-    let mut candles_persisted: u64 = 0;
+    // 11K-instrument capacity (matches MAX_TOTAL_SUBSCRIPTIONS headroom
+    // per `aws-budget.md`). HashMap grows lazily so this is a hint.
+    const AGGREGATOR_CAPACITY: usize = 11_000;
 
-    loop {
-        // Use timeout so stale candles are swept even during quiet periods.
-        match tokio::time::timeout(sweep_interval, tick_rx.recv()).await {
-            Ok(Ok(tick)) => {
-                aggregator.update(&tick);
-            }
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
-                error!(
-                    skipped,
-                    "CRITICAL: cold-path candle consumer lagged — {} ticks not aggregated", skipped
-                );
-                metrics::counter!("tv_candle_ticks_lagged").increment(skipped);
-            }
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                // Shutdown: flush remaining candles
-                aggregator.flush_all();
-                for c in aggregator.completed_slice() {
-                    let _ = candle_writer.append_candle(
-                        c.security_id,
-                        c.exchange_segment_code,
-                        c.timestamp_secs,
-                        c.open,
-                        c.high,
-                        c.low,
-                        c.close,
-                        c.volume,
-                        c.tick_count,
-                        c.iv,
-                        c.delta,
-                        c.gamma,
-                        c.theta,
-                        c.vega,
-                        // Wave-5 §K-L12 (#504b): % fields default to 0.0.
-                        0.0,
-                        0.0,
-                        0.0,
+    let aggregator = std::sync::Arc::new(MultiTfAggregator::with_capacity(AGGREGATOR_CAPACITY));
+
+    // --- Task 1: aggregator subscriber (per-tick fold + seal) ---
+    let agg_clone = std::sync::Arc::clone(&aggregator);
+    let prev_day_cache_for_agg = std::sync::Arc::clone(&prev_day_cache);
+    let heartbeat = AggregatorHeartbeatCounters::new();
+    let heartbeat_writer = heartbeat.clone();
+    let heartbeat_reader = heartbeat.clone();
+    let mut tick_rx = tick_broadcast_sender.subscribe();
+
+    tokio::spawn(async move {
+        loop {
+            match tick_rx.recv().await {
+                Ok(tick) => {
+                    let Some(sender) = global_seal_sender() else {
+                        continue;
+                    };
+                    let stats = agg_clone.consume_tick(
+                        &tick,
+                        tick.exchange_segment_code,
+                        |tf, mut state| {
+                            let refs = prev_day_cache_for_agg
+                                .lookup(tick.security_id, tick.exchange_segment_code)
+                                .unwrap_or_default();
+                            stamp_seal_pct_fields(&mut state, refs);
+                            let seal = BufferedSeal::new(
+                                tick.security_id,
+                                tick.exchange_segment_code,
+                                tf,
+                                state,
+                            );
+                            if sender.try_send(seal).is_err() {
+                                metrics::counter!("tv_seal_mpsc_dropped_total").increment(1);
+                                heartbeat_writer.record_drop();
+                            } else {
+                                metrics::counter!("tv_aggregator_seals_emitted_total").increment(1);
+                                heartbeat_writer.record_emit();
+                            }
+                        },
                     );
+                    if stats.late_count > 0 {
+                        metrics::counter!("tv_aggregator_late_ticks_discarded_total")
+                            .increment(u64::from(stats.late_count));
+                        heartbeat_writer.record_late_ticks(u64::from(stats.late_count));
+                    }
+                    if !stats.instrument_found {
+                        agg_clone.pre_populate(std::iter::once((
+                            tick.security_id,
+                            tick.exchange_segment_code,
+                        )));
+                        metrics::counter!("tv_aggregator_instruments_lazy_inserted_total")
+                            .increment(1);
+                    }
                 }
-                aggregator.clear_completed();
-                let _ = candle_writer.force_flush();
-                info!(
-                    candles_persisted,
-                    total_completed = aggregator.total_completed(),
-                    "cold-path candle persistence consumer shutting down (broadcast closed)"
-                );
-                return;
-            }
-            Err(_timeout) => {
-                // No tick received within sweep_interval — just sweep below
-            }
-        }
-
-        // Periodic sweep: emit stale candles and flush to QuestDB
-        if last_sweep.elapsed() >= sweep_interval {
-            // CRITICAL: Dhan WebSocket timestamps are IST epoch seconds.
-            // Must add IST offset to UTC clock for correct stale comparison.
-            // APPROVED: i64→u32 safe: IST epoch fits u32 until 2106.
-            #[allow(clippy::cast_possible_truncation)]
-            let now_secs = (chrono::Utc::now().timestamp()
-                + i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS))
-                as u32;
-            aggregator.sweep_stale(now_secs);
-            let completed = aggregator.completed_slice();
-
-            for c in completed {
-                if let Err(err) = candle_writer.append_candle(
-                    c.security_id,
-                    c.exchange_segment_code,
-                    c.timestamp_secs,
-                    c.open,
-                    c.high,
-                    c.low,
-                    c.close,
-                    c.volume,
-                    c.tick_count,
-                    c.iv,
-                    c.delta,
-                    c.gamma,
-                    c.theta,
-                    c.vega,
-                    // Wave-5 §K-L12 (#504b): % fields default to 0.0.
-                    0.0,
-                    0.0,
-                    0.0,
-                ) {
-                    warn!(?err, "cold-path candle write failed");
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    metrics::counter!("tv_aggregator_tick_lag_total").increment(skipped);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    tracing::info!("Engine B aggregator subscriber: broadcast closed, exiting");
                     break;
                 }
             }
-
-            candles_persisted = candles_persisted.saturating_add(completed.len() as u64);
-            aggregator.clear_completed();
-
-            if let Err(err) = candle_writer.flush_if_needed() {
-                // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
-                error!(?err, "cold-path candle flush failed");
-            }
-            last_sweep = std::time::Instant::now();
         }
-    }
-}
+    });
+    tracing::info!(
+        aggregator_capacity = AGGREGATOR_CAPACITY,
+        "candle-engine #T1b — multi-TF aggregator task spawned (Engine B)"
+    );
 
-// compute_market_close_sleep is now in boot_helpers module (lib.rs).
+    // --- Task 2: per-minute heartbeat ---
+    const AGGREGATOR_HEARTBEAT_INTERVAL_SECS: u64 = 60;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            AGGREGATOR_HEARTBEAT_INTERVAL_SECS,
+        ));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let snap = heartbeat_reader.drain();
+            if !snap.is_active() {
+                continue;
+            }
+            tracing::info!(
+                seals_emitted = snap.seals_emitted,
+                seals_dropped = snap.seals_dropped,
+                late_ticks_discarded = snap.late_ticks_discarded,
+                interval_secs = AGGREGATOR_HEARTBEAT_INTERVAL_SECS,
+                "aggregator heartbeat (AGGREGATOR-HB-01)"
+            );
+        }
+    });
+    tracing::info!("candle-engine #T1b — aggregator heartbeat task spawned");
+
+    // --- Task 3: IST-midnight boundary force-seal ---
+    // Replaces the deleted Engine-C `run_midnight_rollover_task_with_fanout`.
+    // At IST 00:00:00 each trading day, force-seals every open bucket so
+    // day-N candle state never fuses into day-(N+1)'s first bar. Each
+    // sealed bar is pct-stamped and routed into the SAME seal-writer ring
+    // the per-tick path uses (`global_seal_sender()`).
+    let agg_for_boundary = std::sync::Arc::clone(&aggregator);
+    let prev_day_cache_for_boundary = std::sync::Arc::clone(&prev_day_cache);
+    tokio::spawn(async move {
+        loop {
+            // Sleep until the next IST midnight (bounded helper, ≤ 24h).
+            let sleep_secs = tickvault_common::market_hours::secs_until_next_ist_midnight().max(1);
+            tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+
+            // Only force-seal on trading days — a non-trading-day
+            // midnight has no open buckets worth flushing. `is_trading_day_today`
+            // reads the IST calendar date internally.
+            if !trading_calendar.is_trading_day_today() {
+                tracing::info!("IST-midnight force-seal: skipping (non-trading day)");
+                continue;
+            }
+
+            let Some(sender) = global_seal_sender() else {
+                tracing::warn!("IST-midnight force-seal: seal sender not installed — skipping");
+                continue;
+            };
+
+            let mut sealed: u64 = 0;
+            let mut dropped: u64 = 0;
+            agg_for_boundary.force_seal_all(|security_id, segment_code, tf, mut state| {
+                let refs = prev_day_cache_for_boundary
+                    .lookup(security_id, segment_code)
+                    .unwrap_or_default();
+                stamp_seal_pct_fields(&mut state, refs);
+                let seal = BufferedSeal::new(security_id, segment_code, tf, state);
+                if sender.try_send(seal).is_err() {
+                    metrics::counter!("tv_seal_mpsc_dropped_total").increment(1);
+                    dropped = dropped.saturating_add(1);
+                } else {
+                    metrics::counter!("tv_aggregator_seals_emitted_total").increment(1);
+                    sealed = sealed.saturating_add(1);
+                }
+            });
+            tracing::info!(
+                sealed,
+                dropped,
+                "IST-midnight force-seal complete — open buckets flushed"
+            );
+        }
+    });
+    tracing::info!("candle-engine #T1b — IST-midnight force-seal task spawned");
+}
 
 // ---------------------------------------------------------------------------
 // Helper: Graceful shutdown (shared by fast and slow boot paths)
@@ -7696,69 +7468,6 @@ mod tests {
     }
 
     // ===================================================================
-    // MECHANICAL ENFORCEMENT: IST offset in cold-path candle consumer
-    // ===================================================================
-
-    #[test]
-    fn test_cold_path_candle_consumer_uses_ist_offset() {
-        // Source-level enforcement: the cold-path candle persistence consumer
-        // MUST add IST_UTC_OFFSET_SECONDS to chrono::Utc::now() before calling
-        // sweep_stale(). Without this, UTC clock is 19800s behind IST candle
-        // timestamps → candles never swept → candles_1s stays empty forever.
-        let source = include_str!("main.rs");
-        // Find the run_candle_persistence_consumer function
-        let consumer_start = source
-            .find("async fn run_candle_persistence_consumer")
-            .expect("run_candle_persistence_consumer must exist");
-        let consumer_body = &source[consumer_start..];
-        // Must contain IST offset addition near sweep_stale
-        assert!(
-            consumer_body.contains("IST_UTC_OFFSET_SECONDS"),
-            "cold-path candle consumer MUST add IST_UTC_OFFSET_SECONDS to UTC clock \
-             before calling sweep_stale(). Dhan timestamps are IST epoch seconds."
-        );
-    }
-
-    #[test]
-    fn test_candle_sweep_ist_vs_utc_math() {
-        // Prove the IST offset fix is correct:
-        // If candle.timestamp_secs = 1774356559 (IST epoch for 2026-03-24 12:49 IST)
-        // UTC now() = 1774356559 - 19800 = 1774336759
-        // Without fix: threshold = 1774336759 - 5 = 1774336754
-        //   candle (1774356559) > threshold (1774336754) → NOT stale → NEVER emitted
-        // With fix: now_ist = 1774336759 + 19800 = 1774356559
-        //   threshold = 1774356559 - 5 = 1774356554
-        //   candle (1774356559) > threshold (1774356554) → still active (correct, just created)
-        //   After 5+ seconds: candle (1774356559) < threshold (1774356564) → STALE → emitted ✓
-
-        let candle_ts_ist: u32 = 1_774_356_559; // IST epoch
-        let utc_now: i64 = candle_ts_ist as i64 - 19800; // UTC = IST - 5h30m
-        let stale_threshold_secs: u32 = 5;
-
-        // WITHOUT IST offset (the bug): UTC clock for sweep
-        let threshold_broken = (utc_now as u32).saturating_sub(stale_threshold_secs);
-        assert!(
-            candle_ts_ist > threshold_broken,
-            "BUG: candle is NEVER stale with UTC clock (candle={candle_ts_ist} > threshold={threshold_broken})"
-        );
-
-        // WITH IST offset (the fix): IST clock for sweep
-        let now_ist = (utc_now + 19800) as u32;
-        assert_eq!(
-            now_ist, candle_ts_ist,
-            "IST now should equal candle timestamp"
-        );
-
-        // After 6 seconds, candle should be stale
-        let now_ist_plus_6 = now_ist + 6;
-        let threshold_fixed = now_ist_plus_6.saturating_sub(stale_threshold_secs);
-        assert!(
-            candle_ts_ist < threshold_fixed,
-            "FIX: candle IS stale after 6s with IST clock (candle={candle_ts_ist} < threshold={threshold_fixed})"
-        );
-    }
-
-    // ===================================================================
     // MECHANICAL ENFORCEMENT: Timestamp consistency across all paths
     // ===================================================================
 
@@ -7780,15 +7489,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_live_candle_no_ist_offset() {
-        // Live candle writer uses IST epoch seconds directly (no offset).
-        let source = include_str!("../../storage/src/candle_persistence.rs");
-        assert!(
-            source.contains("compute_live_candle_nanos(timestamp_secs)"),
-            "live candles must use compute_live_candle_nanos (IST direct, no offset)"
-        );
-    }
+    // Candle-engine re-architecture #T1b: `test_live_candle_no_ist_offset`
+    // removed — Engine A (`LiveCandleWriter` / `compute_live_candle_nanos`
+    // → `candles_1s`) is deleted. Engine B's seal timestamps derive from
+    // `TfIndex::bucket_start(tick.exchange_timestamp)` (already IST epoch
+    // seconds, no offset) — covered by `aggregator_cell` + `seal_ring` tests.
 
     #[test]
     fn test_historical_candle_adds_ist_offset() {

@@ -45,10 +45,6 @@ name = "obi"
 harness = false
 
 [[bench]]
-name = "cascade_fanout"
-harness = false
-
-[[bench]]
 name = "bar_cache_lookup"
 harness = false
 

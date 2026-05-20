@@ -4,7 +4,11 @@
 //! # Flow
 //! `WebSocket Pool → mpsc::Receiver<Bytes> → dispatch_frame → ParsedTick`
 //! → junk filter (LTP > 0, valid timestamp) → `TickPersistenceWriter` → QuestDB
-//! → `CandleAggregator` → 1s OHLCV candles
+//!
+//! Candle aggregation is a SEPARATE concern handled off this hot path:
+//! the multi-TF aggregator (Engine B) subscribes to the tick broadcast.
+//! Candle-engine re-architecture #T1b deleted the legacy
+//! `candle_aggregator` module (Engine A — `candles_1s`).
 //!
 //! ## Movers retirement
 //!
@@ -15,7 +19,8 @@
 //! active snapshots are meaningless — there are only 4 instruments.
 
 pub mod boot_ordering_gate;
-pub mod candle_aggregator;
+// Candle-engine re-architecture #T1b: `candle_aggregator` (Engine A)
+// DELETED — Engine B (the multi-TF aggregator) is the only candle engine.
 // PR #4 (2026-05-19): `depth_sequence_tracker` module DELETED.
 pub mod first_seen_set;
 pub mod last_seen_ltt_cache;
@@ -30,7 +35,7 @@ pub mod tick_processor;
 pub mod volume_delta_tracker;
 pub mod volume_monotonicity_guard;
 
-pub use candle_aggregator::CandleAggregator;
+// Candle-engine re-architecture #T1b: `CandleAggregator` re-export retired.
 // PR #4 (2026-05-19): depth_sequence_tracker re-exports retired.
 pub use tick_gap_detector::{
     SharedTickGapDetector, TICK_GAP_COALESCE_WINDOW_SECS_DEFAULT, TICK_GAP_THRESHOLD_SECS_DEFAULT,

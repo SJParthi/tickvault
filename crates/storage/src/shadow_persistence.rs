@@ -207,6 +207,105 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
     .await;
 }
 
+// ---------------------------------------------------------------------------
+// #T1b — drop legacy candle objects (Engine A + Engine C teardown).
+//
+// The candle-engine re-architecture leaves ONLY Engine B (the 21-TF
+// in-memory aggregator flushing to plain `candles_<tf>` tables). Engine A
+// (`candles_1s` base table) and Engine C (the 9 `candles_<tf>` materialized
+// views + the 9 legacy `candles_<tf>_shadow` tables) are deleted.
+//
+// CRITICAL ORDERING: the 9 matviews are NAMED `candles_1m` … `candles_1d`.
+// Engine B's plain tables want those exact names. A matview named
+// `candles_1m` occupying that name makes `CREATE TABLE IF NOT EXISTS
+// candles_1m` a silent no-op. Therefore this MUST run at boot BEFORE
+// `ensure_shadow_candle_tables`. Matviews are dropped before their base
+// table (`candles_1s`) because a matview depends on its base.
+// ---------------------------------------------------------------------------
+
+/// The 9 legacy candle timeframe suffixes shared by the retired Engine-C
+/// materialized views (`candles_<sfx>`) and the retired Wave-6
+/// `candles_<sfx>_shadow` tables. These names are decoupled from
+/// `TfIndex::table_name()` on purpose — they are *legacy* objects that no
+/// longer correspond to any live timeframe enum.
+const LEGACY_CANDLE_TF_SUFFIXES: [&str; 9] =
+    ["1m", "5m", "15m", "30m", "1h", "2h", "3h", "4h", "1d"];
+
+/// Idempotently drop every legacy candle object: the 9 Engine-C
+/// materialized views, the `candles_1s` base table, and the 9 legacy
+/// `candles_<tf>_shadow` tables.
+///
+/// Drop order is load-bearing:
+/// 1. The 9 materialized views (`candles_1m` … `candles_1d`) — a matview
+///    must be dropped before its base table.
+/// 2. The `candles_1s` base table.
+/// 3. The 9 `candles_<tf>_shadow` tables.
+///
+/// Each statement is `DROP … IF EXISTS`, so this is safe to call on every
+/// boot regardless of which objects actually exist. Failures are logged at
+/// `error!` level (Telegram-routable per `error_level_meta_guard.rs`
+/// Rule 5) but do NOT block boot.
+///
+/// MUST be awaited at boot BEFORE `ensure_shadow_candle_tables` so that the
+/// `candles_1m` … `candles_1d` names are free for Engine B's plain tables.
+///
+/// Requires a running QuestDB; boot wiring lives in `crates/app/src/main.rs`
+/// immediately before the `ensure_shadow_candle_tables` call.
+// WIRING-EXEMPT: boot wiring lives in crates/app/src/main.rs before ensure_shadow_candle_tables; integration-covered by CI boot + `make doctor`.
+pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
+        .build()
+        .unwrap_or_else(|_| Client::new());
+
+    // 1. Drop the 9 Engine-C materialized views FIRST — before the base
+    //    table they cascade from.
+    for sfx in LEGACY_CANDLE_TF_SUFFIXES {
+        let view = format!("candles_{sfx}");
+        let ddl = format!("DROP MATERIALIZED VIEW IF EXISTS {view};");
+        run_drop_ddl(&client, &base_url, &view, &ddl).await;
+    }
+
+    // 2. Drop the Engine-A `candles_1s` base table.
+    run_drop_ddl(
+        &client,
+        &base_url,
+        "candles_1s",
+        "DROP TABLE IF EXISTS candles_1s;",
+    )
+    .await;
+
+    // 3. Drop the 9 legacy Wave-6 `candles_<tf>_shadow` tables.
+    for sfx in LEGACY_CANDLE_TF_SUFFIXES {
+        let table = format!("candles_{sfx}_shadow");
+        let ddl = format!("DROP TABLE IF EXISTS {table};");
+        run_drop_ddl(&client, &base_url, &table, &ddl).await;
+    }
+}
+
+/// Issue one DROP DDL statement to QuestDB's `/exec` endpoint.
+///
+/// Same GET-based transport as [`run_ddl`]. A non-2xx response is logged
+/// at `warn!` (a missing object on a fresh deploy is benign because the
+/// statement is `IF EXISTS`); a transport error is logged at `error!`.
+async fn run_drop_ddl(client: &Client, base_url: &str, object: &str, ddl: &str) {
+    match client.get(base_url).query(&[("query", ddl)]).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            info!(object, "legacy candle object dropped (or already absent)");
+        }
+        Ok(resp) => {
+            warn!(object, status = %resp.status(), "legacy candle DROP non-2xx");
+        }
+        Err(err) => {
+            error!(object, ?err, "legacy candle DROP request failed");
+        }
+    }
+}
+
 /// Issue one DDL statement to QuestDB's `/exec` endpoint.
 ///
 /// QuestDB's `/exec` endpoint is **GET-only** — it returns
@@ -307,6 +406,42 @@ mod tests {
         assert!(DEDUP_KEY_AGGREGATOR_SEAL_AUDIT.contains("timeframe"));
         assert!(DEDUP_KEY_AGGREGATOR_SEAL_AUDIT.contains("candle_ts"));
         assert!(DEDUP_KEY_AGGREGATOR_SEAL_AUDIT.contains("trading_date_ist"));
+    }
+
+    #[test]
+    fn test_legacy_candle_tf_suffixes_has_nine_entries() {
+        // The 9 legacy Engine-C timeframes (1m..1d) — distinct from the
+        // 21 live TFs of Engine B.
+        assert_eq!(LEGACY_CANDLE_TF_SUFFIXES.len(), 9);
+        let mut seen = std::collections::HashSet::new();
+        for sfx in LEGACY_CANDLE_TF_SUFFIXES {
+            assert!(seen.insert(sfx), "duplicate legacy suffix: {sfx}");
+        }
+    }
+
+    #[test]
+    fn test_legacy_candle_tf_suffixes_are_canonical() {
+        assert_eq!(
+            LEGACY_CANDLE_TF_SUFFIXES,
+            ["1m", "5m", "15m", "30m", "1h", "2h", "3h", "4h", "1d"]
+        );
+    }
+
+    #[test]
+    fn test_legacy_drop_targets_do_not_collide_with_engine_b_tables() {
+        // Engine B's plain `candles_1s_shadow`-free tables must NOT be in
+        // the legacy shadow-drop set — only the 9 retired `_shadow`
+        // tables. The 9 matview names (`candles_1m` etc.) DO collide with
+        // Engine B plain tables by design — that collision is exactly why
+        // the matviews must be dropped first.
+        let engine_b = candle_table_names();
+        for sfx in LEGACY_CANDLE_TF_SUFFIXES {
+            let shadow = format!("candles_{sfx}_shadow");
+            assert!(
+                !engine_b.contains(&shadow.as_str()),
+                "legacy shadow table {shadow} must not be an Engine B table"
+            );
+        }
     }
 
     #[test]

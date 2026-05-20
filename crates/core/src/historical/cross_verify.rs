@@ -13,7 +13,7 @@
 //!
 //! # Historical vs Live Cross-Match
 //! After post-market re-fetch, compares `historical_candles` (Dhan REST API)
-//! against materialized views (`candles_1m`, `candles_5m`, etc.) from live
+//! against the plain candle tables (`candles_1m`, `candles_5m`, etc.) from live
 //! WebSocket ticks. Detects missed ticks, price drift, and data gaps.
 //!
 //! # Automation
@@ -75,7 +75,7 @@ pub struct FieldDelta {
     pub field: String,
     /// Value from Dhan REST historical fetch.
     pub hist: f64,
-    /// Value from live WebSocket-sourced materialized view.
+    /// Value from the live WebSocket-sourced candle table.
     pub live: f64,
     /// `live - hist`. Positive = live exceeds historical.
     pub delta: f64,
@@ -84,7 +84,7 @@ pub struct FieldDelta {
     pub is_integer: bool,
 }
 
-/// A single candle mismatch between historical API data and live materialized view.
+/// A single candle mismatch between historical API data and the live candle table.
 #[derive(Debug, Clone)]
 pub struct CrossMatchMismatch {
     /// Human-readable symbol (e.g., "RELIANCE").
@@ -138,7 +138,7 @@ pub struct CrossMatchReport {
     pub per_timeframe_mismatches: Vec<(String, usize)>,
     /// Whether the cross-match passed (mismatches within tolerance).
     pub passed: bool,
-    /// True if at least one live materialized view contains rows in the
+    /// True if at least one live candle table contains rows in the
     /// last 3 days. When `false`, the cross-match is meaningless —
     /// the `candles_compared` counter comes from a `LEFT JOIN` that
     /// preserves historical rows even when the live side is empty, so
@@ -264,7 +264,7 @@ const CROSS_MATCH_VOLUME_TOLERANCE_PCT: f64 = 0.0;
 /// EXACT MATCHING: zero tolerance. Any OI difference flags as mismatch.
 const CROSS_MATCH_OI_TOLERANCE_PCT: f64 = 0.0;
 
-/// Mapping from historical timeframe labels to materialized view table names.
+/// Mapping from historical timeframe labels to plain candle table names.
 const CROSS_MATCH_TIMEFRAMES: &[(&str, &str)] = &[
     ("1m", "candles_1m"),
     ("5m", "candles_5m"),
@@ -1443,7 +1443,7 @@ pub async fn verify_candle_integrity(
 // Historical vs Live Cross-Match
 // ---------------------------------------------------------------------------
 
-/// Compares historical candle data (Dhan REST API) against live materialized
+/// Compares historical candle data (Dhan REST API) against the live plain candle table
 /// views (WebSocket ticks) for the same instruments and timestamps.
 ///
 /// Detects:
@@ -1551,10 +1551,10 @@ pub async fn cross_match_historical_vs_live(
     let scope_plain = CROSS_MATCH_SCOPE_SQL;
 
     for &(hist_tf, live_table) in CROSS_MATCH_TIMEFRAMES {
-        // M2: Check if the materialized view exists before JOINing.
+        // M2: Check if the candle table exists before JOINing.
         // SAFETY: live_table is from CROSS_MATCH_TIMEFRAMES constants, not user input.
         // Use SHOW COLUMNS instead of tables() because QuestDB's tables() does NOT
-        // include materialized views — only base tables. SHOW COLUMNS works for both.
+        // include all tables uniformly; SHOW COLUMNS works for plain tables.
         let view_probe_query = format!("SHOW COLUMNS FROM {}", live_table);
         let view_exists = match client
             .get(&base_url)
@@ -1569,7 +1569,7 @@ pub async fn cross_match_historical_vs_live(
             warn!(
                 live_table,
                 timeframe = hist_tf,
-                "materialized view table does not exist — skipping cross-match for this timeframe"
+                "candle table does not exist — skipping cross-match for this timeframe"
             );
             missing_views.push(live_table.to_string());
             continue;
