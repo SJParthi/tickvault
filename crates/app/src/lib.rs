@@ -46,6 +46,5 @@ pub mod prev_oi_loader;
 // table on cold boot.
 pub mod metrics_catalog;
 pub mod observability;
-pub mod prev_day_cache_loader;
 pub mod subsystem_memory;
 pub mod trading_pipeline;

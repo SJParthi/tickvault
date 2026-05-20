@@ -65,20 +65,13 @@ use tickvault_core::websocket::connection_pool::WebSocketConnectionPool;
 use tickvault_core::websocket::order_update_connection::run_order_update_connection;
 use tickvault_core::websocket::types::{InstrumentSubscription, WebSocketError};
 
-use tickvault_storage::calendar_persistence;
 use tickvault_storage::candle_persistence::{
     CandlePersistenceWriter, ensure_candle_table_dedup_keys,
 };
 // PR #3 (2026-05-19): `greeks_persistence` retired. Migration SQL
 // `scripts/migrate-drop-greeks-tables.sql` drops the option_greeks /
 // pcr_snapshots / dhan_option_chain_raw / greeks_verification tables.
-use tickvault_storage::instrument_persistence::{
-    ensure_instrument_tables, persist_instrument_snapshot,
-};
-use tickvault_storage::tick_persistence::{
-    DepthPersistenceWriter, TickPersistenceWriter, ensure_depth_and_prev_close_tables,
-    ensure_tick_table_dedup_keys,
-};
+use tickvault_storage::tick_persistence::{TickPersistenceWriter, ensure_tick_table_dedup_keys};
 
 // PR #3 (2026-05-19): `InlineGreeksComputer` retired alongside the
 // trading::greeks module. `build_inline_greeks_enricher` below now
@@ -99,157 +92,9 @@ use tickvault_api::state::{SharedAppState, SharedHealthStatus, SystemHealthStatu
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Wave 3-C Item 12 — idempotency probe for the once-per-trading-day
-/// market-open self-test. Queries `selftest_audit` for a row with
-/// today's `trading_date_ist` AND `check_name='market-open-self-test'`.
-/// Returns `Ok(true)` when such a row exists (skip the Telegram
-/// notification path; UPSERT the audit row anyway). Used by the
-/// scheduler block in `main()` to defend against rapid restarts that
-/// would otherwise spawn two schedulers both firing at 09:16:00.
-///
-/// Adversarial review (general-purpose Class B+H, 2026-04-28).
-async fn probe_selftest_already_fired_today(
-    qcfg: &tickvault_common::config::QuestDbConfig,
-) -> anyhow::Result<bool> {
-    use chrono::Utc;
-    use std::time::Duration;
-    /// Timeout for the once-per-day idempotency pre-check against
-    /// `selftest_audit`. Mirrors the 5-second deadline used by the
-    /// boot-time QuestDB liveness probe in this same file. Local
-    /// (not in `constants.rs`) because it's specific to this helper.
-    const SELFTEST_PROBE_TIMEOUT_SECS: u64 = 5;
-    let base_url = format!("http://{}:{}/exec", qcfg.host, qcfg.http_port);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(SELFTEST_PROBE_TIMEOUT_SECS))
-        .build()?;
-    let now_ist_nanos = Utc::now()
-        .timestamp_nanos_opt()
-        .unwrap_or(0)
-        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
-    let trading_date_ist = now_ist_nanos - now_ist_nanos.rem_euclid(86_400_000_000_000);
-    let sql = format!(
-        "SELECT count(*) AS n FROM selftest_audit \
-         WHERE trading_date_ist = {trading_date_ist} \
-           AND check_name = 'market-open-self-test';"
-    );
-    let resp = client
-        .get(&base_url)
-        .query(&[("query", sql.as_str())])
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("selftest pre-check non-2xx: {}", resp.status());
-    }
-    let body = resp.text().await?;
-    // QuestDB JSON: dataset is `[[N]]` where N >= 1 means already fired.
-    Ok(body.contains("[[1]]") || body.contains("[[2]]") || body.contains("[[3]]"))
-}
-
-// ---------------------------------------------------------------------------
-// Phase 0 Item 18c — static IP audit row helper
-// ---------------------------------------------------------------------------
-
-/// Writes one row to the `static_ip_audit` QuestDB table capturing the
-/// final outcome of the boot-time Dhan static IP gate.
-///
-/// Best-effort: a failure here NEVER halts boot. The Pass/Fail
-/// decision is already routed to Telegram via `NotificationService`
-/// and to Loki via the structured `error!`/`info!` log; the audit
-/// row is the SQL-queryable forensic trail for SEBI's 5-year window.
-// TEST-EXEMPT: thin async wrapper over the storage helper; the
-// storage helper itself + its tests pin the SQL shape.
-async fn write_static_ip_audit_row(
-    questdb_config: &tickvault_common::config::QuestDbConfig,
-    outcome: tickvault_storage::static_ip_audit_persistence::StaticIpAuditOutcome,
-    reason: &str,
-    ip_flag: &str,
-    ip_match_status: &str,
-    attempts_made: u32,
-    orders_allowed: bool,
-) {
-    let now_ist_nanos = chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .unwrap_or(0)
-        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
-    // Truncate today's IST nanos to IST midnight for trading_date_ist
-    // — matches the pattern selftest/boot audit writers use.
-    let trading_date_ist = now_ist_nanos - now_ist_nanos.rem_euclid(86_400_000_000_000);
-    let attempts_i64 = i64::from(attempts_made);
-    if let Err(e) = tickvault_storage::static_ip_audit_persistence::append_static_ip_audit_row(
-        questdb_config,
-        now_ist_nanos,
-        trading_date_ist,
-        outcome,
-        reason,
-        ip_flag,
-        ip_match_status,
-        attempts_i64,
-        orders_allowed,
-    )
-    .await
-    {
-        // Audit-write failure is observable but non-fatal: the Pass /
-        // Fail decision has already been delivered via Telegram + Loki.
-        tracing::warn!(
-            error = ?e,
-            outcome = outcome.as_str(),
-            "static_ip_audit row write failed (boot continues — Telegram/Loki already carry the outcome)"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Phase 0 Item 19e — live_instance_lock audit row helper
-// ---------------------------------------------------------------------------
-
-/// Writes one row to the `live_instance_lock` QuestDB table capturing
-/// a lock-lifecycle event (Acquired / AlreadyHeld / ValkeyError at
-/// boot; LostOwnership / GracefulRelease wired in Item 19f).
-///
-/// Best-effort: a failure here NEVER halts boot. The
-/// Acquire/Halt decision is already routed to Telegram via
-/// `NotificationService` and to Loki via the structured `info!` /
-/// `error!` log; the audit row is the SQL-queryable forensic trail
-/// for SEBI's 5-year window.
-// TEST-EXEMPT: thin async wrapper over the storage helper; the
-// storage helper itself + its tests pin the SQL shape.
-// APPROVED: 7 wire-format fields plus QuestDB config — same shape as sibling audit-row writers (static_ip_audit, boot_audit).
-#[allow(clippy::too_many_arguments)]
-async fn write_live_instance_lock_row(
-    questdb_config: &tickvault_common::config::QuestDbConfig,
-    outcome: tickvault_storage::live_instance_lock_persistence::LiveInstanceLockOutcome,
-    host_id: &str,
-    peer_holder: &str,
-    env: &str,
-    lock_key: &str,
-    error_detail: &str,
-) {
-    let now_ist_nanos = chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .unwrap_or(0)
-        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
-    let trading_date_ist = now_ist_nanos - now_ist_nanos.rem_euclid(86_400_000_000_000);
-    if let Err(e) =
-        tickvault_storage::live_instance_lock_persistence::append_live_instance_lock_row(
-            questdb_config,
-            now_ist_nanos,
-            trading_date_ist,
-            outcome,
-            host_id,
-            peer_holder,
-            env,
-            lock_key,
-            error_detail,
-        )
-        .await
-    {
-        tracing::warn!(
-            error = ?e,
-            outcome = outcome.as_str(),
-            "live_instance_lock row write failed (boot continues — Telegram/Loki already carry the outcome)"
-        );
-    }
-}
+// #T2b (2026-05-20): probe_selftest_already_fired_today removed — it
+// SELECTed the deleted selftest_audit table for once-a-day dedup. The
+// market-open self-test scheduler now relies on its own timing.
 
 // ---------------------------------------------------------------------------
 // Main
@@ -348,60 +193,8 @@ async fn main() -> Result<()> {
         tracing::warn!("global QuestDbConfig already installed — skipping");
     }
 
-    // Wave 2 Item 9 (AUDIT-05) — periodic selftest audit task. Every
-    // 15 minutes during the trading session, persist a row recording
-    // whether the QuestDB readiness probe succeeded. The body of the
-    // check is the same `wait_for_questdb_ready` call (1s deadline) —
-    // a fast liveness probe, not a full validate-automation run.
-    {
-        const SELFTEST_AUDIT_INTERVAL_SECS: u64 = 900;
-        let qcfg = config.questdb.clone();
-        tokio::spawn(async move {
-            let mut ticker =
-                tokio::time::interval(std::time::Duration::from_secs(SELFTEST_AUDIT_INTERVAL_SECS));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // Skip the first immediate fire — we already probed at boot.
-            ticker.tick().await;
-            loop {
-                ticker.tick().await;
-                let started = std::time::Instant::now();
-                let outcome =
-                    match tickvault_storage::boot_probe::wait_for_questdb_ready(&qcfg, 5).await {
-                        Ok(_) => "green",
-                        Err(_) => "red",
-                    };
-                let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
-                let now_ist_nanos = chrono::Utc::now()
-                    .timestamp_nanos_opt()
-                    .unwrap_or(0)
-                    .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
-                // Truncate today's IST nanos to start of day for trading_date_ist.
-                let trading_date_ist =
-                    now_ist_nanos - (now_ist_nanos.rem_euclid(86_400_000_000_000));
-                if let Err(e) =
-                    tickvault_storage::selftest_audit_persistence::append_selftest_audit_row(
-                        &qcfg,
-                        now_ist_nanos,
-                        trading_date_ist,
-                        "questdb-liveness",
-                        outcome,
-                        duration_ms,
-                        "periodic 15-min liveness probe",
-                    )
-                    .await
-                {
-                    tracing::error!(
-                        error = ?e,
-                        code = tickvault_common::error_code::ErrorCode::Audit05SelftestWriteFailed
-                            .code_str(),
-                        "AUDIT-05 selftest audit row write failed"
-                    );
-                    metrics::counter!("tv_audit_write_failures_total", "table" => "selftest_audit")
-                        .increment(1);
-                }
-            }
-        });
-    }
+    // #T2b (2026-05-20): the periodic 15-min selftest-audit task was
+    // removed with the selftest_audit table (QuestDB table cleanup).
 
     // Wave 2 Item 8 (G4) — install the global tick-gap detector and
     // spawn the 60s coalescing task. Recorded ticks live in a papaya
@@ -1430,18 +1223,11 @@ async fn main() -> Result<()> {
                     &config.questdb,
                 ),
             );
-            let fast_depth_writer = Some(
-                tickvault_storage::tick_persistence::DepthPersistenceWriter::new_disconnected(
-                    &config.questdb,
-                ),
-            );
-
             let _ = fast_registry; // PR #2: instrument_registry was used by deleted movers persistence helpers
             let handle = tokio::spawn(async move {
                 run_tick_processor(
                     receiver,
                     fast_tick_writer,
-                    fast_depth_writer,
                     tick_broadcast_for_processor,
                     greeks_enricher,
                     Some(fast_tick_heartbeat),
@@ -1547,43 +1333,16 @@ async fn main() -> Result<()> {
                     .await;
                 tokio::join!(
                     ensure_tick_table_dedup_keys(&config.questdb),
-                    ensure_depth_and_prev_close_tables(&config.questdb),
-                    ensure_instrument_tables(&config.questdb),
                     ensure_candle_table_dedup_keys(&config.questdb),
-                    calendar_persistence::ensure_calendar_table(&config.questdb),
-                    tickvault_storage::constituency_persistence::ensure_constituency_table(
-                        &config.questdb
-                    ),
                     tickvault_storage::shadow_persistence::ensure_shadow_candle_tables(
                         &config.questdb
                     ),
                     // Candle-engine re-architecture #T1b: `ensure_candle_views`
                     // (Engine C matview cascade) RETIRED.
                     // PR #3 (2026-05-19): `ensure_greeks_tables` retired.
+                    // #T4 (2026-05-20): `ensure_depth_and_prev_close_tables`
+                    // + `calendar_persistence` retired.
                 );
-                // Persist trading calendar to QuestDB (best-effort, non-blocking).
-                // Gap 5: log on failure instead of silent drop.
-                if let Err(err) =
-                    calendar_persistence::persist_calendar(&trading_calendar, &config.questdb)
-                {
-                    warn!(
-                        ?err,
-                        "calendar persistence failed (non-critical, best-effort)"
-                    );
-                }
-
-                // Re-persist instrument data ONLY for CachedPlan path.
-                // FreshBuild already persisted inside load_or_build_instruments.
-                // Double-persist creates duplicate rows in QuestDB snapshot tables.
-                if _needs_persist
-                    && let Some(ref universe) = fresh_universe
-                    && let Err(err) = persist_instrument_snapshot(universe, &config.questdb).await
-                {
-                    warn!(
-                        ?err,
-                        "instrument snapshot persistence failed (non-critical)"
-                    );
-                }
 
                 info!("QuestDB DDL complete (background)");
             },
@@ -2100,15 +1859,6 @@ async fn main() -> Result<()> {
     let instance_lock_handle: Option<tokio::task::JoinHandle<()>> = if trading_mode.is_live() {
         info!("Phase 0 Item 19: acquiring dual-instance Valkey lock");
 
-        // Phase 0 Item 19e — ensure the audit table exists BEFORE
-        // the lifecycle event INSERTs below. Idempotent CREATE TABLE
-        // IF NOT EXISTS; failures log inside the helper and do NOT
-        // halt boot.
-        tickvault_storage::live_instance_lock_persistence::ensure_live_instance_lock_table(
-            &config.questdb,
-        )
-        .await;
-
         // SSM is the only authorized source for the Valkey password
         // per rust-code.md. The boot-time fetch hard-fails on any SSM
         // error — running with no Valkey AUTH would let an attacker
@@ -2158,20 +1908,6 @@ async fn main() -> Result<()> {
                         lock_key: lock_key_for_audit.clone(),
                     },
                 );
-                // Phase 0 Item 19e — persist the boot-halt outcome.
-                // host_id is unavailable at this site (it's derived
-                // after the pool builds), so the audit row uses an
-                // empty host_id; the error_detail captures the cause.
-                write_live_instance_lock_row(
-                    &config.questdb,
-                    tickvault_storage::live_instance_lock_persistence::LiveInstanceLockOutcome::ValkeyError,
-                    "",
-                    "",
-                    &env_for_audit,
-                    &lock_key_for_audit,
-                    &format!("valkey-pool-build-error: {err}"),
-                )
-                .await;
                 return Ok(());
             }
         };
@@ -2207,17 +1943,6 @@ async fn main() -> Result<()> {
                     ttl_secs = tickvault_core::instance_lock::INSTANCE_LOCK_TTL_SECS,
                     "Phase 0 Item 19: dual-instance lock acquired"
                 );
-                // Phase 0 Item 19e — persist Acquired outcome.
-                write_live_instance_lock_row(
-                    &config.questdb,
-                    tickvault_storage::live_instance_lock_persistence::LiveInstanceLockOutcome::Acquired,
-                    &host_id,
-                    "",
-                    &env,
-                    &lock_key,
-                    "",
-                )
-                .await;
             }
             Ok(tickvault_core::instance_lock::AcquireOutcome::AlreadyHeld { holder }) => {
                 error!(
@@ -2232,21 +1957,6 @@ async fn main() -> Result<()> {
                     peer = %holder,
                     "Phase 0 Item 19: another tickvault process holds the lock — BLOCKING BOOT"
                 );
-                // Phase 0 Item 19e — persist the AlreadyHeld outcome
-                // BEFORE the Telegram + return so the audit row exists
-                // even if the notifier path errors. Clone host_id /
-                // env / lock_key for the audit (the values flow into
-                // the notifier afterwards by move).
-                write_live_instance_lock_row(
-                    &config.questdb,
-                    tickvault_storage::live_instance_lock_persistence::LiveInstanceLockOutcome::AlreadyHeld,
-                    &host_id,
-                    &holder,
-                    &env,
-                    &lock_key,
-                    "",
-                )
-                .await;
                 notifier.notify(
                     tickvault_core::notification::events::NotificationEvent::DualInstanceDetected {
                         holder,
@@ -2271,17 +1981,6 @@ async fn main() -> Result<()> {
                     lock_key = %lock_key,
                     "Phase 0 Item 19: Valkey acquire-attempt failed — BLOCKING BOOT"
                 );
-                // Phase 0 Item 19e — persist the ValkeyError outcome.
-                write_live_instance_lock_row(
-                    &config.questdb,
-                    tickvault_storage::live_instance_lock_persistence::LiveInstanceLockOutcome::ValkeyError,
-                    &host_id,
-                    "",
-                    &env,
-                    &lock_key,
-                    &format!("valkey-acquire-error: {err}"),
-                )
-                .await;
                 notifier.notify(
                     tickvault_core::notification::events::NotificationEvent::DualInstanceDetected {
                         holder: format!("(valkey-error: {err})"),
@@ -2305,8 +2004,6 @@ async fn main() -> Result<()> {
             valkey_pool,
             env,
             host_id,
-            lock_key,
-            config.questdb.clone(),
             heartbeat_shutdown_inner,
         );
         instance_lock_shutdown_chain = Some(heartbeat_shutdown_for_chain);
@@ -2350,13 +2047,6 @@ async fn main() -> Result<()> {
             interval_secs = tickvault_common::constants::STATIC_IP_BOOT_RETRY_INTERVAL_SECS,
             "Phase 0 Item 18+18b: verifying Dhan-side static IP whitelist (/v2/ip/getIP)"
         );
-        // Phase 0 Item 18c — ensure the audit table exists BEFORE the
-        // Pass/Fail row writes below. Idempotent CREATE TABLE IF NOT
-        // EXISTS; failures log inside the helper and do NOT halt boot.
-        tickvault_storage::static_ip_audit_persistence::ensure_static_ip_audit_table(
-            &config.questdb,
-        )
-        .await;
         let access_token = {
             use secrecy::ExposeSecret;
             let guard = token_manager.token_handle().load();
@@ -2379,16 +2069,6 @@ async fn main() -> Result<()> {
                         ip_match_status: String::new(),
                         attempts_made: 1,
                     });
-                    write_static_ip_audit_row(
-                        &config.questdb,
-                        tickvault_storage::static_ip_audit_persistence::StaticIpAuditOutcome::Fail,
-                        "empty_response",
-                        "",
-                        "",
-                        1,
-                        false,
-                    )
-                    .await;
                     return Ok(());
                 }
             }
@@ -2440,26 +2120,9 @@ async fn main() -> Result<()> {
                             Ok(resp) => resp.ip_flag,
                             Err(_) => String::new(),
                         };
-                    let ip_match_status =
-                        match ip_verifier::get_ip(&config.dhan.rest_api_base_url, &access_token)
-                            .await
-                        {
-                            Ok(resp) => resp.ip_match_status,
-                            Err(_) => String::new(),
-                        };
                     notifier.notify(NotificationEvent::StaticIpBootCheckPassed {
                         ip_flag: ip_flag.clone(),
                     });
-                    write_static_ip_audit_row(
-                        &config.questdb,
-                        tickvault_storage::static_ip_audit_persistence::StaticIpAuditOutcome::Pass,
-                        "",
-                        &ip_flag,
-                        &ip_match_status,
-                        attempts_made,
-                        true,
-                    )
-                    .await;
                     break None;
                 }
                 ip_verifier::StaticIpBootRetryAction::Retry { next_attempt } => {
@@ -2494,7 +2157,7 @@ async fn main() -> Result<()> {
             // payload + audit row. If this also fails the operator
             // still sees the typed reason which is the actionable
             // signal.
-            let (orders_allowed, ip_match_status, ip_flag) =
+            let (orders_allowed, ip_match_status, _ip_flag) =
                 match ip_verifier::get_ip(&config.dhan.rest_api_base_url, &access_token).await {
                     Ok(resp) => (resp.orders_allowed, resp.ip_match_status, resp.ip_flag),
                     Err(_) => (false, String::new(), String::new()),
@@ -2502,19 +2165,9 @@ async fn main() -> Result<()> {
             notifier.notify(NotificationEvent::StaticIpBootCheckFailed {
                 reason: reason_label.to_string(),
                 orders_allowed,
-                ip_match_status: ip_match_status.clone(),
+                ip_match_status,
                 attempts_made,
             });
-            write_static_ip_audit_row(
-                &config.questdb,
-                tickvault_storage::static_ip_audit_persistence::StaticIpAuditOutcome::Fail,
-                reason_label,
-                &ip_flag,
-                &ip_match_status,
-                attempts_made,
-                orders_allowed,
-            )
-            .await;
             return Ok(());
         }
     } else {
@@ -2528,16 +2181,14 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 6b: Set up QuestDB tick persistence (best-effort)
     // -----------------------------------------------------------------------
-    info!(
-        "setting up QuestDB tables (ticks + instruments + depth + previous_close + historical_candles + materialized views + greeks)"
-    );
+    info!("setting up QuestDB tables (ticks + candles + option_chain + historical_candles)");
 
     // Wave 2 Item 7 (G14) — block until QuestDB is reachable. Escalating
     // logs at +5/+10/+20s; BOOT-01 ERROR @+30s; BOOT-02 HALT @+60s.
     // Prevents the legacy "tick processor starts before QuestDB is up"
     // race that dropped early-boot ticks before this gate existed.
-    let probe_started = std::time::Instant::now();
-    let boot_id = format!(
+    let _probe_started = std::time::Instant::now();
+    let _boot_id = format!(
         "boot-{}",
         chrono::Utc::now()
             .with_timezone(&tickvault_common::trading_calendar::ist_offset())
@@ -2628,11 +2279,7 @@ async fn main() -> Result<()> {
     // every clean boot until 2026-04-28.
     tokio::join!(
         ensure_tick_table_dedup_keys(&config.questdb),
-        ensure_depth_and_prev_close_tables(&config.questdb),
-        ensure_instrument_tables(&config.questdb),
         ensure_candle_table_dedup_keys(&config.questdb),
-        calendar_persistence::ensure_calendar_table(&config.questdb),
-        tickvault_storage::constituency_persistence::ensure_constituency_table(&config.questdb),
         // Candle-engine re-architecture #T1b: `ensure_candle_views`
         // (Engine C — `candles_1s` matview cascade) RETIRED. The 21
         // plain `candles_<tf>` tables are created by
@@ -2640,64 +2287,17 @@ async fn main() -> Result<()> {
         // dropped by `drop_legacy_candle_objects` before this join.
         // PR #3 (2026-05-19): `ensure_greeks_tables` retired alongside
         // the deleted greeks_persistence module.
-        tickvault_storage::indicator_snapshot_persistence::ensure_indicator_snapshot_table(
-            &config.questdb
-        ),
         // PR #4 (2026-05-19): `ensure_deep_depth_table` retired alongside
         // the deleted depth-20/200 pipelines (operator lock 2026-05-15).
-        tickvault_storage::obi_persistence::ensure_obi_table(&config.questdb),
-        // Wave 1 Item 4.2 — un-deprecated previous_close table. Schema
-        // includes the new `source` column (CODE6 / QUOTE_CLOSE /
-        // FULL_CLOSE) and idempotent ALTER ADD COLUMN IF NOT EXISTS so
-        // existing deployments auto-migrate.
-        tickvault_storage::previous_close_persistence::ensure_previous_close_table(&config.questdb,),
-        // Wave 2 Item 9 (G18) — audit-trail tables. SEBI-relevant.
-        // 90d hot → S3 IT → Glacier per `aws-budget.md`.
-        // PR #5 (2026-05-19): phase2_audit table retired alongside the
-        // deleted Phase 2 stock-F&O dispatcher (operator lock 2026-05-15).
-        // PR #4 (2026-05-19): depth_rebalance_audit + depth_dynamic_diff_audit
-        // tables retired alongside the deleted depth-20/200 pipelines.
-        tickvault_storage::ws_reconnect_audit_persistence::ensure_ws_reconnect_audit_table(
-            &config.questdb
-        ),
-        // Phase 0 Item 17b (2026-05-15) — SEBI 24h JWT renewal audit
-        // table. TokenManager writes one row per renewal lifecycle
-        // event via the process-wide `global_questdb_config()`. DDL
-        // is idempotent CREATE TABLE IF NOT EXISTS.
-        tickvault_storage::auth_renewal_audit_persistence::ensure_auth_renewal_audit_table(
-            &config.questdb
-        ),
-        tickvault_storage::boot_audit_persistence::ensure_boot_audit_table(&config.questdb),
-        tickvault_storage::selftest_audit_persistence::ensure_selftest_audit_table(&config.questdb),
-        tickvault_storage::order_audit_persistence::ensure_order_audit_table(&config.questdb),
-        // Phase 0 Item 8+9 (PR-D5, 2026-05-17) — gap_fill_audit forensic
-        // table. PR-D4 began writing rows via `append_gap_fill_audit_row`
-        // but the DDL helper was previously not wired; first INSERT would
-        // fail until this table existed. Same 90d-hot → S3 IT → Glacier
-        // lifecycle as the other audit tables. Idempotent CREATE TABLE
-        // IF NOT EXISTS — safe to call every boot.
-        tickvault_storage::gap_fill_audit_persistence::ensure_gap_fill_audit_table(
-            &config.questdb
-        ),
-        // Phase 0 Item 12 — `last_tick_audit` forensic table. Captures
-        // per-SID last-tick exchange_ts at each minute seal so the
-        // operator can answer "what was the last tick BANKNIFTY received
-        // before the 09:34 seal?" in one SQL query. SEBI-relevant; same
-        // 90d-hot → S3 IT → Glacier lifecycle as the other audit tables.
-        // Idempotent CREATE TABLE IF NOT EXISTS.
-        tickvault_storage::last_tick_audit_persistence::ensure_last_tick_audit_table(
-            &config.questdb
-        ),
-        // Phase 0 Item 20 (2026-05-18) — `orphan_position_audit` forensic
-        // table. The watchdog evaluator + Telegram variants ship today
-        // (dry-run scaffolding); the Phase 1+ runtime spawner will use
-        // this DDL once the OMS API client is wired into boot. Idempotent
-        // CREATE TABLE IF NOT EXISTS — safe to call every boot. DEDUP key
-        // `(trading_date_ist, security_id, exchange_segment, ts)` per
-        // I-P1-11 composite identity rule.
-        tickvault_storage::orphan_position_audit_persistence::ensure_orphan_position_audit_table(
-            &config.questdb
-        ),
+        // #T4 (2026-05-20): `ensure_depth_and_prev_close_tables`,
+        // `calendar_persistence`, `indicator_snapshot_persistence`,
+        // `obi_persistence`, `previous_close_persistence` ensure_* calls
+        // retired — market_depth / nse_holidays / indicator_snapshots /
+        // obi_snapshots / previous_close tables dropped.
+        // #T2b (2026-05-20): the 8 audit-table ensure_* calls
+        // (ws_reconnect / auth_renewal / boot / selftest / order /
+        // gap_fill / last_tick / orphan_position) were removed with
+        // their persistence modules in the QuestDB table cleanup.
         // Option-chain minute-snapshot pipeline (2026-05-16, PR #2 of 5).
         // Forensic table for the 3-times-per-minute Dhan option chain
         // fetches that feed BRUTEX strike-selection. One row per
@@ -2793,45 +2393,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Wave 2 Item 9 — boot audit row for the QuestDB readiness step.
-    // Must run AFTER the `tokio::join!` above so `ensure_boot_audit_table`
-    // has created the table. Writing this row before the join was the cause
-    // of AUDIT-04 firing on every clean boot until 2026-04-28.
-    // Best-effort: failures don't halt boot — the AUDIT-04 ErrorCode +
-    // tracing::error! covers regression.
-    {
-        let now_nanos = chrono::Utc::now()
-            .timestamp_nanos_opt()
-            .unwrap_or(0)
-            .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
-        if let Err(e) = tickvault_storage::boot_audit_persistence::append_boot_audit_row(
-            &config.questdb,
-            now_nanos,
-            &boot_id,
-            "questdb_ready",
-            "ok",
-            i64::try_from(probe_started.elapsed().as_millis()).unwrap_or(i64::MAX),
-            "QuestDB readiness probe succeeded",
-        )
-        .await
-        {
-            tracing::error!(
-                error = ?e,
-                code = tickvault_common::error_code::ErrorCode::Audit04BootWriteFailed.code_str(),
-                "AUDIT-04 boot audit row write failed — continuing"
-            );
-            metrics::counter!("tv_audit_write_failures_total", "table" => "boot_audit")
-                .increment(1);
-        }
-    }
-
-    // Persist trading calendar to QuestDB (best-effort, non-blocking).
-    if let Err(err) = calendar_persistence::persist_calendar(&trading_calendar, &config.questdb) {
-        warn!(
-            ?err,
-            "calendar persistence failed (non-critical, best-effort)"
-        );
-    }
+    // #T2b (2026-05-20): the boot_audit row write was removed with the
+    // boot_audit table (QuestDB table cleanup).
 
     // Wave 1 Item 0.d — boot-time idempotent init for the index prev_close
     // cache directory. Hoisted out of the tick hot path (was a per-packet
@@ -2861,7 +2424,6 @@ async fn main() -> Result<()> {
     let first_seen = tickvault_core::pipeline::first_seen_set::init_global();
     let _first_seen_reset_handle =
         tickvault_core::pipeline::first_seen_set::spawn_ist_midnight_reset_task(first_seen);
-    tickvault_core::pipeline::prev_close_persist::init(&config.questdb);
 
     // Wave 1 Item 0.b part 2 — async tick spill drain. Adds an mpsc(8192)
     // layer in front of the existing sync BufWriter spill so the hot path
@@ -2944,46 +2506,8 @@ async fn main() -> Result<()> {
         }
     };
 
-    let depth_writer = match DepthPersistenceWriter::new(&config.questdb) {
-        Ok(mut writer) => {
-            // Recover stale depth spill files from previous crashes.
-            let recovered = writer.recover_stale_spill_files();
-            if recovered > 0 {
-                info!(
-                    recovered,
-                    "recovered stale depth spill files from previous crash"
-                );
-                notifier.notify(NotificationEvent::Custom {
-                    message: format!(
-                        "Startup: recovered {recovered} depth snapshots from previous crash spill files"
-                    ),
-                });
-            }
-            info!("QuestDB depth writer connected");
-            Some(writer)
-        }
-        Err(err) => {
-            error!(
-                ?err,
-                "QuestDB depth writer unavailable at startup — buffering depth in ring buffer + \
-                 disk spill until QuestDB comes back"
-            );
-            // B2: Use disconnected mode instead of None — ensures zero depth data loss.
-            // The writer will auto-reconnect every 30s and drain the buffer on recovery.
-            // B3: CRITICAL Telegram alert for depth writer unavailable at startup.
-            notifier.notify(NotificationEvent::Custom {
-                message: "CRITICAL: QuestDB Depth Writer UNAVAILABLE — \
-                          Depth persistence in disconnected mode. \
-                          All depth data buffered until QuestDB comes back."
-                    .to_owned(),
-            });
-            let mut writer = DepthPersistenceWriter::new_disconnected(&config.questdb);
-            // Attempt recovery even in disconnected mode — spill files may exist
-            // from a previous session where QuestDB was available.
-            let _ = writer.recover_stale_spill_files();
-            Some(writer)
-        }
-    };
+    // #T4 (2026-05-20): depth_writer construction removed — `market_depth`
+    // table dropped; the IDX_I-only universe runs Quote mode (no depth).
 
     // -----------------------------------------------------------------------
     // Step 6c: Pre-market readiness check (Parthiban directive 2026-04-21)
@@ -3087,16 +2611,6 @@ async fn main() -> Result<()> {
     // Only persist for CachedPlan (not yet persisted). FreshBuild already
     // persisted inside load_or_build_instruments — double-write creates
     // duplicate rows in the same timestamp second.
-    if needs_instrument_persist
-        && let Some(ref universe) = slow_boot_universe
-        && let Err(err) = persist_instrument_snapshot(universe, &config.questdb).await
-    {
-        warn!(
-            ?err,
-            "instrument snapshot persistence failed (non-critical)"
-        );
-    }
-
     // -----------------------------------------------------------------------
     // Step 8: Build WebSocket connection pool (only if authenticated + plan ready)
     // -----------------------------------------------------------------------
@@ -3472,25 +2986,11 @@ async fn main() -> Result<()> {
                      downstream OI Change is Dhan-precise"
                 );
             }
-            // F2 (Wave-5 §K-L13 / #504e follow-up): populate the
-            // `PrevDayCache` consumed by the cascade seal-time pct-
-            // stamping path (PR #520 / F1). Reads `prev_close` from
-            // QuestDB's `previous_close` table and merges the boot-
-            // loaded `prev_oi_cache` (immediately above). Best-effort
-            // — on QuestDB unreachable / SELECT failure the loader
-            // emits PREVCLOSE-04 and the cascade falls back to 0.0
-            // pct fields per the div-by-zero policy.
-            let f2_questdb = config.questdb.clone();
-            let f2_cache = std::sync::Arc::clone(&prev_day_cache);
-            let f2_prev_oi = std::sync::Arc::clone(&prev_oi_cache);
-            tokio::spawn(async move {
-                tickvault_app::prev_day_cache_loader::populate_and_log(
-                    &f2_questdb,
-                    &f2_cache,
-                    &f2_prev_oi,
-                )
-                .await;
-            });
+            // #T4 (2026-05-20): the `previous_close` QuestDB table was
+            // dropped. The boot-time `prev_day_cache_loader` SELECT
+            // against it is retired — `PrevDayCache` stays empty and
+            // the cascade seal-time pct path falls back to 0.0 pct
+            // fields per the documented div-by-zero policy.
         } else {
             warn!(
                 "prev_oi cache loader NOT spawned — slow_registry is None \
@@ -3705,7 +3205,6 @@ async fn main() -> Result<()> {
             run_tick_processor(
                 receiver,
                 tick_writer,
-                depth_writer,
                 tick_broadcast_for_processor,
                 greeks_enricher,
                 Some(slow_tick_heartbeat),
@@ -4245,26 +3744,10 @@ async fn main() -> Result<()> {
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
 
-                    // Adversarial review (general-purpose Class B+H,
-                    // 2026-04-28): rapid restart between 09:14 and 09:16
-                    // (e.g. operator `make restart`) can spawn two
-                    // schedulers that both fire at 09:16. The audit row
-                    // DEDUPs (key = trading_date_ist + check_name) but
-                    // the Telegram notify path does not. Pre-check the
-                    // audit table; if a row already exists for today,
-                    // skip notify (audit row will UPSERT regardless).
-                    let already_fired = match probe_selftest_already_fired_today(&st_qcfg).await {
-                        Ok(v) => v,
-                        Err(err) => {
-                            // Pre-check failure must not block the
-                            // primary self-test path. Log and proceed.
-                            tracing::warn!(
-                                ?err,
-                                "market-open self-test: pre-check failed; proceeding to fire"
-                            );
-                            false
-                        }
-                    };
+                    // #T2b (2026-05-20): the selftest_audit DB pre-check
+                    // was removed with the table. The scheduler fires
+                    // once per process; `already_fired` stays false.
+                    let already_fired = false;
                     if already_fired {
                         info!(
                             "market-open self-test: skipping notify (already fired today; audit-row UPSERT only)"
@@ -4308,7 +3791,7 @@ async fn main() -> Result<()> {
                     };
                     let started = std::time::Instant::now();
                     let outcome = evaluate_self_test(&inputs);
-                    let duration_ms =
+                    let _duration_ms =
                         i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
 
                     info!(
@@ -4365,49 +3848,9 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    // Audit persistence (SCOPE §12.3) — write outcome row
-                    // to selftest_audit. Wave-2-D DEDUP key
-                    // (trading_date_ist, check_name) ensures replay
-                    // idempotence; same boot will UPSERT same row.
-                    let now_ist_nanos = Utc::now()
-                        .timestamp_nanos_opt()
-                        .unwrap_or(0)
-                        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
-                    let trading_date_ist =
-                        now_ist_nanos - (now_ist_nanos.rem_euclid(86_400_000_000_000));
-                    let detail = match &outcome {
-                        MarketOpenSelfTestOutcome::Passed { .. } => {
-                            "all 8 sub-checks green".to_string()
-                        }
-                        MarketOpenSelfTestOutcome::Degraded { failed, .. }
-                        | MarketOpenSelfTestOutcome::Critical { failed, .. } => {
-                            format!("failed: {}", failed.join(","))
-                        }
-                    };
-                    if let Err(e) =
-                        tickvault_storage::selftest_audit_persistence::append_selftest_audit_row(
-                            &st_qcfg,
-                            now_ist_nanos,
-                            trading_date_ist,
-                            "market-open-self-test",
-                            outcome.outcome_str(),
-                            duration_ms,
-                            &detail,
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            error = ?e,
-                            code = tickvault_common::error_code::ErrorCode::Audit05SelftestWriteFailed
-                                .code_str(),
-                            "AUDIT-05 selftest audit row write failed"
-                        );
-                        metrics::counter!(
-                            "tv_audit_write_failures_total",
-                            "table" => "selftest_audit"
-                        )
-                        .increment(1);
-                    }
+                    // #T2b (2026-05-20): the selftest_audit outcome row
+                    // write was removed with the table. The self-test
+                    // result is still delivered via Telegram + Loki.
                 });
             }
 

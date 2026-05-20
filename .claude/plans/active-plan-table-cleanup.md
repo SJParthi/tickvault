@@ -7,6 +7,15 @@
 3h, 4h, 1d) + one option-chain table + `historical_candles`. NO
 `candles_1s`. Everything else dropped.
 
+## Per-Item Guarantee Matrix
+
+Every item in this plan (#T1–#T5) is bound by the canonical 15-row
+"100% everything" matrix and the 7-row resilience demand matrix — see
+`.claude/rules/project/per-wave-guarantee-matrix.md`. All 15 + 7 rows
+apply to every #T item. Each lands only inside the tested envelope,
+with ratcheted regression coverage: compile-verified, ratchet-guarded,
+workspace + scoped test suites green before merge.
+
 ## Goal
 
 Cut the QuestDB schema to **24 tables** — only the live data plane the
@@ -111,10 +120,15 @@ its `ErrorCode` variant(s), and its ratchet tests.
     (cascade); `main.rs` rewire; re-point `cross_verify` +
     `post_open_cross_check` to the plain tables; drop-legacy DDL.
     (PR #734.)
-- [ ] **#T2** — drop ~20 audit tables + `*_audit_persistence.rs` modules
+- [x] **#T2** — drop ~20 audit tables + `*_audit_persistence.rs` modules
   + boot DDL + notification/ErrorCode wiring + ratchets.
-- [ ] **#T3** — drop 5 instrument tables + their persistence surface.
-- [ ] **#T4** — drop 6 misc tables + their persistence modules.
+  (#T2a PR #737 — 10 dead modules; #T2b PR #738 — 9 wired modules.)
+- [x] **#T3** — drop 5 instrument tables + their persistence surface.
+  (PR #739.)
+- [x] **#T4** — drop 6 misc tables + their persistence modules.
+  (market_depth, previous_close, indicator_snapshots, obi_snapshots,
+  nse_holidays, live_instance_lock — modules deleted, callers rewired,
+  boot DDL trimmed.)
 - [ ] **#T5** — cross-verify (PR #9) lands table-free (Telegram-only)
   against `historical_candles`.
 

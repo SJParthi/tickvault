@@ -142,14 +142,3 @@ state — that case escalates to `AGGREGATOR-DROP-01`.
    `missed_minutes` field; if > 1 minute, escalate.
 
 **Source:** `crates/trading/src/aggregator/boundary_timer.rs::tick_boundary_loop`.
-
-## AGGREGATOR-AUDIT-01 — `aggregator_seal_audit` table write failed
-
-**Trigger:** the per-seal audit-table writer returned an error when
-appending to `aggregator_seal_audit`. Audit tables are SEBI-relevant
-forensic records; write failures must surface immediately. Severity::Medium.
-
-**Triage:** identical to `AUDIT-01` (`Phase2AuditWriter::append`):
-check QuestDB ILP TCP port + disk-full state.
-
-**Source:** `crates/storage/src/aggregator_seal_audit_persistence.rs::AggregatorSealAuditWriter::append`.

@@ -14,7 +14,7 @@
 //!
 //! # Modules
 //! - `instrument_persistence` — daily instrument snapshot to QuestDB (Block 01.1)
-//! - `tick_persistence` — batched ILP writer for live ticks + market depth
+//! - `tick_persistence` — batched ILP writer for live ticks
 //! - `candle_persistence` — 1-minute candle persistence from historical fetch
 //! - `valkey_cache` — deadpool-redis async connection pool with typed helpers
 //!
@@ -67,29 +67,17 @@ mod global_qcfg_tests {
     }
 }
 
-pub mod aggregator_seal_audit_persistence;
-pub mod auth_renewal_audit_persistence;
-pub mod bar_correction_audit_persistence;
-pub mod boot_audit_persistence;
 pub mod boot_probe;
-pub mod calendar_persistence;
 pub mod candle_persistence;
-pub mod constituency_persistence;
-pub mod decision_audit_persistence;
 // PR #4 (2026-05-19): deep_depth_persistence + depth_dynamic_diff_audit
 // + depth_rebalance_audit modules DELETED. Audit tables stay on disk
 // per SEBI 5y retention.
 pub mod disk_health_watcher;
-pub mod gap_fill_audit_persistence;
 // PR #3 (2026-05-19): `greeks_persistence` module DELETED. greeks
 // pipeline retired alongside the indices-only universe. The
 // option_greeks / pcr_snapshots / dhan_option_chain_raw / greeks_verification
 // QuestDB tables are dropped by scripts/migrate-drop-greeks-tables.sql.
 pub mod historical_fetch_marker;
-pub mod indicator_snapshot_persistence;
-pub mod instrument_persistence;
-pub mod last_tick_audit_persistence;
-pub mod live_instance_lock_persistence;
 // Candle-engine re-architecture #T1b: `materialized_views` (Engine C —
 // `candles_1s` + the 9 `candles_<tf>` matviews) DELETED. The 21 plain
 // `candles_<tf>` tables are created by
@@ -98,15 +86,8 @@ pub mod live_instance_lock_persistence;
 // `shadow_persistence::drop_legacy_candle_objects`. The 25 retired
 // `movers_*` matviews + `movers_1s` base table are no longer recreated
 // either (the old `drop_bug3_retired_views` lived in this module).
-pub mod obi_persistence;
-pub mod open_price_audit_persistence;
 pub mod option_chain_minute_snapshot_persistence;
-pub mod order_audit_persistence;
-pub mod order_update_ws_audit_persistence;
-pub mod orphan_position_audit_persistence;
 pub mod partition_manager;
-pub mod pnl_audit_persistence;
-pub mod previous_close_persistence;
 pub mod questdb_health;
 pub mod seal_absorption;
 pub mod seal_dlq;
@@ -114,20 +95,13 @@ pub mod seal_spill;
 pub mod seal_writer_loop;
 pub mod seal_writer_runner;
 pub mod seal_writer_task;
-pub mod self_trade_audit_persistence;
-pub mod selftest_audit_persistence;
 pub mod shadow_candle_writer;
 pub mod shadow_persistence;
 pub mod shadow_seal_columns;
-pub mod signal_audit_persistence;
-pub mod sl_replacement_audit_persistence;
-pub mod static_ip_audit_persistence;
 pub mod tick_persistence;
 pub mod tick_spill_drain;
 pub mod valkey_cache;
-pub mod volume_nse_audit_persistence;
 pub mod ws_frame_spill;
-pub mod ws_reconnect_audit_persistence;
 
 /// Test support: re-exports internal functions for DHAT and benchmark tests.
 pub mod tick_persistence_testing {

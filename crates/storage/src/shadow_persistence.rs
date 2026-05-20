@@ -13,8 +13,6 @@
 //!   `.claude/rules/project/security-id-uniqueness.md` (I-P1-11), since
 //!   Dhan reuses `security_id` across segments. The designated
 //!   timestamp `ts` is part of the key (QuestDB requires it).
-//! - The 22nd constant `DEDUP_KEY_AGGREGATOR_SEAL_AUDIT` covers the
-//!   per-seal forensic audit table.
 //!
 //! ## Schema (10 columns, NO pct columns)
 //!
@@ -53,12 +51,6 @@
 //! 3. **Per-instrument-per-bucket uniqueness** — one (instrument, bucket)
 //!    pair → exactly one row, regardless of how many ticks contributed.
 //!
-//! ## Aggregator seal audit table
-//!
-//! `aggregator_seal_audit` — DEDUP UPSERT KEYS `(ts, security_id,
-//! exchange_segment, timeframe, candle_ts, trading_date_ist)`. One audit
-//! row per (day, instrument, TF, bucket).
-//!
 //! Cross-refs:
 //! - I-P1-11: `.claude/rules/project/security-id-uniqueness.md`
 //! - Self-heal pattern: `crates/storage/src/instrument_persistence.rs::ensure_instrument_tables`
@@ -72,15 +64,12 @@ use tickvault_common::config::QuestDbConfig;
 use tickvault_trading::candles::{TF_COUNT, TfIndex};
 
 // ---------------------------------------------------------------------------
-// QuestDB table names — one per timeframe, plus the seal audit table.
+// QuestDB table names — one per timeframe.
 //
 // The 21 candle table names are derived from `TfIndex::table_name()`
 // (the single source of truth in `crates/trading/src/candles/tf_index.rs`).
 // Use `candle_table_names()` below to enumerate them.
 // ---------------------------------------------------------------------------
-
-/// Per-seal forensic audit table.
-pub const QUESTDB_TABLE_AGGREGATOR_SEAL_AUDIT: &str = "aggregator_seal_audit";
 
 // ---------------------------------------------------------------------------
 // DEDUP UPSERT keys — composite per I-P1-11.
@@ -98,12 +87,6 @@ pub const QUESTDB_TABLE_AGGREGATOR_SEAL_AUDIT: &str = "aggregator_seal_audit";
 /// timestamp `ts` (QuestDB requires it) and `segment` per I-P1-11. The
 /// same value is returned by `TfIndex::dedup_key()`.
 pub const DEDUP_KEY_CANDLES: &str = "ts, security_id, segment";
-
-/// Aggregator seal audit DEDUP key — one row per (day, instrument, TF,
-/// bucket). Includes `exchange_segment` for I-P1-11 and `timeframe` so
-/// the same instrument's 1m + 5m seals coexist.
-pub const DEDUP_KEY_AGGREGATOR_SEAL_AUDIT: &str =
-    "security_id, exchange_segment, timeframe, candle_ts, trading_date_ist";
 
 // ---------------------------------------------------------------------------
 // Public helpers — aggregate the table names for downstream consumers.
@@ -182,29 +165,6 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
         );
         run_ddl(&client, &base_url, table, &create_ddl).await;
     }
-
-    let audit_ddl = format!(
-        "CREATE TABLE IF NOT EXISTS {QUESTDB_TABLE_AGGREGATOR_SEAL_AUDIT} (\
-            ts                  TIMESTAMP, \
-            trading_date_ist    DATE, \
-            security_id         INT, \
-            exchange_segment    SYMBOL, \
-            timeframe           SYMBOL, \
-            candle_ts           TIMESTAMP, \
-            seals_emitted       LONG, \
-            seals_dropped       LONG, \
-            late_ticks_discarded LONG, \
-            outcome             SYMBOL\
-        ) timestamp(ts) PARTITION BY DAY \
-        DEDUP UPSERT KEYS(ts, {DEDUP_KEY_AGGREGATOR_SEAL_AUDIT});"
-    );
-    run_ddl(
-        &client,
-        &base_url,
-        QUESTDB_TABLE_AGGREGATOR_SEAL_AUDIT,
-        &audit_ddl,
-    )
-    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -232,14 +192,16 @@ const LEGACY_CANDLE_TF_SUFFIXES: [&str; 9] =
     ["1m", "5m", "15m", "30m", "1h", "2h", "3h", "4h", "1d"];
 
 /// Idempotently drop every legacy candle object: the 9 Engine-C
-/// materialized views, the `candles_1s` base table, and the 9 legacy
-/// `candles_<tf>_shadow` tables.
+/// materialized views, the `candles_1s` base table, the 9 legacy
+/// `candles_<tf>_shadow` tables, and the retired `aggregator_seal_audit`
+/// table.
 ///
 /// Drop order is load-bearing:
 /// 1. The 9 materialized views (`candles_1m` … `candles_1d`) — a matview
 ///    must be dropped before its base table.
 /// 2. The `candles_1s` base table.
 /// 3. The 9 `candles_<tf>_shadow` tables.
+/// 4. The `aggregator_seal_audit` table (#T2a table cleanup).
 ///
 /// Each statement is `DROP … IF EXISTS`, so this is safe to call on every
 /// boot regardless of which objects actually exist. Failures are logged at
@@ -285,6 +247,17 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
         let ddl = format!("DROP TABLE IF EXISTS {table};");
         run_drop_ddl(&client, &base_url, &table, &ddl).await;
     }
+
+    // 4. Drop the retired `aggregator_seal_audit` forensic table (#T2a —
+    //    QuestDB table cleanup). The per-seal audit module is deleted; the
+    //    table itself is dropped here so existing deployments converge.
+    run_drop_ddl(
+        &client,
+        &base_url,
+        "aggregator_seal_audit",
+        "DROP TABLE IF EXISTS aggregator_seal_audit;",
+    )
+    .await;
 }
 
 /// Issue one DROP DDL statement to QuestDB's `/exec` endpoint.
@@ -397,15 +370,6 @@ mod tests {
         for tf in TfIndex::ALL {
             assert_eq!(DEDUP_KEY_CANDLES, tf.dedup_key());
         }
-    }
-
-    #[test]
-    fn test_aggregator_seal_audit_dedup_includes_segment_and_tf() {
-        assert!(DEDUP_KEY_AGGREGATOR_SEAL_AUDIT.contains("security_id"));
-        assert!(DEDUP_KEY_AGGREGATOR_SEAL_AUDIT.contains("exchange_segment"));
-        assert!(DEDUP_KEY_AGGREGATOR_SEAL_AUDIT.contains("timeframe"));
-        assert!(DEDUP_KEY_AGGREGATOR_SEAL_AUDIT.contains("candle_ts"));
-        assert!(DEDUP_KEY_AGGREGATOR_SEAL_AUDIT.contains("trading_date_ist"));
     }
 
     #[test]
