@@ -11,6 +11,9 @@
 //! Requires both `access-token` AND `client-id` headers.
 
 pub mod client;
+// PR #8d (2026-05-20) — L2 VERIFY structural validation of a fetched
+// option-chain response before it is cached (heart-piece §3 row 2).
+pub mod l2_verify;
 // PR #450 commit 3 (2026-05-03): pure helpers to extract `previous_oi`
 // from Option Chain REST responses for the unified /api/movers
 // Dhan-parity OI Change calculations.

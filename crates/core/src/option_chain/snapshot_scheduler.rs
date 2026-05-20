@@ -338,6 +338,17 @@ async fn run_one_slot_fetch(
         }
     };
 
+    // Step 2.5 — L2 VERIFY (PR #8d, heart-piece §3 row 2). Structurally
+    // validate the response BEFORE it reaches the cache. A bad-status /
+    // empty / too-few-strikes response is REJECTED — the cache keeps
+    // its previous (older but valid) snapshot rather than serving the
+    // strategy a malformed chain to strike-select against.
+    let l2 = super::l2_verify::verify_option_chain_structure(&chain);
+    if !l2.is_valid() {
+        record_fetch_failure(underlying, 1, &l2.reason(), notifier, state);
+        return;
+    }
+
     // Step 3 — write into the RAM cache. `Instant::now()` AFTER the
     // network call so the cache's `received_at` reflects when the
     // strategy will actually see this data, not when the request
