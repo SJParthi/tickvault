@@ -1693,6 +1693,18 @@ pub const OPTION_CHAIN_STALE_CYCLES_BEFORE_TELEGRAM: u32 = 3;
 /// the operator-locked value.
 pub const OPTION_CHAIN_L2_VERIFY_TOLERANCE_PCT: f64 = 0.5;
 
+/// PR #8d — L2 VERIFY minimum-strikes sanity floor.
+///
+/// Per `docs/architecture/option-chain-z-plus-heart-piece.md` §3 row 2:
+/// a healthy Dhan option-chain response for NIFTY / BANKNIFTY / SENSEX
+/// carries 200+ strikes. A response with fewer than 30 strikes is
+/// structurally suspect (partial body, wrong expiry, Dhan-side
+/// degradation) and MUST be rejected rather than cached — caching a
+/// near-empty chain would let the strategy strike-select against a
+/// hole. 30 is a conservative floor: comfortably below any real
+/// session's strike count, comfortably above "empty/garbage".
+pub const OPTION_CHAIN_MIN_STRIKES: usize = 30;
+
 /// Default depth batch flush size for QuestDB ILP writes.
 /// Each depth snapshot writes 5 rows (one per level), so effective row count = batch × 5.
 pub const DEPTH_FLUSH_BATCH_SIZE: usize = 200;
