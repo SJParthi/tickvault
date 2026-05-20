@@ -52,4 +52,4 @@ pub use pct_stamping::{
     stamp_seal_pct_fields,
 };
 pub use seal_ring::{BufferOutcome, BufferedSeal, SEAL_BUFFER_CAPACITY, SealRing};
-pub use tf_index::TfIndex;
+pub use tf_index::{TF_COUNT, TfIndex};

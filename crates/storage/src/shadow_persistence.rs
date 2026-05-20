@@ -1,51 +1,52 @@
-//! Wave 6 Sub-PR #1 — Multi-TF aggregator shadow tables.
+//! Candle-engine re-architecture #T1a — plain QuestDB candle tables.
 //!
-//! Direct-flush target tables for the new in-memory multi-timeframe
-//! aggregator. Sealed candles flow `aggregator → ring → ILP → shadow`
-//! WITHOUT cascading through the legacy `candles_1s` materialized view
-//! chain. Per the locked design (`active-plan-aggregator-direct-flush-rehydrate.md`
-//! section "Sub-PR #1 — Aggregator Engine" decisions L-C1 / L-C2 / L-H10):
+//! Direct-flush target tables for the live multi-timeframe aggregator.
+//! Sealed candles flow `aggregator → ring → ILP → candles_<tf>` WITHOUT
+//! cascading through the legacy `candles_1s` materialized-view chain and
+//! WITHOUT the interim `_shadow` tables of the Wave 6 design.
 //!
-//! - 9 timeframes (1m / 5m / 15m / 30m / 1h / 2h / 3h / 4h / 1d) each get
-//!   their OWN shadow table — `candles_{tf}_shadow`.
-//! - Every shadow table carries DEDUP UPSERT KEYS
-//!   `(ts, security_id, exchange_segment)` — composite per
+//! - 21 timeframes (1m / 2m / … / 15m / 30m / 1h / 2h / 3h / 4h / 1d)
+//!   each get their OWN plain QuestDB table — `candles_<tf>`. Names are
+//!   derived from `TfIndex::table_name()` (the single source of truth).
+//! - Every candle table carries DEDUP UPSERT KEYS
+//!   `(ts, security_id, segment)` — composite per
 //!   `.claude/rules/project/security-id-uniqueness.md` (I-P1-11), since
-//!   Dhan reuses `security_id` across segments.
-//! - The 10th constant `DEDUP_KEY_AGGREGATOR_SEAL_AUDIT` covers the
-//!   per-seal forensic audit table (Sub-PR #1 item 1.9, locked decision
-//!   L-M16 — Box 10 of the 12-box matrix turns GREEN inside this PR).
+//!   Dhan reuses `security_id` across segments. The designated
+//!   timestamp `ts` is part of the key (QuestDB requires it).
+//! - The 22nd constant `DEDUP_KEY_AGGREGATOR_SEAL_AUDIT` covers the
+//!   per-seal forensic audit table.
 //!
-//! Sub-PR #4 ("Promotion") later renames these `_shadow` tables to the
-//! canonical `candles_{tf}` names AFTER 1 trading week of zero-diff
-//! cross-verify + 2 days clean. Until then both the legacy mat-views
-//! and the new shadow tables coexist; the divergence ratchet test
-//! (`test_shadow_tables_match_mv_within_1pct`, locked decision L-H5) is
-//! added in the aggregator hot-path commit.
+//! ## Schema (10 columns, NO pct columns)
 //!
-//! ## What this file does NOT yet contain (deferred to follow-up commit)
+//! ```sql
+//! CREATE TABLE IF NOT EXISTS candles_1m (
+//!     segment       SYMBOL,
+//!     security_id   INT,
+//!     ts            TIMESTAMP,
+//!     open          DOUBLE,
+//!     high          DOUBLE,
+//!     low           DOUBLE,
+//!     close         DOUBLE,
+//!     volume        LONG,
+//!     oi            LONG,
+//!     tick_count    INT
+//! ) timestamp(ts) PARTITION BY DAY
+//!   DEDUP UPSERT KEYS(ts, security_id, segment);
+//! ```
 //!
-//! - The hot-path `ShadowCandleWriter` struct + `append_seal()` method.
-//! - The ring → spill → DLQ pattern (locked decision L-C1 — mirror of
-//!   `tick_persistence.rs::TICK_BUFFER_CAPACITY` machinery).
-//! - The `BufferedSeal` retry struct.
-//! - The DDL self-heal `ALTER TABLE ADD COLUMN IF NOT EXISTS` routine.
+//! The 3 `*_pct_from_prev_day` DOUBLE columns of the legacy shadow
+//! schema are intentionally dropped — the live aggregator no longer
+//! stamps prev-day pct values at seal time.
 //!
-//! Those land in the aggregator engine commit immediately following
-//! this one. This file ships the constants + DDL setup so the meta-guard
-//! ratchet (`crates/storage/tests/dedup_segment_meta_guard.rs`) can pin
-//! the new keys today.
+//! ## DEDUP rationale for each candle table
 //!
-//! ## DEDUP rationale for each shadow table
-//!
-//! `(ts, security_id, exchange_segment)` is the composite key. `ts` is
-//! the candle open timestamp (IST nanos derived from the WS LTT field
-//! per `data-integrity.md` — NEVER `Utc::now()` per locked decision
-//! L-H7). `(security_id, exchange_segment)` is the I-P1-11 composite
-//! identity. Three properties together hold:
+//! `(ts, security_id, segment)` is the composite key. `ts` is the
+//! candle open timestamp (IST nanos derived from the WS LTT field per
+//! `data-integrity.md` — NEVER `Utc::now()`). `(security_id, segment)`
+//! is the I-P1-11 composite identity. Three properties hold together:
 //!
 //! 1. **Idempotent re-flush** — a sealed candle re-emitted on aggregator
-//!    crash recovery (Sub-PR #2 rehydration) collapses into the same row.
+//!    crash recovery collapses into the same row.
 //! 2. **Cross-segment safety** — NIFTY (`security_id=13`, `IDX_I`) and a
 //!    distinct NSE_EQ instrument with the same numeric id stay as two
 //!    rows, not one.
@@ -54,16 +55,11 @@
 //!
 //! ## Aggregator seal audit table
 //!
-//! `aggregator_seal_audit` — DEDUP UPSERT KEYS `(trading_date_ist,
-//! security_id, exchange_segment, timeframe, candle_ts)`. One audit row
-//! per (day, instrument, TF, bucket). Ships in this file so future
-//! Claude Code sessions can answer "why was bucket X sealed at IST
-//! Y for instrument Z" weeks later without grepping logs.
+//! `aggregator_seal_audit` — DEDUP UPSERT KEYS `(ts, security_id,
+//! exchange_segment, timeframe, candle_ts, trading_date_ist)`. One audit
+//! row per (day, instrument, TF, bucket).
 //!
 //! Cross-refs:
-//! - Locked decisions L-C1 / L-C2 / L-H10 / L-M16 in
-//!   `.claude/plans/active-plan-aggregator-direct-flush-rehydrate.md`
-//! - Runbook stub: `.claude/rules/project/wave-6-error-codes.md`
 //! - I-P1-11: `.claude/rules/project/security-id-uniqueness.md`
 //! - Self-heal pattern: `crates/storage/src/instrument_persistence.rs::ensure_instrument_tables`
 
@@ -73,64 +69,35 @@ use reqwest::Client;
 use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
+use tickvault_trading::candles::{TF_COUNT, TfIndex};
 
 // ---------------------------------------------------------------------------
 // QuestDB table names — one per timeframe, plus the seal audit table.
+//
+// The 21 candle table names are derived from `TfIndex::table_name()`
+// (the single source of truth in `crates/trading/src/candles/tf_index.rs`).
+// Use `candle_table_names()` below to enumerate them.
 // ---------------------------------------------------------------------------
 
-/// 1-minute sealed candles — primary cross-verify target in Sub-PR #3.
-pub const QUESTDB_TABLE_CANDLES_1M_SHADOW: &str = "candles_1m_shadow";
-/// 5-minute sealed candles — derived from 1m via deterministic rollup.
-pub const QUESTDB_TABLE_CANDLES_5M_SHADOW: &str = "candles_5m_shadow";
-/// 15-minute sealed candles.
-pub const QUESTDB_TABLE_CANDLES_15M_SHADOW: &str = "candles_15m_shadow";
-/// 30-minute sealed candles.
-pub const QUESTDB_TABLE_CANDLES_30M_SHADOW: &str = "candles_30m_shadow";
-/// 1-hour sealed candles.
-pub const QUESTDB_TABLE_CANDLES_1H_SHADOW: &str = "candles_1h_shadow";
-/// 2-hour sealed candles.
-pub const QUESTDB_TABLE_CANDLES_2H_SHADOW: &str = "candles_2h_shadow";
-/// 3-hour sealed candles.
-pub const QUESTDB_TABLE_CANDLES_3H_SHADOW: &str = "candles_3h_shadow";
-/// 4-hour sealed candles.
-pub const QUESTDB_TABLE_CANDLES_4H_SHADOW: &str = "candles_4h_shadow";
-/// 1-day sealed candles.
-pub const QUESTDB_TABLE_CANDLES_1D_SHADOW: &str = "candles_1d_shadow";
-
-/// Per-seal forensic audit table (Sub-PR #1 item 1.9, locked L-M16).
+/// Per-seal forensic audit table.
 pub const QUESTDB_TABLE_AGGREGATOR_SEAL_AUDIT: &str = "aggregator_seal_audit";
 
 // ---------------------------------------------------------------------------
 // DEDUP UPSERT keys — composite per I-P1-11.
 //
-// All 9 candle shadow tables share the same key shape because they are
-// uniformly partitioned `(ts, security_id, exchange_segment)`. The
+// All 21 candle tables share the same key shape because they are
+// uniformly partitioned `(ts, security_id, segment)`. The
 // `dedup_segment_meta_guard.rs` workspace meta-guard scans every
 // `DEDUP_KEY_*` constant in `crates/storage/src/` and FAILS the build
 // if any key that mentions `security_id` does NOT also mention
-// `segment` / `exchange_segment` / `exchange`. Each constant below
-// contains the literal substring `exchange_segment` to satisfy that
-// invariant.
+// `segment` / `exchange_segment` / `exchange`. The constant below
+// contains the literal substring `segment` to satisfy that invariant.
 // ---------------------------------------------------------------------------
 
-/// 1-minute shadow DEDUP key. Includes `exchange_segment` per I-P1-11.
-pub const DEDUP_KEY_CANDLES_1M_SHADOW: &str = "security_id, exchange_segment";
-/// 5-minute shadow DEDUP key.
-pub const DEDUP_KEY_CANDLES_5M_SHADOW: &str = "security_id, exchange_segment";
-/// 15-minute shadow DEDUP key.
-pub const DEDUP_KEY_CANDLES_15M_SHADOW: &str = "security_id, exchange_segment";
-/// 30-minute shadow DEDUP key.
-pub const DEDUP_KEY_CANDLES_30M_SHADOW: &str = "security_id, exchange_segment";
-/// 1-hour shadow DEDUP key.
-pub const DEDUP_KEY_CANDLES_1H_SHADOW: &str = "security_id, exchange_segment";
-/// 2-hour shadow DEDUP key.
-pub const DEDUP_KEY_CANDLES_2H_SHADOW: &str = "security_id, exchange_segment";
-/// 3-hour shadow DEDUP key.
-pub const DEDUP_KEY_CANDLES_3H_SHADOW: &str = "security_id, exchange_segment";
-/// 4-hour shadow DEDUP key.
-pub const DEDUP_KEY_CANDLES_4H_SHADOW: &str = "security_id, exchange_segment";
-/// 1-day shadow DEDUP key.
-pub const DEDUP_KEY_CANDLES_1D_SHADOW: &str = "security_id, exchange_segment";
+/// DEDUP UPSERT key for every candle table. Includes the designated
+/// timestamp `ts` (QuestDB requires it) and `segment` per I-P1-11. The
+/// same value is returned by `TfIndex::dedup_key()`.
+pub const DEDUP_KEY_CANDLES: &str = "ts, security_id, segment";
 
 /// Aggregator seal audit DEDUP key — one row per (day, instrument, TF,
 /// bucket). Includes `exchange_segment` for I-P1-11 and `timeframe` so
@@ -139,59 +106,33 @@ pub const DEDUP_KEY_AGGREGATOR_SEAL_AUDIT: &str =
     "security_id, exchange_segment, timeframe, candle_ts, trading_date_ist";
 
 // ---------------------------------------------------------------------------
-// Public helpers — aggregate the constants for downstream consumers.
+// Public helpers — aggregate the table names for downstream consumers.
 // ---------------------------------------------------------------------------
 
-/// All 9 candle shadow table names in canonical order (1m → 1d).
+/// All 21 candle table names in canonical order (1m → 1d), derived from
+/// `TfIndex::table_name()`.
 ///
 /// Used by:
-/// - DDL setup loop below.
-/// - Forthcoming hot-path `ShadowCandleWriter` to index into the
-///   `[Sender; 9]` ILP sender array.
-/// - Forthcoming Sub-PR #2 rehydration code to query "latest sealed
-///   timestamp per (security_id, segment, TF)".
+/// - the DDL setup loop below.
+/// - the hot-path seal-writer chain to index into the `[Sender; 21]`
+///   ILP sender array.
 #[must_use]
-// TEST-EXEMPT: pure const-array accessor; tested via test_canonical_timeframe_ordering_1m_to_1d + test_all_shadow_table_names_distinct + test_canonical_table_name_pattern.
-pub fn shadow_candle_table_names() -> [&'static str; 9] {
-    [
-        QUESTDB_TABLE_CANDLES_1M_SHADOW,
-        QUESTDB_TABLE_CANDLES_5M_SHADOW,
-        QUESTDB_TABLE_CANDLES_15M_SHADOW,
-        QUESTDB_TABLE_CANDLES_30M_SHADOW,
-        QUESTDB_TABLE_CANDLES_1H_SHADOW,
-        QUESTDB_TABLE_CANDLES_2H_SHADOW,
-        QUESTDB_TABLE_CANDLES_3H_SHADOW,
-        QUESTDB_TABLE_CANDLES_4H_SHADOW,
-        QUESTDB_TABLE_CANDLES_1D_SHADOW,
-    ]
-}
-
-/// All 9 DEDUP UPSERT keys for the candle shadow tables, paired with
-/// their table names so DDL emitters can iterate without index drift.
-#[must_use]
-// TEST-EXEMPT: pure const-array accessor; tested via test_table_dedup_pair_alignment + test_every_dedup_key_includes_exchange_segment.
-pub fn shadow_candle_table_dedup_keys() -> [(&'static str, &'static str); 9] {
-    [
-        (QUESTDB_TABLE_CANDLES_1M_SHADOW, DEDUP_KEY_CANDLES_1M_SHADOW),
-        (QUESTDB_TABLE_CANDLES_5M_SHADOW, DEDUP_KEY_CANDLES_5M_SHADOW),
-        (
-            QUESTDB_TABLE_CANDLES_15M_SHADOW,
-            DEDUP_KEY_CANDLES_15M_SHADOW,
-        ),
-        (
-            QUESTDB_TABLE_CANDLES_30M_SHADOW,
-            DEDUP_KEY_CANDLES_30M_SHADOW,
-        ),
-        (QUESTDB_TABLE_CANDLES_1H_SHADOW, DEDUP_KEY_CANDLES_1H_SHADOW),
-        (QUESTDB_TABLE_CANDLES_2H_SHADOW, DEDUP_KEY_CANDLES_2H_SHADOW),
-        (QUESTDB_TABLE_CANDLES_3H_SHADOW, DEDUP_KEY_CANDLES_3H_SHADOW),
-        (QUESTDB_TABLE_CANDLES_4H_SHADOW, DEDUP_KEY_CANDLES_4H_SHADOW),
-        (QUESTDB_TABLE_CANDLES_1D_SHADOW, DEDUP_KEY_CANDLES_1D_SHADOW),
-    ]
+// TEST-EXEMPT: pure const-array accessor; tested via test_candle_table_names_are_plain_and_canonical + test_all_candle_table_names_distinct.
+pub fn candle_table_names() -> [&'static str; TF_COUNT] {
+    let mut names = [""; TF_COUNT];
+    let mut idx = 0;
+    while idx < TF_COUNT {
+        // `TfIndex::from_ordinal` is const and total over `0..TF_COUNT`.
+        if let Some(tf) = TfIndex::from_ordinal(idx) {
+            names[idx] = tf.table_name();
+        }
+        idx += 1;
+    }
+    names
 }
 
 // ---------------------------------------------------------------------------
-// DDL setup — idempotent CREATE + DEDUP ENABLE.
+// DDL setup — idempotent CREATE + DEDUP UPSERT.
 //
 // Follows the schema-self-heal pattern documented in
 // `.claude/rules/project/observability-architecture.md` ("Schema
@@ -202,8 +143,8 @@ pub fn shadow_candle_table_dedup_keys() -> [(&'static str, &'static str); 9] {
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
-/// Create all 9 candle shadow tables + the per-seal audit table if they
-/// do not already exist, and enable DEDUP UPSERT on each.
+/// Create all 21 plain candle tables + the per-seal audit table if they
+/// do not already exist, with DEDUP UPSERT enabled on each.
 ///
 /// Idempotent: safe to call on every boot. Failures are logged at
 /// `error!` level (Telegram-routable per `error_level_meta_guard.rs`
@@ -212,7 +153,7 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 ///
 /// Requires a running QuestDB; covered by boot integration in CI and
 /// by manual `make doctor` post-boot.
-// TEST-EXEMPT: requires a running QuestDB; tested via boot integration in CI and by `make doctor`. WIRING-EXEMPT: scaffolding for Sub-PR #1 follow-up commit on this branch (aggregator engine wires it into crates/app/src/main.rs alongside ensure_instrument_tables).
+// TEST-EXEMPT: requires a running QuestDB; tested via boot integration in CI and by `make doctor`. WIRING-EXEMPT: boot wiring lives in crates/app/src/main.rs alongside ensure_instrument_tables.
 pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
     let base_url = format!(
         "http://{}:{}/exec",
@@ -223,24 +164,21 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
         .build()
         .unwrap_or_else(|_| Client::new());
 
-    for (table, dedup_key) in shadow_candle_table_dedup_keys() {
+    for table in candle_table_names() {
         let create_ddl = format!(
             "CREATE TABLE IF NOT EXISTS {table} (\
-                ts                          TIMESTAMP, \
+                segment                     SYMBOL, \
                 security_id                 INT, \
-                exchange_segment            SYMBOL, \
+                ts                          TIMESTAMP, \
                 open                        DOUBLE, \
                 high                        DOUBLE, \
                 low                         DOUBLE, \
                 close                       DOUBLE, \
                 volume                      LONG, \
                 oi                          LONG, \
-                tick_count                  INT, \
-                close_pct_from_prev_day     DOUBLE, \
-                oi_pct_from_prev_day        DOUBLE, \
-                volume_pct_from_prev_day    DOUBLE\
+                tick_count                  INT\
             ) timestamp(ts) PARTITION BY DAY \
-            DEDUP UPSERT KEYS(ts, {dedup_key});"
+            DEDUP UPSERT KEYS({DEDUP_KEY_CANDLES});"
         );
         run_ddl(&client, &base_url, table, &create_ddl).await;
     }
@@ -267,48 +205,30 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
         &audit_ddl,
     )
     .await;
-
-    // Phase 0 Item 29 — `candles_source` SYMBOL column ALTER on all 9
-    // shadow candle tables via `ALTER ADD COLUMN IF NOT EXISTS` per the
-    // PR #690 schema self-heal pattern. Values: `live_ws` (default,
-    // implicit for legacy rows), `cross_check_correction` (Item 28
-    // bar-correction writer), `gap_fill_rest` (Items 8+9 — written into
-    // historical_candles, mirrored here for boot-cache parity).
-    //
-    // Column is OUTSIDE the DEDUP key (Items 15+28+29 hot-path-reviewer
-    // C1) so corrections REPLACE the wrong row instead of APPENDING a
-    // sibling row — `(ts, security_id, exchange_segment)` stays the
-    // canonical dedup tuple.
-    for table in shadow_candle_table_names() {
-        let alter_sql =
-            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS candles_source SYMBOL");
-        match client
-            .get(&base_url)
-            .query(&[("query", alter_sql.as_str())])
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                info!(table, "candles_source SYMBOL column ensured");
-            }
-            Ok(resp) => {
-                warn!(
-                    table,
-                    status = %resp.status(),
-                    "ALTER candles_source non-2xx"
-                );
-            }
-            Err(err) => {
-                error!(table, ?err, "ALTER candles_source request failed");
-            }
-        }
-    }
 }
 
+/// Issue one DDL statement to QuestDB's `/exec` endpoint.
+///
+/// Finding S5: the DDL is sent via HTTP **POST** (was GET). QuestDB's
+/// `/exec` endpoint accepts POST — using POST instead of GET keeps the
+/// (potentially long) DDL statement out of the request line that
+/// intermediary proxies / access-logs record verbatim. The `query`
+/// parameter is form-urlencoded into the POST request body via an
+/// explicit `Content-Type: application/x-www-form-urlencoded` header
+/// (the `reqwest` `form` feature is not enabled in this workspace).
 async fn run_ddl(client: &Client, base_url: &str, table: &str, ddl: &str) {
-    match client.get(base_url).query(&[("query", ddl)]).send().await {
+    // Manual form-urlencoding of the single `query=<ddl>` field.
+    let body = format!("query={}", urlencode(ddl));
+    let request = client
+        .post(base_url)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body(body);
+    match request.send().await {
         Ok(resp) if resp.status().is_success() => {
-            info!(table, "shadow table ready");
+            info!(table, "candle table ready");
         }
         Ok(resp) => {
             warn!(table, status = %resp.status(), "DDL non-2xx");
@@ -316,6 +236,37 @@ async fn run_ddl(client: &Client, base_url: &str, table: &str, ddl: &str) {
         Err(err) => {
             error!(table, ?err, "DDL request failed");
         }
+    }
+}
+
+/// Minimal `application/x-www-form-urlencoded` value encoder.
+///
+/// QuestDB DDL only ever contains ASCII identifiers, parentheses,
+/// commas, semicolons and spaces — this percent-encodes every byte
+/// that is not in the unreserved set so the POST body parses
+/// correctly regardless of the statement content.
+fn urlencode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() * 3);
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(hex_nibble(byte >> 4));
+                out.push(hex_nibble(byte & 0x0F));
+            }
+        }
+    }
+    out
+}
+
+/// Maps a 0-15 nibble to its uppercase hex ASCII character.
+const fn hex_nibble(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        _ => (b'A' + (nibble - 10)) as char,
     }
 }
 
@@ -327,48 +278,15 @@ async fn run_ddl(client: &Client, base_url: &str, table: &str, ddl: &str) {
 mod tests {
     use super::*;
 
-    /// Phase 0 Item 29 — source-scan ratchet: `ensure_shadow_candle_tables`
-    /// MUST emit `ALTER TABLE ... ADD COLUMN IF NOT EXISTS candles_source
-    /// SYMBOL` per the PR #690 schema self-heal pattern. Items 15+28+29
-    /// hot-path-reviewer C1 requires the column be added OUTSIDE the
-    /// DEDUP UPSERT KEY (verified by `dedup_segment_meta_guard.rs` which
-    /// scans the constant — `candles_source` does NOT appear in any
-    /// DEDUP_KEY_* constant).
     #[test]
-    fn test_shadow_tables_alter_in_candles_source_column() {
-        let src = include_str!("shadow_persistence.rs");
-        assert!(
-            src.contains("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS candles_source SYMBOL"),
-            "ensure_shadow_candle_tables MUST ALTER ADD COLUMN IF NOT \
-             EXISTS candles_source SYMBOL on all 9 shadow tables. \
-             See Phase 0 Item 29 + hot-path-reviewer C1."
-        );
-    }
-
-    /// Phase 0 Item 29 — `candles_source` MUST NOT appear in any DEDUP
-    /// key (cross-check correction MUST replace the wrong row, not
-    /// append a sibling row). Verified by both this source-scan AND
-    /// `dedup_segment_meta_guard.rs` workspace scan.
-    #[test]
-    fn test_candles_source_not_in_dedup_key() {
-        let src = include_str!("shadow_persistence.rs");
-        // Walk every DEDUP_KEY_* constant declaration and confirm none
-        // mention candles_source.
-        for line in src.lines() {
-            if line.trim_start().starts_with("pub const DEDUP_KEY_") {
-                assert!(
-                    !line.contains("candles_source"),
-                    "candles_source MUST NOT appear in DEDUP_KEY_* — \
-                     corrections must REPLACE not APPEND. Offending \
-                     line: {line}"
-                );
-            }
-        }
+    fn test_candle_table_names_has_twenty_one_entries() {
+        assert_eq!(candle_table_names().len(), TF_COUNT);
+        assert_eq!(TF_COUNT, 21);
     }
 
     #[test]
-    fn test_all_shadow_table_names_distinct() {
-        let names = shadow_candle_table_names();
+    fn test_all_candle_table_names_distinct() {
+        let names = candle_table_names();
         let mut seen = std::collections::HashSet::new();
         for name in names {
             assert!(seen.insert(name), "duplicate table name: {name}");
@@ -376,28 +294,51 @@ mod tests {
     }
 
     #[test]
-    fn test_table_dedup_pair_alignment() {
-        let pairs = shadow_candle_table_dedup_keys();
-        let names = shadow_candle_table_names();
-        for (idx, (table, _)) in pairs.iter().enumerate() {
-            assert_eq!(
-                *table, names[idx],
-                "pairs[{idx}] table name diverges from canonical order"
+    fn test_candle_table_names_are_plain_and_canonical() {
+        // Plain first-class tables — no `_shadow` suffix anywhere.
+        let names = candle_table_names();
+        for name in names {
+            assert!(
+                name.starts_with("candles_"),
+                "table name {name:?} prefix wrong"
+            );
+            assert!(
+                !name.contains("shadow"),
+                "table name {name:?} must be a plain table (no _shadow)"
             );
         }
     }
 
     #[test]
-    fn test_every_dedup_key_includes_exchange_segment() {
-        for (table, key) in shadow_candle_table_dedup_keys() {
-            assert!(
-                key.contains("exchange_segment"),
-                "I-P1-11 violation: {table} key {key:?} missing `exchange_segment`"
+    fn test_candle_table_names_match_tf_index_table_name() {
+        // The DDL loop derives names from `TfIndex::table_name()`; this
+        // pins that alignment so the writer's `[Sender; 21]` indexing
+        // stays consistent with the DDL it created.
+        let names = candle_table_names();
+        for (idx, tf) in TfIndex::ALL.iter().enumerate() {
+            assert_eq!(
+                names[idx],
+                tf.table_name(),
+                "candle_table_names()[{idx}] diverges from TfIndex::table_name()"
             );
-            assert!(
-                key.contains("security_id"),
-                "{table} key {key:?} missing `security_id`"
-            );
+        }
+    }
+
+    #[test]
+    fn test_dedup_key_candles_includes_ts_security_id_segment() {
+        // QuestDB rejects a DEDUP key omitting the designated timestamp;
+        // I-P1-11 requires `segment` alongside `security_id`.
+        assert!(DEDUP_KEY_CANDLES.contains("ts"));
+        assert!(DEDUP_KEY_CANDLES.contains("security_id"));
+        assert!(DEDUP_KEY_CANDLES.contains("segment"));
+    }
+
+    #[test]
+    fn test_dedup_key_candles_matches_tf_index_dedup_key() {
+        // The shared DEDUP key constant must equal `TfIndex::dedup_key()`
+        // so the DDL and the writer agree.
+        for tf in TfIndex::ALL {
+            assert_eq!(DEDUP_KEY_CANDLES, tf.dedup_key());
         }
     }
 
@@ -411,40 +352,30 @@ mod tests {
     }
 
     #[test]
-    fn test_canonical_table_name_pattern() {
-        // Defensive: every shadow table name must end with `_shadow` so
-        // the Sub-PR #4 promotion rename script can be a simple
-        // `s/_shadow$//` substitution.
-        for name in shadow_candle_table_names() {
-            assert!(
-                name.ends_with("_shadow"),
-                "table name {name:?} does not end in _shadow — Sub-PR #4 rename will break"
-            );
-            assert!(
-                name.starts_with("candles_"),
-                "table name {name:?} prefix wrong"
-            );
-        }
-    }
-
-    #[test]
-    fn test_canonical_timeframe_ordering_1m_to_1d() {
-        // The 9 timeframes must appear in canonical short-to-long order
-        // because the forthcoming `[AtomicCell<LiveCandleState>; 9]`
-        // hot-path array is indexed by `TfIndex` ordinal. If this order
-        // ever changes, every consumer of `shadow_candle_table_names()`
-        // must be reviewed.
-        let names = shadow_candle_table_names();
+    fn test_candle_table_names_canonical_ordering_1m_to_1d() {
+        let names = candle_table_names();
         let expected = [
-            "candles_1m_shadow",
-            "candles_5m_shadow",
-            "candles_15m_shadow",
-            "candles_30m_shadow",
-            "candles_1h_shadow",
-            "candles_2h_shadow",
-            "candles_3h_shadow",
-            "candles_4h_shadow",
-            "candles_1d_shadow",
+            "candles_1m",
+            "candles_2m",
+            "candles_3m",
+            "candles_4m",
+            "candles_5m",
+            "candles_6m",
+            "candles_7m",
+            "candles_8m",
+            "candles_9m",
+            "candles_10m",
+            "candles_11m",
+            "candles_12m",
+            "candles_13m",
+            "candles_14m",
+            "candles_15m",
+            "candles_30m",
+            "candles_1h",
+            "candles_2h",
+            "candles_3h",
+            "candles_4h",
+            "candles_1d",
         ];
         assert_eq!(names, expected);
     }

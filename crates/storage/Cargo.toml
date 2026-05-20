@@ -28,6 +28,10 @@ deadpool-redis = { workspace = true }
 questdb-rs = { workspace = true }
 reqwest = { workspace = true }
 crossbeam-channel = { workspace = true }
+# Candle-engine re-architecture #T1a Finding S2: the ShadowCandleWriter
+# ILP conf string is wrapped in `Secret<String>` so it is never logged
+# via Debug.
+secrecy = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

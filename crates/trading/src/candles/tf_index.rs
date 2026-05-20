@@ -1,67 +1,38 @@
-//! Wave 6 Sub-PR #1 — bridge between the existing `Timeframe` markers
-//! (`engine.rs::{Tf1m, Tf5m, ..., Tf1d}`) and the 9 shadow tables
-//! defined in PR #551 (`tickvault_storage::shadow_persistence`).
+//! Runtime-indexable timeframe handle for the live candle engine.
 //!
-//! This module exists because the Wave 6 hot-path multi-TF aggregator
-//! needs an O(1) ordinal-indexable mapping from `(timeframe → shadow
-//! table name + DEDUP key + bucket-seconds + display name)`. The
-//! existing `Timeframe` trait carries `SECS` and `NAME` but is a
-//! type-level handle; the new direct-flush writer needs a runtime
-//! enum so a single `[Sender; 9]` ILP sender array can be indexed by
-//! `TfIndex::as_ordinal()`.
+//! The hot-path multi-TF aggregator needs an O(1) ordinal-indexable
+//! mapping from `(timeframe → QuestDB table name + DEDUP key +
+//! bucket-seconds + display name)`. [`TfIndex`] is that handle: a
+//! `#[repr(u8)]` enum whose ordinal indexes the per-instrument
+//! `[Mutex<LiveCandleState>; 21]` slot array AND the storage-side
+//! `[Sender; 21]` ILP writer array.
 //!
-//! Per the locked design decisions in
-//! `.claude/plans/active-plan-aggregator-direct-flush-rehydrate.md`
-//! Sub-PR #1:
+//! ## The 21 timeframes
 //!
-//! - **L-C2** — `[AtomicCell<LiveCandleState>; 9]` indexed by `TfIndex`.
-//! - **L-H10** — 9 shadow tables `candles_{tf}_shadow` with DEDUP UPSERT
-//!   KEYS `(ts, security_id, exchange_segment)`.
-//! - **L-L22** — canonical 1m → 1d ordering (matches the array index
-//!   order returned by `tickvault_storage::shadow_persistence::shadow_candle_table_names`).
+//! The candle re-architecture (#T1) ships ONE aggregator that derives
+//! all 21 timeframes directly from the live tick stream and flushes
+//! each sealed bar straight to its own plain QuestDB table
+//! (`candles_1m` … `candles_1d`). There are no `_shadow` tables, no
+//! `candles_1s` base table, and no materialized-view cascade — every
+//! timeframe is a first-class table written at seal time.
 //!
-//! ## What this module does NOT yet contain
-//!
-//! - The `[AtomicCell<LiveCandleState>; 9]` cell type itself
-//!   (cell type lands in the next commit on this branch, after
-//!   operator approval to add `crossbeam-utils` or `parking_lot` to
-//!   workspace deps; the foundation `LiveCandleState` struct shape +
-//!   bucket-alignment helpers ride along too).
-//! - The `ShadowBarWriter` ring → spill → DLQ writer
-//!   (Sub-PR #1 item 1.2, follow-up commit).
-//! - The boundary timer
-//!   (Sub-PR #1 item 1.3, follow-up commit).
-//!
-//! Cross-refs:
-//! - `crates/storage/src/shadow_persistence.rs` (PR #551 — shadow tables)
-//! - `crates/trading/src/candles/engine.rs` — the `Timeframe` trait
-//!   and the 9 marker types this module bridges to.
-//! - `.claude/rules/project/wave-6-error-codes.md` — Wave 6 ErrorCode
-//!   runbook (used by the writer commit).
+//! Variants are ordered short-to-long (1m → 1d) so the ordinal
+//! returned by [`Self::as_ordinal`] is stable. Reordering variants is
+//! a SEMVER break — every consumer indexing by ordinal (the
+//! per-instrument `[Mutex<LiveCandleState>; 21]`, the ILP
+//! `[Sender; 21]` writer, the audit-table `timeframe` SYMBOL column)
+//! breaks silently.
 
-use crate::candles::{Tf1d, Tf1h, Tf1m, Tf2h, Tf3h, Tf4h, Tf5m, Tf15m, Tf30m, Timeframe};
+/// Number of timeframes the live candle engine derives. Pinned here so
+/// the per-instrument slot array and the storage-side sender array
+/// share one source of truth.
+pub const TF_COUNT: usize = 21;
 
-/// Runtime-indexable handle for the 9 timeframes shipped to shadow
-/// tables in Wave 6 Sub-PR #1.
-///
-/// Variants are ordered short-to-long (1m → 1d) so the ordinal
-/// returned by [`Self::as_ordinal`] is stable and matches the canonical
-/// order returned by
-/// `tickvault_storage::shadow_persistence::shadow_candle_table_names`.
-/// Reordering variants is a SEMVER break — every consumer indexing by
-/// ordinal (the forthcoming `[AtomicCell<LiveCandleState>; 9]` per
-/// instrument, the ILP `[Sender; 9]` writer, the audit-table
-/// `timeframe` SYMBOL column) breaks silently.
-///
-/// The 9 timeframes match the Wave-5 retained ladder
-/// (`engine.rs:172-180` comment): the 12 sub-15-minute non-canonical
-/// timeframes were retired in PR #517. Wave 6 deliberately ships ONLY
-/// the 9 retained timeframes — sub-minute and weekly/monthly
-/// timeframes are NOT shadow-table-backed in this plan.
+/// Runtime-indexable handle for the 21 candle timeframes.
 ///
 /// Use [`Self::ALL`] to iterate. Use [`Self::from_ordinal`] for
 /// runtime decoding (e.g. parsing audit-table rows). Use
-/// [`Self::shadow_table_name`] / [`Self::shadow_dedup_key`] /
+/// [`Self::table_name`] / [`Self::dedup_key`] /
 /// [`Self::seconds_per_bucket`] / [`Self::display_name`] for direct
 /// look-up without recomputing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -69,35 +40,70 @@ use crate::candles::{Tf1d, Tf1h, Tf1m, Tf2h, Tf3h, Tf4h, Tf5m, Tf15m, Tf30m, Tim
 pub enum TfIndex {
     /// 1-minute candles (60 s).
     M1 = 0,
+    /// 2-minute candles (120 s).
+    M2 = 1,
+    /// 3-minute candles (180 s).
+    M3 = 2,
+    /// 4-minute candles (240 s).
+    M4 = 3,
     /// 5-minute candles (300 s).
-    M5 = 1,
+    M5 = 4,
+    /// 6-minute candles (360 s).
+    M6 = 5,
+    /// 7-minute candles (420 s).
+    M7 = 6,
+    /// 8-minute candles (480 s).
+    M8 = 7,
+    /// 9-minute candles (540 s).
+    M9 = 8,
+    /// 10-minute candles (600 s).
+    M10 = 9,
+    /// 11-minute candles (660 s).
+    M11 = 10,
+    /// 12-minute candles (720 s).
+    M12 = 11,
+    /// 13-minute candles (780 s).
+    M13 = 12,
+    /// 14-minute candles (840 s).
+    M14 = 13,
     /// 15-minute candles (900 s).
-    M15 = 2,
+    M15 = 14,
     /// 30-minute candles (1_800 s).
-    M30 = 3,
+    M30 = 15,
     /// 1-hour candles (3_600 s).
-    H1 = 4,
+    H1 = 16,
     /// 2-hour candles (7_200 s).
-    H2 = 5,
+    H2 = 17,
     /// 3-hour candles (10_800 s).
-    H3 = 6,
+    H3 = 18,
     /// 4-hour candles (14_400 s).
-    H4 = 7,
-    /// 1-day candles (86_400 s — UTC-aligned per `Tf1d` doc; the
+    H4 = 19,
+    /// 1-day candles (86_400 s — UTC-aligned arithmetic; the
     /// IST-midnight rollover task force-seals open bars at IST 00:00
     /// every trading day so the UTC boundary does not produce stale
     /// candles in practice).
-    D1 = 8,
+    D1 = 20,
 }
 
 impl TfIndex {
-    /// All 9 timeframes in canonical short-to-long order. The index
+    /// All 21 timeframes in canonical short-to-long order. The index
     /// of each entry equals its [`Self::as_ordinal`] value, which the
-    /// hot-path `[AtomicCell<LiveCandleState>; 9]` array indexing
-    /// relies on.
-    pub const ALL: [TfIndex; 9] = [
+    /// hot-path `[Mutex<LiveCandleState>; 21]` array indexing relies on.
+    pub const ALL: [TfIndex; TF_COUNT] = [
         TfIndex::M1,
+        TfIndex::M2,
+        TfIndex::M3,
+        TfIndex::M4,
         TfIndex::M5,
+        TfIndex::M6,
+        TfIndex::M7,
+        TfIndex::M8,
+        TfIndex::M9,
+        TfIndex::M10,
+        TfIndex::M11,
+        TfIndex::M12,
+        TfIndex::M13,
+        TfIndex::M14,
         TfIndex::M15,
         TfIndex::M30,
         TfIndex::H1,
@@ -107,10 +113,9 @@ impl TfIndex {
         TfIndex::D1,
     ];
 
-    /// Returns the ordinal (0..=8) used to index the per-instrument
-    /// `[AtomicCell<LiveCandleState>; 9]` array AND the
-    /// `tickvault_storage::shadow_persistence::shadow_candle_table_names`
-    /// return value.
+    /// Returns the ordinal (`0..TF_COUNT`) used to index the
+    /// per-instrument `[Mutex<LiveCandleState>; 21]` array AND the
+    /// storage-side `[Sender; 21]` ILP writer array.
     #[inline]
     #[must_use]
     pub const fn as_ordinal(self) -> usize {
@@ -118,79 +123,99 @@ impl TfIndex {
     }
 
     /// Decodes an ordinal back to a [`TfIndex`]. Returns `None` for
-    /// out-of-range input (≥ 9). Used by the audit-table reader and
-    /// any future MCP `questdb_sql` consumer that surfaces
+    /// out-of-range input (`>= TF_COUNT`). Used by the audit-table
+    /// reader and any MCP `questdb_sql` consumer that surfaces
     /// `timeframe` SYMBOL rows.
     #[inline]
     #[must_use]
     pub const fn from_ordinal(ord: usize) -> Option<Self> {
         match ord {
             0 => Some(Self::M1),
-            1 => Some(Self::M5),
-            2 => Some(Self::M15),
-            3 => Some(Self::M30),
-            4 => Some(Self::H1),
-            5 => Some(Self::H2),
-            6 => Some(Self::H3),
-            7 => Some(Self::H4),
-            8 => Some(Self::D1),
+            1 => Some(Self::M2),
+            2 => Some(Self::M3),
+            3 => Some(Self::M4),
+            4 => Some(Self::M5),
+            5 => Some(Self::M6),
+            6 => Some(Self::M7),
+            7 => Some(Self::M8),
+            8 => Some(Self::M9),
+            9 => Some(Self::M10),
+            10 => Some(Self::M11),
+            11 => Some(Self::M12),
+            12 => Some(Self::M13),
+            13 => Some(Self::M14),
+            14 => Some(Self::M15),
+            15 => Some(Self::M30),
+            16 => Some(Self::H1),
+            17 => Some(Self::H2),
+            18 => Some(Self::H3),
+            19 => Some(Self::H4),
+            20 => Some(Self::D1),
             _ => None,
         }
     }
 
-    /// Returns the QuestDB shadow table name for this timeframe.
-    /// Matches the constants in
-    /// `tickvault_storage::shadow_persistence::QUESTDB_TABLE_CANDLES_*M_SHADOW`
-    /// exactly so the forthcoming `ShadowBarWriter` can use this for
-    /// `Buffer::table(...)` without re-importing storage constants.
+    /// Returns the plain QuestDB table name for this timeframe
+    /// (`candles_1m` … `candles_1d`). The seal-time ILP writer uses
+    /// this for `Buffer::table(...)`.
     #[inline]
     #[must_use]
-    pub const fn shadow_table_name(self) -> &'static str {
+    pub const fn table_name(self) -> &'static str {
         match self {
-            Self::M1 => "candles_1m_shadow",
-            Self::M5 => "candles_5m_shadow",
-            Self::M15 => "candles_15m_shadow",
-            Self::M30 => "candles_30m_shadow",
-            Self::H1 => "candles_1h_shadow",
-            Self::H2 => "candles_2h_shadow",
-            Self::H3 => "candles_3h_shadow",
-            Self::H4 => "candles_4h_shadow",
-            Self::D1 => "candles_1d_shadow",
+            Self::M1 => "candles_1m",
+            Self::M2 => "candles_2m",
+            Self::M3 => "candles_3m",
+            Self::M4 => "candles_4m",
+            Self::M5 => "candles_5m",
+            Self::M6 => "candles_6m",
+            Self::M7 => "candles_7m",
+            Self::M8 => "candles_8m",
+            Self::M9 => "candles_9m",
+            Self::M10 => "candles_10m",
+            Self::M11 => "candles_11m",
+            Self::M12 => "candles_12m",
+            Self::M13 => "candles_13m",
+            Self::M14 => "candles_14m",
+            Self::M15 => "candles_15m",
+            Self::M30 => "candles_30m",
+            Self::H1 => "candles_1h",
+            Self::H2 => "candles_2h",
+            Self::H3 => "candles_3h",
+            Self::H4 => "candles_4h",
+            Self::D1 => "candles_1d",
         }
     }
 
-    /// Returns the DEDUP UPSERT KEY suffix for this timeframe's shadow
-    /// table. Matches `tickvault_storage::shadow_persistence::DEDUP_KEY_CANDLES_*M_SHADOW`.
-    /// All 9 timeframes share the same suffix `"security_id, exchange_segment"`
-    /// per locked decision L-H10 (composite I-P1-11 key); future schema
-    /// changes that diverge per-TF would update this method per-variant.
+    /// Returns the `DEDUP UPSERT KEYS(...)` column list for this
+    /// timeframe's table. Includes the designated timestamp `ts`
+    /// explicitly — QuestDB rejects a DEDUP key that omits the
+    /// designated timestamp column. The composite `(security_id,
+    /// segment)` satisfies the I-P1-11 segment-aware uniqueness rule.
     #[inline]
     #[must_use]
-    pub const fn shadow_dedup_key(self) -> &'static str {
-        // All 9 share the same key today; encoded per-variant so
-        // future divergence is a single-line change without breaking
-        // callers.
-        match self {
-            Self::M1
-            | Self::M5
-            | Self::M15
-            | Self::M30
-            | Self::H1
-            | Self::H2
-            | Self::H3
-            | Self::H4
-            | Self::D1 => "security_id, exchange_segment",
-        }
+    pub const fn dedup_key(self) -> &'static str {
+        "ts, security_id, segment"
     }
 
-    /// Bucket size in seconds — the same value carried by the
-    /// existing `Timeframe::SECS` associated constant.
+    /// Bucket size in seconds.
     #[inline]
     #[must_use]
     pub const fn seconds_per_bucket(self) -> u32 {
         match self {
             Self::M1 => 60,
+            Self::M2 => 120,
+            Self::M3 => 180,
+            Self::M4 => 240,
             Self::M5 => 300,
+            Self::M6 => 360,
+            Self::M7 => 420,
+            Self::M8 => 480,
+            Self::M9 => 540,
+            Self::M10 => 600,
+            Self::M11 => 660,
+            Self::M12 => 720,
+            Self::M13 => 780,
+            Self::M14 => 840,
             Self::M15 => 900,
             Self::M30 => 1_800,
             Self::H1 => 3_600,
@@ -201,15 +226,26 @@ impl TfIndex {
         }
     }
 
-    /// Short display name (`"1m"`, `"5m"`, ..., `"1d"`) — same string
-    /// the existing `Timeframe::NAME` carries. Stable across the
-    /// codebase and the audit-table `timeframe` SYMBOL column.
+    /// Short display name (`"1m"`, `"2m"`, ..., `"1d"`). Stable across
+    /// the codebase and the audit-table `timeframe` SYMBOL column.
     #[inline]
     #[must_use]
     pub const fn display_name(self) -> &'static str {
         match self {
             Self::M1 => "1m",
+            Self::M2 => "2m",
+            Self::M3 => "3m",
+            Self::M4 => "4m",
             Self::M5 => "5m",
+            Self::M6 => "6m",
+            Self::M7 => "7m",
+            Self::M8 => "8m",
+            Self::M9 => "9m",
+            Self::M10 => "10m",
+            Self::M11 => "11m",
+            Self::M12 => "12m",
+            Self::M13 => "13m",
+            Self::M14 => "14m",
             Self::M15 => "15m",
             Self::M30 => "30m",
             Self::H1 => "1h",
@@ -221,16 +257,10 @@ impl TfIndex {
     }
 
     /// Aligns a tick's IST-second timestamp to the start of its
-    /// containing bucket for this timeframe. Matches the existing
-    /// `Timeframe::bucket_start` math.
-    ///
-    /// Used by the boundary timer (Sub-PR #1 item 1.3) and the
-    /// missed-boundary catch-up logic (BOUNDARY-01) to compute the
-    /// bucket-open `ts` for a sealed candle.
+    /// containing bucket for this timeframe.
     ///
     /// `tick_ist_secs` MUST be the IST epoch second derived from the
-    /// WS LTT field (NEVER `Utc::now()` per locked decision L-H7 and
-    /// `data-integrity.md`).
+    /// WS LTT field (NEVER `Utc::now()` per `data-integrity.md`).
     #[inline]
     #[must_use]
     pub const fn bucket_start(self, tick_ist_secs: u32) -> u32 {
@@ -248,25 +278,6 @@ impl TfIndex {
 }
 
 // ---------------------------------------------------------------------------
-// Compile-time agreement with the type-level `Timeframe` trait.
-//
-// These const assertions fail to compile if `Timeframe::SECS` ever
-// drifts from `TfIndex::seconds_per_bucket()` for any of the 9
-// shadow-table-backed timeframes. Catches the regression pre-runtime
-// without depending on `cargo test`.
-// ---------------------------------------------------------------------------
-
-const _: () = assert!(<Tf1m as Timeframe>::SECS == TfIndex::M1.seconds_per_bucket());
-const _: () = assert!(<Tf5m as Timeframe>::SECS == TfIndex::M5.seconds_per_bucket());
-const _: () = assert!(<Tf15m as Timeframe>::SECS == TfIndex::M15.seconds_per_bucket());
-const _: () = assert!(<Tf30m as Timeframe>::SECS == TfIndex::M30.seconds_per_bucket());
-const _: () = assert!(<Tf1h as Timeframe>::SECS == TfIndex::H1.seconds_per_bucket());
-const _: () = assert!(<Tf2h as Timeframe>::SECS == TfIndex::H2.seconds_per_bucket());
-const _: () = assert!(<Tf3h as Timeframe>::SECS == TfIndex::H3.seconds_per_bucket());
-const _: () = assert!(<Tf4h as Timeframe>::SECS == TfIndex::H4.seconds_per_bucket());
-const _: () = assert!(<Tf1d as Timeframe>::SECS == TfIndex::D1.seconds_per_bucket());
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -275,12 +286,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_tf_index_all_has_nine_distinct_variants() {
+    fn test_tf_index_all_has_twenty_one_distinct_variants() {
         let mut seen = std::collections::HashSet::new();
         for tf in TfIndex::ALL {
             assert!(seen.insert(tf), "duplicate variant in TfIndex::ALL: {tf:?}");
         }
-        assert_eq!(TfIndex::ALL.len(), 9);
+        assert_eq!(TfIndex::ALL.len(), TF_COUNT);
+        assert_eq!(TF_COUNT, 21);
     }
 
     #[test]
@@ -314,80 +326,78 @@ mod tests {
 
     #[test]
     fn test_tf_index_from_ordinal_rejects_out_of_range() {
-        assert_eq!(TfIndex::from_ordinal(9), None);
+        assert_eq!(TfIndex::from_ordinal(TF_COUNT), None);
         assert_eq!(TfIndex::from_ordinal(usize::MAX), None);
     }
 
     #[test]
-    fn test_tf_index_shadow_table_names_match_storage_constants_literally() {
-        // The forthcoming hot-path `[Sender; 9]` writer in the storage
-        // crate indexes by `TfIndex::as_ordinal()`. To keep the two
-        // sides aligned WITHOUT introducing a `tickvault-trading →
-        // tickvault-storage` dep cycle (the workspace flow is
-        // common ← core ← trading ← storage ← api ← app), we pin
-        // the strings literally on BOTH sides. This test verifies
-        // the trading-side view; the symmetric verification lives in
-        // `crates/storage/src/shadow_persistence.rs::tests::test_canonical_table_name_pattern`
-        // (which pins the same 9 strings in canonical order).
-        //
-        // If a future change diverges one side from the other, BOTH
-        // tests fail with the literal string mismatch — operator
-        // sees the gap immediately.
-        let bridge_names: [&str; 9] = std::array::from_fn(|i| {
+    fn test_tf_index_table_names_are_plain_and_canonical() {
+        let names: [&str; TF_COUNT] = std::array::from_fn(|i| {
             TfIndex::from_ordinal(i)
-                .expect("ordinal in 0..9")
-                .shadow_table_name()
+                .expect("ordinal in range")
+                .table_name()
         });
         let expected = [
-            "candles_1m_shadow",
-            "candles_5m_shadow",
-            "candles_15m_shadow",
-            "candles_30m_shadow",
-            "candles_1h_shadow",
-            "candles_2h_shadow",
-            "candles_3h_shadow",
-            "candles_4h_shadow",
-            "candles_1d_shadow",
+            "candles_1m",
+            "candles_2m",
+            "candles_3m",
+            "candles_4m",
+            "candles_5m",
+            "candles_6m",
+            "candles_7m",
+            "candles_8m",
+            "candles_9m",
+            "candles_10m",
+            "candles_11m",
+            "candles_12m",
+            "candles_13m",
+            "candles_14m",
+            "candles_15m",
+            "candles_30m",
+            "candles_1h",
+            "candles_2h",
+            "candles_3h",
+            "candles_4h",
+            "candles_1d",
         ];
-        assert_eq!(bridge_names, expected);
+        assert_eq!(names, expected);
+        // No `_shadow` suffix anywhere — these are first-class tables.
+        for name in names {
+            assert!(!name.contains("shadow"), "{name} must be a plain table");
+        }
     }
 
     #[test]
-    fn test_tf_index_dedup_key_matches_storage_constant_literally() {
-        // Every TfIndex variant returns the I-P1-11 composite key
-        // `"security_id, exchange_segment"` per L-H10. Symmetric
-        // verification on the storage side lives in
-        // `dedup_segment_meta_guard.rs` (workspace-wide scan) +
-        // `shadow_persistence.rs::tests::test_every_dedup_key_includes_exchange_segment`.
+    fn test_tf_index_table_names_unique() {
+        let mut seen = std::collections::HashSet::new();
         for tf in TfIndex::ALL {
-            assert_eq!(
-                tf.shadow_dedup_key(),
-                "security_id, exchange_segment",
-                "DEDUP key for {} diverged from canonical I-P1-11 composite",
-                tf.display_name()
+            assert!(
+                seen.insert(tf.table_name()),
+                "duplicate table_name {}",
+                tf.table_name()
             );
         }
     }
 
     #[test]
-    fn test_tf_index_dedup_keys_all_contain_segment_for_i_p1_11() {
-        // Composite key compliance: every shadow table's DEDUP key
-        // MUST contain `exchange_segment` per
-        // `.claude/rules/project/security-id-uniqueness.md`. The
-        // workspace-wide `dedup_segment_meta_guard.rs` enforces this
-        // at the storage-crate level; this test pins the bridge
-        // module's view of the same invariant.
+    fn test_tf_index_dedup_key_includes_ts_and_segment_for_i_p1_11() {
+        // QuestDB rejects a DEDUP key that omits the designated
+        // timestamp; I-P1-11 requires the segment alongside security_id.
         for tf in TfIndex::ALL {
-            let key = tf.shadow_dedup_key();
+            let key = tf.dedup_key();
             assert!(
-                key.contains("exchange_segment"),
-                "I-P1-11 violation: {} dedup key {:?} missing `exchange_segment`",
-                tf.display_name(),
-                key
+                key.contains("ts"),
+                "{} dedup key missing ts",
+                tf.display_name()
             );
             assert!(
                 key.contains("security_id"),
-                "{} dedup key {:?} missing `security_id`",
+                "{} dedup key missing security_id",
+                tf.display_name()
+            );
+            assert!(
+                key.contains("segment"),
+                "I-P1-11 violation: {} dedup key {:?} missing segment",
                 tf.display_name(),
                 key
             );
@@ -397,7 +407,10 @@ mod tests {
     #[test]
     fn test_tf_index_display_names_unique_and_stable() {
         let mut seen = std::collections::HashSet::new();
-        let expected = ["1m", "5m", "15m", "30m", "1h", "2h", "3h", "4h", "1d"];
+        let expected = [
+            "1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "10m", "11m", "12m", "13m",
+            "14m", "15m", "30m", "1h", "2h", "3h", "4h", "1d",
+        ];
         for (idx, tf) in TfIndex::ALL.iter().enumerate() {
             let name = tf.display_name();
             assert_eq!(
@@ -409,56 +422,55 @@ mod tests {
     }
 
     #[test]
-    fn test_tf_index_seconds_per_bucket_matches_existing_timeframe_secs() {
-        // The compile-time `assert!` blocks above already pin this for
-        // each TF, but a runtime test makes the contract visible to
-        // grep + IDE jump-to-test workflows.
-        assert_eq!(<Tf1m as Timeframe>::SECS, TfIndex::M1.seconds_per_bucket());
-        assert_eq!(<Tf5m as Timeframe>::SECS, TfIndex::M5.seconds_per_bucket());
-        assert_eq!(
-            <Tf15m as Timeframe>::SECS,
-            TfIndex::M15.seconds_per_bucket()
-        );
-        assert_eq!(
-            <Tf30m as Timeframe>::SECS,
-            TfIndex::M30.seconds_per_bucket()
-        );
-        assert_eq!(<Tf1h as Timeframe>::SECS, TfIndex::H1.seconds_per_bucket());
-        assert_eq!(<Tf2h as Timeframe>::SECS, TfIndex::H2.seconds_per_bucket());
-        assert_eq!(<Tf3h as Timeframe>::SECS, TfIndex::H3.seconds_per_bucket());
-        assert_eq!(<Tf4h as Timeframe>::SECS, TfIndex::H4.seconds_per_bucket());
-        assert_eq!(<Tf1d as Timeframe>::SECS, TfIndex::D1.seconds_per_bucket());
+    fn test_tf_index_seconds_per_bucket_values() {
+        assert_eq!(TfIndex::M1.seconds_per_bucket(), 60);
+        assert_eq!(TfIndex::M15.seconds_per_bucket(), 900);
+        assert_eq!(TfIndex::M30.seconds_per_bucket(), 1_800);
+        assert_eq!(TfIndex::H1.seconds_per_bucket(), 3_600);
+        assert_eq!(TfIndex::H4.seconds_per_bucket(), 14_400);
+        assert_eq!(TfIndex::D1.seconds_per_bucket(), 86_400);
+        // The 1m..15m ladder is exactly one minute apart per step.
+        for tf in [
+            TfIndex::M1,
+            TfIndex::M2,
+            TfIndex::M3,
+            TfIndex::M4,
+            TfIndex::M5,
+            TfIndex::M6,
+            TfIndex::M7,
+            TfIndex::M8,
+            TfIndex::M9,
+            TfIndex::M10,
+            TfIndex::M11,
+            TfIndex::M12,
+            TfIndex::M13,
+            TfIndex::M14,
+            TfIndex::M15,
+        ] {
+            assert_eq!(tf.seconds_per_bucket() % 60, 0);
+        }
     }
 
     #[test]
     fn test_tf_index_bucket_start_aligns_to_seconds_per_bucket() {
-        // Bucket-start math must be a true downward floor at the
-        // bucket-seconds granularity. Tested across all 9 TFs with an
-        // arbitrary "now" that's NOT bucket-aligned for any of them.
-        let arbitrary = 123_456_789_u32; // not divisible by 60/300/900/1800/3600/...
+        let arbitrary = 123_456_789_u32;
         for tf in TfIndex::ALL {
             let bucket = tf.bucket_start(arbitrary);
             let secs = tf.seconds_per_bucket();
             assert!(
                 bucket <= arbitrary,
-                "bucket_start {} > input {} for tf {}",
-                bucket,
-                arbitrary,
+                "bucket_start past input for {}",
                 tf.display_name()
             );
             assert_eq!(
                 bucket % secs,
                 0,
-                "bucket_start {} not aligned to {} for tf {}",
-                bucket,
-                secs,
+                "bucket_start unaligned for {}",
                 tf.display_name()
             );
             assert!(
                 arbitrary - bucket < secs,
-                "bucket_start {} too far below input {} for tf {}",
-                bucket,
-                arbitrary,
+                "bucket_start too far below input for {}",
                 tf.display_name()
             );
         }
@@ -472,7 +484,7 @@ mod tests {
             assert_eq!(
                 tf.bucket_start(aligned),
                 aligned,
-                "bucket_start should be idempotent on already-aligned input for {}",
+                "bucket_start should be idempotent on aligned input for {}",
                 tf.display_name()
             );
         }
@@ -481,7 +493,7 @@ mod tests {
     #[test]
     fn test_tf_index_bucket_end_equals_start_plus_secs() {
         for tf in TfIndex::ALL {
-            let start = tf.bucket_start(1_716_192_000_u32); // arbitrary
+            let start = tf.bucket_start(1_716_192_000_u32);
             let end = tf.bucket_end(start);
             assert_eq!(end - start, tf.seconds_per_bucket());
         }
@@ -489,27 +501,13 @@ mod tests {
 
     #[test]
     fn test_tf_index_repr_u8_matches_ordinal() {
-        // `#[repr(u8)]` + explicit discriminants → cast to u8 == as_ordinal.
-        // This isn't load-bearing for any call site today but pins the
-        // representation so a future change that adds custom Drop or
-        // similar can be detected.
-        assert_eq!(TfIndex::M1 as u8, 0);
-        assert_eq!(TfIndex::M5 as u8, 1);
-        assert_eq!(TfIndex::M15 as u8, 2);
-        assert_eq!(TfIndex::M30 as u8, 3);
-        assert_eq!(TfIndex::H1 as u8, 4);
-        assert_eq!(TfIndex::H2 as u8, 5);
-        assert_eq!(TfIndex::H3 as u8, 6);
-        assert_eq!(TfIndex::H4 as u8, 7);
-        assert_eq!(TfIndex::D1 as u8, 8);
+        for (idx, tf) in TfIndex::ALL.iter().enumerate() {
+            assert_eq!(*tf as u8, u8::try_from(idx).expect("ordinal fits u8"));
+        }
     }
 
     #[test]
     fn test_tf_index_canonical_total_ordering_matches_secs_ordering() {
-        // PartialOrd + Ord on TfIndex are derived; the variant order
-        // (M1 < M5 < ... < D1) thus matches seconds ascending. This
-        // test pins the contract: a future re-ordering of the enum
-        // variants would silently flip Ord results.
         let mut sorted = TfIndex::ALL.to_vec();
         sorted.sort();
         assert_eq!(sorted, TfIndex::ALL);
