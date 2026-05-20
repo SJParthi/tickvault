@@ -11,9 +11,9 @@
 set -euo pipefail
 
 export TV_QUESTDB_PG_USER="${TV_QUESTDB_PG_USER:-_teardown}"
-export TV_QUESTDB_PG_PASSWORD="${TV_QUESTDB_PG_PASSWORD:-_teardown}"
+export TV_QUESTDB_PG_PASSWORD="${TV_QUESTDB_PG_PASSWORD:-_teardown}" # secret-scan-ignore: compose-parse placeholder, never a real secret
 export TV_GRAFANA_ADMIN_USER="${TV_GRAFANA_ADMIN_USER:-_teardown}"
-export TV_GRAFANA_ADMIN_PASSWORD="${TV_GRAFANA_ADMIN_PASSWORD:-_teardown}"
+export TV_GRAFANA_ADMIN_PASSWORD="${TV_GRAFANA_ADMIN_PASSWORD:-_teardown}" # secret-scan-ignore: compose-parse placeholder, never a real secret
 
 docker compose -f deploy/docker/docker-compose.yml down --remove-orphans
 echo ""
