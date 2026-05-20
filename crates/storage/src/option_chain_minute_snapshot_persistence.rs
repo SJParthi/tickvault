@@ -4,7 +4,7 @@
 //! Persists the option chain snapshot fetched 3 times per minute for
 //! each configured underlying (SENSEX :53, BANKNIFTY :56, NIFTY :59 by
 //! default). One ROW PER STRIKE PER SIDE (CE or PE) so dashboards can
-//! `JOIN` directly against `decision_audit` for forensic trace:
+//! answer forensic queries:
 //!
 //!   * "What was the IV of NIFTY 25650-CE at 11:23:00 IST when BRUTEX
 //!      entered the position?"

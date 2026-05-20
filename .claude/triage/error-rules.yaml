@@ -1697,19 +1697,6 @@ rules:
       Severity::Info. Operational lifecycle ping — no Telegram. Available
       in CloudWatch Logs for audit.
 
-  - name: aggregator-audit-01-write-failed-escalate
-    match:
-      code: AGGREGATOR-AUDIT-01
-    action: escalate
-    runbook_path: .claude/rules/project/wave-6-error-codes.md
-    confidence: 0.95
-    cooldown_secs: 60
-    justification: >-
-      AGGREGATOR-AUDIT-01 = aggregator_seal_audit write failed.
-      Severity::Medium. SEBI-relevant forensic record loss; surface
-      immediately. Same triage as AUDIT-01 — check QuestDB ILP TCP
-      port + disk-full state.
-
   - name: orphan-position-01-detected-escalate
     match:
       code: ORPHAN-POSITION-01
