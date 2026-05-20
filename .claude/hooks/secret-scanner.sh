@@ -56,8 +56,12 @@ scan_secret() {
       continue
     fi
 
+    # -E (ERE) is required: several patterns use {N}/{N,} quantifiers which
+    # are literal text under plain grep (BRE) and would never match — e.g.
+    # the AWS Access Key ID pattern AKIA[0-9A-Z]{16}.
     local matches
-    matches=$(grep -n -i "$pattern" "$full_path" 2>/dev/null \
+    matches=$(grep -n -i -E "$pattern" "$full_path" 2>/dev/null \
+      | grep -v 'secret-scan-ignore' \
       | grep -v '// test' \
       | grep -v '/// ' \
       | grep -v '#\[doc' \
@@ -118,7 +122,10 @@ scan_secret 'password.*=.*"[^"]' 'Hardcoded password'
 scan_secret 'passwd.*=.*"[^"]' 'Hardcoded password'
 scan_secret 'private[_-]key.*=.*"' 'Hardcoded private key'
 scan_secret 'BEGIN.*PRIVATE KEY' 'Embedded private key'
-scan_secret 'bearer.*[A-Za-z0-9_-]{20,}' 'Hardcoded bearer token'
+# Require a space or quote after "bearer" so identifiers like
+# `bearer_token_path` do not false-positive — only a real token value
+# (`Bearer eyJ...`, `bearer = "..."`) follows a space/quote.
+scan_secret 'bearer[ "][A-Za-z0-9_/+.=-]{20,}' 'Hardcoded bearer token'
 
 # Telegram bot tokens
 scan_secret 'bot[0-9]{8,}:' 'Hardcoded Telegram bot token'
