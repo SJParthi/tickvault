@@ -209,13 +209,11 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
 
 /// Issue one DDL statement to QuestDB's `/exec` endpoint.
 ///
-/// Finding S5: the DDL is sent via HTTP **POST** (was GET). QuestDB's
-/// `/exec` endpoint accepts POST — using POST instead of GET keeps the
-/// (potentially long) DDL statement out of the request line that
-/// intermediary proxies / access-logs record verbatim. The `query`
-/// parameter is form-urlencoded into the POST request body via an
-/// explicit `Content-Type: application/x-www-form-urlencoded` header
-/// (the `reqwest` `form` feature is not enabled in this workspace).
+/// QuestDB's `/exec` endpoint is **GET-only** — it returns
+/// `405 Method Not Allowed` for POST. The `query` parameter is
+/// URL-encoded by reqwest's query-string builder. (The #T1a precursor
+/// briefly switched this to POST to keep DDL out of access logs — that
+/// regressed every candle-table DDL to 405; reverted here.)
 async fn run_ddl(client: &Client, base_url: &str, table: &str, ddl: &str) {
     // Manual form-urlencoding of the single `query=<ddl>` field.
     let body = format!("query={}", urlencode(ddl));
