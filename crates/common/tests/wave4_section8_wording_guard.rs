@@ -12,14 +12,16 @@
 //! handling. Wording in `wave-4-shared-preamble.md` + `per-wave-guarantee-matrix.md`
 //! updated to "2,000,000-tick" in tandem.
 //!
-//! 2026-05-11 (Wave 7-A4): rescue ring capacity bumped 2M → 5M (~1.0 GB
-//! pre-allocated VecDeque) per RAM-first hot-path hardening spec in
-//! `.claude/rules/project/aws-budget.md` § "Host Memory Budget — Wave
-//! 7-A4 Locked". Wording in both rule files updated to "5,000,000-tick"
-//! in tandem.
+//! 2026-05-11 (Wave 7-A4): rescue ring capacity bumped 2M → 5M for the
+//! old large universe.
+//!
+//! 2026-05-20: rescue ring rightsized 5M → 100K (~20 MB pre-allocated
+//! VecDeque) — the universe narrowed to 4 IDX_I SIDs (~15-20 tps), so
+//! a 5M ring buffered ~130 hours for a feed that needs minutes.
+//! Wording in both rule files updated to "100,000-tick" in tandem.
 //!
 //! After investigation:
-//! - `TICK_BUFFER_CAPACITY = 5_000_000` exists in
+//! - `TICK_BUFFER_CAPACITY = 100_000` exists in
 //!   `crates/common/src/constants.rs` and is ratcheted by
 //!   `crates/storage/tests/zero_tick_loss_alert_guard.rs`.
 //! - The 65h Fri 16:00 → Mon 09:00 IST weekend sleep/wake test
@@ -61,17 +63,17 @@ fn section8_does_not_claim_unproven_70h_chaos() {
 }
 
 #[test]
-fn section8_keeps_2m_rescue_ring_claim_with_evidence_pointer() {
+fn section8_keeps_rescue_ring_claim_with_evidence_pointer() {
     for (label, path) in [("preamble", PREAMBLE_PATH), ("matrix", MATRIX_PATH)] {
         let text = read(path);
-        // PR #452 (2026-05-03): rescue ring bumped 600K → 2M. The
-        // claim must cite the constant + ratchet test so future
-        // readers can verify the proof in one grep.
+        // 2026-05-20: rescue ring rightsized 5M → 100K for the 4-SID
+        // indices-only universe. The claim must cite the constant +
+        // ratchet test so future readers can verify the proof.
         assert!(
-            text.contains("5,000,000-tick ring buffer capacity"),
-            "{label} ({path}) must keep the proven 5,000,000-tick ring \
-             buffer capacity claim (Wave 7-A4 bumped 2M → 5M for \
-             RAM-first hot-path hardening per aws-budget.md)."
+            text.contains("100,000-tick ring buffer capacity"),
+            "{label} ({path}) must keep the proven 100,000-tick ring \
+             buffer capacity claim (rightsized 5M → 100K 2026-05-20 for \
+             the 4-SID indices-only universe per aws-budget.md)."
         );
         assert!(
             text.contains("`TICK_BUFFER_CAPACITY`"),
@@ -81,7 +83,7 @@ fn section8_keeps_2m_rescue_ring_claim_with_evidence_pointer() {
         assert!(
             text.contains("zero_tick_loss_alert_guard.rs"),
             "{label} ({path}) must cite the ratchet test that pins the \
-             2,000,000 value."
+             100,000 value."
         );
     }
 }
