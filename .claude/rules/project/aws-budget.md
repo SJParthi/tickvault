@@ -3,6 +3,34 @@
 > **Authority:** Parthiban (architect). Non-negotiable.
 > **Scope:** Any file touching AWS deployment, infrastructure, Docker config, or cost-impacting changes.
 
+## OPERATOR DECISION 2026-05-20 — Observability stack → CloudWatch-only
+
+> **Operator (Parthiban), 2026-05-20:** "except questdb app and cloud
+> watch we planned to remove everything."
+
+The runtime is being narrowed to **THREE components only**:
+
+| Keep | Role |
+|---|---|
+| **QuestDB** | the single data plane — 24-table KEEP set |
+| **tickvault app** | the host process |
+| **AWS CloudWatch** | the entire observability layer — metrics, logs, alarms |
+
+**REMOVED (supersedes the Wave 7-A "Docker containers" list below):**
+Grafana, Prometheus, Alertmanager, **Valkey**. The frontend / portal /
+TradingView terminal and Jaeger / Loki / Alloy / Traefik were already
+removed in earlier PRs.
+
+This **supersedes** every "KEEP Grafana / Prometheus / Valkey /
+Alertmanager" statement in the Wave 7-A sections below — those memory
+budgets, RAM-trim tables and the "100% Coverage Verification" table are
+now stale and are recomputed by the removal PRs.
+
+**Execution is staged, NOT done here.** This is a multi-PR program —
+see `.claude/plans/active-plan-observability-cloudwatch-only.md`.
+**Valkey is load-bearing** (dual-instance lock + token cache); its
+removal is the highest-risk PR and must not be half-shipped (Rule 14).
+
 ## Budget: ₹5,000/month MAXIMUM (all AWS services included)
 
 ### Approved AWS Bill (verified from AWS Pricing API, ap-south-1, 2026-04-08)
