@@ -1286,31 +1286,6 @@ mod tests {
         assert!(INFRA_HEALTH_POLL_INTERVAL < INFRA_HEALTH_TIMEOUT);
     }
 
-    /// Regression: 2026-04-28 — boot logged "Grafana service is healthy"
-    /// 0.4 s after `docker compose up -d` returned, but Grafana's HTTP
-    /// server takes 5–10 s to come up. The TCP probe was passing on a
-    /// listener that wasn't serving yet, leading to operator-visible
-    /// ERR_CONNECTION_REFUSED in the browser. The fix layers an HTTP
-    /// probe of `/api/health` on top of the TCP probe. Source-scan
-    /// ratchet locks both pieces in place.
-    #[test]
-    fn test_grafana_health_probe_polls_api_health_endpoint() {
-        let src = include_str!("infra.rs");
-        assert!(
-            src.contains("async fn wait_for_http_endpoint_healthy"),
-            "infra must define an HTTP-level health probe helper"
-        );
-        assert!(
-            src.contains("wait_for_http_endpoint_healthy(\n        \"Grafana\",")
-                || src.contains("wait_for_http_endpoint_healthy(\"Grafana\","),
-            "infra must call wait_for_http_endpoint_healthy with Grafana as the service name"
-        );
-        assert!(
-            src.contains("/api/health"),
-            "Grafana HTTP probe must hit the /api/health endpoint"
-        );
-    }
-
     #[test]
     fn test_docker_daemon_timeout_is_reasonable() {
         assert!(DOCKER_DAEMON_TIMEOUT.as_secs() >= 30);
@@ -1517,16 +1492,6 @@ mod tests {
     }
 
     #[test]
-    fn test_dashboard_services_includes_grafana() {
-        assert!(
-            DASHBOARD_SERVICES
-                .iter()
-                .any(|&(name, _, _, _)| name == "Grafana"),
-            "Grafana must be in DASHBOARD_SERVICES"
-        );
-    }
-
-    #[test]
     fn test_dashboard_services_includes_questdb() {
         assert!(
             DASHBOARD_SERVICES
@@ -1552,12 +1517,12 @@ mod tests {
 
     #[test]
     fn test_dashboard_services_count() {
-        // PR #7d (2026-05-19): 4 services remain after frontend retirement:
-        // Grafana, QuestDB, Prometheus, Traefik.
+        // #O1 (2026-05-20): Grafana removed — 3 dashboard services remain:
+        // QuestDB, Prometheus, Traefik.
         assert_eq!(
             DASHBOARD_SERVICES.len(),
-            4,
-            "expected 4 dashboard services post-PR-#7d"
+            3,
+            "expected 3 dashboard services post-#O1 Grafana removal"
         );
     }
 
@@ -1699,8 +1664,6 @@ mod tests {
         let env_vars = vec![
             ("TV_QUESTDB_PG_USER", "test_user".to_string()),
             ("TV_QUESTDB_PG_PASSWORD", "test_pass".to_string()),
-            ("TV_GRAFANA_ADMIN_USER", "admin".to_string()),
-            ("TV_GRAFANA_ADMIN_PASSWORD", "admin_pass".to_string()),
             ("TV_TELEGRAM_BOT_TOKEN", "bot_token".to_string()),
             ("TV_TELEGRAM_CHAT_ID", "chat_id".to_string()),
         ];
@@ -1935,8 +1898,6 @@ mod tests {
         let env_vars = vec![
             ("TV_QUESTDB_PG_USER", "user".to_string()),
             ("TV_QUESTDB_PG_PASSWORD", "pass".to_string()),
-            ("TV_GRAFANA_ADMIN_USER", "admin".to_string()),
-            ("TV_GRAFANA_ADMIN_PASSWORD", "secret".to_string()),
             ("TV_TELEGRAM_BOT_TOKEN", "123:ABC".to_string()),
             ("TV_TELEGRAM_CHAT_ID", "-12345".to_string()),
         ];
