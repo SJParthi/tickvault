@@ -8,20 +8,19 @@
 //! - Pure compute functions ([`compute_close_pct`],
 //!   [`compute_oi_pct`], [`compute_volume_pct`]) — handle div-by-zero
 //!   without panic, return `0.0` when the baseline is zero.
-//! - [`stamp_bar_pct_fields`] — mutates a `Bar` in place, populating
-//!   `close_pct_from_prev_day`, `oi_pct_from_prev_day`, and
-//!   `volume_pct_from_prev_day`.
+//! - [`stamp_seal_pct_fields`] — mutates a [`LiveCandleState`] in
+//!   place, populating the 3 pct fields at seal time.
 //!
 //! ## Integration
 //!
-//! The actual seal-site wiring (calling `stamp_bar_pct_fields` after
-//! every sealed bar in `CandleEngineMap::on_tick` /
-//! `CandleEngineMap::on_sealed_bar` returns) lands as a small
-//! follow-up PR alongside the boot-time loader that populates a
-//! [`crate::in_mem::PrevDayCache`] from the existing `previous_close`
-//! cache (PR #466) + `prev_oi_loader` (PR #454). #504e ships the
-//! contract + tests so that follow-up is mechanical wiring, not
-//! design work.
+//! `stamp_seal_pct_fields` is called on Engine B's seal path (in the
+//! `spawn_engine_b_aggregator` helper in `crates/app/src/main.rs`)
+//! after every sealed [`LiveCandleState`], using prev-day refs looked
+//! up from a [`crate::in_mem::PrevDayCache`].
+//!
+//! Candle-engine re-architecture #T1b: the legacy `stamp_bar_pct_fields`
+//! (which mutated the Engine-A/C `Bar` type) was DELETED alongside
+//! Engine C — Engine B's `LiveCandleState` is the only candle state.
 //!
 //! ## Div-by-zero policy
 //!
@@ -38,7 +37,6 @@
 //! Pinned by `test_compute_*_pct_handles_zero_baseline_without_nan`.
 
 use crate::candles::aggregator_cell::LiveCandleState;
-use crate::candles::engine::Bar;
 
 /// Frozen-per-day reference values for one `(security_id,
 /// exchange_segment)` instrument. Copy so the lookup hot path is
@@ -129,26 +127,6 @@ pub fn compute_volume_pct(cum_volume: i64, prev_day_total_volume: i64) -> f64 {
     }
 }
 
-/// Stamp the 3 % fields on a sealed Bar using the supplied prev-day
-/// reference values. Mutates the bar in place.
-///
-/// Idempotent: calling twice with the same `refs` produces the same
-/// fields (the formula is deterministic). Calling with different
-/// `refs` overwrites the previous stamping.
-///
-/// **Hot-path cost**: 3 floating-point divisions + 3 multiplications
-/// + 3 stores = ~15 ns. Called on the SEAL path (not per-tick), so
-/// the 200 ns/tick budget is unaffected.
-#[inline]
-pub fn stamp_bar_pct_fields(bar: &mut Bar, refs: PrevDayRefs) {
-    bar.prev_day_close = refs.prev_day_close;
-    bar.prev_day_oi = refs.prev_day_oi;
-    bar.close_pct_from_prev_day = compute_close_pct(bar.close, refs.prev_day_close);
-    bar.oi_pct_from_prev_day = compute_oi_pct(bar.oi, refs.prev_day_oi);
-    bar.volume_pct_from_prev_day =
-        compute_volume_pct(bar.volume_cum_day_at_end, refs.prev_day_total_volume);
-}
-
 /// Wave 6 Sub-PR #1 item 1.5 — stamp the 3 % fields on a sealed
 /// [`LiveCandleState`] using the supplied prev-day refs. The
 /// [`LiveCandleState`] type does NOT carry `prev_day_close` /
@@ -181,29 +159,6 @@ pub fn stamp_seal_pct_fields(state: &mut LiveCandleState, refs: PrevDayRefs) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn empty_bar(close: f64, oi: i64, cum_vol: i64) -> Bar {
-        Bar {
-            bucket_start_ist_secs: 0,
-            bucket_end_ist_secs: 60,
-            open: close,
-            high: close,
-            low: close,
-            close,
-            volume: 0,
-            volume_cum_day_at_end: cum_vol,
-            oi,
-            tick_count: 1,
-            security_id: 1234,
-            exchange_segment_code: 1,
-            sealed: true,
-            prev_day_close: 0.0,
-            prev_day_oi: 0,
-            close_pct_from_prev_day: 0.0,
-            oi_pct_from_prev_day: 0.0,
-            volume_pct_from_prev_day: 0.0,
-        }
-    }
 
     #[test]
     fn test_compute_close_pct_happy_path() {
@@ -255,96 +210,11 @@ mod tests {
     }
 
     #[test]
-    fn test_stamp_bar_pct_fields_populates_all_five_fields() {
-        // Verify the stamping function writes all 5 fields per L12.
-        let mut bar = empty_bar(105.0, 1_500_000, 25_000_000);
-        let refs = PrevDayRefs {
-            prev_day_close: 100.0,
-            prev_day_oi: 1_000_000,
-            prev_day_total_volume: 10_000_000,
-        };
-        stamp_bar_pct_fields(&mut bar, refs);
-        assert_eq!(bar.prev_day_close, 100.0);
-        assert_eq!(bar.prev_day_oi, 1_000_000);
-        assert_eq!(bar.close_pct_from_prev_day, 5.0);
-        assert_eq!(bar.oi_pct_from_prev_day, 50.0);
-        assert_eq!(bar.volume_pct_from_prev_day, 150.0);
-    }
-
-    #[test]
-    fn test_stamp_is_idempotent() {
-        // L13: idempotent stamping — same refs, same output.
-        let mut bar = empty_bar(105.0, 1_500_000, 25_000_000);
-        let refs = PrevDayRefs {
-            prev_day_close: 100.0,
-            prev_day_oi: 1_000_000,
-            prev_day_total_volume: 10_000_000,
-        };
-        stamp_bar_pct_fields(&mut bar, refs);
-        let snapshot = bar;
-        stamp_bar_pct_fields(&mut bar, refs);
-        assert_eq!(bar, snapshot);
-    }
-
-    #[test]
-    fn test_stamp_with_default_refs_zeroes_pct_fields() {
-        // Edge case: PrevDayRefs::default() (all zeros) → all % fields
-        // become 0.0, prev_day_close + prev_day_oi stamped as 0.
-        // Mirrors #504b's "ships fields with 0.0/0 default" semantics.
-        let mut bar = empty_bar(123.45, 999, 99_999);
-        // Pre-set the fields to non-zero so we can verify they get reset.
-        bar.close_pct_from_prev_day = 99.0;
-        stamp_bar_pct_fields(&mut bar, PrevDayRefs::default());
-        assert_eq!(bar.prev_day_close, 0.0);
-        assert_eq!(bar.prev_day_oi, 0);
-        assert_eq!(bar.close_pct_from_prev_day, 0.0);
-        assert_eq!(bar.oi_pct_from_prev_day, 0.0);
-        assert_eq!(bar.volume_pct_from_prev_day, 0.0);
-    }
-
-    #[test]
     fn test_prev_day_refs_default_is_all_zero() {
         let refs = PrevDayRefs::default();
         assert_eq!(refs.prev_day_close, 0.0);
         assert_eq!(refs.prev_day_oi, 0);
         assert_eq!(refs.prev_day_total_volume, 0);
-    }
-
-    #[test]
-    fn test_stamp_bar_pct_fields_preserves_unrelated_bar_state() {
-        // Stamping must NOT touch open / high / low / close / volume
-        // / tick_count / security_id / etc. — only the 5 % fields.
-        let mut bar = empty_bar(105.0, 1_500_000, 25_000_000);
-        bar.open = 99.0;
-        bar.high = 110.0;
-        bar.low = 90.0;
-        bar.tick_count = 42;
-        let refs = PrevDayRefs {
-            prev_day_close: 100.0,
-            prev_day_oi: 1_000_000,
-            prev_day_total_volume: 10_000_000,
-        };
-        stamp_bar_pct_fields(&mut bar, refs);
-        // Unchanged:
-        assert_eq!(bar.open, 99.0);
-        assert_eq!(bar.high, 110.0);
-        assert_eq!(bar.low, 90.0);
-        assert_eq!(bar.close, 105.0);
-        assert_eq!(bar.tick_count, 42);
-        assert_eq!(bar.security_id, 1234);
-    }
-
-    #[test]
-    fn test_negative_pct_change_works() {
-        // A bar that closes BELOW the prev day close → negative %.
-        let mut bar = empty_bar(80.0, 0, 0);
-        let refs = PrevDayRefs {
-            prev_day_close: 100.0,
-            prev_day_oi: 0,
-            prev_day_total_volume: 0,
-        };
-        stamp_bar_pct_fields(&mut bar, refs);
-        assert_eq!(bar.close_pct_from_prev_day, -20.0);
     }
 
     #[test]

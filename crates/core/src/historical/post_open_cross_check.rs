@@ -5,11 +5,11 @@
 //! provides the pure-function comparator + clock helpers + outcome
 //! types that the scheduler (sub-deliverable 4) drives.
 //!
-//! The cross-check compares our `candles_1m_shadow` 09:15 row against
+//! The cross-check compares our `candles_1m` 09:15 row against
 //! Dhan REST `/v2/charts/intraday` 09:15 bar for all 222 SIDs (Phase 0
 //! universe: 4 IDX_I + 218 NSE_EQ). Any OHLCV mismatch outside the
 //! 1-paisa tolerance triggers a `bar_correction_audit` row and a
-//! REPLACE-write to `candles_1m_shadow` + `historical_candles` (mirror)
+//! REPLACE-write to `candles_1m` + `historical_candles` (mirror)
 //! per Items 15+28+29 hostile-agent C1 architecture verdict.
 //!
 //! **This module is pure logic only — NO I/O.** The scheduler in
@@ -50,13 +50,13 @@ pub struct BarMismatch {
     /// Which OHLCV field disagreed. Stable wire-format label —
     /// `open` / `high` / `low` / `close` / `volume`.
     pub field_label: &'static str,
-    /// Our `candles_1m_shadow` value.
+    /// Our `candles_1m` value.
     pub local_value: f64,
     /// Dhan REST `/v2/charts/intraday` value.
     pub dhan_value: f64,
 }
 
-/// Local snapshot of our `candles_1m_shadow` row for the bar being
+/// Local snapshot of our `candles_1m` row for the bar being
 /// cross-checked. Caller reads this from QuestDB before invoking
 /// `compare_bar`.
 #[derive(Debug, Clone, PartialEq)]

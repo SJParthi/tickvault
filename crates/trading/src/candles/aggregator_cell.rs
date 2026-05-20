@@ -155,13 +155,38 @@ impl LiveCandleState {
     /// the start of THIS bucket (carried over from the previously
     /// sealed bucket so inter-bucket volume is preserved). On the
     /// session's very first tick, pass `0`.
+    ///
+    /// Candle-engine re-architecture #T1b — Task 5 (09:15 day-open):
+    /// when `use_day_open` is `true` the bucket's `open` is set to
+    /// `tick.day_open` (the exchange-published day-open price from the
+    /// Quote packet) instead of the first tick's LTP. The caller passes
+    /// `true` only for the FIRST bucket a slot opens after an
+    /// IST-midnight reset, so the day's first bar of every timeframe
+    /// opens at the NSE equilibrium open, not the first traded price.
+    /// `high` / `low` / `close` ALWAYS track the LTP — never
+    /// `day_high` / `day_low` (Dhan mislabels `day_close`, so it is
+    /// never used for a candle's close per Ticket #5525125).
     #[inline]
-    fn from_first_tick(tick: &ParsedTick, bucket_start: u32, bucket_start_cumulative: u64) -> Self {
+    fn from_first_tick(
+        tick: &ParsedTick,
+        bucket_start: u32,
+        bucket_start_cumulative: u64,
+        use_day_open: bool,
+    ) -> Self {
         let price = f64::from(tick.last_traded_price);
+        // Day-open override: the day's first bar opens at the exchange
+        // day-open. Fall back to the LTP if the Quote packet carried a
+        // zero `day_open` (e.g. pre-open or a malformed packet) so the
+        // candle still has a sensible open.
+        let open = if use_day_open && tick.day_open > 0.0 {
+            f64::from(tick.day_open)
+        } else {
+            price
+        };
         let cumulative = u64::from(tick.volume);
         Self {
             bucket_start_ist_secs: bucket_start,
-            open: price,
+            open,
             high: price,
             low: price,
             close: price,
@@ -244,9 +269,22 @@ pub enum ConsumeOutcome {
 /// locks the same slot to seal it. Contention is naturally bounded
 /// to (instrument × TF), and each (instrument × TF × second) sees
 /// at most a handful of ticks.
+///
+/// Candle-engine re-architecture #T1b — Task 5 (09:15 day-open):
+/// `armed_for_day_open` carries one `AtomicBool` per TF slot. When a
+/// slot is "armed", the NEXT tick that opens its first bucket sets the
+/// bucket `open` to `tick.day_open` (the exchange day-open) rather than
+/// the first tick's LTP. Slots are armed at construction
+/// ([`Self::empty`]) and re-armed by [`Self::force_seal`] (the
+/// IST-midnight reset), and disarmed the moment the day's first bucket
+/// opens. Subsequent intraday boundary crossings open with the LTP.
 #[derive(Debug)]
 pub struct AggregatorCell {
     slots: [Mutex<LiveCandleState>; TF_COUNT],
+    /// Per-TF "next opened bucket is the day's first bar" flag. See the
+    /// struct docstring. `true` ⇒ next first-bucket-open uses
+    /// `tick.day_open`; consumed (set `false`) on that open.
+    armed_for_day_open: [std::sync::atomic::AtomicBool; TF_COUNT],
 }
 
 impl AggregatorCell {
@@ -255,10 +293,14 @@ impl AggregatorCell {
     /// one of these per `(security_id, exchange_segment)` from the
     /// `InstrumentRegistry::iter()` composite-key iter per locked
     /// decision L-M19.
+    ///
+    /// Every slot starts **armed for day-open** (Task 5) — the first
+    /// bucket each TF opens after boot uses `tick.day_open`.
     #[must_use]
     pub fn empty() -> Arc<Self> {
         Arc::new(Self {
             slots: std::array::from_fn(|_| Mutex::new(LiveCandleState::empty())),
+            armed_for_day_open: std::array::from_fn(|_| std::sync::atomic::AtomicBool::new(true)),
         })
     }
 
@@ -288,9 +330,19 @@ impl AggregatorCell {
         let bucket_start = tf.bucket_start(tick.exchange_timestamp);
         let mut guard = self.slots[tf.as_ordinal()].lock();
 
-        // First-ever tick for this slot — open the bucket.
+        // First-ever tick for this slot — open the bucket. Task 5: if
+        // this slot is armed (boot or post-IST-midnight reset) the
+        // day's first bar opens at `tick.day_open`. Consume the flag so
+        // every later bucket of the day opens at the LTP.
         if guard.is_uninitialised() {
-            *guard = LiveCandleState::from_first_tick(tick, bucket_start, bucket_start_cumulative);
+            let use_day_open = self.armed_for_day_open[tf.as_ordinal()]
+                .swap(false, std::sync::atomic::Ordering::Relaxed);
+            *guard = LiveCandleState::from_first_tick(
+                tick,
+                bucket_start,
+                bucket_start_cumulative,
+                use_day_open,
+            );
             return ConsumeOutcome::Updated;
         }
 
@@ -301,11 +353,18 @@ impl AggregatorCell {
         }
 
         // Tick belongs to a strictly newer bucket — seal the current
-        // one and open the new bucket.
+        // one and open the new bucket. This is an intraday boundary
+        // crossing, NOT the day's first bar, so the new bucket opens at
+        // the LTP (`use_day_open = false`).
         if bucket_start > guard.bucket_start_ist_secs {
             let sealed_state = std::mem::replace(
                 &mut *guard,
-                LiveCandleState::from_first_tick(tick, bucket_start, bucket_start_cumulative),
+                LiveCandleState::from_first_tick(
+                    tick,
+                    bucket_start,
+                    bucket_start_cumulative,
+                    false,
+                ),
             );
             return ConsumeOutcome::Sealed { sealed_state };
         }
@@ -323,8 +382,15 @@ impl AggregatorCell {
     /// Returns `Some(sealed_state)` if the slot held a non-empty
     /// bucket; `None` if the slot was uninitialised. Caller persists
     /// the returned state to the corresponding shadow table.
+    ///
+    /// Task 5: force-sealing **re-arms** the slot for day-open — the
+    /// IST-midnight force-seal empties every slot, and the first tick
+    /// of the next trading day must open that day's first bar at
+    /// `tick.day_open`. Re-arming unconditionally (even for an
+    /// already-empty slot) is harmless and keeps the invariant simple.
     pub fn force_seal(&self, tf: TfIndex) -> Option<LiveCandleState> {
         let mut guard = self.slots[tf.as_ordinal()].lock();
+        self.armed_for_day_open[tf.as_ordinal()].store(true, std::sync::atomic::Ordering::Relaxed);
         if guard.is_uninitialised() {
             return None;
         }
@@ -610,5 +676,112 @@ mod tests {
         fn assert_copy<T: Copy>() {}
         assert_copy::<ConsumeOutcome>();
         assert_copy::<LiveCandleState>();
+    }
+
+    // -----------------------------------------------------------------------
+    // Candle-engine re-architecture #T1b — Task 5: 09:15 day-open tests
+    // -----------------------------------------------------------------------
+
+    /// Builds a tick carrying a `day_open` value alongside the LTP.
+    fn mk_tick_with_day_open(secs: u32, ltp: f32, day_open: f32) -> ParsedTick {
+        let mut t = mk_tick(secs, ltp, 0, 0);
+        t.day_open = day_open;
+        t
+    }
+
+    #[test]
+    fn test_day_first_bar_opens_at_day_open_not_ltp() {
+        // The first bucket a slot opens (cell is armed at construction)
+        // must take `open` from `tick.day_open`, NOT the first tick LTP.
+        let cell = AggregatorCell::empty();
+        let tick = mk_tick_with_day_open(1_716_000_900, 105.0, 100.0);
+        cell.consume_tick(TfIndex::M1, &tick, 0);
+        let s = cell.snapshot(TfIndex::M1);
+        assert_eq!(s.open, 100.0, "day's first bar opens at tick.day_open");
+        // high/low/close track the LTP, never day_open.
+        assert_eq!(s.high, 105.0);
+        assert_eq!(s.low, 105.0);
+        assert_eq!(s.close, 105.0);
+    }
+
+    #[test]
+    fn test_subsequent_intraday_bars_open_at_ltp_not_day_open() {
+        // After the day's first bar, every later bucket opens at the
+        // first tick's LTP — the armed flag was consumed.
+        let cell = AggregatorCell::empty();
+        // Day's first M1 bucket (armed → uses day_open).
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick_with_day_open(1_716_000_900, 105.0, 100.0),
+            0,
+        );
+        // Next M1 bucket — boundary crossing. day_open=100 still on the
+        // tick, but the slot is disarmed → open must be the LTP 107.0.
+        let outcome = cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick_with_day_open(1_716_000_961, 107.0, 100.0),
+            0,
+        );
+        assert!(matches!(outcome, ConsumeOutcome::Sealed { .. }));
+        let s = cell.snapshot(TfIndex::M1);
+        assert_eq!(s.open, 107.0, "intraday bar opens at LTP, not day_open");
+    }
+
+    #[test]
+    fn test_force_seal_rearms_slot_for_next_day_open() {
+        // The IST-midnight force-seal must re-arm the slot so the next
+        // trading day's first bar opens at the new day_open.
+        let cell = AggregatorCell::empty();
+        // Day 1 first bar consumes the armed flag.
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick_with_day_open(1_716_000_900, 105.0, 100.0),
+            0,
+        );
+        // IST-midnight force-seal empties + re-arms the slot.
+        cell.force_seal(TfIndex::M1);
+        assert!(cell.snapshot(TfIndex::M1).is_uninitialised());
+        // Day 2 first tick — armed again → opens at the new day_open.
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick_with_day_open(1_716_087_300, 210.0, 200.0),
+            0,
+        );
+        let s = cell.snapshot(TfIndex::M1);
+        assert_eq!(s.open, 200.0, "day 2's first bar opens at new day_open");
+    }
+
+    #[test]
+    fn test_day_open_falls_back_to_ltp_when_day_open_is_zero() {
+        // A pre-open / malformed tick with day_open == 0.0 must NOT
+        // produce a zero-open candle — fall back to the LTP.
+        let cell = AggregatorCell::empty();
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick_with_day_open(1_716_000_900, 105.0, 0.0),
+            0,
+        );
+        let s = cell.snapshot(TfIndex::M1);
+        assert_eq!(s.open, 105.0, "zero day_open falls back to LTP");
+    }
+
+    #[test]
+    fn test_day_open_arming_is_per_tf_independent() {
+        // Each TF slot has its own armed flag — consuming M1's flag
+        // must not disarm M5.
+        let cell = AggregatorCell::empty();
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick_with_day_open(1_716_000_900, 105.0, 100.0),
+            0,
+        );
+        // M5's first bar must still use day_open.
+        cell.consume_tick(
+            TfIndex::M5,
+            &mk_tick_with_day_open(1_716_000_900, 105.0, 100.0),
+            0,
+        );
+        assert_eq!(cell.snapshot(TfIndex::M1).open, 100.0);
+        assert_eq!(cell.snapshot(TfIndex::M5).open, 100.0);
     }
 }
