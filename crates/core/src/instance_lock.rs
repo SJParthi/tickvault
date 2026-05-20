@@ -288,11 +288,10 @@ pub async fn release_instance_lock(valkey: &ValkeyPool, env: &str, host_id: &str
 /// still leave 30s of headroom before the lock expires — well above
 /// any realistic Valkey reconnect cycle.
 ///
-/// Audit rows: every terminal lifecycle event (LostOwnership,
-/// GracefulRelease) writes one row to the `live_instance_lock`
-/// QuestDB table via `tickvault_storage`. Failures of the audit
-/// write are best-effort (logged at WARN) — they MUST NOT block the
-/// heartbeat from exiting or releasing the lock.
+/// Terminal lifecycle events (LostOwnership, GracefulRelease) are
+/// surfaced via tracing only — Loki carries the outcome. The
+/// `live_instance_lock` QuestDB audit table was dropped in #T4 of the
+/// table-cleanup plan.
 // TEST-EXEMPT: live Valkey instance required for the GET / SET round
 // trip; the renew_instance_lock / release_instance_lock functions
 // the task delegates to are themselves TEST-EXEMPT for the same
@@ -302,8 +301,6 @@ pub fn spawn_instance_lock_heartbeat(
     valkey: Arc<ValkeyPool>,
     env: String,
     host_id: String,
-    lock_key: String,
-    questdb_config: tickvault_common::config::QuestDbConfig,
     shutdown: Arc<Notify>,
 ) -> JoinHandle<()> {
     let interval = Duration::from_secs(INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS);
@@ -336,15 +333,6 @@ pub fn spawn_instance_lock_heartbeat(
                             INSTANCE_LOCK_TTL_SECS
                         );
                     }
-                    write_lifecycle_audit_row(
-                        &questdb_config,
-                        tickvault_storage::live_instance_lock_persistence::LiveInstanceLockOutcome::GracefulRelease,
-                        &host_id,
-                        &env,
-                        &lock_key,
-                        "",
-                    )
-                    .await;
                     return;
                 }
                 _ = ticker.tick() => {
@@ -367,15 +355,6 @@ pub fn spawn_instance_lock_heartbeat(
                                 "instance lock lost — another process now holds the lock; \
                                  heartbeat task exiting"
                             );
-                            write_lifecycle_audit_row(
-                                &questdb_config,
-                                tickvault_storage::live_instance_lock_persistence::LiveInstanceLockOutcome::LostOwnership,
-                                &host_id,
-                                &env,
-                                &lock_key,
-                                "renew returned Ok(false) — lock held by another process",
-                            )
-                            .await;
                             return;
                         }
                         Err(err) => {
@@ -391,54 +370,6 @@ pub fn spawn_instance_lock_heartbeat(
             }
         }
     })
-}
-
-/// Best-effort heartbeat-side audit-row writer. Mirrors the boot-time
-/// `write_live_instance_lock_row` helper in `crates/app/src/main.rs`
-/// — duplicated here because the heartbeat runs entirely inside
-/// `crates/core` (no main.rs reach-back) and re-exporting the
-/// helper would couple the two crates. A failed audit row is logged
-/// at WARN and ignored; the heartbeat ALWAYS continues its terminal
-/// path (release + return).
-// TEST-EXEMPT: live QuestDB instance required for the HTTP /exec round
-// trip; the storage helper itself is unit-tested in
-// `live_instance_lock_persistence::tests`. The audit write is
-// best-effort and never blocks the terminal release path.
-async fn write_lifecycle_audit_row(
-    questdb_config: &tickvault_common::config::QuestDbConfig,
-    outcome: tickvault_storage::live_instance_lock_persistence::LiveInstanceLockOutcome,
-    host_id: &str,
-    env: &str,
-    lock_key: &str,
-    error_detail: &str,
-) {
-    let now_ist_nanos = chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .unwrap_or(0)
-        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
-    let trading_date_ist = now_ist_nanos - now_ist_nanos.rem_euclid(86_400_000_000_000);
-    if let Err(err) =
-        tickvault_storage::live_instance_lock_persistence::append_live_instance_lock_row(
-            questdb_config,
-            now_ist_nanos,
-            trading_date_ist,
-            outcome,
-            host_id,
-            "",
-            env,
-            lock_key,
-            error_detail,
-        )
-        .await
-    {
-        warn!(
-            target: "tickvault::instance_lock",
-            error = %err,
-            outcome = outcome.as_str(),
-            "live_instance_lock heartbeat-side audit-row write failed (heartbeat exits \
-             regardless — Loki carries the outcome)"
-        );
-    }
 }
 
 #[cfg(test)]

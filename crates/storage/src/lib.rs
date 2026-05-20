@@ -14,7 +14,7 @@
 //!
 //! # Modules
 //! - `instrument_persistence` — daily instrument snapshot to QuestDB (Block 01.1)
-//! - `tick_persistence` — batched ILP writer for live ticks + market depth
+//! - `tick_persistence` — batched ILP writer for live ticks
 //! - `candle_persistence` — 1-minute candle persistence from historical fetch
 //! - `valkey_cache` — deadpool-redis async connection pool with typed helpers
 //!
