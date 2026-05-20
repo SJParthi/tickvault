@@ -86,7 +86,7 @@ its `ErrorCode` variant(s), and its ratchet tests.
 
 ## Sequencing (serial PRs, §H — one at a time)
 
-- [ ] **#T1** — candle re-architecture (RAM-first): 21 **plain**
+- [x] **#T1** — candle re-architecture (RAM-first): 21 **plain**
   QuestDB candle tables fed by the in-memory aggregator's periodic
   async flush; KEEP + extend the RAM aggregator to the 21 TFs (incl.
   re-adding the 12 sub-15m TFs); drop `candles_1s` + the 9 shadow
@@ -97,14 +97,20 @@ its `ErrorCode` variant(s), and its ratchet tests.
     pct, `segment` column, `DEDUP UPSERT KEYS(ts, security_id, segment)`);
     seal-writer chain re-pointed to the plain tables. Old Engine A
     (`candles_1s` + matviews) + Engine C (cascade) still run in
-    parallel — nothing deleted. Workspace compiles green.
-  - [ ] **#T1b** — cutover: minute/IST-midnight boundary force-seal
+    parallel — nothing deleted. Workspace compiles green. (PR #731;
+    405-DDL hotfix PR #733.)
+  - [x] **#T1c** — column cleanup: dropped the 9 `ticks` bucket-C
+    columns (`iv/delta/gamma/theta/vega`, `volume_delta`,
+    `prev_day_close`, `prev_day_oi`, `phase`) via boot-time
+    `ALTER ... DROP COLUMN IF EXISTS` self-heal. The prev-day /
+    volume-delta / phase enrichment was KEPT — it is not dead (still
+    feeds the live VOLUME-MONO-01 gate + the shared `prev_oi_cache`);
+    its teardown is flagged for a separate focused PR. (this PR.)
+  - [x] **#T1b** — cutover: minute/IST-midnight boundary force-seal
     task; delete Engine A (`candles_1s` + matviews) + Engine C
     (cascade); `main.rs` rewire; re-point `cross_verify` +
     `post_open_cross_check` to the plain tables; drop-legacy DDL.
-  - [ ] **#T1c** — column cleanup: drop the 9 `ticks` bucket-C columns
-    + prev-day / volume-delta / phase teardown; final ratchets,
-    dashboards, config.
+    (PR #734.)
 - [ ] **#T2** — drop ~20 audit tables + `*_audit_persistence.rs` modules
   + boot DDL + notification/ErrorCode wiring + ratchets.
 - [ ] **#T3** — drop 5 instrument tables + their persistence surface.
