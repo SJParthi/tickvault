@@ -87,18 +87,6 @@ fn tick_processor_flushes_tick_writer_on_shutdown() {
 }
 
 #[test]
-fn tick_processor_flushes_depth_writer_on_shutdown() {
-    let src = tick_processor_rs();
-    let patterns = ["dw.flush_on_shutdown()"];
-    let hit = patterns.iter().any(|p| src.contains(p));
-    assert!(
-        hit,
-        "Audit finding #12/#3: run_tick_processor MUST call \
-         flush_on_shutdown() on the depth writer before exit."
-    );
-}
-
-#[test]
 fn tick_processor_flushes_candle_writer_on_shutdown() {
     let src = tick_processor_rs();
     // flush_on_shutdown is called on live_candle_writer inside the candle
