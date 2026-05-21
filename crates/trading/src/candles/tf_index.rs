@@ -28,6 +28,18 @@
 /// share one source of truth.
 pub const TF_COUNT: usize = 21;
 
+/// 09:15:00 IST expressed as seconds-of-day (`9*3600 + 15*60`).
+/// The NSE regular trading session opens at 09:15:00 — every candle
+/// bucket grid is anchored here so the first candle of every timeframe
+/// starts exactly at the market open.
+pub(crate) const MARKET_OPEN_SECS_OF_DAY_IST: u32 = 33_300;
+
+/// 15:30:00 IST expressed as seconds-of-day (`15*3600 + 30*60`).
+/// The NSE regular session closes at 15:30:00 — the candle window is
+/// the half-open interval `[09:15:00, 15:30:00)`, so the last 1-minute
+/// candle is `[15:29:00, 15:30:00)` (stamped 15:29). 375 1m candles/day.
+pub(crate) const MARKET_CLOSE_SECS_OF_DAY_IST: u32 = 55_800;
+
 /// Runtime-indexable handle for the 21 candle timeframes.
 ///
 /// Use [`Self::ALL`] to iterate. Use [`Self::from_ordinal`] for
@@ -259,13 +271,25 @@ impl TfIndex {
     /// Aligns a tick's IST-second timestamp to the start of its
     /// containing bucket for this timeframe.
     ///
+    /// Buckets are anchored to the **09:15:00 IST market open**, NOT to
+    /// the epoch — so every timeframe's first candle of the day starts
+    /// exactly at 09:15 (a 30m bucket is `[09:15,09:45)`, not
+    /// `[09:00,09:30)`; a 1h bucket is `[09:15,10:15)`). A tick at or
+    /// before the open anchors to the first bucket; the aggregator's
+    /// market-hours gate keeps genuine pre-open ticks out anyway.
+    ///
     /// `tick_ist_secs` MUST be the IST epoch second derived from the
     /// WS LTT field (NEVER `Utc::now()` per `data-integrity.md`).
     #[inline]
     #[must_use]
     pub const fn bucket_start(self, tick_ist_secs: u32) -> u32 {
         let secs = self.seconds_per_bucket();
-        tick_ist_secs - (tick_ist_secs % secs)
+        let day_start = (tick_ist_secs / 86_400) * 86_400;
+        let market_open = day_start + MARKET_OPEN_SECS_OF_DAY_IST;
+        if tick_ist_secs <= market_open {
+            return market_open;
+        }
+        market_open + ((tick_ist_secs - market_open) / secs) * secs
     }
 
     /// Returns the (exclusive) bucket-end for a given bucket-start.

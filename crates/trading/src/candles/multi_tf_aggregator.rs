@@ -60,6 +60,7 @@ use papaya::HashMap;
 
 use tickvault_common::tick_types::ParsedTick;
 
+use crate::candles::tf_index::{MARKET_CLOSE_SECS_OF_DAY_IST, MARKET_OPEN_SECS_OF_DAY_IST};
 use crate::candles::{AggregatorCell, ConsumeOutcome, LiveCandleState, TfIndex};
 
 /// Composite key per I-P1-11 — `(security_id, exchange_segment_code)`.
@@ -230,6 +231,23 @@ impl MultiTfAggregator {
     where
         F: FnMut(TfIndex, LiveCandleState),
     {
+        // Candle-window gate: only ticks inside the regular trading
+        // session [09:15:00, 15:30:00) IST form candles. Pre-open
+        // auction ticks (< 09:15) and post-close stale ticks (>= 15:30)
+        // are skipped — they still land in the `ticks` table, but they
+        // never pollute the candle grid (which Dhan REST cross-verify
+        // also expects to begin at 09:15). The bucket grid itself is
+        // 09:15-anchored in `TfIndex::bucket_start`.
+        let secs_of_day = tick.exchange_timestamp % 86_400;
+        if secs_of_day < MARKET_OPEN_SECS_OF_DAY_IST || secs_of_day >= MARKET_CLOSE_SECS_OF_DAY_IST
+        {
+            return ConsumeStats {
+                sealed_count: 0,
+                late_count: 0,
+                instrument_found: true,
+            };
+        }
+
         let key = (tick.security_id, exchange_segment_code);
         let pin = self.inner.pin();
         let Some(entry) = pin.get(&key) else {
