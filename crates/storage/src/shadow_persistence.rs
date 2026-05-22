@@ -19,7 +19,7 @@
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS candles_1m (
 //!     segment       SYMBOL,
-//!     security_id   INT,
+//!     security_id   LONG,
 //!     ts            TIMESTAMP,
 //!     open          DOUBLE,
 //!     high          DOUBLE,
@@ -27,7 +27,7 @@
 //!     close         DOUBLE,
 //!     volume        LONG,
 //!     oi            LONG,
-//!     tick_count    INT
+//!     tick_count    LONG
 //! ) timestamp(ts) PARTITION BY DAY
 //!   DEDUP UPSERT KEYS(ts, security_id, segment);
 //! ```
@@ -148,10 +148,24 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
         .unwrap_or_else(|_| Client::new());
 
     for table in candle_table_names() {
+        // Schema self-heal: candle tables created before the
+        // security_id LONG fix have `security_id` / `tick_count` typed
+        // INT. The ILP seal writer sends them via `column_i64` (LONG);
+        // QuestDB rejects every row on the type mismatch, so the table
+        // stays empty. QuestDB cannot ALTER a column's type — drop the
+        // (broken, empty) table and let the corrected CREATE rebuild it.
+        if candle_table_has_int_security_id(&client, &base_url, table).await {
+            let drop_ddl = format!("DROP TABLE IF EXISTS {table};");
+            run_drop_ddl(&client, &base_url, table, &drop_ddl).await;
+            info!(
+                table,
+                "candle table dropped — security_id INT→LONG self-heal"
+            );
+        }
         let create_ddl = format!(
             "CREATE TABLE IF NOT EXISTS {table} (\
                 segment                     SYMBOL, \
-                security_id                 INT, \
+                security_id                 LONG, \
                 ts                          TIMESTAMP, \
                 open                        DOUBLE, \
                 high                        DOUBLE, \
@@ -159,11 +173,37 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
                 close                       DOUBLE, \
                 volume                      LONG, \
                 oi                          LONG, \
-                tick_count                  INT\
+                tick_count                  LONG\
             ) timestamp(ts) PARTITION BY DAY \
             DEDUP UPSERT KEYS({DEDUP_KEY_CANDLES});"
         );
         run_ddl(&client, &base_url, table, &create_ddl).await;
+    }
+}
+
+/// Returns `true` if `table` already exists with `security_id` typed
+/// `INT` — the pre-fix schema the i64 ILP seal writer cannot populate.
+///
+/// A missing table, a `LONG` column, or any query error returns
+/// `false`: a missing table is handled by the `CREATE TABLE IF NOT
+/// EXISTS` that follows, and a transient query error is best-effort —
+/// the worst case is the operator keeps the old empty table until the
+/// next boot.
+async fn candle_table_has_int_security_id(client: &Client, base_url: &str, table: &str) -> bool {
+    let query = format!("SELECT type FROM table_columns('{table}') WHERE column = 'security_id'");
+    match client
+        .get(base_url)
+        .query(&[("query", query.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            let body = resp.text().await.unwrap_or_default();
+            // QuestDB /exec returns the matching row in `dataset` as
+            // `[["INT"]]` / `[["LONG"]]`.
+            body.contains("[[\"INT\"]]")
+        }
+        _ => false,
     }
 }
 

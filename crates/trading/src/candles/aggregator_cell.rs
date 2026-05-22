@@ -459,7 +459,7 @@ mod tests {
         // the implicit coverage in every test_consume_*/test_force_seal_*
         // assertion below.
         let cell = AggregatorCell::empty();
-        cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_900, 100.0, 50, 1_000), 0);
+        cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_960, 100.0, 50, 1_000), 0);
         let snap_a = cell.snapshot(TfIndex::M1);
         let snap_b = cell.snapshot(TfIndex::M1);
         assert_eq!(snap_a, snap_b);
@@ -468,7 +468,7 @@ mod tests {
         assert!(snap_m5.is_uninitialised());
         // Mutating the cell after the first snapshot must NOT mutate
         // the previously-returned snapshot (Copy semantics).
-        cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_915, 105.0, 60, 1_010), 0);
+        cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_975, 105.0, 60, 1_010), 0);
         let snap_after = cell.snapshot(TfIndex::M1);
         assert_eq!(snap_a.close, 100.0); // snap_a is a stale copy by design
         assert_eq!(snap_after.close, 105.0);
@@ -490,12 +490,12 @@ mod tests {
     #[test]
     fn test_consume_tick_first_tick_opens_bucket() {
         let cell = AggregatorCell::empty();
-        let tick = mk_tick(1_716_000_900, 100.0, 50, 1_000);
+        let tick = mk_tick(1_779_354_960, 100.0, 50, 1_000);
         let outcome = cell.consume_tick(TfIndex::M1, &tick, 0);
         assert_eq!(outcome, ConsumeOutcome::Updated);
         let s = cell.snapshot(TfIndex::M1);
         assert!(!s.is_uninitialised());
-        assert_eq!(s.bucket_start_ist_secs, 1_716_000_900); // already aligned
+        assert_eq!(s.bucket_start_ist_secs, 1_779_354_960); // already aligned
         assert_eq!(s.open, 100.0);
         assert_eq!(s.high, 100.0);
         assert_eq!(s.low, 100.0);
@@ -509,12 +509,12 @@ mod tests {
     fn test_consume_tick_in_bucket_tick_folds_high_low_close_volume() {
         let cell = AggregatorCell::empty();
         // Bucket-aligned t=1716000900 (divisible by 60).
-        cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_900, 100.0, 50, 1_000), 0);
+        cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_960, 100.0, 50, 1_000), 0);
         // Same bucket: t=1716000915 still floors to 1716000900.
-        let outcome = cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_915, 105.0, 75, 1_010), 0);
+        let outcome = cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_975, 105.0, 75, 1_010), 0);
         assert_eq!(outcome, ConsumeOutcome::Updated);
         let s = cell.snapshot(TfIndex::M1);
-        assert_eq!(s.bucket_start_ist_secs, 1_716_000_900);
+        assert_eq!(s.bucket_start_ist_secs, 1_779_354_960);
         assert_eq!(s.open, 100.0); // unchanged
         assert_eq!(s.high, 105.0);
         assert_eq!(s.low, 100.0);
@@ -527,8 +527,8 @@ mod tests {
     #[test]
     fn test_consume_tick_low_updates_when_tick_below_open() {
         let cell = AggregatorCell::empty();
-        cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_900, 100.0, 50, 0), 0);
-        let _ = cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_915, 95.0, 60, 0), 0);
+        cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_960, 100.0, 50, 0), 0);
+        let _ = cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_975, 95.0, 60, 0), 0);
         let s = cell.snapshot(TfIndex::M1);
         assert_eq!(s.low, 95.0);
         assert_eq!(s.high, 100.0); // unchanged
@@ -538,17 +538,17 @@ mod tests {
     fn test_consume_tick_boundary_crossing_seals_previous_bucket() {
         let cell = AggregatorCell::empty();
         // Bucket A: 1716000900..1716000960
-        cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_900, 100.0, 50, 1_000), 0);
-        cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_930, 105.0, 70, 1_005), 0);
+        cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_960, 100.0, 50, 1_000), 0);
+        cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_990, 105.0, 70, 1_005), 0);
         // Bucket B: 1716000960..1716001020 — first tick crosses.
         // Pass bucket_start_cumulative=70 (the last cumulative from bucket A).
-        let outcome = cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_961, 102.0, 80, 1_010), 70);
+        let outcome = cell.consume_tick(TfIndex::M1, &mk_tick(1_779_355_021, 102.0, 80, 1_010), 70);
         let sealed_state = match outcome {
             ConsumeOutcome::Sealed { sealed_state } => sealed_state,
             other => panic!("expected Sealed, got {other:?}"),
         };
         // Bucket A as sealed:
-        assert_eq!(sealed_state.bucket_start_ist_secs, 1_716_000_900);
+        assert_eq!(sealed_state.bucket_start_ist_secs, 1_779_354_960);
         assert_eq!(sealed_state.open, 100.0);
         assert_eq!(sealed_state.high, 105.0);
         assert_eq!(sealed_state.low, 100.0);
@@ -558,7 +558,7 @@ mod tests {
 
         // Slot now holds bucket B with this tick:
         let s = cell.snapshot(TfIndex::M1);
-        assert_eq!(s.bucket_start_ist_secs, 1_716_000_960);
+        assert_eq!(s.bucket_start_ist_secs, 1_779_355_020);
         assert_eq!(s.open, 102.0);
         assert_eq!(s.close, 102.0);
         assert_eq!(s.tick_count, 1);
@@ -569,7 +569,7 @@ mod tests {
     fn test_consume_tick_late_tick_returns_discard_late() {
         let cell = AggregatorCell::empty();
         // Open bucket at t=1716001000 (aligned to 60s boundary).
-        let aligned_now = 1_716_001_000_u32 - (1_716_001_000_u32 % 60);
+        let aligned_now = 1_779_355_500_u32; // 2026-05-21 09:25:00 IST (M1-aligned)
         cell.consume_tick(TfIndex::M1, &mk_tick(aligned_now + 30, 100.0, 50, 0), 0);
         // Late tick belongs to the PREVIOUS bucket.
         let late = mk_tick(aligned_now - 5, 99.0, 40, 0);
@@ -587,7 +587,7 @@ mod tests {
         // boundary (because 60 boundaries fit in one hour). The cell
         // must independently track per-TF state.
         let cell = AggregatorCell::empty();
-        let aligned = 1_716_001_000_u32 - (1_716_001_000_u32 % 3_600);
+        let aligned = 1_779_358_500_u32; // 2026-05-21 10:15:00 IST (H1-aligned)
         // Open M1 + H1 at t=aligned+30:
         cell.consume_tick(TfIndex::M1, &mk_tick(aligned + 30, 100.0, 50, 0), 0);
         cell.consume_tick(TfIndex::H1, &mk_tick(aligned + 30, 100.0, 50, 0), 0);
@@ -601,11 +601,11 @@ mod tests {
     #[test]
     fn test_force_seal_returns_some_when_initialised() {
         let cell = AggregatorCell::empty();
-        cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_900, 100.0, 50, 0), 0);
+        cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_960, 100.0, 50, 0), 0);
         let sealed = cell.force_seal(TfIndex::M1);
         assert!(sealed.is_some());
         let s = sealed.expect("just asserted some");
-        assert_eq!(s.bucket_start_ist_secs, 1_716_000_900);
+        assert_eq!(s.bucket_start_ist_secs, 1_779_354_960);
         assert_eq!(s.tick_count, 1);
         // Slot is now empty again.
         assert!(cell.snapshot(TfIndex::M1).is_uninitialised());
@@ -622,8 +622,8 @@ mod tests {
     #[test]
     fn test_force_seal_only_affects_one_slot() {
         let cell = AggregatorCell::empty();
-        cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_900, 100.0, 50, 0), 0);
-        cell.consume_tick(TfIndex::M5, &mk_tick(1_716_000_900, 100.0, 50, 0), 0);
+        cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_960, 100.0, 50, 0), 0);
+        cell.consume_tick(TfIndex::M5, &mk_tick(1_779_354_960, 100.0, 50, 0), 0);
         // Seal M1 only.
         cell.force_seal(TfIndex::M1);
         assert!(cell.snapshot(TfIndex::M1).is_uninitialised());
@@ -636,7 +636,7 @@ mod tests {
         // volume across bucket boundaries (Item 28 carry-over).
         let cell = AggregatorCell::empty();
         // Open bucket A with cumulative volume = 1000.
-        cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_900, 100.0, 1_050, 0), 1_000);
+        cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_960, 100.0, 1_050, 0), 1_000);
         let s = cell.snapshot(TfIndex::M1);
         assert_eq!(s.volume, 50, "incremental from 1000 baseline = 1050 - 1000");
         assert_eq!(s.bucket_start_cumulative, 1_000);
@@ -647,7 +647,7 @@ mod tests {
         // The 3 Wave-5 pct fields stay 0.0 until the seal-time writer
         // stamps them from the prev_day cache (locked decision L-H6).
         let cell = AggregatorCell::empty();
-        cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_900, 100.0, 50, 1_000), 0);
+        cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_960, 100.0, 50, 1_000), 0);
         let s = cell.snapshot(TfIndex::M1);
         assert_eq!(s.close_pct_from_prev_day, 0.0);
         assert_eq!(s.oi_pct_from_prev_day, 0.0);
@@ -694,7 +694,7 @@ mod tests {
         // The first bucket a slot opens (cell is armed at construction)
         // must take `open` from `tick.day_open`, NOT the first tick LTP.
         let cell = AggregatorCell::empty();
-        let tick = mk_tick_with_day_open(1_716_000_900, 105.0, 100.0);
+        let tick = mk_tick_with_day_open(1_779_354_960, 105.0, 100.0);
         cell.consume_tick(TfIndex::M1, &tick, 0);
         let s = cell.snapshot(TfIndex::M1);
         assert_eq!(s.open, 100.0, "day's first bar opens at tick.day_open");
@@ -712,14 +712,14 @@ mod tests {
         // Day's first M1 bucket (armed → uses day_open).
         cell.consume_tick(
             TfIndex::M1,
-            &mk_tick_with_day_open(1_716_000_900, 105.0, 100.0),
+            &mk_tick_with_day_open(1_779_354_960, 105.0, 100.0),
             0,
         );
         // Next M1 bucket — boundary crossing. day_open=100 still on the
         // tick, but the slot is disarmed → open must be the LTP 107.0.
         let outcome = cell.consume_tick(
             TfIndex::M1,
-            &mk_tick_with_day_open(1_716_000_961, 107.0, 100.0),
+            &mk_tick_with_day_open(1_779_355_021, 107.0, 100.0),
             0,
         );
         assert!(matches!(outcome, ConsumeOutcome::Sealed { .. }));
@@ -735,7 +735,7 @@ mod tests {
         // Day 1 first bar consumes the armed flag.
         cell.consume_tick(
             TfIndex::M1,
-            &mk_tick_with_day_open(1_716_000_900, 105.0, 100.0),
+            &mk_tick_with_day_open(1_779_354_960, 105.0, 100.0),
             0,
         );
         // IST-midnight force-seal empties + re-arms the slot.
@@ -744,7 +744,7 @@ mod tests {
         // Day 2 first tick — armed again → opens at the new day_open.
         cell.consume_tick(
             TfIndex::M1,
-            &mk_tick_with_day_open(1_716_087_300, 210.0, 200.0),
+            &mk_tick_with_day_open(1_779_441_360, 210.0, 200.0),
             0,
         );
         let s = cell.snapshot(TfIndex::M1);
@@ -758,7 +758,7 @@ mod tests {
         let cell = AggregatorCell::empty();
         cell.consume_tick(
             TfIndex::M1,
-            &mk_tick_with_day_open(1_716_000_900, 105.0, 0.0),
+            &mk_tick_with_day_open(1_779_354_960, 105.0, 0.0),
             0,
         );
         let s = cell.snapshot(TfIndex::M1);
@@ -772,13 +772,13 @@ mod tests {
         let cell = AggregatorCell::empty();
         cell.consume_tick(
             TfIndex::M1,
-            &mk_tick_with_day_open(1_716_000_900, 105.0, 100.0),
+            &mk_tick_with_day_open(1_779_354_960, 105.0, 100.0),
             0,
         );
         // M5's first bar must still use day_open.
         cell.consume_tick(
             TfIndex::M5,
-            &mk_tick_with_day_open(1_716_000_900, 105.0, 100.0),
+            &mk_tick_with_day_open(1_779_354_960, 105.0, 100.0),
             0,
         );
         assert_eq!(cell.snapshot(TfIndex::M1).open, 100.0);

@@ -60,6 +60,7 @@ use papaya::HashMap;
 
 use tickvault_common::tick_types::ParsedTick;
 
+use crate::candles::tf_index::{MARKET_CLOSE_SECS_OF_DAY_IST, MARKET_OPEN_SECS_OF_DAY_IST};
 use crate::candles::{AggregatorCell, ConsumeOutcome, LiveCandleState, TfIndex};
 
 /// Composite key per I-P1-11 — `(security_id, exchange_segment_code)`.
@@ -230,6 +231,23 @@ impl MultiTfAggregator {
     where
         F: FnMut(TfIndex, LiveCandleState),
     {
+        // Candle-window gate: only ticks inside the regular trading
+        // session [09:15:00, 15:30:00) IST form candles. Pre-open
+        // auction ticks (< 09:15) and post-close stale ticks (>= 15:30)
+        // are skipped — they still land in the `ticks` table, but they
+        // never pollute the candle grid (which Dhan REST cross-verify
+        // also expects to begin at 09:15). The bucket grid itself is
+        // 09:15-anchored in `TfIndex::bucket_start`.
+        let secs_of_day = tick.exchange_timestamp % 86_400;
+        if secs_of_day < MARKET_OPEN_SECS_OF_DAY_IST || secs_of_day >= MARKET_CLOSE_SECS_OF_DAY_IST
+        {
+            return ConsumeStats {
+                sealed_count: 0,
+                late_count: 0,
+                instrument_found: true,
+            };
+        }
+
         let key = (tick.security_id, exchange_segment_code);
         let pin = self.inner.pin();
         let Some(entry) = pin.get(&key) else {
@@ -386,7 +404,7 @@ mod tests {
     #[test]
     fn test_consume_tick_returns_instrument_not_found_when_missing() {
         let agg = MultiTfAggregator::new();
-        let tick = mk_tick(999, 0, 1_716_000_900, 100.0, 50, 0);
+        let tick = mk_tick(999, 0, 1_779_354_960, 100.0, 50, 0);
         let mut sealed_callbacks: u32 = 0;
         let stats = agg.consume_tick(&tick, 0, |_, _| sealed_callbacks += 1);
         assert!(!stats.instrument_found);
@@ -399,7 +417,7 @@ mod tests {
     fn test_consume_tick_first_tick_updates_all_21_tfs_no_seal() {
         let agg = MultiTfAggregator::new();
         agg.pre_populate(vec![(13, 0)]);
-        let tick = mk_tick(13, 0, 1_716_000_900, 100.0, 50, 1_000);
+        let tick = mk_tick(13, 0, 1_779_354_960, 100.0, 50, 1_000);
         let mut sealed_callbacks: u32 = 0;
         let stats = agg.consume_tick(&tick, 0, |_, _| sealed_callbacks += 1);
         assert!(stats.instrument_found);
@@ -421,12 +439,12 @@ mod tests {
     fn test_consume_tick_updates_last_cumulative_after_each_tick() {
         let agg = MultiTfAggregator::new();
         agg.pre_populate(vec![(13, 0)]);
-        let tick1 = mk_tick(13, 0, 1_716_000_900, 100.0, 50, 1_000);
+        let tick1 = mk_tick(13, 0, 1_779_354_960, 100.0, 50, 1_000);
         agg.consume_tick(&tick1, 0, |_, _| {});
         let entry = agg.get(13, 0).expect("present");
         assert_eq!(entry.last_cumulative.load(Ordering::Relaxed), 50);
 
-        let tick2 = mk_tick(13, 0, 1_716_000_910, 101.0, 75, 1_010);
+        let tick2 = mk_tick(13, 0, 1_779_354_970, 101.0, 75, 1_010);
         agg.consume_tick(&tick2, 0, |_, _| {});
         assert_eq!(entry.last_cumulative.load(Ordering::Relaxed), 75);
     }
@@ -435,11 +453,11 @@ mod tests {
     fn test_consume_tick_boundary_crossing_seals_only_crossed_tfs() {
         let agg = MultiTfAggregator::new();
         agg.pre_populate(vec![(13, 0)]);
-        // Base aligned to the 1d (86_400 s) boundary so every TF opens
-        // a fresh bucket at `base`. tick1 at base+10, tick2 at base+70:
+        // Base = 09:15:00 IST market open — every TF opens its first
+        // bucket of the day here. tick1 at base+10, tick2 at base+70:
         // only M1 (60 s) crosses a boundary; M2 (120 s) and every wider
         // TF still hold their `base` bucket.
-        let base = 1_715_990_400_u32; // 86_400 * 19_861
+        let base = 1_779_354_900_u32; // 2026-05-21 09:15:00 IST
         let tick1 = mk_tick(13, 0, base + 10, 100.0, 50, 1_000);
         agg.consume_tick(&tick1, 0, |_, _| {});
         let tick2 = mk_tick(13, 0, base + 70, 102.0, 80, 1_010);
@@ -457,7 +475,7 @@ mod tests {
         agg.pre_populate(vec![(13, 0)]);
         // Open all 9 TFs at t=1716001000+30 (t=1716001030, M1 bucket
         // = 1716001020..1716001080 say).
-        let aligned = 1_716_001_000_u32 - (1_716_001_000_u32 % 60);
+        let aligned = 1_779_355_500_u32; // 2026-05-21 09:25:00 IST (M1-aligned)
         let tick1 = mk_tick(13, 0, aligned + 30, 100.0, 50, 0);
         agg.consume_tick(&tick1, 0, |_, _| {});
         // Late tick belongs to PREVIOUS M1 bucket (t < aligned).
@@ -482,7 +500,7 @@ mod tests {
         agg.pre_populate(vec![(13, 0), (25, 0)]);
         // Tick both instruments to open all slots.
         for sid in [13_u32, 25] {
-            let t = mk_tick(sid, 0, 1_716_000_900, 100.0, 50, 0);
+            let t = mk_tick(sid, 0, 1_779_354_960, 100.0, 50, 0);
             agg.consume_tick(&t, 0, |_, _| {});
         }
         let mut emitted: Vec<(u32, u8, TfIndex)> = Vec::new();
@@ -521,7 +539,7 @@ mod tests {
         // segment must NOT mutate the other's state.
         let agg = MultiTfAggregator::new();
         agg.pre_populate(vec![(13, 0u8), (13, 1u8)]);
-        let tick_seg0 = mk_tick(13, 0, 1_716_000_900, 100.0, 50, 0);
+        let tick_seg0 = mk_tick(13, 0, 1_779_354_960, 100.0, 50, 0);
         agg.consume_tick(&tick_seg0, 0, |_, _| {});
 
         // Segment 1's entry should still be empty.
