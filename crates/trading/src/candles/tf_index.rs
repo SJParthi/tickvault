@@ -477,23 +477,26 @@ mod tests {
 
     #[test]
     fn test_tf_index_bucket_start_aligns_to_seconds_per_bucket() {
-        let arbitrary = 123_456_789_u32;
+        // An in-window IST tick (~11:24 IST). Buckets anchor to the
+        // 09:15:00 market open, NOT the epoch.
+        let tick = 1_779_362_677_u32;
+        let market_open = (tick / 86_400) * 86_400 + 33_300;
         for tf in TfIndex::ALL {
-            let bucket = tf.bucket_start(arbitrary);
+            let bucket = tf.bucket_start(tick);
             let secs = tf.seconds_per_bucket();
             assert!(
-                bucket <= arbitrary,
+                bucket <= tick,
                 "bucket_start past input for {}",
                 tf.display_name()
             );
             assert_eq!(
-                bucket % secs,
+                (bucket - market_open) % secs,
                 0,
-                "bucket_start unaligned for {}",
+                "bucket_start not anchored to 09:15 for {}",
                 tf.display_name()
             );
             assert!(
-                arbitrary - bucket < secs,
+                tick - bucket < secs,
                 "bucket_start too far below input for {}",
                 tf.display_name()
             );
@@ -502,13 +505,13 @@ mod tests {
 
     #[test]
     fn test_tf_index_bucket_start_idempotent_on_aligned_input() {
+        let tick = 1_779_362_677_u32;
         for tf in TfIndex::ALL {
-            let secs = tf.seconds_per_bucket();
-            let aligned = secs.saturating_mul(7);
+            let bucket = tf.bucket_start(tick);
             assert_eq!(
-                tf.bucket_start(aligned),
-                aligned,
-                "bucket_start should be idempotent on aligned input for {}",
+                tf.bucket_start(bucket),
+                bucket,
+                "bucket_start should be idempotent on a bucket boundary for {}",
                 tf.display_name()
             );
         }
