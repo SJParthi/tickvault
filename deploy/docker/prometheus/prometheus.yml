@@ -9,11 +9,8 @@ global:
   evaluation_interval: 15s
   scrape_timeout: 10s
 
-# Route alerts to Alertmanager (→ Telegram).
-alerting:
-  alertmanagers:
-    - static_configs:
-        - targets: ["tv-alertmanager:9093"]
+# Alertmanager removed (observability → CloudWatch-only, 2026-05-20, #O2).
+# Alert routing now lives in AWS CloudWatch Alarms.
 
 # Load recording rules and alert rules
 rule_files:
