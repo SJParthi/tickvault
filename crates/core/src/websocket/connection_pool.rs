@@ -80,6 +80,12 @@ pub struct WebSocketConnectionPool {
     /// the pool's background task and its owner.
     watchdog: std::sync::Mutex<PoolWatchdog>,
 
+    /// A4 log-coalescing state — the last A4 verdict kind (`a4_log_kind`)
+    /// that produced a `poll_watchdog` log line. The Degraded/Halt arms
+    /// re-log only when this value changes, so a long all-down cycle no
+    /// longer prints one line every 5s poll. Cold-path only.
+    last_a4_log_kind: std::sync::atomic::AtomicU8,
+
     /// O1-B (2026-04-17): Per-connection runtime subscribe-command senders.
     /// Index `i` matches `connections[i]`. `None` means "no subscribe
     /// channel was wired for this connection" (e.g. test pools or the
@@ -95,6 +101,34 @@ impl std::fmt::Debug for WebSocketConnectionPool {
         f.debug_struct("WebSocketConnectionPool")
             .field("connection_count", &self.connections.len())
             .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A4 log coalescing
+// ---------------------------------------------------------------------------
+
+/// A4 verdict kind that is not edge-coalesced — `poll_watchdog` logs the
+/// Healthy/Recovered/Degrading arms without edge-gating (Recovered already
+/// fires exactly once; the other two are silent).
+const A4_LOG_KIND_NONE: u8 = 0;
+/// A4 `Degraded` verdict kind (all connections down > 60s).
+const A4_LOG_KIND_DEGRADED: u8 = 1;
+/// A4 `Halt` verdict kind (all connections down > 300s).
+const A4_LOG_KIND_HALT: u8 = 2;
+
+/// Maps a watchdog verdict to its A4 log kind. `poll_watchdog` records the
+/// last kind it logged and re-logs the Degraded/Halt arms only when this
+/// value changes — so a multi-hour all-down cycle yields one log line per
+/// transition instead of one every 5s watchdog poll. The continuous signal
+/// stays available via the `tv_pool_degraded_seconds` gauge.
+fn a4_log_kind(verdict: &WatchdogVerdict) -> u8 {
+    match verdict {
+        WatchdogVerdict::Degraded { .. } => A4_LOG_KIND_DEGRADED,
+        WatchdogVerdict::Halt { .. } => A4_LOG_KIND_HALT,
+        WatchdogVerdict::Healthy
+        | WatchdogVerdict::Recovered { .. }
+        | WatchdogVerdict::Degrading { .. } => A4_LOG_KIND_NONE,
     }
 }
 
@@ -266,6 +300,7 @@ impl WebSocketConnectionPool {
             frame_sender,
             connection_stagger_ms: ws_config.connection_stagger_ms,
             watchdog: std::sync::Mutex::new(PoolWatchdog::new()),
+            last_a4_log_kind: std::sync::atomic::AtomicU8::new(A4_LOG_KIND_NONE),
             // O1-B: empty until `install_subscribe_channels()` is called.
             // APPROVED: cold path — pool constructor, runs once at boot.
             subscribe_senders: std::sync::Mutex::new(Vec::with_capacity(MAX_WEBSOCKET_CONNECTIONS)),
@@ -520,6 +555,16 @@ impl WebSocketConnectionPool {
         let verdict = wd.tick(&healths, now);
         drop(wd);
 
+        // A4 log coalescing: re-log the Degraded/Halt arms only when the
+        // verdict kind changes, so a multi-hour all-down cycle no longer
+        // prints one line every 5s poll. The metrics/gauges below still
+        // update every poll — only the human-readable log is edge-gated.
+        let a4_kind = a4_log_kind(&verdict);
+        let a4_log_edge = self
+            .last_a4_log_kind
+            .swap(a4_kind, std::sync::atomic::Ordering::Relaxed)
+            != a4_kind;
+
         match verdict {
             WatchdogVerdict::Healthy => {
                 metrics::gauge!("tv_pool_degraded_seconds").set(0.0);
@@ -542,19 +587,23 @@ impl WebSocketConnectionPool {
                 // 07:00-09:00 reset window and the operator's inbox is spammed.
                 // Outside market hours we log at INFO level only (dashboard +
                 // metric still updated so operators can see the signal).
-                if pool_watchdog_is_within_market_hours() {
-                    tracing::error!(
-                        down_for_secs = down_for.as_secs(),
-                        "A4 CRITICAL: WebSocket pool has been FULLY DEGRADED for >60s — ALL connections \
-                         are Reconnecting/Disconnected, no market data flowing. Investigate Dhan \
-                         server status, token validity, network reachability."
-                    );
-                } else {
-                    tracing::info!(
-                        down_for_secs = down_for.as_secs(),
-                        "A4: pool degraded outside market hours (09:00-15:30 IST) — downgraded to INFO \
-                         (Dhan routinely resets idle connections pre-market)"
-                    );
+                // A4 log coalescing: gated by `a4_log_edge` so this fires
+                // once per down-cycle transition, not every 5s poll.
+                if a4_log_edge {
+                    if pool_watchdog_is_within_market_hours() {
+                        tracing::error!(
+                            down_for_secs = down_for.as_secs(),
+                            "A4 CRITICAL: WebSocket pool has been FULLY DEGRADED for >60s — ALL connections \
+                             are Reconnecting/Disconnected, no market data flowing. Investigate Dhan \
+                             server status, token validity, network reachability."
+                        );
+                    } else {
+                        tracing::info!(
+                            down_for_secs = down_for.as_secs(),
+                            "A4: pool degraded outside market hours (09:00-15:30 IST) — downgraded to INFO \
+                             (Dhan routinely resets idle connections pre-market)"
+                        );
+                    }
                 }
                 metrics::counter!("tv_pool_degraded_alerts_total").increment(1);
                 metrics::gauge!("tv_pool_degraded_seconds").set(down_for.as_secs_f64());
@@ -566,18 +615,22 @@ impl WebSocketConnectionPool {
                 // we demote Halt to INFO — the downstream supervisor no longer
                 // force-exits the process (see main.rs:3789 for the matching
                 // verdict handler which also checks market-hours post-fix).
-                if pool_watchdog_is_within_market_hours() {
-                    tracing::error!(
-                        down_for_secs = down_for.as_secs(),
-                        "A4 FATAL: WebSocket pool has been FULLY DEGRADED for >300s — initiating process \
-                         halt so supervisor can restart us. If this fires repeatedly, Dhan is likely \
-                         unreachable or the account/token is locked."
-                    );
-                } else {
-                    tracing::info!(
-                        down_for_secs = down_for.as_secs(),
-                        "A4: pool halt verdict outside market hours — downgraded to INFO (no process exit)"
-                    );
+                // A4 log coalescing: gated by `a4_log_edge` so this fires
+                // once per down-cycle transition, not every 5s poll.
+                if a4_log_edge {
+                    if pool_watchdog_is_within_market_hours() {
+                        tracing::error!(
+                            down_for_secs = down_for.as_secs(),
+                            "A4 FATAL: WebSocket pool has been FULLY DEGRADED for >300s — initiating process \
+                             halt so supervisor can restart us. If this fires repeatedly, Dhan is likely \
+                             unreachable or the account/token is locked."
+                        );
+                    } else {
+                        tracing::info!(
+                            down_for_secs = down_for.as_secs(),
+                            "A4: pool halt verdict outside market hours — downgraded to INFO (no process exit)"
+                        );
+                    }
                 }
                 metrics::counter!("tv_pool_halts_total").increment(1);
                 metrics::gauge!("tv_pool_degraded_seconds").set(down_for.as_secs_f64());
@@ -1810,6 +1863,46 @@ mod tests {
                 "dead pool must stay in Degrading, got {v:?}"
             );
         }
+    }
+
+    /// A4 log coalescing: `a4_log_kind` must map every watchdog verdict to a
+    /// stable, distinct kind so the swap-based edge check in `poll_watchdog`
+    /// re-logs Degraded/Halt exactly once per down-cycle transition.
+    #[test]
+    fn test_a4_log_kind_maps_each_verdict() {
+        use std::time::Duration;
+
+        assert_eq!(a4_log_kind(&WatchdogVerdict::Healthy), A4_LOG_KIND_NONE);
+        assert_eq!(
+            a4_log_kind(&WatchdogVerdict::Recovered {
+                was_down_for: Duration::from_secs(1),
+            }),
+            A4_LOG_KIND_NONE,
+        );
+        assert_eq!(
+            a4_log_kind(&WatchdogVerdict::Degrading {
+                down_for: Duration::from_secs(1),
+            }),
+            A4_LOG_KIND_NONE,
+        );
+        assert_eq!(
+            a4_log_kind(&WatchdogVerdict::Degraded {
+                down_for: Duration::from_secs(61),
+            }),
+            A4_LOG_KIND_DEGRADED,
+        );
+        assert_eq!(
+            a4_log_kind(&WatchdogVerdict::Halt {
+                down_for: Duration::from_secs(301),
+            }),
+            A4_LOG_KIND_HALT,
+        );
+
+        // The three kinds must be distinct or the `swap(..) != kind` edge
+        // check would miss a Degraded -> Halt transition.
+        assert_ne!(A4_LOG_KIND_NONE, A4_LOG_KIND_DEGRADED);
+        assert_ne!(A4_LOG_KIND_DEGRADED, A4_LOG_KIND_HALT);
+        assert_ne!(A4_LOG_KIND_NONE, A4_LOG_KIND_HALT);
     }
 
     // =======================================================================
