@@ -66,16 +66,33 @@ ratchets updated, one PR at a time per `pr-completion-protocol.md` §H.
   - Tests: `docker compose config` valid;
     `cargo test -p tickvault-common --test loki_alloy_profile_guard` green.
 
-- [ ] **#O3 — Prometheus removal**
-  - Drop the `prometheus` container from compose; delete `alerts.yml`
-    + the Prometheus scrape config.
-  - The app's `/metrics` endpoint (port 9091) STAYS — CloudWatch agent
-    scrapes it (or the app pushes). Only the container goes.
-  - Delete `resilience_sla_alert_guard.rs` + any alert-rule guards.
+- [x] **#O3 — Prometheus removal** — merged
+  - Dropped the `tv-prometheus` service + `tv-prometheus-data` volume
+    from compose; deleted `deploy/docker/prometheus/` (prometheus.yml +
+    rules/tickvault-alerts.yml).
+  - The app's `/metrics` endpoint (port 9091) STAYS — the CloudWatch
+    agent scrapes it. Only the container is gone.
+  - `infra.rs`: removed Prometheus from `DASHBOARD_SERVICES`, dropped
+    `PROMETHEUS_PORT` + the `wait_for_service_healthy("Prometheus", …)`
+    boot wait; updated `test_dashboard_services_count` → 2.
+  - Deleted alert-rule guards `resilience_sla_alert_guard.rs` and
+    `recording_rules_guard.rs`; trimmed `zero_tick_loss_alert_guard.rs`
+    to its still-valid source-scan tests (metric emissions still
+    matter — CloudWatch scrapes them); removed the
+    `prometheus_alerts_include_depth_sequence_rules` test.
+  - Updated `loki_alloy_profile_guard.rs::compose_preserves_default_services`
+    → 2 services (questdb, valkey).
+  - Deferred to #O5: the unused `PrometheusConfig` struct + `[prometheus]`
+    `config/base.toml` section (inert config, no boot impact).
   - Files: `deploy/docker/docker-compose.yml`,
-    `deploy/docker/prometheus/**`,
-    `crates/storage/tests/resilience_sla_alert_guard.rs`
-  - Tests: `cargo test -p tickvault-storage` green.
+    `deploy/docker/prometheus/**` (deleted), `crates/app/src/infra.rs`,
+    `crates/storage/tests/resilience_sla_alert_guard.rs` (deleted),
+    `crates/storage/tests/zero_tick_loss_alert_guard.rs`,
+    `crates/common/tests/recording_rules_guard.rs` (deleted),
+    `crates/common/tests/claude_session_bootstrap_guard.rs`,
+    `crates/common/tests/loki_alloy_profile_guard.rs`
+  - Tests: `docker compose config` valid; `cargo test -p tickvault-app
+    -p tickvault-storage -p tickvault-common` (scoped) green.
 
 - [ ] **#O4 — Valkey removal — UNBLOCKED (operator decision 2026-05-20)**
   - Valkey is LOAD-BEARING: (a) token cache, (b) dual-instance lock.
@@ -115,11 +132,18 @@ ratchets updated, one PR at a time per `pr-completion-protocol.md` §H.
     half-finished). Also sweep the `tickvault-logs` MCP server +
     `claude_mcp_endpoints_config_guard.rs` / `claude_session_bootstrap_guard.rs`
     `alertmanager_url` / `TICKVAULT_ALERTMANAGER_URL` references.
+  - Remove the now-inert `PrometheusConfig` struct + the `[prometheus]`
+    `config/base.toml` section (left in place by #O3 — it no longer
+    connects to anything; `config_round_trip.rs` updates with it).
+    Keep `ObservabilityConfig` — the `/metrics` exporter on port 9091
+    stays for the CloudWatch agent.
   - Recompute the `aws-budget.md` memory-budget tables for the
     3-component runtime.
   - Files: `.claude/rules/project/aws-budget.md`,
     `.claude/rules/project/observability-architecture.md`,
     `scripts/**`, `scripts/mcp-servers/tickvault-logs/server.py`,
+    `crates/common/src/config.rs`, `config/base.toml`,
+    `crates/common/tests/config_round_trip.rs`,
     `crates/common/tests/claude_mcp_endpoints_config_guard.rs`,
     `crates/common/tests/claude_session_bootstrap_guard.rs`,
     others as found.

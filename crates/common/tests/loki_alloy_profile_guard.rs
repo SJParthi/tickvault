@@ -173,26 +173,28 @@ fn alertmanager_is_removed_from_loki_ruler() {
 fn compose_preserves_default_services() {
     // Observability → CloudWatch-only program
     // (.claude/plans/active-plan-observability-cloudwatch-only.md):
-    // Grafana removed in #O1, Alertmanager in #O2. The default profile
-    // now contains exactly 3 services; Prometheus (#O3) and Valkey
-    // (#O4) removals will reduce this further.
-    //   tv-questdb, tv-valkey, tv-prometheus.
+    // Grafana removed in #O1, Alertmanager in #O2, Prometheus in #O3.
+    // The default profile now contains exactly 2 services; the Valkey
+    // (#O4) removal will reduce this to 1 (QuestDB only).
+    //   tv-questdb, tv-valkey.
     // Loki + Alloy remain profile-gated for opt-in dev use.
     let src = load_text(COMPOSE);
-    let default_profile_services: Vec<&str> = ["tv-questdb:", "tv-valkey:", "tv-prometheus:"]
+    let default_profile_services: Vec<&str> = ["tv-questdb:", "tv-valkey:"]
         .iter()
         .filter(|s| src.contains(*s))
         .copied()
         .collect();
     assert_eq!(
         default_profile_services.len(),
-        3,
-        "Expected exactly 3 default-profile services, found {:?}",
+        2,
+        "Expected exactly 2 default-profile services, found {:?}",
         default_profile_services
     );
     assert!(
-        !src.contains("tv-alertmanager:") && !src.contains("tv-grafana:"),
-        "Grafana (#O1) and Alertmanager (#O2) must be absent from compose"
+        !src.contains("tv-alertmanager:")
+            && !src.contains("tv-grafana:")
+            && !src.contains("tv-prometheus:"),
+        "Grafana (#O1), Alertmanager (#O2) and Prometheus (#O3) must be absent from compose"
     );
 }
 

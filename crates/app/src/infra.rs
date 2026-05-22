@@ -85,17 +85,13 @@ const LOCAL_HOST: &str = "127.0.0.1";
 /// Each entry: (service name, URL, host, port).
 ///
 /// PR #7d (2026-05-19): the `Portal` + `Market Dashboard` entries were
-/// removed alongside the `/portal/*` HTML retirement. The replacement
-/// surface for operator UX is Grafana (top of list), QuestDB Console,
-/// Prometheus, and Telegram alerts.
+/// removed alongside the `/portal/*` HTML retirement.
+/// #O3 (2026-05-20): Prometheus removed — observability narrowed to
+/// CloudWatch-only. Operator UX is the QuestDB Console + Telegram alerts.
 const DASHBOARD_SERVICES: &[(&str, &str, &str, u16)] = &[
     ("QuestDB", "http://localhost:9000", LOCAL_HOST, 9000),
-    ("Prometheus", "http://localhost:9090", LOCAL_HOST, 9090),
     ("Traefik", "http://localhost:8080", LOCAL_HOST, 8080),
 ];
-
-/// Prometheus HTTP port for TCP reachability probe.
-const PROMETHEUS_PORT: u16 = 9090;
 
 /// Valkey (Redis) port for TCP reachability probe.
 const VALKEY_PORT: u16 = 6379;
@@ -117,7 +113,7 @@ const VALKEY_PORT: u16 = 6379;
 /// 1. Ensures Docker daemon is running (launches Docker Desktop on macOS).
 /// 2. Fetches infra credentials from SSM.
 /// 3. Runs `docker compose up -d` (idempotent).
-/// 4. Waits for QuestDB, Grafana, Prometheus, Valkey to become healthy.
+/// 4. Waits for QuestDB + Valkey to become healthy.
 /// 5. Opens dashboards in the default browser.
 ///
 /// Best-effort: if Docker or SSM is unavailable, logs a warning
@@ -232,7 +228,6 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
 
     // Wait for all critical services to become healthy.
     wait_for_service_healthy("QuestDB", &questdb_config.host, questdb_config.http_port).await;
-    wait_for_service_healthy("Prometheus", LOCAL_HOST, PROMETHEUS_PORT).await;
     wait_for_service_healthy("Valkey", LOCAL_HOST, VALKEY_PORT).await;
 
     // Auto-open all monitoring dashboards in the default browser.
@@ -241,7 +236,7 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
 
 /// Opens all reachable monitoring dashboards in the default browser.
 ///
-/// Opens: Grafana, QuestDB Console, Prometheus, Traefik, and Portal.
+/// Opens: QuestDB Console (the remaining browser-facing service).
 /// Best-effort: if a service is not running or the browser cannot be launched,
 /// logs a warning and skips it — does not block boot.
 async fn open_all_dashboards() {
@@ -1517,12 +1512,12 @@ mod tests {
 
     #[test]
     fn test_dashboard_services_count() {
-        // #O1 (2026-05-20): Grafana removed — 3 dashboard services remain:
-        // QuestDB, Prometheus, Traefik.
+        // #O1 Grafana removed, #O3 Prometheus removed (2026-05-20) —
+        // 2 dashboard services remain: QuestDB, Traefik.
         assert_eq!(
             DASHBOARD_SERVICES.len(),
-            3,
-            "expected 3 dashboard services post-#O1 Grafana removal"
+            2,
+            "expected 2 dashboard services post-#O3 Prometheus removal"
         );
     }
 

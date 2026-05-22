@@ -389,23 +389,9 @@ fn chaos_nightly_workflow_wires_ignored_tests() {
     );
 }
 
-#[test]
-fn prometheus_alerts_include_depth_sequence_rules() {
-    // PR #288 (#2): sustained + burst alerts for depth sequence holes.
-    let rules = read("deploy/docker/prometheus/rules/tickvault-alerts.yml");
-    assert!(
-        rules.contains("DepthSequenceHolesSustained"),
-        "tickvault-alerts.yml must include DepthSequenceHolesSustained"
-    );
-    assert!(
-        rules.contains("DepthSequenceHolesBurst"),
-        "tickvault-alerts.yml must include DepthSequenceHolesBurst"
-    );
-    assert!(
-        rules.contains("tv_depth_sequence_holes_total"),
-        "alerts must reference tv_depth_sequence_holes_total"
-    );
-}
+// `prometheus_alerts_include_depth_sequence_rules` removed 2026-05-20
+// (#O3): the Prometheus container + `tickvault-alerts.yml` were retired
+// when observability narrowed to CloudWatch-only.
 
 #[test]
 fn chaos_valkey_kill_test_exists() {
