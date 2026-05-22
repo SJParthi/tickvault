@@ -1,6 +1,6 @@
 //! Shared little-endian read helpers for binary packet parsing.
 //!
-//! These functions are used by all packet parsers (quote, full, market_depth, deep_depth).
+//! These functions are used by the binary packet parsers (ticker, quote, full).
 //! Centralised here to eliminate duplication.
 //!
 //! # Safety Contract
@@ -36,22 +36,6 @@ pub(super) fn read_u32_le(raw: &[u8], offset: usize) -> u32 {
 #[inline(always)]
 pub(super) fn read_u16_le(raw: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([raw[offset], raw[offset + 1]])
-}
-
-/// Reads a little-endian f64 from a byte slice at the given offset.
-#[allow(clippy::arithmetic_side_effects)] // APPROVED: caller validates buffer length before invoking
-#[inline(always)]
-pub(super) fn read_f64_le(raw: &[u8], offset: usize) -> f64 {
-    f64::from_le_bytes([
-        raw[offset],
-        raw[offset + 1],
-        raw[offset + 2],
-        raw[offset + 3],
-        raw[offset + 4],
-        raw[offset + 5],
-        raw[offset + 6],
-        raw[offset + 7],
-    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -197,50 +181,6 @@ mod tests {
         assert_eq!(read_u16_le(&buf, 2), 50);
     }
 
-    // --- read_f64_le ---
-
-    #[test]
-    fn test_read_f64_le_zero() {
-        let bytes = 0.0_f64.to_le_bytes();
-        assert!((read_f64_le(&bytes, 0) - 0.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_read_f64_le_positive() {
-        let bytes = 21004.95_f64.to_le_bytes();
-        assert!((read_f64_le(&bytes, 0) - 21004.95).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_read_f64_le_negative() {
-        let bytes = (-9999.99_f64).to_le_bytes();
-        assert!((read_f64_le(&bytes, 0) - -9999.99).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_read_f64_le_at_offset() {
-        // 12 padding bytes, then the f64
-        let mut buf = [0u8; 20];
-        let value = 12345.6789_f64;
-        buf[12..20].copy_from_slice(&value.to_le_bytes());
-        assert!((read_f64_le(&buf, 12) - 12345.6789).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_read_f64_le_at_nonzero_offset_with_junk() {
-        let mut buf = [0xFF_u8; 16];
-        let value = 0.001_f64;
-        buf[8..16].copy_from_slice(&value.to_le_bytes());
-        assert!((read_f64_le(&buf, 8) - 0.001).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_read_f64_le_depth_price() {
-        // Full Market Depth uses f64 prices (not f32)
-        let bytes = 25650.50_f64.to_le_bytes();
-        assert!((read_f64_le(&bytes, 0) - 25650.50).abs() < f64::EPSILON);
-    }
-
     // --- Cross-function: verify LE byte order matters ---
 
     #[test]
@@ -316,37 +256,6 @@ mod tests {
     fn test_read_f32_le_negative_zero() {
         let bytes = (-0.0_f32).to_le_bytes();
         assert_eq!(read_f32_le(&bytes, 0), 0.0);
-    }
-
-    #[test]
-    fn test_read_f64_le_nan() {
-        let bytes = f64::NAN.to_le_bytes();
-        assert!(read_f64_le(&bytes, 0).is_nan());
-    }
-
-    #[test]
-    fn test_read_f64_le_infinity() {
-        let bytes = f64::INFINITY.to_le_bytes();
-        assert!(read_f64_le(&bytes, 0).is_infinite());
-    }
-
-    #[test]
-    fn test_read_f64_le_neg_infinity() {
-        let bytes = f64::NEG_INFINITY.to_le_bytes();
-        assert!(read_f64_le(&bytes, 0).is_infinite());
-        assert!(read_f64_le(&bytes, 0).is_sign_negative());
-    }
-
-    #[test]
-    fn test_read_f64_le_max_value() {
-        let bytes = f64::MAX.to_le_bytes();
-        assert_eq!(read_f64_le(&bytes, 0), f64::MAX);
-    }
-
-    #[test]
-    fn test_read_f64_le_min_positive() {
-        let bytes = f64::MIN_POSITIVE.to_le_bytes();
-        assert_eq!(read_f64_le(&bytes, 0), f64::MIN_POSITIVE);
     }
 
     // --- u32 boundary values ---

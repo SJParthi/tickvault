@@ -43,11 +43,6 @@ const DOCKER_DAEMON_TIMEOUT: Duration = Duration::from_secs(90);
 /// Polling interval when waiting for services to become healthy.
 const INFRA_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Per-attempt HTTP request timeout for `wait_for_http_endpoint_healthy`.
-/// Short — the endpoint either responds quickly or it isn't ready yet,
-/// in which case we'd rather move on to the next poll.
-const HTTP_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-
 /// Timeout for QuestDB liveness HTTP check (SELECT 1).
 ///
 /// 15s is high enough that a QuestDB under heavy ILP ingestion pressure
@@ -1157,53 +1152,6 @@ async fn wait_for_service_healthy(name: &str, host: &str, port: u16) {
         service = name,
         timeout_secs = INFRA_HEALTH_TIMEOUT.as_secs(),
         "service did not become healthy within timeout — continuing anyway"
-    );
-}
-
-/// Polls an HTTP endpoint until it returns a 2xx response or the timeout
-/// expires. Stricter than `wait_for_service_healthy` (which only proves
-/// the TCP port is open) — Grafana in particular opens its listener
-/// several seconds before the HTTP server is ready to serve requests.
-async fn wait_for_http_endpoint_healthy(name: &str, url: &str) {
-    let start = std::time::Instant::now();
-    let client = reqwest::Client::builder()
-        .timeout(HTTP_HEALTH_PROBE_TIMEOUT)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-
-    while start.elapsed() < INFRA_HEALTH_TIMEOUT {
-        match client.get(url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                info!(service = name, url, "HTTP endpoint is healthy");
-                return;
-            }
-            Ok(resp) => {
-                debug!(
-                    service = name,
-                    url,
-                    status = %resp.status(),
-                    elapsed_secs = start.elapsed().as_secs(),
-                    "HTTP endpoint not yet healthy"
-                );
-            }
-            Err(err) => {
-                debug!(
-                    service = name,
-                    url,
-                    %err,
-                    elapsed_secs = start.elapsed().as_secs(),
-                    "HTTP endpoint not reachable yet"
-                );
-            }
-        }
-        tokio::time::sleep(INFRA_HEALTH_POLL_INTERVAL).await;
-    }
-
-    warn!(
-        service = name,
-        url,
-        timeout_secs = INFRA_HEALTH_TIMEOUT.as_secs(),
-        "HTTP endpoint did not become healthy within timeout — continuing anyway"
     );
 }
 
