@@ -50,11 +50,21 @@ ratchets updated, one PR at a time per `pr-completion-protocol.md` §H.
     `crates/storage/tests/operator_health_dashboard_guard.rs`
   - Tests: `cargo build --workspace` green; `cargo test -p tickvault-app -p tickvault-storage`
 
-- [ ] **#O2 — Alertmanager removal**
-  - Drop the `alertmanager` service + its config from
-    `deploy/docker/docker-compose.yml` / `deploy/docker/`.
-  - Files: `deploy/docker/docker-compose.yml`, `deploy/docker/alertmanager/**`
-  - Tests: compose still `docker compose config`-valid.
+- [x] **#O2 — Alertmanager removal** — merged
+  - Dropped the `tv-alertmanager` service from
+    `deploy/docker/docker-compose.yml`; deleted `deploy/docker/alertmanager/`.
+  - Removed the `alerting:` block from `prometheus.yml` and the
+    `alertmanager_url` from the opt-in `logs`-profile `loki-config.yml`
+    so neither config references the deleted service.
+  - Updated `loki_alloy_profile_guard.rs` (also fixed the
+    `compose_preserves_*` test left stale by #O1's Grafana removal).
+  - Files: `deploy/docker/docker-compose.yml`,
+    `deploy/docker/alertmanager/**` (deleted),
+    `deploy/docker/prometheus/prometheus.yml`,
+    `deploy/docker/loki/loki-config.yml`,
+    `crates/common/tests/loki_alloy_profile_guard.rs`
+  - Tests: `docker compose config` valid;
+    `cargo test -p tickvault-common --test loki_alloy_profile_guard` green.
 
 - [ ] **#O3 — Prometheus removal**
   - Drop the `prometheus` container from compose; delete `alerts.yml`
@@ -93,13 +103,26 @@ ratchets updated, one PR at a time per `pr-completion-protocol.md` §H.
   - Tests: `cargo build --workspace`; boot must still succeed with the
     token manager reading SSM directly.
 
-- [ ] **#O5 — guard / rule cleanup**
+- [ ] **#O5 — guard / rule / script cleanup**
   - Sweep `.claude/rules/` for stale Grafana / Prometheus / Valkey /
     Alertmanager references; update or retire each rule file.
+  - Sweep the operational shell scripts in one consistent pass —
+    `scripts/doctor.sh`, `scripts/verify-stack.sh`,
+    `scripts/ensure-ready.sh`, `scripts/setup-observability.sh`,
+    `scripts/docker-restart.sh` — removing all four removed-service
+    references together (#O1–#O4 left these deliberately, since a
+    per-PR partial edit while sibling refs linger is itself
+    half-finished). Also sweep the `tickvault-logs` MCP server +
+    `claude_mcp_endpoints_config_guard.rs` / `claude_session_bootstrap_guard.rs`
+    `alertmanager_url` / `TICKVAULT_ALERTMANAGER_URL` references.
   - Recompute the `aws-budget.md` memory-budget tables for the
     3-component runtime.
   - Files: `.claude/rules/project/aws-budget.md`,
-    `.claude/rules/project/observability-architecture.md`, others as found.
+    `.claude/rules/project/observability-architecture.md`,
+    `scripts/**`, `scripts/mcp-servers/tickvault-logs/server.py`,
+    `crates/common/tests/claude_mcp_endpoints_config_guard.rs`,
+    `crates/common/tests/claude_session_bootstrap_guard.rs`,
+    others as found.
 
 - [ ] **#O6 — docs sweep**
   - Update every doc that describes Grafana / Prometheus / Valkey /

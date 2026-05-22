@@ -213,42 +213,11 @@ services:
       - tv-network
 
   # ---------------------------------------------------------------------------
-  # Alertmanager — Alert Routing (Prometheus → Telegram)
-  # KEPT in Wave 7-A: operator decision 2026-05-10. Independent process is
-  # critical for "app crashed" alert routing. Routing the alert webhook through
-  # the app itself = single-point-of-failure (app dead = no alert).
-  # 256MB is cheap insurance.
-  # Pinned: prom/alertmanager:v0.32.0
+  # Alertmanager — REMOVED (observability → CloudWatch-only, 2026-05-20).
+  # Alert routing now lives in AWS CloudWatch Alarms. See
+  # .claude/plans/active-plan-observability-cloudwatch-only.md (#O2).
   # ---------------------------------------------------------------------------
-  tv-alertmanager:
-    image: prom/alertmanager:v0.32.0@sha256:fe1f57b89ec7b94928746e61d9924cafd3674c688e3c7c3ad9600d8ef5da6cf9
-    container_name: tv-alertmanager
-    hostname: tv-alertmanager
-    restart: unless-stopped
-    mem_limit: 256m
-    cpus: 0.25
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    ports:
-      - "127.0.0.1:9093:9093"
-    volumes:
-      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
-    command:
-      - "--config.file=/etc/alertmanager/alertmanager.yml"
-      - "--storage.path=/alertmanager"
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "3"
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:9093/-/healthy || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    networks:
-      - tv-network
+
   # ---------------------------------------------------------------------------
   # Wave 7-A REMOVED: tv-traefik (traefik reverse proxy)
   # Replacement on AWS: AWS Application Load Balancer (free tier 750 hrs/mo).

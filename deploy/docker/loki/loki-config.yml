@@ -49,16 +49,15 @@ compactor:
   delete_request_store: filesystem
 
 # Log-pattern alert rules — Phase 3.2. Fire when error signatures spike,
-# when a novel signature appears, or when flush errors storm. Routes
-# through Alertmanager -> existing NotificationService webhook so the
-# zero-touch chain works end-to-end.
+# when a novel signature appears, or when flush errors storm.
+# Alertmanager removed (observability → CloudWatch-only, 2026-05-20, #O2);
+# this `logs`-profile dev ruler evaluates rules without external routing.
 ruler:
   storage:
     type: local
     local:
       directory: /loki/rules
   rule_path: /loki/rules-tmp
-  alertmanager_url: http://tv-alertmanager:9093
   ring:
     kvstore:
       store: inmemory
