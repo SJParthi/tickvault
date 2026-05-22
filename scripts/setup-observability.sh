@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# tickvault — Observability Stack: FULL AUTO Setup
+# tickvault — Infrastructure Stack: FULL AUTO Setup
 # =============================================================================
 # ONE COMMAND. ZERO HUMAN INTERVENTION.
 #
@@ -8,22 +8,20 @@
 #   1.  Detect OS (macOS / Linux) and set platform-specific commands
 #   2.  Check prerequisites (Docker, docker compose, curl, jq)
 #   3.  Auto-install missing prerequisites where possible
-#   4.  Validate AWS credentials exist (for Grafana/QuestDB secrets)
+#   4.  Validate AWS credentials exist (for QuestDB secrets)
 #   5.  Fetch/provision all SSM secrets (idempotent)
-#   6.  Pull all Docker images (7 services, pinned SHA256)
-#   7.  Start the full stack (docker compose up -d)
-#   8.  Health-wait every service with exponential backoff
-#   9.  Validate Prometheus scrape targets are UP
-#   10. Validate Grafana datasources are provisioned
-#   11. Validate Grafana dashboards are loaded
-#   12. Validate Grafana alert rules are provisioned
-#   13. Validate Prometheus recording + alert rules loaded
-#   14. Print full status report
-#   15. Auto-open all dashboards in browser
+#   6.  Check existing stack state (or tear down on --restart)
+#   7.  Pull Docker images (pinned SHA256)
+#   8.  Start the stack (docker compose up -d)
+#   9.  Health-wait QuestDB with exponential backoff; verify Valkey is up
+#   10. Print log-pipeline pointers
+#   11. Print full status report
 #
-# Wave 7-A: Traefik, Loki, Alloy, Jaeger, valkey-exporter were REMOVED to
-# fit the 8GB c7i.xlarge AWS budget. AWS ALB (free tier) replaces Traefik
-# for HTTPS termination; CloudWatch Logs replaces Loki/Jaeger.
+# CloudWatch-only migration (aws-budget.md "OPERATOR DECISION 2026-05-20"):
+# the runtime is QuestDB + the tickvault app + AWS CloudWatch. Grafana,
+# Prometheus, Alertmanager, Loki and Alloy are not part of the default
+# stack. CloudWatch is the entire observability layer (metrics, logs,
+# alarms). Valkey stays until plan item #O4 removes it from the code.
 #
 # Usage:
 #   ./scripts/setup-observability.sh              # full setup + open browser
@@ -48,7 +46,7 @@ NC='\033[0m'
 PASS=0
 WARN=0
 FAIL=0
-TOTAL_STEPS=18
+TOTAL_STEPS=11
 CURRENT_STEP=0
 
 # ---- Flags ----
@@ -135,7 +133,7 @@ fetch_ssm_secret() {
 # =============================================================================
 echo ""
 echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║   tickvault — Observability Stack (Auto)      ║${NC}"
+echo -e "${CYAN}║   tickvault — Infrastructure Stack (Auto)     ║${NC}"
 echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
 # =============================================================================
@@ -228,38 +226,23 @@ ENVIRONMENT="${SSM_ENV}" bash "${SCRIPT_DIR}/provision-infra-secrets.sh"
 info "Fetching credentials for docker-compose..."
 TV_QUESTDB_PG_USER=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/questdb/pg-user")
 TV_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/questdb/pg-password")
-TV_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/grafana/admin-user")
-TV_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/grafana/admin-password")
-export TV_QUESTDB_PG_USER TV_QUESTDB_PG_PASSWORD TV_GRAFANA_ADMIN_USER TV_GRAFANA_ADMIN_PASSWORD
+export TV_QUESTDB_PG_USER TV_QUESTDB_PG_PASSWORD
 
-# Telegram credentials — used by Grafana alerting contact point (alerts.yml).
-# Same SSM path as the Rust app and notify-telegram.sh — ONE source, everywhere.
-TV_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/telegram/bot-token" 2>/dev/null || echo "")
-TV_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/telegram/chat-id" 2>/dev/null || echo "")
-export TV_TELEGRAM_BOT_TOKEN TV_TELEGRAM_CHAT_ID
-
-if [ -n "$TV_TELEGRAM_BOT_TOKEN" ] && [ -n "$TV_TELEGRAM_CHAT_ID" ]; then
-    ok "All 6 secrets ready (infra + Telegram)"
+if [ -n "$TV_QUESTDB_PG_USER" ] && [ -n "$TV_QUESTDB_PG_PASSWORD" ]; then
+    ok "QuestDB credentials ready"
 else
-    ok "4 infrastructure secrets ready"
-    warn "Telegram secrets not in SSM — Grafana alerts will not reach Telegram (Rust-side alerts unaffected)"
+    fail "QuestDB credentials missing from SSM — check /tickvault/${SSM_ENV}/questdb/*"
+    exit 1
 fi
 
 if [ "$VERIFY_ONLY" = true ]; then
     CURRENT_STEP=8
-    TOTAL_STEPS=18
 else
     # ---- Step 6: Restart if requested ----
     if [ "$RESTART" = true ]; then
         step "Tearing down existing stack"
         docker compose -f "${COMPOSE_FILE}" down --remove-orphans 2>&1 || true
-        # Remove Grafana data volume to purge stale provisioning state.
-        # Old Telegram contact point (with empty bot token) persists in Grafana's
-        # SQLite DB even after removing it from alerts.yml — causes crash-loop.
-        # All dashboards/datasources/alerts are defined in provisioning files, so
-        # nothing is lost by clearing the volume.
-        docker volume rm tv-grafana-data 2>/dev/null || true
-        ok "Stack torn down (Grafana volume reset)"
+        ok "Stack torn down"
     else
         step "Checking existing stack state"
         RUNNING=$(docker ps --filter "name=tv-" --format "{{.Names}}" 2>/dev/null | wc -l | tr -d ' ')
@@ -272,8 +255,8 @@ else
     fi
 
     # ---- Step 7: Pull images ----
-    step "Pulling Docker images (7 services, SHA256-pinned)"
-    info "This may take a few minutes on first run (~2GB)..."
+    step "Pulling Docker images (SHA256-pinned)"
+    info "This may take a few minutes on first run..."
     if ! docker compose -f "${COMPOSE_FILE}" pull --quiet 2>&1; then
         fail "Docker image pull failed. Check network connectivity."
         docker compose -f "${COMPOSE_FILE}" pull 2>&1 | tail -20
@@ -282,7 +265,7 @@ else
     ok "All images pulled"
 
     # ---- Step 8: Start stack ----
-    step "Starting observability stack"
+    step "Starting infrastructure stack"
     COMPOSE_OUTPUT=$(docker compose -f "${COMPOSE_FILE}" up -d --remove-orphans 2>&1) || {
         fail "docker compose up failed:"
         echo "$COMPOSE_OUTPUT"
@@ -291,9 +274,9 @@ else
         docker compose -f "${COMPOSE_FILE}" ps --all 2>&1 || true
         echo ""
         info "Recent container logs (last 30 lines per failed service):"
-        # Wave 7-A removed: Traefik, valkey-exporter, Loki, Alloy, Jaeger.
-        # Keep in sync with docker-compose.yml services.
-        for svc in tv-questdb tv-valkey tv-prometheus tv-alertmanager tv-grafana; do
+        # CloudWatch-only runtime: QuestDB + Valkey. Loki/Alloy are
+        # profile-gated ('logs' profile) and not started by default.
+        for svc in tv-questdb tv-valkey; do
             STATUS=$(docker inspect --format='{{.State.Status}}' "$svc" 2>/dev/null || echo "not_found")
             if [ "$STATUS" != "running" ]; then
                 echo -e "  ${RED}--- ${svc} (${STATUS}) ---${NC}"
@@ -302,7 +285,7 @@ else
             fi
         done
         info "Common fixes:"
-        info "  Port conflict: lsof -i :9000 :8812 :3000 :6379 :80 :443"
+        info "  Port conflict: lsof -i :9000 :8812 :6379"
         info "  Clean restart: docker compose -f deploy/docker/docker-compose.yml down -v && re-run"
         info "  Docker resources: Check Docker Desktop → Settings → Resources"
         exit 1
@@ -310,171 +293,39 @@ else
     ok "docker compose up -d complete"
 fi
 
-# ---- Step 9: Wait for all services ----
+# ---- Step 9: Wait for services ----
 step "Waiting for services to be healthy"
 HEALTH_FAIL=0
-# Jaeger, Alloy, Loki removed per aws-budget.md (2.5GB RAM saving).
 # QuestDB readiness: use /exec?query=SELECT%201 instead of the root URL.
 # The root URL returns the full web console HTML (hundreds of KB) which can
 # time out curl's --max-time 3 on first boot while QuestDB is WAL-initializing.
 # The /exec endpoint returns ~30 bytes of JSON and is a true "SQL engine
 # ready" signal, not just "web server accepting connections".
 wait_for_http "QuestDB"         "http://localhost:9000/exec?query=SELECT%201" 120 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
-wait_for_http "Prometheus"      "http://localhost:9090/-/healthy"    30 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
-wait_for_http "Grafana"         "http://localhost:3000/api/health"  45 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
-wait_for_http "Alertmanager"    "http://localhost:9093/-/healthy"    30 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
-# Wave 7-A: Traefik removed (AWS ALB free tier replaces). No more health-wait here.
+
+# Valkey speaks the Redis protocol (port 6379), not HTTP — verify the
+# container is running rather than probing an HTTP endpoint.
+printf "  Waiting for %-18s " "Valkey..."
+VALKEY_STATUS=$(docker inspect --format='{{.State.Status}}' tv-valkey 2>/dev/null || echo "not_found")
+if [ "$VALKEY_STATUS" = "running" ]; then
+    echo -e "${GREEN}UP${NC}"
+else
+    echo -e "${YELLOW}${VALKEY_STATUS}${NC}"
+    HEALTH_FAIL=$((HEALTH_FAIL + 1))
+fi
 
 if [ "$HEALTH_FAIL" -gt 0 ]; then
-    warn "$HEALTH_FAIL services slow to start (may still be initializing)"
+    warn "$HEALTH_FAIL service(s) slow to start (may still be initializing)"
 else
     ok "All services healthy"
 fi
 
-# ---- Step 10: Prometheus targets ----
-step "Validating Prometheus scrape targets"
-PROM_TARGETS=$(curl -sf --max-time 5 "http://localhost:9090/api/v1/targets" 2>/dev/null || echo "")
-if [ -n "$PROM_TARGETS" ]; then
-    UP_COUNT=$(echo "$PROM_TARGETS" | { grep -o '"health":"up"' || true; } | wc -l | tr -d ' ')
-    DOWN_COUNT=$(echo "$PROM_TARGETS" | { grep -o '"health":"down"' || true; } | wc -l | tr -d ' ')
-    TOTAL_TARGETS=$((UP_COUNT + DOWN_COUNT))
-    info "Targets: ${UP_COUNT}/${TOTAL_TARGETS} UP"
-    if [ "$DOWN_COUNT" -gt 0 ]; then
-        # Extract down job names (best-effort — JSON field order may vary)
-        echo "$PROM_TARGETS" | { grep -o '"job":"[^"]*"[^}]*"health":"down"' || true; } | { grep -o '"job":"[^"]*"' || true; } | sort -u | while read -r line; do
-            warn "Target DOWN: $line"
-        done
-    fi
-    if [ "$UP_COUNT" -ge 3 ]; then
-        ok "Core targets reachable (${UP_COUNT} up)"
-    else
-        warn "Only ${UP_COUNT} targets up — some services still starting"
-    fi
-else
-    warn "Could not query Prometheus targets API"
-fi
-
-# ---- Step 11: Grafana datasources ----
-step "Validating Grafana datasources"
-GRAFANA_AUTH="$(echo -n "${TV_GRAFANA_ADMIN_USER}:${TV_GRAFANA_ADMIN_PASSWORD}" | base64)"
-DS_JSON=$(curl -sf --max-time 5 "http://localhost:3000/api/datasources" \
-    -H "Authorization: Basic ${GRAFANA_AUTH}" 2>/dev/null || echo "")
-if [ -n "$DS_JSON" ] && [ "$DS_JSON" != "[]" ]; then
-    DS_COUNT=$(echo "$DS_JSON" | { grep -o '"name"' || true; } | wc -l | tr -d ' ')
-    # Check each expected datasource (Loki + Jaeger removed in Wave 7-A)
-    for ds in Prometheus QuestDB; do
-        if echo "$DS_JSON" | grep -q "\"name\":\"${ds}\""; then
-            info "  ${ds}: provisioned"
-        else
-            warn "  ${ds}: NOT found"
-        fi
-    done
-    ok "${DS_COUNT} datasources configured"
-else
-    warn "Could not verify datasources (Grafana may still be starting)"
-fi
-
-# ---- Step 12: Grafana dashboards ----
-step "Validating Grafana dashboards"
-DASH_JSON=$(curl -sf --max-time 5 "http://localhost:3000/api/search?type=dash-db" \
-    -H "Authorization: Basic ${GRAFANA_AUTH}" 2>/dev/null || echo "")
-if [ -n "$DASH_JSON" ] && [ "$DASH_JSON" != "[]" ]; then
-    DASH_COUNT=$(echo "$DASH_JSON" | { grep -o '"uid"' || true; } | wc -l | tr -d ' ')
-    # Check for expected dashboards by UID (tv-traefik dashboard retired in Wave 7-A)
-    for uid in tv-system-overview tv-logs; do
-        DASH_TITLE=$(echo "$DASH_JSON" | { grep -o "\"uid\":\"${uid}\"[^}]*\"title\":\"[^\"]*\"" || true; } | { grep -o '"title":"[^"]*"' || true; } | head -1)
-        if [ -n "$DASH_TITLE" ]; then
-            info "  ${uid}: loaded"
-        else
-            warn "  ${uid}: not found (may need Grafana restart)"
-        fi
-    done
-    ok "${DASH_COUNT} dashboards provisioned"
-else
-    warn "Could not verify dashboards (provisioning may need a moment)"
-fi
-
-# ---- Step 13: Grafana alert rules + Telegram contact point ----
-step "Validating Grafana alert rules + Telegram contact point"
-ALERT_RULES=$(curl -sf --max-time 5 "http://localhost:3000/api/v1/provisioning/alert-rules" \
-    -H "Authorization: Basic ${GRAFANA_AUTH}" 2>/dev/null || echo "")
-if [ -n "$ALERT_RULES" ] && [ "$ALERT_RULES" != "[]" ]; then
-    ALERT_COUNT=$(echo "$ALERT_RULES" | { grep -o '"uid"' || true; } | wc -l | tr -d ' ')
-    ok "${ALERT_COUNT} alert rules provisioned"
-else
-    warn "Alert rules not yet loaded (Grafana unified alerting may need time)"
-fi
-
-# Configure Telegram contact point via API (not file provisioning — empty tokens crash Grafana)
-CP_JSON=$(curl -sf --max-time 5 "http://localhost:3000/api/v1/provisioning/contact-points" \
-    -H "Authorization: Basic ${GRAFANA_AUTH}" 2>/dev/null || echo "")
-if echo "$CP_JSON" | grep -q "tv-telegram"; then
-    ok "Telegram contact point already configured"
-elif [ -n "$TV_TELEGRAM_BOT_TOKEN" ] && [ -n "$TV_TELEGRAM_CHAT_ID" ]; then
-    # Create Telegram contact point via Grafana API
-    TELEGRAM_PAYLOAD=$(cat <<EOFPAYLOAD
-{
-  "name": "tv-telegram",
-  "type": "telegram",
-  "settings": {
-    "bottoken": "${TV_TELEGRAM_BOT_TOKEN}",
-    "chatid": "${TV_TELEGRAM_CHAT_ID}",
-    "parse_mode": "HTML",
-    "message": "{{ if gt (len .Alerts.Firing) 0 }}🔴 FIRING{{ end }}{{ if gt (len .Alerts.Resolved) 0 }}🟢 RESOLVED{{ end }}\n{{ range .Alerts }}\n<b>{{ .Labels.alertname }}</b>\n{{ .Annotations.summary }}\n{{ .Annotations.description }}\nSeverity: {{ .Labels.severity }}\n{{ end }}"
-  },
-  "disableResolveMessage": false
-}
-EOFPAYLOAD
-    )
-    CP_RESULT=$(curl -sf --max-time 5 -X POST "http://localhost:3000/api/v1/provisioning/contact-points" \
-        -H "Authorization: Basic ${GRAFANA_AUTH}" \
-        -H "Content-Type: application/json" \
-        -H "X-Disable-Provenance: true" \
-        -d "${TELEGRAM_PAYLOAD}" 2>/dev/null || echo "")
-    if echo "$CP_RESULT" | grep -q "uid"; then
-        # Update notification policy to use Telegram
-        POLICY_PAYLOAD='{"receiver":"tv-telegram","group_by":["grafana_folder","alertname"],"group_wait":"30s","group_interval":"5m","repeat_interval":"4h"}'
-        curl -sf --max-time 5 -X PUT "http://localhost:3000/api/v1/provisioning/policies" \
-            -H "Authorization: Basic ${GRAFANA_AUTH}" \
-            -H "Content-Type: application/json" \
-            -H "X-Disable-Provenance: true" \
-            -d "${POLICY_PAYLOAD}" > /dev/null 2>&1 || true
-        ok "Telegram contact point created — Grafana alerts → your phone"
-    else
-        warn "Could not create Telegram contact point (Grafana API error)"
-    fi
-else
-    info "Telegram contact point skipped (no bot token in SSM — alerts go to default receiver)"
-fi
-
-# ---- Step 14: Prometheus rules ----
-step "Validating Prometheus recording & alert rules"
-PROM_RULES=$(curl -sf --max-time 5 "http://localhost:9090/api/v1/rules" 2>/dev/null || echo "")
-if [ -n "$PROM_RULES" ]; then
-    RULE_GROUPS=$(echo "$PROM_RULES" | { grep -o '"name"' || true; } | wc -l | tr -d ' ')
-    RECORDING=$(echo "$PROM_RULES" | { grep -o '"type":"recording"' || true; } | wc -l | tr -d ' ')
-    ALERTING=$(echo "$PROM_RULES" | { grep -o '"type":"alerting"' || true; } | wc -l | tr -d ' ')
-    info "Rule groups: ${RULE_GROUPS}"
-    info "Recording rules: ${RECORDING}"
-    info "Alert rules: ${ALERTING}"
-    if [ "$RULE_GROUPS" -gt 0 ]; then
-        ok "Rules loaded successfully"
-    else
-        warn "No rules loaded — check /etc/prometheus/rules/*.yml"
-    fi
-else
-    warn "Could not query Prometheus rules API"
-fi
-
-# ---- Wave 7-A removed steps (Traefik routes, Jaeger OTLP, Loki/Alloy log pipeline) ----
-# Traefik         -> AWS ALB free tier replaces HTTPS termination
-# Jaeger          -> CloudWatch Logs replaces distributed tracing
-# Loki + Alloy    -> `docker logs tickvault` locally; CloudWatch journald on AWS
-step "Log pipeline (Loki + Alloy removed — see aws-budget.md)"
+# ---- Step 10: Log pipeline ----
+step "Log pipeline (CloudWatch-only — see aws-budget.md)"
 info "Local: docker logs tickvault --tail 100 -f"
 info "AWS:   CloudWatch Logs /tickvault/<env>/system via journald"
 
-# ---- Final report ----
+# ---- Step 11: Final report ----
 step "Final report"
 
 echo ""
@@ -483,25 +334,16 @@ echo -e "  Results: ${GREEN}${PASS} passed${NC}  ${YELLOW}${WARN} warnings${NC} 
 echo -e "${CYAN}══════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "  ${BOLD}Service URLs:${NC}"
-echo -e "    ${CYAN}Grafana${NC}         http://localhost:3000"
-echo -e "    ${CYAN}Prometheus${NC}      http://localhost:9090"
-echo -e "    ${CYAN}Alertmanager${NC}    http://localhost:9093"
 echo -e "    ${CYAN}QuestDB${NC}         http://localhost:9000"
 echo ""
-echo -e "  ${BOLD}Grafana Credentials:${NC}"
-echo -e "    User: ${TV_GRAFANA_ADMIN_USER}"
-echo -e "    Pass: (from AWS SSM /tickvault/${SSM_ENV}/grafana/admin-password)"
+echo -e "  ${BOLD}Observability:${NC} AWS CloudWatch (metrics, logs, alarms)"
 echo ""
 
 if [ "$OPEN_BROWSER" = true ] && [ "$FAIL" -eq 0 ]; then
-    echo -e "  ${CYAN}Opening dashboards in browser...${NC}"
+    echo -e "  ${CYAN}Opening QuestDB console in browser...${NC}"
     sleep 1
-    open_url "http://localhost:3000/d/tv-system-overview/tv-system-overview?orgId=1"
-    sleep 0.5
-    open_url "http://localhost:9090/targets"
-    sleep 0.5
     open_url "http://localhost:9000"
-    echo -e "  ${GREEN}Opened: Grafana, Prometheus, QuestDB${NC}"
+    echo -e "  ${GREEN}Opened: QuestDB${NC}"
 fi
 
 echo ""
@@ -512,7 +354,7 @@ if [ "$FAIL" -gt 0 ]; then
     exit 1
 fi
 
-echo -e "${GREEN}Observability stack fully operational. Zero manual config needed.${NC}"
+echo -e "${GREEN}Infrastructure stack fully operational. Zero manual config needed.${NC}"
 echo ""
 
 # Remind about external health alarms (AWS only)

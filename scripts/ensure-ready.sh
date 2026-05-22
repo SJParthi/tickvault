@@ -4,7 +4,7 @@
 # =============================================================================
 # Called by IntelliJ "Before launch" on every Run App / Test All.
 #
-# Fast path: if all 8 tv-* containers are healthy → exits in <1 second.
+# Fast path: if all tv-* containers are healthy → exits in <1 second.
 # Slow path: runs full setup (Docker + SSM + tables + tools) → 3-5 min first time.
 #
 # This replaces the need for a separate "Bootstrap" step. Clone → Run → Done.
@@ -115,27 +115,20 @@ open_url() {
     fi
 }
 
-# ---- Auto-open all monitoring dashboards ----
-# Opens the monitoring stack in the default browser. Jaeger was removed in
-# the aws-budget.md RAM-saving pass so its URL is no longer opened — it
-# would 404 otherwise. Call is guarded by TV_SKIP_DASHBOARDS=1 for when
-# you don't want the browser to pop up (CI, AWS EventBridge, headless).
+# ---- Auto-open the QuestDB console ----
+# CloudWatch-only migration (aws-budget.md "OPERATOR DECISION 2026-05-20"):
+# Grafana was removed — observability is AWS CloudWatch. QuestDB's web
+# console is the only local dashboard. Call is guarded by TV_SKIP_DASHBOARDS=1
+# for when you don't want the browser to pop up (CI, AWS EventBridge, headless).
 open_dashboards() {
     if [ "${TV_SKIP_DASHBOARDS:-0}" = "1" ]; then
         echo -e "${CYAN}Skipping dashboard auto-open (TV_SKIP_DASHBOARDS=1)${NC}"
         return 0
     fi
-    echo -e "${CYAN}Opening monitoring dashboards...${NC}"
+    echo -e "${CYAN}Opening QuestDB console...${NC}"
     # QuestDB web console — primary SQL tool
     open_url "http://localhost:9000"
-    sleep 0.3
-    # Grafana dashboards (anonymous access enabled — no login required)
-    open_url "http://localhost:3000/d/tv-system-overview/tv-system-overview?orgId=1&refresh=5s"
-    sleep 0.3
-    open_url "http://localhost:3000/d/tv-market-data/market-data-explorer?orgId=1&from=now-3d&to=now&timezone=Asia%2FKolkata&refresh=5s"
-    sleep 0.3
-    open_url "http://localhost:3000/d/tv-trading-pipeline/trading-pipeline?orgId=1&refresh=5s"
-    echo -e "${GREEN}Opened: QuestDB + Grafana (3 dashboards)${NC}"
+    echo -e "${GREEN}Opened: QuestDB${NC}"
 }
 
 # ---- Auto-configure ~/.pgpass for IntelliJ QuestDB database tool ----
@@ -160,18 +153,17 @@ ensure_pgpass() {
     chmod 600 ~/.pgpass
 }
 
-# ---- Fast path: check if all 5 containers are running ----
-# Loki, Alloy, Jaeger, Traefik, and valkey-exporter were removed per
-# `.claude/rules/project/aws-budget.md` (Wave 7-A) to fit the 8GB c7i.xlarge
-# AWS budget. AWS ALB free tier replaces Traefik; valkey-exporter wasn't
-# queried by any panel. Keep this list in sync with
-# `deploy/docker/docker-compose.yml` services (excluding profile-gated ones).
+# ---- Fast path: check if all required containers are running ----
+# CloudWatch-only migration (aws-budget.md "OPERATOR DECISION 2026-05-20"):
+# the runtime is QuestDB + the tickvault app + AWS CloudWatch. Grafana,
+# Prometheus and Alertmanager were removed (plan items #O1/#O2/#O3); Loki
+# and Alloy are profile-gated ('logs' profile) and not started by default.
+# Valkey stays until plan item #O4 removes it from the code.
+# Keep this list in sync with `deploy/docker/docker-compose.yml` services
+# (excluding profile-gated ones).
 REQUIRED_CONTAINERS=(
     "tv-questdb"
     "tv-valkey"
-    "tv-prometheus"
-    "tv-alertmanager"
-    "tv-grafana"
 )
 
 all_running() {
@@ -194,7 +186,7 @@ fi
 # Quick check — if everything is already running, still ensure schema is up-to-date
 if all_running; then
     ensure_pgpass
-    echo -e "${GREEN}All 5 infrastructure containers running.${NC}"
+    echo -e "${GREEN}All infrastructure containers running.${NC}"
     # Always run schema init (idempotent) — ensures new tables are created
     # even when containers were already running before a code update.
     echo -e "${CYAN}Ensuring QuestDB schema is up-to-date...${NC}"
@@ -265,7 +257,7 @@ if ! bash "${SCRIPT_DIR}/setup-observability.sh" --no-open; then
     echo -e "${RED}║                                                            ║${NC}"
     echo -e "${RED}║  Quick checks:                                             ║${NC}"
     echo -e "${RED}║  1. Docker running?  docker info                           ║${NC}"
-    echo -e "${RED}║  2. Port conflict?   lsof -i :9000 :8812 :3000 :80        ║${NC}"
+    echo -e "${RED}║  2. Port conflict?   lsof -i :9000 :8812 :6379             ║${NC}"
     echo -e "${RED}║  3. AWS creds?       aws sts get-caller-identity           ║${NC}"
     echo -e "${RED}║  4. Clean restart?   docker compose \\                      ║${NC}"
     echo -e "${RED}║       -f deploy/docker/docker-compose.yml down -v          ║${NC}"
@@ -308,7 +300,7 @@ fi
 echo ""
 if all_running; then
     echo -e "${GREEN}╔════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║   Infrastructure ready. All 5 services UP.     ║${NC}"
+    echo -e "${GREEN}║   Infrastructure ready. All services UP.       ║${NC}"
     echo -e "${GREEN}╚════════════════════════════════════════════════╝${NC}"
     open_dashboards
     exit 0

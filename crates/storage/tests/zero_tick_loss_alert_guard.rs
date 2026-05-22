@@ -1,35 +1,29 @@
-//! Phase 10.1 of `.claude/plans/active-plan.md` — zero-tick-loss alert guard.
+//! Zero-tick-loss source guard.
 //!
 //! Parthiban's explicit top-priority requirement: "zero ticks loss and
 //! nowhere websocket should get disconnected or reconnect not even a
 //! single tick should be missed". The three-tier buffer (ring -> disk
 //! spill -> recovery) in `tick_persistence.rs` delivers this at the code
-//! level, but the operator-facing guarantee lives in a Prometheus alert
-//! rule.
+//! level.
 //!
-//! This guard pins that rule mechanically. If ANY of these go missing
-//! from `deploy/docker/prometheus/rules/tickvault-alerts.yml`, the build
-//! fails — the operator cannot silently lose their early-warning signal.
+//! 2026-05-20 (#O3 — observability → CloudWatch-only): the four
+//! Prometheus-alert-rule assertions were removed when the Prometheus
+//! container + `tickvault-alerts.yml` were retired. The operator-facing
+//! early-warning signal moves to AWS CloudWatch Alarms over the same
+//! `tv_*` metrics (the app still exposes them on `/metrics`). The
+//! source-scan assertions below stay valid — they pin that the metrics
+//! are still EMITTED, which CloudWatch needs.
 //!
 //! Pinned assertions:
 //!
 //! 1. `tv_ticks_dropped_total` metric is emitted from `tick_persistence.rs`.
-//!    Source scan — if the counter emission is deleted, the metric never
-//!    increments and the alert is silently defanged.
-//! 2. `TicksDropped` alert rule exists, uses `tv_ticks_dropped_total > 0`
-//!    as the expr, and has a non-empty `for:` duration.
-//! 3. `TickBufferActive` alert rule exists (ring buffer in use).
-//! 4. `TickDiskSpillActive` alert rule exists (disk spill in use).
-//! 5. `TickDataLoss` alert rule exists (catch-all data loss signal).
-//!
-//! These 4 alerts together cover every layer of the three-tier buffer:
-//! ring-buffer saturation -> disk-spill activity -> drop counter ->
-//! data-loss catch-all.
+//! 2. `tv_spill_dropped_total` is emitted with `reason` labels.
+//! 3. `TICK_BUFFER_CAPACITY` stays >= 100_000.
+//! 4. `observability-architecture.md` documents the zero-tick-loss chain.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const ALERTS_YAML: &str = "deploy/docker/prometheus/rules/tickvault-alerts.yml";
 const TICK_PERSISTENCE_SOURCE: &str = "crates/storage/src/tick_persistence.rs";
 
 fn workspace_root() -> PathBuf {
@@ -43,46 +37,6 @@ fn workspace_root() -> PathBuf {
 fn load_text(rel: &str) -> String {
     let path = workspace_root().join(rel);
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-}
-
-#[test]
-fn prometheus_alert_rule_ticks_dropped_exists() {
-    let text = load_text(ALERTS_YAML);
-    assert!(
-        text.contains("- alert: TicksDropped"),
-        "TicksDropped alert rule missing — operator loses zero-tick-loss early-warning signal"
-    );
-    assert!(
-        text.contains("tv_ticks_dropped_total > 0"),
-        "TicksDropped rule no longer uses `tv_ticks_dropped_total > 0` expression"
-    );
-}
-
-#[test]
-fn prometheus_alert_rule_tick_buffer_active_exists() {
-    let text = load_text(ALERTS_YAML);
-    assert!(
-        text.contains("- alert: TickBufferActive"),
-        "TickBufferActive alert rule missing — ring buffer saturation is invisible"
-    );
-}
-
-#[test]
-fn prometheus_alert_rule_tick_disk_spill_active_exists() {
-    let text = load_text(ALERTS_YAML);
-    assert!(
-        text.contains("- alert: TickDiskSpillActive"),
-        "TickDiskSpillActive alert rule missing — disk spill activity is invisible"
-    );
-}
-
-#[test]
-fn prometheus_alert_rule_tick_data_loss_exists() {
-    let text = load_text(ALERTS_YAML);
-    assert!(
-        text.contains("- alert: TickDataLoss"),
-        "TickDataLoss catch-all alert rule missing"
-    );
 }
 
 #[test]
@@ -123,21 +77,14 @@ fn tick_persistence_emits_spill_dropped_total_with_reason_label() {
 #[test]
 fn tick_persistence_buffer_capacity_is_at_least_one_lakh() {
     // TICK_BUFFER_CAPACITY must stay above 100K to absorb normal market
-    // bursts without spill-to-disk. The exact floor is 100_000; current
-    // value is 2_000_000 per the docstring (PR #452 2026-05-03 bumped
-    // 600_000 → 2_000_000 for extreme memory pressure handling within
-    // the c7i.xlarge 600 MB OS budget). Checked via constant reference
-    // in source.
+    // bursts without spill-to-disk. The exact floor is 100_000.
     let common_constants = load_text("crates/common/src/constants.rs");
 
-    // Extract the TICK_BUFFER_CAPACITY constant value.
     let cap_line = common_constants
         .lines()
         .find(|l| l.contains("TICK_BUFFER_CAPACITY") && l.contains("="))
         .unwrap_or_else(|| panic!("TICK_BUFFER_CAPACITY not found in common/constants.rs"));
 
-    // Find the numeric literal after '='. Strip underscores and the
-    // `usize` / `u32` etc. suffix.
     let numeric: String = cap_line
         .split('=')
         .nth(1)
@@ -175,5 +122,3 @@ fn observability_architecture_doc_mentions_zero_tick_loss_chain() {
         );
     }
 }
-
-fn _suppress_unused_path_warning(_p: &Path) {}

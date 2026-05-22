@@ -37,8 +37,6 @@ volumes:
     name: tv-questdb-data
   tv-valkey-data:
     name: tv-valkey-data
-  tv-prometheus-data:
-    name: tv-prometheus-data
   # Phase 3 of active-plan.md — only used when `--profile logs` starts.
   tv-loki-data:
     name: tv-loki-data
@@ -169,48 +167,12 @@ services:
   # ---------------------------------------------------------------------------
 
   # ---------------------------------------------------------------------------
-  # Prometheus — Metrics Collection
-  # Bible #28: prom/prometheus:v3.11.2
-  # Wave 7-A: 512MB -> 384MB, retention 30d -> 7d.
+  # Prometheus — REMOVED (observability → CloudWatch-only, 2026-05-20, #O3).
+  # The app's own /metrics endpoint (port 9091) STAYS — the AWS CloudWatch
+  # agent scrapes it directly. Only the Prometheus container is gone.
+  # See .claude/plans/active-plan-observability-cloudwatch-only.md (#O3).
   # ---------------------------------------------------------------------------
-  tv-prometheus:
-    image: prom/prometheus:v3.11.2@sha256:3674db04d3640d2157de57f8679dbe8dbc10a673e6d63ec58d9430e34abbfe68
-    container_name: tv-prometheus
-    hostname: tv-prometheus
-    restart: unless-stopped
-    mem_limit: 384m
-    cpus: 0.5
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    ports:
-      # E5 security: bind to localhost only (no external access to metrics).
-      - "127.0.0.1:9090:9090"
-    volumes:
-      - tv-prometheus-data:/prometheus
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./prometheus/rules:/etc/prometheus/rules:ro
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.path=/prometheus"
-      # Wave 7-A: 30d -> 7d. SEBI long-term retention is in QuestDB audit tables;
-      # Prometheus only needs recent operator-health window (alerts + dashboards).
-      - "--storage.tsdb.retention.time=7d"
-      - "--web.enable-lifecycle"
-      # NOTE: --web.console.libraries and --web.console.templates removed.
-      # Prometheus v3.x no longer bundles console templates (we use Grafana).
-    logging:
-      driver: json-file
-      options:
-        max-size: "100m"
-        max-file: "5"
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/-/healthy || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-    networks:
-      - tv-network
+
 
   # ---------------------------------------------------------------------------
   # Alertmanager — REMOVED (observability → CloudWatch-only, 2026-05-20).
