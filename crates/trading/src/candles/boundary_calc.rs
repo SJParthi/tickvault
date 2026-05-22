@@ -267,24 +267,26 @@ mod tests {
 
     #[test]
     fn test_missed_boundaries_returns_zero_for_in_bucket_tick_m1() {
-        // prev=09:00:00, tick=09:00:30 → same bucket, no miss.
-        let prev = 1_716_000_000_u32; // hypothetical IST 09:00:00
+        // prev = an in-window M1 bucket start, tick 30 s later → same
+        // bucket, no miss.
+        let prev = TfIndex::M1.bucket_start(1_779_362_677);
         let tick = prev + 30;
         assert_eq!(missed_boundaries_for_tf(TfIndex::M1, prev, tick), 0);
     }
 
     #[test]
     fn test_missed_boundaries_returns_zero_for_adjacent_next_bucket_m1() {
-        // prev=09:00:00, tick=09:01:15 → 1 boundary, normal next-bucket.
-        let prev = 1_716_000_000_u32;
-        let tick = prev + 75; // 1 min 15 s later
+        // tick 1 min 15 s after an in-window M1 bucket → 1 boundary,
+        // the normal next-bucket case, 0 *missed*.
+        let prev = TfIndex::M1.bucket_start(1_779_362_677);
+        let tick = prev + 75;
         assert_eq!(missed_boundaries_for_tf(TfIndex::M1, prev, tick), 0);
     }
 
     #[test]
     fn test_missed_boundaries_returns_four_for_5min_gap_m1() {
-        // prev=09:00, tick=09:05:30 → 4 minute-boundaries skipped.
-        let prev = 1_716_000_000_u32;
+        // tick 5 min 30 s after an in-window M1 bucket → 4 skipped.
+        let prev = TfIndex::M1.bucket_start(1_779_362_677);
         let tick = prev + (5 * 60) + 30;
         assert_eq!(missed_boundaries_for_tf(TfIndex::M1, prev, tick), 4);
     }
@@ -300,17 +302,27 @@ mod tests {
     fn test_missed_boundaries_returns_zero_for_late_tick_m1() {
         // tick is BEFORE prev — the late-arrival path
         // (ConsumeOutcome::DiscardLate). No miss.
-        let prev = 1_716_000_900_u32;
+        let prev = TfIndex::M1.bucket_start(1_779_362_677);
         let tick = prev - 30;
         assert_eq!(missed_boundaries_for_tf(TfIndex::M1, prev, tick), 0);
     }
 
     #[test]
     fn test_missed_boundaries_for_each_tf_with_multi_bucket_gap() {
-        // For each TF, prev bucket + 5×bucket_size = 4 missed.
+        // prev = 09:15:00 IST market open; tick = prev + 5×bucket + 30 s
+        // → 4 missed. A 5-bucket gap only fits inside the 22_500 s
+        // (6h15m) trading session for timeframes up to 1h — wider TFs
+        // would cross into the next day, where the 09:15-anchored grid
+        // restarts, so they are skipped (a multi-day gap is never a
+        // within-session scenario; the aggregator resets each day).
+        const SESSION_SECS: u32 = 22_500;
         for tf in TfIndex::ALL {
-            let prev = tf.bucket_start(1_716_000_000);
-            let tick = prev + tf.seconds_per_bucket() * 5 + 30;
+            let secs = tf.seconds_per_bucket();
+            if secs * 5 + 30 > SESSION_SECS {
+                continue;
+            }
+            let prev = tf.bucket_start(1_779_354_900);
+            let tick = prev + secs * 5 + 30;
             let missed = missed_boundaries_for_tf(tf, prev, tick);
             assert_eq!(
                 missed, 4,
@@ -337,7 +349,7 @@ mod tests {
 
     #[test]
     fn test_missed_boundaries_const_evaluable() {
-        const RESULT: u32 = missed_boundaries_for_tf(TfIndex::M1, 1_716_000_000, 1_716_000_330);
+        const RESULT: u32 = missed_boundaries_for_tf(TfIndex::M1, 1_779_354_900, 1_779_355_230);
         assert_eq!(RESULT, 4);
     }
 
