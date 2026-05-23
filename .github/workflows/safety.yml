@@ -21,6 +21,14 @@ on:
   schedule:
     - cron: '0 6 * * 1'  # Monday 6 AM UTC
   workflow_dispatch:       # Allow manual trigger
+  # Self-validate the workflow whenever it itself is edited on main —
+  # ensures toolchain pin bumps (NIGHTLY_VERSION) and step changes run
+  # against the new substrate at merge time instead of waiting up to a
+  # week for the next scheduled cycle.
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/safety.yml'
 
 permissions:
   contents: read
@@ -75,6 +83,35 @@ jobs:
             exit 1
           }
 
+      - name: Auto-close cargo-careful build-failure issue on green build
+        if: steps.build.outcome == 'success'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        with:
+          script: |
+            const title = '⚠️ Safety Net: cargo-careful build failure (nightly compatibility)';
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'safety',
+              per_page: 100,
+            });
+            const match = existing.find(i => i.title === title);
+            if (!match) { return; }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: match.number,
+              body: `Auto-closed: cargo-careful builds clean on \`${process.env.NIGHTLY_VERSION || 'current pin'}\`.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: match.number,
+              state: 'closed',
+              state_reason: 'completed',
+            });
+
       - name: Run careful tests
         id: test
         if: steps.build.outcome == 'success'
@@ -93,6 +130,35 @@ jobs:
             tail -80 /tmp/careful-test.log
             exit 1
           }
+
+      - name: Auto-close cargo-careful runtime issue on green run
+        if: steps.test.outcome == 'success'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        with:
+          script: |
+            const title = '🔴 Safety Net: cargo-careful found issues';
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'safety',
+              per_page: 100,
+            });
+            const match = existing.find(i => i.title === title);
+            if (!match) { return; }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: match.number,
+              body: `Auto-closed: cargo-careful green on \`${process.env.NIGHTLY_VERSION || 'current pin'}\`.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: match.number,
+              state: 'closed',
+              state_reason: 'completed',
+            });
 
       - name: Create issue on test failure (deduplicated)
         if: failure() && steps.test.outputs.test_failed == 'true'
@@ -189,12 +255,45 @@ jobs:
             exit 1
           }
 
+      - name: Auto-close ASan build-failure issue on green build
+        if: steps.build.outcome == 'success'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        with:
+          script: |
+            const title = '⚠️ Safety Net: ASan build failure (nightly compatibility)';
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'safety',
+              per_page: 100,
+            });
+            const match = existing.find(i => i.title === title);
+            if (!match) { return; }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: match.number,
+              body: `Auto-closed: ASan builds clean on \`${process.env.NIGHTLY_VERSION || 'current pin'}\`.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: match.number,
+              state: 'closed',
+              state_reason: 'completed',
+            });
+
       - name: Run tests with AddressSanitizer
         id: test
         if: steps.build.outcome == 'success'
         env:
           RUSTFLAGS: "-Z sanitizer=address"
           TV_SKIP_PERF_ASSERTIONS: "1"
+          # halt_on_error=1 ensures ASan-detected issues actually fail the
+          # test process (default is print-and-continue, which silently lets
+          # the test exit 0 and falsely greens the workflow).
+          ASAN_OPTIONS: "halt_on_error=1:abort_on_error=1:detect_leaks=0"
         run: |
           cargo +${{ env.NIGHTLY_VERSION }} test --workspace \
             --target x86_64-unknown-linux-gnu \
@@ -204,6 +303,35 @@ jobs:
             echo "test_failed=true" >> "$GITHUB_OUTPUT"
             exit 1
           }
+
+      - name: Auto-close ASan runtime issue on green run
+        if: steps.test.outcome == 'success'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        with:
+          script: |
+            const title = '🔴 Safety Net: AddressSanitizer found memory issues';
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'safety',
+              per_page: 100,
+            });
+            const match = existing.find(i => i.title === title);
+            if (!match) { return; }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: match.number,
+              body: `Auto-closed: ASan green on \`${process.env.NIGHTLY_VERSION || 'current pin'}\`.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: match.number,
+              state: 'closed',
+              state_reason: 'completed',
+            });
 
       - name: Create issue on test failure (deduplicated)
         if: failure() && steps.test.outputs.test_failed == 'true'
@@ -300,12 +428,46 @@ jobs:
             exit 1
           }
 
+      - name: Auto-close TSan build-failure issue on green build
+        if: steps.build.outcome == 'success'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        with:
+          script: |
+            const title = '⚠️ Safety Net: TSan build failure (nightly compatibility)';
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'safety',
+              per_page: 100,
+            });
+            const match = existing.find(i => i.title === title);
+            if (!match) { return; }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: match.number,
+              body: `Auto-closed: TSan builds clean on \`${process.env.NIGHTLY_VERSION || 'current pin'}\`.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: match.number,
+              state: 'closed',
+              state_reason: 'completed',
+            });
+
       - name: Run tests with ThreadSanitizer
         id: test
         if: steps.build.outcome == 'success'
         env:
           RUSTFLAGS: "-Z sanitizer=thread"
           TV_SKIP_PERF_ASSERTIONS: "1"
+          # halt_on_error=1 ensures TSan-detected races actually fail the
+          # test process. history_size=7 widens TSan's memory-access ring
+          # buffer so racy stacktraces aren't truncated under heavy test
+          # load (the workspace test count is large).
+          TSAN_OPTIONS: "halt_on_error=1:history_size=7"
         run: |
           cargo +${{ env.NIGHTLY_VERSION }} test --workspace \
             --target x86_64-unknown-linux-gnu \
@@ -315,6 +477,35 @@ jobs:
             echo "test_failed=true" >> "$GITHUB_OUTPUT"
             exit 1
           }
+
+      - name: Auto-close TSan runtime issue on green run
+        if: steps.test.outcome == 'success'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        with:
+          script: |
+            const title = '🔴 Safety Net: ThreadSanitizer found data races';
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'safety',
+              per_page: 100,
+            });
+            const match = existing.find(i => i.title === title);
+            if (!match) { return; }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: match.number,
+              body: `Auto-closed: TSan green on \`${process.env.NIGHTLY_VERSION || 'current pin'}\`.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: match.number,
+              state: 'closed',
+              state_reason: 'completed',
+            });
 
       - name: Create issue on test failure (deduplicated)
         if: failure() && steps.test.outputs.test_failed == 'true'
