@@ -35,7 +35,12 @@ env:
   # the 14-day safety window. 2026-04-20 is proven working (weekly safety
   # run on that date surfaced issues #302 + #304 — i.e. the build +
   # sanitizer jobs ran end-to-end).
-  NIGHTLY_VERSION: nightly-2026-04-20
+  # 2026-05-23: bumped from 2026-04-20 → 2026-05-19 to clear the three open
+  # nightly-compatibility build failures #460 (cargo-careful), #461 (ASan),
+  # #462 (TSan). The 2026-04-20 pin sat 33 days stale, outside the 14-day
+  # window; recent workspace dep updates (incl. rustls 0.23 chain) required
+  # a newer nightly to compile the sanitizer builds.
+  NIGHTLY_VERSION: nightly-2026-05-19
 
 jobs:
   # ---- cargo-careful: Extra debug checks ----
