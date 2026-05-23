@@ -137,9 +137,15 @@ rustls = { version = "0.23.40", default-features = false, features = ["aws_lc_rs
 rustls-native-certs = "0.8.3"
 
 # ---- Section 11: AWS SDK ----
-aws-config = "1.8.16"
-aws-sdk-sns = "1.99.0"
-aws-sdk-ssm = "1.109.0"
+# 2026-05-23: opt out of each crate's legacy `rustls` feature (which pulls
+# vulnerable rustls 0.21 + rustls-webpki 0.101.7 via aws-smithy-http-client's
+# `legacy-rustls-ring`) and opt INTO `default-https-client` instead, which
+# routes through `aws-smithy-http-client/rustls-aws-lc` (rustls 0.23 +
+# aws-lc-rs — already pinned by the workspace at line 136). Closes the 3
+# RUSTSEC advisories on the AWS chain without an upstream SDK release.
+aws-config = { version = "1.8.16", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "credentials-process", "sso"] }
+aws-sdk-sns = { version = "1.99.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-ssm = { version = "1.109.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 
 # ---- Section 16: CLI ----
 clap = { version = "4.6.1", features = ["derive"] }

@@ -36,11 +36,12 @@ unmaintained = "workspace"
 # SDK stack (aws-smithy-http-client 1.1.12). Bumping the AWS SDK suite
 # is its own change requiring a separate PR + verification window — see
 # the deferred-work table in PR #323 for context.
-ignore = [
-    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7 (AWS SDK transitive only — not on tickvault's primary TLS path which is now 0.103.13)" },
-    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7 (AWS SDK transitive only — not on tickvault's primary TLS path which is now 0.103.13)" },
-    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7 CRL-parse panic — AWS SDK transitive only; CRL parsing is not on tickvault's live-feed path (which uses rustls 0.23.37 → webpki 0.103.13, patched). Exploit surface: attacker-controlled CRL from an AWS SDK endpoint — not a realistic attack vector for us. Full fix = AWS SDK suite bump, deferred to its own branch." },
-]
+# 2026-05-23: 3 entries removed after AWS SDK crates were switched off
+# their legacy `rustls` feature onto modern `default-https-client`
+# (rustls 0.23 + aws-lc-rs). Vulnerable rustls-webpki 0.101.7 is no
+# longer in the lockfile — see Cargo.toml Section 11 for the feature
+# selection. Closed advisories: RUSTSEC-2026-0098, 0099, 0104.
+ignore = []
 
 # --- Licenses: Block incompatible licenses ---
 [licenses]
