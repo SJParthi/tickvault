@@ -7,7 +7,7 @@
 
 .PHONY: help run run-supervised stop build test check fmt clippy clean \
         docker-up docker-down docker-restart docker-status docker-logs questdb-init \
-        health status open grafana questdb jaeger prometheus traefik alloy loki \
+        health status open questdb jaeger prometheus traefik alloy loki \
         obs obs-verify obs-restart obs-open \
         logs app-pid \
         audit coverage bench geiger typos quality doc bootstrap scoped-check full-qa parity-soak \
@@ -38,7 +38,7 @@ help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(obs)' | awk 'BEGIN {FS = ":.*?## "}; {printf "    \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 	@echo ""
 	@echo "  MONITORING:"
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(grafana|questdb|jaeger|prometheus|traefik|alloy|loki)' | awk 'BEGIN {FS = ":.*?## "}; {printf "    \033[36m%-20s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(questdb|jaeger|prometheus|traefik|alloy|loki)' | awk 'BEGIN {FS = ":.*?## "}; {printf "    \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 	@echo ""
 
 # =============================================================================
@@ -221,18 +221,6 @@ open: ## Open DLT Control Panel in browser
 # =============================================================================
 # MONITORING — Open dashboards in browser
 # =============================================================================
-
-grafana: ## Open Grafana dashboard (localhost:3000)
-	@open http://localhost:3000
-
-grafana-reload: ## Reload Grafana provisioning (run after editing alerts.yml or dashboards/*.json)
-	@echo "Reloading Grafana provisioning..."
-	@docker compose -f deploy/docker/docker-compose.yml restart tv-grafana >/dev/null 2>&1 \
-		&& echo "  Grafana reloaded — alert rule + dashboard changes are live." \
-		|| { echo "  Reload failed — is Docker running? Try: make docker-up"; exit 1; }
-
-grafana-watch: ## Watch grafana provisioning dir + auto-reload on change (Ctrl+C to stop)
-	@bash scripts/grafana-watch.sh
 
 questdb: ## Open QuestDB console (localhost:9000)
 	@open http://localhost:9000

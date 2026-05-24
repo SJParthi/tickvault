@@ -96,13 +96,8 @@ QUESTDB_PASSWORD=$(generate_password)
 provision_secret "/tickvault/${ENVIRONMENT}/questdb/pg-user" "QuestDB PG User" "admin"
 provision_secret "/tickvault/${ENVIRONMENT}/questdb/pg-password" "QuestDB PG Password" "${QUESTDB_PASSWORD}"
 
-# ---- Grafana admin credentials ----
-GRAFANA_PASSWORD=$(generate_password)
-provision_secret "/tickvault/${ENVIRONMENT}/grafana/admin-user" "Grafana Admin User" "admin"
-provision_secret "/tickvault/${ENVIRONMENT}/grafana/admin-password" "Grafana Admin Password" "${GRAFANA_PASSWORD}"
-
 # ---- Summary ----
 echo "" >&2
 TOTAL=$((CREATED + EXISTED))
-echo -e "  ${GREEN}${TOTAL}/4 infra secrets ready${NC} (${CREATED} created, ${EXISTED} already existed)" >&2
+echo -e "  ${GREEN}${TOTAL}/2 infra secrets ready${NC} (${CREATED} created, ${EXISTED} already existed)" >&2
 echo "" >&2

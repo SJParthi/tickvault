@@ -78,7 +78,7 @@ if ! command -v docker >/dev/null 2>&1; then
     printf "[SKIP] %-14s docker CLI not installed\n" "docker"
 else
     # Wave 7-A: tv-traefik + tv-valkey-exporter removed (see .claude/rules/project/aws-budget.md).
-    for service in tv-questdb tv-valkey tv-prometheus tv-grafana tv-alertmanager; do
+    for service in tv-questdb tv-valkey; do
         run_check "docker" "$service running" \
             bash -c "docker compose -f deploy/docker/docker-compose.yml ps --services --filter status=running | grep -q '^${service}$'"
     done
@@ -141,7 +141,7 @@ print_section "env vars"
 
 # These are required to START the app in LIVE mode. Doctor doesn't
 # require them for the health check itself; just reports absence.
-for v in TV_QUESTDB_PG_USER TV_QUESTDB_PG_PASSWORD TV_GRAFANA_ADMIN_USER TV_GRAFANA_ADMIN_PASSWORD; do
+for v in TV_QUESTDB_PG_USER TV_QUESTDB_PG_PASSWORD; do
     if [ -n "${!v:-}" ]; then
         printf "[PASS] %-14s %s is set\n" "env" "$v"
         PASS=$((PASS + 1))
@@ -229,10 +229,7 @@ if [ "${GATE_MODE}" -eq 1 ]; then
     # runtime endpoints and exit 1 if any fail.
     GATE_FAIL=0
     for probe in \
-        "prometheus http://127.0.0.1:9090/-/healthy" \
         "questdb    http://127.0.0.1:9000/status" \
-        "grafana    http://127.0.0.1:3000/api/health" \
-        "alertmgr   http://127.0.0.1:9093/-/healthy" \
         "api        http://127.0.0.1:3001/health"; do
         name="${probe%% *}"
         url="${probe#* }"

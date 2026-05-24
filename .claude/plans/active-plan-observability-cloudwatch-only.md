@@ -35,20 +35,29 @@ ratchets updated, one PR at a time per `pr-completion-protocol.md` §H.
 
 ## Plan Items (serial PRs)
 
-- [ ] **#O1 — Grafana removal**
-  - Drop the `grafana` service from `deploy/docker/docker-compose.yml`;
-    delete `deploy/docker/grafana/` (dashboards + provisioning).
-  - Remove the Grafana credential fetch (`fetch_grafana_credentials`)
-    from `secret_manager.rs` + boot.
-  - Remove the Grafana health check + "opened dashboard in browser"
-    calls from `crates/app/src/infra.rs`.
-  - Delete guard tests `grafana_dashboard_snapshot_filter_guard.rs`,
-    `operator_health_dashboard_guard.rs`.
-  - Files: `deploy/docker/docker-compose.yml`, `deploy/docker/grafana/**`,
-    `crates/core/src/auth/secret_manager.rs`, `crates/app/src/infra.rs`,
-    `crates/storage/tests/grafana_dashboard_snapshot_filter_guard.rs`,
-    `crates/storage/tests/operator_health_dashboard_guard.rs`
-  - Tests: `cargo build --workspace` green; `cargo test -p tickvault-app -p tickvault-storage`
+- [x] **#O1 — Grafana removal** — merged
+  - The heavy parts (the `tv-grafana` compose service, the
+    `deploy/docker/grafana/` provisioning tree, `fetch_grafana_credentials`,
+    the two `grafana_dashboard_snapshot_filter_guard.rs` /
+    `operator_health_dashboard_guard.rs` guard tests, and the
+    `DASHBOARD_SERVICES` Grafana entry) were already deleted by
+    earlier AWS-lifecycle PRs.
+  - This PR cleaned the residue: `scripts/grafana-watch.sh` deleted;
+    Makefile `grafana` / `grafana-reload` / `grafana-watch` targets dropped;
+    `tv-grafana` references purged from `doctor.sh`, `verify-stack.sh`,
+    `docker-restart.sh`, `validate-automation.sh`, `bootstrap.sh`,
+    `provision-infra-secrets.sh`, `smoke-test.sh`, `setup-secrets.sh`,
+    `100pct-audit.sh`, `tv-tunnel/doctor.sh`,
+    `scripts/claude-session-bootstrap.sh`.
+  - The MCP server `tool_grafana_query` + `ToolSpec` registration were
+    dropped from `scripts/mcp-servers/tickvault-logs/server.py`; the
+    `grafana_url` profile key was dropped from
+    `config/claude-mcp-endpoints.toml` (all 3 profiles) and from
+    `crates/common/tests/claude_mcp_endpoints_config_guard.rs`
+    (struct field, REQUIRED_URL_KEYS, source-scan assertions).
+  - The `TICKVAULT_GRAF_STATUS` / `TICKVAULT_GRAFANA_URL` env-var
+    exports were dropped from the session-bootstrap hook; reachable
+    count now `/4` (was `/5`).
 
 - [x] **#O2 — Alertmanager removal** — merged
   - Dropped the `tv-alertmanager` service from

@@ -66,10 +66,15 @@ falls under and what artifact proves the claim.
 | ErrorCode tag on every `error!` | P | 100% | `crates/common/tests/error_code_tag_guard.rs` |
 | Every ErrorCode has rule + runbook | P | 54/54 variants | `crates/common/tests/error_code_rule_file_crossref.rs` + `triage_rules_full_coverage_guard.rs` |
 | Prometheus metric catalog | P | No drift | `crates/common/tests/metrics_catalog.rs` |
-| Recording rules | P | No drift | `crates/common/tests/recording_rules_guard.rs` |
-| Alertmanager rules wiring | P | Every alert has a rule file | `crates/common/tests/grafana_alerts_wiring.rs` |
 | Zero-tick-loss alert | R | Fires on any gap ≥1s | `deploy/docker/prometheus/rules/tickvault-alerts.yml` + `crates/storage/tests/zero_tick_loss_alert_guard.rs` |
-| Resilience SLA alerts (WS/QuestDB/Valkey) | R | Fires on degradation | `crates/storage/tests/resilience_sla_alert_guard.rs` |
+<!-- Retired with the CloudWatch-only migration:
+  - "Recording rules" / `recording_rules_guard.rs`
+  - "Alertmanager rules wiring" / `grafana_alerts_wiring.rs`           (#O1 Grafana removal)
+  - "Resilience SLA alerts (WS/QuestDB/Valkey)" / `resilience_sla_alert_guard.rs`
+Rows removed once their guard files were deleted by earlier AWS-lifecycle PRs.
+The equivalent coverage will be reasserted via CloudWatch alarm-rule guards
+once the CloudWatch alarms land. -->
+
 | Telegram delivery | R | Every ERROR level | `crates/core/src/notification/` |
 | Structured logging JSONL | P | Every ERROR → `errors.jsonl.<HOUR>` | `crates/app/src/observability.rs` + hourly rotation |
 | Summary writer | R | 60s refresh | `crates/core/src/notification/summary_writer.rs` |

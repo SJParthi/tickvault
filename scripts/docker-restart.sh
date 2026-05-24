@@ -49,8 +49,6 @@ fi
 echo -e "${CYAN}Fetching credentials from AWS SSM...${NC}"
 export TV_QUESTDB_PG_USER=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/questdb/pg-user")
 export TV_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/questdb/pg-password")
-export TV_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/grafana/admin-user")
-export TV_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/grafana/admin-password")
 export TV_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/telegram/bot-token")
 export TV_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/telegram/chat-id")
 echo -e "  ${GREEN}Done${NC}"
@@ -74,11 +72,10 @@ echo -e "${CYAN}Waiting for containers to become healthy...${NC}"
 REQUIRED_CONTAINERS=(
     "tv-questdb"
     "tv-valkey"
-    "tv-prometheus"
-    "tv-alertmanager"
-    "tv-grafana"
     # Wave 7-A removed: tv-traefik (AWS ALB free tier), tv-valkey-exporter
     # (not queried), tv-loki + tv-alloy + tv-jaeger (CloudWatch Logs).
+    # CloudWatch-only migration (#O1/#O2/#O3): tv-grafana, tv-alertmanager,
+    # tv-prometheus retired in favour of CloudWatch metrics + alarms.
 )
 
 MAX_WAIT=90

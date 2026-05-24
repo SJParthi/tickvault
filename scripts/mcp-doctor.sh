@@ -12,7 +12,6 @@
 #   TICKVAULT_ALERTMANAGER_URL  default: http://127.0.0.1:9093
 #   TICKVAULT_QUESTDB_URL       default: http://127.0.0.1:9000
 #   TICKVAULT_API_URL           default: http://127.0.0.1:3001
-#   TICKVAULT_GRAFANA_URL       default: http://127.0.0.1:3000
 
 set -euo pipefail
 
@@ -22,7 +21,6 @@ PROM_URL="${TICKVAULT_PROMETHEUS_URL:-http://127.0.0.1:9090}"
 AM_URL="${TICKVAULT_ALERTMANAGER_URL:-http://127.0.0.1:9093}"
 QDB_URL="${TICKVAULT_QUESTDB_URL:-http://127.0.0.1:9000}"
 API_URL="${TICKVAULT_API_URL:-http://127.0.0.1:3001}"
-GF_URL="${TICKVAULT_GRAFANA_URL:-http://127.0.0.1:3000}"
 
 PASS=0
 FAIL=0
@@ -75,7 +73,6 @@ probe_url "Prometheus"   "$PROM_URL" "/-/healthy"
 probe_url "Alertmanager" "$AM_URL"   "/-/healthy"
 probe_url "QuestDB"      "$QDB_URL"  "/exec?query=SELECT%201"
 probe_url "tickvault API" "$API_URL" "/health"
-probe_url "Grafana"      "$GF_URL"   "/api/health"
 echo
 
 echo "--- Docker CLI presence ---"
