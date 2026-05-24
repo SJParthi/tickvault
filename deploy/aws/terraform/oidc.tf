@@ -31,21 +31,23 @@ variable "github_repo_full_name" {
 # ---------------------------------------------------------------------------
 # OIDC identity provider (one per account, reused across all repos)
 # ---------------------------------------------------------------------------
-
-data "aws_iam_openid_connect_provider" "github" {
-  url = "https://token.actions.githubusercontent.com"
-}
-
-# If the provider doesn't exist yet, the `data` lookup fails. The first
-# `terraform apply` must create it — uncomment the resource below for
-# the first apply, then re-comment (or leave the `data` block and the
-# resource can coexist via `for_each`, but for simplicity run once).
 #
-# resource "aws_iam_openid_connect_provider" "github" {
-#   url             = "https://token.actions.githubusercontent.com"
-#   client_id_list  = ["sts.amazonaws.com"]
-#   thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1"]
-# }
+# Managed as a `resource` (not `data`) so the first `terraform apply` in a
+# fresh AWS account creates it. If the account ALREADY has this provider
+# from prior setup, the operator must `terraform import` it once:
+#
+#   terraform import aws_iam_openid_connect_provider.github \
+#     arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com
+#
+# AWS auto-validates the thumbprint against the real GitHub cert chain
+# (since 2023), so the explicit thumbprint below is a stable well-known
+# value but is not security-critical.
+
+resource "aws_iam_openid_connect_provider" "github" {
+  url             = "https://token.actions.githubusercontent.com"
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1"]
+}
 
 # ---------------------------------------------------------------------------
 # IAM role assumable ONLY by the specific GitHub workflow on main / tags
@@ -59,7 +61,7 @@ resource "aws_iam_role" "github_deploy" {
     Statement = [{
       Effect = "Allow"
       Principal = {
-        Federated = data.aws_iam_openid_connect_provider.github.arn
+        Federated = aws_iam_openid_connect_provider.github.arn
       }
       Action = "sts:AssumeRoleWithWebIdentity"
       Condition = {
