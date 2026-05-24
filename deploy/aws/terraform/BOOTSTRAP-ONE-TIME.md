@@ -2,7 +2,21 @@
 
 > **Charter:** every subsequent infra change is 100% automated via `git push`. This is the ONE mathematical event AWS IAM requires from the account owner. After these 40 seconds, you NEVER touch AWS authentication again.
 
-## The 3 steps
+## Recommended path — `aws-one-shot-bootstrap.sh` (single command)
+
+After creating the IAM access key in the AWS Console (step 1 below) and running `aws configure` on your Mac:
+
+```bash
+./scripts/aws-one-shot-bootstrap.sh
+```
+
+This script does **everything**: reads your AWS keys from `~/.aws/credentials`, pushes them to GitHub Secrets, triggers `terraform-apply.yml`, tails the run live, extracts the Elastic IP + instance ID + OIDC role ARN, and tells you the next steps. After first success, run `./scripts/aws-one-shot-bootstrap.sh --upgrade-to-oidc` to do the security cleanup automatically.
+
+**Prerequisites:** `aws` CLI v2, `gh` CLI (`gh auth login`), `jq`. All standard Mac dev tools.
+
+If you don't have `gh` installed and don't want to install it, the 5-step manual procedure below still works.
+
+## The 3 manual steps (fallback when `gh` CLI is not available)
 
 | # | Where | Click / paste | Time |
 |---|---|---|---|

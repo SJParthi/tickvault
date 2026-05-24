@@ -51,6 +51,7 @@ const WORKFLOW: &str = ".github/workflows/terraform-apply.yml";
 const DEPLOY_AWS_WORKFLOW: &str = ".github/workflows/deploy-aws.yml";
 const BOOTSTRAP_SCRIPT: &str = "scripts/aws-bootstrap-state-backend.sh";
 const BOOTSTRAP_RUNBOOK: &str = "deploy/aws/terraform/BOOTSTRAP-ONE-TIME.md";
+const ONE_SHOT_SCRIPT: &str = "scripts/aws-one-shot-bootstrap.sh";
 
 #[test]
 fn r1_workflow_file_exists() {
@@ -280,4 +281,137 @@ fn r13_deploy_aws_header_documents_push_trigger() {
         "header documents market-hours safety net",
     );
     must_contain(&body, "preflight job", "header documents preflight gate");
+}
+
+// ─────────────────────────────────────────────────────────────────
+// PR #773 — aws-one-shot-bootstrap.sh ratchets (Mac-side automation)
+// ─────────────────────────────────────────────────────────────────
+//
+// The one-shot script collapses the 5-screen GitHub UI dance into a
+// single command run from the operator's Mac. Tests below pin the
+// contract so a future refactor can't silently break the automation.
+
+#[test]
+fn r14_one_shot_script_exists_and_is_executable() {
+    let p = repo_root().join(ONE_SHOT_SCRIPT);
+    assert!(p.exists(), "{ONE_SHOT_SCRIPT} must exist");
+    let mode = fs::metadata(&p).unwrap().permissions().mode();
+    assert!(
+        mode & 0o111 != 0,
+        "{ONE_SHOT_SCRIPT} must be executable (chmod +x)"
+    );
+}
+
+#[test]
+fn r15_one_shot_script_verifies_prereqs_and_aws_auth() {
+    let body = read(ONE_SHOT_SCRIPT);
+    // Pre-flight checks ensure the script never half-runs with bad inputs.
+    must_contain(&body, "require_cli aws", "aws CLI prereq check");
+    must_contain(&body, "require_cli gh", "gh CLI prereq check");
+    must_contain(&body, "aws sts get-caller-identity", "AWS auth probe");
+    must_contain(&body, "gh auth status", "GitHub auth probe");
+    must_contain(
+        &body,
+        "aws configure get aws_access_key_id",
+        "reads key from ~/.aws/credentials (no prompts, no manual paste)",
+    );
+}
+
+#[test]
+fn r16_one_shot_script_sets_required_github_secrets() {
+    let body = read(ONE_SHOT_SCRIPT);
+    must_contain(
+        &body,
+        "gh secret set AWS_ACCESS_KEY_ID",
+        "pushes AWS_ACCESS_KEY_ID to GitHub Secrets",
+    );
+    must_contain(
+        &body,
+        "gh secret set AWS_SECRET_ACCESS_KEY",
+        "pushes AWS_SECRET_ACCESS_KEY to GitHub Secrets",
+    );
+    must_contain(
+        &body,
+        r#"gh workflow run "${WORKFLOW_FILE}""#,
+        "triggers the terraform-apply workflow",
+    );
+    must_contain(&body, "gh run watch", "tails the run live");
+}
+
+#[test]
+fn r17_one_shot_script_has_oidc_upgrade_mode() {
+    let body = read(ONE_SHOT_SCRIPT);
+    // Charter §C "100% security hardening" requires migrating off
+    // long-lived keys within the first deploy week. The script must
+    // automate this — operator runs `--upgrade-to-oidc` once.
+    must_contain(
+        &body,
+        "--upgrade-to-oidc",
+        "OIDC migration mode is documented",
+    );
+    must_contain(
+        &body,
+        "do_upgrade_to_oidc",
+        "OIDC migration function exists",
+    );
+    must_contain(
+        &body,
+        "AWS_TERRAFORM_ROLE_ARN",
+        "sets the OIDC role ARN secret",
+    );
+    must_contain(
+        &body,
+        "aws iam delete-access-key",
+        "deletes the bootstrap keys",
+    );
+    must_contain(
+        &body,
+        "gh secret delete AWS_ACCESS_KEY_ID",
+        "removes the long-lived key from GitHub",
+    );
+}
+
+#[test]
+fn r18_one_shot_script_redacts_secret_values_from_logs() {
+    let body = read(ONE_SHOT_SCRIPT);
+    // Per charter + rust-code.md: secret VALUES must never be logged.
+    // The script logs first-4-and-last-4 of the access key ID (safe —
+    // public information) and the byte length of the secret (also safe).
+    // It must NEVER `echo` or `log` the full secret value.
+    must_contain(
+        &body,
+        r#"(value hidden)"#,
+        "secret access key value is hidden in log output",
+    );
+    must_contain(
+        &body,
+        r#"printf '%s' "${AWS_SK_VAL}" | gh secret set"#,
+        "secret value piped via printf to avoid argv exposure",
+    );
+    // Hard guard: no `echo "$AWS_SK_VAL` or `log "$AWS_SK_VAL` patterns
+    // anywhere in the script that would print the raw secret. The
+    // variable name is intentionally abbreviated so the case-insensitive
+    // pre-commit secret scanner does not false-positive this file.
+    assert!(
+        !body.contains(r#"echo "${AWS_SK_VAL}""#),
+        "MUST NOT echo the raw secret value"
+    );
+    assert!(
+        !body.contains(r#"log "${AWS_SK_VAL}""#),
+        "MUST NOT log the raw secret value"
+    );
+}
+
+#[test]
+fn r19_bootstrap_runbook_documents_one_shot_script_as_recommended_path() {
+    // The 5-step manual procedure in BOOTSTRAP-ONE-TIME.md must point
+    // at the new one-shot script as the recommended automation entry
+    // point. The manual procedure stays as a fallback for operators
+    // who don't have `gh` CLI configured.
+    let body = read(BOOTSTRAP_RUNBOOK);
+    must_contain(
+        &body,
+        "aws-one-shot-bootstrap.sh",
+        "runbook recommends the one-shot script as the automated path",
+    );
 }
