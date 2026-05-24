@@ -274,9 +274,10 @@ else
         docker compose -f "${COMPOSE_FILE}" ps --all 2>&1 || true
         echo ""
         info "Recent container logs (last 30 lines per failed service):"
-        # CloudWatch-only runtime: QuestDB + Valkey. Loki/Alloy are
+        # CloudWatch-only runtime: QuestDB. Loki/Alloy are
         # profile-gated ('logs' profile) and not started by default.
-        for svc in tv-questdb tv-valkey; do
+        # tv-valkey removed in #O4 (2026-05-24).
+        for svc in tv-questdb; do
             STATUS=$(docker inspect --format='{{.State.Status}}' "$svc" 2>/dev/null || echo "not_found")
             if [ "$STATUS" != "running" ]; then
                 echo -e "  ${RED}--- ${svc} (${STATUS}) ---${NC}"
@@ -303,16 +304,7 @@ HEALTH_FAIL=0
 # ready" signal, not just "web server accepting connections".
 wait_for_http "QuestDB"         "http://localhost:9000/exec?query=SELECT%201" 120 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
 
-# Valkey speaks the Redis protocol (port 6379), not HTTP — verify the
-# container is running rather than probing an HTTP endpoint.
-printf "  Waiting for %-18s " "Valkey..."
-VALKEY_STATUS=$(docker inspect --format='{{.State.Status}}' tv-valkey 2>/dev/null || echo "not_found")
-if [ "$VALKEY_STATUS" = "running" ]; then
-    echo -e "${GREEN}UP${NC}"
-else
-    echo -e "${YELLOW}${VALKEY_STATUS}${NC}"
-    HEALTH_FAIL=$((HEALTH_FAIL + 1))
-fi
+# Valkey readiness probe removed in #O4 (2026-05-24).
 
 if [ "$HEALTH_FAIL" -gt 0 ]; then
     warn "$HEALTH_FAIL service(s) slow to start (may still be initializing)"

@@ -78,10 +78,9 @@ echo ""
 # --- Container Status -------------------------------------------------------
 echo -e "${CYAN}[1/5]${NC} Container Status"
 check_container "tv-questdb"
-check_container "tv-valkey"
 # Wave 7-A removed: tv-traefik / tv-loki / tv-alloy / tv-jaeger / tv-valkey-exporter.
 # CloudWatch-only migration removed: tv-grafana (#O1), tv-alertmanager (#O2),
-# tv-prometheus (#O3). See .claude/rules/project/aws-budget.md.
+# tv-prometheus (#O3), tv-valkey (#O4). See .claude/rules/project/aws-budget.md.
 echo ""
 
 # --- HTTP Health Checks ------------------------------------------------------

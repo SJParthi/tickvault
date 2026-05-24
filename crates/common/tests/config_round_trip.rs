@@ -85,11 +85,6 @@ http_port = 9000
 pg_port = 8812
 ilp_port = 9009
 
-[valkey]
-host = "tv-valkey"
-port = 6379
-max_connections = 16
-
 [prometheus]
 host = "tv-prometheus"
 port = 9090
@@ -186,7 +181,6 @@ fn test_config_toml_deserializes_all_sections() {
     assert_eq!(config.trading.nse_holidays.len(), 10);
     assert_eq!(config.dhan.rest_api_base_url, "https://api.dhan.co/v2");
     assert_eq!(config.questdb.http_port, 9000);
-    assert_eq!(config.valkey.port, 6379);
     assert_eq!(config.websocket.subscription_batch_size, 100);
     assert_eq!(config.network.retry_max_attempts, 5);
     assert_eq!(config.token.token_validity_hours, 24);

@@ -173,7 +173,7 @@ check_cargo_test P "Zero-tick-loss alert guard" \
     tickvault-storage zero_tick_loss_alert_guard \
     "crates/storage/tests/zero_tick_loss_alert_guard.rs"
 
-check_cargo_test P "Resilience SLA alert guard (WS+QuestDB+Valkey)" \
+check_cargo_test P "Resilience SLA alert guard (WS+QuestDB)" \
     tickvault-storage resilience_sla_alert_guard \
     "crates/storage/tests/resilience_sla_alert_guard.rs"
 

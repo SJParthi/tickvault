@@ -250,7 +250,7 @@ export TV_QUESTDB_PG_USER=$(fetch_ssm_secret "/tickvault/dev/questdb/pg-user")
 export TV_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/tickvault/dev/questdb/pg-password")
 export TV_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/tickvault/dev/telegram/bot-token")
 export TV_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/tickvault/dev/telegram/chat-id")
-export TV_VALKEY_PASSWORD=$(fetch_ssm_secret "/tickvault/dev/valkey/password")
+# TV_VALKEY_PASSWORD fetch removed in #O4 (2026-05-24) — Valkey removed.
 
 echo -e "  Starting Docker Compose infrastructure..."
 if docker compose -f "${PROJECT_DIR}/deploy/docker/docker-compose.yml" up -d 2>&1 | tail -15; then
@@ -308,7 +308,7 @@ else
 fi
 
 # 3f. Container exit code check
-for container in tv-questdb tv-valkey; do
+for container in tv-questdb; do
     STATUS=$(docker inspect --format='{{.State.Running}} {{.State.ExitCode}}' "$container" 2>/dev/null || echo "false -1")
     IS_RUNNING=$(echo "$STATUS" | awk '{print $1}')
     EXIT_CODE=$(echo "$STATUS" | awk '{print $2}')

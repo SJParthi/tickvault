@@ -163,7 +163,7 @@ ensure_pgpass() {
 # (excluding profile-gated ones).
 REQUIRED_CONTAINERS=(
     "tv-questdb"
-    "tv-valkey"
+    # tv-valkey removed in #O4 (2026-05-24).
 )
 
 all_running() {

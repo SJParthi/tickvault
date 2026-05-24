@@ -181,15 +181,8 @@ const REQUIRED_METRICS: &[(&str, &str)] = &[
         "tv_order_update_messages_total",
         "S4-T4: Total order update messages received (any type).",
     ),
-    (
-        "tv_valkey_ops_total",
-        "S4-T4: Total Valkey operations attempted. Labelled by op \
-         (get / set / del / exists).",
-    ),
-    (
-        "tv_valkey_errors_total",
-        "S4-T4: Total Valkey operation failures. Non-zero during an outage.",
-    ),
+    // `tv_valkey_ops_total` + `tv_valkey_errors_total` removed in
+    // #O4 (2026-05-24) — Valkey deleted from the runtime.
 ];
 
 // Note: `tv_sandbox_gate_blocks_total` was intentionally deferred from E1.
