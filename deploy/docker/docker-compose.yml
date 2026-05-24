@@ -1,17 +1,22 @@
 # =============================================================================
 # tickvault — Docker Compose
 # =============================================================================
-# ALL versions from Tech Stack Bible V6. Same file on Mac and AWS c7i/c8g.xlarge.
-# Target: c7i.xlarge OR c8g.xlarge (4 vCPUs, 8GB RAM)
+# Same file on Mac dev and AWS prod (t4g.medium ARM Graviton, 2 vCPUs / 4 GiB,
+# operator-lock 2026-05-18 in aws-budget.md).
 #
-# Wave 7-A trim (2026-05-10) — see .claude/rules/project/aws-budget.md:
-#   QuestDB 2GB + Valkey 512MB + Prometheus 384MB + Grafana 768MB
-#   + Alertmanager 256MB + App ~500MB + OS ~200MB = ~4.0GB total.
-#   ~4.0GB headroom on 8GB.
+# Post-CloudWatch-only migration (#O1/#O2/#O3/#O4):
+#   QuestDB ~1.5GB + App ~700MB + OS ~400MB = ~2.6GB total.
+#   ~1.4GB headroom on 4 GiB t4g.medium.
 #
-# REMOVED in Wave 7-A:
-#   - Traefik    -> AWS ALB free tier (HTTPS termination)
-#   - valkey-exporter -> not queried; remove
+# REMOVED (CloudWatch-only migration):
+#   - Grafana       -> CloudWatch Dashboards (#O1)
+#   - Alertmanager  -> SNS 4-channel fan-out (#O2)
+#   - Prometheus    -> CloudWatch metrics (#O3)
+#   - Valkey        -> SSM Parameter Store for dual-instance lock (#O4)
+# REMOVED earlier (Wave 7-A):
+#   - Traefik           -> AWS ALB free tier (HTTPS termination)
+#   - valkey-exporter   -> not queried
+#   - Loki / Alloy / Jaeger -> CloudWatch Logs / X-Ray
 #
 # KEPT in Wave 7-A (operator decision 2026-05-10):
 #   - Alertmanager -> independent process safety. If app crashes during
@@ -101,7 +106,7 @@ services:
       # --- Crash Recovery & Stability ---
       # Writer append page size: 1MB. Reduces mmap syscalls for large batches.
       QDB_CAIRO_WRITER_DATA_APPEND_PAGE_SIZE: "1048576"
-      # Parallel WAL apply threads: 2 (matches c7i/c8g.xlarge vCPUs).
+      # Parallel WAL apply threads: 2 (matches t4g.medium 2 vCPUs).
       QDB_WAL_APPLY_WORKER_COUNT: "2"
       QDB_PG_USER: ${TV_QUESTDB_PG_USER:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
       QDB_PG_PASSWORD: ${TV_QUESTDB_PG_PASSWORD:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
@@ -158,7 +163,7 @@ services:
   # ---------------------------------------------------------------------------
   # Loki — log aggregation (Phase 3 of active-plan.md)
   # OPT-IN only: starts with `docker-compose --profile logs up -d`.
-  # Default stack is unaffected. On c7i.xlarge budget: 384MB memory.
+  # Default stack is unaffected. On t4g.medium budget: 384MB memory.
   # Retains errors.jsonl.* structured stream for 30 days; ruler fires
   # LogQL-based alerts (ErrorBurst, FlushErrorStorm, AuthFailureBurst,
   # NovelErrorSignature) via Alertmanager → Telegram.

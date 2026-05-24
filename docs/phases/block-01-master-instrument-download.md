@@ -302,7 +302,7 @@ CREATE TABLE subscribed_indices (
 
 8:30 AM IST — CSV download begins immediately after health check passes.
   + seconds    Download + parse + 5-pass build + validation + persistence.
-              Expected: 3-10 seconds total on MacBook, ~1-3 seconds on c7i.2xlarge.
+              Expected: 3-10 seconds total on MacBook, ~1-3 seconds on t4g.medium.
 
 8:31 AM IST — System READY with instruments loaded.
               WebSocket subscriptions can be prepared.

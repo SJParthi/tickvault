@@ -44,7 +44,7 @@
 ### Benchmarks (`cargo bench`)
 - Results are meaningless on shared/variable cloud hardware
 - Need dedicated hardware with consistent CPU frequency
-- Production benchmarks run on c7i.2xlarge (AWS Mumbai)
+- Production benchmarks run on t4g.medium (AWS Mumbai)
 
 ## Cloud Environment Limits
 

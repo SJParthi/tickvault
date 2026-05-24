@@ -36,8 +36,9 @@ usermod -aG docker ubuntu
 # Install Docker Compose v2 (plugin)
 apt-get install -y docker-compose-plugin
 
-# CloudWatch agent for system metrics + journald
-curl -O https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+# CloudWatch agent for system metrics + journald.
+# t4g.medium is ARM Graviton — arm64 .deb (amd64 will fail to install).
+curl -O https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/arm64/latest/amazon-cloudwatch-agent.deb
 dpkg -i amazon-cloudwatch-agent.deb
 rm amazon-cloudwatch-agent.deb
 

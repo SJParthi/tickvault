@@ -219,7 +219,7 @@
 ### CORE-PIN-01 — Core affinity failed at boot
 
 **Symptom:** Telegram HIGH at boot; `tv_core_pinning_workers_pinned_total < 4`.
-**Cause:** Host has < 4 logical cores OR cgroup cpuset rejects pin OR not running on c7i.xlarge / equivalent.
+**Cause:** Host has < 4 logical cores OR cgroup cpuset rejects pin OR not running on t4g.medium / equivalent.
 **Fix:** `nproc` ≥ 4 required; container needs `--cpuset-cpus=0-3` equivalent.
 **Cross-reference:** `.claude/rules/project/wave-5-error-codes.md::CORE-PIN-01`.
 

@@ -12,7 +12,7 @@
 |----------|-------|
 | **Purpose** | O(1) latency live F&O trading system for Indian markets (NSE) |
 | **Language** | Rust 2024 Edition (stable 1.95.0) |
-| **Architecture** | 6-crate workspace, Docker-first, AWS c7i.2xlarge Mumbai (prod) |
+| **Architecture** | 6-crate workspace, Docker-first, AWS t4g.medium Mumbai (prod) |
 | **Phase** | Phase 1 — Live Trading System |
 | **Codebase** | ~84,000 lines of Rust across 147 files |
 | **Tests** | 2,684 passing (0 failing), 57 ignored (loom), 5 benchmarks |
