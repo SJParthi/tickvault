@@ -137,7 +137,7 @@ Mac NEVER needs S3 because:
 - No market-hours download block in dev (or can be overridden)
 - Cache survives everything except deliberate deletion
 
-### 1B.3 AWS c7i.2xlarge (Prod) — EBS + S3
+### 1B.3 AWS t4g.medium (Prod) — EBS + S3
 
 | Property | Value |
 |----------|-------|

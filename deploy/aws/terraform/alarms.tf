@@ -1,11 +1,12 @@
-# S9: CloudWatch alarms that publish to tv-${env}-alerts SNS topic.
+# CloudWatch infrastructure alarms — publish to tv-${env}-alerts SNS topic.
 #
-# The Grafana alerts in deploy/docker/grafana/provisioning/alerting/
-# fire for in-app metrics (tv_*). These CloudWatch alarms fire for
-# INFRASTRUCTURE signals — the machine / disk / network layer —
-# which Grafana can't see because the app itself might be down.
+# Post-CloudWatch-only-migration (#O1/#O2/#O3/#O4): the entire observability
+# stack is CloudWatch. App-level metrics (tv_*) ship via the CloudWatch agent;
+# infrastructure signals (CPU/disk/network/instance status) ship via these
+# AWS/EC2 namespace alarms. Operator sees both in one place: CloudWatch Console.
 #
-# Alarm → SNS → operator Telegram bot subscription.
+# Alarm → SNS → operator Telegram bot + SMS + Email + Connect call (4-channel
+# fan-out per operator-charter-forever.md §F).
 #
 # 5 alarms to stay within the free tier (CloudWatch free tier = 10
 # alarms/month per account).

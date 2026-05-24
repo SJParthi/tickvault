@@ -331,7 +331,7 @@ cargo install flamegraph
 # Generate (requires perf on Linux, dtrace on macOS)
 cargo flamegraph --bin tickvault -- --config config/base.toml
 
-# AWS c7i.2xlarge supports perf — run during staging deploy
+# AWS t4g.medium supports perf — run during staging deploy
 ```
 
 **CI integration:** Manual / on-demand. Generate during performance investigation.
