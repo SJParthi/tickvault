@@ -76,7 +76,7 @@ terraform plan -out=scale.plan
 terraform apply scale.plan
 
 # 3. Wait for instance to come back; restart Docker stack
-ssh -i ~/.ssh/tv-prod-key.pem ubuntu@<EIP> 'sudo systemctl start docker && cd /opt/tickvault && docker compose up -d'
+ssh -i ~/.ssh/tv-prod-key.pem ec2-user@<EIP> 'sudo systemctl start docker && cd /opt/tickvault && docker compose up -d'
 
 # 4. Verify
 make doctor   # from inside the SSH session
@@ -116,7 +116,7 @@ terraform plan -target=aws_security_group.tv_prod_sg
 terraform apply -target=aws_security_group.tv_prod_sg
 
 # 4. Verify SSH still works
-ssh -i ~/.ssh/tv-prod-key.pem ubuntu@<EIP> 'echo ok'
+ssh -i ~/.ssh/tv-prod-key.pem ec2-user@<EIP> 'echo ok'
 ```
 
 ### Rotate SSH keys (90-day cadence)
@@ -126,14 +126,14 @@ ssh -i ~/.ssh/tv-prod-key.pem ubuntu@<EIP> 'echo ok'
 ssh-keygen -t ed25519 -f ~/.ssh/tv-prod-key-$(date +%Y%m).pem -N ""
 
 # 2. Add public key to instance (uses OLD key still active)
-ssh -i ~/.ssh/tv-prod-key.pem ubuntu@<EIP> \
+ssh -i ~/.ssh/tv-prod-key.pem ec2-user@<EIP> \
     "cat >> ~/.ssh/authorized_keys" < ~/.ssh/tv-prod-key-$(date +%Y%m).pem.pub
 
 # 3. Verify new key works
-ssh -i ~/.ssh/tv-prod-key-$(date +%Y%m).pem ubuntu@<EIP> 'echo ok'
+ssh -i ~/.ssh/tv-prod-key-$(date +%Y%m).pem ec2-user@<EIP> 'echo ok'
 
 # 4. Remove old key from authorized_keys (use new SSH session)
-ssh -i ~/.ssh/tv-prod-key-$(date +%Y%m).pem ubuntu@<EIP> \
+ssh -i ~/.ssh/tv-prod-key-$(date +%Y%m).pem ec2-user@<EIP> \
     "grep -v '<old_key_substring>' ~/.ssh/authorized_keys > /tmp/auth && mv /tmp/auth ~/.ssh/authorized_keys"
 
 # 5. Update local default symlink
