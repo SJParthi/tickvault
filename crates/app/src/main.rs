@@ -1834,15 +1834,17 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 6a-prime: Dual-instance Valkey lock (Phase 0 Item 19)
+    // Step 6a-prime: Dual-instance SSM lock (Phase 0 Item 19)
     // -----------------------------------------------------------------------
     // RESILIENCE-01: only ONE tickvault process per Dhan client-id may
     // ever be live. Two processes against the same account fight over
     // static-IP enforcement (Item 18), fragment the 5-conn WebSocket
-    // budget, and silently break order reconciliation. We hold a
-    // Valkey-backed lock (90s TTL, 30s heartbeat) for the lifetime of
-    // the process; this gate fails the boot if another live peer is
-    // already holding it.
+    // budget, and silently break order reconciliation. We hold an
+    // SSM-Parameter-Store-backed lock (90s TTL, 30s heartbeat) for the
+    // lifetime of the process; this gate fails the boot if another
+    // live peer is already holding it. SSM is the source of truth so
+    // an AWS prod instance and a dev Mac sharing the same env name
+    // cannot accidentally run in parallel.
     //
     // Runs AFTER auth (Step 6) so the boot-halt Telegram + SNS path
     // is fully wired. Runs BEFORE Step 6a static IP boot gate so we
@@ -1857,66 +1859,24 @@ async fn main() -> Result<()> {
     // heartbeat spawn.
     let mut instance_lock_shutdown_chain: Option<std::sync::Arc<tokio::sync::Notify>> = None;
     let instance_lock_handle: Option<tokio::task::JoinHandle<()>> = if trading_mode.is_live() {
-        info!("Phase 0 Item 19: acquiring dual-instance Valkey lock");
+        info!("Phase 0 Item 19: acquiring dual-instance SSM lock");
 
-        // SSM is the only authorized source for the Valkey password
-        // per rust-code.md. The boot-time fetch hard-fails on any SSM
-        // error — running with no Valkey AUTH would let an attacker
-        // squat on the lock key from the same host.
-        let valkey_password = tickvault_core::auth::secret_manager::fetch_valkey_password()
-            .await
-            .context(
-                "Phase 0 Item 19: SSM fetch for Valkey password failed at \
-                     /tickvault/<env>/valkey/password — store the password via \
-                     `aws ssm put-parameter --name /tickvault/<env>/valkey/password \
-                     --type SecureString`",
-            )?;
-        info!(
-            "Phase 0 Item 19: Valkey password loaded from SSM \
-             (/tickvault/<env>/valkey/password)"
+        // SSM is the source of truth for the lock (operator lock
+        // 2026-05-24 — superseded the Valkey-backed implementation
+        // alongside the CloudWatch-only migration). Constructing the
+        // client here keeps the lock self-contained; no Valkey container
+        // needs to be running. Costs: standard-tier SSM PutParameter is
+        // free; ~2,880 calls/day at the 30 s heartbeat interval is well
+        // under the 40 TPS SSM rate cap.
+        let ssm_client = std::sync::Arc::new(
+            tickvault_core::auth::secret_manager::create_ssm_client_public().await,
         );
 
-        // The fetched SecretString must flow into ValkeyConfig.password
-        // BEFORE ValkeyPool::new — the TOML default is empty. Cloning
-        // the config + overwriting password keeps the rest of the
-        // Valkey settings (host/port/max_connections) intact.
-        let mut valkey_cfg = config.valkey.clone();
-        {
-            use secrecy::ExposeSecret;
-            valkey_cfg.password = valkey_password.expose_secret().to_string();
-        }
-
-        let valkey_pool = match tickvault_storage::valkey_cache::ValkeyPool::new(&valkey_cfg) {
-            Ok(pool) => std::sync::Arc::new(pool),
-            Err(err) => {
-                error!(
-                    code = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected
-                        .code_str(),
-                    severity = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected
-                        .severity()
-                        .as_str(),
-                    error = %err,
-                    "Phase 0 Item 19: Valkey pool construction failed — BLOCKING BOOT"
-                );
-                let env_for_audit = tickvault_core::auth::secret_manager::resolve_environment()
-                    .unwrap_or_else(|_| "unknown".to_string());
-                let lock_key_for_audit =
-                    tickvault_core::instance_lock::compute_instance_lock_key(&env_for_audit);
-                notifier.notify(
-                    tickvault_core::notification::events::NotificationEvent::DualInstanceDetected {
-                        holder: format!("(valkey-pool-build-error: {err})"),
-                        lock_key: lock_key_for_audit.clone(),
-                    },
-                );
-                return Ok(());
-            }
-        };
-
-        // host_id composition mirrors Item 19a: pid + boot_random +
-        // aws_instance_id (when present). The instance lock key is
-        // env-qualified, so dev + sandbox + prod cannot collide.
+        // host_id composition: pid + boot_random + aws_instance_id (when
+        // present). The instance lock path is env-qualified, so dev /
+        // sandbox / prod cannot collide.
         let env = tickvault_core::auth::secret_manager::resolve_environment()
-            .context("Phase 0 Item 19: cannot resolve environment for lock key")?;
+            .context("Phase 0 Item 19: cannot resolve environment for lock path")?;
         let host_id = tickvault_core::instance_lock::generate_host_id(
             std::process::id(),
             // Boot-once 64-bit value derived from nanos-since-UNIX-EPOCH.
@@ -1930,9 +1890,9 @@ async fn main() -> Result<()> {
                 .unwrap_or(0),
             None,
         );
-        let lock_key = tickvault_core::instance_lock::compute_instance_lock_key(&env);
+        let lock_key = tickvault_core::instance_lock::compute_instance_lock_path(&env);
 
-        match tickvault_core::instance_lock::try_acquire_instance_lock(&valkey_pool, &env, &host_id)
+        match tickvault_core::instance_lock::try_acquire_instance_lock(&ssm_client, &env, &host_id)
             .await
         {
             Ok(tickvault_core::instance_lock::AcquireOutcome::Acquired) => {
@@ -1966,8 +1926,8 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             Err(err) => {
-                // Valkey GET/SET failed (network blip, auth refused,
-                // pool exhausted). Same HALT semantics as
+                // SSM PutParameter / GetParameter failed (network blip,
+                // IAM denial, throttle). Same HALT semantics as
                 // already-held: we cannot prove there's no peer.
                 error!(
                     code = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected
@@ -1979,11 +1939,11 @@ async fn main() -> Result<()> {
                     env = %env,
                     host_id = %host_id,
                     lock_key = %lock_key,
-                    "Phase 0 Item 19: Valkey acquire-attempt failed — BLOCKING BOOT"
+                    "Phase 0 Item 19: SSM acquire-attempt failed — BLOCKING BOOT"
                 );
                 notifier.notify(
                     tickvault_core::notification::events::NotificationEvent::DualInstanceDetected {
-                        holder: format!("(valkey-error: {err})"),
+                        holder: format!("(ssm-error: {err})"),
                         lock_key,
                     },
                 );
@@ -1996,12 +1956,12 @@ async fn main() -> Result<()> {
         // `shutdown_notify` (constructed at the Step 8b stage) is
         // chained into it via the bridge task installed further
         // down (Item 19f). On the bridge firing, the heartbeat
-        // releases the lock + writes a `GracefulRelease` audit row
-        // before returning.
+        // releases the lock by deleting the SSM Parameter so the next
+        // boot sees a clean slate immediately.
         let heartbeat_shutdown_inner = std::sync::Arc::new(tokio::sync::Notify::new());
         let heartbeat_shutdown_for_chain = heartbeat_shutdown_inner.clone();
         let heartbeat_handle = tickvault_core::instance_lock::spawn_instance_lock_heartbeat(
-            valkey_pool,
+            ssm_client,
             env,
             host_id,
             heartbeat_shutdown_inner,

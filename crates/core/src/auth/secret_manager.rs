@@ -72,6 +72,15 @@ pub(crate) async fn create_ssm_client() -> SsmClient {
     SsmClient::new(&config)
 }
 
+/// Public wrapper around [`create_ssm_client`] for callers outside this
+/// module (e.g. `instance_lock`). Behaviour is identical; the indirection
+/// only exists so the internal helper can stay `pub(crate)` while a
+/// stable export point lives at the crate root.
+// TEST-EXEMPT: one-line delegation to the TEST-EXEMPT create_ssm_client; constructing aws_sdk_ssm::Client needs the live SSM endpoint.
+pub async fn create_ssm_client_public() -> SsmClient {
+    create_ssm_client().await
+}
+
 // ---------------------------------------------------------------------------
 // Secret Retrieval
 // ---------------------------------------------------------------------------
