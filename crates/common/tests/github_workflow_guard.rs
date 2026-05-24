@@ -48,6 +48,7 @@ fn must_contain(haystack: &str, needle: &str, label: &str) {
 }
 
 const WORKFLOW: &str = ".github/workflows/terraform-apply.yml";
+const DEPLOY_AWS_WORKFLOW: &str = ".github/workflows/deploy-aws.yml";
 const BOOTSTRAP_SCRIPT: &str = "scripts/aws-bootstrap-state-backend.sh";
 const BOOTSTRAP_RUNBOOK: &str = "deploy/aws/terraform/BOOTSTRAP-ONE-TIME.md";
 
@@ -207,4 +208,76 @@ fn r10_bootstrap_runbook_exists_and_names_oidc_cleanup() {
         "explicit access-key cleanup step",
     );
     must_contain(&body, "40 seconds", "honest envelope total time");
+}
+
+// ─────────────────────────────────────────────────────────────────
+// PR #772 — deploy-aws.yml auto-trigger + preflight ratchets
+// ─────────────────────────────────────────────────────────────────
+//
+// Per the 5-PR roadmap, deploy-aws.yml must auto-fire on push to main
+// with Rust-relevant paths, AND skip cleanly when AWS bootstrap secrets
+// are absent (same pattern as terraform-apply.yml). Tests below pin
+// that contract.
+
+#[test]
+fn r11_deploy_aws_has_push_to_main_trigger_with_rust_paths() {
+    let body = read(DEPLOY_AWS_WORKFLOW);
+    // The original workflow only triggered on tag push + workflow_dispatch.
+    // PR #772 added push to main with path filters so any merge to main
+    // touching Rust code auto-deploys (outside market hours).
+    must_contain(&body, "branches: [main]", "main branch push trigger");
+    must_contain(&body, "'crates/**'", "Rust source path filter");
+    must_contain(&body, "'Cargo.toml'", "Cargo manifest path filter");
+    must_contain(&body, "'Cargo.lock'", "Cargo.lock path filter");
+    must_contain(
+        &body,
+        "'deploy/systemd/**'",
+        "systemd unit path filter (binary integration)",
+    );
+    // Existing triggers must still be present
+    must_contain(&body, "'v*.*.*'", "existing tag trigger preserved");
+    must_contain(
+        &body,
+        "workflow_dispatch:",
+        "existing manual dispatch preserved",
+    );
+}
+
+#[test]
+fn r12_deploy_aws_has_preflight_gate() {
+    let body = read(DEPLOY_AWS_WORKFLOW);
+    // Mirrors the terraform-apply.yml preflight pattern — gates downstream
+    // jobs on bootstrap secret presence so pre-bootstrap PRs don't go red.
+    must_contain(&body, "preflight:", "deploy-aws preflight job");
+    must_contain(
+        &body,
+        "bootstrap_ready",
+        "deploy-aws preflight emits bootstrap_ready",
+    );
+    // build, guard_market_hours, deploy must all gate on preflight
+    let gate_refs = body
+        .matches("needs.preflight.outputs.bootstrap_ready == 'true'")
+        .count();
+    assert!(
+        gate_refs >= 3,
+        "expected at least 3 jobs gated on preflight (build, guard, deploy); found {gate_refs}"
+    );
+}
+
+#[test]
+fn r13_deploy_aws_header_documents_push_trigger() {
+    let body = read(DEPLOY_AWS_WORKFLOW);
+    // The header comment must list all 3 triggers so future readers
+    // can grep the file without needing to parse the YAML.
+    must_contain(
+        &body,
+        "Push to main with Rust",
+        "header documents push-to-main trigger",
+    );
+    must_contain(
+        &body,
+        "guard_market_hours",
+        "header documents market-hours safety net",
+    );
+    must_contain(&body, "preflight job", "header documents preflight gate");
 }
