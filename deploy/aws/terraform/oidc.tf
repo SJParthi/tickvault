@@ -153,7 +153,7 @@ output "github_oidc_role_arn" {
 
 output "github_oidc_setup_instructions" {
   description = "Paste these commands into the repo secrets UI"
-  value = <<-EOT
+  value       = <<-EOT
     1. Open https://github.com/${var.github_repo_full_name}/settings/secrets/actions
     2. Click 'New repository secret'
     3. Create 3 secrets:
