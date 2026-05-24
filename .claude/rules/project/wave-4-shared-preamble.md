@@ -32,7 +32,6 @@ MUST USE IT — not duplicate it, not reinvent it.
 | Find runbook for ErrorCode | `mcp__tickvault-logs__find_runbook_for_code` | Emitting/referencing an ERROR |
 | Live Prometheus query | `mcp__tickvault-logs__prometheus_query` | Verifying counter increments |
 | Live QuestDB SQL | `mcp__tickvault-logs__questdb_sql` | Verifying table writes / DEDUP |
-| Live Grafana panel | `mcp__tickvault-logs__grafana_query` | Verifying dashboard renders |
 | Detect novel errors | `mcp__tickvault-logs__list_novel_signatures` | After any ERROR-emitting change |
 | Source-grep | `mcp__tickvault-logs__grep_codebase` | Faster than spawning an agent |
 | Latest summary | `mcp__tickvault-logs__summary_snapshot` | At session start |
@@ -121,12 +120,15 @@ For EACH new code path, ALL SEVEN observability layers must fire.
 | 3 | Tracing span | `#[instrument]` on hot-path entry fns | `error_code_tag_guard` |
 | 4 | Loki structured log | `error!`/`warn!`/`info!` with `code = ErrorCode::X.code_str()` | `mcp__tickvault-logs__tail_errors` |
 | 5 | Telegram event | `NotificationEvent::*` typed variant | notification_service routes Severity::High/Critical |
-| 6 | Grafana panel | wraps counter in `increase()`/`rate()` per Rule 12 | `mcp__tickvault-logs__grafana_query` |
-| 7 | Audit table | INSERT into `<event>_audit` table with DEDUP UPSERT KEYS | `mcp__tickvault-logs__questdb_sql` |
+| 6 | Audit table | INSERT into `<event>_audit` table with DEDUP UPSERT KEYS | `mcp__tickvault-logs__questdb_sql` |
+
+> Layer 6 was previously a Grafana panel — retired with the CloudWatch-only
+> migration (#O1). Counter visibility now comes from CloudWatch dashboards
+> in prod and the QuestDB console in dev; the audit row remains the
+> system-of-record.
 
 Mechanical guards (already shipped):
 - `error_code_tag_guard.rs` — `error!` must carry `code` field
-- `operator_health_dashboard_guard.rs` — counters must have a panel
 - `resilience_sla_alert_guard.rs` — counters must have an alert rule
 - `dedup_segment_meta_guard.rs` — every DEDUP key includes segment
 
@@ -150,8 +152,6 @@ bash .claude/hooks/banned-pattern-scanner.sh
 bash .claude/hooks/pub-fn-test-guard.sh "$PWD" all
 bash .claude/hooks/pub-fn-wiring-guard.sh "$PWD"
 bash .claude/hooks/plan-verify.sh
-python3 -c "import yaml; yaml.safe_load(open('deploy/docker/grafana/provisioning/alerting/alerts.yml'))"
-python3 -c "import json; json.load(open('deploy/docker/grafana/dashboards/operator-health.json'))"
 mcp__tickvault-logs__list_active_alerts        # must be []
 mcp__tickvault-logs__list_novel_signatures     # must be []
 cargo bench                                    # if hot path touched — respect benchmark-budgets.toml

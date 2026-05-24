@@ -20,7 +20,6 @@ const REQUIRED_URL_KEYS: &[&str] = &[
     "prometheus_url",
     "alertmanager_url",
     "questdb_url",
-    "grafana_url",
     "tickvault_api_url",
 ];
 const REQUIRED_NON_URL_KEYS: &[&str] = &["logs_source", "logs_dir_local"];
@@ -36,7 +35,6 @@ struct Profile {
     prometheus_url: String,
     alertmanager_url: String,
     questdb_url: String,
-    grafana_url: String,
     tickvault_api_url: String,
     logs_source: String,
     logs_dir_local: String,
@@ -130,7 +128,6 @@ fn all_url_keys_look_like_http_or_https() {
             ("prometheus_url", &profile.prometheus_url),
             ("alertmanager_url", &profile.alertmanager_url),
             ("questdb_url", &profile.questdb_url),
-            ("grafana_url", &profile.grafana_url),
             ("tickvault_api_url", &profile.tickvault_api_url),
         ] {
             assert!(
@@ -173,7 +170,6 @@ fn local_profile_uses_localhost_not_tailscale() {
         &local.prometheus_url,
         &local.alertmanager_url,
         &local.questdb_url,
-        &local.grafana_url,
         &local.tickvault_api_url,
     ] {
         assert!(
@@ -249,7 +245,6 @@ fn mcp_server_reads_config_file_before_env_vars() {
         "questdb_url",
         "alertmanager_url",
         "tickvault_api_url",
-        "grafana_url",
     ] {
         assert!(
             src.contains(&format!("\"{kind}\"")),
@@ -262,7 +257,6 @@ fn mcp_server_reads_config_file_before_env_vars() {
         "TICKVAULT_ALERTMANAGER_URL",
         "TICKVAULT_QUESTDB_URL",
         "TICKVAULT_API_URL",
-        "TICKVAULT_GRAFANA_URL",
     ] {
         // The env var CAN appear (it's passed to _endpoint_url), but
         // NOT in the `base_url or os.environ.get(...)` pattern that the

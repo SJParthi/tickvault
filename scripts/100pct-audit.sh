@@ -169,10 +169,6 @@ check_cargo_test P "Recording rules no-drift" \
     tickvault-common recording_rules_guard \
     "crates/common/tests/recording_rules_guard.rs"
 
-check_cargo_test P "Grafana alerts wiring" \
-    tickvault-common grafana_alerts_wiring \
-    "crates/common/tests/grafana_alerts_wiring.rs"
-
 check_cargo_test P "Zero-tick-loss alert guard" \
     tickvault-storage zero_tick_loss_alert_guard \
     "crates/storage/tests/zero_tick_loss_alert_guard.rs"
@@ -230,10 +226,6 @@ check_cargo_test P "Live-feed purity (no backfill→ticks)" \
 check_cargo_test P "Instrument uniqueness proptest" \
     tickvault-storage instrument_uniqueness_guard \
     "crates/storage/tests/instrument_uniqueness_guard.rs"
-
-check_cargo_test P "Grafana dashboard segment-qualified distinct" \
-    tickvault-storage grafana_dashboard_snapshot_filter_guard \
-    "crates/storage/tests/grafana_dashboard_snapshot_filter_guard.rs"
 
 # =============================================================================
 # AUTONOMOUS OPS (M1-M4, P)

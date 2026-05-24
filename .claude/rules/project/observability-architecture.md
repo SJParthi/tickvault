@@ -244,9 +244,12 @@ summary file and drives the above flow.
       instruments, clear-spill — all three scaffolded, refresh-instruments
       fully functional today); Phase 8.2 Lambda bridge deferred until
       AWS instance provisioned
-- [x] **Phase 9.1** — Grafana Operator Health single-page dashboard
-      shipped: `deploy/docker/grafana/dashboards/operator-health.json`
-      pinned by `crates/storage/tests/operator_health_dashboard_guard.rs`.
+- [~] **Phase 9.1** — Grafana Operator Health single-page dashboard
+      RETIRED with the CloudWatch-only migration (#O1 — Grafana removal).
+      The `deploy/docker/grafana/dashboards/` tree and its
+      `operator_health_dashboard_guard.rs` ratchet were deleted along
+      with the `tv-grafana` container. CloudWatch Dashboards replace
+      operator visualization in prod (free tier: 3 dashboards).
 - [x] **Phase 9.2** — `scripts/validate-automation.sh` + `make
       validate-automation` runs 20 end-to-end checks.
 - [x] **Phase 10.1** — Zero-tick-loss alert guard (4 Prometheus alerts
@@ -258,14 +261,14 @@ summary file and drives the above flow.
       detector module and its DHAT + loom ratchets were deleted too.
 - [x] **Phase 10.3** — Tick-loss chaos test shipped:
       `crates/storage/tests/chaos_zero_tick_loss.rs`.
-- [x] **Phase 11** — WS + QuestDB + Valkey resilience SLA ALERT GUARD
-      shipped (`crates/storage/tests/resilience_sla_alert_guard.rs`,
-      6 tests, 6 alert rules + 6 metric emissions pinned). Chaos
-      integration tests now also shipped: `chaos_questdb_docker_pause.rs`
+- [~] **Phase 11** — WS + QuestDB + Valkey resilience SLA ALERT GUARD
+      partially retired: the Prometheus-side `resilience_sla_alert_guard.rs`
+      was deleted with the Alertmanager + Prometheus removals (#O2 / #O3).
+      The chaos integration tests remain: `chaos_questdb_docker_pause.rs`
       (Phase 11.1 nightly chaos), `chaos_rescue_ring_overflow.rs` +
       `chaos_ws_frame_spill_saturation.rs` (Phase 11.2 backpressure sim),
-      `chaos_valkey_kill.rs` (Phase 11.3 Valkey kill-test). Total chaos
-      tests in workspace: 16.
+      `chaos_valkey_kill.rs` (Phase 11.3 Valkey kill-test). The CloudWatch
+      alarm equivalents land alongside the prod CloudWatch migration.
 - [x] **Phase 12.1** — 100% line coverage threshold set in
       `quality/crate-coverage-thresholds.toml`, enforced by
       `scripts/coverage-gate.sh` in CI

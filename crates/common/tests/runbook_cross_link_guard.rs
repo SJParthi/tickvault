@@ -87,6 +87,20 @@ const KNOWN_BROKEN_ALLOWLIST: &[&str] = &[
     // designed in the runbook §4 but not yet implemented. TODO: PR #13
     // commits `scripts/aws-bootstrap.sh` per the design in the runbook.
     "scripts/aws-bootstrap.sh",
+    // CloudWatch-only migration retired the Grafana, Prometheus and
+    // Alertmanager infra trees. Runbooks still reference the old dashboard
+    // + alert + config files; they'll be regenerated once CloudWatch
+    // dashboards + alarms land. Tracking:
+    // `.claude/plans/active-plan-observability-cloudwatch-only.md`.
+    "deploy/docker/grafana/dashboards/auth-health.json", // #O1
+    "deploy/docker/grafana/dashboards/trading-flow.json", // #O1
+    "deploy/docker/grafana/dashboards/operator-health.json", // #O1
+    "deploy/docker/grafana/dashboards/data-lifecycle.json", // #O1
+    "deploy/docker/grafana/provisioning/alerting/alerts.yml", // #O1
+    "crates/storage/tests/operator_health_dashboard_guard.rs", // #O1
+    "deploy/docker/alertmanager/alertmanager.yml",       // #O2
+    "deploy/docker/prometheus/prometheus.yml",           // #O3
+    "deploy/docker/prometheus/rules/tickvault-alerts.yml", // #O3
 ];
 
 #[test]
