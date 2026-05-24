@@ -36,15 +36,16 @@ variable "instance_type" {
 }
 
 variable "ami_id" {
-  description = "Ubuntu 24.04 LTS ARM64 AMI for ap-south-1. t4g.medium is Graviton — arm64 is mandatory (amd64 will fail to boot)."
+  description = "Amazon Linux 2023 arm64 AMI for ap-south-1. t4g.medium is Graviton — arm64 is mandatory (x86_64 will fail to boot). AL2023 chosen 2026-05-24 over Ubuntu because CloudWatch agent + SSM agent + AWS CLI are pre-installed (no apt-get equivalents needed in user-data)."
   type        = string
   # Placeholder — operator replaces with the output of:
   #   aws ec2 describe-images \
   #     --region ap-south-1 \
-  #     --owners 099720109477 \
-  #     --filters 'Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*' \
+  #     --owners amazon \
+  #     --filters 'Name=name,Values=al2023-ami-2023.*-arm64' \
+  #               'Name=virtualization-type,Values=hvm' \
   #     --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text
-  default = "ami-placeholder-replace-me-arm64"
+  default = "ami-placeholder-replace-me-al2023-arm64"
 }
 
 variable "ebs_gp3_size_gb" {

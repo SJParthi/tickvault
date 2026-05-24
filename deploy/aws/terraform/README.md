@@ -7,7 +7,7 @@ per `.claude/rules/project/aws-budget.md` — **~₹1,022/mo** on `t4g.medium`
 ## What this creates
 
 - **1 VPC** (`10.42.0.0/16`) with 1 public subnet in ap-south-1a
-- **1 EC2 instance** — `t4g.medium` (ARM Graviton, 2 vCPU / 4 GiB) Ubuntu 24.04 LTS arm64, gp3 10GB root
+- **1 EC2 instance** — `t4g.medium` (ARM Graviton, 2 vCPU / 4 GiB) Amazon Linux 2023 arm64, gp3 10GB root
 - **1 Elastic IP** — static public IP (required for Dhan static-IP mandate, effective 2026-04-01; 7-day cooldown on modify — never release once registered)
 - **1 Security Group** — SSH from `operator_cidr`, no other inbound
 - **1 IAM role** — SSM get/put/delete (instance lock), SNS publish, CloudWatch write, S3 read/write to cold bucket
@@ -31,15 +31,18 @@ per `.claude/rules/project/aws-budget.md` — **~₹1,022/mo** on `t4g.medium`
      --query KeyMaterial --output text > ~/.ssh/tv-prod-key.pem
    chmod 400 ~/.ssh/tv-prod-key.pem
    ```
-4. **Find the latest Ubuntu 24.04 LTS arm64 AMI** in ap-south-1 (t4g is Graviton — arm64 mandatory):
+4. **Find the latest Amazon Linux 2023 arm64 AMI** in ap-south-1 (t4g is Graviton — arm64 mandatory):
    ```bash
    aws ec2 describe-images \
      --region ap-south-1 \
-     --owners 099720109477 \
-     --filters 'Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*' \
+     --owners amazon \
+     --filters 'Name=name,Values=al2023-ami-2023.*-arm64' \
+               'Name=virtualization-type,Values=hvm' \
      --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text
    ```
    Set the result as `TF_VAR_ami_id`.
+
+   **Why Amazon Linux 2023 (not Ubuntu)?** AL2023 ships with AWS CLI + amazon-ssm-agent + amazon-cloudwatch-agent **pre-installed**, so the user-data script skips ~30 lines of apt-get installs. ~30s faster cold boot at the daily 08:00 IST EventBridge start. ~150 MB more RAM headroom on the 4 GiB host. The Rust binary, Docker, and tickvault behaviour are byte-identical on either OS.
 5. **Find your public IP** and set `TF_VAR_operator_cidr`:
    ```bash
    export TF_VAR_operator_cidr="$(curl -s ifconfig.me)/32"
