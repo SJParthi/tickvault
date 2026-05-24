@@ -32,7 +32,7 @@ output "cold_bucket_name" {
 
 output "ssh_command" {
   description = "One-liner to SSH in after the instance is running"
-  value       = "ssh -i ~/.ssh/${var.key_name}.pem ubuntu@${aws_eip.tv_app.public_ip}"
+  value       = "ssh -i ~/.ssh/${var.key_name}.pem ec2-user@${aws_eip.tv_app.public_ip}"
 }
 
 output "ssm_session_command" {

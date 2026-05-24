@@ -22,9 +22,13 @@ Wants=network-online.target docker.service
 
 [Service]
 Type=notify
-# The app binary. Adjust path to match your deployment.
-ExecStart=/opt/tickvault/tickvault
-WorkingDirectory=/opt/dlt
+# Run as ec2-user (Amazon Linux 2023 default unprivileged account).
+# /opt/tickvault is chowned to ec2-user in the user-data script.
+User=ec2-user
+Group=ec2-user
+# The app binary, dropped by the deploy-aws GitHub Actions workflow.
+ExecStart=/opt/tickvault/bin/tickvault
+WorkingDirectory=/opt/tickvault
 
 # Auto-restart on ANY failure. RestartSec prevents tight restart loops.
 Restart=always

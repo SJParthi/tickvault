@@ -1,14 +1,28 @@
 #!/bin/bash
-# S7-Step2 / Phase 8.1: EC2 first-boot user-data script.
+# Amazon Linux 2023 first-boot user-data — t4g.medium arm64 (Graviton).
 #
-# Runs ONCE the first time the instance boots. Installs Docker, the
-# CloudWatch agent, clones the repo, sets up the systemd unit, AND
-# enables tickvault.service so every subsequent boot (triggered by
-# the EventBridge 8 AM IST cron) auto-starts the binary. The unit
-# is only *enabled* here, not started — the binary doesn't exist on
-# first boot. The GitHub Actions deploy-aws workflow drops the first
-# binary onto the instance, and from then on every EC2 start-stop
-# cycle controlled by EventBridge will auto-run tickvault.
+# AL2023 ships with the following PRE-INSTALLED (no install step needed):
+#   - AWS CLI v2
+#   - amazon-ssm-agent (for `aws ssm start-session` no-SSH access)
+#   - amazon-cloudwatch-agent (provides system metrics + log forwarding)
+#   - python3 + jq + curl + git
+#
+# AL2023 uses `dnf` (RHEL family). User account: `ec2-user` (NOT `ubuntu`).
+#
+# What this script does on first boot (runs once via cloud-init):
+#   1. Set timezone to Asia/Kolkata (operator convenience; app uses UTC internally)
+#   2. Install Docker via `dnf install docker docker-compose-plugin`
+#   3. Enable Docker daemon at boot
+#   4. Create /opt/tickvault/{config,data/spill,logs,bin}
+#   5. Clone the repo (shallow, main branch)
+#   6. Configure CloudWatch agent with the metrics + log scrape config
+#   7. Bring up the Docker stack (QuestDB only post-#O4)
+#   8. Install + ENABLE (not start) the systemd unit so every subsequent
+#      EC2 boot (EventBridge cron) auto-starts tickvault.
+#
+# The Rust binary itself is dropped onto the instance by the GitHub Actions
+# `deploy-aws` workflow AFTER user-data completes — first boot leaves the
+# unit dormant, second boot picks up the binary.
 
 set -euo pipefail
 
@@ -16,32 +30,21 @@ ENVIRONMENT="${environment}"
 REGION="${region}"
 
 exec > /var/log/tv-user-data.log 2>&1
-echo "=== dlt user-data starting at $(date -u) ==="
+echo "=== tickvault user-data starting at $(date -u) ==="
+echo "    target: AL2023 arm64 (Graviton), env=$${ENVIRONMENT}, region=$${REGION}"
 
-# System update + required packages
-apt-get update
-apt-get install -y \
-    ca-certificates curl gnupg lsb-release \
-    jq awscli unzip git systemd-timesyncd
-
-# Set system timezone to IST for operator convenience (app still uses UTC internally)
+# ---- Step 1: System update + timezone ----
+dnf update -y
 timedatectl set-timezone Asia/Kolkata
 
-# Install Docker via official convenience script (pinned to a specific release
-# channel — operator pins the exact version post-bootstrap)
-curl -fsSL https://get.docker.com | sh
+# ---- Step 2: Docker via dnf (AL2023 ships docker in the default repo) ----
+dnf install -y docker docker-compose-plugin git jq
 systemctl enable --now docker
-usermod -aG docker ubuntu
+usermod -aG docker ec2-user
 
-# Install Docker Compose v2 (plugin)
-apt-get install -y docker-compose-plugin
-
-# CloudWatch agent for system metrics + journald.
-# t4g.medium is ARM Graviton — arm64 .deb (amd64 will fail to install).
-curl -O https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/arm64/latest/amazon-cloudwatch-agent.deb
-dpkg -i amazon-cloudwatch-agent.deb
-rm amazon-cloudwatch-agent.deb
-
+# ---- Step 3: CloudWatch agent config (agent itself is pre-installed) ----
+# Inject the metrics + log config. The agent comes pre-installed but the
+# default config publishes nothing — we want disk%, mem%, cpu%, syslog.
 cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCFG
 {
   "agent": { "metrics_collection_interval": 60 },
@@ -60,8 +63,8 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCFG
       "files": {
         "collect_list": [
           {
-            "file_path": "/var/log/syslog",
-            "log_group_name": "/tickvault/\$${environment}/system",
+            "file_path": "/var/log/messages",
+            "log_group_name": "/tickvault/$${ENVIRONMENT}/system",
             "log_stream_name": "{instance_id}"
           }
         ]
@@ -71,34 +74,36 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCFG
 }
 CWCFG
 
-systemctl enable --now amazon-cloudwatch-agent
+# Apply the config + restart the agent.
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+    -a fetch-config \
+    -m ec2 \
+    -s \
+    -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
 
-# Create application directories
+# ---- Step 4: Create application directories ----
 mkdir -p /opt/tickvault/{config,data/spill,logs,bin}
-chown -R ubuntu:ubuntu /opt/tickvault
+chown -R ec2-user:ec2-user /opt/tickvault
 
-# Clone the repo (shallow, main branch)
-sudo -u ubuntu git clone --depth 1 \
+# ---- Step 5: Clone the repo (shallow, main branch) ----
+sudo -u ec2-user git clone --depth 1 \
     https://github.com/SJParthi/tickvault.git /opt/tickvault/repo
 
-# Start Docker Compose stack (QuestDB only — observability is CloudWatch).
-# `restart: unless-stopped` policy in docker-compose.yml ensures containers
-# come back up automatically after every EC2 stop/start cycle triggered by
-# the 8 AM / 5 PM IST EventBridge schedule — no manual intervention needed.
+# ---- Step 6: Start the Docker Compose stack ----
+# Post-CloudWatch-only migration (#O1/#O2/#O3/#O4): the stack is QuestDB
+# only. `restart: unless-stopped` ensures containers auto-come-up on every
+# EC2 start triggered by the 08:00/17:00 IST EventBridge schedule.
 cd /opt/tickvault/repo/deploy/docker
-sudo -u ubuntu docker compose up -d
+sudo -u ec2-user docker compose up -d
 
-# Install and ENABLE the systemd unit so tickvault auto-starts on every
-# subsequent EC2 boot. Without `enable`, a restart from EventBridge would
-# boot the instance but leave the binary dormant — exactly the "Docker
-# started but app didn't" failure mode the user called out.
+# ---- Step 7: Install + ENABLE the systemd unit ----
+# `enable` only — do NOT start the unit here. The binary doesn't exist yet
+# on first boot; the deploy-aws GitHub Actions workflow will scp it, and
+# subsequent EC2 starts will auto-start the service.
 cp /opt/tickvault/repo/deploy/systemd/tickvault.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable tickvault.service
-# NOTE: `enable` only — do NOT start the unit here. The binary doesn't
-# exist yet on first boot; the deploy-aws workflow will scp it, then
-# subsequent EC2 starts will auto-start the service.
 
 echo "=== tickvault user-data complete at $(date -u) ==="
 echo "Next step: GitHub Actions deploy-aws workflow will scp the first binary."
-echo "After that, every EC2 start (8 AM IST cron) will auto-launch tickvault."
+echo "After that, every EC2 start (08:00 IST cron) will auto-launch tickvault."

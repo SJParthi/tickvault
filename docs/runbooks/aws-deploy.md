@@ -188,7 +188,7 @@ curl https://api.dhan.co/v2/ip/getIP \
 ## Phase 6 — Smoke Test (~5 minutes)
 
 1. **Check Grafana is reachable**
-   - SSH port-forward: `ssh -L 3000:localhost:3000 -i ~/.ssh/tv-prod-key.pem ubuntu@$EIP`
+   - SSH port-forward: `ssh -L 3000:localhost:3000 -i ~/.ssh/tv-prod-key.pem ec2-user@$EIP`
    - Browse to http://localhost:3000 (admin/admin first login)
    - Verify the 4 dashboards load and show data
 2. **Verify Prometheus scrapes tv-app**
