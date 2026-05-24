@@ -49,7 +49,7 @@ data "aws_iam_policy_document" "claude_triage_permissions" {
       "ssm:ListCommandInvocations",
     ]
     resources = [
-      "arn:aws:ec2:${var.aws_region}:*:instance/${aws_instance.tv.id}",
+      "arn:aws:ec2:${var.aws_region}:*:instance/${aws_instance.tv_app.id}",
       "arn:aws:ssm:${var.aws_region}::document/AWS-RunShellScript",
     ]
   }
@@ -105,7 +105,7 @@ resource "aws_lambda_function" "claude_triage" {
 
   environment {
     variables = {
-      EC2_INSTANCE_ID        = aws_instance.tv.id
+      EC2_INSTANCE_ID        = aws_instance.tv_app.id
       TRIAGE_COMMAND_TIMEOUT = "180"
       CLAUDE_BINARY_PATH     = "/usr/local/bin/claude"
       TV_LOG_GROUP           = aws_cloudwatch_log_group.tv_app.name
