@@ -298,9 +298,10 @@ pub enum ErrorCode {
     // (`.claude/plans/active-plan-wave-5-indices-only.md` Items 4/5/6/9)
     // -----------------------------------------------------------------------
     /// `core_affinity::set_for_current` returned `false` for one or more of
-    /// the 4 Tokio workers at boot. Wave 5 Item 6 pins WS read loop, parser,
-    /// ILP writer, and "other" workers to vCPUs 0-3 on AWS c7i.xlarge (and
-    /// to the first 4 P-cores on dev Mac). A failed pin means the affected
+    /// the Tokio workers at boot. The t4g.medium 2-vCPU layout pins the WS
+    /// read loop to core 0; parser, ILP writer, and "other" workers share
+    /// core 1 (see `crates/app/src/core_pinning.rs`). A failed pin means the
+    /// affected
     /// worker can be preempted by other tasks, breaking the O(1) latency
     /// budget. Severity::High; the app continues without pinning so the
     /// operator can observe the gauge `tv_core_pinning_workers_pinned_total`.

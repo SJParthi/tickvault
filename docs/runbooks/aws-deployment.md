@@ -21,7 +21,7 @@ Use `docs/runbooks/aws-deploy.md` for first-time account setup.
 
 | Resource | Type | Spec | Notes |
 |---|---|---|---|
-| EC2 | `c7i.xlarge` (ARM equivalent: `c8g.xlarge`) | 4 vCPU, 8 GB RAM | On-demand pricing only; never reserved/spot |
+| EC2 | `t4g.medium` (ARM equivalent: `t4g.medium`) | 4 vCPU, 8 GB RAM | On-demand pricing only; never reserved/spot |
 | EBS root | gp3 | 30 GB | Host OS + Docker images |
 | EBS data | gp3 | 100 GB | QuestDB hot data (`/data` mount) |
 | Elastic IP | static IPv4 | 1 × | Required by Dhan static-IP enforcement (April 2026) |
@@ -58,7 +58,7 @@ deploy/aws/terraform/
 
 ## Day-2 operations
 
-### Scale the instance (c7i.xlarge → c7i.2xlarge)
+### Scale the instance (t4g.medium → t4g.medium)
 
 **Do NOT do this without explicit operator approval** — doubles EC2
 cost from ~₹4,981/mo to ~₹6,008/mo, blowing the budget. See
@@ -68,7 +68,7 @@ If approved:
 
 ```bash
 # 1. Edit terraform var
-echo 'instance_type = "c7i.2xlarge"' >> deploy/aws/terraform/terraform.tfvars
+echo 'instance_type = "t4g.medium"' >> deploy/aws/terraform/terraform.tfvars
 
 # 2. Plan + apply (CAUTION: this stops the instance for ~3 minutes)
 cd deploy/aws/terraform

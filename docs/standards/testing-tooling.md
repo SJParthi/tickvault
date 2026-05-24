@@ -29,7 +29,7 @@
 
 3. **CI cost does not justify the coverage.** Playwright needs a headless
    browser (Chromium), WebDriver, a display buffer, and ~1-2 GB of container
-   space. On our current c7i.xlarge AWS budget (`aws-budget.md`) that
+   space. On our current t4g.medium AWS budget (`aws-budget.md`) that
    overhead is real money for zero incremental defect catching.
 
 4. **Browser tests are flaky.** Timing-dependent assertions in a browser are

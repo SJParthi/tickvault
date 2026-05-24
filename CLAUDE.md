@@ -19,7 +19,7 @@ Every file, function, config decision must pass all three. No exceptions.
 - **Purpose:** O(1) latency live F&O trading system for Indian markets (NSE)
 - **Language:** Rust 2024 Edition (stable 1.95.0)
 - **Repo:** `https://github.com/SJParthi/tickvault` (single source of truth)
-- **Runtime:** Docker everywhere. Mac (dev) → AWS c7i.2xlarge Mumbai (prod). Same containers, same code, always real AWS SSM.
+- **Runtime:** Docker everywhere. Mac (dev) → AWS t4g.medium Mumbai (prod, operator-lock 2026-05-18 in `aws-budget.md`). Same containers, same code, always real AWS SSM.
 - **Owner:** Parthiban (architect). Claude Code (builder).
 
 ## SESSION PROTOCOL

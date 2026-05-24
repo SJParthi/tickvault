@@ -37,7 +37,7 @@
 //!    Any non-trivial degradation immediately scales the score below 1.
 //! 2. **Bench budget.** The hot path is six `f64::min(1.0, max(0.0, x))`
 //!    clamps and five multiplies — `bench_score_compute_le_1us` ratchets
-//!    p99 ≤ 1 µs (in practice ≤ 50 ns on c7i.xlarge).
+//!    p99 ≤ 1 µs (in practice ≤ 50 ns on t4g.medium).
 //! 3. **No NaN propagation.** Clamping eliminates `NaN * 0 = NaN`. The
 //!    `ZERO_FLOOR_FOR_CLASSIFY` constant guards against any rounding
 //!    edge that could otherwise compute a sub-zero score.

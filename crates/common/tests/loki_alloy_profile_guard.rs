@@ -1,5 +1,5 @@
 //! Phase 3 guard — Loki + Alloy must stay gated behind the `logs`
-//! compose profile so the default stack (c7i.xlarge 8GB RAM) is
+//! compose profile so the default stack (t4g.medium 4 GiB RAM) is
 //! unaffected.
 //!
 //! If someone accidentally removes `profiles: [logs]` from either

@@ -69,7 +69,7 @@ impl IndicatorEngine {
     ///
     /// # Performance
     /// O(1) — every indicator uses a recursive/incremental update.
-    /// Total: ~200ns on c7i.2xlarge (20 indicators, all O(1)).
+    /// Total: ~200ns on t4g.medium (20 indicators, all O(1)).
     ///
     /// # Safety (bounds)
     /// If `security_id >= MAX_INDICATOR_INSTRUMENTS`, returns a default snapshot.
