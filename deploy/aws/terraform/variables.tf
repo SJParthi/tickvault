@@ -25,36 +25,36 @@ variable "environment" {
 }
 
 variable "instance_type" {
-  description = "EC2 instance type. MUST be c7i.xlarge per the ₹5,000/mo budget cap."
+  description = "EC2 instance type. MUST be t4g.medium per operator lock 2026-05-18 (~₹1,022/mo, see aws-budget.md)."
   type        = string
-  default     = "c7i.xlarge"
+  default     = "t4g.medium"
 
   validation {
-    condition     = var.instance_type == "c7i.xlarge"
-    error_message = "Instance type is pinned to c7i.xlarge. Larger instances blow the ₹5,000/mo budget — see aws-budget.md."
+    condition     = var.instance_type == "t4g.medium"
+    error_message = "Instance type is pinned to t4g.medium per operator lock 2026-05-18. The 4-SID IDX_I universe + CloudWatch-only stack fits in 4 GiB. See aws-budget.md."
   }
 }
 
 variable "ami_id" {
-  description = "Ubuntu 24.04 LTS AMI ID for ap-south-1. Operator pins this via `scripts/aws-get-ami.sh`."
+  description = "Ubuntu 24.04 LTS ARM64 AMI for ap-south-1. t4g.medium is Graviton — arm64 is mandatory (amd64 will fail to boot)."
   type        = string
   # Placeholder — operator replaces with the output of:
   #   aws ec2 describe-images \
   #     --region ap-south-1 \
   #     --owners 099720109477 \
-  #     --filters 'Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*' \
+  #     --filters 'Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*' \
   #     --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text
-  default = "ami-placeholder-replace-me"
+  default = "ami-placeholder-replace-me-arm64"
 }
 
 variable "ebs_gp3_size_gb" {
-  description = "Root EBS volume size in GB. 100 per aws-budget.md hot-data tier."
+  description = "Root EBS volume size in GB. 10 per aws-budget.md (4-SID IDX_I dataset is tiny; partition manager prunes to S3)."
   type        = number
-  default     = 100
+  default     = 10
 
   validation {
-    condition     = var.ebs_gp3_size_gb <= 100
-    error_message = "EBS is capped at 100GB per the budget rule. Larger = S3 lifecycle tiering required first."
+    condition     = var.ebs_gp3_size_gb >= 10 && var.ebs_gp3_size_gb <= 30
+    error_message = "EBS is sized 10-30 GB for the 4-SID dataset per aws-budget.md operator-lock 2026-05-18. Larger needs S3 lifecycle tiering first."
   }
 }
 

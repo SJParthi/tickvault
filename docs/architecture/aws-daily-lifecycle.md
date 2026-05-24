@@ -146,7 +146,7 @@ Each case follows the same 7-field template:
 
 **Gap:** `main.tf:253-275` does NOT set `RetryPolicy` on the rules — must add.
 
-### Case C — EC2 capacity error (no c7i.xlarge in ap-south-1)
+### Case C — EC2 capacity error (no t4g.medium in ap-south-1)
 
 | Field | Value |
 |---|---|
@@ -239,7 +239,7 @@ Each case follows the same 7-field template:
 | Field | Value |
 |---|---|
 | Symptom | App was emitting logs, then suddenly silent. EC2 still running. |
-| Root cause | Boot-time peak memory exceeded c7i.xlarge 8GB envelope (e.g., rkyv cache deserialization spike) |
+| Root cause | Boot-time peak memory exceeded t4g.medium 8GB envelope (e.g., rkyv cache deserialization spike) |
 | Detection | Linux OOM-killer SIGKILLs PID. systemd notes Result=signal SIGKILL → restart. After 3 SIGKILLs → halt → boot-not-complete alarm |
 | Routing | Out-of-band (in-band silenced — process is dead) |
 | Auto-recovery | systemd 3-retry. Recovery only if the OOM was transient. |
@@ -445,11 +445,11 @@ These are inconsistent. The 30-min difference is operationally meaningful becaus
 
 ### Historical cost note (pre-2026-05-18)
 
-`aws-budget.md` shows the **₹4,981/mo budget** with c7i.xlarge + EBS + S3 + EIP + CloudWatch free tier + SNS + Data Transfer. The operator's prior-session claim of "<₹1K" is NOT in repo and would require:
+`aws-budget.md` shows the **₹4,981/mo budget** with t4g.medium + EBS + S3 + EIP + CloudWatch free tier + SNS + Data Transfer. The operator's prior-session claim of "<₹1K" is NOT in repo and would require:
 
 | Change | Saves | New monthly cost |
 |---|---|---|
-| Downsize c7i.xlarge → c7i.large | ₹1,765 | ~₹3,200 |
+| Downsize t4g.medium → c7i.large | ₹1,765 | ~₹3,200 |
 | Skip Saturday | ₹600 | ~₹4,400 |
 | Skip Saturday + Sunday | ₹1,200 | ~₹3,800 |
 | Spot instances (operator REJECTED earlier per aws-budget.md rule "on-demand only") | up to ₹2,000 | not in scope |

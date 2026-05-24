@@ -100,13 +100,25 @@ fn test_terraform_instance_type_pinned() {
     let content =
         std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/variables.tf"))
             .expect("variables.tf must be readable"); // APPROVED: test
+    // Operator-lock 2026-05-18 (aws-budget.md): t4g.medium ONLY.
+    // Any reintroduction of c7i.xlarge / c8g.xlarge / other instance types
+    // fails this test.
     assert!(
-        content.contains("\"c7i.xlarge\""),
-        "variables.tf must pin instance_type to c7i.xlarge (budget cap)"
+        content.contains("\"t4g.medium\""),
+        "variables.tf must pin instance_type to t4g.medium (operator lock 2026-05-18, see aws-budget.md)"
     );
     assert!(
-        content.contains("var.instance_type == \"c7i.xlarge\""),
+        content.contains("var.instance_type == \"t4g.medium\""),
         "variables.tf must VALIDATE instance_type pinning"
+    );
+    // Negative asserts — block the retired stack from ever returning.
+    assert!(
+        !content.contains("c7i.xlarge"),
+        "c7i.xlarge retired in operator-lock 2026-05-18"
+    );
+    assert!(
+        !content.contains("c8g.xlarge"),
+        "c8g.xlarge retired in operator-lock 2026-05-18"
     );
 }
 
@@ -114,25 +126,26 @@ fn test_terraform_instance_type_pinned() {
 fn test_terraform_eventbridge_schedules_match_budget() {
     let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
         .expect("main.tf must be readable"); // APPROVED: test
-    // Weekday start: 08:00 IST = 02:30 UTC Mon-Fri
+    // Daily start: 08:00 IST = 02:30 UTC Mon-Sun (operator-lock 2026-05-18
+    // Option A — 7-day availability for BRUTEX work).
     assert!(
-        content.contains("cron(30 2 ? * MON-FRI *)"),
-        "main.tf missing weekday start schedule (02:30 UTC Mon-Fri)"
+        content.contains("cron(30 2 * * ? *)"),
+        "main.tf missing daily start schedule (02:30 UTC every day)"
     );
-    // Weekday stop: 17:00 IST = 11:30 UTC Mon-Fri
+    // Daily stop: 17:00 IST = 11:30 UTC Mon-Sun.
     assert!(
-        content.contains("cron(30 11 ? * MON-FRI *)"),
-        "main.tf missing weekday stop schedule (11:30 UTC Mon-Fri)"
+        content.contains("cron(30 11 * * ? *)"),
+        "main.tf missing daily stop schedule (11:30 UTC every day)"
     );
-    // Weekend start: 08:00 IST = 02:30 UTC Sat-Sun
+    // Negative asserts — the 4-rule weekday/weekend split was consolidated
+    // to 2 daily rules per operator lock 2026-05-18.
     assert!(
-        content.contains("cron(30 2 ? * SAT-SUN *)"),
-        "main.tf missing weekend start schedule"
+        !content.contains("MON-FRI"),
+        "weekday-only schedule retired in operator-lock 2026-05-18"
     );
-    // Weekend stop: 13:00 IST = 07:30 UTC Sat-Sun
     assert!(
-        content.contains("cron(30 7 ? * SAT-SUN *)"),
-        "main.tf missing weekend stop schedule"
+        !content.contains("SAT-SUN"),
+        "weekend-only schedule retired in operator-lock 2026-05-18"
     );
 }
 

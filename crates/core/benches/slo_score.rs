@@ -4,7 +4,7 @@
 //! Hot-path budget: ≤ 1 µs per call (tracked in
 //! `quality/benchmark-budgets.toml` as `slo_score_evaluate`). In
 //! practice the evaluator is six clamps + five multiplies + a 6-way
-//! min-scan, so p99 lands ≤ 50 ns on c7i.xlarge — the 1 µs budget is
+//! min-scan, so p99 lands ≤ 50 ns on t4g.medium — the 1 µs budget is
 //! the SCOPE-mandated ceiling, not a tight bound.
 //!
 //! Run: `cargo bench --bench slo_score -p tickvault-core`

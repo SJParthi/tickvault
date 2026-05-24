@@ -12,7 +12,7 @@
 
 ## Why this happens
 
-Boot-time peak memory exceeded the c7i.xlarge 8GB envelope. Likely causes:
+Boot-time peak memory exceeded the t4g.medium 8GB envelope. Likely causes:
 
 1. rkyv binary cache deserialization spike during universe load.
 2. Bug introduced that allocates a large vector at boot.
@@ -44,7 +44,7 @@ Per `aws-budget.md` rule 11, host headroom floor is 2GB. If actual headroom < 2G
 | Action | Effect |
 |---|---|
 | Stop a non-essential container (e.g. Prometheus during boot) | frees 384MB |
-| Resize to c7i.2xlarge (16GB RAM) | doubles EC2 cost — operator decision |
+| Resize to t4g.medium (16GB RAM) | doubles EC2 cost — operator decision |
 | Trim tickvault working set | requires code change |
 
 ## Acceptance criteria

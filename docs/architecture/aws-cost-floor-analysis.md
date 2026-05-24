@@ -33,7 +33,7 @@
 | Invariant | Source | Min cost it forces |
 |---|---|---|
 | Static IP, registered with Dhan, 24/7 | Dhan static-IP mandate effective 2026-04-01 (auth.md rule 7) | EIP ~₹152/mo (charged when associated AND when instance stopped) |
-| Host memory ≥ 8GB | aws-budget.md rule 6 (sum of QuestDB 1.5GB + App 2GB + headroom 2GB + etc) | smallest instance: c7i.large or c8g.xlarge — both 8GB |
+| Host memory ≥ 8GB | aws-budget.md rule 6 (sum of QuestDB 1.5GB + App 2GB + headroom 2GB + etc) | smallest instance: c7i.large or t4g.medium — both 8GB |
 | SEBI 5-year retention of audit tables | charter §H, aws-budget.md rule "S3 lifecycle policy is MANDATORY" | S3 cold storage growing to ~₹150/mo at year 5 |
 | EBS for hot data (last 14-30 days) | aws-budget.md rule "EBS gp3, 100GB" | At minimum 50GB = ₹387; at 30GB = ₹232 |
 | CloudWatch monitoring + alarms | aws-budget.md rule 4 "MANDATORY and always enabled" | Within free tier — ₹0 if disciplined |
@@ -57,14 +57,14 @@ This is the cost just for the *envelope* — no EC2 hours included yet.
 
 ## §2. The compute cost surface
 
-c7i.large (~₹650/mo) vs c8g.xlarge (~₹1,010/mo) vs c7i.xlarge (~₹4,137/mo) at full 9hr × 22 weekdays + 5hr × 8 weekends:
+c7i.large (~₹650/mo) vs t4g.medium (~₹1,010/mo) vs t4g.medium (~₹4,137/mo) at full 9hr × 22 weekdays + 5hr × 8 weekends:
 
 | Instance | vCPU | RAM | $/hr | ₹/hr | Full schedule ₹/mo | Notes |
 |---|---|---|---|---|---|---|
 | c7i.large | 2 | 4GB | 0.0893 | 7.59 | ₹2,069 | **Fails 8GB memory budget per aws-budget.md** |
-| c7i.xlarge | 4 | 8GB | 0.1785 | 15.17 | ₹4,137 | Current `aws-budget.md` baseline |
+| t4g.medium | 4 | 8GB | 0.1785 | 15.17 | ₹4,137 | Current `aws-budget.md` baseline |
 | c8g.large | 2 | 4GB | 0.0795 | 6.76 | ₹1,842 | ARM, **fails memory budget** |
-| c8g.xlarge | 4 | 8GB | 0.159 | 13.52 | ₹3,687 | ARM, satisfies memory budget. ~12% cheaper than c7i.xlarge |
+| t4g.medium | 4 | 8GB | 0.159 | 13.52 | ₹3,687 | ARM, satisfies memory budget. ~12% cheaper than t4g.medium |
 | t3a.medium | 2 | 4GB | 0.0376 | 3.20 | ₹873 | **Burstable, fails memory budget, CPU credits unreliable for sustained load** |
 | t4g.large | 2 | 8GB | 0.0672 | 5.71 | ₹1,557 | ARM, 8GB, **burstable** — credits exhaust under WS+QuestDB+5 ILP flush bursts |
 | t4g.xlarge | 4 | 16GB | 0.1344 | 11.42 | ₹3,114 | ARM, 16GB, **burstable** — same credit issue but larger baseline |
@@ -73,7 +73,7 @@ Three observations:
 
 1. **Any instance < 8GB RAM fails aws-budget.md rule 6.** That eliminates c7i.large, c8g.large, t3a.medium.
 2. **Burstable t-series violate the hot-path latency invariant.** Tick processing at 5K ticks/sec with QuestDB ILP flush bursts drains CPU credits in minutes; once depleted, the instance falls to baseline ~10-20% CPU which causes Phase 2 dispatch (09:13 IST) to miss its window.
-3. **c8g.xlarge (ARM) is ~12% cheaper than c7i.xlarge for the same RAM.** ARM is a real option IF all our Rust crates compile cleanly for aarch64 (they do — `cargo build --target aarch64-unknown-linux-gnu` is verified by CI). This is a free saving with no envelope break.
+3. **t4g.medium (ARM) is ~12% cheaper than t4g.medium for the same RAM.** ARM is a real option IF all our Rust crates compile cleanly for aarch64 (they do — `cargo build --target aarch64-unknown-linux-gnu` is verified by CI). This is a free saving with no envelope break.
 
 ---
 
@@ -81,9 +81,9 @@ Three observations:
 
 | # | Lever | Saves/mo | Architectural compromise | Operator-acceptable? |
 |---|---|---|---|---|
-| 1 | c7i.xlarge → c8g.xlarge (ARM) | ₹450 | None — same RAM, same vCPU | YES (free win) |
+| 1 | t4g.medium → t4g.medium (ARM) | ₹450 | None — same RAM, same vCPU | YES (free win) |
 | 2 | Skip weekends entirely | ₹607 | Operator does manual start on weekend prep days | YES if operator agrees |
-| 3 | Reduce daily hours 9hr → 4hr (10:00–14:00 IST market core) | ₹2,300 (from c8g.xlarge baseline) | Loses pre-market prep window (Phase 1 boot needs to be < 4 min into market hours, very tight); loses post-market historical fetch (15:30 onwards) | NO — breaks Phase 2 + post-market cross-verify |
+| 3 | Reduce daily hours 9hr → 4hr (10:00–14:00 IST market core) | ₹2,300 (from t4g.medium baseline) | Loses pre-market prep window (Phase 1 boot needs to be < 4 min into market hours, very tight); loses post-market historical fetch (15:30 onwards) | NO — breaks Phase 2 + post-market cross-verify |
 | 4 | Reduce daily hours 9hr → 6hr (08:00–14:00) | ₹1,000 | Loses post-market historical fetch (15:30–17:00) | NO — breaks post-market 1m fetch per Wave 6 plan |
 | 5 | EBS 100GB → 30GB | ₹540 | Tighter hot-window; requires faster S3 lifecycle (14 days vs 30 days to cold) | YES, marginal |
 | 6 | Drop Elastic IP (EIP), use ephemeral on each start | ₹152 | **BLOCKED — Dhan static IP mandate** | NO — order APIs reject |
@@ -91,10 +91,10 @@ Three observations:
 
 ### Best legitimate AWS-only combo
 
-c8g.xlarge + skip weekends + EBS 30GB:
+t4g.medium + skip weekends + EBS 30GB:
 
 ```
-c8g.xlarge weekday 9hr × 22 days  ₹2,676
+t4g.medium weekday 9hr × 22 days  ₹2,676
 EIP                               ₹152
 EBS 30GB                          ₹232
 S3 cold                           ₹150  (year-5 worst case)
@@ -108,10 +108,10 @@ Down from ₹4,981 → ₹3,320 (33% saving). **Still 3.3× over the ₹1K targe
 
 ### Aggressive AWS-only combo (breaks Wave 6 post-market fetch)
 
-c8g.xlarge + weekday only + 5hr/day + EBS 30GB:
+t4g.medium + weekday only + 5hr/day + EBS 30GB:
 
 ```
-c8g.xlarge weekday 5hr × 22 days  ₹1,487
+t4g.medium weekday 5hr × 22 days  ₹1,487
 EIP                               ₹152
 EBS 30GB                          ₹232
 S3 cold (year 1)                  ₹50
@@ -196,8 +196,8 @@ Per SEBI circular SEBI/HO/MIRSD/DOP/CIR/P/2018/153 (and subsequent updates), bro
 
 | Path | Monthly cost | Pros | Cons | Sub-₹1K? |
 |---|---|---|---|---|
-| Current AWS (c7i.xlarge full schedule) | ₹4,981 | matches aws-budget.md baseline | 5x over target | NO |
-| Best AWS legitimate (c8g.xlarge + skip weekends + EBS 30GB) | ₹3,320 | All invariants honored | Still 3.3x over | NO |
+| Current AWS (t4g.medium full schedule) | ₹4,981 | matches aws-budget.md baseline | 5x over target | NO |
+| Best AWS legitimate (t4g.medium + skip weekends + EBS 30GB) | ₹3,320 | All invariants honored | Still 3.3x over | NO |
 | Aggressive AWS (5hr/day) | ₹2,031 | Closer | Breaks Wave 6 post-market fetch | NO |
 | Theoretical AWS (t4g.large + 4hr/day) | ₹895 | Sub-₹1K | Breaks 4 invariants — not viable | NO (invariants) |
 | Contabo VPS + AWS S3 hybrid | ₹744 | Sub-₹1K | New ops infra, migration effort, lower reliability | YES (with cost) |
@@ -212,8 +212,8 @@ Per SEBI circular SEBI/HO/MIRSD/DOP/CIR/P/2018/153 (and subsequent updates), bro
 
 | Choice | What we ship | What operator accepts |
 |---|---|---|
-| **A** — Drop to ₹3.3K/mo on AWS | Switch to c8g.xlarge, skip weekends auto-start, EBS 30GB | 33% saving from current; weekend manual start; tighter hot-window |
-| **B** — Drop to ~₹2K/mo on AWS, accept some break | c8g.xlarge + 5hr/day + skip weekends | Breaks Wave 6 post-market fetch — operator must manually re-run cross-verify next morning |
+| **A** — Drop to ₹3.3K/mo on AWS | Switch to t4g.medium, skip weekends auto-start, EBS 30GB | 33% saving from current; weekend manual start; tighter hot-window |
+| **B** — Drop to ~₹2K/mo on AWS, accept some break | t4g.medium + 5hr/day + skip weekends | Breaks Wave 6 post-market fetch — operator must manually re-run cross-verify next morning |
 | **C** — Sub-₹1K via Contabo migration | 6-8 week migration project to Contabo VPS Mumbai/SG + S3 for SEBI | New ops surface; lower SLA; need to rebuild monitoring/alerting |
 | **D** — Accept ₹4-5K AWS as the honest floor | Keep current aws-budget.md as-is | The <₹1K target was aspirational — revise it |
 
@@ -224,7 +224,7 @@ Honest framing per operator-charter §F: I cannot ship "<₹1K on AWS" because t
 ## §7. Decisions pending operator lock
 
 - [ ] **LOCK-2-FINAL:** Pick A, B, C, or D from §6 above.
-- [ ] If A or B: confirm c7i.xlarge → c8g.xlarge ARM swap (verify Rust binary builds via CI).
+- [ ] If A or B: confirm t4g.medium → t4g.medium ARM swap (verify Rust binary builds via CI).
 - [ ] If A or B: confirm "skip weekend auto-start" — operator OK with manual `aws ec2 start-instances` on weekend prep days?
 - [ ] If B: confirm operator accepts that Wave 6 post-market fetch + cross-verify runs the NEXT morning instead of same-day evening.
 - [ ] If C: open a separate plan `.claude/plans/contabo-migration/` — out of scope of `aws-lifecycle` plan.

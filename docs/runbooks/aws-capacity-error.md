@@ -12,7 +12,7 @@
 
 ## Why this happens
 
-AWS ap-south-1 has a finite hardware pool per AZ per instance type. On busy mornings, c7i.xlarge in `ap-south-1a` may be temporarily exhausted. AWS does not guarantee single-AZ capacity.
+AWS ap-south-1 has a finite hardware pool per AZ per instance type. On busy mornings, t4g.medium in `ap-south-1a` may be temporarily exhausted. AWS does not guarantee single-AZ capacity.
 
 ## Immediate actions
 
@@ -46,6 +46,6 @@ NOT recommended live. Document in case of all-AZ exhaustion (extremely rare).
 
 ## Post-incident
 
-- Operator decision: keep c7i.large running for the day, OR stop + revert + restart on c7i.xlarge tomorrow.
+- Operator decision: keep c7i.large running for the day, OR stop + revert + restart on t4g.medium tomorrow.
 - File Item AWS-11 plan to implement multi-AZ fallback SSM Automation.
 - Honest envelope: AWS does not guarantee against this; accept periodic occurrence.

@@ -10,7 +10,7 @@
 
 [graph]
 targets = [
-    "x86_64-unknown-linux-gnu",    # AWS EC2 c7i.2xlarge (production)
+    "aarch64-unknown-linux-gnu",   # AWS EC2 t4g.medium (production — Graviton ARM, operator-lock 2026-05-18)
     "aarch64-apple-darwin",         # MacBook Pro M4 Pro (development)
 ]
 all-features = true

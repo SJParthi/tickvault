@@ -7,7 +7,7 @@
 //!   3. Dhan binary ticker packet dispatch via `dispatch_frame`
 //!
 //! Budget (`quality/benchmark-budgets.toml::ws_reader_frame_handle_ns`):
-//!   < 100 ns/op on c7i.2xlarge. 5 % regression = CI hard fail.
+//!   < 100 ns/op on t4g.medium. 5 % regression = CI hard fail.
 //!
 //! Rationale: the plan (P1.2 + P3.1 + P7.6) requires the read loop to
 //! stay O(1) and never block on downstream. These three operations are
