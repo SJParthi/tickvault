@@ -13,17 +13,19 @@ terraform {
     }
   }
 
-  # Remote state stored in S3 after first apply.
-  # Uncomment and fill in after running `terraform init` with local state,
-  # creating the bucket, then migrating with `terraform init -migrate-state`.
-  #
-  # backend "s3" {
-  #   bucket         = "tv-terraform-state-<your-account-id>"
-  #   key            = "dlt/prod/terraform.tfstate"
-  #   region         = "ap-south-1"
-  #   encrypt        = true
-  #   dynamodb_table = "tv-terraform-locks"
-  # }
+  # Remote state stored in S3, locked via DynamoDB. Bucket name is
+  # injected at `terraform init` time via `-backend-config="bucket=..."`
+  # (see .github/workflows/terraform-apply.yml) so the account-specific
+  # bucket name doesn't have to live in the repo. The
+  # scripts/aws-bootstrap-state-backend.sh script auto-creates the bucket
+  # + DynamoDB lock table idempotently before init runs.
+  backend "s3" {
+    key            = "dlt/prod/terraform.tfstate"
+    region         = "ap-south-1"
+    encrypt        = true
+    dynamodb_table = "tv-terraform-locks"
+    # bucket = "tv-terraform-state-<account-id>" — injected via -backend-config
+  }
 }
 
 provider "aws" {

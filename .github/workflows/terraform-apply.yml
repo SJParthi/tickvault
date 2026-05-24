@@ -1,0 +1,326 @@
+# terraform-apply.yml — auto-fire `terraform apply` when AWS infra changes land on main.
+#
+# Why this exists (operator-charter-forever.md §C "100% no manual inputs"):
+#   Before this workflow, every infra change required the operator to type
+#   `terraform apply` on their Mac. The charter forbids manual typing. This
+#   workflow closes that gap: on push to main when `deploy/aws/terraform/**`
+#   changes, GitHub Actions runs `terraform plan` (always) + `terraform apply`
+#   (only on main push, only outside market hours). Outputs go to Telegram
+#   via existing SNS routing.
+#
+# Triggers:
+#   - Pull request → `terraform plan` only (safe review)
+#   - Push to main with infra path filter → plan + apply (fully automated)
+#   - workflow_dispatch → on-demand operator override (e.g. emergency apply)
+#
+# Auth precedence (try in order):
+#   1. OIDC role via secrets.AWS_TERRAFORM_ROLE_ARN (preferred, set after first run)
+#   2. Long-lived keys via secrets.AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY
+#      (bootstrap only — delete after first successful OIDC run)
+#
+# Concurrency: serial — never two terraform apply at once. DynamoDB lock
+# provides a second layer of defense.
+
+name: terraform-apply
+
+on:
+  pull_request:
+    paths:
+      - 'deploy/aws/terraform/**'
+      - '.github/workflows/terraform-apply.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/aws/terraform/**'
+      - '.github/workflows/terraform-apply.yml'
+  workflow_dispatch:
+    inputs:
+      confirm_market_hours:
+        description: 'Apply during market hours? Type "yes" to override the guard.'
+        required: false
+        default: 'no'
+      skip_apply:
+        description: 'Plan only, skip apply even on main. Type "yes" to skip.'
+        required: false
+        default: 'no'
+
+concurrency:
+  group: terraform-apply-prod
+  cancel-in-progress: false # never interrupt a running apply
+
+permissions:
+  id-token: write   # OIDC for AWS role assumption
+  contents: read
+  pull-requests: write # so plan output can be posted as PR comment
+
+env:
+  TF_VAR_aws_region: ap-south-1
+  TF_VAR_operator_cidr: "0.0.0.0/0" # CI runs from GH IPs; SSH SG is locked by separate operator override
+  TF_VAR_operator_email: "sjparthi93@gmail.com" # registered alert destination
+  TF_VAR_ami_id: ami-0fa0340d4a8bdd6ee
+  AWS_REGION: ap-south-1
+  TF_DIR: deploy/aws/terraform
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────
+  # Job 0: preflight — check whether bootstrap secrets exist.
+  #
+  # The operator-charter one-time bootstrap (BOOTSTRAP-ONE-TIME.md) is
+  # mathematically required by AWS IAM: a third party (GitHub Actions)
+  # cannot self-authorize. Until the operator pastes either
+  # AWS_TERRAFORM_ROLE_ARN (OIDC, preferred) or AWS_ACCESS_KEY_ID +
+  # AWS_SECRET_ACCESS_KEY (bootstrap), this workflow CANNOT talk to AWS.
+  #
+  # Pre-bootstrap state: this job exits 0 with a friendly skip message,
+  # downstream jobs do not run, the PR check passes. Post-bootstrap:
+  # downstream jobs activate automatically — no workflow edit needed.
+  # ─────────────────────────────────────────────────────────────────
+  preflight:
+    name: Preflight — check bootstrap secrets
+    runs-on: ubuntu-24.04
+    outputs:
+      bootstrap_ready: ${{ steps.check.outputs.bootstrap_ready }}
+    steps:
+      - name: Check whether AWS bootstrap secrets are configured
+        id: check
+        env:
+          OIDC_ROLE: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          ACCESS_KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        run: |
+          if [ -n "${OIDC_ROLE}" ] || [ -n "${ACCESS_KEY}" ]; then
+            echo "bootstrap_ready=true" >> $GITHUB_OUTPUT
+            echo "✅ Bootstrap secrets present — terraform plan + apply will run."
+          else
+            echo "bootstrap_ready=false" >> $GITHUB_OUTPUT
+            echo "::notice::AWS bootstrap secrets not yet configured — skipping terraform plan + apply."
+            echo "::notice::Follow deploy/aws/terraform/BOOTSTRAP-ONE-TIME.md (40 sec) to enable automation."
+            echo ""
+            echo "Skipped jobs: terraform-plan, guard-market-hours, terraform-apply, notify."
+            echo "This is the EXPECTED state for a fresh repo. Workflow exits 0."
+          fi
+
+  # ─────────────────────────────────────────────────────────────────
+  # Job 1: terraform plan — runs on EVERY trigger (post-bootstrap), gates Job 2
+  # ─────────────────────────────────────────────────────────────────
+  terraform-plan:
+    name: Terraform plan
+    runs-on: ubuntu-24.04
+    needs: preflight
+    if: needs.preflight.outputs.bootstrap_ready == 'true'
+    outputs:
+      plan_exitcode: ${{ steps.plan.outputs.exitcode }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (OIDC if available, else access keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: tv-github-terraform-plan-${{ github.run_id }}
+
+      - name: Resolve AWS account id
+        id: aws_account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "account_id=${ACCOUNT_ID}" >> $GITHUB_OUTPUT
+          echo "Using AWS account ${ACCOUNT_ID}"
+
+      - name: Bootstrap S3 state backend + DynamoDB lock (idempotent)
+        run: bash scripts/aws-bootstrap-state-backend.sh "${{ steps.aws_account.outputs.account_id }}" "${{ env.AWS_REGION }}"
+
+      - name: terraform fmt -check
+        run: terraform -chdir=${{ env.TF_DIR }} fmt -check -recursive
+
+      - name: terraform init (with S3 backend)
+        run: |
+          terraform -chdir=${{ env.TF_DIR }} init \
+            -backend-config="bucket=tv-terraform-state-${{ steps.aws_account.outputs.account_id }}" \
+            -backend-config="key=dlt/prod/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=tv-terraform-locks" \
+            -backend-config="encrypt=true"
+
+      - name: terraform validate
+        run: terraform -chdir=${{ env.TF_DIR }} validate
+
+      - name: terraform plan
+        id: plan
+        run: |
+          set +e
+          terraform -chdir=${{ env.TF_DIR }} plan -detailed-exitcode -no-color -out=tfplan
+          EXIT_CODE=$?
+          echo "exitcode=${EXIT_CODE}" >> $GITHUB_OUTPUT
+          # 0 = no changes, 1 = error, 2 = changes pending
+          if [ "${EXIT_CODE}" -eq 1 ]; then
+            echo "::error::terraform plan failed"
+            exit 1
+          fi
+          echo "Plan exit code: ${EXIT_CODE} (0=no-changes, 2=changes-pending)"
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ github.sha }}
+          path: ${{ env.TF_DIR }}/tfplan
+          retention-days: 7
+
+      - name: Post plan summary on PR
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "Plan exit code: ${{ steps.plan.outputs.exitcode }} (0=no-changes, 2=changes-pending)"
+          # PR comment posting could be wired here via gh CLI; left as TODO
+          # to avoid pulling in an extra action. Plan output is in the job log.
+
+  # ─────────────────────────────────────────────────────────────────
+  # Job 2: market-hours guard — blocks apply during 09:15-15:30 IST Mon-Fri
+  # ─────────────────────────────────────────────────────────────────
+  guard-market-hours:
+    name: Market-hours guard
+    runs-on: ubuntu-24.04
+    needs: [preflight, terraform-plan]
+    if: needs.preflight.outputs.bootstrap_ready == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    steps:
+      - name: Check current IST time against market window
+        run: |
+          # 09:15-15:30 IST = 03:45-10:00 UTC.
+          UTC_HOUR=$(date -u +%H)
+          UTC_MINUTE=$(date -u +%M)
+          UTC_DOW=$(date -u +%u)  # 1=Mon, 7=Sun
+          UTC_TIME_NUM=$((10#$UTC_HOUR * 100 + 10#$UTC_MINUTE))
+
+          echo "UTC time: $UTC_HOUR:$UTC_MINUTE (day $UTC_DOW), numeric $UTC_TIME_NUM"
+
+          if [ "$UTC_DOW" -le 5 ] && [ "$UTC_TIME_NUM" -ge 345 ] && [ "$UTC_TIME_NUM" -lt 1000 ]; then
+            if [ "${{ github.event.inputs.confirm_market_hours }}" = "yes" ]; then
+              echo "WARNING: applying infra changes during market hours with explicit override"
+            else
+              echo "::error::BLOCK: applying infra changes during 09:15-15:30 IST is forbidden."
+              echo "Re-run via workflow_dispatch with confirm_market_hours=yes if this is a critical fix."
+              exit 1
+            fi
+          else
+            echo "OK: outside market hours, apply can proceed"
+          fi
+
+  # ─────────────────────────────────────────────────────────────────
+  # Job 3: terraform apply — only on push to main or workflow_dispatch
+  # ─────────────────────────────────────────────────────────────────
+  terraform-apply:
+    name: Terraform apply
+    runs-on: ubuntu-24.04
+    needs: [preflight, terraform-plan, guard-market-hours]
+    if: |
+      needs.preflight.outputs.bootstrap_ready == 'true' && (
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.skip_apply != 'yes')
+      )
+    environment: prod
+    outputs:
+      instance_id: ${{ steps.outputs.outputs.instance_id }}
+      elastic_ip: ${{ steps.outputs.outputs.elastic_ip }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (OIDC if available, else access keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: tv-github-terraform-apply-${{ github.run_id }}
+
+      - name: Resolve AWS account id
+        id: aws_account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "account_id=${ACCOUNT_ID}" >> $GITHUB_OUTPUT
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan-${{ github.sha }}
+          path: ${{ env.TF_DIR }}/
+
+      - name: terraform init (with S3 backend)
+        run: |
+          terraform -chdir=${{ env.TF_DIR }} init \
+            -backend-config="bucket=tv-terraform-state-${{ steps.aws_account.outputs.account_id }}" \
+            -backend-config="key=dlt/prod/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=tv-terraform-locks" \
+            -backend-config="encrypt=true"
+
+      - name: terraform apply tfplan
+        run: terraform -chdir=${{ env.TF_DIR }} apply -auto-approve -no-color tfplan
+
+      - name: Capture outputs
+        id: outputs
+        run: |
+          INSTANCE_ID=$(terraform -chdir=${{ env.TF_DIR }} output -raw instance_id 2>/dev/null || echo "")
+          EIP=$(terraform -chdir=${{ env.TF_DIR }} output -raw elastic_ip 2>/dev/null || echo "")
+          BUDGET=$(terraform -chdir=${{ env.TF_DIR }} output -raw monthly_budget_name 2>/dev/null || echo "")
+          echo "instance_id=${INSTANCE_ID}" >> $GITHUB_OUTPUT
+          echo "elastic_ip=${EIP}" >> $GITHUB_OUTPUT
+          echo "monthly_budget_name=${BUDGET}" >> $GITHUB_OUTPUT
+          echo "INSTANCE_ID=${INSTANCE_ID}"
+          echo "ELASTIC_IP=${EIP}"
+
+  # ─────────────────────────────────────────────────────────────────
+  # Job 4: notify Telegram (via SNS) — success + failure paths
+  # ─────────────────────────────────────────────────────────────────
+  notify:
+    name: Notify Telegram via SNS
+    runs-on: ubuntu-24.04
+    needs: [preflight, terraform-plan, terraform-apply]
+    if: always() && needs.preflight.outputs.bootstrap_ready == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    steps:
+      - name: Configure AWS credentials (OIDC if available, else access keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: tv-github-terraform-notify-${{ github.run_id }}
+
+      - name: Resolve account id
+        id: aws_account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "account_id=${ACCOUNT_ID}" >> $GITHUB_OUTPUT
+
+      - name: Notify on success
+        if: needs.terraform-apply.result == 'success'
+        run: |
+          aws sns publish \
+            --region ${{ env.AWS_REGION }} \
+            --topic-arn "arn:aws:sns:${{ env.AWS_REGION }}:${{ steps.aws_account.outputs.account_id }}:tv-prod-alerts" \
+            --subject "Terraform apply OK" \
+            --message "commit=${{ github.sha }} actor=${{ github.actor }} instance_id=${{ needs.terraform-apply.outputs.instance_id }} elastic_ip=${{ needs.terraform-apply.outputs.elastic_ip }} run=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Notify on failure
+        if: needs.terraform-apply.result == 'failure' || needs.terraform-plan.result == 'failure'
+        run: |
+          aws sns publish \
+            --region ${{ env.AWS_REGION }} \
+            --topic-arn "arn:aws:sns:${{ env.AWS_REGION }}:${{ steps.aws_account.outputs.account_id }}:tv-prod-alerts" \
+            --subject "Terraform apply FAILED" \
+            --message "commit=${{ github.sha }} actor=${{ github.actor }} plan=${{ needs.terraform-plan.result }} apply=${{ needs.terraform-apply.result }} run=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
