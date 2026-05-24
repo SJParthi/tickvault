@@ -71,11 +71,10 @@ echo ""
 echo -e "${CYAN}Waiting for containers to become healthy...${NC}"
 REQUIRED_CONTAINERS=(
     "tv-questdb"
-    "tv-valkey"
     # Wave 7-A removed: tv-traefik (AWS ALB free tier), tv-valkey-exporter
     # (not queried), tv-loki + tv-alloy + tv-jaeger (CloudWatch Logs).
-    # CloudWatch-only migration (#O1/#O2/#O3): tv-grafana, tv-alertmanager,
-    # tv-prometheus retired in favour of CloudWatch metrics + alarms.
+    # CloudWatch-only migration: tv-grafana (#O1), tv-alertmanager (#O2),
+    # tv-prometheus (#O3), tv-valkey (#O4) retired.
 )
 
 MAX_WAIT=90

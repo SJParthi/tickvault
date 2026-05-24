@@ -102,11 +102,6 @@ http_port = 9000
 pg_port = 8812
 ilp_port = 9009
 
-[valkey]
-host = "tv-valkey"
-port = 6379
-max_connections = 16
-
 [prometheus]
 host = "tv-prometheus"
 port = 9090

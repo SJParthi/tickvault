@@ -10,16 +10,21 @@
 #![cfg_attr(test, allow(clippy::assertions_on_constants))]
 #![allow(missing_docs)] // TODO: enforce after adding docs to all public items
 
-//! Data persistence layer — QuestDB for time-series, Valkey for caching.
+//! Data persistence layer — QuestDB for time-series.
 //!
 //! # Modules
 //! - `instrument_persistence` — daily instrument snapshot to QuestDB (Block 01.1)
 //! - `tick_persistence` — batched ILP writer for live ticks
 //! - `candle_persistence` — 1-minute candle persistence from historical fetch
-//! - `valkey_cache` — deadpool-redis async connection pool with typed helpers
 //!
 //! # Boot Sequence Position
-//! OMS -> **QuestDB -> Valkey** -> HTTP API
+//! OMS -> **QuestDB** -> HTTP API
+//!
+//! Note: the legacy Valkey cache layer was deleted in #O4 (2026-05-24).
+//! The dual-instance lock moved to AWS SSM Parameter Store in PR #764;
+//! the file-based token cache (`crates/core/src/auth/token_cache.rs`)
+//! covers crash-restart speed. No remaining production caller needs an
+//! in-memory KV store.
 
 /// Wave 2 — global QuestDB config handle so any module (e.g.,
 /// `connection.rs` reconnect-success) can emit audit rows without
@@ -100,7 +105,8 @@ pub mod shadow_persistence;
 pub mod shadow_seal_columns;
 pub mod tick_persistence;
 pub mod tick_spill_drain;
-pub mod valkey_cache;
+// `valkey_cache` module DELETED in #O4 (2026-05-24) — no production caller
+// remained after PR #764 migrated the dual-instance lock to SSM.
 pub mod ws_frame_spill;
 
 /// Test support: re-exports internal functions for DHAT and benchmark tests.
@@ -175,142 +181,5 @@ mod tests {
     #[test]
     fn test_f32_to_f64_clean_pub_negative() {
         assert_eq!(f32_to_f64_clean_pub(-100.5), -100.5);
-    }
-
-    // -----------------------------------------------------------------------
-    // Cache helper function tests (exercised outside valkey_cache module
-    // so they are NOT skipped by `--skip valkey`)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_cache_instrument_key_format() {
-        let key = crate::valkey_cache::build_instrument_cache_key("universe");
-        assert_eq!(key, "dlt:instrument:universe");
-    }
-
-    #[test]
-    fn test_cache_instrument_key_csv_hash() {
-        let key = crate::valkey_cache::build_instrument_cache_key("csv_hash");
-        assert_eq!(key, "dlt:instrument:csv_hash");
-    }
-
-    #[test]
-    fn test_cache_instrument_key_namespace() {
-        let key = crate::valkey_cache::build_instrument_cache_key("anything");
-        assert!(key.starts_with("dlt:instrument:"));
-    }
-
-    #[test]
-    fn test_cache_instrument_key_empty_suffix() {
-        let key = crate::valkey_cache::build_instrument_cache_key("");
-        assert_eq!(key, "dlt:instrument:");
-    }
-
-    #[test]
-    fn test_cache_token_key_access() {
-        let key = crate::valkey_cache::build_token_cache_key("access");
-        assert_eq!(key, "dlt:token:access");
-    }
-
-    #[test]
-    fn test_cache_token_key_expiry() {
-        let key = crate::valkey_cache::build_token_cache_key("expiry");
-        assert_eq!(key, "dlt:token:expiry");
-    }
-
-    #[test]
-    fn test_cache_token_key_namespace() {
-        let key = crate::valkey_cache::build_token_cache_key("any_suffix");
-        assert!(key.starts_with("dlt:token:"));
-    }
-
-    #[test]
-    fn test_cache_tick_key_ltp() {
-        let key = crate::valkey_cache::build_tick_cache_key(11536, "ltp");
-        assert_eq!(key, "dlt:tick:11536:ltp");
-    }
-
-    #[test]
-    fn test_cache_tick_key_depth() {
-        let key = crate::valkey_cache::build_tick_cache_key(49081, "depth");
-        assert_eq!(key, "dlt:tick:49081:depth");
-    }
-
-    #[test]
-    fn test_cache_tick_key_zero_id() {
-        let key = crate::valkey_cache::build_tick_cache_key(0, "ltp");
-        assert_eq!(key, "dlt:tick:0:ltp");
-    }
-
-    #[test]
-    fn test_cache_tick_key_max_id() {
-        let key = crate::valkey_cache::build_tick_cache_key(u32::MAX, "ohlc");
-        assert_eq!(key, "dlt:tick:4294967295:ohlc");
-    }
-
-    #[test]
-    fn test_cache_tick_key_isolation() {
-        let a = crate::valkey_cache::build_tick_cache_key(100, "ltp");
-        let b = crate::valkey_cache::build_tick_cache_key(200, "ltp");
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn test_cache_ttl_before_target() {
-        // IST 05:30 → target 08:00 → 9000s
-        let utc_midnight = 1_704_067_200_u64;
-        let ttl = crate::valkey_cache::compute_instrument_ttl_secs(utc_midnight, 8);
-        assert_eq!(ttl, 9000);
-    }
-
-    #[test]
-    fn test_cache_ttl_after_target_wraps() {
-        // IST 10:00 → target 08:00 → 79200s
-        let epoch = 86_400 - 19_800 + 36_000;
-        let ttl = crate::valkey_cache::compute_instrument_ttl_secs(epoch, 8);
-        assert_eq!(ttl, 79_200);
-    }
-
-    #[test]
-    fn test_cache_ttl_clamps_min_60() {
-        // Very close to target → clamped to 60s minimum
-        let epoch = 86_400 + 21_599 - 19_800;
-        let ttl = crate::valkey_cache::compute_instrument_ttl_secs(epoch, 6);
-        assert_eq!(ttl, 60);
-    }
-
-    #[test]
-    fn test_cache_ttl_exact_target_wraps_to_next_day() {
-        // IST exactly at target hour → 86400s (next day)
-        let epoch = 86_400 + 28_800 - 19_800;
-        let ttl = crate::valkey_cache::compute_instrument_ttl_secs(epoch, 8);
-        assert_eq!(ttl, 86_400);
-    }
-
-    #[test]
-    fn test_cache_pool_creation() {
-        let config = tickvault_common::config::ValkeyConfig {
-            host: "unreachable-host".to_string(),
-            port: 6379,
-            max_connections: 4,
-            password: String::new(),
-        };
-        // Pool creation is lazy — should succeed even with unreachable host
-        let pool = crate::valkey_cache::ValkeyPool::new(&config);
-        assert!(pool.is_ok());
-    }
-
-    #[test]
-    fn test_cache_pool_reconnect() {
-        let config = tickvault_common::config::ValkeyConfig {
-            host: "unreachable-host".to_string(),
-            port: 6379,
-            max_connections: 4,
-            password: String::new(),
-        };
-        let pool = crate::valkey_cache::ValkeyPool::new(&config).unwrap();
-        // Reconnect should succeed (rebuilds pool, doesn't try to connect)
-        let result = pool.reconnect();
-        assert!(result.is_ok());
     }
 }

@@ -235,7 +235,6 @@ mod tests {
             "tick_processor",
             "depth_connection",
             "questdb_writer",
-            "valkey_cache",
             "websocket_pool",
         ];
         for &component in ALLOWED_SUBSYSTEM_COMPONENTS {

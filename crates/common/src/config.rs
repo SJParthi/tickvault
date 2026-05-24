@@ -17,7 +17,7 @@ pub struct ApplicationConfig {
     pub dhan: DhanConfig,
     pub websocket: WebSocketConfig,
     pub questdb: QuestDbConfig,
-    pub valkey: ValkeyConfig,
+    // `valkey: ValkeyConfig` field DELETED in #O4 (2026-05-24).
     pub prometheus: PrometheusConfig,
     pub network: NetworkConfig,
     pub token: TokenConfig,
@@ -680,25 +680,9 @@ const fn default_retention_days() -> u32 {
     90
 }
 
-/// Valkey (cache) connection configuration.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ValkeyConfig {
-    /// Valkey Docker hostname.
-    pub host: String,
-    /// Valkey port.
-    pub port: u16,
-    /// Maximum connections in the connection pool.
-    pub max_connections: u32,
-    /// Authentication password (matches `--requirepass` in Valkey server config).
-    /// Empty string = no auth (NOT recommended). Default: "tv-dev-only".
-    #[serde(default = "default_valkey_password")]
-    pub password: String,
-}
-
-/// Default Valkey password — empty (loaded from SSM at boot in production).
-fn default_valkey_password() -> String {
-    String::new()
-}
+// `ValkeyConfig` struct + `default_valkey_password` helper DELETED in
+// #O4 (2026-05-24). Valkey removed from the runtime; the dual-instance
+// lock moved to AWS SSM Parameter Store in PR #764.
 
 /// Prometheus metrics endpoint configuration.
 #[derive(Debug, Deserialize)]
@@ -1662,12 +1646,6 @@ mod tests {
                 http_port: 9000,
                 pg_port: 8812,
                 ilp_port: 9009,
-            },
-            valkey: ValkeyConfig {
-                host: "tv-valkey".to_string(),
-                port: 6379,
-                max_connections: 16,
-                password: String::new(),
             },
             prometheus: PrometheusConfig {
                 host: "tv-prometheus".to_string(),
@@ -2773,14 +2751,8 @@ mod tests {
         assert!(super::default_auto_start());
     }
 
-    #[test]
-    fn test_default_valkey_password_is_empty_string() {
-        // Covers `default_valkey_password` (config.rs:356-358).
-        // Production loads the real password from AWS SSM at boot;
-        // the `#[serde(default = ...)]` fallback must stay empty so
-        // a missing TOML field does not leak a hardcoded credential.
-        assert_eq!(super::default_valkey_password(), "");
-    }
+    // `test_default_valkey_password_is_empty_string` DELETED in #O4
+    // (2026-05-24) along with the `default_valkey_password` helper.
 
     #[test]
     fn test_validate_url_empty_rest_api_base_url_rejected() {

@@ -173,21 +173,20 @@ fn alertmanager_is_removed_from_loki_ruler() {
 fn compose_preserves_default_services() {
     // Observability → CloudWatch-only program
     // (.claude/plans/active-plan-observability-cloudwatch-only.md):
-    // Grafana removed in #O1, Alertmanager in #O2, Prometheus in #O3.
-    // The default profile now contains exactly 2 services; the Valkey
-    // (#O4) removal will reduce this to 1 (QuestDB only).
-    //   tv-questdb, tv-valkey.
+    // Grafana removed in #O1, Alertmanager in #O2, Prometheus in #O3,
+    // Valkey in #O4. The default profile now contains exactly 1 service:
+    //   tv-questdb.
     // Loki + Alloy remain profile-gated for opt-in dev use.
     let src = load_text(COMPOSE);
-    let default_profile_services: Vec<&str> = ["tv-questdb:", "tv-valkey:"]
+    let default_profile_services: Vec<&str> = ["tv-questdb:"]
         .iter()
         .filter(|s| src.contains(*s))
         .copied()
         .collect();
     assert_eq!(
         default_profile_services.len(),
-        2,
-        "Expected exactly 2 default-profile services, found {:?}",
+        1,
+        "Expected exactly 1 default-profile service, found {:?}",
         default_profile_services
     );
     assert!(

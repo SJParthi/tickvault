@@ -43,7 +43,7 @@ log() {
 log "starting rollback"
 
 if [[ "${DRY_RUN}" == "1" ]]; then
-    log "dry_run_ok plan=restore_token_from_valkey_backup_key tickvault_token:backup:${CORR_ID}"
+    log "dry_run_ok plan=restore_token_from_file_cache /tmp/tv-token-cache.${CORR_ID}"
     exit 0
 fi
 

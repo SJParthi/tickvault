@@ -39,13 +39,15 @@ ringbuf = "0.4.8"
 # beyond AtomicCell's 16-byte lock-free threshold, so AtomicCell would
 # spin-lock internally anyway. parking_lot::Mutex is ~30ns uncontended,
 # never poisons, and is already present transitively via tokio /
-# tokio-tungstenite / redis.
+# tokio-tungstenite.
 parking_lot = "0.12.5"
 
-# ---- Section 4: Database & Cache ----
+# ---- Section 4: Database ----
+# Valkey/redis was removed in #O4 (2026-05-24). Dual-instance lock
+# lives in AWS SSM (PR #764); token-cache crash recovery is file-based
+# (`crates/core/src/auth/token_cache.rs`). No remaining production
+# caller needs an in-memory KV store.
 questdb-rs = { version = "6.1.0", features = ["chrono_timestamp"] }
-redis = { version = "1.2.1", features = ["tokio-comp", "connection-manager"] }
-deadpool-redis = "0.23.0"
 
 # ---- Section 5: Observability — Metrics ----
 metrics = "0.24.6"
