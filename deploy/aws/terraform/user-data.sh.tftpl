@@ -66,6 +66,18 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCFG
             "file_path": "/var/log/messages",
             "log_group_name": "/tickvault/$${ENVIRONMENT}/system",
             "log_stream_name": "{instance_id}"
+          },
+          {
+            "file_path": "/opt/tickvault/logs/errors.jsonl*",
+            "log_group_name": "/tickvault/$${ENVIRONMENT}/app",
+            "log_stream_name": "{instance_id}/errors-jsonl",
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/opt/tickvault/logs/app.*.log",
+            "log_group_name": "/tickvault/$${ENVIRONMENT}/app",
+            "log_stream_name": "{instance_id}/app",
+            "timezone": "UTC"
           }
         ]
       }

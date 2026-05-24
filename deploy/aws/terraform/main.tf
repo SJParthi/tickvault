@@ -192,6 +192,16 @@ resource "aws_instance" "tv_app" {
   iam_instance_profile   = aws_iam_instance_profile.tv_instance.name
   monitoring             = true
 
+  # Protect against accidental terminate / stop from `aws ec2 *-instances`
+  # CLI calls or AWS Console clicks. To intentionally destroy via
+  # `terraform destroy`, operator must first run:
+  #   aws ec2 modify-instance-attribute --instance-id <id> --no-disable-api-termination
+  #   aws ec2 modify-instance-attribute --instance-id <id> --no-disable-api-stop
+  # then re-apply with the flags flipped to false. Two-step destroy = the
+  # defense.
+  disable_api_termination = true
+  disable_api_stop        = true
+
   metadata_options {
     http_endpoint               = "enabled"
     http_tokens                 = "required" # IMDSv2 mandatory

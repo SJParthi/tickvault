@@ -13,15 +13,18 @@ per `.claude/rules/project/aws-budget.md` — **~₹1,022/mo** on `t4g.medium`
 - **1 IAM role** — SSM get/put/delete (instance lock), SNS publish, CloudWatch write, S3 read/write to cold bucket
 - **2 EventBridge rules** — daily 08:00 IST start / 17:00 IST stop (Mon-Sun)
 - **1 SNS topic** — CRITICAL alerts → 4-channel fan-out (SMS + Telegram + Email + Connect call)
-- **1 CloudWatch log group** — 14-day retention for app + system logs
+- **1 CloudWatch log group** — 14-day retention for app + system logs (scrapes `/var/log/messages`, `/opt/tickvault/logs/errors.jsonl*`, `/opt/tickvault/logs/app.*.log`)
 - **5 CloudWatch alarms** — infrastructure signals (status check, CPU, disk, memory, network)
+- **1 AWS Budget** — monthly cost cap at $12 USD (~₹1,000), 80% forecasted + 100% actual notifications
+- **1 SNS email subscription** — operator email auto-subscribed to `tv-alerts` topic (confirmation via email)
 - **1 S3 bucket** — cold archive, 30-day lifecycle to Intelligent-Tiering, 365-day to Glacier IR, 5-year expiration (SEBI retention)
+- **Termination + stop protection** enabled on EC2 instance (prevents accidental destroy)
 
 **NOT deployed** (CloudWatch-only migration #O1/#O2/#O3/#O4): Grafana, Prometheus, Alertmanager, Valkey. Operator-facing observability = QuestDB Console (local dev) + CloudWatch Console (prod).
 
 ## One-time setup BEFORE first `terraform apply`
 
-1. **Create AWS account.** Enable MFA on root. Attach an Indian credit card. Set a billing alert at ₹1,000 (98% of budget).
+1. **Create AWS account.** Enable MFA on root. Attach an Indian credit card. (Billing alarm at ₹1,000 / 98% of budget is now provisioned by `budget.tf` — no manual setup needed.)
 2. **Request limit increase** for `t4g.medium` in ap-south-1 if your default vCPU quota is 0 (new accounts).
 3. **Create a key pair** for SSH:
    ```bash
@@ -31,7 +34,7 @@ per `.claude/rules/project/aws-budget.md` — **~₹1,022/mo** on `t4g.medium`
      --query KeyMaterial --output text > ~/.ssh/tv-prod-key.pem
    chmod 400 ~/.ssh/tv-prod-key.pem
    ```
-4. **Find the latest Amazon Linux 2023 arm64 AMI** in ap-south-1 (t4g is Graviton — arm64 mandatory):
+4. **AMI default is set** — `var.ami_id` defaults to `ami-0fa0340d4a8bdd6ee` (AL2023 arm64 ap-south-1, published 2026-05-15). To refresh quarterly:
    ```bash
    aws ec2 describe-images \
      --region ap-south-1 \
@@ -40,15 +43,21 @@ per `.claude/rules/project/aws-budget.md` — **~₹1,022/mo** on `t4g.medium`
                'Name=virtualization-type,Values=hvm' \
      --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text
    ```
-   Set the result as `TF_VAR_ami_id`.
+   Update the default in `variables.tf` if newer. `lifecycle.ignore_changes = [ami]` on the instance prevents existing instances from being rebuilt.
 
    **Why Amazon Linux 2023 (not Ubuntu)?** AL2023 ships with AWS CLI + amazon-ssm-agent + amazon-cloudwatch-agent **pre-installed**, so the user-data script skips ~30 lines of apt-get installs. ~30s faster cold boot at the daily 08:00 IST EventBridge start. ~150 MB more RAM headroom on the 4 GiB host. The Rust binary, Docker, and tickvault behaviour are byte-identical on either OS.
 5. **Find your public IP** and set `TF_VAR_operator_cidr`:
    ```bash
    export TF_VAR_operator_cidr="$(curl -s ifconfig.me)/32"
    ```
-6. **Install Terraform** >= 1.9.0.
-7. **Seed SSM parameters** with Dhan / Telegram / QuestDB credentials BEFORE first boot — see `docs/runbooks/aws-deploy.md`.
+6. **Set operator email for alarm notifications** (required):
+   ```bash
+   export TF_VAR_operator_email="you@example.com"
+   ```
+   On first apply, AWS sends a confirmation email — click the link to activate SNS alarm delivery.
+7. **Install Terraform** >= 1.9.0.
+8. **Seed SSM parameters** with Dhan / Telegram / QuestDB credentials BEFORE first boot — run `../../../scripts/aws-seed-ssm-parameters.sh`.
+9. **(Optional but recommended)** Migrate Terraform state to S3 backend after first apply — see `BACKEND-BOOTSTRAP.md`.
 
 ## First apply
 
