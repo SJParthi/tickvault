@@ -106,7 +106,7 @@ chrono-tz = "0.10.4"
 
 # ---- Section 11: Serialization & Errors ----
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = "1.0.150"
 bitcode = "0.6.9"
 rkyv = { version = "0.8.16", features = ["std", "bytecheck"] }
 csv = "1.4.0"
@@ -145,9 +145,9 @@ rustls-native-certs = "0.8.3"
 # routes through `aws-smithy-http-client/rustls-aws-lc` (rustls 0.23 +
 # aws-lc-rs — already pinned by the workspace at line 136). Closes the 3
 # RUSTSEC advisories on the AWS chain without an upstream SDK release.
-aws-config = { version = "1.8.16", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "credentials-process", "sso"] }
-aws-sdk-sns = { version = "1.99.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
-aws-sdk-ssm = { version = "1.109.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-config = { version = "1.8.17", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "credentials-process", "sso"] }
+aws-sdk-sns = { version = "1.100.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-ssm = { version = "1.110.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 
 # ---- Section 16: CLI ----
 clap = { version = "4.6.1", features = ["derive"] }
