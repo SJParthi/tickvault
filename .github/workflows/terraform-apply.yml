@@ -168,7 +168,7 @@ jobs:
           echo "Plan exit code: ${EXIT_CODE} (0=no-changes, 2=changes-pending)"
 
       - name: Upload plan artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: terraform-plan-${{ github.sha }}
           path: ${{ env.TF_DIR }}/tfplan
