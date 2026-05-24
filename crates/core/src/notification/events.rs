@@ -1696,9 +1696,14 @@ impl NotificationEvent {
         match self {
             Self::StartupComplete { mode } => {
                 // SECURITY: Do not expose internal service ports in Telegram.
+                // Dashboards line trimmed in #O1/#O2/#O3/#O4 — Grafana,
+                // Prometheus, Alertmanager, Valkey all removed in the
+                // CloudWatch-only migration. Operator-facing observability
+                // is now the QuestDB Console (local dev) + CloudWatch
+                // Dashboards (AWS prod).
                 format!(
                     "<b>tickvault started</b>\nMode: {mode}\n\n\
-                     Dashboards: Grafana / Prometheus / QuestDB available"
+                     Dashboards: QuestDB Console (local) / CloudWatch (prod)"
                 )
             }
             Self::AuthenticationSuccess => "<b>Auth OK</b> — Dhan JWT acquired".to_string(),
@@ -3344,9 +3349,14 @@ mod tests {
         assert!(!msg.contains("9000"), "internal port leaked: {msg}");
         assert!(!msg.contains("localhost"), "localhost leaked: {msg}");
         assert!(msg.contains("Dashboards"));
-        assert!(msg.contains("Grafana"));
-        assert!(msg.contains("Prometheus"));
         assert!(msg.contains("QuestDB"));
+        assert!(msg.contains("CloudWatch"));
+        // CloudWatch-only migration #O1/#O2/#O3/#O4: the retired
+        // dashboard stack MUST NOT reappear in operator-facing text.
+        assert!(!msg.contains("Grafana"), "retired in #O1: {msg}");
+        assert!(!msg.contains("Prometheus"), "retired in #O3: {msg}");
+        assert!(!msg.contains("Alertmanager"), "retired in #O2: {msg}");
+        assert!(!msg.contains("Valkey"), "retired in #O4: {msg}");
     }
 
     #[test]
@@ -3354,7 +3364,10 @@ mod tests {
         let event = NotificationEvent::StartupComplete { mode: "OFFLINE" };
         let msg = event.to_message();
         assert!(msg.contains("OFFLINE"));
-        assert!(msg.contains("Grafana"));
+        // Post-#O1/#O2/#O3/#O4: dashboard line names QuestDB + CloudWatch
+        // only. Grafana / Prometheus / Alertmanager / Valkey are gone.
+        assert!(msg.contains("QuestDB"));
+        assert!(msg.contains("CloudWatch"));
     }
 
     #[test]
