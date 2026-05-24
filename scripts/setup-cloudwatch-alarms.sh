@@ -10,7 +10,7 @@
 # the Rust app all run ON the same host. If the host dies, they all die.
 # CloudWatch runs in AWS — it watches FROM OUTSIDE.
 #
-# WHEN TO RUN: Once, after deploying to AWS EC2 (c7i.2xlarge Mumbai).
+# WHEN TO RUN: Once, after deploying to AWS EC2 (t4g.medium Mumbai).
 #              Idempotent — safe to re-run.
 #
 # PREREQUISITES:

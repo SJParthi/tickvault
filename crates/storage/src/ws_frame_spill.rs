@@ -101,7 +101,7 @@ pub struct ReplayedFrame {
 /// production: a transient writer stall of up to 13s (e.g. brief disk fsync
 /// latency on a contended host) now absorbs without dropping. Memory cost
 /// at idle is ~3 MiB extra (131k × ~24 B/`WalRecord` header), trivial on
-/// the 8 GiB c7i.xlarge target.
+/// the 4 GiB t4g.medium target.
 const SPILL_CHANNEL_CAPACITY: usize = 131_072;
 
 /// WAL file magic bytes — segment-local sanity check.

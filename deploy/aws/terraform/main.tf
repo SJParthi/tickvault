@@ -1,16 +1,24 @@
-# S7-Step2 / Phase 8.1: DLT AWS stack — everything the ₹5,000/mo budget needs.
+# DLT AWS stack — t4g.medium budget envelope (~₹1,022/mo, operator-lock
+# 2026-05-18 in aws-budget.md).
 #
 # Deployed resources:
 #   - VPC with a single public subnet (no NAT to stay under budget)
 #   - Security group: SSH from operator_cidr, no inbound from market
-#   - IAM role: SSM read + CloudWatch write + EC2 metadata
-#   - EC2 c7i.xlarge with gp3 100GB root volume
-#   - Elastic IP (required for Dhan static IP mandate effective 2026-04-01)
-#   - SSM parameters for Telegram bot token + Dhan access token
-#   - SNS topic for CRITICAL alerts
-#   - EventBridge rules for weekday 8am IST start, 5pm IST stop;
-#     weekend 8am start, 1pm stop
-#   - CloudWatch log group + metric alarms (5 core metrics)
+#   - IAM role: SSM read+write+delete (instance lock) + CloudWatch write +
+#     SNS publish + S3 cold-tier read/write
+#   - EC2 t4g.medium (ARM Graviton, 2 vCPU / 4 GiB) with gp3 10GB root volume
+#   - Elastic IP (Dhan static IP mandate effective 2026-04-01; 7-day cooldown
+#     on modify — never release once registered with Dhan)
+#   - SSM parameters for Dhan credentials, Telegram tokens, QuestDB creds,
+#     instance lock (dual-instance prevention — see crates/core/src/instance_lock.rs)
+#   - SNS topic for CRITICAL alerts → 4-channel fan-out (SMS+Telegram+Email+Connect)
+#   - EventBridge rules for daily 08:00 IST start / 17:00 IST stop (Mon-Sun
+#     per operator lock — accept ₹22/mo overage for 7-day BRUTEX availability)
+#   - CloudWatch log group + metric alarms (5 core infrastructure signals)
+#
+# Stack components NOT deployed (CloudWatch-only migration #O1/#O2/#O3/#O4):
+#   - Grafana / Prometheus / Alertmanager / Valkey — all retired.
+#     Operator observability = QuestDB Console (local) + CloudWatch (prod).
 
 # ---------------------------------------------------------------------------
 # Networking
@@ -125,6 +133,10 @@ resource "aws_iam_role_policy" "tv_instance" {
           "ssm:GetParameter",
           "ssm:GetParameters",
           "ssm:PutParameter",
+          # DeleteParameter needed for graceful release of the
+          # dual-instance lock at shutdown — see PR #764
+          # `crates/core/src/instance_lock.rs::release_instance_lock`.
+          "ssm:DeleteParameter",
         ]
         Resource = [
           "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/*"
@@ -240,38 +252,25 @@ resource "aws_cloudwatch_log_group" "tv_app" {
 }
 
 # ---------------------------------------------------------------------------
-# EventBridge rules for the weekday/weekend start-stop schedule
-# per aws-budget.md. Rules call SSM Automation to start/stop the instance.
+# EventBridge daily start/stop schedule per aws-budget.md operator-lock
+# 2026-05-18 (Option A — accept ₹22/mo overage for 7-day BRUTEX
+# availability). Rules call SSM Automation to start/stop the instance.
 #
 # IST offset is UTC+5:30, so:
-#   Weekday start 08:00 IST = 02:30 UTC (Mon-Fri)
-#   Weekday stop  17:00 IST = 11:30 UTC (Mon-Fri)
-#   Weekend start 08:00 IST = 02:30 UTC (Sat-Sun)
-#   Weekend stop  13:00 IST = 07:30 UTC (Sat-Sun)
+#   Daily start 08:00 IST = 02:30 UTC (Mon-Sun)
+#   Daily stop  17:00 IST = 11:30 UTC (Mon-Sun)
 # ---------------------------------------------------------------------------
 
-resource "aws_cloudwatch_event_rule" "weekday_start" {
-  name                = "tv-${var.environment}-weekday-start"
-  description         = "Start DLT instance at 08:00 IST on weekdays"
-  schedule_expression = "cron(30 2 ? * MON-FRI *)"
+resource "aws_cloudwatch_event_rule" "daily_start" {
+  name                = "tv-${var.environment}-daily-start"
+  description         = "Start tickvault instance at 08:00 IST every day (Mon-Sun)"
+  schedule_expression = "cron(30 2 * * ? *)"
 }
 
-resource "aws_cloudwatch_event_rule" "weekday_stop" {
-  name                = "tv-${var.environment}-weekday-stop"
-  description         = "Stop DLT instance at 17:00 IST on weekdays"
-  schedule_expression = "cron(30 11 ? * MON-FRI *)"
-}
-
-resource "aws_cloudwatch_event_rule" "weekend_start" {
-  name                = "tv-${var.environment}-weekend-start"
-  description         = "Start DLT instance at 08:00 IST on weekends"
-  schedule_expression = "cron(30 2 ? * SAT-SUN *)"
-}
-
-resource "aws_cloudwatch_event_rule" "weekend_stop" {
-  name                = "tv-${var.environment}-weekend-stop"
-  description         = "Stop DLT instance at 13:00 IST on weekends"
-  schedule_expression = "cron(30 7 ? * SAT-SUN *)"
+resource "aws_cloudwatch_event_rule" "daily_stop" {
+  name                = "tv-${var.environment}-daily-stop"
+  description         = "Stop tickvault instance at 17:00 IST every day (Mon-Sun)"
+  schedule_expression = "cron(30 11 * * ? *)"
 }
 
 # ---------------------------------------------------------------------------
@@ -288,8 +287,8 @@ resource "aws_cloudwatch_event_rule" "weekend_stop" {
 #     → starts SSM Automation document `AWS-StartEC2Instance`
 #     → SSM Automation uses the same role to call ec2:StartInstances
 #
-# The 4 rules (weekday start/stop + weekend start/stop) share the same
-# role — scoped to this one instance ARN.
+# The 2 rules (daily start + daily stop, Mon-Sun) share the same role —
+# scoped to this one instance ARN.
 # ---------------------------------------------------------------------------
 
 data "aws_region" "current" {}
@@ -358,51 +357,27 @@ locals {
   ssm_stop_arn  = "arn:aws:ssm:${data.aws_region.current.name}::automation-definition/AWS-StopEC2Instance:$DEFAULT"
 }
 
-resource "aws_cloudwatch_event_target" "weekday_start" {
-  rule      = aws_cloudwatch_event_rule.weekday_start.name
+resource "aws_cloudwatch_event_target" "daily_start" {
+  rule      = aws_cloudwatch_event_rule.daily_start.name
   target_id = "start-instance"
   arn       = local.ssm_start_arn
   role_arn  = aws_iam_role.eventbridge_ec2_scheduler.arn
 
   input = jsonencode({
-    InstanceId             = [aws_instance.tv_app.id]
-    AutomationAssumeRole   = [aws_iam_role.eventbridge_ec2_scheduler.arn]
+    InstanceId           = [aws_instance.tv_app.id]
+    AutomationAssumeRole = [aws_iam_role.eventbridge_ec2_scheduler.arn]
   })
 }
 
-resource "aws_cloudwatch_event_target" "weekday_stop" {
-  rule      = aws_cloudwatch_event_rule.weekday_stop.name
+resource "aws_cloudwatch_event_target" "daily_stop" {
+  rule      = aws_cloudwatch_event_rule.daily_stop.name
   target_id = "stop-instance"
   arn       = local.ssm_stop_arn
   role_arn  = aws_iam_role.eventbridge_ec2_scheduler.arn
 
   input = jsonencode({
-    InstanceId             = [aws_instance.tv_app.id]
-    AutomationAssumeRole   = [aws_iam_role.eventbridge_ec2_scheduler.arn]
-  })
-}
-
-resource "aws_cloudwatch_event_target" "weekend_start" {
-  rule      = aws_cloudwatch_event_rule.weekend_start.name
-  target_id = "start-instance"
-  arn       = local.ssm_start_arn
-  role_arn  = aws_iam_role.eventbridge_ec2_scheduler.arn
-
-  input = jsonencode({
-    InstanceId             = [aws_instance.tv_app.id]
-    AutomationAssumeRole   = [aws_iam_role.eventbridge_ec2_scheduler.arn]
-  })
-}
-
-resource "aws_cloudwatch_event_target" "weekend_stop" {
-  rule      = aws_cloudwatch_event_rule.weekend_stop.name
-  target_id = "stop-instance"
-  arn       = local.ssm_stop_arn
-  role_arn  = aws_iam_role.eventbridge_ec2_scheduler.arn
-
-  input = jsonencode({
-    InstanceId             = [aws_instance.tv_app.id]
-    AutomationAssumeRole   = [aws_iam_role.eventbridge_ec2_scheduler.arn]
+    InstanceId           = [aws_instance.tv_app.id]
+    AutomationAssumeRole = [aws_iam_role.eventbridge_ec2_scheduler.arn]
   })
 }
 

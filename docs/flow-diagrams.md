@@ -595,7 +595,7 @@ Layer 6 │   LIVE MONITORING     │  Tick gap > 30s? → ALERT
 │  │  :4317 OTLP  │    │  Rev. Proxy  │  │  Log ship  │   │
 │  └──────────────┘    └──────────────┘  └────────────┘   │
 │                                                          │
-│  Infrastructure: AWS c7i.2xlarge, Mumbai (ap-south-1)    │
+│  Infrastructure: AWS t4g.medium, Mumbai (ap-south-1)    │
 │                                                          │
 └──────────────────────────────────────────────────────────┘
 ```

@@ -50,16 +50,16 @@ this runbook is complete, ongoing deploys are fully automated via the
    - Budget type: Cost budget
    - Amount: Rs 4500, Monthly, Recurring
    - Email alert on 90% forecasted + 100% actual
-6. **Request limit increase for c7i.xlarge in ap-south-1**
+6. **Request limit increase for t4g.medium in ap-south-1**
    - New AWS accounts default to 0 running On-Demand Standard
      instances (the family that includes c7i).
    - Service Quotas → AWS services → EC2 → Running On-Demand Standard
      (A, C, D, H, I, M, R, T, Z) instances
    - Click **Request increase at account level**
-   - New quota value: `8` (enough for c7i.xlarge = 4 vCPU, with
+   - New quota value: `8` (enough for t4g.medium = 4 vCPU, with
      headroom for a blue-green future upgrade)
    - Justification: "Running a production trading system in
-     ap-south-1 on c7i.xlarge per the fixed deployment spec"
+     ap-south-1 on t4g.medium per the fixed deployment spec"
    - **This takes 1-24 hours for AWS to approve.** Start now.
 
 ## Phase 2 — Bootstrap Secrets (~10 minutes)

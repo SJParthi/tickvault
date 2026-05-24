@@ -1,17 +1,23 @@
-//! Wave 5 Item 6 — `core_affinity` worker pinning helpers.
+//! `core_affinity` worker pinning helpers.
 //!
 //! The hot-path latency budgets in `quality/benchmark-budgets.toml` (≤10ns
 //! tick parse, ≤100ns OMS state transition, ≤50ns map lookup) assume the
-//! WS read loop, parser pipeline, and ILP writer threads each have a
-//! dedicated CPU. On AWS c7i.xlarge (4 vCPUs) and on dev Mac mirroring
-//! the 4-vCPU layout, this module pins:
+//! WS read loop has a dedicated CPU. On AWS t4g.medium (2 vCPUs Graviton,
+//! operator-lock 2026-05-18) and on dev Mac mirroring the 2-vCPU layout,
+//! this module pins:
 //!
 //! ```text
-//! Core 0  ←  WebSocket read loop
-//! Core 1  ←  Tick processor / pipeline
-//! Core 2  ←  QuestDB ILP writer
-//! Core 3  ←  Other (main thread, observability, telegram, etc.)
+//! Core 0  ←  WebSocket read loop (latency-critical)
+//! Core 1  ←  Tick processor / pipeline / ILP writer / Other
+//!            (kernel multiplexes — none of these are < 1µs sensitive)
 //! ```
+//!
+//! Prior to 2026-05-24 this module assumed a 4-vCPU layout (c7i.xlarge).
+//! When the AWS instance was relocked to t4g.medium (2 vCPUs), the layout
+//! consolidated: WsRead keeps its dedicated core, the 3 other roles share
+//! Core 1. The aggregate parser + ILP + observability hot-path budget is
+//! ~10µs (Criterion p99) so multiplexing on a single 2.5 GHz Graviton
+//! core is safely within budget.
 //!
 //! `core_affinity::set_for_current` is best-effort — kernels can ignore
 //! the hint, cgroups can override it, and macOS `thread_policy_set` is a
@@ -30,7 +36,7 @@ use core_affinity::CoreId;
 use tickvault_common::error_code::ErrorCode;
 use tracing::{error, info};
 
-/// Pinning role per the Wave 5 4-vCPU layout. Mapping to a `core_id` is
+/// Pinning role per the t4g.medium 2-vCPU layout. Mapping to a `core_id` is
 /// done at runtime by `pin_current_thread_for(role)` so the host doesn't
 /// need to know the layout statically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -46,16 +52,18 @@ pub enum WorkerRole {
 }
 
 impl WorkerRole {
-    /// Returns the canonical Wave 5 core index for this role on a 4-vCPU
-    /// host. Hosts with fewer cores cannot satisfy the layout — see
-    /// `pin_current_thread_for` for the runtime guard.
+    /// Returns the canonical core index for this role on the t4g.medium
+    /// 2-vCPU layout (operator-lock 2026-05-18). WsRead gets a dedicated
+    /// core; the 3 other roles share core 1 — see module doc-comment for
+    /// the rationale.
     #[must_use]
     pub const fn core_index(self) -> usize {
         match self {
             Self::WsRead => 0,
-            Self::Parser => 1,
-            Self::IlpWriter => 2,
-            Self::Other => 3,
+            // Parser / IlpWriter / Other all share Core 1. The kernel
+            // multiplexes — aggregate budget is ~10µs (Criterion p99),
+            // safely within a single 2.5GHz Graviton core's slot.
+            Self::Parser | Self::IlpWriter | Self::Other => 1,
         }
     }
 
@@ -72,10 +80,12 @@ impl WorkerRole {
     }
 }
 
-/// Minimum number of logical cores Wave 5 expects on the host. Below
-/// this, `pin_current_thread_for` returns an error rather than silently
-/// pinning all roles to a smaller set.
-pub const MINIMUM_CORE_COUNT: usize = 4;
+/// Minimum number of logical cores tickvault expects on the host.
+/// Operator-lock 2026-05-18: t4g.medium (2 vCPU). Below this,
+/// `pin_current_thread_for` returns an error rather than silently
+/// pinning multiple roles onto a single shared core (which would
+/// defeat the WS-read latency isolation).
+pub const MINIMUM_CORE_COUNT: usize = 2;
 
 /// Pins the current thread to the canonical core for the given role.
 ///
@@ -133,10 +143,10 @@ pub fn pin_current_thread_for(role: WorkerRole) -> Result<()> {
             host_cores = n,
             required = MINIMUM_CORE_COUNT,
             "CORE-PIN-01: host has fewer than {MINIMUM_CORE_COUNT} cores — \
-             Wave 5 4-vCPU layout cannot be satisfied; pinning skipped."
+             t4g.medium 2-vCPU layout cannot be satisfied; pinning skipped."
         );
         anyhow::bail!(
-            "host has {} cores; Wave 5 requires at least {}",
+            "host has {} cores; tickvault requires at least {}",
             n,
             MINIMUM_CORE_COUNT
         );
@@ -165,7 +175,7 @@ pub fn pin_current_thread_for(role: WorkerRole) -> Result<()> {
             "outcome" => "failed",
         )
         .increment(1);
-        // Wave 5 hostile-review fix: was `warn!` — but CorePin01 is
+        // Hostile-review fix (was `warn!`): CorePin01 is
         // Severity::High, and the host_too_small / core_ids_unavailable
         // branches above already use `error!`. Splitting the same code
         // across two log levels broke Loki→Telegram routing for the
@@ -215,23 +225,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_worker_role_core_indices_are_distinct_under_4_vcpu_layout() {
-        let roles = [
+    fn test_worker_role_core_indices_match_t4g_medium_layout() {
+        // t4g.medium operator-lock 2026-05-18: 2 vCPUs total.
+        // WsRead gets its own core; everything else shares Core 1.
+        assert_eq!(WorkerRole::WsRead.core_index(), 0);
+        assert_eq!(WorkerRole::Parser.core_index(), 1);
+        assert_eq!(WorkerRole::IlpWriter.core_index(), 1);
+        assert_eq!(WorkerRole::Other.core_index(), 1);
+        // Every role's core_index must be within the host's vCPU budget.
+        for r in [
             WorkerRole::WsRead,
             WorkerRole::Parser,
             WorkerRole::IlpWriter,
             WorkerRole::Other,
-        ];
-        let mut seen = std::collections::HashSet::new();
-        for r in roles {
+        ] {
             assert!(
-                seen.insert(r.core_index()),
-                "role {:?} core index {} collides",
-                r,
+                r.core_index() < MINIMUM_CORE_COUNT,
+                "role {r:?} core index {} >= MINIMUM_CORE_COUNT {MINIMUM_CORE_COUNT}",
                 r.core_index()
             );
-            assert!(r.core_index() < MINIMUM_CORE_COUNT);
         }
+    }
+
+    #[test]
+    fn test_ws_read_is_isolated_from_other_roles() {
+        // The latency-critical WS read loop MUST NOT share a core with
+        // any other role — otherwise the kernel can preempt mid-frame.
+        // Any future refactor that puts Parser/IlpWriter/Other on Core 0
+        // breaks the budgeting and fails this ratchet.
+        let ws_core = WorkerRole::WsRead.core_index();
+        assert_ne!(ws_core, WorkerRole::Parser.core_index());
+        assert_ne!(ws_core, WorkerRole::IlpWriter.core_index());
+        assert_ne!(ws_core, WorkerRole::Other.core_index());
     }
 
     #[test]
@@ -255,10 +280,10 @@ mod tests {
     }
 
     #[test]
-    fn test_minimum_core_count_matches_aws_c7i_xlarge() {
-        // c7i.xlarge has 4 vCPUs; dev Mac mirrors that layout per the
-        // Wave 5 plan. Bumping this constant requires updating both
-        // CLAUDE.md and aws-budget.md.
-        assert_eq!(MINIMUM_CORE_COUNT, 4);
+    fn test_minimum_core_count_matches_aws_t4g_medium() {
+        // t4g.medium has 2 vCPUs (operator-lock 2026-05-18 in aws-budget.md).
+        // Bumping this constant requires updating both CLAUDE.md and
+        // aws-budget.md.
+        assert_eq!(MINIMUM_CORE_COUNT, 2);
     }
 }

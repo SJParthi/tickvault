@@ -431,7 +431,7 @@ would cause date confusion in queries. By storing IST-as-UTC, a simple
 | QuestDB persistence | ~2s | ~150K ILP rows batched |
 | rkyv cache write | ~100ms | Serialize + fsync |
 | **Total** | **3–10s** | MacBook Pro |
-| **Total (prod)** | **1–3s** | AWS c7i.2xlarge |
+| **Total (prod)** | **1–3s** | AWS t4g.medium |
 
 ### 7.2 Load Time (Hot Path — Market Hours)
 
