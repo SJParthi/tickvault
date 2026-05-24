@@ -88,8 +88,8 @@ const DASHBOARD_SERVICES: &[(&str, &str, &str, u16)] = &[
     ("Traefik", "http://localhost:8080", LOCAL_HOST, 8080),
 ];
 
-/// Valkey (Redis) port for TCP reachability probe.
-const VALKEY_PORT: u16 = 6379;
+// `VALKEY_PORT` constant DELETED in #O4 (2026-05-24) — Valkey removed
+// from the runtime.
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -108,7 +108,7 @@ const VALKEY_PORT: u16 = 6379;
 /// 1. Ensures Docker daemon is running (launches Docker Desktop on macOS).
 /// 2. Fetches infra credentials from SSM.
 /// 3. Runs `docker compose up -d` (idempotent).
-/// 4. Waits for QuestDB + Valkey to become healthy.
+/// 4. Waits for QuestDB to become healthy.
 /// 5. Opens dashboards in the default browser.
 ///
 /// Best-effort: if Docker or SSM is unavailable, logs a warning
@@ -223,7 +223,6 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
 
     // Wait for all critical services to become healthy.
     wait_for_service_healthy("QuestDB", &questdb_config.host, questdb_config.http_port).await;
-    wait_for_service_healthy("Valkey", LOCAL_HOST, VALKEY_PORT).await;
 
     // Auto-open all monitoring dashboards in the default browser.
     open_all_dashboards().await;

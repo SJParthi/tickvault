@@ -122,10 +122,6 @@ fn no_panic_health_response_serialization() {
                 status: "connected",
                 detail: None,
             },
-            valkey: SubsystemInfo {
-                status: "connected",
-                detail: None,
-            },
         },
     };
     let json = serde_json::to_string(&resp).unwrap();

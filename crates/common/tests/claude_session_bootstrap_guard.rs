@@ -394,22 +394,10 @@ fn chaos_nightly_workflow_wires_ignored_tests() {
 // (#O3): the Prometheus container + `tickvault-alerts.yml` were retired
 // when observability narrowed to CloudWatch-only.
 
-#[test]
-fn chaos_valkey_kill_test_exists() {
-    // PR #288 (#3): dedicated Valkey chaos test closes the one gap in the
-    // existing 16-file chaos suite.
-    let p = repo_root().join("crates/storage/tests/chaos_valkey_kill.rs");
-    assert!(p.exists(), "chaos_valkey_kill.rs missing");
-    let src = fs::read_to_string(&p).unwrap();
-    assert!(
-        src.contains("docker compose") && src.contains("pause"),
-        "chaos_valkey_kill must shell out to docker compose pause"
-    );
-    assert!(
-        src.contains("#[ignore"),
-        "chaos_valkey_kill tests must be #[ignore]'d (weekly workflow)"
-    );
-}
+// `chaos_valkey_kill_test_exists` guard DELETED in #O4 (2026-05-24)
+// along with the underlying `crates/storage/tests/chaos_valkey_kill.rs`
+// file. Valkey is no longer part of the runtime; chaos tests for it
+// would test a service that doesn't exist.
 
 #[test]
 fn health_slash_command_exists_and_wires_all_layers() {

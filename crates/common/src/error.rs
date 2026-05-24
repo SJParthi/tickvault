@@ -324,8 +324,8 @@ mod tests {
     fn test_infrastructure_unavailable_has_no_source() {
         use std::error::Error;
         let err = ApplicationError::InfrastructureUnavailable {
-            service: "Valkey".to_string(),
-            endpoint: "tv-valkey:6379".to_string(),
+            service: "QuestDB".to_string(),
+            endpoint: "tv-questdb:9009".to_string(),
         };
         assert!(err.source().is_none());
     }

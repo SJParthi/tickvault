@@ -80,7 +80,7 @@ chown -R ubuntu:ubuntu /opt/tickvault
 sudo -u ubuntu git clone --depth 1 \
     https://github.com/SJParthi/tickvault.git /opt/tickvault/repo
 
-# Start Docker Compose stack (QuestDB, Valkey, Prometheus, Grafana, etc).
+# Start Docker Compose stack (QuestDB only — observability is CloudWatch).
 # `restart: unless-stopped` policy in docker-compose.yml ensures containers
 # come back up automatically after every EC2 stop/start cycle triggered by
 # the 8 AM / 5 PM IST EventBridge schedule — no manual intervention needed.

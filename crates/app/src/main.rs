@@ -1862,12 +1862,12 @@ async fn main() -> Result<()> {
         info!("Phase 0 Item 19: acquiring dual-instance SSM lock");
 
         // SSM is the source of truth for the lock (operator lock
-        // 2026-05-24 — superseded the Valkey-backed implementation
+        // 2026-05-24 — replaced the earlier in-memory KV implementation
         // alongside the CloudWatch-only migration). Constructing the
-        // client here keeps the lock self-contained; no Valkey container
-        // needs to be running. Costs: standard-tier SSM PutParameter is
-        // free; ~2,880 calls/day at the 30 s heartbeat interval is well
-        // under the 40 TPS SSM rate cap.
+        // client here keeps the lock self-contained; no auxiliary
+        // service needs to be running. Costs: standard-tier SSM
+        // PutParameter is free; ~2,880 calls/day at the 30 s heartbeat
+        // interval is well under the 40 TPS SSM rate cap.
         let ssm_client = std::sync::Arc::new(
             tickvault_core::auth::secret_manager::create_ssm_client_public().await,
         );

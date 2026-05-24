@@ -35,8 +35,7 @@ networks:
 volumes:
   tv-questdb-data:
     name: tv-questdb-data
-  tv-valkey-data:
-    name: tv-valkey-data
+  # tv-valkey-data volume DELETED in #O4 (2026-05-24) — Valkey removed.
   # Phase 3 of active-plan.md — only used when `--profile logs` starts.
   tv-loki-data:
     name: tv-loki-data
@@ -123,47 +122,12 @@ services:
       - tv-network
 
   # ---------------------------------------------------------------------------
-  # Valkey — Cache (token cache, instrument cache, session data)
-  # Bible #18: valkey/valkey:9.0.3-alpine
-  # Wave 7-A: 1GB -> 512MB (token + instrument cache fits easily).
-  # ---------------------------------------------------------------------------
-  tv-valkey:
-    image: valkey/valkey:9.0.3-alpine@sha256:f741f6f4080be5f2bc213f31206a608bee5369ab617a03d6970b800ee60a00c5
-    container_name: tv-valkey
-    hostname: tv-valkey
-    restart: unless-stopped
-    mem_limit: 512m
-    cpus: 0.5
-    ports:
-      - "6379:6379"
-    volumes:
-      - tv-valkey-data:/data
-    command: >
-      valkey-server
-      --requirepass ${TV_VALKEY_PASSWORD:-tv-dev-only}
-      --maxmemory 256mb
-      --maxmemory-policy allkeys-lru
-      --save 60 1000
-      --appendonly yes
-      --appendfsync everysec
-    logging:
-      driver: json-file
-      options:
-        max-size: "100m"
-        max-file: "5"
-    healthcheck:
-      test: ["CMD", "valkey-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 5s
-    networks:
-      - tv-network
-
-  # ---------------------------------------------------------------------------
-  # Wave 7-A REMOVED: tv-valkey-exporter (oliver006/redis_exporter)
-  # Reason: We don't query Valkey-internal metrics in dashboards or alerts today.
-  # If needed in the future, re-add behind a `--profile metrics-extra` opt-in.
+  # Valkey — REMOVED (observability → CloudWatch-only, 2026-05-24, #O4).
+  # The dual-instance lock moved to AWS SSM Parameter Store in PR #764
+  # (/tickvault/<env>/instance-lock). The file-based token-cache
+  # (crates/core/src/auth/token_cache.rs) covers crash-restart speed.
+  # No remaining production caller needs an in-memory KV store.
+  # See .claude/plans/active-plan-observability-cloudwatch-only.md (#O4).
   # ---------------------------------------------------------------------------
 
   # ---------------------------------------------------------------------------

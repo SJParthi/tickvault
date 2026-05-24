@@ -164,11 +164,9 @@ ilp_port = 9009
 [partition_retention]
 retention_days = 90
 
-[valkey]
-host = "tv-valkey"
-port = 6379
-max_connections = 16
-password = ""
+# [valkey] section DELETED in #O4 (2026-05-24). Valkey removed from
+# the runtime; the dual-instance lock moved to AWS SSM Parameter Store
+# in PR #764.
 
 [prometheus]
 host = "tv-prometheus"

@@ -77,8 +77,8 @@ print_section "docker stack"
 if ! command -v docker >/dev/null 2>&1; then
     printf "[SKIP] %-14s docker CLI not installed\n" "docker"
 else
-    # Wave 7-A: tv-traefik + tv-valkey-exporter removed (see .claude/rules/project/aws-budget.md).
-    for service in tv-questdb tv-valkey; do
+    # tv-valkey removed in #O4 (2026-05-24) — see .claude/rules/project/aws-budget.md.
+    for service in tv-questdb; do
         run_check "docker" "$service running" \
             bash -c "docker compose -f deploy/docker/docker-compose.yml ps --services --filter status=running | grep -q '^${service}$'"
     done
@@ -95,8 +95,7 @@ run_check "endpoint" "Prometheus" \
     curl -fsS -m 3 http://127.0.0.1:9090/-/healthy
 run_check "endpoint" "Grafana" \
     curl -fsS -m 3 http://127.0.0.1:3000/api/health
-run_check "endpoint" "Valkey (PING)" \
-    bash -c "docker compose -f deploy/docker/docker-compose.yml exec -T tv-valkey valkey-cli ping 2>/dev/null | grep -q PONG"
+# Valkey PING check removed in #O4 (2026-05-24).
 run_check "endpoint" "Alertmanager" \
     curl -fsS -m 3 http://127.0.0.1:9093/-/healthy
 
