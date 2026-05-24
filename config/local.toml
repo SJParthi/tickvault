@@ -9,8 +9,7 @@
 [questdb]
 host = "localhost"
 
-[valkey]
-host = "localhost"
+# [valkey] section removed in #O4 (2026-05-24).
 
 [prometheus]
 host = "localhost"

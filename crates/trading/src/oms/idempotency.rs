@@ -15,7 +15,8 @@
 //!
 //! **Known limitation:** On crash, all mappings are lost. The reconciliation
 //! module (`reconciliation.rs`) re-syncs state from Dhan REST API on startup.
-//! Phase 2 will persist the map to Valkey for fast recovery.
+//! Phase 2 persistence: reuse the file-based token-cache pattern
+//! (`crates/core/src/auth/token_cache.rs`) — Valkey was removed in #O4.
 
 use std::collections::HashMap;
 

@@ -11,7 +11,7 @@
 #   2. Generates TOTP code
 #   3. Hits Dhan auth.dhan.co/app/generateAccessToken
 #   4. Atomic swap via arc-swap
-#   5. Persists new token to Valkey cache
+#   5. Persists new token to file cache (/tmp/tv-token-cache)
 #
 # Usage:  scripts/auto-fix-rotate-token.sh [--dry-run]
 #
@@ -24,7 +24,7 @@
 #     correlation_id so M4 verify.sh can track the outcome.
 #
 # Rollback: see scripts/auto-fix-rotate-token-rollback.sh
-#   (Rollback = restore the previous token from Valkey backup key.)
+#   (Rollback = restore the previous token from the file-cache backup.)
 #
 # Exit codes:
 #   0  success (or dry-run OK)

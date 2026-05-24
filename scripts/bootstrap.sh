@@ -194,7 +194,7 @@ wait_for_service() {
 }
 
 wait_for_service "QuestDB" "http://localhost:9000"
-wait_for_service "Valkey" "http://localhost:6379" || true  # Valkey has no HTTP — check via redis-cli below
+# Valkey wait removed in #O4 (2026-05-24) — Valkey removed from runtime.
 wait_for_service "Prometheus" "http://localhost:9090/-/healthy"
 wait_for_service "Grafana" "http://localhost:3000/api/health"
 

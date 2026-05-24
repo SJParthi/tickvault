@@ -628,25 +628,10 @@ pub const SSM_API_SERVICE: &str = "api";
 /// Full path: `/tickvault/<env>/api/bearer-token`
 pub const API_BEARER_TOKEN_SECRET: &str = "bearer-token";
 
-// ---------------------------------------------------------------------------
-// SSM Parameter Store — Valkey Service (added 2026-04-25)
-// ---------------------------------------------------------------------------
-
-/// SSM service path segment for Valkey (Redis-replacement) credentials.
-///
-/// 2026-04-25 security audit (PR #357 follow-up): the Valkey password was
-/// previously a checked-in default of `""` in `config/base.toml` with a
-/// comment that promised "loaded from AWS SSM at boot" — but no SSM fetch
-/// existed. The comment lied to the reader. This service path closes the
-/// gap so Valkey credentials match the rest of the project (Dhan, QuestDB,
-/// Grafana, Telegram, API). Per `.claude/rules/project/rust-code.md` rule
-/// "always real AWS, never mocks" — same code path on local Mac and EC2.
-pub const SSM_VALKEY_SERVICE: &str = "valkey";
-
-/// SSM key for Valkey AUTH password.
-///
-/// Full path: `/tickvault/<env>/valkey/password`
-pub const VALKEY_PASSWORD_SECRET: &str = "password";
+// `SSM_VALKEY_SERVICE` + `VALKEY_PASSWORD_SECRET` constants DELETED in
+// #O4 (2026-05-24) — Valkey removed from the runtime. The dual-instance
+// lock moved to `/tickvault/<env>/instance-lock` (PR #764, see
+// `instance_lock::INSTANCE_LOCK_SSM_PATH_PREFIX`).
 
 // ---------------------------------------------------------------------------
 // SSM Parameter Store — SNS Service

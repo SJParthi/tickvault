@@ -23,7 +23,7 @@ pub struct SubsystemStatus {
     pub order_update: SubsystemInfo,
     pub questdb: SubsystemInfo,
     pub token: SubsystemInfo,
-    pub valkey: SubsystemInfo,
+    // `valkey: SubsystemInfo` field DELETED in #O4 (2026-05-24).
     pub pipeline: SubsystemInfo,
     pub tick_persistence: SubsystemInfo,
 }
@@ -102,15 +102,6 @@ pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthRes
         },
     };
 
-    let valkey = SubsystemInfo {
-        status: if health.valkey_reachable() {
-            "reachable"
-        } else {
-            "unreachable"
-        },
-        detail: None,
-    };
-
     let pipeline = SubsystemInfo {
         status: if health.pipeline_active() {
             "active"
@@ -149,7 +140,6 @@ pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthRes
             order_update,
             questdb,
             token,
-            valkey,
             pipeline,
             tick_persistence,
         },
@@ -288,10 +278,6 @@ mod tests {
                 },
                 token: SubsystemInfo {
                     status: "valid",
-                    detail: None,
-                },
-                valkey: SubsystemInfo {
-                    status: "reachable",
                     detail: None,
                 },
                 pipeline: SubsystemInfo {
