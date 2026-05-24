@@ -5,12 +5,19 @@
 # runs the smoke test, then swaps the systemd unit and monitors the
 # first 60 seconds for crashes. Rolls back on failure.
 #
-# Triggers:
-#   - Manual dispatch (workflow_dispatch) — operator clicks "Run"
+# Triggers (PR #772 added the push-to-main trigger):
+#   - Push to main with Rust/binary-relevant paths (auto-fire after merge)
+#       paths: crates/**, Cargo.toml, Cargo.lock, deploy/systemd/**
 #   - Push of a tag matching v*.*.* (release builds)
+#   - Manual dispatch (workflow_dispatch) — operator override or emergency
 #
-# Never fires automatically on push to a branch — deploys to real
-# infrastructure are always explicit.
+# Safety nets that prevent the auto-trigger from causing harm:
+#   1. preflight job — skips entire workflow if AWS_ROLE_ARN / AWS_ACCESS_KEY_ID
+#      bootstrap secrets are absent (charter §C "100% no false-OK PR checks").
+#   2. guard_market_hours job — blocks deploy during 09:15-15:30 IST Mon-Fri
+#      unless workflow_dispatch with confirm_market_hours=yes.
+#   3. concurrency.group serializes deploys; never two at once.
+#   4. Existing rollback path triggers on failed smoke test.
 #
 # Secrets required (GitHub repo > Settings > Secrets and variables > Actions):
 #   AWS_ROLE_ARN                — OIDC role assumed by the workflow
@@ -30,6 +37,12 @@ on:
         required: false
         default: 'no'
   push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'deploy/systemd/**'
     tags:
       - 'v*.*.*'
 
@@ -42,9 +55,44 @@ permissions:
   contents: read
 
 jobs:
+  # ─────────────────────────────────────────────────────────────────
+  # Job 0: preflight — skip if AWS bootstrap secrets aren't configured.
+  #
+  # Mirrors the pattern from .github/workflows/terraform-apply.yml so
+  # that contributors pushing to main BEFORE the operator's one-time
+  # bootstrap (BOOTSTRAP-ONE-TIME.md) don't see red PR checks.
+  # Pre-bootstrap: this job exits 0 with a notice, downstream jobs
+  # skip cleanly. Post-bootstrap: downstream activates automatically.
+  # ─────────────────────────────────────────────────────────────────
+  preflight:
+    name: Preflight — check bootstrap secrets
+    runs-on: ubuntu-24.04
+    outputs:
+      bootstrap_ready: ${{ steps.check.outputs.bootstrap_ready }}
+    steps:
+      - name: Check whether AWS bootstrap secrets are configured
+        id: check
+        env:
+          OIDC_ROLE: ${{ secrets.AWS_ROLE_ARN }}
+          ACCESS_KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        run: |
+          if [ -n "${OIDC_ROLE}" ] || [ -n "${ACCESS_KEY}" ]; then
+            echo "bootstrap_ready=true" >> $GITHUB_OUTPUT
+            echo "✅ Bootstrap secrets present — deploy chain will run."
+          else
+            echo "bootstrap_ready=false" >> $GITHUB_OUTPUT
+            echo "::notice::AWS bootstrap secrets not yet configured — skipping deploy chain."
+            echo "::notice::Follow deploy/aws/terraform/BOOTSTRAP-ONE-TIME.md (40 sec) to enable automation."
+            echo ""
+            echo "Skipped jobs: build, guard_market_hours, deploy."
+            echo "This is the EXPECTED state for a fresh repo. Workflow exits 0."
+          fi
+
   build:
     name: Build release binary
     runs-on: ubuntu-24.04
+    needs: preflight
+    if: needs.preflight.outputs.bootstrap_ready == 'true'
     outputs:
       binary_artifact_name: ${{ steps.upload.outputs.artifact-id }}
     steps:
@@ -91,7 +139,8 @@ jobs:
   guard_market_hours:
     name: Market-hours guard
     runs-on: ubuntu-24.04
-    needs: build
+    needs: [preflight, build]
+    if: needs.preflight.outputs.bootstrap_ready == 'true'
     steps:
       - name: Check current IST time against market window
         run: |
@@ -120,7 +169,8 @@ jobs:
   deploy:
     name: Deploy to EC2
     runs-on: ubuntu-24.04
-    needs: [build, guard_market_hours]
+    needs: [preflight, build, guard_market_hours]
+    if: needs.preflight.outputs.bootstrap_ready == 'true'
     environment: prod
     steps:
       - name: Checkout (for deploy scripts)
