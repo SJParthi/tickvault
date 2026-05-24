@@ -79,6 +79,36 @@ fn r3_has_both_plan_and_apply_jobs() {
 }
 
 #[test]
+fn r3b_has_preflight_job_that_gates_downstream_on_bootstrap_secrets() {
+    // Per the operator-charter, the workflow MUST skip cleanly (not fail)
+    // when the one-time AWS bootstrap secrets are absent. Otherwise the
+    // PR check goes red on every contributor's first push to the repo,
+    // blocking merges. The preflight job sets `bootstrap_ready=true|false`
+    // and ALL downstream jobs gate on it via `needs.preflight.outputs.bootstrap_ready == 'true'`.
+    let body = read(WORKFLOW);
+    must_contain(&body, "preflight:", "preflight job exists");
+    must_contain(
+        &body,
+        "bootstrap_ready",
+        "preflight emits bootstrap_ready output",
+    );
+    must_contain(
+        &body,
+        "needs.preflight.outputs.bootstrap_ready == 'true'",
+        "downstream jobs gated on preflight result",
+    );
+    // The 3 downstream jobs (terraform-plan, guard-market-hours, terraform-apply)
+    // PLUS the notify job MUST all reference the gate. Count occurrences.
+    let gate_refs = body
+        .matches("needs.preflight.outputs.bootstrap_ready == 'true'")
+        .count();
+    assert!(
+        gate_refs >= 4,
+        "expected at least 4 jobs gated on preflight (plan, guard, apply, notify); found {gate_refs}"
+    );
+}
+
+#[test]
 fn r4_uses_pinned_setup_terraform_action() {
     let body = read(WORKFLOW);
     must_contain(

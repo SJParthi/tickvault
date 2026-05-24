@@ -63,11 +63,50 @@ env:
 
 jobs:
   # ─────────────────────────────────────────────────────────────────
-  # Job 1: terraform plan — runs on EVERY trigger, gates Job 2
+  # Job 0: preflight — check whether bootstrap secrets exist.
+  #
+  # The operator-charter one-time bootstrap (BOOTSTRAP-ONE-TIME.md) is
+  # mathematically required by AWS IAM: a third party (GitHub Actions)
+  # cannot self-authorize. Until the operator pastes either
+  # AWS_TERRAFORM_ROLE_ARN (OIDC, preferred) or AWS_ACCESS_KEY_ID +
+  # AWS_SECRET_ACCESS_KEY (bootstrap), this workflow CANNOT talk to AWS.
+  #
+  # Pre-bootstrap state: this job exits 0 with a friendly skip message,
+  # downstream jobs do not run, the PR check passes. Post-bootstrap:
+  # downstream jobs activate automatically — no workflow edit needed.
+  # ─────────────────────────────────────────────────────────────────
+  preflight:
+    name: Preflight — check bootstrap secrets
+    runs-on: ubuntu-24.04
+    outputs:
+      bootstrap_ready: ${{ steps.check.outputs.bootstrap_ready }}
+    steps:
+      - name: Check whether AWS bootstrap secrets are configured
+        id: check
+        env:
+          OIDC_ROLE: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          ACCESS_KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        run: |
+          if [ -n "${OIDC_ROLE}" ] || [ -n "${ACCESS_KEY}" ]; then
+            echo "bootstrap_ready=true" >> $GITHUB_OUTPUT
+            echo "✅ Bootstrap secrets present — terraform plan + apply will run."
+          else
+            echo "bootstrap_ready=false" >> $GITHUB_OUTPUT
+            echo "::notice::AWS bootstrap secrets not yet configured — skipping terraform plan + apply."
+            echo "::notice::Follow deploy/aws/terraform/BOOTSTRAP-ONE-TIME.md (40 sec) to enable automation."
+            echo ""
+            echo "Skipped jobs: terraform-plan, guard-market-hours, terraform-apply, notify."
+            echo "This is the EXPECTED state for a fresh repo. Workflow exits 0."
+          fi
+
+  # ─────────────────────────────────────────────────────────────────
+  # Job 1: terraform plan — runs on EVERY trigger (post-bootstrap), gates Job 2
   # ─────────────────────────────────────────────────────────────────
   terraform-plan:
     name: Terraform plan
     runs-on: ubuntu-24.04
+    needs: preflight
+    if: needs.preflight.outputs.bootstrap_ready == 'true'
     outputs:
       plan_exitcode: ${{ steps.plan.outputs.exitcode }}
     steps:
@@ -148,8 +187,8 @@ jobs:
   guard-market-hours:
     name: Market-hours guard
     runs-on: ubuntu-24.04
-    needs: terraform-plan
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: [preflight, terraform-plan]
+    if: needs.preflight.outputs.bootstrap_ready == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     steps:
       - name: Check current IST time against market window
         run: |
@@ -179,10 +218,12 @@ jobs:
   terraform-apply:
     name: Terraform apply
     runs-on: ubuntu-24.04
-    needs: [terraform-plan, guard-market-hours]
+    needs: [preflight, terraform-plan, guard-market-hours]
     if: |
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.skip_apply != 'yes')
+      needs.preflight.outputs.bootstrap_ready == 'true' && (
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.skip_apply != 'yes')
+      )
     environment: prod
     outputs:
       instance_id: ${{ steps.outputs.outputs.instance_id }}
@@ -248,8 +289,8 @@ jobs:
   notify:
     name: Notify Telegram via SNS
     runs-on: ubuntu-24.04
-    needs: [terraform-plan, terraform-apply]
-    if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: [preflight, terraform-plan, terraform-apply]
+    if: always() && needs.preflight.outputs.bootstrap_ready == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     steps:
       - name: Configure AWS credentials (OIDC if available, else access keys)
         uses: aws-actions/configure-aws-credentials@v4
