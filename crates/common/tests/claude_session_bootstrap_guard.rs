@@ -46,13 +46,14 @@ fn bootstrap_script_exists_and_is_executable() {
 }
 
 #[test]
-fn bootstrap_writes_all_five_endpoint_vars() {
+fn bootstrap_writes_all_endpoint_vars() {
     let src = read("scripts/claude-session-bootstrap.sh");
+    // Grafana (#O1) was retired with the CloudWatch-only migration;
+    // its TICKVAULT_GRAFANA_URL export was dropped in the same PR.
     for var in [
         "TICKVAULT_PROMETHEUS_URL",
         "TICKVAULT_ALERTMANAGER_URL",
         "TICKVAULT_QUESTDB_URL",
-        "TICKVAULT_GRAFANA_URL",
         "TICKVAULT_API_URL",
     ] {
         assert!(
@@ -63,13 +64,13 @@ fn bootstrap_writes_all_five_endpoint_vars() {
 }
 
 #[test]
-fn bootstrap_writes_all_five_probe_status_vars() {
+fn bootstrap_writes_all_probe_status_vars() {
     let src = read("scripts/claude-session-bootstrap.sh");
+    // GRAF_STATUS was retired with #O1; the script now writes 4 status vars.
     for var in [
         "TICKVAULT_PROM_STATUS",
         "TICKVAULT_ALERT_STATUS",
         "TICKVAULT_QDB_STATUS",
-        "TICKVAULT_GRAF_STATUS",
         "TICKVAULT_API_STATUS",
     ] {
         assert!(
@@ -483,8 +484,8 @@ fn bootstrap_auto_up_requires_every_service_offline() {
     let src = read("scripts/claude-session-bootstrap.sh");
     // A partially-up stack means the operator is mid-debug — never
     // disturb. Auto-up only fires when EVERY probed local service is
-    // OFFLINE (a fresh laptop boot scenario).
-    for status_var in ["PROM_S", "QDB_S", "GRAF_S", "API_S"] {
+    // OFFLINE (a fresh laptop boot scenario). GRAF_S dropped with #O1.
+    for status_var in ["PROM_S", "QDB_S", "API_S"] {
         assert!(
             src.contains(&format!(r#""${status_var}" = "OFFLINE""#)),
             "auto-up must require {status_var}=OFFLINE — partial-up state \

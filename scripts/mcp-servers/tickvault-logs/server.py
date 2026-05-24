@@ -755,52 +755,6 @@ def tool_tickvault_api(
         return {"ok": True, "status": status, "url": full, "text": body[:4000]}
 
 
-def tool_grafana_query(
-    endpoint: str,
-    base_url: str | None = None,
-) -> dict[str, Any]:
-    """HTTP GET against the Grafana HTTP API.
-
-    `endpoint` is the path component, e.g.
-      - `/api/health` — Grafana liveness
-      - `/api/search?query=tickvault` — list dashboards matching a term
-      - `/api/dashboards/uid/<UID>` — dashboard JSON by UID
-      - `/api/alertmanager/grafana/api/v2/alerts` — Grafana-managed alerts
-      - `/api/datasources/proxy/uid/<ds_uid>/api/v1/query?query=...` —
-        proxy a Prometheus/other datasource query
-
-    For anonymous Grafana (the tickvault default), unauthenticated
-    reads work. For authenticated, set
-    `TICKVAULT_GRAFANA_API_TOKEN` env var.
-    """
-    import urllib.request
-
-    gf_url = _endpoint_url(
-        "grafana_url",
-        "TICKVAULT_GRAFANA_URL",
-        "http://127.0.0.1:3000",
-        explicit=base_url,
-    )
-    if not endpoint.startswith("/"):
-        endpoint = f"/{endpoint}"
-    full = f"{gf_url}{endpoint}"
-    req = urllib.request.Request(full)
-    token = os.environ.get("TICKVAULT_GRAFANA_API_TOKEN")
-    if _is_resolved(token):
-        req.add_header("Authorization", f"Bearer {token}")
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
-            body = resp.read().decode("utf-8")
-            status = resp.status
-    except Exception as err:  # noqa: BLE001
-        return {"ok": False, "error": str(err), "url": full}
-    try:
-        parsed = json.loads(body)
-        return {"ok": True, "status": status, "url": full, "json": parsed}
-    except json.JSONDecodeError:
-        return {"ok": True, "status": status, "url": full, "text": body[:4000]}
-
-
 def tool_docker_status() -> dict[str, Any]:
     """Return `docker compose ps --format json` for the tickvault
     Docker stack. Shows every container's name / service / state /
@@ -1161,34 +1115,6 @@ TOOLS: list[ToolSpec] = [
         },
         handler=lambda args: tool_tickvault_api(
             path=args["path"],
-            base_url=args.get("base_url"),
-        ),
-    ),
-    ToolSpec(
-        name="grafana_query",
-        description=(
-            "HTTP GET against the Grafana HTTP API. Endpoints: "
-            "/api/health, /api/search?query=X, /api/dashboards/uid/UID, "
-            "/api/datasources/proxy/uid/DS_UID/api/v1/query?query=Q. "
-            "Unauthenticated reads supported; set "
-            "TICKVAULT_GRAFANA_API_TOKEN for authenticated endpoints."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "endpoint": {
-                    "type": "string",
-                    "description": "Grafana API path starting with /",
-                },
-                "base_url": {
-                    "type": "string",
-                    "description": "Override TICKVAULT_GRAFANA_URL.",
-                },
-            },
-            "required": ["endpoint"],
-        },
-        handler=lambda args: tool_grafana_query(
-            endpoint=args["endpoint"],
             base_url=args.get("base_url"),
         ),
     ),

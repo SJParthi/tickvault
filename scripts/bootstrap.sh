@@ -125,7 +125,7 @@ if ! aws sts get-caller-identity --region "${REGION}" > /dev/null 2>&1; then
     exit 1
 fi
 
-# Auto-create QuestDB + Grafana secrets if they don't exist (idempotent)
+# Auto-create QuestDB secrets if they don't exist (idempotent)
 ENVIRONMENT="${SSM_ENV}" bash scripts/provision-infra-secrets.sh
 
 # Fetch credentials and export for docker-compose
@@ -135,13 +135,7 @@ TV_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/questdb/pg-pass
 export TV_QUESTDB_PG_USER TV_QUESTDB_PG_PASSWORD
 echo -e "${GREEN}OK${NC}"
 
-echo -n "  Exporting Grafana credentials... "
-TV_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/grafana/admin-user")
-TV_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/grafana/admin-password") # ssm_parameter fetch, not hardcoded
-export TV_GRAFANA_ADMIN_USER TV_GRAFANA_ADMIN_PASSWORD
-echo -e "${GREEN}OK${NC}"
-
-echo -n "  Exporting Telegram credentials for Grafana alerts... "
+echo -n "  Exporting Telegram credentials for app notifications... "
 TV_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/telegram/bot-token")
 TV_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/telegram/chat-id")
 export TV_TELEGRAM_BOT_TOKEN TV_TELEGRAM_CHAT_ID

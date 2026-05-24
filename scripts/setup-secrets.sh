@@ -81,8 +81,6 @@ verify_secret "/tickvault/${ENVIRONMENT}/telegram/bot-token" "Telegram Bot Token
 verify_secret "/tickvault/${ENVIRONMENT}/telegram/chat-id" "Telegram Chat ID"
 verify_secret "/tickvault/${ENVIRONMENT}/questdb/pg-user" "QuestDB PG User"
 verify_secret "/tickvault/${ENVIRONMENT}/questdb/pg-password" "QuestDB PG Password"
-verify_secret "/tickvault/${ENVIRONMENT}/grafana/admin-user" "Grafana Admin User"
-verify_secret "/tickvault/${ENVIRONMENT}/grafana/admin-password" "Grafana Admin Password"
 
 echo ""
 

@@ -248,8 +248,6 @@ SSM_ARGS="--region ap-south-1 --with-decryption --output text --query Parameter.
 fetch_ssm_secret() { aws ssm get-parameter --name "$1" ${SSM_ARGS} 2>/dev/null || echo ""; }
 export TV_QUESTDB_PG_USER=$(fetch_ssm_secret "/tickvault/dev/questdb/pg-user")
 export TV_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/tickvault/dev/questdb/pg-password")
-export TV_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/tickvault/dev/grafana/admin-user")
-export TV_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/tickvault/dev/grafana/admin-password")
 export TV_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/tickvault/dev/telegram/bot-token")
 export TV_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/tickvault/dev/telegram/chat-id")
 export TV_VALKEY_PASSWORD=$(fetch_ssm_secret "/tickvault/dev/valkey/password")

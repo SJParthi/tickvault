@@ -117,8 +117,6 @@ run_check "auto-fix clear-spill executable" \
     test -x scripts/auto-fix-clear-spill.sh
 run_check "error-triage hook executable" \
     test -x .claude/hooks/error-triage.sh
-run_check "operator-health dashboard present" \
-    test -f deploy/docker/grafana/dashboards/operator-health.json
 run_check "tickvault-logs MCP server present + executable" \
     test -x scripts/mcp-servers/tickvault-logs/server.py
 run_check "tickvault-logs MCP self-test passes" \

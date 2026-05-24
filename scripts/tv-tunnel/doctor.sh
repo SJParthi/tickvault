@@ -60,7 +60,6 @@ if [[ $EMIT_CONFIG -eq 1 ]]; then
   echo "prometheus_url    = \"https://${HOSTNAME_FQDN}:9090\""
   echo "alertmanager_url  = \"https://${HOSTNAME_FQDN}:9093\""
   echo "questdb_url       = \"https://${HOSTNAME_FQDN}:9000\""
-  echo "grafana_url       = \"https://${HOSTNAME_FQDN}:3000\""
   echo "tickvault_api_url = \"https://${HOSTNAME_FQDN}:3001\""
   echo "logs_source       = \"http\""
   echo "logs_dir_local    = \"./data/logs\""
