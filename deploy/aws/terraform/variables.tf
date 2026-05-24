@@ -38,14 +38,23 @@ variable "instance_type" {
 variable "ami_id" {
   description = "Amazon Linux 2023 arm64 AMI for ap-south-1. t4g.medium is Graviton — arm64 is mandatory (x86_64 will fail to boot). AL2023 chosen 2026-05-24 over Ubuntu because CloudWatch agent + SSM agent + AWS CLI are pre-installed (no apt-get equivalents needed in user-data)."
   type        = string
-  # Placeholder — operator replaces with the output of:
+  # Default = al2023-ami-2023.11.20260514.0 arm64 (operator confirmed via AWS
+  # console 2026-05-24 — published 2026-05-15). Quarterly refresh recommended:
   #   aws ec2 describe-images \
   #     --region ap-south-1 \
   #     --owners amazon \
   #     --filters 'Name=name,Values=al2023-ami-2023.*-arm64' \
   #               'Name=virtualization-type,Values=hvm' \
   #     --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text
-  default = "ami-placeholder-replace-me-al2023-arm64"
+  # `aws_instance.tv_app.lifecycle.ignore_changes = [ami]` prevents drift
+  # from refresh — existing instances keep their AMI; only new instances
+  # pick up the latest default.
+  default = "ami-0fa0340d4a8bdd6ee"
+
+  validation {
+    condition     = can(regex("^ami-[0-9a-f]{8,17}$", var.ami_id))
+    error_message = "ami_id must be a valid AMI ID (format: ami-XXXXXXXXXXXXXXXXX). Run the aws ec2 describe-images command in the comment above to fetch the latest AL2023 arm64 AMI for ap-south-1."
+  }
 }
 
 variable "ebs_gp3_size_gb" {
@@ -86,4 +95,14 @@ variable "dhan_access_token_ssm_param" {
   description = "SSM parameter name where the Dhan access token cache is stored."
   type        = string
   default     = "/tickvault/prod/dhan/access-token"
+}
+
+variable "operator_email" {
+  description = "Operator email address for CloudWatch alarm + budget notifications. SNS sends a confirmation link on first apply; operator clicks it once to activate. Required — no sensible default."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$", var.operator_email))
+    error_message = "operator_email must be a valid email address (set via TF_VAR_operator_email=you@example.com)."
+  }
 }
