@@ -11,7 +11,7 @@
 //!   1. workflow file exists
 //!   2. triggers on push to main with `deploy/aws/terraform/**` path filter
 //!   3. has both terraform-plan and terraform-apply jobs
-//!   4. uses pinned `hashicorp/setup-terraform@v3` action
+//!   4. uses pinned `hashicorp/setup-terraform@v4` action
 //!   5. uses pinned `aws-actions/configure-aws-credentials@v4` action
 //!   6. has the market-hours guard job
 //!   7. has `aws sns publish` for both success and failure notify paths
@@ -115,7 +115,7 @@ fn r4_uses_pinned_setup_terraform_action() {
     let body = read(WORKFLOW);
     must_contain(
         &body,
-        "hashicorp/setup-terraform@v3",
+        "hashicorp/setup-terraform@v4",
         "setup-terraform pinned action",
     );
     must_contain(

@@ -140,7 +140,6 @@ already), commit + push the change, restart the app, and DO NOT trade.
 ## Cross-references
 
   * Behavioral discipline: `docs/runbooks/daily-operations.md`
-  * Kill switch (emergency mid-session stop): `docs/runbooks/kill-switch.md`
   * Phase 0 architecture: `.claude/rules/project/phase-0-architecture.md`
   * Operator charter §H: `.claude/rules/project/operator-charter-forever.md`
   * Telegram message style rules: `.claude/plans/friday-may-15-mega/topic-telegram-message-style-rules.md`
@@ -148,6 +147,6 @@ already), commit + push the change, restart the app, and DO NOT trade.
 ## What this runbook does NOT cover
 
   * **Discipline during trading hours** — see `daily-operations.md`.
-  * **Emergency stop mid-session** — see `kill-switch.md`.
+  * **Emergency stop mid-session** — deferred until Phase 1 live trading rollout reintroduces the `tickvault-trading` crate.
   * **Post-market shutdown sequence** — see `daily-operations.md`
     "Market Close" section.

@@ -16,10 +16,8 @@ the remediation steps.
 |---|---|---|
 | Auth / token failures | [auth.md](./auth.md) | DH-901, DATA-807/808/809/810, AUTH-GAP-* |
 | Zero-tick-loss chain | [zero-tick-loss.md](./zero-tick-loss.md) | TicksDropped, TickBuffer/DiskSpill active, BroadcastLagTickLoss |
-| OMS / Risk failures | [oms-risk.md](./oms-risk.md) | Circuit breaker, rate limiter, daily P&L, DH-904/905/906 |
 | Historical data | [historical-data.md](./historical-data.md) | Dhan historical fetch errors, cross-match gaps, DH-904 bursts |
 | Postmortem template | [postmortem-template.md](./postmortem-template.md) | Copy for any high/critical-severity incident |
-| Dashboards map | [dashboards.md](./dashboards.md) | Morning-ops glance + drill-down navigation |
 
 ## Table — all 54 ErrorCode variants mapped to actions
 
@@ -77,7 +75,7 @@ the remediation steps.
 | **DATA-810** ClientIdInvalid | Critical | `.claude/rules/dhan/authentication.md` | — | **no** |
 | **DATA-811** InvalidExpiry | Medium | `.claude/rules/dhan/option-chain.md` | check params | yes |
 | **DATA-812** InvalidDateFormat | Medium | `.claude/rules/dhan/historical-data.md` | check params | yes |
-| **DATA-813** InvalidSecurityId | Medium | `.claude/rules/dhan/instrument-master.md` | `scripts/auto-fix-refresh-instruments.sh` | yes |
+| **DATA-813** InvalidSecurityId | Medium | `crates/common/src/locked_universe.rs` | verify LOCKED_UNIVERSE SIDs match Dhan response | yes |
 | **DATA-814** InvalidRequest | Medium | `.claude/rules/dhan/api-introduction.md` | — | yes |
 
 ## How Claude's auto-triage uses this table

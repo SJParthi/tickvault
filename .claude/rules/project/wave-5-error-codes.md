@@ -7,61 +7,6 @@
 > every variant in `crates/common/src/error_code.rs::ErrorCode` to be
 > mentioned in at least one rule file under `.claude/rules/`.
 
-## CORE-PIN-01 — `core_affinity` pinning failed at boot
-
-**Trigger:** during boot, the Wave 5 core-pin step iterates the four Tokio
-worker threads (WS read loop, parser, ILP writer, "other") and calls
-`core_affinity::set_for_current(core_id)` on each. If any call returns
-`false` — typically because the host has fewer than 4 logical cores or
-the kernel rejects the affinity request — this code fires. Severity::High.
-
-**App behaviour:** the app continues to start without pinning. Latency
-budgets in `quality/benchmark-budgets.toml` may not be met because the
-kernel can preempt the WS read loop with unrelated work. The gauge
-`tv_core_pinning_workers_pinned_total` reports the actual count of
-successfully-pinned workers (target = 4).
-
-**Triage:**
-1. `nproc` — does the host have ≥ 4 logical cores? Wave 5 mandates
-   AWS c7i.xlarge (4 vCPUs) and dev Mac mirroring 4 P-cores.
-2. `cat /proc/<pid>/status | grep Cpus_allowed_list` — confirm the cgroup
-   policy lets the process pin individual CPUs.
-3. On Linux, check that the container is run with `--cpuset-cpus=0-3`
-   (or equivalent) so the kernel will accept the affinity request.
-4. Restart the app; CORE-PIN-01 either clears or repeats with the same
-   root cause.
-
-**Auto-triage safe:** NO (Severity::High requires operator inspection).
-
-**Source (planned):** Wave 5 Item 6 lands the runtime+pin code in
-`crates/app/src/main.rs` and a `core_pinning::pin_workers` helper.
-
-## CORE-PIN-02 — pinned worker drifted off its assigned core
-
-**Trigger:** the 60s drift watchdog observed a Tokio worker running on a
-core other than its recorded pin. Severity::Medium. Counter
-`tv_core_pinning_drift_total` increments per detected drift, labelled
-by `worker_kind` (`ws_read`, `parser`, `ilp_writer`, `other`).
-
-**Why this happens:** Linux re-balances threads when a CPU goes idle, the
-kernel scheduler may move a thread off its pinned core if the affinity
-request was advisory rather than strict, or the cgroup limits changed
-mid-session.
-
-**Triage:**
-1. `tv_core_pinning_drift_total` rate — single drifts are recoverable;
-   sustained drift > 1/min for 5 min indicates a systemic issue.
-2. Verify cgroup `--cpuset-cpus` still pins all 4 cores; if a sidecar
-   container started consuming a core, the operator must give it a
-   different cpuset.
-3. The drift watchdog re-applies the pin; if drift recurs, the kernel
-   is rejecting the pin — escalate to CORE-PIN-01 root cause.
-
-**Auto-triage safe:** YES (the drift watchdog re-pins automatically).
-
-**Source (planned):** Wave 5 Item 6 — drift watchdog spawned alongside
-the pin step.
-
 ## DEPTH-20-DYN-03 — depth-20 dynamic top-volume selector returned a sub-capacity set
 
 **Trigger:** every 60s the unified depth-dynamic pipeline (`depth_dynamic_pipeline_v2`,

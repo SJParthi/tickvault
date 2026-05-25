@@ -218,7 +218,6 @@ commits MUST cite the verdict file's commit hash.
   * Phase 0 architecture: `.claude/rules/project/phase-0-architecture.md`
   * Operator daily startup: `docs/runbooks/operator-daily-startup.md`
   * Daily discipline: `docs/runbooks/daily-operations.md`
-  * Kill switch: `docs/runbooks/kill-switch.md`
   * Troubleshooting (per ErrorCode): `docs/runbooks/troubleshooting.md`
   * SLO score: `.claude/rules/project/wave-3-d-error-codes.md::SLO-02`
   * Operator charter: `.claude/rules/project/operator-charter-forever.md`

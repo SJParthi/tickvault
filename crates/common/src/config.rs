@@ -359,9 +359,10 @@ impl Default for FeaturesConfig {
             telegram_bucket_coalescer: true,
             market_open_self_test: true,
             realtime_guarantee_score: true,
-            // PR #449 operator kill-switch: OFF until broker-traded
-            // historical source (PR #455 Groww) lands.
-            historical_fetch_enabled: false,
+            // PR #449 operator kill-switch originally OFF. Flipped ON
+            // by PR #788 (2026-05-25) — required for cross-verify;
+            // base.toml + default now aligned (Phase B1 fix-up).
+            historical_fetch_enabled: true,
         }
     }
 }

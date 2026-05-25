@@ -293,26 +293,6 @@ pub enum ErrorCode {
     /// 814: Invalid request.
     Data814InvalidRequest,
 
-    // -----------------------------------------------------------------------
-    // Wave 5 — core_affinity pinning (depth-20/200 codes retired by PR #4)
-    // (`.claude/plans/active-plan-wave-5-indices-only.md` Items 4/5/6/9)
-    // -----------------------------------------------------------------------
-    /// `core_affinity::set_for_current` returned `false` for one or more of
-    /// the Tokio workers at boot. The t4g.medium 2-vCPU layout pins the WS
-    /// read loop to core 0; parser, ILP writer, and "other" workers share
-    /// core 1 (see `crates/app/src/core_pinning.rs`). A failed pin means the
-    /// affected
-    /// worker can be preempted by other tasks, breaking the O(1) latency
-    /// budget. Severity::High; the app continues without pinning so the
-    /// operator can observe the gauge `tv_core_pinning_workers_pinned_total`.
-    CorePin01PinningFailedAtBoot,
-    /// A pinned Tokio worker drifted off its assigned core. Detected by the
-    /// 60s drift watchdog comparing the running thread's CPU affinity mask
-    /// against the recorded pin. Counter `tv_core_pinning_drift_total`
-    /// increments per detected drift. Severity::Medium — the worker is
-    /// still doing work, just not on the dedicated core.
-    CorePin02WorkerDrifted,
-
     /// Wave 5 Item 26 L1 — volume monotonicity breach at runtime. The Dhan
     /// volume field at bytes 22-25 of the Quote/Full packet is cumulative
     /// since session open per Ticket #5525125 (verified via the live Mon
@@ -628,9 +608,6 @@ impl ErrorCode {
             Self::Data812InvalidDateFormat => "DATA-812",
             Self::Data813InvalidSecurityId => "DATA-813",
             Self::Data814InvalidRequest => "DATA-814",
-            // Wave 5 — core_affinity (depth-20/200 codes retired by PR #4)
-            Self::CorePin01PinningFailedAtBoot => "CORE-PIN-01",
-            Self::CorePin02WorkerDrifted => "CORE-PIN-02",
             // Wave 5 Item 13 — prev-close routing
             Self::PrevClose03BootRoutingAssertion => "PREVCLOSE-03",
             // F2 (Wave-5 #504e follow-up) — PrevDayCache boot loader
@@ -729,7 +706,6 @@ impl ErrorCode {
             | Self::InstrumentP0ExpiryAtGate4
             | Self::Data807TokenExpired
             | Self::Boot01QuestDbSlow
-            | Self::CorePin01PinningFailedAtBoot
             | Self::Volume01MonotonicityBreach
             | Self::AggregatorLate01
             | Self::GapFill02RestFetchFailed
@@ -780,7 +756,6 @@ impl ErrorCode {
             | Self::StorageGap03AuditWriteFailed
             | Self::StorageGap04S3ArchiveFailed
             | Self::Telegram01Dropped
-            | Self::CorePin02WorkerDrifted
             | Self::AggregatorSeal01IlpFailed
             | Self::Boundary01CatchupSeal
             // PR #1 (AWS-lifecycle) — Medium option-chain
@@ -883,9 +858,7 @@ impl ErrorCode {
             | Self::Data812InvalidDateFormat
             | Self::Data813InvalidSecurityId
             | Self::Data814InvalidRequest => ".claude/rules/dhan/annexure-enums.md",
-            Self::CorePin01PinningFailedAtBoot
-            | Self::CorePin02WorkerDrifted
-            | Self::PrevClose03BootRoutingAssertion
+            Self::PrevClose03BootRoutingAssertion
             | Self::Volume01MonotonicityBreach => ".claude/rules/project/wave-5-error-codes.md",
             Self::AggregatorDrop01
             | Self::AggregatorLate01
@@ -1024,8 +997,6 @@ impl ErrorCode {
             Self::Selftest02Failed,
             Self::Slo01Healthy,
             Self::Slo02Degraded,
-            Self::CorePin01PinningFailedAtBoot,
-            Self::CorePin02WorkerDrifted,
             Self::PrevClose03BootRoutingAssertion,
             Self::Volume01MonotonicityBreach,
             // PR #5 (2026-05-19): Phase2Ready01PreflightFailed retired.
@@ -1292,7 +1263,11 @@ mod tests {
         // deleted under 4-IDX_I LOCKED_UNIVERSE.
         // 2026-05-20 (#T2a — QuestDB table cleanup): bumped 105 -> 104 by
         // removing AGGREGATOR-AUDIT-01 (aggregator_seal_audit table dropped).
-        assert_eq!(ErrorCode::all().len(), 104);
+        // 2026-05-25 (Phase B1 deletion): bumped 104 -> 102 by removing
+        // CORE-PIN-01 (CorePin01PinningFailedAtBoot) + CORE-PIN-02
+        // (CorePin02WorkerDrifted) — core_pinning.rs module deleted under
+        // LOCKED 4-SID / t4g.medium 2-vCPU scope (no 4-core pinning to do).
+        assert_eq!(ErrorCode::all().len(), 102);
     }
 
     #[test]
