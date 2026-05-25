@@ -10,6 +10,12 @@
 //! # Headers
 //! Requires both `access-token` AND `client-id` headers.
 
+// 2026-05-25 PR #787 — Pure-function helpers for the minute-aligned
+// :50 burst scheduler with intra-minute retry-by-deadline. The
+// canonical scheduler in `snapshot_scheduler.rs` consumes these
+// helpers; tests live alongside the helpers.
+pub mod burst_orchestrator;
+
 pub mod client;
 // 2026-05-25 — Per-day cache of current (nearest) expiry per
 // underlying. Halves Dhan REST traffic by skipping the
