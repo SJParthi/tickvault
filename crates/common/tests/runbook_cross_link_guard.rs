@@ -39,7 +39,10 @@ fn runbook_dir_has_at_least_readme_and_two_deep_dives() {
         .filter_map(|p| p.file_name().and_then(|s| s.to_str()).map(String::from))
         .collect();
 
-    for required in ["README.md", "auth.md", "zero-tick-loss.md", "dashboards.md"] {
+    // 2026-05-25 Phase A deletion: dashboards.md removed under CloudWatch-
+    // only migration (operator decision 2026-05-20: "except QuestDB, app,
+    // and CloudWatch we planned to remove everything"). Grafana retired.
+    for required in ["README.md", "auth.md", "zero-tick-loss.md"] {
         assert!(
             files.contains(required),
             "docs/runbooks/ missing {required}"

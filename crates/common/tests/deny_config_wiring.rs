@@ -48,10 +48,13 @@ fn deny_config_exists_and_has_required_sections() {
 
 #[test]
 fn deny_config_targets_include_linux_and_mac() {
+    // 2026-05-18: operator-locked AWS prod instance is t4g.medium (Graviton
+    // ARM). deny.toml targets aarch64-unknown-linux-gnu (NOT x86_64) to
+    // match production. Dev Mac is aarch64-apple-darwin (M-series).
     let content = read_deny_toml();
     assert!(
-        content.contains("x86_64-unknown-linux-gnu"),
-        "S3-6: deny.toml must target Linux (AWS production)"
+        content.contains("aarch64-unknown-linux-gnu"),
+        "S3-6: deny.toml must target aarch64 Linux (AWS production — t4g.medium Graviton, operator-locked 2026-05-18)"
     );
     assert!(
         content.contains("aarch64-apple-darwin"),

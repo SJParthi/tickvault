@@ -90,7 +90,7 @@ rules:
       code: DATA-813
     action: auto_fix
     auto_fix_script: scripts/auto-fix-refresh-instruments.sh
-    runbook_path: .claude/rules/dhan/instrument-master.md
+    runbook_path: .claude/rules/dhan/annexure-enums.md
     confidence: 0.85
     cooldown_secs: 3600
     justification: >-
@@ -951,37 +951,6 @@ rules:
   # -----------------------------------------------------------------------
   # Phase 7 (2026-04-28) — Depth-20 dynamic top-150 selector
   # -----------------------------------------------------------------------
-
-  - name: core-pin-01-pinning-failed-at-boot-escalate
-    match:
-      code: CORE-PIN-01
-    action: escalate
-    runbook_path: .claude/rules/project/wave-5-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      CORE-PIN-01 means a Tokio worker thread failed to pin to its
-      assigned core at boot — typically host has < 4 logical cores or
-      the kernel rejected `core_affinity::set_for_current`. App
-      continues without pinning; latency budgets in
-      `quality/benchmark-budgets.toml` may be missed. Operator checks
-      `nproc` and cgroup `--cpuset-cpus` policy. Severity::High; never
-      auto-action because the underlying constraint is host-level.
-
-  - name: core-pin-02-worker-drifted-silence
-    match:
-      code: CORE-PIN-02
-    action: silence
-    runbook_path: .claude/rules/project/wave-5-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      CORE-PIN-02 = a pinned Tokio worker drifted off its assigned
-      core. The 60s drift watchdog re-applies the pin automatically;
-      single drifts are recoverable. Severity::Medium. Auto-triage
-      safe per the runbook (the watchdog is the auto-fix). Operator
-      only needs to act if `tv_core_pinning_drift_total` rate >1/min
-      for 5 min, in which case the dashboard escalates separately.
 
   - name: prevclose-03-boot-routing-assertion-escalate
     match:
