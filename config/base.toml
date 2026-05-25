@@ -356,19 +356,19 @@ fetch_retry_max_attempts = 2       # same-minute retries per underlying
 symbol      = "SENSEX"
 security_id = 51
 segment     = "IDX_I"
-slot_sec    = 53
+slot_sec    = 50           # 2026-05-25 operator lock — burst starts at :50; sequential S→B→N completes by :00
 
 [[option_chain_minute_snapshot.underlyings]]
 symbol      = "BANKNIFTY"
 security_id = 25
 segment     = "IDX_I"
-slot_sec    = 56
+slot_sec    = 53
 
 [[option_chain_minute_snapshot.underlyings]]
 symbol      = "NIFTY"
 security_id = 13
 segment     = "IDX_I"
-slot_sec    = 59
+slot_sec    = 56
 
 # ===========================================================================
 # PR #1 (AWS-lifecycle 14-PR sequence) — CONTRACT STUB sections.

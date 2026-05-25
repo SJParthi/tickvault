@@ -73,6 +73,20 @@ pub const LOCKED_UNIVERSE: &[(u32, &str, ExchangeSegment)] = &[
 pub const OPTION_CHAIN_UNDERLYINGS: &[(u32, &str)] =
     &[(13, "NIFTY"), (25, "BANKNIFTY"), (51, "SENSEX")];
 
+/// Operator-locked sequential fetch order for the option-chain minute
+/// scheduler (2026-05-25). At every `:50` of each market-hours minute,
+/// the scheduler fires fetches in THIS order — SENSEX first
+/// (slowest-to-update per operator's profiling), then BANKNIFTY, then
+/// NIFTY. Sequential (not parallel) to stay inside Dhan's
+/// 1-request-per-3-seconds-per-underlying rate limit; total burst
+/// completes in ~18s, finishing before the next minute boundary.
+///
+/// Re-ordering this slice requires a rule-file edit per operator
+/// directive and an explicit ratchet test update. The order is
+/// pinned by `tests/option_chain_warmup_wiring.rs`.
+pub const OPTION_CHAIN_FETCH_SEQUENCE: &[(u32, &str)] =
+    &[(51, "SENSEX"), (25, "BANKNIFTY"), (13, "NIFTY")];
+
 /// Convenience: lookup an underlying name by security_id in the locked
 /// universe. Returns `None` for any SID not in the 4-entry slice.
 ///

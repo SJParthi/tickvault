@@ -262,6 +262,7 @@ pub fn spawn_snapshot_scheduler(
     config: OptionChainMinuteSnapshotConfig,
     client: OptionChainClient,
     cache: SnapshotCache,
+    current_expiry_cache: crate::option_chain::current_expiry_cache::CurrentExpiryCache,
     notifier: Arc<NotificationService>,
     questdb_config: QuestDbConfig,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -283,7 +284,15 @@ pub fn spawn_snapshot_scheduler(
     );
 
     Some(tokio::spawn(async move {
-        run_snapshot_loop(config, client, cache, notifier, questdb_config).await;
+        run_snapshot_loop(
+            config,
+            client,
+            cache,
+            current_expiry_cache,
+            notifier,
+            questdb_config,
+        )
+        .await;
     }))
 }
 
@@ -294,6 +303,7 @@ async fn run_snapshot_loop(
     config: OptionChainMinuteSnapshotConfig,
     mut client: OptionChainClient,
     cache: SnapshotCache,
+    current_expiry_cache: crate::option_chain::current_expiry_cache::CurrentExpiryCache,
     notifier: Arc<NotificationService>,
     questdb_config: QuestDbConfig,
 ) {
@@ -352,6 +362,7 @@ async fn run_snapshot_loop(
             &entry,
             &mut client,
             &cache_handle,
+            &current_expiry_cache,
             &notifier,
             &mut state,
             &config,
@@ -398,6 +409,7 @@ async fn run_one_slot_fetch(
     entry: &OptionChainUnderlyingEntry,
     client: &mut OptionChainClient,
     cache: &SnapshotCache,
+    current_expiry_cache: &crate::option_chain::current_expiry_cache::CurrentExpiryCache,
     notifier: &Arc<NotificationService>,
     state: &mut SchedulerState,
     _config: &OptionChainMinuteSnapshotConfig,
@@ -407,24 +419,51 @@ async fn run_one_slot_fetch(
     let segment = entry.segment.as_str();
     let security_id = u64::from(entry.security_id);
 
-    // Step 1 — fetch the expiry list, pick the nearest non-expired.
-    let expiries = match client.fetch_expiry_list(security_id, segment).await {
-        Ok(list) => list,
-        Err(err) => {
-            record_fetch_failure(underlying, 1, &err.to_string(), notifier, state);
-            return;
+    // Step 1 — resolve the current expiry. Operator-confirmed
+    // 2026-05-25: `data[0]` is ALWAYS the nearest/current expiry per
+    // Dhan's `/optionchain/expirylist` contract. The cache is populated
+    // by the 09:00:30 IST `expiry_warmup` task and the boot-time
+    // REHYDRATE (`option_chain_cache_loader`). Cache hit = skip the
+    // expiry-list Dhan call entirely (50% reduction in REST traffic).
+    // Cache miss = fall back to inline fetch (Z+ L6 RECOVER).
+    let expiry: String = match current_expiry_cache.get(
+        entry.security_id,
+        tickvault_common::segment::segment_str_to_code(segment).unwrap_or(0),
+    ) {
+        Some(cached) => (*cached).to_string(),
+        None => {
+            // Fallback: cache miss. Inline expiry-list fetch.
+            // Populates the cache on success so subsequent slots
+            // benefit immediately.
+            let expiries = match client.fetch_expiry_list(security_id, segment).await {
+                Ok(list) => list,
+                Err(err) => {
+                    record_fetch_failure(underlying, 1, &err.to_string(), notifier, state);
+                    return;
+                }
+            };
+            let Some(first) = expiries.data.into_iter().next() else {
+                record_fetch_failure(
+                    underlying,
+                    1,
+                    "expiry list returned empty array",
+                    notifier,
+                    state,
+                );
+                return;
+            };
+            current_expiry_cache.insert(
+                entry.security_id,
+                tickvault_common::segment::segment_str_to_code(segment).unwrap_or(0),
+                &first,
+            );
+            warn!(
+                underlying,
+                expiry = first.as_str(),
+                "option-chain: current-expiry cache MISS — inline fetch + populate"
+            );
+            first
         }
-    };
-
-    let Some(expiry) = expiries.data.into_iter().next() else {
-        record_fetch_failure(
-            underlying,
-            1,
-            "expiry list returned empty array",
-            notifier,
-            state,
-        );
-        return;
     };
 
     // Step 2 — fetch the option chain itself.

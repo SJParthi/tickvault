@@ -4271,16 +4271,67 @@ async fn main() -> Result<()> {
                 // a follow-up so the future strategy can read from it.
                 // For now (PR #5), spawning is sufficient — the cache
                 // accumulates snapshots ready for the next consumer.
+                // Clone OWNED inputs once so the warmup-client constructor
+                // below (which also takes ownership) can reuse them.
+                let oc_token_for_warmup = oc_token.clone();
+                let oc_client_id_for_warmup = oc_client_id.clone();
+                let oc_base_url_for_warmup = oc_base_url.clone();
+
                 match tickvault_core::option_chain::client::OptionChainClient::new(
                     oc_token,
                     oc_client_id,
                     oc_base_url,
                 ) {
                     Ok(oc_client) => {
+                        // 2026-05-25 — Per-day current-expiry cache.
+                        // Shared between (a) boot REHYDRATE from
+                        // QuestDB (`option_chain_cache_loader`),
+                        // (b) 09:00:30 IST warmup task
+                        // (`expiry_warmup::spawn_expiry_warmup_task`),
+                        // and (c) the minute-snapshot scheduler
+                        // (`spawn_snapshot_scheduler`). All three hold
+                        // cloned handles to the same papaya map.
+                        let current_expiry_cache = tickvault_core::option_chain::current_expiry_cache::CurrentExpiryCache::new();
+
+                        // L3 RECONCILE — rehydrate cache from QuestDB
+                        // (fast crash recovery, <1s). Logs at
+                        // info!/warn!/error! per outcome.
+                        tickvault_app::option_chain_cache_loader::rehydrate_and_log(
+                            &config.questdb,
+                            &current_expiry_cache,
+                        )
+                        .await;
+
+                        // L4 PREVENT — daily 09:00:30 IST warmup task.
+                        // Reuses the same token/client_id/base_url
+                        // constructors as the scheduler.
+                        match tickvault_core::option_chain::client::OptionChainClient::new(
+                            oc_token_for_warmup,
+                            oc_client_id_for_warmup,
+                            oc_base_url_for_warmup,
+                        ) {
+                            Ok(warmup_client) => {
+                                let _ = tickvault_core::option_chain::expiry_warmup::spawn_expiry_warmup_task(
+                                    warmup_client,
+                                    current_expiry_cache.clone(),
+                                    oc_notifier.clone(),
+                                );
+                                info!("option-chain 09:00:30 IST expiry warmup task spawned");
+                            }
+                            Err(err) => {
+                                error!(
+                                    ?err,
+                                    "option-chain warmup client construction failed — \
+                                     warmup task NOT spawned (scheduler will inline-fallback)"
+                                );
+                            }
+                        }
+
                         let _ = tickvault_core::option_chain::snapshot_scheduler::spawn_snapshot_scheduler(
                             oc_config,
                             oc_client,
                             oc_cache,
+                            current_expiry_cache,
                             oc_notifier,
                             config.questdb.clone(),
                         );
