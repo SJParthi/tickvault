@@ -466,16 +466,69 @@ async fn run_one_slot_fetch(
         }
     };
 
-    // Step 2 — fetch the option chain itself.
-    let chain = match client
-        .fetch_option_chain(security_id, segment, &expiry)
-        .await
+    // Step 2 — fetch the option chain itself, with intra-minute
+    // retry per operator lock 2026-05-25 (PR #787). On failure we
+    // retry up to MAX_ATTEMPTS_PER_UNDERLYING_PER_BURST times within
+    // the same minute window, respecting Dhan's per-underlying 3s
+    // rate limit (the client's internal `enforce_rate_limit` inserts
+    // the wait automatically). The retry budget is bounded by the
+    // remaining seconds until the :59 hard deadline.
+    let burst_deadline_sec = crate::option_chain::burst_orchestrator::BURST_DEADLINE_SEC_OF_MINUTE;
+    let mut chain_opt: Option<crate::option_chain::types::OptionChainResponse> = None;
+    let mut last_error: String = String::new();
+    let mut attempts: u32 = 0;
+    while attempts < crate::option_chain::burst_orchestrator::MAX_ATTEMPTS_PER_UNDERLYING_PER_BURST
     {
-        Ok(c) => c,
-        Err(err) => {
-            record_fetch_failure(underlying, 1, &err.to_string(), notifier, state);
-            return;
+        attempts = attempts.saturating_add(1);
+        match client
+            .fetch_option_chain(security_id, segment, &expiry)
+            .await
+        {
+            Ok(c) => {
+                if attempts > 1 {
+                    info!(
+                        underlying,
+                        attempts, "option-chain fetch RECOVERED via intra-minute retry"
+                    );
+                }
+                chain_opt = Some(c);
+                break;
+            }
+            Err(err) => {
+                last_error = err.to_string();
+                // Decide whether to retry: budget + deadline check.
+                let now_utc = chrono::Utc::now().timestamp();
+                let now_secs_of_day =
+                    crate::option_chain::burst_orchestrator::ist_secs_of_day_now(now_utc);
+                let sec_in_min = now_secs_of_day % 60;
+                // Remaining seconds in this minute window before :59.
+                let secs_remaining = burst_deadline_sec.saturating_sub(sec_in_min);
+                match crate::option_chain::burst_orchestrator::next_retry_sleep_secs(
+                    secs_remaining,
+                    attempts,
+                ) {
+                    Some(sleep_secs) => {
+                        warn!(
+                            underlying,
+                            attempt = attempts,
+                            secs_remaining,
+                            sleep_secs,
+                            error = last_error.as_str(),
+                            "option-chain fetch failed — intra-minute retry scheduled"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+                    }
+                    None => {
+                        // No retry budget left — exit and record failure.
+                        break;
+                    }
+                }
+            }
         }
+    }
+    let Some(chain) = chain_opt else {
+        record_fetch_failure(underlying, attempts, &last_error, notifier, state);
+        return;
     };
 
     // Step 2.5 — L2 VERIFY (PR #8d, heart-piece §3 row 2). Structurally
