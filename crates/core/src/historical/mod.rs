@@ -35,6 +35,14 @@
 
 pub mod candle_fetcher;
 pub mod cross_verify;
+// 2026-05-25 PR #788 — JSONL + HTML report writer for cross-verify
+// outcomes. Operator-locked: Telegram is reserved for MISMATCH only;
+// PASS / SKIP go to the report files (operator-readable HTML opens in
+// browser; JSONL grep-able via MCP).
+pub mod cross_verify_report;
+// 2026-05-25 PR #788 — pure-function helpers for the cross-verify
+// scheduler (09:00:30 IST 1d-yesterday and 15:31:00 IST intraday).
+pub mod cross_verify_scheduler;
 // Phase 0 Item 10 — pure planner that computes which 1m bar starts a
 // disconnect gap-fill scheduler should refill. Does NOT write to ticks
 // or synthesize ticks (compliant with live-feed-purity rule). The

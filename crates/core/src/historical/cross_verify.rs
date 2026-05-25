@@ -595,6 +595,20 @@ fn has_price_mismatch(d_open: f64, d_high: f64, d_low: f64, d_close: f64, epsilo
         || d_close.abs() > epsilon
 }
 
+/// Per data-integrity.md "Price Precision Preservation" + operator
+/// lock 2026-05-25: NSE indices (IDX_I) have no published volume.
+/// Dhan returns 0 in both historical and live paths. We exclude IDX_I
+/// from volume comparison entirely — even a drift in Dhan's response
+/// (junk non-zero) must NOT be flagged.
+///
+/// Returns `false` ONLY for `IDX_I`; every other segment is eligible.
+/// O(1) — string equality. Pinned by ratchet
+/// `test_volume_check_skipped_for_idx_i`.
+#[must_use]
+pub fn is_volume_check_eligible(segment: &str) -> bool {
+    segment != "IDX_I"
+}
+
 /// Detects whether a volume mismatch exists.
 ///
 /// Exact matching: any difference in volume values flags as mismatch.
@@ -741,8 +755,15 @@ fn classify_cross_match_row(
 
     let price_mismatch =
         has_price_mismatch(d_open, d_high, d_low, d_close, CROSS_MATCH_PRICE_EPSILON);
-    let volume_mismatch =
-        has_volume_mismatch(hist.volume, live.volume, CROSS_MATCH_VOLUME_TOLERANCE_PCT);
+    // 2026-05-25 (PR #788, operator demand): for IDX_I (indices) volume
+    // is NEVER checked. NSE does not publish volume for index values —
+    // Dhan returns 0 historical and live ticks carry 0. The 0==0 equality
+    // currently masks this, but if Dhan ever drifts (junk non-zero on
+    // either side), we MUST NOT raise a false mismatch.
+    // Pinned by `intra_minute_retry_guard` companion + new ratchet
+    // `test_volume_check_skipped_for_idx_i`.
+    let volume_mismatch = is_volume_check_eligible(&ctx.segment)
+        && has_volume_mismatch(hist.volume, live.volume, CROSS_MATCH_VOLUME_TOLERANCE_PCT);
     let oi_mismatch = has_oi_mismatch(hist.oi, live.oi, CROSS_MATCH_OI_TOLERANCE_PCT);
 
     if !price_mismatch && !volume_mismatch && !oi_mismatch {
@@ -2071,6 +2092,39 @@ async fn parse_missing_historical_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // is_volume_check_eligible — IDX_I volume skip per operator lock 2026-05-25
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_volume_check_eligible_returns_false_for_idx_i() {
+        // NSE indices have no published volume — Dhan returns 0 on
+        // both historical and live paths. We MUST skip the comparison
+        // entirely so any Dhan-side drift doesn't false-positive.
+        assert!(!is_volume_check_eligible("IDX_I"));
+    }
+
+    #[test]
+    fn test_is_volume_check_eligible_returns_true_for_equities_and_fno() {
+        // Every other segment has real volume — comparison MUST run.
+        assert!(is_volume_check_eligible("NSE_EQ"));
+        assert!(is_volume_check_eligible("NSE_FNO"));
+        assert!(is_volume_check_eligible("BSE_FNO"));
+        assert!(is_volume_check_eligible("BSE_EQ"));
+        assert!(is_volume_check_eligible("MCX_COMM"));
+    }
+
+    #[test]
+    fn test_is_volume_check_eligible_case_sensitive() {
+        // Defensive — only exact "IDX_I" string skips. Lowercase or
+        // other variants get the normal volume check (Dhan never
+        // returns those, but we don't want a typo to silently disable
+        // volume checks on a real segment).
+        assert!(is_volume_check_eligible("idx_i"));
+        assert!(is_volume_check_eligible(""));
+        assert!(is_volume_check_eligible("INDEX"));
+    }
 
     // -----------------------------------------------------------------------
     // TodayIstWindow — today-only SQL window (fixes "12 days accumulated" bug)
