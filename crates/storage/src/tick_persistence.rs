@@ -1174,6 +1174,12 @@ impl TickPersistenceWriter {
 
 /// Stack buffer size for f32 shortest decimal representation.
 /// Maximum f32 decimal string: "-3.4028235e+38" = 15 chars. 24 is generous.
+///
+/// Test-only after 2026-05-25 — the canonical conversion now lives in
+/// `tickvault_common::price_precision`. Kept here for the pre-existing
+/// boundary tests (`test_f32_decimal_buf_size_*`) that pin the const's
+/// numeric value.
+#[cfg(test)]
 const F32_DECIMAL_BUF_SIZE: usize = 24;
 
 /// Converts f32 to f64 preserving the shortest decimal representation.
@@ -1187,32 +1193,19 @@ const F32_DECIMAL_BUF_SIZE: usize = 24;
 ///
 /// # Performance
 /// Zero heap allocation — uses a stack buffer for the decimal string.
-#[inline]
 /// Converts f32 → f64 without IEEE 754 widening artifacts.
 ///
 /// STORAGE-GAP-02: Dhan WebSocket sends prices as f32. Naive `v as f64`
-/// introduces artifacts (e.g., 21004.95_f32 → 21004.94921875_f64). This
-/// function converts via shortest decimal representation to preserve the
-/// original Dhan price. O(1) — one format + one parse.
+/// introduces artifacts (e.g., 21004.95_f32 → 21004.94921875_f64).
+///
+/// 2026-05-25: the canonical implementation lives in
+/// `tickvault_common::price_precision::f32_to_f64_clean`. This wrapper
+/// preserves the existing public symbol used by callers + benchmarks
+/// in this crate. The aggregator + indicator engine in
+/// `tickvault-trading` import the common module directly.
+#[inline]
 pub fn f32_to_f64_clean(v: f32) -> f64 {
-    if v == 0.0 || !v.is_finite() {
-        // APPROVED: f64::from(f32) is correct for zero/inf/NaN — no precision loss for these values
-        return f64::from(v);
-    }
-    let mut buf = [0u8; F32_DECIMAL_BUF_SIZE];
-    let mut cursor = std::io::Cursor::new(&mut buf[..]);
-    // f32 Display uses ryu internally — produces the shortest decimal
-    // representation that round-trips through f32. Zero allocation.
-    drop(write!(cursor, "{v}"));
-    #[allow(clippy::arithmetic_side_effects)]
-    // APPROVED: cursor position of a 24-byte buf always fits usize
-    let n = cursor.position() as usize;
-    // f32 Display only produces ASCII digits, '.', '-', 'e', '+'.
-    std::str::from_utf8(&buf[..n])
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        // APPROVED: f64::from(f32) fallback — only reached if ryu/parse fails (never in practice)
-        .unwrap_or(f64::from(v))
+    tickvault_common::price_precision::f32_to_f64_clean(v)
 }
 
 // ---------------------------------------------------------------------------
