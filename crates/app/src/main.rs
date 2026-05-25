@@ -5898,15 +5898,72 @@ fn spawn_historical_candle_fetch(
                     .saturating_sub(cross_match.missing_live)
                     .saturating_sub(missing_historical);
 
+                // PR #788 (2026-05-25 operator lock): cross-verify is a
+                // FORENSIC report, NOT a real-time alert. Telegram fires
+                // ONLY on mismatch (Critical/High path). The PASS branch
+                // writes the row to JSONL + regenerates the HTML report
+                // — no Telegram noise.
+                {
+                    let now_utc_secs = chrono::Utc::now().timestamp();
+                    let today_ist =
+                        tickvault_core::historical::cross_verify_scheduler::ist_date_now(
+                            now_utc_secs,
+                        );
+                    let run_secs =
+                        tickvault_core::historical::cross_verify_scheduler::ist_secs_of_day_now(
+                            now_utc_secs,
+                        );
+                    let trigger = if run_secs < 12 * 3600 {
+                        tickvault_core::historical::cross_verify_scheduler::TRIGGER_LABEL_DAILY
+                    } else {
+                        tickvault_core::historical::cross_verify_scheduler::TRIGGER_LABEL_INTRADAY
+                    };
+                    let row = tickvault_core::historical::cross_verify_report::build_report_row_from_cross_match(
+                        today_ist,
+                        run_secs,
+                        trigger,
+                        &cross_match,
+                    );
+                    if let Err(err) =
+                        tickvault_core::historical::cross_verify_report::append_jsonl_row(&row)
+                    {
+                        error!(
+                            ?err,
+                            "cross-verify JSONL append failed (report degraded; cross-match itself unaffected)"
+                        );
+                    }
+                    // Re-render full HTML from all rows so today's
+                    // 1d + intraday outcomes show up together.
+                    let all_rows =
+                        tickvault_core::historical::cross_verify_report::read_jsonl_rows(today_ist);
+                    if let Err(err) =
+                        tickvault_core::historical::cross_verify_report::write_html_report(
+                            today_ist, &all_rows,
+                        )
+                    {
+                        error!(
+                            ?err,
+                            "cross-verify HTML write failed (report degraded; cross-match itself unaffected)"
+                        );
+                    }
+                }
+
                 if cross_match.passed {
-                    bg_notifier.notify(NotificationEvent::CandleCrossMatchPassed {
-                        timeframes_checked: cross_match.timeframes_checked,
-                        candles_compared: cross_match.candles_compared,
-                        today_ist_label,
+                    // Operator-locked: NO Telegram on PASS — only the
+                    // structured INFO log and the report files.
+                    info!(
+                        timeframes_checked = cross_match.timeframes_checked,
+                        candles_compared = cross_match.candles_compared,
+                        coverage_pct = cross_match.coverage_pct,
+                        today_ist_label = today_ist_label.as_str(),
                         scope_indices,
                         scope_equities,
-                        per_tf_cells: cross_match.per_timeframe_mismatches.clone(),
-                    });
+                        "CROSS-VERIFY PASS — written to data/logs/cross_verify.YYYY-MM-DD.{{jsonl,html}}; \
+                         Telegram suppressed per PR #788 operator lock"
+                    );
+                    // Silence unused-binding warnings from the
+                    // Telegram-routing locals (kept for the fail branch).
+                    let _ = (scope_indices, scope_equities, today_ist_label);
                 } else {
                     // Group mismatch details by category for Telegram.
                     // Order: missing_live → value_diff → missing_historical.
