@@ -60,3 +60,9 @@ pub mod gap_fill_scheduler;
 // types. Scheduler wiring (REST fan-out + audit writes + strategy
 // gate) lands in sub-deliverable 4. See plan §785.
 pub mod post_open_cross_check;
+
+// PR #796 (operator-locked 2026-05-25) — post-market fetch window
+// gate. Restricts 90-day historical fetch + current-day intraday
+// fetch + cross-verification to the 15:30 – 23:00 IST window. Pure
+// O(1) range checker; no allocation; safe to call from any hot path.
+pub mod post_market_fetch_window;
