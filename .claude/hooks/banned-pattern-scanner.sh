@@ -220,7 +220,32 @@ scan_storage_precision() {
   scan_prod_code "$pattern" "$description" "$storage_files"
 }
 
+# 2026-05-25: extended-scope scanner for the ParsedTick price fields.
+# Operator-spotted candles_1m corruption (23937.30078125) traced to
+# f64::from(tick.last_traded_price) in crates/trading and crates/core.
+# Those crates have legitimate u32→f64 / u16→f64 usages so we can't
+# ban bare `f64::from(` like we do in storage — we target the specific
+# f32 price fields by name.
+scan_tick_price_precision() {
+  local pattern="$1"
+  local files="$2"
+  local price_path_files
+
+  price_path_files=$(echo "$files" | grep -E '^crates/(storage|trading|core)/' || true)
+  if [ -z "$price_path_files" ]; then
+    return
+  fi
+
+  scan_prod_code "$pattern" "$pattern — use tickvault_common::price_precision::f32_to_f64_clean() (data-integrity.md \"Price Precision Preservation\")" "$price_path_files"
+}
+
 scan_storage_precision 'f64::from(' 'f64::from(f32) in storage — use f32_to_f64_clean() to preserve Dhan price precision' "$STAGED_FILES"
+scan_tick_price_precision 'f64::from(tick\.last_traded_price)' "$STAGED_FILES"
+scan_tick_price_precision 'f64::from(tick\.day_open)'           "$STAGED_FILES"
+scan_tick_price_precision 'f64::from(tick\.day_high)'           "$STAGED_FILES"
+scan_tick_price_precision 'f64::from(tick\.day_low)'            "$STAGED_FILES"
+scan_tick_price_precision 'f64::from(tick\.day_close)'          "$STAGED_FILES"
+scan_tick_price_precision 'f64::from(tick\.average_traded_price)' "$STAGED_FILES"
 
 # ─────────────────────────────────────────────
 # CATEGORY 3: Hardcoded values (all prod code)
