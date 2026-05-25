@@ -101,6 +101,16 @@ chown -R ec2-user:ec2-user /opt/tickvault
 sudo -u ec2-user git clone --depth 1 \
     https://github.com/SJParthi/tickvault.git /opt/tickvault/repo
 
+# ---- Step 5b: Stage config files where the app expects them ----
+# The Rust app reads `config/base.toml` relative to its working
+# directory (`/opt/tickvault` per the systemd unit). On first boot the
+# /opt/tickvault/config/ directory is empty — without this copy step
+# the binary halts at boot with "config file not found", regardless of
+# whether the deploy-aws workflow has shipped the binary yet.
+# Copy is idempotent — re-running user-data refreshes config from repo.
+cp -f /opt/tickvault/repo/config/*.toml /opt/tickvault/config/ 2>/dev/null || true
+chown -R ec2-user:ec2-user /opt/tickvault/config
+
 # ---- Step 6: Start the Docker Compose stack ----
 # Post-CloudWatch-only migration (#O1/#O2/#O3/#O4): the stack is QuestDB
 # only. `restart: unless-stopped` ensures containers auto-come-up on every
