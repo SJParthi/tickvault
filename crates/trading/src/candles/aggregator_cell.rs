@@ -173,13 +173,19 @@ impl LiveCandleState {
         bucket_start_cumulative: u64,
         use_day_open: bool,
     ) -> Self {
-        let price = f64::from(tick.last_traded_price);
+        // Operator-spotted 2026-05-25: f64::from(f32) on price fields
+        // produces IEEE-754 widening artifacts (e.g. 23925.65_f32 →
+        // 23925.650390625_f64) that landed verbatim in candles_1m.
+        // data-integrity.md "Price Precision Preservation" mandates
+        // f32_to_f64_clean for ALL f32→f64 price conversions written
+        // to QuestDB.
+        let price = tickvault_common::price_precision::f32_to_f64_clean(tick.last_traded_price);
         // Day-open override: the day's first bar opens at the exchange
         // day-open. Fall back to the LTP if the Quote packet carried a
         // zero `day_open` (e.g. pre-open or a malformed packet) so the
         // candle still has a sensible open.
         let open = if use_day_open && tick.day_open > 0.0 {
-            f64::from(tick.day_open)
+            tickvault_common::price_precision::f32_to_f64_clean(tick.day_open)
         } else {
             price
         };
@@ -205,7 +211,9 @@ impl LiveCandleState {
     /// `TfIndex::bucket_start(tick.exchange_timestamp) == self.bucket_start_ist_secs`).
     #[inline]
     fn fold_in_bucket(&mut self, tick: &ParsedTick) {
-        let price = f64::from(tick.last_traded_price);
+        // 2026-05-25: f32_to_f64_clean (not f64::from) — see
+        // from_first_tick docs above for the IEEE-754 widening rationale.
+        let price = tickvault_common::price_precision::f32_to_f64_clean(tick.last_traded_price);
         if price > self.high {
             self.high = price;
         }

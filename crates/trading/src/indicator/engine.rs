@@ -85,11 +85,19 @@ impl IndicatorEngine {
         }
 
         let state = &mut self.states[sid];
-        let price = f64::from(tick.last_traded_price);
-        let high = f64::from(tick.day_high);
-        let low = f64::from(tick.day_low);
+        // Operator-spotted 2026-05-25: f64::from(f32) on price fields
+        // widens IEEE-754 (e.g. 23925.65_f32 → 23925.650390625_f64).
+        // Every SMA/EMA/RSI/MACD/BB derived from these inputs inherits
+        // the widening, and every strategy decision built on those
+        // indicators is therefore built on corrupted numbers.
+        // data-integrity.md "Price Precision Preservation" mandates
+        // f32_to_f64_clean on all f32→f64 price conversions.
+        let price = tickvault_common::price_precision::f32_to_f64_clean(tick.last_traded_price);
+        let high = tickvault_common::price_precision::f32_to_f64_clean(tick.day_high);
+        let low = tickvault_common::price_precision::f32_to_f64_clean(tick.day_low);
+        // u32→f64 is exact (no IEEE-754 widening); kept as f64::from.
         let volume = f64::from(tick.volume);
-        let close = f64::from(tick.day_close);
+        let close = tickvault_common::price_precision::f32_to_f64_clean(tick.day_close);
 
         // Track warmup
         if state.warmup_count < u16::MAX {

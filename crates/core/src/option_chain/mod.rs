@@ -11,6 +11,16 @@
 //! Requires both `access-token` AND `client-id` headers.
 
 pub mod client;
+// 2026-05-25 — Per-day cache of current (nearest) expiry per
+// underlying. Halves Dhan REST traffic by skipping the
+// `/optionchain/expirylist` call on every minute slot (per
+// operator-confirmed `data[0]`-is-always-current insight). See
+// `current_expiry_cache.rs` module docs.
+pub mod current_expiry_cache;
+// 2026-05-25 — Pre-market 09:00:30 IST one-shot task that populates
+// `CurrentExpiryCache` with 3 expiry-list calls (one per
+// NIFTY/BANKNIFTY/SENSEX). Triggered once per trading day.
+pub mod expiry_warmup;
 // PR #8d (2026-05-20) — L2 VERIFY structural validation of a fetched
 // option-chain response before it is cached (heart-piece §3 row 2).
 pub mod l2_verify;

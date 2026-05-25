@@ -46,5 +46,10 @@ pub mod prev_oi_loader;
 // table on cold boot.
 pub mod metrics_catalog;
 pub mod observability;
+// 2026-05-25 — Crash-recovery REHYDRATE of the option-chain current-
+// expiry cache from QuestDB's `option_chain_minute_snapshot` table.
+// See `option_chain_cache_loader.rs` module docs for the 3-tier
+// recovery contract.
+pub mod option_chain_cache_loader;
 pub mod subsystem_memory;
 pub mod trading_pipeline;
