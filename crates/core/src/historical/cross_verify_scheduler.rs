@@ -28,7 +28,7 @@
 //! this window. 09:00:30 sits 30s into the window; 15:31:00 sits 29
 //! minutes before shutdown — both safe.
 
-use chrono::{Datelike, Duration, NaiveDate};
+use chrono::{Duration, NaiveDate};
 
 use tickvault_common::constants::{IST_UTC_OFFSET_SECONDS_I64, SECONDS_PER_DAY};
 
@@ -121,6 +121,7 @@ pub fn ist_date_now(now_utc_secs: i64) -> NaiveDate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Datelike;
 
     #[test]
     fn test_secs_until_next_daily_1d_fire_alias_for_guard() {
