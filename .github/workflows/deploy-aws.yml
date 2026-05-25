@@ -89,8 +89,12 @@ jobs:
           fi
 
   build:
-    name: Build release binary
-    runs-on: ubuntu-24.04
+    # Native ARM64 runner — matches t4g.medium Graviton instance arch.
+    # GitHub provides ubuntu-24.04-arm at no cost for public repos and
+    # standard pricing for private. Native compilation avoids cross-
+    # compile complexity for native deps (aws-lc-rs, ring, jemalloc).
+    name: Build release binary (ARM64)
+    runs-on: ubuntu-24.04-arm
     needs: preflight
     if: needs.preflight.outputs.bootstrap_ready == 'true'
     outputs:
@@ -99,11 +103,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
+      - name: Install Rust toolchain (host = aarch64-unknown-linux-gnu)
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # SHA-pinned (was @master, supply-chain hardening 2026-04-25)
         with:
           toolchain: 1.95.0
-          targets: x86_64-unknown-linux-gnu
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install ARM64 build deps (cmake for aws-lc-rs)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential pkg-config
 
       - name: Cache cargo registry + target
         uses: actions/cache@v4
@@ -112,28 +121,43 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-arm64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build release binary
+      - name: Build tickvault release binary (ARM64)
         run: cargo build --release --bin tickvault -p tickvault-app
 
-      - name: Verify binary exists + under 15MB
+      - name: Build smoke_test binary (ARM64)
+        # Separate binary at crates/app/src/bin/smoke_test.rs — exits 0/1
+        # without burning Dhan rate limit. Run by deploy as a pre-swap gate.
+        run: cargo build --release --bin smoke_test -p tickvault-app
+
+      - name: Verify binaries exist + tickvault under 15MB
         run: |
-          ls -la target/release/tickvault
+          file target/release/tickvault
+          file target/release/smoke_test
+          # Confirm the file command reports ARM aarch64 (not x86)
+          file target/release/tickvault | grep -q 'aarch64\|ARM' \
+            || (echo "FAIL: tickvault is not ARM64 — arch mismatch with t4g.medium Graviton"; exit 1)
           SIZE_BYTES=$(stat -c%s target/release/tickvault)
           SIZE_MB=$((SIZE_BYTES / 1024 / 1024))
-          echo "Binary size: ${SIZE_MB}MB (${SIZE_BYTES} bytes)"
+          echo "tickvault size: ${SIZE_MB}MB (${SIZE_BYTES} bytes)"
           if [ "$SIZE_BYTES" -gt 15728640 ]; then
             echo "FAIL: binary exceeds 15MB cap"
             exit 1
           fi
 
-      - name: Upload artifact
+      - name: Stage both binaries for upload
+        run: |
+          mkdir -p dist
+          cp target/release/tickvault   dist/tickvault
+          cp target/release/smoke_test  dist/smoke_test
+
+      - name: Upload artifact (both binaries)
         id: upload
         uses: actions/upload-artifact@v7
         with:
           name: tickvault-binary
-          path: target/release/tickvault
+          path: dist/
           retention-days: 7
 
   guard_market_hours:
@@ -189,33 +213,46 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
           role-session-name: tv-github-deploy-${{ github.run_id }}
 
-      - name: Upload binary to S3 staging bucket
+      - name: Upload both binaries to S3 staging bucket
         run: |
-          chmod +x ./dist/tickvault
+          chmod +x ./dist/tickvault ./dist/smoke_test
           aws s3 cp ./dist/tickvault \
             s3://tv-prod-cold/deploys/${{ github.sha }}/tickvault \
             --region ${{ vars.AWS_REGION }}
+          aws s3 cp ./dist/smoke_test \
+            s3://tv-prod-cold/deploys/${{ github.sha }}/smoke_test \
+            --region ${{ vars.AWS_REGION }}
 
-      - name: Run SSM command — download binary + smoke test + swap
+      - name: Run SSM command — download binaries + smoke test + atomic swap
+        # Target path is /opt/tickvault (matches user-data.sh.tftpl step 4).
+        # Smoke test is a SEPARATE binary (crates/app/src/bin/smoke_test.rs),
+        # NOT a subcommand of `tickvault`. The previous version
+        # (`bin/tickvault.new smoke-test --duration 30`) was wrong and would
+        # exit non-zero with "unrecognized subcommand".
         id: ssm
         run: |
           CMD_ID=$(aws ssm send-command \
             --region ${{ vars.AWS_REGION }} \
             --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
             --document-name "AWS-RunShellScript" \
-            --comment "DLT deploy sha=${{ github.sha }}" \
+            --comment "tickvault deploy sha=${{ github.sha }}" \
             --parameters 'commands=[
               "set -euo pipefail",
-              "cd /opt/dlt",
+              "cd /opt/tickvault",
+              "# Sync config files from the repo clone (idempotent)",
+              "if [ -d repo/config ]; then cp -f repo/config/*.toml config/ 2>/dev/null || true; chown -R ec2-user:ec2-user config/; fi",
               "# Back up the current binary so we can roll back",
               "if [ -f bin/tickvault ]; then cp bin/tickvault bin/tickvault.backup; fi",
-              "# Download the new binary from S3",
-              "aws s3 cp s3://tv-prod-cold/deploys/${{ github.sha }}/tickvault bin/tickvault.new",
-              "chmod +x bin/tickvault.new",
-              "# Run smoke test (must exit 0 in < 30 seconds)",
-              "timeout 40 bin/tickvault.new smoke-test --duration 30",
-              "# Atomic swap",
-              "mv bin/tickvault.new bin/tickvault",
+              "# Download the new binaries from S3",
+              "aws s3 cp s3://tv-prod-cold/deploys/${{ github.sha }}/tickvault  bin/tickvault.new",
+              "aws s3 cp s3://tv-prod-cold/deploys/${{ github.sha }}/smoke_test bin/smoke_test.new",
+              "chmod +x bin/tickvault.new bin/smoke_test.new",
+              "# Run smoke test using the NEW standalone binary (must exit 0 in < 30s)",
+              "timeout 40 bin/smoke_test.new --duration 30",
+              "# Atomic swap of both binaries after smoke passes",
+              "mv bin/tickvault.new   bin/tickvault",
+              "mv bin/smoke_test.new  bin/smoke_test",
+              "chown ec2-user:ec2-user bin/tickvault bin/smoke_test",
               "# Reload systemd unit",
               "systemctl daemon-reload",
               "systemctl restart tickvault",
@@ -273,7 +310,7 @@ jobs:
               --region ${{ vars.AWS_REGION }} \
               --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
               --document-name "AWS-RunShellScript" \
-              --parameters 'commands=["set -euo pipefail","cd /opt/dlt","if [ -f bin/tickvault.backup ]; then mv bin/tickvault.backup bin/tickvault; systemctl restart tickvault; fi"]'
+              --parameters 'commands=["set -euo pipefail","cd /opt/tickvault","if [ -f bin/tickvault.backup ]; then mv bin/tickvault.backup bin/tickvault; systemctl restart tickvault; fi"]'
             exit 1
           fi
           echo "DEPLOY VERIFIED: tickvault has been active for 60s"
