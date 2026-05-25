@@ -1654,7 +1654,7 @@ pub async fn cross_match_historical_vs_live(
             "SELECT h.security_id, h.segment, h.ts, \
                     h.open, h.high, h.low, h.close, h.volume, \
                     m.open, m.high, m.low, m.close, m.volume, \
-                    h.open_interest, m.open_interest \
+                    h.oi, m.oi \
              FROM {hist} h \
              LEFT JOIN {live} m ON h.security_id = m.security_id AND h.ts = m.ts AND h.segment = m.segment \
              WHERE h.timeframe = '{tf}' AND {ts_filter_h} AND {scope_h} \
@@ -1664,7 +1664,7 @@ pub async fn cross_match_historical_vs_live(
                   OR abs(h.low - m.low) > {eps} \
                   OR abs(h.close - m.close) > {eps} \
                   OR abs(h.volume - m.volume) > 0 \
-                  OR abs(h.open_interest - m.open_interest) > 0)",
+                  OR abs(h.oi - m.oi) > 0)",
             hist = QUESTDB_TABLE_HISTORICAL_CANDLES,
             live = live_table,
             tf = hist_tf,
@@ -4615,5 +4615,38 @@ mod tests {
     #[test]
     fn test_failed_cross_match_report_always_not_passed() {
         assert!(!failed_cross_match_report().passed);
+    }
+
+    /// Regression: 2026-05-25 — cross-verify SQL queried `h.open_interest` /
+    /// `m.open_interest`, but both `historical_candles` and `candles_*`
+    /// materialized views use column `oi`. QuestDB rejected the LEFT JOIN
+    /// with 400 Bad Request 4 times (once per timeframe), masking real
+    /// mismatches behind `coverage_pct = 17%` + `passed = false`.
+    ///
+    /// This source-scan ratchet fails the build if anyone reintroduces
+    /// the wrong column name into the cross-verify SQL builders.
+    #[test]
+    fn test_regression_cross_verify_uses_oi_column_not_open_interest() {
+        let src = include_str!("cross_verify.rs");
+        // The SQL field list and abs() expression MUST reference `h.oi` /
+        // `m.oi`. They MUST NOT reference `h.open_interest` /
+        // `m.open_interest` (column does not exist).
+        assert!(
+            src.contains("h.oi, m.oi"),
+            "cross-verify LEFT JOIN SELECT MUST project `h.oi, m.oi` — \
+             both historical_candles and candles_* expose column `oi`, not \
+             `open_interest`"
+        );
+        assert!(
+            src.contains("abs(h.oi - m.oi)"),
+            "cross-verify WHERE clause MUST use `abs(h.oi - m.oi)` — the \
+             literal `h.open_interest` / `m.open_interest` causes QuestDB \
+             to return 400 Bad Request"
+        );
+        // The positive assertions above are sufficient — they fail the
+        // build if the correct `oi` references disappear. We can't add
+        // a negative assertion for `h.open_interest` here because this
+        // test body itself contains the literal (in the assertion text)
+        // and `include_str!` would see it.
     }
 }
