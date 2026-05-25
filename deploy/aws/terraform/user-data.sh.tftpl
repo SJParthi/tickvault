@@ -44,7 +44,29 @@ usermod -aG docker ec2-user
 
 # ---- Step 3: CloudWatch agent config (agent itself is pre-installed) ----
 # Inject the metrics + log config. The agent comes pre-installed but the
-# default config publishes nothing — we want disk%, mem%, cpu%, syslog.
+# default config publishes nothing — we want disk%, mem%, cpu%, syslog,
+# AND a selective Prometheus scrape of the app's :9091/metrics endpoint
+# so 12 app-level signals land in CloudWatch as custom metrics (alarms
+# in deploy/aws/terraform/app-alarms.tf). The metric_declaration list
+# is intentionally tight — full unfiltered scrape would publish 150+
+# metrics at $0.30/mo each.
+
+# Prometheus scrape config — separate file because the CW agent's
+# prometheus integration reads scrape configs in Prometheus YAML format.
+mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+cat > /opt/aws/amazon-cloudwatch-agent/etc/prometheus.yaml <<PROMCFG
+global:
+  scrape_interval: 60s
+  scrape_timeout: 10s
+scrape_configs:
+  - job_name: tickvault
+    static_configs:
+      - targets:
+          - 127.0.0.1:9091
+        labels:
+          host: tickvault-prod
+PROMCFG
+
 cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCFG
 {
   "agent": { "metrics_collection_interval": 60 },
@@ -59,6 +81,23 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCFG
     }
   },
   "logs": {
+    "metrics_collected": {
+      "prometheus": {
+        "prometheus_config_path": "/opt/aws/amazon-cloudwatch-agent/etc/prometheus.yaml",
+        "emf_processor": {
+          "metric_namespace": "Tickvault/Prod",
+          "metric_declaration_dedup": true,
+          "metric_declaration": [
+            {
+              "source_labels": ["__name__"],
+              "label_matcher": "^(tv_websocket_pool_all_dead|tv_websocket_failed_connections_count|tv_order_update_ws_active|tv_questdb_disconnected_seconds|tv_tick_gap_instruments_silent|tv_token_remaining_seconds|tv_spill_dropped_total|tv_dlq_ticks_total|tv_aggregator_seals_emitted_total|tv_orders_rejected_total|tv_realtime_guarantee_score|tv_clock_skew_seconds)$",
+              "dimensions": [["host"]],
+              "metric_selectors": ["^(tv_websocket_pool_all_dead|tv_websocket_failed_connections_count|tv_order_update_ws_active|tv_questdb_disconnected_seconds|tv_tick_gap_instruments_silent|tv_token_remaining_seconds|tv_spill_dropped_total|tv_dlq_ticks_total|tv_aggregator_seals_emitted_total|tv_orders_rejected_total|tv_realtime_guarantee_score|tv_clock_skew_seconds)$"]
+            }
+          ]
+        }
+      }
+    },
     "logs_collected": {
       "files": {
         "collect_list": [
