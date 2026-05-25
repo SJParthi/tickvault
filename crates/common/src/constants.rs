@@ -1066,6 +1066,20 @@ pub const TICK_PERSIST_START_SECS_OF_DAY_IST: u32 = 32_400;
 /// The end is **exclusive** — a tick at exactly 15:30:00 is NOT persisted.
 pub const TICK_PERSIST_END_SECS_OF_DAY_IST: u32 = 55_800;
 
+/// Operator-locked 2026-05-25: post-market historical fetch + cross-verify
+/// window START. Begins at 15:30:00 IST (= `TICK_PERSIST_END_SECS_OF_DAY_IST`).
+/// Operations gated by this constant: 90-day historical fetch, current-day
+/// intraday fetch (1m/5m/15m/60m), cross-verification.
+pub const POST_MARKET_FETCH_WINDOW_START_SECS_OF_DAY_IST: u32 = 55_800;
+
+/// Operator-locked 2026-05-25: post-market historical fetch + cross-verify
+/// window END. Stops at 23:00:00 IST = 23 × 3600 = 82_800. After this
+/// boundary, in-flight operations abort cleanly and tomorrow's 15:30 IST
+/// retry picks up where today left off. The 7.5h window (15:30→23:00 IST)
+/// gives ample retry budget for Dhan REST backoff ladders (DH-904 + DH-805)
+/// while bounding the operation to a single trading-day boundary.
+pub const POST_MARKET_FETCH_WINDOW_END_SECS_OF_DAY_IST: u32 = 82_800;
+
 /// Seconds in a day (86,400). Used for modulo arithmetic in persist window check.
 pub const SECONDS_PER_DAY: u32 = 86_400;
 
@@ -2026,6 +2040,29 @@ const _: () = assert!(
     TICK_PERSIST_END_SECS_OF_DAY_IST < SECONDS_PER_DAY,
     "TICK_PERSIST_END must be within a single day"
 );
+
+// Post-market fetch window invariants (PR #796, operator-locked 2026-05-25).
+const _: () = assert!(
+    POST_MARKET_FETCH_WINDOW_START_SECS_OF_DAY_IST == 15 * 3600 + 30 * 60,
+    "POST_MARKET_FETCH_WINDOW_START must equal 15:30 IST (55800)"
+);
+const _: () = assert!(
+    POST_MARKET_FETCH_WINDOW_END_SECS_OF_DAY_IST == 23 * 3600,
+    "POST_MARKET_FETCH_WINDOW_END must equal 23:00 IST (82800)"
+);
+const _: () = assert!(
+    POST_MARKET_FETCH_WINDOW_START_SECS_OF_DAY_IST < POST_MARKET_FETCH_WINDOW_END_SECS_OF_DAY_IST,
+    "POST_MARKET_FETCH_WINDOW_START must be before POST_MARKET_FETCH_WINDOW_END"
+);
+const _: () = assert!(
+    POST_MARKET_FETCH_WINDOW_END_SECS_OF_DAY_IST < SECONDS_PER_DAY,
+    "POST_MARKET_FETCH_WINDOW_END must be within a single day"
+);
+const _: () = assert!(
+    POST_MARKET_FETCH_WINDOW_START_SECS_OF_DAY_IST == TICK_PERSIST_END_SECS_OF_DAY_IST,
+    "Fetch window must start exactly when market closes (15:30 IST)"
+);
+
 // Phase 0 Item 20 — orphan-position watchdog timing invariants.
 const _: () = assert!(
     ORPHAN_POSITION_WATCHDOG_TIME_SECS_IST == 15 * 3600 + 25 * 60,

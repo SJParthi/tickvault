@@ -5536,6 +5536,32 @@ fn spawn_historical_candle_fetch(
             candle_writer
         };
 
+        // PR #796 (operator-locked 2026-05-25): hard cutoff at 23:00 IST.
+        // If we've waited so long for the post-market signal that the
+        // clock now reads 23:00 IST or later, abort cleanly instead of
+        // hammering Dhan REST during the operator's no-go window.
+        // Tomorrow's 15:30 IST scheduler will pick up the work.
+        {
+            use tickvault_common::constants::{IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY};
+            use tickvault_core::historical::post_market_fetch_window::{
+                FetchWindowGateOutcome, classify_post_market_fetch_window,
+            };
+            let now_utc = chrono::Utc::now().timestamp();
+            let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            // APPROVED: rem_euclid on SECONDS_PER_DAY (86400) fits u32
+            let sec_of_day = now_ist.rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
+            let outcome = classify_post_market_fetch_window(sec_of_day);
+            if matches!(outcome, FetchWindowGateOutcome::AfterWindowEnd) {
+                warn!(
+                    sec_of_day,
+                    "post-market historical fetch ABORTED — past 23:00 IST cutoff. \
+                     Tomorrow's 15:30 IST scheduler will retry (PR #796 operator-locked window)"
+                );
+                return;
+            }
+        }
+
         info!("starting historical candle fetch");
 
         let summary = fetch_historical_candles(
@@ -5865,47 +5891,67 @@ fn spawn_historical_candle_fetch(
                 }
             }
 
+            // PR #796 (operator-locked 2026-05-25): SKIP branches DELETED.
+            // Cross-verify ALWAYS produces a definitive PASS/FAIL outcome.
+            // Empty live data (post-market boot before any live tick was
+            // captured today) → FAIL with reason "no_live_candles_today".
+            // Partial coverage (mid-session boot) → FAIL with reason
+            // "partial_coverage_X_pct". The JSONL+HTML forensic record
+            // (PR #795) ALWAYS exists irrespective of outcome.
+            //
+            // Note on terminology: the "candles_*" tables are NOT
+            // QuestDB materialized views — they are plain tables
+            // populated by the live aggregator from WebSocket ticks.
+            // The legacy "materialized views" wording in earlier
+            // commits / comments is a stale artefact and has been
+            // removed throughout this branch.
             if !cross_match.live_candles_present || cross_match.candles_compared == 0 {
-                // First run / fresh DB / post-market boot with no live ticks yet.
-                //
-                // `candles_compared` alone is NOT a sufficient signal —
-                // the per-timeframe count query uses LEFT JOIN which
-                // preserves historical rows even when the live MV is
-                // empty. Trust `live_candles_present`, which is computed
-                // from a direct `SELECT count() FROM candles_1m ...`
-                // query against the live view only.
+                let reason = "no_live_candles_today".to_string();
                 info!(
                     live_candles_present = cross_match.live_candles_present,
                     candles_compared = cross_match.candles_compared,
-                    "cross-match SKIPPED — no live data in materialized views (first run, fresh DB, or post-market boot)"
+                    "cross-match FAIL — today's candles tables (candles_1m/5m/15m/60m/1d) \
+                     contain zero rows for the trading window. Likely cause: app booted \
+                     post-market with no live tick capture today. Tomorrow's run will \
+                     compare against today's captured live ticks."
                 );
-                bg_notifier.notify(NotificationEvent::CandleCrossMatchSkipped {
-                    reason: "no live data in materialized views".to_string(),
+                bg_notifier.notify(NotificationEvent::CandleCrossMatchFailed {
                     candles_compared: cross_match.candles_compared,
+                    mismatches: cross_match.mismatches,
+                    missing_live: cross_match.missing_live,
+                    mismatch_details: vec![reason],
+                    today_ist_label: format!("{}", today_window.today_ist),
+                    scope_indices: 0,
+                    scope_equities: 0,
+                    missing_historical: 0,
+                    value_mismatches: 0,
+                    per_tf_gaps: vec![],
                 });
             } else if cross_match.coverage_pct
                 < tickvault_core::historical::cross_verify::CROSS_MATCH_MIN_COVERAGE_PCT
             {
-                // 2026-04-24 regression fix: partial coverage (operator booted
-                // mid-session, or live feed had a major gap). Before this guard,
-                // mid-session-boot produced a false "CROSS-MATCH OK" because the
-                // LEFT JOIN NULL-live detail-query branch under-counted missing
-                // rows. Now we route to Skipped with a reason that names the
-                // actual coverage shortfall so the operator knows the cross-match
-                // was NOT certified.
+                let reason = format!(
+                    "partial_live_coverage_{pct}_pct_threshold_{min}",
+                    pct = cross_match.coverage_pct,
+                    min = tickvault_core::historical::cross_verify::CROSS_MATCH_MIN_COVERAGE_PCT,
+                );
                 info!(
                     coverage_pct = cross_match.coverage_pct,
                     live_candles_present = cross_match.live_candles_present,
                     candles_compared = cross_match.candles_compared,
-                    "cross-match SKIPPED — partial coverage (likely mid-session boot)"
+                    "cross-match FAIL — partial live coverage (likely mid-session boot or live feed degraded)"
                 );
-                bg_notifier.notify(NotificationEvent::CandleCrossMatchSkipped {
-                    reason: format!(
-                        "partial live coverage: {pct}% of historical grid (booted mid-session or live feed degraded; threshold {min}%)",
-                        pct = cross_match.coverage_pct,
-                        min = tickvault_core::historical::cross_verify::CROSS_MATCH_MIN_COVERAGE_PCT,
-                    ),
+                bg_notifier.notify(NotificationEvent::CandleCrossMatchFailed {
                     candles_compared: cross_match.candles_compared,
+                    mismatches: cross_match.mismatches,
+                    missing_live: cross_match.missing_live,
+                    mismatch_details: vec![reason],
+                    today_ist_label: format!("{}", today_window.today_ist),
+                    scope_indices: 0,
+                    scope_equities: 0,
+                    missing_historical: 0,
+                    value_mismatches: 0,
+                    per_tf_gaps: vec![],
                 });
             } else {
                 // Compute the "TODAY ONLY: YYYY-MM-DD HH:MM–HH:MM IST" label
