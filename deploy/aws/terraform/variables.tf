@@ -91,6 +91,12 @@ variable "telegram_bot_token_ssm_param" {
   default     = "/tickvault/prod/telegram/bot-token"
 }
 
+variable "telegram_chat_id_ssm_param" {
+  description = "SSM parameter name where the Telegram chat ID (numeric) is stored."
+  type        = string
+  default     = "/tickvault/prod/telegram/chat-id"
+}
+
 variable "dhan_access_token_ssm_param" {
   description = "SSM parameter name where the Dhan access token cache is stored."
   type        = string
