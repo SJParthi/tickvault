@@ -23,9 +23,10 @@ resource "aws_sns_topic_subscription" "operator_email" {
   endpoint  = var.operator_email
 }
 
-# TODO (follow-up PR):
+# Telegram webhook is wired in `telegram-webhook-lambda.tf` (separate file
+# so the IAM role + Lambda + log group + self-error alarm + SNS subscription
+# stay co-located). Remaining 2 fan-out legs are still TODO:
 # - aws_sns_topic_subscription.operator_sms — protocol = "sms", endpoint = var.operator_phone
-# - aws_sns_topic_subscription.telegram_webhook — protocol = "lambda", endpoint = aws_lambda_function.telegram_relay.arn
 # - aws_connect_outbound_voice_contact — for Critical-severity wake-up call
 
 output "operator_email_subscription_status" {
