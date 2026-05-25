@@ -5814,6 +5814,57 @@ fn spawn_historical_candle_fetch(
                 cross_match_historical_vs_live(&bg_questdb_config, &bg_registry, &today_window)
                     .await;
 
+            // PR #795 (operator-locked 2026-05-25): ALWAYS write a forensic
+            // JSONL + HTML row for every cross-verify run — including SKIP
+            // outcomes. The previous design only wrote files inside the
+            // PASS/FAIL branch, so SKIPPED runs (no live data, partial
+            // coverage, etc.) left ZERO trace on disk. Operator had no way
+            // to confirm the scheduler actually ran. Moving the writers
+            // out of the conditional fixes that. The `outcome` field on
+            // the JSONL row distinguishes PASS / FAIL / SKIP, set by
+            // `build_report_row_from_cross_match` based on the
+            // CrossMatchReport flags.
+            {
+                let now_utc_secs = chrono::Utc::now().timestamp();
+                let today_ist =
+                    tickvault_core::historical::cross_verify_scheduler::ist_date_now(now_utc_secs);
+                let run_secs =
+                    tickvault_core::historical::cross_verify_scheduler::ist_secs_of_day_now(
+                        now_utc_secs,
+                    );
+                let trigger = if run_secs < 12 * 3600 {
+                    tickvault_core::historical::cross_verify_scheduler::TRIGGER_LABEL_DAILY
+                } else {
+                    tickvault_core::historical::cross_verify_scheduler::TRIGGER_LABEL_INTRADAY
+                };
+                let row = tickvault_core::historical::cross_verify_report::build_report_row_from_cross_match(
+                    today_ist,
+                    run_secs,
+                    trigger,
+                    &cross_match,
+                );
+                if let Err(err) =
+                    tickvault_core::historical::cross_verify_report::append_jsonl_row(&row)
+                {
+                    error!(
+                        ?err,
+                        "cross-verify JSONL append failed (report degraded; cross-match itself unaffected)"
+                    );
+                }
+                // Re-render full HTML from all rows so today's
+                // 1d + intraday outcomes show up together.
+                let all_rows =
+                    tickvault_core::historical::cross_verify_report::read_jsonl_rows(today_ist);
+                if let Err(err) = tickvault_core::historical::cross_verify_report::write_html_report(
+                    today_ist, &all_rows,
+                ) {
+                    error!(
+                        ?err,
+                        "cross-verify HTML write failed (report degraded; cross-match itself unaffected)"
+                    );
+                }
+            }
+
             if !cross_match.live_candles_present || cross_match.candles_compared == 0 {
                 // First run / fresh DB / post-market boot with no live ticks yet.
                 //
@@ -5911,55 +5962,10 @@ fn spawn_historical_candle_fetch(
                     .saturating_sub(cross_match.missing_live)
                     .saturating_sub(missing_historical);
 
-                // PR #788 (2026-05-25 operator lock): cross-verify is a
-                // FORENSIC report, NOT a real-time alert. Telegram fires
-                // ONLY on mismatch (Critical/High path). The PASS branch
-                // writes the row to JSONL + regenerates the HTML report
-                // — no Telegram noise.
-                {
-                    let now_utc_secs = chrono::Utc::now().timestamp();
-                    let today_ist =
-                        tickvault_core::historical::cross_verify_scheduler::ist_date_now(
-                            now_utc_secs,
-                        );
-                    let run_secs =
-                        tickvault_core::historical::cross_verify_scheduler::ist_secs_of_day_now(
-                            now_utc_secs,
-                        );
-                    let trigger = if run_secs < 12 * 3600 {
-                        tickvault_core::historical::cross_verify_scheduler::TRIGGER_LABEL_DAILY
-                    } else {
-                        tickvault_core::historical::cross_verify_scheduler::TRIGGER_LABEL_INTRADAY
-                    };
-                    let row = tickvault_core::historical::cross_verify_report::build_report_row_from_cross_match(
-                        today_ist,
-                        run_secs,
-                        trigger,
-                        &cross_match,
-                    );
-                    if let Err(err) =
-                        tickvault_core::historical::cross_verify_report::append_jsonl_row(&row)
-                    {
-                        error!(
-                            ?err,
-                            "cross-verify JSONL append failed (report degraded; cross-match itself unaffected)"
-                        );
-                    }
-                    // Re-render full HTML from all rows so today's
-                    // 1d + intraday outcomes show up together.
-                    let all_rows =
-                        tickvault_core::historical::cross_verify_report::read_jsonl_rows(today_ist);
-                    if let Err(err) =
-                        tickvault_core::historical::cross_verify_report::write_html_report(
-                            today_ist, &all_rows,
-                        )
-                    {
-                        error!(
-                            ?err,
-                            "cross-verify HTML write failed (report degraded; cross-match itself unaffected)"
-                        );
-                    }
-                }
+                // JSONL+HTML write now happens unconditionally at the top
+                // of this block (PR #795). The previous duplicate write
+                // here was removed — keeping it would write 2 rows per
+                // PASS/FAIL run and 0 rows per SKIP run.
 
                 if cross_match.passed {
                     // Operator-locked: NO Telegram on PASS — only the
