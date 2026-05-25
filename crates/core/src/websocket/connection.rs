@@ -341,6 +341,28 @@ pub struct WebSocketConnection {
     /// `String` for an integer 0..5. This field eliminates that alloc
     /// from the run-loop entry path entirely.
     connection_id_label: &'static str,
+
+    /// PR #790b (2026-05-25) — most recent disconnect reason, captured at
+    /// each disconnect emit site and surfaced in the next `WebSocketReconnected`
+    /// Telegram message. `None` means no disconnect has happened yet in this
+    /// process lifetime (initial state).
+    ///
+    /// COLD PATH: written once per disconnect (at most a few times per
+    /// trading day) and read once per reconnect. `std::sync::Mutex` is
+    /// acceptable here — the lock is never held across an `.await` and the
+    /// disconnect/reconnect paths are explicitly NOT the per-tick hot path.
+    last_disconnect_reason: std::sync::Mutex<Option<String>>,
+
+    /// PR #790b — wall-clock UTC epoch seconds when the most recent
+    /// disconnect was recorded. `0` sentinel = no disconnect yet. Used to
+    /// compute `down_secs` for the `WebSocketReconnected` event payload.
+    last_disconnect_at_epoch_secs: std::sync::atomic::AtomicI64,
+
+    /// PR #790b — counts reconnect attempts since the last disconnect was
+    /// recorded. Reset to `0` on the successful reconnect emit. Lets the
+    /// operator distinguish "1 long retry" from "60 short retries" when
+    /// debugging a long outage.
+    attempts_since_last_disconnect: std::sync::atomic::AtomicU32,
 }
 
 /// Audit-2026-05-03 H2: static lookup for connection-id labels used by
@@ -477,6 +499,10 @@ impl WebSocketConnection {
             // `.rodata`. Previously the `run()` loop did a per-call
             // `self.connection_id` to-string conversion which heap-allocated.
             connection_id_label: connection_id_label_static(connection_id),
+            // PR #790b: initial state — no disconnect has happened yet.
+            last_disconnect_reason: std::sync::Mutex::new(None),
+            last_disconnect_at_epoch_secs: std::sync::atomic::AtomicI64::new(0),
+            attempts_since_last_disconnect: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -656,9 +682,17 @@ impl WebSocketConnection {
                             reconnection_count,
                             "WebSocket reconnected (in-market backfill disabled — post-market historical fetch handles any gap)"
                         );
+                        // PR #790b: take disconnect-context (reason + down_secs
+                        // + attempts) captured at the matching disconnect
+                        // sites and emit it with the reconnect event so the
+                        // Telegram message surfaces WHY + HOW LONG + HOW MANY.
+                        let (reason, down_secs, attempts) = self.take_disconnect_context();
                         if let Some(ref n) = self.notifier {
                             n.notify(crate::notification::events::NotificationEvent::WebSocketReconnected {
                                 connection_index: usize::from(self.connection_id),
+                                reason,
+                                down_secs,
+                                attempts,
                             });
                         }
                         // Phase-0-Item-8-9-PR-C (2026-05-17) — emit a
@@ -763,11 +797,15 @@ impl WebSocketConnection {
                                 "Non-reconnectable disconnect — stopping connection"
                             );
                             // H1: Critical disconnect — fire Telegram immediately.
+                            // PR #790b: record reason so the next reconnect Telegram surfaces it.
+                            // O(1) EXEMPT: cold path — fires at most once per disconnect cycle, never per tick
+                            let reason = format!("Non-reconnectable: {code}");
+                            // O(1) EXEMPT: cold path — reason needs to flow to both state slot + Telegram event
+                            self.record_disconnect(reason.clone());
                             if let Some(ref n) = self.notifier {
                                 n.notify(crate::notification::events::NotificationEvent::WebSocketDisconnected {
                                     connection_index: usize::from(self.connection_id),
-                                    // O(1) EXEMPT: cold path — reconnection error, not per tick
-                                    reason: format!("Non-reconnectable: {code}"),
+                                    reason,
                                 });
                             }
                             self.set_state(ConnectionState::Disconnected);
@@ -784,11 +822,15 @@ impl WebSocketConnection {
                             // token expiry indirectly (missing ticks, late
                             // auth-related errors). Now they get an explicit
                             // WebSocketDisconnected event the moment 807 fires.
+                            // PR #790b: record reason so the next reconnect Telegram surfaces it.
+                            // O(1) EXEMPT: cold path — once per 807 event, never per tick
+                            let reason = format!("Token expired ({code}) — waiting for renewal");
+                            // O(1) EXEMPT: cold path — reason needs to flow to both state slot + Telegram event
+                            self.record_disconnect(reason.clone());
                             if let Some(ref n) = self.notifier {
                                 n.notify(crate::notification::events::NotificationEvent::WebSocketDisconnected {
                                     connection_index: usize::from(self.connection_id),
-                                    // O(1) EXEMPT: cold path, once per 807 event
-                                    reason: format!("Token expired ({code}) — waiting for renewal"),
+                                    reason,
                                 });
                             }
                             warn!(
@@ -815,6 +857,11 @@ impl WebSocketConnection {
                                 error = %err,
                                 "WebSocket disconnected — will reconnect"
                             );
+                            // PR #790b: record reason so the next reconnect Telegram surfaces it.
+                            // O(1) EXEMPT: cold path — reconnection error, never per tick
+                            let reason = format!("{err}");
+                            // O(1) EXEMPT: cold path — reason needs to flow to both state slot + Telegram event
+                            self.record_disconnect(reason.clone());
                             if let Some(ref n) = self.notifier {
                                 let event =
                                     if tickvault_common::market_hours::is_within_market_hours_ist()
@@ -822,13 +869,13 @@ impl WebSocketConnection {
                                         crate::notification::events::NotificationEvent::WebSocketDisconnected {
                                         connection_index: usize::from(self.connection_id),
                                         // O(1) EXEMPT: cold path — reconnection error, not per tick
-                                        reason: format!("{err}"),
+                                        reason,
                                     }
                                     } else {
                                         crate::notification::events::NotificationEvent::WebSocketDisconnectedOffHours {
                                         connection_index: usize::from(self.connection_id),
                                         // O(1) EXEMPT: cold path — off-hours reset, not per tick
-                                        reason: format!("{err}"),
+                                        reason,
                                     }
                                     };
                                 n.notify(event);
@@ -845,6 +892,11 @@ impl WebSocketConnection {
                         error = %err,
                         "WebSocket connection failed — will retry"
                     );
+                    // PR #790b: record reason so the next reconnect Telegram surfaces it.
+                    // O(1) EXEMPT: cold path — connect-failed, never per tick
+                    let reason = format!("connect failed: {err}");
+                    // O(1) EXEMPT: cold path — reason needs to flow to both state slot + Telegram event
+                    self.record_disconnect(reason.clone());
                     if let Some(ref n) = self.notifier {
                         // Parthiban override (2026-04-22): same off-hours
                         // severity split as the disconnect branch above.
@@ -853,13 +905,13 @@ impl WebSocketConnection {
                             crate::notification::events::NotificationEvent::WebSocketDisconnected {
                                 connection_index: usize::from(self.connection_id),
                                 // O(1) EXEMPT: cold path — connect-failed is not per tick
-                                reason: format!("connect failed: {err}"),
+                                reason,
                             }
                         } else {
                             crate::notification::events::NotificationEvent::WebSocketDisconnectedOffHours {
                                 connection_index: usize::from(self.connection_id),
                                 // O(1) EXEMPT: cold path — off-hours connect-failed
-                                reason: format!("connect failed: {err}"),
+                                reason,
                             }
                         };
                         n.notify(event);
@@ -1722,6 +1774,64 @@ impl WebSocketConnection {
         let mut state = self.state.lock().expect("state lock poisoned"); // APPROVED: lock poison is unrecoverable
         *state = new_state;
     }
+
+    /// PR #790b (2026-05-25) — record a disconnect for later inclusion in
+    /// the matching reconnect Telegram message. Captures reason + wall-clock
+    /// epoch and increments the attempt counter.
+    ///
+    /// Idempotent for multi-step disconnects (e.g., a 807 token-expired
+    /// disconnect immediately followed by a reconnect failure): the reason
+    /// of the LATEST disconnect wins, but `last_disconnect_at` is only
+    /// updated on the FIRST disconnect of the cycle so `down_secs` reflects
+    /// total downtime (not just the last step).
+    ///
+    /// COLD PATH ONLY. Called from the 4 disconnect emit sites in `run()`.
+    #[allow(clippy::expect_used)] // APPROVED: lock poison is unrecoverable
+    fn record_disconnect(&self, reason: String) {
+        // Capture the reason (latest wins).
+        if let Ok(mut slot) = self.last_disconnect_reason.lock() {
+            *slot = Some(reason);
+        }
+        // Capture the FIRST disconnect timestamp in this cycle (so down_secs
+        // measures total downtime including any intermediate retry failures).
+        let now_secs = chrono::Utc::now().timestamp();
+        let _ = self.last_disconnect_at_epoch_secs.compare_exchange(
+            0,
+            now_secs,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+        // Bump attempt counter.
+        self.attempts_since_last_disconnect
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// PR #790b — read disconnect-context for the matching reconnect event,
+    /// then atomically reset state. Returns `(reason, down_secs, attempts)`
+    /// where:
+    /// * `reason` is `None` if no disconnect was recorded (rare initial path).
+    /// * `down_secs` is `0` if `last_disconnect_at_epoch_secs == 0`.
+    /// * `attempts` is `0` if no retry was needed.
+    fn take_disconnect_context(&self) -> (Option<String>, u64, u32) {
+        let reason = self
+            .last_disconnect_reason
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        let last_at = self
+            .last_disconnect_at_epoch_secs
+            .swap(0, std::sync::atomic::Ordering::AcqRel);
+        let attempts = self
+            .attempts_since_last_disconnect
+            .swap(0, std::sync::atomic::Ordering::AcqRel);
+        let down_secs = if last_at == 0 {
+            0
+        } else {
+            let now = chrono::Utc::now().timestamp();
+            now.saturating_sub(last_at).max(0) as u64
+        };
+        (reason, down_secs, attempts)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1988,6 +2098,56 @@ mod tests {
         assert_eq!(health.connection_id, 0);
         assert_eq!(health.subscribed_count, 0);
         assert_eq!(health.total_reconnections, 0);
+    }
+
+    /// PR #790b (2026-05-25) — disconnect-context capture ratchet.
+    ///
+    /// `record_disconnect` MUST capture (reason, timestamp, attempt count)
+    /// and `take_disconnect_context` MUST return them then reset state. This
+    /// is the wire between disconnect emit sites and the reconnect Telegram
+    /// message that surfaces WHY/HOW-LONG/HOW-MANY for the operator.
+    #[test]
+    fn test_record_disconnect_then_take_returns_context_and_resets() {
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![],
+            FeedMode::Ticker,
+            tx,
+            None,
+        );
+
+        // Initial state: no context to take.
+        let (reason0, down0, attempts0) = conn.take_disconnect_context();
+        assert!(reason0.is_none(), "no disconnect recorded yet");
+        assert_eq!(down0, 0, "no timestamp recorded yet");
+        assert_eq!(attempts0, 0, "no attempts recorded yet");
+
+        // Record 3 disconnects (simulating 3 retry failures in one outage).
+        conn.record_disconnect("Reset by peer".to_string());
+        conn.record_disconnect("Reset by peer".to_string());
+        conn.record_disconnect("connect failed: timeout".to_string());
+
+        // Take the context — should reflect the LATEST reason and the
+        // FIRST disconnect's timestamp (so down_secs measures full outage),
+        // with attempts = 3.
+        let (reason1, _down1, attempts1) = conn.take_disconnect_context();
+        assert_eq!(
+            reason1.as_deref(),
+            Some("connect failed: timeout"),
+            "latest reason wins (caller diagnoses the most recent failure)"
+        );
+        assert_eq!(attempts1, 3, "all 3 disconnects counted");
+
+        // After take, state is reset — next take returns empty again.
+        let (reason2, down2, attempts2) = conn.take_disconnect_context();
+        assert!(reason2.is_none(), "reason cleared after take");
+        assert_eq!(down2, 0, "timestamp cleared after take");
+        assert_eq!(attempts2, 0, "attempts cleared after take");
     }
 
     #[test]
@@ -4436,6 +4596,9 @@ mod tests {
         use crate::notification::NotificationEvent;
         let event = NotificationEvent::WebSocketReconnected {
             connection_index: 0,
+            reason: None,
+            down_secs: 0,
+            attempts: 0,
         };
         let msg = event.to_message();
         assert!(
