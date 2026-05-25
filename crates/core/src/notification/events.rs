@@ -1771,7 +1771,12 @@ impl NotificationEvent {
             } => {
                 // 1-indexed for human readability (Feed 1..N).
                 let display = connection_index.saturating_add(1);
-                let total = tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS;
+                // PR #790a (2026-05-25): under indices_4_only scope lock the
+                // effective main-feed pool is 1, not 5 (the Dhan account-wide
+                // cap). Displaying "1/5" misleads the operator into thinking
+                // 4 connections are silently down. Use the scope-locked
+                // constant.
+                let total = tickvault_common::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT;
                 let pct = if *capacity == 0 {
                     0.0
                 } else {
@@ -1937,27 +1942,30 @@ impl NotificationEvent {
                 connection_index,
                 reason,
             } => {
+                // PR #790a — use scope-locked pool size (1), not Dhan cap (5).
                 format!(
                     "<b>WebSocket {}/{} disconnected</b>\n{reason}",
                     connection_index.saturating_add(1),
-                    tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS
+                    tickvault_common::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT
                 )
             }
             Self::WebSocketDisconnectedOffHours {
                 connection_index,
                 reason,
             } => {
+                // PR #790a — use scope-locked pool size (1), not Dhan cap (5).
                 format!(
                     "<b>WebSocket {}/{} disconnected [off-hours, auto-reconnecting]</b>\n{reason}",
                     connection_index.saturating_add(1),
-                    tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS
+                    tickvault_common::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT
                 )
             }
             Self::WebSocketReconnected { connection_index } => {
+                // PR #790a — use scope-locked pool size (1), not Dhan cap (5).
                 format!(
                     "<b>WebSocket {}/{} reconnected</b>",
                     connection_index.saturating_add(1),
-                    tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS
+                    tickvault_common::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT
                 )
             }
             Self::WebSocketSleepEntered {
@@ -2586,10 +2594,11 @@ impl NotificationEvent {
                 connection_index,
                 attempts,
             } => {
+                // PR #790a — use scope-locked pool size (1), not Dhan cap (5).
                 format!(
                     "<b>WebSocket {}/{} RECONNECTION EXHAUSTED</b>\nAttempts: {attempts}\nNo market data",
                     connection_index.saturating_add(1),
-                    tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS
+                    tickvault_common::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT
                 )
             }
             Self::TokenRenewalDeadlineMissed { deadline_hour_ist } => {
@@ -3688,8 +3697,11 @@ mod tests {
 
     #[test]
     fn test_websocket_connected_includes_index() {
-        // UX fix 2026-04-17: display is 1-indexed (connection_index=2 → "3/5")
+        // UX fix 2026-04-17: display is 1-indexed (connection_index=2 → "3/N")
         // PR #458 (2026-05-04): payload now includes subscribed/capacity/ping.
+        // PR #790a (2026-05-25): pool size is the scope-locked
+        // PHASE_0_MAIN_FEED_CONNECTION_COUNT (= 1), not the Dhan account
+        // cap MAX_WEBSOCKET_CONNECTIONS (= 5).
         let event = NotificationEvent::WebSocketConnected {
             connection_index: 2,
             subscribed_count: 5_000,
@@ -3710,7 +3722,9 @@ mod tests {
 
     #[test]
     fn test_websocket_disconnected_includes_index_and_reason() {
-        // UX fix 2026-04-17: display is 1-indexed (connection_index=1 → "2/5")
+        // UX fix 2026-04-17: display is 1-indexed (connection_index=1 → "2/N")
+        // PR #790a (2026-05-25): "N" is the scope-locked pool size (1) under
+        // indices_4_only, not the Dhan account cap (5).
         let event = NotificationEvent::WebSocketDisconnected {
             connection_index: 1,
             reason: "connection reset by peer".to_string(),
@@ -3722,13 +3736,71 @@ mod tests {
 
     #[test]
     fn test_websocket_reconnected_includes_index() {
-        // UX fix 2026-04-17: display is 1-indexed (connection_index=0 → "1/5")
+        // PR #790a (2026-05-25): under indices_4_only scope the effective
+        // main-feed pool is 1, so the label is "1/1" not "1/5". Pinned by
+        // `test_websocket_reconnected_uses_scope_locked_pool_size` below.
         let event = NotificationEvent::WebSocketReconnected {
             connection_index: 0,
         };
         let msg = event.to_message();
         assert!(msg.contains("1"), "1-indexed display: 0 -> 1; got: {msg}");
         assert!(msg.contains("reconnected"));
+    }
+
+    /// PR #790a (2026-05-25) — ratchet pinning honest pool size in main-feed
+    /// Telegram labels.
+    ///
+    /// Operator-reported 2026-05-25 13:03 IST: live Telegram showed
+    /// "WebSocket 1/5 reconnected" even though `websocket-connection-scope-lock.md`
+    /// locks the main-feed pool to ONE connection under `indices_4_only`.
+    /// The `/5` was the Dhan account-wide cap (`MAX_WEBSOCKET_CONNECTIONS`),
+    /// which is misleading — implies 4 connections are silently down.
+    ///
+    /// This ratchet fails the build if any main-feed Telegram event regresses
+    /// back to displaying "/5" (or any value other than the scope-locked
+    /// `PHASE_0_MAIN_FEED_CONNECTION_COUNT = 1`).
+    #[test]
+    fn test_main_feed_events_use_scope_locked_pool_size_not_dhan_cap() {
+        let disconnect = NotificationEvent::WebSocketDisconnected {
+            connection_index: 0,
+            reason: "test".to_string(),
+        }
+        .to_message();
+        let off_hours = NotificationEvent::WebSocketDisconnectedOffHours {
+            connection_index: 0,
+            reason: "test".to_string(),
+        }
+        .to_message();
+        let reconnected = NotificationEvent::WebSocketReconnected {
+            connection_index: 0,
+        }
+        .to_message();
+        let exhausted = NotificationEvent::WebSocketReconnectionExhausted {
+            connection_index: 0,
+            attempts: 60,
+        }
+        .to_message();
+
+        // All four main-feed events MUST show "1/1" — the scope-locked
+        // effective main-feed pool size under indices_4_only — not "1/5"
+        // (the Dhan account-wide cap).
+        for (label, msg) in [
+            ("WebSocketDisconnected", &disconnect),
+            ("WebSocketDisconnectedOffHours", &off_hours),
+            ("WebSocketReconnected", &reconnected),
+            ("WebSocketReconnectionExhausted", &exhausted),
+        ] {
+            assert!(
+                msg.contains("1/1"),
+                "{label} must display scope-locked pool size '1/1' under \
+                 indices_4_only, got: {msg}"
+            );
+            assert!(
+                !msg.contains("1/5"),
+                "{label} must NOT display Dhan account-wide cap '1/5' — \
+                 this misleads the operator under indices_4_only scope. Got: {msg}"
+            );
+        }
     }
 
     #[test]
