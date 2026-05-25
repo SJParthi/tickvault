@@ -288,6 +288,5 @@ session has automated access to logs/queries/dbs without manual setup.
   * Error code definitions: `crates/common/src/error_code.rs`
   * Per-code runbooks: `.claude/rules/project/wave-*-error-codes.md`
   * Operator daily startup: `docs/runbooks/operator-daily-startup.md`
-  * Emergency stop: `docs/runbooks/kill-switch.md`
   * Daily discipline: `docs/runbooks/daily-operations.md`
   * Phase 0 architecture: `.claude/rules/project/phase-0-architecture.md`
