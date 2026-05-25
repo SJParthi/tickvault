@@ -83,6 +83,19 @@ and replaced with the hard bans in this rule.
    WRITES to either. That file is allowed to continue using historical
    data because it only compares, never produces.
 
+8. **Pre-market yesterday's-1d fetch exception (operator-locked 2026-05-25)** —
+   Parthiban verbatim 2026-05-25 14:30 IST:
+   > "see this should always happen onl yat the time of pre market dude
+   >  okay? Fetch yesterday's 1d for 4 IDX_I SIDs"
+   This is an EXPLICIT override of the 2026-04-22 directive
+   ("historical fetch must NEVER run pre-market on a trading day") for
+   the narrow case of yesterday's-1d-only verification:
+   - **Scope:** 4 IDX_I SIDs (`LOCKED_UNIVERSE`) × 1 timeframe (1d) × 1 day (yesterday) — at most ~20 Dhan REST calls (tiny vs. 90-day post-market hammer)
+   - **Trigger:** 09:00:30 IST every trading day (operator-locked, `DAILY_1D_FIRE_SECS_OF_DAY_IST` constant)
+   - **Purpose:** confirm yesterday's 1d candle is intact in `historical_candles` BEFORE today's session starts; forensic record via JSONL + Telegram only on mismatch
+   - **Marker:** separate marker file from the existing 15:30 IST post-market full-historical-fetch marker. Pre-market fetch does NOT block the post-market full fetch.
+   - **Bulk historical fetch (1m/5m/15m/60m × 90 days)** remains POST-MARKET ONLY per the original 2026-04-22 directive. The exception applies ONLY to the narrow yesterday's-1d case.
+
 ## Test ratchet
 
 - Pre-commit hook (banned-pattern-scanner.sh, category 6) — fails the
