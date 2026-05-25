@@ -301,8 +301,39 @@ const RETIRED_QUESTDB_TABLES: [&str; 12] = [
 ///
 /// Requires a running QuestDB; boot wiring lives in `crates/app/src/main.rs`
 /// immediately before the `ensure_shadow_candle_tables` call.
+///
+/// ## PR #798 — one-shot marker file gate (2026-05-25)
+///
+/// The 45+ DROP statements below are an **upgrade safety net** — they
+/// protect against pre-#T1 deployments where stale materialized views
+/// occupy the `candles_<tf>` names and cause `CREATE TABLE` to 400.
+/// Once a deployment has gone through this cleanup ONCE, repeating the
+/// sweep on every subsequent boot is pure waste (~5s of log spam +
+/// 45 HTTP round-trips against QuestDB).
+///
+/// Operator demand 2026-05-25 19:00 IST: "remove all the stale unused
+/// unwanted not used everything". The DROPs themselves can't be deleted
+/// (they're load-bearing for fresh deployments), but we can gate them
+/// behind a one-shot marker file that records "cleanup already done"
+/// on the local disk. After the first successful run the marker exists
+/// and all subsequent boots skip the loop entirely.
+///
+/// Marker path: `data/state/legacy_candle_objects_dropped.marker`.
+/// To re-run the cleanup (e.g. after restoring from a stale backup),
+/// `rm` the marker file.
 // WIRING-EXEMPT: boot wiring lives in crates/app/src/main.rs before ensure_shadow_candle_tables; integration-covered by CI boot + `make doctor`.
 pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
+    // PR #798 marker-file gate — skip the entire cleanup loop on
+    // deployments where it has already run successfully.
+    let marker_path = std::path::Path::new(LEGACY_DROP_MARKER_PATH);
+    if marker_path.exists() {
+        tracing::debug!(
+            marker = LEGACY_DROP_MARKER_PATH,
+            "legacy candle cleanup already done on this deployment — skipping (PR #798)"
+        );
+        return;
+    }
+
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -371,7 +402,45 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
         let ddl = format!("DROP TABLE IF EXISTS {table};");
         run_drop_ddl(&client, &base_url, table, &ddl).await;
     }
+
+    // PR #798 (operator-locked 2026-05-25) — write one-shot marker so
+    // subsequent boots skip the entire cleanup loop. Best-effort: if
+    // the marker can't be written (disk full, perms), the cleanup just
+    // repeats on next boot — same as before this PR. No data corruption
+    // risk because every DROP is `IF EXISTS`.
+    if let Some(parent) = marker_path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            tracing::warn!(
+                ?err,
+                path = %parent.display(),
+                "PR #798: failed to create data/state/ dir for legacy-drop marker"
+            );
+            return;
+        }
+    }
+    if let Err(err) = std::fs::write(
+        marker_path,
+        "PR #798 marker — legacy candle objects cleaned up on this deployment.\n",
+    ) {
+        tracing::warn!(
+            ?err,
+            path = LEGACY_DROP_MARKER_PATH,
+            "PR #798: failed to write legacy-drop marker (cleanup will repeat next boot)"
+        );
+    } else {
+        tracing::info!(
+            path = LEGACY_DROP_MARKER_PATH,
+            "PR #798: legacy candle cleanup complete — marker written"
+        );
+    }
 }
+
+/// PR #798 — one-shot marker file path. After the legacy candle DROP
+/// sweep runs successfully on a deployment, this file records the fact
+/// so subsequent boots skip the entire loop. To force a re-run (e.g.
+/// after restoring from an older QuestDB backup that still has the
+/// legacy matviews), delete the file.
+const LEGACY_DROP_MARKER_PATH: &str = "data/state/legacy_candle_objects_dropped.marker";
 
 /// Issue one DROP DDL statement to QuestDB's `/exec` endpoint.
 ///
@@ -601,5 +670,33 @@ mod tests {
             "candles_1d",
         ];
         assert_eq!(names, expected);
+    }
+
+    /// PR #798 (operator-locked 2026-05-25) — marker constant is set
+    /// to the canonical relative path under `data/state/`. Future
+    /// Claude sessions that need to add a similar marker should reuse
+    /// the same directory.
+    #[test]
+    fn test_legacy_drop_marker_path_is_in_data_state() {
+        assert_eq!(
+            LEGACY_DROP_MARKER_PATH,
+            "data/state/legacy_candle_objects_dropped.marker"
+        );
+    }
+
+    /// PR #798 — marker path lives under `data/state/`, the same
+    /// directory other one-shot markers use (`historical_fetch_done.json`,
+    /// `yesterdays_1d_pre_market_done.json`).
+    #[test]
+    fn test_legacy_drop_marker_path_starts_with_data_state() {
+        assert!(LEGACY_DROP_MARKER_PATH.starts_with("data/state/"));
+    }
+
+    /// PR #798 — marker filename uses a stable, descriptive name so
+    /// operators reading the directory can identify it without
+    /// cross-referencing the code.
+    #[test]
+    fn test_legacy_drop_marker_filename_is_descriptive() {
+        assert!(LEGACY_DROP_MARKER_PATH.ends_with("legacy_candle_objects_dropped.marker"));
     }
 }
