@@ -28,6 +28,7 @@ pub mod open_price_source;
 pub mod option_chain_schedule;
 pub mod order_types;
 pub mod phase;
+pub mod price_precision;
 pub mod sanitize;
 pub mod segment;
 pub mod tick_types;
