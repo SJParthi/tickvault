@@ -1661,6 +1661,11 @@ async fn main() -> Result<()> {
                     std::sync::Arc::clone(&post_market_signal),
                     is_trading,
                 );
+
+                // PR #793 (operator-locked 2026-05-25): pre-market
+                // yesterday's-1d verify scheduler — see fast-boot site
+                // below for full rationale + rule 8 reference.
+                spawn_yesterdays_1d_pre_market_fetch_scheduler(&subscription_plan, &config, tm);
             }
         } else {
             info!(
@@ -4220,6 +4225,14 @@ async fn main() -> Result<()> {
             std::sync::Arc::clone(&post_market_signal),
             is_trading,
         );
+
+        // PR #793 (operator-locked 2026-05-25): pre-market yesterday's-1d
+        // verify scheduler. Fires at 09:00:30 IST every day. Uses a SEPARATE
+        // marker file from the post-market fetch so the two never collide.
+        // See `.claude/rules/project/live-feed-purity.md` rule 8 for the
+        // verbatim operator override authorizing this narrow ~20 REST-call
+        // pre-market exception.
+        spawn_yesterdays_1d_pre_market_fetch_scheduler(&subscription_plan, &config, &token_manager);
     } else {
         info!(
             "historical candle fetch DISABLED (features.historical_fetch_enabled = false, PR #449)"
@@ -6027,6 +6040,162 @@ fn spawn_historical_candle_fetch(
 
     info!(
         "background historical candle fetch task spawned (will wait for post-market signal if trading hours)"
+    );
+}
+
+/// PR #793 (operator-locked 2026-05-25): pre-market yesterday's-1d verify
+/// scheduler. Fires at 09:00:30 IST every day, fetches yesterday's 1d
+/// candle for the locked universe (4 IDX_I SIDs) via Dhan REST and
+/// UPSERTs into `historical_candles`. Uses a SEPARATE marker file from
+/// the existing 15:30 IST post-market full fetch so the two never
+/// collide.
+///
+/// Operator verbatim 2026-05-25 14:30 IST:
+///   "see this should always happen onl yat the time of pre market dude
+///    okay? Fetch yesterday's 1d for 4 IDX_I SIDs"
+///
+/// Authority: `.claude/rules/project/live-feed-purity.md` rule 8 pins
+/// this as the narrow exception to the 2026-04-22 "no pre-market
+/// historical fetch" directive.
+///
+/// Scope: 4 IDX_I SIDs × 5 timeframes × 1-day window = ~20 REST calls
+/// max per trading day. Tiny vs. the post-market 90-day hammer.
+fn spawn_yesterdays_1d_pre_market_fetch_scheduler(
+    subscription_plan: &Option<SubscriptionPlan>,
+    config: &ApplicationConfig,
+    token_manager: &std::sync::Arc<TokenManager>,
+) {
+    let plan = match subscription_plan
+        .as_ref()
+        .filter(|_| config.historical.enabled)
+    {
+        Some(p) => p,
+        None => return,
+    };
+
+    let bg_registry = plan.registry.clone();
+    let bg_dhan_config = config.dhan.clone();
+    let mut bg_historical_config = config.historical.clone();
+    // Pin lookback to 1 day — we only want yesterday's bar pre-market.
+    // The (today-1, today) Dhan range with toDate non-inclusive returns
+    // yesterday's 1d bar (see cross_verify_scheduler::yesterday_1d_window).
+    bg_historical_config.lookback_days = 1;
+    // SEPARATE marker file so this scheduler is independent from the
+    // 15:30 IST post-market full-fetch marker.
+    bg_historical_config.marker_path = "data/state/yesterdays_1d_pre_market_done.json".to_string();
+    let bg_questdb_config = config.questdb.clone();
+    let bg_token_handle = token_manager.token_handle();
+    let bg_trading_calendar = match tickvault_common::trading_calendar::TradingCalendar::from_config(
+        &config.trading,
+    ) {
+        Ok(c) => std::sync::Arc::new(c),
+        Err(err) => {
+            warn!(
+                ?err,
+                "pre-market yesterday's-1d scheduler: failed to build trading calendar — scheduler NOT spawned"
+            );
+            return;
+        }
+    };
+
+    tokio::spawn(async move {
+        use tickvault_core::historical::candle_fetcher::fetch_yesterdays_1d_pre_market;
+        use tickvault_core::historical::cross_verify_scheduler::{
+            DAILY_1D_FIRE_SECS_OF_DAY_IST, secs_until_next_daily_1d_fire,
+        };
+
+        // Fetch credentials once at startup; refreshed inside the loop
+        // when a fetch is about to run (token may have rotated).
+        info!(
+            target_secs_of_day_ist = DAILY_1D_FIRE_SECS_OF_DAY_IST,
+            marker_path = %bg_historical_config.marker_path,
+            "pre-market yesterday's-1d scheduler started (PR #793, fires at 09:00:30 IST every trading day)"
+        );
+
+        loop {
+            // Compute seconds until next 09:00:30 IST and sleep.
+            use tickvault_common::constants::{IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY};
+            let now_utc = chrono::Utc::now().timestamp();
+            let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            // APPROVED: rem_euclid on SECONDS_PER_DAY (86400) fits u32
+            let sec_of_day = now_ist.rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
+            let sleep_secs = secs_until_next_daily_1d_fire(sec_of_day);
+            info!(
+                sleep_secs,
+                target = DAILY_1D_FIRE_SECS_OF_DAY_IST,
+                "pre-market yesterday's-1d scheduler sleeping until next 09:00:30 IST"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(u64::from(sleep_secs))).await;
+
+            // Audit-findings Rule 3: market-hours / trading-day gate.
+            // Use `is_trading_day_today()` computed AFTER the sleep —
+            // sleeping across midnight means today's date has changed.
+            let today_after_sleep = {
+                let now_utc = chrono::Utc::now().timestamp();
+                let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+                let secs = now_ist.rem_euclid(i64::from(SECONDS_PER_DAY));
+                #[allow(clippy::cast_possible_wrap)] // APPROVED: 86400 fits
+                let date_secs_utc = now_utc - secs;
+                chrono::DateTime::<chrono::Utc>::from_timestamp(date_secs_utc, 0)
+                    .map(|dt| dt.date_naive())
+                    .unwrap_or_else(|| chrono::Utc::now().date_naive())
+            };
+            if !bg_trading_calendar.is_trading_day(today_after_sleep) {
+                info!(
+                    today_ist = %today_after_sleep,
+                    "pre-market yesterday's-1d scheduler skipping — not a trading day"
+                );
+                continue;
+            }
+
+            // Re-create the HTTP-ILP writer per cycle. ILP HTTP is
+            // stateless so this is cheap; idle-socket rotation cannot
+            // bite us across the multi-hour sleep.
+            let mut fetch_writer = match CandlePersistenceWriter::new_http(&bg_questdb_config) {
+                Ok(w) => w,
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        "pre-market yesterday's-1d: failed to create candle writer; will retry next cycle"
+                    );
+                    continue;
+                }
+            };
+
+            // Re-fetch credentials in case token rotated during sleep.
+            let client_id = match secret_manager::fetch_dhan_credentials().await {
+                Ok(creds) => creds.client_id,
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        "pre-market yesterday's-1d: failed to fetch credentials; will retry next cycle"
+                    );
+                    continue;
+                }
+            };
+
+            info!("pre-market yesterday's-1d fetch starting (09:00:30 IST trigger)");
+            let summary = fetch_yesterdays_1d_pre_market(
+                &bg_registry,
+                &bg_dhan_config,
+                &bg_historical_config,
+                &bg_token_handle,
+                &client_id,
+                &mut fetch_writer,
+            )
+            .await;
+            info!(
+                instruments_fetched = summary.instruments_fetched,
+                instruments_failed = summary.instruments_failed,
+                total_candles = summary.total_candles,
+                "pre-market yesterday's-1d fetch completed (next cycle tomorrow 09:00:30 IST)"
+            );
+        }
+    });
+
+    info!(
+        "pre-market yesterday's-1d fetch scheduler spawned (PR #793, operator-locked 2026-05-25)"
     );
 }
 
