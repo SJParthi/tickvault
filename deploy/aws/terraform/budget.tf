@@ -32,13 +32,17 @@ resource "aws_budgets_budget" "tv_monthly" {
     subscriber_email_addresses = [var.operator_email]
   }
 
-  # 100% actual = hard crossing
+  # 100% actual = hard crossing → BOTH email AND the kill-switch SNS
+  # topic (so the dedicated Lambda in budget-killswitch-lambda.tf stops
+  # the EC2 instance + pages operator via Telegram). Email stays as
+  # belt-and-suspenders alongside the automated cooldown.
   notification {
     comparison_operator        = "GREATER_THAN"
     threshold                  = 100
     threshold_type             = "PERCENTAGE"
     notification_type          = "ACTUAL"
     subscriber_email_addresses = [var.operator_email]
+    subscriber_sns_topic_arns  = [aws_sns_topic.tv_budget_kill.arn]
   }
 }
 
