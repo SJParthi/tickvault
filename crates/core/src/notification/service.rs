@@ -1414,6 +1414,9 @@ mod tests {
         });
         service.notify(NotificationEvent::WebSocketReconnected {
             connection_index: 2,
+            reason: None,
+            down_secs: 0,
+            attempts: 0,
         });
         service.notify(NotificationEvent::ShutdownInitiated);
         service.notify(NotificationEvent::HistoricalFetchFailed {
@@ -1991,6 +1994,9 @@ mod tests {
         });
         service.notify(NotificationEvent::WebSocketReconnected {
             connection_index: 0,
+            reason: None,
+            down_secs: 0,
+            attempts: 0,
         });
         service.notify(NotificationEvent::ShutdownInitiated);
         service.notify(NotificationEvent::ShutdownComplete);

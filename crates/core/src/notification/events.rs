@@ -477,7 +477,24 @@ pub enum NotificationEvent {
     },
 
     /// WebSocket reconnected after disconnection.
-    WebSocketReconnected { connection_index: usize },
+    ///
+    /// PR #790b (2026-05-25): now carries the disconnect-reason context so
+    /// the operator sees WHY the disconnect happened + how long it was down +
+    /// how many backoff attempts it took. All three diagnostic fields default
+    /// gracefully (`reason=None`, `down_secs=0`, `attempts=0`) for callers
+    /// that lack context (tests, manual probes).
+    WebSocketReconnected {
+        connection_index: usize,
+        /// Reason recorded at the most recent matching disconnect site, or
+        /// `None` if no disconnect was recorded (rare initial path).
+        reason: Option<String>,
+        /// Wall-clock seconds between disconnect and successful reconnect.
+        /// `0` if no disconnect timestamp was recorded.
+        down_secs: u64,
+        /// Number of reconnect attempts (including this successful one) since
+        /// the last disconnect. `0` if connect-on-first-try.
+        attempts: u32,
+    },
 
     /// Wave 2 Item 5 (G1, WS-GAP-04) — main-feed connection entered
     /// post-close sleep mode (instead of legacy give-up `return false`).
@@ -1960,13 +1977,34 @@ impl NotificationEvent {
                     tickvault_common::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT
                 )
             }
-            Self::WebSocketReconnected { connection_index } => {
+            Self::WebSocketReconnected {
+                connection_index,
+                reason,
+                down_secs,
+                attempts,
+            } => {
                 // PR #790a — use scope-locked pool size (1), not Dhan cap (5).
-                format!(
+                // PR #790b — append disconnect-reason context so the operator
+                // sees WHY + how-long + how-many-attempts in the same message.
+                let pool = tickvault_common::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT;
+                let header = format!(
                     "<b>WebSocket {}/{} reconnected</b>",
                     connection_index.saturating_add(1),
-                    tickvault_common::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT
-                )
+                    pool
+                );
+                // Only render the diagnostic line when we actually have
+                // context (the cold path always sets reason; tests + initial
+                // probes may not).
+                match (reason, *down_secs, *attempts) {
+                    (Some(r), d, a) if d > 0 || a > 0 => {
+                        format!("{header}\nReason: {r}\nDown: {d}s · Attempts: {a}")
+                    }
+                    (Some(r), _, _) => format!("{header}\nReason: {r}"),
+                    (None, d, a) if d > 0 || a > 0 => {
+                        format!("{header}\nDown: {d}s · Attempts: {a}")
+                    }
+                    (None, _, _) => header,
+                }
             }
             Self::WebSocketSleepEntered {
                 feed,
@@ -3741,6 +3779,9 @@ mod tests {
         // `test_websocket_reconnected_uses_scope_locked_pool_size` below.
         let event = NotificationEvent::WebSocketReconnected {
             connection_index: 0,
+            reason: None,
+            down_secs: 0,
+            attempts: 0,
         };
         let msg = event.to_message();
         assert!(msg.contains("1"), "1-indexed display: 0 -> 1; got: {msg}");
@@ -3773,6 +3814,9 @@ mod tests {
         .to_message();
         let reconnected = NotificationEvent::WebSocketReconnected {
             connection_index: 0,
+            reason: None,
+            down_secs: 0,
+            attempts: 0,
         }
         .to_message();
         let exhausted = NotificationEvent::WebSocketReconnectionExhausted {
@@ -3801,6 +3845,95 @@ mod tests {
                  this misleads the operator under indices_4_only scope. Got: {msg}"
             );
         }
+    }
+
+    /// PR #790b (2026-05-25) — diagnostic carry-through ratchet.
+    ///
+    /// Pins that when `WebSocketReconnected` carries `reason`, `down_secs`, or
+    /// `attempts`, the Telegram message surfaces them on a dedicated line so
+    /// the operator immediately sees WHY the disconnect happened + how long
+    /// it was down + how many backoff attempts it took.
+    ///
+    /// This answers the operator's 2026-05-25 13:03 IST question:
+    /// > "why and how this just one connection of 4 instruments websocket
+    /// >  got reconnected"
+    #[test]
+    fn test_reconnect_message_carries_disconnect_diagnostic_when_provided() {
+        let full = NotificationEvent::WebSocketReconnected {
+            connection_index: 0,
+            reason: Some("Reset by peer".to_string()),
+            down_secs: 110,
+            attempts: 6,
+        }
+        .to_message();
+        assert!(
+            full.contains("Reason: Reset by peer"),
+            "must show why the disconnect happened, got: {full}"
+        );
+        assert!(
+            full.contains("Down: 110s"),
+            "must show how long down, got: {full}"
+        );
+        assert!(
+            full.contains("Attempts: 6"),
+            "must show retry attempts, got: {full}"
+        );
+        assert!(
+            full.contains("1/1"),
+            "must keep scope-locked pool size from PR #790a, got: {full}"
+        );
+
+        // Backwards-compat: empty diagnostic context renders as the original
+        // single-line message (no spurious "Down: 0s · Attempts: 0" line).
+        let bare = NotificationEvent::WebSocketReconnected {
+            connection_index: 0,
+            reason: None,
+            down_secs: 0,
+            attempts: 0,
+        }
+        .to_message();
+        assert!(
+            !bare.contains("Down:"),
+            "no diagnostic line when context is empty, got: {bare}"
+        );
+        assert!(
+            !bare.contains("Reason:"),
+            "no Reason line when reason is None, got: {bare}"
+        );
+
+        // Partial context: reason only.
+        let reason_only = NotificationEvent::WebSocketReconnected {
+            connection_index: 0,
+            reason: Some("Token expired (DH-807)".to_string()),
+            down_secs: 0,
+            attempts: 0,
+        }
+        .to_message();
+        assert!(
+            reason_only.contains("Reason: Token expired (DH-807)"),
+            "reason-only renders reason line, got: {reason_only}"
+        );
+        assert!(
+            !reason_only.contains("Down:"),
+            "no Down line when down_secs+attempts both zero, got: {reason_only}"
+        );
+
+        // Partial context: timing only (no reason captured — rare initial path).
+        let timing_only = NotificationEvent::WebSocketReconnected {
+            connection_index: 0,
+            reason: None,
+            down_secs: 15,
+            attempts: 2,
+        }
+        .to_message();
+        assert!(
+            timing_only.contains("Down: 15s · Attempts: 2"),
+            "timing-only renders Down+Attempts, got: {timing_only}"
+        );
+        assert!(
+            !timing_only.contains("Reason:"),
+            "no Reason line when reason is None, got: {timing_only}"
+        );
     }
 
     #[test]
@@ -4758,6 +4891,9 @@ mod tests {
     fn test_ws_reconnected_severity() {
         let event = NotificationEvent::WebSocketReconnected {
             connection_index: 0,
+            reason: None,
+            down_secs: 0,
+            attempts: 0,
         };
         assert_eq!(event.severity(), Severity::Medium);
     }
