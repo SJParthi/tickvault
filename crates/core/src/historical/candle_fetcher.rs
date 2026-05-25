@@ -811,6 +811,137 @@ pub async fn fetch_historical_candles(
     summary
 }
 
+/// Pre-market yesterday's-1d fetch (operator-locked 2026-05-25 — see
+/// `.claude/rules/project/live-feed-purity.md` rule 8). This is the
+/// NARROW exception to the 2026-04-22 "no pre-market historical fetch"
+/// directive: at 09:00:30 IST every trading day, fetch yesterday's
+/// closing candle for the locked 4 IDX_I SIDs so the operator has a
+/// forensic record before today's session opens.
+///
+/// Why it bypasses `decide_fetch`: `decide_fetch` returns
+/// `WaitUntilPostClose` for any pre-15:30 IST trading-day call. That's
+/// correct for the bulk 90-day fetch (which would hammer Dhan REST
+/// pre-market and risk DH-904 on the live path), but wrong for the
+/// narrow ~20 REST-call pre-market verify case the operator explicitly
+/// authorized.
+///
+/// Uses a SEPARATE marker file from the post-market full-fetch marker
+/// so the two schedulers never collide. The marker semantics are the
+/// same: `last_success_date == today` → skip; absent or older →
+/// fetch using `FetchMode::FullNinetyDays` with caller-supplied
+/// `lookback_days = 1` (which produces the (yesterday, today) range).
+///
+/// O(1) marker check + at most ~20 REST calls per trading day.
+#[allow(clippy::too_many_arguments)] // APPROVED: same surface as fetch_historical_candles
+// TEST-EXEMPT: integration function — exercised via wiring ratchets in `yesterdays_1d_pre_market_scheduler_wiring_guard` + existing `fetch_historical_candles_inner` unit tests.
+pub async fn fetch_yesterdays_1d_pre_market(
+    registry: &InstrumentRegistry,
+    dhan_config: &DhanConfig,
+    historical_config: &HistoricalDataConfig,
+    token_handle: &TokenHandle,
+    client_id: &SecretString,
+    candle_writer: &mut CandlePersistenceWriter,
+) -> CandleFetchSummary {
+    let marker_path = PathBuf::from(&historical_config.marker_path);
+    let marker = match read_marker(&marker_path) {
+        Ok(m) => m,
+        Err(err) => {
+            counter!("tv_pre_market_yesterday_1d_marker_read_errors_total").increment(1);
+            error!(
+                ?err,
+                marker_path = %historical_config.marker_path,
+                "failed to read pre-market yesterday's-1d marker — refusing to fetch"
+            );
+            return CandleFetchSummary {
+                instruments_fetched: 0,
+                instruments_failed: 0,
+                total_candles: 0,
+                instruments_skipped: 0,
+                persist_failures: 0,
+                failed_instruments: vec![],
+                failure_reasons: HashMap::new(),
+            };
+        }
+    };
+
+    let today = today_ist_date();
+    if let Some(ref m) = marker
+        && m.last_success_date == today
+    {
+        info!(
+            last_success_date = %m.last_success_date,
+            "pre-market yesterday's-1d already fetched today — skipping"
+        );
+        counter!("tv_pre_market_yesterday_1d_skipped_total").increment(1);
+        return CandleFetchSummary {
+            instruments_fetched: 0,
+            instruments_failed: 0,
+            total_candles: 0,
+            instruments_skipped: 0,
+            persist_failures: 0,
+            failed_instruments: vec![],
+            failure_reasons: HashMap::new(),
+        };
+    }
+
+    info!(
+        %today,
+        marker_present = marker.is_some(),
+        lookback_days = historical_config.lookback_days,
+        marker_path = %historical_config.marker_path,
+        "starting pre-market yesterday's-1d fetch (operator-locked 2026-05-25)"
+    );
+
+    let summary = fetch_historical_candles_inner(
+        FetchMode::FullNinetyDays,
+        today,
+        registry,
+        dhan_config,
+        historical_config,
+        token_handle,
+        client_id,
+        candle_writer,
+    )
+    .await;
+
+    let is_fully_successful = summary.instruments_fetched > 0
+        && summary.instruments_failed == 0
+        && summary.persist_failures == 0;
+
+    if is_fully_successful {
+        #[allow(clippy::cast_possible_truncation)]
+        // APPROVED: counts fit u32 (max 4 IDX_I SIDs)
+        let new_marker = HistoricalFetchMarker {
+            last_success_date: today,
+            instruments_fetched: summary.instruments_fetched as u32,
+            candles_written: summary.total_candles as u64,
+            mode: FetchMode::FullNinetyDays,
+        };
+        if let Err(err) = write_marker(&marker_path, &new_marker) {
+            counter!("tv_pre_market_yesterday_1d_marker_write_errors_total").increment(1);
+            error!(?err, "failed to write pre-market yesterday's-1d marker");
+        } else {
+            info!(
+                marker_path = %historical_config.marker_path,
+                instruments_fetched = summary.instruments_fetched,
+                candles_written = summary.total_candles,
+                "pre-market yesterday's-1d marker written (fully successful run)"
+            );
+            counter!("tv_pre_market_yesterday_1d_success_total").increment(1);
+        }
+    } else {
+        counter!("tv_pre_market_yesterday_1d_failure_total").increment(1);
+        warn!(
+            instruments_fetched = summary.instruments_fetched,
+            instruments_failed = summary.instruments_failed,
+            persist_failures = summary.persist_failures,
+            "pre-market yesterday's-1d marker NOT written — run was not fully successful; tomorrow's 09:00:30 will retry"
+        );
+    }
+
+    summary
+}
+
 /// Internal fetch implementation. Pulls candles from Dhan's REST API
 /// for either the full 90-day window (`FetchMode::FullNinetyDays`) or
 /// only today's intraday data (`FetchMode::TodayOnly`).
