@@ -102,13 +102,17 @@ pub fn build_report_row_from_cross_match(
     trigger: &str,
     report: &CrossMatchReport,
 ) -> CrossVerifyReportRow {
-    let outcome = if report.passed {
-        "PASS"
-    } else if report.live_candles_present && report.candles_compared > 0 {
-        "FAIL"
-    } else {
-        "SKIP"
-    };
+    // PR #797 (operator-locked 2026-05-25): outcome is ALWAYS PASS or
+    // FAIL — never SKIP. This aligns the JSONL+HTML forensic record
+    // with the Telegram emission semantics introduced in PR #796:
+    // empty live candles or partial coverage now route to FAIL (with
+    // structured reason in `mismatch_details`), not SKIP.
+    //
+    // The earlier SKIP branch had two effect-classes that conflicted
+    // with PR #796: (a) HTML showed orange "SKIP" while Telegram said
+    // "FAIL", and (b) operators could not tell from the JSONL whether
+    // verification was truly successful or skipped due to no data.
+    let outcome = if report.passed { "PASS" } else { "FAIL" };
     let mut samples: Vec<MismatchSample> = report
         .mismatch_details
         .iter()
@@ -467,7 +471,12 @@ mod tests {
     }
 
     #[test]
-    fn test_build_report_row_skip_outcome_when_no_live() {
+    fn test_build_report_row_fail_outcome_when_no_live_pr_797() {
+        // PR #797 (operator-locked 2026-05-25): replaces the previous
+        // `test_build_report_row_skip_outcome_when_no_live`. SKIP is
+        // no longer a valid JSONL outcome — empty live candles route
+        // to FAIL with structured reason, matching the Telegram
+        // emission semantics established in PR #796.
         let report = sample_report(false, 0, false);
         let row = build_report_row_from_cross_match(
             NaiveDate::from_ymd_opt(2026, 5, 25).unwrap(),
@@ -475,7 +484,10 @@ mod tests {
             "intraday_15_31",
             &report,
         );
-        assert_eq!(row.outcome, "SKIP");
+        assert_eq!(
+            row.outcome, "FAIL",
+            "PR #797 invariant: outcome MUST be PASS or FAIL only — no SKIP"
+        );
     }
 
     #[test]
