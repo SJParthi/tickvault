@@ -397,31 +397,6 @@ pub enum ErrorCode {
     /// error, network failure, all 222 REST fetches errored). Strategy
     /// gate stays CLOSED. Operator must intervene. Severity::Critical.
     BarMismatch03CrossCheckFailed,
-    /// GAP-FILL-01: gap-fill scheduler supervisor task caught a panic
-    /// in the inner scheduler loop or the broadcast channel closed
-    /// unexpectedly. Severity::Critical — the bounded-zero-loss
-    /// envelope is breached until the supervisor re-spawns the inner
-    /// task. Post-market `cross_verify.rs` is the L3 safety net.
-    GapFill01SchedulerFailed,
-    /// GAP-FILL-02: a per-bar Dhan REST `/v2/charts/intraday` fetch
-    /// failed after exhausting `GAP_FILL_RETRY_ATTEMPTS` (3 generic
-    /// retries) or the DH-904 backoff ladder (4 attempts: 10/20/40/80s).
-    /// The bar's audit row is written with `result=failed` and the
-    /// operator decides whether to backfill manually. Severity::High.
-    GapFill02RestFetchFailed,
-    /// GAP-FILL-03: a per-bar fetch succeeded but the QuestDB UPSERT
-    /// into `candles_1m` failed. The audit row already reflects the
-    /// REST success — operator must reconcile manually OR rely on
-    /// post-market cross-verify. Severity::High.
-    GapFill03UpsertFailed,
-    /// GAP-FILL-04: the gap-fill scheduler's broadcast receiver lagged
-    /// behind and `tokio::sync::broadcast::Receiver::recv()` returned
-    /// `Err(Lagged(n))` — meaning `n` disconnect-resolved events were
-    /// dropped silently before the scheduler could observe them.
-    /// Severity::Critical — n bars may have been missed entirely.
-    /// The scheduler runs a full reconciliation pass (SELECT on
-    /// `candles_1m` over the suspected window) before continuing.
-    GapFill04EventChannelLagged,
 
     // -----------------------------------------------------------------------
     // PR #1 (AWS-lifecycle 14-PR sequence): contract stubs for the future
@@ -619,11 +594,6 @@ impl ErrorCode {
             Self::BarMismatch01CorrectedFromHistorical => "BAR-MISMATCH-01",
             Self::BarMismatch02CrossCheckInconclusive => "BAR-MISMATCH-02",
             Self::BarMismatch03CrossCheckFailed => "BAR-MISMATCH-03",
-            // Phase 0 Items 8+9 — gap-fill scheduler
-            Self::GapFill01SchedulerFailed => "GAP-FILL-01",
-            Self::GapFill02RestFetchFailed => "GAP-FILL-02",
-            Self::GapFill03UpsertFailed => "GAP-FILL-03",
-            Self::GapFill04EventChannelLagged => "GAP-FILL-04",
             // PR #1 (AWS-lifecycle): option_chain + cross_verify stubs
             Self::OptionChain01FetchFailed => "OPTION-CHAIN-01",
             Self::OptionChain02Dh904Exhausted => "OPTION-CHAIN-02",
@@ -668,8 +638,6 @@ impl ErrorCode {
             | Self::BarMismatch01CorrectedFromHistorical
             | Self::BarMismatch02CrossCheckInconclusive
             | Self::BarMismatch03CrossCheckFailed
-            | Self::GapFill01SchedulerFailed
-            | Self::GapFill04EventChannelLagged
             // PR #1 (AWS-lifecycle) — Critical option-chain + cross-verify
             | Self::OptionChain05CacheStaleHaltStrategy
             | Self::OptionChain08TokenExpiredMidCycle
@@ -698,8 +666,6 @@ impl ErrorCode {
             | Self::Boot01QuestDbSlow
             | Self::Volume01MonotonicityBreach
             | Self::AggregatorLate01
-            | Self::GapFill02RestFetchFailed
-            | Self::GapFill03UpsertFailed
             // PR #1 (AWS-lifecycle) — High option-chain + cross-verify
             | Self::OptionChain01FetchFailed
             | Self::OptionChain02Dh904Exhausted
@@ -864,12 +830,6 @@ impl ErrorCode {
             | Self::BarMismatch03CrossCheckFailed => {
                 ".claude/rules/project/phase-0-items-15-28-29-error-codes.md"
             }
-            Self::GapFill01SchedulerFailed
-            | Self::GapFill02RestFetchFailed
-            | Self::GapFill03UpsertFailed
-            | Self::GapFill04EventChannelLagged => {
-                ".claude/rules/project/phase-0-gap-fill-error-codes.md"
-            }
             // PR #1 (AWS-lifecycle): option_chain + cross_verify stubs
             Self::OptionChain01FetchFailed
             | Self::OptionChain02Dh904Exhausted
@@ -1004,11 +964,6 @@ impl ErrorCode {
             Self::BarMismatch01CorrectedFromHistorical,
             Self::BarMismatch02CrossCheckInconclusive,
             Self::BarMismatch03CrossCheckFailed,
-            // Phase 0 Items 8+9 — gap-fill scheduler
-            Self::GapFill01SchedulerFailed,
-            Self::GapFill02RestFetchFailed,
-            Self::GapFill03UpsertFailed,
-            Self::GapFill04EventChannelLagged,
             // PR #1 (AWS-lifecycle 14-PR sequence) — option_chain + cross_verify stubs
             Self::OptionChain01FetchFailed,
             Self::OptionChain02Dh904Exhausted,
@@ -1260,7 +1215,11 @@ mod tests {
         // bumped 102 -> 101 by removing INDEX-OHLC-01 (preopen buffer
         // empty at 09:15:00 IST) — pre-open buffer module deleted; day_open
         // is now the first observed live WebSocket tick after midnight reset.
-        assert_eq!(ErrorCode::all().len(), 101);
+        // 2026-05-26 (PR-B — gap_fill scheduler removal): bumped 101 -> 97
+        // by removing GAP-FILL-01/02/03/04 — gap_fill_scheduler + planner +
+        // disconnect_event + last_seen_ltt_cache modules deleted alongside
+        // Dhan historical fetch chain.
+        assert_eq!(ErrorCode::all().len(), 97);
     }
 
     #[test]

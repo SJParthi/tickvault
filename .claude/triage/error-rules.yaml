@@ -1452,56 +1452,6 @@ rules:
       Operator runs mcp__tickvault-logs__tail_errors for DH-* codes;
       check token validity (DH-901) or rate-limit ladder (DH-904).
 
-  - name: gap-fill-01-scheduler-failed-escalate
-    match:
-      code: GAP-FILL-01
-    action: escalate
-    runbook_path: .claude/rules/project/phase-0-gap-fill-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      GAP-FILL-01 = scheduler supervisor caught panic / channel closed.
-      Severity::Critical. Bounded-zero-loss envelope breached until
-      supervisor respawns inner task. Post-market cross_verify is the
-      L3 safety net.
-
-  - name: gap-fill-02-rest-fetch-failed-escalate
-    match:
-      code: GAP-FILL-02
-    action: escalate
-    runbook_path: .claude/rules/project/phase-0-gap-fill-error-codes.md
-    confidence: 0.9
-    cooldown_secs: 60
-    justification: >-
-      GAP-FILL-02 = per-bar REST fetch failed after all retries.
-      Severity::High. Audit row written with result=failed. Operator
-      decides whether to backfill manually via bhavcopy EOD
-      reconciliation.
-
-  - name: gap-fill-03-upsert-failed-escalate
-    match:
-      code: GAP-FILL-03
-    action: escalate
-    runbook_path: .claude/rules/project/phase-0-gap-fill-error-codes.md
-    confidence: 0.9
-    cooldown_secs: 60
-    justification: >-
-      GAP-FILL-03 = QuestDB UPSERT failed after successful REST fetch.
-      Severity::High. Audit row reflects REST success but QuestDB row
-      NOT written. Rescue-ring writer retries on next flush.
-
-  - name: gap-fill-04-event-channel-lagged-escalate
-    match:
-      code: GAP-FILL-04
-    action: escalate
-    runbook_path: .claude/rules/project/phase-0-gap-fill-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      GAP-FILL-04 = broadcast receiver lagged; disconnect events dropped.
-      Severity::Critical. Up to N outages may have been missed
-      entirely. Scheduler runs full reconciliation pass with
-      trigger_event=scheduler_catchup.
 
   # -----------------------------------------------------------------------
   # Day OHLC tracker for IDX_I (post 2026-05-26 — pre-open buffer removed)

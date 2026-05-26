@@ -43,17 +43,6 @@ pub mod cross_verify_report;
 // 2026-05-25 PR #788 — pure-function helpers for the cross-verify
 // scheduler (09:00:30 IST 1d-yesterday and 15:31:00 IST intraday).
 pub mod cross_verify_scheduler;
-// Phase 0 Item 10 — pure planner that computes which 1m bar starts a
-// disconnect gap-fill scheduler should refill. Does NOT write to ticks
-// or synthesize ticks (compliant with live-feed-purity rule). The
-// scheduler task that consumes this plan lands in a follow-up PR.
-pub mod gap_fill_planner;
-// Phase 0 Item 8+9 (PR-C, 2026-05-17) — consumer side of the
-// disconnect-event broadcast channel. Subscribes to events from
-// `crate::websocket::connection`, calls `gap_fill_planner` to compute
-// missing 1m bars, and emits Prometheus counters. PR-D adds REST fetch
-// + `historical_candles` UPSERT.
-pub mod gap_fill_scheduler;
 
 // Phase 0 Item 15 (2026-05-18) — 09:16:05 IST post-open cross-check
 // primitives. Pure-function comparator + clock helpers + outcome
