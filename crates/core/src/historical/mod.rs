@@ -34,24 +34,3 @@
 //   - `.claude/rules/project/live-feed-purity.md`
 
 pub mod candle_fetcher;
-pub mod cross_verify;
-// 2026-05-25 PR #788 — JSONL + HTML report writer for cross-verify
-// outcomes. Operator-locked: Telegram is reserved for MISMATCH only;
-// PASS / SKIP go to the report files (operator-readable HTML opens in
-// browser; JSONL grep-able via MCP).
-pub mod cross_verify_report;
-// 2026-05-25 PR #788 — pure-function helpers for the cross-verify
-// scheduler (09:00:30 IST 1d-yesterday and 15:31:00 IST intraday).
-pub mod cross_verify_scheduler;
-
-// Phase 0 Item 15 (2026-05-18) — 09:16:05 IST post-open cross-check
-// primitives. Pure-function comparator + clock helpers + outcome
-// types. Scheduler wiring (REST fan-out + audit writes + strategy
-// gate) lands in sub-deliverable 4. See plan §785.
-pub mod post_open_cross_check;
-
-// PR #796 (operator-locked 2026-05-25) — post-market fetch window
-// gate. Restricts 90-day historical fetch + current-day intraday
-// fetch + cross-verification to the 15:30 – 23:00 IST window. Pure
-// O(1) range checker; no allocation; safe to call from any hot path.
-pub mod post_market_fetch_window;
