@@ -20,7 +20,6 @@
 // PR #6b (2026-05-19): universe_builder + csv_downloader + csv_parser + validation
 // modules RETIRED — boot reads LOCKED_UNIVERSE constant; no CSV pipeline.
 pub mod market_open_self_test;
-pub mod preopen_price_buffer;
 pub mod slo_score;
 pub mod subscription_distribution;
 pub mod subscription_planner;

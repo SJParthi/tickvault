@@ -1504,24 +1504,8 @@ rules:
       trigger_event=scheduler_catchup.
 
   # -----------------------------------------------------------------------
-  # PR #2.5 (AWS-lifecycle 14-PR sequence) — Day OHLC tracker for IDX_I
+  # Day OHLC tracker for IDX_I (post 2026-05-26 — pre-open buffer removed)
   # -----------------------------------------------------------------------
-
-  - name: index-ohlc-01-preopen-empty-at-0915-escalate
-    match:
-      code: INDEX-OHLC-01
-    action: escalate
-    runbook_path: .claude/rules/project/index-day-ohlc-tracker-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      INDEX-OHLC-01 = pre-market buffer empty at 09:15:00 IST for an
-      IDX_I SID. Aggregator falls back to first post-open tick LTP
-      (degraded — first TRADED price, not NSE equilibrium). The 15:31
-      IST cross-verify will fail CROSS-VERIFY-01 on the OPEN field
-      for that SID. Severity::Critical — operator paged via 4-channel
-      SNS (SMS+Telegram+Email+Connect call) to investigate WS health
-      during pre-market window.
 
   - name: index-ohlc-02-daily-reset-failed-escalate
     match:
@@ -1532,8 +1516,8 @@ rules:
     cooldown_secs: 60
     justification: >-
       INDEX-OHLC-02 = daily reset at IST midnight failed for one or
-      more IDX_I SIDs. Day high/low/close carry over until first
-      09:15:00 IST tick re-arms via arm_sid. Severity::High.
+      more IDX_I SIDs. Day high/low/close carry over until next live
+      tick re-arms via auto-arm-on-first-tick. Severity::High.
       Transient — next trading day's first tick recovers via re-arm.
       Operator inspects tv_day_ohlc_reset_failures_total counter and
       restarts app if persistent.
