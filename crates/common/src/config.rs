@@ -324,25 +324,8 @@ pub struct FeaturesConfig {
     pub market_open_self_test: bool,
     /// Wave 3 Item 13 — composite real-time guarantee score gauge.
     pub realtime_guarantee_score: bool,
-    /// PR #449 (operator clarification 2026-05-03): kill-switch for the
-    /// entire historical fetch + cross-verification + pre-warmup
-    /// subsystem. Defaults to `false`.
-    ///
-    /// Operator rationale: Dhan's 1-minute historical candles are
-    /// NSE-exchange-wide aggregates (NOT broker-traded), so cross-
-    /// verification against our broker-traded live ticks produces
-    /// false-positive volume mismatches. Until we migrate the
-    /// historical source to a broker-traded feed (Groww API — held
-    /// in PR #455), the entire historical pipeline (fetch + verify
-    /// + cross-match + pre-warmup) is disabled.
-    ///
-    /// PR-C (2026-05-26): the entire Dhan historical fetch chain is
-    /// DELETED. This flag is retained as a noop for config compatibility
-    /// but has no effect — historical fetch, verify and cross-match are
-    /// all gone.
-    ///
-    /// Live tick persistence + materialised views are unaffected.
-    pub historical_fetch_enabled: bool,
+    // PR-D (2026-05-26): `historical_fetch_enabled` retired alongside
+    // the deleted Dhan historical fetch chain.
 }
 
 impl Default for FeaturesConfig {
@@ -359,10 +342,6 @@ impl Default for FeaturesConfig {
             telegram_bucket_coalescer: true,
             market_open_self_test: true,
             realtime_guarantee_score: true,
-            // PR #449 operator kill-switch originally OFF. Flipped ON
-            // by PR #788 (2026-05-25) — required for cross-verify;
-            // base.toml + default now aligned (Phase B1 fix-up).
-            historical_fetch_enabled: true,
         }
     }
 }

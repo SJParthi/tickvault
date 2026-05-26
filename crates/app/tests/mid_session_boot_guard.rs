@@ -205,39 +205,7 @@ fn test_market_open_streaming_routes_to_failed_when_main_feed_is_zero() {
 }
 
 // PR-C (2026-05-26): 2 source-scan guards for the deleted
-// `spawn_historical_candle_fetch` routing tree are retired. The
-// HistoricalFetchAlreadyAvailable variant in events.rs is still
-// pinned by the test below.
-
-#[test]
-fn test_historical_fetch_already_available_variant_exists_at_low_severity() {
-    // Ratchet the event-catalogue side of the PR #353 fix: the new
-    // variant must exist in `events.rs` AND be tagged Severity::Low.
-    // If a future maintainer removes the variant or bumps its severity
-    // to High, Telegram would start paging on idempotent re-runs again.
-    let events_src = read_file("crates/core/src/notification/events.rs");
-    assert!(
-        events_src.contains("HistoricalFetchAlreadyAvailable {"),
-        "events.rs must declare HistoricalFetchAlreadyAvailable variant"
-    );
-    assert!(
-        events_src.contains("Self::HistoricalFetchAlreadyAvailable { .. } => Severity::Low"),
-        "HistoricalFetchAlreadyAvailable MUST be Severity::Low. \
-         An idempotent re-run is not an operator-page event."
-    );
-    assert!(
-        events_src.contains("Historical candles already fetched"),
-        "HistoricalFetchAlreadyAvailable to_message must start with \
-         `<b>Historical candles already fetched</b>` so the operator can \
-         visually distinguish it from the HIGH HistoricalFetchFailed."
-    );
-    assert!(
-        events_src.contains("today_ist: String") && events_src.contains("today_candles: u64"),
-        "HistoricalFetchAlreadyAvailable must carry today_ist (for the \
-         Telegram label) and today_candles (so the operator sees exactly \
-         how much data the DB has — reassurance that the skip is safe)."
-    );
-}
-
-// PR-C (2026-05-26): non-trading-day source-scan guard retired
-// (the spawn_historical_candle_fetch routing tree it ratcheted is deleted).
+// `spawn_historical_candle_fetch` routing tree are retired.
+//
+// PR-D (2026-05-26): HistoricalFetchAlreadyAvailable variant guard
+// retired — the variant itself is deleted alongside candle_fetcher.

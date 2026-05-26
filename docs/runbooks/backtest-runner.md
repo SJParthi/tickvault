@@ -235,7 +235,6 @@ Only AFTER the rubric verdict is PASS does a second PR flip
 ## Cross-references
 
   * Strategy implementation paths: `crates/trading/src/strategy/`
-  * Historical fetch: `crates/core/src/historical/candle_fetcher.rs`
   * Phase 1 monitoring rubric: `docs/runbooks/phase-1-monitoring-rubric.md`
   * Operator daily startup: `docs/runbooks/operator-daily-startup.md`
   * Phase 0 architecture: `.claude/rules/project/phase-0-architecture.md`

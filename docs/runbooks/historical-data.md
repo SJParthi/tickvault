@@ -1,12 +1,13 @@
 # Runbook — Historical data fetch failures
 
-**When it fires:** `HighHistoricalFetchErrors`, `DH-904` (rate limit),
-`DH-908/909` (Dhan 5xx), `DATA-811/812`, plus anything referencing
-`candle_fetcher.rs`.
+**When it fires:** historical artefacts referencing `DH-904` (rate
+limit), `DH-908/909` (Dhan 5xx), `DATA-811/812`.
 
-**Consequence if not resolved:** cross-verification between live and
-historical candles fails silently → potential SEBI audit gap. Strategy
-backtests run on incomplete data.
+**RETIRED 2026-05-26:** the entire Dhan historical fetch chain
+(candle_fetcher.rs + cross_verify.rs + supporting modules) was deleted
+across PRs #803/#804/#805/PR-D. This runbook is retained as historical
+context only; the failure modes it describes can no longer be triggered
+by tickvault code.
 
 ## Quick facts
 
@@ -118,9 +119,10 @@ WHERE security_id = <X>
 ## Related files
 
 - `.claude/rules/dhan/historical-data.md` — Dhan API spec
-- `crates/core/src/historical/candle_fetcher.rs` — fetch + retry
 - `crates/storage/src/candle_persistence.rs` — `historical_candles` writer
 - `.claude/rules/project/historical-candles-cross-verify.md` — invariants
 
-(PR-C 2026-05-26: `cross_verify.rs` module deleted alongside the entire
-Dhan historical fetch chain; the live-vs-historical diff is gone.)
+(PR-C 2026-05-26: `cross_verify.rs` deleted. PR-D 2026-05-26:
+`candle_fetcher.rs` deleted. The entire Dhan historical fetch chain
+is gone — `historical_candles` table is now orphaned and slated for
+deletion in PR-E.)

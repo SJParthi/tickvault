@@ -82,7 +82,9 @@ pub mod disk_health_watcher;
 // pipeline retired alongside the indices-only universe. The
 // option_greeks / pcr_snapshots / dhan_option_chain_raw / greeks_verification
 // QuestDB tables are dropped by scripts/migrate-drop-greeks-tables.sql.
-pub mod historical_fetch_marker;
+// PR-D (2026-05-26): `historical_fetch_marker` module DELETED. The
+// idempotency-marker file was only consumed by candle_fetcher.rs, which
+// is gone alongside the Dhan historical fetch chain.
 // Candle-engine re-architecture #T1b: `materialized_views` (Engine C —
 // `candles_1s` + the 9 `candles_<tf>` matviews) DELETED. The 21 plain
 // `candles_<tf>` tables are created by
