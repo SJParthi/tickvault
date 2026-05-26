@@ -95,9 +95,10 @@ create_base_tables() {
     execute_ddl "candles_1s" \
         "CREATE TABLE IF NOT EXISTS candles_1s (segment SYMBOL, security_id LONG, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, volume LONG, oi LONG, tick_count INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY WAL"
 
-    # 5. historical_candles
-    execute_ddl "historical_candles" \
-        "CREATE TABLE IF NOT EXISTS historical_candles (segment SYMBOL, timeframe SYMBOL, security_id LONG, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, volume LONG, oi LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY WAL"
+    # PR-E (2026-05-26): historical_candles DDL retired alongside the
+    # deleted Dhan historical fetch chain. The migration SQL in
+    # scripts/migrate-drop-historical-candles.sql drops the orphaned
+    # table on existing deployments.
 
     # 6. instrument_build_metadata
     execute_ddl "instrument_build_metadata" \
@@ -161,8 +162,7 @@ apply_dedup_keys() {
     execute_ddl "candles_1s DEDUP" \
         "ALTER TABLE candles_1s DEDUP ENABLE UPSERT KEYS(ts, security_id, segment)"
 
-    execute_ddl "historical_candles DEDUP" \
-        "ALTER TABLE historical_candles DEDUP ENABLE UPSERT KEYS(ts, security_id, timeframe, segment)"
+    # PR-E (2026-05-26): historical_candles DEDUP retired.
 
     execute_ddl "instrument_build_metadata DEDUP" \
         "ALTER TABLE instrument_build_metadata DEDUP ENABLE UPSERT KEYS(timestamp)"

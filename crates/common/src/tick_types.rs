@@ -22,7 +22,6 @@ pub struct ParsedTick {
     /// Last trade quantity (from Quote/Full packets; 0 for Ticker).
     pub last_trade_quantity: u16,
     /// Exchange timestamp as IST epoch seconds from Dhan WebSocket.
-    /// Note: Historical REST API returns UTC epoch seconds (see `HistoricalCandle`).
     pub exchange_timestamp: u32,
     /// Local receive timestamp in nanoseconds since Unix epoch (for latency measurement).
     pub received_at_nanos: i64,
@@ -218,39 +217,6 @@ pub struct NoopGreeksEnricher;
 impl GreeksEnricher for NoopGreeksEnricher {
     #[inline(always)]
     fn enrich(&mut self, _tick: &mut ParsedTick) {}
-}
-
-// ---------------------------------------------------------------------------
-// Historical Candle — 1-minute OHLCV from Dhan intraday API
-// ---------------------------------------------------------------------------
-
-/// An OHLCV candle from Dhan's historical API (intraday or daily).
-///
-/// Used for cross-verification against live tick data and for backfill.
-/// Timestamps are standard UTC epoch seconds from Dhan V2 REST API.
-/// The `timeframe` field discriminates between 1m, 5m, 15m, 60m, and 1d candles.
-#[derive(Debug, Clone)]
-pub struct HistoricalCandle {
-    /// Candle open timestamp as UTC epoch seconds from Dhan V2 REST API.
-    pub timestamp_utc_secs: i64,
-    /// Dhan security identifier.
-    pub security_id: u32,
-    /// Exchange segment code (matches `ParsedTick::exchange_segment_code`).
-    pub exchange_segment_code: u8,
-    /// Timeframe label: "1m", "5m", "15m", "60m", or "1d".
-    pub timeframe: &'static str,
-    /// Open price in rupees.
-    pub open: f64,
-    /// High price in rupees.
-    pub high: f64,
-    /// Low price in rupees.
-    pub low: f64,
-    /// Close price in rupees.
-    pub close: f64,
-    /// Volume for this candle interval.
-    pub volume: i64,
-    /// Open interest (F&O instruments only; 0 for equity).
-    pub open_interest: i64,
 }
 
 /// Response from Dhan's intraday charts API.
@@ -481,28 +447,6 @@ mod tests {
             open_interest: vec![], // No OI — still consistent
         };
         assert!(resp.is_consistent());
-    }
-
-    // --- HistoricalCandle ---
-
-    #[test]
-    fn test_historical_candle_is_clone() {
-        let candle = HistoricalCandle {
-            timestamp_utc_secs: 1700000000,
-            security_id: 42,
-            exchange_segment_code: 2,
-            timeframe: "1m",
-            open: 100.0,
-            high: 102.0,
-            low: 99.0,
-            close: 101.0,
-            volume: 1000,
-            open_interest: 5000,
-        };
-        let cloned = candle.clone();
-        assert_eq!(cloned.security_id, 42);
-        assert_eq!(cloned.timestamp_utc_secs, 1700000000);
-        assert_eq!(cloned.timeframe, "1m");
     }
 
     #[test]
@@ -916,27 +860,6 @@ mod tests {
         assert!(!resp.is_consistent());
     }
 
-    // --- HistoricalCandle field access ---
-
-    #[test]
-    fn test_historical_candle_all_timeframes() {
-        for tf in ["1m", "5m", "15m", "60m", "1d"] {
-            let candle = HistoricalCandle {
-                timestamp_utc_secs: 1700000000,
-                security_id: 42,
-                exchange_segment_code: 2,
-                timeframe: tf,
-                open: 100.0,
-                high: 102.0,
-                low: 99.0,
-                close: 101.0,
-                volume: 1000,
-                open_interest: 0,
-            };
-            assert_eq!(candle.timeframe, tf);
-        }
-    }
-
     // --- ParsedTick Debug impl ---
 
     #[test]
@@ -974,26 +897,6 @@ mod tests {
         let g = OptionGreeksSnapshot::default();
         let debug = format!("{:?}", g);
         assert!(debug.contains("OptionGreeksSnapshot"));
-    }
-
-    // --- HistoricalCandle Debug impl ---
-
-    #[test]
-    fn test_historical_candle_debug_output() {
-        let candle = HistoricalCandle {
-            timestamp_utc_secs: 1700000000,
-            security_id: 42,
-            exchange_segment_code: 2,
-            timeframe: "1m",
-            open: 100.0,
-            high: 102.0,
-            low: 99.0,
-            close: 101.0,
-            volume: 1000,
-            open_interest: 5000,
-        };
-        let debug = format!("{:?}", candle);
-        assert!(debug.contains("HistoricalCandle"));
     }
 
     #[test]
