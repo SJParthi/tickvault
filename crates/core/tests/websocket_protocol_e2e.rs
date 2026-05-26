@@ -95,7 +95,7 @@ use tickvault_common::constants::{
     PREVIOUS_CLOSE_PACKET_SIZE,
     // QuestDB tables
     QUESTDB_TABLE_CANDLES_1S,
-    QUESTDB_TABLE_HISTORICAL_CANDLES,
+    // PR-E (2026-05-26): QUESTDB_TABLE_HISTORICAL_CANDLES retired.
     QUESTDB_TABLE_MARKET_DEPTH,
     QUESTDB_TABLE_NSE_HOLIDAYS,
     QUESTDB_TABLE_PREVIOUS_CLOSE,
@@ -739,7 +739,7 @@ fn test_ist_offset_is_5h30m() {
 #[test]
 fn test_questdb_table_names_are_stable() {
     assert_eq!(QUESTDB_TABLE_TICKS, "ticks");
-    assert_eq!(QUESTDB_TABLE_HISTORICAL_CANDLES, "historical_candles");
+    // PR-E (2026-05-26): historical_candles table retired.
     assert_eq!(QUESTDB_TABLE_CANDLES_1S, "candles_1s");
     assert_eq!(QUESTDB_TABLE_MARKET_DEPTH, "market_depth");
     assert_eq!(QUESTDB_TABLE_PREVIOUS_CLOSE, "previous_close");

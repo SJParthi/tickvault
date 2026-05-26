@@ -60,7 +60,8 @@ use tickvault_core::websocket::connection_pool::WebSocketConnectionPool;
 use tickvault_core::websocket::order_update_connection::run_order_update_connection;
 use tickvault_core::websocket::types::{InstrumentSubscription, WebSocketError};
 
-use tickvault_storage::candle_persistence::ensure_candle_table_dedup_keys;
+// PR-E (2026-05-26): ensure_candle_table_dedup_keys retired alongside
+// the deleted candle_persistence module + historical_candles table.
 // PR #3 (2026-05-19): `greeks_persistence` retired. Migration SQL
 // `scripts/migrate-drop-greeks-tables.sql` drops the option_greeks /
 // pcr_snapshots / dhan_option_chain_raw / greeks_verification tables.
@@ -1310,7 +1311,7 @@ async fn main() -> Result<()> {
                     .await;
                 tokio::join!(
                     ensure_tick_table_dedup_keys(&config.questdb),
-                    ensure_candle_table_dedup_keys(&config.questdb),
+                    // PR-E (2026-05-26): historical_candles table retired.
                     tickvault_storage::shadow_persistence::ensure_shadow_candle_tables(
                         &config.questdb
                     ),
@@ -2190,7 +2191,7 @@ async fn main() -> Result<()> {
     // every clean boot until 2026-04-28.
     tokio::join!(
         ensure_tick_table_dedup_keys(&config.questdb),
-        ensure_candle_table_dedup_keys(&config.questdb),
+        // PR-E (2026-05-26): historical_candles table retired.
         // Candle-engine re-architecture #T1b: `ensure_candle_views`
         // (Engine C — `candles_1s` matview cascade) RETIRED. The 21
         // plain `candles_<tf>` tables are created by
@@ -5969,15 +5970,8 @@ mod tests {
     // `TfIndex::bucket_start(tick.exchange_timestamp)` (already IST epoch
     // seconds, no offset) — covered by `aggregator_cell` + `seal_ring` tests.
 
-    #[test]
-    fn test_historical_candle_adds_ist_offset() {
-        // Historical REST API returns UTC → must add +19800s.
-        let source = include_str!("../../storage/src/candle_persistence.rs");
-        assert!(
-            source.contains("compute_ist_nanos_from_utc_secs"),
-            "historical candles must use compute_ist_nanos_from_utc_secs (UTC + 19800s)"
-        );
-    }
+    // PR-E (2026-05-26): test_historical_candle_adds_ist_offset retired
+    // alongside the deleted candle_persistence module.
 
     // PR #3 (2026-05-19): `test_greeks_pipeline_adds_ist_offset` retired
     // alongside the deleted `greeks_pipeline.rs` file.

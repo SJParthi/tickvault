@@ -64,9 +64,15 @@ and replaced with the hard bans in this rule.
    `run_backfill`, `synthesize_ticks`** MUST NOT appear inside any file
    whose path contains `historical/` or `backfill`/`synth`. Scanner blocks.
 
-4. **Historical data** lives in two places only:
-   - `historical_candles` table — Dhan REST `/charts/historical` results.
-   - `candles_*` materialized views — aggregated live ticks from `ticks`.
+4. **Historical data — RETIRED 2026-05-26.** PR-E deleted the entire
+   Dhan historical fetch chain (`candle_fetcher.rs`,
+   `cross_verify.rs`, `gap_fill_*`, `preopen_*`,
+   `candle_persistence.rs`) AND dropped the `historical_candles`
+   QuestDB table. The only remaining "historical" surface is
+   `candles_*` materialized views aggregated from live ticks in
+   `ticks`. The pre-market yesterday's-1d fetch exception (rule 8
+   below) is also retired — there is no REST historical fetcher in
+   the codebase anymore.
 
 5. **`ticks` table** has ONE write path: `run_tick_processor` in
    `crates/core/src/pipeline/tick_processor.rs`, which consumes the WAL
@@ -78,23 +84,12 @@ and replaced with the hard bans in this rule.
    ticks stay missing. That is correct behaviour — forged ticks are
    worse than absent ticks for a regulated trading system.
 
-7. **Cross-verification** (`crates/core/src/historical/cross_verify.rs`)
-   READS from both `historical_candles` and `candles_*` views. It never
-   WRITES to either. That file is allowed to continue using historical
-   data because it only compares, never produces.
+7. **Cross-verification — RETIRED 2026-05-26.** PR-C deleted
+   `cross_verify.rs`. The live-vs-historical diff no longer runs.
 
-8. **Pre-market yesterday's-1d fetch exception (operator-locked 2026-05-25)** —
-   Parthiban verbatim 2026-05-25 14:30 IST:
-   > "see this should always happen onl yat the time of pre market dude
-   >  okay? Fetch yesterday's 1d for 4 IDX_I SIDs"
-   This is an EXPLICIT override of the 2026-04-22 directive
-   ("historical fetch must NEVER run pre-market on a trading day") for
-   the narrow case of yesterday's-1d-only verification:
-   - **Scope:** 4 IDX_I SIDs (`LOCKED_UNIVERSE`) × 1 timeframe (1d) × 1 day (yesterday) — at most ~20 Dhan REST calls (tiny vs. 90-day post-market hammer)
-   - **Trigger:** 09:00:30 IST every trading day (operator-locked, `DAILY_1D_FIRE_SECS_OF_DAY_IST` constant)
-   - **Purpose:** confirm yesterday's 1d candle is intact in `historical_candles` BEFORE today's session starts; forensic record via JSONL + Telegram only on mismatch
-   - **Marker:** separate marker file from the existing 15:30 IST post-market full-historical-fetch marker. Pre-market fetch does NOT block the post-market full fetch.
-   - **Bulk historical fetch (1m/5m/15m/60m × 90 days)** remains POST-MARKET ONLY per the original 2026-04-22 directive. The exception applies ONLY to the narrow yesterday's-1d case.
+8. **Pre-market yesterday's-1d fetch — RETIRED 2026-05-26.** PR-E
+   deleted the entire historical fetch chain; this exception no
+   longer has any callable code path.
 
 ## Test ratchet
 
@@ -106,14 +101,14 @@ and replaced with the hard bans in this rule.
 
 ## What this rule does NOT forbid
 
-- Fetching historical candles (`candle_fetcher.rs`) — ALLOWED.
-- Storing historical candles in `historical_candles` — ALLOWED.
-- Cross-verifying (`cross_verify.rs`) — ALLOWED.
 - Reading `ticks` from pipeline code — ALLOWED.
-- Reading `historical_candles` from dashboards — ALLOWED.
+- Aggregating `ticks` into `candles_*` materialized views — ALLOWED.
 
-Only synthesising ticks from historical data and writing them to `ticks`
-is banned.
+PR-E (2026-05-26) retired every other historical surface:
+`candle_fetcher.rs`, `cross_verify.rs`, `candle_persistence.rs`, and
+the `historical_candles` table are all deleted. The rule's only
+surviving teeth are now "no synthesised ticks into the `ticks` table",
+which remains enforced.
 
 ## Historical context
 

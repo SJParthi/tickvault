@@ -10,7 +10,9 @@
 //! `ParsedTick` frames originating from the WebSocket connection pool
 //! (`crates/core/src/websocket/`) and processed through
 //! `crates/core/src/pipeline/tick_processor.rs`. Historical REST-API
-//! data belongs in `historical_candles`, never in `ticks`.
+//! data NEVER crosses into `ticks` (the entire Dhan historical fetch
+//! chain was deleted in PRs #803-#807; `historical_candles` table is
+//! gone).
 //!
 //! See `.claude/rules/project/live-feed-purity.md` for the full rule.
 
@@ -93,7 +95,8 @@ fn live_feed_purity_no_tick_writer_in_historical_flow() {
                         "{}:{} — banned symbol `{}` in historical data flow. \
                          Live-feed purity directive (2026-04-17): the `ticks` \
                          table is reserved for WebSocket-sourced ticks only. \
-                         Historical REST data belongs in `historical_candles`.",
+                         The entire Dhan historical fetch chain was \
+                         deleted in PR-E (2026-05-26).",
                         path.display(),
                         line_idx,
                         banned
