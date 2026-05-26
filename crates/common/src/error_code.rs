@@ -400,14 +400,15 @@ pub enum ErrorCode {
 
     // -----------------------------------------------------------------------
     // PR #1 (AWS-lifecycle 14-PR sequence): contract stubs for the future
-    // option_chain + cross_verify modules. Variants exist so downstream
-    // PRs (#8 option_chain, #9 cross_verify) can wire their emit sites
-    // against stable identifiers. NO production emit sites yet —
-    // pub-fn-test guards apply when consumers land.
+    // option_chain module. Variants exist so downstream PR #8 can wire
+    // its emit sites against stable identifiers. NO production emit sites
+    // yet — pub-fn-test guards apply when consumers land.
+    //
+    // (PR-C 2026-05-26: CROSS-VERIFY-01..04 stubs retired along with the
+    // entire cross_verify chain.)
     //
     // See:
     // - docs/architecture/option-chain-z-plus-heart-piece.md §8
-    // - docs/architecture/aws-indices-only-locked-architecture.md §14.4
     // -----------------------------------------------------------------------
     /// OPTION-CHAIN-01: REST fetch failed (network timeout / 5xx). Retried
     /// once with 2s delay; if still failing, the cycle marks that underlying
@@ -439,24 +440,6 @@ pub enum ErrorCode {
     /// Token-manager force-refresh; retry within same cycle. Severity::Critical
     /// because option chain freshness is strategy-blocking.
     OptionChain08TokenExpiredMidCycle,
-
-    /// CROSS-VERIFY-01: 15:31 IST same-day OHLCV cross-verify found a
-    /// mismatch between our derived `candles_<tf>` and Dhan REST
-    /// `/v2/charts/intraday`. Zero-tolerance match required.
-    /// Severity::Critical. Alert+audit only — does NOT block trading
-    /// (operator decides next-day action).
-    CrossVerify011531Mismatch,
-    /// CROSS-VERIFY-02: 15:31 IST cross-verify could not reach Dhan REST.
-    /// Severity::High. Transient — retry next trading day.
-    CrossVerify021531HistUnreachable,
-    /// CROSS-VERIFY-03: 08:05 IST morning 1d cross-check found yesterday's
-    /// derived 1d candle disagrees with Dhan REST authoritative daily bar.
-    /// Severity::Critical. Alert+audit only — does NOT block trading
-    /// (operator-locked 2026-05-18).
-    CrossVerify03Morning1dMismatch,
-    /// CROSS-VERIFY-04: 08:05 IST morning cross-check could not reach
-    /// Dhan REST. Severity::High. Transient.
-    CrossVerify04Morning1dHistUnreachable,
 
     // -----------------------------------------------------------------------
     // PR #2.5 (AWS-lifecycle 14-PR sequence): Day OHLC tracker for IDX_I
@@ -594,7 +577,7 @@ impl ErrorCode {
             Self::BarMismatch01CorrectedFromHistorical => "BAR-MISMATCH-01",
             Self::BarMismatch02CrossCheckInconclusive => "BAR-MISMATCH-02",
             Self::BarMismatch03CrossCheckFailed => "BAR-MISMATCH-03",
-            // PR #1 (AWS-lifecycle): option_chain + cross_verify stubs
+            // PR #1 (AWS-lifecycle): option_chain stubs
             Self::OptionChain01FetchFailed => "OPTION-CHAIN-01",
             Self::OptionChain02Dh904Exhausted => "OPTION-CHAIN-02",
             Self::OptionChain03ParseFailed => "OPTION-CHAIN-03",
@@ -603,10 +586,6 @@ impl ErrorCode {
             Self::OptionChain06CycleOverlapSkip => "OPTION-CHAIN-06",
             Self::OptionChain07ExpiryRollover => "OPTION-CHAIN-07",
             Self::OptionChain08TokenExpiredMidCycle => "OPTION-CHAIN-08",
-            Self::CrossVerify011531Mismatch => "CROSS-VERIFY-01",
-            Self::CrossVerify021531HistUnreachable => "CROSS-VERIFY-02",
-            Self::CrossVerify03Morning1dMismatch => "CROSS-VERIFY-03",
-            Self::CrossVerify04Morning1dHistUnreachable => "CROSS-VERIFY-04",
             // Day OHLC tracker for IDX_I
             Self::IndexOhlc02DailyResetFailed => "INDEX-OHLC-02",
         }
@@ -638,11 +617,9 @@ impl ErrorCode {
             | Self::BarMismatch01CorrectedFromHistorical
             | Self::BarMismatch02CrossCheckInconclusive
             | Self::BarMismatch03CrossCheckFailed
-            // PR #1 (AWS-lifecycle) — Critical option-chain + cross-verify
+            // PR #1 (AWS-lifecycle) — Critical option-chain
             | Self::OptionChain05CacheStaleHaltStrategy
-            | Self::OptionChain08TokenExpiredMidCycle
-            | Self::CrossVerify011531Mismatch
-            | Self::CrossVerify03Morning1dMismatch => Severity::Critical,
+            | Self::OptionChain08TokenExpiredMidCycle => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
             Self::Selftest01Passed
             | Self::Slo01Healthy
@@ -666,12 +643,10 @@ impl ErrorCode {
             | Self::Boot01QuestDbSlow
             | Self::Volume01MonotonicityBreach
             | Self::AggregatorLate01
-            // PR #1 (AWS-lifecycle) — High option-chain + cross-verify
+            // PR #1 (AWS-lifecycle) — High option-chain
             | Self::OptionChain01FetchFailed
             | Self::OptionChain02Dh904Exhausted
             | Self::OptionChain06CycleOverlapSkip
-            | Self::CrossVerify021531HistUnreachable
-            | Self::CrossVerify04Morning1dHistUnreachable
             // PR #2.5 — INDEX-OHLC-02 is High (carry-over wrong but recoverable)
             | Self::IndexOhlc02DailyResetFailed => Severity::High,
             // Medium: data pipeline correctness
@@ -830,7 +805,7 @@ impl ErrorCode {
             | Self::BarMismatch03CrossCheckFailed => {
                 ".claude/rules/project/phase-0-items-15-28-29-error-codes.md"
             }
-            // PR #1 (AWS-lifecycle): option_chain + cross_verify stubs
+            // PR #1 (AWS-lifecycle): option_chain stubs
             Self::OptionChain01FetchFailed
             | Self::OptionChain02Dh904Exhausted
             | Self::OptionChain03ParseFailed
@@ -838,11 +813,7 @@ impl ErrorCode {
             | Self::OptionChain05CacheStaleHaltStrategy
             | Self::OptionChain06CycleOverlapSkip
             | Self::OptionChain07ExpiryRollover
-            | Self::OptionChain08TokenExpiredMidCycle
-            | Self::CrossVerify011531Mismatch
-            | Self::CrossVerify021531HistUnreachable
-            | Self::CrossVerify03Morning1dMismatch
-            | Self::CrossVerify04Morning1dHistUnreachable => {
+            | Self::OptionChain08TokenExpiredMidCycle => {
                 ".claude/rules/project/option-chain-cross-verify-error-codes.md"
             }
             // Day OHLC tracker for IDX_I
@@ -964,7 +935,7 @@ impl ErrorCode {
             Self::BarMismatch01CorrectedFromHistorical,
             Self::BarMismatch02CrossCheckInconclusive,
             Self::BarMismatch03CrossCheckFailed,
-            // PR #1 (AWS-lifecycle 14-PR sequence) — option_chain + cross_verify stubs
+            // PR #1 (AWS-lifecycle 14-PR sequence) — option_chain stubs
             Self::OptionChain01FetchFailed,
             Self::OptionChain02Dh904Exhausted,
             Self::OptionChain03ParseFailed,
@@ -973,10 +944,6 @@ impl ErrorCode {
             Self::OptionChain06CycleOverlapSkip,
             Self::OptionChain07ExpiryRollover,
             Self::OptionChain08TokenExpiredMidCycle,
-            Self::CrossVerify011531Mismatch,
-            Self::CrossVerify021531HistUnreachable,
-            Self::CrossVerify03Morning1dMismatch,
-            Self::CrossVerify04Morning1dHistUnreachable,
             // Day OHLC tracker for IDX_I (Ticker mode)
             Self::IndexOhlc02DailyResetFailed,
         ]
@@ -1184,7 +1151,8 @@ mod tests {
         // 2026-05-18 (Phase 0 Items 15+28+29 — post-open cross-check):
         // bumped 105 -> 108 for BAR-MISMATCH-01/02/03.
         // 2026-05-18 (PR #1 of AWS-lifecycle 14-PR sequence — contract stubs):
-        // bumped 108 -> 120 for OPTION-CHAIN-01..08 + CROSS-VERIFY-01..04.
+        // bumped 108 -> 120 for OPTION-CHAIN-01..08 + CROSS-VERIFY-01..04
+        // (CROSS-VERIFY-* retired in PR-C 2026-05-26).
         // 2026-05-18 (PR #2.5 of AWS-lifecycle — Day OHLC tracker for IDX_I):
         // bumped 120 -> 122 for INDEX-OHLC-01 + INDEX-OHLC-02.
         // 2026-05-19 (PR #4 of AWS-lifecycle — depth pipelines retirement):
@@ -1219,7 +1187,11 @@ mod tests {
         // by removing GAP-FILL-01/02/03/04 — gap_fill_scheduler + planner +
         // disconnect_event + last_seen_ltt_cache modules deleted alongside
         // Dhan historical fetch chain.
-        assert_eq!(ErrorCode::all().len(), 97);
+        // 2026-05-26 (PR-C — cross_verify chain removal): bumped 97 -> 93
+        // by removing CROSS-VERIFY-01/02/03/04 — cross_verify + post_open_cross_check
+        // + post_market_fetch_window + cross_verify_scheduler modules deleted
+        // alongside Dhan historical fetch chain.
+        assert_eq!(ErrorCode::all().len(), 93);
     }
 
     #[test]
@@ -1265,9 +1237,8 @@ mod tests {
                 || s.starts_with("ORPHAN-POSITION-")
                 // Phase 0 Items 15+28+29: 09:16:05 IST post-open cross-check.
                 || s.starts_with("BAR-MISMATCH-")
-                // PR #1 (AWS-lifecycle 14-PR sequence): option_chain + cross_verify stubs
+                // PR #1 (AWS-lifecycle 14-PR sequence): option_chain stubs
                 || s.starts_with("OPTION-CHAIN-")
-                || s.starts_with("CROSS-VERIFY-")
                 // PR #2.5 (AWS-lifecycle): Day OHLC tracker for IDX_I
                 || s.starts_with("INDEX-OHLC-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");

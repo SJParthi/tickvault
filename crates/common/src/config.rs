@@ -336,10 +336,10 @@ pub struct FeaturesConfig {
     /// in PR #455), the entire historical pipeline (fetch + verify
     /// + cross-match + pre-warmup) is disabled.
     ///
-    /// When `false` (default), main.rs skips:
-    /// - `spawn_historical_candle_fetch` (fast + slow boot paths)
-    /// - `verify_candle_integrity`
-    /// - `cross_match_historical_vs_live`
+    /// PR-C (2026-05-26): the entire Dhan historical fetch chain is
+    /// DELETED. This flag is retained as a noop for config compatibility
+    /// but has no effect — historical fetch, verify and cross-match are
+    /// all gone.
     ///
     /// Live tick persistence + materialised views are unaffected.
     pub historical_fetch_enabled: bool,

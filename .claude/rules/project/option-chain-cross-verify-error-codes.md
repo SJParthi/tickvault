@@ -76,51 +76,19 @@ Per `option-chain-z-plus-heart-piece.md` §8. The option_chain REST fetcher runs
 
 ---
 
-## §2. Cross-Verify codes (4 variants — Z+ L3 RECONCILE)
+## §2. Cross-Verify codes — RETIRED (PR-C 2026-05-26)
 
-Per `aws-indices-only-locked-architecture.md` §14. Two daily gates: 15:31 IST same-day intraday verify + 08:05 IST morning 1d check.
+The 4 CROSS-VERIFY codes (CROSS-VERIFY-01..04) and their entire
+`cross_verify` chain were deleted in PR-C of the Dhan historical fetch
+chain removal series (2026-05-26). Operator directive narrowed the
+runtime to spot-only NIFTY 50 strategy; no VWAP, no futures, no
+historical fetch, no L3 RECONCILE pass.
 
-> **#T5 table-cleanup lock (2026-05-20):** cross-verify is **table-free**.
-> It compares our derived `candles_<tf>` against Dhan REST and against
-> `historical_candles`, and reports outcomes **via Telegram only** —
-> there is NO `cross_verify_audit` / `cross_verify_mismatches` QuestDB
-> table. The earlier design (`aws-indices-only-locked-architecture.md`
-> §14.4-14.5, `precision-realism-and-table-redesign.md` tables 11-12)
-> proposed audit tables; the QuestDB table-cleanup plan
-> (`.claude/plans/archive/`, item #T5) supersedes that — the result is
-> a Telegram alert + the structured `error!` log in
-> `data/logs/errors.jsonl.*`, nothing more. Future #9b+ schedulers
-> MUST NOT add an audit-table writer.
-
-### CROSS-VERIFY-01 — 15:31 IST same-day mismatch
-
-**Severity:** Critical.
-**Auto-triage:** No (operator review).
-**Behavior:** Telegram alert only — does **NOT** block trading the next day (operator-locked 2026-05-18) and writes **no audit table** (#T5).
-**Trigger:** at 15:31 IST after market close, the cross-verify scheduler runs 12 pairs (4 SIDs × 3 TFs: 1m, 5m, 15m). For each pair, our derived `candles_<tf>` is compared against Dhan REST `/v2/charts/intraday` for the same trading-date timestamps. Zero-tolerance OHLCV match required. Any mismatch fires this code.
-**Triage:** the Telegram alert names every mismatched `(timeframe, candle timestamp, field)`; the same detail is in the structured `error!` log (`data/logs/errors.jsonl.*`). Verify whether our aggregator missed ticks during a known disconnect window (cross-check the WebSocket reconnect log lines).
-
-### CROSS-VERIFY-02 — 15:31 IST historical REST unreachable
-
-**Severity:** High.
-**Auto-triage:** Yes (retry next trading day).
-**Trigger:** the 15:31 IST cross-verify could not reach `/v2/charts/intraday` (network timeout, persistent 5xx). The day's verification is skipped; alert fires. Next trading day's 08:05 IST morning check covers yesterday's full-day candle via `/v2/charts/historical`.
-**Triage:** confirm Dhan REST endpoint health. Schedule a one-shot manual verify when REST recovers if integrity is operator-critical.
-
-### CROSS-VERIFY-03 — 08:05 IST morning 1d mismatch
-
-**Severity:** Critical.
-**Auto-triage:** No (operator review).
-**Behavior:** Telegram alert only — does **NOT** block trading the day (operator-locked 2026-05-18) and writes **no audit table** (#T5).
-**Trigger:** at 08:05 IST every trading day, fetch yesterday's 1d candle via `/v2/charts/historical` and compare against our derived `candles_1d` row. Zero-tolerance OHLCV match. Mismatch fires this code.
-**Triage:** the Telegram alert + the `error!` log (`data/logs/errors.jsonl.*`) carry the mismatched fields. If our 1d derivation used incorrect day-boundary alignment, fix the boundary logic and re-derive. Yesterday's close becomes part of strategy decisions — operator must decide whether to trade today based on suspect data.
-
-### CROSS-VERIFY-04 — 08:05 IST historical REST unreachable
-
-**Severity:** High.
-**Auto-triage:** Yes (retry next trading day).
-**Trigger:** the 08:05 IST morning check could not reach `/v2/charts/historical`. The day's verification is skipped; alert fires. Trading is NOT blocked (operator-locked).
-**Triage:** same as CROSS-VERIFY-02 — confirm Dhan REST endpoint health.
+Deleted artefacts: `cross_verify.rs`, `cross_verify_report.rs`,
+`cross_verify_scheduler.rs`, `post_open_cross_check.rs`,
+`post_market_fetch_window.rs`, `crates/core/src/cross_verify/`,
+7 guard tests, 4 `ErrorCode` variants, 3 `NotificationEvent` variants,
+5 `CROSS_VERIFY_*` constants.
 
 ---
 

@@ -1139,64 +1139,8 @@ rules:
       operate. Operator verifies SSM /tickvault/prod/dhan_totp_secret
       matches Dhan web UI. Re-registers TOTP if rotated.
 
-  - name: cross-verify-01-1531-mismatch-escalate
-    match:
-      code: CROSS-VERIFY-01
-    action: escalate
-    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      CROSS-VERIFY-01 = 15:31 IST same-day OHLCV mismatch vs Dhan REST
-      /v2/charts/intraday. Severity::Critical. Operator-locked
-      2026-05-18 — does NOT block trading (Telegram alert only;
-      cross-verify is table-free per #T5). Operator reads the
-      mismatched fields from the Telegram alert + errors.jsonl;
-      verifies whether the aggregator missed ticks during a known
-      disconnect. Auto-backfill via REST is the recovery mechanism
-      for the candles_<tf> tables.
-
-  - name: cross-verify-02-1531-hist-unreachable-escalate
-    match:
-      code: CROSS-VERIFY-02
-    action: escalate
-    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
-    confidence: 0.9
-    cooldown_secs: 60
-    justification: >-
-      CROSS-VERIFY-02 = 15:31 IST historical REST unreachable; cross-
-      verify skipped. Severity::High. Transient. Operator confirms
-      Dhan REST endpoint health; the next morning's 08:05 IST 1d
-      check covers yesterday's full-day candle as backup.
-
-  - name: cross-verify-03-morning-1d-mismatch-escalate
-    match:
-      code: CROSS-VERIFY-03
-    action: escalate
-    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      CROSS-VERIFY-03 = 08:05 IST morning 1d mismatch vs Dhan REST
-      /v2/charts/historical. Severity::Critical. Operator-locked
-      2026-05-18 — does NOT block trading (Telegram alert only;
-      cross-verify is table-free per #T5). Operator reads yesterday's
-      mismatched derivation from the Telegram alert + errors.jsonl;
-      if our day-boundary alignment is wrong, fix the boundary logic
-      and re-derive. Operator decides whether to trade today on
-      suspect data.
-
-  - name: cross-verify-04-morning-1d-hist-unreachable-escalate
-    match:
-      code: CROSS-VERIFY-04
-    action: escalate
-    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
-    confidence: 0.9
-    cooldown_secs: 60
-    justification: >-
-      CROSS-VERIFY-04 = 08:05 IST historical REST unreachable; morning
-      check skipped. Severity::High. Transient — same diagnosis path
-      as CROSS-VERIFY-02. Trading NOT blocked (operator-locked).
+  # PR-C (2026-05-26): CROSS-VERIFY-01..04 rules retired alongside
+  # the deleted cross_verify chain (no emit sites left).
 
   # -----------------------------------------------------------------------
   # Pre-existing variants missing triage rules (surfaced by PR #1 meta-guard)

@@ -1294,7 +1294,7 @@ pub const TICK_GAP_RESET_BUSYLOOP_GUARD_SECS: u64 = 3600;
 
 /// Number of 1-minute candles in the cross-verification window (09:15 to 15:29 = 375).
 ///
-/// Used by `cross_verify.rs` to validate historical vs live candle coverage.
+/// Historical candle coverage check (cross_verify module retired PR-C 2026-05-26).
 /// This covers only the continuous trading session (09:15–15:29) because Dhan's
 /// historical intraday API returns data starting from 09:15.
 ///
@@ -1704,46 +1704,11 @@ pub const OPTION_CHAIN_MIN_STRIKES: usize = 30;
 /// back to the 50s base.
 pub const OPTION_CHAIN_COOLDOWN_LADDER_SECS: [u64; 3] = [60, 90, 120];
 
-// ---------------------------------------------------------------------------
-// Cross-verify (AWS-lifecycle PR #9) — Z+ L3 RECONCILE.
-//
-// Per `docs/architecture/aws-indices-only-locked-architecture.md` §14 +
-// `.claude/plans/aws-lifecycle/THE-FINAL-PLAN.md` §5 (PR #9). Two daily
-// gates compare our derived live candles against Dhan REST as ground
-// truth — without this, missed ticks are invisible.
-// ---------------------------------------------------------------------------
-
-/// PR #9 — the three intraday timeframes cross-verified at 15:31 IST.
-///
-/// Operator-locked 2026-05-18: 1h was dropped from the original 4-TF
-/// set. The 15:31 IST gate runs 4 SIDs × 3 TFs = 12 verification pairs
-/// (`CROSS_VERIFY_INTRADAY_PAIR_COUNT`). Each string is BOTH the live
-/// QuestDB table suffix (`candles_1m`, `candles_5m`, `candles_15m`) and
-/// the Dhan intraday interval label after the `m` is stripped
-/// (`"1"`, `"5"`, `"15"` per `dhan/historical-data.md` rule 5).
-pub const CROSS_VERIFY_TIMEFRAMES: [&str; 3] = ["1m", "5m", "15m"];
-
-/// PR #9 — number of (SID, timeframe) pairs the 15:31 IST intraday
-/// gate verifies: 4 locked IDX_I SIDs × 3 timeframes.
-pub const CROSS_VERIFY_INTRADAY_PAIR_COUNT: usize = 12;
-
-/// PR #9 — IST wall-clock (hour, minute) the intraday cross-verify
-/// fires. 15:30 IST is the NSE close; the 1-minute buffer lets the
-/// final 15:29:00–15:29:59 candle settle in our aggregator before the
-/// comparison runs.
-pub const CROSS_VERIFY_INTRADAY_RUN_HHMM_IST: (u32, u32) = (15, 31);
-
-/// PR #9 — IST wall-clock (hour, minute) the morning 1d cross-check
-/// fires. Runs after the 08:00 IST instance boot completes; verifies
-/// yesterday's derived 1d candle against Dhan REST `/v2/charts/historical`.
-pub const CROSS_VERIFY_MORNING_RUN_HHMM_IST: (u32, u32) = (8, 5);
-
-/// PR #9 — OHLCV match tolerance. ZERO — every field must match Dhan
-/// REST exactly, per `historical-candles-cross-verify.md` ("NO
-/// tolerance. NO epsilon. NO ±10%."). A non-zero value here would let
-/// a missed tick slip through undetected, defeating the entire L3
-/// RECONCILE layer.
-pub const CROSS_VERIFY_OHLCV_TOLERANCE: f64 = 0.0;
+// PR-C (2026-05-26): CROSS_VERIFY_* constants RETIRED. The 4 cross-verify
+// constants + their 4 source-pinning tests were deleted along with the
+// entire Dhan historical fetch chain (candle_fetcher + cross_verify +
+// post_open_cross_check + cross_verify_scheduler + post_market_fetch_window
+// modules). Spot-only NIFTY 50 strategy locked; no L3 RECONCILE pass.
 
 /// Default depth batch flush size for QuestDB ILP writes.
 /// Each depth snapshot writes 5 rows (one per level), so effective row count = batch × 5.
@@ -3456,54 +3421,5 @@ mod tests {
                 "cooldown ladder must be strictly increasing"
             );
         }
-    }
-
-    #[test]
-    fn test_cross_verify_timeframes_pinned() {
-        assert_eq!(
-            CROSS_VERIFY_TIMEFRAMES,
-            ["1m", "5m", "15m"],
-            "intraday cross-verify TF set — 1h dropped per operator lock 2026-05-18"
-        );
-    }
-
-    #[test]
-    fn test_cross_verify_intraday_pair_count_matches_universe() {
-        // 4 locked IDX_I SIDs × 3 timeframes = 12 verification pairs.
-        assert_eq!(
-            CROSS_VERIFY_INTRADAY_PAIR_COUNT,
-            4 * CROSS_VERIFY_TIMEFRAMES.len(),
-            "pair count must equal 4 SIDs × the timeframe set size"
-        );
-    }
-
-    #[test]
-    fn test_cross_verify_run_times_pinned() {
-        assert_eq!(
-            CROSS_VERIFY_INTRADAY_RUN_HHMM_IST,
-            (15, 31),
-            "intraday gate fires 1 min after the 15:30 IST NSE close"
-        );
-        assert_eq!(
-            CROSS_VERIFY_MORNING_RUN_HHMM_IST,
-            (8, 5),
-            "morning 1d gate fires after the 08:00 IST instance boot"
-        );
-        // Intraday gate must be after the 15:30 close.
-        let (h, m) = CROSS_VERIFY_INTRADAY_RUN_HHMM_IST;
-        assert!(
-            h > 15 || (h == 15 && m > 30),
-            "intraday cross-verify must run strictly after the 15:30 close"
-        );
-    }
-
-    #[test]
-    fn test_cross_verify_tolerance_is_exactly_zero() {
-        // Zero tolerance is the whole point of L3 RECONCILE — a non-zero
-        // epsilon would let a missed tick slip through undetected.
-        assert_eq!(
-            CROSS_VERIFY_OHLCV_TOLERANCE, 0.0,
-            "cross-verify must be zero-tolerance per historical-candles-cross-verify.md"
-        );
     }
 }

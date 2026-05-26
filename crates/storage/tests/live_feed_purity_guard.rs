@@ -147,28 +147,8 @@ fn live_feed_purity_backfill_mod_declaration_stays_removed() {
     );
 }
 
-// ============================================================================
-// Purity guard — the cross_verify module MAY only READ, never WRITE
-// ============================================================================
-
-#[test]
-fn live_feed_purity_cross_verify_does_not_write_ticks() {
-    let cross_verify = workspace_root().join("crates/core/src/historical/cross_verify.rs");
-    if !cross_verify.is_file() {
-        // Module optional — absence is fine.
-        return;
-    }
-    let content = std::fs::read_to_string(&cross_verify).expect("readable");
-    for banned in &["append_tick(", "TickPersistenceWriter::new"] {
-        assert!(
-            !content.contains(banned),
-            "LIVE-FEED-PURITY violation — cross_verify.rs contains `{}`. \
-             cross_verify READS both historical and live candles and compares \
-             them; it must NEVER write to `ticks`.",
-            banned
-        );
-    }
-}
+// PR-C (2026-05-26): cross_verify module DELETED entirely — purity guard
+// against `cross_verify.rs writing to ticks` is no longer needed.
 
 // ============================================================================
 // Self-tests for the helpers
