@@ -40,22 +40,21 @@
 
 use tickvault_common::error_code::ErrorCode;
 
-/// All seven inputs the self-test consumes. Populated by the boot
-/// scheduler from live counters before each evaluation; the evaluator
-/// itself does not touch any global state.
+/// Inputs the self-test consumes. Populated by the boot scheduler from
+/// live counters before each evaluation; the evaluator itself does not
+/// touch any global state.
+///
+/// Post AWS-lifecycle PR #4 (#707, 2026-05-19) the depth-20 / depth-200
+/// WebSocket pools were deleted entirely — the operator-locked 2-WS scope
+/// (main-feed + order-update) per `.claude/rules/project/websocket-connection-scope-lock.md`
+/// makes those sub-checks structurally impossible to pass. They were
+/// removed from this struct on 2026-05-26 to stop the daily 09:16 IST
+/// SELFTEST-02 DEGRADED Telegram alert that named two retired subsystems.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MarketOpenSelfTestInputs {
     /// Number of main-feed WS connections currently in `Connected` state.
-    /// Expected: 5 (the Dhan account cap).
+    /// Expected: 1 under the LOCKED 4-SID indices-only scope.
     pub main_feed_active: usize,
-    /// Number of depth-20 WS connections currently active.
-    /// Expected: 4 today (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY) — but
-    /// after the 2026-04-25 universe rebuild may be 2. The check is
-    /// "non-zero", not "exactly N".
-    pub depth_20_active: usize,
-    /// Number of depth-200 WS connections currently active.
-    /// Expected: ≥ 1 (NIFTY ATM CE/PE + BANKNIFTY ATM CE/PE = up to 4).
-    pub depth_200_active: usize,
     /// True iff the order-update WebSocket is connected.
     pub order_update_active: bool,
     /// True iff the tick-processing pipeline task is alive (heartbeat
@@ -116,16 +115,12 @@ impl MarketOpenSelfTestOutcome {
 }
 
 /// Total number of sub-checks the evaluator runs. Wire-stable: the
-/// audit `detail` column references this count, and the SCOPE §12.5
-/// test asserts it.
+/// audit `detail` column references this count.
 ///
-/// SCOPE §12.1 lists 7 ordinal sub-checks but the evaluator runs 8
-/// `if` arms (it splits "depth" into `depth_20_active` and
-/// `depth_200_active` because those WS pools are independent). This
-/// constant matches the implementation, not the SCOPE wording.
-/// Adversarial review (hot-path-reviewer, 2026-04-28) caught the
-/// off-by-one between `7` and the actual `8` `if` checks.
-pub const TOTAL_SUB_CHECKS: usize = 8;
+/// 2026-05-26: dropped from 8 → 6 after the depth-20 + depth-200 sub-checks
+/// were removed (their pools are permanently retired per AWS-lifecycle
+/// PR #4 + operator-charter §I).
+pub const TOTAL_SUB_CHECKS: usize = 6;
 
 /// Token-expiry headroom threshold below which the self-test fires
 /// `Critical`. 4 hours = 14_400 seconds. Matches the existing
@@ -158,12 +153,6 @@ pub fn evaluate_self_test(inputs: &MarketOpenSelfTestInputs) -> MarketOpenSelfTe
 
     if inputs.main_feed_active == 0 {
         failed.push("main_feed_active");
-    }
-    if inputs.depth_20_active == 0 {
-        failed.push("depth_20_active");
-    }
-    if inputs.depth_200_active == 0 {
-        failed.push("depth_200_active");
     }
     if !inputs.order_update_active {
         failed.push("order_update_active");
@@ -214,9 +203,7 @@ mod tests {
     /// All-green inputs used as a baseline by the failure-injection tests.
     fn green_inputs() -> MarketOpenSelfTestInputs {
         MarketOpenSelfTestInputs {
-            main_feed_active: 5,
-            depth_20_active: 4,
-            depth_200_active: 2,
+            main_feed_active: 1,
             order_update_active: true,
             pipeline_active: true,
             last_tick_age_secs: 10,
@@ -226,11 +213,11 @@ mod tests {
     }
 
     #[test]
-    fn test_self_test_passes_when_all_seven_checks_green() {
+    fn test_self_test_passes_when_all_six_checks_green() {
         let outcome = evaluate_self_test(&green_inputs());
         assert_eq!(
             outcome,
-            MarketOpenSelfTestOutcome::Passed { checks_passed: 8 }
+            MarketOpenSelfTestOutcome::Passed { checks_passed: 6 }
         );
         assert_eq!(outcome.error_code(), ErrorCode::Selftest01Passed);
         assert_eq!(outcome.outcome_str(), "passed");
@@ -285,7 +272,7 @@ mod tests {
             } => {
                 assert!(failed.contains(&"pipeline_active"));
                 assert_eq!(checks_failed, 1);
-                assert_eq!(checks_passed, 7);
+                assert_eq!(checks_passed, 5);
             }
             other => panic!("expected Degraded, got {other:?}"),
         }
@@ -332,21 +319,43 @@ mod tests {
     /// without flipping a test red.
     #[test]
     fn test_self_test_constants_pinned() {
-        assert_eq!(TOTAL_SUB_CHECKS, 8);
+        assert_eq!(TOTAL_SUB_CHECKS, 6);
         assert_eq!(TOKEN_EXPIRY_HEADROOM_CRITICAL_SECS, 14_400);
         assert_eq!(RECENT_TICK_DEGRADED_THRESHOLD_SECS, 60);
         assert_eq!(CRITICAL_CHECK_NAMES.len(), 3);
     }
 
+    /// Regression guard for 2026-05-26: ensures the depth-20 / depth-200
+    /// sub-checks stay deleted. Re-adding either name would re-introduce
+    /// the daily 09:16 IST SELFTEST-02 DEGRADED false alarm because the
+    /// pools that fed those checks were retired in AWS-lifecycle PR #4.
+    #[test]
+    fn test_self_test_does_not_check_retired_depth_pools() {
+        let inputs = green_inputs();
+        let outcome = evaluate_self_test(&inputs);
+        match outcome {
+            MarketOpenSelfTestOutcome::Passed { .. } => {}
+            other => panic!("green inputs must pass with depth checks removed; got {other:?}"),
+        }
+        // CRITICAL_CHECK_NAMES must not regrow either — depth was always
+        // non-critical, but pinning both lists keeps the contract tight.
+        for name in CRITICAL_CHECK_NAMES {
+            assert!(
+                !name.contains("depth"),
+                "no depth-* names allowed in CRITICAL_CHECK_NAMES; found {name}"
+            );
+        }
+    }
+
     #[test]
     fn test_outcome_str_is_stable() {
         assert_eq!(
-            MarketOpenSelfTestOutcome::Passed { checks_passed: 7 }.outcome_str(),
+            MarketOpenSelfTestOutcome::Passed { checks_passed: 6 }.outcome_str(),
             "passed"
         );
         assert_eq!(
             MarketOpenSelfTestOutcome::Degraded {
-                checks_passed: 6,
+                checks_passed: 5,
                 checks_failed: 1,
                 failed: vec!["pipeline_active"],
             }

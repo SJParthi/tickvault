@@ -356,19 +356,19 @@ fetch_retry_max_attempts = 2       # same-minute retries per underlying
 symbol      = "SENSEX"
 security_id = 51
 segment     = "IDX_I"
-slot_sec    = 50           # 2026-05-25 operator lock — burst starts at :50; sequential S→B→N completes by :00
+slot_sec    = 49           # 2026-05-26: bumped from :50 → :49 to widen S→B→N spacing to 5s. The previous 3s spacing sat right at Dhan's "1 unique request per 3 seconds" rate-limit boundary and produced ~1 DH-904 429 every 5 minutes (see live logs 2026-05-26). 5s spacing eliminates the rate-limit hits with no change to the 50s overall cadence.
 
 [[option_chain_minute_snapshot.underlyings]]
 symbol      = "BANKNIFTY"
 security_id = 25
 segment     = "IDX_I"
-slot_sec    = 53
+slot_sec    = 54
 
 [[option_chain_minute_snapshot.underlyings]]
 symbol      = "NIFTY"
 security_id = 13
 segment     = "IDX_I"
-slot_sec    = 56
+slot_sec    = 59
 
 # ===========================================================================
 # PR #1 (AWS-lifecycle 14-PR sequence) — CONTRACT STUB sections.

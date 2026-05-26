@@ -3719,8 +3719,6 @@ async fn main() -> Result<()> {
                     // from the global `TickGapDetector::scan_gaps_top_n`
                     // (returns the worst-stale instrument's gap).
                     let main_active = st_health.websocket_connections() as usize;
-                    let d20 = st_health.depth_20_connections() as usize;
-                    let d200 = st_health.depth_200_connections() as usize;
                     let oms = st_health.order_update_connected();
                     let pipeline = st_health.pipeline_active();
                     let questdb_ok =
@@ -3740,8 +3738,6 @@ async fn main() -> Result<()> {
                             .unwrap_or(0);
                     let inputs = MarketOpenSelfTestInputs {
                         main_feed_active: main_active,
-                        depth_20_active: d20,
-                        depth_200_active: d200,
                         order_update_active: oms,
                         pipeline_active: pipeline,
                         last_tick_age_secs: worst_gap_secs,
@@ -3757,8 +3753,6 @@ async fn main() -> Result<()> {
                         result = outcome.outcome_str(),
                         code = outcome.error_code().code_str(),
                         main_feed = main_active,
-                        depth_20 = d20,
-                        depth_200 = d200,
                         order_update = oms,
                         questdb_connected = questdb_ok,
                         token_expiry_headroom_secs = token_headroom_secs,
@@ -4019,14 +4013,32 @@ async fn main() -> Result<()> {
                         let qdb_health = if qdb_ok { 1.0 } else { 0.0 };
 
                         // ---- Tick_freshness ------------------------------
+                        // 2026-05-26: INDIA VIX (SID 21) is a derived
+                        // volatility index that legitimately ticks every
+                        // 30-60s during quiet sessions — its silence is
+                        // not a degradation, so excluding it stops the
+                        // SLO-02 flap the operator saw on 2026-05-26.
+                        // We scan the top-N gaps and take the worst that
+                        // is NOT a SLO-excluded SID. N=10 is comfortably
+                        // above 4 (the entire universe) so we always see
+                        // the full picture when called.
+                        const SLO_TICK_FRESHNESS_EXCLUDED_SIDS: &[u32] = &[21]; // INDIA VIX
+                        const SLO_TICK_FRESHNESS_SCAN_TOP_N: usize = 10;
                         let tick_freshness = if !in_market {
                             1.0
                         } else {
                             let worst_gap = tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
                                 .map(|d| {
-                                    let (top, _total) =
-                                        d.scan_gaps_top_n(Instant::now(), 1);
-                                    top.first().map(|(_, _, gap)| *gap).unwrap_or(0)
+                                    let (top, _total) = d.scan_gaps_top_n(
+                                        Instant::now(),
+                                        SLO_TICK_FRESHNESS_SCAN_TOP_N,
+                                    );
+                                    top.iter()
+                                        .find(|(sid, _, _)| {
+                                            !SLO_TICK_FRESHNESS_EXCLUDED_SIDS.contains(sid)
+                                        })
+                                        .map(|(_, _, gap)| *gap)
+                                        .unwrap_or(0)
                                 })
                                 .unwrap_or(0);
                             if worst_gap < SLO_TICK_FRESHNESS_DEGRADED_SECS {
