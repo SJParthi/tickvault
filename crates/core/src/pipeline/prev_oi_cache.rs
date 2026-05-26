@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use papaya::HashMap;
 use reqwest::Client;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 
@@ -250,7 +250,15 @@ impl PrevOiCache {
         self.replace_with(entries);
 
         if count == 0 {
-            info!("prev_oi_cache loaded 0 entries (likely fresh deploy or candles_1d is empty)");
+            // 2026-05-26: demoted INFO → DEBUG. The boot-time caller in
+            // main.rs already emits a once-per-process WARN when the
+            // empty result lands inside market hours, and the periodic
+            // refresh task increments
+            // `tv_prev_oi_cache_refresh_total{outcome="still_empty"}`
+            // every 5 minutes — together those give the operator full
+            // visibility without spamming the log every 5 min for the
+            // entire trading session.
+            debug!("prev_oi_cache loaded 0 entries (fresh deploy or candles_1d empty)");
         } else {
             info!(entries = count, "prev_oi_cache loaded from candles_1d");
         }
