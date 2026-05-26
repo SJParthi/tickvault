@@ -1494,10 +1494,8 @@ pub const QUESTDB_TABLE_MARKET_DEPTH: &str = "market_depth";
 /// QuestDB table: previous close reference data from code 6 packets.
 pub const QUESTDB_TABLE_PREVIOUS_CLOSE: &str = "previous_close";
 
-/// QuestDB table: multi-timeframe OHLCV candles from Dhan historical API.
-/// Stores 1m, 5m, 15m, 60m intraday candles and daily candles in a single table.
-/// Discriminated by `timeframe` SYMBOL column. DEDUP on `(ts, security_id, timeframe)`.
-pub const QUESTDB_TABLE_HISTORICAL_CANDLES: &str = "historical_candles";
+// PR-E (2026-05-26): QUESTDB_TABLE_HISTORICAL_CANDLES retired alongside
+// the deleted Dhan historical fetch chain. The table no longer exists.
 
 /// QuestDB table: 1-second OHLCV candles aggregated from live ticks.
 pub const QUESTDB_TABLE_CANDLES_1S: &str = "candles_1s";

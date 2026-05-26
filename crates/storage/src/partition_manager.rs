@@ -51,7 +51,10 @@ const HOUR_PARTITIONED_TABLES: &[&str] = &[
 ];
 
 /// Tables with DAY partitioning (lower-frequency data).
-const DAY_PARTITIONED_TABLES: &[&str] = &["historical_candles", "candles_1s"];
+///
+/// PR-E (2026-05-26): `historical_candles` removed alongside the deleted
+/// Dhan historical fetch chain.
+const DAY_PARTITIONED_TABLES: &[&str] = &["candles_1s"];
 
 // ---------------------------------------------------------------------------
 // Partition Manager

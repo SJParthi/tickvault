@@ -119,7 +119,6 @@ WHERE security_id = <X>
 ## Related files
 
 - `.claude/rules/dhan/historical-data.md` — Dhan API spec
-- `crates/storage/src/candle_persistence.rs` — `historical_candles` writer
 - `.claude/rules/project/historical-candles-cross-verify.md` — invariants
 
 (PR-C 2026-05-26: `cross_verify.rs` deleted. PR-D 2026-05-26:
