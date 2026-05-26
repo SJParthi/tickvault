@@ -6,8 +6,14 @@
 //!     `data[0]` populates `CurrentExpiryCache`.
 //!   * Minute scheduler reads cached expiry (skips per-slot expiry-list
 //!     Dhan call).
-//!   * Sequence: SENSEX → BANKNIFTY → NIFTY at slots :50 / :53 / :56.
+//!   * Sequence: SENSEX → BANKNIFTY → NIFTY.
 //!   * Crash recovery via REHYDRATE from QuestDB.
+//!
+//! 2026-05-26 amendment: slot spacing widened from 3s (:50/:53/:56) to
+//! 5s (:49/:54/:59) after live logs showed ~1 DH-904 429 every 5 minutes
+//! at the 3s spacing — Dhan's "1 unique request per 3 seconds" boundary
+//! is too tight under network jitter. The S→B→N sequence is preserved;
+//! only the per-call gap changed.
 //!
 //! These ratchets fail the build if any of those contracts regresses.
 
@@ -45,9 +51,11 @@ fn test_option_chain_fetch_sequence_is_sensex_banknifty_nifty() {
 }
 
 #[test]
-fn test_config_slot_secs_are_50_53_56() {
-    // Operator lock: SENSEX :50, BANKNIFTY :53, NIFTY :56. Sequential
-    // fire fits inside the :50..:60 window for the next-minute boundary.
+fn test_config_slot_secs_are_49_54_59() {
+    // 2026-05-26: SENSEX :49, BANKNIFTY :54, NIFTY :59. 5-second spacing
+    // eliminates Dhan rate-limit 429s observed at the previous 3s
+    // spacing (:50/:53/:56). Sequence S→B→N is preserved; all three
+    // fire within the same wall-clock minute.
     let body = read("config/base.toml");
     // Find the option_chain section and pull the slot_sec assignments.
     let section_start = body
@@ -85,19 +93,19 @@ fn test_config_slot_secs_are_50_53_56() {
     }
 
     assert_eq!(
-        extract_slot_sec(&section[sensex_idx..sensex_idx + 250]),
-        50,
-        "SENSEX MUST fire at :50 per operator lock"
+        extract_slot_sec(&section[sensex_idx..sensex_idx + 600]),
+        49,
+        "SENSEX MUST fire at :49 — 5s spacing avoids Dhan DH-904 429s"
     );
     assert_eq!(
-        extract_slot_sec(&section[banknifty_idx..banknifty_idx + 250]),
-        53,
-        "BANKNIFTY MUST fire at :53 per operator lock"
+        extract_slot_sec(&section[banknifty_idx..banknifty_idx + 600]),
+        54,
+        "BANKNIFTY MUST fire at :54 — 5s after SENSEX"
     );
     assert_eq!(
-        extract_slot_sec(&section[nifty_idx..nifty_idx + 250]),
-        56,
-        "NIFTY MUST fire at :56 per operator lock"
+        extract_slot_sec(&section[nifty_idx..nifty_idx + 600]),
+        59,
+        "NIFTY MUST fire at :59 — 5s after BANKNIFTY, within same minute"
     );
 }
 
