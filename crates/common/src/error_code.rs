@@ -495,13 +495,6 @@ pub enum ErrorCode {
     // - crates/trading/src/in_mem/day_ohlc_tracker.rs
     // - .claude/rules/project/index-day-ohlc-tracker-error-codes.md
     // -----------------------------------------------------------------------
-    /// INDEX-OHLC-01: at 09:15:00 IST boundary, the pre-market buffer
-    /// (`PREOPEN_INDEX_UNDERLYINGS`) has no captured close for an SID.
-    /// Aggregator falls back to using the first post-open tick's last_price
-    /// (NOT the official NSE equilibrium) — degraded but not data-loss.
-    /// Operator paged via Telegram. Severity::Critical because the day's
-    /// open price will fail 15:31 IST cross-verify against Dhan REST.
-    IndexOhlc01PreopenEmptyAt0915,
     /// INDEX-OHLC-02: daily reset at IST midnight failed for one or more
     /// SIDs (e.g., parking_lot mutex panic, tracker handle dropped).
     /// Day high/low/close carry over to next trading day — incorrect.
@@ -644,8 +637,7 @@ impl ErrorCode {
             Self::CrossVerify021531HistUnreachable => "CROSS-VERIFY-02",
             Self::CrossVerify03Morning1dMismatch => "CROSS-VERIFY-03",
             Self::CrossVerify04Morning1dHistUnreachable => "CROSS-VERIFY-04",
-            // PR #2.5 — Day OHLC tracker for IDX_I
-            Self::IndexOhlc01PreopenEmptyAt0915 => "INDEX-OHLC-01",
+            // Day OHLC tracker for IDX_I
             Self::IndexOhlc02DailyResetFailed => "INDEX-OHLC-02",
         }
     }
@@ -682,9 +674,7 @@ impl ErrorCode {
             | Self::OptionChain05CacheStaleHaltStrategy
             | Self::OptionChain08TokenExpiredMidCycle
             | Self::CrossVerify011531Mismatch
-            | Self::CrossVerify03Morning1dMismatch
-            // PR #2.5 — INDEX-OHLC-01 is Critical (open price wrong = cross-verify fails)
-            | Self::IndexOhlc01PreopenEmptyAt0915 => Severity::Critical,
+            | Self::CrossVerify03Morning1dMismatch => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
             Self::Selftest01Passed
             | Self::Slo01Healthy
@@ -895,8 +885,8 @@ impl ErrorCode {
             | Self::CrossVerify04Morning1dHistUnreachable => {
                 ".claude/rules/project/option-chain-cross-verify-error-codes.md"
             }
-            // PR #2.5 — Day OHLC tracker for IDX_I
-            Self::IndexOhlc01PreopenEmptyAt0915 | Self::IndexOhlc02DailyResetFailed => {
+            // Day OHLC tracker for IDX_I
+            Self::IndexOhlc02DailyResetFailed => {
                 ".claude/rules/project/index-day-ohlc-tracker-error-codes.md"
             }
         }
@@ -1032,8 +1022,7 @@ impl ErrorCode {
             Self::CrossVerify021531HistUnreachable,
             Self::CrossVerify03Morning1dMismatch,
             Self::CrossVerify04Morning1dHistUnreachable,
-            // PR #2.5 — Day OHLC tracker for IDX_I (Ticker mode + pre-market open)
-            Self::IndexOhlc01PreopenEmptyAt0915,
+            // Day OHLC tracker for IDX_I (Ticker mode)
             Self::IndexOhlc02DailyResetFailed,
         ]
     }
@@ -1267,7 +1256,11 @@ mod tests {
         // CORE-PIN-01 (CorePin01PinningFailedAtBoot) + CORE-PIN-02
         // (CorePin02WorkerDrifted) — core_pinning.rs module deleted under
         // LOCKED 4-SID / t4g.medium 2-vCPU scope (no 4-core pinning to do).
-        assert_eq!(ErrorCode::all().len(), 102);
+        // 2026-05-26 (PR-A — pre-open buffer + Dhan historical removal):
+        // bumped 102 -> 101 by removing INDEX-OHLC-01 (preopen buffer
+        // empty at 09:15:00 IST) — pre-open buffer module deleted; day_open
+        // is now the first observed live WebSocket tick after midnight reset.
+        assert_eq!(ErrorCode::all().len(), 101);
     }
 
     #[test]

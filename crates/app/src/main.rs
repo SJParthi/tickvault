@@ -3272,115 +3272,25 @@ async fn main() -> Result<()> {
                 std::sync::Arc::new(u.clone()) // O(1) EXEMPT: boot-time universe clone
             });
 
-        if let Some(universe_arc) = rebalancer_universe {
-            // Pre-clone universe handle for the snapshotter.
-            let snapshotter_universe = std::sync::Arc::clone(&universe_arc);
-            // Suppress unused-var warning — universe_arc is consumed by the clone above.
-            let _ = universe_arc;
-
-            // PROMPT B precursor (2026-04-20): pre-open price snapshotter.
-            // Subscribes to the tick broadcast and buckets every NSE_EQ
-            // tick that belongs to an F&O stock into the matching minute
-            // slot (09:08..09:12 IST today; widening to 09:00..09:12 in
-            // Fix #1 — see .claude/plans/active-plan.md). The Phase 2
-            // scheduler reads this buffer at **09:13:00 IST** (commit
-            // 0340a7c moved it from 09:12:30 so the 09:12-minute bucket
-            // is fully closed before we read). Outside the window the
-            // snapshotter is idle (no work, no metrics) — see
-            // audit-findings Rule 3.
-            let preopen_buffer =
-                tickvault_core::instrument::preopen_price_buffer::new_shared_preopen_buffer();
-            {
-                let snap_buffer = std::sync::Arc::clone(&preopen_buffer);
-                let snap_universe = snapshotter_universe;
-                let mut snap_rx = tick_broadcast_sender.subscribe();
-                tokio::spawn(async move {
-                    // Plan item A (2026-04-22): combined lookup merges F&O
-                    // stocks (NSE_EQ) + whitelisted indices (NIFTY + BANKNIFTY
-                    // on IDX_I). Indices feed the depth-20 + depth-200 ATM
-                    // selection at **09:13:00 IST** per the unified dispatch
-                    // plan (was 09:12:30 — Fix #8 comment cleanup 2026-04-24).
-                    let lookup =
-                        tickvault_core::instrument::preopen_price_buffer::build_preopen_combined_lookup(
-                            &snap_universe,
-                        );
-                    info!(
-                        combined_lookup_count = lookup.len(),
-                        "Phase 2 pre-open snapshotter started — F&O stocks + indices tracked"
-                    );
-                    loop {
-                        match snap_rx.recv().await {
-                            Ok(tick) => {
-                                // Window-gate first: outside 09:08..09:12 IST we do
-                                // nothing — no classification, no metrics.
-                                if !tickvault_core::instrument::preopen_price_buffer::is_within_preopen_window() {
-                                    continue;
-                                }
-                                use tickvault_core::instrument::preopen_price_buffer::{
-                                    SnapshotterOutcome, classify_tick,
-                                };
-                                match classify_tick(&tick, &lookup) {
-                                    SnapshotterOutcome::Buffered {
-                                        symbol,
-                                        minute_index,
-                                    } => {
-                                        let mut guard = snap_buffer.write().await;
-                                        guard.entry(symbol).or_default().record(
-                                            minute_index,
-                                            f64::from(tick.last_traded_price),
-                                        );
-                                        drop(guard);
-                                        metrics::counter!(
-                                            "tv_phase2_snapshotter_ticks_buffered_total"
-                                        )
-                                        .increment(1);
-                                    }
-                                    SnapshotterOutcome::Filtered(reason) => {
-                                        metrics::counter!(
-                                            "tv_phase2_snapshotter_ticks_filtered_total",
-                                            "reason" => reason.as_label()
-                                        )
-                                        .increment(1);
-                                    }
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        }
-                    }
-                });
-            }
-
+        if let Some(_universe_arc) = rebalancer_universe {
             // -----------------------------------------------------------------
-            // PR #8a Slice 1 (2026-05-19): DayOhlcTracker boot wiring.
+            // DayOhlcTracker boot wiring (post 2026-05-26 simplification).
             //
-            // Closes the operator-locked pre-open equilibrium open-price
-            // gap per `.claude/rules/project/index-day-ohlc-tracker-error-codes.md`:
+            // Per operator directive 2026-05-26 the Dhan historical /
+            // pre-market buffer code was removed. `day_open` for the 4
+            // LOCKED IDX_I SIDs is now the FIRST OBSERVED LIVE TICK LTP
+            // after the IST midnight reset — no external arming required.
             //
-            //   "09:15:00 IST open price MUST = NSE equilibrium open —
-            //    NOT the first post-open tick LTP."
-            //
-            // Three tokio tasks spawned here:
-            //   1. arm task     — at 09:15:00 IST iterate the 4 LOCKED
-            //                     IDX_I SIDs, arm each from
-            //                     PreOpenCloses::backtrack_latest().
-            //                     Empty buffer → INDEX-OHLC-01 Critical.
-            //   2. tick consumer — drain tick broadcast, route IDX_I ticks
-            //                     to update_tick() for day_high/low/close.
-            //   3. midnight reset — IST 00:00:00 clears prev-day state.
+            // Two tokio tasks spawned here:
+            //   1. tick consumer  — drain tick broadcast, route IDX_I ticks
+            //                       to update_tick() which auto-arms on
+            //                       first call and advances day_high/low/
+            //                       close on subsequent calls.
+            //   2. midnight reset — IST 00:00:00 clears prev-day state so
+            //                       the next live tick re-arms.
             // -----------------------------------------------------------------
             let day_ohlc_tracker =
                 std::sync::Arc::new(tickvault_trading::in_mem::DayOhlcTracker::new());
-            {
-                let arm_tracker = std::sync::Arc::clone(&day_ohlc_tracker);
-                let arm_buffer = std::sync::Arc::clone(&preopen_buffer);
-                let arm_calendar = std::sync::Arc::clone(&trading_calendar);
-                let _arm_handle = tickvault_app::day_ohlc_orchestrator::spawn_market_open_arm_task(
-                    arm_tracker,
-                    arm_buffer,
-                    arm_calendar,
-                );
-            }
             {
                 let consumer_tracker = std::sync::Arc::clone(&day_ohlc_tracker);
                 let consumer_rx = tick_broadcast_sender.subscribe();
@@ -3396,24 +3306,8 @@ async fn main() -> Result<()> {
                     tickvault_app::day_ohlc_orchestrator::spawn_midnight_reset_task(reset_tracker);
             }
             info!(
-                "PR #8a Slice 1: DayOhlcTracker boot wired (arm at 09:15:00 IST + tick consumer + midnight reset)"
+                "DayOhlcTracker boot wired (tick consumer + midnight reset; day_open = first live tick LTP)"
             );
-
-            // PR #5 (2026-05-19): Phase 2 crash-recovery RETIRED.
-            //
-            // The crash-recovery block read the 09:13 IST stock-F&O ATM
-            // snapshot from disk and re-dispatched the same chain on a
-            // mid-market restart. Under the operator-locked 4-IDX_I
-            // LOCKED_UNIVERSE (websocket-connection-scope-lock.md
-            // 2026-05-15), stock-F&O is no longer subscribed — the entire
-            // Phase 2 dispatcher chain (`phase2_scheduler` + `phase2_delta`
-            // + `phase2_emit_guard` + `phase2_readiness_check` +
-            // `phase2_recovery` + `phase2_subscription_marker` +
-            // `phase2_audit_persistence`) is dead weight.
-            //
-            // The pre-open snapshotter ABOVE still runs because it feeds
-            // `preopen_price_buffer`, which `DayOhlcTracker` consumes at
-            // 09:15:00 IST to seed the day's OHLC for the 4 IDX_I SIDs.
 
             // Audit Finding #5 (2026-05-03): Pre-market positive readiness
             // ping at 09:14:00 IST — exactly 60s before the NSE opening bell.
