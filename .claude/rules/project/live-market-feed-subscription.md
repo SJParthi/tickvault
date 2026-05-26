@@ -4,6 +4,20 @@
 > **Scope:** Any file touching main WebSocket connection pool, subscription planning, or instrument distribution.
 > **Ground truth:** `docs/dhan-ref/03-live-market-feed-websocket.md`, `docs/dhan-ref/08-annexure-enums.md`
 
+## 2026-05-26 Update — pre-market buffer + Dhan historical REMOVED
+
+Per operator directive 2026-05-26, the `preopen_price_buffer` module
+(plus the `preopen_rest_fallback`, `build_preopen_combined_lookup`,
+`PREOPEN_INDEX_UNDERLYINGS`, etc.) was DELETED alongside the entire
+Dhan historical fetch chain. The 4 IDX_I SIDs (`LOCKED_UNIVERSE`)
+subscribe in Ticker mode and `day_open` derives from the FIRST live
+tick LTP after the IST midnight reset (`DayOhlcTracker::update_tick`
+auto-arms on its first call per trading day). Phase 2 trigger,
+pre-open snapshotter task, REST `/marketfeed/ltp` fallback,
+`build_preopen_combined_lookup`, etc. are all deleted. The rest of
+this file's "2026-04-22/04-24 Updates" and "Architecture (POST-AWS-LIFECYCLE)"
+sections are kept as historical context only.
+
 ## 2026-05-19 Update — AWS-lifecycle PR #7 LOCKED (`indices_4_only`)
 
 The default `[subscription] scope` in `config/base.toml` is
