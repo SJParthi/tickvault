@@ -16,7 +16,6 @@ pub mod activity_watchdog;
 pub mod connection;
 pub mod connection_pool;
 // PR #4 (2026-05-19): `depth_connection` module DELETED.
-pub mod disconnect_event;
 pub mod market_hours_gate;
 pub mod order_update_connection;
 pub mod pool_watchdog;
