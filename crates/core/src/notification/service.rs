@@ -1419,27 +1419,8 @@ mod tests {
             attempts: 0,
         });
         service.notify(NotificationEvent::ShutdownInitiated);
-        service.notify(NotificationEvent::HistoricalFetchFailed {
-            instruments_fetched: 200,
-            instruments_failed: 9,
-            total_candles: 180000,
-            persist_failures: 0,
-            failed_instruments: vec![],
-            failure_reasons: std::collections::HashMap::new(),
-        });
-        service.notify(NotificationEvent::CandleVerificationFailed {
-            instruments_checked: 209,
-            instruments_with_gaps: 3,
-            timeframe_details: String::new(),
-            ohlc_violations: 0,
-            data_violations: 0,
-            timestamp_violations: 0,
-            ohlc_details: vec![],
-            data_details: vec![],
-            timestamp_details: vec![],
-            weekend_violations: 0,
-            weekend_details: vec![],
-        });
+        // PR-D (2026-05-26): HistoricalFetchFailed + CandleVerificationFailed
+        // notify calls removed alongside the deleted variants.
 
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
@@ -1586,27 +1567,8 @@ mod tests {
             connection_index: 0,
             reason: "reset".to_string(),
         });
-        service.notify(NotificationEvent::HistoricalFetchFailed {
-            instruments_fetched: 0,
-            instruments_failed: 500,
-            total_candles: 0,
-            persist_failures: 0,
-            failed_instruments: vec![],
-            failure_reasons: std::collections::HashMap::new(),
-        });
-        service.notify(NotificationEvent::CandleVerificationFailed {
-            instruments_checked: 0,
-            instruments_with_gaps: 100,
-            timeframe_details: String::new(),
-            ohlc_violations: 0,
-            data_violations: 0,
-            timestamp_violations: 0,
-            ohlc_details: vec![],
-            data_details: vec![],
-            timestamp_details: vec![],
-            weekend_violations: 0,
-            weekend_details: vec![],
-        });
+        // PR-D (2026-05-26): HistoricalFetchFailed + CandleVerificationFailed
+        // notify calls removed alongside the deleted variants.
     }
 
     // -----------------------------------------------------------------------

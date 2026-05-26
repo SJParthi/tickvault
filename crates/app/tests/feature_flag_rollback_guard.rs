@@ -49,10 +49,12 @@ use tickvault_common::config::{ApplicationConfig, FeaturesConfig};
 /// to 16) without updating this list — pre-existing drift that
 /// blocked the build when the test harness compiled this file.
 // PR #2 (2026-05-18): `stock_movers_full_universe` + `option_movers_5s`
-// retired alongside the deleted movers pipeline; count is now 14.
+// retired alongside the deleted movers pipeline; count was 14.
 // PR #4 (2026-05-19): `depth_dynamic_top_volume` + `depth_dynamic_pipeline_v2`
-// retired alongside the depth-20 + depth-200 pipelines; count is now 12.
-const EXPECTED_FLAGS: [&str; 12] = [
+// retired alongside the depth-20 + depth-200 pipelines; count was 12.
+// PR-D (2026-05-26): `historical_fetch_enabled` retired alongside the
+// deleted Dhan historical fetch chain; count is now 11.
+const EXPECTED_FLAGS: [&str; 11] = [
     "hotpath_async_writers",
     "phase2_emit_guard",
     "previous_close_persist",
@@ -64,7 +66,6 @@ const EXPECTED_FLAGS: [&str; 12] = [
     "telegram_bucket_coalescer",
     "market_open_self_test",
     "realtime_guarantee_score",
-    "historical_fetch_enabled",
 ];
 
 // ---------------------------------------------------------------------------

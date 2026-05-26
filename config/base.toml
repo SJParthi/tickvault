@@ -313,7 +313,8 @@ realtime_guarantee_score = true
 # flags retired alongside the 20/200-level depth WebSocket pipelines per
 # the 4-IDX_I LOCKED_UNIVERSE operator lock
 # (.claude/rules/project/websocket-connection-scope-lock.md).
-historical_fetch_enabled = true       # 2026-05-25 PR #788: flipped on — required for cross-verify; runs at 09:00 IST boot
+# PR-D (2026-05-26): historical_fetch_enabled retired alongside the
+# deleted Dhan historical fetch chain.
 
 # PR #4 (2026-05-19): [depth_20.dynamic] and [depth_200.dynamic] sections
 # retired with the pipelines they configured.
