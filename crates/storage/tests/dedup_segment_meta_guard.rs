@@ -174,8 +174,8 @@ fn every_dedup_key_is_listed_here_for_auditing() {
 //
 // QuestDB requires the designated timestamp column to be part of every
 // `DEDUP UPSERT KEYS(...)` clause. On 2026-05-18 the production boot
-// returned HTTP 400 for `gap_fill_audit` (ERROR) and `last_tick_audit`
-// (WARN) because their DEDUP key constants omitted `ts` and the DDL
+// returned HTTP 400 for audit tables (e.g. `last_tick_audit` WARN)
+// because their DEDUP key constants omitted `ts` and the DDL
 // format string did not prepend it. The 4 latent siblings
 // (`order_update_ws_audit`, `sl_replacement_audit`, `open_price_audit`,
 // `self_trade_audit`) carried the same omission but had not yet been
@@ -227,7 +227,7 @@ fn every_audit_dedup_key_must_include_designated_timestamp_ts() {
     assert!(
         violations.is_empty(),
         "Audit-table DEDUP key missing `ts` (2026-05-18 production regression):\n\n{}\n\n\
-         Cause: gap_fill_audit + last_tick_audit returned HTTP 400 at boot because \
+         Cause: last_tick_audit returned HTTP 400 at boot because \
          their DEDUP keys lacked the designated timestamp column. See \
          .claude/rules/project/phase-0-architecture.md (audit-table template).",
         violations.join("\n\n"),

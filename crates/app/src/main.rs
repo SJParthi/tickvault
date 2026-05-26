@@ -1057,16 +1057,6 @@ async fn main() -> Result<()> {
             true,
             Some(fast_notifier.clone()),
             ws_frame_spill.clone(),
-            // FAST boot path does NOT wire gap-fill — this is the
-            // pre-market emergency boot variant. The fast-boot pool
-            // is torn down BEFORE the regular boot path at line ~3500
-            // resumes, so any reconnect events during fast-boot would
-            // be orphaned anyway. Once the regular boot resumes the
-            // gap-fill scheduler IS wired and catches all events. If
-            // fast-boot ever changes to stay live into trading hours,
-            // wire `Some(tx)` here using the same broadcast channel
-            // pattern used at the regular-boot site.
-            None,
         ) {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
             None => (None, None),
@@ -1412,20 +1402,12 @@ async fn main() -> Result<()> {
             let questdb_cfg = config.questdb.clone();
             let hs = health_status.clone();
             let persist_notifier = std::sync::Arc::clone(&notifier);
-            // PR-D8: fast-boot path has no gap-fill scheduler reader yet,
-            // but we still pass a disposable LastSeenLttCache so the
-            // consumer's write path stays uniform across both boot
-            // modes. Future PR can wire the gap-fill scheduler into
-            // fast-boot too without changing this signature.
-            let fast_boot_last_seen_cache =
-                tickvault_core::pipeline::last_seen_ltt_cache::LastSeenLttCache::new();
             tokio::spawn(async move {
                 run_tick_persistence_consumer(
                     tick_persistence_rx,
                     questdb_cfg,
                     Some(hs),
                     Some(persist_notifier),
-                    fast_boot_last_seen_cache,
                 )
                 .await;
             });
@@ -2616,113 +2598,6 @@ async fn main() -> Result<()> {
     // Order update WS stays alive until app shutdown.
     let should_connect_ws =
         subscription_plan.is_some() && (is_trading || is_mock_trading || is_muhurat);
-    // Phase 0 Item 8+9 (PR-C, 2026-05-17) — create the disconnect-event
-    // broadcast channel + spawn the gap-fill scheduler BEFORE the WS
-    // pool creates connections. The Sender is cloned into each
-    // `WebSocketConnection` via the pool constructor; the Receiver
-    // is owned by the scheduler task spawned below.
-    //
-    // SHUTDOWN DESIGN (post 3-agent adversarial review):
-    // The dedicated `gap_fill_shutdown_notify` `Arc<Notify>` is kept
-    // as a future-proofing handle for PR-D, where it will be wired
-    // into the global SIGTERM handler so the scheduler can drain
-    // in-flight per-bar tasks gracefully before exit. In PR-C the
-    // scheduler exits cleanly via `broadcast::Receiver::recv()`
-    // returning `Err(Closed)` once all Sender halves drop at process
-    // teardown — that path IS tested
-    // (`test_scheduler_exits_on_channel_close` in
-    // `gap_fill_scheduler.rs`). The `Notify`-arm of the `select!` is
-    // NOT dead code; it is the future PR-D shutdown surface.
-    //
-    // The regular-boot `shutdown_notify` is declared further down in
-    // `main()` (line ~4649) and is out of scope here. PR-D's
-    // refactor will hoist that declaration to make `Arc::clone` work
-    // at this point; until then the dedicated `Notify` is the right
-    // contract.
-    let (gap_fill_event_tx, gap_fill_event_rx) =
-        tickvault_core::websocket::disconnect_event::create_disconnect_event_channel();
-    let gap_fill_shutdown_notify = std::sync::Arc::new(tokio::sync::Notify::new());
-
-    // PR-D8 (2026-05-17) — construct the shared last-seen LTT cache
-    // before the gap-fill scheduler is spawned. The cache is cloned
-    // into both the slow-boot observability consumer (write side, on
-    // every tick) and into GapFillExecutorDeps (read side, at
-    // disconnect-event handling time for outage_start refinement).
-    // Lock-free internally — clones share the underlying papaya map.
-    let last_seen_ltt_cache =
-        tickvault_core::pipeline::last_seen_ltt_cache::LastSeenLttCache::new();
-
-    // Phase 0 PR-D3-impl (2026-05-17) — build the executor deps and
-    // pass them to the scheduler. The scheduler now performs the
-    // actual REST fetch + UPSERT for NIFTY index gap-fill bars
-    // (MVP slice; PR-D4 generalises to per-instrument iteration).
-    //
-    // The dedicated CandlePersistenceWriter is constructed fresh here
-    // (NOT shared with the boot-time historical fetcher) to avoid
-    // mutable-borrow conflicts. If QuestDB is unreachable, log error
-    // and DO NOT spawn the executor — the scheduler stays inert
-    // (broadcast receiver drops eventually on shutdown).
-    let gap_fill_endpoint = format!(
-        "{}/charts/intraday",
-        config.dhan.rest_api_base_url.trim_end_matches('/')
-    );
-    let gap_fill_http_client = std::sync::Arc::new(
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(
-                tickvault_common::constants::GAP_FILL_FETCH_TIMEOUT_SECS,
-            ))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new()),
-    );
-    // Phase 0 PR-D7 (2026-05-17) — per-conn precision. The gap-fill
-    // scheduler iterates the SID snapshot the WebSocket producer
-    // attached to each `DisconnectResolvedEvent`, so no boot-time
-    // registry snapshot is needed here. PR-D6's boot-side
-    // `nse_eq_sids: Arc<Vec<u32>>` was removed because it duplicated
-    // the per-conn payload and caused fan-out across SIDs other
-    // conns owned.
-    let gap_fill_writer_result =
-        tickvault_storage::candle_persistence::CandlePersistenceWriter::new(&config.questdb);
-    match gap_fill_writer_result {
-        Ok(writer) => {
-            let writer_arc: std::sync::Arc<
-                tokio::sync::Mutex<
-                    dyn tickvault_core::historical::gap_fill_scheduler::GapFillCandleSink,
-                >,
-            > = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
-            let deps = tickvault_core::historical::gap_fill_scheduler::GapFillExecutorDeps::new(
-                gap_fill_http_client,
-                gap_fill_endpoint,
-                token_handle.clone(),
-                ws_client_id.clone().into(),
-                writer_arc,
-                config.questdb.clone(),
-                std::sync::Arc::clone(&notifier),
-                last_seen_ltt_cache.clone(),
-            );
-            tokio::spawn(async move {
-                tickvault_core::historical::gap_fill_scheduler::run_gap_fill_scheduler(
-                    gap_fill_event_rx,
-                    gap_fill_shutdown_notify,
-                    deps,
-                )
-                .await;
-            });
-        }
-        Err(err) => {
-            error!(
-                ?err,
-                "gap-fill scheduler: failed to construct dedicated CandlePersistenceWriter — \
-                 gap-fill subsystem disabled this session; broadcast receiver will drain on \
-                 shutdown"
-            );
-            // Explicitly drop the receiver so the broadcast Sender's
-            // `tx.send()` from connection.rs returns `Err(NoReceivers)`
-            // and the connection-side warn! fires (visible degradation
-            // per audit-findings Rule 5).
-            drop(gap_fill_event_rx);
-        }
-    }
 
     let (pool_receiver, ws_pool_ready) = if should_connect_ws {
         match create_websocket_pool(
@@ -2733,8 +2608,6 @@ async fn main() -> Result<()> {
             is_market_hours,
             Some(notifier.clone()),
             ws_frame_spill.clone(),
-            // Phase 0 Item 8+9 PR-C — wire the gap-fill scheduler.
-            Some(gap_fill_event_tx.clone()),
         ) {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
             None => (None, None),
@@ -2834,9 +2707,8 @@ async fn main() -> Result<()> {
     {
         let obs_rx = tick_broadcast_sender.subscribe();
         let questdb_cfg = config.questdb.clone();
-        let obs_cache = last_seen_ltt_cache.clone();
         tokio::spawn(async move {
-            run_slow_boot_observability(obs_rx, questdb_cfg, obs_cache).await;
+            run_slow_boot_observability(obs_rx, questdb_cfg).await;
         });
         info!("slow-boot observability consumer started");
     }
@@ -4843,7 +4715,7 @@ async fn load_instruments(
 /// WITHOUT spawning connections. This allows the tick processor to start
 /// consuming frames BEFORE connections begin sending data, preventing
 /// frame send timeouts during the stagger period.
-#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill + Phase 0 PR-C added disconnect_event_sender
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill
 fn create_websocket_pool(
     token_handle: &TokenHandle,
     client_id: &str,
@@ -4852,14 +4724,6 @@ fn create_websocket_pool(
     is_market_hours: bool,
     notifier: Option<std::sync::Arc<NotificationService>>,
     wal_spill: Option<std::sync::Arc<tickvault_storage::ws_frame_spill::WsFrameSpill>>,
-    // Phase 0 Item 8+9 (PR-C, 2026-05-17) — typed disconnect-event Sender
-    // for the gap-fill scheduler. `Some(tx)` from boot when gap-fill is
-    // wired; `None` from any path that doesn't subscribe to events.
-    disconnect_event_sender: Option<
-        tokio::sync::broadcast::Sender<
-            tickvault_core::websocket::disconnect_event::DisconnectResolvedEvent,
-        >,
-    >,
 ) -> Option<(
     tokio::sync::mpsc::Receiver<bytes::Bytes>,
     WebSocketConnectionPool,
@@ -4989,7 +4853,7 @@ fn create_websocket_pool(
         metrics::gauge!("tv_subscription_plan_dropped_instruments").set(dropped as f64);
     }
 
-    let mut pool = match WebSocketConnectionPool::new_with_optional_wal_and_disconnect_events(
+    let mut pool = match WebSocketConnectionPool::new_with_optional_wal(
         token_handle.clone(),
         client_id.to_string(),
         dhan_for_pool,
@@ -4998,7 +4862,6 @@ fn create_websocket_pool(
         feed_mode,
         notifier,
         wal_spill,
-        disconnect_event_sender,
     ) {
         Ok(pool) => pool,
         Err(err) => {
@@ -6173,7 +6036,6 @@ async fn run_tick_persistence_consumer(
     questdb_config: tickvault_common::config::QuestDbConfig,
     health_status: Option<SharedHealthStatus>,
     notifier: Option<std::sync::Arc<NotificationService>>,
-    last_seen_ltt_cache: tickvault_core::pipeline::last_seen_ltt_cache::LastSeenLttCache,
 ) {
     let mut tick_writer = match TickPersistenceWriter::new(&questdb_config) {
         Ok(writer) => {
@@ -6233,14 +6095,6 @@ async fn run_tick_persistence_consumer(
                 // its own log/metric on gap thresholds; we do NOT publish
                 // any backfill request (in-market backfill disabled).
                 let _ = tick_gap_tracker.record_tick(tick.security_id, tick.exchange_timestamp);
-                // PR-D8: also update the shared last-seen-LTT cache so
-                // the gap-fill scheduler can refine outage_start at
-                // disconnect-event handling time. Lock-free O(1).
-                last_seen_ltt_cache.record(
-                    tick.security_id,
-                    tick.exchange_segment_code,
-                    i64::from(tick.exchange_timestamp),
-                );
 
                 if let Err(err) = tick_writer.append_tick(&tick) {
                     // Phase 0 / Rule 5: persistence failures are ERROR (route to Telegram).
@@ -6344,7 +6198,6 @@ async fn run_tick_persistence_consumer(
 async fn run_slow_boot_observability(
     mut tick_rx: tokio::sync::broadcast::Receiver<tickvault_common::tick_types::ParsedTick>,
     questdb_config: tickvault_common::config::QuestDbConfig,
-    last_seen_ltt_cache: tickvault_core::pipeline::last_seen_ltt_cache::LastSeenLttCache,
 ) {
     info!("S4-T1d: slow-boot observability task started");
 
@@ -6399,14 +6252,6 @@ async fn run_slow_boot_observability(
                 // no backfill request is published (in-market backfill
                 // disabled by user policy).
                 let _ = tick_gap_tracker.record_tick(tick.security_id, tick.exchange_timestamp);
-                // PR-D8: also update the shared last-seen-LTT cache so
-                // the gap-fill scheduler can refine outage_start at
-                // disconnect-event handling time. Lock-free O(1).
-                last_seen_ltt_cache.record(
-                    tick.security_id,
-                    tick.exchange_segment_code,
-                    i64::from(tick.exchange_timestamp),
-                );
 
                 // Audit finding #2 (2026-04-24): periodic per-instrument stall
                 // scan every 30 s. Returns the count of newly-stale instruments;

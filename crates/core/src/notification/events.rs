@@ -1303,78 +1303,6 @@ pub enum NotificationEvent {
         /// to fix the TOML directly.
         reason: String,
     },
-
-    /// Phase 0 Items 8+9 — gap-fill scheduler successfully refilled a
-    /// 1-minute candle for all (or most) instruments. Severity::Info
-    /// — one-shot at end-of-event per bar, NO `Started` partner event
-    /// (per audit-findings Rule 4 edge-trigger discipline; dropping
-    /// `GapFillStarted` after 3-agent review found it would page on
-    /// every brief disconnect).
-    ///
-    /// Sample failed SIDs capped at 5 by the message formatter to keep
-    /// Telegram message body under Bot API 4096-char limit.
-    GapFillCompleted {
-        /// Human-readable bar minute, e.g. `"09:33"`. Pure display field
-        /// — the authoritative bar identity is `(trading_date_ist,
-        /// bar_minute)` in `gap_fill_audit`.
-        bar_minute_ist: String,
-        /// Number of SecurityIds for which the REST fetch + UPSERT
-        /// completed successfully within this bar's attempt window.
-        sids_completed: u32,
-        /// Number that failed every retry; should be 0 on success.
-        sids_failed: u32,
-        /// Wall-clock duration from first REST fire to last UPSERT, in
-        /// whole milliseconds. Useful for diagnosing slow Dhan paths.
-        duration_ms: u32,
-    },
-
-    /// Phase 0 Items 8+9 — gap-fill scheduler completed a bar with
-    /// partial success: some SecurityIds succeeded, some failed.
-    /// Severity::High. Operator inspects `gap_fill_audit` to identify
-    /// the failed SIDs and decide whether to backfill manually.
-    GapFillPartial {
-        /// Human-readable bar minute, e.g. `"09:33"`.
-        bar_minute_ist: String,
-        /// Number that completed REST + UPSERT.
-        sids_completed: u32,
-        /// Number that failed after exhausting retries.
-        sids_failed: u32,
-        /// First `<= 5` failed SecurityIds for at-a-glance debugging.
-        /// Capped at 5 BY THE FORMATTER so the struct field can carry
-        /// any length without runtime panic on giant outages.
-        sample_failed_sids: Vec<u32>,
-    },
-
-    /// Phase 0 Items 8+9 — gap-fill scheduler exhausted every retry
-    /// for an entire bar (zero SIDs succeeded). Severity::Critical.
-    /// The bar is permanently lost from `candles_1m` until post-market
-    /// `cross_verify.rs` catches it at ~17:00 IST.
-    GapFillFailed {
-        /// Human-readable bar minute, e.g. `"09:33"`.
-        bar_minute_ist: String,
-        /// Last error observed across all retries (truncated to 200
-        /// chars at formatter time per security agent finding —
-        /// QuestDB / Dhan response bodies can echo the request SQL).
-        error: String,
-        /// Final attempt number (1-indexed) at which the failure was
-        /// declared terminal. Matches the `attempt` column of the
-        /// final `gap_fill_audit` row for this bar.
-        attempt: u32,
-    },
-
-    /// Phase 0 Items 8+9 — gap-fill scheduler's broadcast receiver
-    /// lagged behind and `tokio::sync::broadcast::Receiver::recv()`
-    /// returned `Err(Lagged(n))`. Up to `n` disconnect-resolved events
-    /// were dropped silently. Severity::Critical.
-    ///
-    /// The scheduler responds by running a full reconciliation pass
-    /// (SELECT on `candles_1m` over the suspected lagged window) and
-    /// triggers a synthetic gap-fill plan for any missing bars.
-    GapFillEventChannelLagged {
-        /// Number of disconnect events the broadcast channel dropped.
-        /// Sourced from `RecvError::Lagged(n)`.
-        dropped_event_count: u64,
-    },
 }
 
 /// One symbol-level entry inside [`NotificationEvent::DepthDynamicV2DiffApplied`].
@@ -2823,79 +2751,6 @@ impl NotificationEvent {
                  Fix `[option_chain_minute_snapshot]` in config/base.toml \
                  + restart."
             ),
-            Self::GapFillCompleted {
-                bar_minute_ist,
-                sids_completed,
-                sids_failed,
-                duration_ms,
-            } => format!(
-                "<b>Gap-fill OK — bar {bar_minute_ist}</b>\n\
-                 refilled: <code>{sids_completed}</code>\n\
-                 failed: <code>{sids_failed}</code>\n\
-                 took: <code>{duration_ms}ms</code>\n\
-                 (after a brief connection blip, the missed minute candle was \
-                 fetched from Dhan and saved)"
-            ),
-            Self::GapFillPartial {
-                bar_minute_ist,
-                sids_completed,
-                sids_failed,
-                sample_failed_sids,
-            } => {
-                // Security agent LOW #3: cap sample at 5 SIDs to keep body
-                // under Telegram Bot API 4096-char limit.
-                const MAX_SAMPLE: usize = 5;
-                let shown: Vec<String> = sample_failed_sids
-                    .iter()
-                    .take(MAX_SAMPLE)
-                    .map(|sid| sid.to_string())
-                    .collect();
-                let more_tail = if sample_failed_sids.len() > MAX_SAMPLE {
-                    format!(" (+{} more)", sample_failed_sids.len() - MAX_SAMPLE)
-                } else {
-                    String::new()
-                };
-                format!(
-                    "<b>⚠️ Gap-fill PARTIAL — bar {bar_minute_ist}</b>\n\
-                     refilled: <code>{sids_completed}</code>\n\
-                     failed: <code>{sids_failed}</code>\n\
-                     sample failed ids: <code>{}</code>{more_tail}\n\
-                     Investigate failed instruments; consider manual backfill.",
-                    shown.join(", "),
-                )
-            }
-            Self::GapFillFailed {
-                bar_minute_ist,
-                error,
-                attempt,
-            } => {
-                // Security agent MEDIUM #2: cap upstream error body at 200
-                // chars before embedding in operator-visible message.
-                const MAX_ERR_LEN: usize = 200;
-                let shown_err: String = error.chars().take(MAX_ERR_LEN).collect();
-                let truncated_marker = if error.chars().count() > MAX_ERR_LEN {
-                    "…(truncated)"
-                } else {
-                    ""
-                };
-                format!(
-                    "<b>🆘 Gap-fill FAILED — bar {bar_minute_ist}</b>\n\
-                     attempt: <code>{attempt}</code>\n\
-                     error: <code>{shown_err}</code>{truncated_marker}\n\
-                     Bar permanently lost from candles_1m until post-market \
-                     cross-verify (~17:00 IST). Operator may backfill manually."
-                )
-            }
-            Self::GapFillEventChannelLagged {
-                dropped_event_count,
-            } => format!(
-                "<b>🆘 Gap-fill DISCONNECT EVENTS DROPPED</b>\n\
-                 dropped: <code>{dropped_event_count}</code>\n\
-                 Up to {dropped_event_count} disconnect events were missed by \
-                 the gap-fill scheduler. Running reconciliation pass against \
-                 candles_1m. Operator: verify reconciliation succeeded; \
-                 escalate if rate sustained."
-            ),
         }
     }
 
@@ -3008,10 +2863,6 @@ impl NotificationEvent {
             Self::OptionChainCacheFallback { .. } => "OptionChainCacheFallback",
             Self::OptionChainStaleHalt { .. } => "OptionChainStaleHalt",
             Self::OptionChainConfigInvalid { .. } => "OptionChainConfigInvalid",
-            Self::GapFillCompleted { .. } => "GapFillCompleted",
-            Self::GapFillPartial { .. } => "GapFillPartial",
-            Self::GapFillFailed { .. } => "GapFillFailed",
-            Self::GapFillEventChannelLagged { .. } => "GapFillEventChannelLagged",
         }
     }
 
@@ -3166,10 +3017,6 @@ impl NotificationEvent {
             Self::OptionChainCacheFallback { .. } => Severity::Medium,
             Self::OptionChainStaleHalt { .. } => Severity::Critical,
             Self::OptionChainConfigInvalid { .. } => Severity::Critical,
-            Self::GapFillCompleted { .. } => Severity::Info,
-            Self::GapFillPartial { .. } => Severity::High,
-            Self::GapFillFailed { .. } => Severity::Critical,
-            Self::GapFillEventChannelLagged { .. } => Severity::Critical,
         }
     }
 

@@ -256,24 +256,6 @@ pub struct WebSocketConnection {
     /// `None` in tests; `Some(Arc<...>)` in production.
     notifier: Option<Arc<crate::notification::NotificationService>>,
 
-    /// Phase 0 Item 8+9 (PR-C, 2026-05-17) — typed broadcast Sender for
-    /// disconnect-resolved events consumed by the gap-fill scheduler.
-    /// `None` in tests and any production path that doesn't wire gap-fill;
-    /// `Some(broadcast::Sender)` after `with_disconnect_event_sender()`.
-    /// Send-fail (no subscribers, channel closed) is a non-fatal warn.
-    disconnect_event_sender: Option<
-        tokio::sync::broadcast::Sender<crate::websocket::disconnect_event::DisconnectResolvedEvent>,
-    >,
-
-    /// PR-D7 (2026-05-17) — per-conn snapshot of `(security_id,
-    /// segment_binary_code)` tuples computed once at construction
-    /// from `instruments`. Sent verbatim (via Arc::clone) on every
-    /// `DisconnectResolvedEvent` so the gap-fill scheduler can fan
-    /// out ONLY across the SIDs this conn had subscribed, not the
-    /// entire registry. Memory bounded by Dhan's 5,000 instruments-
-    /// per-conn cap.
-    subscribed_sec_ids: Arc<Vec<(u32, u8)>>,
-
     /// A5: Graceful shutdown flag. When `true`, the outer `run()` loop exits
     /// without attempting reconnect after the read loop returns. Set by
     /// `request_graceful_shutdown()`.
@@ -437,39 +419,6 @@ impl WebSocketConnection {
             ));
         }
 
-        // PR-D7 (2026-05-17): Pre-compute the per-conn snapshot of
-        // `(security_id, segment_binary_code)` tuples now, while we
-        // still have the typed inputs. The string-parse happens once
-        // at construction (O(1) EXEMPT — runs once at startup, not
-        // per tick) and the resulting Arc<Vec<...>> is reused on
-        // every disconnect-resolved broadcast. Unknown segments fall
-        // back to 255 so the consumer's segment filter (which keeps
-        // only 0=IDX_I and 1=NSE_EQ) naturally skips them.
-        // O(1) EXEMPT: begin
-        // PR-D7 constructor-only allocation. Runs once at startup per
-        // connection (≤5 main-feed conns total). Snapshot is then
-        // reused by Arc::clone on every disconnect-resolved broadcast.
-        let snapshot: Vec<(u32, u8)> = instruments
-            .iter()
-            .filter_map(|inst| {
-                let sid = inst.security_id.parse::<u32>().ok()?;
-                let seg_code = match inst.exchange_segment.as_str() {
-                    "IDX_I" => 0_u8,
-                    "NSE_EQ" => 1,
-                    "NSE_FNO" => 2,
-                    "NSE_CURRENCY" => 3,
-                    "BSE_EQ" => 4,
-                    "MCX_COMM" => 5,
-                    "BSE_CURRENCY" => 7,
-                    "BSE_FNO" => 8,
-                    _ => 255,
-                };
-                Some((sid, seg_code))
-            })
-            .collect();
-        let subscribed_sec_ids = Arc::new(snapshot);
-        // O(1) EXEMPT: end
-
         Self {
             connection_id,
             token_handle,
@@ -483,8 +432,6 @@ impl WebSocketConnection {
             total_reconnections: AtomicU64::new(0),
             cached_subscription_messages,
             notifier,
-            disconnect_event_sender: None,
-            subscribed_sec_ids,
             shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             wal_spill: None,
@@ -514,34 +461,6 @@ impl WebSocketConnection {
     // TEST-EXEMPT: builder pass-through covered indirectly by connection_pool construction paths; no test-visible state change to assert
     pub fn with_wal_spill(mut self, spill: Arc<WsFrameSpill>) -> Self {
         self.wal_spill = Some(spill);
-        self
-    }
-
-    /// Phase 0 Item 8+9 (PR-C, 2026-05-17) — install the disconnect-event
-    /// broadcast Sender.
-    ///
-    /// Chain after `new()`:
-    /// `WebSocketConnection::new(...).with_disconnect_event_sender(tx)`.
-    ///
-    /// The Sender is cloned once at boot time (one broadcast channel
-    /// shared across all 5 main-feed connections). Each successful
-    /// reconnect cycle fires `tx.send(DisconnectResolvedEvent { ... })`
-    /// in the post-reconnect notification block — see the canonical
-    /// send site labelled `Phase-0-Item-8-9-PR-C` in `run()`. Send-fail
-    /// (no subscribers, channel closed) is non-fatal: the reconnect
-    /// proceeds, the gap-fill subsystem misses that event.
-    ///
-    /// Tests do NOT call this builder — the field stays `None` and the
-    /// send site short-circuits.
-    #[must_use]
-    // TEST-EXEMPT: builder pass-through; covered indirectly by the post-reconnect send-site, itself exercised via the connection_pool wiring
-    pub fn with_disconnect_event_sender(
-        mut self,
-        sender: tokio::sync::broadcast::Sender<
-            crate::websocket::disconnect_event::DisconnectResolvedEvent,
-        >,
-    ) -> Self {
-        self.disconnect_event_sender = Some(sender);
         self
     }
 
@@ -694,46 +613,6 @@ impl WebSocketConnection {
                                 down_secs,
                                 attempts,
                             });
-                        }
-                        // Phase-0-Item-8-9-PR-C (2026-05-17) — emit a
-                        // typed disconnect-resolved event to the gap-fill
-                        // scheduler. Best-effort: if the broadcast Sender
-                        // is `None` (tests, gap-fill-disabled), the
-                        // gap-fill subsystem isn't wired and we skip.
-                        // If `Some` but `send()` errors (no subscribers,
-                        // channel closed), log debug + continue — the
-                        // reconnect itself succeeded, only gap-fill is
-                        // degraded.
-                        if let Some(ref tx) = self.disconnect_event_sender {
-                            let now_secs_ist = chrono::Utc::now().timestamp().saturating_add(
-                                i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS),
-                            );
-                            // Best-effort outage_start estimate: subtract
-                            // a conservative ~10s window. PR-D refines
-                            // using last-seen-tick timestamps; for PR-C
-                            // the scheduler logs the event and the
-                            // estimate is sufficient.
-                            let outage_start_secs = now_secs_ist.saturating_sub(10);
-                            let event =
-                                crate::websocket::disconnect_event::DisconnectResolvedEvent {
-                                    connection_index: u8::from(self.connection_id),
-                                    outage_start_secs,
-                                    outage_end_secs: now_secs_ist,
-                                    subscribed: Arc::clone(&self.subscribed_sec_ids),
-                                };
-                            if let Err(send_err) = tx.send(event) {
-                                // Per audit-findings Rule 5: broadcast send
-                                // failures are observable degradation — the
-                                // scheduler has either crashed or never
-                                // subscribed. Routes to Telegram via Loki's
-                                // WARN-level alert chain so the operator
-                                // knows gap-fill is silently degraded.
-                                tracing::warn!(
-                                    connection_id = self.connection_id,
-                                    err = ?send_err,
-                                    "disconnect-event broadcast send failed (no subscribers or closed); gap-fill subsystem is degraded for this reconnect"
-                                );
-                            }
                         }
                     }
 
