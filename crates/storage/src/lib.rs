@@ -15,7 +15,7 @@
 //! # Modules
 //! - `instrument_persistence` — daily instrument snapshot to QuestDB (Block 01.1)
 //! - `tick_persistence` — batched ILP writer for live ticks
-//! - `candle_persistence` — 1-minute candle persistence from historical fetch
+// PR-E (2026-05-26): candle_persistence retired.
 //!
 //! # Boot Sequence Position
 //! OMS -> **QuestDB** -> HTTP API
@@ -73,7 +73,10 @@ mod global_qcfg_tests {
 }
 
 pub mod boot_probe;
-pub mod candle_persistence;
+// PR-E (2026-05-26): `candle_persistence` module deleted alongside the
+// `historical_candles` QuestDB table. The module had no live consumers
+// after PR-D removed candle_fetcher.rs; LiveCandleWriter had been
+// superseded by `shadow_candle_writer` long ago.
 // PR #4 (2026-05-19): deep_depth_persistence + depth_dynamic_diff_audit
 // + depth_rebalance_audit modules DELETED. Audit tables stay on disk
 // per SEBI 5y retention.
@@ -122,11 +125,10 @@ pub mod tick_persistence_testing {
 /// Shared process-wide mutex for tests that touch the real global
 /// `data/spill/` directory (TICK_SPILL_DIR / CANDLE_SPILL_DIR).
 ///
-/// The two recovery tests
+/// The recovery test
 ///   - `tick_persistence::tests::test_recover_skips_current_active_spill`
-///   - `candle_persistence::tests::test_live_candle_recover_stale_spill_files`
 ///
-/// both call `recover_stale_spill_files()`, which drains EVERY matching
+/// calls `recover_stale_spill_files()`, which drains EVERY matching
 /// `{ticks,candles}-*.bin` file under the global spill directory. When
 /// cargo runs these tests in parallel inside the same binary, they race
 /// on filesystem state: one test drains the other test's artefacts

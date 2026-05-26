@@ -122,7 +122,7 @@ pub fn build_category_targets(cat: LogCategory) -> &'static [&'static str] {
     match cat {
         LogCategory::Candles => &[
             "tickvault_core::pipeline::candle_aggregator",
-            "tickvault_storage::candle_persistence",
+            // PR-E (2026-05-26): tickvault_storage::candle_persistence retired.
             "tickvault_storage::materialized_views",
         ],
         // 2026-05-09: the 4 RAM-tracker targets formerly under
