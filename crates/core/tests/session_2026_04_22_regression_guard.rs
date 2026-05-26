@@ -63,24 +63,10 @@ fn guard_offhours_ws_disconnected_variant_exists() {
 // `guard_phase2_empty_plan_fires_phase2_failed` retired in PR #509d
 // — `phase2_scheduler.rs` deleted along with the dispatcher chain.
 
-#[test]
-fn guard_preopen_buffer_captures_index_underlyings() {
-    // Commit f641315 — preopen buffer now records NIFTY (id=13) + BANKNIFTY
-    // (id=25) on IDX_I segment for depth ATM selection.
-    let src = read_file("crates/core/src/instrument/preopen_price_buffer.rs");
-    assert!(
-        src.contains("PREOPEN_INDEX_UNDERLYINGS"),
-        "PREOPEN_INDEX_UNDERLYINGS const MUST exist (commit f641315)."
-    );
-    assert!(
-        src.contains("(\"NIFTY\", 13)"),
-        "PREOPEN_INDEX_UNDERLYINGS must include NIFTY=13."
-    );
-    assert!(
-        src.contains("(\"BANKNIFTY\", 25)"),
-        "PREOPEN_INDEX_UNDERLYINGS must include BANKNIFTY=25."
-    );
-}
+// `guard_preopen_buffer_captures_index_underlyings` retired 2026-05-26 —
+// per operator directive, the Dhan pre-market buffer module was deleted
+// alongside Dhan historical fetch. `day_open` now derives from the first
+// observed live tick LTP via `DayOhlcTracker::update_tick` (auto-arm).
 
 #[test]
 fn guard_streaming_heartbeat_task_exists_in_main() {
@@ -96,20 +82,10 @@ fn guard_streaming_heartbeat_task_exists_in_main() {
     );
 }
 
-#[test]
-fn guard_depth_command_initial_subscribe_variants_exist() {
-    // Commit 6fd9c2a — DepthCommand::InitialSubscribe20 / InitialSubscribe200
-    // variants exist for the future unified 09:13 dispatch (Items B+C).
-    let src = read_file("crates/core/src/websocket/depth_connection.rs");
-    assert!(
-        src.contains("InitialSubscribe20"),
-        "DepthCommand::InitialSubscribe20 MUST exist (commit 6fd9c2a)."
-    );
-    assert!(
-        src.contains("InitialSubscribe200"),
-        "DepthCommand::InitialSubscribe200 MUST exist (commit 6fd9c2a)."
-    );
-}
+// `guard_depth_command_initial_subscribe_variants_exist` retired —
+// `crates/core/src/websocket/depth_connection.rs` was deleted in PR #4
+// (#707) under the LOCKED 2-WS-connections-forever rule (operator-charter §I).
+// Depth feeds are forbidden in any future phase without operator re-approval.
 
 // PR #5 (2026-05-19): guard_phase2_complete_includes_depth_counts retired.
 // Phase2Complete event removed alongside the Phase 2 dispatcher chain
