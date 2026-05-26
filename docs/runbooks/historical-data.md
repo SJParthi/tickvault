@@ -119,7 +119,8 @@ WHERE security_id = <X>
 
 - `.claude/rules/dhan/historical-data.md` — Dhan API spec
 - `crates/core/src/historical/candle_fetcher.rs` — fetch + retry
-- `crates/core/src/historical/cross_verify.rs` — live-vs-historical diff
 - `crates/storage/src/candle_persistence.rs` — `historical_candles` writer
 - `.claude/rules/project/historical-candles-cross-verify.md` — invariants
-- `deploy/docker/grafana/dashboards/data-lifecycle.json` — panel 11
+
+(PR-C 2026-05-26: `cross_verify.rs` module deleted alongside the entire
+Dhan historical fetch chain; the live-vs-historical diff is gone.)

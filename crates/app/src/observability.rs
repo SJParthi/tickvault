@@ -1354,15 +1354,12 @@ mod tests {
     }
 
     #[test]
-    fn test_build_category_targets_historical_routes_fetcher_and_cross_verify() {
+    fn test_build_category_targets_historical_routes_fetcher() {
         let targets = build_category_targets(LogCategory::Historical);
         assert!(targets.contains(&"tickvault_core::historical"));
         assert!(targets.contains(&"tickvault_storage::historical_fetch_marker"));
-        // Operator's primary use case: see candle_fetcher progress logs
-        // in their own file. The `tickvault_core::historical` prefix
-        // covers `candle_fetcher` (its module path is
-        // tickvault_core::historical::candle_fetcher). Verified against
-        // crates/core/src/historical/mod.rs.
+        // PR-C (2026-05-26): cross_verify chain deleted; the historical
+        // category now routes only candle_fetcher progress logs.
     }
 
     #[test]

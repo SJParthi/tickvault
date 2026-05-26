@@ -204,92 +204,10 @@ fn test_market_open_streaming_routes_to_failed_when_main_feed_is_zero() {
     );
 }
 
-#[test]
-fn test_historical_fetch_guards_zero_fetched_zero_candles() {
-    // 2026-04-24 audit finding #1: HistoricalFetchComplete must NOT fire
-    // when `instruments_fetched == 0 && total_candles == 0`. Without this
-    // guard, a Dhan outage that returns 200-with-empty-payload, an empty
-    // universe on a mid-boot race, or a disabled-scope misconfiguration
-    // all produced a green Telegram "Historical candles OK / Fetched: 0 /
-    // Candles: 0" — same false-OK class as the 2026-04-24 15:47 IST
-    // cross-match bug fixed in PR #341.
-    let src = read_file("crates/app/src/main.rs");
-    assert!(
-        src.contains("zero_fetched_degenerate"),
-        "2026-04-24 regression: zero_fetched_degenerate guard missing from \
-         historical-fetch success/failure routing. Without it, fresh-boot \
-         against a Dhan outage produces a false-OK Telegram."
-    );
-    assert!(
-        src.contains("\"zero_fetched_zero_candles\".to_string()"),
-        "2026-04-24 regression: failure_reasons entry for the degenerate \
-         case must include a named reason so Telegram surfaces the actual \
-         diagnostic instead of an empty breakdown."
-    );
-    // Enforce the boolean composition — both conjuncts required. If the
-    // future maintainer removes the `total_candles == 0` conjunct, the
-    // guard regresses silently (any non-zero candle count would bypass).
-    assert!(
-        src.contains("summary.instruments_fetched == 0 && summary.total_candles == 0"),
-        "2026-04-24 regression: zero_fetched_degenerate must require BOTH \
-         instruments_fetched == 0 AND total_candles == 0. Dropping either \
-         conjunct reintroduces the false-OK class."
-    );
-    // Enforce the routing — degenerate case goes to Failed variant.
-    assert!(
-        src.contains("summary.instruments_failed > 0 || zero_fetched_degenerate"),
-        "2026-04-24 regression: degenerate case must route to \
-         HistoricalFetchFailed, not HistoricalFetchComplete."
-    );
-}
-
-#[test]
-fn test_historical_fetch_idempotent_rerun_routes_to_already_available() {
-    // 2026-04-24 operator-feedback follow-up (PR #353):
-    //
-    //   "already we downloaded all the data including today so using
-    //    another branch when we run this again since the data is
-    //    available even for today then in telegram it should display
-    //    the low message as data is already fetched or available for
-    //    today"
-    //
-    // When the fetch returns `instruments_fetched == 0 && total_candles
-    // == 0` BUT QuestDB already has today's candles, fire LOW
-    // `HistoricalFetchAlreadyAvailable` instead of HIGH
-    // `HistoricalFetchFailed`. The operator should not be paged for an
-    // idempotent re-run; they should be paged for a real outage.
-    let src = read_file("crates/app/src/main.rs");
-    assert!(
-        src.contains("zero_fetched_no_actual_failures"),
-        "historical-fetch decision tree must define the \
-         `zero_fetched_no_actual_failures` binding — it's the pre-condition \
-         for the DB presence check. Dropping it would re-merge the \
-         idempotent-rerun path back into HistoricalFetchFailed (HIGH)."
-    );
-    assert!(
-        src.contains("count_historical_candles_for_ist_day"),
-        "historical-fetch decision tree must call \
-         count_historical_candles_for_ist_day — it's the QuestDB presence \
-         check that distinguishes idempotent re-runs from Dhan outages. \
-         Without the call, every zero-fetched boot fires HIGH."
-    );
-    assert!(
-        src.contains("NotificationEvent::HistoricalFetchAlreadyAvailable"),
-        "historical-fetch decision tree must emit \
-         HistoricalFetchAlreadyAvailable on the idempotent-rerun path. \
-         Routing it back through HistoricalFetchComplete would be wrong \
-         — Complete claims a successful fetch; we did not fetch anything."
-    );
-    // The idempotent-rerun branch must be tested for `> 0` against the
-    // presence count, not `>= 0` (which would fire on every zero-fetched
-    // boot regardless of DB state — defeating the whole point).
-    assert!(
-        src.contains("today_candle_presence.unwrap_or(0) > 0"),
-        "idempotent-rerun branch must test `today_candle_presence > 0`. \
-         Dropping the `> 0` makes the branch fire on every failed QuestDB \
-         query, silently masking real outages."
-    );
-}
+// PR-C (2026-05-26): 2 source-scan guards for the deleted
+// `spawn_historical_candle_fetch` routing tree are retired. The
+// HistoricalFetchAlreadyAvailable variant in events.rs is still
+// pinned by the test below.
 
 #[test]
 fn test_historical_fetch_already_available_variant_exists_at_low_severity() {
@@ -321,43 +239,5 @@ fn test_historical_fetch_already_available_variant_exists_at_low_severity() {
     );
 }
 
-#[test]
-fn test_historical_fetch_zero_fetched_on_non_trading_day_routes_to_low() {
-    // 2026-04-26 follow-up: on a non-trading day (weekend / NSE holiday)
-    // the market never opened, so `instruments_fetched == 0 && total_candles
-    // == 0` is the EXPECTED state — not an outage. Before this fix the
-    // operator was paged HIGH `Historical candle fetch — partial failure /
-    // zero_fetched_zero_candles: 1` on every weekend boot. The fix routes
-    // the non-trading-day case to LOW `HistoricalFetchAlreadyAvailable`
-    // (the same Low variant used for trading-day idempotent re-runs).
-    //
-    // Per audit-findings-2026-04-17 Rule 11, a FAILURE-class event whose
-    // denominator is structurally zero on the current calendar day is a
-    // false-positive. This guard pins the gate so a future revert fails
-    // the build.
-    let src = read_file("crates/app/src/main.rs");
-    assert!(
-        src.contains("zero_fetched_non_trading_day"),
-        "main.rs must define `zero_fetched_non_trading_day` binding so the \
-         non-trading-day fork of the zero-fetched routing is mechanically \
-         visible. Dropping it re-merges the weekend boot path back into \
-         HIGH HistoricalFetchFailed."
-    );
-    assert!(
-        src.contains("zero_fetched_no_actual_failures && !is_trading_day"),
-        "the non-trading-day gate MUST require BOTH \
-         `zero_fetched_no_actual_failures` AND `!is_trading_day`. Removing \
-         either conjunct either (a) suppresses real outages on weekends \
-         or (b) re-introduces the false-positive HIGH page."
-    );
-    // The Low routing branch MUST cover both the trading-day idempotent
-    // rerun (today_candle_presence > 0) AND the non-trading-day case.
-    assert!(
-        src.contains("today_candle_presence.unwrap_or(0) > 0 || zero_fetched_non_trading_day"),
-        "Low-severity HistoricalFetchAlreadyAvailable branch must cover \
-         BOTH the idempotent-rerun case (DB has today's candles) AND the \
-         non-trading-day case (market never opened, nothing to fetch). \
-         Dropping the `|| zero_fetched_non_trading_day` regresses to the \
-         pre-fix behaviour where every weekend boot pages HIGH."
-    );
-}
+// PR-C (2026-05-26): non-trading-day source-scan guard retired
+// (the spawn_historical_candle_fetch routing tree it ratcheted is deleted).
