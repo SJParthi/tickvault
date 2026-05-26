@@ -67,8 +67,8 @@ pub const CATEGORY_CANDLES_DIR: &str = "data/logs/candles";
 pub const CATEGORY_CANDLES_PREFIX: &str = "candles";
 pub const CATEGORY_LIVE_TICKS_DIR: &str = "data/logs/live_ticks";
 pub const CATEGORY_LIVE_TICKS_PREFIX: &str = "live_ticks";
-pub const CATEGORY_HISTORICAL_DIR: &str = "data/logs/historical";
-pub const CATEGORY_HISTORICAL_PREFIX: &str = "historical";
+// PR-D (2026-05-26): CATEGORY_HISTORICAL_* constants retired alongside
+// the deleted Dhan historical fetch chain.
 pub const CATEGORY_OPTION_CHAIN_DIR: &str = "data/logs/option_chain";
 pub const CATEGORY_OPTION_CHAIN_PREFIX: &str = "option_chain";
 
@@ -81,7 +81,6 @@ pub const CATEGORY_OPTION_CHAIN_PREFIX: &str = "option_chain";
 pub enum LogCategory {
     Candles,
     LiveTicks,
-    Historical,
     OptionChain,
 }
 
@@ -91,7 +90,6 @@ impl LogCategory {
         match self {
             Self::Candles => CATEGORY_CANDLES_DIR,
             Self::LiveTicks => CATEGORY_LIVE_TICKS_DIR,
-            Self::Historical => CATEGORY_HISTORICAL_DIR,
             Self::OptionChain => CATEGORY_OPTION_CHAIN_DIR,
         }
     }
@@ -101,20 +99,14 @@ impl LogCategory {
         match self {
             Self::Candles => CATEGORY_CANDLES_PREFIX,
             Self::LiveTicks => CATEGORY_LIVE_TICKS_PREFIX,
-            Self::Historical => CATEGORY_HISTORICAL_PREFIX,
             Self::OptionChain => CATEGORY_OPTION_CHAIN_PREFIX,
         }
     }
 
     /// Every variant. Used by retention sweepers + tests.
     #[must_use]
-    pub fn all() -> [Self; 4] {
-        [
-            Self::Candles,
-            Self::LiveTicks,
-            Self::Historical,
-            Self::OptionChain,
-        ]
+    pub fn all() -> [Self; 3] {
+        [Self::Candles, Self::LiveTicks, Self::OptionChain]
     }
 }
 
@@ -152,10 +144,8 @@ pub fn build_category_targets(cat: LogCategory) -> &'static [&'static str] {
             "tickvault_storage::tick_persistence",
             "tickvault_storage::tick_spill_drain",
         ],
-        LogCategory::Historical => &[
-            "tickvault_core::historical",
-            "tickvault_storage::historical_fetch_marker",
-        ],
+        // PR-D (2026-05-26): LogCategory::Historical variant retired
+        // alongside the deleted Dhan historical fetch chain.
         LogCategory::OptionChain => &[
             "tickvault_core::option_chain",
             // PR #3 (2026-05-19): `tickvault_trading::greeks` and
@@ -1306,13 +1296,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_log_category_all_returns_exactly_four_variants() {
-        // 2026-05-09: 4 categories — candles, live ticks, historical,
-        // option chain. The 5th (`Movers`) was retired alongside the
-        // QuestDB movers infrastructure (PR #539) — its 4 RAM-tracker
-        // tracing targets are now folded into LiveTicks.
+    fn test_log_category_all_returns_exactly_three_variants() {
+        // PR-D (2026-05-26): 3 categories — candles, live ticks, option chain.
+        // `LogCategory::Historical` retired alongside the deleted Dhan
+        // historical fetch chain. `LogCategory::Movers` was retired
+        // earlier (PR #539) — its targets folded into LiveTicks.
         let all = LogCategory::all();
-        assert_eq!(all.len(), 4);
+        assert_eq!(all.len(), 3);
     }
 
     #[test]
@@ -1323,8 +1313,6 @@ mod tests {
         assert_eq!(LogCategory::Candles.prefix(), "candles");
         assert_eq!(LogCategory::LiveTicks.dir(), "data/logs/live_ticks");
         assert_eq!(LogCategory::LiveTicks.prefix(), "live_ticks");
-        assert_eq!(LogCategory::Historical.dir(), "data/logs/historical");
-        assert_eq!(LogCategory::Historical.prefix(), "historical");
         assert_eq!(LogCategory::OptionChain.dir(), "data/logs/option_chain");
         assert_eq!(LogCategory::OptionChain.prefix(), "option_chain");
     }
@@ -1353,14 +1341,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_build_category_targets_historical_routes_fetcher() {
-        let targets = build_category_targets(LogCategory::Historical);
-        assert!(targets.contains(&"tickvault_core::historical"));
-        assert!(targets.contains(&"tickvault_storage::historical_fetch_marker"));
-        // PR-C (2026-05-26): cross_verify chain deleted; the historical
-        // category now routes only candle_fetcher progress logs.
-    }
+    // PR-D (2026-05-26): historical category routing test retired
+    // alongside the deleted LogCategory::Historical variant.
 
     #[test]
     fn test_build_category_targets_live_ticks_covers_websocket_and_pipeline() {

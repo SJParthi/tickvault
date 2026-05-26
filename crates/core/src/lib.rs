@@ -29,7 +29,9 @@
 //! Config -> Instrument Download -> **Auth** -> WebSocket -> Parse -> Route
 
 pub mod auth;
-pub mod historical;
+// PR-D (2026-05-26): `historical` module deleted — candle_fetcher.rs was
+// the last surviving file (cross_verify chain deleted in PR-C). The
+// entire Dhan historical fetch chain is gone.
 // PR #6a (2026-05-19): index_constituency module RETIRED (4-IDX_I LOCKED_UNIVERSE).
 pub mod instance_lock;
 pub mod instrument;
