@@ -10,7 +10,7 @@
 //!
 //! ## Invariants enforced
 //!
-//! 1. Each underlying's `slot_sec` is in `[50, 59]` (last 10 sec of minute).
+//! 1. Each underlying's `slot_sec` is in `[40, 59]` (last 20 sec of minute).
 //! 2. All `slot_sec` values are distinct across underlyings.
 //! 3. Every `(symbol, security_id, segment)` tuple is unique.
 //! 4. Symbol strings are non-empty and ASCII-only.
@@ -27,11 +27,20 @@ use crate::config::OptionChainUnderlyingEntry;
 use std::collections::HashSet;
 use std::fmt;
 
-/// First valid `slot_sec` (HH:MM:50). Slots earlier than this would
+/// First valid `slot_sec` (HH:MM:40). Slots earlier than this would
 /// fire too far from the next-minute boundary; the snapshot's purpose
 /// is to give the strategy the freshest-possible chain right BEFORE
 /// the new minute starts.
-pub const OPTION_CHAIN_MIN_SLOT_SEC: u32 = 50;
+///
+/// 2026-05-26: widened from `50` → `40` to give the operator headroom
+/// for 5-second spacing across 3 underlyings (e.g. 49/54/59). The
+/// previous `[50, 59]` window only allowed 10 seconds, forcing either
+/// 4-second spacing (which sits at the Dhan rate-limit boundary and
+/// produced ~1 DH-904 per 5 min in live logs) or one slot to fall
+/// outside the window (which is what broke the scheduler on
+/// 2026-05-27 — SENSEX `slot_sec = 49` rejected, scheduler refused
+/// to spawn).
+pub const OPTION_CHAIN_MIN_SLOT_SEC: u32 = 40;
 
 /// Last valid `slot_sec` (HH:MM:59). Going past 59 would cross the
 /// minute boundary and stamp the row with the next minute's `ts`.
@@ -319,14 +328,14 @@ mod tests {
 
     #[test]
     fn test_slot_sec_below_range_rejected() {
-        let underlyings = vec![entry("NIFTY", 13, "IDX_I", 49)];
+        let underlyings = vec![entry("NIFTY", 13, "IDX_I", 39)];
         let err = validate_option_chain_schedule(&underlyings).unwrap_err();
         match err {
             ScheduleError::SlotSecOutOfRange {
                 slot_sec, min, max, ..
             } => {
-                assert_eq!(slot_sec, 49);
-                assert_eq!(min, 50);
+                assert_eq!(slot_sec, 39);
+                assert_eq!(min, 40);
                 assert_eq!(max, 59);
             }
             other => panic!("expected SlotSecOutOfRange, got {other:?}"),
@@ -446,9 +455,39 @@ mod tests {
         // These constants are the schedule contract. Bumping them
         // changes the operator-visible TOML semantics; require a
         // deliberate edit + this test update.
-        assert_eq!(OPTION_CHAIN_MIN_SLOT_SEC, 50);
+        assert_eq!(OPTION_CHAIN_MIN_SLOT_SEC, 40);
         assert_eq!(OPTION_CHAIN_MAX_SLOT_SEC, 59);
         assert_eq!(OPTION_CHAIN_MAX_UNDERLYINGS, 10);
+    }
+
+    /// Regression: 2026-05-27 — SENSEX `slot_sec = 49` (operator bumped
+    /// 50 → 49 on 2026-05-26 to widen S→B→N to 5s) was rejected by the
+    /// `[50, 59]` validator, refusing the scheduler at boot for an
+    /// entire trading day. Widening the window to `[40, 59]` accepts
+    /// the operator's 49/54/59 layout.
+    #[test]
+    fn test_regression_2026_05_27_sensex_slot_49_accepted() {
+        let entries = vec![
+            OptionChainUnderlyingEntry {
+                symbol: "SENSEX".to_string(),
+                security_id: 51,
+                segment: "IDX_I".to_string(),
+                slot_sec: 49,
+            },
+            OptionChainUnderlyingEntry {
+                symbol: "BANKNIFTY".to_string(),
+                security_id: 25,
+                segment: "IDX_I".to_string(),
+                slot_sec: 54,
+            },
+            OptionChainUnderlyingEntry {
+                symbol: "NIFTY".to_string(),
+                security_id: 13,
+                segment: "IDX_I".to_string(),
+                slot_sec: 59,
+            },
+        ];
+        assert!(validate_option_chain_schedule(&entries).is_ok());
     }
 
     #[test]
