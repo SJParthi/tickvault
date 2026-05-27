@@ -31,6 +31,16 @@ crossbeam-channel = { workspace = true }
 # via Debug.
 secrecy = { workspace = true }
 
+[features]
+# Sub-PR #10b-ε of 2026-05-27 daily-universe expansion: gates the
+# `instrument_fetch_audit` table contract (schema constants + DEDUP key +
+# FetchOutcome enum). Mirrors the `tickvault-core` feature gate per
+# `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md` §21
+# — until Sub-PR #10b-ζ ships the DDL + append helpers AND the boot
+# orchestrator wires it, this feature is dormant and the gated code is
+# dead. No default feature.
+daily_universe_fetcher = []
+
 [dev-dependencies]
 criterion = { workspace = true }
 dhat = { workspace = true }
