@@ -67,6 +67,14 @@ pub mod daily_universe_orchestrator;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod boot_time_of_day_guard;
 
+// Sub-PR #11b of 2026-05-27 daily-universe expansion: boot day
+// classifier — Weekend / DeclaredHoliday / Muhurat / RegularTradingDay.
+// Pure function consuming operator-maintained `nse_holidays` +
+// `muhurat_session_dates` lists. No URL fetch (deferred to #11c
+// pending operator URL verification).
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod boot_day_classifier;
+
 // PR #6b (2026-05-19): pub use binary_cache::MappedUniverse RETIRED.
 // PR #6a (2026-05-19): pub use diagnostic::run_instrument_diagnostic RETIRED.
 // PR #6b (2026-05-19): instrument_loader + universe_builder re-exports RETIRED —
