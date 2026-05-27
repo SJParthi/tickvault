@@ -82,6 +82,14 @@ pub mod boot_day_classifier;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod l3_anomaly_check;
 
+// Sub-PR #11d of 2026-05-27 daily-universe expansion: extended boot
+// day classifier covering NSE late-added holidays (additional_holidays)
+// + Sunday Budget sessions (extra_trading_days) + Muhurat timing-
+// pending status. Operator-verified per docs/operator/nse-trading-
+// calendar-2026.md.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod boot_day_classifier_extended;
+
 // PR #6b (2026-05-19): pub use binary_cache::MappedUniverse RETIRED.
 // PR #6a (2026-05-19): pub use diagnostic::run_instrument_diagnostic RETIRED.
 // PR #6b (2026-05-19): instrument_loader + universe_builder re-exports RETIRED —
