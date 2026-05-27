@@ -75,6 +75,13 @@ pub mod boot_time_of_day_guard;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod boot_day_classifier;
 
+// Sub-PR #9b of 2026-05-27 daily-universe expansion: L3 RECONCILE
+// anomaly check — compare today's CSV row count vs yesterday's
+// `instrument_fetch_audit` baseline. Pure function. Z+ defense layer 3.
+// SHA-256 deferred to Sub-PR #9c (needs sha2 workspace dep approval).
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod l3_anomaly_check;
+
 // PR #6b (2026-05-19): pub use binary_cache::MappedUniverse RETIRED.
 // PR #6a (2026-05-19): pub use diagnostic::run_instrument_diagnostic RETIRED.
 // PR #6b (2026-05-19): instrument_loader + universe_builder re-exports RETIRED —
