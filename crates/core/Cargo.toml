@@ -45,6 +45,12 @@ loom = { workspace = true, optional = true }
 [features]
 loom = ["dep:loom"]
 dhat = []
+# Sub-PR #1.5 + #3 of 2026-05-27 daily-universe expansion: gates the
+# CSV-downloader + universe-fetcher code paths. Activation lands in
+# Sub-PR #9 (lifecycle reconciler) + Sub-PR #10 (boot orchestrator) —
+# until then the feature is dormant and the gated code is dead. Per
+# `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md` §21.
+daily_universe_fetcher = []
 
 [dev-dependencies]
 proptest = { workspace = true }
