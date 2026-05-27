@@ -31,6 +31,12 @@ pub mod subscription_planner;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod csv_downloader;
 
+// Sub-PR #4 of 2026-05-27 daily-universe expansion: robust parser for
+// the Dhan Detailed instrument-master CSV. Same feature flag as the
+// downloader — both compose into Sub-PR #10's orchestrator.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod csv_parser;
+
 // PR #6b (2026-05-19): pub use binary_cache::MappedUniverse RETIRED.
 // PR #6a (2026-05-19): pub use diagnostic::run_instrument_diagnostic RETIRED.
 // PR #6b (2026-05-19): instrument_loader + universe_builder re-exports RETIRED —
