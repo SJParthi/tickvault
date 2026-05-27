@@ -399,6 +399,44 @@ pub enum ErrorCode {
     BarMismatch03CrossCheckFailed,
 
     // -----------------------------------------------------------------------
+    // Sub-PR #9 of 2026-05-27 daily-universe expansion: lifecycle-fetch
+    // ErrorCodes for the boot-time CSV → universe-build chain. Emit
+    // sites land in Sub-PR #10 (boot orchestrator). NO production emit
+    // sites in THIS PR — contract stubs only, gated by the cross-ref
+    // test against rule-file mentions.
+    // -----------------------------------------------------------------------
+    /// INSTR-FETCH-01: Detailed CSV fetch hard-failed after retry
+    /// exhaustion. The §4 infinite-retry policy on this code is
+    /// operator-locked — the boot orchestrator keeps retrying with
+    /// escalating Telegram. This variant fires on EVERY attempt past
+    /// the §4 escalation table (Info at attempt 1-3, High at 4-10,
+    /// Critical at 11+). Severity::Critical.
+    InstrFetch01CsvHardFailed,
+
+    /// INSTR-FETCH-02: CSV parse / schema validation failed. The bytes
+    /// passed §18 hardening (Sub-PR #3) but failed §26 robustness
+    /// (Sub-PR #4) — mandatory-field validation triggered the >0.1%
+    /// row failure threshold OR a mandatory header column was missing.
+    /// Severity::Critical — operator must inspect raw CSV before
+    /// retry can succeed.
+    InstrFetch02SchemaValidationFailed,
+
+    /// INSTR-FETCH-03: F&O dangling-reference threshold exceeded.
+    /// More than 0.5% of FUTSTK/OPTSTK derivative rows referenced an
+    /// `UNDERLYING_SECURITY_ID` that didn't resolve to any NSE_EQ row
+    /// in the same CSV. Per Sub-PR #5 + §3 + §26. Severity::Critical
+    /// — boot HALTS until the upstream CSV is consistent.
+    InstrFetch03DanglingReferences,
+
+    /// INSTR-FETCH-04: Universe-size envelope violated. The built
+    /// universe contained `< MIN_DAILY_UNIVERSE_SIZE (100)` OR
+    /// `> MAX_DAILY_UNIVERSE_SIZE (400)` instruments per Sub-PR #7's
+    /// envelope check. Either an upstream extractor returned partial
+    /// data (too small) or a regression let in extra rows (too large).
+    /// Severity::Critical — boot HALTS.
+    InstrFetch04UniverseSizeOutOfBounds,
+
+    // -----------------------------------------------------------------------
     // PR #1 (AWS-lifecycle 14-PR sequence): contract stubs for the future
     // option_chain module. Variants exist so downstream PR #8 can wire
     // its emit sites against stable identifiers. NO production emit sites
@@ -577,6 +615,10 @@ impl ErrorCode {
             Self::BarMismatch01CorrectedFromHistorical => "BAR-MISMATCH-01",
             Self::BarMismatch02CrossCheckInconclusive => "BAR-MISMATCH-02",
             Self::BarMismatch03CrossCheckFailed => "BAR-MISMATCH-03",
+            Self::InstrFetch01CsvHardFailed => "INSTR-FETCH-01",
+            Self::InstrFetch02SchemaValidationFailed => "INSTR-FETCH-02",
+            Self::InstrFetch03DanglingReferences => "INSTR-FETCH-03",
+            Self::InstrFetch04UniverseSizeOutOfBounds => "INSTR-FETCH-04",
             // PR #1 (AWS-lifecycle): option_chain stubs
             Self::OptionChain01FetchFailed => "OPTION-CHAIN-01",
             Self::OptionChain02Dh904Exhausted => "OPTION-CHAIN-02",
@@ -619,7 +661,12 @@ impl ErrorCode {
             | Self::BarMismatch03CrossCheckFailed
             // PR #1 (AWS-lifecycle) — Critical option-chain
             | Self::OptionChain05CacheStaleHaltStrategy
-            | Self::OptionChain08TokenExpiredMidCycle => Severity::Critical,
+            | Self::OptionChain08TokenExpiredMidCycle
+            // Sub-PR #9 — all 4 INSTR-FETCH codes are HALT-class
+            | Self::InstrFetch01CsvHardFailed
+            | Self::InstrFetch02SchemaValidationFailed
+            | Self::InstrFetch03DanglingReferences
+            | Self::InstrFetch04UniverseSizeOutOfBounds => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
             Self::Selftest01Passed
             | Self::Slo01Healthy
@@ -805,6 +852,13 @@ impl ErrorCode {
             | Self::BarMismatch03CrossCheckFailed => {
                 ".claude/rules/project/phase-0-items-15-28-29-error-codes.md"
             }
+            // Sub-PR #9 of 2026-05-27 daily-universe expansion
+            Self::InstrFetch01CsvHardFailed
+            | Self::InstrFetch02SchemaValidationFailed
+            | Self::InstrFetch03DanglingReferences
+            | Self::InstrFetch04UniverseSizeOutOfBounds => {
+                ".claude/rules/project/daily-universe-instr-fetch-error-codes.md"
+            }
             // PR #1 (AWS-lifecycle): option_chain stubs
             Self::OptionChain01FetchFailed
             | Self::OptionChain02Dh904Exhausted
@@ -935,6 +989,11 @@ impl ErrorCode {
             Self::BarMismatch01CorrectedFromHistorical,
             Self::BarMismatch02CrossCheckInconclusive,
             Self::BarMismatch03CrossCheckFailed,
+            // Sub-PR #9 of 2026-05-27 daily-universe expansion
+            Self::InstrFetch01CsvHardFailed,
+            Self::InstrFetch02SchemaValidationFailed,
+            Self::InstrFetch03DanglingReferences,
+            Self::InstrFetch04UniverseSizeOutOfBounds,
             // PR #1 (AWS-lifecycle 14-PR sequence) — option_chain stubs
             Self::OptionChain01FetchFailed,
             Self::OptionChain02Dh904Exhausted,
@@ -1191,7 +1250,7 @@ mod tests {
         // by removing CROSS-VERIFY-01/02/03/04 — cross_verify + post_open_cross_check
         // + post_market_fetch_window + cross_verify_scheduler modules deleted
         // alongside Dhan historical fetch chain.
-        assert_eq!(ErrorCode::all().len(), 93);
+        assert_eq!(ErrorCode::all().len(), 97);
     }
 
     #[test]
@@ -1240,7 +1299,9 @@ mod tests {
                 // PR #1 (AWS-lifecycle 14-PR sequence): option_chain stubs
                 || s.starts_with("OPTION-CHAIN-")
                 // PR #2.5 (AWS-lifecycle): Day OHLC tracker for IDX_I
-                || s.starts_with("INDEX-OHLC-");
+                || s.starts_with("INDEX-OHLC-")
+                // Sub-PR #9 of 2026-05-27 daily-universe expansion
+                || s.starts_with("INSTR-FETCH-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

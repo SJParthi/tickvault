@@ -31,6 +31,65 @@ pub mod subscription_planner;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod csv_downloader;
 
+// Sub-PR #4 of 2026-05-27 daily-universe expansion: robust parser for
+// the Dhan Detailed instrument-master CSV. Same feature flag as the
+// downloader — both compose into Sub-PR #10's orchestrator.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod csv_parser;
+
+// Sub-PR #5 of 2026-05-27 daily-universe expansion: extract the set
+// of unique F&O underlying SecurityIds + cross-validate the dangling-
+// reference invariant from parsed CSV rows.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod fno_underlying_extractor;
+
+// Sub-PR #6 of 2026-05-27 daily-universe expansion: extract every
+// IDX_I INDEX row (NSE indices + 1 BSE SENSEX) per §2 universe scope.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod index_extractor;
+
+// Sub-PR #7 of 2026-05-27 daily-universe expansion: combine the F&O
+// underlyings (Sub-PR #5) + indices (Sub-PR #6) into a unified
+// DailyUniverse with size-envelope enforcement.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod daily_universe;
+
+// Sub-PR #10 of 2026-05-27 daily-universe expansion: chain the
+// CSV parser + extractors + universe builder into a single pure
+// function. Maps each underlying error to the right INSTR-FETCH-*
+// ErrorCode for Telegram routing + CloudWatch tagging.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod daily_universe_orchestrator;
+
+// Sub-PR #11 of 2026-05-27 daily-universe expansion: boot-time-of-day
+// guard per §10 — refuse boot if `now > 08:55 IST` without operator
+// override flag (`--allow-late-boot`). Pure function.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod boot_time_of_day_guard;
+
+// Sub-PR #11b of 2026-05-27 daily-universe expansion: boot day
+// classifier — Weekend / DeclaredHoliday / Muhurat / RegularTradingDay.
+// Pure function consuming operator-maintained `nse_holidays` +
+// `muhurat_session_dates` lists. No URL fetch (deferred to #11c
+// pending operator URL verification).
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod boot_day_classifier;
+
+// Sub-PR #9b of 2026-05-27 daily-universe expansion: L3 RECONCILE
+// anomaly check — compare today's CSV row count vs yesterday's
+// `instrument_fetch_audit` baseline. Pure function. Z+ defense layer 3.
+// SHA-256 deferred to Sub-PR #9c (needs sha2 workspace dep approval).
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod l3_anomaly_check;
+
+// Sub-PR #11d of 2026-05-27 daily-universe expansion: extended boot
+// day classifier covering NSE late-added holidays (additional_holidays)
+// + Sunday Budget sessions (extra_trading_days) + Muhurat timing-
+// pending status. Operator-verified per docs/operator/nse-trading-
+// calendar-2026.md.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod boot_day_classifier_extended;
+
 // PR #6b (2026-05-19): pub use binary_cache::MappedUniverse RETIRED.
 // PR #6a (2026-05-19): pub use diagnostic::run_instrument_diagnostic RETIRED.
 // PR #6b (2026-05-19): instrument_loader + universe_builder re-exports RETIRED —
