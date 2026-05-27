@@ -1011,6 +1011,15 @@ pub const MAX_DAILY_UNIVERSE_SIZE: usize = 400;
 /// streams as a DoS surface.
 pub const MAX_CSV_BODY_BYTES: usize = 50 * 1024 * 1024;
 
+/// Dhan Detailed instrument-master CSV URL (public static file).
+/// Operator-locked 2026-05-27 per rule file §3. Sub-PR #3 consumes this.
+pub const DHAN_DETAILED_CSV_URL: &str =
+    "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"; // APPROVED: infrastructure constant — operator-locked daily-universe expansion 2026-05-27 §3
+
+/// Connect-timeout for the Detailed CSV fetch (Sub-PR #3). Distinct
+/// from the whole-response timeout `INSTRUMENT_FETCH_PER_ATTEMPT_TIMEOUT_SECS`.
+pub const CSV_CONNECT_TIMEOUT_SECS: u64 = 10;
+
 // ---------------------------------------------------------------------------
 // F&O Universe — Index Aliases (FNO symbol → IDX_I symbol)
 // ---------------------------------------------------------------------------
