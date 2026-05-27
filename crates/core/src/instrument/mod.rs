@@ -70,6 +70,16 @@ pub mod daily_universe_orchestrator;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod instr_fetch_retry_policy;
 
+// Sub-PR #10b-β of 2026-05-27 daily-universe expansion: pure-function
+// adapter that maps `(OrchestratorError, attempt)` into a
+// `RetryDecision` carrying the §4 backoff `Duration` + an optional
+// Telegram emit payload (severity, error_code, stage). Bridges
+// Sub-PR #10 (orchestrator chain) with Sub-PR #10b-α (retry policy
+// primitives). Boot orchestrator (Sub-PR #10b proper) owns the
+// `tokio::sleep` + Telegram dispatch side-effects.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod instr_fetch_retry_adapter;
+
 // Sub-PR #11 of 2026-05-27 daily-universe expansion: boot-time-of-day
 // guard per §10 — refuse boot if `now > 08:55 IST` without operator
 // override flag (`--allow-late-boot`). Pure function.
