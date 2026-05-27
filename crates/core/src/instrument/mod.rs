@@ -61,6 +61,15 @@ pub mod daily_universe;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod daily_universe_orchestrator;
 
+// Sub-PR #10b-α of 2026-05-27 daily-universe expansion: pure-function
+// retry policy primitives for the §4 infinite-retry escalation ladder.
+// Boot stays BLOCKED until a fresh validated CSV is in hand — these
+// helpers compute the backoff schedule + Telegram severity tier so the
+// full boot orchestrator (Sub-PR #10b integration) can drive the loop
+// deterministically.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod instr_fetch_retry_policy;
+
 // Sub-PR #11 of 2026-05-27 daily-universe expansion: boot-time-of-day
 // guard per §10 — refuse boot if `now > 08:55 IST` without operator
 // override flag (`--allow-late-boot`). Pure function.
