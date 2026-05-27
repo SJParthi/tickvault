@@ -90,6 +90,15 @@ pub mod l3_anomaly_check;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod boot_day_classifier_extended;
 
+// Sub-PR #11c of 2026-05-27 daily-universe expansion: pure-function
+// helpers to parse the NSE holiday-master JSON date format
+// (`DD-MMM-YYYY`) and cross-check the operator-maintained nse_holidays
+// config list against an externally-fetched set. Best-effort — the NSE
+// endpoint is undocumented and may change; operator config remains
+// authoritative.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod nse_holiday_cross_check;
+
 // Sub-PR #11e of 2026-05-27 daily-universe expansion: boot complete-by
 // 08:45 IST deadline per operator clarification 2026-05-27. Enforces
 // the 15-minute buffer before 09:00 market open. Pure function.

@@ -1020,6 +1020,15 @@ pub const DHAN_DETAILED_CSV_URL: &str =
 /// from the whole-response timeout `INSTRUMENT_FETCH_PER_ATTEMPT_TIMEOUT_SECS`.
 pub const CSV_CONNECT_TIMEOUT_SECS: u64 = 10;
 
+/// NSE holiday-master cross-check URL (operator-verified 2026-05-27 per
+/// `docs/operator/nse-trading-calendar-2026.md` §1c). Sub-PR #11c consumes
+/// this for best-effort cross-validation of the operator-maintained
+/// `nse_holidays` config list. This URL is an undocumented JSON endpoint
+/// — its availability is NOT contractually guaranteed by NSE. Best-effort
+/// only; the authoritative source is the operator-maintained config list.
+pub const DHAN_NSE_HOLIDAY_CROSS_CHECK_URL: &str =
+    "https://www.nseindia.com/api/holiday-master?type=trading"; // APPROVED: infrastructure constant — operator-verified NSE 2026 research 2026-05-27
+
 // ---------------------------------------------------------------------------
 // F&O Universe — Index Aliases (FNO symbol → IDX_I symbol)
 // ---------------------------------------------------------------------------
