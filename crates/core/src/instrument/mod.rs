@@ -48,6 +48,12 @@ pub mod fno_underlying_extractor;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod index_extractor;
 
+// Sub-PR #7 of 2026-05-27 daily-universe expansion: combine the F&O
+// underlyings (Sub-PR #5) + indices (Sub-PR #6) into a unified
+// DailyUniverse with size-envelope enforcement.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod daily_universe;
+
 // PR #6b (2026-05-19): pub use binary_cache::MappedUniverse RETIRED.
 // PR #6a (2026-05-19): pub use diagnostic::run_instrument_diagnostic RETIRED.
 // PR #6b (2026-05-19): instrument_loader + universe_builder re-exports RETIRED —
