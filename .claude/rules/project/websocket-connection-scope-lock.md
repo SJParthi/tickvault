@@ -1,5 +1,7 @@
 # WebSocket Connection Scope Lock — Operator Lock 2026-05-15
 
+> **⚠ ALLOWED-INSTRUMENTS SUPERSEDED 2026-05-27 by [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md):** main-feed subscription expanded from 4 IDX_I SIDs (`LOCKED_UNIVERSE`) to ~250 daily-fetched SIDs (all NSE indices + 1 BSE SENSEX + unique F&O underlyings); all in Quote mode (was Ticker for IDX_I). `SubscriptionScope::Indices4Only` retires; replaced by `SubscriptionScope::DailyUniverse`. The 2-WebSocket lock itself (1 main-feed + 1 order-update) is UNCHANGED. Contents below retained as 2026-05-15 historical audit.
+>
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §I > this file > defaults.
 > **Scope:** PERMANENT. Every Phase. Every PR. Every future Claude/Cowork session.
 > **Operator-locked:** 2026-05-15 (verbatim quote below).

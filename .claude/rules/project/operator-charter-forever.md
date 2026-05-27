@@ -227,6 +227,8 @@ For every plan item / new feature / Telegram message / docs:
 
 ## I. WebSocket connection scope lock (MANDATORY, FOREVER — operator lock 2026-05-15)
 
+> **⚠ ALLOWED-INSTRUMENTS SUPERSEDED 2026-05-27 by [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md):** main-feed expanded from 4 IDX_I SIDs to ~250 daily-fetched SIDs (all NSE indices + 1 BSE SENSEX + unique F&O underlyings, all Quote mode). The 2-WebSocket lock (1 main-feed + 1 order-update FOREVER) is UNCHANGED — only the instrument set on the single main-feed conn expanded per operator approval 2026-05-27. The 2026-05-15 verbatim quote below still binds the 2-WS architecture.
+>
 > Operator verbatim 2026-05-15:
 > "except [for] this 1 connection main feed websocket and order update websocket we will never ever use anything else"
 
