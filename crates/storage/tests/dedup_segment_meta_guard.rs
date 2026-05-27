@@ -143,14 +143,18 @@ fn every_dedup_key_is_listed_here_for_auditing() {
     // #T4 (2026-05-20): market_depth / previous_close / indicator_snapshots
     // / obi_snapshots tables dropped — removes DEDUP_KEY_MARKET_DEPTH,
     // DEDUP_KEY_PREVIOUS_CLOSE, DEDUP_KEY_INDICATORS, DEDUP_KEY_OBI.
-    // The threshold is lowered to 3 — equal to the current
-    // declaration-site count so a single accidental removal still
-    // flips the ratchet.
+    // #T5 (2026-05-26): PR-E removed candle_persistence.rs alongside
+    // the historical_candles table, eliminating its DEDUP_KEY_CANDLES
+    // declaration. Set drops to 2; threshold lowered accordingly.
     //
-    // Current set touching `security_id` (3 declaration sites):
-    //   DEDUP_KEY_TICKS, DEDUP_KEY_CANDLES (candle_persistence),
-    //   DEDUP_KEY_CANDLES (shadow_persistence — shared by all 21 plain
-    //   candle tables).
+    // Current set touching `security_id` (2 declaration sites):
+    //   DEDUP_KEY_TICKS (tick_persistence.rs),
+    //   DEDUP_KEY_CANDLES (shadow_persistence.rs — shared by all 21
+    //   plain candle tables).
+    //
+    // Future Sub-PR #9 of the 2026-05-27 daily-universe expansion will
+    // add `DEDUP_KEY_INSTRUMENT_LIFECYCLE` + `DEDUP_KEY_INSTRUMENT_LIFECYCLE_AUDIT`
+    // — at which point this threshold should rise back to ≥4.
     let decls = collect_dedup_key_declarations();
     let keys_with_security_id: Vec<&str> = decls
         .iter()
@@ -158,10 +162,10 @@ fn every_dedup_key_is_listed_here_for_auditing() {
         .map(|(_, _, name, _)| name.as_str())
         .collect();
     assert!(
-        keys_with_security_id.len() >= 3,
-        "expected at least 3 DEDUP_KEY_* constants touching security_id \
-         (post #T4 misc-table cleanup), got {}: {:?}. A decrease means a \
-         table was removed — verify the removal was intentional.",
+        keys_with_security_id.len() >= 2,
+        "expected at least 2 DEDUP_KEY_* constants touching security_id \
+         (post #T5 candle_persistence removal), got {}: {:?}. A decrease \
+         means a table was removed — verify the removal was intentional.",
         keys_with_security_id.len(),
         keys_with_security_id,
     );
