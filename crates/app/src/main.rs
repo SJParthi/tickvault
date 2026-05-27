@@ -4705,10 +4705,17 @@ fn create_websocket_pool(
     // helper inlined here after `phase2_recovery` module retirement
     // (operator lock 2026-05-15, websocket-connection-scope-lock.md).
     let effective_watchdog_threshold = match config.subscription.scope {
-        // AWS-lifecycle LOCKED (PR #7b) — single-variant enum; 4 IDX_I
-        // SIDs only, IDX_I idle tolerance applies (3s — the expected
-        // 1-3 tick/sec window).
+        // AWS-lifecycle LOCKED (PR #7b) — 4 IDX_I SIDs only, IDX_I idle
+        // tolerance applies (3s — the expected 1-3 tick/sec window).
         tickvault_common::config::SubscriptionScope::Indices4Only => {
+            tickvault_core::websocket::activity_watchdog::WATCHDOG_THRESHOLD_IDX_I_SECS
+        }
+        // Sub-PR #1 of 2026-05-27 — `DailyUniverse` variant introduced;
+        // production code-path activation lands in Sub-PRs #2-#13. Same
+        // IDX_I watchdog threshold applies until #8 tunes it for the
+        // 250-SID mixed universe (indices + NSE_EQ underlyings).
+        // See `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`.
+        tickvault_common::config::SubscriptionScope::DailyUniverse => {
             tickvault_core::websocket::activity_watchdog::WATCHDOG_THRESHOLD_IDX_I_SECS
         }
     };

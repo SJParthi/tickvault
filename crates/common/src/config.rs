@@ -894,6 +894,20 @@ pub enum SubscriptionScope {
     #[default]
     #[serde(rename = "indices_4_only")]
     Indices4Only,
+
+    /// Daily-universe scope (operator lock 2026-05-27 — see
+    /// `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`).
+    /// Subscribe ~250 SIDs daily-fetched from Dhan Detailed CSV: all
+    /// NSE `IDX_I` indices + 1 BSE SENSEX `IDX_I` index + every unique
+    /// `UNDERLYING_SECURITY_ID` referenced by `FUTSTK/OPTSTK/FUTIDX/
+    /// OPTIDX` rows (resolved to NSE_EQ spots). All in Quote mode
+    /// (request code 17, 50-byte response packets carrying day OHLC).
+    /// Target: ~250 SIDs on a single main-feed WebSocket connection
+    /// (Dhan cap = 5,000 SIDs/conn). Fully landed once Sub-PRs
+    /// #2-#13 of the 14-sub-PR sequence ship. Currently NOT the
+    /// `#[default]` — code path activation happens incrementally.
+    #[serde(rename = "daily_universe")]
+    DailyUniverse,
 }
 
 impl SubscriptionScope {
@@ -903,6 +917,7 @@ impl SubscriptionScope {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Indices4Only => "indices_4_only",
+            Self::DailyUniverse => "daily_universe",
         }
     }
 }
@@ -2231,19 +2246,73 @@ mod tests {
         assert_eq!(wrapper.subscription.scope.as_str(), "indices_4_only");
     }
 
-    // PR #7b — SubscriptionScope is a single-variant enum after the
-    // legacy retirement. Any future scope expansion must add a NEW
-    // variant + go through `websocket-connection-scope-lock.md`.
+    // Sub-PR #1 of 2026-05-27 daily-universe expansion — the enum
+    // grew from 1 to 2 variants. Adding/removing variants without
+    // updating this test fails the build (match exhaustiveness).
+    // See `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`.
     #[test]
-    fn test_subscription_scope_has_exactly_one_variant() {
-        // Compile-time guarantee: match must be exhaustive over the
-        // single variant. If a new variant is added without updating
+    fn test_subscription_scope_has_exactly_two_variants() {
+        // Compile-time guarantee: match must be exhaustive. If a
+        // third variant is added or one is removed without updating
         // this test, the build fails.
-        let s = SubscriptionScope::default();
-        let label = match s {
-            SubscriptionScope::Indices4Only => "indices_4_only",
-        };
-        assert_eq!(label, "indices_4_only");
+        for s in [
+            SubscriptionScope::Indices4Only,
+            SubscriptionScope::DailyUniverse,
+        ] {
+            let label = match s {
+                SubscriptionScope::Indices4Only => "indices_4_only",
+                SubscriptionScope::DailyUniverse => "daily_universe",
+            };
+            assert_eq!(label, s.as_str());
+        }
+    }
+
+    // Sub-PR #1 of 2026-05-27 — DailyUniverse variant exists and has
+    // the stable wire-format label "daily_universe". Pinned so any
+    // future rename forces a rule-file edit first.
+    #[test]
+    fn test_subscription_scope_daily_universe_label() {
+        assert_eq!(SubscriptionScope::DailyUniverse.as_str(), "daily_universe");
+    }
+
+    // Sub-PR #1 of 2026-05-27 — `daily_universe` round-trips via figment.
+    #[test]
+    fn test_daily_universe_serde_roundtrip() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let toml_daily = r#"
+            [subscription]
+            scope = "daily_universe"
+            feed_mode = "Quote"
+            subscribe_stock_equities = false
+            stock_atm_strikes_above = 25
+            stock_atm_strikes_below = 25
+            stock_default_atm_fallback_enabled = true
+        "#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            subscription: SubscriptionConfig,
+        }
+        let wrapper: Wrapper = Figment::new()
+            .merge(Toml::string(toml_daily))
+            .extract()
+            .expect("daily_universe scope must round-trip");
+        assert_eq!(wrapper.subscription.scope, SubscriptionScope::DailyUniverse);
+        assert_eq!(wrapper.subscription.scope.as_str(), "daily_universe");
+    }
+
+    // Sub-PR #1 of 2026-05-27 — default is STILL `Indices4Only` after
+    // this PR. Activation of `DailyUniverse` as default lands later
+    // once Sub-PRs #2-#13 wire the supporting code paths (CSV fetch,
+    // lifecycle table, universe builder, etc.). This test fails if
+    // someone flips the default prematurely.
+    #[test]
+    fn test_subscription_scope_default_still_indices4only_sub_pr_1() {
+        assert_eq!(
+            SubscriptionScope::default(),
+            SubscriptionScope::Indices4Only
+        );
     }
 
     // PR #7b — the 3 dead flags (subscribe_*_derivatives,
