@@ -37,6 +37,12 @@ pub mod csv_downloader;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod csv_parser;
 
+// Sub-PR #5 of 2026-05-27 daily-universe expansion: extract the set
+// of unique F&O underlying SecurityIds + cross-validate the dangling-
+// reference invariant from parsed CSV rows.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod fno_underlying_extractor;
+
 // PR #6b (2026-05-19): pub use binary_cache::MappedUniverse RETIRED.
 // PR #6a (2026-05-19): pub use diagnostic::run_instrument_diagnostic RETIRED.
 // PR #6b (2026-05-19): instrument_loader + universe_builder re-exports RETIRED —
