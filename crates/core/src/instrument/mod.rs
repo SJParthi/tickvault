@@ -80,6 +80,15 @@ pub mod instr_fetch_retry_policy;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod instr_fetch_retry_adapter;
 
+// Sub-PR #10b-γ of 2026-05-27 daily-universe expansion: pure-async
+// retry-loop driver that composes the §4 infinite-retry contract. Takes
+// 4 operator-supplied closures (fetch / build / sleep / emit) so unit
+// tests can drive every branch without a tokio runtime. The integration
+// PRs (#10b-δ HTTP wiring, #10b-ε Telegram wiring, #10b-ζ audit row)
+// plug real side effects into this loop.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod instr_fetch_loop;
+
 // Sub-PR #11 of 2026-05-27 daily-universe expansion: boot-time-of-day
 // guard per §10 — refuse boot if `now > 08:55 IST` without operator
 // override flag (`--allow-late-boot`). Pure function.
