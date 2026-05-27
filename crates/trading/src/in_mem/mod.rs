@@ -49,6 +49,7 @@
 pub mod bar_cache;
 pub mod consumer;
 pub mod day_ohlc_tracker;
+pub mod pct_change_cache;
 pub mod prev_day_cache;
 pub mod reset_scheduler;
 pub mod tick_storage;
@@ -56,6 +57,7 @@ pub mod tick_storage;
 pub use bar_cache::{BarCache, CompactBar, bar_cache_clear_before_threshold};
 pub use consumer::run_tick_storage_consumer;
 pub use day_ohlc_tracker::{DayOhlc, DayOhlcTracker};
+pub use pct_change_cache::{PctChange, PctChangeCache};
 pub use prev_day_cache::PrevDayCache;
 pub use reset_scheduler::{run_tick_storage_daily_reset, secs_until_next_market_open_ist};
 pub use tick_storage::{DEFAULT_PER_INSTRUMENT_CAPACITY, TickStorage};
