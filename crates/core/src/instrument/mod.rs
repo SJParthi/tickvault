@@ -61,6 +61,12 @@ pub mod daily_universe;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod daily_universe_orchestrator;
 
+// Sub-PR #11 of 2026-05-27 daily-universe expansion: boot-time-of-day
+// guard per §10 — refuse boot if `now > 08:55 IST` without operator
+// override flag (`--allow-late-boot`). Pure function.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod boot_time_of_day_guard;
+
 // PR #6b (2026-05-19): pub use binary_cache::MappedUniverse RETIRED.
 // PR #6a (2026-05-19): pub use diagnostic::run_instrument_diagnostic RETIRED.
 // PR #6b (2026-05-19): instrument_loader + universe_builder re-exports RETIRED —
