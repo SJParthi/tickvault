@@ -961,6 +961,57 @@ const _: () = {
 pub const PHASE_0_MAIN_FEED_CONNECTION_COUNT: usize = 1;
 
 // ---------------------------------------------------------------------------
+// Sub-PR #2 of 2026-05-27 daily-universe expansion — boot-step deadlines.
+// ---------------------------------------------------------------------------
+// Per `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`
+// section 19 ("Boot-step deadlines + EC2 cron heartbeat"). The §4 infinite-
+// retry policy applies ONLY to the CSV fetch path. Pre-CSV boot steps
+// (auth, IP whitelist, QuestDB DDL) have BOUNDED deadlines so a stuck Dhan
+// auth / unreachable QuestDB / DNS-failed IP-whitelist endpoint fails fast
+// rather than wedging the boot indefinitely.
+//
+// Consumed by Sub-PR #10's boot orchestrator (Step 6c) via
+// `tokio::time::timeout(Duration::from_secs(BOOT_STEP_*_TIMEOUT_SECS), ...)`.
+// Wiring is deferred to #10 so this PR is pure declarative (zero runtime
+// behaviour change).
+
+/// Step 6 (Dhan auth — TOTP -> JWT) total deadline. Includes up to 3 ×
+/// 20s internal retries. Exceeding this fires Severity::Critical Telegram
+/// + BOOT BLOCKS. Per rule file §19 boot-step deadline table.
+pub const BOOT_STEP_AUTH_TIMEOUT_SECS: u64 = 60;
+
+/// Step 6a (Dhan static-IP whitelist `GET /v2/ip/getIP`) deadline.
+/// Exceeding fires Severity::Critical + BOOT BLOCKS. Per rule file §19.
+pub const BOOT_STEP_IP_WHITELIST_TIMEOUT_SECS: u64 = 30;
+
+/// Step 6b (QuestDB DDL — includes new `instrument_lifecycle` +
+/// `instrument_lifecycle_audit` tables in Sub-PR #9) deadline. Exceeding
+/// fires Severity::Critical via `BOOT-01`/`BOOT-02` runbook + BOOT BLOCKS.
+/// Per rule file §19.
+pub const BOOT_STEP_QUESTDB_DDL_TIMEOUT_SECS: u64 = 60;
+
+/// Single-attempt Dhan Detailed-CSV fetch deadline (Sub-PR #3 will consume).
+/// Per rule file §18 hardening contract. The §4 infinite-retry policy
+/// wraps this per-attempt timeout — a single 60s-blocking GET is bounded;
+/// failure → retry per §4 escalation ladder, not a permanent halt.
+pub const INSTRUMENT_FETCH_PER_ATTEMPT_TIMEOUT_SECS: u64 = 60;
+
+/// Maximum daily-universe size (per rule file §2 + §4 + §15). Boot HALTS
+/// if computed universe size is outside `[MIN_DAILY_UNIVERSE_SIZE,
+/// MAX_DAILY_UNIVERSE_SIZE]`. Sub-PR #11 (boot-time-of-day guard) will
+/// enforce; this PR declares the bound.
+pub const MIN_DAILY_UNIVERSE_SIZE: usize = 100;
+
+/// See `MIN_DAILY_UNIVERSE_SIZE`.
+pub const MAX_DAILY_UNIVERSE_SIZE: usize = 400;
+
+/// CSV download body size cap (per rule file §18 hardening contract).
+/// Sub-PR #3 will enforce via `reqwest` bounded read. Expected real-world
+/// CSV is 5-15 MB; 50 MB cap absorbs growth without admitting gigabyte
+/// streams as a DoS surface.
+pub const MAX_CSV_BODY_BYTES: usize = 50 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
 // F&O Universe — Index Aliases (FNO symbol → IDX_I symbol)
 // ---------------------------------------------------------------------------
 
