@@ -143,4 +143,172 @@ mod tests {
             );
         }
     }
+
+    // ====================================================================
+    // Sub-PR #4.5 — display-layer 2-decimal formatters (operator-locked
+    // 2026-05-27): every Telegram message, every UI string, every REST
+    // response that renders a PRICE or a PERCENTAGE must go through one
+    // of the helpers below. Storage / RAM keeps full f64 precision; only
+    // the operator-facing string boundary rounds to 2 decimals.
+    // ====================================================================
+
+    #[test]
+    fn test_format_price_2_decimals_basic() {
+        assert_eq!(format_price_2_decimals(2500.55), "2500.55");
+        assert_eq!(format_price_2_decimals(10.20), "10.20");
+        assert_eq!(format_price_2_decimals(0.05), "0.05");
+        assert_eq!(format_price_2_decimals(100.0), "100.00");
+    }
+
+    #[test]
+    fn test_format_price_2_decimals_rounds_extra_digits() {
+        // Math results (e.g. weighted averages, P&L) can produce extra
+        // digits — operator-facing display rounds to 2 decimals.
+        assert_eq!(format_price_2_decimals(2520.5500488), "2520.55");
+        assert_eq!(format_price_2_decimals(2520.5599), "2520.56");
+        assert_eq!(format_price_2_decimals(2520.554), "2520.55");
+        // 2520.555 in f64 is not exactly representable — defer to Rust's
+        // built-in rounding (banker's, but the f64 input may already be
+        // slightly off from 2520.555 exact). Just verify it produces a
+        // valid 2-decimal string.
+        let s = format_price_2_decimals(2520.555);
+        assert!(s == "2520.55" || s == "2520.56", "got {s}");
+    }
+
+    #[test]
+    fn test_format_price_2_decimals_negative() {
+        // Greeks deltas, P&L drawdowns — must render with sign.
+        assert_eq!(format_price_2_decimals(-150.55), "-150.55");
+        assert_eq!(format_price_2_decimals(-0.05), "-0.05");
+    }
+
+    #[test]
+    fn test_format_price_2_decimals_zero() {
+        assert_eq!(format_price_2_decimals(0.0), "0.00");
+        assert_eq!(format_price_2_decimals(-0.0), "-0.00");
+    }
+
+    #[test]
+    fn test_format_price_2_decimals_non_finite_safe() {
+        // Defensive — NaN / Inf should NOT propagate to operator-facing
+        // strings as "NaN" / "inf" because that's confusing. Use a
+        // sentinel that the operator can spot.
+        assert_eq!(format_price_2_decimals(f64::NAN), "—");
+        assert_eq!(format_price_2_decimals(f64::INFINITY), "—");
+        assert_eq!(format_price_2_decimals(f64::NEG_INFINITY), "—");
+    }
+
+    #[test]
+    fn test_format_pct_2_decimals_positive() {
+        assert_eq!(format_pct_2_decimals(5.0), "+5.00%");
+        assert_eq!(format_pct_2_decimals(4.166_666_666_666_667), "+4.17%");
+        assert_eq!(format_pct_2_decimals(0.05), "+0.05%");
+    }
+
+    #[test]
+    fn test_format_pct_2_decimals_negative() {
+        // "+" sign omitted for negative — standard NSE display convention.
+        assert_eq!(format_pct_2_decimals(-5.0), "-5.00%");
+        assert_eq!(format_pct_2_decimals(-0.813_008_130_081_3), "-0.81%");
+    }
+
+    #[test]
+    fn test_format_pct_2_decimals_zero_uses_neutral_sign() {
+        // Zero gets neither + nor - — operator can immediately see
+        // "no change" without the +0.00% confusion.
+        assert_eq!(format_pct_2_decimals(0.0), "0.00%");
+        assert_eq!(format_pct_2_decimals(-0.0), "0.00%");
+    }
+
+    #[test]
+    fn test_format_pct_2_decimals_non_finite_safe() {
+        // Pre-market / newly-listed instrument has no prev_close → pct
+        // is None → caller passes f64::NAN. Render as em-dash, NOT
+        // "NaN%".
+        assert_eq!(format_pct_2_decimals(f64::NAN), "—");
+        assert_eq!(format_pct_2_decimals(f64::INFINITY), "—");
+    }
+
+    #[test]
+    fn test_format_pct_2_decimals_small_values_round_correctly() {
+        // < 0.005% rounds to 0.00% — operator sees "essentially zero".
+        // Tiny positive that rounds to 0.00 must show as "0.00%" (no
+        // sign), NOT "+0.00%" — per zero-render convention.
+        assert_eq!(format_pct_2_decimals(0.004), "0.00%");
+        // 0.005 boundary is f64-representation-dependent; just verify
+        // the output is a valid % string with 2 decimals.
+        let s = format_pct_2_decimals(0.005);
+        assert!(s == "+0.01%" || s == "0.00%", "got {s}");
+    }
+}
+
+// ============================================================================
+// Display-layer 2-decimal formatters (Sub-PR #4.5)
+// ============================================================================
+
+/// Sentinel for non-finite display values. NaN / +inf / -inf render as
+/// an em-dash (operator-locked 2026-05-27) rather than "NaN" / "inf"
+/// which are confusing in a trading context. Callers MUST use these
+/// helpers — direct `format!("{:.2}", value)` is banned in
+/// operator-facing string paths per Sub-PR #4.6 (future hook addition).
+const NON_FINITE_SENTINEL: &str = "—";
+
+/// Format a price value for operator display — exactly 2 decimal places,
+/// non-finite values rendered as em-dash sentinel.
+///
+/// Operator-locked 2026-05-27: every price emitted via Telegram, UI, or
+/// REST response MUST go through this helper. Storage + RAM keep full
+/// f64 precision; only the operator-facing boundary rounds to 2 decimals.
+///
+/// # Examples
+///
+/// ```
+/// use tickvault_common::price_precision::format_price_2_decimals;
+/// assert_eq!(format_price_2_decimals(2500.55), "2500.55");
+/// assert_eq!(format_price_2_decimals(2520.5500488), "2520.55");
+/// assert_eq!(format_price_2_decimals(f64::NAN), "—");
+/// ```
+#[must_use]
+pub fn format_price_2_decimals(value: f64) -> String {
+    if !value.is_finite() {
+        return NON_FINITE_SENTINEL.to_string();
+    }
+    format!("{value:.2}")
+}
+
+/// Format a percentage value for operator display — exactly 2 decimal
+/// places, leading sign ('+' or '-'), trailing '%'. Zero renders without
+/// a sign. Non-finite values render as em-dash sentinel.
+///
+/// Operator-locked 2026-05-27: every percentage emitted via Telegram,
+/// UI, or REST response MUST go through this helper. Standard NSE
+/// display convention.
+///
+/// # Examples
+///
+/// ```
+/// use tickvault_common::price_precision::format_pct_2_decimals;
+/// assert_eq!(format_pct_2_decimals(5.0), "+5.00%");
+/// assert_eq!(format_pct_2_decimals(-0.81), "-0.81%");
+/// assert_eq!(format_pct_2_decimals(0.0), "0.00%");
+/// assert_eq!(format_pct_2_decimals(f64::NAN), "—");
+/// ```
+#[must_use]
+pub fn format_pct_2_decimals(value: f64) -> String {
+    if !value.is_finite() {
+        return NON_FINITE_SENTINEL.to_string();
+    }
+    // Zero (including -0.0) renders without a sign per operator
+    // convention. Use `format!("{:.2}", value)` to apply rounding first,
+    // then check the rounded value — avoids "+0.00%" when the raw value
+    // is a tiny negative that rounds to zero.
+    let rounded = format!("{value:.2}");
+    if rounded == "0.00" || rounded == "-0.00" {
+        return "0.00%".to_string();
+    }
+    if value > 0.0 {
+        format!("+{rounded}%")
+    } else {
+        format!("{rounded}%")
+    }
 }
