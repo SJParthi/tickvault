@@ -1398,6 +1398,62 @@ rules:
 
 
   # -----------------------------------------------------------------------
+  # Sub-PR #9 of 2026-05-27 daily-universe expansion — fetch chain
+  # -----------------------------------------------------------------------
+
+  - name: instr-fetch-01-csv-hard-failed-escalate
+    match:
+      code: INSTR-FETCH-01
+    action: escalate
+    runbook_path: .claude/rules/project/daily-universe-instr-fetch-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      INSTR-FETCH-01 = Detailed CSV fetch hard-failed past §4 retry
+      ladder. Severity::Critical. Operator inspects Dhan CDN health
+      + considers --operator-acknowledge-stale-csv override.
+
+  - name: instr-fetch-02-schema-validation-failed-escalate
+    match:
+      code: INSTR-FETCH-02
+    action: escalate
+    runbook_path: .claude/rules/project/daily-universe-instr-fetch-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      INSTR-FETCH-02 = CSV parser rejected the body. Severity::Critical.
+      Either missing header, non-UTF-8, or >0.1% row failures.
+      Operator inspects raw CSV via curl; possible Dhan schema break.
+
+  - name: instr-fetch-03-dangling-references-escalate
+    match:
+      code: INSTR-FETCH-03
+    action: escalate
+    runbook_path: .claude/rules/project/daily-universe-instr-fetch-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      INSTR-FETCH-03 = >0.5% of FUTSTK/OPTSTK rows had dangling
+      UNDERLYING_SECURITY_ID. Severity::Critical. Possible Dhan-side
+      timing or our parser regression dropping NSE_EQ rows below the
+      0.1% threshold.
+
+  - name: instr-fetch-04-universe-size-out-of-bounds-escalate
+    match:
+      code: INSTR-FETCH-04
+    action: escalate
+    runbook_path: .claude/rules/project/daily-universe-instr-fetch-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      INSTR-FETCH-04 = computed universe size outside [100, 400].
+      Severity::Critical. Either upstream extractor returned partial
+      data (below) OR a regression let in extra rows (above).
+      Operator runs --dry-run-universe to inspect each extractor's
+      contribution.
+
+
+  # -----------------------------------------------------------------------
   # Day OHLC tracker for IDX_I (post 2026-05-26 — pre-open buffer removed)
   # -----------------------------------------------------------------------
 
