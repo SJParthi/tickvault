@@ -89,6 +89,15 @@ pub mod instr_fetch_retry_adapter;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod instr_fetch_loop;
 
+// Sub-PR #10b-δ of 2026-05-27 daily-universe expansion: production
+// runner that drives the §4 infinite-retry loop with real
+// `tokio::time::sleep` + structured tracing per ErrorCode severity.
+// Wires Sub-PR #10b-γ (loop driver) + Sub-PR #10 (build) + Sub-PR #10b-β
+// (retry decision) into one entry-point. Telegram dispatch + audit row
+// land in #10b-ε / #10b-ζ.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod instr_fetch_runner;
+
 // Sub-PR #11 of 2026-05-27 daily-universe expansion: boot-time-of-day
 // guard per §10 — refuse boot if `now > 08:55 IST` without operator
 // override flag (`--allow-late-boot`). Pure function.
