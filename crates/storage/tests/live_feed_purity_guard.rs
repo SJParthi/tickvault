@@ -134,20 +134,31 @@ fn live_feed_purity_backfill_module_stays_deleted() {
 
 #[test]
 fn live_feed_purity_backfill_mod_declaration_stays_removed() {
+    // PR-E (2026-05-26) deleted the entire `crates/core/src/historical/`
+    // directory. Absent file = strictly stronger guarantee than
+    // "file exists without `pub mod backfill`". Tolerate both states:
+    // - file absent (current state — historical/ deleted)
+    // - file present but does NOT contain `pub mod backfill`
     let historical_mod = workspace_root().join("crates/core/src/historical/mod.rs");
-    let content = std::fs::read_to_string(&historical_mod)
-        .expect("historical mod.rs must exist and be readable");
-    let live_decl = content.lines().any(|line| {
-        let trimmed = line.trim();
-        !trimmed.starts_with("//") && trimmed.contains("pub mod backfill")
-    });
-    assert!(
-        !live_decl,
-        "LIVE-FEED-PURITY violation — `pub mod backfill` has been re-added \
-         to `{}`. Parthiban directive (2026-04-17): the BackfillWorker \
-         module is DELETED. Remove the declaration.",
-        historical_mod.display()
-    );
+    match std::fs::read_to_string(&historical_mod) {
+        Err(_) => {
+            // historical/ directory absent — backfill module cannot
+            // possibly exist. Test passes trivially.
+        }
+        Ok(content) => {
+            let live_decl = content.lines().any(|line| {
+                let trimmed = line.trim();
+                !trimmed.starts_with("//") && trimmed.contains("pub mod backfill")
+            });
+            assert!(
+                !live_decl,
+                "LIVE-FEED-PURITY violation — `pub mod backfill` has been re-added \
+                 to `{}`. Parthiban directive (2026-04-17): the BackfillWorker \
+                 module is DELETED. Remove the declaration.",
+                historical_mod.display()
+            );
+        }
+    }
 }
 
 // PR-C (2026-05-26): cross_verify module DELETED entirely — purity guard
