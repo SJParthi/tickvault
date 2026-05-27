@@ -90,6 +90,12 @@ pub mod l3_anomaly_check;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod boot_day_classifier_extended;
 
+// Sub-PR #11e of 2026-05-27 daily-universe expansion: boot complete-by
+// 08:45 IST deadline per operator clarification 2026-05-27. Enforces
+// the 15-minute buffer before 09:00 market open. Pure function.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod boot_complete_by_guard;
+
 // PR #6b (2026-05-19): pub use binary_cache::MappedUniverse RETIRED.
 // PR #6a (2026-05-19): pub use diagnostic::run_instrument_diagnostic RETIRED.
 // PR #6b (2026-05-19): instrument_loader + universe_builder re-exports RETIRED —
