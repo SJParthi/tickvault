@@ -81,6 +81,13 @@ pub mod boot_probe;
 // + depth_rebalance_audit modules DELETED. Audit tables stay on disk
 // per SEBI 5y retention.
 pub mod disk_health_watcher;
+// Sub-PR #10b-ε (2026-05-27): instrument_fetch_audit table contract —
+// schema constants + DEDUP key + FetchOutcome enum. Feature-gated under
+// `daily_universe_fetcher` per
+// `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`
+// §21. DDL + append helpers + Row struct land in Sub-PR #10b-ζ.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod instrument_fetch_audit_persistence;
 // PR #3 (2026-05-19): `greeks_persistence` module DELETED. greeks
 // pipeline retired alongside the indices-only universe. The
 // option_greeks / pcr_snapshots / dhan_option_chain_raw / greeks_verification
