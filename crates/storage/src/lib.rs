@@ -93,6 +93,11 @@ pub mod instrument_fetch_audit_persistence;
 // rule §21. DDL + Row + append helpers land in follow-up sub-PRs.
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod instrument_lifecycle_persistence;
+// Daily lifecycle reconciler — PURE decision logic (§5/§6/§23). The app
+// boot orchestrator owns the I/O loop and consumes these pure functions.
+// Feature-gated per rule §21.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod lifecycle_reconciler;
 // PR #3 (2026-05-19): `greeks_persistence` module DELETED. greeks
 // pipeline retired alongside the indices-only universe. The
 // option_greeks / pcr_snapshots / dhan_option_chain_raw / greeks_verification
