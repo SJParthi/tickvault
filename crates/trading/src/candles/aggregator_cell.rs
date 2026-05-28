@@ -106,6 +106,14 @@ pub struct LiveCandleState {
     pub oi: i64,
     /// Number of ticks folded into this bucket.
     pub tick_count: u32,
+    /// Previous-day close baseline captured live from the tick's
+    /// `day_close` field (Dhan's Quote-packet prev-day close — static per
+    /// trading day, blank pre-market, populated from 09:15 IST). Last
+    /// non-zero value seen wins, so a pre-market `0` never clobbers a real
+    /// baseline. Feeds `close_pct_from_prev_day` at seal — no QuestDB /
+    /// PrevDayCache dependency (operator decision 2026-05-28: take the
+    /// prev-day close straight from the ticks `close` column).
+    pub prev_day_close: f64,
     /// `close - prev_day.close` / `prev_day.close` * 100.0. Stamped at
     /// seal time per locked decision L-H6.
     pub close_pct_from_prev_day: f64,
@@ -132,6 +140,7 @@ impl LiveCandleState {
             bucket_start_cumulative: 0,
             oi: 0,
             tick_count: 0,
+            prev_day_close: 0.0,
             close_pct_from_prev_day: 0.0,
             oi_pct_from_prev_day: 0.0,
             volume_pct_from_prev_day: 0.0,
@@ -200,6 +209,14 @@ impl LiveCandleState {
             bucket_start_cumulative,
             oi: i64::from(tick.open_interest),
             tick_count: 1,
+            // Prev-day close baseline from the live Quote `close` field.
+            // `0.0` pre-market (Dhan ships it blank until 09:15) — the
+            // first 09:15+ tick supplies the real value via fold_in_bucket.
+            prev_day_close: if tick.day_close > 0.0 {
+                tickvault_common::price_precision::f32_to_f64_clean(tick.day_close)
+            } else {
+                0.0
+            },
             close_pct_from_prev_day: 0.0,
             oi_pct_from_prev_day: 0.0,
             volume_pct_from_prev_day: 0.0,
@@ -227,6 +244,12 @@ impl LiveCandleState {
         self.volume = u64::from(tick.volume).saturating_sub(self.bucket_start_cumulative);
         self.oi = i64::from(tick.open_interest);
         self.tick_count = self.tick_count.saturating_add(1);
+        // Keep the last non-zero prev-day close (Quote `close`). A blank
+        // pre-market 0 must never clobber a real baseline captured earlier.
+        if tick.day_close > 0.0 {
+            self.prev_day_close =
+                tickvault_common::price_precision::f32_to_f64_clean(tick.day_close);
+        }
     }
 }
 
@@ -511,6 +534,28 @@ mod tests {
         assert_eq!(s.volume, 50);
         assert_eq!(s.oi, 1_000);
         assert_eq!(s.tick_count, 1);
+    }
+
+    #[test]
+    fn test_prev_day_close_captured_from_tick_and_not_clobbered_by_premarket_zero() {
+        // PR-4b: prev_day_close comes live from tick.day_close (Dhan Quote
+        // `close` field). A later pre-market tick with day_close=0 must NOT
+        // wipe a real baseline captured earlier.
+        let cell = AggregatorCell::empty();
+        // First tick carries a real prev-day close (e.g. 09:15+).
+        let mut t1 = mk_tick(1_779_354_960, 100.0, 50, 1_000);
+        t1.day_close = 95.5;
+        cell.consume_tick(TfIndex::M1, &t1, 0);
+        assert_eq!(cell.snapshot(TfIndex::M1).prev_day_close, 95.5);
+        // Subsequent in-bucket tick with day_close=0 must keep 95.5.
+        let mut t2 = mk_tick(1_779_354_975, 101.0, 70, 1_010);
+        t2.day_close = 0.0;
+        cell.consume_tick(TfIndex::M1, &t2, 0);
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).prev_day_close,
+            95.5,
+            "pre-market 0 must not clobber the captured baseline"
+        );
     }
 
     #[test]

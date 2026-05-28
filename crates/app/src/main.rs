@@ -5554,9 +5554,15 @@ fn spawn_engine_b_aggregator(
                         &tick,
                         tick.exchange_segment_code,
                         |tf, mut state| {
-                            let refs = prev_day_cache_for_agg
+                            let mut refs = prev_day_cache_for_agg
                                 .lookup(tick.security_id, tick.exchange_segment_code)
                                 .unwrap_or_default();
+                            // Operator decision 2026-05-28: take the prev-day
+                            // close straight from the live ticks `close`
+                            // column (captured into the candle state), not the
+                            // QuestDB PrevDayCache (which is empty in the
+                            // Engine-B runtime). Drives close_pct_from_prev_day.
+                            refs.prev_day_close = state.prev_day_close;
                             stamp_seal_pct_fields(&mut state, refs);
                             let seal = BufferedSeal::new(
                                 tick.security_id,
@@ -5657,9 +5663,12 @@ fn spawn_engine_b_aggregator(
             let mut sealed: u64 = 0;
             let mut dropped: u64 = 0;
             agg_for_boundary.force_seal_all(|security_id, segment_code, tf, mut state| {
-                let refs = prev_day_cache_for_boundary
+                let mut refs = prev_day_cache_for_boundary
                     .lookup(security_id, segment_code)
                     .unwrap_or_default();
+                // Live prev-day close from the candle state (see per-tick
+                // seal site above) — operator decision 2026-05-28.
+                refs.prev_day_close = state.prev_day_close;
                 stamp_seal_pct_fields(&mut state, refs);
                 let seal = BufferedSeal::new(security_id, segment_code, tf, state);
                 if sender.try_send(seal).is_err() {

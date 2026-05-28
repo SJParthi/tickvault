@@ -83,6 +83,14 @@ pub struct ShadowSealRow {
     pub oi: i64,
     /// `LiveCandleState::tick_count` (`u32`) widened to `i64`.
     pub tick_count: i64,
+    /// `LiveCandleState::close_pct_from_prev_day` — already `f64`. The
+    /// seal-time price % vs the previous-day close (sourced live from the
+    /// tick `close` column). `0.0` pre-market / on day-1 when no prev-day
+    /// close is available yet. Lands in the `close_pct_from_prev_day`
+    /// DOUBLE column. (oi_pct / volume_pct are intentionally NOT persisted
+    /// — spot instruments have no OI and indices no volume, per operator
+    /// decision 2026-05-28.)
+    pub close_pct_from_prev_day: f64,
 }
 
 impl ShadowSealRow {
@@ -118,6 +126,7 @@ impl ShadowSealRow {
             volume: volume_i64,
             oi: seal.state.oi,
             tick_count: i64::from(seal.state.tick_count),
+            close_pct_from_prev_day: seal.state.close_pct_from_prev_day,
         }
     }
 }
@@ -148,6 +157,30 @@ mod tests {
         state.oi = 50_000;
         state.tick_count = 5;
         BufferedSeal::new(sid, seg, tf, state)
+    }
+
+    #[test]
+    fn test_from_buffered_seal_carries_close_pct_from_prev_day() {
+        // PR-4b: the seal-time price % must flow from LiveCandleState into
+        // the persisted row (it lands in the close_pct_from_prev_day DOUBLE
+        // column). 105 close vs 100 prev-day close ⇒ +5.0%.
+        let mut state = LiveCandleState::empty();
+        state.bucket_start_ist_secs = 1_716_000_900;
+        state.close = 105.0;
+        state.prev_day_close = 100.0;
+        state.close_pct_from_prev_day = 5.0;
+        let seal = BufferedSeal::new(13, EXCHANGE_SEGMENT_NSE_EQ, TfIndex::M1, state);
+        let row = ShadowSealRow::from_buffered_seal(&seal);
+        assert!((row.close_pct_from_prev_day - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_from_buffered_seal_close_pct_defaults_zero_premarket() {
+        // Pre-market / day-1: no prev-day close ⇒ pct stays 0.0 (never NaN).
+        let row =
+            ShadowSealRow::from_buffered_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0));
+        assert_eq!(row.close_pct_from_prev_day, 0.0);
+        assert!(!row.close_pct_from_prev_day.is_nan());
     }
 
     #[test]
