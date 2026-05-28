@@ -82,6 +82,11 @@ pub mod apply_reconcile_plan;
 // Feature-gated §21; the HTTP-fetch/retry/main.rs spawn is a follow-up.
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod lifecycle_reconcile_orchestrator;
+// Outer daily-universe boot orchestrator: §4 fetch-runner → reconcile →
+// terminal fetch-audit, capturing CSV SHA-256 provenance. Feature-gated
+// §21; the main.rs Step-6c task spawn is the final wiring PR.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod daily_universe_boot;
 // 2026-05-25 — Crash-recovery REHYDRATE of the option-chain current-
 // expiry cache from QuestDB's `option_chain_minute_snapshot` table.
 // See `option_chain_cache_loader.rs` module docs for the 3-tier
