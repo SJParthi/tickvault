@@ -2174,6 +2174,87 @@ async fn main() -> Result<()> {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Step 6c (go-live PR-1 of the daily-universe sequence) — daily-universe
+    // instrument fetch. Feature-gated by `daily_universe_fetcher`
+    // (`daily-universe-scope-expansion-2026-05-27.md` §21); the prod default
+    // flip is the final PR of this sequence. When compiled in, download the
+    // Dhan Detailed CSV, build the ~250-SID universe, and reconcile it into the
+    // instrument_lifecycle / instrument_lifecycle_audit / instrument_fetch_audit
+    // tables.
+    //
+    // FAIL-CLOSED per operator §4 lock: infinite retry (max_attempts = None)
+    // with escalating Telegram at attempts 4/11/21; boot BLOCKS until a fresh,
+    // validated CSV is in hand. A reconcile/audit error (QuestDB) HALTS boot
+    // rather than proceeding on unknown state. QuestDB readiness is confirmed
+    // above. The scope-aware WS subscription that actually streams the ~250
+    // SIDs lands in the next PR (the planner does not consume DailyUniverse
+    // yet), and the prod default flip is the PR after that.
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "daily_universe_fetcher")]
+    {
+        use anyhow::Context;
+        use std::sync::Arc;
+        use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+        use tickvault_core::instrument::csv_downloader::CsvDownloader;
+        use tickvault_storage::instrument_fetch_audit_persistence::ensure_instrument_fetch_audit_table;
+        use tickvault_storage::instrument_lifecycle_persistence::{
+            ensure_instrument_lifecycle_audit_table, ensure_instrument_lifecycle_table,
+        };
+
+        info!(
+            "Step 6c: daily-universe instrument fetch (feature daily_universe_fetcher ON, fail-closed §4)"
+        );
+
+        // Idempotent CREATE TABLE IF NOT EXISTS for the 3 lifecycle/audit
+        // tables — run_daily_universe_boot's downstream writers assume these
+        // exist (they do not self-ensure).
+        ensure_instrument_lifecycle_table(&config.questdb).await;
+        ensure_instrument_lifecycle_audit_table(&config.questdb).await;
+        ensure_instrument_fetch_audit_table(&config.questdb).await;
+
+        // IST wall-clock nanoseconds (host-clock based) per the
+        // instrument_lifecycle_persistence convention. Derived from a single
+        // `now_utc` so `now` and `today-midnight` are consistent.
+        let now_utc = chrono::Utc::now();
+        let offset_nanos = i64::from(IST_UTC_OFFSET_SECONDS) * 1_000_000_000;
+        let now_ist_nanos = now_utc.timestamp_nanos_opt().unwrap_or(0) + offset_nanos;
+        let now_ist = now_utc + chrono::TimeDelta::seconds(i64::from(IST_UTC_OFFSET_SECONDS));
+        let today_ist_nanos = now_ist
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .and_then(|midnight| midnight.and_utc().timestamp_nanos_opt())
+            .unwrap_or(now_ist_nanos);
+
+        let downloader =
+            Arc::new(CsvDownloader::new().context("Step 6c: CsvDownloader init failed")?);
+        let fetch_fn = move |_attempt: u32| {
+            let downloader = Arc::clone(&downloader);
+            async move { downloader.fetch_csv().await }
+        };
+        // §4: infinite retry (None) — boot blocks until a fresh CSV is in hand.
+        // dry_run = false: write real lifecycle/audit rows.
+        let outcome = tickvault_app::daily_universe_boot::run_daily_universe_boot(
+            &config.questdb,
+            fetch_fn,
+            now_ist_nanos,
+            today_ist_nanos,
+            false,
+            None,
+        )
+        .await
+        .context("Step 6c: daily-universe boot failed (fail-closed §4) — halting")?;
+
+        info!(
+            universe_size = outcome.universe_size,
+            total_rows = outcome.total_rows,
+            attempts_used = outcome.attempts_used,
+            upserted = outcome.reconcile.apply.upserted,
+            expired = outcome.reconcile.apply.expired,
+            "Step 6c: daily universe built + lifecycle reconciled"
+        );
+    }
+
     // Candle-engine re-architecture #T1b — drop the legacy candle objects
     // (Engine A `candles_1s` base table + Engine C's 9 `candles_<tf>`
     // materialized views + the retired Wave-6 `candles_<tf>_shadow`
