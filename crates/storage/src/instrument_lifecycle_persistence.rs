@@ -693,6 +693,99 @@ pub async fn append_instrument_lifecycle_audit_row(
     Ok(())
 }
 
+// ============================================================================
+// instrument_lifecycle UPDATE (state-flip for expiry / reactivation)
+// ============================================================================
+
+/// Build the UPDATE statement that flips an `instrument_lifecycle` row's
+/// state columns WITHOUT rewriting the full 24-column row.
+///
+/// Used by the daily reconciler for DISAPPEARANCE transitions
+/// (`Expired` / `SegmentMoved`): the instrument is no longer in today's
+/// CSV, so there are no fresh attribute values — a full-row UPSERT would
+/// wipe `underlying_security_id` / `expiry_date` / etc. This mirrors the
+/// I-P1-08 `mark_missing_as_expired` precedent (UPDATE, not re-insert).
+///
+/// `lifecycle_state` is NOT part of the DEDUP key (which is
+/// `ts, security_id, exchange_segment`), so updating it in place is
+/// safe. The WHERE clause is the I-P1-11 composite key.
+///
+/// `exchange_segment` is sanitized; `new_state` is a static enum string;
+/// numerics are typed — no injection surface.
+#[must_use]
+pub fn build_lifecycle_state_update_sql(
+    security_id: i64,
+    exchange_segment: &str,
+    new_state: LifecycleState,
+    expired_date_nanos: i64,
+    last_update_ts_nanos: i64,
+) -> String {
+    let segment = sanitize_audit_string(exchange_segment);
+    // `state` is NOT sanitized: it is a compile-time `&'static str` from
+    // `LifecycleState::as_str()` (one of 5 lowercase snake_case constants),
+    // provably free of SQL-breaking characters — same convention as the
+    // SYMBOL enum labels in the append helpers. Only caller-supplied
+    // free-text (`exchange_segment`) is sanitized.
+    let state = new_state.as_str();
+    let expired_micros = expired_date_nanos / 1_000;
+    let last_update_micros = last_update_ts_nanos / 1_000;
+    format!(
+        "UPDATE {QUESTDB_TABLE_INSTRUMENT_LIFECYCLE} \
+         SET lifecycle_state = '{state}', expired_date = {expired_micros}, \
+         last_update_ts = {last_update_micros} \
+         WHERE security_id = {security_id} AND exchange_segment = '{segment}';"
+    )
+}
+
+/// Flip an `instrument_lifecycle` row's state in place (expiry /
+/// segment-move / reactivation-without-fresh-attrs). Cold path — called
+/// by the daily reconciler per disappearance transition.
+///
+/// # Errors
+///
+/// Propagates the `reqwest` transport error, or returns `Err` on a
+/// non-2xx `/exec` response.
+pub async fn update_lifecycle_state(
+    questdb_config: &QuestDbConfig,
+    security_id: i64,
+    exchange_segment: &str,
+    new_state: LifecycleState,
+    expired_date_nanos: i64,
+    last_update_ts_nanos: i64,
+) -> anyhow::Result<()> {
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
+        .build()?;
+    let sql = build_lifecycle_state_update_sql(
+        security_id,
+        exchange_segment,
+        new_state,
+        expired_date_nanos,
+        last_update_ts_nanos,
+    );
+    let resp = client
+        .get(&base_url)
+        .query(&[("query", sql.as_str())])
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body: String = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect();
+        anyhow::bail!("instrument_lifecycle UPDATE non-2xx ({status}): {body}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1277,5 +1370,102 @@ mod tests {
         row.field_deltas = "{\"lot_size\":[0,250]}";
         let result = append_instrument_lifecycle_audit_row(&cfg, &row).await;
         assert!(result.is_err(), "transport error path must propagate");
+    }
+
+    // ========================================================================
+    // update_lifecycle_state (state-flip) tests
+    // ========================================================================
+
+    #[test]
+    fn test_build_lifecycle_state_update_sql_shape_and_micros() {
+        let sql = build_lifecycle_state_update_sql(
+            99887,
+            "NSE_EQ",
+            LifecycleState::ExpiredFromFno,
+            1_700_100_000_000_000_000,
+            1_700_000_000_000_000_000,
+        );
+        assert!(sql.starts_with("UPDATE instrument_lifecycle SET"));
+        assert!(sql.contains("lifecycle_state = 'expired_from_fno'"));
+        // nanos → micros (year-9999 guard).
+        assert!(
+            sql.contains("expired_date = 1700100000000000"),
+            "expired_date must be micros: {sql}"
+        );
+        assert!(
+            sql.contains("last_update_ts = 1700000000000000"),
+            "last_update_ts must be micros: {sql}"
+        );
+        // I-P1-11 composite WHERE key.
+        assert!(sql.contains("WHERE security_id = 99887 AND exchange_segment = 'NSE_EQ'"));
+    }
+
+    #[test]
+    fn test_build_lifecycle_state_update_sql_does_not_touch_dedup_key_columns() {
+        // The UPDATE must only set lifecycle_state / expired_date /
+        // last_update_ts — NEVER the DEDUP key columns (ts, security_id,
+        // exchange_segment). Setting a key column would re-identify the row.
+        // Parse each `SET col = ...` assignment's LHS precisely (substring
+        // checks would false-trip: "last_update_ts" contains "ts").
+        let sql = build_lifecycle_state_update_sql(1, "NSE_EQ", LifecycleState::Active, 0, 0);
+        let set_clause = sql
+            .split("SET")
+            .nth(1)
+            .and_then(|s| s.split("WHERE").next())
+            .expect("SET ... WHERE present");
+        let allowed = ["lifecycle_state", "expired_date", "last_update_ts"];
+        for assignment in set_clause.split(',') {
+            let lhs = assignment
+                .split('=')
+                .next()
+                .map(str::trim)
+                .unwrap_or_default();
+            assert!(
+                allowed.contains(&lhs),
+                "SET assigns unexpected column `{lhs}` — must be one of {allowed:?} \
+                 (never a DEDUP-key column)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_lifecycle_state_update_sql_sanitizes_segment_injection() {
+        let sql = build_lifecycle_state_update_sql(
+            1,
+            "'); DROP TABLE instrument_lifecycle;--",
+            LifecycleState::ExpiredIndex,
+            0,
+            0,
+        );
+        assert!(
+            !sql.contains("DROP TABLE instrument_lifecycle;"),
+            "segment injection must be neutralized: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_build_lifecycle_state_update_sql_renders_each_state() {
+        for st in LifecycleState::all() {
+            let sql = build_lifecycle_state_update_sql(1, "NSE_EQ", st, 0, 0);
+            assert!(
+                sql.contains(&format!("lifecycle_state = '{}'", st.as_str())),
+                "must render state {st:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_lifecycle_state_returns_err_when_questdb_unreachable() {
+        let cfg = cfg_unreachable();
+        let result = update_lifecycle_state(
+            &cfg,
+            99887,
+            "NSE_EQ",
+            LifecycleState::ExpiredFromFno,
+            1_700_100_000_000_000_000,
+            1_700_000_000_000_000_000,
+        )
+        .await;
+        assert!(result.is_err(), "must propagate transport error");
     }
 }
