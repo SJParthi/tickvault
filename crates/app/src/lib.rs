@@ -67,6 +67,11 @@ pub mod lifecycle_reconcile_plan;
 pub mod observability;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod today_instrument;
+// Pure value-resolution helpers for the reconciler apply step (expiry
+// date→nanos, first_seen preservation, UPSERT/UPDATE routing).
+// Feature-gated §21; the async apply loop is a follow-up.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod lifecycle_apply;
 // 2026-05-25 — Crash-recovery REHYDRATE of the option-chain current-
 // expiry cache from QuestDB's `option_chain_minute_snapshot` table.
 // See `option_chain_cache_loader.rs` module docs for the 3-tier
