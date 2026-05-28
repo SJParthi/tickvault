@@ -1,22 +1,30 @@
 # =============================================================================
-# tickvault — Claude Session Integration
+# tickvault — Claude Session Integration (AUTO-TRIGGER DISABLED 2026-05-28)
 # =============================================================================
-# Watches all claude/* session branches. On any push to a session branch,
-# automatically merges those changes into claude/integration.
+# Historically: on any push to a claude/* branch this auto-merged that branch
+# into the `claude/integration` aggregation branch, so a single
+# `claude/integration -> main` PR could be raised later.
 #
-# No PR needed. Direct fast-forward or merge commit.
-# When ready, raise ONE PR from claude/integration → main.
+# That flow is NOT used in practice — each session raises an individual PR
+# straight to `main`. The aggregation branch went stale and conflicted on
+# every push, which stamped a spurious failing "Merge into claude/integration"
+# check on otherwise-green PRs. It was never a required check and never blocked
+# a merge, but the red X was misleading.
 #
-# If merge conflict occurs, the workflow fails and alerts via comment.
+# Auto-trigger removed: this workflow now runs ONLY on manual dispatch, and the
+# merge step is non-fatal so even a manual run never hard-fails. To re-enable
+# the old behaviour, restore the `push:` trigger block shown in the comment.
 # =============================================================================
 
 name: Claude Integration
 
+# Disabled auto-run. Original trigger (restore to re-enable):
+#   push:
+#     branches:
+#       - 'claude/**'
+#       - '!claude/integration'
 on:
-  push:
-    branches:
-      - 'claude/**'
-      - '!claude/integration'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -51,13 +59,16 @@ jobs:
             git checkout -b claude/integration origin/main
           fi
 
-      - name: Merge session branch
+      - name: Merge session branch (non-fatal on conflict)
         run: |
           SESSION_BRANCH="${GITHUB_REF#refs/heads/}"
           echo "Merging ${SESSION_BRANCH} into claude/integration"
-          git merge "origin/${SESSION_BRANCH}" \
-            --no-edit \
-            -m "chore(integration): merge ${SESSION_BRANCH}"
+          if ! git merge "origin/${SESSION_BRANCH}" --no-edit \
+              -m "chore(integration): merge ${SESSION_BRANCH}"; then
+            echo "::warning::merge conflict integrating ${SESSION_BRANCH}; skipping (non-fatal)"
+            git merge --abort || true
+            exit 0
+          fi
 
       - name: Push claude/integration
         run: git push -u origin claude/integration
