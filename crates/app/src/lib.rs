@@ -44,6 +44,14 @@ pub mod prev_oi_loader;
 // non-zero `prev_day_close` values from QuestDB's `previous_close`
 // table on cold boot.
 pub mod metrics_catalog;
+// Sub-PR #10b-ζ-2 (2026-05-27): maps INSTR-FETCH per-attempt + terminal
+// fetch outcomes → `instrument_fetch_audit` rows and writes them via the
+// storage helper. App crate owns this seam because `core` (the runner)
+// cannot depend on `storage` (the writer). Feature-gated under
+// `daily_universe_fetcher` per rule §21; boot callsite lands in the
+// final Sub-PR #10 orchestrator.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod instr_fetch_audit_writer;
 pub mod observability;
 // 2026-05-25 — Crash-recovery REHYDRATE of the option-chain current-
 // expiry cache from QuestDB's `option_chain_minute_snapshot` table.
