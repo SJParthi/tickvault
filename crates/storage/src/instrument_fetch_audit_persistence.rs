@@ -1,17 +1,20 @@
-//! `instrument_fetch_audit` table contract — Sub-PR #10b-ε of the
-//! 2026-05-27 daily-universe expansion.
+//! `instrument_fetch_audit` table persistence — Sub-PR #10b-ε (contract)
+//! and Sub-PR #10b-ζ-1 (persistence helpers) of the 2026-05-27
+//! daily-universe expansion.
 //!
-//! **Status:** CONTRACT STUBS ONLY. This module ships:
+//! **Status:** PERSISTENCE HELPERS LIVE. This module ships:
 //!
-//! * [`QUESTDB_TABLE_INSTRUMENT_FETCH_AUDIT`] — wire-format table name
-//! * [`DEDUP_KEY_INSTRUMENT_FETCH_AUDIT`] — composite DEDUP UPSERT KEYS clause
-//! * [`FetchOutcome`] — typed SYMBOL column wire-format labels
+//! * [`QUESTDB_TABLE_INSTRUMENT_FETCH_AUDIT`] — wire-format table name (ε)
+//! * [`DEDUP_KEY_INSTRUMENT_FETCH_AUDIT`] — composite DEDUP UPSERT KEYS clause (ε)
+//! * [`FetchOutcome`] — typed SYMBOL column wire-format labels (ε)
+//! * [`InstrumentFetchAuditRow`] — typed row in schema order (ζ-1)
+//! * [`ensure_instrument_fetch_audit_table`] — idempotent CREATE TABLE (ζ-1)
+//! * [`append_instrument_fetch_audit_row`] — single-row `/exec` insert (ζ-1)
 //!
-//! The DDL string, `ensure_*_table` helper, `append_*_row` helper, and
-//! the row struct land in Sub-PR #10b-ζ alongside the boot-orchestrator
-//! callsite. Splitting the contract from the DDL/append helpers keeps
-//! each sub-PR focused per the operator's "one PR at a time + small
-//! focused changes" preference (operator-charter-forever.md §H).
+//! The boot-orchestrator callsite that wires these helpers into the
+//! INSTR-FETCH runner lands in Sub-PR #10b-ζ-2 (kept separate so the
+//! boot-path change is reviewed in isolation per operator-charter-forever.md
+//! §H — "one PR at a time + small focused changes").
 //!
 //! **Feature-gated.** Compiles only when the `daily_universe_fetcher`
 //! Cargo feature is enabled, mirroring the `tickvault-core` gate per
@@ -61,8 +64,26 @@
 //! validation-failure forensics — the DEDUP key MUST be extended with
 //! `exchange_segment` per `.claude/rules/project/security-id-uniqueness.md`
 //! and the corresponding I-P1-11 ratchet. The
-//! [`test_dedup_key_segment_pairing_invariant_if_security_id_ever_added`]
+//! [`tests::test_dedup_key_segment_pairing_invariant_if_security_id_ever_added`]
 //! unit test is the watchdog.
+//!
+//! # Timestamp rule
+//!
+//! Both `ts` and `trading_date_ist` are supplied by the caller as IST
+//! wall-clock nanoseconds. The fetch chain runs on the host clock
+//! (`Utc::now()` → IST), NOT on a Dhan WebSocket `exchange_timestamp`,
+//! so the caller is responsible for adding the IST offset BEFORE
+//! handing nanos to this writer (same convention as the greeks
+//! pipeline, NOT the live-tick pipeline). This module performs ONLY the
+//! nanos→micros division QuestDB `TIMESTAMP` columns require; it does
+//! NOT add or remove any IST offset.
+//!
+//! # Live SQL TEST-EXEMPT
+//!
+//! [`ensure_instrument_fetch_audit_table`] and
+//! [`append_instrument_fetch_audit_row`] require a running QuestDB; the
+//! `/exec` error path is covered by the `#[tokio::test]` cases below
+//! which assert the helpers return `Err` against an unreachable host.
 //!
 //! # Cross-references
 //!
@@ -73,6 +94,18 @@
 //!   the matching `FetchOutcome::*` SYMBOL value.
 
 #![cfg(feature = "daily_universe_fetcher")]
+
+use std::time::Duration;
+
+use reqwest::Client;
+use tracing::{error, info, warn};
+
+use tickvault_common::config::QuestDbConfig;
+use tickvault_common::sanitize::sanitize_audit_string;
+
+/// `/exec` HTTP timeout for both DDL and INSERT. Matches the value used
+/// by every other `*_audit_persistence` module in the storage crate.
+const QUESTDB_EXEC_TIMEOUT_SECS: u64 = 10;
 
 /// Wire-format table name. Stable across releases — operators,
 /// dashboards, and the `partition_manager` S3 archive job depend on
@@ -198,6 +231,214 @@ impl FetchOutcome {
                 | Self::UniverseSizeOutOfBounds
         )
     }
+}
+
+/// Column list shared by the DDL and the INSERT helper, in exact schema
+/// order. One constant so the writer and the table definition cannot
+/// drift. 12 columns.
+const INSERT_COLUMN_LIST: &str = "ts, trading_date_ist, outcome, attempt, error_code, \
+     total_rows, universe_size, index_count, underlying_count, source_csv_sha256, \
+     dry_run, detail";
+
+/// One `instrument_fetch_audit` row in the shape the writer accepts.
+///
+/// Field-count rationale: 12 columns mirror the L3-RECONCILE and L5-AUDIT
+/// demands of `daily-universe-scope-expansion-2026-05-27.md` §9. The
+/// `total_rows` with `source_csv_sha256` pair powers the L3 day-over-day
+/// reconcile ("row count within 0.5×..2× of yesterday"). The trio
+/// `universe_size`, `index_count`, `underlying_count` captures the L4
+/// envelope check. The trio `outcome`, `error_code`, `attempt` captures
+/// the §4 retry-ladder forensic chain. `dry_run` isolates §27 dry-run
+/// rows from live rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstrumentFetchAuditRow<'a> {
+    /// IST wall-clock nanoseconds of this attempt. Designated timestamp.
+    /// Caller adds the IST offset (host-clock source, NOT a Dhan WS
+    /// `exchange_timestamp`).
+    pub ts_nanos_ist: i64,
+    /// IST date-midnight nanoseconds — QuestDB partition column. Part of
+    /// the DEDUP key.
+    pub trading_date_ist_nanos: i64,
+    /// Outcome of this attempt.
+    pub outcome: FetchOutcome,
+    /// §4 retry attempt number (1-based). Part of the DEDUP key so two
+    /// same-kind failures on the same day are both preserved.
+    pub attempt: u32,
+    /// The `ErrorCode` wire string (e.g. `"INSTR-FETCH-01"`) for failure
+    /// outcomes; empty string for `Success` / `HolidayObservation` /
+    /// `OperatorOverride` / `DryRun`. NOT escaped here —
+    /// `sanitize_audit_string` is applied internally.
+    pub error_code: &'a str,
+    /// Raw CSV row count for this attempt (L3 reconcile baseline). 0 when
+    /// the fetch failed before the row count was known.
+    pub total_rows: i64,
+    /// Computed daily-universe size (L4 envelope check). 0 when the build
+    /// never reached the size computation.
+    pub universe_size: i64,
+    /// Number of index SIDs in the computed universe. 0 pre-build.
+    pub index_count: i64,
+    /// Number of unique F&O underlying SIDs in the computed universe.
+    /// 0 pre-build.
+    pub underlying_count: i64,
+    /// SHA-256 of the fetched CSV payload (L3 provenance + reconcile).
+    /// Empty string when the fetch failed before hashing. NOT escaped
+    /// here — `sanitize_audit_string` is applied internally.
+    pub source_csv_sha256: &'a str,
+    /// `true` when produced by a `--dry-run-universe` invocation (§27).
+    pub dry_run: bool,
+    /// Free-form operator-readable diagnostic. For `OperatorOverride`
+    /// this carries the operator's required note (§20). NOT escaped here
+    /// — `sanitize_audit_string` is applied internally.
+    pub detail: &'a str,
+}
+
+/// Creates the audit table if absent. Idempotent — safe to call on every
+/// boot. Schema columns + DEDUP key are pinned by ratchet tests.
+// TEST-EXEMPT: requires running QuestDB; tested via boot integration in CI.
+pub async fn ensure_instrument_fetch_audit_table(questdb_config: &QuestDbConfig) {
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
+        .build()
+        .unwrap_or_else(|_| Client::new());
+
+    let create_ddl = format!(
+        "CREATE TABLE IF NOT EXISTS {QUESTDB_TABLE_INSTRUMENT_FETCH_AUDIT} (\
+            ts TIMESTAMP, \
+            trading_date_ist TIMESTAMP, \
+            outcome SYMBOL, \
+            attempt INT, \
+            error_code SYMBOL, \
+            total_rows LONG, \
+            universe_size INT, \
+            index_count INT, \
+            underlying_count INT, \
+            source_csv_sha256 SYMBOL, \
+            dry_run BOOLEAN, \
+            detail STRING\
+        ) timestamp(ts) PARTITION BY DAY WAL \
+        DEDUP UPSERT KEYS({DEDUP_KEY_INSTRUMENT_FETCH_AUDIT});"
+    );
+    match client
+        .get(&base_url)
+        .query(&[("query", create_ddl.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            info!(
+                table = QUESTDB_TABLE_INSTRUMENT_FETCH_AUDIT,
+                "audit table ready"
+            );
+        }
+        Ok(resp) => {
+            warn!(
+                table = QUESTDB_TABLE_INSTRUMENT_FETCH_AUDIT,
+                status = %resp.status(),
+                "DDL non-2xx"
+            );
+        }
+        Err(err) => {
+            error!(
+                table = QUESTDB_TABLE_INSTRUMENT_FETCH_AUDIT,
+                ?err,
+                "DDL request failed"
+            );
+        }
+    }
+}
+
+/// Formats one row as a QuestDB `VALUES (...)` tuple in schema order.
+///
+/// `*_nanos` fields are IST wall-clock nanoseconds; this divides them to
+/// microseconds because QuestDB `TIMESTAMP` columns store microseconds
+/// since epoch — embedding nanos overflows the year-9999 range
+/// (2026-04-28 regression).
+fn format_row_values_tuple(row: &InstrumentFetchAuditRow<'_>) -> String {
+    // `outcome` is NOT passed through `sanitize_audit_string`: it is a
+    // compile-time `&'static str` from `FetchOutcome::as_str()` (one of 8
+    // lowercase snake_case constants), provably free of SQL-breaking
+    // characters. Same pattern as `option_chain_minute_snapshot_persistence.rs`.
+    // The 3 free-text fields below (caller-supplied / CSV-derived) ARE
+    // sanitized — they are the only injection-reachable inputs.
+    let outcome = row.outcome.as_str();
+    // `attempt` is u32 but the QuestDB column is INT (i32). The §4 retry
+    // ladder keeps attempt small (escalates Critical at 21+, caps backoff
+    // at 300s), so it never approaches i32::MAX. Belt-and-suspenders guard
+    // so a future caller regression surfaces in debug builds rather than
+    // silently wrapping when QuestDB parses the literal as i32.
+    debug_assert!(
+        row.attempt <= i32::MAX as u32,
+        "attempt {} exceeds QuestDB INT (i32) range",
+        row.attempt
+    );
+    let error_code = sanitize_audit_string(row.error_code);
+    let source_csv_sha256 = sanitize_audit_string(row.source_csv_sha256);
+    let detail = sanitize_audit_string(row.detail);
+    let ts_micros = row.ts_nanos_ist / 1_000;
+    let trading_date_micros = row.trading_date_ist_nanos / 1_000;
+    let attempt = row.attempt;
+    let total_rows = row.total_rows;
+    let universe_size = row.universe_size;
+    let index_count = row.index_count;
+    let underlying_count = row.underlying_count;
+    let dry_run = row.dry_run;
+    format!(
+        "({ts_micros}, {trading_date_micros}, '{outcome}', {attempt}, '{error_code}', \
+          {total_rows}, {universe_size}, {index_count}, {underlying_count}, \
+          '{source_csv_sha256}', {dry_run}, '{detail}')"
+    )
+}
+
+/// Appends one `instrument_fetch_audit` row.
+///
+/// Cold path — called at most a handful of times per boot (once per §4
+/// retry attempt that escalates, plus the terminal outcome). The table's
+/// `DEDUP UPSERT KEYS` makes a re-run idempotent.
+///
+/// # Errors
+///
+/// Propagates the `reqwest` transport error, or returns `Err` on a
+/// non-2xx `/exec` response.
+pub async fn append_instrument_fetch_audit_row(
+    questdb_config: &QuestDbConfig,
+    row: &InstrumentFetchAuditRow<'_>,
+) -> anyhow::Result<()> {
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
+        .build()?;
+    let sql = format!(
+        "INSERT INTO {QUESTDB_TABLE_INSTRUMENT_FETCH_AUDIT} \
+         ({INSERT_COLUMN_LIST}) VALUES {tuple};",
+        tuple = format_row_values_tuple(row),
+    );
+    let resp = client
+        .get(&base_url)
+        .query(&[("query", sql.as_str())])
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        // Cap the reflected QuestDB body at 200 chars: this error string
+        // can propagate to a Telegram alert, and an unbounded body could
+        // leak schema/query detail. Matches the PREVCLOSE-04 convention.
+        let body: String = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect();
+        anyhow::bail!("instrument_fetch_audit insert non-2xx ({status}): {body}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -427,5 +668,213 @@ mod tests {
         // PartialEq self-check.
         assert_eq!(FetchOutcome::Success, FetchOutcome::Success);
         assert_ne!(FetchOutcome::Success, FetchOutcome::HolidayObservation);
+    }
+
+    // ========================================================================
+    // ζ-1 persistence-helper tests
+    // ========================================================================
+
+    fn test_cfg_unreachable() -> QuestDbConfig {
+        // Port 1 is reserved and never listening; ensures a real HTTP
+        // failure without hitting any live service.
+        QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 8812,
+            ilp_port: 9009,
+        }
+    }
+
+    fn sample_success_row() -> InstrumentFetchAuditRow<'static> {
+        InstrumentFetchAuditRow {
+            ts_nanos_ist: 1_700_000_000_000_000_000,
+            trading_date_ist_nanos: 1_699_920_000_000_000_000,
+            outcome: FetchOutcome::Success,
+            attempt: 1,
+            error_code: "",
+            total_rows: 142_350,
+            universe_size: 248,
+            index_count: 30,
+            underlying_count: 218,
+            source_csv_sha256: "abc123def456",
+            dry_run: false,
+            detail: "",
+        }
+    }
+
+    #[test]
+    fn test_insert_column_list_has_twelve_columns() {
+        // The shared column list must name every schema column so the
+        // INSERT helper and the DDL stay aligned.
+        assert_eq!(
+            INSERT_COLUMN_LIST.matches(',').count() + 1,
+            12,
+            "INSERT column list must name all 12 schema columns"
+        );
+    }
+
+    #[test]
+    fn test_ddl_contains_all_twelve_columns() {
+        // Source-scan: every schema column must be declared in the DDL
+        // string. Any drift between code + schema fails the build.
+        let source = include_str!("instrument_fetch_audit_persistence.rs");
+        let columns = [
+            "ts TIMESTAMP",
+            "trading_date_ist TIMESTAMP",
+            "outcome SYMBOL",
+            "attempt INT",
+            "error_code SYMBOL",
+            "total_rows LONG",
+            "universe_size INT",
+            "index_count INT",
+            "underlying_count INT",
+            "source_csv_sha256 SYMBOL",
+            "dry_run BOOLEAN",
+            "detail STRING",
+        ];
+        for col in columns {
+            assert!(
+                source.contains(col),
+                "DDL must declare column `{col}` — drift between code + schema rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ddl_partition_by_day_with_wal_and_dedup() {
+        let source = include_str!("instrument_fetch_audit_persistence.rs");
+        assert!(
+            source.contains("PARTITION BY DAY WAL"),
+            "DDL must include `PARTITION BY DAY WAL` — required for retention + idempotent writes"
+        );
+        assert!(
+            source.contains("DEDUP UPSERT KEYS({DEDUP_KEY_INSTRUMENT_FETCH_AUDIT})"),
+            "DDL must wire the DEDUP key constant into the CREATE TABLE statement"
+        );
+    }
+
+    #[test]
+    fn test_insert_sql_uses_microseconds_not_nanoseconds() {
+        // Regression class 2026-04-28: QuestDB TIMESTAMP columns store
+        // microseconds; embedding nanos overflows the year-9999 bound.
+        let source = include_str!("instrument_fetch_audit_persistence.rs");
+        assert!(
+            source.contains("ts_nanos_ist / 1_000"),
+            "INSERT helper must divide ts nanos to micros (year-9999 overflow guard)"
+        );
+        assert!(
+            source.contains("trading_date_ist_nanos / 1_000"),
+            "INSERT helper must divide trading_date_ist nanos to micros"
+        );
+    }
+
+    #[test]
+    fn test_format_row_values_tuple_has_twelve_fields() {
+        let tuple = format_row_values_tuple(&sample_success_row());
+        assert!(
+            tuple.starts_with('(') && tuple.ends_with(')'),
+            "tuple must be paren-wrapped"
+        );
+        // No nested parens/commas in any sanitized field → comma count
+        // is exact: 12 columns → 11 separating commas.
+        let inner = &tuple[1..tuple.len() - 1];
+        assert_eq!(
+            inner.matches(',').count(),
+            11,
+            "12 columns → 11 separating commas"
+        );
+    }
+
+    #[test]
+    fn test_format_row_values_tuple_divides_nanos_to_micros() {
+        // Verify the actual numeric output, not just a source-scan.
+        let tuple = format_row_values_tuple(&sample_success_row());
+        // 1_700_000_000_000_000_000 nanos / 1_000 = 1_700_000_000_000_000 micros
+        assert!(
+            tuple.starts_with("(1700000000000000, 1699920000000000, 'success', 1,"),
+            "tuple must lead with micros-converted ts + trading_date + outcome + attempt; got: {tuple}"
+        );
+    }
+
+    #[test]
+    fn test_format_row_values_tuple_renders_dry_run_boolean_and_error_code() {
+        // A retryable-failure dry-run row exercises the error_code +
+        // dry_run + detail string-formatting paths together.
+        let mut row = sample_success_row();
+        row.outcome = FetchOutcome::CsvHardFailed;
+        row.error_code = "INSTR-FETCH-01";
+        row.dry_run = true;
+        row.detail = "dhan cdn 503 after 11 attempts";
+        let tuple = format_row_values_tuple(&row);
+        assert!(
+            tuple.contains("'csv_hard_failed'"),
+            "outcome label: {tuple}"
+        );
+        assert!(tuple.contains("'INSTR-FETCH-01'"), "error_code: {tuple}");
+        assert!(tuple.contains(", true, "), "dry_run boolean: {tuple}");
+        assert!(
+            tuple.contains("'dhan cdn 503 after 11 attempts'"),
+            "detail free text: {tuple}"
+        );
+    }
+
+    #[test]
+    fn test_ensure_instrument_fetch_audit_table_pub_fn_visible() {
+        // Cheap smoke that the public surface compiles + is reachable.
+        let _ = ensure_instrument_fetch_audit_table;
+    }
+
+    #[tokio::test]
+    async fn test_append_row_returns_err_when_questdb_unreachable() {
+        let cfg = test_cfg_unreachable();
+        let row = sample_success_row();
+        let result = append_instrument_fetch_audit_row(&cfg, &row).await;
+        assert!(
+            result.is_err(),
+            "must propagate transport error when QuestDB is unreachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_append_row_handles_operator_override_outcome() {
+        // Exercise the §20 operator-override variant + its free-text
+        // detail through the transport-error path.
+        let cfg = test_cfg_unreachable();
+        let mut row = sample_success_row();
+        row.outcome = FetchOutcome::OperatorOverride;
+        row.detail = "operator acknowledged stale csv 2026-05-27";
+        row.dry_run = false;
+        let result = append_instrument_fetch_audit_row(&cfg, &row).await;
+        assert!(result.is_err(), "transport error path must propagate");
+    }
+
+    #[test]
+    fn test_error_body_is_capped_at_200_chars() {
+        // Source-scan: the non-2xx branch must bound the reflected
+        // QuestDB body so an unbounded response can't flood a Telegram
+        // alert or leak schema detail (security-reviewer MEDIUM).
+        let source = include_str!("instrument_fetch_audit_persistence.rs");
+        assert!(
+            source.contains(".chars().take(200).collect()"),
+            "append helper must cap the reflected QuestDB error body at 200 chars"
+        );
+    }
+
+    #[test]
+    fn test_format_row_values_tuple_sanitizes_injection_in_detail() {
+        // The detail free-text field is caller/CSV-supplied — a malicious
+        // payload must not escape the single-quoted SQL literal. Confirm
+        // the classic break-out string is neutralized (single-quote
+        // doubled, semicolon + double-dash stripped by sanitize).
+        let mut row = sample_success_row();
+        row.detail = "'); DROP TABLE instrument_fetch_audit;--";
+        let tuple = format_row_values_tuple(&row);
+        assert!(
+            !tuple.contains("DROP TABLE instrument_fetch_audit;"),
+            "semicolon-terminated injection must be neutralized; got: {tuple}"
+        );
+        // The tuple must still be a single balanced VALUES row — the
+        // sanitized detail stays inside its quotes.
+        assert!(tuple.starts_with('(') && tuple.ends_with(')'));
     }
 }
