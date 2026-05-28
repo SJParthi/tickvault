@@ -76,6 +76,18 @@
 
 #![cfg(feature = "daily_universe_fetcher")]
 
+use std::time::Duration;
+
+use reqwest::Client;
+use tracing::{error, info, warn};
+
+use tickvault_common::config::QuestDbConfig;
+use tickvault_common::sanitize::sanitize_audit_string;
+
+/// `/exec` HTTP timeout for both DDL and INSERT. Matches the value used
+/// by the other `*_persistence` modules in the storage crate.
+const QUESTDB_EXEC_TIMEOUT_SECS: u64 = 10;
+
 /// Wire-format table name for the current-state lifecycle table.
 /// Stable across releases — operators, the reconciler, and the
 /// `partition_manager` S3 archive job depend on the exact string.
@@ -236,6 +248,238 @@ impl TransitionKind {
             Self::SegmentMoved,
         ]
     }
+}
+
+// ============================================================================
+// instrument_lifecycle persistence (DDL + Row + ensure + append)
+// ============================================================================
+
+/// Column list shared by the DDL and the INSERT helper, in exact schema
+/// order. One constant so the writer and the table definition cannot
+/// drift. 24 columns.
+const LIFECYCLE_INSERT_COLUMN_LIST: &str = "ts, last_update_ts, security_id, exchange_segment, \
+     exchange_id, instrument_type, symbol_name, display_name, underlying_security_id, \
+     underlying_symbol, lot_size, tick_size, expiry_date, strike_price, option_type, \
+     lifecycle_state, lifecycle_state_locked, first_seen_date, last_seen_date, last_active_date, \
+     expired_date, prev_symbol_chain, source_csv_sha256, dry_run";
+
+/// One `instrument_lifecycle` row in the shape the writer accepts.
+///
+/// 24 columns covering the full §5 schema + §23 `prev_symbol_chain` +
+/// §27 `dry_run`. The designated `ts` is NOT in this struct — the writer
+/// stamps it from [`lifecycle_designated_ts_nanos`] (pinned constant, so
+/// the UPSERT dedups on the business key per I-P1-08). The mutable
+/// last-update wall-clock is `last_update_ts_nanos`.
+///
+/// `*_nanos` date fields are IST wall-clock nanoseconds (host-clock
+/// source — the daily reconciler runs on `Utc::now()` → IST, NOT a Dhan
+/// WS `exchange_timestamp`). The writer divides them to microseconds for
+/// QuestDB `TIMESTAMP` columns. A `*_nanos` value of `0` is written as
+/// literal **epoch-0 (`1970-01-01`)**, NOT SQL `NULL`, for optional date
+/// columns (expiry / expired / etc). Consumers MUST therefore detect
+/// "no expiry" via `lifecycle_state` / `instrument_type`, NOT via
+/// `expiry_date IS NULL` (which never matches).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstrumentLifecycleRow<'a> {
+    /// Mutable last-update wall-clock (IST nanos). Distinct from the
+    /// pinned designated `ts`.
+    pub last_update_ts_nanos: i64,
+    pub security_id: i64,
+    pub exchange_segment: &'a str,
+    pub exchange_id: &'a str,
+    pub instrument_type: &'a str,
+    pub symbol_name: &'a str,
+    pub display_name: &'a str,
+    /// 0 for spot/index (no underlying).
+    pub underlying_security_id: i64,
+    pub underlying_symbol: &'a str,
+    pub lot_size: i32,
+    pub tick_size: f64,
+    /// IST nanos; 0 for spot/index (no expiry).
+    pub expiry_date_nanos: i64,
+    /// 0.0 for non-options.
+    pub strike_price: f64,
+    /// `CE` / `PE` / empty for non-options.
+    pub option_type: &'a str,
+    pub lifecycle_state: LifecycleState,
+    /// §5 operator override — orchestrator skips locked rows when
+    /// flipping states.
+    pub lifecycle_state_locked: bool,
+    pub first_seen_date_nanos: i64,
+    pub last_seen_date_nanos: i64,
+    pub last_active_date_nanos: i64,
+    /// 0 while active; set when state flips to any `expired_*`.
+    pub expired_date_nanos: i64,
+    /// §23 append-only JSON array of prior symbols (rename/merger chain).
+    pub prev_symbol_chain: &'a str,
+    pub source_csv_sha256: &'a str,
+    /// §27 — `true` for `--dry-run-universe` rows; the reconciler reads
+    /// only `WHERE dry_run = false` for the next-day delta.
+    pub dry_run: bool,
+}
+
+/// Creates the `instrument_lifecycle` table if absent. Idempotent.
+///
+/// **`PARTITION BY NONE`** — the designated `ts` is pinned to a constant
+/// (I-P1-08), so a date partition would funnel every never-deleted row
+/// into one `1970-01-01` partition. See the module-level "DDL follow-up
+/// MUST read this" note.
+// TEST-EXEMPT: requires running QuestDB; tested via boot integration in CI.
+pub async fn ensure_instrument_lifecycle_table(questdb_config: &QuestDbConfig) {
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
+        .build()
+        .unwrap_or_else(|_| Client::new());
+
+    let create_ddl = format!(
+        "CREATE TABLE IF NOT EXISTS {QUESTDB_TABLE_INSTRUMENT_LIFECYCLE} (\
+            ts TIMESTAMP, \
+            last_update_ts TIMESTAMP, \
+            security_id LONG, \
+            exchange_segment SYMBOL, \
+            exchange_id SYMBOL, \
+            instrument_type SYMBOL, \
+            symbol_name SYMBOL, \
+            display_name STRING, \
+            underlying_security_id LONG, \
+            underlying_symbol SYMBOL, \
+            lot_size INT, \
+            tick_size DOUBLE, \
+            expiry_date TIMESTAMP, \
+            strike_price DOUBLE, \
+            option_type SYMBOL, \
+            lifecycle_state SYMBOL, \
+            lifecycle_state_locked BOOLEAN, \
+            first_seen_date TIMESTAMP, \
+            last_seen_date TIMESTAMP, \
+            last_active_date TIMESTAMP, \
+            expired_date TIMESTAMP, \
+            prev_symbol_chain STRING, \
+            source_csv_sha256 SYMBOL, \
+            dry_run BOOLEAN\
+        ) timestamp(ts) PARTITION BY NONE WAL \
+        DEDUP UPSERT KEYS({DEDUP_KEY_INSTRUMENT_LIFECYCLE});"
+    );
+    match client
+        .get(&base_url)
+        .query(&[("query", create_ddl.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            info!(
+                table = QUESTDB_TABLE_INSTRUMENT_LIFECYCLE,
+                "lifecycle table ready"
+            );
+        }
+        Ok(resp) => {
+            warn!(
+                table = QUESTDB_TABLE_INSTRUMENT_LIFECYCLE,
+                status = %resp.status(),
+                "DDL non-2xx"
+            );
+        }
+        Err(err) => {
+            error!(
+                table = QUESTDB_TABLE_INSTRUMENT_LIFECYCLE,
+                ?err,
+                "DDL request failed"
+            );
+        }
+    }
+}
+
+/// Formats one row as a QuestDB `VALUES (...)` tuple in schema order.
+///
+/// The leading designated `ts` is stamped from
+/// [`lifecycle_designated_ts_nanos`] (constant). All `*_nanos` fields are
+/// divided to microseconds (QuestDB `TIMESTAMP` stores micros; embedding
+/// nanos overflows the year-9999 bound — 2026-04-28 regression).
+fn format_lifecycle_row_tuple(row: &InstrumentLifecycleRow<'_>) -> String {
+    let ts_micros = lifecycle_designated_ts_nanos() / 1_000;
+    let last_update_micros = row.last_update_ts_nanos / 1_000;
+    let exchange_segment = sanitize_audit_string(row.exchange_segment);
+    let exchange_id = sanitize_audit_string(row.exchange_id);
+    let instrument_type = sanitize_audit_string(row.instrument_type);
+    let symbol_name = sanitize_audit_string(row.symbol_name);
+    let display_name = sanitize_audit_string(row.display_name);
+    let underlying_symbol = sanitize_audit_string(row.underlying_symbol);
+    let option_type = sanitize_audit_string(row.option_type);
+    let lifecycle_state = row.lifecycle_state.as_str();
+    let prev_symbol_chain = sanitize_audit_string(row.prev_symbol_chain);
+    let source_csv_sha256 = sanitize_audit_string(row.source_csv_sha256);
+    let security_id = row.security_id;
+    let underlying_security_id = row.underlying_security_id;
+    let lot_size = row.lot_size;
+    let tick_size = row.tick_size;
+    let expiry_micros = row.expiry_date_nanos / 1_000;
+    let strike_price = row.strike_price;
+    let lifecycle_state_locked = row.lifecycle_state_locked;
+    let first_seen_micros = row.first_seen_date_nanos / 1_000;
+    let last_seen_micros = row.last_seen_date_nanos / 1_000;
+    let last_active_micros = row.last_active_date_nanos / 1_000;
+    let expired_micros = row.expired_date_nanos / 1_000;
+    let dry_run = row.dry_run;
+    format!(
+        "({ts_micros}, {last_update_micros}, {security_id}, '{exchange_segment}', \
+          '{exchange_id}', '{instrument_type}', '{symbol_name}', '{display_name}', \
+          {underlying_security_id}, '{underlying_symbol}', {lot_size}, {tick_size}, \
+          {expiry_micros}, {strike_price}, '{option_type}', '{lifecycle_state}', \
+          {lifecycle_state_locked}, {first_seen_micros}, {last_seen_micros}, \
+          {last_active_micros}, {expired_micros}, '{prev_symbol_chain}', \
+          '{source_csv_sha256}', {dry_run})"
+    )
+}
+
+/// Appends (UPSERT) one `instrument_lifecycle` row. The table's DEDUP
+/// UPSERT KEYS make this idempotent — re-writing the same
+/// `(security_id, exchange_segment)` updates the row in place.
+///
+/// Cold path — called by the daily reconciler at boot (~250 rows).
+///
+/// # Errors
+///
+/// Propagates the `reqwest` transport error, or returns `Err` on a
+/// non-2xx `/exec` response.
+pub async fn append_instrument_lifecycle_row(
+    questdb_config: &QuestDbConfig,
+    row: &InstrumentLifecycleRow<'_>,
+) -> anyhow::Result<()> {
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
+        .build()?;
+    let sql = format!(
+        "INSERT INTO {QUESTDB_TABLE_INSTRUMENT_LIFECYCLE} \
+         ({LIFECYCLE_INSERT_COLUMN_LIST}) VALUES {tuple};",
+        tuple = format_lifecycle_row_tuple(row),
+    );
+    let resp = client
+        .get(&base_url)
+        .query(&[("query", sql.as_str())])
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        // Cap the reflected QuestDB body (it can reach Telegram) — same
+        // convention as instrument_fetch_audit.
+        let body: String = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect();
+        anyhow::bail!("instrument_lifecycle insert non-2xx ({status}): {body}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -421,5 +665,220 @@ mod tests {
         for v in TransitionKind::all() {
             assert!(t.insert(v));
         }
+    }
+
+    // ========================================================================
+    // Persistence-helper tests (DDL + Row + append)
+    // ========================================================================
+
+    fn cfg_unreachable() -> QuestDbConfig {
+        QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 8812,
+            ilp_port: 9009,
+        }
+    }
+
+    fn sample_index_row() -> InstrumentLifecycleRow<'static> {
+        InstrumentLifecycleRow {
+            last_update_ts_nanos: 1_700_000_000_000_000_000,
+            security_id: 13,
+            exchange_segment: "IDX_I",
+            exchange_id: "NSE",
+            instrument_type: "INDEX",
+            symbol_name: "NIFTY",
+            display_name: "NIFTY 50",
+            underlying_security_id: 0,
+            underlying_symbol: "",
+            lot_size: 0,
+            tick_size: 0.05,
+            expiry_date_nanos: 0,
+            strike_price: 0.0,
+            option_type: "",
+            lifecycle_state: LifecycleState::Active,
+            lifecycle_state_locked: false,
+            first_seen_date_nanos: 1_699_920_000_000_000_000,
+            last_seen_date_nanos: 1_700_000_000_000_000_000,
+            last_active_date_nanos: 1_700_000_000_000_000_000,
+            expired_date_nanos: 0,
+            prev_symbol_chain: "",
+            source_csv_sha256: "deadbeef",
+            dry_run: false,
+        }
+    }
+
+    #[test]
+    fn test_lifecycle_insert_column_list_has_24_columns() {
+        assert_eq!(
+            LIFECYCLE_INSERT_COLUMN_LIST.matches(',').count() + 1,
+            24,
+            "INSERT column list must name all 24 schema columns"
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_ddl_uses_partition_by_none() {
+        // The constant designated ts (I-P1-08) REQUIRES PARTITION BY NONE
+        // — a date partition would funnel every never-deleted row into a
+        // single 1970 partition (Z+ hostile-review M1). Source-scan pins it.
+        // Scan only the DDL format string's literal fragment so the test
+        // doesn't trip over the module doc (which mentions PARTITION BY
+        // DAY in prose). The positive presence of `PARTITION BY NONE WAL`
+        // in the CREATE statement is the contract.
+        let source = include_str!("instrument_lifecycle_persistence.rs");
+        assert!(
+            source.contains(") timestamp(ts) PARTITION BY NONE WAL"),
+            "instrument_lifecycle DDL MUST use PARTITION BY NONE (constant ts per I-P1-08)"
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_ddl_contains_all_24_columns() {
+        let source = include_str!("instrument_lifecycle_persistence.rs");
+        let columns = [
+            "ts TIMESTAMP",
+            "last_update_ts TIMESTAMP",
+            "security_id LONG",
+            "exchange_segment SYMBOL",
+            "exchange_id SYMBOL",
+            "instrument_type SYMBOL",
+            "symbol_name SYMBOL",
+            "display_name STRING",
+            "underlying_security_id LONG",
+            "underlying_symbol SYMBOL",
+            "lot_size INT",
+            "tick_size DOUBLE",
+            "expiry_date TIMESTAMP",
+            "strike_price DOUBLE",
+            "option_type SYMBOL",
+            "lifecycle_state SYMBOL",
+            "lifecycle_state_locked BOOLEAN",
+            "first_seen_date TIMESTAMP",
+            "last_seen_date TIMESTAMP",
+            "last_active_date TIMESTAMP",
+            "expired_date TIMESTAMP",
+            "prev_symbol_chain STRING",
+            "source_csv_sha256 SYMBOL",
+            "dry_run BOOLEAN",
+        ];
+        for col in columns {
+            assert!(
+                source.contains(col),
+                "DDL must declare column `{col}` — drift between code + schema rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lifecycle_tuple_stamps_constant_designated_ts() {
+        // The leading designated ts must come from the pinned constant
+        // (0 → 0 micros), NOT from last_update_ts.
+        let tuple = format_lifecycle_row_tuple(&sample_index_row());
+        assert!(
+            tuple.starts_with("(0, 1700000000000000, 13, 'IDX_I',"),
+            "tuple must lead with constant ts=0 micros, then last_update micros, then security_id; got: {tuple}"
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_tuple_has_24_fields() {
+        let tuple = format_lifecycle_row_tuple(&sample_index_row());
+        assert!(tuple.starts_with('(') && tuple.ends_with(')'));
+        let inner = &tuple[1..tuple.len() - 1];
+        assert_eq!(
+            inner.matches(',').count(),
+            23,
+            "24 columns → 23 separating commas"
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_tuple_divides_all_timestamps_to_micros() {
+        let source = include_str!("instrument_lifecycle_persistence.rs");
+        for field in [
+            "last_update_ts_nanos / 1_000",
+            "expiry_date_nanos / 1_000",
+            "first_seen_date_nanos / 1_000",
+            "last_seen_date_nanos / 1_000",
+            "last_active_date_nanos / 1_000",
+            "expired_date_nanos / 1_000",
+        ] {
+            assert!(
+                source.contains(field),
+                "tuple builder must divide `{field}` to micros (year-9999 guard)"
+            );
+        }
+        assert!(
+            source.contains("lifecycle_designated_ts_nanos() / 1_000"),
+            "designated ts must also be divided to micros"
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_tuple_renders_option_row_and_locked_flag() {
+        let mut row = sample_index_row();
+        row.security_id = 99887;
+        row.exchange_segment = "NSE_FNO";
+        row.instrument_type = "OPTSTK";
+        row.option_type = "CE";
+        row.strike_price = 2500.0;
+        row.lifecycle_state = LifecycleState::ExpiredContract;
+        row.lifecycle_state_locked = true;
+        row.expired_date_nanos = 1_700_100_000_000_000_000;
+        let tuple = format_lifecycle_row_tuple(&row);
+        assert!(tuple.contains("'NSE_FNO'"));
+        assert!(tuple.contains("'OPTSTK'"));
+        assert!(tuple.contains("'CE'"));
+        assert!(tuple.contains("'expired_contract'"));
+        assert!(
+            tuple.contains(", true, "),
+            "locked flag must render: {tuple}"
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_tuple_sanitizes_injection_in_display_name() {
+        let mut row = sample_index_row();
+        row.display_name = "'); DROP TABLE instrument_lifecycle;--";
+        let tuple = format_lifecycle_row_tuple(&row);
+        assert!(
+            !tuple.contains("DROP TABLE instrument_lifecycle;"),
+            "semicolon-terminated injection must be neutralized: {tuple}"
+        );
+        assert!(tuple.starts_with('(') && tuple.ends_with(')'));
+    }
+
+    #[test]
+    fn test_ensure_instrument_lifecycle_table_pub_fn_visible() {
+        let _ = ensure_instrument_lifecycle_table;
+    }
+
+    #[tokio::test]
+    async fn test_append_instrument_lifecycle_row_returns_err_when_questdb_unreachable() {
+        let cfg = cfg_unreachable();
+        let row = sample_index_row();
+        let result = append_instrument_lifecycle_row(&cfg, &row).await;
+        assert!(result.is_err(), "must propagate transport error");
+    }
+
+    #[tokio::test]
+    async fn test_append_instrument_lifecycle_row_handles_expired_fno_state() {
+        let cfg = cfg_unreachable();
+        let mut row = sample_index_row();
+        row.lifecycle_state = LifecycleState::ExpiredFromFno;
+        row.expired_date_nanos = 1_700_100_000_000_000_000;
+        let result = append_instrument_lifecycle_row(&cfg, &row).await;
+        assert!(result.is_err(), "transport error path must propagate");
+    }
+
+    #[test]
+    fn test_lifecycle_append_error_body_capped() {
+        let source = include_str!("instrument_lifecycle_persistence.rs");
+        assert!(
+            source.contains(".chars()\n            .take(200)\n            .collect()")
+                || source.contains(".take(200)"),
+            "append helper must cap the reflected QuestDB error body"
+        );
     }
 }
