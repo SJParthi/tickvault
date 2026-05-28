@@ -44,7 +44,7 @@ use tracing::{error, info, warn};
 
 use super::csv_downloader::CsvDownloadError;
 use super::daily_universe::DailyUniverse;
-use super::daily_universe_orchestrator::build_universe_from_bytes;
+use super::daily_universe_orchestrator::{OrchestratorError, build_universe_from_bytes};
 use super::instr_fetch_loop::{LoopOutcome, run_instr_fetch_loop};
 use super::instr_fetch_retry_adapter::TelegramEmit;
 
@@ -80,9 +80,26 @@ where
     Fetch: FnMut(u32) -> FetchFut,
     FetchFut: Future<Output = Result<Vec<u8>, CsvDownloadError>>,
 {
+    // Wrap the pure builder so the FULL error detail (e.g. the dangling-
+    // reference sample from `INSTR-FETCH-03`) reaches Loki on every failed
+    // attempt. The retry loop only carries the typed ErrorCode forward, so
+    // without this the operator would see "boot BLOCKED" with no clue WHICH
+    // underlyings failed to resolve.
+    let build_with_diagnostics = |bytes: &[u8]| -> Result<DailyUniverse, OrchestratorError> {
+        build_universe_from_bytes(bytes).inspect_err(|e| {
+            let code = e.error_code().code_str();
+            warn!(
+                code = code,
+                stage = e.stage(),
+                detail = %e,
+                "daily-universe build attempt failed — boot remains BLOCKED",
+            );
+        })
+    };
+
     run_instr_fetch_loop(
         fetch_fn,
-        build_universe_from_bytes,
+        build_with_diagnostics,
         |duration| tokio::time::sleep(duration),
         emit_telegram_event,
         max_attempts,

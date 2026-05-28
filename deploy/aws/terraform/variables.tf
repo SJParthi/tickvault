@@ -112,3 +112,14 @@ variable "operator_email" {
     error_message = "operator_email must be a valid email address (set via TF_VAR_operator_email=you@example.com)."
   }
 }
+
+variable "operator_phone" {
+  description = "Operator phone number in E.164 format (e.g. +919876543210) for the SNS SMS alert leg — the 3rd fan-out channel after Telegram + email. OPTIONAL: leave empty (\"\") to skip SMS (no subscription is created). Set via TF_VAR_operator_phone. India SMS via SNS may require moving the account out of the SMS sandbox + DLT sender-ID registration (operator/AWS-account concern, not code)."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.operator_phone == "" || can(regex("^\\+[1-9][0-9]{7,14}$", var.operator_phone))
+    error_message = "operator_phone must be empty or E.164 format (e.g. +919876543210)."
+  }
+}

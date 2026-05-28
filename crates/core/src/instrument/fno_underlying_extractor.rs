@@ -39,6 +39,7 @@
 use std::collections::{HashMap, HashSet};
 
 use thiserror::Error;
+use tickvault_common::constants::CSV_TEST_SYMBOL_MARKER;
 
 use super::csv_parser::CsvRow;
 
@@ -51,6 +52,19 @@ pub const DANGLING_REFERENCE_REJECT_THRESHOLD: f64 = 0.005;
 /// NSE_EQ segment string (per Dhan ExchangeSegment enum). Used to
 /// classify cash-equity rows for the underlying-resolution lookup.
 const NSE_EQ_SEGMENT: &str = "NSE_EQ";
+
+/// `EXCH_ID` value for the National Stock Exchange. Stock derivatives on
+/// any other exchange (e.g. BSE) reference a NON-`NSE_EQ` underlying and
+/// are therefore OUT OF SCOPE for the NSE_EQ-only daily universe (rule
+/// §2 + §4 — "every UNDERLYING_SECURITY_ID from FUTSTK/OPTSTK rows
+/// resolves to an NSE_EQ row"). Excluding them mirrors the deleted
+/// `universe_builder` Pass-3 behaviour, which skipped BSE stock futures.
+const NSE_EXCH_ID: &str = "NSE";
+
+/// Maximum number of dangling-reference samples carried in the rejection
+/// error for operator triage. Bounded so a fully-dangling CSV can't
+/// allocate a multi-thousand-entry Vec into the error/log chain.
+const MAX_DANGLING_SAMPLES: usize = 10;
 
 /// Derivative instrument prefixes that REFERENCE an NSE_EQ underlying.
 /// Index derivatives (FUTIDX/OPTIDX) reference IDX_I underlyings —
@@ -91,13 +105,19 @@ pub enum ExtractError {
     /// as an NSE_EQ row in the same CSV. Per §3 + §26 of the rule file.
     #[error(
         "{dangling_count} of {total_derivative_count} stock-derivative rows ({pct:.4}%) had \
-         dangling underlying refs — threshold {threshold_pct:.4}%"
+         dangling underlying refs — threshold {threshold_pct:.4}% — sample: [{}]",
+        sample.join(", ")
     )]
     DanglingReferenceThresholdExceeded {
         dangling_count: usize,
         total_derivative_count: usize,
         pct: f64,
         threshold_pct: f64,
+        /// Up to [`MAX_DANGLING_SAMPLES`] `"<symbol>→<underlying_id>"`
+        /// strings naming the first dangling rows — surfaced in the
+        /// error/log chain so the operator can see WHICH underlyings
+        /// failed to resolve without re-running with a debugger.
+        sample: Vec<String>,
     },
 
     /// No stock-derivative rows found in the input. Likely a parser
@@ -129,29 +149,40 @@ pub fn extract_fno_underlyings(rows: &[CsvRow]) -> Result<FnoUnderlyingExtractio
         }
     }
 
-    // Pass 2 — scan stock-derivative rows, validate underlying refs.
+    // Pass 2 — scan IN-SCOPE stock-derivative rows, validate underlying refs.
+    //
+    // In scope = NSE FUTSTK/OPTSTK that are NOT Dhan TEST contracts. The
+    // real Dhan Detailed CSV also ships (a) BSE stock derivatives whose
+    // underlyings live in BSE_EQ (absent from the NSE_EQ-only lookup) and
+    // (b) placeholder TEST contracts with synthetic underlyings — both
+    // would otherwise be miscounted as dangling and blow past the 0.5%
+    // threshold, blocking boot forever. The deleted `universe_builder`
+    // Pass-3 excluded both for exactly this reason.
     let mut unique_underlying_ids: HashSet<String> = HashSet::new();
     let mut dangling_count: usize = 0;
     let mut total_derivative_count: usize = 0;
+    let mut sample: Vec<String> = Vec::new();
 
     for row in rows {
-        if !is_stock_derivative(&row.instrument) {
+        if !is_in_scope_stock_derivative(&row.instrument, &row.exch_id) {
+            continue;
+        }
+        if is_test_instrument(&row.symbol_name, &row.underlying_symbol) {
             continue;
         }
         total_derivative_count = total_derivative_count.saturating_add(1);
 
         let underlying_id = &row.underlying_security_id;
-        if underlying_id.is_empty() {
-            // Should never happen — Sub-PR #4 parser drops derivative
-            // rows with empty underlying. Defensive: count as dangling.
-            dangling_count = dangling_count.saturating_add(1);
-            continue;
-        }
-
-        if nse_eq_lookup.contains_key(underlying_id) {
+        let resolved = !underlying_id.is_empty() && nse_eq_lookup.contains_key(underlying_id);
+        if resolved {
             unique_underlying_ids.insert(underlying_id.clone());
         } else {
+            // Empty underlying should never happen (Sub-PR #4 parser drops
+            // derivative rows with an empty underlying); count defensively.
             dangling_count = dangling_count.saturating_add(1);
+            if sample.len() < MAX_DANGLING_SAMPLES {
+                sample.push(format!("{}→{}", row.symbol_name, underlying_id));
+            }
         }
     }
 
@@ -168,6 +199,7 @@ pub fn extract_fno_underlyings(rows: &[CsvRow]) -> Result<FnoUnderlyingExtractio
             total_derivative_count,
             pct: dangling_pct * 100.0,
             threshold_pct: DANGLING_REFERENCE_REJECT_THRESHOLD * 100.0,
+            sample,
         });
     }
 
@@ -184,6 +216,26 @@ fn is_stock_derivative(instrument: &str) -> bool {
     STOCK_DERIVATIVE_PREFIXES
         .iter()
         .any(|p| instrument.eq_ignore_ascii_case(p))
+}
+
+/// A stock derivative that is in scope for the NSE_EQ-only daily universe:
+/// FUTSTK/OPTSTK on the National Stock Exchange. BSE stock derivatives are
+/// excluded because their underlyings live in `BSE_EQ`, which the
+/// NSE_EQ-only lookup intentionally does not contain (rule §2 + §4).
+#[must_use]
+fn is_in_scope_stock_derivative(instrument: &str, exch_id: &str) -> bool {
+    is_stock_derivative(instrument) && exch_id.eq_ignore_ascii_case(NSE_EXCH_ID)
+}
+
+/// Dhan ships placeholder TEST contracts in the instrument master whose
+/// `UNDERLYING_SECURITY_ID` is synthetic and never resolves to a real
+/// `NSE_EQ` row. Skip them (mirrors the deleted `universe_builder` Pass-3
+/// `CSV_TEST_SYMBOL_MARKER` skip) so they are not miscounted as dangling.
+#[must_use]
+fn is_test_instrument(symbol_name: &str, underlying_symbol: &str) -> bool {
+    let marker = CSV_TEST_SYMBOL_MARKER.to_ascii_uppercase();
+    symbol_name.to_ascii_uppercase().contains(&marker)
+        || underlying_symbol.to_ascii_uppercase().contains(&marker)
 }
 
 #[cfg(test)]
@@ -437,5 +489,116 @@ mod tests {
         let result = extract_fno_underlyings(&rows).expect("at threshold accepts");
         assert_eq!(result.dangling_count, 1);
         assert_eq!(result.total_derivative_count, 200);
+    }
+
+    fn bse_stock_derivative_row(
+        security_id: &str,
+        instrument: &str,
+        symbol: &str,
+        underlying: &str,
+    ) -> CsvRow {
+        CsvRow {
+            security_id: security_id.to_string(),
+            exch_id: "BSE".to_string(),
+            segment: "BSE_FNO".to_string(),
+            instrument: instrument.to_string(),
+            symbol_name: symbol.to_string(),
+            underlying_security_id: underlying.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn bse_stock_derivatives_are_out_of_scope_not_dangling() {
+        // The real Dhan CSV ships BSE FUTSTK/OPTSTK whose underlyings live
+        // in BSE_EQ (absent from the NSE_EQ-only lookup). They MUST be
+        // ignored entirely — neither counted nor flagged dangling — else a
+        // valid CSV blows past the 0.5% threshold and blocks boot forever.
+        let rows = vec![
+            nse_eq_row("2885", "RELIANCE"),
+            stock_derivative_row("38919", "FUTSTK", "RELIANCE26JUNFUT", "2885"),
+            // 50 BSE stock derivatives with BSE_EQ underlyings — would all
+            // be "dangling" against the NSE_EQ lookup if not excluded.
+            bse_stock_derivative_row("70001", "OPTSTK", "BSESTK1", "500001"),
+            bse_stock_derivative_row("70002", "FUTSTK", "BSESTK2", "500002"),
+        ];
+        let result = extract_fno_underlyings(&rows).expect("BSE rows excluded → accepts");
+        assert_eq!(
+            result.total_derivative_count, 1,
+            "only the NSE derivative counts"
+        );
+        assert_eq!(result.dangling_count, 0);
+        assert!(result.unique_underlying_ids.contains("2885"));
+    }
+
+    #[test]
+    fn test_marker_contracts_are_skipped() {
+        // Dhan TEST placeholder contracts carry synthetic underlyings that
+        // never resolve. They must be skipped (matches deleted
+        // universe_builder Pass-3 CSV_TEST_SYMBOL_MARKER skip).
+        let rows = vec![
+            nse_eq_row("2885", "RELIANCE"),
+            stock_derivative_row("38919", "FUTSTK", "RELIANCE26JUNFUT", "2885"),
+            // TEST contract on the symbol name…
+            stock_derivative_row("88001", "FUTSTK", "TESTSTK26JUNFUT", "999001"),
+            // …and one flagged via the underlying symbol.
+            CsvRow {
+                security_id: "88002".to_string(),
+                exch_id: "NSE".to_string(),
+                segment: "NSE_FNO".to_string(),
+                instrument: "OPTSTK".to_string(),
+                symbol_name: "ZZ26JUN100CE".to_string(),
+                underlying_security_id: "999002".to_string(),
+                underlying_symbol: "TESTSTK".to_string(),
+                ..Default::default()
+            },
+        ];
+        let result = extract_fno_underlyings(&rows).expect("TEST rows skipped → accepts");
+        assert_eq!(
+            result.total_derivative_count, 1,
+            "TEST contracts not counted"
+        );
+        assert_eq!(result.dangling_count, 0);
+    }
+
+    #[test]
+    fn dangling_error_carries_sample_of_offending_rows() {
+        // 100 NSE FUTSTK rows, all dangling → rejection error must name the
+        // first few offenders for operator triage.
+        let mut rows: Vec<CsvRow> = (0..100)
+            .map(|i| {
+                stock_derivative_row(
+                    &format!("4{i:04}"),
+                    "FUTSTK",
+                    &format!("UNKNOWN{i}FUT"),
+                    &format!("99{i:04}"),
+                )
+            })
+            .collect();
+        rows.push(nse_eq_row("2885", "RELIANCE"));
+        let err = extract_fno_underlyings(&rows).expect_err("must reject");
+        let ExtractError::DanglingReferenceThresholdExceeded { sample, .. } = err else {
+            panic!("expected DanglingReferenceThresholdExceeded, got {err:?}");
+        };
+        assert_eq!(sample.len(), MAX_DANGLING_SAMPLES, "sample is bounded");
+        assert!(
+            sample.iter().any(|s| s.contains("UNKNOWN0FUT→990000")),
+            "sample must name an offending symbol→underlying pair: {sample:?}",
+        );
+    }
+
+    #[test]
+    fn is_in_scope_filters_exchange_and_instrument() {
+        assert!(is_in_scope_stock_derivative("FUTSTK", "NSE"));
+        assert!(is_in_scope_stock_derivative("optstk", "nse"));
+        assert!(!is_in_scope_stock_derivative("FUTSTK", "BSE"));
+        assert!(!is_in_scope_stock_derivative("FUTIDX", "NSE"));
+    }
+
+    #[test]
+    fn is_test_instrument_matches_either_field() {
+        assert!(is_test_instrument("TESTSTK26JUNFUT", ""));
+        assert!(is_test_instrument("ZZ", "teststk"));
+        assert!(!is_test_instrument("RELIANCE26JUNFUT", "RELIANCE"));
     }
 }

@@ -1,59 +1,36 @@
-# Implementation Plan: Daily-Universe Go-Live — PR-2 (scope-aware 250-SID subscription)
+# PR-4 HOTFIX — daily-universe runtime bugs (boot blocked + missing schema)
 
-**Status:** APPROVED
+**Status:** APPROVED (operator: "fix and implement everything entirely")
 **Date:** 2026-05-28
-**Approved by:** Parthiban (full go-live everywhere, fail-closed §4; "go ahead with the plan" after PR-1 #852 merged)
-**Branch:** `claude/daily-universe-scope-aware-subscription`
+**Discovered:** live local run 16:16 IST — boot HANGS at Step 6c; instrument_lifecycle table 400; no 250 SIDs; no ticks; no % changes.
+**Root-caused (all confirmed against code + docs/dhan-ref/09-instrument-master.md):**
 
-## Go-live sequence
+## Bug A — `instrument_lifecycle` DDL → 400 Bad Request (table never created)
+- **Cause:** `crates/storage/src/instrument_lifecycle_persistence.rs:381` uses `timestamp(ts) PARTITION BY NONE WAL ... DEDUP UPSERT KEYS(...)`. QuestDB **rejects WAL+DEDUP on a non-partitioned table**. Audit tables work (they use `PARTITION BY DAY WAL`).
+- **Fix:** change to `PARTITION BY DAY WAL`. Constant `ts` (epoch-0, I-P1-08) → all rows land in the 1970-01-01 partition; DEDUP on `(ts, security_id, exchange_segment)` still works. Verify the reconcile INSERT writes a CONSTANT ts (else daily partitions + no cross-day dedup).
+- **Ratchet/doc updates:** test at line ~1053 asserts `PARTITION BY NONE WAL` → flip to DAY; module doc lines 61-62, 340-343.
 
-| PR | What | Prod effect |
-|----|------|-------------|
-| PR-1 #852 (merged) | Boot Step-6c wiring, fail-closed §4 | none (flag OFF) |
-| **PR-2 (this)** | Scope-aware planner -> WS subscribes the ~250 SIDs when scope=DailyUniverse | none yet (flag OFF) |
-| PR-3 | Flip prod `default` flag ON + `scope = "daily_universe"` — GO-LIVE | 250 SIDs everywhere |
+## Bug B — boot BLOCKED (INSTR-FETCH-03), no 250 SIDs (SYSTEMIC)
+- **Cause:** code matches CSV `SEGMENT` column against `"NSE_EQ"`/`"IDX_I"`, but Dhan Detailed CSV `SEGMENT` is **single-char** (`E`=Equity, `I`=Index, `D`=Derivatives, `C`, `M`) per `docs/dhan-ref/09-instrument-master.md:37`. So `nse_eq_lookup` is empty → all FUTSTK/OPTSTK underlyings "dangling" → >0.5% → reject → infinite retry.
+- **Fix (parse-time derivation — cleanest, fixes the whole chain):** in `crates/core/src/instrument/csv_parser.rs` row construction (~line 345), derive canonical `exchange_segment` from `(exch_id, segment_char)` and store THAT in `row.segment`:
+  - `seg="I"` → `IDX_I` (both NSE+BSE indices)
+  - `exch=NSE,seg=E` → `NSE_EQ`; `exch=NSE,seg=D` → `NSE_FNO`
+  - `exch=BSE,seg=E` → `BSE_EQ`; `exch=BSE,seg=D` → `BSE_FNO`
+  - `seg=C` → `{NSE,BSE}_CURRENCY`; `seg=M` → `MCX_COMM`
+- **Then unchanged-and-correct:** `fno_underlying_extractor.rs:53/128` (NSE_EQ), `index_extractor.rs` (IDX_I filter), `daily_universe.rs`, lifecycle `exchange_segment` column.
+- **New test:** parser test feeding the REAL single-char codes (`E`/`I`/`D`) asserting `row.segment` derives `NSE_EQ`/`IDX_I`/`NSE_FNO`. This is the regression guard the merged PRs lacked (all unit tests used synthetic `segment:"NSE_EQ"`).
+- **Audit `index_extractor.rs`** for the same `"IDX_I"` vs `"I"` mismatch (the index half of the 250 SIDs).
 
-## Design (from deep investigation)
+## Concern C — percentage-change columns removed (operator expects them)
+- **Finding:** Engine-B candle tables = 10 cols, **NO `*_pct_from_prev_day`** (`shadow_persistence.rs:17,35`). The 3 pct columns were dropped in the Engine-B rewrite.
+- **Decision needed + fix:** re-add `close_pct_from_prev_day`, `oi_pct_from_prev_day`, `volume_pct_from_prev_day` (DOUBLE) to the candle DDL + restore seal-time pct-stamping (prev_day cache → seal), OR confirm % is computed in-memory/elsewhere. Operator wants visible % changes.
 
-**Structural decision:** consolidate the daily-universe fetch into `load_instruments`'
-scope branch so the built `DailyUniverse` flows straight into the subscription
-plan (instead of threading an `Arc` across ~2,500 boot lines). The standalone
-Step-6c block from PR-1 moves into the `DailyUniverse` arm of `load_instruments`
-(same tokens preserved so the wiring ratchet still passes).
+## Table/column create-update audit (operator: "all tables/columns should be created/updated")
+- Verify every merged-PR table actually CREATEs at runtime (not just unit-tested): instrument_lifecycle (A), lifecycle_audit ✓, fetch_audit ✓, 21 candle TFs ✓, ticks ✓, option_chain_minute_snapshot ✓.
+- Verify ALTER ADD COLUMN IF NOT EXISTS self-heal for any new columns.
 
-| Seam | File | Change |
-|---|---|---|
-| `DailyUniverseBootOutcome` | daily_universe_boot.rs | `run_daily_universe_boot` returns `(outcome, Arc<DailyUniverse>)` (tuple — no new struct field) |
-| New planner fn | subscription_planner.rs | `build_subscription_plan_from_daily_universe(&DailyUniverse, &SubscriptionConfig, today) -> SubscriptionPlan` — `subscription_targets` -> `InstrumentRegistry` (Quote mode §8), I-P1-11 `(sid, segment)` dedup |
-| `load_instruments` | main.rs | `match config.subscription.scope`: Indices4Only -> existing; DailyUniverse (feature-gated) -> fetch+build plan; not(feature) -> bail |
-| Remove standalone Step-6c | main.rs | moved into the load_instruments DailyUniverse arm |
-| pool size | config.rs `effective_main_feed_pool_size` | stays 1 (250 SIDs fit on 1 conn, Dhan cap 5000) |
+## Why this regressed past CI
+All daily-universe unit/source-scan tests used synthetic rows + never hit a live QuestDB or the real CSV. Add: (1) parser real-segment test, (2) a boot-integration smoke that runs the DDLs against a live QuestDB in CI.
 
-- [x] Add feature-gated, fail-closed Step 6c block to the boot sequence
-  - Files: crates/app/src/main.rs
-  - Tokens: ensure_instrument_lifecycle_table, ensure_instrument_lifecycle_audit_table,
-    ensure_instrument_fetch_audit_table, CsvDownloader, run_daily_universe_boot
-  - Behaviour: ensure 3 tables → Arc<CsvDownloader> fetch_fn → run_daily_universe_boot
-    (dry_run=false, max_attempts=None infinite §4) → `?`-bail on Err (fail-closed) → log outcome.
-  - IST nanos per the lifecycle persistence convention (IST wall-clock nanos).
-
-- [ ] `run_daily_universe_boot` returns `(DailyUniverseBootOutcome, Arc<DailyUniverse>)`
-  - Files: crates/app/src/daily_universe_boot.rs
-  - Tests: existing Err-path tests unaffected
-- [ ] `build_subscription_plan_from_daily_universe`
-  - Files: crates/core/src/instrument/subscription_planner.rs
-  - Tests: test_daily_universe_plan_emits_all_sids, test_daily_universe_plan_dedup_composite_key, test_daily_universe_plan_quote_mode
-- [ ] scope-aware `load_instruments` + relocate Step-6c into the DailyUniverse arm (feature-gated, fail-closed §4)
-  - Files: crates/app/src/main.rs
-- [ ] Guard updates
-  - Files: crates/core/tests/indices4only_scope_lock_guard.rs, crates/app/tests/daily_universe_boot_wiring_guard.rs
-  - Tests: test_subscription_scope_has_two_variants
-
-## Scenarios
-
-| # | Scenario | Expected |
-|---|----------|----------|
-| 1 | feature OFF (default) | unchanged — 4-IDX_I, no DailyUniverse path compiled |
-| 2 | feature ON, scope=Indices4Only | unchanged 4-IDX_I plan |
-| 3 | feature ON, scope=DailyUniverse, CSV ok | ~250-SID plan, 3 WS batches (100/100/50), Quote mode, lifecycle tables populated |
-| 4 | feature ON, scope=DailyUniverse, CSV/QuestDB down | fail-closed §4 — boot blocks/halts |
+## Sequence
+PR-4a: Bug A (DDL) + Bug B (segment derivation) + tests → unblocks boot + builds 250 SIDs. PR-4b: Concern C (% columns) after operator confirms intent.

@@ -50,11 +50,15 @@ core_affinity = { workspace = true }
 sha2 = { workspace = true, optional = true }
 
 [features]
-# Sub-PR #10b-ζ-2 of the 2026-05-27 daily-universe expansion: forwards
-# the daily_universe_fetcher gate to core (the INSTR-FETCH runner) and
-# storage (the instrument_fetch_audit writer) so the app-side audit-write
-# seam compiles against both. Dormant by default per rule §21 — the boot
-# callsite + feature flip land in the final Sub-PR #10 boot orchestrator.
+# GO-LIVE (PR-3, 2026-05-28): daily_universe_fetcher is now in `default` per
+# the operator full-go-live approval ("250 SIDs + new scope as production AND
+# local, everywhere"; boot fail-closed §4 "Block until CSV"). The §21
+# sequencing is satisfied — the fetcher chain + boot wiring (PR-1 #852) +
+# scope-aware subscription (PR-2 #853) all merged first. Paired with
+# `config/base.toml [subscription] scope = "daily_universe"`.
+default = ["daily_universe_fetcher"]
+# Forwards the gate to core (the INSTR-FETCH runner) and storage (the
+# instrument_fetch_audit writer) so the app-side audit-write seam compiles.
 daily_universe_fetcher = [
     "dep:sha2",
     "tickvault-core/daily_universe_fetcher",

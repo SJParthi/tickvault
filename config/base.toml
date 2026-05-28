@@ -236,13 +236,15 @@ allowed_origins = ["http://localhost:3000", "http://localhost:3001"]
 # 218 NSE_EQ F&O underlying stocks in Quote mode. NO derivatives, NO greeks,
 # NO depth-20, NO depth-200, NO movers pipeline, NO Phase 2 dispatcher.
 #
-# Scope is the SOURCE OF TRUTH for the 2-WS lock per
-# `.claude/rules/project/websocket-connection-scope-lock.md` and charter §I.
-# `indices_4_only` is the ONLY legal value after PR #7b — the legacy
-# `full_universe` / `indices_only_all_expiries` / `indices_underlyings_only`
-# variants have been retired. Adding a new scope requires operator
-# re-approval recorded in the rule file with a dated quote.
-scope = "indices_4_only"
+# Scope is the SOURCE OF TRUTH for the WS subscription per
+# `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`
+# (supersedes the 2026-05-15 4-SID lock). GO-LIVE 2026-05-28: `daily_universe`
+# is the operator-locked production scope — ~250 SIDs (all NSE indices + 1 BSE
+# SENSEX + unique F&O underlying spots), Quote mode, fail-closed §4. The
+# 2-WebSocket lock (1 main-feed + 1 order-update) is UNCHANGED. The only other
+# legal value is `indices_4_only` (the retired 4-SID scope, kept for rollback).
+# Adding a new scope requires operator re-approval recorded in the rule file.
+scope = "daily_universe"
 feed_mode = "Full"
 subscribe_stock_equities = true
 stock_atm_strikes_above = 25
