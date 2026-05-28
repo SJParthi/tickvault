@@ -482,6 +482,200 @@ pub async fn append_instrument_lifecycle_row(
     Ok(())
 }
 
+// ============================================================================
+// instrument_lifecycle_audit persistence (DDL + Row + ensure + append)
+// ============================================================================
+
+/// Column list shared by the audit DDL + INSERT helper, in exact schema
+/// order. One constant so writer + table can't drift. 16 columns.
+const LIFECYCLE_AUDIT_INSERT_COLUMN_LIST: &str = "ts, trading_date_ist, security_id, \
+     exchange_segment, from_state, to_state, transition_kind, field_deltas, source_csv_sha256, \
+     operator_note, lifecycle_state_after, lot_size_after, tick_size_after, expiry_date_after, \
+     symbol_name_after, dry_run";
+
+/// One `instrument_lifecycle_audit` row — the forensic record of a single
+/// state transition (§6 + §25 point-in-time snapshot columns + §27).
+///
+/// Append-only (NOT UPSERT-in-place), so `ts` is the REAL per-transition
+/// wall-clock (IST nanos) — unlike the `instrument_lifecycle` table whose
+/// `ts` is pinned constant. The `*_after` columns snapshot the
+/// post-transition state so SEBI point-in-time queries (§25) can answer
+/// "what was instrument X's state on date D?" without replaying the whole
+/// chain.
+///
+/// `from_state` is `None` for an `appeared` transition (no prior state);
+/// it renders as the empty SYMBOL `''`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstrumentLifecycleAuditRow<'a> {
+    /// REAL per-transition wall-clock (IST nanos). Designated timestamp.
+    pub ts_nanos_ist: i64,
+    /// IST date-midnight nanos — partition/business date.
+    pub trading_date_ist_nanos: i64,
+    pub security_id: i64,
+    pub exchange_segment: &'a str,
+    /// Prior state; `None` for `appeared` (renders `''`).
+    pub from_state: Option<LifecycleState>,
+    pub to_state: LifecycleState,
+    pub transition_kind: TransitionKind,
+    /// JSON of changed `field: [old, new]` pairs (when
+    /// `transition_kind == Updated`); empty otherwise.
+    pub field_deltas: &'a str,
+    pub source_csv_sha256: &'a str,
+    /// Free-form note (populated only by manual overrides — §5/§6).
+    pub operator_note: &'a str,
+    /// §25 snapshot: post-transition `lifecycle_state`.
+    pub lifecycle_state_after: LifecycleState,
+    pub lot_size_after: i32,
+    pub tick_size_after: f64,
+    /// §25 snapshot: post-transition expiry (IST nanos; 0 for spot/index).
+    pub expiry_date_after_nanos: i64,
+    pub symbol_name_after: &'a str,
+    /// §27 — dry-run isolation.
+    pub dry_run: bool,
+}
+
+/// Creates the `instrument_lifecycle_audit` table if absent. Idempotent.
+///
+/// **`PARTITION BY DAY`** — unlike the sibling `instrument_lifecycle`
+/// table, this one is append-only with a REAL per-transition `ts`, so it
+/// partitions by day normally (enabling the `partition_manager`
+/// S3-archive-by-date lifecycle for the 5-year SEBI chain).
+// TEST-EXEMPT: requires running QuestDB; tested via boot integration in CI.
+pub async fn ensure_instrument_lifecycle_audit_table(questdb_config: &QuestDbConfig) {
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
+        .build()
+        .unwrap_or_else(|_| Client::new());
+
+    let create_ddl = format!(
+        "CREATE TABLE IF NOT EXISTS {QUESTDB_TABLE_INSTRUMENT_LIFECYCLE_AUDIT} (\
+            ts TIMESTAMP, \
+            trading_date_ist TIMESTAMP, \
+            security_id LONG, \
+            exchange_segment SYMBOL, \
+            from_state SYMBOL, \
+            to_state SYMBOL, \
+            transition_kind SYMBOL, \
+            field_deltas STRING, \
+            source_csv_sha256 SYMBOL, \
+            operator_note STRING, \
+            lifecycle_state_after SYMBOL, \
+            lot_size_after INT, \
+            tick_size_after DOUBLE, \
+            expiry_date_after TIMESTAMP, \
+            symbol_name_after SYMBOL, \
+            dry_run BOOLEAN\
+        ) timestamp(ts) PARTITION BY DAY WAL \
+        DEDUP UPSERT KEYS({DEDUP_KEY_INSTRUMENT_LIFECYCLE_AUDIT});"
+    );
+    match client
+        .get(&base_url)
+        .query(&[("query", create_ddl.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            info!(
+                table = QUESTDB_TABLE_INSTRUMENT_LIFECYCLE_AUDIT,
+                "lifecycle audit table ready"
+            );
+        }
+        Ok(resp) => {
+            warn!(
+                table = QUESTDB_TABLE_INSTRUMENT_LIFECYCLE_AUDIT,
+                status = %resp.status(),
+                "DDL non-2xx"
+            );
+        }
+        Err(err) => {
+            error!(
+                table = QUESTDB_TABLE_INSTRUMENT_LIFECYCLE_AUDIT,
+                ?err,
+                "DDL request failed"
+            );
+        }
+    }
+}
+
+/// Formats one audit row as a QuestDB `VALUES (...)` tuple in schema order.
+///
+/// `ts` is the REAL per-transition wall-clock (divided nanos→micros like
+/// every other timestamp — year-9999 guard). `from_state == None` renders
+/// the empty SYMBOL `''`.
+fn format_lifecycle_audit_row_tuple(row: &InstrumentLifecycleAuditRow<'_>) -> String {
+    let ts_micros = row.ts_nanos_ist / 1_000;
+    let trading_date_micros = row.trading_date_ist_nanos / 1_000;
+    let security_id = row.security_id;
+    let exchange_segment = sanitize_audit_string(row.exchange_segment);
+    let from_state = row.from_state.map_or("", LifecycleState::as_str);
+    let to_state = row.to_state.as_str();
+    let transition_kind = row.transition_kind.as_str();
+    let field_deltas = sanitize_audit_string(row.field_deltas);
+    let source_csv_sha256 = sanitize_audit_string(row.source_csv_sha256);
+    let operator_note = sanitize_audit_string(row.operator_note);
+    let lifecycle_state_after = row.lifecycle_state_after.as_str();
+    let lot_size_after = row.lot_size_after;
+    let tick_size_after = row.tick_size_after;
+    let expiry_after_micros = row.expiry_date_after_nanos / 1_000;
+    let symbol_name_after = sanitize_audit_string(row.symbol_name_after);
+    let dry_run = row.dry_run;
+    format!(
+        "({ts_micros}, {trading_date_micros}, {security_id}, '{exchange_segment}', \
+          '{from_state}', '{to_state}', '{transition_kind}', '{field_deltas}', \
+          '{source_csv_sha256}', '{operator_note}', '{lifecycle_state_after}', \
+          {lot_size_after}, {tick_size_after}, {expiry_after_micros}, \
+          '{symbol_name_after}', {dry_run})"
+    )
+}
+
+/// Appends one `instrument_lifecycle_audit` row. Append-only forensic
+/// chain — the DEDUP UPSERT KEYS make a re-run idempotent.
+///
+/// Cold path — called by the daily reconciler per state transition.
+///
+/// # Errors
+///
+/// Propagates the `reqwest` transport error, or returns `Err` on a
+/// non-2xx `/exec` response.
+pub async fn append_instrument_lifecycle_audit_row(
+    questdb_config: &QuestDbConfig,
+    row: &InstrumentLifecycleAuditRow<'_>,
+) -> anyhow::Result<()> {
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
+        .build()?;
+    let sql = format!(
+        "INSERT INTO {QUESTDB_TABLE_INSTRUMENT_LIFECYCLE_AUDIT} \
+         ({LIFECYCLE_AUDIT_INSERT_COLUMN_LIST}) VALUES {tuple};",
+        tuple = format_lifecycle_audit_row_tuple(row),
+    );
+    let resp = client
+        .get(&base_url)
+        .query(&[("query", sql.as_str())])
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body: String = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect();
+        anyhow::bail!("instrument_lifecycle_audit insert non-2xx ({status}): {body}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -880,5 +1074,173 @@ mod tests {
                 || source.contains(".take(200)"),
             "append helper must cap the reflected QuestDB error body"
         );
+    }
+
+    // ========================================================================
+    // instrument_lifecycle_audit persistence-helper tests
+    // ========================================================================
+
+    fn sample_audit_row() -> InstrumentLifecycleAuditRow<'static> {
+        InstrumentLifecycleAuditRow {
+            ts_nanos_ist: 1_700_000_000_000_000_000,
+            trading_date_ist_nanos: 1_699_920_000_000_000_000,
+            security_id: 99887,
+            exchange_segment: "NSE_FNO",
+            from_state: Some(LifecycleState::Active),
+            to_state: LifecycleState::ExpiredFromFno,
+            transition_kind: TransitionKind::Expired,
+            field_deltas: "",
+            source_csv_sha256: "deadbeef",
+            operator_note: "",
+            lifecycle_state_after: LifecycleState::ExpiredFromFno,
+            lot_size_after: 250,
+            tick_size_after: 0.05,
+            expiry_date_after_nanos: 1_700_100_000_000_000_000,
+            symbol_name_after: "TCS",
+            dry_run: false,
+        }
+    }
+
+    #[test]
+    fn test_audit_insert_column_list_has_16_columns() {
+        assert_eq!(
+            LIFECYCLE_AUDIT_INSERT_COLUMN_LIST.matches(',').count() + 1,
+            16,
+            "audit INSERT column list must name all 16 schema columns"
+        );
+    }
+
+    #[test]
+    fn test_audit_ddl_uses_partition_by_day() {
+        // Append-only with REAL per-transition ts → partitions by day
+        // (unlike the constant-ts lifecycle table which uses NONE).
+        let source = include_str!("instrument_lifecycle_persistence.rs");
+        assert!(
+            source.contains(") timestamp(ts) PARTITION BY DAY WAL \\\n        DEDUP UPSERT KEYS({DEDUP_KEY_INSTRUMENT_LIFECYCLE_AUDIT})")
+                || source.contains("PARTITION BY DAY WAL"),
+            "audit DDL must use PARTITION BY DAY (real per-transition ts)"
+        );
+    }
+
+    #[test]
+    fn test_audit_ddl_contains_all_16_columns() {
+        let source = include_str!("instrument_lifecycle_persistence.rs");
+        let columns = [
+            "ts TIMESTAMP",
+            "trading_date_ist TIMESTAMP",
+            "security_id LONG",
+            "exchange_segment SYMBOL",
+            "from_state SYMBOL",
+            "to_state SYMBOL",
+            "transition_kind SYMBOL",
+            "field_deltas STRING",
+            "source_csv_sha256 SYMBOL",
+            "operator_note STRING",
+            "lifecycle_state_after SYMBOL",
+            "lot_size_after INT",
+            "tick_size_after DOUBLE",
+            "expiry_date_after TIMESTAMP",
+            "symbol_name_after SYMBOL",
+            "dry_run BOOLEAN",
+        ];
+        for col in columns {
+            assert!(
+                source.contains(col),
+                "audit DDL must declare column `{col}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_audit_tuple_has_16_fields() {
+        let tuple = format_lifecycle_audit_row_tuple(&sample_audit_row());
+        assert!(tuple.starts_with('(') && tuple.ends_with(')'));
+        let inner = &tuple[1..tuple.len() - 1];
+        assert_eq!(
+            inner.matches(',').count(),
+            15,
+            "16 columns → 15 separating commas"
+        );
+    }
+
+    #[test]
+    fn test_audit_tuple_renders_states_and_transition() {
+        let tuple = format_lifecycle_audit_row_tuple(&sample_audit_row());
+        // ts divided to micros, security_id, segment, from→to states.
+        assert!(
+            tuple.starts_with("(1700000000000000, 1699920000000000, 99887, 'NSE_FNO',"),
+            "leading fields: {tuple}"
+        );
+        assert!(
+            tuple.contains("'active', 'expired_from_fno', 'expired'"),
+            "from/to/kind: {tuple}"
+        );
+        assert!(tuple.contains("'TCS'"), "symbol_name_after: {tuple}");
+    }
+
+    #[test]
+    fn test_audit_tuple_appeared_has_empty_from_state() {
+        // `appeared` has no prior state → from_state None → renders ''.
+        let mut row = sample_audit_row();
+        row.from_state = None;
+        row.to_state = LifecycleState::Active;
+        row.transition_kind = TransitionKind::Appeared;
+        row.lifecycle_state_after = LifecycleState::Active;
+        let tuple = format_lifecycle_audit_row_tuple(&row);
+        assert!(
+            tuple.contains("'', 'active', 'appeared'"),
+            "appeared must render empty from_state then to_state + kind: {tuple}"
+        );
+    }
+
+    #[test]
+    fn test_audit_tuple_sanitizes_injection_in_operator_note() {
+        let mut row = sample_audit_row();
+        row.operator_note = "'); DROP TABLE instrument_lifecycle_audit;--";
+        let tuple = format_lifecycle_audit_row_tuple(&row);
+        assert!(
+            !tuple.contains("DROP TABLE instrument_lifecycle_audit;"),
+            "injection in operator_note must be neutralized: {tuple}"
+        );
+        assert!(tuple.starts_with('(') && tuple.ends_with(')'));
+    }
+
+    #[test]
+    fn test_audit_tuple_divides_timestamps_to_micros() {
+        let source = include_str!("instrument_lifecycle_persistence.rs");
+        for field in [
+            "row.ts_nanos_ist / 1_000",
+            "trading_date_ist_nanos / 1_000",
+            "expiry_date_after_nanos / 1_000",
+        ] {
+            assert!(
+                source.contains(field),
+                "audit tuple must divide `{field}` to micros"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ensure_instrument_lifecycle_audit_table_pub_fn_visible() {
+        let _ = ensure_instrument_lifecycle_audit_table;
+    }
+
+    #[tokio::test]
+    async fn test_append_instrument_lifecycle_audit_row_returns_err_when_questdb_unreachable() {
+        let cfg = cfg_unreachable();
+        let row = sample_audit_row();
+        let result = append_instrument_lifecycle_audit_row(&cfg, &row).await;
+        assert!(result.is_err(), "must propagate transport error");
+    }
+
+    #[tokio::test]
+    async fn test_append_instrument_lifecycle_audit_row_handles_appeared_transition() {
+        let cfg = cfg_unreachable();
+        let mut row = sample_audit_row();
+        row.from_state = None;
+        row.transition_kind = TransitionKind::Appeared;
+        row.field_deltas = "{\"lot_size\":[0,250]}";
+        let result = append_instrument_lifecycle_audit_row(&cfg, &row).await;
+        assert!(result.is_err(), "transport error path must propagate");
     }
 }
