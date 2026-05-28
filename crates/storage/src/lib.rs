@@ -88,6 +88,11 @@ pub mod disk_health_watcher;
 // §21. DDL + append helpers + Row struct land in Sub-PR #10b-ζ.
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod instrument_fetch_audit_persistence;
+// Lifecycle table contracts (§5/§6 SEBI never-delete) — schema constants
+// + DEDUP keys + LifecycleState/TransitionKind enums. Feature-gated per
+// rule §21. DDL + Row + append helpers land in follow-up sub-PRs.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod instrument_lifecycle_persistence;
 // PR #3 (2026-05-19): `greeks_persistence` module DELETED. greeks
 // pipeline retired alongside the indices-only universe. The
 // option_greeks / pcr_snapshots / dhan_option_chain_raw / greeks_verification

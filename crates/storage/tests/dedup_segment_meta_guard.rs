@@ -152,9 +152,14 @@ fn every_dedup_key_is_listed_here_for_auditing() {
     //   DEDUP_KEY_CANDLES (shadow_persistence.rs — shared by all 21
     //   plain candle tables).
     //
-    // Future Sub-PR #9 of the 2026-05-27 daily-universe expansion will
-    // add `DEDUP_KEY_INSTRUMENT_LIFECYCLE` + `DEDUP_KEY_INSTRUMENT_LIFECYCLE_AUDIT`
-    // — at which point this threshold should rise back to ≥4.
+    // The 2026-05-27 daily-universe lifecycle contracts added
+    // `DEDUP_KEY_INSTRUMENT_LIFECYCLE` + `DEDUP_KEY_INSTRUMENT_LIFECYCLE_AUDIT`
+    // (both segment-paired per I-P1-11), so the threshold rose from 2 to 4
+    // as anticipated. Current set touching `security_id`:
+    //   DEDUP_KEY_TICKS (tick_persistence.rs),
+    //   DEDUP_KEY_CANDLES (shadow_persistence.rs),
+    //   DEDUP_KEY_INSTRUMENT_LIFECYCLE (instrument_lifecycle_persistence.rs),
+    //   DEDUP_KEY_INSTRUMENT_LIFECYCLE_AUDIT (instrument_lifecycle_persistence.rs).
     let decls = collect_dedup_key_declarations();
     let keys_with_security_id: Vec<&str> = decls
         .iter()
@@ -162,9 +167,10 @@ fn every_dedup_key_is_listed_here_for_auditing() {
         .map(|(_, _, name, _)| name.as_str())
         .collect();
     assert!(
-        keys_with_security_id.len() >= 2,
-        "expected at least 2 DEDUP_KEY_* constants touching security_id \
-         (post #T5 candle_persistence removal), got {}: {:?}. A decrease \
+        keys_with_security_id.len() >= 4,
+        "expected at least 4 DEDUP_KEY_* constants touching security_id \
+         (DEDUP_KEY_TICKS, DEDUP_KEY_CANDLES, DEDUP_KEY_INSTRUMENT_LIFECYCLE, \
+         DEDUP_KEY_INSTRUMENT_LIFECYCLE_AUDIT), got {}: {:?}. A decrease \
          means a table was removed — verify the removal was intentional.",
         keys_with_security_id.len(),
         keys_with_security_id,
