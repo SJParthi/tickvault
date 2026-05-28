@@ -77,6 +77,11 @@ pub mod lifecycle_apply;
 // Feature-gated §21; boot wiring is a follow-up.
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod apply_reconcile_plan;
+// App-side reconcile orchestrator: chains extract → load-prev → plan →
+// apply into one async entry point. Fail-closed on read-back error.
+// Feature-gated §21; the HTTP-fetch/retry/main.rs spawn is a follow-up.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod lifecycle_reconcile_orchestrator;
 // 2026-05-25 — Crash-recovery REHYDRATE of the option-chain current-
 // expiry cache from QuestDB's `option_chain_minute_snapshot` table.
 // See `option_chain_cache_loader.rs` module docs for the 3-tier
