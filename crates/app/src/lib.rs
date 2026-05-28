@@ -52,6 +52,11 @@ pub mod metrics_catalog;
 // final Sub-PR #10 orchestrator.
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod instr_fetch_audit_writer;
+// Boot-time read-back of yesterday's instrument_lifecycle rows — the
+// read-side primitive the daily reconciler I/O loop diffs against today's
+// CSV. Feature-gated per rule §21.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod lifecycle_cache_loader;
 pub mod observability;
 // 2026-05-25 — Crash-recovery REHYDRATE of the option-chain current-
 // expiry cache from QuestDB's `option_chain_minute_snapshot` table.

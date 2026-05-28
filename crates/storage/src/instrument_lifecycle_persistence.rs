@@ -165,6 +165,23 @@ impl LifecycleState {
         }
     }
 
+    /// Parse a wire-format SYMBOL label back into a [`LifecycleState`].
+    /// Returns `None` for any unrecognized string — the read-back loader
+    /// counts these as "unknown state" rather than guessing, so a future
+    /// schema drift surfaces instead of silently mis-classifying.
+    /// Exact inverse of [`as_str`](Self::as_str).
+    #[must_use]
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "active" => Some(Self::Active),
+            "expired_from_fno" => Some(Self::ExpiredFromFno),
+            "expired_contract" => Some(Self::ExpiredContract),
+            "expired_index" => Some(Self::ExpiredIndex),
+            "delisted" => Some(Self::Delisted),
+            _ => None,
+        }
+    }
+
     /// True only for `Active`. Dashboards + the subscription dispatcher
     /// MUST filter `WHERE lifecycle_state = 'active'`.
     #[must_use]
@@ -846,6 +863,24 @@ mod tests {
         assert_eq!(LifecycleState::ExpiredContract.as_str(), "expired_contract");
         assert_eq!(LifecycleState::ExpiredIndex.as_str(), "expired_index");
         assert_eq!(LifecycleState::Delisted.as_str(), "delisted");
+    }
+
+    #[test]
+    fn test_lifecycle_state_from_wire_roundtrips_every_variant() {
+        for v in LifecycleState::all() {
+            assert_eq!(
+                LifecycleState::from_wire(v.as_str()),
+                Some(v),
+                "from_wire(as_str()) must roundtrip for {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lifecycle_state_from_wire_rejects_unknown() {
+        assert_eq!(LifecycleState::from_wire("nonsense"), None);
+        assert_eq!(LifecycleState::from_wire(""), None);
+        assert_eq!(LifecycleState::from_wire("ACTIVE"), None, "case-sensitive");
     }
 
     #[test]
