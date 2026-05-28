@@ -70,7 +70,13 @@ const DERIVATIVE_INSTRUMENT_PREFIXES: &[&str] = &[
 /// Strings are owned; the parser sanitizes `symbol_name` against BiDi
 /// override unicode + ILP-injection characters per the audit-string
 /// rule.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// NOTE: `Eq` was dropped when the f64 detail fields (`tick_size`,
+// `strike_price`) were added — `f64: !Eq`. `CsvRow` is only ever a map
+// VALUE (`HashMap<String, CsvRow>`) / `Vec<CsvRow>`, never a key, so
+// `Eq`/`Hash` are not required. `Default` is derived so the (test-only)
+// construction sites can spread `..Default::default()` for the optional
+// detail fields.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct CsvRow {
     pub security_id: String,
     pub exch_id: String,
@@ -81,6 +87,25 @@ pub struct CsvRow {
     /// validate that this resolves to a real NSE_EQ row — that cross-
     /// check lives in Sub-PR #5+.
     pub underlying_security_id: String,
+    // ---- Optional detail columns (Dhan Detailed CSV) ----
+    // Not mandatory: indices have no lot/strike/expiry; the parser
+    // defaults each to empty/0 when the column is absent or the cell is
+    // blank/unparseable (best-effort — never rejects a row over these).
+    /// `UNDERLYING_SYMBOL` — symbol of the underlying (derivatives only).
+    pub underlying_symbol: String,
+    /// `DISPLAY_NAME` — human-readable Dhan display name.
+    pub display_name: String,
+    /// `LOT_SIZE` — trading lot (0 if absent/unparseable).
+    pub lot_size: i32,
+    /// `TICK_SIZE` — minimum price increment (0.0 if absent/unparseable).
+    pub tick_size: f64,
+    /// `SM_EXPIRY_DATE` — raw `YYYY-MM-DD` string (empty for spot/index).
+    /// Date→nanos conversion happens in the lifecycle-extraction layer.
+    pub expiry_date: String,
+    /// `STRIKE_PRICE` — options only (0.0 if absent/unparseable).
+    pub strike_price: f64,
+    /// `OPTION_TYPE` — `CE` / `PE` / empty for non-options.
+    pub option_type: String,
 }
 
 /// Errors that can occur during CSV parsing.
@@ -199,6 +224,14 @@ struct ColumnIndices {
     instrument: usize,
     symbol_name: usize,
     underlying_security_id: usize,
+    // Optional detail columns — `usize::MAX` sentinel when absent.
+    underlying_symbol: usize,
+    display_name: usize,
+    lot_size: usize,
+    tick_size: usize,
+    expiry_date: usize,
+    strike_price: usize,
+    option_type: usize,
 }
 
 fn build_column_indices<R: std::io::Read>(
@@ -224,7 +257,53 @@ fn build_column_indices<R: std::io::Read>(
         // not present at all. If the header is missing we treat all
         // rows as having an empty value (handled in extract_row).
         underlying_security_id: find("UNDERLYING_SECURITY_ID").unwrap_or(usize::MAX),
+        // Detail columns are all OPTIONAL — `usize::MAX` when the header
+        // is absent, so the parser still works on a Compact CSV. Column
+        // names per `docs/dhan-ref/09-instrument-master.md` §2.
+        underlying_symbol: find("UNDERLYING_SYMBOL").unwrap_or(usize::MAX),
+        display_name: find("DISPLAY_NAME").unwrap_or(usize::MAX),
+        lot_size: find("LOT_SIZE").unwrap_or(usize::MAX),
+        tick_size: find("TICK_SIZE").unwrap_or(usize::MAX),
+        expiry_date: find("SM_EXPIRY_DATE").unwrap_or(usize::MAX),
+        strike_price: find("STRIKE_PRICE").unwrap_or(usize::MAX),
+        option_type: find("OPTION_TYPE").unwrap_or(usize::MAX),
     })
+}
+
+/// Read an optional string cell — empty when the column is absent.
+/// Sanitized against ILP/BiDi per the audit-string rule.
+fn opt_str(record: &csv::StringRecord, idx: usize) -> String {
+    if idx == usize::MAX {
+        return String::new();
+    }
+    sanitize_audit_string(record.get(idx).unwrap_or("").trim())
+}
+
+/// Read an optional `i32` cell — 0 when absent/blank/unparseable
+/// (best-effort; these fields never reject a row).
+fn opt_i32(record: &csv::StringRecord, idx: usize) -> i32 {
+    if idx == usize::MAX {
+        return 0;
+    }
+    record
+        .get(idx)
+        .unwrap_or("")
+        .trim()
+        .parse::<i32>()
+        .unwrap_or(0)
+}
+
+/// Read an optional `f64` cell — 0.0 when absent/blank/unparseable.
+fn opt_f64(record: &csv::StringRecord, idx: usize) -> f64 {
+    if idx == usize::MAX {
+        return 0.0;
+    }
+    record
+        .get(idx)
+        .unwrap_or("")
+        .trim()
+        .parse::<f64>()
+        .unwrap_or(0.0)
 }
 
 /// Extract one validated CSV row. Returns `None` if any mandatory
@@ -268,6 +347,14 @@ fn extract_row(record: &csv::StringRecord, idx: &ColumnIndices) -> Option<CsvRow
         instrument: instrument.to_string(),
         symbol_name: symbol_name_clean,
         underlying_security_id: underlying_security_id.to_string(),
+        // Optional detail columns — best-effort, never reject the row.
+        underlying_symbol: opt_str(record, idx.underlying_symbol),
+        display_name: opt_str(record, idx.display_name),
+        lot_size: opt_i32(record, idx.lot_size),
+        tick_size: opt_f64(record, idx.tick_size),
+        expiry_date: opt_str(record, idx.expiry_date),
+        strike_price: opt_f64(record, idx.strike_price),
+        option_type: opt_str(record, idx.option_type),
     })
 }
 
@@ -292,6 +379,86 @@ mod tests {
             buf.push_str(row);
         }
         buf.into_bytes()
+    }
+
+    /// Detailed header with the optional detail columns appended.
+    const DETAILED_HEADER: &str = "SECURITY_ID,EXCH_ID,SEGMENT,INSTRUMENT,SYMBOL_NAME,\
+         UNDERLYING_SECURITY_ID,UNDERLYING_SYMBOL,DISPLAY_NAME,LOT_SIZE,TICK_SIZE,\
+         SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE";
+
+    #[test]
+    fn minimal_csv_defaults_detail_columns_when_absent() {
+        // The Compact/minimal header has none of the detail columns —
+        // they must default to empty/0 (parser still works, no reject).
+        let bytes = make_csv(VALID_HEADER, &["13,NSE,IDX_I,INDEX,NIFTY,"]);
+        let rows = parse_detailed_csv(&bytes).expect("parse");
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.underlying_symbol, "");
+        assert_eq!(r.display_name, "");
+        assert_eq!(r.lot_size, 0);
+        assert!((r.tick_size - 0.0).abs() < f64::EPSILON);
+        assert_eq!(r.expiry_date, "");
+        assert!((r.strike_price - 0.0).abs() < f64::EPSILON);
+        assert_eq!(r.option_type, "");
+    }
+
+    #[test]
+    fn detailed_csv_parses_option_detail_columns() {
+        let bytes = make_csv(
+            DETAILED_HEADER,
+            &[
+                "43581,NSE,NSE_FNO,OPTSTK,TCS-25Dec-4000-CE,11536,TCS,TCS 25 DEC 4000 CALL,\
+               175,0.05,2025-12-25,4000.5,CE",
+            ],
+        );
+        let rows = parse_detailed_csv(&bytes).expect("parse");
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.underlying_symbol, "TCS");
+        assert_eq!(r.display_name, "TCS 25 DEC 4000 CALL");
+        assert_eq!(r.lot_size, 175);
+        assert!((r.tick_size - 0.05).abs() < f64::EPSILON);
+        assert_eq!(r.expiry_date, "2025-12-25");
+        assert!((r.strike_price - 4000.5).abs() < f64::EPSILON);
+        assert_eq!(r.option_type, "CE");
+    }
+
+    #[test]
+    fn detail_columns_blank_or_unparseable_default_safely() {
+        // An index row in the Detailed schema: detail cells blank /
+        // non-numeric must default to empty/0, never reject the row.
+        let bytes = make_csv(
+            DETAILED_HEADER,
+            &["13,NSE,IDX_I,INDEX,NIFTY,,,NIFTY 50,,notanumber,,,"],
+        );
+        let rows = parse_detailed_csv(&bytes).expect("parse");
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.display_name, "NIFTY 50");
+        assert_eq!(r.lot_size, 0, "blank LOT_SIZE → 0");
+        assert!(
+            (r.tick_size - 0.0).abs() < f64::EPSILON,
+            "non-numeric TICK_SIZE → 0.0"
+        );
+        assert_eq!(r.option_type, "");
+    }
+
+    #[test]
+    fn detail_string_columns_are_sanitized() {
+        // A BiDi/ILP-injection attempt in DISPLAY_NAME must be neutralized
+        // (same sanitize_audit_string path as symbol_name).
+        let bytes = make_csv(
+            DETAILED_HEADER,
+            &["13,NSE,IDX_I,INDEX,NIFTY,,,'); DROP TABLE x;--,0,0.05,,0,"],
+        );
+        let rows = parse_detailed_csv(&bytes).expect("parse");
+        assert_eq!(rows.len(), 1);
+        assert!(
+            !rows[0].display_name.contains("DROP TABLE x;"),
+            "display_name injection must be neutralized: {}",
+            rows[0].display_name
+        );
     }
 
     #[test]

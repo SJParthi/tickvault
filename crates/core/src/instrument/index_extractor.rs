@@ -160,6 +160,7 @@ mod tests {
             instrument: instrument.to_string(),
             symbol_name: symbol.to_string(),
             underlying_security_id: String::new(),
+            ..Default::default()
         }
     }
 
@@ -171,6 +172,7 @@ mod tests {
             instrument: "EQUITY".to_string(),
             symbol_name: symbol.to_string(),
             underlying_security_id: String::new(),
+            ..Default::default()
         }
     }
 
@@ -253,6 +255,7 @@ mod tests {
                 instrument: "FUTSTK".to_string(),
                 symbol_name: "RELIANCE26JUNFUT".to_string(),
                 underlying_security_id: "2885".to_string(),
+                ..Default::default()
             },
         ];
         let result = extract_indices(&rows).expect("extract");
@@ -285,6 +288,7 @@ mod tests {
                 instrument: "index".to_string(),
                 symbol_name: "NIFTY".to_string(),
                 underlying_security_id: String::new(),
+                ..Default::default()
             },
             CsvRow {
                 security_id: "51".to_string(),
@@ -293,6 +297,7 @@ mod tests {
                 instrument: "index".to_string(),
                 symbol_name: "sensex".to_string(), // lowercase
                 underlying_security_id: String::new(),
+                ..Default::default()
             },
         ];
         let result = extract_indices(&rows).expect("extract");
