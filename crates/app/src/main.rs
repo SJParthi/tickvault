@@ -3114,13 +3114,16 @@ async fn main() -> Result<()> {
     // they are not depth-specific.
     // -----------------------------------------------------------------------
     if should_connect_ws && subscription_plan.is_some() {
-        // Build FnoUniverse Arc for the pre-open snapshotter (one-time clone at boot)
-        let rebalancer_universe: Option<std::sync::Arc<FnoUniverse>> =
-            slow_boot_universe.as_ref().map(|u| {
-                std::sync::Arc::new(u.clone()) // O(1) EXEMPT: boot-time universe clone
-            });
-
-        if let Some(_universe_arc) = rebalancer_universe {
+        // C1 fix (PR-2): the DayOhlcTracker + 09:14 readiness + 09:15:30
+        // streaming-confirmation tasks below are NOT universe-specific — they
+        // filter ticks by segment, not by an instrument list. They must run
+        // whenever a subscription plan exists, under BOTH Indices4Only and
+        // DailyUniverse. Previously this was gated on `slow_boot_universe`
+        // being Some; under DailyUniverse the universe is None (the ~250-SID
+        // plan is the source of truth, not an FnoUniverse), which silently
+        // skipped all three tasks — a false-OK regression. The outer
+        // `subscription_plan.is_some()` (above) is the correct gate.
+        {
             // -----------------------------------------------------------------
             // DayOhlcTracker boot wiring (post 2026-05-26 simplification).
             //
