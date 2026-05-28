@@ -178,7 +178,7 @@ mod tests {
     // ---- is_stock_split ---------------------------------------------------
 
     #[test]
-    fn test_split_detected_when_lot_size_halves() {
+    fn test_is_stock_split_detected_when_lot_size_halves() {
         // TCS 1000 → 250 lot (split).
         assert!(is_stock_split(1000, 250, 0.05, 0.05));
         // Exactly half also counts.
@@ -212,7 +212,7 @@ mod tests {
     // ---- classify_disappearance_state ------------------------------------
 
     #[test]
-    fn test_disappearance_index_maps_to_expired_index() {
+    fn test_classify_disappearance_state_index_maps_to_expired_index() {
         assert_eq!(
             classify_disappearance_state("INDEX"),
             LifecycleState::ExpiredIndex
@@ -253,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn test_transition_no_prior_row_is_appeared() {
+    fn test_classify_transition_no_prior_row_is_appeared() {
         let mut i = base_input();
         i.prev_state = None;
         assert_eq!(
