@@ -168,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_first_seen_preserves_prior() {
+    fn test_resolve_first_seen_nanos_preserves_prior() {
         let prev = prev_with_first_seen(1_699_920_000_000_000_000);
         let today = 1_700_500_000_000_000_000;
         assert_eq!(
