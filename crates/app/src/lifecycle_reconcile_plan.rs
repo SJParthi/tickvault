@@ -220,6 +220,7 @@ mod tests {
             lot_size: lot,
             tick_size: tick,
             symbol_name: sym.to_string(),
+            first_seen_date_nanos: 0,
         }
     }
 

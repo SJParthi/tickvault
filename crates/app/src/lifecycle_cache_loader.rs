@@ -24,8 +24,8 @@
 //!
 //! `SELECT security_id, exchange_segment, lifecycle_state,
 //! lifecycle_state_locked, instrument_type, lot_size, tick_size,
-//! symbol_name FROM instrument_lifecycle WHERE dry_run = false` — the
-//! QuestDB `/exec` `dataset` rows are:
+//! symbol_name, cast(first_seen_date as long) FROM instrument_lifecycle
+//! WHERE dry_run = false` — the QuestDB `/exec` `dataset` rows are:
 //!
 //! 1. `security_id` LONG → i64
 //! 2. `exchange_segment` SYMBOL → String
@@ -35,6 +35,8 @@
 //! 6. `lot_size` INT → i32
 //! 7. `tick_size` DOUBLE → f64
 //! 8. `symbol_name` SYMBOL → String
+//! 9. `cast(first_seen_date as long)` → i64 micros (×1000 → nanos);
+//!    `apply` preserves it on an existing-row UPSERT
 //!
 //! Only `dry_run = false` rows are read — §27 dry-run rows must never
 //! seed the next live reconcile.
@@ -65,6 +67,11 @@ pub struct PrevLifecycleAttrs {
     pub lot_size: i32,
     pub tick_size: f64,
     pub symbol_name: String,
+    /// `first_seen_date` (IST nanos) — the first time this instrument was
+    /// EVER observed. `apply` PRESERVES this on an UPSERT of an existing
+    /// row (a full-row write must not reset "first seen" to today). Read
+    /// via `cast(first_seen_date as long)` (micros) × 1000.
+    pub first_seen_date_nanos: i64,
 }
 
 /// Composite key per I-P1-11 — `security_id` alone is NOT unique.
@@ -92,9 +99,12 @@ pub struct LifecycleParseResult {
 /// so the reconciler can detect reactivation; excludes §27 dry-run rows.
 #[must_use]
 pub fn build_lifecycle_select_sql() -> String {
+    // `first_seen_date` is a TIMESTAMP; `cast(... as long)` returns it as
+    // epoch-microseconds (a JSON number), avoiding ISO-8601 parsing.
     format!(
         "SELECT security_id, exchange_segment, lifecycle_state, \
-         lifecycle_state_locked, instrument_type, lot_size, tick_size, symbol_name \
+         lifecycle_state_locked, instrument_type, lot_size, tick_size, symbol_name, \
+         cast(first_seen_date as long) \
          FROM {QUESTDB_TABLE_INSTRUMENT_LIFECYCLE} WHERE dry_run = false"
     )
 }
@@ -113,7 +123,7 @@ pub fn parse_questdb_lifecycle_dataset(dataset: &Value) -> LifecycleParseResult 
             out.skipped_malformed = out.skipped_malformed.saturating_add(1);
             continue;
         };
-        if cells.len() < 8 {
+        if cells.len() < 9 {
             out.skipped_malformed = out.skipped_malformed.saturating_add(1);
             continue;
         }
@@ -126,6 +136,7 @@ pub fn parse_questdb_lifecycle_dataset(dataset: &Value) -> LifecycleParseResult 
             Some(lot_size),
             Some(tick_size),
             Some(symbol_name),
+            Some(first_seen_micros),
         ) = (
             cells[0].as_i64(),
             cells[1].as_str(),
@@ -135,6 +146,7 @@ pub fn parse_questdb_lifecycle_dataset(dataset: &Value) -> LifecycleParseResult 
             cells[5].as_i64(),
             cells[6].as_f64(),
             cells[7].as_str(),
+            cells[8].as_i64(),
         )
         else {
             out.skipped_malformed = out.skipped_malformed.saturating_add(1);
@@ -145,6 +157,8 @@ pub fn parse_questdb_lifecycle_dataset(dataset: &Value) -> LifecycleParseResult 
             continue;
         };
         let lot_size = i32::try_from(lot_size).unwrap_or(0);
+        // micros → nanos (the lifecycle row writer divides nanos→micros).
+        let first_seen_date_nanos = first_seen_micros.saturating_mul(1_000);
         out.rows.insert(
             (security_id, exchange_segment.to_string()),
             PrevLifecycleAttrs {
@@ -154,6 +168,7 @@ pub fn parse_questdb_lifecycle_dataset(dataset: &Value) -> LifecycleParseResult 
                 lot_size,
                 tick_size,
                 symbol_name: symbol_name.to_string(),
+                first_seen_date_nanos,
             },
         );
     }
@@ -240,12 +255,26 @@ mod tests {
         ] {
             assert!(sql.contains(col), "SELECT must include `{col}`");
         }
+        assert!(
+            sql.contains("cast(first_seen_date as long)"),
+            "SELECT must read first_seen_date as long micros for apply to preserve it"
+        );
     }
 
     #[test]
     fn test_parse_questdb_lifecycle_dataset_well_formed_active_row() {
-        let dataset =
-            serde_json::json!([[13, "IDX_I", "active", false, "INDEX", 0, 0.05, "NIFTY"]]);
+        // 9th cell = first_seen_date micros (1_699_920_000_000_000 µs).
+        let dataset = serde_json::json!([[
+            13,
+            "IDX_I",
+            "active",
+            false,
+            "INDEX",
+            0,
+            0.05,
+            "NIFTY",
+            1_699_920_000_000_000_i64
+        ]]);
         let r = parse_questdb_lifecycle_dataset(&dataset);
         assert_eq!(r.rows.len(), 1);
         assert_eq!(r.skipped_malformed, 0);
@@ -257,6 +286,8 @@ mod tests {
         assert_eq!(attrs.lot_size, 0);
         assert!((attrs.tick_size - 0.05).abs() < f64::EPSILON);
         assert_eq!(attrs.symbol_name, "NIFTY");
+        // micros × 1000 → nanos.
+        assert_eq!(attrs.first_seen_date_nanos, 1_699_920_000_000_000_000_i64);
     }
 
     #[test]
@@ -270,7 +301,8 @@ mod tests {
                 "EQUITY",
                 250,
                 0.05,
-                "TCS"
+                "TCS",
+                1_699_920_000_000_000_i64
             ],
             [
                 51,
@@ -280,7 +312,8 @@ mod tests {
                 "INDEX",
                 0,
                 0.05,
-                "SENSEX"
+                "SENSEX",
+                0
             ]
         ]);
         let r = parse_questdb_lifecycle_dataset(&dataset);
@@ -289,6 +322,7 @@ mod tests {
         assert_eq!(tcs.state, LifecycleState::ExpiredFromFno);
         assert!(tcs.locked);
         assert_eq!(tcs.lot_size, 250);
+        assert_eq!(tcs.first_seen_date_nanos, 1_699_920_000_000_000_000_i64);
     }
 
     #[test]
@@ -301,7 +335,8 @@ mod tests {
             "EQUITY",
             1,
             0.05,
-            "X"
+            "X",
+            0
         ]]);
         let r = parse_questdb_lifecycle_dataset(&dataset);
         assert_eq!(r.rows.len(), 0);
@@ -312,9 +347,9 @@ mod tests {
     #[test]
     fn test_parse_malformed_rows_counted() {
         let dataset = serde_json::json!([
-            [13, "IDX_I", "active", false, "INDEX", 0, 0.05], // too few cells (7)
+            [13, "IDX_I", "active", false, "INDEX", 0, 0.05, "NIFTY"], // 8 cells (< 9)
             "not_an_array",
-            [13, "IDX_I", "active", false, "INDEX", 0, 0.05, "NIFTY"] // good
+            [13, "IDX_I", "active", false, "INDEX", 0, 0.05, "NIFTY", 0] // good (9)
         ]);
         let r = parse_questdb_lifecycle_dataset(&dataset);
         assert_eq!(r.rows.len(), 1);
@@ -337,7 +372,8 @@ mod tests {
 
     #[test]
     fn test_parse_bad_cell_type_is_malformed() {
-        // security_id is a string, not a number.
+        // security_id is a string, not a number (9 cells so it reaches
+        // the type-coercion path, not the <9 length check).
         let dataset = serde_json::json!([[
             "not_a_number",
             "IDX_I",
@@ -346,8 +382,39 @@ mod tests {
             "INDEX",
             0,
             0.05,
-            "NIFTY"
+            "NIFTY",
+            0
         ]]);
+        let r = parse_questdb_lifecycle_dataset(&dataset);
+        assert_eq!(r.rows.len(), 0);
+        assert_eq!(r.skipped_malformed, 1);
+    }
+
+    #[test]
+    fn test_parse_first_seen_micros_converted_to_nanos() {
+        // first_seen_date micros × 1000 → nanos, so apply can preserve it.
+        let dataset = serde_json::json!([[
+            13,
+            "IDX_I",
+            "active",
+            false,
+            "INDEX",
+            0,
+            0.05,
+            "NIFTY",
+            1_700_000_000_000_000_i64
+        ]]);
+        let r = parse_questdb_lifecycle_dataset(&dataset);
+        let attrs = r.rows.get(&(13, "IDX_I".to_string())).expect("row");
+        assert_eq!(attrs.first_seen_date_nanos, 1_700_000_000_000_000_000_i64);
+    }
+
+    #[test]
+    fn test_parse_eight_cell_row_now_malformed() {
+        // The first_seen column made the contract 9 cells; an 8-cell row
+        // (the old shape) is now malformed, not silently accepted.
+        let dataset =
+            serde_json::json!([[13, "IDX_I", "active", false, "INDEX", 0, 0.05, "NIFTY"]]);
         let r = parse_questdb_lifecycle_dataset(&dataset);
         assert_eq!(r.rows.len(), 0);
         assert_eq!(r.skipped_malformed, 1);
