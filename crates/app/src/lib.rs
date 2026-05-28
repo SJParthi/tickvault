@@ -72,6 +72,11 @@ pub mod today_instrument;
 // Feature-gated §21; the async apply loop is a follow-up.
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod lifecycle_apply;
+// The async apply step: walks the reconcile plan applying §24 audit-first
+// ordering (append audit row → UPSERT present / UPDATE disappearance).
+// Feature-gated §21; boot wiring is a follow-up.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod apply_reconcile_plan;
 // 2026-05-25 — Crash-recovery REHYDRATE of the option-chain current-
 // expiry cache from QuestDB's `option_chain_minute_snapshot` table.
 // See `option_chain_cache_loader.rs` module docs for the 3-tier
