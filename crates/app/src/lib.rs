@@ -62,7 +62,11 @@ pub mod lifecycle_cache_loader;
 // Feature-gated per rule §21.
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod lifecycle_reconcile_plan;
+// Extract today's full per-instrument detail from the built DailyUniverse
+// (#845 parser detail) for the lifecycle-row UPSERT. Feature-gated §21.
 pub mod observability;
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod today_instrument;
 // 2026-05-25 — Crash-recovery REHYDRATE of the option-chain current-
 // expiry cache from QuestDB's `option_chain_minute_snapshot` table.
 // See `option_chain_cache_loader.rs` module docs for the 3-tier
