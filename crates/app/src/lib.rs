@@ -57,6 +57,11 @@ pub mod instr_fetch_audit_writer;
 // CSV. Feature-gated per rule §21.
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod lifecycle_cache_loader;
+// Daily reconcile-plan computation — pure diff of today's universe vs
+// yesterday's read-back into a list of state transitions to persist.
+// Feature-gated per rule §21.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod lifecycle_reconcile_plan;
 pub mod observability;
 // 2026-05-25 — Crash-recovery REHYDRATE of the option-chain current-
 // expiry cache from QuestDB's `option_chain_minute_snapshot` table.
