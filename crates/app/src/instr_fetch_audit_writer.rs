@@ -253,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn test_map_error_code_covers_all_four_instr_fetch_codes() {
+    fn test_map_error_code_to_fetch_outcome_covers_all_four() {
         assert_eq!(
             map_error_code_to_fetch_outcome(ErrorCode::InstrFetch01CsvHardFailed),
             Some(FetchOutcome::CsvHardFailed)
@@ -273,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn test_map_error_code_returns_none_for_non_fetch_code() {
+    fn test_map_error_code_to_fetch_outcome_none_for_non_fetch_code() {
         // A non-INSTR-FETCH code must NOT be silently mapped to a fetch
         // outcome — we refuse to write a misleading audit row.
         assert_eq!(
