@@ -243,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_well_formed_active_row() {
+    fn test_parse_questdb_lifecycle_dataset_well_formed_active_row() {
         let dataset =
             serde_json::json!([[13, "IDX_I", "active", false, "INDEX", 0, 0.05, "NIFTY"]]);
         let r = parse_questdb_lifecycle_dataset(&dataset);
