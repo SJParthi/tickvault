@@ -121,7 +121,9 @@ mod tests {
     }
 
     fn index_err() -> OrchestratorError {
-        OrchestratorError::IndexExtract(IndexExtractError::BseSensexMissing)
+        OrchestratorError::IndexExtract(IndexExtractError::BseSensexMissing {
+            bse_idx_symbols_seen: Vec::new(),
+        })
     }
 
     fn build_err() -> OrchestratorError {

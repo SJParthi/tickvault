@@ -85,8 +85,16 @@ pub enum IndexExtractError {
 
     /// BSE SENSEX row is missing from the CSV. Per operator quote 2 of
     /// the rule file §0 this row MUST be present; boot HALTS otherwise.
-    #[error("BSE SENSEX IDX_I row missing — operator-locked §0 quote 2")]
-    BseSensexMissing,
+    ///
+    /// `bse_idx_symbols_seen` names the BSE `IDX_I` `INDEX` symbols that
+    /// WERE present so the operator can immediately tell whether Dhan
+    /// renamed SENSEX (e.g. `"BSE SENSEX"`, `"SENSEX 30"`) rather than
+    /// dropping it — without re-running under a debugger.
+    #[error(
+        "BSE SENSEX IDX_I row missing — operator-locked §0 quote 2 — BSE IDX_I symbols seen: [{}]",
+        bse_idx_symbols_seen.join(", ")
+    )]
+    BseSensexMissing { bse_idx_symbols_seen: Vec<String> },
 }
 
 /// Extract every `IDX_I` index row from the parsed CSV per §2.
@@ -103,6 +111,9 @@ pub enum IndexExtractError {
 pub fn extract_indices(rows: &[CsvRow]) -> Result<IndexExtraction, IndexExtractError> {
     let mut nse_indices: Vec<CsvRow> = Vec::new();
     let mut bse_sensex: Option<CsvRow> = None;
+    // Track BSE IDX_I symbols seen, so a SENSEX-rename surfaces in the
+    // rejection error instead of an opaque "missing".
+    let mut bse_idx_symbols_seen: Vec<String> = Vec::new();
 
     for row in rows {
         if !is_idx_i_index(&row.segment, &row.instrument) {
@@ -111,13 +122,15 @@ pub fn extract_indices(rows: &[CsvRow]) -> Result<IndexExtraction, IndexExtractE
 
         if row.exch_id.eq_ignore_ascii_case(EXCH_ID_NSE) {
             nse_indices.push(row.clone());
-        } else if row.exch_id.eq_ignore_ascii_case(EXCH_ID_BSE) && is_bse_sensex(&row.symbol_name) {
-            // Operator-locked: only the SINGLE BSE SENSEX row is in
-            // scope, not other BSE indices.
-            bse_sensex = Some(row.clone());
+        } else if row.exch_id.eq_ignore_ascii_case(EXCH_ID_BSE) {
+            bse_idx_symbols_seen.push(row.symbol_name.clone());
+            if is_bse_sensex(&row.symbol_name) {
+                // Operator-locked: only the SINGLE BSE SENSEX row is in
+                // scope, not other BSE indices.
+                bse_sensex = Some(row.clone());
+            }
+            // Any other BSE IDX_I symbol is silently ignored per §2 scope.
         }
-        // Any other (segment=IDX_I, exch=BSE, symbol != SENSEX) row is
-        // silently ignored per §2 universe scope.
     }
 
     if nse_indices.is_empty() {
@@ -127,7 +140,9 @@ pub fn extract_indices(rows: &[CsvRow]) -> Result<IndexExtraction, IndexExtractE
     }
 
     if bse_sensex.is_none() {
-        return Err(IndexExtractError::BseSensexMissing);
+        return Err(IndexExtractError::BseSensexMissing {
+            bse_idx_symbols_seen,
+        });
     }
 
     Ok(IndexExtraction {
@@ -209,7 +224,30 @@ mod tests {
         // is a HALT condition.
         let rows = vec![idx_i_row("13", "NSE", "INDEX", "NIFTY")];
         let result = extract_indices(&rows);
-        assert!(matches!(result, Err(IndexExtractError::BseSensexMissing)));
+        assert!(matches!(
+            result,
+            Err(IndexExtractError::BseSensexMissing { .. })
+        ));
+    }
+
+    #[test]
+    fn bse_sensex_missing_error_lists_bse_symbols_seen() {
+        // If Dhan renames SENSEX, the error must name the BSE IDX_I symbols
+        // that WERE present so the operator can spot the rename instantly.
+        let rows = vec![
+            idx_i_row("13", "NSE", "INDEX", "NIFTY"),
+            idx_i_row("99", "BSE", "INDEX", "BSE SENSEX"), // renamed — not exact "SENSEX"
+            idx_i_row("52", "BSE", "INDEX", "BANKEX"),
+        ];
+        let err = extract_indices(&rows).expect_err("must reject");
+        let IndexExtractError::BseSensexMissing {
+            bse_idx_symbols_seen,
+        } = err
+        else {
+            panic!("expected BseSensexMissing, got {err:?}");
+        };
+        assert!(bse_idx_symbols_seen.iter().any(|s| s == "BSE SENSEX"));
+        assert!(bse_idx_symbols_seen.iter().any(|s| s == "BANKEX"));
     }
 
     #[test]
