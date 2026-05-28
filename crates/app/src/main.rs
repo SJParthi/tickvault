@@ -44,6 +44,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use tickvault_common::config::ApplicationConfig;
+use tickvault_common::config::SubscriptionScope;
 use tickvault_common::instrument_types::FnoUniverse;
 use tickvault_common::trading_calendar::{TradingCalendar, ist_offset};
 use tickvault_core::auth::secret_manager;
@@ -1023,7 +1024,7 @@ async fn main() -> Result<()> {
 
         // --- Load instruments (sub-1ms from rkyv cache during market hours) ---
         let (subscription_plan, fresh_universe, _needs_persist) =
-            load_instruments(&config, is_trading, trading_calendar.as_ref()).await;
+            load_instruments(&config, is_trading, trading_calendar.as_ref()).await?;
 
         // Audit finding #6 (2026-04-24): emit InstrumentBuildSuccess when
         // instruments load successfully. Previously only the FAILURE path
@@ -2174,86 +2175,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Step 6c (go-live PR-1 of the daily-universe sequence) — daily-universe
-    // instrument fetch. Feature-gated by `daily_universe_fetcher`
-    // (`daily-universe-scope-expansion-2026-05-27.md` §21); the prod default
-    // flip is the final PR of this sequence. When compiled in, download the
-    // Dhan Detailed CSV, build the ~250-SID universe, and reconcile it into the
-    // instrument_lifecycle / instrument_lifecycle_audit / instrument_fetch_audit
-    // tables.
-    //
-    // FAIL-CLOSED per operator §4 lock: infinite retry (max_attempts = None)
-    // with escalating Telegram at attempts 4/11/21; boot BLOCKS until a fresh,
-    // validated CSV is in hand. A reconcile/audit error (QuestDB) HALTS boot
-    // rather than proceeding on unknown state. QuestDB readiness is confirmed
-    // above. The scope-aware WS subscription that actually streams the ~250
-    // SIDs lands in the next PR (the planner does not consume DailyUniverse
-    // yet), and the prod default flip is the PR after that.
-    // -----------------------------------------------------------------------
-    #[cfg(feature = "daily_universe_fetcher")]
-    {
-        use anyhow::Context;
-        use std::sync::Arc;
-        use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
-        use tickvault_core::instrument::csv_downloader::CsvDownloader;
-        use tickvault_storage::instrument_fetch_audit_persistence::ensure_instrument_fetch_audit_table;
-        use tickvault_storage::instrument_lifecycle_persistence::{
-            ensure_instrument_lifecycle_audit_table, ensure_instrument_lifecycle_table,
-        };
-
-        info!(
-            "Step 6c: daily-universe instrument fetch (feature daily_universe_fetcher ON, fail-closed §4)"
-        );
-
-        // Idempotent CREATE TABLE IF NOT EXISTS for the 3 lifecycle/audit
-        // tables — run_daily_universe_boot's downstream writers assume these
-        // exist (they do not self-ensure).
-        ensure_instrument_lifecycle_table(&config.questdb).await;
-        ensure_instrument_lifecycle_audit_table(&config.questdb).await;
-        ensure_instrument_fetch_audit_table(&config.questdb).await;
-
-        // IST wall-clock nanoseconds (host-clock based) per the
-        // instrument_lifecycle_persistence convention. Derived from a single
-        // `now_utc` so `now` and `today-midnight` are consistent.
-        let now_utc = chrono::Utc::now();
-        let offset_nanos = i64::from(IST_UTC_OFFSET_SECONDS) * 1_000_000_000;
-        let now_ist_nanos = now_utc.timestamp_nanos_opt().unwrap_or(0) + offset_nanos;
-        let now_ist = now_utc + chrono::TimeDelta::seconds(i64::from(IST_UTC_OFFSET_SECONDS));
-        let today_ist_nanos = now_ist
-            .date_naive()
-            .and_hms_opt(0, 0, 0)
-            .and_then(|midnight| midnight.and_utc().timestamp_nanos_opt())
-            .unwrap_or(now_ist_nanos);
-
-        let downloader =
-            Arc::new(CsvDownloader::new().context("Step 6c: CsvDownloader init failed")?);
-        let fetch_fn = move |_attempt: u32| {
-            let downloader = Arc::clone(&downloader);
-            async move { downloader.fetch_csv().await }
-        };
-        // §4: infinite retry (None) — boot blocks until a fresh CSV is in hand.
-        // dry_run = false: write real lifecycle/audit rows.
-        let outcome = tickvault_app::daily_universe_boot::run_daily_universe_boot(
-            &config.questdb,
-            fetch_fn,
-            now_ist_nanos,
-            today_ist_nanos,
-            false,
-            None,
-        )
-        .await
-        .context("Step 6c: daily-universe boot failed (fail-closed §4) — halting")?;
-
-        info!(
-            universe_size = outcome.universe_size,
-            total_rows = outcome.total_rows,
-            attempts_used = outcome.attempts_used,
-            upserted = outcome.reconcile.apply.upserted,
-            expired = outcome.reconcile.apply.expired,
-            "Step 6c: daily universe built + lifecycle reconciled"
-        );
-    }
+    // Step 6c (daily-universe instrument fetch) moved into `load_instruments`
+    // (the `DailyUniverse` scope arm) so the built universe flows straight
+    // into the subscription plan. See `load_daily_universe_plan`.
 
     // Candle-engine re-architecture #T1b — drop the legacy candle objects
     // (Engine A `candles_1s` base table + Engine C's 9 `candles_<tf>`
@@ -2581,7 +2505,7 @@ async fn main() -> Result<()> {
     // CachedPlan loads from rkyv cache and returns universe for persistence here.
     // To avoid DOUBLE persistence on FreshBuild, only persist if CachedPlan.
     let (subscription_plan, slow_boot_universe, needs_instrument_persist) =
-        load_instruments(&config, is_trading, trading_calendar.as_ref()).await;
+        load_instruments(&config, is_trading, trading_calendar.as_ref()).await?;
 
     // Audit finding #6 (2026-04-24): emit InstrumentBuildSuccess when
     // instruments load successfully on the standard-boot path. Mirrors
@@ -4702,35 +4626,132 @@ async fn main() -> Result<()> {
 /// `false` because the synthetic universe has no F&O contracts to persist;
 /// the 4 IDX_I rows are written via the standard instrument-master DDL
 /// idempotency path.
-#[allow(clippy::unused_async)] // APPROVED: signature preserved for symmetry with prior async impl + call sites
+#[allow(clippy::unused_async)] // APPROVED: Indices4Only arm has no await; DailyUniverse arm awaits
 async fn load_instruments(
     config: &ApplicationConfig,
     _is_trading_day: bool,
     trading_calendar: &TradingCalendar,
-) -> (Option<SubscriptionPlan>, Option<FnoUniverse>, bool) {
-    info!("loading 4-IDX_I LOCKED_UNIVERSE (no CSV download / parse / validate)");
+) -> anyhow::Result<(Option<SubscriptionPlan>, Option<FnoUniverse>, bool)> {
+    match config.subscription.scope {
+        SubscriptionScope::Indices4Only => {
+            info!("loading 4-IDX_I LOCKED_UNIVERSE (no CSV download / parse / validate)");
 
-    let universe = FnoUniverse::locked_4_idx_i();
-    let today = Utc::now().with_timezone(&ist_offset()).date_naive();
-    // Empty spot prices — no F&O underlyings to ATM-select.
-    let empty_spot_prices = std::collections::HashMap::new();
-    let plan = build_subscription_plan(
-        &universe,
-        &config.subscription,
-        today,
-        &empty_spot_prices,
-        Some(trading_calendar),
-    );
+            let universe = FnoUniverse::locked_4_idx_i();
+            let today = Utc::now().with_timezone(&ist_offset()).date_naive();
+            // Empty spot prices — no F&O underlyings to ATM-select.
+            let empty_spot_prices = std::collections::HashMap::new();
+            let plan = build_subscription_plan(
+                &universe,
+                &config.subscription,
+                today,
+                &empty_spot_prices,
+                Some(trading_calendar),
+            );
 
+            info!(
+                total = plan.summary.total,
+                feed_mode = %plan.summary.feed_mode,
+                "subscription plan ready (LOCKED_UNIVERSE — 4 IDX_I SIDs)"
+            );
+
+            // needs_persist=false: synthetic universe has no F&O derivative rows
+            // to write beyond the 4 IDX_I entries handled by the DDL path.
+            Ok((Some(plan), Some(universe), false))
+        }
+        #[cfg(feature = "daily_universe_fetcher")]
+        SubscriptionScope::DailyUniverse => load_daily_universe_plan(config).await,
+        #[cfg(not(feature = "daily_universe_fetcher"))]
+        SubscriptionScope::DailyUniverse => {
+            anyhow::bail!(
+                "subscription scope is DailyUniverse but the daily_universe_fetcher feature is \
+                 not compiled in — rebuild with `--features daily_universe_fetcher`"
+            )
+        }
+    }
+}
+
+/// Step 6c — daily-universe fetch + build the ~250-SID subscription plan.
+///
+/// FAIL-CLOSED per operator §4 lock: `max_attempts = None` (infinite retry,
+/// escalating Telegram at attempts 4/11/21); boot BLOCKS until a fresh,
+/// validated CSV is in hand. A reconcile/audit (QuestDB) error HALTS boot
+/// (`?`-propagated) rather than proceeding on unknown state. The built
+/// universe flows straight into `build_subscription_plan_from_daily_universe`
+/// (Quote mode §8, ~250 SIDs). `needs_persist = false` — the lifecycle
+/// reconcile already persisted inside `run_daily_universe_boot`.
+#[cfg(feature = "daily_universe_fetcher")]
+async fn load_daily_universe_plan(
+    config: &ApplicationConfig,
+) -> anyhow::Result<(Option<SubscriptionPlan>, Option<FnoUniverse>, bool)> {
+    use anyhow::Context;
+    use std::sync::Arc;
+    use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+    use tickvault_core::instrument::csv_downloader::CsvDownloader;
+    use tickvault_core::instrument::subscription_planner::build_subscription_plan_from_daily_universe;
+    use tickvault_storage::instrument_fetch_audit_persistence::ensure_instrument_fetch_audit_table;
+    use tickvault_storage::instrument_lifecycle_persistence::{
+        ensure_instrument_lifecycle_audit_table, ensure_instrument_lifecycle_table,
+    };
+
+    info!("Step 6c: daily-universe instrument fetch (scope=DailyUniverse, fail-closed §4)");
+
+    // QuestDB must be reachable before the reconcile writes. Idempotent if the
+    // boot probe already ran on this path (works regardless of boot path).
+    tickvault_storage::boot_probe::wait_for_questdb_ready(
+        &config.questdb,
+        tickvault_storage::boot_probe::BOOT_DEADLINE_SECS,
+    )
+    .await
+    .context("Step 6c: QuestDB not ready for daily-universe reconcile")?;
+
+    // Idempotent CREATE TABLE IF NOT EXISTS — the boot's downstream writers
+    // assume these 3 lifecycle/audit tables exist (they do not self-ensure).
+    ensure_instrument_lifecycle_table(&config.questdb).await;
+    ensure_instrument_lifecycle_audit_table(&config.questdb).await;
+    ensure_instrument_fetch_audit_table(&config.questdb).await;
+
+    // IST wall-clock nanoseconds (host-clock based) per the
+    // instrument_lifecycle_persistence convention — single `now_utc` so `now`
+    // and `today-midnight` are consistent.
+    let now_utc = chrono::Utc::now();
+    let offset_nanos = i64::from(IST_UTC_OFFSET_SECONDS) * 1_000_000_000;
+    let now_ist_nanos = now_utc.timestamp_nanos_opt().unwrap_or(0) + offset_nanos;
+    let now_ist = now_utc + chrono::TimeDelta::seconds(i64::from(IST_UTC_OFFSET_SECONDS));
+    let today_ist_nanos = now_ist
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .and_then(|midnight| midnight.and_utc().timestamp_nanos_opt())
+        .unwrap_or(now_ist_nanos);
+
+    let downloader = Arc::new(CsvDownloader::new().context("Step 6c: CsvDownloader init failed")?);
+    let fetch_fn = move |_attempt: u32| {
+        let downloader = Arc::clone(&downloader);
+        async move { downloader.fetch_csv().await }
+    };
+    // §4: infinite retry (None) — boot blocks until a fresh CSV is in hand.
+    // dry_run = false: write real lifecycle/audit rows.
+    let (outcome, daily_universe) = tickvault_app::daily_universe_boot::run_daily_universe_boot(
+        &config.questdb,
+        fetch_fn,
+        now_ist_nanos,
+        today_ist_nanos,
+        false,
+        None,
+    )
+    .await
+    .context("Step 6c: daily-universe boot failed (fail-closed §4) — halting")?;
+
+    let plan = build_subscription_plan_from_daily_universe(&daily_universe);
     info!(
+        universe_size = outcome.universe_size,
         total = plan.summary.total,
         feed_mode = %plan.summary.feed_mode,
-        "subscription plan ready (LOCKED_UNIVERSE — 4 IDX_I SIDs)"
+        upserted = outcome.reconcile.apply.upserted,
+        expired = outcome.reconcile.apply.expired,
+        "subscription plan ready (DailyUniverse — ~250 SIDs, Quote mode)"
     );
 
-    // needs_persist=false: synthetic universe has no F&O derivative rows to
-    // write to QuestDB beyond the 4 IDX_I entries handled by the DDL path.
-    (Some(plan), Some(universe), false)
+    Ok((Some(plan), None, false))
 }
 
 // create_log_file_writer is now in boot_helpers module (lib.rs).
