@@ -378,7 +378,7 @@ pub async fn ensure_instrument_lifecycle_table(questdb_config: &QuestDbConfig) {
             prev_symbol_chain STRING, \
             source_csv_sha256 SYMBOL, \
             dry_run BOOLEAN\
-        ) timestamp(ts) PARTITION BY NONE WAL \
+        ) timestamp(ts) PARTITION BY DAY WAL \
         DEDUP UPSERT KEYS({DEDUP_KEY_INSTRUMENT_LIFECYCLE});"
     );
     match client
@@ -1041,17 +1041,18 @@ mod tests {
 
     #[test]
     fn test_lifecycle_ddl_uses_partition_by_none() {
-        // The constant designated ts (I-P1-08) REQUIRES PARTITION BY NONE
-        // — a date partition would funnel every never-deleted row into a
-        // single 1970 partition (Z+ hostile-review M1). Source-scan pins it.
-        // Scan only the DDL format string's literal fragment so the test
-        // doesn't trip over the module doc (which mentions PARTITION BY
-        // DAY in prose). The positive presence of `PARTITION BY NONE WAL`
-        // in the CREATE statement is the contract.
+        // Bug A fix (2026-05-28): QuestDB REJECTS WAL+DEDUP on a
+        // non-partitioned table (PARTITION BY NONE WAL → HTTP 400 at boot,
+        // observed live 16:16 IST). The table MUST be PARTITION BY DAY WAL.
+        // The constant designated ts (I-P1-08) simply funnels every
+        // never-deleted row into the single 1970-01-01 partition — harmless;
+        // DEDUP on (ts, security_id, exchange_segment) still keys correctly
+        // because ts is constant. Source-scan pins the corrected contract.
         let source = include_str!("instrument_lifecycle_persistence.rs");
         assert!(
-            source.contains(") timestamp(ts) PARTITION BY NONE WAL"),
-            "instrument_lifecycle DDL MUST use PARTITION BY NONE (constant ts per I-P1-08)"
+            source.contains(") timestamp(ts) PARTITION BY DAY WAL"),
+            "instrument_lifecycle DDL MUST use PARTITION BY DAY WAL (WAL+DEDUP \
+             requires a partitioned table; constant ts → single 1970 partition)"
         );
     }
 
