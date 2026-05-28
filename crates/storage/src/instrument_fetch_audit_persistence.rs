@@ -825,7 +825,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_row_returns_err_when_questdb_unreachable() {
+    async fn test_append_instrument_fetch_audit_row_returns_err_when_questdb_unreachable() {
         let cfg = test_cfg_unreachable();
         let row = sample_success_row();
         let result = append_instrument_fetch_audit_row(&cfg, &row).await;
@@ -836,7 +836,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_row_handles_operator_override_outcome() {
+    async fn test_append_instrument_fetch_audit_row_handles_operator_override_outcome() {
         // Exercise the §20 operator-override variant + its free-text
         // detail through the transport-error path.
         let cfg = test_cfg_unreachable();
