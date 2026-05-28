@@ -46,5 +46,16 @@ rustls = { workspace = true }
 reqwest = { workspace = true }
 core_affinity = { workspace = true }
 
+[features]
+# Sub-PR #10b-ζ-2 of the 2026-05-27 daily-universe expansion: forwards
+# the daily_universe_fetcher gate to core (the INSTR-FETCH runner) and
+# storage (the instrument_fetch_audit writer) so the app-side audit-write
+# seam compiles against both. Dormant by default per rule §21 — the boot
+# callsite + feature flip land in the final Sub-PR #10 boot orchestrator.
+daily_universe_fetcher = [
+    "tickvault-core/daily_universe_fetcher",
+    "tickvault-storage/daily_universe_fetcher",
+]
+
 [package.metadata.cargo-machete]
 ignored = ["chrono-tz", "clap", "signal-hook"]
