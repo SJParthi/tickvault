@@ -14,27 +14,31 @@
 //!   Dhan reuses `security_id` across segments. The designated
 //!   timestamp `ts` is part of the key (QuestDB requires it).
 //!
-//! ## Schema (10 columns, NO pct columns)
+//! ## Schema (11 columns)
 //!
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS candles_1m (
-//!     segment       SYMBOL,
-//!     security_id   LONG,
-//!     ts            TIMESTAMP,
-//!     open          DOUBLE,
-//!     high          DOUBLE,
-//!     low           DOUBLE,
-//!     close         DOUBLE,
-//!     volume        LONG,
-//!     oi            LONG,
-//!     tick_count    LONG
+//!     segment                  SYMBOL,
+//!     security_id              LONG,
+//!     ts                       TIMESTAMP,
+//!     open                     DOUBLE,
+//!     high                     DOUBLE,
+//!     low                      DOUBLE,
+//!     close                    DOUBLE,
+//!     volume                   LONG,
+//!     oi                       LONG,
+//!     tick_count               LONG,
+//!     close_pct_from_prev_day  DOUBLE
 //! ) timestamp(ts) PARTITION BY DAY
 //!   DEDUP UPSERT KEYS(ts, security_id, segment);
 //! ```
 //!
-//! The 3 `*_pct_from_prev_day` DOUBLE columns of the legacy shadow
-//! schema are intentionally dropped — the live aggregator no longer
-//! stamps prev-day pct values at seal time.
+//! `close_pct_from_prev_day` (re-added 2026-05-28, PR-4b) is the seal-time
+//! price % vs the previous-day close, sourced live from the tick `close`
+//! column (`LiveCandleState::prev_day_close`). The legacy `oi_pct` /
+//! `volume_pct` columns stay dropped — spot instruments have no OI and
+//! indices have no volume, so neither is meaningful for this universe
+//! (operator decision 2026-05-28).
 //!
 //! ## DEDUP rationale for each candle table
 //!
@@ -173,11 +177,21 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
                 close                       DOUBLE, \
                 volume                      LONG, \
                 oi                          LONG, \
-                tick_count                  LONG\
+                tick_count                  LONG, \
+                close_pct_from_prev_day     DOUBLE\
             ) timestamp(ts) PARTITION BY DAY \
             DEDUP UPSERT KEYS({DEDUP_KEY_CANDLES});"
         );
         run_ddl(&client, &base_url, table, &create_ddl).await;
+
+        // Schema self-heal: candle tables created before the
+        // close_pct_from_prev_day column existed (pre-2026-05-28 Engine-B
+        // 10-col schema) auto-migrate. QuestDB ignores the ADD when the
+        // column already exists, so running every boot is free (per
+        // observability-architecture.md "Schema self-heal at boot").
+        let alter_ddl =
+            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS close_pct_from_prev_day DOUBLE;");
+        run_ddl(&client, &base_url, table, &alter_ddl).await;
     }
 }
 
