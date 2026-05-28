@@ -45,6 +45,9 @@ chrono-tz = { workspace = true }
 rustls = { workspace = true }
 reqwest = { workspace = true }
 core_affinity = { workspace = true }
+# Only the feature-gated daily-universe boot orchestrator hashes the CSV
+# (source_csv_sha256 provenance); optional so the default build stays lean.
+sha2 = { workspace = true, optional = true }
 
 [features]
 # Sub-PR #10b-ζ-2 of the 2026-05-27 daily-universe expansion: forwards
@@ -53,6 +56,7 @@ core_affinity = { workspace = true }
 # seam compiles against both. Dormant by default per rule §21 — the boot
 # callsite + feature flip land in the final Sub-PR #10 boot orchestrator.
 daily_universe_fetcher = [
+    "dep:sha2",
     "tickvault-core/daily_universe_fetcher",
     "tickvault-storage/daily_universe_fetcher",
 ]
