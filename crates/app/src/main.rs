@@ -4718,13 +4718,19 @@ async fn load_daily_universe_plan(
     // and `today-midnight` are consistent.
     let now_utc = chrono::Utc::now();
     let offset_nanos = i64::from(IST_UTC_OFFSET_SECONDS) * 1_000_000_000;
-    let now_ist_nanos = now_utc.timestamp_nanos_opt().unwrap_or(0) + offset_nanos;
+    // Fail-closed on a clock outside the representable nanos range
+    // (~1677..2262) rather than silently stamping epoch-0 audit rows
+    // (PR-2 security review LOW). Unreachable in practice; never lies.
+    let now_ist_nanos = now_utc
+        .timestamp_nanos_opt()
+        .context("Step 6c: system clock outside representable nanosecond range")?
+        + offset_nanos;
     let now_ist = now_utc + chrono::TimeDelta::seconds(i64::from(IST_UTC_OFFSET_SECONDS));
     let today_ist_nanos = now_ist
         .date_naive()
         .and_hms_opt(0, 0, 0)
         .and_then(|midnight| midnight.and_utc().timestamp_nanos_opt())
-        .unwrap_or(now_ist_nanos);
+        .context("Step 6c: IST midnight outside representable nanosecond range")?;
 
     let downloader = Arc::new(CsvDownloader::new().context("Step 6c: CsvDownloader init failed")?);
     let fetch_fn = move |_attempt: u32| {
