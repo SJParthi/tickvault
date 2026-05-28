@@ -306,6 +306,32 @@ fn opt_f64(record: &csv::StringRecord, idx: usize) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Map Dhan Detailed-CSV `(EXCH_ID, SEGMENT)` to the canonical
+/// `ExchangeSegment` string. SEGMENT is single-char in the Detailed CSV
+/// (`E`=Equity, `D`=Derivatives, `I`=Index, `C`=Currency, `M`=Commodity);
+/// EXCH_ID is `NSE`/`BSE`/`MCX`. Indices share `IDX_I` across exchanges.
+/// An already-canonical value (e.g. `"NSE_EQ"` from a synthetic test row)
+/// or any unrecognized combo passes through verbatim. PURE.
+#[must_use]
+fn derive_exchange_segment(exch_id: &str, segment: &str) -> String {
+    match (
+        exch_id.to_ascii_uppercase().as_str(),
+        segment.to_ascii_uppercase().as_str(),
+    ) {
+        (_, "I") => "IDX_I",
+        ("NSE", "E") => "NSE_EQ",
+        ("NSE", "D") => "NSE_FNO",
+        ("NSE", "C") => "NSE_CURRENCY",
+        ("BSE", "E") => "BSE_EQ",
+        ("BSE", "D") => "BSE_FNO",
+        ("BSE", "C") => "BSE_CURRENCY",
+        ("MCX", "M") => "MCX_COMM",
+        // Already-canonical (contains '_') or unknown: pass through verbatim.
+        _ => segment,
+    }
+    .to_string()
+}
+
 /// Extract one validated CSV row. Returns `None` if any mandatory
 /// field is empty or if a derivative row has no underlying.
 fn extract_row(record: &csv::StringRecord, idx: &ColumnIndices) -> Option<CsvRow> {
@@ -343,7 +369,12 @@ fn extract_row(record: &csv::StringRecord, idx: &ColumnIndices) -> Option<CsvRow
     Some(CsvRow {
         security_id: security_id.to_string(),
         exch_id: exch_id.to_string(),
-        segment: segment.to_string(),
+        // Bug B (2026-05-28): Dhan Detailed CSV SEGMENT is a single-char code
+        // (E/D/I/C/M per docs/dhan-ref/09-instrument-master.md:37); downstream
+        // daily-universe code matches canonical strings ("NSE_EQ"/"IDX_I"/
+        // "NSE_FNO"). Derive the canonical form so the whole chain works on the
+        // real CSV. (Already-canonical/synthetic values pass through verbatim.)
+        segment: derive_exchange_segment(exch_id, segment),
         instrument: instrument.to_string(),
         symbol_name: symbol_name_clean,
         underlying_security_id: underlying_security_id.to_string(),
