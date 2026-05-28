@@ -198,6 +198,7 @@ mod tests {
             instrument: "EQUITY".to_string(),
             symbol_name: symbol.to_string(),
             underlying_security_id: String::new(),
+            ..Default::default()
         }
     }
 
@@ -214,6 +215,7 @@ mod tests {
             instrument: instrument.to_string(),
             symbol_name: symbol.to_string(),
             underlying_security_id: underlying.to_string(),
+            ..Default::default()
         }
     }
 
@@ -333,6 +335,7 @@ mod tests {
                 instrument: "FUTIDX".to_string(),
                 symbol_name: "NIFTY26JUNFUT".to_string(),
                 underlying_security_id: "13".to_string(), // IDX_I NIFTY
+                ..Default::default()
             },
             stock_derivative_row("38919", "FUTSTK", "RELIANCE26JUNFUT", "2885"),
         ];
@@ -371,6 +374,7 @@ mod tests {
                 instrument: "equity".to_string(),
                 symbol_name: "RELIANCE".to_string(),
                 underlying_security_id: String::new(),
+                ..Default::default()
             },
             CsvRow {
                 security_id: "38919".to_string(),
@@ -379,6 +383,7 @@ mod tests {
                 instrument: "futstk".to_string(),
                 symbol_name: "RELIANCE26JUNFUT".to_string(),
                 underlying_security_id: "2885".to_string(),
+                ..Default::default()
             },
         ];
         let result = extract_fno_underlyings(&rows).expect("extract");

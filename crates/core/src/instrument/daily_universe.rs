@@ -198,6 +198,7 @@ mod tests {
             instrument: "EQUITY".to_string(),
             symbol_name: symbol.to_string(),
             underlying_security_id: String::new(),
+            ..Default::default()
         }
     }
 
@@ -209,6 +210,7 @@ mod tests {
             instrument: "INDEX".to_string(),
             symbol_name: symbol.to_string(),
             underlying_security_id: String::new(),
+            ..Default::default()
         }
     }
 
