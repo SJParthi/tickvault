@@ -25,9 +25,24 @@ resource "aws_sns_topic_subscription" "operator_email" {
 
 # Telegram webhook is wired in `telegram-webhook-lambda.tf` (separate file
 # so the IAM role + Lambda + log group + self-error alarm + SNS subscription
-# stay co-located). Remaining 2 fan-out legs are still TODO:
-# - aws_sns_topic_subscription.operator_sms — protocol = "sms", endpoint = var.operator_phone
-# - aws_connect_outbound_voice_contact — for Critical-severity wake-up call
+# stay co-located).
+
+# SMS fan-out leg (3rd channel). OPTIONAL — created only when
+# var.operator_phone is set (E.164). Empty phone => count 0 => no SMS
+# subscription, no apply error. NOTE: India SMS delivery via SNS may need
+# the account moved out of the SMS sandbox + DLT sender-ID registration
+# (operator/AWS-account concern, not code). Cost budgeted in aws-budget.md
+# §6 (~100 msgs/mo).
+resource "aws_sns_topic_subscription" "operator_sms" {
+  count     = var.operator_phone == "" ? 0 : 1
+  topic_arn = aws_sns_topic.tv_alerts.arn
+  protocol  = "sms"
+  endpoint  = var.operator_phone
+}
+
+# Remaining fan-out leg still TODO (post-go-live — needs an AWS Connect
+# instance + contact flow, heavier than a single Terraform resource):
+# - aws_connect_outbound_voice_contact — Critical-severity wake-up call
 
 output "operator_email_subscription_status" {
   description = "Reminder: check your inbox for the SNS confirmation email and click the link to activate alarm delivery."
