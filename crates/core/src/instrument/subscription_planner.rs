@@ -38,6 +38,9 @@ use tickvault_common::instrument_types::{
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_common::types::{ExchangeSegment, FeedMode};
 
+#[cfg(feature = "daily_universe_fetcher")]
+use crate::instrument::daily_universe::{DailyUniverse, InstrumentRole};
+
 // ---------------------------------------------------------------------------
 // Subscription Plan — output of the planner
 // ---------------------------------------------------------------------------
@@ -766,6 +769,116 @@ pub fn build_subscription_plan(
         stocks_skipped = summary.stocks_skipped_no_chain,
         capacity_pct = format!("{:.1}%", summary.capacity_utilization_pct),
         "Subscription plan built"
+    );
+
+    SubscriptionPlan { registry, summary }
+}
+
+/// Builds a subscription plan from a daily-universe (~250 SIDs) per the
+/// 2026-05-27 `DailyUniverse` scope. Every SID subscribes in **Quote mode**
+/// (§8 — the 50-byte packet carries day OHLC at fixed offsets). Only IDX_I
+/// indices and NSE_EQ F&O-underlying spots are subscribed — NO derivative
+/// contracts. Dedup is the composite `(security_id, exchange_segment)` key
+/// (I-P1-11). Cold path — called once at boot.
+///
+/// The instrument segment is derived from the target ROLE, which is
+/// authoritative per rule §2 (indices → IDX_I; F&O underlyings resolve to
+/// their NSE_EQ spot row). Rows whose `security_id` is not a valid `u32`
+/// are skipped + counted — never panics on malformed CSV-derived data.
+#[cfg(feature = "daily_universe_fetcher")]
+pub fn build_subscription_plan_from_daily_universe(universe: &DailyUniverse) -> SubscriptionPlan {
+    // §8: the daily universe subscribes every SID in Quote mode.
+    let feed_mode = FeedMode::Quote;
+
+    let mut instruments: Vec<SubscribedInstrument> =
+        Vec::with_capacity(universe.subscription_targets.len());
+    // I-P1-11: dedup on the composite (security_id, segment) key.
+    let mut seen_ids: HashSet<(u32, ExchangeSegment)> =
+        HashSet::with_capacity(universe.subscription_targets.len());
+    let mut skipped_unparsable_sid: usize = 0;
+
+    for target in &universe.subscription_targets {
+        let Ok(security_id) = target.csv_row.security_id.parse::<u32>() else {
+            skipped_unparsable_sid += 1;
+            continue;
+        };
+        // Role determines segment deterministically (rule §2).
+        let segment = match target.role {
+            InstrumentRole::Index => ExchangeSegment::IdxI,
+            InstrumentRole::FnoUnderlying => ExchangeSegment::NseEquity,
+        };
+        if !seen_ids.insert((security_id, segment)) {
+            continue;
+        }
+        let instrument = match target.role {
+            InstrumentRole::Index => {
+                make_major_index_instrument(security_id, &target.csv_row.symbol_name, feed_mode)
+            }
+            InstrumentRole::FnoUnderlying => SubscribedInstrument {
+                security_id,
+                exchange_segment: ExchangeSegment::NseEquity,
+                category: SubscriptionCategory::StockEquity,
+                display_label: target.csv_row.symbol_name.clone(),
+                underlying_symbol: target.csv_row.symbol_name.clone(),
+                instrument_kind: None,
+                expiry_date: None,
+                strike_price: None,
+                option_type: None,
+                feed_mode,
+            },
+        };
+        instruments.push(instrument);
+    }
+
+    if skipped_unparsable_sid > 0 {
+        warn!(
+            skipped_unparsable_sid,
+            "daily-universe plan: skipped rows with non-numeric security_id"
+        );
+    }
+
+    let registry = InstrumentRegistry::from_instruments(instruments);
+    metrics::gauge!("tv_instrument_registry_cross_segment_collisions")
+        .set(registry.cross_segment_collisions() as f64);
+    metrics::gauge!("tv_instrument_registry_total_entries").set(registry.len() as f64);
+
+    let total = registry.len();
+    let exceeds_capacity = total > MAX_TOTAL_SUBSCRIPTIONS;
+    if exceeds_capacity {
+        warn!(
+            total,
+            capacity = MAX_TOTAL_SUBSCRIPTIONS,
+            "Daily-universe plan exceeds WebSocket capacity"
+        );
+    }
+    let capacity_utilization_pct = if MAX_TOTAL_SUBSCRIPTIONS > 0 {
+        (total as f64 / MAX_TOTAL_SUBSCRIPTIONS as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let summary = SubscriptionPlanSummary {
+        major_index_values: registry.category_count(SubscriptionCategory::MajorIndexValue),
+        display_indices: registry.category_count(SubscriptionCategory::DisplayIndex),
+        index_derivatives: registry.category_count(SubscriptionCategory::IndexDerivative),
+        stock_equities: registry.category_count(SubscriptionCategory::StockEquity),
+        stock_derivatives: registry.category_count(SubscriptionCategory::StockDerivative),
+        total,
+        feed_mode,
+        exceeds_capacity,
+        stocks_skipped_no_chain: 0,
+        stock_derivatives_available: 0,
+        stock_derivatives_skipped: 0,
+        capacity_utilization_pct,
+    };
+
+    info!(
+        major_index_values = summary.major_index_values,
+        stock_equities = summary.stock_equities,
+        total = summary.total,
+        feed_mode = %feed_mode,
+        skipped_unparsable_sid,
+        "Daily-universe subscription plan built"
     );
 
     SubscriptionPlan { registry, summary }
@@ -4760,5 +4873,88 @@ mod tests {
             tickvault_common::constants::PHASE_0_IDX_I_SYMBOLS.len(),
             tickvault_common::constants::PHASE_0_IDX_I_COUNT,
         );
+    }
+}
+
+#[cfg(all(test, feature = "daily_universe_fetcher"))]
+mod daily_universe_plan_tests {
+    use super::*;
+    use crate::instrument::csv_parser::CsvRow;
+    use crate::instrument::daily_universe::{DailyUniverse, InstrumentRole, SubscriptionTarget};
+
+    fn daily_target(
+        role: InstrumentRole,
+        security_id: &str,
+        segment: &str,
+        symbol: &str,
+    ) -> SubscriptionTarget {
+        SubscriptionTarget {
+            role,
+            csv_row: CsvRow {
+                security_id: security_id.to_string(),
+                exch_id: String::new(),
+                segment: segment.to_string(),
+                instrument: String::new(),
+                symbol_name: symbol.to_string(),
+                underlying_security_id: String::new(),
+                underlying_symbol: String::new(),
+                display_name: String::new(),
+                lot_size: 0,
+                tick_size: 0.0,
+                expiry_date: String::new(),
+                strike_price: 0.0,
+                option_type: String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_daily_universe_plan_emits_all_sids_quote_mode() {
+        let universe = DailyUniverse {
+            subscription_targets: vec![
+                daily_target(InstrumentRole::Index, "13", "IDX_I", "NIFTY"),
+                daily_target(InstrumentRole::Index, "51", "IDX_I", "SENSEX"),
+                daily_target(InstrumentRole::FnoUnderlying, "2885", "NSE_EQ", "RELIANCE"),
+            ],
+        };
+        let plan = build_subscription_plan_from_daily_universe(&universe);
+        assert_eq!(plan.summary.total, 3, "all 3 SIDs emitted");
+        assert_eq!(plan.summary.major_index_values, 2, "2 indices");
+        assert_eq!(plan.summary.stock_equities, 1, "1 NSE_EQ underlying");
+        // §8: every daily-universe SID subscribes in Quote mode.
+        assert_eq!(plan.summary.feed_mode, FeedMode::Quote);
+    }
+
+    #[test]
+    fn test_daily_universe_plan_dedup_composite_and_skips_unparsable() {
+        let universe = DailyUniverse {
+            subscription_targets: vec![
+                daily_target(InstrumentRole::Index, "13", "IDX_I", "NIFTY"),
+                // Same (security_id, segment) — I-P1-11 composite dedup drops it.
+                daily_target(InstrumentRole::Index, "13", "IDX_I", "NIFTY-DUP"),
+                // Non-numeric security_id — skipped (never panics).
+                daily_target(
+                    InstrumentRole::FnoUnderlying,
+                    "not-a-number",
+                    "NSE_EQ",
+                    "BAD",
+                ),
+            ],
+        };
+        let plan = build_subscription_plan_from_daily_universe(&universe);
+        assert_eq!(
+            plan.summary.total, 1,
+            "dup dropped + unparsable skipped → 1 survivor"
+        );
+        assert_eq!(plan.summary.major_index_values, 1);
+    }
+
+    #[test]
+    fn test_daily_universe_plan_empty_is_empty() {
+        let universe = DailyUniverse {
+            subscription_targets: vec![],
+        };
+        let plan = build_subscription_plan_from_daily_universe(&universe);
+        assert_eq!(plan.summary.total, 0);
     }
 }

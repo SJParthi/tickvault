@@ -49,7 +49,7 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_core::instrument::csv_downloader::CsvDownloadError;
-use tickvault_core::instrument::daily_universe::InstrumentRole;
+use tickvault_core::instrument::daily_universe::{DailyUniverse, InstrumentRole};
 use tickvault_core::instrument::instr_fetch_loop::LoopOutcome;
 use tickvault_core::instrument::instr_fetch_runner::run_daily_universe_fetch_runner;
 use tracing::info;
@@ -154,6 +154,10 @@ pub fn ensure_reconcile_fully_applied(reconcile: &ReconcileRunOutcome) -> Result
 /// not fully apply (`apply.errors > 0` or a missing-detail skip — see
 /// [`ensure_reconcile_fully_applied`]; refuses to record a false-OK
 /// Success), or (e) the terminal-success audit write fails.
+///
+/// On success returns `(outcome, Arc<DailyUniverse>)` — the built universe
+/// is handed back so the caller (`load_instruments`) can build the
+/// ~250-SID WebSocket subscription plan from it without re-fetching.
 pub async fn run_daily_universe_boot<Fetch, FetchFut>(
     questdb_config: &QuestDbConfig,
     fetch_fn: Fetch,
@@ -161,7 +165,7 @@ pub async fn run_daily_universe_boot<Fetch, FetchFut>(
     today_ist_nanos: i64,
     dry_run: bool,
     max_attempts: Option<u32>,
-) -> Result<DailyUniverseBootOutcome>
+) -> Result<(DailyUniverseBootOutcome, Arc<DailyUniverse>)>
 where
     Fetch: FnMut(u32) -> FetchFut,
     FetchFut: Future<Output = Result<Vec<u8>, CsvDownloadError>>,
@@ -196,6 +200,9 @@ where
     let LoopOutcome::Success { attempts_used } = outcome else {
         anyhow::bail!("daily-universe runner returned a universe with a non-Success outcome");
     };
+    // Share the built universe: reconcile borrows it; the caller gets a clone
+    // to build the subscription plan (avoids a second CSV fetch).
+    let universe = Arc::new(universe);
 
     // Recover the captured value even from a poisoned mutex (the data is
     // valid; poison only signals a prior panic) so a poison can't be
@@ -256,13 +263,14 @@ where
         dry_run,
         "daily-universe boot complete"
     );
-    Ok(DailyUniverseBootOutcome {
+    let outcome = DailyUniverseBootOutcome {
         attempts_used,
         universe_size,
         total_rows,
         source_csv_sha256,
         reconcile,
-    })
+    };
+    Ok((outcome, universe))
 }
 
 #[cfg(test)]
