@@ -141,11 +141,21 @@ pub enum ExtractError {
 /// surface this as a CRITICAL Telegram event + halt boot per the §4
 /// infinite-retry policy.
 pub fn extract_fno_underlyings(rows: &[CsvRow]) -> Result<FnoUnderlyingExtraction, ExtractError> {
-    // Pass 1 — build the NSE_EQ index.
+    // Pass 1 — build the NSE_EQ index, keyed by the CANONICAL integer form
+    // of `SECURITY_ID`. Both `SECURITY_ID` and `UNDERLYING_SECURITY_ID` are
+    // documented integer SecurityIds, but a raw-string `==` compare is
+    // fragile against format drift on the real Dhan CSV (leading zeros,
+    // trailing `.0`, surrounding whitespace). Normalising both sides to the
+    // parsed integer makes "11536", " 11536 ", "011536" and "11536.0" all
+    // resolve to the same equity — matching how `today_instrument` parses
+    // these cells to `i64` downstream. NSE_EQ rows whose id is non-numeric
+    // (should never happen) are skipped so they can't shadow a real id.
     let mut nse_eq_lookup: HashMap<String, CsvRow> = HashMap::new();
     for row in rows {
-        if row.segment.eq_ignore_ascii_case(NSE_EQ_SEGMENT) {
-            nse_eq_lookup.insert(row.security_id.clone(), row.clone());
+        if row.segment.eq_ignore_ascii_case(NSE_EQ_SEGMENT)
+            && let Some(canonical) = canonical_security_id(&row.security_id)
+        {
+            nse_eq_lookup.insert(canonical, row.clone());
         }
     }
 
@@ -172,16 +182,22 @@ pub fn extract_fno_underlyings(rows: &[CsvRow]) -> Result<FnoUnderlyingExtractio
         }
         total_derivative_count = total_derivative_count.saturating_add(1);
 
-        let underlying_id = &row.underlying_security_id;
-        let resolved = !underlying_id.is_empty() && nse_eq_lookup.contains_key(underlying_id);
-        if resolved {
-            unique_underlying_ids.insert(underlying_id.clone());
-        } else {
-            // Empty underlying should never happen (Sub-PR #4 parser drops
-            // derivative rows with an empty underlying); count defensively.
-            dangling_count = dangling_count.saturating_add(1);
-            if sample.len() < MAX_DANGLING_SAMPLES {
-                sample.push(format!("{}→{}", row.symbol_name, underlying_id));
+        // Normalise the underlying to its canonical integer form before
+        // resolving — see Pass 1. An empty / non-numeric underlying yields
+        // `None` and is counted as dangling (should never happen: Sub-PR #4
+        // drops derivative rows with an empty underlying).
+        match canonical_security_id(&row.underlying_security_id) {
+            Some(canonical) if nse_eq_lookup.contains_key(&canonical) => {
+                unique_underlying_ids.insert(canonical);
+            }
+            _ => {
+                dangling_count = dangling_count.saturating_add(1);
+                if sample.len() < MAX_DANGLING_SAMPLES {
+                    sample.push(format!(
+                        "{}→{}",
+                        row.symbol_name, row.underlying_security_id
+                    ));
+                }
             }
         }
     }
@@ -231,6 +247,28 @@ fn is_in_scope_stock_derivative(instrument: &str, exch_id: &str) -> bool {
 /// `UNDERLYING_SECURITY_ID` is synthetic and never resolves to a real
 /// `NSE_EQ` row. Skip them (mirrors the deleted `universe_builder` Pass-3
 /// `CSV_TEST_SYMBOL_MARKER` skip) so they are not miscounted as dangling.
+/// Normalise a raw CSV SecurityId cell to its canonical integer string.
+///
+/// Returns `None` for empty / non-numeric cells. Accepts surrounding
+/// whitespace, leading zeros (`"011536"`), and a trailing `.0`
+/// (`"11536.0"` — some CSV exporters render integer columns as floats).
+/// Two ids that denote the same instrument always normalise to the same
+/// `String`, so the equity lookup is robust to Dhan-side format drift.
+#[must_use]
+fn canonical_security_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Tolerate a single trailing ".0" / ".00…" float rendering.
+    let digits = match trimmed.split_once('.') {
+        Some((int_part, frac)) if frac.chars().all(|c| c == '0') => int_part,
+        Some(_) => return None, // non-zero fractional part → not a SecurityId
+        None => trimmed,
+    };
+    digits.parse::<u64>().ok().map(|n| n.to_string())
+}
+
 #[must_use]
 fn is_test_instrument(symbol_name: &str, underlying_symbol: &str) -> bool {
     let marker = CSV_TEST_SYMBOL_MARKER.to_ascii_uppercase();
@@ -600,5 +638,35 @@ mod tests {
         assert!(is_test_instrument("TESTSTK26JUNFUT", ""));
         assert!(is_test_instrument("ZZ", "teststk"));
         assert!(!is_test_instrument("RELIANCE26JUNFUT", "RELIANCE"));
+    }
+
+    #[test]
+    fn canonical_security_id_normalizes_format_drift() {
+        assert_eq!(canonical_security_id("11536").as_deref(), Some("11536"));
+        assert_eq!(canonical_security_id(" 11536 ").as_deref(), Some("11536"));
+        assert_eq!(canonical_security_id("011536").as_deref(), Some("11536"));
+        assert_eq!(canonical_security_id("11536.0").as_deref(), Some("11536"));
+        assert_eq!(canonical_security_id("11536.00").as_deref(), Some("11536"));
+        assert_eq!(canonical_security_id(""), None);
+        assert_eq!(canonical_security_id("   "), None);
+        assert_eq!(canonical_security_id("TCS"), None);
+        assert_eq!(canonical_security_id("115.36"), None);
+    }
+
+    #[test]
+    fn underlying_resolves_despite_float_and_zero_pad_format_drift() {
+        // Equity id is the clean "2885"; the derivative rows reference it
+        // with a trailing ".0" and a leading zero. Both MUST resolve —
+        // exact-string compare would have flagged them dangling.
+        let rows = vec![
+            nse_eq_row("2885", "RELIANCE"),
+            stock_derivative_row("38919", "FUTSTK", "RELIANCE26JUNFUT", "2885.0"),
+            stock_derivative_row("38920", "OPTSTK", "RELIANCE26JUN2500CE", "0002885"),
+        ];
+        let result = extract_fno_underlyings(&rows).expect("format drift resolves");
+        assert_eq!(result.dangling_count, 0);
+        assert_eq!(result.total_derivative_count, 2);
+        assert_eq!(result.unique_underlying_ids.len(), 1);
+        assert!(result.unique_underlying_ids.contains("2885"));
     }
 }
