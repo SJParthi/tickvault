@@ -211,6 +211,8 @@ impl ShadowCandleWriter {
             .with_context(|| "candle append: column_i64(oi) failed")?
             .column_i64("tick_count", row.tick_count)
             .with_context(|| "candle append: column_i64(tick_count) failed")?
+            .column_f64("close_pct_from_prev_day", row.close_pct_from_prev_day)
+            .with_context(|| "candle append: column_f64(close_pct_from_prev_day) failed")?
             .at(TimestampNanos::new(row.timestamp_ist_nanos))
             .with_context(|| "candle append: at(TimestampNanos) failed")?;
         self.pending_count += 1;
@@ -466,16 +468,17 @@ mod tests {
     }
 
     #[test]
-    fn test_append_seal_buffer_omits_pct_columns() {
-        // The plain candle tables have a 10-column schema — the 3
-        // legacy `*_pct_from_prev_day` columns are NOT written.
+    fn test_append_seal_buffer_writes_close_pct_only() {
+        // PR-4b (2026-05-28): the 11-column schema writes
+        // `close_pct_from_prev_day` but NOT the oi/volume pct columns —
+        // spot has no OI and indices no volume, so those stay dropped.
         let mut w = ShadowCandleWriter::for_test();
         w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
             .expect("append");
         let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
         assert!(
-            !s.contains("close_pct_from_prev_day"),
-            "close_pct must NOT be written in {s}"
+            s.contains("close_pct_from_prev_day="),
+            "close_pct MUST be written in {s}"
         );
         assert!(
             !s.contains("oi_pct_from_prev_day"),
