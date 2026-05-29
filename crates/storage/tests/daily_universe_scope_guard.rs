@@ -307,9 +307,15 @@ fn lifecycle_persistence_exposes_batched_insert_path() {
             && body.contains("pub async fn append_instrument_lifecycle_audit_rows"),
         "storage must expose batched insert fns"
     );
+    // The inserts MUST be SIZE-bounded (byte cap), not just fixed-row chunks —
+    // a 5000-row chunk of the ~219K F&O master produced a multi-MB URL that
+    // QuestDB rejected ("79190 write error(s)" boot halt, 2026-05-29). Both the
+    // row cap and the byte cap must be enforced via the shared splitter.
     assert!(
-        body.contains("LIFECYCLE_INSERT_BATCH_SIZE") && body.contains(".chunks("),
-        "batched inserts must chunk rows into multi-row INSERTs"
+        body.contains("LIFECYCLE_INSERT_BATCH_SIZE")
+            && body.contains("LIFECYCLE_INSERT_MAX_SQL_BYTES")
+            && body.contains("build_size_bounded_inserts"),
+        "batched inserts must be bounded by BOTH row count and serialized byte size"
     );
 }
 
