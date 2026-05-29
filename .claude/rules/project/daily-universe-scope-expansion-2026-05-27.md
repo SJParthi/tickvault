@@ -104,6 +104,11 @@ This product, starting from the date of this lock, opens exactly TWO WebSocket c
 
 Per operator Quote 4: "for future or options it should be just marked as expired and active alone only right dude instead of deleting it".
 
+**Quote 5 (2026-05-29, applicable-F&O master — supersedes the §10-step-4 "indices + underlyings only" scope for the lifecycle table):**
+> "I asked you to pull ALL the FNO in instruments … only fno for our applicable fno instruments right dude … if yes go ahead"
+
+**MASTER vs SUBSCRIPTION (locked 2026-05-29):** `instrument_lifecycle` is the **full applicable-F&O master** — it stores, in addition to the indices + F&O underlying spots, **every applicable F&O contract**: the `FUTSTK`/`OPTSTK` rows whose `UNDERLYING_SECURITY_ID` resolves to one of our tracked NSE_EQ underlyings, plus the `FUTIDX`/`OPTIDX` rows for our tracked indices. Currency F&O (`FUTCUR`/`OPTCUR`), commodity F&O (`FUTCOM`/`OPTFUT`), and non-F&O equities NOT in our underlying set are EXCLUDED. These contract rows carry `lifecycle_state` transitions (`active` → `expired_contract`) and are NEVER deleted (SEBI §25 point-in-time). **This is the master/audit table ONLY — it does NOT change the WebSocket subscription**, which remains the 331-SID indices+spots set per §2 + the 2-WebSocket lock. The `MAX_DAILY_UNIVERSE_SIZE = 400` envelope in §2 bounds the *subscription* set, NOT the lifecycle master (which legitimately holds ~219K applicable-F&O rows).
+
 | Column | Type | Purpose |
 |---|---|---|
 | `ts` | TIMESTAMP | Designated timestamp (last update) |
@@ -308,11 +313,11 @@ The new `instrument_lifecycle` orchestrator slots between existing Step 6 (auth)
               1. Read yesterday's active set from `instrument_lifecycle` (cold-path bootstrap)
               2. GET Dhan Detailed CSV with L1-L7 defense layers (§9)
               3. Validate + parse + SHA-256
-              4. Extract indices (filter §2) + unique F&O underlyings (group by UNDERLYING_SECURITY_ID)
-              5. Compute delta vs yesterday — emit added / expired / renamed transitions
-              6. UPSERT `instrument_lifecycle` + INSERT `instrument_lifecycle_audit`
+              4. Extract (a) indices (filter §2) + unique F&O underlyings (group by UNDERLYING_SECURITY_ID) → the 331-SID SUBSCRIPTION set; AND (b) the applicable F&O CONTRACTS (FUTSTK/OPTSTK for resolved underlyings + FUTIDX/OPTIDX for tracked indices; currency/commodity excluded) → MASTER-only set per §5
+              5. Compute delta vs yesterday — emit added / expired / renamed transitions (over the full master set incl. contracts)
+              6. UPSERT `instrument_lifecycle` (subscription set + applicable-F&O contracts per §5) + INSERT `instrument_lifecycle_audit`
               7. INSERT `instrument_fetch_audit` outcome row
-              8. Build `Arc<DailyUniverse>` for the WS subscription dispatcher
+              8. Build `Arc<DailyUniverse>` for the WS subscription dispatcher — dispatcher reads `subscription_targets` ONLY (331), NEVER the contracts (2-WS lock)
               9. Bust rkyv binary cache; rebuild for tomorrow's warm boot
               [Infinite retry on any L1-L4 failure per §4]
 08:34      Step 7: Spawn 1 main-feed WebSocket; subscribe Quote mode in 3 batches
