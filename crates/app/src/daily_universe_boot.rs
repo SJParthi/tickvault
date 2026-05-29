@@ -379,6 +379,7 @@ mod tests {
                 malformed_expiry: 0,
                 skipped_missing_detail: skipped,
             },
+            warm_skipped: false,
         }
     }
 

@@ -441,9 +441,88 @@ pub async fn append_instrument_fetch_audit_row(
     Ok(())
 }
 
+/// Parse the QuestDB `/exec` `dataset` JSON for the single `source_csv_sha256`
+/// cell of the most-recent fetch-audit row. PURE — `dataset[0][0]` as a string,
+/// `None` for an empty/malformed dataset. Extracted for deterministic testing.
+#[must_use]
+pub fn parse_last_fetch_audit_sha(dataset: &serde_json::Value) -> Option<String> {
+    dataset
+        .as_array()?
+        .first()?
+        .as_array()?
+        .first()?
+        .as_str()
+        .map(std::string::ToString::to_string)
+}
+
+/// Read the `source_csv_sha256` of the most-recent fetch-audit row (one
+/// `SELECT … ORDER BY ts DESC LIMIT 1`). Powers the O(1) warm-boot skip: if it
+/// equals today's CSV SHA-256, the universe is unchanged and the full
+/// re-UPSERT is skipped. Returns `Ok(None)` when the table is empty (Day 1).
+/// A transport/QuestDB error is propagated so the caller falls through to a
+/// FULL reconcile (fail-safe — never skip on an unknown prior state).
+/// (Pure parser `parse_last_fetch_audit_sha` carries the unit coverage.)
+// TEST-EXEMPT: requires running QuestDB; tested via boot integration in CI.
+pub async fn read_last_fetch_audit_sha(
+    questdb_config: &QuestDbConfig,
+) -> anyhow::Result<Option<String>> {
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
+        .build()?;
+    let sql = format!(
+        "SELECT source_csv_sha256 FROM {QUESTDB_TABLE_INSTRUMENT_FETCH_AUDIT} \
+         ORDER BY ts DESC LIMIT 1;"
+    );
+    let resp = client
+        .get(&base_url)
+        .query(&[("query", sql.as_str())])
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body: String = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect();
+        anyhow::bail!("instrument_fetch_audit sha read non-2xx ({status}): {body}");
+    }
+    let body = resp.text().await?;
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    Ok(parse_last_fetch_audit_sha(&v["dataset"]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_last_fetch_audit_sha_extracts_first_cell() {
+        let v = serde_json::json!({ "dataset": [["abc123def"]] });
+        assert_eq!(
+            parse_last_fetch_audit_sha(&v["dataset"]).as_deref(),
+            Some("abc123def")
+        );
+    }
+
+    #[test]
+    fn test_parse_last_fetch_audit_sha_empty_and_malformed_are_none() {
+        // Empty table (Day 1) → no warm-skip, full reconcile runs.
+        let empty = serde_json::json!({ "dataset": [] });
+        assert_eq!(parse_last_fetch_audit_sha(&empty["dataset"]), None);
+        // Non-string cell → None (never a false SHA-match).
+        let malformed = serde_json::json!({ "dataset": [[42]] });
+        assert_eq!(parse_last_fetch_audit_sha(&malformed["dataset"]), None);
+        // Missing dataset key → None.
+        let missing = serde_json::json!({});
+        assert_eq!(parse_last_fetch_audit_sha(&missing["dataset"]), None);
+    }
 
     /// Every wire-format variant the column SYMBOL set should ever
     /// carry. The audit-trail forensic guarantee depends on this list
