@@ -112,6 +112,14 @@ ok "Elastic IP before: ${EIP_BEFORE}"
 # ---------------------------------------------------------------------------
 # Stop → modify → start
 # ---------------------------------------------------------------------------
+# Clear stop-protection FIRST (idempotent). The live box may still have
+# disable_api_stop=true if the Terraform that flips it to false (PR #867)
+# hasn't applied yet — without this, the stop below fails with
+# OperationNotPermitted *after* the market-hours guard already committed,
+# leaving a half-run. --no-disable-api-stop is a no-op when already cleared.
+log "Clearing stop-protection (disable_api_stop=false) — idempotent"
+run "aws ec2 modify-instance-attribute --region '$REGION' --instance-id '$IID' --no-disable-api-stop"
+
 log "Stopping ${IID} (downtime begins)"
 run "aws ec2 stop-instances --region '$REGION' --instance-ids '$IID' >/dev/null"
 run "aws ec2 wait instance-stopped --region '$REGION' --instance-ids '$IID'"

@@ -196,3 +196,44 @@ fn deploy_terraform_files_exist() {
     _assert_exists(MAIN_TF);
     _assert_exists(VARIABLES_TF);
 }
+
+const UPGRADE_SCRIPT: &str = "scripts/aws-upgrade-instance.sh";
+const APP_ALARMS_TF: &str = "deploy/aws/terraform/app-alarms.tf";
+
+/// The in-place upgrade script MUST clear stop-protection before stopping —
+/// otherwise a stop on a still-`disable_api_stop=true` box fails mid-run
+/// (OperationNotPermitted) after the market-hours guard already committed.
+#[test]
+fn deploy_upgrade_script_clears_stop_protection_before_stop() {
+    let body = squish(&read(UPGRADE_SCRIPT));
+    assert!(
+        body.contains("--no-disable-api-stop"),
+        "aws-upgrade-instance.sh must `modify-instance-attribute --no-disable-api-stop` \
+         before `stop-instances`, so the upgrade can't deadlock on a stop-protected box."
+    );
+    // The clear must come BEFORE the stop call (comment-stripped so a comment
+    // mentioning "stop" can't skew the ordering).
+    let code = squish(&code_only(&read(UPGRADE_SCRIPT)));
+    let clear_at = code.find("--no-disable-api-stop");
+    let stop_at = code.find("stop-instances");
+    assert!(
+        matches!((clear_at, stop_at), (Some(c), Some(s)) if c < s),
+        "the disable_api_stop clear must precede the stop-instances call"
+    );
+}
+
+/// The disk-used alarm (the "grow online when the alarm fires" trip-wire the
+/// operator chose 2026-05-29) MUST exist — without it the reactive grow plan
+/// has no trigger and the 30 GB can silently fill during the 3-month run.
+#[test]
+fn deploy_disk_used_alarm_exists() {
+    let body = read(APP_ALARMS_TF);
+    assert!(
+        body.contains("\"disk_used_high\""),
+        "app-alarms.tf must define the `disk_used_high` alarm (the disk-capacity trip-wire)."
+    );
+    assert!(
+        body.contains("disk_used_percent"),
+        "the disk alarm must query the CWAgent `disk_used_percent` metric."
+    );
+}
