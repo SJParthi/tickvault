@@ -445,4 +445,82 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
     }
+
+    /// The correctness ratchet behind PR #884: a subscription plan built from
+    /// a snapshot-restored universe must be IDENTICAL to the plan built from
+    /// the original universe. If this ever drifts, warm-resubscribe would
+    /// silently subscribe to a different set than the cold build — the worst
+    /// possible failure mode (looks healthy, wrong data). We assert both the
+    /// summary counts AND the exact (security_id, segment) set in the registry.
+    #[test]
+    fn test_plan_is_identical_across_snapshot_boundary() {
+        use crate::instrument::subscription_planner::build_subscription_plan_from_daily_universe;
+        use tickvault_common::types::ExchangeSegment;
+
+        // Realistic mixed universe — indices (IDX_I) + F&O underlyings (NSE_EQ).
+        let original = DailyUniverse {
+            subscription_targets: vec![
+                target(InstrumentRole::Index, "13", "NIFTY"),
+                target(InstrumentRole::Index, "25", "BANKNIFTY"),
+                target(InstrumentRole::Index, "51", "SENSEX"),
+                target(InstrumentRole::FnoUnderlying, "2885", "RELIANCE"),
+                target(InstrumentRole::FnoUnderlying, "1333", "HDFCBANK"),
+                target(InstrumentRole::FnoUnderlying, "11536", "TCS"),
+            ],
+            fno_contracts: vec![],
+        };
+
+        let date = "2099-07-08";
+        let path = snapshot_path_for(date).expect("valid date");
+        let _ = std::fs::remove_file(&path);
+
+        // Plan A: directly from the original universe.
+        let plan_a = build_subscription_plan_from_daily_universe(&original);
+
+        // Round-trip through the on-disk snapshot, then Plan B.
+        write_plan_snapshot(&original, date).expect("write ok");
+        let restored = load_plan_snapshot_for_today(date).expect("load ok");
+        let plan_b = build_subscription_plan_from_daily_universe(&restored);
+
+        // Summary counts must match exactly.
+        assert_eq!(plan_a.summary.total, plan_b.summary.total, "total drift");
+        assert_eq!(
+            plan_a.summary.major_index_values, plan_b.summary.major_index_values,
+            "index-count drift"
+        );
+        assert_eq!(
+            plan_a.summary.stock_equities, plan_b.summary.stock_equities,
+            "stock-count drift"
+        );
+        assert_eq!(
+            plan_a.summary.feed_mode, plan_b.summary.feed_mode,
+            "feed-mode drift"
+        );
+
+        // The exact (security_id, segment) set must match — this is the
+        // I-P1-11 composite identity that the WS dispatcher subscribes.
+        let mut set_a: Vec<(u32, ExchangeSegment)> = plan_a
+            .registry
+            .iter()
+            .map(|i| (i.security_id, i.exchange_segment))
+            .collect();
+        let mut set_b: Vec<(u32, ExchangeSegment)> = plan_b
+            .registry
+            .iter()
+            .map(|i| (i.security_id, i.exchange_segment))
+            .collect();
+        set_a.sort_by_key(|(id, _)| *id);
+        set_b.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            set_a, set_b,
+            "subscription set differs across the snapshot boundary — warm resubscribe would diverge from cold build"
+        );
+        assert_eq!(
+            set_a.len(),
+            6,
+            "all 6 instruments must survive the round-trip"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
