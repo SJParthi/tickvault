@@ -277,12 +277,46 @@ resource "aws_cloudwatch_metric_alarm" "clock_skew_high" {
 }
 
 # ---------------------------------------------------------------------------
+# 13. Root volume filling — the "grow online when the alarm fires" trigger
+#     (operator lock 2026-05-29: start 30 GB, grow on alarm).
+#
+# WHY THIS IS NEEDED: retention_days=90 (config/base.toml) means a ~90-day
+# (3-month) data-pull NEVER ages a partition past the eviction window — so the
+# disk only grows for the whole run, with zero auto-eviction. This alarm is the
+# trip-wire. RESPONSE (no downtime, no data loss — gp3 grows online):
+#   1. bump ebs_gp3_size_gb (e.g. 30 -> 50) in variables.tf + terraform apply
+#   2. on the box (SSM): sudo growpart /dev/nvme0n1 1 && sudo xfs_growfs /
+#   See docs/runbooks/may31-inplace-upgrade-and-access.md §2.1.
+#
+# Uses a CloudWatch Metrics Insights query so we do NOT have to pin the
+# CWAgent disk dimensions (device/fstype vary); it selects by InstanceId +
+# mount path only.
+resource "aws_cloudwatch_metric_alarm" "disk_used_high" {
+  alarm_name          = "tv-${var.environment}-disk-used-high"
+  alarm_description   = "Root volume > 75% full. 90-day retention means a 3-month run never auto-evicts, so the disk only grows. Grow online (no downtime): bump ebs_gp3_size_gb 30->50 + apply, then on the box: sudo growpart /dev/nvme0n1 1 && sudo xfs_growfs /. See may31-inplace-upgrade-and-access.md §2.1."
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  threshold           = 75
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.app_alarm_actions
+  ok_actions          = local.app_alarm_ok
+
+  metric_query {
+    id          = "disk_used"
+    period      = 300
+    return_data = true
+    expression  = "SELECT MAX(disk_used_percent) FROM \"CWAgent\" WHERE InstanceId = '${aws_instance.tv_app.id}' AND path = '/'"
+  }
+}
+
+# ---------------------------------------------------------------------------
 # Output — operator-facing reminder + alarm list
 # ---------------------------------------------------------------------------
 
 output "app_cloudwatch_alarms" {
-  description = "The 12 application-level alarms scraping Prometheus via the CloudWatch agent. Pre-merge cost note: pushes total alarms from 6 → 18 and adds 12 custom metrics. Overage above free tier: ~$1.40/mo ≈ ₹120/mo (aws-budget.md total ₹1,022 → ~₹1,142)."
+  description = "13 application-level alarms (12 Prometheus-via-CW-agent + 1 disk-used Metrics-Insights). Cost note: total alarms 6 → 19; overage above the 10 free-tier alarms ≈ $0.90/mo + 12 custom metrics ≈ $0.60/mo ≈ ₹130/mo — well inside the $25 budget cap."
   value = [
+    aws_cloudwatch_metric_alarm.disk_used_high.alarm_name,
     aws_cloudwatch_metric_alarm.ws_pool_all_dead.alarm_name,
     aws_cloudwatch_metric_alarm.ws_failed_connections.alarm_name,
     aws_cloudwatch_metric_alarm.order_update_ws_inactive.alarm_name,

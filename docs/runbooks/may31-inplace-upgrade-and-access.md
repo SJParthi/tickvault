@@ -100,6 +100,46 @@ by design, so you literally cannot fat-finger it during the session.
 
 ---
 
+## 2.1 — ⚠ Grow the filesystem after the EBS resize (MANDATORY)
+
+> Sir, the resize made the **fridge** bigger (block device 10 → 30 GB) — but the
+> **shelves inside** are still built for 10 GB. The OS partition + filesystem do
+> NOT auto-expand. Until you push the shelves out, QuestDB still hits "disk full"
+> at 10 GB even though the console shows 30. **One command fixes it. Skipping
+> this is the #1 silent way the 3-month run dies.**
+
+After STEP 1's `terraform apply` resizes the volume, SSM into the box and run:
+
+```bash
+# AL2023 arm64 / Nitro: root device is nvme0n1, partition 1, filesystem xfs.
+sudo growpart /dev/nvme0n1 1     # expand the partition to fill the volume
+sudo xfs_growfs /                # expand the xfs filesystem to fill the partition
+df -h /                          # confirm: Size now ~30G, not 10G
+```
+
+(If `lsblk` shows the root device is not `nvme0n1` or `df -T /` shows `ext4`
+instead of `xfs`, adjust: `resize2fs /dev/<dev>` for ext4. AL2023 arm64 default
+is `nvme0n1` + `xfs`.) `growpart`/`xfs_growfs` are **idempotent** — safe to
+re-run; they no-op if already grown.
+
+### Disk capacity over the 3 months — the "grow online when the alarm fires" plan
+
+**Why this matters:** retention is **90 days** (`config/base.toml:165`) and a
+3-month run is ~90 days — so **no partition ever ages out → zero auto-eviction →
+the 30 GB only fills, never drains.** Operator decision (2026-05-29): **start
+30 GB, grow online when the alarm trips** (gp3 grows with NO downtime, NO data
+loss).
+
+| Trigger | Action (zero downtime) |
+|---|---|
+| CloudWatch alarm **`tv-prod-disk-used-high`** fires at **>75%** (added in the deploy-hardening PR) — pages via SNS/Telegram | 1. Bump `ebs_gp3_size_gb` (e.g. `30 → 50`) in `variables.tf` → `terraform apply`. 2. On the box: `sudo growpart /dev/nvme0n1 1 && sudo xfs_growfs /`. |
+| Belt-and-suspenders | Weekly `df -h /` over SSM / `mcp__tickvault-logs__docker_status` during your 3-month watch. |
+
+> 50 GB gp3 ≈ ₹155/mo more than 30 GB — only paid **if** you actually grow, and
+> only from the grow date. Until then the bill stays at the locked ~₹2,058/mo.
+
+---
+
 ## 3. STEP 2 — In-place `t4g.medium → m8g.large` (off-market)
 
 The instance type is **NOT** managed by Terraform (it's in `ignore_changes`).
