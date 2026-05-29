@@ -76,6 +76,17 @@ pub struct DailyUniverseBootOutcome {
     /// Real-time proof of the O(1) warm path: a warm-skip boot is sub-second
     /// regardless of universe size; a full rebuild is the batched seconds path.
     pub elapsed_ms: u64,
+    /// Per-phase breakdown of `elapsed_ms` — REAL proof (no guessing) of WHERE
+    /// a cold boot spends its seconds, so the operator can see download vs
+    /// build vs QuestDB-write at a glance. `download_ms` is the wall-clock of
+    /// the LAST (successful) CSV GET that built the universe — it excludes
+    /// retry/backoff time from earlier failed attempts. `reconcile_ms` is the
+    /// lifecycle UPSERT/UPDATE phase (the bulk QuestDB ILP write; sub-ms on a
+    /// warm-skip boot). `build_ms` (parse + extract + assemble) is derived by
+    /// the caller as `elapsed_ms − download_ms − reconcile_ms`.
+    pub download_ms: u64,
+    /// Wall-clock of the lifecycle reconcile phase (QuestDB write), ms.
+    pub reconcile_ms: u64,
 }
 
 /// Lowercase-hex SHA-256 of the CSV bytes — the `source_csv_sha256`
@@ -181,18 +192,22 @@ where
     // seconds path. Surfaced via `elapsed_ms` + Telegram + Prometheus.
     let boot_timer = Instant::now();
 
-    // Capture provenance (sha + data-row count) of each fetched body. On
-    // success the last capture is the body that built the universe.
-    let captured: Arc<Mutex<Option<(String, i64)>>> = Arc::new(Mutex::new(None));
+    // Capture provenance (sha + data-row count + download wall-clock) of each
+    // fetched body. On success the last capture is the body that built the
+    // universe. `download_ms` times ONLY the GET future (this attempt), so the
+    // per-phase breakdown excludes retry/backoff time from earlier attempts.
+    let captured: Arc<Mutex<Option<(String, i64, u64)>>> = Arc::new(Mutex::new(None));
     let mut inner = fetch_fn;
     let cap_for_closure = Arc::clone(&captured);
     let wrapped = move |attempt: u32| {
         let fut = inner(attempt);
         let cap = Arc::clone(&cap_for_closure);
         async move {
+            let dl_timer = Instant::now();
             let result = fut.await;
+            let download_ms = u64::try_from(dl_timer.elapsed().as_millis()).unwrap_or(u64::MAX);
             if let Ok(bytes) = &result {
-                let provenance = (sha256_hex(bytes), count_csv_data_rows(bytes));
+                let provenance = (sha256_hex(bytes), count_csv_data_rows(bytes), download_ms);
                 if let Ok(mut guard) = cap.lock() {
                     *guard = Some(provenance);
                 }
@@ -222,7 +237,7 @@ where
         Ok(guard) => guard.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
     };
-    let (source_csv_sha256, total_rows) = captured_provenance
+    let (source_csv_sha256, total_rows, download_ms) = captured_provenance
         .context("CSV provenance missing after a successful fetch (internal invariant)")?;
 
     let universe_size = i64::try_from(universe.total_count()).unwrap_or(i64::MAX);
@@ -234,6 +249,7 @@ where
     // §10 ordering: reconcile FIRST (lifecycle UPSERT/UPDATE + lifecycle
     // audit), then the instrument_fetch_audit terminal-success row. A
     // fail-closed reconcile error aborts before recording a clean outcome.
+    let reconcile_timer = Instant::now();
     let reconcile = run_lifecycle_reconcile(
         questdb_config,
         &universe,
@@ -244,6 +260,7 @@ where
     )
     .await
     .context("daily lifecycle reconcile failed")?;
+    let reconcile_ms = u64::try_from(reconcile_timer.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     // Refuse to stamp a clean Success audit row if the reconcile did not
     // fully apply (false-OK guard — the next idempotent boot completes it).
@@ -264,6 +281,12 @@ where
     .await
     .context("instrument_fetch_audit terminal-success write failed")?;
 
+    let elapsed_ms = u64::try_from(boot_timer.elapsed().as_millis()).unwrap_or(u64::MAX);
+    // build_ms (parse + extract + assemble) is the residual after the two
+    // measured phases. Saturating so a clock hiccup can never underflow.
+    let build_ms = elapsed_ms
+        .saturating_sub(download_ms)
+        .saturating_sub(reconcile_ms);
     info!(
         attempts_used,
         universe_size,
@@ -271,10 +294,14 @@ where
         upserted = reconcile.apply.upserted,
         expired = reconcile.apply.expired,
         errors = reconcile.apply.errors,
+        warm_skipped = reconcile.warm_skipped,
+        elapsed_ms,
+        download_ms,
+        build_ms,
+        reconcile_ms,
         dry_run,
-        "daily-universe boot complete"
+        "daily-universe boot complete (per-phase: download→build→reconcile)"
     );
-    let elapsed_ms = u64::try_from(boot_timer.elapsed().as_millis()).unwrap_or(u64::MAX);
     let outcome = DailyUniverseBootOutcome {
         attempts_used,
         universe_size,
@@ -282,6 +309,8 @@ where
         source_csv_sha256,
         reconcile,
         elapsed_ms,
+        download_ms,
+        reconcile_ms,
     };
     Ok((outcome, universe))
 }

@@ -4888,14 +4888,28 @@ async fn load_daily_universe_plan(
     let elapsed_ms = outcome.elapsed_ms;
     let warm_skipped = outcome.reconcile.warm_skipped;
     let total_rows = u64::try_from(outcome.total_rows).unwrap_or(0);
+    // Per-phase breakdown — REAL proof of WHERE a cold boot spends its seconds
+    // (no guessing): download (network GET) → build (parse+extract+assemble,
+    // CPU) → reconcile (QuestDB ILP write). build_ms is the residual.
+    let download_ms = outcome.download_ms;
+    let reconcile_ms = outcome.reconcile_ms;
+    let build_ms = elapsed_ms
+        .saturating_sub(download_ms)
+        .saturating_sub(reconcile_ms);
     info!(
         elapsed_ms,
+        download_ms,
+        build_ms,
+        reconcile_ms,
         warm_skipped,
         total_rows,
         universe_size = outcome.universe_size,
-        "instrument load timing (O(1) warm-path proof)"
+        "instrument load timing (O(1) warm-path proof; per-phase download→build→reconcile)"
     );
     metrics::gauge!("tv_instrument_load_duration_ms").set(elapsed_ms as f64);
+    metrics::gauge!("tv_instrument_load_download_ms").set(download_ms as f64);
+    metrics::gauge!("tv_instrument_load_build_ms").set(build_ms as f64);
+    metrics::gauge!("tv_instrument_load_reconcile_ms").set(reconcile_ms as f64);
     metrics::gauge!("tv_instrument_load_warm_skipped").set(if warm_skipped { 1.0 } else { 0.0 });
     metrics::gauge!("tv_instrument_load_total_rows").set(total_rows as f64);
     INSTRUMENT_LOAD_ELAPSED_MS.store(elapsed_ms, std::sync::atomic::Ordering::Relaxed);
