@@ -36,6 +36,8 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_core::instrument::daily_universe::DailyUniverse;
+use tickvault_storage::instrument_fetch_audit_persistence::read_last_fetch_audit_sha;
+use tickvault_storage::instrument_lifecycle_persistence::bump_active_last_seen;
 use tracing::{info, warn};
 
 use crate::apply_reconcile_plan::{ApplyOutcome, apply_reconcile_plan};
@@ -62,6 +64,10 @@ pub struct ReconcileRunOutcome {
     pub plan_size: usize,
     /// Per-action apply tally.
     pub apply: ApplyOutcome,
+    /// `true` when the O(1) warm-boot fast path ran: today's CSV SHA-256
+    /// matched the last boot's, so the universe is unchanged and the full
+    /// re-UPSERT was SKIPPED in favour of a single `last_seen` bump.
+    pub warm_skipped: bool,
 }
 
 /// Project today's full-detail instruments into the two structures the
@@ -160,6 +166,37 @@ pub async fn run_lifecycle_reconcile(
         return Err(err);
     }
 
+    // ── O(1) WARM-BOOT fast path ──────────────────────────────────────────
+    // If the lifecycle table is non-empty AND today's CSV SHA-256 matches the
+    // last boot's, the universe is byte-identical and already persisted — the
+    // full re-UPSERT (up to ~219K rows) is pure waste. Do ONE `last_seen` bump
+    // instead: O(1) HTTP requests regardless of universe size. Fail-safe: any
+    // read error OR empty table OR SHA mismatch falls through to the FULL
+    // reconcile (never skip on an unknown/changed prior state).
+    if !prev.rows.is_empty()
+        && let Ok(Some(last_sha)) = read_last_fetch_audit_sha(questdb_config).await
+        && last_sha == source_csv_sha256
+    {
+        bump_active_last_seen(questdb_config, today_ist_nanos, now_ist_nanos)
+            .await
+            .context("O(1) warm-boot last_seen bump failed")?;
+        info!(
+            universe_size = today.len(),
+            prev_rows_loaded = prev.rows.len(),
+            sha = %source_csv_sha256,
+            "daily lifecycle reconcile WARM-SKIP — CSV SHA unchanged, O(1) last_seen bump (full re-UPSERT skipped)"
+        );
+        return Ok(ReconcileRunOutcome {
+            universe_size: today.len(),
+            prev_rows_loaded: prev.rows.len(),
+            skipped_unknown_state: prev.skipped_unknown_state,
+            skipped_malformed: prev.skipped_malformed,
+            plan_size: 0,
+            apply: ApplyOutcome::default(),
+            warm_skipped: true,
+        });
+    }
+
     let plan = compute_reconcile_plan(&today_attrs, &prev.rows);
     let apply = apply_reconcile_plan(
         questdb_config,
@@ -180,6 +217,7 @@ pub async fn run_lifecycle_reconcile(
         skipped_malformed: prev.skipped_malformed,
         plan_size: plan.len(),
         apply,
+        warm_skipped: false,
     };
     info!(
         universe_size = outcome.universe_size,

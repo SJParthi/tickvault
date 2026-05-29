@@ -901,6 +901,66 @@ pub async fn update_lifecycle_state(
     Ok(())
 }
 
+// ============================================================================
+// O(1) WARM-BOOT path — single-statement last_seen refresh
+// ============================================================================
+
+/// Build the O(1) warm-boot UPDATE: bump `last_seen_date` + `last_active_date`
+/// (+ `last_update_ts`) for ALL `active` rows in ONE statement. Used when the
+/// daily CSV SHA-256 is unchanged from the last boot — the universe is
+/// identical and already persisted, so re-UPSERTing every row is pure waste.
+/// This is O(1) in HTTP requests regardless of universe size (331 or 2M rows).
+/// PURE (no I/O) — extracted for deterministic testing.
+#[must_use]
+pub fn build_bump_active_last_seen_sql(today_ist_nanos: i64, last_update_ts_nanos: i64) -> String {
+    let today_micros = today_ist_nanos / 1_000;
+    let last_update_micros = last_update_ts_nanos / 1_000;
+    // `active` is the compile-time `LifecycleState::Active` label — no
+    // sanitization needed (same convention as build_lifecycle_state_update_sql).
+    let active = LifecycleState::Active.as_str();
+    format!(
+        "UPDATE {QUESTDB_TABLE_INSTRUMENT_LIFECYCLE} \
+         SET last_seen_date = {today_micros}, last_active_date = {today_micros}, \
+         last_update_ts = {last_update_micros} \
+         WHERE lifecycle_state = '{active}';"
+    )
+}
+
+/// Execute the O(1) warm-boot `last_seen` bump (one UPDATE, one round-trip).
+/// (Pure builder `build_bump_active_last_seen_sql` carries the unit coverage.)
+// TEST-EXEMPT: requires running QuestDB; tested via boot integration in CI.
+pub async fn bump_active_last_seen(
+    questdb_config: &QuestDbConfig,
+    today_ist_nanos: i64,
+    last_update_ts_nanos: i64,
+) -> anyhow::Result<()> {
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
+        .build()?;
+    let sql = build_bump_active_last_seen_sql(today_ist_nanos, last_update_ts_nanos);
+    let resp = client
+        .get(&base_url)
+        .query(&[("query", sql.as_str())])
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body: String = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect();
+        anyhow::bail!("instrument_lifecycle warm-bump non-2xx ({status}): {body}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1499,6 +1559,24 @@ mod tests {
         // returns on empty), but the builder must not panic.
         let sql = build_lifecycle_multi_insert_sql(&[]);
         assert!(sql.contains("VALUES ;"));
+    }
+
+    #[test]
+    fn test_build_bump_active_last_seen_sql_shape_micros_and_active_filter() {
+        // 1_700_000_000_000_000_000 ns → 1_700_000_000_000_000 µs.
+        let sql =
+            build_bump_active_last_seen_sql(1_700_100_000_000_000_000, 1_700_000_000_000_000_000);
+        assert!(sql.starts_with(&format!("UPDATE {QUESTDB_TABLE_INSTRUMENT_LIFECYCLE} SET")));
+        assert!(sql.contains("last_seen_date = 1700100000000000"));
+        assert!(sql.contains("last_active_date = 1700100000000000"));
+        assert!(sql.contains("last_update_ts = 1700000000000000"));
+        // O(1) win: ONE statement scoped to active rows, no per-row VALUES.
+        assert!(sql.contains("WHERE lifecycle_state = 'active'"));
+        assert!(
+            !sql.contains("VALUES"),
+            "warm bump is an UPDATE, never an INSERT"
+        );
+        assert!(sql.ends_with(';'));
     }
 
     #[tokio::test]

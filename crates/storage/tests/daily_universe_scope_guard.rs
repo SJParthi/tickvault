@@ -312,3 +312,43 @@ fn lifecycle_persistence_exposes_batched_insert_path() {
         "batched inserts must chunk rows into multi-row INSERTs"
     );
 }
+
+// ---------------------------------------------------------------------------
+// O(1) WARM-BOOT ratchet (2026-05-29): when today's CSV SHA-256 matches the
+// last boot's, the reconcile MUST skip the full re-UPSERT and do a single
+// last_seen bump (O(1) requests, any universe size). A regression that drops
+// the warm path fails the build here.
+// ---------------------------------------------------------------------------
+#[test]
+fn reconcile_has_o1_warm_skip_on_unchanged_sha() {
+    let body = src("crates/app/src/lifecycle_reconcile_orchestrator.rs");
+    assert!(
+        body.contains("read_last_fetch_audit_sha") && body.contains("bump_active_last_seen"),
+        "reconcile must compare last CSV SHA + bump last_seen on a match (O(1) warm skip)"
+    );
+    assert!(
+        body.contains("warm_skipped: true"),
+        "the warm path must early-return warm_skipped=true (skipping the full re-UPSERT)"
+    );
+}
+
+#[test]
+fn storage_exposes_o1_warm_primitives() {
+    let lc = src("crates/storage/src/instrument_lifecycle_persistence.rs");
+    assert!(
+        lc.contains("pub fn build_bump_active_last_seen_sql")
+            && lc.contains("pub async fn bump_active_last_seen"),
+        "storage must expose the single-statement last_seen bump"
+    );
+    // The bump is ONE UPDATE scoped to active rows — never a per-row INSERT.
+    assert!(
+        lc.contains("WHERE lifecycle_state = '{active}'"),
+        "the warm bump must be a single active-scoped UPDATE"
+    );
+    let fa = src("crates/storage/src/instrument_fetch_audit_persistence.rs");
+    assert!(
+        fa.contains("pub async fn read_last_fetch_audit_sha")
+            && fa.contains("ORDER BY ts DESC LIMIT 1"),
+        "storage must read the last fetch-audit SHA in one bounded SELECT"
+    );
+}
