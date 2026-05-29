@@ -25,13 +25,13 @@ variable "environment" {
 }
 
 variable "instance_type" {
-  description = "EC2 instance type. MUST be t4g.medium per operator lock 2026-05-18 (~₹1,022/mo, see aws-budget.md)."
+  description = "EC2 instance type. MUST be t4g.large per operator lock 2026-05-27 (~₹1,514/mo, see daily-universe-scope-expansion-2026-05-27.md §7, which supersedes the 2026-05-18 t4g.medium lock)."
   type        = string
-  default     = "t4g.medium"
+  default     = "t4g.large"
 
   validation {
-    condition     = var.instance_type == "t4g.medium"
-    error_message = "Instance type is pinned to t4g.medium per operator lock 2026-05-18. The 4-SID IDX_I universe + CloudWatch-only stack fits in 4 GiB. See aws-budget.md."
+    condition     = var.instance_type == "t4g.large"
+    error_message = "Instance type is pinned to t4g.large (8 GiB) per operator lock 2026-05-27. The ~250-SID daily universe x 21 timeframes RAM-resident (today + yesterday sealed bars) needs 8 GiB. This SUPERSEDES the 2026-05-18 t4g.medium lock. See daily-universe-scope-expansion-2026-05-27.md section 7."
   }
 }
 

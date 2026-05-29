@@ -1,12 +1,13 @@
-# DLT AWS stack — t4g.medium budget envelope (~₹1,022/mo, operator-lock
-# 2026-05-18 in aws-budget.md).
+# DLT AWS stack — t4g.large budget envelope (~₹1,514/mo, operator-lock
+# 2026-05-27 in daily-universe-scope-expansion-2026-05-27.md §7, which
+# supersedes the 2026-05-18 t4g.medium lock).
 #
 # Deployed resources:
 #   - VPC with a single public subnet (no NAT to stay under budget)
 #   - Security group: SSH from operator_cidr, no inbound from market
 #   - IAM role: SSM read+write+delete (instance lock) + CloudWatch write +
 #     SNS publish + S3 cold-tier read/write
-#   - EC2 t4g.medium (ARM Graviton, 2 vCPU / 4 GiB) with gp3 10GB root volume
+#   - EC2 t4g.large (ARM Graviton, 2 vCPU / 8 GiB) with gp3 10GB root volume
 #   - Elastic IP (Dhan static IP mandate effective 2026-04-01; 7-day cooldown
 #     on modify — never release once registered with Dhan)
 #   - SSM parameters for Dhan credentials, Telegram tokens, QuestDB creds,
