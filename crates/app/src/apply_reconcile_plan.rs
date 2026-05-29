@@ -62,7 +62,8 @@ use tickvault_common::config::QuestDbConfig;
 use tickvault_common::sanitize::sanitize_audit_string;
 use tickvault_storage::instrument_lifecycle_persistence::{
     InstrumentLifecycleAuditRow, InstrumentLifecycleRow, LifecycleState, TransitionKind,
-    append_instrument_lifecycle_audit_row, append_instrument_lifecycle_row, update_lifecycle_state,
+    append_instrument_lifecycle_audit_rows, append_instrument_lifecycle_rows,
+    update_lifecycle_state,
 };
 use tracing::{error, info};
 
@@ -429,17 +430,24 @@ pub async fn apply_reconcile_plan(
 ) -> ApplyOutcome {
     let mut outcome = ApplyOutcome::default();
 
+    // ── Phase 1 — build ALL rows in memory (no I/O). PERF 2026-05-29: the
+    // previous per-action loop did 2 HTTP round-trips PER ROW, each building
+    // a fresh client — ~219K rows = ~438K round-trips = boot took minutes→
+    // hours. We now collect owned audit + lifecycle rows + disappearances,
+    // then write them in chunked multi-row INSERTs (a handful of requests).
+    let mut owned_audits: Vec<OwnedLifecycleAuditRow> = Vec::with_capacity(plan.len());
+    let mut owned_upserts: Vec<OwnedLifecycleRow> = Vec::new();
+    // Disappearances are rare (a handful/day) → kept as per-row UPDATEs.
+    let mut disappearances: Vec<(i64, String, LifecycleState)> = Vec::new();
+
     for action in plan {
         let (security_id, exchange_segment) = &action.key;
         let detail = today_detail.get(&action.key);
         let prev_attrs = prev.get(&action.key);
 
-        // A present (UPSERT) transition's full-row write needs today's
-        // detail. Resolve it BEFORE the audit write so a missing-detail
-        // invariant violation skips the WHOLE action — never leaving an
-        // orphan audit row recording an UPSERT we then can't perform
-        // (the §24 invariant: no audit row without an intended,
-        // fulfillable lifecycle change). Disappearances need no detail.
+        // A present (UPSERT) transition needs today's detail. Resolve BEFORE
+        // queuing the audit row so a missing-detail invariant violation skips
+        // the WHOLE action (§24: no audit row without a fulfillable change).
         let upsert_detail = if is_upsert_transition(action.to_state) {
             match detail {
                 Some(today) => Some(today),
@@ -458,10 +466,8 @@ pub async fn apply_reconcile_plan(
             None
         };
 
-        // §24 step 1 — append the audit row FIRST (real transition_kind +
-        // *_after snapshot). On failure skip the lifecycle write: never a
-        // lifecycle change without its forensic row.
-        let audit = build_audit_row_for_action(
+        // Queue the audit row (written FIRST, as a batch, per §24).
+        owned_audits.push(build_audit_row_for_action(
             action,
             detail,
             prev_attrs,
@@ -469,24 +475,9 @@ pub async fn apply_reconcile_plan(
             today_ist_nanos,
             source_csv_sha256,
             dry_run,
-        );
-        if let Err(err) =
-            append_instrument_lifecycle_audit_row(questdb_config, &audit.as_row()).await
-        {
-            error!(
-                security_id,
-                exchange_segment = exchange_segment.as_str(),
-                transition_kind = action.transition_kind.as_str(),
-                ?err,
-                "lifecycle audit append failed — skipping lifecycle write (next boot re-runs)"
-            );
-            outcome.errors += 1;
-            continue;
-        }
+        ));
 
-        // §24 step 2 — apply the lifecycle change.
         if let Some(today) = upsert_detail {
-            // Present transition → full-row UPSERT.
             let (row, malformed) = build_lifecycle_upsert_row(
                 action,
                 today,
@@ -499,9 +490,6 @@ pub async fn apply_reconcile_plan(
             if malformed {
                 outcome.malformed_expiry += 1;
                 metrics::counter!(MALFORMED_EXPIRY_COUNTER).increment(1);
-                // raw_expiry is, by definition here, an unparseable
-                // CSV-sourced string — strip control/BiDi chars before it
-                // reaches the JSONL/Telegram log pipeline (log-integrity).
                 error!(
                     security_id,
                     exchange_segment = exchange_segment.as_str(),
@@ -509,44 +497,78 @@ pub async fn apply_reconcile_plan(
                     "derivative expiry string failed to parse — wrote 0 (no-expiry) sentinel"
                 );
             }
-            match append_instrument_lifecycle_row(questdb_config, &row.as_row()).await {
-                Ok(()) => outcome.upserted += 1,
-                Err(err) => {
-                    error!(
-                        security_id,
-                        exchange_segment = exchange_segment.as_str(),
-                        ?err,
-                        "lifecycle UPSERT failed (audit row written; next boot re-runs)"
-                    );
-                    outcome.errors += 1;
-                }
-            }
+            owned_upserts.push(row);
         } else {
-            // Disappearance → in-place state UPDATE (expire / segment-move).
-            match update_lifecycle_state(
-                questdb_config,
-                *security_id,
-                exchange_segment,
-                action.to_state,
-                today_ist_nanos, // expired_date
-                now_ist_nanos,   // last_update_ts
-            )
-            .await
-            {
-                Ok(()) => outcome.expired += 1,
-                Err(err) => {
-                    error!(
-                        security_id,
-                        exchange_segment = exchange_segment.as_str(),
-                        ?err,
-                        "lifecycle state UPDATE failed (audit row written; next boot re-runs)"
-                    );
-                    outcome.errors += 1;
-                }
+            disappearances.push((*security_id, exchange_segment.clone(), action.to_state));
+        }
+    }
+
+    // ── Phase 2 — §24 audit-first: write ALL audit rows (batched) BEFORE any
+    // lifecycle write. If the audit batch fails, skip the lifecycle batch so
+    // we never have a lifecycle change without its forensic chain (next boot
+    // re-runs — idempotent via DEDUP UPSERT KEYS).
+    let audit_rows: Vec<InstrumentLifecycleAuditRow<'_>> = owned_audits
+        .iter()
+        .map(OwnedLifecycleAuditRow::as_row)
+        .collect();
+    if let Err(err) = append_instrument_lifecycle_audit_rows(questdb_config, &audit_rows).await {
+        error!(
+            ?err,
+            audit_rows = audit_rows.len(),
+            "lifecycle audit BATCH append failed — skipping lifecycle writes (next boot re-runs)"
+        );
+        outcome.errors += audit_rows.len();
+        return finish_apply(outcome);
+    }
+
+    // ── Phase 3 — batched lifecycle UPSERT.
+    let upsert_rows: Vec<InstrumentLifecycleRow<'_>> = owned_upserts
+        .iter()
+        .map(OwnedLifecycleRow::as_row)
+        .collect();
+    match append_instrument_lifecycle_rows(questdb_config, &upsert_rows).await {
+        Ok(()) => outcome.upserted += upsert_rows.len(),
+        Err(err) => {
+            error!(
+                ?err,
+                upsert_rows = upsert_rows.len(),
+                "lifecycle UPSERT BATCH failed (audit rows written; next boot re-runs)"
+            );
+            outcome.errors += upsert_rows.len();
+        }
+    }
+
+    // ── Phase 4 — disappearance state-flips (rare → per-row UPDATE).
+    for (security_id, exchange_segment, to_state) in &disappearances {
+        match update_lifecycle_state(
+            questdb_config,
+            *security_id,
+            exchange_segment,
+            *to_state,
+            today_ist_nanos,
+            now_ist_nanos,
+        )
+        .await
+        {
+            Ok(()) => outcome.expired += 1,
+            Err(err) => {
+                error!(
+                    security_id,
+                    exchange_segment = exchange_segment.as_str(),
+                    ?err,
+                    "lifecycle state UPDATE failed (audit row written; next boot re-runs)"
+                );
+                outcome.errors += 1;
             }
         }
     }
 
+    finish_apply(outcome)
+}
+
+/// Emit the completion log + return the outcome (shared by the normal path
+/// and the audit-batch-failure early return).
+fn finish_apply(outcome: ApplyOutcome) -> ApplyOutcome {
     info!(
         upserted = outcome.upserted,
         expired = outcome.expired,
