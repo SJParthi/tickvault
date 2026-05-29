@@ -233,6 +233,7 @@ mod tests {
         // ONLY the retry-loop semantics.
         DailyUniverse {
             subscription_targets: Vec::new(),
+            fno_contracts: Vec::new(),
         }
     }
 

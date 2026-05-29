@@ -4916,6 +4916,7 @@ mod daily_universe_plan_tests {
                 daily_target(InstrumentRole::Index, "51", "IDX_I", "SENSEX"),
                 daily_target(InstrumentRole::FnoUnderlying, "2885", "NSE_EQ", "RELIANCE"),
             ],
+            fno_contracts: vec![],
         };
         let plan = build_subscription_plan_from_daily_universe(&universe);
         assert_eq!(plan.summary.total, 3, "all 3 SIDs emitted");
@@ -4940,6 +4941,7 @@ mod daily_universe_plan_tests {
                     "BAD",
                 ),
             ],
+            fno_contracts: vec![],
         };
         let plan = build_subscription_plan_from_daily_universe(&universe);
         assert_eq!(
@@ -4953,6 +4955,7 @@ mod daily_universe_plan_tests {
     fn test_daily_universe_plan_empty_is_empty() {
         let universe = DailyUniverse {
             subscription_targets: vec![],
+            fno_contracts: vec![],
         };
         let plan = build_subscription_plan_from_daily_universe(&universe);
         assert_eq!(plan.summary.total, 0);
