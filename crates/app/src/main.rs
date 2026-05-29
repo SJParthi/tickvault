@@ -2525,6 +2525,20 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Boot-timing proof Telegram (DailyUniverse scope only — sentinel-guarded
+    // so Indices4Only emits nothing). Reads the wall-clock stashed by
+    // `load_daily_universe_plan`; gives the operator REAL daily evidence the
+    // O(1) warm path is working: warm-skip boots are sub-second regardless of
+    // the applicable-F&O master size; a full rebuild is the batched-seconds
+    // cold path.
+    if let Some(message) = format_instrument_load_telegram(
+        INSTRUMENT_LOAD_ELAPSED_MS.load(std::sync::atomic::Ordering::Relaxed),
+        INSTRUMENT_LOAD_WARM_SKIPPED.load(std::sync::atomic::Ordering::Relaxed),
+        INSTRUMENT_LOAD_TOTAL_ROWS.load(std::sync::atomic::Ordering::Relaxed),
+    ) {
+        notifier.notify(NotificationEvent::Custom { message });
+    }
+
     // Only persist for CachedPlan (not yet persisted). FreshBuild already
     // persisted inside load_or_build_instruments — double-write creates
     // duplicate rows in the same timestamp second.
@@ -4613,6 +4627,58 @@ async fn main() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Boot-timing proof — real-time evidence the O(1) warm path is working
+// ---------------------------------------------------------------------------
+//
+// `load_daily_universe_plan` (Step 6c) writes the whole instrument-load
+// wall-clock here so the caller (which DOES hold the `notifier`) can emit a
+// single operator-facing Telegram line each boot. Sentinel `u64::MAX` =
+// "not measured this boot" (e.g. the Indices4Only scope never runs the
+// daily-universe fetch), so the caller suppresses the Telegram in that case.
+//
+// Why globals and not a return-value thread: `load_instruments` and its
+// match arms return `(plan, universe, needs_persist)` shared across two boot
+// paths + two scopes; widening that tuple for one observability field would
+// touch every arm. A trio of atomics set in one place + read in one place is
+// the smaller, lower-risk surface.
+static INSTRUMENT_LOAD_ELAPSED_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+static INSTRUMENT_LOAD_WARM_SKIPPED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static INSTRUMENT_LOAD_TOTAL_ROWS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Formats the operator-facing boot-timing Telegram line.
+///
+/// Returns `None` when `elapsed_ms == u64::MAX` (the sentinel meaning "not
+/// measured this boot" — e.g. the Indices4Only scope skips the daily-universe
+/// fetch entirely), so the caller emits nothing in that case.
+///
+/// Plain-English, auto-driver-readable per the 10 Telegram commandments: no
+/// library names, no file paths, no version numbers — just "how long + warm
+/// or cold + how many rows".
+fn format_instrument_load_telegram(
+    elapsed_ms: u64,
+    warm_skipped: bool,
+    total_rows: u64,
+) -> Option<String> {
+    if elapsed_ms == u64::MAX {
+        return None;
+    }
+    // Integer seconds-with-one-decimal without float formatting surprises.
+    let secs_whole = elapsed_ms / 1000;
+    let secs_tenths = (elapsed_ms % 1000) / 100;
+    let detail = if warm_skipped {
+        "universe unchanged — reused the existing list (no rebuild needed)"
+    } else {
+        "full rebuild — fresh list pulled and saved"
+    };
+    Some(format!(
+        "📦 Instrument load: {secs_whole}.{secs_tenths}s ✅ — {detail} ({total_rows} rows on file)"
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Helper: Load instruments (shared by fast and slow boot paths)
 // ---------------------------------------------------------------------------
 
@@ -4759,6 +4825,29 @@ async fn load_daily_universe_plan(
         expired = outcome.reconcile.apply.expired,
         "subscription plan ready (DailyUniverse — ~250 SIDs, Quote mode)"
     );
+
+    // Boot-timing proof: REAL evidence the O(1) warm path is working in
+    // production every day. A warm-skip boot (CSV SHA unchanged vs the last
+    // fetch-audit row) is sub-second regardless of the ~219K applicable-F&O
+    // master size; a full rebuild is the batched-seconds cold path. Surfaced
+    // three ways — structured INFO log (daily proof), Prometheus gauges
+    // (graphable trend), and a Telegram line emitted by the caller.
+    let elapsed_ms = outcome.elapsed_ms;
+    let warm_skipped = outcome.reconcile.warm_skipped;
+    let total_rows = u64::try_from(outcome.total_rows).unwrap_or(0);
+    info!(
+        elapsed_ms,
+        warm_skipped,
+        total_rows,
+        universe_size = outcome.universe_size,
+        "instrument load timing (O(1) warm-path proof)"
+    );
+    metrics::gauge!("tv_instrument_load_duration_ms").set(elapsed_ms as f64);
+    metrics::gauge!("tv_instrument_load_warm_skipped").set(if warm_skipped { 1.0 } else { 0.0 });
+    metrics::gauge!("tv_instrument_load_total_rows").set(total_rows as f64);
+    INSTRUMENT_LOAD_ELAPSED_MS.store(elapsed_ms, std::sync::atomic::Ordering::Relaxed);
+    INSTRUMENT_LOAD_WARM_SKIPPED.store(warm_skipped, std::sync::atomic::Ordering::Relaxed);
+    INSTRUMENT_LOAD_TOTAL_ROWS.store(total_rows, std::sync::atomic::Ordering::Relaxed);
 
     Ok((Some(plan), None, false))
 }
@@ -6048,6 +6137,39 @@ mod tests {
 
         assert!(should_fast_boot(true, true));
         assert!(!should_fast_boot(false, true));
+    }
+
+    #[test]
+    fn test_format_instrument_load_telegram_warm_skip() {
+        let msg = format_instrument_load_telegram(412, true, 219_431)
+            .expect("measured boot must produce a message");
+        assert!(msg.contains("0.4s"), "elapsed rendered: {msg}");
+        assert!(msg.contains("unchanged"), "warm-skip phrasing: {msg}");
+        assert!(msg.contains("219431"), "row count: {msg}");
+        // Telegram commandments: no library names / file paths.
+        assert!(!msg.contains("rkyv") && !msg.contains(".rs") && !msg.contains("QuestDB"));
+    }
+
+    #[test]
+    fn test_format_instrument_load_telegram_full_rebuild() {
+        let msg = format_instrument_load_telegram(6234, false, 219_431)
+            .expect("measured boot must produce a message");
+        assert!(msg.contains("6.2s"), "elapsed rendered: {msg}");
+        assert!(msg.contains("full rebuild"), "cold-path phrasing: {msg}");
+    }
+
+    #[test]
+    fn test_format_instrument_load_telegram_sentinel_suppressed() {
+        // u64::MAX == "not measured this boot" (e.g. Indices4Only scope) →
+        // no Telegram at all.
+        assert!(format_instrument_load_telegram(u64::MAX, false, 0).is_none());
+    }
+
+    #[test]
+    fn test_format_instrument_load_telegram_sub_100ms() {
+        // A warm-skip can be tens of ms — render as 0.0s, never panic.
+        let msg = format_instrument_load_telegram(37, true, 4).expect("message");
+        assert!(msg.contains("0.0s"), "sub-100ms rendered: {msg}");
     }
 
     #[test]
