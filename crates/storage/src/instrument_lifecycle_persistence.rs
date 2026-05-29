@@ -55,7 +55,22 @@
 //! carries `transition_kind` so two different transitions for the same
 //! instrument on the same day both survive (§6).
 //!
-//! ## ⚠ DDL follow-up MUST read this
+//! ## 2026-05-29 — bulk writes use ILP (port 9009), NOT `/exec` URL
+//!
+//! Both tables are `timestamp(ts) PARTITION BY DAY WAL DEDUP UPSERT KEYS(...)`
+//! (see the DDLs below — the "PARTITION BY NONE" prose in the historical note
+//! that follows is SUPERSEDED). With the lifecycle table's constant designated
+//! `ts`, every never-deleted row lands in one partition — harmless, and WAL +
+//! DEDUP work correctly. The BULK writers
+//! ([`append_instrument_lifecycle_rows`] / [`append_instrument_lifecycle_audit_rows`])
+//! ingest via **ILP** (the same pipe ticks/candles use) — NOT multi-row SQL
+//! `INSERT` over `/exec`. Reason: `/exec` carries the SQL in the URL query
+//! string, capped by QuestDB's request buffer; at the ~79K-row applicable-F&O
+//! master this overflowed (the 2026-05-29 "79190 write error(s)" /
+//! "connection closed before message completed" boot halts). ILP has no URL
+//! limit. The single-row helpers + DDL stay on `/exec` (small, no URL issue).
+//!
+//! ## ⚠ DDL follow-up — historical note (SUPERSEDED above)
 //!
 //! Because `instrument_lifecycle`'s designated `ts` is pinned to epoch 0,
 //! the table's DDL **MUST use `PARTITION BY NONE`** (or partition on a
@@ -78,11 +93,13 @@
 
 use std::time::Duration;
 
+use anyhow::Context;
+use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
 use reqwest::Client;
 use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
-use tickvault_common::sanitize::sanitize_audit_string;
+use tickvault_common::sanitize::{sanitize_audit_string, sanitize_ilp_string, sanitize_ilp_symbol};
 
 /// `/exec` HTTP timeout for both DDL and INSERT. Matches the value used
 /// by the other `*_persistence` modules in the storage crate.
@@ -337,10 +354,11 @@ pub struct InstrumentLifecycleRow<'a> {
 
 /// Creates the `instrument_lifecycle` table if absent. Idempotent.
 ///
-/// **`PARTITION BY NONE`** — the designated `ts` is pinned to a constant
-/// (I-P1-08), so a date partition would funnel every never-deleted row
-/// into one `1970-01-01` partition. See the module-level "DDL follow-up
-/// MUST read this" note.
+/// `timestamp(ts) PARTITION BY DAY WAL DEDUP UPSERT KEYS(...)`. The designated
+/// `ts` is pinned to a constant (I-P1-08), so every never-deleted row lands in
+/// one partition — harmless, and WAL + DEDUP work correctly, which is what lets
+/// the bulk writer ingest via ILP (port 9009). DDL itself goes over `/exec`
+/// (a single small statement, no URL-size issue).
 // TEST-EXEMPT: requires running QuestDB; tested via boot integration in CI.
 pub async fn ensure_instrument_lifecycle_table(questdb_config: &QuestDbConfig) {
     let base_url = format!(
@@ -410,6 +428,18 @@ pub async fn ensure_instrument_lifecycle_table(questdb_config: &QuestDbConfig) {
     }
 }
 
+/// Coerce a non-finite f64 (NaN / ±inf) to `0.0` before SQL formatting.
+///
+/// `format!("{}", f64::NAN)` emits the literal `NaN`, which QuestDB rejects —
+/// a single such tuple would fail its whole INSERT and halt the boot. The
+/// ~219K-row applicable-F&O master can carry an odd strike/tick from upstream
+/// CSV parsing, so we clamp defensively (a 0.0 price is an obvious sentinel an
+/// operator can spot, never a silent SQL break).
+#[must_use]
+fn finite_or_zero(value: f64) -> f64 {
+    if value.is_finite() { value } else { 0.0 }
+}
+
 /// Formats one row as a QuestDB `VALUES (...)` tuple in schema order.
 ///
 /// The leading designated `ts` is stamped from
@@ -432,9 +462,9 @@ fn format_lifecycle_row_tuple(row: &InstrumentLifecycleRow<'_>) -> String {
     let security_id = row.security_id;
     let underlying_security_id = row.underlying_security_id;
     let lot_size = row.lot_size;
-    let tick_size = row.tick_size;
+    let tick_size = finite_or_zero(row.tick_size);
     let expiry_micros = row.expiry_date_nanos / 1_000;
-    let strike_price = row.strike_price;
+    let strike_price = finite_or_zero(row.strike_price);
     let lifecycle_state_locked = row.lifecycle_state_locked;
     let first_seen_micros = row.first_seen_date_nanos / 1_000;
     let last_seen_micros = row.last_seen_date_nanos / 1_000;
@@ -499,31 +529,110 @@ pub async fn append_instrument_lifecycle_row(
     Ok(())
 }
 
-/// Rows per multi-row INSERT request. QuestDB `/exec` accepts large
-/// multi-row `VALUES` bodies; 5000 collapses the applicable-F&O master
-/// (~219K rows) into ~44 requests instead of ~219K single-row round-trips.
-/// PERF (2026-05-29): the per-row path built a fresh `reqwest::Client` +
-/// one HTTP round-trip PER ROW — 219K rows = ~219K round-trips = boot took
-/// minutes→hours. Batching + one reused client cuts it to a few seconds.
-pub const LIFECYCLE_INSERT_BATCH_SIZE: usize = 5000;
-
-/// Build ONE multi-row `INSERT … VALUES (t1),(t2),…,(tN);` for a chunk of
-/// lifecycle rows. PURE (no I/O) — extracted for deterministic testing.
-#[must_use]
-pub fn build_lifecycle_multi_insert_sql(rows: &[InstrumentLifecycleRow<'_>]) -> String {
-    let tuples: Vec<String> = rows.iter().map(format_lifecycle_row_tuple).collect();
-    format!(
-        "INSERT INTO {QUESTDB_TABLE_INSTRUMENT_LIFECYCLE} \
-         ({LIFECYCLE_INSERT_COLUMN_LIST}) VALUES {};",
-        tuples.join(",")
-    )
+/// Write one `instrument_lifecycle` row into an ILP [`Buffer`].
+///
+/// PURE builder (no network) — deterministically unit-tested via
+/// `buffer.as_bytes()`. This is the bulk-ingest replacement for the old
+/// `/exec` SQL path: the SQL door (URL query string) is capped by QuestDB's
+/// request buffer and overflowed at the ~79K-row F&O master; ILP (port 9009)
+/// is the real ingestion pipe (same one ticks/candles use) with no URL limit.
+///
+/// ILP rules honoured: all SYMBOL columns are written BEFORE any field; the
+/// DEDUP-key SYMBOL `exchange_segment` is always written; optional SYMBOLs that
+/// are empty (`exchange_id` / `underlying_symbol` / `option_type`) are SKIPPED
+/// (→ stored **NULL**, NOT the empty symbol `''` the old `/exec` path wrote;
+/// none are DEDUP keys so no duplicate rows result — but consumers must filter
+/// `option_type IS NULL`, not `= ''`). Empty ILP tag values are non-standard,
+/// hence the skip. f64s are clamped via [`finite_or_zero`]; SYMBOLs use
+/// [`sanitize_ilp_symbol`] (strips ILP tag delimiters) and STRING columns use
+/// [`sanitize_ilp_string`] (preserves commas/JSON). Timestamps
+/// are written as nanos ([`TimestampNanos`]) — QuestDB stores micros. The
+/// designated `ts` is the pinned constant so DEDUP fires on the business key
+/// (I-P1-08).
+fn build_lifecycle_ilp_row(
+    buffer: &mut Buffer,
+    row: &InstrumentLifecycleRow<'_>,
+) -> anyhow::Result<()> {
+    buffer.table(QUESTDB_TABLE_INSTRUMENT_LIFECYCLE)?;
+    // ── SYMBOLs first (ILP requires all tags before any field). ──
+    buffer.symbol(
+        "exchange_segment",
+        sanitize_ilp_symbol(row.exchange_segment).as_ref(),
+    )?;
+    buffer.symbol(
+        "instrument_type",
+        sanitize_ilp_symbol(row.instrument_type).as_ref(),
+    )?;
+    buffer.symbol("symbol_name", sanitize_ilp_symbol(row.symbol_name).as_ref())?;
+    buffer.symbol("lifecycle_state", row.lifecycle_state.as_str())?;
+    buffer.symbol(
+        "source_csv_sha256",
+        sanitize_ilp_symbol(row.source_csv_sha256).as_ref(),
+    )?;
+    // Optional SYMBOLs — skip when empty (→ NULL) to avoid empty ILP symbols.
+    if !row.exchange_id.is_empty() {
+        buffer.symbol("exchange_id", sanitize_ilp_symbol(row.exchange_id).as_ref())?;
+    }
+    if !row.underlying_symbol.is_empty() {
+        buffer.symbol(
+            "underlying_symbol",
+            sanitize_ilp_symbol(row.underlying_symbol).as_ref(),
+        )?;
+    }
+    if !row.option_type.is_empty() {
+        buffer.symbol("option_type", sanitize_ilp_symbol(row.option_type).as_ref())?;
+    }
+    // ── Fields. ──
+    buffer.column_i64("security_id", row.security_id)?;
+    buffer.column_i64("underlying_security_id", row.underlying_security_id)?;
+    buffer.column_i64("lot_size", i64::from(row.lot_size))?;
+    buffer.column_f64("tick_size", finite_or_zero(row.tick_size))?;
+    buffer.column_f64("strike_price", finite_or_zero(row.strike_price))?;
+    buffer.column_bool("lifecycle_state_locked", row.lifecycle_state_locked)?;
+    buffer.column_bool("dry_run", row.dry_run)?;
+    // STRING columns use `sanitize_ilp_string` (NOT the symbol sanitiser):
+    // commas/equals are literal-safe inside an ILP quoted string and must be
+    // preserved — stripping them would corrupt JSON-bearing fields.
+    buffer.column_str("display_name", &sanitize_ilp_string(row.display_name))?;
+    buffer.column_str(
+        "prev_symbol_chain",
+        &sanitize_ilp_string(row.prev_symbol_chain),
+    )?;
+    buffer.column_ts(
+        "last_update_ts",
+        TimestampNanos::new(row.last_update_ts_nanos),
+    )?;
+    buffer.column_ts("expiry_date", TimestampNanos::new(row.expiry_date_nanos))?;
+    buffer.column_ts(
+        "first_seen_date",
+        TimestampNanos::new(row.first_seen_date_nanos),
+    )?;
+    buffer.column_ts(
+        "last_seen_date",
+        TimestampNanos::new(row.last_seen_date_nanos),
+    )?;
+    buffer.column_ts(
+        "last_active_date",
+        TimestampNanos::new(row.last_active_date_nanos),
+    )?;
+    buffer.column_ts("expired_date", TimestampNanos::new(row.expired_date_nanos))?;
+    buffer.at(TimestampNanos::new(lifecycle_designated_ts_nanos()))?;
+    Ok(())
 }
 
-/// Batched UPSERT of many `instrument_lifecycle` rows. ONE reused client;
-/// rows chunked into [`LIFECYCLE_INSERT_BATCH_SIZE`] multi-row INSERTs.
-/// Idempotent via the table's DEDUP UPSERT KEYS — re-run is safe.
-/// (Pure builder `build_lifecycle_multi_insert_sql` carries the unit coverage.)
-// TEST-EXEMPT: requires running QuestDB; tested via boot integration in CI.
+/// Bulk-ingest many `instrument_lifecycle` rows via QuestDB **ILP** (port
+/// 9009) — the real ingestion pipe, NOT the `/exec` SQL/URL door.
+///
+/// The whole [`Buffer`] is built on the async task (CPU-only, borrows `rows`),
+/// then the blocking ILP connect + flush runs on a `spawn_blocking` thread so
+/// the tokio runtime is never blocked. Idempotent via the table's DEDUP UPSERT
+/// KEYS — a re-run after a fail-closed boot is safe (Z+ L6).
+///
+/// # Errors
+/// Returns `Err` if the ILP `Sender` cannot connect or the flush fails; the
+/// caller (`apply_reconcile_plan`) counts this and the next idempotent boot
+/// re-runs.
+// TEST-EXEMPT: network I/O — pure builder `build_lifecycle_ilp_row` is unit-tested + boot integration exercises the flush.
 pub async fn append_instrument_lifecycle_rows(
     questdb_config: &QuestDbConfig,
     rows: &[InstrumentLifecycleRow<'_>],
@@ -531,32 +640,24 @@ pub async fn append_instrument_lifecycle_rows(
     if rows.is_empty() {
         return Ok(());
     }
-    let base_url = format!(
-        "http://{}:{}/exec",
-        questdb_config.host, questdb_config.http_port
-    );
-    let client = Client::builder()
-        .timeout(Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
-        .build()?;
-    for chunk in rows.chunks(LIFECYCLE_INSERT_BATCH_SIZE) {
-        let sql = build_lifecycle_multi_insert_sql(chunk);
-        let resp = client
-            .get(&base_url)
-            .query(&[("query", sql.as_str())])
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body: String = resp
-                .text()
-                .await
-                .unwrap_or_default()
-                .chars()
-                .take(200)
-                .collect();
-            anyhow::bail!("instrument_lifecycle batch insert non-2xx ({status}): {body}");
-        }
+    let conf = questdb_config.build_ilp_conf_string();
+    let mut buffer = Buffer::new(ProtocolVersion::V1);
+    for row in rows {
+        build_lifecycle_ilp_row(&mut buffer, row)
+            .context("building instrument_lifecycle ILP row")?;
     }
+    // Borrows of `rows` end here; move the owned buffer + conf into a blocking
+    // thread for the synchronous ILP connect + flush.
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let mut sender =
+            Sender::from_conf(&conf).context("connect QuestDB ILP (instrument_lifecycle)")?;
+        sender
+            .flush(&mut buffer)
+            .context("flush instrument_lifecycle rows via ILP")?;
+        Ok(())
+    })
+    .await
+    .context("instrument_lifecycle ILP flush task join")??;
     Ok(())
 }
 
@@ -697,7 +798,7 @@ fn format_lifecycle_audit_row_tuple(row: &InstrumentLifecycleAuditRow<'_>) -> St
     let operator_note = sanitize_audit_string(row.operator_note);
     let lifecycle_state_after = row.lifecycle_state_after.as_str();
     let lot_size_after = row.lot_size_after;
-    let tick_size_after = row.tick_size_after;
+    let tick_size_after = finite_or_zero(row.tick_size_after);
     let expiry_after_micros = row.expiry_date_after_nanos / 1_000;
     let symbol_name_after = sanitize_audit_string(row.symbol_name_after);
     let dry_run = row.dry_run;
@@ -756,22 +857,68 @@ pub async fn append_instrument_lifecycle_audit_row(
 
 /// Build ONE multi-row `INSERT … VALUES (t1),…,(tN);` for a chunk of audit
 /// rows. PURE (no I/O) — extracted for deterministic testing.
-#[must_use]
-pub fn build_lifecycle_audit_multi_insert_sql(rows: &[InstrumentLifecycleAuditRow<'_>]) -> String {
-    let tuples: Vec<String> = rows.iter().map(format_lifecycle_audit_row_tuple).collect();
-    format!(
-        "INSERT INTO {QUESTDB_TABLE_INSTRUMENT_LIFECYCLE_AUDIT} \
-         ({LIFECYCLE_AUDIT_INSERT_COLUMN_LIST}) VALUES {};",
-        tuples.join(",")
-    )
+///
+/// Same ILP rules as [`build_lifecycle_ilp_row`]: SYMBOLs before fields; the
+/// DEDUP-key SYMBOLs (`exchange_segment`, `transition_kind`) are always written;
+/// the optional `from_state` SYMBOL is SKIPPED when empty (`appeared` has no
+/// prior state → NULL). `field_deltas` / `operator_note` are STRING columns.
+fn build_lifecycle_audit_ilp_row(
+    buffer: &mut Buffer,
+    row: &InstrumentLifecycleAuditRow<'_>,
+) -> anyhow::Result<()> {
+    buffer.table(QUESTDB_TABLE_INSTRUMENT_LIFECYCLE_AUDIT)?;
+    // ── SYMBOLs first. ──
+    buffer.symbol(
+        "exchange_segment",
+        sanitize_ilp_symbol(row.exchange_segment).as_ref(),
+    )?;
+    buffer.symbol("to_state", row.to_state.as_str())?;
+    buffer.symbol("transition_kind", row.transition_kind.as_str())?;
+    buffer.symbol(
+        "source_csv_sha256",
+        sanitize_ilp_symbol(row.source_csv_sha256).as_ref(),
+    )?;
+    buffer.symbol("lifecycle_state_after", row.lifecycle_state_after.as_str())?;
+    buffer.symbol(
+        "symbol_name_after",
+        sanitize_ilp_symbol(row.symbol_name_after).as_ref(),
+    )?;
+    // `from_state` is empty for an `appeared` transition — skip (→ NULL).
+    if let Some(from_state) = row.from_state {
+        buffer.symbol("from_state", from_state.as_str())?;
+    }
+    // ── Fields. ──
+    buffer.column_i64("security_id", row.security_id)?;
+    buffer.column_i64("lot_size_after", i64::from(row.lot_size_after))?;
+    buffer.column_f64("tick_size_after", finite_or_zero(row.tick_size_after))?;
+    buffer.column_bool("dry_run", row.dry_run)?;
+    // STRING columns use `sanitize_ilp_string` — `field_deltas` is JSON
+    // (`{"lot_size":[1000,200]}`); the symbol sanitiser would strip its
+    // commas and corrupt the forensic chain.
+    buffer.column_str("field_deltas", &sanitize_ilp_string(row.field_deltas))?;
+    buffer.column_str("operator_note", &sanitize_ilp_string(row.operator_note))?;
+    buffer.column_ts(
+        "trading_date_ist",
+        TimestampNanos::new(row.trading_date_ist_nanos),
+    )?;
+    buffer.column_ts(
+        "expiry_date_after",
+        TimestampNanos::new(row.expiry_date_after_nanos),
+    )?;
+    // Audit `ts` is the REAL per-transition wall-clock (NOT pinned constant).
+    buffer.at(TimestampNanos::new(row.ts_nanos_ist))?;
+    Ok(())
 }
 
-/// Batched append of many `instrument_lifecycle_audit` rows. ONE reused
-/// client; chunked into [`LIFECYCLE_INSERT_BATCH_SIZE`] multi-row INSERTs.
-/// Append-only forensic chain — written BEFORE the lifecycle batch so the
-/// §24 audit-first invariant holds at batch granularity.
-/// (Pure builder `build_lifecycle_audit_multi_insert_sql` carries unit coverage.)
-// TEST-EXEMPT: requires running QuestDB; tested via boot integration in CI.
+/// Bulk-append many `instrument_lifecycle_audit` rows via QuestDB **ILP**
+/// (port 9009). Append-only forensic chain — written BEFORE the lifecycle
+/// batch so the §24 audit-first invariant holds. Idempotent via DEDUP UPSERT
+/// KEYS. Buffer built on the async task; blocking flush on `spawn_blocking`.
+///
+/// # Errors
+/// Returns `Err` on ILP connect/flush failure → caller counts it → next
+/// idempotent boot re-runs (Z+ L6).
+// TEST-EXEMPT: network I/O — pure builder `build_lifecycle_audit_ilp_row` is unit-tested + boot integration exercises the flush.
 pub async fn append_instrument_lifecycle_audit_rows(
     questdb_config: &QuestDbConfig,
     rows: &[InstrumentLifecycleAuditRow<'_>],
@@ -779,32 +926,22 @@ pub async fn append_instrument_lifecycle_audit_rows(
     if rows.is_empty() {
         return Ok(());
     }
-    let base_url = format!(
-        "http://{}:{}/exec",
-        questdb_config.host, questdb_config.http_port
-    );
-    let client = Client::builder()
-        .timeout(Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
-        .build()?;
-    for chunk in rows.chunks(LIFECYCLE_INSERT_BATCH_SIZE) {
-        let sql = build_lifecycle_audit_multi_insert_sql(chunk);
-        let resp = client
-            .get(&base_url)
-            .query(&[("query", sql.as_str())])
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body: String = resp
-                .text()
-                .await
-                .unwrap_or_default()
-                .chars()
-                .take(200)
-                .collect();
-            anyhow::bail!("instrument_lifecycle_audit batch insert non-2xx ({status}): {body}");
-        }
+    let conf = questdb_config.build_ilp_conf_string();
+    let mut buffer = Buffer::new(ProtocolVersion::V1);
+    for row in rows {
+        build_lifecycle_audit_ilp_row(&mut buffer, row)
+            .context("building instrument_lifecycle_audit ILP row")?;
     }
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let mut sender =
+            Sender::from_conf(&conf).context("connect QuestDB ILP (instrument_lifecycle_audit)")?;
+        sender
+            .flush(&mut buffer)
+            .context("flush instrument_lifecycle_audit rows via ILP")?;
+        Ok(())
+    })
+    .await
+    .context("instrument_lifecycle_audit ILP flush task join")??;
     Ok(())
 }
 
@@ -1530,35 +1667,126 @@ mod tests {
     }
 
     #[test]
-    fn test_build_lifecycle_multi_insert_sql_batches_rows() {
-        let rows = [sample_index_row(), sample_index_row(), sample_index_row()];
-        let sql = build_lifecycle_multi_insert_sql(&rows);
+    fn test_build_lifecycle_ilp_row_content() {
+        // The bulk writer now ingests via ILP (port 9009), NOT the /exec URL.
+        // The pure row builder writes a valid ILP line for the lifecycle table.
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        build_lifecycle_ilp_row(&mut buffer, &sample_index_row()).unwrap();
+        assert_eq!(buffer.row_count(), 1);
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains(QUESTDB_TABLE_INSTRUMENT_LIFECYCLE));
+        assert!(content.contains("exchange_segment="));
+        assert!(content.contains("instrument_type="));
+        assert!(content.contains("lifecycle_state="));
+        assert!(content.contains("security_id="));
+        assert!(content.contains("tick_size="));
+        assert!(content.contains("lifecycle_state_locked="));
+    }
+
+    #[test]
+    fn test_build_lifecycle_ilp_row_empty_symbols_skipped_no_error() {
+        // Index rows carry empty exchange_id / underlying_symbol / option_type.
+        // Empty SYMBOLs MUST be skipped (→ NULL), never written as empty ILP
+        // symbols (which QuestDB versions can reject). Build must not error.
+        let mut row = sample_index_row();
+        row.exchange_id = "";
+        row.underlying_symbol = "";
+        row.option_type = "";
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        build_lifecycle_ilp_row(&mut buffer, &row)
+            .expect("empty optional symbols must build cleanly");
+        assert_eq!(buffer.row_count(), 1);
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        // Skipped optional symbols must NOT appear as `name=` tags …
+        assert!(!content.contains("option_type="));
+        assert!(!content.contains("underlying_symbol="));
+        // … but the mandatory DEDUP-key symbol is always present.
+        assert!(content.contains("exchange_segment="));
+    }
+
+    #[test]
+    fn test_build_lifecycle_ilp_row_clamps_non_finite_f64() {
+        // A non-finite strike/tick must be clamped (finite_or_zero) so the ILP
+        // f64 encoder never sees NaN/inf — regression for the boot-halt class.
+        let mut row = sample_index_row();
+        row.tick_size = f64::NAN;
+        row.strike_price = f64::INFINITY;
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        build_lifecycle_ilp_row(&mut buffer, &row).expect("non-finite f64 must clamp, not error");
+        assert_eq!(buffer.row_count(), 1);
+    }
+
+    #[test]
+    fn test_build_lifecycle_audit_ilp_row_content() {
+        // sample_audit_row has from_state = Some(Active) → present as a tag.
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        build_lifecycle_audit_ilp_row(&mut buffer, &sample_audit_row()).unwrap();
+        assert_eq!(buffer.row_count(), 1);
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(content.contains(QUESTDB_TABLE_INSTRUMENT_LIFECYCLE_AUDIT));
+        assert!(content.contains("transition_kind="));
+        assert!(content.contains("to_state="));
+        assert!(content.contains("from_state="));
+        assert!(content.contains("security_id="));
+    }
+
+    #[test]
+    fn test_build_lifecycle_audit_ilp_row_preserves_field_deltas_json() {
+        // Regression (2026-05-29 3-agent review): `field_deltas` is a STRING
+        // column carrying JSON with COMMAS. It MUST go through
+        // sanitize_ilp_string (preserves commas), NOT sanitize_ilp_symbol
+        // (strips commas → corrupts the forensic JSON). The commas must
+        // survive into the ILP buffer.
+        let mut row = sample_audit_row();
+        row.field_deltas = r#"{"lot_size":[1000,200]}"#;
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        build_lifecycle_audit_ilp_row(&mut buffer, &row).unwrap();
+        let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(
-            sql.starts_with(&format!(
-                "INSERT INTO {QUESTDB_TABLE_INSTRUMENT_LIFECYCLE} ("
-            )),
-            "must target the lifecycle table with the column list"
+            content.contains("[1000,200]"),
+            "field_deltas JSON commas must be preserved, got: {content}"
         );
-        // 3 tuples → 2 `),(` separators → ONE multi-row INSERT (not 3 requests).
-        assert_eq!(sql.matches("),(").count(), 2, "3 rows → one batched INSERT");
-        assert!(sql.ends_with(");"));
     }
 
     #[test]
-    fn test_build_lifecycle_audit_multi_insert_sql_batches_rows() {
-        let rows = [sample_audit_row(), sample_audit_row()];
-        let sql = build_lifecycle_audit_multi_insert_sql(&rows);
-        assert!(sql.contains(QUESTDB_TABLE_INSTRUMENT_LIFECYCLE_AUDIT));
-        assert_eq!(sql.matches("),(").count(), 1, "2 rows → one batched INSERT");
-        assert!(sql.ends_with(");"));
+    fn test_build_lifecycle_audit_ilp_row_appeared_skips_empty_from_state() {
+        // An `appeared` transition has from_state = None → skipped (→ NULL).
+        let mut row = sample_audit_row();
+        row.from_state = None;
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        build_lifecycle_audit_ilp_row(&mut buffer, &row).unwrap();
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(
+            !content.contains("from_state="),
+            "None from_state must be skipped"
+        );
+        // The DEDUP-key symbols are always written.
+        assert!(content.contains("transition_kind="));
+        assert!(content.contains("exchange_segment="));
     }
 
     #[test]
-    fn test_build_multi_insert_sql_empty_is_degenerate_but_safe() {
-        // Empty slice → "VALUES ;" — never actually sent (the async fn early-
-        // returns on empty), but the builder must not panic.
-        let sql = build_lifecycle_multi_insert_sql(&[]);
-        assert!(sql.contains("VALUES ;"));
+    fn test_finite_or_zero_clamps_non_finite() {
+        assert_eq!(finite_or_zero(12.5), 12.5);
+        assert_eq!(finite_or_zero(0.0), 0.0);
+        assert_eq!(finite_or_zero(f64::NAN), 0.0);
+        assert_eq!(finite_or_zero(f64::INFINITY), 0.0);
+        assert_eq!(finite_or_zero(f64::NEG_INFINITY), 0.0);
+    }
+
+    #[test]
+    fn test_lifecycle_tuple_never_emits_nan_or_inf() {
+        // A row with non-finite strike/tick must NOT put NaN/inf into the SQL
+        // (which QuestDB rejects → boot halt). Regression guard for the
+        // 2026-05-29 "79190 write error(s)" class of failure.
+        let mut row = sample_index_row();
+        row.tick_size = f64::NAN;
+        row.strike_price = f64::INFINITY;
+        let tuple = format_lifecycle_row_tuple(&row);
+        assert!(
+            !tuple.contains("NaN") && !tuple.contains("inf"),
+            "tuple: {tuple}"
+        );
     }
 
     #[test]

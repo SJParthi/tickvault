@@ -95,8 +95,61 @@ use tickvault_api::state::{SharedAppState, SharedHealthStatus, SystemHealthStatu
 // Main
 // ---------------------------------------------------------------------------
 
+/// Exit code returned by the `--check-trading-day` gate.
+///
+/// The holiday-gate shell script (`deploy/aws/holiday-gate.sh`) reads `$?` —
+/// NOT stdout (the app denies `print_stdout`/`print_stderr`). Contract:
+/// - `0`  = today (IST) is a trading day → let the app start.
+/// - `75` = today is a weekend / NSE holiday → gate self-stops the instance.
+///
+/// Pure so the contract is unit-testable without touching the clock/config.
+fn trading_day_gate_exit_code(is_trading_day: bool) -> i32 {
+    if is_trading_day { 0 } else { 75 }
+}
+
+/// `--check-trading-day` short-circuit: load config → build the calendar →
+/// evaluate IST today → exit with [`trading_day_gate_exit_code`].
+///
+/// FAIL-OPEN: any config/calendar load error exits `70`, which the gate script
+/// treats as "let the app start" — so the gate can NEVER stop the box on a real
+/// trading day because of a transient load failure. Single source of truth: the
+/// SAME `config/base.toml` NSE holiday list the app itself uses (no duplication).
+fn run_trading_day_gate() -> ! {
+    let config: ApplicationConfig = match Figment::new()
+        .merge(Toml::file(CONFIG_BASE_PATH))
+        .merge(Toml::file(CONFIG_LOCAL_PATH))
+        .extract()
+    {
+        Ok(c) => c,
+        // FAIL-OPEN on load error (exit 70 → gate lets the app start).
+        Err(_) => std::process::exit(70),
+    };
+    let calendar = match TradingCalendar::from_config(&config.trading) {
+        Ok(c) => c,
+        Err(_) => std::process::exit(70),
+    };
+    let today_ist = (chrono::Utc::now()
+        + chrono::TimeDelta::seconds(tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64))
+    .date_naive();
+    std::process::exit(trading_day_gate_exit_code(
+        calendar.is_trading_day(today_ist),
+    ));
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // -----------------------------------------------------------------------
+    // Step -1: Holiday-gate CLI short-circuit (cold path, no TLS / no runtime).
+    // -----------------------------------------------------------------------
+    // `tickvault --check-trading-day` is invoked by the boot-time holiday gate
+    // (deploy/aws/holiday-gate.sh via the tickvault-holiday-gate.service oneshot)
+    // BEFORE the app proper starts. It exits 0 (trading day) / 75 (holiday) /
+    // 70 (load error → fail-open). Must run before CryptoProvider install — the
+    // gate needs no TLS and exits immediately.
+    if std::env::args().any(|a| a == "--check-trading-day") {
+        run_trading_day_gate();
+    }
+
     // -----------------------------------------------------------------------
     // Step 0: Install rustls CryptoProvider (must happen before ANY TLS usage)
     // -----------------------------------------------------------------------
@@ -4753,68 +4806,91 @@ async fn load_daily_universe_plan(
     config: &ApplicationConfig,
 ) -> anyhow::Result<(Option<SubscriptionPlan>, Option<FnoUniverse>, bool)> {
     use anyhow::Context;
-    use std::sync::Arc;
-    use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
-    use tickvault_core::instrument::csv_downloader::CsvDownloader;
+    use tickvault_core::instrument::instrument_snapshot;
     use tickvault_core::instrument::subscription_planner::build_subscription_plan_from_daily_universe;
-    use tickvault_storage::instrument_fetch_audit_persistence::ensure_instrument_fetch_audit_table;
-    use tickvault_storage::instrument_lifecycle_persistence::{
-        ensure_instrument_lifecycle_audit_table, ensure_instrument_lifecycle_table,
-    };
 
     info!("Step 6c: daily-universe instrument fetch (scope=DailyUniverse, fail-closed §4)");
 
-    // QuestDB must be reachable before the reconcile writes. Idempotent if the
-    // boot probe already ran on this path (works regardless of boot path).
-    tickvault_storage::boot_probe::wait_for_questdb_ready(
-        &config.questdb,
-        tickvault_storage::boot_probe::BOOT_DEADLINE_SECS,
-    )
-    .await
-    .context("Step 6c: QuestDB not ready for daily-universe reconcile")?;
+    // Today's IST trading date — the snapshot cache key.
+    let now_ist = chrono::Utc::now()
+        + chrono::TimeDelta::seconds(i64::from(
+            tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+        ));
+    let today_date = now_ist.date_naive().format("%Y-%m-%d").to_string();
 
-    // Idempotent CREATE TABLE IF NOT EXISTS — the boot's downstream writers
-    // assume these 3 lifecycle/audit tables exist (they do not self-ensure).
-    ensure_instrument_lifecycle_table(&config.questdb).await;
-    ensure_instrument_lifecycle_audit_table(&config.questdb).await;
-    ensure_instrument_fetch_audit_table(&config.questdb).await;
+    // ── FAST PATH (PR-2): same-day snapshot → instant warm resubscribe ──
+    // Operator-authorized relaxation of the §4 "boot blocks until fresh CSV"
+    // rule for SAME-DAY crash recovery ONLY (lock §29). A date-keyed snapshot
+    // means today's universe was already fetched + validated + lifecycle-
+    // written by an earlier successful boot. We resubscribe instantly (~1ms)
+    // and run the full cold rebuild in the BACKGROUND to refresh the lifecycle
+    // master + snapshot. The fast path never SKIPS the audit/lifecycle work —
+    // it DEFERS it past first-tick. The FIRST boot of the day (no snapshot)
+    // still takes the fail-closed slow path below.
+    let warm_timer = std::time::Instant::now();
+    if let Some(universe) = instrument_snapshot::load_plan_snapshot_for_today(&today_date) {
+        let plan = build_subscription_plan_from_daily_universe(&universe);
+        let elapsed_ms = u64::try_from(warm_timer.elapsed().as_millis()).unwrap_or(u64::MAX);
+        info!(
+            universe_size = universe.total_count(),
+            total = plan.summary.total,
+            feed_mode = %plan.summary.feed_mode,
+            elapsed_ms,
+            "subscription plan ready (DailyUniverse — INSTANT warm resubscribe from snapshot)"
+        );
+        // Timing-proof telemetry: warm path, no cold rebuild this boot.
+        record_instrument_load_telemetry(elapsed_ms, 0, 0, true, 0);
 
-    // IST wall-clock nanoseconds (host-clock based) per the
-    // instrument_lifecycle_persistence convention — single `now_utc` so `now`
-    // and `today-midnight` are consistent.
-    let now_utc = chrono::Utc::now();
-    let offset_nanos = i64::from(IST_UTC_OFFSET_SECONDS) * 1_000_000_000;
-    // Fail-closed on a clock outside the representable nanos range
-    // (~1677..2262) rather than silently stamping epoch-0 audit rows
-    // (PR-2 security review LOW). Unreachable in practice; never lies.
-    let now_ist_nanos = now_utc
-        .timestamp_nanos_opt()
-        .context("Step 6c: system clock outside representable nanosecond range")?
-        + offset_nanos;
-    let now_ist = now_utc + chrono::TimeDelta::seconds(i64::from(IST_UTC_OFFSET_SECONDS));
-    let today_ist_nanos = now_ist
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .and_then(|midnight| midnight.and_utc().timestamp_nanos_opt())
-        .context("Step 6c: IST midnight outside representable nanosecond range")?;
+        // Background reconcile: refresh lifecycle master + snapshot off the
+        // critical path. Failure here does NOT halt — first-tick already flows
+        // from the snapshot, and lifecycle for TODAY was already written by the
+        // earlier boot that produced the snapshot.
+        let questdb = config.questdb.clone();
+        let date_for_bg = today_date.clone();
+        tokio::spawn(async move {
+            match cold_build_daily_universe(&questdb, false).await {
+                Ok((_outcome, fresh_universe)) => {
+                    if let Err(e) =
+                        instrument_snapshot::write_plan_snapshot(&fresh_universe, &date_for_bg)
+                    {
+                        warn!(error = %e, "background reconcile: snapshot refresh write failed");
+                    } else {
+                        info!(
+                            "background reconcile complete — lifecycle master + snapshot refreshed"
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        code = tickvault_common::error_code::ErrorCode::InstrFetch01CsvHardFailed
+                            .code_str(),
+                        error = %e,
+                        "background reconcile failed — warm plan still live; retries next boot"
+                    );
+                }
+            }
+        });
 
-    let downloader = Arc::new(CsvDownloader::new().context("Step 6c: CsvDownloader init failed")?);
-    let fetch_fn = move |_attempt: u32| {
-        let downloader = Arc::clone(&downloader);
-        async move { downloader.fetch_csv().await }
-    };
-    // §4: infinite retry (None) — boot blocks until a fresh CSV is in hand.
-    // dry_run = false: write real lifecycle/audit rows.
-    let (outcome, daily_universe) = tickvault_app::daily_universe_boot::run_daily_universe_boot(
-        &config.questdb,
-        fetch_fn,
-        now_ist_nanos,
-        today_ist_nanos,
-        false,
-        None,
-    )
-    .await
-    .context("Step 6c: daily-universe boot failed (fail-closed §4) — halting")?;
+        return Ok((Some(plan), None, false));
+    }
+
+    // ── SLOW PATH: first boot of the day (no snapshot) — full cold build ──
+    // §4 fail-closed: infinite retry, boot BLOCKS until a fresh validated CSV
+    // is in hand. A reconcile/audit error HALTS boot (?-propagated).
+    let (outcome, daily_universe) = cold_build_daily_universe(&config.questdb, false)
+        .await
+        .context("Step 6c: daily-universe cold build failed (fail-closed §4) — halting")?;
+
+    // Persist the snapshot so a same-day crash takes the fast path above.
+    // Best-effort: a failed cache write is degraded-not-broken (next boot
+    // cold-builds again).
+    if let Err(e) = instrument_snapshot::write_plan_snapshot(&daily_universe, &today_date) {
+        warn!(
+            error = %e,
+            date = %today_date,
+            "plan snapshot write failed — same-day crash will cold-build"
+        );
+    }
 
     let plan = build_subscription_plan_from_daily_universe(&daily_universe);
     info!(
@@ -4827,29 +4903,135 @@ async fn load_daily_universe_plan(
     );
 
     // Boot-timing proof: REAL evidence the O(1) warm path is working in
-    // production every day. A warm-skip boot (CSV SHA unchanged vs the last
-    // fetch-audit row) is sub-second regardless of the ~219K applicable-F&O
-    // master size; a full rebuild is the batched-seconds cold path. Surfaced
-    // three ways — structured INFO log (daily proof), Prometheus gauges
-    // (graphable trend), and a Telegram line emitted by the caller.
+    // production every day. Per-phase breakdown (download → build → reconcile)
+    // shows WHERE a cold boot spends its seconds.
     let elapsed_ms = outcome.elapsed_ms;
     let warm_skipped = outcome.reconcile.warm_skipped;
     let total_rows = u64::try_from(outcome.total_rows).unwrap_or(0);
+    let download_ms = outcome.download_ms;
+    let reconcile_ms = outcome.reconcile_ms;
+    let build_ms = elapsed_ms
+        .saturating_sub(download_ms)
+        .saturating_sub(reconcile_ms);
     info!(
         elapsed_ms,
+        download_ms,
+        build_ms,
+        reconcile_ms,
         warm_skipped,
         total_rows,
         universe_size = outcome.universe_size,
-        "instrument load timing (O(1) warm-path proof)"
+        "instrument load timing (O(1) warm-path proof; per-phase download→build→reconcile)"
     );
+    record_instrument_load_telemetry(
+        elapsed_ms,
+        download_ms,
+        reconcile_ms,
+        warm_skipped,
+        total_rows,
+    );
+
+    Ok((Some(plan), None, false))
+}
+
+/// Emit the instrument-load timing telemetry — Prometheus gauges + the
+/// process-global atomics the boot-timing Telegram line reads. Shared by both
+/// the warm (snapshot) and cold (full build) paths so the gauges/atomics are
+/// written exactly once per load, regardless of path.
+#[cfg(feature = "daily_universe_fetcher")]
+fn record_instrument_load_telemetry(
+    elapsed_ms: u64,
+    download_ms: u64,
+    reconcile_ms: u64,
+    warm_skipped: bool,
+    total_rows: u64,
+) {
+    let build_ms = elapsed_ms
+        .saturating_sub(download_ms)
+        .saturating_sub(reconcile_ms);
     metrics::gauge!("tv_instrument_load_duration_ms").set(elapsed_ms as f64);
+    metrics::gauge!("tv_instrument_load_download_ms").set(download_ms as f64);
+    metrics::gauge!("tv_instrument_load_build_ms").set(build_ms as f64);
+    metrics::gauge!("tv_instrument_load_reconcile_ms").set(reconcile_ms as f64);
     metrics::gauge!("tv_instrument_load_warm_skipped").set(if warm_skipped { 1.0 } else { 0.0 });
     metrics::gauge!("tv_instrument_load_total_rows").set(total_rows as f64);
     INSTRUMENT_LOAD_ELAPSED_MS.store(elapsed_ms, std::sync::atomic::Ordering::Relaxed);
     INSTRUMENT_LOAD_WARM_SKIPPED.store(warm_skipped, std::sync::atomic::Ordering::Relaxed);
     INSTRUMENT_LOAD_TOTAL_ROWS.store(total_rows, std::sync::atomic::Ordering::Relaxed);
+}
 
-    Ok((Some(plan), None, false))
+/// Cold build of the daily universe: wait for QuestDB → ensure lifecycle/audit
+/// tables → download the Detailed CSV → run the §4 fail-closed boot (infinite
+/// retry, lifecycle reconcile). Returns the boot outcome + the built universe.
+///
+/// Shared by the slow boot path (awaited) and the warm-path background
+/// reconcile (spawned). Takes only `&QuestDbConfig` so it is cheap to clone
+/// into the background task.
+#[cfg(feature = "daily_universe_fetcher")]
+async fn cold_build_daily_universe(
+    questdb: &tickvault_common::config::QuestDbConfig,
+    dry_run: bool,
+) -> anyhow::Result<(
+    tickvault_app::daily_universe_boot::DailyUniverseBootOutcome,
+    std::sync::Arc<tickvault_core::instrument::daily_universe::DailyUniverse>,
+)> {
+    use anyhow::Context;
+    use std::sync::Arc;
+    use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+    use tickvault_core::instrument::csv_downloader::CsvDownloader;
+    use tickvault_storage::instrument_fetch_audit_persistence::ensure_instrument_fetch_audit_table;
+    use tickvault_storage::instrument_lifecycle_persistence::{
+        ensure_instrument_lifecycle_audit_table, ensure_instrument_lifecycle_table,
+    };
+
+    // QuestDB must be reachable before the reconcile writes (idempotent).
+    tickvault_storage::boot_probe::wait_for_questdb_ready(
+        questdb,
+        tickvault_storage::boot_probe::BOOT_DEADLINE_SECS,
+    )
+    .await
+    .context("daily-universe: QuestDB not ready for reconcile")?;
+
+    // Idempotent CREATE TABLE IF NOT EXISTS — downstream writers assume these
+    // 3 lifecycle/audit tables exist (they do not self-ensure).
+    ensure_instrument_lifecycle_table(questdb).await;
+    ensure_instrument_lifecycle_audit_table(questdb).await;
+    ensure_instrument_fetch_audit_table(questdb).await;
+
+    // IST wall-clock nanoseconds (host-clock based) — single `now_utc` so `now`
+    // and `today-midnight` are consistent. Fail-closed on a clock outside the
+    // representable nanos range rather than stamping epoch-0 audit rows.
+    let now_utc = chrono::Utc::now();
+    let offset_nanos = i64::from(IST_UTC_OFFSET_SECONDS) * 1_000_000_000;
+    let now_ist_nanos = now_utc
+        .timestamp_nanos_opt()
+        .context("daily-universe: system clock outside representable nanosecond range")?
+        + offset_nanos;
+    let now_ist = now_utc + chrono::TimeDelta::seconds(i64::from(IST_UTC_OFFSET_SECONDS));
+    let today_ist_nanos = now_ist
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .and_then(|midnight| midnight.and_utc().timestamp_nanos_opt())
+        .context("daily-universe: IST midnight outside representable nanosecond range")?;
+
+    let downloader =
+        Arc::new(CsvDownloader::new().context("daily-universe: CsvDownloader init failed")?);
+    let fetch_fn = move |_attempt: u32| {
+        let downloader = Arc::clone(&downloader);
+        async move { downloader.fetch_csv().await }
+    };
+    // §4: infinite retry (None) — boot blocks until a fresh CSV is in hand.
+    let (outcome, universe) = tickvault_app::daily_universe_boot::run_daily_universe_boot(
+        questdb,
+        fetch_fn,
+        now_ist_nanos,
+        today_ist_nanos,
+        dry_run,
+        None,
+    )
+    .await
+    .context("daily-universe boot failed (fail-closed §4)")?;
+    Ok((outcome, universe))
 }
 
 // create_log_file_writer is now in boot_helpers module (lib.rs).
@@ -6156,6 +6338,20 @@ mod tests {
             .expect("measured boot must produce a message");
         assert!(msg.contains("6.2s"), "elapsed rendered: {msg}");
         assert!(msg.contains("full rebuild"), "cold-path phrasing: {msg}");
+    }
+
+    #[test]
+    fn test_trading_day_gate_exit_code_trading() {
+        // Trading day → 0 so the gate lets the app start.
+        assert_eq!(trading_day_gate_exit_code(true), 0);
+    }
+
+    #[test]
+    fn test_trading_day_gate_exit_code_non_trading() {
+        // Weekend/holiday → 75 so the gate self-stops the instance.
+        assert_eq!(trading_day_gate_exit_code(false), 75);
+        // 75 must be distinct from the fail-open load-error code 70.
+        assert_ne!(trading_day_gate_exit_code(false), 70);
     }
 
     #[test]

@@ -44,7 +44,7 @@ use tickvault_common::error_code::ErrorCode;
 use super::csv_parser::{CsvParseError, parse_detailed_csv};
 use super::daily_universe::{BuildError, DailyUniverse, build_daily_universe};
 use super::fno_underlying_extractor::{
-    ExtractError, canonical_sid, collect_applicable_fno_contracts, extract_fno_underlyings,
+    ExtractError, collect_applicable_fno_contracts, extract_fno_underlyings,
 };
 use super::index_extractor::{IndexExtractError, extract_indices};
 
@@ -148,22 +148,14 @@ pub fn build_universe_from_bytes(bytes: &[u8]) -> Result<DailyUniverse, Orchestr
     let indices = extract_indices(&rows)?;
 
     // Step 3b: collect the applicable F&O CONTRACTS for the lifecycle master
-    // (operator lock 2026-05-29 Quote 5, §5). Tracked-index SIDs are resolved
-    // with the SAME canonicaliser as the underlying-resolution path so the
-    // FUTIDX/OPTIDX match is robust to CSV format drift. These rows are
+    // (operator lock 2026-05-29 Quote 5, §5). Stock F&O is matched by
+    // underlying→NSE_EQ resolution; index F&O is matched by EXCHANGE (NSE/BSE)
+    // because Dhan links index options/futures via a derivatives-domain
+    // underlying SID (NIFTY=26000, BANKNIFTY=26009, SENSEX=1, BANKEX=12) that
+    // is NOT the IDX_I spot SID — matching on the spot SID dropped every index
+    // contract (2026-05-29 ~17K-row miss, fixed here). These rows are
     // master-only — they NEVER enter `subscription_targets`.
-    let mut index_sids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for r in &indices.nse_indices {
-        if let Some(c) = canonical_sid(&r.security_id) {
-            index_sids.insert(c);
-        }
-    }
-    if let Some(s) = &indices.bse_sensex
-        && let Some(c) = canonical_sid(&s.security_id)
-    {
-        index_sids.insert(c);
-    }
-    let fno_contracts = collect_applicable_fno_contracts(&rows, &fno, &index_sids);
+    let fno_contracts = collect_applicable_fno_contracts(&rows, &fno);
 
     // Step 4: build the unified universe (envelope check on the SUBSCRIPTION
     // set per §2 + §22; fno_contracts are master-only and not bounded).

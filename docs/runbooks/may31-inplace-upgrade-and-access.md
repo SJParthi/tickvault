@@ -212,6 +212,42 @@ grepping needed:**
 
 ---
 
+## 5.1 NSE-holiday boot gate (auto self-stop on non-trading days)
+
+The EventBridge cron starts the box **every weekday (Mon–Fri)**, but NSE has
+weekday holidays (Republic Day, Diwali, etc.) on which a boot is a pure no-op
+that still bills ~8h. A boot-time gate now handles this automatically:
+
+> **Picture:** the box wakes at 08:30, and the first thing it does is check its
+> own calendar. *"Is the market open today?"* If yes → the trading app starts.
+> If it's a holiday → the box texts nothing and **switches itself back off** —
+> no ~8h bill, no no-op boot noise. You do nothing.
+
+| Piece | What it does |
+|---|---|
+| `tickvault --check-trading-day` | the app reads the SAME `config/base.toml` NSE holiday list and exits `0` (trading) / `75` (holiday). One source of truth — no second list to maintain. |
+| `tickvault-holiday-gate.service` | a oneshot that runs BEFORE the app each boot, calls the check, and stops the instance on a holiday verdict. |
+| **FAIL-OPEN** | if the binary is missing (first boot), config fails to load, or AWS metadata is unreachable, the gate **lets the app start** — it can NEVER stop the box on a real trading day by mistake. |
+
+**Override — work on a holiday without the auto-stop:**
+
+```bash
+# Over SSM (no SSH) — touch the marker, THEN start the box manually:
+aws ssm send-command \
+  --document-name "AWS-RunShellScript" \
+  --targets "Key=InstanceIds,Values=<instance-id>" \
+  --parameters 'commands=["touch /opt/tickvault/ALLOW_HOLIDAY_RUN"]'
+# Remove it again when done so the next holiday auto-stops as usual:
+#   rm -f /opt/tickvault/ALLOW_HOLIDAY_RUN
+```
+
+While `/opt/tickvault/ALLOW_HOLIDAY_RUN` exists the gate skips the holiday
+check entirely and the app runs normally on holidays/weekends. The gate's
+verdict + any self-stop is visible in `journalctl -u tickvault-holiday-gate`
+and CloudWatch (`/tickvault/prod/system`).
+
+---
+
 ## 6. ACCESS — reach the box from every surface
 
 > **Golden rule:** there is **no SSH port-22 dependency** for normal ops — use

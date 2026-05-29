@@ -162,8 +162,20 @@ sudo -u ec2-user docker compose up -d
 # on first boot; the deploy-aws GitHub Actions workflow will scp it, and
 # subsequent EC2 starts will auto-start the service.
 cp /opt/tickvault/repo/deploy/systemd/tickvault.service /etc/systemd/system/
+
+# ---- Step 7b: Install + ENABLE the NSE-holiday boot gate ----
+# The EventBridge cron starts the box every weekday (Mon-Fri), but NSE has
+# weekday holidays on which a boot is a pure no-op that still bills ~8h. This
+# oneshot gate runs BEFORE tickvault.service, asks the app's own calendar
+# (config/base.toml NSE holiday list — single source of truth), and self-stops
+# the instance on a non-trading day. FAIL-OPEN: only a definitive holiday
+# verdict stops the box. Override: `touch /opt/tickvault/ALLOW_HOLIDAY_RUN`.
+chmod +x /opt/tickvault/repo/deploy/aws/holiday-gate.sh
+cp /opt/tickvault/repo/deploy/systemd/tickvault-holiday-gate.service /etc/systemd/system/
+
 systemctl daemon-reload
 systemctl enable tickvault.service
+systemctl enable tickvault-holiday-gate.service
 
 echo "=== tickvault user-data complete at $(date -u) ==="
 echo "Next step: GitHub Actions deploy-aws workflow will scp the first binary."

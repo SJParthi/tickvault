@@ -86,3 +86,31 @@
 
 - [ ] Wording matches mandated envelope qualifier (see `operator-charter-forever.md` §F)
 - [ ] No "never disconnect" / "never fails" lies without envelope
+
+## Zero-Loss Guarantee Charter (see `.claude/rules/project/zero-loss-guarantee-charter.md`)
+
+<!-- Checked on EVERY PR / sub-PR / task. Tick or write `N/A — <reason>`. -->
+
+### Coverage proof (§2) — artefact, not a claim
+
+- [ ] Tests added (paste `test result: ok. N passed` with N) — or `N/A — docs only`
+- [ ] Audit `<event>_audit` table + DEDUP keys (or `N/A`)
+- [ ] Monitoring: Prom counter/gauge + tracing span (or `N/A`)
+- [ ] Logging: every `error!` carries `code = ErrorCode::X.code_str()`
+- [ ] Alerting: alert rule added for any new failure mode (or `N/A`)
+- [ ] Scenario/edge: chaos + property test for new failure mode (or `N/A`)
+- [ ] Performance: DHAT + Criterion numbers pasted if hot path (or `N/A — not hot path`)
+- [ ] Extreme check: a ratchet test fails the build on regression
+
+### Zero-loss / resilience envelope (§1) — honest + bounded
+
+- [ ] No new tick-drop path; ring→spill→DLQ unchanged
+- [ ] WS `SubscribeRxGuard` + pool watchdog unchanged
+- [ ] No new hot-path allocation (DHAT clean) — O(1) per-tick / per-lookup
+- [ ] Any inherently-O(N) step is FLAGGED as O(N), never claimed O(1)
+- [ ] Composite `(security_id, exchange_segment)` uniqueness + DEDUP keys intact
+
+### No-hallucination evidence (§4)
+
+- [ ] Every outcome claim is backed by REAL pasted evidence (counts / bench / query), not "should pass"
+- [ ] Unmeasured outcomes are stated as "not yet measured", never asserted

@@ -125,6 +125,20 @@ jobs:
       fail-fast: false
       matrix:
         crate: [common, storage, core, trading, api, app]
+        # Crates that define the `daily_universe_fetcher` feature must be
+        # tested WITH it enabled — otherwise the entire daily-universe
+        # subsystem (CSV downloader/parser/extractors + the warm-resubscribe
+        # snapshot) is #[cfg]-excluded and its --lib unit tests run vacuously
+        # (false-OK, charter Rule 11). These `include` entries merge a
+        # `features` arg into the matching crate job; crates without an entry
+        # get an empty `features` string.
+        include:
+          - crate: core
+            features: "--features daily_universe_fetcher"
+          - crate: storage
+            features: "--features daily_universe_fetcher"
+          - crate: app
+            features: "--features daily_universe_fetcher"
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -149,7 +163,7 @@ jobs:
         # Profile `ci` (.config/nextest.toml) caps per-test wall-clock
         # at 90 s so runaway tests fail fast. Flaky tests get 1 retry
         # before being marked FAIL.
-        run: cargo nextest run -p tickvault-${{ matrix.crate }} --lib --no-fail-fast --profile ci
+        run: cargo nextest run -p tickvault-${{ matrix.crate }} ${{ matrix.features }} --lib --no-fail-fast --profile ci
 
   # -------------------------------------------------------------------------
   # Security & Audit — delegated to security-audit.yml workflow.

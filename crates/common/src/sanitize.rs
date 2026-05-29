@@ -101,6 +101,46 @@ pub fn sanitize_ilp_symbol(input: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(bounded)
 }
 
+/// Sanitiser for a value bound to a QuestDB **ILP STRING column**
+/// (`Buffer::column_str`), as opposed to a SYMBOL tag.
+///
+/// Why a third sanitiser:
+/// * [`sanitize_audit_string`] targets SQL string literals — it strips `;`/`--`
+///   and DOUBLES single quotes. Both are WRONG for ILP (no SQL quoting; the
+///   `questdb-rs` encoder escapes the value itself), and quote-doubling would
+///   corrupt the stored text.
+/// * [`sanitize_ilp_symbol`] strips the ILP TAG delimiters `,` and `=`. That is
+///   correct for a SYMBOL (tag) but WRONG for a STRING field: commas/equals are
+///   literal-safe inside an ILP quoted string, and stripping them corrupts JSON
+///   payloads (e.g. the audit `field_deltas` `{"lot_size":[1000,200]}`).
+///
+/// This helper preserves `,` `=` `'` `;` `-` `"` verbatim — `questdb-rs`
+/// `column_str` escapes the genuinely ILP-special `"` / `\` / newline itself —
+/// while still stripping ASCII/C1 control chars and Unicode BiDi-override /
+/// zero-width / BOM characters (display-spoofing + grep/jq breakage, per the
+/// Wave-2-D audit), and caps length at [`MAX_AUDIT_STR_LEN`].
+#[must_use]
+pub fn sanitize_ilp_string(input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+    input
+        .chars()
+        .take(MAX_AUDIT_STR_LEN)
+        .filter(|ch| {
+            let cp = *ch as u32;
+            // Keep everything EXCEPT control / C1 / BiDi / zero-width / BOM.
+            !(cp < 0x20
+                || cp == 0x7f
+                || (0x80..=0x9f).contains(&cp)
+                || ('\u{202a}'..='\u{202e}').contains(ch)
+                || ('\u{2066}'..='\u{2069}').contains(ch)
+                || ('\u{200b}'..='\u{200f}').contains(ch)
+                || *ch == '\u{feff}')
+        })
+        .collect()
+}
+
 /// Centralised audit-string sanitiser. Every audit-table writer
 /// (`*_audit_persistence.rs`) MUST funnel free-text columns through this
 /// helper before SQL interpolation.
@@ -539,6 +579,40 @@ mod tests {
     #[test]
     fn test_sanitize_audit_string_empty_returns_empty() {
         assert_eq!(sanitize_audit_string(""), "");
+    }
+
+    #[test]
+    fn test_sanitize_ilp_string_empty_returns_empty() {
+        assert_eq!(sanitize_ilp_string(""), "");
+    }
+
+    #[test]
+    fn test_sanitize_ilp_string_preserves_json_commas_and_punctuation() {
+        // The audit `field_deltas` JSON MUST survive intact — commas/colons/
+        // brackets/quotes are literal-safe inside an ILP STRING field. (The
+        // SYMBOL sanitiser would strip the commas and corrupt the JSON.)
+        let json = r#"{"lot_size":[1000,200],"tick_size":[0.05,0.01]}"#;
+        assert_eq!(sanitize_ilp_string(json), json);
+        // Single quotes are NOT doubled (that's the SQL sanitiser's job).
+        assert_eq!(sanitize_ilp_string("O'Brien & Co"), "O'Brien & Co");
+        // Equals + semicolons preserved (literal-safe in a quoted string).
+        assert_eq!(sanitize_ilp_string("a=b; c-d"), "a=b; c-d");
+    }
+
+    #[test]
+    fn test_sanitize_ilp_string_strips_control_and_bidi() {
+        // Control chars, BiDi override, zero-width, BOM are stripped.
+        let dirty = "ABC\n\t\u{202e}DEF\u{200b}\u{feff}";
+        assert_eq!(sanitize_ilp_string(dirty), "ABCDEF");
+    }
+
+    #[test]
+    fn test_sanitize_ilp_string_truncates_to_max_len() {
+        let long = "x".repeat(MAX_AUDIT_STR_LEN + 50);
+        assert_eq!(
+            sanitize_ilp_string(&long).chars().count(),
+            MAX_AUDIT_STR_LEN
+        );
     }
 
     #[test]
