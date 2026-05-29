@@ -92,14 +92,24 @@ fn csv_row_to_today_instrument(row: &CsvRow) -> TodayInstrument {
 }
 
 /// Extract every instrument in the built universe as a full-detail
-/// [`TodayInstrument`]. PURE — reads `DailyUniverse::subscription_targets`.
-/// Order matches the universe (indices first, then F&O underlyings).
+/// [`TodayInstrument`]. PURE — reads BOTH `subscription_targets` (the 331
+/// indices + F&O underlyings) AND `fno_contracts` (applicable F&O contracts,
+/// master-only per operator lock 2026-05-29 Quote 5). The lifecycle reconcile
+/// UPSERTs the full set; the WebSocket dispatcher reads `subscription_targets`
+/// ONLY (2-WebSocket lock untouched). Order: indices, then F&O underlyings,
+/// then F&O contracts.
 #[must_use]
 pub fn extract_today_instruments(universe: &DailyUniverse) -> Vec<TodayInstrument> {
     universe
         .subscription_targets
         .iter()
         .map(|t| csv_row_to_today_instrument(&t.csv_row))
+        .chain(
+            universe
+                .fno_contracts
+                .iter()
+                .map(csv_row_to_today_instrument),
+        )
         .collect()
 }
 
@@ -215,6 +225,7 @@ mod tests {
                     },
                 },
             ],
+            fno_contracts: vec![],
         };
         let out = extract_today_instruments(&universe);
         assert_eq!(out.len(), 2);
@@ -228,7 +239,63 @@ mod tests {
     fn test_extract_today_instruments_empty_universe() {
         let universe = DailyUniverse {
             subscription_targets: vec![],
+            fno_contracts: vec![],
         };
         assert!(extract_today_instruments(&universe).is_empty());
+    }
+
+    #[test]
+    fn test_extract_today_instruments_includes_fno_contracts_master_only() {
+        // 1 subscription target (NIFTY index) + 2 applicable F&O contracts.
+        // Operator lock 2026-05-29 Quote 5: the lifecycle reconcile sees ALL
+        // 3; the WebSocket dispatcher (subscription_targets) sees only the 1.
+        let universe = DailyUniverse {
+            subscription_targets: vec![SubscriptionTarget {
+                role: InstrumentRole::Index,
+                csv_row: CsvRow {
+                    security_id: "13".to_string(),
+                    segment: "IDX_I".to_string(),
+                    instrument: "INDEX".to_string(),
+                    symbol_name: "NIFTY".to_string(),
+                    ..Default::default()
+                },
+            }],
+            fno_contracts: vec![
+                CsvRow {
+                    security_id: "49081".to_string(),
+                    segment: "NSE_FNO".to_string(),
+                    instrument: "OPTIDX".to_string(),
+                    symbol_name: "NIFTY26JUN24000CE".to_string(),
+                    underlying_security_id: "13".to_string(),
+                    ..Default::default()
+                },
+                CsvRow {
+                    security_id: "49082".to_string(),
+                    segment: "NSE_FNO".to_string(),
+                    instrument: "FUTSTK".to_string(),
+                    symbol_name: "RELIANCE26JUNFUT".to_string(),
+                    underlying_security_id: "2885".to_string(),
+                    ..Default::default()
+                },
+            ],
+        };
+        // Lifecycle reconcile reads ALL 3 (1 subscription + 2 contracts).
+        let out = extract_today_instruments(&universe);
+        assert_eq!(out.len(), 3, "master = subscription + contracts");
+        assert_eq!(out[0].security_id, 13, "subscription target first");
+        assert_eq!(out[1].security_id, 49081, "then contracts");
+        assert_eq!(out[2].security_id, 49082);
+        // The subscription dispatcher reads only subscription_targets → 1.
+        assert_eq!(
+            universe.subscription_targets.len(),
+            1,
+            "feed stays 1 — 2-WS lock"
+        );
+        assert_eq!(universe.lifecycle_count(), 3);
+        assert_eq!(
+            universe.total_count(),
+            1,
+            "envelope counts subscription only"
+        );
     }
 }
