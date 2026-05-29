@@ -46,6 +46,13 @@ struct AggregatorHeartbeatInner {
     seals_emitted: AtomicU64,
     seals_dropped: AtomicU64,
     late_ticks_discarded: AtomicU64,
+    /// G3 positive-signal counter: sealed candles this interval whose
+    /// `close_pct_from_prev_day` was NON-ZERO. The false-OK guard
+    /// (audit-findings Rule 11) for the percentage-change feature — if
+    /// `seals_emitted` advances during market hours but this stays 0,
+    /// the % column is silently broken (the Concern-C regression class),
+    /// the exact false-OK the operator must never miss.
+    close_pct_nonzero: AtomicU64,
 }
 
 impl AggregatorHeartbeatCounters {
@@ -76,6 +83,14 @@ impl AggregatorHeartbeatCounters {
             .fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Record one emitted seal whose `close_pct_from_prev_day` was
+    /// non-zero (G3 real-time proof that the percentage-change column is
+    /// populating). Seal path; called once per timeframe at a boundary,
+    /// only when the computed % is non-zero. ~3 ns.
+    pub fn record_close_pct_nonzero(&self) {
+        self.inner.close_pct_nonzero.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Atomic snapshot + reset.
     ///
     /// Returns the counts accumulated since the last `drain` call and
@@ -90,6 +105,7 @@ impl AggregatorHeartbeatCounters {
             seals_emitted: self.inner.seals_emitted.swap(0, Ordering::AcqRel),
             seals_dropped: self.inner.seals_dropped.swap(0, Ordering::AcqRel),
             late_ticks_discarded: self.inner.late_ticks_discarded.swap(0, Ordering::AcqRel),
+            close_pct_nonzero: self.inner.close_pct_nonzero.swap(0, Ordering::AcqRel),
         }
     }
 }
@@ -106,6 +122,11 @@ pub struct AggregatorHeartbeatSnapshot {
     pub seals_dropped: u64,
     /// Ticks arriving after their bucket's seal had already fired.
     pub late_ticks_discarded: u64,
+    /// Emitted seals this interval with a non-zero `close_pct_from_prev_day`.
+    /// Compare against `seals_emitted`: `seals_emitted > 0` while
+    /// `close_pct_nonzero == 0` during market hours is the percentage-change
+    /// false-OK smell (G3 / audit-findings Rule 11).
+    pub close_pct_nonzero: u64,
 }
 
 impl AggregatorHeartbeatSnapshot {
@@ -189,18 +210,21 @@ mod tests {
             seals_emitted: 1,
             seals_dropped: 0,
             late_ticks_discarded: 0,
+            close_pct_nonzero: 0,
         };
         assert!(s.is_active());
         let s = AggregatorHeartbeatSnapshot {
             seals_emitted: 0,
             seals_dropped: 1,
             late_ticks_discarded: 0,
+            close_pct_nonzero: 0,
         };
         assert!(s.is_active());
         let s = AggregatorHeartbeatSnapshot {
             seals_emitted: 0,
             seals_dropped: 0,
             late_ticks_discarded: 1,
+            close_pct_nonzero: 0,
         };
         assert!(s.is_active());
     }
@@ -211,8 +235,46 @@ mod tests {
             seals_emitted: 0,
             seals_dropped: 0,
             late_ticks_discarded: 0,
+            close_pct_nonzero: 0,
         };
         assert!(!s.is_active());
+    }
+
+    #[test]
+    fn test_record_close_pct_nonzero_increments_only_that_counter() {
+        let c = AggregatorHeartbeatCounters::new();
+        c.record_close_pct_nonzero();
+        c.record_close_pct_nonzero();
+        let snap = c.drain();
+        assert_eq!(snap.close_pct_nonzero, 2);
+        assert_eq!(snap.seals_emitted, 0);
+        assert_eq!(snap.seals_dropped, 0);
+        assert_eq!(snap.late_ticks_discarded, 0);
+    }
+
+    #[test]
+    fn test_drain_resets_close_pct_nonzero() {
+        let c = AggregatorHeartbeatCounters::new();
+        c.record_close_pct_nonzero();
+        assert_eq!(c.drain().close_pct_nonzero, 1);
+        assert_eq!(c.drain().close_pct_nonzero, 0);
+    }
+
+    // G3 false-OK contract: a non-zero close_pct_nonzero implies at least
+    // one seal carried a real % change. `seals_emitted > 0` with
+    // `close_pct_nonzero == 0` during market hours is the smell the
+    // operator/CloudWatch alarm watches for.
+    #[test]
+    fn test_close_pct_nonzero_is_bounded_by_seals_emitted_when_wired() {
+        let c = AggregatorHeartbeatCounters::new();
+        // simulate the seal site: every nonzero-pct seal is also an emit
+        c.record_emit();
+        c.record_close_pct_nonzero();
+        c.record_emit(); // a flat (0%) seal — emit without nonzero
+        let snap = c.drain();
+        assert!(snap.close_pct_nonzero <= snap.seals_emitted);
+        assert_eq!(snap.seals_emitted, 2);
+        assert_eq!(snap.close_pct_nonzero, 1);
     }
 
     /// `Clone` shares state via `Arc<AtomicU64>` so writer / reader

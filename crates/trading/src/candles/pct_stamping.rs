@@ -248,6 +248,21 @@ mod tests {
         s
     }
 
+    // Operator 2-decimal contract (2026-05-29): close_pct must never
+    // persist more than 2 digits after the point. Before the fix this
+    // produced values like 0.10534002950099992 in QuestDB.
+    #[test]
+    fn test_compute_close_pct_rounds_to_two_decimals() {
+        // 23932.75 vs 23908.5 → 0.1014...% → rounds to 0.10
+        let pct = compute_close_pct(23932.75, 23908.5);
+        assert_eq!(pct, 0.10);
+        // a value that rounds up
+        let pct_up = compute_close_pct(29662.15, 28907.0);
+        assert_eq!(pct_up, 2.61);
+        // verify no long fraction survives
+        assert_eq!((pct_up * 100.0).fract(), 0.0);
+    }
+
     #[test]
     fn test_stamp_seal_pct_fields_happy_path() {
         let mut state = mk_live_candle_state(105.0, 1_500_000, 5_000_000, 20_000_000);
