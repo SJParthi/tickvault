@@ -206,14 +206,41 @@ impl OwnedLifecycleRow {
     }
 }
 
-/// A non-empty expiry string that parsed to the `0` sentinel is malformed:
-/// `expiry_date_to_ist_nanos` returns `0` for BOTH "no expiry" (empty) and
-/// "unparseable", so the only way to tell them apart is to check whether
-/// the source string was non-empty. Spot/index rows have an empty expiry
-/// and are NOT flagged.
+/// The 8 Dhan derivative instrument types (FUT*/OPT*) — the ONLY rows that
+/// carry a real expiry. Mirrors `DERIVATIVE_INSTRUMENT_PREFIXES` in
+/// `crates/core/src/instrument/csv_parser.rs`; kept identical by
+/// `test_malformed_expiry_derivative_type_list_is_the_canonical_eight`.
+const DERIVATIVE_INSTRUMENT_TYPES: &[&str] = &[
+    "FUTIDX", "OPTIDX", "FUTSTK", "OPTSTK", "FUTCUR", "OPTCUR", "FUTCOM", "OPTFUT",
+];
+
 #[must_use]
-pub fn is_malformed_expiry(raw_expiry: &str, parsed_nanos: i64) -> bool {
-    !raw_expiry.trim().is_empty() && parsed_nanos == 0
+fn instrument_type_carries_expiry(instrument_type: &str) -> bool {
+    DERIVATIVE_INSTRUMENT_TYPES
+        .iter()
+        .any(|t| instrument_type.eq_ignore_ascii_case(t))
+}
+
+/// A *derivative* row whose non-empty expiry string parsed to the `0`
+/// sentinel is malformed: `expiry_date_to_ist_nanos` returns `0` for BOTH
+/// "no expiry" and "unparseable", so we additionally require a non-empty
+/// source string.
+///
+/// INDEX / EQUITY rows are NEVER flagged — they have no expiry by nature.
+/// Dhan does not ship them with an empty field; it ships the literal
+/// placeholder `0001-01-01`, which `NaiveDate` parses to year-1 midnight,
+/// which is OUTSIDE the i64-nanos range (~1678–2262), so it collapses to the
+/// same `0` sentinel as an unparseable string. The previous "non-empty + 0"
+/// check therefore mis-flagged ~120 index rows EVERY boot, each emitting an
+/// `error!("derivative expiry failed to parse")` that routes to Telegram —
+/// pure pager noise, and categorically wrong (indices are not derivatives).
+/// Gating on the instrument type fixes both: only the 8 FUT*/OPT* types can
+/// be malformed.
+#[must_use]
+pub fn is_malformed_expiry(instrument_type: &str, raw_expiry: &str, parsed_nanos: i64) -> bool {
+    instrument_type_carries_expiry(instrument_type)
+        && !raw_expiry.trim().is_empty()
+        && parsed_nanos == 0
 }
 
 /// Represent an `f64` as a JSON value WITHOUT panicking on non-finite
@@ -347,7 +374,7 @@ pub fn build_lifecycle_upsert_row(
     dry_run: bool,
 ) -> (OwnedLifecycleRow, bool) {
     let expiry_nanos = expiry_date_to_ist_nanos(&today.expiry_date);
-    let malformed = is_malformed_expiry(&today.expiry_date, expiry_nanos);
+    let malformed = is_malformed_expiry(&today.instrument_type, &today.expiry_date, expiry_nanos);
     let first_seen = resolve_first_seen_nanos(&action.key, prev, today_ist_nanos);
     let row = OwnedLifecycleRow {
         last_update_ts_nanos: now_ist_nanos,
@@ -605,25 +632,80 @@ mod tests {
 
     #[test]
     fn test_is_malformed_expiry_nonempty_zero_is_malformed() {
-        assert!(is_malformed_expiry("not-a-date", 0));
-        assert!(is_malformed_expiry("  2025-13-99  ", 0));
+        // A derivative whose expiry string is non-empty yet parsed to 0.
+        assert!(is_malformed_expiry("OPTSTK", "not-a-date", 0));
+        assert!(is_malformed_expiry("FUTIDX", "  2025-13-99  ", 0));
     }
 
     #[test]
     fn test_is_malformed_expiry_empty_is_not_malformed() {
         assert!(
-            !is_malformed_expiry("", 0),
-            "spot/index empty expiry is fine"
+            !is_malformed_expiry("OPTSTK", "", 0),
+            "even a derivative with an empty expiry string is not 'malformed'"
         );
-        assert!(!is_malformed_expiry("   ", 0));
+        assert!(!is_malformed_expiry("FUTSTK", "   ", 0));
     }
 
     #[test]
     fn test_is_malformed_expiry_valid_parse_is_not_malformed() {
         assert!(!is_malformed_expiry(
+            "OPTSTK",
             "2025-12-25",
             1_735_084_800_000_000_000
         ));
+    }
+
+    /// Regression (2026-05-29): the live boot log emitted ~120
+    /// `error!("derivative expiry failed to parse")` lines for INDEX rows.
+    /// Dhan ships index/equity rows with the placeholder `0001-01-01`, which
+    /// parses to year-1 (outside i64-nanos) → the `0` sentinel. Non-derivative
+    /// rows must NEVER be flagged malformed regardless of their expiry string.
+    #[test]
+    fn test_is_malformed_expiry_index_0001_sentinel_is_not_malformed() {
+        assert!(
+            !is_malformed_expiry("INDEX", "0001-01-01", 0),
+            "INDEX rows carry the 0001-01-01 no-expiry placeholder — not malformed"
+        );
+        assert!(
+            !is_malformed_expiry("EQUITY", "0001-01-01", 0),
+            "EQUITY rows have no expiry — not malformed"
+        );
+        // Even a genuinely garbage string on a non-derivative is not flagged:
+        // the error is categorically about *derivative* expiry.
+        assert!(!is_malformed_expiry("INDEX", "garbage", 0));
+    }
+
+    /// A derivative that somehow carries the 0001-01-01 sentinel (a real data
+    /// problem — derivatives MUST have an expiry) IS still flagged.
+    #[test]
+    fn test_is_malformed_expiry_derivative_with_sentinel_is_malformed() {
+        assert!(is_malformed_expiry("OPTSTK", "0001-01-01", 0));
+    }
+
+    /// The derivative-type list must stay identical to the canonical 8 prefixes
+    /// in `crates/core/src/instrument/csv_parser.rs::DERIVATIVE_INSTRUMENT_PREFIXES`.
+    /// If Dhan adds a derivative class, update BOTH lists together.
+    #[test]
+    fn test_malformed_expiry_derivative_type_list_is_the_canonical_eight() {
+        let mut got = DERIVATIVE_INSTRUMENT_TYPES.to_vec();
+        got.sort_unstable();
+        let mut want = vec![
+            "FUTIDX", "OPTIDX", "FUTSTK", "OPTSTK", "FUTCUR", "OPTCUR", "FUTCOM", "OPTFUT",
+        ];
+        want.sort_unstable();
+        assert_eq!(
+            got, want,
+            "derivative type list drifted from the canonical 8"
+        );
+    }
+
+    #[test]
+    fn test_instrument_type_carries_expiry_is_case_insensitive() {
+        assert!(instrument_type_carries_expiry("optstk"));
+        assert!(instrument_type_carries_expiry("OPTSTK"));
+        assert!(!instrument_type_carries_expiry("index"));
+        assert!(!instrument_type_carries_expiry("INDEX"));
+        assert!(!instrument_type_carries_expiry("EQUITY"));
     }
 
     // ---- build_field_deltas_json ----
