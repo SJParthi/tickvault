@@ -410,6 +410,18 @@ pub async fn ensure_instrument_lifecycle_table(questdb_config: &QuestDbConfig) {
     }
 }
 
+/// Coerce a non-finite f64 (NaN / ±inf) to `0.0` before SQL formatting.
+///
+/// `format!("{}", f64::NAN)` emits the literal `NaN`, which QuestDB rejects —
+/// a single such tuple would fail its whole INSERT and halt the boot. The
+/// ~219K-row applicable-F&O master can carry an odd strike/tick from upstream
+/// CSV parsing, so we clamp defensively (a 0.0 price is an obvious sentinel an
+/// operator can spot, never a silent SQL break).
+#[must_use]
+fn finite_or_zero(value: f64) -> f64 {
+    if value.is_finite() { value } else { 0.0 }
+}
+
 /// Formats one row as a QuestDB `VALUES (...)` tuple in schema order.
 ///
 /// The leading designated `ts` is stamped from
@@ -432,9 +444,9 @@ fn format_lifecycle_row_tuple(row: &InstrumentLifecycleRow<'_>) -> String {
     let security_id = row.security_id;
     let underlying_security_id = row.underlying_security_id;
     let lot_size = row.lot_size;
-    let tick_size = row.tick_size;
+    let tick_size = finite_or_zero(row.tick_size);
     let expiry_micros = row.expiry_date_nanos / 1_000;
-    let strike_price = row.strike_price;
+    let strike_price = finite_or_zero(row.strike_price);
     let lifecycle_state_locked = row.lifecycle_state_locked;
     let first_seen_micros = row.first_seen_date_nanos / 1_000;
     let last_seen_micros = row.last_seen_date_nanos / 1_000;
@@ -507,6 +519,48 @@ pub async fn append_instrument_lifecycle_row(
 /// minutes→hours. Batching + one reused client cuts it to a few seconds.
 pub const LIFECYCLE_INSERT_BATCH_SIZE: usize = 5000;
 
+/// Max bytes of the joined `VALUES` tuples per `/exec` request.
+///
+/// QuestDB's REST `/exec` takes the SQL in the URL **query string**, which
+/// reqwest URL-encodes (≈2–3× inflation), and QuestDB bounds the request by its
+/// header buffer. A fixed 5000-row chunk of the ~219K applicable-F&O master
+/// produces a multi-megabyte URL that QuestDB rejects — the cause of the
+/// "79190 write error(s)" boot halt once the F&O master (#872) grew the table
+/// from ~331 rows to ~79K+. We therefore cap each statement by SERIALIZED BYTE
+/// SIZE (not just row count). 32 KB of raw tuples ≈ <100 KB encoded — safely
+/// under QuestDB's default request limit (the pre-F&O 331-row single INSERT,
+/// which worked, was already larger than this cap, so 32 KB has real headroom).
+pub const LIFECYCLE_INSERT_MAX_SQL_BYTES: usize = 32_768;
+
+/// Split pre-formatted `VALUES` tuples into complete `INSERT … VALUES …;`
+/// statements, each bounded BOTH by row count ([`LIFECYCLE_INSERT_BATCH_SIZE`])
+/// AND serialized byte size ([`LIFECYCLE_INSERT_MAX_SQL_BYTES`]). PURE — the
+/// deterministic unit coverage for the URL-length fix. Always makes progress:
+/// a single tuple larger than the byte cap still goes as its own statement
+/// (better to attempt than to stall the boot).
+#[must_use]
+pub fn build_size_bounded_inserts(insert_prefix: &str, tuples: &[String]) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut start = 0usize;
+    while start < tuples.len() {
+        let mut end = start;
+        let mut bytes = 0usize;
+        while end < tuples.len()
+            && (end - start) < LIFECYCLE_INSERT_BATCH_SIZE
+            && (end == start || bytes + tuples[end].len() + 1 <= LIFECYCLE_INSERT_MAX_SQL_BYTES)
+        {
+            bytes += tuples[end].len() + 1; // +1 for the joining comma
+            end += 1;
+        }
+        statements.push(format!(
+            "{insert_prefix} VALUES {};",
+            tuples[start..end].join(",")
+        ));
+        start = end;
+    }
+    statements
+}
+
 /// Build ONE multi-row `INSERT … VALUES (t1),(t2),…,(tN);` for a chunk of
 /// lifecycle rows. PURE (no I/O) — extracted for deterministic testing.
 #[must_use]
@@ -538,8 +592,13 @@ pub async fn append_instrument_lifecycle_rows(
     let client = Client::builder()
         .timeout(Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
         .build()?;
-    for chunk in rows.chunks(LIFECYCLE_INSERT_BATCH_SIZE) {
-        let sql = build_lifecycle_multi_insert_sql(chunk);
+    // Size-bounded statements (NOT fixed 5000-row chunks) — keeps every
+    // URL-encoded /exec request under QuestDB's limit at any row count.
+    let tuples: Vec<String> = rows.iter().map(format_lifecycle_row_tuple).collect();
+    let prefix = format!(
+        "INSERT INTO {QUESTDB_TABLE_INSTRUMENT_LIFECYCLE} ({LIFECYCLE_INSERT_COLUMN_LIST})"
+    );
+    for sql in build_size_bounded_inserts(&prefix, &tuples) {
         let resp = client
             .get(&base_url)
             .query(&[("query", sql.as_str())])
@@ -697,7 +756,7 @@ fn format_lifecycle_audit_row_tuple(row: &InstrumentLifecycleAuditRow<'_>) -> St
     let operator_note = sanitize_audit_string(row.operator_note);
     let lifecycle_state_after = row.lifecycle_state_after.as_str();
     let lot_size_after = row.lot_size_after;
-    let tick_size_after = row.tick_size_after;
+    let tick_size_after = finite_or_zero(row.tick_size_after);
     let expiry_after_micros = row.expiry_date_after_nanos / 1_000;
     let symbol_name_after = sanitize_audit_string(row.symbol_name_after);
     let dry_run = row.dry_run;
@@ -786,8 +845,14 @@ pub async fn append_instrument_lifecycle_audit_rows(
     let client = Client::builder()
         .timeout(Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
         .build()?;
-    for chunk in rows.chunks(LIFECYCLE_INSERT_BATCH_SIZE) {
-        let sql = build_lifecycle_audit_multi_insert_sql(chunk);
+    // Size-bounded statements (NOT fixed 5000-row chunks) — see
+    // `append_instrument_lifecycle_rows` for the URL-length rationale.
+    let tuples: Vec<String> = rows.iter().map(format_lifecycle_audit_row_tuple).collect();
+    let prefix = format!(
+        "INSERT INTO {QUESTDB_TABLE_INSTRUMENT_LIFECYCLE_AUDIT} \
+         ({LIFECYCLE_AUDIT_INSERT_COLUMN_LIST})"
+    );
+    for sql in build_size_bounded_inserts(&prefix, &tuples) {
         let resp = client
             .get(&base_url)
             .query(&[("query", sql.as_str())])
@@ -1551,6 +1616,75 @@ mod tests {
         assert!(sql.contains(QUESTDB_TABLE_INSTRUMENT_LIFECYCLE_AUDIT));
         assert_eq!(sql.matches("),(").count(), 1, "2 rows → one batched INSERT");
         assert!(sql.ends_with(");"));
+    }
+
+    #[test]
+    fn test_build_size_bounded_inserts_splits_by_byte_cap() {
+        // 1000 tuples of ~100 bytes each = ~100 KB total → must split into
+        // several statements, each under the 32 KB byte cap. Regression for the
+        // "79190 write error(s)" boot halt (a single megabyte URL was rejected).
+        let tuples: Vec<String> = (0..1000)
+            .map(|i| format!("({i},'{}')", "x".repeat(90)))
+            .collect();
+        let stmts = build_size_bounded_inserts("INSERT INTO t (a,b)", &tuples);
+        assert!(
+            stmts.len() > 1,
+            "100 KB of tuples must split into many statements"
+        );
+        for s in &stmts {
+            assert!(
+                s.len() <= LIFECYCLE_INSERT_MAX_SQL_BYTES + 64, // +prefix/suffix slack
+                "every statement must stay under the byte cap: got {} bytes",
+                s.len()
+            );
+            assert!(s.starts_with("INSERT INTO t (a,b) VALUES "));
+            assert!(s.ends_with(");"));
+        }
+        // Round-trip: every tuple appears exactly once across all statements.
+        let total_tuples: usize = stmts.iter().map(|s| s.matches("),(").count() + 1).sum();
+        assert_eq!(total_tuples, 1000, "no tuple dropped or duplicated");
+    }
+
+    #[test]
+    fn test_build_size_bounded_inserts_always_progresses_on_oversized_tuple() {
+        // A single tuple larger than the byte cap still emits as its own
+        // statement — never an infinite loop / stall.
+        let huge = format!("({})", "9".repeat(LIFECYCLE_INSERT_MAX_SQL_BYTES * 2));
+        let stmts = build_size_bounded_inserts("INSERT INTO t (a)", &[huge]);
+        assert_eq!(
+            stmts.len(),
+            1,
+            "one oversized tuple → exactly one statement"
+        );
+    }
+
+    #[test]
+    fn test_build_size_bounded_inserts_empty_is_empty() {
+        assert!(build_size_bounded_inserts("INSERT INTO t (a)", &[]).is_empty());
+    }
+
+    #[test]
+    fn test_finite_or_zero_clamps_non_finite() {
+        assert_eq!(finite_or_zero(12.5), 12.5);
+        assert_eq!(finite_or_zero(0.0), 0.0);
+        assert_eq!(finite_or_zero(f64::NAN), 0.0);
+        assert_eq!(finite_or_zero(f64::INFINITY), 0.0);
+        assert_eq!(finite_or_zero(f64::NEG_INFINITY), 0.0);
+    }
+
+    #[test]
+    fn test_lifecycle_tuple_never_emits_nan_or_inf() {
+        // A row with non-finite strike/tick must NOT put NaN/inf into the SQL
+        // (which QuestDB rejects → boot halt). Regression guard for the
+        // 2026-05-29 "79190 write error(s)" class of failure.
+        let mut row = sample_index_row();
+        row.tick_size = f64::NAN;
+        row.strike_price = f64::INFINITY;
+        let tuple = format_lifecycle_row_tuple(&row);
+        assert!(
+            !tuple.contains("NaN") && !tuple.contains("inf"),
+            "tuple: {tuple}"
+        );
     }
 
     #[test]
