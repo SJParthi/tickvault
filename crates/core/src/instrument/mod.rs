@@ -61,6 +61,13 @@ pub mod daily_universe;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod daily_universe_orchestrator;
 
+// PR-2 (2026-05-29 disaster-recovery): date-keyed subscription-plan
+// snapshot on host disk (separate from the QuestDB volume) for instant
+// warm-resubscribe after a same-day crash / DB wipe. Same feature flag —
+// it caches the output of the DailyUniverse build.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod instrument_snapshot;
+
 // Sub-PR #10b-α of 2026-05-27 daily-universe expansion: pure-function
 // retry policy primitives for the §4 infinite-retry escalation ladder.
 // Boot stays BLOCKED until a fresh validated CSV is in hand — these
