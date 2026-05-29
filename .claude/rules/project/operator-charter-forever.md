@@ -317,6 +317,7 @@ git pull <current-branch>
 # 2. Mandatory reads (in order)
 cat CLAUDE.md                                                            # project charter
 cat .claude/rules/project/operator-charter-forever.md                    # this file (the forever rules)
+cat .claude/rules/project/zero-loss-guarantee-charter.md                 # the per-PR/task/session GUARANTEE CHECK (2026-05-29)
 cat .claude/rules/project/wave-4-shared-preamble.md                      # wave-4 specifics (still applies)
 cat .claude/plans/friday-may-15-mega/INDEX.md                            # current state
 cat .claude/plans/friday-may-15-mega/step-1-honest-envelope.md           # canonical reference
