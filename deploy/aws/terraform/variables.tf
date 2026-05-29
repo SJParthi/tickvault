@@ -25,13 +25,13 @@ variable "environment" {
 }
 
 variable "instance_type" {
-  description = "EC2 instance type. MUST be t4g.medium per operator lock 2026-05-18 (~₹1,022/mo, see aws-budget.md)."
+  description = "EC2 instance type. MUST be m8g.large per operator lock 2026-05-29 (Graviton4, 8 GiB, $0.06416/hr ap-south-1; see daily-universe-scope-expansion-2026-05-27.md §7 Quote 5, which supersedes the 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks)."
   type        = string
-  default     = "t4g.medium"
+  default     = "m8g.large"
 
   validation {
-    condition     = var.instance_type == "t4g.medium"
-    error_message = "Instance type is pinned to t4g.medium per operator lock 2026-05-18. The 4-SID IDX_I universe + CloudWatch-only stack fits in 4 GiB. See aws-budget.md."
+    condition     = var.instance_type == "m8g.large"
+    error_message = "Instance type is pinned to m8g.large (Graviton4, 8 GiB) per operator lock 2026-05-29 (Quote 5). 8 GiB at 2 vCPU needs the m-family 4:1 ratio (c8g=4 GiB too small, r8g=16 GiB wasteful). This SUPERSEDES the 2026-05-27 t4g.large lock. See daily-universe-scope-expansion-2026-05-27.md section 7."
   }
 }
 
@@ -57,14 +57,20 @@ variable "ami_id" {
   }
 }
 
+variable "enable_eip" {
+  description = "Provision a 24/7 Elastic IP (static public IP). DEFAULT false per operator lock 2026-05-29 §7 Quote 5: the 3-month data-pull places NO orders, so the Dhan static-IP whitelist is not needed — saving ~₹430/mo. The instance gets a fresh public IP on each stop/start (fine for data-only). Set TRUE before going LIVE with orders (then register the EIP with Dhan; 7-day modify cooldown applies)."
+  type        = bool
+  default     = false
+}
+
 variable "ebs_gp3_size_gb" {
-  description = "Root EBS volume size in GB. 10 per aws-budget.md (4-SID IDX_I dataset is tiny; partition manager prunes to S3)."
+  description = "Root EBS volume size in GB. 30 per operator lock 2026-05-29 §7 Quote 6 — 30 GB hot window keeps the all-in bill ~₹2,058/mo; the partition manager auto-archives partitions >90d to the cheaper S3 cold bucket (~4x cheaper than EBS/GB), so EBS holds only hot data. gp3 grows online (no stop, no data loss) — raise this anytime the hot window needs more."
   type        = number
-  default     = 10
+  default     = 30
 
   validation {
-    condition     = var.ebs_gp3_size_gb >= 10 && var.ebs_gp3_size_gb <= 30
-    error_message = "EBS is sized 10-30 GB for the 4-SID dataset per aws-budget.md operator-lock 2026-05-18. Larger needs S3 lifecycle tiering first."
+    condition     = var.ebs_gp3_size_gb >= 10 && var.ebs_gp3_size_gb <= 200
+    error_message = "EBS is sized 10-200 GB. 30 GB default per operator lock 2026-05-29 (hot window + S3 cold-tier archival keeps bill ~₹2,058/mo). gp3 grows online beyond this if needed."
   }
 }
 

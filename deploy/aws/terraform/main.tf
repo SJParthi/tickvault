@@ -1,12 +1,14 @@
-# DLT AWS stack — t4g.medium budget envelope (~₹1,022/mo, operator-lock
-# 2026-05-18 in aws-budget.md).
+# DLT AWS stack — m8g.large budget envelope (~₹2,058/mo incl GST: 270 hrs,
+# 30 GB EBS, no EIP; operator-lock 2026-05-29 in
+# daily-universe-scope-expansion-2026-05-27.md §7 Quotes 5+6, which supersede
+# the 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks).
 #
 # Deployed resources:
 #   - VPC with a single public subnet (no NAT to stay under budget)
 #   - Security group: SSH from operator_cidr, no inbound from market
 #   - IAM role: SSM read+write+delete (instance lock) + CloudWatch write +
 #     SNS publish + S3 cold-tier read/write
-#   - EC2 t4g.medium (ARM Graviton, 2 vCPU / 4 GiB) with gp3 10GB root volume
+#   - EC2 m8g.large (ARM Graviton4, 2 vCPU / 8 GiB) with gp3 10GB root volume
 #   - Elastic IP (Dhan static IP mandate effective 2026-04-01; 7-day cooldown
 #     on modify — never release once registered with Dhan)
 #   - SSM parameters for Dhan credentials, Telegram tokens, QuestDB creds,
@@ -46,7 +48,12 @@ resource "aws_subnet" "public" {
   vpc_id                  = aws_vpc.dlt.id
   cidr_block              = "10.42.1.0/24"
   availability_zone       = "${var.aws_region}a"
-  map_public_ip_on_launch = false # we use a static EIP
+  # Auto-assign a public IP on launch so the instance is reachable for
+  # the data-pull window WITHOUT a static EIP (var.enable_eip = false,
+  # operator lock 2026-05-29 §7 Quote 5 — no orders, no Dhan static-IP
+  # need). When enable_eip flips true for live trading, the EIP overrides
+  # this with a stable address.
+  map_public_ip_on_launch = true
 
   tags = {
     Name = "tv-${var.environment}-public-a"
@@ -235,7 +242,13 @@ resource "aws_instance" "tv_app" {
   }
 }
 
+# Elastic IP — count-gated on var.enable_eip (DEFAULT 0 for the 3-month
+# data-pull; no orders → no Dhan static-IP whitelist need → ~₹430/mo saved).
+# Flip enable_eip=true before going LIVE with orders to provision + register
+# a stable IP with Dhan. Reversible one-line change — matches the
+# operator_phone count-gate pattern in sns-subscriptions.tf.
 resource "aws_eip" "tv_app" {
+  count    = var.enable_eip ? 1 : 0
   domain   = "vpc"
   instance = aws_instance.tv_app.id
 
@@ -262,25 +275,26 @@ resource "aws_cloudwatch_log_group" "tv_app" {
 }
 
 # ---------------------------------------------------------------------------
-# EventBridge daily start/stop schedule per aws-budget.md operator-lock
-# 2026-05-18 (Option A — accept ₹22/mo overage for 7-day BRUTEX
-# availability). Rules call SSM Automation to start/stop the instance.
+# EventBridge weekday start/stop schedule per daily-universe-scope-
+# expansion-2026-05-27.md §7 Quote 5 (2026-05-29): trading WEEKDAYS only
+# (Mon-Fri), 08:30-16:30 IST. Weekends + NSE holidays = instance OFF unless
+# the operator manually starts it. Rules call SSM Automation to start/stop.
 #
 # IST offset is UTC+5:30, so:
-#   Daily start 08:00 IST = 02:30 UTC (Mon-Sun)
-#   Daily stop  17:00 IST = 11:30 UTC (Mon-Sun)
+#   Weekday start 08:30 IST = 03:00 UTC (Mon-Fri)
+#   Weekday stop  16:30 IST = 11:00 UTC (Mon-Fri)
 # ---------------------------------------------------------------------------
 
 resource "aws_cloudwatch_event_rule" "daily_start" {
   name                = "tv-${var.environment}-daily-start"
-  description         = "Start tickvault instance at 08:00 IST every day (Mon-Sun)"
-  schedule_expression = "cron(30 2 * * ? *)"
+  description         = "Start tickvault instance at 08:30 IST on trading weekdays (Mon-Fri)"
+  schedule_expression = "cron(0 3 ? * MON-FRI *)"
 }
 
 resource "aws_cloudwatch_event_rule" "daily_stop" {
   name                = "tv-${var.environment}-daily-stop"
-  description         = "Stop tickvault instance at 17:00 IST every day (Mon-Sun)"
-  schedule_expression = "cron(30 11 * * ? *)"
+  description         = "Stop tickvault instance at 16:30 IST on trading weekdays (Mon-Fri)"
+  schedule_expression = "cron(0 11 ? * MON-FRI *)"
 }
 
 # ---------------------------------------------------------------------------
