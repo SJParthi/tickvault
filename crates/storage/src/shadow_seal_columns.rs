@@ -21,6 +21,7 @@
 //! The writer is a thin wrapper that drains the absorption pipeline,
 //! calls this extractor, and feeds the `Buffer`.
 
+use tickvault_common::price_precision::round_to_2dp;
 use tickvault_common::segment::segment_code_to_str;
 use tickvault_trading::candles::BufferedSeal;
 
@@ -119,10 +120,10 @@ impl ShadowSealRow {
             timestamp_ist_nanos,
             security_id: i64::from(seal.security_id),
             segment: segment_code_to_str(seal.exchange_segment_code),
-            open: seal.state.open,
-            high: seal.state.high,
-            low: seal.state.low,
-            close: seal.state.close,
+            open: round_to_2dp(seal.state.open),
+            high: round_to_2dp(seal.state.high),
+            low: round_to_2dp(seal.state.low),
+            close: round_to_2dp(seal.state.close),
             volume: volume_i64,
             oi: seal.state.oi,
             tick_count: i64::from(seal.state.tick_count),
