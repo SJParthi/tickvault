@@ -43,7 +43,9 @@ use tickvault_common::error_code::ErrorCode;
 
 use super::csv_parser::{CsvParseError, parse_detailed_csv};
 use super::daily_universe::{BuildError, DailyUniverse, build_daily_universe};
-use super::fno_underlying_extractor::{ExtractError, extract_fno_underlyings};
+use super::fno_underlying_extractor::{
+    ExtractError, canonical_sid, collect_applicable_fno_contracts, extract_fno_underlyings,
+};
 use super::index_extractor::{IndexExtractError, extract_indices};
 
 /// Errors that can occur during orchestration. Each variant wraps the
@@ -145,8 +147,27 @@ pub fn build_universe_from_bytes(bytes: &[u8]) -> Result<DailyUniverse, Orchestr
     // Step 3: extract indices (asserts BSE SENSEX present per §0 quote 2).
     let indices = extract_indices(&rows)?;
 
-    // Step 4: build the unified universe (envelope check per §2 + §22).
-    let universe = build_daily_universe(indices, fno)?;
+    // Step 3b: collect the applicable F&O CONTRACTS for the lifecycle master
+    // (operator lock 2026-05-29 Quote 5, §5). Tracked-index SIDs are resolved
+    // with the SAME canonicaliser as the underlying-resolution path so the
+    // FUTIDX/OPTIDX match is robust to CSV format drift. These rows are
+    // master-only — they NEVER enter `subscription_targets`.
+    let mut index_sids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in &indices.nse_indices {
+        if let Some(c) = canonical_sid(&r.security_id) {
+            index_sids.insert(c);
+        }
+    }
+    if let Some(s) = &indices.bse_sensex
+        && let Some(c) = canonical_sid(&s.security_id)
+    {
+        index_sids.insert(c);
+    }
+    let fno_contracts = collect_applicable_fno_contracts(&rows, &fno, &index_sids);
+
+    // Step 4: build the unified universe (envelope check on the SUBSCRIPTION
+    // set per §2 + §22; fno_contracts are master-only and not bounded).
+    let universe = build_daily_universe(indices, fno, fno_contracts)?;
 
     Ok(universe)
 }

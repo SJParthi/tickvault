@@ -19,23 +19,23 @@
 
 ## Plan Items
 
-- [ ] Item 1 — Rule-file contract (§15 protocol)
+- [x] Item 1 — Rule-file contract (merged #871) (§15 protocol)
   - Files: `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md` (§5 intro + §10 step 4/6), NEW `.claude/rules/dhan/instrument-master.md`
   - Tests: n/a (docs); cross-ref via existing guards
 
-- [ ] Item 2 — Extractor retains applicable F&O contract rows
+- [x] Item 2 — Extractor retains applicable F&O contract rows
   - Files: `crates/core/src/instrument/fno_underlying_extractor.rs` (retain FUTSTK/OPTSTK contract rows whose underlying resolves), index F&O collector for FUTIDX/OPTIDX
   - Tests: `fno_underlying_extractor::tests::*` (contracts retained, currency/commodity excluded)
 
-- [ ] Item 3 — `DailyUniverse.fno_contracts` field + `FnoContract` role
+- [x] Item 3 — `DailyUniverse.fno_contracts` field + `FnoContract` role
   - Files: `crates/core/src/instrument/daily_universe.rs`
   - Tests: `daily_universe::tests::*` (contracts present in fno_contracts, NOT in subscription_targets)
 
-- [ ] Item 4 — Lifecycle reconcile includes contracts; subscription dispatch does NOT
+- [x] Item 4 — Lifecycle reconcile includes contracts; subscription dispatch does NOT
   - Files: `crates/app/src/today_instrument.rs` (`extract_today_instruments` iterates subscription_targets + fno_contracts), reconcile orchestrator unchanged (reads the expanded set)
   - Tests: orchestrator tests assert lifecycle plan_size = 331 + contracts; subscription planner still 331
 
-- [ ] Item 5 — Z+ ratchet
+- [x] Item 5 — Z+ ratchet
   - Files: `crates/storage/tests/daily_universe_scope_guard.rs` or new guard
   - Tests: pin "lifecycle includes FnoContract rows AND subscription_targets excludes them"
 

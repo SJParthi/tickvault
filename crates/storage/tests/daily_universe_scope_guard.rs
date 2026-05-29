@@ -216,3 +216,63 @@ fn daily_universe_two_websocket_envelope_unchanged() {
         "rule file must mark the 2-WebSocket envelope as UNCHANGED from prior 2026-05-15 lock"
     );
 }
+
+// ---------------------------------------------------------------------------
+// F&O-master code wiring (operator lock 2026-05-29 Quote 5) — these pin the
+// CODE that makes `instrument_lifecycle` the applicable-F&O master while the
+// WebSocket subscription stays at the 331-SID set. A future edit that reverts
+// the master to "331-only" (drops the contract collector or the chained
+// extraction) fails the build here.
+// ---------------------------------------------------------------------------
+
+fn src(rel: &str) -> String {
+    let path = repo_root().join(rel);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()))
+}
+
+/// The applicable-F&O contract collector MUST exist and gate on the tracked
+/// underlyings + tracked index SIDs (not blindly take every derivative).
+#[test]
+fn fno_master_contract_collector_exists() {
+    let body = src("crates/core/src/instrument/fno_underlying_extractor.rs");
+    assert!(
+        body.contains("pub fn collect_applicable_fno_contracts"),
+        "collect_applicable_fno_contracts must exist (applicable-F&O master, Quote 5)"
+    );
+    assert!(
+        body.contains("INDEX_DERIVATIVE_PREFIXES") && body.contains("\"FUTIDX\""),
+        "collector must handle index F&O (FUTIDX/OPTIDX) for tracked indices"
+    );
+    assert!(
+        body.contains("unique_underlying_ids.contains") && body.contains("index_sids.contains"),
+        "collector must gate stock derivs on tracked underlyings AND index derivs on tracked indices"
+    );
+}
+
+/// `DailyUniverse` MUST carry `fno_contracts` SEPARATE from `subscription_targets`
+/// so the master holds contracts while the feed does not.
+#[test]
+fn daily_universe_has_master_only_fno_contracts_field() {
+    let body = src("crates/core/src/instrument/daily_universe.rs");
+    assert!(
+        body.contains("pub fno_contracts: Vec<CsvRow>"),
+        "DailyUniverse must have a master-only `fno_contracts` field"
+    );
+    // The envelope check must remain on subscription_targets (the 331), NOT
+    // on the contracts — else the ~219K master would trip the [100,400] HALT.
+    assert!(
+        body.contains("let total = subscription_targets.len();"),
+        "the [100,400] envelope must bound subscription_targets, not the contracts"
+    );
+}
+
+/// The lifecycle reconcile extraction MUST chain `fno_contracts` so the master
+/// UPSERTs them; the subscription dispatcher path must NOT.
+#[test]
+fn extract_today_instruments_chains_fno_contracts() {
+    let body = src("crates/app/src/today_instrument.rs");
+    assert!(
+        body.contains(".fno_contracts") && body.contains(".chain("),
+        "extract_today_instruments must chain universe.fno_contracts into the lifecycle set"
+    );
+}

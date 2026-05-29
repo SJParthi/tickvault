@@ -78,15 +78,35 @@ pub struct SubscriptionTarget {
 /// Unified daily universe — every instrument the live system tracks.
 #[derive(Debug, Clone)]
 pub struct DailyUniverse {
+    /// The 331-SID set the WebSocket subscribes to (indices + F&O underlying
+    /// spots). Bounded by `[MIN, MAX]_DAILY_UNIVERSE_SIZE`. The subscription
+    /// dispatcher reads ONLY this — the 2-WebSocket lock is enforced here.
     pub subscription_targets: Vec<SubscriptionTarget>,
+    /// Applicable F&O CONTRACT rows (FUTSTK/OPTSTK for resolved underlyings +
+    /// FUTIDX/OPTIDX for tracked indices; currency/commodity excluded). These
+    /// are persisted to the `instrument_lifecycle` master ONLY — they are
+    /// NEVER subscribed (operator lock 2026-05-29 Quote 5, §5 of
+    /// daily-universe-scope-expansion-2026-05-27.md). Not bounded by the
+    /// subscription envelope (legitimately ~219K rows).
+    pub fno_contracts: Vec<CsvRow>,
 }
 
 impl DailyUniverse {
-    /// Count of all instruments in the universe. Used by Sub-PR #11's
+    /// Count of SUBSCRIPTION instruments (indices + F&O underlyings). This is
+    /// what the `[100,400]` envelope guard + the WS dispatcher use — it
+    /// deliberately EXCLUDES `fno_contracts` (master-only). Sub-PR #11's
     /// boot-time-of-day guard + Sub-PR #12's CloudWatch gauge.
     #[must_use]
     pub fn total_count(&self) -> usize {
         self.subscription_targets.len()
+    }
+
+    /// Count of ALL instruments written to the `instrument_lifecycle` master:
+    /// subscription targets + applicable F&O contracts. Used for the
+    /// reconcile / audit observability (NOT the subscription envelope).
+    #[must_use]
+    pub fn lifecycle_count(&self) -> usize {
+        self.subscription_targets.len() + self.fno_contracts.len()
     }
 
     /// Count of instruments by role — operator-facing observability.
@@ -134,6 +154,7 @@ pub enum BuildError {
 pub fn build_daily_universe(
     indices: IndexExtraction,
     fno: FnoUnderlyingExtraction,
+    fno_contracts: Vec<CsvRow>,
 ) -> Result<DailyUniverse, BuildError> {
     let mut subscription_targets: Vec<SubscriptionTarget> = Vec::new();
 
@@ -182,6 +203,7 @@ pub fn build_daily_universe(
 
     Ok(DailyUniverse {
         subscription_targets,
+        fno_contracts,
     })
 }
 
@@ -245,10 +267,25 @@ mod tests {
         // 30 indices + 1 SENSEX + 219 underlyings = 250 total.
         let indices = make_indices(30);
         let fno = make_fno(219);
-        let universe = build_daily_universe(indices, fno).expect("build");
+        let universe = build_daily_universe(indices, fno, Vec::new()).expect("build");
         assert_eq!(universe.total_count(), 250);
         assert_eq!(universe.count_by_role(InstrumentRole::Index), 31);
         assert_eq!(universe.count_by_role(InstrumentRole::FnoUnderlying), 219);
+    }
+
+    #[test]
+    fn lifecycle_count_adds_contracts_total_count_excludes_them() {
+        // 30 indices + 1 SENSEX + 100 underlyings = 131 subscription targets.
+        let universe = build_daily_universe(
+            make_indices(30),
+            make_fno(100),
+            vec![nse_eq_row("49081", "NIFTY26JUN24000CE")],
+        )
+        .expect("build");
+        // total_count = SUBSCRIPTION only (the [100,400] envelope basis).
+        assert_eq!(universe.total_count(), 131);
+        // lifecycle_count = subscription + the master-only contract.
+        assert_eq!(universe.lifecycle_count(), 132);
     }
 
     #[test]
@@ -256,7 +293,7 @@ mod tests {
         // 30 indices + 1 SENSEX + 50 underlyings = 81, below MIN=100.
         let indices = make_indices(30);
         let fno = make_fno(50);
-        let result = build_daily_universe(indices, fno);
+        let result = build_daily_universe(indices, fno, Vec::new());
         assert!(matches!(
             result,
             Err(BuildError::UniverseSizeOutOfBounds {
@@ -272,7 +309,7 @@ mod tests {
         // 30 indices + 1 SENSEX + 500 underlyings = 531, above MAX=400.
         let indices = make_indices(30);
         let fno = make_fno(500);
-        let result = build_daily_universe(indices, fno);
+        let result = build_daily_universe(indices, fno, Vec::new());
         assert!(matches!(
             result,
             Err(BuildError::UniverseSizeOutOfBounds {
@@ -288,7 +325,7 @@ mod tests {
         // 30 indices + 1 SENSEX + 69 underlyings = 100, exactly MIN.
         let indices = make_indices(30);
         let fno = make_fno(69);
-        let universe = build_daily_universe(indices, fno).expect("at MIN accepts");
+        let universe = build_daily_universe(indices, fno, Vec::new()).expect("at MIN accepts");
         assert_eq!(universe.total_count(), 100);
     }
 
@@ -297,7 +334,7 @@ mod tests {
         // 30 indices + 1 SENSEX + 369 underlyings = 400, exactly MAX.
         let indices = make_indices(30);
         let fno = make_fno(369);
-        let universe = build_daily_universe(indices, fno).expect("at MAX accepts");
+        let universe = build_daily_universe(indices, fno, Vec::new()).expect("at MAX accepts");
         assert_eq!(universe.total_count(), 400);
     }
 
@@ -305,7 +342,7 @@ mod tests {
     fn indices_appear_before_underlyings_in_order() {
         let indices = make_indices(30);
         let fno = make_fno(69);
-        let universe = build_daily_universe(indices, fno).expect("build");
+        let universe = build_daily_universe(indices, fno, Vec::new()).expect("build");
 
         // First 30 are NSE indices, then BSE SENSEX, then underlyings.
         for (i, t) in universe.subscription_targets.iter().take(31).enumerate() {
@@ -325,7 +362,7 @@ mod tests {
     fn bse_sensex_appears_after_nse_indices() {
         let indices = make_indices(30);
         let fno = make_fno(69);
-        let universe = build_daily_universe(indices, fno).expect("build");
+        let universe = build_daily_universe(indices, fno, Vec::new()).expect("build");
 
         // Index target #30 (0-indexed) should be SENSEX.
         let sensex = &universe.subscription_targets[30];
@@ -337,7 +374,7 @@ mod tests {
     fn count_by_role_returns_correct_counts() {
         let indices = make_indices(30);
         let fno = make_fno(150);
-        let universe = build_daily_universe(indices, fno).expect("build");
+        let universe = build_daily_universe(indices, fno, Vec::new()).expect("build");
         assert_eq!(universe.count_by_role(InstrumentRole::Index), 31);
         assert_eq!(universe.count_by_role(InstrumentRole::FnoUnderlying), 150);
         // Sum equals total.
@@ -372,7 +409,7 @@ mod tests {
             total_derivative_count: 1,
         };
         let indices = make_indices(100); // 100 + 1 = 101 indices alone
-        let universe = build_daily_universe(indices, fno).expect("build");
+        let universe = build_daily_universe(indices, fno, Vec::new()).expect("build");
         // Ghost SID is silently skipped → 0 fno_underlying entries.
         assert_eq!(universe.count_by_role(InstrumentRole::FnoUnderlying), 0);
         assert_eq!(universe.count_by_role(InstrumentRole::Index), 101);
@@ -391,7 +428,7 @@ mod tests {
             dangling_count: 0,
             total_derivative_count: 0,
         };
-        let result = build_daily_universe(indices, fno);
+        let result = build_daily_universe(indices, fno, Vec::new());
         assert!(matches!(
             result,
             Err(BuildError::UniverseSizeOutOfBounds { actual: 0, .. })

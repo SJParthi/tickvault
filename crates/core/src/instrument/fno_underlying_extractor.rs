@@ -73,6 +73,10 @@ const MAX_DANGLING_SAMPLES: usize = 10;
 /// locked 2-segment scope (NSE_EQ + NSE_FNO).
 const STOCK_DERIVATIVE_PREFIXES: &[&str] = &["FUTSTK", "OPTSTK"];
 
+/// Index F&O contract instrument types — the applicable index derivatives for
+/// the `instrument_lifecycle` master (operator lock 2026-05-29 Quote 5, §5).
+const INDEX_DERIVATIVE_PREFIXES: &[&str] = &["FUTIDX", "OPTIDX"];
+
 /// Result of the F&O underlying extraction pass.
 #[derive(Debug, Clone)]
 pub struct FnoUnderlyingExtraction {
@@ -274,6 +278,64 @@ fn is_test_instrument(symbol_name: &str, underlying_symbol: &str) -> bool {
     let marker = CSV_TEST_SYMBOL_MARKER.to_ascii_uppercase();
     symbol_name.to_ascii_uppercase().contains(&marker)
         || underlying_symbol.to_ascii_uppercase().contains(&marker)
+}
+
+#[must_use]
+fn is_index_derivative(instrument: &str) -> bool {
+    INDEX_DERIVATIVE_PREFIXES
+        .iter()
+        .any(|p| instrument.eq_ignore_ascii_case(p))
+}
+
+/// Collect the **applicable F&O contract rows** for the `instrument_lifecycle`
+/// master (operator lock 2026-05-29 Quote 5, §5 of
+/// `daily-universe-scope-expansion-2026-05-27.md`):
+///
+///  - in-scope NSE `FUTSTK`/`OPTSTK` whose `UNDERLYING_SECURITY_ID` resolves to
+///    one of our tracked NSE_EQ underlyings (`fno.unique_underlying_ids`), AND
+///  - `FUTIDX`/`OPTIDX` whose `UNDERLYING_SECURITY_ID` resolves to one of our
+///    tracked index SIDs (`index_sids`).
+///
+/// EXCLUDES currency F&O (`FUTCUR`/`OPTCUR`), commodity F&O (`FUTCOM`/`OPTFUT`),
+/// Dhan TEST placeholders, and any derivative whose underlying is NOT tracked.
+/// These rows are persisted to the master ONLY — they are NEVER subscribed
+/// (the WebSocket reads `DailyUniverse::subscription_targets`).
+///
+/// PURE: no I/O, no allocation beyond the returned `Vec`. O(rows).
+#[must_use]
+pub fn collect_applicable_fno_contracts(
+    rows: &[CsvRow],
+    fno: &FnoUnderlyingExtraction,
+    index_sids: &HashSet<String>,
+) -> Vec<CsvRow> {
+    let mut contracts: Vec<CsvRow> = Vec::new();
+    for row in rows {
+        if is_test_instrument(&row.symbol_name, &row.underlying_symbol) {
+            continue;
+        }
+        let Some(canonical) = canonical_security_id(&row.underlying_security_id) else {
+            continue;
+        };
+        let applicable = if is_in_scope_stock_derivative(&row.instrument, &row.exch_id) {
+            fno.unique_underlying_ids.contains(&canonical)
+        } else if is_index_derivative(&row.instrument) {
+            index_sids.contains(&canonical)
+        } else {
+            false
+        };
+        if applicable {
+            contracts.push(row.clone());
+        }
+    }
+    contracts
+}
+
+/// Canonicalise a raw CSV `SECURITY_ID` cell (public wrapper over the internal
+/// normaliser) so callers assembling the `index_sids` set use the SAME
+/// normalisation as the underlying-resolution path.
+#[must_use]
+pub fn canonical_sid(raw: &str) -> Option<String> {
+    canonical_security_id(raw)
 }
 
 #[cfg(test)]
@@ -654,6 +716,14 @@ mod tests {
     }
 
     #[test]
+    fn canonical_sid_public_wrapper_matches_internal() {
+        assert_eq!(canonical_sid("011536").as_deref(), Some("11536"));
+        assert_eq!(canonical_sid(" 13 ").as_deref(), Some("13"));
+        assert_eq!(canonical_sid("TCS"), None);
+        assert_eq!(canonical_sid(""), None);
+    }
+
+    #[test]
     fn underlying_resolves_despite_float_and_zero_pad_format_drift() {
         // Equity id is the clean "2885"; the derivative rows reference it
         // with a trailing ".0" and a leading zero. Both MUST resolve —
@@ -668,5 +738,82 @@ mod tests {
         assert_eq!(result.total_derivative_count, 2);
         assert_eq!(result.unique_underlying_ids.len(), 1);
         assert!(result.unique_underlying_ids.contains("2885"));
+    }
+
+    // ---- collect_applicable_fno_contracts (operator lock 2026-05-29 Quote 5) ----
+
+    fn deriv_row(instrument: &str, exch: &str, underlying_sid: &str, symbol: &str) -> CsvRow {
+        CsvRow {
+            security_id: "999".to_string(),
+            exch_id: exch.to_string(),
+            segment: if instrument.contains("IDX") {
+                "NSE_FNO".to_string()
+            } else {
+                "NSE_FNO".to_string()
+            },
+            instrument: instrument.to_string(),
+            symbol_name: symbol.to_string(),
+            underlying_security_id: underlying_sid.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn fno_with_underlying(sid: &str) -> FnoUnderlyingExtraction {
+        let mut unique_underlying_ids = HashSet::new();
+        unique_underlying_ids.insert(sid.to_string());
+        let mut nse_eq_lookup = HashMap::new();
+        nse_eq_lookup.insert(sid.to_string(), nse_eq_row(sid, "RELIANCE"));
+        FnoUnderlyingExtraction {
+            unique_underlying_ids,
+            nse_eq_lookup,
+            dangling_count: 0,
+            total_derivative_count: 1,
+        }
+    }
+
+    #[test]
+    fn collect_applicable_fno_contracts_keeps_stock_and_index_excludes_rest() {
+        let fno = fno_with_underlying("2885"); // RELIANCE tracked underlying
+        let mut index_sids = HashSet::new();
+        index_sids.insert("13".to_string()); // NIFTY tracked index
+
+        let rows = vec![
+            // ✅ applicable stock derivatives (underlying 2885 resolves)
+            deriv_row("FUTSTK", "NSE", "2885", "RELIANCE26JUNFUT"),
+            deriv_row("OPTSTK", "NSE", "2885", "RELIANCE26JUN2800CE"),
+            // ✅ applicable index derivatives (underlying 13 = NIFTY tracked)
+            deriv_row("FUTIDX", "NSE", "13", "NIFTY26JUNFUT"),
+            deriv_row("OPTIDX", "NSE", "13", "NIFTY26JUN24000CE"),
+            // ❌ stock derivative whose underlying is NOT tracked
+            deriv_row("OPTSTK", "NSE", "99999", "UNTRACKED26JUN100CE"),
+            // ❌ index derivative whose underlying index is NOT tracked
+            deriv_row("OPTIDX", "NSE", "25", "BANKNIFTY26JUN50000CE"),
+            // ❌ currency F&O — excluded entirely
+            deriv_row("OPTCUR", "NSE", "13", "USDINR26JUN90CE"),
+            // ❌ commodity F&O — excluded entirely
+            deriv_row("FUTCOM", "MCX", "13", "GOLD26JUNFUT"),
+            // ❌ TEST placeholder — excluded
+            deriv_row("OPTSTK", "NSE", "2885", "TESTSTK26JUN100CE"),
+        ];
+
+        let got = collect_applicable_fno_contracts(&rows, &fno, &index_sids);
+        assert_eq!(got.len(), 4, "exactly the 4 applicable contracts");
+        let symbols: Vec<&str> = got.iter().map(|r| r.symbol_name.as_str()).collect();
+        assert!(symbols.contains(&"RELIANCE26JUNFUT"));
+        assert!(symbols.contains(&"RELIANCE26JUN2800CE"));
+        assert!(symbols.contains(&"NIFTY26JUNFUT"));
+        assert!(symbols.contains(&"NIFTY26JUN24000CE"));
+    }
+
+    #[test]
+    fn collect_applicable_fno_contracts_empty_when_nothing_tracked() {
+        let fno = fno_with_underlying("2885");
+        let index_sids = HashSet::new();
+        // Index derivative but no index tracked, stock derivative untracked.
+        let rows = vec![
+            deriv_row("FUTIDX", "NSE", "13", "NIFTY26JUNFUT"),
+            deriv_row("FUTSTK", "NSE", "77777", "OTHER26JUNFUT"),
+        ];
+        assert!(collect_applicable_fno_contracts(&rows, &fno, &index_sids).is_empty());
     }
 }

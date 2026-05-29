@@ -232,6 +232,7 @@ mod tests {
                     "TCS",
                 ),
             ],
+            fno_contracts: vec![],
         }
     }
 
@@ -311,6 +312,7 @@ mod tests {
         let cfg = cfg_unreachable();
         let empty = DailyUniverse {
             subscription_targets: vec![],
+            fno_contracts: vec![],
         };
         let result = run_lifecycle_reconcile(&cfg, &empty, 1, 1, "sha", false).await;
         assert!(result.is_err());
