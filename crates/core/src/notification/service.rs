@@ -23,6 +23,7 @@
 //! blocking on the caller. Hot path (tick parsing) is completely unaffected.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
@@ -729,6 +730,54 @@ fn classify_telegram_status(status: reqwest::StatusCode) -> TelegramSendOutcome 
     }
 }
 
+/// Window for rate-limiting the transient send-failure WARN. During a
+/// network/DNS outage every retry of every chunk hits the failure path
+/// (dozens/min — see the 2026-05-29 13:03 IST local DNS dropout), flooding
+/// the logs with identical "sendMessage HTTP error (transient)" lines. This
+/// throttle affects ONLY that one log line — the send + retry logic and the
+/// `error!("...report is incomplete")` alert-delivery signal are UNCHANGED, so
+/// no alert is ever suppressed.
+const TRANSIENT_SEND_WARN_WINDOW_SECS: i64 = 60;
+
+/// Epoch seconds of the last emitted transient-send WARN (0 = never).
+static LAST_TRANSIENT_WARN_EPOCH: AtomicI64 = AtomicI64::new(0);
+/// Count of transient-send WARNs suppressed since the last emission.
+static TRANSIENT_WARN_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+
+/// Pure decision: should the transient-send WARN emit now? Emits when the
+/// window has fully elapsed since the last emission (rising edge); otherwise
+/// the caller suppresses (and counts) it. `last_epoch == 0` (never emitted)
+/// always emits. Extracted for deterministic unit testing of the boundary.
+#[must_use]
+fn transient_warn_should_emit(now_epoch: i64, last_epoch: i64, window_secs: i64) -> bool {
+    now_epoch.saturating_sub(last_epoch) >= window_secs
+}
+
+/// Rate-limited WARN for a transient Telegram send failure. At most one log
+/// line per [`TRANSIENT_SEND_WARN_WINDOW_SECS`]; the emission carries the count
+/// of WARNs suppressed since the previous one so the operator still sees the
+/// magnitude. Pure log-noise control — never gates alert delivery.
+fn warn_transient_send_throttled(safe_msg: &str) {
+    let now = chrono::Utc::now().timestamp();
+    let last = LAST_TRANSIENT_WARN_EPOCH.load(Ordering::Relaxed);
+    if transient_warn_should_emit(now, last, TRANSIENT_SEND_WARN_WINDOW_SECS)
+        && LAST_TRANSIENT_WARN_EPOCH
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        let suppressed = TRANSIENT_WARN_SUPPRESSED.swap(0, Ordering::Relaxed);
+        warn!(
+            error = %safe_msg,
+            suppressed_in_last_window = suppressed,
+            "notification: Telegram sendMessage HTTP error (transient)"
+        );
+    } else {
+        // Either inside the window, or a racing thread won the window —
+        // count this one for the next emission.
+        TRANSIENT_WARN_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 async fn send_telegram_message(
     client: &reqwest::Client,
     base_url: &str,
@@ -773,10 +822,11 @@ async fn send_telegram_message(
             let safe_msg = err
                 .to_string()
                 .replace(bot_token.expose_secret(), "[REDACTED]");
-            warn!(
-                error = %safe_msg,
-                "notification: Telegram sendMessage HTTP error (transient)"
-            );
+            // Rate-limited: during a network/DNS outage this path fires
+            // dozens of times/min. Throttle the LOG line only — the send,
+            // retry, and the "report incomplete" ERROR are untouched, so no
+            // alert is ever suppressed (operator lock 2026-05-29 follow-up).
+            warn_transient_send_throttled(&safe_msg);
             // Network errors are always transient — DNS, TLS handshake,
             // TCP reset all self-heal on retry.
             TelegramSendOutcome::Transient
@@ -2210,6 +2260,22 @@ mod tests {
         assert_eq!(strip_html_tags("a & b"), "a & b");
         assert_eq!(strip_html_tags("100%"), "100%");
         assert_eq!(strip_html_tags("P&L: +500"), "P&L: +500");
+    }
+
+    #[test]
+    fn test_transient_warn_should_emit_window_boundary() {
+        let w = TRANSIENT_SEND_WARN_WINDOW_SECS;
+        // Never emitted before (last == 0) → emit.
+        assert!(transient_warn_should_emit(1000, 0, w));
+        // Exactly at the window boundary → emit (>=).
+        assert!(transient_warn_should_emit(1000 + w, 1000, w));
+        // One second past the boundary → emit.
+        assert!(transient_warn_should_emit(1001 + w, 1000, w));
+        // Inside the window → suppress.
+        assert!(!transient_warn_should_emit(1000 + w - 1, 1000, w));
+        assert!(!transient_warn_should_emit(1000, 1000, w));
+        // Clock skew backwards (now < last) → suppress (saturating_sub → 0).
+        assert!(!transient_warn_should_emit(500, 1000, w));
     }
 
     // -----------------------------------------------------------------------
