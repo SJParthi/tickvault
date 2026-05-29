@@ -522,15 +522,26 @@ pub const LIFECYCLE_INSERT_BATCH_SIZE: usize = 5000;
 /// Max bytes of the joined `VALUES` tuples per `/exec` request.
 ///
 /// QuestDB's REST `/exec` takes the SQL in the URL **query string**, which
-/// reqwest URL-encodes (≈2–3× inflation), and QuestDB bounds the request by its
-/// header buffer. A fixed 5000-row chunk of the ~219K applicable-F&O master
-/// produces a multi-megabyte URL that QuestDB rejects — the cause of the
-/// "79190 write error(s)" boot halt once the F&O master (#872) grew the table
-/// from ~331 rows to ~79K+. We therefore cap each statement by SERIALIZED BYTE
-/// SIZE (not just row count). 32 KB of raw tuples ≈ <100 KB encoded — safely
-/// under QuestDB's default request limit (the pre-F&O 331-row single INSERT,
-/// which worked, was already larger than this cap, so 32 KB has real headroom).
-pub const LIFECYCLE_INSERT_MAX_SQL_BYTES: usize = 32_768;
+/// reqwest URL-encodes (every `'`/`,`/`(`/space → `%XX`/`+`, ≈2.5–3× inflation),
+/// and QuestDB bounds the WHOLE request line by `http.request.header.buffer.size`
+/// (default **64 KiB**). When the encoded request line exceeds that buffer
+/// QuestDB closes the socket mid-request — observed live 2026-05-29 as
+/// `connection closed before message completed` on the ~79K-row applicable-F&O
+/// master boot.
+///
+/// **History:** #879 first introduced byte-bounding at 32 KB *raw*, but 32 KB
+/// raw → ~80 KB *encoded* → still over the 64 KiB buffer (the symptom merely
+/// shifted from a non-2xx to a dropped connection). The cap below is on RAW
+/// tuple bytes; at ~2.7× encoding, 8 KB raw → ~22 KB encoded → comfortably
+/// under 64 KiB with >2× margin. (The sibling `option_chain_minute_snapshot`
+/// writer proves the same GET `/exec` path works at small batch sizes — its
+/// 15-row cap is the closest proven-safe precedent, so we stay in that scale.)
+///
+/// 4 KB raw → ~20 audit rows / ~13 lifecycle rows per request → ~6 KB encoded:
+/// far under even a conservative request buffer. Cold boot of the ~79K master
+/// becomes a few thousand small round-trips (~10–15 s, once); the #876 warm-skip
+/// makes every subsequent same-CSV boot sub-second. Correctness over raw speed.
+pub const LIFECYCLE_INSERT_MAX_SQL_BYTES: usize = 4_000;
 
 /// Split pre-formatted `VALUES` tuples into complete `INSERT … VALUES …;`
 /// statements, each bounded BOTH by row count ([`LIFECYCLE_INSERT_BATCH_SIZE`])
@@ -1661,6 +1672,21 @@ mod tests {
     #[test]
     fn test_build_size_bounded_inserts_empty_is_empty() {
         assert!(build_size_bounded_inserts("INSERT INTO t (a)", &[]).is_empty());
+    }
+
+    #[test]
+    fn test_lifecycle_insert_byte_cap_stays_small_for_exec_url_buffer() {
+        // Regression (2026-05-29): the SQL rides in the GET /exec URL query
+        // string; reqwest URL-encodes it and QuestDB drops the connection when
+        // the encoded request line exceeds its header buffer. #879's first cut
+        // used 32 KB raw → ~80 KB encoded → still over the buffer ("connection
+        // closed before message completed"). The cap MUST stay small enough
+        // that the encoded URL clears even a conservative buffer. Do NOT raise
+        // this above 8 KB without moving the writes off the URL path (ILP).
+        assert!(
+            LIFECYCLE_INSERT_MAX_SQL_BYTES <= 8_000,
+            "byte cap {LIFECYCLE_INSERT_MAX_SQL_BYTES} risks exceeding QuestDB's /exec URL buffer"
+        );
     }
 
     #[test]
