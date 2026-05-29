@@ -34,3 +34,20 @@ All daily-universe unit/source-scan tests used synthetic rows + never hit a live
 
 ## Sequence
 PR-4a: Bug A (DDL) + Bug B (segment derivation) + tests → unblocks boot + builds 250 SIDs. PR-4b: Concern C (% columns) after operator confirms intent.
+
+---
+
+## ARCHIVED 2026-05-29 — all items merged to main
+
+| Item | PR | main commit |
+|---|---|---|
+| Bug A — instrument_lifecycle DDL PARTITION BY DAY | #856 | merged |
+| Bug B — single-char CSV segment derivation | #856 | merged |
+| Concern C — re-add close_pct_from_prev_day | #860 | merged |
+| G1 — close_pct persist-chain ratchet | #861 | merged |
+| % columns 2-decimal (round_to_2dp) + G3 proof | #863 | fed3bca |
+| Price columns 2-decimal at write site | #864 | 5f6bdf9 |
+
+Operator 2-decimal contract is now a build-failing invariant across all
+price + percentage DOUBLE columns (greeks/IV exempt by operator decision).
+F&O scope verified unchanged per 2026-05-27 lock.
