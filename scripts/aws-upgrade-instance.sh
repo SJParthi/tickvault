@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# aws-upgrade-instance.sh — in-place t4g.medium → t4g.large flip.
+# aws-upgrade-instance.sh — in-place t4g.medium → m8g.large flip.
 #
 # Implements §7 Mechanical Rule 7 of
 # `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`:
@@ -11,11 +11,11 @@
 # Flow (per the rule):
 #   1. Discover the instance by Name tag `tv-${ENV}-app` (default env=prod).
 #   2. Refuse unless it is currently t4g.medium (idempotent: if already
-#      t4g.large, report and exit 0).
+#      m8g.large, report and exit 0).
 #   3. Market-hours guard — refuse 09:00–15:30 IST Mon–Fri unless --force
 #      (upgrade requires a stop; never stop during a live session).
 #   4. `aws ec2 stop-instances` → wait `instance-stopped`.
-#   5. `aws ec2 modify-instance-attribute --instance-type t4g.large`.
+#   5. `aws ec2 modify-instance-attribute --instance-type m8g.large`.
 #   6. `aws ec2 start-instances` → wait `instance-running`.
 #   7. Verify the new type + that the EIP is still associated.
 #
@@ -27,7 +27,7 @@
 #   ./scripts/aws-upgrade-instance.sh --dry-run  # print actions, change nothing
 #   ./scripts/aws-upgrade-instance.sh --force    # bypass market-hours guard
 #
-# Idempotent: re-running after success is a no-op (already t4g.large).
+# Idempotent: re-running after success is a no-op (already m8g.large).
 
 set -euo pipefail
 
@@ -37,7 +37,7 @@ set -euo pipefail
 ENV="${TV_ENV:-prod}"
 REGION="${AWS_REGION:-ap-south-1}"          # ap-south-1 Mumbai per aws-budget.md
 FROM_TYPE="t4g.medium"
-TO_TYPE="t4g.large"                          # operator lock 2026-05-27 §7
+TO_TYPE="m8g.large"                          # operator lock 2026-05-29 §7 Quote 5
 NAME_TAG="tv-${ENV}-app"
 
 DRY_RUN=0

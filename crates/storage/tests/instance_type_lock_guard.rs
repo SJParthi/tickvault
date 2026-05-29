@@ -1,13 +1,14 @@
 //! Sub-PR #1 of 2026-05-27 daily-universe expansion — source-scan ratchet
-//! pinning the **t4g.large instance type lock** documented in
+//! pinning the **m8g.large instance type lock** documented in
 //! `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md` §7.
 //!
-//! The 2026-05-18 t4g.medium operator-lock was superseded by the
-//! 2026-05-27 t4g.large lock (8 GiB RAM) to hold ~250 SIDs across 21
-//! timeframes RAM-resident. This guard fails the build if:
+//! Lock history: 2026-05-18 t4g.medium → 2026-05-27 t4g.large → 2026-05-29
+//! **m8g.large** (Graviton4, 8 GiB RAM — operator Quote 5). RAM unchanged at
+//! 8 GiB across the t4g.large→m8g.large change; only the instance string +
+//! pricing moved. This guard fails the build if:
 //!
 //!  1. The new authoritative rule file disappears or stops pinning
-//!     `t4g.large`.
+//!     `m8g.large`.
 //!  2. The four superseded rule files lose their SUPERSEDED-BY
 //!     markers (= future readers wouldn't find the new contract).
 //!  3. The instance-type lock value in any of the 5 docs disagrees
@@ -38,9 +39,9 @@ fn read(path: &Path) -> String {
 }
 
 /// Section A — the new authoritative rule file MUST exist and pin
-/// `t4g.large` as the locked instance type.
+/// `m8g.large` as the locked instance type.
 #[test]
-fn instance_lock_authoritative_rule_file_pins_t4g_large() {
+fn instance_lock_authoritative_rule_file_pins_m8g_large() {
     let root = repo_root();
     let path = root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md");
     assert!(
@@ -50,16 +51,16 @@ fn instance_lock_authoritative_rule_file_pins_t4g_large() {
     );
     let body = read(&path);
     assert!(
-        body.contains("t4g.large"),
-        "daily-universe rule file must pin `t4g.large` as the new instance lock"
+        body.contains("m8g.large"),
+        "daily-universe rule file must pin `m8g.large` as the new instance lock"
     );
     assert!(
-        body.contains("**t4g.large**"),
-        "daily-universe rule file must bold-pin `t4g.large` in the §7 instance-spec table"
+        body.contains("**m8g.large**"),
+        "daily-universe rule file must bold-pin `m8g.large` in the §7 instance-spec table"
     );
     assert!(
         body.contains("8 GiB RAM"),
-        "daily-universe rule file must pin 8 GiB RAM for t4g.large"
+        "daily-universe rule file must pin 8 GiB RAM for m8g.large"
     );
 }
 
@@ -128,16 +129,18 @@ fn instance_lock_supersession_markers_present_in_operator_charter() {
 }
 
 /// Section C — the bill in §7 must match the locked figure. Operator
-/// approved ~₹1,514/mo on 2026-05-27. If someone re-tunes this in the
-/// rule file without operator approval, the build fails.
+/// approved ~₹2,058/mo on 2026-05-29 (m8g.large, 270 hrs, 30 GB EBS, no EIP,
+/// incl. 18% GST; supersedes the earlier ~₹1,503 / ~₹1,514 figures). If
+/// someone re-tunes this in the rule file without operator approval, the
+/// build fails.
 #[test]
-fn instance_lock_monthly_bill_pinned_to_rupees_1514() {
+fn instance_lock_monthly_bill_pinned_to_rupees_2058() {
     let root = repo_root();
     let body =
         read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
     assert!(
-        body.contains("~₹1,514/mo") || body.contains("Rs 1,514/mo"),
-        "rule file §7 must pin the ~₹1,514/mo bill (operator approved 2026-05-27)"
+        body.contains("~₹2,058/mo") || body.contains("Rs 2,058/mo"),
+        "rule file §7 must pin the ~₹2,058/mo bill (operator approved 2026-05-29: m8g.large, 270 hrs, 30 GB EBS, no EIP, incl GST)"
     );
 }
 

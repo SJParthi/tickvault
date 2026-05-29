@@ -23,9 +23,21 @@
 **Quote 4 (2026-05-27, infinite retry + lifecycle preservation):**
 > "see irrespective of any situations it should never ever fail i mean until or unless without the proper fetch it should retry right that too covering all kinds of entire extreme worst case scenarios errors exceptions situations bugs … for future or options it should be just marked as expired and active alone only right dude instead of deleting it right dude"
 
+**Quote 5 (2026-05-29, instance = m8g.large + weekday-only schedule):**
+> "why m8 why not c8 or r8 dude?" … "see only on tarding working days our plan is to run only 8.30 am till 4.30 pm max dude … then after that whenever manually i need to run the isnatcne i will do it"
+>
+> Operator authorized: (a) instance lock → **m8g.large** (Graviton4, latest gen, 2 vCPU / 8 GiB, general-purpose — m-family chosen over c8g [4 GiB, too little RAM] and r8g [16 GiB, wasteful] because 8 GiB needs the 4:1 general-purpose ratio); live ap-south-1 on-demand = **$0.06416/hr**. (b) Schedule → **trading weekdays only (Mon–Fri), 08:30–16:30 IST auto start/stop**; operator starts manually for any out-of-window run. This is the dated quote §7 Mechanical Rule 1 + §12 require before the instance + schedule change.
+
+**Quote 6 (2026-05-29, EBS + no EIP + <₹2,000 target for data-pull):**
+> "for storage atleast we need 100 gb right so even in later phase we can easily move everything to s3 right dude" … "why ebs is so costly why not internal storage dude?" … "it should be less than 2000 dude thats our plan" … "exclude static ip dude since for the next three months no real orders … lets say 270 hours"
+>
+> Operator authorized + resolved: (c) EBS gp3 **30 GB** (not 100 — 100 GB pushed the all-in bill to ~₹2,698 incl GST, over the operator's <₹2,000 target; 30 GB hot window + S3 archival of >90d partitions keeps it ~₹2,058. Internal/instance NVMe rejected — wiped on daily stop). gp3 grows online; raise anytime. (d) **Elastic IP excluded** (`enable_eip = false`) for the 3-month no-orders data-pull — saves ~₹430/mo; re-enable before live trading. (e) cost basis = **270 running hrs/month**. (f) Tax = **18% GST** total (IGST inter-state, or CGST 9% + SGST 9% intra-state — same 18%, no extra cess). All-in ≈ **₹2,058/mo incl. GST** (~₹58 over the ₹2,000 target — operator accepted; drop to 20 GB for strictly-under).
+
 **Approvals:**
 - 2026-05-27: Approved Sub-PR plan items A–D (infinite retry policy, single `instrument_lifecycle` table, separate `instrument_lifecycle_audit` table, plan growing to 14 sub-PRs)
 - 2026-05-27: Approved options X–Z (EventBridge cron at 08:30 IST, `lifecycle_state_locked` column for operator overrides, `--dry-run-universe` CLI flag for first prod validation)
+- 2026-05-29: Approved instance m8g.large (Graviton4, 8 GiB) + weekday-only 08:30–16:30 IST auto schedule (manual start otherwise) per Quote 5
+- 2026-05-29: Approved EBS 100 GB + EIP excluded (no orders) + 270-hr basis → ~₹2,698/mo incl GST per Quote 6
 
 ---
 
@@ -144,47 +156,90 @@ SEBI retention: 5 years (matches the `order_audit` table standard).
 
 ---
 
-## §7. Instance lock — t4g.large (LOCKED 2026-05-27, supersedes 2026-05-18 t4g.medium)
+## §7. Instance lock — m8g.large (LOCKED 2026-05-29, supersedes the 2026-05-27 t4g.large lock + 2026-05-18 t4g.medium)
+
+**2026-05-29 change (operator Quote 5):** instance lock → **m8g.large**
+(Graviton4, the latest generation, fixed-performance) — SAME 8 GiB RAM, so
+the Mechanical Rule 2 memory budget below is preserved verbatim. Family
+choice rationale: 8 GiB at 2 vCPU requires the **4:1 general-purpose (m)
+ratio** — c8g.large is 4 GiB (too little, would OOM the ~4.1 GB working
+set) and r8g.large is 16 GiB (wasteful + pricier per GiB). m8g.large is
+the only family/size that lands exactly on 2 vCPU / 8 GiB. EBS-backed (NOT
+the `m8gd` local-SSD variant — that NVMe is wiped on every daily auto-stop).
 
 | Spec | Value |
 |---|---|
-| Instance | **t4g.large** — ARM Graviton, **2 vCPU, 8 GiB RAM** |
+| Instance | **m8g.large** — ARM Graviton4, **2 vCPU, 8 GiB RAM** (general-purpose) |
 | Region | ap-south-1 (Mumbai) |
 | Tenancy | Default (Shared) |
-| Pricing | On-demand $0.0448/hr — no Reserved / Savings Plan / Spot |
-| Schedule | **08:30–17:00 IST every day Mon–Sun** (was 08:00–17:00; new cron `cron(0 3 * * ? *)` for 08:30 IST start) |
+| Pricing | On-demand **$0.06416/hr** (live ap-south-1, 2026-05-29) — no Reserved / Savings Plan / Spot |
+| Schedule | **Trading weekdays only (Mon–Fri), 08:30–16:30 IST auto** (start `cron(0 3 ? * MON-FRI *)`, stop `cron(0 11 ? * MON-FRI *)`). Out-of-window runs = operator manual start. Weekends + holidays = OFF unless manually started. |
 | EBS | gp3 10 GB (unchanged) |
 | EIP | 1 (24/7, Dhan static-IP mandate — unchanged) |
 | Network | ENA enabled by default |
 
-### Cost bill (LOCKED ~₹1,571/mo)
+### Cost bill (LOCKED ~₹2,698/mo incl. 18% GST — 270 hrs, 100 GB EBS, NO EIP)
 
-| Line | Calc | Monthly ₹ |
+Operator-set ceiling **270 running hours/month** (auto weekday schedule
+~176 hrs + manual runs). **EBS 30 GB** (Quote 6). **Elastic IP EXCLUDED**
+(Quote 5/6: the 3-month data-pull places NO orders → Dhan static-IP
+whitelist not needed → `enable_eip = false`). m8g.large @ $0.06416/hr,
+$1 ≈ ₹85. **Every running component is itemised below — monitoring,
+alerting, Docker, Lambdas, Telegram are all included and free-tier.**
+
+| Line | Calc | USD |
 |---|---|---|
-| EC2 t4g.large | $0.0448/hr × 8.5hr × 30 × ₹85 | ₹971 |
-| EIP (24/7) | $0.005/hr × 720h × ₹85 | ₹306 |
-| EBS gp3 10 GB | $0.0912 × 10 × ₹85 | ₹78 |
-| S3 cold | tiny dataset | ₹15 |
-| CloudWatch | free tier (10/10/5GB) | ₹0 |
-| SNS SMS | 100 msgs × $0.00278 × ₹85 | ₹24 |
-| SNS Email / Lambda | free tier | ₹0 |
-| Data transfer | ~14 GB outbound (more SIDs) | ₹120 |
-| **TOTAL** | | **~₹1,514/mo** |
+| EC2 m8g.large (hosts app + Docker + QuestDB) | $0.06416/hr × 270 hrs | $17.32 |
+| Elastic IP | EXCLUDED (no orders → no static-IP need) | $0.00 |
+| EBS gp3 30 GB | $0.0912 × 30 | $2.74 |
+| S3 cold (aged-out partitions) | tiny, grows over time | $0.18 |
+| Docker (QuestDB + tickvault containers) | runs on the EC2 host | $0.00 |
+| CloudWatch metrics (10 custom) | free tier = 10 | $0.00 |
+| CloudWatch alarms (10) | free tier = 10 | $0.00 |
+| CloudWatch Logs (app/journal) | free tier = 5 GB/mo | $0.00 |
+| CloudWatch Dashboards (3) | free tier = 3 | $0.00 |
+| Lambda (telegram-webhook, budget-killswitch, triage) | free tier = 1M req/mo | $0.00 |
+| SNS → Telegram + Email fan-out | free tier (1M / 1k) | $0.00 |
+| SNS → SMS (optional) | ~100 India msgs | $0.28 |
+| Data transfer out | ~14 GB < 100 GB free egress | $0.00 |
+| **Subtotal (pre-GST)** | | **$20.52** |
+| **× ₹85/$** | | **₹1,744** |
+| **+ 18% GST (AWS India)** | | **~₹2,058/mo** |
 
-**Honest envelope:** ~₹1,514/mo is **+₹492 over the previous ₹1,022/mo t4g.medium lock** and **+₹514 over the original <₹1,000 target**. Operator approved 2026-05-27.
+**Honest envelope:** ~**₹2,058/month all-in including GST** at the 270-hr
+ceiling, 30 GB EBS, no EIP. **The entire observability stack — CloudWatch
+metrics/alarms/logs/dashboards, all 3 Lambdas, and Telegram + Email alert
+fan-out — costs ₹0** (low-volume control-plane services sit inside AWS's
+permanent free tier per §7 Rule 5's CloudWatch-only design; only optional
+SMS is ~₹24). ~₹58 over the operator's <₹2,000 target — operator accepted;
+dropping EBS to 20 GB lands strictly under (₹1,966). 30 GB chosen over 100
+GB because the partition manager archives >90d data to S3 (~4× cheaper/GB),
+so EBS holds only the hot window; gp3 grows online if needed. EIP excluded
+(saves ~₹430/mo); flip `enable_eip = true` + re-register with Dhan before
+live orders. **Tax:** 18% GST total (IGST inter-state, or CGST 9% + SGST 9%
+intra-state — identical 18%, no extra cess). Verified: m8g.large $0.06416/hr
+console-confirmed (ap-south-1, 2026-05-29); EBS/S3/SNS are AWS list rates.
+Budget alarm ceiling = $25/mo pre-GST. Operator approved 2026-05-29.
 
-> **Note on instance schedule:** the original prior-lock schedule was 08:00–17:00 IST (9 hours). The new schedule shifts the start to 08:30 IST per option X approval (gives 15-min cushion for cold-boot + Step 1–6 + CSV retry budget so the app is ready before 09:00 market open). End-of-day stays 17:00 IST. Total runtime ≈ 8.5 hours; if operator prefers full 9 hours (08:30–17:30 IST), update this section.
+> **Note on instance schedule (2026-05-29):** trading WEEKDAYS only
+> (Mon–Fri), **08:30–16:30 IST** auto start/stop. Weekends + NSE holidays
+> = instance OFF unless the operator manually starts it. The 08:30 start
+> gives the cold-boot + Step 1–6 auth + 08:45 CSV-fetch retry budget so
+> the app is ready before 09:00 market open; 16:30 stop is ~1h after the
+> 15:30 close (covers post-close digest + flush). Earlier plans
+> (08:00–17:00 7-day, then 08:30–17:00 7-day) are superseded.
 
 ### Mechanical Rules (replaces aws-budget.md mechanical rules 1+6)
 
-1. **Instance type is t4g.large. PERIOD.** Going larger (t4g.xlarge, c7g, m7g) requires:
-   - Operator explicit approval with dated quote
+1. **Instance type is m8g.large. PERIOD.** Changing it (to t4g.large, m7g,
+   r8g, a larger m8g size, etc.) requires:
+   - Operator explicit approval with dated quote (see §0 Quote 5)
    - Update to this file
    - Update to `aws-indices-only-locked-architecture.md` §5
    - Update to `aws-budget.md` (existing file marked SUPERSEDED)
    - Ratchet test `crates/storage/tests/instance_type_lock_guard.rs` updated to pin the new type
 
-2. **Host memory budget for t4g.large (8 GiB total) — POST CloudWatch-only migration, 250 SIDs across 21 TFs:**
+2. **Host memory budget for m8g.large (8 GiB total) — POST CloudWatch-only migration, 250 SIDs across 21 TFs:**
    - QuestDB process: ~2.5 GB (more write pressure — ~5000 ticks/sec sustained, ~2500 audit rows/min)
    - Tickvault app: registry + 21-TF aggregator + indicator state + today/yesterday RAM-resident sealed bars (≈3.2 MB × 250 SIDs) ≈ **~800 MB**
    - App: rescue ring (100K tick cap, fixed): 10 MB
@@ -195,7 +250,7 @@ SEBI retention: 5 years (matches the `order_audit` table standard).
    - **Total used: ~4.1 GB**
    - **Headroom: ~3.9 GB** — well above the 1 GB Linux kswapd floor
 
-3. **EBS stays at 10 GB.** Partition manager auto-archives to S3 at 90d. Estimated ~50 MB/day across all tables for 250 SIDs × 21 TFs ≈ 200 days of hot data fits in 10 GB.
+3. **EBS = 30 GB gp3** (operator lock 2026-05-29 Quote 6, raised from 10 GB; 30 chosen over 100 to keep the all-in bill ~₹2,058/mo near the operator's <₹2,000 target). The partition manager auto-archives partitions >90d to the S3 cold bucket (~4× cheaper per GB than EBS), so EBS holds only the hot window. gp3 **grows online** (no stop, no data loss) — 30 GB is a floor; raise it live if the hot window grows. Internal/instance (m8gd local NVMe) storage is NOT used — it is wiped on every daily auto-stop, so it cannot hold QuestDB data. Terraform `ebs_gp3_size_gb` default = 30, range 10–200.
 
 4. **No paid AWS services** (RDS, ElastiCache, NAT Gateway, ALB) without budget review.
 
@@ -203,7 +258,7 @@ SEBI retention: 5 years (matches the `order_audit` table standard).
 
 6. **RAM-first hot path (mandatory, unchanged):** every indicator + strategy + risk decision reads from RAM. QuestDB is persistence + audit + cold-path boot rehydration only. Banned-pattern scanner enforces.
 
-7. **One-time instance upgrade script:** `scripts/aws-upgrade-instance.sh` performs the t4g.medium → t4g.large flip via `aws ec2 stop-instances` → `aws ec2 modify-instance-attribute` → `aws ec2 start-instances`. EIP + EBS preserved. Downtime ~3 minutes, scheduled Sunday 22:00 IST (off-market).
+7. **One-time instance upgrade script:** `scripts/aws-upgrade-instance.sh` performs the in-place instance flip (the already-running instance → **m8g.large**) via `aws ec2 stop-instances` → `aws ec2 modify-instance-attribute` → `aws ec2 start-instances`. EIP + EBS preserved (the script verifies the EIP survives and aborts if it changed). Downtime ~3 minutes, run on a Sunday off-market window. `FROM_TYPE`/`TO_TYPE` in the script are the single source for the flip; the market-hours guard refuses 09:00–15:30 IST Mon–Fri without `--force`.
 
 ---
 
@@ -243,7 +298,7 @@ Per `.claude/rules/project/z-plus-defense-doctrine.md`:
 The new `instrument_lifecycle` orchestrator slots between existing Step 6 (auth) and the WebSocket pool spawn:
 
 ```
-08:30 IST  EventBridge cron fires; EC2 t4g.large boots (~60s cold)
+08:30 IST  EventBridge cron fires (Mon–Fri only); EC2 m8g.large boots (~60s cold)
 08:31      Docker compose up (QuestDB + tickvault-app)
 08:31:30   App Step 1-5: CryptoProvider → Config → Observability → Logging → Notification
 08:32      Step 6: Dhan auth (TOTP → JWT) — Valkey dual-instance lock acquired
