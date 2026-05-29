@@ -1,20 +1,32 @@
-# DLT AWS stack — t4g.medium budget envelope (~₹1,022/mo, operator-lock
-# 2026-05-18 in aws-budget.md).
+# DLT AWS stack — m8g.large budget envelope (~₹2,058/mo incl GST: 270 hrs,
+# 30 GB EBS, no EIP; operator-lock 2026-05-29 in
+# daily-universe-scope-expansion-2026-05-27.md §7 Quotes 5+6, which supersede
+# the 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks).
 #
 # Deployed resources:
 #   - VPC with a single public subnet (no NAT to stay under budget)
 #   - Security group: SSH from operator_cidr, no inbound from market
 #   - IAM role: SSM read+write+delete (instance lock) + CloudWatch write +
 #     SNS publish + S3 cold-tier read/write
-#   - EC2 t4g.medium (ARM Graviton, 2 vCPU / 4 GiB) with gp3 10GB root volume
-#   - Elastic IP (Dhan static IP mandate effective 2026-04-01; 7-day cooldown
-#     on modify — never release once registered with Dhan)
+#   - EC2 m8g.large (ARM Graviton4, 2 vCPU / 8 GiB) with gp3 30GB root volume
+#   - Elastic IP — count-gated on var.enable_eip (DEFAULT false for the 3-month
+#     data-pull: no orders → no Dhan static-IP whitelist need → ~₹430/mo saved.
+#     Flip enable_eip=true before going LIVE with orders; 7-day modify cooldown)
 #   - SSM parameters for Dhan credentials, Telegram tokens, QuestDB creds,
 #     instance lock (dual-instance prevention — see crates/core/src/instance_lock.rs)
 #   - SNS topic for CRITICAL alerts → 4-channel fan-out (SMS+Telegram+Email+Connect)
-#   - EventBridge rules for daily 08:00 IST start / 17:00 IST stop (Mon-Sun
-#     per operator lock — accept ₹22/mo overage for 7-day BRUTEX availability)
+#   - EventBridge rules for daily 08:30 IST start / 16:30 IST stop (Mon-Fri
+#     trading weekdays only per operator lock 2026-05-29 §7 Quote 5; weekends +
+#     NSE holidays = OFF unless the operator manually starts the instance)
 #   - CloudWatch log group + metric alarms (5 core infrastructure signals)
+#
+# IN-PLACE UPGRADE CONTRACT (operator lock 2026-05-29): the running instance
+# i-0b956d0209231a48b (tv-prod-app) is upgraded t4g.medium → m8g.large by
+# scripts/aws-upgrade-instance.sh (stop → modify-instance-attribute → start) at
+# a controlled off-market time, NOT by `terraform apply`. Terraform therefore
+# IGNORES instance_type + user_data on aws_instance.tv_app (lifecycle block
+# below) so a merge-triggered apply can NEVER replace/wipe the box. Code deploys
+# happen over SSM (git pull && docker compose up), never via instance replace.
 #
 # Stack components NOT deployed (CloudWatch-only migration #O1/#O2/#O3/#O4):
 #   - Grafana / Prometheus / Alertmanager / Valkey — all retired.
@@ -43,10 +55,15 @@ resource "aws_internet_gateway" "dlt" {
 }
 
 resource "aws_subnet" "public" {
-  vpc_id                  = aws_vpc.dlt.id
-  cidr_block              = "10.42.1.0/24"
-  availability_zone       = "${var.aws_region}a"
-  map_public_ip_on_launch = false # we use a static EIP
+  vpc_id            = aws_vpc.dlt.id
+  cidr_block        = "10.42.1.0/24"
+  availability_zone = "${var.aws_region}a"
+  # Auto-assign a public IP on launch so the instance is reachable for
+  # the data-pull window WITHOUT a static EIP (var.enable_eip = false,
+  # operator lock 2026-05-29 §7 Quote 5 — no orders, no Dhan static-IP
+  # need). When enable_eip flips true for live trading, the EIP overrides
+  # this with a stable address.
+  map_public_ip_on_launch = true
 
   tags = {
     Name = "tv-${var.environment}-public-a"
@@ -192,15 +209,20 @@ resource "aws_instance" "tv_app" {
   iam_instance_profile   = aws_iam_instance_profile.tv_instance.name
   monitoring             = true
 
-  # Protect against accidental terminate / stop from `aws ec2 *-instances`
-  # CLI calls or AWS Console clicks. To intentionally destroy via
-  # `terraform destroy`, operator must first run:
+  # Terminate-protection ON (terminate destroys the EBS root volume + all
+  # QuestDB data — the one truly irreversible action). To intentionally
+  # `terraform destroy`, operator first runs:
   #   aws ec2 modify-instance-attribute --instance-id <id> --no-disable-api-termination
-  #   aws ec2 modify-instance-attribute --instance-id <id> --no-disable-api-stop
-  # then re-apply with the flags flipped to false. Two-step destroy = the
-  # defense.
+  # then re-applies with the flag false. Two-step destroy = the defense.
+  #
+  # Stop-protection OFF (operator lock 2026-05-29): the weekday 16:30 IST
+  # EventBridge stop cron AND scripts/aws-upgrade-instance.sh BOTH need
+  # ec2:StopInstances. `disable_api_stop = true` would silently block the
+  # daily auto-stop → instance runs 24/7 → ~720 hrs/mo → ~₹5,500 bill instead
+  # of the locked ~₹2,058/mo, and would block the in-place m8g.large upgrade.
+  # Stop is reversible (EBS + data survive a stop) so it needs no guard.
   disable_api_termination = true
-  disable_api_stop        = true
+  disable_api_stop        = false
 
   metadata_options {
     http_endpoint               = "enabled"
@@ -220,7 +242,12 @@ resource "aws_instance" "tv_app" {
     }
   }
 
-  user_data_replace_on_change = true
+  # user_data is the ONE-TIME bootstrap (installs Docker, clones repo, first
+  # boot). After bootstrap, code deploys happen over SSM (git pull && docker
+  # compose up) — NEVER by re-running user_data. So drift in this template must
+  # NOT trigger an instance replace (replace = fresh root volume = QuestDB data
+  # orphaned). false here + user_data in ignore_changes below = belt+suspenders.
+  user_data_replace_on_change = false
   user_data = templatefile("${path.module}/user-data.sh.tftpl", {
     environment = var.environment
     region      = var.aws_region
@@ -230,12 +257,27 @@ resource "aws_instance" "tv_app" {
     Name = "tv-${var.environment}-app"
   }
 
+  # NEVER let `terraform apply` replace or re-type the running box:
+  #   - ami:           AMI refresh updates the default for NEW instances only;
+  #                    existing instance keeps its AMI (no replace).
+  #   - instance_type: the t4g.medium → m8g.large upgrade is done out-of-band by
+  #                    scripts/aws-upgrade-instance.sh at a controlled off-market
+  #                    time. Terraform must not fight that or revert it. The
+  #                    var.instance_type validation still documents the desired
+  #                    m8g.large for any fresh provision.
+  #   - user_data:     bootstrap-only (see note above); deploys are over SSM.
   lifecycle {
-    ignore_changes = [ami]
+    ignore_changes = [ami, instance_type, user_data]
   }
 }
 
+# Elastic IP — count-gated on var.enable_eip (DEFAULT 0 for the 3-month
+# data-pull; no orders → no Dhan static-IP whitelist need → ~₹430/mo saved).
+# Flip enable_eip=true before going LIVE with orders to provision + register
+# a stable IP with Dhan. Reversible one-line change — matches the
+# operator_phone count-gate pattern in sns-subscriptions.tf.
 resource "aws_eip" "tv_app" {
+  count    = var.enable_eip ? 1 : 0
   domain   = "vpc"
   instance = aws_instance.tv_app.id
 
@@ -262,25 +304,26 @@ resource "aws_cloudwatch_log_group" "tv_app" {
 }
 
 # ---------------------------------------------------------------------------
-# EventBridge daily start/stop schedule per aws-budget.md operator-lock
-# 2026-05-18 (Option A — accept ₹22/mo overage for 7-day BRUTEX
-# availability). Rules call SSM Automation to start/stop the instance.
+# EventBridge weekday start/stop schedule per daily-universe-scope-
+# expansion-2026-05-27.md §7 Quote 5 (2026-05-29): trading WEEKDAYS only
+# (Mon-Fri), 08:30-16:30 IST. Weekends + NSE holidays = instance OFF unless
+# the operator manually starts it. Rules call SSM Automation to start/stop.
 #
 # IST offset is UTC+5:30, so:
-#   Daily start 08:00 IST = 02:30 UTC (Mon-Sun)
-#   Daily stop  17:00 IST = 11:30 UTC (Mon-Sun)
+#   Weekday start 08:30 IST = 03:00 UTC (Mon-Fri)
+#   Weekday stop  16:30 IST = 11:00 UTC (Mon-Fri)
 # ---------------------------------------------------------------------------
 
 resource "aws_cloudwatch_event_rule" "daily_start" {
   name                = "tv-${var.environment}-daily-start"
-  description         = "Start tickvault instance at 08:00 IST every day (Mon-Sun)"
-  schedule_expression = "cron(30 2 * * ? *)"
+  description         = "Start tickvault instance at 08:30 IST on trading weekdays (Mon-Fri)"
+  schedule_expression = "cron(0 3 ? * MON-FRI *)"
 }
 
 resource "aws_cloudwatch_event_rule" "daily_stop" {
   name                = "tv-${var.environment}-daily-stop"
-  description         = "Stop tickvault instance at 17:00 IST every day (Mon-Sun)"
-  schedule_expression = "cron(30 11 * * ? *)"
+  description         = "Stop tickvault instance at 16:30 IST on trading weekdays (Mon-Fri)"
+  schedule_expression = "cron(0 11 ? * MON-FRI *)"
 }
 
 # ---------------------------------------------------------------------------
@@ -297,7 +340,7 @@ resource "aws_cloudwatch_event_rule" "daily_stop" {
 #     → starts SSM Automation document `AWS-StartEC2Instance`
 #     → SSM Automation uses the same role to call ec2:StartInstances
 #
-# The 2 rules (daily start + daily stop, Mon-Sun) share the same role —
+# The 2 rules (daily start + daily stop, Mon-Fri) share the same role —
 # scoped to this one instance ARN.
 # ---------------------------------------------------------------------------
 

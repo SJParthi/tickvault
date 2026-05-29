@@ -1208,6 +1208,20 @@ pub fn f32_to_f64_clean(v: f32) -> f64 {
     tickvault_common::price_precision::f32_to_f64_clean(v)
 }
 
+/// Rounds a price/percentage `f64` to 2 decimal places before persistence.
+///
+/// Operator rule (2026-05-29): every persisted price/percentage DOUBLE
+/// column carries at most two digits after the point. Always composed
+/// AROUND [`f32_to_f64_clean`] — `round_to_2dp(f32_to_f64_clean(v))` — never
+/// replacing it: the clean conversion preserves Dhan's shortest-decimal
+/// form (data-integrity.md), and this final round guarantees the 2-dp
+/// contract for the rare exchange-computed value (e.g. `avg_price` VWAP)
+/// that carries >2 digits. Thin re-export of the canonical primitive.
+#[inline]
+pub fn round_to_2dp(v: f64) -> f64 {
+    tickvault_common::price_precision::round_to_2dp(v)
+}
+
 // ---------------------------------------------------------------------------
 // Buffer Building (extracted for testability)
 // ---------------------------------------------------------------------------
@@ -1242,21 +1256,27 @@ fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
         .context("segment")?
         .column_i64("security_id", i64::from(tick.security_id))
         .context("security_id")?
-        .column_f64("ltp", f32_to_f64_clean(tick.last_traded_price))
+        .column_f64(
+            "ltp",
+            round_to_2dp(f32_to_f64_clean(tick.last_traded_price)),
+        )
         .context("ltp")?
-        .column_f64("open", f32_to_f64_clean(tick.day_open))
+        .column_f64("open", round_to_2dp(f32_to_f64_clean(tick.day_open)))
         .context("open")?
-        .column_f64("high", f32_to_f64_clean(tick.day_high))
+        .column_f64("high", round_to_2dp(f32_to_f64_clean(tick.day_high)))
         .context("high")?
-        .column_f64("low", f32_to_f64_clean(tick.day_low))
+        .column_f64("low", round_to_2dp(f32_to_f64_clean(tick.day_low)))
         .context("low")?
-        .column_f64("close", f32_to_f64_clean(tick.day_close))
+        .column_f64("close", round_to_2dp(f32_to_f64_clean(tick.day_close)))
         .context("close")?
         .column_i64("volume", i64::from(tick.volume))
         .context("volume")?
         .column_i64("oi", i64::from(tick.open_interest))
         .context("oi")?
-        .column_f64("avg_price", f32_to_f64_clean(tick.average_traded_price))
+        .column_f64(
+            "avg_price",
+            round_to_2dp(f32_to_f64_clean(tick.average_traded_price)),
+        )
         .context("avg_price")?
         .column_i64("last_trade_qty", i64::from(tick.last_trade_quantity))
         .context("last_trade_qty")?

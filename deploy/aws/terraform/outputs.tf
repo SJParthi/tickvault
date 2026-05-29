@@ -6,8 +6,8 @@ output "instance_id" {
 }
 
 output "elastic_ip" {
-  description = "Static public IP — register this with Dhan IP whitelist"
-  value       = aws_eip.tv_app.public_ip
+  description = "Static public IP (register with Dhan IP whitelist) when enable_eip=true; otherwise the instance's auto-assigned public IP (changes on each stop/start — fine for the no-orders data-pull window)."
+  value       = var.enable_eip ? aws_eip.tv_app[0].public_ip : aws_instance.tv_app.public_ip
 }
 
 output "vpc_id" {
@@ -32,7 +32,7 @@ output "cold_bucket_name" {
 
 output "ssh_command" {
   description = "One-liner to SSH in after the instance is running"
-  value       = "ssh -i ~/.ssh/${var.key_name}.pem ec2-user@${aws_eip.tv_app.public_ip}"
+  value       = "ssh -i ~/.ssh/${var.key_name}.pem ec2-user@${var.enable_eip ? aws_eip.tv_app[0].public_ip : aws_instance.tv_app.public_ip}"
 }
 
 output "ssm_session_command" {

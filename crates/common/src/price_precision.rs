@@ -74,9 +74,59 @@ pub fn f32_to_f64_clean(v: f32) -> f64 {
         .unwrap_or(f64::from(v))
 }
 
+/// Rounds a finite `f64` to exactly 2 decimal places (half-away-from-zero).
+///
+/// Operator rule (2026-05-29): persisted DOUBLE columns for percentage /
+/// price values carry at most two digits after the decimal point. This is
+/// the canonical rounding primitive for that contract — write sites round
+/// through THIS function so a 17-digit artifact like
+/// `0.10142836229792751` becomes the 2-dp value `0.1`.
+///
+/// Non-finite inputs (`NaN` / `±Inf`) are returned unchanged. `-0.0`
+/// normalises to `0.0` so QuestDB never stores a signed zero.
+///
+/// # Performance
+/// O(1): two multiplies + one `round` + one divide. No allocation. Safe on
+/// the seal path (called per sealed candle, not per tick).
+#[inline]
+#[must_use]
+pub fn round_to_2dp(value: f64) -> f64 {
+    if !value.is_finite() {
+        return value;
+    }
+    let rounded = (value * 100.0).round() / 100.0;
+    if rounded == 0.0 { 0.0 } else { rounded }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_round_to_2dp_truncates_long_fraction() {
+        assert_eq!(format!("{}", round_to_2dp(0.101_428_362_297_927_51)), "0.1");
+        assert_eq!(format!("{}", round_to_2dp(2.613_407_964_243_586_3)), "2.61");
+        assert_eq!(format!("{}", round_to_2dp(-0.531_771_429_404_51)), "-0.53");
+    }
+
+    #[test]
+    fn test_round_to_2dp_already_two_or_fewer() {
+        assert_eq!(round_to_2dp(5.0), 5.0);
+        assert_eq!(format!("{}", round_to_2dp(5.12)), "5.12");
+    }
+
+    #[test]
+    fn test_round_to_2dp_normalises_negative_zero() {
+        let r = round_to_2dp(-0.0001);
+        assert_eq!(r, 0.0);
+        assert!(r.is_sign_positive(), "must normalise -0.0 -> 0.0");
+    }
+
+    #[test]
+    fn test_round_to_2dp_passes_through_non_finite() {
+        assert!(round_to_2dp(f64::NAN).is_nan());
+        assert!(round_to_2dp(f64::INFINITY).is_infinite());
+    }
 
     #[test]
     fn test_f32_to_f64_clean_preserves_simple_prices() {
