@@ -80,7 +80,11 @@ pub fn compute_close_pct(close: f64, prev_day_close: f64) -> f64 {
     if prev_day_close == 0.0 {
         0.0
     } else {
-        ((close - prev_day_close) / prev_day_close) * 100.0
+        // 2-decimal contract (operator rule 2026-05-29): persisted % columns
+        // carry <=2 digits after the point. Round via the canonical primitive.
+        tickvault_common::price_precision::round_to_2dp(
+            ((close - prev_day_close) / prev_day_close) * 100.0,
+        )
     }
 }
 
@@ -103,7 +107,8 @@ pub fn compute_oi_pct(oi: i64, prev_day_oi: i64) -> f64 {
         // bug that data-integrity.md guards against.
         let oi_f = oi as f64;
         let prev_f = prev_day_oi as f64;
-        ((oi_f - prev_f) / prev_f) * 100.0
+        // 2-decimal contract (operator rule 2026-05-29).
+        tickvault_common::price_precision::round_to_2dp(((oi_f - prev_f) / prev_f) * 100.0)
     }
 }
 
@@ -123,7 +128,8 @@ pub fn compute_volume_pct(cum_volume: i64, prev_day_total_volume: i64) -> f64 {
         // APPROVED: see `compute_oi_pct` for widening rationale.
         let cum_f = cum_volume as f64;
         let prev_f = prev_day_total_volume as f64;
-        ((cum_f - prev_f) / prev_f) * 100.0
+        // 2-decimal contract (operator rule 2026-05-29).
+        tickvault_common::price_precision::round_to_2dp(((cum_f - prev_f) / prev_f) * 100.0)
     }
 }
 
