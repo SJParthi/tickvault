@@ -748,3 +748,52 @@ Operator directive verbatim 2026-05-27:
 
 - `crates/storage/tests/operator_boundary_indicator_strategy_guard.rs::test_indicator_engine_states_field_unchanged_since_2026_05_27`
   (source-scan: SHA-256 the relevant lines of `engine.rs`; any modification fails the build until the boundary is lifted)
+
+---
+
+## §29. Same-day warm-resubscribe snapshot — operator authorization 2026-05-29
+
+**Operator quote (2026-05-29, this session):**
+> "yes go ahead bro merge all the PRs let em run this atalst bro okay?"
+> — given in direct response to the disaster-recovery analysis showing
+> that an OOM / crash / Docker restart / QuestDB-volume wipe at 11:30 IST
+> should NOT force the full cold rebuild before ticks flow again.
+
+**What this authorizes (and bounds):** a date-keyed subscription-plan
+snapshot written to the host disk (`data/instrument-cache/plan-snapshot-YYYY-MM-DD.json`),
+SEPARATE from the QuestDB volume, used for INSTANT warm-resubscribe on a
+**same-day** boot. This is a narrowly-scoped relaxation of §4's "boot
+BLOCKS until a fresh validated CSV is in hand" rule — and ONLY for the
+same-day-crash case.
+
+| Boot case | Behaviour | §4 fail-closed still applies? |
+|---|---|---|
+| FIRST boot of the trading day (no snapshot) | Full cold build, infinite retry, boot BLOCKS until fresh CSV | YES — unchanged |
+| SAME-DAY re-boot (snapshot present, date matches today) | Instant plan from snapshot (~1ms) → ticks flow → background reconcile refreshes lifecycle master + snapshot | Relaxed for first-tick; reconcile runs in background |
+| Snapshot from a PREVIOUS day | Rejected (date mismatch) → falls through to cold build | YES |
+| Snapshot corrupt / unknown role | Rejected (fail-closed) → falls through to cold build | YES |
+
+**Why this is NOT "proceeding with stale data" (the §4 prohibition):** a
+same-date snapshot means today's universe was already fetched, validated,
+and lifecycle-written by an earlier successful boot. The snapshot is a
+cache of THAT computation, not a substitute for a missing fetch. The
+background reconcile re-runs the full §4 cold build (infinite retry,
+fail-closed) and refreshes both the lifecycle master and the snapshot —
+so the audit/lifecycle work is DEFERRED past first-tick, never SKIPPED.
+
+**Honest envelope:** this does NOT detect an intraday universe change; it
+is a same-day warm cache keyed on the IST trading date. Correctness of
+"is today's universe still valid" remains the background reconcile's job.
+If the background reconcile fails, ticks still flow from the warm plan and
+the next boot retries — lifecycle for TODAY was already written by the
+boot that produced the snapshot.
+
+**Source + ratchets:**
+- `crates/core/src/instrument/instrument_snapshot.rs` (module + 12 unit tests)
+- `crates/app/src/main.rs::load_daily_universe_plan` (fast-path + slow-path),
+  `cold_build_daily_universe` (shared helper), `record_instrument_load_telemetry`
+- Path-traversal guard: `instrument_snapshot::is_valid_trading_date` (strict
+  `YYYY-MM-DD`, fail-closed) — test `test_is_valid_trading_date_rejects_traversal_and_malformed`
+- Fail-closed role parse — test `test_to_universe_fails_closed_on_unknown_role`
+- Background-reconcile failure logs `error!` with `code = INSTR-FETCH-01`,
+  does NOT halt the live warm plan.
