@@ -499,6 +499,67 @@ pub async fn append_instrument_lifecycle_row(
     Ok(())
 }
 
+/// Rows per multi-row INSERT request. QuestDB `/exec` accepts large
+/// multi-row `VALUES` bodies; 5000 collapses the applicable-F&O master
+/// (~219K rows) into ~44 requests instead of ~219K single-row round-trips.
+/// PERF (2026-05-29): the per-row path built a fresh `reqwest::Client` +
+/// one HTTP round-trip PER ROW — 219K rows = ~219K round-trips = boot took
+/// minutes→hours. Batching + one reused client cuts it to a few seconds.
+pub const LIFECYCLE_INSERT_BATCH_SIZE: usize = 5000;
+
+/// Build ONE multi-row `INSERT … VALUES (t1),(t2),…,(tN);` for a chunk of
+/// lifecycle rows. PURE (no I/O) — extracted for deterministic testing.
+#[must_use]
+pub fn build_lifecycle_multi_insert_sql(rows: &[InstrumentLifecycleRow<'_>]) -> String {
+    let tuples: Vec<String> = rows.iter().map(format_lifecycle_row_tuple).collect();
+    format!(
+        "INSERT INTO {QUESTDB_TABLE_INSTRUMENT_LIFECYCLE} \
+         ({LIFECYCLE_INSERT_COLUMN_LIST}) VALUES {};",
+        tuples.join(",")
+    )
+}
+
+/// Batched UPSERT of many `instrument_lifecycle` rows. ONE reused client;
+/// rows chunked into [`LIFECYCLE_INSERT_BATCH_SIZE`] multi-row INSERTs.
+/// Idempotent via the table's DEDUP UPSERT KEYS — re-run is safe.
+/// (Pure builder `build_lifecycle_multi_insert_sql` carries the unit coverage.)
+// TEST-EXEMPT: requires running QuestDB; tested via boot integration in CI.
+pub async fn append_instrument_lifecycle_rows(
+    questdb_config: &QuestDbConfig,
+    rows: &[InstrumentLifecycleRow<'_>],
+) -> anyhow::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
+        .build()?;
+    for chunk in rows.chunks(LIFECYCLE_INSERT_BATCH_SIZE) {
+        let sql = build_lifecycle_multi_insert_sql(chunk);
+        let resp = client
+            .get(&base_url)
+            .query(&[("query", sql.as_str())])
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body: String = resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(200)
+                .collect();
+            anyhow::bail!("instrument_lifecycle batch insert non-2xx ({status}): {body}");
+        }
+    }
+    Ok(())
+}
+
 // ============================================================================
 // instrument_lifecycle_audit persistence (DDL + Row + ensure + append)
 // ============================================================================
@@ -689,6 +750,60 @@ pub async fn append_instrument_lifecycle_audit_row(
             .take(200)
             .collect();
         anyhow::bail!("instrument_lifecycle_audit insert non-2xx ({status}): {body}");
+    }
+    Ok(())
+}
+
+/// Build ONE multi-row `INSERT … VALUES (t1),…,(tN);` for a chunk of audit
+/// rows. PURE (no I/O) — extracted for deterministic testing.
+#[must_use]
+pub fn build_lifecycle_audit_multi_insert_sql(rows: &[InstrumentLifecycleAuditRow<'_>]) -> String {
+    let tuples: Vec<String> = rows.iter().map(format_lifecycle_audit_row_tuple).collect();
+    format!(
+        "INSERT INTO {QUESTDB_TABLE_INSTRUMENT_LIFECYCLE_AUDIT} \
+         ({LIFECYCLE_AUDIT_INSERT_COLUMN_LIST}) VALUES {};",
+        tuples.join(",")
+    )
+}
+
+/// Batched append of many `instrument_lifecycle_audit` rows. ONE reused
+/// client; chunked into [`LIFECYCLE_INSERT_BATCH_SIZE`] multi-row INSERTs.
+/// Append-only forensic chain — written BEFORE the lifecycle batch so the
+/// §24 audit-first invariant holds at batch granularity.
+/// (Pure builder `build_lifecycle_audit_multi_insert_sql` carries unit coverage.)
+// TEST-EXEMPT: requires running QuestDB; tested via boot integration in CI.
+pub async fn append_instrument_lifecycle_audit_rows(
+    questdb_config: &QuestDbConfig,
+    rows: &[InstrumentLifecycleAuditRow<'_>],
+) -> anyhow::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
+        .build()?;
+    for chunk in rows.chunks(LIFECYCLE_INSERT_BATCH_SIZE) {
+        let sql = build_lifecycle_audit_multi_insert_sql(chunk);
+        let resp = client
+            .get(&base_url)
+            .query(&[("query", sql.as_str())])
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body: String = resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(200)
+                .collect();
+            anyhow::bail!("instrument_lifecycle_audit batch insert non-2xx ({status}): {body}");
+        }
     }
     Ok(())
 }
@@ -1352,6 +1467,38 @@ mod tests {
     #[test]
     fn test_ensure_instrument_lifecycle_audit_table_pub_fn_visible() {
         let _ = ensure_instrument_lifecycle_audit_table;
+    }
+
+    #[test]
+    fn test_build_lifecycle_multi_insert_sql_batches_rows() {
+        let rows = [sample_index_row(), sample_index_row(), sample_index_row()];
+        let sql = build_lifecycle_multi_insert_sql(&rows);
+        assert!(
+            sql.starts_with(&format!(
+                "INSERT INTO {QUESTDB_TABLE_INSTRUMENT_LIFECYCLE} ("
+            )),
+            "must target the lifecycle table with the column list"
+        );
+        // 3 tuples → 2 `),(` separators → ONE multi-row INSERT (not 3 requests).
+        assert_eq!(sql.matches("),(").count(), 2, "3 rows → one batched INSERT");
+        assert!(sql.ends_with(");"));
+    }
+
+    #[test]
+    fn test_build_lifecycle_audit_multi_insert_sql_batches_rows() {
+        let rows = [sample_audit_row(), sample_audit_row()];
+        let sql = build_lifecycle_audit_multi_insert_sql(&rows);
+        assert!(sql.contains(QUESTDB_TABLE_INSTRUMENT_LIFECYCLE_AUDIT));
+        assert_eq!(sql.matches("),(").count(), 1, "2 rows → one batched INSERT");
+        assert!(sql.ends_with(");"));
+    }
+
+    #[test]
+    fn test_build_multi_insert_sql_empty_is_degenerate_but_safe() {
+        // Empty slice → "VALUES ;" — never actually sent (the async fn early-
+        // returns on empty), but the builder must not panic.
+        let sql = build_lifecycle_multi_insert_sql(&[]);
+        assert!(sql.contains("VALUES ;"));
     }
 
     #[tokio::test]

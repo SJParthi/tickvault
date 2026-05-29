@@ -276,3 +276,39 @@ fn extract_today_instruments_chains_fno_contracts() {
         "extract_today_instruments must chain universe.fno_contracts into the lifecycle set"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PERF ratchet (2026-05-29): the lifecycle reconcile MUST write in BATCHES,
+// not one HTTP round-trip per row. The per-row path built a fresh client +
+// one round-trip per row → ~219K rows = ~438K round-trips = boot took
+// minutes→hours. A regression to the per-row append fns fails the build here.
+// ---------------------------------------------------------------------------
+#[test]
+fn apply_reconcile_uses_batched_writes_not_per_row() {
+    let body = src("crates/app/src/apply_reconcile_plan.rs");
+    assert!(
+        body.contains("append_instrument_lifecycle_rows(")
+            && body.contains("append_instrument_lifecycle_audit_rows("),
+        "apply_reconcile_plan must use the BATCHED append fns (one client, multi-row INSERT)"
+    );
+    assert!(
+        !body.contains("append_instrument_lifecycle_row(")
+            && !body.contains("append_instrument_lifecycle_audit_row("),
+        "apply_reconcile_plan must NOT use the per-row append fns — perf regression \
+         (219K rows = 219K HTTP round-trips). Use the batched *_rows fns."
+    );
+}
+
+#[test]
+fn lifecycle_persistence_exposes_batched_insert_path() {
+    let body = src("crates/storage/src/instrument_lifecycle_persistence.rs");
+    assert!(
+        body.contains("pub async fn append_instrument_lifecycle_rows")
+            && body.contains("pub async fn append_instrument_lifecycle_audit_rows"),
+        "storage must expose batched insert fns"
+    );
+    assert!(
+        body.contains("LIFECYCLE_INSERT_BATCH_SIZE") && body.contains(".chunks("),
+        "batched inserts must chunk rows into multi-row INSERTs"
+    );
+}
