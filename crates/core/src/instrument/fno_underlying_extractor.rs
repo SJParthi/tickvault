@@ -61,6 +61,13 @@ const NSE_EQ_SEGMENT: &str = "NSE_EQ";
 /// `universe_builder` Pass-3 behaviour, which skipped BSE stock futures.
 const NSE_EXCH_ID: &str = "NSE";
 
+/// `EXCH_ID` value for the Bombay Stock Exchange. In scope for INDEX
+/// derivatives only (SENSEX, BANKEX, SENSEX50, FOCIT options/futures) per the
+/// operator 2026-05-29 "everything incl BANKEX" scope — NOT for BSE single-
+/// stock F&O (operator: "BSE only SENSEX [index]"), which the stock path
+/// still excludes via its `NSE`-only gate.
+const BSE_EXCH_ID: &str = "BSE";
+
 /// Maximum number of dangling-reference samples carried in the rejection
 /// error for operator triage. Bounded so a fully-dangling CSV can't
 /// allocate a multi-thousand-entry Vec into the error/log chain.
@@ -247,6 +254,19 @@ fn is_in_scope_stock_derivative(instrument: &str, exch_id: &str) -> bool {
     is_stock_derivative(instrument) && exch_id.eq_ignore_ascii_case(NSE_EXCH_ID)
 }
 
+/// An index derivative (FUTIDX/OPTIDX) is in scope when it trades on an
+/// EQUITY-index exchange — NSE or BSE. Index F&O cannot be matched by the
+/// IDX_I spot SecurityId because Dhan references the index via a separate
+/// derivatives-domain SID (NIFTY=26000, BANKNIFTY=26009, SENSEX=1, BANKEX=12,
+/// VERIFIED on the live 2026-05-28 Detailed CSV), so we gate by exchange
+/// instead. MCX commodity-index derivatives (MCXBULLDEX/MCXMETLDEX) are
+/// EXCLUDED here per the operator no-commodity lock — only NSE + BSE equity
+/// indices are in scope ("everything incl BANKEX", operator 2026-05-29).
+#[must_use]
+fn is_equity_index_exchange(exch_id: &str) -> bool {
+    exch_id.eq_ignore_ascii_case(NSE_EXCH_ID) || exch_id.eq_ignore_ascii_case(BSE_EXCH_ID)
+}
+
 /// Dhan ships placeholder TEST contracts in the instrument master whose
 /// `UNDERLYING_SECURITY_ID` is synthetic and never resolves to a real
 /// `NSE_EQ` row. Skip them (mirrors the deleted `universe_builder` Pass-3
@@ -306,20 +326,30 @@ fn is_index_derivative(instrument: &str) -> bool {
 pub fn collect_applicable_fno_contracts(
     rows: &[CsvRow],
     fno: &FnoUnderlyingExtraction,
-    index_sids: &HashSet<String>,
 ) -> Vec<CsvRow> {
     let mut contracts: Vec<CsvRow> = Vec::new();
     for row in rows {
         if is_test_instrument(&row.symbol_name, &row.underlying_symbol) {
             continue;
         }
-        let Some(canonical) = canonical_security_id(&row.underlying_security_id) else {
-            continue;
-        };
         let applicable = if is_in_scope_stock_derivative(&row.instrument, &row.exch_id) {
-            fno.unique_underlying_ids.contains(&canonical)
+            // Stock F&O: underlying MUST resolve to a tracked NSE_EQ spot.
+            // Dhan links stock options to the cash-equity SecurityId, e.g.
+            // HDFCBANK option → underlying 1333 = HDFCBANK NSE_EQ spot. A
+            // non-numeric/empty underlying yields None → excluded.
+            canonical_security_id(&row.underlying_security_id)
+                .is_some_and(|canonical| fno.unique_underlying_ids.contains(&canonical))
         } else if is_index_derivative(&row.instrument) {
-            index_sids.contains(&canonical)
+            // Index F&O: Dhan links these via a DERIVATIVES-domain underlying
+            // SID (NIFTY=26000, BANKNIFTY=26009, SENSEX=1, BANKEX=12) that is
+            // NOT the IDX_I spot SID (NIFTY=13, BANKNIFTY=25, SENSEX=51) —
+            // VERIFIED against the live 2026-05-28 Detailed CSV. Matching on
+            // the index spot id therefore dropped EVERY index option/future
+            // (the 2026-05-29 ~17K-row miss). Operator scope 2026-05-29
+            // ("everything incl BANKEX") = ALL NSE + BSE equity-index F&O, so
+            // we gate by EXCHANGE. MCX commodity-index derivatives
+            // (MCXBULLDEX/MCXMETLDEX) stay excluded per the no-commodity lock.
+            is_equity_index_exchange(&row.exch_id)
         } else {
             false
         };
@@ -772,48 +802,63 @@ mod tests {
     }
 
     #[test]
-    fn collect_applicable_fno_contracts_keeps_stock_and_index_excludes_rest() {
+    fn collect_applicable_fno_contracts_keeps_stock_and_nse_bse_index_excludes_rest() {
+        // 2026-05-29 fix: index F&O is matched by EXCHANGE (NSE/BSE), NOT by
+        // the IDX_I spot SID — Dhan links index options via a derivatives-
+        // domain underlying SID (NIFTY=26000, SENSEX=1) that never equals the
+        // spot SID (13/51). MCX commodity-index stays excluded.
         let fno = fno_with_underlying("2885"); // RELIANCE tracked underlying
-        let mut index_sids = HashSet::new();
-        index_sids.insert("13".to_string()); // NIFTY tracked index
 
         let rows = vec![
-            // ✅ applicable stock derivatives (underlying 2885 resolves)
+            // ✅ stock derivatives whose underlying 2885 resolves to NSE_EQ
             deriv_row("FUTSTK", "NSE", "2885", "RELIANCE26JUNFUT"),
             deriv_row("OPTSTK", "NSE", "2885", "RELIANCE26JUN2800CE"),
-            // ✅ applicable index derivatives (underlying 13 = NIFTY tracked)
-            deriv_row("FUTIDX", "NSE", "13", "NIFTY26JUNFUT"),
-            deriv_row("OPTIDX", "NSE", "13", "NIFTY26JUN24000CE"),
+            // ✅ NSE index F&O — derivatives-domain underlying SID 26000/26009
+            //    (NOT spot 13/25); matched purely by exch=NSE now.
+            deriv_row("FUTIDX", "NSE", "26000", "NIFTY26JUNFUT"),
+            deriv_row("OPTIDX", "NSE", "26000", "NIFTY26JUN24000CE"),
+            deriv_row("OPTIDX", "NSE", "26009", "BANKNIFTY26JUN50000CE"),
+            // ✅ BSE index F&O — SENSEX (underlying 1) + BANKEX (underlying 12)
+            deriv_row("OPTIDX", "BSE", "1", "SENSEX26JUN80000CE"),
+            deriv_row("OPTIDX", "BSE", "12", "BANKEX26JUN60000CE"),
             // ❌ stock derivative whose underlying is NOT tracked
             deriv_row("OPTSTK", "NSE", "99999", "UNTRACKED26JUN100CE"),
-            // ❌ index derivative whose underlying index is NOT tracked
-            deriv_row("OPTIDX", "NSE", "25", "BANKNIFTY26JUN50000CE"),
-            // ❌ currency F&O — excluded entirely
+            // ❌ MCX commodity-index F&O — excluded (no-commodity lock)
+            deriv_row("OPTIDX", "MCX", "568", "MCXBULLDEX26JUN100CE"),
+            // ❌ currency / commodity F&O — not stock/index derivatives
             deriv_row("OPTCUR", "NSE", "13", "USDINR26JUN90CE"),
-            // ❌ commodity F&O — excluded entirely
             deriv_row("FUTCOM", "MCX", "13", "GOLD26JUNFUT"),
             // ❌ TEST placeholder — excluded
             deriv_row("OPTSTK", "NSE", "2885", "TESTSTK26JUN100CE"),
         ];
 
-        let got = collect_applicable_fno_contracts(&rows, &fno, &index_sids);
-        assert_eq!(got.len(), 4, "exactly the 4 applicable contracts");
+        let got = collect_applicable_fno_contracts(&rows, &fno);
         let symbols: Vec<&str> = got.iter().map(|r| r.symbol_name.as_str()).collect();
+        assert_eq!(
+            got.len(),
+            7,
+            "2 stock + 3 NSE-index + 2 BSE-index; got {symbols:?}"
+        );
         assert!(symbols.contains(&"RELIANCE26JUNFUT"));
         assert!(symbols.contains(&"RELIANCE26JUN2800CE"));
         assert!(symbols.contains(&"NIFTY26JUNFUT"));
         assert!(symbols.contains(&"NIFTY26JUN24000CE"));
+        assert!(symbols.contains(&"BANKNIFTY26JUN50000CE"));
+        assert!(symbols.contains(&"SENSEX26JUN80000CE"));
+        assert!(symbols.contains(&"BANKEX26JUN60000CE"));
+        // MCX commodity-index must NOT leak in.
+        assert!(!symbols.contains(&"MCXBULLDEX26JUN100CE"));
     }
 
     #[test]
-    fn collect_applicable_fno_contracts_empty_when_nothing_tracked() {
+    fn collect_applicable_fno_contracts_excludes_untracked_stock_and_mcx_index() {
         let fno = fno_with_underlying("2885");
-        let index_sids = HashSet::new();
-        // Index derivative but no index tracked, stock derivative untracked.
         let rows = vec![
-            deriv_row("FUTIDX", "NSE", "13", "NIFTY26JUNFUT"),
+            // untracked stock underlying → excluded
             deriv_row("FUTSTK", "NSE", "77777", "OTHER26JUNFUT"),
+            // MCX commodity-index → excluded (only NSE/BSE equity-index in scope)
+            deriv_row("OPTIDX", "MCX", "568", "MCXBULLDEX26JUN100CE"),
         ];
-        assert!(collect_applicable_fno_contracts(&rows, &fno, &index_sids).is_empty());
+        assert!(collect_applicable_fno_contracts(&rows, &fno).is_empty());
     }
 }
