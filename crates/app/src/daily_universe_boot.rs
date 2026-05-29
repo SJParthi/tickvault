@@ -44,6 +44,7 @@
 
 use core::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -71,6 +72,10 @@ pub struct DailyUniverseBootOutcome {
     pub source_csv_sha256: String,
     /// The reconcile tally (the caller MUST inspect `reconcile.apply.errors`).
     pub reconcile: ReconcileRunOutcome,
+    /// Wall-clock of the whole instrument load (fetch→build→reconcile), ms.
+    /// Real-time proof of the O(1) warm path: a warm-skip boot is sub-second
+    /// regardless of universe size; a full rebuild is the batched seconds path.
+    pub elapsed_ms: u64,
 }
 
 /// Lowercase-hex SHA-256 of the CSV bytes — the `source_csv_sha256`
@@ -170,6 +175,12 @@ where
     Fetch: FnMut(u32) -> FetchFut,
     FetchFut: Future<Output = Result<Vec<u8>, CsvDownloadError>>,
 {
+    // Wall-clock the whole instrument load (fetch→build→reconcile). This is
+    // the real-time proof of the O(1) warm path: a warm-skip boot is
+    // sub-second regardless of universe size; a full rebuild is the batched
+    // seconds path. Surfaced via `elapsed_ms` + Telegram + Prometheus.
+    let boot_timer = Instant::now();
+
     // Capture provenance (sha + data-row count) of each fetched body. On
     // success the last capture is the body that built the universe.
     let captured: Arc<Mutex<Option<(String, i64)>>> = Arc::new(Mutex::new(None));
@@ -263,12 +274,14 @@ where
         dry_run,
         "daily-universe boot complete"
     );
+    let elapsed_ms = u64::try_from(boot_timer.elapsed().as_millis()).unwrap_or(u64::MAX);
     let outcome = DailyUniverseBootOutcome {
         attempts_used,
         universe_size,
         total_rows,
         source_csv_sha256,
         reconcile,
+        elapsed_ms,
     };
     Ok((outcome, universe))
 }
