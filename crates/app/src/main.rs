@@ -5564,6 +5564,10 @@ fn spawn_engine_b_aggregator(
                             // Engine-B runtime). Drives close_pct_from_prev_day.
                             refs.prev_day_close = state.prev_day_close;
                             stamp_seal_pct_fields(&mut state, refs);
+                            // G3 real-time proof: capture the % BEFORE `state`
+                            // is moved into the seal. A non-zero value proves
+                            // the percentage-change column is populating live.
+                            let close_pct_nonzero = state.close_pct_from_prev_day != 0.0;
                             let seal = BufferedSeal::new(
                                 tick.security_id,
                                 tick.exchange_segment_code,
@@ -5576,6 +5580,11 @@ fn spawn_engine_b_aggregator(
                             } else {
                                 metrics::counter!("tv_aggregator_seals_emitted_total").increment(1);
                                 heartbeat_writer.record_emit();
+                                if close_pct_nonzero {
+                                    metrics::counter!("tv_aggregator_close_pct_nonzero_total")
+                                        .increment(1);
+                                    heartbeat_writer.record_close_pct_nonzero();
+                                }
                             }
                         },
                     );
@@ -5626,6 +5635,7 @@ fn spawn_engine_b_aggregator(
                 seals_emitted = snap.seals_emitted,
                 seals_dropped = snap.seals_dropped,
                 late_ticks_discarded = snap.late_ticks_discarded,
+                close_pct_nonzero = snap.close_pct_nonzero,
                 interval_secs = AGGREGATOR_HEARTBEAT_INTERVAL_SECS,
                 "aggregator heartbeat (AGGREGATOR-HB-01)"
             );
@@ -5670,6 +5680,9 @@ fn spawn_engine_b_aggregator(
                 // seal site above) — operator decision 2026-05-28.
                 refs.prev_day_close = state.prev_day_close;
                 stamp_seal_pct_fields(&mut state, refs);
+                // G3 real-time proof (capture before move) — same contract as
+                // the per-tick seal site above.
+                let close_pct_nonzero = state.close_pct_from_prev_day != 0.0;
                 let seal = BufferedSeal::new(security_id, segment_code, tf, state);
                 if sender.try_send(seal).is_err() {
                     metrics::counter!("tv_seal_mpsc_dropped_total").increment(1);
@@ -5677,6 +5690,9 @@ fn spawn_engine_b_aggregator(
                 } else {
                     metrics::counter!("tv_aggregator_seals_emitted_total").increment(1);
                     sealed = sealed.saturating_add(1);
+                    if close_pct_nonzero {
+                        metrics::counter!("tv_aggregator_close_pct_nonzero_total").increment(1);
+                    }
                 }
             });
             tracing::info!(
