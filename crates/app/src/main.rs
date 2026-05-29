@@ -95,8 +95,61 @@ use tickvault_api::state::{SharedAppState, SharedHealthStatus, SystemHealthStatu
 // Main
 // ---------------------------------------------------------------------------
 
+/// Exit code returned by the `--check-trading-day` gate.
+///
+/// The holiday-gate shell script (`deploy/aws/holiday-gate.sh`) reads `$?` —
+/// NOT stdout (the app denies `print_stdout`/`print_stderr`). Contract:
+/// - `0`  = today (IST) is a trading day → let the app start.
+/// - `75` = today is a weekend / NSE holiday → gate self-stops the instance.
+///
+/// Pure so the contract is unit-testable without touching the clock/config.
+fn trading_day_gate_exit_code(is_trading_day: bool) -> i32 {
+    if is_trading_day { 0 } else { 75 }
+}
+
+/// `--check-trading-day` short-circuit: load config → build the calendar →
+/// evaluate IST today → exit with [`trading_day_gate_exit_code`].
+///
+/// FAIL-OPEN: any config/calendar load error exits `70`, which the gate script
+/// treats as "let the app start" — so the gate can NEVER stop the box on a real
+/// trading day because of a transient load failure. Single source of truth: the
+/// SAME `config/base.toml` NSE holiday list the app itself uses (no duplication).
+fn run_trading_day_gate() -> ! {
+    let config: ApplicationConfig = match Figment::new()
+        .merge(Toml::file(CONFIG_BASE_PATH))
+        .merge(Toml::file(CONFIG_LOCAL_PATH))
+        .extract()
+    {
+        Ok(c) => c,
+        // FAIL-OPEN on load error (exit 70 → gate lets the app start).
+        Err(_) => std::process::exit(70),
+    };
+    let calendar = match TradingCalendar::from_config(&config.trading) {
+        Ok(c) => c,
+        Err(_) => std::process::exit(70),
+    };
+    let today_ist = (chrono::Utc::now()
+        + chrono::TimeDelta::seconds(tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64))
+    .date_naive();
+    std::process::exit(trading_day_gate_exit_code(
+        calendar.is_trading_day(today_ist),
+    ));
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // -----------------------------------------------------------------------
+    // Step -1: Holiday-gate CLI short-circuit (cold path, no TLS / no runtime).
+    // -----------------------------------------------------------------------
+    // `tickvault --check-trading-day` is invoked by the boot-time holiday gate
+    // (deploy/aws/holiday-gate.sh via the tickvault-holiday-gate.service oneshot)
+    // BEFORE the app proper starts. It exits 0 (trading day) / 75 (holiday) /
+    // 70 (load error → fail-open). Must run before CryptoProvider install — the
+    // gate needs no TLS and exits immediately.
+    if std::env::args().any(|a| a == "--check-trading-day") {
+        run_trading_day_gate();
+    }
+
     // -----------------------------------------------------------------------
     // Step 0: Install rustls CryptoProvider (must happen before ANY TLS usage)
     // -----------------------------------------------------------------------
@@ -6156,6 +6209,20 @@ mod tests {
             .expect("measured boot must produce a message");
         assert!(msg.contains("6.2s"), "elapsed rendered: {msg}");
         assert!(msg.contains("full rebuild"), "cold-path phrasing: {msg}");
+    }
+
+    #[test]
+    fn test_trading_day_gate_exit_code_trading() {
+        // Trading day → 0 so the gate lets the app start.
+        assert_eq!(trading_day_gate_exit_code(true), 0);
+    }
+
+    #[test]
+    fn test_trading_day_gate_exit_code_non_trading() {
+        // Weekend/holiday → 75 so the gate self-stops the instance.
+        assert_eq!(trading_day_gate_exit_code(false), 75);
+        // 75 must be distinct from the fail-open load-error code 70.
+        assert_ne!(trading_day_gate_exit_code(false), 70);
     }
 
     #[test]

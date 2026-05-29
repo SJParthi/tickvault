@@ -186,6 +186,25 @@ resource "aws_iam_role_policy" "tv_instance" {
           "arn:aws:s3:::tv-${var.environment}-cold/*",
           "arn:aws:s3:::tv-${var.environment}-cold"
         ]
+      },
+      {
+        # NSE-holiday self-stop: the boot-time holiday gate
+        # (deploy/aws/holiday-gate.sh) stops THIS instance on a non-trading
+        # day so the Mon-Fri start cron never bills a full no-op day.
+        # Scoped by the Name tag (NOT the instance ARN) on purpose — the
+        # instance -> instance-profile -> role -> policy chain would create a
+        # dependency cycle if this referenced aws_instance.tv_app directly.
+        # The tag condition still limits the action to exactly the tv-app box.
+        Effect = "Allow"
+        Action = [
+          "ec2:StopInstances",
+        ]
+        Resource = "arn:aws:ec2:${var.aws_region}:*:instance/*"
+        Condition = {
+          StringEquals = {
+            "ec2:ResourceTag/Name" = "tv-${var.environment}-app"
+          }
+        }
       }
     ]
   })

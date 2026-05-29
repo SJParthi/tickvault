@@ -237,3 +237,77 @@ fn deploy_disk_used_alarm_exists() {
         "the disk alarm must query the CWAgent `disk_used_percent` metric."
     );
 }
+
+const HOLIDAY_GATE_SH: &str = "deploy/aws/holiday-gate.sh";
+const HOLIDAY_GATE_UNIT: &str = "deploy/systemd/tickvault-holiday-gate.service";
+const USER_DATA_TFTPL: &str = "deploy/aws/terraform/user-data.sh.tftpl";
+
+/// The NSE-holiday boot gate MUST stay wired end-to-end and FAIL-OPEN. Without
+/// it the Mon-Fri start cron bills a full ~8h no-op day on every NSE weekday
+/// holiday during the 3-month data pull. The fail-open default is the safety
+/// property: the gate may only stop the box on a definitive holiday verdict —
+/// never on a missing binary / config error / IMDS failure, or it could kill a
+/// real trading day.
+#[test]
+fn holiday_gate_is_wired_and_fail_open() {
+    // 1. The app exposes the exit-code gate the script reads.
+    let main = read("crates/app/src/main.rs");
+    assert!(
+        main.contains("fn trading_day_gate_exit_code")
+            && main.contains("--check-trading-day")
+            && main.contains("run_trading_day_gate"),
+        "main.rs must expose the --check-trading-day gate (exit 0=trading / 75=holiday)"
+    );
+
+    // 2. The shell gate: override marker, fail-open on missing binary, stops the
+    //    box ONLY on the definitive 75 verdict, IMDSv2 token-required.
+    let sh = read(HOLIDAY_GATE_SH);
+    assert!(
+        sh.contains("ALLOW_HOLIDAY_RUN"),
+        "gate must honour the /opt/tickvault/ALLOW_HOLIDAY_RUN override marker"
+    );
+    assert!(
+        sh.contains("ec2 stop-instances") && sh.contains("-ne 75"),
+        "gate must self-stop ONLY on the exit-75 verdict (fail-open on `-ne 75`)"
+    );
+    assert!(
+        sh.contains("X-aws-ec2-metadata-token"),
+        "gate must use IMDSv2 (token-required) to resolve the instance-id"
+    );
+    // Fail-open evidence: missing binary and non-75 codes exit 0.
+    assert!(
+        sh.contains("fail-open"),
+        "gate must document + implement the fail-open default (never stop on uncertainty)"
+    );
+
+    // 3. Dedicated oneshot unit ordered BEFORE the app (NOT an ExecStartPre on
+    //    tickvault.service — that would trip Restart=always into a stop loop).
+    let unit = read(HOLIDAY_GATE_UNIT);
+    assert!(
+        unit.contains("Type=oneshot") && unit.contains("Before=tickvault.service"),
+        "the gate must be a oneshot unit ordered Before=tickvault.service"
+    );
+    assert!(
+        unit.contains("SuccessExitStatus=0 1"),
+        "the holiday verdict (exit 1) must be a success status for the oneshot"
+    );
+
+    // 4. First-boot user-data installs + enables the gate unit.
+    let ud = read(USER_DATA_TFTPL);
+    assert!(
+        ud.contains("tickvault-holiday-gate.service")
+            && ud.contains("systemctl enable tickvault-holiday-gate.service"),
+        "user-data must install + enable tickvault-holiday-gate.service"
+    );
+
+    // 5. IAM: ec2:StopInstances scoped to the tv-app box by tag (no ARN cycle).
+    let tf = code_only(&read(MAIN_TF));
+    assert!(
+        tf.contains("ec2:StopInstances"),
+        "the instance role must grant ec2:StopInstances for the self-stop"
+    );
+    assert!(
+        tf.contains("ec2:ResourceTag/Name"),
+        "ec2:StopInstances must be tag-scoped to tv-<env>-app (avoids the role->instance cycle)"
+    );
+}

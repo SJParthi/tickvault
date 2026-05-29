@@ -1,0 +1,45 @@
+# =============================================================================
+# tickvault-holiday-gate — boot-time NSE-holiday self-stop gate
+# =============================================================================
+# Runs ONCE per boot, ORDERED BEFORE tickvault.service. Asks the app binary
+# `--check-trading-day` (single source of truth: config/base.toml NSE holiday
+# list) and self-stops the instance on a non-trading day so the EventBridge
+# Mon-Fri start cron never bills a full no-op day on an NSE weekday holiday.
+#
+# FAIL-OPEN: stops ONLY on a definitive holiday verdict; every uncertainty
+# (missing binary, config error, IMDS failure) lets the app start. A separate
+# oneshot unit (NOT an ExecStartPre on tickvault.service) so a holiday exit
+# does NOT trigger tickvault's Restart=always loop.
+#
+# Override: `touch /opt/tickvault/ALLOW_HOLIDAY_RUN` (see may31 runbook).
+#
+# Install (done by user-data.sh.tftpl first boot):
+#   sudo cp deploy/systemd/tickvault-holiday-gate.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable tickvault-holiday-gate
+# =============================================================================
+
+[Unit]
+Description=tickvault — NSE holiday boot gate (self-stop on non-trading days)
+Documentation=https://github.com/SJParthi/tickvault
+After=network-online.target
+Wants=network-online.target
+# Run the gate BEFORE the trading app so a holiday verdict stops the box
+# before the app does any work.
+Before=tickvault.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/opt/tickvault
+ExecStart=/opt/tickvault/repo/deploy/aws/holiday-gate.sh
+# A holiday verdict returns exit 1 (instance stop issued); that is an expected,
+# non-error outcome for this gate, so do not let it fail the boot transaction.
+SuccessExitStatus=0 1
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tickvault-holiday-gate
+
+[Install]
+WantedBy=multi-user.target
