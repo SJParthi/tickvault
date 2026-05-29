@@ -300,22 +300,31 @@ fn apply_reconcile_uses_batched_writes_not_per_row() {
 }
 
 #[test]
-fn lifecycle_persistence_exposes_batched_insert_path() {
+fn lifecycle_persistence_uses_ilp_not_exec_url() {
     let body = src("crates/storage/src/instrument_lifecycle_persistence.rs");
     assert!(
         body.contains("pub async fn append_instrument_lifecycle_rows")
             && body.contains("pub async fn append_instrument_lifecycle_audit_rows"),
-        "storage must expose batched insert fns"
+        "storage must expose the bulk lifecycle/audit append fns"
     );
-    // The inserts MUST be SIZE-bounded (byte cap), not just fixed-row chunks —
-    // a 5000-row chunk of the ~219K F&O master produced a multi-MB URL that
-    // QuestDB rejected ("79190 write error(s)" boot halt, 2026-05-29). Both the
-    // row cap and the byte cap must be enforced via the shared splitter.
+    // The bulk writers MUST ingest via QuestDB ILP (port 9009) — the real
+    // ingestion pipe, like ticks/candles — NOT the /exec SQL/URL door. The
+    // /exec URL query string is capped by QuestDB's request buffer and
+    // overflowed at the ~79K-row F&O master (the "79190 write error(s)" /
+    // "connection closed" boot halts, 2026-05-29). ILP has no URL limit.
     assert!(
-        body.contains("LIFECYCLE_INSERT_BATCH_SIZE")
-            && body.contains("LIFECYCLE_INSERT_MAX_SQL_BYTES")
-            && body.contains("build_size_bounded_inserts"),
-        "batched inserts must be bounded by BOTH row count and serialized byte size"
+        body.contains("build_ilp_conf_string")
+            && body.contains("Sender::from_conf")
+            && body.contains("build_lifecycle_ilp_row")
+            && body.contains("build_lifecycle_audit_ilp_row"),
+        "bulk lifecycle/audit writes must go through ILP (Sender/Buffer), not /exec URL"
+    );
+    // Regression: the old size-bounded /exec SQL path MUST be gone — its
+    // presence means someone reverted ILP back to the URL door.
+    assert!(
+        !body.contains("build_size_bounded_inserts")
+            && !body.contains("LIFECYCLE_INSERT_MAX_SQL_BYTES"),
+        "the /exec URL batch path must stay deleted — bulk writes are ILP-only"
     );
 }
 
