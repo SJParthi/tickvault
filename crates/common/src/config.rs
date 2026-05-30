@@ -18,7 +18,7 @@ pub struct ApplicationConfig {
     pub websocket: WebSocketConfig,
     pub questdb: QuestDbConfig,
     // `valkey: ValkeyConfig` field DELETED in #O4 (2026-05-24).
-    pub prometheus: PrometheusConfig,
+    // `prometheus: PrometheusConfig` field DELETED in #O5 (2026-05-30) — Prometheus container removed in #O3; the /metrics exporter (observability.rs, port 9091) is independent and stays for CloudWatch.
     pub network: NetworkConfig,
     pub token: TokenConfig,
     pub risk: RiskConfig,
@@ -664,14 +664,7 @@ const fn default_retention_days() -> u32 {
 // #O4 (2026-05-24). Valkey removed from the runtime; the dual-instance
 // lock moved to AWS SSM Parameter Store in PR #764.
 
-/// Prometheus metrics endpoint configuration.
-#[derive(Debug, Deserialize)]
-pub struct PrometheusConfig {
-    /// Prometheus Docker hostname.
-    pub host: String,
-    /// Prometheus port.
-    pub port: u16,
-}
+// `PrometheusConfig` struct DELETED in #O5 (2026-05-30) — Prometheus container removed in #O3.
 
 /// Network timeout and retry configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -1642,10 +1635,7 @@ mod tests {
                 pg_port: 8812,
                 ilp_port: 9009,
             },
-            prometheus: PrometheusConfig {
-                host: "tv-prometheus".to_string(),
-                port: 9090,
-            },
+            // `prometheus: PrometheusConfig` DELETED in #O5 (2026-05-30).
             network: NetworkConfig {
                 request_timeout_ms: 5000,
                 websocket_connect_timeout_ms: 10000,

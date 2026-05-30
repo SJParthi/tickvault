@@ -50,9 +50,10 @@ fn bootstrap_writes_all_endpoint_vars() {
     let src = read("scripts/claude-session-bootstrap.sh");
     // Grafana (#O1) was retired with the CloudWatch-only migration;
     // its TICKVAULT_GRAFANA_URL export was dropped in the same PR.
+    // TICKVAULT_ALERTMANAGER_URL dropped in #O5 (2026-05-30) — Alertmanager
+    // container removed in #O2.
     for var in [
         "TICKVAULT_PROMETHEUS_URL",
-        "TICKVAULT_ALERTMANAGER_URL",
         "TICKVAULT_QUESTDB_URL",
         "TICKVAULT_API_URL",
     ] {
@@ -66,10 +67,11 @@ fn bootstrap_writes_all_endpoint_vars() {
 #[test]
 fn bootstrap_writes_all_probe_status_vars() {
     let src = read("scripts/claude-session-bootstrap.sh");
-    // GRAF_STATUS was retired with #O1; the script now writes 4 status vars.
+    // GRAF_STATUS was retired with #O1; TICKVAULT_ALERT_STATUS was dropped
+    // in #O5 (2026-05-30, Alertmanager container removed in #O2); the script
+    // now writes 3 status vars.
     for var in [
         "TICKVAULT_PROM_STATUS",
-        "TICKVAULT_ALERT_STATUS",
         "TICKVAULT_QDB_STATUS",
         "TICKVAULT_API_STATUS",
     ] {
