@@ -308,6 +308,30 @@ fn test_aws_control_workflow_covers_all_operations() {
 }
 
 #[test]
+fn test_terraform_apply_replans_so_archive_file_zips_exist() {
+    // Regression 2026-05-30 (terraform-apply #40/#43/#46): apply ran on a
+    // SEPARATE runner from plan and only downloaded `tfplan`, so the Lambda
+    // `data "archive_file"` .zip files built during plan were missing ->
+    // `reading ZIP file (./.budget-killswitch.zip): no such file or directory`.
+    // The fix re-plans on the apply runner (`apply -auto-approve` WITHOUT the
+    // saved tfplan) so archive_file rebuilds the zips locally. Guard pins that
+    // the apply step no longer applies the saved plan file.
+    let content =
+        std::fs::read_to_string(workspace_root().join(".github/workflows/terraform-apply.yml"))
+            .expect("terraform-apply.yml must be readable"); // APPROVED: test
+    assert!(
+        !content.contains("apply -auto-approve -no-color tfplan"),
+        "terraform-apply.yml must NOT apply the saved tfplan — the apply runner \
+         lacks the archive_file .zip outputs built on the plan runner. Re-plan \
+         on the apply runner instead."
+    );
+    assert!(
+        content.contains("apply -auto-approve -no-color"),
+        "terraform-apply.yml must still run terraform apply -auto-approve"
+    );
+}
+
+#[test]
 fn test_terraform_instance_role_has_ssm_managed_core() {
     // Regression 2026-05-30 (deploy-aws run #98): `aws ssm send-command` failed
     // with `InvalidInstanceId: Instances not in a valid state for account`. The

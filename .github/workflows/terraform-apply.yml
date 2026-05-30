@@ -268,8 +268,18 @@ jobs:
             -backend-config="dynamodb_table=tv-terraform-locks" \
             -backend-config="encrypt=true"
 
-      - name: terraform apply tfplan
-        run: terraform -chdir=${{ env.TF_DIR }} apply -auto-approve -no-color tfplan
+      - name: terraform apply
+        # Re-plan + apply on THIS runner instead of applying the saved tfplan.
+        # WHY: the Lambda resources use `data "archive_file"` which builds the
+        # .zip on whichever runner evaluates it. The plan job built the zips on
+        # the PLAN runner and uploaded only `tfplan` (not the zips), so
+        # `apply tfplan` on this separate runner failed with
+        # `reading ZIP file (./.budget-killswitch.zip): no such file or
+        # directory` (terraform-apply #40/#43/#46). Re-evaluating here rebuilds
+        # the zips locally. archive_file is deterministic, and apply only runs
+        # after the plan job already passed + the market-hours guard, so a
+        # same-commit re-plan is safe and idempotent.
+        run: terraform -chdir=${{ env.TF_DIR }} apply -auto-approve -no-color
 
       - name: Capture outputs
         id: outputs
