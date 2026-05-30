@@ -45,13 +45,30 @@ fn validate_environment(env: &str) -> Result<String, ApplicationError> {
     Ok(env.to_string())
 }
 
-/// Returns the SSM environment from the `ENVIRONMENT` env var,
-/// falling back to `DEFAULT_SSM_ENVIRONMENT` ("dev").
+/// Returns the SSM environment from the `TV_ENVIRONMENT` env var (preferred,
+/// set by the systemd unit on AWS), falling back to the legacy `ENVIRONMENT`
+/// var, then to `DEFAULT_SSM_ENVIRONMENT` ("dev").
+///
+/// Precedence (first non-empty wins): `TV_ENVIRONMENT` → `ENVIRONMENT` → `"dev"`.
+/// Unifying on `TV_ENVIRONMENT` keeps the SSM secret prefix
+/// (`/tickvault/<env>/...`) consistent with the config-file env selection in
+/// `boot_helpers::resolve_config_env` — both read the same variable, so the
+/// deployed box's `TV_ENVIRONMENT=staging` drives BOTH the config merge and
+/// the SSM prefix. The legacy `ENVIRONMENT` fallback preserves existing local
+/// dev behaviour.
 ///
 /// Validates that the environment string contains only alphanumeric
 /// characters and hyphens to prevent path traversal.
 pub fn resolve_environment() -> Result<String, ApplicationError> {
-    let env = std::env::var("ENVIRONMENT").unwrap_or_else(|_| DEFAULT_SSM_ENVIRONMENT.to_string());
+    let env = std::env::var("TV_ENVIRONMENT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("ENVIRONMENT")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or_else(|| DEFAULT_SSM_ENVIRONMENT.to_string());
     validate_environment(&env)
 }
 
