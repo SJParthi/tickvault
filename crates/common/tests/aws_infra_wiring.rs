@@ -251,6 +251,40 @@ fn test_terraform_eventbridge_schedules_match_budget() {
 }
 
 #[test]
+fn test_aws_control_workflow_covers_all_operations() {
+    // Full automation: a single dispatchable workflow operates the whole AWS
+    // deployment (start/stop/reboot/status/restart-app/restart-questdb/
+    // seed-secrets/deploy) from anywhere — GitHub web/mobile or a Claude session
+    // — with zero terminal commands. Must exist, expose every action, guard
+    // market hours on session-interrupting actions, and never echo a secret.
+    let wf = std::fs::read_to_string(workspace_root().join(".github/workflows/aws-control.yml"))
+        .expect("aws-control.yml must be readable"); // APPROVED: test
+    for action in &[
+        "status",
+        "start",
+        "stop",
+        "reboot",
+        "restart-app",
+        "restart-questdb",
+        "seed-secrets",
+        "deploy",
+    ] {
+        assert!(
+            wf.contains(&format!("action == '{action}'")),
+            "aws-control.yml must implement the '{action}' action"
+        );
+    }
+    assert!(
+        wf.contains("Market-hours guard"),
+        "aws-control.yml must guard session-interrupting actions against market hours"
+    );
+    assert!(
+        !wf.contains("echo \"$value\"") && !wf.contains("echo $value"),
+        "aws-control.yml must NEVER echo a decrypted secret value"
+    );
+}
+
+#[test]
 fn test_terraform_s3_lifecycle_matches_sebi_retention() {
     let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
         .expect("main.tf must be readable"); // APPROVED: test
