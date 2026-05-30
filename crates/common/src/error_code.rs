@@ -361,7 +361,7 @@ pub enum ErrorCode {
     /// within a minute window indicates wall-clock instability;
     /// escalate to BOOT-03 territory.
     Boundary01CatchupSeal,
-    /// RESILIENCE-01: another `tickvault` process holds the Valkey
+    /// RESILIENCE-01: another `tickvault` process holds the SSM
     /// dual-instance lock for this client-id. Two processes running
     /// against the same Dhan account fight over static-IP enforcement
     /// and fragment the WebSocket connection budget. Boot HALTS until

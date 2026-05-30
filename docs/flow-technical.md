@@ -14,7 +14,7 @@
   common     → Shared types, config, enums, constants. No business logic.
   core       → Runtime engine: auth, instruments, WebSocket, parser, pipeline.
   trading    → OMS, risk engine, strategies, indicators.
-  storage    → QuestDB + Valkey persistence.
+  storage    → QuestDB persistence.
   api        → Axum HTTP server with REST endpoints.
 
 Dependency rule: app → {api, trading, core, storage} → common
@@ -248,7 +248,11 @@ f32→f64 precision: Custom converter prevents IEEE 754 widening artifacts
   21004.95_f32 → "21004.95" (string round-trip) → 21004.95_f64
 ```
 
-### Valkey (Redis-Compatible Cache)
+### Valkey (Redis-Compatible Cache) — REMOVED (#O4, 2026-05-24)
+
+> Historical section. Valkey was removed from the runtime in #O4; the
+> token cache is now file-based and the dual-instance lock uses AWS SSM.
+> The description below is retained as history only.
 
 ```
 deadpool-redis async pool

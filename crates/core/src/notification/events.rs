@@ -809,7 +809,7 @@ pub enum NotificationEvent {
         max_attempts: u32,
     },
 
-    /// Phase 0 Item 19 — another `tickvault` process holds the Valkey
+    /// Phase 0 Item 19 — another `tickvault` process holds the SSM
     /// dual-instance lock for this client-id at boot time. Two processes
     /// running against the same Dhan account fight over static-IP
     /// enforcement and fragment the WebSocket connection budget — boot
@@ -819,15 +819,15 @@ pub enum NotificationEvent {
     DualInstanceDetected {
         /// Best-effort holder identity (e.g.,
         /// `i-0123abc:42:deadbeefcafef00d` or `local:42:...`). Empty
-        /// string is a valid value: the Valkey GET fallback may race
-        /// with the other instance's release between our SET-NX-EX and
-        /// the diagnostic read. The boot-halt decision is correct
-        /// regardless; operator uses `make doctor` / direct Valkey to
-        /// identify the winner in that case.
+        /// string is a valid value: the SSM lock read may race
+        /// with the other instance's release between our compare-and-set
+        /// and the diagnostic read. The boot-halt decision is correct
+        /// regardless; operator uses `make doctor` to inspect the SSM
+        /// lock and identify the winner in that case.
         holder: String,
         /// The env-qualified lock key (e.g. `tickvault:instance:lock:prod`).
-        /// Surfaced so the operator can run `valkey-cli GET <key>` to
-        /// triage without needing to know the key construction rule.
+        /// Surfaced so the operator can run `make doctor` to inspect the
+        /// SSM lock without needing to know the key construction rule.
         lock_key: String,
     },
 
@@ -4453,7 +4453,7 @@ mod tests {
 
     #[test]
     fn test_dual_instance_detected_empty_holder_uses_fallback_text() {
-        // The Valkey GET fallback can return an empty holder (race
+        // The SSM lock read can return an empty holder (race
         // between SET-NX-EX and the diagnostic GET). The Telegram
         // payload must still be operator-readable in that case —
         // pin the fallback phrasing.

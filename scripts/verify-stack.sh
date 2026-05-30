@@ -80,7 +80,8 @@ echo -e "${CYAN}[1/5]${NC} Container Status"
 check_container "tv-questdb"
 # Wave 7-A removed: tv-traefik / tv-loki / tv-alloy / tv-jaeger / tv-valkey-exporter.
 # CloudWatch-only migration removed: tv-grafana (#O1), tv-alertmanager (#O2),
-# tv-prometheus (#O3), tv-valkey (#O4). See .claude/rules/project/aws-budget.md.
+# tv-prometheus (#O3), tv-valkey (#O4 — fully removed; runtime is QuestDB + app
+# only). See .claude/rules/project/aws-budget.md.
 echo ""
 
 # --- HTTP Health Checks ------------------------------------------------------
@@ -96,7 +97,6 @@ echo ""
 
 # --- TCP Port Checks ---------------------------------------------------------
 echo -e "${CYAN}[3/5]${NC} TCP Port Checks"
-check_tcp "Valkey (6379)" "localhost" "6379"
 check_tcp "QuestDB PG (8812)" "localhost" "8812"
 check_tcp "QuestDB ILP (9009)" "localhost" "9009"
 check_tcp "OTLP gRPC (4317)" "localhost" "4317"

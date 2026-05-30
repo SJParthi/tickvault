@@ -1655,7 +1655,7 @@ mod tests {
     fn test_is_service_reachable_localhost_various_ports() {
         // Exercise is_service_reachable with various port numbers.
         // Most ports should be unreachable in test env.
-        let ports = [9000_u16, 9009, 8812, 6379, 3000, 16686, 3100, 9090, 8080];
+        let ports = [9000_u16, 9009, 8812, 3000, 16686, 3100, 9090, 8080];
         for port in ports {
             // We don't assert true/false — just exercise the code path.
             let _ = is_service_reachable("127.0.0.1", port);

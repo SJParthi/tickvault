@@ -100,7 +100,6 @@ skip = [
     { crate = "rand", reason = "failsafe uses rand 0.8.x via transitive deps" },
     { crate = "rand_chacha", reason = "follows rand version split" },
     { crate = "rand_core", reason = "follows rand version split" },
-    { crate = "redis", reason = "deadpool-redis may pull different redis version" },
     { crate = "untrusted", reason = "aws-lc-rs 1.16.3 pins untrusted 0.7.x while ring/aws-credential-types use 0.9.x" },
     # --- aws-lc dual-version while AWS SDK is on rustls 0.23.x + aws-lc-rs 1.16.3 ---
     # Dependabot bumps `aws-lc-sys 0.40 → 0.41` (PR #686) and

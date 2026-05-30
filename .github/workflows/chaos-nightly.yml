@@ -57,7 +57,6 @@ jobs:
       CARGO_TERM_COLOR: always
       # Point the test env vars at the Docker compose stack's published ports.
       TV_QUESTDB_HTTP_URL: http://127.0.0.1:9000
-      TV_VALKEY_URL: redis://127.0.0.1:6379
       TV_PROMETHEUS_URL: http://127.0.0.1:9090
       TV_METRICS_PORT: '9091'
       # Some chaos tests gate on this — off by default, on via workflow_dispatch.

@@ -1,7 +1,7 @@
 # Data Integrity — Zero Data Loss
 
 > Rules summary: `.claude/rules/data-integrity.md` (auto-loaded).
-> This doc is for deep implementation detail only — QuestDB patterns, Valkey idempotency, reconciliation.
+> This doc is for deep implementation detail only — QuestDB patterns, idempotency, reconciliation. (Valkey was removed from the runtime in #O4, 2026-05-24; the idempotency notes below are retained as historical context — current idempotency is in-memory + a file-based token cache.)
 
 ## Idempotency Rules
 Every write operation must be idempotent — running it twice produces the same result.
@@ -10,11 +10,11 @@ Every write operation must be idempotent — running it twice produces the same 
 
 **Instrument persistence:** Call persist_instrument_snapshot() AT MOST ONCE per calendar day (IST). Caller guards against double invocation. expiry_date is STRING (YYYY-MM-DD), NOT TIMESTAMP. Futures: option_type = '' (empty), strike_price = 0.0 (NOT NULL).
 
-**Valkey writes:** SET with explicit keys (naturally idempotent). Counters: atomic INCR, never GET+SET.
+**Valkey writes (historical — Valkey removed #O4, 2026-05-24):** SET with explicit keys (naturally idempotent). Counters: atomic INCR, never GET+SET.
 
 **OMS transitions:** statig state machine rejects invalid transitions at type level. Every transition logged. Append-only in QuestDB.
 
-**Order submission:** Generate idempotency key BEFORE sending. Store in Valkey BEFORE submission. On retry, check Valkey first. CRITICAL: duplicate orders = double financial exposure.
+**Order submission:** Generate idempotency key BEFORE sending. Store in the idempotency tracker BEFORE submission (was Valkey before #O4, 2026-05-24; now in-memory). On retry, check the tracker first. CRITICAL: duplicate orders = double financial exposure.
 
 ## Deduplication
 - **Ticks:** Deduplicate by (security_id, exchange_timestamp, sequence_number). QuestDB uses designated timestamp (ts) + security_id as UPSERT KEYS. Bounded ring buffer for O(1) lookup. Log duplicates at WARN.

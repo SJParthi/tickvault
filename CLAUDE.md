@@ -119,7 +119,6 @@ crates/
 | `instrument_persistence.rs` | Instrument master persistence |
 | `calendar_persistence.rs` | Trading calendar storage |
 | `materialized_views.rs` | QuestDB materialized view DDL |
-| `valkey_cache.rs` | Redis/Valkey caching layer |
 | `deep_depth_persistence.rs` | 20/200-level depth ILP writer to `deep_market_depth` table |
 | `movers_persistence.rs` | Stock + option movers ILP writer |
 | `indicator_snapshot_persistence.rs` | Indicator snapshot ILP writer |
@@ -342,7 +341,6 @@ make prometheus                      # localhost:9090
 | Service | Image Version | Port | Purpose |
 |---------|--------------|------|---------|
 | tv-questdb | 9.3.2 | 9000/8812/9009 | Time-series DB |
-| tv-valkey | 9.0.2-alpine | 6379 | Cache (Redis replacement) |
 | tv-prometheus | v3.9.1 | 9090 | Metrics |
 | tv-grafana | 12.3.3 | 3000 | Dashboards |
 | tv-jaeger | 2.15.0 | 16686 | Distributed tracing |
@@ -425,7 +423,7 @@ Tests in `crates/*/tests/gap_enforcement.rs` verify:
 
 ## CONFIGURATION
 
-`config/base.toml` — 17 sections: `trading` (incl. nse_holidays), `dhan`, `questdb`, `valkey`, `prometheus`, `websocket`, `network`, `token`, `risk`, `strategy` (**`dry_run = true` by default**), `logging`, `instrument`, `api` (port 3001), `subscription`, `notification`, `observability`, `historical`
+`config/base.toml` sections: `trading` (incl. nse_holidays), `dhan`, `questdb`, `prometheus`, `websocket`, `network`, `token`, `risk`, `strategy` (**`dry_run = true` by default**), `logging`, `instrument`, `api` (port 3001), `subscription`, `notification`, `observability`, `historical` (the `valkey` section was removed in #O4, 2026-05-24)
 
 `[subscription]` post-AWS-lifecycle (PR #7b): `scope = "indices_4_only"` is the only legal value. The 3 dead `subscribe_*_derivatives` / `subscribe_display_indices` flags have been deleted from `SubscriptionConfig`. `SubscriptionScope` is a single-variant enum — any future scope expansion requires a rule-file edit + new enum variant per `.claude/rules/project/websocket-connection-scope-lock.md`.
 

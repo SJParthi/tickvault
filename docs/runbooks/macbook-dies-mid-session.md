@@ -28,14 +28,14 @@ MacBook crashes or loses power during market hours with open F&O positions.
 ### Step 4: After restart
 1. System will reconnect automatically (WebSocket auto-reconnect).
 2. Run manual reconciliation: `cargo run --bin tickvault -- --reconcile-only`
-3. Verify Valkey, QuestDB, Dhan API all agree.
+3. Verify QuestDB, Dhan API all agree. (Valkey removed in #O4, 2026-05-24.)
 4. Check for missed tick gaps in QuestDB:
    ```sql
    SELECT min(ts), max(ts) FROM ticks WHERE ts > dateadd('h', -4, now())
    ```
 
 ## System Requirements Verified By Tests
-- System survives unexpected shutdown without data corruption (Valkey AOF, QuestDB WAL)
+- System survives unexpected shutdown without data corruption (QuestDB WAL; Valkey removed in #O4, 2026-05-24)
 - WebSocket auto-reconnects on restart
 - Reconciliation detects any state drift
 - Test: `safety_layer::reconciliation_safety::*`

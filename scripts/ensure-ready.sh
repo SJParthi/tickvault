@@ -158,7 +158,8 @@ ensure_pgpass() {
 # the runtime is QuestDB + the tickvault app + AWS CloudWatch. Grafana,
 # Prometheus and Alertmanager were removed (plan items #O1/#O2/#O3); Loki
 # and Alloy are profile-gated ('logs' profile) and not started by default.
-# Valkey stays until plan item #O4 removes it from the code.
+# Valkey was removed from the runtime in #O4 (2026-05-24) — QuestDB is the
+# only required container.
 # Keep this list in sync with `deploy/docker/docker-compose.yml` services
 # (excluding profile-gated ones).
 REQUIRED_CONTAINERS=(
@@ -257,7 +258,7 @@ if ! bash "${SCRIPT_DIR}/setup-observability.sh" --no-open; then
     echo -e "${RED}║                                                            ║${NC}"
     echo -e "${RED}║  Quick checks:                                             ║${NC}"
     echo -e "${RED}║  1. Docker running?  docker info                           ║${NC}"
-    echo -e "${RED}║  2. Port conflict?   lsof -i :9000 :8812 :6379             ║${NC}"
+    echo -e "${RED}║  2. Port conflict?   lsof -i :9000 :8812                   ║${NC}"
     echo -e "${RED}║  3. AWS creds?       aws sts get-caller-identity           ║${NC}"
     echo -e "${RED}║  4. Clean restart?   docker compose \\                      ║${NC}"
     echo -e "${RED}║       -f deploy/docker/docker-compose.yml down -v          ║${NC}"

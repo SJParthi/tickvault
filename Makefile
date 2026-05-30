@@ -180,7 +180,7 @@ health: ## Check app health endpoint
 	@echo "❤️  Health check:"
 	@curl -s http://localhost:$(APP_PORT)/health 2>/dev/null | python3 -m json.tool 2>/dev/null || echo "  ⚠️  App not running (http://localhost:$(APP_PORT)/health)"
 
-status: ## Full system status (Docker + App + QuestDB + Valkey)
+status: ## Full system status (Docker + App + QuestDB)
 	@echo ""
 	@echo "  ╔════════════════════════════════════════╗"
 	@echo "  ║   tickvault — System Status     ║"
@@ -201,11 +201,6 @@ status: ## Full system status (Docker + App + QuestDB + Valkey)
 	@curl -sf --max-time 2 http://localhost:9000/exec?query=SHOW+TABLES > /dev/null 2>&1 \
 		&& echo "     ✅ Console: http://localhost:9000" \
 		|| echo "     ⚠️  Not reachable on port 9000"
-	@echo ""
-	@echo "  💾 Valkey:"
-	@docker exec tv-valkey valkey-cli ping 2>/dev/null | grep -q PONG \
-		&& echo "     ✅ PONG — connected" \
-		|| echo "     ⚠️  Not reachable"
 	@echo ""
 	@echo "  📈 Monitoring URLs:"
 	@echo "     Grafana:    http://localhost:3000"

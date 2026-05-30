@@ -138,9 +138,22 @@ ratchets updated, one PR at a time per `pr-completion-protocol.md` §H.
   - Tests: `cargo build --workspace`; boot must still succeed with the
     token manager reading SSM directly.
 
-- [ ] **#O5 — guard / rule / script cleanup**
-  - Sweep `.claude/rules/` for stale Grafana / Prometheus / Valkey /
-    Alertmanager references; update or retire each rule file.
+- [ ] **#O5 — guard / rule / script cleanup** (Valkey slice DONE 2026-05-30; Prometheus/Alertmanager slice pending)
+  - **DONE (PR after #889):** removed all residual *Valkey* refs —
+    `Makefile` status target, `.github/workflows/chaos-nightly.yml`
+    `TV_VALKEY_URL`, `scripts/{verify-stack,smoke-test,ensure-ready,setup-observability}.sh`
+    Valkey TCP-waits + `:6379` port hints, `deny.toml` dead `redis`
+    skip, `crates/app/src/infra.rs` test port array, and the
+    `auto-fix-rotate-token-rollback.sh` header comment. Reworded the
+    kept SSM-lock doc-comments (`error_code.rs`, `events.rs`) from
+    Valkey→SSM.
+  - **PENDING (next PR):** the now-inert `PrometheusConfig` struct +
+    `[prometheus]` `config/base.toml` section (+ `config_round_trip.rs`);
+    `alertmanager_url` / `TICKVAULT_ALERTMANAGER_URL` in the
+    `tickvault-logs` MCP server + `claude_mcp_endpoints_config_guard.rs`
+    / `claude_session_bootstrap_guard.rs`; recompute `aws-budget.md`
+    memory tables for the 3-component runtime; sweep `.claude/rules/`
+    for stale Grafana/Prometheus/Alertmanager references.
   - Sweep the operational shell scripts in one consistent pass —
     `scripts/doctor.sh`, `scripts/verify-stack.sh`,
     `scripts/ensure-ready.sh`, `scripts/setup-observability.sh`,
@@ -166,11 +179,18 @@ ratchets updated, one PR at a time per `pr-completion-protocol.md` §H.
     `crates/common/tests/claude_session_bootstrap_guard.rs`,
     others as found.
 
-- [ ] **#O6 — docs sweep**
-  - Update every doc that describes Grafana / Prometheus / Valkey /
-    the frontend as live (`CLAUDE.md`, `docs/PROJECT-SCOPE.md`,
-    `docs/phases/*`, `docs/flow-*`, runbooks, `docs/architecture/*`).
-  - Retire `docs/phases/block-04-tradingview-terminal.md`.
+- [ ] **#O6 — docs sweep** (Valkey slice DONE 2026-05-30; Grafana/Prometheus slice pending)
+  - **DONE (PR after #889):** corrected every stale "live Valkey"
+    description across `CLAUDE.md`, `README.md`, `docs/PROJECT-SCOPE.md`,
+    `docs/flow-{technical,diagrams}.md`, `docs/phases/{phase-1-live-trading,phase-0-readme}.md`,
+    `docs/standards/{data-integrity,quality-gates,failure-scenarios}.md`,
+    `docs/runbooks/{backtest-runner,macbook-dies-mid-session}.md`,
+    `docs/operator/aws-readiness-audit-2026-05-03.md`,
+    `crates/app/src/bin/tv_doctor.rs`, `http/health-checks.http`.
+    Accurate-history lines annotated `(removed #O4 2026-05-24)`.
+  - **PENDING (next PR):** sweep the same docs for Grafana / Prometheus /
+    the frontend described as live; retire
+    `docs/phases/block-04-tradingview-terminal.md`.
 
 ## Scenarios
 
