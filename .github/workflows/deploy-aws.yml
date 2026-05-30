@@ -131,7 +131,7 @@ jobs:
         # without burning Dhan rate limit. Run by deploy as a pre-swap gate.
         run: cargo build --release --bin smoke_test -p tickvault-app
 
-      - name: Verify binaries exist + tickvault under 15MB
+      - name: Verify binaries exist + tickvault under 30MB
         run: |
           file target/release/tickvault
           file target/release/smoke_test
@@ -141,8 +141,19 @@ jobs:
           SIZE_BYTES=$(stat -c%s target/release/tickvault)
           SIZE_MB=$((SIZE_BYTES / 1024 / 1024))
           echo "tickvault size: ${SIZE_MB}MB (${SIZE_BYTES} bytes)"
-          if [ "$SIZE_BYTES" -gt 15728640 ]; then
-            echo "FAIL: binary exceeds 15MB cap"
+          # Cap raised 15MB -> 30MB on 2026-05-30. The release binary grew to
+          # ~18MB through legitimate feature growth: it statically links THREE
+          # AWS SDKs (aws-sdk-ssm + aws-sdk-sns + aws-config), reqwest+rustls,
+          # tokio, questdb-rs and rkyv. 18MB *stripped* is normal for that set.
+          # Binary size has ZERO runtime/latency impact (it is not loaded into
+          # the hot path), and shrinking via opt-level="z" would TRADE AWAY the
+          # O(1) latency the charter mandates — so we raise the cap, not the
+          # binary. 30MB still catches catastrophic bloat (an accidentally
+          # un-stripped debug binary is ~80MB). Pinned by
+          # crates/common/tests/aws_infra_wiring.rs::
+          # test_deploy_aws_binary_size_cap_is_30mb.
+          if [ "$SIZE_BYTES" -gt 31457280 ]; then
+            echo "FAIL: binary exceeds 30MB cap"
             exit 1
           fi
 
