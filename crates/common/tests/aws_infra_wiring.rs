@@ -479,6 +479,31 @@ fn test_deploy_aws_after_close_workflow_fires_in_premarket_and_postmarket_only()
 }
 
 #[test]
+fn test_deploy_aws_binary_size_cap_is_30mb() {
+    // Regression 2026-05-30: deploy-aws #97 failed because the release binary
+    // grew to ~18MB (3 AWS SDKs + reqwest/rustls + tokio + questdb + rkyv,
+    // all statically linked) against a stale 15MB cap that lived ONLY in this
+    // workflow (CI never enforced it). Binary size has zero runtime/latency
+    // impact and shrinking via opt-level="z" would hurt the O(1) hot path, so
+    // the cap was raised to 30MB. This guard pins the new value so a future
+    // edit can't silently drop it back to a blocking number.
+    let content =
+        std::fs::read_to_string(workspace_root().join(".github/workflows/deploy-aws.yml"))
+            .expect("deploy-aws.yml must be readable"); // APPROVED: test
+    assert!(
+        content.contains("31457280"),
+        "deploy-aws.yml binary size cap must be 30MB (31457280 bytes) — the \
+         ~18MB release binary (3 AWS SDKs + reqwest/rustls/tokio/questdb/rkyv) \
+         exceeds the old 15MB cap; shrinking would hurt O(1) latency."
+    );
+    assert!(
+        !content.contains("15728640"),
+        "deploy-aws.yml must NOT retain the old 15MB cap (15728640) — it \
+         blocks every deploy of the legitimately-grown binary."
+    );
+}
+
+#[test]
 fn test_dep_freshness_workflow_cron_schedule() {
     let content = std::fs::read_to_string(
         workspace_root().join(".github/workflows/dep-freshness-nightly.yml"),
