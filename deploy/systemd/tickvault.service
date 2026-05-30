@@ -40,7 +40,14 @@ WatchdogSec=60
 
 # Environment
 Environment=RUST_LOG=info
-Environment=TV_ENVIRONMENT=prod
+# TV_ENVIRONMENT selects BOTH config/<env>.toml AND the /tickvault/<env>/ SSM
+# prefix (read by boot_helpers::resolve_config_env + secret_manager).
+# staging = sandbox/data-pull (dry_run=true, sandbox.dhan.co, no real orders) —
+# the locked config for the 3-month no-orders monitoring phase.
+# DO NOT change to "prod" until going live: production.toml sets dry_run=false +
+# real api.dhan.co + requires the registered static EIP (enable_eip=true). See
+# config/production.toml + config/staging.toml.
+Environment=TV_ENVIRONMENT=staging
 
 # Resource limits
 LimitNOFILE=65536

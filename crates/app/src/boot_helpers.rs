@@ -45,6 +45,57 @@ pub const OFF_HOURS_CONNECTION_STAGGER_MS: u64 = 1000;
 /// Local override config file path (git-ignored, optional).
 pub const CONFIG_LOCAL_PATH: &str = "config/local.toml";
 
+/// Resolves the deployment environment name for config-file selection.
+///
+/// Precedence (first non-empty wins): `TV_ENVIRONMENT` → `ENVIRONMENT` → `"dev"`.
+/// This is the SAME precedence used by
+/// `tickvault_core::auth::secret_manager::resolve_environment`, so the
+/// config-file env and the SSM secret prefix (`/tickvault/<env>/...`) always
+/// agree — the deployed box's `TV_ENVIRONMENT=staging` selects BOTH
+/// `config/staging.toml` AND `/tickvault/staging/...` secrets.
+pub fn resolve_config_env() -> String {
+    std::env::var("TV_ENVIRONMENT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("ENVIRONMENT")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or_else(|| "dev".to_string())
+}
+
+/// Returns the per-environment config override path (`config/<env>.toml`) to
+/// merge BETWEEN base and local, or `None` when no override applies.
+///
+/// `None` is returned for `dev` and `local` so existing local-dev behaviour
+/// (base + local only) is byte-identical — there is no `config/dev.toml`, and
+/// `config/local.toml` is already merged separately. For any other env
+/// (`staging`, `production`, `sandbox`) the matching `config/<env>.toml` is
+/// returned. The env name is sanitised to a strict `[a-z0-9-]` allowlist so a
+/// malicious env var can never traverse paths.
+pub fn config_env_path(env: &str) -> Option<String> {
+    let normalized = env.trim().to_ascii_lowercase();
+    // dev/local: no dedicated override file (base + local already cover it).
+    if normalized.is_empty() || normalized == "dev" || normalized == "local" {
+        return None;
+    }
+    // Strict allowlist — reject anything that could traverse the filesystem.
+    if !normalized
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return None;
+    }
+    // `prod` is an accepted alias for the canonical `production.toml`.
+    let file_stem = if normalized == "prod" {
+        "production"
+    } else {
+        normalized.as_str()
+    };
+    Some(format!("config/{file_stem}.toml"))
+}
+
 // ---------------------------------------------------------------------------
 // IST timestamp formatter for tracing-subscriber
 // ---------------------------------------------------------------------------
@@ -444,6 +495,91 @@ pub fn drain_replayed_order_updates_to_broadcast(
 mod tests {
     use super::*;
     use std::net::SocketAddr;
+
+    // -----------------------------------------------------------------------
+    // resolve_config_env — env-var precedence (TV_ENVIRONMENT > ENVIRONMENT > dev)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_config_env_defaults_to_dev_when_unset() {
+        // Process-global env vars are racy across parallel tests, so this test
+        // only asserts the DEFAULT branch under a serialized lock that clears
+        // both vars. The precedence ordering itself is pinned by the pure
+        // `config_env_path` tests below + the documented contract.
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: single-threaded section under ENV_LOCK; restored before unlock.
+        let saved_tv = std::env::var("TV_ENVIRONMENT").ok();
+        let saved_env = std::env::var("ENVIRONMENT").ok();
+        unsafe {
+            std::env::remove_var("TV_ENVIRONMENT");
+            std::env::remove_var("ENVIRONMENT");
+        }
+        assert_eq!(resolve_config_env(), "dev");
+        unsafe {
+            match saved_tv {
+                Some(v) => std::env::set_var("TV_ENVIRONMENT", v),
+                None => std::env::remove_var("TV_ENVIRONMENT"),
+            }
+            match saved_env {
+                Some(v) => std::env::set_var("ENVIRONMENT", v),
+                None => std::env::remove_var("ENVIRONMENT"),
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // config_env_path — per-environment override selection + path-traversal safety
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_env_path_dev_and_local_return_none() {
+        // dev/local must NOT add an override file — base + local already cover
+        // local development, so behaviour stays byte-identical.
+        assert_eq!(config_env_path("dev"), None);
+        assert_eq!(config_env_path("local"), None);
+        assert_eq!(config_env_path(""), None);
+        assert_eq!(config_env_path("  "), None);
+        assert_eq!(config_env_path("DEV"), None); // case-insensitive
+    }
+
+    #[test]
+    fn test_config_env_path_staging_maps_to_staging_toml() {
+        // The 3-month data-pull phase runs staging = sandbox/dry_run config.
+        assert_eq!(
+            config_env_path("staging"),
+            Some("config/staging.toml".to_string())
+        );
+    }
+
+    #[test]
+    fn test_config_env_path_prod_aliases_to_production_toml() {
+        // Both "prod" and "production" resolve to the canonical production.toml.
+        assert_eq!(
+            config_env_path("prod"),
+            Some("config/production.toml".to_string())
+        );
+        assert_eq!(
+            config_env_path("production"),
+            Some("config/production.toml".to_string())
+        );
+        assert_eq!(
+            config_env_path("PROD"),
+            Some("config/production.toml".to_string())
+        );
+    }
+
+    #[test]
+    fn test_config_env_path_rejects_path_traversal() {
+        // A hostile env var must never escape config/ — anything outside the
+        // strict [a-z0-9-] allowlist returns None (falls back to base+local).
+        assert_eq!(config_env_path("../secrets"), None);
+        assert_eq!(config_env_path("..%2fetc%2fpasswd"), None);
+        assert_eq!(config_env_path("prod/../../etc"), None);
+        assert_eq!(config_env_path("a b"), None);
+        assert_eq!(config_env_path("prod.toml"), None); // dot not allowed
+    }
 
     // -----------------------------------------------------------------------
     // build_app_log_filter_directive

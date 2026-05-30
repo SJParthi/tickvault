@@ -163,8 +163,17 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 1: Load and validate configuration
     // -----------------------------------------------------------------------
-    let config: ApplicationConfig = Figment::new()
-        .merge(Toml::file(CONFIG_BASE_PATH))
+    // Merge order (last-write-wins): base.toml → config/<env>.toml → local.toml.
+    // The per-environment override is selected by TV_ENVIRONMENT (preferred) /
+    // ENVIRONMENT, the SAME variable secret_manager uses for the SSM prefix, so
+    // config + secrets always agree. For dev/local there is no override file,
+    // so this is byte-identical to the previous base + local behaviour.
+    let config_env = tickvault_app::boot_helpers::resolve_config_env();
+    let mut config_figment = Figment::new().merge(Toml::file(CONFIG_BASE_PATH));
+    if let Some(env_path) = tickvault_app::boot_helpers::config_env_path(&config_env) {
+        config_figment = config_figment.merge(Toml::file(env_path));
+    }
+    let config: ApplicationConfig = config_figment
         .merge(Toml::file(CONFIG_LOCAL_PATH))
         .extract()
         .context("failed to load configuration from config/base.toml")?;
