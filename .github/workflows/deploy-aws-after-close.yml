@@ -1,0 +1,105 @@
+# =============================================================================
+# tickvault — auto-deploy in pre-market + post-market windows ONLY
+# =============================================================================
+# Operator lock 2026-05-30: "only pre-market AND post-market alone only our
+# new codes merged ones should be deployed". Code-merge-driven deploys NEVER
+# fire during 09:15-15:30 IST trading hours via the auto path. (Instance
+# start/stop/restart remain on-demand via the AWS Console — separate concern.)
+#
+# Two crons, both Mon–Fri:
+#   • 03:15 UTC = 08:45 IST → PRE-MARKET window. Instance auto-starts at
+#     08:30 IST; this fires 15 minutes later, well before 09:15 market open.
+#   • 10:01 UTC = 15:31 IST → POST-MARKET window. ~1 minute after NSE close.
+#
+# Idempotent: before dispatching, we compare main's current HEAD against the
+# `head_sha` of the most recent SUCCESSFUL deploy-aws run on main. If equal,
+# nothing to deploy — exit clean (no spurious restart on quiet days).
+#
+# Triggers:
+#   - schedule: 03:15 + 10:01 UTC Mon–Fri
+#   - workflow_dispatch: manual operator override (just-in-case button)
+#
+# Honest envelope:
+#   - Merge during 09:15-15:30 IST → blocked → auto-fires at 15:31 IST same day ✅
+#   - Merge over the weekend → auto-fires Monday 08:45 IST (pre-market) ✅
+#   - Merge before 08:45 IST on a weekday → auto-fires same day 08:45 IST ✅
+#   - NSE holiday: cron fires; deploy-aws's own market-hours guard is a no-op
+#     outside trading hours, so the deploy runs harmlessly on holiday windows.
+#   - No new commits → idempotent skip (no restart, no extra cost).
+# =============================================================================
+
+name: deploy-aws-after-close
+
+on:
+  schedule:
+    # 03:15 UTC = 08:45 IST (pre-market). 10:01 UTC = 15:31 IST (post-market).
+    # Mon–Fri only.
+    - cron: '15 3 * * 1-5'
+    - cron: '1 10 * * 1-5'
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-aws-after-close
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write   # required to dispatch deploy-aws.yml
+
+jobs:
+  retry-if-needed:
+    name: Re-fire deploy-aws if main has an undeployed commit
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout (for git rev-parse)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 1
+          ref: main
+
+      - name: Compare main HEAD vs last successful deploy
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          MAIN_SHA=$(git rev-parse HEAD)
+          echo "main HEAD = $MAIN_SHA"
+
+          # Pull the most recent SUCCESSFUL deploy-aws run on main.
+          # If there is none yet (fresh repo), we treat it as "deploy needed".
+          LAST_DEPLOYED=$(gh api \
+            "repos/${{ github.repository }}/actions/workflows/deploy-aws.yml/runs?branch=main&status=success&per_page=1" \
+            --jq '.workflow_runs[0].head_sha // ""')
+          echo "last successful deploy sha = ${LAST_DEPLOYED:-<none>}"
+
+          if [ -z "$LAST_DEPLOYED" ]; then
+            echo "No prior successful deploy on record — dispatching first deploy."
+            echo "dispatch=true" >> "$GITHUB_OUTPUT"
+          elif [ "$MAIN_SHA" != "$LAST_DEPLOYED" ]; then
+            echo "main has moved since last successful deploy — dispatching."
+            echo "dispatch=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "main is already deployed — nothing to do."
+            echo "dispatch=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Dispatch deploy-aws.yml on main
+        if: steps.check.outputs.dispatch == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run deploy-aws.yml --ref main
+          echo "::notice::deploy-aws dispatched on main — watch Actions tab"
+
+      - name: Summary
+        run: |
+          {
+            echo "## Auto-deploy after market close"
+            echo ""
+            if [ "${{ steps.check.outputs.dispatch }}" = "true" ]; then
+              echo "✅ Dispatched \`deploy-aws.yml\` on \`main\` — operator sees green/red on the deploy-aws run."
+            else
+              echo "ℹ️  \`main\` is already deployed — no action taken (idempotent)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -435,6 +435,50 @@ fn test_deploy_aws_workflow_uses_oidc() {
 }
 
 #[test]
+fn test_deploy_aws_after_close_workflow_fires_in_premarket_and_postmarket_only() {
+    // Operator lock 2026-05-30: "only pre-market AND post-market alone only
+    // our new codes merged ones should be deployed". Code-merge-driven
+    // deploys NEVER auto-fire during 09:15-15:30 IST trading hours.
+    //   - pre-market cron  = 03:15 UTC = 08:45 IST (after 08:30 instance boot)
+    //   - post-market cron = 10:01 UTC = 15:31 IST (after 15:30 NSE close)
+    let path = ".github/workflows/deploy-aws-after-close.yml";
+    require_file_exists(
+        path,
+        "auto-deploy in pre-market + post-market windows (operator lock 2026-05-30)",
+    );
+    let content = std::fs::read_to_string(workspace_root().join(path))
+        .expect("deploy-aws-after-close.yml must be readable"); // APPROVED: test
+
+    assert!(
+        content.contains("15 3 * * 1-5"),
+        "deploy-aws-after-close.yml must include pre-market cron \
+         03:15 UTC Mon-Fri (08:45 IST)"
+    );
+    assert!(
+        content.contains("1 10 * * 1-5"),
+        "deploy-aws-after-close.yml must include post-market cron \
+         10:01 UTC Mon-Fri (15:31 IST)"
+    );
+    // Must dispatch deploy-aws.yml — that's the whole point.
+    assert!(
+        content.contains("gh workflow run deploy-aws.yml"),
+        "deploy-aws-after-close.yml must dispatch deploy-aws.yml via gh CLI"
+    );
+    // Idempotency: must compare main HEAD against last successful deploy SHA
+    // so quiet days don't trigger a spurious 5s app restart.
+    assert!(
+        content.contains("head_sha"),
+        "deploy-aws-after-close.yml must compare against last successful \
+         deploy head_sha (idempotency — no spurious restart on quiet days)"
+    );
+    // Required permission to dispatch another workflow.
+    assert!(
+        content.contains("actions: write"),
+        "deploy-aws-after-close.yml must request actions:write to dispatch deploy-aws.yml"
+    );
+}
+
+#[test]
 fn test_dep_freshness_workflow_cron_schedule() {
     let content = std::fs::read_to_string(
         workspace_root().join(".github/workflows/dep-freshness-nightly.yml"),
