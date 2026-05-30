@@ -130,6 +130,36 @@ fn test_terraform_instance_type_pinned() {
 }
 
 #[test]
+fn test_seed_staging_ssm_workflow_is_automated_and_secret_safe() {
+    // Full automation: a GitHub Actions workflow copies /tickvault/dev/* ->
+    // /tickvault/staging/* using the AWS creds already in GitHub Secrets, so the
+    // operator never re-types or pastes a secret. It must: (1) exist, (2) be
+    // dispatchable, (3) use --overwrite (idempotent), (4) NEVER echo a secret
+    // value (only names), (5) target the staging prefix.
+    let wf =
+        std::fs::read_to_string(workspace_root().join(".github/workflows/seed-staging-ssm.yml"))
+            .expect("seed-staging-ssm.yml must be readable"); // APPROVED: test
+    assert!(
+        wf.contains("workflow_dispatch"),
+        "seed workflow must be manually dispatchable (one click in Actions)"
+    );
+    assert!(
+        wf.contains("/tickvault/${SOURCE_ENV}") && wf.contains("/tickvault/${TARGET_ENV}"),
+        "seed workflow must copy from the dev source path to the staging target path"
+    );
+    assert!(
+        wf.contains("--overwrite"),
+        "seed workflow must use --overwrite so re-running is idempotent"
+    );
+    // Secret-safety: the value is piped into put-parameter, NEVER echoed. Assert
+    // there is no `echo` of the value variable.
+    assert!(
+        !wf.contains("echo \"$value\"") && !wf.contains("echo $value"),
+        "seed workflow must NEVER echo a decrypted secret value to the log"
+    );
+}
+
+#[test]
 fn test_cloudwatch_operator_dashboard_exists() {
     // The CloudWatch-only runtime has NO Grafana — the operator dashboard is a
     // native CloudWatch dashboard (deploy/aws/terraform/dashboard.tf). It must
