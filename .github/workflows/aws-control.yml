@@ -1,0 +1,324 @@
+# =============================================================================
+# AWS control panel — start / stop / reboot / status / restart / deploy
+# =============================================================================
+# ONE workflow to operate the whole AWS deployment with ZERO terminal commands.
+# Trigger it from anywhere:
+#   - GitHub web/mobile: Actions -> "AWS Control" -> Run workflow -> pick action
+#   - Claude (chat/code/cowork/IntelliJ): the claude-mobile-command workflow can
+#     dispatch this, or Claude calls `gh workflow run aws-control.yml -f action=...`
+#
+# Every action runs in GitHub Actions using the AWS creds already in repo
+# Secrets — nothing typed on a laptop, nothing exposed. Each action is explicit
+# and idempotent. Destructive/market-hours-sensitive actions (stop, reboot,
+# restart-app) honour a market-hours guard unless `force=yes`.
+#
+# Actions:
+#   status          - print instance state + app/QuestDB health (read-only)
+#   start           - start the EC2 instance (idempotent)
+#   stop            - stop the EC2 instance (market-hours guarded)
+#   reboot          - reboot the EC2 instance (market-hours guarded)
+#   restart-app     - systemctl restart tickvault (via SSM; market-hours guarded)
+#   restart-questdb - restart the QuestDB docker container (via SSM)
+#   seed-secrets    - copy /tickvault/dev/* -> /tickvault/staging/* (idempotent)
+#   deploy          - dispatch the full deploy-aws build+ship+restart pipeline
+# =============================================================================
+
+name: AWS Control
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'What to do'
+        required: true
+        type: choice
+        options:
+          - status
+          - start
+          - stop
+          - reboot
+          - restart-app
+          - restart-questdb
+          - seed-secrets
+          - deploy
+      force:
+        description: 'Override the market-hours guard? (yes/no)'
+        required: false
+        default: 'no'
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+  actions: write   # needed to dispatch deploy-aws.yml for action=deploy
+
+concurrency:
+  group: aws-control
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-south-1
+
+jobs:
+  preflight:
+    name: Check creds present
+    runs-on: ubuntu-24.04
+    outputs:
+      ready: ${{ steps.c.outputs.ready }}
+    steps:
+      - id: c
+        env:
+          OIDC: ${{ secrets.AWS_ROLE_ARN }}
+          KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        run: |
+          if [ -n "$OIDC" ] || [ -n "$KEY" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::error::No AWS creds in repo Secrets (AWS_ROLE_ARN or AWS_ACCESS_KEY_ID)."
+          fi
+
+  control:
+    name: ${{ github.event.inputs.action }}
+    runs-on: ubuntu-24.04
+    needs: preflight
+    if: needs.preflight.outputs.ready == 'true'
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: tv-aws-control-${{ github.run_id }}
+
+      - name: Resolve instance id
+        id: iid
+        run: |
+          set -euo pipefail
+          IID="${{ secrets.EC2_INSTANCE_ID }}"
+          if [ -z "$IID" ]; then
+            # Fall back to the Name tag if the secret isn't set.
+            IID=$(aws ec2 describe-instances --region "$AWS_REGION" \
+                    --filters "Name=tag:Name,Values=tv-prod-app" \
+                              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+                    --query 'Reservations[0].Instances[0].InstanceId' --output text)
+          fi
+          [ -n "$IID" ] && [ "$IID" != "None" ] || { echo "::error::Could not resolve instance id"; exit 1; }
+          echo "id=$IID" >> "$GITHUB_OUTPUT"
+          echo "Instance: $IID"
+
+      - name: Market-hours guard (IST 09:15-15:30 Mon-Fri)
+        id: guard
+        run: |
+          set -euo pipefail
+          action="${{ github.event.inputs.action }}"
+          force="${{ github.event.inputs.force }}"
+          # Only stop/reboot/restart-app interrupt a live session.
+          case "$action" in
+            stop|reboot|restart-app) sensitive=1 ;;
+            *) sensitive=0 ;;
+          esac
+          if [ "$sensitive" = "1" ] && [ "$force" != "yes" ]; then
+            # IST = UTC+5:30. Market window UTC 03:45-10:00, Mon-Fri.
+            mins=$(( ( $(date -u +%H) * 60 + $(date -u +%M) ) ))
+            dow=$(date -u +%u)  # 1=Mon..7=Sun
+            if [ "$dow" -le 5 ] && [ "$mins" -ge 225 ] && [ "$mins" -le 600 ]; then
+              echo "::error::'$action' blocked during market hours (09:15-15:30 IST Mon-Fri). Re-run with force=yes if truly needed."
+              exit 1
+            fi
+          fi
+          echo "guard passed (action=$action force=$force)"
+
+      - name: status
+        if: github.event.inputs.action == 'status'
+        run: |
+          set -euo pipefail
+          IID=${{ steps.iid.outputs.id }}
+          S="$GITHUB_STEP_SUMMARY"
+          echo "# 📊 tickvault — full AWS status" >> "$S"
+          echo "" >> "$S"
+
+          # ---- 1. EC2 instance state ----
+          STATE=$(aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$IID" \
+            --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo "unknown")
+          TYPE=$(aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$IID" \
+            --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null || echo "?")
+          echo "## 🖥️  Instance" >> "$S"
+          echo "- State: **$STATE**  |  Type: **$TYPE**  |  Region: ap-south-1" >> "$S"
+          echo "" >> "$S"
+
+          if [ "$STATE" != "running" ]; then
+            echo "> ⚠️ The instance is **$STATE** — start it first (AWS Control → start) to see app/QuestDB/data." >> "$S"
+            echo "Instance is $STATE — nothing more to gather."
+            exit 0
+          fi
+
+          # ---- 2-6. On-box gather: app, QuestDB, row counts, logs, errors ----
+          # One SSM script collects everything; QuestDB queried over local HTTP /exec.
+          CMD=$(aws ssm send-command --region "$AWS_REGION" --instance-ids "$IID" \
+            --document-name AWS-RunShellScript \
+            --comment "tickvault full status" \
+            --parameters 'commands=[
+              "echo ===APP===",
+              "systemctl is-active tickvault 2>/dev/null || echo inactive",
+              "echo ===DOCKER===",
+              "docker ps --format \"{{.Names}} {{.Status}}\" 2>/dev/null || echo none",
+              "echo ===ROWS===",
+              "for t in ticks candles_1m option_chain_minute_snapshot instrument_lifecycle; do c=$(curl -s \"http://localhost:9000/exec?query=select%20count(*)%20from%20$t\" 2>/dev/null | grep -oE \"\\[\\[[0-9]+\" | grep -oE \"[0-9]+\" | head -1); echo \"$t=${c:-NA}\"; done",
+              "echo ===LOGS===",
+              "journalctl -u tickvault -n 12 --no-pager 2>/dev/null | tail -12 || echo no-logs",
+              "echo ===ERRORS===",
+              "tail -3 /opt/tickvault/data/logs/errors.summary.md 2>/dev/null || echo no-summary"
+            ]' \
+            --query Command.CommandId --output text 2>/dev/null || echo "")
+
+          if [ -z "$CMD" ]; then
+            echo "> ⚠️ Could not reach the box via SSM (agent may be starting). Try again in a minute." >> "$S"
+            exit 0
+          fi
+
+          # Wait for the command to finish (up to ~40s).
+          for i in $(seq 1 20); do
+            ST=$(aws ssm get-command-invocation --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" --query Status --output text 2>/dev/null || echo Pending)
+            case "$ST" in Success|Failed|Cancelled|TimedOut) break;; esac
+            sleep 2
+          done
+          OUT=$(aws ssm get-command-invocation --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" --query StandardOutputContent --output text 2>/dev/null || echo "")
+
+          # Parse sections.
+          app=$(echo "$OUT" | awk '/===APP===/{f=1;next}/===DOCKER===/{f=0}f' | tr -d '[:space:]')
+          docker=$(echo "$OUT" | awk '/===DOCKER===/{f=1;next}/===ROWS===/{f=0}f')
+          rows=$(echo "$OUT" | awk '/===ROWS===/{f=1;next}/===LOGS===/{f=0}f')
+          logs=$(echo "$OUT" | awk '/===LOGS===/{f=1;next}/===ERRORS===/{f=0}f')
+          errs=$(echo "$OUT" | awk '/===ERRORS===/{f=1;next}f')
+
+          # ---- App health ----
+          echo "## 🟢 App" >> "$S"
+          if [ "$app" = "active" ]; then
+            echo "- tickvault service: **active** ✅" >> "$S"
+          else
+            echo "- tickvault service: **$app** ⚠️ — if 'inactive', run AWS Control → deploy (ships + starts the app)." >> "$S"
+          fi
+          echo "" >> "$S"
+
+          # ---- QuestDB / Docker ----
+          echo "## 🗄️  QuestDB (Docker)" >> "$S"
+          if echo "$docker" | grep -qi quest; then
+            echo '```' >> "$S"; echo "$docker" | grep -i quest >> "$S"; echo '```' >> "$S"
+          else
+            echo "- QuestDB container not found ⚠️ (deploy starts it)." >> "$S"
+          fi
+          echo "" >> "$S"
+
+          # ---- Data row counts ----
+          echo "## 📈 Data captured (QuestDB row counts)" >> "$S"
+          echo '```' >> "$S"; echo "$rows" >> "$S"; echo '```' >> "$S"
+          echo "_ticks/candles climb during market hours; 0 off-market or pre-deploy is normal._" >> "$S"
+          echo "" >> "$S"
+
+          # ---- Recent logs ----
+          echo "## 📜 Recent app logs (last 12 lines)" >> "$S"
+          echo '```' >> "$S"; echo "$logs" >> "$S"; echo '```' >> "$S"
+          echo "" >> "$S"
+
+          # ---- Errors summary ----
+          echo "## 🚨 Errors" >> "$S"
+          echo '```' >> "$S"; echo "$errs" >> "$S"; echo '```' >> "$S"
+          echo "" >> "$S"
+
+          # ---- Plain-English verdict ----
+          echo "## ✅ Verdict" >> "$S"
+          if [ "$app" = "active" ] && echo "$docker" | grep -qi quest; then
+            echo "**Healthy** — instance running, app active, QuestDB up. Data flows during market hours; watch the row counts above." >> "$S"
+          elif [ "$app" != "active" ]; then
+            echo "**App not running yet** — the box + QuestDB are up, but the tickvault binary isn't active. **Next: AWS Control → deploy.**" >> "$S"
+          else
+            echo "**Partial** — see the sections above; re-run status after a minute." >> "$S"
+          fi
+          echo "" >> "$S"
+          echo "_Dashboards: CloudWatch → Dashboards → tv-prod-operator · Logs: CloudWatch → Log groups → /tickvault/prod/app_" >> "$S"
+
+          # Also echo to the run log for quick glance.
+          echo "$OUT"
+
+      - name: start
+        if: github.event.inputs.action == 'start'
+        run: |
+          IID=${{ steps.iid.outputs.id }}
+          aws ec2 start-instances --region "$AWS_REGION" --instance-ids "$IID" >/dev/null
+          aws ec2 wait instance-running --region "$AWS_REGION" --instance-ids "$IID"
+          echo "Started $IID — running."
+
+      - name: stop
+        if: github.event.inputs.action == 'stop'
+        run: |
+          IID=${{ steps.iid.outputs.id }}
+          aws ec2 stop-instances --region "$AWS_REGION" --instance-ids "$IID" >/dev/null
+          aws ec2 wait instance-stopped --region "$AWS_REGION" --instance-ids "$IID"
+          echo "Stopped $IID."
+
+      - name: reboot
+        if: github.event.inputs.action == 'reboot'
+        run: |
+          IID=${{ steps.iid.outputs.id }}
+          aws ec2 reboot-instances --region "$AWS_REGION" --instance-ids "$IID"
+          echo "Reboot issued for $IID."
+
+      - name: restart-app
+        if: github.event.inputs.action == 'restart-app'
+        run: |
+          set -euo pipefail
+          IID=${{ steps.iid.outputs.id }}
+          CMD=$(aws ssm send-command --region "$AWS_REGION" --instance-ids "$IID" \
+            --document-name AWS-RunShellScript \
+            --parameters 'commands=["systemctl restart tickvault","sleep 5","systemctl is-active --quiet tickvault && echo RESTARTED-OK || (echo FAIL; exit 1)"]' \
+            --query Command.CommandId --output text)
+          aws ssm wait command-executed --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" || true
+          aws ssm get-command-invocation --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" \
+            --query StandardOutputContent --output text
+
+      - name: restart-questdb
+        if: github.event.inputs.action == 'restart-questdb'
+        run: |
+          set -euo pipefail
+          IID=${{ steps.iid.outputs.id }}
+          CMD=$(aws ssm send-command --region "$AWS_REGION" --instance-ids "$IID" \
+            --document-name AWS-RunShellScript \
+            --parameters 'commands=["cd /opt/tickvault/repo/deploy/docker && docker compose restart questdb && docker ps --format \"{{.Names}} {{.Status}}\" | grep -i quest"]' \
+            --query Command.CommandId --output text)
+          aws ssm wait command-executed --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" || true
+          aws ssm get-command-invocation --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" \
+            --query StandardOutputContent --output text
+
+      - name: seed-secrets
+        if: github.event.inputs.action == 'seed-secrets'
+        run: |
+          set -euo pipefail
+          names=$(aws ssm get-parameters-by-path --path /tickvault/dev --recursive \
+                    --region "$AWS_REGION" --query 'Parameters[].Name' --output text)
+          [ -n "$names" ] || { echo "::error::no /tickvault/dev/* params"; exit 1; }
+          n=0
+          for name in $names; do
+            newname="/tickvault/staging/${name#/tickvault/dev/}"
+            ptype=$(aws ssm get-parameter --name "$name" --region "$AWS_REGION" --query 'Parameter.Type' --output text)
+            value=$(aws ssm get-parameter --name "$name" --with-decryption --region "$AWS_REGION" --query 'Parameter.Value' --output text)
+            aws ssm put-parameter --name "$newname" --type "$ptype" --value "$value" --overwrite --region "$AWS_REGION" >/dev/null
+            n=$((n+1)); echo "  seeded $name -> $newname ($ptype)"
+          done
+          echo "Seeded $n parameters dev -> staging."
+
+      - name: deploy
+        if: github.event.inputs.action == 'deploy'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run deploy-aws.yml --repo "${{ github.repository }}" --ref main
+          echo "Dispatched deploy-aws.yml (build -> ship -> smoke -> restart). Watch it in the Actions tab."
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## AWS Control: \`${{ github.event.inputs.action }}\` ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "Instance: ${{ steps.iid.outputs.id }} | region: ${AWS_REGION} | force: ${{ github.event.inputs.force }}" >> "$GITHUB_STEP_SUMMARY"

@@ -79,13 +79,6 @@ const KNOWN_BROKEN_ALLOWLIST: &[&str] = &[
     // phase-1-monitoring-rubric.md references a plan doc that was
     // archived. TODO: PR #11 docs cleanup updates this runbook.
     ".claude/plans/friday-may-15-mega/topic-PHASE-1-RUBRIC-VERDICT.md",
-    // aws-deployment.md references files that exist only after
-    // `terraform init` runs locally (gitignored) and a per-rule TF file
-    // that was consolidated into main.tf. TODO: PR #13 (Terraform
-    // t4g.medium + Amazon Connect Lambda) refreshes this runbook to
-    // reflect the consolidated main.tf layout.
-    "deploy/aws/terraform/terraform.tfvars",
-    "deploy/aws/terraform/eventbridge.tf",
     // operator-end-to-end-automation.md references a bootstrap script
     // designed in the runbook §4 but not yet implemented. TODO: PR #13
     // commits `scripts/aws-bootstrap.sh` per the design in the runbook.

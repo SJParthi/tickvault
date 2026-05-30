@@ -48,12 +48,12 @@ git push → GitHub Actions terraform-apply.yml fires
   │   ├─ Security group (SSH from 0.0.0.0/0 — tighten via TF_VAR_operator_cidr later)
   │   ├─ IAM role for EC2 instance
   │   ├─ IAM role for GitHub OIDC (this replaces your access key!)
-  │   ├─ EC2 t4g.medium AL2023 arm64 + EBS gp3 10GB encrypted
-  │   ├─ Elastic IP (register with Dhan POST /v2/ip/setIP)
+  │   ├─ EC2 m8g.large AL2023 arm64 + EBS gp3 30GB encrypted
+  │   ├─ Elastic IP — count-gated, DEFAULT OFF (enable_eip=false; flip true before live orders)
   │   ├─ SNS topic + email subscription (check inbox, click confirm)
-  │   ├─ EventBridge cron 08:00/17:00 IST daily start/stop
+  │   ├─ EventBridge cron 08:30/16:30 IST weekday-only (MON-FRI) start/stop
   │   ├─ 5 CloudWatch alarms (status×2, CPU, EBS, network)
-  │   ├─ AWS Budget at $12 USD (~₹1,000)
+  │   ├─ AWS Budget at $25 USD (~₹2,058/mo all-in incl GST)
   │   ├─ S3 cold bucket with 5-year SEBI lifecycle
   │   └─ CloudWatch log group (14d retention)
   └─ SNS publish → Telegram "Terraform apply OK ... instance_id=i-... elastic_ip=X.X.X.X"

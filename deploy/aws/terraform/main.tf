@@ -156,7 +156,15 @@ resource "aws_iam_role_policy" "tv_instance" {
           "ssm:DeleteParameter",
         ]
         Resource = [
-          "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/*"
+          # var.environment names the infra resources (prod). The APP, however,
+          # reads its secrets under the SSM prefix selected by TV_ENVIRONMENT
+          # (systemd unit) — currently "staging" for the 3-month data-pull phase
+          # (sandbox/dry_run, no real orders). Allow BOTH prefixes explicitly so
+          # the box can read /tickvault/staging/* today and /tickvault/prod/*
+          # after the eventual live cutover (TV_ENVIRONMENT=staging -> prod).
+          # Least-privilege: only these two named env prefixes, not /tickvault/*.
+          "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/*",
+          "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/staging/*"
         ]
       },
       {

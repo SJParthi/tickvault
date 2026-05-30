@@ -130,6 +130,99 @@ fn test_terraform_instance_type_pinned() {
 }
 
 #[test]
+fn test_seed_staging_ssm_workflow_is_automated_and_secret_safe() {
+    // Full automation: a GitHub Actions workflow copies /tickvault/dev/* ->
+    // /tickvault/staging/* using the AWS creds already in GitHub Secrets, so the
+    // operator never re-types or pastes a secret. It must: (1) exist, (2) be
+    // dispatchable, (3) use --overwrite (idempotent), (4) NEVER echo a secret
+    // value (only names), (5) target the staging prefix.
+    let wf =
+        std::fs::read_to_string(workspace_root().join(".github/workflows/seed-staging-ssm.yml"))
+            .expect("seed-staging-ssm.yml must be readable"); // APPROVED: test
+    assert!(
+        wf.contains("workflow_dispatch"),
+        "seed workflow must be manually dispatchable (one click in Actions)"
+    );
+    assert!(
+        wf.contains("/tickvault/${SOURCE_ENV}") && wf.contains("/tickvault/${TARGET_ENV}"),
+        "seed workflow must copy from the dev source path to the staging target path"
+    );
+    assert!(
+        wf.contains("--overwrite"),
+        "seed workflow must use --overwrite so re-running is idempotent"
+    );
+    // Secret-safety: the value is piped into put-parameter, NEVER echoed. Assert
+    // there is no `echo` of the value variable.
+    assert!(
+        !wf.contains("echo \"$value\"") && !wf.contains("echo $value"),
+        "seed workflow must NEVER echo a decrypted secret value to the log"
+    );
+}
+
+#[test]
+fn test_cloudwatch_operator_dashboard_exists() {
+    // The CloudWatch-only runtime has NO Grafana — the operator dashboard is a
+    // native CloudWatch dashboard (deploy/aws/terraform/dashboard.tf). It must
+    // exist + chart only metrics the CW agent actually scrapes (the allowlist
+    // in user-data prometheus.yaml) + reference real alarm resources, so a
+    // terraform apply doesn't fail and no widget is empty.
+    let dash = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/dashboard.tf"))
+        .expect("dashboard.tf must be readable"); // APPROVED: test
+    assert!(
+        dash.contains("resource \"aws_cloudwatch_dashboard\" \"operator\""),
+        "dashboard.tf must declare the operator CloudWatch dashboard"
+    );
+    // A few signal metrics that MUST be charted (and are in the scrape allowlist).
+    for metric in &[
+        "tv_realtime_guarantee_score",
+        "tv_questdb_disconnected_seconds",
+        "tv_token_remaining_seconds",
+        "tv_aggregator_seals_emitted_total",
+    ] {
+        assert!(
+            dash.contains(metric),
+            "operator dashboard must chart {metric} (a scraped Tickvault/Prod metric)"
+        );
+    }
+    // The dashboard_url output lets the operator jump straight to it.
+    let outputs = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/outputs.tf"))
+        .expect("outputs.tf must be readable"); // APPROVED: test
+    assert!(
+        outputs.contains("dashboard_url"),
+        "outputs.tf must expose dashboard_url for one-click console access"
+    );
+}
+
+#[test]
+fn test_terraform_instance_iam_allows_staging_ssm_prefix() {
+    // The app reads its secrets under the SSM prefix selected by
+    // TV_ENVIRONMENT (systemd unit) = "staging" for the 3-month data-pull
+    // phase. The instance IAM role is named with var.environment (prod), so
+    // its SSM Resource must EXPLICITLY also allow /tickvault/staging/* —
+    // otherwise the box is IAM-denied reading /tickvault/staging/dhan/* and
+    // boot fails at auth. Regression: 2026-05-30 pre-flight audit caught the
+    // app(staging) vs IAM(prod) SSM-prefix mismatch before first deploy.
+    let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
+        .expect("main.tf must be readable"); // APPROVED: test
+    assert!(
+        content.contains("parameter/tickvault/staging/*"),
+        "main.tf instance IAM role must allow ssm:GetParameter on \
+         /tickvault/staging/* — the app's TV_ENVIRONMENT=staging SSM prefix. \
+         Without it the box is IAM-denied reading its Dhan/Telegram secrets."
+    );
+    // The systemd unit must agree — TV_ENVIRONMENT=staging is the source of the
+    // staging SSM prefix the IAM line above grants.
+    let unit = std::fs::read_to_string(workspace_root().join("deploy/systemd/tickvault.service"))
+        .expect("tickvault.service must be readable"); // APPROVED: test
+    assert!(
+        unit.contains("TV_ENVIRONMENT=staging"),
+        "tickvault.service must set TV_ENVIRONMENT=staging (data-pull, no real \
+         orders). If this flips to prod, the IAM staging grant + this test must \
+         be revisited together (production.toml arms real money)."
+    );
+}
+
+#[test]
 fn test_terraform_eventbridge_schedules_match_budget() {
     let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
         .expect("main.tf must be readable"); // APPROVED: test
@@ -154,6 +247,63 @@ fn test_terraform_eventbridge_schedules_match_budget() {
     assert!(
         !content.contains("cron(30 11 * * ? *)"),
         "7-day daily stop cron retired in operator-lock 2026-05-29 (weekday-only now)"
+    );
+}
+
+#[test]
+fn test_seed_staging_ssm_self_fires_and_cowork_can_dispatch() {
+    // Zero-click automation: the seed workflow self-fires on a daily cron (no
+    // human clicks "Run workflow"), and Claude Cowork (claude-mobile-command)
+    // has actions:write so it can dispatch aws-control / deploy / seed on
+    // request. Both pinned so the self-firing automation can't silently regress.
+    let seed =
+        std::fs::read_to_string(workspace_root().join(".github/workflows/seed-staging-ssm.yml"))
+            .expect("seed-staging-ssm.yml must be readable"); // APPROVED: test
+    assert!(
+        seed.contains("schedule:") && seed.contains("cron:"),
+        "seed-staging-ssm.yml must self-fire on a cron schedule (zero-click)"
+    );
+    let mobile = std::fs::read_to_string(
+        workspace_root().join(".github/workflows/claude-mobile-command.yml"),
+    )
+    .expect("claude-mobile-command.yml must be readable"); // APPROVED: test
+    assert!(
+        mobile.contains("actions: write"),
+        "claude-mobile-command must have actions:write so Cowork can dispatch AWS workflows"
+    );
+}
+
+#[test]
+fn test_aws_control_workflow_covers_all_operations() {
+    // Full automation: a single dispatchable workflow operates the whole AWS
+    // deployment (start/stop/reboot/status/restart-app/restart-questdb/
+    // seed-secrets/deploy) from anywhere — GitHub web/mobile or a Claude session
+    // — with zero terminal commands. Must exist, expose every action, guard
+    // market hours on session-interrupting actions, and never echo a secret.
+    let wf = std::fs::read_to_string(workspace_root().join(".github/workflows/aws-control.yml"))
+        .expect("aws-control.yml must be readable"); // APPROVED: test
+    for action in &[
+        "status",
+        "start",
+        "stop",
+        "reboot",
+        "restart-app",
+        "restart-questdb",
+        "seed-secrets",
+        "deploy",
+    ] {
+        assert!(
+            wf.contains(&format!("action == '{action}'")),
+            "aws-control.yml must implement the '{action}' action"
+        );
+    }
+    assert!(
+        wf.contains("Market-hours guard"),
+        "aws-control.yml must guard session-interrupting actions against market hours"
+    );
+    assert!(
+        !wf.contains("echo \"$value\"") && !wf.contains("echo $value"),
+        "aws-control.yml must NEVER echo a decrypted secret value"
     );
 }
 
@@ -218,6 +368,34 @@ fn test_github_actions_workflows_exist() {
     require_file_exists(
         ".github/workflows/dep-freshness-nightly.yml",
         "Nightly 02:00 IST dep-drift scan",
+    );
+}
+
+#[test]
+fn test_deploy_aws_workflow_refreshes_repo_and_systemd_unit() {
+    // Regression 2026-05-30 pre-flight audit: the deploy SSM command shipped a
+    // new binary + synced config, but NEVER refreshed the box's repo clone or
+    // the systemd unit. The clone is shallow from first boot, so the box would
+    // keep its first-boot systemd unit FOREVER. That unit carries TV_ENVIRONMENT
+    // — a stale unit (pre-#898 TV_ENVIRONMENT=prod) would make the new binary
+    // load production.toml = REAL ORDERS, breaking the no-orders data-pull lock.
+    // The deploy must git-pull the clone AND re-copy the systemd unit before
+    // daemon-reload + restart.
+    let content =
+        std::fs::read_to_string(workspace_root().join(".github/workflows/deploy-aws.yml"))
+            .expect("deploy-aws.yml must be readable"); // APPROVED: test
+    assert!(
+        content.contains("git -C repo reset --hard origin/main"),
+        "deploy-aws.yml SSM command must git-refresh the box's repo clone to \
+         origin/main before copying config/systemd — otherwise the box runs \
+         its stale first-boot files forever."
+    );
+    assert!(
+        content.contains(
+            "cp -f repo/deploy/systemd/tickvault.service /etc/systemd/system/tickvault.service"
+        ),
+        "deploy-aws.yml SSM command must refresh the systemd unit from the repo \
+         (carries TV_ENVIRONMENT=staging — a stale prod unit would arm real money)."
     );
 }
 
