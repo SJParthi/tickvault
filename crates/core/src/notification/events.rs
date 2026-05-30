@@ -1891,7 +1891,7 @@ impl NotificationEvent {
             }
             Self::DualInstanceDetected { holder, lock_key } => {
                 let holder_line = if holder.is_empty() {
-                    "(holder identity not retrievable — Valkey may have raced; check `make doctor` or `valkey-cli GET <key>`)"
+                    "(holder identity not retrievable — the lock check raced; run `make doctor`)"
                         .to_string()
                 } else {
                     format!("Live peer: {holder}")
