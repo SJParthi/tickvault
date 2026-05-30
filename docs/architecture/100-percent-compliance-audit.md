@@ -198,7 +198,7 @@ The proof is mechanical, observable, and reproducible:
 | `cargo test --workspace` green | All 22-category tests pass | `git pull && cargo test --workspace` |
 | CloudWatch dashboard URL | Live metrics: 10 gauges + 10 counters | Open in browser |
 | `mcp__tickvault-logs__run_doctor` 7 sections green | Live infra health | Invoke MCP tool in Claude session |
-| `mcp__tickvault-logs__list_active_alerts` empty | No firing alerts | Same |
+| CloudWatch alarms none firing | No firing alerts (the `list_active_alerts` MCP tool was retired in #O5, 2026-05-30) | CloudWatch console / `run_doctor` |
 | `mcp__tickvault-logs__summary_snapshot` | Last-hour ERROR signatures | Same |
 | Daily 15:31 IST Telegram "Cross-match OK \| TFs: 4 \| Candles: N \| All OHLCV exact" | Same-day data integrity | Read phone |
 | Daily 08:05 IST Telegram "Morning 1d cross-check OK" | Yesterday's overnight integrity | Read phone |

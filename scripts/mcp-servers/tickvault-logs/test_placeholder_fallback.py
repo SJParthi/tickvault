@@ -22,10 +22,10 @@ sys.path.insert(0, str(HERE))
 
 # Set placeholders BEFORE importing server so the module-level cache
 # (_ENDPOINTS_CACHE) is initialized with the placeholder-aware logic.
+# TICKVAULT_PROMETHEUS_URL / TICKVAULT_ALERTMANAGER_URL dropped in #O5
+# (2026-05-30) — Prometheus (#O3) + Alertmanager (#O2) containers removed.
 PLACEHOLDERS = {
     "TICKVAULT_LOGS_DIR": "${TICKVAULT_LOGS_DIR}",
-    "TICKVAULT_PROMETHEUS_URL": "${TICKVAULT_PROMETHEUS_URL}",
-    "TICKVAULT_ALERTMANAGER_URL": "${TICKVAULT_ALERTMANAGER_URL}",
     "TICKVAULT_QUESTDB_URL": "${TICKVAULT_QUESTDB_URL}",
     "TICKVAULT_API_URL": "${TICKVAULT_API_URL}",
     "TICKVAULT_MCP_PROFILE": "${TICKVAULT_MCP_PROFILE}",
@@ -68,10 +68,10 @@ assert_eq("logs_dir", logs, not_equal="${TICKVAULT_LOGS_DIR}")
 if "${" in str(logs):
     failures.append(f"logs_dir: placeholder leaked through: {logs!r}")
 
-prom = server._endpoint_url("prometheus_url", "TICKVAULT_PROMETHEUS_URL", "http://127.0.0.1:9090")
-assert_eq("prom_url", prom, not_equal="${TICKVAULT_PROMETHEUS_URL}")
-if "${" in prom:
-    failures.append(f"prom_url: placeholder leaked through: {prom!r}")
+qdb = server._endpoint_url("questdb_url", "TICKVAULT_QUESTDB_URL", "http://127.0.0.1:9000")
+assert_eq("questdb_url", qdb, not_equal="${TICKVAULT_QUESTDB_URL}")
+if "${" in qdb:
+    failures.append(f"questdb_url: placeholder leaked through: {qdb!r}")
 
 logs_src = server._logs_source()
 if logs_src not in {"http", "local"}:
@@ -93,5 +93,5 @@ if failures:
         print(f"  - {f}")
     sys.exit(1)
 
-print("PASS: placeholder fallback works for all 8 env vars.")
+print("PASS: placeholder fallback works for all 6 env vars.")
 sys.exit(0)

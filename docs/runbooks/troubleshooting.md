@@ -276,8 +276,7 @@ Use the MCP tools — they're auto-loaded in every session:
 mcp__tickvault-logs__tail_errors                    # last 50 ERRORs
 mcp__tickvault-logs__find_runbook_for_code <CODE>   # auto-resolves runbook path
 mcp__tickvault-logs__summary_snapshot               # last-hour signatures
-mcp__tickvault-logs__list_active_alerts             # currently firing Prom alerts
-mcp__tickvault-logs__run_doctor                     # 7-section health snapshot
+mcp__tickvault-logs__run_doctor                     # 7-section health snapshot + CloudWatch alarms
 ```
 
 The MCP server enforces the operator-charter §A automation rule: every

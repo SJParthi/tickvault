@@ -8,17 +8,15 @@
 #
 # Env vars (override defaults):
 #   TICKVAULT_LOGS_DIR          default: <repo>/data/logs
-#   TICKVAULT_PROMETHEUS_URL    default: http://127.0.0.1:9090
-#   TICKVAULT_ALERTMANAGER_URL  default: http://127.0.0.1:9093
 #   TICKVAULT_QUESTDB_URL       default: http://127.0.0.1:9000
 #   TICKVAULT_API_URL           default: http://127.0.0.1:3001
+# Prometheus/Alertmanager probes removed in #O5 (2026-05-30) — those
+# containers were removed in #O3/#O2 (CloudWatch-only observability).
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LOGS_DIR="${TICKVAULT_LOGS_DIR:-$REPO_ROOT/data/logs}"
-PROM_URL="${TICKVAULT_PROMETHEUS_URL:-http://127.0.0.1:9090}"
-AM_URL="${TICKVAULT_ALERTMANAGER_URL:-http://127.0.0.1:9093}"
 QDB_URL="${TICKVAULT_QUESTDB_URL:-http://127.0.0.1:9000}"
 API_URL="${TICKVAULT_API_URL:-http://127.0.0.1:3001}"
 
@@ -69,8 +67,6 @@ fi
 echo
 
 echo "--- HTTP endpoints ---"
-probe_url "Prometheus"   "$PROM_URL" "/-/healthy"
-probe_url "Alertmanager" "$AM_URL"   "/-/healthy"
 probe_url "QuestDB"      "$QDB_URL"  "/exec?query=SELECT%201"
 probe_url "tickvault API" "$API_URL" "/health"
 echo

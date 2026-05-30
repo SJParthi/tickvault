@@ -52,11 +52,9 @@ fn bootstrap_writes_all_endpoint_vars() {
     // its TICKVAULT_GRAFANA_URL export was dropped in the same PR.
     // TICKVAULT_ALERTMANAGER_URL dropped in #O5 (2026-05-30) — Alertmanager
     // container removed in #O2.
-    for var in [
-        "TICKVAULT_PROMETHEUS_URL",
-        "TICKVAULT_QUESTDB_URL",
-        "TICKVAULT_API_URL",
-    ] {
+    // TICKVAULT_PROMETHEUS_URL dropped in #O5 (2026-05-30) — Prometheus
+    // container removed in #O3.
+    for var in ["TICKVAULT_QUESTDB_URL", "TICKVAULT_API_URL"] {
         assert!(
             src.contains(&format!("export {var}")),
             "bootstrap does not export {var}"
@@ -68,13 +66,10 @@ fn bootstrap_writes_all_endpoint_vars() {
 fn bootstrap_writes_all_probe_status_vars() {
     let src = read("scripts/claude-session-bootstrap.sh");
     // GRAF_STATUS was retired with #O1; TICKVAULT_ALERT_STATUS was dropped
-    // in #O5 (2026-05-30, Alertmanager container removed in #O2); the script
-    // now writes 3 status vars.
-    for var in [
-        "TICKVAULT_PROM_STATUS",
-        "TICKVAULT_QDB_STATUS",
-        "TICKVAULT_API_STATUS",
-    ] {
+    // in #O5 (2026-05-30, Alertmanager container removed in #O2);
+    // TICKVAULT_PROM_STATUS was dropped in #O5 (2026-05-30, Prometheus
+    // container removed in #O3); the script now writes 2 status vars.
+    for var in ["TICKVAULT_QDB_STATUS", "TICKVAULT_API_STATUS"] {
         assert!(
             src.contains(&format!("export {var}")),
             "bootstrap does not export {var}"
@@ -118,30 +113,12 @@ fn session_sanity_hook_tails_live_errors_jsonl() {
     );
 }
 
-#[test]
-fn session_sanity_hook_pulls_prometheus_when_reachable() {
-    // PR #288 (#9b): when Prometheus is REACHABLE, SessionStart must pull
-    // the zero-tick-loss-adjacent counters so operators and Claude both see
-    // the real numbers at session start. The pull must be conditional
-    // (REACHABLE only) to keep SessionStart fast when the stack is down.
-    let hook = read(".claude/hooks/session-sanity.sh");
-    assert!(
-        hook.contains("TICKVAULT_PROM_STATUS") && hook.contains("REACHABLE"),
-        "session-sanity must gate the Prometheus pull on PROM_STATUS=REACHABLE"
-    );
-    assert!(
-        hook.contains("tv_ticks_dropped_total"),
-        "session-sanity must pull tv_ticks_dropped_total"
-    );
-    assert!(
-        hook.contains("tv_depth_sequence_holes_total"),
-        "session-sanity must pull tv_depth_sequence_holes_total (PR #288 #5)"
-    );
-    assert!(
-        hook.contains("tv_instrument_registry_cross_segment_collisions"),
-        "session-sanity must pull the registry collision gauge (I-P1-11)"
-    );
-}
+// `session_sanity_hook_pulls_prometheus_when_reachable` was REMOVED in #O5
+// (2026-05-30): the local Prometheus session-start pull was retired when the
+// Prometheus container was removed (#O3, CloudWatch-only migration). Those
+// zero-tick-loss-adjacent counters are now observed via CloudWatch metrics
+// (scraped from the app `/metrics` exporter). The session-sanity hook no
+// longer references TICKVAULT_PROM_STATUS / TICKVAULT_PROMETHEUS_URL.
 
 #[test]
 fn precompact_hook_reinvokes_bootstrap() {
@@ -408,6 +385,9 @@ fn health_slash_command_exists_and_wires_all_layers() {
     // with zero manual setup. The command file is version-controlled
     // so it works identically on every clone.
     let cmd = read(".claude/commands/health.md");
+    // prometheus_query + list_active_alerts dropped in #O5 (2026-05-30) —
+    // Prometheus (#O3) + Alertmanager (#O2) containers removed; queries now
+    // go via questdb_sql / CloudWatch.
     for required in [
         "validate-automation.sh",
         "doctor.sh",
@@ -415,9 +395,7 @@ fn health_slash_command_exists_and_wires_all_layers() {
         "tail_errors",
         "summary_snapshot",
         "list_novel_signatures",
-        "prometheus_query",
         "questdb_sql",
-        "list_active_alerts",
         "session-env",
     ] {
         assert!(
@@ -474,8 +452,9 @@ fn bootstrap_auto_up_requires_every_service_offline() {
     let src = read("scripts/claude-session-bootstrap.sh");
     // A partially-up stack means the operator is mid-debug — never
     // disturb. Auto-up only fires when EVERY probed local service is
-    // OFFLINE (a fresh laptop boot scenario). GRAF_S dropped with #O1.
-    for status_var in ["PROM_S", "QDB_S", "API_S"] {
+    // OFFLINE (a fresh laptop boot scenario). GRAF_S dropped with #O1;
+    // PROM_S dropped with #O5 (Prometheus container removed in #O3).
+    for status_var in ["QDB_S", "API_S"] {
         assert!(
             src.contains(&format!(r#""${status_var}" = "OFFLINE""#)),
             "auto-up must require {status_var}=OFFLINE — partial-up state \

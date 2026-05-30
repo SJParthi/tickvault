@@ -32,7 +32,7 @@ from typing import Any, Iterable
 # Configuration — universal, branch-independent endpoints
 # ---------------------------------------------------------------------------
 #
-# Resolution order for every endpoint URL (prom/questdb/alertmanager/...):
+# Resolution order for every endpoint URL (questdb/tickvault_api/...):
 #   1. Explicit `base_url` argument passed to the tool (single-call override)
 #   2. Env var TICKVAULT_<KIND>_URL (session-level override)
 #   3. Active profile in config/claude-mcp-endpoints.toml (universal default)
@@ -127,8 +127,8 @@ def _endpoint_url(
 ) -> str:
     """Resolve an endpoint URL via the 4-tier precedence order.
 
-    `kind` is the key in the profile config (e.g. "prometheus_url").
-    `env_var` is the legacy env-var override (e.g. "TICKVAULT_PROMETHEUS_URL").
+    `kind` is the key in the profile config (e.g. "questdb_url").
+    `env_var` is the legacy env-var override (e.g. "TICKVAULT_QUESTDB_URL").
     `default` is the Mode A localhost fallback.
     `explicit` is a single-call override from the tool invocation.
     """
@@ -422,31 +422,6 @@ def tool_signature_history(signature: str, limit: int = 500) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def tool_prometheus_query(query: str, base_url: str | None = None) -> dict[str, Any]:
-    """Run an instant PromQL query against the local Prometheus.
-
-    Returns the raw API response as a dict. Lets Claude ask live
-    questions like "what's tv_ticks_dropped_total right now?" without
-    needing shell access or curl + jq chains.
-    """
-    import urllib.parse
-    import urllib.request
-
-    prom_url = _endpoint_url(
-        "prometheus_url",
-        "TICKVAULT_PROMETHEUS_URL",
-        "http://127.0.0.1:9090",
-        explicit=base_url,
-    )
-    full = f"{prom_url}/api/v1/query?query={urllib.parse.quote(query)}"
-    try:
-        with urllib.request.urlopen(full, timeout=5) as resp:  # noqa: S310
-            body = resp.read().decode("utf-8")
-        return {"ok": True, "query": query, "response": json.loads(body)}
-    except Exception as err:  # noqa: BLE001
-        return {"ok": False, "query": query, "error": str(err)}
-
-
 def tool_find_runbook_for_code(code: str) -> dict[str, Any]:
     """Given an ErrorCode string (e.g. "DH-904"), find the runbook(s)
     that reference it and return the full markdown path + a preview
@@ -680,42 +655,6 @@ def tool_git_recent_log(limit: int = 20) -> dict[str, Any]:
             }
         )
     return {"ok": True, "count": len(commits), "commits": commits}
-
-
-def tool_list_active_alerts(base_url: str | None = None) -> dict[str, Any]:
-    """List every active (firing) Alertmanager alert. Gives Claude a
-    live view of WHAT is currently broken without parsing
-    errors.summary.md (the summary_writer lags up to 60s).
-    """
-    import urllib.request
-
-    am_url = _endpoint_url(
-        "alertmanager_url",
-        "TICKVAULT_ALERTMANAGER_URL",
-        "http://127.0.0.1:9093",
-        explicit=base_url,
-    )
-    full = f"{am_url}/api/v2/alerts?active=true&silenced=false&inhibited=false"
-    try:
-        with urllib.request.urlopen(full, timeout=5) as resp:  # noqa: S310
-            body = resp.read().decode("utf-8")
-        parsed = json.loads(body)
-    except Exception as err:  # noqa: BLE001
-        return {"ok": False, "error": str(err)}
-    summary: list[dict[str, Any]] = []
-    for alert in parsed:
-        labels = alert.get("labels") or {}
-        annotations = alert.get("annotations") or {}
-        summary.append(
-            {
-                "alertname": labels.get("alertname"),
-                "severity": labels.get("severity"),
-                "starts_at": alert.get("startsAt"),
-                "summary": annotations.get("summary"),
-                "runbook": annotations.get("runbook"),
-            }
-        )
-    return {"ok": True, "active_count": len(summary), "alerts": summary}
 
 
 def tool_tickvault_api(
@@ -957,26 +896,6 @@ TOOLS: list[ToolSpec] = [
         ),
     ),
     ToolSpec(
-        name="prometheus_query",
-        description=(
-            "Run an instant PromQL query against the local Prometheus "
-            "and return the raw API response. Lets Claude answer "
-            "\"what's the value of tv_ticks_dropped_total right now?\" "
-            "in one tool call, no shell required."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "PromQL query (e.g. 'tv_ticks_dropped_total' or 'rate(tv_ticks_processed_total[1m])')",
-                },
-            },
-            "required": ["query"],
-        },
-        handler=lambda args: tool_prometheus_query(query=args["query"]),
-    ),
-    ToolSpec(
         name="find_runbook_for_code",
         description=(
             "Given an ErrorCode string (e.g. 'DH-904', 'I-P1-11'), "
@@ -996,17 +915,6 @@ TOOLS: list[ToolSpec] = [
             "required": ["code"],
         },
         handler=lambda args: tool_find_runbook_for_code(code=args["code"]),
-    ),
-    ToolSpec(
-        name="list_active_alerts",
-        description=(
-            "List every currently-firing Alertmanager alert (active, "
-            "not silenced, not inhibited). Live view of what's broken "
-            "— more up-to-date than errors.summary.md (which has a 60s "
-            "refresh lag)."
-        ),
-        input_schema={"type": "object", "properties": {}},
-        handler=lambda _args: tool_list_active_alerts(),
     ),
     ToolSpec(
         name="questdb_sql",

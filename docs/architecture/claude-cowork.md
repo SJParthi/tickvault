@@ -21,8 +21,8 @@ This document proves every word is mechanically delivered.
 | Live ERROR events | `data/logs/errors.jsonl.YYYY-MM-DD-HH` | `mcp__tickvault-logs__tail_errors(limit=N)` |
 | Top signatures | `data/logs/errors.summary.md` | `mcp__tickvault-logs__summary_snapshot()` |
 | Triage audit trail | `data/logs/auto-fix.log` | `mcp__tickvault-logs__triage_log_tail(limit=N)` |
-| Firing alerts | Alertmanager :9093 | `mcp__tickvault-logs__list_active_alerts()` |
-| Any metric value | Prometheus :9090 | `mcp__tickvault-logs__prometheus_query(query)` |
+| Firing alarms | CloudWatch alarms | `mcp__tickvault-logs__run_doctor()` (the `list_active_alerts` MCP tool was retired in #O5, 2026-05-30, Alertmanager container removed in #O2) |
+| Any metric value | CloudWatch metrics / app `/metrics` exporter | `mcp__tickvault-logs__questdb_sql(...)` for persisted counters (the `prometheus_query` MCP tool was retired in #O5, 2026-05-30, Prometheus container removed in #O3) |
 | Any signature history | errors.jsonl.* | `mcp__tickvault-logs__signature_history(sig)` |
 | Novel-signature candidates | errors.jsonl.* | `mcp__tickvault-logs__list_novel_signatures(since_minutes)` |
 
@@ -51,8 +51,8 @@ The canonical Claude flow when a Telegram alert fires:
 ```
 Telegram: "🔴 OMS-GAP-03 CircuitBreakerOpen"
     │
-    ├─> Claude: list_active_alerts()
-    │       sees full alert context + runbook link
+    ├─> Claude: run_doctor()  / CloudWatch alarms
+    │       sees full alarm context + runbook link
     │
     ├─> Claude: find_runbook_for_code("OMS-GAP-03")
     │       points at docs/runbooks/oms-risk.md
@@ -60,7 +60,7 @@ Telegram: "🔴 OMS-GAP-03 CircuitBreakerOpen"
     │
     ├─> Claude reads runbook (1 tool call)
     │
-    ├─> Claude: prometheus_query("tv_circuit_breaker_state")
+    ├─> Claude: tv_circuit_breaker_state via CloudWatch metrics / /metrics
     │       confirms state = 1 (OPEN)
     │
     ├─> Claude: signature_history("<hash>")
@@ -85,9 +85,14 @@ mcp__tickvault-logs__signature_history(signature="abcd1234efgh5678")
 
 ### By live metric
 
+The `prometheus_query` MCP tool was retired in #O5 (2026-05-30) —
+the Prometheus container was removed in #O3. Read live counters from
+CloudWatch metrics (prod) or the app's `/metrics` Prometheus-format
+exporter (dev), e.g.:
+
 ```
-mcp__tickvault-logs__prometheus_query("rate(tv_ticks_processed_total[1m])")
-mcp__tickvault-logs__prometheus_query("tv_circuit_breaker_state")
+rate(tv_ticks_processed_total[1m])    # CloudWatch metric / /metrics exporter
+tv_circuit_breaker_state              # CloudWatch metric / /metrics exporter
 ```
 
 ### By novel pattern

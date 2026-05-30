@@ -41,7 +41,7 @@ never hallucinates.
 3. **Error triage** → `make triage-dry-run` (inspect) → `make triage-execute` (act).
 4. **"What's happening right now?"** → the **tickvault-logs MCP** tools are auto-loaded
    from `.mcp.json`. Prefer `mcp__tickvault-logs__summary_snapshot`,
-   `tail_errors`, `list_novel_signatures`, `prometheus_query`, `questdb_sql`,
+   `tail_errors`, `list_novel_signatures`, `questdb_sql`,
    `run_doctor` over hand-rolled Bash.
 5. **"How do I fix error code X?"** → `mcp__tickvault-logs__find_runbook_for_code`
    returns the runbook path in `docs/runbooks/`. Never guess.

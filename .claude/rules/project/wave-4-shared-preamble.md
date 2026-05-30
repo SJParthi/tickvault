@@ -30,12 +30,12 @@ MUST USE IT — not duplicate it, not reinvent it.
 | Health check | `mcp__tickvault-logs__run_doctor` | At session start, before code |
 | Tail recent ERRORs | `mcp__tickvault-logs__tail_errors` | Investigating any failure |
 | Find runbook for ErrorCode | `mcp__tickvault-logs__find_runbook_for_code` | Emitting/referencing an ERROR |
-| Live Prometheus query | `mcp__tickvault-logs__prometheus_query` | Verifying counter increments |
+| Live metric value | CloudWatch metrics console / app `/metrics` exporter | Verifying counter increments |
 | Live QuestDB SQL | `mcp__tickvault-logs__questdb_sql` | Verifying table writes / DEDUP |
 | Detect novel errors | `mcp__tickvault-logs__list_novel_signatures` | After any ERROR-emitting change |
 | Source-grep | `mcp__tickvault-logs__grep_codebase` | Faster than spawning an agent |
 | Latest summary | `mcp__tickvault-logs__summary_snapshot` | At session start |
-| Active Prom alerts | `mcp__tickvault-logs__list_active_alerts` | Before opening PR |
+| Active alerts | `mcp__tickvault-logs__run_doctor` (CloudWatch alarms) | Before opening PR |
 | Local app log tail | `mcp__tickvault-logs__app_log_tail` | Debugging runtime issues |
 | Triage log tail | `mcp__tickvault-logs__triage_log_tail` | Reviewing auto-fix outcomes |
 | Docker container status | `mcp__tickvault-logs__docker_status` | When a service is OFFLINE |
@@ -44,7 +44,7 @@ MUST USE IT — not duplicate it, not reinvent it.
 
 1. Run `mcp__tickvault-logs__run_doctor` — capture current health.
 2. Run `mcp__tickvault-logs__summary_snapshot` — read recent ERROR signatures.
-3. Run `mcp__tickvault-logs__list_active_alerts` — fail loudly if anything red.
+3. Run `mcp__tickvault-logs__run_doctor` (CloudWatch alarms) — fail loudly if anything red.
 4. Run `bash .claude/hooks/session-auto-health.sh` if present — auto-doctor + validate-automation.
 5. Read `data/logs/session-auto-health.latest.txt` if present — previous session's verdict carries forward.
 
@@ -115,7 +115,7 @@ For EACH new code path, ALL SEVEN observability layers must fire.
 
 | # | Layer | Mechanism | Verification |
 |---|---|---|---|
-| 1 | Prometheus counter | `metrics::counter!("tv_<name>_total", ...)` static labels | `mcp__tickvault-logs__prometheus_query` |
+| 1 | Prometheus counter | `metrics::counter!("tv_<name>_total", ...)` static labels | CloudWatch metrics (from `/metrics` exporter) |
 | 2 | Prometheus gauge | `metrics::gauge!("tv_<name>", ...)` | dashboard panel cites it |
 | 3 | Tracing span | `#[instrument]` on hot-path entry fns | `error_code_tag_guard` |
 | 4 | Loki structured log | `error!`/`warn!`/`info!` with `code = ErrorCode::X.code_str()` | `mcp__tickvault-logs__tail_errors` |
@@ -152,7 +152,7 @@ bash .claude/hooks/banned-pattern-scanner.sh
 bash .claude/hooks/pub-fn-test-guard.sh "$PWD" all
 bash .claude/hooks/pub-fn-wiring-guard.sh "$PWD"
 bash .claude/hooks/plan-verify.sh
-mcp__tickvault-logs__list_active_alerts        # must be []
+mcp__tickvault-logs__run_doctor                # CloudWatch alarms must be clear
 mcp__tickvault-logs__list_novel_signatures     # must be []
 cargo bench                                    # if hot path touched — respect benchmark-budgets.toml
 cargo test --features dhat                     # if hot path touched — 0 hot-path allocations

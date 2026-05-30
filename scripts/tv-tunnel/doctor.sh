@@ -35,19 +35,15 @@ fi
 HOSTNAME_FQDN="$($TS_BIN status --json 2>/dev/null | awk -F '"' '/"DNSName":/{print $4; exit}' | sed 's/\.$//')"
 [[ -z "$HOSTNAME_FQDN" ]] && { fail_row "tailscale not logged in"; exit 1; }
 
-declare -a PORTS=(9090 9093 9000 3000 3001)
+# Prometheus(9090)/Alertmanager(9093)/Grafana(3000) removed in the CloudWatch-only
+# migration (#O1/#O2/#O3) — the tunnel only fronts QuestDB + the tickvault API now.
+declare -a PORTS=(9000 3001)
 declare -A NAMES=(
-  [9090]="Prometheus"
-  [9093]="Alertmanager"
   [9000]="QuestDB HTTP"
-  [3000]="Grafana"
   [3001]="tickvault API"
 )
 declare -A PATHS=(
-  [9090]="/-/ready"
-  [9093]="/-/ready"
   [9000]="/"
-  [3000]="/api/health"
   [3001]="/health"
 )
 
@@ -57,8 +53,6 @@ if [[ $EMIT_CONFIG -eq 1 ]]; then
   profile_name=$([[ "$(uname -s)" == "Darwin" ]] && echo "mac-dev" || echo "aws-prod")
   echo "# Paste under [profiles.${profile_name}] in config/claude-mcp-endpoints.toml"
   echo "[profiles.${profile_name}]"
-  echo "prometheus_url    = \"https://${HOSTNAME_FQDN}:9090\""
-  echo "alertmanager_url  = \"https://${HOSTNAME_FQDN}:9093\""
   echo "questdb_url       = \"https://${HOSTNAME_FQDN}:9000\""
   echo "tickvault_api_url = \"https://${HOSTNAME_FQDN}:3001\""
   echo "logs_source       = \"http\""

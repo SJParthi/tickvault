@@ -195,9 +195,9 @@ grepping needed:**
 
 | You want to know… | Signal (already wired) | How to read it |
 |---|---|---|
-| WS disconnect/reconnect count | `tv_websocket_connections_active` gauge + `WebSocketDisconnected*` events | CloudWatch metric / `mcp__tickvault-logs__prometheus_query` |
+| WS disconnect/reconnect count | `tv_websocket_connections_active` gauge + `WebSocketDisconnected*` events | CloudWatch metric / app `/metrics` exporter |
 | Ticks missing / silent feed | **WS-GAP-06** tick-gap detector (coalesced 60s summary) | `mcp__tickvault-logs__tail_errors` / CloudWatch logs |
-| Overall "is it healthy right now" | **SLO-02** composite score (10s) | log-only, never pages; `prometheus_query "tv_slo_*"` |
+| Overall "is it healthy right now" | **SLO-02** composite score (10s) | log-only, never pages; read `tv_slo_*` from CloudWatch metrics (the `prometheus_query` MCP tool was retired in #O5, 2026-05-30) |
 | Latency (wire→done) | `tv_wire_to_done_duration_ns`, `tv_tick_processing_duration_ns` | CloudWatch metric |
 | Daily proof it's alive | `AGGREGATOR-HB-01` per-minute heartbeat | log / CloudWatch |
 
@@ -256,7 +256,7 @@ and CloudWatch (`/tickvault/prod/system`).
 
 | Surface | How you access the AWS box | Notes |
 |---|---|---|
-| **Claude Code (CLI/web/Cowork)** | The **`tickvault-logs` MCP** (auto-loaded from `.mcp.json`) — `mcp__tickvault-logs__run_doctor`, `tail_errors`, `prometheus_query`, `questdb_sql`, `app_log_tail`, `docker_status`. Plus `aws ssm start-session` from a Bash tool when creds are present. | Zero manual setup per session — same tools local or AWS. This is the primary path. |
+| **Claude Code (CLI/web/Cowork)** | The **`tickvault-logs` MCP** (auto-loaded from `.mcp.json`) — `mcp__tickvault-logs__run_doctor`, `tail_errors`, `questdb_sql`, `app_log_tail`, `docker_status`. Plus `aws ssm start-session` from a Bash tool when creds are present. | Zero manual setup per session — same tools local or AWS. This is the primary path. |
 | **Claude Chat** | Ask it to read this repo + the CloudWatch/QuestDB outputs you paste, OR drive the `tickvault-logs` MCP if connected. | Best for reasoning over pasted logs/screenshots. |
 | **Claude Cowork** | Same `.mcp.json` → same `mcp__tickvault-logs__*` tools surface automatically. | Identical to Claude Code. |
 | **IntelliJ** | (a) AWS Toolkit plugin → **Session Manager** shell into `i-0b956d0209231a48b`; (b) Remote-SSH over the SSM tunnel; (c) plain Git/terminal for the repo. | No port-22 exposure needed — SSM tunnel. |

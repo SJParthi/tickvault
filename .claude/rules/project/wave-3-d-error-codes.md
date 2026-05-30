@@ -80,7 +80,7 @@ for the formal definition + numerical-stability notes.
    * `Phase2_health` weakest → `PHASE2-01` runbook
      (`.claude/rules/project/wave-1-error-codes.md`).
 3. Re-run `make doctor` + check
-   `mcp__tickvault-logs__list_active_alerts` to correlate with the
+   `mcp__tickvault-logs__run_doctor` (CloudWatch alarms) to correlate with the
    underlying typed alerts.
 
 **Why we do not auto-fix:** SLO-02 is a *summary* signal. The
