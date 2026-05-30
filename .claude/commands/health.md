@@ -41,15 +41,19 @@ existing, Mac local or AWS remote) with zero manual setup.
    Call with `since_minutes: 60`. Any novel signature = operator
    attention needed. Report count + top 3 (if any).
 
-8. **Prometheus pulse — MCP `prometheus_query`**
-   Run these 5 queries, report value (skip with "N/A — Prometheus
-   OFFLINE" if `TICKVAULT_PROM_STATUS != REACHABLE`):
+8. **Metric pulse — CloudWatch metrics (prod) / app `/metrics` exporter**
+   The Prometheus container was removed in #O3 and the
+   `prometheus_query` MCP tool was retired in #O5 (2026-05-30). The app
+   still emits these counters in Prometheus FORMAT on its `/metrics`
+   endpoint (port 9091), scraped by the CloudWatch agent in prod. Read
+   them from CloudWatch metrics (or curl the exporter directly in dev);
+   skip with "N/A — metrics endpoint unreachable" if the app is down:
 
-   - `sum(tv_ticks_dropped_total)` — must be 0
-   - `sum(tv_depth_sequence_holes_total)` — operator reviews rate
+   - `tv_ticks_dropped_total` — must be 0
+   - `tv_depth_sequence_holes_total` — operator reviews rate
    - `tv_instrument_registry_cross_segment_collisions` — known collisions only (e.g. 2)
    - `tv_websocket_connections_active` — 0 off-hours, 5 during 9:00-15:30 IST
-   - `sum(tv_questdb_spill_bytes)` — 0 during steady state
+   - `tv_questdb_spill_bytes` — 0 during steady state
 
 9. **QuestDB pulse — MCP `questdb_sql`**
    Run these 3 queries, report row count / first value (skip with "N/A —
@@ -59,8 +63,11 @@ existing, Mac local or AWS remote) with zero manual setup.
    - `SELECT count() FROM historical_candles` — total candles
    - `SELECT count() FROM derivative_contracts WHERE status='active'` — active contracts
 
-10. **Active alerts — MCP `list_active_alerts`**
-    Any firing alert = red row in the table.
+10. **Active alarms — CloudWatch alarms / `run_doctor`**
+    The Alertmanager container was removed in #O2 and the
+    `list_active_alerts` MCP tool was retired in #O5 (2026-05-30).
+    Check CloudWatch alarms (prod) or `mcp__tickvault-logs__run_doctor`
+    for the current health verdict. Any firing alarm = red row.
 
 ## Output format
 
@@ -69,22 +76,22 @@ Print **exactly** this markdown table at the end (no filler prose above/below):
 ```
 | # | Check | Status | Detail |
 |---|-------|--------|--------|
-| 1 | Runtime attach | PASS | profile=local prom=REACHABLE qdb=REACHABLE graf=REACHABLE api=OFFLINE |
+| 1 | Runtime attach | PASS | profile=local qdb=REACHABLE api=OFFLINE |
 | 2 | Static guards (validate-automation) | PASS | 31/31 |
 | 3 | Doctor full-system health | PASS | 6/7 sections green (aws SKIP) |
 | 4 | 100% audit | PASS | P=41/41 R=4/4 |
 | 5 | ERROR tail (last 10) | PASS | count=0 |
 | 6 | Summary snapshot | PASS | zero ERROR events in window |
 | 7 | Novel signatures (60min) | PASS | count=0 |
-| 8 | Prometheus — ticks_dropped | PASS | 0 |
-| 8 | Prometheus — depth_seq_holes | PASS | 0 |
-| 8 | Prometheus — id_collisions | PASS | 2 (expected: NIFTY id=13, BANKNIFTY id=25) |
-| 8 | Prometheus — ws_active | INFO | 0 (off-hours expected) |
-| 8 | Prometheus — qdb_spill_bytes | PASS | 0 |
+| 8 | Metrics — ticks_dropped | PASS | 0 |
+| 8 | Metrics — depth_seq_holes | PASS | 0 |
+| 8 | Metrics — id_collisions | PASS | 2 (expected: NIFTY id=13, BANKNIFTY id=25) |
+| 8 | Metrics — ws_active | INFO | 0 (off-hours expected) |
+| 8 | Metrics — qdb_spill_bytes | PASS | 0 |
 | 9 | QuestDB — ticks last 1h | INFO | 0 (off-hours expected) |
 | 9 | QuestDB — historical candles | PASS | 220500 |
 | 9 | QuestDB — active contracts | PASS | 105846 |
-| 10 | Active alerts | PASS | none firing |
+| 10 | Active alarms | PASS | none firing |
 ```
 
 ## Rules

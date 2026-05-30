@@ -83,8 +83,10 @@ present in the same Telegram thread.
   3. The 7 widgets: WebSocket connections, QuestDB connected, tick freshness,
      token expiry headroom, spill ring health, Phase 2 outcome,
      composite SLO score.
-  4. **Cross-reference with `mcp__tickvault-logs__list_active_alerts`** —
-     any firing alert names the underlying ErrorCode + runbook path.
+  4. **Cross-reference with CloudWatch alarms / `mcp__tickvault-logs__run_doctor`**
+     (the `list_active_alerts` MCP tool was retired in #O5, 2026-05-30,
+     when the Alertmanager container was removed in #O2) — any firing
+     alarm names the underlying ErrorCode + runbook path.
 
 ## Section D — Subscription count is not 222/222
 

@@ -41,7 +41,7 @@ Auto-fired by `.claude/settings.json` SessionStart hooks (already wired):
 |---|---|---|
 | 1 | `mcp__tickvault-logs__run_doctor` | 7-section health snapshot |
 | 2 | `mcp__tickvault-logs__summary_snapshot` | Last-hour error signatures |
-| 3 | `mcp__tickvault-logs__list_active_alerts` | Currently-firing Prom alerts |
+| 3 | `mcp__tickvault-logs__run_doctor` (CloudWatch alarms) | Currently-firing alerts |
 | 4 | `bash .claude/hooks/session-auto-health.sh` | doctor + validate-automation in bg |
 | 5 | `bash .claude/hooks/session-context-brief.sh` | Active plans + open PR + errors-last-hour |
 | 6 | `bash .claude/hooks/session-sanity.sh` | Branch + auto-save check |
@@ -53,8 +53,8 @@ Auto-fired by `.claude/settings.json` SessionStart hooks (already wired):
 The `.mcp.json` `tickvault-logs` entry is loaded automatically — same MCP tools surface as `mcp__tickvault-logs__*`. Therefore:
 
 - Logs ✅ accessible via `mcp__tickvault-logs__app_log_tail` / `tail_errors`
-- Queries ✅ accessible via `mcp__tickvault-logs__questdb_sql` / `prometheus_query`
-- DBs ✅ accessible (QuestDB + Prometheus via above)
+- Queries ✅ accessible via `mcp__tickvault-logs__questdb_sql` (live metrics via CloudWatch / the `/metrics` exporter)
+- DBs ✅ accessible (QuestDB via above)
 - Project / product ✅ accessible (entire repo + grep + read)
 - Local / AWS ✅ both supported (same MCP server)
 - Common runtime ✅ same docker-compose Mac dev = AWS prod
@@ -76,7 +76,7 @@ The `.mcp.json` `tickvault-logs` entry is loaded automatically — same MCP tool
 | 100% code performance | DHAT zero-alloc + Criterion p99 budgets + bench-gate ≤5% regression | `cargo bench` + `scripts/bench-gate.sh` |
 | 100% monitoring | 7-layer telemetry (Prom counter + gauge + tracing span + Loki log + Telegram event + Grafana panel + audit table) | `mcp__tickvault-logs__run_doctor` |
 | 100% logging | tracing macros mandatory; ERROR → Telegram via Loki/Alertmanager | hourly `errors.jsonl` rotation |
-| 100% alerting | `alerts.yml` Prom rule + `resilience_sla_alert_guard.rs` ratchet | `mcp__tickvault-logs__list_active_alerts` |
+| 100% alerting | `alerts.yml` Prom rule + `resilience_sla_alert_guard.rs` ratchet | `mcp__tickvault-logs__run_doctor` (CloudWatch alarms) |
 | 100% security | banned-pattern + secret-scan + `Secret<T>` enforcement + security-reviewer agent | `cargo audit` post-deploy |
 | 100% security hardening | static IP enforcement + secret scan + `unused_must_use` lint | post-deploy IP verify |
 | 100% bug fixing | adversarial 3-agent review (proven 4-bug catch rate per 30-commit PR) | pre-PR + post-impl agent pass |
@@ -324,7 +324,7 @@ cat .claude/plans/friday-may-15-mega/step-1-honest-envelope.md           # canon
 tail -50 .claude/plans/friday-may-15-mega/00-decisions-log.md            # recent locks
 
 # 3. Auto-fire (handled by SessionStart hook — already wired)
-# - run_doctor / summary_snapshot / list_active_alerts
+# - run_doctor / summary_snapshot (CloudWatch alarms surfaced via run_doctor)
 
 # 4. Ask operator: "I've read the charter. Current state is <X>. Continuing with <Y>?"
 ```

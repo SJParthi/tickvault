@@ -33,7 +33,7 @@ checklist or in a dedicated "Per-Item Guarantee Matrix" subsection:
 | 100% code performance | DHAT zero-alloc + Criterion p99 budgets + bench-gate ≤5% regression | `cargo bench` + `scripts/bench-gate.sh` | DHAT test if hot path |
 | 100% monitoring | 7-layer telemetry (Prom counter + gauge + tracing span + Loki log + Telegram event + Grafana panel + audit table) | `mcp__tickvault-logs__run_doctor` | 9-box completes 7 layers |
 | 100% logging | tracing macros mandatory (no println!/dbg!); ERROR → Telegram | hourly errors.jsonl rotation | every error path uses `error!` with `code` |
-| 100% alerting | `alerts.yml` Prom rule + `resilience_sla_alert_guard.rs` ratchet | `mcp__tickvault-logs__list_active_alerts` | item adds alert for new failure |
+| 100% alerting | `alerts.yml` Prom rule + `resilience_sla_alert_guard.rs` ratchet | `mcp__tickvault-logs__run_doctor` (CloudWatch alarms) | item adds alert for new failure |
 | 100% security | banned-pattern + secret-scan + `Secret<T>` + security-reviewer agent | `cargo audit` post-deploy | item runs security-reviewer |
 | 100% security hardening | static IP enforcement + pre-commit secret scan + `unused_must_use` lint | post-deploy IP verify | item declares attack-surface delta |
 | 100% bugs fixing | adversarial 3-agent review (proven 4-bug catch rate) | pre-PR + post-impl agent pass | item runs all 3 agents |
@@ -91,7 +91,7 @@ Every NEW Claude Code session auto-runs at start:
 |---|---|---|
 | 1 | `mcp__tickvault-logs__run_doctor` | 7-section health snapshot |
 | 2 | `mcp__tickvault-logs__summary_snapshot` | last hour ERROR signatures |
-| 3 | `mcp__tickvault-logs__list_active_alerts` | active firing Prom alerts |
+| 3 | `mcp__tickvault-logs__run_doctor` (CloudWatch alarms) | active firing alerts |
 | 4 | `session-context-brief.sh` | active plans + open PR + errors-last-hour + 5-step protocol |
 | 5 | `session-auto-health.sh` | doctor + validate-automation + mcp-doctor (background) |
 | 6 | `session-sanity.sh` | branch + uncommitted check + auto-save remote |

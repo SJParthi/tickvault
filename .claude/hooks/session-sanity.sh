@@ -117,10 +117,10 @@ echo "  make tail-errors         # live JSONL tail of structured ERROR events" >
 echo "  make errors-summary      # human-readable snapshot (refreshed every 60s by the app)" >&2
 echo "  make triage-dry-run      # what would auto-fix do? (inspect before execute)" >&2
 echo "  make triage-execute      # run the auto-fix against today's novel signatures" >&2
-echo "MCP live tools (auto-loaded via .mcp.json — 12 tools, prefix mcp__tickvault-logs__):" >&2
+echo "MCP live tools (auto-loaded via .mcp.json — prefix mcp__tickvault-logs__):" >&2
 echo "  tail_errors, list_novel_signatures, summary_snapshot, triage_log_tail," >&2
-echo "  signature_history, prometheus_query, find_runbook_for_code, list_active_alerts," >&2
-echo "  questdb_sql, grep_codebase, run_doctor, git_recent_log" >&2
+echo "  signature_history, find_runbook_for_code, questdb_sql, grep_codebase," >&2
+echo "  run_doctor, git_recent_log, app_log_tail, docker_status, tickvault_api" >&2
 echo "Runbooks (for operator + any AI session): docs/runbooks/README.md (54-code index)" >&2
 echo "Architecture + guarantees: docs/architecture/{zero-touch-stack,guarantees,claude-cowork}.md" >&2
 
@@ -128,34 +128,17 @@ echo "Architecture + guarantees: docs/architecture/{zero-touch-stack,guarantees,
 if [ -f "$SESSION_ENV" ]; then
   echo "" >&2
   echo "Runtime endpoints (profile=${TICKVAULT_MCP_PROFILE:-?}):" >&2
-  printf "  prom=%s  alert=%s  questdb=%s  grafana=%s  api=%s\n" \
-    "${TICKVAULT_PROM_STATUS:-?}" "${TICKVAULT_ALERT_STATUS:-?}" \
-    "${TICKVAULT_QDB_STATUS:-?}" "${TICKVAULT_GRAF_STATUS:-?}" \
-    "${TICKVAULT_API_STATUS:-?}" >&2
+  printf "  questdb=%s  api=%s\n" \
+    "${TICKVAULT_QDB_STATUS:-?}" "${TICKVAULT_API_STATUS:-?}" >&2
 fi
 
-# PR #288 (#9b): LIVE METRIC PULL — when Prometheus is REACHABLE, pull the
-# zero-tick-loss-adjacent counters so every session opens knowing whether
-# the app is actually dropping ticks / losing frames. 2s timeout per query,
-# 5 queries total — bounded at 10s worst case. If Prometheus is OFFLINE,
-# this block is skipped entirely (SessionStart stays fast).
-if [ "${TICKVAULT_PROM_STATUS:-}" = "REACHABLE" ] && [ -n "${TICKVAULT_PROMETHEUS_URL:-}" ]; then
-  prom_q() {
-    local q="$1"
-    curl -fsS -m 2 --data-urlencode "query=$q" \
-      "${TICKVAULT_PROMETHEUS_URL}/api/v1/query" 2>/dev/null \
-      | awk 'match($0, /"value":\[[^,]+,"([^"]+)"/, a) { print a[1]; exit }'
-  }
-  TICKS_DROPPED=$(prom_q 'sum(tv_ticks_dropped_total)' 2>/dev/null)
-  SEQ_HOLES=$(prom_q 'sum(tv_depth_sequence_holes_total)' 2>/dev/null)
-  COLLISIONS=$(prom_q 'tv_instrument_registry_cross_segment_collisions' 2>/dev/null)
-  WS_UP=$(prom_q 'tv_websocket_connections_active' 2>/dev/null)
-  QDB_SPILL=$(prom_q 'sum(tv_questdb_spill_bytes)' 2>/dev/null)
-  echo "Live signal (from Prometheus):" >&2
-  printf "  ticks_dropped=%s  depth_seq_holes=%s  id_collisions=%s  ws_active=%s  qdb_spill_bytes=%s\n" \
-    "${TICKS_DROPPED:-n/a}" "${SEQ_HOLES:-n/a}" "${COLLISIONS:-n/a}" \
-    "${WS_UP:-n/a}" "${QDB_SPILL:-n/a}" >&2
-fi
+# Zero-tick-loss-adjacent counters (tv_ticks_dropped_total,
+# tv_depth_sequence_holes_total, tv_instrument_registry_cross_segment_collisions,
+# tv_websocket_connections_active, tv_questdb_spill_bytes) are now observed via
+# CloudWatch metrics (scraped from the app `/metrics` exporter) — the local
+# Prometheus session-start pull was retired in #O5 (2026-05-30, Prometheus
+# container removed in #O3). A CloudWatch-/`/metrics`-backed session-start
+# counter pull can be re-added as a follow-up enhancement.
 
 # LIVE ERROR TAIL — inline the last 10 structured ERROR events, if any.
 # Every Claude session / cowork task starts with this in context so nobody

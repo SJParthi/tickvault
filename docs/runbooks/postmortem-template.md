@@ -47,7 +47,7 @@ dependency and its failure mode.)
 
 **Evidence:**
 - `mcp__tickvault-logs__tail_errors --limit 100 --code <X>` (attached log snippet)
-- `mcp__tickvault-logs__prometheus_query(...)` (snapshot of relevant metric)
+- CloudWatch metric snapshot (or app `/metrics` exporter readout) for the relevant counter — the `prometheus_query` MCP tool was retired in #O5 (2026-05-30, Prometheus container removed in #O3)
 - Git commit(s): `<sha>`
 - Dashboard screenshot(s): `tv-<uid>` at `<time>`
 

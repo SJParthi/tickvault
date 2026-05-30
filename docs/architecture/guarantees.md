@@ -134,9 +134,9 @@ no shell, no curl, no grep:
 | "Current error summary?" | `summary_snapshot` |
 | "Triage audit trail?" | `triage_log_tail` |
 | "Full history of signature X?" | `signature_history` |
-| "What's the current metric X?" | `prometheus_query` |
+| "What's the current metric X?" | CloudWatch metrics / app `/metrics` exporter (the `prometheus_query` MCP tool was retired in #O5, 2026-05-30) |
 | "Which runbook for code Y?" | `find_runbook_for_code` |
-| "What's firing right now?" | `list_active_alerts` |
+| "What's firing right now?" | CloudWatch alarms / `run_doctor` (the `list_active_alerts` MCP tool was retired in #O5, 2026-05-30) |
 | "Run SQL query Z" | `questdb_sql` |
 | "Find pattern P in the codebase" | `grep_codebase` |
 | "Is the system healthy?" | `run_doctor` |

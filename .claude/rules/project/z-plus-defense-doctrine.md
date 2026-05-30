@@ -132,7 +132,7 @@ Every new Claude Code / Cowork session automatically inherits via SessionStart h
 |---|---|---|
 | 1 | `mcp__tickvault-logs__run_doctor` | 7-section health snapshot |
 | 2 | `mcp__tickvault-logs__summary_snapshot` | Recent ERROR signatures |
-| 3 | `mcp__tickvault-logs__list_active_alerts` | Currently-firing alerts |
+| 3 | `mcp__tickvault-logs__run_doctor` (CloudWatch alarms) | Currently-firing alerts |
 | 4 | `session-auto-health.sh` | Doctor + validate-automation in background |
 | 5 | `session-context-brief.sh` | Active plans + open PRs |
 | 6 | `session-sanity.sh` | Branch + uncommitted check |

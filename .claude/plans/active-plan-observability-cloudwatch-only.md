@@ -138,7 +138,30 @@ ratchets updated, one PR at a time per `pr-completion-protocol.md` §H.
   - Tests: `cargo build --workspace`; boot must still succeed with the
     token manager reading SSM directly.
 
-- [ ] **#O5 — guard / rule / script cleanup** (Valkey slice DONE 2026-05-30; Prometheus/Alertmanager slice pending)
+- [ ] **#O5 — guard / rule / script cleanup** (Valkey slice DONE; PrometheusConfig+AM config slice DONE #891; query-tooling+script sweep DONE 2026-05-30; aws-budget memory recompute + triage/verify.sh matched-pair PENDING)
+  - **DONE (symmetric query-tooling removal, PR 2026-05-30):** operator-decided
+    symmetric full removal — deleted the dead `prometheus_query` (Prometheus
+    :9090, removed #O3) + `list_active_alerts` (Alertmanager :9093, removed #O2)
+    MCP tools + both `ToolSpec`s from `server.py`; dropped `prometheus_url` from
+    all 3 endpoint profiles + the `Profile` struct + `claude_mcp_endpoints_config_guard.rs`;
+    dropped `TICKVAULT_PROMETHEUS_URL` from `claude_session_bootstrap_guard.rs`;
+    removed the dead Prometheus session-start pull from `session-sanity.sh` + its
+    lockstep guard test; removed the 2 dead tools from
+    `tickvault_logs_mcp_guard.rs::REQUIRED_TOOL_NAMES`; swept the
+    Grafana/Prometheus/Alertmanager container probes from `doctor.sh`,
+    `verify-stack.sh`, `mcp-doctor.sh`, `claude-session-bootstrap.sh`,
+    `tv-tunnel/doctor.sh` (incl. `--emit-config`); name-swapped every
+    `prometheus_query`/`list_active_alerts` ref across the auto-loaded `.claude/rules/`
+    charter + 8 rule files + 2 slash commands + CLAUDE.md + 8 docs to
+    CloudWatch / `run_doctor` / `questdb_sql`. Kept the `/metrics` exporter
+    (port 9091, CloudWatch-scraped) untouched.
+  - **STILL PENDING:** (a) `aws-budget.md` 3-component memory-table recompute
+    (file is SUPERSEDED by the daily-universe lock; low value); (b) the
+    `scripts/triage/verify.sh` ↔ `autonomous_ops_m3_m4_guard.rs` matched pair —
+    a *separate* autonomous-ops M3/M4 subsystem that queries Prometheus to verify
+    auto-fix outcomes; retargeting it to CloudWatch is a re-design, not a
+    mechanical removal, so it is a clearly-scoped FOLLOW-UP (source-scan guard
+    still passes today → no build break).
   - **DONE (PR after #889):** removed all residual *Valkey* refs —
     `Makefile` status target, `.github/workflows/chaos-nightly.yml`
     `TV_VALKEY_URL`, `scripts/{verify-stack,smoke-test,ensure-ready,setup-observability}.sh`

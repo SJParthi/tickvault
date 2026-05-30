@@ -88,8 +88,9 @@ the tick_processor task crashed. Check `errors.log` for a panic trace.
 ```bash
 # Check the buffer size history via the metrics exporter / CloudWatch.
 # Buffer at > 100K = backpressure. Buffer at 600K+ = spilling.
-# Prefer the MCP tool: mcp__tickvault-logs__prometheus_query "tv_tick_buffer_size"
-# (or query the tv_tick_buffer_size metric in the CloudWatch console).
+# Query the tv_tick_buffer_size metric in the CloudWatch console (prod)
+# or curl the app's /metrics endpoint (dev). The prometheus_query MCP
+# tool was retired in #O5 (2026-05-30) — Prometheus container removed in #O3.
 ```
 
 ## Recovery

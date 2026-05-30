@@ -18,7 +18,7 @@ button.
    Run `/health` logic inline (do NOT re-invoke the slash command; you
    are already in a session). This prints the canonical 14-row PASS/FAIL
    table for static guards, doctor, audit, ERROR tail, summary snapshot,
-   novel signatures, Prometheus/QuestDB pulse, alerts.
+   novel signatures, metric/QuestDB pulse, CloudWatch alarms.
 
 3. **Kick off cloud verification (fire-and-forget).**
    ```
@@ -40,9 +40,11 @@ button.
    Call `mcp__tickvault-logs__list_novel_signatures` (since=120 minutes).
    If zero → good. If non-zero → list codes + counts.
 
-6. **Firing alerts.**
-   Call `mcp__tickvault-logs__list_active_alerts`. Zero firing = good.
-   Any firing → name them + severity.
+6. **Firing alarms.**
+   Check CloudWatch alarms (prod) or `mcp__tickvault-logs__run_doctor`
+   (the `list_active_alerts` MCP tool was retired in #O5 (2026-05-30)
+   when the Alertmanager container was removed in #O2). Zero firing =
+   good. Any firing → name them + severity.
 
 ## Output format
 

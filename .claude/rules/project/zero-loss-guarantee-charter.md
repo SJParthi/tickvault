@@ -22,7 +22,7 @@ This is a **checklist contract**, not an aspiration. The mechanical reality:
 
 | When | What is checked | By what |
 |---|---|---|
-| Every new/current session START | this charter is auto-loaded; session runs `run_doctor` + `summary_snapshot` + `list_active_alerts` | `.claude/settings.json` SessionStart hooks |
+| Every new/current session START | this charter is auto-loaded; session runs `run_doctor` + `summary_snapshot` (CloudWatch alarms surfaced via `run_doctor`) | `.claude/settings.json` SessionStart hooks |
 | Every PR / sub-PR | the §3 GUARANTEE CHECK block is filled in the PR body (every box ticked **or** marked `N/A — <reason>`) | `.github/pull_request_template.md` + reviewer |
 | Every task / sub-task / plan item | the §3 block is carried in the plan item (or cross-referenced) | `per-item-guarantee-check.sh` + `plan-verify.sh` |
 | Every commit | banned-pattern + secret + pub-fn + fmt + the 12 pre-push gates | git hooks (see `operator-charter-forever.md` enforcement chain) |
@@ -139,7 +139,7 @@ the operator's "no hallucination" rule made mechanical:
 
 - "tests pass" → paste the `test result: ok. N passed` line, with N.
 - "fast / O(1)" → paste Criterion / DHAT numbers, name the budget.
-- "alerts fire" → name the Prom rule + `list_active_alerts` result.
+- "alerts fire" → name the Prom rule + the CloudWatch alarm state (via `run_doctor`).
 - "audited" → name the `<event>_audit` table + a `questdb_sql` count.
 - "recovers" → name the chaos test that exercises the path.
 
