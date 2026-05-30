@@ -251,6 +251,29 @@ fn test_terraform_eventbridge_schedules_match_budget() {
 }
 
 #[test]
+fn test_seed_staging_ssm_self_fires_and_cowork_can_dispatch() {
+    // Zero-click automation: the seed workflow self-fires on a daily cron (no
+    // human clicks "Run workflow"), and Claude Cowork (claude-mobile-command)
+    // has actions:write so it can dispatch aws-control / deploy / seed on
+    // request. Both pinned so the self-firing automation can't silently regress.
+    let seed =
+        std::fs::read_to_string(workspace_root().join(".github/workflows/seed-staging-ssm.yml"))
+            .expect("seed-staging-ssm.yml must be readable"); // APPROVED: test
+    assert!(
+        seed.contains("schedule:") && seed.contains("cron:"),
+        "seed-staging-ssm.yml must self-fire on a cron schedule (zero-click)"
+    );
+    let mobile = std::fs::read_to_string(
+        workspace_root().join(".github/workflows/claude-mobile-command.yml"),
+    )
+    .expect("claude-mobile-command.yml must be readable"); // APPROVED: test
+    assert!(
+        mobile.contains("actions: write"),
+        "claude-mobile-command must have actions:write so Cowork can dispatch AWS workflows"
+    );
+}
+
+#[test]
 fn test_aws_control_workflow_covers_all_operations() {
     // Full automation: a single dispatchable workflow operates the whole AWS
     // deployment (start/stop/reboot/status/restart-app/restart-questdb/
