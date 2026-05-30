@@ -308,6 +308,49 @@ fn test_aws_control_workflow_covers_all_operations() {
 }
 
 #[test]
+fn test_terraform_instance_role_has_ssm_managed_core() {
+    // Regression 2026-05-30 (deploy-aws run #98): `aws ssm send-command` failed
+    // with `InvalidInstanceId: Instances not in a valid state for account`. The
+    // EC2 instance role had inline ssm:GetParameter perms (for the app to read
+    // secrets) but NOT AmazonSSMManagedInstanceCore, so the SSM *agent* could
+    // not register the box as a managed instance. The deploy pushes the binary
+    // via SSM, so this attachment is mandatory. (Session Manager tunnels in
+    // docs/runbooks/aws-access-from-anywhere.md also depend on it.)
+    let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
+        .expect("main.tf must be readable"); // APPROVED: test
+    assert!(
+        content.contains("AmazonSSMManagedInstanceCore"),
+        "main.tf must attach AmazonSSMManagedInstanceCore to the EC2 instance \
+         role — required for `aws ssm send-command` (the deploy mechanism) to \
+         reach the box; without it send-command fails InvalidInstanceId."
+    );
+}
+
+#[test]
+fn test_deploy_aws_resolves_account_id_at_runtime() {
+    // Regression 2026-05-30 (deploy-aws run #98): the Telegram-notify steps used
+    // ${{ secrets.AWS_ACCOUNT_ID }} which was empty -> SNS publish failed with
+    // `Invalid parameter: AccountId`. The account id is now derived at runtime
+    // via `aws sts get-caller-identity`, removing the manual-secret dependency.
+    let content =
+        std::fs::read_to_string(workspace_root().join(".github/workflows/deploy-aws.yml"))
+            .expect("deploy-aws.yml must be readable"); // APPROVED: test
+    assert!(
+        content.contains("aws sts get-caller-identity --query Account"),
+        "deploy-aws.yml must derive the AWS account id at runtime"
+    );
+    assert!(
+        content.contains("steps.acct.outputs.id"),
+        "deploy-aws.yml SNS topic ARNs must use the runtime-derived account id"
+    );
+    assert!(
+        !content.contains("secrets.AWS_ACCOUNT_ID"),
+        "deploy-aws.yml must NOT reference the empty AWS_ACCOUNT_ID secret \
+         (it caused the SNS `Invalid parameter: AccountId` failure)."
+    );
+}
+
+#[test]
 fn test_terraform_s3_lifecycle_matches_sebi_retention() {
     let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
         .expect("main.tf must be readable"); // APPROVED: test

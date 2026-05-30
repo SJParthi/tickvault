@@ -20,9 +20,11 @@
 #   4. Existing rollback path triggers on failed smoke test.
 #
 # Secrets required (GitHub repo > Settings > Secrets and variables > Actions):
-#   AWS_ROLE_ARN                — OIDC role assumed by the workflow
-#   AWS_ACCOUNT_ID              — used in the role ARN template
+#   AWS_ROLE_ARN                — OIDC role assumed by the workflow (optional if
+#                                 access keys are set; preflight accepts either)
 #   EC2_INSTANCE_ID             — the tv-prod-app instance ID from tf output
+#   (AWS_ACCOUNT_ID is NO LONGER required — derived at runtime via
+#    `aws sts get-caller-identity`, see the "Resolve AWS account id" step.)
 #
 # Variables (repo > Settings > Secrets and variables > Variables):
 #   AWS_REGION                  — ap-south-1
@@ -231,6 +233,16 @@ jobs:
           aws-region: ${{ vars.AWS_REGION || 'ap-south-1' }}
           role-session-name: tv-github-deploy-${{ github.run_id }}
 
+      - name: Resolve AWS account id at runtime
+        # Derive the account id from the live credentials instead of relying on
+        # the AWS_ACCOUNT_ID GitHub secret (which was empty -> SNS publish failed
+        # with `Invalid parameter: AccountId` in deploy-aws run #98). This removes
+        # a manual-setup dependency entirely: the SNS topic ARN for the Telegram
+        # notify steps is built from this value. Runs early (right after creds)
+        # so its output is available to the `if: failure()` notify step too.
+        id: acct
+        run: echo "id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
+
       - name: Upload both binaries to S3 staging bucket
         run: |
           chmod +x ./dist/tickvault ./dist/smoke_test
@@ -350,7 +362,7 @@ jobs:
           # an INFO-level message so the operator sees the deploy land.
           aws sns publish \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
-            --topic-arn arn:aws:sns:${{ vars.AWS_REGION || 'ap-south-1' }}:${{ secrets.AWS_ACCOUNT_ID }}:tv-prod-alerts \
+            --topic-arn arn:aws:sns:${{ vars.AWS_REGION || 'ap-south-1' }}:${{ steps.acct.outputs.id }}:tv-prod-alerts \
             --subject "DLT deploy OK" \
             --message "commit=${{ github.sha }} ref=${{ github.ref }} actor=${{ github.actor }}"
 
@@ -359,6 +371,6 @@ jobs:
         run: |
           aws sns publish \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
-            --topic-arn arn:aws:sns:${{ vars.AWS_REGION || 'ap-south-1' }}:${{ secrets.AWS_ACCOUNT_ID }}:tv-prod-alerts \
+            --topic-arn arn:aws:sns:${{ vars.AWS_REGION || 'ap-south-1' }}:${{ steps.acct.outputs.id }}:tv-prod-alerts \
             --subject "DLT deploy FAILED" \
             --message "commit=${{ github.sha }} ref=${{ github.ref }} actor=${{ github.actor }} run=${{ github.run_id }}"
