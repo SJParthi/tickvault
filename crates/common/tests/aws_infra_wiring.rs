@@ -130,6 +130,40 @@ fn test_terraform_instance_type_pinned() {
 }
 
 #[test]
+fn test_cloudwatch_operator_dashboard_exists() {
+    // The CloudWatch-only runtime has NO Grafana — the operator dashboard is a
+    // native CloudWatch dashboard (deploy/aws/terraform/dashboard.tf). It must
+    // exist + chart only metrics the CW agent actually scrapes (the allowlist
+    // in user-data prometheus.yaml) + reference real alarm resources, so a
+    // terraform apply doesn't fail and no widget is empty.
+    let dash = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/dashboard.tf"))
+        .expect("dashboard.tf must be readable"); // APPROVED: test
+    assert!(
+        dash.contains("resource \"aws_cloudwatch_dashboard\" \"operator\""),
+        "dashboard.tf must declare the operator CloudWatch dashboard"
+    );
+    // A few signal metrics that MUST be charted (and are in the scrape allowlist).
+    for metric in &[
+        "tv_realtime_guarantee_score",
+        "tv_questdb_disconnected_seconds",
+        "tv_token_remaining_seconds",
+        "tv_aggregator_seals_emitted_total",
+    ] {
+        assert!(
+            dash.contains(metric),
+            "operator dashboard must chart {metric} (a scraped Tickvault/Prod metric)"
+        );
+    }
+    // The dashboard_url output lets the operator jump straight to it.
+    let outputs = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/outputs.tf"))
+        .expect("outputs.tf must be readable"); // APPROVED: test
+    assert!(
+        outputs.contains("dashboard_url"),
+        "outputs.tf must expose dashboard_url for one-click console access"
+    );
+}
+
+#[test]
 fn test_terraform_instance_iam_allows_staging_ssm_prefix() {
     // The app reads its secrets under the SSM prefix selected by
     // TV_ENVIRONMENT (systemd unit) = "staging" for the 3-month data-pull

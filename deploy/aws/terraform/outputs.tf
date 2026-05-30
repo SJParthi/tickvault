@@ -39,3 +39,8 @@ output "ssm_session_command" {
   description = "One-liner to open a Session Manager shell (no SSH key needed)"
   value       = "aws ssm start-session --region ${var.aws_region} --target ${aws_instance.tv_app.id}"
 }
+
+output "dashboard_url" {
+  description = "Direct URL to the CloudWatch operator dashboard (open in any browser)"
+  value       = "https://${var.aws_region}.console.aws.amazon.com/cloudwatch/home?region=${var.aws_region}#dashboards/dashboard/${aws_cloudwatch_dashboard.operator.dashboard_name}"
+}
