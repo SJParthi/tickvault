@@ -130,6 +130,35 @@ fn test_terraform_instance_type_pinned() {
 }
 
 #[test]
+fn test_terraform_instance_iam_allows_staging_ssm_prefix() {
+    // The app reads its secrets under the SSM prefix selected by
+    // TV_ENVIRONMENT (systemd unit) = "staging" for the 3-month data-pull
+    // phase. The instance IAM role is named with var.environment (prod), so
+    // its SSM Resource must EXPLICITLY also allow /tickvault/staging/* —
+    // otherwise the box is IAM-denied reading /tickvault/staging/dhan/* and
+    // boot fails at auth. Regression: 2026-05-30 pre-flight audit caught the
+    // app(staging) vs IAM(prod) SSM-prefix mismatch before first deploy.
+    let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
+        .expect("main.tf must be readable"); // APPROVED: test
+    assert!(
+        content.contains("parameter/tickvault/staging/*"),
+        "main.tf instance IAM role must allow ssm:GetParameter on \
+         /tickvault/staging/* — the app's TV_ENVIRONMENT=staging SSM prefix. \
+         Without it the box is IAM-denied reading its Dhan/Telegram secrets."
+    );
+    // The systemd unit must agree — TV_ENVIRONMENT=staging is the source of the
+    // staging SSM prefix the IAM line above grants.
+    let unit = std::fs::read_to_string(workspace_root().join("deploy/systemd/tickvault.service"))
+        .expect("tickvault.service must be readable"); // APPROVED: test
+    assert!(
+        unit.contains("TV_ENVIRONMENT=staging"),
+        "tickvault.service must set TV_ENVIRONMENT=staging (data-pull, no real \
+         orders). If this flips to prod, the IAM staging grant + this test must \
+         be revisited together (production.toml arms real money)."
+    );
+}
+
+#[test]
 fn test_terraform_eventbridge_schedules_match_budget() {
     let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
         .expect("main.tf must be readable"); // APPROVED: test
