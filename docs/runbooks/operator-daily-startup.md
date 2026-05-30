@@ -11,8 +11,8 @@
 |---|---|---|---|---|
 | 1 | Telegram `BootReadyConfirmation` arrived | Telegram chat | Single Severity::Info message dated today's IST date | Section A below |
 | 2 | All 4 boot gates green | Same Telegram thread | `static_ip ✓ instance_lock ✓ clock_skew ✓ questdb_ready ✓` | Section B below |
-| 3 | Grafana operator-health dashboard | `http://<host>:3000/d/operator-health` | All 7 health tiles green; no firing alerts | Section C below |
-| 4 | 222/222 SIDs subscribed | Grafana "Main feed subscription count" tile | `tv_main_feed_subscribed_total == 222` | Section D below |
+| 3 | CloudWatch operator-health dashboard | CloudWatch console → Dashboards → operator-health | All 7 health widgets green; no firing alarms | Section C below |
+| 4 | Main feed SIDs subscribed | CloudWatch "Main feed subscription count" widget | `tv_main_feed_subscribed_total` matches the expected universe size | Section D below |
 | 5 | `previous_close` table populated for today | QuestDB | `SELECT count(*) FROM previous_close WHERE trading_date_ist = today()` returns ≥ 200 rows | Section E below |
 
 ## Time budget
@@ -22,8 +22,8 @@
 08:30 — phone unlock + Telegram open
 08:30 — check #1 BootReadyConfirmation
 08:31 — check #2 4 boot gates
-08:32 — open Grafana operator-health
-08:33 — check #3 dashboard tiles
+08:32 — open CloudWatch operator-health dashboard
+08:33 — check #3 dashboard widgets
 08:34 — check #4 subscription count
 08:35 — open QuestDB console
 08:36 — check #5 previous_close row count
@@ -68,13 +68,19 @@ present in the same Telegram thread.
     section 4 + `docker ps`. If QuestDB cold-starting, wait 30s and
     boot will auto-pass.
 
-## Section C — Grafana dashboard tile red
+## Section C — CloudWatch dashboard widget red
 
-  1. The dashboard is `deploy/docker/grafana/dashboards/operator-health.json`
-     (pinned by `crates/storage/tests/operator_health_dashboard_guard.rs`).
-  2. Each tile maps to a Prometheus counter — drill in to identify the
+> The local Grafana operator-health dashboard was retired in the
+> CloudWatch-only migration (#O1, 2026-05-19). Operator visualization now
+> lives in CloudWatch Dashboards; the QuestDB web console covers ad-hoc
+> queries.
+
+  1. The dashboard is the CloudWatch `operator-health` dashboard
+     (provisioned via Terraform under `deploy/aws/terraform/`).
+  2. Each widget maps to a CloudWatch metric (ingested from the app's
+     Prometheus-wire-format exporter) — drill in to identify the
      failing dimension.
-  3. The 7 tiles: WebSocket connections, QuestDB connected, tick freshness,
+  3. The 7 widgets: WebSocket connections, QuestDB connected, tick freshness,
      token expiry headroom, spill ring health, Phase 2 outcome,
      composite SLO score.
   4. **Cross-reference with `mcp__tickvault-logs__list_active_alerts`** —

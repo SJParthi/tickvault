@@ -154,8 +154,9 @@ see §11 for rollback.
 
 ## §5. Instance unreachable
 
-**Symptom:** Both `aws ssm start-session` and SSH time out. Grafana also
-unreachable (port-forward fails).
+**Symptom:** Both `aws ssm start-session` and SSH time out. The CloudWatch
+operator-health dashboard shows no fresh metrics (the EC2 host stopped
+reporting).
 
 **Likely causes:** kernel panic, network layer issue, EC2 hardware fault.
 

@@ -129,8 +129,9 @@ Post-AWS-lifecycle (PRs #2-#7d, 2026-05-19) the API surface narrowed
 to operator/observability endpoints. The entire `/portal/*` HTML
 frontend + `/api/option-chain` + `/api/pcr` + `/api/market/indices`
 + `/api/movers*` + `/api/instruments/*` + `/api/index-constituency*`
-routes were retired (replacement: Grafana / Telegram / MCP /
-QuestDB Console).
+routes were retired (replacement: CloudWatch Dashboards / Telegram /
+MCP / QuestDB Console). (Grafana was retired in the CloudWatch-only
+migration #O1, 2026-05-19.)
 
 | File | Contains |
 |------|----------|
@@ -259,10 +260,10 @@ make bench                           # cargo bench --workspace
 make audit                           # cargo audit + cargo deny
 
 # Dashboards
-make grafana                         # localhost:3000
-make questdb                         # localhost:9000
-make jaeger                          # localhost:16686
-make prometheus                      # localhost:9090
+make questdb                         # localhost:9000 (QuestDB web console)
+# Operator dashboards in prod = AWS CloudWatch Dashboards.
+# Grafana / Prometheus / Jaeger were retired in the CloudWatch-only
+# migration (#O1/#O3, 2026-05-19); their make targets no longer exist.
 ```
 
 ## TESTING STRATEGY
@@ -336,17 +337,20 @@ make prometheus                      # localhost:9090
 **Commit message:** `^(feat|fix|refactor|test|docs|chore|perf|security|ci|build|style|bench|revert)(\([a-z0-9_/-]+\))?: .+`
 **Other hooks:** pre-tool-dispatch, auto-save, session-sanity, plan-verify, block-env-files
 
-## DOCKER SERVICES (8 containers)
+## DOCKER SERVICES
+
+Post CloudWatch-only migration (#O1/#O2/#O3/#O4, 2026-05-19+) the runtime
+is **QuestDB + the tickvault app + AWS CloudWatch ONLY**. The metrics /
+dashboards / alerting containers were removed: Grafana (#O1), Alertmanager
+(#O2), Prometheus (#O3), and Valkey (#O4). Jaeger and Traefik were retired
+earlier. CloudWatch (metrics + logs + alarms + dashboards) is the entire
+observability layer in prod.
 
 | Service | Image Version | Port | Purpose |
 |---------|--------------|------|---------|
-| tv-questdb | 9.3.2 | 9000/8812/9009 | Time-series DB |
-| tv-prometheus | v3.9.1 | 9090 | Metrics |
-| tv-grafana | 12.3.3 | 3000 | Dashboards |
-| tv-jaeger | 2.15.0 | 16686 | Distributed tracing |
-| tv-loki | 3.6.6 | 3100 | Log aggregation |
-| tv-alloy | v1.8.0 | — | Observability collector |
-| tv-traefik | v3.6.8 | 80/443/8080 | API gateway |
+| tv-questdb | 9.3.5 | 9000/8812/9009 | Time-series DB |
+| tv-loki | 3.7.1 | 3100 | Log aggregation (Alloy ships logs to CloudWatch in prod) |
+| tv-alloy | v1.16.0 | — | Observability collector |
 
 All images pinned with SHA256 digest. Config in `deploy/docker/docker-compose.yml`.
 

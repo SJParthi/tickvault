@@ -111,11 +111,11 @@
 │                   └─────────────┘                          │
 │                                                            │
 │  Monitoring (continuous):                                  │
-│  ├── Prometheus scrapes every 15s                          │
+│  ├── App metrics → CloudWatch every ~60s                   │
 │  ├── Tick gap detection per-tick (30s warn, 120s error)   │
 │  ├── Token renewal at 23h mark                             │
 │  ├── IP verification every 5 min                           │
-│  └── Grafana dashboards auto-refresh 5s                    │
+│  └── CloudWatch dashboards (Grafana retired #O1, 2026-05-19)│
 │                                                            │
 │  Market Close (15:30 IST):                                 │
 │  ├── WebSocket connections gracefully closed                │
@@ -240,11 +240,10 @@ Docker auto-restarts (OS-level service)
     ▼
 Containers restart: restart: unless-stopped
     QuestDB: ~15s to healthy
-    Valkey: ~5s
-    Prometheus: ~10s
-    Grafana: ~15s (depends on Loki)
-    Loki: ~10s (/ready healthcheck)
-    Alloy: ~10s (depends on Loki)
+    (Valkey/Prometheus/Grafana/Loki/Alloy containers were removed in the
+     CloudWatch-only migration #O1–#O4, 2026-05-19/05-24 — the only
+     containers now are QuestDB + the tickvault app; metrics/logs/alarms/
+     dashboards live in AWS CloudWatch)
     │
     ▼
 App (systemd) detects QuestDB healthy
@@ -334,18 +333,22 @@ Next reconnect attempt succeeds
 │  Events: AuthFailed, TokenRenewalFailed, WS Disconnected │
 │          InstrumentBuildFailed, RiskHalt, IpMismatch     │
 │                                                           │
-│  Path 2: Prometheus → Grafana → Telegram (1-5 min)      │
+│  Path 2: Metrics → CloudWatch Alarm → Telegram (1-5 min) │
 │  ─────────────────────────────────────────────           │
-│  App metrics → Prometheus scrape → Alert rules →          │
-│  Grafana unified alerting → tv-telegram contact point   │
-│  Alerts: TargetDown, AppDown, PipelineStopped,           │
-│          NoTicks, HighParseErrors, ServiceFlapping        │
+│  App metrics (Prom wire format) → CloudWatch metrics →    │
+│  CloudWatch Alarm → SNS → Telegram (via Lambda webhook)  │
+│  Alarms: AppDown, PipelineStopped, NoTicks,              │
+│          HighParseErrors, ServiceFlapping                 │
 │                                                           │
-│  Path 3: Loki ERROR logs → Grafana → Telegram (1-3 min) │
+│  Path 3: ERROR logs → CloudWatch → Telegram (1-3 min)   │
 │  ─────────────────────────────────────────────           │
-│  error!() → file → Alloy → Loki → Grafana alert rule →  │
-│  tv-telegram contact point                               │
+│  error!() → file → CloudWatch Logs agent → CloudWatch    │
+│  Logs metric filter / alarm → SNS → Telegram             │
 │  Covers: tick gaps, QuestDB failures, panics, any ERROR  │
+│                                                           │
+│  (Grafana #O1, Alertmanager #O2, Prometheus #O3, Loki/   │
+│   Alloy containers were retired in the CloudWatch-only    │
+│   migration, 2026-05-19; CloudWatch is the prod layer.)   │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -353,11 +356,11 @@ Next reconnect attempt succeeds
 
 | Failure | Path | Time to Alert |
 |---------|------|---------------|
-| App crash | Path 2 (Prometheus) | ~1 min |
+| App crash | Path 2 (CloudWatch alarm) | ~1 min |
 | WS disconnect | Path 1 (Direct) | <1s |
 | Token failure | Path 1 (Direct) | <1s |
-| Tick gap >120s | Path 3 (Loki ERROR) | ~2 min |
-| QuestDB write fail | Path 2 (Prometheus) | ~3 min |
+| Tick gap >120s | Path 3 (CloudWatch ERROR log) | ~2 min |
+| QuestDB write fail | Path 2 (CloudWatch alarm) | ~3 min |
 | Container restart | Path 2 (Prometheus) | ~2-5 min |
 | IP mismatch | Path 1 (Direct) | <1s |
 | Parse errors | Path 2 (Prometheus) | ~3 min |
@@ -419,7 +422,7 @@ If any check fails → CRITICAL Telegram alert + HALT.
 | Token expires | ✅ Auto-renewal | None |
 | Network outage | ✅ Auto-reconnect | Check Telegram |
 | Docker restarts | ✅ unless-stopped | Check Telegram |
-| Data gaps | ✅ Post-market backfill | Check Grafana after close |
+| Data gaps | ✅ Post-market backfill | Check CloudWatch dashboard after close |
 
 **Bottom line:** Start the app, go to the gym. Everything is automated.
 Your only job is to check Telegram if it buzzes.

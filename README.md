@@ -27,7 +27,7 @@ tickvault/
 │   ├── api/                # Axum HTTP API + dashboard
 │   └── app/                # Binary entrypoint (main.rs boot sequence)
 ├── docs/                   # Phase docs, codebase map, reference
-├── deploy/                 # Docker Compose, Dockerfiles, Grafana dashboards
+├── deploy/                 # Docker Compose, Dockerfiles, AWS/CloudWatch config
 ├── quality/                # Benchmark budgets, quality gates
 ├── scripts/                # Bootstrap, CI, deployment scripts
 └── fuzz/                   # Fuzz testing targets
@@ -55,11 +55,13 @@ cargo run
 
 ## Development Security Notes
 
-The `docker-compose.yml` services are configured for **local development only**:
+The `docker-compose.yml` services are configured for **local development only**.
+Post the CloudWatch-only migration (#O1–#O4, 2026-05-19) the runtime is
+QuestDB + the tickvault app + AWS CloudWatch only; Grafana, Prometheus,
+Alertmanager, and Valkey were removed (Traefik/Jaeger retired earlier). The
+remaining dev containers:
 
-- **Grafana:** anonymous admin enabled (`GF_AUTH_ANONYMOUS_ORG_ROLE=Admin`) — disable in prod
-- **Traefik:** dashboard on port 8080 without auth — add basicAuth middleware in prod
-- **Loki:** auth disabled — enable auth via reverse proxy in prod
+- **Loki / Alloy:** auth disabled — log pipeline; Alloy ships logs to CloudWatch in prod
 - **QuestDB:** credentials loaded from AWS SSM (not hardcoded)
 
 Production hardening is tracked in Phase 2 (AWS deployment).

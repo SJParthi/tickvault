@@ -8,13 +8,13 @@
 - [ ] Review today's economic events (RBI announcements? Budget? GDP data?)
 - [ ] Check NSE market status: https://www.nseindia.com
 - [ ] Set today's personal loss limit in your mind — decide now, not during loss
-- [ ] Verify Grafana dashboard accessible
+- [ ] Verify CloudWatch operator-health dashboard accessible
 - [ ] Verify Telegram alerts working (startup message received)
 
 ## During Market Hours (9:15 AM - 3:30 PM IST)
 
 - [ ] Do NOT watch P&L tick by tick
-- [ ] Set Grafana dashboard to refresh every 5 minutes, not real-time
+- [ ] Set the CloudWatch dashboard to refresh every 5 minutes, not real-time
 - [ ] Check alerts — react to CRITICAL only, queue HIGH for 5-minute check
 - [ ] Do not add positions based on "feeling"
 - [ ] Take one break between 11 AM - 12 PM away from the screen

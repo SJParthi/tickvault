@@ -27,6 +27,6 @@
 
 ## Post-Release
 - [ ] Telegram notification: "v<X.Y.Z> deployed successfully"
-- [ ] Grafana annotation: release marker on dashboards
+- [ ] CloudWatch annotation: release marker on the operator-health dashboard
 - [ ] Old version containers stopped after 30-minute window
 - [ ] Git tag pushed, GitHub release created with changelog

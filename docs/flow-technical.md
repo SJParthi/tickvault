@@ -47,7 +47,7 @@ Step 2: Prometheus Metrics
   ▼
 Step 3: Structured Logging
   │  tracing-subscriber with 3 layers:
-  │    Console (text or JSON) + File (JSON for Alloy→Loki) + OpenTelemetry
+  │    Console (text or JSON) + File (JSON, shipped to CloudWatch Logs) + OpenTelemetry
   ▼
 Step 4 (parallel):
   │  ┌─ Notification Init (Telegram bot from SSM)
@@ -104,7 +104,8 @@ Step 12: Order Update WebSocket
   ▼
 Step 13: API Server
   │  Axum on 0.0.0.0:8080
-  │  Endpoints: /health, /api/stats, /api/quote, /api/top-movers, /portal
+  │  Endpoints: /health, /api/stats, /api/quote (the /portal HTML
+  │  frontend was retired in the AWS-lifecycle PRs, 2026-05-19)
   ▼
 Step 14: Token Renewal Task
   │  Background loop: check expiry every hour
@@ -467,11 +468,12 @@ http_host = "localhost"            # Override Docker DNS for cargo run
 ## Observability Stack
 
 ```
-Prometheus (:9090)  → scrapes metrics → Grafana dashboards
-Alloy               → watches data/logs/app.log → pushes to Loki
-Loki                → log aggregation → Grafana log explorer
-Jaeger V2           → receives OpenTelemetry traces → trace visualization
-Traefik             → reverse proxy for all web UIs
+App metrics exporter → Prometheus wire format → AWS CloudWatch metrics + dashboards
+CloudWatch agent     → watches data/logs/app.log → CloudWatch Logs
+QuestDB web console  → ad-hoc operator queries
 
-All running in Docker alongside the application.
+CloudWatch (metrics + logs + alarms + dashboards) is the entire
+observability layer in prod. The Prometheus, Grafana, Alertmanager
+(and Valkey) containers were removed in the CloudWatch-only migration
+(#O1–#O4, 2026-05-19); Jaeger and Traefik were retired earlier.
 ```
