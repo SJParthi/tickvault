@@ -58,9 +58,9 @@ variable "ami_id" {
 }
 
 variable "enable_eip" {
-  description = "Provision a 24/7 Elastic IP (static public IP). DEFAULT false per operator lock 2026-05-29 §7 Quote 5: the 3-month data-pull places NO orders, so the Dhan static-IP whitelist is not needed — saving ~₹430/mo. The instance gets a fresh public IP on each stop/start (fine for data-only). Set TRUE before going LIVE with orders (then register the EIP with Dhan; 7-day modify cooldown applies)."
+  description = "Provision a 24/7 Elastic IP (static public IP). FLIPPED TO TRUE 2026-05-31 (operator approved 'Yes — enable it now'). The 2026-05-29 §7 Quote 5 assumption that 'the instance gets a fresh public IP on each stop/start' proved FALSE: after the manual t4g→m8g.large upgrade (stop/modify/start), the instance's ENI has auto-assign-public-IP OFF (console: 'Auto-assigned IP address: –'), so it had NO public IP and NO internet path at all — it could not reach AWS Systems Manager (Fleet Manager showed 0 managed nodes → deploy `InvalidInstanceId`) NOR Dhan. AWS cannot add an ephemeral public IP to an already-running instance; only an EIP can. So the EIP is now mandatory for the box to function, not optional. Cost ~₹300/mo; needed for live orders anyway (then register this EIP with Dhan; 7-day modify cooldown applies)."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "ebs_gp3_size_gb" {
