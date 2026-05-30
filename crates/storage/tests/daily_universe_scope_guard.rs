@@ -243,9 +243,19 @@ fn fno_master_contract_collector_exists() {
         body.contains("INDEX_DERIVATIVE_PREFIXES") && body.contains("\"FUTIDX\""),
         "collector must handle index F&O (FUTIDX/OPTIDX) for tracked indices"
     );
+    // Stock derivs gate on the tracked NSE_EQ underlying set; index derivs gate
+    // by equity-index EXCHANGE (PR #882 — index F&O link via a DERIVATIVES-domain
+    // underlying SID, NOT the IDX_I spot SID, so the prior `index_sids.contains`
+    // gating dropped ~17K contracts; exchange-gating recovered them). Updated
+    // 2026-05-30 to match the current collector after the #882 fix.
     assert!(
-        body.contains("unique_underlying_ids.contains") && body.contains("index_sids.contains"),
-        "collector must gate stock derivs on tracked underlyings AND index derivs on tracked indices"
+        body.contains("unique_underlying_ids.contains"),
+        "collector must gate stock derivs on the tracked NSE_EQ underlying set"
+    );
+    assert!(
+        body.contains("is_equity_index_exchange"),
+        "collector must gate index derivs by equity-index exchange (PR #882 — \
+         index F&O underlying SID is DERIVATIVES-domain, not the IDX_I spot SID)"
     );
 }
 

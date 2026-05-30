@@ -251,6 +251,34 @@ fn test_github_actions_workflows_exist() {
 }
 
 #[test]
+fn test_deploy_aws_workflow_refreshes_repo_and_systemd_unit() {
+    // Regression 2026-05-30 pre-flight audit: the deploy SSM command shipped a
+    // new binary + synced config, but NEVER refreshed the box's repo clone or
+    // the systemd unit. The clone is shallow from first boot, so the box would
+    // keep its first-boot systemd unit FOREVER. That unit carries TV_ENVIRONMENT
+    // — a stale unit (pre-#898 TV_ENVIRONMENT=prod) would make the new binary
+    // load production.toml = REAL ORDERS, breaking the no-orders data-pull lock.
+    // The deploy must git-pull the clone AND re-copy the systemd unit before
+    // daemon-reload + restart.
+    let content =
+        std::fs::read_to_string(workspace_root().join(".github/workflows/deploy-aws.yml"))
+            .expect("deploy-aws.yml must be readable"); // APPROVED: test
+    assert!(
+        content.contains("git -C repo reset --hard origin/main"),
+        "deploy-aws.yml SSM command must git-refresh the box's repo clone to \
+         origin/main before copying config/systemd — otherwise the box runs \
+         its stale first-boot files forever."
+    );
+    assert!(
+        content.contains(
+            "cp -f repo/deploy/systemd/tickvault.service /etc/systemd/system/tickvault.service"
+        ),
+        "deploy-aws.yml SSM command must refresh the systemd unit from the repo \
+         (carries TV_ENVIRONMENT=staging — a stale prod unit would arm real money)."
+    );
+}
+
+#[test]
 fn test_deploy_aws_workflow_has_market_hours_guard() {
     let content =
         std::fs::read_to_string(workspace_root().join(".github/workflows/deploy-aws.yml"))
