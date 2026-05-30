@@ -77,7 +77,7 @@ START
     │ 4a.     │  Telegram bot init (from SSM)
     │ Notify  │
     ├─────────┤
-    │ 4b.     │  Docker health check (QuestDB, Valkey)
+    │ 4b.     │  Docker health check (QuestDB)
     │ Infra   │  Auto-start if down
     └────┬────┘
          ▼

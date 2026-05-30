@@ -50,7 +50,6 @@ Any stage fails = build is RED. No exceptions.
 | Tick pipeline routing | <100ns | core |
 | papaya lookup | <50ns | core |
 | Full tick processing | <10μs | core |
-| Valkey cache read | <100μs | storage |
 | QuestDB ILP write | <1ms | storage |
 | OMS state transition | <100ns | trading |
 | Market hour validation | <50ns | common |

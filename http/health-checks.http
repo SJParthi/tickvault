@@ -27,8 +27,7 @@ GET {{questdb_host}}/exec?query=SHOW%20TABLES
 
 ### ---- Cache ----
 
-### Valkey Ping (via QuestDB proxy — direct test requires redis-cli)
-# Use Docker: docker exec dlt-valkey valkey-cli ping
+# Valkey health check REMOVED in #O4 (2026-05-24) — Valkey removed from the runtime.
 
 ### ---- Monitoring ----
 

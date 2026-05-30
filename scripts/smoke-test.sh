@@ -14,11 +14,11 @@
 # What it exercises:
 #   1. Config loading + validation
 #   2. Docker Desktop auto-launch (macOS) or systemctl (Linux)
-#   3. Docker Compose infrastructure start (QuestDB, Valkey, Grafana, etc.)
+#   3. Docker Compose infrastructure start (QuestDB)
 #   4. Container health checks (exit codes, OOM detection)
 #   5. QuestDB query validation (SELECT 1)
 #   6. Disk space pre-flight check
-#   7. AWS SSM credential fetch (Dhan, Telegram, QuestDB, Valkey)
+#   7. AWS SSM credential fetch (Dhan, Telegram, QuestDB)
 #   8. Dhan authentication (TOTP + JWT generation)
 #   9. IP verification against SSM static IP
 #  10. QuestDB DDL table creation
@@ -285,7 +285,6 @@ wait_for_tcp() {
 # QuestDB first boot with table creation can take 80-120s (B3 in infra.rs).
 # Use 120s timeout to match INFRA_HEALTH_TIMEOUT.
 wait_for_tcp "QuestDB (HTTP 9000)" "localhost" "9000" 120 || true
-wait_for_tcp "Valkey (6379)" "localhost" "6379" 60 || true
 wait_for_tcp "Grafana (3000)" "localhost" "3000" 60 || true
 
 # 3d. Open Grafana in browser (so you can see it's working)
@@ -494,7 +493,7 @@ echo -e "${GREEN}${BOLD}All checks passed!${NC} The auto-start system is working
 echo ""
 echo -e "  ${CYAN}What was verified:${NC}"
 echo -e "    - Docker Desktop auto-launch"
-echo -e "    - Docker Compose infrastructure (QuestDB, Valkey, Grafana)"
+echo -e "    - Docker Compose infrastructure (QuestDB)"
 echo -e "    - Container health + exit code checks"
 echo -e "    - QuestDB query validation (SELECT 1)"
 echo -e "    - Disk space pre-flight"

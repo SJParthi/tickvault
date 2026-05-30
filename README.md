@@ -57,7 +57,6 @@ cargo run
 
 The `docker-compose.yml` services are configured for **local development only**:
 
-- **Valkey:** port 6379 exposed without AUTH — bind to 127.0.0.1, add AUTH in prod
 - **Grafana:** anonymous admin enabled (`GF_AUTH_ANONYMOUS_ORG_ROLE=Admin`) — disable in prod
 - **Traefik:** dashboard on port 8080 without auth — add basicAuth middleware in prod
 - **Loki:** auth disabled — enable auth via reverse proxy in prod
