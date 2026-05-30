@@ -113,12 +113,12 @@ app → api → trading → core → storage → common
 
 ### Block 12: HTTP API Server — COMPLETE
 - **Files:** `api/src/` (handlers: health, instruments, quote, static_file, stats, top_movers + middleware, state, lib)
-- **What it does:** axum server, health check, stats (QuestDB), portal frontend, instrument rebuild, CORS, bearer auth middleware
+- **What it does:** axum server, health check, stats (QuestDB), instrument rebuild, CORS, bearer auth middleware (the `/portal` HTML frontend was retired in the AWS-lifecycle PRs, 2026-05-19)
 - **Tests:** API smoke, auth middleware, contract tests
 
 ### Block 13: Observability Stack — COMPLETE
 - **Files:** `app/src/observability.rs`, `core/src/notification/` (events, service, mod)
-- **What it does:** Prometheus metrics, OpenTelemetry tracing, Telegram alerts, Grafana dashboards, Loki log aggregation
+- **What it does:** metrics (Prometheus wire format scraped by CloudWatch), tracing, Telegram alerts, log aggregation. (Prometheus/Grafana/Alertmanager containers + Grafana dashboards were retired in the CloudWatch-only migration #O1–#O3, 2026-05-19; CloudWatch Dashboards replace Grafana in prod.)
 - **Docker:** QuestDB (Valkey/Prometheus/Grafana/Loki/Alloy/Jaeger/Traefik all removed — CloudWatch-only migration #O1–#O4, 2026-05-24)
 
 ### Block 14: Risk Engine — COMPLETE

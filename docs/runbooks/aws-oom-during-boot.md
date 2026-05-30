@@ -17,7 +17,9 @@ Boot-time peak memory exceeded the t4g.medium 8GB envelope. Likely causes:
 1. rkyv binary cache deserialization spike during universe load.
 2. Bug introduced that allocates a large vector at boot.
 3. Container memory limits over-allocated (sum > 6GB per `aws-budget.md` rule 6).
-4. Sidecar process (Grafana plugin install, Prometheus WAL replay) ate memory at the same time.
+   Post CloudWatch-only migration (#O1–#O4) the runtime is QuestDB + the
+   tickvault app only, so the container sum is small — but verify nothing
+   stale was re-added to docker-compose.
 
 ## Immediate actions
 
@@ -43,7 +45,7 @@ Per `aws-budget.md` rule 11, host headroom floor is 2GB. If actual headroom < 2G
 
 | Action | Effect |
 |---|---|
-| Stop a non-essential container (e.g. Prometheus during boot) | frees 384MB |
+| Trim the QuestDB write buffer / cache during boot | frees a few hundred MB (the Grafana/Prometheus sidecars that used to free RAM here were removed in the CloudWatch-only migration #O1–#O3) |
 | Resize to t4g.medium (16GB RAM) | doubles EC2 cost — operator decision |
 | Trim tickvault working set | requires code change |
 

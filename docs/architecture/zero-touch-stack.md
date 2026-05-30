@@ -1,5 +1,15 @@
 # Zero-Touch Observability Stack — Complete Reference
 
+> **CloudWatch-only migration (#O1–#O4, 2026-05-19/05-24):** the Grafana
+> (#O1), Alertmanager (#O2), Prometheus (#O3) and Valkey (#O4) containers
+> were removed; Loki/Alloy/Jaeger/Traefik were retired earlier. The live
+> runtime is QuestDB + the tickvault app + AWS CloudWatch only. CloudWatch
+> (metrics + logs + alarms + dashboards) is the entire prod observability
+> layer; the QuestDB web console covers ad-hoc queries. The diagram and the
+> phase-by-phase HISTORY table below still reference the retired
+> Loki/Alloy/Grafana/Alertmanager hops — those are accurate as historical
+> deliverables but are NOT the current live path (annotations inline).
+
 > **Ground truth this file derives from (auto-loaded):**
 > `.claude/rules/project/observability-architecture.md`
 >
@@ -51,14 +61,12 @@ blocking regression. Validation: `make validate-automation` runs
                          │      (Phase 2 JSONL, ERROR-only)
                          │      rotated hourly, 48h swept
                          ▼
-                 Alloy (opt-in)   NotificationService
+          CloudWatch Logs agent    NotificationService
                     │                   │
                     ▼                   ▼
-                  Loki            Telegram + AWS SNS
-                    │                   │
-                    ▼                   ▼
-            LogQL alerts via       Alertmanager webhook
-            Ruler -> Alertmanager  (edge-trigger dedup)
+            AWS CloudWatch        Telegram + AWS SNS
+            (logs + metrics       (edge-trigger dedup)
+             + alarms)                  │
                     │                   │
                     └───────┬───────────┘
                             ▼
@@ -97,16 +105,16 @@ AWS path (opt-in):
 | 1.2 | `8d34421` | Sample production sites migrated to carry `code = ErrorCode::X.code_str()`; `error_code_tag_guard` meta-test. |
 | 2.1 | `cce7188`, `d942695` | `tracing-appender` dep, `init_errors_jsonl_appender`, `sweep_errors_jsonl_retention`, wired into `main.rs` subscriber chain. |
 | 2.2 | `a81206f` | `make tail-errors` + `make errors-summary` + `make triage-dry-run`/`triage-execute`. |
-| 3.1, 3.2 | `26f99c5` | Loki + Alloy under `--profile logs`; 4 LogQL rules (`ErrorBurst`, `FlushErrorStorm`, `AuthFailureBurst`, `NovelErrorSignature`); 11-test `loki_alloy_profile_guard`. |
+| 3.1, 3.2 | `26f99c5` | Loki + Alloy under `--profile logs`; 4 LogQL rules (`ErrorBurst`, `FlushErrorStorm`, `AuthFailureBurst`, `NovelErrorSignature`); 11-test `loki_alloy_profile_guard`. _(Loki/Alloy retired in the CloudWatch-only migration; logs now ship to CloudWatch Logs.)_ |
 | 5.1, 5.2 | `7b87ab2` | `summary_writer` tokio task, FNV-1a signature grouping, 18 unit tests; `make status` integration. |
 | 6.1, 6.2 | `a3145e9` | `error-rules.yaml` (7 seed rules), `error-triage.sh` shell hook, 3 auto-fix scripts, 7-test `triage_rules_guard`. |
 | 7.1 | `a3145e9` | `claude-loop-prompt.md` runbook. |
 | 7.2 | `8c53928` | `scripts/mcp-servers/tickvault-logs/server.py` — 5-tool MCP (`tail_errors`, `list_novel_signatures`, `summary_snapshot`, `triage_log_tail`, `signature_history`); 7-test `tickvault_logs_mcp_guard`. |
 | 8.1 | `a3145e9`, `a81206f` | `scripts/auto-fix-{restart-depth,refresh-instruments,clear-spill}.sh`. |
 | 8.2 | `c68346d` | `deploy/aws/lambda/claude-triage/` Lambda + `claude-triage-lambda.tf` (opt-in); 7-test `claude_triage_lambda_guard`. |
-| 9.1 | `1cdd78a` | `operator-health.json` single-page Grafana dashboard (14 panels); 7-test `operator_health_dashboard_guard`. |
+| 9.1 | `1cdd78a` | `operator-health.json` single-page Grafana dashboard (14 panels); 7-test `operator_health_dashboard_guard`. _(RETIRED in the CloudWatch-only migration #O1; the dashboard tree + its guard were deleted. CloudWatch Dashboards replace operator visualization in prod.)_ |
 | 9.2 | `a81206f`, extended each phase | `scripts/validate-automation.sh` + `make validate-automation` — 28 end-to-end checks. |
-| 10.1 | `275157a` | `zero_tick_loss_alert_guard` — 7 tests pin all 4 Prometheus tick-loss alerts + metric emissions + buffer capacity constant + doc coherence. |
+| 10.1 | `275157a` | `zero_tick_loss_alert_guard` — pins tick-loss metric emissions + buffer capacity constant + doc coherence. _(Post #O3 the 4 Prometheus alert-rule assertions were removed when the Prometheus container retired; the early-warning signal moved to CloudWatch Alarms over the same metrics, which the guard still pins as EMITTED.)_ |
 | 11 | `897f7b6` | `resilience_sla_alert_guard` — 6 tests pin WS/QuestDB/Valkey SLA alerts. |
 | 12.1 | existing `quality/crate-coverage-thresholds.toml` | 100% line-coverage floor per crate, enforced by `scripts/coverage-gate.sh`. |
 | 12.2 | existing `.github/workflows/mutation.yml:103-113` | Mutation zero-survivor gate. |
@@ -127,10 +135,9 @@ AWS path (opt-in):
 | MCP log server | `scripts/mcp-servers/tickvault-logs/server.py` |
 | AWS triage Lambda | `deploy/aws/lambda/claude-triage/handler.py` |
 | Lambda Terraform | `deploy/aws/terraform/claude-triage-lambda.tf` |
-| Loki / Alloy configs | `deploy/docker/{loki,alloy}/*.{yml,alloy}` |
-| LogQL rules | `deploy/docker/loki/rules.yml` |
-| Prometheus alerts | `deploy/docker/prometheus/rules/tickvault-alerts.yml` |
-| Grafana operator dashboard | `deploy/docker/grafana/dashboards/operator-health.json` |
+| Logs shipping (current) | CloudWatch Logs agent → CloudWatch Logs _(Loki/Alloy retired in the CloudWatch-only migration #O1–#O3)_ |
+| Operator alarms (current) | AWS CloudWatch Alarms _(the Prometheus `tickvault-alerts.yml` rules + Alertmanager were retired #O2/#O3)_ |
+| Operator dashboard (current) | CloudWatch Dashboards _(the local Grafana `operator-health.json` + its tree were retired #O1)_ |
 | Validate automation | `scripts/validate-automation.sh` |
 
 ## All 28 validate-automation.sh checks
@@ -149,14 +156,14 @@ Run `make validate-automation` to exercise all of these in ~30 seconds.
 7. `summary_writer` unit tests (18 tests)
 8. `observability` library tests (37 tests)
 9. `observability_chain_e2e` (4 tests)
-10. `operator_health_dashboard_guard` (7 tests)
-11. `resilience_sla_alert_guard` (6 tests)
+10. `operator_health_dashboard_guard` _(RETIRED with Grafana removal #O1)_
+11. `resilience_sla_alert_guard` _(Prometheus-side assertions retired #O2/#O3; chaos tests remain)_
 12. `tickvault_logs_mcp_guard` (7 tests)
 13. `claude_triage_lambda_guard` (7 tests)
-14. `loki_alloy_profile_guard` (11 tests)
+14. `loki_alloy_profile_guard` _(RETIRED with Loki/Alloy removal)_
 
 **File-level invariants (10):**
-- architecture doc / triage YAML / loop prompt / 4 auto-fix scripts / error-triage hook / operator-health dashboard / MCP server / MCP self-test passes.
+- architecture doc / triage YAML / loop prompt / 4 auto-fix scripts / error-triage hook / MCP server / MCP self-test passes. _(The local operator-health dashboard invariant was retired with Grafana #O1; the dashboard now lives in CloudWatch.)_
 
 **Source-code invariants (3):**
 - `flatten_event(true)` in main.rs tracing layer (regression risk).
@@ -167,13 +174,13 @@ Run `make validate-automation` to exercise all of these in ~30 seconds.
 
 | Claim | Proof |
 |---|---|
-| Every `error!` reaches Telegram within ~15s | Prometheus alert rules + `error-level` tracing layer |
+| Every `error!` reaches Telegram within ~15s | CloudWatch Alarms (over the metrics formerly scraped by Prometheus) + `error-level` tracing layer |
 | No flush/persist/drain failure is silenced | `error_level_meta_guard` — 28 phrases pinned |
 | Every ErrorCode has rule docs | `error_code_rule_file_crossref` forward+reverse |
-| Zero-tick-loss alerts exist | `zero_tick_loss_alert_guard` — 4 alerts + metric + buffer capacity + doc all pinned |
-| WS/QuestDB/Valkey SLA alerts exist | `resilience_sla_alert_guard` — 6 alerts + metrics pinned |
-| Grafana operator dashboard has every required panel | `operator_health_dashboard_guard` — 14 panels pinned |
-| Loki/Alloy never start without operator opt-in | `loki_alloy_profile_guard` — default stack still 7 services |
+| Zero-tick-loss metrics are emitted (alarms in CloudWatch) | `zero_tick_loss_alert_guard` — metric + buffer capacity + doc pinned (the 4 Prometheus alert-rule assertions retired #O3; alarms moved to CloudWatch) |
+| WS/QuestDB SLA chaos coverage exists | `resilience_sla_alert_guard` Prometheus-side assertions retired #O2/#O3; chaos tests (`chaos_questdb_*`, `chaos_ws_*`, `chaos_valkey_kill`) remain |
+| Operator dashboard has every required widget | CloudWatch Dashboards _(the Grafana `operator_health_dashboard_guard` was retired with Grafana #O1)_ |
+| Loki/Alloy not in the default stack | RETIRED — Loki/Alloy removed entirely in the CloudWatch-only migration |
 | Claude-triage Lambda never provisions until `enable_claude_triage_lambda = true` | `claude_triage_lambda_guard` — every resource `count`-gated |
 | MCP log server exposes 5 tools, no pip deps | `tickvault_logs_mcp_guard` — imports allow-list enforced |
 | Instrument lifecycle tables self-heal on boot | `ALTER TABLE ADD COLUMN IF NOT EXISTS` pattern — source-scan asserted |
@@ -185,7 +192,8 @@ Run `make validate-automation` to exercise all of these in ~30 seconds.
 make validate-automation
 
 # Glance at the operator health dashboard
-open http://localhost:3000/d/tv-operator-health
+# (CloudWatch console → Dashboards → operator-health; the local Grafana
+#  dashboard at :3000 was retired in the CloudWatch-only migration #O1)
 
 # See recent errors (if any)
 make errors-summary
@@ -197,10 +205,10 @@ make tail-errors
 make triage-dry-run
 ```
 
-If every panel is green on the Grafana dashboard and
+If every widget is green on the CloudWatch operator-health dashboard and
 `errors.summary.md` says "Zero ERROR-level events in the lookback
 window", the system needs no attention. If anything is red, the
-panel title + description names the runbook path to follow.
+widget title + description names the runbook path to follow.
 
 ## What Claude Code runs on every triage cycle
 

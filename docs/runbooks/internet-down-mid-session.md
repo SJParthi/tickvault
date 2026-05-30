@@ -10,7 +10,7 @@ Home internet fails during market hours.
 - Laptop WiFi connects to hotspot automatically if configured
 
 ### Step 2: Verify system reconnected
-- Check Grafana dashboard (accessible via phone hotspot)
+- Check the CloudWatch operator-health dashboard (accessible via phone hotspot)
 - Verify WebSocket reconnected (green indicator)
 - Verify tick ingestion resumed (check last tick timestamp)
 
@@ -34,4 +34,4 @@ Home internet fails during market hours.
 ## Pre-Configuration Checklist
 - [ ] Phone hotspot SSID saved on laptop
 - [ ] Phone hotspot auto-connect enabled
-- [ ] Grafana accessible on hotspot network
+- [ ] CloudWatch dashboard accessible on hotspot network

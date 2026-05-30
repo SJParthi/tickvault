@@ -143,4 +143,6 @@ for all auth-family rules.
 - `crates/core/src/auth/token_manager.rs` — arc-swap + retry logic
 - `crates/core/src/auth/secret_manager.rs` — SSM fetcher
 - `crates/core/src/auth/token_cache.rs` — fast restart cache
-- `deploy/docker/grafana/dashboards/auth-health.json` — live dashboard
+- CloudWatch operator-health dashboard — auth-health widgets (the local
+  Grafana `auth-health.json` dashboard was retired in the CloudWatch-only
+  migration #O1, 2026-05-19)

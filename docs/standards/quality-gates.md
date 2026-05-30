@@ -70,9 +70,13 @@ Full checklist: `docs/templates/release-checklist.md` (read ONLY at release time
 
 After deployment, verify:
 
-1. All Grafana dashboards showing data — no gaps, no stale panels
-2. Prometheus scrape targets all UP — zero down targets
-3. Jaeger traces flowing — spans visible for tick processing
-4. Loki logs streaming — application logs arriving via Alloy
-5. Telegram test alert fires — confirm alerting pipeline works
-6. Tick latency within budget — <10ns parse, <10μs processing confirmed in metrics
+1. CloudWatch operator-health dashboard showing data — no gaps, no stale widgets
+2. App metrics flowing into CloudWatch — the namespace shows fresh datapoints
+3. CloudWatch Logs receiving application logs — recent log streams present
+4. Telegram test alert fires — confirm CloudWatch Alarm → SNS → Telegram pipeline works
+5. Tick latency within budget — <10ns parse, <10μs processing confirmed in metrics
+
+> The Grafana, Prometheus, Alertmanager, Loki/Alloy and Jaeger containers
+> were retired in the CloudWatch-only migration (#O1–#O4, 2026-05-19/05-24);
+> AWS CloudWatch (metrics + logs + alarms + dashboards) is the entire prod
+> observability layer.

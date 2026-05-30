@@ -8,12 +8,12 @@
 |-------|------------|---------------|----------|
 | SEV-1 | Money at risk. Trading halted. Data loss. | IMMEDIATE | OMS stuck, duplicate orders, position mismatch |
 | SEV-2 | System degraded but trading safe. | 15 minutes | WebSocket reconnecting, elevated latency |
-| SEV-3 | Non-critical component down. | 1 hour | Grafana stale, Jaeger not receiving traces |
+| SEV-3 | Non-critical component down. | 1 hour | CloudWatch dashboard stale, metric ingestion lagging |
 | SEV-4 | Cosmetic or non-urgent. | Next session | Dashboard formatting, log verbosity |
 
 ## Rollback Protocol
 
-1. Confirm the issue (Grafana, Loki, Telegram alerts)
+1. Confirm the issue (CloudWatch dashboard / logs, Telegram alerts)
 2. Decide: rollback or hotfix?
    - Uncertain → ROLLBACK (safe default)
    - Root cause clear + fix <10 lines → hotfix

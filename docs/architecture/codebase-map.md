@@ -91,20 +91,17 @@ tickvault/
 │   │       ├── health.rs              # GET /health → JSON status + version
 │   │       ├── stats.rs               # GET /api/stats → QuestDB table counts (proxied, no CORS)
 │   │       ├── instruments.rs         # POST /api/instruments/rebuild → trigger instrument rebuild
-│   │       ├── top_movers.rs          # GET /api/top-movers → top movers by change_pct
-│   │       └── static_file.rs         # GET /portal → portal.html (DLT Control Panel, embedded at compile time)
-│   │   └── static/
-│   │       └── portal.html            # DLT Control Panel — nav dashboard with live status + stats
+│   │       └── debug.rs               # GET /api/debug/logs/* → MCP read-only observability
+│   │       # (the /portal HTML frontend + static_file.rs + portal.html
+│   │       #  were retired in the AWS-lifecycle PRs, 2026-05-19)
 │   └── app/
 │       └── src/main.rs                 # Full orchestration: CryptoProvider → Config → Auth → Universe → Subscription → WS → Parse → Persist → HTTP
 ├── deploy/docker/
-│   ├── docker-compose.yml              # 8 services, all SHA256-pinned, health-checked
-│   ├── prometheus/prometheus.yml       # Scrape targets: app:9091, questdb:9003
-│   ├── loki/loki-config.yml            # TSDB schema, 30d retention
-│   ├── alloy/alloy-config.alloy        # Docker log discovery → Loki
-│   ├── traefik/traefik.yml             # Reverse proxy, blue-green ready
-│   └── grafana/provisioning/
-│       └── datasources/datasources.yml # Prometheus + Loki datasources
+│   └── docker-compose.yml              # QuestDB + tickvault app only, SHA256-pinned
+│       # (Grafana #O1, Alertmanager #O2, Prometheus #O3, Valkey #O4 +
+│       #  the Loki/Alloy/Traefik/Jaeger configs were removed in the
+│       #  CloudWatch-only migration, 2026-05-19/05-24; metrics/logs/
+│       #  alarms/dashboards live in AWS CloudWatch)
 ├── scripts/
 │   ├── setup-secrets.sh               # Seeds SSM params in AWS
 │   └── notify-telegram.sh             # Sends Telegram alerts via real AWS SSM
@@ -254,7 +251,8 @@ build_router(state: SharedAppState) -> Router
 SharedAppState::new(questdb, dhan, instrument, top_movers_snapshot) -> Self
 
 // Endpoints
-GET   /portal                → DLT Control Panel (nav dashboard with live status, stats, service links)
+// (the /portal HTML Control Panel was retired in the AWS-lifecycle PRs,
+//  2026-05-19; operator visualization is CloudWatch / QuestDB console)
 GET   /health                → { "status": "ok", "version": "0.1.0" }
 GET   /api/stats             → { questdb_reachable, tables, underlyings, derivatives, subscribed_indices, ticks }
 GET   /api/top-movers        → Top movers by change_pct (from shared snapshot)
