@@ -435,24 +435,29 @@ fn test_deploy_aws_workflow_uses_oidc() {
 }
 
 #[test]
-fn test_deploy_aws_after_close_workflow_exists_and_fires_at_1531_ist() {
-    // Option B (operator lock 2026-05-30): if a merge to main lands during
-    // market hours (09:15-15:30 IST Mon-Fri), guard_market_hours blocks the
-    // deploy. This auto-retry workflow re-fires deploy-aws.yml at 15:31 IST
-    // every weekday so the blocked deploy lands the moment the market closes
-    // — true zero-downtime-during-market without the cost of blue/green.
+fn test_deploy_aws_after_close_workflow_fires_in_premarket_and_postmarket_only() {
+    // Operator lock 2026-05-30: "only pre-market AND post-market alone only
+    // our new codes merged ones should be deployed". Code-merge-driven
+    // deploys NEVER auto-fire during 09:15-15:30 IST trading hours.
+    //   - pre-market cron  = 03:15 UTC = 08:45 IST (after 08:30 instance boot)
+    //   - post-market cron = 10:01 UTC = 15:31 IST (after 15:30 NSE close)
     let path = ".github/workflows/deploy-aws-after-close.yml";
     require_file_exists(
         path,
-        "auto-deploy-after-market-close workflow (Option B, zero-touch)",
+        "auto-deploy in pre-market + post-market windows (operator lock 2026-05-30)",
     );
     let content = std::fs::read_to_string(workspace_root().join(path))
         .expect("deploy-aws-after-close.yml must be readable"); // APPROVED: test
 
-    // 15:31 IST = 10:01 UTC. Mon-Fri only (cron day-of-week = 1-5).
+    assert!(
+        content.contains("15 3 * * 1-5"),
+        "deploy-aws-after-close.yml must include pre-market cron \
+         03:15 UTC Mon-Fri (08:45 IST)"
+    );
     assert!(
         content.contains("1 10 * * 1-5"),
-        "deploy-aws-after-close.yml cron must be 10:01 UTC Mon-Fri (15:31 IST)"
+        "deploy-aws-after-close.yml must include post-market cron \
+         10:01 UTC Mon-Fri (15:31 IST)"
     );
     // Must dispatch deploy-aws.yml — that's the whole point.
     assert!(

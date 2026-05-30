@@ -1,34 +1,40 @@
 # =============================================================================
-# tickvault — auto-deploy after market close (Option B, zero-touch)
+# tickvault — auto-deploy in pre-market + post-market windows ONLY
 # =============================================================================
-# Goal: if a commit merged to main during market hours (09:15–15:30 IST Mon–Fri),
-# the deploy-aws.yml `guard_market_hours` job blocks it. This workflow re-fires
-# deploy-aws.yml at 15:31 IST (10:01 UTC) every weekday so the merge lands
-# automatically the moment the market closes — with ZERO downtime during the
-# trading session (the 5s app restart only ever happens after-hours).
+# Operator lock 2026-05-30: "only pre-market AND post-market alone only our
+# new codes merged ones should be deployed". Code-merge-driven deploys NEVER
+# fire during 09:15-15:30 IST trading hours via the auto path. (Instance
+# start/stop/restart remain on-demand via the AWS Console — separate concern.)
+#
+# Two crons, both Mon–Fri:
+#   • 03:15 UTC = 08:45 IST → PRE-MARKET window. Instance auto-starts at
+#     08:30 IST; this fires 15 minutes later, well before 09:15 market open.
+#   • 10:01 UTC = 15:31 IST → POST-MARKET window. ~1 minute after NSE close.
 #
 # Idempotent: before dispatching, we compare main's current HEAD against the
 # `head_sha` of the most recent SUCCESSFUL deploy-aws run on main. If equal,
 # nothing to deploy — exit clean (no spurious restart on quiet days).
 #
 # Triggers:
-#   - schedule: 10:01 UTC Mon–Fri (15:31 IST, ~1 minute after NSE close)
+#   - schedule: 03:15 + 10:01 UTC Mon–Fri
 #   - workflow_dispatch: manual operator override (just-in-case button)
 #
 # Honest envelope:
-#   - 09:15-15:30 IST blocked → 15:31 IST same-day deploy ✅
-#   - Weekend merge → Monday 15:31 IST deploy ✅
-#   - NSE holiday → next weekday 15:31 IST (holiday calendar TODO; today we
-#     re-dispatch every weekday — deploy-aws's own guard is a no-op outside
-#     market hours, so it just runs harmlessly on holiday afternoons)
-#   - No new commits → idempotent skip (no restart, no extra cost)
+#   - Merge during 09:15-15:30 IST → blocked → auto-fires at 15:31 IST same day ✅
+#   - Merge over the weekend → auto-fires Monday 08:45 IST (pre-market) ✅
+#   - Merge before 08:45 IST on a weekday → auto-fires same day 08:45 IST ✅
+#   - NSE holiday: cron fires; deploy-aws's own market-hours guard is a no-op
+#     outside trading hours, so the deploy runs harmlessly on holiday windows.
+#   - No new commits → idempotent skip (no restart, no extra cost).
 # =============================================================================
 
 name: deploy-aws-after-close
 
 on:
   schedule:
-    # 10:01 UTC = 15:31 IST. Mon–Fri only.
+    # 03:15 UTC = 08:45 IST (pre-market). 10:01 UTC = 15:31 IST (post-market).
+    # Mon–Fri only.
+    - cron: '15 3 * * 1-5'
     - cron: '1 10 * * 1-5'
   workflow_dispatch: {}
 
