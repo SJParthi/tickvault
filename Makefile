@@ -355,6 +355,13 @@ aws-apply: aws-bootstrap-check ## Apply the Terraform stack (requires TF_VAR_ami
 	fi
 	@cd deploy/aws/terraform && terraform apply
 
+aws-deploy: ## One-command deploy: push secrets to GitHub + trigger terraform-apply.yml + tail to completion (wraps scripts/aws-one-shot-bootstrap.sh)
+	@command -v aws >/dev/null 2>&1 || { echo "  FAIL: aws CLI not installed (run 'aws configure' first)"; exit 1; }
+	@command -v gh  >/dev/null 2>&1 || { echo "  FAIL: gh CLI not installed (run 'gh auth login' first)"; exit 1; }
+	@command -v jq  >/dev/null 2>&1 || { echo "  FAIL: jq not installed (brew install jq)"; exit 1; }
+	@echo "Running the one-shot AWS bootstrap (idempotent, safe to re-run)..."
+	@./scripts/aws-one-shot-bootstrap.sh
+
 aws-outputs: ## Show Terraform outputs (instance_id, elastic_ip, etc.)
 	@cd deploy/aws/terraform && terraform output
 

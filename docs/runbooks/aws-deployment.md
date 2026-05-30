@@ -1,6 +1,8 @@
 # AWS Deployment — Infrastructure Reference
 
-> **Authority:** Parthiban (architect). Approved AWS bill ≤ ₹5,000/mo per `aws-budget.md`.
+> **Refreshed 2026-05-30** to match the m8g.large / CloudWatch-only / no-EIP operator lock (`daily-universe-scope-expansion-2026-05-27.md` §7).
+>
+> **Authority:** Parthiban (architect). Approved AWS bill ≤ $25/mo (~₹2,058/mo all-in incl. GST at 270 hrs) per `aws-budget.md` + daily-universe §7.
 > **Scope:** Infrastructure-as-code reference + day-2 operations. NOT the first-time setup runbook.
 > **First-time setup:** `docs/runbooks/aws-deploy.md` covers the one-time account creation + first Terraform apply.
 > **Region:** `ap-south-1` (Mumbai) ONLY. Dhan static-IP whitelist + low latency.
@@ -12,7 +14,7 @@ This is the OPERATIONAL reference for the AWS deployment:
   * Day-2 ops — scaling, key rotation, security-group updates
   * Terraform module structure + invocation
   * Quick-reference tables for every AWS resource
-  * EventBridge cron schedule (08:30-17:30 IST)
+  * EventBridge cron schedule (08:30-16:30 IST, weekday-only)
   * Disaster recovery cross-reference
 
 Use `docs/runbooks/aws-deploy.md` for first-time account setup.
@@ -21,71 +23,79 @@ Use `docs/runbooks/aws-deploy.md` for first-time account setup.
 
 | Resource | Type | Spec | Notes |
 |---|---|---|---|
-| EC2 | `t4g.medium` (ARM equivalent: `t4g.medium`) | 4 vCPU, 8 GB RAM | On-demand pricing only; never reserved/spot |
-| EBS root | gp3 | 30 GB | Host OS + Docker images |
-| EBS data | gp3 | 100 GB | QuestDB hot data (`/data` mount) |
-| Elastic IP | static IPv4 | 1 × | Required by Dhan static-IP enforcement (April 2026) |
+| EC2 | `m8g.large` | ARM Graviton4, 2 vCPU, 8 GiB RAM | On-demand only ($0.06416/hr ap-south-1); never reserved/spot. Operator-PINNED (daily-universe §7) |
+| EBS root | gp3 | 30 GB (`ebs_gp3_size_gb`, default 30, range 10-200) | Host OS + Docker + QuestDB hot window; >90d partitions archived to S3 |
+| Elastic IP | static IPv4 | count-gated (`enable_eip`, **default OFF**) | EXCLUDED for the 3-month no-orders data-pull window (saves ~₹430/mo). Flip `enable_eip = true` + re-register with Dhan BEFORE live orders |
 | IAM Role | `tv-prod-instance-role` | SSM read + S3 archive write | Attached to EC2 instance profile |
-| IAM Role | `tv-github-deploy-role` | EC2 stop/start + EIP describe | Used by GitHub Actions deploy workflow |
-| Security Group | `tv-prod-sg` | Inbound: 22 (operator IP only), 443 (ALB) | Egress: all (TLS to Dhan + AWS APIs) |
-| EventBridge Rule | `tv-prod-start-weekday` | `cron(0 3 ? * MON-FRI *)` (08:30 IST) | Auto-start |
-| EventBridge Rule | `tv-prod-stop-weekday` | `cron(0 12 ? * MON-FRI *)` (17:30 IST) | Auto-stop |
-| EventBridge Rule | `tv-prod-start-weekend` | `cron(0 3 ? * SAT,SUN *)` (08:30 IST) | Auto-start |
-| EventBridge Rule | `tv-prod-stop-weekend` | `cron(0 8 ? * SAT,SUN *)` (13:30 IST) | Auto-stop (5h weekend window) |
-| ALB | application load balancer | port 443 only | Free tier 750 hrs/mo |
-| CloudWatch | metrics + alarms + logs | within free tier | 10 metrics, 10 alarms, 5 GB logs |
-| SNS Topic | `tv-prod-sms-alerts` | India SMS | ~100 msg/mo, ₹25 |
+| IAM Role | `tv-github-deploy-role` | EC2 stop/start + EIP describe | Used by GitHub Actions deploy workflow (OIDC, `oidc.tf`) |
+| Security Group | `tv-prod-sg` | Inbound: 22 (operator IP only) | Egress: all (TLS to Dhan + AWS APIs). No inbound 443 — there is no load balancer |
+| EventBridge Rule | `tv-prod-start-weekday` | `cron(0 3 ? * MON-FRI *)` (08:30 IST Mon-Fri) | Auto-start |
+| EventBridge Rule | `tv-prod-stop-weekday` | `cron(0 11 ? * MON-FRI *)` (16:30 IST Mon-Fri) | Auto-stop. Weekends + NSE holidays = OFF unless operator manually starts |
+| CloudWatch | metrics + alarms + logs + dashboards | within free tier | 10 metrics, 10 alarms, 5 GB logs, 3 dashboards. Sole observability layer (no Grafana/Prometheus/Alertmanager) |
+| SNS Topic | `tv-prod-sms-alerts` | India SMS | ~100 msg/mo, ~₹24 |
 | S3 Bucket | `tv-prod-archive-ap-south-1` | Intelligent-Tiering + Glacier | Lifecycle 90d → 365d → Glacier |
-| SSM Parameter Store | `/tickvault/prod/*` | encrypted (SecureString) | Dhan token, TOTP secret, Valkey password |
+| SSM Parameter Store | `/tickvault/prod/*` | encrypted (SecureString) | Dhan token, TOTP secret (Valkey removed in #O4; dual-instance lock now lives in SSM) |
 
 ## Terraform module layout
 
+The Terraform is a **flat layout** (no per-resource split files). The real
+files are:
+
 ```
 deploy/aws/terraform/
-├── main.tf                # provider + state config
-├── variables.tf           # region, instance_type, env
-├── ec2.tf                 # EC2 + EBS + EIP attach
-├── iam.tf                 # 2 roles + instance profile
-├── security_groups.tf     # tv-prod-sg
-├── eventbridge.tf         # 4 cron rules (start/stop × weekday/weekend)
-├── alb.tf                 # ALB + target group + listener
-├── cloudwatch.tf          # alarms + log groups
-├── sns.tf                 # SMS topic + subscription
-├── s3.tf                  # archive bucket + lifecycle policy
-├── ssm.tf                 # secrets (managed elsewhere; tf reads-only)
-└── outputs.tf             # EIP, instance_id, ALB DNS
+├── main.tf                      # VPC + EC2 + EIP (count-gated) + IAM + SNS + EventBridge + S3
+├── variables.tf                 # region, env, ebs_gp3_size_gb, enable_eip, operator_ip, ...
+├── versions.tf                  # provider + Terraform version pins
+├── outputs.tf                   # instance_id, EIP (when enabled), SNS topic ARN
+├── user-data.sh.tftpl           # EC2 boot script template (Amazon Linux 2023 arm64)
+├── oidc.tf                      # GitHub Actions OIDC provider + deploy role trust
+├── alarms.tf                    # CloudWatch infra alarms
+├── app-alarms.tf                # CloudWatch app-level alarms
+├── budget.tf                    # $25/mo budget cap
+├── sns-subscriptions.tf         # SMS/email/HTTPS subscriptions
+├── budget-killswitch-lambda.tf  # auto-stop on budget breach
+├── claude-triage-lambda.tf      # triage Lambda
+├── telegram-webhook-lambda.tf   # SNS → Telegram bridge Lambda
+└── README.md                    # module readme
 ```
 
 ## Day-2 operations
 
-### Scale the instance (t4g.medium → t4g.medium)
+### Change the instance type — operator-PINNED, NOT a casual edit
 
-**Do NOT do this without explicit operator approval** — doubles EC2
-cost from ~₹4,981/mo to ~₹6,008/mo, blowing the budget. See
-`.claude/rules/project/aws-budget.md` rule 1.
+The instance type is **`m8g.large` and is operator-PINNED** (Graviton4,
+2 vCPU, 8 GiB RAM). A Terraform validation block on the `instance_type`
+variable **rejects any other type** at `plan` time — there is no
+`t4g`-to-`t4g` (or any other) scale path you can reach by editing a
+tfvars file.
 
-If approved:
+Changing the instance type is NOT a tfvars edit. It requires the
+**4-file rule-update protocol** in
+`daily-universe-scope-expansion-2026-05-27.md` §7 Mechanical Rule 1:
 
-```bash
-# 1. Edit terraform var
-echo 'instance_type = "t4g.medium"' >> deploy/aws/terraform/terraform.tfvars
+  1. Operator explicit approval with a dated quote.
+  2. Update `daily-universe-scope-expansion-2026-05-27.md` §7.
+  3. Update `docs/architecture/aws-indices-only-locked-architecture.md` §5.
+  4. Update `.claude/rules/project/aws-budget.md` (marked SUPERSEDED).
+  5. Update the ratchet test `crates/storage/tests/instance_type_lock_guard.rs`
+     to pin the new type, AND the Terraform validation block in `variables.tf`.
 
-# 2. Plan + apply (CAUTION: this stops the instance for ~3 minutes)
-cd deploy/aws/terraform
-terraform plan -out=scale.plan
-terraform apply scale.plan
+Only after all of the above does the actual Terraform change land. The
+budget is capped at $25/mo (`budget.tf`); the killswitch Lambda auto-stops
+the instance on breach. See `.claude/rules/project/aws-budget.md` rule 1.
 
-# 3. Wait for instance to come back; restart Docker stack
-ssh -i ~/.ssh/tv-prod-key.pem ec2-user@<EIP> 'sudo systemctl start docker && cd /opt/tickvault && docker compose up -d'
-
-# 4. Verify
-make doctor   # from inside the SSH session
-```
+To grow disk instead (online, no instance stop), raise `ebs_gp3_size_gb`
+(default 30, range 10-200) — gp3 grows live without data loss.
 
 ### Rotate the Elastic IP — DO NOT (7-day cooldown!)
 
-The Elastic IP is registered with Dhan's static-IP whitelist. **Dhan
-enforces a 7-day cooldown on IP changes.** Rotating the EIP means 7
+> **Current state:** the EIP is DISABLED (`enable_eip = false`) for the
+> 3-month no-orders data-pull window — there is no EIP to rotate today.
+> This section applies once `enable_eip = true` is flipped (which must
+> happen, with Dhan re-registration, BEFORE any live orders).
+
+When enabled, the Elastic IP is registered with Dhan's static-IP whitelist.
+**Dhan enforces a 7-day cooldown on IP changes.** Rotating the EIP means 7
 days of rejected orders.
 
 If the EIP somehow gets released (e.g., terraform destroy):
@@ -106,17 +116,13 @@ the home IP changes (ISP DHCP refresh, new location):
 # 1. Get current public IP
 NEW_IP=$(curl -s ifconfig.me)
 
-# 2. Update terraform var
-sed -i.bak "s/operator_ip = .*/operator_ip = \"$NEW_IP\/32\"/" \
-    deploy/aws/terraform/terraform.tfvars
-
-# 3. Apply
+# 2. Pass the new operator_ip to terraform (var defined in variables.tf)
 cd deploy/aws/terraform
-terraform plan -target=aws_security_group.tv_prod_sg
-terraform apply -target=aws_security_group.tv_prod_sg
+terraform plan  -var="operator_ip=$NEW_IP/32" -target=aws_security_group.tv_prod_sg
+terraform apply -var="operator_ip=$NEW_IP/32" -target=aws_security_group.tv_prod_sg
 
-# 4. Verify SSH still works
-ssh -i ~/.ssh/tv-prod-key.pem ec2-user@<EIP> 'echo ok'
+# 3. Verify SSH still works (use the instance public IP, or the EIP if enable_eip=true)
+ssh -i ~/.ssh/tv-prod-key.pem ec2-user@<INSTANCE_IP> 'echo ok'
 ```
 
 ### Rotate SSH keys (90-day cadence)
@@ -142,16 +148,22 @@ ln -sf ~/.ssh/tv-prod-key-$(date +%Y%m).pem ~/.ssh/tv-prod-key.pem
 
 ### Modify the EventBridge cron schedule
 
-Per `aws-budget.md` rule 7, schedule shift is fine as long as total
-runtime stays ≤ 9hr weekdays + 5hr weekends. To shift weekend stop
-from 13:30 IST to 14:30 IST (adds ~₹121/mo):
+The schedule is **weekday-only (Mon-Fri)**: auto-start 08:30 IST, auto-stop
+16:30 IST. There are exactly TWO EventBridge rules and **no weekend rules** —
+weekends + NSE holidays leave the instance OFF unless the operator manually
+starts it (see "Manual start/stop" below). The crons live in `main.tf`:
+
+```
+start: cron(0 3 ? * MON-FRI *)   # 08:30 IST Mon-Fri
+stop:  cron(0 11 ? * MON-FRI *)  # 16:30 IST Mon-Fri
+```
+
+To shift the weekday window (e.g. stop at 17:00 IST instead of 16:30), edit
+the `schedule_expression` of the stop rule in `main.tf`, keeping total
+runtime within the budget envelope (~270 running hrs/mo at the $25/mo cap):
 
 ```bash
-# Edit deploy/aws/terraform/eventbridge.tf, change:
-#   schedule_expression = "cron(0 8 ? * SAT,SUN *)"   # 13:30 IST
-# to:
-#   schedule_expression = "cron(0 9 ? * SAT,SUN *)"   # 14:30 IST
-
+# Edit the stop rule schedule_expression in deploy/aws/terraform/main.tf, then:
 cd deploy/aws/terraform
 terraform plan
 terraform apply
@@ -175,7 +187,10 @@ aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
 
 ## Cost monitoring
 
-Set a CloudWatch billing alarm at ₹4,500/mo (90% of budget):
+The $25/mo budget cap is managed in Terraform (`budget.tf`), and the
+killswitch Lambda (`budget-killswitch-lambda.tf`) auto-stops the instance
+on breach — no manual alarm setup is required. If you want an additional
+ad-hoc CloudWatch billing alarm (e.g. at $22, ~90% of cap):
 
 ```bash
 aws cloudwatch put-metric-alarm \
@@ -184,7 +199,7 @@ aws cloudwatch put-metric-alarm \
   --namespace AWS/Billing \
   --statistic Maximum \
   --period 21600 \
-  --threshold 4500 \
+  --threshold 22 \
   --comparison-operator GreaterThanThreshold \
   --evaluation-periods 1 \
   --alarm-actions <SNS_TOPIC_ARN_FROM_TERRAFORM_OUTPUT> \
@@ -206,8 +221,8 @@ aws ce get-cost-and-usage \
 See `docs/runbooks/aws-disaster-recovery.md` for:
 
   * EC2 instance loss → terraform apply from scratch
-  * EBS data volume corruption → restore from S3 snapshots
-  * EIP released → 7-day Dhan support coordination
+  * EBS root volume corruption → rebuild + restore hot data from S3 archive
+  * EIP released (only when `enable_eip = true`) → 7-day Dhan support coordination
   * IAM role compromise → key rotation procedure
   * Region-wide outage → manual failover to ap-south-2 (Hyderabad)
 
