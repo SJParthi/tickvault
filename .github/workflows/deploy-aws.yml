@@ -206,11 +206,18 @@ jobs:
           name: tickvault-binary
           path: ./dist/
 
-      - name: Configure AWS credentials via OIDC
+      - name: Configure AWS credentials (OIDC preferred, keys fallback)
+        # The OIDC role (AWS_ROLE_ARN) only exists AFTER the post-bootstrap
+        # security cleanup (BOOTSTRAP-ONE-TIME.md steps 4-5). Until then the
+        # operator has only AWS_ACCESS_KEY_ID/SECRET set — so this step MUST
+        # accept either. Mirrors seed-staging-ssm.yml so deploy works the
+        # moment the box exists, not only after the OIDC migration.
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'ap-south-1' }}
           role-session-name: tv-github-deploy-${{ github.run_id }}
 
       - name: Upload both binaries to S3 staging bucket
@@ -218,10 +225,10 @@ jobs:
           chmod +x ./dist/tickvault ./dist/smoke_test
           aws s3 cp ./dist/tickvault \
             s3://tv-prod-cold/deploys/${{ github.sha }}/tickvault \
-            --region ${{ vars.AWS_REGION }}
+            --region ${{ vars.AWS_REGION || 'ap-south-1' }}
           aws s3 cp ./dist/smoke_test \
             s3://tv-prod-cold/deploys/${{ github.sha }}/smoke_test \
-            --region ${{ vars.AWS_REGION }}
+            --region ${{ vars.AWS_REGION || 'ap-south-1' }}
 
       - name: Run SSM command — download binaries + smoke test + atomic swap
         # Target path is /opt/tickvault (matches user-data.sh.tftpl step 4).
@@ -232,7 +239,7 @@ jobs:
         id: ssm
         run: |
           CMD_ID=$(aws ssm send-command \
-            --region ${{ vars.AWS_REGION }} \
+            --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
             --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
             --document-name "AWS-RunShellScript" \
             --comment "tickvault deploy sha=${{ github.sha }}" \
@@ -276,14 +283,14 @@ jobs:
       - name: Wait for SSM command completion
         run: |
           aws ssm wait command-executed \
-            --region ${{ vars.AWS_REGION }} \
+            --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
             --command-id ${{ steps.ssm.outputs.command_id }} \
             --instance-id ${{ secrets.EC2_INSTANCE_ID }}
 
       - name: Fetch SSM command output
         run: |
           aws ssm get-command-invocation \
-            --region ${{ vars.AWS_REGION }} \
+            --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
             --command-id ${{ steps.ssm.outputs.command_id }} \
             --instance-id ${{ secrets.EC2_INSTANCE_ID }} \
             --query '[Status,StandardOutputContent,StandardErrorContent]' \
@@ -296,14 +303,14 @@ jobs:
           FAIL=0
           for i in 1 2 3 4 5 6; do
             STATE=$(aws ssm send-command \
-              --region ${{ vars.AWS_REGION }} \
+              --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
               --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
               --document-name "AWS-RunShellScript" \
               --parameters 'commands=["systemctl is-active tickvault"]' \
               --query 'Command.CommandId' --output text)
             sleep 5
             RESULT=$(aws ssm get-command-invocation \
-              --region ${{ vars.AWS_REGION }} \
+              --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
               --command-id "$STATE" \
               --instance-id ${{ secrets.EC2_INSTANCE_ID }} \
               --query 'StandardOutputContent' --output text | tr -d '[:space:]')
@@ -317,7 +324,7 @@ jobs:
           if [ "$FAIL" -eq 1 ]; then
             echo "ROLLBACK: tickvault is not active after deploy — rolling back"
             aws ssm send-command \
-              --region ${{ vars.AWS_REGION }} \
+              --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
               --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
               --document-name "AWS-RunShellScript" \
               --parameters 'commands=["set -euo pipefail","cd /opt/tickvault","if [ -f bin/tickvault.backup ]; then mv bin/tickvault.backup bin/tickvault; systemctl restart tickvault; fi"]'
@@ -331,8 +338,8 @@ jobs:
           # The SNS topic has a Telegram webhook subscription; publish
           # an INFO-level message so the operator sees the deploy land.
           aws sns publish \
-            --region ${{ vars.AWS_REGION }} \
-            --topic-arn arn:aws:sns:${{ vars.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:tv-prod-alerts \
+            --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
+            --topic-arn arn:aws:sns:${{ vars.AWS_REGION || 'ap-south-1' }}:${{ secrets.AWS_ACCOUNT_ID }}:tv-prod-alerts \
             --subject "DLT deploy OK" \
             --message "commit=${{ github.sha }} ref=${{ github.ref }} actor=${{ github.actor }}"
 
@@ -340,7 +347,7 @@ jobs:
         if: failure()
         run: |
           aws sns publish \
-            --region ${{ vars.AWS_REGION }} \
-            --topic-arn arn:aws:sns:${{ vars.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:tv-prod-alerts \
+            --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
+            --topic-arn arn:aws:sns:${{ vars.AWS_REGION || 'ap-south-1' }}:${{ secrets.AWS_ACCOUNT_ID }}:tv-prod-alerts \
             --subject "DLT deploy FAILED" \
             --message "commit=${{ github.sha }} ref=${{ github.ref }} actor=${{ github.actor }} run=${{ github.run_id }}"
