@@ -92,15 +92,15 @@ variable "operator_cidr" {
 }
 
 variable "telegram_bot_token_ssm_param" {
-  description = "SSM parameter name where the Telegram bot token is stored."
+  description = "SSM parameter name where the Telegram bot token is stored. Defaults to the STAGING path because the app runs TV_ENVIRONMENT=staging during the 3-month no-orders data-pull, and the seed populates /tickvault/staging/* (the /tickvault/prod/* path does not exist yet -> ParameterNotFound in the webhook Lambda, 2026-05-30). Flip to /tickvault/prod/telegram/bot-token when going live (TV_ENVIRONMENT=prod)."
   type        = string
-  default     = "/tickvault/prod/telegram/bot-token"
+  default     = "/tickvault/staging/telegram/bot-token"
 }
 
 variable "telegram_chat_id_ssm_param" {
-  description = "SSM parameter name where the Telegram chat ID (numeric) is stored."
+  description = "SSM parameter name where the Telegram chat ID (numeric) is stored. Defaults to the STAGING path (see telegram_bot_token_ssm_param). Flip to /tickvault/prod/telegram/chat-id when going live."
   type        = string
-  default     = "/tickvault/prod/telegram/chat-id"
+  default     = "/tickvault/staging/telegram/chat-id"
 }
 
 variable "dhan_access_token_ssm_param" {
