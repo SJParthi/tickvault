@@ -103,15 +103,24 @@ ratchets updated, one PR at a time per `pr-completion-protocol.md` §H.
   - Tests: `docker compose config` valid; `cargo test -p tickvault-app
     -p tickvault-storage -p tickvault-common` (scoped) green.
 
-- [ ] **#O4 — Valkey removal — UNBLOCKED (operator decision 2026-05-20)**
-  - Valkey is LOAD-BEARING: (a) token cache, (b) dual-instance lock.
-  - **Operator decision 2026-05-20 — "Just remove valkey also":** the
-    dual-instance lock is **RETIRED**, not replaced. No file lock, no
-    QuestDB row. Acceptable because sandbox mode already skips the lock
-    and `dry_run = true` is the default — the lock only mattered in
-    live multi-host trading. Re-evaluate before `dry_run = false` if
-    multi-host deployment is ever on the table (note it in the live-go
-    checklist).
+- [x] **#O4 — Valkey removal — merged (PR #764, 2026-05-24)**
+  - Valkey was LOAD-BEARING: (a) token cache, (b) dual-instance lock.
+  - **As shipped (supersedes the 2026-05-20 "retire entirely" note):**
+    Valkey itself is fully removed (container, `valkey_cache.rs`,
+    `fetch_valkey_password`, `chaos_valkey_kill.rs`, the `[valkey]`
+    config, the Valkey token-cache layer). The token cache is now a
+    local FILE (`/tmp/tv-token-cache`, crash-recovery only); auth reads
+    SSM directly. The dual-instance lock was **MIGRATED to SSM** (not
+    retired) — `crates/core/src/instance_lock.rs` is now SSM-backed and
+    still load-bearing in boot Step 6a-prime, gated on
+    `trading_mode.is_live()` so it is inert under the `dry_run = true`
+    default. Operator decision 2026-05-30: KEEP the SSM lock (real
+    two-process safety guard, zero Valkey dependency, zero cost in
+    dry-run). The `Resilience01DualInstanceDetected` ErrorCode + its
+    RESILIENCE-01 runbook stay.
+  - Carry into the `dry_run = false` go-live checklist: the SSM lock
+    now provides the dual-instance guard; confirm it is exercised
+    before flipping live.
   - Token cache: dropped — the auth chain is cache → SSM → TOTP; SSM
     is the source of truth, so removal is graceful degradation.
   - Work: delete `valkey_cache.rs`; delete `instance_lock.rs` + its
@@ -172,11 +181,15 @@ ratchets updated, one PR at a time per `pr-completion-protocol.md` §H.
 | 3 | Operator wants a dashboard | CloudWatch console — no local Grafana |
 | 4 | An `error!` fires | routed to CloudWatch Logs (Telegram path re-pointed off Alertmanager) |
 
-## #O4 lock question — RESOLVED 2026-05-20
+## #O4 lock question — RESOLVED 2026-05-30 (supersedes the 2026-05-20 note)
 
-The dual-instance lock lived in Valkey. Operator decision 2026-05-20
-("Just remove valkey also"): **retire the dual-instance guard
-entirely** — option (c). No replacement infra. All 6 items #O1–#O6 are
-now unblocked; execute serially per §H. Carry one note into the
-`dry_run = false` go-live checklist: re-evaluate dual-instance
-protection if multi-host deployment is ever considered.
+The dual-instance lock originally lived in Valkey. The 2026-05-20 note
+proposed retiring it entirely with no replacement. What actually shipped
+in PR #764 was different and better: Valkey is gone, but the lock was
+**migrated to SSM** (`crates/core/src/instance_lock.rs`) rather than
+retired. Operator decision 2026-05-30: **KEEP the SSM lock** — it is a
+genuine two-process safety guard (prevents two instances racing the 24h
+JWT into DH-901), carries no Valkey dependency, and is inert under the
+`dry_run = true` default (gated on `trading_mode.is_live()`). The
+`Resilience01DualInstanceDetected` ErrorCode + RESILIENCE-01 runbook
+stay. #O4 is DONE; remaining serial items per §H are #O5 then #O6.
