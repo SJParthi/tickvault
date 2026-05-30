@@ -16,12 +16,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 const REQUIRED_PROFILES: &[&str] = &["local", "mac-dev", "aws-prod"];
-const REQUIRED_URL_KEYS: &[&str] = &[
-    "prometheus_url",
-    "alertmanager_url",
-    "questdb_url",
-    "tickvault_api_url",
-];
+const REQUIRED_URL_KEYS: &[&str] = &["prometheus_url", "questdb_url", "tickvault_api_url"];
 const REQUIRED_NON_URL_KEYS: &[&str] = &["logs_source", "logs_dir_local"];
 
 #[derive(Debug, Deserialize)]
@@ -33,7 +28,6 @@ struct EndpointsConfig {
 #[derive(Debug, Deserialize)]
 struct Profile {
     prometheus_url: String,
-    alertmanager_url: String,
     questdb_url: String,
     tickvault_api_url: String,
     logs_source: String,
@@ -126,7 +120,6 @@ fn all_url_keys_look_like_http_or_https() {
     for (name, profile) in &cfg.profiles {
         for (key, value) in [
             ("prometheus_url", &profile.prometheus_url),
-            ("alertmanager_url", &profile.alertmanager_url),
             ("questdb_url", &profile.questdb_url),
             ("tickvault_api_url", &profile.tickvault_api_url),
         ] {
@@ -168,7 +161,6 @@ fn local_profile_uses_localhost_not_tailscale() {
         .expect("local profile presence already asserted");
     for url in [
         &local.prometheus_url,
-        &local.alertmanager_url,
         &local.questdb_url,
         &local.tickvault_api_url,
     ] {
@@ -240,12 +232,7 @@ fn mcp_server_reads_config_file_before_env_vars() {
         .unwrap_or_else(|_| panic!("MCP server source missing at {}", path.display()));
 
     // Every endpoint URL lookup must use _endpoint_url(...).
-    for kind in [
-        "prometheus_url",
-        "questdb_url",
-        "alertmanager_url",
-        "tickvault_api_url",
-    ] {
+    for kind in ["prometheus_url", "questdb_url", "tickvault_api_url"] {
         assert!(
             src.contains(&format!("\"{kind}\"")),
             "MCP server source must reference profile key '{kind}' via _endpoint_url"
@@ -254,7 +241,6 @@ fn mcp_server_reads_config_file_before_env_vars() {
     // No bare os.environ.get of the legacy env vars for URL resolution.
     for env in [
         "TICKVAULT_PROMETHEUS_URL",
-        "TICKVAULT_ALERTMANAGER_URL",
         "TICKVAULT_QUESTDB_URL",
         "TICKVAULT_API_URL",
     ] {
