@@ -1,0 +1,96 @@
+# =============================================================================
+# aws-autopilot — self-check + auto-heal the AWS deployment (zero human)
+# =============================================================================
+# Operator demand 2026-05-31: "make it as an extreme complete comprehensive
+# automated process ... I never ever wanted to get stuck with manual
+# configurations like run deploy, configure static elastic IP."
+#
+# This workflow runs scripts/aws-autopilot.sh which checks every layer of the
+# running deployment and AUTO-FIXES what it safely can (start a stopped box in
+# market hours, re-associate the Elastic IP, restart the app, bring QuestDB
+# back up), and Telegram-alerts only what needs human eyes. It posts a summary
+# to the run + Telegram so the operator never has to open the AWS console.
+#
+# Triggers:
+#   - schedule: every 15 min between 03:00-11:00 UTC (08:30-16:30 IST) Mon-Fri,
+#     i.e. while the box is supposed to be up. (Cheap: a few aws CLI calls.)
+#   - workflow_dispatch: on-demand, with a `strict` input that exits non-zero
+#     if anything is unhealed (so you can wire it as a gate).
+#
+# Auth: same OIDC-or-access-key fallback as seed/deploy. Skips cleanly if the
+# bootstrap secrets aren't set.
+# =============================================================================
+
+name: aws-autopilot
+
+on:
+  schedule:
+    # Every 15 min, 03:00-11:00 UTC (08:30-16:30 IST), Mon-Fri.
+    - cron: '*/15 3-11 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      strict:
+        description: 'Exit non-zero if any issue is left unhealed? (yes/no)'
+        required: false
+        default: 'no'
+
+concurrency:
+  group: aws-autopilot
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  TV_ENVIRONMENT: staging
+
+jobs:
+  preflight:
+    name: Preflight — bootstrap secrets present?
+    runs-on: ubuntu-24.04
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - name: Check AWS creds
+        id: check
+        env:
+          OIDC_ROLE: ${{ secrets.AWS_ROLE_ARN }}
+          ACCESS_KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          EC2_ID: ${{ secrets.EC2_INSTANCE_ID }}
+        run: |
+          if { [ -n "$OIDC_ROLE" ] || [ -n "$ACCESS_KEY" ]; } && [ -n "$EC2_ID" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::AWS bootstrap secrets / EC2_INSTANCE_ID not set — autopilot skipped."
+          fi
+
+  autopilot:
+    name: Self-check + auto-heal
+    runs-on: ubuntu-24.04
+    needs: preflight
+    if: needs.preflight.outputs.ready == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 1
+
+      - name: Configure AWS credentials (OIDC preferred, keys fallback)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: tv-autopilot-${{ github.run_id }}
+
+      - name: Run autopilot
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+          EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+          TV_ENVIRONMENT: ${{ env.TV_ENVIRONMENT }}
+          STRICT: ${{ github.event.inputs.strict || 'no' }}
+        run: bash scripts/aws-autopilot.sh
