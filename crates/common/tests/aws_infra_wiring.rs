@@ -435,6 +435,45 @@ fn test_deploy_aws_workflow_uses_oidc() {
 }
 
 #[test]
+fn test_deploy_aws_after_close_workflow_exists_and_fires_at_1531_ist() {
+    // Option B (operator lock 2026-05-30): if a merge to main lands during
+    // market hours (09:15-15:30 IST Mon-Fri), guard_market_hours blocks the
+    // deploy. This auto-retry workflow re-fires deploy-aws.yml at 15:31 IST
+    // every weekday so the blocked deploy lands the moment the market closes
+    // — true zero-downtime-during-market without the cost of blue/green.
+    let path = ".github/workflows/deploy-aws-after-close.yml";
+    require_file_exists(
+        path,
+        "auto-deploy-after-market-close workflow (Option B, zero-touch)",
+    );
+    let content = std::fs::read_to_string(workspace_root().join(path))
+        .expect("deploy-aws-after-close.yml must be readable"); // APPROVED: test
+
+    // 15:31 IST = 10:01 UTC. Mon-Fri only (cron day-of-week = 1-5).
+    assert!(
+        content.contains("1 10 * * 1-5"),
+        "deploy-aws-after-close.yml cron must be 10:01 UTC Mon-Fri (15:31 IST)"
+    );
+    // Must dispatch deploy-aws.yml — that's the whole point.
+    assert!(
+        content.contains("gh workflow run deploy-aws.yml"),
+        "deploy-aws-after-close.yml must dispatch deploy-aws.yml via gh CLI"
+    );
+    // Idempotency: must compare main HEAD against last successful deploy SHA
+    // so quiet days don't trigger a spurious 5s app restart.
+    assert!(
+        content.contains("head_sha"),
+        "deploy-aws-after-close.yml must compare against last successful \
+         deploy head_sha (idempotency — no spurious restart on quiet days)"
+    );
+    // Required permission to dispatch another workflow.
+    assert!(
+        content.contains("actions: write"),
+        "deploy-aws-after-close.yml must request actions:write to dispatch deploy-aws.yml"
+    );
+}
+
+#[test]
 fn test_dep_freshness_workflow_cron_schedule() {
     let content = std::fs::read_to_string(
         workspace_root().join(".github/workflows/dep-freshness-nightly.yml"),

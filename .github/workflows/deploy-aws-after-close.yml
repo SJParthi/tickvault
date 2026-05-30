@@ -1,0 +1,99 @@
+# =============================================================================
+# tickvault — auto-deploy after market close (Option B, zero-touch)
+# =============================================================================
+# Goal: if a commit merged to main during market hours (09:15–15:30 IST Mon–Fri),
+# the deploy-aws.yml `guard_market_hours` job blocks it. This workflow re-fires
+# deploy-aws.yml at 15:31 IST (10:01 UTC) every weekday so the merge lands
+# automatically the moment the market closes — with ZERO downtime during the
+# trading session (the 5s app restart only ever happens after-hours).
+#
+# Idempotent: before dispatching, we compare main's current HEAD against the
+# `head_sha` of the most recent SUCCESSFUL deploy-aws run on main. If equal,
+# nothing to deploy — exit clean (no spurious restart on quiet days).
+#
+# Triggers:
+#   - schedule: 10:01 UTC Mon–Fri (15:31 IST, ~1 minute after NSE close)
+#   - workflow_dispatch: manual operator override (just-in-case button)
+#
+# Honest envelope:
+#   - 09:15-15:30 IST blocked → 15:31 IST same-day deploy ✅
+#   - Weekend merge → Monday 15:31 IST deploy ✅
+#   - NSE holiday → next weekday 15:31 IST (holiday calendar TODO; today we
+#     re-dispatch every weekday — deploy-aws's own guard is a no-op outside
+#     market hours, so it just runs harmlessly on holiday afternoons)
+#   - No new commits → idempotent skip (no restart, no extra cost)
+# =============================================================================
+
+name: deploy-aws-after-close
+
+on:
+  schedule:
+    # 10:01 UTC = 15:31 IST. Mon–Fri only.
+    - cron: '1 10 * * 1-5'
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-aws-after-close
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write   # required to dispatch deploy-aws.yml
+
+jobs:
+  retry-if-needed:
+    name: Re-fire deploy-aws if main has an undeployed commit
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout (for git rev-parse)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 1
+          ref: main
+
+      - name: Compare main HEAD vs last successful deploy
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          MAIN_SHA=$(git rev-parse HEAD)
+          echo "main HEAD = $MAIN_SHA"
+
+          # Pull the most recent SUCCESSFUL deploy-aws run on main.
+          # If there is none yet (fresh repo), we treat it as "deploy needed".
+          LAST_DEPLOYED=$(gh api \
+            "repos/${{ github.repository }}/actions/workflows/deploy-aws.yml/runs?branch=main&status=success&per_page=1" \
+            --jq '.workflow_runs[0].head_sha // ""')
+          echo "last successful deploy sha = ${LAST_DEPLOYED:-<none>}"
+
+          if [ -z "$LAST_DEPLOYED" ]; then
+            echo "No prior successful deploy on record — dispatching first deploy."
+            echo "dispatch=true" >> "$GITHUB_OUTPUT"
+          elif [ "$MAIN_SHA" != "$LAST_DEPLOYED" ]; then
+            echo "main has moved since last successful deploy — dispatching."
+            echo "dispatch=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "main is already deployed — nothing to do."
+            echo "dispatch=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Dispatch deploy-aws.yml on main
+        if: steps.check.outputs.dispatch == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run deploy-aws.yml --ref main
+          echo "::notice::deploy-aws dispatched on main — watch Actions tab"
+
+      - name: Summary
+        run: |
+          {
+            echo "## Auto-deploy after market close"
+            echo ""
+            if [ "${{ steps.check.outputs.dispatch }}" = "true" ]; then
+              echo "✅ Dispatched \`deploy-aws.yml\` on \`main\` — operator sees green/red on the deploy-aws run."
+            else
+              echo "ℹ️  \`main\` is already deployed — no action taken (idempotent)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
