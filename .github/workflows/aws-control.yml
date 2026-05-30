@@ -136,19 +136,112 @@ jobs:
         run: |
           set -euo pipefail
           IID=${{ steps.iid.outputs.id }}
-          echo "### EC2 state"
-          aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$IID" \
-            --query 'Reservations[0].Instances[0].{State:State.Name,Type:InstanceType,AZ:Placement.AvailabilityZone,LaunchTime:LaunchTime}' --output table
-          echo "### App + QuestDB health (via SSM, best-effort)"
+          S="$GITHUB_STEP_SUMMARY"
+          echo "# 📊 tickvault — full AWS status" >> "$S"
+          echo "" >> "$S"
+
+          # ---- 1. EC2 instance state ----
+          STATE=$(aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$IID" \
+            --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo "unknown")
+          TYPE=$(aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$IID" \
+            --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null || echo "?")
+          echo "## 🖥️  Instance" >> "$S"
+          echo "- State: **$STATE**  |  Type: **$TYPE**  |  Region: ap-south-1" >> "$S"
+          echo "" >> "$S"
+
+          if [ "$STATE" != "running" ]; then
+            echo "> ⚠️ The instance is **$STATE** — start it first (AWS Control → start) to see app/QuestDB/data." >> "$S"
+            echo "Instance is $STATE — nothing more to gather."
+            exit 0
+          fi
+
+          # ---- 2-6. On-box gather: app, QuestDB, row counts, logs, errors ----
+          # One SSM script collects everything; QuestDB queried over local HTTP /exec.
           CMD=$(aws ssm send-command --region "$AWS_REGION" --instance-ids "$IID" \
             --document-name AWS-RunShellScript \
-            --parameters 'commands=["systemctl is-active tickvault || true","docker ps --format \"{{.Names}} {{.Status}}\" | grep -i quest || true"]' \
+            --comment "tickvault full status" \
+            --parameters 'commands=[
+              "echo ===APP===",
+              "systemctl is-active tickvault 2>/dev/null || echo inactive",
+              "echo ===DOCKER===",
+              "docker ps --format \"{{.Names}} {{.Status}}\" 2>/dev/null || echo none",
+              "echo ===ROWS===",
+              "for t in ticks candles_1m option_chain_minute_snapshot instrument_lifecycle; do c=$(curl -s \"http://localhost:9000/exec?query=select%20count(*)%20from%20$t\" 2>/dev/null | grep -oE \"\\[\\[[0-9]+\" | grep -oE \"[0-9]+\" | head -1); echo \"$t=${c:-NA}\"; done",
+              "echo ===LOGS===",
+              "journalctl -u tickvault -n 12 --no-pager 2>/dev/null | tail -12 || echo no-logs",
+              "echo ===ERRORS===",
+              "tail -3 /opt/tickvault/data/logs/errors.summary.md 2>/dev/null || echo no-summary"
+            ]' \
             --query Command.CommandId --output text 2>/dev/null || echo "")
-          if [ -n "$CMD" ]; then
-            sleep 4
-            aws ssm get-command-invocation --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" \
-              --query StandardOutputContent --output text 2>/dev/null || echo "(instance may be stopped — start it first)"
+
+          if [ -z "$CMD" ]; then
+            echo "> ⚠️ Could not reach the box via SSM (agent may be starting). Try again in a minute." >> "$S"
+            exit 0
           fi
+
+          # Wait for the command to finish (up to ~40s).
+          for i in $(seq 1 20); do
+            ST=$(aws ssm get-command-invocation --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" --query Status --output text 2>/dev/null || echo Pending)
+            case "$ST" in Success|Failed|Cancelled|TimedOut) break;; esac
+            sleep 2
+          done
+          OUT=$(aws ssm get-command-invocation --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" --query StandardOutputContent --output text 2>/dev/null || echo "")
+
+          # Parse sections.
+          app=$(echo "$OUT" | awk '/===APP===/{f=1;next}/===DOCKER===/{f=0}f' | tr -d '[:space:]')
+          docker=$(echo "$OUT" | awk '/===DOCKER===/{f=1;next}/===ROWS===/{f=0}f')
+          rows=$(echo "$OUT" | awk '/===ROWS===/{f=1;next}/===LOGS===/{f=0}f')
+          logs=$(echo "$OUT" | awk '/===LOGS===/{f=1;next}/===ERRORS===/{f=0}f')
+          errs=$(echo "$OUT" | awk '/===ERRORS===/{f=1;next}f')
+
+          # ---- App health ----
+          echo "## 🟢 App" >> "$S"
+          if [ "$app" = "active" ]; then
+            echo "- tickvault service: **active** ✅" >> "$S"
+          else
+            echo "- tickvault service: **$app** ⚠️ — if 'inactive', run AWS Control → deploy (ships + starts the app)." >> "$S"
+          fi
+          echo "" >> "$S"
+
+          # ---- QuestDB / Docker ----
+          echo "## 🗄️  QuestDB (Docker)" >> "$S"
+          if echo "$docker" | grep -qi quest; then
+            echo '```' >> "$S"; echo "$docker" | grep -i quest >> "$S"; echo '```' >> "$S"
+          else
+            echo "- QuestDB container not found ⚠️ (deploy starts it)." >> "$S"
+          fi
+          echo "" >> "$S"
+
+          # ---- Data row counts ----
+          echo "## 📈 Data captured (QuestDB row counts)" >> "$S"
+          echo '```' >> "$S"; echo "$rows" >> "$S"; echo '```' >> "$S"
+          echo "_ticks/candles climb during market hours; 0 off-market or pre-deploy is normal._" >> "$S"
+          echo "" >> "$S"
+
+          # ---- Recent logs ----
+          echo "## 📜 Recent app logs (last 12 lines)" >> "$S"
+          echo '```' >> "$S"; echo "$logs" >> "$S"; echo '```' >> "$S"
+          echo "" >> "$S"
+
+          # ---- Errors summary ----
+          echo "## 🚨 Errors" >> "$S"
+          echo '```' >> "$S"; echo "$errs" >> "$S"; echo '```' >> "$S"
+          echo "" >> "$S"
+
+          # ---- Plain-English verdict ----
+          echo "## ✅ Verdict" >> "$S"
+          if [ "$app" = "active" ] && echo "$docker" | grep -qi quest; then
+            echo "**Healthy** — instance running, app active, QuestDB up. Data flows during market hours; watch the row counts above." >> "$S"
+          elif [ "$app" != "active" ]; then
+            echo "**App not running yet** — the box + QuestDB are up, but the tickvault binary isn't active. **Next: AWS Control → deploy.**" >> "$S"
+          else
+            echo "**Partial** — see the sections above; re-run status after a minute." >> "$S"
+          fi
+          echo "" >> "$S"
+          echo "_Dashboards: CloudWatch → Dashboards → tv-prod-operator · Logs: CloudWatch → Log groups → /tickvault/prod/app_" >> "$S"
+
+          # Also echo to the run log for quick glance.
+          echo "$OUT"
 
       - name: start
         if: github.event.inputs.action == 'start'
