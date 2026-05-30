@@ -27,7 +27,7 @@ crates/
 ├── common/    → 14 source files, 1 test file      (shared types, config, enums, errors)
 ├── core/      → 44 source files, 12 test files     (WS, parser, pipeline, auth, instruments)
 ├── trading/   → 20 source files, 9 test files      (OMS, risk, strategy, indicators)
-├── storage/   → 7 source files, 2 test files       (QuestDB, Valkey, persistence)
+├── storage/   → 7 source files, 2 test files       (QuestDB, persistence)
 ├── api/       → 9 source files, 3 test files       (axum HTTP, handlers, middleware)
 └── app/       → 4 source files, 0 test files       (main binary, boot orchestration)
 ```
@@ -45,7 +45,7 @@ app → api → trading → core → storage → common
 
 ### Block 01: Master Instrument Download — COMPLETE
 - **Files:** `core/src/instrument/` (9 files: csv_downloader, csv_parser, universe_builder, validation, subscription_planner, binary_cache, delta_detector, daily_scheduler, s3_backup, diagnostic, instrument_loader)
-- **What it does:** Downloads Dhan detailed CSV daily, parses ~100K instruments, builds FnoUniverse with all lookup maps, generates WebSocket subscription plans, persists to QuestDB + Valkey
+- **What it does:** Downloads Dhan detailed CSV daily, parses ~100K instruments, builds FnoUniverse with all lookup maps, generates WebSocket subscription plans, persists to QuestDB
 - **Key types:** `InstrumentRecord`, `FnoKey`, `FnoUniverse`, `InstrumentRegistry`
 - **Tests:** Schema validation, proptest registry, category counts, edge cases
 
@@ -95,7 +95,7 @@ app → api → trading → core → storage → common
 
 ### Block 10: Order Management System — PARTIALLY COMPLETE
 - **Files:** `trading/src/oms/` (8 files: api_client, circuit_breaker, engine, idempotency, rate_limiter, reconciliation, state_machine, types)
-- **What's built:** OMS engine with state machine (statig), rate limiter (GCRA), circuit breaker (failsafe), idempotency (Valkey), reconciliation logic, order types
+- **What's built:** OMS engine with state machine (statig), rate limiter (GCRA), circuit breaker (failsafe), idempotency (in-memory), reconciliation logic, order types
 - **What's pending:**
   - [ ] Wire OMS engine to real Dhan REST API (place/modify/cancel)
   - [ ] OMS state transition from live Order Update WebSocket
@@ -113,13 +113,13 @@ app → api → trading → core → storage → common
 
 ### Block 12: HTTP API Server — COMPLETE
 - **Files:** `api/src/` (handlers: health, instruments, quote, static_file, stats, top_movers + middleware, state, lib)
-- **What it does:** axum server, health check, stats (QuestDB), portal frontend, instrument rebuild, CORS, bearer auth middleware
+- **What it does:** axum server, health check, stats (QuestDB), instrument rebuild, CORS, bearer auth middleware (the `/portal` HTML frontend was retired in the AWS-lifecycle PRs, 2026-05-19)
 - **Tests:** API smoke, auth middleware, contract tests
 
 ### Block 13: Observability Stack — COMPLETE
 - **Files:** `app/src/observability.rs`, `core/src/notification/` (events, service, mod)
-- **What it does:** Prometheus metrics, OpenTelemetry tracing, Telegram alerts, Grafana dashboards, Loki log aggregation
-- **Docker:** QuestDB, Valkey, Prometheus, Grafana, Loki, Alloy, Jaeger V2, Traefik
+- **What it does:** metrics (Prometheus wire format scraped by CloudWatch), tracing, Telegram alerts, log aggregation. (Prometheus/Grafana/Alertmanager containers + Grafana dashboards were retired in the CloudWatch-only migration #O1–#O3, 2026-05-19; CloudWatch Dashboards replace Grafana in prod.)
+- **Docker:** QuestDB (Valkey/Prometheus/Grafana/Loki/Alloy/Jaeger/Traefik all removed — CloudWatch-only migration #O1–#O4, 2026-05-24)
 
 ### Block 14: Risk Engine — COMPLETE
 - **Files:** `trading/src/risk/` (engine, tick_gap_tracker, types, mod)
@@ -127,8 +127,8 @@ app → api → trading → core → storage → common
 - **Key types:** `RiskEngine`, `RiskConfig`, `TickGapTracker`
 - **Tests:** 49 risk tests (proptest, never-requirements, edge cases, reconciliation safety, regression)
 
-### Block 15: Valkey Cache — COMPLETE
-- **Files:** `storage/src/valkey_cache.rs`
+### Block 15: Valkey Cache — COMPLETE (removed #O4 2026-05-24)
+- **Files:** `storage/src/valkey_cache.rs` (deleted in #O4)
 - **What it does:** deadpool-redis async pool, typed helpers (get/set/del/exists/set_nx_ex), health check via PING
 
 ### Supporting: Strategy & Indicators — COMPLETE
@@ -328,7 +328,7 @@ app → api → trading → core → storage → common
 - `app/src/infra.rs` — Docker/infra health checks
 - `app/src/observability.rs` — Tracing + metrics init
 - `storage/src/tick_persistence.rs` — QuestDB ILP writer
-- `storage/src/valkey_cache.rs` — Valkey (Redis) cache
+- `storage/src/valkey_cache.rs` — Valkey (Redis) cache (removed #O4 2026-05-24)
 
 ---
 

@@ -38,7 +38,7 @@ so let's go") is FORBIDDEN.
 allows for that + post-close sleep transition + occasional Dhan-side
 RST. Above this, network or auth instability is real.
 
-**Inspection:** `mcp__tickvault-logs__prometheus_query "increase(tv_websocket_disconnects_total{feed='main'}[22d])"`
+**Inspection:** read `tv_websocket_disconnects_total{feed='main'}` from CloudWatch metrics (prod) or the app `/metrics` endpoint (dev). The `prometheus_query` MCP tool was retired in #O5 (2026-05-30) — Prometheus container removed in #O3.
 
 ### 2. Disconnect rate — order update
 

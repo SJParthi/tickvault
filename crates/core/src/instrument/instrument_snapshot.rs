@@ -523,4 +523,81 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    /// Production-scale disaster proof: a realistic ~331-SID universe (the live
+    /// daily-universe size) must round-trip through the snapshot losslessly —
+    /// no SID silently dropped, the plan identical to the cold build. A drop
+    /// at scale is the catastrophic "warm boot subscribes to fewer instruments
+    /// than the cold build, looks healthy" failure. Runs in CI as a --lib test.
+    #[test]
+    fn test_warm_resubscribe_lossless_at_production_scale() {
+        use crate::instrument::subscription_planner::build_subscription_plan_from_daily_universe;
+
+        const INDEX_COUNT: usize = 3;
+        const UNDERLYING_COUNT: usize = 328; // 3 + 328 = 331, the live size
+        let mut targets = Vec::with_capacity(INDEX_COUNT + UNDERLYING_COUNT);
+        targets.push(target(InstrumentRole::Index, "13", "NIFTY"));
+        targets.push(target(InstrumentRole::Index, "25", "BANKNIFTY"));
+        targets.push(target(InstrumentRole::Index, "51", "SENSEX"));
+        for i in 0..UNDERLYING_COUNT {
+            // 10000+ keeps ids well clear of the 3 index ids above; all unique.
+            let sid = (10_000 + i).to_string();
+            let sym = format!("STK{i}");
+            targets.push(target(InstrumentRole::FnoUnderlying, &sid, &sym));
+        }
+        let original = DailyUniverse {
+            subscription_targets: targets,
+            fno_contracts: vec![],
+        };
+        let expected = INDEX_COUNT + UNDERLYING_COUNT;
+
+        let date = "2099-08-09";
+        let path = snapshot_path_for(date).expect("valid date");
+        let _ = std::fs::remove_file(&path);
+
+        let plan_a = build_subscription_plan_from_daily_universe(&original);
+        write_plan_snapshot(&original, date).expect("write ok");
+        let restored = load_plan_snapshot_for_today(date).expect("load ok");
+        let plan_b = build_subscription_plan_from_daily_universe(&restored);
+
+        assert_eq!(
+            plan_a.summary.total, expected,
+            "cold build must plan all {expected} SIDs"
+        );
+        assert_eq!(
+            plan_b.summary.total, expected,
+            "warm resubscribe dropped SIDs at production scale"
+        );
+        assert_eq!(
+            restored.subscription_targets.len(),
+            expected,
+            "snapshot lost targets at scale"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Crash-during-write disaster: the write is tmp-file + atomic rename, so a
+    /// process killed mid-write leaves only a `.tmp` and NO `.json`. The loader
+    /// must then return `None` (→ cold path) and must NEVER read the partial
+    /// `.tmp`. This proves an OOM/SIGKILL at the exact write instant degrades
+    /// to a clean cold build, never a corrupt warm plan.
+    #[test]
+    fn test_load_ignores_partial_tmp_write() {
+        let date = "2099-09-10";
+        let path = snapshot_path_for(date).expect("valid date");
+        let tmp_path = path.with_extension("json.tmp");
+        std::fs::create_dir_all(CACHE_BASE_DIR).expect("mkdir");
+        // Simulate a crash mid-write: a half-written .tmp exists, no .json.
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&tmp_path, b"{ \"trading_date_ist\": \"2099-09-10\", \"targ")
+            .expect("write partial tmp");
+
+        assert!(
+            load_plan_snapshot_for_today(date).is_none(),
+            "loader must ignore the partial .tmp and fall through to cold build"
+        );
+
+        let _ = std::fs::remove_file(&tmp_path);
+    }
 }

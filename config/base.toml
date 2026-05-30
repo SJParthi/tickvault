@@ -168,9 +168,9 @@ retention_days = 90
 # the runtime; the dual-instance lock moved to AWS SSM Parameter Store
 # in PR #764.
 
-[prometheus]
-host = "tv-prometheus"
-port = 9090
+# [prometheus] section DELETED in #O5 (2026-05-30). Prometheus container
+# removed in #O3; the /metrics exporter (observability.rs, port 9091) is
+# independent and stays for CloudWatch scraping.
 
 [websocket]
 ping_interval_secs = 10

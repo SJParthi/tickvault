@@ -14,7 +14,7 @@
   common     → Shared types, config, enums, constants. No business logic.
   core       → Runtime engine: auth, instruments, WebSocket, parser, pipeline.
   trading    → OMS, risk engine, strategies, indicators.
-  storage    → QuestDB + Valkey persistence.
+  storage    → QuestDB persistence.
   api        → Axum HTTP server with REST endpoints.
 
 Dependency rule: app → {api, trading, core, storage} → common
@@ -47,7 +47,7 @@ Step 2: Prometheus Metrics
   ▼
 Step 3: Structured Logging
   │  tracing-subscriber with 3 layers:
-  │    Console (text or JSON) + File (JSON for Alloy→Loki) + OpenTelemetry
+  │    Console (text or JSON) + File (JSON, shipped to CloudWatch Logs) + OpenTelemetry
   ▼
 Step 4 (parallel):
   │  ┌─ Notification Init (Telegram bot from SSM)
@@ -104,7 +104,8 @@ Step 12: Order Update WebSocket
   ▼
 Step 13: API Server
   │  Axum on 0.0.0.0:8080
-  │  Endpoints: /health, /api/stats, /api/quote, /api/top-movers, /portal
+  │  Endpoints: /health, /api/stats, /api/quote (the /portal HTML
+  │  frontend was retired in the AWS-lifecycle PRs, 2026-05-19)
   ▼
 Step 14: Token Renewal Task
   │  Background loop: check expiry every hour
@@ -248,7 +249,11 @@ f32→f64 precision: Custom converter prevents IEEE 754 widening artifacts
   21004.95_f32 → "21004.95" (string round-trip) → 21004.95_f64
 ```
 
-### Valkey (Redis-Compatible Cache)
+### Valkey (Redis-Compatible Cache) — REMOVED (#O4, 2026-05-24)
+
+> Historical section. Valkey was removed from the runtime in #O4; the
+> token cache is now file-based and the dual-instance lock uses AWS SSM.
+> The description below is retained as history only.
 
 ```
 deadpool-redis async pool
@@ -463,11 +468,12 @@ http_host = "localhost"            # Override Docker DNS for cargo run
 ## Observability Stack
 
 ```
-Prometheus (:9090)  → scrapes metrics → Grafana dashboards
-Alloy               → watches data/logs/app.log → pushes to Loki
-Loki                → log aggregation → Grafana log explorer
-Jaeger V2           → receives OpenTelemetry traces → trace visualization
-Traefik             → reverse proxy for all web UIs
+App metrics exporter → Prometheus wire format → AWS CloudWatch metrics + dashboards
+CloudWatch agent     → watches data/logs/app.log → CloudWatch Logs
+QuestDB web console  → ad-hoc operator queries
 
-All running in Docker alongside the application.
+CloudWatch (metrics + logs + alarms + dashboards) is the entire
+observability layer in prod. The Prometheus, Grafana, Alertmanager
+(and Valkey) containers were removed in the CloudWatch-only migration
+(#O1–#O4, 2026-05-19); Jaeger and Traefik were retired earlier.
 ```

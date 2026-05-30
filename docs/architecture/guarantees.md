@@ -116,11 +116,9 @@ But we CAN mechanically guarantee:
 | Every ERROR in JSONL within ~1s | `crates/app/src/observability.rs` | `init_errors_jsonl_appender` (tracing-appender 0.2.3) |
 | 48h retention auto-swept | same | `sweep_errors_jsonl_retention` tokio task |
 | Summary markdown regenerates every 60s | `crates/core/src/notification/summary_writer.rs` | tokio interval |
-| 5 Grafana dashboards auto-provisioned | `deploy/docker/grafana/provisioning/` | Grafana reads on boot |
-| Operator dashboard pins 14 panels | `crates/storage/tests/operator_health_dashboard_guard.rs` | 7 structural tests |
-| Prometheus recording rules speed up dashboards | `deploy/docker/prometheus/rules/tickvault-alerts.yml` | 10 `tv:*` pre-aggregations |
-| Every recording rule pinned | `crates/common/tests/recording_rules_guard.rs` | 7 tests |
-| Loki LogQL alerts (opt-in) | `deploy/docker/loki/rules.yml` | 4 alert rules + guard |
+| Operator dashboards (CloudWatch) | AWS CloudWatch Dashboards | provisioned via `deploy/aws/terraform/` _(the 5 local Grafana dashboards + `operator_health_dashboard_guard` were retired in the CloudWatch-only migration #O1, 2026-05-19)_ |
+| Operator alarms (CloudWatch) | AWS CloudWatch Alarms over the app metrics | _(the Prometheus recording/alert rules `tickvault-alerts.yml` + `recording_rules_guard` were retired #O2/#O3)_ |
+| ERROR logs → CloudWatch Logs | CloudWatch Logs metric filters / alarms | _(the opt-in Loki LogQL alerts + Loki/Alloy containers were retired in the CloudWatch-only migration)_ |
 | `make doctor` = 7-section health in one command | `scripts/doctor.sh` | run any time |
 | 12 MCP tools for Claude workspace access | `scripts/mcp-servers/tickvault-logs/server.py` | `tickvault_logs_mcp_guard` |
 
@@ -136,9 +134,9 @@ no shell, no curl, no grep:
 | "Current error summary?" | `summary_snapshot` |
 | "Triage audit trail?" | `triage_log_tail` |
 | "Full history of signature X?" | `signature_history` |
-| "What's the current metric X?" | `prometheus_query` |
+| "What's the current metric X?" | CloudWatch metrics / app `/metrics` exporter (the `prometheus_query` MCP tool was retired in #O5, 2026-05-30) |
 | "Which runbook for code Y?" | `find_runbook_for_code` |
-| "What's firing right now?" | `list_active_alerts` |
+| "What's firing right now?" | CloudWatch alarms / `run_doctor` (the `list_active_alerts` MCP tool was retired in #O5, 2026-05-30) |
 | "Run SQL query Z" | `questdb_sql` |
 | "Find pattern P in the codebase" | `grep_codebase` |
 | "Is the system healthy?" | `run_doctor` |

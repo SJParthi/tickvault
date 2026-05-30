@@ -46,7 +46,7 @@ Stage 4 — Commit winning params
 ### Pre-conditions
 
   * Dev Mac has `tickvault` cloned + Docker daemon running
-  * `make docker-up` brings up local QuestDB + Valkey + Grafana
+  * `make docker-up` brings up local QuestDB (Valkey/Grafana removed in #O4, 2026-05-24)
   * Research Dhan token in `~/.aws/credentials` SSM path
     `/tickvault/dev-research/dhan/access-token`
   * Free disk ≥ 100 GB on Mac (90 days × 222 SIDs × 5 timeframes ≈

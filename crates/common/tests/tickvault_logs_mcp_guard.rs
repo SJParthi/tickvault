@@ -29,10 +29,11 @@ const REQUIRED_TOOL_NAMES: &[&str] = &[
     "summary_snapshot",
     "triage_log_tail",
     "signature_history",
-    // Phase 7.2 expansion — live-query tools for Claude co-work
-    "prometheus_query",
+    // Phase 7.2 expansion — live-query tools for Claude co-work.
+    // `prometheus_query` + `list_active_alerts` were RETIRED in #O5
+    // (2026-05-30) — they pointed at the now-removed Prometheus (#O3) +
+    // Alertmanager (#O2) containers. Use questdb_sql / CloudWatch instead.
     "find_runbook_for_code",
-    "list_active_alerts",
     // Phase 7.2 workspace-wide expansion — SQL / grep / doctor / git
     "questdb_sql",
     "grep_codebase",
@@ -139,7 +140,9 @@ fn tickvault_logs_mcp_server_is_stdlib_only() {
         "from datetime",
         "from pathlib",
         "from typing",
-        // Added for Phase 7.2 expansion (prometheus_query, list_active_alerts)
+        // urllib retained for tool_tickvault_api (the prometheus_query +
+        // list_active_alerts tools that originally needed it were retired
+        // in #O5, 2026-05-30).
         "import urllib.parse",
         "import urllib.request",
         // Phase 7.2 workspace-wide (grep_codebase, run_doctor, git_recent_log)

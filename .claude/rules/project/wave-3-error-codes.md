@@ -33,8 +33,9 @@ breach the zero-tick-loss or order-management envelopes. The
 `rate(tv_telegram_dropped_total[1m]) > 0.1` for ≥ 60s.
 
 **Triage:**
-1. `mcp__tickvault-logs__prometheus_query "tv_telegram_dropped_total"` —
-   inspect the `reason` label distribution.
+1. Inspect `tv_telegram_dropped_total` in the CloudWatch metrics console
+   (scraped from the app's `/metrics` exporter) — inspect the `reason`
+   label distribution.
 2. If `reason="send_failed"` dominates: check Telegram bot API health
    (`curl -fsS https://api.telegram.org`), verify the bot token is still
    valid in AWS SSM, check egress firewall.

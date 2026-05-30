@@ -187,12 +187,14 @@ curl https://api.dhan.co/v2/ip/getIP \
 
 ## Phase 6 — Smoke Test (~5 minutes)
 
-1. **Check Grafana is reachable**
-   - SSH port-forward: `ssh -L 3000:localhost:3000 -i ~/.ssh/tv-prod-key.pem ec2-user@$EIP`
-   - Browse to http://localhost:3000 (admin/admin first login)
-   - Verify the 4 dashboards load and show data
-2. **Verify Prometheus scrapes tv-app**
-   - Grafana → Explore → Prometheus datasource → `tv_questdb_connected`
+1. **Check the CloudWatch operator-health dashboard is reachable**
+   - CloudWatch console → Dashboards → `operator-health`
+   - Verify the widgets load and show data
+   - (Grafana was retired in the CloudWatch-only migration #O1, 2026-05-19;
+     CloudWatch Dashboards replace it in prod.)
+2. **Verify metrics are flowing into CloudWatch**
+   - CloudWatch console → Metrics → the tickvault namespace →
+     `tv_questdb_connected`
    - Should return 1.0
 3. **Verify Telegram alerts**
    - Trigger a test alert: stop QuestDB temporarily

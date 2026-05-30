@@ -1,5 +1,19 @@
 # Claude MCP Access Runbook — Universal, Branch-Independent
 
+> **CloudWatch-only migration note (#O1–#O5, 2026-05-19/05-30):** the
+> Grafana, Alertmanager, and Prometheus containers (and Valkey) were
+> removed. Observability in prod is AWS CloudWatch (metrics + logs +
+> alarms + dashboards); ad-hoc queries use the QuestDB web console. The
+> app still exposes Prometheus-wire-format metrics on its `/metrics`
+> endpoint (scraped by the CloudWatch agent), but the `prometheus_query`
+> and `list_active_alerts` MCP tools were RETIRED in #O5 (2026-05-30) —
+> they pointed at the now-removed Prometheus (:9090) and Alertmanager
+> (:9093) containers. Use `questdb_sql` / CloudWatch metrics for live
+> counter values and CloudWatch alarms / `run_doctor` for firing
+> alerts. The retired Grafana/Alertmanager funnel rows, the
+> `grafana_url`/`alertmanager_url`/`prometheus_url` inputs, and the
+> `grafana_query` tool below have been removed accordingly.
+
 > **Purpose:** every Claude Code session, every claude.ai web sandbox,
 > every claude cowork session — on any branch, any machine — can read
 > tickvault's full runtime state (metrics, logs, alerts, DB) WITHOUT
@@ -45,10 +59,7 @@ After install-mac.sh / install-aws.sh runs:
            ↓
 ┌──────────────────────────────────────────────────────────────┐
 │ Tailscale Funnel (stable public URL on .ts.net)              │
-│ mac-hostname.your-tailnet.ts.net:9090  → Prometheus         │
-│ mac-hostname.your-tailnet.ts.net:9093  → Alertmanager       │
 │ mac-hostname.your-tailnet.ts.net:9000  → QuestDB HTTP       │
-│ mac-hostname.your-tailnet.ts.net:3000  → Grafana            │
 │ mac-hostname.your-tailnet.ts.net:3001  → tickvault API      │
 │                                         ├── /api/debug/logs/summary         │
 │                                         └── /api/debug/logs/jsonl/latest    │
@@ -66,7 +77,7 @@ Key properties:
 - **Logs over HTTP, not filesystem**: `/api/debug/logs/*` eliminates rsync.
 - **Auto-heal**: launchd/systemd restart the funnel on crash or reboot.
 
-## Seven inputs the MCP server reads
+## Five inputs the MCP server reads
 
 Read from `config/claude-mcp-endpoints.toml` under the active profile.
 Env vars (when set) override the file. The file overrides hardcoded
@@ -74,10 +85,8 @@ localhost defaults.
 
 | Input | Env override | Profile key |
 |---|---|---|
-| Prometheus URL | `TICKVAULT_PROMETHEUS_URL` | `prometheus_url` |
-| Alertmanager URL | `TICKVAULT_ALERTMANAGER_URL` | `alertmanager_url` |
+| Prometheus URL (app exporter / CloudWatch source) | `TICKVAULT_PROMETHEUS_URL` | `prometheus_url` |
 | QuestDB HTTP URL | `TICKVAULT_QUESTDB_URL` | `questdb_url` |
-| Grafana URL | `TICKVAULT_GRAFANA_URL` | `grafana_url` |
 | tickvault API URL | `TICKVAULT_API_URL` | `tickvault_api_url` |
 | Logs source | `TICKVAULT_LOGS_SOURCE` (`http` or `local`) | `logs_source` |
 | Logs directory (when `local`) | `TICKVAULT_LOGS_DIR` | `logs_dir_local` |
@@ -87,7 +96,7 @@ Profile selection order:
 2. `active = "<name>"` at the top of `claude-mcp-endpoints.toml`
 3. Fallback to `"local"` (everything on `127.0.0.1`)
 
-## Full MCP tool surface (16 tools)
+## Full MCP tool surface (15 tools)
 
 Every surface of the tickvault stack is reachable through one MCP server
 — no screenshots, no copy-paste, no manual tailing.
@@ -100,14 +109,11 @@ Every surface of the tickvault stack is reachable through one MCP server
 | `signature_history` | all events matching a signature hash |
 | `triage_log_tail` | `data/logs/auto-fix.log` |
 | `find_runbook_for_code` | `.claude/rules/**` runbook lookup |
-| `prometheus_query` | any PromQL |
 | `questdb_sql` | any SQL against all 20 QuestDB tables |
-| `list_active_alerts` | firing Alertmanager alerts |
 | `run_doctor` | `make doctor` parsed output |
 | `grep_codebase` | ripgrep over workspace |
 | `git_recent_log` | last N commits |
 | `tickvault_api` | any tickvault REST API endpoint |
-| `grafana_query` | any Grafana HTTP API endpoint |
 | `docker_status` | `docker compose ps --format json` |
 | `app_log_tail` | full INFO/DEBUG app log |
 
@@ -174,10 +180,7 @@ bash scripts/tv-tunnel/doctor.sh --emit-config
 This prints a TOML block like:
 ```toml
 [profiles.mac-dev]
-prometheus_url    = "https://your-mac.tailnet-name.ts.net:9090"
-alertmanager_url  = "https://your-mac.tailnet-name.ts.net:9093"
 questdb_url       = "https://your-mac.tailnet-name.ts.net:9000"
-grafana_url       = "https://your-mac.tailnet-name.ts.net:3000"
 tickvault_api_url = "https://your-mac.tailnet-name.ts.net:3001"
 logs_source       = "http"
 logs_dir_local    = "./data/logs"

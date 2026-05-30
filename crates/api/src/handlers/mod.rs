@@ -10,7 +10,8 @@
 //!   `/api/option-chain`, `/api/pcr`, `/api/market/indices` routes. The
 //!   replacement surface is Grafana dashboards (live tick feed, candles,
 //!   PCR), Telegram alerts (op events), MCP tools (`questdb_sql`,
-//!   `prometheus_query`, `run_doctor`), and the QuestDB Console at
+//!   `run_doctor`; the `prometheus_query` tool was retired in #O5
+//!   2026-05-30), and the QuestDB Console at
 //!   `localhost:9000` for ad-hoc queries.
 
 pub mod debug;

@@ -20,7 +20,7 @@ set -uo pipefail
 
 # --gate: treat SKIP/WARN on runtime endpoints as FAIL. Intended for live
 # sessions where the app is supposed to be running — the audit should not
-# silently pass when Prometheus/QuestDB/Grafana are unreachable.
+# silently pass when QuestDB or the tickvault API are unreachable.
 GATE_MODE=0
 for arg in "$@"; do
     case "$arg" in
@@ -91,13 +91,11 @@ print_section "endpoints"
 
 run_check "endpoint" "QuestDB HTTP" \
     curl -fsS -m 3 http://127.0.0.1:9000/status
-run_check "endpoint" "Prometheus" \
-    curl -fsS -m 3 http://127.0.0.1:9090/-/healthy
-run_check "endpoint" "Grafana" \
-    curl -fsS -m 3 http://127.0.0.1:3000/api/health
 # Valkey PING check removed in #O4 (2026-05-24).
-run_check "endpoint" "Alertmanager" \
-    curl -fsS -m 3 http://127.0.0.1:9093/-/healthy
+# Grafana (#O1), Alertmanager (#O2) and Prometheus (#O3) container probes
+# removed in #O5 (2026-05-30) — those containers no longer exist
+# (CloudWatch-only observability). The app's /metrics exporter (port 9091)
+# is scraped by the CloudWatch agent in prod, not probed here.
 
 # ---------------------------------------------------------------------------
 # 4. Zero-touch artefacts present + non-stale

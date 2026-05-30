@@ -17,7 +17,7 @@
 - Duplicate tick data → Must deduplicate, not double-count
 - Out-of-order timestamps → Must detect + handle
 - QuestDB write fails → Must buffer + retry, not lose data
-- Valkey connection drops → Must reconnect via deadpool, serve stale if needed
+- (Valkey removed from runtime in #O4, 2026-05-24 — no longer a failure surface; token cache is file-based, dual-instance lock uses AWS SSM)
 
 ## State Failures
 - Application crash mid-processing → Must recover state from memmap2

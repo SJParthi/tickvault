@@ -85,10 +85,6 @@ http_port = 9000
 pg_port = 8812
 ilp_port = 9009
 
-[prometheus]
-host = "tv-prometheus"
-port = 9090
-
 [websocket]
 ping_interval_secs = 10
 pong_timeout_secs = 10

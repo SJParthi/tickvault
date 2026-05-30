@@ -5,7 +5,7 @@
 //!   2. Parseable as TOML
 //!   3. Has an `active` top-level string pointing at a valid profile
 //!   4. Has the three canonical profiles (local, mac-dev, aws-prod)
-//!   5. Every profile has all 7 required keys
+//!   5. Every profile has all required keys (2 URL + 2 non-URL)
 //!   6. Every URL-typed key is a valid-looking HTTP(S) URL
 //!
 //! Milestone 1 of `.claude/plans/autonomous-operations-100pct.md`.
@@ -16,12 +16,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 const REQUIRED_PROFILES: &[&str] = &["local", "mac-dev", "aws-prod"];
-const REQUIRED_URL_KEYS: &[&str] = &[
-    "prometheus_url",
-    "alertmanager_url",
-    "questdb_url",
-    "tickvault_api_url",
-];
+const REQUIRED_URL_KEYS: &[&str] = &["questdb_url", "tickvault_api_url"];
 const REQUIRED_NON_URL_KEYS: &[&str] = &["logs_source", "logs_dir_local"];
 
 #[derive(Debug, Deserialize)]
@@ -32,8 +27,6 @@ struct EndpointsConfig {
 
 #[derive(Debug, Deserialize)]
 struct Profile {
-    prometheus_url: String,
-    alertmanager_url: String,
     questdb_url: String,
     tickvault_api_url: String,
     logs_source: String,
@@ -125,8 +118,6 @@ fn all_url_keys_look_like_http_or_https() {
     let (_, cfg) = load_config();
     for (name, profile) in &cfg.profiles {
         for (key, value) in [
-            ("prometheus_url", &profile.prometheus_url),
-            ("alertmanager_url", &profile.alertmanager_url),
             ("questdb_url", &profile.questdb_url),
             ("tickvault_api_url", &profile.tickvault_api_url),
         ] {
@@ -166,12 +157,7 @@ fn local_profile_uses_localhost_not_tailscale() {
         .profiles
         .get("local")
         .expect("local profile presence already asserted");
-    for url in [
-        &local.prometheus_url,
-        &local.alertmanager_url,
-        &local.questdb_url,
-        &local.tickvault_api_url,
-    ] {
+    for url in [&local.questdb_url, &local.tickvault_api_url] {
         assert!(
             url.contains("127.0.0.1") || url.contains("localhost"),
             "[profiles.local] URLs must point at localhost, got: {url}"
@@ -232,7 +218,7 @@ fn tunnel_install_scripts_exist_and_are_executable() {
 #[test]
 fn mcp_server_reads_config_file_before_env_vars() {
     // Source-scan guard: the MCP server source MUST call _endpoint_url
-    // (the config-aware resolver), not bare os.environ.get for the 5
+    // (the config-aware resolver), not bare os.environ.get for the
     // endpoint URLs. Prevents regression where someone reverts to plain
     // env-var lookups and breaks the committed-config contract.
     let path = repo_root().join("scripts/mcp-servers/tickvault-logs/server.py");
@@ -240,24 +226,14 @@ fn mcp_server_reads_config_file_before_env_vars() {
         .unwrap_or_else(|_| panic!("MCP server source missing at {}", path.display()));
 
     // Every endpoint URL lookup must use _endpoint_url(...).
-    for kind in [
-        "prometheus_url",
-        "questdb_url",
-        "alertmanager_url",
-        "tickvault_api_url",
-    ] {
+    for kind in ["questdb_url", "tickvault_api_url"] {
         assert!(
             src.contains(&format!("\"{kind}\"")),
             "MCP server source must reference profile key '{kind}' via _endpoint_url"
         );
     }
     // No bare os.environ.get of the legacy env vars for URL resolution.
-    for env in [
-        "TICKVAULT_PROMETHEUS_URL",
-        "TICKVAULT_ALERTMANAGER_URL",
-        "TICKVAULT_QUESTDB_URL",
-        "TICKVAULT_API_URL",
-    ] {
+    for env in ["TICKVAULT_QUESTDB_URL", "TICKVAULT_API_URL"] {
         // The env var CAN appear (it's passed to _endpoint_url), but
         // NOT in the `base_url or os.environ.get(...)` pattern that the
         // config loader replaced. Detect the banned pattern.

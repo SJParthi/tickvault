@@ -41,7 +41,7 @@ never hallucinates.
 3. **Error triage** → `make triage-dry-run` (inspect) → `make triage-execute` (act).
 4. **"What's happening right now?"** → the **tickvault-logs MCP** tools are auto-loaded
    from `.mcp.json`. Prefer `mcp__tickvault-logs__summary_snapshot`,
-   `tail_errors`, `list_novel_signatures`, `prometheus_query`, `questdb_sql`,
+   `tail_errors`, `list_novel_signatures`, `questdb_sql`,
    `run_doctor` over hand-rolled Bash.
 5. **"How do I fix error code X?"** → `mcp__tickvault-logs__find_runbook_for_code`
    returns the runbook path in `docs/runbooks/`. Never guess.
@@ -119,7 +119,6 @@ crates/
 | `instrument_persistence.rs` | Instrument master persistence |
 | `calendar_persistence.rs` | Trading calendar storage |
 | `materialized_views.rs` | QuestDB materialized view DDL |
-| `valkey_cache.rs` | Redis/Valkey caching layer |
 | `deep_depth_persistence.rs` | 20/200-level depth ILP writer to `deep_market_depth` table |
 | `movers_persistence.rs` | Stock + option movers ILP writer |
 | `indicator_snapshot_persistence.rs` | Indicator snapshot ILP writer |
@@ -130,8 +129,9 @@ Post-AWS-lifecycle (PRs #2-#7d, 2026-05-19) the API surface narrowed
 to operator/observability endpoints. The entire `/portal/*` HTML
 frontend + `/api/option-chain` + `/api/pcr` + `/api/market/indices`
 + `/api/movers*` + `/api/instruments/*` + `/api/index-constituency*`
-routes were retired (replacement: Grafana / Telegram / MCP /
-QuestDB Console).
+routes were retired (replacement: CloudWatch Dashboards / Telegram /
+MCP / QuestDB Console). (Grafana was retired in the CloudWatch-only
+migration #O1, 2026-05-19.)
 
 | File | Contains |
 |------|----------|
@@ -260,10 +260,10 @@ make bench                           # cargo bench --workspace
 make audit                           # cargo audit + cargo deny
 
 # Dashboards
-make grafana                         # localhost:3000
-make questdb                         # localhost:9000
-make jaeger                          # localhost:16686
-make prometheus                      # localhost:9090
+make questdb                         # localhost:9000 (QuestDB web console)
+# Operator dashboards in prod = AWS CloudWatch Dashboards.
+# Grafana / Prometheus / Jaeger were retired in the CloudWatch-only
+# migration (#O1/#O3, 2026-05-19); their make targets no longer exist.
 ```
 
 ## TESTING STRATEGY
@@ -337,18 +337,20 @@ make prometheus                      # localhost:9090
 **Commit message:** `^(feat|fix|refactor|test|docs|chore|perf|security|ci|build|style|bench|revert)(\([a-z0-9_/-]+\))?: .+`
 **Other hooks:** pre-tool-dispatch, auto-save, session-sanity, plan-verify, block-env-files
 
-## DOCKER SERVICES (8 containers)
+## DOCKER SERVICES
+
+Post CloudWatch-only migration (#O1/#O2/#O3/#O4, 2026-05-19+) the runtime
+is **QuestDB + the tickvault app + AWS CloudWatch ONLY**. The metrics /
+dashboards / alerting containers were removed: Grafana (#O1), Alertmanager
+(#O2), Prometheus (#O3), and Valkey (#O4). Jaeger and Traefik were retired
+earlier. CloudWatch (metrics + logs + alarms + dashboards) is the entire
+observability layer in prod.
 
 | Service | Image Version | Port | Purpose |
 |---------|--------------|------|---------|
-| tv-questdb | 9.3.2 | 9000/8812/9009 | Time-series DB |
-| tv-valkey | 9.0.2-alpine | 6379 | Cache (Redis replacement) |
-| tv-prometheus | v3.9.1 | 9090 | Metrics |
-| tv-grafana | 12.3.3 | 3000 | Dashboards |
-| tv-jaeger | 2.15.0 | 16686 | Distributed tracing |
-| tv-loki | 3.6.6 | 3100 | Log aggregation |
-| tv-alloy | v1.8.0 | — | Observability collector |
-| tv-traefik | v3.6.8 | 80/443/8080 | API gateway |
+| tv-questdb | 9.3.5 | 9000/8812/9009 | Time-series DB |
+| tv-loki | 3.7.1 | 3100 | Log aggregation (Alloy ships logs to CloudWatch in prod) |
+| tv-alloy | v1.16.0 | — | Observability collector |
 
 All images pinned with SHA256 digest. Config in `deploy/docker/docker-compose.yml`.
 
@@ -425,7 +427,7 @@ Tests in `crates/*/tests/gap_enforcement.rs` verify:
 
 ## CONFIGURATION
 
-`config/base.toml` — 17 sections: `trading` (incl. nse_holidays), `dhan`, `questdb`, `valkey`, `prometheus`, `websocket`, `network`, `token`, `risk`, `strategy` (**`dry_run = true` by default**), `logging`, `instrument`, `api` (port 3001), `subscription`, `notification`, `observability`, `historical`
+`config/base.toml` sections: `trading` (incl. nse_holidays), `dhan`, `questdb`, `prometheus`, `websocket`, `network`, `token`, `risk`, `strategy` (**`dry_run = true` by default**), `logging`, `instrument`, `api` (port 3001), `subscription`, `notification`, `observability`, `historical` (the `valkey` section was removed in #O4, 2026-05-24)
 
 `[subscription]` post-AWS-lifecycle (PR #7b): `scope = "indices_4_only"` is the only legal value. The 3 dead `subscribe_*_derivatives` / `subscribe_display_indices` flags have been deleted from `SubscriptionConfig`. `SubscriptionScope` is a single-variant enum — any future scope expansion requires a rule-file edit + new enum variant per `.claude/rules/project/websocket-connection-scope-lock.md`.
 

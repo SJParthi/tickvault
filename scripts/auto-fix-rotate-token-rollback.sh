@@ -3,11 +3,14 @@
 #
 # A token rotation is hard to roll back: once Dhan issues a new token,
 # the old one is invalidated. The "rollback" here is therefore to
-# RESTORE the previous token from the Valkey backup key that rotate-token.sh
-# writes before overwriting (a short-circuit recovery path).
+# RESTORE the previous token from the file-based token cache that
+# rotate-token.sh writes before overwriting (a short-circuit recovery
+# path). Valkey was removed from the runtime in #O4 (2026-05-24); the
+# token cache is now the on-disk file at the path pinned by
+# `crates/common/src/constants.rs::TOKEN_CACHE_FILE_PATH`.
 #
 # Correlation: must be called with the same correlation_id that the
-# original rotate emitted. Looks up the backup key by that id.
+# original rotate emitted. Looks up the backup copy by that id.
 #
 # Usage:
 #   scripts/auto-fix-rotate-token-rollback.sh <correlation_id> [--dry-run]

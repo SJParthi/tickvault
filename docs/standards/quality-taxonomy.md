@@ -134,18 +134,26 @@
 
 ## Category 6: Monitoring & Observability
 
+> **CloudWatch-only migration (#O1–#O4, 2026-05-19/05-24):** the Grafana,
+> Prometheus, Alertmanager, Loki/Alloy and Jaeger containers were removed.
+> AWS CloudWatch (metrics + logs + alarms + dashboards) is the entire prod
+> observability layer; the QuestDB web console covers ad-hoc queries. The
+> app still EMITS Prometheus-wire-format metrics — those are ingested by
+> CloudWatch, not a Prometheus container. The container-specific rows below
+> are updated to reflect this.
+
 | # | Dimension | Description | Trading Relevance | Status | Enforcement | File/Tool |
 |---|-----------|-------------|-------------------|--------|-------------|-----------|
-| 6.1 | Application metrics (Prometheus) | Counters, gauges, histograms | Tick latency spike above 10μs triggers investigation | `CONFIGURED` | metrics 0.24.3 + prometheus exporter in deps, Docker running | `docker-compose.yml` prometheus service |
+| 6.1 | Application metrics (Prometheus wire format) | Counters, gauges, histograms | Tick latency spike above 10μs triggers investigation | `CONFIGURED` | metrics 0.24.3 + prometheus exporter in deps; ingested by CloudWatch | app metrics exporter → CloudWatch |
 | 6.2 | Structured logging | JSON tracing events with 5W fields | Post-incident analysis: which instrument, what price, when, why | `ENFORCED` | tracing 0.1.44 + tracing-subscriber 0.3.22, JSON formatter | `.claude/rules/rust-code.md` |
-| 6.3 | Log aggregation (Loki) | Centralized log storage + LogQL queries | Filter by security_id, time range, severity during investigation | `CONFIGURED` | Loki 3.6.6 + Alloy v1.8.0 in Docker | `deploy/docker/loki/` |
-| 6.4 | Distributed tracing (Jaeger) | OpenTelemetry spans across pipeline stages | Reveals where latency spent: parse vs channel vs QuestDB write | `CONFIGURED` | Jaeger v2 in Docker, opentelemetry 0.31.0 in deps | `docker-compose.yml` jaeger service |
-| 6.5 | Health checks | /health endpoint + Docker healthchecks | Traefik routing, automated recovery, monitoring | `ENFORCED` | Axum handler, all 8 Docker services have healthcheck | `crates/api/src/handlers/health.rs` |
-| 6.6 | Dashboards (Grafana) | Visual monitoring panels | Single pane of glass for trading system | `CONFIGURED` | Grafana 12.3.3 with provisioned datasources, no dashboards yet | `deploy/docker/grafana/` |
+| 6.3 | Log aggregation (CloudWatch Logs) | Centralized log storage + queries | Filter by security_id, time range, severity during investigation | `CONFIGURED` | logs shipped to CloudWatch Logs (Loki/Alloy retired #O1–#O3) | CloudWatch Logs |
+| 6.4 | Distributed tracing (OpenTelemetry) | OpenTelemetry spans across pipeline stages | Reveals where latency spent: parse vs channel vs QuestDB write | `CONFIGURED` | opentelemetry 0.31.0 in deps (Jaeger container retired; CloudWatch X-Ray optional) | OTel exporter |
+| 6.5 | Health checks | /health endpoint + Docker healthchecks | Automated recovery, monitoring | `ENFORCED` | Axum handler; QuestDB + app healthchecked | `crates/api/src/handlers/health.rs` |
+| 6.6 | Dashboards (CloudWatch) | Visual monitoring widgets | Single pane of glass for trading system | `CONFIGURED` | CloudWatch Dashboards (Grafana retired #O1) | `deploy/aws/terraform/` |
 | 6.7 | Alerting (Telegram) | ERROR-level → immediate notification | Sole operator needs instant notification during market hours | `ENFORCED` | teloxide 0.13.0 in deps, notify script exists | `scripts/notify-telegram.sh` |
 | 6.8 | SLO tracking | p99 < 10μs, uptime > 99.9%, success > 99.99% | Convert performance budgets to monitorable targets | `GAP` | Performance budgets defined, no formal SLO monitoring | See Gap #15 |
-| 6.9 | Error rate monitoring | Error % tracking over time | Rising error rate = degradation before failure | `GAP` | Not configured | Prometheus counter + Grafana alert |
-| 6.10 | Resource monitoring | CPU/mem/disk/network per container | Disk full at 95% or OOM must be caught before impact | `DOCUMENTED` | Prometheus node exporter planned, Docker stats available | `quality_gates.md` Gate 6 |
+| 6.9 | Error rate monitoring | Error % tracking over time | Rising error rate = degradation before failure | `GAP` | Not configured | metric counter + CloudWatch alarm |
+| 6.10 | Resource monitoring | CPU/mem/disk/network per host | Disk full at 95% or OOM must be caught before impact | `DOCUMENTED` | CloudWatch host metrics; Docker stats available | `quality_gates.md` Gate 6 |
 
 ---
 
@@ -450,11 +458,14 @@ sast:
 
 **Why:** Performance budgets in quality_gates.md are not tracked at runtime. Need measurable targets: tick p99 < 10μs, WS uptime > 99.9%, order success > 99.99%.
 
-**Tool:** Prometheus recording rules + Grafana SLO dashboard
+**Tool:** CloudWatch metric math + CloudWatch SLO dashboard + CloudWatch
+Alarm (post the CloudWatch-only migration #O1–#O3, the prior Prometheus
+recording rules + Grafana SLO dashboard plan no longer applies; the
+illustrative PromQL below is kept only to show the SLO arithmetic).
 
-**Implementation:**
+**Implementation (illustrative — translate to CloudWatch metric math):**
 ```yaml
-# Prometheus recording rule
+# Prometheus recording rule (historical example of the SLO arithmetic)
 groups:
   - name: slo
     rules:

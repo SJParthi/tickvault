@@ -180,7 +180,7 @@ health: ## Check app health endpoint
 	@echo "❤️  Health check:"
 	@curl -s http://localhost:$(APP_PORT)/health 2>/dev/null | python3 -m json.tool 2>/dev/null || echo "  ⚠️  App not running (http://localhost:$(APP_PORT)/health)"
 
-status: ## Full system status (Docker + App + QuestDB + Valkey)
+status: ## Full system status (Docker + App + QuestDB)
 	@echo ""
 	@echo "  ╔════════════════════════════════════════╗"
 	@echo "  ║   tickvault — System Status     ║"
@@ -201,11 +201,6 @@ status: ## Full system status (Docker + App + QuestDB + Valkey)
 	@curl -sf --max-time 2 http://localhost:9000/exec?query=SHOW+TABLES > /dev/null 2>&1 \
 		&& echo "     ✅ Console: http://localhost:9000" \
 		|| echo "     ⚠️  Not reachable on port 9000"
-	@echo ""
-	@echo "  💾 Valkey:"
-	@docker exec tv-valkey valkey-cli ping 2>/dev/null | grep -q PONG \
-		&& echo "     ✅ PONG — connected" \
-		|| echo "     ⚠️  Not reachable"
 	@echo ""
 	@echo "  📈 Monitoring URLs:"
 	@echo "     Grafana:    http://localhost:3000"
@@ -322,13 +317,12 @@ aws-bootstrap-check: ## Verify prerequisites for the first terraform apply
 	@echo ""
 	@echo "Next: run 'make aws-init' to initialize Terraform"
 
-aws-ami: ## Look up the latest Ubuntu 24.04 LTS AMI in ap-south-1 (export TF_VAR_ami_id)
-	@AMI=$$(aws ec2 describe-images \
+aws-ami: ## Look up the latest Amazon Linux 2023 arm64 AMI in ap-south-1 (export TF_VAR_ami_id)
+	@AMI=$$(aws ssm get-parameters \
 		--region ap-south-1 \
-		--owners 099720109477 \
-		--filters 'Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*' \
-		--query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text); \
-	echo "Latest Ubuntu 24.04 AMI in ap-south-1: $$AMI"; \
+		--names /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 \
+		--query 'Parameters[0].Value' --output text); \
+	echo "Latest AL2023 arm64 AMI in ap-south-1: $$AMI"; \
 	echo "export TF_VAR_ami_id=$$AMI"
 
 aws-operator-cidr: ## Print your current public IP CIDR for TF_VAR_operator_cidr

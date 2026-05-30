@@ -70,8 +70,9 @@ day.
 
 **Triage:**
 
-1. `mcp__tickvault-logs__prometheus_query "tv_cross_check_rest_errors_total"`
-   — if non-zero, Dhan REST is failing across many SIDs.
+1. Inspect `tv_cross_check_rest_errors_total` in CloudWatch metrics (from
+   the app `/metrics` exporter) — if non-zero, Dhan REST is failing across
+   many SIDs.
 2. Operator can manually flip strategy gate via admin endpoint
    IF they confirm Dhan REST health via direct curl test.
 3. 15:31 IST post-market cross-verify will run AGAIN with the full

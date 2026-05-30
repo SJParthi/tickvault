@@ -13,7 +13,7 @@
 #   6.  Check existing stack state (or tear down on --restart)
 #   7.  Pull Docker images (pinned SHA256)
 #   8.  Start the stack (docker compose up -d)
-#   9.  Health-wait QuestDB with exponential backoff; verify Valkey is up
+#   9.  Health-wait QuestDB with exponential backoff
 #   10. Print log-pipeline pointers
 #   11. Print full status report
 #
@@ -21,7 +21,7 @@
 # the runtime is QuestDB + the tickvault app + AWS CloudWatch. Grafana,
 # Prometheus, Alertmanager, Loki and Alloy are not part of the default
 # stack. CloudWatch is the entire observability layer (metrics, logs,
-# alarms). Valkey stays until plan item #O4 removes it from the code.
+# alarms). Valkey was removed from the runtime in #O4 (2026-05-24).
 #
 # Usage:
 #   ./scripts/setup-observability.sh              # full setup + open browser
@@ -286,7 +286,7 @@ else
             fi
         done
         info "Common fixes:"
-        info "  Port conflict: lsof -i :9000 :8812 :6379"
+        info "  Port conflict: lsof -i :9000 :8812"
         info "  Clean restart: docker compose -f deploy/docker/docker-compose.yml down -v && re-run"
         info "  Docker resources: Check Docker Desktop → Settings → Resources"
         exit 1

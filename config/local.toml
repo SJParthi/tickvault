@@ -11,8 +11,7 @@ host = "localhost"
 
 # [valkey] section removed in #O4 (2026-05-24).
 
-[prometheus]
-host = "localhost"
+# [prometheus] section DELETED in #O5 (2026-05-30).
 
 [instrument]
 csv_cache_directory = "data/instrument-cache"

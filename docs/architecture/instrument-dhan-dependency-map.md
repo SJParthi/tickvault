@@ -211,7 +211,7 @@ Total: 8 bytes                  — BINARY_HEADER_SIZE = 8
 **File:** `constants.rs:215` + `parser/header.rs`
 **Dhan change:** Header layout changes (e.g., adds a version byte).
 **Failure mode:** **LOUD** — all packets fail to parse → massive parse error
-rate → Grafana alert fires within seconds.
+rate → CloudWatch alarm fires within seconds.
 
 ### F3. Response Code Mapping
 
@@ -229,7 +229,7 @@ rate → Grafana alert fires within seconds.
 
 **Dhan change:** New response code added (e.g., code 9 for something new).
 **Failure mode:** **LOUD** — dispatcher logs `"unknown response_code: 9"` →
-packet dropped → parse error counter increments → Grafana alert.
+packet dropped → parse error counter increments → CloudWatch alarm.
 
 **Future-proof:** Unknown codes are logged and dropped. System continues
 processing known codes. Adding support = one match arm in dispatcher.
@@ -338,7 +338,7 @@ DECREASES, we'd over-subscribe → Dhan rejects → **LOUD**.
 | Dhan Change | Risk | Mitigation |
 |-------------|------|-----------|
 | New segment code (code 6) | Ticks labeled "UNKNOWN" | Monitor `segment="UNKNOWN"` in QuestDB |
-| New response code in WS | Packets dropped as unknown | Monitor parse error rate in Grafana |
+| New response code in WS | Packets dropped as unknown | Monitor parse error rate in CloudWatch |
 | New instrument type in CSV | Rows silently filtered | Monitor derivative_count trend |
 | Index alias changes | Index not linked to price feed | Check 9 WARN in logs |
 | Expiry date format changes | Contracts filtered as no-expiry | Monitor derivative_count drop |
@@ -374,7 +374,7 @@ DECREASES, we'd over-subscribe → Dhan rejects → **LOUD**.
 2. Validation checks pass
 3. Instruments subscribed
 4. Ticks flowing
-5. Grafana shows normal metrics
+5. CloudWatch shows normal metrics
 ```
 
 ### Why We Never Struggle
@@ -403,7 +403,7 @@ DECREASES, we'd over-subscribe → Dhan rejects → **LOUD**.
 | All 8 must-exist indices present | Validation Check 1 passes | Index ID change |
 | WebSocket connected | `tv_websocket_connections_active` | WS URL/auth change |
 
-> **CRITICAL (I-P1-08):** ALL Grafana queries on instrument snapshot tables
+> **CRITICAL (I-P1-08):** ALL dashboard / QuestDB-console queries on instrument snapshot tables
 > (`fno_underlyings`, `derivative_contracts`, `subscribed_indices`) MUST filter
 > by date. These tables accumulate rows across days by design. Unfiltered
 > `SELECT count()` will show N x daily_count where N = number of days of data.
@@ -422,4 +422,4 @@ DECREASES, we'd over-subscribe → Dhan rejects → **LOUD**.
 | Validation | I-P0-01 (duplicate ID), I-P0-02 (count consistency) |
 | Order safety | I-P0-03 (expiry Gate 4) |
 | Operational | I-P1-01 (daily refresh), I-P1-07 (Unavailable = CRITICAL) |
-| Observability/Grafana | I-P1-08 (cross-day snapshot accumulation — RESOLVED) |
+| Observability | I-P1-08 (cross-day snapshot accumulation — RESOLVED) |

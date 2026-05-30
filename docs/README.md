@@ -71,7 +71,7 @@ These 21 files are the **verified source of truth** for every Dhan API endpoint.
 | [Block 01 — Instrument Download](phases/block-01-master-instrument-download.md) | Complete |
 | [Block 02 — Authentication](phases/block-02-authentication.md) | Complete |
 | [Block 03 — WebSocket Manager](phases/block-03-websocket-connection-manager.md) | Complete |
-| [Block 04 — TradingView Terminal](phases/block-04-tradingview-terminal.md) | In Progress |
+| Block 04 — TradingView Terminal | Retired (the HTML frontend / TradingView portal was removed in the AWS-lifecycle PRs, 2026-05-19) |
 
 ---
 

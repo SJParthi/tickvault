@@ -86,9 +86,11 @@ the tick_processor task crashed. Check `errors.log` for a panic trace.
 ### 4. Ring buffer saturation history
 
 ```bash
-# Check the buffer size history via Prometheus.
+# Check the buffer size history via the metrics exporter / CloudWatch.
 # Buffer at > 100K = backpressure. Buffer at 600K+ = spilling.
-curl -sS 'http://localhost:9090/api/v1/query?query=tv_tick_buffer_size' | jq .
+# Query the tv_tick_buffer_size metric in the CloudWatch console (prod)
+# or curl the app's /metrics endpoint (dev). The prometheus_query MCP
+# tool was retired in #O5 (2026-05-30) — Prometheus container removed in #O3.
 ```
 
 ## Recovery
@@ -145,8 +147,11 @@ is full. Causes:
   files represent ticks not yet in QuestDB. Deleting = SEBI violation.
 - **Never lower `TICK_BUFFER_CAPACITY` below 100K.** The
   `zero_tick_loss_alert_guard` blocks this at the unit-test level.
-- **Never disable the three Prometheus tick-loss alerts.** Pinned by
-  `zero_tick_loss_alert_guard` — build fails if removed.
+- **Never disable the tick-loss early-warning alerts.** Since the
+  CloudWatch-only migration (#O3, 2026-05-20) these are AWS CloudWatch
+  Alarms over the same `tv_tick_buffer_size` / `tv_spill_*` metrics; the
+  `zero_tick_loss_alert_guard` now pins that those metrics are still
+  EMITTED — build fails if the emission is removed.
 
 ## Preventive measures
 
@@ -160,7 +165,10 @@ is full. Causes:
 
 - `crates/storage/src/tick_persistence.rs` — 3-tier buffer logic
 - `crates/common/src/constants.rs` — `TICK_BUFFER_CAPACITY`
-- `crates/storage/tests/zero_tick_loss_alert_guard.rs` — 7 pinned invariants
-- `deploy/docker/prometheus/rules/tickvault-alerts.yml` — 4 zero-tick-loss alerts
+- `crates/storage/tests/zero_tick_loss_alert_guard.rs` — pinned invariants
+  (post #O3 it pins metric emission; the Prometheus alert-rule assertions +
+  `tickvault-alerts.yml` were retired in the CloudWatch-only migration)
 - `scripts/auto-fix-clear-spill.sh` — drain helper
-- `deploy/docker/grafana/dashboards/operator-health.json` — panels 8/9/10 show each tier
+- CloudWatch operator-health dashboard — the buffer/spill/DLQ tiers (the
+  local Grafana `operator-health.json` panels 8/9/10 were retired in #O1,
+  2026-05-19)

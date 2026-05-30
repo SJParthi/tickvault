@@ -197,8 +197,9 @@ instead of waiting until the 09:16:30 IST market-open self-test.
 
 **Triage:**
 
-1. `mcp__tickvault-logs__prometheus_query "tv_websocket_connections_active"`
-   — if depth-200 count is 0, this is auth/handshake; follow Cause 1.
+1. Inspect `tv_websocket_connections_active` in CloudWatch metrics (from
+   the app `/metrics` exporter) — if depth-200 count is 0, this is
+   auth/handshake; follow Cause 1.
 2. `mcp__tickvault-logs__tail_errors` — search for `WebSocketDisconnected`
    with kind=depth-200 in the boot window. If present, it's a server-side
    reset; escalate to operator.

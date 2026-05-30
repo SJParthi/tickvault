@@ -77,7 +77,7 @@ START
     │ 4a.     │  Telegram bot init (from SSM)
     │ Notify  │
     ├─────────┤
-    │ 4b.     │  Docker health check (QuestDB, Valkey)
+    │ 4b.     │  Docker health check (QuestDB)
     │ Infra   │  Auto-start if down
     └────┬────┘
          ▼
@@ -567,6 +567,13 @@ Layer 6 │   LIVE MONITORING     │  Tick gap > 30s? → ALERT
 
 ## Diagram 11: Docker Service Stack
 
+> Post CloudWatch-only migration (#O1–#O4, 2026-05-19/05-24) the runtime is
+> QuestDB + the tickvault app + AWS CloudWatch ONLY. Grafana (#O1),
+> Alertmanager (#O2), Prometheus (#O3) and Valkey (#O4) containers were
+> removed; Jaeger, Loki, Alloy and Traefik were retired earlier. The app
+> still exposes Prometheus-wire-format metrics on a local port — those are
+> scraped/shipped into CloudWatch metrics, not a Prometheus container.
+
 ```
 ┌──────────────────────────────────────────────────────────┐
 │                    DOCKER COMPOSE                         │
@@ -575,27 +582,18 @@ Layer 6 │   LIVE MONITORING     │  Tick gap > 30s? → ALERT
 │  │  tickvault     │    │  QuestDB     │                    │
 │  │              │───▶│  :9000 HTTP  │                    │
 │  │  :8080 API   │    │  :8812 PG    │                    │
-│  │  :9090 Prom  │    │  :9009 ILP   │                    │
-│  └──────────────┘    └──────────────┘                    │
+│  │  metrics:    │    │  :9009 ILP   │                    │
+│  │  Prom wire   │    └──────────────┘                    │
+│  └──────┬───────┘                                        │
 │         │                                                │
-│         │            ┌──────────────┐                    │
-│         └───────────▶│   Valkey     │                    │
-│                      │  :6379       │                    │
-│                      └──────────────┘                    │
+│         ▼ (metrics + logs)                               │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  AWS CloudWatch                                    │   │
+│  │  metrics + logs + alarms + dashboards              │   │
+│  │  (the entire observability layer in prod)          │   │
+│  └──────────────────────────────────────────────────┘   │
 │                                                          │
-│  ┌──────────────┐    ┌──────────────┐    ┌────────────┐  │
-│  │  Prometheus  │───▶│   Grafana    │◀───│   Loki     │  │
-│  │  :9091       │    │  :3000       │    │  :3100     │  │
-│  └──────────────┘    └──────────────┘    └────────────┘  │
-│                           ▲                    ▲         │
-│                           │              ┌─────┘         │
-│  ┌──────────────┐    ┌────┴─────────┐    │               │
-│  │  Jaeger V2   │    │   Traefik    │  ┌─┴──────────┐   │
-│  │  :16686      │    │  :80/:443    │  │   Alloy    │   │
-│  │  :4317 OTLP  │    │  Rev. Proxy  │  │  Log ship  │   │
-│  └──────────────┘    └──────────────┘  └────────────┘   │
-│                                                          │
-│  Infrastructure: AWS t4g.medium, Mumbai (ap-south-1)    │
+│  Infrastructure: AWS m8g.large, Mumbai (ap-south-1)     │
 │                                                          │
 └──────────────────────────────────────────────────────────┘
 ```

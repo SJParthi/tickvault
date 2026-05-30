@@ -1056,7 +1056,7 @@ crates/
 ├── common/     → Shared types, constants, config, errors
 ├── core/       → WebSocket, binary parsing, tick pipeline, candle aggregation
 ├── trading/    → OMS, risk engine, order execution, strategy interface
-├── storage/    → QuestDB writer, Valkey cache, persistence logic
+├── storage/    → QuestDB writer, persistence logic
 ├── api/        → axum HTTP server, REST endpoints, WebSocket proxy
 └── app/        → Binary entry point, orchestration, boot sequence
 ```
@@ -1078,7 +1078,7 @@ app → api → trading → core → storage → common
 | `common` | Types, enums, constants, config, errors | serde, chrono, thiserror |
 | `core` | WebSocket client, binary parser, tick pipeline, candle builder | tokio, tokio-tungstenite, zerocopy, rtrb, crossbeam |
 | `trading` | OMS state machine, risk engine, order API client, strategy trait | statig, governor, failsafe, blackscholes |
-| `storage` | QuestDB ILP writer, Valkey cache, instrument persistence | questdb-rs, redis/deadpool-redis |
+| `storage` | QuestDB ILP writer, instrument persistence | questdb-rs |
 | `api` | HTTP server, REST endpoints, health/stats/instruments | axum, tower, tower-http |
 | `app` | main(), boot sequence, signal handling, orchestration | clap, signal-hook, sd-notify |
 
@@ -1093,7 +1093,6 @@ app → api → trading → core → storage → common
 | Service | Image | Ports | Purpose |
 |---------|-------|-------|---------|
 | `tv-questdb` | QuestDB (Bible version) | 9000, 8812, 9009 | Time-series DB (HTTP, PG wire, ILP) |
-| `tv-valkey` | Valkey (Bible version) | 6379 | Cache (session, state, rate limits) |
 | `tv-prometheus` | Prometheus (Bible version) | 9090 | Metrics collection |
 | `tv-grafana` | Grafana (Bible version) | 3000 | Dashboards + alerting |
 | `tv-loki` | Loki (Bible version) | 3100 | Log aggregation |
@@ -1340,7 +1339,7 @@ Response: Array of OHLCV candles with timestamps.
 - [ ] Place/modify/cancel order API client
 - [ ] Rate limiter (10 orders/sec)
 - [ ] Circuit breaker for API failures
-- [ ] Idempotency key generation + Valkey check
+- [ ] Idempotency key generation + idempotency check (was Valkey; in-memory since #O4 2026-05-24)
 - [ ] Position tracking and reconciliation
 
 ### Block 11: Order Update WebSocket — COMPLETE
@@ -1377,9 +1376,9 @@ Response: Array of OHLCV candles with timestamps.
 - [x] P&L calculation (realized from FIFO closes, unrealized tracking)
 - [x] Auto-halt on risk breach (manual halt/reset, daily reset)
 
-### Block 15: Valkey Cache — COMPLETE
+### Block 15: Valkey Cache — COMPLETE (removed #O4 2026-05-24)
 
-- [x] deadpool-redis async connection pool (ValkeyPool)
+- [x] deadpool-redis async connection pool (ValkeyPool) — removed in #O4
 - [x] Typed helpers: get, set, set_ex, del, exists, set_nx_ex
 - [x] Health check via PING
 - [x] Integrated into boot sequence (best-effort step 6.5)
@@ -1424,7 +1423,7 @@ The boot sequence determines implementation order:
 12. Block 12: HTTP API Server           ✅ COMPLETE
 13. Block 13: Observability             ✅ COMPLETE
 14. Block 14: Risk Engine               ✅ COMPLETE
-15. Block 15: Valkey Cache              ✅ COMPLETE
+15. Block 15: Valkey Cache              ✅ COMPLETE (removed #O4 2026-05-24)
 ```
 
 Each block is self-contained with its own tests, benchmarks, and documentation. No block ships without passing ALL quality gates (fmt, clippy, test, benchmark, coverage).

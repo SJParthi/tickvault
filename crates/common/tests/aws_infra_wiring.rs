@@ -100,18 +100,25 @@ fn test_terraform_instance_type_pinned() {
     let content =
         std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/variables.tf"))
             .expect("variables.tf must be readable"); // APPROVED: test
-    // Operator-lock 2026-05-18 (aws-budget.md): t4g.medium ONLY.
-    // Any reintroduction of c7i.xlarge / c8g.xlarge / other instance types
-    // fails this test.
+    // Operator-lock 2026-05-29 (daily-universe-scope-expansion-2026-05-27.md §7
+    // Quote 5): m8g.large ONLY (Graviton4, 8 GiB). SUPERSEDES the 2026-05-18
+    // t4g.medium + 2026-05-27 t4g.large locks. Any reintroduction of
+    // c7i.xlarge / c8g.xlarge / t4g.* as the PINNED type fails this test.
     assert!(
-        content.contains("\"t4g.medium\""),
-        "variables.tf must pin instance_type to t4g.medium (operator lock 2026-05-18, see aws-budget.md)"
+        content.contains("\"m8g.large\""),
+        "variables.tf must pin instance_type to m8g.large (operator lock 2026-05-29, see daily-universe-scope-expansion-2026-05-27.md §7)"
     );
     assert!(
-        content.contains("var.instance_type == \"t4g.medium\""),
+        content.contains("var.instance_type == \"m8g.large\""),
         "variables.tf must VALIDATE instance_type pinning"
     );
-    // Negative asserts — block the retired stack from ever returning.
+    // Negative asserts — block the retired stacks from ever returning as the
+    // validated default (t4g.medium/t4g.large may still appear in SUPERSEDES
+    // comments, so we only forbid them as the validation condition).
+    assert!(
+        !content.contains("var.instance_type == \"t4g.medium\""),
+        "t4g.medium retired as the pinned type (operator lock 2026-05-29)"
+    );
     assert!(
         !content.contains("c7i.xlarge"),
         "c7i.xlarge retired in operator-lock 2026-05-18"
@@ -126,26 +133,27 @@ fn test_terraform_instance_type_pinned() {
 fn test_terraform_eventbridge_schedules_match_budget() {
     let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
         .expect("main.tf must be readable"); // APPROVED: test
-    // Daily start: 08:00 IST = 02:30 UTC Mon-Sun (operator-lock 2026-05-18
-    // Option A — 7-day availability for BRUTEX work).
+    // Weekday start: 08:30 IST = 03:00 UTC Mon-Fri (operator-lock 2026-05-29,
+    // daily-universe-scope-expansion-2026-05-27.md §7 Quote 5 — trading
+    // weekdays only, 08:30-16:30 IST; SUPERSEDES the 2026-05-18 7-day cron).
     assert!(
-        content.contains("cron(30 2 * * ? *)"),
-        "main.tf missing daily start schedule (02:30 UTC every day)"
+        content.contains("cron(0 3 ? * MON-FRI *)"),
+        "main.tf missing weekday start schedule (03:00 UTC Mon-Fri = 08:30 IST)"
     );
-    // Daily stop: 17:00 IST = 11:30 UTC Mon-Sun.
+    // Weekday stop: 16:30 IST = 11:00 UTC Mon-Fri.
     assert!(
-        content.contains("cron(30 11 * * ? *)"),
-        "main.tf missing daily stop schedule (11:30 UTC every day)"
+        content.contains("cron(0 11 ? * MON-FRI *)"),
+        "main.tf missing weekday stop schedule (11:00 UTC Mon-Fri = 16:30 IST)"
     );
-    // Negative asserts — the 4-rule weekday/weekend split was consolidated
-    // to 2 daily rules per operator lock 2026-05-18.
+    // Negative asserts — the prior 7-day daily crons (02:30/11:30 UTC every
+    // day) were replaced by the weekday-only pair per operator lock 2026-05-29.
     assert!(
-        !content.contains("MON-FRI"),
-        "weekday-only schedule retired in operator-lock 2026-05-18"
+        !content.contains("cron(30 2 * * ? *)"),
+        "7-day daily start cron retired in operator-lock 2026-05-29 (weekday-only now)"
     );
     assert!(
-        !content.contains("SAT-SUN"),
-        "weekend-only schedule retired in operator-lock 2026-05-18"
+        !content.contains("cron(30 11 * * ? *)"),
+        "7-day daily stop cron retired in operator-lock 2026-05-29 (weekday-only now)"
     );
 }
 

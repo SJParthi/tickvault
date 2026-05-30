@@ -103,15 +103,24 @@ ratchets updated, one PR at a time per `pr-completion-protocol.md` §H.
   - Tests: `docker compose config` valid; `cargo test -p tickvault-app
     -p tickvault-storage -p tickvault-common` (scoped) green.
 
-- [ ] **#O4 — Valkey removal — UNBLOCKED (operator decision 2026-05-20)**
-  - Valkey is LOAD-BEARING: (a) token cache, (b) dual-instance lock.
-  - **Operator decision 2026-05-20 — "Just remove valkey also":** the
-    dual-instance lock is **RETIRED**, not replaced. No file lock, no
-    QuestDB row. Acceptable because sandbox mode already skips the lock
-    and `dry_run = true` is the default — the lock only mattered in
-    live multi-host trading. Re-evaluate before `dry_run = false` if
-    multi-host deployment is ever on the table (note it in the live-go
-    checklist).
+- [x] **#O4 — Valkey removal — merged (PR #764, 2026-05-24)**
+  - Valkey was LOAD-BEARING: (a) token cache, (b) dual-instance lock.
+  - **As shipped (supersedes the 2026-05-20 "retire entirely" note):**
+    Valkey itself is fully removed (container, `valkey_cache.rs`,
+    `fetch_valkey_password`, `chaos_valkey_kill.rs`, the `[valkey]`
+    config, the Valkey token-cache layer). The token cache is now a
+    local FILE (`/tmp/tv-token-cache`, crash-recovery only); auth reads
+    SSM directly. The dual-instance lock was **MIGRATED to SSM** (not
+    retired) — `crates/core/src/instance_lock.rs` is now SSM-backed and
+    still load-bearing in boot Step 6a-prime, gated on
+    `trading_mode.is_live()` so it is inert under the `dry_run = true`
+    default. Operator decision 2026-05-30: KEEP the SSM lock (real
+    two-process safety guard, zero Valkey dependency, zero cost in
+    dry-run). The `Resilience01DualInstanceDetected` ErrorCode + its
+    RESILIENCE-01 runbook stay.
+  - Carry into the `dry_run = false` go-live checklist: the SSM lock
+    now provides the dual-instance guard; confirm it is exercised
+    before flipping live.
   - Token cache: dropped — the auth chain is cache → SSM → TOTP; SSM
     is the source of truth, so removal is graceful degradation.
   - Work: delete `valkey_cache.rs`; delete `instance_lock.rs` + its
@@ -129,9 +138,52 @@ ratchets updated, one PR at a time per `pr-completion-protocol.md` §H.
   - Tests: `cargo build --workspace`; boot must still succeed with the
     token manager reading SSM directly.
 
-- [ ] **#O5 — guard / rule / script cleanup**
-  - Sweep `.claude/rules/` for stale Grafana / Prometheus / Valkey /
-    Alertmanager references; update or retire each rule file.
+- [ ] **#O5 — guard / rule / script cleanup** (Valkey slice DONE; PrometheusConfig+AM config slice DONE #891; query-tooling+script sweep DONE 2026-05-30; aws-budget memory recompute + triage/verify.sh matched-pair PENDING)
+  - **DONE (symmetric query-tooling removal, PR 2026-05-30):** operator-decided
+    symmetric full removal — deleted the dead `prometheus_query` (Prometheus
+    :9090, removed #O3) + `list_active_alerts` (Alertmanager :9093, removed #O2)
+    MCP tools + both `ToolSpec`s from `server.py`; dropped `prometheus_url` from
+    all 3 endpoint profiles + the `Profile` struct + `claude_mcp_endpoints_config_guard.rs`;
+    dropped `TICKVAULT_PROMETHEUS_URL` from `claude_session_bootstrap_guard.rs`;
+    removed the dead Prometheus session-start pull from `session-sanity.sh` + its
+    lockstep guard test; removed the 2 dead tools from
+    `tickvault_logs_mcp_guard.rs::REQUIRED_TOOL_NAMES`; swept the
+    Grafana/Prometheus/Alertmanager container probes from `doctor.sh`,
+    `verify-stack.sh`, `mcp-doctor.sh`, `claude-session-bootstrap.sh`,
+    `tv-tunnel/doctor.sh` (incl. `--emit-config`); name-swapped every
+    `prometheus_query`/`list_active_alerts` ref across the auto-loaded `.claude/rules/`
+    charter + 8 rule files + 2 slash commands + CLAUDE.md + 8 docs to
+    CloudWatch / `run_doctor` / `questdb_sql`. Kept the `/metrics` exporter
+    (port 9091, CloudWatch-scraped) untouched.
+  - **DONE (#O5 final closeout, PR 2026-05-30):** (a) `aws-budget.md` memory
+    recompute — VERIFIED already 3-component (rule 6: QuestDB + app + OS only;
+    Valkey/Prometheus/Grafana/Alertmanager listed as REMOVED); its t4g.medium
+    scope is correct for that SUPERSEDED historical doc (authoritative m8g.large
+    table lives in daily-universe §7 Mechanical Rule 2) — no edit needed. (b)
+    `scripts/triage/verify.sh` retargeted off the retired Prometheus PromQL path
+    to an interim `/metrics`-scrape evaluator (`TICKVAULT_METRICS_URL`, default
+    `127.0.0.1:9091/metrics`); supports `sum(METRIC)[== N]` / `METRIC[== N]` via
+    awk (sum across label series, float-safe compare); unsupported PromQL → exit 2.
+    `autonomous_ops_m3_m4_guard.rs` updated in lockstep (usage signature +
+    `TICKVAULT_METRICS_URL`). Full CloudWatch GetMetricData version deferred to
+    the AWS phase (needs provisioned CloudWatch). **The CloudWatch-only migration
+    (#O1–#O6) is now COMPLETE — no dead Prometheus/Alertmanager/Grafana/Valkey
+    reference remains in any active code, config, script, or hook path.**
+  - **DONE (PR after #889):** removed all residual *Valkey* refs —
+    `Makefile` status target, `.github/workflows/chaos-nightly.yml`
+    `TV_VALKEY_URL`, `scripts/{verify-stack,smoke-test,ensure-ready,setup-observability}.sh`
+    Valkey TCP-waits + `:6379` port hints, `deny.toml` dead `redis`
+    skip, `crates/app/src/infra.rs` test port array, and the
+    `auto-fix-rotate-token-rollback.sh` header comment. Reworded the
+    kept SSM-lock doc-comments (`error_code.rs`, `events.rs`) from
+    Valkey→SSM.
+  - **PENDING (next PR):** the now-inert `PrometheusConfig` struct +
+    `[prometheus]` `config/base.toml` section (+ `config_round_trip.rs`);
+    `alertmanager_url` / `TICKVAULT_ALERTMANAGER_URL` in the
+    `tickvault-logs` MCP server + `claude_mcp_endpoints_config_guard.rs`
+    / `claude_session_bootstrap_guard.rs`; recompute `aws-budget.md`
+    memory tables for the 3-component runtime; sweep `.claude/rules/`
+    for stale Grafana/Prometheus/Alertmanager references.
   - Sweep the operational shell scripts in one consistent pass —
     `scripts/doctor.sh`, `scripts/verify-stack.sh`,
     `scripts/ensure-ready.sh`, `scripts/setup-observability.sh`,
@@ -157,11 +209,18 @@ ratchets updated, one PR at a time per `pr-completion-protocol.md` §H.
     `crates/common/tests/claude_session_bootstrap_guard.rs`,
     others as found.
 
-- [ ] **#O6 — docs sweep**
-  - Update every doc that describes Grafana / Prometheus / Valkey /
-    the frontend as live (`CLAUDE.md`, `docs/PROJECT-SCOPE.md`,
-    `docs/phases/*`, `docs/flow-*`, runbooks, `docs/architecture/*`).
-  - Retire `docs/phases/block-04-tradingview-terminal.md`.
+- [ ] **#O6 — docs sweep** (Valkey slice DONE 2026-05-30; Grafana/Prometheus slice pending)
+  - **DONE (PR after #889):** corrected every stale "live Valkey"
+    description across `CLAUDE.md`, `README.md`, `docs/PROJECT-SCOPE.md`,
+    `docs/flow-{technical,diagrams}.md`, `docs/phases/{phase-1-live-trading,phase-0-readme}.md`,
+    `docs/standards/{data-integrity,quality-gates,failure-scenarios}.md`,
+    `docs/runbooks/{backtest-runner,macbook-dies-mid-session}.md`,
+    `docs/operator/aws-readiness-audit-2026-05-03.md`,
+    `crates/app/src/bin/tv_doctor.rs`, `http/health-checks.http`.
+    Accurate-history lines annotated `(removed #O4 2026-05-24)`.
+  - **PENDING (next PR):** sweep the same docs for Grafana / Prometheus /
+    the frontend described as live; retire
+    `docs/phases/block-04-tradingview-terminal.md`.
 
 ## Scenarios
 
@@ -172,11 +231,15 @@ ratchets updated, one PR at a time per `pr-completion-protocol.md` §H.
 | 3 | Operator wants a dashboard | CloudWatch console — no local Grafana |
 | 4 | An `error!` fires | routed to CloudWatch Logs (Telegram path re-pointed off Alertmanager) |
 
-## #O4 lock question — RESOLVED 2026-05-20
+## #O4 lock question — RESOLVED 2026-05-30 (supersedes the 2026-05-20 note)
 
-The dual-instance lock lived in Valkey. Operator decision 2026-05-20
-("Just remove valkey also"): **retire the dual-instance guard
-entirely** — option (c). No replacement infra. All 6 items #O1–#O6 are
-now unblocked; execute serially per §H. Carry one note into the
-`dry_run = false` go-live checklist: re-evaluate dual-instance
-protection if multi-host deployment is ever considered.
+The dual-instance lock originally lived in Valkey. The 2026-05-20 note
+proposed retiring it entirely with no replacement. What actually shipped
+in PR #764 was different and better: Valkey is gone, but the lock was
+**migrated to SSM** (`crates/core/src/instance_lock.rs`) rather than
+retired. Operator decision 2026-05-30: **KEEP the SSM lock** — it is a
+genuine two-process safety guard (prevents two instances racing the 24h
+JWT into DH-901), carries no Valkey dependency, and is inert under the
+`dry_run = true` default (gated on `trading_mode.is_live()`). The
+`Resilience01DualInstanceDetected` ErrorCode + RESILIENCE-01 runbook
+stay. #O4 is DONE; remaining serial items per §H are #O5 then #O6.

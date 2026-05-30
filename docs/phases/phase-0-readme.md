@@ -116,7 +116,7 @@ for the canonical reference):
 | # | Table | Item | Purpose |
 |---|---|---|---|
 | 1 | `static_ip_audit` | 18c | Boot-time Dhan `/v2/ip/getIP` outcome |
-| 2 | `live_instance_lock` | 19e | Dual-instance Valkey lock lifecycle |
+| 2 | `live_instance_lock` | 19e | Dual-instance SSM lock lifecycle (was Valkey before #O4) |
 | 3 | `auth_renewal_audit` | 17a | SEBI 24h JWT renewal lifecycle |
 | 4 | `open_price_audit` | 16a | 09:15 candle's open-price source decision |
 | 5 | `order_update_ws_audit` | 24a | Live order-update WS events with Source filter |
@@ -141,7 +141,7 @@ Plus the supporting non-audit but SEBI-relevant tables: `order_audit`
   * **Item 22e** — `check_tick_ohlc_integrity(ltp, high, low) -> u8`
     bitmask of 3 OHLC invariant violations + 3 static-label counters.
   * **Item 18 + 19** — Boot-gate refusals: static IP not whitelisted
-    OR another tickvault process holds the Valkey lock → boot HALTS
+    OR another tickvault process holds the SSM lock → boot HALTS
     with operator-readable Telegram + the failure persists to the
     relevant audit table.
 

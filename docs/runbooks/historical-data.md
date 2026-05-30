@@ -35,17 +35,19 @@ by tickvault code.
 ### 1. Is the fetcher actually running?
 
 ```bash
-mcp__tickvault-logs__prometheus_query("tv_historical_candles_fetched_total")
+# Read tv_historical_candles_fetched_total from CloudWatch metrics (prod)
+# or curl the app's /metrics endpoint (dev). The prometheus_query MCP tool
+# was retired in #O5 (2026-05-30) — Prometheus container removed in #O3.
 # Expected: increases during off-market hours. Flat = fetcher crashed.
 ```
 
 ### 2. Error rate proportion
 
 ```bash
-# Error ratio
-mcp__tickvault-logs__prometheus_query(
-  "rate(tv_historical_fetch_errors_total[1h]) / rate(tv_historical_candles_fetched_total[1h])"
-)
+# Error ratio — compute from CloudWatch metrics (prod) / the app /metrics
+# endpoint (dev): rate(tv_historical_fetch_errors_total) divided by
+# rate(tv_historical_candles_fetched_total). The prometheus_query MCP tool
+# was retired in #O5 (2026-05-30) — Prometheus container removed in #O3.
 # Baseline 0.001–0.01. Above 0.1 = abnormal.
 ```
 
