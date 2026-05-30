@@ -155,13 +155,20 @@ ratchets updated, one PR at a time per `pr-completion-protocol.md` §H.
     charter + 8 rule files + 2 slash commands + CLAUDE.md + 8 docs to
     CloudWatch / `run_doctor` / `questdb_sql`. Kept the `/metrics` exporter
     (port 9091, CloudWatch-scraped) untouched.
-  - **STILL PENDING:** (a) `aws-budget.md` 3-component memory-table recompute
-    (file is SUPERSEDED by the daily-universe lock; low value); (b) the
-    `scripts/triage/verify.sh` ↔ `autonomous_ops_m3_m4_guard.rs` matched pair —
-    a *separate* autonomous-ops M3/M4 subsystem that queries Prometheus to verify
-    auto-fix outcomes; retargeting it to CloudWatch is a re-design, not a
-    mechanical removal, so it is a clearly-scoped FOLLOW-UP (source-scan guard
-    still passes today → no build break).
+  - **DONE (#O5 final closeout, PR 2026-05-30):** (a) `aws-budget.md` memory
+    recompute — VERIFIED already 3-component (rule 6: QuestDB + app + OS only;
+    Valkey/Prometheus/Grafana/Alertmanager listed as REMOVED); its t4g.medium
+    scope is correct for that SUPERSEDED historical doc (authoritative m8g.large
+    table lives in daily-universe §7 Mechanical Rule 2) — no edit needed. (b)
+    `scripts/triage/verify.sh` retargeted off the retired Prometheus PromQL path
+    to an interim `/metrics`-scrape evaluator (`TICKVAULT_METRICS_URL`, default
+    `127.0.0.1:9091/metrics`); supports `sum(METRIC)[== N]` / `METRIC[== N]` via
+    awk (sum across label series, float-safe compare); unsupported PromQL → exit 2.
+    `autonomous_ops_m3_m4_guard.rs` updated in lockstep (usage signature +
+    `TICKVAULT_METRICS_URL`). Full CloudWatch GetMetricData version deferred to
+    the AWS phase (needs provisioned CloudWatch). **The CloudWatch-only migration
+    (#O1–#O6) is now COMPLETE — no dead Prometheus/Alertmanager/Grafana/Valkey
+    reference remains in any active code, config, script, or hook path.**
   - **DONE (PR after #889):** removed all residual *Valkey* refs —
     `Makefile` status target, `.github/workflows/chaos-nightly.yml`
     `TV_VALKEY_URL`, `scripts/{verify-stack,smoke-test,ensure-ready,setup-observability}.sh`

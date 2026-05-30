@@ -145,13 +145,15 @@ fn verify_harness_script_exists_and_is_executable() {
     let src = std::fs::read_to_string(&path).unwrap();
     // Contract: usage signature
     assert!(
-        src.contains("usage: $0 <correlation_id> <promql_predicate>"),
+        src.contains("usage: $0 <correlation_id> <metric_predicate>"),
         "verify.sh usage signature regressed"
     );
-    // Contract: default Prometheus URL
+    // Contract: reads the /metrics exporter endpoint (the Prometheus
+    // PromQL path was retired in #O5 2026-05-30 — Prometheus container
+    // removed in #O3; verify.sh now scrapes the app's /metrics exporter).
     assert!(
-        src.contains("TICKVAULT_PROMETHEUS_URL"),
-        "verify.sh must read TICKVAULT_PROMETHEUS_URL env var"
+        src.contains("TICKVAULT_METRICS_URL"),
+        "verify.sh must read TICKVAULT_METRICS_URL env var"
     );
     // Contract: 3 exit codes documented
     for code in &["exit 0", "exit 1", "exit 2"] {
