@@ -23,7 +23,7 @@
 
 data "archive_file" "tv_daily_budget_digest_zip" {
   type        = "zip"
-  output_path = "${path.module}/lambda-zips/tv_daily_budget_digest.zip"
+  output_path = "${path.module}/.tv-daily-budget-digest.zip"
   source {
     content  = <<-PYEOF
 import os, json, boto3
@@ -164,7 +164,7 @@ resource "aws_lambda_permission" "tv_daily_budget_digest_eventbridge" {
 
 data "archive_file" "tv_hard_stop_guard_zip" {
   type        = "zip"
-  output_path = "${path.module}/lambda-zips/tv_hard_stop_guard.zip"
+  output_path = "${path.module}/.tv-hard-stop-guard.zip"
   source {
     content  = <<-PYEOF
 import os, json, boto3
