@@ -41,10 +41,20 @@ on:
   push:
     branches: [main]
     paths:
+      # Rust sources + deps
       - 'crates/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      # systemd unit (apps's runtime contract)
       - 'deploy/systemd/**'
+      # Docker compose (QuestDB infra; arch / image / env)
+      - 'deploy/docker/**'
+      # Config TOML (loaded by app at boot)
+      - 'config/**'
+      # The deploy workflow ITSELF (so a PR that fixes the deploy
+      # auto-redeploys without the operator clicking "Run workflow").
+      # Charter: "everything completely comprehensively fully automated".
+      - '.github/workflows/deploy-aws.yml'
     tags:
       - 'v*.*.*'
 

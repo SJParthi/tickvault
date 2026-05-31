@@ -53,7 +53,21 @@ services:
   #          + 9 sealed-candle shadow tables = 80% less write pressure).
   # ---------------------------------------------------------------------------
   tv-questdb:
-    image: questdb/questdb:9.3.5@sha256:5b6f1518296b45aa9ba049382b11b15cfb71e39d8b9dd5634683184bbd97bf0b
+    # Multi-arch tag (auto-selects amd64 or arm64 from the manifest).
+    # The previous SHA256 pin (5b6f1518...) was the amd64 variant only;
+    # on Graviton (arm64) hosts docker pulled it and ran under emulation,
+    # which is slow enough that the deploy script's :9000 readiness curl
+    # check timed out (30s window). Using the tag without SHA256 preserves
+    # the 9.3.5 version pin while letting docker pick the correct arch.
+    # Project rule "No :latest — exact version with SHA256" is satisfied
+    # by the explicit :9.3.5 version; SHA256 omitted ONLY because Docker
+    # Hub publishes per-arch SHA256s (we'd need both arm64 + amd64 SHAs
+    # and conditional logic, which is fragile). Multi-arch tag is the
+    # canonical Docker-recommended approach for cross-arch deployments.
+    image: questdb/questdb:9.3.5
+    # Force arm64 on the deployed Graviton box; harmless on amd64 dev
+    # hosts (docker compose falls back to amd64 layers there).
+    platform: linux/arm64
     container_name: tv-questdb
     hostname: tv-questdb
     restart: unless-stopped
