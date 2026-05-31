@@ -328,8 +328,12 @@ jobs:
               "mv bin/tickvault.new   bin/tickvault",
               "mv bin/smoke_test.new  bin/smoke_test",
               "chown ec2-user:ec2-user bin/tickvault bin/smoke_test",
-              "# Reload systemd (picks up the refreshed unit) + restart",
+              "# Reload systemd (picks up the refreshed unit) + (re)enable + restart.",
+              "# `enable` is required because a previously-failed deploy may have",
+              "# disabled the service via the auto-stop step (kills Telegram spam).",
+              "# `enable` is idempotent — no-op if already enabled.",
               "systemctl daemon-reload",
+              "systemctl enable tickvault || true",
               "# On systemctl failure, dump status + journal so the deploy log shows WHY (Z+ L1 DETECT).",
               "systemctl restart tickvault || (echo ===== systemctl status ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== journalctl tickvault.service last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1)",
               "sleep 5",
@@ -428,6 +432,29 @@ jobs:
             --topic-arn arn:aws:sns:${{ vars.AWS_REGION || 'ap-south-1' }}:${{ steps.acct.outputs.id }}:tv-prod-alerts \
             --subject "DLT deploy OK" \
             --message "commit=${{ github.sha }} ref=${{ github.ref }} actor=${{ github.actor }}"
+
+      - name: Auto-stop tickvault service on deploy failure (kills Telegram spam)
+        if: failure()
+        # When the deploy fails AFTER the binary is in place, systemd's
+        # Restart=always keeps relaunching it every few seconds. If each
+        # boot reaches the auth step (it does after PR #921/#922), each
+        # boot fires a "Auth OK" Telegram — operator gets one Telegram
+        # per minute forever. Auto-stop + disable here breaks the loop
+        # the moment the deploy fails. Next successful deploy will
+        # re-enable + start the service via the existing systemctl
+        # daemon-reload + restart sequence above.
+        # Honest envelope: this can only execute if AWS creds were
+        # configured (i.e. failure happened AFTER the configure-creds
+        # step). For earlier failures it silently no-ops via `|| true`.
+        run: |
+          set +e
+          aws ssm send-command \
+            --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
+            --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
+            --document-name "AWS-RunShellScript" \
+            --comment "tickvault auto-stop on deploy failure sha=${{ github.sha }}" \
+            --parameters 'commands=["systemctl stop tickvault || true","systemctl disable tickvault || true","echo AUTO-STOPPED-AND-DISABLED: next successful deploy will re-enable + start the service"]' \
+            --query Command.CommandId --output text || echo "(could not dispatch auto-stop — AWS creds likely not configured at this stage)"
 
       - name: Notify Telegram on failure
         if: failure()
