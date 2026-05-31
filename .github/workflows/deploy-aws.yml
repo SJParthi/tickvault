@@ -105,16 +105,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Install Rust toolchain (host = aarch64-unknown-linux-gnu)
+      - name: Install Rust toolchain (host = aarch64-unknown-linux-musl, static binary)
+        # MUSL static target eliminates GLIBC version dependency entirely.
+        # Background: AL2023 ships GLIBC 2.34; ubuntu-24.04-arm runners have 2.39.
+        # A glibc-dynamic binary built on the runner refuses to load on the box
+        # with `version GLIBC_2.38/2.39 not found`. Static musl binary = zero
+        # runtime libc dependency = runs on any Linux forever. Z+ L4 PREVENT.
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # SHA-pinned (was @master, supply-chain hardening 2026-04-25)
         with:
           toolchain: 1.95.0
-          targets: aarch64-unknown-linux-gnu
+          targets: aarch64-unknown-linux-musl
 
-      - name: Install ARM64 build deps (cmake for aws-lc-rs)
+      - name: Install ARM64 musl build deps (cmake for aws-lc-rs + musl-tools)
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential pkg-config
+          sudo apt-get install -y cmake build-essential pkg-config musl-tools musl-dev
 
       - name: Cache cargo registry + target
         uses: actions/cache@v4
@@ -123,24 +128,35 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-arm64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-arm64-musl-cargo-release-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build tickvault release binary (ARM64)
-        run: cargo build --release --bin tickvault -p tickvault-app
+      - name: Build tickvault release binary (ARM64 musl static)
+        env:
+          # musl needs the right C compiler/linker for aws-lc-rs's cmake build
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --release --target aarch64-unknown-linux-musl --bin tickvault -p tickvault-app
 
-      - name: Build smoke_test binary (ARM64)
+      - name: Build smoke_test binary (ARM64 musl static)
         # Separate binary at crates/app/src/bin/smoke_test.rs — exits 0/1
         # without burning Dhan rate limit. Run by deploy as a pre-swap gate.
-        run: cargo build --release --bin smoke_test -p tickvault-app
+        env:
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --release --target aarch64-unknown-linux-musl --bin smoke_test -p tickvault-app
 
-      - name: Verify binaries exist + tickvault under 30MB
+      - name: Verify binaries exist + tickvault under 30MB + statically linked
         run: |
-          file target/release/tickvault
-          file target/release/smoke_test
+          BIN_DIR=target/aarch64-unknown-linux-musl/release
+          file "$BIN_DIR/tickvault"
+          file "$BIN_DIR/smoke_test"
           # Confirm the file command reports ARM aarch64 (not x86)
-          file target/release/tickvault | grep -q 'aarch64\|ARM' \
-            || (echo "FAIL: tickvault is not ARM64 — arch mismatch with t4g.medium Graviton"; exit 1)
-          SIZE_BYTES=$(stat -c%s target/release/tickvault)
+          file "$BIN_DIR/tickvault" | grep -q 'aarch64\|ARM' \
+            || (echo "FAIL: tickvault is not ARM64 — arch mismatch with Graviton box"; exit 1)
+          # Confirm statically linked (no GLIBC dependency at runtime)
+          file "$BIN_DIR/tickvault" | grep -q 'statically linked' \
+            || (echo "FAIL: tickvault is NOT statically linked — musl build broke; would hit GLIBC mismatch on AL2023"; exit 1)
+          SIZE_BYTES=$(stat -c%s "$BIN_DIR/tickvault")
           SIZE_MB=$((SIZE_BYTES / 1024 / 1024))
           echo "tickvault size: ${SIZE_MB}MB (${SIZE_BYTES} bytes)"
           # Cap raised 15MB -> 30MB on 2026-05-30. The release binary grew to
@@ -154,6 +170,7 @@ jobs:
           # un-stripped debug binary is ~80MB). Pinned by
           # crates/common/tests/aws_infra_wiring.rs::
           # test_deploy_aws_binary_size_cap_is_30mb.
+          # Note: musl static linking adds ~2-3MB vs glibc-dynamic; cap unchanged.
           if [ "$SIZE_BYTES" -gt 31457280 ]; then
             echo "FAIL: binary exceeds 30MB cap"
             exit 1
@@ -162,8 +179,9 @@ jobs:
       - name: Stage both binaries for upload
         run: |
           mkdir -p dist
-          cp target/release/tickvault   dist/tickvault
-          cp target/release/smoke_test  dist/smoke_test
+          BIN_DIR=target/aarch64-unknown-linux-musl/release
+          cp "$BIN_DIR/tickvault"   dist/tickvault
+          cp "$BIN_DIR/smoke_test"  dist/smoke_test
 
       - name: Upload artifact (both binaries)
         id: upload
