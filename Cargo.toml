@@ -113,7 +113,7 @@ csv = "1.4.0"
 thiserror = "2.0.18"
 anyhow = "1.0.102"
 bytes = "1.11.1"
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 
 # ---- Section 12: System & Resilience ----
 core_affinity = "0.8.3"
