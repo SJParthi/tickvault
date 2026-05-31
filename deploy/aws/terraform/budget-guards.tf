@@ -23,7 +23,7 @@
 
 data "archive_file" "tv_daily_budget_digest_zip" {
   type        = "zip"
-  output_path = "${path.module}/lambda-zips/tv_daily_budget_digest.zip"
+  output_path = "${path.module}/.tv-daily-budget-digest.zip"
   source {
     content  = <<-PYEOF
 import os, json, boto3
@@ -101,18 +101,18 @@ resource "aws_iam_role_policy" "tv_daily_budget_digest" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect = "Allow"
-        Action = ["ce:GetCostAndUsage", "ce:GetCostForecast"]
+        Effect   = "Allow"
+        Action   = ["ce:GetCostAndUsage", "ce:GetCostForecast"]
         Resource = "*"
       },
       {
-        Effect = "Allow"
-        Action = "sns:Publish"
+        Effect   = "Allow"
+        Action   = "sns:Publish"
         Resource = aws_sns_topic.tv_alerts.arn
       },
       {
-        Effect = "Allow"
-        Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "*"
       },
     ]
@@ -164,7 +164,7 @@ resource "aws_lambda_permission" "tv_daily_budget_digest_eventbridge" {
 
 data "archive_file" "tv_hard_stop_guard_zip" {
   type        = "zip"
-  output_path = "${path.module}/lambda-zips/tv_hard_stop_guard.zip"
+  output_path = "${path.module}/.tv-hard-stop-guard.zip"
   source {
     content  = <<-PYEOF
 import os, json, boto3
@@ -218,18 +218,18 @@ resource "aws_iam_role_policy" "tv_hard_stop_guard" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect = "Allow"
-        Action = ["ec2:DescribeInstances", "ec2:StopInstances"]
+        Effect   = "Allow"
+        Action   = ["ec2:DescribeInstances", "ec2:StopInstances"]
         Resource = "*"
       },
       {
-        Effect = "Allow"
-        Action = "sns:Publish"
+        Effect   = "Allow"
+        Action   = "sns:Publish"
         Resource = aws_sns_topic.tv_alerts.arn
       },
       {
-        Effect = "Allow"
-        Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "*"
       },
     ]
