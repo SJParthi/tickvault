@@ -304,20 +304,47 @@ jobs:
           echo "command_id=$CMD_ID" >> $GITHUB_OUTPUT
 
       - name: Wait for SSM command completion
+        # continue-on-error so the box-side output is ALWAYS fetched + printed
+        # below, even when the on-box script fails (smoke test, git refresh,
+        # systemctl, etc.). Without this the failure reason was hidden — the
+        # "Fetch output" step was skipped on wait-failure (deploy #103).
+        continue-on-error: true
         run: |
           aws ssm wait command-executed \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
             --command-id ${{ steps.ssm.outputs.command_id }} \
             --instance-id ${{ secrets.EC2_INSTANCE_ID }}
 
-      - name: Fetch SSM command output
+      - name: Fetch SSM command output + fail loudly on box-side error
+        # if: always() — print the box-side STDOUT/STDERR no matter what, so a
+        # failed on-box step (e.g. smoke test) shows its real reason in the log
+        # instead of an opaque "Waiter ... Failed". Then re-fail the job if the
+        # command status was not Success.
+        if: always()
         run: |
+          STATUS=$(aws ssm get-command-invocation \
+            --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
+            --command-id ${{ steps.ssm.outputs.command_id }} \
+            --instance-id ${{ secrets.EC2_INSTANCE_ID }} \
+            --query 'Status' --output text)
+          echo "===== SSM command status: ${STATUS} ====="
+          echo "----- STDOUT (on-box) -----"
           aws ssm get-command-invocation \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
             --command-id ${{ steps.ssm.outputs.command_id }} \
             --instance-id ${{ secrets.EC2_INSTANCE_ID }} \
-            --query '[Status,StandardOutputContent,StandardErrorContent]' \
-            --output text
+            --query 'StandardOutputContent' --output text || true
+          echo "----- STDERR (on-box) -----"
+          aws ssm get-command-invocation \
+            --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
+            --command-id ${{ steps.ssm.outputs.command_id }} \
+            --instance-id ${{ secrets.EC2_INSTANCE_ID }} \
+            --query 'StandardErrorContent' --output text || true
+          if [ "${STATUS}" != "Success" ]; then
+            echo "::error::SSM command on the box failed with status=${STATUS} — see STDOUT/STDERR above for the on-box reason."
+            exit 1
+          fi
+
 
       - name: Monitor first 60 seconds for crashes
         run: |
