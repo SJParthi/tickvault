@@ -268,6 +268,12 @@ jobs:
             --comment "tickvault deploy sha=${{ github.sha }}" \
             --parameters 'commands=[
               "set -euo pipefail",
+              "# SELF-HEAL box state before any cd (Z+ defense — idempotent).",
+              "# Reconstructs /opt/tickvault layout if user-data.sh.tftpl never completed",
+              "# (rebuilt instance / EBS swap / cold restore). No-op when already correct.",
+              "mkdir -p /opt/tickvault/config /opt/tickvault/data/spill /opt/tickvault/logs /opt/tickvault/bin",
+              "if [ ! -d /opt/tickvault/repo/.git ]; then sudo -u ec2-user git clone --depth 1 https://github.com/SJParthi/tickvault.git /opt/tickvault/repo; fi",
+              "chown -R ec2-user:ec2-user /opt/tickvault",
               "cd /opt/tickvault",
               "# Refresh the repo clone to latest main BEFORE copying config/systemd.",
               "# The clone is shallow (--depth 1) from first boot; without this pull",
@@ -377,7 +383,7 @@ jobs:
               --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
               --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
               --document-name "AWS-RunShellScript" \
-              --parameters 'commands=["set -euo pipefail","cd /opt/tickvault","if [ -f bin/tickvault.backup ]; then mv bin/tickvault.backup bin/tickvault; systemctl restart tickvault; fi"]'
+              --parameters 'commands=["set -euo pipefail","if [ ! -d /opt/tickvault ]; then echo SKIP_ROLLBACK_NO_DIR; exit 0; fi","cd /opt/tickvault","if [ -f bin/tickvault.backup ]; then mv bin/tickvault.backup bin/tickvault; systemctl restart tickvault; fi"]'
             exit 1
           fi
           echo "DEPLOY VERIFIED: tickvault has been active for 60s"
