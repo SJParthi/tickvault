@@ -96,11 +96,11 @@ resource "aws_cloudwatch_dashboard" "operator" {
         width  = 8
         height = 6
         properties = {
-          title  = "Candle seals emitted (data flowing during market hours)"
-          region = local.dash_region
-          view   = "timeSeries"
+          title   = "Candle seals emitted (data flowing during market hours)"
+          region  = local.dash_region
+          view    = "timeSeries"
           metrics = [[local.dash_namespace, "tv_aggregator_seals_emitted_total", { stat = "Sum" }]]
-          period = 300
+          period  = 300
         }
       },
       {
@@ -110,12 +110,12 @@ resource "aws_cloudwatch_dashboard" "operator" {
         width  = 8
         height = 6
         properties = {
-          title  = "Instruments silent (tick-gap — 0 = all streaming)"
-          region = local.dash_region
-          view   = "timeSeries"
+          title   = "Instruments silent (tick-gap — 0 = all streaming)"
+          region  = local.dash_region
+          view    = "timeSeries"
           metrics = [[local.dash_namespace, "tv_tick_gap_instruments_silent"]]
-          period = 60
-          stat   = "Maximum"
+          period  = 60
+          stat    = "Maximum"
         }
       },
       {
@@ -146,11 +146,11 @@ resource "aws_cloudwatch_dashboard" "operator" {
         width  = 8
         height = 6
         properties = {
-          title  = "Tick spill dropped (0 = no loss)"
-          region = local.dash_region
-          view   = "timeSeries"
+          title   = "Tick spill dropped (0 = no loss)"
+          region  = local.dash_region
+          view    = "timeSeries"
           metrics = [[local.dash_namespace, "tv_spill_dropped_total", { stat = "Sum" }]]
-          period = 300
+          period  = 300
         }
       },
       {
@@ -160,11 +160,11 @@ resource "aws_cloudwatch_dashboard" "operator" {
         width  = 8
         height = 6
         properties = {
-          title  = "DLQ ticks (recoverable overflow — 0 = none)"
-          region = local.dash_region
-          view   = "timeSeries"
+          title   = "DLQ ticks (recoverable overflow — 0 = none)"
+          region  = local.dash_region
+          view    = "timeSeries"
           metrics = [[local.dash_namespace, "tv_dlq_ticks_total", { stat = "Sum" }]]
-          period = 300
+          period  = 300
         }
       },
       {
@@ -174,12 +174,12 @@ resource "aws_cloudwatch_dashboard" "operator" {
         width  = 8
         height = 6
         properties = {
-          title  = "Clock skew (seconds vs trusted source)"
-          region = local.dash_region
-          view   = "timeSeries"
+          title   = "Clock skew (seconds vs trusted source)"
+          region  = local.dash_region
+          view    = "timeSeries"
           metrics = [[local.dash_namespace, "tv_clock_skew_seconds"]]
-          period = 60
-          stat   = "Maximum"
+          period  = 60
+          stat    = "Maximum"
         }
       },
 
@@ -191,12 +191,12 @@ resource "aws_cloudwatch_dashboard" "operator" {
         width  = 12
         height = 6
         properties = {
-          title  = "EC2 CPU utilization (%)"
-          region = local.dash_region
-          view   = "timeSeries"
+          title   = "EC2 CPU utilization (%)"
+          region  = local.dash_region
+          view    = "timeSeries"
           metrics = [["AWS/EC2", "CPUUtilization", "InstanceId", aws_instance.tv_app.id]]
-          period = 60
-          stat   = "Average"
+          period  = 60
+          stat    = "Average"
         }
       },
       {
@@ -206,11 +206,11 @@ resource "aws_cloudwatch_dashboard" "operator" {
         width  = 12
         height = 6
         properties = {
-          title  = "Root disk used (%)"
-          region = local.dash_region
-          view   = "timeSeries"
+          title   = "Root disk used (%)"
+          region  = local.dash_region
+          view    = "timeSeries"
           metrics = [[{ expression = "SELECT MAX(disk_used_percent) FROM \"CWAgent\" WHERE InstanceId = '${aws_instance.tv_app.id}' AND path = '/'", label = "disk used %", id = "diskpct" }]]
-          period = 300
+          period  = 300
         }
       },
 

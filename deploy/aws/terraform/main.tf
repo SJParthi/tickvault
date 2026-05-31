@@ -223,6 +223,22 @@ resource "aws_iam_instance_profile" "tv_instance" {
   role = aws_iam_role.tv_instance.name
 }
 
+# SSM Managed-Instance Core — REQUIRED for the deploy-aws.yml workflow to run
+# `aws ssm send-command` against this box (download binary -> smoke test ->
+# atomic swap -> restart). The inline policy above grants ssm:GetParameter etc.
+# for the APP to read its secrets, but the SSM *agent* needs a separate set of
+# permissions (ssm:UpdateInstanceInformation, ssmmessages:*, ec2messages:*) to
+# register the instance as a "managed instance". Without this attachment,
+# send-command fails with `InvalidInstanceId: Instances not in a valid state
+# for account` (observed in deploy-aws run #98, 2026-05-30). This AWS-managed
+# policy is the standard, least-privilege way to enable SSM management +
+# Session Manager (the operator's tunnel access in
+# docs/runbooks/aws-access-from-anywhere.md also depends on it).
+resource "aws_iam_role_policy_attachment" "tv_instance_ssm_core" {
+  role       = aws_iam_role.tv_instance.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
 # ---------------------------------------------------------------------------
 # EC2 instance + EIP
 # ---------------------------------------------------------------------------

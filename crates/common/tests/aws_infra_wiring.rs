@@ -308,6 +308,73 @@ fn test_aws_control_workflow_covers_all_operations() {
 }
 
 #[test]
+fn test_terraform_apply_replans_so_archive_file_zips_exist() {
+    // Regression 2026-05-30 (terraform-apply #40/#43/#46): apply ran on a
+    // SEPARATE runner from plan and only downloaded `tfplan`, so the Lambda
+    // `data "archive_file"` .zip files built during plan were missing ->
+    // `reading ZIP file (./.budget-killswitch.zip): no such file or directory`.
+    // The fix re-plans on the apply runner (`apply -auto-approve` WITHOUT the
+    // saved tfplan) so archive_file rebuilds the zips locally. Guard pins that
+    // the apply step no longer applies the saved plan file.
+    let content =
+        std::fs::read_to_string(workspace_root().join(".github/workflows/terraform-apply.yml"))
+            .expect("terraform-apply.yml must be readable"); // APPROVED: test
+    assert!(
+        !content.contains("apply -auto-approve -no-color tfplan"),
+        "terraform-apply.yml must NOT apply the saved tfplan — the apply runner \
+         lacks the archive_file .zip outputs built on the plan runner. Re-plan \
+         on the apply runner instead."
+    );
+    assert!(
+        content.contains("apply -auto-approve -no-color"),
+        "terraform-apply.yml must still run terraform apply -auto-approve"
+    );
+}
+
+#[test]
+fn test_terraform_instance_role_has_ssm_managed_core() {
+    // Regression 2026-05-30 (deploy-aws run #98): `aws ssm send-command` failed
+    // with `InvalidInstanceId: Instances not in a valid state for account`. The
+    // EC2 instance role had inline ssm:GetParameter perms (for the app to read
+    // secrets) but NOT AmazonSSMManagedInstanceCore, so the SSM *agent* could
+    // not register the box as a managed instance. The deploy pushes the binary
+    // via SSM, so this attachment is mandatory. (Session Manager tunnels in
+    // docs/runbooks/aws-access-from-anywhere.md also depend on it.)
+    let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
+        .expect("main.tf must be readable"); // APPROVED: test
+    assert!(
+        content.contains("AmazonSSMManagedInstanceCore"),
+        "main.tf must attach AmazonSSMManagedInstanceCore to the EC2 instance \
+         role — required for `aws ssm send-command` (the deploy mechanism) to \
+         reach the box; without it send-command fails InvalidInstanceId."
+    );
+}
+
+#[test]
+fn test_deploy_aws_resolves_account_id_at_runtime() {
+    // Regression 2026-05-30 (deploy-aws run #98): the Telegram-notify steps used
+    // ${{ secrets.AWS_ACCOUNT_ID }} which was empty -> SNS publish failed with
+    // `Invalid parameter: AccountId`. The account id is now derived at runtime
+    // via `aws sts get-caller-identity`, removing the manual-secret dependency.
+    let content =
+        std::fs::read_to_string(workspace_root().join(".github/workflows/deploy-aws.yml"))
+            .expect("deploy-aws.yml must be readable"); // APPROVED: test
+    assert!(
+        content.contains("aws sts get-caller-identity --query Account"),
+        "deploy-aws.yml must derive the AWS account id at runtime"
+    );
+    assert!(
+        content.contains("steps.acct.outputs.id"),
+        "deploy-aws.yml SNS topic ARNs must use the runtime-derived account id"
+    );
+    assert!(
+        !content.contains("secrets.AWS_ACCOUNT_ID"),
+        "deploy-aws.yml must NOT reference the empty AWS_ACCOUNT_ID secret \
+         (it caused the SNS `Invalid parameter: AccountId` failure)."
+    );
+}
+
+#[test]
 fn test_terraform_s3_lifecycle_matches_sebi_retention() {
     let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
         .expect("main.tf must be readable"); // APPROVED: test
@@ -431,6 +498,53 @@ fn test_deploy_aws_workflow_uses_oidc() {
     assert!(
         content.contains("role-to-assume"),
         "deploy-aws.yml must reference the OIDC role ARN"
+    );
+}
+
+#[test]
+fn test_aws_autopilot_selfheal_workflow_exists() {
+    // Operator demand 2026-05-31: "make it an extreme complete comprehensive
+    // automated process ... never get stuck with manual configurations like
+    // run deploy, configure static elastic IP." The aws-autopilot workflow +
+    // script self-check the running deployment every 15 min and auto-heal
+    // (start stopped box in market hours, re-associate EIP, restart app,
+    // bring QuestDB up), Telegram-alerting only what needs human eyes.
+    require_file_exists(
+        ".github/workflows/aws-autopilot.yml",
+        "AWS self-check + auto-heal workflow (operator demand 2026-05-31)",
+    );
+    require_file_exists("scripts/aws-autopilot.sh", "AWS autopilot self-heal script");
+    let wf = std::fs::read_to_string(workspace_root().join(".github/workflows/aws-autopilot.yml"))
+        .expect("aws-autopilot.yml must be readable"); // APPROVED: test
+    // Runs on a schedule (every 15 min during the box's up-window) — not
+    // only on-demand, so it self-heals without a human.
+    assert!(
+        wf.contains("schedule:") && wf.contains("*/15"),
+        "aws-autopilot.yml must run on a 15-minute schedule (self-heal without a human)"
+    );
+    assert!(
+        wf.contains("scripts/aws-autopilot.sh"),
+        "aws-autopilot.yml must invoke scripts/aws-autopilot.sh"
+    );
+
+    let sh = std::fs::read_to_string(workspace_root().join("scripts/aws-autopilot.sh"))
+        .expect("aws-autopilot.sh must be readable"); // APPROVED: test
+    // The auto-heal actions the operator explicitly wanted to never do by hand.
+    assert!(
+        sh.contains("associate-address"),
+        "autopilot must auto-re-associate the Elastic IP (operator: 'configure static elastic IP')"
+    );
+    assert!(
+        sh.contains("systemctl restart tickvault"),
+        "autopilot must auto-restart the app"
+    );
+    assert!(
+        sh.contains("start-instances"),
+        "autopilot must auto-start a stopped box during market hours"
+    );
+    assert!(
+        sh.contains("describe-instance-information"),
+        "autopilot must verify the box is an SSM managed node"
     );
 }
 

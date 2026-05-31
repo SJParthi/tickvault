@@ -20,9 +20,11 @@
 #   4. Existing rollback path triggers on failed smoke test.
 #
 # Secrets required (GitHub repo > Settings > Secrets and variables > Actions):
-#   AWS_ROLE_ARN                — OIDC role assumed by the workflow
-#   AWS_ACCOUNT_ID              — used in the role ARN template
+#   AWS_ROLE_ARN                — OIDC role assumed by the workflow (optional if
+#                                 access keys are set; preflight accepts either)
 #   EC2_INSTANCE_ID             — the tv-prod-app instance ID from tf output
+#   (AWS_ACCOUNT_ID is NO LONGER required — derived at runtime via
+#    `aws sts get-caller-identity`, see the "Resolve AWS account id" step.)
 #
 # Variables (repo > Settings > Secrets and variables > Variables):
 #   AWS_REGION                  — ap-south-1
@@ -231,6 +233,16 @@ jobs:
           aws-region: ${{ vars.AWS_REGION || 'ap-south-1' }}
           role-session-name: tv-github-deploy-${{ github.run_id }}
 
+      - name: Resolve AWS account id at runtime
+        # Derive the account id from the live credentials instead of relying on
+        # the AWS_ACCOUNT_ID GitHub secret (which was empty -> SNS publish failed
+        # with `Invalid parameter: AccountId` in deploy-aws run #98). This removes
+        # a manual-setup dependency entirely: the SNS topic ARN for the Telegram
+        # notify steps is built from this value. Runs early (right after creds)
+        # so its output is available to the `if: failure()` notify step too.
+        id: acct
+        run: echo "id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
+
       - name: Upload both binaries to S3 staging bucket
         run: |
           chmod +x ./dist/tickvault ./dist/smoke_test
@@ -256,6 +268,12 @@ jobs:
             --comment "tickvault deploy sha=${{ github.sha }}" \
             --parameters 'commands=[
               "set -euo pipefail",
+              "# SELF-HEAL box state before any cd (Z+ defense — idempotent).",
+              "# Reconstructs /opt/tickvault layout if user-data.sh.tftpl never completed",
+              "# (rebuilt instance / EBS swap / cold restore). No-op when already correct.",
+              "mkdir -p /opt/tickvault/config /opt/tickvault/data/spill /opt/tickvault/logs /opt/tickvault/bin",
+              "if [ ! -d /opt/tickvault/repo/.git ]; then sudo -u ec2-user git clone --depth 1 https://github.com/SJParthi/tickvault.git /opt/tickvault/repo; fi",
+              "chown -R ec2-user:ec2-user /opt/tickvault",
               "cd /opt/tickvault",
               "# Refresh the repo clone to latest main BEFORE copying config/systemd.",
               "# The clone is shallow (--depth 1) from first boot; without this pull",
@@ -292,20 +310,47 @@ jobs:
           echo "command_id=$CMD_ID" >> $GITHUB_OUTPUT
 
       - name: Wait for SSM command completion
+        # continue-on-error so the box-side output is ALWAYS fetched + printed
+        # below, even when the on-box script fails (smoke test, git refresh,
+        # systemctl, etc.). Without this the failure reason was hidden — the
+        # "Fetch output" step was skipped on wait-failure (deploy #103).
+        continue-on-error: true
         run: |
           aws ssm wait command-executed \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
             --command-id ${{ steps.ssm.outputs.command_id }} \
             --instance-id ${{ secrets.EC2_INSTANCE_ID }}
 
-      - name: Fetch SSM command output
+      - name: Fetch SSM command output + fail loudly on box-side error
+        # if: always() — print the box-side STDOUT/STDERR no matter what, so a
+        # failed on-box step (e.g. smoke test) shows its real reason in the log
+        # instead of an opaque "Waiter ... Failed". Then re-fail the job if the
+        # command status was not Success.
+        if: always()
         run: |
+          STATUS=$(aws ssm get-command-invocation \
+            --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
+            --command-id ${{ steps.ssm.outputs.command_id }} \
+            --instance-id ${{ secrets.EC2_INSTANCE_ID }} \
+            --query 'Status' --output text)
+          echo "===== SSM command status: ${STATUS} ====="
+          echo "----- STDOUT (on-box) -----"
           aws ssm get-command-invocation \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
             --command-id ${{ steps.ssm.outputs.command_id }} \
             --instance-id ${{ secrets.EC2_INSTANCE_ID }} \
-            --query '[Status,StandardOutputContent,StandardErrorContent]' \
-            --output text
+            --query 'StandardOutputContent' --output text || true
+          echo "----- STDERR (on-box) -----"
+          aws ssm get-command-invocation \
+            --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
+            --command-id ${{ steps.ssm.outputs.command_id }} \
+            --instance-id ${{ secrets.EC2_INSTANCE_ID }} \
+            --query 'StandardErrorContent' --output text || true
+          if [ "${STATUS}" != "Success" ]; then
+            echo "::error::SSM command on the box failed with status=${STATUS} — see STDOUT/STDERR above for the on-box reason."
+            exit 1
+          fi
+
 
       - name: Monitor first 60 seconds for crashes
         run: |
@@ -338,7 +383,7 @@ jobs:
               --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
               --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
               --document-name "AWS-RunShellScript" \
-              --parameters 'commands=["set -euo pipefail","cd /opt/tickvault","if [ -f bin/tickvault.backup ]; then mv bin/tickvault.backup bin/tickvault; systemctl restart tickvault; fi"]'
+              --parameters 'commands=["set -euo pipefail","if [ ! -d /opt/tickvault ]; then echo SKIP_ROLLBACK_NO_DIR; exit 0; fi","cd /opt/tickvault","if [ -f bin/tickvault.backup ]; then mv bin/tickvault.backup bin/tickvault; systemctl restart tickvault; fi"]'
             exit 1
           fi
           echo "DEPLOY VERIFIED: tickvault has been active for 60s"
@@ -350,7 +395,7 @@ jobs:
           # an INFO-level message so the operator sees the deploy land.
           aws sns publish \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
-            --topic-arn arn:aws:sns:${{ vars.AWS_REGION || 'ap-south-1' }}:${{ secrets.AWS_ACCOUNT_ID }}:tv-prod-alerts \
+            --topic-arn arn:aws:sns:${{ vars.AWS_REGION || 'ap-south-1' }}:${{ steps.acct.outputs.id }}:tv-prod-alerts \
             --subject "DLT deploy OK" \
             --message "commit=${{ github.sha }} ref=${{ github.ref }} actor=${{ github.actor }}"
 
@@ -359,6 +404,6 @@ jobs:
         run: |
           aws sns publish \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
-            --topic-arn arn:aws:sns:${{ vars.AWS_REGION || 'ap-south-1' }}:${{ secrets.AWS_ACCOUNT_ID }}:tv-prod-alerts \
+            --topic-arn arn:aws:sns:${{ vars.AWS_REGION || 'ap-south-1' }}:${{ steps.acct.outputs.id }}:tv-prod-alerts \
             --subject "DLT deploy FAILED" \
             --message "commit=${{ github.sha }} ref=${{ github.ref }} actor=${{ github.actor }} run=${{ github.run_id }}"
