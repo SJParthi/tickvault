@@ -335,9 +335,11 @@ jobs:
               "systemctl daemon-reload",
               "systemctl enable tickvault || true",
               "# On systemctl failure, dump status + journal so the deploy log shows WHY (Z+ L1 DETECT).",
-              "systemctl restart tickvault || (echo ===== systemctl status ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== journalctl tickvault.service last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1)",
+              "# Two journal dumps: (1) -xeu (rich systemd metadata, useful for context),",
+              "# (2) --output=cat -n 200 (raw app stdout/stderr ONLY, no systemd noise — the actual error).",
+              "systemctl restart tickvault || (echo ===== systemctl status ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== app stdout/stderr ONLY last 200 ===== && journalctl -u tickvault.service -n 200 --no-pager --output=cat || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1)",
               "sleep 5",
-              "systemctl is-active --quiet tickvault || (echo ===== service inactive after 5s ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== journalctl tickvault.service last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1)",
+              "systemctl is-active --quiet tickvault || (echo ===== service inactive after 5s ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== app stdout/stderr ONLY last 200 ===== && journalctl -u tickvault.service -n 200 --no-pager --output=cat || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1)",
               "echo DEPLOY OK"
             ]' \
             --query 'Command.CommandId' --output text)
