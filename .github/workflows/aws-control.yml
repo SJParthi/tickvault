@@ -18,6 +18,7 @@
 #   stop            - stop the EC2 instance (market-hours guarded)
 #   reboot          - reboot the EC2 instance (market-hours guarded)
 #   restart-app     - systemctl restart tickvault (via SSM; market-hours guarded)
+#   stop-app        - kill-switch: stop + disable tickvault (breaks restart loops + Telegram spam)
 #   restart-questdb - restart the QuestDB docker container (via SSM)
 #   seed-secrets    - copy /tickvault/dev/* -> /tickvault/staging/* (idempotent)
 #   deploy          - dispatch the full deploy-aws build+ship+restart pipeline
@@ -38,6 +39,7 @@ on:
           - stop
           - reboot
           - restart-app
+          - stop-app
           - restart-questdb
           - seed-secrets
           - deploy
@@ -117,7 +119,7 @@ jobs:
           force="${{ github.event.inputs.force }}"
           # Only stop/reboot/restart-app interrupt a live session.
           case "$action" in
-            stop|reboot|restart-app) sensitive=1 ;;
+            stop|reboot|restart-app|stop-app) sensitive=1 ;;
             *) sensitive=0 ;;
           esac
           if [ "$sensitive" = "1" ] && [ "$force" != "yes" ]; then
@@ -274,6 +276,23 @@ jobs:
           CMD=$(aws ssm send-command --region "$AWS_REGION" --instance-ids "$IID" \
             --document-name AWS-RunShellScript \
             --parameters 'commands=["systemctl restart tickvault","sleep 5","systemctl is-active --quiet tickvault && echo RESTARTED-OK || (echo FAIL; exit 1)"]' \
+            --query Command.CommandId --output text)
+          aws ssm wait command-executed --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" || true
+          aws ssm get-command-invocation --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" \
+            --query StandardOutputContent --output text
+
+      - name: stop-app
+        if: github.event.inputs.action == 'stop-app'
+        # Kill-switch — stops the tickvault service AND disables it so
+        # systemd Restart=always cannot relaunch it. Use when a deploy
+        # is restart-looping (e.g. config / runtime crash) and spamming
+        # Telegram. Next successful `deploy` will re-enable + start it.
+        run: |
+          set -euo pipefail
+          IID=${{ steps.iid.outputs.id }}
+          CMD=$(aws ssm send-command --region "$AWS_REGION" --instance-ids "$IID" \
+            --document-name AWS-RunShellScript \
+            --parameters 'commands=["systemctl stop tickvault || true","systemctl disable tickvault || true","systemctl is-active --quiet tickvault && (echo FAIL: service still active; exit 1) || echo STOPPED-AND-DISABLED"]' \
             --query Command.CommandId --output text)
           aws ssm wait command-executed --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" || true
           aws ssm get-command-invocation --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" \
