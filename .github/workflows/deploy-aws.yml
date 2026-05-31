@@ -303,9 +303,10 @@ jobs:
               "chown ec2-user:ec2-user bin/tickvault bin/smoke_test",
               "# Reload systemd (picks up the refreshed unit) + restart",
               "systemctl daemon-reload",
-              "systemctl restart tickvault",
+              "# On systemctl failure, dump status + journal so the deploy log shows WHY (Z+ L1 DETECT).",
+              "systemctl restart tickvault || (echo ===== systemctl status ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== journalctl tickvault.service last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1)",
               "sleep 5",
-              "systemctl is-active --quiet tickvault || (echo FAIL && exit 1)",
+              "systemctl is-active --quiet tickvault || (echo ===== service inactive after 5s ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== journalctl tickvault.service last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1)",
               "echo DEPLOY OK"
             ]' \
             --query 'Command.CommandId' --output text)
