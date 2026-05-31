@@ -502,6 +502,53 @@ fn test_deploy_aws_workflow_uses_oidc() {
 }
 
 #[test]
+fn test_aws_autopilot_selfheal_workflow_exists() {
+    // Operator demand 2026-05-31: "make it an extreme complete comprehensive
+    // automated process ... never get stuck with manual configurations like
+    // run deploy, configure static elastic IP." The aws-autopilot workflow +
+    // script self-check the running deployment every 15 min and auto-heal
+    // (start stopped box in market hours, re-associate EIP, restart app,
+    // bring QuestDB up), Telegram-alerting only what needs human eyes.
+    require_file_exists(
+        ".github/workflows/aws-autopilot.yml",
+        "AWS self-check + auto-heal workflow (operator demand 2026-05-31)",
+    );
+    require_file_exists("scripts/aws-autopilot.sh", "AWS autopilot self-heal script");
+    let wf = std::fs::read_to_string(workspace_root().join(".github/workflows/aws-autopilot.yml"))
+        .expect("aws-autopilot.yml must be readable"); // APPROVED: test
+    // Runs on a schedule (every 15 min during the box's up-window) — not
+    // only on-demand, so it self-heals without a human.
+    assert!(
+        wf.contains("schedule:") && wf.contains("*/15"),
+        "aws-autopilot.yml must run on a 15-minute schedule (self-heal without a human)"
+    );
+    assert!(
+        wf.contains("scripts/aws-autopilot.sh"),
+        "aws-autopilot.yml must invoke scripts/aws-autopilot.sh"
+    );
+
+    let sh = std::fs::read_to_string(workspace_root().join("scripts/aws-autopilot.sh"))
+        .expect("aws-autopilot.sh must be readable"); // APPROVED: test
+    // The auto-heal actions the operator explicitly wanted to never do by hand.
+    assert!(
+        sh.contains("associate-address"),
+        "autopilot must auto-re-associate the Elastic IP (operator: 'configure static elastic IP')"
+    );
+    assert!(
+        sh.contains("systemctl restart tickvault"),
+        "autopilot must auto-restart the app"
+    );
+    assert!(
+        sh.contains("start-instances"),
+        "autopilot must auto-start a stopped box during market hours"
+    );
+    assert!(
+        sh.contains("describe-instance-information"),
+        "autopilot must verify the box is an SSM managed node"
+    );
+}
+
+#[test]
 fn test_deploy_aws_after_close_workflow_fires_in_premarket_and_postmarket_only() {
     // Operator lock 2026-05-30: "only pre-market AND post-market alone only
     // our new codes merged ones should be deployed". Code-merge-driven
