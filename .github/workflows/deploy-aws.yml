@@ -442,12 +442,39 @@ jobs:
         # below, even when the on-box script fails (smoke test, git refresh,
         # systemctl, etc.). Without this the failure reason was hidden — the
         # "Fetch output" step was skipped on wait-failure (deploy #103).
+        #
+        # DO NOT use `aws ssm wait command-executed` here: that built-in waiter
+        # has a HARD-CODED budget of 20 polls × 5s = 100 seconds. The on-box
+        # script now does Docker Compose plugin download, `docker compose up`
+        # + 30s QuestDB readiness loop, CloudWatch agent install/config, and a
+        # 40s smoke test — easily > 100s of wall-clock. The waiter gave up
+        # while the command was still InProgress, the Fetch step then saw
+        # Status=InProgress (with EMPTY stdout/stderr, because SSM only fills
+        # those at a terminal state) and hard-failed a deploy that was actually
+        # still progressing (deploy run 26732460896, 2026-06-01). We poll
+        # manually with a 10-minute budget for a genuine TERMINAL state instead.
         continue-on-error: true
         run: |
-          aws ssm wait command-executed \
-            --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
-            --command-id ${{ steps.ssm.outputs.command_id }} \
-            --instance-id ${{ secrets.EC2_INSTANCE_ID }}
+          set -uo pipefail
+          REGION="${{ vars.AWS_REGION || 'ap-south-1' }}"
+          CMD_ID="${{ steps.ssm.outputs.command_id }}"
+          IID="${{ secrets.EC2_INSTANCE_ID }}"
+          # 120 polls × 5s = 600s (10 min). SSM send-command default execution
+          # timeout is 3600s, so the command itself is never killed under us.
+          for i in $(seq 1 120); do
+            STATUS=$(aws ssm get-command-invocation \
+              --region "$REGION" --command-id "$CMD_ID" --instance-id "$IID" \
+              --query 'Status' --output text 2>/dev/null || echo "Pending")
+            echo "poll $i/120: status=$STATUS"
+            case "$STATUS" in
+              Success|Failed|Cancelled|TimedOut)
+                echo "reached terminal state: $STATUS"
+                exit 0
+                ;;
+            esac
+            sleep 5
+          done
+          echo "::warning::SSM command still non-terminal after 10 min — the Fetch step below will report the real status."
 
       - name: Fetch SSM command output + fail loudly on box-side error
         # if: always() — print the box-side STDOUT/STDERR no matter what, so a
