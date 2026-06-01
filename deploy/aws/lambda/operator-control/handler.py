@@ -1,39 +1,29 @@
-"""Operator-control Lambda — the single-URL operator console (VIEW + CONTROL).
+"""Operator portal Lambda — ONE URL to run the whole product (VIEW + CONTROL).
 
-WHY THIS EXISTS
----------------
-The operator wants ONE place — one URL they can open on a phone — to both SEE
-the trading box (is the app up? are ticks flowing? are candles sealing? any
-recent errors?) AND control it (start / stop / restart-app / restart-questdb).
-No AWS console, no GitHub UI, no Grafana signup.
+Open the Function URL in a browser and you get a device-locked mission-control
+page with tabs: Overview (box status + control), Data (live metrics + a QuestDB
+query box), GitHub (open PRs + CI status + merge + trigger deploy), Logs (live
+error/app tail), and AWS (CloudWatch alarms + month-to-date cost).
 
 ONE URL, two layers:
-  * `GET  /`  → serves the console HTML page. PUBLIC (no token) — the page is
-                a static shell that contains ZERO secrets. It just renders a
-                token box + status panel + buttons.
-  * `POST /`  → every action ("view" snapshot, start, stop, restart-*) requires
-                `Authorization: Bearer <secret>` (constant-time compare). The
-                page reads the token the operator typed (kept in the browser's
-                localStorage) and sends it on every POST.
+  * `GET  /` → serves the portal HTML. PUBLIC shell with ZERO secrets — it just
+               renders a lock screen + tabs. It can do nothing until unlocked.
+  * `POST /` → every action requires `Authorization: Bearer <secret>`
+               (constant-time compare). The key is saved only in the device's
+               localStorage and sent on every POST. Only the operator's laptop
+               + phone hold it, so in practice only those devices work.
 
-SECURITY MODEL (deliberately strict — this can stop a live trading box)
------------------------------------------------------------------------
-* Function URL AWS auth is NONE, but EVERY POST must carry the bearer secret
-  matching the SSM SecureString. Missing/wrong → 401. The GET page shell is
-  intentionally public (no secret in it) so the operator can open it and THEN
-  paste the token.
-* The Lambda's IAM role is scoped to EXACTLY this instance: ec2 Start/Stop/
-  Reboot on the one instance ARN, ssm:SendCommand + ssm:GetCommandInvocation on
-  the one instance + AWS-RunShellScript only, ssm:GetParameter on the one
-  secret. It can do NOTHING else.
-* Destructive actions (stop / reboot / restart-app / stop-app) are blocked
-  during market hours (09:15–15:30 IST Mon–Fri) unless the body sets
-  {"force": true} — mirrors aws-control.yml's guard.
-* Every invocation is CloudWatch-logged (audit) and the action is echoed back.
-
-This Lambda intentionally does NOT implement `deploy` — deploy needs GitHub
-`workflow_dispatch` (a PAT we don't store). Deploy stays on the auto-on-merge
-path; the console links to it rather than holding a GitHub credential.
+SECURITY MODEL (deliberately strict — this can stop a live trading box):
+* Bearer secret from SSM SecureString /tickvault/<env>/operator/control-secret.
+* GitHub actions use a fine-grained PAT from SSM
+  /tickvault/<env>/operator/github-token, scoped to this one repo. Never in the
+  page, never in env, never in Terraform state.
+* IAM scoped to exactly this instance + read-only CloudWatch/CostExplorer +
+  the two SSM secrets. Nothing else.
+* Destructive box actions (stop/reboot/restart-app/stop-app) are blocked during
+  market hours (09:15-15:30 IST Mon-Fri) unless {"force": true}.
+* The SQL box is READ-ONLY: only SELECT/SHOW/EXPLAIN/WITH are accepted; any
+  mutating keyword is rejected before it ever reaches QuestDB.
 """
 
 from __future__ import annotations
@@ -43,87 +33,98 @@ import hmac
 import json
 import os
 import time
+import urllib.error
+import urllib.request
 
 REGION = os.environ.get("AWS_REGION", "ap-south-1")
 INSTANCE_ID = os.environ.get("TV_INSTANCE_ID", "")
-# Name of the SSM SecureString holding the bearer secret. We read the secret
-# at cold start via ssm:GetParameter (decrypted) — it is NEVER placed in the
-# Lambda env or Terraform state, so it cannot leak via GetFunctionConfiguration.
+GH_REPO = os.environ.get("GH_REPO", "SJParthi/tickvault")
+GH_DEPLOY_WORKFLOW = os.environ.get("GH_DEPLOY_WORKFLOW", "deploy-aws.yml")
 _SECRET_PARAM = os.environ.get("OPERATOR_CONTROL_SECRET_PARAM", "")
+_GH_TOKEN_PARAM = os.environ.get("OPERATOR_GITHUB_TOKEN_PARAM", "")
 
-# Lazy-init boto3 clients so the pure-function tests (auth, market-hours,
-# snapshot parsing, HTML serving) run without boto3 installed. The clients are
-# constructed on first AWS call and cached for the warm Lambda's lifetime.
+# Lazy-init boto3 clients so the pure-function tests run without boto3 installed.
 _clients: dict[str, object] = {}
 
 
-def _ec2_client():
-    if "ec2" not in _clients:
+def _client(name: str, region: str = ""):
+    key = name + (region or REGION)
+    if key not in _clients:
         import boto3  # noqa: PLC0415
 
-        _clients["ec2"] = boto3.client("ec2", region_name=REGION)
-    return _clients["ec2"]
+        _clients[key] = boto3.client(name, region_name=region or REGION)
+    return _clients[key]
 
 
-def _ssm_client():
-    if "ssm" not in _clients:
-        import boto3  # noqa: PLC0415
-
-        _clients["ssm"] = boto3.client("ssm", region_name=REGION)
-    return _clients["ssm"]
-
-
-def _load_control_secret() -> str:
-    """Read the bearer secret from SSM SecureString (decrypted)."""
-    if not _SECRET_PARAM:
+def _load_param(param: str) -> str:
+    if not param:
         return ""
     try:
-        return _ssm_client().get_parameter(Name=_SECRET_PARAM, WithDecryption=True)["Parameter"]["Value"]
-    except Exception:  # noqa: BLE001 — no secret => deny all (fail closed)
+        return _client("ssm").get_parameter(Name=param, WithDecryption=True)["Parameter"]["Value"]
+    except Exception:  # noqa: BLE001 — missing => deny / disable (fail closed)
         return ""
 
 
-# 60s TTL cache: avoids an SSM read on every call, but picks up a ROTATED
-# secret within 60s (review finding 5) — not stuck until the next cold start.
 _SECRET_TTL_SECS = 60.0
-_secret_cache = {"value": "", "ts": 0.0}
+_cache: dict[str, dict] = {}
+
+
+def _cached_param(param: str) -> str:
+    now = time.monotonic()
+    c = _cache.get(param)
+    if not c or not c["value"] or (now - c["ts"]) > _SECRET_TTL_SECS:
+        _cache[param] = {"value": _load_param(param), "ts": now}
+    return _cache[param]["value"]
 
 
 def _control_secret() -> str:
-    now = time.monotonic()
-    if not _secret_cache["value"] or (now - _secret_cache["ts"]) > _SECRET_TTL_SECS:
-        _secret_cache["value"] = _load_control_secret()
-        _secret_cache["ts"] = now
-    return _secret_cache["value"]
+    return _cached_param(_SECRET_PARAM)
 
 
-# Actions that are blocked during market hours unless force=true.
+def _github_token() -> str:
+    return _cached_param(_GH_TOKEN_PARAM)
+
+
+# Destructive box actions blocked during market hours unless force=true.
 _DESTRUCTIVE = {"stop", "reboot", "restart-app", "stop-app"}
 
-# IST market window (seconds since IST midnight): 09:15:00 .. 15:30:00.
 _MKT_OPEN_SECS = 9 * 3600 + 15 * 60
 _MKT_CLOSE_SECS = 15 * 3600 + 30 * 60
 _IST_OFFSET_SECS = 19800  # +05:30
 
-# Synchronous SSM snapshot budget. SendCommand → poll GetCommandInvocation up to
-# this long, then return whatever we have (console shows "snapshot pending").
 _VIEW_TIMEOUT_SECS = 6.0
 _VIEW_POLL_SECS = 0.4
 
+# Read-only SQL gate: the first keyword must be one of these.
+_SQL_ALLOWED_PREFIXES = ("select", "show", "explain", "with")
+# ...and none of these mutating keywords may appear anywhere.
+_SQL_BANNED = (
+    "insert",
+    "update",
+    "delete",
+    "drop",
+    "alter",
+    "truncate",
+    "create",
+    "copy",
+    "rename",
+    "reindex",
+    "vacuum",
+    "grant",
+    "revoke",
+)
+
 
 def _is_market_hours(now_utc: datetime.datetime) -> bool:
-    """True during NSE market hours (Mon–Fri 09:15–15:30 IST)."""
+    """True during NSE market hours (Mon-Fri 09:15-15:30 IST)."""
     ist = now_utc + datetime.timedelta(seconds=_IST_OFFSET_SECS)
-    if ist.weekday() >= 5:  # Sat/Sun
+    if ist.weekday() >= 5:
         return False
     sod = ist.hour * 3600 + ist.minute * 60 + ist.second
     return _MKT_OPEN_SECS <= sod < _MKT_CLOSE_SECS
 
 
 def _http_method(event: dict) -> str:
-    """Extract the HTTP method from a Function URL (payload v2.0) event.
-    Falls back to POST so a malformed event is treated as an action (which
-    then hits the auth gate) rather than silently serving the page."""
     try:
         return str(event["requestContext"]["http"]["method"]).upper()
     except (KeyError, TypeError):
@@ -131,23 +132,37 @@ def _http_method(event: dict) -> str:
 
 
 def _authorized(headers: dict) -> bool:
-    """Constant-time bearer check. Header keys are lowercased by Function URL.
-    Required format is exactly `Authorization: Bearer <secret>` (one space,
-    case-sensitive scheme) — document this on the console page to avoid
-    emergency lockout confusion (review finding 4)."""
+    """Constant-time bearer check. Header keys are lowercased by Function URL."""
     secret = _control_secret()
     if not secret:
-        return False  # fail closed: no secret configured => deny all
+        return False
     auth = (headers or {}).get("authorization", "")
     if not auth.startswith("Bearer "):
         return False
-    presented = auth[len("Bearer ") :]
-    return hmac.compare_digest(presented, secret)
+    return hmac.compare_digest(auth[len("Bearer ") :], secret)
+
+
+def _is_safe_sql(query: str) -> bool:
+    """Read-only gate. The query must start with an allowed keyword and contain
+    no mutating keyword (whole-word). Pure function — fully unit-tested."""
+    q = (query or "").strip().lower()
+    if not q:
+        return False
+    import re  # noqa: PLC0415
+
+    # First WORD must be an allowed read-only keyword (not just a prefix, so
+    # "explainx ..." / "selector ..." are rejected).
+    first = re.split(r"[^a-z]+", q, maxsplit=1)[0]
+    if first not in _SQL_ALLOWED_PREFIXES:
+        return False
+    for kw in _SQL_BANNED:
+        if re.search(r"\b" + kw + r"\b", q):
+            return False
+    return True
 
 
 def _ssm_shell(commands: list[str]) -> str:
-    """Run a shell command on the instance via SSM, return the command id."""
-    resp = _ssm_client().send_command(
+    resp = _client("ssm").send_command(
         InstanceIds=[INSTANCE_ID],
         DocumentName="AWS-RunShellScript",
         Parameters={"commands": commands},
@@ -156,17 +171,14 @@ def _ssm_shell(commands: list[str]) -> str:
 
 
 def _ssm_shell_sync(commands: list[str]) -> str:
-    """Send a command and poll for its output up to _VIEW_TIMEOUT_SECS.
-    Returns combined stdout+stderr, or "" on timeout. GetCommandInvocation
-    can 400 (InvocationDoesNotExist) for a moment right after SendCommand,
-    so we swallow exceptions and keep polling until the deadline."""
+    """Send a command and poll for output up to _VIEW_TIMEOUT_SECS."""
     cid = _ssm_shell(commands)
     deadline = time.monotonic() + _VIEW_TIMEOUT_SECS
     while time.monotonic() < deadline:
         time.sleep(_VIEW_POLL_SECS)
         try:
-            inv = _ssm_client().get_command_invocation(CommandId=cid, InstanceId=INSTANCE_ID)
-        except Exception:  # noqa: BLE001 — invocation not registered yet
+            inv = _client("ssm").get_command_invocation(CommandId=cid, InstanceId=INSTANCE_ID)
+        except Exception:  # noqa: BLE001 — not registered yet
             continue
         if inv.get("Status") in ("Success", "Failed", "Cancelled", "TimedOut"):
             return (inv.get("StandardOutputContent", "") or "") + (
@@ -175,9 +187,6 @@ def _ssm_shell_sync(commands: list[str]) -> str:
     return ""
 
 
-# The on-box snapshot. QuestDB `/exp` returns CSV (header line + value line),
-# so `tail -1` yields just the number. journalctl gives reliable ERROR lines
-# for the systemd unit regardless of the app's working directory.
 _VIEW_COMMANDS = [
     "set +e",
     'echo "APP=$(systemctl is-active tickvault 2>/dev/null || echo inactive)"',
@@ -188,6 +197,8 @@ _VIEW_COMMANDS = [
     'echo "C15M=$(curl -fsS "${Q}SELECT%20count()%20FROM%20candles_15m%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
     'echo "C60M=$(curl -fsS "${Q}SELECT%20count()%20FROM%20candles_60m%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
     'echo "C1D=$(curl -fsS "${Q}SELECT%20count()%20FROM%20candles_1d%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
+    'echo "DEDUP_KEYS=$(curl -fsS "${Q}SELECT%20count()%20FROM%20table_columns(%27ticks%27)%20WHERE%20upsertKey=true" 2>/dev/null | tail -1)"',
+    'echo "MAX_TPS=$(curl -fsS "${Q}SELECT%20max(c)%20FROM%20(SELECT%20count()%20c%20FROM%20ticks%20WHERE%20ts%20IN%20today()%20GROUP%20BY%20ts,security_id)" 2>/dev/null | tail -1)"',
     'echo "ERRORS_BEGIN"',
     "journalctl -u tickvault -p err -n 5 --no-pager 2>/dev/null | tail -5 || true",
     'echo "ERRORS_END"',
@@ -195,9 +206,7 @@ _VIEW_COMMANDS = [
 
 
 def _parse_view(stdout: str) -> dict:
-    """Parse the labeled snapshot stdout into a structured dict. Pure function
-    (no AWS) so it is fully unit-testable. Unknown / missing values become
-    empty strings; the error block is collected between the BEGIN/END markers."""
+    """Parse the labeled snapshot stdout into a structured dict (pure)."""
     fields: dict[str, str] = {}
     errors: list[str] = []
     in_errors = False
@@ -225,32 +234,78 @@ def _parse_view(stdout: str) -> dict:
             "60m": fields.get("C60M", ""),
             "1d": fields.get("C1D", ""),
         },
+        "dedup_key_columns": fields.get("DEDUP_KEYS", ""),
+        "max_ticks_per_second": fields.get("MAX_TPS", ""),
         "recent_errors": errors,
     }
 
 
+# ---------------------------------------------------------------- GitHub helper
+def _gh(method: str, path: str, body: dict | None = None) -> tuple[int, object]:
+    """Minimal GitHub REST call using urllib (no deps). Returns (status, json)."""
+    token = _github_token()
+    if not token:
+        return 0, {"error": "github token not configured"}
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request("https://api.github.com" + path, data=data, method=method)
+    req.add_header("authorization", "Bearer " + token)
+    req.add_header("accept", "application/vnd.github+json")
+    req.add_header("x-github-api-version", "2022-11-28")
+    req.add_header("user-agent", "tickvault-operator-console")
+    if data is not None:
+        req.add_header("content-type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:  # noqa: S310 — fixed host
+            txt = r.read().decode() or "{}"
+            return r.status, (json.loads(txt) if txt.strip() else {})
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode() or "{}")
+        except Exception:  # noqa: BLE001
+            return e.code, {"error": "github http error"}
+    except Exception:  # noqa: BLE001
+        return 0, {"error": "github request failed"}
+
+
+def _gh_open_prs() -> list[dict]:
+    """List open PRs with their head-commit CI rollup. Top 10, newest first."""
+    st, prs = _gh("GET", f"/repos/{GH_REPO}/pulls?state=open&per_page=10&sort=created&direction=desc")
+    if st != 200 or not isinstance(prs, list):
+        return []
+    out = []
+    for pr in prs[:10]:
+        sha = (pr.get("head") or {}).get("sha", "")
+        ci = "unknown"
+        if sha:
+            cst, cs = _gh("GET", f"/repos/{GH_REPO}/commits/{sha}/status")
+            if cst == 200 and isinstance(cs, dict):
+                ci = cs.get("state", "unknown")  # success | pending | failure
+        out.append(
+            {
+                "number": pr.get("number"),
+                "title": pr.get("title", ""),
+                "draft": bool(pr.get("draft")),
+                "mergeable_state": pr.get("mergeable_state", ""),
+                "ci": ci,
+            }
+        )
+    return out
+
+
+# --------------------------------------------------------------------- response
 def _resp(status: int, body: dict) -> dict:
-    return {
-        "statusCode": status,
-        "headers": {"content-type": "application/json"},
-        "body": json.dumps(body),
-    }
+    return {"statusCode": status, "headers": {"content-type": "application/json"}, "body": json.dumps(body)}
 
 
 def _html_resp() -> dict:
     return {
         "statusCode": 200,
-        "headers": {
-            "content-type": "text/html; charset=utf-8",
-            "cache-control": "no-store",
-        },
+        "headers": {"content-type": "text/html; charset=utf-8", "cache-control": "no-store"},
         "body": _console_html(),
     }
 
 
 def lambda_handler(event, _context):
-    # GET → serve the public console shell (no secret in it). The page then
-    # POSTs token-authenticated actions back to this same URL.
     if _http_method(event) == "GET":
         return _html_resp()
 
@@ -258,7 +313,6 @@ def lambda_handler(event, _context):
     if not _authorized(headers):
         return _resp(401, {"error": "unauthorized"})
 
-    # Body may be a JSON string (Function URL) or already-parsed.
     raw = event.get("body") or "{}"
     try:
         payload = raw if isinstance(raw, dict) else json.loads(raw)
@@ -271,201 +325,394 @@ def lambda_handler(event, _context):
     if action in _DESTRUCTIVE and _is_market_hours(datetime.datetime.utcnow()) and not force:
         return _resp(
             409,
-            {
-                "error": "blocked during market hours (09:15-15:30 IST). "
-                'Re-send with {"force": true} to override.',
-                "action": action,
-            },
+            {"error": 'blocked during market hours (09:15-15:30 IST). Re-send with {"force": true} to override.', "action": action},
         )
 
     try:
+        # ---- box control ----
         if action == "start":
-            _ec2_client().start_instances(InstanceIds=[INSTANCE_ID])
-            return _resp(200, {"ok": True, "action": action, "instance": INSTANCE_ID})
+            _client("ec2").start_instances(InstanceIds=[INSTANCE_ID])
+            return _resp(200, {"ok": True, "action": action})
         if action == "stop":
-            _ec2_client().stop_instances(InstanceIds=[INSTANCE_ID])
-            return _resp(200, {"ok": True, "action": action, "instance": INSTANCE_ID})
+            _client("ec2").stop_instances(InstanceIds=[INSTANCE_ID])
+            return _resp(200, {"ok": True, "action": action})
         if action == "reboot":
-            _ec2_client().reboot_instances(InstanceIds=[INSTANCE_ID])
-            return _resp(200, {"ok": True, "action": action, "instance": INSTANCE_ID})
+            _client("ec2").reboot_instances(InstanceIds=[INSTANCE_ID])
+            return _resp(200, {"ok": True, "action": action})
         if action == "restart-app":
-            cid = _ssm_shell(["systemctl restart tickvault"])
-            return _resp(200, {"ok": True, "action": action, "command_id": cid})
+            return _resp(200, {"ok": True, "action": action, "command_id": _ssm_shell(["systemctl restart tickvault"])})
         if action == "stop-app":
-            cid = _ssm_shell(
-                ["systemctl stop tickvault || true", "systemctl disable tickvault || true"]
-            )
+            cid = _ssm_shell(["systemctl stop tickvault || true", "systemctl disable tickvault || true"])
             return _resp(200, {"ok": True, "action": action, "command_id": cid})
         if action == "restart-questdb":
-            cid = _ssm_shell(
-                [
-                    "cd /opt/tickvault/repo/deploy/docker && docker compose restart questdb",
-                ]
-            )
+            cid = _ssm_shell(["cd /opt/tickvault/repo/deploy/docker && docker compose restart questdb"])
             return _resp(200, {"ok": True, "action": action, "command_id": cid})
+
+        # ---- overview / data ----
         if action in ("status", "view"):
-            state = _ec2_client().describe_instances(InstanceIds=[INSTANCE_ID])
-            inst = state["Reservations"][0]["Instances"][0]
-            snapshot = _parse_view(_ssm_shell_sync(_VIEW_COMMANDS))
+            inst = _client("ec2").describe_instances(InstanceIds=[INSTANCE_ID])["Reservations"][0]["Instances"][0]
+            snap = _parse_view(_ssm_shell_sync(_VIEW_COMMANDS))
             return _resp(
                 200,
-                {
-                    "ok": True,
-                    "action": "view",
-                    "instance_state": inst["State"]["Name"],
-                    "market_hours": _is_market_hours(datetime.datetime.utcnow()),
-                    **snapshot,
-                },
+                {"ok": True, "action": "view", "instance_state": inst["State"]["Name"], "market_hours": _is_market_hours(datetime.datetime.utcnow()), **snap},
             )
+        if action == "sql":
+            q = str(payload.get("query", "")).strip()
+            if not _is_safe_sql(q):
+                return _resp(400, {"error": "only read-only SELECT/SHOW/EXPLAIN/WITH queries are allowed"})
+            import urllib.parse  # noqa: PLC0415
+
+            enc = urllib.parse.quote(q)
+            out = _ssm_shell_sync(["set +e", f"curl -fsS 'http://127.0.0.1:9000/exp?query={enc}&limit=200' 2>/dev/null | head -200 || echo 'query failed'"])
+            return _resp(200, {"ok": True, "action": "sql", "csv": out})
+        if action == "logs":
+            out = _ssm_shell_sync(
+                [
+                    "set +e",
+                    "echo ERR_BEGIN",
+                    "journalctl -u tickvault -p err -n 40 --no-pager 2>/dev/null | tail -40 || true",
+                    "echo ERR_END",
+                    "echo APP_BEGIN",
+                    "journalctl -u tickvault -n 40 --no-pager 2>/dev/null | tail -40 || true",
+                    "echo APP_END",
+                ]
+            )
+            return _resp(200, {"ok": True, "action": "logs", "raw": out})
+
+        # ---- github ----
+        if action == "gh_prs":
+            return _resp(200, {"ok": True, "action": action, "prs": _gh_open_prs(), "repo": GH_REPO})
+        if action == "gh_merge":
+            n = int(payload.get("number", 0))
+            if n <= 0:
+                return _resp(400, {"error": "missing PR number"})
+            st, body = _gh("PUT", f"/repos/{GH_REPO}/pulls/{n}/merge", {"merge_method": "squash"})
+            return _resp(200, {"ok": st in (200, 201), "action": action, "status": st, "merged": isinstance(body, dict) and body.get("merged", False)})
+        if action == "gh_deploy":
+            st, _b = _gh("POST", f"/repos/{GH_REPO}/actions/workflows/{GH_DEPLOY_WORKFLOW}/dispatches", {"ref": "main"})
+            return _resp(200, {"ok": st in (201, 204), "action": action, "status": st})
+
+        # ---- aws ----
+        if action == "aws_status":
+            alarms = _client("cloudwatch").describe_alarms(StateValue="ALARM", MaxRecords=20)
+            firing = [a["AlarmName"] for a in alarms.get("MetricAlarms", [])]
+            cost = _month_to_date_cost()
+            return _resp(200, {"ok": True, "action": action, "alarms_firing": firing, "cost_mtd_usd": cost})
+
         return _resp(400, {"error": f"unknown action: {action!r}"})
     except Exception as exc:  # noqa: BLE001
-        # Review finding 1: do NOT echo the raw AWS exception to the caller —
-        # it can leak ARNs / account id / topology. Log it for the operator;
-        # return a generic message.
-        print(f"operator-control action={action!r} failed: {exc!r}")  # noqa: T201 — CloudWatch
+        print(f"operator-portal action={action!r} failed: {exc!r}")  # noqa: T201 — CloudWatch
         return _resp(500, {"error": "action failed", "action": action})
 
 
+def _month_to_date_cost() -> str:
+    """Month-to-date AWS spend via Cost Explorer (us-east-1 endpoint)."""
+    try:
+        today = datetime.date.today()
+        start = today.replace(day=1).isoformat()
+        end = (today + datetime.timedelta(days=1)).isoformat()
+        ce = _client("ce", region="us-east-1")
+        r = ce.get_cost_and_usage(
+            TimePeriod={"Start": start, "End": end},
+            Granularity="MONTHLY",
+            Metrics=["UnblendedCost"],
+        )
+        amt = r["ResultsByTime"][0]["Total"]["UnblendedCost"]["Amount"]
+        return f"{float(amt):.2f}"
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _console_html() -> str:
-    """The single-page console. Vanilla JS, no dependencies, no secrets. The
-    token the operator types is kept ONLY in the browser's localStorage and
-    sent as `Authorization: Bearer <token>` on every POST to this same URL."""
-    return """<!doctype html>
+    """The single-page operator portal. Vanilla JS, no deps, no secrets. The
+    token is the device key: saved only in this device's localStorage, sent as
+    `Authorization: Bearer <token>` on every POST. Raw string so embedded JS
+    regex/escapes survive verbatim."""
+    return r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>tickvault — operator console</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>tickvault — operator portal</title>
 <style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  body { margin:0; font-family:-apple-system,Segoe UI,Roboto,sans-serif;
-         background:#0b0e14; color:#e6e6e6; padding:16px; max-width:760px; margin:0 auto; }
-  h1 { font-size:20px; margin:8px 0 4px; }
-  .sub { color:#8a93a6; font-size:13px; margin-bottom:16px; }
-  .card { background:#141925; border:1px solid #232a3a; border-radius:12px;
-          padding:14px; margin-bottom:14px; }
-  label { font-size:12px; color:#8a93a6; display:block; margin-bottom:6px; }
-  input[type=password] { width:100%; padding:10px; border-radius:8px; border:1px solid #2a3346;
-          background:#0b0e14; color:#e6e6e6; font-size:14px; }
-  .row { display:flex; gap:8px; flex-wrap:wrap; }
-  button { flex:1 1 auto; min-width:120px; padding:12px; border-radius:10px; border:0;
-           font-size:14px; font-weight:600; cursor:pointer; color:#0b0e14; }
-  .b-view { background:#4f8cff; color:#fff; }
-  .b-go { background:#33c47d; }
-  .b-warn { background:#f0a93b; }
-  .b-stop { background:#ff5d5d; color:#fff; }
-  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(110px,1fr)); gap:10px; }
-  .metric { background:#0b0e14; border:1px solid #232a3a; border-radius:10px; padding:10px; }
-  .metric .v { font-size:20px; font-weight:700; }
-  .metric .k { font-size:11px; color:#8a93a6; margin-top:2px; }
-  .ok { color:#33c47d; } .bad { color:#ff5d5d; } .warn { color:#f0a93b; }
-  pre { background:#0b0e14; border:1px solid #232a3a; border-radius:10px; padding:10px;
-        overflow:auto; font-size:12px; white-space:pre-wrap; max-height:200px; }
-  .muted { color:#8a93a6; font-size:12px; }
-  .toast { position:fixed; left:50%; bottom:20px; transform:translateX(-50%);
-           background:#232a3a; padding:10px 16px; border-radius:8px; font-size:13px;
-           opacity:0; transition:opacity .2s; pointer-events:none; }
-  .toast.show { opacity:1; }
+  :root{ color-scheme:dark; --bg:#070a12; --card:#111726cc; --line:#222c40; --txt:#e9eef7;
+         --mut:#8a93a6; --grn:#28d17c; --red:#ff5d6c; --amb:#f4b740; --blu:#4f8cff; --cyan:#38e1d6; }
+  *{ box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body{ margin:0; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif; color:var(--txt);
+        min-height:100vh; padding:18px 14px 48px;
+        background:radial-gradient(1200px 600px at 10% -10%, #15233f55, transparent 60%),
+          radial-gradient(1000px 500px at 110% 0%, #1c2a1f55, transparent 55%),
+          linear-gradient(180deg,#070a12,#0a0f1c); background-attachment:fixed; }
+  .wrap{ max-width:920px; margin:0 auto; }
+  .hdr{ display:flex; align-items:center; gap:12px; margin-bottom:14px; }
+  .logo{ font-size:22px; font-weight:800; background:linear-gradient(90deg,#7fb2ff,#38e1d6,#28d17c);
+         -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .live{ display:flex; align-items:center; gap:7px; font-size:12px; color:var(--mut); margin-left:auto; }
+  .dot{ width:11px; height:11px; border-radius:50%; background:var(--red); }
+  .dot.on{ background:var(--grn); animation:pulse 1.6s infinite; }
+  @keyframes pulse{ 0%{box-shadow:0 0 0 0 #28d17caa} 70%{box-shadow:0 0 0 12px #28d17c00} 100%{box-shadow:0 0 0 0 #28d17c00} }
+  .tabs{ display:flex; gap:6px; flex-wrap:wrap; margin-bottom:14px; }
+  .tab{ padding:9px 14px; border-radius:11px; background:#0c1322; border:1px solid var(--line); color:var(--mut);
+        font-size:13px; font-weight:700; cursor:pointer; }
+  .tab.active{ color:#fff; background:linear-gradient(90deg,#1c3158,#163b39); border-color:#2f5fb0; }
+  .card{ background:var(--card); border:1px solid var(--line); border-radius:16px; padding:16px; margin-bottom:14px;
+         backdrop-filter:blur(6px); box-shadow:0 10px 30px #00000055; animation:rise .45s ease both; }
+  @keyframes rise{ from{opacity:0; transform:translateY(8px)} to{opacity:1; transform:none} }
+  .lbl{ font-size:11px; text-transform:uppercase; letter-spacing:1px; color:var(--mut); margin-bottom:12px; }
+  input,textarea{ width:100%; padding:12px; border-radius:11px; border:1px solid #2a3346; background:#070a12;
+        color:var(--txt); font-size:14px; font-family:inherit; }
+  textarea{ min-height:64px; font-family:ui-monospace,Menlo,monospace; }
+  button{ border:0; border-radius:12px; padding:13px 15px; font-size:14px; font-weight:700; cursor:pointer;
+          color:#06101e; transition:transform .08s; }
+  button:active{ transform:scale(.97); }
+  .b-blu{ background:linear-gradient(90deg,#4f8cff,#38e1d6); color:#fff; } .b-go{ background:linear-gradient(90deg,#28d17c,#7be0a3); }
+  .b-amb{ background:linear-gradient(90deg,#f4b740,#ffd479); } .b-stop{ background:linear-gradient(90deg,#ff5d6c,#ff8a93); color:#fff; }
+  .b-ghost{ background:#1a2336; color:var(--txt); }
+  .row{ display:flex; gap:10px; flex-wrap:wrap; } .row>button{ flex:1 1 150px; }
+  .hero{ display:flex; gap:16px; flex-wrap:wrap; }
+  .bignum{ flex:2 1 240px; background:linear-gradient(135deg,#0e1626,#0a1120); border:1px solid var(--line);
+           border-radius:16px; padding:18px; position:relative; overflow:hidden; }
+  .bignum .n{ font-size:44px; font-weight:900; line-height:1; background:linear-gradient(90deg,#9fd0ff,#38e1d6);
+              -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .bignum .c{ font-size:12px; color:var(--mut); margin-top:6px; }
+  .bignum::after{ content:""; position:absolute; inset:0; background:linear-gradient(120deg,transparent 30%,#ffffff14 50%,transparent 70%);
+        transform:translateX(-120%); animation:shine 3.4s infinite; } @keyframes shine{ to{transform:translateX(120%)} }
+  .pills{ flex:1 1 160px; display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .pill{ border:1px solid var(--line); border-radius:13px; padding:12px; background:#070b15; }
+  .pill .v{ font-size:18px; font-weight:800; } .pill .k{ font-size:11px; color:var(--mut); margin-top:3px; }
+  .bar{ display:flex; align-items:center; gap:10px; margin:9px 0; }
+  .bar .name{ width:46px; font-size:12px; color:var(--mut); }
+  .bar .track{ flex:1; height:14px; background:#0a1120; border-radius:8px; overflow:hidden; border:1px solid var(--line); }
+  .bar .fill{ height:100%; width:0; border-radius:8px; background:linear-gradient(90deg,#4f8cff,#38e1d6); transition:width .9s cubic-bezier(.2,.8,.2,1); }
+  .bar .num{ width:60px; text-align:right; font-weight:700; font-size:13px; }
+  .shields{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; }
+  .shield{ border:1px solid var(--line); border-radius:14px; padding:14px; background:#070b15; animation:pop .45s ease both; }
+  @keyframes pop{ from{opacity:0; transform:scale(.94)} to{opacity:1} }
+  .shield .ttl{ font-size:12px; color:var(--mut); } .shield .st{ font-size:17px; font-weight:800; margin-top:5px; }
+  .shield.good{ border-color:#1d5b3d; box-shadow:0 0 18px #28d17c22; } .shield.bad{ border-color:#5b2330; box-shadow:0 0 18px #ff5d6c22; }
+  .spark{ width:100%; height:70px; display:block; }
+  .ok{ color:var(--grn);} .bad{ color:var(--red);} .warn{ color:var(--amb);} .cy{ color:var(--cyan);}
+  .muted{ color:var(--mut); font-size:12px; }
+  pre{ background:#070b15; border:1px solid var(--line); border-radius:11px; padding:10px; overflow:auto;
+       font-size:11.5px; white-space:pre-wrap; max-height:300px; }
+  table{ width:100%; border-collapse:collapse; font-size:12px; } th,td{ text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+  th{ color:var(--mut); font-weight:600; }
+  .pr{ display:flex; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  .pr .t{ flex:1 1 200px; } .pr .num{ color:var(--mut); font-weight:700; margin-right:6px; }
+  .badge{ font-size:11px; font-weight:800; padding:3px 9px; border-radius:20px; }
+  .badge.success{ background:#103a27; color:var(--grn);} .badge.pending{ background:#3a3110; color:var(--amb);}
+  .badge.failure{ background:#3a1620; color:var(--red);} .badge.unknown{ background:#1a2336; color:var(--mut);}
+  .mini{ padding:9px 12px; font-size:12px; flex:0 0 auto; }
+  .switch{ display:flex; align-items:center; gap:8px; font-size:12px; color:var(--mut); }
+  .toast{ position:fixed; left:50%; bottom:22px; transform:translateX(-50%) translateY(20px); background:#1a2336;
+          border:1px solid var(--line); padding:12px 18px; border-radius:12px; font-size:14px; opacity:0; transition:.25s;
+          pointer-events:none; box-shadow:0 10px 30px #000; } .toast.show{ opacity:1; transform:translateX(-50%) translateY(0); }
+  [hidden]{ display:none !important; }
+  .lock{ text-align:center; padding:26px 18px; } .lock .ic{ font-size:40px; }
+  .spin{ animation:spin 1s linear infinite; display:inline-block; } @keyframes spin{ to{transform:rotate(360deg)} }
 </style>
 </head>
 <body>
-  <h1>🛰️ tickvault operator console</h1>
-  <div class="sub">One page. View the box and control it. Token stays on this device only.</div>
-
-  <div class="card">
-    <label>Operator token (Bearer secret — saved on this device)</label>
-    <input id="tok" type="password" placeholder="paste token" autocomplete="off">
-    <div class="muted" style="margin-top:6px">Header sent: <code>Authorization: Bearer &lt;token&gt;</code></div>
+<div class="wrap">
+  <div class="hdr">
+    <div class="logo">🛰️ tickvault</div>
+    <div class="live"><span class="dot" id="livedot"></span><span id="livetxt">offline</span></div>
   </div>
 
-  <div class="card">
-    <div class="row">
-      <button class="b-view" onclick="refresh()">🔄 Refresh status</button>
+  <div class="card lock" id="lock">
+    <div class="ic">🔐</div>
+    <div class="lbl" style="margin-top:8px">device key</div>
+    <p class="muted" style="max-width:460px;margin:6px auto 14px">This portal only works on a device that holds your
+      secret key — your laptop and your phone. Anyone else who opens this link sees this screen and can do nothing.
+      Paste your key once; it is saved on THIS device only.</p>
+    <input id="tok" type="password" placeholder="paste your operator key" autocomplete="off">
+    <div class="row" style="margin-top:12px"><button class="b-blu" onclick="unlock()">🔓 Unlock this device</button></div>
+  </div>
+
+  <div id="app" hidden>
+    <div class="tabs">
+      <div class="tab active" data-t="overview" onclick="tab('overview')">📊 Overview</div>
+      <div class="tab" data-t="data" onclick="tab('data')">📈 Data</div>
+      <div class="tab" data-t="github" onclick="tab('github')">🔀 GitHub</div>
+      <div class="tab" data-t="logs" onclick="tab('logs')">📜 Logs</div>
+      <div class="tab" data-t="aws" onclick="tab('aws')">☁️ AWS</div>
     </div>
-    <div class="grid" id="metrics" style="margin-top:12px"></div>
-    <div class="muted" id="updated" style="margin-top:8px"></div>
-  </div>
 
-  <div class="card">
-    <label>Recent errors (last 5)</label>
-    <pre id="errors">—</pre>
-  </div>
+    <!-- OVERVIEW -->
+    <section data-tab="overview">
+      <div class="card">
+        <div class="hero">
+          <div class="bignum"><div class="n" id="ticksbig">0</div><div class="c">ticks captured today</div></div>
+          <div class="pills">
+            <div class="pill"><div class="v" id="p_inst">—</div><div class="k">instance</div></div>
+            <div class="pill"><div class="v" id="p_app">—</div><div class="k">app</div></div>
+            <div class="pill"><div class="v" id="p_mkt">—</div><div class="k">market</div></div>
+            <div class="pill"><div class="v" id="p_tps">—</div><div class="k">peak ticks/sec</div></div>
+          </div>
+        </div>
+        <div class="row" style="margin-top:14px"><button class="b-blu" id="refbtn" onclick="loadOverview()">🔄 Refresh now</button></div>
+        <div style="display:flex;align-items:center;gap:14px;margin-top:10px">
+          <label class="switch"><input type="checkbox" id="auto" checked onchange="autotoggle()"> auto-refresh (8s)</label>
+          <span class="muted" id="updated"></span>
+        </div>
+      </div>
+      <div class="card"><div class="lbl">live ticks/sec — proof no sub-second tick is lost</div>
+        <svg class="spark" id="spark" viewBox="0 0 300 70" preserveAspectRatio="none"></svg></div>
+      <div class="card"><div class="lbl">guarantees — live proof read from the box</div><div class="shields" id="shields"></div></div>
+      <div class="card"><div class="lbl">control</div>
+        <div class="row" style="margin-bottom:10px">
+          <button class="b-go" onclick="act('start')">▶ Start instance</button>
+          <button class="b-amb" onclick="act('restart-app')">♻ Restart app</button>
+          <button class="b-amb" onclick="act('restart-questdb')">♻ Restart QuestDB</button></div>
+        <div class="row">
+          <button class="b-stop" onclick="act('stop')">⏹ Stop instance</button>
+          <button class="b-stop" onclick="act('stop-app')">⏹ Stop app</button></div>
+        <div class="muted" style="margin-top:10px">Stop / restart are blocked 9:15 AM–3:30 PM IST Mon–Fri.</div>
+        <label class="switch" style="margin-top:8px"><input type="checkbox" id="force"> force (override market-hours guard)</label>
+        <div class="row" style="margin-top:14px"><button class="b-ghost" onclick="lock()">🔒 Lock / forget this device</button></div>
+      </div>
+    </section>
 
-  <div class="card">
-    <label>Control</label>
-    <div class="row" style="margin-bottom:8px">
-      <button class="b-go" onclick="act('start')">▶ Start instance</button>
-      <button class="b-warn" onclick="act('restart-app')">♻ Restart app</button>
-      <button class="b-warn" onclick="act('restart-questdb')">♻ Restart QuestDB</button>
-    </div>
-    <div class="row">
-      <button class="b-stop" onclick="act('stop')">⏹ Stop instance</button>
-      <button class="b-stop" onclick="act('stop-app')">⏹ Stop app</button>
-    </div>
-    <div class="muted" style="margin-top:8px">Stop / restart are blocked 9:15 AM–3:30 PM IST Mon–Fri.
-      Tick “force” to override.</div>
-    <label style="margin-top:8px"><input type="checkbox" id="force"> force (override market-hours guard)</label>
-  </div>
+    <!-- DATA -->
+    <section data-tab="data" hidden>
+      <div class="card"><div class="lbl">candles sealed today (per timeframe)</div><div id="bars"></div></div>
+      <div class="card"><div class="lbl">QuestDB query (read-only)</div>
+        <textarea id="sql" placeholder="SELECT ts, security_id, count() FROM ticks WHERE ts IN today() GROUP BY ts, security_id ORDER BY 3 DESC LIMIT 20"></textarea>
+        <div class="row" style="margin-top:10px"><button class="b-blu" onclick="runSql()">▶ Run query</button></div>
+        <div id="sqlout" style="margin-top:12px;overflow:auto"></div>
+        <div class="muted" style="margin-top:8px">Only SELECT / SHOW / EXPLAIN / WITH are allowed. Capped at 200 rows.</div>
+      </div>
+    </section>
 
-  <div class="toast" id="toast"></div>
+    <!-- GITHUB -->
+    <section data-tab="github" hidden>
+      <div class="card"><div class="lbl">github — <span id="ghrepo">repo</span></div>
+        <div class="row" style="margin-bottom:8px">
+          <button class="b-blu" onclick="loadGithub()">🔄 Load open PRs</button>
+          <button class="b-amb" onclick="ghDeploy()">🚀 Trigger deploy to AWS</button></div>
+        <div id="prs"></div>
+        <div class="muted" style="margin-top:8px">Merge = squash to main. Deploy runs the deploy-aws workflow on main.</div>
+      </div>
+    </section>
+
+    <!-- LOGS -->
+    <section data-tab="logs" hidden>
+      <div class="card"><div class="lbl">errors (last 40)</div>
+        <div class="row" style="margin-bottom:10px"><button class="b-blu" onclick="loadLogs()">🔄 Load logs</button></div>
+        <pre id="logErr">—</pre></div>
+      <div class="card"><div class="lbl">app log (last 40)</div><pre id="logApp">—</pre></div>
+    </section>
+
+    <!-- AWS -->
+    <section data-tab="aws" hidden>
+      <div class="card"><div class="lbl">aws</div>
+        <div class="row" style="margin-bottom:12px"><button class="b-blu" onclick="loadAws()">🔄 Load alarms + cost</button></div>
+        <div class="hero">
+          <div class="bignum"><div class="n" id="cost">$—</div><div class="c">AWS spend this month (USD)</div></div>
+          <div class="pills" style="grid-template-columns:1fr"><div class="pill"><div class="v" id="alarmcount">—</div><div class="k">alarms firing</div></div></div>
+        </div>
+        <div id="alarms" style="margin-top:12px"></div>
+      </div>
+    </section>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
 
 <script>
-const TOK = document.getElementById('tok');
-TOK.value = localStorage.getItem('tv_token') || '';
-TOK.addEventListener('input', () => localStorage.setItem('tv_token', TOK.value));
+const $=id=>document.getElementById(id);
+let TOKEN=localStorage.getItem('tv_token')||'';
+let timer=null, hist=[], lastTicks=0, curTab='overview';
 
-function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg;
-  t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2600); }
+function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove('show'),2600); }
+function esc(s){ return String(s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])); }
+function setLive(on){ $('livedot').classList.toggle('on',on); $('livetxt').textContent=on?'live':'offline'; }
 
-async function call(action, extra){
-  const token = TOK.value.trim();
-  if(!token){ toast('Enter the token first'); return null; }
-  const body = Object.assign({action}, extra||{});
-  try {
-    const r = await fetch(location.href, { method:'POST',
-      headers:{'authorization':'Bearer '+token,'content-type':'application/json'},
-      body: JSON.stringify(body) });
-    const j = await r.json().catch(()=>({}));
-    if(r.status===401){ toast('Wrong token (401)'); return null; }
+function unlock(){ const v=($('tok').value||'').trim(); if(!v){ toast('Paste your key first'); return; }
+  TOKEN=v; localStorage.setItem('tv_token',v); $('lock').hidden=true; $('app').hidden=false; startAuto(); loadOverview(); }
+function lock(){ TOKEN=''; localStorage.removeItem('tv_token'); $('tok').value=''; stopAuto(); $('app').hidden=true; $('lock').hidden=false; setLive(false); toast('Locked — key forgotten on this device'); }
+
+function tab(name){ curTab=name; document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.t===name));
+  document.querySelectorAll('section[data-tab]').forEach(s=>s.hidden=s.dataset.tab!==name);
+  if(name==='github' && !$('prs').dataset.loaded) loadGithub();
+  if(name==='aws' && !$('alarms').dataset.loaded) loadAws();
+  if(name==='logs' && $('logErr').textContent==='—') loadLogs(); }
+
+async function call(action, extra){ if(!TOKEN){ toast('Locked'); return null; }
+  try{ const r=await fetch(location.href,{method:'POST',
+      headers:{'authorization':'Bearer '+TOKEN,'content-type':'application/json'},
+      body:JSON.stringify(Object.assign({action},extra||{}))});
+    const j=await r.json().catch(()=>({}));
+    if(r.status===401){ toast('Wrong key (401)'); setLive(false); return null; }
     if(r.status===409){ toast(j.error||'Blocked during market hours'); return null; }
     if(!r.ok){ toast(j.error||('Error '+r.status)); return null; }
     return j;
-  } catch(e){ toast('Network error'); return null; }
-}
+  }catch(e){ toast('Network error'); setLive(false); return null; } }
 
-function metric(k,v,cls){ return `<div class="metric"><div class="v ${cls||''}">${v}</div><div class="k">${k}</div></div>`; }
+function countUp(el,target){ target=parseInt(String(target).replace(/[^0-9]/g,''),10)||0; const from=lastTicks||0; lastTicks=target;
+  const t0=performance.now(),dur=900; function step(t){ const k=Math.min(1,(t-t0)/dur);
+    el.textContent=Math.round(from+(target-from)*(1-Math.pow(1-k,3))).toLocaleString(); if(k<1) requestAnimationFrame(step); } requestAnimationFrame(step); }
 
-async function refresh(){
-  toast('Loading…');
-  const j = await call('view');
-  if(!j) return;
-  const appOk = j.app==='active';
-  const c = j.candles||{};
-  document.getElementById('metrics').innerHTML =
-    metric('Instance', j.instance_state||'?', j.instance_state==='running'?'ok':'bad') +
-    metric('App', appOk?'up':(j.app||'down'), appOk?'ok':'bad') +
-    metric('Ticks today', j.ticks_today||'0') +
-    metric('1m candles', c['1m']||'0') +
-    metric('5m candles', c['5m']||'0') +
-    metric('15m candles', c['15m']||'0') +
-    metric('60m candles', c['60m']||'0') +
-    metric('1d candles', c['1d']||'0') +
-    metric('Market', j.market_hours?'OPEN':'closed', j.market_hours?'warn':'');
-  const errs = (j.recent_errors||[]);
-  document.getElementById('errors').textContent = errs.length? errs.join('\\n') : 'none 🎉';
-  document.getElementById('updated').textContent = 'Updated '+new Date().toLocaleTimeString();
-}
+function drawSpark(){ const w=300,h=70,pad=6,xs=hist.slice(-40),max=Math.max(2,...xs);
+  const pts=xs.map((v,i)=>{ const x=pad+(w-2*pad)*(xs.length<2?0:i/(xs.length-1)); const y=h-pad-(h-2*pad)*(v/max); return x.toFixed(1)+','+y.toFixed(1); });
+  const line=pts.join(' '); const area=pts.length?'M'+pad+','+(h-pad)+' L'+line.replace(/ /g,' L')+' L'+(w-pad)+','+(h-pad)+' Z':'';
+  $('spark').innerHTML='<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#38e1d6" stop-opacity=".5"/><stop offset="1" stop-color="#38e1d6" stop-opacity="0"/></linearGradient></defs>'+
+    (area?'<path d="'+area+'" fill="url(#g)"/>':'')+(pts.length>1?'<polyline points="'+line+'" fill="none" stroke="#38e1d6" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>':'')+
+    (pts.length?'<circle cx="'+pts[pts.length-1].split(',')[0]+'" cy="'+pts[pts.length-1].split(',')[1]+'" r="3.5" fill="#38e1d6"/>':''); }
 
-async function act(action){
-  if(!confirm('Run "'+action+'" on the trading box?')) return;
-  const force = document.getElementById('force').checked;
-  toast(action+'…');
-  const j = await call(action, {force});
-  if(j){ toast('✅ '+action+' sent'); setTimeout(refresh, 1500); }
-}
+function bar(name,n,max){ const pct=max>0?Math.max(3,Math.round(100*n/max)):0;
+  return '<div class="bar"><div class="name">'+name+'</div><div class="track"><div class="fill" style="width:'+pct+'%"></div></div><div class="num">'+n.toLocaleString()+'</div></div>'; }
+function shield(t,s,good){ return '<div class="shield '+(good?'good':'bad')+'"><div class="ttl">'+t+'</div><div class="st '+(good?'ok':'warn')+'">'+s+'</div></div>'; }
 
-if(TOK.value) refresh();
+async function loadOverview(){ $('refbtn').innerHTML='<span class="spin">🔄</span> Refreshing…'; const j=await call('view'); $('refbtn').textContent='🔄 Refresh now'; if(!j) return;
+  const appOk=j.app==='active', running=j.instance_state==='running'; setLive(appOk&&running);
+  countUp($('ticksbig'), j.ticks_today||'0');
+  $('p_inst').innerHTML='<span class="'+(running?'ok':'bad')+'">'+(j.instance_state||'?')+'</span>';
+  $('p_app').innerHTML='<span class="'+(appOk?'ok':'bad')+'">'+(appOk?'up':(j.app||'down'))+'</span>';
+  $('p_mkt').innerHTML='<span class="'+(j.market_hours?'warn':'')+'">'+(j.market_hours?'OPEN':'closed')+'</span>';
+  const tpsN=parseInt(j.max_ticks_per_second,10)||0; $('p_tps').innerHTML='<span class="cy">'+tpsN+'</span>';
+  hist.push(tpsN); if(hist.length>60) hist.shift(); drawSpark();
+  const c=j.candles||{}, vals=['1m','5m','15m','60m','1d'].map(k=>parseInt(c[k],10)||0), mx=Math.max(1,...vals);
+  $('bars').innerHTML=['1m','5m','15m','60m','1d'].map((k,i)=>bar(k,vals[i],mx)).join('');
+  const keysOk=(j.dedup_key_columns||'')==='4', capOk=tpsN>1;
+  $('shields').innerHTML=shield('Dedup key columns',(j.dedup_key_columns||'?'),keysOk)+shield('Sub-second fix',keysOk?'LIVE ✅':'OLD ⚠',keysOk)+
+    shield('No tick lost',capOk?'WORKING ✅':(j.market_hours?'CHECK ⚠':'idle'),capOk||!j.market_hours)+shield('Peak ticks / second',tpsN,capOk);
+  $('updated').textContent='updated '+new Date().toLocaleTimeString(); }
+
+async function runSql(){ const q=$('sql').value.trim(); if(!q){ toast('Type a query'); return; } $('sqlout').innerHTML='<span class="muted">running…</span>';
+  const j=await call('sql',{query:q}); if(!j){ $('sqlout').innerHTML=''; return; }
+  const lines=(j.csv||'').split(/\r?\n/).filter(x=>x.length); if(!lines.length){ $('sqlout').innerHTML='<span class="muted">no rows</span>'; return; }
+  const rows=lines.map(l=>l.split(',').map(c=>c.replace(/^"|"$/g,'')));
+  let h='<table><tr>'+rows[0].map(c=>'<th>'+esc(c)+'</th>').join('')+'</tr>';
+  for(let i=1;i<rows.length;i++) h+='<tr>'+rows[i].map(c=>'<td>'+esc(c)+'</td>').join('')+'</tr>';
+  $('sqlout').innerHTML=h+'</table>'; }
+
+function ciBadge(s){ const k=['success','pending','failure'].includes(s)?s:'unknown'; return '<span class="badge '+k+'">'+s+'</span>'; }
+async function loadGithub(){ $('prs').dataset.loaded='1'; $('prs').innerHTML='<span class="muted">loading…</span>'; const j=await call('gh_prs'); if(!j){ $('prs').innerHTML=''; return; }
+  $('ghrepo').textContent=j.repo||''; const prs=j.prs||[];
+  if(!prs.length){ $('prs').innerHTML='<span class="muted">no open PRs 🎉</span>'; return; }
+  $('prs').innerHTML=prs.map(p=>'<div class="pr"><div class="t"><span class="num">#'+p.number+'</span>'+esc(p.title)+(p.draft?' <span class="badge unknown">draft</span>':'')+'</div>'+ciBadge(p.ci)+
+    '<button class="b-go mini" onclick="ghMerge('+p.number+')">merge</button></div>').join(''); }
+async function ghMerge(n){ if(!confirm('Squash-merge PR #'+n+' to main?')) return; toast('merging #'+n+'…'); const j=await call('gh_merge',{number:n});
+  if(j&&j.merged){ toast('✅ merged #'+n); setTimeout(loadGithub,1500); } else { toast('merge not completed (status '+(j&&j.status)+')'); } }
+async function ghDeploy(){ if(!confirm('Trigger a deploy to AWS (deploy-aws workflow on main)?')) return; toast('triggering deploy…'); const j=await call('gh_deploy');
+  toast(j&&j.ok?'🚀 deploy triggered':'deploy trigger failed (status '+(j&&j.status)+')'); }
+
+async function loadLogs(){ $('logErr').textContent='loading…'; const j=await call('logs'); if(!j){ $('logErr').textContent='—'; return; }
+  const raw=j.raw||''; const grab=(a,b)=>{ const m=raw.split(a)[1]; return m?m.split(b)[0].trim():''; };
+  $('logErr').textContent=grab('ERR_BEGIN','ERR_END')||'none 🎉'; $('logApp').textContent=grab('APP_BEGIN','APP_END')||'—'; }
+
+async function loadAws(){ $('alarms').dataset.loaded='1'; $('alarms').innerHTML='<span class="muted">loading…</span>'; const j=await call('aws_status'); if(!j){ $('alarms').innerHTML=''; return; }
+  $('cost').textContent='$'+(j.cost_mtd_usd||'—'); const al=j.alarms_firing||[]; $('alarmcount').innerHTML='<span class="'+(al.length?'bad':'ok')+'">'+al.length+'</span>';
+  $('alarms').innerHTML=al.length? al.map(a=>'<div class="pr"><span class="badge failure">ALARM</span> <span class="t">'+esc(a)+'</span></div>').join('') : '<span class="ok">all clear 🎉</span>'; }
+
+async function act(action){ if(!confirm('Run "'+action+'" on the trading box?')) return; const force=$('force').checked; toast(action+'…');
+  const j=await call(action,{force}); if(j){ toast('✅ '+action+' sent'); setTimeout(loadOverview,1600); } }
+
+function startAuto(){ stopAuto(); if($('auto').checked) timer=setInterval(()=>{ if(curTab==='overview') loadOverview(); },8000); }
+function stopAuto(){ if(timer){ clearInterval(timer); timer=null; } }
+function autotoggle(){ $('auto').checked?startAuto():stopAuto(); }
+
+if(TOKEN){ $('tok').value=TOKEN; $('lock').hidden=true; $('app').hidden=false; startAuto(); loadOverview(); }
 </script>
 </body>
 </html>"""

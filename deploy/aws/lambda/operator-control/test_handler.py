@@ -87,6 +87,8 @@ class ParseView(unittest.TestCase):
             "C15M=25\n"
             "C60M=6\n"
             "C1D=4\n"
+            "DEDUP_KEYS=4\n"
+            "MAX_TPS=5\n"
             "ERRORS_BEGIN\n"
             "Jun 01 11:00 tickvault: WARN something\n"
             "ERRORS_END\n"
@@ -96,12 +98,16 @@ class ParseView(unittest.TestCase):
         self.assertEqual(out["ticks_today"], "152340")
         self.assertEqual(out["candles"]["1m"], "372")
         self.assertEqual(out["candles"]["1d"], "4")
+        self.assertEqual(out["dedup_key_columns"], "4")
+        self.assertEqual(out["max_ticks_per_second"], "5")
         self.assertEqual(len(out["recent_errors"]), 1)
         self.assertIn("WARN something", out["recent_errors"][0])
 
     def test_empty_stdout_yields_blank_fields(self) -> None:
         out = handler._parse_view("")
         self.assertEqual(out["app"], "")
+        self.assertEqual(out["dedup_key_columns"], "")
+        self.assertEqual(out["max_ticks_per_second"], "")
         self.assertEqual(out["recent_errors"], [])
 
     def test_no_error_lines_between_markers(self) -> None:
@@ -116,13 +122,43 @@ class GetServesPublicHtml(unittest.TestCase):
         resp = handler.lambda_handler(ev, None)
         self.assertEqual(resp["statusCode"], 200)
         self.assertIn("text/html", resp["headers"]["content-type"])
-        self.assertIn("operator console", resp["body"])
+        self.assertIn("operator portal", resp["body"])
 
     def test_html_contains_no_secret(self) -> None:
         # The page is a static shell — it must NOT embed any token/secret.
         html = handler._console_html()
         self.assertNotIn("Bearer s3cret", html)
         self.assertIn("localStorage", html)  # token kept client-side only
+
+    def test_html_has_all_tabs(self) -> None:
+        html = handler._console_html()
+        for t in ("overview", "data", "github", "logs", "aws"):
+            self.assertIn('data-t="' + t + '"', html)
+
+
+class SafeSql(unittest.TestCase):
+    def test_select_is_allowed(self) -> None:
+        self.assertTrue(handler._is_safe_sql("SELECT count() FROM ticks"))
+        self.assertTrue(handler._is_safe_sql("  with x as (select 1) select * from x"))
+        self.assertTrue(handler._is_safe_sql("SHOW COLUMNS FROM ticks"))
+
+    def test_mutations_are_rejected(self) -> None:
+        for q in (
+            "DROP TABLE ticks",
+            "delete from ticks",
+            "insert into ticks values (1)",
+            "update ticks set x=1",
+            "truncate table ticks",
+            "alter table ticks add column z int",
+            "select 1; drop table ticks",  # banned keyword anywhere
+        ):
+            self.assertFalse(handler._is_safe_sql(q), q)
+
+    def test_empty_or_non_read_is_rejected(self) -> None:
+        self.assertFalse(handler._is_safe_sql(""))
+        self.assertFalse(handler._is_safe_sql("   "))
+        self.assertFalse(handler._is_safe_sql("explainx select 1"))  # not a prefix word? still starts with 'explain'
+        self.assertFalse(handler._is_safe_sql("vacuum"))
 
 
 class PostRequiresAuth(unittest.TestCase):
