@@ -194,7 +194,14 @@ pre-open auction 09:00–09:08 finalizes) is the day's open. Every sealed candle
 day_open_0915 × 100` (2-dp, f64). Sibling of the existing seal-time
 prev-day pct-stamping (`close_pct_from_prev_day`). div-by-zero → 0.0.
 
-- [ ] 8a. Add `open_pct` (DOUBLE) to every `candles_*_shadow` table DDL +
+**ANCHOR = Option 2 (operator 2026-06-01):** the official 09:15 open = the
+exchange `day_open` field carried in every Quote packet (bytes 34-37 = NSE
+pre-open auction result). No deleted module needed — captured live on
+`LiveCandleState.session_open` (last-non-zero-wins, mirrors `prev_day_close`).
+RAM: `LiveCandleState` budget bumped 96→112 B (+84 KB total, negligible).
+STATUS: DONE — PR3 (trading candles 1257 green, storage 492 green, app builds).
+
+- [x] 8a. Add `open_pct` (DOUBLE) to every `candles_*_shadow` table DDL +
   `ALTER ADD COLUMN IF NOT EXISTS` self-heal. Files:
   `crates/storage/src/shadow_persistence.rs` (+ `candle_persistence.rs` if it
   writes live candles). DEDUP key UNCHANGED `(ts, security_id, segment)`.

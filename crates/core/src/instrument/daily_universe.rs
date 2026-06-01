@@ -144,11 +144,24 @@ impl DailyUniverse {
                 continue;
             }
             // GIFT Nifty row found — resolve sid + numeric segment code.
+            // Rule 11 (no silent false-OK): if a found GIFT row can't resolve,
+            // the exemption is silently empty → GIFT ticks wrongly dropped
+            // outside 09:15–15:30. Surface it loudly instead.
             let Ok(sid) = t.csv_row.security_id.trim().parse::<u32>() else {
+                tracing::warn!(
+                    security_id = %t.csv_row.security_id,
+                    "always-on: GIFT Nifty row found but security_id did not parse as u32 — \
+                     market-hours exemption will be EMPTY for GIFT this session"
+                );
                 continue;
             };
             let Some(code) = tickvault_common::segment::segment_str_to_code(&t.csv_row.segment)
             else {
+                tracing::warn!(
+                    sid,
+                    segment = %t.csv_row.segment,
+                    "always-on: GIFT Nifty segment unrecognised — exemption EMPTY for GIFT"
+                );
                 continue;
             };
             set.insert((sid, code));

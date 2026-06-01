@@ -92,6 +92,12 @@ pub struct ShadowSealRow {
     /// — spot instruments have no OI and indices no volume, per operator
     /// decision 2026-05-28.)
     pub close_pct_from_prev_day: f64,
+    /// `LiveCandleState::open_pct` — already `f64`. The seal-time price %
+    /// vs the official 09:15 session open (Quote `day_open` field, the NSE
+    /// pre-open auction result). `0.0` pre-market when `session_open` is
+    /// still blank. Lands in the `open_pct` DOUBLE column (operator lock
+    /// 2026-06-01 §31, Option 2).
+    pub open_pct: f64,
 }
 
 impl ShadowSealRow {
@@ -128,6 +134,7 @@ impl ShadowSealRow {
             oi: seal.state.oi,
             tick_count: i64::from(seal.state.tick_count),
             close_pct_from_prev_day: seal.state.close_pct_from_prev_day,
+            open_pct: seal.state.open_pct,
         }
     }
 }
@@ -173,6 +180,20 @@ mod tests {
         let seal = BufferedSeal::new(13, EXCHANGE_SEGMENT_NSE_EQ, TfIndex::M1, state);
         let row = ShadowSealRow::from_buffered_seal(&seal);
         assert!((row.close_pct_from_prev_day - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_from_buffered_seal_carries_open_pct() {
+        // §31 Option 2: the seal-time % vs the official 09:15 open must flow
+        // from LiveCandleState into the persisted row (open_pct DOUBLE column).
+        let mut state = LiveCandleState::empty();
+        state.bucket_start_ist_secs = 1_716_000_900;
+        state.close = 102.5;
+        state.session_open = 100.0;
+        state.open_pct = 2.5;
+        let seal = BufferedSeal::new(13, EXCHANGE_SEGMENT_NSE_EQ, TfIndex::M1, state);
+        let row = ShadowSealRow::from_buffered_seal(&seal);
+        assert!((row.open_pct - 2.5).abs() < f64::EPSILON);
     }
 
     #[test]

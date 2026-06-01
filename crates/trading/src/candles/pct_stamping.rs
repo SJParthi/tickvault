@@ -88,6 +88,25 @@ pub fn compute_close_pct(close: f64, prev_day_close: f64) -> f64 {
     }
 }
 
+/// Compute close-vs-session-open % change (operator lock 2026-06-01 §31,
+/// Option 2 — the NSE official 09:15 open from the Quote `day_open` field).
+///
+/// Formula: `((close - session_open) / session_open) * 100`.
+///
+/// Returns `0.0` if `session_open == 0.0` (pre-open / blank) — never NaN.
+#[must_use]
+#[inline]
+pub fn compute_open_pct(close: f64, session_open: f64) -> f64 {
+    if session_open == 0.0 {
+        0.0
+    } else {
+        // 2-decimal contract (operator rule 2026-05-29).
+        tickvault_common::price_precision::round_to_2dp(
+            ((close - session_open) / session_open) * 100.0,
+        )
+    }
+}
+
 /// Compute OI-vs-prev-day % change.
 ///
 /// Formula: `((oi - prev_day_oi) / prev_day_oi) * 100`.
@@ -160,6 +179,10 @@ pub fn stamp_seal_pct_fields(state: &mut LiveCandleState, refs: PrevDayRefs) {
     state.oi_pct_from_prev_day = compute_oi_pct(state.oi, refs.prev_day_oi);
     state.volume_pct_from_prev_day =
         compute_volume_pct(cum_volume_at_end_i64, refs.prev_day_total_volume);
+    // Operator lock 2026-06-01 §31 (Option 2): % vs the official 09:15
+    // session open, captured live on `state.session_open` from the Quote
+    // `day_open` field (no refs / cache needed — it's on the state).
+    state.open_pct = compute_open_pct(state.close, state.session_open);
 }
 
 #[cfg(test)]
@@ -174,6 +197,31 @@ mod tests {
         assert_eq!(compute_close_pct(95.0, 100.0), -5.0);
         // No change
         assert_eq!(compute_close_pct(100.0, 100.0), 0.0);
+    }
+
+    #[test]
+    fn test_compute_open_pct_vs_session_open() {
+        // §31 Option 2: % change vs the official 09:15 open.
+        // Open 23400, close 23540 → +0.6%.
+        assert_eq!(compute_open_pct(23_540.0, 23_400.0), 0.6);
+        // Below open → negative.
+        assert_eq!(compute_open_pct(99.0, 100.0), -1.0);
+        // At open → 0.
+        assert_eq!(compute_open_pct(100.0, 100.0), 0.0);
+        // Div-by-zero guard (pre-open / blank session_open) → 0.0, never NaN.
+        let z = compute_open_pct(123.45, 0.0);
+        assert_eq!(z, 0.0);
+        assert!(!z.is_nan());
+    }
+
+    #[test]
+    fn test_stamp_seal_sets_open_pct_from_session_open() {
+        let mut state = LiveCandleState::empty();
+        state.bucket_start_ist_secs = 1_716_000_900;
+        state.session_open = 100.0;
+        state.close = 102.5;
+        stamp_seal_pct_fields(&mut state, PrevDayRefs::default());
+        assert_eq!(state.open_pct, 2.5, "close 102.5 vs open 100 = +2.5%");
     }
 
     #[test]
