@@ -10,7 +10,7 @@ no Grafana.
 | Request | Auth | What it does |
 |---|---|---|
 | `GET /` (open the URL in a browser) | **none** | Serves the console page — a static shell with **zero secrets**. It shows a token box, a status panel, and control buttons. |
-| `POST /` `{ "action": "view" }` | **Bearer token** | Live snapshot: instance state, app up/down, today's tick count, per-timeframe candle counts, last 5 errors. |
+| `POST /` `{ "action": "view" }` | **Bearer token** | Live snapshot: instance state, app up/down, today's tick count, per-timeframe candle counts, last 5 errors, **plus live guarantee proof** — the deployed `ticks` dedup-key column count (4 = the sub-second fix is live) and the max ticks-per-second today (>1 = sub-second capture working). |
 | `POST /` `{ "action": "start\|stop\|reboot\|restart-app\|stop-app\|restart-questdb" }` | **Bearer token** | Runs the scoped action on the one instance. |
 
 The token you type is stored **only in your browser** (localStorage) and sent

@@ -188,6 +188,13 @@ _VIEW_COMMANDS = [
     'echo "C15M=$(curl -fsS "${Q}SELECT%20count()%20FROM%20candles_15m%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
     'echo "C60M=$(curl -fsS "${Q}SELECT%20count()%20FROM%20candles_60m%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
     'echo "C1D=$(curl -fsS "${Q}SELECT%20count()%20FROM%20candles_1d%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
+    # Live proof the #954 sub-second fix is deployed: the ticks table's DEDUP
+    # UPSERT key should be 4 columns (ts, security_id, segment, received_at).
+    'echo "DEDUP_KEYS=$(curl -fsS "${Q}SELECT%20count()%20FROM%20table_columns(%27ticks%27)%20WHERE%20upsertKey=true" 2>/dev/null | tail -1)"',
+    # Live proof sub-second capture works: the biggest burst of ticks sharing
+    # one (second, instrument) today. >1 means distinct sub-second ticks are
+    # being preserved (the whole point of #954); =1 collapses, 0/blank = idle.
+    'echo "MAX_TPS=$(curl -fsS "${Q}SELECT%20max(c)%20FROM%20(SELECT%20count()%20c%20FROM%20ticks%20WHERE%20ts%20IN%20today()%20GROUP%20BY%20ts,security_id)" 2>/dev/null | tail -1)"',
     'echo "ERRORS_BEGIN"',
     "journalctl -u tickvault -p err -n 5 --no-pager 2>/dev/null | tail -5 || true",
     'echo "ERRORS_END"',
@@ -225,6 +232,8 @@ def _parse_view(stdout: str) -> dict:
             "60m": fields.get("C60M", ""),
             "1d": fields.get("C1D", ""),
         },
+        "dedup_key_columns": fields.get("DEDUP_KEYS", ""),
+        "max_ticks_per_second": fields.get("MAX_TPS", ""),
         "recent_errors": errors,
     }
 
@@ -388,6 +397,11 @@ def _console_html() -> str:
   </div>
 
   <div class="card">
+    <label>Guarantees (live proof from the box)</label>
+    <div class="grid" id="guarantees"></div>
+  </div>
+
+  <div class="card">
     <label>Recent errors (last 5)</label>
     <pre id="errors">—</pre>
   </div>
@@ -452,6 +466,19 @@ async function refresh(){
     metric('60m candles', c['60m']||'0') +
     metric('1d candles', c['1d']||'0') +
     metric('Market', j.market_hours?'OPEN':'closed', j.market_hours?'warn':'');
+
+  // Live proof of the O(1) no-loss guarantees, read straight from the box.
+  const keys = j.dedup_key_columns||'';
+  const tps = j.max_ticks_per_second||'';
+  const keysOk = keys==='4';                 // ts+security_id+segment+received_at
+  const tpsN = parseInt(tps,10);
+  const tpsOk = !isNaN(tpsN) && tpsN>1;       // >1 sub-second tick = capture works
+  document.getElementById('guarantees').innerHTML =
+    metric('Dedup key cols', keys||'?', keysOk?'ok':'warn') +
+    metric('Sub-second fix', keysOk?'live ✅':'old ⚠', keysOk?'ok':'warn') +
+    metric('Max ticks/sec', tps||'0', tpsOk?'ok':'') +
+    metric('Capture', tpsOk?'working ✅':(j.market_hours?'check ⚠':'idle'), tpsOk?'ok':(j.market_hours?'warn':''));
+
   const errs = (j.recent_errors||[]);
   document.getElementById('errors').textContent = errs.length? errs.join('\\n') : 'none 🎉';
   document.getElementById('updated').textContent = 'Updated '+new Date().toLocaleTimeString();
