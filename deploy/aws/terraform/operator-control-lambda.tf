@@ -1,8 +1,6 @@
 # Operator portal Lambda — action backend for the single-page operator portal
 # (Overview / Data / GitHub / Logs / AWS / Latency tabs).
-# Re-trigger marker: this file edit fires terraform-apply on push to main so the
-# portal (enabled via TF_VAR_enable_operator_control_lambda in the workflow) is
-# created and the ready-made link is DM'd to Telegram. (2026-06-01)
+# Re-trigger marker: bump to fire terraform-apply (re-zips handler.py). (2026-06-01b)
 #
 # WHY: the operator wants ONE place (console URL + Telegram) to view AND control
 # the box, without the AWS console or GitHub UI. Grafana = view; this = control.

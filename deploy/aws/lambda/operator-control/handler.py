@@ -840,8 +840,12 @@ async function runSql(){ const q=$('sql').value.trim(); if(!q){ toast('Type a qu
   const j=await call('sql',{query:q}); if(!j){ $('sqlout').innerHTML=''; return; }
   const lines=(j.csv||'').split(/\r?\n/).filter(x=>x.length); if(!lines.length){ $('sqlout').innerHTML='<span class="muted">no rows</span>'; return; }
   const rows=lines.map(l=>l.split(',').map(c=>c.replace(/^"|"$/g,'')));
+  // QuestDB renders our IST-stored timestamps as "...T15:28:00.000000Z" — the
+  // value is already IST (project storage convention); strip the noisy
+  // microseconds + Z and the T so it reads "2026-06-01 15:28:00 IST".
+  const tcell=c=>{ const m=/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.\d+)?Z?$/.exec(c); return m? m[1]+' '+m[2]+' IST' : c; };
   let h='<table><tr>'+rows[0].map(c=>'<th>'+esc(c)+'</th>').join('')+'</tr>';
-  for(let i=1;i<rows.length;i++) h+='<tr>'+rows[i].map(c=>'<td>'+esc(c)+'</td>').join('')+'</tr>';
+  for(let i=1;i<rows.length;i++) h+='<tr>'+rows[i].map(c=>'<td>'+esc(tcell(c))+'</td>').join('')+'</tr>';
   $('sqlout').innerHTML=h+'</table>'; }
 
 function ciBadge(s){ const k=['success','pending','failure'].includes(s)?s:'unknown'; return '<span class="badge '+k+'">'+s+'</span>'; }
