@@ -733,6 +733,26 @@ mod tests {
     }
 
     #[test]
+    fn excludes_real_nsetest_scrips_011_through_181() {
+        // 2026-06-01 cross-check vs NSE fo_mktlots.csv: Dhan's master carries
+        // 18 `0N1NSETEST`/`1N1NSETEST` dummy underlyings (011NSETEST..181NSETEST)
+        // that are NOT real F&O stocks. NSE's official list = 211 stocks;
+        // Dhan FUTSTK/OPTSTK distinct underlyings = 229; the 18 difference is
+        // exactly these test scrips. They MUST be excluded so we subscribe 211,
+        // not 229. (`CSV_TEST_SYMBOL_MARKER == "TEST"` catches the NSETEST suffix.)
+        for sid in ["011", "091", "181"] {
+            let und = format!("{sid}NSETEST");
+            let sym = format!("{und}26JUNFUT");
+            assert!(
+                is_test_instrument(&sym, &und),
+                "{und} must be filtered as a TEST scrip"
+            );
+        }
+        // A real stock with TEST nowhere in it is kept.
+        assert!(!is_test_instrument("HDFCBANK26JUNFUT", "HDFCBANK"));
+    }
+
+    #[test]
     fn canonical_security_id_normalizes_format_drift() {
         assert_eq!(canonical_security_id("11536").as_deref(), Some("11536"));
         assert_eq!(canonical_security_id(" 11536 ").as_deref(), Some("11536"));

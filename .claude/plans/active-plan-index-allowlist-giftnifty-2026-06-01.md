@@ -137,11 +137,16 @@ BSE (1): SENSEX (already handled by the existing BSE arm of `extract_indices`).
 
 ## VERIFIED 2026-06-01 from the operator's uploaded master CSV (api-scrip-master-detailed.csv, 220,287 rows)
 
-**F&O single-stock count is 229 (not 211, not 218):** distinct NSE FUTSTK/OPTSTK
-`UNDERLYING_SECURITY_ID` = 229, distinct `UNDERLYING_SYMBOL` = 229, ALL 229
-resolve to a live NSE EQUITY spot row. (218 was tickvault's old rule estimate;
-211 was the BruteX project's count from a different/older filter.) Real total
-universe = **32 indices + 229 stock spots = 261** (inside the [100,400] envelope).
+**F&O single-stock count is 211 (CORRECTED 2026-06-01 vs NSE fo_mktlots.csv).**
+Dhan's master has 229 distinct NSE FUTSTK/OPTSTK `UNDERLYING_SYMBOL`, but 18 of
+those are dummy `011NSETEST…181NSETEST` test scrips. NSE's official
+`fo_mktlots.csv` lists exactly **211 stock F&O underlyings** + 5 index F&O
+(NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY/NIFTYNXT50); the 211 real symbols match
+Dhan **exactly** (intersection 211, zero missing; diff = the 18 NSETEST only).
+tickvault ALREADY excludes them (`CSV_TEST_SYMBOL_MARKER="TEST"` →
+`is_test_instrument` `.contains("TEST")`), so the extractor yields **211**, not
+229. Real total universe = **32 indices + 211 stock spots = 243** (inside the
+[100,400] envelope). Pinned by `excludes_real_nsetest_scrips_011_through_181`.
 
 **GIFT Nifty confirmed in IDX_I:** `EXCH=NSE SEG=I INSTR=INDEX sid=5024
 SYM='GIFTNIFTY' DISP='Gift Nifty'` → the index allowlist + always-on exemption
