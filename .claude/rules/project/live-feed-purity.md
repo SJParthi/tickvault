@@ -87,9 +87,33 @@ and replaced with the hard bans in this rule.
 7. **Cross-verification — RETIRED 2026-05-26.** PR-C deleted
    `cross_verify.rs`. The live-vs-historical diff no longer runs.
 
-8. **Pre-market yesterday's-1d fetch — RETIRED 2026-05-26.** PR-E
-   deleted the entire historical fetch chain; this exception no
-   longer has any callable code path.
+8. **Pre-market yesterday's-1d fetch — RETIRED 2026-05-26, then NARROWLY
+   RE-ALLOWED 2026-06-01 (see rule 9).** PR-E deleted the OLD broad chain;
+   it stays deleted. A strictly bounded replacement is re-allowed below.
+
+9. **Bounded prev-day 1-candle fetch — RE-ALLOWED 2026-06-01 (operator
+   directive).** Operator quote 2026-06-01: *"once authentication is
+   successful and instruments get loaded successfully then instantly we
+   planned to pull historical one day previous day data of all these
+   subscribed symbols"* → chose "Re-add full prev-day OHLCV fetch",
+   operator-confirmed scope = **one day, one daily candle per symbol**.
+
+   RE-ALLOWS a STRICTLY BOUNDED REST fetch, distinct from the deleted chain:
+   - **Scope:** yesterday's SINGLE daily candle (O/H/L/C/V) per subscribed
+     SID (~243), fetched ONCE at boot after instruments load.
+   - **Destination:** a SEPARATE `prev_day_ohlcv` QuestDB table — **NEVER
+     `ticks`** (the hard ban in rules 1-6 stands; no synthesized ticks).
+   - **Source:** Dhan REST `POST /v2/charts/historical` (daily; fromDate =
+     prev trading day, non-inclusive toDate).
+   - **Fail-soft:** a symbol REST can't return is skipped + logged; boot
+     never blocks (cold path).
+   - **NOT** the deleted `candle_fetcher.rs`/`cross_verify.rs` chain, NOT
+     under `crates/core/src/historical/`, no 90-day range, no intraday, no
+     gap-fill, no cross-verify. Lives in its own `prev_day_ohlcv` module.
+
+   What STAYS banned (this rule does NOT relax): synthesized ticks →
+   `ticks`, `BackfillWorker`, `run_backfill`, `synthesize_ticks`,
+   `TickPersistenceWriter`/`append_tick` in any historical/synth path.
 
 ## Test ratchet
 
