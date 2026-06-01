@@ -1,10 +1,16 @@
 //! S3-3: Property test for tick DEDUP uniqueness.
 //!
-//! **Invariant under test:** the triple `(exchange_timestamp, security_id,
-//! exchange_segment_code)` is the unique key for a tick in QuestDB. Two
-//! ticks with the same triple will be merged by QuestDB DEDUP UPSERT KEYS;
-//! two ticks with ANY difference in the triple MUST be preserved as
-//! separate rows.
+//! **Invariant under test:** the quadruple `(exchange_timestamp, security_id,
+//! exchange_segment_code, received_at_nanos)` is the unique key for a tick in
+//! QuestDB. Two ticks with the same quadruple will be merged by QuestDB DEDUP
+//! UPSERT KEYS; two ticks with ANY difference in the quadruple MUST be
+//! preserved as separate rows.
+//!
+//! `received_at_nanos` joined the key (2026-06-01) because Dhan's
+//! `exchange_timestamp` (LTT) is SECOND-granular: without the nanosecond
+//! local-capture instant, 3-4-5 distinct sub-second ticks for one instrument
+//! would collapse to one row. A genuine replay re-emits the SAME
+//! `received_at_nanos`, so dedup of true duplicates is preserved.
 //!
 //! This is the backbone of the zero-tick-loss guarantee — if DEDUP
 //! incorrectly collapsed two distinct ticks, we'd silently lose data, and
@@ -28,11 +34,12 @@ use tickvault_storage::tick_persistence::tick_dedup_key;
 
 /// Computes the canonical dedup "tuple" for a tick — matches the QuestDB
 /// DEDUP UPSERT KEYS semantics.
-fn dedup_tuple(tick: &ParsedTick) -> (u32, u32, u8) {
+fn dedup_tuple(tick: &ParsedTick) -> (u32, u32, u8, i64) {
     (
         tick.exchange_timestamp,
         tick.security_id,
         tick.exchange_segment_code,
+        tick.received_at_nanos,
     )
 }
 
@@ -123,6 +130,23 @@ proptest! {
         changed.exchange_timestamp = new_ts;
         prop_assert_ne!(dedup_tuple(&base), dedup_tuple(&changed));
     }
+
+    /// S3-3/9: Different received_at → different tuple. This is the
+    /// sub-second-preservation invariant (2026-06-01): two ticks with the
+    /// SAME second-granular `exchange_timestamp`, same security_id, same
+    /// segment, but distinct nanosecond capture instants MUST be preserved
+    /// as separate rows — they are genuinely distinct market events that
+    /// arrived inside the same wall-clock second.
+    #[test]
+    fn prop_different_received_at_different_tuple(
+        base in arb_tick(),
+        new_recv in any::<i64>(),
+    ) {
+        prop_assume!(new_recv != base.received_at_nanos);
+        let mut changed = base;
+        changed.received_at_nanos = new_recv;
+        prop_assert_ne!(dedup_tuple(&base), dedup_tuple(&changed));
+    }
 }
 
 /// S3-3/6: Spot check the hard-coded DEDUP key string contains both
@@ -140,6 +164,11 @@ fn dedup_key_string_contains_security_id_and_segment() {
         key.contains("segment"),
         "STORAGE-GAP-01: DEDUP_KEY_TICKS must include segment to prevent \
          cross-segment collision, got: {key}"
+    );
+    assert!(
+        key.contains("received_at"),
+        "DEDUP_KEY_TICKS must include received_at to preserve sub-second \
+         ticks (Dhan LTT is second-granular), got: {key}"
     );
 }
 

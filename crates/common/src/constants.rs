@@ -446,6 +446,18 @@ pub const ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS: u64 = 500;
 /// Maximum reconnect delay for order update WebSocket (milliseconds).
 pub const ORDER_UPDATE_RECONNECT_MAX_DELAY_MS: u64 = 60000;
 
+/// Base floor (ms) applied to the MAIN-FEED reconnect wait after a Dhan feed
+/// rate-limit (HTTP 429 / DATA-805 "too many requests/connections" class).
+/// Dhan's documented guidance for the 805 class is "stop all connections for
+/// 60s, then reconnect one at a time" — so the first post-429 reconnect waits
+/// at least 60s instead of the instant (0ms) first-retry. Grows ×2 per
+/// consecutive 429 up to `WS_RATE_LIMIT_BACKOFF_CAP_MS`. Prevents an
+/// instant-reconnect loop from keeping the rate-limit alive forever.
+pub const WS_RATE_LIMIT_BACKOFF_BASE_MS: u64 = 60_000;
+
+/// Cap (ms) for the post-429 main-feed reconnect floor (5 minutes).
+pub const WS_RATE_LIMIT_BACKOFF_CAP_MS: u64 = 300_000;
+
 /// Timeout for the order update WebSocket auth response (seconds).
 /// After sending the LoginReq (MsgCode 42), the server should respond
 /// within this window. 10 seconds is generous for a JSON auth handshake.

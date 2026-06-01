@@ -20,6 +20,12 @@
 #   restart-app     - systemctl restart tickvault (via SSM; market-hours guarded)
 #   stop-app        - kill-switch: stop + disable tickvault (breaks restart loops + Telegram spam)
 #   restart-questdb - restart the QuestDB docker container (via SSM)
+#   rotate-ip       - swap the instance's public Elastic IP for a fresh one +
+#                     restart the app. Clears a Dhan IP-level feed penalty (feed
+#                     shows "Connection reset / 0 of 1 connected" while the SAME
+#                     token works elsewhere — proving an IP block, not an account
+#                     block). No-orders data-pull phase only: Dhan's static-IP
+#                     ORDER whitelist does NOT gate the market-data feed.
 #   seed-secrets    - copy /tickvault/dev/* -> /tickvault/staging/* (idempotent)
 #   deploy          - dispatch the full deploy-aws build+ship+restart pipeline
 # =============================================================================
@@ -41,6 +47,7 @@ on:
           - restart-app
           - stop-app
           - restart-questdb
+          - rotate-ip
           - seed-secrets
           - deploy
       force:
@@ -119,7 +126,7 @@ jobs:
           force="${{ github.event.inputs.force }}"
           # Only stop/reboot/restart-app interrupt a live session.
           case "$action" in
-            stop|reboot|restart-app|stop-app) sensitive=1 ;;
+            stop|reboot|restart-app|stop-app|rotate-ip) sensitive=1 ;;
             *) sensitive=0 ;;
           esac
           if [ "$sensitive" = "1" ] && [ "$force" != "yes" ]; then
@@ -310,6 +317,75 @@ jobs:
           aws ssm wait command-executed --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" || true
           aws ssm get-command-invocation --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" \
             --query StandardOutputContent --output text
+
+      - name: rotate-ip
+        if: github.event.inputs.action == 'rotate-ip'
+        # Swap the instance's public Elastic IP for a brand-new one, then
+        # restart the app so the market-data feed reconnects from the fresh IP.
+        # Worst-case coverage:
+        #   * instance must be running (else associate fails) -> guard up front
+        #   * allocate succeeds but associate fails -> release the orphan EIP
+        #   * old EIP released only if it was a real EIP and != the new one
+        #   * manual SSM poll (NOT `wait command-executed`, whose ~100s ceiling
+        #     timed out long commands in deploy-aws.yml — same lesson reused)
+        run: |
+          set -euo pipefail
+          IID=${{ steps.iid.outputs.id }}
+          S="$GITHUB_STEP_SUMMARY"
+
+          STATE=$(aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$IID" \
+            --query 'Reservations[0].Instances[0].State.Name' --output text)
+          [ "$STATE" = "running" ] || { echo "::error::instance is $STATE — start it first (AWS Control -> start)"; exit 1; }
+
+          OLD_IP=$(aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$IID" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null || echo "None")
+          OLD_ALLOC=$(aws ec2 describe-addresses --region "$AWS_REGION" \
+            --filters "Name=instance-id,Values=$IID" \
+            --query 'Addresses[0].AllocationId' --output text 2>/dev/null || echo "None")
+          echo "Old public IP: $OLD_IP | old EIP alloc: $OLD_ALLOC"
+
+          NEW_ALLOC=$(aws ec2 allocate-address --region "$AWS_REGION" --domain vpc \
+            --query AllocationId --output text)
+          NEW_IP=$(aws ec2 describe-addresses --region "$AWS_REGION" --allocation-ids "$NEW_ALLOC" \
+            --query 'Addresses[0].PublicIp' --output text)
+          echo "Allocated fresh EIP: $NEW_IP ($NEW_ALLOC)"
+
+          if ! aws ec2 associate-address --region "$AWS_REGION" \
+                 --instance-id "$IID" --allocation-id "$NEW_ALLOC" --allow-reassociation >/dev/null; then
+            echo "::error::associate failed — releasing the just-allocated EIP to avoid an orphan charge"
+            aws ec2 release-address --region "$AWS_REGION" --allocation-id "$NEW_ALLOC" || true
+            exit 1
+          fi
+          echo "Associated $NEW_IP -> $IID."
+
+          if [ "$OLD_ALLOC" != "None" ] && [ -n "$OLD_ALLOC" ] && [ "$OLD_ALLOC" != "$NEW_ALLOC" ]; then
+            aws ec2 release-address --region "$AWS_REGION" --allocation-id "$OLD_ALLOC" \
+              && echo "Released old EIP $OLD_IP ($OLD_ALLOC)." \
+              || echo "::warning::could not release old EIP $OLD_ALLOC — release it manually later."
+          fi
+
+          # Restart the app so it dials the feed out from the new IP.
+          CMD=$(aws ssm send-command --region "$AWS_REGION" --instance-ids "$IID" \
+            --document-name AWS-RunShellScript \
+            --parameters 'commands=["systemctl restart tickvault","sleep 5","systemctl is-active --quiet tickvault && echo RESTARTED-OK || (echo FAIL; exit 1)"]' \
+            --query Command.CommandId --output text)
+          for i in $(seq 1 20); do
+            ST=$(aws ssm get-command-invocation --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" --query Status --output text 2>/dev/null || echo Pending)
+            case "$ST" in Success|Failed|Cancelled|TimedOut) break;; esac
+            sleep 2
+          done
+          aws ssm get-command-invocation --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" \
+            --query StandardOutputContent --output text || true
+
+          echo "# 🔄 IP rotated" >> "$S"
+          echo "" >> "$S"
+          echo "| | value |" >> "$S"
+          echo "|---|---|" >> "$S"
+          echo "| Old IP | \`$OLD_IP\` |" >> "$S"
+          echo "| New IP | \`$NEW_IP\` |" >> "$S"
+          echo "| Instance | \`$IID\` |" >> "$S"
+          echo "" >> "$S"
+          echo "App restarted from the fresh IP — watch Telegram for **'1 of 1 feeds connected'**." >> "$S"
 
       - name: seed-secrets
         if: github.event.inputs.action == 'seed-secrets'

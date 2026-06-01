@@ -138,13 +138,26 @@ if [ "$STATE" = "running" ]; then
     if [ "$APP" = "active" ]; then
       note_ok "app (tickvault) active"
     else
-      echo "  app inactive ($APP) — restarting via SSM"
-      ssm_run "systemctl restart tickvault 2>/dev/null; sleep 5" >/dev/null
-      APP2=$(ssm_run "systemctl is-active tickvault 2>/dev/null || echo inactive" | tr -d '[:space:]')
-      if [ "$APP2" = "active" ]; then
-        note_heal "restarted app (tickvault) — was $APP"
+      # Respect the operator kill-switch. `stop-app` (AWS Control) runs
+      # `systemctl disable tickvault`, so a DISABLED unit means the app was
+      # stopped ON PURPOSE — e.g. to let a Dhan feed rate-limit (HTTP 429 /
+      # DATA-805) cool down. Auto-restarting it would re-open the feed
+      # connection and keep the 429 alive forever (every restart = a fresh
+      # connect attempt). So: NEVER auto-restart a disabled unit — surface it
+      # as an intentional stop. Only an ENABLED-but-inactive unit (a genuine
+      # crash) gets the auto-restart.
+      ENABLED=$(ssm_run "systemctl is-enabled tickvault 2>/dev/null || echo disabled" | tr -d '[:space:]')
+      if [ "$ENABLED" = "disabled" ]; then
+        note_ok "app (tickvault) intentionally stopped (kill-switch — unit disabled); not auto-restarting (re-enable via AWS Control deploy/start when ready)"
       else
-        note_issue "app (tickvault) not active after restart ($APP2) — check journalctl"
+        echo "  app inactive ($APP), unit enabled — restarting via SSM"
+        ssm_run "systemctl restart tickvault 2>/dev/null; sleep 5" >/dev/null
+        APP2=$(ssm_run "systemctl is-active tickvault 2>/dev/null || echo inactive" | tr -d '[:space:]')
+        if [ "$APP2" = "active" ]; then
+          note_heal "restarted app (tickvault) — was $APP"
+        else
+          note_issue "app (tickvault) not active after restart ($APP2) — check journalctl"
+        fi
       fi
     fi
 

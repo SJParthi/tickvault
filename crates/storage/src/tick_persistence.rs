@@ -48,19 +48,32 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 /// AFTER `ts` in the actual `UPSERT KEYS(...)` clause. The DDL builder at
 /// `setup_tick_tables` formats this as
 /// `ALTER TABLE ticks DEDUP ENABLE UPSERT KEYS(ts, {DEDUP_KEY_TICKS})`,
-/// producing the full key `(ts, security_id, segment)`.
+/// producing the full key `(ts, security_id, segment, received_at)`.
 ///
 /// **Why `segment` is mandatory** (STORAGE-GAP-01 + I-P1-11):
 /// Dhan reuses the same numeric `security_id` across exchange segments
 /// (e.g. `security_id = 13` is `NIFTY` on `IDX_I` AND a stock on `NSE_EQ`).
 /// Without `segment` in the key, two LEGITIMATELY DISTINCT ticks at the same
 /// `ts` would silently UPSERT each other and one segment's data would be lost.
-/// The composite `(ts, security_id, segment)` is the ONLY uniqueness
-/// guarantee — `security_id` alone is NOT unique.
+///
+/// **Why `received_at` is mandatory** (sub-second tick preservation):
+/// Dhan's `exchange_timestamp` (LTT) is SECOND-granular, so the designated
+/// timestamp `ts` is identical for every tick that arrives inside the same
+/// wall-clock second. With only `(ts, security_id, segment)` in the key,
+/// 3-4-5 genuinely-distinct sub-second ticks for one instrument would
+/// silently UPSERT each other down to ONE surviving row — real market
+/// activity lost. `received_at` is the NANOSECOND local-clock capture
+/// instant (monotonic within a process), so it disambiguates sub-second
+/// ticks WITHOUT defeating dedup of genuine replays: a true replay re-emits
+/// the SAME `received_at` nanos (it is part of the parsed tick), so it still
+/// collapses to one row. The composite
+/// `(ts, security_id, segment, received_at)` is the uniqueness guarantee —
+/// `security_id` alone is NOT unique, and `(ts, security_id, segment)` alone
+/// collapses sub-second bursts.
 ///
 /// Enforced by `dedup_segment_meta_guard.rs` (workspace-wide constant scan)
 /// + `test_tick_dedup_key_includes_segment` (STORAGE-GAP-01 integration test).
-const DEDUP_KEY_TICKS: &str = "security_id, segment";
+const DEDUP_KEY_TICKS: &str = "security_id, segment, received_at";
 
 /// Returns the DEDUP UPSERT KEY string for the ticks table.
 /// Exposed for gap enforcement integration tests (STORAGE-GAP-01).
@@ -2538,7 +2551,12 @@ mod tests {
             DEDUP_KEY_TICKS.contains("segment"),
             "DEDUP_KEY_TICKS must include segment (STORAGE-GAP-01)"
         );
-        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment");
+        assert!(
+            DEDUP_KEY_TICKS.contains("received_at"),
+            "DEDUP_KEY_TICKS must include received_at to preserve sub-second ticks \
+             (Dhan LTT is second-granular, so ts alone collapses bursts)"
+        );
+        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, received_at");
     }
 
     /// STORAGE-GAP-01: Verify that the ticks DDL includes exchange_segment
@@ -3703,8 +3721,8 @@ mod tests {
 
     #[test]
     fn test_tick_dedup_key_exact_value() {
-        // STORAGE-GAP-01: Exact value check
-        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment");
+        // STORAGE-GAP-01 (segment) + sub-second preservation (received_at).
+        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, received_at");
     }
 
     #[test]
@@ -3815,7 +3833,7 @@ mod tests {
 
     #[test]
     fn test_dedup_key_ticks_exact_format() {
-        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment");
+        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, received_at");
     }
 
     #[test]

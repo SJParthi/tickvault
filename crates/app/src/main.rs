@@ -1613,6 +1613,16 @@ async fn main() -> Result<()> {
             }
         };
 
+        // FAST-BOOT candle-sealing fix (2026-06-01): the seal-writer loop
+        // publishes the GLOBAL seal Sender the aggregator needs to emit
+        // candles. It was wired in the SLOW boot path ONLY, so FAST BOOT
+        // captured ticks but sealed ZERO candles (the candles_1m=0 bug —
+        // `global_seal_sender()` was None, so the aggregator's per-tick
+        // closure skipped every tick via `else { continue }`). Wire it here
+        // too, BEFORE the aggregator, so the Sender is published when the
+        // first tick folds. set_global_seal_sender is idempotent (first wins).
+        spawn_seal_writer_loop(&config.questdb);
+
         // Candle-engine re-architecture #T1b — wire Engine B (the only
         // candle engine: 21-TF aggregator → 21 plain `candles_<tf>`
         // tables). Subscriber + heartbeat + IST-midnight force-seal
@@ -2547,7 +2557,14 @@ async fn main() -> Result<()> {
                         reason: reason.clone(),
                         within_market_hours: in_market_hours,
                     });
-                    if in_market_hours {
+                    // The profile/IP pre-market check is a LIVE-ORDER-TRADING
+                    // gate (dataPlan / activeSegment / static-IP must be valid
+                    // before placing real orders). In the no-orders DATA-CAPTURE
+                    // phase (mode != Live, e.g. Paper) it must NOT block boot —
+                    // capturing ticks needs neither a validated profile nor a
+                    // static IP, and a HALT here just crash-loops the app and
+                    // stops all data capture. Only HALT when we will trade live.
+                    if in_market_hours && config.strategy.mode.is_live() {
                         // HALT — we refuse to boot into a live trading session
                         // with a bad profile. systemd will restart on the next
                         // attempt but the underlying cause (dataPlan / segment
@@ -2560,11 +2577,15 @@ async fn main() -> Result<()> {
                             "pre-market profile check FAILED during market hours — HALT: {reason}"
                         );
                     }
-                    // Pre-market window — log ERROR (triggers Telegram) but
-                    // allow boot to continue; operator has until 09:15 IST.
+                    // Pre-market window OR non-live (data-capture) mode: log
+                    // ERROR (triggers Telegram) but allow boot to CONTINUE so
+                    // the market-data feed + tick capture still run. No live
+                    // orders are placed in this mode, so a bad profile/IP is
+                    // not a trading-safety risk.
                     error!(
                         error = %err,
-                        "pre-market profile check FAILED — investigate before 09:15 IST"
+                        mode = ?config.strategy.mode,
+                        "pre-market profile check FAILED — continuing (data-capture mode or pre-09:15; no live orders placed)"
                     );
                 }
             }
@@ -5808,6 +5829,56 @@ async fn run_slow_boot_observability(
 /// Both boot paths (fast crash-recovery + slow normal start) call this
 /// so candle aggregation is identical regardless of boot mode.
 // WIRING-EXEMPT: call sites are the fast-boot + slow-boot blocks in `main` below.
+/// Spawns the Wave 6 seal-writer loop and publishes its GLOBAL seal Sender so
+/// the multi-TF aggregator (Engine B) can emit sealed candles into the
+/// `candles_<tf>` tables.
+///
+/// MUST run on BOTH boot paths. If the Sender is never published,
+/// `global_seal_sender()` returns None and the aggregator's per-tick closure
+/// skips every tick (`else { continue }`), leaving `candles_*` empty. This is
+/// the 2026-06-01 `candles_1m=0` bug: the seal-writer was wired in the slow
+/// boot path only, so FAST BOOT captured ticks but sealed no candles.
+/// `set_global_seal_sender` is idempotent (first installer wins), so calling
+/// this on whichever boot path runs is safe.
+fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConfig) {
+    use tickvault_storage::seal_writer_loop::{run_seal_writer_loop, seal_drain_interval};
+    use tickvault_storage::seal_writer_runner::SealWriterRunner;
+
+    // 1024 seals × 100 ms cycle = ~10,240 seals/sec sustained — well above
+    // the ~99K-seal IST-midnight burst absorbed across ~10 cycles.
+    const SEAL_MAX_DRAIN_PER_CYCLE: usize = 1_024;
+
+    match SealWriterRunner::new(questdb_config, SEAL_MAX_DRAIN_PER_CYCLE) {
+        Ok(runner) => {
+            if !tickvault_storage::seal_writer_runner::set_global_seal_sender(runner.sender()) {
+                tracing::warn!(
+                    "global seal sender already installed (idempotent skip) — first installer wins"
+                );
+            }
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            // Hold the watch sender for the process lifetime so the loop's
+            // `.changed().await` does not wake on a disconnected channel.
+            std::mem::forget(cancel_tx);
+            tokio::spawn(async move {
+                let _final_outcome =
+                    run_seal_writer_loop(runner, seal_drain_interval(), cancel_rx).await;
+                tracing::info!("seal writer loop exited gracefully");
+            });
+            tracing::info!(
+                interval_ms = seal_drain_interval().as_millis(),
+                max_drain_per_cycle = SEAL_MAX_DRAIN_PER_CYCLE,
+                "seal writer task spawned — Engine B candle sealing enabled"
+            );
+        }
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                "failed to construct SealWriterRunner — candles will NOT seal this session"
+            );
+        }
+    }
+}
+
 fn spawn_engine_b_aggregator(
     tick_broadcast_sender: &tokio::sync::broadcast::Sender<
         tickvault_common::tick_types::ParsedTick,
