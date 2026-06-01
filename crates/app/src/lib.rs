@@ -38,6 +38,7 @@ pub mod infra;
 // bhavcopy → cache extraction primitives into the boot path so the
 // in-memory cache (consumed by the cascade seal-time pct-stamping
 // path + tick enricher) is Dhan-precise from the first tick.
+pub mod prev_day_ohlcv_boot;
 pub mod prev_oi_loader;
 // F2 (Wave-5 #504e follow-up) — boot-time loader for `PrevDayCache`
 // so the cascade seal-time pct-stamping path (PR #520 / F1) sees
