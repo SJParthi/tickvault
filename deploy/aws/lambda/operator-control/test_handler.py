@@ -135,6 +135,13 @@ class GetServesPublicHtml(unittest.TestCase):
         for t in ("overview", "data", "github", "logs", "aws", "latency"):
             self.assertIn('data-t="' + t + '"', html)
 
+    def test_html_supports_ready_made_key_link(self) -> None:
+        # A #key=... link must auto-unlock + strip the fragment from the URL.
+        html = handler._console_html()
+        self.assertIn("location.hash", html)
+        self.assertIn("replaceState", html)
+        self.assertIn("tv_token", html)
+
 
 class Latency(unittest.TestCase):
     def test_avg_ns(self) -> None:

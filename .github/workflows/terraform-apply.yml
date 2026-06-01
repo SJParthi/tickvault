@@ -58,6 +58,10 @@ env:
   TF_VAR_operator_cidr: "0.0.0.0/0" # CI runs from GH IPs; SSH SG is locked by separate operator override
   TF_VAR_operator_email: "sjparthi93@gmail.com" # registered alert destination
   TF_VAR_ami_id: ami-0fa0340d4a8bdd6ee
+  # Operator portal: opt prod IN via CI (the terraform variable default stays
+  # false, so local/other applies are unaffected). This creates the portal
+  # Lambda + Function URL on the next apply.
+  TF_VAR_enable_operator_control_lambda: "true"
   AWS_REGION: ap-south-1
   TF_DIR: deploy/aws/terraform
 
@@ -292,6 +296,37 @@ jobs:
           echo "monthly_budget_name=${BUDGET}" >> $GITHUB_OUTPUT
           echo "INSTANCE_ID=${INSTANCE_ID}"
           echo "ELASTIC_IP=${EIP}"
+
+      - name: Send ready-made operator-portal link to Telegram
+        # Zero-touch: if the portal is enabled, generate the device key in SSM
+        # (once), then DM the operator a single tappable link with the key in
+        # the URL fragment (#key=...). The fragment never reaches the server;
+        # the operator opens it and is unlocked with no typing. The key is
+        # NEVER printed to the Actions log — only published to the private
+        # SNS->Telegram channel.
+        run: |
+          set +e
+          URL=$(terraform -chdir=${{ env.TF_DIR }} output -raw operator_control_function_url 2>/dev/null)
+          if [ -z "$URL" ] || [ "$URL" = "null" ]; then
+            echo "operator portal disabled — nothing to publish"; exit 0
+          fi
+          SECRET_NAME="/tickvault/prod/operator/control-secret"
+          if ! aws ssm get-parameter --name "$SECRET_NAME" --region ${{ env.AWS_REGION }} >/dev/null 2>&1; then
+            KEY=$(openssl rand -base64 30 | tr -d '\n')
+            aws ssm put-parameter --name "$SECRET_NAME" --type SecureString \
+              --value "$KEY" --region ${{ env.AWS_REGION }} >/dev/null
+            echo "generated a new operator device key (stored in SSM SecureString)"
+          else
+            KEY=$(aws ssm get-parameter --name "$SECRET_NAME" --with-decryption \
+              --query Parameter.Value --output text --region ${{ env.AWS_REGION }})
+          fi
+          LINK="${URL}#key=${KEY}"
+          aws sns publish --region ${{ env.AWS_REGION }} \
+            --topic-arn "arn:aws:sns:${{ env.AWS_REGION }}:${{ steps.aws_account.outputs.account_id }}:tv-prod-alerts" \
+            --subject "Operator portal ready" \
+            --message "Your tickvault operator portal is live. Tap to open (your key is baked in — do NOT forward this message): ${LINK}" >/dev/null
+          echo "✅ Published the ready-made portal link to Telegram (key NOT shown here)."
+          echo "Operator portal URL (key sent privately via Telegram): ${URL}" >> "$GITHUB_STEP_SUMMARY"
 
   # ─────────────────────────────────────────────────────────────────
   # Job 4: notify Telegram (via SNS) — success + failure paths
