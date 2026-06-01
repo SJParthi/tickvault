@@ -306,7 +306,7 @@ jobs:
         # SNS->Telegram channel.
         run: |
           set +e
-          URL=$(terraform -chdir=${{ env.TF_DIR }} output -raw operator_control_function_url 2>/dev/null)
+          URL=$(terraform -chdir=${{ env.TF_DIR }} output -raw operator_portal_url 2>/dev/null)
           if [ -z "$URL" ] || [ "$URL" = "null" ]; then
             echo "operator portal disabled — nothing to publish"; exit 0
           fi

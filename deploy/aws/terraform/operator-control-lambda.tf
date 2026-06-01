@@ -197,6 +197,53 @@ resource "aws_lambda_permission" "operator_control_url" {
   function_url_auth_type = "NONE"
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# API Gateway (HTTP API) → same Lambda. The Lambda Function URL (above) returns
+# 403 AccessDeniedException in this account even with a perfect public resource
+# policy + AuthType=NONE (an account/org-side denial of public Function URLs we
+# could not lift). API Gateway invokes the Lambda via lambda:InvokeFunction with
+# the apigateway.amazonaws.com principal — a completely different path that is
+# NOT subject to the Function-URL denial — so the public portal works here. Same
+# handler, same bearer-key auth, same payload v2.0 shape (requestContext.http).
+# ─────────────────────────────────────────────────────────────────────────────
+resource "aws_apigatewayv2_api" "operator_control" {
+  count         = var.enable_operator_control_lambda ? 1 : 0
+  name          = "tv-${var.environment}-operator-portal"
+  protocol_type = "HTTP"
+}
+
+resource "aws_apigatewayv2_integration" "operator_control" {
+  count                  = var.enable_operator_control_lambda ? 1 : 0
+  api_id                 = aws_apigatewayv2_api.operator_control[0].id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.operator_control[0].invoke_arn
+  integration_method     = "POST"
+  payload_format_version = "2.0"
+}
+
+resource "aws_apigatewayv2_route" "operator_control" {
+  count     = var.enable_operator_control_lambda ? 1 : 0
+  api_id    = aws_apigatewayv2_api.operator_control[0].id
+  route_key = "$default" # GET serves the page, POST runs actions — all to one Lambda
+  target    = "integrations/${aws_apigatewayv2_integration.operator_control[0].id}"
+}
+
+resource "aws_apigatewayv2_stage" "operator_control" {
+  count       = var.enable_operator_control_lambda ? 1 : 0
+  api_id      = aws_apigatewayv2_api.operator_control[0].id
+  name        = "$default"
+  auto_deploy = true
+}
+
+resource "aws_lambda_permission" "operator_control_apigw" {
+  count         = var.enable_operator_control_lambda ? 1 : 0
+  statement_id  = "AllowApiGatewayInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.operator_control[0].function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.operator_control[0].execution_arn}/*/*"
+}
+
 # Per-Lambda error alarm → existing tv_alerts SNS (matches the killswitch pattern).
 resource "aws_cloudwatch_metric_alarm" "operator_control_errors" {
   count               = var.enable_operator_control_lambda ? 1 : 0
@@ -215,5 +262,10 @@ resource "aws_cloudwatch_metric_alarm" "operator_control_errors" {
 
 output "operator_control_function_url" {
   value       = var.enable_operator_control_lambda ? aws_lambda_function_url.operator_control[0].function_url : null
-  description = "Open this URL in a browser = the operator console (GET serves the page). Buttons POST with header 'Authorization: Bearer <secret>' + body {\"action\":\"view|start|stop|reboot|restart-app|stop-app|restart-questdb\"}"
+  description = "Legacy Lambda Function URL — returns 403 in this account (public Function URLs denied). Use operator_portal_url (API Gateway) instead."
+}
+
+output "operator_portal_url" {
+  value       = var.enable_operator_control_lambda ? aws_apigatewayv2_stage.operator_control[0].invoke_url : null
+  description = "THE operator portal URL (API Gateway → Lambda). Open in a browser; same bearer-key auth inside. This is the link DM'd to Telegram."
 }
