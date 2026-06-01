@@ -147,6 +147,7 @@ fn is_window_exempt(
     security_id: u32,
     exchange_segment_code: u8,
 ) -> bool {
+    // O(1) EXEMPT: HashSet `contains` is O(1) hashing, not an O(n) Vec scan.
     always_on.contains(&(security_id, exchange_segment_code))
 }
 
