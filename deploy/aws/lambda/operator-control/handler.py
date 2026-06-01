@@ -240,6 +240,97 @@ def _parse_view(stdout: str) -> dict:
     }
 
 
+# ----------------------------------------------------------------- latency snap
+# Measures the REAL per-tick + per-process latency on the box:
+#  * network RTT to the Dhan feed edge (TCP connect + TLS handshake, 3 samples)
+#  * local QuestDB round-trip (SELECT 1)
+#  * the app's own histograms at :9091/metrics — sum/count gives average ns for
+#    tick parse+process (`tv_tick_processing_duration_ns`) and the full
+#    wire->parsed->routed journey (`tv_wire_to_done_duration_ns`), plus order
+#    placement (`tv_order_placement_duration_ns`).
+#  * wall-clock skew vs chrony's NTP source.
+_LATENCY_COMMANDS = [
+    "set +e",
+    'echo "DHAN_BEGIN"',
+    "for i in 1 2 3; do curl -o /dev/null -s -w '%{time_connect} %{time_appconnect}\\n' --max-time 3 https://api-feed.dhan.co/ 2>/dev/null || echo 'x x'; done",
+    'echo "DHAN_END"',
+    "echo \"QDB=$(curl -o /dev/null -s -w '%{time_total}' --max-time 3 'http://127.0.0.1:9000/exec?query=SELECT%201' 2>/dev/null)\"",
+    "echo \"SKEW=$(chronyc tracking 2>/dev/null | awk '/Last offset/{print $4}')\"",
+    'echo "METRICS_BEGIN"',
+    "curl -fsS --max-time 3 http://127.0.0.1:9091/metrics 2>/dev/null | grep -E '^tv_(tick_processing|wire_to_done|order_placement)_duration_ns_(sum|count)' || echo none",
+    'echo "METRICS_END"',
+]
+
+
+def _avg_ns(sum_v: str, count_v: str) -> float | None:
+    """sum/count -> average nanoseconds, or None if no samples. Pure."""
+    try:
+        s = float(sum_v)
+        c = float(count_v)
+        return s / c if c > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_latency(stdout: str) -> dict:
+    """Parse the labeled latency snapshot into a structured dict (pure)."""
+    dhan_tcp: list[float] = []
+    dhan_tls: list[float] = []
+    metrics: dict[str, str] = {}
+    fields: dict[str, str] = {}
+    mode = ""
+    for line in (stdout or "").splitlines():
+        if line in ("DHAN_BEGIN", "METRICS_BEGIN"):
+            mode = line.split("_")[0]
+            continue
+        if line in ("DHAN_END", "METRICS_END"):
+            mode = ""
+            continue
+        if mode == "DHAN":
+            parts = line.split()
+            if len(parts) == 2:
+                try:
+                    dhan_tcp.append(float(parts[0]))
+                    dhan_tls.append(float(parts[1]))
+                except ValueError:
+                    pass
+            continue
+        if mode == "METRICS":
+            # e.g. "tv_tick_processing_duration_ns_sum 1.23e6"
+            bits = line.split()
+            if len(bits) == 2:
+                metrics[bits[0]] = bits[1]
+            continue
+        if "=" in line:
+            k, _, v = line.partition("=")
+            fields[k.strip()] = v.strip()
+
+    def ms(values: list[float]) -> str:
+        vals = [v for v in values if v > 0]
+        return f"{min(vals) * 1000:.1f}" if vals else ""
+
+    def sec_to_ms(s: str) -> str:
+        try:
+            return f"{float(s) * 1000:.1f}"
+        except (TypeError, ValueError):
+            return ""
+
+    def avg(name: str):
+        a = _avg_ns(metrics.get(name + "_sum", ""), metrics.get(name + "_count", ""))
+        return round(a, 1) if a is not None else None
+
+    return {
+        "dhan_tcp_ms": ms(dhan_tcp),
+        "dhan_tls_ms": ms(dhan_tls),
+        "questdb_ms": sec_to_ms(fields.get("QDB", "")),
+        "clock_skew_ms": sec_to_ms(fields.get("SKEW", "")),
+        "tick_process_avg_ns": avg("tv_tick_processing_duration_ns"),
+        "wire_to_done_avg_ns": avg("tv_wire_to_done_duration_ns"),
+        "order_place_avg_ns": avg("tv_order_placement_duration_ns"),
+        "tick_count": metrics.get("tv_tick_processing_duration_ns_count", ""),
+    }
+
+
 # ---------------------------------------------------------------- GitHub helper
 def _gh(method: str, path: str, body: dict | None = None) -> tuple[int, object]:
     """Minimal GitHub REST call using urllib (no deps). Returns (status, json)."""
@@ -378,6 +469,8 @@ def lambda_handler(event, _context):
                 ]
             )
             return _resp(200, {"ok": True, "action": "logs", "raw": out})
+        if action == "latency":
+            return _resp(200, {"ok": True, "action": "latency", **_parse_latency(_ssm_shell_sync(_LATENCY_COMMANDS))})
 
         # ---- github ----
         if action == "gh_prs":
@@ -536,6 +629,7 @@ def _console_html() -> str:
       <div class="tab" data-t="github" onclick="tab('github')">🔀 GitHub</div>
       <div class="tab" data-t="logs" onclick="tab('logs')">📜 Logs</div>
       <div class="tab" data-t="aws" onclick="tab('aws')">☁️ AWS</div>
+      <div class="tab" data-t="latency" onclick="tab('latency')">⚡ Latency</div>
     </div>
 
     <!-- OVERVIEW -->
@@ -614,6 +708,20 @@ def _console_html() -> str:
         <div id="alarms" style="margin-top:12px"></div>
       </div>
     </section>
+
+    <!-- LATENCY -->
+    <section data-tab="latency" hidden>
+      <div class="card"><div class="lbl">latency — measured live on the box</div>
+        <div class="row" style="margin-bottom:12px"><button class="b-blu" onclick="loadLatency()">⚡ Measure now</button></div>
+        <div class="lbl" style="margin-top:4px">network — how fast each tick reaches us</div>
+        <div class="shields" id="latnet"></div>
+        <div class="lbl" style="margin-top:16px">processing — how fast we handle each tick</div>
+        <div class="shields" id="latproc"></div>
+        <div class="muted" id="lattick" style="margin-top:10px"></div>
+        <div class="muted" style="margin-top:6px">Budgets: tick parse ≤10 ns · full tick process ≤10 µs · order ≤100 ns.
+          Dhan's exchange timestamp is 1-second granular, so the win is low, steady arrival — not microsecond co-location.</div>
+      </div>
+    </section>
   </div>
 </div>
 <div class="toast" id="toast"></div>
@@ -635,6 +743,7 @@ function tab(name){ curTab=name; document.querySelectorAll('.tab').forEach(t=>t.
   document.querySelectorAll('section[data-tab]').forEach(s=>s.hidden=s.dataset.tab!==name);
   if(name==='github' && !$('prs').dataset.loaded) loadGithub();
   if(name==='aws' && !$('alarms').dataset.loaded) loadAws();
+  if(name==='latency' && !$('latnet').dataset.loaded) loadLatency();
   if(name==='logs' && $('logErr').textContent==='—') loadLogs(); }
 
 async function call(action, extra){ if(!TOKEN){ toast('Locked'); return null; }
@@ -704,6 +813,23 @@ async function loadLogs(){ $('logErr').textContent='loading…'; const j=await c
 async function loadAws(){ $('alarms').dataset.loaded='1'; $('alarms').innerHTML='<span class="muted">loading…</span>'; const j=await call('aws_status'); if(!j){ $('alarms').innerHTML=''; return; }
   $('cost').textContent='$'+(j.cost_mtd_usd||'—'); const al=j.alarms_firing||[]; $('alarmcount').innerHTML='<span class="'+(al.length?'bad':'ok')+'">'+al.length+'</span>';
   $('alarms').innerHTML=al.length? al.map(a=>'<div class="pr"><span class="badge failure">ALARM</span> <span class="t">'+esc(a)+'</span></div>').join('') : '<span class="ok">all clear 🎉</span>'; }
+
+function fmtNs(n){ if(n==null||n==='') return '—'; n=Number(n); if(n<1000) return n.toFixed(0)+' ns';
+  if(n<1e6) return (n/1e3).toFixed(2)+' µs'; if(n<1e9) return (n/1e6).toFixed(2)+' ms'; return (n/1e9).toFixed(2)+' s'; }
+function fmtMs(s){ return (s===''||s==null)?'—':s+' ms'; }
+async function loadLatency(){ $('latnet').dataset.loaded='1'; $('latnet').innerHTML='<span class="muted">measuring…</span>'; $('latproc').innerHTML='';
+  const j=await call('latency'); if(!j){ $('latnet').innerHTML=''; return; }
+  const tcp=parseFloat(j.dhan_tcp_ms), skew=Math.abs(parseFloat(j.clock_skew_ms));
+  $('latnet').innerHTML=
+    shield('Network to Dhan (TCP)', fmtMs(j.dhan_tcp_ms), !isNaN(tcp)&&tcp<15)+
+    shield('+ TLS handshake', fmtMs(j.dhan_tls_ms), true)+
+    shield('QuestDB round-trip', fmtMs(j.questdb_ms), true)+
+    shield('Clock skew', fmtMs(j.clock_skew_ms), isNaN(skew)||skew<50);
+  $('latproc').innerHTML=
+    shield('Per-tick process', fmtNs(j.tick_process_avg_ns), (j.tick_process_avg_ns||1e12)<10000)+
+    shield('Wire → done (full)', fmtNs(j.wire_to_done_avg_ns), (j.wire_to_done_avg_ns||1e12)<100000)+
+    shield('Order placement', fmtNs(j.order_place_avg_ns), true);
+  $('lattick').textContent = j.tick_count? ('averaged over '+Number(j.tick_count).toLocaleString()+' ticks since boot') : 'no ticks measured yet (market closed?)'; }
 
 async function act(action){ if(!confirm('Run "'+action+'" on the trading box?')) return; const force=$('force').checked; toast(action+'…');
   const j=await call(action,{force}); if(j){ toast('✅ '+action+' sent'); setTimeout(loadOverview,1600); } }
