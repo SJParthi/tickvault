@@ -1,0 +1,9 @@
+global:
+  scrape_interval: 60s
+  scrape_timeout: 10s
+scrape_configs:
+  - job_name: tickvault
+    static_configs:
+      - targets: ['127.0.0.1:9091']
+        labels:
+          host: tickvault-prod
