@@ -20,9 +20,15 @@
 # Cost: invocations inside Lambda free tier (1M/mo); SSM RunCommand free.
 
 variable "enable_operator_control_lambda" {
-  description = "Deploy the operator-control Lambda + Function URL. Requires SSM SecureString /tickvault/<env>/operator/control-secret."
+  description = "Deploy the operator portal Lambda + Function URL. Requires SSM SecureString /tickvault/<env>/operator/control-secret (+ /operator/github-token for the GitHub tab)."
   type        = bool
   default     = false
+}
+
+variable "operator_github_repo" {
+  description = "owner/repo the operator portal's GitHub tab acts on (view PRs, squash-merge, trigger deploy)."
+  type        = string
+  default     = "SJParthi/tickvault"
 }
 
 data "aws_iam_policy_document" "operator_control_assume" {
@@ -83,6 +89,24 @@ data "aws_iam_policy_document" "operator_control_permissions" {
     resources = ["arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/operator/control-secret"]
   }
 
+  # Fine-grained GitHub PAT (scoped to the one repo) for the GitHub tab —
+  # view PRs, squash-merge, trigger deploy. Read of the SecureString only.
+  statement {
+    sid       = "ReadGithubToken"
+    effect    = "Allow"
+    actions   = ["ssm:GetParameter"]
+    resources = ["arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/operator/github-token"]
+  }
+
+  # AWS tab: read-only CloudWatch alarm states + month-to-date cost. No
+  # resource-level scoping is available for these read APIs (AWS requires "*").
+  statement {
+    sid       = "ReadOnlyObservability"
+    effect    = "Allow"
+    actions   = ["cloudwatch:DescribeAlarms", "ce:GetCostAndUsage"]
+    resources = ["*"]
+  }
+
   # Review finding 7: pin logs to THIS account + this Lambda's log group only.
   statement {
     sid    = "LambdaLogs"
@@ -137,6 +161,9 @@ resource "aws_lambda_function" "operator_control" {
       # lands in env or Terraform state. AWS_REGION is auto-provided by Lambda.
       TV_INSTANCE_ID                = aws_instance.tv_app.id
       OPERATOR_CONTROL_SECRET_PARAM = "/tickvault/${var.environment}/operator/control-secret"
+      OPERATOR_GITHUB_TOKEN_PARAM   = "/tickvault/${var.environment}/operator/github-token"
+      GH_REPO                       = var.operator_github_repo
+      GH_DEPLOY_WORKFLOW            = "deploy-aws.yml"
     }
   }
 }

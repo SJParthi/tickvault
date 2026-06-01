@@ -1,59 +1,48 @@
-# Operator-control Lambda — the single-URL console
+# Operator portal — the single-URL mission control
 
-One URL you open on a phone or laptop to **see** the trading box (instance up?
-app up? ticks flowing? candles sealing? recent errors?) **and control** it
-(start / stop / restart-app / restart-questdb). No AWS console, no GitHub UI,
-no Grafana.
+One URL you open on a phone or laptop to run the whole product. Tabs:
 
-## How it works
+| Tab | What you do |
+|---|---|
+| 📊 **Overview** | Live status (instance/app/market), count-up tick counter, ticks/sec sparkline, **live no-loss proof** (dedup key cols + peak ticks/sec), and Start / Stop / Restart-app / Restart-QuestDB buttons |
+| 📈 **Data** | Animated candle bars per timeframe + a **read-only QuestDB query box** (SELECT/SHOW/EXPLAIN/WITH only, capped 200 rows) |
+| 🔀 **GitHub** | See open PRs + their CI status, **squash-merge** a PR, and **trigger a deploy** — all from the page |
+| 📜 **Logs** | Live error tail + app log tail from the box (journald) |
+| ☁️ **AWS** | CloudWatch alarms firing + this month's AWS spend |
 
-| Request | Auth | What it does |
-|---|---|---|
-| `GET /` (open the URL in a browser) | **none** | Serves the console page — a static shell with **zero secrets**. It shows a token box, a status panel, and control buttons. |
-| `POST /` `{ "action": "view" }` | **Bearer token** | Live snapshot: instance state, app up/down, today's tick count, per-timeframe candle counts, last 5 errors. |
-| `POST /` `{ "action": "start\|stop\|reboot\|restart-app\|stop-app\|restart-questdb" }` | **Bearer token** | Runs the scoped action on the one instance. |
+## Security model
 
-The token you type is stored **only in your browser** (localStorage) and sent
-as `Authorization: Bearer <token>` on every POST. It never appears in the page
-source, Terraform state, or the Lambda env.
-
-Destructive actions (`stop`, `reboot`, `restart-app`, `stop-app`) are blocked
-09:15–15:30 IST Mon–Fri unless you tick **force**.
-
-`deploy` is intentionally NOT here — deploy auto-fires when a PR merges to
-`main` touching `crates/**`. This console links you to the box, not GitHub.
+- `GET /` serves the page — a **public, inert shell with zero secrets**.
+- Every `POST` action requires `Authorization: Bearer <secret>` (constant-time compare). The **token is the device key**: saved only in that device's browser localStorage. Only your laptop + phone hold it → in practice only those devices work. "🔒 Lock / forget this device" wipes it.
+- GitHub actions use a **fine-grained PAT scoped to the one repo**, read from SSM at runtime — never in the page, env, or Terraform state.
+- IAM scoped to: this one instance (ec2 start/stop/reboot, ssm send+read), the two SSM secrets, and read-only `cloudwatch:DescribeAlarms` + `ce:GetCostAndUsage`. Nothing else.
+- The SQL box is **read-only** — mutating keywords are rejected before the query reaches QuestDB.
+- Destructive box actions are blocked 09:15–15:30 IST Mon–Fri unless you tick **force**.
 
 ## One-time enable (feature-flagged OFF by default — zero cost/risk until you opt in)
 
 ```bash
-# 1. Create the bearer secret (pick a long random string).
+# 1. Console bearer key (your device key — paste it into the page once)
 aws ssm put-parameter --region ap-south-1 \
   --name /tickvault/prod/operator/control-secret \
-  --type SecureString \
-  --value "$(openssl rand -base64 30)"
+  --type SecureString --value "$(openssl rand -base64 30)"
 
-# 2. Turn on the feature flag and apply (creates the Lambda + Function URL + IAM).
+# 2. Fine-grained GitHub PAT — scope it to ONLY SJParthi/tickvault with:
+#      Contents: read, Pull requests: read+write, Actions: read+write, Checks: read
+#    (create at https://github.com/settings/personal-access-tokens)
+aws ssm put-parameter --region ap-south-1 \
+  --name /tickvault/prod/operator/github-token \
+  --type SecureString --value "github_pat_xxx"
+
+# 3. Turn the portal on (creates Lambda + Function URL + scoped IAM)
 cd deploy/aws/terraform
 terraform apply -var enable_operator_control_lambda=true
 
-# 3. Grab the URL (open it in a browser; paste the secret from step 1 once).
+# 4. Get your URL — open it, paste the device key once
 terraform output operator_control_function_url
 ```
 
-To read the secret back later: `aws ssm get-parameter --name
-/tickvault/prod/operator/control-secret --with-decryption --query
-Parameter.Value --output text`.
-
-## Security model
-
-- Function URL AWS auth = `NONE`, but every POST is gated by a constant-time
-  bearer compare against the SSM SecureString. Missing/wrong → `401`.
-- IAM scoped to **exactly** this instance: `ec2:Start/Stop/Reboot` on the one
-  instance ARN, `ssm:SendCommand` + `ssm:GetCommandInvocation` on the one
-  instance + `AWS-RunShellScript` only, `ssm:GetParameter` on the one secret.
-  Nothing else.
-- Every invocation is CloudWatch-logged; a `tv-prod-operator-control-errors`
-  alarm pages if the Lambda starts erroring.
+The GitHub tab simply shows "github token not configured" until step 2 is done; everything else works without it.
 
 ## Tests
 
@@ -62,6 +51,4 @@ cd deploy/aws/lambda/operator-control
 python3 -m unittest test_handler -v
 ```
 
-15 pure-function tests (method routing, bearer auth, market-hours guard,
-snapshot parsing, public-HTML-has-no-secret). The boto3 EC2/SSM action paths
-are exercised by the live deploy smoke test.
+19 pure-function tests: method routing, constant-time bearer auth, market-hours guard, snapshot parsing, the read-only SQL gate, all-tabs-present, and public-HTML-has-no-secret. The boto3 / GitHub / SSM action paths are exercised by the live deploy smoke test.
