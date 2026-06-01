@@ -87,6 +87,8 @@ class ParseView(unittest.TestCase):
             "C15M=25\n"
             "C60M=6\n"
             "C1D=4\n"
+            "DEDUP_KEYS=4\n"
+            "MAX_TPS=5\n"
             "ERRORS_BEGIN\n"
             "Jun 01 11:00 tickvault: WARN something\n"
             "ERRORS_END\n"
@@ -96,12 +98,16 @@ class ParseView(unittest.TestCase):
         self.assertEqual(out["ticks_today"], "152340")
         self.assertEqual(out["candles"]["1m"], "372")
         self.assertEqual(out["candles"]["1d"], "4")
+        self.assertEqual(out["dedup_key_columns"], "4")
+        self.assertEqual(out["max_ticks_per_second"], "5")
         self.assertEqual(len(out["recent_errors"]), 1)
         self.assertIn("WARN something", out["recent_errors"][0])
 
     def test_empty_stdout_yields_blank_fields(self) -> None:
         out = handler._parse_view("")
         self.assertEqual(out["app"], "")
+        self.assertEqual(out["dedup_key_columns"], "")
+        self.assertEqual(out["max_ticks_per_second"], "")
         self.assertEqual(out["recent_errors"], [])
 
     def test_no_error_lines_between_markers(self) -> None:
