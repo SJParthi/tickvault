@@ -178,7 +178,8 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
                 volume                      LONG, \
                 oi                          LONG, \
                 tick_count                  LONG, \
-                close_pct_from_prev_day     DOUBLE\
+                close_pct_from_prev_day     DOUBLE, \
+                open_pct                    DOUBLE\
             ) timestamp(ts) PARTITION BY DAY \
             DEDUP UPSERT KEYS({DEDUP_KEY_CANDLES});"
         );
@@ -192,6 +193,12 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
         let alter_ddl =
             format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS close_pct_from_prev_day DOUBLE;");
         run_ddl(&client, &base_url, table, &alter_ddl).await;
+
+        // §31 Option 2 (2026-06-01): self-heal the `open_pct` column for
+        // tables created before it existed. Free on every boot.
+        let alter_open_pct =
+            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS open_pct DOUBLE;");
+        run_ddl(&client, &base_url, table, &alter_open_pct).await;
     }
 }
 

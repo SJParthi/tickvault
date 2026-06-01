@@ -121,6 +121,16 @@ pub struct LiveCandleState {
     pub oi_pct_from_prev_day: f64,
     /// `volume / prev_day.volume * 100.0`. Stamped at seal time.
     pub volume_pct_from_prev_day: f64,
+    /// Today's SESSION open = the exchange-published `day_open` (Dhan
+    /// Quote-packet bytes 34-37 = the NSE pre-open auction result, i.e.
+    /// the official 09:15 open). Static per trading day, blank pre-market;
+    /// last non-zero value wins so a pre-open `0` never clobbers it.
+    /// Feeds `open_pct` at seal (operator lock 2026-06-01 §31 / Option 2).
+    pub session_open: f64,
+    /// `(close - session_open) / session_open * 100.0` — % change vs the
+    /// official 09:15 open. Stamped at seal time. `0.0` if session_open is
+    /// `0.0` (div-by-zero guard).
+    pub open_pct: f64,
 }
 
 impl LiveCandleState {
@@ -144,6 +154,8 @@ impl LiveCandleState {
             close_pct_from_prev_day: 0.0,
             oi_pct_from_prev_day: 0.0,
             volume_pct_from_prev_day: 0.0,
+            session_open: 0.0,
+            open_pct: 0.0,
         }
     }
 
@@ -220,6 +232,15 @@ impl LiveCandleState {
             close_pct_from_prev_day: 0.0,
             oi_pct_from_prev_day: 0.0,
             volume_pct_from_prev_day: 0.0,
+            // Session open from the live Quote `day_open` field (official
+            // 09:15 open). `0.0` pre-market; first 09:15+ tick supplies the
+            // real value via fold_in_bucket. Feeds `open_pct` at seal.
+            session_open: if tick.day_open > 0.0 {
+                tickvault_common::price_precision::f32_to_f64_clean(tick.day_open)
+            } else {
+                0.0
+            },
+            open_pct: 0.0,
         }
     }
 
@@ -249,6 +270,11 @@ impl LiveCandleState {
         if tick.day_close > 0.0 {
             self.prev_day_close =
                 tickvault_common::price_precision::f32_to_f64_clean(tick.day_close);
+        }
+        // Keep the last non-zero session open (Quote `day_open`). Mirrors
+        // the prev_day_close guard above — a pre-open 0 must not clobber it.
+        if tick.day_open > 0.0 {
+            self.session_open = tickvault_common::price_precision::f32_to_f64_clean(tick.day_open);
         }
     }
 }
@@ -432,9 +458,13 @@ impl AggregatorCell {
 
 // Compile-time size assertion — bumping this requires updating the
 // per-instrument RAM budget in `aws-budget.md`.
+// 2026-06-01 §31 Option 2: bumped 96 → 112 to carry `session_open` +
+// `open_pct` (the official-09:15-open % column, mirrors the existing
+// prev_day_close/close_pct per-slot pattern). RAM cost: +16 B × 21 TF ×
+// ~250 SIDs ≈ 84 KB total — negligible on the 8 GiB host.
 const _: () = assert!(
-    std::mem::size_of::<LiveCandleState>() <= 96,
-    "LiveCandleState exceeded 96-byte budget — every new field bloats per-instrument RAM by 9× (one slot per TF). Either shrink the new field or update aws-budget.md and bump this assertion."
+    std::mem::size_of::<LiveCandleState>() <= 112,
+    "LiveCandleState exceeded 112-byte budget — every new field bloats per-instrument RAM by 21× (one slot per TF). Either shrink the new field or update aws-budget.md and bump this assertion."
 );
 
 // ---------------------------------------------------------------------------
@@ -457,9 +487,10 @@ mod tests {
 
     #[test]
     fn test_live_candle_state_size_is_within_budget() {
-        // 96-byte budget is pinned by the const _ assert above; this
-        // runtime test makes the contract grep-able.
-        assert!(std::mem::size_of::<LiveCandleState>() <= 96);
+        // 112-byte budget is pinned by the const _ assert above (bumped
+        // from 96 for §31 session_open + open_pct); this runtime test
+        // makes the contract grep-able.
+        assert!(std::mem::size_of::<LiveCandleState>() <= 112);
     }
 
     #[test]
@@ -469,6 +500,38 @@ mod tests {
         assert_eq!(s.bucket_start_ist_secs, 0);
         assert_eq!(s.open, 0.0);
         assert_eq!(s.tick_count, 0);
+        // §31 Option 2: new fields default to 0.0.
+        assert_eq!(s.session_open, 0.0);
+        assert_eq!(s.open_pct, 0.0);
+    }
+
+    #[test]
+    fn test_session_open_captured_from_day_open() {
+        // §31 Option 2: the official 09:15 open is captured live from the
+        // Quote `day_open` field (last non-zero wins, like prev_day_close).
+        let cell = AggregatorCell::empty();
+        let mut t1 = mk_tick(1_779_354_960, 100.0, 50, 1_000);
+        t1.day_open = 100.0;
+        cell.consume_tick(TfIndex::M1, &t1, 0);
+        assert_eq!(cell.snapshot(TfIndex::M1).session_open, 100.0);
+
+        // A later in-bucket tick keeps session_open + updates close.
+        let mut t2 = mk_tick(1_779_354_975, 103.0, 60, 1_010);
+        t2.day_open = 100.0;
+        cell.consume_tick(TfIndex::M1, &t2, 0);
+        let snap = cell.snapshot(TfIndex::M1);
+        assert_eq!(snap.session_open, 100.0, "session_open preserved");
+        assert_eq!(snap.close, 103.0);
+
+        // A pre-open tick (day_open == 0) must NOT clobber the captured open.
+        let mut t3 = mk_tick(1_779_354_990, 104.0, 70, 1_020);
+        t3.day_open = 0.0;
+        cell.consume_tick(TfIndex::M1, &t3, 0);
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).session_open,
+            100.0,
+            "day_open=0 must not clobber the real session open"
+        );
     }
 
     #[test]

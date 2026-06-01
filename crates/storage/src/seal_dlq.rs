@@ -109,6 +109,9 @@ pub struct SealDlqRecord {
     pub oi_pct_from_prev_day: f64,
     #[serde(default)]
     pub volume_pct_from_prev_day: f64,
+    /// §31 Option 2 (2026-06-01): % vs the official 09:15 session open.
+    #[serde(default)]
+    pub open_pct: f64,
 }
 
 impl From<&SerializedSeal> for SealDlqRecord {
@@ -133,6 +136,7 @@ impl From<&SerializedSeal> for SealDlqRecord {
             close_pct_from_prev_day: s.close_pct_from_prev_day,
             oi_pct_from_prev_day: s.oi_pct_from_prev_day,
             volume_pct_from_prev_day: s.volume_pct_from_prev_day,
+            open_pct: s.open_pct,
         }
     }
 }
@@ -159,6 +163,7 @@ impl From<&SealDlqRecord> for SerializedSeal {
             close_pct_from_prev_day: r.close_pct_from_prev_day,
             oi_pct_from_prev_day: r.oi_pct_from_prev_day,
             volume_pct_from_prev_day: r.volume_pct_from_prev_day,
+            open_pct: r.open_pct,
         }
     }
 }
@@ -343,6 +348,7 @@ mod tests {
             close_pct_from_prev_day: 1.5,
             oi_pct_from_prev_day: -0.2,
             volume_pct_from_prev_day: 12.3,
+            open_pct: 7.7,
         }
     }
 
@@ -466,6 +472,7 @@ mod tests {
             close_pct_from_prev_day: -3.5,
             oi_pct_from_prev_day: -10.0,
             volume_pct_from_prev_day: -100.0,
+            open_pct: -50.0,
         };
         let r = SealDlqRecord::from(&s);
         let json = serde_json::to_string(&r).expect("serialise");
