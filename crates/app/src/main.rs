@@ -2547,7 +2547,14 @@ async fn main() -> Result<()> {
                         reason: reason.clone(),
                         within_market_hours: in_market_hours,
                     });
-                    if in_market_hours {
+                    // The profile/IP pre-market check is a LIVE-ORDER-TRADING
+                    // gate (dataPlan / activeSegment / static-IP must be valid
+                    // before placing real orders). In the no-orders DATA-CAPTURE
+                    // phase (mode != Live, e.g. Paper) it must NOT block boot —
+                    // capturing ticks needs neither a validated profile nor a
+                    // static IP, and a HALT here just crash-loops the app and
+                    // stops all data capture. Only HALT when we will trade live.
+                    if in_market_hours && config.strategy.mode.is_live() {
                         // HALT — we refuse to boot into a live trading session
                         // with a bad profile. systemd will restart on the next
                         // attempt but the underlying cause (dataPlan / segment
@@ -2560,11 +2567,15 @@ async fn main() -> Result<()> {
                             "pre-market profile check FAILED during market hours — HALT: {reason}"
                         );
                     }
-                    // Pre-market window — log ERROR (triggers Telegram) but
-                    // allow boot to continue; operator has until 09:15 IST.
+                    // Pre-market window OR non-live (data-capture) mode: log
+                    // ERROR (triggers Telegram) but allow boot to CONTINUE so
+                    // the market-data feed + tick capture still run. No live
+                    // orders are placed in this mode, so a bad profile/IP is
+                    // not a trading-safety risk.
                     error!(
                         error = %err,
-                        "pre-market profile check FAILED — investigate before 09:15 IST"
+                        mode = ?config.strategy.mode,
+                        "pre-market profile check FAILED — continuing (data-capture mode or pre-09:15; no live orders placed)"
                     );
                 }
             }
