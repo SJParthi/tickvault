@@ -345,6 +345,13 @@ pub struct WebSocketConnection {
     /// operator distinguish "1 long retry" from "60 short retries" when
     /// debugging a long outage.
     attempts_since_last_disconnect: std::sync::atomic::AtomicU32,
+    /// Consecutive Dhan feed rate-limit (HTTP 429 / DATA-805 class) connect
+    /// failures since the last successful connect. Drives the post-429
+    /// reconnect floor in `wait_with_backoff` (Dhan guidance: "stop all
+    /// connections for 60s, then reconnect one at a time" — instant-retry
+    /// after a 429 just keeps the limit alive). Reset to `0` on a clean
+    /// connect+subscribe.
+    rate_limit_streak: std::sync::atomic::AtomicU32,
 }
 
 /// Audit-2026-05-03 H2: static lookup for connection-id labels used by
@@ -450,6 +457,7 @@ impl WebSocketConnection {
             last_disconnect_reason: std::sync::Mutex::new(None),
             last_disconnect_at_epoch_secs: std::sync::atomic::AtomicI64::new(0),
             attempts_since_last_disconnect: std::sync::atomic::AtomicU32::new(0),
+            rate_limit_streak: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -898,6 +906,13 @@ impl WebSocketConnection {
                         body = ?response.body().as_ref().map(|b| String::from_utf8_lossy(b).to_string()),
                         "WebSocket HTTP error"
                     );
+                    // Dhan feed rate-limit (HTTP 429 / DATA-805 class): bump the
+                    // streak so the NEXT `wait_with_backoff` applies the 60s→5m
+                    // floor instead of the instant (0ms) first-retry. Instant
+                    // reconnect after a 429 just keeps the limit alive.
+                    if response.status().as_u16() == 429 {
+                        self.rate_limit_streak.fetch_add(1, Ordering::Release);
+                    }
                 }
                 return Err(WebSocketError::ConnectionFailed {
                     url: self.websocket_base_url.clone(),
@@ -930,6 +945,10 @@ impl WebSocketConnection {
             messages_sent = self.cached_subscription_messages.len(),
             "Subscriptions sent"
         );
+
+        // Clean connect + subscribe — clear any feed rate-limit streak so the
+        // post-429 reconnect floor resets to normal backoff.
+        self.rate_limit_streak.store(0, Ordering::Release);
 
         // Reunite for the read loop.
         // APPROVED: reuniting same split — cannot fail
@@ -1603,13 +1622,30 @@ impl WebSocketConnection {
         // different value on each reconnect attempt. No new crate dep.
         //
         // Jitter range: ±jitter_pct% of base_delay_ms, clamped to [0, base*2].
-        let delay_ms = jitter_reconnect_delay(base_delay_ms, self.connection_id, attempt);
+        let jittered_ms = jitter_reconnect_delay(base_delay_ms, self.connection_id, attempt);
+
+        // Post-429 floor: if Dhan has rate-limited the feed (HTTP 429 /
+        // DATA-805 class), enforce a 60s→5m minimum so we stop hammering the
+        // endpoint. Instant-retry after a 429 just keeps the limit alive.
+        let rl_streak = self.rate_limit_streak.load(Ordering::Acquire);
+        let delay_ms = if rl_streak > 0 {
+            let floor_ms = compute_rate_limit_floor_ms(
+                rl_streak,
+                tickvault_common::constants::WS_RATE_LIMIT_BACKOFF_BASE_MS,
+                tickvault_common::constants::WS_RATE_LIMIT_BACKOFF_CAP_MS,
+            );
+            metrics::counter!("tv_ws_rate_limit_backoff_total", "feed" => "main").increment(1);
+            jittered_ms.max(floor_ms)
+        } else {
+            jittered_ms
+        };
 
         info!(
             connection_id = self.connection_id,
             attempt = attempt,
             base_delay_ms = base_delay_ms,
             delay_ms = delay_ms,
+            rate_limit_streak = rl_streak,
             "Reconnecting after backoff"
         );
 
@@ -1759,6 +1795,28 @@ pub fn compute_reconnect_base_delay_ms(attempt: u64, initial_ms: u64, max_ms: u6
     initial_ms.saturating_mul(multiplier).min(max_ms)
 }
 
+/// Minimum reconnect wait (ms) after `streak` consecutive Dhan feed
+/// rate-limit (HTTP 429 / DATA-805 class) connect failures:
+/// `base_ms * 2^(streak-1)`, capped at `cap_ms`. A `streak` of `0` returns
+/// `0` (no floor — normal backoff applies). The caller takes
+/// `delay.max(floor)`, so a 429 turns the instant (0ms) first-retry into a
+/// `base_ms` (60s) cooldown that grows ×2 per consecutive 429. This mirrors
+/// Dhan's "stop all connections for 60s, then reconnect one at a time"
+/// guidance for the 805 class and prevents an instant-reconnect loop from
+/// keeping the rate-limit alive.
+///
+/// Pure function. Tested by `test_compute_rate_limit_floor_ms_*`.
+#[inline]
+#[must_use]
+pub fn compute_rate_limit_floor_ms(streak: u32, base_ms: u64, cap_ms: u64) -> u64 {
+    if streak == 0 {
+        return 0;
+    }
+    let shift = streak.saturating_sub(1).min(63);
+    let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+    base_ms.saturating_mul(multiplier).min(cap_ms)
+}
+
 pub(crate) fn jitter_reconnect_delay(base_delay_ms: u64, connection_id: u8, attempt: u64) -> u64 {
     if base_delay_ms == 0 {
         return 0;
@@ -1831,6 +1889,34 @@ mod tests {
         assert_eq!(compute_reconnect_base_delay_ms(0, 500, 30_000), 0);
         assert_eq!(compute_reconnect_base_delay_ms(0, 0, 0), 0);
         assert_eq!(compute_reconnect_base_delay_ms(0, 1, 1_000_000), 0);
+    }
+
+    #[test]
+    fn test_compute_rate_limit_floor_ms_zero_streak_is_no_floor() {
+        // No 429 seen → no floor; normal backoff applies.
+        assert_eq!(compute_rate_limit_floor_ms(0, 60_000, 300_000), 0);
+    }
+
+    #[test]
+    fn test_compute_rate_limit_floor_ms_grows_then_caps() {
+        // streak=1 → base (60s); doubles each consecutive 429; caps at 5m.
+        assert_eq!(compute_rate_limit_floor_ms(1, 60_000, 300_000), 60_000);
+        assert_eq!(compute_rate_limit_floor_ms(2, 60_000, 300_000), 120_000);
+        assert_eq!(compute_rate_limit_floor_ms(3, 60_000, 300_000), 240_000);
+        // 60_000 * 2^3 = 480_000 > 300_000 → clamped to the cap.
+        assert_eq!(compute_rate_limit_floor_ms(4, 60_000, 300_000), 300_000);
+        assert_eq!(compute_rate_limit_floor_ms(50, 60_000, 300_000), 300_000);
+    }
+
+    #[test]
+    fn test_compute_rate_limit_floor_overrides_instant_first_retry() {
+        // The real bug: attempt=0 normally yields an INSTANT (0ms) reconnect,
+        // which after a 429 keeps the rate-limit alive. With a streak the
+        // caller takes max(0, floor) = floor, so the first retry waits 60s.
+        let instant = compute_reconnect_base_delay_ms(0, 500, 30_000);
+        let floor = compute_rate_limit_floor_ms(1, 60_000, 300_000);
+        assert_eq!(instant, 0);
+        assert_eq!(instant.max(floor), 60_000);
     }
 
     #[test]
