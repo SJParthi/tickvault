@@ -838,6 +838,12 @@ function startAuto(){ stopAuto(); if($('auto').checked) timer=setInterval(()=>{ 
 function stopAuto(){ if(timer){ clearInterval(timer); timer=null; } }
 function autotoggle(){ $('auto').checked?startAuto():stopAuto(); }
 
+// Ready-made link support: a URL ending in #key=<secret> (or ?key=) auto-saves
+// the device key, strips it from the address bar, and unlocks — so the Telegram
+// link "just works" with zero typing. The fragment never reaches the server.
+(function(){ var k=(location.hash.match(/key=([^&]+)/)||[])[1] || new URLSearchParams(location.search).get('key');
+  if(k){ TOKEN=decodeURIComponent(k); localStorage.setItem('tv_token',TOKEN);
+    try{ history.replaceState(null,'',location.pathname); }catch(e){} } })();
 if(TOKEN){ $('tok').value=TOKEN; $('lock').hidden=true; $('app').hidden=false; startAuto(); loadOverview(); }
 </script>
 </body>

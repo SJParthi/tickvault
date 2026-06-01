@@ -135,6 +135,51 @@ class GetServesPublicHtml(unittest.TestCase):
         for t in ("overview", "data", "github", "logs", "aws", "latency"):
             self.assertIn('data-t="' + t + '"', html)
 
+    def test_html_supports_ready_made_key_link(self) -> None:
+        # A #key=... link must auto-unlock + strip the fragment from the URL.
+        html = handler._console_html()
+        self.assertIn("location.hash", html)
+        self.assertIn("replaceState", html)
+        self.assertIn("tv_token", html)
+
+
+class Latency(unittest.TestCase):
+    def test_avg_ns(self) -> None:
+        self.assertEqual(handler._avg_ns("1000", "10"), 100.0)
+        self.assertIsNone(handler._avg_ns("1000", "0"))
+        self.assertIsNone(handler._avg_ns("", ""))
+
+    def test_parse_latency_full(self) -> None:
+        stdout = (
+            "DHAN_BEGIN\n"
+            "0.012 0.030\n"
+            "0.009 0.025\n"
+            "0.011 0.028\n"
+            "DHAN_END\n"
+            "QDB=0.0021\n"
+            "SKEW=0.000123\n"
+            "METRICS_BEGIN\n"
+            "tv_tick_processing_duration_ns_sum 50000\n"
+            "tv_tick_processing_duration_ns_count 1000\n"
+            "tv_wire_to_done_duration_ns_sum 8000000\n"
+            "tv_wire_to_done_duration_ns_count 1000\n"
+            "METRICS_END\n"
+        )
+        out = handler._parse_latency(stdout)
+        self.assertEqual(out["dhan_tcp_ms"], "9.0")  # min of the 3 samples
+        self.assertEqual(out["questdb_ms"], "2.1")
+        self.assertEqual(out["clock_skew_ms"], "0.1")
+        self.assertEqual(out["tick_process_avg_ns"], 50.0)
+        self.assertEqual(out["wire_to_done_avg_ns"], 8000.0)
+        self.assertIsNone(out["order_place_avg_ns"])
+        self.assertEqual(out["tick_count"], "1000")
+
+    def test_parse_latency_empty(self) -> None:
+        out = handler._parse_latency("")
+        self.assertEqual(out["dhan_tcp_ms"], "")
+        self.assertIsNone(out["tick_process_avg_ns"])
+        self.assertEqual(out["tick_count"], "")
+
 
 class Latency(unittest.TestCase):
     def test_avg_ns(self) -> None:
