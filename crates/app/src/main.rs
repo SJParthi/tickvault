@@ -1689,6 +1689,17 @@ async fn main() -> Result<()> {
                 .to_string(),
         });
 
+        // CRITICAL: tell systemd the service is up. The unit is Type=notify, so
+        // systemd kills the process at TimeoutStartSec (default 90s) unless it
+        // receives sd_notify(READY=1). The slow-boot path sends this near the
+        // end of main(), but the fast-boot (crash-recovery) path returns into
+        // run_shutdown_fast() below and never reaches that call site. Without
+        // this line the fast-boot path was SIGTERM'd every 90s, restarted into
+        // crash-recovery (cached token + market hours), and looped forever —
+        // which is exactly why ticks never persisted on AWS. No-op when
+        // NOTIFY_SOCKET is unset (e.g. local `cargo run`).
+        infra::notify_systemd_ready();
+
         // --- Await shutdown ---
         return run_shutdown_fast(
             ws_handles,
