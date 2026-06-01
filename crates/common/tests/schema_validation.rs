@@ -308,12 +308,14 @@ fn test_dedup_key_derivative_contracts_includes_underlying_symbol() {
 /// security_id. The constant lives in the storage crate but the required value
 /// is a documented contract — we assert it here to catch any future rename.
 ///
-/// Ground truth: DEDUP_KEY_TICKS = "security_id, segment"
+/// Ground truth: DEDUP_KEY_TICKS = "security_id, segment, received_at"
 #[test]
 fn test_dedup_key_ticks_includes_segment() {
     // I-P1-06: dedup key must include segment to prevent cross-segment
-    // collision (NSE_EQ vs BSE_EQ with same security_id).
-    const DEDUP_KEY_TICKS: &str = "security_id, segment";
+    // collision (NSE_EQ vs BSE_EQ with same security_id). It also includes
+    // received_at (2026-06-01) so sub-second ticks — which share a
+    // second-granular Dhan LTT `ts` — are not collapsed to one row.
+    const DEDUP_KEY_TICKS: &str = "security_id, segment, received_at";
     assert!(
         DEDUP_KEY_TICKS.contains("segment"),
         "I-P1-06: DEDUP_KEY_TICKS must contain 'segment' to prevent \
@@ -322,5 +324,9 @@ fn test_dedup_key_ticks_includes_segment() {
     assert!(
         DEDUP_KEY_TICKS.contains("security_id"),
         "DEDUP_KEY_TICKS must also contain 'security_id'"
+    );
+    assert!(
+        DEDUP_KEY_TICKS.contains("received_at"),
+        "DEDUP_KEY_TICKS must contain 'received_at' to preserve sub-second ticks"
     );
 }
