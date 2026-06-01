@@ -453,23 +453,22 @@ def lambda_handler(event, _context):
             cid = _ssm_shell(["cd /opt/tickvault/repo/deploy/docker && docker compose restart questdb"])
             return _resp(200, {"ok": True, "action": action, "command_id": cid})
         if action == "wipe-questdb":
-            # DESTRUCTIVE: deletes ALL QuestDB data for a fresh start. Always
-            # requires force=true (even off-hours), and is in _DESTRUCTIVE so it
-            # is ALSO market-hours-blocked. Sequence: stop app -> compose down -v
-            # (removes the tv-questdb-data volume) -> up -d (empty QuestDB) ->
-            # start app (boot DDL recreates the schema). Next session = fresh.
+            # DESTRUCTIVE: empties the market-data tables for a fresh start.
+            # Requires force=true (even off-hours) + is in _DESTRUCTIVE
+            # (market-hours-blocked). TRUNCATEs ticks + candles directly in
+            # QuestDB — the docker-volume approach (down -v) proved unreliable on
+            # this box (QuestDB started outside the compose project / volume
+            # in-use), but TRUNCATE clears the rows regardless and keeps the
+            # schema, so no recreation is needed. Audit tables are intentionally
+            # preserved (SEBI retention). Next session = fresh data.
             if not force:
                 return _resp(409, {"error": 'wipe is destructive — re-send with {"force": true}', "action": action})
-            cid = _ssm_shell(
-                [
-                    "set +e",
-                    "systemctl stop tickvault || true",
-                    "cd /opt/tickvault/repo/deploy/docker && docker compose down -v",
-                    "cd /opt/tickvault/repo/deploy/docker && docker compose up -d",
-                    "sleep 8",
-                    "systemctl start tickvault || true",
-                ]
-            )
+            tables = ["ticks", "candles_1m", "candles_5m", "candles_15m", "candles_60m", "candles_1d"]
+            cmds = ["set +e"]
+            cmds += [
+                f"curl -fsS 'http://127.0.0.1:9000/exec?query=TRUNCATE%20TABLE%20{t}' 2>/dev/null; echo" for t in tables
+            ]
+            cid = _ssm_shell(cmds)
             return _resp(200, {"ok": True, "action": action, "command_id": cid})
 
         # ---- overview / data ----
