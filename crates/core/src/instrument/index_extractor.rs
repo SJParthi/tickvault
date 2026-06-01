@@ -1,6 +1,12 @@
-//! Sub-PR #6 of 2026-05-27 daily-universe expansion — extract every
-//! `IDX_I` index row from the parsed Dhan Detailed CSV per the §2
-//! universe scope (all NSE indices + 1 BSE SENSEX).
+//! Sub-PR #6 of 2026-05-27 daily-universe expansion — extract the
+//! in-scope `IDX_I` index rows from the parsed Dhan Detailed CSV.
+//!
+//! **Operator lock 2026-06-01 (§30):** the NSE side is now a FIXED
+//! 31-index allowlist (the Dhan Markets → Index → NSE display set), NOT
+//! "all NSE index rows". The master carries 119 NSE index rows; the
+//! other 88 (G-Sec, Shariah, leverage, ESG, multicap variants) are
+//! dropped. BSE side stays "SENSEX only". GIFT Nifty (`GIFTNIFTY`,
+//! sid 5024) is allowlisted AND flagged for the market-hours exemption.
 //!
 //! **Feature-gated.** This module compiles only when the
 //! `daily_universe_fetcher` cargo feature is enabled (per §21 of the
@@ -54,6 +60,72 @@ const EXCH_ID_BSE: &str = "BSE";
 /// sensex bse index also needed dude entirely".
 const BSE_SENSEX_SYMBOL: &str = "SENSEX";
 
+/// Fixed NSE index allowlist — operator lock 2026-06-01 (§30 of the rule
+/// file). The Dhan master carries 119 NSE `IDX_I` index rows (G-Sec,
+/// Shariah, leverage, ESG, multicap…); the operator wants ONLY the 31
+/// indices shown on Dhan's Markets → Index → NSE page. Every string is
+/// the EXACT `SYMBOL_NAME` verified 1-by-1 against the operator's real
+/// master CSV (api-scrip-master-detailed.csv, 220,287 rows, 2026-06-01),
+/// stored already-normalized (uppercase, single-spaced) so the match is
+/// O(1)-ish over a 31-entry slice with no per-row allocation beyond the
+/// normalized symbol. A non-allowlisted NSE index row is dropped.
+///
+/// `GIFTNIFTY` (sid 5024) is in this list AND additionally exempted from
+/// the market-hours tick/candle window (it trades ~21h/day on NSE-IX) —
+/// see the always-on exemption built from this extraction at boot.
+const NSE_INDEX_ALLOWLIST: &[&str] = &[
+    "NIFTY",
+    "NIFTY NEXT 50",
+    "BANKNIFTY",
+    "FINNIFTY",
+    "INDIA VIX",
+    "NIFTYIT",
+    "NIFTY AUTO",
+    "NIFTY PHARMA",
+    "NIFTY FMCG",
+    "NIFTY METAL",
+    "NIFTY MEDIA",
+    "NIFTY 100",
+    "NIFTY 200",
+    "NIFTY 500",
+    "GIFTNIFTY",
+    "NIFTY PVT BANK",
+    "NIFTY PSU BANK",
+    "NIFTY REALTY",
+    "NIFTY ENERGY",
+    "NIFTYINFRA",
+    "NIFTY MNC",
+    "NIFTY CONSUMPTION",
+    "NIFTY SERV SECTOR",
+    "MIDCPNIFTY",
+    "NIFTYMCAP50",
+    "NIFTY MID100 FREE",
+    "NIFTY MIDCAP 150",
+    "NIFTY SMALLCAP 50",
+    "NIFTY SMALLCAP 100",
+    "NIFTY SMALLCAP 250",
+    "NIFTY MICROCAP250",
+];
+
+/// The `SYMBOL_NAME` of GIFT Nifty in the Dhan master (sid 5024,
+/// `EXCH=NSE SEGMENT=I INSTRUMENT=INDEX`). Used both as an allowlist
+/// member above and to resolve the market-hours exemption SID at boot.
+pub const GIFT_NIFTY_SYMBOL: &str = "GIFTNIFTY";
+
+/// Normalize a symbol for allowlist comparison: collapse internal
+/// whitespace to a single space, trim, uppercase. Cold-path (boot)
+/// only — the one `String` allocation per index row is acceptable.
+///
+/// O(1) EXEMPT: runs once per CSV row at boot, not on the tick hot path.
+#[must_use]
+pub fn normalize_index_symbol(symbol: &str) -> String {
+    symbol
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_uppercase()
+}
+
 /// Result of the index extraction pass.
 #[derive(Debug, Clone)]
 pub struct IndexExtraction {
@@ -64,6 +136,13 @@ pub struct IndexExtraction {
     /// The single BSE SENSEX row. `None` if the CSV does not contain
     /// one — boot HALTS in that case per the operator's §0 quote 2.
     pub bse_sensex: Option<CsvRow>,
+
+    /// Allowlisted NSE index names (from [`NSE_INDEX_ALLOWLIST`]) that
+    /// were NOT present in today's CSV. Empty in the normal case. The
+    /// boot orchestrator emits a LOUD `warn!` naming these so a Dhan
+    /// rename/removal surfaces immediately instead of a silent drop
+    /// (operator lock 2026-06-01 §30 — "no silent miss").
+    pub allowlist_misses: Vec<&'static str>,
 }
 
 impl IndexExtraction {
@@ -114,6 +193,9 @@ pub fn extract_indices(rows: &[CsvRow]) -> Result<IndexExtraction, IndexExtractE
     // Track BSE IDX_I symbols seen, so a SENSEX-rename surfaces in the
     // rejection error instead of an opaque "missing".
     let mut bse_idx_symbols_seen: Vec<String> = Vec::new();
+    // Operator lock 2026-06-01 §30: per-allowlist-entry match flags so we
+    // can report which allowlisted indices the CSV did NOT contain.
+    let mut matched = vec![false; NSE_INDEX_ALLOWLIST.len()];
 
     for row in rows {
         if !is_idx_i_index(&row.segment, &row.instrument) {
@@ -121,7 +203,18 @@ pub fn extract_indices(rows: &[CsvRow]) -> Result<IndexExtraction, IndexExtractE
         }
 
         if row.exch_id.eq_ignore_ascii_case(EXCH_ID_NSE) {
-            nse_indices.push(row.clone());
+            // Operator lock 2026-06-01 §30: keep ONLY the 31 allowlisted
+            // NSE indices (the Dhan Index-tab set). The master carries
+            // 119 NSE index rows; the other 88 are dropped here.
+            let norm = normalize_index_symbol(&row.symbol_name);
+            if let Some(pos) = NSE_INDEX_ALLOWLIST
+                .iter()
+                .position(|allowed| *allowed == norm)
+            {
+                matched[pos] = true;
+                nse_indices.push(row.clone());
+            }
+            // Non-allowlisted NSE index → silently dropped per §30 scope.
         } else if row.exch_id.eq_ignore_ascii_case(EXCH_ID_BSE) {
             bse_idx_symbols_seen.push(row.symbol_name.clone());
             if is_bse_sensex(&row.symbol_name) {
@@ -145,9 +238,18 @@ pub fn extract_indices(rows: &[CsvRow]) -> Result<IndexExtraction, IndexExtractE
         });
     }
 
+    // Operator lock 2026-06-01 §30: collect allowlisted names the CSV did
+    // NOT contain, so the boot orchestrator can LOUD-warn (no silent miss).
+    let allowlist_misses: Vec<&'static str> = NSE_INDEX_ALLOWLIST
+        .iter()
+        .zip(matched.iter())
+        .filter_map(|(name, hit)| (!hit).then_some(*name))
+        .collect();
+
     Ok(IndexExtraction {
         nse_indices,
         bse_sensex,
+        allowlist_misses,
     })
 }
 
@@ -377,26 +479,98 @@ mod tests {
         let extraction = IndexExtraction {
             nse_indices: Vec::new(),
             bse_sensex: None,
+            allowlist_misses: Vec::new(),
         };
         assert_eq!(extraction.total_index_count(), 0);
     }
 
+    // ---- Operator lock 2026-06-01 §30: fixed 31-index allowlist ----
+
     #[test]
-    fn realistic_universe_count_matches_30() {
-        // Per §2 the expected count is "~30 NSE indices + 1 BSE SENSEX".
-        // Build a 30-index NSE set + SENSEX and verify the count.
-        let mut rows = Vec::new();
-        for i in 0..30 {
-            rows.push(idx_i_row(
-                &format!("{i}"),
-                "NSE",
-                "INDEX",
-                &format!("INDEX{i}"),
-            ));
+    fn allowlist_has_exactly_31_nse_indices() {
+        assert_eq!(NSE_INDEX_ALLOWLIST.len(), 31);
+        // Every entry must already be normalized (uppercase, single-spaced)
+        // so the runtime match is a direct equality.
+        for name in NSE_INDEX_ALLOWLIST {
+            assert_eq!(*name, normalize_index_symbol(name), "{name} not normalized");
         }
+        // GIFT Nifty must be in the allowlist (it's an NSE IDX_I index).
+        assert!(NSE_INDEX_ALLOWLIST.contains(&GIFT_NIFTY_SYMBOL));
+    }
+
+    #[test]
+    fn normalize_index_symbol_collapses_and_uppercases() {
+        assert_eq!(normalize_index_symbol("nifty 50"), "NIFTY 50");
+        assert_eq!(
+            normalize_index_symbol("  NIFTY   MID100  FREE "),
+            "NIFTY MID100 FREE"
+        );
+        assert_eq!(normalize_index_symbol("giftnifty"), "GIFTNIFTY");
+    }
+
+    #[test]
+    fn full_31_allowlist_plus_sensex_yields_32_indices() {
+        // Build the real allowlisted set (verified SYMBOL_NAMEs) + SENSEX.
+        let mut rows: Vec<CsvRow> = NSE_INDEX_ALLOWLIST
+            .iter()
+            .enumerate()
+            .map(|(i, sym)| idx_i_row(&format!("{i}"), "NSE", "INDEX", sym))
+            .collect();
         rows.push(idx_i_row("51", "BSE", "INDEX", "SENSEX"));
         let result = extract_indices(&rows).expect("extract");
-        assert_eq!(result.nse_indices.len(), 30);
-        assert_eq!(result.total_index_count(), 31);
+        assert_eq!(result.nse_indices.len(), 31);
+        assert!(result.bse_sensex.is_some());
+        assert_eq!(result.total_index_count(), 32);
+        assert!(result.allowlist_misses.is_empty(), "no misses expected");
+    }
+
+    #[test]
+    fn drops_non_allowlisted_nse_indices() {
+        // The master carries 119 NSE index rows; only allowlisted ones survive.
+        let rows = vec![
+            idx_i_row("13", "NSE", "INDEX", "NIFTY"), // allowlisted
+            idx_i_row("806", "NSE", "INDEX", "Nifty GS 10Yr"), // junk — dropped
+            idx_i_row("487", "NSE", "INDEX", "NIFTY50 PR 2X LEV"), // junk — dropped
+            idx_i_row("826", "NSE", "INDEX", "Nifty Shariah 25"), // junk — dropped
+            idx_i_row("51", "BSE", "INDEX", "SENSEX"),
+        ];
+        let result = extract_indices(&rows).expect("extract");
+        assert_eq!(result.nse_indices.len(), 1, "only NIFTY kept");
+        assert!(result.nse_indices.iter().all(|r| r.symbol_name == "NIFTY"));
+        assert_eq!(result.total_index_count(), 2);
+    }
+
+    #[test]
+    fn reports_allowlist_misses_when_an_index_absent() {
+        // Only NIFTY present (+SENSEX) → the other 30 allowlisted names
+        // are reported as misses so the boot orchestrator can LOUD-warn.
+        let rows = vec![
+            idx_i_row("13", "NSE", "INDEX", "NIFTY"),
+            idx_i_row("51", "BSE", "INDEX", "SENSEX"),
+        ];
+        let result = extract_indices(&rows).expect("extract");
+        assert_eq!(result.allowlist_misses.len(), 30);
+        assert!(result.allowlist_misses.contains(&"BANKNIFTY"));
+        assert!(result.allowlist_misses.contains(&"GIFTNIFTY"));
+        assert!(!result.allowlist_misses.contains(&"NIFTY"));
+    }
+
+    #[test]
+    fn gift_nifty_kept_when_present() {
+        // GIFT Nifty (sid 5024, SYM GIFTNIFTY) must survive the allowlist.
+        let rows = vec![
+            idx_i_row("13", "NSE", "INDEX", "NIFTY"),
+            idx_i_row("5024", "NSE", "INDEX", "GIFTNIFTY"),
+            idx_i_row("51", "BSE", "INDEX", "SENSEX"),
+        ];
+        let result = extract_indices(&rows).expect("extract");
+        assert!(
+            result
+                .nse_indices
+                .iter()
+                .any(|r| r.symbol_name == "GIFTNIFTY"),
+            "GIFTNIFTY must be kept"
+        );
+        assert!(!result.allowlist_misses.contains(&"GIFTNIFTY"));
     }
 }
