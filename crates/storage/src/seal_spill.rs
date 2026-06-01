@@ -104,6 +104,10 @@ pub struct SerializedSeal {
     pub close_pct_from_prev_day: f64,
     pub oi_pct_from_prev_day: f64,
     pub volume_pct_from_prev_day: f64,
+    /// §31 Option 2 (2026-06-01): % vs the official 09:15 session open.
+    /// Serialised into the previously-reserved bytes 96..104 — old spill
+    /// records (zero padding there) decode `open_pct = 0.0`, backward-compatible.
+    pub open_pct: f64,
 }
 
 impl SerializedSeal {
@@ -128,7 +132,9 @@ impl SerializedSeal {
         buf[72..80].copy_from_slice(&self.close_pct_from_prev_day.to_le_bytes());
         buf[80..88].copy_from_slice(&self.oi_pct_from_prev_day.to_le_bytes());
         buf[88..96].copy_from_slice(&self.volume_pct_from_prev_day.to_le_bytes());
-        // buf[96..128] = reserved padding (zero) for future fields
+        // §31 Option 2: open_pct in the first 8 reserved bytes.
+        buf[96..104].copy_from_slice(&self.open_pct.to_le_bytes());
+        // buf[104..128] = reserved padding (zero) for future fields
         buf
     }
 
@@ -175,6 +181,10 @@ impl SerializedSeal {
             ]),
             volume_pct_from_prev_day: f64::from_le_bytes([
                 buf[88], buf[89], buf[90], buf[91], buf[92], buf[93], buf[94], buf[95],
+            ]),
+            // §31 Option 2: bytes 96..104 (zero in pre-§31 records → 0.0).
+            open_pct: f64::from_le_bytes([
+                buf[96], buf[97], buf[98], buf[99], buf[100], buf[101], buf[102], buf[103],
             ]),
         })
     }
@@ -228,6 +238,7 @@ impl From<&BufferedSeal> for SerializedSeal {
             close_pct_from_prev_day: b.state.close_pct_from_prev_day,
             oi_pct_from_prev_day: b.state.oi_pct_from_prev_day,
             volume_pct_from_prev_day: b.state.volume_pct_from_prev_day,
+            open_pct: b.state.open_pct,
         }
     }
 }
@@ -258,6 +269,9 @@ impl SerializedSeal {
         state.close_pct_from_prev_day = self.close_pct_from_prev_day;
         state.oi_pct_from_prev_day = self.oi_pct_from_prev_day;
         state.volume_pct_from_prev_day = self.volume_pct_from_prev_day;
+        // §31 Option 2: already-stamped at original seal; session_open is
+        // irrelevant on replay (open_pct is the persisted value).
+        state.open_pct = self.open_pct;
         Some(BufferedSeal::new(
             self.security_id,
             self.exchange_segment_code,
@@ -486,6 +500,7 @@ mod tests {
             close_pct_from_prev_day: 1.5,
             oi_pct_from_prev_day: -0.2,
             volume_pct_from_prev_day: 12.3,
+            open_pct: 7.7,
         }
     }
 
@@ -542,6 +557,7 @@ mod tests {
             close_pct_from_prev_day: -3.5,
             oi_pct_from_prev_day: -10.0,
             volume_pct_from_prev_day: -100.0,
+            open_pct: -50.0,
         };
         let bytes = original.to_bytes();
         let decoded = SerializedSeal::from_bytes(&bytes).expect("decoded");
@@ -557,14 +573,22 @@ mod tests {
     #[test]
     fn test_serialized_seal_to_bytes_padding_zero_filled() {
         // Bytes 6..8 (between tf_ordinal and bucket_start_ist_secs)
-        // and bytes 96..128 (reserved tail) MUST be zero so the file
-        // format is deterministic and grep-friendly.
+        // and bytes 104..128 (reserved tail) MUST be zero so the file
+        // format is deterministic and grep-friendly. §31 Option 2 now
+        // uses bytes 96..104 for `open_pct`, so the zero-padding tail
+        // starts at 104.
         let seal = mk_seal(13, 0, 0, 1_716_000_900, 100.0);
         let bytes = seal.to_bytes();
         for i in [6, 7] {
             assert_eq!(bytes[i], 0, "padding byte at {i} not zero");
         }
-        for i in 96..SEAL_SPILL_RECORD_SIZE {
+        // §31: bytes 96..104 carry open_pct (mk_seal sets 7.7 → non-zero).
+        assert_ne!(
+            &bytes[96..104],
+            &[0u8; 8],
+            "open_pct bytes 96..104 must be written"
+        );
+        for i in 104..SEAL_SPILL_RECORD_SIZE {
             assert_eq!(bytes[i], 0, "reserved tail byte at {i} not zero");
         }
     }
