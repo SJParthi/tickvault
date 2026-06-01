@@ -259,6 +259,7 @@ mod tests {
         IndexExtraction {
             nse_indices,
             bse_sensex: Some(idx_i_row("51", "BSE", "SENSEX")),
+            allowlist_misses: Vec::new(),
         }
     }
 
@@ -421,6 +422,7 @@ mod tests {
         let indices = IndexExtraction {
             nse_indices: Vec::new(),
             bse_sensex: None,
+            allowlist_misses: Vec::new(),
         };
         let fno = FnoUnderlyingExtraction {
             unique_underlying_ids: HashSet::new(),

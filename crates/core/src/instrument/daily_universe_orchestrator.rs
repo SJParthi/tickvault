@@ -167,6 +167,7 @@ pub fn build_universe_from_bytes(bytes: &[u8]) -> Result<DailyUniverse, Orchestr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instrument::index_extractor::NSE_INDEX_ALLOWLIST;
 
     /// Build a synthetic Detailed-CSV body with N stock-derivative rows
     /// backed by 1 NSE_EQ underlying + N NSE indices + 1 BSE SENSEX.
@@ -178,7 +179,10 @@ mod tests {
         s.push_str("2885,NSE,NSE_EQ,EQUITY,RELIANCE,\n");
         // N NSE indices (NSE IDX_I INDEX rows)
         for i in 0..num_nse_indices {
-            s.push_str(&format!("{i},NSE,IDX_I,INDEX,IDX{i},\n"));
+            // Use REAL allowlisted index symbols (operator lock 2026-06-01
+            // §30) — fake "IDX{i}" names are now dropped by the allowlist.
+            let sym = NSE_INDEX_ALLOWLIST[i % NSE_INDEX_ALLOWLIST.len()];
+            s.push_str(&format!("{i},NSE,IDX_I,INDEX,{sym},\n"));
         }
         // 1 BSE SENSEX (mandatory per §0 quote 2)
         s.push_str("51,BSE,IDX_I,INDEX,SENSEX,\n");
@@ -207,7 +211,8 @@ mod tests {
         }
         // 30 NSE indices
         for i in 0..30 {
-            s.push_str(&format!("{},NSE,IDX_I,INDEX,IDX{i},\n", 1000 + i));
+            let sym = NSE_INDEX_ALLOWLIST[i % NSE_INDEX_ALLOWLIST.len()];
+            s.push_str(&format!("{},NSE,IDX_I,INDEX,{sym},\n", 1000 + i));
         }
         // 1 BSE SENSEX
         s.push_str("51,BSE,IDX_I,INDEX,SENSEX,\n");
@@ -325,7 +330,8 @@ mod tests {
             s.push_str(&format!("28{i:04},NSE,NSE_EQ,EQUITY,STK{i},\n"));
         }
         for i in 0..30 {
-            s.push_str(&format!("{},NSE,IDX_I,INDEX,IDX{i},\n", 1000 + i));
+            let sym = NSE_INDEX_ALLOWLIST[i % NSE_INDEX_ALLOWLIST.len()];
+            s.push_str(&format!("{},NSE,IDX_I,INDEX,{sym},\n", 1000 + i));
         }
         s.push_str("51,BSE,IDX_I,INDEX,SENSEX,\n");
         for i in 0..100 {
