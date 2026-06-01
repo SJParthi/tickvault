@@ -29,8 +29,8 @@
     "logs_collected": {
       "files": {
         "collect_list": [
-          { "file_path": "/opt/tickvault/logs/errors.jsonl*", "log_group_name": "/tickvault/prod/app", "log_stream_name": "{instance_id}/errors-jsonl", "timezone": "UTC" },
-          { "file_path": "/opt/tickvault/logs/app.*.log", "log_group_name": "/tickvault/prod/app", "log_stream_name": "{instance_id}/app", "timezone": "UTC" }
+          { "file_path": "/opt/tickvault/data/logs/errors.jsonl*", "log_group_name": "/tickvault/prod/app", "log_stream_name": "{instance_id}/errors-jsonl", "timezone": "UTC" },
+          { "file_path": "/opt/tickvault/data/logs/app.*", "log_group_name": "/tickvault/prod/app", "log_stream_name": "{instance_id}/app", "timezone": "UTC" }
         ]
       }
     }
