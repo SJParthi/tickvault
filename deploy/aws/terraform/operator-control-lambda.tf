@@ -54,9 +54,9 @@ data "aws_iam_policy_document" "operator_control_permissions" {
     resources = ["*"]
   }
 
-  # Only ssm:SendCommand — the handler fires commands and returns the command
-  # id; it never reads results back, so GetCommandInvocation/ListCommandInvocations
-  # are intentionally NOT granted (review finding 2 — least privilege).
+  # ssm:SendCommand fires the shell; ssm:GetCommandInvocation reads the output
+  # back for the synchronous "view" snapshot (instance/app/tick/candle status).
+  # SendCommand is scoped to the one instance + AWS-RunShellScript only.
   statement {
     sid     = "SsmSendCommand"
     effect  = "Allow"
@@ -65,6 +65,15 @@ data "aws_iam_policy_document" "operator_control_permissions" {
       "arn:aws:ec2:${var.aws_region}:*:instance/${aws_instance.tv_app.id}",
       "arn:aws:ssm:${var.aws_region}::document/AWS-RunShellScript",
     ]
+  }
+
+  # GetCommandInvocation has no resource-level scoping (AWS requires "*"); it is
+  # a read of command output keyed by the command id this Lambda itself created.
+  statement {
+    sid       = "SsmReadCommandOutput"
+    effect    = "Allow"
+    actions   = ["ssm:GetCommandInvocation"]
+    resources = ["*"]
   }
 
   statement {
@@ -107,6 +116,7 @@ data "archive_file" "operator_control" {
   type        = "zip"
   source_dir  = "${path.module}/../lambda/operator-control"
   output_path = "${path.module}/.build/operator-control.zip"
+  excludes    = ["test_handler.py", "README.md"] # ship handler.py only — not test/docs
 }
 
 resource "aws_lambda_function" "operator_control" {
@@ -138,7 +148,7 @@ resource "aws_lambda_function_url" "operator_control" {
 
   cors {
     allow_origins = ["*"]
-    allow_methods = ["POST"]
+    allow_methods = ["GET", "POST"] # GET serves the console page; POST runs actions
     allow_headers = ["authorization", "content-type"]
     max_age       = 300
   }
@@ -162,5 +172,5 @@ resource "aws_cloudwatch_metric_alarm" "operator_control_errors" {
 
 output "operator_control_function_url" {
   value       = var.enable_operator_control_lambda ? aws_lambda_function_url.operator_control[0].function_url : null
-  description = "POST here with header 'Authorization: Bearer <secret>' + body {\"action\":\"start|stop|reboot|restart-app|stop-app|restart-questdb|status\"}"
+  description = "Open this URL in a browser = the operator console (GET serves the page). Buttons POST with header 'Authorization: Bearer <secret>' + body {\"action\":\"view|start|stop|reboot|restart-app|stop-app|restart-questdb\"}"
 }
