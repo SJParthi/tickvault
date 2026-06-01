@@ -86,7 +86,7 @@ def _github_token() -> str:
 
 
 # Destructive box actions blocked during market hours unless force=true.
-_DESTRUCTIVE = {"stop", "reboot", "restart-app", "stop-app"}
+_DESTRUCTIVE = {"stop", "reboot", "restart-app", "stop-app", "wipe-questdb"}
 
 _MKT_OPEN_SECS = 9 * 3600 + 15 * 60
 _MKT_CLOSE_SECS = 15 * 3600 + 30 * 60
@@ -94,6 +94,10 @@ _IST_OFFSET_SECS = 19800  # +05:30
 
 _VIEW_TIMEOUT_SECS = 6.0
 _VIEW_POLL_SECS = 0.4
+# Latency probes run 3×curl-to-Dhan (--max-time 3) + QuestDB + metrics ON the
+# box (~9-12s wall-clock), so the poll window must be longer than the view's.
+# Lambda timeout is 30s, so 22s leaves margin.
+_LATENCY_TIMEOUT_SECS = 22.0
 
 # Read-only SQL gate: the first keyword must be one of these.
 _SQL_ALLOWED_PREFIXES = ("select", "show", "explain", "with")
@@ -170,10 +174,16 @@ def _ssm_shell(commands: list[str]) -> str:
     return resp["Command"]["CommandId"]
 
 
-def _ssm_shell_sync(commands: list[str]) -> str:
-    """Send a command and poll for output up to _VIEW_TIMEOUT_SECS."""
-    cid = _ssm_shell(commands)
-    deadline = time.monotonic() + _VIEW_TIMEOUT_SECS
+def _ssm_shell_sync(commands: list[str], timeout: float = _VIEW_TIMEOUT_SECS) -> str:
+    """Send a command and poll for output up to `timeout` seconds. Returns "" on
+    any failure (e.g. the box is STOPPED — its SSM agent is offline, so
+    send_command raises). Callers degrade to an empty snapshot, never a 500."""
+    try:
+        cid = _ssm_shell(commands)
+    except Exception as exc:  # noqa: BLE001 — box stopped / SSM agent offline
+        print(f"operator-portal ssm send_command failed (box offline?): {exc!r}")  # noqa: T201
+        return ""
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         time.sleep(_VIEW_POLL_SECS)
         try:
@@ -391,7 +401,11 @@ def _resp(status: int, body: dict) -> dict:
 def _html_resp() -> dict:
     return {
         "statusCode": 200,
-        "headers": {"content-type": "text/html; charset=utf-8", "cache-control": "no-store"},
+        "headers": {
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "no-store",
+            "referrer-policy": "no-referrer",
+        },
         "body": _console_html(),
     }
 
@@ -438,14 +452,40 @@ def lambda_handler(event, _context):
         if action == "restart-questdb":
             cid = _ssm_shell(["cd /opt/tickvault/repo/deploy/docker && docker compose restart questdb"])
             return _resp(200, {"ok": True, "action": action, "command_id": cid})
+        if action == "wipe-questdb":
+            # DESTRUCTIVE: deletes ALL QuestDB data for a fresh start. Always
+            # requires force=true (even off-hours), and is in _DESTRUCTIVE so it
+            # is ALSO market-hours-blocked. Sequence: stop app -> compose down -v
+            # (removes the tv-questdb-data volume) -> up -d (empty QuestDB) ->
+            # start app (boot DDL recreates the schema). Next session = fresh.
+            if not force:
+                return _resp(409, {"error": 'wipe is destructive — re-send with {"force": true}', "action": action})
+            cid = _ssm_shell(
+                [
+                    "set +e",
+                    "systemctl stop tickvault || true",
+                    "cd /opt/tickvault/repo/deploy/docker && docker compose down -v",
+                    "cd /opt/tickvault/repo/deploy/docker && docker compose up -d",
+                    "sleep 8",
+                    "systemctl start tickvault || true",
+                ]
+            )
+            return _resp(200, {"ok": True, "action": action, "command_id": cid})
 
         # ---- overview / data ----
         if action in ("status", "view"):
             inst = _client("ec2").describe_instances(InstanceIds=[INSTANCE_ID])["Reservations"][0]["Instances"][0]
-            snap = _parse_view(_ssm_shell_sync(_VIEW_COMMANDS))
+            state = inst["State"]["Name"]
+            # The on-box snapshot needs the SSM agent, which is only reachable
+            # while the instance is RUNNING. The box auto-stops 16:30 IST, so
+            # off-hours we skip SSM entirely and return a clean "stopped" view
+            # (instance_state + empty snapshot) instead of 500ing. The operator
+            # then taps ▶ Start. _ssm_shell_sync also fails-soft, but skipping
+            # avoids a pointless ~6s wait.
+            snap = _parse_view(_ssm_shell_sync(_VIEW_COMMANDS) if state == "running" else "")
             return _resp(
                 200,
-                {"ok": True, "action": "view", "instance_state": inst["State"]["Name"], "market_hours": _is_market_hours(datetime.datetime.utcnow()), **snap},
+                {"ok": True, "action": "view", "instance_state": state, "market_hours": _is_market_hours(datetime.datetime.utcnow()), **snap},
             )
         if action == "sql":
             q = str(payload.get("query", "")).strip()
@@ -470,11 +510,13 @@ def lambda_handler(event, _context):
             )
             return _resp(200, {"ok": True, "action": "logs", "raw": out})
         if action == "latency":
-            return _resp(200, {"ok": True, "action": "latency", **_parse_latency(_ssm_shell_sync(_LATENCY_COMMANDS))})
+            return _resp(200, {"ok": True, "action": "latency", **_parse_latency(_ssm_shell_sync(_LATENCY_COMMANDS, timeout=_LATENCY_TIMEOUT_SECS))})
 
         # ---- github ----
         if action == "gh_prs":
-            return _resp(200, {"ok": True, "action": action, "prs": _gh_open_prs(), "repo": GH_REPO})
+            # gh_configured=False lets the UI say "token not set" instead of the
+            # misleading "no open PRs 🎉" when the github-token SSM param is absent.
+            return _resp(200, {"ok": True, "action": action, "prs": _gh_open_prs(), "repo": GH_REPO, "gh_configured": bool(_github_token())})
         if action == "gh_merge":
             n = int(payload.get("number", 0))
             if n <= 0:
@@ -487,10 +529,15 @@ def lambda_handler(event, _context):
 
         # ---- aws ----
         if action == "aws_status":
-            alarms = _client("cloudwatch").describe_alarms(StateValue="ALARM", MaxRecords=20)
-            firing = [a["AlarmName"] for a in alarms.get("MetricAlarms", [])]
-            cost = _month_to_date_cost()
-            return _resp(200, {"ok": True, "action": action, "alarms_firing": firing, "cost_mtd_usd": cost})
+            # Each read is independently fail-soft so a throttle on one doesn't
+            # 500 the whole tab.
+            try:
+                alarms = _client("cloudwatch").describe_alarms(StateValue="ALARM", MaxRecords=20)
+                firing = [a["AlarmName"] for a in alarms.get("MetricAlarms", [])]
+            except Exception as exc:  # noqa: BLE001
+                print(f"operator-portal describe_alarms failed: {exc!r}")  # noqa: T201
+                firing = None
+            return _resp(200, {"ok": True, "action": action, "alarms_firing": firing, "cost_mtd_usd": _month_to_date_cost()})
 
         return _resp(400, {"error": f"unknown action: {action!r}"})
     except Exception as exc:  # noqa: BLE001
@@ -663,6 +710,8 @@ def _console_html() -> str:
           <button class="b-stop" onclick="act('stop-app')">⏹ Stop app</button></div>
         <div class="muted" style="margin-top:10px">Stop / restart are blocked 9:15 AM–3:30 PM IST Mon–Fri.</div>
         <label class="switch" style="margin-top:8px"><input type="checkbox" id="force"> force (override market-hours guard)</label>
+        <div class="row" style="margin-top:18px"><button class="b-stop" onclick="wipeData()">🗑️ Wipe ALL data → fresh start</button></div>
+        <div class="muted" style="margin-top:6px">Deletes every tick &amp; candle and restarts empty. Run when the box is RUNNING; next session = fresh data. Asks you to type WIPE.</div>
         <div class="row" style="margin-top:14px"><button class="b-ghost" onclick="lock()">🔒 Lock / forget this device</button></div>
       </div>
     </section>
@@ -798,6 +847,7 @@ async function runSql(){ const q=$('sql').value.trim(); if(!q){ toast('Type a qu
 function ciBadge(s){ const k=['success','pending','failure'].includes(s)?s:'unknown'; return '<span class="badge '+k+'">'+s+'</span>'; }
 async function loadGithub(){ $('prs').dataset.loaded='1'; $('prs').innerHTML='<span class="muted">loading…</span>'; const j=await call('gh_prs'); if(!j){ $('prs').innerHTML=''; return; }
   $('ghrepo').textContent=j.repo||''; const prs=j.prs||[];
+  if(j.gh_configured===false){ $('prs').innerHTML='<span class="warn">GitHub token not set — add the github-token SSM param to enable this tab.</span>'; return; }
   if(!prs.length){ $('prs').innerHTML='<span class="muted">no open PRs 🎉</span>'; return; }
   $('prs').innerHTML=prs.map(p=>'<div class="pr"><div class="t"><span class="num">#'+p.number+'</span>'+esc(p.title)+(p.draft?' <span class="badge unknown">draft</span>':'')+'</div>'+ciBadge(p.ci)+
     '<button class="b-go mini" onclick="ghMerge('+p.number+')">merge</button></div>').join(''); }
@@ -811,7 +861,9 @@ async function loadLogs(){ $('logErr').textContent='loading…'; const j=await c
   $('logErr').textContent=grab('ERR_BEGIN','ERR_END')||'none 🎉'; $('logApp').textContent=grab('APP_BEGIN','APP_END')||'—'; }
 
 async function loadAws(){ $('alarms').dataset.loaded='1'; $('alarms').innerHTML='<span class="muted">loading…</span>'; const j=await call('aws_status'); if(!j){ $('alarms').innerHTML=''; return; }
-  $('cost').textContent='$'+(j.cost_mtd_usd||'—'); const al=j.alarms_firing||[]; $('alarmcount').innerHTML='<span class="'+(al.length?'bad':'ok')+'">'+al.length+'</span>';
+  $('cost').textContent='$'+(j.cost_mtd_usd||'—');
+  if(j.alarms_firing===null){ $('alarmcount').innerHTML='<span class="warn">?</span>'; $('alarms').innerHTML='<span class="warn">CloudWatch read failed — retry.</span>'; return; }
+  const al=j.alarms_firing||[]; $('alarmcount').innerHTML='<span class="'+(al.length?'bad':'ok')+'">'+al.length+'</span>';
   $('alarms').innerHTML=al.length? al.map(a=>'<div class="pr"><span class="badge failure">ALARM</span> <span class="t">'+esc(a)+'</span></div>').join('') : '<span class="ok">all clear 🎉</span>'; }
 
 function fmtNs(n){ if(n==null||n==='') return '—'; n=Number(n); if(n<1000) return n.toFixed(0)+' ns';
@@ -834,6 +886,13 @@ async function loadLatency(){ $('latnet').dataset.loaded='1'; $('latnet').innerH
 async function act(action){ if(!confirm('Run "'+action+'" on the trading box?')) return; const force=$('force').checked; toast(action+'…');
   const j=await call(action,{force}); if(j){ toast('✅ '+action+' sent'); setTimeout(loadOverview,1600); } }
 
+async function wipeData(){
+  if(prompt('This DELETES every tick and candle, then restarts empty. The box must be RUNNING. Type WIPE to confirm:')!=='WIPE'){ toast('cancelled'); return; }
+  toast('wiping → fresh start…');
+  const j=await call('wipe-questdb',{force:true});
+  if(j&&j.ok){ toast('✅ wipe started — fresh data from next session'); setTimeout(loadOverview,4000); }
+  else { toast((j&&j.error)||'wipe failed — is the box running?'); } }
+
 function startAuto(){ stopAuto(); if($('auto').checked) timer=setInterval(()=>{ if(curTab==='overview') loadOverview(); },8000); }
 function stopAuto(){ if(timer){ clearInterval(timer); timer=null; } }
 function autotoggle(){ $('auto').checked?startAuto():stopAuto(); }
@@ -842,7 +901,7 @@ function autotoggle(){ $('auto').checked?startAuto():stopAuto(); }
 // the device key, strips it from the address bar, and unlocks — so the Telegram
 // link "just works" with zero typing. The fragment never reaches the server.
 (function(){ var k=(location.hash.match(/key=([^&]+)/)||[])[1] || new URLSearchParams(location.search).get('key');
-  if(k){ TOKEN=decodeURIComponent(k); localStorage.setItem('tv_token',TOKEN);
+  if(k){ try{ k=decodeURIComponent(k); }catch(e){} TOKEN=k; localStorage.setItem('tv_token',TOKEN);
     try{ history.replaceState(null,'',location.pathname); }catch(e){} } })();
 if(TOKEN){ $('tok').value=TOKEN; $('lock').hidden=true; $('app').hidden=false; startAuto(); loadOverview(); }
 </script>

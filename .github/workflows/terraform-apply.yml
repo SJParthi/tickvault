@@ -313,12 +313,14 @@ jobs:
           SECRET_NAME="/tickvault/prod/operator/control-secret"
           if ! aws ssm get-parameter --name "$SECRET_NAME" --region ${{ env.AWS_REGION }} >/dev/null 2>&1; then
             KEY=$(openssl rand -base64 30 | tr -d '\n')
+            echo "::add-mask::${KEY}"
             aws ssm put-parameter --name "$SECRET_NAME" --type SecureString \
               --value "$KEY" --region ${{ env.AWS_REGION }} >/dev/null
             echo "generated a new operator device key (stored in SSM SecureString)"
           else
             KEY=$(aws ssm get-parameter --name "$SECRET_NAME" --with-decryption \
               --query Parameter.Value --output text --region ${{ env.AWS_REGION }})
+            echo "::add-mask::${KEY}"
           fi
           LINK="${URL}#key=${KEY}"
           aws sns publish --region ${{ env.AWS_REGION }} \
