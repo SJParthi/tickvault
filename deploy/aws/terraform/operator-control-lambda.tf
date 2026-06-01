@@ -184,6 +184,19 @@ resource "aws_lambda_function_url" "operator_control" {
   }
 }
 
+# REQUIRED for authorization_type = "NONE": a Function URL with NONE auth still
+# returns HTTP 403 "Forbidden" unless a resource-based permission grants
+# lambda:InvokeFunctionUrl to principal "*". This is the public-invoke grant;
+# real auth is still the constant-time bearer check inside the handler.
+resource "aws_lambda_permission" "operator_control_url" {
+  count                  = var.enable_operator_control_lambda ? 1 : 0
+  statement_id           = "AllowPublicFunctionUrlInvoke"
+  action                 = "lambda:InvokeFunctionUrl"
+  function_name          = aws_lambda_function.operator_control[0].function_name
+  principal              = "*"
+  function_url_auth_type = "NONE"
+}
+
 # Per-Lambda error alarm → existing tv_alerts SNS (matches the killswitch pattern).
 resource "aws_cloudwatch_metric_alarm" "operator_control_errors" {
   count               = var.enable_operator_control_lambda ? 1 : 0
