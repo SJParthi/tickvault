@@ -224,5 +224,40 @@ class PostRequiresAuth(unittest.TestCase):
         self.assertEqual(resp["statusCode"], 401)
 
 
+class WipeGate(unittest.TestCase):
+    def setUp(self) -> None:
+        self._orig = handler._control_secret
+        handler._control_secret = lambda: "s3cret-token"  # type: ignore[assignment]
+
+    def tearDown(self) -> None:
+        handler._control_secret = self._orig  # type: ignore[assignment]
+
+    def _wipe(self, force: bool):
+        return handler.lambda_handler(
+            {
+                "requestContext": {"http": {"method": "POST"}},
+                "headers": {"authorization": "Bearer s3cret-token"},
+                "body": json.dumps({"action": "wipe-questdb", "force": force}),
+            },
+            None,
+        )
+
+    def test_wipe_without_force_is_blocked(self) -> None:
+        # Either the destructive market-hours guard (409) or the explicit
+        # force-required guard (409) — never reaches boto3.
+        resp = self._wipe(force=False)
+        self.assertEqual(resp["statusCode"], 409)
+
+    def test_wipe_is_in_destructive_set(self) -> None:
+        self.assertIn("wipe-questdb", handler._DESTRUCTIVE)
+
+
+class HtmlWipeButton(unittest.TestCase):
+    def test_html_has_wipe_button(self) -> None:
+        html = handler._console_html()
+        self.assertIn("wipeData()", html)
+        self.assertIn("Wipe ALL data", html)
+
+
 if __name__ == "__main__":
     unittest.main()
