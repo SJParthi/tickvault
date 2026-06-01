@@ -58,9 +58,9 @@ data "aws_iam_policy_document" "operator_control_permissions" {
   # id; it never reads results back, so GetCommandInvocation/ListCommandInvocations
   # are intentionally NOT granted (review finding 2 — least privilege).
   statement {
-    sid       = "SsmSendCommand"
-    effect    = "Allow"
-    actions   = ["ssm:SendCommand"]
+    sid     = "SsmSendCommand"
+    effect  = "Allow"
+    actions = ["ssm:SendCommand"]
     resources = [
       "arn:aws:ec2:${var.aws_region}:*:instance/${aws_instance.tv_app.id}",
       "arn:aws:ssm:${var.aws_region}::document/AWS-RunShellScript",
