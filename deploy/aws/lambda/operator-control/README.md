@@ -9,6 +9,7 @@ One URL you open on a phone or laptop to run the whole product. Tabs:
 | 🔀 **GitHub** | See open PRs + their CI status, **squash-merge** a PR, and **trigger a deploy** — all from the page |
 | 📜 **Logs** | Live error tail + app log tail from the box (journald) |
 | ☁️ **AWS** | CloudWatch alarms firing + this month's AWS spend |
+| ⚡ **Latency** | Real measured per-tick latency (network RTT to Dhan, TLS, QuestDB round-trip, clock skew, per-tick process ns + wire→done ns from the app metrics). See `docs/architecture/aws-vs-home-latency.md`. |
 
 ## Security model
 
