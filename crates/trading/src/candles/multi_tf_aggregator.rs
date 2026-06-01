@@ -171,8 +171,8 @@ impl MultiTfAggregator {
     /// 09:15–15:30 IST window gate. Builder style so existing
     /// `new()`/`with_capacity()` call sites (incl. all tests) keep the
     /// safe empty default.
-    // TEST-EXEMPT: builder exercised by test_gift_nifty_exempt_tick_aggregates_outside_window.
     #[must_use]
+    // TEST-EXEMPT: builder exercised by test_gift_nifty_exempt_tick_aggregates_outside_window.
     pub fn with_always_on(mut self, always_on: Arc<HashSet<(u32, u8)>>) -> Self {
         self.always_on = always_on;
         self
