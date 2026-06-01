@@ -54,11 +54,14 @@
 //! | 72   | 8 | `close_pct_from_prev_day: f64`  |
 //! | 80   | 8 | `oi_pct_from_prev_day: f64`     |
 //! | 88   | 8 | `volume_pct_from_prev_day: f64` |
-//! | 96   | 32 | reserved padding (zero-filled) |
+//! | 96   | 8 | `open_pct: f64` (§31 Option 2)  |
+//! | 104  | 24 | reserved padding (zero-filled) |
 //!
-//! Total: 128 bytes. The trailing 32-byte padding region is reserved
-//! for future field additions WITHOUT a file-format break — readers
-//! that don't recognise additional fields ignore them.
+//! Total: 128 bytes. The trailing 24-byte padding region (bytes 104..128)
+//! is reserved for future field additions WITHOUT a file-format break —
+//! readers that don't recognise additional fields ignore them. Pre-§31
+//! records have zero at bytes 96..104, so they decode `open_pct = 0.0`
+//! (backward-compatible).
 
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;

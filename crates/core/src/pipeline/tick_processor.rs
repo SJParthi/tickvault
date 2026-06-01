@@ -1158,14 +1158,24 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                         m_stale_day.increment(1);
                         continue;
                     }
-                    if !is_within_persist_window(tick.exchange_timestamp) {
+                    // §30 parity (audit Rule 6 — both guards on EVERY persist site):
+                    // always-on instruments (GIFT Nifty, ~21 h/day) skip the two
+                    // window gates here too, exactly like the Ticker/Quote path.
+                    // Latent today (GIFT subscribes Quote mode), but keeps the two
+                    // persist paths symmetric so a future Full-mode always-on SID
+                    // is not silently dropped ~16 h/day.
+                    let window_exempt =
+                        is_window_exempt(&always_on, tick.security_id, tick.exchange_segment_code);
+                    if !window_exempt && !is_within_persist_window(tick.exchange_timestamp) {
                         outside_hours_filtered = outside_hours_filtered.saturating_add(1);
                         m_outside_hours.increment(1);
                         continue;
                     }
                     // Wall-clock guard: reject stale WebSocket snapshots received
                     // outside market hours (same as Ticker/Quote path above).
-                    if !is_wall_clock_within_persist_window(tick.received_at_nanos) {
+                    if !window_exempt
+                        && !is_wall_clock_within_persist_window(tick.received_at_nanos)
+                    {
                         outside_hours_filtered = outside_hours_filtered.saturating_add(1);
                         m_outside_hours.increment(1);
                         continue;
