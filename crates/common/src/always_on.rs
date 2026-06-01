@@ -36,6 +36,7 @@ static ALWAYS_ON: OnceLock<Arc<HashSet<(u32, u8)>>> = OnceLock::new();
 /// wins; later calls are ignored (boot runs once). Safe to never call —
 /// [`current`] then returns an empty set (today's behavior: nothing is
 /// exempt).
+// TEST-EXEMPT: covered by tests::current_before_init_is_empty_then_reflects_init.
 pub fn init_always_on_segments(set: HashSet<(u32, u8)>) {
     // First call wins; a second call returns Err(rejected_set) which we
     // intentionally discard (boot runs once). `drop` uses the #[must_use].
@@ -45,6 +46,7 @@ pub fn init_always_on_segments(set: HashSet<(u32, u8)>) {
 /// The current always-on set as a cheap-to-clone `Arc`. Returns an empty
 /// set if [`init_always_on_segments`] was never called (e.g. the
 /// `Indices4Only` scope, or any test that does not boot the universe).
+// TEST-EXEMPT: covered by tests::current_before_init_is_empty_then_reflects_init.
 #[must_use]
 pub fn current() -> Arc<HashSet<(u32, u8)>> {
     ALWAYS_ON
