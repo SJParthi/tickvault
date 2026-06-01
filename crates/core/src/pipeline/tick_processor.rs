@@ -136,6 +136,21 @@ fn is_today_ist(exchange_timestamp: u32, today_ist_day_number: u32) -> bool {
     exchange_timestamp / SECONDS_PER_DAY == today_ist_day_number
 }
 
+/// Operator lock 2026-06-01 §30: is `(security_id, exchange_segment_code)`
+/// exempt from the [09:00, 15:30) IST persist window? GIFT Nifty
+/// (`GIFTNIFTY`, NSE-IX) trades ~21 h/day, so its ticks must persist
+/// outside the regular session. The set is boot-immutable and tiny
+/// (usually ≤1 entry), so this is O(1).
+#[inline(always)]
+fn is_window_exempt(
+    always_on: &std::collections::HashSet<(u32, u8)>,
+    security_id: u32,
+    exchange_segment_code: u8,
+) -> bool {
+    // O(1) EXEMPT: HashSet `contains` is O(1) hashing, not an O(n) Vec scan.
+    always_on.contains(&(security_id, exchange_segment_code))
+}
+
 // ---------------------------------------------------------------------------
 // O(1) Tick Validity Checks (extracted for testability)
 // ---------------------------------------------------------------------------
@@ -508,6 +523,13 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     // `prev_oi_cache` and marking the `BootOrderingGate` ready
     // before attaching the enricher here — see L14.
     tick_enricher: Option<std::sync::Arc<TickEnricher>>,
+    // Operator lock 2026-06-01 §30: `(security_id, exchange_segment_code)`
+    // pairs EXEMPT from the [09:00, 15:30) IST persist window (GIFT Nifty
+    // trades ~21 h/day on NSE-IX). Empty set → no exemptions → today's
+    // behavior for every instrument. Boot wires this from
+    // `DailyUniverse::always_on_segments` via
+    // `tickvault_common::always_on::current()`.
+    always_on: std::sync::Arc<std::collections::HashSet<(u32, u8)>>,
 ) {
     // Grab metric handles once before the hot loop — O(1) per tick after this.
     // These are no-ops if no metrics recorder is installed (e.g., in tests).
@@ -901,7 +923,14 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     m_stale_day.increment(1);
                     continue;
                 }
-                if !is_within_persist_window(tick.exchange_timestamp) {
+                // Operator lock 2026-06-01 §30: always-on instruments (GIFT
+                // Nifty, ~21 h/day) skip BOTH market-hours window gates so
+                // their off-session ticks still persist. The stale-day
+                // guard above is KEPT (a GIFT tick must still be today's).
+                // O(1): one lookup of a tiny boot-set set (usually ≤1 entry).
+                let window_exempt =
+                    is_window_exempt(&always_on, tick.security_id, tick.exchange_segment_code);
+                if !window_exempt && !is_within_persist_window(tick.exchange_timestamp) {
                     // Phase 0 Item 12 (2026-05-17) — `last_tick_audit` LATE-TICK
                     // anomaly path. Before dropping the tick, if its
                     // `exchange_timestamp` stamps at or after the session
@@ -923,7 +952,8 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 // Wall-clock guard: reject stale WebSocket snapshots received
                 // outside market hours (post-market data has valid exchange_timestamp
                 // from today's session but arrives after 15:30 IST).
-                if !is_wall_clock_within_persist_window(tick.received_at_nanos) {
+                // §30: always-on instruments (GIFT Nifty) are exempt here too.
+                if !window_exempt && !is_wall_clock_within_persist_window(tick.received_at_nanos) {
                     outside_hours_filtered = outside_hours_filtered.saturating_add(1);
                     m_outside_hours.increment(1);
                     continue;
@@ -1637,9 +1667,10 @@ mod tests {
             frame_receiver,
             tick_writer,
             tick_broadcast,
-            None, // greeks_enricher
+            None,                                                  // greeks_enricher
             None, // tick_heartbeat — watchdog not exercised in tests
             None, // tick_enricher — Phase 2.5 enricher unused by these tests; legacy append_tick path covers them
+            std::sync::Arc::new(std::collections::HashSet::new()), // §30 always-on: empty in tests
         )
         .await;
     }
@@ -3210,6 +3241,20 @@ mod tests {
     fn test_persist_window_zero_timestamp() {
         // Timestamp 0 → seconds_of_day = 0, well outside [09:00, 15:30)
         assert!(!is_within_persist_window(0));
+    }
+
+    #[test]
+    fn test_is_window_exempt_only_for_listed_pairs() {
+        // Operator lock 2026-06-01 §30: GIFT Nifty (sid 5024, IDX_I=0) is
+        // exempt; everything else is not. Composite (sid, segment) key.
+        let mut set = std::collections::HashSet::new();
+        set.insert((5024_u32, 0_u8));
+        assert!(is_window_exempt(&set, 5024, 0), "GIFT Nifty exempt");
+        assert!(!is_window_exempt(&set, 13, 0), "NIFTY not exempt");
+        assert!(!is_window_exempt(&set, 5024, 1), "same sid, wrong segment");
+        // Empty set (default) → nothing exempt → today's behavior.
+        let empty = std::collections::HashSet::new();
+        assert!(!is_window_exempt(&empty, 5024, 0));
     }
 
     #[test]

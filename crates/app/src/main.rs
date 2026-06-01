@@ -1273,6 +1273,7 @@ async fn main() -> Result<()> {
                     greeks_enricher,
                     Some(fast_tick_heartbeat),
                     None, // tick_enricher — Phase 2.5 wiring deferred until prev_oi_cache + boot ordering gate land in slow boot
+                    tickvault_common::always_on::current(), // §30 GIFT exemption
                 )
                 .await;
             });
@@ -3132,6 +3133,7 @@ async fn main() -> Result<()> {
                 // `prev_day_oi`, `phase` columns instead of the
                 // legacy zero/PREMARKET defaults.
                 Some(std::sync::Arc::clone(&tick_enricher)),
+                tickvault_common::always_on::current(), // §30 GIFT exemption
             )
             .await;
         });
@@ -5072,6 +5074,19 @@ async fn cold_build_daily_universe(
     )
     .await
     .context("daily-universe boot failed (fail-closed §4)")?;
+
+    // Operator lock 2026-06-01 §30: install the always-on (no market-hours
+    // filter) exemption set ONCE from the freshly-built universe. GIFT Nifty
+    // (sid 5024, NSE-IX, ~21 h/day) is the only entry today. Read later by
+    // the tick processor + candle aggregator via
+    // `tickvault_common::always_on::current()`. Empty set if GIFT absent.
+    let always_on = universe.always_on_segments();
+    info!(
+        always_on_count = always_on.len(),
+        "§30 always-on (no market-hours filter) set installed"
+    );
+    tickvault_common::always_on::init_always_on_segments(always_on);
+
     Ok((outcome, universe))
 }
 
@@ -5895,7 +5910,12 @@ fn spawn_engine_b_aggregator(
     // per `aws-budget.md`). HashMap grows lazily so this is a hint.
     const AGGREGATOR_CAPACITY: usize = 11_000;
 
-    let aggregator = std::sync::Arc::new(MultiTfAggregator::with_capacity(AGGREGATOR_CAPACITY));
+    // §30: GIFT Nifty (always-on) candles must form across its full ~21h
+    // session — pass the boot-installed exemption set into the aggregator.
+    let aggregator = std::sync::Arc::new(
+        MultiTfAggregator::with_capacity(AGGREGATOR_CAPACITY)
+            .with_always_on(tickvault_common::always_on::current()),
+    );
 
     // --- Task 1: aggregator subscriber (per-tick fold + seal) ---
     let agg_clone = std::sync::Arc::clone(&aggregator);
