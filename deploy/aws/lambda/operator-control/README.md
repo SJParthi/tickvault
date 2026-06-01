@@ -20,7 +20,17 @@ One URL you open on a phone or laptop to run the whole product. Tabs:
 - The SQL box is **read-only** — mutating keywords are rejected before the query reaches QuestDB.
 - Destructive box actions are blocked 09:15–15:30 IST Mon–Fri unless you tick **force**.
 
-## One-time enable (feature-flagged OFF by default — zero cost/risk until you opt in)
+## Zero-touch enable (prod, via CI)
+
+Prod opts in through `terraform-apply.yml` (`TF_VAR_enable_operator_control_lambda=true`).
+On the next apply the workflow **creates the Lambda + Function URL, generates your
+device key in SSM (once), and DMs you one tappable link on Telegram with the key
+baked into the URL fragment** (`…/#key=…`). Open it → you're unlocked, no typing.
+The key is never printed to the Actions log; the fragment never reaches the server.
+**Do not forward that Telegram message** — the link is your key. (The GitHub tab
+still needs the optional `github-token` SSM param below.)
+
+## Manual enable (local — the terraform variable default stays OFF)
 
 ```bash
 # 1. Console bearer key (your device key — paste it into the page once)
