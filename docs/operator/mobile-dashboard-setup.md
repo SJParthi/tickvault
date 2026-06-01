@@ -158,7 +158,26 @@ authed endpoint that parses the query and rejects anything that isn't a `SELECT`
 
 ## 6. One-tap control (no terminal) — already exists
 **GitHub mobile app → Actions → "AWS Control" → Run workflow → pick:**
-`status` · `start` · `stop` · `restart-app` · `stop-app` · `restart-questdb` · `deploy`.
+`status` · `start` · `stop` · `restart-app` · `stop-app` · `restart-questdb` · `rotate-ip` · `deploy`.
+
+### `rotate-ip` — clear a Dhan IP-level feed penalty in one tap
+If the feed shows **"Connection reset / 0 of 1 connected"** but the *same* token
+works on another machine (e.g. your laptop), Dhan has rate-penalised the box's
+**IP**, not your account. One tap on `rotate-ip` swaps the instance's public
+Elastic IP for a fresh one, releases the old (so it isn't billed), and restarts
+the app so the feed dials out from the clean IP — then watch Telegram for
+**"1 of 1 feeds connected"**.
+
+| | Manual (AWS console) | `rotate-ip` button |
+|---|---|---|
+| Steps | allocate → associate → release → restart (4) | **1 tap** |
+| Time | ~2 min | ~30 s |
+| Mistake risk | medium | ~zero (guards built in) |
+
+> Only valid in the **no-orders data-pull phase** — Dhan's static-IP *Order*
+> whitelist does **not** gate the market-data feed, so swapping the IP is safe.
+> Do it **once** per penalty; repeatedly hopping IPs can escalate Dhan to an
+> account-level block.
 
 ---
 
