@@ -73,7 +73,7 @@ const BSE_SENSEX_SYMBOL: &str = "SENSEX";
 /// `GIFTNIFTY` (sid 5024) is in this list AND additionally exempted from
 /// the market-hours tick/candle window (it trades ~21h/day on NSE-IX) —
 /// see the always-on exemption built from this extraction at boot.
-const NSE_INDEX_ALLOWLIST: &[&str] = &[
+pub const NSE_INDEX_ALLOWLIST: &[&str] = &[
     "NIFTY",
     "NIFTY NEXT 50",
     "BANKNIFTY",
