@@ -181,6 +181,22 @@ class Latency(unittest.TestCase):
         self.assertEqual(out["tick_count"], "")
 
 
+class ParseStorage(unittest.TestCase):
+    def test_parses_df_du(self) -> None:
+        out = handler._parse_storage(
+            "DISK_USED=6G\nDISK_FREE=24G\nDISK_PCT=20%\nDB_SIZE=3G\n"
+        )
+        self.assertEqual(out["disk_used_gb"], "6")
+        self.assertEqual(out["disk_free_gb"], "24")
+        self.assertEqual(out["disk_pct"], "20%")
+        self.assertEqual(out["db_size_gb"], "3")
+
+    def test_empty(self) -> None:
+        out = handler._parse_storage("")
+        self.assertEqual(out["disk_free_gb"], "")
+        self.assertEqual(out["db_size_gb"], "")
+
+
 class SafeSql(unittest.TestCase):
     def test_select_is_allowed(self) -> None:
         self.assertTrue(handler._is_safe_sql("SELECT count() FROM ticks"))

@@ -341,6 +341,35 @@ def _parse_latency(stdout: str) -> dict:
     }
 
 
+# ----------------------------------------------------------------- storage snap
+# Disk used/free on the EBS root + QuestDB on-disk size. `df -BG` prints whole
+# GB. The QuestDB data lives in the named docker volume on the root EBS.
+_STORAGE_COMMANDS = [
+    "set +e",
+    "df -BG / | tail -1 | awk '{print \"DISK_USED=\"$3\"\\nDISK_FREE=\"$4\"\\nDISK_PCT=\"$5}'",
+    "echo \"DB_SIZE=$(du -sBG /var/lib/docker/volumes/tv-questdb-data/_data 2>/dev/null | cut -f1)\"",
+]
+
+
+def _parse_storage(stdout: str) -> dict:
+    """Parse df/du output into disk_used/free/pct + db_size (pure)."""
+    f: dict[str, str] = {}
+    for line in (stdout or "").splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            f[k.strip()] = v.strip()
+
+    def g(k: str) -> str:
+        return f.get(k, "").replace("G", "").strip()
+
+    return {
+        "disk_used_gb": g("DISK_USED"),
+        "disk_free_gb": g("DISK_FREE"),
+        "disk_pct": f.get("DISK_PCT", ""),
+        "db_size_gb": g("DB_SIZE"),
+    }
+
+
 # ---------------------------------------------------------------- GitHub helper
 def _gh(method: str, path: str, body: dict | None = None) -> tuple[int, object]:
     """Minimal GitHub REST call using urllib (no deps). Returns (status, json)."""
@@ -536,7 +565,10 @@ def lambda_handler(event, _context):
             except Exception as exc:  # noqa: BLE001
                 print(f"operator-portal describe_alarms failed: {exc!r}")  # noqa: T201
                 firing = None
-            return _resp(200, {"ok": True, "action": action, "alarms_firing": firing, "cost_mtd_usd": _month_to_date_cost()})
+            # Disk space + QuestDB size from the box (empty when the box is
+            # stopped — SSM offline — which is fine, the UI shows —).
+            storage = _parse_storage(_ssm_shell_sync(_STORAGE_COMMANDS))
+            return _resp(200, {"ok": True, "action": action, "alarms_firing": firing, "cost_mtd_usd": _month_to_date_cost(), **storage})
 
         return _resp(400, {"error": f"unknown action: {action!r}"})
     except Exception as exc:  # noqa: BLE001
@@ -755,6 +787,10 @@ def _console_html() -> str:
         </div>
         <div id="alarms" style="margin-top:12px"></div>
       </div>
+      <div class="card"><div class="lbl">storage — disk space &amp; database size (on the box)</div>
+        <div class="shields" id="storage"></div>
+        <div class="muted" style="margin-top:8px">EBS auto-archives partitions &gt;90d to S3, and grows online — so it won't fill. Watch "DB size" climb day-by-day to see your GB/day. (Shows — when the box is stopped.)</div>
+      </div>
     </section>
 
     <!-- LATENCY -->
@@ -867,7 +903,13 @@ async function loadAws(){ $('alarms').dataset.loaded='1'; $('alarms').innerHTML=
   $('cost').textContent='$'+(j.cost_mtd_usd||'—');
   if(j.alarms_firing===null){ $('alarmcount').innerHTML='<span class="warn">?</span>'; $('alarms').innerHTML='<span class="warn">CloudWatch read failed — retry.</span>'; return; }
   const al=j.alarms_firing||[]; $('alarmcount').innerHTML='<span class="'+(al.length?'bad':'ok')+'">'+al.length+'</span>';
-  $('alarms').innerHTML=al.length? al.map(a=>'<div class="pr"><span class="badge failure">ALARM</span> <span class="t">'+esc(a)+'</span></div>').join('') : '<span class="ok">all clear 🎉</span>'; }
+  $('alarms').innerHTML=al.length? al.map(a=>'<div class="pr"><span class="badge failure">ALARM</span> <span class="t">'+esc(a)+'</span></div>').join('') : '<span class="ok">all clear 🎉</span>';
+  const free=parseInt(j.disk_free_gb,10), pct=parseInt(j.disk_pct,10);
+  const freeOk=isNaN(free)?true:free>5; const pctOk=isNaN(pct)?true:pct<85;
+  $('storage').innerHTML=
+    shield('Disk free', (j.disk_free_gb?j.disk_free_gb+' GB':'—'), freeOk)+
+    shield('Disk used', (j.disk_used_gb?j.disk_used_gb+' GB ('+(j.disk_pct||'')+')':'—'), pctOk)+
+    shield('Database size', (j.db_size_gb?j.db_size_gb+' GB':'—'), true); }
 
 function fmtNs(n){ if(n==null||n==='') return '—'; n=Number(n); if(n<1000) return n.toFixed(0)+' ns';
   if(n<1e6) return (n/1e3).toFixed(2)+' µs'; if(n<1e9) return (n/1e6).toFixed(2)+' ms'; return (n/1e9).toFixed(2)+' s'; }
