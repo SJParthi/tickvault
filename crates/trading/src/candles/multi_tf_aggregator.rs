@@ -53,6 +53,7 @@
 //!   `LiveCandleState` BEFORE pushing into the ring).
 //! - DHAT zero-alloc + Criterion bench (item 1.6).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -138,6 +139,11 @@ pub struct ConsumeStats {
 #[derive(Clone, Default)]
 pub struct MultiTfAggregator {
     inner: Arc<HashMap<AggregatorKey, Arc<InstrumentEntry>>>,
+    /// Operator lock 2026-06-01 §30: `(security_id, exchange_segment_code)`
+    /// pairs exempt from the 09:15–15:30 IST candle-window gate (GIFT
+    /// Nifty trades ~21 h/day). Empty by default → no exemptions →
+    /// today's behavior. Set once at boot via `with_always_on`.
+    always_on: Arc<HashSet<(u32, u8)>>,
 }
 
 impl MultiTfAggregator {
@@ -154,7 +160,21 @@ impl MultiTfAggregator {
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             inner: Arc::new(HashMap::with_capacity(cap)),
+            always_on: Arc::new(HashSet::new()),
         }
+    }
+
+    /// Install the always-on (no market-hours filter) exemption set
+    /// (operator lock 2026-06-01 §30). Boot wires this from
+    /// `DailyUniverse::always_on_segments` so GIFT Nifty candles form
+    /// across its full ~21 h session instead of being dropped by the
+    /// 09:15–15:30 IST window gate. Builder style so existing
+    /// `new()`/`with_capacity()` call sites (incl. all tests) keep the
+    /// safe empty default.
+    #[must_use]
+    pub fn with_always_on(mut self, always_on: Arc<HashSet<(u32, u8)>>) -> Self {
+        self.always_on = always_on;
+        self
     }
 
     /// Number of instruments tracked.
@@ -238,9 +258,17 @@ impl MultiTfAggregator {
         // never pollute the candle grid (which Dhan REST cross-verify
         // also expects to begin at 09:15). The bucket grid itself is
         // 09:15-anchored in `TfIndex::bucket_start`.
+        // Operator lock 2026-06-01 §30: always-on instruments (GIFT Nifty,
+        // ~21 h/day on NSE-IX) are EXEMPT from the regular-session window
+        // gate so their candles form across their full session. O(1) read
+        // of a tiny boot-set set (usually ≤1 entry).
+        let exempt_key = (tick.security_id, exchange_segment_code);
+        // O(1) EXEMPT: `always_on` is a HashSet — contains is O(1) hashing, not a Vec scan.
+        let exempt = self.always_on.contains(&exempt_key);
         let secs_of_day = tick.exchange_timestamp % 86_400;
-        if secs_of_day < MARKET_OPEN_SECS_OF_DAY_IST || secs_of_day >= MARKET_CLOSE_SECS_OF_DAY_IST
-        {
+        let out_of_session = secs_of_day < MARKET_OPEN_SECS_OF_DAY_IST
+            || secs_of_day >= MARKET_CLOSE_SECS_OF_DAY_IST;
+        if !exempt && out_of_session {
             return ConsumeStats {
                 sealed_count: 0,
                 late_count: 0,
@@ -411,6 +439,39 @@ mod tests {
         assert_eq!(stats.sealed_count, 0);
         assert_eq!(stats.late_count, 0);
         assert_eq!(sealed_callbacks, 0);
+    }
+
+    #[test]
+    fn test_non_exempt_tick_outside_window_is_skipped() {
+        // Operator lock 2026-06-01 §30: a normal instrument's tick at
+        // 20:00 IST (outside 09:15–15:30) must NOT open any candle.
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(13, 0)]);
+        // secs_of_day = 72000 = 20:00 IST (base day-aligned + 72000).
+        let tick = mk_tick(13, 0, 1_779_235_200 + 72_000, 100.0, 50, 1_000);
+        agg.consume_tick(&tick, 0, |_, _| {});
+        let entry = agg.get(13, 0).expect("present");
+        assert!(
+            entry.cell.snapshot(TfIndex::ALL[0]).is_uninitialised(),
+            "non-exempt tick outside the session window must be skipped"
+        );
+    }
+
+    #[test]
+    fn test_gift_nifty_exempt_tick_aggregates_outside_window() {
+        // GIFT Nifty (sid 5024, IDX_I=0) in the always-on set aggregates
+        // at 20:00 IST — its candle MUST open.
+        let mut set = HashSet::new();
+        set.insert((5024_u32, 0_u8));
+        let agg = MultiTfAggregator::with_capacity(8).with_always_on(Arc::new(set));
+        agg.pre_populate(vec![(5024, 0)]);
+        let tick = mk_tick(5024, 0, 1_779_235_200 + 72_000, 100.0, 50, 1_000);
+        agg.consume_tick(&tick, 0, |_, _| {});
+        let entry = agg.get(5024, 0).expect("present");
+        assert!(
+            !entry.cell.snapshot(TfIndex::ALL[0]).is_uninitialised(),
+            "exempt GIFT Nifty tick outside the window MUST aggregate"
+        );
     }
 
     #[test]
