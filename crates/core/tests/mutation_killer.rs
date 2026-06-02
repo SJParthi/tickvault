@@ -44,12 +44,14 @@ fn mutation_watchdog_threshold_live_and_depth_is_exactly_50_not_40_or_60() {
 }
 
 #[test]
-fn mutation_watchdog_threshold_order_update_is_exactly_660_not_600() {
-    // 600s tolerance + 60s safety margin. A mutant using 600 (the
-    // tolerance alone) would let the watchdog fire during legitimate
-    // no-order windows, spamming Telegram.
-    assert_eq!(WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS, 660);
-    assert!(WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS > 600);
+fn mutation_watchdog_threshold_order_update_is_exactly_14400() {
+    // 4 hours (14_400s). The order-update feed can legitimately be silent
+    // for hours (no orders placed in a dry-run / quiet session), so the
+    // watchdog must NOT fire during those windows. A mutant shortening
+    // this (e.g. to 1800) would reintroduce the every-30-min false
+    // reconnect storm (see live-market-feed-subscription.md 2026-04-24 §7).
+    assert_eq!(WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS, 14_400);
+    assert!(WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS > 3_600);
 }
 
 #[test]

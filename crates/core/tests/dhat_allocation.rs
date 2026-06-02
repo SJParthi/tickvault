@@ -135,8 +135,10 @@ fn dhat_all_parsers_zero_alloc() {
     // 2. Quote parse
     assert!(tickvault_core::parser::dispatch_frame(&quote_pkt, 0).is_ok());
 
-    // 3. Market depth parse
-    assert!(tickvault_core::parser::dispatch_frame(&depth_pkt, 0).is_ok());
+    // 3. Market depth — retired v1 response code 3 (replaced by Full
+    //    code 8 in v2). dispatch_frame now REJECTS it; the rejection path
+    //    must also be zero-allocation.
+    assert!(tickvault_core::parser::dispatch_frame(&depth_pkt, 0).is_err());
 
     // 4. Full packet parse
     assert!(tickvault_core::parser::dispatch_frame(&full_pkt, 0).is_ok());

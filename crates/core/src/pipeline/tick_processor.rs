@@ -778,7 +778,9 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     let hex_len = raw_frame.len().min(64);
                     let hex_dump: String = raw_frame[..hex_len]
                         .iter()
-                        .map(|b| format!("{b:02x}"))
+                        // O(1) EXEMPT: cold path, parse errors are rare (bounded
+                        // to the first 100); only runs on a malformed frame.
+                        .map(|b| format!("{b:02x}")) // O(1) EXEMPT: cold path
                         .collect::<Vec<_>>()
                         .join(" "); // O(1) EXEMPT: cold path, parse errors are rare
                     if parse_errors.is_multiple_of(10) {
