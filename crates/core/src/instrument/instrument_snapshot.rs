@@ -52,6 +52,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use tickvault_common::constants::MIN_DAILY_UNIVERSE_SIZE;
 use tracing::{debug, warn};
 
 use super::daily_universe::{DailyUniverse, InstrumentRole, SubscriptionTarget};
@@ -268,6 +269,24 @@ pub fn load_plan_snapshot_for_today(trading_date_ist: &str) -> Option<DailyUnive
         return None;
     }
     let universe = to_universe(&snapshot)?;
+    // Zero-tick-loss guard (2026-06-02): a same-day snapshot that is empty or
+    // implausibly small (corruption, truncated/partial write, manual edit) must
+    // NOT be warm-resubscribed — that would subscribe to too few / zero SIDs and
+    // SILENTLY lose the day's ticks with no alarm. Reject it → return None so the
+    // caller falls through to the cold build, which re-fetches the Dhan CSV and
+    // enforces the [MIN_DAILY_UNIVERSE_SIZE, MAX_DAILY_UNIVERSE_SIZE] envelope
+    // (fail-closed boot halt on an out-of-range size). The cold path is the only
+    // sanctioned way to accept a universe.
+    if universe.subscription_targets.len() < MIN_DAILY_UNIVERSE_SIZE {
+        warn!(
+            date = trading_date_ist,
+            targets = universe.subscription_targets.len(),
+            min = MIN_DAILY_UNIVERSE_SIZE,
+            "plan snapshot has too few targets (empty/corrupt?) — rejecting warm \
+             path; cold build will rebuild + envelope-check (zero-tick-loss guard)"
+        );
+        return None;
+    }
     debug!(
         date = trading_date_ist,
         targets = universe.subscription_targets.len(),
@@ -303,6 +322,25 @@ mod tests {
                 security_id: "99999".to_string(),
                 ..CsvRow::default()
             }],
+        }
+    }
+
+    /// A universe with >= MIN_DAILY_UNIVERSE_SIZE targets — passes the
+    /// zero-tick-loss size guard in `load_plan_snapshot_for_today` (the warm
+    /// path rejects anything smaller as empty/corrupt).
+    fn large_sample_universe() -> DailyUniverse {
+        let mut subscription_targets = Vec::with_capacity(MIN_DAILY_UNIVERSE_SIZE + 20);
+        subscription_targets.push(target(InstrumentRole::Index, "13", "NIFTY"));
+        for i in 0..(MIN_DAILY_UNIVERSE_SIZE + 19) {
+            subscription_targets.push(target(
+                InstrumentRole::FnoUnderlying,
+                &format!("{}", 10_000 + i),
+                "SYM",
+            ));
+        }
+        DailyUniverse {
+            subscription_targets,
+            fno_contracts: Vec::new(),
         }
     }
 
@@ -398,12 +436,33 @@ mod tests {
         // Clean any leftover from a prior run.
         let _ = std::fs::remove_file(&path);
 
-        write_plan_snapshot(&sample_universe(), date).expect("write ok");
+        // Use a >= MIN_DAILY_UNIVERSE_SIZE universe so the zero-tick-loss size
+        // guard accepts the warm load (a 2-SID snapshot is now rejected — see
+        // test_load_rejects_too_small_snapshot_zero_tick_loss_guard).
+        write_plan_snapshot(&large_sample_universe(), date).expect("write ok");
         let loaded = load_plan_snapshot_for_today(date).expect("load ok");
-        assert_eq!(loaded.subscription_targets.len(), 2);
+        assert!(loaded.subscription_targets.len() >= MIN_DAILY_UNIVERSE_SIZE);
         assert_eq!(loaded.subscription_targets[0].csv_row.security_id, "13");
 
         // Cleanup.
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_rejects_too_small_snapshot_zero_tick_loss_guard() {
+        // Regression 2026-06-02: a same-day snapshot with too few SIDs
+        // (empty/corrupt/truncated) MUST be rejected → cold build rebuilds +
+        // envelope-checks. Prevents silent warm-resubscribe to ~0 SIDs, which
+        // would lose the entire day's ticks with no alarm.
+        let date = "2099-05-06";
+        let path = snapshot_path_for(date).expect("valid date");
+        let _ = std::fs::remove_file(&path);
+        // sample_universe() has only 2 targets — below MIN_DAILY_UNIVERSE_SIZE.
+        write_plan_snapshot(&sample_universe(), date).expect("write ok");
+        assert!(
+            load_plan_snapshot_for_today(date).is_none(),
+            "snapshot with < MIN_DAILY_UNIVERSE_SIZE targets must be rejected (cold build)"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -458,15 +517,28 @@ mod tests {
         use tickvault_common::types::ExchangeSegment;
 
         // Realistic mixed universe — indices (IDX_I) + F&O underlyings (NSE_EQ).
+        let mut targets_vec = vec![
+            target(InstrumentRole::Index, "13", "NIFTY"),
+            target(InstrumentRole::Index, "25", "BANKNIFTY"),
+            target(InstrumentRole::Index, "51", "SENSEX"),
+            target(InstrumentRole::FnoUnderlying, "2885", "RELIANCE"),
+            target(InstrumentRole::FnoUnderlying, "1333", "HDFCBANK"),
+            target(InstrumentRole::FnoUnderlying, "11536", "TCS"),
+        ];
+        // Pad to >= MIN_DAILY_UNIVERSE_SIZE so the snapshot passes the
+        // zero-tick-loss size guard (2026-06-02). Plan-A and Plan-B both build
+        // from this same padded universe, so the plan-identity assertions below
+        // are unaffected; the padding SIDs (20000+) never collide with the named
+        // ones and are all FnoUnderlying (index count stays 3).
+        for i in 0..MIN_DAILY_UNIVERSE_SIZE {
+            targets_vec.push(target(
+                InstrumentRole::FnoUnderlying,
+                &format!("{}", 20_000 + i),
+                "PAD",
+            ));
+        }
         let original = DailyUniverse {
-            subscription_targets: vec![
-                target(InstrumentRole::Index, "13", "NIFTY"),
-                target(InstrumentRole::Index, "25", "BANKNIFTY"),
-                target(InstrumentRole::Index, "51", "SENSEX"),
-                target(InstrumentRole::FnoUnderlying, "2885", "RELIANCE"),
-                target(InstrumentRole::FnoUnderlying, "1333", "HDFCBANK"),
-                target(InstrumentRole::FnoUnderlying, "11536", "TCS"),
-            ],
+            subscription_targets: targets_vec,
             fno_contracts: vec![],
         };
 
@@ -517,8 +589,8 @@ mod tests {
         );
         assert_eq!(
             set_a.len(),
-            6,
-            "all 6 instruments must survive the round-trip"
+            original.subscription_targets.len(),
+            "all instruments must survive the round-trip"
         );
 
         let _ = std::fs::remove_file(&path);
