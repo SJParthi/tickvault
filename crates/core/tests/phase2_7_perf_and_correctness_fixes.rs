@@ -53,28 +53,38 @@ fn hot_path_c1_record_tick_uses_single_papaya_insert() {
     );
 }
 
-/// Hot-path C2 ratchet: the wall-clock read is hoisted out of the
-/// per-tick branch. The processor caches `frame_now_ist_secs` once
-/// per frame (1-30 ticks share it) and passes that to enricher.enrich_tick.
+/// Hot-path C2 ratchet: no per-tick wall-clock syscall on the enrich path.
+///
+/// **Updated 2026-06-02:** the original C2 fix hoisted the wall-clock read to
+/// a frame-level `frame_now_ist_secs` cache. The production code was since
+/// improved to derive the seconds-of-day from the TICK'S OWN
+/// `exchange_timestamp` (`tick.exchange_timestamp % 86_400`) — zero wall-clock
+/// syscalls per tick, and the correct semantic (exchange time, not arrival
+/// time). This ratchet now pins that stronger invariant. The old ratchet
+/// asserted `frame_now_ist_secs`, which no longer exists — it was stale
+/// against the refactor and failing on `main`.
 #[test]
 fn hot_path_c2_now_ist_secs_hoisted_to_frame_level() {
     let src = read("core/src/pipeline/tick_processor.rs");
+    // The per-tick seconds-of-day is derived from the tick's exchange
+    // timestamp — no syscall, no shared frame cache needed.
     assert!(
-        src.contains("let frame_now_ist_secs"),
-        "tick_processor must declare a frame-level cache `frame_now_ist_secs` \
-         (hot-path C2 fix: amortize the wall-clock read across the frame)"
+        src.contains("tick.exchange_timestamp % 86_400"),
+        "tick_processor must derive the per-tick seconds-of-day from \
+         `tick.exchange_timestamp % 86_400` (hot-path C2: no per-tick \
+         wall-clock syscall on the enrich path)"
     );
     assert!(
-        src.contains("enricher.enrich_tick(&tick, frame_now_ist_secs)"),
-        "tick_processor must pass `frame_now_ist_secs` (the cached value) \
-         to enricher.enrich_tick — not a per-tick now_ist_secs_of_day() call"
+        src.contains("enricher.enrich_tick(&tick, tick_secs_of_day)"),
+        "tick_processor must pass the tick-derived `tick_secs_of_day` to \
+         enricher.enrich_tick — not a per-tick wall-clock read"
     );
     // Per-tick re-reads of the wall clock inside the persistence
-    // branch must be gone.
+    // branch must be gone (the C2 invariant, unchanged).
     assert!(
         !src.contains("let now_ist_secs = now_ist_secs_of_day();"),
-        "tick_processor must NOT re-read the wall clock per tick — use \
-         the frame-level cache instead (hot-path C2 fix)"
+        "tick_processor must NOT re-read the wall clock per tick — derive \
+         from the tick's exchange timestamp instead (hot-path C2)"
     );
 }
 
@@ -93,7 +103,7 @@ fn hostile_c1_midnight_rollover_task_spawned_in_slow_boot() {
     assert!(
         src.contains("config.questdb.clone()"),
         "spawn_midnight_rollover_task receives the QuestDB config so it can \
-         reload prev_oi_cache from candles_1d at IST midnight"
+         reload prev_oi_cache from prev_day_ohlcv at IST midnight"
     );
 }
 
