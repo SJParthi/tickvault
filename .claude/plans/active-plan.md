@@ -1,71 +1,49 @@
-# Implementation Plan: Fix AWS auto-start miss + deploy-on-stopped-box spam
+# Active Plan: 1d timeframe = historical-only (never tick-calculated)
 
-**Status:** VERIFIED
+**Status:** APPROVED (design locked) — implementation in progress
 **Date:** 2026-06-02
-**Approved by:** Parthiban (2026-06-02 — "Fixes B + C + diagnostic", normal trading day)
+**Approved by:** Parthiban — "1 day timeframe should never ever be calculated, always pulled once and only from historical 1 day timeframe" + chose **"Add OI to the daily pull"** when asked how prev-OI sources its OI.
 
-> Per-wave / per-item guarantee matrix: cross-references
-> `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row) and
-> `.claude/rules/project/zero-loss-guarantee-charter.md`. This is a CI/infra
-> change (no Rust hot-path, no QuestDB schema, no tick path) — the resilience
-> rows are N/A; the proof rows are the ratchet tests listed below.
+## Verified facts (from 3-agent adversarial review + my own code verification)
 
-## Incident
+1. **The write boundary** for `candles_1d` is TWO `on_seal` closures in `crates/app/src/main.rs` (~line 6003 per-tick + ~6123 boundary force-seal). The aggregator (`multi_tf_aggregator.rs`) still seals all 21 TFs internally; only these closures turn a sealed bucket into a persisted `BufferedSeal`. **Skip D1 here** (not in the aggregator loops) → keeps the fixed 21-slot arrays + the `42 = 2×21` aggregator unit test intact.
+2. **prev-OI reads OI from `candles_1d`** at boot (`main.rs:3021` `load_from_questdb`) AND every midnight (`main.rs:3159` `spawn_prev_oi_cache_refresh_task` → `tick_enricher.rs:214` → `prev_oi_cache.rs:176` `SELECT … oi FROM candles_1d`). If we stop sealing D1 without redirecting this, every `oi_pct_from_prev_day` silently becomes 0.0 → CRITICAL silent corruption. (Boot ALSO loads prev-OI from Option Chain REST at `main.rs:2933`; the candles_1d path is an additional/overlapping source.)
+3. **`prev_day_ohlcv` has NO `oi` column** (`prev_day_ohlcv_persistence.rs` — open/high/low/close/volume only). The boot fetch (`prev_day_ohlcv_boot.rs`) currently does NOT request OI from Dhan. **`grep "FROM prev_day_ohlcv"` = 0 hits** — the table is write-only; no reader exists yet.
+4. Only `bar_cache_loader.rs` actively SELECTs `candles_1d_shadow`; would load 0 D1 rows. Other "candles_1d" references in tick_enricher/prev_oi_cache/boot_ordering_gate doc comments are about the OI path above.
 
-2026-06-02 08:45 IST: EC2 box still stopped (08:30 IST EventBridge start did not
-succeed) → every `deploy-aws` run failed at `aws ssm send-command`
-(`InvalidInstanceId: Instances not in a valid state`) → 5× "DLT deploy FAILED"
-Telegram overnight. `aws-autopilot` only self-started during 09:00-15:35 IST, so
-the 08:30-09:00 gap was uncovered.
+## Plan Items (ALL land in ONE PR — partial = OI% corruption)
 
-## Plan Items
+- [ ] **Storage: add `oi` to `prev_day_ohlcv`**
+  - Files: crates/storage/src/prev_day_ohlcv_persistence.rs
+  - DDL gets `oi LONG`; `PrevDayOhlcvRow` gets `pub oi: i64`; ILP append adds `column_i64("oi", ...)`. DEDUP key unchanged.
+  - Tests: prev_day_ohlcv_create_ddl test asserts `oi` column.
 
-- [x] **B — deploy-aws: do not page on an intentional off-hours skip**
-  - Files: .github/workflows/deploy-aws.yml
-  - Behaviour: when a stopped box is auto-pushed-to outside the 08:30-16:30 IST
-    up-window, set `DEPLOY_SKIP_REASON=intentional_stopped`, gate the
-    failure-notify + auto-stop + fetch-output steps on it (no Telegram); run
-    stays non-success so the 08:45 cron redeploys.
-  - Tests: test_deploy_aws_self_starts_stopped_instance_and_skips_offhours_cleanly
+- [ ] **Fetch: request + parse OI in the daily pull**
+  - Files: crates/app/src/prev_day_ohlcv_boot.rs
+  - Add `oi: true` to the Dhan `/v2/charts/historical` request; parse the `open_interest` columnar array (per historical-data.md); set `row.oi` (0 for equities/indices where OI is meaningless — Dhan returns all-zero).
+  - Tests: parse test for the oi array.
 
-- [x] **C — deploy-aws: self-start a stopped box that SHOULD be up**
-  - Files: .github/workflows/deploy-aws.yml
-  - Behaviour: "Ensure instance running" step starts the box + waits for SSM
-    `PingStatus=Online` before send-command, when in the up-window or a manual
-    dispatch (self-heals a missed EventBridge start).
-  - Tests: test_deploy_aws_self_starts_stopped_instance_and_skips_offhours_cleanly
+- [ ] **Repoint prev-OI from candles_1d → prev_day_ohlcv**
+  - Files: crates/core/src/pipeline/prev_oi_cache.rs:176
+  - SQL `FROM candles_1d` → `FROM prev_day_ohlcv`. Same columns (security_id, segment, oi), same LATEST-ON semantics.
+  - Tests: phase2_11_prev_oi_refresh.rs + phase2_7 → assert reload from prev_day_ohlcv.
 
-- [x] **C — autopilot: widen self-start window to 08:30-16:30 IST**
-  - Files: scripts/aws-autopilot.sh
-  - Behaviour: new `is_box_up_window` (830-1630) replaces `is_market_window`
-    for the stopped-box start, covering the 08:30-09:00 pre-market gap.
-  - Tests: test_aws_autopilot_selfheal_workflow_exists
+- [ ] **Aggregator: skip D1 seal emission**
+  - Files: crates/app/src/main.rs (~6003 + ~6123)
+  - `if tf == TfIndex::D1 { return; }` as the first line of each on_seal closure.
+  - Tests: aggregator unit tests UNCHANGED (skip is in main.rs, not the aggregator).
 
-- [x] **Diagnostic (A) — autopilot: report why EventBridge start failed**
-  - Files: scripts/aws-autopilot.sh
-  - Behaviour: `diagnose_eventbridge_start` inspects the `tv-prod-daily-start`
-    rule state + last `AWS-StartEC2Instance` automation when the box is found
-    stopped in the up-window, surfacing the failing layer to the operator.
-  - Tests: test_aws_autopilot_selfheal_workflow_exists
+- [ ] **bar_cache_loader: drop the 1d tuple** (1d now from prev_day_ohlcv, not candles_1d_shadow)
+  - Files: crates/app/src/bar_cache_loader.rs
+  - Tests: bar_cache_loader tests (721/761) drop `1d`.
 
-- [x] **Ratchet tests**
-  - Files: crates/common/tests/aws_infra_wiring.rs
-  - Tests: test_deploy_aws_self_starts_stopped_instance_and_skips_offhours_cleanly,
-    test_aws_autopilot_selfheal_workflow_exists
+- [ ] **Rule + ratchets**
+  - live-feed-purity.md: one-line carve-out — "candles_1d is historical-only (prev_day_ohlcv); the live aggregator does NOT seal D1."
+  - metrics_catalog.rs: exempt D1 from market-hours seal-rate expectations (avoid false "broken" alarm per audit Rule 11).
 
-## Scenarios
+## Edge cases (covered)
+- prev_day_ohlcv empty at boot (Dhan fetch failed) → prev-OI loads 0 → add a positive-signal log so it's not a silent false-OK (audit Rule 11).
+- Today's 1d absent until next morning's pull → confirmed no consumer requires same-day D1.
 
-| # | Scenario | Expected |
-|---|----------|----------|
-| 1 | 08:30 EventBridge start fails; autopilot runs 08:30 | diagnoses + starts box |
-| 2 | Push to main at 02:00 IST (box stopped) | clean skip, NO Telegram, run non-success |
-| 3 | 08:45 pre-market cron, box stopped | deploy self-starts box + deploys |
-| 4 | Manual workflow_dispatch any time, box stopped | self-starts box + deploys |
-| 5 | Box already running | deploy proceeds unchanged |
-
-## Verification
-
-- `cargo test -p tickvault-common --test aws_infra_wiring` → 30 passed
-- `cargo test -p tickvault-common --test github_workflow_guard` → push-trigger ratchet green
-- `bash -n scripts/aws-autopilot.sh` → OK
-- deploy-aws.yml parses as YAML
+## Keep unchanged
+`TfIndex::D1`, `TF_COUNT=21`, `candles_1d` DDL/self-heal, the ordinal-indexed `[Sender;21]` — reordering = silent SEMVER break (`tf_index.rs` docs). The table stays created (just unwritten by ticks).
