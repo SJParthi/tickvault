@@ -204,6 +204,32 @@ resource "aws_cloudwatch_metric_alarm" "dlq_ticks" {
 }
 
 # ---------------------------------------------------------------------------
+# 8b. Tick PERMANENTLY dropped — the final zero-tick-loss breach
+#
+# `tv_ticks_dropped_total` increments ONLY when the rescue ring AND the disk
+# spill AND the DLQ NDJSON all failed for a tick (tick_persistence.rs). This
+# is strictly more severe than `tv_spill_dropped_total` / `tv_dlq_ticks_total`
+# (which still recover the payload downstream): a non-zero value here means a
+# tick was IRRECOVERABLY lost. It is the operator's #1 invariant breach, so it
+# gets its own dedicated alarm even though the upstream tiers also alarm.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "ticks_dropped" {
+  alarm_name          = "tv-${var.environment}-ticks-dropped"
+  alarm_description   = "A tick was PERMANENTLY dropped — rescue ring + disk spill + DLQ NDJSON ALL failed. Irrecoverable zero-tick-loss breach (host OOM + disk full + dlq dir unwritable). Investigate immediately. MUST always be 0."
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "tv_ticks_dropped_total"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+  dimensions          = local.app_dimensions
+  alarm_actions       = local.app_alarm_actions
+  ok_actions          = local.app_alarm_ok
+}
+
+# ---------------------------------------------------------------------------
 # 9. Aggregator producing zero seals during market hours
 #
 # Note: this alarm is NOT market-hours-gated at the CloudWatch level (CW

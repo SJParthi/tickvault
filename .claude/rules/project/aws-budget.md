@@ -47,7 +47,7 @@ removal is the highest-risk PR and must not be half-shipped.
 | EIP (24/7) | 1 static IP — Dhan static-IP mandate | $0.005/hr × 720h | ₹306 |
 | EBS gp3 | 10 GB (tight — 4-SID dataset is small) | $0.0912/GB-mo | ₹78 |
 | S3 cold | Tiny dataset (4 SIDs) — Intelligent-Tier → Glacier auto | $0.025→$0.002/GB-mo | ₹15 |
-| CloudWatch | 10 metrics + 10 alarms + 5GB logs (free tier) | $0 | ₹0 |
+| CloudWatch | 10 custom metrics + 5GB logs (free tier) + 18 alarms (13 app + 5 infra; first 10 free, 8 over @ $0.10) | ~$0.80 | ₹68 |
 | SNS SMS | ~100 India SMS/mo | $0.00278/msg | ₹24 |
 | SNS Email / HTTPS / Lambda | free tier | $0 | ₹0 |
 | Data transfer | ~10 GB outbound | ~$0.01/GB | ₹85 |
