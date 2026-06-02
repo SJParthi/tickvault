@@ -52,3 +52,20 @@ obi_compute              = 1000         # <1μs = 1000ns — matches obi_compute
 # Common crate
 is_trading_day           = 50           # <50ns  — matches calendar/is_trading_day
 config_toml_load         = 10000000     # <10ms = 10,000,000ns — matches config/toml_load
+
+# =============================================================================
+# Per-element counts for BATCH benchmarks (2026-06-02)
+# =============================================================================
+# Some benchmarks process N elements per Criterion iteration, so their measured
+# median is the BATCH time, not the per-element time. The budgets above are
+# PER-ELEMENT (e.g. `pipeline` is "<100ns per tick"). bench-gate.sh divides a
+# batch bench's median by its element count here before comparing, so the gate
+# enforces the per-element budget honestly. Benches not listed default to 1.
+#
+# Found by the 2026-06-02 load+chaos proof run: before this, the gate compared
+# pipeline/batch_100_mixed's 100-tick median (~470ns) against the 100ns/tick
+# budget — a unit bug that failed by construction even though per-tick latency
+# was ~4.7ns (≈20× under budget).
+[elements]
+pipeline_batch_100_mixed  = 100   # 100 mixed packets per iter
+pipeline_burst_100_ticker = 100   # 100 ticker packets per iter
