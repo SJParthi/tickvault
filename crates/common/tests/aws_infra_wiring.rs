@@ -609,10 +609,46 @@ fn test_deploy_aws_self_starts_stopped_instance_and_skips_offhours_cleanly() {
         "deploy-aws.yml must set DEPLOY_SKIP_REASON for an off-hours skip"
     );
     assert!(
-        content.contains("env.DEPLOY_SKIP_REASON != 'intentional_stopped'"),
-        "deploy-aws.yml failure-notify + auto-stop steps must be gated on \
-         DEPLOY_SKIP_REASON so an intentional off-hours skip does NOT page the \
+        content.contains("env.DEPLOY_SKIP_REASON == ''"),
+        "deploy-aws.yml failure-notify + auto-stop + fetch-output steps must be \
+         gated on DEPLOY_SKIP_REASON being empty so ANY intentional defer \
+         (off-hours stopped box OR market-hours swap abort) does NOT page the \
          operator (anti-spam)"
+    );
+}
+
+#[test]
+fn test_deploy_aws_regates_market_hours_at_swap_time() {
+    // ROOT-CAUSE FIX 2026-06-02 (incident #2): PR #971 merged at 09:11 IST
+    // (4 min before the 09:15 open), passed the START-time guard_market_hours,
+    // then the ~4-5 min ARM build pushed the SSM binary swap + systemctl
+    // restart to ~09:16 IST — INSIDE market open — blanking the live feed for
+    // ~2 min at the bell. The start-time guard cannot see a build that crosses
+    // the open boundary. This pins the SWAP-time re-gate: immediately before
+    // the SSM swap, deploy-aws re-checks IST market hours and ABORTS (defers
+    // to the 15:31 cron) instead of restarting the live app mid-session.
+    let content =
+        std::fs::read_to_string(workspace_root().join(".github/workflows/deploy-aws.yml"))
+            .expect("deploy-aws.yml must be readable"); // APPROVED: test
+    assert!(
+        content.contains("Re-gate market hours at SWAP time"),
+        "deploy-aws.yml must re-check market hours immediately before the SSM \
+         binary swap (a build that started pre-open can cross the 09:15 boundary)"
+    );
+    assert!(
+        content.contains("market_hours_swap_abort"),
+        "the swap-time re-gate must set DEPLOY_SKIP_REASON=market_hours_swap_abort \
+         so the deferred run does not page the operator + the 15:31 cron redeploys"
+    );
+    // The swap-time gate must encode the 09:15-15:30 IST window (915/1530) and
+    // honour the same operator override as the start-time guard.
+    assert!(
+        content.contains("915") && content.contains("1530"),
+        "swap-time re-gate must encode the 09:15-15:30 IST market window (915/1530)"
+    );
+    assert!(
+        content.contains("confirm_market_hours"),
+        "swap-time re-gate must keep the workflow_dispatch confirm_market_hours override"
     );
 }
 

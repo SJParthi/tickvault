@@ -429,6 +429,39 @@ jobs:
             s3://tv-prod-cold/deploys/${{ github.sha }}/smoke_test \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }}
 
+      - name: Re-gate market hours at SWAP time (no mid-session restart)
+        # ROOT-CAUSE FIX 2026-06-02 (incident #2): the `guard_market_hours`
+        # job checks the clock at JOB START. PR #971 merged at 09:11:21 IST
+        # (4 min before the 09:15 open), passed that guard, then the ~4-5 min
+        # ARM build pushed the actual SSM binary-swap + `systemctl restart` to
+        # ~09:16 IST — INSIDE market open. That restart blanked the live feed
+        # for ~2 min right at the bell (recent_tick SELFTEST-02 failed 09:15;
+        # ticks resumed only after FAST BOOT 09:17). The start-time guard
+        # cannot see a build that crosses the open boundary.
+        #
+        # This step re-checks IST market hours IMMEDIATELY before the swap. If
+        # we are now inside 09:15-15:30 IST Mon-Fri, ABORT before touching the
+        # box: the binary is already built + in S3, so the 15:31 IST
+        # post-market cron (deploy-aws-after-close) will redeploy it safely.
+        # DEPLOY_SKIP_REASON suppresses the failure Telegram (this is an
+        # intentional defer, not a failure) while keeping the run non-success
+        # so the cron re-fires. The manual override path stays open via
+        # workflow_dispatch confirm_market_hours=yes (same as the start guard).
+        run: |
+          set -uo pipefail
+          if [ "${{ github.event.inputs.confirm_market_hours }}" = "yes" ]; then
+            echo "operator override (confirm_market_hours=yes) — proceeding with swap during market hours"
+            exit 0
+          fi
+          DOW=$(TZ='Asia/Kolkata' date +%u)
+          HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM))
+          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 915 ] && [ "$HHMM" -lt 1530 ]; then
+            echo "DEPLOY_SKIP_REASON=market_hours_swap_abort" >> "$GITHUB_ENV"
+            echo "::warning::Market is OPEN ($HHMM IST) at swap time — the build crossed the 09:15 boundary. ABORTING the binary swap to avoid a mid-session restart. The 15:31 IST post-market cron will redeploy this commit. (Override: re-run with confirm_market_hours=yes.)"
+            exit 1
+          fi
+          echo "outside market hours ($HHMM IST, dow=$DOW) — safe to swap"
+
       - name: Run SSM command — download binaries + smoke test + atomic swap
         # Target path is /opt/tickvault (matches user-data.sh.tftpl step 4).
         # Smoke test is a SEPARATE binary (crates/app/src/bin/smoke_test.rs),
@@ -580,7 +613,7 @@ jobs:
         # Skipped on an intentional off-hours skip (the box is down on purpose;
         # there is no command_id to query, so this would only emit AWS
         # ParamValidation noise — see the "Ensure instance running" step).
-        if: always() && env.DEPLOY_SKIP_REASON != 'intentional_stopped'
+        if: always() && env.DEPLOY_SKIP_REASON == ''
         run: |
           STATUS=$(aws ssm get-command-invocation \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
@@ -656,7 +689,7 @@ jobs:
       - name: Auto-stop tickvault service on deploy failure (kills Telegram spam)
         # Not on an intentional off-hours skip: the box is already stopped, so
         # this would only emit InvalidInstanceId noise.
-        if: failure() && env.DEPLOY_SKIP_REASON != 'intentional_stopped'
+        if: failure() && env.DEPLOY_SKIP_REASON == ''
         # When the deploy fails AFTER the binary is in place, systemd's
         # Restart=always keeps relaunching it every few seconds. If each
         # boot reaches the auth step (it does after PR #921/#922), each
@@ -683,7 +716,7 @@ jobs:
         # purpose, auto push outside the up-window) is NOT a failure worth
         # paging the operator at 2 AM. The 08:45 IST pre-market cron redeploys.
         # Genuine deploy failures (box up, smoke test failed, etc.) still page.
-        if: failure() && env.DEPLOY_SKIP_REASON != 'intentional_stopped'
+        if: failure() && env.DEPLOY_SKIP_REASON == ''
         run: |
           aws sns publish \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
