@@ -139,7 +139,7 @@ fn r5_uses_pinned_configure_aws_credentials_action() {
 fn r6_has_market_hours_guard_job() {
     let body = read(WORKFLOW);
     must_contain(&body, "guard-market-hours:", "guard-market-hours job");
-    must_contain(&body, "03:45-10:00 UTC", "IST market-hours window comment");
+    must_contain(&body, "03:30-10:00 UTC", "IST market-hours window comment");
     must_contain(&body, "confirm_market_hours", "override input present");
 }
 

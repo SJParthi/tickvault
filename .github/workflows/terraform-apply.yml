@@ -186,7 +186,7 @@ jobs:
           # to avoid pulling in an extra action. Plan output is in the job log.
 
   # ─────────────────────────────────────────────────────────────────
-  # Job 2: market-hours guard — blocks apply during 09:15-15:30 IST Mon-Fri
+  # Job 2: market-hours guard — blocks apply during 09:00-15:30 IST Mon-Fri
   # ─────────────────────────────────────────────────────────────────
   guard-market-hours:
     name: Market-hours guard
@@ -196,7 +196,7 @@ jobs:
     steps:
       - name: Check current IST time against market window
         run: |
-          # 09:15-15:30 IST = 03:45-10:00 UTC.
+          # 09:00-15:30 IST = 03:30-10:00 UTC.
           UTC_HOUR=$(date -u +%H)
           UTC_MINUTE=$(date -u +%M)
           UTC_DOW=$(date -u +%u)  # 1=Mon, 7=Sun
@@ -204,11 +204,11 @@ jobs:
 
           echo "UTC time: $UTC_HOUR:$UTC_MINUTE (day $UTC_DOW), numeric $UTC_TIME_NUM"
 
-          if [ "$UTC_DOW" -le 5 ] && [ "$UTC_TIME_NUM" -ge 345 ] && [ "$UTC_TIME_NUM" -lt 1000 ]; then
+          if [ "$UTC_DOW" -le 5 ] && [ "$UTC_TIME_NUM" -ge 330 ] && [ "$UTC_TIME_NUM" -lt 1000 ]; then
             if [ "${{ github.event.inputs.confirm_market_hours }}" = "yes" ]; then
               echo "WARNING: applying infra changes during market hours with explicit override"
             else
-              echo "::error::BLOCK: applying infra changes during 09:15-15:30 IST is forbidden."
+              echo "::error::BLOCK: applying infra changes during 09:00-15:30 IST is forbidden."
               echo "Re-run via workflow_dispatch with confirm_market_hours=yes if this is a critical fix."
               exit 1
             fi

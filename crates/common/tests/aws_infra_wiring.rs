@@ -477,10 +477,10 @@ fn test_deploy_aws_workflow_has_market_hours_guard() {
         content.contains("guard_market_hours"),
         "deploy-aws.yml must have guard_market_hours job"
     );
-    // The 09:15-15:30 IST window in UTC is 03:45-10:00.
+    // The 09:00-15:30 IST window in UTC is 03:30-10:00.
     assert!(
-        content.contains("345") && content.contains("1000"),
-        "deploy-aws.yml must encode the 09:15-15:30 IST window in UTC (345-1000)"
+        content.contains("330") && content.contains("1000"),
+        "deploy-aws.yml must encode the 09:00-15:30 IST window in UTC (330-1000)"
     );
 }
 
@@ -635,18 +635,18 @@ fn test_deploy_aws_regates_market_hours_at_swap_time() {
     assert!(
         content.contains("Re-gate market hours at SWAP time"),
         "deploy-aws.yml must re-check market hours immediately before the SSM \
-         binary swap (a build that started pre-open can cross the 09:15 boundary)"
+         binary swap (a build that started pre-open can cross the 09:00 boundary)"
     );
     assert!(
         content.contains("market_hours_swap_abort"),
         "the swap-time re-gate must set DEPLOY_SKIP_REASON=market_hours_swap_abort \
          so the deferred run does not page the operator + the 15:31 cron redeploys"
     );
-    // The swap-time gate must encode the 09:15-15:30 IST window (915/1530) and
+    // The swap-time gate must encode the 09:00-15:30 IST window (900/1530) and
     // honour the same operator override as the start-time guard.
     assert!(
-        content.contains("915") && content.contains("1530"),
-        "swap-time re-gate must encode the 09:15-15:30 IST market window (915/1530)"
+        content.contains("900") && content.contains("1530"),
+        "swap-time re-gate must encode the 09:00-15:30 IST market window (900/1530)"
     );
     assert!(
         content.contains("confirm_market_hours"),
@@ -658,7 +658,7 @@ fn test_deploy_aws_regates_market_hours_at_swap_time() {
 fn test_deploy_aws_after_close_workflow_fires_in_premarket_and_postmarket_only() {
     // Operator lock 2026-05-30: "only pre-market AND post-market alone only
     // our new codes merged ones should be deployed". Code-merge-driven
-    // deploys NEVER auto-fire during 09:15-15:30 IST trading hours.
+    // deploys NEVER auto-fire during 09:00-15:30 IST trading hours.
     //   - pre-market cron  = 03:15 UTC = 08:45 IST (after 08:30 instance boot)
     //   - post-market cron = 10:01 UTC = 15:31 IST (after 15:30 NSE close)
     let path = ".github/workflows/deploy-aws-after-close.yml";
