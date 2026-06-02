@@ -184,7 +184,7 @@ resource "aws_cloudwatch_event_rule" "deploy_watchdog_instance_start" {
     source        = ["aws.ec2"]
     "detail-type" = ["EC2 Instance State-change Notification"]
     detail = {
-      state       = ["running"]
+      state         = ["running"]
       "instance-id" = [aws_instance.tv_app.id]
     }
   })
