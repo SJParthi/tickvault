@@ -116,6 +116,16 @@ jobs:
   # Test — one job per crate, parallel. Matrix + fail-fast: false so a
   # failure in one crate surfaces the failure signal without cancelling
   # the others.
+  #
+  # Runs the FULL per-crate suite (unit + integration tests), NOT just
+  # `--lib`. 2026-06-02: the prior `--lib`-only gate let integration test
+  # targets in `crates/*/tests/` rot silently — they only ran in the
+  # post-merge Coverage & Perf job, which sat chronically RED for days
+  # (10 stale integration targets, fixed in #988). Integration tests are
+  # CI-safe by design: QuestDB/Docker/timing-dependent ones are `#[ignore]`d
+  # (run manually) and the rest exercise disconnected/spill paths via
+  # `new_disconnected()`, so they need no service container. Running them
+  # here catches the rot at PR time instead of days later post-merge.
   # -------------------------------------------------------------------------
   test:
     name: "Test (${{ matrix.crate }})"
@@ -159,11 +169,14 @@ jobs:
         with:
           tool: cargo-nextest
 
-      - name: cargo nextest run -p tickvault-${{ matrix.crate }} --lib (profile=ci)
+      - name: cargo nextest run -p tickvault-${{ matrix.crate }} (lib + integration, profile=ci)
+        # Full per-crate suite — unit (lib) AND integration (tests/) targets.
+        # `#[ignore]`d tests (QuestDB/Docker/timing-dependent) are skipped by
+        # nextest, exactly as in the post-merge Coverage & Perf job.
         # Profile `ci` (.config/nextest.toml) caps per-test wall-clock
         # at 90 s so runaway tests fail fast. Flaky tests get 1 retry
         # before being marked FAIL.
-        run: cargo nextest run -p tickvault-${{ matrix.crate }} ${{ matrix.features }} --lib --no-fail-fast --profile ci
+        run: cargo nextest run -p tickvault-${{ matrix.crate }} ${{ matrix.features }} --no-fail-fast --profile ci
 
   # -------------------------------------------------------------------------
   # Security & Audit — delegated to security-audit.yml workflow.
