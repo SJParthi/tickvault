@@ -292,6 +292,13 @@ pub enum NotificationEvent {
         per_connection: Vec<(usize, usize, Option<u32>)>,
         boot_path: BootPathLabel,
         boot_wall_clock_secs: f64,
+        /// Age (secs) of the most-recent REAL tick across all instruments,
+        /// or `None` if zero real ticks captured yet. Sourced from
+        /// `TickGapDetector::freshest_tick_age_secs` (real ticks only —
+        /// never pings). Closes the 2026-06-02 false-OK where the per-feed
+        /// "last update Xs ago" counted Dhan keep-alive pings and could
+        /// read healthy while no real ticks were captured.
+        last_real_tick_age_secs: Option<u32>,
     },
 
     /// Aggregate pool-degraded summary — fires when only a subset of
@@ -1275,6 +1282,7 @@ fn format_pool_online_message(
     per_connection: &[(usize, usize, Option<u32>)],
     boot_path: BootPathLabel,
     boot_wall_clock_secs: f64,
+    last_real_tick_age_secs: Option<u32>,
 ) -> String {
     let total_subscribed: usize = per_connection.iter().map(|(s, _, _)| *s).sum();
     let total_capacity: usize = per_connection.iter().map(|(_, c, _)| *c).sum();
@@ -1294,6 +1302,19 @@ fn format_pool_online_message(
         cap = format_with_commas(total_capacity),
         pct = pool_pct,
     ));
+    // Real-tick freshness (NOT frame freshness). The per-feed "last update"
+    // line below counts ANY frame incl. Dhan keep-alive pings, so it can read
+    // "0s ago" while zero real ticks are captured. This line reports the
+    // most-recent GENUINE tick so "live" can never look green on a ping-only
+    // feed (2026-06-02 false-OK fix).
+    match last_real_tick_age_secs {
+        Some(age) => out.push_str(&format!("📈 Real market ticks: last one {age}s ago\n\n")),
+        None => out.push_str(
+            "⚠️ Real market ticks: NONE captured yet — feed may be sending only \
+             keep-alive pings. If this persists after market open, the feed is \
+             connected but not delivering data.\n\n",
+        ),
+    }
     out.push_str("Per feed:\n");
     for (idx, (sub, cap, last)) in per_connection.iter().enumerate() {
         let display = idx.saturating_add(1);
@@ -1490,12 +1511,14 @@ impl NotificationEvent {
                 per_connection,
                 boot_path,
                 boot_wall_clock_secs,
+                last_real_tick_age_secs,
             } => format_pool_online_message(
                 *connected,
                 *total,
                 per_connection,
                 *boot_path,
                 *boot_wall_clock_secs,
+                *last_real_tick_age_secs,
             ),
             Self::WebSocketPoolPartialAfterDeadline {
                 connected,

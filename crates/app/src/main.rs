@@ -5429,12 +5429,24 @@ async fn emit_websocket_connected_alerts(
     let boot_wall_clock_secs = boot_start.elapsed().as_secs_f64();
 
     if connected_count == total {
+        // Real-tick freshness (not frame freshness): the most-recent GENUINE
+        // tick across all instruments, sourced from the global TickGapDetector
+        // (populated only by real tick frames, never Dhan keep-alive pings).
+        // `None` => zero real ticks captured yet. Surfacing this in the
+        // "live and ready" message closes the 2026-06-02 false-OK where the
+        // per-feed "last update Xs ago" counted pings and could read healthy
+        // while no real ticks flowed. Cold path — once per boot summary.
+        let last_real_tick_age_secs =
+            tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
+                .and_then(|d| d.freshest_tick_age_secs(std::time::Instant::now()))
+                .and_then(|secs| u32::try_from(secs).ok());
         notifier.notify(NotificationEvent::WebSocketPoolOnline {
             connected: connected_count,
             total,
             per_connection,
             boot_path,
             boot_wall_clock_secs,
+            last_real_tick_age_secs,
         });
     } else if !tickvault_common::market_hours::is_within_market_hours_ist() {
         // 2026-05-09: off-hours boot — non-connected slots are
