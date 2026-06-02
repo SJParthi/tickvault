@@ -137,15 +137,20 @@ fn test_every_alarm_metric_is_in_emf_filter_list() {
 }
 
 #[test]
-fn test_app_alarms_count_is_twelve() {
+fn test_app_alarms_count_is_thirteen() {
     // Pin the count so future PRs that delete an alarm without updating
     // the rule files / PR body fail this guard. Cost note (aws-budget.md)
     // depends on this number — keeping the budget honest means keeping
     // this number explicit.
+    //
+    // 13 (was 12) since 2026-06-02: added `tv_ticks_dropped_total` — the
+    // final zero-tick-loss breach (rescue ring + spill + DLQ all failed),
+    // the operator's #1 invariant. The upstream spill/dlq tiers were
+    // already alarmed; this is the strictly-more-severe irrecoverable case.
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 12,
-        "Z+ L2 VERIFY ratchet: expected exactly 12 app-level CloudWatch alarms \
+        count, 13,
+        "Z+ L2 VERIFY ratchet: expected exactly 13 app-level CloudWatch alarms \
          (one per critical app signal). Found {count}. If you intentionally added \
          or removed one, update aws-budget.md custom-metric cost line AND this guard."
     );
