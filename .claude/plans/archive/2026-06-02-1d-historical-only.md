@@ -1,6 +1,6 @@
 # Active Plan: 1d timeframe = historical-only (never tick-calculated)
 
-**Status:** VERIFIED — all 6 items implemented + scoped tests green; PR open, monitoring to merge
+**Status:** DONE — merged to main in PR #979 (2026-06-02). Archived.
 **Date:** 2026-06-02
 **Approved by:** Parthiban — "1 day timeframe should never ever be calculated, always pulled once and only from historical 1 day timeframe" + chose **"Add OI to the daily pull"** when asked how prev-OI sources its OI.
 

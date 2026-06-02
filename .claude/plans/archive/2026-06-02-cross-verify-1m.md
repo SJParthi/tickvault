@@ -1,6 +1,6 @@
 # Follow-up Plan: Post-market 1-minute cross-verification (NEXT PR)
 
-**Status:** APPROVED — operator locked **CSV output + exact-match + mismatch count** (2026-06-02: *"csv and exact match cross verification is needed"*). Implementing on branch `claude/cross-verify-1m`.
+**Status:** DONE — merged to main in PR #980 (feature) + #981 (243 fix), 2026-06-02. Archived.
 **Date:** 2026-06-02
 **Approved by:** Parthiban — feature + CSV + exact-match all confirmed 2026-06-02.
 
