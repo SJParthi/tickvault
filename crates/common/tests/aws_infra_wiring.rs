@@ -877,3 +877,70 @@ fn test_start_watchdog_lambda_monitors_the_morning_start() {
         "handler must check the instance is running"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Deploy-watchdog Lambda (2026-06-02) — AWS-native safety-net for the
+// post-merge auto-deploy. Operator decision "AWS watchdog safety-net": keep
+// the GitHub-cron deploy, add an EventBridge->Lambda that covers cron misses.
+// Ratchet the wiring so it can't silently rot (charter "extreme check").
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_deploy_watchdog_lambda_is_wired() {
+    require_file_exists(
+        "deploy/aws/terraform/deploy-watchdog-lambda.tf",
+        "Deploy-watchdog Lambda terraform (EventBridge + IAM + function)",
+    );
+    require_file_exists(
+        "deploy/aws/lambda/deploy-watchdog/handler.py",
+        "Deploy-watchdog Lambda handler",
+    );
+    let tf = std::fs::read_to_string(
+        workspace_root().join("deploy/aws/terraform/deploy-watchdog-lambda.tf"),
+    )
+    .expect("deploy-watchdog-lambda.tf must be readable"); // APPROVED: test
+
+    // Two weekday EventBridge schedules, 5 min after each GitHub deploy cron:
+    // 08:50 IST = 03:20 UTC, 15:36 IST = 10:06 UTC.
+    assert!(
+        tf.contains("cron(20 3 ? * MON-FRI *)"),
+        "deploy-watchdog must run 08:50 IST (03:20 UTC Mon-Fri) — 5 min after the pre-market cron"
+    );
+    assert!(
+        tf.contains("cron(6 10 ? * MON-FRI *)"),
+        "deploy-watchdog must run 15:36 IST (10:06 UTC Mon-Fri) — 5 min after the post-market cron"
+    );
+    // It reads the repo-scoped GitHub token (same param as operator-control)
+    // and can publish to the alerts topic.
+    assert!(
+        tf.contains("/operator/github-token") && tf.contains("ssm:GetParameter"),
+        "deploy-watchdog must read the repo-scoped GitHub token from SSM"
+    );
+    assert!(
+        tf.contains("aws_sns_topic.tv_alerts.arn"),
+        "deploy-watchdog must be able to page the operator via the tv_alerts SNS topic"
+    );
+}
+
+#[test]
+fn test_deploy_watchdog_handler_only_dispatches_when_positively_stale() {
+    // The handler's safety contract: NEVER dispatch on uncertainty. The pure
+    // `is_stale` must return False when either sha is unknown (the no-false-OK
+    // inverse — we never "fix" what we can't confirm is broken).
+    let h = std::fs::read_to_string(
+        workspace_root().join("deploy/aws/lambda/deploy-watchdog/handler.py"),
+    )
+    .expect("deploy-watchdog handler.py must be readable"); // APPROVED: test
+    assert!(
+        h.contains("def is_stale("),
+        "handler must expose the pure is_stale decision function"
+    );
+    assert!(
+        h.contains("if not desired_sha or not deployed_sha:") && h.contains("return False"),
+        "is_stale MUST return False when either sha is unknown — never dispatch on uncertainty"
+    );
+    assert!(
+        h.contains("deploy-aws-after-close.yml"),
+        "watchdog must dispatch the idempotent + market-hours-guarded auto-deploy workflow"
+    );
+}
