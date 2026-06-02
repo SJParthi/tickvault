@@ -98,6 +98,14 @@ pub struct ShadowSealRow {
     /// still blank. Lands in the `open_pct` DOUBLE column (operator lock
     /// 2026-06-01 §31, Option 2).
     pub open_pct: f64,
+    /// `LiveCandleState::change_pct` — already `f64`. The headline day
+    /// change % (close vs yesterday's close). Lands in the `change_pct`
+    /// DOUBLE column (operator request 2026-06-02).
+    pub change_pct: f64,
+    /// `LiveCandleState::open_gap_pct` — already `f64`. The opening gap %
+    /// (today's 09:15 open vs yesterday's close). Lands in the
+    /// `open_gap_pct` DOUBLE column (operator request 2026-06-02).
+    pub open_gap_pct: f64,
 }
 
 impl ShadowSealRow {
@@ -135,6 +143,11 @@ impl ShadowSealRow {
             tick_count: i64::from(seal.state.tick_count),
             close_pct_from_prev_day: seal.state.close_pct_from_prev_day,
             open_pct: seal.state.open_pct,
+            // change_pct == close_pct_from_prev_day (the headline day change
+            // %). Derived here rather than stored on LiveCandleState to keep
+            // the per-instrument RAM budget (operator request 2026-06-02).
+            change_pct: seal.state.close_pct_from_prev_day,
+            open_gap_pct: seal.state.open_gap_pct,
         }
     }
 }
@@ -194,6 +207,35 @@ mod tests {
         let seal = BufferedSeal::new(13, EXCHANGE_SEGMENT_NSE_EQ, TfIndex::M1, state);
         let row = ShadowSealRow::from_buffered_seal(&seal);
         assert!((row.open_pct - 2.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_from_buffered_seal_carries_change_pct_and_open_gap_pct() {
+        // Operator request 2026-06-02: change_pct + open_gap_pct must flow
+        // from LiveCandleState into the persisted row.
+        let mut state = LiveCandleState::empty();
+        state.bucket_start_ist_secs = 1_716_000_900;
+        state.close = 105.0;
+        state.session_open = 102.0;
+        state.prev_day_close = 100.0;
+        // change_pct is derived from close_pct_from_prev_day at extraction.
+        state.close_pct_from_prev_day = 5.0;
+        state.open_gap_pct = 2.0;
+        let seal = BufferedSeal::new(13, EXCHANGE_SEGMENT_NSE_EQ, TfIndex::M1, state);
+        let row = ShadowSealRow::from_buffered_seal(&seal);
+        assert!((row.change_pct - 5.0).abs() < f64::EPSILON);
+        assert!((row.open_gap_pct - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_from_buffered_seal_change_pct_open_gap_pct_default_zero_premarket() {
+        // Pre-market / day-1: no prev-day close ⇒ both pct stay 0.0 (never NaN).
+        let row =
+            ShadowSealRow::from_buffered_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0));
+        assert_eq!(row.change_pct, 0.0);
+        assert_eq!(row.open_gap_pct, 0.0);
+        assert!(!row.change_pct.is_nan());
+        assert!(!row.open_gap_pct.is_nan());
     }
 
     #[test]

@@ -131,6 +131,12 @@ pub struct LiveCandleState {
     /// official 09:15 open. Stamped at seal time. `0.0` if session_open is
     /// `0.0` (div-by-zero guard).
     pub open_pct: f64,
+    /// `(session_open - prev_day_close) / prev_day_close * 100.0` — the
+    /// OPENING GAP %: today's official 09:15 open vs yesterday's close
+    /// (gap-up positive, gap-down negative). Operator request 2026-06-02.
+    /// Stamped at seal time. `0.0` if `prev_day_close` is `0.0`
+    /// (div-by-zero guard).
+    pub open_gap_pct: f64,
 }
 
 impl LiveCandleState {
@@ -156,6 +162,7 @@ impl LiveCandleState {
             volume_pct_from_prev_day: 0.0,
             session_open: 0.0,
             open_pct: 0.0,
+            open_gap_pct: 0.0,
         }
     }
 
@@ -241,6 +248,7 @@ impl LiveCandleState {
                 0.0
             },
             open_pct: 0.0,
+            open_gap_pct: 0.0,
         }
     }
 
@@ -462,9 +470,14 @@ impl AggregatorCell {
 // `open_pct` (the official-09:15-open % column, mirrors the existing
 // prev_day_close/close_pct per-slot pattern). RAM cost: +16 B × 21 TF ×
 // ~250 SIDs ≈ 84 KB total — negligible on the 8 GiB host.
+// 2026-06-02 (operator request): bumped 112 → 120 to carry `open_gap_pct`
+// (the opening-gap % column). The companion `change_pct` column is DERIVED
+// from `close_pct_from_prev_day` at the seal-row extractor, so it costs zero
+// per-instrument RAM. RAM cost of `open_gap_pct`: +8 B × 21 TF × ~250 SIDs
+// ≈ 42 KB total — negligible on the 8 GiB host (see aws-budget.md Tier 1).
 const _: () = assert!(
-    std::mem::size_of::<LiveCandleState>() <= 112,
-    "LiveCandleState exceeded 112-byte budget — every new field bloats per-instrument RAM by 21× (one slot per TF). Either shrink the new field or update aws-budget.md and bump this assertion."
+    std::mem::size_of::<LiveCandleState>() <= 120,
+    "LiveCandleState exceeded 120-byte budget — every new field bloats per-instrument RAM by 21× (one slot per TF). Either shrink the new field or update aws-budget.md and bump this assertion."
 );
 
 // ---------------------------------------------------------------------------
@@ -487,10 +500,11 @@ mod tests {
 
     #[test]
     fn test_live_candle_state_size_is_within_budget() {
-        // 112-byte budget is pinned by the const _ assert above (bumped
-        // from 96 for §31 session_open + open_pct); this runtime test
-        // makes the contract grep-able.
-        assert!(std::mem::size_of::<LiveCandleState>() <= 112);
+        // 120-byte budget is pinned by the const _ assert above (bumped
+        // from 96 for §31 session_open + open_pct, then 112 → 120 for the
+        // 2026-06-02 open_gap_pct column); this runtime test makes the
+        // contract grep-able.
+        assert!(std::mem::size_of::<LiveCandleState>() <= 120);
     }
 
     #[test]
@@ -503,6 +517,8 @@ mod tests {
         // §31 Option 2: new fields default to 0.0.
         assert_eq!(s.session_open, 0.0);
         assert_eq!(s.open_pct, 0.0);
+        // 2026-06-02: opening-gap % defaults to 0.0.
+        assert_eq!(s.open_gap_pct, 0.0);
     }
 
     #[test]

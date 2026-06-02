@@ -112,6 +112,14 @@ pub struct SealDlqRecord {
     /// §31 Option 2 (2026-06-01): % vs the official 09:15 session open.
     #[serde(default)]
     pub open_pct: f64,
+    /// Operator request 2026-06-02: headline day change % (close vs
+    /// yesterday's close).
+    #[serde(default)]
+    pub change_pct: f64,
+    /// Operator request 2026-06-02: opening gap % (today's 09:15 open vs
+    /// yesterday's close).
+    #[serde(default)]
+    pub open_gap_pct: f64,
 }
 
 impl From<&SerializedSeal> for SealDlqRecord {
@@ -137,6 +145,8 @@ impl From<&SerializedSeal> for SealDlqRecord {
             oi_pct_from_prev_day: s.oi_pct_from_prev_day,
             volume_pct_from_prev_day: s.volume_pct_from_prev_day,
             open_pct: s.open_pct,
+            change_pct: s.change_pct,
+            open_gap_pct: s.open_gap_pct,
         }
     }
 }
@@ -164,6 +174,8 @@ impl From<&SealDlqRecord> for SerializedSeal {
             oi_pct_from_prev_day: r.oi_pct_from_prev_day,
             volume_pct_from_prev_day: r.volume_pct_from_prev_day,
             open_pct: r.open_pct,
+            change_pct: r.change_pct,
+            open_gap_pct: r.open_gap_pct,
         }
     }
 }
@@ -349,6 +361,8 @@ mod tests {
             oi_pct_from_prev_day: -0.2,
             volume_pct_from_prev_day: 12.3,
             open_pct: 7.7,
+            change_pct: 1.5,
+            open_gap_pct: 0.8,
         }
     }
 
@@ -415,6 +429,9 @@ mod tests {
             "close_pct_from_prev_day",
             "oi_pct_from_prev_day",
             "volume_pct_from_prev_day",
+            "open_pct",
+            "change_pct",
+            "open_gap_pct",
         ] {
             assert!(
                 json.contains(&format!("\"{field}\"")),
@@ -473,6 +490,8 @@ mod tests {
             oi_pct_from_prev_day: -10.0,
             volume_pct_from_prev_day: -100.0,
             open_pct: -50.0,
+            change_pct: -3.5,
+            open_gap_pct: -1.2,
         };
         let r = SealDlqRecord::from(&s);
         let json = serde_json::to_string(&r).expect("serialise");

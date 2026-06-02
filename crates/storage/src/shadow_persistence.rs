@@ -28,7 +28,10 @@
 //!     volume                   LONG,
 //!     oi                       LONG,
 //!     tick_count               LONG,
-//!     close_pct_from_prev_day  DOUBLE
+//!     close_pct_from_prev_day  DOUBLE,
+//!     open_pct                 DOUBLE,
+//!     change_pct               DOUBLE,
+//!     open_gap_pct             DOUBLE
 //! ) timestamp(ts) PARTITION BY DAY
 //!   DEDUP UPSERT KEYS(ts, security_id, segment);
 //! ```
@@ -179,7 +182,9 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
                 oi                          LONG, \
                 tick_count                  LONG, \
                 close_pct_from_prev_day     DOUBLE, \
-                open_pct                    DOUBLE\
+                open_pct                    DOUBLE, \
+                change_pct                  DOUBLE, \
+                open_gap_pct                DOUBLE\
             ) timestamp(ts) PARTITION BY DAY \
             DEDUP UPSERT KEYS({DEDUP_KEY_CANDLES});"
         );
@@ -199,6 +204,16 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
         let alter_open_pct =
             format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS open_pct DOUBLE;");
         run_ddl(&client, &base_url, table, &alter_open_pct).await;
+
+        // Operator request 2026-06-02: self-heal the `change_pct` +
+        // `open_gap_pct` columns for tables created before they existed.
+        // Free on every boot (QuestDB ignores ADD when the column exists).
+        let alter_change_pct =
+            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS change_pct DOUBLE;");
+        run_ddl(&client, &base_url, table, &alter_change_pct).await;
+        let alter_open_gap_pct =
+            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS open_gap_pct DOUBLE;");
+        run_ddl(&client, &base_url, table, &alter_open_gap_pct).await;
     }
 }
 

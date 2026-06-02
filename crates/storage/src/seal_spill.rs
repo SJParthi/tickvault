@@ -55,13 +55,16 @@
 //! | 80   | 8 | `oi_pct_from_prev_day: f64`     |
 //! | 88   | 8 | `volume_pct_from_prev_day: f64` |
 //! | 96   | 8 | `open_pct: f64` (§31 Option 2)  |
-//! | 104  | 24 | reserved padding (zero-filled) |
+//! | 104  | 8 | `change_pct: f64` (2026-06-02)  |
+//! | 112  | 8 | `open_gap_pct: f64` (2026-06-02)|
+//! | 120  | 8 | reserved padding (zero-filled)  |
 //!
-//! Total: 128 bytes. The trailing 24-byte padding region (bytes 104..128)
+//! Total: 128 bytes. The trailing 8-byte padding region (bytes 120..128)
 //! is reserved for future field additions WITHOUT a file-format break —
 //! readers that don't recognise additional fields ignore them. Pre-§31
-//! records have zero at bytes 96..104, so they decode `open_pct = 0.0`
-//! (backward-compatible).
+//! records have zero at bytes 96..104, so they decode `open_pct = 0.0`;
+//! pre-2026-06-02 records have zero at bytes 104..120, so they decode
+//! `change_pct = 0.0` / `open_gap_pct = 0.0` (all backward-compatible).
 
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
@@ -111,6 +114,14 @@ pub struct SerializedSeal {
     /// Serialised into the previously-reserved bytes 96..104 — old spill
     /// records (zero padding there) decode `open_pct = 0.0`, backward-compatible.
     pub open_pct: f64,
+    /// Operator request 2026-06-02: headline day change % (close vs
+    /// yesterday's close). Serialised into bytes 104..112 — pre-2026-06-02
+    /// records (zero padding) decode `change_pct = 0.0`, backward-compatible.
+    pub change_pct: f64,
+    /// Operator request 2026-06-02: opening gap % (today's 09:15 open vs
+    /// yesterday's close). Serialised into bytes 112..120 — pre-2026-06-02
+    /// records decode `open_gap_pct = 0.0`, backward-compatible.
+    pub open_gap_pct: f64,
 }
 
 impl SerializedSeal {
@@ -137,7 +148,10 @@ impl SerializedSeal {
         buf[88..96].copy_from_slice(&self.volume_pct_from_prev_day.to_le_bytes());
         // §31 Option 2: open_pct in the first 8 reserved bytes.
         buf[96..104].copy_from_slice(&self.open_pct.to_le_bytes());
-        // buf[104..128] = reserved padding (zero) for future fields
+        // Operator request 2026-06-02: change_pct + open_gap_pct.
+        buf[104..112].copy_from_slice(&self.change_pct.to_le_bytes());
+        buf[112..120].copy_from_slice(&self.open_gap_pct.to_le_bytes());
+        // buf[120..128] = reserved padding (zero) for future fields
         buf
     }
 
@@ -188,6 +202,13 @@ impl SerializedSeal {
             // §31 Option 2: bytes 96..104 (zero in pre-§31 records → 0.0).
             open_pct: f64::from_le_bytes([
                 buf[96], buf[97], buf[98], buf[99], buf[100], buf[101], buf[102], buf[103],
+            ]),
+            // 2026-06-02: bytes 104..120 (zero in older records → 0.0).
+            change_pct: f64::from_le_bytes([
+                buf[104], buf[105], buf[106], buf[107], buf[108], buf[109], buf[110], buf[111],
+            ]),
+            open_gap_pct: f64::from_le_bytes([
+                buf[112], buf[113], buf[114], buf[115], buf[116], buf[117], buf[118], buf[119],
             ]),
         })
     }
@@ -242,6 +263,9 @@ impl From<&BufferedSeal> for SerializedSeal {
             oi_pct_from_prev_day: b.state.oi_pct_from_prev_day,
             volume_pct_from_prev_day: b.state.volume_pct_from_prev_day,
             open_pct: b.state.open_pct,
+            // change_pct == close_pct_from_prev_day (derived, not a state field).
+            change_pct: b.state.close_pct_from_prev_day,
+            open_gap_pct: b.state.open_gap_pct,
         }
     }
 }
@@ -275,6 +299,10 @@ impl SerializedSeal {
         // §31 Option 2: already-stamped at original seal; session_open is
         // irrelevant on replay (open_pct is the persisted value).
         state.open_pct = self.open_pct;
+        // 2026-06-02: open_gap_pct already stamped at seal. change_pct is
+        // derived (== close_pct_from_prev_day), so it's not a state field —
+        // the replayed close_pct restores it at the next extraction.
+        state.open_gap_pct = self.open_gap_pct;
         Some(BufferedSeal::new(
             self.security_id,
             self.exchange_segment_code,
@@ -504,6 +532,8 @@ mod tests {
             oi_pct_from_prev_day: -0.2,
             volume_pct_from_prev_day: 12.3,
             open_pct: 7.7,
+            change_pct: 1.5,
+            open_gap_pct: 0.8,
         }
     }
 
@@ -561,10 +591,49 @@ mod tests {
             oi_pct_from_prev_day: -10.0,
             volume_pct_from_prev_day: -100.0,
             open_pct: -50.0,
+            change_pct: -3.5,
+            open_gap_pct: -1.2,
         };
         let bytes = original.to_bytes();
         let decoded = SerializedSeal::from_bytes(&bytes).expect("decoded");
         assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_serialized_seal_change_pct_open_gap_pct_roundtrip_at_bytes_104_120() {
+        // Operator request 2026-06-02: the two new pct fields live in the
+        // previously-reserved bytes 104..120 and survive a byte round-trip.
+        let mut s = mk_seal(7, 1, 0, 1_716_000_900, 100.0);
+        s.change_pct = 4.44;
+        s.open_gap_pct = -2.22;
+        let bytes = s.to_bytes();
+        // Verify the exact byte offsets carry the values.
+        assert_eq!(
+            f64::from_le_bytes(bytes[104..112].try_into().unwrap()),
+            4.44
+        );
+        assert_eq!(
+            f64::from_le_bytes(bytes[112..120].try_into().unwrap()),
+            -2.22
+        );
+        let decoded = SerializedSeal::from_bytes(&bytes).expect("decoded");
+        assert_eq!(decoded.change_pct, 4.44);
+        assert_eq!(decoded.open_gap_pct, -2.22);
+    }
+
+    #[test]
+    fn test_serialized_seal_pre_2026_06_02_record_decodes_pct_as_zero() {
+        // Backward-compat: a record with zeros at bytes 104..120 (older
+        // writer) decodes change_pct / open_gap_pct as 0.0, never NaN.
+        let mut bytes = mk_seal(7, 1, 0, 1_716_000_900, 100.0).to_bytes();
+        for b in bytes.iter_mut().take(120).skip(104) {
+            *b = 0;
+        }
+        let decoded = SerializedSeal::from_bytes(&bytes).expect("decoded");
+        assert_eq!(decoded.change_pct, 0.0);
+        assert_eq!(decoded.open_gap_pct, 0.0);
+        assert!(!decoded.change_pct.is_nan());
+        assert!(!decoded.open_gap_pct.is_nan());
     }
 
     #[test]
@@ -591,7 +660,20 @@ mod tests {
             &[0u8; 8],
             "open_pct bytes 96..104 must be written"
         );
-        for i in 104..SEAL_SPILL_RECORD_SIZE {
+        // 2026-06-02: bytes 104..112 = change_pct (1.5), 112..120 = open_gap_pct
+        // (0.8) — both non-zero in mk_seal.
+        assert_ne!(
+            &bytes[104..112],
+            &[0u8; 8],
+            "change_pct bytes 104..112 must be written"
+        );
+        assert_ne!(
+            &bytes[112..120],
+            &[0u8; 8],
+            "open_gap_pct bytes 112..120 must be written"
+        );
+        // The reserved tail now starts at 120.
+        for i in 120..SEAL_SPILL_RECORD_SIZE {
             assert_eq!(bytes[i], 0, "reserved tail byte at {i} not zero");
         }
     }
