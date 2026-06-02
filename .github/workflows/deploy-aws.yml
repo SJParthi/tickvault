@@ -679,13 +679,15 @@ jobs:
       - name: Notify Telegram on success
         if: success()
         run: |
-          # The SNS topic has a Telegram webhook subscription; publish
-          # an INFO-level message so the operator sees the deploy land.
+          # The SNS topic has a Telegram webhook subscription; publish a
+          # plain-English message so the operator sees the deploy land clearly.
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          IST_TIME="$(TZ='Asia/Kolkata' date +'%I:%M %p IST')"
           aws sns publish \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
             --topic-arn arn:aws:sns:${{ vars.AWS_REGION || 'ap-south-1' }}:${{ steps.acct.outputs.id }}:tv-prod-alerts \
-            --subject "DLT deploy OK" \
-            --message "commit=${{ github.sha }} ref=${{ github.ref }} actor=${{ github.actor }}"
+            --subject "✅ tickvault deployed — new code is LIVE" \
+            --message "✅ New code is LIVE on AWS, deployed at ${IST_TIME} (version ${SHORT_SHA}). The app restarted on the latest code. Nothing for you to do."
 
       - name: Auto-stop tickvault service on deploy failure (kills Telegram spam)
         # Not on an intentional off-hours skip: the box is already stopped, so
@@ -719,8 +721,10 @@ jobs:
         # Genuine deploy failures (box up, smoke test failed, etc.) still page.
         if: failure() && env.DEPLOY_SKIP_REASON == ''
         run: |
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          IST_TIME="$(TZ='Asia/Kolkata' date +'%I:%M %p IST')"
           aws sns publish \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
             --topic-arn arn:aws:sns:${{ vars.AWS_REGION || 'ap-south-1' }}:${{ steps.acct.outputs.id }}:tv-prod-alerts \
-            --subject "DLT deploy FAILED" \
-            --message "commit=${{ github.sha }} ref=${{ github.ref }} actor=${{ github.actor }} run=${{ github.run_id }}"
+            --subject "🆘 tickvault deploy FAILED" \
+            --message "🆘 Deploy FAILED at ${IST_TIME} (version ${SHORT_SHA}). The app was auto-stopped to avoid repeated alerts; the next deploy re-enables it. Check the run: ${{ github.run_id }}"
