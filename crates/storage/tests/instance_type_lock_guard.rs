@@ -144,17 +144,16 @@ fn instance_lock_monthly_bill_pinned_to_rupees_2058() {
     );
 }
 
-/// Section D — the schedule lock must mention `08:30 IST` (operator
-/// option X approval, 2026-05-27). Earlier 08:00 IST schedule would
-/// not give enough cold-boot + retry budget for the 08:45 IST CSV
-/// fetch deadline.
+/// Section D — the schedule lock must mention `08:00 IST` (operator widened
+/// the window to 08:00-17:00 on 2026-06-02: "make it as 8 am till 5 pm … so
+/// pre-market and post-market and deployment … can run without worries").
 #[test]
-fn instance_lock_schedule_pinned_to_0830_ist_start() {
+fn instance_lock_schedule_pinned_to_0800_ist_start() {
     let root = repo_root();
     let body =
         read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
     assert!(
-        body.contains("08:30–17:00 IST") || body.contains("08:30 IST"),
-        "rule file §7 must pin the 08:30 IST EventBridge cron start"
+        body.contains("08:00–17:00 IST") || body.contains("08:00 IST"),
+        "rule file §7 must pin the 08:00 IST EventBridge cron start"
     );
 }

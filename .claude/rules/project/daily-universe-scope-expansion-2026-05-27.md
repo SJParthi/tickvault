@@ -38,6 +38,7 @@
 - 2026-05-27: Approved options X–Z (EventBridge cron at 08:30 IST, `lifecycle_state_locked` column for operator overrides, `--dry-run-universe` CLI flag for first prod validation)
 - 2026-05-29: Approved instance m8g.large (Graviton4, 8 GiB) + weekday-only 08:30–16:30 IST auto schedule (manual start otherwise) per Quote 5
 - 2026-05-29: Approved EBS 100 GB + EIP excluded (no orders) + 270-hr basis → ~₹2,698/mo incl GST per Quote 6
+- 2026-06-02: Operator WIDENED the schedule from 08:30–16:30 IST to **08:00–17:00 IST** (verbatim: "instead of 8.30 am make it as 8 am till 5 pm dude so that pre-market and post-market and deployment and all other activities can run without any worries"). Crons: start `cron(30 2 ? * MON-FRI *)` (02:30 UTC = 08:00 IST), stop `cron(30 11 ? * MON-FRI *)` (11:30 UTC = 17:00 IST). Cost: +1 hr/day (~+₹120/mo), still inside the ~₹2,058/mo envelope. This dated quote satisfies §7 Mechanical Rule 1 for the schedule change.
 
 ---
 
@@ -178,7 +179,7 @@ the `m8gd` local-SSD variant — that NVMe is wiped on every daily auto-stop).
 | Region | ap-south-1 (Mumbai) |
 | Tenancy | Default (Shared) |
 | Pricing | On-demand **$0.06416/hr** (live ap-south-1, 2026-05-29) — no Reserved / Savings Plan / Spot |
-| Schedule | **Trading weekdays only (Mon–Fri), 08:30–16:30 IST auto** (start `cron(0 3 ? * MON-FRI *)`, stop `cron(0 11 ? * MON-FRI *)`). Out-of-window runs = operator manual start. Weekends + holidays = OFF unless manually started. |
+| Schedule | **Trading weekdays only (Mon–Fri), 08:00–17:00 IST auto** (start `cron(30 2 ? * MON-FRI *)`, stop `cron(30 11 ? * MON-FRI *)`) — widened from 08:30–16:30 on 2026-06-02 per operator (pre/post-market + deploy room). Out-of-window runs = operator manual start. Weekends + holidays = OFF unless manually started. |
 | EBS | gp3 10 GB (unchanged) |
 | EIP | 1 (24/7, Dhan static-IP mandate — unchanged) |
 | Network | ENA enabled by default |

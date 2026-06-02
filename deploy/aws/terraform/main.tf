@@ -347,26 +347,31 @@ resource "aws_cloudwatch_log_group" "tv_app" {
 }
 
 # ---------------------------------------------------------------------------
-# EventBridge weekday start/stop schedule per daily-universe-scope-
-# expansion-2026-05-27.md §7 Quote 5 (2026-05-29): trading WEEKDAYS only
-# (Mon-Fri), 08:30-16:30 IST. Weekends + NSE holidays = instance OFF unless
-# the operator manually starts it. Rules call SSM Automation to start/stop.
+# EventBridge weekday start/stop schedule. Operator widened the window to
+# 08:00-17:00 IST on 2026-06-02 (verbatim: "instead of 8.30 am make it as 8 am
+# till 5 pm dude so that pre-market and post-market and deployment and all
+# other activities can run without any worries") — supersedes the 2026-05-29
+# 08:30-16:30 lock in daily-universe-scope-expansion-2026-05-27.md §7. Trading
+# WEEKDAYS only (Mon-Fri); weekends + NSE holidays = instance OFF unless the
+# operator manually starts it. Rules call SSM Automation to start/stop.
+#
+# Cost: +1 hr/day (~+₹120/mo); still inside the ~₹2,058/mo budget envelope.
 #
 # IST offset is UTC+5:30, so:
-#   Weekday start 08:30 IST = 03:00 UTC (Mon-Fri)
-#   Weekday stop  16:30 IST = 11:00 UTC (Mon-Fri)
+#   Weekday start 08:00 IST = 02:30 UTC (Mon-Fri)
+#   Weekday stop  17:00 IST = 11:30 UTC (Mon-Fri)
 # ---------------------------------------------------------------------------
 
 resource "aws_cloudwatch_event_rule" "daily_start" {
   name                = "tv-${var.environment}-daily-start"
-  description         = "Start tickvault instance at 08:30 IST on trading weekdays (Mon-Fri)"
-  schedule_expression = "cron(0 3 ? * MON-FRI *)"
+  description         = "Start tickvault instance at 08:00 IST on trading weekdays (Mon-Fri)"
+  schedule_expression = "cron(30 2 ? * MON-FRI *)"
 }
 
 resource "aws_cloudwatch_event_rule" "daily_stop" {
   name                = "tv-${var.environment}-daily-stop"
-  description         = "Stop tickvault instance at 16:30 IST on trading weekdays (Mon-Fri)"
-  schedule_expression = "cron(0 11 ? * MON-FRI *)"
+  description         = "Stop tickvault instance at 17:00 IST on trading weekdays (Mon-Fri)"
+  schedule_expression = "cron(30 11 ? * MON-FRI *)"
 }
 
 # ---------------------------------------------------------------------------
