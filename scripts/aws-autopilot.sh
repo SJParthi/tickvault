@@ -66,6 +66,51 @@ is_market_window() {
   [ "$dow" -le 5 ] && [ "$t" -ge 900 ] && [ "$t" -le 1535 ]
 }
 
+# --- up-window (IST) helper: is now within 08:30-16:30 IST Mon-Fri? ----------
+# This is the EventBridge START/STOP schedule window — the box is SUPPOSED to
+# be running for the WHOLE of it, not just market hours (09:15-15:30). The
+# pre-market gap (08:30-09:00) is when the daily universe is fetched + the WS
+# subscribes, so a stopped box there is a real problem, not "expected". Using
+# is_market_window() for the self-start left the 08:30-09:00 window uncovered:
+# if the EventBridge 08:30 start silently failed, autopilot waited until 09:00
+# to rescue it (2026-06-02 incident). is_box_up_window() closes that gap.
+is_box_up_window() {
+  local h m dow t
+  h=$(TZ='Asia/Kolkata' date +%H); m=$(TZ='Asia/Kolkata' date +%M)
+  dow=$(TZ='Asia/Kolkata' date +%u)   # 1=Mon..7=Sun
+  t=$((10#$h * 100 + 10#$m))
+  [ "$dow" -le 5 ] && [ "$t" -ge 830 ] && [ "$t" -le 1630 ]
+}
+
+# --- diagnostic: is the EventBridge daily-start rule healthy? ----------------
+# Called when the box is found stopped DURING the up-window — i.e. the 08:30
+# EventBridge start should have run but didn't. Surfaces WHICH layer failed so
+# the operator (or a future Claude session) doesn't have to guess. Infra
+# resources are named with the terraform var.environment = "prod" (the SNS
+# topic above is tv-prod-alerts), so the rule is tv-prod-daily-start.
+diagnose_eventbridge_start() {
+  local rule="tv-prod-daily-start" state today execs
+  state=$(aws events describe-rule --region "$REGION" --name "$rule" \
+    --query 'State' --output text 2>/dev/null || echo MISSING)
+  if [ "$state" = "MISSING" ]; then
+    note_issue "EventBridge rule '$rule' is MISSING — run terraform-apply (the 08:30 auto-start does not exist)"
+    return
+  fi
+  if [ "$state" != "ENABLED" ]; then
+    note_issue "EventBridge rule '$rule' state=$state (not ENABLED) — re-enable it; the box will not auto-start until then"
+    return
+  fi
+  # Rule exists + enabled, but the box is still stopped in the up-window =>
+  # the rule fired but the SSM AWS-StartEC2Instance automation failed (IAM /
+  # PassRole / capacity). Surface the most recent start-automation outcome.
+  today=$(TZ='Asia/Kolkata' date +%F)
+  execs=$(aws ssm describe-automation-executions --region "$REGION" \
+    --filters "Key=DocumentNamePrefix,Values=AWS-StartEC2Instance" \
+    --query 'AutomationExecutionMetadataList[0].[AutomationExecutionStatus,ExecutionStartTime]' \
+    --output text 2>/dev/null || echo "none")
+  note_issue "EventBridge rule '$rule' ENABLED but box stopped in up-window — start-automation likely failed (last AWS-StartEC2Instance: ${execs}). Autopilot is starting the box now; check the rule target IAM (PassRole) if this repeats daily."
+}
+
 echo "===== tickvault AWS autopilot — $(date -u +%FT%TZ) ====="
 echo "instance=$INSTANCE_ID region=$REGION env=$ENVIRONMENT strict=$STRICT"
 
@@ -77,15 +122,19 @@ STATE=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_
 if [ "$STATE" = "running" ]; then
   note_ok "EC2 instance running"
 elif [ "$STATE" = "stopped" ]; then
-  if is_market_window; then
-    echo "  instance stopped DURING market window — starting it"
+  if is_box_up_window; then
+    # The box should be RUNNING for the whole 08:30-16:30 IST window. Stopped
+    # here = the 08:30 EventBridge start failed. Diagnose WHICH layer broke,
+    # then self-start (the diagnostic only reports; it never starts the box).
+    echo "  instance stopped DURING up-window (08:30-16:30 IST) — diagnosing + starting it"
+    diagnose_eventbridge_start
     if aws ec2 start-instances --region "$REGION" --instance-ids "$INSTANCE_ID" >/dev/null 2>&1; then
-      note_heal "started EC2 instance (was stopped during market hours)"
+      note_heal "started EC2 instance (was stopped during the 08:30-16:30 IST up-window)"
     else
-      note_issue "EC2 instance stopped during market hours and start failed"
+      note_issue "EC2 instance stopped during up-window and start-instances failed"
     fi
   else
-    note_ok "EC2 instance stopped (expected — outside trading window)"
+    note_ok "EC2 instance stopped (expected — outside the 08:30-16:30 IST up-window)"
   fi
   # Nothing else to check on a stopped box.
   STATE="stopped"
