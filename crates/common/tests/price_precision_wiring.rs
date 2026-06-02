@@ -185,23 +185,27 @@ fn test_banned_pattern_hook_covers_trading_and_core_paths() {
 }
 
 #[test]
-fn test_option_chain_minute_snapshot_enabled_in_default_config() {
-    // Operator-spotted 2026-05-25: option_chain_minute_snapshot table
-    // was empty despite the writer being wired. Root cause: config
-    // default `enabled = false`. Flipping on is part of this PR; this
-    // ratchet prevents a silent re-disable.
+fn test_option_chain_minute_snapshot_disabled_pending_data_api_entitlement() {
+    // 2026-06-02 operator decision: the Dhan account does NOT have the
+    // Option Chain Data API entitlement, so /v2/optionchain/expirylist
+    // returns 404 every minute for NIFTY/BANKNIFTY/SENSEX and pages
+    // [HIGH] continuously. Spot tick capture is unaffected, so the
+    // snapshot is DISABLED until the account gains the entitlement.
+    // This ratchet prevents a silent re-enable that would resume the
+    // 404 storm. (Was `enabled = true`, 2026-05-25 → 2026-06-02.)
     let body = fs::read_to_string(workspace_root().join("config/base.toml")).unwrap_or_default(); // APPROVED: test
     let block_start = body
         .find("[option_chain_minute_snapshot]")
         .expect("[option_chain_minute_snapshot] section must exist in config/base.toml"); // APPROVED: test
-    // Window the next ~400 chars for the enabled key — it sits near the
+    // Window the next ~600 chars for the enabled key — it sits near the
     // top of the section in the canonical layout.
     let block = &body[block_start..(block_start + 600).min(body.len())];
     assert!(
-        block.contains("enabled = true"),
+        block.contains("enabled = false"),
         "Z+ ratchet: config/base.toml [option_chain_minute_snapshot] \
-         must set enabled = true. Operator confirmed 2026-05-25 that the \
-         writer is wired and the table should fill at every market-open \
-         minute boundary."
+         must set enabled = false until the Dhan account has the Option \
+         Chain Data API entitlement (2026-06-02 operator decision). \
+         Re-enabling resumes the per-minute /optionchain/expirylist 404 \
+         storm."
     );
 }
