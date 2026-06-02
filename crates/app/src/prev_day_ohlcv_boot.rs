@@ -36,6 +36,11 @@ const REST_TIMEOUT_SECS: u64 = 15;
 const HISTORICAL_PATH: &str = "/charts/historical";
 /// Max look-back when computing the previous trading day (safety bound).
 const MAX_TRADING_DAY_LOOKBACK: i64 = 14;
+/// Max spins on the Data-API rate gate before giving up on this symbol's
+/// turn (bounded busy-wait: `RATE_GATE_MAX_SPINS × RATE_GATE_BACKOFF_MS`).
+const RATE_GATE_MAX_SPINS: u32 = 50;
+/// Backoff between rate-gate spins.
+const RATE_GATE_BACKOFF_MS: u64 = 50;
 
 /// Boot transport for the daily universe Arc — stashed in `cold_build`
 /// (where the universe is fresh), read at the prev-day-fetch spawn site
@@ -63,6 +68,12 @@ pub struct DailyCandle {
     pub low: f64,
     pub close: f64,
     pub volume: i64,
+    /// Previous-day open interest. Sources the prev-OI cache (1d
+    /// historical-only directive 2026-06-02). Dhan returns `open_interest`
+    /// as a columnar array, all-zero for equities/indices (historical-data.md
+    /// rule 11). Defaults to 0 when the array is absent/mismatched so an
+    /// OI-less equity candle is still accepted.
+    pub oi: i64,
 }
 
 /// Walk back from `today` to the most recent trading day strictly before it.
@@ -111,6 +122,10 @@ pub fn historical_request_body(
         "securityId": security_id,
         "exchangeSegment": exchange_segment,
         "instrument": instrument,
+        // Request open-interest (historical-data.md rule 4 — `oi` BOOLEAN
+        // optional). Drives the prev-OI cache for F&O; all-zero for
+        // equities/indices.
+        "oi": true,
         "fromDate": from_date.format("%Y-%m-%d").to_string(),
         "toDate": to_date.format("%Y-%m-%d").to_string(),
     })
@@ -144,6 +159,14 @@ pub fn parse_last_daily_candle(body: &str) -> Option<DailyCandle> {
         return None;
     }
     let i = n - 1; // last candle
+    // open_interest is OPTIONAL (only present when `oi:true` was requested AND
+    // the instrument is F&O). Equities/indices omit it or send all-zero
+    // (historical-data.md rule 11). Default to 0 — never reject the candle for
+    // a missing/short OI array.
+    let oi = arr("open_interest")
+        .filter(|a| a.len() == n)
+        .and_then(|a| a[i].as_i64().or_else(|| a[i].as_f64().map(|f| f as i64)))
+        .unwrap_or(0);
     Some(DailyCandle {
         utc_epoch_secs: ts[i].as_i64()?,
         open: open[i].as_f64()?,
@@ -154,6 +177,7 @@ pub fn parse_last_daily_candle(body: &str) -> Option<DailyCandle> {
         volume: vol[i]
             .as_i64()
             .or_else(|| vol[i].as_f64().map(|f| f as i64))?,
+        oi,
     })
 }
 
@@ -234,11 +258,11 @@ pub async fn run_prev_day_ohlcv_fetch(
         );
 
         // Data-API rate gate (5/sec). Busy-wait the GCRA cell, bounded.
-        for _ in 0..50 {
+        for _ in 0..RATE_GATE_MAX_SPINS {
             if limiter.check().is_ok() {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(RATE_GATE_BACKOFF_MS)).await;
         }
 
         match fetch_one(&client, &url, &jwt, &body).await {
@@ -256,6 +280,7 @@ pub async fn run_prev_day_ohlcv_fetch(
                     low: candle.low,
                     close: candle.close,
                     volume: candle.volume,
+                    oi: candle.oi,
                 };
                 if writer.append_row(&prow).is_ok() {
                     summary.fetched = summary.fetched.saturating_add(1);
@@ -367,6 +392,7 @@ mod tests {
         assert_eq!(b["securityId"], "1333", "securityId is a STRING");
         assert_eq!(b["exchangeSegment"], "NSE_EQ");
         assert_eq!(b["instrument"], "EQUITY");
+        assert_eq!(b["oi"], true, "open-interest requested for prev-OI cache");
         assert_eq!(b["fromDate"], "2026-05-29");
         assert_eq!(b["toDate"], "2026-06-01");
     }
@@ -379,6 +405,39 @@ mod tests {
         assert_eq!(c.close, 104.25);
         assert_eq!(c.volume, 12345);
         assert_eq!(c.utc_epoch_secs, 1_748_563_200);
+        // No open_interest array (equity-style) → OI defaults to 0.
+        assert_eq!(c.oi, 0, "missing open_interest defaults to 0");
+    }
+
+    #[test]
+    fn parse_open_interest_for_fno() {
+        // F&O daily candle WITH open_interest (oi:true requested).
+        let body = r#"{"open":[250.0],"high":[260.0],"low":[245.0],"close":[255.0],"volume":[12345],"open_interest":[987654],"timestamp":[1748563200]}"#;
+        let c = parse_last_daily_candle(body).expect("parse");
+        assert_eq!(c.oi, 987_654, "F&O open_interest parsed");
+    }
+
+    #[test]
+    fn parse_open_interest_takes_last_when_multiple() {
+        let body = r#"{"open":[1.0,2.0],"high":[1.0,2.0],"low":[1.0,2.0],"close":[1.0,2.0],"volume":[10,20],"open_interest":[111,222],"timestamp":[100,200]}"#;
+        let c = parse_last_daily_candle(body).expect("parse");
+        assert_eq!(c.oi, 222, "takes the LAST open_interest");
+    }
+
+    #[test]
+    fn parse_open_interest_length_mismatch_defaults_zero() {
+        // OI array shorter than the rest → candle still parses, OI = 0.
+        let body = r#"{"open":[1.0,2.0],"high":[1.0,2.0],"low":[1.0,2.0],"close":[1.0,2.0],"volume":[10,20],"open_interest":[111],"timestamp":[100,200]}"#;
+        let c = parse_last_daily_candle(body).expect("parse");
+        assert_eq!(c.oi, 0, "mismatched OI length → 0, candle still valid");
+        assert_eq!(c.close, 2.0, "candle body unaffected");
+    }
+
+    #[test]
+    fn parse_open_interest_as_float_truncates() {
+        let body = r#"{"open":[1.0],"high":[1.0],"low":[1.0],"close":[1.0],"volume":[1],"open_interest":[55555.0],"timestamp":[100]}"#;
+        let c = parse_last_daily_candle(body).expect("parse");
+        assert_eq!(c.oi, 55_555);
     }
 
     #[test]

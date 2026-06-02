@@ -1,10 +1,16 @@
 //! Previous-day open interest cache.
 //!
 //! Per L13 + L14 of `.claude/plans/active-plan-29-tf-and-movers-deletion.md`,
-//! the cache loads at boot from QuestDB `candles_1d` (yesterday's row per
+//! the cache loads at boot from QuestDB `prev_day_ohlcv` (yesterday's row per
 //! `(security_id, exchange_segment)`) and reloads at IST midnight when the
 //! `MidnightRolloverTask` fires. The cache is read on every tick to stamp
 //! `prev_day_oi` into the new lifecycle column.
+//!
+//! **Source change 2026-06-02 (1d historical-only directive):** the source
+//! was `candles_1d` (a tick-sealed matview). Since the live aggregator no
+//! longer seals the 1d timeframe — 1d is pulled once each morning from Dhan
+//! historical into `prev_day_ohlcv` (now carrying an `oi` column) — this cache
+//! reads OI from `prev_day_ohlcv` instead.
 //!
 //! ## Design
 //!
@@ -13,11 +19,11 @@
 //!   cross-segment SecurityId collision (NSE_FNO/BSE_FNO can share IDs).
 //!   `papaya` provides lock-free O(1) read on the hot path.
 //! - **Loader**: boot-time HTTP query against QuestDB's `/exec` endpoint
-//!   over `candles_1d` for `ts > yesterday_midnight - 1d` LATEST ON
+//!   over `prev_day_ohlcv` for `ts > now() - 10d` LATEST ON
 //!   `(security_id, segment)`. One HTTP round trip; O(N) instruments.
 //! - **Reload at midnight**: same loader rerun. `papaya` allows
 //!   atomic-replace semantics so the hot path never sees a partial state.
-//! - **Empty-result safety**: a fresh deploy with no prior `candles_1d`
+//! - **Empty-result safety**: a fresh deploy with no prior `prev_day_ohlcv`
 //!   data starts with an empty cache. `prev_day_oi` lookups return
 //!   `None` → ILP writes a NULL value, downstream `oi_change_pct` returns
 //!   0.0 per the formulas.rs guard. No panic, no bad data.
@@ -79,7 +85,7 @@ impl PrevOiCache {
 
     /// Looks up yesterday's closing OI for a given instrument.
     /// Returns `None` if the instrument has no prior-day record (new
-    /// listing, expired contract, fresh deploy with empty `candles_1d`).
+    /// listing, expired contract, fresh deploy with empty `prev_day_ohlcv`).
     ///
     /// O(1), lock-free, zero-alloc — safe to call on the hot path.
     #[inline]
@@ -143,14 +149,20 @@ impl PrevOiCache {
     }
 
     /// Loads yesterday's closing OI for every `(security_id, segment)`
-    /// pair from QuestDB's `candles_1d` matview.
+    /// pair from QuestDB's `prev_day_ohlcv` table.
     ///
-    /// The query selects the LATEST row per composite key inside
-    /// `[yesterday_midnight - 1d, yesterday_midnight + 1d]` (a 48h
-    /// window absorbs DST or boot-time clock-skew without missing a
-    /// row). The `oi` column is the last open-interest value of that
-    /// daily candle — i.e. the day's closing OI, exactly what we want
-    /// for `prev_day_oi`.
+    /// **Source change 2026-06-02 (1d historical-only directive):** 1d is
+    /// no longer tick-sealed into `candles_1d`; it is pulled once each
+    /// morning from Dhan historical into `prev_day_ohlcv` (which now carries
+    /// an `oi` column). This loader reads OI from there.
+    ///
+    /// The query selects the LATEST `oi` per composite key. The lower bound
+    /// is a generous `-10d` so a Monday / post-holiday-cluster boot still
+    /// finds the most recent prior trading day's row (whose `ts` is the
+    /// prev-trading-day IST midnight — up to several calendar days back over
+    /// a long weekend). `LATEST ON ts PARTITION BY` collapses to one row per
+    /// instrument. The `prev_day_ohlcv` table is tiny (one row per symbol per
+    /// day), so the wider scan is cheap and bounded.
     ///
     /// Returns the number of entries loaded on success.
     pub async fn load_from_questdb(&self, config: &QuestDbConfig) -> Result<usize, LoadError> {
@@ -165,16 +177,18 @@ impl PrevOiCache {
             .map_err(LoadError::HttpClient)?;
         let url = format!("http://{}:{}/exec", config.host, config.http_port);
 
-        // QuestDB SQL: select the LATEST oi per composite key from yesterday's
-        // candles_1d. We use `LATEST ON ts PARTITION BY` semantics — see
-        // `dhan-ref` materialized views section.
-        //
-        // Range: `(today_midnight - 2d, today_midnight)` so we always pick up
-        // the most recent prior-day row even on Monday (Friday's row is the
-        // latest), holiday weeks, etc. QuestDB resolves `LATEST ON` to a
+        // QuestDB SQL: select the LATEST oi per composite key from
+        // prev_day_ohlcv (the 1d historical-only table; carries `oi` as of
+        // 2026-06-02). `LATEST ON ts PARTITION BY` semantics resolve to a
         // single row per (security_id, segment).
-        let sql = "SELECT security_id, segment, oi FROM candles_1d \
-                   WHERE ts > dateadd('d', -2, now()) AND ts < now() \
+        //
+        // Range: `(now - 10d, now)`. prev_day_ohlcv stores the prev-trading-day
+        // candle at IST-midnight `ts`, so on a Monday / post-holiday boot the
+        // newest row can be several calendar days back. The generous -10d lower
+        // bound guarantees it is never excluded, while keeping the scan bounded
+        // (the table holds one row per symbol per day).
+        let sql = "SELECT security_id, segment, oi FROM prev_day_ohlcv \
+                   WHERE ts > dateadd('d', -10, now()) AND ts < now() \
                    LATEST ON ts PARTITION BY security_id, segment";
 
         let response = client
@@ -193,7 +207,7 @@ impl PrevOiCache {
             // caller logs as ERROR + Telegram. Treating this as
             // "loaded with empty cache" was the False-OK class bug
             // flagged by the adversarial review — operator never
-            // saw a signal that QuestDB candles_1d failed to load.
+            // saw a signal that QuestDB prev_day_ohlcv failed to load.
             error!(
                 code = tickvault_common::error_code::ErrorCode::PrevClose01IlpFailed.code_str(),
                 %status,
@@ -258,9 +272,9 @@ impl PrevOiCache {
             // every 5 minutes — together those give the operator full
             // visibility without spamming the log every 5 min for the
             // entire trading session.
-            debug!("prev_oi_cache loaded 0 entries (fresh deploy or candles_1d empty)");
+            debug!("prev_oi_cache loaded 0 entries (fresh deploy or prev_day_ohlcv empty)");
         } else {
-            info!(entries = count, "prev_oi_cache loaded from candles_1d");
+            info!(entries = count, "prev_oi_cache loaded from prev_day_ohlcv");
         }
         Ok(count)
     }
@@ -425,7 +439,7 @@ mod tests {
 
     #[test]
     fn test_replace_with_empty_marks_loaded() {
-        // Fresh deploy scenario: candles_1d empty, replace_with([]) called.
+        // Fresh deploy scenario: prev_day_ohlcv empty, replace_with([]) called.
         let c = PrevOiCache::new();
         c.replace_with(Vec::new());
         assert!(c.is_loaded());
