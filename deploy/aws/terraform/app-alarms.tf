@@ -43,6 +43,12 @@ locals {
 
 # ---------------------------------------------------------------------------
 # 1. Main-feed WebSocket pool dead — every conn dropped, no live ticks
+# treat_missing_data = notBreaching (was "breaching", 2026-06-02): the metric
+# is emitted ONLY while the app runs, so on the scheduled weekday 16:30 IST
+# stop / weekends / any deploy gap the metric goes missing and "breaching"
+# held this alarm STUCK FIRING across the gap (operator saw it firing while the
+# box was up + ticks flowing). App-death while the box is up is still caught by
+# systemd Restart=always + the in-app tick-gap Telegram + the EC2 status alarm.
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "ws_pool_all_dead" {
   alarm_name          = "tv-${var.environment}-ws-pool-all-dead"
@@ -54,7 +60,7 @@ resource "aws_cloudwatch_metric_alarm" "ws_pool_all_dead" {
   period              = 60
   statistic           = "Maximum"
   threshold           = 0
-  treat_missing_data  = "breaching"
+  treat_missing_data  = "notBreaching"
   dimensions          = local.app_dimensions
   alarm_actions       = local.app_alarm_actions
   ok_actions          = local.app_alarm_ok
@@ -81,6 +87,10 @@ resource "aws_cloudwatch_metric_alarm" "ws_failed_connections" {
 
 # ---------------------------------------------------------------------------
 # 3. Order-update WebSocket down — orders fly blind
+# treat_missing_data = notBreaching (was "breaching", 2026-06-02): same
+# stale-FIRING fix as ws_pool_all_dead — the metric is missing whenever the box
+# is intentionally stopped (16:30 IST / weekends) or during a deploy gap, and
+# "breaching" held this alarm stuck FIRING across that gap.
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "order_update_ws_inactive" {
   alarm_name          = "tv-${var.environment}-order-update-ws-inactive"
@@ -92,7 +102,7 @@ resource "aws_cloudwatch_metric_alarm" "order_update_ws_inactive" {
   period              = 60
   statistic           = "Minimum"
   threshold           = 1
-  treat_missing_data  = "breaching"
+  treat_missing_data  = "notBreaching"
   dimensions          = local.app_dimensions
   alarm_actions       = local.app_alarm_actions
   ok_actions          = local.app_alarm_ok
