@@ -14,7 +14,7 @@
 //!
 //! # Error Handling & Zero-Tick-Loss Guarantee
 //! On QuestDB failure, ticks are held in a bounded ring buffer
-//! (`TICK_BUFFER_CAPACITY` = 600K ticks). When the ring buffer fills,
+//! (`TICK_BUFFER_CAPACITY` = 100K ticks). When the ring buffer fills,
 //! overflow ticks spill to disk (`data/spill/ticks-YYYYMMDD.bin`).
 //! On recovery, ring buffer drains first, then disk spill.
 //! On graceful shutdown, remaining ticks flush to QuestDB or disk.

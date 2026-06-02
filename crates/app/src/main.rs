@@ -472,11 +472,18 @@ async fn main() -> Result<()> {
             error!(
                 ?err,
                 dir = %ws_wal_dir,
-                "STAGE-C: failed to initialize WsFrameSpill — proceeding WITHOUT durable WAL. \
-                 This is a degraded mode: zero-tick-loss guarantee is NOT active. \
-                 Investigate disk permissions and free space immediately."
+                "STAGE-C: failed to initialize WsFrameSpill — HALTING boot (fail-closed). \
+                 The durable WAL is the zero-tick-loss guarantee (ring → spill → WAL); \
+                 running WITHOUT it would admit SILENT frame loss under channel \
+                 backpressure. Fix disk permissions/free space, then restart."
             );
-            None
+            // Zero-tick-loss fail-closed (operator mandate 2026-06-02: "ticks
+            // should never ever be lost … irrespective of any situation").
+            // The WAL is the durable floor of the ring → spill → WAL chain; if it
+            // can't init, the guarantee is void, so we REFUSE to run. systemd
+            // Restart=always re-launches and the operator is paged by the ERROR
+            // above — a loud restart loop beats a silent lossy session.
+            std::process::exit(1);
         }
     };
 
@@ -5046,7 +5053,11 @@ async fn load_daily_universe_plan(
             "subscription plan ready (DailyUniverse — INSTANT warm resubscribe from snapshot)"
         );
         // Timing-proof telemetry: warm path, no cold rebuild this boot.
-        record_instrument_load_telemetry(elapsed_ms, 0, 0, true, 0);
+        // total_rows MUST be the real universe size (was hardcoded 0 — a healthy
+        // 243-SID warm boot then mislabelled itself "0 rows on file", making an
+        // empty universe indistinguishable from a healthy one). 2026-06-02 fix.
+        let warm_total_rows = u64::try_from(universe.total_count()).unwrap_or(0);
+        record_instrument_load_telemetry(elapsed_ms, 0, 0, true, warm_total_rows);
 
         // Background reconcile: refresh lifecycle master + snapshot off the
         // critical path. Failure here does NOT halt — first-tick already flows

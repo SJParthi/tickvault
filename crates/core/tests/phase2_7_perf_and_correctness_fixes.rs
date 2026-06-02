@@ -88,6 +88,26 @@ fn hot_path_c2_now_ist_secs_hoisted_to_frame_level() {
     );
 }
 
+/// Regression: 2026-06-02 — zero-tick-loss WAL must be fail-closed. The WAL
+/// (`WsFrameSpill`) is the durable floor of the ring → spill → WAL chain; if it
+/// can't init at boot, running without it admits SILENT frame loss under
+/// backpressure. The boot MUST `std::process::exit(1)` rather than proceed with
+/// `wal_spill = None`. Pins fail-closed so it can't regress to degraded mode.
+#[test]
+fn test_regression_ws_frame_wal_init_is_fail_closed() {
+    let src = read("app/src/main.rs");
+    assert!(
+        src.contains("HALTING boot (fail-closed)") && src.contains("WsFrameSpill"),
+        "main.rs must HALT boot (fail-closed) when WsFrameSpill init fails — \
+         the WAL is the zero-tick-loss durability floor"
+    );
+    assert!(
+        !src.contains("proceeding WITHOUT durable WAL"),
+        "main.rs must NOT proceed without the durable WAL (degraded mode removed \
+         2026-06-02 — would admit silent tick loss)"
+    );
+}
+
 /// Regression: 2026-06-02 — prod deploy of 8debad0 failed because the prev_oi
 /// cache was repointed (PR #979) from `candles_1d` to the NEW `prev_day_ohlcv`
 /// table, which may not exist on a fresh box when the boot-ordering gate's

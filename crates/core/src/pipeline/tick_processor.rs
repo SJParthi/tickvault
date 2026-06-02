@@ -1043,12 +1043,17 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                         Err(err) => {
                             storage_errors = storage_errors.saturating_add(1);
                             m_storage_errors.increment(1);
-                            if storage_errors <= 100 {
-                                warn!(
+                            // Audit Rule 5: persist failures use error! (Telegram-
+                            // routable). Edge-triggered (Rule 4): page on the FIRST
+                            // error + every 1000th to avoid per-tick spam. The tick
+                            // is NOT lost — force_flush rescues it into the
+                            // ring → spill → WAL chain.
+                            if storage_errors == 1 || storage_errors % 1000 == 0 {
+                                error!(
                                     ?err,
                                     security_id = tick.security_id,
                                     total_errors = storage_errors,
-                                    "failed to append tick to QuestDB"
+                                    "failed to append tick to QuestDB (tick rescued to ring/spill/WAL)"
                                 );
                             }
                         }
@@ -1232,12 +1237,15 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                             Err(err) => {
                                 storage_errors = storage_errors.saturating_add(1);
                                 m_storage_errors.increment(1);
-                                if storage_errors <= 100 {
-                                    warn!(
+                                // Audit Rule 5 + Rule 4 (edge-triggered): page on
+                                // first error + every 1000th. Tick rescued to
+                                // ring/spill/WAL — not lost.
+                                if storage_errors == 1 || storage_errors % 1000 == 0 {
+                                    error!(
                                         ?err,
                                         security_id = tick.security_id,
                                         total_errors = storage_errors,
-                                        "failed to append tick to QuestDB"
+                                        "failed to append tick to QuestDB (tick rescued to ring/spill/WAL)"
                                     );
                                 }
                             }
