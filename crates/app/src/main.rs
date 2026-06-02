@@ -3009,6 +3009,22 @@ async fn main() -> Result<()> {
         );
         let tick_enricher =
             std::sync::Arc::new(tickvault_core::pipeline::tick_enricher::TickEnricher::new());
+        // 1d-historical-only regression fix (2026-06-02): the prev_oi cache
+        // now loads from `prev_day_ohlcv` (repointed from `candles_1d` in
+        // PR #979). Unlike `candles_1d` — which is always CREATEd early in boot
+        // by `ensure_shadow_candle_tables` — `prev_day_ohlcv` is a NEW table
+        // whose `ensure_*` runs inside the concurrently-spawned boot fetch
+        // task, so on a fresh box's first boot with the new binary it may not
+        // exist yet when the gate-blocking load below runs. A missing table
+        // makes `load_from_questdb` return Err → the boot-ordering gate stays
+        // `AwaitingOiCache` → `try_authorize_subscribe()` fails →
+        // `std::process::exit(1)` → systemd marks tickvault.service failed →
+        // the deploy aborts. Ensure the table exists HERE (idempotent
+        // CREATE TABLE IF NOT EXISTS) so the load hits an existing — possibly
+        // empty (Ok count=0, graceful) — table. A genuine QuestDB-unreachable
+        // still Errs and fail-closes as designed (L14 invariant preserved).
+        tickvault_storage::prev_day_ohlcv_persistence::ensure_prev_day_ohlcv_table(&config.questdb)
+            .await;
         // Phase 2.8 H4 fix: only mark the gate ready on Ok. On Err the
         // gate stays in `AwaitingOiCache` and `try_authorize_subscribe`
         // refuses authorization — the operator gets a typed ERROR
