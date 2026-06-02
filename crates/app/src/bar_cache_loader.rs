@@ -63,18 +63,19 @@ struct QuestDbExecResponse {
 /// HTTP request timeout for the boot SELECT.
 ///
 /// Mirrors the `prev_day_cache_loader::QUESTDB_QUERY_TIMEOUT_SECS = 10`.
-/// The union SELECT across 9 shadow tables can return up to ~11M rows
-/// (today + yesterday × 9 TFs × ~5.5M per TF averaged) so the timeout
-/// is generous.
+/// The union SELECT across 8 shadow tables can return up to ~11M rows
+/// (today + yesterday × 8 TFs × ~5.5M per TF averaged) so the timeout
+/// is generous. (1d is historical-only — sourced from `prev_day_ohlcv`,
+/// not a shadow table — per the 2026-06-02 directive.)
 const BAR_CACHE_QUERY_TIMEOUT_SECS: u64 = 30;
 
 /// IST seconds-per-day cutoff: 24h. Used in `dateadd('d', -1, now())`
 /// equivalent — load today + yesterday only.
 const BAR_CACHE_LOOKBACK_DAYS: i32 = 2;
 
-/// Build the UNION ALL SQL across the 9 shadow tables. Pure function
-/// so the caller can inspect the SQL in a test without spinning
-/// QuestDB.
+/// Build the UNION ALL SQL across the 8 shadow tables (1d excluded —
+/// historical-only, sourced from `prev_day_ohlcv`). Pure function so the
+/// caller can inspect the SQL in a test without spinning QuestDB.
 #[must_use]
 pub fn build_bar_cache_select_sql() -> String {
     let tables = [
@@ -86,7 +87,10 @@ pub fn build_bar_cache_select_sql() -> String {
         ("candles_2h_shadow", "2h"),
         ("candles_3h_shadow", "3h"),
         ("candles_4h_shadow", "4h"),
-        ("candles_1d_shadow", "1d"),
+        // 1d historical-only (operator directive 2026-06-02): the D1 timeframe
+        // is NOT tick-sealed, so `candles_1d_shadow` is unwritten. The 1d bar
+        // comes from `prev_day_ohlcv` (via the prev-OI cache), so this loader
+        // no longer SELECTs candles_1d_shadow. 8 shadow tables, not 9.
     ];
     let mut sql = String::with_capacity(2048); // O(1) EXEMPT: cold-path boot SELECT builder
     for (idx, (table, tf_label)) in tables.iter().enumerate() {
@@ -117,7 +121,8 @@ pub struct PopulationOutcome {
 }
 
 /// Boot-time entry point: read today + yesterday sealed bars from the
-/// 9 `candles_<tf>_shadow` tables and populate the `BarCache`.
+/// 8 `candles_<tf>_shadow` tables (1d excluded — historical-only) and
+/// populate the `BarCache`.
 ///
 /// Best-effort — emits `Err` on QuestDB unavailability so the caller
 /// can log + continue boot. The hot-path code paths that read from
@@ -707,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_sql_includes_all_9_shadow_tables() {
+    fn test_build_sql_includes_all_8_shadow_tables() {
         let sql = build_bar_cache_select_sql();
         for table in [
             "candles_1m_shadow",
@@ -718,13 +723,18 @@ mod tests {
             "candles_2h_shadow",
             "candles_3h_shadow",
             "candles_4h_shadow",
-            "candles_1d_shadow",
         ] {
             assert!(
                 sql.contains(table),
                 "SQL must include FROM {table} clause; got:\n{sql}"
             );
         }
+        // 1d historical-only (2026-06-02): D1 is NOT tick-sealed, so the loader
+        // must NOT SELECT candles_1d_shadow.
+        assert!(
+            !sql.contains("candles_1d_shadow"),
+            "candles_1d_shadow must be EXCLUDED (1d is historical-only); got:\n{sql}"
+        );
     }
 
     #[test]
@@ -732,8 +742,8 @@ mod tests {
         let sql = build_bar_cache_select_sql();
         let union_count = sql.matches(" UNION ALL ").count();
         assert_eq!(
-            union_count, 8,
-            "9 tables → 8 UNION ALL separators; got {union_count}\nSQL:\n{sql}"
+            union_count, 7,
+            "8 tables → 7 UNION ALL separators; got {union_count}\nSQL:\n{sql}"
         );
     }
 
@@ -758,11 +768,16 @@ mod tests {
     #[test]
     fn test_build_sql_injects_tf_label_literals() {
         let sql = build_bar_cache_select_sql();
-        for tf_label in ["1m", "5m", "15m", "30m", "1h", "2h", "3h", "4h", "1d"] {
+        for tf_label in ["1m", "5m", "15m", "30m", "1h", "2h", "3h", "4h"] {
             assert!(
                 sql.contains(&format!("'{tf_label}' AS timeframe")),
                 "SQL must inject TF literal '{tf_label}' AS timeframe; got:\n{sql}"
             );
         }
+        // 1d historical-only (2026-06-02): no 1d label is emitted by the loader.
+        assert!(
+            !sql.contains("'1d' AS timeframe"),
+            "1d label must NOT appear (historical-only); got:\n{sql}"
+        );
     }
 }

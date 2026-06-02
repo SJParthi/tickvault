@@ -19,10 +19,20 @@
 //!     high         DOUBLE,
 //!     low          DOUBLE,
 //!     close        DOUBLE,
-//!     volume       LONG
+//!     volume       LONG,
+//!     oi           LONG         -- prev-day open interest (F&O only; 0 for IDX_I/equity)
 //! ) timestamp(ts) PARTITION BY DAY
 //!   DEDUP UPSERT KEYS(ts, security_id, segment);
 //! ```
+//!
+//! ## `oi` column (operator directive 2026-06-02 — 1d historical-only)
+//!
+//! When the live aggregator stopped sealing the `D1` (1-day) timeframe (1d is
+//! now historical-only), the prev-OI cache lost its `candles_1d` source. This
+//! table is now the prev-OI source, so it carries the previous-day open
+//! interest. Dhan REST `/v2/charts/historical` returns `open_interest` as a
+//! columnar array (all-zero for equities/indices where OI is meaningless).
+//! `oi` is NOT a DEDUP key column — only `(ts, security_id, segment)` are.
 //!
 //! ## Timestamp rule (`data-integrity.md`)
 //!
@@ -67,6 +77,10 @@ pub struct PrevDayOhlcvRow {
     pub low: f64,
     pub close: f64,
     pub volume: i64,
+    /// Previous-day open interest. Meaningful for F&O only; Dhan returns
+    /// all-zero for IDX_I / equity. Sources the prev-OI cache (1d
+    /// historical-only directive 2026-06-02). NOT a DEDUP key column.
+    pub oi: i64,
 }
 
 /// Convert a Dhan REST historical candle UTC-epoch-second timestamp into
@@ -97,7 +111,8 @@ pub fn prev_day_ohlcv_create_ddl() -> String {
             high         DOUBLE, \
             low          DOUBLE, \
             close        DOUBLE, \
-            volume       LONG\
+            volume       LONG, \
+            oi           LONG\
         ) timestamp(ts) PARTITION BY DAY \
         DEDUP UPSERT KEYS({DEDUP_KEY_PREV_DAY_OHLCV});"
     )
@@ -144,6 +159,34 @@ pub async fn ensure_prev_day_ohlcv_table(questdb_config: &QuestDbConfig) {
         }
         Err(err) => error!(?err, "prev_day_ohlcv: CREATE TABLE request failed"),
     }
+
+    // Schema self-heal (observability-architecture.md): a table created by an
+    // earlier build (before the 2026-06-02 1d-historical-only `oi` column)
+    // auto-migrates here. QuestDB ignores ADD COLUMN that already exists, so
+    // running every boot is free.
+    match client
+        .get(&base_url)
+        .query(&[("query", prev_day_ohlcv_alter_add_oi_ddl())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            error!(%status, body = %body.chars().take(200).collect::<String>(),
+                "prev_day_ohlcv: ALTER ADD COLUMN oi returned non-2xx");
+        }
+        Err(err) => error!(?err, "prev_day_ohlcv: ALTER ADD COLUMN oi request failed"),
+    }
+}
+
+/// Idempotent `ALTER TABLE ADD COLUMN IF NOT EXISTS oi LONG`. Pure (testable
+/// without QuestDB). Schema self-heal for tables created before the
+/// 2026-06-02 1d-historical-only directive added the `oi` column.
+#[must_use]
+pub fn prev_day_ohlcv_alter_add_oi_ddl() -> &'static str {
+    "ALTER TABLE prev_day_ohlcv ADD COLUMN IF NOT EXISTS oi LONG;"
 }
 
 /// Lazy-connect ILP writer for the `prev_day_ohlcv` table. Mirrors
@@ -229,6 +272,8 @@ impl PrevDayOhlcvWriter {
             .with_context(|| "prev_day_ohlcv append: column_f64(close) failed")?
             .column_i64("volume", row.volume)
             .with_context(|| "prev_day_ohlcv append: column_i64(volume) failed")?
+            .column_i64("oi", row.oi)
+            .with_context(|| "prev_day_ohlcv append: column_i64(oi) failed")?
             .at(TimestampNanos::new(row.ts_ist_nanos))
             .with_context(|| "prev_day_ohlcv append: at(ts) failed")?;
         self.pending = self.pending.saturating_add(1);
@@ -289,11 +334,24 @@ mod tests {
             "low          DOUBLE",
             "close        DOUBLE",
             "volume       LONG",
+            "oi           LONG",
             "DEDUP UPSERT KEYS(ts, security_id, segment)",
             "PARTITION BY DAY",
         ] {
             assert!(ddl.contains(needle), "DDL missing: {needle}\n{ddl}");
         }
+        // `oi` must NOT be part of the DEDUP key (it is mutable data, not identity).
+        assert!(
+            ddl.contains("DEDUP UPSERT KEYS(ts, security_id, segment)"),
+            "oi must not be a DEDUP key column"
+        );
+    }
+
+    #[test]
+    fn test_prev_day_ohlcv_alter_add_oi_ddl_is_idempotent_add_column() {
+        let alter = prev_day_ohlcv_alter_add_oi_ddl();
+        assert!(alter.contains("ALTER TABLE prev_day_ohlcv"));
+        assert!(alter.contains("ADD COLUMN IF NOT EXISTS oi LONG"));
     }
 
     #[test]
@@ -327,6 +385,7 @@ mod tests {
             low: 99.0,
             close: 105.5,
             volume: 0,
+            oi: 0,
         };
         w.append_row(&row).expect("append");
         assert_eq!(w.pending(), 1);
@@ -334,6 +393,30 @@ mod tests {
         let text = String::from_utf8_lossy(bytes);
         assert!(text.contains("prev_day_ohlcv"), "table name in wire bytes");
         assert!(text.contains("IDX_I"), "segment in wire bytes");
+        assert!(text.contains("oi="), "oi column in wire bytes");
+    }
+
+    #[test]
+    fn test_append_row_serialises_nonzero_oi_for_fno() {
+        // F&O contract: OI is meaningful and must reach the wire.
+        let mut w = PrevDayOhlcvWriter::for_test();
+        let row = PrevDayOhlcvRow {
+            ts_ist_nanos: 1_000_000_000,
+            security_id: 49_081,
+            segment: "NSE_FNO",
+            open: 250.0,
+            high: 260.0,
+            low: 245.0,
+            close: 255.0,
+            volume: 12_345,
+            oi: 987_654,
+        };
+        w.append_row(&row).expect("append");
+        let text = String::from_utf8_lossy(w.buffer_bytes());
+        assert!(
+            text.contains("oi=987654"),
+            "F&O oi value on the wire: {text}"
+        );
     }
 
     #[test]
@@ -354,6 +437,7 @@ mod tests {
             low: 0.5,
             close: 1.5,
             volume: 100,
+            oi: 0,
         };
         w.append_row(&row).expect("a1");
         w.append_row(&row).expect("a2");

@@ -5,19 +5,24 @@
 //! cover:
 //!
 //! - **M2** — boot at 23:50 IST window: boot-time load reads "today's"
-//!   `candles_1d` row briefly before midnight; minutes later that row
+//!   `prev_day_ohlcv` row briefly before midnight; minutes later that row
 //!   becomes "yesterday's" without an immediate reload. The midnight
 //!   task fires at 00:00 IST and reloads, but the cache was correct
 //!   anyway in this case.
 //!
-//! - **M4** — fresh deploy with empty `candles_1d`: boot-time load
+//! - **M4** — fresh deploy with empty `prev_day_ohlcv`: boot-time load
 //!   returns `Ok(count=0)`, cache stays empty until the next IST
 //!   midnight. OI Change panels read 0% for the entire first day.
-//!   Periodic refresh closes that gap once the matview pipeline
-//!   produces its first daily candle.
+//!   Periodic refresh closes that gap once the morning historical pull
+//!   populates `prev_day_ohlcv`.
 //!
-//! - **M4** — QuestDB matview chain still building post-boot: refresh
-//!   covers the gap if the matview catches up after boot.
+//! - **M4** — `prev_day_ohlcv` still being written post-boot (the daily
+//!   historical pull runs as a cold-path task): refresh covers the gap
+//!   if the table catches up after boot.
+//!
+//! **Source note 2026-06-02:** the OI source moved from the tick-sealed
+//! `candles_1d` matview to the historical-only `prev_day_ohlcv` table
+//! (1d historical-only directive). These scenarios are unchanged in shape.
 
 use std::path::PathBuf;
 
@@ -96,7 +101,7 @@ fn phase2_11_emits_three_outcome_labels_for_observability() {
     let src = read("core/src/pipeline/tick_enricher.rs");
     // The refresh task emits tv_prev_oi_cache_refresh_total with three
     // distinct outcome labels so dashboards can distinguish:
-    //   - "still_empty" — candles_1d not yet populated, will retry
+    //   - "still_empty" — prev_day_ohlcv not yet populated, will retry
     //   - "populated"   — task succeeded, exiting
     //   - "err"         — load failed, will retry
     //   - "external"    — cache populated by another path (midnight)

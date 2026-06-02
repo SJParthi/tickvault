@@ -5969,7 +5969,8 @@ fn spawn_engine_b_aggregator(
 ) {
     use tickvault_storage::seal_writer_runner::global_seal_sender;
     use tickvault_trading::candles::{
-        AggregatorHeartbeatCounters, BufferedSeal, MultiTfAggregator, stamp_seal_pct_fields,
+        AggregatorHeartbeatCounters, BufferedSeal, MultiTfAggregator, TfIndex,
+        stamp_seal_pct_fields,
     };
 
     // 11K-instrument capacity (matches MAX_TOTAL_SUBSCRIPTIONS headroom
@@ -6002,6 +6003,17 @@ fn spawn_engine_b_aggregator(
                         &tick,
                         tick.exchange_segment_code,
                         |tf, mut state| {
+                            // 1d historical-only (operator directive 2026-06-02):
+                            // the 1d timeframe is NEVER tick-calculated. It is
+                            // pulled once each morning from Dhan historical into
+                            // `prev_day_ohlcv`. Drop any D1 seal the aggregator
+                            // emits so it never reaches `candles_1d`. The
+                            // aggregator still seals all 21 TFs internally
+                            // (fixed 21-slot arrays + `42 = 2×21` unit test
+                            // intact); only this write boundary skips D1.
+                            if tf == TfIndex::D1 {
+                                return;
+                            }
                             let mut refs = prev_day_cache_for_agg
                                 .lookup(tick.security_id, tick.exchange_segment_code)
                                 .unwrap_or_default();
@@ -6121,6 +6133,12 @@ fn spawn_engine_b_aggregator(
             let mut sealed: u64 = 0;
             let mut dropped: u64 = 0;
             agg_for_boundary.force_seal_all(|security_id, segment_code, tf, mut state| {
+                // 1d historical-only (operator directive 2026-06-02): D1 is
+                // never tick-sealed — drop it at this write boundary too. See
+                // the per-tick seal site above for the full rationale.
+                if tf == TfIndex::D1 {
+                    return;
+                }
                 let mut refs = prev_day_cache_for_boundary
                     .lookup(security_id, segment_code)
                     .unwrap_or_default();

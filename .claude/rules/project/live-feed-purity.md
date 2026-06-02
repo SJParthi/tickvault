@@ -115,6 +115,30 @@ and replaced with the hard bans in this rule.
    `ticks`, `BackfillWorker`, `run_backfill`, `synthesize_ticks`,
    `TickPersistenceWriter`/`append_tick` in any historical/synth path.
 
+10. **1d timeframe is HISTORICAL-ONLY — never tick-calculated (operator
+    directive 2026-06-02).** Operator quote: *"for 1 day timeframe alone it
+    should never ever be calculated, it should always be pulled once and only
+    from historical 1 day timeframe."*
+
+    - The live multi-TF aggregator STILL seals all 21 timeframes internally
+      (fixed 21-slot arrays + the `42 = 2×21` aggregator unit test stay
+      intact), but the two seal **write boundaries** in
+      `crates/app/src/main.rs` (per-tick + IST-midnight force-seal) DROP the
+      `TfIndex::D1` seal — so **`candles_1d` / `candles_1d_shadow` are NOT
+      written by the live path**. They remain CREATEd (DDL/self-heal intact)
+      but unwritten.
+    - The 1d daily candle is the prev-day row in **`prev_day_ohlcv`** (now
+      carrying an `oi` column), pulled ONCE each morning on AWS auto-start via
+      the rule-9 bounded historical fetch.
+    - The **prev-OI cache** (`crates/core/src/pipeline/prev_oi_cache.rs`)
+      reads OI from `prev_day_ohlcv` (was `candles_1d`) at boot AND at every
+      IST midnight — so `oi_pct_from_prev_day` keeps populating.
+    - The **bar-cache loader** SELECTs 8 shadow tables (not 9) — it no longer
+      reads `candles_1d_shadow`.
+    - Why: a tick-built 1d candle is just a sample of the day; the historical
+      daily candle is NSE's authoritative O/H/L/C/V — the same exact-match
+      reason the operator cited for the intraday chart-vs-tick gap.
+
 ## Test ratchet
 
 - Pre-commit hook (banned-pattern-scanner.sh, category 6) — fails the
