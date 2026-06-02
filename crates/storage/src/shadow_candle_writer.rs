@@ -216,6 +216,11 @@ impl ShadowCandleWriter {
             // §31 Option 2: % change vs the official 09:15 session open.
             .column_f64("open_pct", row.open_pct)
             .with_context(|| "candle append: column_f64(open_pct) failed")?
+            // Operator request 2026-06-02: headline day change % + opening gap %.
+            .column_f64("change_pct", row.change_pct)
+            .with_context(|| "candle append: column_f64(change_pct) failed")?
+            .column_f64("open_gap_pct", row.open_gap_pct)
+            .with_context(|| "candle append: column_f64(open_gap_pct) failed")?
             .at(TimestampNanos::new(row.timestamp_ist_nanos))
             .with_context(|| "candle append: at(TimestampNanos) failed")?;
         self.pending_count += 1;
