@@ -350,7 +350,7 @@ per_instrument_capacity = 5000
 # Design doc:
 # .claude/plans/friday-may-15-mega/topic-OPTION-CHAIN-MINUTE-SNAPSHOT.md
 [option_chain_minute_snapshot]
-enabled = true                     # 2026-05-25: scheduler+writer wired in prior PRs; flipped on per operator confirmation
+enabled = false                    # 2026-06-02: DISABLED per operator. The Dhan account lacks the Option Chain Data API entitlement, so /v2/optionchain/expirylist returns 404 every minute (NIFTY/BANKNIFTY/SENSEX) and pages [HIGH]. Spot tick capture is unaffected. Re-enable once the account has the Option Chain Data API. (Was true 2026-05-25.)
 cache_max_stale_secs = 300         # 5 min hard halt threshold
 strike_window_atm_each_side = 25   # ATM ± 25 strikes cached per underlying
 fetch_retry_max_attempts = 2       # same-minute retries per underlying
