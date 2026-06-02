@@ -160,6 +160,51 @@ resource "aws_lambda_permission" "deploy_watchdog_postmarket" {
   source_arn    = aws_cloudwatch_event_rule.deploy_watchdog_postmarket.arn
 }
 
+# ---------------------------------------------------------------------------
+# INSTANT deploy on instance start (operator directive 2026-06-02)
+#
+# "auto deployment should happen instantly when the instance is started at
+# 08:00." The 08:00 EventBridge start brings the box up; this rule fires the
+# deploy-watchdog the MOMENT the instance enters the `running` state — so the
+# latest `main` is pulled + restarted within a couple of minutes of 08:00,
+# NOT at the 08:45 cron. The watchdog is idempotent (only dispatches if main
+# is actually newer than the last successful deploy), so a same-day restart
+# that is already up-to-date is a silent no-op. The 08:45/08:50 schedules
+# above remain as belt-and-suspenders backups.
+#
+# Event-pattern (not a schedule): EC2 Instance State-change → `running` for
+# THIS instance only. SSM agent is up within ~30-60s of `running`; the
+# dispatched GitHub deploy takes ~1-2 min to reach its SSM step, by which the
+# box is ready.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_event_rule" "deploy_watchdog_instance_start" {
+  name        = "tv-${var.environment}-deploy-watchdog-instance-start"
+  description = "Instant deploy when the tv-app EC2 instance enters 'running' (08:00 auto-start)"
+  event_pattern = jsonencode({
+    source        = ["aws.ec2"]
+    "detail-type" = ["EC2 Instance State-change Notification"]
+    detail = {
+      state         = ["running"]
+      "instance-id" = [aws_instance.tv_app.id]
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_target" "deploy_watchdog_instance_start" {
+  rule      = aws_cloudwatch_event_rule.deploy_watchdog_instance_start.name
+  target_id = "deploy-watchdog-instance-start"
+  arn       = aws_lambda_function.deploy_watchdog.arn
+  input     = jsonencode({ window = "instance-start" })
+}
+
+resource "aws_lambda_permission" "deploy_watchdog_instance_start" {
+  statement_id  = "AllowExecutionFromEventBridgeInstanceStart"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.deploy_watchdog.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.deploy_watchdog_instance_start.arn
+}
+
 output "deploy_watchdog_function_name" {
   description = "Deploy-watchdog Lambda name (covers GitHub-cron auto-deploy misses)"
   value       = aws_lambda_function.deploy_watchdog.function_name
