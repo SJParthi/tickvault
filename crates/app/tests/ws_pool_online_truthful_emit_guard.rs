@@ -34,6 +34,7 @@ fn pool_online_message_for_fully_connected_pool_says_live() {
         ],
         boot_path: BootPathLabel::Slow,
         boot_wall_clock_secs: 11.2,
+        last_real_tick_age_secs: Some(3),
     };
     let msg = event.to_message();
     assert!(
@@ -110,6 +111,7 @@ fn pool_online_severity_is_low_partial_is_high() {
         per_connection: vec![(5_000, 5_000, Some(1)); 5],
         boot_path: BootPathLabel::Slow,
         boot_wall_clock_secs: 10.0,
+        last_real_tick_age_secs: Some(1),
     };
     let partial = NotificationEvent::WebSocketPoolPartialAfterDeadline {
         connected: 0,
@@ -170,4 +172,44 @@ fn boot_path_label_human_strings_are_distinct() {
     assert_ne!(BootPathLabel::Slow.human(), BootPathLabel::Fast.human());
     assert!(BootPathLabel::Slow.human().contains("Normal"));
     assert!(BootPathLabel::Fast.human().contains("crash recovery"));
+}
+
+// 2026-06-02 false-OK fix: the "live and ready" pool-online message must report
+// REAL-tick freshness (not raw frame freshness, which counts Dhan keep-alive
+// pings). These ratchets pin both paths so a future edit cannot silently drop
+// the real-tick line and let "live" look green on a ping-only feed.
+#[test]
+fn pool_online_shows_real_tick_age_when_ticks_flowing() {
+    let event = NotificationEvent::WebSocketPoolOnline {
+        connected: 1,
+        total: 1,
+        per_connection: vec![(243, 5_000, Some(0))],
+        boot_path: BootPathLabel::Slow,
+        boot_wall_clock_secs: 0.9,
+        last_real_tick_age_secs: Some(2),
+    };
+    let msg = event.to_message();
+    assert!(
+        msg.contains("Real market ticks: last one 2s ago"),
+        "pool-online must report real-tick freshness when ticks are flowing; got: {msg}"
+    );
+}
+
+#[test]
+fn pool_online_warns_when_no_real_ticks_only_pings() {
+    let event = NotificationEvent::WebSocketPoolOnline {
+        connected: 1,
+        total: 1,
+        // Frame freshness Some(0) ("0s ago") would look healthy, but zero real
+        // ticks => the message MUST warn, not read green.
+        per_connection: vec![(243, 5_000, Some(0))],
+        boot_path: BootPathLabel::Slow,
+        boot_wall_clock_secs: 0.9,
+        last_real_tick_age_secs: None,
+    };
+    let msg = event.to_message();
+    assert!(
+        msg.contains("NONE captured yet") && msg.contains("keep-alive pings"),
+        "pool-online must warn (not look green) when zero real ticks captured; got: {msg}"
+    );
 }

@@ -89,6 +89,25 @@ impl TickGapDetector {
         pin.insert((security_id, segment), now);
     }
 
+    /// Age (seconds) of the MOST-RECENT real tick across ALL instruments,
+    /// or `None` if no tick has ever been recorded (map empty).
+    ///
+    /// This is the "are real market ticks actually flowing?" signal —
+    /// the map is populated ONLY from genuine parsed tick frames
+    /// (`record_tick`), never from WebSocket keep-alive pings. It exists
+    /// so operator-facing health messages can report real-tick freshness
+    /// instead of raw frame freshness (which counts pings and can read
+    /// "0s ago / healthy" while zero real ticks are captured — the
+    /// 2026-06-02 false-OK). Cold path: called once per heartbeat, NOT on
+    /// the hot loop.
+    #[must_use]
+    pub fn freshest_tick_age_secs(&self, now: Instant) -> Option<u64> {
+        let pin = self.last_seen.pin();
+        pin.iter()
+            .map(|(_, last)| now.saturating_duration_since(*last).as_secs())
+            .min()
+    }
+
     /// Returns the list of `(security_id, segment, gap_secs)` for every
     /// instrument silent ≥ `threshold_secs`. Cold path — called once
     /// per coalesce window from a background task.
@@ -457,6 +476,33 @@ mod tests {
         // The hot-path call site must NOT panic when no detector is
         // installed (test binaries that don't call set_*).
         record_tick_global(13, ExchangeSegment::IdxI, Instant::now());
+    }
+
+    #[test]
+    fn test_freshest_tick_age_secs_none_when_empty() {
+        // No ticks ever recorded => None (the "zero real ticks captured"
+        // signal that drives the live-message ping-only warning).
+        let d = TickGapDetector::new(30);
+        assert_eq!(d.freshest_tick_age_secs(Instant::now()), None);
+    }
+
+    #[test]
+    fn test_freshest_tick_age_secs_returns_most_recent_across_instruments() {
+        // Records two ticks at different ages; freshest = the smallest age.
+        let d = TickGapDetector::new(30);
+        let now = Instant::now();
+        // Older tick (10s ago) + newer tick (2s ago).
+        d.record_tick(
+            13,
+            ExchangeSegment::IdxI,
+            now - std::time::Duration::from_secs(10),
+        );
+        d.record_tick(
+            25,
+            ExchangeSegment::IdxI,
+            now - std::time::Duration::from_secs(2),
+        );
+        assert_eq!(d.freshest_tick_age_secs(now), Some(2));
     }
 
     #[test]
