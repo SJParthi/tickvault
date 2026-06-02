@@ -73,6 +73,10 @@ mod global_qcfg_tests {
 }
 
 pub mod boot_probe;
+// Operator directive 2026-06-02: post-market 1-minute cross-verification audit
+// + CSV (narrowed replacement for the deleted cross_verify.rs — 1m/spot/today
+// only). See live-feed-purity.md rule 11.
+pub mod cross_verify_1m_audit_persistence;
 // PR-E (2026-05-26): `candle_persistence` module deleted alongside the
 // `historical_candles` QuestDB table. The module had no live consumers
 // after PR-D removed candle_fetcher.rs; LiveCandleWriter had been

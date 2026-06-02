@@ -437,6 +437,24 @@ pub enum ErrorCode {
     InstrFetch04UniverseSizeOutOfBounds,
 
     // -----------------------------------------------------------------------
+    // Operator directive 2026-06-02: post-market 1-minute cross-verification.
+    // At 15:31 IST we compare every subscribed spot instrument's live
+    // candles_1m OHLCV against Dhan intraday 1-minute candles, EXACT match.
+    // Narrowed replacement for the deleted cross_verify chain (1m/spot/today).
+    // See cross-verify-1m-error-codes.md + live-feed-purity.md rule 11.
+    // -----------------------------------------------------------------------
+    /// CROSS-VERIFY-1M-01: one or more 1-minute OHLCV cells disagreed between
+    /// our `candles_1m` and Dhan intraday. Mismatches written to the
+    /// `cross_verify_1m_audit` table + CSV; the per-day count is the quality
+    /// signal. Severity::High (operator-visible; expected non-zero due to
+    /// sampled-feed vs full-tape — track the trend, not the absolute).
+    CrossVerify1m01MismatchFound,
+    /// CROSS-VERIFY-1M-02: the Dhan intraday fetch was degraded — REST errored
+    /// / rate-limited for a material fraction of spot SIDs, so the
+    /// verification could not vouch for the full universe. Severity::High.
+    CrossVerify1m02FetchDegraded,
+
+    // -----------------------------------------------------------------------
     // PR #1 (AWS-lifecycle 14-PR sequence): contract stubs for the future
     // option_chain module. Variants exist so downstream PR #8 can wire
     // its emit sites against stable identifiers. NO production emit sites
@@ -619,6 +637,9 @@ impl ErrorCode {
             Self::InstrFetch02SchemaValidationFailed => "INSTR-FETCH-02",
             Self::InstrFetch03DanglingReferences => "INSTR-FETCH-03",
             Self::InstrFetch04UniverseSizeOutOfBounds => "INSTR-FETCH-04",
+            // Operator 2026-06-02: post-market 1-minute cross-verification
+            Self::CrossVerify1m01MismatchFound => "CROSS-VERIFY-1M-01",
+            Self::CrossVerify1m02FetchDegraded => "CROSS-VERIFY-1M-02",
             // PR #1 (AWS-lifecycle): option_chain stubs
             Self::OptionChain01FetchFailed => "OPTION-CHAIN-01",
             Self::OptionChain02Dh904Exhausted => "OPTION-CHAIN-02",
@@ -695,7 +716,10 @@ impl ErrorCode {
             | Self::OptionChain02Dh904Exhausted
             | Self::OptionChain06CycleOverlapSkip
             // PR #2.5 — INDEX-OHLC-02 is High (carry-over wrong but recoverable)
-            | Self::IndexOhlc02DailyResetFailed => Severity::High,
+            | Self::IndexOhlc02DailyResetFailed
+            // Operator 2026-06-02 — post-market 1m cross-verify (both High)
+            | Self::CrossVerify1m01MismatchFound
+            | Self::CrossVerify1m02FetchDegraded => Severity::High,
             // Medium: data pipeline correctness
             // PR #6b (2026-05-19): I-P0-01/02/04/05 retired with their modules.
             Self::InstrumentP1CrossSegmentCollision
@@ -859,6 +883,10 @@ impl ErrorCode {
             | Self::InstrFetch04UniverseSizeOutOfBounds => {
                 ".claude/rules/project/daily-universe-instr-fetch-error-codes.md"
             }
+            // Operator 2026-06-02: post-market 1-minute cross-verification
+            Self::CrossVerify1m01MismatchFound | Self::CrossVerify1m02FetchDegraded => {
+                ".claude/rules/project/cross-verify-1m-error-codes.md"
+            }
             // PR #1 (AWS-lifecycle): option_chain stubs
             Self::OptionChain01FetchFailed
             | Self::OptionChain02Dh904Exhausted
@@ -994,6 +1022,9 @@ impl ErrorCode {
             Self::InstrFetch02SchemaValidationFailed,
             Self::InstrFetch03DanglingReferences,
             Self::InstrFetch04UniverseSizeOutOfBounds,
+            // Operator 2026-06-02: post-market 1-minute cross-verification
+            Self::CrossVerify1m01MismatchFound,
+            Self::CrossVerify1m02FetchDegraded,
             // PR #1 (AWS-lifecycle 14-PR sequence) — option_chain stubs
             Self::OptionChain01FetchFailed,
             Self::OptionChain02Dh904Exhausted,
@@ -1250,7 +1281,10 @@ mod tests {
         // by removing CROSS-VERIFY-01/02/03/04 — cross_verify + post_open_cross_check
         // + post_market_fetch_window + cross_verify_scheduler modules deleted
         // alongside Dhan historical fetch chain.
-        assert_eq!(ErrorCode::all().len(), 97);
+        // 2026-06-02 (operator post-market 1-minute cross-verification):
+        // bumped 97 -> 99 by adding CROSS-VERIFY-1M-01 (mismatch found) +
+        // CROSS-VERIFY-1M-02 (intraday fetch degraded).
+        assert_eq!(ErrorCode::all().len(), 99);
     }
 
     #[test]
@@ -1301,7 +1335,9 @@ mod tests {
                 // PR #2.5 (AWS-lifecycle): Day OHLC tracker for IDX_I
                 || s.starts_with("INDEX-OHLC-")
                 // Sub-PR #9 of 2026-05-27 daily-universe expansion
-                || s.starts_with("INSTR-FETCH-");
+                || s.starts_with("INSTR-FETCH-")
+                // Operator 2026-06-02: post-market 1-minute cross-verification
+                || s.starts_with("CROSS-VERIFY-1M-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
