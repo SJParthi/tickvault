@@ -114,17 +114,18 @@ fn deploy_instance_ignores_type_and_user_data_to_prevent_replace() {
 }
 
 /// Weekday-only schedule (trading days). Mon-Fri crons, not Mon-Sun.
-/// IST 08:30 start = 03:00 UTC; IST 16:30 stop = 11:00 UTC.
+/// IST 08:00 start = 02:30 UTC; IST 17:00 stop = 11:30 UTC (operator widened
+/// the window to 08:00-17:00 on 2026-06-02 for pre/post-market + deploy room).
 #[test]
 fn deploy_schedule_is_weekday_only() {
     let body = read(MAIN_TF);
     assert!(
-        body.contains("cron(0 3 ? * MON-FRI *)"),
-        "main.tf daily_start must be `cron(0 3 ? * MON-FRI *)` (08:30 IST, Mon-Fri)."
+        body.contains("cron(30 2 ? * MON-FRI *)"),
+        "main.tf daily_start must be `cron(30 2 ? * MON-FRI *)` (08:00 IST, Mon-Fri)."
     );
     assert!(
-        body.contains("cron(0 11 ? * MON-FRI *)"),
-        "main.tf daily_stop must be `cron(0 11 ? * MON-FRI *)` (16:30 IST, Mon-Fri)."
+        body.contains("cron(30 11 ? * MON-FRI *)"),
+        "main.tf daily_stop must be `cron(30 11 ? * MON-FRI *)` (17:00 IST, Mon-Fri)."
     );
     assert!(
         !body.contains("MON-SUN") && !body.contains("* * ? * * *"),
@@ -134,17 +135,22 @@ fn deploy_schedule_is_weekday_only() {
 
 /// EIP off by default (no orders for 3 months → no Dhan static-IP need).
 #[test]
-fn deploy_eip_is_disabled_by_default() {
+fn deploy_eip_is_enabled_by_default() {
     let vars = squish(&read(VARIABLES_TF));
     assert!(
         vars.contains("variable \"enable_eip\""),
         "variables.tf must declare `enable_eip`."
     );
-    // The default false must appear within the enable_eip block. We assert the
-    // bool default is present and that no `default = true` shadows it.
+    // 2026-05-31: operator flipped enable_eip default false -> true. The manual
+    // t4g -> m8g.large upgrade left the ENI with auto-assign-public-IP OFF, so
+    // the box had NO public IP / no internet path (SSM showed 0 managed nodes,
+    // deploy InvalidInstanceId) until an EIP was attached. EIP is now mandatory.
+    // This guard was previously asserting `default = false` (stale) — updated to
+    // match the operator-approved reality.
     assert!(
-        vars.contains("type = bool default = false"),
-        "enable_eip must default to false (no orders 3mo → no EIP → ~₹430/mo saved)."
+        vars.contains("type = bool default = true"),
+        "enable_eip must default to true (operator 2026-05-31 — EIP mandatory; \
+         without it the box has no public IP / no SSM / no Dhan path)."
     );
     let main = squish(&code_only(&read(MAIN_TF)));
     assert!(
