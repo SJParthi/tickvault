@@ -920,6 +920,26 @@ fn test_deploy_watchdog_lambda_is_wired() {
         tf.contains("aws_sns_topic.tv_alerts.arn"),
         "deploy-watchdog must be able to page the operator via the tv_alerts SNS topic"
     );
+    // INSTANT deploy on instance start (operator directive 2026-06-02): an
+    // EC2 state-change event rule fires the watchdog the moment the box enters
+    // `running`, so the latest main deploys right after the 08:00 auto-start —
+    // not at the 08:45 cron. This is the PRIMARY morning deploy trigger.
+    assert!(
+        tf.contains("EC2 Instance State-change Notification") && tf.contains("\"running\""),
+        "deploy-watchdog must have an EventBridge event-pattern rule that fires \
+         on the tv-app EC2 instance entering 'running' — the instant-deploy-on-start \
+         trigger (operator directive 2026-06-02)."
+    );
+    assert!(
+        tf.contains("aws_instance.tv_app.id"),
+        "the instance-start rule must scope to THIS instance (aws_instance.tv_app.id), \
+         not fire on every EC2 in the account."
+    );
+    assert!(
+        tf.contains("window = \"instance-start\""),
+        "the instance-start target must pass window=\"instance-start\" so the handler \
+         logs/labels the instant trigger distinctly."
+    );
 }
 
 #[test]

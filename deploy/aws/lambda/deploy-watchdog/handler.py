@@ -7,11 +7,16 @@ would leave the box running STALE code with no signal. aws-autopilot mitigates
 some of this, but it too runs on GitHub.
 
 This Lambda is the belt-and-suspenders: it runs IN AWS (EventBridge -> Lambda),
-so it covers GitHub-cron misses even when GitHub Actions is degraded. Two
-EventBridge schedules fire it a few minutes AFTER the GitHub cron:
+so it covers GitHub-cron misses even when GitHub Actions is degraded. Three
+EventBridge triggers fire it:
 
-  * 08:50 IST (03:20 UTC Mon-Fri) — 5 min after the 08:45 pre-market cron.
-  * 15:36 IST (10:06 UTC Mon-Fri) — 5 min after the 15:31 post-market cron.
+  * INSTANT (event-pattern): the moment the tv-app EC2 instance enters the
+    `running` state — i.e. right after the 08:00 IST auto-start. This is the
+    PRIMARY morning deploy trigger (operator directive 2026-06-02: "auto
+    deployment should happen instantly when the instance is started"). Latest
+    `main` is deployed within ~1-2 min of 08:00, not at the 08:45 cron.
+  * 08:50 IST (03:20 UTC Mon-Fri) — backup, 5 min after the 08:45 pre-market cron.
+  * 15:36 IST (10:06 UTC Mon-Fri) — backup, 5 min after the 15:31 post-market cron.
 
 On each fire it answers ONE question, using GitHub as the source of truth (the
 same idempotency signal `deploy-aws-after-close.yml` itself uses):
