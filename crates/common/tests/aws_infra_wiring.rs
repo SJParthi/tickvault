@@ -834,3 +834,46 @@ fn test_systemd_unit_restart_policy() {
         "systemd unit must send SIGTERM (graceful shutdown handler)"
     );
 }
+
+#[test]
+fn test_start_watchdog_lambda_monitors_the_morning_start() {
+    // 2026-06-02: AWS-native watchdog that answers "who monitors the 08:00
+    // start?". A ping Lambda at 08:00 IST + a check Lambda at 08:15 IST that
+    // pages if the box did not come up. Runs IN AWS (not on a GitHub runner),
+    // so it alerts even if GitHub Actions is down — the gap that hid the
+    // 2026-06-02 silent start failure.
+    require_file_exists(
+        "deploy/aws/lambda/start-watchdog/handler.py",
+        "start-watchdog Lambda handler (ping + check)",
+    );
+    require_file_exists(
+        "deploy/aws/terraform/start-watchdog-lambda.tf",
+        "start-watchdog Lambda terraform (IAM + 2 EventBridge schedules)",
+    );
+    let tf = std::fs::read_to_string(
+        workspace_root().join("deploy/aws/terraform/start-watchdog-lambda.tf"),
+    )
+    .expect("start-watchdog-lambda.tf must be readable"); // APPROVED: test
+    // Ping at 08:00 IST (02:30 UTC) + check at 08:15 IST (02:45 UTC), weekdays.
+    assert!(
+        tf.contains("cron(30 2 ? * MON-FRI *)"),
+        "ping schedule must be 02:30 UTC Mon-Fri (08:00 IST)"
+    );
+    assert!(
+        tf.contains("cron(45 2 ? * MON-FRI *)"),
+        "check schedule must be 02:45 UTC Mon-Fri (08:15 IST)"
+    );
+    // Least-privilege: describe EC2 + publish to the alerts topic.
+    assert!(
+        tf.contains("ec2:DescribeInstances") && tf.contains("aws_sns_topic.tv_alerts.arn"),
+        "watchdog Lambda must describe EC2 + publish to tv_alerts"
+    );
+    let py = std::fs::read_to_string(
+        workspace_root().join("deploy/aws/lambda/start-watchdog/handler.py"),
+    )
+    .expect("handler.py must be readable"); // APPROVED: test
+    assert!(
+        py.contains("describe_instances") && py.contains("\"running\""),
+        "handler must check the instance is running"
+    );
+}
