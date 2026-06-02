@@ -301,11 +301,12 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           set -uo pipefail
-          # Up-window = 08:30-16:30 IST Mon-Fri (the EventBridge schedule window).
+          # Up-window = 08:00-17:00 IST Mon-Fri (the EventBridge schedule window;
+          # widened from 08:30-16:30 on 2026-06-02 per operator).
           DOW=$(TZ='Asia/Kolkata' date +%u)            # 1=Mon..7=Sun
           HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM))
           UP_WINDOW=no
-          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 830 ] && [ "$HHMM" -le 1630 ]; then UP_WINDOW=yes; fi
+          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 800 ] && [ "$HHMM" -le 1700 ]; then UP_WINDOW=yes; fi
           # A manual run or the after-close cron dispatch (workflow_dispatch)
           # always intends the box up — self-start regardless of clock.
           SHOULD_BE_UP=no

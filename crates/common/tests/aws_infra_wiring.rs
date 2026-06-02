@@ -226,27 +226,29 @@ fn test_terraform_instance_iam_allows_staging_ssm_prefix() {
 fn test_terraform_eventbridge_schedules_match_budget() {
     let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
         .expect("main.tf must be readable"); // APPROVED: test
-    // Weekday start: 08:30 IST = 03:00 UTC Mon-Fri (operator-lock 2026-05-29,
-    // daily-universe-scope-expansion-2026-05-27.md §7 Quote 5 — trading
-    // weekdays only, 08:30-16:30 IST; SUPERSEDES the 2026-05-18 7-day cron).
+    // Weekday start: 08:00 IST = 02:30 UTC Mon-Fri (operator widened the
+    // window to 08:00-17:00 on 2026-06-02 — "make it as 8 am till 5 pm … so
+    // pre-market and post-market and deployment … can run without worries";
+    // supersedes the 2026-05-29 08:30-16:30 lock §7).
     assert!(
-        content.contains("cron(0 3 ? * MON-FRI *)"),
-        "main.tf missing weekday start schedule (03:00 UTC Mon-Fri = 08:30 IST)"
+        content.contains("cron(30 2 ? * MON-FRI *)"),
+        "main.tf missing weekday start schedule (02:30 UTC Mon-Fri = 08:00 IST)"
     );
-    // Weekday stop: 16:30 IST = 11:00 UTC Mon-Fri.
+    // Weekday stop: 17:00 IST = 11:30 UTC Mon-Fri.
     assert!(
-        content.contains("cron(0 11 ? * MON-FRI *)"),
-        "main.tf missing weekday stop schedule (11:00 UTC Mon-Fri = 16:30 IST)"
+        content.contains("cron(30 11 ? * MON-FRI *)"),
+        "main.tf missing weekday stop schedule (11:30 UTC Mon-Fri = 17:00 IST)"
     );
-    // Negative asserts — the prior 7-day daily crons (02:30/11:30 UTC every
-    // day) were replaced by the weekday-only pair per operator lock 2026-05-29.
+    // Negative asserts — the prior 7-day daily crons (every day, no MON-FRI
+    // restriction) must NOT return. The weekday-only `? * MON-FRI` form is
+    // distinct from the retired 7-day `* * ?` form.
     assert!(
         !content.contains("cron(30 2 * * ? *)"),
-        "7-day daily start cron retired in operator-lock 2026-05-29 (weekday-only now)"
+        "7-day daily start cron retired (weekday-only now)"
     );
     assert!(
         !content.contains("cron(30 11 * * ? *)"),
-        "7-day daily stop cron retired in operator-lock 2026-05-29 (weekday-only now)"
+        "7-day daily stop cron retired (weekday-only now)"
     );
 }
 
@@ -558,8 +560,8 @@ fn test_aws_autopilot_selfheal_workflow_exists() {
          08:30 EventBridge start is not rescued until 09:00 (2026-06-02 incident)"
     );
     assert!(
-        sh.contains("830") && sh.contains("1630"),
-        "is_box_up_window must encode the 08:30-16:30 IST bounds (830/1630)"
+        sh.contains("800") && sh.contains("1700"),
+        "is_box_up_window must encode the 08:00-17:00 IST bounds (800/1700)"
     );
     // 2026-06-02 diagnostic (the 'A' fix): when the box is stopped during the
     // up-window, autopilot must report WHY the EventBridge auto-start failed

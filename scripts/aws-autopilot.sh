@@ -66,7 +66,7 @@ is_market_window() {
   [ "$dow" -le 5 ] && [ "$t" -ge 900 ] && [ "$t" -le 1535 ]
 }
 
-# --- up-window (IST) helper: is now within 08:30-16:30 IST Mon-Fri? ----------
+# --- up-window (IST) helper: is now within 08:00-17:00 IST Mon-Fri? ----------
 # This is the EventBridge START/STOP schedule window — the box is SUPPOSED to
 # be running for the WHOLE of it, not just market hours (09:15-15:30). The
 # pre-market gap (08:30-09:00) is when the daily universe is fetched + the WS
@@ -79,7 +79,7 @@ is_box_up_window() {
   h=$(TZ='Asia/Kolkata' date +%H); m=$(TZ='Asia/Kolkata' date +%M)
   dow=$(TZ='Asia/Kolkata' date +%u)   # 1=Mon..7=Sun
   t=$((10#$h * 100 + 10#$m))
-  [ "$dow" -le 5 ] && [ "$t" -ge 830 ] && [ "$t" -le 1630 ]
+  [ "$dow" -le 5 ] && [ "$t" -ge 800 ] && [ "$t" -le 1700 ]
 }
 
 # --- diagnostic: is the EventBridge daily-start rule healthy? ----------------
