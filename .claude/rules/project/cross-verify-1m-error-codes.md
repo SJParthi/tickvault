@@ -19,7 +19,7 @@ alone … for all those subscribed spot instruments."* — and the follow-up: *"
 and exact match cross verification is needed."*
 
 At **15:31 IST** each trading day, for every subscribed **spot** instrument (the
-~250 daily-universe SIDs — indices + F&O underlyings), we fetch Dhan's
+243 daily-universe SIDs — indices + F&O underlyings), we fetch Dhan's
 authoritative **intraday 1-minute** candles (`POST /v2/charts/intraday`, interval
 `"1"`) and compare OHLCV **timestamp-by-timestamp**, **EXACT match**, against our
 live `candles_1m`. Mismatches go to:
@@ -77,7 +77,7 @@ report a clean "all match" on an empty/partial compare set).
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — look for `CROSS-VERIFY-1M-02` and the
    per-symbol fetch failure reasons.
-2. Check Dhan Data-API health + our rate budget (5/sec, 100k/day). ~250 calls is
+2. Check Dhan Data-API health + our rate budget (5/sec, 100k/day). 243 calls is
    well inside budget, so sustained failure points at Dhan-side or network.
 3. The 15:31 run is best-effort and never blocks; next trading day re-runs.
 
