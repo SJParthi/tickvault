@@ -56,53 +56,16 @@ fn read_repo_file(rel: &str) -> String {
 // Source-scan ratchets (1, 2, 3, 7)
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_depth_20_post_close_sleeps_until_next_open() {
-    // Source-scan ratchet: the depth-20 reconnect loop in
-    // `depth_connection.rs::run_twenty_depth_connection` MUST invoke
-    // `depth_post_close_sleep_or_exhaust` with feed label `"depth_20"`
-    // (NOT `"depth20"` — the underscore is required for consistency
-    // with the typed `WebSocketSleepEntered { feed }` field used by
-    // Telegram routing).
-    let src = read_repo_file("crates/core/src/websocket/depth_connection.rs");
-    assert!(
-        src.contains("depth_post_close_sleep_or_exhaust(\n                        \"depth_20\",")
-            || src.contains("depth_post_close_sleep_or_exhaust(\"depth_20\""),
-        "depth-20 reconnect path MUST call depth_post_close_sleep_or_exhaust(\"depth_20\", ...)"
-    );
-    // Helper itself MUST emit the WS-GAP-04 code on entering sleep.
-    assert!(
-        src.contains("ErrorCode::WsGap04PostCloseSleep"),
-        "depth helper MUST tag WS-GAP-04 code on post-close sleep"
-    );
-    // Helper MUST emit WebSocketSleepEntered AND WebSocketSleepResumed.
-    assert!(
-        src.contains("WebSocketSleepEntered"),
-        "depth helper MUST emit WebSocketSleepEntered Telegram event"
-    );
-    assert!(
-        src.contains("WebSocketSleepResumed"),
-        "depth helper MUST emit WebSocketSleepResumed Telegram event"
-    );
-    // Helper MUST proactively renew a stale token before resuming.
-    assert!(
-        src.contains("force_renewal_if_stale(14_400)"),
-        "depth helper MUST call force_renewal_if_stale(14_400) before reconnect"
-    );
-}
-
-#[test]
-fn test_depth_200_post_close_sleeps_until_next_open() {
-    // Source-scan ratchet: the depth-200 reconnect loop in
-    // `depth_connection.rs::run_two_hundred_depth_connection` MUST
-    // invoke the same helper with feed label `"depth_200"`.
-    let src = read_repo_file("crates/core/src/websocket/depth_connection.rs");
-    assert!(
-        src.contains("depth_post_close_sleep_or_exhaust(\n                        \"depth_200\",")
-            || src.contains("depth_post_close_sleep_or_exhaust(\"depth_200\""),
-        "depth-200 reconnect path MUST call depth_post_close_sleep_or_exhaust(\"depth_200\", ...)"
-    );
-}
+// REMOVED 2026-06-02 (CI rot fix): the depth-20 / depth-200 post-close
+// source-scan ratchets. The depth WebSocket modules
+// (`crates/core/src/websocket/depth_connection.rs`,
+// `run_twenty_depth_connection`, `run_two_hundred_depth_connection`) were
+// DELETED in the AWS-lifecycle PR #4 — only the main-feed + order-update
+// WebSockets remain forever per
+// `.claude/rules/project/websocket-connection-scope-lock.md`. The two
+// source-scan tests below read a file that no longer exists and so panicked.
+// The order-update post-close ratchet (which guards the SAME shared helper
+// pattern on the surviving feed) is retained below.
 
 #[test]
 fn test_order_update_post_close_sleeps_until_next_open() {

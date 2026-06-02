@@ -434,56 +434,18 @@ fn make_golden_market_depth() -> Vec<u8> {
 }
 
 #[test]
-fn golden_market_depth_round_trip_exact() {
+fn golden_market_depth_code3_is_rejected_in_v2() {
+    // Retired v1 response code 3 (market depth). In Dhan v2 this packet
+    // type is replaced by the Full packet (code 8); `dispatch_frame` now
+    // REJECTS code 3 with `ParseError::UnknownResponseCode(3)` rather than
+    // parsing it into a `TickWithDepth`. The golden builder still produces a
+    // well-formed v1 frame; the v2 contract is that dispatch refuses it.
     let packet = make_golden_market_depth();
-    let parsed = dispatch_frame(&packet, 555).unwrap();
-
-    match parsed {
-        ParsedFrame::TickWithDepth(tick, depth) => {
-            // Tick: only LTP populated (no timestamp, volume, OHLC, OI)
-            assert_eq!(tick.security_id, 2885);
-            assert_eq!(tick.exchange_segment_code, EXCHANGE_SEGMENT_NSE_FNO);
-            assert_eq!(tick.last_traded_price, 2450.75);
-            assert_eq!(tick.received_at_nanos, 555);
-            // Market Depth has no timestamp, volume, OHLC, OI
-            assert_eq!(tick.exchange_timestamp, 0);
-            assert_eq!(tick.volume, 0);
-            assert_eq!(tick.open_interest, 0);
-            assert_eq!(tick.average_traded_price, 0.0);
-            assert_eq!(tick.day_open, 0.0);
-            assert_eq!(tick.day_high, 0.0);
-            assert_eq!(tick.day_low, 0.0);
-            assert_eq!(tick.day_close, 0.0);
-
-            // Depth level 0 (best)
-            assert_eq!(depth.len(), 5);
-            assert_eq!(depth[0].bid_quantity, 5000);
-            assert_eq!(depth[0].ask_quantity, 3000);
-            assert_eq!(depth[0].bid_orders, 25);
-            assert_eq!(depth[0].ask_orders, 18);
-            assert_eq!(depth[0].bid_price, 2450.50);
-            assert_eq!(depth[0].ask_price, 2451.00);
-
-            // Depth level 1
-            assert_eq!(depth[1].bid_quantity, 4000);
-            assert_eq!(depth[1].ask_quantity, 2500);
-            assert_eq!(depth[1].bid_orders, 20);
-            assert_eq!(depth[1].ask_orders, 14);
-            assert_eq!(depth[1].bid_price, 2450.25);
-            assert_eq!(depth[1].ask_price, 2451.25);
-
-            // Levels 2-4 zero (not populated)
-            for level in &depth[2..] {
-                assert_eq!(level.bid_quantity, 0);
-                assert_eq!(level.ask_quantity, 0);
-                assert_eq!(level.bid_orders, 0);
-                assert_eq!(level.ask_orders, 0);
-                assert_eq!(level.bid_price, 0.0);
-                assert_eq!(level.ask_price, 0.0);
-            }
-        }
-        other => panic!("expected TickWithDepth variant, got: {other:?}"),
-    }
+    let result = dispatch_frame(&packet, 555);
+    assert!(
+        result.is_err(),
+        "retired v1 market-depth code 3 must be rejected in v2, not parsed: {result:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

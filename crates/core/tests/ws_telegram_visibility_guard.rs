@@ -146,30 +146,13 @@ fn main_feed_wires_notify_on_disconnect_and_reconnect() {
     );
 }
 
-#[test]
-fn depth_20_connection_fires_reconnect_notify() {
-    let src = read("crates/core/src/websocket/depth_connection.rs");
-    assert!(
-        src.contains("DepthTwentyReconnected"),
-        "depth_connection.rs must emit DepthTwentyReconnected inside \
-         run_twenty_depth_connection on every successful reconnect."
-    );
-    assert!(
-        src.contains("failures_before_attempt > 0"),
-        "depth_connection.rs must guard the reconnect emission on \
-         failures_before_attempt > 0 so fresh-boot does NOT fire."
-    );
-}
-
-#[test]
-fn depth_200_connection_fires_reconnect_notify() {
-    let src = read("crates/core/src/websocket/depth_connection.rs");
-    assert!(
-        src.contains("DepthTwoHundredReconnected"),
-        "depth_connection.rs must emit DepthTwoHundredReconnected inside \
-         run_two_hundred_depth_connection on every successful reconnect."
-    );
-}
+// REMOVED 2026-06-02 (CI rot fix): depth_20 / depth_200 reconnect-notify
+// source-scan ratchets. The depth WebSocket module
+// (`crates/core/src/websocket/depth_connection.rs`) was DELETED in
+// AWS-lifecycle PR #4 — only the main-feed + order-update WebSockets remain
+// per `.claude/rules/project/websocket-connection-scope-lock.md`. Both tests
+// read a file that no longer exists. The main-feed + order-update
+// reconnect-notify ratchets are retained.
 
 #[test]
 fn order_update_connection_fires_reconnect_notify() {
@@ -194,29 +177,21 @@ fn order_update_connection_fires_reconnect_notify() {
 }
 
 // ---------------------------------------------------------------------------
-// (3) Main.rs wires reconnect_notifier into all 3 connection functions
+// (3) Main.rs wires reconnect_notifier into the surviving connection functions
+//     (main-feed + order-update — the only 2 WS types per the scope lock).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn main_rs_passes_reconnect_notifier_to_all_three_connection_functions() {
+fn main_rs_passes_reconnect_notifier_to_order_update_call_sites() {
+    // Updated 2026-06-02 (CI rot fix): depth-20 / depth-200 were deleted in
+    // AWS-lifecycle PR #4, so the former "all 3 connection functions" is now
+    // the order-update connection (fast + slow boot call sites). Order-update
+    // has two call sites; both must pass a reconnect notifier.
     let src = read("crates/app/src/main.rs");
     assert!(
-        src.contains("d20_reconnect_notifier"),
-        "main.rs must construct + pass d20_reconnect_notifier into \
-         run_twenty_depth_connection."
-    );
-    assert!(
-        src.contains("d200_reconnect_notifier"),
-        "main.rs must construct + pass d200_reconnect_notifier into \
-         run_two_hundred_depth_connection."
-    );
-    // Order-update has two call sites (fast + slow boot paths); both
-    // must pass a reconnect notifier.
-    assert!(
-        src.matches("reconnect_notifier").count() >= 3,
-        "main.rs must pass a reconnect notifier into every call site of the \
-         3 depth / order-update connection functions (depth-20, depth-200, \
-         order-update fast boot, order-update slow boot)."
+        src.matches("reconnect_notifier").count() >= 2,
+        "main.rs must pass a reconnect notifier into every order-update \
+         connection call site (fast boot + slow boot)."
     );
 }
 
@@ -224,16 +199,9 @@ fn main_rs_passes_reconnect_notifier_to_all_three_connection_functions() {
 // (4) Fast first-retry latency on all 4 WS types
 // ---------------------------------------------------------------------------
 
-#[test]
-fn depth_first_retry_is_at_most_500ms() {
-    let src = read("crates/core/src/websocket/depth_connection.rs");
-    assert!(
-        src.contains("const DEPTH_RECONNECT_INITIAL_MS: u64 = 500;"),
-        "DEPTH_RECONNECT_INITIAL_MS must be exactly 500ms for uniform fast \
-         first-retry parity with the main feed. Regression reinstates the \
-         slower 1000ms first-retry latency."
-    );
-}
+// REMOVED 2026-06-02 (CI rot fix): depth_first_retry_is_at_most_500ms — the
+// depth WebSocket module was deleted in AWS-lifecycle PR #4. The main-feed +
+// order-update first-retry latency ratchets are retained.
 
 #[test]
 fn order_update_first_retry_is_at_most_500ms() {
