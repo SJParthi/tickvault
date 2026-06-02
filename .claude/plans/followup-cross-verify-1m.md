@@ -8,7 +8,7 @@
 
 ## Scope (locked by operator)
 - **When:** 15:31 IST onwards (post-close), once per trading day, cold path.
-- **What:** for every subscribed **spot** instrument (the ~250 daily-universe SIDs — indices + F&O underlyings), fetch Dhan **intraday 1-minute** candles (REST `/v2/charts/intraday`, interval `"1"`) and compare OHLCV **timestamp-by-timestamp** against our `candles_1m`.
+- **What:** for every subscribed **spot** instrument (the 243 daily-universe SIDs — indices + F&O underlyings), fetch Dhan **intraday 1-minute** candles (REST `/v2/charts/intraday`, interval `"1"`) and compare OHLCV **timestamp-by-timestamp** against our `candles_1m`.
 - **Only 1m.** No other timeframe.
 - **Output:** mismatches written to an easily-accessible, trackable artefact — **CSV/Excel file** + a QuestDB audit table (`cross_verify_1m_audit`) + a per-day **mismatch count** + Telegram summary.
 - Pre-market finalized close → 09:15 open is ALREADY done (separate, untouched).
@@ -28,10 +28,10 @@
 |---|---|
 | ✅ **Pro — correctness proof** | Daily, automated, exact-match evidence that our live 1m candles match NSE's authoritative tape (the very gap seen on the NIFTY chart). Trackable mismatch count over time = a quality SLI. |
 | ✅ **Pro — auditable artefact** | CSV/Excel + QuestDB table + Telegram. Open the CSV in Excel, sort by mismatch, see exactly which SID/minute/field drifted. SEBI-friendly trail. |
-| ✅ **Pro — O(1) compare** | HashMap keyed `(sid, segment, minute_ts)` → O(1) per-minute lookup; O(N) total over the day (~375 min × 250 SIDs). Cold path, off the live hot path — zero trading-latency impact. |
+| ✅ **Pro — O(1) compare** | HashMap keyed `(sid, segment, minute_ts)` → O(1) per-minute lookup; O(N) total over the day (~375 min × 243 SIDs). Cold path, off the live hot path — zero trading-latency impact. |
 | ✅ **Pro — bounded & fail-soft** | Today-only, 1m-only, spot-only; a symbol Dhan can't return is skipped + logged; never blocks. |
 | ⚠️ **Con — expected non-zero mismatches** | Our live feed is **sampled** (2–4 ticks/sec) vs Dhan's full tape, so H/L especially WILL differ on some minutes. Zero-tolerance flags these. **Mitigation:** track the trend — a stable baseline = sampling noise; a sudden spike = real problem. (Optional tolerance band later, operator's call.) |
-| ⚠️ **Con — Dhan Data-API quota** | ~250 intraday calls/day at 5/sec ≈ 50s of calls. Well inside the 100k/day Data-API budget. |
+| ⚠️ **Con — Dhan Data-API quota** | 243 intraday calls/day at 5/sec ≈ 50s of calls. Well inside the 100k/day Data-API budget. |
 | ⚠️ **Con — re-adds a deleted surface** | `cross_verify.rs` was deleted 2026-05-26. This is a NARROWER replacement (1m-only, spot-only, today-only). Needs `live-feed-purity.md` carve-out extended so the banned-pattern scanner doesn't reject it. |
 | ❌ **Missing (deferred)** | Excel `.xlsx` (vs `.csv`) needs a crate dep (`rust_xlsxwriter`) → Parthiban version-pin approval. Start with CSV (Excel opens it natively); add `.xlsx` only if formatting/colours wanted. |
 | ❌ **Missing (deferred)** | Per-field tolerance bands (e.g., ignore ±0.05 on H/L) — start exact, tune later. |
@@ -40,4 +40,4 @@
 ## Open question for operator (before implementation)
 1. **CSV now, Excel later?** (CSV opens in Excel natively; `.xlsx` needs a new pinned dep → your approval.)
 2. **Exact-match or tolerance band?** (Recommend exact first + track the count; the count itself tells you if it's noise or a real break.)
-3. **All ~250 spot SIDs, or indices-only to start?** (Operator said "all subscribed spot instruments" → all 250.)
+3. **All 243 spot SIDs, or indices-only to start?** (Operator said "all subscribed spot instruments" → all 243. RESOLVED.)
