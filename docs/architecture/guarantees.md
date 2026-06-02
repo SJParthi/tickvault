@@ -22,7 +22,7 @@ where the answer is "trust me".
 
 | Claim | Proof file | Test name |
 |---|---|---|
-| Every `error!` reaches Telegram within ~15s | `deploy/docker/prometheus/rules/tickvault-alerts.yml` + `crates/core/src/notification/service.rs` | `resilience_sla_alert_guard` |
+| Every `error!` reaches Telegram (Loki→ERROR routing) + CloudWatch alarms→SNS 4-channel fan-out | `crates/core/src/notification/service.rs` + `deploy/aws/terraform/app-alarms.tf` | `crates/common/tests/cloudwatch_app_alarms_wiring.rs` (the Prometheus `tickvault-alerts.yml` + `resilience_sla_alert_guard` cited here previously were retired #O2/#O3) |
 | No flush/drain/persist failure is silenced as WARN | `crates/storage/tests/error_level_meta_guard.rs` | `flush_persist_broadcast_failures_must_use_error_level` |
 | 54 error codes, every one documented in a rule file | `crates/common/src/error_code.rs` | `every_error_code_variant_appears_in_a_rule_file` |
 | Every rule-file code has an ErrorCode variant | `crates/common/tests/error_code_rule_file_crossref.rs` | `every_rule_file_code_has_an_enum_variant` |
@@ -38,27 +38,35 @@ where the answer is "trust me".
 Physics limit: we cannot force Dhan's servers to stay connected.
 But we CAN mechanically guarantee:
 
+> **2026-06-02 accuracy fix:** the prior rows here cited Prometheus rule
+> file `tickvault-alerts.yml` + `resilience_sla_alert_guard` — both were
+> DELETED in the CloudWatch-only migration (#O2/#O3). The real proof is now
+> the CloudWatch alarm stack in `deploy/aws/terraform/app-alarms.tf`,
+> ratcheted by `crates/common/tests/cloudwatch_app_alarms_wiring.rs`
+> (3-way EMF↔alarm↔Rust-emit wiring check).
+
 | Claim | Proof file | Test name |
 |---|---|---|
-| Prometheus alert fires when `tv_ticks_dropped_total > 0` | `deploy/docker/prometheus/rules/tickvault-alerts.yml` | `prometheus_alert_rule_ticks_dropped_exists` |
-| Alert fires when ring buffer active | same yaml | `prometheus_alert_rule_tick_buffer_active_exists` |
-| Alert fires when disk spill active | same yaml | `prometheus_alert_rule_tick_disk_spill_active_exists` |
-| Catch-all data-loss alert exists | same yaml | `prometheus_alert_rule_tick_data_loss_exists` |
-| `ticks_dropped_total` counter field still emitted from storage | `crates/storage/src/tick_persistence.rs` | `tick_persistence_emits_dropped_counter_field` |
-| `TICK_BUFFER_CAPACITY >= 100,000` (absorbs market bursts) | `crates/common/src/constants.rs` | `tick_persistence_buffer_capacity_is_at_least_one_lakh` |
-| 30s QuestDB outage drops zero ticks | `crates/storage/tests/chaos_zero_tick_loss.rs` | `chaos_questdb_outage_30s_loses_zero_ticks` (`#[ignore]` — run manually) |
-| 60s outage triggers spill but zero drops | same | `chaos_prolonged_outage_60s_triggers_disk_spill` (`#[ignore]`) |
-| WS/QuestDB/Valkey SLA alerts all wired | `crates/storage/tests/resilience_sla_alert_guard.rs` | `every_resilience_sla_alert_is_pinned` |
-| Every SLA alert has a severity label | same | `every_resilience_alert_has_severity_label` |
-| QuestDB liveness gauge emitted somewhere in storage | same | `tick_persistence_emits_questdb_connection_gauge` |
+| CloudWatch alarm fires when `tv_ticks_dropped_total > 0` (the FINAL irrecoverable tick-loss breach — added #989) | `deploy/aws/terraform/app-alarms.tf` (`tv-${env}-ticks-dropped`) | `crates/common/tests/cloudwatch_app_alarms_wiring.rs::test_app_alarms_count_is_thirteen` |
+| Alarm fires when disk spill is dropping (`tv_spill_dropped_total`) | same tf (`tv-${env}-spill-dropped`) | same guard (every alarm metric has a Rust emit-site) |
+| Alarm fires when DLQ catches ticks (`tv_dlq_ticks_total`) | same tf (`tv-${env}-dlq-ticks`) | same guard |
+| Every alarm metric is published by the CW agent (EMF filter) | `deploy/aws/terraform/user-data.sh.tftpl` | `cloudwatch_app_alarms_wiring.rs::test_every_alarm_metric_is_in_emf_filter_list` |
+| Every alarm metric has a real Rust emit-site (no dead alarms) | crates/ (`counter!`/`gauge!`) | `cloudwatch_app_alarms_wiring.rs::test_every_alarm_metric_has_a_rust_emit_site` |
+| `ticks_dropped_total` counter field still emitted from storage | `crates/storage/src/tick_persistence.rs` | `crates/storage/tests/zero_tick_loss_alert_guard.rs` |
+| `TICK_BUFFER_CAPACITY >= 100,000` (absorbs market bursts) | `crates/common/src/constants.rs` | `zero_tick_loss_alert_guard.rs` |
+| QuestDB outage drops zero ticks (disconnected writer) | `crates/storage/tests/chaos_questdb_full_session.rs` | `chaos_questdb_full_session_zero_tick_loss` (run 2026-06-02: 0 lost) |
+| Disk-full → DLQ NDJSON catches every tick | `crates/storage/tests/chaos_disk_full.rs` | `chaos_disk_full_triggers_dlq` (`#[ignore]` — run 2026-06-02: 0 lost) |
+| SIGKILL mid-batch → spill replay loses zero ticks | `crates/storage/tests/chaos_sigkill_replay.rs` | `chaos_sigkill_spill_replay_zero_loss` (`#[ignore]` — run 2026-06-02: 0 lost) |
+| Spill ring saturation (50 churn cycles) — no leak, no panic | `crates/storage/tests/chaos_ws_frame_spill_saturation.rs` | `chaos_rapid_spill_churn_50_cycles_no_leak_no_panic` |
+| WAL is fail-closed at boot (no silent-loss degraded mode) | `crates/app/src/main.rs` | `crates/core/tests/phase2_7_perf_and_correctness_fixes.rs::test_regression_ws_frame_wal_init_is_fail_closed` |
 
 ## Tier 3 — O(1) hot-path + zero-allocation
 
 | Claim | Proof file | Test name |
 |---|---|---|
 | Tick parse ≤ 10 ns (p99) | `quality/benchmark-budgets.toml` + Criterion benches | bench gate via `scripts/bench-gate.sh` |
-| Pipeline routing ≤ 100 ns per tick | same | same |
-| papaya registry lookup ≤ 50 ns | same | same |
+| Pipeline routing ≤ 100 ns per tick (gate now divides batch median by element count — honest per-tick, fixed #992; measured 2026-06-02: 4.7 ns/tick) | same + `quality/benchmark-budgets.toml` `[elements]` | `crates/common/tests/bench_budget_elements_guard.rs` |
+| papaya registry lookup ≤ 50 ns (measured 2026-06-02: 10.6 ns, hit≈miss → true O(1)) | same | bench gate |
 | OMS state transition ≤ 100 ns | same | same |
 | Zero heap alloc per tick | `crates/core/tests/dhat_allocation.rs` | DHAT harness, fails CI on non-zero alloc |
 | 5% benchmark regression = build fail | `quality/benchmark-budgets.toml` | bench-gate CI stage |
@@ -169,6 +177,19 @@ Physics / economics limits. These claims are **replaced by SLAs**:
 | "No future bugs" | 0 known bugs at HEAD + every seen pattern = CI block | every guard above |
 | "100% of all possible scenarios" | Every enumerated scenario + fuzz + mutation | weekly fuzz / mutation CI |
 | "Auto-resolve every incident" | Known-signature → auto-fix; novel → escalate with context | triage hook + YAML rules |
+
+## Tier 11 — Session 2026-06-02 hardening (new guarantees, evidence-cited)
+
+Added this session; every row points at a real test created alongside it.
+
+| Claim | Proof file | Test name |
+|---|---|---|
+| Integration tests run on EVERY PR (not just `--lib`) — the #988 silent-rot class is dead | `.github/workflows/ci.yml` (test matrix) | `crates/common/tests/github_workflow_guard.rs::r17_ci_test_matrix_runs_integration_tests_not_just_lib` |
+| The 10 rotted integration targets are repaired + green | `crates/core/tests/*` (dhat_allocation, snapshot_parser, ws_*, phase2_*, mutation_killer) + `crates/common/tests/triage_rules_full_coverage_guard.rs` | all green in #988 + #991 CI |
+| Final irrecoverable tick-loss has a dedicated CloudWatch alarm | `deploy/aws/terraform/app-alarms.tf` | `cloudwatch_app_alarms_wiring.rs::test_app_alarms_count_is_thirteen` |
+| Post-merge auto-deploy is covered by an AWS-native watchdog (GitHub-cron miss safety-net) | `deploy/aws/terraform/deploy-watchdog-lambda.tf` + `deploy/aws/lambda/deploy-watchdog/` | `crates/common/tests/aws_infra_wiring.rs::test_deploy_watchdog_lambda_is_wired` + `..._only_dispatches_when_positively_stale` |
+| `change_pct` + `open_gap_pct` candle columns wired end-to-end (DDL + ALTER + ILP + struct + spill) | `crates/storage/src/{shadow_persistence,shadow_candle_writer,shadow_seal_columns,seal_spill}.rs` | `crates/storage/tests/candle_pct_column_guard.rs::{change_pct,open_gap_pct}_column_wired_end_to_end` |
+| Latency bench gate enforces PER-TICK budgets (batch-vs-per-tick unit bug fixed) | `scripts/bench-gate.sh` + `quality/benchmark-budgets.toml` `[elements]` | `bench_budget_elements_guard.rs` (2 tests) |
 
 ## How to prove this matrix is real (right now)
 
