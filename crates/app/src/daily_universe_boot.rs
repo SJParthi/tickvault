@@ -344,8 +344,12 @@ mod tests {
         for i in 0..100 {
             s.push_str(&format!("28{i:04},NSE,NSE_EQ,EQUITY,STK{i},\n"));
         }
+        // Operator lock 2026-06-01 §30: the index allowlist drops fake
+        // IDX{i} symbols, so use real allowlisted names (first 30 of 31).
+        use tickvault_core::instrument::index_extractor::NSE_INDEX_ALLOWLIST;
         for i in 0..30 {
-            s.push_str(&format!("{},NSE,IDX_I,INDEX,IDX{i},\n", 1000 + i));
+            let sym = NSE_INDEX_ALLOWLIST[i % NSE_INDEX_ALLOWLIST.len()];
+            s.push_str(&format!("{},NSE,IDX_I,INDEX,{sym},\n", 1000 + i));
         }
         s.push_str("51,BSE,IDX_I,INDEX,SENSEX,\n");
         for i in 0..100 {

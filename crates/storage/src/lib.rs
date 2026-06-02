@@ -115,6 +115,7 @@ pub mod lifecycle_reconciler;
 // either (the old `drop_bug3_retired_views` lived in this module).
 pub mod option_chain_minute_snapshot_persistence;
 pub mod partition_manager;
+pub mod prev_day_ohlcv_persistence;
 pub mod questdb_health;
 pub mod seal_absorption;
 pub mod seal_dlq;

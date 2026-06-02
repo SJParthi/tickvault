@@ -213,6 +213,9 @@ impl ShadowCandleWriter {
             .with_context(|| "candle append: column_i64(tick_count) failed")?
             .column_f64("close_pct_from_prev_day", row.close_pct_from_prev_day)
             .with_context(|| "candle append: column_f64(close_pct_from_prev_day) failed")?
+            // §31 Option 2: % change vs the official 09:15 session open.
+            .column_f64("open_pct", row.open_pct)
+            .with_context(|| "candle append: column_f64(open_pct) failed")?
             .at(TimestampNanos::new(row.timestamp_ist_nanos))
             .with_context(|| "candle append: at(TimestampNanos) failed")?;
         self.pending_count += 1;

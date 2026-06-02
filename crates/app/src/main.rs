@@ -1273,6 +1273,7 @@ async fn main() -> Result<()> {
                     greeks_enricher,
                     Some(fast_tick_heartbeat),
                     None, // tick_enricher — Phase 2.5 wiring deferred until prev_oi_cache + boot ordering gate land in slow boot
+                    tickvault_common::always_on::current(), // §30 GIFT exemption
                 )
                 .await;
             });
@@ -2797,6 +2798,55 @@ async fn main() -> Result<()> {
         info!("slow-boot observability consumer started");
     }
 
+    // PR4 (operator 2026-06-01): bounded prev-day OHLCV fetch. Cold path —
+    // fetches yesterday's single daily candle per subscribed SID into the
+    // separate `prev_day_ohlcv` table (never `ticks`); fail-soft per symbol;
+    // never blocks live ticks. Only runs when the daily universe was built
+    // (`stashed_universe()` is `None` under Indices4Only or on build failure).
+    if let Some(pd_universe) = tickvault_app::prev_day_ohlcv_boot::stashed_universe() {
+        match TradingCalendar::from_config(&config.trading) {
+            Ok(cal) => {
+                // Compute the dates HERE (calendar in scope) so the task
+                // doesn't need to move the non-Clone TradingConfig/Calendar.
+                let now_ist = chrono::Utc::now()
+                    + chrono::Duration::seconds(i64::from(
+                        tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+                    ));
+                let today = now_ist.date_naive();
+                let from = tickvault_app::prev_day_ohlcv_boot::previous_trading_day(today, |d| {
+                    cal.is_trading_day(d)
+                });
+                let pd_token = std::sync::Arc::clone(&token_handle);
+                let pd_qcfg = config.questdb.clone();
+                let pd_base = config.dhan.rest_api_base_url.clone();
+                tokio::spawn(async move {
+                    let summary = tickvault_app::prev_day_ohlcv_boot::run_prev_day_ohlcv_fetch(
+                        pd_universe,
+                        pd_token,
+                        pd_qcfg,
+                        pd_base,
+                        from,
+                        today,
+                    )
+                    .await;
+                    info!(
+                        fetched = summary.fetched,
+                        skipped = summary.skipped,
+                        failed = summary.failed,
+                        "prev-day OHLCV boot fetch done"
+                    );
+                });
+                info!("prev-day OHLCV boot fetch task spawned");
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "prev_day_ohlcv: calendar build failed — boot fetch skipped"
+                );
+            }
+        }
+    }
+
     // Candle-engine re-architecture #T1b — wire Engine B (the only
     // candle engine). Engine C (`candles_1s` → `CandleEngineMap<Tf1s>`
     // → `CascadeFanout` matview cascade + `run_midnight_rollover_task_with_fanout`)
@@ -3132,6 +3182,7 @@ async fn main() -> Result<()> {
                 // `prev_day_oi`, `phase` columns instead of the
                 // legacy zero/PREMARKET defaults.
                 Some(std::sync::Arc::clone(&tick_enricher)),
+                tickvault_common::always_on::current(), // §30 GIFT exemption
             )
             .await;
         });
@@ -5072,6 +5123,24 @@ async fn cold_build_daily_universe(
     )
     .await
     .context("daily-universe boot failed (fail-closed §4)")?;
+
+    // Operator lock 2026-06-01 §30: install the always-on (no market-hours
+    // filter) exemption set ONCE from the freshly-built universe. GIFT Nifty
+    // (sid 5024, NSE-IX, ~21 h/day) is the only entry today. Read later by
+    // the tick processor + candle aggregator via
+    // `tickvault_common::always_on::current()`. Empty set if GIFT absent.
+    let always_on = universe.always_on_segments();
+    info!(
+        always_on_count = always_on.len(),
+        "§30 always-on (no market-hours filter) set installed"
+    );
+    tickvault_common::always_on::init_always_on_segments(always_on);
+
+    // PR4 (operator 2026-06-01): stash the freshly-built universe so the
+    // boot prev-day OHLCV fetch task (spawned later, where the token + REST
+    // base URL are in scope) can read the ~243 subscription targets.
+    tickvault_app::prev_day_ohlcv_boot::stash_universe(std::sync::Arc::clone(&universe));
+
     Ok((outcome, universe))
 }
 
@@ -5895,7 +5964,12 @@ fn spawn_engine_b_aggregator(
     // per `aws-budget.md`). HashMap grows lazily so this is a hint.
     const AGGREGATOR_CAPACITY: usize = 11_000;
 
-    let aggregator = std::sync::Arc::new(MultiTfAggregator::with_capacity(AGGREGATOR_CAPACITY));
+    // §30: GIFT Nifty (always-on) candles must form across its full ~21h
+    // session — pass the boot-installed exemption set into the aggregator.
+    let aggregator = std::sync::Arc::new(
+        MultiTfAggregator::with_capacity(AGGREGATOR_CAPACITY)
+            .with_always_on(tickvault_common::always_on::current()),
+    );
 
     // --- Task 1: aggregator subscriber (per-tick fold + seal) ---
     let agg_clone = std::sync::Arc::clone(&aggregator);

@@ -117,6 +117,57 @@ impl DailyUniverse {
             .filter(|t| t.role == role)
             .count()
     }
+
+    /// Build the always-on (no market-hours filter) exemption set —
+    /// operator lock 2026-06-01 §30. Scans the subscription targets for
+    /// GIFT Nifty (`GIFTNIFTY`, an NSE-IX index that trades ~21 h/day)
+    /// and returns its `(security_id, exchange_segment_code)`. The result
+    /// is installed once at boot via
+    /// `tickvault_common::always_on::init_always_on_segments` and read by
+    /// the tick processor + candle aggregator so GIFT ticks/candles are
+    /// NOT dropped outside 09:15–15:30 IST.
+    ///
+    /// Returns an EMPTY set when GIFT Nifty is absent (cold day / Dhan
+    /// dropped it) — the caller's loud allowlist-miss warn already covers
+    /// the visibility; the exemption simply does nothing in that case.
+    ///
+    /// O(1) EXEMPT: cold-path, runs once per boot over ~250 targets.
+    #[must_use]
+    pub fn always_on_segments(&self) -> std::collections::HashSet<(u32, u8)> {
+        use super::index_extractor::{GIFT_NIFTY_SYMBOL, normalize_index_symbol};
+        let mut set = std::collections::HashSet::new();
+        for t in &self.subscription_targets {
+            if t.role != InstrumentRole::Index {
+                continue;
+            }
+            if normalize_index_symbol(&t.csv_row.symbol_name) != GIFT_NIFTY_SYMBOL {
+                continue;
+            }
+            // GIFT Nifty row found — resolve sid + numeric segment code.
+            // Rule 11 (no silent false-OK): if a found GIFT row can't resolve,
+            // the exemption is silently empty → GIFT ticks wrongly dropped
+            // outside 09:15–15:30. Surface it loudly instead.
+            let Ok(sid) = t.csv_row.security_id.trim().parse::<u32>() else {
+                tracing::warn!(
+                    security_id = %t.csv_row.security_id,
+                    "always-on: GIFT Nifty row found but security_id did not parse as u32 — \
+                     market-hours exemption will be EMPTY for GIFT this session"
+                );
+                continue;
+            };
+            let Some(code) = tickvault_common::segment::segment_str_to_code(&t.csv_row.segment)
+            else {
+                tracing::warn!(
+                    sid,
+                    segment = %t.csv_row.segment,
+                    "always-on: GIFT Nifty segment unrecognised — exemption EMPTY for GIFT"
+                );
+                continue;
+            };
+            set.insert((sid, code));
+        }
+        set
+    }
 }
 
 /// Errors that can occur during universe assembly.
@@ -259,7 +310,50 @@ mod tests {
         IndexExtraction {
             nse_indices,
             bse_sensex: Some(idx_i_row("51", "BSE", "SENSEX")),
+            allowlist_misses: Vec::new(),
         }
+    }
+
+    #[test]
+    fn always_on_segments_resolves_gift_nifty() {
+        // Operator lock 2026-06-01 §30: GIFT Nifty (sid 5024, IDX_I=0) is
+        // the only always-on instrument.
+        let universe = DailyUniverse {
+            subscription_targets: vec![
+                SubscriptionTarget {
+                    role: InstrumentRole::Index,
+                    csv_row: idx_i_row("13", "NSE", "NIFTY"),
+                },
+                SubscriptionTarget {
+                    role: InstrumentRole::Index,
+                    csv_row: idx_i_row("5024", "NSE", "GIFTNIFTY"),
+                },
+                SubscriptionTarget {
+                    role: InstrumentRole::FnoUnderlying,
+                    csv_row: nse_eq_row("2885", "RELIANCE"),
+                },
+            ],
+            fno_contracts: Vec::new(),
+        };
+        let set = universe.always_on_segments();
+        assert_eq!(set.len(), 1, "only GIFT Nifty is always-on");
+        assert!(set.contains(&(5024, 0)), "GIFT Nifty (IDX_I=0) exempt");
+        assert!(!set.contains(&(13, 0)), "NIFTY is NOT exempt");
+    }
+
+    #[test]
+    fn always_on_segments_empty_without_gift_nifty() {
+        let universe = DailyUniverse {
+            subscription_targets: vec![SubscriptionTarget {
+                role: InstrumentRole::Index,
+                csv_row: idx_i_row("13", "NSE", "NIFTY"),
+            }],
+            fno_contracts: Vec::new(),
+        };
+        assert!(
+            universe.always_on_segments().is_empty(),
+            "no GIFT Nifty → empty exemption set"
+        );
     }
 
     #[test]
@@ -421,6 +515,7 @@ mod tests {
         let indices = IndexExtraction {
             nse_indices: Vec::new(),
             bse_sensex: None,
+            allowlist_misses: Vec::new(),
         };
         let fno = FnoUnderlyingExtraction {
             unique_underlying_ids: HashSet::new(),

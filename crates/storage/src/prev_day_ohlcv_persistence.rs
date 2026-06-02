@@ -1,0 +1,362 @@
+//! Previous-day OHLCV persistence — operator directive 2026-06-01
+//! (`live-feed-purity.md` rule 9). A SEPARATE QuestDB table holding
+//! yesterday's single daily candle (O/H/L/C/V) per subscribed instrument,
+//! fetched ONCE at boot via Dhan REST `/v2/charts/historical` (daily).
+//!
+//! **This is NOT the `ticks` table** and NOT the deleted 90-day historical
+//! chain. One row per (instrument, prev-trading-day). DEDUP UPSERT KEYS
+//! `(ts, security_id, segment)` per I-P1-11 → idempotent re-runs collapse to
+//! one row; cross-segment same-`security_id` instruments stay distinct.
+//!
+//! ## Schema
+//!
+//! ```sql
+//! CREATE TABLE IF NOT EXISTS prev_day_ohlcv (
+//!     segment      SYMBOL,
+//!     security_id  LONG,
+//!     ts           TIMESTAMP,   -- prev trading-day IST midnight (nanos)
+//!     open         DOUBLE,
+//!     high         DOUBLE,
+//!     low          DOUBLE,
+//!     close        DOUBLE,
+//!     volume       LONG
+//! ) timestamp(ts) PARTITION BY DAY
+//!   DEDUP UPSERT KEYS(ts, security_id, segment);
+//! ```
+//!
+//! ## Timestamp rule (`data-integrity.md`)
+//!
+//! Dhan REST historical timestamps are **UNIX UTC epoch seconds**, so the
+//! IST-displayed designated timestamp adds `+IST_UTC_OFFSET` (19800 s) —
+//! the OPPOSITE of WebSocket LTT (already IST). See
+//! [`prev_day_ist_nanos_from_utc_secs`].
+
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
+use tracing::{error, warn};
+
+use tickvault_common::config::QuestDbConfig;
+use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+
+/// QuestDB table name. One row per (instrument, prev-trading-day).
+pub const PREV_DAY_OHLCV_TABLE: &str = "prev_day_ohlcv";
+
+/// DEDUP UPSERT key — includes the designated timestamp `ts` (QuestDB
+/// requires it) and `segment` per I-P1-11. The `dedup_segment_meta_guard`
+/// workspace test scans this constant; it MUST mention `segment`.
+pub const DEDUP_KEY_PREV_DAY_OHLCV: &str = "ts, security_id, segment";
+
+const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
+
+/// One previous-day daily candle ready for ILP write. All prices are
+/// `f64` (Dhan REST returns f64 natively — no `f32_to_f64_clean` needed
+/// per `data-integrity.md`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PrevDayOhlcvRow {
+    /// Designated timestamp: prev trading-day IST midnight, in nanoseconds.
+    pub ts_ist_nanos: i64,
+    /// Composite-key part 1 (I-P1-11). Widened to `i64` for `column_i64`.
+    pub security_id: i64,
+    /// Composite-key part 2 (I-P1-11). `&'static` segment string
+    /// (`IDX_I` / `NSE_EQ` / …) for the `symbol` column.
+    pub segment: &'static str,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: i64,
+}
+
+/// Convert a Dhan REST historical candle UTC-epoch-second timestamp into
+/// the IST-midnight designated-timestamp nanoseconds the table stores.
+///
+/// `data-integrity.md`: historical REST timestamps are UTC epoch seconds,
+/// so we add `+IST_UTC_OFFSET_SECONDS` (19800) — the OPPOSITE of the
+/// WebSocket LTT rule (which is already IST and must NEVER get the offset).
+///
+/// O(1) — 1 add + 1 multiply. Saturating to avoid overflow panics.
+#[must_use]
+pub fn prev_day_ist_nanos_from_utc_secs(utc_epoch_secs: i64) -> i64 {
+    utc_epoch_secs
+        .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
+        .saturating_mul(1_000_000_000)
+}
+
+/// The idempotent `CREATE TABLE` DDL for `prev_day_ohlcv`. Pure (testable
+/// without QuestDB).
+#[must_use]
+pub fn prev_day_ohlcv_create_ddl() -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {PREV_DAY_OHLCV_TABLE} (\
+            segment      SYMBOL, \
+            security_id  LONG, \
+            ts           TIMESTAMP, \
+            open         DOUBLE, \
+            high         DOUBLE, \
+            low          DOUBLE, \
+            close        DOUBLE, \
+            volume       LONG\
+        ) timestamp(ts) PARTITION BY DAY \
+        DEDUP UPSERT KEYS({DEDUP_KEY_PREV_DAY_OHLCV});"
+    )
+}
+
+/// Create the `prev_day_ohlcv` table if absent (idempotent, schema-self-heal
+/// pattern). Failures log at `error!` (Telegram-routable) but do NOT block
+/// boot — the fetcher simply can't persist and reports it.
+// Requires a live QuestDB; the DDL string is unit-tested via the
+// `prev_day_ohlcv_create_ddl` tests. Boot wiring lives in
+// crates/app/src/main.rs (called by run_prev_day_ohlcv_fetch).
+// TEST-EXEMPT: live-QuestDB DDL runner (DDL string unit-tested).
+pub async fn ensure_prev_day_ohlcv_table(questdb_config: &QuestDbConfig) {
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
+        .build()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            error!(
+                ?err,
+                "prev_day_ohlcv: HTTP client build failed — table not ensured"
+            );
+            return;
+        }
+    };
+    let ddl = prev_day_ohlcv_create_ddl();
+    match client
+        .get(&base_url)
+        .query(&[("query", ddl.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            error!(%status, body = %body.chars().take(200).collect::<String>(),
+                "prev_day_ohlcv: CREATE TABLE returned non-2xx");
+        }
+        Err(err) => error!(?err, "prev_day_ohlcv: CREATE TABLE request failed"),
+    }
+}
+
+/// Lazy-connect ILP writer for the `prev_day_ohlcv` table. Mirrors
+/// `ShadowCandleWriter`: if QuestDB is unreachable at construction the
+/// writer still builds (`sender = None`); `append_row` fills the local
+/// buffer and `flush` returns `Err` until a reconnect lands.
+pub struct PrevDayOhlcvWriter {
+    sender: Option<Sender>,
+    buffer: Buffer,
+    pending: usize,
+}
+
+impl PrevDayOhlcvWriter {
+    /// Production constructor — connects via ILP TCP, lazy on failure.
+    #[must_use]
+    // TEST-EXEMPT: production ILP-connect constructor (needs live QuestDB); the disconnected/append/flush paths are covered via for_test().
+    pub fn new(config: &QuestDbConfig) -> Self {
+        let conf = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        match Sender::from_conf(&conf) {
+            Ok(s) => {
+                let b = s.new_buffer();
+                Self {
+                    sender: Some(s),
+                    buffer: b,
+                    pending: 0,
+                }
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "prev_day_ohlcv writer: QuestDB unreachable — buffering locally"
+                );
+                Self {
+                    sender: None,
+                    buffer: Buffer::new(ProtocolVersion::V1),
+                    pending: 0,
+                }
+            }
+        }
+    }
+
+    /// Test constructor — disconnected writer, empty buffer.
+    #[must_use]
+    // TEST-EXEMPT: test-only helper used by append/flush unit tests below.
+    pub fn for_test() -> Self {
+        Self {
+            sender: None,
+            buffer: Buffer::new(ProtocolVersion::V1),
+            pending: 0,
+        }
+    }
+
+    /// `true` when a live ILP sender is held.
+    #[must_use]
+    // TEST-EXEMPT: observability accessor, exercised by test_flush_when_disconnected_errors.
+    pub fn is_connected(&self) -> bool {
+        self.sender.is_some()
+    }
+
+    /// Rows buffered since the last flush.
+    #[must_use]
+    pub const fn pending(&self) -> usize {
+        self.pending
+    }
+
+    /// Append one prev-day candle row to the ILP buffer. O(1), zero alloc
+    /// beyond the buffer's internal growth.
+    pub fn append_row(&mut self, row: &PrevDayOhlcvRow) -> Result<()> {
+        self.buffer
+            .table(PREV_DAY_OHLCV_TABLE)
+            .with_context(|| "prev_day_ohlcv append: table() failed")?
+            .symbol("segment", row.segment)
+            .with_context(|| "prev_day_ohlcv append: symbol(segment) failed")?
+            .column_i64("security_id", row.security_id)
+            .with_context(|| "prev_day_ohlcv append: column_i64(security_id) failed")?
+            .column_f64("open", row.open)
+            .with_context(|| "prev_day_ohlcv append: column_f64(open) failed")?
+            .column_f64("high", row.high)
+            .with_context(|| "prev_day_ohlcv append: column_f64(high) failed")?
+            .column_f64("low", row.low)
+            .with_context(|| "prev_day_ohlcv append: column_f64(low) failed")?
+            .column_f64("close", row.close)
+            .with_context(|| "prev_day_ohlcv append: column_f64(close) failed")?
+            .column_i64("volume", row.volume)
+            .with_context(|| "prev_day_ohlcv append: column_i64(volume) failed")?
+            .at(TimestampNanos::new(row.ts_ist_nanos))
+            .with_context(|| "prev_day_ohlcv append: at(ts) failed")?;
+        self.pending = self.pending.saturating_add(1);
+        Ok(())
+    }
+
+    /// Bytes currently buffered (observability + tests).
+    #[must_use]
+    // TEST-EXEMPT: observability accessor, exercised by test_append_row_fills_buffer_with_table_and_segment.
+    pub fn buffer_byte_count(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Raw buffered bytes (tests assert table/segment/value serialisation).
+    #[must_use]
+    // TEST-EXEMPT: observability accessor, exercised by test_append_row_fills_buffer_with_table_and_segment.
+    pub fn buffer_bytes(&self) -> &[u8] {
+        self.buffer.as_bytes()
+    }
+
+    /// Flush the buffer to QuestDB. `Err` if disconnected (caller logs +
+    /// the cold-path fetch reports the failure; boot is unaffected).
+    pub fn flush(&mut self) -> Result<()> {
+        let sender = self
+            .sender
+            .as_mut()
+            .context("prev_day_ohlcv flush: not connected to QuestDB")?;
+        sender
+            .flush(&mut self.buffer)
+            .context("prev_day_ohlcv flush: ILP flush failed")?;
+        self.pending = 0;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dedup_key_includes_segment() {
+        // I-P1-11 + dedup_segment_meta_guard contract.
+        assert!(DEDUP_KEY_PREV_DAY_OHLCV.contains("segment"));
+        assert!(DEDUP_KEY_PREV_DAY_OHLCV.contains("security_id"));
+        assert!(DEDUP_KEY_PREV_DAY_OHLCV.contains("ts"));
+    }
+
+    #[test]
+    fn test_prev_day_ohlcv_create_ddl_has_all_columns() {
+        let ddl = prev_day_ohlcv_create_ddl();
+        for needle in [
+            "prev_day_ohlcv",
+            "segment      SYMBOL",
+            "security_id  LONG",
+            "ts           TIMESTAMP",
+            "open         DOUBLE",
+            "high         DOUBLE",
+            "low          DOUBLE",
+            "close        DOUBLE",
+            "volume       LONG",
+            "DEDUP UPSERT KEYS(ts, security_id, segment)",
+            "PARTITION BY DAY",
+        ] {
+            assert!(ddl.contains(needle), "DDL missing: {needle}\n{ddl}");
+        }
+    }
+
+    #[test]
+    fn test_prev_day_ist_nanos_from_utc_secs_adds_offset() {
+        // Historical REST = UTC epoch secs → +19800 for IST, then ×1e9.
+        // 2026-05-29 00:00:00 UTC = 1_780_012_800 (example); IST = +19800.
+        let utc = 1_780_012_800_i64;
+        let got = prev_day_ist_nanos_from_utc_secs(utc);
+        assert_eq!(got, (utc + 19_800) * 1_000_000_000);
+        // Saturating guard — no panic at extremes.
+        assert_eq!(prev_day_ist_nanos_from_utc_secs(i64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn test_for_test_writer_is_disconnected_and_empty() {
+        let w = PrevDayOhlcvWriter::for_test();
+        assert!(!w.is_connected());
+        assert_eq!(w.pending(), 0);
+        assert_eq!(w.buffer_byte_count(), 0);
+    }
+
+    #[test]
+    fn test_append_row_fills_buffer_with_table_and_segment() {
+        let mut w = PrevDayOhlcvWriter::for_test();
+        let row = PrevDayOhlcvRow {
+            ts_ist_nanos: (1_780_012_800_i64 + 19_800) * 1_000_000_000,
+            security_id: 13,
+            segment: "IDX_I",
+            open: 100.0,
+            high: 110.0,
+            low: 99.0,
+            close: 105.5,
+            volume: 0,
+        };
+        w.append_row(&row).expect("append");
+        assert_eq!(w.pending(), 1);
+        let bytes = w.buffer_bytes();
+        let text = String::from_utf8_lossy(bytes);
+        assert!(text.contains("prev_day_ohlcv"), "table name in wire bytes");
+        assert!(text.contains("IDX_I"), "segment in wire bytes");
+    }
+
+    #[test]
+    fn test_flush_when_disconnected_errors() {
+        let mut w = PrevDayOhlcvWriter::for_test();
+        assert!(w.flush().is_err(), "disconnected flush must Err, not panic");
+    }
+
+    #[test]
+    fn test_two_appends_increment_pending() {
+        let mut w = PrevDayOhlcvWriter::for_test();
+        let row = PrevDayOhlcvRow {
+            ts_ist_nanos: 1_000_000_000,
+            security_id: 25,
+            segment: "NSE_EQ",
+            open: 1.0,
+            high: 2.0,
+            low: 0.5,
+            close: 1.5,
+            volume: 100,
+        };
+        w.append_row(&row).expect("a1");
+        w.append_row(&row).expect("a2");
+        assert_eq!(w.pending(), 2);
+    }
+}
