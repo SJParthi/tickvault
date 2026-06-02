@@ -25,7 +25,13 @@ resource "aws_cloudwatch_metric_alarm" "instance_status_check" {
   statistic           = "Maximum"
   threshold           = 0
   alarm_description   = "EC2 Status Check failed — instance-level fault. See DR runbook §5 (Instance unreachable)."
-  treat_missing_data  = "breaching"
+  # treat_missing_data = notBreaching (was "breaching", 2026-06-02): the box is
+  # auto-stopped daily at 17:00 IST (08:00–17:00 schedule). A STOPPED instance
+  # emits no StatusCheckFailed datapoints, so "breaching" flipped this alarm to
+  # a false ALARM every evening (pager fatigue). notBreaching keeps it OK while
+  # stopped, yet still fires on a real breaching datapoint (instance RUNNING but
+  # status check failing). Matches the app-alarms.tf fix pattern.
+  treat_missing_data  = "notBreaching"
 
   dimensions = {
     InstanceId = aws_instance.tv_app.id
@@ -49,7 +55,11 @@ resource "aws_cloudwatch_metric_alarm" "system_status_check" {
   statistic           = "Maximum"
   threshold           = 0
   alarm_description   = "AWS System Check failed — requires reboot to trigger underlying-host move. See DR runbook §5."
-  treat_missing_data  = "breaching"
+  # treat_missing_data = notBreaching (was "breaching", 2026-06-02): same as the
+  # instance-status alarm above — a STOPPED instance (daily 17:00 IST schedule)
+  # emits no datapoints, so "breaching" false-fired this alarm every evening.
+  # notBreaching stays OK while stopped, still fires on a real failed check.
+  treat_missing_data  = "notBreaching"
 
   dimensions = {
     InstanceId = aws_instance.tv_app.id
