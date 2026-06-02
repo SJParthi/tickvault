@@ -11,6 +11,9 @@
 > **Honesty clause:** physics-impossible claims (e.g. "WebSocket never
 > disconnects") are replaced with **measurable SLAs** that fire alerts
 > on violation. Both columns are honest about which is which.
+>
+> **Plain-English version** (no jargon, no file names — for anyone):
+> `docs/architecture/what-we-guarantee-plain-english.md`. Same truth, human words.
 
 ## How to use this file
 
