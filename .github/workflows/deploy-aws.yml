@@ -271,6 +271,102 @@ jobs:
         id: acct
         run: echo "id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
 
+      - name: Ensure instance running (self-start + wait for SSM online)
+        # ROOT-CAUSE FIX 2026-06-02: every deploy ships the binary via
+        # `aws ssm send-command`, which can ONLY reach a RUNNING, SSM-online
+        # box. Before this step the deploy assumed the box was already up, so a
+        # stopped box -> `InvalidInstanceId: Instances not in a valid state` ->
+        # FAIL -> "DLT deploy FAILED" Telegram, on EVERY push. Two distinct
+        # cases, two behaviours:
+        #
+        #   A. The box SHOULD be up now (08:30-16:30 IST Mon-Fri, OR this run is
+        #      a manual/after-close workflow_dispatch). If it's stopped, the
+        #      08:30 EventBridge start silently failed (see scripts/aws-autopilot.sh
+        #      EventBridge diagnostic). SELF-HEAL: start it here + wait for the
+        #      SSM agent to report Online, then proceed with the deploy. This is
+        #      the fix for the 2026-06-02 "box never auto-started" incident.
+        #
+        #   B. The box is intentionally stopped (overnight / weekend push,
+        #      outside the up-window). Do NOT start it (would bill ~₹2/hr off-
+        #      schedule, breaching the budget lock). Skip the deploy: set
+        #      DEPLOY_SKIP_REASON so the failure-notify + auto-stop steps below
+        #      stay SILENT (no Telegram spam), then exit non-zero so this run is
+        #      NOT recorded as a successful deploy — the 08:45 IST pre-market
+        #      cron (deploy-aws-after-close) redeploys the same commit once the
+        #      box is up. Honest envelope: an off-hours push shows a red Actions
+        #      run (correct — "couldn't deploy, box is down") but pages nobody.
+        env:
+          REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+          IID: ${{ secrets.EC2_INSTANCE_ID }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -uo pipefail
+          # Up-window = 08:30-16:30 IST Mon-Fri (the EventBridge schedule window).
+          DOW=$(TZ='Asia/Kolkata' date +%u)            # 1=Mon..7=Sun
+          HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM))
+          UP_WINDOW=no
+          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 830 ] && [ "$HHMM" -le 1630 ]; then UP_WINDOW=yes; fi
+          # A manual run or the after-close cron dispatch (workflow_dispatch)
+          # always intends the box up — self-start regardless of clock.
+          SHOULD_BE_UP=no
+          if [ "$UP_WINDOW" = "yes" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then SHOULD_BE_UP=yes; fi
+          echo "IST dow=$DOW time=$HHMM up_window=$UP_WINDOW event=$EVENT_NAME should_be_up=$SHOULD_BE_UP"
+
+          state() {
+            aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
+              --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo unknown
+          }
+          # Let any in-flight pending/stopping settle (<=2 min) before deciding.
+          for _ in $(seq 1 24); do
+            ST=$(state); echo "instance state=$ST"
+            case "$ST" in running|stopped) break ;; esac
+            sleep 5
+          done
+
+          if [ "$ST" = "running" ]; then
+            echo "instance already running — proceeding with deploy"
+            exit 0
+          fi
+
+          if [ "$ST" != "stopped" ]; then
+            echo "::error::instance in unexpected state '$ST' — not safe to deploy"
+            exit 1
+          fi
+
+          if [ "$SHOULD_BE_UP" != "yes" ]; then
+            echo "DEPLOY_SKIP_REASON=intentional_stopped" >> "$GITHUB_ENV"
+            echo "::notice::Box is intentionally stopped (outside 08:30-16:30 IST Mon-Fri up-window) and this is an auto push — skipping deploy without paging. The 08:45 IST pre-market cron will redeploy this commit once the box is up."
+            exit 1
+          fi
+
+          echo "box stopped but SHOULD be up — starting it (EventBridge start likely failed)"
+          aws ec2 start-instances --region "$REGION" --instance-ids "$IID" >/dev/null
+          # Wait for EC2 'running' (<=3 min).
+          for _ in $(seq 1 36); do
+            ST=$(state); echo "  waiting for running: $ST"
+            [ "$ST" = "running" ] && break
+            sleep 5
+          done
+          if [ "$ST" != "running" ]; then
+            echo "::error::instance did not reach 'running' within 3 min after start-instances"
+            exit 1
+          fi
+          # Wait for the SSM agent to register Online (<=3 min) — send-command
+          # fails with InvalidInstanceId until then even on a running box.
+          for _ in $(seq 1 36); do
+            PING=$(aws ssm describe-instance-information --region "$REGION" \
+              --filters "Key=InstanceIds,Values=$IID" \
+              --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || echo None)
+            echo "  waiting for SSM Online: $PING"
+            [ "$PING" = "Online" ] && break
+            sleep 5
+          done
+          if [ "$PING" != "Online" ]; then
+            echo "::error::SSM agent not Online within 3 min after start — cannot send-command"
+            exit 1
+          fi
+          echo "instance started + SSM Online — proceeding with deploy"
+
       - name: Auto-seed /tickvault/staging/* from /tickvault/dev/* (idempotent)
         # The systemd unit sets TV_ENVIRONMENT=staging, so the app reads SSM
         # at /tickvault/staging/{service}/{key}. If staging is empty (fresh
@@ -481,7 +577,10 @@ jobs:
         # failed on-box step (e.g. smoke test) shows its real reason in the log
         # instead of an opaque "Waiter ... Failed". Then re-fail the job if the
         # command status was not Success.
-        if: always()
+        # Skipped on an intentional off-hours skip (the box is down on purpose;
+        # there is no command_id to query, so this would only emit AWS
+        # ParamValidation noise — see the "Ensure instance running" step).
+        if: always() && env.DEPLOY_SKIP_REASON != 'intentional_stopped'
         run: |
           STATUS=$(aws ssm get-command-invocation \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
@@ -555,7 +654,9 @@ jobs:
             --message "commit=${{ github.sha }} ref=${{ github.ref }} actor=${{ github.actor }}"
 
       - name: Auto-stop tickvault service on deploy failure (kills Telegram spam)
-        if: failure()
+        # Not on an intentional off-hours skip: the box is already stopped, so
+        # this would only emit InvalidInstanceId noise.
+        if: failure() && env.DEPLOY_SKIP_REASON != 'intentional_stopped'
         # When the deploy fails AFTER the binary is in place, systemd's
         # Restart=always keeps relaunching it every few seconds. If each
         # boot reaches the auth step (it does after PR #921/#922), each
@@ -578,7 +679,11 @@ jobs:
             --query Command.CommandId --output text || echo "(could not dispatch auto-stop — AWS creds likely not configured at this stage)"
 
       - name: Notify Telegram on failure
-        if: failure()
+        # ANTI-SPAM 2026-06-02: an intentional off-hours skip (box stopped on
+        # purpose, auto push outside the up-window) is NOT a failure worth
+        # paging the operator at 2 AM. The 08:45 IST pre-market cron redeploys.
+        # Genuine deploy failures (box up, smoke test failed, etc.) still page.
+        if: failure() && env.DEPLOY_SKIP_REASON != 'intentional_stopped'
         run: |
           aws sns publish \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \

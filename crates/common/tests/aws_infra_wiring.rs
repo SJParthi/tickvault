@@ -546,6 +546,74 @@ fn test_aws_autopilot_selfheal_workflow_exists() {
         sh.contains("describe-instance-information"),
         "autopilot must verify the box is an SSM managed node"
     );
+    // 2026-06-02 fix: the self-start window must be the FULL 08:30-16:30 IST
+    // up-window, not just market hours (09:00-15:35). The pre-market gap
+    // (08:30-09:00) is when the universe is fetched + WS subscribes — a stopped
+    // box there is a real problem. Using is_market_window left autopilot
+    // waiting until 09:00 to rescue a failed 08:30 EventBridge start.
+    assert!(
+        sh.contains("is_box_up_window"),
+        "autopilot must self-start a stopped box across the WHOLE 08:30-16:30 IST \
+         up-window (is_box_up_window), not only market hours — otherwise a failed \
+         08:30 EventBridge start is not rescued until 09:00 (2026-06-02 incident)"
+    );
+    assert!(
+        sh.contains("830") && sh.contains("1630"),
+        "is_box_up_window must encode the 08:30-16:30 IST bounds (830/1630)"
+    );
+    // 2026-06-02 diagnostic (the 'A' fix): when the box is stopped during the
+    // up-window, autopilot must report WHY the EventBridge auto-start failed
+    // (rule missing / disabled / automation errored) so the operator doesn't
+    // have to guess from the AWS console.
+    assert!(
+        sh.contains("diagnose_eventbridge_start"),
+        "autopilot must diagnose the EventBridge daily-start rule when the box is \
+         found stopped during the up-window"
+    );
+    assert!(
+        sh.contains("tv-prod-daily-start") && sh.contains("describe-rule"),
+        "the EventBridge diagnostic must inspect the tv-prod-daily-start rule state"
+    );
+}
+
+#[test]
+fn test_deploy_aws_self_starts_stopped_instance_and_skips_offhours_cleanly() {
+    // 2026-06-02 incident: the box did not auto-start at 08:30 IST, so every
+    // `deploy-aws` run failed at `aws ssm send-command` with
+    // `InvalidInstanceId: Instances not in a valid state` and paged the
+    // operator ("DLT deploy FAILED") on every overnight push. Two fixes pinned
+    // here:
+    //   C) the deploy job self-starts a stopped box when it SHOULD be up
+    //      (up-window or manual dispatch) and waits for the SSM agent Online
+    //      before send-command — this self-heals a missed EventBridge start.
+    //   B) an off-hours auto push to a deliberately-stopped box skips cleanly
+    //      via DEPLOY_SKIP_REASON, suppressing the failure Telegram (no 2 AM
+    //      spam) while staying non-success so the 08:45 cron redeploys.
+    let content =
+        std::fs::read_to_string(workspace_root().join(".github/workflows/deploy-aws.yml"))
+            .expect("deploy-aws.yml must be readable"); // APPROVED: test
+    // C: self-start + SSM-online wait before the SSM deploy.
+    assert!(
+        content.contains("Ensure instance running"),
+        "deploy-aws.yml must ensure the instance is running before send-command \
+         (a stopped box -> InvalidInstanceId -> failed deploy)"
+    );
+    assert!(
+        content.contains("aws ec2 start-instances") && content.contains("PingStatus"),
+        "deploy-aws.yml must self-start a stopped box and wait for the SSM agent \
+         PingStatus=Online before deploying"
+    );
+    // B: intentional off-hours skip flag + the failure-notify gate on it.
+    assert!(
+        content.contains("DEPLOY_SKIP_REASON=intentional_stopped"),
+        "deploy-aws.yml must set DEPLOY_SKIP_REASON for an off-hours skip"
+    );
+    assert!(
+        content.contains("env.DEPLOY_SKIP_REASON != 'intentional_stopped'"),
+        "deploy-aws.yml failure-notify + auto-stop steps must be gated on \
+         DEPLOY_SKIP_REASON so an intentional off-hours skip does NOT page the \
+         operator (anti-spam)"
+    );
 }
 
 #[test]
