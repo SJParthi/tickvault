@@ -1,8 +1,8 @@
 # Follow-up Plan: Post-market 1-minute cross-verification (NEXT PR)
 
-**Status:** DRAFT — implement AFTER the 1d-historical-only PR merges (serial-PR protocol, operator-charter §H).
+**Status:** APPROVED — operator locked **CSV output + exact-match + mismatch count** (2026-06-02: *"csv and exact match cross verification is needed"*). Implementing on branch `claude/cross-verify-1m`.
 **Date:** 2026-06-02
-**Approved by:** Parthiban (feature requested 2026-06-02; design pending final approval)
+**Approved by:** Parthiban — feature + CSV + exact-match all confirmed 2026-06-02.
 
 **Operator quote (2026-06-02):** *"put back the historical cross verification at precise 3.31 pm onwards … cross verification between dhan historical intraday of entire one minute candle OHLCV for every timestamp … among our candles_1m … highlighted or stored or csv or excel file or easily accessible and trackable to find how many times there is a mismatch … only for one min alone … for all those subscribed spot instruments."*
 
