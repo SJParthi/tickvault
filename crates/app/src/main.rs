@@ -3555,6 +3555,105 @@ async fn main() -> Result<()> {
                 });
             }
 
+            // Operator directive 2026-06-02: post-market 1-minute
+            // cross-verification at 15:31:00 IST. For every subscribed SPOT
+            // instrument, compare our live `candles_1m` OHLCV against Dhan's
+            // authoritative intraday 1-minute candles, EXACT match, and write
+            // mismatches to the `cross_verify_1m_audit` table + a per-day CSV
+            // (`data/cross-verify/`). The per-day mismatch COUNT is the quality
+            // signal. Cold path, fail-soft, market-hours-gated (audit Rule 3).
+            if let Some(cv_universe) = tickvault_app::prev_day_ohlcv_boot::stashed_universe() {
+                // Build owned spot targets HERE (universe Arc in scope) so the
+                // task doesn't hold the Arc. Skip rows with an unparseable SID.
+                let cv_targets: Vec<tickvault_app::cross_verify_1m_boot::CrossVerifyTarget> =
+                    cv_universe
+                        .subscription_targets
+                        .iter()
+                        .filter_map(|t| {
+                            t.csv_row.security_id.trim().parse::<i64>().ok().map(|sid| {
+                                tickvault_app::cross_verify_1m_boot::CrossVerifyTarget {
+                                    security_id: sid,
+                                    segment: t.csv_row.segment.trim().to_string(),
+                                    symbol: t.csv_row.symbol_name.trim().to_string(),
+                                    instrument:
+                                        tickvault_app::prev_day_ohlcv_boot::instrument_type_for_role(
+                                            t.role,
+                                        ),
+                                }
+                            })
+                        })
+                        .collect();
+                let cv_token = std::sync::Arc::clone(&token_handle);
+                let cv_qcfg = config.questdb.clone();
+                let cv_base = config.dhan.rest_api_base_url.clone();
+                let cv_calendar = std::sync::Arc::clone(&trading_calendar);
+                tokio::spawn(async move {
+                    use chrono::{FixedOffset, NaiveTime, TimeZone, Utc};
+                    use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+                    let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+                        return;
+                    };
+                    let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+                    let today_ist = now_ist.date_naive();
+                    if !cv_calendar.is_trading_day(today_ist) {
+                        info!("cross_verify_1m: skipping (non-trading day)");
+                        return;
+                    }
+                    if cv_targets.is_empty() {
+                        info!("cross_verify_1m: no spot targets — skipping");
+                        return;
+                    }
+                    let Some(target_time) = NaiveTime::from_hms_opt(15, 31, 0) else {
+                        return;
+                    };
+                    let now_time = now_ist.time();
+                    if now_time >= target_time {
+                        debug!(
+                            now = %now_time,
+                            "cross_verify_1m: skipping (past 15:31 — mid-evening boot)"
+                        );
+                        return;
+                    }
+                    let secs_until = (target_time - now_time).num_seconds().max(0) as u64;
+                    info!(secs_until, "cross_verify_1m: sleeping until 15:31:00 IST");
+                    tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+
+                    // IST-midnight-as-epoch nanos (our candles_1m `ts` stores
+                    // IST wall-clock as an epoch — data-integrity.md). The day
+                    // window for the SELECT is [midnight, midnight+24h).
+                    let day_start_secs = today_ist
+                        .and_hms_opt(0, 0, 0)
+                        .map(|dt| dt.and_utc().timestamp())
+                        .unwrap_or(0);
+                    let day_start_ist_nanos = day_start_secs.saturating_mul(1_000_000_000);
+                    let run_ts_ist_nanos = Utc::now()
+                        .timestamp()
+                        .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
+                        .saturating_mul(1_000_000_000);
+
+                    let summary = tickvault_app::cross_verify_1m_boot::run_cross_verify_1m(
+                        &cv_targets,
+                        cv_token,
+                        cv_qcfg,
+                        cv_base,
+                        today_ist,
+                        day_start_ist_nanos,
+                        run_ts_ist_nanos,
+                        tickvault_app::cross_verify_1m_boot::default_csv_dir(),
+                    )
+                    .await;
+                    info!(
+                        instruments = summary.instruments_checked,
+                        compared = summary.stats.compared,
+                        mismatches = summary.stats.mismatches,
+                        missing = summary.stats.missing_ours,
+                        degraded = summary.degraded,
+                        "PROOF: cross_verify_1m fired @ 15:31:00 IST"
+                    );
+                });
+                info!("cross_verify_1m: post-market verification task spawned");
+            }
+
             // Wave 3-C Item 12 (2026-04-28): market-open self-test at
             // 09:16:00 IST — a single tri-state verdict
             // (Passed / Degraded / Critical) over 7 sub-checks. Fires

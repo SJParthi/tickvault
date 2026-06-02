@@ -139,6 +139,33 @@ and replaced with the hard bans in this rule.
       daily candle is NSE's authoritative O/H/L/C/V — the same exact-match
       reason the operator cited for the intraday chart-vs-tick gap.
 
+11. **Post-market 1-minute cross-verification — RE-ALLOWED 2026-06-02 (operator
+    directive, narrowed).** Operator quote: *"put back the historical cross
+    verification at precise 3.31 pm onwards … dhan historical intraday … one
+    minute candle OHLCV … among our candles_1m … csv … exact match … only for
+    one min alone … for all those subscribed spot instruments"* + *"csv and
+    exact match cross verification is needed."*
+
+    RE-ALLOWS a STRICTLY BOUNDED post-market read-only compare, distinct from
+    the deleted `cross_verify.rs` chain:
+    - **When:** 15:31:00 IST, once per trading day, cold path, market-hours
+      gated (audit Rule 3).
+    - **What:** for every subscribed **spot** SID, fetch Dhan **intraday**
+      1-minute candles (`POST /v2/charts/intraday`, interval `"1"`) and compare
+      OHLCV timestamp-by-timestamp, **EXACT**, against our live `candles_1m`
+      (READ-only SELECT).
+    - **Output:** mismatches → `cross_verify_1m_audit` QuestDB table (DEDUP
+      `(trading_date_ist, security_id, segment, minute_ts_ist, field)` —
+      I-P1-11) + `data/cross-verify/cross-verify-1m-YYYY-MM-DD.csv` + Telegram
+      count via `error!(code = CROSS-VERIFY-1M-01/02)`.
+    - **NOT** the deleted 90-day chain: 1-minute only, spot only, today only,
+      post-market only, no other timeframe, no synthesized ticks into `ticks`
+      (rules 1–6 stand), lives in `crates/app/src/cross_verify_1m_boot.rs` +
+      `crates/storage/src/cross_verify_1m_audit_persistence.rs` (NOT under
+      `crates/core/src/historical/`).
+    - **Reads `candles_1m`** (allowed — "Reading `ticks`/`candles_*` from
+      pipeline code is ALLOWED"); writes ONLY to the new audit table + CSV.
+
 ## Test ratchet
 
 - Pre-commit hook (banned-pattern-scanner.sh, category 6) — fails the
