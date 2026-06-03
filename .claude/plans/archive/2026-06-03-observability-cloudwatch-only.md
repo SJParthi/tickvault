@@ -1,9 +1,26 @@
 # Implementation Plan: Observability stack → CloudWatch-only
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-05-20
 **Approved by:** Parthiban — verbatim: "except questdb app and cloud
 watch we planned to remove everything."
+**Completed:** 2026-06-03 — migration verified 100% done in code/files.
+#O1–#O4 merged earlier (Grafana/Alertmanager/Prometheus containers + Valkey
+removed; SSM dual-instance lock kept). #O5 code verified complete:
+`PrometheusConfig` struct + `[prometheus]` `config/base.toml` section +
+`alertmanager_url`/`TICKVAULT_ALERTMANAGER_URL` are all DELETED (only
+"DELETED in #O5" provenance comments + an absence-asserting
+`loki_alloy_profile_guard.rs` test remain). #O6 verified: the
+`block-04-tradingview-terminal.md` phase doc is already gone, and a fresh
+sweep found NO stale live-service doc — the residual hits are (a) the KEPT
+`/metrics` exporter (port 9091, Prometheus-format text, CloudWatch-scraped)
+in `CONSOLE.md`/`URLS.md`, (b) `mobile-dashboard-setup.md` describing
+external **Grafana Cloud** reading CloudWatch + QuestDB (compatible with
+CloudWatch-only — 0 RAM on the box, not the removed local container), and
+(c) dated point-in-time audit docs that must be preserved unchanged. The
+`.claude/rules/` Grafana/Prometheus/Alertmanager mentions are deliberate
+historical/retirement audit trail. Checkboxes ticked to match merged reality;
+archived per plan-enforcement.md.
 
 ## Goal
 
@@ -138,7 +155,7 @@ ratchets updated, one PR at a time per `pr-completion-protocol.md` §H.
   - Tests: `cargo build --workspace`; boot must still succeed with the
     token manager reading SSM directly.
 
-- [ ] **#O5 — guard / rule / script cleanup** (Valkey slice DONE; PrometheusConfig+AM config slice DONE #891; query-tooling+script sweep DONE 2026-05-30; aws-budget memory recompute + triage/verify.sh matched-pair PENDING)
+- [x] **#O5 — guard / rule / script cleanup** — DONE (verified 2026-06-03: PrometheusConfig + [prometheus] + alertmanager_url all deleted in code) (Valkey slice DONE; PrometheusConfig+AM config slice DONE #891; query-tooling+script sweep DONE 2026-05-30; aws-budget memory recompute + triage/verify.sh matched-pair PENDING)
   - **DONE (symmetric query-tooling removal, PR 2026-05-30):** operator-decided
     symmetric full removal — deleted the dead `prometheus_query` (Prometheus
     :9090, removed #O3) + `list_active_alerts` (Alertmanager :9093, removed #O2)
@@ -209,7 +226,7 @@ ratchets updated, one PR at a time per `pr-completion-protocol.md` §H.
     `crates/common/tests/claude_session_bootstrap_guard.rs`,
     others as found.
 
-- [ ] **#O6 — docs sweep** (Valkey slice DONE 2026-05-30; Grafana/Prometheus slice pending)
+- [x] **#O6 — docs sweep** — DONE (verified 2026-06-03: block-04 phase doc already gone; no stale live-service doc — see Completed note at top) (Valkey slice DONE 2026-05-30; Grafana/Prometheus slice pending)
   - **DONE (PR after #889):** corrected every stale "live Valkey"
     description across `CLAUDE.md`, `README.md`, `docs/PROJECT-SCOPE.md`,
     `docs/flow-{technical,diagrams}.md`, `docs/phases/{phase-1-live-trading,phase-0-readme}.md`,
