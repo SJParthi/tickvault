@@ -167,11 +167,19 @@ This plan closes them, each with a ratchet test so they can't regress.
   sampled metric). 3/3 green in 0.08s.
   - Files: `crates/storage/tests/chaos_midnight_seal_burst.rs`.
 
-- [ ] **PR-7 (G6+G7) — compound-failure chaos tests.** (a) SIGKILL mid-batch-flush
-  → DEDUP absorbs, zero dup/loss; (b) disk-full + QuestDB-down simultaneously →
-  DLQ NDJSON captures every payload.
-  - Files: `crates/storage/tests/chaos_sigkill_mid_flush.rs`,
-    `crates/storage/tests/chaos_disk_full_plus_questdb_down.rs`.
+- [x] **PR-7 (G6+G7) — compound-failure chaos tests.** (PR #TBD) Verified the
+  TICK path already has both (`chaos_sigkill_replay.rs` + `chaos_disk_full.rs`),
+  so — per audit Rule 13 (no redundant tests) — PR-7 targets the genuinely
+  uncovered **SEAL absorption path** (PR-6's new surface): (a) `chaos_seal_sigkill_spill_replay.rs`
+  — 20K seals spilled then SIGKILL (drop without clear); fresh writer `read_all`
+  recovers all 20K byte-exact, in order, and idempotently (re-read = identical
+  set → DEDUP-safe, zero dup/loss); (b) `chaos_seal_disk_full_dlq_capture.rs` —
+  spill dir made unusable (regular-file-at-path → cross-platform, no flaky
+  chmod) + QuestDB down → ring overflow → spill FAILS → DLQ captures every one
+  of 2,500 overflow seals (dropped=0; DLQ NDJSON read back == 2,500). Both run
+  in normal CI. 2/2 green.
+  - Files: `crates/storage/tests/chaos_seal_sigkill_spill_replay.rs`,
+    `crates/storage/tests/chaos_seal_disk_full_dlq_capture.rs`.
 
 - [ ] **PR-8 (H1+H2) — hot-path zero-copy + lossless candles (BIGGER — needs
   its own approval/agent pass).** Pass `Bytes` (Arc clone) into the WAL append
