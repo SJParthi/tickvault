@@ -756,6 +756,23 @@ rules:
       consumer. Escalate (Telegram + draft Issue) so the operator restarts
       the app per the runbook.
 
+  - name: disk-watcher-01-respawn-escalate
+    match:
+      code: DISK-WATCHER-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      DISK-WATCHER-01 means the supervisor respawned the spill disk-health
+      watcher after it died (panic/cancel). A single respawn self-heals — the
+      watcher resumes and disk-free monitoring (the "disk full + QuestDB down"
+      early warning) continues. But a sustained respawn rate means a real bug
+      in the probe loop. Mirrors WS-GAP-05; the CloudWatch alarm pages on a
+      flapping watcher. Escalate (Telegram + draft Issue) so the operator can
+      correlate the panic backtrace, with a 5-min cooldown to avoid spamming
+      on the benign one-off respawn at shutdown.
+
   - name: auth-gap-03-token-force-renewal-on-wake-silence
     match:
       code: AUTH-GAP-03

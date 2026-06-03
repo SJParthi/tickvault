@@ -141,10 +141,22 @@ This plan closes them, each with a ratchet test so they can't regress.
   - Verified: wiring guard 3/3 (emit-site + EMF-filter + count); core clippy
     `-D warnings` exit 0; name-stability test green.
 
-- [ ] **PR-5 (G3) — supervise the disk-health watcher.** Name the handle, run it
-  under the `respawn_dead_connections_loop` (WS-GAP-05) pattern so a panic
-  respawns + alerts instead of vanishing.
-  - Files: `crates/app/src/main.rs`, supervisor wiring, source-scan guard.
+- [x] **PR-5 (G3) — supervise the disk-health watcher.** (PR #TBD) Replaced the
+  fire-and-forget `_disk_health_watcher_handle` with
+  `spawn_supervised_spill_disk_health_watcher` (WS-GAP-05 pattern): on watcher
+  panic/cancel it logs `DISK-WATCHER-01`, increments
+  `tv_disk_watcher_respawn_total{reason}` (new CloudWatch alarm
+  `tv-<env>-disk-watcher-respawn`, count-guard 15→16), and respawns after a
+  5s backoff so disk-free monitoring continues. New `DiskWatcher01Respawned`
+  ErrorCode (Low) + runbook in `wave-2-error-codes.md`.
+  - Files: `crates/storage/src/disk_health_watcher.rs` (supervisor +
+    `classify_join_exit` + 5 tests), `crates/app/src/main.rs`,
+    `crates/common/src/error_code.rs`, `deploy/aws/terraform/app-alarms.tf`,
+    `deploy/aws/terraform/user-data.sh.tftpl`,
+    `crates/common/tests/cloudwatch_app_alarms_wiring.rs`,
+    `.claude/rules/project/wave-2-error-codes.md`.
+  - Tests: `disk_watcher_supervisor_guard.rs` (2, source-scan), supervisor
+    unit tests (5), `error_code` count+prefix (bumped 100→101).
 
 - [ ] **PR-6 (G5) — `chaos_midnight_seal_burst.rs`.** Fire ~99K synthetic seals
   in one batch; assert `tv_seal_absorption_total{tier="dropped"} == 0` and the

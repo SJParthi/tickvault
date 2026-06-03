@@ -2461,8 +2461,15 @@ async fn main() -> Result<()> {
     // Closes the highest-risk hole in the zero-loss chain ("disk full +
     // QuestDB down simultaneously"). Operator now gets ~hours of warning
     // via `tv_spill_dir_free_bytes` gauge before the spill disk fills.
-    let _disk_health_watcher_handle =
-        tickvault_storage::disk_health_watcher::spawn_spill_disk_health_watcher(
+    //
+    // G3 (zero-tick-loss audit PR-5): run the watcher UNDER A SUPERVISOR
+    // (mirrors the WS-GAP-05 pool supervisor) so a panic in the watcher
+    // respawns it + logs DISK-WATCHER-01 + increments
+    // `tv_disk_watcher_respawn_total` (CloudWatch-alarmed) instead of
+    // silently vanishing — previously this handle was bound to `_` and a
+    // watcher panic killed disk-free monitoring with no signal.
+    let _disk_health_watcher_supervisor =
+        tickvault_storage::disk_health_watcher::spawn_supervised_spill_disk_health_watcher(
             std::path::PathBuf::from("data/spill"),
         );
 

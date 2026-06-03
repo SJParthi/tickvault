@@ -200,6 +200,14 @@ pub enum ErrorCode {
     /// no ticks reach the pipeline until the consumer/app restarts.
     /// Severity::High.
     WsGap07LiveChannelClosed,
+    /// DISK-WATCHER-01: the spill disk-health watcher task exited
+    /// (panic/cancel) and the supervisor respawned it so free-space
+    /// monitoring — the early-warning for the "disk full + QuestDB down"
+    /// zero-loss gap — keeps running instead of vanishing silently.
+    /// Mirrors the WS-GAP-05 pool-supervisor pattern. Severity::Low
+    /// (respawn self-heals; the `tv_disk_watcher_respawn_total` counter
+    /// feeds a CloudWatch alarm that pages on a flapping watcher).
+    DiskWatcher01Respawned,
     /// AUTH-GAP-03: token force-renewed on WebSocket wake.
     AuthGap03TokenForceRenewedOnWake,
     /// BOOT-01: slow-boot QuestDB readiness deadline approaching (>30s).
@@ -577,6 +585,7 @@ impl ErrorCode {
             Self::WsGap05PoolRespawn => "WS-GAP-05",
             Self::WsGap06TickGapSummary => "WS-GAP-06",
             Self::WsGap07LiveChannelClosed => "WS-GAP-07",
+            Self::DiskWatcher01Respawned => "DISK-WATCHER-01",
             Self::AuthGap03TokenForceRenewedOnWake => "AUTH-GAP-03",
             Self::Boot01QuestDbSlow => "BOOT-01",
             Self::Boot02DeadlineExceeded => "BOOT-02",
@@ -779,6 +788,7 @@ impl ErrorCode {
             | Self::HotPath02WriterQueueDrop
             | Self::WsGap04PostCloseSleep
             | Self::WsGap05PoolRespawn
+            | Self::DiskWatcher01Respawned
             | Self::AuthGap03TokenForceRenewedOnWake
             | Self::Telegram02CoalescerStateInconsistency => Severity::Low,
         }
@@ -828,6 +838,7 @@ impl ErrorCode {
             | Self::WsGap05PoolRespawn
             | Self::WsGap06TickGapSummary
             | Self::WsGap07LiveChannelClosed
+            | Self::DiskWatcher01Respawned
             | Self::AuthGap03TokenForceRenewedOnWake
             | Self::Boot01QuestDbSlow
             | Self::Boot02DeadlineExceeded
@@ -993,6 +1004,7 @@ impl ErrorCode {
             Self::WsGap05PoolRespawn,
             Self::WsGap06TickGapSummary,
             Self::WsGap07LiveChannelClosed,
+            Self::DiskWatcher01Respawned,
             Self::AuthGap03TokenForceRenewedOnWake,
             Self::Boot01QuestDbSlow,
             Self::Boot02DeadlineExceeded,
@@ -1297,7 +1309,9 @@ mod tests {
         // CROSS-VERIFY-1M-02 (intraday fetch degraded).
         // 2026-06-03 (zero-tick-loss PR-2 — G2): bumped 99 -> 100 for
         // WS-GAP-07 (live frame channel closed — tick consumer died).
-        assert_eq!(ErrorCode::all().len(), 100);
+        // 2026-06-03 (zero-tick-loss PR-5 — G3): bumped 100 -> 101 for
+        // DISK-WATCHER-01 (spill disk-health watcher respawned by supervisor).
+        assert_eq!(ErrorCode::all().len(), 101);
     }
 
     #[test]
@@ -1350,7 +1364,9 @@ mod tests {
                 // Sub-PR #9 of 2026-05-27 daily-universe expansion
                 || s.starts_with("INSTR-FETCH-")
                 // Operator 2026-06-02: post-market 1-minute cross-verification
-                || s.starts_with("CROSS-VERIFY-1M-");
+                || s.starts_with("CROSS-VERIFY-1M-")
+                // zero-tick-loss PR-5 (G3): supervised disk-health watcher
+                || s.starts_with("DISK-WATCHER-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
