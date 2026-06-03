@@ -160,6 +160,71 @@ fn spill_record_preserves_close_pct_field() {
 // Self-tests for the helper (so the guard itself can't silently no-op)
 // ============================================================================
 
+// ============================================================================
+// 6. Operator request 2026-06-02 — `change_pct` + `open_gap_pct` columns must
+//    stay wired end-to-end across the SAME persist chain (DDL + ALTER + ILP
+//    write + seal-row struct + spill record). `change_pct` is DERIVED from
+//    `close_pct_from_prev_day` at the seal-row extractor (no LiveCandleState
+//    field), so its struct/spill presence is the row/serialized-seal field.
+// ============================================================================
+
+/// Assert a derived/stamped pct column is wired across DDL, ALTER, ILP write,
+/// seal-row struct and spill record.
+fn assert_pct_column_wired_end_to_end(col: &str) {
+    let (sp_path, sp) = storage_src("shadow_persistence.rs");
+    let sp = code_only(&sp);
+    assert!(
+        sp.contains(&format!("{col}                  DOUBLE"))
+            || sp.contains(&format!("{col}                DOUBLE"))
+            || sp.contains(&format!("{col} DOUBLE")),
+        "{}: candle CREATE TABLE DDL must declare `{col} DOUBLE` (operator \
+         request 2026-06-02).",
+        sp_path.display()
+    );
+    assert!(
+        sp.contains(&format!("ADD COLUMN IF NOT EXISTS {col} DOUBLE")),
+        "{}: candle schema self-heal must `ALTER TABLE {{table}} ADD COLUMN IF \
+         NOT EXISTS {col} DOUBLE;` so upgraded deployments backfill the column.",
+        sp_path.display()
+    );
+
+    let (w_path, w) = storage_src("shadow_candle_writer.rs");
+    let w = code_only(&w);
+    assert!(
+        w.contains(&format!(".column_f64(\"{col}\"")),
+        "{}: the ILP `append_seal` builder must emit `.column_f64(\"{col}\", \
+         row.{col})` — a DDL column never written stays NULL.",
+        w_path.display()
+    );
+
+    let (r_path, r) = storage_src("shadow_seal_columns.rs");
+    let r = code_only(&r);
+    assert!(
+        r.contains(&format!("pub {col}: f64")),
+        "{}: the persisted seal-row struct must carry `pub {col}: f64`.",
+        r_path.display()
+    );
+
+    let (s_path, s) = storage_src("seal_spill.rs");
+    let s = code_only(&s);
+    assert!(
+        s.contains(&format!("pub {col}: f64")),
+        "{}: the on-disk spill record must carry `pub {col}: f64` so an \
+         overflowed seal still re-persists the % on replay (zero-loss).",
+        s_path.display()
+    );
+}
+
+#[test]
+fn change_pct_column_wired_end_to_end() {
+    assert_pct_column_wired_end_to_end("change_pct");
+}
+
+#[test]
+fn open_gap_pct_column_wired_end_to_end() {
+    assert_pct_column_wired_end_to_end("open_gap_pct");
+}
+
 #[test]
 fn self_test_code_only_strips_comments_keeps_code() {
     let sample = "// close_pct_from_prev_day in a comment\nlet x = close_pct_from_prev_day;";

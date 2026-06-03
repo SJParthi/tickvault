@@ -88,6 +88,51 @@ fn hot_path_c2_now_ist_secs_hoisted_to_frame_level() {
     );
 }
 
+/// Regression: 2026-06-02 — zero-tick-loss WAL must be fail-closed. The WAL
+/// (`WsFrameSpill`) is the durable floor of the ring → spill → WAL chain; if it
+/// can't init at boot, running without it admits SILENT frame loss under
+/// backpressure. The boot MUST `std::process::exit(1)` rather than proceed with
+/// `wal_spill = None`. Pins fail-closed so it can't regress to degraded mode.
+#[test]
+fn test_regression_ws_frame_wal_init_is_fail_closed() {
+    let src = read("app/src/main.rs");
+    assert!(
+        src.contains("HALTING boot (fail-closed)") && src.contains("WsFrameSpill"),
+        "main.rs must HALT boot (fail-closed) when WsFrameSpill init fails — \
+         the WAL is the zero-tick-loss durability floor"
+    );
+    assert!(
+        !src.contains("proceeding WITHOUT durable WAL"),
+        "main.rs must NOT proceed without the durable WAL (degraded mode removed \
+         2026-06-02 — would admit silent tick loss)"
+    );
+}
+
+/// Regression: 2026-06-02 — prod deploy of 8debad0 failed because the prev_oi
+/// cache was repointed (PR #979) from `candles_1d` to the NEW `prev_day_ohlcv`
+/// table, which may not exist on a fresh box when the boot-ordering gate's
+/// blocking load runs. A missing table → load Err → gate AwaitingOiCache →
+/// try_authorize_subscribe() false → std::process::exit(1) → systemd marks
+/// tickvault.service failed → deploy aborts. The fix ensures the table exists
+/// BEFORE the load. This guard pins that ordering so it can't regress.
+#[test]
+fn test_regression_prev_day_ohlcv_table_ensured_before_prev_oi_load() {
+    let src = read("app/src/main.rs");
+    let ensure_idx = src
+        .find("ensure_prev_day_ohlcv_table(")
+        .expect("main.rs must ensure prev_day_ohlcv table before the prev_oi load");
+    let load_idx = src
+        .find(".load_from_questdb(&config.questdb)")
+        .expect("main.rs must load prev_oi_cache from QuestDB at boot");
+    assert!(
+        ensure_idx < load_idx,
+        "ensure_prev_day_ohlcv_table() MUST be called BEFORE \
+         prev_oi_cache.load_from_questdb() — otherwise a missing prev_day_ohlcv \
+         table on a fresh box makes the boot-ordering gate exit(1) and the \
+         deploy fails (regression 2026-06-02, commit 8debad0)"
+    );
+}
+
 /// Hostile C1 ratchet: midnight rollover task is spawned in slow boot.
 /// Without this, ~24,300 ticks at 09:15 IST on Day N+1 trigger false
 /// VOLUME-MONO-01 alerts (per L13).

@@ -86,21 +86,12 @@ fn h3_main_rs_emits_empty_cache_diagnostic() {
     );
 }
 
-#[test]
-fn h2_phase_code_to_str_returns_unknown_for_out_of_range() {
-    let src = read("storage/src/tick_persistence.rs");
-    // The function body must explicitly return "UNKNOWN" on the
-    // catch-all arm — not "PREMARKET".
-    assert!(
-        src.contains("\"UNKNOWN\""),
-        "phase_code_to_str must return \"UNKNOWN\" for out-of-range codes (H2 drift hazard fix)"
-    );
-    // Confirm the producer-side counter exists.
-    assert!(
-        src.contains("tv_phase_code_unknown_total"),
-        "phase_code_to_str must increment tv_phase_code_unknown_total on the UNKNOWN arm"
-    );
-}
+// REMOVED 2026-06-02 (CI rot fix): `h2_phase_code_to_str_returns_unknown_for_out_of_range`.
+// The `phase_code_to_str` function + its `tv_phase_code_unknown_total` counter
+// were deleted from `tick_persistence.rs` when the per-tick phase-code column
+// was removed (candle-engine re-architecture). The H2 drift-hazard concern no
+// longer has any production surface to guard — the test scanned for strings
+// that no longer exist anywhere in the workspace.
 
 #[test]
 fn security_h_load_error_http_request_does_not_embed_reqwest_display() {

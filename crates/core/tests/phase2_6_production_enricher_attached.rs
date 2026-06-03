@@ -48,14 +48,22 @@ fn slow_boot_loads_prev_oi_cache_from_questdb() {
 }
 
 #[test]
-fn slow_boot_handles_prev_oi_cache_load_error_gracefully() {
+fn slow_boot_handles_prev_oi_cache_load_error_fail_closed() {
     let src = read_main();
-    // The match arm against load_from_questdb's Result must contain
-    // both an Ok branch (info log) and an Err branch (warn log) so
-    // a transient QuestDB failure does NOT kill boot.
+    // Updated 2026-06-02 (Phase 2.9 H1): the prev_oi_cache load is now
+    // FAIL-CLOSED, not graceful. The match arm against load_from_questdb's
+    // Result must contain both an Ok branch (info log) and an Err branch
+    // that logs at ERROR with the typed PREVCLOSE-01 code and leaves the
+    // boot-ordering gate in AwaitingOiCache (→ try_authorize_subscribe()
+    // false → process::exit(1)). A transient QuestDB failure HALTS the boot
+    // so systemd restarts it rather than subscribing with unhealthy state.
     assert!(
-        src.contains("prev_oi_cache load failed"),
-        "main.rs must log the prev_oi_cache load failure as a warn (graceful degradation per L14)"
+        src.contains("prev_oi_cache load FAILED"),
+        "main.rs must log the prev_oi_cache load failure at ERROR (fail-closed per L14 / PREVCLOSE-01)"
+    );
+    assert!(
+        src.contains("tv_prev_oi_cache_load_total"),
+        "main.rs must emit the tv_prev_oi_cache_load_total counter (outcome label) on both load branches"
     );
     assert!(
         src.contains("prev_oi_cache loaded for tick enricher"),

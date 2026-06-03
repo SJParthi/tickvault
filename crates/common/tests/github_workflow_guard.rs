@@ -139,7 +139,7 @@ fn r5_uses_pinned_configure_aws_credentials_action() {
 fn r6_has_market_hours_guard_job() {
     let body = read(WORKFLOW);
     must_contain(&body, "guard-market-hours:", "guard-market-hours job");
-    must_contain(&body, "03:45-10:00 UTC", "IST market-hours window comment");
+    must_contain(&body, "03:30-10:15 UTC", "IST market-hours window comment");
     must_contain(&body, "confirm_market_hours", "override input present");
 }
 
@@ -413,5 +413,35 @@ fn r19_bootstrap_runbook_documents_one_shot_script_as_recommended_path() {
         &body,
         "aws-one-shot-bootstrap.sh",
         "runbook recommends the one-shot script as the automated path",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CI test-matrix gate (2026-06-02) — the PR `test` matrix MUST run the full
+// per-crate suite (unit + integration), NOT just `--lib`. A `--lib`-only gate
+// let integration targets rot silently until the post-merge Coverage & Perf
+// job, which sat chronically RED for days (#988). Ratchet so it can't regress.
+// ---------------------------------------------------------------------------
+
+const CI_WORKFLOW: &str = ".github/workflows/ci.yml";
+
+#[test]
+fn r17_ci_test_matrix_runs_integration_tests_not_just_lib() {
+    let ci = read(CI_WORKFLOW);
+    // The per-crate nextest run line must exist...
+    must_contain(
+        &ci,
+        "cargo nextest run -p tickvault-${{ matrix.crate }}",
+        "ci.yml test matrix",
+    );
+    // ...and it must NOT restrict to `--lib` (which would skip the
+    // integration targets and let them rot — the #988 root cause).
+    assert!(
+        !ci.contains(
+            "cargo nextest run -p tickvault-${{ matrix.crate }} ${{ matrix.features }} --lib"
+        ),
+        "ci.yml test matrix MUST NOT use `--lib` — that skips integration tests \
+         in crates/*/tests/ and lets them rot silently until the post-merge \
+         Coverage & Perf job (#988 root cause). Run the full per-crate suite."
     );
 }

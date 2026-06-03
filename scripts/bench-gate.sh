@@ -45,8 +45,10 @@ import json, sys, os, re
 
 # Parse budgets TOML (simple parser)
 budgets = {}
+elements = {}
 max_regression = 5.0
 in_budgets = False
+in_elements = False
 with open('$BUDGETS_FILE') as f:
     for line in f:
         line = line.strip()
@@ -55,15 +57,25 @@ with open('$BUDGETS_FILE') as f:
             continue
         if line == '[budgets]':
             in_budgets = True
+            in_elements = False
             continue
-        if line.startswith('[') and line != '[budgets]':
+        if line == '[elements]':
+            in_elements = True
             in_budgets = False
+            continue
+        if line.startswith('[') and line not in ('[budgets]', '[elements]'):
+            in_budgets = False
+            in_elements = False
             continue
         if in_budgets and '=' in line and not line.startswith('#'):
             key, val = line.split('=', 1)
             # Strip inline comments
             val = val.split('#')[0].strip()
             budgets[key.strip()] = float(val)
+        if in_elements and '=' in line and not line.startswith('#'):
+            key, val = line.split('=', 1)
+            val = val.split('#')[0].strip()
+            elements[key.strip()] = int(val)
 
 failed = False
 checked = 0
@@ -84,6 +96,21 @@ for root, dirs, files in os.walk(criterion_dir):
         # Get median estimate in nanoseconds
         median_ns = data.get('median', {}).get('point_estimate', 0)
 
+        # Per-element normalization: batch benchmarks process N elements per
+        # Criterion iteration (e.g. pipeline/batch_100_mixed runs 100 ticks per
+        # measured iter). The budgets are PER-ELEMENT (e.g. pipeline < 100ns/
+        # tick), so divide the batch median by its element count before
+        # comparing. Benches not listed in [elements] default to 1 (no change).
+        # Without this, the gate compared a 100-tick batch median against a
+        # 1-tick budget — a unit bug that made the pipeline gate fail by
+        # construction even though per-tick latency was ~20x under budget.
+        n_elements = 1
+        for key in elements:
+            if key in bench_name or bench_name in key:
+                n_elements = max(1, elements[key])
+                break
+        per_elem_ns = median_ns / n_elements
+
         # Normalize bench name for budget lookup
         # Try exact match, then underscore-normalized
         budget_ns = None
@@ -94,11 +121,12 @@ for root, dirs, files in os.walk(criterion_dir):
 
         if budget_ns is not None:
             checked += 1
-            if median_ns > budget_ns:
-                print(f'  FAIL: {bench_name}: {median_ns:.0f}ns (budget: {budget_ns:.0f}ns)')
+            unit = f' ({median_ns:.0f}ns / {n_elements})' if n_elements > 1 else ''
+            if per_elem_ns > budget_ns:
+                print(f'  FAIL: {bench_name}: {per_elem_ns:.0f}ns{unit} (budget: {budget_ns:.0f}ns)')
                 failed = True
             else:
-                print(f'  PASS: {bench_name}: {median_ns:.0f}ns (budget: {budget_ns:.0f}ns)')
+                print(f'  PASS: {bench_name}: {per_elem_ns:.0f}ns{unit} (budget: {budget_ns:.0f}ns)')
         else:
             print(f'  INFO: {bench_name}: {median_ns:.0f}ns (no budget defined — skipping)')
 

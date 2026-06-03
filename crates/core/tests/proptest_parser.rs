@@ -229,32 +229,29 @@ proptest! {
 proptest! {
     #[test]
     #[allow(clippy::arithmetic_side_effects)]
-    fn proptest_market_depth_fields_preserved(
+    fn proptest_market_depth_code3_is_rejected_in_v2(
         security_id in 1..u32::MAX,
         ltp in 0.01_f32..100_000.0,
     ) {
+        // Regression 2026-06-02: response code 3 (v1 `MarketDepth`) was RETIRED
+        // in the Dhan v2 migration — v2 subscriptions never receive it, and the
+        // parser must REJECT it (annexure-enums rule 4: "Unknown codes must
+        // log + skip. Never panic."). The previous test parsed a code-3 packet
+        // and `.unwrap()`-ed a `TickWithDepth`, which now panics with
+        // `UnknownResponseCode(3)`. The correct invariant: code 3 → Err, never a
+        // parsed frame, never a panic — for ANY (security_id, ltp).
         let mut buf = vec![0u8; MARKET_DEPTH_PACKET_SIZE];
-        buf[0] = 3; // RESPONSE_CODE_MARKET_DEPTH
+        buf[0] = 3; // retired v1 RESPONSE_CODE_MARKET_DEPTH
         buf[1..3].copy_from_slice(&(MARKET_DEPTH_PACKET_SIZE as u16).to_le_bytes());
         buf[3] = EXCHANGE_SEGMENT_NSE_FNO;
         buf[4..8].copy_from_slice(&security_id.to_le_bytes());
         buf[8..12].copy_from_slice(&ltp.to_le_bytes());
 
-        let parsed = dispatch_frame(&buf, 0).unwrap();
-
-        match parsed {
-            ParsedFrame::TickWithDepth(tick, depth) => {
-                prop_assert_eq!(tick.security_id, security_id);
-                prop_assert_eq!(tick.last_traded_price, ltp);
-                prop_assert_eq!(tick.exchange_segment_code, EXCHANGE_SEGMENT_NSE_FNO);
-                // Market depth has no timestamp, volume, OI
-                prop_assert_eq!(tick.exchange_timestamp, 0);
-                prop_assert_eq!(tick.volume, 0);
-                prop_assert_eq!(tick.open_interest, 0);
-                prop_assert_eq!(depth.len(), 5);
-            }
-            other => prop_assert!(false, "expected TickWithDepth, got: {other:?}"),
-        }
+        // Must not panic AND must not produce a parsed frame — code 3 is unknown.
+        prop_assert!(
+            dispatch_frame(&buf, 0).is_err(),
+            "retired v1 response code 3 must be rejected in v2, not parsed"
+        );
     }
 }
 

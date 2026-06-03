@@ -39,8 +39,12 @@ fn h1_l14_refusal_calls_process_exit() {
 #[test]
 fn h1_l14_refusal_logs_typed_error_code() {
     let src = read_main();
+    // PR #5 (2026-05-19) retagged the L14 refusal from
+    // `Phase2Ready01PreflightFailed` (retired with the Phase 2 dispatcher)
+    // to `PrevClose01IlpFailed`, which matches the "PREVCLOSE-01" message
+    // reference per the error_code_tag_guard meta-test invariant.
     assert!(
-        src.contains("ErrorCode::Phase2Ready01PreflightFailed"),
+        src.contains("ErrorCode::PrevClose01IlpFailed"),
         "main.rs must tag the L14 refusal with a typed ErrorCode (Phase 2.9 H1 fix)"
     );
 }

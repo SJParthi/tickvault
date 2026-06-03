@@ -472,11 +472,18 @@ async fn main() -> Result<()> {
             error!(
                 ?err,
                 dir = %ws_wal_dir,
-                "STAGE-C: failed to initialize WsFrameSpill — proceeding WITHOUT durable WAL. \
-                 This is a degraded mode: zero-tick-loss guarantee is NOT active. \
-                 Investigate disk permissions and free space immediately."
+                "STAGE-C: failed to initialize WsFrameSpill — HALTING boot (fail-closed). \
+                 The durable WAL is the zero-tick-loss guarantee (ring → spill → WAL); \
+                 running WITHOUT it would admit SILENT frame loss under channel \
+                 backpressure. Fix disk permissions/free space, then restart."
             );
-            None
+            // Zero-tick-loss fail-closed (operator mandate 2026-06-02: "ticks
+            // should never ever be lost … irrespective of any situation").
+            // The WAL is the durable floor of the ring → spill → WAL chain; if it
+            // can't init, the guarantee is void, so we REFUSE to run. systemd
+            // Restart=always re-launches and the operator is paged by the ERROR
+            // above — a loud restart loop beats a silent lossy session.
+            std::process::exit(1);
         }
     };
 
@@ -3009,6 +3016,22 @@ async fn main() -> Result<()> {
         );
         let tick_enricher =
             std::sync::Arc::new(tickvault_core::pipeline::tick_enricher::TickEnricher::new());
+        // 1d-historical-only regression fix (2026-06-02): the prev_oi cache
+        // now loads from `prev_day_ohlcv` (repointed from `candles_1d` in
+        // PR #979). Unlike `candles_1d` — which is always CREATEd early in boot
+        // by `ensure_shadow_candle_tables` — `prev_day_ohlcv` is a NEW table
+        // whose `ensure_*` runs inside the concurrently-spawned boot fetch
+        // task, so on a fresh box's first boot with the new binary it may not
+        // exist yet when the gate-blocking load below runs. A missing table
+        // makes `load_from_questdb` return Err → the boot-ordering gate stays
+        // `AwaitingOiCache` → `try_authorize_subscribe()` fails →
+        // `std::process::exit(1)` → systemd marks tickvault.service failed →
+        // the deploy aborts. Ensure the table exists HERE (idempotent
+        // CREATE TABLE IF NOT EXISTS) so the load hits an existing — possibly
+        // empty (Ok count=0, graceful) — table. A genuine QuestDB-unreachable
+        // still Errs and fail-closes as designed (L14 invariant preserved).
+        tickvault_storage::prev_day_ohlcv_persistence::ensure_prev_day_ohlcv_table(&config.questdb)
+            .await;
         // Phase 2.8 H4 fix: only mark the gate ready on Ok. On Err the
         // gate stays in `AwaitingOiCache` and `try_authorize_subscribe`
         // refuses authorization — the operator gets a typed ERROR
@@ -5030,7 +5053,11 @@ async fn load_daily_universe_plan(
             "subscription plan ready (DailyUniverse — INSTANT warm resubscribe from snapshot)"
         );
         // Timing-proof telemetry: warm path, no cold rebuild this boot.
-        record_instrument_load_telemetry(elapsed_ms, 0, 0, true, 0);
+        // total_rows MUST be the real universe size (was hardcoded 0 — a healthy
+        // 243-SID warm boot then mislabelled itself "0 rows on file", making an
+        // empty universe indistinguishable from a healthy one). 2026-06-02 fix.
+        let warm_total_rows = u64::try_from(universe.total_count()).unwrap_or(0);
+        record_instrument_load_telemetry(elapsed_ms, 0, 0, true, warm_total_rows);
 
         // Background reconcile: refresh lifecycle master + snapshot off the
         // critical path. Failure here does NOT halt — first-tick already flows

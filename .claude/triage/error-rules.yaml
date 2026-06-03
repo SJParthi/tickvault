@@ -1471,3 +1471,41 @@ rules:
       Transient — next trading day's first tick recovers via re-arm.
       Operator inspects tv_day_ohlc_reset_failures_total counter and
       restarts app if persistent.
+
+
+  # -----------------------------------------------------------------------
+  # Post-market 1-minute cross-verification (2026-06-02, narrowed re-allow)
+  # -----------------------------------------------------------------------
+
+  - name: cross-verify-1m-01-mismatch-found-escalate
+    match:
+      code: CROSS-VERIFY-1M-01
+    action: escalate
+    runbook_path: .claude/rules/project/cross-verify-1m-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      CROSS-VERIFY-1M-01 = one or more 1-minute OHLCV cells disagreed
+      (exact compare) between our candles_1m and Dhan intraday for the
+      trading day. Severity::High, data-integrity signal — NOT
+      auto-triage-safe. Track the trend, not the absolute count: our
+      live feed is sampled while Dhan's intraday is built from the full
+      tape, so per-minute high/low drift is expected sampling noise. A
+      sudden spike or sustained open/close drift is a real problem.
+      Operator inspects data/cross-verify/cross-verify-1m-<date>.csv +
+      the cross_verify_1m_audit table.
+
+  - name: cross-verify-1m-02-fetch-degraded-escalate
+    match:
+      code: CROSS-VERIFY-1M-02
+    action: escalate
+    runbook_path: .claude/rules/project/cross-verify-1m-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      CROSS-VERIFY-1M-02 = Dhan intraday REST errored / rate-limited /
+      returned empty for a material fraction of the spot SIDs, so the
+      15:31 IST verification could not vouch for the full universe that
+      day (false-OK avoidance, audit Rule 11). Severity::High. Best-effort
+      run never blocks; next trading day re-runs. Operator checks Dhan
+      Data-API health + the 5/sec, 100k/day rate budget.

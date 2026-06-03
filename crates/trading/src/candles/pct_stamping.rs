@@ -183,6 +183,13 @@ pub fn stamp_seal_pct_fields(state: &mut LiveCandleState, refs: PrevDayRefs) {
     // session open, captured live on `state.session_open` from the Quote
     // `day_open` field (no refs / cache needed — it's on the state).
     state.open_pct = compute_open_pct(state.close, state.session_open);
+    // Operator request 2026-06-02: opening gap % = today's official 09:15
+    // open vs yesterday's close. Reuses `compute_close_pct` (div-by-zero →
+    // 0.0, 2-decimal contract). The companion `change_pct` column (close vs
+    // yesterday's close) is numerically identical to `close_pct_from_prev_day`,
+    // so it is DERIVED at the seal-row extractor rather than stored on the
+    // state (keeps the per-instrument RAM budget — one fewer f64 × 21 TFs).
+    state.open_gap_pct = compute_close_pct(state.session_open, refs.prev_day_close);
 }
 
 #[cfg(test)]
@@ -222,6 +229,57 @@ mod tests {
         state.close = 102.5;
         stamp_seal_pct_fields(&mut state, PrevDayRefs::default());
         assert_eq!(state.open_pct, 2.5, "close 102.5 vs open 100 = +2.5%");
+    }
+
+    #[test]
+    fn test_stamp_seal_sets_open_gap_pct() {
+        // Operator request 2026-06-02. prev_day_close = 100, session_open = 102
+        // → +2% gap-up. (change_pct is derived from close_pct at the seal-row
+        // extractor, not stored on the state — see shadow_seal_columns.)
+        let mut state = LiveCandleState::empty();
+        state.bucket_start_ist_secs = 1_716_000_900;
+        state.session_open = 102.0;
+        state.close = 105.0;
+        let refs = PrevDayRefs {
+            prev_day_close: 100.0,
+            prev_day_oi: 0,
+            prev_day_total_volume: 0,
+        };
+        stamp_seal_pct_fields(&mut state, refs);
+        assert_eq!(
+            state.open_gap_pct, 2.0,
+            "session open 102 vs prev close 100 = +2% gap-up"
+        );
+        // close_pct_from_prev_day (== the derived change_pct) is the day change.
+        assert_eq!(state.close_pct_from_prev_day, 5.0);
+    }
+
+    #[test]
+    fn test_stamp_seal_open_gap_pct_zero_baseline_no_nan() {
+        // prev_day_close = 0 (newly listed / pre-market) → 0.0, never NaN.
+        let mut state = LiveCandleState::empty();
+        state.session_open = 102.0;
+        state.close = 105.0;
+        stamp_seal_pct_fields(&mut state, PrevDayRefs::default());
+        assert_eq!(state.open_gap_pct, 0.0);
+        assert!(!state.open_gap_pct.is_nan());
+    }
+
+    #[test]
+    fn test_stamp_seal_open_gap_pct_negative_gap_down() {
+        // session_open 98 vs prev close 100 → -2% gap-down.
+        let mut state = LiveCandleState::empty();
+        state.session_open = 98.0;
+        state.close = 99.0;
+        let refs = PrevDayRefs {
+            prev_day_close: 100.0,
+            prev_day_oi: 0,
+            prev_day_total_volume: 0,
+        };
+        stamp_seal_pct_fields(&mut state, refs);
+        assert_eq!(state.open_gap_pct, -2.0);
+        // derived change_pct == close_pct_from_prev_day = (99-100)/100 = -1%.
+        assert_eq!(state.close_pct_from_prev_day, -1.0);
     }
 
     #[test]
