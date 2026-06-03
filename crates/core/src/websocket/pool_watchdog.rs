@@ -98,6 +98,30 @@ impl PoolWatchdog {
         self.degraded_alert_fired
     }
 
+    /// Resets the watchdog to the freshly-constructed `Healthy` state and
+    /// clears the `degraded_alert_fired` latch.
+    ///
+    /// **Why this exists (pre-market deferral fix, 2026-06-03):** the
+    /// main-feed pool is intentionally DEFERRED until 09:00 IST — it opens
+    /// zero TCP sockets pre-market because Dhan idle-resets pre-market
+    /// connections. So every connection reads "down" during the deferral
+    /// window and `tick()` accumulates an `AllDown { since }` from ~08:42
+    /// boot. The caller (`spawn_pool_watchdog_task`) calls this once per
+    /// off-hours poll so that stale `since` never carries into the
+    /// `is_within_market_hours_ist()` boundary at 09:00:00 — without it the
+    /// first in-hours poll saw `down_for ≈ 1055s > POOL_HALT_SECS` and
+    /// tripped a `Halt` → `std::process::exit(2)` → supervisor restart,
+    /// paging `[HIGH] WS POOL HALT` + `[HIGH] FAST BOOT` every market open.
+    ///
+    /// After reset, a still-all-down pool starts a FRESH `AllDown` window on
+    /// the next `tick()`, so the genuine in-market 300s halt countdown
+    /// restarts from the post-reset instant rather than inheriting the
+    /// pre-market deferral.
+    pub fn reset(&mut self) {
+        self.state = PoolHealthState::Healthy;
+        self.degraded_alert_fired = false;
+    }
+
     /// Evaluates pool health given the current connection snapshots and
     /// the current time. Pure function — the caller decides what to do
     /// with the verdict.
@@ -399,6 +423,70 @@ mod tests {
             WatchdogVerdict::Healthy,
             "Connecting means we're actively trying — not yet a failure"
         );
+    }
+
+    #[test]
+    fn test_watchdog_reset_returns_to_healthy_from_alldown() {
+        // Drive the watchdog into AllDown with the Degraded alert latched,
+        // then reset — it must return to a freshly-constructed Healthy state.
+        let mut wd = PoolWatchdog::new();
+        let start = Instant::now();
+        wd.tick(&all_reconnecting(), start); // enter AllDown
+        wd.tick(&all_reconnecting(), start + Duration::from_secs(90)); // Degraded fires
+        assert!(wd.degraded_alert_fired());
+        assert!(matches!(wd.state(), PoolHealthState::AllDown { .. }));
+
+        wd.reset();
+
+        assert_eq!(wd.state(), PoolHealthState::Healthy);
+        assert!(
+            !wd.degraded_alert_fired(),
+            "reset must clear the degraded-alert latch"
+        );
+    }
+
+    #[test]
+    fn test_watchdog_reset_restarts_down_timer() {
+        // Pre-market deferral fix: after reset, a still-all-down pool starts
+        // a FRESH AllDown window, so the 300s Halt countdown restarts from
+        // the post-reset instant instead of inheriting the pre-market
+        // deferral. This is exactly what prevents the 09:00:00 false Halt:
+        // the off-hours reset means the first in-hours tick begins a fresh
+        // ZERO-based window, not a ~1055s carried-over one.
+        let mut wd = PoolWatchdog::new();
+        let start = Instant::now();
+        wd.tick(&all_reconnecting(), start);
+        // 290s down — just shy of the 300s Halt threshold.
+        let t_290 = start + Duration::from_secs(290);
+        assert!(matches!(
+            wd.tick(&all_reconnecting(), t_290),
+            WatchdogVerdict::Degrading { .. } | WatchdogVerdict::Degraded { .. }
+        ));
+
+        wd.reset();
+
+        // 5s after reset, still all-down → a fresh AllDown window opens with
+        // down_for == ZERO. Crucially NOT a Halt (which the un-reset 295s
+        // would NOT have been either, but +15s later it WOULD have halted —
+        // here it never can because the timer restarted).
+        let t_295 = start + Duration::from_secs(295);
+        assert_eq!(
+            wd.tick(&all_reconnecting(), t_295),
+            WatchdogVerdict::Degrading {
+                down_for: Duration::ZERO
+            },
+            "after reset the down-timer must restart from zero"
+        );
+    }
+
+    #[test]
+    fn test_watchdog_reset_on_healthy_is_noop() {
+        // Resetting an already-Healthy watchdog must be safe and idempotent.
+        let mut wd = PoolWatchdog::new();
+        wd.tick(&all_connected(), Instant::now());
+        wd.reset();
+        assert_eq!(wd.state(), PoolHealthState::Healthy);
+        assert!(!wd.degraded_alert_fired());
     }
 
     #[test]
