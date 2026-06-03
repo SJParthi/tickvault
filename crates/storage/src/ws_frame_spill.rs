@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use tracing::{error, info, warn};
 
@@ -64,7 +65,11 @@ impl WsType {
 #[derive(Debug)]
 struct WalRecord {
     ws_type: WsType,
-    frame: Vec<u8>,
+    // Zero-tick-loss PR-8a (H1): `Bytes` (Arc-refcounted) so the WS read
+    // loop hands ownership to the disk-writer thread with an O(1) refcount
+    // bump instead of a per-frame `Vec<u8>` malloc. Derefs to `&[u8]`, so
+    // `write_record` / `crc32_ieee_of` / `.len()` are unchanged.
+    frame: Bytes,
 }
 
 /// Result of a hot-path `append()` attempt.
@@ -153,10 +158,18 @@ impl WsFrameSpill {
         })
     }
 
-    /// Hot path. Non-blocking. O(1). Never allocates beyond the caller's Vec.
-    // TEST-EXEMPT: covered by test_append_spill_and_replay_roundtrip + test_drop_counter_increments_when_channel_full
-    pub fn append(&self, ws_type: WsType, frame: Vec<u8>) -> AppendOutcome {
-        let record = WalRecord { ws_type, frame };
+    /// Hot path. Non-blocking. O(1). Zero-allocation: accepts anything
+    /// convertible into `Bytes` and sends it over the pre-allocated crossbeam
+    /// ring — no heap allocation occurs here. The WS read loop passes
+    /// `data.clone()` (an O(1) Arc refcount bump, NOT a `Vec<u8>` copy);
+    /// `Vec<u8>` callers convert via `Bytes::from`, which steals the buffer
+    /// (also zero-copy), so existing callers keep working unchanged.
+    // TEST-EXEMPT: covered by test_append_spill_and_replay_roundtrip + test_drop_counter_increments_when_channel_full; the Bytes-clone hand-off is proven zero-alloc by crates/core/tests/dhat_ws_reader_zero_alloc.rs::dhat_ws_reader_tail_zero_alloc
+    pub fn append(&self, ws_type: WsType, frame: impl Into<Bytes>) -> AppendOutcome {
+        let record = WalRecord {
+            ws_type,
+            frame: frame.into(),
+        };
         match self.spill_tx.try_send(record) {
             Ok(()) => AppendOutcome::Spilled,
             Err(TrySendError::Full(_)) => {

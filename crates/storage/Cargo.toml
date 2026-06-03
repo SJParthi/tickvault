@@ -15,6 +15,10 @@ tickvault-common = { path = "../common" }
 # wiring it.
 tickvault-trading = { path = "../trading" }
 tokio = { workspace = true }
+# Zero-tick-loss PR-8a (H1): the WS read loop hands the WAL spill a `Bytes`
+# (Arc-refcounted, O(1) clone) instead of a per-frame `Vec<u8>` malloc.
+# Workspace-pinned (same version core/app already use).
+bytes = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

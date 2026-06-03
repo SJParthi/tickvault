@@ -1278,13 +1278,12 @@ impl WebSocketConnection {
                     //     path and it requires both the disk writer thread
                     //     AND the downstream consumer to be stuck simultaneously.
                     if let Some(spill) = self.wal_spill.as_ref() {
-                        // O(1) EXEMPT: one Vec<u8> copy per frame (≤162 B for Full packets)
-                        // is required to hand owned memory to the disk writer thread. This
-                        // is O(frame_len) which is bounded by the largest Dhan packet and
-                        // therefore constant-bounded. One alloc per frame at peak 10k
-                        // frames/sec is well within jemalloc headroom.
-                        let frame_vec = data.to_vec();
-                        let outcome = spill.append(WsType::LiveFeed, frame_vec);
+                        // Zero-tick-loss PR-8a (H1): hand the WAL spill an O(1)
+                        // `Bytes` Arc-refcount clone instead of a per-frame
+                        // `Vec<u8>` malloc. `data` is already `Bytes` (the live
+                        // forward below also moves it zero-copy), so `data.clone()`
+                        // is a refcount bump — no heap allocation on the read loop.
+                        let outcome = spill.append(WsType::LiveFeed, data.clone());
                         if outcome == tickvault_storage::ws_frame_spill::AppendOutcome::Dropped {
                             error!(
                                 connection_id = self.connection_id,
