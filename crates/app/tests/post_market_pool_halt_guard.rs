@@ -176,6 +176,64 @@ fn boot_deadline_alert_is_market_hours_gated() {
 }
 
 #[test]
+fn pool_watchdog_is_reset_outside_market_hours() {
+    // Pre-market deferral fix (2026-06-03): the main-feed pool is
+    // intentionally DEFERRED until 09:00 IST (zero TCP sockets opened
+    // pre-market because Dhan idle-resets pre-market connections). Every
+    // connection therefore reads "down" during 08:42→09:00, and the
+    // watchdog stamps an `AllDown { since }` at ~08:42 boot. Without
+    // resetting the watchdog on each off-hours poll, that stale `since`
+    // accumulates and trips the 300s Halt the instant
+    // is_within_market_hours_ist() flips true at 09:00:00 — a forced
+    // std::process::exit(2) + supervisor restart that paged
+    // [HIGH] WS POOL HALT + [HIGH] FAST BOOT every single market open.
+    //
+    // This guards against a future refactor silently dropping that reset.
+    let src = read_main_rs();
+    // Scope to the watchdog task body. Use a generous window from the
+    // poll_watchdog call so the post-match reset (which sits just after the
+    // verdict match) is comfortably inside it.
+    let needle = "let verdict = pool.poll_watchdog();";
+    let start = src
+        .find(needle)
+        .expect("spawn_pool_watchdog_task must contain `let verdict = pool.poll_watchdog();`");
+    let end = (start + 8_000).min(src.len());
+    let block = &src[start..end];
+
+    let reset_idx = block.find("reset_watchdog").expect(
+        "spawn_pool_watchdog_task must call pool.reset_watchdog() so the pre-market \
+         DEFERRED window never accumulates a stale AllDown { since } that trips the \
+         300s Halt at 09:00:00. Removing it re-introduces the daily forced restart \
+         + [HIGH] WS POOL HALT + [HIGH] FAST BOOT pages observed 2026-06-03 09:00 IST.",
+    );
+    // The reset MUST be gated on `!in_market_hours` — resetting in-hours
+    // would defeat the genuine 300s all-down Halt that protects against a
+    // real mid-session feed outage.
+    let gate_idx = block.find("if !in_market_hours").expect(
+        "reset_watchdog must be gated by `if !in_market_hours` — it may run ONLY \
+         off-hours. Resetting during market hours would silently disable the \
+         genuine 300s all-down → Halt safety property.",
+    );
+    assert!(
+        gate_idx < reset_idx,
+        "the `if !in_market_hours` gate must lexically precede the reset_watchdog \
+         call (the reset lives inside the off-hours branch). Found gate at {gate_idx}, \
+         reset at {reset_idx}."
+    );
+    // The gate must IMMEDIATELY precede the reset (same block, `if
+    // !in_market_hours { pool.reset_watchdog(); }`) — not merely appear
+    // somewhere earlier. A loose distance would let a refactor move the
+    // reset out of the off-hours branch while the test still passed.
+    assert!(
+        reset_idx - gate_idx < 80,
+        "the reset_watchdog call must sit directly inside the `if !in_market_hours` \
+         block (within 80 bytes of the gate). Found a gap of {} bytes — the reset \
+         may have drifted out of the off-hours branch.",
+        reset_idx - gate_idx
+    );
+}
+
+#[test]
 fn watchdog_metrics_still_increment_outside_market_hours() {
     // Even when we suppress Telegram + process exit post-market, the
     // metric counters must still increment so dashboards retain the

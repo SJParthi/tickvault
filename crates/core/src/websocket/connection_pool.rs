@@ -598,6 +598,28 @@ impl WebSocketConnectionPool {
         verdict
     }
 
+    /// Resets the pool's internal watchdog to its freshly-constructed
+    /// `Healthy` state (see `PoolWatchdog::reset`).
+    ///
+    /// Called by `spawn_pool_watchdog_task` on every **off-hours** poll so
+    /// the intentional pre-market DEFERRAL window (no TCP opened until
+    /// 09:00 IST) never accumulates a stale `AllDown { since }` that would
+    /// trip the 300s `Halt` the instant `is_within_market_hours_ist()` flips
+    /// true at 09:00:00. Without this, the first in-hours poll saw ~1055s of
+    /// carried-over pre-market down-time and force-exited the process,
+    /// paging `[HIGH] WS POOL HALT` + `[HIGH] FAST BOOT` every market open.
+    ///
+    /// Cold path — runs at most once per 5s off-hours poll, never per tick.
+    /// The timer-restart semantics are unit-tested in `pool_watchdog.rs`
+    /// (`test_watchdog_reset_*`); the pool wrapper is covered by
+    /// `test_pool_reset_watchdog_is_callable_and_keeps_pool_pollable`.
+    #[allow(clippy::expect_used)] // APPROVED: lock poison on watchdog is unrecoverable
+    pub fn reset_watchdog(&self) {
+        // APPROVED: lock poison is unrecoverable — the process is corrupted anyway
+        let mut wd = self.watchdog.lock().expect("pool watchdog lock poisoned");
+        wd.reset();
+    }
+
     /// A5: Graceful shutdown — requests each connection to send a
     /// `RequestCode: 12` (Disconnect) to Dhan and close its socket cleanly.
     ///
@@ -1796,6 +1818,44 @@ mod tests {
             "fresh pool with all-Disconnected connections must transition \
              into Degrading on first poll, got {verdict:?}"
         );
+    }
+
+    /// Pre-market deferral fix (2026-06-03): `reset_watchdog` returns the
+    /// pool's internal watchdog to `Healthy` so the intentional pre-market
+    /// DEFERRED window (no TCP opened until 09:00 IST) never accumulates a
+    /// stale `AllDown { since }` that trips the 300s Halt at 09:00:00. The
+    /// timer-restart semantics are unit-tested in `pool_watchdog.rs`
+    /// (`test_watchdog_reset_*`); here we verify the pool wrapper delegates
+    /// without panicking, is idempotent, and leaves the pool pollable.
+    #[test]
+    fn test_pool_reset_watchdog_is_callable_and_keeps_pool_pollable() {
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            make_instruments(100),
+            FeedMode::Ticker,
+            None,
+        )
+        .unwrap();
+
+        // Fresh pool = all Disconnected → first poll enters the all-down cycle.
+        assert!(matches!(
+            pool.poll_watchdog(),
+            WatchdogVerdict::Degrading { .. }
+        ));
+
+        // Reset must not panic and must be idempotent.
+        pool.reset_watchdog();
+        pool.reset_watchdog();
+
+        // After reset the pool is still pollable; an all-down pool re-enters
+        // Degrading with a freshly-restarted down-window.
+        assert!(matches!(
+            pool.poll_watchdog(),
+            WatchdogVerdict::Degrading { .. }
+        ));
     }
 
     /// A4: Repeated polls on a dead pool stay in Degrading (until 60s

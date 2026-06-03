@@ -5730,6 +5730,27 @@ fn spawn_pool_watchdog_task(
                             // will upgrade to Degraded / Halt if this persists.
                         }
                     }
+
+                    // Pre-market deferral fix (2026-06-03): OUTSIDE market
+                    // hours the main-feed pool is intentionally DEFERRED —
+                    // it opens zero TCP sockets until 09:00 IST because Dhan
+                    // idle-resets pre-market connections. So every connection
+                    // reads "down" during 08:42→09:00 and the watchdog stamps
+                    // an `AllDown { since }` at ~08:42 boot. Reset the
+                    // watchdog on each off-hours poll so that stale `since`
+                    // never carries into the `is_within_market_hours_ist()`
+                    // boundary: without this, the first in-hours poll at
+                    // 09:00:00 saw down_for ≈ 1055s > POOL_HALT_SECS (300s)
+                    // and tripped Halt → std::process::exit(2) → supervisor
+                    // restart, paging [HIGH] WS POOL HALT + [HIGH] FAST BOOT
+                    // every single market open. The first in-hours poll now
+                    // starts a FRESH 300s window, giving the deferred feed
+                    // its normal reconnect time; the genuine in-market
+                    // "all-down for 300s → halt" safety property (the
+                    // Halt arm above, gated by in_market_hours) is unchanged.
+                    if !in_market_hours {
+                        pool.reset_watchdog();
+                    }
                 }
             }
         }
