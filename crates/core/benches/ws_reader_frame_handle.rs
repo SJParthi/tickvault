@@ -106,7 +106,9 @@ fn bench_wal_append(c: &mut Criterion) {
     let packet = build_ticker_packet();
     c.bench_function("ws_reader/wal_append", |b| {
         b.iter(|| {
-            // Clone simulates the `data.to_vec()` done inside the read loop.
+            // The read loop now hands the WAL an O(1) `Bytes` clone (H1);
+            // this `Vec` clone is the bench's owned input (append takes
+            // `impl Into<Bytes>`, so the `Vec` is buffer-stolen, not copied).
             let frame_vec = packet.clone();
             black_box(spill.append(WsType::LiveFeed, black_box(frame_vec)));
         });
