@@ -52,6 +52,36 @@ silence ≥30s during the most recent 60s coalesce window.
 
 **Source:** `crates/core/src/pipeline/tick_gap_detector.rs::TickGapDetector::scan`
 
+## WS-GAP-07 — live-feed frame channel closed (tick consumer died)
+
+**Trigger:** the main-feed read loop's `frame_sender.try_send(frame)`
+returned `TrySendError::Closed` — the downstream tick-processing consumer
+(`run_tick_processor`) holding the `Receiver` has been dropped. The read
+loop logs `error!` (code `WS-GAP-07`), increments
+`tv_ws_live_channel_closed_drop_total{ws_type="live_feed"}`, and returns,
+stopping frame forwarding on that connection. Severity::High.
+
+**Why High (not Low like the post-close sleep):** unlike a backpressure
+`Full` (the WAL still durably records the frame), a `Closed` channel means
+the consumer task is GONE — no ticks reach the pipeline from this
+connection until the consumer/app restarts. The previous code logged this
+at `warn!` with no counter, so the operator was blind to a dead consumer
+mid-market (audit Rule 5 — drain failures must be `error!`).
+
+**Triage:**
+1. `mcp__tickvault-logs__tail_errors` — search for `WS-GAP-07`; the event
+   carries `connection_id`.
+2. Check `tv_ws_live_channel_closed_drop_total` rate — a non-zero value
+   during market hours means the tick processor died. Look in
+   `data/logs/errors.jsonl.*` for a panic backtrace from
+   `run_tick_processor` immediately preceding the WS-GAP-07 line.
+3. The pool supervisor (WS-GAP-05) respawns the *connection* task, but it
+   cannot resurrect a dead *consumer*. If the consumer is gone, restart the
+   app — boot re-creates the channel + consumer.
+
+**Source:** `crates/core/src/websocket/connection.rs` (the
+`TrySendError::Closed` arm of the live-feed `try_send`).
+
 ## AUTH-GAP-03 — token force-renewed on WebSocket wake
 
 **Trigger:** Item 5's wake-from-sleep path observed

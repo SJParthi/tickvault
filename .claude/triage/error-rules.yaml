@@ -741,6 +741,21 @@ rules:
       already routes the summary event; the JSONL entry is for
       audit only. Silence (cooldown matches the 60s coalesce window).
 
+  - name: ws-gap-07-live-channel-closed-escalate
+    match:
+      code: WS-GAP-07
+    action: escalate
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      WS-GAP-07 = the live-feed frame channel's receiver was dropped — the
+      tick-processing consumer died, so no ticks reach the pipeline from this
+      connection until the app restarts. High severity; the pool supervisor
+      (WS-GAP-05) respawns the connection task but cannot resurrect a dead
+      consumer. Escalate (Telegram + draft Issue) so the operator restarts
+      the app per the runbook.
+
   - name: auth-gap-03-token-force-renewal-on-wake-silence
     match:
       code: AUTH-GAP-03
