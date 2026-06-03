@@ -142,3 +142,51 @@ state — that case escalates to `AGGREGATOR-DROP-01`.
    `missed_minutes` field; if > 1 minute, escalate.
 
 **Source:** `crates/trading/src/aggregator/boundary_timer.rs::tick_boundary_loop`.
+
+## AGGREGATOR-LAG-01 — candle aggregator tick-broadcast lagged (zero-tick-loss PR-8b, H2-lite)
+
+**Trigger:** the candle aggregator's `tokio::broadcast` receiver
+(`spawn_seal_writer_loop` in `crates/app/src/main.rs`) returned
+`RecvError::Lagged(n)` — the aggregator fell so far behind that the
+broadcast dropped `n` ticks from ITS view. `TICK_BROADCAST_CAPACITY`
+is 262,144 (~52 seconds of buffer at ~5K ticks/sec across the 243-SID
+universe), so a `Lagged` means the aggregator task stalled for tens of
+seconds — a serious incident (OOM-pressure, CPU starvation, a blocked
+seal-writer). Severity::High.
+
+**CRITICAL ASSURANCE — ticks are NOT lost and NOT reordered.** The
+dropped ticks are dropped only from the *aggregator's* broadcast view.
+The `ticks` QuestDB table is fed by a SEPARATE, lossless + ordered
+consumer (WAL ring → disk spill → DLQ on the persistence path; dedup by
+`(ts, security_id, segment)`). Every tick is still durably persisted, in
+order. ONLY the derived candles (`candles_*_shadow`) for the lagged
+window may under-count. Tick routing + ordering on the live WS read loop
+are untouched by this code path.
+
+**Why it was upgraded from a silent counter (audit Rule 5):** before
+PR-8b the `Lagged` arm only did `counter!("tv_aggregator_tick_lag_total")`
+— a candle-data-loss-class event with zero operator signal. It now emits
+`error!(code = AGGREGATOR-LAG-01)` so it routes to Telegram + the
+`errors.jsonl` forensic sink.
+
+**Triage:**
+1. The `error!` payload carries `skipped` (tick count). Inspect
+   `data/logs/errors.jsonl.*` for the timestamp → that is the lagged
+   window.
+2. Root-cause the stall: `mcp__tickvault-logs__run_doctor` + check host
+   memory/CPU (a >52s stall implies OOM pressure or a blocked
+   seal-writer — cross-check `AGGREGATOR-SEAL-01` / `AGGREGATOR-DROP-01`
+   and `tv_seal_mpsc_dropped_total`).
+3. **Rebuild the affected candles (no tick is lost):** the 15:31 IST
+   post-market 1-minute cross-verify (`CROSS-VERIFY-1M-01`) compares
+   `candles_1m` vs Dhan's authoritative 1m candles, exact-match, and
+   names every mismatched minute. Those minutes are rebuildable from the
+   lossless, ordered `ticks` table.
+
+**Auto-triage safe:** NO (Severity::High; a >52s aggregator stall needs
+operator root-cause — the candle under-count is recoverable but the
+underlying stall is not self-healing).
+
+**Source:** `crates/app/src/main.rs` (the aggregator subscriber
+`RecvError::Lagged` arm in `spawn_seal_writer_loop`),
+`crates/common/src/error_code.rs::AggregatorLag01TickLagDropped`.

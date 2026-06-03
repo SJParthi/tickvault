@@ -357,6 +357,18 @@ pub enum ErrorCode {
     /// timestamps). Severity::High — typically clock drift or slow
     /// consumer.
     AggregatorLate01,
+    /// AGGREGATOR-LAG-01: the candle aggregator's tick-broadcast receiver
+    /// returned `Lagged(n)` — it fell so far behind the ~52s
+    /// `TICK_BROADCAST_CAPACITY` buffer that the broadcast dropped `n`
+    /// ticks from ITS view. The dropped ticks are NOT lost from the
+    /// `ticks` table (a separate, lossless+ordered consumer) — only the
+    /// derived candles for that window may under-count. Was a silent
+    /// counter bump; now `error!` + counter so the operator sees the
+    /// (very rare, >52s-stall-class) incident and can rebuild the
+    /// affected candle window from the lossless `ticks` table (the
+    /// 15:31 IST post-market 1m cross-verify pinpoints the minutes).
+    /// Severity::High. Tick ROUTING and ORDER are untouched.
+    AggregatorLag01TickLagDropped,
     /// AGGREGATOR-SEAL-01: seal-time ILP write to one of the 9
     /// `candles_*_shadow` tables failed; the row was caught by the
     /// ring buffer. Severity::Medium — data is buffered, not lost.
@@ -641,6 +653,7 @@ impl ErrorCode {
             // Wave 6 — Multi-TF aggregator
             Self::AggregatorDrop01 => "AGGREGATOR-DROP-01",
             Self::AggregatorLate01 => "AGGREGATOR-LATE-01",
+            Self::AggregatorLag01TickLagDropped => "AGGREGATOR-LAG-01",
             Self::AggregatorSeal01IlpFailed => "AGGREGATOR-SEAL-01",
             Self::AggregatorHb01Heartbeat => "AGGREGATOR-HB-01",
             Self::Boundary01CatchupSeal => "BOUNDARY-01",
@@ -727,6 +740,7 @@ impl ErrorCode {
             | Self::Boot01QuestDbSlow
             | Self::Volume01MonotonicityBreach
             | Self::AggregatorLate01
+            | Self::AggregatorLag01TickLagDropped
             // PR #1 (AWS-lifecycle) — High option-chain
             | Self::OptionChain01FetchFailed
             | Self::OptionChain02Dh904Exhausted
@@ -885,6 +899,7 @@ impl ErrorCode {
             | Self::Volume01MonotonicityBreach => ".claude/rules/project/wave-5-error-codes.md",
             Self::AggregatorDrop01
             | Self::AggregatorLate01
+            | Self::AggregatorLag01TickLagDropped
             | Self::AggregatorSeal01IlpFailed
             | Self::AggregatorHb01Heartbeat
             | Self::Boundary01CatchupSeal => ".claude/rules/project/wave-6-error-codes.md",
@@ -1029,6 +1044,7 @@ impl ErrorCode {
             // Wave 6 — Multi-TF aggregator (Sub-PR #1)
             Self::AggregatorDrop01,
             Self::AggregatorLate01,
+            Self::AggregatorLag01TickLagDropped,
             Self::AggregatorSeal01IlpFailed,
             Self::AggregatorHb01Heartbeat,
             Self::Boundary01CatchupSeal,
@@ -1311,7 +1327,9 @@ mod tests {
         // WS-GAP-07 (live frame channel closed — tick consumer died).
         // 2026-06-03 (zero-tick-loss PR-5 — G3): bumped 100 -> 101 for
         // DISK-WATCHER-01 (spill disk-health watcher respawned by supervisor).
-        assert_eq!(ErrorCode::all().len(), 101);
+        // 2026-06-03 (zero-tick-loss PR-8b — H2-lite): bumped 101 -> 102 for
+        // AGGREGATOR-LAG-01 (candle aggregator broadcast Lagged — now loud).
+        assert_eq!(ErrorCode::all().len(), 102);
     }
 
     #[test]

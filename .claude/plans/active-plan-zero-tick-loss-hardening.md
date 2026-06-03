@@ -181,14 +181,29 @@ This plan closes them, each with a ratchet test so they can't regress.
   - Files: `crates/storage/tests/chaos_seal_sigkill_spill_replay.rs`,
     `crates/storage/tests/chaos_seal_disk_full_dlq_capture.rs`.
 
-- [ ] **PR-8 (H1+H2) — hot-path zero-copy + lossless candles (BIGGER — needs
-  its own approval/agent pass).** Pass `Bytes` (Arc clone) into the WAL append
-  instead of `to_vec()`; give the candle aggregator a dedicated bounded
-  SPSC/spill-backed feed instead of `broadcast` so `Lagged` becomes recoverable,
-  not skipped. DHAT + Criterion p99 gate added.
+- [x] **PR-8a (H1) — hot-path zero-copy.** (PR #1009, MERGED) `data.clone()`
+  (`Bytes` Arc-bump) into the WAL append instead of `to_vec()`. DHAT proves the
+  full WS read-loop tail is zero-alloc (verified vs tungstenite 0.29 shared
+  Bytes). 3-agent review CLEAN. Tick loss + order UNCHANGED.
   - Files: `crates/core/src/websocket/connection.rs`,
-    `crates/storage/src/ws_frame_spill.rs`,
-    `crates/app/src/trading_pipeline.rs`, aggregator wiring, bench + DHAT tests.
+    `crates/storage/src/ws_frame_spill.rs`, `crates/storage/Cargo.toml`,
+    `crates/core/tests/dhat_ws_reader_zero_alloc.rs`.
+- [x] **PR-8b (H2-lite) — candle aggregator lag made LOUD + recoverable**
+  (PR #TBD). Operator chose the lower-risk slice (2026-06-03): do NOT rewire
+  live tick routing (would risk reorder). Instead: the aggregator's broadcast
+  `Lagged` arm (was a silent counter) now emits `error!(code=AGGREGATOR-LAG-01)`
+  → Telegram + forensic JSONL; ticks stay lossless+ordered in the `ticks` table
+  (separate consumer), candle under-count windows are pinpointed by the 15:31
+  post-market 1m cross-verify + rebuildable from `ticks`. `TICK_BROADCAST_CAPACITY`
+  already 262,144 (~52s buffer) so no bump needed. PLUS a tick-ORDER ratchet
+  (`ws_frame_order_preservation_guard.rs`) per operator hard requirement: WAL
+  replay returns frames in EXACT append order (FIFO + strictly +1 monotonic).
+  - Files: `crates/app/src/main.rs` (Lagged arm), `crates/common/src/error_code.rs`
+    (AGGREGATOR-LAG-01, count 101→102), `.claude/rules/project/wave-6-error-codes.md`,
+    `.claude/triage/error-rules.yaml`,
+    `crates/storage/tests/{aggregator_lag_loud_guard,ws_frame_order_preservation_guard}.rs`.
+  - Deferred (NOT this PR): the full broadcast→dedicated-SPSC rewrite + DHAT/Criterion
+    on it — operator-gated; current broadcast is FIFO-per-receiver (never reorders).
 
 ## Scenarios
 

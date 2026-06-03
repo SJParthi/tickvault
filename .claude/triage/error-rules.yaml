@@ -1349,6 +1349,23 @@ rules:
       indicates clock drift or slow consumer keeping ticks in
       pipeline channel longer than boundary period.
 
+  - name: aggregator-lag-01-broadcast-lagged-escalate
+    match:
+      code: AGGREGATOR-LAG-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-6-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 60
+    justification: >-
+      AGGREGATOR-LAG-01 = the candle aggregator's tick-broadcast fell so
+      far behind the ~52s buffer that the broadcast dropped ticks from its
+      view. Severity::High. Ticks are NOT lost (separate lossless+ordered
+      `ticks` consumer) and NOT reordered — only the derived candles for
+      the window may under-count, recoverable via the post-market 1m
+      cross-verify + the ticks table. A >52s aggregator stall is a serious
+      host-health incident (OOM/CPU starvation/blocked seal-writer);
+      escalate so the operator root-causes the stall.
+
   - name: aggregator-seal-01-ilp-failed-ring-caught-escalate
     match:
       code: AGGREGATOR-SEAL-01
