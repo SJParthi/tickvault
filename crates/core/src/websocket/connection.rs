@@ -614,6 +614,20 @@ impl WebSocketConnection {
                         // sites and emit it with the reconnect event so the
                         // Telegram message surfaces WHY + HOW LONG + HOW MANY.
                         let (reason, down_secs, attempts) = self.take_disconnect_context();
+                        // G1 (zero-tick-loss PR-3): quantify reconnect-gap time so
+                        // dashboards + a CloudWatch rate-alarm can see sustained or
+                        // excessive reconnect churn (Dhan packets carry no sequence
+                        // number, so a sub-30s reconnect's lost ticks are otherwise
+                        // invisible to the 30s tick-gap detector). Per-event severity
+                        // stays Medium — typical reconnects are 5-10s, so escalating
+                        // each to High would spam the pager; the rate-alarm on the
+                        // cumulative counter is the correct anomaly detector.
+                        metrics::counter!("tv_ws_reconnect_total", "feed" => "main").increment(1);
+                        metrics::counter!(
+                            "tv_ws_reconnect_gap_seconds_total",
+                            "feed" => "main"
+                        )
+                        .increment(down_secs);
                         if let Some(ref n) = self.notifier {
                             n.notify(crate::notification::events::NotificationEvent::WebSocketReconnected {
                                 connection_index: usize::from(self.connection_id),
