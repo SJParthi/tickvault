@@ -158,9 +158,13 @@ This plan closes them, each with a ratchet test so they can't regress.
   - Tests: `disk_watcher_supervisor_guard.rs` (2, source-scan), supervisor
     unit tests (5), `error_code` count+prefix (bumped 100→101).
 
-- [ ] **PR-6 (G5) — `chaos_midnight_seal_burst.rs`.** Fire ~99K synthetic seals
-  in one batch; assert `tv_seal_absorption_total{tier="dropped"} == 0` and the
-  ring→spill→DLQ cascade absorbs the burst within the 100K cap.
+- [x] **PR-6 (G5) — `chaos_midnight_seal_burst.rs`.** (PR #TBD) 3 deterministic
+  tests on the real `SealAbsorptionPipeline`: (1) full 99K burst fits the real
+  200K ring → all Buffered, dropped=0, spilled=0; (2) undersized 1K ring + 6K
+  burst → ring→spill cascade absorbs all 5K overflow, dropped=0; (3)
+  conservation — every submitted seal accounted for in exactly one tier, loss
+  tier empty. Asserts on returned `SubmitOutcome` counts (deterministic, not a
+  sampled metric). 3/3 green in 0.08s.
   - Files: `crates/storage/tests/chaos_midnight_seal_burst.rs`.
 
 - [ ] **PR-7 (G6+G7) — compound-failure chaos tests.** (a) SIGKILL mid-batch-flush
