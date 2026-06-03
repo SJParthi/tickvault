@@ -6224,6 +6224,33 @@ fn spawn_engine_b_aggregator(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     metrics::counter!("tv_aggregator_tick_lag_total").increment(skipped);
+                    // H2-lite (zero-tick-loss PR-8b): the aggregator fell so far
+                    // behind the ~52s TICK_BROADCAST_CAPACITY buffer that the
+                    // broadcast dropped `skipped` ticks from ITS view. This was a
+                    // SILENT counter bump; make it LOUD (audit Rule 5 — a
+                    // candle-data-loss event must be `error!`, never silent).
+                    //
+                    // CRITICAL ASSURANCE: the dropped ticks are NOT lost and NOT
+                    // reordered. The lossless + ORDERED durable record is the WAL
+                    // frame spill (`ws_frame_spill`: raw frames captured by the WS
+                    // read loop BEFORE any broadcast fan-out — single-producer FIFO
+                    // segments, ring→spill→DLQ, replayed in append order on boot).
+                    // This broadcast `Lagged` is downstream of that WAL, so it can
+                    // only affect the DERIVED candles for this window — never the
+                    // durable tick record, and never tick ORDER. The 15:31 IST
+                    // post-market 1-minute cross-verify pinpoints the affected
+                    // minutes, rebuildable from the WAL-backed, ts-ordered `ticks`
+                    // table. Tick routing + order on the live read loop are
+                    // untouched by this change.
+                    tracing::error!(
+                        skipped,
+                        code =
+                            tickvault_common::error_code::ErrorCode::AggregatorLag01TickLagDropped
+                                .code_str(),
+                        "candle aggregator tick-broadcast LAGGED — derived candles for this \
+                         window may under-count; ticks remain safe + ordered in the ticks table; \
+                         rebuild via the post-market 1m cross-verify"
+                    );
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     tracing::info!("Engine B aggregator subscriber: broadcast closed, exiting");
