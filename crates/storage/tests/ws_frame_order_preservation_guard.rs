@@ -17,6 +17,16 @@
 //! could silently creep in (a buffering/sort/parallel-drain regression), so
 //! it gets an explicit FIFO assertion the existing replay test (counts +
 //! content only) does not provide.
+//!
+//! Coverage boundary (honest): these tests exercise the SINGLE-segment case
+//! (N×~28 B ≪ `WAL_SEGMENT_MAX_BYTES` = 128 MiB → one segment file). Cross
+//! segment ordering is guaranteed by `replay_all` sorting segments
+//! lexicographically by a zero-padded-20-digit nanosecond filename
+//! (`ws-frames-{nanos:020}.wal`) — lexicographic == chronological == append
+//! order — and is NOT exercised here because forcing a 2nd segment would
+//! require writing >128 MiB per run (rejected: slow + disk pressure). The
+//! single-producer FIFO within a segment + that sort are the full order
+//! guarantee.
 
 use std::sync::Arc;
 

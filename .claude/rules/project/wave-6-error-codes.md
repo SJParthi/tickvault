@@ -156,12 +156,20 @@ seal-writer). Severity::High.
 
 **CRITICAL ASSURANCE — ticks are NOT lost and NOT reordered.** The
 dropped ticks are dropped only from the *aggregator's* broadcast view.
-The `ticks` QuestDB table is fed by a SEPARATE, lossless + ordered
-consumer (WAL ring → disk spill → DLQ on the persistence path; dedup by
-`(ts, security_id, segment)`). Every tick is still durably persisted, in
-order. ONLY the derived candles (`candles_*_shadow`) for the lagged
-window may under-count. Tick routing + ordering on the live WS read loop
-are untouched by this code path.
+The lossless + ORDERED durable record is the **WAL frame spill**
+(`crates/storage/src/ws_frame_spill.rs`): raw frames are captured by the
+WS read loop *before* any broadcast fan-out, into single-producer FIFO
+segments (ring → disk spill → DLQ), replayed in exact append order on
+boot. Because this broadcast `Lagged` is strictly *downstream* of that
+WAL, it can affect ONLY the derived candles (`candles_*_shadow`) for the
+lagged window — never the durable tick record, never tick order. (The
+`ticks` table's own persistence consumer is also a broadcast subscriber
+that can lag — but it is backfilled from the WAL on recovery and alarmed
+via `tv_ticks_permanently_lost`, so the WAL, not the ticks-table
+consumer, is the lossless guarantor.) The 15:31 IST post-market 1m
+cross-verify pinpoints the affected minutes for rebuild from the
+WAL-backed, ts-ordered `ticks` table. Tick routing + ordering on the
+live WS read loop are untouched by this code path.
 
 **Why it was upgraded from a silent counter (audit Rule 5):** before
 PR-8b the `Lagged` arm only did `counter!("tv_aggregator_tick_lag_total")`

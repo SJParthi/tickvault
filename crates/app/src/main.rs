@@ -6231,13 +6231,17 @@ fn spawn_engine_b_aggregator(
                     // candle-data-loss event must be `error!`, never silent).
                     //
                     // CRITICAL ASSURANCE: the dropped ticks are NOT lost and NOT
-                    // reordered — the `ticks` table is a SEPARATE, lossless +
-                    // ordered consumer (WAL ring→spill→DLQ + dedup by ts). Only
-                    // the DERIVED candles for this window may under-count. The
-                    // 15:31 IST post-market 1-minute cross-verify pinpoints the
-                    // exact affected minutes, which are rebuildable from the
-                    // lossless ordered `ticks` table. Tick routing + order on the
-                    // live read loop are untouched by this change.
+                    // reordered. The lossless + ORDERED durable record is the WAL
+                    // frame spill (`ws_frame_spill`: raw frames captured by the WS
+                    // read loop BEFORE any broadcast fan-out — single-producer FIFO
+                    // segments, ring→spill→DLQ, replayed in append order on boot).
+                    // This broadcast `Lagged` is downstream of that WAL, so it can
+                    // only affect the DERIVED candles for this window — never the
+                    // durable tick record, and never tick ORDER. The 15:31 IST
+                    // post-market 1-minute cross-verify pinpoints the affected
+                    // minutes, rebuildable from the WAL-backed, ts-ordered `ticks`
+                    // table. Tick routing + order on the live read loop are
+                    // untouched by this change.
                     tracing::error!(
                         skipped,
                         code =
