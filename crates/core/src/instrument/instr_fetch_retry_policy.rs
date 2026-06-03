@@ -111,7 +111,7 @@ pub fn should_emit_telegram(attempt: u32) -> bool {
     }
     // High / Critical tiers — every 5th attempt counted from attempt = 11.
     let offset = attempt - (INFO_THRESHOLD + 1);
-    offset % ESCALATED_CADENCE == 0
+    offset.is_multiple_of(ESCALATED_CADENCE)
 }
 
 #[cfg(test)]

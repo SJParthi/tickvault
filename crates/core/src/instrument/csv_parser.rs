@@ -46,16 +46,6 @@ const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 /// Value: 0.001 = 0.1% in decimal.
 pub const MANDATORY_FIELD_REJECT_THRESHOLD: f64 = 0.001;
 
-/// Mandatory CSV columns common to every row (per Dhan Detailed CSV
-/// schema). Missing or empty = drop row + count.
-const MANDATORY_FIELDS_ALL_ROWS: &[&str] = &[
-    "SECURITY_ID",
-    "EXCH_ID",
-    "SEGMENT",
-    "INSTRUMENT",
-    "SYMBOL_NAME",
-];
-
 /// Derivative instrument-type prefixes — these rows additionally need a
 /// non-empty `UNDERLYING_SECURITY_ID` per §26 dangling-reference rule.
 /// The dangling-reference cross-check itself lives in Sub-PR #5+; this

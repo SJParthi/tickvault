@@ -1710,7 +1710,10 @@ impl WebSocketConnection {
         // Capture the FIRST disconnect timestamp in this cycle (so down_secs
         // measures total downtime including any intermediate retry failures).
         let now_secs = chrono::Utc::now().timestamp();
-        let _ = self.last_disconnect_at_epoch_secs.compare_exchange(
+        // First-disconnect-wins: a lost CAS race just means another path
+        // already stamped the epoch this cycle, which is fine. Bind to a
+        // `_`-prefixed name (not bare `_`) so the must-use result is consumed.
+        let _cas_outcome = self.last_disconnect_at_epoch_secs.compare_exchange(
             0,
             now_secs,
             std::sync::atomic::Ordering::AcqRel,

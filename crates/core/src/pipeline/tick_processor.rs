@@ -1050,7 +1050,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                             // error + every 1000th to avoid per-tick spam. The tick
                             // is NOT lost — force_flush rescues it into the
                             // ring → spill → WAL chain.
-                            if storage_errors == 1 || storage_errors % 1000 == 0 {
+                            if storage_errors == 1 || storage_errors.is_multiple_of(1000) {
                                 error!(
                                     ?err,
                                     security_id = tick.security_id,
@@ -1242,7 +1242,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                                 // Audit Rule 5 + Rule 4 (edge-triggered): page on
                                 // first error + every 1000th. Tick rescued to
                                 // ring/spill/WAL — not lost.
-                                if storage_errors == 1 || storage_errors % 1000 == 0 {
+                                if storage_errors == 1 || storage_errors.is_multiple_of(1000) {
                                     error!(
                                         ?err,
                                         security_id = tick.security_id,

@@ -94,8 +94,8 @@ pub struct OrphanPositionInfo {
 /// so the supervisor task can drop the upstream `DhanPositionResponse`
 /// vec (returned by `reqwest::json()`) and still drive the audit-row
 /// write loop + Telegram emit. Pre-allocating `with_capacity(positions.len())`
-/// would still produce the same allocation in the common path where
-/// > 50% of positions are orphans; the empty-set fast path
+/// would still produce the same allocation in the common path where over
+/// 50% of positions are orphans; the empty-set fast path
 /// short-circuits via `if pos.net_qty == 0 { continue; }`.
 // APPROVED: daily compliance gate — see paragraph above. Not hot path.
 #[must_use]

@@ -691,6 +691,7 @@ impl TickPersistenceWriter {
     /// - Fields: `ts_ms`, `reason`, `security_id`, `segment`, `ltt`, `ltp`,
     ///   `ltq`, `volume`, `atp`, `buy_qty`, `sell_qty`, `open`, `close`,
     ///   `high`, `low`, `oi`.
+    ///
     /// Phase 2.14 security MEDIUM fix: `reason` MUST be `&'static str`
     /// (compile-time literal). The type system rejects any runtime
     /// string at the call site, so the NDJSON line cannot carry
