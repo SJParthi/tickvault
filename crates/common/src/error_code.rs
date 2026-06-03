@@ -194,6 +194,12 @@ pub enum ErrorCode {
     WsGap05PoolRespawn,
     /// WS-GAP-06: tick-gap detector fired a coalesced summary.
     WsGap06TickGapSummary,
+    /// WS-GAP-07: the live-feed frame channel's receiver was dropped
+    /// (the tick-processing consumer died), so the WebSocket read loop
+    /// stops forwarding frames and returns. Serious mid-market condition —
+    /// no ticks reach the pipeline until the consumer/app restarts.
+    /// Severity::High.
+    WsGap07LiveChannelClosed,
     /// AUTH-GAP-03: token force-renewed on WebSocket wake.
     AuthGap03TokenForceRenewedOnWake,
     /// BOOT-01: slow-boot QuestDB readiness deadline approaching (>30s).
@@ -570,6 +576,7 @@ impl ErrorCode {
             Self::WsGap04PostCloseSleep => "WS-GAP-04",
             Self::WsGap05PoolRespawn => "WS-GAP-05",
             Self::WsGap06TickGapSummary => "WS-GAP-06",
+            Self::WsGap07LiveChannelClosed => "WS-GAP-07",
             Self::AuthGap03TokenForceRenewedOnWake => "AUTH-GAP-03",
             Self::Boot01QuestDbSlow => "BOOT-01",
             Self::Boot02DeadlineExceeded => "BOOT-02",
@@ -719,7 +726,9 @@ impl ErrorCode {
             | Self::IndexOhlc02DailyResetFailed
             // Operator 2026-06-02 — post-market 1m cross-verify (both High)
             | Self::CrossVerify1m01MismatchFound
-            | Self::CrossVerify1m02FetchDegraded => Severity::High,
+            | Self::CrossVerify1m02FetchDegraded
+            // WS-GAP-07 — live frame channel closed (tick consumer died)
+            | Self::WsGap07LiveChannelClosed => Severity::High,
             // Medium: data pipeline correctness
             // PR #6b (2026-05-19): I-P0-01/02/04/05 retired with their modules.
             Self::InstrumentP1CrossSegmentCollision
@@ -818,6 +827,7 @@ impl ErrorCode {
             Self::WsGap04PostCloseSleep
             | Self::WsGap05PoolRespawn
             | Self::WsGap06TickGapSummary
+            | Self::WsGap07LiveChannelClosed
             | Self::AuthGap03TokenForceRenewedOnWake
             | Self::Boot01QuestDbSlow
             | Self::Boot02DeadlineExceeded
@@ -982,6 +992,7 @@ impl ErrorCode {
             Self::WsGap04PostCloseSleep,
             Self::WsGap05PoolRespawn,
             Self::WsGap06TickGapSummary,
+            Self::WsGap07LiveChannelClosed,
             Self::AuthGap03TokenForceRenewedOnWake,
             Self::Boot01QuestDbSlow,
             Self::Boot02DeadlineExceeded,
@@ -1284,7 +1295,9 @@ mod tests {
         // 2026-06-02 (operator post-market 1-minute cross-verification):
         // bumped 97 -> 99 by adding CROSS-VERIFY-1M-01 (mismatch found) +
         // CROSS-VERIFY-1M-02 (intraday fetch degraded).
-        assert_eq!(ErrorCode::all().len(), 99);
+        // 2026-06-03 (zero-tick-loss PR-2 — G2): bumped 99 -> 100 for
+        // WS-GAP-07 (live frame channel closed — tick consumer died).
+        assert_eq!(ErrorCode::all().len(), 100);
     }
 
     #[test]

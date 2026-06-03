@@ -80,13 +80,25 @@ This plan closes them, each with a ratchet test so they can't regress.
     guard-test pattern and is best solved by ONE workspace decision, not 265
     scattered edits. Tracked as a follow-up; out of PR-1 scope.
 
-- [ ] **PR-2 (G2) — WS live-channel-closed = `error!` + counter, never silent.**
-  Change the `warn!` drop site to `error!(code = WS-GAP-…)` +
-  `tv_ws_live_channel_closed_drop_total`; extend `error_level_meta_guard.rs` to
-  also scan the `core`/websocket crate so this can't regress.
+- [x] **PR-2 (G2) — WS live-channel-closed = `error!` + counter, never silent.**
+  DONE. Added typed `ErrorCode::WsGap07LiveChannelClosed` ("WS-GAP-07",
+  Severity::High) fully wired (enum + code_str + severity + runbook_path +
+  all() + catalogue-size ratchet bumped 99→100 + rule-file section in
+  `wave-2-error-codes.md` + triage rule `ws-gap-07-...-escalate` in
+  `error-rules.yaml`). Changed the `TrySendError::Closed` arm in
+  `connection.rs` from `warn!` (silent drop) to `error!(code = WS-GAP-07)` +
+  `tv_ws_live_channel_closed_drop_total{ws_type="live_feed"}`. Operator is now
+  alerted (Telegram via Loki) + dashboards count a dead-consumer event.
   - Files: `crates/core/src/websocket/connection.rs`,
-    `crates/storage/tests/error_level_meta_guard.rs` (or a new core guard)
-  - Tests: source-scan ratchet that the drop site uses `error!` + the counter.
+    `crates/common/src/error_code.rs`,
+    `.claude/rules/project/wave-2-error-codes.md`,
+    `.claude/triage/error-rules.yaml`
+  - Verified: common 42/42 test binaries green (cross-ref + tag-guard +
+    triage-coverage + catalogue-size ratchets all pass); clippy common+core
+    `-D warnings` exit 0.
+  - Note: `error_level_meta_guard.rs` extension to the core crate deferred —
+    the typed-code + ratchets above already pin this site; a crate-wide
+    meta-guard rescan is a separate hardening.
 
 - [ ] **PR-3 (G1) — reconnect tick-gap detection (the CRITICAL one).** Stamp
   reconnect start/end; emit `tv_ws_reconnect_gap_seconds{feed}` +

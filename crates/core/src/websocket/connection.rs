@@ -1332,10 +1332,26 @@ impl WebSocketConnection {
                             // (when WAL is attached).
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
-                            warn!(
+                            // WS-GAP-07: the tick-processing consumer holding the
+                            // Receiver is gone — unlike a `Full` backpressure (the
+                            // WAL still records the frame), a `Closed` channel means
+                            // NO ticks reach the pipeline from this connection until
+                            // the consumer/app restarts. error! (Telegram via Loki) +
+                            // dedicated counter per audit Rule 5 (drain failures are
+                            // error!, never warn!).
+                            error!(
                                 connection_id = self.connection_id,
-                                "Frame receiver dropped — stopping read loop"
+                                code = tickvault_common::error_code::ErrorCode::WsGap07LiveChannelClosed
+                                    .code_str(),
+                                "WS live frame channel CLOSED — tick consumer dropped; \
+                                 stopping read loop. Frames will not flow on this \
+                                 connection until the consumer/app restarts."
                             );
+                            metrics::counter!(
+                                "tv_ws_live_channel_closed_drop_total",
+                                "ws_type" => "live_feed"
+                            )
+                            .increment(1);
                             return Ok(());
                         }
                     }
