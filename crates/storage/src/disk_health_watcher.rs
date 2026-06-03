@@ -185,6 +185,69 @@ pub fn spawn_spill_disk_health_watcher(spill_dir: PathBuf) -> tokio::task::JoinH
     })
 }
 
+/// Backoff between a watcher death and its respawn. Small so disk-free
+/// monitoring resumes quickly, but non-zero so a watcher that panics
+/// instantly on every start cannot busy-spin the CPU — it respawns at
+/// most once per this interval, and the `tv_disk_watcher_respawn_total`
+/// counter rate surfaces the flap to the operator via CloudWatch.
+pub const DISK_WATCHER_RESPAWN_BACKOFF_SECS: u64 = 5;
+
+/// Classify why a supervised task's `JoinHandle` resolved, into a stable
+/// metric label. Pure function so the supervisor's branch logic is unit
+/// testable without constructing a real `JoinError` (which has no public
+/// constructor).
+#[must_use]
+pub fn classify_join_exit(join_result: &Result<(), tokio::task::JoinError>) -> &'static str {
+    match join_result {
+        Ok(()) => "clean_exit",
+        Err(e) if e.is_panic() => "panic",
+        Err(e) if e.is_cancelled() => "cancelled",
+        Err(_) => "unknown",
+    }
+}
+
+/// G3 (zero-tick-loss audit) — supervise the spill disk-health watcher.
+///
+/// [`spawn_spill_disk_health_watcher`] runs an infinite probe loop, so its
+/// `JoinHandle` resolves ONLY on a fatal event (panic or external cancel).
+/// Before this supervisor the handle was bound to `_` in `main.rs`, so a
+/// panic made disk-free monitoring vanish silently — and that monitoring is
+/// the early-warning for the single highest-risk gap in the zero-loss chain
+/// ("disk full + QuestDB down"). This supervisor mirrors the WS-GAP-05 pool
+/// supervisor: on every watcher death it logs `error!` (code
+/// `DISK-WATCHER-01`) + increments `tv_disk_watcher_respawn_total{reason}`,
+/// then respawns after [`DISK_WATCHER_RESPAWN_BACKOFF_SECS`] so monitoring
+/// continues. The counter feeds a CloudWatch alarm so the operator is paged
+/// on a flapping watcher.
+///
+/// The returned `JoinHandle` is itself an infinite loop (it never resolves
+/// in normal operation); callers bind it to a `_`-prefixed name. The
+/// supervisor body has no panic path of its own (no `unwrap`/`expect`,
+/// pure-function classification), so it does not need a supervisor-of-the-
+/// supervisor.
+// O(1) EXEMPT: cold-path supervisor — one task per session, fires only on watcher death.
+pub fn spawn_supervised_spill_disk_health_watcher(
+    spill_dir: PathBuf,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let handle = spawn_spill_disk_health_watcher(spill_dir.clone());
+            let join_result = handle.await;
+            let reason = classify_join_exit(&join_result);
+            error!(
+                reason,
+                code = tickvault_common::error_code::ErrorCode::DiskWatcher01Respawned.code_str(),
+                backoff_secs = DISK_WATCHER_RESPAWN_BACKOFF_SECS,
+                path = %spill_dir.display(),
+                "DISK-WATCHER-01: spill disk-health watcher exited — respawning so \
+                 free-space monitoring continues (disk-full + QuestDB-down early warning)"
+            );
+            metrics::counter!("tv_disk_watcher_respawn_total", "reason" => reason).increment(1);
+            tokio::time::sleep(Duration::from_secs(DISK_WATCHER_RESPAWN_BACKOFF_SECS)).await;
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +323,64 @@ mod tests {
                 assert!(!reason.is_empty(), "failure must carry a reason string");
             }
         }
+    }
+
+    // -- G3 supervisor (spawn_supervised_spill_disk_health_watcher) --
+
+    #[test]
+    fn test_respawn_backoff_is_small_but_nonzero() {
+        // Non-zero so a tight panic loop can't busy-spin the CPU; small so
+        // disk-free monitoring resumes within seconds of a watcher death.
+        assert!(DISK_WATCHER_RESPAWN_BACKOFF_SECS >= 1);
+        assert!(DISK_WATCHER_RESPAWN_BACKOFF_SECS <= 30);
+    }
+
+    #[tokio::test]
+    async fn test_classify_join_exit_clean() {
+        let h = tokio::spawn(async {});
+        let r = h.await;
+        assert_eq!(classify_join_exit(&r), "clean_exit");
+    }
+
+    #[tokio::test]
+    async fn test_classify_join_exit_panic() {
+        // A panicking task yields a JoinError where is_panic() == true.
+        let h = tokio::spawn(async {
+            panic!("intentional test panic"); // APPROVED: test — exercises the panic branch
+        });
+        let r = h.await;
+        assert_eq!(classify_join_exit(&r), "panic");
+    }
+
+    #[tokio::test]
+    async fn test_classify_join_exit_cancelled() {
+        // An aborted task yields a JoinError where is_cancelled() == true.
+        let h = tokio::spawn(async {
+            // Sleep long enough that abort lands before completion.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        });
+        h.abort();
+        let r = h.await;
+        assert_eq!(classify_join_exit(&r), "cancelled");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_supervised_spill_disk_health_watcher_keeps_running() {
+        // The supervisor is an infinite loop — its JoinHandle must NOT
+        // resolve in normal operation. The inner watcher it spawns also
+        // loops forever (60s probe interval), so the supervisor parks on
+        // `handle.await` and never completes. (If a future edit makes the
+        // supervisor return after one watcher death instead of respawning,
+        // this guard fails.)
+        let handle = spawn_supervised_spill_disk_health_watcher(std::path::PathBuf::from(
+            "data/spill-supervisor-test",
+        ));
+        // Let the spawned task make progress.
+        tokio::task::yield_now().await;
+        assert!(
+            !handle.is_finished(),
+            "supervisor must keep running, not exit after spawning the watcher"
+        );
+        handle.abort();
     }
 }

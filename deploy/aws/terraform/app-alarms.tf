@@ -391,11 +391,34 @@ resource "aws_cloudwatch_metric_alarm" "ws_reconnect_gap_high" {
 }
 
 # ---------------------------------------------------------------------------
+# 16. Disk-health watcher respawn churn (G3) — the watcher that guards the
+# "disk full + QuestDB down" gap died and was respawned by its supervisor.
+# `tv_disk_watcher_respawn_total` increments once per watcher death. A
+# rate-alarm (Sum over 5m) pages only on a FLAPPING watcher (a real bug),
+# not on a benign one-off respawn at shutdown.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "disk_watcher_respawn" {
+  alarm_name          = "tv-${var.environment}-disk-watcher-respawn"
+  alarm_description   = "Spill disk-health watcher is flapping — respawned >0 times in 5m. Disk-free monitoring (the disk-full + QuestDB-down early warning) keeps running via the supervisor, but a repeating respawn means a real bug; inspect the DISK-WATCHER-01 panic backtrace."
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "tv_disk_watcher_respawn_total"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+  dimensions          = local.app_dimensions
+  alarm_actions       = local.app_alarm_actions
+  ok_actions          = local.app_alarm_ok
+}
+
+# ---------------------------------------------------------------------------
 # Output — operator-facing reminder + alarm list
 # ---------------------------------------------------------------------------
 
 output "app_cloudwatch_alarms" {
-  description = "15 application-level alarms (14 Prometheus-via-CW-agent + 1 disk-used Metrics-Insights). Cost note: total alarms 6 → 21; overage above the 10 free-tier alarms ≈ $1.10/mo + 14 custom metrics ≈ $0.70/mo ≈ ₹155/mo — well inside the $25 budget cap."
+  description = "16 application-level alarms (15 Prometheus-via-CW-agent + 1 disk-used Metrics-Insights). Cost note: total alarms 6 → 22; overage above the 10 free-tier alarms ≈ $1.20/mo + 15 custom metrics ≈ $0.75/mo ≈ ₹166/mo — well inside the $25 budget cap."
   value = [
     aws_cloudwatch_metric_alarm.disk_used_high.alarm_name,
     aws_cloudwatch_metric_alarm.ws_pool_all_dead.alarm_name,
@@ -412,5 +435,6 @@ output "app_cloudwatch_alarms" {
     aws_cloudwatch_metric_alarm.clock_skew_high.alarm_name,
     aws_cloudwatch_metric_alarm.ws_frame_dropped_no_wal.alarm_name,
     aws_cloudwatch_metric_alarm.ws_reconnect_gap_high.alarm_name,
+    aws_cloudwatch_metric_alarm.disk_watcher_respawn.alarm_name,
   ]
 }

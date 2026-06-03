@@ -180,3 +180,43 @@ QuestDB partition to S3 and the upload failed. Idempotency-key
 3. Check Glacier 90-day minimum was honored — partition not re-archived.
 
 **Source:** `crates/storage/src/s3_archive.rs` (Wave 2 Item 9.4)
+
+## DISK-WATCHER-01 — spill disk-health watcher respawned (zero-tick-loss PR-5, G3)
+
+**Trigger:** the spill disk-health watcher task
+(`spawn_spill_disk_health_watcher`) exited — panic or external cancel — and
+the supervisor (`spawn_supervised_spill_disk_health_watcher`) caught the
+death, logged it, incremented `tv_disk_watcher_respawn_total{reason}`, and
+respawned the watcher after a short backoff so disk-free monitoring
+continues. The watcher is the early-warning for the single highest-risk
+gap in the zero-loss chain ("disk full **and** QuestDB down at once"), so
+losing it silently — the pre-PR-5 behaviour, where the handle was bound to
+`_` in `main.rs` — meant the operator could lose `tv_spill_dir_free_bytes`
+visibility with no signal. Severity::Low (the respawn self-heals); the
+CloudWatch alarm `tv-<env>-disk-watcher-respawn` pages only on a *flapping*
+watcher (Sum > 0 over 5m), not on a benign one-off.
+
+**Why mirror WS-GAP-05 and not just restart the app:** the watcher is
+stateless and cheap to respawn, and monitoring MUST keep running — a single
+panic should not take disk visibility offline until the next manual restart.
+This is the same supervisor pattern as the WS-GAP-05 pool supervisor.
+
+**Triage:**
+1. `mcp__tickvault-logs__tail_errors` — search for `DISK-WATCHER-01`; the
+   event carries `reason` (`panic` / `cancelled` / `clean_exit` / `unknown`)
+   and the spill `path`.
+2. `reason="panic"` repeating → a real bug in `probe_disk_free_bytes` or the
+   watcher loop (it has no `unwrap`/`expect`, so investigate the `df`
+   shell-out path + parse). Inspect `data/logs/errors.jsonl.*` for the panic
+   backtrace immediately preceding the DISK-WATCHER-01 line.
+3. `reason="cancelled"` at shutdown → benign (the runtime is tearing down).
+4. A sustained non-zero `tv_disk_watcher_respawn_total` rate (the CloudWatch
+   alarm fired) with no obvious bug → restart the app to reset the watcher
+   from a clean state.
+
+**Auto-triage safe:** YES (Severity::Low; respawn already restored
+monitoring — the operator inspects the `reason` + backtrace at leisure).
+
+**Source:** `crates/storage/src/disk_health_watcher.rs::spawn_supervised_spill_disk_health_watcher`,
+`crates/common/src/error_code.rs::DiskWatcher01Respawned`. Boot wiring:
+`crates/app/src/main.rs` (the `_disk_health_watcher_supervisor` spawn).

@@ -151,10 +151,14 @@ fn test_app_alarms_count_is_thirteen() {
     // `tv_ws_frame_dropped_no_wal_total` (hard WS-frame-lost breach) +
     // `tv_ws_reconnect_gap_seconds_total` (reconnect-churn rate-alarm —
     // gives PR-3's reconnect-gap metric its anomaly detector).
+    // 16 (was 15) since 2026-06-03 (zero-tick-loss PR-5 / G3): added
+    // `tv_disk_watcher_respawn_total` — the spill disk-health watcher is
+    // now supervised (respawn + alert) instead of fire-and-forget; the
+    // counter feeds this rate-alarm so a flapping watcher pages.
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 15,
-        "Z+ L2 VERIFY ratchet: expected exactly 15 app-level CloudWatch alarms \
+        count, 16,
+        "Z+ L2 VERIFY ratchet: expected exactly 16 app-level CloudWatch alarms \
          (one per critical app signal). Found {count}. If you intentionally added \
          or removed one, update aws-budget.md custom-metric cost line AND this guard."
     );
