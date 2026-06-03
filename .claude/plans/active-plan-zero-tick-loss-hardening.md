@@ -100,13 +100,26 @@ This plan closes them, each with a ratchet test so they can't regress.
     the typed-code + ratchets above already pin this site; a crate-wide
     meta-guard rescan is a separate hardening.
 
-- [ ] **PR-3 (G1) — reconnect tick-gap detection (the CRITICAL one).** Stamp
-  reconnect start/end; emit `tv_ws_reconnect_gap_seconds{feed}` +
-  `Severity::High` Telegram if a market-hours reconnect exceeds a threshold
-  (default 5s); write a `ws_reconnect_audit` row. + CloudWatch alarm.
-  - Files: `crates/core/src/websocket/connection.rs`, notification events,
-    audit persistence, `deploy/aws/terraform/app-alarms.tf`
-  - Tests: pure-function classifier (gap → severity) unit tests + alarm guard.
+- [x] **PR-3 (G1) — reconnect-gap visibility (the CRITICAL one).** DONE,
+  honestly narrowed after reading the code: the reconnect site ALREADY emits
+  `WebSocketReconnected` (Severity::Medium) carrying `down_secs` on every
+  reconnect — so it was NOT silent. The genuine missing piece was a **metric**:
+  Dhan packets carry no sequence number, so a sub-30s reconnect's lost ticks
+  are invisible to the 30s tick-gap detector AND there was no quantified
+  signal. Added `tv_ws_reconnect_gap_seconds_total{feed="main"}` (incremented
+  by the measured `down_secs`) + `tv_ws_reconnect_total{feed="main"}` at the
+  reconnect site in `connection.rs`.
+  - **Deliberately NOT escalating per-event severity to High:** the gap-hunt
+    itself notes typical reconnects are 5–10s, so a 5s→High rule would spam the
+    pager (violates audit Rule 4 / the DepthRebalanced anti-fatigue lesson).
+    The correct anomaly detector is a CloudWatch **rate-alarm** on the
+    cumulative counter — that alarm lands in PR-4 (the alarm PR).
+  - `ws_reconnect_audit` table + DDL/persistence (AUDIT-03 was reserved/unbuilt)
+    is a separate larger build, honestly deferred — the metric is the
+    high-value, low-risk core of G1.
+  - Files: `crates/core/src/websocket/connection.rs`,
+    `crates/core/tests/ws_reconnect_gap_metric_guard.rs` (3 source-scan ratchets).
+  - Verified: guard tests green; clippy core `--tests -D warnings` exit 0.
 
 - [ ] **PR-4 (G4) — CloudWatch alarm on the WAL hard-drop counter.**
   `tv_ws_frame_dropped_no_wal_total > 0 for 1m → Critical SNS`.
