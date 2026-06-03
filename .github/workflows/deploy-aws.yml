@@ -14,7 +14,7 @@
 # Safety nets that prevent the auto-trigger from causing harm:
 #   1. preflight job — skips entire workflow if AWS_ROLE_ARN / AWS_ACCESS_KEY_ID
 #      bootstrap secrets are absent (charter §C "100% no false-OK PR checks").
-#   2. guard_market_hours job — blocks deploy during 09:00-15:30 IST Mon-Fri
+#   2. guard_market_hours job — blocks deploy during 09:00-15:45 IST Mon-Fri
 #      unless workflow_dispatch with confirm_market_hours=yes.
 #   3. concurrency.group serializes deploys; never two at once.
 #   4. Existing rollback path triggers on failed smoke test.
@@ -209,7 +209,8 @@ jobs:
     steps:
       - name: Check current IST time against market window
         run: |
-          # 09:00-15:30 IST = 03:30-10:00 UTC.
+          # No-deploy band 09:00-15:45 IST = 03:30-10:15 UTC (operator lock
+          # 2026-06-03: "only between 9 am till 3.45 pm it should not happen").
           # Monday-Friday only (NSE trading days, ignoring holidays for now).
           UTC_HOUR=$(date -u +%H)
           UTC_MINUTE=$(date -u +%M)
@@ -218,17 +219,17 @@ jobs:
 
           echo "UTC time: $UTC_HOUR:$UTC_MINUTE (day $UTC_DOW), numeric $UTC_TIME_NUM"
 
-          # No-deploy window in UTC: 0330 (09:00 IST) to 1000 (15:30 IST)
-          if [ "$UTC_DOW" -le 5 ] && [ "$UTC_TIME_NUM" -ge 330 ] && [ "$UTC_TIME_NUM" -lt 1000 ]; then
+          # No-deploy window in UTC: 0330 (09:00 IST) to 1015 (15:45 IST)
+          if [ "$UTC_DOW" -le 5 ] && [ "$UTC_TIME_NUM" -ge 330 ] && [ "$UTC_TIME_NUM" -lt 1015 ]; then
             if [ "${{ github.event.inputs.confirm_market_hours }}" = "yes" ]; then
               echo "WARNING: deploying during market hours with explicit override"
             else
-              echo "BLOCK: deploying during 09:00-15:30 IST is forbidden without override."
+              echo "BLOCK: deploying during 09:00-15:45 IST is forbidden without override."
               echo "Re-run with confirm_market_hours=yes if this is an emergency fix."
               exit 1
             fi
           else
-            echo "OK: outside market hours, deploy can proceed"
+            echo "OK: outside the 09:00-15:45 IST no-deploy band, deploy can proceed"
           fi
 
   deploy:
@@ -441,8 +442,8 @@ jobs:
         # cannot see a build that crosses the open boundary.
         #
         # This step re-checks IST market hours IMMEDIATELY before the swap. If
-        # we are now inside 09:00-15:30 IST Mon-Fri, ABORT before touching the
-        # box: the binary is already built + in S3, so the 15:31 IST
+        # we are now inside 09:00-15:45 IST Mon-Fri, ABORT before touching the
+        # box: the binary is already built + in S3, so the 15:46 IST
         # post-market cron (deploy-aws-after-close) will redeploy it safely.
         # DEPLOY_SKIP_REASON suppresses the failure Telegram (this is an
         # intentional defer, not a failure) while keeping the run non-success
@@ -456,9 +457,9 @@ jobs:
           fi
           DOW=$(TZ='Asia/Kolkata' date +%u)
           HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM))
-          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 900 ] && [ "$HHMM" -lt 1530 ]; then
+          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 900 ] && [ "$HHMM" -lt 1545 ]; then
             echo "DEPLOY_SKIP_REASON=market_hours_swap_abort" >> "$GITHUB_ENV"
-            echo "::warning::Market is OPEN ($HHMM IST) at swap time — the build crossed the 09:00 boundary (pre-open session starts 09:00 IST). ABORTING the binary swap to avoid a mid-session restart. The 15:31 IST post-market cron will redeploy this commit. (Override: re-run with confirm_market_hours=yes.)"
+            echo "::warning::Market is OPEN ($HHMM IST) at swap time — the build crossed into the 09:00-15:45 IST no-deploy band. ABORTING the binary swap to avoid a mid-session restart. The 15:46 IST post-market cron will redeploy this commit. (Override: re-run with confirm_market_hours=yes.)"
             exit 1
           fi
           echo "outside market hours ($HHMM IST, dow=$DOW) — safe to swap"

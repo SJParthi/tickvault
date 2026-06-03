@@ -1,13 +1,13 @@
 # Deploy-watchdog Lambda — AWS-native safety-net for the post-merge auto-deploy.
 #
 # Operator decision 2026-06-02 ("AWS watchdog safety-net"): keep the existing
-# GitHub-Actions auto-deploy (deploy-aws-after-close.yml cron @ 08:45 + 15:31
-# IST), but add an AWS-native check a few minutes later that covers GitHub-cron
+# GitHub-Actions auto-deploy (deploy-aws-after-close.yml cron @ 08:00 + 08:45 +
+# 15:46 IST), but add an AWS-native check a few minutes later that covers GitHub-cron
 # misses (GitHub-hosted cron can be silently delayed/skipped under load).
 #
 # Two EventBridge schedules invoke the same Lambda with a `window` input:
 #   * 08:50 IST = 03:20 UTC Mon-Fri — 5 min after the pre-market cron.
-#   * 15:36 IST = 10:06 UTC Mon-Fri — 5 min after the post-market cron.
+#   * 15:51 IST = 10:21 UTC Mon-Fri — 5 min after the 15:46 post-market cron.
 #
 # The Lambda asks GitHub "is main HEAD already deployed?" (deployed = head_sha of
 # the most recent SUCCESSFUL deploy-aws.yml run — the same idempotency signal the
@@ -126,8 +126,8 @@ resource "aws_cloudwatch_event_rule" "deploy_watchdog_premarket" {
 
 resource "aws_cloudwatch_event_rule" "deploy_watchdog_postmarket" {
   name                = "tv-${var.environment}-deploy-watchdog-postmarket"
-  description         = "15:36 IST (Mon-Fri) — cover a missed 15:31 post-market auto-deploy"
-  schedule_expression = "cron(6 10 ? * MON-FRI *)"
+  description         = "15:51 IST (Mon-Fri) — cover a missed 15:46 post-market auto-deploy"
+  schedule_expression = "cron(21 10 ? * MON-FRI *)"
 }
 
 resource "aws_cloudwatch_event_target" "deploy_watchdog_premarket" {

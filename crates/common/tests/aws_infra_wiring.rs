@@ -477,10 +477,11 @@ fn test_deploy_aws_workflow_has_market_hours_guard() {
         content.contains("guard_market_hours"),
         "deploy-aws.yml must have guard_market_hours job"
     );
-    // The 09:00-15:30 IST window in UTC is 03:30-10:00.
+    // The 09:00-15:45 IST no-deploy band in UTC is 03:30-10:15 (operator lock
+    // 2026-06-03: "only between 9 am till 3.45 pm it should not happen").
     assert!(
-        content.contains("330") && content.contains("1000"),
-        "deploy-aws.yml must encode the 09:00-15:30 IST window in UTC (330-1000)"
+        content.contains("330") && content.contains("1015"),
+        "deploy-aws.yml must encode the 09:00-15:45 IST window in UTC (330-1015)"
     );
 }
 
@@ -628,7 +629,7 @@ fn test_deploy_aws_regates_market_hours_at_swap_time() {
     // ~2 min at the bell. The start-time guard cannot see a build that crosses
     // the open boundary. This pins the SWAP-time re-gate: immediately before
     // the SSM swap, deploy-aws re-checks IST market hours and ABORTS (defers
-    // to the 15:31 cron) instead of restarting the live app mid-session.
+    // to the 15:46 cron) instead of restarting the live app mid-session.
     let content =
         std::fs::read_to_string(workspace_root().join(".github/workflows/deploy-aws.yml"))
             .expect("deploy-aws.yml must be readable"); // APPROVED: test
@@ -640,13 +641,13 @@ fn test_deploy_aws_regates_market_hours_at_swap_time() {
     assert!(
         content.contains("market_hours_swap_abort"),
         "the swap-time re-gate must set DEPLOY_SKIP_REASON=market_hours_swap_abort \
-         so the deferred run does not page the operator + the 15:31 cron redeploys"
+         so the deferred run does not page the operator + the 15:46 cron redeploys"
     );
-    // The swap-time gate must encode the 09:00-15:30 IST window (900/1530) and
+    // The swap-time gate must encode the 09:00-15:45 IST window (900/1545) and
     // honour the same operator override as the start-time guard.
     assert!(
-        content.contains("900") && content.contains("1530"),
-        "swap-time re-gate must encode the 09:00-15:30 IST market window (900/1530)"
+        content.contains("900") && content.contains("1545"),
+        "swap-time re-gate must encode the 09:00-15:45 IST market window (900/1545)"
     );
     assert!(
         content.contains("confirm_market_hours"),
@@ -656,28 +657,36 @@ fn test_deploy_aws_regates_market_hours_at_swap_time() {
 
 #[test]
 fn test_deploy_aws_after_close_workflow_fires_in_premarket_and_postmarket_only() {
-    // Operator lock 2026-05-30: "only pre-market AND post-market alone only
-    // our new codes merged ones should be deployed". Code-merge-driven
-    // deploys NEVER auto-fire during 09:00-15:30 IST trading hours.
-    //   - pre-market cron  = 03:15 UTC = 08:45 IST (after 08:30 instance boot)
-    //   - post-market cron = 10:01 UTC = 15:31 IST (after 15:30 NSE close)
+    // Operator lock 2026-06-03: "always deploy whenever the instance auto-starts
+    // at 8 am ... only between 9 am till 3.45 pm it should not happen." The ONLY
+    // no-deploy band is 09:00-15:45 IST; every other time auto-deploys main.
+    //   - instance-start cron = 02:30 UTC = 08:00 IST (self-starts a stopped box)
+    //   - pre-market cron      = 03:15 UTC = 08:45 IST (backup, before 09:15 open)
+    //   - post-market cron     = 10:16 UTC = 15:46 IST (just after the 15:45 band)
     let path = ".github/workflows/deploy-aws-after-close.yml";
     require_file_exists(
         path,
-        "auto-deploy in pre-market + post-market windows (operator lock 2026-05-30)",
+        "auto-deploy at 08:00 instance-start + outside the 09:00-15:45 IST band \
+         (operator lock 2026-06-03)",
     );
     let content = std::fs::read_to_string(workspace_root().join(path))
         .expect("deploy-aws-after-close.yml must be readable"); // APPROVED: test
 
+    assert!(
+        content.contains("30 2 * * 1-5"),
+        "deploy-aws-after-close.yml must include instance-start cron \
+         02:30 UTC Mon-Fri (08:00 IST) — self-starts the box + deploys even if \
+         the EventBridge instance-start fails (2026-06-03 incident fix)"
+    );
     assert!(
         content.contains("15 3 * * 1-5"),
         "deploy-aws-after-close.yml must include pre-market cron \
          03:15 UTC Mon-Fri (08:45 IST)"
     );
     assert!(
-        content.contains("1 10 * * 1-5"),
+        content.contains("16 10 * * 1-5"),
         "deploy-aws-after-close.yml must include post-market cron \
-         10:01 UTC Mon-Fri (15:31 IST)"
+         10:16 UTC Mon-Fri (15:46 IST — just after the 15:45 no-deploy band)"
     );
     // Must dispatch deploy-aws.yml — that's the whole point.
     assert!(
@@ -901,14 +910,14 @@ fn test_deploy_watchdog_lambda_is_wired() {
     .expect("deploy-watchdog-lambda.tf must be readable"); // APPROVED: test
 
     // Two weekday EventBridge schedules, 5 min after each GitHub deploy cron:
-    // 08:50 IST = 03:20 UTC, 15:36 IST = 10:06 UTC.
+    // 08:50 IST = 03:20 UTC, 15:51 IST = 10:21 UTC.
     assert!(
         tf.contains("cron(20 3 ? * MON-FRI *)"),
         "deploy-watchdog must run 08:50 IST (03:20 UTC Mon-Fri) — 5 min after the pre-market cron"
     );
     assert!(
-        tf.contains("cron(6 10 ? * MON-FRI *)"),
-        "deploy-watchdog must run 15:36 IST (10:06 UTC Mon-Fri) — 5 min after the post-market cron"
+        tf.contains("cron(21 10 ? * MON-FRI *)"),
+        "deploy-watchdog must run 15:51 IST (10:21 UTC Mon-Fri) — 5 min after the 15:46 post-market cron"
     );
     // It reads the repo-scoped GitHub token (same param as operator-control)
     // and can publish to the alerts topic.
