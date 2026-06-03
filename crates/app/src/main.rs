@@ -24,6 +24,12 @@
 //! 14. Spawn token renewal task
 //! 15. Await shutdown signal
 
+// APPROVED: clippy 1.95 tightened these doc-formatting lints; this binary
+// crate root predates them. Allow rather than churn doc comments for a
+// cosmetic markdown-rendering nicety with zero runtime/behavior impact.
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::doc_overindented_list_items)]
+
 // Modules are declared in lib.rs for coverage instrumentation.
 use tickvault_app::boot_helpers::{
     CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, FAST_BOOT_WINDOW_END, FAST_BOOT_WINDOW_START, IstTimer,
@@ -4333,7 +4339,7 @@ async fn main() -> Result<()> {
                             oc_base_url_for_warmup,
                         ) {
                             Ok(warmup_client) => {
-                                let _ = tickvault_core::option_chain::expiry_warmup::spawn_expiry_warmup_task(
+                                let _warmup_handle = tickvault_core::option_chain::expiry_warmup::spawn_expiry_warmup_task(
                                     warmup_client,
                                     current_expiry_cache.clone(),
                                     oc_notifier.clone(),

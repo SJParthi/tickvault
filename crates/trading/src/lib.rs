@@ -9,7 +9,13 @@
 #![cfg_attr(not(test), warn(clippy::let_underscore_must_use))]
 #![cfg_attr(test, allow(clippy::assertions_on_constants))]
 #![cfg_attr(test, allow(clippy::field_reassign_with_default))]
-#![allow(missing_docs)] // TODO: enforce after adding docs to all public items
+#![allow(missing_docs)]
+// TODO: enforce after adding docs to all public items
+// APPROVED: clippy 1.95 tightened these doc-formatting lints; the codebase
+// predates them. Allow rather than churn ~100 doc comments for a cosmetic
+// markdown-rendering nicety with zero runtime/behavior impact.
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::doc_overindented_list_items)]
 
 //! Trading engine: O(1) indicators, FSM strategies, OMS, Greeks, and risk controls.
 //!

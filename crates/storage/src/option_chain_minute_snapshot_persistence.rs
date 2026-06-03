@@ -7,11 +7,11 @@
 //! answer forensic queries:
 //!
 //!   * "What was the IV of NIFTY 25650-CE at 11:23:00 IST when BRUTEX
-//!      entered the position?"
+//!     entered the position?"
 //!   * "Did SENSEX 79500-PE have liquidity (top_bid/top_ask both > 0)
-//!      at the moment of entry?"
+//!     at the moment of entry?"
 //!   * "Which strikes were ATM ±25 for BANKNIFTY between 10:00 and
-//!      10:30 IST?"
+//!     10:30 IST?"
 //!
 //! ## DEDUP key contract
 //!

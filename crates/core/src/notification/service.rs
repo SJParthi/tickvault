@@ -367,18 +367,16 @@ impl NotificationService {
                 // Critical/High/Medium remains driven by severity inside
                 // the coalescer's `observe` (we don't even call it when
                 // `force_immediate` is set).
-                if !force_immediate {
-                    if let Some(coalescer) = self.coalescer.as_ref() {
-                        let decision = coalescer.observe(topic, severity, || body.clone());
-                        if matches!(decision, CoalesceDecision::Coalesced) {
-                            metrics::counter!(
-                                "tv_telegram_dispatched_total",
-                                "severity" => severity.as_label(),
-                                "coalesced" => "true",
-                            )
-                            .increment(1);
-                            return;
-                        }
+                if !force_immediate && let Some(coalescer) = self.coalescer.as_ref() {
+                    let decision = coalescer.observe(topic, severity, || body.clone());
+                    if matches!(decision, CoalesceDecision::Coalesced) {
+                        metrics::counter!(
+                            "tv_telegram_dispatched_total",
+                            "severity" => severity.as_label(),
+                            "coalesced" => "true",
+                        )
+                        .increment(1);
+                        return;
                     }
                 }
                 // Bypass / coalescer disabled: this dispatch counts as a

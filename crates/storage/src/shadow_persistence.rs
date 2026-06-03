@@ -444,15 +444,15 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
     // the marker can't be written (disk full, perms), the cleanup just
     // repeats on next boot — same as before this PR. No data corruption
     // risk because every DROP is `IF EXISTS`.
-    if let Some(parent) = marker_path.parent() {
-        if let Err(err) = std::fs::create_dir_all(parent) {
-            tracing::warn!(
-                ?err,
-                path = %parent.display(),
-                "PR #798: failed to create data/state/ dir for legacy-drop marker"
-            );
-            return;
-        }
+    if let Some(parent) = marker_path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(
+            ?err,
+            path = %parent.display(),
+            "PR #798: failed to create data/state/ dir for legacy-drop marker"
+        );
+        return;
     }
     if let Err(err) = std::fs::write(
         marker_path,
