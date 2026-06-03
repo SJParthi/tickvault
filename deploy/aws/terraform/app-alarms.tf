@@ -346,11 +346,56 @@ resource "aws_cloudwatch_metric_alarm" "disk_used_high" {
 }
 
 # ---------------------------------------------------------------------------
+# 14. WS frame dropped with NO WAL — the hard zero-tick-loss breach (G4)
+# `tv_ws_frame_dropped_no_wal_total` increments ONLY when the live frame
+# channel is full AND the WAL spill is not attached — the frame is genuinely
+# lost (not just buffered). Any non-zero value is an irrecoverable tick loss.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "ws_frame_dropped_no_wal" {
+  alarm_name          = "tv-${var.environment}-ws-frame-dropped-no-wal"
+  alarm_description   = "WS live frame LOST — channel full AND no WAL attached. Irrecoverable tick loss. Investigate consumer liveness + re-enable WAL spill immediately."
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "tv_ws_frame_dropped_no_wal_total"
+  namespace           = local.app_namespace
+  period              = 60
+  statistic           = "Sum"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+  dimensions          = local.app_dimensions
+  alarm_actions       = local.app_alarm_actions
+  ok_actions          = local.app_alarm_ok
+}
+
+# ---------------------------------------------------------------------------
+# 15. WS reconnect-gap rate too high (G1) — sustained/excessive reconnect churn
+# `tv_ws_reconnect_gap_seconds_total` accumulates the measured down-time of
+# every reconnect. A rate-alarm (Sum over 5m) flags excessive churn WITHOUT
+# paging on each routine 5-10s reconnect. Threshold 60s of cumulative gap per
+# 5m window = the feed spent >20% of the window reconnecting.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "ws_reconnect_gap_high" {
+  alarm_name          = "tv-${var.environment}-ws-reconnect-gap-high"
+  alarm_description   = "WS reconnect churn high — cumulative reconnect-gap > 60s in 5m. Sub-30s reconnects drop ticks invisibly (no Dhan sequence number); investigate network/Dhan stability."
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "tv_ws_reconnect_gap_seconds_total"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 60
+  treat_missing_data  = "notBreaching"
+  dimensions          = local.app_dimensions
+  alarm_actions       = local.app_alarm_actions
+  ok_actions          = local.app_alarm_ok
+}
+
+# ---------------------------------------------------------------------------
 # Output — operator-facing reminder + alarm list
 # ---------------------------------------------------------------------------
 
 output "app_cloudwatch_alarms" {
-  description = "13 application-level alarms (12 Prometheus-via-CW-agent + 1 disk-used Metrics-Insights). Cost note: total alarms 6 → 19; overage above the 10 free-tier alarms ≈ $0.90/mo + 12 custom metrics ≈ $0.60/mo ≈ ₹130/mo — well inside the $25 budget cap."
+  description = "15 application-level alarms (14 Prometheus-via-CW-agent + 1 disk-used Metrics-Insights). Cost note: total alarms 6 → 21; overage above the 10 free-tier alarms ≈ $1.10/mo + 14 custom metrics ≈ $0.70/mo ≈ ₹155/mo — well inside the $25 budget cap."
   value = [
     aws_cloudwatch_metric_alarm.disk_used_high.alarm_name,
     aws_cloudwatch_metric_alarm.ws_pool_all_dead.alarm_name,
@@ -365,5 +410,7 @@ output "app_cloudwatch_alarms" {
     aws_cloudwatch_metric_alarm.orders_rejected.alarm_name,
     aws_cloudwatch_metric_alarm.realtime_guarantee_critical.alarm_name,
     aws_cloudwatch_metric_alarm.clock_skew_high.alarm_name,
+    aws_cloudwatch_metric_alarm.ws_frame_dropped_no_wal.alarm_name,
+    aws_cloudwatch_metric_alarm.ws_reconnect_gap_high.alarm_name,
   ]
 }
