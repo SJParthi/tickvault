@@ -1,7 +1,7 @@
 """Deploy watchdog Lambda — AWS-native safety-net for the post-merge auto-deploy.
 
 The post-merge auto-deploy runs from `deploy-aws-after-close.yml`, a GitHub
-Actions cron (08:45 + 15:31 IST Mon-Fri). GitHub-hosted cron is best-effort:
+Actions cron (08:00 + 08:45 + 15:46 IST Mon-Fri). GitHub-hosted cron is best-effort:
 under platform load it can be delayed 10-30+ minutes or skipped entirely, which
 would leave the box running STALE code with no signal. aws-autopilot mitigates
 some of this, but it too runs on GitHub.
@@ -16,7 +16,7 @@ EventBridge triggers fire it:
     deployment should happen instantly when the instance is started"). Latest
     `main` is deployed within ~1-2 min of 08:00, not at the 08:45 cron.
   * 08:50 IST (03:20 UTC Mon-Fri) — backup, 5 min after the 08:45 pre-market cron.
-  * 15:36 IST (10:06 UTC Mon-Fri) — backup, 5 min after the 15:31 post-market cron.
+  * 15:51 IST (10:21 UTC Mon-Fri) — backup, 5 min after the 15:46 post-market cron.
 
 On each fire it answers ONE question, using GitHub as the source of truth (the
 same idempotency signal `deploy-aws-after-close.yml` itself uses):
