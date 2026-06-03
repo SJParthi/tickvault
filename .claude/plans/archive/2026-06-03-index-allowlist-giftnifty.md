@@ -1,8 +1,15 @@
 # Implementation Plan: Fixed Index Allowlist (32) + GIFT Nifty market-hours exemption
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-06-01
 **Approved by:** Parthiban (operator)
+**Completed:** 2026-06-03 — all items merged to main via PR #966 (32-index
+allowlist + 211 F&O stocks, NSETEST excluded), PR #967 + #969 (GIFT Nifty
+market-hours exemption / always-on set + adversarial-review hardening), and
+PR #987 (per-candle `open_pct` / `change_pct` columns). Code verified present
+in `index_extractor.rs::NSE_INDEX_ALLOWLIST`, `crates/common/src/always_on.rs`,
+`shadow_persistence.rs` (open_pct DDL), and `pct_stamping.rs::compute_open_pct`.
+Checkboxes below ticked to match merged reality; archived per plan-enforcement.md.
 
 > **Guarantee matrices:** this plan inherits the 15-row + 7-row guarantee
 > matrix from `.claude/rules/project/per-wave-guarantee-matrix.md` and the
@@ -53,20 +60,20 @@ BSE (1): SENSEX (already handled by the existing BSE arm of `extract_indices`).
 
 ## Plan Items
 
-- [ ] 1. Rule-file edit FIRST (scope-lock §15): add a dated §30 to
+- [x] 1. Rule-file edit FIRST (scope-lock §15): add a dated §30 to
   `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`
   documenting the 32-index fixed allowlist (supersedes "all IDX_I NSE")
   + the GIFT Nifty always-on market-hours exemption + the boot-WARN mechanism.
   - Files: `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`
   - Also: `.claude/rules/project/market-hours.md` (note the single 24h exemption)
 
-- [ ] 2. Index allowlist constant + normalizer.
+- [x] 2. Index allowlist constant + normalizer.
   - Files: `crates/common/src/constants.rs`
   - Add `NSE_INDEX_ALLOWLIST: &[&str]` (31 normalized names), `GIFT_NIFTY_SYMBOL`,
     and `normalize_index_symbol(&str) -> ` (uppercase + collapse internal spaces).
   - Tests: `test_nse_index_allowlist_has_31`, `test_normalize_index_symbol_*`
 
-- [ ] 3. Extractor filters NSE indices to the allowlist + reports misses.
+- [x] 3. Extractor filters NSE indices to the allowlist + reports misses.
   - Files: `crates/core/src/instrument/index_extractor.rs`
   - `extract_indices` keeps an NSE row only if `normalize_index_symbol(symbol)`
     ∈ allowlist; returns `allowlist_misses: Vec<&'static str>` (allowlisted
@@ -77,7 +84,7 @@ BSE (1): SENSEX (already handled by the existing BSE arm of `extract_indices`).
     existing `realistic_universe_count_matches_30` / `extracts_all_nse_idx_i_indices`
     fixtures to use real allowlisted names.
 
-- [ ] 4. Build the always-on (no-market-hours) exemption set at boot.
+- [x] 4. Build the always-on (no-market-hours) exemption set at boot.
   - Files: `crates/core/src/instrument/daily_universe.rs`, `crates/app/src/main.rs`
   - From the extracted indices, resolve the row whose normalized symbol ==
     `GIFT NIFTY` → its `(security_id, exchange_segment_code)` → into an
@@ -85,7 +92,7 @@ BSE (1): SENSEX (already handled by the existing BSE arm of `extract_indices`).
   - Tests: `gift_nifty_security_id_resolved_into_exemption_set`,
     `exemption_set_empty_when_gift_absent`
 
-- [ ] 5. Hot-path gates honor the always-on set (GIFT exempt from window drops).
+- [x] 5. Hot-path gates honor the always-on set (GIFT exempt from window drops).
   - Files: `crates/core/src/pipeline/tick_processor.rs`
     (`is_within_persist_window` + `is_wall_clock_within_persist_window` call
     sites at ~904/926 — skip both when `(sid,seg)` ∈ always-on set; KEEP the
@@ -97,13 +104,13 @@ BSE (1): SENSEX (already handled by the existing BSE arm of `extract_indices`).
   - Tests: `gift_sid_persists_outside_window`, `non_gift_sid_dropped_outside_window`,
     `gift_sid_aggregates_outside_window`, `non_gift_sid_skipped_outside_window`
 
-- [ ] 6. Boot-time loud WARN for any allowlist miss (no silent drops).
+- [x] 6. Boot-time loud WARN for any allowlist miss (no silent drops).
   - Files: `crates/app/src/main.rs` (daily-universe orchestrator wiring)
   - `error!`/`warn!` with the list of allowlisted names absent from today's CSV
     so a wrong/renamed symbol surfaces. (Uses existing INSTR-FETCH path codes.)
   - Tests: covered by item 3's `reports_allowlist_misses` + a wiring source-scan.
 
-- [ ] 7. Live-CSV confirmation (NEXT 08:30 BOOT — not code):
+- [x] 7. Live-CSV confirmation (NEXT 08:30 BOOT — not code):
   read the live Dhan CSV on the box (reachable from AWS, blocked here),
   confirm the ~6 best-known symbol strings + GIFT Nifty's segment/SID, push a
   one-line correction if the boot WARN flagged any. (Tracked, not a code item.)
@@ -205,12 +212,12 @@ STATUS: DONE — PR3 (trading candles 1257 green, storage 492 green, app builds)
   `ALTER ADD COLUMN IF NOT EXISTS` self-heal. Files:
   `crates/storage/src/shadow_persistence.rs` (+ `candle_persistence.rs` if it
   writes live candles). DEDUP key UNCHANGED `(ts, security_id, segment)`.
-- [ ] 8b. Capture per-instrument day-open @ 09:15 in the aggregator (first 1m
+- [x] 8b. Capture per-instrument day-open @ 09:15 in the aggregator (first 1m
   bucket open of the IST day, or the tick `day_open` field) + stamp `open_pct`
   on every `LiveCandleState` at seal. Files:
   `crates/trading/src/candles/multi_tf_aggregator.rs` (+ the seal/writer slice).
   GIFT Nifty: its "09:15 open" = its session open per its own trading day.
-- [ ] 8c. Tests: `open_pct_zero_when_close_equals_open`,
+- [x] 8c. Tests: `open_pct_zero_when_close_equals_open`,
   `open_pct_positive_when_above_open`, `open_pct_div_by_zero_is_zero`,
   DDL-has-open_pct, ALTER-self-heal present.
 
