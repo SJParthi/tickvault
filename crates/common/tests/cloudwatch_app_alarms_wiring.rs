@@ -147,10 +147,14 @@ fn test_app_alarms_count_is_thirteen() {
     // final zero-tick-loss breach (rescue ring + spill + DLQ all failed),
     // the operator's #1 invariant. The upstream spill/dlq tiers were
     // already alarmed; this is the strictly-more-severe irrecoverable case.
+    // 15 (was 13) since 2026-06-03 (zero-tick-loss PR-4 / G4+G1): added
+    // `tv_ws_frame_dropped_no_wal_total` (hard WS-frame-lost breach) +
+    // `tv_ws_reconnect_gap_seconds_total` (reconnect-churn rate-alarm —
+    // gives PR-3's reconnect-gap metric its anomaly detector).
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 13,
-        "Z+ L2 VERIFY ratchet: expected exactly 13 app-level CloudWatch alarms \
+        count, 15,
+        "Z+ L2 VERIFY ratchet: expected exactly 15 app-level CloudWatch alarms \
          (one per critical app signal). Found {count}. If you intentionally added \
          or removed one, update aws-budget.md custom-metric cost line AND this guard."
     );

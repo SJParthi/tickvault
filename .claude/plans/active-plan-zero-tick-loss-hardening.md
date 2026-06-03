@@ -121,9 +121,25 @@ This plan closes them, each with a ratchet test so they can't regress.
     `crates/core/tests/ws_reconnect_gap_metric_guard.rs` (3 source-scan ratchets).
   - Verified: guard tests green; clippy core `--tests -D warnings` exit 0.
 
-- [ ] **PR-4 (G4) — CloudWatch alarm on the WAL hard-drop counter.**
-  `tv_ws_frame_dropped_no_wal_total > 0 for 1m → Critical SNS`.
-  - Files: `deploy/aws/terraform/app-alarms.tf`, a source-scan alarm guard test.
+- [x] **PR-4 (G4 + G1-alarm) — CloudWatch alarms for the WS hard-drop + reconnect-gap.**
+  DONE. Two new `aws_cloudwatch_metric_alarm` blocks in `app-alarms.tf`:
+  (1) `ws_frame_dropped_no_wal` — `tv_ws_frame_dropped_no_wal_total > 0` over
+  60s (the irrecoverable WS-frame-lost breach, G4); (2) `ws_reconnect_gap_high`
+  — `tv_ws_reconnect_gap_seconds_total` Sum > 60s over 5m (gives PR-3's
+  reconnect-gap metric its anomaly detector WITHOUT per-event pager spam,
+  completing G1's detection loop). Added both metrics to the
+  `user-data.sh.tftpl` EMF filter (else the CW agent won't publish them);
+  updated the output list + count-guard 13→15.
+  - Reformatted both emit sites to single-line `counter!("name"...)` so the
+    `cloudwatch_app_alarms_wiring` guard's detector finds them (dropped the
+    always-"live_feed" `ws_type` label on the deeply-nested no_wal emit — the
+    alarm keys on the `host` dimension regardless).
+  - Files: `deploy/aws/terraform/app-alarms.tf`,
+    `deploy/aws/terraform/user-data.sh.tftpl`,
+    `crates/core/src/websocket/connection.rs`,
+    `crates/common/tests/cloudwatch_app_alarms_wiring.rs` (count 13→15).
+  - Verified: wiring guard 3/3 (emit-site + EMF-filter + count); core clippy
+    `-D warnings` exit 0; name-stability test green.
 
 - [ ] **PR-5 (G3) — supervise the disk-health watcher.** Name the handle, run it
   under the `respawn_dead_connections_loop` (WS-GAP-05) pattern so a panic

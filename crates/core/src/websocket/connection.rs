@@ -623,11 +623,8 @@ impl WebSocketConnection {
                         // each to High would spam the pager; the rate-alarm on the
                         // cumulative counter is the correct anomaly detector.
                         metrics::counter!("tv_ws_reconnect_total", "feed" => "main").increment(1);
-                        metrics::counter!(
-                            "tv_ws_reconnect_gap_seconds_total",
-                            "feed" => "main"
-                        )
-                        .increment(down_secs);
+                        metrics::counter!("tv_ws_reconnect_gap_seconds_total", "feed" => "main")
+                            .increment(down_secs);
                         if let Some(ref n) = self.notifier {
                             n.notify(crate::notification::events::NotificationEvent::WebSocketReconnected {
                                 connection_index: usize::from(self.connection_id),
@@ -1326,11 +1323,13 @@ impl WebSocketConnection {
                                      attached — frame LOST. Investigate consumer task \
                                      liveness and re-enable WAL spill (WS-2 audit gap)."
                                 );
-                                metrics::counter!(
-                                    "tv_ws_frame_dropped_no_wal_total",
-                                    "ws_type" => "live_feed"
-                                )
-                                .increment(1);
+                                // NOTE: emitted WITHOUT a label so the
+                                // `cloudwatch_app_alarms_wiring` guard's
+                                // single-line `counter!("name"` detector finds it
+                                // (this is now an alarmed metric — G4). The
+                                // ws_type was always "live_feed"; the CloudWatch
+                                // alarm keys on the `host` dimension regardless.
+                                metrics::counter!("tv_ws_frame_dropped_no_wal_total").increment(1);
                                 // Also increment the existing backpressure counter so
                                 // single-pane-of-glass dashboards still see the event.
                                 metrics::counter!(
