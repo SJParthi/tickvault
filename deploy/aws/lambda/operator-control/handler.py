@@ -525,12 +525,30 @@ def lambda_handler(event, _context):
             if not force:
                 return _resp(409, {"error": 'docker-reset is the FULL nuke (deletes volumes + images + ALL data incl. SEBI audit tables) — re-send with {"force": true}', "action": action})
             compose_dir = "/opt/tickvault/repo/deploy/docker"
+            # The data lives in the NAMED volume `tv-questdb-data` (container
+            # `tv-questdb`). `docker compose down -v` in compose_dir does NOT
+            # reliably remove it — QuestDB may run outside this compose project
+            # (the documented wipe-questdb caveat), so `down -v` leaves the
+            # named volume intact and `up` re-attaches the SAME old data. The
+            # fix: force-remove the container BY NAME (releases the volume),
+            # then remove the volume BY NAME, then `up` recreates it EMPTY.
             cmds = [
                 "set +e",
                 "systemctl stop tickvault || true",
+                # 1. force-remove the data containers BY NAME (releases volumes)
+                "docker rm -f tv-questdb tv-loki tv-alloy 2>/dev/null || true",
+                # 2. remove the QuestDB data volume BY NAME (the actual ticks/candles)
+                "docker volume rm tv-questdb-data 2>/dev/null || true",
+                # 3. compose-level teardown for anything still managed there
                 f"cd {compose_dir} || exit 0",
                 "docker compose down -v --remove-orphans || true",
+                # 4. belt-and-suspenders: volume again (in case compose re-held it)
+                "docker volume rm tv-questdb-data 2>/dev/null || true",
+                # 5. images + any leftover unused volumes
                 "docker system prune -af --volumes || true",
+                # 6. verify the volume is GONE before recreating (loud if not)
+                "docker volume inspect tv-questdb-data >/dev/null 2>&1 && echo 'WARN: tv-questdb-data still present' || echo 'OK: tv-questdb-data removed'",
+                # 7. recreate everything fresh (empty volume) + restart app
                 "docker compose up -d || true",
                 "systemctl enable tickvault || true",
                 "systemctl restart tickvault || true",
