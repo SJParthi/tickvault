@@ -86,7 +86,7 @@ def _github_token() -> str:
 
 
 # Destructive box actions blocked during market hours unless force=true.
-_DESTRUCTIVE = {"stop", "reboot", "restart-app", "stop-app", "wipe-questdb"}
+_DESTRUCTIVE = {"stop", "reboot", "restart-app", "stop-app", "wipe-questdb", "docker-reset"}
 
 _MKT_OPEN_SECS = 9 * 3600 + 15 * 60
 _MKT_CLOSE_SECS = 15 * 3600 + 30 * 60
@@ -499,6 +499,45 @@ def lambda_handler(event, _context):
             ]
             cid = _ssm_shell(cmds)
             return _resp(200, {"ok": True, "action": action, "command_id": cid})
+        if action == "docker-reset":
+            # MOST DESTRUCTIVE: full Docker teardown + fresh rebuild (operator
+            # Option B, 2026-06-04). Unlike wipe-questdb (TRUNCATE rows, keeps
+            # audit tables for SEBI), this DELETES the Docker volumes + images
+            # entirely, so EVERY table — including the SEBI-retention audit
+            # tables — is gone. The operator explicitly chose this; the UI
+            # double-confirms (type "NUKE") and spells out the audit-data loss.
+            #
+            # Sequence (each step fail-soft so one hiccup can't wedge the box):
+            #   1. stop the app (systemd) so it releases the QuestDB connection
+            #      (the in-use volume is exactly why `down -v` was unreliable
+            #      for wipe-questdb — stopping the app first fixes that).
+            #   2. `docker compose down -v --remove-orphans` — drop containers
+            #      + named volumes (QuestDB data, loki, alloy).
+            #   3. `docker system prune -af --volumes` — delete images +
+            #      any remaining unused volumes (the "delete images" intent).
+            #   4. `docker compose up -d` — re-pull the SHA256-pinned images
+            #      and recreate containers on EMPTY volumes.
+            #   5. restart the app — it recreates `ticks` + candle tables fresh
+            #      via `ensure_*_table_dedup_keys`, so the new table is born
+            #      with the correct DEDUP UPSERT KEYS (incl. received_at) — a
+            #      fresh start also clears the stale "sub-second dedup OLD"
+            #      condition. Next instance start is also clean (empty volumes).
+            if not force:
+                return _resp(409, {"error": 'docker-reset is the FULL nuke (deletes volumes + images + ALL data incl. SEBI audit tables) — re-send with {"force": true}', "action": action})
+            compose_dir = "/opt/tickvault/repo/deploy/docker"
+            cmds = [
+                "set +e",
+                "systemctl stop tickvault || true",
+                f"cd {compose_dir} || exit 0",
+                "docker compose down -v --remove-orphans || true",
+                "docker system prune -af --volumes || true",
+                "docker compose up -d || true",
+                "systemctl enable tickvault || true",
+                "systemctl restart tickvault || true",
+                "echo docker-reset-dispatched",
+            ]
+            cid = _ssm_shell(cmds)
+            return _resp(200, {"ok": True, "action": action, "command_id": cid})
 
         # ---- overview / data ----
         if action in ("status", "view"):
@@ -742,7 +781,9 @@ def _console_html() -> str:
         <div class="muted" style="margin-top:10px">Stop / restart are blocked 9:15 AM–3:30 PM IST Mon–Fri.</div>
         <label class="switch" style="margin-top:8px"><input type="checkbox" id="force"> force (override market-hours guard)</label>
         <div class="row" style="margin-top:18px"><button class="b-stop" onclick="wipeData()">🗑️ Wipe ALL data → fresh start</button></div>
-        <div class="muted" style="margin-top:6px">Deletes every tick &amp; candle and restarts empty. Run when the box is RUNNING; next session = fresh data. Asks you to type WIPE.</div>
+        <div class="muted" style="margin-top:6px">Deletes every tick &amp; candle and restarts empty (audit tables kept). Run when the box is RUNNING; next session = fresh data. Asks you to type WIPE.</div>
+        <div class="row" style="margin-top:18px"><button class="b-stop" onclick="dockerReset()">💥 Full Docker reset → wipe EVERYTHING</button></div>
+        <div class="muted" style="margin-top:6px">⚠️ NUCLEAR: deletes Docker containers + volumes + images and rebuilds from scratch. Wipes <b>ALL</b> data INCLUDING the SEBI-retention audit tables. Box must be RUNNING. Asks you to type NUKE.</div>
         <div class="row" style="margin-top:14px"><button class="b-ghost" onclick="lock()">🔒 Lock / forget this device</button></div>
       </div>
     </section>
@@ -937,6 +978,13 @@ async function wipeData(){
   const j=await call('wipe-questdb',{force:true});
   if(j&&j.ok){ toast('✅ wipe started — fresh data from next session'); setTimeout(loadOverview,4000); }
   else { toast((j&&j.error)||'wipe failed — is the box running?'); } }
+async function dockerReset(){
+  if(prompt('⚠️ NUCLEAR RESET. This DELETES Docker containers + volumes + images and rebuilds from scratch — wiping ALL data INCLUDING the SEBI-retention audit tables. The box must be RUNNING. Type NUKE to confirm:')!=='NUKE'){ toast('cancelled'); return; }
+  if(!confirm('Last check: every table is destroyed, including audit history. Continue?')){ toast('cancelled'); return; }
+  toast('💥 full Docker reset → rebuilding (may take a minute)…');
+  const j=await call('docker-reset',{force:true});
+  if(j&&j.ok){ toast('✅ Docker reset started — fresh containers + empty data; app restarting'); setTimeout(loadOverview,8000); }
+  else { toast((j&&j.error)||'docker-reset failed — is the box running?'); } }
 
 function startAuto(){ stopAuto(); if($('auto').checked) timer=setInterval(()=>{ if(curTab==='overview') loadOverview(); },8000); }
 function stopAuto(){ if(timer){ clearInterval(timer); timer=null; } }

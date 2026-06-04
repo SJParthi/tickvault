@@ -267,12 +267,40 @@ class WipeGate(unittest.TestCase):
     def test_wipe_is_in_destructive_set(self) -> None:
         self.assertIn("wipe-questdb", handler._DESTRUCTIVE)
 
+    def _docker_reset(self, force: bool):
+        return handler.lambda_handler(
+            {
+                "requestContext": {"http": {"method": "POST"}},
+                "headers": {"authorization": "Bearer s3cret-token"},
+                "body": json.dumps({"action": "docker-reset", "force": force}),
+            },
+            None,
+        )
+
+    def test_docker_reset_without_force_is_blocked(self) -> None:
+        # Force-required guard (409) OR the destructive market-hours guard (409)
+        # — must never reach SSM/boto3 without an explicit force.
+        resp = self._docker_reset(force=False)
+        self.assertEqual(resp["statusCode"], 409)
+
+    def test_docker_reset_is_in_destructive_set(self) -> None:
+        # Membership = market-hours-blocked during 09:15-15:30 IST.
+        self.assertIn("docker-reset", handler._DESTRUCTIVE)
+
 
 class HtmlWipeButton(unittest.TestCase):
     def test_html_has_wipe_button(self) -> None:
         html = handler._console_html()
         self.assertIn("wipeData()", html)
         self.assertIn("Wipe ALL data", html)
+
+    def test_html_has_docker_reset_button(self) -> None:
+        html = handler._console_html()
+        self.assertIn("dockerReset()", html)
+        self.assertIn("Full Docker reset", html)
+        # The nuke must spell out the SEBI-audit-data loss + require typing NUKE.
+        self.assertIn("NUKE", html)
+        self.assertIn("audit", html)
 
 
 if __name__ == "__main__":
