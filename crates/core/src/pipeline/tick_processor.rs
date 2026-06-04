@@ -265,6 +265,47 @@ pub const CLOCK_SKEW_BACKWARD_THRESHOLD_NANOS: i64 = 60_000_000_000;
 static MAX_WALL_CLOCK_SEEN_NANOS: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
 
+/// Last `received_at_nanos` HANDED OUT by `current_received_at_nanos()`, used
+/// to guarantee **strict monotonicity** of `received_at` across every tick.
+///
+/// ## Why (dedup-collision elimination — operator directive 2026-06-04)
+///
+/// The `ticks` DEDUP UPSERT key is `(ts, security_id, segment, received_at)`.
+/// `ts` is the exchange timestamp, which is only **1-second granular**, so two
+/// distinct ticks for the same instrument within the same second are
+/// distinguished ONLY by `received_at`. If two such ticks ever received the
+/// SAME `received_at` nanosecond (a burst during a fast move + a coarse clock),
+/// QuestDB's UPSERT would COLLAPSE them into one row — silently dropping a
+/// tick (e.g. the minute's true high/low extreme). By forcing `received_at`
+/// strictly increasing, two distinct ticks can NEVER share the dedup key, so
+/// a same-nanosecond collision is **structurally impossible**, not merely
+/// "unlikely". The bump is sub-microsecond and never affects the
+/// second-granular market-hours window check.
+static LAST_RECEIVED_AT_NANOS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Pure helper: given the raw wall-clock `now` (UTC nanos) and the
+/// last-handed-out value, returns a value that is **strictly greater** than
+/// the last one (`now` if it already advanced, else `last + 1`), and updates
+/// the atomic. Lock-free CAS loop — O(1), zero allocation, hot-path safe.
+///
+/// Guarantees: the returned sequence is strictly monotonically increasing, so
+/// no two calls ever return the same value → no two ticks ever share the
+/// `received_at` component of the DEDUP key.
+#[inline]
+fn monotonic_received_at(now: i64, last: &std::sync::atomic::AtomicI64) -> i64 {
+    use std::sync::atomic::Ordering;
+    loop {
+        let prev = last.load(Ordering::Relaxed);
+        let next = now.max(prev.saturating_add(1));
+        if last
+            .compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return next;
+        }
+    }
+}
+
 /// Test-only override for `received_at_nanos` used by `run_tick_processor`.
 ///
 /// Production always uses `Utc::now()` via the `else` branch in
@@ -289,7 +330,12 @@ fn current_received_at_nanos() -> i64 {
             return override_val;
         }
     }
-    chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    // Strict-monotonic bump (dedup-collision elimination): every tick gets a
+    // received_at strictly greater than the previous one, so two distinct
+    // ticks can never share the `(ts, security_id, segment, received_at)`
+    // dedup key. See LAST_RECEIVED_AT_NANOS doc for the full rationale.
+    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    monotonic_received_at(now, &LAST_RECEIVED_AT_NANOS)
 }
 
 /// Returns `true` if the wall-clock time (received_at_nanos) falls within
@@ -1588,6 +1634,63 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test-only arithmetic (casts, indexing) is safe
 mod tests {
     use super::*;
+
+    // --- Dedup-collision elimination: strict-monotonic received_at ---
+    // (operator directive 2026-06-04) — prove two distinct ticks can never
+    // share the `(ts, security_id, segment, received_at)` dedup key.
+
+    #[test]
+    fn test_monotonic_received_at_same_now_returns_strictly_increasing() {
+        // A burst: the clock returns the SAME nanosecond for two ticks.
+        // The helper MUST hand out strictly-increasing values so the dedup
+        // key can never collapse them.
+        let last = std::sync::atomic::AtomicI64::new(0);
+        let a = monotonic_received_at(1_000, &last);
+        let b = monotonic_received_at(1_000, &last); // same clock value
+        let c = monotonic_received_at(1_000, &last); // same clock value
+        assert_eq!(a, 1_000);
+        assert_eq!(b, 1_001, "collision on same nanosecond must bump +1");
+        assert_eq!(c, 1_002);
+        assert!(a < b && b < c, "strictly increasing");
+    }
+
+    #[test]
+    fn test_monotonic_received_at_backward_clock_still_increases() {
+        // NTP step / clock goes backward: never emit a value <= last.
+        let last = std::sync::atomic::AtomicI64::new(0);
+        assert_eq!(monotonic_received_at(5_000, &last), 5_000);
+        assert_eq!(
+            monotonic_received_at(4_000, &last),
+            5_001,
+            "backward clock must still strictly increase (last+1)"
+        );
+        assert_eq!(monotonic_received_at(4_999, &last), 5_002);
+    }
+
+    #[test]
+    fn test_monotonic_received_at_forward_clock_uses_now() {
+        // Normal case: the clock advances past last → use the real value.
+        let last = std::sync::atomic::AtomicI64::new(0);
+        assert_eq!(monotonic_received_at(10_000, &last), 10_000);
+        assert_eq!(monotonic_received_at(10_500, &last), 10_500);
+        assert_eq!(monotonic_received_at(20_000, &last), 20_000);
+    }
+
+    #[test]
+    fn test_monotonic_received_at_long_sequence_is_strictly_unique() {
+        // 10k calls with a clock that barely moves → every output unique +
+        // strictly increasing → zero dedup-key collisions possible.
+        let last = std::sync::atomic::AtomicI64::new(0);
+        let mut prev = i64::MIN;
+        for i in 0..10_000i64 {
+            // Clock that repeats values heavily (only advances every 100 calls).
+            let now = 1_000_000 + (i / 100);
+            let got = monotonic_received_at(now, &last);
+            assert!(got > prev, "must be strictly increasing: {got} > {prev}");
+            prev = got;
+        }
+    }
+
     use tickvault_common::constants::{
         DISCONNECT_PACKET_SIZE, FULL_QUOTE_PACKET_SIZE, HEADER_OFFSET_EXCHANGE_SEGMENT,
         HEADER_OFFSET_MESSAGE_LENGTH, HEADER_OFFSET_RESPONSE_CODE, HEADER_OFFSET_SECURITY_ID,
