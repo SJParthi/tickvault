@@ -98,3 +98,29 @@ fn guard_helpers_are_sane() {
     // the DDL string (has spaces/uppercase) must NOT be treated as a table name
     assert!(!table_name_constants(sample).iter().any(|t| t.contains(' ')));
 }
+
+/// The 21 live candle tables are swept by iterating `candle_table_names()` (the
+/// single source of truth) in `detach_old_partitions`. This cross-references
+/// that source — closing the gap where #1022's meta-guard was blind to candle
+/// tables (it only saw literals inside `partition_manager.rs`). Catches both
+/// (a) deletion of the candle sweep loop and (b) a future `_shadow` rename.
+#[test]
+fn candle_tables_are_swept_via_single_source() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let pm =
+        fs::read_to_string(src.join("partition_manager.rs")).expect("read partition_manager.rs");
+    assert!(
+        pm.contains("candle_table_names()"),
+        "partition_manager must sweep candle tables via candle_table_names() — the candle \
+         retention loop is missing (the #1022 phantom-`_shadow`-name bug would return)"
+    );
+
+    let names = tickvault_storage::shadow_persistence::candle_table_names();
+    assert_eq!(names.len(), 21, "expected 21 live candle tables");
+    for n in names {
+        assert!(
+            n.starts_with("candles_") && !n.contains("_shadow"),
+            "candle table name must be plain candles_<TF> (no _shadow): {n}"
+        );
+    }
+}
