@@ -26,6 +26,11 @@
 #![cfg_attr(test, allow(clippy::assertions_on_constants))]
 #![cfg_attr(test, allow(clippy::field_reassign_with_default))]
 #![allow(missing_docs)]
+// APPROVED: clippy 1.95 tightened these doc-formatting lints; the codebase
+// predates them. Allow rather than churn doc comments for a cosmetic
+// markdown-rendering nicety with zero runtime/behavior impact.
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::doc_overindented_list_items)]
 
 pub mod handlers;
 pub mod middleware;

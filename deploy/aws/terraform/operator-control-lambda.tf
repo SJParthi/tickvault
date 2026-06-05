@@ -1,6 +1,6 @@
 # Operator portal Lambda — action backend for the single-page operator portal
 # (Overview / Data / GitHub / Logs / AWS / Latency tabs).
-# Re-trigger marker: bump to fire terraform-apply (re-zips handler.py). (2026-06-01d)
+# Re-trigger marker: bump to fire terraform-apply (re-zips handler.py). (2026-06-05 — docker-reset hardened: remove containers BY VOLUME, fail-loud gate if volume survives, wipe host caches)
 #
 # WHY: the operator wants ONE place (console URL + Telegram) to view AND control
 # the box, without the AWS console or GitHub UI. Grafana = view; this = control.

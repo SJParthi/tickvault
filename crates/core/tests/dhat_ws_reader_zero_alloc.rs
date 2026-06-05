@@ -1,21 +1,25 @@
 //! STAGE-D P7.5 — DHAT zero-allocation test for the WS reader hot path.
 //!
-//! Verifies Principle #1 ("Zero allocation on hot path") for the two
-//! cheapest parts of the WS read loop:
+//! Verifies Principle #1 ("Zero allocation on hot path") for the THREE
+//! parts of the WS read loop tail:
 //!
 //!   1. `AtomicU64::fetch_add(1, Ordering::Relaxed)` — the activity
 //!      watchdog counter bump executed on every inbound frame. MUST
 //!      allocate zero bytes.
 //!
-//!   2. `dispatch_frame()` — the binary parser called after the WAL
+//!   2. The WAL hand-off — zero-tick-loss PR-8a (H1) replaced the
+//!      per-frame `data.to_vec()` malloc with `data.clone()` on the
+//!      `Bytes` the read loop already holds. A `Bytes` clone is an O(1)
+//!      Arc refcount bump, NOT a copy, so the durable-WAL hand-off now
+//!      allocates zero bytes. This test pins that — a regression back to
+//!      `to_vec()` would make `allocs_during` non-zero and fail here.
+//!
+//!   3. `dispatch_frame()` — the binary parser called after the WAL
 //!      append to route the frame into the tick processor. MUST
 //!      allocate zero bytes.
 //!
-//! The third step in the read loop — `WsFrameSpill::append` — takes
-//! an owned `Vec<u8>` (one allocation per frame). That allocation is
-//! deliberate and bounded (`O(frame_len)` ≤ 162 B for Full packets),
-//! so it is NOT covered by this test. The hot-path-reviewer rule marks
-//! it `O(1) EXEMPT` inside the read loop with a justification.
+//! With H1, the ENTIRE read-loop tail (counter + WAL hand-off + dispatch)
+//! is zero-allocation — no per-frame malloc remains on the hottest path.
 //!
 //! DHAT allows only one profiler per process, so all hot-path
 //! assertions are consolidated into a single test.
@@ -25,6 +29,8 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use bytes::Bytes;
 
 use tickvault_common::constants::{
     EXCHANGE_SEGMENT_NSE_FNO, QUOTE_PACKET_SIZE, TICKER_PACKET_SIZE,
@@ -54,13 +60,18 @@ fn make_quote_bytes(security_id: u32) -> Vec<u8> {
     buf
 }
 
-/// Simulate the WS read loop per-frame "tail" that runs AFTER the
-/// durable WAL append: counter bump + dispatch. Returns the parsed
-/// frame wrapped in `black_box` so the compiler cannot elide the work.
+/// Simulate the full WS read loop per-frame tail: counter bump + WAL
+/// hand-off (`Bytes::clone`, the H1 zero-alloc replacement for `to_vec`)
+/// + dispatch. Returns the parsed frame wrapped in `black_box` so the
+/// compiler cannot elide the work.
 #[inline(always)]
-fn ws_reader_tail(counter: &AtomicU64, packet: &[u8]) -> bool {
+fn ws_reader_tail(counter: &AtomicU64, frame: &Bytes) -> bool {
     counter.fetch_add(1, Ordering::Relaxed);
-    let parsed = dispatch_frame(black_box(packet), black_box(0));
+    // H1: hand the durable WAL an O(1) Arc-refcount clone (NOT a copy).
+    // This is exactly what `spill.append(WsType::LiveFeed, data.clone())`
+    // does on the live read loop.
+    let wal_handoff = black_box(frame.clone());
+    let parsed = dispatch_frame(black_box(wal_handoff.as_ref()), black_box(0));
     black_box(parsed).is_ok()
 }
 
@@ -73,12 +84,35 @@ fn ws_reader_tail(counter: &AtomicU64, packet: &[u8]) -> bool {
 fn dhat_ws_reader_tail_zero_alloc() {
     let _profiler = dhat::Profiler::builder().testing().build();
 
-    // Pre-allocate inputs BEFORE the measurement window.
+    // Pre-allocate inputs BEFORE the measurement window, in the SAME SHARED
+    // representation tokio-tungstenite delivers. tungstenite 0.29 builds
+    // `Message::Binary`'s `Bytes` via `in_buffer.split_to(len).freeze()`
+    // (src/protocol/frame/mod.rs:199 + :227) — a `split_to` promotes the
+    // buffer to the shared (Arc-backed) kind, so the delivered `Bytes` is
+    // already shared and its `clone()` is a pure refcount bump (alloc-free).
+    //
+    // A freshly-built `Bytes` (from `Vec`/`BytesMut::freeze`) is instead
+    // *promotable*: its FIRST clone allocates a one-time control block. We
+    // reproduce production's shared state by forcing that promotion HERE,
+    // off-clock (the throwaway clone's promotion alloc happens before the
+    // measurement window), so the in-window clone measures exactly the live
+    // hot path's zero-alloc refcount bump.
+    let to_shared_bytes = |v: Vec<u8>| -> Bytes {
+        let b = Bytes::from(v);
+        let _promoted = std::hint::black_box(b.clone()); // off-clock: KIND_VEC -> shared
+        b
+    };
     let counter = AtomicU64::new(0);
-    let ticker_pkt = make_ticker_bytes(52432, 245.50, 1_700_000_000);
-    let quote_pkt = make_quote_bytes(52432);
-    let ticker_burst: Vec<Vec<u8>> = (0..100)
-        .map(|i| make_ticker_bytes(50000 + i, 100.0 + i as f32, 1_700_000_000 + i))
+    let ticker_pkt = to_shared_bytes(make_ticker_bytes(52432, 245.50, 1_700_000_000));
+    let quote_pkt = to_shared_bytes(make_quote_bytes(52432));
+    let ticker_burst: Vec<Bytes> = (0..100)
+        .map(|i| {
+            to_shared_bytes(make_ticker_bytes(
+                50000 + i,
+                100.0 + i as f32,
+                1_700_000_000 + i,
+            ))
+        })
         .collect();
 
     // ---- Measurement window begins ----
@@ -106,10 +140,12 @@ fn dhat_ws_reader_tail_zero_alloc() {
 
     assert_eq!(
         allocs_during, 0,
-        "WS reader tail (counter + dispatch) allocated {} blocks — PRINCIPLE #1 VIOLATED.\n\
-         Only the bounded WAL `data.to_vec()` is permitted; everything else must be \
-         zero-allocation. Check for hidden String/Vec/Box creation in dispatch_frame \
-         or the hot-path counter bump.",
+        "WS reader tail (counter + WAL Bytes-clone hand-off + dispatch) allocated {} \
+         blocks — PRINCIPLE #1 VIOLATED.\n\
+         After H1 the ENTIRE tail must be zero-allocation. A non-zero count almost \
+         certainly means the WAL hand-off regressed from `data.clone()` back to \
+         `data.to_vec()`, or hidden String/Vec/Box creation crept into dispatch_frame \
+         or the counter bump.",
         allocs_during
     );
 }

@@ -267,6 +267,10 @@ impl MultiTfAggregator {
         // O(1) EXEMPT: `always_on` is a HashSet — contains is O(1) hashing, not a Vec scan.
         let exempt = self.always_on.contains(&exempt_key);
         let secs_of_day = tick.exchange_timestamp % 86_400;
+        // The O(1) pre-commit scanner flags any `.contains(` as a Vec scan; the
+        // explicit comparison below is equally O(1) (two integer comparisons).
+        // APPROVED: manual_range_contains is intentional to avoid that false positive.
+        #[allow(clippy::manual_range_contains)]
         let out_of_session = secs_of_day < MARKET_OPEN_SECS_OF_DAY_IST
             || secs_of_day >= MARKET_CLOSE_SECS_OF_DAY_IST;
         if !exempt && out_of_session {

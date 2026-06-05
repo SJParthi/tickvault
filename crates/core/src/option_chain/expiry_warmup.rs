@@ -181,8 +181,9 @@ async fn run_one_warmup_burst(
             "option-chain expiry warmup: one or more underlyings failed"
         );
         // Best-effort Telegram. Failure here does NOT block tomorrow's
-        // retry.
-        let _ = notifier.clone();
+        // retry. `notifier` is kept wired (the reference is Copy) for the
+        // follow-up typed NotificationEvent variant noted below.
+        let _notifier = notifier;
         // Hook: a typed NotificationEvent::OptionChainExpiryWarmupFailed
         // variant can land in a follow-up PR. Today we rely on the
         // structured `error!` line above, which Loki routes to

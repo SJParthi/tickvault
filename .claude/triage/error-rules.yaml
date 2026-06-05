@@ -741,6 +741,38 @@ rules:
       already routes the summary event; the JSONL entry is for
       audit only. Silence (cooldown matches the 60s coalesce window).
 
+  - name: ws-gap-07-live-channel-closed-escalate
+    match:
+      code: WS-GAP-07
+    action: escalate
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      WS-GAP-07 = the live-feed frame channel's receiver was dropped — the
+      tick-processing consumer died, so no ticks reach the pipeline from this
+      connection until the app restarts. High severity; the pool supervisor
+      (WS-GAP-05) respawns the connection task but cannot resurrect a dead
+      consumer. Escalate (Telegram + draft Issue) so the operator restarts
+      the app per the runbook.
+
+  - name: disk-watcher-01-respawn-escalate
+    match:
+      code: DISK-WATCHER-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      DISK-WATCHER-01 means the supervisor respawned the spill disk-health
+      watcher after it died (panic/cancel). A single respawn self-heals — the
+      watcher resumes and disk-free monitoring (the "disk full + QuestDB down"
+      early warning) continues. But a sustained respawn rate means a real bug
+      in the probe loop. Mirrors WS-GAP-05; the CloudWatch alarm pages on a
+      flapping watcher. Escalate (Telegram + draft Issue) so the operator can
+      correlate the panic backtrace, with a 5-min cooldown to avoid spamming
+      on the benign one-off respawn at shutdown.
+
   - name: auth-gap-03-token-force-renewal-on-wake-silence
     match:
       code: AUTH-GAP-03
@@ -1316,6 +1348,23 @@ rules:
       Severity::High. Discarded by aggregator. Sustained > 1/sec
       indicates clock drift or slow consumer keeping ticks in
       pipeline channel longer than boundary period.
+
+  - name: aggregator-lag-01-broadcast-lagged-escalate
+    match:
+      code: AGGREGATOR-LAG-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-6-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 60
+    justification: >-
+      AGGREGATOR-LAG-01 = the candle aggregator's tick-broadcast fell so
+      far behind the ~52s buffer that the broadcast dropped ticks from its
+      view. Severity::High. Ticks are NOT lost (separate lossless+ordered
+      `ticks` consumer) and NOT reordered — only the derived candles for
+      the window may under-count, recoverable via the post-market 1m
+      cross-verify + the ticks table. A >52s aggregator stall is a serious
+      host-health incident (OOM/CPU starvation/blocked seal-writer);
+      escalate so the operator root-causes the stall.
 
   - name: aggregator-seal-01-ilp-failed-ring-caught-escalate
     match:

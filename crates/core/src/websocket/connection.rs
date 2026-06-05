@@ -614,6 +614,17 @@ impl WebSocketConnection {
                         // sites and emit it with the reconnect event so the
                         // Telegram message surfaces WHY + HOW LONG + HOW MANY.
                         let (reason, down_secs, attempts) = self.take_disconnect_context();
+                        // G1 (zero-tick-loss PR-3): quantify reconnect-gap time so
+                        // dashboards + a CloudWatch rate-alarm can see sustained or
+                        // excessive reconnect churn (Dhan packets carry no sequence
+                        // number, so a sub-30s reconnect's lost ticks are otherwise
+                        // invisible to the 30s tick-gap detector). Per-event severity
+                        // stays Medium — typical reconnects are 5-10s, so escalating
+                        // each to High would spam the pager; the rate-alarm on the
+                        // cumulative counter is the correct anomaly detector.
+                        metrics::counter!("tv_ws_reconnect_total", "feed" => "main").increment(1);
+                        metrics::counter!("tv_ws_reconnect_gap_seconds_total", "feed" => "main")
+                            .increment(down_secs);
                         if let Some(ref n) = self.notifier {
                             n.notify(crate::notification::events::NotificationEvent::WebSocketReconnected {
                                 connection_index: usize::from(self.connection_id),
@@ -1267,13 +1278,12 @@ impl WebSocketConnection {
                     //     path and it requires both the disk writer thread
                     //     AND the downstream consumer to be stuck simultaneously.
                     if let Some(spill) = self.wal_spill.as_ref() {
-                        // O(1) EXEMPT: one Vec<u8> copy per frame (≤162 B for Full packets)
-                        // is required to hand owned memory to the disk writer thread. This
-                        // is O(frame_len) which is bounded by the largest Dhan packet and
-                        // therefore constant-bounded. One alloc per frame at peak 10k
-                        // frames/sec is well within jemalloc headroom.
-                        let frame_vec = data.to_vec();
-                        let outcome = spill.append(WsType::LiveFeed, frame_vec);
+                        // Zero-tick-loss PR-8a (H1): hand the WAL spill an O(1)
+                        // `Bytes` Arc-refcount clone instead of a per-frame
+                        // `Vec<u8>` malloc. `data` is already `Bytes` (the live
+                        // forward below also moves it zero-copy), so `data.clone()`
+                        // is a refcount bump — no heap allocation on the read loop.
+                        let outcome = spill.append(WsType::LiveFeed, data.clone());
                         if outcome == tickvault_storage::ws_frame_spill::AppendOutcome::Dropped {
                             error!(
                                 connection_id = self.connection_id,
@@ -1312,11 +1322,13 @@ impl WebSocketConnection {
                                      attached — frame LOST. Investigate consumer task \
                                      liveness and re-enable WAL spill (WS-2 audit gap)."
                                 );
-                                metrics::counter!(
-                                    "tv_ws_frame_dropped_no_wal_total",
-                                    "ws_type" => "live_feed"
-                                )
-                                .increment(1);
+                                // NOTE: emitted WITHOUT a label so the
+                                // `cloudwatch_app_alarms_wiring` guard's
+                                // single-line `counter!("name"` detector finds it
+                                // (this is now an alarmed metric — G4). The
+                                // ws_type was always "live_feed"; the CloudWatch
+                                // alarm keys on the `host` dimension regardless.
+                                metrics::counter!("tv_ws_frame_dropped_no_wal_total").increment(1);
                                 // Also increment the existing backpressure counter so
                                 // single-pane-of-glass dashboards still see the event.
                                 metrics::counter!(
@@ -1332,10 +1344,26 @@ impl WebSocketConnection {
                             // (when WAL is attached).
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
-                            warn!(
+                            // WS-GAP-07: the tick-processing consumer holding the
+                            // Receiver is gone — unlike a `Full` backpressure (the
+                            // WAL still records the frame), a `Closed` channel means
+                            // NO ticks reach the pipeline from this connection until
+                            // the consumer/app restarts. error! (Telegram via Loki) +
+                            // dedicated counter per audit Rule 5 (drain failures are
+                            // error!, never warn!).
+                            error!(
                                 connection_id = self.connection_id,
-                                "Frame receiver dropped — stopping read loop"
+                                code = tickvault_common::error_code::ErrorCode::WsGap07LiveChannelClosed
+                                    .code_str(),
+                                "WS live frame channel CLOSED — tick consumer dropped; \
+                                 stopping read loop. Frames will not flow on this \
+                                 connection until the consumer/app restarts."
                             );
+                            metrics::counter!(
+                                "tv_ws_live_channel_closed_drop_total",
+                                "ws_type" => "live_feed"
+                            )
+                            .increment(1);
                             return Ok(());
                         }
                     }
@@ -1710,7 +1738,10 @@ impl WebSocketConnection {
         // Capture the FIRST disconnect timestamp in this cycle (so down_secs
         // measures total downtime including any intermediate retry failures).
         let now_secs = chrono::Utc::now().timestamp();
-        let _ = self.last_disconnect_at_epoch_secs.compare_exchange(
+        // First-disconnect-wins: a lost CAS race just means another path
+        // already stamped the epoch this cycle, which is fine. Bind to a
+        // `_`-prefixed name (not bare `_`) so the must-use result is consumed.
+        let _cas_outcome = self.last_disconnect_at_epoch_secs.compare_exchange(
             0,
             now_secs,
             std::sync::atomic::Ordering::AcqRel,

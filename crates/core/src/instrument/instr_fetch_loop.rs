@@ -138,15 +138,15 @@ where
     let mut attempt: u32 = 1;
     loop {
         // Test-only cap
-        if let Some(cap) = max_attempts {
-            if attempt > cap {
-                return (
-                    LoopOutcome::Exhausted {
-                        attempts_used: attempt - 1,
-                    },
-                    None,
-                );
-            }
+        if let Some(cap) = max_attempts
+            && attempt > cap
+        {
+            return (
+                LoopOutcome::Exhausted {
+                    attempts_used: attempt - 1,
+                },
+                None,
+            );
         }
 
         // Step 1: fetch bytes

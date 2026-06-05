@@ -265,6 +265,47 @@ pub const CLOCK_SKEW_BACKWARD_THRESHOLD_NANOS: i64 = 60_000_000_000;
 static MAX_WALL_CLOCK_SEEN_NANOS: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
 
+/// Last `received_at_nanos` HANDED OUT by `current_received_at_nanos()`, used
+/// to guarantee **strict monotonicity** of `received_at` across every tick.
+///
+/// ## Why (dedup-collision elimination — operator directive 2026-06-04)
+///
+/// The `ticks` DEDUP UPSERT key is `(ts, security_id, segment, received_at)`.
+/// `ts` is the exchange timestamp, which is only **1-second granular**, so two
+/// distinct ticks for the same instrument within the same second are
+/// distinguished ONLY by `received_at`. If two such ticks ever received the
+/// SAME `received_at` nanosecond (a burst during a fast move + a coarse clock),
+/// QuestDB's UPSERT would COLLAPSE them into one row — silently dropping a
+/// tick (e.g. the minute's true high/low extreme). By forcing `received_at`
+/// strictly increasing, two distinct ticks can NEVER share the dedup key, so
+/// a same-nanosecond collision is **structurally impossible**, not merely
+/// "unlikely". The bump is sub-microsecond and never affects the
+/// second-granular market-hours window check.
+static LAST_RECEIVED_AT_NANOS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Pure helper: given the raw wall-clock `now` (UTC nanos) and the
+/// last-handed-out value, returns a value that is **strictly greater** than
+/// the last one (`now` if it already advanced, else `last + 1`), and updates
+/// the atomic. Lock-free CAS loop — O(1), zero allocation, hot-path safe.
+///
+/// Guarantees: the returned sequence is strictly monotonically increasing, so
+/// no two calls ever return the same value → no two ticks ever share the
+/// `received_at` component of the DEDUP key.
+#[inline]
+fn monotonic_received_at(now: i64, last: &std::sync::atomic::AtomicI64) -> i64 {
+    use std::sync::atomic::Ordering;
+    loop {
+        let prev = last.load(Ordering::Relaxed);
+        let next = now.max(prev.saturating_add(1));
+        if last
+            .compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return next;
+        }
+    }
+}
+
 /// Test-only override for `received_at_nanos` used by `run_tick_processor`.
 ///
 /// Production always uses `Utc::now()` via the `else` branch in
@@ -289,7 +330,12 @@ fn current_received_at_nanos() -> i64 {
             return override_val;
         }
     }
-    chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    // Strict-monotonic bump (dedup-collision elimination): every tick gets a
+    // received_at strictly greater than the previous one, so two distinct
+    // ticks can never share the `(ts, security_id, segment, received_at)`
+    // dedup key. See LAST_RECEIVED_AT_NANOS doc for the full rationale.
+    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    monotonic_received_at(now, &LAST_RECEIVED_AT_NANOS)
 }
 
 /// Returns `true` if the wall-clock time (received_at_nanos) falls within
@@ -416,9 +462,10 @@ fn utc_nanos_to_ist_epoch_secs(received_at_nanos: i64) -> u32 {
 /// This is safe: QuestDB `DEDUP UPSERT KEYS(ts, security_id)` is the
 /// authoritative server-side dedup. This ring buffer reduces redundant writes.
 struct TickDedupRing {
-    /// Pre-allocated slot array. Each slot holds a 64-bit fingerprint.
-    /// Initialized to `u64::MAX` (empty sentinel).
-    slots: Box<[u64]>,
+    /// Pre-allocated slot array. Each slot holds `(fingerprint, last_seen_nanos)`.
+    /// Initialized to `(u64::MAX, i64::MIN)` (empty sentinel — never matches a
+    /// real fingerprint, and `i64::MIN` makes the first sighting non-recent).
+    slots: Box<[(u64, i64)]>,
     /// Bitmask for fast modulo: `size - 1` where size is a power of two.
     mask: usize,
 }
@@ -436,25 +483,49 @@ impl TickDedupRing {
         );
         let size = 1_usize << power;
         Self {
-            slots: vec![u64::MAX; size].into_boxed_slice(),
+            slots: vec![(u64::MAX, i64::MIN); size].into_boxed_slice(),
             mask: size.wrapping_sub(1),
         }
     }
 
-    /// Returns `true` if this tick was recently seen (duplicate).
+    /// Returns `true` if this tick is a recent EXACT duplicate (a Dhan
+    /// reconnect re-send), i.e. the same `(security_id, exchange_timestamp, ltp)`
+    /// was seen within `DEDUP_RESEND_WINDOW_NANOS` of `now_nanos`.
+    ///
+    /// Time-windowed (2026-06-05): a genuine price RE-TOUCH that arrives beyond
+    /// the window — e.g. an index re-touching the same price minutes later with
+    /// a stale LTT — is NOT treated as a duplicate, so it survives to the ticks
+    /// table + broadcast instead of being silently dropped. Dropping an
+    /// identical `(price, LTT)` WITHIN the window is OHLC-safe (the price is
+    /// already recorded).
     ///
     /// # Performance
-    /// O(1) — one hash computation + one array lookup + one comparison.
+    /// O(1) — one hash + one array lookup + one compare + one store. Zero alloc.
     #[inline(always)]
-    fn is_duplicate(&mut self, security_id: u32, exchange_timestamp: u32, ltp: f32) -> bool {
+    fn is_duplicate(
+        &mut self,
+        security_id: u32,
+        exchange_timestamp: u32,
+        ltp: f32,
+        now_nanos: i64,
+    ) -> bool {
         let key = Self::fingerprint(security_id, exchange_timestamp, ltp);
         let idx = (key as usize) & self.mask;
-        if self.slots[idx] == key {
-            true
-        } else {
-            self.slots[idx] = key;
-            false
-        }
+        let (fp, last_seen) = self.slots[idx];
+        let recent = fp == key
+            && now_nanos.saturating_sub(last_seen)
+                <= tickvault_common::constants::DEDUP_RESEND_WINDOW_NANOS;
+        self.slots[idx] = (key, now_nanos);
+        recent
+    }
+
+    /// Test-only 3-arg shim: same `now_nanos` (0) for back-to-back calls, so a
+    /// repeated identical triple is within the resend window → duplicate. Lets
+    /// the existing dedup tests keep their (id, ts, ltp) semantics while the
+    /// time-windowing is covered by the dedicated window tests below.
+    #[cfg(test)]
+    fn is_dup_test(&mut self, security_id: u32, exchange_timestamp: u32, ltp: f32) -> bool {
+        self.is_duplicate(security_id, exchange_timestamp, ltp, 0)
     }
 
     /// Builds a 64-bit fingerprint from tick identity fields using FNV-1a mixing.
@@ -471,6 +542,87 @@ impl TickDedupRing {
         h ^= u64::from(ltp.to_bits());
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
         h
+    }
+}
+
+/// Residual of the tick-conservation identity (cold-path proof — NOT hot path).
+///
+/// `processed` = ticks that entered the tick branch; the other six are the ONLY
+/// terminal outcomes of a tick-branch entry (verified in `run_tick_processor`:
+/// persist Ok → `persisted`, persist Err (rescued) → `storage_errors`, and the
+/// four `continue` drops `junk` / `stale_day` / `outside_hours` / `dedup`). The
+/// loop is synchronous, so at the periodic check there are zero in-flight ticks
+/// and the identity is exact. Returns `processed - accounted`: 0 = every tick
+/// accounted, > 0 = unaccounted (leak), < 0 = double-count bug.
+#[inline]
+fn tick_conservation_residual(
+    processed: u64,
+    persisted: u64,
+    storage_errors: u64,
+    junk: u64,
+    stale_day: u64,
+    outside_hours: u64,
+    dedup: u64,
+) -> i64 {
+    let accounted = persisted
+        .saturating_add(storage_errors)
+        .saturating_add(junk)
+        .saturating_add(stale_day)
+        .saturating_add(outside_hours)
+        .saturating_add(dedup);
+    (processed as i64).saturating_sub(accounted as i64)
+}
+
+/// Per-window change in the conservation residual. `> 0` means ticks entered the
+/// branch this window but reached no known terminal outcome — an ACTIVE leak. A
+/// flat residual (delta 0) is benign even if the absolute is non-zero, so a
+/// constant offset never pages; only a growing gap does.
+#[inline]
+fn conservation_leak_delta(current_residual: i64, last_residual: i64) -> i64 {
+    current_residual.saturating_sub(last_residual)
+}
+
+#[cfg(test)]
+mod conservation_tests {
+    use super::{conservation_leak_delta, tick_conservation_residual};
+
+    #[test]
+    fn test_tick_conservation_residual_balanced_is_zero() {
+        // 100 in = 70 persisted + 5 errors + 3 junk + 2 stale + 15 out + 5 dedup
+        assert_eq!(tick_conservation_residual(100, 70, 5, 3, 2, 15, 5), 0);
+    }
+
+    #[test]
+    fn test_tick_conservation_residual_one_unaccounted_is_positive_one() {
+        // one tick entered but reached no terminal outcome
+        assert_eq!(tick_conservation_residual(100, 70, 5, 3, 2, 15, 4), 1);
+    }
+
+    #[test]
+    fn test_tick_conservation_residual_double_count_is_negative() {
+        // accounted exceeds processed → double-count bug surfaces as negative
+        assert_eq!(tick_conservation_residual(100, 99, 5, 0, 0, 0, 0), -4);
+    }
+
+    #[test]
+    fn test_tick_conservation_residual_all_zero_is_zero() {
+        assert_eq!(tick_conservation_residual(0, 0, 0, 0, 0, 0, 0), 0);
+    }
+
+    #[test]
+    fn test_conservation_leak_delta_flat_residual_is_zero() {
+        // constant offset (e.g. benign) → no active leak
+        assert_eq!(conservation_leak_delta(7, 7), 0);
+    }
+
+    #[test]
+    fn test_conservation_leak_delta_growing_gap_is_positive() {
+        assert_eq!(conservation_leak_delta(12, 7), 5);
+    }
+
+    #[test]
+    fn test_conservation_leak_delta_shrinking_is_negative() {
+        assert_eq!(conservation_leak_delta(3, 7), -4);
     }
 }
 
@@ -590,6 +742,12 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     let mut last_logged_dedup: u64 = 0;
     let mut last_logged_junk: u64 = 0;
     let mut last_logged_persisted: u64 = 0;
+    // Tick-conservation ledger: previous window's residual (None until seeded
+    // on the first window so the first delta is 0 — no spurious page) + the
+    // last `ticks_processed` total, used to emit the positive "OK" line only
+    // when ticks actually flowed (no idle pre/post-market spam).
+    let mut last_conservation_residual: Option<i64> = None;
+    let mut last_conservation_processed: u64 = 0;
     // Local mirror of `m_ticks_persisted` Prometheus counter so the
     // 60s periodic stats log can show the persisted-vs-filtered ratio
     // without scraping Prometheus.
@@ -967,6 +1125,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     tick.security_id,
                     tick.exchange_timestamp,
                     tick.last_traded_price,
+                    tick.received_at_nanos,
                 ) {
                     dedup_filtered = dedup_filtered.saturating_add(1);
                     m_dedup_filtered.increment(1);
@@ -1050,7 +1209,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                             // error + every 1000th to avoid per-tick spam. The tick
                             // is NOT lost — force_flush rescues it into the
                             // ring → spill → WAL chain.
-                            if storage_errors == 1 || storage_errors % 1000 == 0 {
+                            if storage_errors == 1 || storage_errors.is_multiple_of(1000) {
                                 error!(
                                     ?err,
                                     security_id = tick.security_id,
@@ -1195,6 +1354,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                         tick.security_id,
                         tick.exchange_timestamp,
                         tick.last_traded_price,
+                        tick.received_at_nanos,
                     ) {
                         dedup_filtered = dedup_filtered.saturating_add(1);
                         m_dedup_filtered.increment(1);
@@ -1242,7 +1402,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                                 // Audit Rule 5 + Rule 4 (edge-triggered): page on
                                 // first error + every 1000th. Tick rescued to
                                 // ring/spill/WAL — not lost.
-                                if storage_errors == 1 || storage_errors % 1000 == 0 {
+                                if storage_errors == 1 || storage_errors.is_multiple_of(1000) {
                                     error!(
                                         ?err,
                                         security_id = tick.security_id,
@@ -1511,6 +1671,51 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 last_logged_junk = junk_ticks_filtered;
                 last_logged_persisted = ticks_persisted;
             }
+
+            // Tick-conservation ledger (cold-path PROOF that no tick is lost
+            // between branch entry and a known outcome). Identity (exact, since
+            // the loop is synchronous → zero in-flight at this point):
+            //   ticks_processed == persisted + storage_errors + junk
+            //                      + stale_day + outside_hours + dedup
+            // Only meaningful with a writer (persist is the dominant terminal).
+            // We alert on a GROWING residual (active leak), not the absolute, so
+            // a constant offset never pages — only real divergence does.
+            if tick_writer.is_some() {
+                let residual = tick_conservation_residual(
+                    ticks_processed,
+                    ticks_persisted,
+                    storage_errors,
+                    junk_ticks_filtered,
+                    stale_day_filtered,
+                    outside_hours_filtered,
+                    dedup_filtered,
+                );
+                if let Some(prev) = last_conservation_residual {
+                    let leak = conservation_leak_delta(residual, prev);
+                    if leak > 0 {
+                        metrics::counter!("tv_tick_conservation_leak_total").increment(leak as u64);
+                        error!(
+                            target: "tickvault_core::pipeline::tick_processor::conservation",
+                            unaccounted_this_window = leak,
+                            residual_total = residual,
+                            ticks_processed,
+                            ticks_persisted,
+                            storage_errors,
+                            "TICK CONSERVATION LEAK — ticks entered the pipeline but reached no known outcome this window"
+                        );
+                    } else if ticks_processed > last_conservation_processed {
+                        info!(
+                            target: "tickvault_core::pipeline::tick_processor::conservation",
+                            residual_total = residual,
+                            ticks_processed,
+                            "tick conservation OK — every tick accounted (residual flat)"
+                        );
+                    }
+                }
+                last_conservation_residual = Some(residual);
+                last_conservation_processed = ticks_processed;
+            }
+
             last_filter_stats_log = Instant::now();
         }
 
@@ -1588,6 +1793,63 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test-only arithmetic (casts, indexing) is safe
 mod tests {
     use super::*;
+
+    // --- Dedup-collision elimination: strict-monotonic received_at ---
+    // (operator directive 2026-06-04) — prove two distinct ticks can never
+    // share the `(ts, security_id, segment, received_at)` dedup key.
+
+    #[test]
+    fn test_monotonic_received_at_same_now_returns_strictly_increasing() {
+        // A burst: the clock returns the SAME nanosecond for two ticks.
+        // The helper MUST hand out strictly-increasing values so the dedup
+        // key can never collapse them.
+        let last = std::sync::atomic::AtomicI64::new(0);
+        let a = monotonic_received_at(1_000, &last);
+        let b = monotonic_received_at(1_000, &last); // same clock value
+        let c = monotonic_received_at(1_000, &last); // same clock value
+        assert_eq!(a, 1_000);
+        assert_eq!(b, 1_001, "collision on same nanosecond must bump +1");
+        assert_eq!(c, 1_002);
+        assert!(a < b && b < c, "strictly increasing");
+    }
+
+    #[test]
+    fn test_monotonic_received_at_backward_clock_still_increases() {
+        // NTP step / clock goes backward: never emit a value <= last.
+        let last = std::sync::atomic::AtomicI64::new(0);
+        assert_eq!(monotonic_received_at(5_000, &last), 5_000);
+        assert_eq!(
+            monotonic_received_at(4_000, &last),
+            5_001,
+            "backward clock must still strictly increase (last+1)"
+        );
+        assert_eq!(monotonic_received_at(4_999, &last), 5_002);
+    }
+
+    #[test]
+    fn test_monotonic_received_at_forward_clock_uses_now() {
+        // Normal case: the clock advances past last → use the real value.
+        let last = std::sync::atomic::AtomicI64::new(0);
+        assert_eq!(monotonic_received_at(10_000, &last), 10_000);
+        assert_eq!(monotonic_received_at(10_500, &last), 10_500);
+        assert_eq!(monotonic_received_at(20_000, &last), 20_000);
+    }
+
+    #[test]
+    fn test_monotonic_received_at_long_sequence_is_strictly_unique() {
+        // 10k calls with a clock that barely moves → every output unique +
+        // strictly increasing → zero dedup-key collisions possible.
+        let last = std::sync::atomic::AtomicI64::new(0);
+        let mut prev = i64::MIN;
+        for i in 0..10_000i64 {
+            // Clock that repeats values heavily (only advances every 100 calls).
+            let now = 1_000_000 + (i / 100);
+            let got = monotonic_received_at(now, &last);
+            assert!(got > prev, "must be strictly increasing: {got} > {prev}");
+            prev = got;
+        }
+    }
+
     use tickvault_common::constants::{
         DISCONNECT_PACKET_SIZE, FULL_QUOTE_PACKET_SIZE, HEADER_OFFSET_EXCHANGE_SEGMENT,
         HEADER_OFFSET_MESSAGE_LENGTH, HEADER_OFFSET_RESPONSE_CODE, HEADER_OFFSET_SECURITY_ID,
@@ -2445,57 +2707,106 @@ mod tests {
     #[test]
     fn test_dedup_ring_new_tick_not_duplicate() {
         let mut ring = TickDedupRing::new(8); // 256 slots
-        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(!ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+    }
+
+    // --- time-windowed dedup (2026-06-05 hardening) ---
+
+    #[test]
+    fn test_dedup_ring_resend_within_window_is_duplicate() {
+        // Same (id, LTT, ltp) re-sent 1s later (< 2s window) = reconnect re-send → dropped.
+        let mut ring = TickDedupRing::new(8);
+        let ts = today_ist_epoch_at(10, 0, 0);
+        let t0 = 1_000_000_000_000_i64; // 1000s in nanos
+        assert!(!ring.is_duplicate(13, ts, 24500.0, t0));
+        assert!(ring.is_duplicate(13, ts, 24500.0, t0 + 1_000_000_000)); // +1s
+    }
+
+    #[test]
+    fn test_dedup_ring_retouch_beyond_window_is_kept() {
+        // Same (id, LTT, ltp) re-touched 67s later (> 2s window, stale LTT) =
+        // genuine re-touch → KEPT (the 2026-06-05 fix). This is the case the
+        // operator's 23440 surfaced: a re-touch with a stale LTT is no longer
+        // silently dropped from the ticks table.
+        let mut ring = TickDedupRing::new(8);
+        let ts = today_ist_epoch_at(10, 0, 0);
+        let t0 = 1_000_000_000_000_i64;
+        assert!(!ring.is_duplicate(13, ts, 24500.0, t0));
+        assert!(!ring.is_duplicate(13, ts, 24500.0, t0 + 67_000_000_000)); // +67s
+    }
+
+    #[test]
+    fn test_dedup_ring_at_exact_window_boundary_is_duplicate() {
+        // delta == window (2s) is inclusive → still a re-send.
+        let mut ring = TickDedupRing::new(8);
+        let ts = today_ist_epoch_at(10, 0, 0);
+        let t0 = 1_000_000_000_000_i64;
+        assert!(!ring.is_duplicate(13, ts, 24500.0, t0));
+        assert!(ring.is_duplicate(
+            13,
+            ts,
+            24500.0,
+            t0 + tickvault_common::constants::DEDUP_RESEND_WINDOW_NANOS
+        ));
+    }
+
+    #[test]
+    fn test_dedup_ring_different_ltp_never_duplicate_even_same_instant() {
+        // Distinct price in the same instant = distinct fingerprint → not a dup.
+        let mut ring = TickDedupRing::new(8);
+        let ts = today_ist_epoch_at(10, 0, 0);
+        assert!(!ring.is_duplicate(13, ts, 24500.0, 0));
+        assert!(!ring.is_duplicate(13, ts, 24501.0, 0));
     }
 
     #[test]
     fn test_dedup_ring_same_tick_is_duplicate() {
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
-        assert!(ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(!ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24500.0));
     }
 
     #[test]
     fn test_dedup_ring_third_identical_also_duplicate() {
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
-        assert!(ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
-        assert!(ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(!ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24500.0));
     }
 
     #[test]
     fn test_dedup_ring_different_security_not_duplicate() {
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
-        assert!(!ring.is_duplicate(14, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(!ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(!ring.is_dup_test(14, today_ist_epoch_at(10, 0, 0), 24500.0));
     }
 
     #[test]
     fn test_dedup_ring_different_timestamp_not_duplicate() {
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
-        assert!(!ring.is_duplicate(13, 1772073901, 24500.0));
+        assert!(!ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(!ring.is_dup_test(13, 1772073901, 24500.0));
     }
 
     #[test]
     fn test_dedup_ring_different_ltp_not_duplicate() {
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
-        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24501.0));
+        assert!(!ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(!ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24501.0));
     }
 
     #[test]
     fn test_dedup_ring_zero_security_id() {
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(0, 0, 0.0));
-        assert!(ring.is_duplicate(0, 0, 0.0));
+        assert!(!ring.is_dup_test(0, 0, 0.0));
+        assert!(ring.is_dup_test(0, 0, 0.0));
     }
 
     #[test]
     fn test_dedup_ring_max_values() {
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(u32::MAX, u32::MAX, f32::MAX));
-        assert!(ring.is_duplicate(u32::MAX, u32::MAX, f32::MAX));
+        assert!(!ring.is_dup_test(u32::MAX, u32::MAX, f32::MAX));
+        assert!(ring.is_dup_test(u32::MAX, u32::MAX, f32::MAX));
     }
 
     #[test]
@@ -2504,16 +2815,16 @@ mod tests {
         // will eventually evict earlier ones, allowing re-insertion.
         let mut ring = TickDedupRing::new(8); // 256 slots
         // Insert first tick
-        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(!ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24500.0));
         // Fill buffer with other entries to force eviction
         for i in 1..=512 {
-            ring.is_duplicate(i + 100, today_ist_epoch_at(10, 0, 0), 24500.0 + (i as f32));
+            ring.is_dup_test(i + 100, today_ist_epoch_at(10, 0, 0), 24500.0 + (i as f32));
         }
         // Original entry may have been evicted — should no longer be duplicate
         // (This tests that the ring buffer has finite memory and old entries are lost)
         // Note: this is probabilistic based on hash distribution.
         // We don't assert the result — just verify it doesn't panic.
-        let _ = ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0);
+        let _ = ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24500.0);
     }
 
     #[test]
@@ -2522,13 +2833,13 @@ mod tests {
         // Alternating security IDs should not confuse the dedup
         for round in 0..3 {
             let ts = today_ist_epoch_at(10, 0, 0) + round;
-            assert!(!ring.is_duplicate(13, ts, 24500.0));
-            assert!(!ring.is_duplicate(14, ts, 24500.0));
-            assert!(!ring.is_duplicate(15, ts, 24500.0));
+            assert!(!ring.is_dup_test(13, ts, 24500.0));
+            assert!(!ring.is_dup_test(14, ts, 24500.0));
+            assert!(!ring.is_dup_test(15, ts, 24500.0));
             // Duplicates within same round
-            assert!(ring.is_duplicate(13, ts, 24500.0));
-            assert!(ring.is_duplicate(14, ts, 24500.0));
-            assert!(ring.is_duplicate(15, ts, 24500.0));
+            assert!(ring.is_dup_test(13, ts, 24500.0));
+            assert!(ring.is_dup_test(14, ts, 24500.0));
+            assert!(ring.is_dup_test(15, ts, 24500.0));
         }
     }
 
@@ -3674,17 +3985,17 @@ mod tests {
         // NaN != NaN in IEEE 754, but to_bits() gives consistent bits.
         // Two NaN ticks with same sec+ts should be detected as duplicate.
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), f32::NAN));
-        assert!(ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), f32::NAN));
+        assert!(!ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), f32::NAN));
+        assert!(ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), f32::NAN));
     }
 
     #[test]
     fn test_dedup_ring_neg_zero_vs_pos_zero() {
         // -0.0 and +0.0 have different bit patterns in IEEE 754.
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 0.0));
+        assert!(!ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 0.0));
         // -0.0 has a different bit pattern → should NOT be a duplicate
-        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), -0.0_f32));
+        assert!(!ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), -0.0_f32));
     }
 
     #[test]
@@ -3692,12 +4003,12 @@ mod tests {
         let mut ring = TickDedupRing::new(16); // 65536 slots
         // Insert many unique entries
         for i in 0..1000 {
-            assert!(!ring.is_duplicate(i, today_ist_epoch_at(10, 0, 0), 24500.0));
+            assert!(!ring.is_dup_test(i, today_ist_epoch_at(10, 0, 0), 24500.0));
         }
         // Re-insert all — most should still be duplicates (65536 >> 1000)
         let mut dups = 0;
         for i in 0..1000 {
-            if ring.is_duplicate(i, today_ist_epoch_at(10, 0, 0), 24500.0) {
+            if ring.is_dup_test(i, today_ist_epoch_at(10, 0, 0), 24500.0) {
                 dups += 1;
             }
         }

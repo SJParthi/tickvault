@@ -24,6 +24,12 @@
 //! 14. Spawn token renewal task
 //! 15. Await shutdown signal
 
+// APPROVED: clippy 1.95 tightened these doc-formatting lints; this binary
+// crate root predates them. Allow rather than churn doc comments for a
+// cosmetic markdown-rendering nicety with zero runtime/behavior impact.
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::doc_overindented_list_items)]
+
 // Modules are declared in lib.rs for coverage instrumentation.
 use tickvault_app::boot_helpers::{
     CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, FAST_BOOT_WINDOW_END, FAST_BOOT_WINDOW_START, IstTimer,
@@ -2455,8 +2461,15 @@ async fn main() -> Result<()> {
     // Closes the highest-risk hole in the zero-loss chain ("disk full +
     // QuestDB down simultaneously"). Operator now gets ~hours of warning
     // via `tv_spill_dir_free_bytes` gauge before the spill disk fills.
-    let _disk_health_watcher_handle =
-        tickvault_storage::disk_health_watcher::spawn_spill_disk_health_watcher(
+    //
+    // G3 (zero-tick-loss audit PR-5): run the watcher UNDER A SUPERVISOR
+    // (mirrors the WS-GAP-05 pool supervisor) so a panic in the watcher
+    // respawns it + logs DISK-WATCHER-01 + increments
+    // `tv_disk_watcher_respawn_total` (CloudWatch-alarmed) instead of
+    // silently vanishing — previously this handle was bound to `_` and a
+    // watcher panic killed disk-free monitoring with no signal.
+    let _disk_health_watcher_supervisor =
+        tickvault_storage::disk_health_watcher::spawn_supervised_spill_disk_health_watcher(
             std::path::PathBuf::from("data/spill"),
         );
 
@@ -2823,10 +2836,17 @@ async fn main() -> Result<()> {
                 let from = tickvault_app::prev_day_ohlcv_boot::previous_trading_day(today, |d| {
                     cal.is_trading_day(d)
                 });
+                // Capture the expected universe size BEFORE the Arc moves into
+                // the fetch, so the post-fetch coverage verification can compare.
+                let pd_expected = pd_universe.subscription_targets.len();
                 let pd_token = std::sync::Arc::clone(&token_handle);
                 let pd_qcfg = config.questdb.clone();
                 let pd_base = config.dhan.rest_api_base_url.clone();
                 tokio::spawn(async move {
+                    use tickvault_app::prev_day_ohlcv_boot::{
+                        PrevDayCoverage, evaluate_prev_day_coverage, prev_day_csv_dir,
+                        write_prev_day_coverage_csv,
+                    };
                     let summary = tickvault_app::prev_day_ohlcv_boot::run_prev_day_ohlcv_fetch(
                         pd_universe,
                         pd_token,
@@ -2836,12 +2856,37 @@ async fn main() -> Result<()> {
                         today,
                     )
                     .await;
-                    info!(
-                        fetched = summary.fetched,
-                        skipped = summary.skipped,
-                        failed = summary.failed,
-                        "prev-day OHLCV boot fetch done"
-                    );
+                    // Verify coverage (false-OK guard) + write the operator-
+                    // visible CSV (`make prev-day-show`). Fail-soft on FS error.
+                    if let Err(err) = write_prev_day_coverage_csv(
+                        prev_day_csv_dir(),
+                        today,
+                        pd_expected,
+                        &summary,
+                    ) {
+                        warn!(?err, "prev_day_ohlcv: coverage CSV write failed");
+                    }
+                    match evaluate_prev_day_coverage(pd_expected, summary.fetched) {
+                        PrevDayCoverage::Ok { pct } => info!(
+                            pct,
+                            fetched = summary.fetched,
+                            expected = pd_expected,
+                            "PROOF: prev-day OHLCV coverage OK"
+                        ),
+                        PrevDayCoverage::Degraded { pct } => warn!(
+                            pct,
+                            fetched = summary.fetched,
+                            expected = pd_expected,
+                            skipped = summary.skipped,
+                            failed = summary.failed,
+                            "prev-day OHLCV coverage DEGRADED — symbols missing yesterday's candle"
+                        ),
+                        PrevDayCoverage::Empty => error!(
+                            expected = pd_expected,
+                            failed = summary.failed,
+                            "prev-day OHLCV coverage EMPTY — no yesterday candles fetched"
+                        ),
+                    }
                 });
                 info!("prev-day OHLCV boot fetch task spawned");
             }
@@ -3611,35 +3656,53 @@ async fn main() -> Result<()> {
                 let cv_base = config.dhan.rest_api_base_url.clone();
                 let cv_calendar = std::sync::Arc::clone(&trading_calendar);
                 tokio::spawn(async move {
-                    use chrono::{FixedOffset, NaiveTime, TimeZone, Utc};
+                    use chrono::{FixedOffset, TimeZone, Timelike, Utc};
+                    use tickvault_app::cross_verify_1m_boot::{
+                        CrossVerifyStart, decide_cross_verify_start,
+                    };
                     use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
                     let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
                         return;
                     };
                     let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
                     let today_ist = now_ist.date_naive();
-                    if !cv_calendar.is_trading_day(today_ist) {
-                        info!("cross_verify_1m: skipping (non-trading day)");
-                        return;
-                    }
                     if cv_targets.is_empty() {
                         info!("cross_verify_1m: no spot targets — skipping");
                         return;
                     }
-                    let Some(target_time) = NaiveTime::from_hms_opt(15, 31, 0) else {
-                        return;
-                    };
-                    let now_time = now_ist.time();
-                    if now_time >= target_time {
-                        debug!(
-                            now = %now_time,
-                            "cross_verify_1m: skipping (past 15:31 — mid-evening boot)"
-                        );
-                        return;
+                    // Operator on-demand override: `make cross-verify-now` sets
+                    // TICKVAULT_CROSS_VERIFY_NOW=1 to run the verification right
+                    // now (proving the pipeline without waiting for 15:31 IST on
+                    // a live trading day). Fail-soft: a forced run on a quiet day
+                    // just yields an empty/degraded report, never fabricated data.
+                    let force_now = std::env::var("TICKVAULT_CROSS_VERIFY_NOW")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                    let now_secs_of_day = now_ist.time().num_seconds_from_midnight();
+                    let is_trading_day = cv_calendar.is_trading_day(today_ist);
+                    match decide_cross_verify_start(now_secs_of_day, is_trading_day, force_now) {
+                        CrossVerifyStart::SkipNonTradingDay => {
+                            info!("cross_verify_1m: skipping (non-trading day)");
+                            return;
+                        }
+                        CrossVerifyStart::SkipPastTrigger => {
+                            debug!(
+                                now = %now_ist.time(),
+                                "cross_verify_1m: skipping (past 15:31 — mid-evening boot)"
+                            );
+                            return;
+                        }
+                        CrossVerifyStart::RunNow => {
+                            info!(
+                                "cross_verify_1m: TICKVAULT_CROSS_VERIFY_NOW set — running \
+                                 on-demand NOW (operator dry-run)"
+                            );
+                        }
+                        CrossVerifyStart::SleepThenRun(secs_until) => {
+                            info!(secs_until, "cross_verify_1m: sleeping until 15:31:00 IST");
+                            tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+                        }
                     }
-                    let secs_until = (target_time - now_time).num_seconds().max(0) as u64;
-                    info!(secs_until, "cross_verify_1m: sleeping until 15:31:00 IST");
-                    tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
 
                     // IST-midnight-as-epoch nanos (our candles_1m `ts` stores
                     // IST wall-clock as an epoch — data-integrity.md). The day
@@ -4333,7 +4396,7 @@ async fn main() -> Result<()> {
                             oc_base_url_for_warmup,
                         ) {
                             Ok(warmup_client) => {
-                                let _ = tickvault_core::option_chain::expiry_warmup::spawn_expiry_warmup_task(
+                                let _warmup_handle = tickvault_core::option_chain::expiry_warmup::spawn_expiry_warmup_task(
                                     warmup_client,
                                     current_expiry_cache.clone(),
                                     oc_notifier.clone(),
@@ -6211,6 +6274,33 @@ fn spawn_engine_b_aggregator(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     metrics::counter!("tv_aggregator_tick_lag_total").increment(skipped);
+                    // H2-lite (zero-tick-loss PR-8b): the aggregator fell so far
+                    // behind the ~52s TICK_BROADCAST_CAPACITY buffer that the
+                    // broadcast dropped `skipped` ticks from ITS view. This was a
+                    // SILENT counter bump; make it LOUD (audit Rule 5 — a
+                    // candle-data-loss event must be `error!`, never silent).
+                    //
+                    // CRITICAL ASSURANCE: the dropped ticks are NOT lost and NOT
+                    // reordered. The lossless + ORDERED durable record is the WAL
+                    // frame spill (`ws_frame_spill`: raw frames captured by the WS
+                    // read loop BEFORE any broadcast fan-out — single-producer FIFO
+                    // segments, ring→spill→DLQ, replayed in append order on boot).
+                    // This broadcast `Lagged` is downstream of that WAL, so it can
+                    // only affect the DERIVED candles for this window — never the
+                    // durable tick record, and never tick ORDER. The 15:31 IST
+                    // post-market 1-minute cross-verify pinpoints the affected
+                    // minutes, rebuildable from the WAL-backed, ts-ordered `ticks`
+                    // table. Tick routing + order on the live read loop are
+                    // untouched by this change.
+                    tracing::error!(
+                        skipped,
+                        code =
+                            tickvault_common::error_code::ErrorCode::AggregatorLag01TickLagDropped
+                                .code_str(),
+                        "candle aggregator tick-broadcast LAGGED — derived candles for this \
+                         window may under-count; ticks remain safe + ordered in the ticks table; \
+                         rebuild via the post-market 1m cross-verify"
+                    );
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     tracing::info!("Engine B aggregator subscriber: broadcast closed, exiting");
