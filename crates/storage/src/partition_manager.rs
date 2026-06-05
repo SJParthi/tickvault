@@ -40,8 +40,11 @@ const PARTITION_DDL_TIMEOUT_SECS: u64 = 30;
 // only live HOUR-partitioned table.
 pub(crate) const HOUR_PARTITIONED_TABLES: &[&str] = &["ticks"];
 
-/// Tables with DAY partitioning that the retention sweep DETACHes past the hot
-/// window.
+/// DAY-partitioned **audit + daily-data** tables the retention sweep DETACHes
+/// past the hot window. The 21 live **candle** tables (`candles_1m` …
+/// `candles_1d`) are NOT listed here — they are swept by iterating
+/// [`crate::shadow_persistence::candle_table_names`] (the single source of
+/// truth, `TfIndex::table_name()`) so the candle names can never drift.
 ///
 /// **Honest boundary:** `detach_old_partitions` uses `ALTER TABLE … DETACH
 /// PARTITION` — it moves old partitions to a local `detached/` dir (SEBI-safe,
@@ -50,17 +53,6 @@ pub(crate) const HOUR_PARTITIONED_TABLES: &[&str] = &["ticks"];
 /// implemented. This list bounds the *active* table and is the prerequisite for
 /// archival; it does not by itself reclaim disk.
 pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
-    // Live multi-timeframe candle shadow tables (Engine B seal writes).
-    "candles_1s_shadow",
-    "candles_1m_shadow",
-    "candles_5m_shadow",
-    "candles_15m_shadow",
-    "candles_30m_shadow",
-    "candles_1h_shadow",
-    "candles_2h_shadow",
-    "candles_3h_shadow",
-    "candles_4h_shadow",
-    "candles_1d_shadow",
     // Audit + daily-data tables (SEBI 5y → detach to S3 cold when archival ships).
     "instrument_fetch_audit",
     "instrument_lifecycle_audit",
@@ -154,9 +146,34 @@ impl PartitionManager {
             }
         }
 
-        // DAY-partitioned tables (same exempt guard as the HOUR loop).
+        // DAY-partitioned audit/data tables (same exempt guard as the HOUR loop).
         for table in DAY_PARTITIONED_TABLES {
             if RETENTION_EXEMPT_TABLES.contains(table) {
+                continue;
+            }
+            match self
+                .detach_partitions_for_table(table, cutoff_days, "DAY")
+                .await
+            {
+                Ok(count) => {
+                    total_detached = total_detached.saturating_add(count);
+                    if count > 0 {
+                        info!(table, detached = count, "partitions detached");
+                    }
+                }
+                Err(err) => {
+                    warn!(?err, table, "failed to detach partitions");
+                }
+            }
+        }
+
+        // The 21 live candle tables (`candles_1m` … `candles_1d`), DAY-partitioned.
+        // Derived from `candle_table_names()` (the single source of truth,
+        // `TfIndex::table_name()`) so the swept names can NEVER drift from what is
+        // actually created/written. This is the dominant disk-growth source —
+        // #1022 named phantom `candles_*_shadow` tables and missed it.
+        for table in crate::shadow_persistence::candle_table_names() {
+            if RETENTION_EXEMPT_TABLES.contains(&table) {
                 continue;
             }
             match self
@@ -359,20 +376,11 @@ mod tests {
     }
 
     #[test]
-    fn test_live_day_tables_are_all_covered() {
-        // Every live PARTITION BY DAY table that grows MUST be swept. This pins
-        // the 2026-06-05 fix so the lists can't silently drop a live table again.
+    fn test_day_list_holds_the_audit_data_tables() {
+        // The DAY const holds ONLY the audit/data tables; candle tables are
+        // swept via candle_table_names() in detach_old_partitions (see
+        // test_candle_tables_are_real_plain_names).
         for live in [
-            "candles_1s_shadow",
-            "candles_1m_shadow",
-            "candles_5m_shadow",
-            "candles_15m_shadow",
-            "candles_30m_shadow",
-            "candles_1h_shadow",
-            "candles_2h_shadow",
-            "candles_3h_shadow",
-            "candles_4h_shadow",
-            "candles_1d_shadow",
             "instrument_fetch_audit",
             "instrument_lifecycle_audit",
             "option_chain_minute_snapshot",
@@ -381,7 +389,26 @@ mod tests {
         ] {
             assert!(
                 DAY_PARTITIONED_TABLES.contains(&live),
-                "live growing table not covered by retention sweep: {live}"
+                "audit/data table not covered by retention sweep: {live}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_candle_tables_are_real_plain_names_not_shadow() {
+        // The candle tables swept by detach_old_partitions come from the single
+        // source of truth. They MUST be plain `candles_<TF>` (no `_shadow`) and
+        // number 21 — this is the exact bug #1022 had (phantom `_shadow` names).
+        let names = crate::shadow_persistence::candle_table_names();
+        assert_eq!(names.len(), 21, "expected 21 live candle tables");
+        for name in names {
+            assert!(
+                name.starts_with("candles_"),
+                "candle table name not canonical: {name}"
+            );
+            assert!(
+                !name.contains("_shadow"),
+                "candle table must be plain (no _shadow): {name}"
             );
         }
     }
