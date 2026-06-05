@@ -131,8 +131,13 @@ impl PartitionManager {
             "starting partition detach cycle"
         );
 
-        // HOUR-partitioned tables
+        // HOUR-partitioned tables. Defense-in-depth: never sweep an exempt
+        // (SEBI point-in-time, never-delete) table even if one is mistakenly
+        // added to a sweep list — the exempt set is the final guard.
         for table in HOUR_PARTITIONED_TABLES {
+            if RETENTION_EXEMPT_TABLES.contains(table) {
+                continue;
+            }
             match self
                 .detach_partitions_for_table(table, cutoff_days, "HOUR")
                 .await
@@ -149,8 +154,11 @@ impl PartitionManager {
             }
         }
 
-        // DAY-partitioned tables
+        // DAY-partitioned tables (same exempt guard as the HOUR loop).
         for table in DAY_PARTITIONED_TABLES {
+            if RETENTION_EXEMPT_TABLES.contains(table) {
+                continue;
+            }
             match self
                 .detach_partitions_for_table(table, cutoff_days, "DAY")
                 .await
