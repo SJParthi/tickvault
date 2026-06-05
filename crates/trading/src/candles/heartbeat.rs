@@ -46,6 +46,9 @@ struct AggregatorHeartbeatInner {
     seals_emitted: AtomicU64,
     seals_dropped: AtomicU64,
     late_ticks_discarded: AtomicU64,
+    /// Option B: 1-bucket-late ticks that re-folded their OWN minute's
+    /// high/low/close and were re-emitted (UPSERT) rather than discarded.
+    amended_ticks: AtomicU64,
     /// G3 positive-signal counter: sealed candles this interval whose
     /// `close_pct_from_prev_day` was NON-ZERO. The false-OK guard
     /// (audit-findings Rule 11) for the percentage-change feature — if
@@ -83,6 +86,12 @@ impl AggregatorHeartbeatCounters {
             .fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Record `n` late ticks that AMENDED their own minute's high/low/close
+    /// (Option B; `ConsumeStats::amended_count`). Hot path.
+    pub fn record_amended_ticks(&self, n: u64) {
+        self.inner.amended_ticks.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// Record one emitted seal whose `close_pct_from_prev_day` was
     /// non-zero (G3 real-time proof that the percentage-change column is
     /// populating). Seal path; called once per timeframe at a boundary,
@@ -105,6 +114,7 @@ impl AggregatorHeartbeatCounters {
             seals_emitted: self.inner.seals_emitted.swap(0, Ordering::AcqRel),
             seals_dropped: self.inner.seals_dropped.swap(0, Ordering::AcqRel),
             late_ticks_discarded: self.inner.late_ticks_discarded.swap(0, Ordering::AcqRel),
+            amended_ticks: self.inner.amended_ticks.swap(0, Ordering::AcqRel),
             close_pct_nonzero: self.inner.close_pct_nonzero.swap(0, Ordering::AcqRel),
         }
     }
@@ -120,8 +130,12 @@ pub struct AggregatorHeartbeatSnapshot {
     pub seals_emitted: u64,
     /// Sealed bars dropped because the mpsc channel was full.
     pub seals_dropped: u64,
-    /// Ticks arriving after their bucket's seal had already fired.
+    /// Ticks arriving after their bucket's seal had already fired AND too late
+    /// to amend (≥ 2 buckets late, or post-force_seal) — genuinely dropped.
     pub late_ticks_discarded: u64,
+    /// Option B: 1-bucket-late ticks that re-folded their own minute's
+    /// high/low/close and were re-emitted (UPSERT) instead of discarded.
+    pub amended_ticks: u64,
     /// Emitted seals this interval with a non-zero `close_pct_from_prev_day`.
     /// Compare against `seals_emitted`: `seals_emitted > 0` while
     /// `close_pct_nonzero == 0` during market hours is the percentage-change
@@ -138,7 +152,10 @@ impl AggregatorHeartbeatSnapshot {
     /// snapshot and MUST NOT emit (audit-findings Rule 11).
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.seals_emitted > 0 || self.seals_dropped > 0 || self.late_ticks_discarded > 0
+        self.seals_emitted > 0
+            || self.seals_dropped > 0
+            || self.late_ticks_discarded > 0
+            || self.amended_ticks > 0
     }
 }
 
@@ -210,6 +227,7 @@ mod tests {
             seals_emitted: 1,
             seals_dropped: 0,
             late_ticks_discarded: 0,
+            amended_ticks: 0,
             close_pct_nonzero: 0,
         };
         assert!(s.is_active());
@@ -217,6 +235,7 @@ mod tests {
             seals_emitted: 0,
             seals_dropped: 1,
             late_ticks_discarded: 0,
+            amended_ticks: 0,
             close_pct_nonzero: 0,
         };
         assert!(s.is_active());
@@ -224,6 +243,16 @@ mod tests {
             seals_emitted: 0,
             seals_dropped: 0,
             late_ticks_discarded: 1,
+            amended_ticks: 0,
+            close_pct_nonzero: 0,
+        };
+        assert!(s.is_active());
+        // Option B: an amend alone makes the heartbeat active.
+        let s = AggregatorHeartbeatSnapshot {
+            seals_emitted: 0,
+            seals_dropped: 0,
+            late_ticks_discarded: 0,
+            amended_ticks: 1,
             close_pct_nonzero: 0,
         };
         assert!(s.is_active());
@@ -235,9 +264,21 @@ mod tests {
             seals_emitted: 0,
             seals_dropped: 0,
             late_ticks_discarded: 0,
+            amended_ticks: 0,
             close_pct_nonzero: 0,
         };
         assert!(!s.is_active());
+    }
+
+    #[test]
+    fn test_record_amended_ticks_adds_count() {
+        let c = AggregatorHeartbeatCounters::new();
+        c.record_amended_ticks(4);
+        c.record_amended_ticks(6);
+        let snap = c.drain();
+        assert_eq!(snap.amended_ticks, 10);
+        // drain reset
+        assert_eq!(c.drain().amended_ticks, 0);
     }
 
     #[test]
