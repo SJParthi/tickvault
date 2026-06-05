@@ -12,7 +12,7 @@
         logs app-pid \
         audit coverage bench geiger typos quality doc bootstrap scoped-check full-qa parity-soak \
         dispatch dispatch-readonly dispatch-status dispatch-logs dispatch-check dispatch-audit \
-        cross-verify-show cross-verify-now \
+        cross-verify-show cross-verify-now prev-day-show \
 
 # ---- Configuration ----
 APP_NAME       := tickvault
@@ -503,3 +503,7 @@ cross-verify-now: ## Run the post-market cross-verify NOW (on-demand, needs live
 	@echo "  Requires a booted app: Dhan auth + QuestDB + today's candles_1m."
 	@echo "  On a dev box without live credentials this will stop at auth — that is expected."
 	@TICKVAULT_CROSS_VERIFY_NOW=1 $(MAKE) run
+
+# ---- Pre-market prev-day OHLCV fetch coverage (operator visibility) ----
+prev-day-show: ## Show the latest pre-market prev-day fetch coverage report
+	@bash scripts/prev-day-show.sh

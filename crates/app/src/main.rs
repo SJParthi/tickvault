@@ -2836,10 +2836,17 @@ async fn main() -> Result<()> {
                 let from = tickvault_app::prev_day_ohlcv_boot::previous_trading_day(today, |d| {
                     cal.is_trading_day(d)
                 });
+                // Capture the expected universe size BEFORE the Arc moves into
+                // the fetch, so the post-fetch coverage verification can compare.
+                let pd_expected = pd_universe.subscription_targets.len();
                 let pd_token = std::sync::Arc::clone(&token_handle);
                 let pd_qcfg = config.questdb.clone();
                 let pd_base = config.dhan.rest_api_base_url.clone();
                 tokio::spawn(async move {
+                    use tickvault_app::prev_day_ohlcv_boot::{
+                        PrevDayCoverage, evaluate_prev_day_coverage, prev_day_csv_dir,
+                        write_prev_day_coverage_csv,
+                    };
                     let summary = tickvault_app::prev_day_ohlcv_boot::run_prev_day_ohlcv_fetch(
                         pd_universe,
                         pd_token,
@@ -2849,12 +2856,37 @@ async fn main() -> Result<()> {
                         today,
                     )
                     .await;
-                    info!(
-                        fetched = summary.fetched,
-                        skipped = summary.skipped,
-                        failed = summary.failed,
-                        "prev-day OHLCV boot fetch done"
-                    );
+                    // Verify coverage (false-OK guard) + write the operator-
+                    // visible CSV (`make prev-day-show`). Fail-soft on FS error.
+                    if let Err(err) = write_prev_day_coverage_csv(
+                        prev_day_csv_dir(),
+                        today,
+                        pd_expected,
+                        &summary,
+                    ) {
+                        warn!(?err, "prev_day_ohlcv: coverage CSV write failed");
+                    }
+                    match evaluate_prev_day_coverage(pd_expected, summary.fetched) {
+                        PrevDayCoverage::Ok { pct } => info!(
+                            pct,
+                            fetched = summary.fetched,
+                            expected = pd_expected,
+                            "PROOF: prev-day OHLCV coverage OK"
+                        ),
+                        PrevDayCoverage::Degraded { pct } => warn!(
+                            pct,
+                            fetched = summary.fetched,
+                            expected = pd_expected,
+                            skipped = summary.skipped,
+                            failed = summary.failed,
+                            "prev-day OHLCV coverage DEGRADED — symbols missing yesterday's candle"
+                        ),
+                        PrevDayCoverage::Empty => error!(
+                            expected = pd_expected,
+                            failed = summary.failed,
+                            "prev-day OHLCV coverage EMPTY — no yesterday candles fetched"
+                        ),
+                    }
                 });
                 info!("prev-day OHLCV boot fetch task spawned");
             }
