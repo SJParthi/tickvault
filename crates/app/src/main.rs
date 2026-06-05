@@ -3624,35 +3624,53 @@ async fn main() -> Result<()> {
                 let cv_base = config.dhan.rest_api_base_url.clone();
                 let cv_calendar = std::sync::Arc::clone(&trading_calendar);
                 tokio::spawn(async move {
-                    use chrono::{FixedOffset, NaiveTime, TimeZone, Utc};
+                    use chrono::{FixedOffset, TimeZone, Timelike, Utc};
+                    use tickvault_app::cross_verify_1m_boot::{
+                        CrossVerifyStart, decide_cross_verify_start,
+                    };
                     use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
                     let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
                         return;
                     };
                     let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
                     let today_ist = now_ist.date_naive();
-                    if !cv_calendar.is_trading_day(today_ist) {
-                        info!("cross_verify_1m: skipping (non-trading day)");
-                        return;
-                    }
                     if cv_targets.is_empty() {
                         info!("cross_verify_1m: no spot targets — skipping");
                         return;
                     }
-                    let Some(target_time) = NaiveTime::from_hms_opt(15, 31, 0) else {
-                        return;
-                    };
-                    let now_time = now_ist.time();
-                    if now_time >= target_time {
-                        debug!(
-                            now = %now_time,
-                            "cross_verify_1m: skipping (past 15:31 — mid-evening boot)"
-                        );
-                        return;
+                    // Operator on-demand override: `make cross-verify-now` sets
+                    // TICKVAULT_CROSS_VERIFY_NOW=1 to run the verification right
+                    // now (proving the pipeline without waiting for 15:31 IST on
+                    // a live trading day). Fail-soft: a forced run on a quiet day
+                    // just yields an empty/degraded report, never fabricated data.
+                    let force_now = std::env::var("TICKVAULT_CROSS_VERIFY_NOW")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                    let now_secs_of_day = now_ist.time().num_seconds_from_midnight();
+                    let is_trading_day = cv_calendar.is_trading_day(today_ist);
+                    match decide_cross_verify_start(now_secs_of_day, is_trading_day, force_now) {
+                        CrossVerifyStart::SkipNonTradingDay => {
+                            info!("cross_verify_1m: skipping (non-trading day)");
+                            return;
+                        }
+                        CrossVerifyStart::SkipPastTrigger => {
+                            debug!(
+                                now = %now_ist.time(),
+                                "cross_verify_1m: skipping (past 15:31 — mid-evening boot)"
+                            );
+                            return;
+                        }
+                        CrossVerifyStart::RunNow => {
+                            info!(
+                                "cross_verify_1m: TICKVAULT_CROSS_VERIFY_NOW set — running \
+                                 on-demand NOW (operator dry-run)"
+                            );
+                        }
+                        CrossVerifyStart::SleepThenRun(secs_until) => {
+                            info!(secs_until, "cross_verify_1m: sleeping until 15:31:00 IST");
+                            tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+                        }
                     }
-                    let secs_until = (target_time - now_time).num_seconds().max(0) as u64;
-                    info!(secs_until, "cross_verify_1m: sleeping until 15:31:00 IST");
-                    tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
 
                     // IST-midnight-as-epoch nanos (our candles_1m `ts` stores
                     // IST wall-clock as an epoch — data-integrity.md). The day

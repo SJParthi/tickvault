@@ -55,6 +55,124 @@ const SECONDS_PER_MINUTE: i64 = 60;
 /// Nanoseconds per second (IST-epoch → nanos).
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
+/// IST seconds-of-day for the post-market cross-verify trigger (15:31:00).
+const CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST: u32 = 15 * 3600 + 31 * 60; // 55_860
+
+/// Decision for WHEN the post-market 1-minute cross-verify should fire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrossVerifyStart {
+    /// Not a trading day and not forced → do not run.
+    SkipNonTradingDay,
+    /// Past 15:31 IST on a normal (non-forced) boot → mid-evening boot, skip.
+    SkipPastTrigger,
+    /// Run immediately — operator forced an on-demand run.
+    RunNow,
+    /// Sleep this many seconds, then run at 15:31:00 IST.
+    SleepThenRun(u64),
+}
+
+/// Pure decision: given the current IST seconds-of-day, whether today is a
+/// trading day, and whether the operator forced an on-demand run, decide when
+/// the cross-verify should fire.
+///
+/// `force_now` (set by the `TICKVAULT_CROSS_VERIFY_NOW` env var via
+/// `make cross-verify-now`) overrides BOTH the trading-day gate and the 15:31
+/// schedule so an operator can prove the pipeline end-to-end on demand without
+/// waiting for 15:31 IST on a live trading day. The run itself remains
+/// fail-soft on empty/partial data, so a forced run on a quiet day simply
+/// produces an empty/degraded report rather than fabricating anything.
+pub fn decide_cross_verify_start(
+    now_secs_of_day_ist: u32,
+    is_trading_day: bool,
+    force_now: bool,
+) -> CrossVerifyStart {
+    if force_now {
+        return CrossVerifyStart::RunNow;
+    }
+    if !is_trading_day {
+        return CrossVerifyStart::SkipNonTradingDay;
+    }
+    if now_secs_of_day_ist >= CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST {
+        return CrossVerifyStart::SkipPastTrigger;
+    }
+    CrossVerifyStart::SleepThenRun(u64::from(
+        CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST - now_secs_of_day_ist,
+    ))
+}
+
+#[cfg(test)]
+mod start_decision_tests {
+    use super::{
+        CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST, CrossVerifyStart, decide_cross_verify_start,
+    };
+
+    #[test]
+    fn test_decide_cross_verify_start_trigger_constant_is_1531_ist() {
+        assert_eq!(CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST, 55_860);
+    }
+
+    #[test]
+    fn test_decide_cross_verify_start_trading_day_before_1531_sleeps() {
+        // 15:30:00 IST → sleep 60s to 15:31:00.
+        let now = 15 * 3600 + 30 * 60;
+        assert_eq!(
+            decide_cross_verify_start(now, true, false),
+            CrossVerifyStart::SleepThenRun(60)
+        );
+    }
+
+    #[test]
+    fn test_decide_cross_verify_start_at_exact_trigger_skips_past() {
+        let now = CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST;
+        assert_eq!(
+            decide_cross_verify_start(now, true, false),
+            CrossVerifyStart::SkipPastTrigger
+        );
+    }
+
+    #[test]
+    fn test_decide_cross_verify_start_after_1531_skips_past() {
+        let now = 16 * 3600;
+        assert_eq!(
+            decide_cross_verify_start(now, true, false),
+            CrossVerifyStart::SkipPastTrigger
+        );
+    }
+
+    #[test]
+    fn test_decide_cross_verify_start_non_trading_day_skips() {
+        let now = 10 * 3600;
+        assert_eq!(
+            decide_cross_verify_start(now, false, false),
+            CrossVerifyStart::SkipNonTradingDay
+        );
+    }
+
+    #[test]
+    fn test_decide_cross_verify_start_force_overrides_non_trading_day() {
+        assert_eq!(
+            decide_cross_verify_start(10 * 3600, false, true),
+            CrossVerifyStart::RunNow
+        );
+    }
+
+    #[test]
+    fn test_decide_cross_verify_start_force_overrides_past_trigger() {
+        assert_eq!(
+            decide_cross_verify_start(20 * 3600, true, true),
+            CrossVerifyStart::RunNow
+        );
+    }
+
+    #[test]
+    fn test_decide_cross_verify_start_force_overrides_before_trigger() {
+        assert_eq!(
+            decide_cross_verify_start(9 * 3600, true, true),
+            CrossVerifyStart::RunNow
+        );
+    }
+}
+
 /// One 1-minute candle, keyed by its IST-minute bucket. `volume` is `i64`
 /// (exact integer compare). Prices are `f64` (our `candles_1m` and Dhan REST
 /// are both f64 — exact compare per the operator's "exact match").
