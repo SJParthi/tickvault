@@ -226,18 +226,18 @@ fn test_terraform_instance_iam_allows_staging_ssm_prefix() {
 fn test_terraform_eventbridge_schedules_match_budget() {
     let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
         .expect("main.tf must be readable"); // APPROVED: test
-    // Weekday start: 08:00 IST = 02:30 UTC Mon-Fri (operator widened the
-    // window to 08:00-17:00 on 2026-06-02 — "make it as 8 am till 5 pm … so
-    // pre-market and post-market and deployment … can run without worries";
-    // supersedes the 2026-05-29 08:30-16:30 lock §7).
+    // Weekday start: 08:30 IST = 03:00 UTC Mon-Fri (operator narrowed the
+    // window back to 08:30-16:30 on 2026-06-05 — "make the aws instance start
+    // and stop from 8.30 am till 4.30 pm"; supersedes the 2026-06-02
+    // 08:00-17:00 widening).
     assert!(
-        content.contains("cron(30 2 ? * MON-FRI *)"),
-        "main.tf missing weekday start schedule (02:30 UTC Mon-Fri = 08:00 IST)"
+        content.contains("cron(0 3 ? * MON-FRI *)"),
+        "main.tf missing weekday start schedule (03:00 UTC Mon-Fri = 08:30 IST)"
     );
-    // Weekday stop: 17:00 IST = 11:30 UTC Mon-Fri.
+    // Weekday stop: 16:30 IST = 11:00 UTC Mon-Fri.
     assert!(
-        content.contains("cron(30 11 ? * MON-FRI *)"),
-        "main.tf missing weekday stop schedule (11:30 UTC Mon-Fri = 17:00 IST)"
+        content.contains("cron(0 11 ? * MON-FRI *)"),
+        "main.tf missing weekday stop schedule (11:00 UTC Mon-Fri = 16:30 IST)"
     );
     // Negative asserts — the prior 7-day daily crons (every day, no MON-FRI
     // restriction) must NOT return. The weekday-only `? * MON-FRI` form is
@@ -561,8 +561,8 @@ fn test_aws_autopilot_selfheal_workflow_exists() {
          08:30 EventBridge start is not rescued until 09:00 (2026-06-02 incident)"
     );
     assert!(
-        sh.contains("800") && sh.contains("1700"),
-        "is_box_up_window must encode the 08:00-17:00 IST bounds (800/1700)"
+        sh.contains("830") && sh.contains("1630"),
+        "is_box_up_window must encode the 08:30-16:30 IST bounds (830/1630)"
     );
     // 2026-06-02 diagnostic (the 'A' fix): when the box is stopped during the
     // up-window, autopilot must report WHY the EventBridge auto-start failed
@@ -660,22 +660,22 @@ fn test_deploy_aws_after_close_workflow_fires_in_premarket_and_postmarket_only()
     // Operator lock 2026-06-03: "always deploy whenever the instance auto-starts
     // at 8 am ... only between 9 am till 3.45 pm it should not happen." The ONLY
     // no-deploy band is 09:00-15:45 IST; every other time auto-deploys main.
-    //   - instance-start cron = 02:30 UTC = 08:00 IST (self-starts a stopped box)
+    //   - instance-start cron = 03:00 UTC = 08:30 IST (self-starts a stopped box)
     //   - pre-market cron      = 03:15 UTC = 08:45 IST (backup, before 09:15 open)
     //   - post-market cron     = 10:16 UTC = 15:46 IST (just after the 15:45 band)
     let path = ".github/workflows/deploy-aws-after-close.yml";
     require_file_exists(
         path,
-        "auto-deploy at 08:00 instance-start + outside the 09:00-15:45 IST band \
+        "auto-deploy at 08:30 instance-start + outside the 09:00-15:45 IST band \
          (operator lock 2026-06-03)",
     );
     let content = std::fs::read_to_string(workspace_root().join(path))
         .expect("deploy-aws-after-close.yml must be readable"); // APPROVED: test
 
     assert!(
-        content.contains("30 2 * * 1-5"),
+        content.contains("0 3 * * 1-5"),
         "deploy-aws-after-close.yml must include instance-start cron \
-         02:30 UTC Mon-Fri (08:00 IST) — self-starts the box + deploys even if \
+         03:00 UTC Mon-Fri (08:30 IST) — self-starts the box + deploys even if \
          the EventBridge instance-start fails (2026-06-03 incident fix)"
     );
     assert!(
@@ -846,8 +846,8 @@ fn test_systemd_unit_restart_policy() {
 
 #[test]
 fn test_start_watchdog_lambda_monitors_the_morning_start() {
-    // 2026-06-02: AWS-native watchdog that answers "who monitors the 08:00
-    // start?". A ping Lambda at 08:00 IST + a check Lambda at 08:15 IST that
+    // 2026-06-02: AWS-native watchdog that answers "who monitors the 08:30
+    // start?". A ping Lambda at 08:30 IST + a check Lambda at 08:45 IST that
     // pages if the box did not come up. Runs IN AWS (not on a GitHub runner),
     // so it alerts even if GitHub Actions is down — the gap that hid the
     // 2026-06-02 silent start failure.
@@ -863,14 +863,14 @@ fn test_start_watchdog_lambda_monitors_the_morning_start() {
         workspace_root().join("deploy/aws/terraform/start-watchdog-lambda.tf"),
     )
     .expect("start-watchdog-lambda.tf must be readable"); // APPROVED: test
-    // Ping at 08:00 IST (02:30 UTC) + check at 08:15 IST (02:45 UTC), weekdays.
+    // Ping at 08:30 IST (03:00 UTC) + check at 08:45 IST (03:15 UTC), weekdays.
     assert!(
-        tf.contains("cron(30 2 ? * MON-FRI *)"),
-        "ping schedule must be 02:30 UTC Mon-Fri (08:00 IST)"
+        tf.contains("cron(0 3 ? * MON-FRI *)"),
+        "ping schedule must be 03:00 UTC Mon-Fri (08:30 IST)"
     );
     assert!(
-        tf.contains("cron(45 2 ? * MON-FRI *)"),
-        "check schedule must be 02:45 UTC Mon-Fri (08:15 IST)"
+        tf.contains("cron(15 3 ? * MON-FRI *)"),
+        "check schedule must be 03:15 UTC Mon-Fri (08:45 IST)"
     );
     // Least-privilege: describe EC2 + publish to the alerts topic.
     assert!(

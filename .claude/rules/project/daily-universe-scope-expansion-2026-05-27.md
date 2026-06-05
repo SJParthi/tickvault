@@ -39,6 +39,7 @@
 - 2026-05-29: Approved instance m8g.large (Graviton4, 8 GiB) + weekday-only 08:30–16:30 IST auto schedule (manual start otherwise) per Quote 5
 - 2026-05-29: Approved EBS 100 GB + EIP excluded (no orders) + 270-hr basis → ~₹2,698/mo incl GST per Quote 6
 - 2026-06-02: Operator WIDENED the schedule from 08:30–16:30 IST to **08:00–17:00 IST** (verbatim: "instead of 8.30 am make it as 8 am till 5 pm dude so that pre-market and post-market and deployment and all other activities can run without any worries"). Crons: start `cron(30 2 ? * MON-FRI *)` (02:30 UTC = 08:00 IST), stop `cron(30 11 ? * MON-FRI *)` (11:30 UTC = 17:00 IST). Cost: +1 hr/day (~+₹120/mo), still inside the ~₹2,058/mo envelope. This dated quote satisfies §7 Mechanical Rule 1 for the schedule change.
+- 2026-06-05: Operator NARROWED the schedule back from 08:00–17:00 IST to **08:30–16:30 IST** (verbatim: "make the aws instance start and stop from 8.30 am till 4.30 pm dude one and only when it is needed let me start it manually"). Crons: start `cron(0 3 ? * MON-FRI *)` (03:00 UTC = 08:30 IST), stop `cron(0 11 ? * MON-FRI *)` (11:00 UTC = 16:30 IST). The start-watchdog ping/check move to 08:30/08:45 IST; the GitHub-Actions after-close start cron + `aws-autopilot.sh`/`deploy-aws.yml` up-window move to 08:30–16:30 in lockstep. Cost: −1 hr/day (~−₹120/mo). The 08:30 start still gives the documented §10 boot budget before the 09:00 pre-open. This dated quote satisfies §7 Mechanical Rule 1 + §12 for the schedule change and supersedes the 2026-06-02 widening.
 
 ---
 
@@ -179,7 +180,7 @@ the `m8gd` local-SSD variant — that NVMe is wiped on every daily auto-stop).
 | Region | ap-south-1 (Mumbai) |
 | Tenancy | Default (Shared) |
 | Pricing | On-demand **$0.06416/hr** (live ap-south-1, 2026-05-29) — no Reserved / Savings Plan / Spot |
-| Schedule | **Trading weekdays only (Mon–Fri), 08:00–17:00 IST auto** (start `cron(30 2 ? * MON-FRI *)`, stop `cron(30 11 ? * MON-FRI *)`) — widened from 08:30–16:30 on 2026-06-02 per operator (pre/post-market + deploy room). Out-of-window runs = operator manual start. Weekends + holidays = OFF unless manually started. |
+| Schedule | **Trading weekdays only (Mon–Fri), 08:30–16:30 IST auto** (start `cron(0 3 ? * MON-FRI *)`, stop `cron(0 11 ? * MON-FRI *)`) — narrowed back from 08:00–17:00 on 2026-06-05 per operator ("make the aws instance start and stop from 8.30 am till 4.30 pm"; supersedes the 2026-06-02 widening). Out-of-window runs = operator manual start. Weekends + holidays = OFF unless manually started. |
 | EBS | gp3 10 GB (unchanged) |
 | EIP | 1 (24/7, Dhan static-IP mandate — unchanged) |
 | Network | ENA enabled by default |

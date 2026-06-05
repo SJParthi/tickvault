@@ -114,18 +114,19 @@ fn deploy_instance_ignores_type_and_user_data_to_prevent_replace() {
 }
 
 /// Weekday-only schedule (trading days). Mon-Fri crons, not Mon-Sun.
-/// IST 08:00 start = 02:30 UTC; IST 17:00 stop = 11:30 UTC (operator widened
-/// the window to 08:00-17:00 on 2026-06-02 for pre/post-market + deploy room).
+/// IST 08:30 start = 03:00 UTC; IST 16:30 stop = 11:00 UTC (operator narrowed
+/// the window back to 08:30-16:30 on 2026-06-05 — "make the aws instance start
+/// and stop from 8.30 am till 4.30 pm"; supersedes the 2026-06-02 08:00-17:00).
 #[test]
 fn deploy_schedule_is_weekday_only() {
     let body = read(MAIN_TF);
     assert!(
-        body.contains("cron(30 2 ? * MON-FRI *)"),
-        "main.tf daily_start must be `cron(30 2 ? * MON-FRI *)` (08:00 IST, Mon-Fri)."
+        body.contains("cron(0 3 ? * MON-FRI *)"),
+        "main.tf daily_start must be `cron(0 3 ? * MON-FRI *)` (08:30 IST, Mon-Fri)."
     );
     assert!(
-        body.contains("cron(30 11 ? * MON-FRI *)"),
-        "main.tf daily_stop must be `cron(30 11 ? * MON-FRI *)` (17:00 IST, Mon-Fri)."
+        body.contains("cron(0 11 ? * MON-FRI *)"),
+        "main.tf daily_stop must be `cron(0 11 ? * MON-FRI *)` (16:30 IST, Mon-Fri)."
     );
     assert!(
         !body.contains("MON-SUN") && !body.contains("* * ? * * *"),
