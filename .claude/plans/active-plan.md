@@ -1,96 +1,99 @@
-# Implementation Plan: Tick-conservation ledger (proof no tick is lost)
+# Implementation Plan: Time-windowed ring dedup (hardening — NOT the 23440 candle fix)
 
 **Status:** APPROVED
 **Date:** 2026-06-05
-**Approved by:** Parthiban ("go ahead with whatever is recommended")
+**Approved by:** Parthiban ("Do the dedup hardening anyway")
 **Crate(s) touched:** `core`
 
-## Context (verified)
+## Context (verified, no illusion)
 
-The tick processor's tick branch has exactly these terminal outcomes per entry
-(verified by reading `tick_processor.rs` 850–1270; integrity/late-tick/day_close
-checks only *count*, they do not drop):
+The in-memory `TickDedupRing` (`tick_processor.rs`) drops a tick when its exact
+`(security_id, exchange_timestamp, ltp)` fingerprint was already seen — to drop
+Dhan reconnect re-sends. Side effect: a **genuine price re-touch** with a
+**stale LTT** (same `exchange_timestamp`) is wrongly dropped, so it never reaches
+the ticks table or the broadcast.
 
-`ticks_processed == ticks_persisted + storage_errors + junk_ticks_filtered +
-stale_day_filtered + outside_hours_filtered + dedup_filtered`
-
-The loop is synchronous (each tick fully resolved before the next), so at the
-existing 60s periodic check there are **zero in-flight ticks** → the identity is
-**exact**. A correct system holds residual == 0 forever; any positive residual
-delta in a window = ticks entered but vanished unaccounted = a real leak.
+**Honest scope (stated up-front, in the PR too):** this does **NOT** fix the
+11:49 23440 candle-high miss. Verified: the candle aggregator buckets by
+`exchange_timestamp` (L-H7) and DISCARDS ticks whose LTT precedes the open bucket
+(L-C3). So a stale-LTT re-touch, even if kept here, is bucket-discarded by the
+aggregator. This hardening only restores the re-touch to the **`ticks` table**
+(visible by `received_at`); the candle fix (if the cause is stale LTT) is a
+separate bucketing change pending live-data confirmation.
 
 ## Plan Items
 
-- [ ] Item 1 — Pure, unit-tested conservation math
-  - Files: `crates/core/src/pipeline/tick_processor.rs`
-  - Tests: `conservation_tests::*`
-- [ ] Item 2 — Wire the per-window leak check into the existing 60s block
+- [x] Item 1 — Make the ring time-windowed (slot stores last-seen nanos)
+  - Files: `crates/core/src/pipeline/tick_processor.rs`, `crates/common/src/constants.rs`
+  - Tests: `TickDedupRing` unit tests (window in/out, distinct ltp)
+- [x] Item 2 — Pass `received_at_nanos` at the two call sites
   - Files: `crates/core/src/pipeline/tick_processor.rs`
 
 ## Design
 
-1. Pure fn `tick_conservation_residual(processed, persisted, storage_errors,
-   junk, stale_day, outside_hours, dedup) -> i64` = `processed - sum(outcomes)`.
-   0 = balanced; >0 = unaccounted (leak); <0 = double-count bug.
-2. Pure fn `conservation_leak_delta(current_residual, last_residual) -> i64`.
-3. In the existing 60s periodic block (only when `tick_writer.is_some()`, since
-   persistence-conservation is meaningless without a writer): compute the
-   residual, compare to the previous window's residual; if the **delta is > 0**
-   (ticks entered this window that reached no known terminal), emit
-   `error!("TICK CONSERVATION LEAK …", unaccounted=delta, residual, …)` (Telegram
-   via the ERROR sink) + `counter!("tv_tick_conservation_leak_total")`. Always log
-   the residual at `info!` when the window had activity, so the books are visible
-   even at 0 (positive false-OK avoidance, audit Rule 11).
+1. `TickDedupRing.slots: Box<[(u64, i64)]>` — (fingerprint, last_seen_nanos),
+   init `(u64::MAX, i64::MIN)`.
+2. `is_duplicate(security_id, exchange_timestamp, ltp, now_nanos) -> bool`:
+   `recent = fp == key && now_nanos.saturating_sub(last) <= DEDUP_RESEND_WINDOW_NANOS`;
+   always store `(key, now_nanos)`; return `recent`. A re-send (within window) →
+   dropped; a genuine re-touch beyond the window → kept.
+3. `DEDUP_RESEND_WINDOW_NANOS = 2_000_000_000` (2 s) in `constants.rs` —
+   comfortably covers a reconnect re-send burst (sub-second) while letting a
+   real re-touch seconds/minutes later through. Dropping an identical
+   `(price, LTT)` within 2 s is OHLC-safe (the price is already recorded).
+4. Both call sites pass `tick.received_at_nanos` as `now_nanos` (the arrival
+   clock — the dedup window is in arrival terms, which is what distinguishes a
+   reconnect re-send from a later genuine re-touch).
+5. `fingerprint()` unchanged.
 
 ## Edge Cases
 
-- **No writer** (`tick_writer` None — tests / non-persist config) → skip the
-  check (persistence-conservation undefined). Pinned by guarding on `is_some()`.
-- **Counter wrap** → all accumulators are `u64`; residual uses `i64`; a wrap
-  would surface as a large negative (double-count) which is itself alarming.
-- **Constant benign offset** → we alert on the **delta**, not the absolute, so a
-  flat residual never pages; only a *growing* gap (active loss) does.
-- **First window** → `last_residual` seeded to the first computed residual, so
-  the first delta is 0 (no spurious page at startup).
+- **Reconnect gap > window** → one re-send leaks through (kept). Acceptable: it
+  re-broadcasts an identical price (no OHLC change) + one extra ticks row
+  (distinct `received_at`). Rare; documented.
+- **received_at non-monotonic (NTP step back)** → `saturating_sub` floors at 0 →
+  treated as "recent" → dropped. Safe (worst case drops a re-touch, never panics).
+- **Slot collision** (different fingerprint, same idx) → still can only cause a
+  MISSED dup (a tick passes), never a false drop. Unchanged from before.
 
 ## Failure Modes
 
-- Missed a drop reason in the identity → would show as a steady positive residual
-  delta = false page. Mitigated: the identity was enumerated from source; the
-  `info!` residual line makes a constant offset obvious for quick correction; and
-  the check is delta-based so only *active* divergence pages.
-- The check itself is cold-path (60s), not per-tick → no hot-path / O(1) risk.
+- Window too long → a fast genuine re-touch of identical (price,LTT) dropped —
+  but that's OHLC-safe (same price already seen). Window too short → re-sends
+  leak as extra rows. 2 s balances both.
+- The ring is still O(1), zero-alloc (pre-allocated `Box<[_]>`), `#[inline]` —
+  hot-path budget unchanged. Enforced by the DHAT + Criterion gates.
 
 ## Test Plan
 
-- `cargo test -p tickvault-core tick_processor` → `conservation_tests` green:
-  balanced → 0; one unaccounted → +1; double-count → negative; delta math.
-- `cargo fmt --check`; design-first wall (impl crate `core` + this APPROVED plan
-  referencing it); pub-fn-test + pub-fn-wiring guards (pure fns get tests + the
-  60s block is their call site).
+- `cargo test -p tickvault-core tick_processor` — new/updated `TickDedupRing`
+  tests: (a) identical within window → dup; (b) identical beyond window → NOT
+  dup; (c) different ltp → not dup; (d) first-seen → not dup.
+- DHAT zero-alloc + Criterion bench (the mechanical hot-path Z+ gates) — the
+  change adds one i64 compare + store, no allocation; budget must hold (≤5%).
+- `cargo clippy --workspace -- -D warnings -W clippy::perf` (real CI command).
+- design-first wall (impl crate `core` + this APPROVED plan).
 
 ## Rollback
 
-Single-file change. Revert the commit: remove the two pure fns + the 60s-block
-check + the one counter. No schema, no data, no hot-path behaviour change.
+Single-file logic + one constant. Revert restores the timestamp-less ring. No
+schema/data change. No candle-behaviour change (the candle never benefited).
 
 ## Observability
 
-New `tv_tick_conservation_leak_total` counter + a per-window `info!` residual line
-+ an `error!` (Telegram) on any active leak. This IS the proof layer the operator
-asked for: it makes "no tick lost between entry and a known outcome" a live,
-measured fact, not a claim.
+The existing `tv_dedup_filtered_total` counter now reflects only true re-sends
+(within window), not genuine re-touches — so its rate becomes a cleaner re-send
+signal. No new metric.
 
 ## Per-Item Guarantee Matrix (cross-reference)
 
-This plan and every item in it are bound by the 15-row 100% guarantee matrix and
-the 7-row resilience demand matrix — see
+This plan and every item are bound by the 15-row 100% guarantee matrix and the
+7-row resilience demand matrix — see
 `.claude/rules/project/per-wave-guarantee-matrix.md`. All 15 + 7 rows apply.
 
-**Honest envelope (per `wave-4-shared-preamble.md` §8):** any "100%" wording here
-means "100% inside the tested envelope, with ratcheted regression coverage" — the
-envelope being the pure conservation-math unit tests + the live delta check. The
-ledger proves no tick is lost **between tick-branch entry and a known terminal
-outcome**; it is cold-path (60s) so it carries NO O(1) / nanosecond / hot-path
-claim. It does not (and cannot) prove the network delivered every Dhan packet —
-that bound is the WAL frame spill, tracked separately. No illusion.
+**Honest envelope (per `wave-4-shared-preamble.md` §8):** any "100%" means "100%
+inside the tested envelope, with ratcheted regression coverage" — the unit tests
++ DHAT + Criterion gate. This is a hot-path change kept O(1)/zero-alloc; it
+hardens ticks-table re-touch fidelity and **does NOT fix the 23440 candle-high
+miss** (the aggregator bucket-discards stale-LTT ticks). Stating it fixes the
+candle would be the hallucination the operator forbids.
