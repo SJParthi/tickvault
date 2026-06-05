@@ -25,17 +25,34 @@ and turns the "design first" half into a hard, fail-closed gate.
 
 | Step | Logic | Outcome |
 |---|---|---|
-| 1 | Compute changed files: `origin/main...HEAD` + working tree + staged | — |
-| 2 | Any match `^crates/[a-z_]+/src/.*\.rs$`? | No → **PASS** (docs/CI/hooks/config/deps exempt) |
-| 3 | Latest commit body has `PLAN-EXEMPT: <reason>`? | Yes → **PASS** (logged, auditable) |
-| 4 | An `.claude/plans/active-plan*.md` exists? | No → **BLOCK** |
-| 5 | Plan has all 6 required `##` sections? | Missing any → **BLOCK** (names which) |
-| 6 | `**Status:**` is `APPROVED` / `IN_PROGRESS` / `VERIFIED`? | No → **BLOCK** |
+| 1 | Compute changed files: `origin/main...HEAD` + working tree + staged + **untracked** (NUL-safe) | — |
+| 2 | Any match `^crates/[A-Za-z0-9_-]+/src/.*\.rs$`? | No → **PASS** (docs/CI/hooks/config/deps exempt) |
+| 3 | Latest commit body has `PLAN-EXEMPT: <reason>` **and** ≤1 impl file changed? | Yes → **PASS** (logged, auditable); multi-file → **BLOCK** |
+| 4 | Any `.claude/plans/active-plan*.md` exists? | No → **BLOCK** |
+| 5 | Some plan has all 6 required `##` sections, **each with a non-empty body**? | None → **BLOCK** (names which) |
+| 6 | That plan's `**Status:**` is `APPROVED` / `IN_PROGRESS` / `VERIFIED`? | No → **BLOCK** |
+| 7 | That plan **references a changed crate** (name or file path)? | No → **BLOCK** |
 
 The 6 required sections: **Design**, **Edge Cases**, **Failure Modes**,
-**Test Plan**, **Rollback**, **Observability**.
+**Test Plan**, **Rollback**, **Observability** — each must have content, not
+just a heading. All `active-plan*.md` files are scanned; at least one must
+fully satisfy steps 5–7 for the specific change.
 
 Exit codes: `0` = allowed, `2` = BLOCK (errors on stderr).
+
+### Adversarial-review hardening (2026-06-05)
+
+A security-reviewer + hostile bypass-hunt pass on the gate itself found and
+fixed these false-negatives **before** it shipped:
+
+| ID | Hole it closed |
+|---|---|
+| C1 | A brand-new untracked `crates/x/src/evil.rs` (never `git add`ed) was invisible to all diff sources → would PASS. Now counted via `git ls-files --others`. |
+| H2 | Crate-name regex `[a-z_]+` missed `core2` / `MyCrate` / `foo-bar`; broadened to `[A-Za-z0-9_-]+`. |
+| H3 | `head -1` validated a change against one arbitrary (possibly stale) plan; now scans ALL plans and the satisfying one must reference the changed crate. |
+| M4 | Six empty headings used to satisfy the section check; now each section needs a non-empty body. |
+| M5 | `PLAN-EXEMPT` could cover a whole multi-file feature; now capped to ≤1 implementation file. |
+| L6 | Base ref resolves `origin/main → main`; NUL-safe path handling throughout. |
 
 ---
 
@@ -86,12 +103,17 @@ six behaviours — run it any time:
 ```
 $ bash .claude/hooks/plan-gate.selftest.sh
   ok   : impl change + no plan -> BLOCK (exit 2)
-  ok   : impl change + PLAN-EXEMPT -> PASS (exit 0)
+  ok   : impl change + PLAN-EXEMPT (1 file) -> PASS (exit 0)
+  ok   : PLAN-EXEMPT covering 2 impl files -> BLOCK (exit 2)
   ok   : impl change + complete APPROVED plan -> PASS (exit 0)
   ok   : impl change + incomplete plan -> BLOCK (exit 2)
   ok   : complete plan but Status=DRAFT -> BLOCK (exit 2)
   ok   : docs-only change -> PASS (exit 0)
-  plan-gate self-test: 6 passed, 0 failed
+  ok   : untracked NEW .rs file, no plan -> BLOCK (C1) (exit 2)
+  ok   : hollow plan (empty sections) -> BLOCK (M4) (exit 2)
+  ok   : digit-crate (core2) src, no plan -> BLOCK (H2) (exit 2)
+  ok   : plan references wrong crate -> BLOCK (H3) (exit 2)
+  plan-gate self-test: 11 passed, 0 failed
 ```
 
 ---
