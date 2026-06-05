@@ -287,6 +287,30 @@ class WipeGate(unittest.TestCase):
         # Membership = market-hours-blocked during 09:15-15:30 IST.
         self.assertIn("docker-reset", handler._DESTRUCTIVE)
 
+    def test_docker_reset_forced_is_hardened_full_nuke(self) -> None:
+        # Regression 2026-06-05: "the nuke didn't wipe the data". The forced
+        # docker-reset must (a) remove containers by VOLUME (not just the literal
+        # name tv-questdb, which missed an off-project QuestDB), (b) fail LOUD
+        # without recreating if the volume survives, and (c) wipe the HOST app
+        # caches the Docker nuke can't see (instrument-cache/spill/dlq).
+        captured: dict = {}
+        orig = handler._ssm_shell
+        handler._ssm_shell = lambda cmds: (captured.__setitem__("cmds", cmds) or "cmd-123")  # type: ignore[assignment]
+        try:
+            resp = self._docker_reset(force=True)
+        finally:
+            handler._ssm_shell = orig  # type: ignore[assignment]
+        self.assertEqual(resp["statusCode"], 200)
+        joined = "\n".join(captured["cmds"])
+        # (a) robust container removal by VOLUME, not just by name
+        self.assertIn("--filter volume=tv-questdb-data", joined)
+        # (b) hard fail-loud gate — must NOT recreate if the volume survives
+        self.assertIn("DOCKER-RESET-FAILED", joined)
+        # (c) host caches wiped too (the dirs the Docker nuke cannot see)
+        self.assertIn("/opt/tickvault/data/instrument-cache", joined)
+        self.assertIn("/opt/tickvault/data/spill", joined)
+        self.assertIn("/opt/tickvault/data/dlq", joined)
+
 
 class HtmlWipeButton(unittest.TestCase):
     def test_html_has_wipe_button(self) -> None:
