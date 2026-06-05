@@ -49,7 +49,7 @@ pub const BOOT_HARD_DEADLINE_SECS_OF_DAY_IST: u32 = 8 * 3600 + 55 * 60;
 /// Earliest allowed boot start per §10. Equals 08:30:00 IST
 /// = 8 × 3600 + 30 × 60 = 30,600 seconds of day.
 ///
-/// Per §7 the EC2 instance schedule is "08:30–16:30 IST every weekday".
+/// Per §7 the EC2 instance schedule is "08:30–17:00 IST every day".
 /// Booting BEFORE 08:30 IST means the EventBridge cron fired too early
 /// (clock skew on the orchestrator host) — also a halt condition
 /// because the static-IP whitelist + Dhan auth tokens may not yet be
