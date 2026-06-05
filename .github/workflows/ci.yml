@@ -73,6 +73,34 @@ jobs:
           exit $failed
 
   # -------------------------------------------------------------------------
+  # Design-First Wall — no implementation change (crates/*/src/**.rs) may land
+  # without an APPROVED plan referencing the changed crate. Runs the SAME hook
+  # the local pre-push gate uses (.claude/hooks/plan-gate.sh), so a push that
+  # bypassed local hooks (--no-verify, a web edit, a fork) is still caught.
+  # See .claude/rules/project/design-first-wall.md.
+  # -------------------------------------------------------------------------
+  design-first-wall:
+    name: "Design-First Wall"
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Enforce design-first wall (plan-gate)
+        shell: bash
+        env:
+          # The hook's documented base-ref override (L6): use the exact PR base
+          # commit for the ${BASE}...HEAD changed-file diff — no reliance on
+          # origin/main ref resolution inside the runner.
+          PLAN_GATE_BASE: ${{ github.event.pull_request.base.sha }}
+          CLAUDE_PROJECT_DIR: ${{ github.workspace }}
+        run: bash .claude/hooks/plan-gate.sh "${{ github.workspace }}"
+
+  # -------------------------------------------------------------------------
   # Build & Verify — fmt + clippy + lib tests per crate.
   #
   # Split fmt + clippy (fast, one runner) from per-crate `cargo nextest run
