@@ -520,6 +520,87 @@ impl TickDedupRing {
     }
 }
 
+/// Residual of the tick-conservation identity (cold-path proof — NOT hot path).
+///
+/// `processed` = ticks that entered the tick branch; the other six are the ONLY
+/// terminal outcomes of a tick-branch entry (verified in `run_tick_processor`:
+/// persist Ok → `persisted`, persist Err (rescued) → `storage_errors`, and the
+/// four `continue` drops `junk` / `stale_day` / `outside_hours` / `dedup`). The
+/// loop is synchronous, so at the periodic check there are zero in-flight ticks
+/// and the identity is exact. Returns `processed - accounted`: 0 = every tick
+/// accounted, > 0 = unaccounted (leak), < 0 = double-count bug.
+#[inline]
+fn tick_conservation_residual(
+    processed: u64,
+    persisted: u64,
+    storage_errors: u64,
+    junk: u64,
+    stale_day: u64,
+    outside_hours: u64,
+    dedup: u64,
+) -> i64 {
+    let accounted = persisted
+        .saturating_add(storage_errors)
+        .saturating_add(junk)
+        .saturating_add(stale_day)
+        .saturating_add(outside_hours)
+        .saturating_add(dedup);
+    (processed as i64).saturating_sub(accounted as i64)
+}
+
+/// Per-window change in the conservation residual. `> 0` means ticks entered the
+/// branch this window but reached no known terminal outcome — an ACTIVE leak. A
+/// flat residual (delta 0) is benign even if the absolute is non-zero, so a
+/// constant offset never pages; only a growing gap does.
+#[inline]
+fn conservation_leak_delta(current_residual: i64, last_residual: i64) -> i64 {
+    current_residual.saturating_sub(last_residual)
+}
+
+#[cfg(test)]
+mod conservation_tests {
+    use super::{conservation_leak_delta, tick_conservation_residual};
+
+    #[test]
+    fn test_tick_conservation_residual_balanced_is_zero() {
+        // 100 in = 70 persisted + 5 errors + 3 junk + 2 stale + 15 out + 5 dedup
+        assert_eq!(tick_conservation_residual(100, 70, 5, 3, 2, 15, 5), 0);
+    }
+
+    #[test]
+    fn test_tick_conservation_residual_one_unaccounted_is_positive_one() {
+        // one tick entered but reached no terminal outcome
+        assert_eq!(tick_conservation_residual(100, 70, 5, 3, 2, 15, 4), 1);
+    }
+
+    #[test]
+    fn test_tick_conservation_residual_double_count_is_negative() {
+        // accounted exceeds processed → double-count bug surfaces as negative
+        assert_eq!(tick_conservation_residual(100, 99, 5, 0, 0, 0, 0), -4);
+    }
+
+    #[test]
+    fn test_tick_conservation_residual_all_zero_is_zero() {
+        assert_eq!(tick_conservation_residual(0, 0, 0, 0, 0, 0, 0), 0);
+    }
+
+    #[test]
+    fn test_conservation_leak_delta_flat_residual_is_zero() {
+        // constant offset (e.g. benign) → no active leak
+        assert_eq!(conservation_leak_delta(7, 7), 0);
+    }
+
+    #[test]
+    fn test_conservation_leak_delta_growing_gap_is_positive() {
+        assert_eq!(conservation_leak_delta(12, 7), 5);
+    }
+
+    #[test]
+    fn test_conservation_leak_delta_shrinking_is_negative() {
+        assert_eq!(conservation_leak_delta(3, 7), -4);
+    }
+}
+
 /// Runs the tick processing pipeline until the frame receiver closes.
 ///
 /// This is designed to run as a single `tokio::spawn` task.
@@ -636,6 +717,12 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     let mut last_logged_dedup: u64 = 0;
     let mut last_logged_junk: u64 = 0;
     let mut last_logged_persisted: u64 = 0;
+    // Tick-conservation ledger: previous window's residual (None until seeded
+    // on the first window so the first delta is 0 — no spurious page) + the
+    // last `ticks_processed` total, used to emit the positive "OK" line only
+    // when ticks actually flowed (no idle pre/post-market spam).
+    let mut last_conservation_residual: Option<i64> = None;
+    let mut last_conservation_processed: u64 = 0;
     // Local mirror of `m_ticks_persisted` Prometheus counter so the
     // 60s periodic stats log can show the persisted-vs-filtered ratio
     // without scraping Prometheus.
@@ -1557,6 +1644,51 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 last_logged_junk = junk_ticks_filtered;
                 last_logged_persisted = ticks_persisted;
             }
+
+            // Tick-conservation ledger (cold-path PROOF that no tick is lost
+            // between branch entry and a known outcome). Identity (exact, since
+            // the loop is synchronous → zero in-flight at this point):
+            //   ticks_processed == persisted + storage_errors + junk
+            //                      + stale_day + outside_hours + dedup
+            // Only meaningful with a writer (persist is the dominant terminal).
+            // We alert on a GROWING residual (active leak), not the absolute, so
+            // a constant offset never pages — only real divergence does.
+            if tick_writer.is_some() {
+                let residual = tick_conservation_residual(
+                    ticks_processed,
+                    ticks_persisted,
+                    storage_errors,
+                    junk_ticks_filtered,
+                    stale_day_filtered,
+                    outside_hours_filtered,
+                    dedup_filtered,
+                );
+                if let Some(prev) = last_conservation_residual {
+                    let leak = conservation_leak_delta(residual, prev);
+                    if leak > 0 {
+                        metrics::counter!("tv_tick_conservation_leak_total").increment(leak as u64);
+                        error!(
+                            target: "tickvault_core::pipeline::tick_processor::conservation",
+                            unaccounted_this_window = leak,
+                            residual_total = residual,
+                            ticks_processed,
+                            ticks_persisted,
+                            storage_errors,
+                            "TICK CONSERVATION LEAK — ticks entered the pipeline but reached no known outcome this window"
+                        );
+                    } else if ticks_processed > last_conservation_processed {
+                        info!(
+                            target: "tickvault_core::pipeline::tick_processor::conservation",
+                            residual_total = residual,
+                            ticks_processed,
+                            "tick conservation OK — every tick accounted (residual flat)"
+                        );
+                    }
+                }
+                last_conservation_residual = Some(residual);
+                last_conservation_processed = ticks_processed;
+            }
+
             last_filter_stats_log = Instant::now();
         }
 

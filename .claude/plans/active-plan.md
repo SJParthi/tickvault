@@ -1,81 +1,85 @@
-# Implementation Plan: Retention sweep must cover the REAL candle tables
+# Implementation Plan: Tick-conservation ledger (proof no tick is lost)
 
 **Status:** APPROVED
 **Date:** 2026-06-05
-**Approved by:** Parthiban ("fix everything … no illusion") + hostile-audit CRITICAL
-**Crate(s) touched:** `storage`
+**Approved by:** Parthiban ("go ahead with whatever is recommended")
+**Crate(s) touched:** `core`
 
-## Context (verified — a real bug in the just-merged #1022)
+## Context (verified)
 
-#1022 set `DAY_PARTITIONED_TABLES` to 10 `candles_*_shadow` literals copied from
-the (stale) rule files. The ACTUAL live candle tables are `candles_1m` …
-`candles_1d` — **21 tables, NO `_shadow` suffix** — per `TfIndex::table_name()`
-(`crates/trading/src/candles/tf_index.rs:175-197`, the single source of truth:
-"there are **no** `_shadow` tables"), enumerated by
-`shadow_persistence::candle_table_names()`. Confirmed against the operator's
-QuestDB screenshot (`candles_1m`, `candles_10m`, …). So the candle tables — the
-dominant disk-growth source — are **still not swept**; #1022 fixed the audit
-tables but not the candles. The meta-guard missed it because it only checks
-string literals inside `partition_manager.rs` (tautological for a list of
-literals); the real names live in a `match` in another crate.
+The tick processor's tick branch has exactly these terminal outcomes per entry
+(verified by reading `tick_processor.rs` 850–1270; integrity/late-tick/day_close
+checks only *count*, they do not drop):
+
+`ticks_processed == ticks_persisted + storage_errors + junk_ticks_filtered +
+stale_day_filtered + outside_hours_filtered + dedup_filtered`
+
+The loop is synchronous (each tick fully resolved before the next), so at the
+existing 60s periodic check there are **zero in-flight ticks** → the identity is
+**exact**. A correct system holds residual == 0 forever; any positive residual
+delta in a window = ticks entered but vanished unaccounted = a real leak.
 
 ## Plan Items
 
-- [x] Item 1 — Sweep the REAL candle tables from the single source
-  - Files: `crates/storage/src/partition_manager.rs`
-  - Tests: `partition_manager::tests::test_*`
-- [x] Item 2 — Make the meta-guard cross-reference `candle_table_names()`
-  - Files: `crates/storage/tests/partition_retention_coverage_guard.rs`
+- [ ] Item 1 — Pure, unit-tested conservation math
+  - Files: `crates/core/src/pipeline/tick_processor.rs`
+  - Tests: `conservation_tests::*`
+- [ ] Item 2 — Wire the per-window leak check into the existing 60s block
+  - Files: `crates/core/src/pipeline/tick_processor.rs`
 
 ## Design
 
-1. `DAY_PARTITIONED_TABLES` const → the **audit/data** tables only
-   (`instrument_fetch_audit`, `instrument_lifecycle_audit`,
-   `option_chain_minute_snapshot`, `prev_day_ohlcv`, `cross_verify_1m_audit`).
-   Remove all 10 phantom `candles_*_shadow` literals.
-2. `detach_old_partitions` gains a third loop over
-   `crate::shadow_persistence::candle_table_names()` (DAY granularity, exempt-skip)
-   — sweeps all 21 real candle tables **derived from the single source**, so the
-   names can never drift from what's actually created/written.
-3. Unit tests: assert the DAY const holds the 5 audit/data tables; assert
-   `candle_table_names()` returns 21 plain `candles_<TF>` names (no `_shadow`).
-4. Meta-guard: import `tickvault_storage::shadow_persistence::candle_table_names`
-   and assert (a) `partition_manager.rs` source references `candle_table_names`
-   (the candle sweep loop can't be silently deleted) and (b) every candle name is
-   a plain `candles_*` (no `_shadow`) so a future rename is caught.
+1. Pure fn `tick_conservation_residual(processed, persisted, storage_errors,
+   junk, stale_day, outside_hours, dedup) -> i64` = `processed - sum(outcomes)`.
+   0 = balanced; >0 = unaccounted (leak); <0 = double-count bug.
+2. Pure fn `conservation_leak_delta(current_residual, last_residual) -> i64`.
+3. In the existing 60s periodic block (only when `tick_writer.is_some()`, since
+   persistence-conservation is meaningless without a writer): compute the
+   residual, compare to the previous window's residual; if the **delta is > 0**
+   (ticks entered this window that reached no known terminal), emit
+   `error!("TICK CONSERVATION LEAK …", unaccounted=delta, residual, …)` (Telegram
+   via the ERROR sink) + `counter!("tv_tick_conservation_leak_total")`. Always log
+   the residual at `info!` when the window had activity, so the books are visible
+   even at 0 (positive false-OK avoidance, audit Rule 11).
 
 ## Edge Cases
 
-- `candles_1d` is created but unwritten (live-feed-purity rule 10) → empty →
-  `DETACH` is a harmless no-op. Sweeping all 21 (incl. 1d) is safe and avoids
-  special-casing.
-- A non-existent table name → `detach_partitions_for_table` returns `Ok(0)` on the
-  404 (existing behaviour) — but with the single-source derivation this can't
-  happen for candles.
-- `instrument_lifecycle` (exempt) is not a candle name → unaffected.
+- **No writer** (`tick_writer` None — tests / non-persist config) → skip the
+  check (persistence-conservation undefined). Pinned by guarding on `is_some()`.
+- **Counter wrap** → all accumulators are `u64`; residual uses `i64`; a wrap
+  would surface as a large negative (double-count) which is itself alarming.
+- **Constant benign offset** → we alert on the **delta**, not the absolute, so a
+  flat residual never pages; only a *growing* gap (active loss) does.
+- **First window** → `last_residual` seeded to the first computed residual, so
+  the first delta is 0 (no spurious page at startup).
 
 ## Failure Modes
 
-- `candle_table_names()` drift → impossible by construction (single source).
-- Someone deletes the candle sweep loop → meta-guard source-scan fails the build.
-- Vec/alloc concern → N/A: the detach cycle is cold-path (periodic), not hot path.
+- Missed a drop reason in the identity → would show as a steady positive residual
+  delta = false page. Mitigated: the identity was enumerated from source; the
+  `info!` residual line makes a constant offset obvious for quick correction; and
+  the check is delta-based so only *active* divergence pages.
+- The check itself is cold-path (60s), not per-tick → no hot-path / O(1) risk.
 
 ## Test Plan
 
-- `cargo test -p tickvault-storage partition_manager` → updated coverage + SEBI tests green.
-- `cargo test -p tickvault-storage --test partition_retention_coverage_guard` → meta-guard (now candle-aware) green.
-- `cargo clippy --workspace -- -D warnings -W clippy::perf` green (the real CI command).
+- `cargo test -p tickvault-core tick_processor` → `conservation_tests` green:
+  balanced → 0; one unaccounted → +1; double-count → negative; delta math.
+- `cargo fmt --check`; design-first wall (impl crate `core` + this APPROVED plan
+  referencing it); pub-fn-test + pub-fn-wiring guards (pure fns get tests + the
+  60s block is their call site).
 
 ## Rollback
 
-Single-file logic change + meta-guard update. Revert restores #1022's (buggy)
-state. No schema/data/runtime change beyond which tables the existing detach
-cycle visits.
+Single-file change. Revert the commit: remove the two pure fns + the 60s-block
+check + the one counter. No schema, no data, no hot-path behaviour change.
 
 ## Observability
 
-`detach_old_partitions` already logs `info!(table, detached=count)` per table —
-now it actually logs the 21 candle tables. No new metric. Cold-path; no hot-path / O(1) involvement.
+New `tv_tick_conservation_leak_total` counter + a per-window `info!` residual line
++ an `error!` (Telegram) on any active leak. This IS the proof layer the operator
+asked for: it makes "no tick lost between entry and a known outcome" a live,
+measured fact, not a claim.
 
 ## Per-Item Guarantee Matrix (cross-reference)
 
@@ -83,10 +87,10 @@ This plan and every item in it are bound by the 15-row 100% guarantee matrix and
 the 7-row resilience demand matrix — see
 `.claude/rules/project/per-wave-guarantee-matrix.md`. All 15 + 7 rows apply.
 
-**Honest envelope (per `wave-4-shared-preamble.md` §8):** any "100%" means "100%
-inside the tested envelope, with ratcheted regression coverage" — here the
-single-source candle derivation + the candle-aware meta-guard. Cold-path
-storage-retention fix; NO O(1) / hot-path / zero-tick-loss claim, and it still
-does NOT free EBS by itself (S3 archival of detached partitions remains the
-separate AWS-dependent piece). No illusion: this corrects the candle-table gap
-#1022 left open.
+**Honest envelope (per `wave-4-shared-preamble.md` §8):** any "100%" wording here
+means "100% inside the tested envelope, with ratcheted regression coverage" — the
+envelope being the pure conservation-math unit tests + the live delta check. The
+ledger proves no tick is lost **between tick-branch entry and a known terminal
+outcome**; it is cold-path (60s) so it carries NO O(1) / nanosecond / hot-path
+claim. It does not (and cannot) prove the network delivered every Dhan packet —
+that bound is the WAL frame spill, tracked separately. No illusion.
