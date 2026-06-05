@@ -59,12 +59,25 @@ downgrade OR market-hours-gate removal fails the build.
 
 ## AGGREGATOR-LATE-01 — tick arrived after its bucket sealed (discarded)
 
-**Trigger:** at a minute boundary the aggregator sealed a 1m bucket; a
-tick whose `exchange_timestamp` falls inside that bucket arrives ≥1 ms
-after the seal completes. The aggregator MUST NOT silently merge the
-late tick into the next bucket (would shift data across timestamps);
-MUST NOT silently discard it; the only correct action is `error!` log
-+ counter increment + discard. Severity::High.
+**REVISED 2026-06-05 (operator lock — Option B "late tick re-folds its own
+minute"):** a late tick whose `exchange_timestamp` floors to the
+MOST-RECENTLY sealed bucket is NO LONGER discarded — it re-folds its OWN
+minute's high/low/close (`ConsumeOutcome::AmendedLate`) and the candle is
+re-emitted so the writer UPSERTs it in place (DEDUP `(ts, security_id,
+segment)`). The tick's timestamp decides its minute, so this is NOT a
+cross-bucket merge — it corrects the candle the tick always belonged to.
+Observability: `tv_aggregator_amended_ticks_total` + the heartbeat `amended`
+field. `AGGREGATOR-LATE-01` (`ErrorCode::AggregatorLate01...`) now fires ONLY
+for a tick that is **≥ 2 buckets late** OR has **no amendable sealed bucket**
+(e.g. just after the IST-midnight / 15:30 `force_seal` cleared it — the
+cross-day-amend guard §4b) — only THEN is it `error!` + counter + discard.
+
+**Original trigger (pre-2026-06-05, retained for history):** at a minute
+boundary the aggregator sealed a 1m bucket; a tick whose `exchange_timestamp`
+falls inside that bucket arrives ≥1 ms after the seal completes. The
+aggregator MUST NOT silently merge the late tick into the next bucket (would
+shift data across timestamps); MUST NOT silently discard it; the only correct
+action is `error!` log + counter increment + discard. Severity::High.
 
 **Triage:**
 1. Counter `tv_aggregator_late_tick_total{action="discard"}` rate — a

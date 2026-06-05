@@ -104,11 +104,14 @@ impl InstrumentEntry {
 /// without the container itself doing tracing (kept side-effect-free
 /// for testability).
 ///
-/// Per locked decision **L-C3**, `late_count` ≥ 1 means the caller
-/// MUST emit one ERROR log + increment
-/// `tv_aggregator_late_tick_total{action="discard"}`. The container
-/// coalesces 21 possible late-discards into one count so the caller
-/// emits ONE log line per tick (not 21).
+/// `late_count` ≥ 1 means the caller increments
+/// `tv_aggregator_late_ticks_discarded_total` (a tick ≥ 2 buckets late, or with
+/// no amendable last-sealed bucket). `amended_count` ≥ 1 (Option B, operator
+/// lock 2026-06-05, supersedes L-C3 "no silent merge") means a 1-bucket-late
+/// tick re-folded its own minute's high/low/close and the caller routed the
+/// amended candle through `on_seal` (UPSERT) + increments
+/// `tv_aggregator_amended_ticks_total`. The container coalesces the 21 TFs into
+/// counts so the caller emits ONE log line per tick (not 21).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ConsumeStats {
     /// Number of TFs that just sealed a bucket and emitted a sealed
@@ -117,6 +120,9 @@ pub struct ConsumeStats {
     /// Number of TFs that received this tick as a late arrival
     /// (before their open bucket's start). 0..=21.
     pub late_count: u8,
+    /// Number of TFs whose most-recently-sealed bucket was AMENDED by this
+    /// late tick (Option B) and re-emitted via `on_seal` for UPSERT. 0..=21.
+    pub amended_count: u8,
     /// `true` if the instrument was looked up successfully.
     /// `false` if the (security_id, segment) pair was NOT in the
     /// container (a tick for an instrument that wasn't pre-populated
@@ -277,6 +283,7 @@ impl MultiTfAggregator {
             return ConsumeStats {
                 sealed_count: 0,
                 late_count: 0,
+                amended_count: 0,
                 instrument_found: true,
             };
         }
@@ -287,6 +294,7 @@ impl MultiTfAggregator {
             return ConsumeStats {
                 sealed_count: 0,
                 late_count: 0,
+                amended_count: 0,
                 instrument_found: false,
             };
         };
@@ -294,6 +302,7 @@ impl MultiTfAggregator {
         let last_cum = entry.last_cumulative.load(Ordering::Relaxed);
         let mut sealed_count: u8 = 0;
         let mut late_count: u8 = 0;
+        let mut amended_count: u8 = 0;
 
         for tf in TfIndex::ALL {
             match entry.cell.consume_tick(tf, tick, last_cum) {
@@ -301,6 +310,13 @@ impl MultiTfAggregator {
                 ConsumeOutcome::Sealed { sealed_state } => {
                     sealed_count = sealed_count.saturating_add(1);
                     on_seal(tf, sealed_state);
+                }
+                // Option B: a 1-bucket-late tick amended its own minute's
+                // high/low/close — route the corrected candle through the SAME
+                // seal path so the writer UPSERTs (replaces) that minute's row.
+                ConsumeOutcome::AmendedLate { amended_state } => {
+                    amended_count = amended_count.saturating_add(1);
+                    on_seal(tf, amended_state);
                 }
                 ConsumeOutcome::DiscardLate => {
                     late_count = late_count.saturating_add(1);
@@ -319,6 +335,7 @@ impl MultiTfAggregator {
         ConsumeStats {
             sealed_count,
             late_count,
+            amended_count,
             instrument_found: true,
         }
     }
@@ -536,28 +553,54 @@ mod tests {
     }
 
     #[test]
-    fn test_consume_tick_reports_late_count_for_late_ticks_no_silent_merge() {
+    fn test_consume_tick_discards_late_when_no_amendable_sealed_bucket() {
         let agg = MultiTfAggregator::new();
         agg.pre_populate(vec![(13, 0)]);
-        // Open all 9 TFs at t=1716001000+30 (t=1716001030, M1 bucket
-        // = 1716001020..1716001080 say).
         let aligned = 1_779_355_500_u32; // 2026-05-21 09:25:00 IST (M1-aligned)
         let tick1 = mk_tick(13, 0, aligned + 30, 100.0, 50, 0);
         agg.consume_tick(&tick1, 0, |_, _| {});
-        // Late tick belongs to PREVIOUS M1 bucket (t < aligned).
+        // Late tick belongs to the PREVIOUS M1 bucket, but NO bucket has been
+        // sealed yet → no amendable last-sealed bucket → DiscardLate (Option B
+        // only amends a bucket that was actually sealed by a newer in-session tick).
         let late_tick = mk_tick(13, 0, aligned - 5, 99.0, 40, 0);
-        let mut sealed_callbacks: u32 = 0;
-        let stats = agg.consume_tick(&late_tick, 0, |_, _| sealed_callbacks += 1);
+        let mut on_seal_calls: u32 = 0;
+        let stats = agg.consume_tick(&late_tick, 0, |_, _| on_seal_calls += 1);
         assert!(stats.instrument_found);
-        // M1 is late (previous bucket); 5m/15m/etc. are still in
-        // their open buckets so they update normally.
         assert_eq!(stats.sealed_count, 0);
+        assert_eq!(stats.amended_count, 0);
         assert!(
             stats.late_count >= 1,
             "M1 should have flagged late; got late_count={}",
             stats.late_count
         );
-        assert_eq!(sealed_callbacks, 0);
+        assert_eq!(on_seal_calls, 0);
+    }
+
+    #[test]
+    fn test_consume_tick_amends_just_sealed_bucket_and_routes_via_on_seal() {
+        // Option B: a 1-bucket-late tick re-folds its OWN minute's high/low/close
+        // and is re-emitted through on_seal so the writer UPSERTs the candle.
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(13, 0)]);
+        let b1 = 1_779_355_500_u32; // 09:25:00 IST
+        agg.consume_tick(&mk_tick(13, 0, b1 + 30, 100.0, 50, 0), 0, |_, _| {}); // open M1 bucket1
+        agg.consume_tick(&mk_tick(13, 0, b1 + 70, 105.0, 60, 0), 0, |_, _| {}); // cross boundary → seal M1 bucket1
+        // Late tick (LTT 09:25:50) into the just-sealed M1 bucket1, price 110 (new high).
+        let mut m1_amend_emits: u32 = 0;
+        let stats = agg.consume_tick(&mk_tick(13, 0, b1 + 50, 110.0, 55, 0), 0, |tf, st| {
+            if tf == TfIndex::M1 {
+                m1_amend_emits += 1;
+                assert_eq!(st.bucket_start_ist_secs, b1);
+                assert_eq!(st.high, 110.0); // corrected high routed for UPSERT
+            }
+        });
+        assert!(
+            stats.amended_count >= 1,
+            "M1 should have amended; got amended_count={}",
+            stats.amended_count
+        );
+        assert_eq!(stats.late_count, 0);
+        assert_eq!(m1_amend_emits, 1);
     }
 
     #[test]

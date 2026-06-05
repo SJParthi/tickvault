@@ -17,8 +17,8 @@
 //!
 //! ## RAM budget
 //!
-//! `SEAL_BUFFER_CAPACITY = 200_000` and `BufferedSeal` ≤ 128 bytes →
-//! ~25 MB worst-case. Fits comfortably in the 2 GB App envelope from
+//! `SEAL_BUFFER_CAPACITY = 200_000` and `BufferedSeal` ≤ 144 bytes →
+//! ~29 MB worst-case. Fits comfortably in the 2 GB App envelope from
 //! `aws-budget.md`.
 //!
 //! ## Drop semantics on overflow
@@ -111,11 +111,13 @@ impl BufferedSeal {
 }
 
 // Compile-time size assertion. `BufferedSeal` carries the entire
-// `LiveCandleState` (~88 bytes) + the routing fields (5 bytes for
-// security_id + segment + tf, plus padding). 128 bytes is comfortable.
+// `LiveCandleState` (128 bytes after the 2026-06-05 Option B `close_ts_ist_secs`)
+// + the routing fields (security_id + segment + tf + padding). 144 bytes covers
+// it. Ring RAM = SEAL_BUFFER_CAPACITY (200_000) × 144 ≈ 28.8 MB (was 25.6 MB at
+// 128) — +3.2 MB, negligible on the 8 GiB host (see aws-budget.md Tier 1).
 const _: () = assert!(
-    std::mem::size_of::<BufferedSeal>() <= 128,
-    "BufferedSeal exceeded 128-byte budget — ring RAM = SEAL_BUFFER_CAPACITY × this size; bumping requires updating aws-budget.md."
+    std::mem::size_of::<BufferedSeal>() <= 144,
+    "BufferedSeal exceeded 144-byte budget — ring RAM = SEAL_BUFFER_CAPACITY × this size; bumping requires updating aws-budget.md."
 );
 
 /// Outcome of [`SealRing::try_buffer`].
@@ -282,7 +284,7 @@ mod tests {
     fn test_buffered_seal_size_within_budget() {
         // Pinned by `const _ = assert!` above. Runtime-mirrored here
         // so a future field bloat fails grep-able tests too.
-        assert!(std::mem::size_of::<BufferedSeal>() <= 128);
+        assert!(std::mem::size_of::<BufferedSeal>() <= 144);
     }
 
     #[test]

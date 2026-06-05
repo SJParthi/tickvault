@@ -14,11 +14,15 @@
 //!   `LiveCandleState` is ~64 bytes which exceeds AtomicCell's 16-byte
 //!   lock-free threshold; AtomicCell would spin-lock internally
 //!   anyway). `parking_lot::Mutex` is ~30 ns uncontended on Linux.
-//! - **L-C3** — late-tick discard (timestamp before bucket-start of
-//!   the cell's open bucket) is signalled via [`ConsumeOutcome::DiscardLate`]
-//!   so the caller can `error!(code = AGGREGATOR-LATE-01, ...)` per
-//!   `error_level_meta_guard.rs` Rule 5. NO silent merge across
-//!   buckets.
+//! - **L-C3 (REVISED — operator lock 2026-06-05, Option B):** a late tick
+//!   (`exchange_timestamp` before the open bucket) whose minute is the
+//!   MOST-RECENTLY sealed bucket re-folds its OWN minute's high/low/close
+//!   ([`ConsumeOutcome::AmendedLate`]) and the caller re-emits → the writer
+//!   UPSERTs that candle in place (the tick's timestamp decides its minute, so
+//!   this is NOT a cross-bucket merge). Only a ≥2-bucket-late tick, or one with
+//!   no amendable sealed bucket (post-`force_seal`), is [`ConsumeOutcome::DiscardLate`]
+//!   + `error!(code = AGGREGATOR-LATE-01, ...)`. Supersedes the pre-2026-06-05
+//!   "always discard / no silent merge" rule.
 //! - **L-H7** — bucket alignment derived from `tick.exchange_timestamp`
 //!   (IST epoch seconds, NEVER `Utc::now()`).
 //! - **L-H12** — caller propagates `Option<exchange_segment_code>`
@@ -106,6 +110,12 @@ pub struct LiveCandleState {
     pub oi: i64,
     /// Number of ticks folded into this bucket.
     pub tick_count: u32,
+    /// `exchange_timestamp` (IST epoch secs) of the tick that set the current
+    /// `close`. Used by the Option B late-tick amend (`fold_late_hlc`) to decide
+    /// whether a late tick is genuinely the minute's LAST tick — close is
+    /// overwritten ONLY when `late_tick.exchange_timestamp >= close_ts_ist_secs`,
+    /// so an out-of-order EARLIER late tick can never clobber a truly-later close.
+    pub close_ts_ist_secs: u32,
     /// Previous-day close baseline captured live from the tick's
     /// `day_close` field (Dhan's Quote-packet prev-day close — static per
     /// trading day, blank pre-market, populated from 09:15 IST). Last
@@ -156,6 +166,7 @@ impl LiveCandleState {
             bucket_start_cumulative: 0,
             oi: 0,
             tick_count: 0,
+            close_ts_ist_secs: 0,
             prev_day_close: 0.0,
             close_pct_from_prev_day: 0.0,
             oi_pct_from_prev_day: 0.0,
@@ -228,6 +239,7 @@ impl LiveCandleState {
             bucket_start_cumulative,
             oi: i64::from(tick.open_interest),
             tick_count: 1,
+            close_ts_ist_secs: tick.exchange_timestamp,
             // Prev-day close baseline from the live Quote `close` field.
             // `0.0` pre-market (Dhan ships it blank until 09:15) — the
             // first 09:15+ tick supplies the real value via fold_in_bucket.
@@ -267,6 +279,9 @@ impl LiveCandleState {
             self.low = price;
         }
         self.close = price;
+        // In-order ticks have monotonically non-decreasing LTT, so this records
+        // the latest close time (used by the Option B late-tick amend).
+        self.close_ts_ist_secs = tick.exchange_timestamp;
         // Item 28 carry-over: incremental volume from bucket start.
         // saturating_sub guards against rare out-of-order tick where
         // current cumulative < bucket-start.
@@ -284,6 +299,36 @@ impl LiveCandleState {
         if tick.day_open > 0.0 {
             self.session_open = tickvault_common::price_precision::f32_to_f64_clean(tick.day_open);
         }
+    }
+
+    /// Option B (operator lock 2026-06-05): folds a LATE tick — one whose
+    /// `exchange_timestamp` belongs to THIS (already-sealed) bucket but which
+    /// physically arrived after the bucket was sealed — into the bucket's
+    /// **high, low, and close** (H/L/C).
+    ///
+    /// - `high` (max) / `low` (min): always safe — order-independent extremes.
+    /// - `close`: overwritten ONLY when this late tick is genuinely the minute's
+    ///   LAST tick, i.e. `tick.exchange_timestamp >= close_ts_ist_secs`. This
+    ///   prevents an out-of-order EARLIER late tick from clobbering a truly-later
+    ///   close. For the operator's case (LTT 9:15:59 arriving at 9:16:00.000) the
+    ///   tick IS the last second of the minute, so close updates.
+    /// - `open` / `volume` / `oi`: untouched. `open` is the FIRST tick (a
+    ///   latecomer can't be first); `volume`/`oi` are order-dependent cumulative
+    ///   snapshots whose late value is ambiguous.
+    #[inline]
+    fn fold_late_hlc(&mut self, tick: &ParsedTick) {
+        let price = tickvault_common::price_precision::f32_to_f64_clean(tick.last_traded_price);
+        if price > self.high {
+            self.high = price;
+        }
+        if price < self.low {
+            self.low = price;
+        }
+        if tick.exchange_timestamp >= self.close_ts_ist_secs {
+            self.close = price;
+            self.close_ts_ist_secs = tick.exchange_timestamp;
+        }
+        self.tick_count = self.tick_count.saturating_add(1);
     }
 }
 
@@ -307,12 +352,24 @@ pub enum ConsumeOutcome {
         /// The state of the bucket that just closed.
         sealed_state: LiveCandleState,
     },
-    /// Tick belongs to a bucket that's STRICTLY OLDER than the one
-    /// the slot has open (i.e. `TfIndex::bucket_start(tick.exchange_timestamp)
-    /// < self.bucket_start_ist_secs`). Caller MUST emit
-    /// `error!(code = AGGREGATOR-LATE-01, ...)` + increment
-    /// `tv_aggregator_late_tick_total{action="discard"}` per locked
-    /// decision L-C3. NO silent merge.
+    /// Option B (operator lock 2026-06-05): a LATE tick whose
+    /// `exchange_timestamp` floors to the MOST-RECENTLY sealed bucket
+    /// (`bucket_start == last_sealed[tf].bucket_start_ist_secs`) was re-folded
+    /// into that bucket's high/low. `amended_state` is the corrected candle;
+    /// the caller MUST route it through the SAME `on_seal` path so the writer
+    /// UPSERTs it — replacing that minute's candle row in place (DEDUP
+    /// `(ts, security_id, segment)`). Counts as `amended`, NOT `discarded`.
+    AmendedLate {
+        /// The just-amended (re-sealed) state to UPSERT.
+        amended_state: LiveCandleState,
+    },
+    /// Tick belongs to a bucket STRICTLY OLDER than BOTH the open bucket AND
+    /// the most-recently sealed bucket (≥ 2 buckets late), OR there is no
+    /// amendable last-sealed bucket (e.g. just after `force_seal` cleared it
+    /// across the day boundary). Only THEN is the tick dropped. Caller emits
+    /// `error!(code = AGGREGATOR-LATE-01, ...)` + increments the
+    /// late-discarded counter. (Supersedes the pre-2026-06-05 L-C3 "no silent
+    /// merge" — a 1-bucket-late tick now amends its own minute instead.)
     DiscardLate,
 }
 
@@ -350,6 +407,14 @@ pub struct AggregatorCell {
     /// struct docstring. `true` ⇒ next first-bucket-open uses
     /// `tick.day_open`; consumed (set `false`) on that open.
     armed_for_day_open: [std::sync::atomic::AtomicBool; TF_COUNT],
+    /// Per-TF copy of the MOST-RECENTLY sealed bucket (Option B, operator lock
+    /// 2026-06-05). A late tick whose `exchange_timestamp` floors to this bucket
+    /// re-folds its high/low here and the caller re-emits → QuestDB UPSERT
+    /// replaces that minute's candle in place. Stored only on an INTRADAY
+    /// boundary-crossing seal; CLEARED by `force_seal` so a previous-day bucket
+    /// is never amendable across the IST-midnight / 15:30 day boundary. Empty
+    /// sentinel (`bucket_start_ist_secs == 0`) means "nothing amendable".
+    last_sealed: [Mutex<LiveCandleState>; TF_COUNT],
 }
 
 impl AggregatorCell {
@@ -366,6 +431,7 @@ impl AggregatorCell {
         Arc::new(Self {
             slots: std::array::from_fn(|_| Mutex::new(LiveCandleState::empty())),
             armed_for_day_open: std::array::from_fn(|_| std::sync::atomic::AtomicBool::new(true)),
+            last_sealed: std::array::from_fn(|_| Mutex::new(LiveCandleState::empty())),
         })
     }
 
@@ -431,11 +497,26 @@ impl AggregatorCell {
                     false,
                 ),
             );
+            // Option B: remember this just-sealed INTRADAY bucket so a late tick
+            // (LTT in it, arrived after the seal) can re-fold its high/low. Lock
+            // order is ALWAYS slot-guard → last_sealed (here, the late arm, and
+            // force_seal) → no deadlock.
+            *self.last_sealed[tf.as_ordinal()].lock() = sealed_state;
             return ConsumeOutcome::Sealed { sealed_state };
         }
 
-        // Tick belongs to an older bucket — late arrival. Drop with
-        // diagnostic per L-C3.
+        // Tick belongs to an OLDER bucket — late arrival. Option B (operator
+        // lock 2026-06-05): if its LTT floors to the most-recently sealed
+        // bucket, re-fold its high/low into THAT minute and re-emit (the writer
+        // UPSERTs, replacing the row in place). Only a ≥2-bucket-late tick, or
+        // one with no amendable last-sealed bucket (post-force_seal), is dropped.
+        let mut last = self.last_sealed[tf.as_ordinal()].lock();
+        if !last.is_uninitialised() && bucket_start == last.bucket_start_ist_secs {
+            last.fold_late_hlc(tick);
+            return ConsumeOutcome::AmendedLate {
+                amended_state: *last,
+            };
+        }
         ConsumeOutcome::DiscardLate
     }
 
@@ -456,6 +537,12 @@ impl AggregatorCell {
     pub fn force_seal(&self, tf: TfIndex) -> Option<LiveCandleState> {
         let mut guard = self.slots[tf.as_ordinal()].lock();
         self.armed_for_day_open[tf.as_ordinal()].store(true, std::sync::atomic::Ordering::Relaxed);
+        // Option B §4b (cross-day safety): a force-seal is the IST-midnight /
+        // post-15:30 day boundary. CLEAR the amendable last-sealed bucket so a
+        // stray in-session late tick can NEVER UPSERT a previous-day candle
+        // across the day boundary. Only an INTRADAY boundary-crossing seal
+        // (consume_tick) leaves an amendable bucket. Lock order: slot → last_sealed.
+        *self.last_sealed[tf.as_ordinal()].lock() = LiveCandleState::empty();
         if guard.is_uninitialised() {
             return None;
         }
@@ -475,9 +562,13 @@ impl AggregatorCell {
 // from `close_pct_from_prev_day` at the seal-row extractor, so it costs zero
 // per-instrument RAM. RAM cost of `open_gap_pct`: +8 B × 21 TF × ~250 SIDs
 // ≈ 42 KB total — negligible on the 8 GiB host (see aws-budget.md Tier 1).
+// 2026-06-05 (operator lock, Option B late-tick amend): bumped 120 → 128 to
+// carry `close_ts_ist_secs` (the close tick's LTT, so a late tick only
+// overwrites close when it is genuinely the minute's last tick). RAM cost:
+// +8 B × 21 TF × ~250 SIDs × 2 (slots + last_sealed) ≈ 84 KB total — negligible.
 const _: () = assert!(
-    std::mem::size_of::<LiveCandleState>() <= 120,
-    "LiveCandleState exceeded 120-byte budget — every new field bloats per-instrument RAM by 21× (one slot per TF). Either shrink the new field or update aws-budget.md and bump this assertion."
+    std::mem::size_of::<LiveCandleState>() <= 128,
+    "LiveCandleState exceeded 128-byte budget — every new field bloats per-instrument RAM by 21× (one slot per TF). Either shrink the new field or update aws-budget.md and bump this assertion."
 );
 
 // ---------------------------------------------------------------------------
@@ -500,11 +591,12 @@ mod tests {
 
     #[test]
     fn test_live_candle_state_size_is_within_budget() {
-        // 120-byte budget is pinned by the const _ assert above (bumped
+        // 128-byte budget is pinned by the const _ assert above (bumped
         // from 96 for §31 session_open + open_pct, then 112 → 120 for the
-        // 2026-06-02 open_gap_pct column); this runtime test makes the
-        // contract grep-able.
-        assert!(std::mem::size_of::<LiveCandleState>() <= 120);
+        // 2026-06-02 open_gap_pct column, then 120 → 128 for the 2026-06-05
+        // Option B close_ts_ist_secs); this runtime test makes the contract
+        // grep-able.
+        assert!(std::mem::size_of::<LiveCandleState>() <= 128);
     }
 
     #[test]
@@ -703,7 +795,9 @@ mod tests {
         // Open bucket at t=1716001000 (aligned to 60s boundary).
         let aligned_now = 1_779_355_500_u32; // 2026-05-21 09:25:00 IST (M1-aligned)
         cell.consume_tick(TfIndex::M1, &mk_tick(aligned_now + 30, 100.0, 50, 0), 0);
-        // Late tick belongs to the PREVIOUS bucket.
+        // Late tick belongs to the PREVIOUS bucket. NO bucket has been sealed
+        // yet (only one bucket was ever opened), so there is no amendable
+        // last-sealed bucket → DiscardLate (Option B falls through to discard).
         let late = mk_tick(aligned_now - 5, 99.0, 40, 0);
         let outcome = cell.consume_tick(TfIndex::M1, &late, 0);
         assert_eq!(outcome, ConsumeOutcome::DiscardLate);
@@ -711,6 +805,72 @@ mod tests {
         let s = cell.snapshot(TfIndex::M1);
         assert_eq!(s.tick_count, 1);
         assert_eq!(s.close, 100.0);
+    }
+
+    // ---- Option B: late-tick re-folds its OWN minute (operator lock 2026-06-05) ----
+
+    #[test]
+    fn test_late_tick_into_just_sealed_bucket_amends_high_low_close() {
+        let cell = AggregatorCell::empty();
+        let b1 = 1_779_355_500_u32; // 09:25:00 IST, M1-aligned
+        // Open bucket1: open=high=low=close=100 @ 09:25:30, volume 50.
+        cell.consume_tick(TfIndex::M1, &mk_tick(b1 + 30, 100.0, 50, 0), 0);
+        // Cross the boundary @ 09:26:10 → seal bucket1, open bucket2.
+        let sealed = cell.consume_tick(TfIndex::M1, &mk_tick(b1 + 70, 105.0, 60, 0), 50);
+        assert!(matches!(sealed, ConsumeOutcome::Sealed { .. }));
+        // Late tick: LTT 09:25:50 belongs to the JUST-SEALED bucket1, price 110
+        // (a new high), arriving out of order. The operator's exact case.
+        let late = mk_tick(b1 + 50, 110.0, 55, 0);
+        match cell.consume_tick(TfIndex::M1, &late, 50) {
+            ConsumeOutcome::AmendedLate { amended_state } => {
+                assert_eq!(amended_state.bucket_start_ist_secs, b1);
+                assert_eq!(amended_state.high, 110.0); // raised
+                assert_eq!(amended_state.low, 100.0); // unchanged
+                assert_eq!(amended_state.close, 110.0); // LTT 09:25:50 >= close_ts 09:25:30
+                assert_eq!(amended_state.open, 100.0); // open NEVER changes
+                assert_eq!(amended_state.volume, 50); // volume NEVER changes
+            }
+            other => panic!("expected AmendedLate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_late_amend_keeps_close_when_late_tick_is_earlier_in_minute() {
+        let cell = AggregatorCell::empty();
+        let b1 = 1_779_355_500_u32;
+        cell.consume_tick(TfIndex::M1, &mk_tick(b1 + 40, 100.0, 50, 0), 0); // close_ts=b1+40
+        cell.consume_tick(TfIndex::M1, &mk_tick(b1 + 70, 105.0, 60, 0), 50); // seal bucket1
+        // Late tick from EARLIER in bucket1 (LTT b1+10 < close_ts b1+40),
+        // price 90 (a new low). low updates; close must NOT regress.
+        let late = mk_tick(b1 + 10, 90.0, 55, 0);
+        match cell.consume_tick(TfIndex::M1, &late, 50) {
+            ConsumeOutcome::AmendedLate { amended_state } => {
+                assert_eq!(amended_state.low, 90.0); // order-independent → updated
+                assert_eq!(amended_state.close, 100.0); // EARLIER tick → close unchanged
+            }
+            other => panic!("expected AmendedLate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_force_seal_clears_last_sealed_no_cross_day_amend() {
+        let cell = AggregatorCell::empty();
+        let b1 = 1_779_355_500_u32; // 09:25:00
+        let b2 = b1 + 120; // 09:27:00
+        cell.consume_tick(TfIndex::M1, &mk_tick(b1 + 30, 100.0, 50, 0), 0);
+        cell.consume_tick(TfIndex::M1, &mk_tick(b1 + 70, 105.0, 60, 0), 50); // seal bucket1
+        // §4b: a force-seal (IST-midnight / post-15:30) clears the amendable
+        // bucket + empties the slot, so a previous-day bar can never be amended.
+        let _ = cell.force_seal(TfIndex::M1);
+        // A new bucket opens (next session).
+        cell.consume_tick(TfIndex::M1, &mk_tick(b2 + 10, 200.0, 70, 60), 60);
+        // A stray late tick whose LTT floors to the OLD (force-sealed) bucket1
+        // must NOT amend a cross-day candle — it is dropped.
+        let late = mk_tick(b1 + 50, 999.0, 55, 0);
+        assert_eq!(
+            cell.consume_tick(TfIndex::M1, &late, 60),
+            ConsumeOutcome::DiscardLate
+        );
     }
 
     #[test]

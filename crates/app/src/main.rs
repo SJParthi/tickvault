@@ -6263,6 +6263,14 @@ fn spawn_engine_b_aggregator(
                             .increment(u64::from(stats.late_count));
                         heartbeat_writer.record_late_ticks(u64::from(stats.late_count));
                     }
+                    // Option B: a 1-bucket-late tick re-folded its OWN minute's
+                    // high/low/close and was re-emitted via on_seal (UPSERT
+                    // replaced the candle row). Observable, not a silent merge.
+                    if stats.amended_count > 0 {
+                        metrics::counter!("tv_aggregator_amended_ticks_total")
+                            .increment(u64::from(stats.amended_count));
+                        heartbeat_writer.record_amended_ticks(u64::from(stats.amended_count));
+                    }
                     if !stats.instrument_found {
                         agg_clone.pre_populate(std::iter::once((
                             tick.security_id,
