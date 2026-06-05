@@ -157,11 +157,15 @@ fn is_window_exempt(
 
 /// Returns `true` if the LTP is a valid tradeable price.
 ///
-/// Invalid: NaN, Infinity, zero, or negative values.
-/// O(1) — 1 `is_finite()` + 1 comparison.
+/// Invalid: NaN, Infinity, zero, negative, or absurdly-large values. The upper
+/// bound (`MAX_PLAUSIBLE_LTP` = ₹10 crore, ~500× the priciest real NSE
+/// instrument) rejects an absurd-but-FINITE garbage price (e.g. `f32::MAX` from
+/// a mangled frame) BEFORE it can poison a candle's high/low or a `ticks` row.
+/// It can never reject a genuine price, so no real tick is ever missed.
+/// O(1) — 1 `is_finite()` + 2 comparisons.
 #[inline(always)]
 fn is_valid_ltp(ltp: f32) -> bool {
-    ltp.is_finite() && ltp > 0.0
+    ltp.is_finite() && ltp > 0.0 && ltp <= tickvault_common::constants::MAX_PLAUSIBLE_LTP
 }
 
 /// Returns `true` if the tick has valid price AND timestamp.
@@ -501,7 +505,7 @@ impl TickDedupRing {
         );
         let size = 1_usize << power;
         Self {
-            slots: vec![(u64::MAX, i64::MIN); size].into_boxed_slice(),
+            slots: vec![u64::MAX; size].into_boxed_slice(),
             mask: size.wrapping_sub(1),
         }
     }
@@ -4128,7 +4132,24 @@ mod tests {
     fn test_is_valid_ltp_positive_price() {
         assert!(is_valid_ltp(24500.0));
         assert!(is_valid_ltp(0.01));
-        assert!(is_valid_ltp(f32::MAX));
+        // Real NSE prices (incl. the priciest instruments) are well under the
+        // ceiling and must always pass — never miss a genuine tick.
+        assert!(is_valid_ltp(150_000.0)); // MRF-class stock
+        assert!(is_valid_ltp(80_000.0)); // SENSEX-class index
+        assert!(is_valid_ltp(tickvault_common::constants::MAX_PLAUSIBLE_LTP)); // exactly at the ceiling = valid (inclusive)
+    }
+
+    #[test]
+    fn test_is_valid_ltp_rejects_absurd_but_finite_price() {
+        // The security-agent HIGH: f32::MAX is finite & > 0 but is garbage from
+        // a mangled frame. It MUST be rejected so it can never poison a candle
+        // high/low or a ticks row.
+        assert!(!is_valid_ltp(f32::MAX));
+        // Just above the ceiling is rejected.
+        assert!(!is_valid_ltp(
+            tickvault_common::constants::MAX_PLAUSIBLE_LTP * 2.0
+        ));
+        assert!(!is_valid_ltp(1.0e30));
     }
 
     #[test]

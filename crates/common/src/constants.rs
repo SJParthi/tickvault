@@ -1811,6 +1811,21 @@ pub const DEPTH_BUFFER_CAPACITY: usize = 100_000;
 /// 946684800 = 2000-01-01T00:00:00Z — safely before any real market data.
 pub const MINIMUM_VALID_EXCHANGE_TIMESTAMP: u32 = 946_684_800;
 
+/// Maximum plausible last-traded price (INR). A tick whose LTP exceeds this is
+/// a corrupt / garbage frame — NOT a real observation — and is filtered as junk
+/// BEFORE it can poison a candle's high/low or a `ticks` row.
+///
+/// `is_valid_ltp` already rejects NaN / Inf / ≤ 0, but an absurd-but-FINITE
+/// value (e.g. `f32::MAX` ≈ 3.4e38 from a mangled frame) slips through and the
+/// O(1) candle fold sets `high = 3.4e38`, permanently corrupting that minute.
+///
+/// 100,000,000 (₹10 crore) is ~500× above the highest-priced real NSE
+/// instrument (MRF ≈ ₹1.5 lakh; SENSEX ≈ 80k; BANKNIFTY ≈ 52k), so it can NEVER
+/// reject a genuine price — it only catches corruption. Chosen as an absolute
+/// ceiling (not a per-instrument band) precisely so a legitimate large move is
+/// never dropped (prime directive: never miss a real tick).
+pub const MAX_PLAUSIBLE_LTP: f32 = 100_000_000.0;
+
 // ---------------------------------------------------------------------------
 // IST Timezone Offset (i64)
 // ---------------------------------------------------------------------------
@@ -1942,18 +1957,6 @@ pub const FRAME_CHANNEL_CAPACITY: usize = 131_072;
 /// False negatives (missed duplicates due to hash collision/eviction) are safe:
 /// QuestDB `DEDUP UPSERT KEYS(ts, security_id)` is the authoritative dedup layer.
 pub const DEDUP_RING_BUFFER_POWER: u32 = 16;
-
-/// Time window (nanoseconds) within which an identical
-/// `(security_id, exchange_timestamp, ltp)` tick is treated as a Dhan reconnect
-/// RE-SEND and dropped by the in-memory `TickDedupRing`. Beyond this window the
-/// same triple is treated as a genuine price RE-TOUCH (e.g. an index re-touching
-/// the same price minutes later while its LTT is stale) and is KEPT, so it
-/// reaches the ticks table + broadcast instead of being silently dropped.
-///
-/// 2 s comfortably covers a reconnect re-send burst (sub-second) while letting a
-/// real re-touch seconds/minutes later through. Dropping an identical
-/// `(price, LTT)` within 2 s is OHLC-safe — that price is already recorded.
-pub const DEDUP_RESEND_WINDOW_NANOS: i64 = 2_000_000_000;
 
 // ---------------------------------------------------------------------------
 // Indicator Engine — Ring Buffer & Warmup
