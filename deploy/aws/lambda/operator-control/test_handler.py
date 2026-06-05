@@ -142,6 +142,29 @@ class GetServesPublicHtml(unittest.TestCase):
         self.assertIn("replaceState", html)
         self.assertIn("tv_token", html)
 
+    def test_nuke_message_is_honest_not_optimistic(self) -> None:
+        # The nuke runs async for minutes; the UI must NOT claim "fresh
+        # containers + empty data" the instant it is dispatched (false-OK).
+        html = handler._console_html()
+        self.assertNotIn("fresh containers + empty data", html)
+        self.assertIn("wiping in background", html)
+        # It must poll the REAL outcome and surface both success + the hard-gate
+        # failure (volume still in-use → data NOT wiped).
+        self.assertIn("pollNuke", html)
+        self.assertIn("command-status", html)
+        self.assertIn("DOCKER-RESET-FAILED", html)
+        self.assertIn("NUKE FAILED", html)
+
+
+class ViewCommands(unittest.TestCase):
+    def test_dedup_key_query_url_encodes_the_equals(self) -> None:
+        # The dedup-key count query is the only view query with an `=` in its
+        # value; it MUST be encoded as %3D or QuestDB /exp returns empty and the
+        # "Dedup key columns" panel shows "?". Guard against regression.
+        dedup_cmd = next(c for c in handler._VIEW_COMMANDS if "DEDUP_KEYS=" in c)
+        self.assertIn("upsertKey%3Dtrue", dedup_cmd)
+        self.assertNotIn("upsertKey=true", dedup_cmd)
+
 
 class Latency(unittest.TestCase):
     def test_avg_ns(self) -> None:

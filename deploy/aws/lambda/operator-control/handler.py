@@ -207,7 +207,12 @@ _VIEW_COMMANDS = [
     'echo "C15M=$(curl -fsS "${Q}SELECT%20count()%20FROM%20candles_15m%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
     'echo "C60M=$(curl -fsS "${Q}SELECT%20count()%20FROM%20candles_60m%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
     'echo "C1D=$(curl -fsS "${Q}SELECT%20count()%20FROM%20candles_1d%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
-    'echo "DEDUP_KEYS=$(curl -fsS "${Q}SELECT%20count()%20FROM%20table_columns(%27ticks%27)%20WHERE%20upsertKey=true" 2>/dev/null | tail -1)"',
+    # NOTE: the `=` in `upsertKey=true` MUST be URL-encoded as %3D — it is the
+    # ONLY view query carrying a raw `=` inside the ?query= value, which the
+    # QuestDB /exp query-string parser mis-handled, returning empty so the
+    # dashboard "Dedup key columns" panel showed "?". Encoded form = a clean
+    # `count` of the 4 upsert-key columns (ts, security_id, segment, received_at).
+    'echo "DEDUP_KEYS=$(curl -fsS "${Q}SELECT%20count()%20FROM%20table_columns(%27ticks%27)%20WHERE%20upsertKey%3Dtrue" 2>/dev/null | tail -1)"',
     'echo "MAX_TPS=$(curl -fsS "${Q}SELECT%20max(c)%20FROM%20(SELECT%20count()%20c%20FROM%20ticks%20WHERE%20ts%20IN%20today()%20GROUP%20BY%20ts,security_id)" 2>/dev/null | tail -1)"',
     'echo "ERRORS_BEGIN"',
     "journalctl -u tickvault -p err -n 5 --no-pager 2>/dev/null | tail -5 || true",
@@ -481,6 +486,27 @@ def lambda_handler(event, _context):
         if action == "restart-questdb":
             cid = _ssm_shell(["cd /opt/tickvault/repo/deploy/docker && docker compose restart questdb"])
             return _resp(200, {"ok": True, "action": action, "command_id": cid})
+        if action == "command-status":
+            # READ-ONLY (not in _DESTRUCTIVE, allowed off-hours, no force). Lets
+            # the UI poll the REAL outcome of an async SSM command (e.g. the
+            # docker-reset nuke, which runs for minutes) instead of showing a
+            # fake "done" the instant it is dispatched. Returns the SSM status +
+            # a tail of stdout/stderr so the UI can tell "docker-reset-dispatched"
+            # (success) from "DOCKER-RESET-FAILED" (the hard-gate: volume still
+            # in-use → data NOT wiped) — no more false-OK.
+            cid = str(payload.get("command_id", "")).strip()
+            if not cid:
+                return _resp(400, {"error": "command-status requires command_id", "action": action})
+            try:
+                inv = _client("ssm").get_command_invocation(CommandId=cid, InstanceId=INSTANCE_ID)
+            except Exception:  # noqa: BLE001 — not registered yet / box offline
+                # Not an error: the command may not have propagated to SSM yet.
+                return _resp(200, {"ok": True, "action": action, "status": "Pending", "stdout_tail": ""})
+            out = (inv.get("StandardOutputContent", "") or "") + (inv.get("StandardErrorContent", "") or "")
+            return _resp(
+                200,
+                {"ok": True, "action": action, "status": inv.get("Status", ""), "stdout_tail": out[-1500:]},
+            )
         if action == "wipe-questdb":
             # DESTRUCTIVE: empties the market-data tables for a fresh start.
             # Requires force=true (even off-hours) + is in _DESTRUCTIVE
@@ -1016,10 +1042,24 @@ async function wipeData(){
 async function dockerReset(){
   if(prompt('⚠️ NUCLEAR RESET. This DELETES Docker containers + volumes + images and rebuilds from scratch — wiping ALL data INCLUDING the SEBI-retention audit tables. The box must be RUNNING. Type NUKE to confirm:')!=='NUKE'){ toast('cancelled'); return; }
   if(!confirm('Last check: every table is destroyed, including audit history. Continue?')){ toast('cancelled'); return; }
-  toast('💥 full Docker reset → rebuilding (may take a minute)…');
+  toast('💥 nuke dispatched → wiping in background (~2-3 min)…');
   const j=await call('docker-reset',{force:true});
-  if(j&&j.ok){ toast('✅ Docker reset started — fresh containers + empty data; app restarting'); setTimeout(loadOverview,8000); }
-  else { toast((j&&j.error)||'docker-reset failed — is the box running?'); } }
+  if(!(j&&j.ok)){ toast((j&&j.error)||'docker-reset failed — is the box running?'); return; }
+  if(!j.command_id){ toast('⚠️ nuke dispatched but no command id — re-check the ticks count in ~3 min'); setTimeout(loadOverview,8000); return; }
+  pollNuke(j.command_id,0); }
+// Poll the REAL nuke outcome instead of claiming success the instant it is
+// dispatched. The teardown (down -v + prune -af + image re-pull + up) runs for
+// minutes; we show the truthful result: complete, FAILED (hard gate — volume
+// still in-use, data NOT wiped), or still-running.
+async function pollNuke(cid,n){
+  if(n>40){ toast('⏳ nuke still running after 3+ min — re-check the ticks count manually'); setTimeout(loadOverview,4000); return; }
+  const s=await call('command-status',{command_id:cid}); const st=(s&&s.status)||'', out=(s&&s.stdout_tail)||'';
+  if(st==='Success'||st==='Failed'||st==='Cancelled'||st==='TimedOut'){
+    if(out.indexOf('DOCKER-RESET-FAILED')>=0){ toast('🔴 NUKE FAILED — QuestDB volume still in use, data NOT wiped. Check the box.'); }
+    else if(out.indexOf('docker-reset-dispatched')>=0){ toast('✅ nuke complete — empty DB; app restarting'); }
+    else { toast('⚠️ nuke finished ('+st+') — re-check the ticks count'); }
+    setTimeout(loadOverview,6000); return; }
+  setTimeout(()=>pollNuke(cid,n+1),5000); }
 
 function startAuto(){ stopAuto(); if($('auto').checked) timer=setInterval(()=>{ if(curTab==='overview') loadOverview(); },8000); }
 function stopAuto(){ if(timer){ clearInterval(timer); timer=null; } }
