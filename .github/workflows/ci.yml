@@ -239,8 +239,17 @@ jobs:
       - name: Run coverage (workspace, JSON output)
         run: |
           cargo llvm-cov clean --workspace
+          # DHAT zero-alloc tests (dhat_instrument_registry / dhat_token_handle /
+          # dhat_tick_persistence) assert EXACT heap-allocation counts. Under
+          # llvm-cov the coverage instrumentation ITSELF adds allocations, so
+          # those assertions fail (exit 101) and abort the whole coverage run —
+          # this is why "Coverage & Perf" was RED on main for days and never
+          # produced coverage.json. DHAT-vs-coverage is a known incompatibility.
+          # Skip the dhat_* tests HERE only; they STILL run + enforce zero-alloc
+          # in the normal Test (core)/Test (storage) jobs, so the guarantee holds.
           cargo llvm-cov --workspace --no-fail-fast --json \
-            --output-path target/llvm-cov/coverage.json
+            --output-path target/llvm-cov/coverage.json \
+            -- --skip dhat_
 
       - name: Enforce per-crate coverage thresholds
         run: bash scripts/coverage-gate.sh target/llvm-cov/coverage.json
