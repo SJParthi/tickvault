@@ -1655,6 +1655,22 @@ mod tests {
         EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO, IST_UTC_OFFSET_SECONDS_I64,
     };
 
+    /// Test isolation helper: delete every `ticks-*.bin` in the shared spill
+    /// dir so a recovery-COUNT test starts from a known-empty state. Used by the
+    /// exact-count recovery tests under the `spill_dir_test_lock`. Idempotent;
+    /// ignores a missing dir and per-file removal errors.
+    fn purge_stale_tick_spill_files(dir: &std::path::Path) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with("ticks-") && name.ends_with(".bin") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
     fn make_test_tick(security_id: u32, ltp: f32) -> ParsedTick {
         ParsedTick {
             security_id,
@@ -5617,6 +5633,11 @@ mod tests {
         // verify count returned matches ticks written.
         let real_spill_dir = std::path::Path::new(TICK_SPILL_DIR);
         std::fs::create_dir_all(real_spill_dir).unwrap();
+        // Test isolation (deterministic COUNT assertion): wipe any leftover
+        // `ticks-*.bin` first. `recover_stale_spill_files` scans the WHOLE
+        // shared spill dir, so a stray file from another test in the same
+        // nextest run would otherwise inflate the count (the 60-vs-50 CI flake).
+        purge_stale_tick_spill_files(real_spill_dir);
 
         let spill_file = real_spill_dir.join("ticks-20230101.bin");
         let tick_count = 50_usize;
@@ -5667,6 +5688,9 @@ mod tests {
         // Verify the active file is NOT drained but the older one IS.
         let real_spill_dir = std::path::Path::new(TICK_SPILL_DIR);
         std::fs::create_dir_all(real_spill_dir).unwrap();
+        // Test isolation (deterministic COUNT assertion) — see
+        // test_recover_stale_spill_file_on_startup.
+        purge_stale_tick_spill_files(real_spill_dir);
 
         let active_file = real_spill_dir.join("ticks-20260325.bin");
         let stale_file = real_spill_dir.join("ticks-20260201.bin");
