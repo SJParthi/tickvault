@@ -1943,18 +1943,6 @@ pub const FRAME_CHANNEL_CAPACITY: usize = 131_072;
 /// QuestDB `DEDUP UPSERT KEYS(ts, security_id)` is the authoritative dedup layer.
 pub const DEDUP_RING_BUFFER_POWER: u32 = 16;
 
-/// Time window (nanoseconds) within which an identical
-/// `(security_id, exchange_timestamp, ltp)` tick is treated as a Dhan reconnect
-/// RE-SEND and dropped by the in-memory `TickDedupRing`. Beyond this window the
-/// same triple is treated as a genuine price RE-TOUCH (e.g. an index re-touching
-/// the same price minutes later while its LTT is stale) and is KEPT, so it
-/// reaches the ticks table + broadcast instead of being silently dropped.
-///
-/// 2 s comfortably covers a reconnect re-send burst (sub-second) while letting a
-/// real re-touch seconds/minutes later through. Dropping an identical
-/// `(price, LTT)` within 2 s is OHLC-safe — that price is already recorded.
-pub const DEDUP_RESEND_WINDOW_NANOS: i64 = 2_000_000_000;
-
 // ---------------------------------------------------------------------------
 // Indicator Engine — Ring Buffer & Warmup
 // ---------------------------------------------------------------------------
