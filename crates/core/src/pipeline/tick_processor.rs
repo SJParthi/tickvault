@@ -462,9 +462,10 @@ fn utc_nanos_to_ist_epoch_secs(received_at_nanos: i64) -> u32 {
 /// This is safe: QuestDB `DEDUP UPSERT KEYS(ts, security_id)` is the
 /// authoritative server-side dedup. This ring buffer reduces redundant writes.
 struct TickDedupRing {
-    /// Pre-allocated slot array. Each slot holds a 64-bit fingerprint.
-    /// Initialized to `u64::MAX` (empty sentinel).
-    slots: Box<[u64]>,
+    /// Pre-allocated slot array. Each slot holds `(fingerprint, last_seen_nanos)`.
+    /// Initialized to `(u64::MAX, i64::MIN)` (empty sentinel — never matches a
+    /// real fingerprint, and `i64::MIN` makes the first sighting non-recent).
+    slots: Box<[(u64, i64)]>,
     /// Bitmask for fast modulo: `size - 1` where size is a power of two.
     mask: usize,
 }
@@ -482,25 +483,49 @@ impl TickDedupRing {
         );
         let size = 1_usize << power;
         Self {
-            slots: vec![u64::MAX; size].into_boxed_slice(),
+            slots: vec![(u64::MAX, i64::MIN); size].into_boxed_slice(),
             mask: size.wrapping_sub(1),
         }
     }
 
-    /// Returns `true` if this tick was recently seen (duplicate).
+    /// Returns `true` if this tick is a recent EXACT duplicate (a Dhan
+    /// reconnect re-send), i.e. the same `(security_id, exchange_timestamp, ltp)`
+    /// was seen within `DEDUP_RESEND_WINDOW_NANOS` of `now_nanos`.
+    ///
+    /// Time-windowed (2026-06-05): a genuine price RE-TOUCH that arrives beyond
+    /// the window — e.g. an index re-touching the same price minutes later with
+    /// a stale LTT — is NOT treated as a duplicate, so it survives to the ticks
+    /// table + broadcast instead of being silently dropped. Dropping an
+    /// identical `(price, LTT)` WITHIN the window is OHLC-safe (the price is
+    /// already recorded).
     ///
     /// # Performance
-    /// O(1) — one hash computation + one array lookup + one comparison.
+    /// O(1) — one hash + one array lookup + one compare + one store. Zero alloc.
     #[inline(always)]
-    fn is_duplicate(&mut self, security_id: u32, exchange_timestamp: u32, ltp: f32) -> bool {
+    fn is_duplicate(
+        &mut self,
+        security_id: u32,
+        exchange_timestamp: u32,
+        ltp: f32,
+        now_nanos: i64,
+    ) -> bool {
         let key = Self::fingerprint(security_id, exchange_timestamp, ltp);
         let idx = (key as usize) & self.mask;
-        if self.slots[idx] == key {
-            true
-        } else {
-            self.slots[idx] = key;
-            false
-        }
+        let (fp, last_seen) = self.slots[idx];
+        let recent = fp == key
+            && now_nanos.saturating_sub(last_seen)
+                <= tickvault_common::constants::DEDUP_RESEND_WINDOW_NANOS;
+        self.slots[idx] = (key, now_nanos);
+        recent
+    }
+
+    /// Test-only 3-arg shim: same `now_nanos` (0) for back-to-back calls, so a
+    /// repeated identical triple is within the resend window → duplicate. Lets
+    /// the existing dedup tests keep their (id, ts, ltp) semantics while the
+    /// time-windowing is covered by the dedicated window tests below.
+    #[cfg(test)]
+    fn is_dup_test(&mut self, security_id: u32, exchange_timestamp: u32, ltp: f32) -> bool {
+        self.is_duplicate(security_id, exchange_timestamp, ltp, 0)
     }
 
     /// Builds a 64-bit fingerprint from tick identity fields using FNV-1a mixing.
@@ -1100,6 +1125,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     tick.security_id,
                     tick.exchange_timestamp,
                     tick.last_traded_price,
+                    tick.received_at_nanos,
                 ) {
                     dedup_filtered = dedup_filtered.saturating_add(1);
                     m_dedup_filtered.increment(1);
@@ -1328,6 +1354,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                         tick.security_id,
                         tick.exchange_timestamp,
                         tick.last_traded_price,
+                        tick.received_at_nanos,
                     ) {
                         dedup_filtered = dedup_filtered.saturating_add(1);
                         m_dedup_filtered.increment(1);
@@ -2680,57 +2707,106 @@ mod tests {
     #[test]
     fn test_dedup_ring_new_tick_not_duplicate() {
         let mut ring = TickDedupRing::new(8); // 256 slots
-        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(!ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+    }
+
+    // --- time-windowed dedup (2026-06-05 hardening) ---
+
+    #[test]
+    fn test_dedup_ring_resend_within_window_is_duplicate() {
+        // Same (id, LTT, ltp) re-sent 1s later (< 2s window) = reconnect re-send → dropped.
+        let mut ring = TickDedupRing::new(8);
+        let ts = today_ist_epoch_at(10, 0, 0);
+        let t0 = 1_000_000_000_000_i64; // 1000s in nanos
+        assert!(!ring.is_duplicate(13, ts, 24500.0, t0));
+        assert!(ring.is_duplicate(13, ts, 24500.0, t0 + 1_000_000_000)); // +1s
+    }
+
+    #[test]
+    fn test_dedup_ring_retouch_beyond_window_is_kept() {
+        // Same (id, LTT, ltp) re-touched 67s later (> 2s window, stale LTT) =
+        // genuine re-touch → KEPT (the 2026-06-05 fix). This is the case the
+        // operator's 23440 surfaced: a re-touch with a stale LTT is no longer
+        // silently dropped from the ticks table.
+        let mut ring = TickDedupRing::new(8);
+        let ts = today_ist_epoch_at(10, 0, 0);
+        let t0 = 1_000_000_000_000_i64;
+        assert!(!ring.is_duplicate(13, ts, 24500.0, t0));
+        assert!(!ring.is_duplicate(13, ts, 24500.0, t0 + 67_000_000_000)); // +67s
+    }
+
+    #[test]
+    fn test_dedup_ring_at_exact_window_boundary_is_duplicate() {
+        // delta == window (2s) is inclusive → still a re-send.
+        let mut ring = TickDedupRing::new(8);
+        let ts = today_ist_epoch_at(10, 0, 0);
+        let t0 = 1_000_000_000_000_i64;
+        assert!(!ring.is_duplicate(13, ts, 24500.0, t0));
+        assert!(ring.is_duplicate(
+            13,
+            ts,
+            24500.0,
+            t0 + tickvault_common::constants::DEDUP_RESEND_WINDOW_NANOS
+        ));
+    }
+
+    #[test]
+    fn test_dedup_ring_different_ltp_never_duplicate_even_same_instant() {
+        // Distinct price in the same instant = distinct fingerprint → not a dup.
+        let mut ring = TickDedupRing::new(8);
+        let ts = today_ist_epoch_at(10, 0, 0);
+        assert!(!ring.is_duplicate(13, ts, 24500.0, 0));
+        assert!(!ring.is_duplicate(13, ts, 24501.0, 0));
     }
 
     #[test]
     fn test_dedup_ring_same_tick_is_duplicate() {
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
-        assert!(ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(!ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24500.0));
     }
 
     #[test]
     fn test_dedup_ring_third_identical_also_duplicate() {
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
-        assert!(ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
-        assert!(ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(!ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24500.0));
     }
 
     #[test]
     fn test_dedup_ring_different_security_not_duplicate() {
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
-        assert!(!ring.is_duplicate(14, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(!ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(!ring.is_dup_test(14, today_ist_epoch_at(10, 0, 0), 24500.0));
     }
 
     #[test]
     fn test_dedup_ring_different_timestamp_not_duplicate() {
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
-        assert!(!ring.is_duplicate(13, 1772073901, 24500.0));
+        assert!(!ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(!ring.is_dup_test(13, 1772073901, 24500.0));
     }
 
     #[test]
     fn test_dedup_ring_different_ltp_not_duplicate() {
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
-        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24501.0));
+        assert!(!ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(!ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24501.0));
     }
 
     #[test]
     fn test_dedup_ring_zero_security_id() {
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(0, 0, 0.0));
-        assert!(ring.is_duplicate(0, 0, 0.0));
+        assert!(!ring.is_dup_test(0, 0, 0.0));
+        assert!(ring.is_dup_test(0, 0, 0.0));
     }
 
     #[test]
     fn test_dedup_ring_max_values() {
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(u32::MAX, u32::MAX, f32::MAX));
-        assert!(ring.is_duplicate(u32::MAX, u32::MAX, f32::MAX));
+        assert!(!ring.is_dup_test(u32::MAX, u32::MAX, f32::MAX));
+        assert!(ring.is_dup_test(u32::MAX, u32::MAX, f32::MAX));
     }
 
     #[test]
@@ -2739,16 +2815,16 @@ mod tests {
         // will eventually evict earlier ones, allowing re-insertion.
         let mut ring = TickDedupRing::new(8); // 256 slots
         // Insert first tick
-        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0));
+        assert!(!ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24500.0));
         // Fill buffer with other entries to force eviction
         for i in 1..=512 {
-            ring.is_duplicate(i + 100, today_ist_epoch_at(10, 0, 0), 24500.0 + (i as f32));
+            ring.is_dup_test(i + 100, today_ist_epoch_at(10, 0, 0), 24500.0 + (i as f32));
         }
         // Original entry may have been evicted — should no longer be duplicate
         // (This tests that the ring buffer has finite memory and old entries are lost)
         // Note: this is probabilistic based on hash distribution.
         // We don't assert the result — just verify it doesn't panic.
-        let _ = ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 24500.0);
+        let _ = ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 24500.0);
     }
 
     #[test]
@@ -2757,13 +2833,13 @@ mod tests {
         // Alternating security IDs should not confuse the dedup
         for round in 0..3 {
             let ts = today_ist_epoch_at(10, 0, 0) + round;
-            assert!(!ring.is_duplicate(13, ts, 24500.0));
-            assert!(!ring.is_duplicate(14, ts, 24500.0));
-            assert!(!ring.is_duplicate(15, ts, 24500.0));
+            assert!(!ring.is_dup_test(13, ts, 24500.0));
+            assert!(!ring.is_dup_test(14, ts, 24500.0));
+            assert!(!ring.is_dup_test(15, ts, 24500.0));
             // Duplicates within same round
-            assert!(ring.is_duplicate(13, ts, 24500.0));
-            assert!(ring.is_duplicate(14, ts, 24500.0));
-            assert!(ring.is_duplicate(15, ts, 24500.0));
+            assert!(ring.is_dup_test(13, ts, 24500.0));
+            assert!(ring.is_dup_test(14, ts, 24500.0));
+            assert!(ring.is_dup_test(15, ts, 24500.0));
         }
     }
 
@@ -3909,17 +3985,17 @@ mod tests {
         // NaN != NaN in IEEE 754, but to_bits() gives consistent bits.
         // Two NaN ticks with same sec+ts should be detected as duplicate.
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), f32::NAN));
-        assert!(ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), f32::NAN));
+        assert!(!ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), f32::NAN));
+        assert!(ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), f32::NAN));
     }
 
     #[test]
     fn test_dedup_ring_neg_zero_vs_pos_zero() {
         // -0.0 and +0.0 have different bit patterns in IEEE 754.
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), 0.0));
+        assert!(!ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), 0.0));
         // -0.0 has a different bit pattern → should NOT be a duplicate
-        assert!(!ring.is_duplicate(13, today_ist_epoch_at(10, 0, 0), -0.0_f32));
+        assert!(!ring.is_dup_test(13, today_ist_epoch_at(10, 0, 0), -0.0_f32));
     }
 
     #[test]
@@ -3927,12 +4003,12 @@ mod tests {
         let mut ring = TickDedupRing::new(16); // 65536 slots
         // Insert many unique entries
         for i in 0..1000 {
-            assert!(!ring.is_duplicate(i, today_ist_epoch_at(10, 0, 0), 24500.0));
+            assert!(!ring.is_dup_test(i, today_ist_epoch_at(10, 0, 0), 24500.0));
         }
         // Re-insert all — most should still be duplicates (65536 >> 1000)
         let mut dups = 0;
         for i in 0..1000 {
-            if ring.is_duplicate(i, today_ist_epoch_at(10, 0, 0), 24500.0) {
+            if ring.is_dup_test(i, today_ist_epoch_at(10, 0, 0), 24500.0) {
                 dups += 1;
             }
         }
