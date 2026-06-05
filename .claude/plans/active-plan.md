@@ -81,3 +81,18 @@ summary. A new `"running on-demand NOW"` info log marks forced runs so they are
 distinguishable from the scheduled 15:31 run in the logs. No new metric/table
 needed — honest scope: this is cold-path operator tooling, not a hot path, so
 no O(1) / zero-tick-loss claims apply.
+
+## Per-Item Guarantee Matrix (cross-reference)
+
+This plan and every item in it are bound by the 15-row 100% guarantee matrix
+and the 7-row resilience demand matrix — see
+`.claude/rules/project/per-wave-guarantee-matrix.md`. All 15 + 7 rows apply to
+every item in this plan.
+
+**Honest envelope (per `wave-4-shared-preamble.md` §8):** any "100%" wording
+here means "100% inside the tested envelope, with ratcheted regression
+coverage" — the envelope being the 8 pure-decision unit tests + the 16 existing
+cross-verify tests + the design-first wall gate. This change is cold-path
+operator tooling and carries NO O(1) / zero-tick-loss / hot-path guarantee,
+because it does not touch the hot path; asserting otherwise would be the
+hallucination the operator forbids.
