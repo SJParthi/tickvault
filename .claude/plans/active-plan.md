@@ -65,6 +65,8 @@ None — test isolation only. CI "Test (storage)" stops flaking.
 Bound by the 15-row 100% guarantee matrix + 7-row resilience matrix — see
 `.claude/rules/project/per-wave-guarantee-matrix.md`.
 
-**Honest envelope:** test-only flake fix making a recovery-COUNT assertion
-deterministic regardless of nextest parallel ordering. No production logic
-change; the zero-tick-loss spill→recover behaviour is unchanged.
+**Honest envelope:** "100% inside the tested envelope, with ratcheted regression
+coverage" = the 8 deterministic `test_recover_*` tests. This is a test-only flake
+fix making a recovery-COUNT assertion deterministic regardless of nextest parallel
+ordering. No production logic change; the zero-tick-loss spill→recover behaviour is
+unchanged.
