@@ -1,90 +1,102 @@
-# Implementation Plan: Pre-market prev-day fetch — verify + see
+# Implementation Plan: Partition-retention coverage fix (storage cost runaway)
 
 **Status:** APPROVED
 **Date:** 2026-06-05
-**Approved by:** Parthiban (chose option A — "Verify + see existing fetch")
-**Crate(s) touched:** `app`
+**Approved by:** Parthiban ("proceed with everything fix everything … approved")
+**Crate(s) touched:** `storage`
+
+## Context (verified, no illusion)
+
+The partition manager's retention sweep (`detach_old_partitions`) iterates two
+hard-coded lists. Verified against the code:
+- `HOUR_PARTITIONED_TABLES` names **deleted** tables (greeks/depth/movers/option_chain — modules gone).
+- `DAY_PARTITIONED_TABLES` = `["candles_1s"]` only.
+- The **live growing** `PARTITION BY DAY` tables — the 10 `candles_*_shadow`, plus
+  `instrument_fetch_audit`, `instrument_lifecycle_audit`, `option_chain_minute_snapshot`,
+  `prev_day_ohlcv`, `cross_verify_1m_audit` — are in **neither list**, so their old
+  partitions are **never swept** → unbounded active-table growth.
+- `instrument_lifecycle` is `PARTITION BY DAY` but is the **never-delete SEBI
+  point-in-time** table — it MUST be excluded from sweeping.
+
+**Honest boundary (stated, not hidden):** `detach_old_partitions` uses
+`ALTER TABLE … DETACH PARTITION` — it moves old partitions to a local `detached/`
+dir (SEBI-safe, no DROP). There is **no S3 archiver module** in the codebase, so
+detach alone does **not** free EBS bytes — it bounds the *active* table and is the
+prerequisite for archival. Actually freeing EBS (S3 upload + local cleanup of
+detached partitions) is a SEPARATE piece that needs AWS provisioning; this PR does
+**not** claim to free EBS, only to fix the stale-coverage bug + prevent its return.
 
 ## Plan Items
 
-- [x] Item 1 — Pure coverage-verification helpers in the `app` crate
-  - Files: `crates/app/src/prev_day_ohlcv_boot.rs`
-  - Tests: `coverage_tests::*` (9 tests)
-- [x] Item 2 — Wire verify + CSV write after the boot fetch
-  - Files: `crates/app/src/main.rs`
-- [x] Item 3 — `make prev-day-show` + script (human-visible surface)
-  - Files: `Makefile`, `scripts/prev-day-show.sh`
-- [x] Item 4 — Operator runbook
-  - Files: `docs/runbooks/prev-day-ohlcv.md`
+- [x] Item 1 — Fix the two lists to the live reality; add a documented exempt set
+  - Files: `crates/storage/src/partition_manager.rs`
+  - Tests: `partition_manager::tests::test_*` (coverage + SEBI-exclusion)
+- [x] Item 2 — Anti-staleness meta-guard (can't-go-stale ratchet)
+  - Files: `crates/storage/tests/partition_retention_coverage_guard.rs`
+  - Tests: `every_storage_table_constant_has_a_retention_decision`
 
 ## Design
 
-The pre-market prev-day fetch already exists and is wired
-(`run_prev_day_ohlcv_fetch` → `prev_day_ohlcv` table, returning a
-`PrevDayFetchSummary { fetched, skipped, failed }`). The gap is **verification**
-(did we get yesterday's candle for enough of the universe?) and **visibility**
-(a human can't see it). Symmetric to the post-market cross-verify shipped in
-#1020, with zero changes to the fetch itself:
-
-1. Pure `evaluate_prev_day_coverage(expected, fetched) -> PrevDayCoverage`
-   (`Ok` ≥ 90% / `Degraded` / `Empty`) + `coverage_csv(...)` formatter +
-   `write_prev_day_coverage_csv(...)` FS wrapper. All unit-tested.
-2. `main.rs` captures `expected = subscription_targets.len()` before the fetch,
-   then after it: writes the coverage CSV and logs `info!`/`warn!`/`error!` per
-   outcome (degraded/empty route to Telegram via the ERROR/WARN sinks).
-3. `make prev-day-show` → `scripts/prev-day-show.sh`: prints the latest
-   `data/prev-day/*.csv` or an honest "not run yet + where else to look".
-   Runbook documents all surfaces.
+1. `HOUR_PARTITIONED_TABLES = ["ticks"]` (the only live HOUR table).
+2. `DAY_PARTITIONED_TABLES` = the 10 `candles_*_shadow` + `instrument_fetch_audit`
+   + `instrument_lifecycle_audit` + `option_chain_minute_snapshot` + `prev_day_ohlcv`
+   + `cross_verify_1m_audit`.
+3. `RETENTION_EXEMPT_TABLES = ["instrument_lifecycle"]` with a doc comment citing
+   the SEBI never-delete rule (daily-universe §5/§25). Make the three lists `pub`
+   so the meta-guard test can read them.
+4. Meta-guard: scan `crates/storage/src/*.rs` for table-name constants
+   (`const …TABLE… : &str = "x"`) and assert every one is in
+   `HOUR ∪ DAY ∪ EXEMPT`. New audit tables (which all follow that constant
+   pattern) are then **automatically** required to declare a retention decision —
+   the list can never silently go stale again.
 
 ## Edge Cases
 
-- **No JWT on a dev box** → the existing fetch skips and returns a zero summary;
-  coverage = `Empty`; the CSV records `empty`; `prev-day-show` says so. No fake data.
-- **Exactly 90% coverage** → `Ok` (inclusive boundary) — pinned by a test.
-- **Zero subscription targets** → `Empty` (guards divide-by-zero; pinned by a test).
-- **FS write failure** (read-only `data/`) → `warn!`, fetch result still logged;
-  boot never blocks.
+- A table listed but not yet created → `DETACH` query returns not-found → already
+  handled (logged `warn`, loop continues). No crash.
+- `instrument_lifecycle` accidentally added to a sweep list → a dedicated test
+  fails the build (SEBI guard).
+- A future `*_audit` table added without a retention decision → the meta-guard
+  fails the build.
+- Shadow tables generated (no single constant) → covered explicitly in the DAY list
+  + pinned by a unit test naming all 10.
 
 ## Failure Modes
 
-- Wrong coverage math → boundary tests (full=100/ok, 90/ok, 89/degraded, 0/empty,
-  expected=0/empty).
-- `error!`/`warn!` here carry NO known code prefix, so the tag-guard needs no
-  `code=` field; not a flush/persist/drain phrase, so the level meta-guard is satisfied.
-- The fetch's own behaviour is unchanged (we only read its returned summary).
+- Wrong table name in a list → `DETACH` no-ops harmlessly (warn). Not data loss.
+- Over-sweep (detaching a never-delete table) → prevented by the EXEMPT set + SEBI test.
+- The meta-guard itself going stale → it derives the expected set by *scanning source*,
+  so it tracks reality, not a hand-maintained copy.
 
 ## Test Plan
 
-- `cargo test -p tickvault-app prev_day_ohlcv_boot` → 25 green (9 new + 16 existing).
-- `bash scripts/prev-day-show.sh` → prints the honest "no report yet" message (verified).
-- `cargo fmt --check`; design-first wall self-check (impl crate `app` + this APPROVED plan referencing it); pub-fn-test guard satisfied (tests named to convention).
+- `cargo test -p tickvault-storage partition_manager` → list-coverage + SEBI-exclusion tests green.
+- `cargo test -p tickvault-storage --test partition_retention_coverage_guard` → meta-guard green.
+- `cargo fmt --check`; design-first wall (impl crate `storage` + this APPROVED plan referencing it).
 
 ## Rollback
 
-Self-contained. Revert the commit: delete the `make` target +
-`scripts/prev-day-show.sh` + runbook, and remove the verify/CSV block from
-`main.rs` (the pure helpers + tests can stay harmlessly). No schema, no data, no
-hot-path impact.
+Single-file logic change + one test file. Revert the commit to restore the prior
+lists. No schema change, no data migration, no runtime behaviour beyond which
+tables the existing detach cycle visits.
 
 ## Observability
 
-A new `PROOF: prev-day OHLCV coverage OK` info line on success; `coverage
-DEGRADED`/`EMPTY` warn/error → Telegram on a thin/empty fetch (false-OK guard,
-audit Rule 11). The per-day coverage CSV (`data/prev-day/`) is the human
-surface; the `prev_day_ohlcv` QuestDB table holds the actual candles. No new
-metric/table — cold-path operator tooling.
+The existing `detach_old_partitions` already logs `info!(table, detached=count)`
+per swept table — now those logs will actually cover the live tables. No new
+metric/table. Cold-path maintenance task; no hot-path / O(1) involvement.
 
 ## Per-Item Guarantee Matrix (cross-reference)
 
 This plan and every item in it are bound by the 15-row 100% guarantee matrix and
 the 7-row resilience demand matrix — see
-`.claude/rules/project/per-wave-guarantee-matrix.md`. All 15 + 7 rows apply to
-every item in this plan.
+`.claude/rules/project/per-wave-guarantee-matrix.md`. All 15 + 7 rows apply.
 
-**Honest envelope (per `wave-4-shared-preamble.md` §8):** any "100%" wording
-here means "100% inside the tested envelope, with ratcheted regression
-coverage" — the envelope being the 9 new pure-function unit tests + the 16
-existing prev-day tests. This change is cold-path operator tooling + a
-completeness check; it carries NO O(1) / zero-tick-loss / hot-path guarantee
-because it does not touch the hot path. Asserting otherwise would be the
-hallucination the operator forbids.
+**Honest envelope (per `wave-4-shared-preamble.md` §8):** any "100%" wording here
+means "100% inside the tested envelope, with ratcheted regression coverage" — the
+envelope being the list-coverage unit tests + the source-scanning meta-guard. This
+is a cold-path storage-retention fix; it carries NO O(1) / zero-tick-loss /
+hot-path guarantee, and it does NOT by itself free EBS (the S3-archival of
+detached partitions is a separate, AWS-dependent piece, flagged honestly). No
+hallucination: stating it "fixes the cost" outright would be false — it fixes the
+stale-coverage bug + prevents regression.
