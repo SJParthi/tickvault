@@ -1501,6 +1501,25 @@ rules:
       Operator runs --dry-run-universe to inspect each extractor's
       contribution.
 
+  # -----------------------------------------------------------------------
+  # NTM Sub-PR #10a (§31): niftyindices constituent source degraded
+  # -----------------------------------------------------------------------
+
+  - name: ntm-constituency-01-source-degraded-escalate
+    match:
+      code: NTM-CONSTITUENCY-01
+    action: escalate
+    runbook_path: .claude/rules/project/ntm-constituency-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      NTM-CONSTITUENCY-01 = the niftyindices constituent source failed
+      (fetch / parse / >0.5% dangling). Severity::Critical. By operator
+      policy this DEGRADES (trade the indices + F&O-underlyings core
+      universe) rather than halting, but the operator MUST be told that
+      today runs without the ~500 cash-only NTM constituents. No safe
+      auto-action — escalate.
+
 
   # -----------------------------------------------------------------------
   # Day OHLC tracker for IDX_I (post 2026-05-26 — pre-open buffer removed)
