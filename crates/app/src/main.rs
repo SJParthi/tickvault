@@ -3825,6 +3825,20 @@ async fn main() -> Result<()> {
                                 top.first().map(|(_, _, gap)| *gap).unwrap_or(0)
                             })
                             .unwrap_or(0);
+                    // §31 universe-completeness — read the live universe the
+                    // boot stashed (same source as the post-market cross-check
+                    // above). None (no universe at 09:16) → (0, 0) → both
+                    // sub-checks fail loudly, which is correct.
+                    let (index_values, ntm_constituents) =
+                        tickvault_app::prev_day_ohlcv_boot::stashed_universe()
+                            .map(|u| {
+                                use tickvault_core::instrument::daily_universe::InstrumentRole;
+                                (
+                                    u.count_by_role(InstrumentRole::Index),
+                                    u.index_constituent_count(),
+                                )
+                            })
+                            .unwrap_or((0, 0));
                     let inputs = MarketOpenSelfTestInputs {
                         main_feed_active: main_active,
                         order_update_active: oms,
@@ -3832,6 +3846,8 @@ async fn main() -> Result<()> {
                         last_tick_age_secs: worst_gap_secs,
                         questdb_connected: questdb_ok,
                         token_expiry_headroom_secs: token_headroom_secs,
+                        index_values_subscribed: index_values,
+                        ntm_constituents_subscribed: ntm_constituents,
                     };
                     let started = std::time::Instant::now();
                     let outcome = evaluate_self_test(&inputs);
@@ -3845,6 +3861,8 @@ async fn main() -> Result<()> {
                         order_update = oms,
                         questdb_connected = questdb_ok,
                         token_expiry_headroom_secs = token_headroom_secs,
+                        index_values,
+                        ntm_constituents,
                         "PROOF: market-open self-test fired @ 09:16:00 IST"
                     );
 

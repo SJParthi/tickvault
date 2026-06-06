@@ -68,14 +68,25 @@ pub struct MarketOpenSelfTestInputs {
     /// Seconds remaining until the JWT auth token expires.
     /// Less than 4h (14_400s) is a critical failure.
     pub token_expiry_headroom_secs: u64,
+    /// Number of index VALUES (IDX_I role) currently in the live
+    /// subscription. Expected 33 under §31 (32 NSE allowlist incl.
+    /// NIFTY TOTAL MKT + 1 BSE SENSEX). Below
+    /// `INDEX_VALUES_SUBSCRIBED_FLOOR` = the index universe collapsed.
+    pub index_values_subscribed: usize,
+    /// Number of NIFTY Total Market constituent stocks currently in the
+    /// live subscription (the `is_index_constituent` count, including
+    /// stocks that are ALSO F&O underlyings). Expected ~748 under §31.
+    /// Below `NTM_CONSTITUENTS_SUBSCRIBED_FLOOR` = the constituent layer
+    /// broke or degraded.
+    pub ntm_constituents_subscribed: usize,
 }
 
 /// Tri-state outcome of one self-test evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarketOpenSelfTestOutcome {
-    /// All seven sub-checks green. Severity::Info.
+    /// All eight sub-checks green. Severity::Info.
     Passed {
-        /// Always 7 in the current schema; carried for forward
+        /// Always 8 in the current schema; carried for forward
         /// compatibility if the SCOPE ever adds checks.
         checks_passed: usize,
     },
@@ -120,7 +131,26 @@ impl MarketOpenSelfTestOutcome {
 /// 2026-05-26: dropped from 8 → 6 after the depth-20 + depth-200 sub-checks
 /// were removed (their pools are permanently retired per AWS-lifecycle
 /// PR #4 + operator-charter §I).
-pub const TOTAL_SUB_CHECKS: usize = 6;
+/// 2026-06-06: raised 6 → 8 — added the two universe-completeness checks
+/// (`index_universe_complete`, `ntm_universe_complete`) so the 09:16 IST
+/// health snapshot confirms the §31 live universe (33 index values + ~748
+/// NTM constituent stocks) is whole, not just that the feed is alive.
+pub const TOTAL_SUB_CHECKS: usize = 8;
+
+/// Minimum number of index VALUES expected in the live subscription
+/// before `index_universe_complete` fails (Degraded). The §31 allowlist
+/// is 33 (32 NSE incl. NIFTY TOTAL MKT + 1 BSE SENSEX); up to 3 legit
+/// per-day absences are tolerated (the exact missing index is already
+/// named by the boot `allowlist_misses` telemetry). Below this floor the
+/// index universe has collapsed, not merely drifted.
+pub const INDEX_VALUES_SUBSCRIBED_FLOOR: usize = 30;
+
+/// Minimum number of NIFTY Total Market constituent stocks expected in
+/// the live subscription before `ntm_universe_complete` fails (Degraded).
+/// NTM is ~748; this floor tolerates routine constituent churn / a
+/// partial load. Below it the constituent layer broke or fully degraded
+/// (the latter also pages `NTM-CONSTITUENCY-01` at boot).
+pub const NTM_CONSTITUENTS_SUBSCRIBED_FLOOR: usize = 600;
 
 /// Token-expiry headroom threshold below which the self-test fires
 /// `Critical`. 4 hours = 14_400 seconds. Matches the existing
@@ -147,7 +177,7 @@ pub const CRITICAL_CHECK_NAMES: &[&str] = &[
 /// (acceptable — fires once per trading day).
 #[must_use]
 pub fn evaluate_self_test(inputs: &MarketOpenSelfTestInputs) -> MarketOpenSelfTestOutcome {
-    // Run all seven checks; collect names of the failed ones. Static
+    // Run all eight checks; collect names of the failed ones. Static
     // strings only — never include user-controllable data.
     let mut failed: Vec<&'static str> = Vec::new();
 
@@ -168,6 +198,14 @@ pub fn evaluate_self_test(inputs: &MarketOpenSelfTestInputs) -> MarketOpenSelfTe
     }
     if inputs.token_expiry_headroom_secs < TOKEN_EXPIRY_HEADROOM_CRITICAL_SECS {
         failed.push("token_expiry_headroom");
+    }
+    // §31 universe-completeness — non-critical (the feed still trades the
+    // indices + F&O underlyings even with a partial constituent set).
+    if inputs.index_values_subscribed < INDEX_VALUES_SUBSCRIBED_FLOOR {
+        failed.push("index_universe_complete");
+    }
+    if inputs.ntm_constituents_subscribed < NTM_CONSTITUENTS_SUBSCRIBED_FLOOR {
+        failed.push("ntm_universe_complete");
     }
 
     let checks_failed = failed.len();
@@ -209,18 +247,87 @@ mod tests {
             last_tick_age_secs: 10,
             questdb_connected: true,
             token_expiry_headroom_secs: 5 * 3600,
+            index_values_subscribed: 33,
+            ntm_constituents_subscribed: 748,
         }
     }
 
     #[test]
-    fn test_self_test_passes_when_all_six_checks_green() {
+    fn test_self_test_passes_when_all_eight_checks_green() {
         let outcome = evaluate_self_test(&green_inputs());
         assert_eq!(
             outcome,
-            MarketOpenSelfTestOutcome::Passed { checks_passed: 6 }
+            MarketOpenSelfTestOutcome::Passed { checks_passed: 8 }
         );
         assert_eq!(outcome.error_code(), ErrorCode::Selftest01Passed);
         assert_eq!(outcome.outcome_str(), "passed");
+    }
+
+    #[test]
+    fn test_self_test_passes_when_universe_complete() {
+        // Universe exactly at the §31 expectation passes.
+        let mut inputs = green_inputs();
+        inputs.index_values_subscribed = 33;
+        inputs.ntm_constituents_subscribed = 748;
+        assert_eq!(
+            evaluate_self_test(&inputs),
+            MarketOpenSelfTestOutcome::Passed { checks_passed: 8 }
+        );
+    }
+
+    #[test]
+    fn test_self_test_degraded_when_index_universe_below_floor() {
+        let mut inputs = green_inputs();
+        inputs.index_values_subscribed = INDEX_VALUES_SUBSCRIBED_FLOOR - 1;
+        match evaluate_self_test(&inputs) {
+            MarketOpenSelfTestOutcome::Degraded { failed, .. } => {
+                assert!(failed.contains(&"index_universe_complete"));
+            }
+            other => panic!("expected Degraded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_self_test_degraded_when_ntm_universe_below_floor() {
+        let mut inputs = green_inputs();
+        inputs.ntm_constituents_subscribed = NTM_CONSTITUENTS_SUBSCRIBED_FLOOR - 1;
+        match evaluate_self_test(&inputs) {
+            MarketOpenSelfTestOutcome::Degraded { failed, .. } => {
+                assert!(failed.contains(&"ntm_universe_complete"));
+            }
+            other => panic!("expected Degraded, got {other:?}"),
+        }
+    }
+
+    /// Both universe checks failing (no critical check) stays Degraded —
+    /// the feed still trades indices + F&O, so an incomplete universe must
+    /// NOT escalate to Critical.
+    #[test]
+    fn test_self_test_universe_checks_are_not_critical() {
+        let mut inputs = green_inputs();
+        inputs.index_values_subscribed = 0;
+        inputs.ntm_constituents_subscribed = 0;
+        match evaluate_self_test(&inputs) {
+            MarketOpenSelfTestOutcome::Degraded { failed, .. } => {
+                assert!(failed.contains(&"index_universe_complete"));
+                assert!(failed.contains(&"ntm_universe_complete"));
+            }
+            other => panic!("expected Degraded (not Critical), got {other:?}"),
+        }
+        // Neither universe check may be in the critical-escalation set.
+        assert!(!CRITICAL_CHECK_NAMES.contains(&"index_universe_complete"));
+        assert!(!CRITICAL_CHECK_NAMES.contains(&"ntm_universe_complete"));
+    }
+
+    /// A single legitimately-delisted index (32 ≥ 30 floor) must NOT page.
+    #[test]
+    fn test_self_test_tolerates_one_delisted_index() {
+        let mut inputs = green_inputs();
+        inputs.index_values_subscribed = 32;
+        assert_eq!(
+            evaluate_self_test(&inputs),
+            MarketOpenSelfTestOutcome::Passed { checks_passed: 8 }
+        );
     }
 
     #[test]
@@ -272,7 +379,7 @@ mod tests {
             } => {
                 assert!(failed.contains(&"pipeline_active"));
                 assert_eq!(checks_failed, 1);
-                assert_eq!(checks_passed, 5);
+                assert_eq!(checks_passed, 7);
             }
             other => panic!("expected Degraded, got {other:?}"),
         }
@@ -319,10 +426,12 @@ mod tests {
     /// without flipping a test red.
     #[test]
     fn test_self_test_constants_pinned() {
-        assert_eq!(TOTAL_SUB_CHECKS, 6);
+        assert_eq!(TOTAL_SUB_CHECKS, 8);
         assert_eq!(TOKEN_EXPIRY_HEADROOM_CRITICAL_SECS, 14_400);
         assert_eq!(RECENT_TICK_DEGRADED_THRESHOLD_SECS, 60);
         assert_eq!(CRITICAL_CHECK_NAMES.len(), 3);
+        assert_eq!(INDEX_VALUES_SUBSCRIBED_FLOOR, 30);
+        assert_eq!(NTM_CONSTITUENTS_SUBSCRIBED_FLOOR, 600);
     }
 
     /// Regression guard for 2026-05-26: ensures the depth-20 / depth-200
@@ -350,7 +459,7 @@ mod tests {
     #[test]
     fn test_outcome_str_is_stable() {
         assert_eq!(
-            MarketOpenSelfTestOutcome::Passed { checks_passed: 6 }.outcome_str(),
+            MarketOpenSelfTestOutcome::Passed { checks_passed: 8 }.outcome_str(),
             "passed"
         );
         assert_eq!(

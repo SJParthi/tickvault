@@ -1,93 +1,94 @@
-# Implementation Plan: NTM subscription PROOF harness (F1) + secid-46→443 comment reconcile + market-open self-test (F2)
+# Implementation Plan: F2 — market-open self-test asserts the live universe is complete (33 indices + NTM stocks)
 
 **Status:** VERIFIED
 **Date:** 2026-06-06
-**Approved by:** Parthiban — "do both dude okay?" (run F1 live-proof + write the F1+F2 plan) +
-"clearly tell me what is the security id for ntm" / live brutex master shows NTM index secid = 443.
-**Crate(s) touched:** `core` (F1: `crates/core/examples/ntm_subscription_proof.rs`; Item 3:
-2 stale comments in `crates/core/src/instrument/index_extractor.rs`; F2 FUTURE: a market-open
-self-test sub-check in `crates/core/src/instrument/`).
+**Approved by:** Parthiban — "except brutex plan implement everything else dude okay?" (F1 + #1046
+merged; implement F2 now; brutex is out of scope / different repo).
+**Crate(s) touched:** `core` (`crates/core/src/instrument/market_open_self_test.rs` — 2 new
+sub-checks + tests) and `app` (`crates/app/src/main.rs` — populate the 2 new inputs from the stashed
+universe). **No new ErrorCode** — reuses SELFTEST-01 (pass) / SELFTEST-02 (fail), so no rule-file /
+cross-ref / runbook churn.
 
 ## Context
 
-Operator asked: are the **33 index values** (32 NSE allowlist incl. NIFTY TOTAL MKT + 1 BSE SENSEX)
-AND the **~748 NIFTY Total Market constituent stocks** actually fetched / resolved / subscribed? The
-§31 chain is merged (#1034–#1045) + `daily_universe_fetcher` is default-on. Open box was **live
-runtime proof**. F1 closes it as far as the sandbox allows; F2 makes it self-policing. Separately the
-operator's live master shows the NTM index secid is **443**, not the **46** that two tickvault
-COMMENTS claim (46 was the Dhan web-chart IDX-segment value). tickvault reads the secid DYNAMICALLY
-(match by SYMBOL_NAME "NIFTY TOTAL MKT"), so runtime is already correct — only the comments are
-stale. Item 3 reconciles them so no future reader is misled.
+The §31 NTM chain is merged (live subscription = 33 index values + ~748 NTM constituent stocks) and
+F1 proved the build path (#1046). The remaining guard is a FOREVER self-check: every trading day at
+09:16 IST the existing market-open self-test must also confirm the **live universe is complete** —
+the 33 index values and the ~748 NTM constituents are actually in the subscription — so a silent
+regression (niftyindices filename change, a dropped batch, an allowlist drift) pages the operator
+instead of going unnoticed. This turns the daily SELFTEST-01 "Passed" ping into positive proof the
+universe is whole, and routes any shortfall to the existing SELFTEST-02 Degraded page.
 
 ## Design
 
-- **F1 (this PR):** `crates/core/examples/ntm_subscription_proof.rs` runs the REAL pipeline —
-  `parse_constituents` → `IndexConstituencyMap` → `resolve_constituents` — against the operator's
-  REAL `ind_niftytotalmarket_list.csv`. HONEST ENVELOPE: true network end-to-end needs egress + a
-  token; sandbox egress = 403 + QuestDB offline, so synthetic Dhan security_ids over the REAL ISINs
-  (clearly labelled) prove the JOIN matches every real ISIN. Real ids come from Dhan's master at boot.
-- **Item 3 (this PR):** edit the two `secid 46` comments in `index_extractor.rs` to state the secid is
-  READ DYNAMICALLY from the live master (operator's live master = 443; 46 was the Dhan-chart IDX
-  view). No logic change — tickvault never used 46 as a value.
-- **F2 (FUTURE PR):** a pure-function market-open self-test sub-check asserting the live
-  `subscription_targets` contains the 33 index values + the NTM constituent set (count ≥ floor),
-  emitting an existing-style typed-code Telegram on shortfall. Pure logic + wiring + unit tests.
+- Add 2 fields to `MarketOpenSelfTestInputs`: `index_values_subscribed: usize`,
+  `ntm_constituents_subscribed: usize`.
+- Add 2 floor consts:
+  - `INDEX_VALUES_SUBSCRIBED_FLOOR = 30` — the allowlist is 33 (32 NSE incl. NIFTY TOTAL MKT + 1 BSE
+    SENSEX); ≤3 legit per-day absences are tolerated (the exact missing index is already named by the
+    boot `allowlist_misses` telemetry). Below 30 = the index universe collapsed.
+  - `NTM_CONSTITUENTS_SUBSCRIBED_FLOOR = 600` — NTM is ~748; tolerate churn / partial; below 600 =
+    the constituent layer broke or degraded.
+- Add 2 sub-checks in `evaluate_self_test`, both **non-critical** (Degraded class — the feed still
+  trades indices + F&O even with a partial constituent set; not added to `CRITICAL_CHECK_NAMES`):
+  `index_universe_complete`, `ntm_universe_complete`.
+- Bump `TOTAL_SUB_CHECKS` 6 → 8; fix stale "seven"/"six" doc wording.
+- Wire in `main.rs` self-test closure: read `prev_day_ohlcv_boot::stashed_universe()` (already used at
+  main.rs:3633), compute `count_by_role(InstrumentRole::Index)` + `index_constituent_count()`,
+  populate the 2 new inputs (default 0 if no universe stashed → the checks fail loudly, which is
+  correct: no universe at 09:16 = broken). Add both counts to the existing `info!` PROOF line.
 
 ## Edge Cases
 
-- CSV path missing → harness `expect` fails loudly (proof tool, not prod).
-- niftyindices non-EQ series rows → parser drops them (measured: 7 dropped, 748 kept).
-- Renamed ticker (symbol changed, ISIN same) → still resolves via ISIN (STEP 6 asserts true).
-- Item 3: if the live master ever renames NTM, `allowlist_misses` boot telemetry already LOUD-warns —
-  the comment fix notes this so the secid is never assumed.
-- F2: NTM source degraded (`NTM-CONSTITUENCY-01`) → self-test treats core-universe as the floor.
+- No universe stashed (boot failed) → counts 0 → both checks fail → Degraded page (correct: universe
+  missing at market open is a real problem the operator must see).
+- NTM source degraded that day (`NTM-CONSTITUENCY-01` already paged at boot) → ntm count ~0 < floor →
+  ntm_universe_complete fails → the 09:16 health snapshot accurately reflects the degraded universe.
+  This is once-per-day (not Rule-4 polling spam) and is the authoritative current-state check.
+- Legit single-index delisting → index count 32 ≥ 30 floor → no false page.
+- All green → SELFTEST-01 Passed with checks_passed = 8 (positive daily proof the universe is whole).
 
 ## Failure Modes
 
-- F1 is read-only/offline — cannot affect boot, feed, or any table.
-- Item 3 is comments only — zero runtime effect.
-- F2 (future) ALERTS on shortfall, never halts the feed; market-hours gated + edge-triggered.
+- Pure evaluator — no I/O, no panic paths, zero alloc on the all-green path (existing contract kept).
+- Self-test is observe-only: it ALERTS, never halts the feed (existing design).
+- main.rs read of `stashed_universe()` is `Option` — `None` maps to 0 counts, never panics.
 
 ## Test Plan
 
-- F1: executed this session against the real file — **748 parsed (0 missing ISIN, 7 non-EQ dropped),
-  748/748 resolved (100%) via ISIN, rename-proof = true**. Chain unit tests green:
-  `constituent_resolver` 8, `daily_universe` 37, `index_extractor` 19, `index_constituency` 27 = 91.
-- Item 3: `cargo test -p tickvault-core --lib instrument::index_extractor` stays green (comments only;
-  `allowlist_has_exactly_32_nse_indices` unaffected).
-- F2 (future): unit tests on the pure sub-check. `cargo test -p tickvault-core`.
+- `cargo test -p tickvault-core --lib instrument::market_open_self_test` — new + existing unit tests:
+  pass-when-complete (checks_passed=8), degraded-when-index-below-floor,
+  degraded-when-ntm-below-floor, both-below-floor lists both names + stays Degraded (not Critical),
+  updated constants-pinned (TOTAL_SUB_CHECKS=8, 2 floors), green baseline updated.
+- `cargo test -p tickvault-app` — main.rs compiles; feature_flag_rollback_guard unaffected.
+- banned-pattern + pub-fn-test + plan-verify + plan-gate green.
 
 ## Rollback
 
-- F1: single `examples/` file — `git revert` removes the proof tool; nothing references it.
-- Item 3: comment-only — `git revert` restores prior text; no behavior either way.
-- F2 (future): self-test sub-check + wiring — `git revert` removes the check; feed untouched.
+- `git revert` removes the 2 fields + 2 checks + wiring; the self-test reverts to 6 checks; the feed
+  and universe build are untouched (self-test never gated them). Clean, single-PR revert.
 
 ## Observability
 
-- F1 prints measured counts to stdout (the proof artifact). No new prod telemetry.
-- Item 3: none (comments).
-- F2 (future): reuses the 7-layer pattern (typed `ErrorCode` + runbook + Telegram + counter).
+- Reuses SELFTEST-01 (Info/pass) + SELFTEST-02 (High/Degraded) — existing Telegram + `tv_self_test_total`
+  counter + the runbook in `wave-3-c-error-codes.md` (already documents SELFTEST-01/02). The two new
+  sub-check names appear in the SELFTEST-02 `failed` list. main.rs `info!` PROOF line adds
+  `index_values` + `ntm_constituents` counts.
 
 ## Plan Items
 
-- [x] Item 1 — F1 proof harness: real parse → map → resolve on the real NTM CSV + rename-proof
-  - Files: `crates/core/examples/ntm_subscription_proof.rs`
-  - Tests: resolve_constituents_by_isin_primary, isin_match_ignores_dhan_symbol_rename, parses_basic_two_row_csv
-- [x] Item 3 — reconcile the 2 stale `secid 46` comments → note dynamic read (live master = 443)
-  - Files: `crates/core/src/instrument/index_extractor.rs`
-  - Tests: allowlist_has_exactly_32_nse_indices
-
-> **FUTURE (F2, separate PR — NOT part of this PR's checklist):** a pure-function market-open
-> self-test sub-check asserting the live `subscription_targets` contains the 33 index values + the
-> NTM constituent set (count ≥ floor), emitting a typed-code Telegram on shortfall. Tracked here so
-> it is not lost; it ships under its own approved plan.
+- [x] Item 1 — `market_open_self_test.rs`: 2 fields + 2 floor consts + 2 sub-checks + TOTAL_SUB_CHECKS 6→8 + tests
+  - Files: `crates/core/src/instrument/market_open_self_test.rs`
+  - Tests: test_self_test_passes_when_universe_complete, test_self_test_degraded_when_index_universe_below_floor, test_self_test_degraded_when_ntm_universe_below_floor, test_self_test_universe_checks_are_not_critical
+- [x] Item 2 — wire the 2 inputs from the stashed universe in the 09:16 self-test closure
+  - Files: `crates/app/src/main.rs`
+  - Tests: test_self_test_constants_pinned (updated floors/count assertions)
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | Run F1 on the real NTM CSV | 748 parsed, 748/748 resolved via ISIN, rename-proof true |
-| 2 | Live master NTM secid = 443 | tickvault reads 443 dynamically (never used 46); comments now match |
-| 3 | niftyindices down at boot | core universe subscribed; `NTM-CONSTITUENCY-01` pages |
-| 4 | F2 (future): an index value missing from live subscription | self-test fails + Telegram, feed runs |
+| 1 | Healthy day: 33 indices + 748 NTM live | SELFTEST-01 Passed, checks_passed=8 (positive proof) |
+| 2 | NTM constituents missing (niftyindices broke) | SELFTEST-02 Degraded names `ntm_universe_complete`; feed runs |
+| 3 | Index universe collapsed (< 30) | SELFTEST-02 Degraded names `index_universe_complete` |
+| 4 | One index legitimately delisted (32 left) | no false page (≥ 30 floor) |
