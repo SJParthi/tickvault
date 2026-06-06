@@ -799,3 +799,49 @@ boot that produced the snapshot.
 - Fail-closed role parse — test `test_to_universe_fails_closed_on_unknown_role`
 - Background-reconcile failure logs `error!` with `code = INSTR-FETCH-01`,
   does NOT halt the live warm plan.
+
+---
+
+# §31 — NIFTY Total Market + index→stocks subscription (operator authorization 2026-06-06)
+
+**Operator decisions (2026-06-06, captured via AskUserQuestion — authoritative):**
+1. Add a **33rd index — NIFTY Total Market** — to the tracked set (today 31 NSE
+   allowlist + 1 BSE SENSEX = 32).
+2. Build an **index → its constituent stocks** mapping for every tracked index.
+3. **Subscribe ALL NIFTY Total Market constituent stocks (~750)** to the live feed
+   in **Quote mode**, on the **existing single main-feed WebSocket** (NO new WS).
+4. The other 32 indices: **map only**. The live SUBSCRIPTION set is the **NTM
+   union** (NTM is the broadest basket and already contains their members).
+5. **F&O stocks remain separately extractable** — each subscribed stock carries a
+   **role tag** (`fno_underlying` and/or `index_constituent`, with the owning
+   index list). "F&O only" is an **O(1) filter** over the same data — NOT a second
+   download and NOT a second subscription/WebSocket.
+6. **`MAX_DAILY_UNIVERSE_SIZE` is raised 400 → 1200** to fit ~1,000 live SIDs +
+   headroom. The `[100, 400]` envelope in §2/§9-L4 becomes `[100, 1200]`.
+7. Constituency source: **niftyindices.com** (rebuild the deleted downloader; reuse
+   the existing `INDEX_CONSTITUENCY_*` constants).
+
+**What is UNCHANGED (still locked):**
+- Exactly **2 WebSocket connections** (1 main-feed + 1 order-update). ~1,000 SIDs
+  fit on the one main-feed conn (Dhan cap 5,000/conn). The 2-WS lock holds.
+- **Quote mode** for every SID (§8).
+- **`(security_id, exchange_segment)` composite uniqueness** + DEDUP UPSERT KEYS
+  (I-P1-11). The NTM-union subscription is deduped against the F&O underlyings.
+- `instrument_lifecycle` is still NEVER deleted; the new `role` is an added column,
+  applied via `ALTER TABLE ADD COLUMN IF NOT EXISTS`.
+- Indicators/strategies boundary (§28) is untouched by this work.
+
+**Honest envelope (mandatory per §13 / operator-charter §F):**
+- RAM at ~1,000 SIDs × 21 TFs ≈ ~3.2 GB working set on the m8g.large 8 GiB host
+  (~3.9 GB headroom). This is a **MEASURED gate** in the persistence/validation
+  sub-PR — NOT promised blind. If the measurement exceeds budget, the scope or the
+  resident-TF set is revisited with the operator before go-live.
+- "~750 NTM stocks" is the expected count; the EXACT count comes from the live
+  niftyindices.com constituent file at build time (no hard-coded hallucinated number).
+
+**Implementation sequencing** lives in `.claude/plans/active-plan.md` (Sub-PR #1 =
+this authorization record; Sub-PRs #2–#7 = cap+allowlist, downloader, mapping +
+role tagging, subscription wiring, persistence + observability + RAM proof, e2e
+validation). Each is a separate serial PR with the 15+7 guarantee matrix and the
+adversarial 3-agent review. No code sub-PR may widen the subscription beyond the
+NTM union without re-confirming against this section.
