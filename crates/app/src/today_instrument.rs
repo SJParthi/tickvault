@@ -133,6 +133,7 @@ mod tests {
             expiry_date: "2025-12-25".to_string(),
             strike_price: 4000.5,
             option_type: "CE".to_string(),
+            isin: String::new(),
         }
     }
 

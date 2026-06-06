@@ -4904,6 +4904,7 @@ mod daily_universe_plan_tests {
                 expiry_date: String::new(),
                 strike_price: 0.0,
                 option_type: String::new(),
+                isin: String::new(),
             },
         }
     }
