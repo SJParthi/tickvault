@@ -245,6 +245,12 @@ where
         i64::try_from(universe.count_by_role(InstrumentRole::Index)).unwrap_or(i64::MAX);
     let underlying_count =
         i64::try_from(universe.count_by_role(InstrumentRole::FnoUnderlying)).unwrap_or(i64::MAX);
+    // §31 NTM observability — flag-derived counts (include the both-case).
+    // `fno_underlying_count` == `count_by_role(FnoUnderlying)` today (NTM fold
+    // empty pre-#10), but reads from the lossless flag for forward-correctness.
+    let fno_flag_count = i64::try_from(universe.fno_underlying_count()).unwrap_or(i64::MAX);
+    let index_constituent_count =
+        i64::try_from(universe.index_constituent_count()).unwrap_or(i64::MAX);
 
     // §10 ordering: reconcile FIRST (lifecycle UPSERT/UPDATE + lifecycle
     // audit), then the instrument_fetch_audit terminal-success row. A
@@ -290,6 +296,9 @@ where
     info!(
         attempts_used,
         universe_size,
+        index_count,
+        fno_underlying_count = fno_flag_count,
+        index_constituent_count,
         total_rows,
         upserted = reconcile.apply.upserted,
         expired = reconcile.apply.expired,

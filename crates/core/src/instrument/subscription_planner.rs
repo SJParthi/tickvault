@@ -802,10 +802,13 @@ pub fn build_subscription_plan_from_daily_universe(universe: &DailyUniverse) -> 
             skipped_unparsable_sid += 1;
             continue;
         };
-        // Role determines segment deterministically (rule §2).
+        // Role determines segment deterministically (rule §2). NTM
+        // constituents (§31) are NSE_EQ equities, same as F&O underlyings.
         let segment = match target.role {
             InstrumentRole::Index => ExchangeSegment::IdxI,
-            InstrumentRole::FnoUnderlying => ExchangeSegment::NseEquity,
+            InstrumentRole::FnoUnderlying | InstrumentRole::IndexConstituent => {
+                ExchangeSegment::NseEquity
+            }
         };
         if !seen_ids.insert((security_id, segment)) {
             continue;
@@ -814,18 +817,20 @@ pub fn build_subscription_plan_from_daily_universe(universe: &DailyUniverse) -> 
             InstrumentRole::Index => {
                 make_major_index_instrument(security_id, &target.csv_row.symbol_name, feed_mode)
             }
-            InstrumentRole::FnoUnderlying => SubscribedInstrument {
-                security_id,
-                exchange_segment: ExchangeSegment::NseEquity,
-                category: SubscriptionCategory::StockEquity,
-                display_label: target.csv_row.symbol_name.clone(),
-                underlying_symbol: target.csv_row.symbol_name.clone(),
-                instrument_kind: None,
-                expiry_date: None,
-                strike_price: None,
-                option_type: None,
-                feed_mode,
-            },
+            InstrumentRole::FnoUnderlying | InstrumentRole::IndexConstituent => {
+                SubscribedInstrument {
+                    security_id,
+                    exchange_segment: ExchangeSegment::NseEquity,
+                    category: SubscriptionCategory::StockEquity,
+                    display_label: target.csv_row.symbol_name.clone(),
+                    underlying_symbol: target.csv_row.symbol_name.clone(),
+                    instrument_kind: None,
+                    expiry_date: None,
+                    strike_price: None,
+                    option_type: None,
+                    feed_mode,
+                }
+            }
         };
         instruments.push(instrument);
     }
@@ -4890,6 +4895,8 @@ mod daily_universe_plan_tests {
     ) -> SubscriptionTarget {
         SubscriptionTarget {
             role,
+            is_fno_underlying: role == InstrumentRole::FnoUnderlying,
+            is_index_constituent: role == InstrumentRole::IndexConstituent,
             csv_row: CsvRow {
                 security_id: security_id.to_string(),
                 exch_id: String::new(),

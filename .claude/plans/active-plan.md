@@ -1,92 +1,133 @@
-# Implementation Plan: NTM Sub-PR #4 — constituent → Dhan security_id ISIN join
+# Implementation Plan: NTM Sub-PR #5 — union NTM constituents into the subscription + role flags
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-06-06
-**Approved by:** Parthiban — "if merged, go ahead" standing directive after #1037; builds to §31.1 (merged #1036).
-**Crate(s) touched:** `core` (`csv_parser.rs` +`isin`; new `constituent_resolver.rs`;
-`subscription_planner.rs` test literal), `app` (`today_instrument.rs` test literal).
-Feature-gated behind `daily_universe_fetcher`.
+**Approved by:** Parthiban — AskUserQuestion 2026-06-06: chose the **two-flags faithful** role
+model ("is_fno_underlying + is_index_constituent, both set if both") + standing "if merged, go
+ahead" after #1038.
+**Crate(s) touched:** `core` (`daily_universe.rs`, `instrument_snapshot.rs`),
+`app` (`daily_universe_boot.rs`, `prev_day_ohlcv_boot.rs`, `today_instrument.rs`,
+`lifecycle_reconcile_orchestrator.rs` — match/literal sites). Feature path is the existing
+`daily_universe_fetcher` build.
 
 ## Context
 
-Implements the §31.1 mapping contract: resolve niftyindices constituents (Sub-PR #3
-`IndexConstituencyMap`) → Dhan NSE-EQ `security_id` via the **ISIN-primary** join with
-**symbol fallback**, **fail-closed** on >0.5% dangling, **deduped** by
-`(security_id, exchange_segment)`. Role tagging + the union with F&O underlyings are
-deferred to Sub-PR #5 (subscription wiring), where the union actually happens.
+§31 item 3–5 + §31.1: the live subscription becomes the **NTM union** (indices + F&O
+underlyings + ~750 NTM constituent stocks), all Quote mode on the existing single main-feed WS
+(2-WS lock unchanged). Each subscribed stock carries a **role tag** so "F&O only" is an **O(1)
+filter**, not a second download/WebSocket (§31 item 5). A stock can be **both** an F&O underlying
+**and** an NTM constituent — §31.1(6) says `fno_underlying` **and/or** `index_constituent` — so
+the model is two independent flags, lossless.
 
-## Plan Items
-
-- [x] Item 1 — `CsvRow.isin` (the §31.1 PRIMARY join key)
-  - Files: `crates/core/src/instrument/csv_parser.rs` (+`isin` field, `ColumnIndices`,
-    `find("ISIN")`, `extract_row`)
-  - Tests: existing csv_parser suite recompiles + passes (20)
-- [x] Item 2 — `constituent_resolver.rs` — the ISIN-primary / symbol-fallback join
-  - Files: `crates/core/src/instrument/constituent_resolver.rs`, `mod.rs`
-  - O(1) `HashMap<ISIN,(sid,seg)>` + `HashMap<Symbol,(sid,seg)>` over NSE-EQ-EQUITY
-    rows; ISIN-primary, symbol fallback; fail-closed >0.5% dangling; dedup by
-    `(security_id, exchange_segment)`.
-  - Tests: ISIN-primary, rename-proof (ISIN match ignores symbol), symbol fallback,
-    non-NSE-EQ rejected, dedup, fail-closed >0.5%, tolerates <0.5%, empty-ok (9)
-- [x] Item 3 — fix CsvRow full-literal test sites for the new field
-  - Files: `subscription_planner.rs`, `today_instrument.rs`
+This PR wires the **assembly** (`build_daily_universe`) + the **warm-snapshot round-trip**. The
+real constituent data flows at boot in **Sub-PR #10** (orchestrator); until then the new
+`ntm_constituents` arg is passed **empty**, so live boot is byte-for-byte unchanged. The
+SID→CsvRow bridge from the resolver output is Sub-PR #10's job — this PR does NOT touch the
+merged `constituent_resolver.rs`.
 
 ## Design
 
-`CsvRow` gains `isin` (optional — `usize::MAX` sentinel when the Compact CSV lacks the
-column; `opt_str` sanitizes it). `resolve_constituents(&IndexConstituencyMap, &[CsvRow])`
-filters Dhan rows to canonical `NSE_EQ` + `EQUITY`, builds the two O(1) indexes, then
-for each unique constituent prefers the ISIN key and falls back to symbol. ISIN is the
-honest precise key (rename/series-proof); symbol-alone is never primary. The >0.5%
-fail-closed gate guards against a bad CSV silently mapping half the universe to nothing.
+- **`InstrumentRole`** gains `IndexConstituent` (cash-only NTM stock, NSE_EQ EQUITY) +
+  `as_str()` label `"index_constituent"`. Primary classes stay mutually exclusive:
+  `Index` (IDX_I value) · `FnoUnderlying` (equity that is an F&O underlying, with or without NTM
+  membership) · `IndexConstituent` (equity that is ONLY an NTM constituent).
+- **`SubscriptionTarget`** gains two `bool` flags — `is_fno_underlying`, `is_index_constituent` —
+  the lossless membership set. Invariants (asserted by tests): `Index` ⇒ both false;
+  `FnoUnderlying` ⇒ `is_fno_underlying == true`; `IndexConstituent` ⇒
+  `is_fno_underlying == false && is_index_constituent == true`.
+- **`build_daily_universe(indices, fno, fno_contracts, ntm_constituents: Vec<CsvRow>)`** — new
+  4th arg. Pass order unchanged (indices → F&O underlyings), then **Pass 4 — NTM fold**:
+  build `HashMap<(security_id, NseEquity), idx>` over the equity targets already pushed; for each
+  constituent row, if its `(sid, NSE_EQ)` matches an existing `FnoUnderlying` target → set that
+  target's `is_index_constituent = true` (the **both** case, no new row); else push a new
+  `IndexConstituent` target (`is_fno_underlying=false, is_index_constituent=true`). Intra-batch
+  dedup by `(sid, seg)` so a repeated constituent row doesn't double-push (I-P1-11).
+- **O(1) extract helpers** on `DailyUniverse`: `fno_underlying_count()` /
+  `index_constituent_count()` (filter on the flags) — the operator's "separately extractable"
+  guarantee, used by the boot observability gauges.
+- **Snapshot** (`instrument_snapshot.rs`): `SnapshotTarget` gains `is_fno_underlying` +
+  `is_index_constituent` (serde `#[serde(default)]` ⇒ old same-day snapshots deserialize with
+  `false`); `from_universe`/`to_universe` carry the flags; `parse_role` learns
+  `"index_constituent"`; fail-closed-on-unknown-role preserved.
 
 ## Edge Cases
 
-- Constituent symbol renamed but ISIN stable → still resolves (rename-proof test).
-- Constituent missing ISIN → symbol fallback (test).
-- Same ISIN on a derivative row → NOT matched (NSE-EQ-EQUITY filter; test).
-- Two constituents → same Dhan SID → deduped (test).
-- Empty constituency → `total=0`, no div-by-zero, OK (test).
+- Constituent SID == an F&O underlying SID (same NSE_EQ) → flag the existing target, **no dup**.
+- Constituent SID collides with an `Index` SID across segments (I-P1-11: sid alone not unique) →
+  keyed on `(sid, NSE_EQ)`, so the IDX_I index is never touched.
+- Duplicate constituent rows in the input Vec → deduped by `(sid, seg)`; first wins.
+- `ntm_constituents` empty (today, pre-#10) → universe identical to current; size still bounded.
+- Universe size with full NTM (~750+) → within `MAX_DAILY_UNIVERSE_SIZE = 1200` (Sub-PR #2).
+- Constituent row whose `security_id` doesn't parse / wrong segment → it's a pre-resolved NSE_EQ
+  row by contract; build still keys defensively on the string `(security_id, segment)` and
+  won't panic.
 
 ## Failure Modes
 
-- `> 0.5%` constituents unresolvable → `ConstituentResolveError::TooManyDangling`
-  (fail-closed; the orchestrator in Sub-PR #10 decides halt vs operator override).
-- Inputs are pre-sanitized by Sub-PR #3 (constituents) + `csv_parser` (`CsvRow` via
-  `sanitize_audit_string`), so the resolver handles only clean strings.
+- Universe out of `[100,1200]` after the fold → existing `BuildError::UniverseSizeOutOfBounds`
+  (boot HALTS, fail-closed) — unchanged path, now also covers the NTM expansion.
+- Old snapshot without flags → `#[serde(default)]` false; role still drives subscription, so the
+  warm plan is correct (F&O-only filter falls back to `role == FnoUnderlying` for old snapshots).
+  Documented; next cold build re-stamps flags.
+- Unknown role label in a snapshot → `to_universe` returns `None` (fail-closed) — unchanged.
 
 ## Test Plan
 
-- `cargo test -p tickvault-core --features daily_universe_fetcher -- constituent_resolver csv_parser index_constituency` → 56 passed, 0 failed (verified).
-- `cargo test -p tickvault-app --lib --no-run` → compiles (test literal fixed).
-- Full-workspace test-compile to catch CsvRow literal breakage everywhere (lesson from
-  #1037: `cargo check` skips test code — must compile tests).
+`cargo test -p tickvault-core` + workspace **test-compile** (the #1037 lesson — `cargo check`
+skips test code; literal/match sites live in test code too).
+
+- `daily_universe.rs`: fold-dedup (both-case sets both flags, no dup row); pure-constituent adds
+  `IndexConstituent`; `Index` ⇒ both flags false; `fno_underlying_count`/`index_constituent_count`
+  correct incl. the both-case; empty `ntm_constituents` ⇒ unchanged; envelope still bounds; role
+  invariants hold; `as_str`/`parse` round-trip for the new variant.
+- `instrument_snapshot.rs`: flags survive `from_universe`→`to_universe`; old snapshot (no flag
+  fields) deserializes with `false`; unknown-role still fails closed; new `"index_constituent"`
+  label round-trips.
+- Updated existing literal/match sites compile + pass (today_instrument, lifecycle_reconcile,
+  subscription_planner, prev_day_ohlcv_boot, daily_universe_boot).
 
 ## Rollback
 
-- Feature-gated + unwired (no production caller until Sub-PR #5/#10) → `git revert`
-  removes it with zero runtime impact. `CsvRow.isin` is an additive optional field.
+Pure additive on the assembly + snapshot model; live boot passes `ntm_constituents = vec![]`
+until Sub-PR #10, so reverting #5 (or passing empty forever) restores exact current behavior.
+`git revert` is clean — no migration, no persisted-schema dependency in this PR.
 
 ## Observability
 
-- Pure function returning typed `Result` + diagnostics (`unresolved_symbols`, `via_isin`).
-  Runtime telemetry (counters, Telegram on fail-closed reject) attaches at boot wiring
-  (Sub-PR #6/#10). N/A for this unwired join.
+`daily_universe_boot.rs` adds boot gauge `tv_universe_size{kind="index_constituent"}` and keeps
+`kind="index"`/`kind="fno_underlying"` (now flag-derived counts). No new error code (no new
+failure class — size violations reuse `INSTR-FETCH-04`). Telegram/audit additions land with the
+real data flow in Sub-PR #10.
 
-## Adversarial review
+## Plan Items
 
-Resolver is a PURE function over PRE-SANITIZED inputs (Sub-PR #3 + csv_parser both run
-`sanitize_audit_string`). Covered by 9 adversarial-style unit tests (fail-closed, dedup,
-rename-proof, fallback, non-NSE-EQ rejection, boundary fractions). A fresh 3-agent spawn
-was constrained by container disk pressure this session; flagged for the next pass.
+- [x] Item 1 — data model: `InstrumentRole::IndexConstituent` + `as_str`; `SubscriptionTarget`
+  two flags; role invariants
+  - Files: `crates/core/src/instrument/daily_universe.rs`
+  - Tests: `instrument_role_as_str_is_stable_wire_format`
+- [x] Item 2 — `build_daily_universe` 4th arg + Pass-4 NTM fold (dedup, both-case flag)
+  - Files: `crates/core/src/instrument/daily_universe.rs`
+  - Tests: `ntm_fold_both_case_sets_both_flags_no_dup`,
+    `ntm_fold_pure_constituent_adds_role`, `ntm_fold_empty_is_unchanged`,
+    `ntm_fold_dedups_repeat_rows`, `ntm_fold_does_not_touch_index_values_across_segments`,
+    `ntm_fold_drops_non_nse_eq_constituent_row_fail_closed`,
+    `fno_underlying_count_includes_both_case`, `index_constituent_count_includes_both_case`
+- [x] Item 3 — snapshot flags round-trip + `parse_role`
+  - Files: `crates/core/src/instrument/instrument_snapshot.rs`
+  - Tests: `test_snapshot_flags_round_trip`, `test_snapshot_old_format_defaults_flags_false`,
+    `test_parse_role_inverse_of_as_str`
+- [x] Item 4 — fix all match/literal sites + boot gauge
+  - Files: `crates/app/src/daily_universe_boot.rs`, `crates/app/src/prev_day_ohlcv_boot.rs`,
+    `crates/app/src/today_instrument.rs`, `crates/app/src/lifecycle_reconcile_orchestrator.rs`,
+    `crates/core/src/instrument/subscription_planner.rs`
+  - Tests: existing suites recompile + pass
 
-## Per-Item Guarantee Matrix
+## Scenarios
 
-| Demand | Sub-PR #4 |
-|---|---|
-| 100% testing | 9 resolver tests (incl. boundary 0.5% gate) + 20 parser + recompile |
-| O(1)/perf | O(1) ISIN + symbol HashMaps; per-constituent O(1) lookup; cold path |
-| security | inputs pre-sanitized; ISIN-primary (no wrong-security mapping); non-NSE-EQ filtered |
-| uniqueness/dedup | dedup by `(security_id, exchange_segment)` (I-P1-11) |
-| honest envelope | fail-closed >0.5% dangling; role tagging + union explicitly deferred to #5 |
-| no half-finished (Rule 14) | `resolve_constituents` is a real callable + fixture-tested; feature-gated like its siblings; Sub-PR #5/#10 call it |
+| # | Scenario | Expected |
+|---|----------|----------|
+| 1 | NTM stock that is also an F&O underlying | one target, role=FnoUnderlying, BOTH flags true |
+| 2 | NTM stock not in F&O | new target, role=IndexConstituent, only is_index_constituent |
+| 3 | empty ntm_constituents (today) | universe == current; live boot unchanged |
+| 4 | full NTM (~750) | size ≤ 1200; "F&O only" = is_fno_underlying (O(1)) |
+| 5 | old warm snapshot (no flags) | deserializes flags=false; role drives subscription |

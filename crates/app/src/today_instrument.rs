@@ -205,6 +205,8 @@ mod tests {
             subscription_targets: vec![
                 SubscriptionTarget {
                     role: InstrumentRole::Index,
+                    is_fno_underlying: false,
+                    is_index_constituent: false,
                     csv_row: CsvRow {
                         security_id: "13".to_string(),
                         exch_id: "NSE".to_string(),
@@ -216,6 +218,8 @@ mod tests {
                 },
                 SubscriptionTarget {
                     role: InstrumentRole::FnoUnderlying,
+                    is_fno_underlying: true,
+                    is_index_constituent: false,
                     csv_row: CsvRow {
                         security_id: "11536".to_string(),
                         exch_id: "NSE".to_string(),
@@ -253,6 +257,8 @@ mod tests {
         let universe = DailyUniverse {
             subscription_targets: vec![SubscriptionTarget {
                 role: InstrumentRole::Index,
+                is_fno_underlying: false,
+                is_index_constituent: false,
                 csv_row: CsvRow {
                     security_id: "13".to_string(),
                     segment: "IDX_I".to_string(),

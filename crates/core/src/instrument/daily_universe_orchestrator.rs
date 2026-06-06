@@ -159,7 +159,12 @@ pub fn build_universe_from_bytes(bytes: &[u8]) -> Result<DailyUniverse, Orchestr
 
     // Step 4: build the unified universe (envelope check on the SUBSCRIPTION
     // set per §2 + §22; fno_contracts are master-only and not bounded).
-    let universe = build_daily_universe(indices, fno, fno_contracts)?;
+    //
+    // NTM constituents (§31) are passed EMPTY here until Sub-PR #10 wires the
+    // niftyindices downloader → `constituent_resolver` → SID→CsvRow bridge into
+    // this orchestrator. Empty ⇒ the universe is byte-for-byte the pre-#5
+    // indices + F&O-underlyings set (live boot unchanged).
+    let universe = build_daily_universe(indices, fno, fno_contracts, Vec::new())?;
 
     Ok(universe)
 }
