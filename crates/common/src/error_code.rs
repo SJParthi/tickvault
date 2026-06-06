@@ -456,7 +456,7 @@ pub enum ErrorCode {
 
     /// INSTR-FETCH-04: Universe-size envelope violated. The built
     /// universe contained `< MIN_DAILY_UNIVERSE_SIZE (100)` OR
-    /// `> MAX_DAILY_UNIVERSE_SIZE (400)` instruments per Sub-PR #7's
+    /// `> MAX_DAILY_UNIVERSE_SIZE (1200)` instruments per Sub-PR #7's
     /// envelope check. Either an upstream extractor returned partial
     /// data (too small) or a regression let in extra rows (too large).
     /// Severity::Critical — boot HALTS.

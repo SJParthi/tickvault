@@ -1014,8 +1014,12 @@ pub const INSTRUMENT_FETCH_PER_ATTEMPT_TIMEOUT_SECS: u64 = 60;
 /// enforce; this PR declares the bound.
 pub const MIN_DAILY_UNIVERSE_SIZE: usize = 100;
 
-/// See `MIN_DAILY_UNIVERSE_SIZE`.
-pub const MAX_DAILY_UNIVERSE_SIZE: usize = 400;
+/// See `MIN_DAILY_UNIVERSE_SIZE`. Raised 400 → 1200 per rule file §31
+/// (operator authorization 2026-06-06) to fit the NIFTY Total Market
+/// stock expansion (~1,000 live SIDs + headroom). Still a boot-time
+/// validation bound only — not a pre-allocation (the aggregator is sized
+/// by the independent `AGGREGATOR_CAPACITY`).
+pub const MAX_DAILY_UNIVERSE_SIZE: usize = 1200;
 
 /// CSV download body size cap (per rule file §18 hardening contract).
 /// Sub-PR #3 will enforce via `reqwest` bounded read. Expected real-world
