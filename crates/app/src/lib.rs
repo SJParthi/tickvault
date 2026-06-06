@@ -61,6 +61,11 @@ pub mod metrics_catalog;
 // final Sub-PR #10 orchestrator.
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod instr_fetch_audit_writer;
+// §31 item 2 (NTM Map-B, 2026-06-06): boot population of the full
+// index→constituents mapping (all ~46 tracked indices). Map-only, decoupled,
+// degrade-safe — does NOT touch the live subscription. Feature-gated per §21.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod index_constituency_boot;
 // Boot-time read-back of yesterday's instrument_lifecycle rows — the
 // read-side primitive the daily reconciler I/O loop diffs against today's
 // CSV. Feature-gated per rule §21.
