@@ -1,81 +1,109 @@
-# Implementation Plan: CI-enforce the design-first wall
+# Implementation Plan: §28 indicator/strategy operator-boundary guard
 
 **Status:** APPROVED
-**Date:** 2026-06-05
-**Approved by:** Parthiban — chose "CI-enforce the plan wall".
-**Crate(s) touched:** none (CI workflow only: `.github/workflows/ci.yml`)
+**Date:** 2026-06-06
+**Approved by:** Parthiban — AskUserQuestion "implement the guard test" (2026-06-06).
+**Crate(s) touched:** none under `src/` — adds `crates/storage/tests/operator_boundary_indicator_strategy_guard.rs` (a test) + docs/plan files only. (Design-first wall does not trigger on `tests/`, but this plan exists for plan-enforcement + the per-wave guarantee matrix.)
 
 ## Context
 
-The design-first wall (`.claude/hooks/plan-gate.sh`) blocks an implementation
-push (`crates/*/src/**.rs`) that has no APPROVED plan referencing the changed
-crate. Today it runs ONLY in the local pre-push hooks
-(`.claude/hooks/pre-push-gate.sh` + `scripts/git-hooks/pre-push`), so a push
-that bypasses local hooks (`--no-verify`, a web edit, a fork) escapes it. This
-item runs the SAME hook as a GitHub CI gate on every PR.
+`.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md` §28 (operator
+boundary, 2026-05-27 verbatim "as of now don't even touch indicators and strategies
+area dude okay?") PROMISES a mechanical ratchet:
+
+> `crates/storage/tests/operator_boundary_indicator_strategy_guard.rs::test_indicator_engine_states_field_unchanged_since_2026_05_27`
+> (source-scan: SHA-256 the relevant lines of `engine.rs`; any modification fails the
+> build until the boundary is lifted)
+
+Deep-research agent verification (2026-06-06) confirmed the test FILE DOES NOT EXIST —
+the boundary is currently enforced only by human discipline, not mechanically. This
+item ships the missing ratchet.
 
 ## Plan Items
 
-- [x] Item 1 — Add a `design-first-wall` job to `ci.yml` (pull_request only)
-  - Files: `.github/workflows/ci.yml`
-  - Tests: `bash .claude/hooks/plan-gate.sh` already self-tested by
-    `.claude/hooks/plan-gate.selftest.sh` (11 cases); CI step re-runs the gate
+- [x] Item 1 — Add `crates/storage/tests/operator_boundary_indicator_strategy_guard.rs`
+  - Files: `crates/storage/tests/operator_boundary_indicator_strategy_guard.rs`
+  - Tests: `test_indicator_engine_states_field_unchanged_since_2026_05_27`,
+    `test_indicator_strategy_boundary_files_unchanged`,
+    `test_boundary_manifest_covers_every_src_file`
 
 ## Design
 
-1. New job `design-first-wall`, `if: github.event_name == 'pull_request'`,
-   `runs-on: ubuntu-latest`, mirrors the `commit-lint` job shape.
-2. `actions/checkout@v6` with `fetch-depth: 0` so the base commit is present.
-3. Run `bash .claude/hooks/plan-gate.sh "${{ github.workspace }}"` with
-   `PLAN_GATE_BASE=${{ github.event.pull_request.base.sha }}` — the hook's
-   documented env override (L6), giving the exact PR base for the
-   `${BASE}...HEAD` diff (no reliance on `origin/main` ref resolution).
-   `CLAUDE_PROJECT_DIR=${{ github.workspace }}`.
-4. Exit non-zero (gate's exit 2) fails the job → the PR check goes red.
+The boundary is "do not touch `crates/trading/src/indicator/` or
+`crates/trading/src/strategy/`". The strongest mechanical enforcement is a
+content-pin of EVERY `.rs` file under both directories. Any edit (even a comment)
+flips the pin → build fails → forces a conscious boundary-lift (re-bless + rule
+edit).
+
+- **Hash:** inline FNV-1a 64-bit (offset `0xcbf29ce484222325`, prime
+  `0x100000001b3`). Chosen over `sha2` because new workspace deps need operator
+  approval (CLAUDE.md), and FNV-1a is deterministic + version-stable for a
+  persisted pin (unlike `std::hash::DefaultHasher`). This is regression-evidence,
+  not adversarial crypto, so FNV-1a is sufficient.
+- **Manifest:** a `const BOUNDARY_FILES: &[(path, fnv1a64, byte_len, line_count)]`
+  baked from the current tree (computed 2026-06-06).
+- **Repo-root resolution:** `CARGO_MANIFEST_DIR` (`crates/storage`) → `parent().parent()`
+  — same pattern as `crates/core/tests/indices4only_scope_lock_guard.rs`.
+- **`test_indicator_engine_states_field_unchanged_since_2026_05_27`** (the §28-named
+  test): asserts `engine.rs` still contains the exact `states: Vec<IndicatorState>,`
+  field line AND its (fnv, len) matches the pin — satisfies the §28 "states field
+  unchanged" contract specifically.
+- **`test_indicator_strategy_boundary_files_unchanged`**: every manifest file matches
+  its pinned (fnv, len).
+- **`test_boundary_manifest_covers_every_src_file`**: the manifest is neither missing
+  a file that exists on disk nor referencing a file that was deleted (catches a NEW
+  file added to the frozen dirs, or a deletion).
 
 ## Edge Cases
 
-- **Docs/CI-only PR (incl. THIS one)** → no `crates/*/src/**.rs` change → gate
-  PASSES (so this PR is self-consistent; it does not block itself).
-- **`PLAN-EXEMPT:` commit** → gate honours it (≤1 impl file) → PASS.
-- **Plan archived before merge** → gate would BLOCK (no active plan). The
-  current Claude workflow commits plan + code together and archives only
-  AFTER merge, so the plan is present on the PR branch — compatible. Documented
-  so a future archive-before-merge flow knows to use `PLAN-EXEMPT:` or keep the
-  plan until merge.
+- **New `.rs` added to a frozen dir** → `test_boundary_manifest_covers_every_src_file`
+  fails (disk has a file the manifest doesn't) — boundary still enforced.
+- **A frozen file deleted** → same test fails (manifest references a missing file).
+- **Reformatting / comment-only edit** → fnv changes → fails. Intended: §28 is
+  "don't even touch".
+- **Line-ending/whitespace drift** → fnv + byte_len change → fails. Intended.
+- **Test run from a different CWD** → repo root is derived from `CARGO_MANIFEST_DIR`,
+  not CWD, so it is stable.
 
 ## Failure Modes
 
-- The job only READS git + runs the hook; it cannot mutate the repo. Worst case
-  is a false RED, recoverable by adding the plan or a `PLAN-EXEMPT:` line.
-- Not yet a REQUIRED check (branch protection is an operator UI setting) — the
-  job runs + reports; the operator marks it required to make it merge-blocking.
-  Stated honestly in the PR.
+- The test only READS files; it cannot mutate the repo. Worst case is a false RED
+  when the operator legitimately edits the frozen area — resolved by re-blessing the
+  manifest AND updating §28 (the intended "lift the boundary" ritual). The failure
+  message spells this out.
+- If `CARGO_MANIFEST_DIR` resolution ever breaks (repo restructure), the test fails
+  closed (missing files) rather than silently passing.
 
 ## Test Plan
 
-- `bash .claude/hooks/plan-gate.sh "$PWD"` locally (this PR = no impl src) → exit 0.
-- `PLAN_GATE_BASE=origin/main bash .claude/hooks/plan-gate.sh "$PWD"` → exit 0.
-- `bash .claude/hooks/plan-gate.selftest.sh` → 11/11 pass (gate logic unchanged).
-- YAML sanity: the job parses (no tab/indent errors).
+- `cargo test -p tickvault-storage --test operator_boundary_indicator_strategy_guard`
+  → all 3 tests green on the current (un-edited) tree.
+- Negative check (manual, not committed): touch a byte in `engine.rs` → test goes RED;
+  revert → GREEN. (Verified locally during implementation, not part of the committed
+  suite.)
+- `cargo build --workspace` stays green (test-only addition).
 
 ## Rollback
 
-Delete the `design-first-wall` job from `ci.yml`. No code/schema impact; the
-local pre-push hooks still enforce the wall.
+- Single test file + plan/docs. `git revert <sha>` removes the guard entirely; zero
+  runtime/production impact (it is a dev/test-time ratchet only).
 
 ## Observability
 
-The PR Checks tab gains a "Design-First Wall" check — green/red per PR. No new
-metric (CI-native signal).
+- This is a build-time ratchet, not a runtime path — no Prometheus/Telegram/audit
+  surface applies. Its "signal" is a failing `cargo test` / CI check, which is the
+  correct and only observability for a source-scan guard (mirrors
+  `indices4only_scope_lock_guard.rs`, `dedup_segment_meta_guard.rs`). N/A for the
+  7-layer runtime telemetry by design.
 
-## Per-Item Guarantee Matrix (cross-reference)
+## Per-Item Guarantee Matrix (per `.claude/rules/project/per-wave-guarantee-matrix.md`)
 
-Bound by the 15-row guarantee matrix + 7-row resilience matrix — see
-`.claude/rules/project/per-wave-guarantee-matrix.md`.
-
-**Honest envelope:** "100% inside the tested envelope, with ratcheted regression
-coverage" = the `plan-gate.selftest.sh` 11-case suite (the gate logic this CI
-job invokes). This adds a CI surface for an EXISTING, tested gate; it does not
-change the gate logic. It becomes merge-blocking only once the operator marks
-the check required in branch protection — stated, not assumed.
+| Demand | This item |
+|---|---|
+| 100% testing | 3 tests cover field-pin, all-file-pin, and add/delete drift |
+| 100% scenarios | edge cases above (add/delete/reformat/whitespace/CWD) each map to a test arm |
+| 100% code review | adversarial self-review of the guard logic before PR |
+| O(1)/perf | N/A — test-time only, not a hot path; no runtime allocation introduced |
+| zero-loss / WS / QuestDB | N/A — does not touch tick/WS/DB paths |
+| uniqueness/dedup | N/A — no storage key |
+| honest envelope | guard detects ANY content change to the 12 frozen files; it does NOT prevent edits, it FAILS THE BUILD on them (the §28 "until the boundary is lifted" mechanism) |
