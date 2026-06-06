@@ -462,6 +462,16 @@ pub enum ErrorCode {
     /// Severity::Critical — boot HALTS.
     InstrFetch04UniverseSizeOutOfBounds,
 
+    /// NTM-CONSTITUENCY-01: the NIFTY Total Market constituent source
+    /// (niftyindices.com) failed at boot — fetch error, malformed CSV, or
+    /// `> 0.5%` dangling constituents vs the Dhan master. Per operator
+    /// AskUserQuestion 2026-06-06 the policy is **degrade + alert**: boot
+    /// PROCEEDS on the indices + F&O-underlyings core universe (the Dhan CSV
+    /// path stays fail-closed §4) and the ~500 cash-only NTM constituents are
+    /// absent for the day. Severity::Critical — the operator is paged that
+    /// today runs without the full NTM union. NOT a boot halt.
+    NtmConstituency01SourceDegraded,
+
     // -----------------------------------------------------------------------
     // Operator directive 2026-06-02: post-market 1-minute cross-verification.
     // At 15:31 IST we compare every subscribed spot instrument's live
@@ -666,6 +676,7 @@ impl ErrorCode {
             Self::InstrFetch02SchemaValidationFailed => "INSTR-FETCH-02",
             Self::InstrFetch03DanglingReferences => "INSTR-FETCH-03",
             Self::InstrFetch04UniverseSizeOutOfBounds => "INSTR-FETCH-04",
+            Self::NtmConstituency01SourceDegraded => "NTM-CONSTITUENCY-01",
             // Operator 2026-06-02: post-market 1-minute cross-verification
             Self::CrossVerify1m01MismatchFound => "CROSS-VERIFY-1M-01",
             Self::CrossVerify1m02FetchDegraded => "CROSS-VERIFY-1M-02",
@@ -716,7 +727,8 @@ impl ErrorCode {
             | Self::InstrFetch01CsvHardFailed
             | Self::InstrFetch02SchemaValidationFailed
             | Self::InstrFetch03DanglingReferences
-            | Self::InstrFetch04UniverseSizeOutOfBounds => Severity::Critical,
+            | Self::InstrFetch04UniverseSizeOutOfBounds
+            | Self::NtmConstituency01SourceDegraded => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
             Self::Selftest01Passed
             | Self::Slo01Healthy
@@ -919,6 +931,10 @@ impl ErrorCode {
             | Self::InstrFetch04UniverseSizeOutOfBounds => {
                 ".claude/rules/project/daily-universe-instr-fetch-error-codes.md"
             }
+            // Sub-PR #10 of 2026-06-06 NTM turn-on (§31)
+            Self::NtmConstituency01SourceDegraded => {
+                ".claude/rules/project/ntm-constituency-error-codes.md"
+            }
             // Operator 2026-06-02: post-market 1-minute cross-verification
             Self::CrossVerify1m01MismatchFound | Self::CrossVerify1m02FetchDegraded => {
                 ".claude/rules/project/cross-verify-1m-error-codes.md"
@@ -1061,6 +1077,7 @@ impl ErrorCode {
             Self::InstrFetch02SchemaValidationFailed,
             Self::InstrFetch03DanglingReferences,
             Self::InstrFetch04UniverseSizeOutOfBounds,
+            Self::NtmConstituency01SourceDegraded,
             // Operator 2026-06-02: post-market 1-minute cross-verification
             Self::CrossVerify1m01MismatchFound,
             Self::CrossVerify1m02FetchDegraded,
@@ -1329,7 +1346,9 @@ mod tests {
         // DISK-WATCHER-01 (spill disk-health watcher respawned by supervisor).
         // 2026-06-03 (zero-tick-loss PR-8b — H2-lite): bumped 101 -> 102 for
         // AGGREGATOR-LAG-01 (candle aggregator broadcast Lagged — now loud).
-        assert_eq!(ErrorCode::all().len(), 102);
+        // 2026-06-06 (NTM Sub-PR #10a, §31): bumped 102 -> 103 for
+        // NTM-CONSTITUENCY-01 (niftyindices source degraded — core universe continues).
+        assert_eq!(ErrorCode::all().len(), 103);
     }
 
     #[test]
@@ -1384,7 +1403,9 @@ mod tests {
                 // Operator 2026-06-02: post-market 1-minute cross-verification
                 || s.starts_with("CROSS-VERIFY-1M-")
                 // zero-tick-loss PR-5 (G3): supervised disk-health watcher
-                || s.starts_with("DISK-WATCHER-");
+                || s.starts_with("DISK-WATCHER-")
+                // NTM Sub-PR #10a (§31): niftyindices constituent source degrade
+                || s.starts_with("NTM-CONSTITUENCY-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
