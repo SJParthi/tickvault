@@ -3218,12 +3218,14 @@ mod tests {
             indices_failed: 1,
             unique_stocks: 200,
             total_mappings: 350,
+            missing_isin: 4,
             build_timestamp: chrono::Utc::now().with_timezone(&ist),
         };
         assert_eq!(meta.indices_downloaded, 5);
         assert_eq!(meta.indices_failed, 1);
         assert_eq!(meta.unique_stocks, 200);
         assert_eq!(meta.total_mappings, 350);
+        assert_eq!(meta.missing_isin, 4);
         assert_eq!(
             meta.download_duration,
             std::time::Duration::from_millis(500)
