@@ -96,6 +96,11 @@ pub struct CsvRow {
     pub strike_price: f64,
     /// `OPTION_TYPE` — `CE` / `PE` / empty for non-options.
     pub option_type: String,
+    /// `ISIN` — the 12-char security identity (e.g. `INE002A01018`).
+    /// Empty when absent (Compact CSV). The §31.1 PRIMARY join key for
+    /// resolving niftyindices constituents → NSE-EQ `security_id`
+    /// (Sub-PR #4 `constituent_resolver`).
+    pub isin: String,
 }
 
 /// Errors that can occur during CSV parsing.
@@ -222,6 +227,7 @@ struct ColumnIndices {
     expiry_date: usize,
     strike_price: usize,
     option_type: usize,
+    isin: usize,
 }
 
 fn build_column_indices<R: std::io::Read>(
@@ -257,6 +263,8 @@ fn build_column_indices<R: std::io::Read>(
         expiry_date: find("SM_EXPIRY_DATE").unwrap_or(usize::MAX),
         strike_price: find("STRIKE_PRICE").unwrap_or(usize::MAX),
         option_type: find("OPTION_TYPE").unwrap_or(usize::MAX),
+        // §31.1 PRIMARY join key — OPTIONAL (absent on the Compact CSV).
+        isin: find("ISIN").unwrap_or(usize::MAX),
     })
 }
 
@@ -376,6 +384,7 @@ fn extract_row(record: &csv::StringRecord, idx: &ColumnIndices) -> Option<CsvRow
         expiry_date: opt_str(record, idx.expiry_date),
         strike_price: opt_f64(record, idx.strike_price),
         option_type: opt_str(record, idx.option_type),
+        isin: opt_str(record, idx.isin),
     })
 }
 
