@@ -81,7 +81,7 @@ Without typed codes, these failures would surface as ad-hoc error strings — op
 
 **Severity:** Critical.
 **Auto-triage:** No.
-**Trigger:** Sub-PR #7's `build_daily_universe()` returned `Err(BuildError::UniverseSizeOutOfBounds)`. Computed size is outside `[MIN_DAILY_UNIVERSE_SIZE = 100, MAX_DAILY_UNIVERSE_SIZE = 400]`.
+**Trigger:** Sub-PR #7's `build_daily_universe()` returned `Err(BuildError::UniverseSizeOutOfBounds)`. Computed size is outside `[MIN_DAILY_UNIVERSE_SIZE = 100, MAX_DAILY_UNIVERSE_SIZE = 1200]`.
 
 **Triage steps:**
 1. `mcp__tickvault-logs__tail_errors` — read `actual / min / max` diagnostic.

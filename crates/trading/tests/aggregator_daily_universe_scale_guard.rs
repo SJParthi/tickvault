@@ -20,15 +20,19 @@
 //! ## What this guard pins
 //!
 //! 1. `SEAL_BUFFER_CAPACITY` (200K) ≥ `MAX_DAILY_UNIVERSE_SIZE × TF_COUNT`
-//!    (400 × 21 = 8,400). Headroom factor ≈ 24×. This is the
+//!    (1200 × 21 = 25,200). Headroom factor ≈ 7.9×. This is the
 //!    boundary-burst budget for the seal ring per `aws-budget.md`
-//!    rule 6's memory map (the seal ring is 200K × 128 B = 25 MB).
+//!    rule 6's memory map (the seal ring is 200K × 144 B ≈ 28.8 MB).
+//!    The 200K buffer is design-locked (L-C1) and sized for the real
+//!    ~99K IST-midnight burst with 2× margin (see
+//!    `chaos_midnight_seal_burst.rs`); 7.9× over the 1200-SID worst
+//!    case is well above that adequacy floor.
 //!
 //! 2. `MultiTfAggregator::with_capacity(MAX_DAILY_UNIVERSE_SIZE)`
 //!    constructs without panic — the boot-time pre-sizing path used
 //!    by Sub-PR #10's orchestrator will be valid for the new scale.
 //!
-//! 3. `pre_populate` accepts 400 composite keys without collision per
+//! 3. `pre_populate` accepts 1200 composite keys without collision per
 //!    I-P1-11.
 //!
 //! 4. `force_seal_all` iterates all entries without panic — the
@@ -59,24 +63,24 @@ fn tf_count_pinned_at_21_for_daily_universe() {
     assert_eq!(TF_COUNT, 21);
 }
 
-/// MAX_DAILY_UNIVERSE_SIZE pinned at 400 by Sub-PR #2 + Sub-PR #7's
-/// envelope check.
+/// MAX_DAILY_UNIVERSE_SIZE pinned at 1200 by Sub-PR #2 (NTM expansion,
+/// rule §31) + Sub-PR #7's envelope check.
 #[test]
-fn max_daily_universe_size_pinned_at_400() {
-    assert_eq!(MAX_DAILY_UNIVERSE_SIZE, 400);
+fn max_daily_universe_size_pinned_at_1200() {
+    assert_eq!(MAX_DAILY_UNIVERSE_SIZE, 1200);
 }
 
 /// Worst-case minute-boundary seal burst:
-/// `MAX_DAILY_UNIVERSE_SIZE × TF_COUNT = 400 × 21 = 8,400` seals.
+/// `MAX_DAILY_UNIVERSE_SIZE × TF_COUNT = 1200 × 21 = 25,200` seals.
 ///
 /// (Practical burst is smaller — only the 1m TF + any larger TFs that
 /// happen to cross a boundary at the same minute. But the seal ring
 /// must absorb the worst case without backpressure on the hot path.)
 ///
-/// `SEAL_BUFFER_CAPACITY = 200_000` gives ~24× headroom over the
+/// `SEAL_BUFFER_CAPACITY = 200_000` gives ~7.9× headroom over the
 /// worst-case burst. Ratchet:
-/// - Bumping `MAX_DAILY_UNIVERSE_SIZE` beyond ~9,500 would invalidate
-///   the assumption — this test fails fast at that point.
+/// - Bumping `MAX_DAILY_UNIVERSE_SIZE` beyond ~1,900 would push headroom
+///   below the ≥5× floor — this test fails fast at that point.
 /// - Shrinking `SEAL_BUFFER_CAPACITY` below the burst would invalidate
 ///   the assumption — this test fails fast there too.
 #[test]
@@ -89,16 +93,20 @@ fn seal_buffer_capacity_absorbs_worst_case_daily_universe_burst() {
 }
 
 /// Headroom factor: how much spare capacity the seal ring has beyond
-/// the worst-case burst. Pinned at >= 20× so future scope expansion
-/// (e.g. more TFs, more SIDs) has growth room before requiring a
-/// rule-file edit.
+/// the worst-case burst. The pre-NTM 20× margin (a growth buffer "before
+/// requiring a rule-file edit") is now CONSUMED by the authorized §31
+/// rule-file edit (cap 400→1200). At the 1200 cap, headroom is ~7.9×,
+/// which is still well above the chaos-tested 2× IST-midnight-burst
+/// adequacy floor (`chaos_midnight_seal_burst.rs`). Floor lowered to ≥5×
+/// — a deliberate, documented consequence of the §31 expansion, NOT a
+/// silent weakening. The 200K buffer (L-C1 design lock) is preserved.
 #[test]
-fn seal_buffer_capacity_has_at_least_20x_headroom_over_burst() {
+fn seal_buffer_capacity_has_at_least_5x_headroom_over_burst() {
     let worst_case_burst = MAX_DAILY_UNIVERSE_SIZE * TF_COUNT;
     let headroom_factor = SEAL_BUFFER_CAPACITY / worst_case_burst;
     assert!(
-        headroom_factor >= 20,
-        "SEAL_BUFFER_CAPACITY headroom factor ({headroom_factor}×) below 20× safety margin"
+        headroom_factor >= 5,
+        "SEAL_BUFFER_CAPACITY headroom factor ({headroom_factor}×) below 5× safety margin"
     );
 }
 
@@ -112,15 +120,15 @@ fn aggregator_constructs_with_daily_universe_capacity() {
     assert_eq!(agg.len(), 0);
 }
 
-/// Pre-populating with 400 composite keys per I-P1-11 succeeds — every
-/// `(security_id, segment)` pair becomes a distinct papaya entry. The
-/// `_` in `count == _ as usize` isn't actually used; we just rely on
-/// the returned count matching the input length.
+/// Pre-populating with `MAX_DAILY_UNIVERSE_SIZE` (1200) composite keys per
+/// I-P1-11 succeeds — every `(security_id, segment)` pair becomes a distinct
+/// papaya entry. The `_` in `count == _ as usize` isn't actually used; we just
+/// rely on the returned count matching the input length.
 #[test]
-fn aggregator_pre_populates_400_composite_keys_without_collision() {
+fn aggregator_pre_populates_1200_composite_keys_without_collision() {
     let agg = MultiTfAggregator::with_capacity(MAX_DAILY_UNIVERSE_SIZE);
 
-    // Synthetic 400-instrument universe: mix of segments to stress
+    // Synthetic full-cap universe: mix of segments to stress
     // composite-key uniqueness. Use both NSE_EQ (segment_code=1) and
     // IDX_I (segment_code=0) per the §2 universe scope.
     let keys: Vec<(u32, u8)> = (0..MAX_DAILY_UNIVERSE_SIZE as u32)
@@ -135,7 +143,7 @@ fn aggregator_pre_populates_400_composite_keys_without_collision() {
     let inserted = agg.pre_populate(keys.iter().copied());
     assert_eq!(
         inserted, MAX_DAILY_UNIVERSE_SIZE,
-        "pre_populate should insert all 400 distinct composite keys"
+        "pre_populate should insert all 1200 distinct composite keys"
     );
     assert_eq!(agg.len(), MAX_DAILY_UNIVERSE_SIZE);
 }
@@ -158,11 +166,11 @@ fn aggregator_distinguishes_same_sid_across_segments_per_i_p1_11() {
     assert!(agg.get(27, 1).is_some(), "(27, NSE_EQ) entry must exist");
 }
 
-/// `force_seal_all` iterates every entry without panic at the 400-SID
+/// `force_seal_all` iterates every entry without panic at the 1200-SID
 /// scale. The callback counts entries; we assert the count matches the
 /// pre-populated size.
 #[test]
-fn force_seal_all_iterates_all_400_entries_without_panic() {
+fn force_seal_all_iterates_all_1200_entries_without_panic() {
     let agg = MultiTfAggregator::with_capacity(MAX_DAILY_UNIVERSE_SIZE);
     let keys: Vec<(u32, u8)> = (0..MAX_DAILY_UNIVERSE_SIZE as u32)
         .map(|i| (i, 1u8))

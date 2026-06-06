@@ -334,7 +334,7 @@ mod tests {
     /// A valid Detailed-CSV body that `build_universe_from_bytes` accepts
     /// (131 instruments: 100 NSE_EQ underlyings + 30 NSE indices + 1 BSE
     /// SENSEX + 100 FUTSTK derivatives). Mirrors the core orchestrator's
-    /// own end-to-end fixture so the universe clears the [100, 400]
+    /// own end-to-end fixture so the universe clears the [100, 1200]
     /// envelope.
     fn valid_csv() -> Vec<u8> {
         let mut s = String::from(

@@ -58,7 +58,7 @@ This product, starting from the date of this lock, opens exactly TWO WebSocket c
 
 **Total live WebSocket connections to Dhan: 2** (UNCHANGED from prior lock).
 
-**Universe size envelope (mechanical bound):** `MAX_DAILY_UNIVERSE_SIZE = 400`. Boot HALTS if computed universe is outside `[100, 400]`. Fits comfortably on 1 main-feed connection (Dhan cap = 5,000 SIDs/conn).
+**Universe size envelope (mechanical bound):** `MAX_DAILY_UNIVERSE_SIZE = 1200` (raised from 400 per §31, NTM expansion 2026-06-06). Boot HALTS if computed universe is outside `[100, 1200]`. Fits comfortably on 1 main-feed connection (Dhan cap = 5,000 SIDs/conn).
 
 **Subscription dispatch:** 250 SIDs sent in 3 JSON batches (Dhan cap = 100 SIDs/message), sequential with `SubscribeRxGuard` (PR #337) preserving subscription state across reconnects.
 
@@ -109,7 +109,7 @@ Per operator Quote 4: "for future or options it should be just marked as expired
 **Quote 5 (2026-05-29, applicable-F&O master — supersedes the §10-step-4 "indices + underlyings only" scope for the lifecycle table):**
 > "I asked you to pull ALL the FNO in instruments … only fno for our applicable fno instruments right dude … if yes go ahead"
 
-**MASTER vs SUBSCRIPTION (locked 2026-05-29):** `instrument_lifecycle` is the **full applicable-F&O master** — it stores, in addition to the indices + F&O underlying spots, **every applicable F&O contract**: the `FUTSTK`/`OPTSTK` rows whose `UNDERLYING_SECURITY_ID` resolves to one of our tracked NSE_EQ underlyings, plus the `FUTIDX`/`OPTIDX` rows for our tracked indices. Currency F&O (`FUTCUR`/`OPTCUR`), commodity F&O (`FUTCOM`/`OPTFUT`), and non-F&O equities NOT in our underlying set are EXCLUDED. These contract rows carry `lifecycle_state` transitions (`active` → `expired_contract`) and are NEVER deleted (SEBI §25 point-in-time). **This is the master/audit table ONLY — it does NOT change the WebSocket subscription**, which remains the 331-SID indices+spots set per §2 + the 2-WebSocket lock. The `MAX_DAILY_UNIVERSE_SIZE = 400` envelope in §2 bounds the *subscription* set, NOT the lifecycle master (which legitimately holds ~219K applicable-F&O rows).
+**MASTER vs SUBSCRIPTION (locked 2026-05-29):** `instrument_lifecycle` is the **full applicable-F&O master** — it stores, in addition to the indices + F&O underlying spots, **every applicable F&O contract**: the `FUTSTK`/`OPTSTK` rows whose `UNDERLYING_SECURITY_ID` resolves to one of our tracked NSE_EQ underlyings, plus the `FUTIDX`/`OPTIDX` rows for our tracked indices. Currency F&O (`FUTCUR`/`OPTCUR`), commodity F&O (`FUTCOM`/`OPTFUT`), and non-F&O equities NOT in our underlying set are EXCLUDED. These contract rows carry `lifecycle_state` transitions (`active` → `expired_contract`) and are NEVER deleted (SEBI §25 point-in-time). **This is the master/audit table ONLY — it does NOT change the WebSocket subscription**, which remains the 331-SID indices+spots set per §2 + the 2-WebSocket lock. The `MAX_DAILY_UNIVERSE_SIZE = 1200` envelope in §2 bounds the *subscription* set, NOT the lifecycle master (which legitimately holds ~219K applicable-F&O rows).
 
 | Column | Type | Purpose |
 |---|---|---|
@@ -293,7 +293,7 @@ Per `.claude/rules/project/z-plus-defense-doctrine.md`:
 | **L1 DETECT** | HTTPS GET on `images.dhan.co/api-data/api-scrip-master-detailed.csv`; check 200 OK + content-length > 1 MB | Network failure, Dhan 5xx, empty response |
 | **L2 VERIFY** | Parse CSV header row; SHA-256 of payload; row count; mandatory-column presence; TLS cert validation | Schema drift, partial download, corruption, DNS poisoning |
 | **L3 RECONCILE** | Compare row count + SHA-256 vs yesterday's `instrument_fetch_audit`; flag if `total_rows < 0.5× yesterday OR > 2× yesterday` | Silent Dhan-side bulk changes, stale-CSV serving |
-| **L4 PREVENT** | Validate parsed universe size in `[100, 400]`; HALT if outside. Verify every `UNDERLYING_SECURITY_ID` from FUTSTK/OPTSTK rows resolves to an NSE_EQ row in the same CSV (no dangling references). | Misparsed CSV; runaway subscription cost |
+| **L4 PREVENT** | Validate parsed universe size in `[100, 1200]`; HALT if outside. Verify every `UNDERLYING_SECURITY_ID` from FUTSTK/OPTSTK rows resolves to an NSE_EQ row in the same CSV (no dangling references). | Misparsed CSV; runaway subscription cost |
 | **L5 AUDIT** | `instrument_fetch_audit` row per attempt (success or failure) + `instrument_lifecycle_audit` row per state transition + `tv_universe_size{kind=...}` CloudWatch metric + tracing span | Continuous observability + forensic chain |
 | **L6 RECOVER** | Infinite retry (per §4). NEVER fallback to a different data source. NEVER proceed with stale data. | Operator-locked: no silent degradation |
 | **L7 COOLDOWN** | Retry backoff capped at 300s between attempts; never burst Dhan with >5 GETs/min | Self-induced rate limit |
@@ -344,7 +344,7 @@ The new `instrument_lifecycle` orchestrator slots between existing Step 6 (auth)
 |---|---|---|
 | `SubscriptionScope::DailyUniverse` enum variant | Compile-time scope contract; retires `Indices4Only` | `crates/common/src/config.rs` (Sub-PR #1) |
 | `effective_main_feed_pool_size(_, _) → 1` | Main feed always 1 conn (UNCHANGED) | `crates/common/src/config.rs` (Sub-PR #1) |
-| `MAX_DAILY_UNIVERSE_SIZE = 400` constant | Universe size cap; HALT if exceeded | `crates/common/src/constants.rs` (Sub-PR #7) |
+| `MAX_DAILY_UNIVERSE_SIZE = 1200` constant | Universe size cap; HALT if exceeded | `crates/common/src/constants.rs` (Sub-PR #2/#7) |
 | `crates/storage/tests/instance_type_lock_guard.rs` | Source-scan: pins `t4g.large` in `aws-budget.md` + this file + architecture doc §5 | NEW in Sub-PR #1 |
 | `crates/storage/tests/daily_universe_scope_guard.rs` | Source-scan: pins Detailed CSV URL + DEDUP key contract + Quote-mode-for-all + retry-policy unbounded loop + I-P1-11 composite key | NEW in Sub-PR #1 |
 | Source-scan retirement of `indices4only_scope_lock_guard.rs` | Old ratchet removed | RETIRED in Sub-PR #1 |
@@ -816,10 +816,19 @@ boot that produced the snapshot.
    **role tag** (`fno_underlying` and/or `index_constituent`, with the owning
    index list). "F&O only" is an **O(1) filter** over the same data — NOT a second
    download and NOT a second subscription/WebSocket.
-6. **`MAX_DAILY_UNIVERSE_SIZE` is raised 400 → 1200** to fit ~1,000 live SIDs +
-   headroom. The `[100, 400]` envelope in §2/§9-L4 becomes `[100, 1200]`.
+6. **`MAX_DAILY_UNIVERSE_SIZE` raised 400 → 1200** to fit ~1,000 live SIDs +
+   headroom. **DONE in Sub-PR #2 (2026-06-06):** the §2/§9-L4 envelope is now
+   `[100, 1200]`; the seal-ring headroom guard floor moved 20× → 5× (still
+   ~7.9× at the 1200 cap, well above the chaos-tested 2× IST-midnight-burst
+   adequacy; the 200K `SEAL_BUFFER_CAPACITY` L-C1 design lock is preserved).
 7. Constituency source: **niftyindices.com** (rebuild the deleted downloader; reuse
-   the existing `INDEX_CONSTITUENCY_*` constants).
+   the existing `INDEX_CONSTITUENCY_*` constants). **Operator-provided exact URL
+   (2026-06-06):** the NIFTY Total Market constituents (~750 stocks) live at
+   `https://www.niftyindices.com/IndexConstituent/ind_niftytotalmarket_list.csv`
+   (i.e. `INDEX_CONSTITUENCY_BASE_URL` + `ind_niftytotalmarket_list.csv`). This is
+   the constituent-STOCK list for Sub-PR #3/#4; the NIFTY Total Market INDEX value
+   itself (the IDX_I allowlist entry) needs its exact Dhan master `SYMBOL_NAME`,
+   resolved from the live Detailed master in Sub-PR #3 (NOT guessed).
 
 **What is UNCHANGED (still locked):**
 - Exactly **2 WebSocket connections** (1 main-feed + 1 order-update). ~1,000 SIDs

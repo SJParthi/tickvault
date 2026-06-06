@@ -13,7 +13,7 @@
 //!   `MIN_DAILY_UNIVERSE_SIZE`)
 //! - Sub-PR #10 — boot orchestrator (uses `BOOT_STEP_*_TIMEOUT_SECS`)
 //! - Sub-PR #11 — boot-time-of-day guard (HALT if universe size outside
-//!   `[100, 400]`)
+//!   `[100, 1200]`)
 //!
 //! This guard fails the build if:
 //!  1. Any constant is removed.
@@ -90,10 +90,10 @@ fn min_daily_universe_size_pinned_at_100() {
 }
 
 #[test]
-fn max_daily_universe_size_pinned_at_400() {
+fn max_daily_universe_size_pinned_at_1200() {
     assert_eq!(
-        MAX_DAILY_UNIVERSE_SIZE, 400,
-        "Maximum universe size must be 400 per rule file §2 + §22"
+        MAX_DAILY_UNIVERSE_SIZE, 1200,
+        "Maximum universe size must be 1200 per rule file §2 + §31 (NTM expansion, 2026-06-06)"
     );
 }
 
@@ -133,8 +133,8 @@ fn rule_file_pins_30s_ip_whitelist_deadline() {
 fn rule_file_pins_universe_size_envelope() {
     let body = rule_file_body();
     assert!(
-        body.contains("[100, 400]") || body.contains("MAX_DAILY_UNIVERSE_SIZE = 400"),
-        "rule file §2 / §22 must pin the [100, 400] universe envelope"
+        body.contains("[100, 1200]") || body.contains("MAX_DAILY_UNIVERSE_SIZE = 1200"),
+        "rule file §2 / §22 must pin the [100, 1200] universe envelope"
     );
 }
 

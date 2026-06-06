@@ -174,13 +174,13 @@ fn daily_universe_lifecycle_audit_table_locked() {
 fn daily_universe_size_envelope_locked() {
     let body = rule_file_body();
     assert!(
-        body.contains("MAX_DAILY_UNIVERSE_SIZE = 400")
+        body.contains("MAX_DAILY_UNIVERSE_SIZE = 1200")
             || body.contains("`MAX_DAILY_UNIVERSE_SIZE`"),
-        "rule file must pin the MAX_DAILY_UNIVERSE_SIZE = 400 cap"
+        "rule file must pin the MAX_DAILY_UNIVERSE_SIZE = 1200 cap"
     );
     assert!(
-        body.contains("[100, 400]"),
-        "rule file must pin the [100, 400] universe-size envelope"
+        body.contains("[100, 1200]"),
+        "rule file must pin the [100, 1200] universe-size envelope"
     );
 }
 

@@ -25,7 +25,7 @@
 //!
 //! ## Envelope enforcement (§2 + §22)
 //!
-//! `MIN_DAILY_UNIVERSE_SIZE = 100`, `MAX_DAILY_UNIVERSE_SIZE = 400`
+//! `MIN_DAILY_UNIVERSE_SIZE = 100`, `MAX_DAILY_UNIVERSE_SIZE = 1200`
 //! (constants from Sub-PR #2 in `tickvault-common`). Computed universe
 //! sizes outside this envelope return `Err(UniverseSizeOutOfBounds)` —
 //! fail-closed per §1 of the rule file. The orchestrator surfaces this
@@ -177,7 +177,7 @@ pub enum BuildError {
     /// MAX_DAILY_UNIVERSE_SIZE]`. Per §2 + §22 — boot HALTS.
     ///
     /// Fail-closed: a too-small universe (e.g. <100) means an upstream
-    /// extractor returned partial data; a too-large universe (>400)
+    /// extractor returned partial data; a too-large universe (>1200)
     /// means an upstream regression let in extra rows (e.g. BSE
     /// non-SENSEX, or commodity F&O). Either way, refuse to proceed.
     #[error("computed universe size {actual} outside envelope [{min}, {max}]")]
@@ -393,23 +393,23 @@ mod tests {
             Err(BuildError::UniverseSizeOutOfBounds {
                 actual: 81,
                 min: 100,
-                max: 400
+                max: 1200
             })
         ));
     }
 
     #[test]
     fn rejects_universe_above_max_size() {
-        // 30 indices + 1 SENSEX + 500 underlyings = 531, above MAX=400.
+        // 30 indices + 1 SENSEX + 1170 underlyings = 1201, above MAX=1200.
         let indices = make_indices(30);
-        let fno = make_fno(500);
+        let fno = make_fno(1170);
         let result = build_daily_universe(indices, fno, Vec::new());
         assert!(matches!(
             result,
             Err(BuildError::UniverseSizeOutOfBounds {
-                actual: 531,
+                actual: 1201,
                 min: 100,
-                max: 400
+                max: 1200
             })
         ));
     }
@@ -425,11 +425,11 @@ mod tests {
 
     #[test]
     fn accepts_universe_exactly_at_max_size() {
-        // 30 indices + 1 SENSEX + 369 underlyings = 400, exactly MAX.
+        // 30 indices + 1 SENSEX + 1169 underlyings = 1200, exactly MAX.
         let indices = make_indices(30);
-        let fno = make_fno(369);
+        let fno = make_fno(1169);
         let universe = build_daily_universe(indices, fno, Vec::new()).expect("at MAX accepts");
-        assert_eq!(universe.total_count(), 400);
+        assert_eq!(universe.total_count(), 1200);
     }
 
     #[test]
@@ -535,6 +535,6 @@ mod tests {
         // Defensive: pin the constants used here against the same
         // constants pinned in Sub-PR #2's source-scan ratchet.
         assert_eq!(MIN_DAILY_UNIVERSE_SIZE, 100);
-        assert_eq!(MAX_DAILY_UNIVERSE_SIZE, 400);
+        assert_eq!(MAX_DAILY_UNIVERSE_SIZE, 1200);
     }
 }
