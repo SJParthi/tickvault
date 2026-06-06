@@ -5338,6 +5338,20 @@ async fn cold_build_daily_universe(
     // base URL are in scope) can read the ~243 subscription targets.
     tickvault_app::prev_day_ohlcv_boot::stash_universe(std::sync::Arc::clone(&universe));
 
+    // §31 item 2 (NTM Map-B): populate the FULL per-index constituency mapping
+    // (all ~46 tracked indices) into the `index_constituency` table. MAP-ONLY +
+    // fully decoupled — it re-fetches independently and NEVER touches the live
+    // subscription. Spawned fire-and-forget so it never delays boot or the feed;
+    // degrade-safe (logs warn! + returns on any failure).
+    tokio::spawn(
+        tickvault_app::index_constituency_boot::persist_index_constituency_mapping(
+            questdb.clone(),
+            now_ist.date_naive(),
+            today_ist_nanos,
+            dry_run,
+        ),
+    );
+
     Ok((outcome, universe))
 }
 
