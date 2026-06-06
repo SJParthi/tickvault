@@ -854,3 +854,50 @@ role tagging, subscription wiring, persistence + observability + RAM proof, e2e
 validation). Each is a separate serial PR with the 15+7 guarantee matrix and the
 adversarial 3-agent review. No code sub-PR may widen the subscription beyond the
 NTM union without re-confirming against this section.
+
+---
+
+## §31.1 — Constituent → Dhan `security_id` mapping contract (LOCKED 2026-06-06)
+
+> **Authority for Sub-PR #4.** This is the precise, fail-closed mapping the
+> constituency code MUST build to. Operator-confirmed mapping approach 2026-06-06.
+
+**Source files (the join):**
+
+| niftyindices `ind_niftytotalmarket_list.csv` (~750 rows) | Dhan Detailed master (`api-scrip-master-detailed.csv`) |
+|---|---|
+| `Symbol` (NSE ticker, e.g. `RELIANCE`) | `SYMBOL_NAME` |
+| `Series` (e.g. `EQ`) | `SEGMENT` (`E`=Equity), `EXCH_ID` (`NSE`) |
+| **`ISIN Code`** (e.g. `INE002A01018`) | **`ISIN`** column (present in the raw CSV; `CsvRow` must add `isin` via `find("ISIN")` — Sub-PR #3) |
+| — | `SECURITY_ID` ← the value we resolve |
+
+**Mapping rule (LOCKED):**
+
+1. **PRIMARY key = ISIN.** Globally unique per security, rename-proof and
+   series-proof. Match NTM `ISIN Code` → Dhan row `ISIN`, filtered to
+   `EXCH_ID == NSE AND SEGMENT == E AND SERIES == EQ` (cash equity). The matched
+   row's `SECURITY_ID` is the answer.
+2. **SECONDARY / cross-check = `(Symbol, Series=EQ, NSE, Equity)`.** Validate the
+   ISIN hit's `SYMBOL_NAME` ≈ normalized NTM `Symbol`; also the fallback if a
+   constituent ever lacks an ISIN. Symbol-ALONE is BANNED as the primary key
+   (tickers get reused/renamed; Dhan `SYMBOL_NAME` punctuation may differ).
+3. **O(1) build:** construct a `HashMap<ISIN, (security_id, ExchangeSegment)>` from
+   the Dhan NSE-EQ rows ONCE (cold path), then each of the ~750 constituents is an
+   O(1) ISIN lookup. No per-constituent scan of the master.
+4. **Fail-closed:** a constituent whose ISIN resolves to ZERO Dhan NSE-EQ rows is
+   flagged + counted (`error!` with a typed code), NEVER silently dropped. If
+   `> 0.5%` of constituents are unresolved, REJECT the build (mirror §3 / §26
+   dangling-reference reject).
+5. **Dedup:** resolved SIDs are unioned with the existing F&O underlyings by
+   `(security_id, exchange_segment)` (I-P1-11). No double-subscribe.
+6. **Role tagging:** each resolved stock carries `role` ∈ {`index_constituent`,
+   `fno_underlying`} (both if applicable) so "F&O only" is an O(1) filter, not a
+   second download/WebSocket (per §31 item 5).
+7. **NTM INDEX value (separate):** the IDX_I allowlist entry for NIFTY Total Market
+   is resolved from the Dhan master `SYMBOL_NAME` in Sub-PR #3 — NOT guessed, NOT
+   derived from the constituent CSV.
+
+**Why ISIN-primary is the honest precise key:** symbols are reassigned/renamed over
+time and the two CSVs may format them differently; the 12-char ISIN (`INE…`) is the
+immutable security identity, so it is the only join key that cannot silently map to
+the wrong/old security. The symbol+series cross-check catches the rare bad-ISIN row.
