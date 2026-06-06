@@ -59,6 +59,7 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     "option_chain_minute_snapshot",
     "prev_day_ohlcv",
     "cross_verify_1m_audit",
+    "index_constituency",
 ];
 
 /// Tables EXEMPT from retention sweeping — NEVER detached or dropped.
@@ -386,6 +387,7 @@ mod tests {
             "option_chain_minute_snapshot",
             "prev_day_ohlcv",
             "cross_verify_1m_audit",
+            "index_constituency",
         ] {
             assert!(
                 DAY_PARTITIONED_TABLES.contains(&live),
