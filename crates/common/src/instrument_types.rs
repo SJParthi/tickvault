@@ -885,6 +885,11 @@ pub struct ConstituencyBuildMetadata {
     pub unique_stocks: usize,
     /// Total number of (index, stock) mappings.
     pub total_mappings: usize,
+    /// Count of kept constituents whose source `ISIN Code` was empty.
+    /// This is the first input to the §31.1 ">0.5% unresolvable ISIN ⇒
+    /// reject" fail-closed gate (the gate itself runs in Sub-PR #4's
+    /// Dhan-master join); surfaced here so the operator sees the ratio.
+    pub missing_isin: usize,
     /// Timestamp when the build completed (IST).
     pub build_timestamp: DateTime<FixedOffset>,
 }
@@ -898,6 +903,7 @@ impl Default for ConstituencyBuildMetadata {
             indices_failed: 0,
             unique_stocks: 0,
             total_mappings: 0,
+            missing_isin: 0,
             build_timestamp: Utc::now().with_timezone(&ist),
         }
     }
@@ -3212,12 +3218,14 @@ mod tests {
             indices_failed: 1,
             unique_stocks: 200,
             total_mappings: 350,
+            missing_isin: 4,
             build_timestamp: chrono::Utc::now().with_timezone(&ist),
         };
         assert_eq!(meta.indices_downloaded, 5);
         assert_eq!(meta.indices_failed, 1);
         assert_eq!(meta.unique_stocks, 200);
         assert_eq!(meta.total_mappings, 350);
+        assert_eq!(meta.missing_isin, 4);
         assert_eq!(
             meta.download_duration,
             std::time::Duration::from_millis(500)

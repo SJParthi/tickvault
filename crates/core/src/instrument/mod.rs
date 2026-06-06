@@ -68,6 +68,14 @@ pub mod daily_universe_orchestrator;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod instrument_snapshot;
 
+// NTM Sub-PR #3 of 2026-05-27 daily-universe expansion: rebuild of the
+// niftyindices.com index-constituency downloader + parser + cache (the
+// predecessor was deleted under 4-IDX_I scope; constants + types survived).
+// Builds the index→stocks map per §31.1; the Dhan-master ISIN join +
+// boot wiring land in Sub-PR #4 / #10. Same feature flag.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod index_constituency;
+
 // Sub-PR #10b-α of 2026-05-27 daily-universe expansion: pure-function
 // retry policy primitives for the §4 infinite-retry escalation ladder.
 // Boot stays BLOCKED until a fresh validated CSV is in hand — these
