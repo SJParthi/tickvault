@@ -54,14 +54,10 @@ fn runbook_dir_has_at_least_readme_and_two_deep_dives() {
 /// Every entry must have a justification comment + TODO marker so the
 /// allowlist stays shrinking.
 const KNOWN_BROKEN_ALLOWLIST: &[&str] = &[
-    // aws-deploy.md references a GitHub OIDC setup runbook that was
-    // never authored. TODO: write docs/runbooks/github-oidc-setup.md
-    // or remove the reference.
-    "docs/runbooks/github-oidc-setup.md",
-    // daily-operations.md references an override-log template that
-    // was never authored. TODO: write docs/templates/override_log.md
-    // or remove the reference.
-    "docs/templates/override_log.md",
+    // RESOLVED 2026-06-06: docs/runbooks/github-oidc-setup.md authored
+    // (aws-deploy.md step 1 now resolves) — allowlist entry removed.
+    // RESOLVED 2026-06-06: daily-operations.md typo fixed
+    // (`override_log.md` -> the existing `override-log.md`) — entry removed.
     // 2026-05-18 PR #1 (AWS-lifecycle 14-PR sequence) entries —
     // pre-existing stale references from main that surfaced when PR #1
     // landed the option_chain_cross_verify rule file. None caused by
