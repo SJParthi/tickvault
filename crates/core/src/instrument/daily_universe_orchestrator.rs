@@ -38,10 +38,14 @@
 
 #![cfg(feature = "daily_universe_fetcher")]
 
+use std::collections::HashMap;
+
 use thiserror::Error;
 use tickvault_common::error_code::ErrorCode;
+use tickvault_common::instrument_types::IndexConstituencyMap;
 
-use super::csv_parser::{CsvParseError, parse_detailed_csv};
+use super::constituent_resolver::resolve_constituents;
+use super::csv_parser::{CsvParseError, CsvRow, parse_detailed_csv};
 use super::daily_universe::{BuildError, DailyUniverse, build_daily_universe};
 use super::fno_underlying_extractor::{
     ExtractError, collect_applicable_fno_contracts, extract_fno_underlyings,
@@ -110,33 +114,96 @@ impl OrchestratorError {
     }
 }
 
+/// Resolve the §31 NTM constituency map against the parsed Dhan rows and
+/// BRIDGE each resolved constituent back to its full Dhan `CsvRow`.
+///
+/// **Degrade-by-design (operator AskUserQuestion 2026-06-06):** if the resolve
+/// step fails (`> 0.5%` dangling, i.e. the niftyindices list is out of sync with
+/// the Dhan master) this logs `error!(code = NTM-CONSTITUENCY-01)` and returns an
+/// EMPTY vec — the caller proceeds on the indices + F&O-underlyings core universe.
+/// It is NEVER a boot halt; the Dhan core path stays fail-closed independently.
+///
+/// The bridge builds a `HashMap<(security_id, segment), &CsvRow>` over `rows`
+/// (O(N) once, cold path) and does an O(1) lookup per resolved constituent. Every
+/// resolved SID was sourced FROM `rows`, so a lookup miss is impossible by
+/// construction; a miss is counted defensively, never panics.
+///
+/// COLD PATH — runs once at boot.
+#[must_use]
+pub fn resolve_ntm_rows(rows: &[CsvRow], ntm_map: &IndexConstituencyMap) -> Vec<CsvRow> {
+    let outcome = match resolve_constituents(ntm_map, rows) {
+        Ok(o) => o,
+        Err(err) => {
+            // DEGRADE: NTM layer unusable; core universe continues.
+            tracing::error!(
+                code = ErrorCode::NtmConstituency01SourceDegraded.code_str(),
+                reason = "dangling",
+                %err,
+                "NTM constituency resolve failed — degrading to core universe (no NTM constituents this session)"
+            );
+            return Vec::new();
+        }
+    };
+
+    // Bridge: (security_id, segment) → &CsvRow, O(1) lookup per resolved.
+    let mut by_key: HashMap<(&str, &str), &CsvRow> = HashMap::with_capacity(rows.len());
+    for r in rows {
+        by_key.insert((r.security_id.as_str(), r.segment.as_str()), r);
+    }
+    let mut ntm_rows: Vec<CsvRow> = Vec::with_capacity(outcome.resolved.len());
+    let mut bridge_misses = 0usize;
+    for rc in &outcome.resolved {
+        match by_key.get(&(rc.security_id.as_str(), rc.exchange_segment.as_str())) {
+            Some(row) => ntm_rows.push((*row).clone()),
+            None => bridge_misses += 1, // impossible by construction; counted, never panic
+        }
+    }
+    if bridge_misses > 0 {
+        tracing::warn!(
+            bridge_misses,
+            resolved = outcome.resolved.len(),
+            "NTM bridge: resolved constituent had no matching Dhan row (unexpected)"
+        );
+    }
+    tracing::info!(
+        ntm_resolved = ntm_rows.len(),
+        ntm_unresolved = outcome.unresolved_symbols.len(),
+        ntm_total = outcome.total,
+        "NTM constituents resolved + bridged to Dhan rows"
+    );
+    ntm_rows
+}
+
 /// Chain the CSV parser + extractors + universe builder into a single
 /// function.
 ///
-/// **Pure function** — no I/O, no allocation beyond what the underlying
-/// layers do, deterministic.
+/// **Pure function** — no I/O. `ntm_map` is the §31 NIFTY-Total-Market
+/// constituency (built by the boot caller via `build_constituency_map`);
+/// `None` means the niftyindices source was unavailable (the caller already
+/// emitted `NTM-CONSTITUENCY-01`) and the universe is built on the indices +
+/// F&O-underlyings core set only.
 ///
 /// # Algorithm
 ///
-/// 1. Parse the bytes via Sub-PR #4 `parse_detailed_csv()`
-///    → `Vec<CsvRow>` on success, error maps to `INSTR-FETCH-02`
-/// 2. Extract F&O underlyings via Sub-PR #5 `extract_fno_underlyings()`
-///    → `FnoUnderlyingExtraction` on success, error maps to `INSTR-FETCH-03`
-/// 3. Extract indices via Sub-PR #6 `extract_indices()`
-///    → `IndexExtraction` on success, error maps to `INSTR-FETCH-02`
-/// 4. Build the universe via Sub-PR #7 `build_daily_universe()`
-///    → `DailyUniverse` on success, error maps to `INSTR-FETCH-04`
+/// 1. Parse the bytes via Sub-PR #4 `parse_detailed_csv()` → `INSTR-FETCH-02`
+/// 2. Extract F&O underlyings via Sub-PR #5 → `INSTR-FETCH-03`
+/// 3. Extract indices via Sub-PR #6 → `INSTR-FETCH-02`
+/// 3c. Resolve + bridge the §31 NTM constituents (degrade-safe — empty on
+///     failure, NOT an error)
+/// 4. Build the universe via Sub-PR #7 → `INSTR-FETCH-04`
 ///
 /// # Errors
 ///
-/// See [`OrchestratorError`] variants.
+/// See [`OrchestratorError`] variants. NTM-source failure is NOT an error
+/// (degrade-by-design per §31 + operator 2026-06-06).
 ///
 /// # Performance
 ///
-/// COLD PATH — called once at boot per trading day. The 4-step chain
-/// totals ~10ms for a typical Dhan Detailed CSV (~25K rows). Not on
-/// any hot path; runs inside Sub-PR #10b's boot-step timeout wrapper.
-pub fn build_universe_from_bytes(bytes: &[u8]) -> Result<DailyUniverse, OrchestratorError> {
+/// COLD PATH — called once at boot per trading day.
+pub fn build_universe_from_bytes(
+    bytes: &[u8],
+    ntm_map: Option<&IndexConstituencyMap>,
+) -> Result<DailyUniverse, OrchestratorError> {
     // Step 1: parse
     let rows = parse_detailed_csv(bytes)?;
 
@@ -157,14 +224,19 @@ pub fn build_universe_from_bytes(bytes: &[u8]) -> Result<DailyUniverse, Orchestr
     // master-only — they NEVER enter `subscription_targets`.
     let fno_contracts = collect_applicable_fno_contracts(&rows, &fno);
 
+    // Step 3c: resolve + bridge the §31 NTM constituents (degrade-safe). When
+    // `ntm_map` is None (source unavailable) or resolve fails, this is empty and
+    // the universe is the indices + F&O-underlyings core set.
+    let ntm_rows = match ntm_map {
+        Some(map) => resolve_ntm_rows(&rows, map),
+        None => Vec::new(),
+    };
+
     // Step 4: build the unified universe (envelope check on the SUBSCRIPTION
-    // set per §2 + §22; fno_contracts are master-only and not bounded).
-    //
-    // NTM constituents (§31) are passed EMPTY here until Sub-PR #10 wires the
-    // niftyindices downloader → `constituent_resolver` → SID→CsvRow bridge into
-    // this orchestrator. Empty ⇒ the universe is byte-for-byte the pre-#5
-    // indices + F&O-underlyings set (live boot unchanged).
-    let universe = build_daily_universe(indices, fno, fno_contracts, Vec::new())?;
+    // set per §2 + §22; fno_contracts are master-only and not bounded). An NTM
+    // set that pushes the universe past MAX is an INSTR-FETCH-04 fail-closed
+    // HALT (a data anomaly), NOT a degrade.
+    let universe = build_daily_universe(indices, fno, fno_contracts, ntm_rows)?;
 
     Ok(universe)
 }
@@ -228,7 +300,7 @@ mod tests {
                 38000 + i
             ));
         }
-        let universe = build_universe_from_bytes(s.as_bytes()).expect("build");
+        let universe = build_universe_from_bytes(s.as_bytes(), None).expect("build");
         // 30 NSE + 1 SENSEX + 100 underlyings = 131 instruments
         assert_eq!(universe.total_count(), 131);
     }
@@ -237,7 +309,7 @@ mod tests {
     fn maps_parse_error_to_instr_fetch_02() {
         // Empty CSV body — parser returns Empty error
         let bytes = b"SECURITY_ID,EXCH_ID,SEGMENT,INSTRUMENT,SYMBOL_NAME,UNDERLYING_SECURITY_ID";
-        let err = build_universe_from_bytes(bytes).unwrap_err();
+        let err = build_universe_from_bytes(bytes, None).unwrap_err();
         assert_eq!(
             err.error_code(),
             ErrorCode::InstrFetch02SchemaValidationFailed
@@ -254,7 +326,7 @@ mod tests {
         s.push_str("2885,NSE,NSE_EQ,EQUITY,RELIANCE,\n");
         s.push_str("13,NSE,IDX_I,INDEX,NIFTY,\n");
         s.push_str("38000,NSE,NSE_FNO,FUTSTK,RELIANCEFUT,2885\n");
-        let err = build_universe_from_bytes(s.as_bytes()).unwrap_err();
+        let err = build_universe_from_bytes(s.as_bytes(), None).unwrap_err();
         assert_eq!(
             err.error_code(),
             ErrorCode::InstrFetch02SchemaValidationFailed
@@ -279,7 +351,7 @@ mod tests {
                 38000 + i
             ));
         }
-        let err = build_universe_from_bytes(s.as_bytes()).unwrap_err();
+        let err = build_universe_from_bytes(s.as_bytes(), None).unwrap_err();
         assert_eq!(err.error_code(), ErrorCode::InstrFetch03DanglingReferences);
         assert_eq!(err.stage(), "fno_underlying_extractor");
     }
@@ -289,7 +361,7 @@ mod tests {
         // Valid CSV but only 1 underlying + 1 NSE_I + 1 SENSEX = 3
         // instruments, below MIN=100 envelope.
         let bytes = synthetic_csv(1, 1);
-        let err = build_universe_from_bytes(&bytes).unwrap_err();
+        let err = build_universe_from_bytes(&bytes, None).unwrap_err();
         assert_eq!(
             err.error_code(),
             ErrorCode::InstrFetch04UniverseSizeOutOfBounds
@@ -322,7 +394,7 @@ mod tests {
     fn stage_returns_stable_wire_format() {
         // The stage() values feed CloudWatch metric dimensions + audit
         // table columns; they MUST be stable across releases.
-        let parse_err = build_universe_from_bytes(b"SECURITY_ID").unwrap_err();
+        let parse_err = build_universe_from_bytes(b"SECURITY_ID", None).unwrap_err();
         assert_eq!(parse_err.stage(), "csv_parser");
     }
 
@@ -348,8 +420,8 @@ mod tests {
         let bytes = s.as_bytes();
 
         // Two calls with identical bytes → identical total_count.
-        let u1 = build_universe_from_bytes(bytes).expect("build 1");
-        let u2 = build_universe_from_bytes(bytes).expect("build 2");
+        let u1 = build_universe_from_bytes(bytes, None).expect("build 1");
+        let u2 = build_universe_from_bytes(bytes, None).expect("build 2");
         assert_eq!(u1.total_count(), u2.total_count());
     }
 
@@ -364,16 +436,110 @@ mod tests {
         bytes.push(0xC9);
         bytes.push(0x6E);
         bytes.extend_from_slice(b",\n");
-        let err = build_universe_from_bytes(&bytes).unwrap_err();
+        let err = build_universe_from_bytes(&bytes, None).unwrap_err();
         assert_eq!(
             err.error_code(),
             ErrorCode::InstrFetch02SchemaValidationFailed
         );
     }
 
+    // ----- Sub-PR #10a: NTM resolve + bridge (§31) -----
+
+    fn eq_row(sid: &str, sym: &str, isin: &str) -> CsvRow {
+        CsvRow {
+            security_id: sid.to_string(),
+            exch_id: "NSE".to_string(),
+            segment: "NSE_EQ".to_string(),
+            instrument: "EQUITY".to_string(),
+            symbol_name: sym.to_string(),
+            isin: isin.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn ntm_map(items: &[(&str, &str)]) -> IndexConstituencyMap {
+        use tickvault_common::instrument_types::IndexConstituent;
+        let mut map = IndexConstituencyMap::default();
+        let rows: Vec<IndexConstituent> = items
+            .iter()
+            .map(|(sym, isin)| IndexConstituent {
+                index_name: "Nifty Total Market".to_string(),
+                symbol: (*sym).to_string(),
+                isin: (*isin).to_string(),
+                weight: 0.0,
+                sector: "Test".to_string(),
+                last_updated: chrono::NaiveDate::from_ymd_opt(2026, 6, 6).unwrap(),
+            })
+            .collect();
+        map.index_to_constituents
+            .insert("Nifty Total Market".to_string(), rows);
+        map
+    }
+
+    #[test]
+    fn resolve_ntm_rows_bridges_resolved_to_dhan_rows() {
+        // 2 Dhan NSE_EQ rows; NTM references one by ISIN → bridge returns its
+        // FULL CsvRow (not just the resolved tuple).
+        let rows = vec![
+            eq_row("2885", "RELIANCE", "INE002A01018"),
+            eq_row("1594", "INFY", "INE009A01021"),
+        ];
+        let map = ntm_map(&[("RELIANCE", "INE002A01018")]);
+        let bridged = resolve_ntm_rows(&rows, &map);
+        assert_eq!(bridged.len(), 1);
+        assert_eq!(bridged[0].security_id, "2885");
+        assert_eq!(bridged[0].symbol_name, "RELIANCE");
+        assert_eq!(bridged[0].segment, "NSE_EQ");
+    }
+
+    #[test]
+    fn resolve_ntm_rows_degrades_to_empty_on_dangling() {
+        // All constituents dangle (no matching Dhan row) → >0.5% threshold →
+        // resolve_constituents errors → degrade to EMPTY, never panics.
+        let rows = vec![eq_row("2885", "RELIANCE", "INE002A01018")];
+        let map = ntm_map(&[
+            ("GHOST1", "INE000X00001"),
+            ("GHOST2", "INE000X00002"),
+            ("GHOST3", "INE000X00003"),
+        ]);
+        let bridged = resolve_ntm_rows(&rows, &map);
+        assert!(bridged.is_empty(), "dangling → degrade to empty");
+    }
+
+    #[test]
+    fn build_universe_with_ntm_map_threads_through() {
+        // End-to-end: a valid CSV + an NTM map referencing an F&O underlying
+        // (STK0) → both-case flagged, no dup, universe still valid.
+        let mut s = String::from(
+            "SECURITY_ID,EXCH_ID,SEGMENT,INSTRUMENT,SYMBOL_NAME,UNDERLYING_SECURITY_ID\n",
+        );
+        for i in 0..100 {
+            s.push_str(&format!("28{i:04},NSE,NSE_EQ,EQUITY,STK{i},\n"));
+        }
+        for i in 0..30 {
+            let sym = NSE_INDEX_ALLOWLIST[i % NSE_INDEX_ALLOWLIST.len()];
+            s.push_str(&format!("{i},NSE,IDX_I,INDEX,{sym},\n"));
+        }
+        s.push_str("51,BSE,IDX_I,INDEX,SENSEX,\n");
+        for i in 0..100 {
+            s.push_str(&format!("38{i:04},NSE,NSE_FNO,FUTSTK,STK{i}FUT,28{i:04}\n"));
+        }
+        // NTM references STK0 (symbol fallback — synthetic CSV has no ISIN).
+        let map = ntm_map(&[("STK0", "")]);
+        let universe = build_universe_from_bytes(s.as_bytes(), Some(&map)).expect("build with ntm");
+        // STK0 is an F&O underlying AND now an NTM constituent → both flags, no dup.
+        assert_eq!(universe.index_constituent_count(), 1);
+        let both = universe
+            .subscription_targets
+            .iter()
+            .find(|t| t.csv_row.symbol_name == "STK0")
+            .expect("STK0 present");
+        assert!(both.is_fno_underlying && both.is_index_constituent);
+    }
+
     #[test]
     fn orchestrator_error_display_includes_underlying_message() {
-        let err = build_universe_from_bytes(b"SECURITY_ID,EXCH_ID,SEGMENT").unwrap_err();
+        let err = build_universe_from_bytes(b"SECURITY_ID,EXCH_ID,SEGMENT", None).unwrap_err();
         let msg = format!("{err}");
         // The Display impl should include either "CSV parse failed" or
         // the underlying error message (depending on which layer fails

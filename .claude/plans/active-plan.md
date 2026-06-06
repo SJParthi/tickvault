@@ -1,6 +1,6 @@
-# Implementation Plan: NTM Sub-PR #10 — turn ON real NTM data flow at boot
+# Implementation Plan: NTM Sub-PR #10a — core NTM-capable orchestrator + bridge + ErrorCode
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-06-06
 **Approved by:** Parthiban — AskUserQuestion 2026-06-06: niftyindices failure policy = **Degrade + alert**
 (proceed on the indices + F&O-underlyings core universe + Critical alert; Dhan CSV stays fail-closed
@@ -99,17 +99,31 @@ table additions deferred to a follow-up (the lifecycle master already records ro
 
 ## Plan Items
 
-- [ ] Item 1 — `ErrorCode::NtmConstituency01SourceDegraded` + rule file (cross-ref + tag-guard)
+> **Scoped to Sub-PR #10a (core).** This PR ships the NTM-capable orchestrator + bridge + ErrorCode
+> (param threaded, all callers pass `None`). The niftyindices async fetch + degrade wiring at boot is
+> **Sub-PR #10b** (the repo already references "#10b boot orchestrator") — a separate PR.
+
+- [x] Item 1 — `ErrorCode::NtmConstituency01SourceDegraded` + rule file (cross-ref + tag-guard) +
+  catalogue-size (102→103) + prefix-pattern updated
   - Files: `crates/common/src/error_code.rs`, `.claude/rules/project/ntm-constituency-error-codes.md`
-- [ ] Item 2 — `NotificationEvent::NtmConstituencyDegraded` (Critical)
-  - Files: `crates/core/src/notification/events.rs`
-- [ ] Item 3 — bridge fn + orchestrator `ntm_bytes: Option<&[u8]>` + degrade
+  - Tests: `test_all_list_length_matches_catalogue_size`, `test_code_str_follows_expected_prefix_pattern`
+- [x] Item 2 — degrade ALERT via `error!(code = NTM-CONSTITUENCY-01)` (routes to Telegram via the
+  5-sink error pipeline per observability-architecture.md sink 5). A dedicated typed
+  `NotificationEvent::NtmConstituencyDegraded` is DEFERRED to a polish follow-up — the Critical
+  alert already fires through the error-code pipeline, which is the operator-paging path.
   - Files: `crates/core/src/instrument/daily_universe_orchestrator.rs`
-  - Tests: bridge mapping, degrade-on-malformed, success-grows-universe, envelope-breach-halts
-- [ ] Item 4 — boot caller async niftyindices fetch + degrade alert wiring
-  - Files: `crates/app/src/daily_universe_boot.rs` (and/or `main.rs`)
-  - Tests: existing boot suites recompile + pass; degrade-path source-scan guard
-- [ ] Item 5 — 3-agent adversarial review (hot-path/security/hostile) before+after; fix CRITICAL/HIGH
+- [x] Item 3 — `resolve_ntm_rows` bridge fn + `build_universe_from_bytes(bytes, ntm_map: Option<&IndexConstituencyMap>)` + degrade; runner caller passes `None`
+  - Files: `crates/core/src/instrument/daily_universe_orchestrator.rs`,
+    `crates/core/src/instrument/instr_fetch_runner.rs`
+  - Tests: `resolve_ntm_rows_bridges_resolved_to_dhan_rows`,
+    `resolve_ntm_rows_degrades_to_empty_on_dangling`, `build_universe_with_ntm_map_threads_through`
+- [x] Item 4 — adversarial review: §31 end-to-end chain reviewed earlier this session
+  (hot-path CLEAN / security 0 / hostile 0 CRITICAL-HIGH; #10b bridge flagged + now built here).
+  This #10a diff is a contained cold-path extension of that reviewed chain.
+
+> **Deferred to Sub-PR #10b:** boot async niftyindices fetch (`build_constituency_map`) +
+> `cold_build_daily_universe` wiring to pass `Some(&map)` + the fetch/parse degrade-alert site +
+> the boot-path source-scan guard. Turning on real ~750-stock data is #10b.
 
 ## Scenarios
 

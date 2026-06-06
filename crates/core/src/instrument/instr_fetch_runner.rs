@@ -86,7 +86,9 @@ where
     // without this the operator would see "boot BLOCKED" with no clue WHICH
     // underlyings failed to resolve.
     let build_with_diagnostics = |bytes: &[u8]| -> Result<DailyUniverse, OrchestratorError> {
-        build_universe_from_bytes(bytes).inspect_err(|e| {
+        // NTM constituents (§31) are passed `None` here — the niftyindices async
+        // fetch + degrade wiring is Sub-PR #10b (this runner stays CSV-bytes-pure).
+        build_universe_from_bytes(bytes, None).inspect_err(|e| {
             let code = e.error_code().code_str();
             warn!(
                 code = code,
