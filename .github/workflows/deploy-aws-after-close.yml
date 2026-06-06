@@ -6,13 +6,13 @@
 # be auto deployed to ec2 — ONLY between 9 am till 3.45 pm it should not happen.
 # except this time always auto deployment should happen." So the ONLY no-deploy
 # window is 09:00-15:45 IST (the live trading + post-close-settle band); every
-# other time — including the 08:00 IST auto-start — auto-deploys the latest main.
+# other time — including the 08:30 IST auto-start — auto-deploys the latest main.
 #
 # Three crons, all Mon–Fri:
-#   • 02:30 UTC = 08:00 IST → INSTANCE-START deploy. Fires the moment the box is
+#   • 03:00 UTC = 08:30 IST → INSTANCE-START deploy. Fires the moment the box is
 #     scheduled to auto-start. deploy-aws SELF-STARTS a stopped box in the
-#     08:00-17:00 up-window (see "Ensure instance running" in deploy-aws.yml),
-#     so even if the 08:00 EventBridge instance-start silently fails, THIS cron
+#     08:30-16:30 up-window (see "Ensure instance running" in deploy-aws.yml),
+#     so even if the 08:30 EventBridge instance-start silently fails, THIS cron
 #     still brings the box up + ships the latest main before 09:00 open. This is
 #     the belt-and-suspenders fix for the 2026-06-03 "box never auto-started"
 #     incident — it does not depend on the EC2 'running' event firing at all.
@@ -26,14 +26,14 @@
 # nothing to deploy — exit clean (no spurious restart on quiet days).
 #
 # Triggers:
-#   - schedule: 02:30 + 03:15 + 10:16 UTC Mon–Fri
+#   - schedule: 03:00 + 03:15 + 10:16 UTC Mon–Fri
 #   - workflow_dispatch: manual operator override (just-in-case button)
 #
 # Honest envelope:
 #   - Merge during 09:00-15:45 IST → blocked → auto-fires at 15:46 IST same day ✅
-#   - Merge over the weekend → auto-fires Monday 08:00 IST (instance-start) ✅
-#   - Merge before 08:00 IST on a weekday → auto-fires same day 08:00 IST ✅
-#   - Box failed to auto-start at 08:00 → the 08:00 cron self-starts it + deploys ✅
+#   - Merge over the weekend → auto-fires Monday 08:30 IST (instance-start) ✅
+#   - Merge before 08:30 IST on a weekday → auto-fires same day 08:30 IST ✅
+#   - Box failed to auto-start at 08:30 → the 08:30 cron self-starts it + deploys ✅
 #   - NSE holiday: cron fires; deploy-aws's own market-hours guard is a no-op
 #     outside trading hours, so the deploy runs harmlessly on holiday windows.
 #   - No new commits → idempotent skip (no restart, no extra cost).
@@ -43,10 +43,10 @@ name: deploy-aws-after-close
 
 on:
   schedule:
-    # 02:30 UTC = 08:00 IST (instance-start). 03:15 UTC = 08:45 IST (pre-market).
+    # 03:00 UTC = 08:30 IST (instance-start). 03:15 UTC = 08:45 IST (pre-market).
     # 10:16 UTC = 15:46 IST (post-market, just after the 15:45 no-deploy band).
     # Mon–Fri only.
-    - cron: '30 2 * * 1-5'
+    - cron: '0 3 * * 1-5'
     - cron: '15 3 * * 1-5'
     - cron: '16 10 * * 1-5'
   workflow_dispatch: {}

@@ -79,7 +79,7 @@ is_box_up_window() {
   h=$(TZ='Asia/Kolkata' date +%H); m=$(TZ='Asia/Kolkata' date +%M)
   dow=$(TZ='Asia/Kolkata' date +%u)   # 1=Mon..7=Sun
   t=$((10#$h * 100 + 10#$m))
-  [ "$dow" -le 5 ] && [ "$t" -ge 800 ] && [ "$t" -le 1700 ]
+  [ "$dow" -le 5 ] && [ "$t" -ge 830 ] && [ "$t" -le 1630 ]
 }
 
 # --- diagnostic: is the EventBridge daily-start rule healthy? ----------------

@@ -7,10 +7,10 @@
 # it alerts even if GitHub Actions is down.
 #
 # Two EventBridge schedules invoke the same Lambda with a `mode` input:
-#   * ping  @ 02:30 UTC = 08:00 IST (fires with daily_start) -> positive
+#   * ping  @ 03:00 UTC = 08:30 IST (fires with daily_start) -> positive
 #     "start triggered" Telegram.
-#   * check @ 02:45 UTC = 08:15 IST -> ec2:DescribeInstances; if NOT running,
-#     Severity::Critical "08:00 auto-start FAILED" Telegram. Silent if healthy.
+#   * check @ 03:15 UTC = 08:45 IST -> ec2:DescribeInstances; if NOT running,
+#     Severity::Critical "08:30 auto-start FAILED" Telegram. Silent if healthy.
 #
 # Cost: 2 invokes/weekday (~44/mo) — free tier (1M req/mo). Effectively ₹0.
 
@@ -107,19 +107,19 @@ resource "aws_cloudwatch_log_group" "start_watchdog" {
 }
 
 # ---------------------------------------------------------------------------
-# EventBridge schedules — ping (08:00 IST) + check (08:15 IST), weekdays
+# EventBridge schedules — ping (08:30 IST) + check (08:45 IST), weekdays
 # ---------------------------------------------------------------------------
 
 resource "aws_cloudwatch_event_rule" "start_watchdog_ping" {
   name                = "tv-${var.environment}-start-watchdog-ping"
-  description         = "08:00 IST (Mon-Fri) positive 'instance start triggered' Telegram"
-  schedule_expression = "cron(30 2 ? * MON-FRI *)"
+  description         = "08:30 IST (Mon-Fri) positive 'instance start triggered' Telegram"
+  schedule_expression = "cron(0 3 ? * MON-FRI *)"
 }
 
 resource "aws_cloudwatch_event_rule" "start_watchdog_check" {
   name                = "tv-${var.environment}-start-watchdog-check"
-  description         = "08:15 IST (Mon-Fri) verify the box actually started; page if not"
-  schedule_expression = "cron(45 2 ? * MON-FRI *)"
+  description         = "08:45 IST (Mon-Fri) verify the box actually started; page if not"
+  schedule_expression = "cron(15 3 ? * MON-FRI *)"
 }
 
 resource "aws_cloudwatch_event_target" "start_watchdog_ping" {
