@@ -1,101 +1,80 @@
-# Implementation Plan: NTM Sub-PR #10b — boot turn-on of real NTM data
+# Implementation Plan: NTM index value (§31 item 1) + allowlist self-verify
 
 **Status:** VERIFIED
 **Date:** 2026-06-06
-**Approved by:** Parthiban — AskUserQuestion 2026-06-06 (niftyindices failure = **Degrade + alert**) +
-standing "once merged, go ahead with the plan always".
-**Crate(s) touched:** `core` (`instr_fetch_runner.rs` — thread `ntm_map`), `app`
-(`daily_universe_boot.rs` — thread `ntm_map`; `main.rs` — best-effort niftyindices fetch +
-`fetch_ntm_constituency_map` helper). Feature: `daily_universe_fetcher`.
+**Approved by:** Parthiban — AskUserQuestion 2026-06-06: "Standard name + boot self-verify" +
+"NTM index value now, full map later" (after he asked whether the NTM index value was actually added).
+**Crate(s) touched:** `core` (`index_extractor.rs` — add the 32nd allowlist entry;
+`daily_universe_orchestrator.rs` — wire the `allowlist_misses` boot log). Feature:
+`daily_universe_fetcher`.
 
 ## Context
 
-#10a (merged) made the orchestrator NTM-capable (`build_universe_from_bytes(bytes, ntm_map)` +
-`resolve_ntm_rows` bridge + `NTM-CONSTITUENCY-01`), with all callers passing `None`. #10b is the
-**turn-on**: fetch the real niftyindices constituents at boot and thread them down so the ~750-stock
-NTM union actually flows on the single main-feed WS.
+Operator verification caught a real gap: #3/#4/#5/#10b subscribe the ~750 NTM **constituent
+stocks**, but the **NIFTY Total Market INDEX value itself** (§31 item 1, the 33rd tracked index)
+was NEVER added to `NSE_INDEX_ALLOWLIST` (31 NSE entries, no NTM). Also found: `allowlist_misses`
+was a **dead field** — computed in `extract_indices` but never logged — so the "self-verify" was an
+illusion. Operator's "no hallucination / real-time guarantee" demands both fixed.
 
 ## Design
 
-- **`main.rs::fetch_ntm_constituency_map(today)`** (new private async helper) — builds
-  `ConstituencyDownloader` + `build_constituency_map(&dl, NTM_CONSTITUENCY_SLUGS, today)` wrapped in
-  `tokio::time::timeout(NTM_CONSTITUENCY_FETCH_TIMEOUT_SECS = 30s)`. **CRITICAL fix (hostile review):**
-  the SUBSCRIPTION uses the **NTM slug ONLY** (§31 item 4) — NOT the full ~49-index
-  `INDEX_CONSTITUENCY_SLUGS`, whose deduped union ≈ the entire NSE (~1,900 stocks) would breach
-  `MAX_DAILY_UNIVERSE_SIZE` and HALT boot on a *healthy* fetch. **Degrade+alert**: on downloader-init
-  failure OR timeout OR an empty map it logs `error!(code = NTM-CONSTITUENCY-01)` (reason =
-  downloader_init / timeout / fetch_or_parse) and returns `None`; NEVER blocks boot.
-- **Threading:** `cold_build_daily_universe` → `run_daily_universe_boot(.., ntm_map)` (app) →
-  `run_daily_universe_fetch_runner(wrapped, max_attempts, ntm_map.as_ref())` (core) →
-  `build_universe_from_bytes(bytes, ntm_map)`. `Option<&IndexConstituencyMap>` is `Copy`, so the
-  runner's retry closure re-uses it across attempts with no clone.
-- The Dhan CSV path stays **fail-closed §4** (infinite retry); ONLY the niftyindices NTM layer
-  degrades. Subscription set = union of tracked-index constituents (NTM dominates), bounded by the
-  `[100, 1200]` envelope (`INSTR-FETCH-04` halts if exceeded — a data anomaly, not a degrade).
+- **Add `"NIFTY TOTAL MARKET"`** as the 32nd `NSE_INDEX_ALLOWLIST` entry → it flows through the
+  existing index path: `extract_indices` matches the live Dhan IDX_I row → `SubscriptionTarget`
+  with `role = Index` → subscribed in Quote mode like the other 31 indices (+ SENSEX = 33 total).
+- **Wire `allowlist_misses` → loud boot log** in `daily_universe_orchestrator::build_universe_from_bytes`:
+  empty ⇒ `info!` positive signal; non-empty ⇒ `warn!` naming the missed index(es). This is the
+  **real, non-illusory self-verify**: if Dhan's exact IDX_I `SYMBOL_NAME` for NTM differs from the
+  standard name, the boot log LOUD-warns "index allowlist MISS … NIFTY TOTAL MARKET" instead of
+  silently dropping it — operator then corrects with the verbatim symbol.
 
 ## Edge Cases
 
-- niftyindices fully down / DNS / 5xx → empty map → `None` + Critical alert → core universe.
-- Some slugs fail, NTM ok → map non-empty → resolve over what's present (best-effort).
-- `>0.5%` constituents dangling vs Dhan rows → `resolve_ntm_rows` degrades to empty (#10a) + alert.
-- All constituents are F&O underlyings → both-flags set, no dup (#5 fold).
-- Union > 1200 → `INSTR-FETCH-04` fail-closed HALT.
-- Weekend/holiday → existing daily orchestrator gate; fetch best-effort.
+- Dhan's symbol == "NIFTY TOTAL MARKET" → matched, subscribed, `info!` OK.
+- Dhan's symbol differs (e.g. "NIFTY TOTAL MKT") → `warn!` miss at boot; index value not subscribed
+  until corrected (constituents unaffected — they come from niftyindices, not this allowlist).
+- Index temporarily absent from the master → same `warn!` path (correct: it IS a miss).
+- +1 index vs the `[100,1200]` universe envelope → ample headroom; no overflow.
 
 ## Failure Modes
 
-- NTM source down → DEGRADE + `NTM-CONSTITUENCY-01` Critical (operator-chosen); core trades.
-- Dhan CSV down → §4 infinite-retry fail-closed (UNCHANGED — NTM policy does not relax this).
-- niftyindices slow → bounded by the downloader's connect/read timeouts (#3 §18 hardening); cold path.
+- Wrong/renamed Dhan symbol → loud `warn!` (visible), NOT silent drop — the operator-chosen
+  self-verify. No boot block (an index-value miss is a degrade, not fail-closed).
+- The constituent-stock subscription is independent of this allowlist (niftyindices-sourced), so a
+  miss here never affects the ~750 stocks.
 
 ## Test Plan
 
-`cargo test -p tickvault-core --features daily_universe_fetcher` + `-p tickvault-app` (scoped; full
-workspace = CI). Threading is param-only — covered by recompiling the existing runner (8) + boot (11)
-suites with the new arg (all callers updated). The resolve+bridge + degrade behaviour is already
-unit-tested in #10a (`resolve_ntm_rows_*`, `build_universe_with_ntm_map_threads_through`).
-`fetch_ntm_constituency_map` is a thin best-effort wrapper over already-tested `build_constituency_map`
-(network I/O — TEST-EXEMPT by integration boundary; degrade branches are straight-line + logged).
+`cargo test -p tickvault-core --features daily_universe_fetcher` (index_extractor + orchestrator).
+Count assertions updated (31→32, 32→33, 30→31 misses); `allowlist_has_exactly_32_nse_indices`
+asserts membership; new `build_consumes_allowlist_misses_for_boot_self_verify` source-scan guard
+blocks the dead-field regression (audit Rule 13). Orchestrator + daily_universe + boot suites
+recompile green (no count drift — fixtures use dynamic `len()`).
 
 ## Rollback
 
-Degrade-by-design: a niftyindices outage OR `git revert` both fall back to the proven core universe
-(the new fetch returns `None` ⇒ identical to pre-#10b boot). No migration, no schema change.
+`git revert` removes the one allowlist entry + the log wiring; the universe returns to the prior 31
+NSE indices. No schema/migration. The constituent-stock path is untouched.
 
 ## Observability
 
-`NTM-CONSTITUENCY-01` Critical → Telegram via the 5-sink error pipeline on degrade; boot `info!`
-logs `indices` + `unique_stocks` on success and the per-phase build log (#5) shows
-`index_constituent_count` non-zero. `tv_universe_size{kind="index_constituent"}` (gauge, #5) becomes
-non-zero on a healthy NTM boot.
+`info!`/`warn!` boot self-verify line (the new real telemetry). `tv_universe_size{kind="index"}`
+(existing) reflects the +1 index on a healthy boot. No new error code (a miss is a `warn!`, not a
+typed failure class).
 
 ## Plan Items
 
-- [x] Item 1 — `run_daily_universe_fetch_runner` gains `ntm_map: Option<&IndexConstituencyMap>`;
-  retry closure threads it into `build_universe_from_bytes`
-  - Files: `crates/core/src/instrument/instr_fetch_runner.rs`
-  - Tests: `runner_wires_build_universe_from_bytes`, `runner_wires_tokio_time_sleep`
-- [x] Item 2 — `run_daily_universe_boot` gains `ntm_map: Option<IndexConstituencyMap>`; passes
-  `.as_ref()` to the runner
-  - Files: `crates/app/src/daily_universe_boot.rs`
-  - Tests: `test_run_daily_universe_boot_no_universe_bails`,
-    `test_run_daily_universe_boot_valid_csv_reaches_reconcile_then_fails_closed`
-- [x] Item 3 — `main.rs::fetch_ntm_constituency_map` best-effort fetch + degrade alert; wired into
-  `cold_build_daily_universe`
-  - Files: `crates/app/src/main.rs`
-  - Tests: `test_run_daily_universe_boot_valid_csv_reaches_reconcile_then_fails_closed` (boot path recompiles + green; helper is a network-boundary best-effort wrapper)
-- [x] Item 4 — adversarial review on the #10b diff (hot-path CLEAN; hostile found **1 CRITICAL + 1
-  MEDIUM**, BOTH fixed inline): CRITICAL = subscribe NTM-slug-only (was full ~49-index list →
-  envelope breach → boot HALT on healthy fetch); MEDIUM = added `NTM_CONSTITUENCY_FETCH_TIMEOUT_SECS`
-  total-fetch timeout so a stalled niftyindices degrades instead of delaying boot. New constants
-  `NTM_CONSTITUENCY_SLUGS` + `NTM_CONSTITUENCY_FETCH_TIMEOUT_SECS`.
-  - Files: `crates/common/src/constants.rs`
+- [x] Item 1 — add `"NIFTY TOTAL MARKET"` to `NSE_INDEX_ALLOWLIST`; update count tests + docs
+  - Files: `crates/core/src/instrument/index_extractor.rs`
+  - Tests: `allowlist_has_exactly_32_nse_indices`, `full_32_allowlist_plus_sensex_yields_33_indices`,
+    `reports_allowlist_misses_when_an_index_absent`
+- [x] Item 2 — wire `allowlist_misses` → loud boot `info!`/`warn!` self-verify
+  - Files: `crates/core/src/instrument/daily_universe_orchestrator.rs`
+  - Tests: `build_consumes_allowlist_misses_for_boot_self_verify`
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | niftyindices healthy | universe = core + ~750 NTM; both-flags on overlap; `index_constituent_count` > 0 |
-| 2 | niftyindices down | core universe + `NTM-CONSTITUENCY-01` Critical; trading continues |
-| 3 | union > 1200 | `INSTR-FETCH-04` fail-closed HALT |
-| 4 | revert / source outage | exact pre-#10b core universe |
+| 1 | Dhan symbol = "NIFTY TOTAL MARKET" | NTM index value subscribed; `info!` self-verify OK |
+| 2 | Dhan symbol differs | `warn!` miss at boot naming NIFTY TOTAL MARKET; operator corrects |
+| 3 | revert | back to 31 NSE indices; constituents unaffected |

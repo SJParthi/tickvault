@@ -214,6 +214,26 @@ pub fn build_universe_from_bytes(
     // Step 3: extract indices (asserts BSE SENSEX present per §0 quote 2).
     let indices = extract_indices(&rows)?;
 
+    // §31 item 1 self-verify (operator 2026-06-06, "no illusion"): an
+    // allowlisted NSE index whose exact `SYMBOL_NAME` is NOT in today's Dhan
+    // master is a REAL miss — we intended to subscribe that index value and
+    // didn't. This is the boot telemetry that catches a wrong/renamed Dhan
+    // symbol (e.g. the NIFTY Total Market entry) LOUDLY instead of silently
+    // dropping it. Empty list = positive signal (every allowlisted index found).
+    if indices.allowlist_misses.is_empty() {
+        tracing::info!(
+            nse_indices = indices.nse_indices.len(),
+            "index allowlist self-verify OK — every allowlisted NSE index found in the Dhan master"
+        );
+    } else {
+        tracing::warn!(
+            miss_count = indices.allowlist_misses.len(),
+            missed = ?indices.allowlist_misses,
+            "index allowlist MISS — allowlisted NSE index value(s) absent from today's Dhan \
+             master; their live index value will NOT be subscribed (check the exact Dhan SYMBOL_NAME)"
+        );
+    }
+
     // Step 3b: collect the applicable F&O CONTRACTS for the lifecycle master
     // (operator lock 2026-05-29 Quote 5, §5). Stock F&O is matched by
     // underlying→NSE_EQ resolution; index F&O is matched by EXCHANGE (NSE/BSE)
@@ -547,6 +567,26 @@ mod tests {
         assert!(
             msg.contains("CSV") || msg.contains("parse") || msg.contains("missing"),
             "got: {msg}"
+        );
+    }
+
+    /// §31 item 1 (operator "no illusion"): the orchestrator MUST consume
+    /// `indices.allowlist_misses` and log it, so a wrong/renamed Dhan index
+    /// symbol surfaces at boot instead of silently dropping the index value.
+    /// Source-scan guard (audit Rule 13: a computed-but-never-consumed field
+    /// is a bug) — blocks regression back to a dead field.
+    #[test]
+    fn build_consumes_allowlist_misses_for_boot_self_verify() {
+        let src = include_str!("daily_universe_orchestrator.rs");
+        assert!(
+            src.contains("indices.allowlist_misses"),
+            "orchestrator MUST consume allowlist_misses (the §31 boot self-verify); \
+             a computed-but-unlogged field is a dead-field bug (audit Rule 13)"
+        );
+        assert!(
+            src.contains("index allowlist MISS"),
+            "the allowlist-miss path MUST emit a loud warn so a wrong Dhan symbol \
+             is visible at boot, not silent"
         );
     }
 }
