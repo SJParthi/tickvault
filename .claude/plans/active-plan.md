@@ -21,13 +21,19 @@ Operator-provided source (rule §31 item 7):
 
 ## Plan Items
 
-- [ ] Item 1 — `index_constituency/downloader.rs` — hardened HTTP client
+**Adversarial 3-agent review (done):** hot-path = CLEAN (confirmed cold-path,
+no banned unwraps, bounded). hostile = H1 (missing_isin dropped) + M1 (no
+Series=EQ filter) — both FIXED below. security = (see PR body). Fixes:
+`ConstituencyBuildMetadata.missing_isin` added + summed in `assemble_map` (H1);
+parser now filters `Series=EQ` with `skipped_non_eq` count (M1).
+
+- [x] Item 1 — `index_constituency/downloader.rs` — hardened HTTP client
   - Files: `crates/core/src/instrument/index_constituency/downloader.rs`, `mod.rs`
   - Mirror `csv_downloader.rs`: `redirect::Policy::none()`, body cap, 10 s connect /
     60 s read timeout, Content-Type allowlist (`text/csv`/`octet-stream`/`plain`),
     typed `ConstituencyDownloadError` enum. URL = base const + filename arg.
   - Tests: `redirect_policy_is_none`, `rejects_html_content_type`, `body_cap_enforced`
-- [ ] Item 2 — `index_constituency/parser.rs` — robust constituent-CSV parser
+- [x] Item 2 — `index_constituency/parser.rs` — robust constituent-CSV parser
   - Files: `crates/core/src/instrument/index_constituency/parser.rs`
   - Columns `Company Name, Industry, Symbol, Series, ISIN Code` → `IndexConstituent`
     (`index_name` arg, `symbol`, `isin`, `sector=Industry`, `weight=0.0`,
@@ -38,20 +44,20 @@ Operator-provided source (rule §31 item 7):
   - Tests: header parse, BOM strip, CRLF, quoted commas, disclaimer-row skip,
     missing-ISIN row handling, non-UTF-8 reject, proptest arbitrary-bytes either
     parse-or-reject-cleanly
-- [ ] Item 3 — `index_constituency/cache.rs` — JSON cache round-trip
+- [x] Item 3 — `index_constituency/cache.rs` — JSON cache round-trip
   - Files: `crates/core/src/instrument/index_constituency/cache.rs`
   - Write/read `IndexConstituencyMap` to `data/instrument-cache/<date>/`
     `constituency-map.json` (`INDEX_CONSTITUENCY_CSV_CACHE_FILENAME`); path-traversal
     guard on the date component (reuse `instrument_snapshot::is_valid_trading_date`).
   - Tests: serde round-trip identity, path-traversal reject, missing-file → None
-- [ ] Item 4 — `build_constituency_map(...)` top-level (the wiring call site)
+- [x] Item 4 — `build_constituency_map(...)` top-level (the wiring call site)
   - Files: `crates/core/src/instrument/index_constituency/mod.rs`
   - Calls downloader → parser → assembles `IndexConstituencyMap` (forward + reverse
     maps, build metadata). This is the non-test caller satisfying the pub-fn-wiring
     guard for the parser/downloader pub fns.
   - Tests: end-to-end with an in-memory CSV fixture (no network) → map has expected
     forward/reverse entries + metadata
-- [ ] Item 5 — storage hardening ratchet
+- [x] Item 5 — storage hardening ratchet
   - Files: `crates/storage/tests/constituency_downloader_hardening_guard.rs`
   - Mirror `csv_downloader_hardening_guard.rs`: source-scan pins redirect-none, body
     cap, content-type allowlist, timeouts present.
