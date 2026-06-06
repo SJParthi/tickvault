@@ -2379,6 +2379,24 @@ pub const INDEX_CONSTITUENCY_SLUGS: &[(&str, &str)] = &[
 /// Number of slugs in `INDEX_CONSTITUENCY_SLUGS`.
 pub const INDEX_CONSTITUENCY_SLUG_COUNT: usize = INDEX_CONSTITUENCY_SLUGS.len();
 
+/// The SUBSCRIPTION constituent source (§31 item 4, operator lock 2026-06-06):
+/// the live main-feed subscription is the **NIFTY Total Market union ONLY**
+/// (NTM is the broadest basket and already contains the other indices' members).
+/// The boot turn-on (NTM Sub-PR #10b) fetches THIS slug — NOT the full
+/// `INDEX_CONSTITUENCY_SLUGS` — because the deduped union of all ~49 indices is
+/// ~the entire NSE (~1,900 stocks), which would breach `MAX_DAILY_UNIVERSE_SIZE`
+/// and HALT boot. The full list above is for the (map-only, not-subscribed)
+/// §31-item-2 index→constituents mapping, a separate concern.
+pub const NTM_CONSTITUENCY_SLUGS: &[(&str, &str)] =
+    &[("Nifty Total Market", "ind_niftytotalmarket_list")];
+
+/// Total wall-clock budget for the boot-time NTM constituency fetch (§31 Sub-PR
+/// #10b). niftyindices.com can accept a connection then stall the body (the
+/// per-GET 60s read timeout doesn't bound a slow-loris before the 09:00 open),
+/// so the boot caller wraps the fetch in `tokio::time::timeout(this)` and
+/// DEGRADES to the core universe on expiry (operator policy 2026-06-06).
+pub const NTM_CONSTITUENCY_FETCH_TIMEOUT_SECS: u64 = 30;
+
 /// Slugs known to return 404/HTML from niftyindices.com — skipped by the
 /// CSV downloader so we don't log 14 WARNs + fire an aggregated ERROR every
 /// boot for URLs we already know are wrong. The underlying CSVs almost

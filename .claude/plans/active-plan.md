@@ -1,136 +1,101 @@
-# Implementation Plan: NTM Sub-PR #10a — core NTM-capable orchestrator + bridge + ErrorCode
+# Implementation Plan: NTM Sub-PR #10b — boot turn-on of real NTM data
 
 **Status:** VERIFIED
 **Date:** 2026-06-06
-**Approved by:** Parthiban — AskUserQuestion 2026-06-06: niftyindices failure policy = **Degrade + alert**
-(proceed on the indices + F&O-underlyings core universe + Critical alert; Dhan CSV stays fail-closed
-§4) + standing "once merged, go ahead with the plan".
-**Crate(s) touched:** `core` (`daily_universe_orchestrator.rs`, new bridge fn; `index_constituency/`
-glue), `app` (`daily_universe_boot.rs`/`main.rs` async niftyindices fetch + degrade wiring),
-`common` (`error_code.rs` new `NtmConstituency01SourceDegraded` + rule-file mention),
-`core/notification` (new `NotificationEvent` variant). Feature: `daily_universe_fetcher`.
+**Approved by:** Parthiban — AskUserQuestion 2026-06-06 (niftyindices failure = **Degrade + alert**) +
+standing "once merged, go ahead with the plan always".
+**Crate(s) touched:** `core` (`instr_fetch_runner.rs` — thread `ntm_map`), `app`
+(`daily_universe_boot.rs` — thread `ntm_map`; `main.rs` — best-effort niftyindices fetch +
+`fetch_ntm_constituency_map` helper). Feature: `daily_universe_fetcher`.
 
 ## Context
 
-This is the **live turn-on** of the §31 NTM subscription. Sub-PRs #2–#5 built every piece behind
-the feature flag, passing `ntm_constituents = Vec::new()` so live boot stayed unchanged. #10 wires
-the real data so the ~750-stock NTM union actually flows on the single main-feed WS.
-
-## The seam (verified against merged code)
-
-```
-boot (app, async)                         orchestrator (core, sync)
-─────────────────                         ─────────────────────────
-csv_downloader::fetch_csv() ── dhan_bytes ─┐
-ConstituencyDownloader::fetch_slug(        │
-  "ind_niftytotalmarket_list")             │
-  → Result<Vec<u8>>  [DEGRADE on Err]──ntm_bytes(Option)
-                                           ▼
-        build_universe_from_bytes(dhan_bytes, ntm_bytes: Option<&[u8]>)
-           parse_detailed_csv(dhan_bytes) → rows
-           extract_indices / extract_fno_underlyings / collect_fno_contracts
-           IF ntm_bytes:
-             parse_constituents(ntm,"Nifty Total Market",today) → ParsedConstituents
-             assemble IndexConstituencyMap
-             resolve_constituents(map, &rows) → ResolveOutcome   [DEGRADE on TooManyDangling]
-             BRIDGE: HashMap<(sid,seg),&CsvRow> over rows; map each resolved → cloned CsvRow
-                     → ntm_constituent_rows: Vec<CsvRow>
-           build_daily_universe(indices, fno, fno_contracts, ntm_constituent_rows)
-```
+#10a (merged) made the orchestrator NTM-capable (`build_universe_from_bytes(bytes, ntm_map)` +
+`resolve_ntm_rows` bridge + `NTM-CONSTITUENCY-01`), with all callers passing `None`. #10b is the
+**turn-on**: fetch the real niftyindices constituents at boot and thread them down so the ~750-stock
+NTM union actually flows on the single main-feed WS.
 
 ## Design
 
-- **Bridge fn** (core, e.g. `daily_universe_orchestrator::resolve_ntm_rows(rows: &[CsvRow], ntm_bytes: &[u8], today) -> Result<Vec<CsvRow>, NtmDegradeReason>`):
-  parse → assemble map → `resolve_constituents` → build `HashMap<(security_id,segment), &CsvRow>`
-  (O(N) once) → O(1) lookup per resolved → clone → `Vec<CsvRow>`. Every resolved SID is sourced
-  FROM `rows`, so the lookup never misses; a miss is counted, never panics.
-- **Orchestrator**: `build_universe_from_bytes` gains `ntm_bytes: Option<&[u8]>`. On any NTM-side
-  error (parse / `TooManyDangling` / empty) → **degrade**: log `error!(code=NTM-CONSTITUENCY-01)`,
-  treat NTM as empty, continue building the core universe (NOT an `OrchestratorError`). The Dhan
-  core path stays fail-closed exactly as today.
-- **Boot caller** (app): async `ConstituencyDownloader::fetch_slug("ind_niftytotalmarket_list")`;
-  on `Err` → `None` + degrade alert. Pass `ntm_bytes.as_deref()` to the orchestrator. (Cache-fallback
-  was NOT selected by the operator — pure degrade.)
-- **New `ErrorCode::NtmConstituency01SourceDegraded`** (`NTM-CONSTITUENCY-01`, Severity::Critical,
-  auto-triage NO) + rule-file `.claude/rules/project/ntm-constituency-error-codes.md` (cross-ref test).
-- **New `NotificationEvent::NtmConstituencyDegraded { reason, core_universe_size }`** (Critical) so
-  the operator is paged that today runs without the ~500 cash-only constituents.
+- **`main.rs::fetch_ntm_constituency_map(today)`** (new private async helper) — builds
+  `ConstituencyDownloader` + `build_constituency_map(&dl, NTM_CONSTITUENCY_SLUGS, today)` wrapped in
+  `tokio::time::timeout(NTM_CONSTITUENCY_FETCH_TIMEOUT_SECS = 30s)`. **CRITICAL fix (hostile review):**
+  the SUBSCRIPTION uses the **NTM slug ONLY** (§31 item 4) — NOT the full ~49-index
+  `INDEX_CONSTITUENCY_SLUGS`, whose deduped union ≈ the entire NSE (~1,900 stocks) would breach
+  `MAX_DAILY_UNIVERSE_SIZE` and HALT boot on a *healthy* fetch. **Degrade+alert**: on downloader-init
+  failure OR timeout OR an empty map it logs `error!(code = NTM-CONSTITUENCY-01)` (reason =
+  downloader_init / timeout / fetch_or_parse) and returns `None`; NEVER blocks boot.
+- **Threading:** `cold_build_daily_universe` → `run_daily_universe_boot(.., ntm_map)` (app) →
+  `run_daily_universe_fetch_runner(wrapped, max_attempts, ntm_map.as_ref())` (core) →
+  `build_universe_from_bytes(bytes, ntm_map)`. `Option<&IndexConstituencyMap>` is `Copy`, so the
+  runner's retry closure re-uses it across attempts with no clone.
+- The Dhan CSV path stays **fail-closed §4** (infinite retry); ONLY the niftyindices NTM layer
+  degrades. Subscription set = union of tracked-index constituents (NTM dominates), bounded by the
+  `[100, 1200]` envelope (`INSTR-FETCH-04` halts if exceeded — a data anomaly, not a degrade).
 
 ## Edge Cases
 
-- niftyindices 5xx / timeout / DNS fail → degrade, core universe lives, Critical alert.
-- niftyindices 200 but malformed / non-UTF-8 / missing column → degrade (parse error).
-- `> 0.5%` constituents dangling vs Dhan rows → `resolve_constituents` `TooManyDangling` → degrade.
-- All constituents already F&O underlyings → universe size unchanged; both-flags set (no dup).
-- NTM pushes universe past `MAX_DAILY_UNIVERSE_SIZE = 1200` → `build_daily_universe` envelope reject
-  (fail-closed — this is a Dhan/NTM data anomaly worth halting on, NOT a degrade).
-- Weekend/holiday boot → existing holiday gate; niftyindices fetch best-effort.
+- niftyindices fully down / DNS / 5xx → empty map → `None` + Critical alert → core universe.
+- Some slugs fail, NTM ok → map non-empty → resolve over what's present (best-effort).
+- `>0.5%` constituents dangling vs Dhan rows → `resolve_ntm_rows` degrades to empty (#10a) + alert.
+- All constituents are F&O underlyings → both-flags set, no dup (#5 fold).
+- Union > 1200 → `INSTR-FETCH-04` fail-closed HALT.
+- Weekend/holiday → existing daily orchestrator gate; fetch best-effort.
 
 ## Failure Modes
 
-- NTM source down → DEGRADE + `NTM-CONSTITUENCY-01` Critical (operator-chosen). Core trading continues.
-- Bridge lookup miss (should be impossible) → counted, skipped, never panics.
-- Envelope breach after fold → `INSTR-FETCH-04` fail-closed HALT (unchanged).
-- Dhan CSV failure → §4 infinite-retry fail-closed (unchanged — NTM policy does NOT relax this).
+- NTM source down → DEGRADE + `NTM-CONSTITUENCY-01` Critical (operator-chosen); core trades.
+- Dhan CSV down → §4 infinite-retry fail-closed (UNCHANGED — NTM policy does not relax this).
+- niftyindices slow → bounded by the downloader's connect/read timeouts (#3 §18 hardening); cold path.
 
 ## Test Plan
 
-`cargo test -p tickvault-core --features daily_universe_fetcher` + scoped app + workspace test-compile
-(disk: scoped only — full workspace link exceeds the container; CI is the full-workspace gate).
-
-- bridge: resolved→CsvRow mapping correct; both-case dedup; pure-constituent added; lookup-miss skip.
-- orchestrator degrade: malformed ntm_bytes → core universe built, NTM empty, code emitted (not Err).
-- orchestrator success: valid ntm_bytes → universe grows by the resolved count; counts correct.
-- envelope: NTM over-MAX → `INSTR-FETCH-04` (still fail-closed).
-- ErrorCode: variant + `code_str` + rule-file cross-ref + tag-guard.
-- NotificationEvent severity Critical.
+`cargo test -p tickvault-core --features daily_universe_fetcher` + `-p tickvault-app` (scoped; full
+workspace = CI). Threading is param-only — covered by recompiling the existing runner (8) + boot (11)
+suites with the new arg (all callers updated). The resolve+bridge + degrade behaviour is already
+unit-tested in #10a (`resolve_ntm_rows_*`, `build_universe_with_ntm_map_threads_through`).
+`fetch_ntm_constituency_map` is a thin best-effort wrapper over already-tested `build_constituency_map`
+(network I/O — TEST-EXEMPT by integration boundary; degrade branches are straight-line + logged).
 
 ## Rollback
 
-NTM is degrade-by-design: passing `ntm_bytes = None` (or feature off) restores the exact pre-#10
-core universe. `git revert` clean; no migration. The live turn-on is gated by the niftyindices fetch
-succeeding — a revert or a source outage both fall back to the proven core universe.
+Degrade-by-design: a niftyindices outage OR `git revert` both fall back to the proven core universe
+(the new fetch returns `None` ⇒ identical to pre-#10b boot). No migration, no schema change.
 
 ## Observability
 
-`NTM-CONSTITUENCY-01` Critical → Telegram + `errors.jsonl`; boot `info!` adds the resolved NTM count
-+ `tv_universe_size{kind="index_constituent"}` (already added in #5) now non-zero on success. Audit
-table additions deferred to a follow-up (the lifecycle master already records roles via #9/#5).
+`NTM-CONSTITUENCY-01` Critical → Telegram via the 5-sink error pipeline on degrade; boot `info!`
+logs `indices` + `unique_stocks` on success and the per-phase build log (#5) shows
+`index_constituent_count` non-zero. `tv_universe_size{kind="index_constituent"}` (gauge, #5) becomes
+non-zero on a healthy NTM boot.
 
 ## Plan Items
 
-> **Scoped to Sub-PR #10a (core).** This PR ships the NTM-capable orchestrator + bridge + ErrorCode
-> (param threaded, all callers pass `None`). The niftyindices async fetch + degrade wiring at boot is
-> **Sub-PR #10b** (the repo already references "#10b boot orchestrator") — a separate PR.
-
-- [x] Item 1 — `ErrorCode::NtmConstituency01SourceDegraded` + rule file (cross-ref + tag-guard) +
-  catalogue-size (102→103) + prefix-pattern updated
-  - Files: `crates/common/src/error_code.rs`, `.claude/rules/project/ntm-constituency-error-codes.md`
-  - Tests: `test_all_list_length_matches_catalogue_size`, `test_code_str_follows_expected_prefix_pattern`
-- [x] Item 2 — degrade ALERT via `error!(code = NTM-CONSTITUENCY-01)` (routes to Telegram via the
-  5-sink error pipeline per observability-architecture.md sink 5). A dedicated typed
-  `NotificationEvent::NtmConstituencyDegraded` is DEFERRED to a polish follow-up — the Critical
-  alert already fires through the error-code pipeline, which is the operator-paging path.
-  - Files: `crates/core/src/instrument/daily_universe_orchestrator.rs`
-- [x] Item 3 — `resolve_ntm_rows` bridge fn + `build_universe_from_bytes(bytes, ntm_map: Option<&IndexConstituencyMap>)` + degrade; runner caller passes `None`
-  - Files: `crates/core/src/instrument/daily_universe_orchestrator.rs`,
-    `crates/core/src/instrument/instr_fetch_runner.rs`
-  - Tests: `resolve_ntm_rows_bridges_resolved_to_dhan_rows`,
-    `resolve_ntm_rows_degrades_to_empty_on_dangling`, `build_universe_with_ntm_map_threads_through`
-- [x] Item 4 — adversarial review: §31 end-to-end chain reviewed earlier this session
-  (hot-path CLEAN / security 0 / hostile 0 CRITICAL-HIGH; #10b bridge flagged + now built here).
-  This #10a diff is a contained cold-path extension of that reviewed chain.
-
-> **Deferred to Sub-PR #10b:** boot async niftyindices fetch (`build_constituency_map`) +
-> `cold_build_daily_universe` wiring to pass `Some(&map)` + the fetch/parse degrade-alert site +
-> the boot-path source-scan guard. Turning on real ~750-stock data is #10b.
+- [x] Item 1 — `run_daily_universe_fetch_runner` gains `ntm_map: Option<&IndexConstituencyMap>`;
+  retry closure threads it into `build_universe_from_bytes`
+  - Files: `crates/core/src/instrument/instr_fetch_runner.rs`
+  - Tests: `runner_wires_build_universe_from_bytes`, `runner_wires_tokio_time_sleep`
+- [x] Item 2 — `run_daily_universe_boot` gains `ntm_map: Option<IndexConstituencyMap>`; passes
+  `.as_ref()` to the runner
+  - Files: `crates/app/src/daily_universe_boot.rs`
+  - Tests: `test_run_daily_universe_boot_no_universe_bails`,
+    `test_run_daily_universe_boot_valid_csv_reaches_reconcile_then_fails_closed`
+- [x] Item 3 — `main.rs::fetch_ntm_constituency_map` best-effort fetch + degrade alert; wired into
+  `cold_build_daily_universe`
+  - Files: `crates/app/src/main.rs`
+  - Tests: `test_run_daily_universe_boot_valid_csv_reaches_reconcile_then_fails_closed` (boot path recompiles + green; helper is a network-boundary best-effort wrapper)
+- [x] Item 4 — adversarial review on the #10b diff (hot-path CLEAN; hostile found **1 CRITICAL + 1
+  MEDIUM**, BOTH fixed inline): CRITICAL = subscribe NTM-slug-only (was full ~49-index list →
+  envelope breach → boot HALT on healthy fetch); MEDIUM = added `NTM_CONSTITUENCY_FETCH_TIMEOUT_SECS`
+  total-fetch timeout so a stalled niftyindices degrades instead of delaying boot. New constants
+  `NTM_CONSTITUENCY_SLUGS` + `NTM_CONSTITUENCY_FETCH_TIMEOUT_SECS`.
+  - Files: `crates/common/src/constants.rs`
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | niftyindices healthy | universe = indices + F&O underlyings + ~500 cash NTM; both-flags on overlap |
-| 2 | niftyindices down | core universe only + `NTM-CONSTITUENCY-01` Critical; trading continues |
-| 3 | malformed NTM CSV | degrade (not a boot halt); Dhan core unaffected |
-| 4 | NTM over MAX=1200 | `INSTR-FETCH-04` fail-closed HALT |
-| 5 | revert / feature off | exact pre-#10 core universe |
+| 1 | niftyindices healthy | universe = core + ~750 NTM; both-flags on overlap; `index_constituent_count` > 0 |
+| 2 | niftyindices down | core universe + `NTM-CONSTITUENCY-01` Critical; trading continues |
+| 3 | union > 1200 | `INSTR-FETCH-04` fail-closed HALT |
+| 4 | revert / source outage | exact pre-#10b core universe |
