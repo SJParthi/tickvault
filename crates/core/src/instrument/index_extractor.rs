@@ -109,9 +109,12 @@ pub const NSE_INDEX_ALLOWLIST: &[&str] = &[
     "NIFTY MICROCAP250",
     // §31 item 1 (operator 2026-06-06): NIFTY Total Market — the 33rd tracked
     // index value (32nd NSE entry). Dhan's exact IDX_I symbol is "NIFTY TOTAL MKT"
-    // (abbreviated; SecurityId 46, exch=IDX seg=I) — confirmed from the operator's
-    // Dhan chart screenshot 2026-06-06, NOT guessed. The `allowlist_misses` boot
-    // telemetry still LOUD-warns if the live master ever differs.
+    // (abbreviated). The security_id is READ DYNAMICALLY from the matched live
+    // master row — it is NEVER hardcoded here. The operator's live detailed
+    // master shows the NSE IDX_I row secid = 443 (2026-06-06); an earlier "46"
+    // came from the Dhan web-chart IDX-segment view and was never used as a
+    // value. The `allowlist_misses` boot telemetry LOUD-warns if the live
+    // master ever differs.
     "NIFTY TOTAL MKT",
 ];
 
@@ -498,8 +501,9 @@ mod tests {
     fn allowlist_has_exactly_32_nse_indices() {
         // 31 (§30 lock) + NIFTY TOTAL MKT (§31 item 1, 2026-06-06) = 32.
         assert_eq!(NSE_INDEX_ALLOWLIST.len(), 32);
-        // Dhan's exact IDX_I symbol (secid 46) — confirmed from the operator's
-        // Dhan chart, NOT the long-form "NIFTY TOTAL MARKET".
+        // Dhan's exact IDX_I symbol is "NIFTY TOTAL MKT", NOT the long-form
+        // "NIFTY TOTAL MARKET". The secid is read dynamically from the live
+        // master (operator's live master = 443; "46" was the Dhan-chart IDX view).
         assert!(NSE_INDEX_ALLOWLIST.contains(&"NIFTY TOTAL MKT"));
         // Every entry must already be normalized (uppercase, single-spaced)
         // so the runtime match is a direct equality.
