@@ -28,7 +28,7 @@
   WHERE ts >= today()
   ```
 - [ ] Review any alerts that fired during the day
-- [ ] Log any manual interventions in `docs/templates/override_log.md`
+- [ ] Log any manual interventions in `docs/templates/override-log.md`
 - [ ] Note any anomalies for system improvement
 - [ ] Shutdown checklist: system halted cleanly, Valkey persisted, disk OK
 
