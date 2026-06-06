@@ -1,80 +1,84 @@
-# Implementation Plan: NTM index value (§31 item 1) + allowlist self-verify
+# Implementation Plan: NTM Map-A — index_constituency persistence layer
 
 **Status:** VERIFIED
 **Date:** 2026-06-06
-**Approved by:** Parthiban — AskUserQuestion 2026-06-06: "Standard name + boot self-verify" +
-"NTM index value now, full map later" (after he asked whether the NTM index value was actually added).
-**Crate(s) touched:** `core` (`index_extractor.rs` — add the 32nd allowlist entry;
-`daily_universe_orchestrator.rs` — wire the `allowlist_misses` boot log). Feature:
-`daily_universe_fetcher`.
+**Approved by:** Parthiban — "yes do this … I need guarantee and assurance" + "full per-index
+mapping" (AskUserQuestion 2026-06-06). Split Map-A (this PR, persistence) → Map-B (boot wiring).
+**Crate(s) touched:** `storage` (new `index_constituency_persistence.rs` + `lib.rs` registration).
+Feature: `daily_universe_fetcher`. **No boot change** — self-contained, fully tested first.
 
 ## Context
 
-Operator verification caught a real gap: #3/#4/#5/#10b subscribe the ~750 NTM **constituent
-stocks**, but the **NIFTY Total Market INDEX value itself** (§31 item 1, the 33rd tracked index)
-was NEVER added to `NSE_INDEX_ALLOWLIST` (31 NSE entries, no NTM). Also found: `allowlist_misses`
-was a **dead field** — computed in `extract_indices` but never logged — so the "self-verify" was an
-illusion. Operator's "no hallucination / real-time guarantee" demands both fixed.
+§31 item 2 + operator verification: the full index→constituents mapping for all ~46 tracked
+indices must be **persisted + queryable both directions** ("which indices is stock X in / which
+stocks in index Y"). No `index_constituency` table existed. Map-A ships the persistence layer;
+Map-B wires the boot fetch (all 46 lists → resolve per-index → write here), subscription staying
+NTM-union-only.
 
 ## Design
 
-- **Add `"NIFTY TOTAL MARKET"`** as the 32nd `NSE_INDEX_ALLOWLIST` entry → it flows through the
-  existing index path: `extract_indices` matches the live Dhan IDX_I row → `SubscriptionTarget`
-  with `role = Index` → subscribed in Quote mode like the other 31 indices (+ SENSEX = 33 total).
-- **Wire `allowlist_misses` → loud boot log** in `daily_universe_orchestrator::build_universe_from_bytes`:
-  empty ⇒ `info!` positive signal; non-empty ⇒ `warn!` naming the missed index(es). This is the
-  **real, non-illusory self-verify**: if Dhan's exact IDX_I `SYMBOL_NAME` for NTM differs from the
-  standard name, the boot log LOUD-warns "index allowlist MISS … NIFTY TOTAL MARKET" instead of
-  silently dropping it — operator then corrects with the verbatim symbol.
+- New table `index_constituency` — one row per `(trading_date, index_name, security_id,
+  exchange_segment)`. Columns: `ts` (designated = IST trading-date midnight), `index_name` SYMBOL,
+  `security_id` LONG, `exchange_segment` SYMBOL, `symbol_name` SYMBOL, `isin` SYMBOL, `via_isin`
+  BOOLEAN, `source` SYMBOL, `dry_run` BOOLEAN.
+- **DEDUP UPSERT KEYS `(ts, index_name, security_id, exchange_segment)`** — `ts` (designated, =
+  trading date) keeps daily rebalance history; `index_name` distinguishes the same stock across
+  its many indices; `security_id`+`exchange_segment` is I-P1-11 composite identity.
+- `ensure_index_constituency_table` (idempotent DDL), `build_index_constituency_ilp_row` (pure ILP
+  builder), `append_index_constituency_rows` (bulk ILP on `spawn_blocking`). Mirrors the canonical
+  `instrument_lifecycle_persistence` template.
 
 ## Edge Cases
 
-- Dhan's symbol == "NIFTY TOTAL MARKET" → matched, subscribed, `info!` OK.
-- Dhan's symbol differs (e.g. "NIFTY TOTAL MKT") → `warn!` miss at boot; index value not subscribed
-  until corrected (constituents unaffected — they come from niftyindices, not this allowlist).
-- Index temporarily absent from the master → same `warn!` path (correct: it IS a miss).
-- +1 index vs the `[100,1200]` universe envelope → ample headroom; no overflow.
+- Same stock in many indices → distinct rows (index_name in the key), not collapsed.
+- Empty `isin` (symbol-fallback) → SYMBOL skipped (→ NULL, not empty ILP symbol); `via_isin=false`.
+- Re-run same day → DEDUP UPSERT in place (idempotent); next day → new partition rows (history).
+- Large row count (~thousands of (index,stock) pairs) → ILP bulk (not the `/exec` URL door).
+- Cross-segment `security_id` reuse → segment in the key prevents collision (I-P1-11).
 
 ## Failure Modes
 
-- Wrong/renamed Dhan symbol → loud `warn!` (visible), NOT silent drop — the operator-chosen
-  self-verify. No boot block (an index-value miss is a degrade, not fail-closed).
-- The constituent-stock subscription is independent of this allowlist (niftyindices-sourced), so a
-  miss here never affects the ~750 stocks.
+- DDL non-2xx / transient → `warn!` (mirrors sibling ensure_*); the bulk write surfaces a hard
+  `Err` the Map-B caller logs + the next idempotent boot re-runs.
+- ILP connect/flush failure → `Err` propagated; idempotent re-run safe (DEDUP).
 
 ## Test Plan
 
-`cargo test -p tickvault-core --features daily_universe_fetcher` (index_extractor + orchestrator).
-Count assertions updated (31→32, 32→33, 30→31 misses); `allowlist_has_exactly_32_nse_indices`
-asserts membership; new `build_consumes_allowlist_misses_for_boot_self_verify` source-scan guard
-blocks the dead-field regression (audit Rule 13). Orchestrator + daily_universe + boot suites
-recompile green (no count drift — fixtures use dynamic `len()`).
+`cargo test -p tickvault-storage --features daily_universe_fetcher`:
+- `test_table_name_constant_is_stable`, `test_dedup_key_includes_segment_and_index_and_designated_ts`,
+  `test_ddl_columns_constant_matches_schema`, `test_build_ilp_row_symbols_before_fields_and_contains_values`,
+  `test_build_ilp_row_skips_empty_isin`.
+- `dedup_segment_meta_guard` (workspace meta-guard) — confirms the new DEDUP key includes segment.
+- pure ILP builder unit-tested via `buffer.as_bytes()`; network paths TEST-EXEMPT (Map-B boot
+  integration exercises the flush).
 
 ## Rollback
 
-`git revert` removes the one allowlist entry + the log wiring; the universe returns to the prior 31
-NSE indices. No schema/migration. The constituent-stock path is untouched.
+Pure-additive new module + 1 `lib.rs` line; nothing consumes it yet (Map-B will). `git revert` is
+clean — no migration, no caller. The table is `CREATE IF NOT EXISTS` so even a half-applied deploy
+self-heals.
 
 ## Observability
 
-`info!`/`warn!` boot self-verify line (the new real telemetry). `tv_universe_size{kind="index"}`
-(existing) reflects the +1 index on a healthy boot. No new error code (a miss is a `warn!`, not a
-typed failure class).
+The table itself IS the queryable observability (both-direction SQL). Map-B adds the boot write +
+counts + degrade alert. No new error code (write failure is a propagated `Err` + `warn!`).
 
 ## Plan Items
 
-- [x] Item 1 — add `"NIFTY TOTAL MARKET"` to `NSE_INDEX_ALLOWLIST`; update count tests + docs
-  - Files: `crates/core/src/instrument/index_extractor.rs`
-  - Tests: `allowlist_has_exactly_32_nse_indices`, `full_32_allowlist_plus_sensex_yields_33_indices`,
-    `reports_allowlist_misses_when_an_index_absent`
-- [x] Item 2 — wire `allowlist_misses` → loud boot `info!`/`warn!` self-verify
-  - Files: `crates/core/src/instrument/daily_universe_orchestrator.rs`
-  - Tests: `build_consumes_allowlist_misses_for_boot_self_verify`
+- [x] Item 1 — `index_constituency_persistence.rs`: table const, composite DEDUP key, DDL, pure ILP
+  builder, bulk writer
+  - Files: `crates/storage/src/index_constituency_persistence.rs`, `crates/storage/src/lib.rs`
+  - Tests: `test_table_name_constant_is_stable`,
+    `test_dedup_key_includes_segment_and_index_and_designated_ts`,
+    `test_ddl_columns_constant_matches_schema`,
+    `test_build_ilp_row_symbols_before_fields_and_contains_values`,
+    `test_build_ilp_row_skips_empty_isin`
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | Dhan symbol = "NIFTY TOTAL MARKET" | NTM index value subscribed; `info!` self-verify OK |
-| 2 | Dhan symbol differs | `warn!` miss at boot naming NIFTY TOTAL MARKET; operator corrects |
-| 3 | revert | back to 31 NSE indices; constituents unaffected |
+| 1 | RELIANCE in NIFTY 50 + NIFTY BANK + NTM | 3 distinct rows (one per index) |
+| 2 | constituent resolved via symbol fallback (no ISIN) | row with isin NULL, via_isin=false |
+| 3 | same-day re-run | DEDUP UPSERT in place (no dup) |
+| 4 | next trading day | new partition rows (rebalance history kept) |
