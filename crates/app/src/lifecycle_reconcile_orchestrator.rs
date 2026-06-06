@@ -247,6 +247,8 @@ mod tests {
     ) -> SubscriptionTarget {
         SubscriptionTarget {
             role,
+            is_fno_underlying: role == InstrumentRole::FnoUnderlying,
+            is_index_constituent: role == InstrumentRole::IndexConstituent,
             csv_row: CsvRow {
                 security_id: sid.to_string(),
                 exch_id: "NSE".to_string(),
