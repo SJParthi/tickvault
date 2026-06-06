@@ -1,94 +1,85 @@
-# Implementation Plan: F2 — market-open self-test asserts the live universe is complete (33 indices + NTM stocks)
+# Implementation Plan: NTM subscription-contract ratchet (build-failing guard for the 33/748/NTM-only invariants)
 
 **Status:** VERIFIED
 **Date:** 2026-06-06
-**Approved by:** Parthiban — "except brutex plan implement everything else dude okay?" (F1 + #1046
-merged; implement F2 now; brutex is out of scope / different repo).
-**Crate(s) touched:** `core` (`crates/core/src/instrument/market_open_self_test.rs` — 2 new
-sub-checks + tests) and `app` (`crates/app/src/main.rs` — populate the 2 new inputs from the stashed
-universe). **No new ErrorCode** — reuses SELFTEST-01 (pass) / SELFTEST-02 (fail), so no rule-file /
-cross-ref / runbook churn.
+**Approved by:** Parthiban — "go ahead" → AskUserQuestion answer "Harden tickvault further".
+**Crate(s) touched:** `core` (new test-only file `crates/core/tests/ntm_subscription_contract_guard.rs`).
+No production code changes. No new ErrorCode.
 
 ## Context
 
-The §31 NTM chain is merged (live subscription = 33 index values + ~748 NTM constituent stocks) and
-F1 proved the build path (#1046). The remaining guard is a FOREVER self-check: every trading day at
-09:16 IST the existing market-open self-test must also confirm the **live universe is complete** —
-the 33 index values and the ~748 NTM constituents are actually in the subscription — so a silent
-regression (niftyindices filename change, a dropped batch, an allowlist drift) pages the operator
-instead of going unnoticed. This turns the daily SELFTEST-01 "Passed" ping into positive proof the
-universe is whole, and routes any shortfall to the existing SELFTEST-02 Degraded page.
+The runtime F2 self-test (#1047) catches universe drift at 09:16 IST. This adds the COMPILE/CI-time
+counterpart: a ratchet that fails the build the instant anyone silently changes the NTM subscription
+contract — the numbers the operator cares about (33 index values, ~748 NTM stocks, NTM-UNION-ONLY
+subscription, cap headroom). The biggest unpinned risk: `NTM_CONSTITUENCY_SLUGS` contents are
+asserted NOWHERE today, so a future edit could expand the subscribed constituent set from "Nifty
+Total Market only" to all ~46 index lists (~the entire NSE), breaching `MAX_DAILY_UNIVERSE_SIZE` and
+the 2-WS lock. This guard pins that decision + the cross-constant relationships that no single
+existing test covers.
 
 ## Design
 
-- Add 2 fields to `MarketOpenSelfTestInputs`: `index_values_subscribed: usize`,
-  `ntm_constituents_subscribed: usize`.
-- Add 2 floor consts:
-  - `INDEX_VALUES_SUBSCRIBED_FLOOR = 30` — the allowlist is 33 (32 NSE incl. NIFTY TOTAL MKT + 1 BSE
-    SENSEX); ≤3 legit per-day absences are tolerated (the exact missing index is already named by the
-    boot `allowlist_misses` telemetry). Below 30 = the index universe collapsed.
-  - `NTM_CONSTITUENTS_SUBSCRIBED_FLOOR = 600` — NTM is ~748; tolerate churn / partial; below 600 =
-    the constituent layer broke or degraded.
-- Add 2 sub-checks in `evaluate_self_test`, both **non-critical** (Degraded class — the feed still
-  trades indices + F&O even with a partial constituent set; not added to `CRITICAL_CHECK_NAMES`):
-  `index_universe_complete`, `ntm_universe_complete`.
-- Bump `TOTAL_SUB_CHECKS` 6 → 8; fix stale "seven"/"six" doc wording.
-- Wire in `main.rs` self-test closure: read `prev_day_ohlcv_boot::stashed_universe()` (already used at
-  main.rs:3633), compute `count_by_role(InstrumentRole::Index)` + `index_constituent_count()`,
-  populate the 2 new inputs (default 0 if no universe stashed → the checks fail loudly, which is
-  correct: no universe at 09:16 = broken). Add both counts to the existing `info!` PROOF line.
+New `crates/core/tests/ntm_subscription_contract_guard.rs` with pure const-relationship assertions:
+
+1. `subscription_slug_is_ntm_only` — `NTM_CONSTITUENCY_SLUGS == [("Nifty Total Market",
+   "ind_niftytotalmarket_list")]` (exactly one; the subscribed constituent source is NTM only).
+2. `ntm_subscription_slug_is_subset_of_full_map` — every `NTM_CONSTITUENCY_SLUGS` entry also exists
+   in `INDEX_CONSTITUENCY_SLUGS` (the map-only superset).
+3. `full_constituency_map_includes_ntm` — `INDEX_CONSTITUENCY_SLUGS` contains the NTM entry.
+4. `index_value_allowlist_includes_ntm` — `NSE_INDEX_ALLOWLIST` contains "NIFTY TOTAL MKT".
+5. `f2_index_floor_within_achievable_bounds` — `1 <= INDEX_VALUES_SUBSCRIBED_FLOOR <=
+   NSE_INDEX_ALLOWLIST.len() + 1` (the +1 = BSE SENSEX = 33 max). Catches a floor set above what's
+   achievable (would page every day).
+6. `f2_ntm_floor_fits_under_cap` — `1 <= NTM_CONSTITUENTS_SUBSCRIBED_FLOOR` AND
+   `(NSE_INDEX_ALLOWLIST.len()+1) + NTM_CONSTITUENTS_SUBSCRIBED_FLOOR <= MAX_DAILY_UNIVERSE_SIZE`.
+7. `universe_cap_accommodates_expected_ntm_union` — documented expected counts
+   (EXPECTED_INDEX_VALUES = 33, EXPECTED_NTM_CONSTITUENTS = 748) satisfy
+   `EXPECTED_INDEX_VALUES + EXPECTED_NTM_CONSTITUENTS <= MAX_DAILY_UNIVERSE_SIZE` AND
+   `MIN_DAILY_UNIVERSE_SIZE <= EXPECTED_INDEX_VALUES` (index-only fallback still clears the min gate).
+
+All assertions are deterministic const reads — no I/O, no feature flag, no network. Not duplicating
+existing single-value pins (`MAX_DAILY_UNIVERSE_SIZE==1200`, allowlist len==32, F2 floors) — this
+guard pins the RELATIONSHIPS between them + the previously-unpinned NTM-only slug contract.
 
 ## Edge Cases
 
-- No universe stashed (boot failed) → counts 0 → both checks fail → Degraded page (correct: universe
-  missing at market open is a real problem the operator must see).
-- NTM source degraded that day (`NTM-CONSTITUENCY-01` already paged at boot) → ntm count ~0 < floor →
-  ntm_universe_complete fails → the 09:16 health snapshot accurately reflects the degraded universe.
-  This is once-per-day (not Rule-4 polling spam) and is the authoritative current-state check.
-- Legit single-index delisting → index count 32 ≥ 30 floor → no false page.
-- All green → SELFTEST-01 Passed with checks_passed = 8 (positive daily proof the universe is whole).
+- Someone adds a 2nd slug to `NTM_CONSTITUENCY_SLUGS` → test 1 fails (the exact regression that would
+  blow the cap).
+- Someone lowers `MAX_DAILY_UNIVERSE_SIZE` below the live union (781) → test 6/7 fail.
+- Someone raises an F2 floor above achievable → test 5/6 fail.
+- Someone removes NTM from the allowlist or the map → test 3/4 fail.
 
 ## Failure Modes
 
-- Pure evaluator — no I/O, no panic paths, zero alloc on the all-green path (existing contract kept).
-- Self-test is observe-only: it ALERTS, never halts the feed (existing design).
-- main.rs read of `stashed_universe()` is `Option` — `None` maps to 0 counts, never panics.
+- Test-only file — cannot affect production behavior. Worst case is a false-positive build break,
+  resolved by reconciling the guard with an intentional contract change (which SHOULD be a conscious,
+  reviewed edit — that's the point).
 
 ## Test Plan
 
-- `cargo test -p tickvault-core --lib instrument::market_open_self_test` — new + existing unit tests:
-  pass-when-complete (checks_passed=8), degraded-when-index-below-floor,
-  degraded-when-ntm-below-floor, both-below-floor lists both names + stays Degraded (not Critical),
-  updated constants-pinned (TOTAL_SUB_CHECKS=8, 2 floors), green baseline updated.
-- `cargo test -p tickvault-app` — main.rs compiles; feature_flag_rollback_guard unaffected.
-- banned-pattern + pub-fn-test + plan-verify + plan-gate green.
+- `cargo test -p tickvault-core --test ntm_subscription_contract_guard` — all 7 assertions green now.
+- banned-pattern + plan-verify + plan-gate green.
 
 ## Rollback
 
-- `git revert` removes the 2 fields + 2 checks + wiring; the self-test reverts to 6 checks; the feed
-  and universe build are untouched (self-test never gated them). Clean, single-PR revert.
+- `git revert` deletes the test file; zero production impact.
 
 ## Observability
 
-- Reuses SELFTEST-01 (Info/pass) + SELFTEST-02 (High/Degraded) — existing Telegram + `tv_self_test_total`
-  counter + the runbook in `wave-3-c-error-codes.md` (already documents SELFTEST-01/02). The two new
-  sub-check names appear in the SELFTEST-02 `failed` list. main.rs `info!` PROOF line adds
-  `index_values` + `ntm_constituents` counts.
+- N/A — compile/CI-time guard. Its "signal" is a red build on contract drift (the strongest signal
+  per the charter's "ratchet test fails the build on regression" demand).
 
 ## Plan Items
 
-- [x] Item 1 — `market_open_self_test.rs`: 2 fields + 2 floor consts + 2 sub-checks + TOTAL_SUB_CHECKS 6→8 + tests
-  - Files: `crates/core/src/instrument/market_open_self_test.rs`
-  - Tests: test_self_test_passes_when_universe_complete, test_self_test_degraded_when_index_universe_below_floor, test_self_test_degraded_when_ntm_universe_below_floor, test_self_test_universe_checks_are_not_critical
-- [x] Item 2 — wire the 2 inputs from the stashed universe in the 09:16 self-test closure
-  - Files: `crates/app/src/main.rs`
-  - Tests: test_self_test_constants_pinned (updated floors/count assertions)
+- [x] Item 1 — add `ntm_subscription_contract_guard.rs` with the 7 cross-constant ratchet tests
+  - Files: `crates/core/tests/ntm_subscription_contract_guard.rs`
+  - Tests: subscription_slug_is_ntm_only, ntm_subscription_slug_is_subset_of_full_map, index_value_allowlist_includes_ntm, universe_cap_accommodates_expected_ntm_union
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | Healthy day: 33 indices + 748 NTM live | SELFTEST-01 Passed, checks_passed=8 (positive proof) |
-| 2 | NTM constituents missing (niftyindices broke) | SELFTEST-02 Degraded names `ntm_universe_complete`; feed runs |
-| 3 | Index universe collapsed (< 30) | SELFTEST-02 Degraded names `index_universe_complete` |
-| 4 | One index legitimately delisted (32 left) | no false page (≥ 30 floor) |
+| 1 | Someone expands NTM subscription to all 46 lists | build FAILS (subscription_slug_is_ntm_only) |
+| 2 | Someone lowers the universe cap below 781 | build FAILS (universe_cap_accommodates_expected_ntm_union) |
+| 3 | Someone drops NTM from the allowlist/map | build FAILS (index_value_allowlist_includes_ntm / full_constituency_map_includes_ntm) |
+| 4 | Healthy contract | all 7 green |
