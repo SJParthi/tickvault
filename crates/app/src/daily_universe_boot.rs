@@ -49,6 +49,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use tickvault_common::config::QuestDbConfig;
+use tickvault_common::instrument_types::IndexConstituencyMap;
 use tickvault_core::instrument::csv_downloader::CsvDownloadError;
 use tickvault_core::instrument::daily_universe::{DailyUniverse, InstrumentRole};
 use tickvault_core::instrument::instr_fetch_loop::LoopOutcome;
@@ -181,6 +182,7 @@ pub async fn run_daily_universe_boot<Fetch, FetchFut>(
     today_ist_nanos: i64,
     dry_run: bool,
     max_attempts: Option<u32>,
+    ntm_map: Option<IndexConstituencyMap>,
 ) -> Result<(DailyUniverseBootOutcome, Arc<DailyUniverse>)>
 where
     Fetch: FnMut(u32) -> FetchFut,
@@ -216,7 +218,8 @@ where
         }
     };
 
-    let (outcome, universe) = run_daily_universe_fetch_runner(wrapped, max_attempts).await;
+    let (outcome, universe) =
+        run_daily_universe_fetch_runner(wrapped, max_attempts, ntm_map.as_ref()).await;
 
     let Some(universe) = universe else {
         anyhow::bail!(
@@ -472,7 +475,7 @@ mod tests {
                 b"SECURITY_ID,EXCH_ID,SEGMENT,INSTRUMENT,SYMBOL_NAME,UNDERLYING_SECURITY_ID\n51,BSE,IDX_I,INDEX,SENSEX,\n".to_vec(),
             )
         };
-        let result = run_daily_universe_boot(&cfg, fetch, 1, 1, false, Some(1)).await;
+        let result = run_daily_universe_boot(&cfg, fetch, 1, 1, false, Some(1), None).await;
         assert!(result.is_err(), "no universe built → boot must bail");
     }
 
@@ -486,7 +489,7 @@ mod tests {
         // wrapper capture → runner Success → universe → counts → reconcile.
         let cfg = cfg_unreachable();
         let fetch = |_attempt: u32| async { Ok::<_, CsvDownloadError>(valid_csv()) };
-        let result = run_daily_universe_boot(&cfg, fetch, 1, 1, false, Some(1)).await;
+        let result = run_daily_universe_boot(&cfg, fetch, 1, 1, false, Some(1), None).await;
         let msg = format!("{:#}", result.expect_err("reconcile must fail-closed"));
         assert!(
             msg.contains("reconcile"),

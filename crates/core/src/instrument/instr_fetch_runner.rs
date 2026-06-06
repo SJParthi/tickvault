@@ -42,6 +42,8 @@ use core::future::Future;
 use tickvault_common::error_code::{ErrorCode, Severity};
 use tracing::{error, info, warn};
 
+use tickvault_common::instrument_types::IndexConstituencyMap;
+
 use super::csv_downloader::CsvDownloadError;
 use super::daily_universe::DailyUniverse;
 use super::daily_universe_orchestrator::{OrchestratorError, build_universe_from_bytes};
@@ -75,6 +77,7 @@ use super::instr_fetch_retry_adapter::TelegramEmit;
 pub async fn run_daily_universe_fetch_runner<Fetch, FetchFut>(
     fetch_fn: Fetch,
     max_attempts: Option<u32>,
+    ntm_map: Option<&IndexConstituencyMap>,
 ) -> (LoopOutcome, Option<DailyUniverse>)
 where
     Fetch: FnMut(u32) -> FetchFut,
@@ -86,9 +89,10 @@ where
     // without this the operator would see "boot BLOCKED" with no clue WHICH
     // underlyings failed to resolve.
     let build_with_diagnostics = |bytes: &[u8]| -> Result<DailyUniverse, OrchestratorError> {
-        // NTM constituents (§31) are passed `None` here — the niftyindices async
-        // fetch + degrade wiring is Sub-PR #10b (this runner stays CSV-bytes-pure).
-        build_universe_from_bytes(bytes, None).inspect_err(|e| {
+        // §31 NTM (Sub-PR #10b): `ntm_map` is the best-effort niftyindices
+        // constituency fetched once by the boot caller; `None` means the source
+        // degraded (caller already emitted NTM-CONSTITUENCY-01) → core universe.
+        build_universe_from_bytes(bytes, ntm_map).inspect_err(|e| {
             let code = e.error_code().code_str();
             warn!(
                 code = code,
@@ -242,7 +246,7 @@ mod tests {
             let next = outcomes.borrow_mut().remove(0);
             async move { next }
         };
-        let (outcome, universe) = run_daily_universe_fetch_runner(fetch, Some(1)).await;
+        let (outcome, universe) = run_daily_universe_fetch_runner(fetch, Some(1), None).await;
         assert_eq!(outcome, LoopOutcome::Exhausted { attempts_used: 1 });
         assert!(universe.is_none());
     }
@@ -260,7 +264,7 @@ mod tests {
             let next = outcomes.borrow_mut().remove(0);
             async move { next }
         };
-        let (outcome, universe) = run_daily_universe_fetch_runner(fetch, Some(1)).await;
+        let (outcome, universe) = run_daily_universe_fetch_runner(fetch, Some(1), None).await;
         assert_eq!(outcome, LoopOutcome::Exhausted { attempts_used: 1 });
         assert!(universe.is_none());
     }
@@ -276,7 +280,7 @@ mod tests {
             let next = outcomes.borrow_mut().pop();
             async move { next.unwrap_or(Err(CsvDownloadError::BodyTooLarge)) }
         };
-        let (outcome, universe) = run_daily_universe_fetch_runner(fetch, Some(0)).await;
+        let (outcome, universe) = run_daily_universe_fetch_runner(fetch, Some(0), None).await;
         assert_eq!(outcome, LoopOutcome::Exhausted { attempts_used: 0 });
         assert!(universe.is_none());
         assert!(!fetch_called, "max_attempts=0 must not invoke fetcher");

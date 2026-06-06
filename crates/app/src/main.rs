@@ -5301,6 +5301,13 @@ async fn cold_build_daily_universe(
         let downloader = Arc::clone(&downloader);
         async move { downloader.fetch_csv().await }
     };
+    // §31 NTM (Sub-PR #10b): best-effort fetch of the NIFTY Total Market
+    // constituents. DEGRADE+ALERT (operator 2026-06-06): a None here means the
+    // niftyindices source failed — the universe builds on the indices +
+    // F&O-underlyings core set and `NTM-CONSTITUENCY-01` already paged. The
+    // Dhan CSV path below stays fail-closed (§4) regardless.
+    let ntm_map = fetch_ntm_constituency_map(now_ist.date_naive()).await;
+
     // §4: infinite retry (None) — boot blocks until a fresh CSV is in hand.
     let (outcome, universe) = tickvault_app::daily_universe_boot::run_daily_universe_boot(
         questdb,
@@ -5309,6 +5316,7 @@ async fn cold_build_daily_universe(
         today_ist_nanos,
         dry_run,
         None,
+        ntm_map,
     )
     .await
     .context("daily-universe boot failed (fail-closed §4)")?;
@@ -5331,6 +5339,80 @@ async fn cold_build_daily_universe(
     tickvault_app::prev_day_ohlcv_boot::stash_universe(std::sync::Arc::clone(&universe));
 
     Ok((outcome, universe))
+}
+
+/// §31 NTM (Sub-PR #10b): best-effort fetch of the NIFTY Total Market (and the
+/// other tracked-index) constituents from niftyindices.com, assembled into an
+/// [`IndexConstituencyMap`] for the universe builder's resolve+bridge step.
+///
+/// **DEGRADE+ALERT (operator AskUserQuestion 2026-06-06):** this NEVER blocks
+/// boot. On any failure (downloader init, all slugs failed → empty map) it logs
+/// `error!(code = NTM-CONSTITUENCY-01)` (→ Telegram via the 5-sink pipeline) and
+/// returns `None`, so the universe builds on the indices + F&O-underlyings core
+/// set. The Dhan CSV path stays fail-closed (§4) independently. Per-slug
+/// download/parse failures are already logged inside `build_constituency_map`.
+///
+/// Cold path — runs once at boot.
+async fn fetch_ntm_constituency_map(
+    today: chrono::NaiveDate,
+) -> Option<tickvault_common::instrument_types::IndexConstituencyMap> {
+    use std::time::Duration;
+    use tickvault_common::constants::{
+        NTM_CONSTITUENCY_FETCH_TIMEOUT_SECS, NTM_CONSTITUENCY_SLUGS,
+    };
+    use tickvault_common::error_code::ErrorCode;
+    use tickvault_core::instrument::index_constituency::build_constituency_map;
+    use tickvault_core::instrument::index_constituency::downloader::ConstituencyDownloader;
+
+    let downloader = match ConstituencyDownloader::new() {
+        Ok(d) => d,
+        Err(err) => {
+            error!(
+                code = ErrorCode::NtmConstituency01SourceDegraded.code_str(),
+                reason = "downloader_init",
+                %err,
+                "NTM constituency downloader init failed — degrading to core universe"
+            );
+            return None;
+        }
+    };
+    // §31 item 4: subscribe the NTM union ONLY (NTM_CONSTITUENCY_SLUGS), NOT the
+    // full ~49-index list (whose union ~= the entire NSE → would breach the
+    // [100,1200] envelope and HALT boot). Total-fetch timeout bounds a stalled
+    // niftyindices before the 09:00 open → degrade.
+    let map = match tokio::time::timeout(
+        Duration::from_secs(NTM_CONSTITUENCY_FETCH_TIMEOUT_SECS),
+        build_constituency_map(&downloader, NTM_CONSTITUENCY_SLUGS, today),
+    )
+    .await
+    {
+        Ok(map) => map,
+        Err(_elapsed) => {
+            error!(
+                code = ErrorCode::NtmConstituency01SourceDegraded.code_str(),
+                reason = "timeout",
+                timeout_secs = NTM_CONSTITUENCY_FETCH_TIMEOUT_SECS,
+                "NTM constituency fetch exceeded its boot budget — degrading to core universe"
+            );
+            return None;
+        }
+    };
+    if map.index_to_constituents.is_empty() {
+        error!(
+            code = ErrorCode::NtmConstituency01SourceDegraded.code_str(),
+            reason = "fetch_or_parse",
+            indices_failed = map.build_metadata.indices_failed,
+            "NTM constituency fetch returned no indices — degrading to core universe \
+             (today runs without the cash-only NTM constituents)"
+        );
+        return None;
+    }
+    info!(
+        indices = map.index_to_constituents.len(),
+        unique_stocks = map.stock_to_indices.len(),
+        "NTM constituency map fetched for the daily-universe build"
+    );
+    Some(map)
 }
 
 // create_log_file_writer is now in boot_helpers module (lib.rs).
