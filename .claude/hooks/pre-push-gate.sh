@@ -61,6 +61,21 @@ echo "╚═══════════════════════�
 
 HEAD_CURRENT=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
 
+# Gate 0: Design-first wall — implementation logic needs an APPROVED plan first.
+# (Fail-closed on a real violation; PASS on docs/CI/hooks/config/deps. Escape
+# hatch: PLAN-EXEMPT in the commit body for genuinely trivial changes.)
+echo "  [0] Design-first wall (plan-gate)..." >&2
+if [ -x "$HOOKS_DIR/plan-gate.sh" ]; then
+  PLAN_OUT=$(timeout 30 "$HOOKS_DIR/plan-gate.sh" "$CWD" 2>&1)
+  PLAN_EXIT=$?
+  echo "$PLAN_OUT" >&2
+  if [ "$PLAN_EXIT" -ne 0 ]; then
+    FAILED=1
+  fi
+else
+  echo "  SKIP: plan-gate.sh not executable" >&2
+fi
+
 # Gate 1: cargo fmt
 echo "  [1/8] cargo fmt --check..." >&2
 FMT_OUT=$(timeout 60 cargo fmt --all -- --check 2>&1)

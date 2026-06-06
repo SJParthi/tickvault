@@ -643,21 +643,24 @@ jobs:
 
       - name: Monitor first 60 seconds for crashes
         run: |
+          REGION="${{ vars.AWS_REGION || 'ap-south-1' }}"
+          IID="${{ secrets.EC2_INSTANCE_ID }}"
           # Poll the app systemd state every 10 seconds for 60 seconds.
-          # If it goes inactive, the deploy failed — roll back.
+          # If it goes inactive, the deploy failed — capture WHY (the on-box
+          # journal) BEFORE rolling back, then roll back.
           FAIL=0
           for i in 1 2 3 4 5 6; do
             STATE=$(aws ssm send-command \
-              --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
-              --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
+              --region "$REGION" \
+              --instance-ids "$IID" \
               --document-name "AWS-RunShellScript" \
               --parameters 'commands=["systemctl is-active tickvault"]' \
               --query 'Command.CommandId' --output text)
             sleep 5
             RESULT=$(aws ssm get-command-invocation \
-              --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
+              --region "$REGION" \
               --command-id "$STATE" \
-              --instance-id ${{ secrets.EC2_INSTANCE_ID }} \
+              --instance-id "$IID" \
               --query 'StandardOutputContent' --output text | tr -d '[:space:]')
             echo "Check $i: systemd state = $RESULT"
             if [ "$RESULT" != "active" ]; then
@@ -667,10 +670,46 @@ jobs:
             sleep 5
           done
           if [ "$FAIL" -eq 1 ]; then
+            # ── Z+ L1 DETECT (2026-06-05 fix, deploy run #176) ───────────────
+            # The app started but DIED inside this 60s verify window — the most
+            # common real failure (a delayed boot-step panic between T+5s and
+            # T+60s). The on-box restart-failure path dumps the journal, but a
+            # crash caught HERE previously rolled back with ZERO diagnostic, so
+            # the operator saw "FAILED" and never learned WHY. Capture the raw
+            # app stdout/stderr + systemd status NOW, before the rollback swaps
+            # the binary back, so the reason reaches BOTH the deploy log AND the
+            # Telegram failure alert. "100% logging — no silent failures."
+            echo "===== APP DIED IN VERIFY WINDOW — capturing on-box diagnostics ====="
+            DIAG_CMD=$(aws ssm send-command \
+              --region "$REGION" \
+              --instance-ids "$IID" \
+              --document-name "AWS-RunShellScript" \
+              --comment "tickvault verify-window crash diagnostics sha=${{ github.sha }}" \
+              --parameters 'commands=["echo ===== systemctl status =====","systemctl status tickvault.service --no-pager -l 2>&1 | tail -n 40 || true","echo ===== app stdout/stderr ONLY last 120 =====","journalctl -u tickvault.service -n 120 --no-pager --output=cat 2>&1 || true"]' \
+              --query 'Command.CommandId' --output text 2>/dev/null || echo "")
+            DIAG=""
+            if [ -n "$DIAG_CMD" ]; then
+              sleep 6
+              DIAG=$(aws ssm get-command-invocation \
+                --region "$REGION" \
+                --command-id "$DIAG_CMD" \
+                --instance-id "$IID" \
+                --query 'StandardOutputContent' --output text 2>/dev/null || echo "(diagnostics fetch failed)")
+            fi
+            echo "----- ON-BOX CRASH DIAGNOSTICS -----"
+            echo "$DIAG"
+            echo "------------------------------------"
+            # Hand the last ~12 lines to the failure-notify step so the operator
+            # sees the reason on Telegram WITHOUT opening the Actions run.
+            {
+              echo "CRASH_DIAG<<EOF_DIAG"
+              echo "$DIAG" | tail -n 12
+              echo "EOF_DIAG"
+            } >> "$GITHUB_ENV"
             echo "ROLLBACK: tickvault is not active after deploy — rolling back"
             aws ssm send-command \
-              --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
-              --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
+              --region "$REGION" \
+              --instance-ids "$IID" \
               --document-name "AWS-RunShellScript" \
               --parameters 'commands=["set -euo pipefail","if [ ! -d /opt/tickvault ]; then echo SKIP_ROLLBACK_NO_DIR; exit 0; fi","cd /opt/tickvault","if [ -f bin/tickvault.backup ]; then mv bin/tickvault.backup bin/tickvault; systemctl restart tickvault; fi"]'
             exit 1
@@ -724,8 +763,17 @@ jobs:
         run: |
           SHORT_SHA="${GITHUB_SHA:0:7}"
           IST_TIME="$(TZ='Asia/Kolkata' date +'%I:%M %p IST')"
+          MSG="🆘 Deploy FAILED at ${IST_TIME} (version ${SHORT_SHA}). The app was auto-stopped to avoid repeated alerts; the next deploy re-enables it. Check the run: ${{ github.run_id }}"
+          # If the app started then crashed inside the 60s verify window, the
+          # Monitor step captured WHY into CRASH_DIAG — forward it so the
+          # operator sees the actual reason on the phone, not just "FAILED".
+          # printf keeps every YAML block-scalar line indented (a bare
+          # unindented continuation line would terminate the `run: |` block).
+          if [ -n "${CRASH_DIAG:-}" ]; then
+            MSG="$(printf '%s\n\nWhy it died (last lines on the box):\n%s' "$MSG" "$CRASH_DIAG")"
+          fi
           aws sns publish \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
             --topic-arn arn:aws:sns:${{ vars.AWS_REGION || 'ap-south-1' }}:${{ steps.acct.outputs.id }}:tv-prod-alerts \
             --subject "🆘 tickvault deploy FAILED" \
-            --message "🆘 Deploy FAILED at ${IST_TIME} (version ${SHORT_SHA}). The app was auto-stopped to avoid repeated alerts; the next deploy re-enables it. Check the run: ${{ github.run_id }}"
+            --message "$MSG"

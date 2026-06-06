@@ -142,6 +142,29 @@ class GetServesPublicHtml(unittest.TestCase):
         self.assertIn("replaceState", html)
         self.assertIn("tv_token", html)
 
+    def test_nuke_message_is_honest_not_optimistic(self) -> None:
+        # The nuke runs async for minutes; the UI must NOT claim "fresh
+        # containers + empty data" the instant it is dispatched (false-OK).
+        html = handler._console_html()
+        self.assertNotIn("fresh containers + empty data", html)
+        self.assertIn("wiping in background", html)
+        # It must poll the REAL outcome and surface both success + the hard-gate
+        # failure (volume still in-use → data NOT wiped).
+        self.assertIn("pollNuke", html)
+        self.assertIn("command-status", html)
+        self.assertIn("DOCKER-RESET-FAILED", html)
+        self.assertIn("NUKE FAILED", html)
+
+
+class ViewCommands(unittest.TestCase):
+    def test_dedup_key_query_url_encodes_the_equals(self) -> None:
+        # The dedup-key count query is the only view query with an `=` in its
+        # value; it MUST be encoded as %3D or QuestDB /exp returns empty and the
+        # "Dedup key columns" panel shows "?". Guard against regression.
+        dedup_cmd = next(c for c in handler._VIEW_COMMANDS if "DEDUP_KEYS=" in c)
+        self.assertIn("upsertKey%3Dtrue", dedup_cmd)
+        self.assertNotIn("upsertKey=true", dedup_cmd)
+
 
 class Latency(unittest.TestCase):
     def test_avg_ns(self) -> None:
@@ -286,6 +309,30 @@ class WipeGate(unittest.TestCase):
     def test_docker_reset_is_in_destructive_set(self) -> None:
         # Membership = market-hours-blocked during 09:15-15:30 IST.
         self.assertIn("docker-reset", handler._DESTRUCTIVE)
+
+    def test_docker_reset_forced_is_hardened_full_nuke(self) -> None:
+        # Regression 2026-06-05: "the nuke didn't wipe the data". The forced
+        # docker-reset must (a) remove containers by VOLUME (not just the literal
+        # name tv-questdb, which missed an off-project QuestDB), (b) fail LOUD
+        # without recreating if the volume survives, and (c) wipe the HOST app
+        # caches the Docker nuke can't see (instrument-cache/spill/dlq).
+        captured: dict = {}
+        orig = handler._ssm_shell
+        handler._ssm_shell = lambda cmds: (captured.__setitem__("cmds", cmds) or "cmd-123")  # type: ignore[assignment]
+        try:
+            resp = self._docker_reset(force=True)
+        finally:
+            handler._ssm_shell = orig  # type: ignore[assignment]
+        self.assertEqual(resp["statusCode"], 200)
+        joined = "\n".join(captured["cmds"])
+        # (a) robust container removal by VOLUME, not just by name
+        self.assertIn("--filter volume=tv-questdb-data", joined)
+        # (b) hard fail-loud gate — must NOT recreate if the volume survives
+        self.assertIn("DOCKER-RESET-FAILED", joined)
+        # (c) host caches wiped too (the dirs the Docker nuke cannot see)
+        self.assertIn("/opt/tickvault/data/instrument-cache", joined)
+        self.assertIn("/opt/tickvault/data/spill", joined)
+        self.assertIn("/opt/tickvault/data/dlq", joined)
 
 
 class HtmlWipeButton(unittest.TestCase):

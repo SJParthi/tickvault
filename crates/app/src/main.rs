@@ -2836,10 +2836,17 @@ async fn main() -> Result<()> {
                 let from = tickvault_app::prev_day_ohlcv_boot::previous_trading_day(today, |d| {
                     cal.is_trading_day(d)
                 });
+                // Capture the expected universe size BEFORE the Arc moves into
+                // the fetch, so the post-fetch coverage verification can compare.
+                let pd_expected = pd_universe.subscription_targets.len();
                 let pd_token = std::sync::Arc::clone(&token_handle);
                 let pd_qcfg = config.questdb.clone();
                 let pd_base = config.dhan.rest_api_base_url.clone();
                 tokio::spawn(async move {
+                    use tickvault_app::prev_day_ohlcv_boot::{
+                        PrevDayCoverage, evaluate_prev_day_coverage, prev_day_csv_dir,
+                        write_prev_day_coverage_csv,
+                    };
                     let summary = tickvault_app::prev_day_ohlcv_boot::run_prev_day_ohlcv_fetch(
                         pd_universe,
                         pd_token,
@@ -2849,12 +2856,37 @@ async fn main() -> Result<()> {
                         today,
                     )
                     .await;
-                    info!(
-                        fetched = summary.fetched,
-                        skipped = summary.skipped,
-                        failed = summary.failed,
-                        "prev-day OHLCV boot fetch done"
-                    );
+                    // Verify coverage (false-OK guard) + write the operator-
+                    // visible CSV (`make prev-day-show`). Fail-soft on FS error.
+                    if let Err(err) = write_prev_day_coverage_csv(
+                        prev_day_csv_dir(),
+                        today,
+                        pd_expected,
+                        &summary,
+                    ) {
+                        warn!(?err, "prev_day_ohlcv: coverage CSV write failed");
+                    }
+                    match evaluate_prev_day_coverage(pd_expected, summary.fetched) {
+                        PrevDayCoverage::Ok { pct } => info!(
+                            pct,
+                            fetched = summary.fetched,
+                            expected = pd_expected,
+                            "PROOF: prev-day OHLCV coverage OK"
+                        ),
+                        PrevDayCoverage::Degraded { pct } => warn!(
+                            pct,
+                            fetched = summary.fetched,
+                            expected = pd_expected,
+                            skipped = summary.skipped,
+                            failed = summary.failed,
+                            "prev-day OHLCV coverage DEGRADED — symbols missing yesterday's candle"
+                        ),
+                        PrevDayCoverage::Empty => error!(
+                            expected = pd_expected,
+                            failed = summary.failed,
+                            "prev-day OHLCV coverage EMPTY — no yesterday candles fetched"
+                        ),
+                    }
                 });
                 info!("prev-day OHLCV boot fetch task spawned");
             }
@@ -3624,35 +3656,53 @@ async fn main() -> Result<()> {
                 let cv_base = config.dhan.rest_api_base_url.clone();
                 let cv_calendar = std::sync::Arc::clone(&trading_calendar);
                 tokio::spawn(async move {
-                    use chrono::{FixedOffset, NaiveTime, TimeZone, Utc};
+                    use chrono::{FixedOffset, TimeZone, Timelike, Utc};
+                    use tickvault_app::cross_verify_1m_boot::{
+                        CrossVerifyStart, decide_cross_verify_start,
+                    };
                     use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
                     let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
                         return;
                     };
                     let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
                     let today_ist = now_ist.date_naive();
-                    if !cv_calendar.is_trading_day(today_ist) {
-                        info!("cross_verify_1m: skipping (non-trading day)");
-                        return;
-                    }
                     if cv_targets.is_empty() {
                         info!("cross_verify_1m: no spot targets — skipping");
                         return;
                     }
-                    let Some(target_time) = NaiveTime::from_hms_opt(15, 31, 0) else {
-                        return;
-                    };
-                    let now_time = now_ist.time();
-                    if now_time >= target_time {
-                        debug!(
-                            now = %now_time,
-                            "cross_verify_1m: skipping (past 15:31 — mid-evening boot)"
-                        );
-                        return;
+                    // Operator on-demand override: `make cross-verify-now` sets
+                    // TICKVAULT_CROSS_VERIFY_NOW=1 to run the verification right
+                    // now (proving the pipeline without waiting for 15:31 IST on
+                    // a live trading day). Fail-soft: a forced run on a quiet day
+                    // just yields an empty/degraded report, never fabricated data.
+                    let force_now = std::env::var("TICKVAULT_CROSS_VERIFY_NOW")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                    let now_secs_of_day = now_ist.time().num_seconds_from_midnight();
+                    let is_trading_day = cv_calendar.is_trading_day(today_ist);
+                    match decide_cross_verify_start(now_secs_of_day, is_trading_day, force_now) {
+                        CrossVerifyStart::SkipNonTradingDay => {
+                            info!("cross_verify_1m: skipping (non-trading day)");
+                            return;
+                        }
+                        CrossVerifyStart::SkipPastTrigger => {
+                            debug!(
+                                now = %now_ist.time(),
+                                "cross_verify_1m: skipping (past 15:31 — mid-evening boot)"
+                            );
+                            return;
+                        }
+                        CrossVerifyStart::RunNow => {
+                            info!(
+                                "cross_verify_1m: TICKVAULT_CROSS_VERIFY_NOW set — running \
+                                 on-demand NOW (operator dry-run)"
+                            );
+                        }
+                        CrossVerifyStart::SleepThenRun(secs_until) => {
+                            info!(secs_until, "cross_verify_1m: sleeping until 15:31:00 IST");
+                            tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+                        }
                     }
-                    let secs_until = (target_time - now_time).num_seconds().max(0) as u64;
-                    info!(secs_until, "cross_verify_1m: sleeping until 15:31:00 IST");
-                    tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
 
                     // IST-midnight-as-epoch nanos (our candles_1m `ts` stores
                     // IST wall-clock as an epoch — data-integrity.md). The day
@@ -6212,6 +6262,14 @@ fn spawn_engine_b_aggregator(
                         metrics::counter!("tv_aggregator_late_ticks_discarded_total")
                             .increment(u64::from(stats.late_count));
                         heartbeat_writer.record_late_ticks(u64::from(stats.late_count));
+                    }
+                    // Option B: a 1-bucket-late tick re-folded its OWN minute's
+                    // high/low/close and was re-emitted via on_seal (UPSERT
+                    // replaced the candle row). Observable, not a silent merge.
+                    if stats.amended_count > 0 {
+                        metrics::counter!("tv_aggregator_amended_ticks_total")
+                            .increment(u64::from(stats.amended_count));
+                        heartbeat_writer.record_amended_ticks(u64::from(stats.amended_count));
                     }
                     if !stats.instrument_found {
                         agg_clone.pre_populate(std::iter::once((

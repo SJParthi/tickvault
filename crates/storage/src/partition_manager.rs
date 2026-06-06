@@ -33,28 +33,41 @@ const PARTITION_DDL_TIMEOUT_SECS: u64 = 30;
 /// listed here because it's high-frequency snapshot data subject to the
 /// same retention rotation. The constant name predates the rotation-vs-
 /// partition-period distinction.
-const HOUR_PARTITIONED_TABLES: &[&str] = &[
-    "ticks",
-    "market_depth",
-    "deep_market_depth",
-    "obi_snapshots",
-    "option_greeks",
-    "dhan_option_chain_raw",
-    "greeks_verification",
-    "pcr_snapshots",
-    "indicator_snapshots",
-    // PR #2 (2026-05-18): `stock_movers`, `option_movers`, and the
-    // 22 `movers_*` matview-source tables retired alongside the
-    // deleted movers pipeline. Their HOUR partitions will be dropped
-    // by the `migrations/0001-drop-movers-tables.sql` one-shot
-    // migration shipped in the same PR.
+// 2026-06-05: corrected to the live post-cleanup reality. The previous lists
+// named DELETED tables (greeks / depth / movers / option_chain — modules gone)
+// and OMITTED every live growing table, so the retention sweep visited nothing
+// real → unbounded active-table growth (a storage/cost runaway). `ticks` is the
+// only live HOUR-partitioned table.
+pub(crate) const HOUR_PARTITIONED_TABLES: &[&str] = &["ticks"];
+
+/// DAY-partitioned **audit + daily-data** tables the retention sweep DETACHes
+/// past the hot window. The 21 live **candle** tables (`candles_1m` …
+/// `candles_1d`) are NOT listed here — they are swept by iterating
+/// [`crate::shadow_persistence::candle_table_names`] (the single source of
+/// truth, `TfIndex::table_name()`) so the candle names can never drift.
+///
+/// **Honest boundary:** `detach_old_partitions` uses `ALTER TABLE … DETACH
+/// PARTITION` — it moves old partitions to a local `detached/` dir (SEBI-safe,
+/// never DROP). Actually freeing EBS requires S3-upload + local cleanup of the
+/// detached partitions — a SEPARATE, AWS-dependent piece that is NOT yet
+/// implemented. This list bounds the *active* table and is the prerequisite for
+/// archival; it does not by itself reclaim disk.
+pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
+    // Audit + daily-data tables (SEBI 5y → detach to S3 cold when archival ships).
+    "instrument_fetch_audit",
+    "instrument_lifecycle_audit",
+    "option_chain_minute_snapshot",
+    "prev_day_ohlcv",
+    "cross_verify_1m_audit",
 ];
 
-/// Tables with DAY partitioning (lower-frequency data).
+/// Tables EXEMPT from retention sweeping — NEVER detached or dropped.
 ///
-/// PR-E (2026-05-26): `historical_candles` removed alongside the deleted
-/// Dhan historical fetch chain.
-const DAY_PARTITIONED_TABLES: &[&str] = &["candles_1s"];
+/// `instrument_lifecycle` is the SEBI point-in-time master: every instrument
+/// EVER observed, never deleted (daily-universe §5/§25). It must stay whole for
+/// point-in-time reconstruction, so it is never swept even though it is
+/// `PARTITION BY DAY`. It is small (~219K rows) so it does not need sweeping.
+pub(crate) const RETENTION_EXEMPT_TABLES: &[&str] = &["instrument_lifecycle"];
 
 // ---------------------------------------------------------------------------
 // Partition Manager
@@ -110,8 +123,13 @@ impl PartitionManager {
             "starting partition detach cycle"
         );
 
-        // HOUR-partitioned tables
+        // HOUR-partitioned tables. Defense-in-depth: never sweep an exempt
+        // (SEBI point-in-time, never-delete) table even if one is mistakenly
+        // added to a sweep list — the exempt set is the final guard.
         for table in HOUR_PARTITIONED_TABLES {
+            if RETENTION_EXEMPT_TABLES.contains(table) {
+                continue;
+            }
             match self
                 .detach_partitions_for_table(table, cutoff_days, "HOUR")
                 .await
@@ -128,8 +146,36 @@ impl PartitionManager {
             }
         }
 
-        // DAY-partitioned tables
+        // DAY-partitioned audit/data tables (same exempt guard as the HOUR loop).
         for table in DAY_PARTITIONED_TABLES {
+            if RETENTION_EXEMPT_TABLES.contains(table) {
+                continue;
+            }
+            match self
+                .detach_partitions_for_table(table, cutoff_days, "DAY")
+                .await
+            {
+                Ok(count) => {
+                    total_detached = total_detached.saturating_add(count);
+                    if count > 0 {
+                        info!(table, detached = count, "partitions detached");
+                    }
+                }
+                Err(err) => {
+                    warn!(?err, table, "failed to detach partitions");
+                }
+            }
+        }
+
+        // The 21 live candle tables (`candles_1m` … `candles_1d`), DAY-partitioned.
+        // Derived from `candle_table_names()` (the single source of truth,
+        // `TfIndex::table_name()`) so the swept names can NEVER drift from what is
+        // actually created/written. This is the dominant disk-growth source —
+        // #1022 named phantom `candles_*_shadow` tables and missed it.
+        for table in crate::shadow_persistence::candle_table_names() {
+            if RETENTION_EXEMPT_TABLES.contains(&table) {
+                continue;
+            }
             match self
                 .detach_partitions_for_table(table, cutoff_days, "DAY")
                 .await
@@ -325,6 +371,71 @@ mod tests {
     }
 
     #[test]
+    fn test_ticks_is_the_only_hour_table() {
+        assert_eq!(HOUR_PARTITIONED_TABLES, &["ticks"]);
+    }
+
+    #[test]
+    fn test_day_list_holds_the_audit_data_tables() {
+        // The DAY const holds ONLY the audit/data tables; candle tables are
+        // swept via candle_table_names() in detach_old_partitions (see
+        // test_candle_tables_are_real_plain_names).
+        for live in [
+            "instrument_fetch_audit",
+            "instrument_lifecycle_audit",
+            "option_chain_minute_snapshot",
+            "prev_day_ohlcv",
+            "cross_verify_1m_audit",
+        ] {
+            assert!(
+                DAY_PARTITIONED_TABLES.contains(&live),
+                "audit/data table not covered by retention sweep: {live}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_candle_tables_are_real_plain_names_not_shadow() {
+        // The candle tables swept by detach_old_partitions come from the single
+        // source of truth. They MUST be plain `candles_<TF>` (no `_shadow`) and
+        // number 21 — this is the exact bug #1022 had (phantom `_shadow` names).
+        let names = crate::shadow_persistence::candle_table_names();
+        assert_eq!(names.len(), 21, "expected 21 live candle tables");
+        for name in names {
+            assert!(
+                name.starts_with("candles_"),
+                "candle table name not canonical: {name}"
+            );
+            assert!(
+                !name.contains("_shadow"),
+                "candle table must be plain (no _shadow): {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_instrument_lifecycle_is_exempt_never_swept() {
+        // SEBI point-in-time master — never detached/dropped (daily-universe §5/§25).
+        assert!(RETENTION_EXEMPT_TABLES.contains(&"instrument_lifecycle"));
+        assert!(
+            !HOUR_PARTITIONED_TABLES.contains(&"instrument_lifecycle"),
+            "instrument_lifecycle must NEVER be swept (SEBI)"
+        );
+        assert!(
+            !DAY_PARTITIONED_TABLES.contains(&"instrument_lifecycle"),
+            "instrument_lifecycle must NEVER be swept (SEBI)"
+        );
+    }
+
+    #[test]
+    fn test_exempt_tables_never_appear_in_a_sweep_list() {
+        for ex in RETENTION_EXEMPT_TABLES {
+            assert!(!HOUR_PARTITIONED_TABLES.contains(ex));
+            assert!(!DAY_PARTITIONED_TABLES.contains(ex));
+        }
+    }
+
+    #[test]
     fn test_parse_partition_names_valid() {
         let json = r#"{"columns":[{"name":"name","type":"VARCHAR"}],"dataset":[["2026-04-01"],["2026-04-02"]],"count":2}"#;
         let names = parse_partition_names(json);
@@ -361,13 +472,8 @@ mod tests {
         assert_eq!(names[0], "2026-04-01T09");
     }
 
-    #[test]
-    fn test_obi_in_hour_partitioned_tables() {
-        assert!(
-            HOUR_PARTITIONED_TABLES.contains(&"obi_snapshots"),
-            "obi_snapshots must be in HOUR-partitioned list"
-        );
-    }
+    // (removed test_obi_in_hour_partitioned_tables — `obi_snapshots` is a
+    // deleted table; the 2026-06-05 retention fix dropped it from the list.)
 
     #[test]
     fn test_ticks_in_hour_partitioned_tables() {

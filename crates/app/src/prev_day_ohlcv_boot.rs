@@ -189,6 +189,180 @@ pub struct PrevDayFetchSummary {
     pub failed: usize,
 }
 
+/// Minimum % of subscription targets that must have yesterday's daily candle
+/// for the pre-market fetch to count as healthy (mirrors the 90% live-vs-
+/// historical cross-match bar). Below this → degraded (false-OK guard,
+/// audit-findings Rule 11 — never report OK on a thin/empty set).
+pub const PREV_DAY_COVERAGE_MIN_PCT: u32 = 90;
+
+/// Directory for the per-day pre-market coverage report CSV.
+const PREV_DAY_CSV_DIR: &str = "data/prev-day";
+
+/// Where the pre-market coverage CSV is written (operator-visible surface).
+pub const fn prev_day_csv_dir() -> &'static str {
+    PREV_DAY_CSV_DIR
+}
+
+/// Verdict for the pre-market prev-day fetch coverage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrevDayCoverage {
+    /// Coverage met the bar.
+    Ok { pct: u32 },
+    /// Some symbols missing yesterday's candle (below the bar).
+    Degraded { pct: u32 },
+    /// No yesterday candles at all (or no targets) — nothing to vouch for.
+    Empty,
+}
+
+/// Pure verification: did the pre-market fetch get yesterday's daily candle for
+/// enough of the subscribed universe? `expected` = number of subscription
+/// targets; `fetched` = how many got a valid candle persisted. Never reports
+/// `Ok` on an empty set (audit-findings Rule 11 — no false-OK).
+pub fn evaluate_prev_day_coverage(expected: usize, fetched: usize) -> PrevDayCoverage {
+    if expected == 0 || fetched == 0 {
+        return PrevDayCoverage::Empty;
+    }
+    let pct = ((fetched as u64).saturating_mul(100) / expected as u64) as u32;
+    if pct >= PREV_DAY_COVERAGE_MIN_PCT {
+        PrevDayCoverage::Ok { pct }
+    } else {
+        PrevDayCoverage::Degraded { pct }
+    }
+}
+
+/// Render the one-row coverage report as CSV text (pure — unit-tested). A human
+/// opens this in Excel; `make prev-day-show` prints it.
+pub fn coverage_csv(
+    trading_date_ist: NaiveDate,
+    expected: usize,
+    summary: &PrevDayFetchSummary,
+) -> String {
+    let outcome = match evaluate_prev_day_coverage(expected, summary.fetched) {
+        PrevDayCoverage::Ok { .. } => "ok",
+        PrevDayCoverage::Degraded { .. } => "degraded",
+        PrevDayCoverage::Empty => "empty",
+    };
+    let pct = if expected == 0 {
+        0
+    } else {
+        ((summary.fetched as u64).saturating_mul(100) / expected as u64) as u32
+    };
+    format!(
+        "trading_date_ist,expected,fetched,skipped,failed,coverage_pct,outcome\n\
+         {trading_date_ist},{expected},{f},{s},{fl},{pct},{outcome}\n",
+        f = summary.fetched,
+        s = summary.skipped,
+        fl = summary.failed,
+    )
+}
+
+/// Write the coverage CSV to `data/prev-day/prev-day-coverage-YYYY-MM-DD.csv`.
+/// Thin FS wrapper around `coverage_csv`; the caller logs on `Err` (fail-soft).
+pub fn write_prev_day_coverage_csv(
+    dir: &str,
+    trading_date_ist: NaiveDate,
+    expected: usize,
+    summary: &PrevDayFetchSummary,
+) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = std::path::Path::new(dir).join(format!("prev-day-coverage-{trading_date_ist}.csv"));
+    std::fs::write(&path, coverage_csv(trading_date_ist, expected, summary))?;
+    Ok(path)
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::{
+        PREV_DAY_COVERAGE_MIN_PCT, PrevDayCoverage, PrevDayFetchSummary, coverage_csv,
+        evaluate_prev_day_coverage, prev_day_csv_dir, write_prev_day_coverage_csv,
+    };
+    use chrono::NaiveDate;
+
+    fn date() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 6, 4).unwrap()
+    }
+
+    #[test]
+    fn test_evaluate_prev_day_coverage_full_is_ok() {
+        assert_eq!(
+            evaluate_prev_day_coverage(243, 243),
+            PrevDayCoverage::Ok { pct: 100 }
+        );
+    }
+
+    #[test]
+    fn test_evaluate_prev_day_coverage_at_threshold_is_ok() {
+        // 90 of 100 = exactly the bar.
+        assert_eq!(
+            evaluate_prev_day_coverage(100, PREV_DAY_COVERAGE_MIN_PCT as usize),
+            PrevDayCoverage::Ok { pct: 90 }
+        );
+    }
+
+    #[test]
+    fn test_evaluate_prev_day_coverage_below_threshold_is_degraded() {
+        assert_eq!(
+            evaluate_prev_day_coverage(100, 89),
+            PrevDayCoverage::Degraded { pct: 89 }
+        );
+    }
+
+    #[test]
+    fn test_evaluate_prev_day_coverage_zero_fetched_is_empty() {
+        assert_eq!(evaluate_prev_day_coverage(243, 0), PrevDayCoverage::Empty);
+    }
+
+    #[test]
+    fn test_evaluate_prev_day_coverage_zero_expected_is_empty() {
+        assert_eq!(evaluate_prev_day_coverage(0, 0), PrevDayCoverage::Empty);
+    }
+
+    #[test]
+    fn test_coverage_csv_has_header_and_row() {
+        let s = PrevDayFetchSummary {
+            fetched: 240,
+            skipped: 2,
+            failed: 1,
+        };
+        let csv = coverage_csv(date(), 243, &s);
+        assert!(csv.starts_with(
+            "trading_date_ist,expected,fetched,skipped,failed,coverage_pct,outcome\n"
+        ));
+        assert!(csv.contains("2026-06-04,243,240,2,1,98,ok\n"));
+    }
+
+    #[test]
+    fn test_coverage_csv_marks_empty_outcome() {
+        let s = PrevDayFetchSummary {
+            fetched: 0,
+            skipped: 0,
+            failed: 243,
+        };
+        let csv = coverage_csv(date(), 243, &s);
+        assert!(csv.contains(",0,0,243,0,empty\n"));
+    }
+
+    #[test]
+    fn test_write_prev_day_coverage_csv_writes_expected_content() {
+        let dir = std::env::temp_dir().join(format!("tv-prevday-{}", std::process::id()));
+        let dir_str = dir.to_string_lossy().to_string();
+        let s = PrevDayFetchSummary {
+            fetched: 243,
+            skipped: 0,
+            failed: 0,
+        };
+        let path = write_prev_day_coverage_csv(&dir_str, date(), 243, &s).expect("write ok");
+        let read = std::fs::read_to_string(&path).expect("read ok");
+        assert_eq!(read, coverage_csv(date(), 243, &s));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_prev_day_csv_dir_is_under_data() {
+        assert_eq!(prev_day_csv_dir(), "data/prev-day");
+    }
+}
+
 /// Fetch + persist the previous trading day's daily candle for every
 /// subscription target. Fail-soft per symbol; boot never blocks.
 ///

@@ -207,7 +207,12 @@ _VIEW_COMMANDS = [
     'echo "C15M=$(curl -fsS "${Q}SELECT%20count()%20FROM%20candles_15m%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
     'echo "C60M=$(curl -fsS "${Q}SELECT%20count()%20FROM%20candles_60m%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
     'echo "C1D=$(curl -fsS "${Q}SELECT%20count()%20FROM%20candles_1d%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
-    'echo "DEDUP_KEYS=$(curl -fsS "${Q}SELECT%20count()%20FROM%20table_columns(%27ticks%27)%20WHERE%20upsertKey=true" 2>/dev/null | tail -1)"',
+    # NOTE: the `=` in `upsertKey=true` MUST be URL-encoded as %3D — it is the
+    # ONLY view query carrying a raw `=` inside the ?query= value, which the
+    # QuestDB /exp query-string parser mis-handled, returning empty so the
+    # dashboard "Dedup key columns" panel showed "?". Encoded form = a clean
+    # `count` of the 4 upsert-key columns (ts, security_id, segment, received_at).
+    'echo "DEDUP_KEYS=$(curl -fsS "${Q}SELECT%20count()%20FROM%20table_columns(%27ticks%27)%20WHERE%20upsertKey%3Dtrue" 2>/dev/null | tail -1)"',
     'echo "MAX_TPS=$(curl -fsS "${Q}SELECT%20max(c)%20FROM%20(SELECT%20count()%20c%20FROM%20ticks%20WHERE%20ts%20IN%20today()%20GROUP%20BY%20ts,security_id)" 2>/dev/null | tail -1)"',
     'echo "ERRORS_BEGIN"',
     "journalctl -u tickvault -p err -n 5 --no-pager 2>/dev/null | tail -5 || true",
@@ -481,6 +486,27 @@ def lambda_handler(event, _context):
         if action == "restart-questdb":
             cid = _ssm_shell(["cd /opt/tickvault/repo/deploy/docker && docker compose restart questdb"])
             return _resp(200, {"ok": True, "action": action, "command_id": cid})
+        if action == "command-status":
+            # READ-ONLY (not in _DESTRUCTIVE, allowed off-hours, no force). Lets
+            # the UI poll the REAL outcome of an async SSM command (e.g. the
+            # docker-reset nuke, which runs for minutes) instead of showing a
+            # fake "done" the instant it is dispatched. Returns the SSM status +
+            # a tail of stdout/stderr so the UI can tell "docker-reset-dispatched"
+            # (success) from "DOCKER-RESET-FAILED" (the hard-gate: volume still
+            # in-use → data NOT wiped) — no more false-OK.
+            cid = str(payload.get("command_id", "")).strip()
+            if not cid:
+                return _resp(400, {"error": "command-status requires command_id", "action": action})
+            try:
+                inv = _client("ssm").get_command_invocation(CommandId=cid, InstanceId=INSTANCE_ID)
+            except Exception:  # noqa: BLE001 — not registered yet / box offline
+                # Not an error: the command may not have propagated to SSM yet.
+                return _resp(200, {"ok": True, "action": action, "status": "Pending", "stdout_tail": ""})
+            out = (inv.get("StandardOutputContent", "") or "") + (inv.get("StandardErrorContent", "") or "")
+            return _resp(
+                200,
+                {"ok": True, "action": action, "status": inv.get("Status", ""), "stdout_tail": out[-1500:]},
+            )
         if action == "wipe-questdb":
             # DESTRUCTIVE: empties the market-data tables for a fresh start.
             # Requires force=true (even off-hours) + is in _DESTRUCTIVE
@@ -509,45 +535,62 @@ def lambda_handler(event, _context):
             #
             # Sequence (each step fail-soft so one hiccup can't wedge the box):
             #   1. stop the app (systemd) so it releases the QuestDB connection
-            #      (the in-use volume is exactly why `down -v` was unreliable
-            #      for wipe-questdb — stopping the app first fixes that).
-            #   2. `docker compose down -v --remove-orphans` — drop containers
-            #      + named volumes (QuestDB data, loki, alloy).
-            #   3. `docker system prune -af --volumes` — delete images +
-            #      any remaining unused volumes (the "delete images" intent).
-            #   4. `docker compose up -d` — re-pull the SHA256-pinned images
-            #      and recreate containers on EMPTY volumes.
-            #   5. restart the app — it recreates `ticks` + candle tables fresh
-            #      via `ensure_*_table_dedup_keys`, so the new table is born
-            #      with the correct DEDUP UPSERT KEYS (incl. received_at) — a
-            #      fresh start also clears the stale "sub-second dedup OLD"
-            #      condition. Next instance start is also clean (empty volumes).
+            #      and the volume (an in-use volume is exactly why `volume rm`
+            #      silently failed before).
+            #   2. remove EVERY container that mounts `tv-questdb-data` — by
+            #      VOLUME, not by name — so QuestDB is caught even when it runs
+            #      under a different container name / compose project (the
+            #      documented "outside the compose project" case). THIS is the
+            #      fix for "the nuke didn't wipe the data": the old code removed
+            #      only the literal name `tv-questdb`, so an off-project QuestDB
+            #      kept the volume in-use and `volume rm` no-op'd under `|| true`.
+            #   3. compose down -v + `docker system prune -af --volumes` — drop
+            #      remaining containers, named volumes, and images.
+            #   4. HARD GATE: if `tv-questdb-data` still exists it is still
+            #      in-use → DO NOT `up` (that would re-attach the SAME old
+            #      ticks — the silent-survival bug). Fail LOUD + `exit 1` so the
+            #      operator sees the nuke did not complete, instead of a fake OK.
+            #   5. wipe the HOST app caches too (instrument-cache, spill, dlq)
+            #      under /opt/tickvault/data — these are host dirs the Docker
+            #      nuke cannot see, so "reuse the existing list" survived every
+            #      reset. Logs are preserved for forensics.
+            #   6. `docker compose up -d` on the now-empty volume + restart app —
+            #      it recreates `ticks` + candle + audit tables fresh via
+            #      `ensure_*_table_dedup_keys` with the correct DEDUP keys.
             if not force:
                 return _resp(409, {"error": 'docker-reset is the FULL nuke (deletes volumes + images + ALL data incl. SEBI audit tables) — re-send with {"force": true}', "action": action})
             compose_dir = "/opt/tickvault/repo/deploy/docker"
-            # The data lives in the NAMED volume `tv-questdb-data` (container
-            # `tv-questdb`). `docker compose down -v` in compose_dir does NOT
-            # reliably remove it — QuestDB may run outside this compose project
-            # (the documented wipe-questdb caveat), so `down -v` leaves the
-            # named volume intact and `up` re-attaches the SAME old data. The
-            # fix: force-remove the container BY NAME (releases the volume),
-            # then remove the volume BY NAME, then `up` recreates it EMPTY.
+            data_dir = "/opt/tickvault/data"
             cmds = [
                 "set +e",
+                # 1. stop the app so it releases the QuestDB connection + volume
                 "systemctl stop tickvault || true",
-                # 1. force-remove the data containers BY NAME (releases volumes)
+                # 2. ROBUST: remove EVERY container mounting the data volume, by
+                #    VOLUME not by name — catches an off-project / renamed QuestDB
+                #    that the old by-name `docker rm -f tv-questdb` missed, which
+                #    left the volume in-use so `volume rm` silently no-op'd.
+                "docker ps -aq --filter volume=tv-questdb-data | xargs -r docker rm -f 2>/dev/null || true",
+                # also drop the well-known sidecar containers by name
                 "docker rm -f tv-questdb tv-loki tv-alloy 2>/dev/null || true",
-                # 2. remove the QuestDB data volume BY NAME (the actual ticks/candles)
-                "docker volume rm tv-questdb-data 2>/dev/null || true",
                 # 3. compose-level teardown for anything still managed there
                 f"cd {compose_dir} || exit 0",
                 "docker compose down -v --remove-orphans || true",
-                # 4. belt-and-suspenders: volume again (in case compose re-held it)
-                "docker volume rm tv-questdb-data 2>/dev/null || true",
-                # 5. images + any leftover unused volumes
+                # 4. the volume is now unreferenced — remove it, then prune images
+                "docker volume rm -f tv-questdb-data 2>/dev/null || true",
                 "docker system prune -af --volumes || true",
-                # 6. verify the volume is GONE before recreating (loud if not)
-                "docker volume inspect tv-questdb-data >/dev/null 2>&1 && echo 'WARN: tv-questdb-data still present' || echo 'OK: tv-questdb-data removed'",
+                # 5. HARD GATE — fail LOUD instead of silently re-attaching stale
+                #    data. If the volume survived, it is still in-use; do NOT `up`.
+                "if docker volume inspect tv-questdb-data >/dev/null 2>&1; then "
+                "echo 'DOCKER-RESET-FAILED: tv-questdb-data still present (in-use) — NOT recreating to avoid re-attaching stale data. Holders:'; "
+                "docker ps -a --filter volume=tv-questdb-data --format '{{.Names}} ({{.Status}})'; "
+                "echo docker-reset-FAILED; exit 1; "
+                "fi",
+                "echo 'OK: tv-questdb-data removed'",
+                # 6. wipe HOST app caches too (the Docker nuke can't see these) —
+                #    instrument-cache (the 'reused existing list' that survived),
+                #    spill + dlq. Logs are KEPT for forensics.
+                f"rm -rf {data_dir}/instrument-cache {data_dir}/spill {data_dir}/dlq 2>/dev/null || true",
+                "echo 'OK: host caches wiped (instrument-cache, spill, dlq); logs preserved'",
                 # 7. recreate everything fresh (empty volume) + restart app
                 "docker compose up -d || true",
                 "systemctl enable tickvault || true",
@@ -999,10 +1042,24 @@ async function wipeData(){
 async function dockerReset(){
   if(prompt('⚠️ NUCLEAR RESET. This DELETES Docker containers + volumes + images and rebuilds from scratch — wiping ALL data INCLUDING the SEBI-retention audit tables. The box must be RUNNING. Type NUKE to confirm:')!=='NUKE'){ toast('cancelled'); return; }
   if(!confirm('Last check: every table is destroyed, including audit history. Continue?')){ toast('cancelled'); return; }
-  toast('💥 full Docker reset → rebuilding (may take a minute)…');
+  toast('💥 nuke dispatched → wiping in background (~2-3 min)…');
   const j=await call('docker-reset',{force:true});
-  if(j&&j.ok){ toast('✅ Docker reset started — fresh containers + empty data; app restarting'); setTimeout(loadOverview,8000); }
-  else { toast((j&&j.error)||'docker-reset failed — is the box running?'); } }
+  if(!(j&&j.ok)){ toast((j&&j.error)||'docker-reset failed — is the box running?'); return; }
+  if(!j.command_id){ toast('⚠️ nuke dispatched but no command id — re-check the ticks count in ~3 min'); setTimeout(loadOverview,8000); return; }
+  pollNuke(j.command_id,0); }
+// Poll the REAL nuke outcome instead of claiming success the instant it is
+// dispatched. The teardown (down -v + prune -af + image re-pull + up) runs for
+// minutes; we show the truthful result: complete, FAILED (hard gate — volume
+// still in-use, data NOT wiped), or still-running.
+async function pollNuke(cid,n){
+  if(n>40){ toast('⏳ nuke still running after 3+ min — re-check the ticks count manually'); setTimeout(loadOverview,4000); return; }
+  const s=await call('command-status',{command_id:cid}); const st=(s&&s.status)||'', out=(s&&s.stdout_tail)||'';
+  if(st==='Success'||st==='Failed'||st==='Cancelled'||st==='TimedOut'){
+    if(out.indexOf('DOCKER-RESET-FAILED')>=0){ toast('🔴 NUKE FAILED — QuestDB volume still in use, data NOT wiped. Check the box.'); }
+    else if(out.indexOf('docker-reset-dispatched')>=0){ toast('✅ nuke complete — empty DB; app restarting'); }
+    else { toast('⚠️ nuke finished ('+st+') — re-check the ticks count'); }
+    setTimeout(loadOverview,6000); return; }
+  setTimeout(()=>pollNuke(cid,n+1),5000); }
 
 function startAuto(){ stopAuto(); if($('auto').checked) timer=setInterval(()=>{ if(curTab==='overview') loadOverview(); },8000); }
 function stopAuto(){ if(timer){ clearInterval(timer); timer=null; } }
