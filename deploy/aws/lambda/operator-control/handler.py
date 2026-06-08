@@ -484,7 +484,13 @@ def lambda_handler(event, _context):
             cid = _ssm_shell(["systemctl stop tickvault || true", "systemctl disable tickvault || true"])
             return _resp(200, {"ok": True, "action": action, "command_id": cid})
         if action == "restart-questdb":
-            cid = _ssm_shell(["cd /opt/tickvault/repo/deploy/docker && docker compose restart questdb"])
+            # `up -d` (create-or-restart), NOT `restart`: `restart` fails if the
+            # container was removed (down/wipe/reset), leaving QuestDB down + the
+            # app crash-looping on BOOT-02. `up -d` recreates it when gone and
+            # restarts it when merely stopped. Idempotent on a healthy container.
+            # (Does NOT fix QuestDB CRASHING on start — disk-full / volume
+            # corruption: see docs/runbooks/aws-docker-daemon-dead.md.)
+            cid = _ssm_shell(["cd /opt/tickvault/repo/deploy/docker && docker compose up -d questdb"])
             return _resp(200, {"ok": True, "action": action, "command_id": cid})
         if action == "command-status":
             # READ-ONLY (not in _DESTRUCTIVE, allowed off-hours, no force). Lets

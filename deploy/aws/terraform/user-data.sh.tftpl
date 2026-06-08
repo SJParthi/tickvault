@@ -107,13 +107,13 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCFG
             "log_stream_name": "{instance_id}"
           },
           {
-            "file_path": "/opt/tickvault/logs/errors.jsonl*",
+            "file_path": "/opt/tickvault/data/logs/errors.jsonl*",
             "log_group_name": "/tickvault/$${ENVIRONMENT}/app",
             "log_stream_name": "{instance_id}/errors-jsonl",
             "timezone": "UTC"
           },
           {
-            "file_path": "/opt/tickvault/logs/app.*.log",
+            "file_path": "/opt/tickvault/data/logs/app.*.log",
             "log_group_name": "/tickvault/$${ENVIRONMENT}/app",
             "log_stream_name": "{instance_id}/app",
             "timezone": "UTC"
@@ -133,7 +133,10 @@ CWCFG
     -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
 
 # ---- Step 4: Create application directories ----
-mkdir -p /opt/tickvault/{config,data/spill,logs,bin}
+# NOTE: the app writes its logs to data/logs (WorkingDirectory=/opt/tickvault +
+# ReadWritePaths=/opt/tickvault/data), which is where the CloudWatch agent now
+# tails app.*.log + errors.jsonl from (NOT the old /opt/tickvault/logs).
+mkdir -p /opt/tickvault/{config,data/spill,data/logs,bin}
 chown -R ec2-user:ec2-user /opt/tickvault
 
 # ---- Step 5: Clone the repo (shallow, main branch) ----
