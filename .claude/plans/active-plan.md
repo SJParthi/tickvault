@@ -1,82 +1,102 @@
-# Implementation Plan: fill the 3 acknowledged doc gaps (kill-switch runbook + GitHub OIDC runbook + override-log link fix)
+# Implementation Plan: QuestDB self-heal + fix CloudWatch log path (the "IntelliJ view" in AWS)
 
 **Status:** VERIFIED
-**Date:** 2026-06-06
-**Approved by:** Parthiban — "yes dude go ahead" (write the 3 real docs identified in the doc audit).
-**Crate(s) touched:** none (docs + 1 test-file allowlist edit). No production source, no new ErrorCode.
+**Date:** 2026-06-08
+**Approved by:** Parthiban — "Go ahead" (build the QuestDB self-heal + the AWS end-to-end log view).
+**Crate(s) touched:** NONE — deploy + docs only (systemd unit, user-data CloudWatch-agent config,
+operator-control Lambda, new runbook). No production Rust, no new ErrorCode → plan-gate exempt.
 
 ## Context
 
-The doc audit found the codebase's own cross-link guard (`runbook_cross_link_guard.rs`) carries a
-shrinking allowlist of acknowledged-missing docs. Three are real gaps for LIVE functionality:
-1. `docs/runbooks/kill-switch.md` — kill-switch is live OMS code (`activate/deactivate/
-   get_kill_switch_status`) and prod `events.rs` tells the operator "decide go/no-go per kill-switch
-   runbook", but the runbook doesn't exist.
-2. `docs/runbooks/github-oidc-setup.md` — allowlisted TODO; `aws-deploy.md` step 1 points here for the
-   GitHub-Actions→AWS OIDC role (`AWS_ROLE_ARN` secret, `id-token: write`, ap-south-1).
-3. `docs/templates/override_log.md` — allowlisted TODO, BUT the file already exists as
-   `override-log.md` (hyphen); the reference in `daily-operations.md` is a 1-char typo
-   (`override_log` vs `override-log`). Fix the link, don't author a duplicate.
+Root-caused from the live journal: the app crash-loops forever (`BOOT-02: QuestDB not ready`,
+restart counter 26+) because **the QuestDB container is down and nothing on the box recreates it** —
+`user-data` runs once (cloud-init), the app unit only waits for the Docker *daemon* (not the QuestDB
+*container*), and the portal "Restart QuestDB" button uses `compose restart` (which fails if the
+container is gone). Separately, the operator wants the AWS equivalent of IntelliJ's live log view —
+but the CloudWatch agent ships `/opt/tickvault/logs/` while the app actually writes
+`/opt/tickvault/data/logs/` (WorkingDirectory=/opt/tickvault + `ReadWritePaths=/opt/tickvault/data`),
+so **app logs never reach CloudWatch** — a real path-mismatch bug.
 
 ## Design
 
-- **kill-switch.md** — operator runbook from the verified facts: endpoints `POST /v2/killswitch?
-  killSwitchStatus=ACTIVATE|DEACTIVATE`, `GET /v2/killswitch`; prerequisite (all positions closed +
-  no pending orders before ACTIVATE → else `exit_all_positions()` first); day-scoped; the OMS client
-  fns that drive it; when to pull it (the OptionChainStaleHalt go/no-go reference); P&L-exit
-  (`/pnlExit`) as the related auto-exit. Ground truth: `docs/dhan-ref/15-traders-control.md`.
-- **github-oidc-setup.md** — steps matching the real workflows: create the GitHub OIDC IAM identity
-  provider (`token.actions.githubusercontent.com`), an IAM role (`tv-github-deploy-role`) with a trust
-  policy scoped to `repo:SJParthi/tickvault:*`, attach least-privilege deploy permissions, set the
-  `AWS_ROLE_ARN` repo secret + `AWS_REGION` var; replaces the long-lived-creds temporary workaround.
-- **daily-operations.md** — change `docs/templates/override_log.md` → `docs/templates/override-log.md`
-  (existing file).
-- **runbook_cross_link_guard.rs** — remove the two now-resolved allowlist entries
-  (`docs/runbooks/github-oidc-setup.md`, `docs/templates/override_log.md`) so the guard ratchets down.
+1. **Self-heal QuestDB at app boot** — `deploy/systemd/tickvault.service`: add
+   `ExecStartPre=-/usr/bin/docker compose -f /opt/tickvault/repo/deploy/docker/docker-compose.yml up -d questdb`.
+   Runs as ec2-user (in the docker group), recreates a missing/stopped QuestDB before the app starts.
+   `-` prefix = a transient compose hiccup doesn't hard-fail the unit; the app's own 60s
+   `wait_for_questdb_ready` remains the real gate. Fixes the "container gone → loop forever" class.
+2. **Restart-QuestDB button → create-or-restart** — `operator-control/handler.py`: change
+   `docker compose restart questdb` → `docker compose up -d questdb` so the portal button works even
+   when the container vanished (not just when it's merely stopped).
+3. **Fix CloudWatch log path (the IntelliJ view)** — `user-data.sh.tftpl` CloudWatch-agent
+   `collect_list`: `/opt/tickvault/logs/{errors.jsonl*,app.*.log}` →
+   `/opt/tickvault/data/logs/...` (where the app actually writes). This makes the full app log +
+   `errors.jsonl` (incl. the `BOOT-02` `error!`) stream to CloudWatch `/tickvault/<env>/app` →
+   CloudWatch **Live Tail** becomes the real-time end-to-end console. Also fix the `mkdir` to create
+   `data/logs`.
+4. **New runbook** `docs/runbooks/aws-docker-daemon-dead.md` — disk-full / QuestDB-down / Docker
+   recovery (referenced by `aws-daily-lifecycle.md`); documents the self-heal + the journald-vs-
+   CloudWatch split (systemd/boot lines = journald/portal Logs tab; app+error logs = CloudWatch).
+
+**Honest scope note:** journald (the raw systemd `Failed to start` + the final anyhow `Error:` line)
+is NOT shipped to CloudWatch by the agent (it tails files, not the journal). But the *root-cause*
+`BOOT-02` line IS emitted via `error!` → `errors.jsonl` → reaches CloudWatch after fix #3, so the
+operator sees WHY boot failed in CloudWatch. Raw systemd lines stay in journald (portal Logs tab).
+A journald→CloudWatch source is deliberately out of scope (fragile; the path fix covers the need).
+
+**Deploy caveat (documented in the runbook):** the systemd-unit + user-data changes take effect on
+the next deploy / instance refresh — the existing down box must first be recovered manually
+(free disk / `docker compose up -d`).
 
 ## Edge Cases
 
-- Removing allowlist entries makes the guard ENFORCE resolution: kill-switch.md + github-oidc-setup.md
-  now exist; the override_log reference is fixed to the existing override-log.md → all resolve.
-- kill-switch.md is referenced from a phase doc (not a runbook) so it was never allowlisted; creating
-  it is purely additive.
+- ExecStartPre under `ProtectSystem=strict` — only reads the compose file (/opt readable) + talks to
+  `/run/docker.sock` (/run not locked by strict); ec2-user is in the docker group. Works.
+- Disk genuinely full → ExecStartPre `up -d` still can't start QuestDB → app still waits/fails
+  (correct — can't conjure space); the runbook covers freeing disk / growing EBS.
+- `up -d questdb` is idempotent — a healthy running QuestDB is untouched.
 
 ## Failure Modes
 
-- Docs + one test-file edit; zero production-behavior impact. The only failure surface is the
-  cross-link guard, which I run locally to confirm green after the allowlist shrink.
+- All changes are deploy/docs. ExecStartPre uses `-` so it never blocks boot worse than today.
+  Lambda change is a one-word command swap. user-data change is a path string.
 
 ## Test Plan
 
-- `cargo test -p tickvault-common --test runbook_cross_link_guard` — green after the 2 new docs + the
-  link fix + the allowlist shrink.
-- `bash .claude/hooks/plan-verify.sh` + plan-gate green.
+- `python3 -c "import json; ..."` validate the embedded CloudWatch-agent JSON still parses.
+- `python3 -m py_compile deploy/aws/lambda/operator-control/handler.py` — Lambda still compiles.
+- `cargo test -p tickvault-common --test runbook_cross_link_guard` — new runbook has no dangling links.
+- Manual review of the systemd unit (no syntax tool; matches existing directive style).
 
 ## Rollback
 
-- `git revert` removes the 2 docs, restores the typo + the 2 allowlist entries. Pure docs revert.
+- `git revert` restores the old systemd unit, the `compose restart`, and the old CW path. Pure
+  deploy/docs revert; no runtime code affected.
 
 ## Observability
 
-- N/A — documentation. The guard test is the mechanical proof the links resolve.
+- After deploy: CloudWatch `/tickvault/<env>/app` Live Tail shows the full app log + errors (incl.
+  BOOT-02). `tv_disk_*` gauges + the existing 75%-full alarm already cover disk.
 
 ## Plan Items
 
-- [x] Item 1 — write `docs/runbooks/kill-switch.md` (live OMS kill-switch operator runbook)
-  - Files: `docs/runbooks/kill-switch.md`
-  - Tests: every_repo_path_referenced_in_runbooks_resolves
-- [x] Item 2 — write `docs/runbooks/github-oidc-setup.md` + remove its allowlist entry
-  - Files: `docs/runbooks/github-oidc-setup.md`, `crates/common/tests/runbook_cross_link_guard.rs`
-  - Tests: every_repo_path_referenced_in_runbooks_resolves
-- [x] Item 3 — fix `daily-operations.md` override-log link + remove its allowlist entry
-  - Files: `docs/runbooks/daily-operations.md`, `crates/common/tests/runbook_cross_link_guard.rs`
+- [x] Item 1 — systemd `ExecStartPre` self-heals QuestDB
+  - Files: `deploy/systemd/tickvault.service`
+  - Tests: N/A (TEST-EXEMPT systemd unit — no Rust)
+- [x] Item 2 — Restart-QuestDB button → `compose up -d`
+  - Files: `deploy/aws/lambda/operator-control/handler.py`
+  - Tests: N/A (TEST-EXEMPT Lambda — py_compile verified)
+- [x] Item 3 — fix CloudWatch agent log path → `/opt/tickvault/data/logs/`
+  - Files: `deploy/aws/terraform/user-data.sh.tftpl`
+  - Tests: N/A (TEST-EXEMPT Terraform template — JSON validated)
+- [x] Item 4 — new `aws-docker-daemon-dead.md` runbook
+  - Files: `docs/runbooks/aws-docker-daemon-dead.md`
   - Tests: every_repo_path_referenced_in_runbooks_resolves
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | Operator hits OptionChainStaleHalt Telegram | kill-switch.md tells them go/no-go + how to pull the switch |
-| 2 | New deployer sets up CI→AWS | github-oidc-setup.md gives the exact IAM OIDC steps |
-| 3 | Operator logs a manual override | daily-operations.md links to the real override-log.md template |
-| 4 | Cross-link guard runs | all referenced paths resolve; allowlist shrank by 2 |
+| 1 | QuestDB container removed, app starts | ExecStartPre `up -d` recreates it → app boots (no more loop) |
+| 2 | Operator presses Restart QuestDB with container gone | `up -d` recreates it (old `restart` would fail) |
+| 3 | App running, operator opens CloudWatch Live Tail | full app log + BOOT/errors stream live (IntelliJ-style) |
+| 4 | Disk full | self-heal can't help; runbook → free disk / grow EBS |

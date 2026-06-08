@@ -30,6 +30,20 @@ Group=ec2-user
 ExecStart=/opt/tickvault/bin/tickvault
 WorkingDirectory=/opt/tickvault
 
+# Self-heal: ensure the QuestDB container EXISTS + is started before the app
+# boots. user-data's `docker compose up -d` runs only once (cloud-init), and
+# Docker's `restart: unless-stopped` cannot recreate a container that was
+# removed (down/wipe/reset). Without this, a missing QuestDB makes the app
+# crash-loop forever on BOOT-02. `up -d questdb` is idempotent (no-op if already
+# healthy) and recreates it if gone. Leading `-` = a transient compose hiccup
+# does NOT hard-fail the unit; the app's own 60s `wait_for_questdb_ready` is the
+# real gate.
+# NOTE: this fixes the "container removed" class. It does NOT fix QuestDB
+# CRASHING on start (disk-full / volume corruption) — `up` creates it but it
+# exits. For that, see docs/runbooks/aws-docker-daemon-dead.md (`docker logs
+# tv-questdb` + `df -h`).
+ExecStartPre=-/usr/bin/docker compose -f /opt/tickvault/repo/deploy/docker/docker-compose.yml up -d questdb
+
 # Auto-restart on ANY failure. RestartSec prevents tight restart loops.
 Restart=always
 RestartSec=3
