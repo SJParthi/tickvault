@@ -31,8 +31,69 @@ use tickvault_common::instrument_types::{
     ConstituencyBuildMetadata, IndexConstituencyMap, IndexConstituent,
 };
 
-use self::downloader::ConstituencyDownloader;
+use self::downloader::{ConstituencyDownloadError, ConstituencyDownloader};
 use self::parser::{ParsedConstituents, parse_constituents};
+
+use std::time::Duration;
+use tickvault_common::constants::{
+    INDEX_CONSTITUENCY_RETRY_MAX_DELAY_SECS, INDEX_CONSTITUENCY_RETRY_MAX_TIMES,
+    INDEX_CONSTITUENCY_RETRY_MIN_DELAY_SECS,
+};
+
+/// Backoff (seconds) before the retry that follows a failed `attempt`
+/// (1-based). Exponential from `INDEX_CONSTITUENCY_RETRY_MIN_DELAY_SECS`,
+/// doubling each attempt, capped at `INDEX_CONSTITUENCY_RETRY_MAX_DELAY_SECS`.
+/// PURE — no I/O; unit-tested below.
+#[must_use]
+pub fn constituency_retry_delay_secs(attempt: usize) -> u64 {
+    let min = INDEX_CONSTITUENCY_RETRY_MIN_DELAY_SECS;
+    let max = INDEX_CONSTITUENCY_RETRY_MAX_DELAY_SECS.max(min);
+    if attempt <= 1 {
+        return min;
+    }
+    // doubling: min * 2^(attempt-1), saturating + capped at max.
+    let shift = u32::try_from(attempt - 1).unwrap_or(u32::MAX).min(20);
+    min.saturating_mul(1u64 << shift).min(max)
+}
+
+/// Fetch one slug with up to `INDEX_CONSTITUENCY_RETRY_MAX_TIMES` attempts and
+/// exponential backoff between them (operator 2026-06-08: "retry at least five
+/// times"). A transient niftyindices timeout / 5xx / reset on one attempt no
+/// longer drops the whole list — only an exhausted ladder returns `Err`.
+///
+/// COLD PATH — runs once per slug at boot.
+// TEST-EXEMPT: network I/O orchestration; the pure backoff schedule is unit-tested
+// via `constituency_retry_delay_secs`, and `ConstituencyDownloader::fetch_slug`
+// is covered in the downloader's own tests.
+async fn fetch_slug_with_retry(
+    downloader: &ConstituencyDownloader,
+    display_name: &str,
+    slug: &str,
+) -> Result<Vec<u8>, ConstituencyDownloadError> {
+    let max = INDEX_CONSTITUENCY_RETRY_MAX_TIMES.max(1);
+    let mut attempt = 1usize;
+    loop {
+        match downloader.fetch_slug(slug).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(err) => {
+                if attempt >= max {
+                    return Err(err);
+                }
+                let delay = constituency_retry_delay_secs(attempt);
+                tracing::warn!(
+                    index = display_name,
+                    attempt,
+                    max,
+                    delay_secs = delay,
+                    %err,
+                    "constituency download attempt failed; retrying"
+                );
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+                attempt += 1;
+            }
+        }
+    }
+}
 
 /// Assemble an [`IndexConstituencyMap`] from per-index parsed rows.
 ///
@@ -96,7 +157,7 @@ pub async fn build_constituency_map(
     let mut indices_failed = 0usize;
 
     for (display_name, slug) in slugs {
-        match downloader.fetch_slug(slug).await {
+        match fetch_slug_with_retry(downloader, display_name, slug).await {
             Ok(bytes) => match parse_constituents(&bytes, display_name, today) {
                 Ok(parsed) => {
                     tracing::info!(
@@ -125,6 +186,42 @@ pub async fn build_constituency_map(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_delay_first_attempt_is_min() {
+        assert_eq!(
+            constituency_retry_delay_secs(1),
+            INDEX_CONSTITUENCY_RETRY_MIN_DELAY_SECS
+        );
+    }
+
+    #[test]
+    fn retry_delay_grows_exponentially_then_caps() {
+        // min=1, max=10 → 1, 2, 4, 8, 10(capped), 10...
+        assert_eq!(constituency_retry_delay_secs(1), 1);
+        assert_eq!(constituency_retry_delay_secs(2), 2);
+        assert_eq!(constituency_retry_delay_secs(3), 4);
+        assert_eq!(constituency_retry_delay_secs(4), 8);
+        assert_eq!(
+            constituency_retry_delay_secs(5),
+            INDEX_CONSTITUENCY_RETRY_MAX_DELAY_SECS
+        );
+    }
+
+    #[test]
+    fn retry_delay_never_exceeds_max_even_for_huge_attempt() {
+        assert!(constituency_retry_delay_secs(1000) <= INDEX_CONSTITUENCY_RETRY_MAX_DELAY_SECS);
+        // and no overflow panic on a pathological attempt count
+        assert!(
+            constituency_retry_delay_secs(usize::MAX) <= INDEX_CONSTITUENCY_RETRY_MAX_DELAY_SECS
+        );
+    }
+
+    #[test]
+    fn retry_max_times_is_at_least_five() {
+        // operator 2026-06-08: "retry at least five times"
+        assert!(INDEX_CONSTITUENCY_RETRY_MAX_TIMES >= 5);
+    }
 
     fn today() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 6, 6).unwrap()

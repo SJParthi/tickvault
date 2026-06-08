@@ -2293,8 +2293,12 @@ pub const INDEX_CONSTITUENCY_RETRY_MIN_DELAY_SECS: u64 = 1;
 /// Retry: maximum backoff delay in seconds between download attempts.
 pub const INDEX_CONSTITUENCY_RETRY_MAX_DELAY_SECS: u64 = 10;
 
-/// Retry: maximum number of retry attempts per CSV download.
-pub const INDEX_CONSTITUENCY_RETRY_MAX_TIMES: usize = 2;
+/// Retry: maximum number of attempts per CSV download (operator 2026-06-08:
+/// "retry at least five times"). Wired into `build_constituency_map` with
+/// exponential backoff between `INDEX_CONSTITUENCY_RETRY_MIN_DELAY_SECS` and
+/// `INDEX_CONSTITUENCY_RETRY_MAX_DELAY_SECS`. A transient niftyindices timeout /
+/// 5xx / reset on one attempt no longer drops the whole NTM list for the day.
+pub const INDEX_CONSTITUENCY_RETRY_MAX_TIMES: usize = 5;
 
 /// User-Agent header for niftyindices.com requests.
 /// niftyindices.com returns 403 Forbidden without a browser-like User-Agent.
