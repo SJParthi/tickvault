@@ -101,7 +101,7 @@ toml = "1.1.2"
 figment = { version = "0.10.19", features = ["toml", "env"] }
 
 # ---- Section 10: Date & Time ----
-chrono = { version = "0.4.44", features = ["serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
 chrono-tz = "0.10.4"
 
 # ---- Section 11: Serialization & Errors ----
@@ -137,7 +137,7 @@ zeroize = { version = "1.8.2", features = ["derive"] }
 # Both tokio-tungstenite and reqwest depend on rustls 0.23+, which requires
 # an explicit CryptoProvider. We use aws-lc-rs (already in the dep tree).
 rustls = { version = "0.23.40", default-features = false, features = ["aws_lc_rs"] }
-rustls-native-certs = "0.8.3"
+rustls-native-certs = "0.8.4"
 
 # ---- Section 11: AWS SDK ----
 # 2026-05-23: opt out of each crate's legacy `rustls` feature (which pulls
@@ -146,9 +146,9 @@ rustls-native-certs = "0.8.3"
 # routes through `aws-smithy-http-client/rustls-aws-lc` (rustls 0.23 +
 # aws-lc-rs — already pinned by the workspace at line 136). Closes the 3
 # RUSTSEC advisories on the AWS chain without an upstream SDK release.
-aws-config = { version = "1.8.17", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "credentials-process", "sso"] }
-aws-sdk-sns = { version = "1.101.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
-aws-sdk-ssm = { version = "1.111.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-config = { version = "1.8.18", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "credentials-process", "sso"] }
+aws-sdk-sns = { version = "1.103.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-ssm = { version = "1.112.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 
 # ---- Section 16: CLI ----
 clap = { version = "4.6.1", features = ["derive"] }
