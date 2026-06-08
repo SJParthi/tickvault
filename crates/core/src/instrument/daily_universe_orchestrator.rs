@@ -165,11 +165,23 @@ pub fn resolve_ntm_rows(rows: &[CsvRow], ntm_map: &IndexConstituencyMap) -> Vec<
             "NTM bridge: resolved constituent had no matching Dhan row (unexpected)"
         );
     }
+    // Operator visibility (audit-findings Rule 11 — no silent drops): name the
+    // skipped stragglers so each boot SHOWS exactly which constituents failed
+    // the ISIN→Dhan join. Truncated to the first 20 to bound the log line.
+    const MAX_LOGGED_STRAGGLERS: usize = 20;
+    let dropped_names = outcome
+        .unresolved_symbols
+        .iter()
+        .take(MAX_LOGGED_STRAGGLERS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
     tracing::info!(
         ntm_resolved = ntm_rows.len(),
         ntm_unresolved = outcome.unresolved_symbols.len(),
         ntm_total = outcome.total,
-        "NTM constituents resolved + bridged to Dhan rows"
+        ntm_dropped_names = %dropped_names,
+        "NTM constituents resolved + bridged to Dhan rows (unresolved stragglers skipped)"
     );
     ntm_rows
 }

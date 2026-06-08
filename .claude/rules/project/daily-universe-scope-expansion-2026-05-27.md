@@ -884,10 +884,16 @@ NTM union without re-confirming against this section.
 3. **O(1) build:** construct a `HashMap<ISIN, (security_id, ExchangeSegment)>` from
    the Dhan NSE-EQ rows ONCE (cold path), then each of the ~750 constituents is an
    O(1) ISIN lookup. No per-constituent scan of the master.
-4. **Fail-closed:** a constituent whose ISIN resolves to ZERO Dhan NSE-EQ rows is
-   flagged + counted (`error!` with a typed code), NEVER silently dropped. If
-   `> 0.5%` of constituents are unresolved, REJECT the build (mirror §3 / §26
-   dangling-reference reject).
+4. **Fail-closed (NTM membership tolerance = 2%, operator lock 2026-06-08):** a
+   constituent whose ISIN resolves to ZERO Dhan NSE-EQ rows is counted + LOGGED
+   BY NAME (never silently dropped). If `> 2%` of constituents are unresolved,
+   REJECT the build; at or below 2% the unresolved few are skipped and the rest
+   subscribed. This NTM membership-list tolerance was raised from 0.5% → 2%
+   after the live 2026-06-08 boot degraded the entire NTM universe (244 of ~1000)
+   because 5 of 748 stragglers (0.67%) exceeded the old 0.5% bar. It is
+   DELIBERATELY looser than — and SEPARATE from — the order-critical Dhan-master
+   F&O dangling guard (§3 / §26, line above, unchanged at 0.5%). Pinned by
+   `constituent_resolver::tests::test_dangling_reject_fraction_is_two_percent`.
 5. **Dedup:** resolved SIDs are unioned with the existing F&O underlyings by
    `(security_id, exchange_segment)` (I-P1-11). No double-subscribe.
 6. **Role tagging:** each resolved stock carries `role` ∈ {`index_constituent`,
