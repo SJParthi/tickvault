@@ -48,7 +48,7 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 /// AFTER `ts` in the actual `UPSERT KEYS(...)` clause. The DDL builder at
 /// `setup_tick_tables` formats this as
 /// `ALTER TABLE ticks DEDUP ENABLE UPSERT KEYS(ts, {DEDUP_KEY_TICKS})`,
-/// producing the full key `(ts, security_id, segment, received_at)`.
+/// producing the full key `(ts, security_id, segment, payload_hash)`.
 ///
 /// **Why `segment` is mandatory** (STORAGE-GAP-01 + I-P1-11):
 /// Dhan reuses the same numeric `security_id` across exchange segments
@@ -56,24 +56,30 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 /// Without `segment` in the key, two LEGITIMATELY DISTINCT ticks at the same
 /// `ts` would silently UPSERT each other and one segment's data would be lost.
 ///
-/// **Why `received_at` is mandatory** (sub-second tick preservation):
-/// Dhan's `exchange_timestamp` (LTT) is SECOND-granular, so the designated
-/// timestamp `ts` is identical for every tick that arrives inside the same
-/// wall-clock second. With only `(ts, security_id, segment)` in the key,
-/// 3-4-5 genuinely-distinct sub-second ticks for one instrument would
-/// silently UPSERT each other down to ONE surviving row — real market
-/// activity lost. `received_at` is the NANOSECOND local-clock capture
-/// instant (monotonic within a process), so it disambiguates sub-second
-/// ticks WITHOUT defeating dedup of genuine replays: a true replay re-emits
-/// the SAME `received_at` nanos (it is part of the parsed tick), so it still
-/// collapses to one row. The composite
-/// `(ts, security_id, segment, received_at)` is the uniqueness guarantee —
-/// `security_id` alone is NOT unique, and `(ts, security_id, segment)` alone
-/// collapses sub-second bursts.
+/// **Why `payload_hash` is the tiebreaker (2026-06-08, replaces `received_at`):**
+/// Dhan's `exchange_timestamp` (LTT) is SECOND-granular, so `ts` is identical
+/// for every tick inside the same wall-clock second. A tiebreaker is needed so
+/// 2-5 genuinely-distinct sub-second ticks for one instrument are NOT collapsed
+/// to one row. The PREVIOUS tiebreaker `received_at` was generated at *processing
+/// time* (`current_received_at_nanos()`), which had two flaws: (1) it relied on
+/// the wall clock returning a unique nanosecond per tick — not guaranteed by
+/// construction, so two distinct same-second ticks could in theory collide and
+/// one be lost; and (2) on WAL/reconnect REPLAY the same frame was re-stamped
+/// with a NEW `received_at`, so a true duplicate would NOT collapse → a
+/// duplicate row. `payload_hash` fixes both: it is a deterministic FNV-1a
+/// fingerprint of the tick's value-bearing fields (see `tick_payload_hash`), so
+///   • two DISTINCT ticks differ in ≥1 field → different hash → BOTH kept (no loss);
+///   • a true duplicate / replay / reconnect re-send is byte-identical → same
+///     hash → collapsed (idempotent, replay-safe);
+///   • two same-second ticks with identical content carry zero new information
+///     and collapse (correct — they are indistinguishable duplicates).
+/// `received_at` remains a stored COLUMN (latency analysis) but is NO LONGER in
+/// the dedup key. The composite `(ts, security_id, segment, payload_hash)` is
+/// the uniqueness guarantee.
 ///
 /// Enforced by `dedup_segment_meta_guard.rs` (workspace-wide constant scan)
 /// + `test_tick_dedup_key_includes_segment` (STORAGE-GAP-01 integration test).
-const DEDUP_KEY_TICKS: &str = "security_id, segment, received_at";
+const DEDUP_KEY_TICKS: &str = "security_id, segment, payload_hash";
 
 /// Returns the DEDUP UPSERT KEY string for the ticks table.
 /// Exposed for gap enforcement integration tests (STORAGE-GAP-01).
@@ -1240,6 +1246,48 @@ pub fn round_to_2dp(v: f64) -> f64 {
 // Buffer Building (extracted for testability)
 // ---------------------------------------------------------------------------
 
+/// One FNV-1a mixing step over a byte slice. Free function (not a closure) so
+/// `tick_payload_hash` can read `h` after feeding — zero-alloc, `#[inline]`.
+#[inline]
+fn fnv1a_step(mut hash: u64, bytes: &[u8]) -> u64 {
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// Deterministic content fingerprint of a tick's value-bearing fields — the
+/// `ticks` DEDUP tiebreaker (replaces the old `received_at`, 2026-06-08).
+///
+/// **Determinism is mandatory:** this is FNV-1a with a FIXED offset basis, NOT
+/// `std::hash::DefaultHasher` (which is per-process randomized and would make a
+/// replayed frame hash differently after a restart → duplicate row). The same
+/// tick content ALWAYS yields the same hash across processes/restarts, so a
+/// WAL-replayed or reconnect-resent frame collapses (idempotent), while any
+/// differing field yields a different hash so two DISTINCT same-second ticks are
+/// both preserved. Zero-alloc, O(1) over a fixed field set — safe on the hot path.
+#[inline]
+fn tick_payload_hash(tick: &ParsedTick) -> i64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut h = FNV_OFFSET;
+    h = fnv1a_step(h, &tick.last_traded_price.to_le_bytes());
+    h = fnv1a_step(h, &tick.exchange_timestamp.to_le_bytes());
+    h = fnv1a_step(h, &tick.last_trade_quantity.to_le_bytes());
+    h = fnv1a_step(h, &tick.average_traded_price.to_le_bytes());
+    h = fnv1a_step(h, &tick.volume.to_le_bytes());
+    h = fnv1a_step(h, &tick.total_buy_quantity.to_le_bytes());
+    h = fnv1a_step(h, &tick.total_sell_quantity.to_le_bytes());
+    h = fnv1a_step(h, &tick.open_interest.to_le_bytes());
+    h = fnv1a_step(h, &tick.day_open.to_le_bytes());
+    h = fnv1a_step(h, &tick.day_high.to_le_bytes());
+    h = fnv1a_step(h, &tick.day_low.to_le_bytes());
+    h = fnv1a_step(h, &tick.day_close.to_le_bytes());
+    // u64 → i64 bit-reinterpret (full range preserved; QuestDB stores LONG).
+    i64::from_le_bytes(h.to_le_bytes())
+}
+
 /// Writes a single tick row into the ILP buffer (no flush).
 ///
 /// Dhan WebSocket sends `exchange_timestamp` as IST epoch seconds — already
@@ -1302,6 +1350,11 @@ fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
         .context("exchange_timestamp")?
         .column_ts("received_at", received_nanos)
         .context("received_at")?
+        // DEDUP tiebreaker (2026-06-08): deterministic content fingerprint so
+        // distinct same-second ticks are both kept and true duplicates/replays
+        // collapse. See `tick_payload_hash` + the `DEDUP_KEY_TICKS` doc.
+        .column_i64("payload_hash", tick_payload_hash(tick))
+        .context("payload_hash")?
         .at(ts_nanos)
         .context("designated timestamp")?;
 
@@ -1363,6 +1416,7 @@ const TICKS_CREATE_DDL: &str = "\
         total_sell_qty LONG,\
         exchange_timestamp LONG,\
         received_at TIMESTAMP,\
+        payload_hash LONG,\
         ts TIMESTAMP\
     ) TIMESTAMP(ts) PARTITION BY HOUR WAL\
 ";
@@ -1439,6 +1493,34 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
                 "ticks table CREATE DDL request failed — table not pre-created"
             );
             return;
+        }
+    }
+
+    // Step 1b: Brownfield migration (2026-06-08) — ensure the `payload_hash`
+    // DEDUP-key column exists on pre-existing tables BEFORE the DEDUP ENABLE
+    // below references it. Without this, an old table would hit "deduplicate key
+    // column not found" and trip the DROP+CREATE auto-recover path → today's
+    // ticks lost. `ADD COLUMN IF NOT EXISTS` is idempotent (no-op once present).
+    let add_payload_hash_sql =
+        format!("ALTER TABLE \"{QUESTDB_TABLE_TICKS}\" ADD COLUMN IF NOT EXISTS payload_hash LONG");
+    match client
+        .get(&base_url)
+        .query(&[("query", &add_payload_hash_sql)])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            debug!("ticks.payload_hash column ensured (ADD COLUMN IF NOT EXISTS)");
+        }
+        Ok(resp) => {
+            let body = resp.text().await.unwrap_or_default();
+            warn!(
+                body = body.chars().take(200).collect::<String>(),
+                "ticks.payload_hash ADD COLUMN returned non-success — DEDUP enable may auto-recover"
+            );
+        }
+        Err(err) => {
+            warn!(?err, "ticks.payload_hash ADD COLUMN request failed");
         }
     }
 
@@ -2569,11 +2651,78 @@ mod tests {
             "DEDUP_KEY_TICKS must include segment (STORAGE-GAP-01)"
         );
         assert!(
-            DEDUP_KEY_TICKS.contains("received_at"),
-            "DEDUP_KEY_TICKS must include received_at to preserve sub-second ticks \
-             (Dhan LTT is second-granular, so ts alone collapses bursts)"
+            DEDUP_KEY_TICKS.contains("payload_hash"),
+            "DEDUP_KEY_TICKS must include payload_hash to preserve sub-second ticks \
+             AND stay replay-idempotent (Dhan LTT is second-granular, so ts alone \
+             collapses bursts; received_at was re-stamped on replay → duplicates)"
         );
-        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, received_at");
+        assert!(
+            !DEDUP_KEY_TICKS.contains("received_at"),
+            "received_at must NOT be in the dedup key — it is re-stamped at \
+             processing time, so on WAL/reconnect replay it differs and breaks \
+             idempotency (2026-06-08: replaced by payload_hash)"
+        );
+        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, payload_hash");
+    }
+
+    // --- payload_hash dedup tiebreaker (2026-06-08) -------------------------
+
+    #[test]
+    fn test_payload_hash_is_deterministic_across_fresh_ticks() {
+        // Two independently-built ticks with identical content MUST hash equal —
+        // this is what makes a WAL-replayed / reconnect-resent frame collapse
+        // (idempotent) regardless of process or received_at.
+        let a = make_test_tick(13, 23161.50);
+        let b = make_test_tick(13, 23161.50);
+        assert_eq!(tick_payload_hash(&a), tick_payload_hash(&b));
+        // Stable across repeated calls on the same value.
+        assert_eq!(tick_payload_hash(&a), tick_payload_hash(&a));
+    }
+
+    #[test]
+    fn test_payload_hash_ignores_received_at_replay_safe() {
+        // The whole point: a replayed frame gets a NEW received_at, but the hash
+        // must be UNCHANGED so DEDUP still collapses it. received_at is NOT fed
+        // into the fingerprint.
+        let mut a = make_test_tick(13, 23161.50);
+        let mut b = make_test_tick(13, 23161.50);
+        a.received_at_nanos = 1_000_000_000_000_000_000;
+        b.received_at_nanos = 2_222_222_222_222_222_222;
+        assert_eq!(
+            tick_payload_hash(&a),
+            tick_payload_hash(&b),
+            "received_at must not affect the hash — else replay duplicates"
+        );
+    }
+
+    #[test]
+    fn test_payload_hash_differs_on_distinct_price() {
+        // Two distinct same-second ticks (different LTP) MUST hash differently so
+        // BOTH survive DEDUP — this is the no-loss guarantee.
+        let a = make_test_tick(13, 23161.50);
+        let b = make_test_tick(13, 23161.55);
+        assert_ne!(tick_payload_hash(&a), tick_payload_hash(&b));
+    }
+
+    #[test]
+    fn test_payload_hash_differs_on_distinct_volume() {
+        // Same price, different volume (a distinct stock trade in the same
+        // second) → different hash → both kept.
+        let mut a = make_test_tick(13, 23161.50);
+        let mut b = make_test_tick(13, 23161.50);
+        a.volume = 50000;
+        b.volume = 50075;
+        assert_ne!(tick_payload_hash(&a), tick_payload_hash(&b));
+    }
+
+    #[test]
+    fn test_payload_hash_differs_on_exchange_timestamp() {
+        // Same content but a different second is a genuinely different tick.
+        let mut a = make_test_tick(13, 23161.50);
+        let mut b = make_test_tick(13, 23161.50);
+        a.exchange_timestamp = 1_740_556_500;
+        b.exchange_timestamp = 1_740_556_501;
+        assert_ne!(tick_payload_hash(&a), tick_payload_hash(&b));
     }
 
     /// STORAGE-GAP-01: Verify that the ticks DDL includes exchange_segment
@@ -3739,7 +3888,7 @@ mod tests {
     #[test]
     fn test_tick_dedup_key_exact_value() {
         // STORAGE-GAP-01 (segment) + sub-second preservation (received_at).
-        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, received_at");
+        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, payload_hash");
     }
 
     #[test]
@@ -3850,7 +3999,7 @@ mod tests {
 
     #[test]
     fn test_dedup_key_ticks_exact_format() {
-        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, received_at");
+        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, payload_hash");
     }
 
     #[test]
