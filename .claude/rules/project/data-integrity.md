@@ -14,9 +14,23 @@ paths:
 - QuestDB: designated timestamp + security_id as natural dedup key
 
 ## Tick Deduplication
-- Dedup by (security_id, exchange_timestamp, sequence_number)
-- Bounded ring buffer for O(1) lookup
-- Log duplicates at WARN
+- **QuestDB `ticks` DEDUP UPSERT KEY = `(ts, security_id, segment, payload_hash)`**
+  (`DEDUP_KEY_TICKS` in `crates/storage/src/tick_persistence.rs`).
+  - `ts` = `exchange_timestamp × 1e9` (Dhan LTT, SECOND-granular).
+  - `segment` — mandatory (I-P1-11; `security_id` reused across segments).
+  - `payload_hash` — deterministic FNV-1a fingerprint of the tick's value-bearing
+    fields (`tick_payload_hash`). This is the sub-second tiebreaker AND the
+    replay-idempotency key: distinct same-second ticks differ in ≥1 field →
+    different hash → both kept (no loss); a true duplicate / WAL-replay /
+    reconnect re-send is byte-identical → same hash → collapsed (idempotent).
+  - **Dhan has NO per-tick sequence number** — `payload_hash` (content) is the
+    only deterministic, replay-stable uniqueness basis available.
+  - **`received_at` is NOT in the key** (2026-06-08): it is re-stamped at
+    processing time, so on replay it differs → would create duplicate rows.
+    It remains a stored column for latency analysis only.
+- FNV-1a MUST stay fixed-seed/deterministic — NEVER `std::hash::DefaultHasher`
+  (per-process randomized → breaks replay idempotency across restarts).
+- Bounded ring buffer for O(1) lookup; log duplicates at WARN.
 
 ## Position Reconciliation
 - After every fill: mismatch = halt trading + alert. End-of-day (immediately after WebSocket disconnect at 15:30 IST): full Dhan vs OMS reconciliation.

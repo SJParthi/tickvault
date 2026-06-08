@@ -1,81 +1,93 @@
-# Implementation Plan: niftyindices NTM fetch — 5× retry + exponential backoff
+# Implementation Plan: ticks DEDUP tiebreaker → content `payload_hash` (replay-safe uniqueness)
 
 **Status:** APPROVED
 **Date:** 2026-06-08
-**Approved by:** Parthiban — "retry at least five times" + "fix everything" (2026-06-08).
-**Crate(s) touched:** `tickvault-common` (constant), `tickvault-core` (fetch loop).
+**Approved by:** Parthiban — AskUserQuestion 2026-06-08 "Frame-payload hash (Recommended)" + "fix everything".
+**Crate(s) touched:** `tickvault-storage` (+ data-integrity rule).
 
 ## Context
 
-The NTM constituency download (`build_constituency_map`) did a **single** `fetch_slug` per list
-with no retry. A transient niftyindices.com timeout / 5xx / connection-reset on that one attempt
-drops the whole NTM list for the day (degrade to core universe via NTM-CONSTITUENCY-01). The retry
-constants already existed (`INDEX_CONSTITUENCY_RETRY_*`) but were never wired, and
-`INDEX_CONSTITUENCY_RETRY_MAX_TIMES` was only 2. (Note: today's NTM miss was the ISIN-dangling
-threshold, fixed in #1053 — this PR is separate forward hardening for the *fetch* path.)
+Deep audit of the tick-ingest path found the one genuine internal loss/duplicate suspect: the
+`ticks` DEDUP key `(ts, security_id, segment, received_at)` used `received_at` (local `Utc::now()`
+nanos, stamped at processing time) as the sub-second tiebreaker. Two flaws:
+1. **Not unique by construction** — relied on the wall clock returning a distinct nanosecond per
+   tick; two distinct same-second ticks could in theory collide → one silently lost.
+2. **Replay-unsafe** — on WAL/reconnect replay the same frame is re-stamped with a NEW `received_at`
+   → the key differs → a true duplicate would NOT collapse → duplicate row.
+Dhan's protocol has NO per-tick sequence number, so a content fingerprint is the only deterministic,
+replay-stable uniqueness basis.
 
 ## Design
 
-1. **`crates/common/src/constants.rs`** — `INDEX_CONSTITUENCY_RETRY_MAX_TIMES` 2 → 5 (operator
-   "at least five times").
-2. **`crates/core/src/instrument/index_constituency/mod.rs`**:
-   - NEW pure `constituency_retry_delay_secs(attempt)` — exponential backoff from
-     `INDEX_CONSTITUENCY_RETRY_MIN_DELAY_SECS` (1s), doubling, capped at
-     `INDEX_CONSTITUENCY_RETRY_MAX_DELAY_SECS` (10s); overflow-safe.
-   - NEW private `fetch_slug_with_retry(downloader, name, slug)` — up to MAX_TIMES attempts,
-     `warn!` per failed attempt with the next delay, sleeps between, returns the last `Err` only on
-     exhaustion. The per-attempt read timeout stays the generous 60s
-     (`INSTRUMENT_FETCH_PER_ATTEMPT_TIMEOUT_SECS`) + 10s connect.
-   - `build_constituency_map` calls `fetch_slug_with_retry` instead of `fetch_slug`.
+1. **`tick_payload_hash(&ParsedTick) -> i64`** — deterministic FNV-1a (FIXED offset basis, NOT
+   `DefaultHasher`) over the value-bearing fields (ltp, exchange_timestamp, ltq, atp, volume,
+   buy/sell qty, oi, day o/h/l/c). Zero-alloc, `#[inline]`, O(1) over a fixed field set.
+2. **`DEDUP_KEY_TICKS`** `(ts, security_id, segment, received_at)` → `(ts, security_id, segment,
+   payload_hash)`. `received_at` stays a stored COLUMN (latency analysis), removed from the key.
+3. **DDL** adds `payload_hash LONG`; **brownfield migration** `ALTER TABLE ticks ADD COLUMN IF NOT
+   EXISTS payload_hash LONG` runs BEFORE the DEDUP ENABLE (so the existing-table auto-recover
+   DROP+CREATE path can never fire on the new key — no data loss).
+4. **Doc + data-integrity rule** updated to the new key + the determinism/replay rationale.
 
-No change to the matching/threshold logic (that's #1053), the 2-WebSocket lock, or the
-degrade-by-design fallback (an exhausted ladder still degrades to core universe, just far less often).
+Result: distinct ticks differ in ≥1 field → different hash → BOTH kept (no loss); a true duplicate /
+WAL-replay / reconnect re-send is byte-identical → same hash → collapsed (idempotent). Achieves the
+"a distinct tick can never be collapsed" goal AND fixes replay idempotency.
 
 ## Edge Cases
 
-- attempt=1 → MIN delay; huge/`usize::MAX` attempt → capped at MAX, no overflow (try_from + shift cap).
-- MAX_TIMES floored at 1 (a misconfig to 0 still does one attempt).
-- All attempts fail → returns the last `Err`; caller logs + degrades exactly as before (no new panic).
-- Success on attempt N → returns immediately (no extra delay).
+- Two same-second different-price ticks → different hash → both kept. ✅
+- Same frame replayed with a fresh `received_at` → same hash → collapsed. ✅ (test pins this)
+- Same-second identical-content ticks → collapse (information-identical duplicate — correct).
+- `usize`/overflow: FNV uses `wrapping_mul`; `u64`→`i64` via bit-reinterpret (full range, no panic).
+- Brownfield table missing the column → ADD COLUMN IF NOT EXISTS first → DEDUP never hits
+  "key column not found" → no accidental DROP TABLE.
 
 ## Failure Modes
 
-- Worst-case added boot latency if niftyindices is fully down: 1+2+4+8 = 15s of backoff across 5
-  attempts (cold path, before market open) — acceptable; bounded.
-- No new hot-path code (cold boot path only); no new alloc on any tick path.
+- ADD COLUMN fails (QuestDB down at boot) → logged WARN; DEDUP enable may then auto-recover. The
+  app's own ring→spill→DLQ still protects ticks. No new panic path (no unwrap/expect added).
+- Hot path: + ~48 byte-ops/tick, zero-alloc — negligible; DHAT-safe.
 
 ## Test Plan
 
-`cargo test -p tickvault-core --features daily_universe_fetcher --lib index_constituency::tests`:
-- `retry_delay_first_attempt_is_min`
-- `retry_delay_grows_exponentially_then_caps` (1,2,4,8,10)
-- `retry_delay_never_exceeds_max_even_for_huge_attempt` (incl. `usize::MAX`, no panic)
-- `retry_max_times_is_at_least_five`
-- existing 4 index_constituency tests still pass. (8/8 green locally.)
+`cargo test -p tickvault-storage --lib tick_persistence::tests` (271 pass) + new hash tests:
+- `test_payload_hash_is_deterministic_across_fresh_ticks`
+- `test_payload_hash_ignores_received_at_replay_safe` (the replay-safety guarantee)
+- `test_payload_hash_differs_on_distinct_price` / `_volume` / `_exchange_timestamp`
+- `test_tick_dedup_key_includes_segment` updated (key == `security_id, segment, payload_hash`)
+- `dedup_segment_meta_guard` (5) still green (key includes segment).
 
 ## Rollback
 
-Revert the constant + the two functions + the one call-site change. Pure cold-path logic; no schema,
-wire, or data change. `git revert`-clean.
+Revert the commit. The `payload_hash` column is additive (harmless if left). DEDUP key reverts to
+`received_at`. No data migration beyond the additive column. `git revert`-clean.
 
 ## Observability
 
-- Each failed attempt logs `warn!(index, attempt, max, delay_secs, err, "…retrying")` so the operator
-  sees the retry ladder in the app log / CloudWatch. `NTM-CONSTITUENCY-01` still fires (Critical) only
-  if all 5 attempts fail AND the resulting set degrades — i.e. a genuinely sustained outage.
+- No new error code. The fingerprint is internal; existing tick metrics unchanged. The 15:31 Dhan
+  1m cross-verify remains the end-to-end completeness detector.
+
+## ⚠️ Deploy window
+
+This migrates the LIVE `ticks` table (adds a column + changes the DEDUP key). **Deploy AFTER market
+close (≥15:30 IST)** — the brownfield ADD-COLUMN-before-DEDUP ordering makes it safe, but a schema
+change on the actively-written table is best done off-session.
 
 ## Per-item guarantee matrix
 
 All 15 "100% everything" rows + 7 resilience rows from
-`.claude/rules/project/per-wave-guarantee-matrix.md` apply to every item in this plan. Hot-path rows
-(DHAT/Criterion) are N/A — cold boot path only, no per-tick code; the pure backoff helper is
-unit-tested (incl. overflow), and the retry is bounded (≤15s) so it cannot hang boot.
+`.claude/rules/project/per-wave-guarantee-matrix.md` apply. O(1) per-tick hash (zero-alloc), no
+hot-path allocation, composite-key uniqueness strengthened, replay-idempotent, ratcheted by the 5
+new hash tests + the updated dedup-key test + the dedup_segment_meta_guard.
 
 ## Plan Items
 
-- [x] Raise `INDEX_CONSTITUENCY_RETRY_MAX_TIMES` 2 → 5
-  - Files: crates/common/src/constants.rs
-  - Tests: retry_max_times_is_at_least_five
-- [x] Wire 5× retry + exponential backoff into the NTM fetch
-  - Files: crates/core/src/instrument/index_constituency/mod.rs
-  - Tests: retry_delay_first_attempt_is_min, retry_delay_grows_exponentially_then_caps, retry_delay_never_exceeds_max_even_for_huge_attempt
+- [x] Add deterministic `tick_payload_hash` (FNV-1a, fixed seed)
+  - Files: crates/storage/src/tick_persistence.rs
+  - Tests: test_payload_hash_is_deterministic_across_fresh_ticks, _ignores_received_at_replay_safe, _differs_on_distinct_price, _differs_on_distinct_volume, _differs_on_exchange_timestamp
+- [x] Swap DEDUP key received_at → payload_hash + DDL + brownfield ADD COLUMN before DEDUP
+  - Files: crates/storage/src/tick_persistence.rs
+  - Tests: test_tick_dedup_key_includes_segment, dedup_segment_meta_guard
+- [x] Sync the data-integrity rule to the new key + determinism/replay rationale
+  - Files: .claude/rules/project/data-integrity.md
+  - Tests: n/a (docs)
