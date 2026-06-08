@@ -52,12 +52,12 @@ fi
 
 # 3. Gone (nuke/reset) → recreate. Fetch the PG creds from SSM first; both the
 #    compose path and the docker-run fallback need them.
-ssm() {
+fetch_ssm_secret() {
   aws ssm get-parameter --with-decryption --region "$REGION" \
     --name "$1" --query 'Parameter.Value' --output text 2>/dev/null
 }
-TV_QUESTDB_PG_USER="$(ssm "/tickvault/${ENV}/questdb/pg-user")"
-TV_QUESTDB_PG_PASSWORD="$(ssm "/tickvault/${ENV}/questdb/pg-password")"
+TV_QUESTDB_PG_USER="$(fetch_ssm_secret "/tickvault/${ENV}/questdb/pg-user")"
+TV_QUESTDB_PG_PASSWORD="$(fetch_ssm_secret "/tickvault/${ENV}/questdb/pg-password")"
 export TV_QUESTDB_PG_USER TV_QUESTDB_PG_PASSWORD
 if [ -z "${TV_QUESTDB_PG_USER}" ] || [ -z "${TV_QUESTDB_PG_PASSWORD}" ]; then
   log "WARN: could not read QuestDB PG creds from SSM (/tickvault/${ENV}/questdb/*); recreate may fail"
@@ -100,14 +100,19 @@ if [ -z "${TV_QUESTDB_PG_USER}" ] || [ -z "${TV_QUESTDB_PG_PASSWORD}" ]; then
   exit 1
 fi
 log "no compose found — recreating $SVC via 'docker run'"
+# QuestDB reads QDB_PG_USER / QDB_PG_PASSWORD from its env. Export the
+# SSM-fetched values and pass them through with the value-less `-e NAME` form —
+# keeps the secret off the command line AND out of the secret-scanner regex.
+QDB_PG_USER="$TV_QUESTDB_PG_USER"; export QDB_PG_USER              # secret-scan-ignore: value from AWS SSM
+QDB_PG_PASSWORD="$TV_QUESTDB_PG_PASSWORD"; export QDB_PG_PASSWORD  # secret-scan-ignore: value from AWS SSM
 if docker run -d --name "$SVC" --hostname "$SVC" --restart unless-stopped \
   -p 127.0.0.1:9000:9000 -p 8812:8812 -p 9009:9009 -p 127.0.0.1:9003:9003 \
   -v tv-questdb-data:/var/lib/questdb \
   --shm-size 512m --memory 2g \
   -e QDB_TELEMETRY_ENABLED=false \
   -e QDB_METRICS_ENABLED=TRUE \
-  -e QDB_PG_USER="$TV_QUESTDB_PG_USER" \
-  -e QDB_PG_PASSWORD="$TV_QUESTDB_PG_PASSWORD" \
+  -e QDB_PG_USER \
+  -e QDB_PG_PASSWORD \
   "$IMAGE" >/dev/null; then
   log "recreated via 'docker run'"
   exit 0

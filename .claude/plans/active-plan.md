@@ -70,6 +70,16 @@ No schema/data/wire change.
   `FAILED …`) to stdout → journald (and the deploy SSM command output), so the operator sees exactly
   how QuestDB came up. App BOOT-01/02 codes unchanged.
 
+## Per-item guarantee matrix
+
+All 15 "100% everything" rows + 7 resilience rows from
+`.claude/rules/project/per-wave-guarantee-matrix.md` apply to every item in this
+plan. This is a deploy/scripts/Lambda-only hotfix (no Rust/wire/schema change):
+the Rust-specific rows (DHAT, Criterion, coverage) are satisfied by "no
+production Rust touched"; the resilience rows are satisfied by "no new
+tick-drop path; QuestDB self-heal strengthened (recovers from removed/stopped/
+no-compose states); idempotent; git-revert-clean rollback".
+
 ## Plan Items
 
 - [x] Add robust `scripts/ensure-questdb.sh`
