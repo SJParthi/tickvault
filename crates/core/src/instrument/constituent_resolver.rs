@@ -13,9 +13,17 @@
 //! - **SECONDARY / fallback = Symbol.** When a constituent has no ISIN (or
 //!   the ISIN doesn't resolve), fall back to a `HashMap<Symbol, …>` over the
 //!   same NSE-EQ-EQUITY rows. Symbol-alone is never the PRIMARY key.
-//! - **Fail-closed.** A constituent that resolves to ZERO Dhan rows is
-//!   counted as dangling; if `dangling / total > 0.5%` the whole resolve is
-//!   REJECTED (mirrors §3 / §26 dangling-reference reject).
+//! - **Fail-closed (NTM membership tolerance = 2%).** A constituent that
+//!   resolves to ZERO Dhan rows is counted as dangling; if
+//!   `dangling / total > 2%` the whole resolve is REJECTED. This NTM-only
+//!   membership-list tolerance (operator lock 2026-06-08) is DELIBERATELY
+//!   LOOSER than the order-critical Dhan-master F&O dangling guard
+//!   (`fno_underlying_extractor.rs`, §3, unchanged): a ~750-stock index
+//!   membership list naturally carries a handful of unmatchable names
+//!   (new listings / SME / ISIN edge cases), and 5 stragglers must NOT
+//!   throw away 743 good stocks. Below the bar, the unresolved few are
+//!   simply skipped (and logged by the caller); above it, the whole list
+//!   is rejected (a genuinely broken niftyindices feed).
 //! - **Dedup** the resolved set by `(security_id, exchange_segment)` (I-P1-11).
 //!
 //! Role tagging + the union with the F&O underlyings happen at the
@@ -30,8 +38,18 @@ use tickvault_common::instrument_types::IndexConstituencyMap;
 
 use super::csv_parser::CsvRow;
 
-/// §31.1(4) reject threshold: > 0.5% unresolvable constituents.
-pub const DANGLING_REJECT_FRACTION: f64 = 0.005;
+/// §31.1(4) NTM membership reject threshold: > 2% unresolvable constituents.
+///
+/// Operator lock 2026-06-08 raised this from 0.5% → 2% after the live AWS
+/// boot degraded the entire NTM universe (244 instead of ~1000) because
+/// 5 of 748 constituents (0.67%) failed the ISIN→Dhan-master join and
+/// 0.67% exceeded the old 0.5% bar. 2% (~15 of 748) gives headroom for the
+/// handful of genuinely-unmatchable names (new listings / SME / ISIN edge
+/// cases) while still fail-closing a materially broken niftyindices feed.
+/// NOTE: this is the NTM membership-list tolerance ONLY — the Dhan-master
+/// F&O dangling guard (`fno_underlying_extractor.rs`, §3) is a SEPARATE,
+/// stricter, order-critical check and is unchanged.
+pub const DANGLING_REJECT_FRACTION: f64 = 0.02;
 
 /// A constituent successfully resolved to a Dhan NSE-EQ instrument.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,21 +305,29 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_above_half_percent_dangling() {
-        // 1 of 100 unresolved = 1% > 0.5% → reject.
-        let mut pairs: Vec<(String, String)> = (0..99)
+    fn test_dangling_reject_fraction_is_two_percent() {
+        // Operator lock 2026-06-08: NTM membership tolerance = 2% (was 0.5%).
+        assert!((DANGLING_REJECT_FRACTION - 0.02).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn fail_closed_above_two_percent_dangling() {
+        // 3 of 100 unresolved = 3% > 2% → reject.
+        let mut pairs: Vec<(String, String)> = (0..97)
             .map(|i| (format!("SYM{i}"), format!("INE{i:09}")))
             .collect();
-        pairs.push(("DANGLE".to_string(), "INE999999999".to_string()));
+        for d in 0..3 {
+            pairs.push((format!("DANGLE{d}"), format!("INE99999999{d}")));
+        }
         let constituents: Vec<(&str, &str)> = pairs
             .iter()
             .map(|(s, i)| (s.as_str(), i.as_str()))
             .collect();
         let map = map_with(&constituents);
-        // Dhan has all but DANGLE.
+        // Dhan has the first 97; the 3 DANGLEs are absent.
         let dhan: Vec<CsvRow> = pairs
             .iter()
-            .take(99)
+            .take(97)
             .enumerate()
             .map(|(i, (s, isin))| eq_row(&format!("{i}"), s, isin))
             .collect();
@@ -310,10 +336,38 @@ mod tests {
             ConstituentResolveError::TooManyDangling {
                 dangling, total, ..
             } => {
-                assert_eq!(dangling, 1);
+                assert_eq!(dangling, 3);
                 assert_eq!(total, 100);
             }
         }
+    }
+
+    #[test]
+    fn tolerates_ntm_straggler_fraction() {
+        // The live 2026-06-08 scenario: 5 of 748 unresolved = 0.67% < 2% →
+        // Ok with 743 resolved, 5 skipped (NOT a whole-list rejection).
+        let mut pairs: Vec<(String, String)> = (0..743)
+            .map(|i| (format!("SYM{i}"), format!("INE{i:09}")))
+            .collect();
+        for d in 0..5 {
+            pairs.push((format!("DANGLE{d}"), format!("INE88888888{d}")));
+        }
+        let constituents: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(s, i)| (s.as_str(), i.as_str()))
+            .collect();
+        let map = map_with(&constituents);
+        // Dhan has the first 743; the 5 DANGLEs are absent.
+        let dhan: Vec<CsvRow> = pairs
+            .iter()
+            .take(743)
+            .enumerate()
+            .map(|(i, (s, isin))| eq_row(&format!("{i}"), s, isin))
+            .collect();
+        let out = resolve_constituents(&map, &dhan).unwrap();
+        assert_eq!(out.total, 748);
+        assert_eq!(out.resolved.len(), 743);
+        assert_eq!(out.unresolved_symbols.len(), 5);
     }
 
     #[test]

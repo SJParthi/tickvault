@@ -1,102 +1,97 @@
-# Implementation Plan: QuestDB self-heal + fix CloudWatch log path (the "IntelliJ view" in AWS)
+# Implementation Plan: NTM constituent dangling threshold 0.5% → 2% + log stragglers
 
 **Status:** VERIFIED
 **Date:** 2026-06-08
-**Approved by:** Parthiban — "Go ahead" (build the QuestDB self-heal + the AWS end-to-end log view).
-**Crate(s) touched:** NONE — deploy + docs only (systemd unit, user-data CloudWatch-agent config,
-operator-control Lambda, new runbook). No production Rust, no new ErrorCode → plan-gate exempt.
+**Approved by:** Parthiban — AskUserQuestion 2026-06-08 "Raise threshold to 2% + skip stragglers (Recommended)".
+**Crate(s) touched:** `tickvault-core` (+ rule docs).
 
 ## Context
 
-Root-caused from the live journal: the app crash-loops forever (`BOOT-02: QuestDB not ready`,
-restart counter 26+) because **the QuestDB container is down and nothing on the box recreates it** —
-`user-data` runs once (cloud-init), the app unit only waits for the Docker *daemon* (not the QuestDB
-*container*), and the portal "Restart QuestDB" button uses `compose restart` (which fails if the
-container is gone). Separately, the operator wants the AWS equivalent of IntelliJ's live log view —
-but the CloudWatch agent ships `/opt/tickvault/logs/` while the app actually writes
-`/opt/tickvault/data/logs/` (WorkingDirectory=/opt/tickvault + `ReadWritePaths=/opt/tickvault/data`),
-so **app logs never reach CloudWatch** — a real path-mismatch bug.
+Live AWS log (`/opt/tickvault/data/logs/errors.jsonl.2026-06-08`) root-caused the missing NTM
+universe (244 subscribed instead of ~1000):
+
+```json
+{"code":"NTM-CONSTITUENCY-01","reason":"dangling",
+ "err":"constituent resolve dangling fraction 5/748 = 0.0067 exceeds 0.005"}
+```
+
+The niftyindices download SUCCEEDED (748 constituents). The ISIN→Dhan-master join left **5 of 748
+(0.67%) unresolved**, which exceeds the §31.1(4) `DANGLING_REJECT_FRACTION = 0.005` (0.5%) gate, so
+`resolve_constituents` returns `Err(TooManyDangling)` → `resolve_ntm_rows` degrades to EMPTY → the
+universe falls back to indices + F&O underlyings (~244). The 0.5% gate allows only ≤3 of 748 — a
+~750-stock membership list naturally has a handful of unmatchable names (new listings, SME, ISIN
+edge cases), so 5 stragglers nuking 743 good stocks is an all-or-nothing trap.
 
 ## Design
 
-1. **Self-heal QuestDB at app boot** — `deploy/systemd/tickvault.service`: add
-   `ExecStartPre=-/usr/bin/docker compose -f /opt/tickvault/repo/deploy/docker/docker-compose.yml up -d questdb`.
-   Runs as ec2-user (in the docker group), recreates a missing/stopped QuestDB before the app starts.
-   `-` prefix = a transient compose hiccup doesn't hard-fail the unit; the app's own 60s
-   `wait_for_questdb_ready` remains the real gate. Fixes the "container gone → loop forever" class.
-2. **Restart-QuestDB button → create-or-restart** — `operator-control/handler.py`: change
-   `docker compose restart questdb` → `docker compose up -d questdb` so the portal button works even
-   when the container vanished (not just when it's merely stopped).
-3. **Fix CloudWatch log path (the IntelliJ view)** — `user-data.sh.tftpl` CloudWatch-agent
-   `collect_list`: `/opt/tickvault/logs/{errors.jsonl*,app.*.log}` →
-   `/opt/tickvault/data/logs/...` (where the app actually writes). This makes the full app log +
-   `errors.jsonl` (incl. the `BOOT-02` `error!`) stream to CloudWatch `/tickvault/<env>/app` →
-   CloudWatch **Live Tail** becomes the real-time end-to-end console. Also fix the `mkdir` to create
-   `data/logs`.
-4. **New runbook** `docs/runbooks/aws-docker-daemon-dead.md` — disk-full / QuestDB-down / Docker
-   recovery (referenced by `aws-daily-lifecycle.md`); documents the self-heal + the journald-vs-
-   CloudWatch split (systemd/boot lines = journald/portal Logs tab; app+error logs = CloudWatch).
+1. **`crates/core/src/instrument/constituent_resolver.rs`** — raise the NTM-only
+   `DANGLING_REJECT_FRACTION` from `0.005` (0.5%) to `0.02` (2%). 0.67% < 2% → resolve now returns
+   `Ok` with `resolved = 743`, `unresolved_symbols = [5 names]` (the existing under-threshold path
+   already DROPS the unresolved and keeps the resolved — raising the threshold IS the "skip
+   stragglers" behaviour). Update the module + constant + error docstrings to cite the 2% NTM value
+   and that it is DISTINCT from the Dhan-master F&O dangling guard (`fno_underlying_extractor.rs`,
+   unchanged at the §3 reject level).
+2. **`crates/core/src/instrument/daily_universe_orchestrator.rs`** — in `resolve_ntm_rows`, the
+   success-path `info!` already logs `ntm_unresolved` (count); extend it to also log the actual
+   dropped symbol names (truncated to the first 20, joined) so every boot SHOWS which constituents
+   were skipped — operator visibility per audit-findings Rule 11 (no silent drops).
+3. **Rule docs** — `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md` §31.1(4) +
+   `.claude/rules/project/ntm-constituency-error-codes.md`: record that the NTM constituent reject
+   threshold is 2% (operator lock 2026-06-08), separate from the 0.5% Dhan-master F&O guard.
 
-**Honest scope note:** journald (the raw systemd `Failed to start` + the final anyhow `Error:` line)
-is NOT shipped to CloudWatch by the agent (it tails files, not the journal). But the *root-cause*
-`BOOT-02` line IS emitted via `error!` → `errors.jsonl` → reaches CloudWatch after fix #3, so the
-operator sees WHY boot failed in CloudWatch. Raw systemd lines stay in journald (portal Logs tab).
-A journald→CloudWatch source is deliberately out of scope (fragile; the path fix covers the need).
-
-**Deploy caveat (documented in the runbook):** the systemd-unit + user-data changes take effect on
-the next deploy / instance refresh — the existing down box must first be recovered manually
-(free disk / `docker compose up -d`).
+This is the operator-approved fix; it only loosens the NTM membership-list join tolerance — it does
+NOT touch the Dhan-master fail-closed path (which stays the order-critical guard) and does NOT touch
+the 2-WebSocket lock or the subscription dispatch.
 
 ## Edge Cases
 
-- ExecStartPre under `ProtectSystem=strict` — only reads the compose file (/opt readable) + talks to
-  `/run/docker.sock` (/run not locked by strict); ec2-user is in the docker group. Works.
-- Disk genuinely full → ExecStartPre `up -d` still can't start QuestDB → app still waits/fails
-  (correct — can't conjure space); the runbook covers freeing disk / growing EBS.
-- `up -d questdb` is idempotent — a healthy running QuestDB is untouched.
+- 0/0 constituents (niftyindices fully down): existing `if total > 0` guard untouched → no div-by-0;
+  empty map → `resolve_ntm_rows` returns empty → core universe (NTM-CONSTITUENCY-01), unchanged.
+- Exactly 2.0% dangling: code uses `fraction > FRACTION` (strict) → 2.0% does NOT reject (accepted).
+- > 2% dangling (e.g. niftyindices serves a corrupt/half list): still `Err(TooManyDangling)` →
+  degrade to core universe + NTM-CONSTITUENCY-01 (fail-closed preserved at the higher bar).
+- Stragglers change day-to-day: the dropped-names log lists whatever the current set is each boot.
 
 ## Failure Modes
 
-- All changes are deploy/docs. ExecStartPre uses `-` so it never blocks boot worse than today.
-  Lambda change is a one-word command swap. user-data change is a path string.
+- Threshold too loose hides a real niftyindices corruption: mitigated — 2% still fail-closes a
+  materially broken list; only a handful of genuine stragglers pass; dropped names are logged so a
+  rising straggler count is visible.
+- No new panic path (pure function, no unwrap/expect added).
 
 ## Test Plan
 
-- `python3 -c "import json; ..."` validate the embedded CloudWatch-agent JSON still parses.
-- `python3 -m py_compile deploy/aws/lambda/operator-control/handler.py` — Lambda still compiles.
-- `cargo test -p tickvault-common --test runbook_cross_link_guard` — new runbook has no dangling links.
-- Manual review of the systemd unit (no syntax tool; matches existing directive style).
+- `crates/core/src/instrument/constituent_resolver.rs` unit tests (run with
+  `cargo test -p tickvault-core --features daily_universe_fetcher`):
+  - UPDATE `fail_closed_above_half_percent_dangling` → `fail_closed_above_two_percent_dangling`
+    (3/100 = 3% > 2% → reject).
+  - KEEP `tolerates_below_threshold_dangling` (1/300 = 0.33% < 2% → OK).
+  - ADD `tolerates_ntm_straggler_fraction` — 5 dangling / 748 total = 0.67% < 2% → `Ok`,
+    `resolved.len() == 743`, `unresolved_symbols.len() == 5` (the live scenario).
+  - ADD `test_dangling_reject_fraction_is_two_percent` pinning the constant = 0.02.
+- `daily_universe_orchestrator.rs` existing tests still pass (logging-only change to the Ok path).
 
 ## Rollback
 
-- `git revert` restores the old systemd unit, the `compose restart`, and the old CW path. Pure
-  deploy/docs revert; no runtime code affected.
+Single-constant revert: set `DANGLING_REJECT_FRACTION` back to `0.005` and revert the two test
+edits + the log line. No data migration, no schema change, no wire-format change — pure in-process
+boot-path logic. `git revert <sha>` is clean.
 
 ## Observability
 
-- After deploy: CloudWatch `/tickvault/<env>/app` Live Tail shows the full app log + errors (incl.
-  BOOT-02). `tv_disk_*` gauges + the existing 75%-full alarm already cover disk.
+- The boot `info!` in `resolve_ntm_rows` now carries `ntm_resolved`, `ntm_unresolved`, and the
+  dropped symbol NAMES — so CloudWatch/`errors.jsonl`/app log show exactly which constituents were
+  skipped each morning. `NTM-CONSTITUENCY-01` still fires (Critical) only when the (now 2%) gate is
+  breached — i.e. a genuinely broken list, not a few stragglers.
 
 ## Plan Items
 
-- [x] Item 1 — systemd `ExecStartPre` self-heals QuestDB
-  - Files: `deploy/systemd/tickvault.service`
-  - Tests: N/A (TEST-EXEMPT systemd unit — no Rust)
-- [x] Item 2 — Restart-QuestDB button → `compose up -d`
-  - Files: `deploy/aws/lambda/operator-control/handler.py`
-  - Tests: N/A (TEST-EXEMPT Lambda — py_compile verified)
-- [x] Item 3 — fix CloudWatch agent log path → `/opt/tickvault/data/logs/`
-  - Files: `deploy/aws/terraform/user-data.sh.tftpl`
-  - Tests: N/A (TEST-EXEMPT Terraform template — JSON validated)
-- [x] Item 4 — new `aws-docker-daemon-dead.md` runbook
-  - Files: `docs/runbooks/aws-docker-daemon-dead.md`
-  - Tests: every_repo_path_referenced_in_runbooks_resolves
-
-## Scenarios
-
-| # | Scenario | Expected |
-|---|----------|----------|
-| 1 | QuestDB container removed, app starts | ExecStartPre `up -d` recreates it → app boots (no more loop) |
-| 2 | Operator presses Restart QuestDB with container gone | `up -d` recreates it (old `restart` would fail) |
-| 3 | App running, operator opens CloudWatch Live Tail | full app log + BOOT/errors stream live (IntelliJ-style) |
-| 4 | Disk full | self-heal can't help; runbook → free disk / grow EBS |
+- [x] Raise `DANGLING_REJECT_FRACTION` 0.005 → 0.02 + docstrings
+  - Files: crates/core/src/instrument/constituent_resolver.rs
+  - Tests: test_dangling_reject_fraction_is_two_percent, fail_closed_above_two_percent_dangling, tolerates_ntm_straggler_fraction
+- [x] Log dropped straggler names on the NTM resolve success path
+  - Files: crates/core/src/instrument/daily_universe_orchestrator.rs
+  - Tests: existing daily_universe_orchestrator tests (logging-only)
+- [x] Document the 2% NTM threshold (distinct from 0.5% Dhan-master guard)
+  - Files: .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md, .claude/rules/project/ntm-constituency-error-codes.md
+  - Tests: n/a (docs)

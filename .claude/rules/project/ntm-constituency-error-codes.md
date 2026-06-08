@@ -36,7 +36,9 @@ halt all trading because a *secondary* list source is down.
    `Err` (network timeout, DNS, 5xx, redirect-blocked, body-cap exceeded — Sub-PR #3 hardening).
 2. **Parse failure** — niftyindices returned 200 but the body was malformed / non-UTF-8 / missing a
    mandatory column (`parse_constituents` error).
-3. **Resolve failure** — `> 0.5%` of constituents did not resolve to a Dhan NSE-EQ row
+3. **Resolve failure** — `> 2%` of constituents did not resolve to a Dhan NSE-EQ row
+   (threshold raised 0.5% → 2% by operator lock 2026-06-08 — see §31.1(4); a few
+   stragglers no longer nuke the whole list, they are skipped + logged by name)
    (`constituent_resolver::ConstituentResolveError::TooManyDangling`).
 
 **Consequence (degrade, NOT halt):** `build_daily_universe` is called with `ntm_constituents` empty,
