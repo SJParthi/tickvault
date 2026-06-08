@@ -1268,8 +1268,11 @@ fn fnv1a_step(mut hash: u64, bytes: &[u8]) -> u64 {
 /// WAL-replayed or reconnect-resent frame collapses (idempotent), while any
 /// differing field yields a different hash so two DISTINCT same-second ticks are
 /// both preserved. Zero-alloc, O(1) over a fixed field set — safe on the hot path.
+///
+/// `pub` so the DEDUP-uniqueness proptest can model the EXACT production
+/// tiebreaker instead of a stale hand-rolled copy.
 #[inline]
-fn tick_payload_hash(tick: &ParsedTick) -> i64 {
+pub fn tick_payload_hash(tick: &ParsedTick) -> i64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     let mut h = FNV_OFFSET;
     h = fnv1a_step(h, &tick.last_traded_price.to_le_bytes());
@@ -2668,7 +2671,7 @@ mod tests {
     // --- payload_hash dedup tiebreaker (2026-06-08) -------------------------
 
     #[test]
-    fn test_payload_hash_is_deterministic_across_fresh_ticks() {
+    fn test_tick_payload_hash_is_deterministic_across_fresh_ticks() {
         // Two independently-built ticks with identical content MUST hash equal —
         // this is what makes a WAL-replayed / reconnect-resent frame collapse
         // (idempotent) regardless of process or received_at.

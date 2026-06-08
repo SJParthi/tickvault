@@ -1,16 +1,18 @@
 //! S3-3: Property test for tick DEDUP uniqueness.
 //!
 //! **Invariant under test:** the quadruple `(exchange_timestamp, security_id,
-//! exchange_segment_code, received_at_nanos)` is the unique key for a tick in
+//! exchange_segment_code, payload_hash)` is the unique key for a tick in
 //! QuestDB. Two ticks with the same quadruple will be merged by QuestDB DEDUP
-//! UPSERT KEYS; two ticks with ANY difference in the quadruple MUST be
-//! preserved as separate rows.
+//! UPSERT KEYS; two ticks with ANY difference MUST be preserved as separate rows.
 //!
-//! `received_at_nanos` joined the key (2026-06-01) because Dhan's
-//! `exchange_timestamp` (LTT) is SECOND-granular: without the nanosecond
-//! local-capture instant, 3-4-5 distinct sub-second ticks for one instrument
-//! would collapse to one row. A genuine replay re-emits the SAME
-//! `received_at_nanos`, so dedup of true duplicates is preserved.
+//! **2026-06-08:** `payload_hash` REPLACED `received_at_nanos` as the
+//! sub-second tiebreaker. `received_at` was stamped at processing time, so on
+//! WAL/reconnect REPLAY the same frame got a NEW value → a true duplicate would
+//! NOT collapse → duplicate row. `payload_hash` is a deterministic content
+//! fingerprint (`tick_payload_hash`): two DISTINCT ticks differ in ≥1 value
+//! field → different hash → both kept (no loss); a true duplicate / replay is
+//! byte-identical → same hash → collapsed (idempotent). Dhan has no per-tick
+//! sequence number, so a content fingerprint is the only replay-stable basis.
 //!
 //! This is the backbone of the zero-tick-loss guarantee — if DEDUP
 //! incorrectly collapsed two distinct ticks, we'd silently lose data, and
@@ -30,16 +32,18 @@
 
 use proptest::prelude::*;
 use tickvault_common::tick_types::ParsedTick;
-use tickvault_storage::tick_persistence::tick_dedup_key;
+use tickvault_storage::tick_persistence::{tick_dedup_key, tick_payload_hash};
 
 /// Computes the canonical dedup "tuple" for a tick — matches the QuestDB
-/// DEDUP UPSERT KEYS semantics.
+/// DEDUP UPSERT KEYS `(ts, security_id, segment, payload_hash)` EXACTLY by
+/// calling the production `tick_payload_hash`. (2026-06-08: `received_at` was
+/// replaced by the content fingerprint `payload_hash` — see the module header.)
 fn dedup_tuple(tick: &ParsedTick) -> (u32, u32, u8, i64) {
     (
         tick.exchange_timestamp,
         tick.security_id,
         tick.exchange_segment_code,
-        tick.received_at_nanos,
+        tick_payload_hash(tick),
     )
 }
 
@@ -74,22 +78,32 @@ proptest! {
         prop_assert_eq!(a, b);
     }
 
-    /// S3-3/2: Non-key fields don't affect the tuple. Changing price,
-    /// volume, day_* fields, greeks — none of those should move the key.
+    /// S3-3/2 (2026-06-08, INVERTED): value fields ARE now part of the key via
+    /// the content fingerprint `payload_hash`. Changing the price → a DIFFERENT
+    /// tuple → both rows preserved. THIS is the no-loss guarantee: two distinct
+    /// same-second ticks (which differ in ≥1 value field) can never collapse.
     #[test]
-    fn prop_non_key_fields_do_not_affect_tuple(
+    fn prop_distinct_price_changes_tuple(
         base in arb_tick(),
         new_price in 1_f32..100_000_f32,
-        new_vol in any::<u32>(),
-        new_oi in any::<u32>(),
     ) {
+        prop_assume!(new_price.to_le_bytes() != base.last_traded_price.to_le_bytes());
         let mut changed = base;
         changed.last_traded_price = new_price;
+        prop_assert_ne!(dedup_tuple(&base), dedup_tuple(&changed));
+    }
+
+    /// S3-3/2b: changing volume (a distinct stock trade in the same second)
+    /// → different tuple → both kept.
+    #[test]
+    fn prop_distinct_volume_changes_tuple(
+        base in arb_tick(),
+        new_vol in any::<u32>(),
+    ) {
+        prop_assume!(new_vol != base.volume);
+        let mut changed = base;
         changed.volume = new_vol;
-        changed.open_interest = new_oi;
-        changed.day_high = new_price;
-        changed.day_low = new_price;
-        prop_assert_eq!(dedup_tuple(&base), dedup_tuple(&changed));
+        prop_assert_ne!(dedup_tuple(&base), dedup_tuple(&changed));
     }
 
     /// S3-3/3: Different security_id → different tuple.
@@ -131,21 +145,20 @@ proptest! {
         prop_assert_ne!(dedup_tuple(&base), dedup_tuple(&changed));
     }
 
-    /// S3-3/9: Different received_at → different tuple. This is the
-    /// sub-second-preservation invariant (2026-06-01): two ticks with the
-    /// SAME second-granular `exchange_timestamp`, same security_id, same
-    /// segment, but distinct nanosecond capture instants MUST be preserved
-    /// as separate rows — they are genuinely distinct market events that
-    /// arrived inside the same wall-clock second.
+    /// S3-3/9 (2026-06-08, INVERTED): `received_at` is NO LONGER in the key.
+    /// Changing ONLY `received_at_nanos` MUST keep the tuple IDENTICAL — this is
+    /// the replay-idempotency guarantee: a WAL-replayed / reconnect-resent frame
+    /// is re-stamped with a fresh `received_at` at processing time, yet it must
+    /// still collapse to ONE row (same content → same `payload_hash`). The old
+    /// `received_at`-in-key behaviour would have created a duplicate row here.
     #[test]
-    fn prop_different_received_at_different_tuple(
+    fn prop_received_at_does_not_affect_tuple(
         base in arb_tick(),
         new_recv in any::<i64>(),
     ) {
-        prop_assume!(new_recv != base.received_at_nanos);
         let mut changed = base;
         changed.received_at_nanos = new_recv;
-        prop_assert_ne!(dedup_tuple(&base), dedup_tuple(&changed));
+        prop_assert_eq!(dedup_tuple(&base), dedup_tuple(&changed));
     }
 }
 
@@ -166,9 +179,15 @@ fn dedup_key_string_contains_security_id_and_segment() {
          cross-segment collision, got: {key}"
     );
     assert!(
-        key.contains("received_at"),
-        "DEDUP_KEY_TICKS must include received_at to preserve sub-second \
-         ticks (Dhan LTT is second-granular), got: {key}"
+        key.contains("payload_hash"),
+        "DEDUP_KEY_TICKS must include payload_hash to preserve sub-second ticks \
+         AND stay replay-idempotent (Dhan LTT is second-granular; received_at was \
+         re-stamped on replay → duplicates, replaced 2026-06-08), got: {key}"
+    );
+    assert!(
+        !key.contains("received_at"),
+        "received_at must NOT be in the dedup key (re-stamped on replay → \
+         duplicates); replaced by payload_hash 2026-06-08, got: {key}"
     );
 }
 
@@ -197,34 +216,35 @@ fn dedup_regression_nse_bse_1333_collision() {
     );
 }
 
-/// S3-3/8: Backfill replay idempotency — a synthesised tick from the
-/// BackfillWorker and a later live WebSocket tick with the same triple
-/// MUST have the same dedup tuple. QuestDB UPSERT KEYS will merge them
-/// into one row (live wins via later ts on WAL, or both collapse if ts
-/// identical).
+/// S3-3/8 (2026-06-08, REWRITTEN): replay idempotency under the `payload_hash`
+/// key. The old version modelled the deleted + banned historical-backfill path
+/// and (incorrectly, post-2026-06-08) asserted that two DIFFERENT-content ticks
+/// should merge — that contradicts the no-loss guarantee. The CORRECT replay
+/// scenario: the SAME frame replayed (every value field identical) but
+/// re-stamped with a fresh `received_at_nanos` at processing time MUST still
+/// produce the SAME dedup tuple → QuestDB collapses it to one row (idempotent).
 #[test]
-fn dedup_backfill_replay_idempotent() {
-    let synthetic = ParsedTick {
+fn dedup_identical_content_replay_idempotent() {
+    let original = ParsedTick {
         security_id: 1333,
         exchange_segment_code: 1,
         exchange_timestamp: 1_700_000_060,
-        last_traded_price: 2499.50, // backfilled from minute candle close
-        day_close: 0.0,             // unknown at backfill time
-        ..Default::default()
-    };
-    let live = ParsedTick {
-        security_id: 1333,
-        exchange_segment_code: 1,
-        exchange_timestamp: 1_700_000_060,
-        last_traded_price: 2500.00, // real value from WebSocket
+        last_traded_price: 2500.00,
         volume: 12345,
         day_close: 2490.0,
+        received_at_nanos: 1_700_000_060_111_111_111,
         ..Default::default()
     };
+    // Same frame replayed (WAL recovery / reconnect re-send): identical content,
+    // ONLY the processing-time received_at differs.
+    let replayed = ParsedTick {
+        received_at_nanos: 1_700_000_999_999_999_999,
+        ..original
+    };
     assert_eq!(
-        dedup_tuple(&synthetic),
-        dedup_tuple(&live),
-        "backfill replay must use the same dedup tuple as the live tick \
-         so QuestDB DEDUP merges them idempotently"
+        dedup_tuple(&original),
+        dedup_tuple(&replayed),
+        "a replayed frame (identical content, fresh received_at) MUST share the \
+         dedup tuple so QuestDB DEDUP collapses it — replay idempotency"
     );
 }
