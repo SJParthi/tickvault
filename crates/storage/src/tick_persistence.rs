@@ -22,7 +22,8 @@
 
 use std::collections::VecDeque;
 use std::io::{BufReader, BufWriter, Read as _, Write as _};
-use std::time::Duration;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, Sender, TimestampNanos};
@@ -1291,6 +1292,53 @@ pub fn tick_payload_hash(tick: &ParsedTick) -> i64 {
     i64::from_le_bytes(h.to_le_bytes())
 }
 
+/// Process-wide, strictly-monotonic capture-sequence counter (TICK-SEQ-01).
+///
+/// Seeded from / clamped to wall-clock nanoseconds so the value is also roughly
+/// time-ordered and a process restart resumes near the current nanos instead of
+/// resetting to 0. See [`next_capture_seq`].
+static TICK_CAPTURE_SEQ: AtomicI64 = AtomicI64::new(0);
+
+/// Wall-clock nanoseconds since the Unix epoch, clamped into `i64`. Used only as
+/// the lower bound for [`next_capture_seq`]; never the designated timestamp.
+/// O(1), zero-alloc, no panic.
+#[inline]
+fn wall_clock_nanos() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// Returns a strictly-monotonic capture sequence: `max(prev + 1, wall_nanos)`.
+///
+/// **Guarantees (TICK-SEQ-01):** never repeats and never decreases — even when
+/// two rows are built within the same nanosecond (the `+1` wins) or the system
+/// clock steps backward via NTP (the `+1` still wins). Lock-free CAS loop, O(1),
+/// zero heap allocation — safe on the persist path.
+///
+/// **Step-1 scope:** this value is populated into the `capture_seq` *column*
+/// only; the `ticks` DEDUP key is UNCHANGED (still `payload_hash`) in this step.
+/// It becomes the replay-stable key tiebreaker once the capture sequence is
+/// sourced from the durable WAL frame (TICK-SEQ-01 step 2). Because the value is
+/// generated at row-build time here, it is NOT yet replay-stable across a WAL
+/// replay; that is intentional and harmless while the key remains `payload_hash`.
+/// See `.claude/plans/active-plan.md`.
+#[inline]
+fn next_capture_seq() -> i64 {
+    let now = wall_clock_nanos();
+    loop {
+        let prev = TICK_CAPTURE_SEQ.load(Ordering::Relaxed);
+        let next = prev.saturating_add(1).max(now);
+        if TICK_CAPTURE_SEQ
+            .compare_exchange_weak(prev, next, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok()
+        {
+            return next;
+        }
+    }
+}
+
 /// Writes a single tick row into the ILP buffer (no flush).
 ///
 /// Dhan WebSocket sends `exchange_timestamp` as IST epoch seconds — already
@@ -1358,6 +1406,12 @@ fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
         // collapse. See `tick_payload_hash` + the `DEDUP_KEY_TICKS` doc.
         .column_i64("payload_hash", tick_payload_hash(tick))
         .context("payload_hash")?
+        // TICK-SEQ-01 step 1: strictly-monotonic per-row capture sequence,
+        // stored as a column. NOT yet in the DEDUP key (still `payload_hash`) —
+        // it becomes the replay-stable key tiebreaker once sourced from the WAL
+        // frame (step 2). See `next_capture_seq` + `.claude/plans/active-plan.md`.
+        .column_i64("capture_seq", next_capture_seq())
+        .context("capture_seq")?
         .at(ts_nanos)
         .context("designated timestamp")?;
 
@@ -1420,6 +1474,7 @@ const TICKS_CREATE_DDL: &str = "\
         exchange_timestamp LONG,\
         received_at TIMESTAMP,\
         payload_hash LONG,\
+        capture_seq LONG,\
         ts TIMESTAMP\
     ) TIMESTAMP(ts) PARTITION BY HOUR WAL\
 ";
@@ -1524,6 +1579,33 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
         }
         Err(err) => {
             warn!(?err, "ticks.payload_hash ADD COLUMN request failed");
+        }
+    }
+
+    // Step 1c: Brownfield migration (TICK-SEQ-01 step 1) — ensure the
+    // `capture_seq` column exists on pre-existing tables. Additive + idempotent
+    // (`ADD COLUMN IF NOT EXISTS`); the DEDUP key is unchanged in this step, so
+    // this never affects existing rows or dedup behaviour.
+    let add_capture_seq_sql =
+        format!("ALTER TABLE \"{QUESTDB_TABLE_TICKS}\" ADD COLUMN IF NOT EXISTS capture_seq LONG");
+    match client
+        .get(&base_url)
+        .query(&[("query", &add_capture_seq_sql)])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            debug!("ticks.capture_seq column ensured (ADD COLUMN IF NOT EXISTS)");
+        }
+        Ok(resp) => {
+            let body = resp.text().await.unwrap_or_default();
+            warn!(
+                body = body.chars().take(200).collect::<String>(),
+                "ticks.capture_seq ADD COLUMN returned non-success"
+            );
+        }
+        Err(err) => {
+            warn!(?err, "ticks.capture_seq ADD COLUMN request failed");
         }
     }
 
@@ -8932,5 +9014,60 @@ mod tests {
             diff_secs, IST_UTC_OFFSET_SECONDS_I64,
             "exchange_timestamp (IST) minus received_at (UTC) ≈ IST offset"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // TICK-SEQ-01 step 1: capture_seq column + monotonic stamper
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_next_capture_seq_strictly_monotonic_and_unique() {
+        // Strictly increasing (hence unique) even under the shared global
+        // counter and concurrent test threads bumping it: `max(prev+1, now)`
+        // guarantees a forward step on every call.
+        let mut prev = next_capture_seq();
+        for _ in 0..10_000 {
+            let cur = next_capture_seq();
+            assert!(
+                cur > prev,
+                "capture_seq must strictly increase: {cur} !> {prev}"
+            );
+            prev = cur;
+        }
+    }
+
+    #[test]
+    fn test_next_capture_seq_clamps_to_at_least_wall_nanos() {
+        // The value is never below the current wall-clock nanos lower bound,
+        // so a restart resumes near "now" rather than resetting to 0.
+        let floor = wall_clock_nanos();
+        assert!(next_capture_seq() >= floor);
+    }
+
+    #[test]
+    fn test_ticks_ddl_contains_capture_seq_long() {
+        assert!(
+            TICKS_CREATE_DDL.contains("capture_seq LONG"),
+            "ticks DDL must declare the capture_seq LONG column"
+        );
+    }
+
+    #[test]
+    fn test_build_tick_row_emits_capture_seq_column() {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let tick = make_test_tick(13, 23_146.45);
+        build_tick_row(&mut buffer, &tick).unwrap();
+        let content = String::from_utf8_lossy(buffer.as_bytes());
+        assert!(
+            content.contains("capture_seq="),
+            "ILP row must contain the capture_seq column. Got: {content}"
+        );
+    }
+
+    #[test]
+    fn test_dedup_key_unchanged_in_step1() {
+        // Step 1 is column-only — it must NOT alter the dedup key. The key flip
+        // to capture_seq is TICK-SEQ-01 step 2 (after WAL replay-stability).
+        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, payload_hash");
     }
 }
