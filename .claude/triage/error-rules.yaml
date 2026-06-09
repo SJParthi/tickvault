@@ -1577,3 +1577,42 @@ rules:
       day (false-OK avoidance, audit Rule 11). Severity::High. Best-effort
       run never blocks; next trading day re-runs. Operator checks Dhan
       Data-API health + the 5/sec, 100k/day rate budget.
+
+
+  # -----------------------------------------------------------------------
+  # WAL frame-spill writer hardening (2026-06-09, zero-tick-loss)
+  # -----------------------------------------------------------------------
+
+  - name: ws-spill-01-writer-respawn-escalate
+    match:
+      code: WS-SPILL-01
+    action: escalate
+    runbook_path: .claude/rules/project/ws-frame-spill-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      WS-SPILL-01 means the WAL frame-spill writer thread died (panic or a
+      transient disk I/O error) and the supervisor respawned it with the same
+      channel, so the durable WAL floor survives and append never sees
+      Disconnected. A single respawn self-heals; a sustained respawn or
+      write-error rate (tv_ws_frame_spill_writer_respawn_total /
+      tv_ws_frame_spill_write_errors_total) means the underlying disk is
+      failing. High severity; mirrors WS-GAP-05 / DISK-WATCHER-01. Escalate
+      (Telegram + draft Issue) so the operator restores disk health, with a
+      5-min cooldown to avoid spamming on a benign one-off respawn.
+
+  - name: ws-spill-02-frame-dropped-escalate
+    match:
+      code: WS-SPILL-02
+    action: escalate
+    runbook_path: .claude/rules/project/ws-frame-spill-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      WS-SPILL-02 = a Dhan frame was dropped because the WAL spill writer was
+      dead at the append instant (channel Disconnected). The WS-SPILL-01
+      respawn makes this window tiny and practically unreachable, but it is a
+      genuine durable-frame loss (tv_ticks_lost_total{source=spill_writer_dead}).
+      Severity::Critical — NEVER auto-action. Escalate (Telegram + draft Issue)
+      paired with the WS-SPILL-01 respawn so the operator fixes the disk
+      failure that killed the writer.
