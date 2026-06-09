@@ -106,16 +106,16 @@ def handler(event, context):
 
     lines = [
         f"{emoji} *AWS Cost — tickvault*",
-        f"_Yesterday_:   ₹{inr(yday_usd):.0f}   (${yday_usd:.2f})",
-        f"_This month_:  ₹{inr(mtd_usd):.0f}   (${mtd_usd:.2f})",
+        f"_Yesterday_:   ₹{inr(yday_usd):.0f}   ($${yday_usd:.2f})",
+        f"_This month_:  ₹{inr(mtd_usd):.0f}   ($${mtd_usd:.2f})",
         f"_Of $25 stop-budget_: {pct:.0f}%",
-        f"_Forecast EOM_: ₹{inr(forecast_usd):.0f}   (${forecast_usd:.2f})",
+        f"_Forecast EOM_: ₹{inr(forecast_usd):.0f}   ($${forecast_usd:.2f})",
         f"_Days left_:   {days_remaining}",
         "",
         "*Where it goes (this month):*",
     ]
     for nice, usd in sorted(by_svc.items(), key=lambda kv: -kv[1]):
-        lines.append(f"  {nice:<16} ₹{inr(usd):.0f}  (${usd:.2f})")
+        lines.append(f"  {nice:<16} ₹{inr(usd):.0f}  ($${usd:.2f})")
     if not by_svc:
         lines.append("  (no spend yet this month)")
 
