@@ -748,10 +748,23 @@ jobs:
         # Restart=always keeps relaunching it every few seconds. If each
         # boot reaches the auth step (it does after PR #921/#922), each
         # boot fires a "Auth OK" Telegram — operator gets one Telegram
-        # per minute forever. Auto-stop + disable here breaks the loop
-        # the moment the deploy fails. Next successful deploy will
-        # re-enable + start the service via the existing systemctl
-        # daemon-reload + restart sequence above.
+        # per minute forever. We `systemctl stop` here to break that loop
+        # for THIS boot (an explicit stop suppresses Restart=always until
+        # the next boot/deploy).
+        #
+        # 2026-06-09 AUTO-START FIX: we DO NOT `systemctl disable` anymore.
+        # Disabling poisoned next-morning auto-start (the unit no longer
+        # started at the 08:30 boot) AND tricked scripts/aws-autopilot.sh
+        # into reading a disabled unit as an INTENTIONAL kill-switch (so it
+        # refused to self-heal it — see aws-autopilot.sh "unit disabled"
+        # branch). Leaving the unit ENABLED means: systemd auto-starts it at
+        # the next boot, the autopilot restarts an enabled-but-inactive unit,
+        # and a genuinely-bad binary is replaced by the morning redeploy
+        # (~08:45 IST) — all without the operator touching the box. The
+        # intentional kill-switch (disable via AWS Control) stays the ONLY
+        # source of a disabled unit, so the autopilot's disabled==intentional
+        # semantics remain correct. Regression-locked by
+        # crates/storage/tests/deploy_no_disable_on_failure_guard.rs.
         # Honest envelope: this can only execute if AWS creds were
         # configured (i.e. failure happened AFTER the configure-creds
         # step). For earlier failures it silently no-ops via `|| true`.
@@ -762,7 +775,7 @@ jobs:
             --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
             --document-name "AWS-RunShellScript" \
             --comment "tickvault auto-stop on deploy failure sha=${{ github.sha }}" \
-            --parameters 'commands=["systemctl stop tickvault || true","systemctl disable tickvault || true","echo AUTO-STOPPED-AND-DISABLED: next successful deploy will re-enable + start the service"]' \
+            --parameters 'commands=["systemctl stop tickvault || true","echo AUTO-STOPPED-UNIT-STAYS-ENABLED: stopped to break the Restart=always spam loop for this boot; unit kept ENABLED so it auto-starts at the next boot and aws-autopilot self-heals it."]' \
             --query Command.CommandId --output text || echo "(could not dispatch auto-stop — AWS creds likely not configured at this stage)"
 
       - name: Notify Telegram on failure
@@ -774,7 +787,7 @@ jobs:
         run: |
           SHORT_SHA="${GITHUB_SHA:0:7}"
           IST_TIME="$(TZ='Asia/Kolkata' date +'%I:%M %p IST')"
-          MSG="🆘 Deploy FAILED at ${IST_TIME} (version ${SHORT_SHA}). The app was auto-stopped to avoid repeated alerts; the next deploy re-enables it. Check the run: ${{ github.run_id }}"
+          MSG="🆘 Deploy FAILED at ${IST_TIME} (version ${SHORT_SHA}). The app was auto-stopped to avoid repeated alerts; it stays set to auto-start at the next boot/deploy. Check the run: ${{ github.run_id }}"
           # If the app started then crashed inside the 60s verify window, the
           # Monitor step captured WHY into CRASH_DIAG — forward it so the
           # operator sees the actual reason on the phone, not just "FAILED".
