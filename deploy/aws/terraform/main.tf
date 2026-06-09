@@ -180,6 +180,13 @@ resource "aws_iam_role_policy" "tv_instance" {
           "logs:CreateLogStream",
           "logs:PutLogEvents",
           "cloudwatch:PutMetricData",
+          # The amazon-cloudwatch-agent calls ec2:DescribeTags in `-m ec2` mode to
+          # resolve instance metadata for metric dimensions. Without it the agent
+          # retried a 403 UnauthorizedOperation for ~60s then failed config
+          # validation, starving the tickvault restart in the deploy script
+          # (incident 2026-06-09, deploy #228 — observability fault took the live
+          # trading app down). DescribeTags has no resource-level scoping, so "*".
+          "ec2:DescribeTags",
         ]
         Resource = "*"
       },
