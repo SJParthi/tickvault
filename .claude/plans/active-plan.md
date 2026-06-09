@@ -94,6 +94,17 @@ since payload_hash is still written. `git revert <sha>`.
 read loop), security-reviewer (WAL format change, no injection), general-purpose hostile (replay
 back-compat, restart-mid-second collision, NTP backward, u64 wrap, migration idempotency).
 
+## Per-Item Guarantee Matrix
+
+Every item below carries the full 15-row "100% everything" matrix and the 7-row
+Resilience Demand matrix. See `per-wave-guarantee-matrix.md` (canonical form: Item 22 /
+Item 24 in `active-plan-wave-5-indices-only.md`) — all 15 + 7 rows apply to every item in
+this plan. Honest envelope: any "100%" here means **100% inside the tested envelope, with
+ratcheted regression coverage** (chaos `45→75→45` replay, DHAT zero-alloc on the read-loop
+stamp, WAL v2 round-trip + v1 back-compat replay, replay-twice idempotency, `DEDUP_KEY_TICKS`
+meta-guard) — beyond the envelope the existing spill→DLQ NDJSON catches every payload as
+recoverable text. Composite `(security_id, exchange_segment)` uniqueness (I-P1-11) preserved.
+
 ## Plan Items
 
 - [ ] `capture_seq` monotonic stamper (AtomicU64, `max(prev+1, now)`) at WS read
