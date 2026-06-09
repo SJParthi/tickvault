@@ -422,7 +422,10 @@ async fn main() -> Result<()> {
     let ws_wal_path = std::path::PathBuf::from(&ws_wal_dir);
     // Replay first — this MUST happen before any WS connection opens so we
     // never race a fresh append against a stale segment rotation.
-    let mut ws_wal_replay_live_feed: Vec<bytes::Bytes> = Vec::new();
+    // TICK-SEQ-01: carry each replayed frame's `frame_seq` so re-injected
+    // frames reuse the SAME capture sequence as their original live write
+    // (replay-stable). v1 records replay with frame_seq=0.
+    let mut ws_wal_replay_live_feed: Vec<(u64, bytes::Bytes)> = Vec::new();
     let mut ws_wal_replay_order_update: Vec<Vec<u8>> = Vec::new();
     match tickvault_storage::ws_frame_spill::replay_all(&ws_wal_path) {
         Ok(recovered) => {
@@ -435,7 +438,8 @@ async fn main() -> Result<()> {
                     match rec.ws_type {
                         tickvault_storage::ws_frame_spill::WsType::LiveFeed => {
                             live += 1;
-                            ws_wal_replay_live_feed.push(bytes::Bytes::from(rec.frame));
+                            ws_wal_replay_live_feed
+                                .push((rec.frame_seq, bytes::Bytes::from(rec.frame)));
                         }
                         tickvault_storage::ws_frame_spill::WsType::OrderUpdate => {
                             ord += 1;
@@ -5467,7 +5471,7 @@ fn create_websocket_pool(
     notifier: Option<std::sync::Arc<NotificationService>>,
     wal_spill: Option<std::sync::Arc<tickvault_storage::ws_frame_spill::WsFrameSpill>>,
 ) -> Option<(
-    tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    tokio::sync::mpsc::Receiver<(u64, bytes::Bytes)>,
     WebSocketConnectionPool,
 )> {
     let plan = match subscription_plan {
