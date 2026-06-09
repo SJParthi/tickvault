@@ -58,7 +58,7 @@ This product, starting from the date of this lock, opens exactly TWO WebSocket c
 
 **Total live WebSocket connections to Dhan: 2** (UNCHANGED from prior lock).
 
-**Universe size envelope (mechanical bound):** `MAX_DAILY_UNIVERSE_SIZE = 400`. Boot HALTS if computed universe is outside `[100, 400]`. Fits comfortably on 1 main-feed connection (Dhan cap = 5,000 SIDs/conn).
+**Universe size envelope (mechanical bound):** `MAX_DAILY_UNIVERSE_SIZE = 1200` (raised from 400 per §31, NTM expansion 2026-06-06). Boot HALTS if computed universe is outside `[100, 1200]`. Fits comfortably on 1 main-feed connection (Dhan cap = 5,000 SIDs/conn).
 
 **Subscription dispatch:** 250 SIDs sent in 3 JSON batches (Dhan cap = 100 SIDs/message), sequential with `SubscribeRxGuard` (PR #337) preserving subscription state across reconnects.
 
@@ -109,7 +109,7 @@ Per operator Quote 4: "for future or options it should be just marked as expired
 **Quote 5 (2026-05-29, applicable-F&O master — supersedes the §10-step-4 "indices + underlyings only" scope for the lifecycle table):**
 > "I asked you to pull ALL the FNO in instruments … only fno for our applicable fno instruments right dude … if yes go ahead"
 
-**MASTER vs SUBSCRIPTION (locked 2026-05-29):** `instrument_lifecycle` is the **full applicable-F&O master** — it stores, in addition to the indices + F&O underlying spots, **every applicable F&O contract**: the `FUTSTK`/`OPTSTK` rows whose `UNDERLYING_SECURITY_ID` resolves to one of our tracked NSE_EQ underlyings, plus the `FUTIDX`/`OPTIDX` rows for our tracked indices. Currency F&O (`FUTCUR`/`OPTCUR`), commodity F&O (`FUTCOM`/`OPTFUT`), and non-F&O equities NOT in our underlying set are EXCLUDED. These contract rows carry `lifecycle_state` transitions (`active` → `expired_contract`) and are NEVER deleted (SEBI §25 point-in-time). **This is the master/audit table ONLY — it does NOT change the WebSocket subscription**, which remains the 331-SID indices+spots set per §2 + the 2-WebSocket lock. The `MAX_DAILY_UNIVERSE_SIZE = 400` envelope in §2 bounds the *subscription* set, NOT the lifecycle master (which legitimately holds ~219K applicable-F&O rows).
+**MASTER vs SUBSCRIPTION (locked 2026-05-29):** `instrument_lifecycle` is the **full applicable-F&O master** — it stores, in addition to the indices + F&O underlying spots, **every applicable F&O contract**: the `FUTSTK`/`OPTSTK` rows whose `UNDERLYING_SECURITY_ID` resolves to one of our tracked NSE_EQ underlyings, plus the `FUTIDX`/`OPTIDX` rows for our tracked indices. Currency F&O (`FUTCUR`/`OPTCUR`), commodity F&O (`FUTCOM`/`OPTFUT`), and non-F&O equities NOT in our underlying set are EXCLUDED. These contract rows carry `lifecycle_state` transitions (`active` → `expired_contract`) and are NEVER deleted (SEBI §25 point-in-time). **This is the master/audit table ONLY — it does NOT change the WebSocket subscription**, which remains the 331-SID indices+spots set per §2 + the 2-WebSocket lock. The `MAX_DAILY_UNIVERSE_SIZE = 1200` envelope in §2 bounds the *subscription* set, NOT the lifecycle master (which legitimately holds ~219K applicable-F&O rows).
 
 | Column | Type | Purpose |
 |---|---|---|
@@ -293,7 +293,7 @@ Per `.claude/rules/project/z-plus-defense-doctrine.md`:
 | **L1 DETECT** | HTTPS GET on `images.dhan.co/api-data/api-scrip-master-detailed.csv`; check 200 OK + content-length > 1 MB | Network failure, Dhan 5xx, empty response |
 | **L2 VERIFY** | Parse CSV header row; SHA-256 of payload; row count; mandatory-column presence; TLS cert validation | Schema drift, partial download, corruption, DNS poisoning |
 | **L3 RECONCILE** | Compare row count + SHA-256 vs yesterday's `instrument_fetch_audit`; flag if `total_rows < 0.5× yesterday OR > 2× yesterday` | Silent Dhan-side bulk changes, stale-CSV serving |
-| **L4 PREVENT** | Validate parsed universe size in `[100, 400]`; HALT if outside. Verify every `UNDERLYING_SECURITY_ID` from FUTSTK/OPTSTK rows resolves to an NSE_EQ row in the same CSV (no dangling references). | Misparsed CSV; runaway subscription cost |
+| **L4 PREVENT** | Validate parsed universe size in `[100, 1200]`; HALT if outside. Verify every `UNDERLYING_SECURITY_ID` from FUTSTK/OPTSTK rows resolves to an NSE_EQ row in the same CSV (no dangling references). | Misparsed CSV; runaway subscription cost |
 | **L5 AUDIT** | `instrument_fetch_audit` row per attempt (success or failure) + `instrument_lifecycle_audit` row per state transition + `tv_universe_size{kind=...}` CloudWatch metric + tracing span | Continuous observability + forensic chain |
 | **L6 RECOVER** | Infinite retry (per §4). NEVER fallback to a different data source. NEVER proceed with stale data. | Operator-locked: no silent degradation |
 | **L7 COOLDOWN** | Retry backoff capped at 300s between attempts; never burst Dhan with >5 GETs/min | Self-induced rate limit |
@@ -344,7 +344,7 @@ The new `instrument_lifecycle` orchestrator slots between existing Step 6 (auth)
 |---|---|---|
 | `SubscriptionScope::DailyUniverse` enum variant | Compile-time scope contract; retires `Indices4Only` | `crates/common/src/config.rs` (Sub-PR #1) |
 | `effective_main_feed_pool_size(_, _) → 1` | Main feed always 1 conn (UNCHANGED) | `crates/common/src/config.rs` (Sub-PR #1) |
-| `MAX_DAILY_UNIVERSE_SIZE = 400` constant | Universe size cap; HALT if exceeded | `crates/common/src/constants.rs` (Sub-PR #7) |
+| `MAX_DAILY_UNIVERSE_SIZE = 1200` constant | Universe size cap; HALT if exceeded | `crates/common/src/constants.rs` (Sub-PR #2/#7) |
 | `crates/storage/tests/instance_type_lock_guard.rs` | Source-scan: pins `t4g.large` in `aws-budget.md` + this file + architecture doc §5 | NEW in Sub-PR #1 |
 | `crates/storage/tests/daily_universe_scope_guard.rs` | Source-scan: pins Detailed CSV URL + DEDUP key contract + Quote-mode-for-all + retry-policy unbounded loop + I-P1-11 composite key | NEW in Sub-PR #1 |
 | Source-scan retirement of `indices4only_scope_lock_guard.rs` | Old ratchet removed | RETIRED in Sub-PR #1 |
@@ -799,3 +799,111 @@ boot that produced the snapshot.
 - Fail-closed role parse — test `test_to_universe_fails_closed_on_unknown_role`
 - Background-reconcile failure logs `error!` with `code = INSTR-FETCH-01`,
   does NOT halt the live warm plan.
+
+---
+
+# §31 — NIFTY Total Market + index→stocks subscription (operator authorization 2026-06-06)
+
+**Operator decisions (2026-06-06, captured via AskUserQuestion — authoritative):**
+1. Add a **33rd index — NIFTY Total Market** — to the tracked set (today 31 NSE
+   allowlist + 1 BSE SENSEX = 32).
+2. Build an **index → its constituent stocks** mapping for every tracked index.
+3. **Subscribe ALL NIFTY Total Market constituent stocks (~750)** to the live feed
+   in **Quote mode**, on the **existing single main-feed WebSocket** (NO new WS).
+4. The other 32 indices: **map only**. The live SUBSCRIPTION set is the **NTM
+   union** (NTM is the broadest basket and already contains their members).
+5. **F&O stocks remain separately extractable** — each subscribed stock carries a
+   **role tag** (`fno_underlying` and/or `index_constituent`, with the owning
+   index list). "F&O only" is an **O(1) filter** over the same data — NOT a second
+   download and NOT a second subscription/WebSocket.
+6. **`MAX_DAILY_UNIVERSE_SIZE` raised 400 → 1200** to fit ~1,000 live SIDs +
+   headroom. **DONE in Sub-PR #2 (2026-06-06):** the §2/§9-L4 envelope is now
+   `[100, 1200]`; the seal-ring headroom guard floor moved 20× → 5× (still
+   ~7.9× at the 1200 cap, well above the chaos-tested 2× IST-midnight-burst
+   adequacy; the 200K `SEAL_BUFFER_CAPACITY` L-C1 design lock is preserved).
+7. Constituency source: **niftyindices.com** (rebuild the deleted downloader; reuse
+   the existing `INDEX_CONSTITUENCY_*` constants). **Operator-provided exact URL
+   (2026-06-06):** the NIFTY Total Market constituents (~750 stocks) live at
+   `https://www.niftyindices.com/IndexConstituent/ind_niftytotalmarket_list.csv`
+   (i.e. `INDEX_CONSTITUENCY_BASE_URL` + `ind_niftytotalmarket_list.csv`). This is
+   the constituent-STOCK list for Sub-PR #3/#4; the NIFTY Total Market INDEX value
+   itself (the IDX_I allowlist entry) needs its exact Dhan master `SYMBOL_NAME`,
+   resolved from the live Detailed master in Sub-PR #3 (NOT guessed).
+
+**What is UNCHANGED (still locked):**
+- Exactly **2 WebSocket connections** (1 main-feed + 1 order-update). ~1,000 SIDs
+  fit on the one main-feed conn (Dhan cap 5,000/conn). The 2-WS lock holds.
+- **Quote mode** for every SID (§8).
+- **`(security_id, exchange_segment)` composite uniqueness** + DEDUP UPSERT KEYS
+  (I-P1-11). The NTM-union subscription is deduped against the F&O underlyings.
+- `instrument_lifecycle` is still NEVER deleted; the new `role` is an added column,
+  applied via `ALTER TABLE ADD COLUMN IF NOT EXISTS`.
+- Indicators/strategies boundary (§28) is untouched by this work.
+
+**Honest envelope (mandatory per §13 / operator-charter §F):**
+- RAM at ~1,000 SIDs × 21 TFs ≈ ~3.2 GB working set on the m8g.large 8 GiB host
+  (~3.9 GB headroom). This is a **MEASURED gate** in the persistence/validation
+  sub-PR — NOT promised blind. If the measurement exceeds budget, the scope or the
+  resident-TF set is revisited with the operator before go-live.
+- "~750 NTM stocks" is the expected count; the EXACT count comes from the live
+  niftyindices.com constituent file at build time (no hard-coded hallucinated number).
+
+**Implementation sequencing** lives in `.claude/plans/active-plan.md` (Sub-PR #1 =
+this authorization record; Sub-PRs #2–#7 = cap+allowlist, downloader, mapping +
+role tagging, subscription wiring, persistence + observability + RAM proof, e2e
+validation). Each is a separate serial PR with the 15+7 guarantee matrix and the
+adversarial 3-agent review. No code sub-PR may widen the subscription beyond the
+NTM union without re-confirming against this section.
+
+---
+
+## §31.1 — Constituent → Dhan `security_id` mapping contract (LOCKED 2026-06-06)
+
+> **Authority for Sub-PR #4.** This is the precise, fail-closed mapping the
+> constituency code MUST build to. Operator-confirmed mapping approach 2026-06-06.
+
+**Source files (the join):**
+
+| niftyindices `ind_niftytotalmarket_list.csv` (~750 rows) | Dhan Detailed master (`api-scrip-master-detailed.csv`) |
+|---|---|
+| `Symbol` (NSE ticker, e.g. `RELIANCE`) | `SYMBOL_NAME` |
+| `Series` (e.g. `EQ`) | `SEGMENT` (`E`=Equity), `EXCH_ID` (`NSE`) |
+| **`ISIN Code`** (e.g. `INE002A01018`) | **`ISIN`** column (present in the raw CSV; `CsvRow` must add `isin` via `find("ISIN")` — Sub-PR #3) |
+| — | `SECURITY_ID` ← the value we resolve |
+
+**Mapping rule (LOCKED):**
+
+1. **PRIMARY key = ISIN.** Globally unique per security, rename-proof and
+   series-proof. Match NTM `ISIN Code` → Dhan row `ISIN`, filtered to
+   `EXCH_ID == NSE AND SEGMENT == E AND SERIES == EQ` (cash equity). The matched
+   row's `SECURITY_ID` is the answer.
+2. **SECONDARY / cross-check = `(Symbol, Series=EQ, NSE, Equity)`.** Validate the
+   ISIN hit's `SYMBOL_NAME` ≈ normalized NTM `Symbol`; also the fallback if a
+   constituent ever lacks an ISIN. Symbol-ALONE is BANNED as the primary key
+   (tickers get reused/renamed; Dhan `SYMBOL_NAME` punctuation may differ).
+3. **O(1) build:** construct a `HashMap<ISIN, (security_id, ExchangeSegment)>` from
+   the Dhan NSE-EQ rows ONCE (cold path), then each of the ~750 constituents is an
+   O(1) ISIN lookup. No per-constituent scan of the master.
+4. **Fail-closed (NTM membership tolerance = 2%, operator lock 2026-06-08):** a
+   constituent whose ISIN resolves to ZERO Dhan NSE-EQ rows is counted + LOGGED
+   BY NAME (never silently dropped). If `> 2%` of constituents are unresolved,
+   REJECT the build; at or below 2% the unresolved few are skipped and the rest
+   subscribed. This NTM membership-list tolerance was raised from 0.5% → 2%
+   after the live 2026-06-08 boot degraded the entire NTM universe (244 of ~1000)
+   because 5 of 748 stragglers (0.67%) exceeded the old 0.5% bar. It is
+   DELIBERATELY looser than — and SEPARATE from — the order-critical Dhan-master
+   F&O dangling guard (§3 / §26, line above, unchanged at 0.5%). Pinned by
+   `constituent_resolver::tests::test_dangling_reject_fraction_is_two_percent`.
+5. **Dedup:** resolved SIDs are unioned with the existing F&O underlyings by
+   `(security_id, exchange_segment)` (I-P1-11). No double-subscribe.
+6. **Role tagging:** each resolved stock carries `role` ∈ {`index_constituent`,
+   `fno_underlying`} (both if applicable) so "F&O only" is an O(1) filter, not a
+   second download/WebSocket (per §31 item 5).
+7. **NTM INDEX value (separate):** the IDX_I allowlist entry for NIFTY Total Market
+   is resolved from the Dhan master `SYMBOL_NAME` in Sub-PR #3 — NOT guessed, NOT
+   derived from the constituent CSV.
+
+**Why ISIN-primary is the honest precise key:** symbols are reassigned/renamed over
+time and the two CSVs may format them differently; the 12-char ISIN (`INE…`) is the
+immutable security identity, so it is the only join key that cannot silently map to
+the wrong/old security. The symbol+series cross-check catches the rare bad-ISIN row.

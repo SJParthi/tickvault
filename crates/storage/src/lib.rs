@@ -103,6 +103,11 @@ pub mod instrument_fetch_audit_persistence;
 // rule §21. DDL + Row + append helpers land in follow-up sub-PRs.
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod instrument_lifecycle_persistence;
+// §31 item 2 (NTM Map-A, 2026-06-06): full index→constituents mapping table —
+// queryable both directions. Map-only (does NOT change the subscription).
+// Feature-gated per rule §21.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod index_constituency_persistence;
 // Daily lifecycle reconciler — PURE decision logic (§5/§6/§23). The app
 // boot orchestrator owns the I/O loop and consumes these pure functions.
 // Feature-gated per rule §21.

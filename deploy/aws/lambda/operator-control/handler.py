@@ -484,7 +484,15 @@ def lambda_handler(event, _context):
             cid = _ssm_shell(["systemctl stop tickvault || true", "systemctl disable tickvault || true"])
             return _resp(200, {"ok": True, "action": action, "command_id": cid})
         if action == "restart-questdb":
-            cid = _ssm_shell(["cd /opt/tickvault/repo/deploy/docker && docker compose restart questdb"])
+            # ensure-questdb.sh (create-or-restart), robust to docker-compose
+            # v1/v2 absence + the CORRECT service name (tv-questdb) + SSM creds
+            # for the recreate case. The old `docker compose up -d questdb` had
+            # all three bugs (incident 2026-06-08) and silently no-op'd, leaving
+            # QuestDB down + the app crash-looping on BOOT-02. The helper handles
+            # running/stopped/removed and falls back to `docker run`.
+            # (Does NOT fix QuestDB CRASHING on start — disk-full / volume
+            # corruption: see docs/runbooks/aws-docker-daemon-dead.md.)
+            cid = _ssm_shell(["bash /opt/tickvault/repo/scripts/ensure-questdb.sh"])
             return _resp(200, {"ok": True, "action": action, "command_id": cid})
         if action == "command-status":
             # READ-ONLY (not in _DESTRUCTIVE, allowed off-hours, no force). Lets
@@ -591,8 +599,13 @@ def lambda_handler(event, _context):
                 #    spill + dlq. Logs are KEPT for forensics.
                 f"rm -rf {data_dir}/instrument-cache {data_dir}/spill {data_dir}/dlq 2>/dev/null || true",
                 "echo 'OK: host caches wiped (instrument-cache, spill, dlq); logs preserved'",
-                # 7. recreate everything fresh (empty volume) + restart app
-                "docker compose up -d || true",
+                # 7. recreate QuestDB fresh (empty volume) + restart app. Use
+                #    ensure-questdb.sh — robust to docker-compose v1/v2 absence +
+                #    correct service name + SSM creds. The old bare
+                #    `docker compose up -d` silently no-op'd on a box without the
+                #    v2 plugin, so the nuke DELETED QuestDB but never rebuilt it
+                #    → BOOT-02 crash-loop (incident 2026-06-08).
+                "bash /opt/tickvault/repo/scripts/ensure-questdb.sh || true",
                 "systemctl enable tickvault || true",
                 "systemctl restart tickvault || true",
                 "echo docker-reset-dispatched",

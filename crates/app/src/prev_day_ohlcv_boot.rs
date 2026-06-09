@@ -103,7 +103,8 @@ pub fn previous_trading_day<F: Fn(NaiveDate) -> bool>(
 pub fn instrument_type_for_role(role: InstrumentRole) -> &'static str {
     match role {
         InstrumentRole::Index => "INDEX",
-        InstrumentRole::FnoUnderlying => "EQUITY",
+        // Both equity roles are NSE_EQ EQUITY rows (§31 NTM constituents).
+        InstrumentRole::FnoUnderlying | InstrumentRole::IndexConstituent => "EQUITY",
     }
 }
 

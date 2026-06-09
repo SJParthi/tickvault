@@ -115,7 +115,7 @@ jobs:
       plan_exitcode: ${{ steps.plan.outputs.exitcode }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.0.3
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v4
@@ -236,7 +236,7 @@ jobs:
       elastic_ip: ${{ steps.outputs.outputs.elastic_ip }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.0.3
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v4

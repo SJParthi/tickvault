@@ -422,7 +422,10 @@ async fn main() -> Result<()> {
     let ws_wal_path = std::path::PathBuf::from(&ws_wal_dir);
     // Replay first — this MUST happen before any WS connection opens so we
     // never race a fresh append against a stale segment rotation.
-    let mut ws_wal_replay_live_feed: Vec<bytes::Bytes> = Vec::new();
+    // TICK-SEQ-01: carry each replayed frame's `frame_seq` so re-injected
+    // frames reuse the SAME capture sequence as their original live write
+    // (replay-stable). v1 records replay with frame_seq=0.
+    let mut ws_wal_replay_live_feed: Vec<(u64, bytes::Bytes)> = Vec::new();
     let mut ws_wal_replay_order_update: Vec<Vec<u8>> = Vec::new();
     match tickvault_storage::ws_frame_spill::replay_all(&ws_wal_path) {
         Ok(recovered) => {
@@ -435,7 +438,8 @@ async fn main() -> Result<()> {
                     match rec.ws_type {
                         tickvault_storage::ws_frame_spill::WsType::LiveFeed => {
                             live += 1;
-                            ws_wal_replay_live_feed.push(bytes::Bytes::from(rec.frame));
+                            ws_wal_replay_live_feed
+                                .push((rec.frame_seq, bytes::Bytes::from(rec.frame)));
                         }
                         tickvault_storage::ws_frame_spill::WsType::OrderUpdate => {
                             ord += 1;
@@ -1469,20 +1473,25 @@ async fn main() -> Result<()> {
         // subscribes to the tick broadcast and persists to QuestDB. This never touches
         // the hot-path tick processor loop — zero allocation impact.
         {
-            let tick_persistence_rx = fast_tick_broadcast_sender.subscribe();
+            // TICK-SEQ-01 PR-2b: fast boot's `run_tick_processor` (started with a
+            // lossless `new_disconnected` writer above) is now the SOLE seq-correct
+            // ticks persister — exactly matching slow boot. The old
+            // `run_tick_persistence_consumer` was a redundant SECOND persister
+            // (broadcast-fed, lossy on lag, seq-LESS) that, under the new
+            // `capture_seq` dedup key, wrote every tick with a DIFFERENT seq than
+            // the hot-path writer → duplicate rows. We reuse the existing slow-boot
+            // observability consumer so fast boot KEEPS the gap-tracking +
+            // QuestDB-health-poll surface WITHOUT a second writer (no blind spot,
+            // no duplicates).
+            let observability_rx = fast_tick_broadcast_sender.subscribe();
             let questdb_cfg = config.questdb.clone();
-            let hs = health_status.clone();
-            let persist_notifier = std::sync::Arc::clone(&notifier);
             tokio::spawn(async move {
-                run_tick_persistence_consumer(
-                    tick_persistence_rx,
-                    questdb_cfg,
-                    Some(hs),
-                    Some(persist_notifier),
-                )
-                .await;
+                run_slow_boot_observability(observability_rx, questdb_cfg).await;
             });
-            info!("background tick persistence consumer started (cold path)");
+            info!(
+                "fast-boot observability consumer started (gap-track + QuestDB health; \
+                 single seq-correct persister owns ticks)"
+            );
         }
 
         // Candle-engine re-architecture #T1b: the cold-path Engine-A
@@ -3825,6 +3834,20 @@ async fn main() -> Result<()> {
                                 top.first().map(|(_, _, gap)| *gap).unwrap_or(0)
                             })
                             .unwrap_or(0);
+                    // §31 universe-completeness — read the live universe the
+                    // boot stashed (same source as the post-market cross-check
+                    // above). None (no universe at 09:16) → (0, 0) → both
+                    // sub-checks fail loudly, which is correct.
+                    let (index_values, ntm_constituents) =
+                        tickvault_app::prev_day_ohlcv_boot::stashed_universe()
+                            .map(|u| {
+                                use tickvault_core::instrument::daily_universe::InstrumentRole;
+                                (
+                                    u.count_by_role(InstrumentRole::Index),
+                                    u.index_constituent_count(),
+                                )
+                            })
+                            .unwrap_or((0, 0));
                     let inputs = MarketOpenSelfTestInputs {
                         main_feed_active: main_active,
                         order_update_active: oms,
@@ -3832,6 +3855,8 @@ async fn main() -> Result<()> {
                         last_tick_age_secs: worst_gap_secs,
                         questdb_connected: questdb_ok,
                         token_expiry_headroom_secs: token_headroom_secs,
+                        index_values_subscribed: index_values,
+                        ntm_constituents_subscribed: ntm_constituents,
                     };
                     let started = std::time::Instant::now();
                     let outcome = evaluate_self_test(&inputs);
@@ -3845,6 +3870,8 @@ async fn main() -> Result<()> {
                         order_update = oms,
                         questdb_connected = questdb_ok,
                         token_expiry_headroom_secs = token_headroom_secs,
+                        index_values,
+                        ntm_constituents,
                         "PROOF: market-open self-test fired @ 09:16:00 IST"
                     );
 
@@ -5301,6 +5328,13 @@ async fn cold_build_daily_universe(
         let downloader = Arc::clone(&downloader);
         async move { downloader.fetch_csv().await }
     };
+    // §31 NTM (Sub-PR #10b): best-effort fetch of the NIFTY Total Market
+    // constituents. DEGRADE+ALERT (operator 2026-06-06): a None here means the
+    // niftyindices source failed — the universe builds on the indices +
+    // F&O-underlyings core set and `NTM-CONSTITUENCY-01` already paged. The
+    // Dhan CSV path below stays fail-closed (§4) regardless.
+    let ntm_map = fetch_ntm_constituency_map(now_ist.date_naive()).await;
+
     // §4: infinite retry (None) — boot blocks until a fresh CSV is in hand.
     let (outcome, universe) = tickvault_app::daily_universe_boot::run_daily_universe_boot(
         questdb,
@@ -5309,6 +5343,7 @@ async fn cold_build_daily_universe(
         today_ist_nanos,
         dry_run,
         None,
+        ntm_map,
     )
     .await
     .context("daily-universe boot failed (fail-closed §4)")?;
@@ -5330,7 +5365,95 @@ async fn cold_build_daily_universe(
     // base URL are in scope) can read the ~243 subscription targets.
     tickvault_app::prev_day_ohlcv_boot::stash_universe(std::sync::Arc::clone(&universe));
 
+    // §31 item 2 (NTM Map-B): populate the FULL per-index constituency mapping
+    // (all ~46 tracked indices) into the `index_constituency` table. MAP-ONLY +
+    // fully decoupled — it re-fetches independently and NEVER touches the live
+    // subscription. Spawned fire-and-forget so it never delays boot or the feed;
+    // degrade-safe (logs warn! + returns on any failure).
+    tokio::spawn(
+        tickvault_app::index_constituency_boot::persist_index_constituency_mapping(
+            questdb.clone(),
+            now_ist.date_naive(),
+            today_ist_nanos,
+            dry_run,
+        ),
+    );
+
     Ok((outcome, universe))
+}
+
+/// §31 NTM (Sub-PR #10b): best-effort fetch of the NIFTY Total Market (and the
+/// other tracked-index) constituents from niftyindices.com, assembled into an
+/// [`IndexConstituencyMap`] for the universe builder's resolve+bridge step.
+///
+/// **DEGRADE+ALERT (operator AskUserQuestion 2026-06-06):** this NEVER blocks
+/// boot. On any failure (downloader init, all slugs failed → empty map) it logs
+/// `error!(code = NTM-CONSTITUENCY-01)` (→ Telegram via the 5-sink pipeline) and
+/// returns `None`, so the universe builds on the indices + F&O-underlyings core
+/// set. The Dhan CSV path stays fail-closed (§4) independently. Per-slug
+/// download/parse failures are already logged inside `build_constituency_map`.
+///
+/// Cold path — runs once at boot.
+async fn fetch_ntm_constituency_map(
+    today: chrono::NaiveDate,
+) -> Option<tickvault_common::instrument_types::IndexConstituencyMap> {
+    use std::time::Duration;
+    use tickvault_common::constants::{
+        NTM_CONSTITUENCY_FETCH_TIMEOUT_SECS, NTM_CONSTITUENCY_SLUGS,
+    };
+    use tickvault_common::error_code::ErrorCode;
+    use tickvault_core::instrument::index_constituency::build_constituency_map;
+    use tickvault_core::instrument::index_constituency::downloader::ConstituencyDownloader;
+
+    let downloader = match ConstituencyDownloader::new() {
+        Ok(d) => d,
+        Err(err) => {
+            error!(
+                code = ErrorCode::NtmConstituency01SourceDegraded.code_str(),
+                reason = "downloader_init",
+                %err,
+                "NTM constituency downloader init failed — degrading to core universe"
+            );
+            return None;
+        }
+    };
+    // §31 item 4: subscribe the NTM union ONLY (NTM_CONSTITUENCY_SLUGS), NOT the
+    // full ~49-index list (whose union ~= the entire NSE → would breach the
+    // [100,1200] envelope and HALT boot). Total-fetch timeout bounds a stalled
+    // niftyindices before the 09:00 open → degrade.
+    let map = match tokio::time::timeout(
+        Duration::from_secs(NTM_CONSTITUENCY_FETCH_TIMEOUT_SECS),
+        build_constituency_map(&downloader, NTM_CONSTITUENCY_SLUGS, today),
+    )
+    .await
+    {
+        Ok(map) => map,
+        Err(_elapsed) => {
+            error!(
+                code = ErrorCode::NtmConstituency01SourceDegraded.code_str(),
+                reason = "timeout",
+                timeout_secs = NTM_CONSTITUENCY_FETCH_TIMEOUT_SECS,
+                "NTM constituency fetch exceeded its boot budget — degrading to core universe"
+            );
+            return None;
+        }
+    };
+    if map.index_to_constituents.is_empty() {
+        error!(
+            code = ErrorCode::NtmConstituency01SourceDegraded.code_str(),
+            reason = "fetch_or_parse",
+            indices_failed = map.build_metadata.indices_failed,
+            "NTM constituency fetch returned no indices — degrading to core universe \
+             (today runs without the cash-only NTM constituents)"
+        );
+        return None;
+    }
+    info!(
+        indices = map.index_to_constituents.len(),
+        unique_stocks = map.stock_to_indices.len(),
+        "NTM constituency map fetched for the daily-universe build"
+    );
+    Some(map)
 }
 
 // create_log_file_writer is now in boot_helpers module (lib.rs).
@@ -5353,7 +5476,7 @@ fn create_websocket_pool(
     notifier: Option<std::sync::Arc<NotificationService>>,
     wal_spill: Option<std::sync::Arc<tickvault_storage::ws_frame_spill::WsFrameSpill>>,
 ) -> Option<(
-    tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    tokio::sync::mpsc::Receiver<(u64, bytes::Bytes)>,
     WebSocketConnectionPool,
 )> {
     let plan = match subscription_plan {
@@ -5818,160 +5941,6 @@ fn spawn_pool_watchdog_task(
             }
         }
     });
-}
-
-/// Subscribes to the tick broadcast and writes ticks to QuestDB.
-///
-/// Used in fast boot where the tick processor starts with `None` writers
-/// (QuestDB isn't ready yet). This consumer starts after QuestDB DDL
-/// completes and persists ticks on the cold path — zero impact on the
-/// hot-path tick processor.
-///
-/// Depth persistence is handled by the tick processor in slow boot only.
-/// In fast boot, depth data is not persisted until the next full restart
-/// (depth requires raw frame fields which the broadcast doesn't carry).
-async fn run_tick_persistence_consumer(
-    mut tick_rx: tokio::sync::broadcast::Receiver<tickvault_common::tick_types::ParsedTick>,
-    questdb_config: tickvault_common::config::QuestDbConfig,
-    health_status: Option<SharedHealthStatus>,
-    notifier: Option<std::sync::Arc<NotificationService>>,
-) {
-    let mut tick_writer = match TickPersistenceWriter::new(&questdb_config) {
-        Ok(writer) => {
-            info!("cold-path tick persistence writer connected to QuestDB");
-            if let Some(ref hs) = health_status {
-                hs.set_tick_persistence_connected(true);
-            }
-            writer
-        }
-        Err(err) => {
-            warn!(
-                ?err,
-                "cold-path tick persistence writer: QuestDB unavailable at startup — \
-                 buffering all ticks in ring buffer + disk spill until QuestDB comes back"
-            );
-            // CRITICAL FIX: Never return here. Use new_disconnected() so the consumer
-            // keeps running and buffers ALL ticks. The writer will auto-reconnect every
-            // 30 seconds and drain the buffer when QuestDB becomes available.
-            // Without this, fast-boot mode loses ALL ticks when QuestDB is down.
-            TickPersistenceWriter::new_disconnected(&questdb_config)
-        }
-    };
-
-    let mut ticks_persisted: u64 = 0;
-    // O(1) EXEMPT: cold path, pipeline setup
-    let flush_interval = std::time::Duration::from_millis(100);
-    let mut last_flush = std::time::Instant::now();
-
-    // S3-1: QuestDB health poller — state machine that tracks the writer's
-    // connection state and fires CRITICAL alerts on outages >30s.
-    let mut qdb_health_poller = tickvault_storage::questdb_health::QuestDbHealthPoller::new();
-    let qdb_health_tick_interval = std::time::Duration::from_secs(2); // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
-    let mut last_qdb_health_tick = std::time::Instant::now();
-
-    // Tick gap tracker — detects when a security's LTT gap exceeds the
-    // ERROR threshold. Fires its own log/metric/alert; gap backfill is
-    // explicitly disabled inside the WebSocket path (user policy:
-    // in-market backfill must never run; post-market historical fetch
-    // handles the cold path separately).
-    //
-    // Capacity = MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION (5000) ×
-    // MAX_WEBSOCKET_CONNECTIONS (5) = 25,000.
-    let tick_gap_tracker_capacity =
-        tickvault_common::constants::MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION
-            .saturating_mul(tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS);
-    let mut tick_gap_tracker =
-        tickvault_trading::risk::tick_gap_tracker::TickGapTracker::new(tick_gap_tracker_capacity);
-    info!(
-        capacity = tick_gap_tracker_capacity,
-        "tick gap tracker instantiated with full-universe capacity (in-market backfill disabled)"
-    );
-
-    loop {
-        match tick_rx.recv().await {
-            Ok(tick) => {
-                // Record the tick into the gap tracker. The tracker fires
-                // its own log/metric on gap thresholds; we do NOT publish
-                // any backfill request (in-market backfill disabled).
-                let _ = tick_gap_tracker.record_tick(tick.security_id, tick.exchange_timestamp);
-
-                if let Err(err) = tick_writer.append_tick(&tick) {
-                    // Phase 0 / Rule 5: persistence failures are ERROR (route to Telegram).
-                    error!(?err, "cold-path tick persistence write failed");
-                }
-
-                ticks_persisted = ticks_persisted.saturating_add(1);
-
-                // S3-1: Poll the QuestDB health state machine every 2s.
-                // The state machine is pure — we feed it the current
-                // connection state and the current time, and it returns
-                // a verdict that we hand to emit_metrics_for_verdict.
-                if last_qdb_health_tick.elapsed() >= qdb_health_tick_interval {
-                    let verdict = qdb_health_poller
-                        .tick(tick_writer.is_connected(), std::time::Instant::now());
-                    tickvault_storage::questdb_health::emit_metrics_for_verdict(
-                        verdict,
-                        &qdb_health_poller,
-                    );
-                    last_qdb_health_tick = std::time::Instant::now();
-                }
-
-                // Periodic flush (every 100ms) to keep data flowing to QuestDB.
-                if last_flush.elapsed() >= flush_interval {
-                    let _ = tick_writer.flush_if_needed();
-                    last_flush = std::time::Instant::now();
-                }
-
-                // B2: After QuestDB recovery + buffer drain, run integrity check.
-                if tick_writer.take_recovery_flag() {
-                    // Fire immediate Telegram notification for QuestDB recovery.
-                    if let Some(ref n) = notifier {
-                        n.notify(NotificationEvent::QuestDbReconnected {
-                            writer: "tick".to_string(),
-                            drained_count: ticks_persisted as usize,
-                        });
-                    }
-                    let qdb_config = questdb_config.clone();
-                    tokio::spawn(async move {
-                        tickvault_storage::tick_persistence::check_tick_gaps_after_recovery(
-                            &qdb_config,
-                            30, // Check last 30 minutes
-                        )
-                        .await;
-                    });
-                }
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                // C2: CRITICAL — ticks permanently lost due to broadcast lag.
-                // This fires ERROR log → Loki → Telegram alert automatically.
-                // Root cause: QuestDB ILP flush is slower than tick ingestion rate.
-                // Defense: broadcast capacity 262K + tick writer ring buffer 2M (PR #452) + disk spill.
-                error!(
-                    skipped,
-                    "CRITICAL: cold-path tick persistence lagged — {} ticks permanently lost",
-                    skipped
-                );
-                metrics::counter!("tv_ticks_permanently_lost").increment(skipped);
-                // Explicit Telegram: ERROR log triggers Loki alert, but also notify directly
-                // in case Loki pipeline is delayed.
-                if let Some(ref n) = notifier {
-                    n.notify(NotificationEvent::QuestDbDisconnected {
-                        writer: format!("tick_persistence (LAGGED: {skipped} ticks lost)"),
-                        signal: skipped,
-                        signal_kind: "Ticks dropped by broadcast lag".to_string(),
-                    });
-                }
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                info!(
-                    ticks_persisted,
-                    "cold-path tick persistence consumer shutting down (broadcast closed)"
-                );
-                let _ = tick_writer.flush_if_needed();
-                return;
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

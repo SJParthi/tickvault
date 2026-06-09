@@ -42,6 +42,8 @@ fn main() {
     fn target(role: InstrumentRole, sid: &str, sym: &str) -> SubscriptionTarget {
         SubscriptionTarget {
             role,
+            is_fno_underlying: role == InstrumentRole::FnoUnderlying,
+            is_index_constituent: role == InstrumentRole::IndexConstituent,
             csv_row: CsvRow {
                 security_id: sid.to_string(),
                 symbol_name: sym.to_string(),

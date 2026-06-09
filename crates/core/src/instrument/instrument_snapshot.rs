@@ -72,12 +72,21 @@ const SNAPSHOT_PREFIX: &str = "plan-snapshot-";
 /// [`InstrumentRole::as_str`] so the JSON is self-describing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotTarget {
-    /// `"index"` or `"fno_underlying"` — see [`InstrumentRole::as_str`].
+    /// `"index"`, `"fno_underlying"`, or `"index_constituent"` — see
+    /// [`InstrumentRole::as_str`].
     pub role: String,
     /// Dhan SecurityId as a string (matches `CsvRow::security_id`).
     pub security_id: String,
     /// Tradable symbol (matches `CsvRow::symbol_name`).
     pub symbol_name: String,
+    /// Lossless membership flag (§31.1(6)). `#[serde(default)]` so a snapshot
+    /// written by pre-Sub-PR-#5 code deserializes with `false` — the `role`
+    /// still drives subscription, so the warm plan stays correct.
+    #[serde(default)]
+    pub is_fno_underlying: bool,
+    /// Lossless membership flag (§31.1(6)). See `is_fno_underlying`.
+    #[serde(default)]
+    pub is_index_constituent: bool,
 }
 
 /// The on-disk snapshot. Keyed by the IST trading date so a stale (previous-
@@ -157,7 +166,19 @@ pub fn to_universe(snapshot: &PlanSnapshot) -> Option<DailyUniverse> {
             symbol_name: t.symbol_name.clone(),
             ..CsvRow::default()
         };
-        subscription_targets.push(SubscriptionTarget { role, csv_row });
+        // Derive the membership flags from `role` when the snapshot left them
+        // at the serde default (`false`) — a snapshot written by pre-Sub-PR-#5
+        // code carries no flag fields, so without this an `fno_underlying` row
+        // would round-trip to `is_fno_underlying == false`, breaking the role
+        // invariant and `fno_underlying_count()`. The OR preserves the explicit
+        // both-case (`FnoUnderlying` + `is_index_constituent == true`).
+        subscription_targets.push(SubscriptionTarget {
+            role,
+            is_fno_underlying: t.is_fno_underlying || role == InstrumentRole::FnoUnderlying,
+            is_index_constituent: t.is_index_constituent
+                || role == InstrumentRole::IndexConstituent,
+            csv_row,
+        });
     }
     Some(DailyUniverse {
         subscription_targets,
@@ -171,6 +192,7 @@ fn parse_role(label: &str) -> Option<InstrumentRole> {
     match label {
         "index" => Some(InstrumentRole::Index),
         "fno_underlying" => Some(InstrumentRole::FnoUnderlying),
+        "index_constituent" => Some(InstrumentRole::IndexConstituent),
         _ => None,
     }
 }
@@ -185,6 +207,8 @@ pub fn snapshot_from_universe(universe: &DailyUniverse, trading_date_ist: &str) 
             role: t.role.as_str().to_string(),
             security_id: t.csv_row.security_id.clone(),
             symbol_name: t.csv_row.symbol_name.clone(),
+            is_fno_underlying: t.is_fno_underlying,
+            is_index_constituent: t.is_index_constituent,
         })
         .collect();
     PlanSnapshot {
@@ -300,8 +324,12 @@ mod tests {
     use super::*;
 
     fn target(role: InstrumentRole, sid: &str, sym: &str) -> SubscriptionTarget {
+        // Flags follow the role invariant (the both-case is covered explicitly
+        // by `test_snapshot_flags_round_trip`).
         SubscriptionTarget {
             role,
+            is_fno_underlying: role == InstrumentRole::FnoUnderlying,
+            is_index_constituent: role == InstrumentRole::IndexConstituent,
             csv_row: CsvRow {
                 security_id: sid.to_string(),
                 symbol_name: sym.to_string(),
@@ -409,6 +437,8 @@ mod tests {
                 role: "depth_underlying".to_string(), // not a known role
                 security_id: "13".to_string(),
                 symbol_name: "NIFTY".to_string(),
+                is_fno_underlying: false,
+                is_index_constituent: false,
             }],
         };
         assert!(
@@ -424,7 +454,77 @@ mod tests {
             parse_role("fno_underlying"),
             Some(InstrumentRole::FnoUnderlying)
         );
+        assert_eq!(
+            parse_role("index_constituent"),
+            Some(InstrumentRole::IndexConstituent)
+        );
         assert_eq!(parse_role("garbage"), None);
+    }
+
+    #[test]
+    fn test_snapshot_flags_round_trip() {
+        // Sub-PR #5: the lossless membership flags survive
+        // universe → snapshot → JSON → snapshot → universe, incl. the both-case.
+        let universe = DailyUniverse {
+            subscription_targets: vec![
+                target(InstrumentRole::Index, "13", "NIFTY"),
+                // The both-case: F&O underlying that is ALSO an NTM constituent.
+                SubscriptionTarget {
+                    role: InstrumentRole::FnoUnderlying,
+                    is_fno_underlying: true,
+                    is_index_constituent: true,
+                    csv_row: CsvRow {
+                        security_id: "2885".to_string(),
+                        symbol_name: "RELIANCE".to_string(),
+                        ..CsvRow::default()
+                    },
+                },
+                target(InstrumentRole::IndexConstituent, "1594", "INFY"),
+            ],
+            fno_contracts: Vec::new(),
+        };
+        let snap = snapshot_from_universe(&universe, "2026-06-06");
+        let json = serde_json::to_string(&snap).expect("serialize");
+        let back: PlanSnapshot = serde_json::from_str(&json).expect("deserialize");
+        let rebuilt = to_universe(&back).expect("known roles round-trip");
+        assert_eq!(rebuilt.fno_underlying_count(), 1, "the both-case stock");
+        assert_eq!(
+            rebuilt.index_constituent_count(),
+            2,
+            "both-case + pure constituent"
+        );
+        let both = &rebuilt.subscription_targets[1];
+        assert!(both.is_fno_underlying && both.is_index_constituent);
+    }
+
+    #[test]
+    fn test_snapshot_old_format_defaults_flags_false() {
+        // A snapshot written by pre-Sub-PR-#5 code has no flag fields. serde
+        // default ⇒ false; the role still drives subscription.
+        let legacy = r#"{
+            "trading_date_ist": "2026-06-06",
+            "targets": [
+                { "role": "fno_underlying", "security_id": "2885", "symbol_name": "RELIANCE" }
+            ]
+        }"#;
+        let snap: PlanSnapshot = serde_json::from_str(legacy).expect("legacy parses");
+        // At the serde layer the missing fields default to false …
+        assert!(!snap.targets[0].is_fno_underlying, "missing field ⇒ false");
+        assert!(!snap.targets[0].is_index_constituent);
+        // … but `to_universe` DERIVES the flag from `role`, so the invariant
+        // `FnoUnderlying ⇒ is_fno_underlying` holds even for a legacy snapshot
+        // and `fno_underlying_count()` stays correct (hostile-review LOW fix).
+        let uni = to_universe(&snap).expect("legacy round-trips");
+        assert_eq!(
+            uni.subscription_targets[0].role,
+            InstrumentRole::FnoUnderlying,
+            "role still drives subscription for a legacy snapshot"
+        );
+        assert!(
+            uni.subscription_targets[0].is_fno_underlying,
+            "flag derived from role on legacy snapshot"
+        );
+        assert_eq!(uni.fno_underlying_count(), 1, "count correct post-derive");
     }
 
     #[test]

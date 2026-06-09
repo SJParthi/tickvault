@@ -1014,8 +1014,12 @@ pub const INSTRUMENT_FETCH_PER_ATTEMPT_TIMEOUT_SECS: u64 = 60;
 /// enforce; this PR declares the bound.
 pub const MIN_DAILY_UNIVERSE_SIZE: usize = 100;
 
-/// See `MIN_DAILY_UNIVERSE_SIZE`.
-pub const MAX_DAILY_UNIVERSE_SIZE: usize = 400;
+/// See `MIN_DAILY_UNIVERSE_SIZE`. Raised 400 → 1200 per rule file §31
+/// (operator authorization 2026-06-06) to fit the NIFTY Total Market
+/// stock expansion (~1,000 live SIDs + headroom). Still a boot-time
+/// validation bound only — not a pre-allocation (the aggregator is sized
+/// by the independent `AGGREGATOR_CAPACITY`).
+pub const MAX_DAILY_UNIVERSE_SIZE: usize = 1200;
 
 /// CSV download body size cap (per rule file §18 hardening contract).
 /// Sub-PR #3 will enforce via `reqwest` bounded read. Expected real-world
@@ -2289,8 +2293,12 @@ pub const INDEX_CONSTITUENCY_RETRY_MIN_DELAY_SECS: u64 = 1;
 /// Retry: maximum backoff delay in seconds between download attempts.
 pub const INDEX_CONSTITUENCY_RETRY_MAX_DELAY_SECS: u64 = 10;
 
-/// Retry: maximum number of retry attempts per CSV download.
-pub const INDEX_CONSTITUENCY_RETRY_MAX_TIMES: usize = 2;
+/// Retry: maximum number of attempts per CSV download (operator 2026-06-08:
+/// "retry at least five times"). Wired into `build_constituency_map` with
+/// exponential backoff between `INDEX_CONSTITUENCY_RETRY_MIN_DELAY_SECS` and
+/// `INDEX_CONSTITUENCY_RETRY_MAX_DELAY_SECS`. A transient niftyindices timeout /
+/// 5xx / reset on one attempt no longer drops the whole NTM list for the day.
+pub const INDEX_CONSTITUENCY_RETRY_MAX_TIMES: usize = 5;
 
 /// User-Agent header for niftyindices.com requests.
 /// niftyindices.com returns 403 Forbidden without a browser-like User-Agent.
@@ -2374,6 +2382,24 @@ pub const INDEX_CONSTITUENCY_SLUGS: &[(&str, &str)] = &[
 
 /// Number of slugs in `INDEX_CONSTITUENCY_SLUGS`.
 pub const INDEX_CONSTITUENCY_SLUG_COUNT: usize = INDEX_CONSTITUENCY_SLUGS.len();
+
+/// The SUBSCRIPTION constituent source (§31 item 4, operator lock 2026-06-06):
+/// the live main-feed subscription is the **NIFTY Total Market union ONLY**
+/// (NTM is the broadest basket and already contains the other indices' members).
+/// The boot turn-on (NTM Sub-PR #10b) fetches THIS slug — NOT the full
+/// `INDEX_CONSTITUENCY_SLUGS` — because the deduped union of all ~49 indices is
+/// ~the entire NSE (~1,900 stocks), which would breach `MAX_DAILY_UNIVERSE_SIZE`
+/// and HALT boot. The full list above is for the (map-only, not-subscribed)
+/// §31-item-2 index→constituents mapping, a separate concern.
+pub const NTM_CONSTITUENCY_SLUGS: &[(&str, &str)] =
+    &[("Nifty Total Market", "ind_niftytotalmarket_list")];
+
+/// Total wall-clock budget for the boot-time NTM constituency fetch (§31 Sub-PR
+/// #10b). niftyindices.com can accept a connection then stall the body (the
+/// per-GET 60s read timeout doesn't bound a slow-loris before the 09:00 open),
+/// so the boot caller wraps the fetch in `tokio::time::timeout(this)` and
+/// DEGRADES to the core universe on expiry (operator policy 2026-06-06).
+pub const NTM_CONSTITUENCY_FETCH_TIMEOUT_SECS: u64 = 30;
 
 /// Slugs known to return 404/HTML from niftyindices.com — skipped by the
 /// CSV downloader so we don't log 14 WARNs + fire an aggregated ERROR every

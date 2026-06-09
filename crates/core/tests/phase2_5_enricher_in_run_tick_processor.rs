@@ -43,8 +43,9 @@ fn run_tick_processor_signature_carries_tick_enricher_param() {
 fn run_tick_processor_branches_to_append_tick_enriched_on_some_path() {
     let src = read("core/src/pipeline/tick_processor.rs");
     assert!(
-        src.contains("writer.append_tick_enriched(&tick, life)"),
-        "run_tick_processor must call append_tick_enriched in the enricher Some branch"
+        src.contains("writer.append_tick_enriched_with_seq(&tick, life, capture_seq)"),
+        "run_tick_processor must call append_tick_enriched_with_seq (replay-stable \
+         capture_seq, TICK-SEQ-01 PR-2b) in the enricher Some branch"
     );
     // Phase 2.10: phase classification now uses `tick.exchange_timestamp`
     // (per-tick Dhan-source IST seconds-of-day) instead of `now_ist_secs`
@@ -63,12 +64,13 @@ fn run_tick_processor_branches_to_append_tick_enriched_on_some_path() {
 #[test]
 fn run_tick_processor_falls_back_to_append_tick_on_none_path() {
     let src = read("core/src/pipeline/tick_processor.rs");
-    // The legacy path still calls append_tick when no enricher is attached.
-    // We don't pin the exact spelling — just that the symbol is present in
-    // the same function (which a substring scan over the file confirms).
+    // TICK-SEQ-01 PR-2b: the no-enricher branch persists via the replay-stable
+    // `append_tick_with_seq` (threaded capture_seq), NOT the seq-less `append_tick`
+    // — else WAL replay duplicates the row under the (ts,sid,segment,capture_seq) key.
     assert!(
-        src.contains("writer.append_tick(&tick)"),
-        "run_tick_processor must keep the legacy `append_tick` fallback for the None branch"
+        src.contains("writer.append_tick_with_seq(&tick, capture_seq)"),
+        "run_tick_processor must use append_tick_with_seq (replay-stable capture_seq) \
+         in the no-enricher None branch"
     );
 }
 

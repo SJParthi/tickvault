@@ -25,7 +25,7 @@
 //!
 //! ## Envelope enforcement (§2 + §22)
 //!
-//! `MIN_DAILY_UNIVERSE_SIZE = 100`, `MAX_DAILY_UNIVERSE_SIZE = 400`
+//! `MIN_DAILY_UNIVERSE_SIZE = 100`, `MAX_DAILY_UNIVERSE_SIZE = 1200`
 //! (constants from Sub-PR #2 in `tickvault-common`). Computed universe
 //! sizes outside this envelope return `Err(UniverseSizeOutOfBounds)` —
 //! fail-closed per §1 of the rule file. The orchestrator surfaces this
@@ -50,8 +50,16 @@ pub enum InstrumentRole {
     /// `IDX_I` `INDEX` row — NSE indices + 1 BSE SENSEX (Sub-PR #6).
     Index,
     /// `NSE_EQ` `EQUITY` row referenced by a FUTSTK/OPTSTK as its
-    /// `UNDERLYING_SECURITY_ID` (Sub-PR #5).
+    /// `UNDERLYING_SECURITY_ID`. This is the PRIMARY tag for an equity that
+    /// is an F&O underlying — whether or not it is ALSO an NTM constituent
+    /// (the dual membership lives in [`SubscriptionTarget`]'s two flags).
     FnoUnderlying,
+    /// `NSE_EQ` `EQUITY` row that is a NIFTY Total Market constituent but is
+    /// NOT an F&O underlying (operator lock §31, 2026-06-06). Equities that
+    /// are BOTH keep [`InstrumentRole::FnoUnderlying`] and set
+    /// `is_index_constituent` — so these three primary classes stay mutually
+    /// exclusive while the flags carry the lossless "and/or" membership.
+    IndexConstituent,
 }
 
 impl InstrumentRole {
@@ -64,14 +72,27 @@ impl InstrumentRole {
         match self {
             Self::Index => "index",
             Self::FnoUnderlying => "fno_underlying",
+            Self::IndexConstituent => "index_constituent",
         }
     }
 }
 
 /// One instrument the WebSocket pool will subscribe to.
+///
+/// `role` is the mutually-exclusive PRIMARY classification; the two booleans
+/// are the lossless membership set per §31.1(6) ("`fno_underlying` **and/or**
+/// `index_constituent`"). A stock that is BOTH an F&O underlying AND an NTM
+/// constituent carries `role == FnoUnderlying` with BOTH flags `true`. Invariants
+/// (asserted by tests): `Index` ⇒ both flags false; `FnoUnderlying` ⇒
+/// `is_fno_underlying`; `IndexConstituent` ⇒ `!is_fno_underlying && is_index_constituent`.
+/// "F&O only" is the O(1) filter `is_fno_underlying`.
 #[derive(Debug, Clone)]
 pub struct SubscriptionTarget {
     pub role: InstrumentRole,
+    /// `true` iff this equity is an F&O underlying (§31 item 5 O(1) filter).
+    pub is_fno_underlying: bool,
+    /// `true` iff this equity is a NIFTY Total Market constituent.
+    pub is_index_constituent: bool,
     pub csv_row: CsvRow,
 }
 
@@ -115,6 +136,29 @@ impl DailyUniverse {
         self.subscription_targets
             .iter()
             .filter(|t| t.role == role)
+            .count()
+    }
+
+    /// O(1)-per-target count of F&O underlyings in the subscription — the
+    /// operator's "F&O separately extractable" guarantee (§31 item 5). Counts
+    /// the `is_fno_underlying` flag, so it INCLUDES the both-case (an F&O
+    /// underlying that is also an NTM constituent), unlike `count_by_role`.
+    #[must_use]
+    pub fn fno_underlying_count(&self) -> usize {
+        self.subscription_targets
+            .iter()
+            .filter(|t| t.is_fno_underlying)
+            .count()
+    }
+
+    /// O(1)-per-target count of NIFTY Total Market constituents in the
+    /// subscription — counts the `is_index_constituent` flag, INCLUDING the
+    /// both-case (an NTM stock that is also an F&O underlying).
+    #[must_use]
+    pub fn index_constituent_count(&self) -> usize {
+        self.subscription_targets
+            .iter()
+            .filter(|t| t.is_index_constituent)
             .count()
     }
 
@@ -177,7 +221,7 @@ pub enum BuildError {
     /// MAX_DAILY_UNIVERSE_SIZE]`. Per §2 + §22 — boot HALTS.
     ///
     /// Fail-closed: a too-small universe (e.g. <100) means an upstream
-    /// extractor returned partial data; a too-large universe (>400)
+    /// extractor returned partial data; a too-large universe (>1200)
     /// means an upstream regression let in extra rows (e.g. BSE
     /// non-SENSEX, or commodity F&O). Either way, refuse to proceed.
     #[error("computed universe size {actual} outside envelope [{min}, {max}]")]
@@ -206,6 +250,7 @@ pub fn build_daily_universe(
     indices: IndexExtraction,
     fno: FnoUnderlyingExtraction,
     fno_contracts: Vec<CsvRow>,
+    ntm_constituents: Vec<CsvRow>,
 ) -> Result<DailyUniverse, BuildError> {
     let mut subscription_targets: Vec<SubscriptionTarget> = Vec::new();
 
@@ -213,6 +258,8 @@ pub fn build_daily_universe(
     for row in indices.nse_indices {
         subscription_targets.push(SubscriptionTarget {
             role: InstrumentRole::Index,
+            is_fno_underlying: false,
+            is_index_constituent: false,
             csv_row: row,
         });
     }
@@ -221,6 +268,8 @@ pub fn build_daily_universe(
     if let Some(sensex) = indices.bse_sensex {
         subscription_targets.push(SubscriptionTarget {
             role: InstrumentRole::Index,
+            is_fno_underlying: false,
+            is_index_constituent: false,
             csv_row: sensex,
         });
     }
@@ -234,6 +283,8 @@ pub fn build_daily_universe(
         if let Some(row) = fno.nse_eq_lookup.get(sid) {
             subscription_targets.push(SubscriptionTarget {
                 role: InstrumentRole::FnoUnderlying,
+                is_fno_underlying: true,
+                is_index_constituent: false,
                 csv_row: row.clone(),
             });
         }
@@ -241,6 +292,60 @@ pub fn build_daily_universe(
         // extractor only inserts a SID into `unique_underlying_ids`
         // AFTER confirming `nse_eq_lookup.contains_key(sid)`. Defensive
         // skip (don't panic).
+    }
+
+    // Pass 4 — NTM constituents (operator lock §31, 2026-06-06).
+    //
+    // `ntm_constituents` are already-resolved NSE_EQ EQUITY rows (the SID→row
+    // bridge from `constituent_resolver` is Sub-PR #10's job). Union them in,
+    // deduped by `(security_id, exchange_segment)` (I-P1-11):
+    //  * a constituent whose `(sid, NSE_EQ)` matches an existing target (an F&O
+    //    underlying pushed in Pass 3) → flag that target `is_index_constituent`
+    //    (the lossless "both" case, NO duplicate row);
+    //  * otherwise → push a new `IndexConstituent` target.
+    //
+    // O(N) cold-path build of the index over the equity targets pushed so far;
+    // O(1) lookup per constituent. NOT a hot path.
+    if !ntm_constituents.is_empty() {
+        use std::collections::HashMap;
+        let mut by_key: HashMap<(String, String), usize> = HashMap::new();
+        for (idx, t) in subscription_targets.iter().enumerate() {
+            // Only equity targets can collide with a constituent; index values
+            // are IDX_I and keyed separately, so they never match an NSE_EQ key.
+            by_key.insert(
+                (t.csv_row.security_id.clone(), t.csv_row.segment.clone()),
+                idx,
+            );
+        }
+        for row in ntm_constituents {
+            // §31.1 contract: constituents are pre-resolved NSE_EQ EQUITY rows.
+            // Fail-closed against a future Sub-PR #10 wiring bug — a non-NSE_EQ
+            // row could otherwise collide on the string key or be mis-routed as
+            // an equity by the subscription planner. Skip + warn, never subscribe.
+            if row.segment != "NSE_EQ" {
+                tracing::warn!(
+                    security_id = %row.security_id,
+                    segment = %row.segment,
+                    "NTM fold: dropping non-NSE_EQ constituent row (contract violation)"
+                );
+                continue;
+            }
+            let key = (row.security_id.clone(), row.segment.clone());
+            if let Some(&idx) = by_key.get(&key) {
+                // Existing target (F&O underlying OR an already-folded
+                // constituent) — set the constituent flag, no new row.
+                subscription_targets[idx].is_index_constituent = true;
+            } else {
+                let new_idx = subscription_targets.len();
+                subscription_targets.push(SubscriptionTarget {
+                    role: InstrumentRole::IndexConstituent,
+                    is_fno_underlying: false,
+                    is_index_constituent: true,
+                    csv_row: row,
+                });
+                by_key.insert(key, new_idx);
+            }
+        }
     }
 
     let total = subscription_targets.len();
@@ -272,6 +377,24 @@ mod tests {
             symbol_name: symbol.to_string(),
             underlying_security_id: String::new(),
             ..Default::default()
+        }
+    }
+
+    fn target_index(row: CsvRow) -> SubscriptionTarget {
+        SubscriptionTarget {
+            role: InstrumentRole::Index,
+            is_fno_underlying: false,
+            is_index_constituent: false,
+            csv_row: row,
+        }
+    }
+
+    fn target_fno(row: CsvRow) -> SubscriptionTarget {
+        SubscriptionTarget {
+            role: InstrumentRole::FnoUnderlying,
+            is_fno_underlying: true,
+            is_index_constituent: false,
+            csv_row: row,
         }
     }
 
@@ -320,18 +443,9 @@ mod tests {
         // the only always-on instrument.
         let universe = DailyUniverse {
             subscription_targets: vec![
-                SubscriptionTarget {
-                    role: InstrumentRole::Index,
-                    csv_row: idx_i_row("13", "NSE", "NIFTY"),
-                },
-                SubscriptionTarget {
-                    role: InstrumentRole::Index,
-                    csv_row: idx_i_row("5024", "NSE", "GIFTNIFTY"),
-                },
-                SubscriptionTarget {
-                    role: InstrumentRole::FnoUnderlying,
-                    csv_row: nse_eq_row("2885", "RELIANCE"),
-                },
+                target_index(idx_i_row("13", "NSE", "NIFTY")),
+                target_index(idx_i_row("5024", "NSE", "GIFTNIFTY")),
+                target_fno(nse_eq_row("2885", "RELIANCE")),
             ],
             fno_contracts: Vec::new(),
         };
@@ -344,10 +458,7 @@ mod tests {
     #[test]
     fn always_on_segments_empty_without_gift_nifty() {
         let universe = DailyUniverse {
-            subscription_targets: vec![SubscriptionTarget {
-                role: InstrumentRole::Index,
-                csv_row: idx_i_row("13", "NSE", "NIFTY"),
-            }],
+            subscription_targets: vec![target_index(idx_i_row("13", "NSE", "NIFTY"))],
             fno_contracts: Vec::new(),
         };
         assert!(
@@ -361,7 +472,7 @@ mod tests {
         // 30 indices + 1 SENSEX + 219 underlyings = 250 total.
         let indices = make_indices(30);
         let fno = make_fno(219);
-        let universe = build_daily_universe(indices, fno, Vec::new()).expect("build");
+        let universe = build_daily_universe(indices, fno, Vec::new(), Vec::new()).expect("build");
         assert_eq!(universe.total_count(), 250);
         assert_eq!(universe.count_by_role(InstrumentRole::Index), 31);
         assert_eq!(universe.count_by_role(InstrumentRole::FnoUnderlying), 219);
@@ -374,6 +485,7 @@ mod tests {
             make_indices(30),
             make_fno(100),
             vec![nse_eq_row("49081", "NIFTY26JUN24000CE")],
+            Vec::new(),
         )
         .expect("build");
         // total_count = SUBSCRIPTION only (the [100,400] envelope basis).
@@ -387,29 +499,29 @@ mod tests {
         // 30 indices + 1 SENSEX + 50 underlyings = 81, below MIN=100.
         let indices = make_indices(30);
         let fno = make_fno(50);
-        let result = build_daily_universe(indices, fno, Vec::new());
+        let result = build_daily_universe(indices, fno, Vec::new(), Vec::new());
         assert!(matches!(
             result,
             Err(BuildError::UniverseSizeOutOfBounds {
                 actual: 81,
                 min: 100,
-                max: 400
+                max: 1200
             })
         ));
     }
 
     #[test]
     fn rejects_universe_above_max_size() {
-        // 30 indices + 1 SENSEX + 500 underlyings = 531, above MAX=400.
+        // 30 indices + 1 SENSEX + 1170 underlyings = 1201, above MAX=1200.
         let indices = make_indices(30);
-        let fno = make_fno(500);
-        let result = build_daily_universe(indices, fno, Vec::new());
+        let fno = make_fno(1170);
+        let result = build_daily_universe(indices, fno, Vec::new(), Vec::new());
         assert!(matches!(
             result,
             Err(BuildError::UniverseSizeOutOfBounds {
-                actual: 531,
+                actual: 1201,
                 min: 100,
-                max: 400
+                max: 1200
             })
         ));
     }
@@ -419,24 +531,26 @@ mod tests {
         // 30 indices + 1 SENSEX + 69 underlyings = 100, exactly MIN.
         let indices = make_indices(30);
         let fno = make_fno(69);
-        let universe = build_daily_universe(indices, fno, Vec::new()).expect("at MIN accepts");
+        let universe =
+            build_daily_universe(indices, fno, Vec::new(), Vec::new()).expect("at MIN accepts");
         assert_eq!(universe.total_count(), 100);
     }
 
     #[test]
     fn accepts_universe_exactly_at_max_size() {
-        // 30 indices + 1 SENSEX + 369 underlyings = 400, exactly MAX.
+        // 30 indices + 1 SENSEX + 1169 underlyings = 1200, exactly MAX.
         let indices = make_indices(30);
-        let fno = make_fno(369);
-        let universe = build_daily_universe(indices, fno, Vec::new()).expect("at MAX accepts");
-        assert_eq!(universe.total_count(), 400);
+        let fno = make_fno(1169);
+        let universe =
+            build_daily_universe(indices, fno, Vec::new(), Vec::new()).expect("at MAX accepts");
+        assert_eq!(universe.total_count(), 1200);
     }
 
     #[test]
     fn indices_appear_before_underlyings_in_order() {
         let indices = make_indices(30);
         let fno = make_fno(69);
-        let universe = build_daily_universe(indices, fno, Vec::new()).expect("build");
+        let universe = build_daily_universe(indices, fno, Vec::new(), Vec::new()).expect("build");
 
         // First 30 are NSE indices, then BSE SENSEX, then underlyings.
         for (i, t) in universe.subscription_targets.iter().take(31).enumerate() {
@@ -456,7 +570,7 @@ mod tests {
     fn bse_sensex_appears_after_nse_indices() {
         let indices = make_indices(30);
         let fno = make_fno(69);
-        let universe = build_daily_universe(indices, fno, Vec::new()).expect("build");
+        let universe = build_daily_universe(indices, fno, Vec::new(), Vec::new()).expect("build");
 
         // Index target #30 (0-indexed) should be SENSEX.
         let sensex = &universe.subscription_targets[30];
@@ -468,7 +582,7 @@ mod tests {
     fn count_by_role_returns_correct_counts() {
         let indices = make_indices(30);
         let fno = make_fno(150);
-        let universe = build_daily_universe(indices, fno, Vec::new()).expect("build");
+        let universe = build_daily_universe(indices, fno, Vec::new(), Vec::new()).expect("build");
         assert_eq!(universe.count_by_role(InstrumentRole::Index), 31);
         assert_eq!(universe.count_by_role(InstrumentRole::FnoUnderlying), 150);
         // Sum equals total.
@@ -483,6 +597,10 @@ mod tests {
     fn instrument_role_as_str_is_stable_wire_format() {
         assert_eq!(InstrumentRole::Index.as_str(), "index");
         assert_eq!(InstrumentRole::FnoUnderlying.as_str(), "fno_underlying");
+        assert_eq!(
+            InstrumentRole::IndexConstituent.as_str(),
+            "index_constituent"
+        );
     }
 
     #[test]
@@ -503,7 +621,7 @@ mod tests {
             total_derivative_count: 1,
         };
         let indices = make_indices(100); // 100 + 1 = 101 indices alone
-        let universe = build_daily_universe(indices, fno, Vec::new()).expect("build");
+        let universe = build_daily_universe(indices, fno, Vec::new(), Vec::new()).expect("build");
         // Ghost SID is silently skipped → 0 fno_underlying entries.
         assert_eq!(universe.count_by_role(InstrumentRole::FnoUnderlying), 0);
         assert_eq!(universe.count_by_role(InstrumentRole::Index), 101);
@@ -523,7 +641,7 @@ mod tests {
             dangling_count: 0,
             total_derivative_count: 0,
         };
-        let result = build_daily_universe(indices, fno, Vec::new());
+        let result = build_daily_universe(indices, fno, Vec::new(), Vec::new());
         assert!(matches!(
             result,
             Err(BuildError::UniverseSizeOutOfBounds { actual: 0, .. })
@@ -535,6 +653,159 @@ mod tests {
         // Defensive: pin the constants used here against the same
         // constants pinned in Sub-PR #2's source-scan ratchet.
         assert_eq!(MIN_DAILY_UNIVERSE_SIZE, 100);
-        assert_eq!(MAX_DAILY_UNIVERSE_SIZE, 400);
+        assert_eq!(MAX_DAILY_UNIVERSE_SIZE, 1200);
+    }
+
+    // ----- Sub-PR #5: NTM constituent fold (operator lock §31) -----
+
+    #[test]
+    fn ntm_fold_empty_is_unchanged() {
+        // Empty ntm_constituents (today, pre-#10) → identical to current.
+        let a = build_daily_universe(make_indices(30), make_fno(150), Vec::new(), Vec::new())
+            .expect("build");
+        assert_eq!(a.total_count(), 181);
+        assert_eq!(a.index_constituent_count(), 0);
+        assert_eq!(a.fno_underlying_count(), 150);
+    }
+
+    #[test]
+    fn ntm_fold_both_case_sets_both_flags_no_dup() {
+        // Constituent SID "U0001" collides with an F&O underlying pushed in
+        // Pass 3 → the existing target gets is_index_constituent, NO new row.
+        let before = build_daily_universe(make_indices(30), make_fno(150), Vec::new(), Vec::new())
+            .expect("before")
+            .total_count();
+        let universe = build_daily_universe(
+            make_indices(30),
+            make_fno(150),
+            Vec::new(),
+            vec![nse_eq_row("U0001", "STK1")],
+        )
+        .expect("build");
+        // No duplicate row — count unchanged.
+        assert_eq!(universe.total_count(), before);
+        // The matched target is BOTH.
+        let both = universe
+            .subscription_targets
+            .iter()
+            .find(|t| t.csv_row.security_id == "U0001")
+            .expect("U0001 present");
+        assert_eq!(both.role, InstrumentRole::FnoUnderlying);
+        assert!(
+            both.is_fno_underlying && both.is_index_constituent,
+            "both flags"
+        );
+        assert_eq!(universe.fno_underlying_count(), 150);
+        assert_eq!(universe.index_constituent_count(), 1);
+    }
+
+    #[test]
+    fn ntm_fold_pure_constituent_adds_role() {
+        // A constituent SID with no F&O underlying match → new IndexConstituent.
+        let universe = build_daily_universe(
+            make_indices(30),
+            make_fno(150),
+            Vec::new(),
+            vec![nse_eq_row("999999", "PURECONST")],
+        )
+        .expect("build");
+        assert_eq!(universe.total_count(), 182); // 181 + 1 new
+        let pc = universe
+            .subscription_targets
+            .iter()
+            .find(|t| t.csv_row.security_id == "999999")
+            .expect("present");
+        assert_eq!(pc.role, InstrumentRole::IndexConstituent);
+        assert!(!pc.is_fno_underlying && pc.is_index_constituent);
+        assert_eq!(universe.index_constituent_count(), 1);
+        assert_eq!(universe.fno_underlying_count(), 150);
+    }
+
+    #[test]
+    fn ntm_fold_dedups_repeat_rows() {
+        // Same constituent row twice in the input → folded once (I-P1-11).
+        let universe = build_daily_universe(
+            make_indices(30),
+            make_fno(150),
+            Vec::new(),
+            vec![
+                nse_eq_row("999999", "PURECONST"),
+                nse_eq_row("999999", "PURECONST"),
+            ],
+        )
+        .expect("build");
+        assert_eq!(universe.total_count(), 182, "repeat folded once, not twice");
+        assert_eq!(universe.index_constituent_count(), 1);
+    }
+
+    #[test]
+    fn ntm_fold_does_not_touch_index_values_across_segments() {
+        // I-P1-11: a constituent NSE_EQ SID equal to an index IDX_I SID must
+        // NOT flag the index value (keyed on (sid, NSE_EQ)).
+        // make_indices uses IDX_I sids "I0".."I29" + "51"; use NSE_EQ "51".
+        let universe = build_daily_universe(
+            make_indices(30),
+            make_fno(150),
+            Vec::new(),
+            vec![nse_eq_row("51", "FIFTYONE_EQ")],
+        )
+        .expect("build");
+        // SENSEX index (IDX_I, sid 51) must remain a pure Index.
+        let sensex = universe
+            .subscription_targets
+            .iter()
+            .find(|t| t.csv_row.segment == "IDX_I" && t.csv_row.security_id == "51")
+            .expect("SENSEX present");
+        assert!(!sensex.is_index_constituent, "index value untouched");
+        // The NSE_EQ "51" is a new constituent row.
+        assert_eq!(universe.index_constituent_count(), 1);
+        assert_eq!(universe.total_count(), 182);
+    }
+
+    #[test]
+    fn fno_underlying_count_includes_both_case() {
+        // Flag-based count includes an F&O underlying that is ALSO a constituent.
+        let universe = build_daily_universe(
+            make_indices(30),
+            make_fno(150),
+            Vec::new(),
+            vec![nse_eq_row("U0001", "STK1")], // both-case
+        )
+        .expect("build");
+        assert_eq!(universe.fno_underlying_count(), 150);
+    }
+
+    #[test]
+    fn index_constituent_count_includes_both_case() {
+        // Flag-based count includes the both-case + a pure constituent.
+        let universe = build_daily_universe(
+            make_indices(30),
+            make_fno(150),
+            Vec::new(),
+            vec![
+                nse_eq_row("U0001", "STK1"),       // both-case
+                nse_eq_row("999999", "PURECONST"), // pure constituent
+            ],
+        )
+        .expect("build");
+        assert_eq!(universe.index_constituent_count(), 2);
+    }
+
+    #[test]
+    fn ntm_fold_drops_non_nse_eq_constituent_row_fail_closed() {
+        // Defensive (hostile-review LOW): a non-NSE_EQ row (a future #10 wiring
+        // bug) is dropped, never subscribed.
+        let bad = CsvRow {
+            security_id: "12345".to_string(),
+            exch_id: "NSE".to_string(),
+            segment: "NSE_FNO".to_string(), // NOT NSE_EQ
+            instrument: "OPTSTK".to_string(),
+            symbol_name: "BADROW".to_string(),
+            ..Default::default()
+        };
+        let universe = build_daily_universe(make_indices(30), make_fno(150), Vec::new(), vec![bad])
+            .expect("build");
+        assert_eq!(universe.index_constituent_count(), 0, "non-NSE_EQ dropped");
+        assert_eq!(universe.total_count(), 181, "no row added");
     }
 }

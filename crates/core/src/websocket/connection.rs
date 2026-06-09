@@ -240,7 +240,9 @@ pub struct WebSocketConnection {
     instruments: Vec<InstrumentSubscription>,
 
     /// Channel sender for forwarding raw binary frames to downstream.
-    frame_sender: mpsc::Sender<bytes::Bytes>,
+    /// TICK-SEQ-01: sends `(frame_seq, frame)` — the read-loop capture sequence
+    /// stamped once and shared with the WAL so `capture_seq` is replay-stable.
+    frame_sender: mpsc::Sender<(u64, bytes::Bytes)>,
 
     /// Current connection state (tracked for health reporting).
     state: std::sync::Mutex<ConnectionState>,
@@ -389,7 +391,7 @@ impl WebSocketConnection {
         ws_config: WebSocketConfig,
         instruments: Vec<InstrumentSubscription>,
         feed_mode: FeedMode,
-        frame_sender: mpsc::Sender<bytes::Bytes>,
+        frame_sender: mpsc::Sender<(u64, bytes::Bytes)>,
         notifier: Option<Arc<crate::notification::NotificationService>>,
     ) -> Self {
         let websocket_base_url = dhan_config.websocket_url.clone(); // O(1) EXEMPT: constructor — once
@@ -1277,13 +1279,19 @@ impl WebSocketConnection {
                     //     the CRITICAL metric — that is the single "real loss"
                     //     path and it requires both the disk writer thread
                     //     AND the downstream consumer to be stuck simultaneously.
+                    // TICK-SEQ-01: stamp the capture sequence ONCE per frame, then
+                    // share the SAME value with BOTH the durable WAL and the live
+                    // broadcast so the persisted `capture_seq` is replay-stable.
+                    // O(1) atomic, zero heap alloc.
+                    let frame_seq = tickvault_storage::ws_frame_spill::next_frame_seq();
                     if let Some(spill) = self.wal_spill.as_ref() {
                         // Zero-tick-loss PR-8a (H1): hand the WAL spill an O(1)
                         // `Bytes` Arc-refcount clone instead of a per-frame
                         // `Vec<u8>` malloc. `data` is already `Bytes` (the live
                         // forward below also moves it zero-copy), so `data.clone()`
                         // is a refcount bump — no heap allocation on the read loop.
-                        let outcome = spill.append(WsType::LiveFeed, data.clone());
+                        let outcome =
+                            spill.append_with_seq(WsType::LiveFeed, data.clone(), frame_seq);
                         if outcome == tickvault_storage::ws_frame_spill::AppendOutcome::Dropped {
                             error!(
                                 connection_id = self.connection_id,
@@ -1292,7 +1300,7 @@ impl WebSocketConnection {
                             // CRITICAL metric already incremented inside spill.append().
                         }
                     }
-                    match self.frame_sender.try_send(data) {
+                    match self.frame_sender.try_send((frame_seq, data)) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_dropped)) => {
                             let wal_attached = self.wal_spill.is_some();
@@ -3603,7 +3611,7 @@ mod tests {
 
     /// Helper: creates a `WebSocketConnection` with tiny timeouts for fast tests.
     fn make_test_conn_for_read_loop(
-        frame_sender: mpsc::Sender<bytes::Bytes>,
+        frame_sender: mpsc::Sender<(u64, bytes::Bytes)>,
     ) -> WebSocketConnection {
         WebSocketConnection::new(
             0,
@@ -3652,7 +3660,7 @@ mod tests {
         assert!(result.is_ok(), "read loop should return Ok on close");
 
         // Verify the binary payload was forwarded.
-        let received = rx.recv().await.expect("should receive frame"); // APPROVED: test
+        let (_seq, received) = rx.recv().await.expect("should receive frame"); // APPROVED: test
         assert_eq!(received, payload);
     }
 
@@ -3680,7 +3688,7 @@ mod tests {
 
         // All 3 frames should be received.
         for i in 0u8..3 {
-            let frame = rx.recv().await.expect("should receive frame"); // APPROVED: test
+            let (_seq, frame) = rx.recv().await.expect("should receive frame"); // APPROVED: test
             assert_eq!(frame, vec![i, i + 1, i + 2]);
         }
     }
@@ -4072,9 +4080,9 @@ mod tests {
         assert!(result.is_ok());
 
         // Check that both binary frames were forwarded.
-        let frame1 = rx.recv().await.expect("should get frame 1"); // APPROVED: test
+        let (_seq, frame1) = rx.recv().await.expect("should get frame 1"); // APPROVED: test
         assert_eq!(frame1, vec![0xAA]);
-        let frame2 = rx.recv().await.expect("should get frame 2"); // APPROVED: test
+        let (_seq2, frame2) = rx.recv().await.expect("should get frame 2"); // APPROVED: test
         assert_eq!(frame2, vec![0xBB]);
     }
 
@@ -4185,7 +4193,7 @@ mod tests {
         let result = read_handle.await.expect("task panicked"); // APPROVED: test
         assert!(result.is_ok());
 
-        let received = rx.recv().await.expect("should receive large frame"); // APPROVED: test
+        let (_seq, received) = rx.recv().await.expect("should receive large frame"); // APPROVED: test
         assert_eq!(received.len(), 4096);
         assert_eq!(received, expected);
     }
@@ -4210,7 +4218,7 @@ mod tests {
         let result = read_handle.await.expect("task panicked"); // APPROVED: test
         assert!(result.is_ok());
 
-        let received = rx.recv().await.expect("should receive empty frame"); // APPROVED: test
+        let (_seq, received) = rx.recv().await.expect("should receive empty frame"); // APPROVED: test
         assert!(received.is_empty());
     }
 
@@ -4267,7 +4275,7 @@ mod tests {
         let result = read_handle.await.expect("task panicked"); // APPROVED: test
         assert!(result.is_ok());
 
-        let frame = rx.recv().await.expect("should receive binary frame"); // APPROVED: test
+        let (_seq, frame) = rx.recv().await.expect("should receive binary frame"); // APPROVED: test
         assert_eq!(frame, vec![0xFF]);
     }
 

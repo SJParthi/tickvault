@@ -113,7 +113,7 @@ jobs:
       binary_artifact_name: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.0.3
 
       - name: Install Rust toolchain (host = aarch64-unknown-linux-musl, static binary)
         # MUSL static target eliminates GLIBC version dependency entirely.
@@ -240,7 +240,7 @@ jobs:
     environment: prod
     steps:
       - name: Checkout (for deploy scripts)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.0.3
 
       - name: Download built binary
         uses: actions/download-artifact@v4
@@ -544,17 +544,13 @@ jobs:
               "if [ -f repo/deploy/docker/docker-compose.yml ]; then export TV_QUESTDB_PG_USER=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/staging/questdb/pg-user --with-decryption --output text --query Parameter.Value 2>/dev/null || aws ssm get-parameter --region ap-south-1 --name /tickvault/dev/questdb/pg-user --with-decryption --output text --query Parameter.Value 2>/dev/null || echo admin); export TV_QUESTDB_PG_PASSWORD=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/staging/questdb/pg-password --with-decryption --output text --query Parameter.Value 2>/dev/null || aws ssm get-parameter --region ap-south-1 --name /tickvault/dev/questdb/pg-password --with-decryption --output text --query Parameter.Value 2>/dev/null || echo quest); (cd repo/deploy/docker && TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" docker compose up -d) || (echo FATAL: docker compose up failed; exit 1); else echo FATAL: docker-compose.yml missing from repo/deploy/docker; exit 1; fi",
               "# Verify QuestDB is actually listening on 9000 (HTTP) within 30s",
               "for i in 1 2 3 4 5 6; do if curl -fsS http://127.0.0.1:9000/exec?query=SELECT%201 >/dev/null 2>&1; then echo QUESTDB-UP; break; fi; sleep 5; if [ $i -eq 6 ]; then echo FATAL: QuestDB not responding on :9000 after 30s; docker compose -f repo/deploy/docker/docker-compose.yml ps; exit 1; fi; done",
-              "# SELF-HEAL: CloudWatch Agent install + config (mirrors user-data Step 2-3).",
-              "# Without this the dashboards show No data and /tickvault/prod/app log group",
-              "# has zero log streams. Idempotent: installer no-ops if already present;",
-              "# config write + agent restart is safe to run every deploy.",
-              "command -v amazon-cloudwatch-agent-ctl >/dev/null 2>&1 || sudo dnf install -y amazon-cloudwatch-agent || sudo yum install -y amazon-cloudwatch-agent || (curl -fsSL https://amazoncloudwatch-agent-ap-south-1.s3.ap-south-1.amazonaws.com/amazon_linux/arm64/latest/amazon-cloudwatch-agent.rpm -o /tmp/cwa.rpm && sudo rpm -i /tmp/cwa.rpm) || true",
-              "sudo mkdir -p /opt/aws/amazon-cloudwatch-agent/etc",
-              "if [ -f repo/deploy/aws/cloudwatch-agent.json ]; then sudo cp -f repo/deploy/aws/cloudwatch-agent.json /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json; fi",
-              "if [ -f repo/deploy/aws/prometheus.yaml ]; then sudo cp -f repo/deploy/aws/prometheus.yaml /opt/aws/amazon-cloudwatch-agent/etc/prometheus.yaml; fi",
-              "sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json || true",
-              "sudo systemctl enable --now amazon-cloudwatch-agent || true",
-              "echo CWAGENT-CONFIGURED",
+              "# === TRADING APP FIRST ===",
+              "# The trading app is the deploy. Start + verify it BEFORE touching the",
+              "# CloudWatch agent, so a broken OBSERVABILITY agent can never block or",
+              "# cancel the TRADING app start (incident 2026-06-09: `enable --now`",
+              "# amazon-cloudwatch-agent retried ec2:DescribeTags 403 for ~60s then failed",
+              "# config validation, starving the tickvault restart -> false deploy FAILED +",
+              "# auto-stop, taking the live app down for an observability-only fault).",
               "systemctl daemon-reload",
               "systemctl enable tickvault || true",
               "# On systemctl failure, dump status + journal so the deploy log shows WHY (Z+ L1 DETECT).",
@@ -563,6 +559,21 @@ jobs:
               "systemctl restart tickvault || (echo ===== systemctl status ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== app stdout/stderr ONLY last 200 ===== && journalctl -u tickvault.service -n 200 --no-pager --output=cat || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1)",
               "sleep 5",
               "systemctl is-active --quiet tickvault || (echo ===== service inactive after 5s ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== app stdout/stderr ONLY last 200 ===== && journalctl -u tickvault.service -n 200 --no-pager --output=cat || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1)",
+              "echo TICKVAULT-UP",
+              "# === OBSERVABILITY LAST (non-fatal + time-bounded) ===",
+              "# SELF-HEAL: CloudWatch Agent install + config (mirrors user-data Step 2-3).",
+              "# Without this the dashboards show No data and /tickvault/prod/app log group",
+              "# has zero log streams. Idempotent. EVERY step is `|| true` and bounded by",
+              "# `timeout` / `--no-block` so the agent can NEVER block or fail the deploy —",
+              "# the verified-running trading app above is what the deploy succeeds on.",
+              "command -v amazon-cloudwatch-agent-ctl >/dev/null 2>&1 || sudo dnf install -y amazon-cloudwatch-agent || sudo yum install -y amazon-cloudwatch-agent || (curl -fsSL https://amazoncloudwatch-agent-ap-south-1.s3.ap-south-1.amazonaws.com/amazon_linux/arm64/latest/amazon-cloudwatch-agent.rpm -o /tmp/cwa.rpm && sudo rpm -i /tmp/cwa.rpm) || true",
+              "sudo mkdir -p /opt/aws/amazon-cloudwatch-agent/etc",
+              "if [ -f repo/deploy/aws/cloudwatch-agent.json ]; then sudo cp -f repo/deploy/aws/cloudwatch-agent.json /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json; fi",
+              "if [ -f repo/deploy/aws/prometheus.yaml ]; then sudo cp -f repo/deploy/aws/prometheus.yaml /opt/aws/amazon-cloudwatch-agent/etc/prometheus.yaml; fi",
+              "sudo timeout 25 /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json || echo 'WARN: cloudwatch-agent fetch-config failed (observability only, app unaffected)'",
+              "sudo systemctl enable amazon-cloudwatch-agent || true",
+              "sudo systemctl start amazon-cloudwatch-agent --no-block || true",
+              "echo CWAGENT-CONFIGURED",
               "echo DEPLOY OK"
             ]' \
             --query 'Command.CommandId' --output text)
@@ -737,10 +748,23 @@ jobs:
         # Restart=always keeps relaunching it every few seconds. If each
         # boot reaches the auth step (it does after PR #921/#922), each
         # boot fires a "Auth OK" Telegram — operator gets one Telegram
-        # per minute forever. Auto-stop + disable here breaks the loop
-        # the moment the deploy fails. Next successful deploy will
-        # re-enable + start the service via the existing systemctl
-        # daemon-reload + restart sequence above.
+        # per minute forever. We `systemctl stop` here to break that loop
+        # for THIS boot (an explicit stop suppresses Restart=always until
+        # the next boot/deploy).
+        #
+        # 2026-06-09 AUTO-START FIX: we DO NOT `systemctl disable` anymore.
+        # Disabling poisoned next-morning auto-start (the unit no longer
+        # started at the 08:30 boot) AND tricked scripts/aws-autopilot.sh
+        # into reading a disabled unit as an INTENTIONAL kill-switch (so it
+        # refused to self-heal it — see aws-autopilot.sh "unit disabled"
+        # branch). Leaving the unit ENABLED means: systemd auto-starts it at
+        # the next boot, the autopilot restarts an enabled-but-inactive unit,
+        # and a genuinely-bad binary is replaced by the morning redeploy
+        # (~08:45 IST) — all without the operator touching the box. The
+        # intentional kill-switch (disable via AWS Control) stays the ONLY
+        # source of a disabled unit, so the autopilot's disabled==intentional
+        # semantics remain correct. Regression-locked by
+        # crates/storage/tests/deploy_no_disable_on_failure_guard.rs.
         # Honest envelope: this can only execute if AWS creds were
         # configured (i.e. failure happened AFTER the configure-creds
         # step). For earlier failures it silently no-ops via `|| true`.
@@ -751,7 +775,7 @@ jobs:
             --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
             --document-name "AWS-RunShellScript" \
             --comment "tickvault auto-stop on deploy failure sha=${{ github.sha }}" \
-            --parameters 'commands=["systemctl stop tickvault || true","systemctl disable tickvault || true","echo AUTO-STOPPED-AND-DISABLED: next successful deploy will re-enable + start the service"]' \
+            --parameters 'commands=["systemctl stop tickvault || true","echo AUTO-STOPPED-UNIT-STAYS-ENABLED: stopped to break the Restart=always spam loop for this boot; unit kept ENABLED so it auto-starts at the next boot and aws-autopilot self-heals it."]' \
             --query Command.CommandId --output text || echo "(could not dispatch auto-stop — AWS creds likely not configured at this stage)"
 
       - name: Notify Telegram on failure
@@ -763,7 +787,7 @@ jobs:
         run: |
           SHORT_SHA="${GITHUB_SHA:0:7}"
           IST_TIME="$(TZ='Asia/Kolkata' date +'%I:%M %p IST')"
-          MSG="🆘 Deploy FAILED at ${IST_TIME} (version ${SHORT_SHA}). The app was auto-stopped to avoid repeated alerts; the next deploy re-enables it. Check the run: ${{ github.run_id }}"
+          MSG="🆘 Deploy FAILED at ${IST_TIME} (version ${SHORT_SHA}). The app was auto-stopped to avoid repeated alerts; it stays set to auto-start at the next boot/deploy. Check the run: ${{ github.run_id }}"
           # If the app started then crashed inside the 60s verify window, the
           # Monitor step captured WHY into CRASH_DIAG — forward it so the
           # operator sees the actual reason on the phone, not just "FAILED".

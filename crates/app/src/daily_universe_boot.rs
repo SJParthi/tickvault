@@ -49,6 +49,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use tickvault_common::config::QuestDbConfig;
+use tickvault_common::instrument_types::IndexConstituencyMap;
 use tickvault_core::instrument::csv_downloader::CsvDownloadError;
 use tickvault_core::instrument::daily_universe::{DailyUniverse, InstrumentRole};
 use tickvault_core::instrument::instr_fetch_loop::LoopOutcome;
@@ -181,6 +182,7 @@ pub async fn run_daily_universe_boot<Fetch, FetchFut>(
     today_ist_nanos: i64,
     dry_run: bool,
     max_attempts: Option<u32>,
+    ntm_map: Option<IndexConstituencyMap>,
 ) -> Result<(DailyUniverseBootOutcome, Arc<DailyUniverse>)>
 where
     Fetch: FnMut(u32) -> FetchFut,
@@ -216,7 +218,8 @@ where
         }
     };
 
-    let (outcome, universe) = run_daily_universe_fetch_runner(wrapped, max_attempts).await;
+    let (outcome, universe) =
+        run_daily_universe_fetch_runner(wrapped, max_attempts, ntm_map.as_ref()).await;
 
     let Some(universe) = universe else {
         anyhow::bail!(
@@ -245,6 +248,12 @@ where
         i64::try_from(universe.count_by_role(InstrumentRole::Index)).unwrap_or(i64::MAX);
     let underlying_count =
         i64::try_from(universe.count_by_role(InstrumentRole::FnoUnderlying)).unwrap_or(i64::MAX);
+    // §31 NTM observability — flag-derived counts (include the both-case).
+    // `fno_underlying_count` == `count_by_role(FnoUnderlying)` today (NTM fold
+    // empty pre-#10), but reads from the lossless flag for forward-correctness.
+    let fno_flag_count = i64::try_from(universe.fno_underlying_count()).unwrap_or(i64::MAX);
+    let index_constituent_count =
+        i64::try_from(universe.index_constituent_count()).unwrap_or(i64::MAX);
 
     // §10 ordering: reconcile FIRST (lifecycle UPSERT/UPDATE + lifecycle
     // audit), then the instrument_fetch_audit terminal-success row. A
@@ -290,6 +299,9 @@ where
     info!(
         attempts_used,
         universe_size,
+        index_count,
+        fno_underlying_count = fno_flag_count,
+        index_constituent_count,
         total_rows,
         upserted = reconcile.apply.upserted,
         expired = reconcile.apply.expired,
@@ -335,7 +347,7 @@ mod tests {
     /// A valid Detailed-CSV body that `build_universe_from_bytes` accepts
     /// (131 instruments: 100 NSE_EQ underlyings + 30 NSE indices + 1 BSE
     /// SENSEX + 100 FUTSTK derivatives). Mirrors the core orchestrator's
-    /// own end-to-end fixture so the universe clears the [100, 400]
+    /// own end-to-end fixture so the universe clears the [100, 1200]
     /// envelope.
     fn valid_csv() -> Vec<u8> {
         let mut s = String::from(
@@ -464,7 +476,7 @@ mod tests {
                 b"SECURITY_ID,EXCH_ID,SEGMENT,INSTRUMENT,SYMBOL_NAME,UNDERLYING_SECURITY_ID\n51,BSE,IDX_I,INDEX,SENSEX,\n".to_vec(),
             )
         };
-        let result = run_daily_universe_boot(&cfg, fetch, 1, 1, false, Some(1)).await;
+        let result = run_daily_universe_boot(&cfg, fetch, 1, 1, false, Some(1), None).await;
         assert!(result.is_err(), "no universe built → boot must bail");
     }
 
@@ -478,7 +490,7 @@ mod tests {
         // wrapper capture → runner Success → universe → counts → reconcile.
         let cfg = cfg_unreachable();
         let fetch = |_attempt: u32| async { Ok::<_, CsvDownloadError>(valid_csv()) };
-        let result = run_daily_universe_boot(&cfg, fetch, 1, 1, false, Some(1)).await;
+        let result = run_daily_universe_boot(&cfg, fetch, 1, 1, false, Some(1), None).await;
         let msg = format!("{:#}", result.expect_err("reconcile must fail-closed"));
         assert!(
             msg.contains("reconcile"),

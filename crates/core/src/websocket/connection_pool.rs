@@ -61,14 +61,16 @@ pub struct WebSocketConnectionPool {
     connections: Vec<Arc<WebSocketConnection>>,
 
     /// Receiver for raw binary frames from all connections.
-    frame_receiver: mpsc::Receiver<bytes::Bytes>,
+    /// TICK-SEQ-01: each item is `(frame_seq, frame)` — the read-loop capture
+    /// sequence rides alongside the frame so `capture_seq` is replay-stable.
+    frame_receiver: mpsc::Receiver<(u64, bytes::Bytes)>,
 
     /// STAGE-C.2b: Retained clone of the shared frame sender. Held on the
     /// pool so boot-time WAL replay can inject recovered LiveFeed frames
     /// into the downstream consumer through the same mpsc the live
     /// connections write to. Without this, replayed frames would only be
     /// archived, never re-played into the live pipeline.
-    frame_sender: mpsc::Sender<bytes::Bytes>,
+    frame_sender: mpsc::Sender<(u64, bytes::Bytes)>,
 
     /// Stagger delay between connection spawns (milliseconds). 0 = no stagger.
     connection_stagger_ms: u64,
@@ -276,7 +278,7 @@ impl WebSocketConnectionPool {
     /// cleanly when the caller is done injecting. Covered end-to-end by
     /// the STAGE-C.2b replay-injection integration flow in main.rs.
     // TEST-EXEMPT: trivial Arc-bump clone accessor — `mpsc::Sender::clone` is tokio-tested; integration covered by main.rs replay-injection path
-    pub fn frame_sender_clone(&self) -> mpsc::Sender<bytes::Bytes> {
+    pub fn frame_sender_clone(&self) -> mpsc::Sender<(u64, bytes::Bytes)> {
         self.frame_sender.clone() // APPROVED: cold path — Arc bump for boot-time WAL replay, not per-tick
     }
 
@@ -332,7 +334,7 @@ impl WebSocketConnectionPool {
     ///
     /// The caller owns this receiver and reads raw binary frames from
     /// all active connections. Each frame is a complete Dhan binary packet.
-    pub fn take_frame_receiver(&mut self) -> mpsc::Receiver<bytes::Bytes> {
+    pub fn take_frame_receiver(&mut self) -> mpsc::Receiver<(u64, bytes::Bytes)> {
         // Replace with a dummy channel — receiver can only be taken once.
         let (_, dummy) = mpsc::channel(1);
         std::mem::replace(&mut self.frame_receiver, dummy)

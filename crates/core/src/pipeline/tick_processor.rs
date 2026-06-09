@@ -673,7 +673,7 @@ mod conservation_tests {
 // APPROVED: indices-only hot-loop entry point — params wire distinct tick/depth/broadcast/greeks/enricher/heartbeat collaborators; a struct would only relocate the count.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tick_processor<G: GreeksEnricher>(
-    mut frame_receiver: mpsc::Receiver<bytes::Bytes>,
+    mut frame_receiver: mpsc::Receiver<(u64, bytes::Bytes)>,
     mut tick_writer: Option<TickPersistenceWriter>,
     tick_broadcast: Option<broadcast::Sender<ParsedTick>>,
     mut greeks_enricher: Option<G>,
@@ -922,7 +922,13 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     // PR #4 (2026-05-19): `depth_seq_tracker` retired alongside the
     // deleted depth_sequence_tracker module. Depth feeds are gone.
 
-    while let Some(raw_frame) = frame_receiver.recv().await {
+    while let Some((frame_seq, raw_frame)) = frame_receiver.recv().await {
+        // TICK-SEQ-01: the read-loop `frame_seq` IS this frame's capture
+        // sequence (1 frame = 1 tick — review CRITICAL #1). It is replay-stable:
+        // WAL replay re-delivers the SAME frame_seq, so the persisted
+        // `capture_seq` matches the original. u64→i64 is safe (wall-nanos-seeded,
+        // always positive, « i64::MAX; keeps `ORDER BY capture_seq` correct).
+        let capture_seq = i64::try_from(frame_seq).unwrap_or(i64::MAX);
         let tick_start = Instant::now();
         frames_processed = frames_processed.saturating_add(1);
         m_frames.increment(1);
@@ -1215,9 +1221,9 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 // QuestDB write errors (connection down, buffer full, etc.).
                 if let Some(ref mut writer) = tick_writer {
                     let result = if let Some((_, _, life)) = lifecycle_for_tick {
-                        writer.append_tick_enriched(&tick, life)
+                        writer.append_tick_enriched_with_seq(&tick, life, capture_seq)
                     } else {
-                        writer.append_tick(&tick)
+                        writer.append_tick_with_seq(&tick, capture_seq)
                     };
                     match result {
                         Ok(()) => {
@@ -1411,9 +1417,13 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                                 prev_day_oi: enriched.prev_day_oi,
                                 phase: enriched.phase as u8,
                             };
-                            writer.append_tick_enriched(&tick, life)
+                            // TICK-SEQ-01 PR-2b (review C1): the Full-packet arm
+                            // MUST thread the same replay-stable capture_seq as the
+                            // Quote arm — else WAL replay re-stamps a fresh seq and
+                            // the row duplicates under the capture_seq dedup key.
+                            writer.append_tick_enriched_with_seq(&tick, life, capture_seq)
                         } else {
-                            writer.append_tick(&tick)
+                            writer.append_tick_with_seq(&tick, capture_seq)
                         };
                         match result {
                             Ok(()) => {
@@ -1965,12 +1975,24 @@ mod tests {
     // PR #2 (2026-05-18): movers tracker params removed from
     // `run_test_tick_processor` alongside the deleted modules.
     async fn run_test_tick_processor(
-        frame_receiver: mpsc::Receiver<bytes::Bytes>,
+        mut frame_receiver: mpsc::Receiver<bytes::Bytes>,
         tick_writer: Option<TickPersistenceWriter>,
         tick_broadcast: Option<broadcast::Sender<ParsedTick>>,
     ) {
+        // TICK-SEQ-01: bridge the test's `Bytes` channel to the production
+        // `(frame_seq, frame)` channel so the existing Bytes-sending test sites
+        // stay unchanged. frame_seq=0 is fine here — `capture_seq` is a non-key
+        // column in this slice (production stamps the real read-loop seq).
+        let (seq_tx, seq_rx) = mpsc::channel::<(u64, bytes::Bytes)>(256);
+        tokio::spawn(async move {
+            while let Some(frame) = frame_receiver.recv().await {
+                if seq_tx.send((0u64, frame)).await.is_err() {
+                    break;
+                }
+            }
+        });
         run_tick_processor::<tickvault_common::tick_types::NoopGreeksEnricher>(
-            frame_receiver,
+            seq_rx,
             tick_writer,
             tick_broadcast,
             None,                                                  // greeks_enricher

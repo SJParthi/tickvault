@@ -16,10 +16,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use tickvault_common::error_code::ErrorCode;
 use tracing::{error, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -65,6 +66,11 @@ impl WsType {
 #[derive(Debug)]
 struct WalRecord {
     ws_type: WsType,
+    /// TICK-SEQ-01: strictly-monotonic per-frame capture sequence, persisted in
+    /// the v2 record so replay reproduces it (replay-stable). PR-2a stamps it
+    /// internally at `append` time; a later slice hoists the stamp to the WS
+    /// read loop so it equals the per-tick `capture_seq`.
+    frame_seq: u64,
     // Zero-tick-loss PR-8a (H1): `Bytes` (Arc-refcounted) so the WS read
     // loop hands ownership to the disk-writer thread with an O(1) refcount
     // bump instead of a per-frame `Vec<u8>` malloc. Derefs to `&[u8]`, so
@@ -87,6 +93,9 @@ pub enum AppendOutcome {
 pub struct ReplayedFrame {
     pub ws_type: WsType,
     pub frame: Vec<u8>,
+    /// TICK-SEQ-01: the `frame_seq` read back from the v2 record (replay-stable).
+    /// `0` for legacy v1 records that predate the field.
+    pub frame_seq: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -110,13 +119,35 @@ pub struct ReplayedFrame {
 const SPILL_CHANNEL_CAPACITY: usize = 131_072;
 
 /// WAL file magic bytes — segment-local sanity check.
+///
+/// TICK-SEQ-01 PR-2a: `TVW1` = v1 record (no `frame_seq`); `TVW2` = v2 record
+/// (carries an 8-byte LE `frame_seq` immediately after `ws_type`). Replay
+/// accepts BOTH, so segments written before this change still recover. NEW
+/// records are always written v2.
 const WAL_MAGIC: [u8; 4] = *b"TVW1";
+const WAL_MAGIC_V2: [u8; 4] = *b"TVW2";
+
+/// Minimum on-disk record size per version, used by the replay loop guard:
+/// v1 = magic(4)+ws_type(1)+len(4)+crc(4) = 13; v2 inserts frame_seq(8) = 21.
+const WAL_MIN_RECORD_V1: usize = 13;
+const WAL_MIN_RECORD_V2: usize = 21;
 
 /// Rotate to a new segment after this many bytes.
 const WAL_SEGMENT_MAX_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Writer buffer size — large enough to batch-fsync hundreds of records.
 const WAL_WRITER_BUFFER: usize = 256 * 1024;
+
+/// Backoff before the supervisor re-enters the writer loop after a panic or a
+/// fatal return, so a hard-failing writer cannot pin a CPU in a hot respawn
+/// loop. Mirrors the WS-GAP-05 pool-supervisor / DISK-WATCHER-01 backoff.
+const WAL_WRITER_RESPAWN_BACKOFF: Duration = Duration::from_millis(200);
+
+/// Backoff after a transient disk write/flush/segment-open error before the
+/// writer retries, so a full or contended disk does not spin. The thread stays
+/// alive and keeps draining the channel — it never tears down the durable
+/// WAL floor for a transient I/O hiccup.
+const WAL_WRITER_IO_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------------------
 // WsFrameSpill
@@ -145,8 +176,48 @@ impl WsFrameSpill {
         thread::Builder::new()
             .name("ws-frame-spill-writer".to_string())
             .spawn(move || {
-                if let Err(err) = writer_loop(rx, &wal_dir_for_thread, &persisted_for_thread) {
-                    error!(error = %err, "ws-frame-spill-writer exited with error");
+                // Supervisor loop (mirrors WS-GAP-05 pool supervisor +
+                // DISK-WATCHER-01). A panic or a fatal return from the writer
+                // must NOT silently kill the durable WAL floor: we re-enter
+                // `writer_loop` with the SAME `rx`, so `append()` never sees
+                // `Disconnected` and every Dhan frame keeps being captured.
+                // `rx` is owned here and only borrowed per iteration → it
+                // outlives any panic, keeping the channel alive across respawns.
+                loop {
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        writer_loop(&rx, &wal_dir_for_thread, &persisted_for_thread)
+                    }));
+                    match outcome {
+                        Ok(Ok(())) => {
+                            // Clean shutdown: all senders dropped, channel closed.
+                            info!("ws-frame-spill-writer exited cleanly (channel closed)");
+                            break;
+                        }
+                        Ok(Err(err)) => {
+                            error!(
+                                code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                                error = %err,
+                                "WAL spill writer returned error — respawning to preserve durable WAL floor"
+                            );
+                            metrics::counter!(
+                                "tv_ws_frame_spill_writer_respawn_total",
+                                "reason" => "error"
+                            )
+                            .increment(1);
+                        }
+                        Err(_panic) => {
+                            error!(
+                                code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                                "CRITICAL: WAL spill writer PANICKED — respawning to preserve durable WAL floor"
+                            );
+                            metrics::counter!(
+                                "tv_ws_frame_spill_writer_respawn_total",
+                                "reason" => "panic"
+                            )
+                            .increment(1);
+                        }
+                    }
+                    thread::sleep(WAL_WRITER_RESPAWN_BACKOFF);
                 }
             })
             .map_err(|e| anyhow::anyhow!("spawn spill writer thread: {e}"))?;
@@ -158,6 +229,21 @@ impl WsFrameSpill {
         })
     }
 
+    /// Test-only constructor whose writer thread is already gone: the
+    /// receiver is dropped immediately, so every `append()` deterministically
+    /// hits the `TrySendError::Disconnected` arm. Used to prove that the
+    /// writer-dead drop path is loud (WS-SPILL-02), not silent.
+    #[cfg(test)]
+    fn new_with_dead_writer_for_test() -> Self {
+        let (tx, rx) = bounded::<WalRecord>(SPILL_CHANNEL_CAPACITY);
+        drop(rx); // no writer ever runs → channel is Disconnected for sends
+        Self {
+            spill_tx: tx,
+            drop_critical: Arc::new(AtomicU64::new(0)),
+            persisted_total: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
     /// Hot path. Non-blocking. O(1). Zero-allocation: accepts anything
     /// convertible into `Bytes` and sends it over the pre-allocated crossbeam
     /// ring — no heap allocation occurs here. The WS read loop passes
@@ -166,8 +252,23 @@ impl WsFrameSpill {
     /// (also zero-copy), so existing callers keep working unchanged.
     // TEST-EXEMPT: covered by test_append_spill_and_replay_roundtrip + test_drop_counter_increments_when_channel_full; the Bytes-clone hand-off is proven zero-alloc by crates/core/tests/dhat_ws_reader_zero_alloc.rs::dhat_ws_reader_tail_zero_alloc
     pub fn append(&self, ws_type: WsType, frame: impl Into<Bytes>) -> AppendOutcome {
+        self.append_with_seq(ws_type, frame, next_frame_seq())
+    }
+
+    /// Like [`WsFrameSpill::append`] but stamps the caller-provided `frame_seq`
+    /// (the WS read loop's value) so the SAME sequence is persisted in the WAL
+    /// AND shared with the live broadcast → `ticks.capture_seq` (replay-stable).
+    /// TICK-SEQ-01 threading slice. Hot path, O(1), zero-alloc.
+    // TEST-EXEMPT: identical try_send path as `append` (covered by test_append_spill_and_replay_roundtrip + test_wal_v2_roundtrip_preserves_frame_seq); frame_seq plumbing covered by chaos_ws_frame_wal_replay + the read-loop integration.
+    pub fn append_with_seq(
+        &self,
+        ws_type: WsType,
+        frame: impl Into<Bytes>,
+        frame_seq: u64,
+    ) -> AppendOutcome {
         let record = WalRecord {
             ws_type,
+            frame_seq,
             frame: frame.into(),
         };
         match self.spill_tx.try_send(record) {
@@ -198,7 +299,36 @@ impl WsFrameSpill {
                 .increment(1);
                 AppendOutcome::Dropped
             }
-            Err(TrySendError::Disconnected(_)) => AppendOutcome::Dropped,
+            Err(TrySendError::Disconnected(_)) => {
+                // WS-SPILL-02: the writer thread was dead at this instant
+                // (channel Disconnected). The WS-SPILL-01 supervisor respawns
+                // it, so this window is tiny and practically unreachable — but
+                // it is a genuine durable-frame loss, so it must be LOUD, not
+                // a silent return (the pre-2026-06-09 behaviour).
+                let prev = self.drop_critical.fetch_add(1, Ordering::Relaxed);
+                error!(
+                    code = ErrorCode::WsSpill02FrameDropped.code_str(),
+                    ws_type = ws_type.as_str(),
+                    drop_count = prev + 1,
+                    "CRITICAL: WAL spill writer DEAD — frame dropped (durable floor lost)"
+                );
+                // Same label set as the Full arm so existing alerts on
+                // `tv_ws_frame_spill_drop_critical` fire for this cause too.
+                metrics::counter!(
+                    "tv_ws_frame_spill_drop_critical",
+                    "ws_type" => ws_type.as_str()
+                )
+                .increment(1);
+                // The distinguishing cause lives on the SLA counter's `source`
+                // label (Full arm uses "spill_drop_critical").
+                metrics::counter!(
+                    "tv_ticks_lost_total",
+                    "source" => "spill_writer_dead",
+                    "ws_type" => ws_type.as_str(),
+                )
+                .increment(1);
+                AppendOutcome::Dropped
+            }
         }
     }
 
@@ -218,56 +348,195 @@ impl WsFrameSpill {
 // ---------------------------------------------------------------------------
 
 fn writer_loop(
-    rx: Receiver<WalRecord>,
+    rx: &Receiver<WalRecord>,
     wal_dir: &Path,
     persisted: &AtomicU64,
 ) -> anyhow::Result<()> {
-    let mut current = open_new_segment(wal_dir)?;
+    // `None` = no open segment; the next record reopens one. A transient disk
+    // error sets this back to `None` instead of propagating out of the thread.
+    // The thread therefore NEVER dies on a transient I/O hiccup — it keeps
+    // draining the channel so `append()` never observes `Disconnected` and the
+    // durable WAL floor survives. The ONLY clean exit is the channel closing.
+    let mut current: Option<BufWriter<File>> = open_segment_resilient(wal_dir);
     let mut bytes_written: u64 = 0;
 
     loop {
-        // Block until at least one record arrives. Exit cleanly when all
-        // senders dropped.
+        // Block until at least one record arrives. Exit cleanly (and ONLY here)
+        // when all senders are dropped — that is the clean-shutdown signal.
         let first = match rx.recv() {
             Ok(r) => r,
             Err(_) => {
-                drop(current.flush());
+                if let Some(mut w) = current.take() {
+                    drop(w.flush());
+                }
                 info!("ws-frame-spill-writer channel closed; exiting");
                 return Ok(());
             }
         };
-        write_record(&mut current, &first)?;
-        bytes_written += record_disk_size(&first);
-        persisted.fetch_add(1, Ordering::Relaxed);
+
+        #[cfg(test)]
+        maybe_test_panic(&first);
+        bytes_written += persist_record_resilient(&mut current, wal_dir, &first, persisted);
 
         // Drain up to N more without blocking so we batch-flush.
         for _ in 0..256 {
             match rx.try_recv() {
                 Ok(r) => {
-                    write_record(&mut current, &r)?;
-                    bytes_written += record_disk_size(&r);
-                    persisted.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(test)]
+                    maybe_test_panic(&r);
+                    bytes_written += persist_record_resilient(&mut current, wal_dir, &r, persisted);
                 }
                 Err(_) => break,
             }
         }
 
-        current.flush()?;
+        if let Some(w) = current.as_mut()
+            && let Err(err) = w.flush()
+        {
+            report_io_error("flush", &err);
+            // Drop the possibly-broken writer; the next record reopens it.
+            current = None;
+            thread::sleep(WAL_WRITER_IO_RETRY_BACKOFF);
+        }
 
         if bytes_written >= WAL_SEGMENT_MAX_BYTES {
-            drop(current.flush());
-            drop(current);
-            current = open_new_segment(wal_dir)?;
+            if let Some(mut w) = current.take() {
+                drop(w.flush());
+            }
+            current = open_segment_resilient(wal_dir);
             bytes_written = 0;
         }
     }
 }
 
+/// Open a fresh WAL segment, converting any error into `None` + a loud
+/// `WS-SPILL-01` log + counter so the writer thread keeps draining the channel
+/// instead of dying. The next record retries the open.
+fn open_segment_resilient(wal_dir: &Path) -> Option<BufWriter<File>> {
+    match open_new_segment(wal_dir) {
+        Ok(w) => Some(w),
+        Err(err) => {
+            error!(
+                code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                stage = "open_segment",
+                error = %err,
+                "WAL spill writer could not open a segment — will retry; thread stays alive"
+            );
+            metrics::counter!(
+                "tv_ws_frame_spill_write_errors_total",
+                "stage" => "open_segment"
+            )
+            .increment(1);
+            None
+        }
+    }
+}
+
+/// Durably write one record, reopening the segment first if needed. Returns the
+/// on-disk byte count actually persisted (0 if the write could not land).
+/// NEVER propagates an error — a transient disk failure must not kill the
+/// writer thread (that would silently end durable capture of every frame).
+fn persist_record_resilient(
+    current: &mut Option<BufWriter<File>>,
+    wal_dir: &Path,
+    r: &WalRecord,
+    persisted: &AtomicU64,
+) -> u64 {
+    if current.is_none() {
+        *current = open_segment_resilient(wal_dir);
+    }
+    let Some(w) = current.as_mut() else {
+        // No segment available (disk full / unwritable). The frame still
+        // reaches the in-memory broadcast + the persist-side ring→spill→DLQ;
+        // only the WAL belt is missing for this frame, which we count + alarm.
+        metrics::counter!(
+            "tv_ws_frame_spill_write_errors_total",
+            "stage" => "no_segment"
+        )
+        .increment(1);
+        return 0;
+    };
+    match write_record(w, r) {
+        Ok(()) => {
+            persisted.fetch_add(1, Ordering::Relaxed);
+            record_disk_size(r)
+        }
+        Err(err) => {
+            report_io_error("write_record", &err);
+            // Drop the possibly-corrupt writer; reopen on the next record.
+            *current = None;
+            thread::sleep(WAL_WRITER_IO_RETRY_BACKOFF);
+            0
+        }
+    }
+}
+
+fn report_io_error(stage: &'static str, err: &std::io::Error) {
+    error!(
+        code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+        stage,
+        error = %err,
+        "WAL spill writer I/O error — reopening segment; thread stays alive"
+    );
+    metrics::counter!("tv_ws_frame_spill_write_errors_total", "stage" => stage).increment(1);
+}
+
+/// Test-only panic injection: a record whose frame equals the sentinel makes
+/// the writer thread panic, exercising the supervisor's catch-and-respawn path
+/// (WS-SPILL-01). Interference-free — no other test sends this sentinel, so no
+/// shared mutable state is needed.
+#[cfg(test)]
+const TEST_PANIC_SENTINEL: &[u8] = b"__WS_SPILL_TEST_PANIC_SENTINEL__";
+
+#[cfg(test)]
+fn maybe_test_panic(r: &WalRecord) {
+    if r.frame.as_ref() == TEST_PANIC_SENTINEL {
+        panic!("test-injected writer panic (sentinel frame)");
+    }
+}
+
+/// Process-wide strictly-monotonic frame sequence: `max(prev+1, wall_nanos)`.
+/// Lock-free CAS, O(1), zero heap alloc. The WS read loop calls this ONCE per
+/// frame and passes the value to BOTH [`WsFrameSpill::append_with_seq`] and the
+/// live broadcast, so the WAL record and the `ticks.capture_seq` column carry
+/// the identical replay-stable value.
+static WAL_FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
+
+pub fn next_frame_seq() -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    loop {
+        let prev = WAL_FRAME_SEQ.load(Ordering::Relaxed);
+        let next = prev.saturating_add(1).max(now);
+        if WAL_FRAME_SEQ
+            .compare_exchange_weak(prev, next, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok()
+        {
+            return next;
+        }
+    }
+}
+
 fn write_record(w: &mut BufWriter<File>, r: &WalRecord) -> std::io::Result<()> {
-    let frame_len = r.frame.len() as u32;
-    let crc = crc32_ieee_of(&[&[r.ws_type.as_u8()], &frame_len.to_le_bytes()[..], &r.frame]);
-    w.write_all(&WAL_MAGIC)?;
+    // TICK-SEQ-01: always write the v2 record (TVW2 + 8-byte LE frame_seq after
+    // ws_type). `u32::try_from` makes an over-large frame explicit rather than
+    // silently truncating (frames are ≤162 B in production).
+    let frame_len = u32::try_from(r.frame.len()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "WAL frame > u32::MAX")
+    })?;
+    let frame_seq = r.frame_seq.to_le_bytes();
+    // CRC covers ws_type || frame_seq || len || frame.
+    let crc = crc32_ieee_of(&[
+        &[r.ws_type.as_u8()],
+        &frame_seq[..],
+        &frame_len.to_le_bytes()[..],
+        &r.frame,
+    ]);
+    w.write_all(&WAL_MAGIC_V2)?;
     w.write_all(&[r.ws_type.as_u8()])?;
+    w.write_all(&frame_seq)?;
     w.write_all(&frame_len.to_le_bytes())?;
     w.write_all(&r.frame)?;
     w.write_all(&crc.to_le_bytes())?;
@@ -275,8 +544,8 @@ fn write_record(w: &mut BufWriter<File>, r: &WalRecord) -> std::io::Result<()> {
 }
 
 fn record_disk_size(r: &WalRecord) -> u64 {
-    // magic(4) + ws_type(1) + len(4) + frame + crc(4)
-    4 + 1 + 4 + r.frame.len() as u64 + 4
+    // v2: magic(4) + ws_type(1) + frame_seq(8) + len(4) + frame + crc(4) = 21 + frame
+    WAL_MIN_RECORD_V2 as u64 + r.frame.len() as u64
 }
 
 fn open_new_segment(wal_dir: &Path) -> anyhow::Result<BufWriter<File>> {
@@ -399,10 +668,26 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
 
     let mut out = Vec::new();
     let mut i = 0usize;
-    // Minimum record: magic(4) + ws_type(1) + len(4) + crc(4) = 13
-    while i + 13 <= buf.len() {
-        if buf[i..i + 4] != WAL_MAGIC {
+    // Smallest record is v1 (13 bytes); v2 is 21. Gate the OUTER loop on the v1
+    // minimum, then re-check the version-specific minimum after the magic check
+    // so a partial v2 tail can never be read as if its frame_seq were payload.
+    while i + WAL_MIN_RECORD_V1 <= buf.len() {
+        let magic = &buf[i..i + 4];
+        let is_v2 = magic == WAL_MAGIC_V2;
+        let is_v1 = magic == WAL_MAGIC;
+        if !is_v1 && !is_v2 {
             warn!(segment = ?path, offset = i, "WAL magic mismatch; stopping at boundary");
+            break;
+        }
+        // Version disambiguation + per-version minimum-size guard (security
+        // review HIGH): a v2 record needs 21 bytes before its variable frame.
+        let min_rec = if is_v2 {
+            WAL_MIN_RECORD_V2
+        } else {
+            WAL_MIN_RECORD_V1
+        };
+        if i + min_rec > buf.len() {
+            warn!(segment = ?path, offset = i, is_v2, "truncated header at tail");
             break;
         }
         let ws_byte = buf[i + 4];
@@ -413,28 +698,64 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
                 break;
             }
         };
-        let len_bytes: [u8; 4] = match buf[i + 5..i + 9].try_into() {
+        // v1: [magic|ws|len|frame|crc]; v2: [magic|ws|frame_seq(8)|len|frame|crc].
+        let (frame_seq, len_off) = if is_v2 {
+            let seq_bytes: [u8; 8] = match buf[i + 5..i + 13].try_into() {
+                Ok(b) => b,
+                Err(_) => break,
+            };
+            (u64::from_le_bytes(seq_bytes), i + 13)
+        } else {
+            (0u64, i + 5)
+        };
+        let len_bytes: [u8; 4] = match buf[len_off..len_off + 4].try_into() {
             Ok(b) => b,
             Err(_) => break,
         };
         let frame_len = u32::from_le_bytes(len_bytes) as usize;
-        let record_end = i + 9 + frame_len + 4;
+        let frame_off = len_off + 4;
+        // checked_add chain (security review MEDIUM — defence-in-depth).
+        let record_end = match frame_off
+            .checked_add(frame_len)
+            .and_then(|v| v.checked_add(4))
+        {
+            Some(v) => v,
+            None => {
+                warn!(segment = ?path, offset = i, frame_len, "record length overflow; stopping");
+                break;
+            }
+        };
         if record_end > buf.len() {
             warn!(segment = ?path, offset = i, frame_len, "truncated record at tail");
             break;
         }
-        let frame = buf[i + 9..i + 9 + frame_len].to_vec();
-        let crc_bytes: [u8; 4] = match buf[i + 9 + frame_len..record_end].try_into() {
+        let frame = buf[frame_off..frame_off + frame_len].to_vec();
+        let crc_bytes: [u8; 4] = match buf[frame_off + frame_len..record_end].try_into() {
             Ok(b) => b,
             Err(_) => break,
         };
         let expected = u32::from_le_bytes(crc_bytes);
-        let actual = crc32_ieee_of(&[&[ws_byte], &(frame_len as u32).to_le_bytes()[..], &frame]);
+        // CRC covers the version's exact header bytes: v2 includes frame_seq.
+        let len_le = (frame_len as u32).to_le_bytes();
+        let actual = if is_v2 {
+            crc32_ieee_of(&[
+                &[ws_byte],
+                &frame_seq.to_le_bytes()[..],
+                &len_le[..],
+                &frame,
+            ])
+        } else {
+            crc32_ieee_of(&[&[ws_byte], &len_le[..], &frame])
+        };
         if actual != expected {
             warn!(segment = ?path, offset = i, expected, actual, "CRC mismatch; stopping");
             break;
         }
-        out.push(ReplayedFrame { ws_type, frame });
+        out.push(ReplayedFrame {
+            ws_type,
+            frame,
+            frame_seq,
+        });
         i = record_end;
     }
     Ok(out)
@@ -518,6 +839,103 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- TICK-SEQ-01 PR-2a: TVW2 frame_seq format ---------------------------
+
+    /// Encodes a legacy v1 (`TVW1`, no frame_seq) record exactly as the
+    /// pre-TICK-SEQ-01 writer did, so back-compat replay can be exercised.
+    fn encode_v1_record(ws: WsType, frame: &[u8]) -> Vec<u8> {
+        let len = (frame.len() as u32).to_le_bytes();
+        let crc = crc32_ieee_of(&[&[ws.as_u8()], &len[..], frame]);
+        let mut v = Vec::new();
+        v.extend_from_slice(&WAL_MAGIC);
+        v.push(ws.as_u8());
+        v.extend_from_slice(&len);
+        v.extend_from_slice(frame);
+        v.extend_from_slice(&crc.to_le_bytes());
+        v
+    }
+
+    #[test]
+    fn test_wal_v2_roundtrip_preserves_frame_seq() {
+        let dir = tmp_dir("v2-roundtrip");
+        {
+            let spill = WsFrameSpill::new(&dir).unwrap();
+            spill.append(WsType::LiveFeed, vec![9, 8, 7]);
+            spill.append(WsType::LiveFeed, vec![6, 5, 4]);
+            wait_until_persisted(&spill, 2);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        let frames = replay_all(&dir).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].frame, vec![9, 8, 7]);
+        assert_eq!(frames[1].frame, vec![6, 5, 4]);
+        // frame_seq is stamped + persisted + read back; strictly increasing.
+        assert!(frames[0].frame_seq > 0, "v2 frame_seq must be non-zero");
+        assert!(
+            frames[1].frame_seq > frames[0].frame_seq,
+            "frame_seq must be strictly increasing across records: {} !> {}",
+            frames[1].frame_seq,
+            frames[0].frame_seq
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_wal_v1_backcompat_replay() {
+        // A v1 segment written before this change must still recover, with
+        // frame_seq defaulting to 0 (the new key keeps v1 on payload_hash).
+        let dir = tmp_dir("v1-backcompat");
+        let seg = dir.join("ws-frames-00000000000000000001.wal");
+        let mut bytes = encode_v1_record(WsType::LiveFeed, &[1, 2, 3, 4]);
+        bytes.extend_from_slice(&encode_v1_record(WsType::OrderUpdate, b"{\"a\":2}"));
+        std::fs::write(&seg, &bytes).unwrap();
+
+        let frames = replay_all(&dir).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].ws_type, WsType::LiveFeed);
+        assert_eq!(frames[0].frame, vec![1, 2, 3, 4]);
+        assert_eq!(frames[0].frame_seq, 0, "legacy v1 record → frame_seq 0");
+        assert_eq!(frames[1].ws_type, WsType::OrderUpdate);
+        assert_eq!(frames[1].frame_seq, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_wal_v2_min_record_size_guard_no_panic() {
+        // A 13-byte buffer passes the v1 outer guard but is a TRUNCATED v2
+        // header (needs 21). The parser must reject it cleanly — no panic, no
+        // OOB read, zero frames (security review HIGH: min-size guard).
+        let dir = tmp_dir("v2-truncated");
+        let seg = dir.join("ws-frames-00000000000000000002.wal");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&WAL_MAGIC_V2); // 4
+        bytes.push(WsType::LiveFeed.as_u8()); // +1
+        bytes.extend_from_slice(&[0u8; 8]); // +8 frame_seq, but NO len/frame/crc → 13 total
+        assert_eq!(bytes.len(), 13);
+        std::fs::write(&seg, &bytes).unwrap();
+
+        let frames = replay_all(&dir).unwrap(); // must not panic
+        assert!(
+            frames.is_empty(),
+            "truncated v2 header must recover 0 frames"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_next_frame_seq_strictly_monotonic() {
+        let mut prev = next_frame_seq();
+        for _ in 0..5_000 {
+            let cur = next_frame_seq();
+            assert!(
+                cur > prev,
+                "frame_seq must strictly increase: {cur} !> {prev}"
+            );
+            prev = cur;
+        }
+    }
+
     #[test]
     fn test_replay_handles_missing_dir() {
         let dir = std::env::temp_dir().join("tv-wal-nonexistent-xyz");
@@ -597,6 +1015,104 @@ mod tests {
         assert_eq!(outcome, AppendOutcome::Spilled);
         assert_eq!(spill.drop_critical_count(), 0);
         drop(spill);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_disconnected_arm_alarms() {
+        // WS-SPILL-02: when the writer thread is dead (channel Disconnected),
+        // `append` must DROP LOUDLY — increment drop_critical — not return
+        // silently as it did before 2026-06-09.
+        let spill = WsFrameSpill::new_with_dead_writer_for_test();
+        assert_eq!(spill.drop_critical_count(), 0);
+        let outcome = spill.append(WsType::LiveFeed, vec![9, 9, 9]);
+        assert_eq!(outcome, AppendOutcome::Dropped);
+        assert_eq!(
+            spill.drop_critical_count(),
+            1,
+            "writer-dead drop must be counted (WS-SPILL-02), never silent"
+        );
+    }
+
+    #[test]
+    fn test_open_segment_resilient_returns_none_on_unopenable_path() {
+        // A path *under a regular file* can never host a segment (ENOTDIR,
+        // even for root) → resilient open returns None with NO panic and NO
+        // error propagation, proving a disk failure cannot tear down the
+        // writer thread. A good dir still opens.
+        let dir = tmp_dir("resilient-open");
+        let file_path = dir.join("not-a-dir");
+        std::fs::write(&file_path, b"x").unwrap();
+        let bad = file_path.join("under-a-file");
+        assert!(open_segment_resilient(&bad).is_none());
+        assert!(open_segment_resilient(&dir).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_writer_survives_unwritable_dir_then_recovers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_dir("unwritable");
+        // Make the WAL dir read-only so a non-root writer cannot create a
+        // segment. (If the test runs as root the writes simply succeed — the
+        // assertions below still hold; the deterministic open-failure proof is
+        // `test_open_segment_resilient_returns_none_on_unopenable_path`.)
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let spill = WsFrameSpill::new(&dir).unwrap();
+        // Channel still accepts; the writer logs WS-SPILL-01 + counts the error
+        // but DOES NOT die.
+        assert_eq!(
+            spill.append(WsType::LiveFeed, vec![1, 2, 3]),
+            AppendOutcome::Spilled
+        );
+        std::thread::sleep(Duration::from_millis(80));
+        // Thread still alive → channel NOT Disconnected → append still Spilled.
+        assert_eq!(
+            spill.append(WsType::LiveFeed, vec![4, 5, 6]),
+            AppendOutcome::Spilled
+        );
+        assert_eq!(
+            spill.drop_critical_count(),
+            0,
+            "no Disconnected drops — the writer thread must stay alive"
+        );
+        // Restore write permission; the recovered writer must now persist.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        spill.append(WsType::LiveFeed, vec![7, 8, 9]);
+        wait_until_persisted(&spill, 1);
+        drop(spill);
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_writer_respawns_after_panic_sentinel() {
+        let dir = tmp_dir("respawn");
+        let spill = WsFrameSpill::new(&dir).unwrap();
+        // A normal frame persists.
+        spill.append(WsType::LiveFeed, b"before".to_vec());
+        wait_until_persisted(&spill, 1);
+        // Inject a panic in the writer thread (consumed sentinel record).
+        assert_eq!(
+            spill.append(WsType::LiveFeed, TEST_PANIC_SENTINEL.to_vec()),
+            AppendOutcome::Spilled
+        );
+        // Give the supervisor time to catch the panic and respawn the writer.
+        std::thread::sleep(Duration::from_millis(400));
+        // The respawned writer keeps the channel alive (NOT Disconnected) and
+        // the post-respawn frame lands durably — proving WS-SPILL-01 respawn.
+        assert_eq!(
+            spill.append(WsType::LiveFeed, b"after".to_vec()),
+            AppendOutcome::Spilled
+        );
+        wait_until_persisted(&spill, 2); // "before" + "after" (sentinel was consumed)
+        assert_eq!(
+            spill.drop_critical_count(),
+            0,
+            "respawn must keep the channel alive — no Disconnected drops"
+        );
+        drop(spill);
+        std::thread::sleep(Duration::from_millis(50));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

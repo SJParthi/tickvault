@@ -61,10 +61,12 @@ const REQUIRED_METRICS: &[(&str, &str)] = &[
     // --- Zero-Tick-Loss SLA (Parthiban 2026-04-20) ---
     (
         "tv_ticks_lost_total",
-        "Explicit zero-tick-loss SLA counter. Incremented from TWO sites: \
+        "Explicit zero-tick-loss SLA counter. Incremented from THREE sites: \
          (1) `ws_frame_spill::append` when the WAL spill channel is full \
          (source=\"spill_drop_critical\"); (2) `tick_persistence::write_to_dlq` \
-         when both ring buffer and disk spill failed (source=\"dlq_fallback\"). \
+         when both ring buffer and disk spill failed (source=\"dlq_fallback\"); \
+         (3) `ws_frame_spill::append` when the WAL writer thread is dead at the \
+         append instant (source=\"spill_writer_dead\", WS-SPILL-02). \
          MUST be 0 in production. Labelled by `source` and `ws_type` so \
          Grafana heatmaps can attribute losses per WebSocket. \
          CI assertion: asserted == 0 in `zero_tick_loss_sla_guard` tests.",
@@ -83,6 +85,21 @@ const REQUIRED_METRICS: &[(&str, &str)] = &[
          (CRC32 mismatch or truncated tail). MUST be 0 in production. \
          Non-zero indicates disk corruption, abrupt kills mid-write, or \
          tampering.",
+    ),
+    (
+        "tv_ws_frame_spill_writer_respawn_total",
+        "WS-SPILL-01: the WAL frame-spill writer thread died (panic or fatal \
+         return) and the supervisor respawned it with the same channel, so the \
+         durable WAL floor survives and `append` never sees Disconnected. \
+         Labelled by `reason` (panic|error). A sustained non-zero rate means \
+         the underlying disk is failing — High-severity Telegram page.",
+    ),
+    (
+        "tv_ws_frame_spill_write_errors_total",
+        "WS-SPILL-01: a transient disk write/flush/segment-open error inside the \
+         WAL writer thread. The thread alarms, reopens a fresh segment, and keeps \
+         draining instead of dying. Labelled by `stage` \
+         (write_record|flush|open_segment|no_segment). MUST be 0 in production.",
     ),
     // --- Session 1 (A2 dead-letter queue) ---
     (
