@@ -88,11 +88,39 @@ since payload_hash is still written. `git revert <sha>`.
   a sustained high rate flags a slow/backward clock (BOOT-03 territory).
 - The chaos test is the ratchet; cross-verify 1m unaffected (candles already correct).
 
-## Adversarial review (mandatory — architecturally significant)
+## Adversarial review (COMPLETE — 2026-06-09, 3 agents on the design)
 
-3 agents on the design AND the diff: hot-path-reviewer (atomic stamp zero-alloc, no contention on the
-read loop), security-reviewer (WAL format change, no injection), general-purpose hostile (replay
-back-compat, restart-mid-second collision, NTP backward, u64 wrap, migration idempotency).
+hot-path-reviewer + security-reviewer + general-purpose(hostile) reviewed the step-2 design
+against the real code. Caught **4 CRITICAL + 4 HIGH** before any risky code. Findings → fixes
+(all folded into the REVISED design below):
+
+| Sev | Finding | Fix (locked) |
+|---|---|---|
+| CRITICAL | `f(frame_seq, packet_index)` — `dispatch_frame` is 1 frame = 1 tick; no packet_index exists | `capture_seq := frame_seq` **1:1** |
+| CRITICAL | persist still calls step-1 `next_capture_seq()` → WAL replay re-stamps → duplicate rows | **DELETE** persist-time stamp; capture_seq rides frame→persist |
+| CRITICAL | reuse magic `TVW1` → v1 records misparsed under new key → dup/loss | **`TVW2`** magic; **v1 segments stay on `payload_hash` key** |
+| CRITICAL | key-flip via existing path can **auto-`DROP TABLE` ticks** (SEBI!) | **NEVER auto-DROP populated `ticks`**; in-place `DEDUP ENABLE` only |
+| HIGH | live vs WAL capture_seq divergence (dual stamping) | single source = frame-stamped; test `live==replayed` |
+| HIGH | WAL replay loop guard `i+13` is v1; v2 = 21 + mid-record bounds check | bump guard + intermediate bounds check before reading capture_seq |
+| HIGH | in-place DEDUP key-set change may be unsupported by QuestDB | verify in-place support FIRST; else gated migration (never DROP) |
+| MED | u64→i64 bit-cast → negative → breaks `ORDER BY` | keep frame_seq positive (wall-nanos clamp), no bit-cast; `checked_add` |
+
+## REVISED step-2 design — operator-approved SAFE SPLIT (2026-06-09)
+
+Operator chose **Safe split (2 PRs)**. capture_seq is threaded WITHOUT adding a field to
+`ParsedTick` (126 construction sites) — it rides as a value alongside the tick from the WAL
+frame to `build_tick_row` (storage-path sidecar / ParsedTick field — implementer picks the
+lower-churn option; if ParsedTick field, scripted update + add `Default`).
+
+- **PR-2a (additive, zero behaviour change, fully reversible):** stamp `frame_seq` ONCE in the
+  WS read loop (`connection.rs`, seeded from wall-nanos like step-1); persist it in a **`TVW2`**
+  WAL record (8 bytes; v1 `TVW1` still replays); thread it through the broadcast
+  `(frame_seq, Bytes)` → `tick_processor` → `build_tick_row` so the `capture_seq` COLUMN is
+  replay-stable; **DELETE the persist-time `next_capture_seq()`**; **key STAYS `payload_hash`**.
+- **PR-2b (the fix):** flip the dedup key to `(ts, security_id, segment, capture_seq)` **in place**
+  (hard guard: never DROP a populated `ticks`; keep payload_hash as a column); v1-replay path
+  stays on payload_hash; ship the `45→75→45` chaos + replay-twice idempotency + `live==replayed`.
+
 
 ## Per-Item Guarantee Matrix
 
@@ -107,20 +135,15 @@ recoverable text. Composite `(security_id, exchange_segment)` uniqueness (I-P1-1
 
 ## Plan Items
 
-- [ ] `capture_seq` monotonic stamper (AtomicU64, `max(prev+1, now)`) at WS read
-  - Files: crates/core/src/websocket/connection.rs (+ common constant)
-  - Tests: test_capture_seq_strictly_monotonic, test_capture_seq_clamps_backward_clock
-- [ ] WAL frame format v2 carries capture_seq (+ versioned back-compat replay)
-  - Files: crates/storage/src/ws_frame_spill.rs
-  - Tests: test_wal_v2_roundtrip_capture_seq, test_wal_v1_backcompat_replay
-- [ ] Thread capture_seq frame→ParsedTick→persist; ticks gains capture_seq column + new DEDUP key
-  - Files: crates/common/src/tick_types.rs, crates/storage/src/tick_persistence.rs
-  - Tests: test_dedup_key_includes_capture_seq, test_tick_dedup_key_includes_segment (unchanged)
-- [ ] Chaos regression for the operator's index burst
-  - Files: crates/storage/tests/chaos_index_same_value_burst_preserved.rs
-  - Tests: chaos_index_same_value_burst_preserved, chaos_capture_seq_replay_idempotent
-- [ ] data-integrity.md + dedup meta-guard updated
-  - Files: .claude/rules/project/data-integrity.md, crates/storage/tests/dedup_segment_meta_guard.rs
+- [x] **Step 1 (PR #1063, MERGED):** `capture_seq LONG` column + monotonic stamper at persist time; key UNCHANGED (zero regression)
+  - Files: crates/storage/src/tick_persistence.rs
+  - Tests: test_next_capture_seq_strictly_monotonic_and_unique, test_ticks_ddl_contains_capture_seq_long, test_build_tick_row_emits_capture_seq_column, test_dedup_key_unchanged_in_step1
+- [ ] **PR-2a:** `frame_seq` stamped once in WS read loop (wall-nanos seed) → `TVW2` WAL record (v1 back-compat) → broadcast `(frame_seq, Bytes)` → `tick_processor` → `build_tick_row`; DELETE persist-time stamp; key STAYS payload_hash
+  - Files: crates/core/src/websocket/connection.rs, crates/core/src/websocket/connection_pool.rs, crates/storage/src/ws_frame_spill.rs, crates/core/src/pipeline/tick_processor.rs, crates/core/src/parser/dispatcher.rs, crates/storage/src/tick_persistence.rs
+  - Tests: test_wal_v2_roundtrip_frame_seq, test_wal_v1_backcompat_replay, test_wal_v2_min_record_size_guard, test_frame_seq_strictly_monotonic_from_read_loop, test_live_capture_seq_equals_replayed
+- [ ] **PR-2b:** flip dedup key to `(ts, security_id, segment, capture_seq)` IN PLACE (never DROP populated ticks; payload_hash kept as column); v1-replay stays on payload_hash key
+  - Files: crates/storage/src/tick_persistence.rs, crates/storage/tests/dedup_segment_meta_guard.rs, .claude/rules/project/data-integrity.md
+  - Tests: chaos_index_same_value_burst_preserved (45→75→45), chaos_capture_seq_replay_idempotent, test_dedup_key_includes_capture_seq, test_key_flip_never_drops_populated_ticks
 
 ## Scenarios
 
