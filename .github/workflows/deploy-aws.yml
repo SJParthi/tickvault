@@ -570,7 +570,7 @@ jobs:
               "sudo mkdir -p /opt/aws/amazon-cloudwatch-agent/etc",
               "if [ -f repo/deploy/aws/cloudwatch-agent.json ]; then sudo cp -f repo/deploy/aws/cloudwatch-agent.json /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json; fi",
               "if [ -f repo/deploy/aws/prometheus.yaml ]; then sudo cp -f repo/deploy/aws/prometheus.yaml /opt/aws/amazon-cloudwatch-agent/etc/prometheus.yaml; fi",
-              "sudo timeout 25 /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json || echo 'WARN: cloudwatch-agent fetch-config failed (observability only, app unaffected)'",
+              "sudo timeout 25 /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json || echo WARN: cloudwatch-agent fetch-config failed - observability only app unaffected",
               "sudo systemctl enable amazon-cloudwatch-agent || true",
               "sudo systemctl start amazon-cloudwatch-agent --no-block || true",
               "echo CWAGENT-CONFIGURED",
