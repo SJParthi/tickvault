@@ -439,7 +439,14 @@ async fn connect_and_listen(
                     // O(1) EXEMPT: one allocation per frame on a cold path
                     // (orders are sparse — ~1-100/day).
                     let frame_vec = text.as_bytes().to_vec();
-                    let outcome = spill.append(WsType::OrderUpdate, frame_vec);
+                    // TICK-SEQ-01: order-update frames are JSON (not ticks) and are
+                    // not broadcast to the tick processor, but they still get a
+                    // monotonic frame_seq for WAL replay-ordering parity.
+                    let outcome = spill.append_with_seq(
+                        WsType::OrderUpdate,
+                        frame_vec,
+                        tickvault_storage::ws_frame_spill::next_frame_seq(),
+                    );
                     if outcome == AppendOutcome::Dropped {
                         error!(
                             "CRITICAL: WAL spill dropped OrderUpdate frame — disk writer stalled"

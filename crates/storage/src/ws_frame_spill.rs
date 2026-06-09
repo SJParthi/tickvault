@@ -252,9 +252,23 @@ impl WsFrameSpill {
     /// (also zero-copy), so existing callers keep working unchanged.
     // TEST-EXEMPT: covered by test_append_spill_and_replay_roundtrip + test_drop_counter_increments_when_channel_full; the Bytes-clone hand-off is proven zero-alloc by crates/core/tests/dhat_ws_reader_zero_alloc.rs::dhat_ws_reader_tail_zero_alloc
     pub fn append(&self, ws_type: WsType, frame: impl Into<Bytes>) -> AppendOutcome {
+        self.append_with_seq(ws_type, frame, next_frame_seq())
+    }
+
+    /// Like [`WsFrameSpill::append`] but stamps the caller-provided `frame_seq`
+    /// (the WS read loop's value) so the SAME sequence is persisted in the WAL
+    /// AND shared with the live broadcast → `ticks.capture_seq` (replay-stable).
+    /// TICK-SEQ-01 threading slice. Hot path, O(1), zero-alloc.
+    // TEST-EXEMPT: identical try_send path as `append` (covered by test_append_spill_and_replay_roundtrip + test_wal_v2_roundtrip_preserves_frame_seq); frame_seq plumbing covered by chaos_ws_frame_wal_replay + the read-loop integration.
+    pub fn append_with_seq(
+        &self,
+        ws_type: WsType,
+        frame: impl Into<Bytes>,
+        frame_seq: u64,
+    ) -> AppendOutcome {
         let record = WalRecord {
             ws_type,
-            frame_seq: next_frame_seq(),
+            frame_seq,
             frame: frame.into(),
         };
         match self.spill_tx.try_send(record) {
@@ -482,12 +496,13 @@ fn maybe_test_panic(r: &WalRecord) {
 }
 
 /// Process-wide strictly-monotonic frame sequence: `max(prev+1, wall_nanos)`.
-/// Lock-free CAS, O(1), zero heap alloc. TICK-SEQ-01 PR-2a stamps this at
-/// `append` time; a later slice hoists it to the WS read loop (passed in) so
-/// it equals the per-tick `capture_seq` written to `ticks.capture_seq`.
+/// Lock-free CAS, O(1), zero heap alloc. The WS read loop calls this ONCE per
+/// frame and passes the value to BOTH [`WsFrameSpill::append_with_seq`] and the
+/// live broadcast, so the WAL record and the `ticks.capture_seq` column carry
+/// the identical replay-stable value.
 static WAL_FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
 
-fn next_frame_seq() -> u64 {
+pub fn next_frame_seq() -> u64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))

@@ -360,6 +360,16 @@ impl TickPersistenceWriter {
     /// O(1) — single ILP row append + conditional flush.
     /// Ring buffer and reconnect logic (cold path) only run on error.
     pub fn append_tick(&mut self, tick: &ParsedTick) -> Result<()> {
+        self.append_tick_with_seq(tick, next_capture_seq())
+    }
+
+    /// Like [`append_tick`] but threads a replay-stable `capture_seq` (sourced
+    /// from the WS read-loop `frame_seq`) into the persisted row. TICK-SEQ-01
+    /// threading slice: the tick processor calls this with the frame's seq so
+    /// the live row's `capture_seq` matches the WAL-replayed row's. Ring-buffered
+    /// (QuestDB-down) ticks fall back to a drain-time seq, which PR-2b makes
+    /// ring-stable.
+    pub fn append_tick_with_seq(&mut self, tick: &ParsedTick, capture_seq: i64) -> Result<()> {
         // If sender is None (previous failure), attempt reconnect before writing.
         if self.sender.is_none() {
             match self.try_reconnect_on_error() {
@@ -375,7 +385,7 @@ impl TickPersistenceWriter {
             }
         }
 
-        build_tick_row(&mut self.buffer, tick)?;
+        build_tick_row_seq(&mut self.buffer, tick, capture_seq)?;
 
         // Track in-flight: save a copy so we can rescue on flush failure.
         // ParsedTick is Copy (112 bytes) — this is a memcpy, not a heap alloc.
@@ -413,7 +423,18 @@ impl TickPersistenceWriter {
     ///
     /// O(1) — same characteristics as `append_tick`. The `TickLifecycle`
     /// carrier is `Copy`, no heap allocation.
-    pub fn append_tick_enriched(&mut self, tick: &ParsedTick, _life: TickLifecycle) -> Result<()> {
+    pub fn append_tick_enriched(&mut self, tick: &ParsedTick, life: TickLifecycle) -> Result<()> {
+        self.append_tick_enriched_with_seq(tick, life, next_capture_seq())
+    }
+
+    /// Like [`append_tick_enriched`] but threads a replay-stable `capture_seq`
+    /// (from the WS read-loop `frame_seq`). TICK-SEQ-01 threading slice.
+    pub fn append_tick_enriched_with_seq(
+        &mut self,
+        tick: &ParsedTick,
+        _life: TickLifecycle,
+        capture_seq: i64,
+    ) -> Result<()> {
         if self.sender.is_none() {
             match self.try_reconnect_on_error() {
                 Ok(()) => {
@@ -426,7 +447,7 @@ impl TickPersistenceWriter {
             }
         }
 
-        build_tick_row(&mut self.buffer, tick)?;
+        build_tick_row_seq(&mut self.buffer, tick, capture_seq)?;
 
         self.in_flight.push(*tick);
         self.pending_count = self.pending_count.saturating_add(1);
@@ -1352,6 +1373,15 @@ fn next_capture_seq() -> i64 {
 /// Price fields use `f32_to_f64_clean` to preserve the original Dhan f32
 /// precision without f32→f64 widening artifacts.
 fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
+    build_tick_row_seq(buffer, tick, next_capture_seq())
+}
+
+/// Like [`build_tick_row`] but writes the caller-supplied, replay-stable
+/// `capture_seq` (sourced from the WAL `frame_seq` via the tick processor)
+/// instead of generating one at persist time. TICK-SEQ-01 threading slice:
+/// this is what makes the live row's `capture_seq` match the WAL-replayed
+/// row's `capture_seq` for the same frame (closes review HIGH #5 / CRITICAL #2).
+fn build_tick_row_seq(buffer: &mut Buffer, tick: &ParsedTick, capture_seq: i64) -> Result<()> {
     // Dhan WebSocket exchange_timestamp is already IST epoch seconds.
     // Store directly — no offset needed.
     let ts_nanos =
@@ -1406,11 +1436,12 @@ fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
         // collapse. See `tick_payload_hash` + the `DEDUP_KEY_TICKS` doc.
         .column_i64("payload_hash", tick_payload_hash(tick))
         .context("payload_hash")?
-        // TICK-SEQ-01 step 1: strictly-monotonic per-row capture sequence,
-        // stored as a column. NOT yet in the DEDUP key (still `payload_hash`) —
-        // it becomes the replay-stable key tiebreaker once sourced from the WAL
-        // frame (step 2). See `next_capture_seq` + `.claude/plans/active-plan.md`.
-        .column_i64("capture_seq", next_capture_seq())
+        // TICK-SEQ-01: replay-stable capture sequence. On the live path this is
+        // the WS read-loop `frame_seq`; on WAL replay it is the SAME value read
+        // back from the v2 record — so a true duplicate collapses and distinct
+        // ticks are kept. Still a stored column only in this slice; the DEDUP key
+        // flip to capture_seq lands in PR-2b. See `.claude/plans/active-plan.md`.
+        .column_i64("capture_seq", capture_seq)
         .context("capture_seq")?
         .at(ts_nanos)
         .context("designated timestamp")?;
