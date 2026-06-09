@@ -1,8 +1,10 @@
 //! Wave 2 Item 5 (G1) — main-feed WebSocket post-close sleep + token-aware
 //! wake resilience ratchets.
 //!
-//! These tests pin five regression invariants documented in
-//! `.claude/plans/active-plan-wave-2.md` Item 5.6:
+//! These tests pin six regression invariants. Invariants 1-5 are documented
+//! in `.claude/plans/active-plan-wave-2.md` Item 5.6; invariant 6 (W6-2) is
+//! the long-weekend holiday wake flagged "Outstanding (Wave-6)" by the
+//! per-wave-guarantee-matrix / wave-4-shared-preamble charter:
 //!
 //! 1. `test_main_feed_post_close_sleeps_until_next_open` — a Friday
 //!    16:00 IST snapshot must produce a `secs_until_next_market_open`
@@ -25,6 +27,10 @@
 //!    `return false` path must be reached ONLY through the `// Legacy
 //!    fallback` branch when no `TradingCalendar` is installed. The
 //!    primary path MUST sleep + return `true`.
+//! 6. `test_long_weekend_monday_holiday_sleep_wakes_on_tuesday` (W6-2) —
+//!    a Friday 16:00 IST close with the following Monday declared an NSE
+//!    holiday must wake on Tuesday 09:00 IST (89h), skipping Sat + Sun +
+//!    the Monday holiday, bounded under 120h.
 
 #![allow(clippy::unwrap_used)] // APPROVED: test code
 #![allow(clippy::expect_used)] // APPROVED: test code
@@ -198,5 +204,84 @@ fn test_no_reconnect_exhaustion_path_remains() {
         "legacy `return false` post-close branch must be labelled \
          `// Legacy fallback` so source-scan distinguishes it from \
          a regression"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// W6-2 — long-weekend (Monday-holiday) dormant-sleep wake.
+//
+// `test_70h_sleep_then_connect_succeeds` pins the 65h Fri 16:00 IST → Mon
+// 09:00 IST weekend wake. The per-wave-guarantee-matrix / wave-4-shared-preamble
+// charter explicitly lists the LONGER holiday-weekend dormant sleep as
+// "Outstanding (Wave-6): >65h holiday-weekend dormant sleep ... NOT yet pinned
+// by a chaos test", and disaster-recovery.md scenario #15 describes the same
+// Wed/Fri-close → Tue-open holiday wake. This test closes that gap: a Friday
+// 16:00 IST close with the following Monday declared an NSE holiday must wake
+// on TUESDAY 09:00 IST (skipping Sat + Sun + the Monday holiday), proving
+// `secs_until_next_market_open` handles a holiday adjacent to the weekend,
+// lands exactly on the next real trading day, and stays bounded.
+// ---------------------------------------------------------------------------
+
+fn make_calendar_with_holiday(date_ymd: &str, name: &str) -> TradingCalendar {
+    let cfg = TradingConfig {
+        market_open_time: "09:00:00".to_string(),
+        market_close_time: "15:30:00".to_string(),
+        order_cutoff_time: "15:29:00".to_string(),
+        data_collection_start: "09:00:00".to_string(),
+        data_collection_end: "15:30:00".to_string(),
+        timezone: "Asia/Kolkata".to_string(),
+        max_orders_per_second: 10,
+        nse_holidays: vec![NseHolidayEntry {
+            date: date_ymd.to_string(),
+            name: name.to_string(),
+        }],
+        muhurat_trading_dates: vec![],
+        nse_mock_trading_dates: vec![],
+    };
+    TradingCalendar::from_config(&cfg).expect("valid trading config")
+}
+
+#[test]
+fn test_long_weekend_monday_holiday_sleep_wakes_on_tuesday() {
+    // Monday 2026-04-06 declared an NSE holiday → the Friday 2026-04-03
+    // 16:00 IST post-close sleep must wake on Tuesday 2026-04-07 09:00 IST,
+    // NOT the Monday (which the plain-weekend test would expect).
+    let cal = make_calendar_with_holiday("2026-04-06", "Test Monday Holiday");
+
+    let friday = NaiveDate::from_ymd_opt(2026, 4, 3).unwrap();
+    let monday = NaiveDate::from_ymd_opt(2026, 4, 6).unwrap();
+    let tuesday = NaiveDate::from_ymd_opt(2026, 4, 7).unwrap();
+    assert_eq!(friday.weekday(), Weekday::Fri);
+    assert_eq!(monday.weekday(), Weekday::Mon);
+    assert_eq!(tuesday.weekday(), Weekday::Tue);
+
+    let now = ist_unix(friday, 16, 0, 0);
+    let secs = cal
+        .secs_until_next_market_open(now)
+        .expect("trading day reachable");
+
+    // Must land EXACTLY on Tuesday 09:00 IST, skipping Sat + Sun + Mon holiday.
+    let target = ist_unix(tuesday, 9, 0, 0);
+    assert_eq!(
+        i64::try_from(secs).unwrap(),
+        target - now,
+        "Fri 16:00 IST with a Monday NSE holiday MUST wake on Tuesday 09:00 IST \
+         (skip Sat + Sun + the Monday holiday), not Monday"
+    );
+
+    // Fri 16:00 → Tue 09:00 = 4 days − 7h = 89 hours. It MUST exceed the plain
+    // 65h weekend wake and stay bounded under 120h (dormant sleep never runs away).
+    assert_eq!(
+        secs,
+        89 * 3600,
+        "Fri 16:00 IST → Tue 09:00 IST across a Monday holiday must equal 89 hours"
+    );
+    assert!(
+        secs > 65 * 3600,
+        "long-weekend (holiday) wake must exceed the plain 65h weekend, got {secs}s"
+    );
+    assert!(
+        secs < 120 * 3600,
+        "dormant sleep window must stay bounded under 120h, got {secs}s"
     );
 }
