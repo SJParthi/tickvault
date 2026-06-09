@@ -62,7 +62,10 @@
 use std::io::{Read, Write};
 use tickvault_common::config::QuestDbConfig;
 
-const TICK_SPILL_RECORD_SIZE: usize = 112;
+// TICK-SEQ-01 PR-2b: 112 → 120 (8-byte capture_seq at bytes 108..116). Synthetic
+// records leave 108..116 as 0, which production `deserialize_tick_seq` reads as
+// capture_seq=0 — fine for this ignored, manually-run replay test.
+const TICK_SPILL_RECORD_SIZE: usize = 120;
 
 /// Mimics the TCP drain server used by `tick_persistence` unit tests.
 /// Accepts one connection and drains bytes until close.

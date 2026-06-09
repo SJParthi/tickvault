@@ -49,7 +49,7 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 /// AFTER `ts` in the actual `UPSERT KEYS(...)` clause. The DDL builder at
 /// `setup_tick_tables` formats this as
 /// `ALTER TABLE ticks DEDUP ENABLE UPSERT KEYS(ts, {DEDUP_KEY_TICKS})`,
-/// producing the full key `(ts, security_id, segment, payload_hash)`.
+/// producing the full key `(ts, security_id, segment, capture_seq)`.
 ///
 /// **Why `segment` is mandatory** (STORAGE-GAP-01 + I-P1-11):
 /// Dhan reuses the same numeric `security_id` across exchange segments
@@ -57,30 +57,32 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 /// Without `segment` in the key, two LEGITIMATELY DISTINCT ticks at the same
 /// `ts` would silently UPSERT each other and one segment's data would be lost.
 ///
-/// **Why `payload_hash` is the tiebreaker (2026-06-08, replaces `received_at`):**
-/// Dhan's `exchange_timestamp` (LTT) is SECOND-granular, so `ts` is identical
-/// for every tick inside the same wall-clock second. A tiebreaker is needed so
-/// 2-5 genuinely-distinct sub-second ticks for one instrument are NOT collapsed
-/// to one row. The PREVIOUS tiebreaker `received_at` was generated at *processing
-/// time* (`current_received_at_nanos()`), which had two flaws: (1) it relied on
-/// the wall clock returning a unique nanosecond per tick — not guaranteed by
-/// construction, so two distinct same-second ticks could in theory collide and
-/// one be lost; and (2) on WAL/reconnect REPLAY the same frame was re-stamped
-/// with a NEW `received_at`, so a true duplicate would NOT collapse → a
-/// duplicate row. `payload_hash` fixes both: it is a deterministic FNV-1a
-/// fingerprint of the tick's value-bearing fields (see `tick_payload_hash`), so
-///   • two DISTINCT ticks differ in ≥1 field → different hash → BOTH kept (no loss);
-///   • a true duplicate / replay / reconnect re-send is byte-identical → same
-///     hash → collapsed (idempotent, replay-safe);
-///   • two same-second ticks with identical content carry zero new information
-///     and collapse (correct — they are indistinguishable duplicates).
-/// `received_at` remains a stored COLUMN (latency analysis) but is NO LONGER in
-/// the dedup key. The composite `(ts, security_id, segment, payload_hash)` is
-/// the uniqueness guarantee.
+/// **Why `capture_seq` is the tiebreaker (TICK-SEQ-01 PR-2b, replaces `payload_hash`):**
+/// Dhan's `exchange_timestamp` (LTT) is SECOND-granular, so `ts` is identical for
+/// every tick inside the same wall-clock second. A tiebreaker is needed so
+/// genuinely-distinct sub-second ticks for one instrument are NOT collapsed to one
+/// row. `payload_hash` (a content fingerprint) was the prior tiebreaker, but it
+/// COLLAPSES two same-second ticks whose VALUES are byte-identical — which is real
+/// data loss for INDICES (volume=0, no trades): the live NIFTY sequence
+/// `23,146.45 → 23,146.75 → 23,146.45` has two `45` ticks with identical content →
+/// identical hash → the return-to-45 tick is silently lost.
+/// `capture_seq` fixes this: it is a strictly-monotonic, REPLAY-STABLE sequence
+/// stamped ONCE at the WS read instant (`ws_frame_spill::next_frame_seq`) and
+/// carried unchanged through RAM → ring → spill → DLQ → WAL → DB, so:
+///   • two DISTINCT arrivals get DISTINCT `capture_seq` → BOTH kept (no loss),
+///     EVEN when every value field is identical (the index case above);
+///   • a true duplicate / WAL-replay / reconnect re-send reuses the SAME
+///     `capture_seq` (read back from the WAL frame) → same key → collapsed
+///     (idempotent, replay-safe).
+/// `payload_hash` remains a STORED content-integrity column (no longer in the
+/// key); `received_at` likewise remains a column only. The composite
+/// `(ts, security_id, segment, capture_seq)` is the uniqueness guarantee, and
+/// `ORDER BY ts, capture_seq` reproduces exact intra-second arrival order.
 ///
 /// Enforced by `dedup_segment_meta_guard.rs` (workspace-wide constant scan)
-/// + `test_tick_dedup_key_includes_segment` (STORAGE-GAP-01 integration test).
-const DEDUP_KEY_TICKS: &str = "security_id, segment, payload_hash";
+/// + `test_tick_dedup_key_includes_segment` (STORAGE-GAP-01 integration test)
+/// + `chaos_index_same_value_burst_preserved` (the 45→75→45 regression).
+const DEDUP_KEY_TICKS: &str = "security_id, segment, capture_seq";
 
 /// Returns the DEDUP UPSERT KEY string for the ticks table.
 /// Exposed for gap enforcement integration tests (STORAGE-GAP-01).
@@ -127,7 +129,7 @@ const RECONNECT_THROTTLE_SECS: u64 = 30;
 ///         open(4) + close(4) + high(4) + low(4) + oi(4) + oi_high(4) + oi_low(4) +
 ///         iv(8) + delta(8) + gamma(8) + theta(8) + vega(8) + pad(3)
 ///         = 112 bytes (aligned).
-const TICK_SPILL_RECORD_SIZE: usize = 112;
+const TICK_SPILL_RECORD_SIZE: usize = 120;
 
 // Compile-time guard: if ParsedTick changes size, this will fail.
 // Actual struct may be smaller but we use 112 for alignment.
@@ -149,7 +151,18 @@ const TICK_SPILL_DIR: &str = "data/spill";
 
 /// Serialize a `ParsedTick` to a fixed-size byte array for disk spill.
 /// All fields written as little-endian. O(1), zero allocation.
+// TICK-SEQ-01 PR-2b: production spills via `serialize_tick_seq`; this seq-less
+// delegate is retained for the serialize round-trip tests.
+#[cfg(test)]
 fn serialize_tick(tick: &ParsedTick) -> [u8; TICK_SPILL_RECORD_SIZE] {
+    serialize_tick_seq(tick, 0)
+}
+
+/// TICK-SEQ-01 PR-2b: serialize a tick WITH its replay-stable `capture_seq` at
+/// bytes 108..116, so a spilled (QuestDB-down) tick drained later reuses the
+/// SAME `capture_seq` as its WAL replay would — preventing a DUPLICATE under the
+/// `(ts, security_id, segment, capture_seq)` dedup key. O(1), zero allocation.
+fn serialize_tick_seq(tick: &ParsedTick, capture_seq: i64) -> [u8; TICK_SPILL_RECORD_SIZE] {
     let mut buf = [0u8; TICK_SPILL_RECORD_SIZE];
     buf[0..4].copy_from_slice(&tick.security_id.to_le_bytes());
     buf[4] = tick.exchange_segment_code;
@@ -174,7 +187,8 @@ fn serialize_tick(tick: &ParsedTick) -> [u8; TICK_SPILL_RECORD_SIZE] {
     buf[84..92].copy_from_slice(&tick.gamma.to_le_bytes());
     buf[92..100].copy_from_slice(&tick.theta.to_le_bytes());
     buf[100..108].copy_from_slice(&tick.vega.to_le_bytes());
-    // buf[108..111] = padding
+    buf[108..116].copy_from_slice(&capture_seq.to_le_bytes());
+    // buf[116..120] = padding
     buf
 }
 
@@ -218,6 +232,17 @@ fn deserialize_tick(buf: &[u8; TICK_SPILL_RECORD_SIZE]) -> ParsedTick {
     }
 }
 
+/// TICK-SEQ-01 PR-2b: deserialize a spilled tick AND its replay-stable
+/// `capture_seq` (bytes 108..116). The drain path uses this so a drained tick is
+/// re-persisted with its ORIGINAL `capture_seq`, matching what its WAL replay
+/// would write — no duplicate under the capture_seq dedup key.
+fn deserialize_tick_seq(buf: &[u8; TICK_SPILL_RECORD_SIZE]) -> (ParsedTick, i64) {
+    let capture_seq = i64::from_le_bytes([
+        buf[108], buf[109], buf[110], buf[111], buf[112], buf[113], buf[114], buf[115],
+    ]);
+    (deserialize_tick(buf), capture_seq)
+}
+
 pub struct TickPersistenceWriter {
     sender: Option<Sender>,
     buffer: Buffer,
@@ -227,15 +252,19 @@ pub struct TickPersistenceWriter {
     ilp_conf_string: String,
     /// Resilience ring buffer: holds ticks when QuestDB is down.
     /// Drains on recovery (oldest-first). Capacity: `TICK_BUFFER_CAPACITY`.
+    /// TICK-SEQ-01 PR-2b: each entry is `(tick, capture_seq)` so a drained tick
+    /// is re-persisted with its ORIGINAL replay-stable `capture_seq` (matching
+    /// its WAL replay → no duplicate under the capture_seq dedup key).
     // O(1) EXEMPT: begin — VecDeque allocation bounded by TICK_BUFFER_CAPACITY (~19MB max)
-    tick_buffer: VecDeque<ParsedTick>,
+    tick_buffer: VecDeque<(ParsedTick, i64)>,
     // O(1) EXEMPT: end
     /// In-flight buffer: tracks ticks currently in the ILP buffer that haven't
     /// been confirmed flushed. On flush failure, these are rescued back to the
     /// ring buffer. On successful flush, this is cleared.
     /// Max size: `TICK_FLUSH_BATCH_SIZE` (1000 ticks × 72 bytes = 72KB).
     // O(1) EXEMPT: begin — bounded by TICK_FLUSH_BATCH_SIZE
-    in_flight: Vec<ParsedTick>,
+    // TICK-SEQ-01 PR-2b: `(tick, capture_seq)` so rescue preserves the seq.
+    in_flight: Vec<(ParsedTick, i64)>,
     // O(1) EXEMPT: end
     /// Total ticks spilled to disk (ring buffer overflow).
     ticks_spilled_total: u64,
@@ -283,7 +312,7 @@ impl TickPersistenceWriter {
         // Eagerly publish `tv_questdb_connected=1.0` so the operator-health +
         // tv-health "QuestDB" tiles flip GREEN immediately on first connect
         // — instead of showing "No data" RED for ~30s while the
-        // `QuestDbHealthPoller` (which lives inside `run_tick_persistence_consumer`,
+        // `QuestDbHealthPoller` (which lives inside `run_slow_boot_observability`,
         // started much later in main.rs) waits for its first tick. The poller
         // continues to own the canonical source-of-truth for outage detection;
         // this emission just sets a healthy initial value.
@@ -369,6 +398,7 @@ impl TickPersistenceWriter {
     /// the live row's `capture_seq` matches the WAL-replayed row's. Ring-buffered
     /// (QuestDB-down) ticks fall back to a drain-time seq, which PR-2b makes
     /// ring-stable.
+    // TEST-EXEMPT: exercised by every `append_tick` test (the seq-less delegate calls this) + the ring-seq round-trip in test_spill_roundtrip_preserves_capture_seq + chaos_index_same_value_burst_preserved; a direct unit test needs a live/mock QuestDB ILP writer.
     pub fn append_tick_with_seq(&mut self, tick: &ParsedTick, capture_seq: i64) -> Result<()> {
         // If sender is None (previous failure), attempt reconnect before writing.
         if self.sender.is_none() {
@@ -379,7 +409,7 @@ impl TickPersistenceWriter {
                 }
                 Err(_) => {
                     // Still can't connect — buffer this tick instead of losing it.
-                    self.buffer_tick(*tick);
+                    self.buffer_tick_seq(*tick, capture_seq);
                     return Ok(());
                 }
             }
@@ -389,7 +419,7 @@ impl TickPersistenceWriter {
 
         // Track in-flight: save a copy so we can rescue on flush failure.
         // ParsedTick is Copy (112 bytes) — this is a memcpy, not a heap alloc.
-        self.in_flight.push(*tick);
+        self.in_flight.push((*tick, capture_seq));
         self.pending_count = self.pending_count.saturating_add(1);
 
         if self.pending_count >= TICK_FLUSH_BATCH_SIZE
@@ -429,6 +459,7 @@ impl TickPersistenceWriter {
 
     /// Like [`append_tick_enriched`] but threads a replay-stable `capture_seq`
     /// (from the WS read-loop `frame_seq`). TICK-SEQ-01 threading slice.
+    // TEST-EXEMPT: exercised by every `append_tick_enriched` test (the seq-less delegate calls this) + the ring-seq round-trip in test_spill_roundtrip_preserves_capture_seq + chaos_index_same_value_burst_preserved; a direct unit test needs a live/mock QuestDB ILP writer.
     pub fn append_tick_enriched_with_seq(
         &mut self,
         tick: &ParsedTick,
@@ -441,7 +472,7 @@ impl TickPersistenceWriter {
                     self.drain_tick_buffer();
                 }
                 Err(_) => {
-                    self.buffer_tick(*tick);
+                    self.buffer_tick_seq(*tick, capture_seq);
                     return Ok(());
                 }
             }
@@ -449,7 +480,7 @@ impl TickPersistenceWriter {
 
         build_tick_row_seq(&mut self.buffer, tick, capture_seq)?;
 
-        self.in_flight.push(*tick);
+        self.in_flight.push((*tick, capture_seq));
         self.pending_count = self.pending_count.saturating_add(1);
 
         if self.pending_count >= TICK_FLUSH_BATCH_SIZE
@@ -570,7 +601,8 @@ impl TickPersistenceWriter {
         for i in 0..count {
             // SAFETY: index is within bounds (0..count where count = original len).
             // We don't modify in_flight length inside this loop.
-            self.buffer_tick(self.in_flight[i]);
+            let (tick, capture_seq) = self.in_flight[i];
+            self.buffer_tick_seq(tick, capture_seq);
         }
         self.in_flight.clear();
         self.pending_count = 0;
@@ -627,13 +659,24 @@ impl TickPersistenceWriter {
 
     /// Pushes a tick into the ring buffer. If the buffer is full, spills the
     /// tick to disk instead of dropping it. **Zero tick loss guarantee.**
+    ///
+    /// Legacy/test convenience: stamps a fresh fallback `capture_seq`. Production
+    /// callers use [`buffer_tick_seq`] to preserve the replay-stable sequence.
+    #[cfg(test)]
     fn buffer_tick(&mut self, tick: ParsedTick) {
+        self.buffer_tick_seq(tick, next_capture_seq());
+    }
+
+    /// TICK-SEQ-01 PR-2b: like [`buffer_tick`] but preserves the tick's
+    /// replay-stable `capture_seq` through the ring (and disk spill), so a
+    /// drained tick is re-persisted with the SAME seq its WAL replay uses.
+    fn buffer_tick_seq(&mut self, tick: ParsedTick, capture_seq: i64) {
         // O(1) EXEMPT: begin — bounded ring buffer, max TICK_BUFFER_CAPACITY
         if self.tick_buffer.len() >= TICK_BUFFER_CAPACITY {
             // Ring buffer full — spill to disk (never drop).
-            self.spill_tick_to_disk(&tick);
+            self.spill_tick_to_disk_seq(&tick, capture_seq);
         } else {
-            self.tick_buffer.push_back(tick);
+            self.tick_buffer.push_back((tick, capture_seq));
             // A3: High watermark alert — fires once when buffer crosses 80%.
             if self.tick_buffer.len() == TICK_BUFFER_HIGH_WATERMARK {
                 error!(
@@ -659,7 +702,7 @@ impl TickPersistenceWriter {
     /// record before being counted as dropped. Only if the DLQ write ALSO
     /// fails is the tick permanently lost.
     #[rustfmt::skip]
-    fn spill_tick_to_disk(&mut self, tick: &ParsedTick) {
+    fn spill_tick_to_disk_seq(&mut self, tick: &ParsedTick, capture_seq: i64) {
         // Lazy-open the spill file.
         if self.spill_writer.is_none() && let Err(err) = self.open_spill_file() {
             error!(?err, "CRITICAL: cannot open tick spill file — falling back to DLQ");
@@ -671,7 +714,7 @@ impl TickPersistenceWriter {
             self.write_to_dlq(tick, "spill_open_failed");
             return;
         }
-        let record = serialize_tick(tick);
+        let record = serialize_tick_seq(tick, capture_seq);
         // Wave 1 Item 0.b part 2 — try the async drain path FIRST.
         // The drain task uses tokio::fs::File::write_all and dispatches
         // the actual syscall to tokio's blocking pool, decoupling the
@@ -703,6 +746,13 @@ impl TickPersistenceWriter {
         if self.ticks_spilled_total.is_multiple_of(10_000) {
             warn!(ticks_spilled = self.ticks_spilled_total, "tick disk spill growing — QuestDB still down");
         }
+    }
+
+    /// Test convenience: spill with a fresh fallback `capture_seq`. Production
+    /// callers use `spill_tick_to_disk_seq` to preserve the replay-stable seq.
+    #[cfg(test)]
+    fn spill_tick_to_disk(&mut self, tick: &ParsedTick) {
+        self.spill_tick_to_disk_seq(tick, next_capture_seq());
     }
 
     /// A2: Last-resort dead-letter write. Called when both ring buffer AND
@@ -884,12 +934,12 @@ impl TickPersistenceWriter {
         if self.sender.is_none() { return; }
         let ring_count = self.tick_buffer.len();
         let mut drained: usize = 0;
-        while let Some(tick) = self.tick_buffer.pop_front() {
-            if let Err(err) = build_tick_row(&mut self.buffer, &tick) {
+        while let Some((tick, capture_seq)) = self.tick_buffer.pop_front() {
+            if let Err(err) = build_tick_row_seq(&mut self.buffer, &tick, capture_seq) {
                 warn!(?err, security_id = tick.security_id, "build_tick_row failed during drain — tick skipped");
                 continue;
             }
-            self.in_flight.push(tick);
+            self.in_flight.push((tick, capture_seq));
             self.pending_count = self.pending_count.saturating_add(1);
             drained += 1;
             if self.pending_count >= TICK_FLUSH_BATCH_SIZE && let Err(err) = self.force_flush() {
@@ -941,12 +991,12 @@ impl TickPersistenceWriter {
                 Err(ref err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(err) => { warn!(?err, drained, "disk spill read error — stopping drain"); break; }
             }
-            let tick = deserialize_tick(&record);
-            if let Err(err) = build_tick_row(&mut self.buffer, &tick) {
+            let (tick, capture_seq) = deserialize_tick_seq(&record);
+            if let Err(err) = build_tick_row_seq(&mut self.buffer, &tick, capture_seq) {
                 warn!(?err, security_id = tick.security_id, "build_tick_row failed during spill drain — tick skipped");
                 continue;
             }
-            self.in_flight.push(tick);
+            self.in_flight.push((tick, capture_seq));
             self.pending_count = self.pending_count.saturating_add(1);
             drained = drained.saturating_add(1);
             if self.pending_count >= TICK_FLUSH_BATCH_SIZE && let Err(err) = self.force_flush() {
@@ -1017,11 +1067,11 @@ impl TickPersistenceWriter {
                     Ok(()) => {}, Err(ref err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
                     Err(err) => { warn!(?err, drained, path = %path.display(), "stale spill read error — stopping drain"); break; }
                 }
-                let tick = deserialize_tick(&record);
-                if let Err(err) = build_tick_row(&mut self.buffer, &tick) {
+                let (tick, capture_seq) = deserialize_tick_seq(&record);
+                if let Err(err) = build_tick_row_seq(&mut self.buffer, &tick, capture_seq) {
                     warn!(?err, security_id = tick.security_id, "build_tick_row failed during stale spill drain — tick skipped"); continue;
                 }
-                self.in_flight.push(tick);
+                self.in_flight.push((tick, capture_seq));
                 self.pending_count = self.pending_count.saturating_add(1);
                 drained = drained.saturating_add(1);
                 if self.pending_count >= TICK_FLUSH_BATCH_SIZE && let Err(err) = self.force_flush() {
@@ -1153,8 +1203,8 @@ impl TickPersistenceWriter {
                 remaining,
                 "shutdown: QuestDB unreachable — spilling remaining ticks to disk"
             );
-            while let Some(tick) = self.tick_buffer.pop_front() {
-                self.spill_tick_to_disk(&tick);
+            while let Some((tick, capture_seq)) = self.tick_buffer.pop_front() {
+                self.spill_tick_to_disk_seq(&tick, capture_seq);
             }
             // Flush BufWriter to ensure all bytes hit disk.
             if let Some(ref mut writer) = self.spill_writer
@@ -1372,6 +1422,9 @@ fn next_capture_seq() -> i64 {
 ///
 /// Price fields use `f32_to_f64_clean` to preserve the original Dhan f32
 /// precision without f32→f64 widening artifacts.
+// TICK-SEQ-01 PR-2b: production persists via `build_tick_row_seq` (threaded
+// capture_seq); this seq-less delegate is retained for unit tests.
+#[cfg(test)]
 fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
     build_tick_row_seq(buffer, tick, next_capture_seq())
 }
@@ -1539,6 +1592,53 @@ pub(crate) const TICKS_DROPPED_COLUMNS: &[&str] = &[
     "phase",
 ];
 
+/// CRITICAL #4 guard (TICK-SEQ-01 PR-2b): is the `ticks` table populated?
+///
+/// Returns `true` if it has ≥1 row, so the stale-schema DROP-recovery path can
+/// refuse to wipe a SEBI-retentioned table. Best-effort + FAIL-SAFE: on any
+/// request/parse error it returns `true` (assume populated → do NOT drop). A
+/// genuinely fresh table is empty (`CREATE TABLE IF NOT EXISTS` ran first in the
+/// same function), so the only `false` result is a real, confirmed-empty table.
+// TEST-EXEMPT: requires a live QuestDB (`/exec`); the fail-safe parse branches are
+// covered by test_ticks_populated_parse_* unit tests over the response-body parser.
+async fn ticks_table_is_populated(client: &Client, base_url: &str) -> bool {
+    let sql = format!("SELECT count() FROM {QUESTDB_TABLE_TICKS}");
+    let Ok(resp) = client.get(base_url).query(&[("query", &sql)]).send().await else {
+        return true; // request failed → fail-safe (do not drop)
+    };
+    if !resp.status().is_success() {
+        return true; // non-2xx → fail-safe
+    }
+    let body = match resp.text().await {
+        Ok(b) => b,
+        Err(err) => {
+            // Body-read failure after a 2xx: fail-safe (treat as populated → never
+            // drop), but surface it so a transient read error is not invisible.
+            warn!(
+                ?err,
+                "ticks count() body read failed — assuming populated (fail-safe)"
+            );
+            return true;
+        }
+    };
+    parse_ticks_count_populated(&body)
+}
+
+/// Pure parser for `ticks_table_is_populated`: extracts the count from a QuestDB
+/// `/exec` JSON body (`..."dataset":[[N]]...`) and returns `N > 0`. FAIL-SAFE:
+/// any parse failure returns `true` (assume populated → never drop).
+fn parse_ticks_count_populated(body: &str) -> bool {
+    body.split("\"dataset\":[[")
+        .nth(1)
+        .and_then(|s| {
+            s.split(|c: char| !c.is_ascii_digit())
+                .find(|t| !t.is_empty())
+        })
+        .and_then(|n| n.parse::<u64>().ok())
+        .map(|count| count > 0)
+        .unwrap_or(true)
+}
+
 /// Creates the `ticks` table (if not exists) and enables DEDUP UPSERT KEYS.
 ///
 /// Best-effort: if QuestDB is unreachable, logs a warning and continues.
@@ -1659,30 +1759,45 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
             } else {
                 let body = response.text().await.unwrap_or_default();
                 if body.contains("deduplicate key column not found") {
-                    warn!("ticks table has stale schema — dropping and recreating");
-                    let drop_sql = format!("DROP TABLE IF EXISTS {QUESTDB_TABLE_TICKS}");
-                    drop(
-                        client
-                            .get(&base_url)
-                            .query(&[("query", &drop_sql)])
-                            .send()
-                            .await,
-                    );
-                    drop(
-                        client
-                            .get(&base_url)
-                            .query(&[("query", TICKS_CREATE_DDL)])
-                            .send()
-                            .await,
-                    );
-                    drop(
-                        client
-                            .get(&base_url)
-                            .query(&[("query", &dedup_sql)])
-                            .send()
-                            .await,
-                    );
-                    info!("ticks table recreated with correct schema");
+                    // TICK-SEQ-01 PR-2b — CRITICAL #4 guard: NEVER auto-DROP a
+                    // POPULATED `ticks` table (SEBI 5-year retention). The
+                    // DROP+recreate recovery is only safe on a genuinely
+                    // fresh/empty table. If the table has rows, refuse to drop
+                    // and surface an operator-actionable error — the existing
+                    // dedup key stays active rather than wiping live data.
+                    if ticks_table_is_populated(&client, &base_url).await {
+                        error!(
+                            "ticks DEDUP key change reported a stale schema BUT the table is \
+                             POPULATED — refusing to DROP (SEBI retention). The existing dedup \
+                             key stays active; operator must migrate the schema manually."
+                        );
+                        metrics::counter!("tv_ticks_dedup_drop_blocked_total").increment(1);
+                    } else {
+                        warn!("ticks table has stale schema (empty) — dropping and recreating");
+                        let drop_sql = format!("DROP TABLE IF EXISTS {QUESTDB_TABLE_TICKS}");
+                        drop(
+                            client
+                                .get(&base_url)
+                                .query(&[("query", &drop_sql)])
+                                .send()
+                                .await,
+                        );
+                        drop(
+                            client
+                                .get(&base_url)
+                                .query(&[("query", TICKS_CREATE_DDL)])
+                                .send()
+                                .await,
+                        );
+                        drop(
+                            client
+                                .get(&base_url)
+                                .query(&[("query", &dedup_sql)])
+                                .send()
+                                .await,
+                        );
+                        info!("ticks table recreated with correct schema");
+                    }
                 } else {
                     warn!(
                         body = body.chars().take(200).collect::<String>(),
@@ -2767,18 +2882,25 @@ mod tests {
             "DEDUP_KEY_TICKS must include segment (STORAGE-GAP-01)"
         );
         assert!(
-            DEDUP_KEY_TICKS.contains("payload_hash"),
-            "DEDUP_KEY_TICKS must include payload_hash to preserve sub-second ticks \
-             AND stay replay-idempotent (Dhan LTT is second-granular, so ts alone \
-             collapses bursts; received_at was re-stamped on replay → duplicates)"
+            DEDUP_KEY_TICKS.contains("capture_seq"),
+            "DEDUP_KEY_TICKS must include capture_seq — the replay-stable sub-second \
+             tiebreaker (TICK-SEQ-01 PR-2b). Dhan LTT is second-granular, so ts alone \
+             collapses bursts; payload_hash collapsed same-value index ticks (the \
+             45->75->45 loss); capture_seq keeps distinct arrivals AND stays \
+             replay-idempotent (read back from the WAL frame)."
         );
         assert!(
             !DEDUP_KEY_TICKS.contains("received_at"),
             "received_at must NOT be in the dedup key — it is re-stamped at \
-             processing time, so on WAL/reconnect replay it differs and breaks \
-             idempotency (2026-06-08: replaced by payload_hash)"
+             processing time, so on WAL/reconnect replay it differs and breaks idempotency"
         );
-        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, payload_hash");
+        assert!(
+            !DEDUP_KEY_TICKS.contains("payload_hash"),
+            "payload_hash must NOT be in the dedup key after PR-2b — it collapses \
+             same-value same-second index ticks (data loss); it stays a stored \
+             content-integrity column only"
+        );
+        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, capture_seq");
     }
 
     // --- payload_hash dedup tiebreaker (2026-06-08) -------------------------
@@ -4004,7 +4126,7 @@ mod tests {
     #[test]
     fn test_tick_dedup_key_exact_value() {
         // STORAGE-GAP-01 (segment) + sub-second preservation (received_at).
-        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, payload_hash");
+        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, capture_seq");
     }
 
     #[test]
@@ -4115,7 +4237,7 @@ mod tests {
 
     #[test]
     fn test_dedup_key_ticks_exact_format() {
-        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, payload_hash");
+        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, capture_seq");
     }
 
     #[test]
@@ -4623,12 +4745,12 @@ mod tests {
         // The ring buffer contents are unchanged (no pop_front anymore).
         let front = writer.tick_buffer.front().unwrap();
         assert_eq!(
-            front.security_id, 0,
+            front.0.security_id, 0,
             "ring buffer oldest should still be id=0 (no drop)"
         );
         let back = writer.tick_buffer.back().unwrap();
         assert_eq!(
-            back.security_id,
+            back.0.security_id,
             (TICK_BUFFER_CAPACITY - 1) as u32,
             "ring buffer newest should be the last one that fit"
         );
@@ -4880,8 +5002,35 @@ mod tests {
     #[test]
     fn test_tick_spill_record_size() {
         assert_eq!(
-            TICK_SPILL_RECORD_SIZE, 112,
-            "spill record must be exactly 112 bytes"
+            TICK_SPILL_RECORD_SIZE, 120,
+            "spill record must be exactly 120 bytes (108 tick fields + 8-byte capture_seq + 4 padding) — TICK-SEQ-01 PR-2b"
+        );
+    }
+
+    #[test]
+    fn test_spill_roundtrip_preserves_capture_seq() {
+        // TICK-SEQ-01 PR-2b: the spill record carries capture_seq so a drained
+        // (QuestDB-down) tick is re-persisted with its ORIGINAL replay-stable seq
+        // — matching its WAL replay → NO duplicate under the capture_seq key.
+        let tick = make_test_tick(13, 23146.45);
+        let capture_seq: i64 = 9_876_543_210;
+        let (restored, restored_seq) =
+            deserialize_tick_seq(&serialize_tick_seq(&tick, capture_seq));
+        assert_eq!(restored.security_id, tick.security_id);
+        assert_eq!(restored.last_traded_price, tick.last_traded_price);
+        assert_eq!(
+            restored_seq, capture_seq,
+            "capture_seq MUST survive the spill serialize→deserialize round-trip"
+        );
+    }
+
+    #[test]
+    fn test_spill_seqless_delegate_writes_zero_capture_seq() {
+        let tick = make_test_tick(1, 100.0);
+        let (_, seq) = deserialize_tick_seq(&serialize_tick(&tick));
+        assert_eq!(
+            seq, 0,
+            "the seq-less serialize delegate writes capture_seq=0"
         );
     }
 
@@ -5722,7 +5871,7 @@ mod tests {
         for i in 0..tick_count as u32 {
             let tick = make_test_tick(i, 24500.0 + i as f32);
             build_tick_row(&mut writer.buffer, &tick).unwrap();
-            writer.in_flight.push(tick);
+            writer.in_flight.push((tick, 0));
             writer.pending_count += 1;
         }
         assert_eq!(writer.pending_count(), tick_count);
@@ -5758,7 +5907,7 @@ mod tests {
         // Verify the rescued ticks have correct data.
         for (i, tick) in writer.tick_buffer.iter().enumerate() {
             assert_eq!(
-                tick.security_id, i as u32,
+                tick.0.security_id, i as u32,
                 "rescued tick {i}: security_id must match"
             );
         }
@@ -5882,7 +6031,7 @@ mod tests {
 
         // The rescued tick data must be correct.
         let rescued = writer.tick_buffer.front().unwrap();
-        assert_eq!(rescued.security_id, 42);
+        assert_eq!(rescued.0.security_id, 42);
     }
 
     // -----------------------------------------------------------------------
@@ -6547,7 +6696,7 @@ mod tests {
         for i in 0..tick_count as u32 {
             let tick = make_test_tick(i, 24500.0 + i as f32);
             let _ = build_tick_row(&mut writer.buffer, &tick);
-            writer.in_flight.push(tick);
+            writer.in_flight.push((tick, 0));
             writer.pending_count = writer.pending_count.saturating_add(1);
         }
 
@@ -6602,7 +6751,7 @@ mod tests {
         for i in 0..(TICK_FLUSH_BATCH_SIZE - 1) as u32 {
             let tick = make_test_tick(i, 24500.0);
             build_tick_row(&mut writer.buffer, &tick).unwrap();
-            writer.in_flight.push(tick);
+            writer.in_flight.push((tick, 0));
             writer.pending_count = writer.pending_count.saturating_add(1);
         }
         assert_eq!(writer.pending_count(), TICK_FLUSH_BATCH_SIZE - 1);
@@ -6715,7 +6864,9 @@ mod tests {
 
         // Fill ring buffer to capacity.
         for i in 0..TICK_BUFFER_CAPACITY as u32 {
-            writer.tick_buffer.push_back(make_test_tick(i, i as f32));
+            writer
+                .tick_buffer
+                .push_back((make_test_tick(i, i as f32), 0));
         }
         // Ensure spill_writer is None and no spill_path, but try to spill.
         writer.spill_writer = None;
@@ -6842,7 +6993,9 @@ mod tests {
         // Manually populate in_flight.
         let tick_count = 3_usize;
         for i in 0..tick_count as u32 {
-            writer.in_flight.push(make_test_tick(i, 100.0 + i as f32));
+            writer
+                .in_flight
+                .push((make_test_tick(i, 100.0 + i as f32), 0));
         }
         writer.pending_count = tick_count;
 
@@ -6884,7 +7037,7 @@ mod tests {
         for i in 0..buffer_count as u32 {
             writer
                 .tick_buffer
-                .push_back(make_test_tick(i, 24500.0 + i as f32));
+                .push_back((make_test_tick(i, 24500.0 + i as f32), 0));
         }
         assert_eq!(writer.buffered_tick_count(), buffer_count);
 
@@ -7174,8 +7327,10 @@ mod tests {
     // =======================================================================
 
     #[test]
-    fn test_tick_spill_record_size_is_112() {
-        assert_eq!(TICK_SPILL_RECORD_SIZE, 112);
+    fn test_tick_spill_record_size_is_120() {
+        // TICK-SEQ-01 PR-2b: grew 112 → 120 to carry the 8-byte capture_seq so a
+        // spilled (QuestDB-down) tick is re-persisted with its replay-stable seq.
+        assert_eq!(TICK_SPILL_RECORD_SIZE, 120);
     }
 
     #[test]
@@ -7268,7 +7423,9 @@ mod tests {
         writer.sender = None;
         writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
-        writer.tick_buffer.push_back(make_test_tick(100, 500.0));
+        writer
+            .tick_buffer
+            .push_back((make_test_tick(100, 500.0), 0));
         assert_eq!(writer.buffered_tick_count(), 1);
 
         // Now point to a valid server and allow reconnect
@@ -7332,8 +7489,8 @@ mod tests {
         writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
         writer.pending_count = 2;
-        writer.in_flight.push(make_test_tick(300, 700.0));
-        writer.in_flight.push(make_test_tick(301, 710.0));
+        writer.in_flight.push((make_test_tick(300, 700.0), 0));
+        writer.in_flight.push((make_test_tick(301, 710.0), 0));
 
         let result = writer.force_flush();
         // Should rescue in-flight ticks, then fail reconnect (throttled)
@@ -7605,7 +7762,7 @@ mod tests {
 
         // Trigger a real spill: fill the ring buffer to capacity, then spill one tick.
         for i in 0..TICK_BUFFER_CAPACITY as u32 {
-            writer.tick_buffer.push_back(make_test_tick(i, 1.0));
+            writer.tick_buffer.push_back((make_test_tick(i, 1.0), 0));
         }
         writer.spill_tick_to_disk(&make_test_tick(999_999, 2.0));
 
@@ -7687,7 +7844,9 @@ mod tests {
         };
         let mut writer = TickPersistenceWriter::new(&config).unwrap();
         writer.sender = None;
-        writer.tick_buffer.push_back(make_test_tick(700, 1100.0));
+        writer
+            .tick_buffer
+            .push_back((make_test_tick(700, 1100.0), 0));
 
         writer.drain_tick_buffer();
         assert_eq!(
@@ -7863,7 +8022,7 @@ mod tests {
 
         // Buffer some ticks first
         let tick = make_test_tick(42, 24500.0);
-        writer.tick_buffer.push_back(tick);
+        writer.tick_buffer.push_back((tick, 0));
 
         // Disconnect the sender
         writer.sender = None;
@@ -8023,7 +8182,7 @@ mod tests {
         for i in 0..5_u32 {
             writer
                 .tick_buffer
-                .push_back(make_test_tick(2000 + i, 25000.0 + i as f32));
+                .push_back((make_test_tick(2000 + i, 25000.0 + i as f32), 0));
         }
         assert_eq!(writer.tick_buffer.len(), 5);
 
@@ -8045,7 +8204,9 @@ mod tests {
         let mut writer = TickPersistenceWriter::new(&good_config).unwrap();
         writer.sender = None;
 
-        writer.tick_buffer.push_back(make_test_tick(3000, 26000.0));
+        writer
+            .tick_buffer
+            .push_back((make_test_tick(3000, 26000.0), 0));
         writer.drain_tick_buffer();
         // Drain should return immediately when sender is None
         assert_eq!(
@@ -8440,7 +8601,7 @@ mod tests {
             writer.pending_count = writer.pending_count.saturating_add(500);
             writer
                 .in_flight
-                .push(make_test_tick(90000 + attempt, 99999.0));
+                .push((make_test_tick(90000 + attempt, 99999.0), 0));
             let result = writer.force_flush();
             if result.is_err() {
                 assert!(
@@ -8478,7 +8639,7 @@ mod tests {
         for i in 0..TICK_BUFFER_CAPACITY {
             writer
                 .tick_buffer
-                .push_back(make_test_tick(i as u32, 100.0));
+                .push_back((make_test_tick(i as u32, 100.0), 0));
         }
 
         // Now buffer_tick should trigger spill_tick_to_disk
@@ -8504,8 +8665,12 @@ mod tests {
         let mut writer = TickPersistenceWriter::new(&config).unwrap();
 
         // Add ticks to ring buffer
-        writer.tick_buffer.push_back(make_test_tick(4000, 24500.0));
-        writer.tick_buffer.push_back(make_test_tick(4001, 24501.0));
+        writer
+            .tick_buffer
+            .push_back((make_test_tick(4000, 24500.0), 0));
+        writer
+            .tick_buffer
+            .push_back((make_test_tick(4001, 24501.0), 0));
 
         // Poison the buffer by starting a row without finishing it.
         // This makes the next build_tick_row call fail because the buffer
@@ -8536,13 +8701,13 @@ mod tests {
         for i in 0..(TICK_FLUSH_BATCH_SIZE + 100) as u32 {
             writer
                 .tick_buffer
-                .push_back(make_test_tick(5000 + i, 24700.0));
+                .push_back((make_test_tick(5000 + i, 24700.0), 0));
         }
         // Also add 3 ticks for the final flush path (line 457)
         for i in 0..3_u32 {
             writer
                 .tick_buffer
-                .push_back(make_test_tick(50000 + i, 24800.0));
+                .push_back((make_test_tick(50000 + i, 24800.0), 0));
         }
         // Drain will build rows into the buffer, then try to flush
         // at batch boundary. The flush may fail because connection is broken.
@@ -9096,9 +9261,35 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_key_unchanged_in_step1() {
-        // Step 1 is column-only — it must NOT alter the dedup key. The key flip
-        // to capture_seq is TICK-SEQ-01 step 2 (after WAL replay-stability).
-        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, payload_hash");
+    fn test_dedup_key_is_capture_seq_after_flip() {
+        // TICK-SEQ-01 PR-2b: the dedup tiebreaker is now the replay-stable
+        // capture_seq (not payload_hash) — the regression pin for the 45->75->45
+        // index tick-loss fix.
+        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, capture_seq");
+    }
+
+    // --- CRITICAL #4: ticks-populated parser (never auto-DROP populated table) ---
+
+    #[test]
+    fn test_ticks_populated_parse_nonzero_is_populated() {
+        // QuestDB /exec body with a non-zero count → populated → DROP refused.
+        let body = r#"{"query":"...","columns":[{"name":"count","type":"LONG"}],"dataset":[[12345]],"count":1}"#;
+        assert!(parse_ticks_count_populated(body));
+    }
+
+    #[test]
+    fn test_ticks_populated_parse_zero_is_empty() {
+        let body = r#"{"query":"...","dataset":[[0]],"count":1}"#;
+        assert!(!parse_ticks_count_populated(body));
+    }
+
+    #[test]
+    fn test_ticks_populated_parse_garbage_fails_safe() {
+        // Any unparseable body → fail-safe TRUE (assume populated, never drop).
+        assert!(parse_ticks_count_populated("not json"));
+        assert!(parse_ticks_count_populated(""));
+        assert!(parse_ticks_count_populated(
+            r#"{"error":"table does not exist"}"#
+        ));
     }
 }

@@ -1473,20 +1473,25 @@ async fn main() -> Result<()> {
         // subscribes to the tick broadcast and persists to QuestDB. This never touches
         // the hot-path tick processor loop — zero allocation impact.
         {
-            let tick_persistence_rx = fast_tick_broadcast_sender.subscribe();
+            // TICK-SEQ-01 PR-2b: fast boot's `run_tick_processor` (started with a
+            // lossless `new_disconnected` writer above) is now the SOLE seq-correct
+            // ticks persister — exactly matching slow boot. The old
+            // `run_tick_persistence_consumer` was a redundant SECOND persister
+            // (broadcast-fed, lossy on lag, seq-LESS) that, under the new
+            // `capture_seq` dedup key, wrote every tick with a DIFFERENT seq than
+            // the hot-path writer → duplicate rows. We reuse the existing slow-boot
+            // observability consumer so fast boot KEEPS the gap-tracking +
+            // QuestDB-health-poll surface WITHOUT a second writer (no blind spot,
+            // no duplicates).
+            let observability_rx = fast_tick_broadcast_sender.subscribe();
             let questdb_cfg = config.questdb.clone();
-            let hs = health_status.clone();
-            let persist_notifier = std::sync::Arc::clone(&notifier);
             tokio::spawn(async move {
-                run_tick_persistence_consumer(
-                    tick_persistence_rx,
-                    questdb_cfg,
-                    Some(hs),
-                    Some(persist_notifier),
-                )
-                .await;
+                run_slow_boot_observability(observability_rx, questdb_cfg).await;
             });
-            info!("background tick persistence consumer started (cold path)");
+            info!(
+                "fast-boot observability consumer started (gap-track + QuestDB health; \
+                 single seq-correct persister owns ticks)"
+            );
         }
 
         // Candle-engine re-architecture #T1b: the cold-path Engine-A
@@ -5936,160 +5941,6 @@ fn spawn_pool_watchdog_task(
             }
         }
     });
-}
-
-/// Subscribes to the tick broadcast and writes ticks to QuestDB.
-///
-/// Used in fast boot where the tick processor starts with `None` writers
-/// (QuestDB isn't ready yet). This consumer starts after QuestDB DDL
-/// completes and persists ticks on the cold path — zero impact on the
-/// hot-path tick processor.
-///
-/// Depth persistence is handled by the tick processor in slow boot only.
-/// In fast boot, depth data is not persisted until the next full restart
-/// (depth requires raw frame fields which the broadcast doesn't carry).
-async fn run_tick_persistence_consumer(
-    mut tick_rx: tokio::sync::broadcast::Receiver<tickvault_common::tick_types::ParsedTick>,
-    questdb_config: tickvault_common::config::QuestDbConfig,
-    health_status: Option<SharedHealthStatus>,
-    notifier: Option<std::sync::Arc<NotificationService>>,
-) {
-    let mut tick_writer = match TickPersistenceWriter::new(&questdb_config) {
-        Ok(writer) => {
-            info!("cold-path tick persistence writer connected to QuestDB");
-            if let Some(ref hs) = health_status {
-                hs.set_tick_persistence_connected(true);
-            }
-            writer
-        }
-        Err(err) => {
-            warn!(
-                ?err,
-                "cold-path tick persistence writer: QuestDB unavailable at startup — \
-                 buffering all ticks in ring buffer + disk spill until QuestDB comes back"
-            );
-            // CRITICAL FIX: Never return here. Use new_disconnected() so the consumer
-            // keeps running and buffers ALL ticks. The writer will auto-reconnect every
-            // 30 seconds and drain the buffer when QuestDB becomes available.
-            // Without this, fast-boot mode loses ALL ticks when QuestDB is down.
-            TickPersistenceWriter::new_disconnected(&questdb_config)
-        }
-    };
-
-    let mut ticks_persisted: u64 = 0;
-    // O(1) EXEMPT: cold path, pipeline setup
-    let flush_interval = std::time::Duration::from_millis(100);
-    let mut last_flush = std::time::Instant::now();
-
-    // S3-1: QuestDB health poller — state machine that tracks the writer's
-    // connection state and fires CRITICAL alerts on outages >30s.
-    let mut qdb_health_poller = tickvault_storage::questdb_health::QuestDbHealthPoller::new();
-    let qdb_health_tick_interval = std::time::Duration::from_secs(2); // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
-    let mut last_qdb_health_tick = std::time::Instant::now();
-
-    // Tick gap tracker — detects when a security's LTT gap exceeds the
-    // ERROR threshold. Fires its own log/metric/alert; gap backfill is
-    // explicitly disabled inside the WebSocket path (user policy:
-    // in-market backfill must never run; post-market historical fetch
-    // handles the cold path separately).
-    //
-    // Capacity = MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION (5000) ×
-    // MAX_WEBSOCKET_CONNECTIONS (5) = 25,000.
-    let tick_gap_tracker_capacity =
-        tickvault_common::constants::MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION
-            .saturating_mul(tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS);
-    let mut tick_gap_tracker =
-        tickvault_trading::risk::tick_gap_tracker::TickGapTracker::new(tick_gap_tracker_capacity);
-    info!(
-        capacity = tick_gap_tracker_capacity,
-        "tick gap tracker instantiated with full-universe capacity (in-market backfill disabled)"
-    );
-
-    loop {
-        match tick_rx.recv().await {
-            Ok(tick) => {
-                // Record the tick into the gap tracker. The tracker fires
-                // its own log/metric on gap thresholds; we do NOT publish
-                // any backfill request (in-market backfill disabled).
-                let _ = tick_gap_tracker.record_tick(tick.security_id, tick.exchange_timestamp);
-
-                if let Err(err) = tick_writer.append_tick(&tick) {
-                    // Phase 0 / Rule 5: persistence failures are ERROR (route to Telegram).
-                    error!(?err, "cold-path tick persistence write failed");
-                }
-
-                ticks_persisted = ticks_persisted.saturating_add(1);
-
-                // S3-1: Poll the QuestDB health state machine every 2s.
-                // The state machine is pure — we feed it the current
-                // connection state and the current time, and it returns
-                // a verdict that we hand to emit_metrics_for_verdict.
-                if last_qdb_health_tick.elapsed() >= qdb_health_tick_interval {
-                    let verdict = qdb_health_poller
-                        .tick(tick_writer.is_connected(), std::time::Instant::now());
-                    tickvault_storage::questdb_health::emit_metrics_for_verdict(
-                        verdict,
-                        &qdb_health_poller,
-                    );
-                    last_qdb_health_tick = std::time::Instant::now();
-                }
-
-                // Periodic flush (every 100ms) to keep data flowing to QuestDB.
-                if last_flush.elapsed() >= flush_interval {
-                    let _ = tick_writer.flush_if_needed();
-                    last_flush = std::time::Instant::now();
-                }
-
-                // B2: After QuestDB recovery + buffer drain, run integrity check.
-                if tick_writer.take_recovery_flag() {
-                    // Fire immediate Telegram notification for QuestDB recovery.
-                    if let Some(ref n) = notifier {
-                        n.notify(NotificationEvent::QuestDbReconnected {
-                            writer: "tick".to_string(),
-                            drained_count: ticks_persisted as usize,
-                        });
-                    }
-                    let qdb_config = questdb_config.clone();
-                    tokio::spawn(async move {
-                        tickvault_storage::tick_persistence::check_tick_gaps_after_recovery(
-                            &qdb_config,
-                            30, // Check last 30 minutes
-                        )
-                        .await;
-                    });
-                }
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                // C2: CRITICAL — ticks permanently lost due to broadcast lag.
-                // This fires ERROR log → Loki → Telegram alert automatically.
-                // Root cause: QuestDB ILP flush is slower than tick ingestion rate.
-                // Defense: broadcast capacity 262K + tick writer ring buffer 2M (PR #452) + disk spill.
-                error!(
-                    skipped,
-                    "CRITICAL: cold-path tick persistence lagged — {} ticks permanently lost",
-                    skipped
-                );
-                metrics::counter!("tv_ticks_permanently_lost").increment(skipped);
-                // Explicit Telegram: ERROR log triggers Loki alert, but also notify directly
-                // in case Loki pipeline is delayed.
-                if let Some(ref n) = notifier {
-                    n.notify(NotificationEvent::QuestDbDisconnected {
-                        writer: format!("tick_persistence (LAGGED: {skipped} ticks lost)"),
-                        signal: skipped,
-                        signal_kind: "Ticks dropped by broadcast lag".to_string(),
-                    });
-                }
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                info!(
-                    ticks_persisted,
-                    "cold-path tick persistence consumer shutting down (broadcast closed)"
-                );
-                let _ = tick_writer.flush_if_needed();
-                return;
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -625,11 +625,11 @@ fn chaos_sigkill_mid_batch_spill_replay() {
         let spill_file = tmp_dir.join(format!("ticks-{}.bin", chrono::Utc::now().format("%Y%m%d")));
         let metadata = std::fs::metadata(&spill_file)
             .expect("spill file must survive writer drop (the entire point of the test)");
-        let expected_bytes = u64::from(overflow_count) * 112; // TICK_SPILL_RECORD_SIZE
+        let expected_bytes = u64::from(overflow_count) * 120; // TICK_SPILL_RECORD_SIZE (TICK-SEQ-01 PR-2b: 112→120, +8B capture_seq)
         assert_eq!(
             metadata.len(),
             expected_bytes,
-            "spill file length mismatch — expected {expected_bytes} bytes ({overflow_count} × 112)"
+            "spill file length mismatch — expected {expected_bytes} bytes ({overflow_count} × 120)"
         );
         drop(replay);
     }
