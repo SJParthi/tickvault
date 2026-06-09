@@ -10,7 +10,7 @@
 //! - **Pure helpers** — zero I/O, fully testable: `format_bind_addr`, `effective_ws_stagger`, etc.
 //! - **Config & logging** — `load_and_validate_config`, `build_env_filter`, `build_fmt_layer`
 //! - **Boot orchestration** — `load_instruments`, `build_websocket_pool`, `run_shutdown_fast`
-//! - **Persistence consumers** — `run_tick_persistence_consumer`
+//! - **Observability consumers** — `run_slow_boot_observability` (gap-track + QuestDB health; both boot paths)
 
 use chrono::{NaiveDate, Timelike};
 use tracing::warn;

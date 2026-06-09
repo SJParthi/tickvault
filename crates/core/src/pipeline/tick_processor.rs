@@ -1417,9 +1417,13 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                                 prev_day_oi: enriched.prev_day_oi,
                                 phase: enriched.phase as u8,
                             };
-                            writer.append_tick_enriched(&tick, life)
+                            // TICK-SEQ-01 PR-2b (review C1): the Full-packet arm
+                            // MUST thread the same replay-stable capture_seq as the
+                            // Quote arm — else WAL replay re-stamps a fresh seq and
+                            // the row duplicates under the capture_seq dedup key.
+                            writer.append_tick_enriched_with_seq(&tick, life, capture_seq)
                         } else {
-                            writer.append_tick(&tick)
+                            writer.append_tick_with_seq(&tick, capture_seq)
                         };
                         match result {
                             Ok(()) => {

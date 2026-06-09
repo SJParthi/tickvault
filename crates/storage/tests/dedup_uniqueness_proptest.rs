@@ -1,9 +1,19 @@
 //! S3-3: Property test for tick DEDUP uniqueness.
 //!
-//! **Invariant under test:** the quadruple `(exchange_timestamp, security_id,
-//! exchange_segment_code, payload_hash)` is the unique key for a tick in
-//! QuestDB. Two ticks with the same quadruple will be merged by QuestDB DEDUP
-//! UPSERT KEYS; two ticks with ANY difference MUST be preserved as separate rows.
+//! **TICK-SEQ-01 PR-2b update:** the live `ticks` DEDUP tiebreaker is now
+//! `capture_seq` (a replay-stable read-loop sequence), NOT `payload_hash` —
+//! because `payload_hash` (content) collapses two same-second SAME-VALUE index
+//! ticks (the live `45→75→45` NIFTY loss). The capture_seq dedup is
+//! regression-tested in `chaos_index_same_value_burst_preserved.rs`. The
+//! property tests BELOW still exercise `tick_payload_hash` as a deterministic
+//! CONTENT-FINGERPRINT function (it remains a stored content-integrity column),
+//! and `dedup_key_string_contains_security_id_and_segment` pins the actual
+//! capture_seq key.
+//!
+//! **Invariant under test (content fingerprint):** the quadruple
+//! `(exchange_timestamp, security_id, exchange_segment_code, payload_hash)`
+//! distinguishes ticks by CONTENT. Two ticks with the same quadruple have
+//! identical content; two ticks with ANY value difference get a different hash.
 //!
 //! **2026-06-08:** `payload_hash` REPLACED `received_at_nanos` as the
 //! sub-second tiebreaker. `received_at` was stamped at processing time, so on
@@ -179,15 +189,19 @@ fn dedup_key_string_contains_security_id_and_segment() {
          cross-segment collision, got: {key}"
     );
     assert!(
-        key.contains("payload_hash"),
-        "DEDUP_KEY_TICKS must include payload_hash to preserve sub-second ticks \
-         AND stay replay-idempotent (Dhan LTT is second-granular; received_at was \
-         re-stamped on replay → duplicates, replaced 2026-06-08), got: {key}"
+        key.contains("capture_seq"),
+        "DEDUP_KEY_TICKS must include capture_seq — the replay-stable sub-second \
+         tiebreaker (TICK-SEQ-01 PR-2b). payload_hash collapsed same-value index \
+         ticks (the 45->75->45 loss); capture_seq keeps distinct arrivals, got: {key}"
     );
     assert!(
         !key.contains("received_at"),
-        "received_at must NOT be in the dedup key (re-stamped on replay → \
-         duplicates); replaced by payload_hash 2026-06-08, got: {key}"
+        "received_at must NOT be in the dedup key (re-stamped on replay → duplicates), got: {key}"
+    );
+    assert!(
+        !key.contains("payload_hash"),
+        "payload_hash must NOT be in the dedup key after PR-2b — it collapses \
+         same-value same-second index ticks; it stays a stored content column, got: {key}"
     );
 }
 

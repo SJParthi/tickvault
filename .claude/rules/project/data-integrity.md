@@ -14,22 +14,37 @@ paths:
 - QuestDB: designated timestamp + security_id as natural dedup key
 
 ## Tick Deduplication
-- **QuestDB `ticks` DEDUP UPSERT KEY = `(ts, security_id, segment, payload_hash)`**
-  (`DEDUP_KEY_TICKS` in `crates/storage/src/tick_persistence.rs`).
+- **QuestDB `ticks` DEDUP UPSERT KEY = `(ts, security_id, segment, capture_seq)`**
+  (`DEDUP_KEY_TICKS` in `crates/storage/src/tick_persistence.rs`) — TICK-SEQ-01.
   - `ts` = `exchange_timestamp × 1e9` (Dhan LTT, SECOND-granular).
   - `segment` — mandatory (I-P1-11; `security_id` reused across segments).
-  - `payload_hash` — deterministic FNV-1a fingerprint of the tick's value-bearing
-    fields (`tick_payload_hash`). This is the sub-second tiebreaker AND the
-    replay-idempotency key: distinct same-second ticks differ in ≥1 field →
-    different hash → both kept (no loss); a true duplicate / WAL-replay /
-    reconnect re-send is byte-identical → same hash → collapsed (idempotent).
-  - **Dhan has NO per-tick sequence number** — `payload_hash` (content) is the
-    only deterministic, replay-stable uniqueness basis available.
-  - **`received_at` is NOT in the key** (2026-06-08): it is re-stamped at
-    processing time, so on replay it differs → would create duplicate rows.
-    It remains a stored column for latency analysis only.
-- FNV-1a MUST stay fixed-seed/deterministic — NEVER `std::hash::DefaultHasher`
-  (per-process randomized → breaks replay idempotency across restarts).
+  - `capture_seq` — the sub-second tiebreaker AND the replay-idempotency key. It
+    is a strictly-monotonic, **replay-stable** sequence stamped ONCE at the WS
+    read instant (`ws_frame_spill::next_frame_seq` = `max(prev+1, wall_nanos)`,
+    1 frame = 1 tick) and carried **unchanged** through RAM → ring → spill → DLQ
+    → WAL → DB:
+    - two DISTINCT arrivals get DISTINCT `capture_seq` → BOTH kept (no loss),
+      **even when every value field is byte-identical** — this is the fix for the
+      live index loss `NIFTY 23,146.45 → 23,146.75 → 23,146.45` (volume=0 indices
+      have no per-tick variation, so content alone cannot distinguish them);
+    - a true duplicate / WAL-replay / reconnect re-send reuses the **SAME**
+      `capture_seq` (read back from the `TVW2` WAL record, NOT re-stamped) → same
+      key → collapsed (idempotent, replay-safe).
+  - **`payload_hash` is NOT in the key** (TICK-SEQ-01 PR-2b): it COLLAPSED
+    same-value same-second index ticks (real data loss). It remains a stored
+    **content-integrity** column (and `tick_payload_hash` a deterministic
+    fingerprint function), just no longer the dedup tiebreaker.
+  - **`received_at` is NOT in the key**: re-stamped at processing time, so on
+    replay it differs → would create duplicate rows. Stored column only.
+  - **Key-flip migration is in-place + fail-safe**: `ensure_tick_table_dedup_keys`
+    re-runs `DEDUP ENABLE UPSERT KEYS(...)` with the new key set; the stale-schema
+    DROP-recovery path **NEVER drops a POPULATED `ticks` table** (SEBI retention)
+    — `ticks_table_is_populated` gates it (`tv_ticks_dedup_drop_blocked_total`).
+- `capture_seq` MUST stay strictly-monotonic + WAL-persisted (replay-stable);
+  a per-process counter that resets on restart would break cross-restart
+  idempotency — it is seeded from wall-clock nanos.
+- Regression-pinned by `chaos_index_same_value_burst_preserved.rs` (the
+  `45→75→45` test + replay-twice idempotency) + `test_dedup_key_is_capture_seq_after_flip`.
 - Bounded ring buffer for O(1) lookup; log duplicates at WARN.
 
 ## Position Reconciliation
