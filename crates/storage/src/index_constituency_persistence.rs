@@ -64,6 +64,11 @@ pub const DEDUP_KEY_INDEX_CONSTITUENCY: &str = "ts, index_name, security_id, exc
 /// Column list shared by the DDL — one source so the writer + table cannot
 /// drift. (The ILP writer names each column explicitly; this constant pins the
 /// DDL ordering + the `test_ddl_contains_expected_columns` ratchet.)
+///
+/// Test-only: referenced exclusively by the DDL-column ratchet tests, so it is
+/// `#[cfg(test)]`-gated to avoid a dead-code lint on the production lib build
+/// (`cargo clippy --all-targets -- -D warnings`).
+#[cfg(test)]
 const INDEX_CONSTITUENCY_COLUMNS: &[&str] = &[
     "ts",
     "index_name",
