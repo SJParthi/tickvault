@@ -1669,7 +1669,8 @@ async fn main() -> Result<()> {
             config.questdb.clone(),
             config.dhan.clone(),
             config.instrument.clone(),
-            health_status,
+            // clone (not move) so the post-market task spawn below can also hold it
+            health_status.clone(),
         );
 
         // 2026-04-25 security audit (PR #357): SSM-only bearer token resolution
@@ -1732,6 +1733,23 @@ async fn main() -> Result<()> {
         // which is exactly why ticks never persisted on AWS. No-op when
         // NOTIFY_SOCKET is unset (e.g. local `cargo run`).
         infra::notify_systemd_ready();
+
+        // Boot-symmetry fix (2026-06-09): the post-market 15:31 cross-verify +
+        // 15:31:30 EOD digest were slow-boot-only, so a mid-session crash restart
+        // (this fast-boot path) silently skipped both. Spawn the same tasks here.
+        // The EOD digest always runs. The cross-verify reads the globally-stashed
+        // DailyUniverse (stashed inside cold_build_daily_universe, which the cold
+        // fast-boot path also goes through); the INSTANT warm-snapshot fast-path
+        // builds no DailyUniverse object, so cross-verify there finds none and
+        // self-skips (honest limitation — warm-path cross-verify is a follow-up).
+        // Each task also self-skips if past its IST trigger or on a non-trading day.
+        spawn_post_market_tasks(
+            notifier.clone(),
+            std::sync::Arc::clone(&health_status),
+            std::sync::Arc::clone(&trading_calendar),
+            std::sync::Arc::clone(&token_handle),
+            &config,
+        );
 
         // --- Await shutdown ---
         return run_shutdown_fast(
@@ -3565,189 +3583,16 @@ async fn main() -> Result<()> {
                 });
             }
 
-            // Phase 0 Item 22d (2026-05-15): End-of-day digest at
-            // 15:31:30 IST — 90s after the 15:30 close so the
-            // market-close shutdown signal has settled. Severity::Info
-            // — never pages, only a daily positive ping that the feed
-            // stayed up + token has overnight headroom.
-            //
-            // Audit-findings Rule 3 (market-hours-aware): trading-day
-            // check + skip silently if past 15:31:30 IST (mid-evening
-            // boot legitimately runs past this point).
-            //
-            // Operator-charter §G: plain-English action line when the
-            // JWT will expire before tomorrow's opening bell.
-            {
-                let eod_notifier = notifier.clone();
-                let eod_health = health_status.clone();
-                let eod_calendar = std::sync::Arc::clone(&trading_calendar);
-                let eod_main_feed_total = tickvault_common::config::effective_main_feed_pool_size(
-                    config.subscription.scope,
-                    config.dhan.max_websocket_connections,
-                );
-                tokio::spawn(async move {
-                    use chrono::{FixedOffset, NaiveTime, TimeZone, Utc};
-                    use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
-                    let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
-                        return;
-                    };
-                    let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
-                    let today_ist = now_ist.date_naive();
-                    if !eod_calendar.is_trading_day(today_ist) {
-                        info!("end-of-day digest: skipping (non-trading day)");
-                        return;
-                    }
-                    let Some(target) = NaiveTime::from_hms_opt(15, 31, 30) else {
-                        return;
-                    };
-                    let now_time = now_ist.time();
-                    if now_time >= target {
-                        // Mid-evening boot past 15:31:30 — skip silently
-                        // (audit-findings Rule 3).
-                        debug!(
-                            now = %now_time,
-                            "end-of-day digest: skipping (past 15:31:30 — mid-evening boot)"
-                        );
-                        return;
-                    }
-                    let secs_until = (target - now_time).num_seconds().max(0) as u64;
-                    info!(secs_until, "end-of-day digest: sleeping until 15:31:30 IST");
-                    tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
-
-                    let main_active = eod_health.websocket_connections() as usize;
-                    let token_hours = eod_health.token_remaining_secs() / 3600;
-                    let trading_date_ist = today_ist.format("%Y-%m-%d").to_string();
-                    info!(
-                        main_feed = main_active,
-                        token_remaining_hours = token_hours,
-                        trading_date = %trading_date_ist,
-                        "PROOF: end-of-day digest fired @ 15:31:30 IST"
-                    );
-                    eod_notifier.notify(NotificationEvent::EndOfDayDigest {
-                        trading_date_ist,
-                        main_feed_active: main_active,
-                        main_feed_total: eod_main_feed_total,
-                        token_remaining_hours: token_hours,
-                    });
-                });
-            }
-
-            // Operator directive 2026-06-02: post-market 1-minute
-            // cross-verification at 15:31:00 IST. For every subscribed SPOT
-            // instrument, compare our live `candles_1m` OHLCV against Dhan's
-            // authoritative intraday 1-minute candles, EXACT match, and write
-            // mismatches to the `cross_verify_1m_audit` table + a per-day CSV
-            // (`data/cross-verify/`). The per-day mismatch COUNT is the quality
-            // signal. Cold path, fail-soft, market-hours-gated (audit Rule 3).
-            if let Some(cv_universe) = tickvault_app::prev_day_ohlcv_boot::stashed_universe() {
-                // Build owned spot targets HERE (universe Arc in scope) so the
-                // task doesn't hold the Arc. Skip rows with an unparseable SID.
-                let cv_targets: Vec<tickvault_app::cross_verify_1m_boot::CrossVerifyTarget> =
-                    cv_universe
-                        .subscription_targets
-                        .iter()
-                        .filter_map(|t| {
-                            t.csv_row.security_id.trim().parse::<i64>().ok().map(|sid| {
-                                tickvault_app::cross_verify_1m_boot::CrossVerifyTarget {
-                                    security_id: sid,
-                                    segment: t.csv_row.segment.trim().to_string(),
-                                    symbol: t.csv_row.symbol_name.trim().to_string(),
-                                    instrument:
-                                        tickvault_app::prev_day_ohlcv_boot::instrument_type_for_role(
-                                            t.role,
-                                        ),
-                                }
-                            })
-                        })
-                        .collect();
-                let cv_token = std::sync::Arc::clone(&token_handle);
-                let cv_qcfg = config.questdb.clone();
-                let cv_base = config.dhan.rest_api_base_url.clone();
-                let cv_calendar = std::sync::Arc::clone(&trading_calendar);
-                tokio::spawn(async move {
-                    use chrono::{FixedOffset, TimeZone, Timelike, Utc};
-                    use tickvault_app::cross_verify_1m_boot::{
-                        CrossVerifyStart, decide_cross_verify_start,
-                    };
-                    use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
-                    let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
-                        return;
-                    };
-                    let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
-                    let today_ist = now_ist.date_naive();
-                    if cv_targets.is_empty() {
-                        info!("cross_verify_1m: no spot targets — skipping");
-                        return;
-                    }
-                    // Operator on-demand override: `make cross-verify-now` sets
-                    // TICKVAULT_CROSS_VERIFY_NOW=1 to run the verification right
-                    // now (proving the pipeline without waiting for 15:31 IST on
-                    // a live trading day). Fail-soft: a forced run on a quiet day
-                    // just yields an empty/degraded report, never fabricated data.
-                    let force_now = std::env::var("TICKVAULT_CROSS_VERIFY_NOW")
-                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                        .unwrap_or(false);
-                    let now_secs_of_day = now_ist.time().num_seconds_from_midnight();
-                    let is_trading_day = cv_calendar.is_trading_day(today_ist);
-                    match decide_cross_verify_start(now_secs_of_day, is_trading_day, force_now) {
-                        CrossVerifyStart::SkipNonTradingDay => {
-                            info!("cross_verify_1m: skipping (non-trading day)");
-                            return;
-                        }
-                        CrossVerifyStart::SkipPastTrigger => {
-                            debug!(
-                                now = %now_ist.time(),
-                                "cross_verify_1m: skipping (past 15:31 — mid-evening boot)"
-                            );
-                            return;
-                        }
-                        CrossVerifyStart::RunNow => {
-                            info!(
-                                "cross_verify_1m: TICKVAULT_CROSS_VERIFY_NOW set — running \
-                                 on-demand NOW (operator dry-run)"
-                            );
-                        }
-                        CrossVerifyStart::SleepThenRun(secs_until) => {
-                            info!(secs_until, "cross_verify_1m: sleeping until 15:31:00 IST");
-                            tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
-                        }
-                    }
-
-                    // IST-midnight-as-epoch nanos (our candles_1m `ts` stores
-                    // IST wall-clock as an epoch — data-integrity.md). The day
-                    // window for the SELECT is [midnight, midnight+24h).
-                    let day_start_secs = today_ist
-                        .and_hms_opt(0, 0, 0)
-                        .map(|dt| dt.and_utc().timestamp())
-                        .unwrap_or(0);
-                    let day_start_ist_nanos = day_start_secs.saturating_mul(1_000_000_000);
-                    let run_ts_ist_nanos = Utc::now()
-                        .timestamp()
-                        .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
-                        .saturating_mul(1_000_000_000);
-
-                    let summary = tickvault_app::cross_verify_1m_boot::run_cross_verify_1m(
-                        &cv_targets,
-                        cv_token,
-                        cv_qcfg,
-                        cv_base,
-                        today_ist,
-                        day_start_ist_nanos,
-                        run_ts_ist_nanos,
-                        tickvault_app::cross_verify_1m_boot::default_csv_dir(),
-                    )
-                    .await;
-                    info!(
-                        instruments = summary.instruments_checked,
-                        compared = summary.stats.compared,
-                        mismatches = summary.stats.mismatches,
-                        missing = summary.stats.missing_ours,
-                        degraded = summary.degraded,
-                        "PROOF: cross_verify_1m fired @ 15:31:00 IST"
-                    );
-                });
-                info!("cross_verify_1m: post-market verification task spawned");
-            }
+            // Post-market tasks (EOD digest 15:31:30 IST + 1-minute cross-verify
+            // 15:31:00 IST). Extracted to spawn_post_market_tasks so the fast-boot
+            // path runs them too (boot-symmetry, 2026-06-09).
+            spawn_post_market_tasks(
+                notifier.clone(),
+                std::sync::Arc::clone(&health_status),
+                std::sync::Arc::clone(&trading_calendar),
+                std::sync::Arc::clone(&token_handle),
+                &config,
+            );
 
             // Wave 3-C Item 12 (2026-04-28): market-open self-test at
             // 09:16:00 IST — a single tri-state verdict
@@ -6969,4 +6814,199 @@ fn redact_ip_last_octet(raw: &str) -> String {
     }
     // Unknown shape — fully redact
     "[REDACTED]".to_string()
+}
+
+/// Spawn the two post-market tasks — end-of-day digest (15:31:30 IST) and the
+/// 1-minute cross-verify (15:31:00 IST). Called from BOTH boot paths so a
+/// mid-session fast-boot restart runs them too (boot-symmetry, 2026-06-09).
+/// Each spawned task self-skips if past its IST trigger or on a non-trading day,
+/// so calling this from a late/non-trading boot is safe (no-op).
+fn spawn_post_market_tasks(
+    notifier: std::sync::Arc<NotificationService>,
+    health_status: SharedHealthStatus,
+    trading_calendar: std::sync::Arc<TradingCalendar>,
+    token_handle: TokenHandle,
+    config: &ApplicationConfig,
+) {
+    // Phase 0 Item 22d (2026-05-15): End-of-day digest at
+    // 15:31:30 IST — 90s after the 15:30 close so the
+    // market-close shutdown signal has settled. Severity::Info
+    // — never pages, only a daily positive ping that the feed
+    // stayed up + token has overnight headroom.
+    //
+    // Audit-findings Rule 3 (market-hours-aware): trading-day
+    // check + skip silently if past 15:31:30 IST (mid-evening
+    // boot legitimately runs past this point).
+    //
+    // Operator-charter §G: plain-English action line when the
+    // JWT will expire before tomorrow's opening bell.
+    {
+        let eod_notifier = notifier.clone();
+        let eod_health = health_status.clone();
+        let eod_calendar = std::sync::Arc::clone(&trading_calendar);
+        let eod_main_feed_total = tickvault_common::config::effective_main_feed_pool_size(
+            config.subscription.scope,
+            config.dhan.max_websocket_connections,
+        );
+        tokio::spawn(async move {
+            use chrono::{FixedOffset, NaiveTime, TimeZone, Utc};
+            use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+            let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+                return;
+            };
+            let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+            let today_ist = now_ist.date_naive();
+            if !eod_calendar.is_trading_day(today_ist) {
+                info!("end-of-day digest: skipping (non-trading day)");
+                return;
+            }
+            let Some(target) = NaiveTime::from_hms_opt(15, 31, 30) else {
+                return;
+            };
+            let now_time = now_ist.time();
+            if now_time >= target {
+                // Mid-evening boot past 15:31:30 — skip silently
+                // (audit-findings Rule 3).
+                debug!(
+                    now = %now_time,
+                    "end-of-day digest: skipping (past 15:31:30 — mid-evening boot)"
+                );
+                return;
+            }
+            let secs_until = (target - now_time).num_seconds().max(0) as u64;
+            info!(secs_until, "end-of-day digest: sleeping until 15:31:30 IST");
+            tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+
+            let main_active = eod_health.websocket_connections() as usize;
+            let token_hours = eod_health.token_remaining_secs() / 3600;
+            let trading_date_ist = today_ist.format("%Y-%m-%d").to_string();
+            info!(
+                main_feed = main_active,
+                token_remaining_hours = token_hours,
+                trading_date = %trading_date_ist,
+                "PROOF: end-of-day digest fired @ 15:31:30 IST"
+            );
+            eod_notifier.notify(NotificationEvent::EndOfDayDigest {
+                trading_date_ist,
+                main_feed_active: main_active,
+                main_feed_total: eod_main_feed_total,
+                token_remaining_hours: token_hours,
+            });
+        });
+    }
+
+    // Operator directive 2026-06-02: post-market 1-minute
+    // cross-verification at 15:31:00 IST. For every subscribed SPOT
+    // instrument, compare our live `candles_1m` OHLCV against Dhan's
+    // authoritative intraday 1-minute candles, EXACT match, and write
+    // mismatches to the `cross_verify_1m_audit` table + a per-day CSV
+    // (`data/cross-verify/`). The per-day mismatch COUNT is the quality
+    // signal. Cold path, fail-soft, market-hours-gated (audit Rule 3).
+    if let Some(cv_universe) = tickvault_app::prev_day_ohlcv_boot::stashed_universe() {
+        // Build owned spot targets HERE (universe Arc in scope) so the
+        // task doesn't hold the Arc. Skip rows with an unparseable SID.
+        let cv_targets: Vec<tickvault_app::cross_verify_1m_boot::CrossVerifyTarget> = cv_universe
+            .subscription_targets
+            .iter()
+            .filter_map(|t| {
+                t.csv_row.security_id.trim().parse::<i64>().ok().map(|sid| {
+                    tickvault_app::cross_verify_1m_boot::CrossVerifyTarget {
+                        security_id: sid,
+                        segment: t.csv_row.segment.trim().to_string(),
+                        symbol: t.csv_row.symbol_name.trim().to_string(),
+                        instrument: tickvault_app::prev_day_ohlcv_boot::instrument_type_for_role(
+                            t.role,
+                        ),
+                    }
+                })
+            })
+            .collect();
+        let cv_token = std::sync::Arc::clone(&token_handle);
+        let cv_qcfg = config.questdb.clone();
+        let cv_base = config.dhan.rest_api_base_url.clone();
+        let cv_calendar = std::sync::Arc::clone(&trading_calendar);
+        tokio::spawn(async move {
+            use chrono::{FixedOffset, TimeZone, Timelike, Utc};
+            use tickvault_app::cross_verify_1m_boot::{
+                CrossVerifyStart, decide_cross_verify_start,
+            };
+            use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+            let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+                return;
+            };
+            let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+            let today_ist = now_ist.date_naive();
+            if cv_targets.is_empty() {
+                info!("cross_verify_1m: no spot targets — skipping");
+                return;
+            }
+            // Operator on-demand override: `make cross-verify-now` sets
+            // TICKVAULT_CROSS_VERIFY_NOW=1 to run the verification right
+            // now (proving the pipeline without waiting for 15:31 IST on
+            // a live trading day). Fail-soft: a forced run on a quiet day
+            // just yields an empty/degraded report, never fabricated data.
+            let force_now = std::env::var("TICKVAULT_CROSS_VERIFY_NOW")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let now_secs_of_day = now_ist.time().num_seconds_from_midnight();
+            let is_trading_day = cv_calendar.is_trading_day(today_ist);
+            match decide_cross_verify_start(now_secs_of_day, is_trading_day, force_now) {
+                CrossVerifyStart::SkipNonTradingDay => {
+                    info!("cross_verify_1m: skipping (non-trading day)");
+                    return;
+                }
+                CrossVerifyStart::SkipPastTrigger => {
+                    debug!(
+                        now = %now_ist.time(),
+                        "cross_verify_1m: skipping (past 15:31 — mid-evening boot)"
+                    );
+                    return;
+                }
+                CrossVerifyStart::RunNow => {
+                    info!(
+                        "cross_verify_1m: TICKVAULT_CROSS_VERIFY_NOW set — running \
+                                 on-demand NOW (operator dry-run)"
+                    );
+                }
+                CrossVerifyStart::SleepThenRun(secs_until) => {
+                    info!(secs_until, "cross_verify_1m: sleeping until 15:31:00 IST");
+                    tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+                }
+            }
+
+            // IST-midnight-as-epoch nanos (our candles_1m `ts` stores
+            // IST wall-clock as an epoch — data-integrity.md). The day
+            // window for the SELECT is [midnight, midnight+24h).
+            let day_start_secs = today_ist
+                .and_hms_opt(0, 0, 0)
+                .map(|dt| dt.and_utc().timestamp())
+                .unwrap_or(0);
+            let day_start_ist_nanos = day_start_secs.saturating_mul(1_000_000_000);
+            let run_ts_ist_nanos = Utc::now()
+                .timestamp()
+                .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
+                .saturating_mul(1_000_000_000);
+
+            let summary = tickvault_app::cross_verify_1m_boot::run_cross_verify_1m(
+                &cv_targets,
+                cv_token,
+                cv_qcfg,
+                cv_base,
+                today_ist,
+                day_start_ist_nanos,
+                run_ts_ist_nanos,
+                tickvault_app::cross_verify_1m_boot::default_csv_dir(),
+            )
+            .await;
+            info!(
+                instruments = summary.instruments_checked,
+                compared = summary.stats.compared,
+                mismatches = summary.stats.mismatches,
+                missing = summary.stats.missing_ours,
+                degraded = summary.degraded,
+                "PROOF: cross_verify_1m fired @ 15:31:00 IST"
+            );
+        });
+        info!("cross_verify_1m: post-market verification task spawned");
+    }
 }

@@ -1,93 +1,77 @@
-# Implementation Plan: Permanent AUTO-START guarantee — failed deploy must not disable the unit
+# Implementation Plan: Boot-symmetry — post-market cross-verify + EOD digest must run on BOTH boot paths
 
 **Status:** VERIFIED
 **Date:** 2026-06-09
-**Approved by:** Parthiban ("yes dude yes" — 2026-06-09)
-**Crate(s) touched:** `tickvault-storage` (test only) + `.github/workflows/deploy-aws.yml` (infra)
+**Approved by:** Parthiban ("go ahead with the plan" — 2026-06-09, after #1068 merged)
+**Crate(s) touched:** `tickvault-app` (`crates/app/src/main.rs`) + new ratchet test in `tickvault-storage`/`tickvault-app` tests
 
-## Context
+## Context / the gap (verified in code)
 
-Operator question 2026-06-09: *"will this auto start tomorrow as per the process
-automatically can you guarantee me?"* Investigation found `deploy-aws.yml`'s
-deploy-failure path ran `systemctl stop tickvault` **and** `systemctl disable
-tickvault`. The `disable` is the auto-start killer: a disabled unit does not
-start at the next 08:30 IST boot, AND `scripts/aws-autopilot.sh` treats a
-disabled unit as an intentional kill-switch and refuses to self-heal it. So one
-failed evening deploy silently removed the next morning's auto-start with almost
-no signal. This is the permanent repo fix the operator asked for.
+`main.rs` has two mutually-exclusive boot paths:
+- **Slow boot** (normal morning / off-hours): builds the universe via `cold_build_daily_universe()` which calls `prev_day_ohlcv_boot::stash_universe(...)` (line ~5366), then in its tail spawns the **end-of-day digest** (15:31:30 IST, lines ~3568-3633) and the **post-market 1-minute cross-verify** (15:31:00 IST, lines ~3635-3750).
+- **Fast boot** (mid-session crash restart, 09:00-15:30 IST): loads instruments via `load_instruments()` → `fresh_universe: Option<Arc<DailyUniverse>>` (line ~1105), wires the pipeline, then awaits shutdown and `return Ok(())` BEFORE ever reaching the slow-boot tail.
 
-## Design
+**Result:** on a mid-session restart (today's exact case), the 15:31 cross-verify and 15:31:30 EOD digest are **silently skipped** — which is why the operator couldn't see the post-market cross-verification today. Both are future-of-day events the fast-booted process is alive for, so both SHOULD run.
 
-Keep the `systemctl stop` (it alone breaks the systemd `Restart=always`
-"Auth OK" Telegram-per-minute spam loop for the current boot — an explicit stop
-suppresses `Restart=always` until the next boot). DROP the `systemctl disable`.
-The unit stays ENABLED on a failed deploy, so:
-- systemd auto-starts it at the next 08:30 IST boot;
-- `aws-autopilot.sh` restarts an enabled-but-inactive unit (existing self-heal);
-- a genuinely-bad binary is replaced by the morning redeploy (~08:45 IST).
-The intentional kill-switch (disable via AWS Control) stays the ONLY source of a
-disabled unit, so the autopilot's `disabled == intentional` semantics remain
-correct. No new Lambda / IAM / SSM machinery — the fix re-enables the existing
-self-heal by removing the one line that defeated it.
+Additionally, the cross-verify reads `prev_day_ohlcv_boot::stashed_universe()`, populated globally inside `cold_build_daily_universe`. The COLD fast-boot path also goes through `cold_build_daily_universe`, so it IS stashed there; only the INSTANT warm-snapshot fast-path builds no `DailyUniverse` object (it returns `None`), so cross-verify there self-skips. (`fresh_universe` from `load_instruments` is an `FnoUniverse`, a different type — it cannot be stashed as the `DailyUniverse` cross-verify needs.)
+
+## Design (decisions resolved — Rule 15/17)
+
+1. **Extract** the two inline spawn blocks into ONE module-scope helper
+   `fn spawn_post_market_tasks(notifier: Arc<NotificationService>, health_status: SharedHealthStatus, trading_calendar: Arc<TradingCalendar>, token_handle: TokenHandle, config: &ApplicationConfig)`.
+   The helper body is the EXISTING code moved verbatim (EOD digest spawn + cross-verify spawn that reads `stashed_universe()` internally). Single source of truth → no copy-paste drift.
+2. **Slow boot:** replace the inline blocks (3568-3750) with one call to the helper.
+3. **Fast boot:** call the helper before the fast-boot shutdown await. NO `fresh_universe` stash — `fresh_universe` is an `FnoUniverse`, not the `DailyUniverse` cross-verify needs. The `DailyUniverse` is stashed globally inside `cold_build_daily_universe` (which the cold fast-boot path runs), so cross-verify works on the cold fast-boot path; the warm-snapshot fast-path has no `DailyUniverse` and cross-verify self-skips there (honest limitation — warm-path cross-verify is a follow-up). The EOD digest has no universe dependency and runs on both paths unconditionally.
+4. **Ratchet:** source-scan test asserting (i) `spawn_post_market_tasks(` is **called from ≥2 sites** in main.rs (both boot paths), and (ii) the `EndOfDayDigest` notify + `run_cross_verify_1m` call live ONLY inside the helper (not duplicated inline) — so a future edit can't wire a post-market task into only one path.
+
+**Why a helper, not duplicate blocks:** duplication is the exact drift this fix removes; the repo's boot-symmetry rule (S6-G4) requires both boot paths wired from one source.
 
 ## Edge Cases
 
-- **Binary crash-loops after a passed smoke-test:** unit stays enabled → next
-  boot crash-loops until the ~08:45 IST redeploy swaps a good binary. Bounded,
-  self-healing, operator already paged by the failure Telegram. Acceptable vs.
-  the old behaviour (silently disabled forever).
-- **Intentional kill-switch (AWS Control disable):** unaffected — still the only
-  path that disables; autopilot still respects it.
-- **Failure before AWS creds configured:** the SSM send-command no-ops via
-  `|| true` (unchanged).
+- **Fast boot warm-snapshot path (no DailyUniverse stashed):** cross-verify reads `stashed_universe() == None` → existing `if let Some(...)` skips cleanly (no panic). EOD digest still runs. Honest limitation, documented inline.
+- **Mid-evening fast boot past 15:31:** both tasks already self-skip via their internal `now >= target` / `decide_cross_verify_start(SkipPastTrigger)` guards (audit Rule 3) — unchanged.
+- **Non-trading day:** both tasks self-skip via `is_trading_day` checks — unchanged.
+- **Double-spawn risk:** the two paths are mutually exclusive (`if fast { ...; return } else { ... }`), so the helper runs exactly once per process. The ratchet counts call SITES (source), not runtime invocations.
 
 ## Failure Modes
 
-- Guard false-match on a comment string: avoided — the workflow no longer
-  contains the literal `disable tickvault` anywhere (the new comment uses
-  `systemctl disable` without `tickvault`).
-- Autopilot self-heal deleted in a future edit: pinned by Section C of the guard.
+- Helper param-type mismatch → caught by `cargo build -p tickvault-app`.
+- Fast boot lacks one of the params → verified present: `fast_notifier`, `health_status` (1327), `token_handle` (1028), `trading_calendar` (235, shared), `config` all in scope.
+- Cross-verify finding no targets on the warm fast-boot path → expected + documented (the `DailyUniverse` only exists on the cold path, which stashes it in `cold_build_daily_universe`).
 
 ## Test Plan
 
-- `crates/storage/tests/deploy_no_disable_on_failure_guard.rs`:
-  - `deploy_failure_path_never_disables_tickvault_unit`
-  - `deploy_failure_path_still_stops_to_break_restart_spam_loop`
-  - `autopilot_still_self_heals_enabled_but_inactive_unit`
-- `python3 -c "import yaml,sys; yaml.safe_load(open('.github/workflows/deploy-aws.yml'))"` parse check.
+- `crates/app/tests/boot_symmetry_post_market_guard.rs` (new):
+  - `post_market_tasks_called_from_both_boot_paths` (≥2 call sites)
+  - `eod_digest_and_cross_verify_live_only_in_the_helper` (no inline duplication)
+- `cargo build -p tickvault-app` clean.
+- `cargo test -p tickvault-app` scoped green.
 
 ## Rollback
 
-Pure infra (YAML + a test + this plan). Revert the single commit to restore the
-prior `stop`+`disable` failure path. No data migration, no binary behaviour
-change.
+Single commit; revert restores the slow-boot-only inline blocks. No schema, no data, no wire-protocol change — pure boot wiring of already-shipped tasks.
 
 ## Observability
 
-No new metric needed — the existing deploy-failure Telegram fires unchanged
-(wording updated to "stays set to auto-start at the next boot/deploy"). The
-`aws-autopilot.sh` self-heal already emits its `note_ok` / restart logs. The
-15-row + 7-row guarantee + resilience matrices are cross-referenced from
-`.claude/rules/project/per-wave-guarantee-matrix.md`; the applicable rows for
-this infra-only change are Recovery validation + Scenario coverage, both proven
-by the source-scan guard above.
+No new metric/event — reuses the existing `EndOfDayDigest` notification + `CROSS-VERIFY-1M-01/02` codes + the `"PROOF: ... fired"` info logs. The only change is that fast boot now ALSO emits them. The boot-symmetry ratchet is the regression lock. 15+7 guarantee matrices cross-referenced from `.claude/rules/project/per-wave-guarantee-matrix.md`; applicable rows: Functionality coverage (both paths) + Scenario coverage (mid-session restart day) + Recovery validation.
 
 ## Plan Items
 
-- [x] Drop `systemctl disable tickvault` from the deploy-failure SSM command; keep `stop`
-  - Files: .github/workflows/deploy-aws.yml
-  - Tests: deploy_failure_path_never_disables_tickvault_unit, deploy_failure_path_still_stops_to_break_restart_spam_loop
-- [x] Update the failure comment block + failure Telegram wording to reflect "unit stays enabled"
-  - Files: .github/workflows/deploy-aws.yml
-- [x] Add source-scan ratchet pinning the fix + the autopilot self-heal dependency
-  - Files: crates/storage/tests/deploy_no_disable_on_failure_guard.rs
-  - Tests: autopilot_still_self_heals_enabled_but_inactive_unit
+- [x] Extract `spawn_post_market_tasks` module-scope helper from the two inline slow-boot spawn blocks
+  - Files: crates/app/src/main.rs
+- [x] Slow boot: replace inline blocks with a call to the helper
+  - Files: crates/app/src/main.rs
+- [x] Fast boot: call the helper before shutdown await (universe stashed globally in cold_build; no fresh_universe stash — wrong type)
+  - Files: crates/app/src/main.rs
+- [x] Boot-symmetry ratchet test (both call sites + no inline duplication)
+  - Files: crates/app/tests/boot_symmetry_post_market_guard.rs
+  - Tests: post_market_tasks_called_from_both_boot_paths, eod_digest_and_cross_verify_live_only_in_the_helper
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | Evening deploy fails (smoke pass, runtime fail) | Unit STOPPED but ENABLED → next 08:30 boot auto-starts |
-| 2 | Next morning boot with enabled-but-inactive unit | systemd starts it; autopilot restarts within 15 min if not |
-| 3 | Operator intentionally disables via AWS Control | Autopilot respects kill-switch (unchanged) |
-| 4 | Future edit re-adds `disable tickvault` | Build fails on the ratchet guard |
+| 1 | Normal morning (slow) boot, trading day | EOD digest + cross-verify run (unchanged) |
+| 2 | Mid-session crash restart (fast boot) — today's case | EOD digest + cross-verify NOW run (the fix) |
+| 3 | Fast boot, no universe (Indices4Only) | cross-verify skips cleanly; EOD digest still runs |
+| 4 | Future edit wires a post-market task into one path only | Ratchet test fails the build |
