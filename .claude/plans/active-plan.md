@@ -1,93 +1,140 @@
-# Implementation Plan: ticks DEDUP tiebreaker → content `payload_hash` (replay-safe uniqueness)
+# Implementation Plan: WAL spill writer thread — survive I/O errors + respawn on panic + alarm the silent drop (zero-tick-loss hardening)
 
-**Status:** APPROVED
-**Date:** 2026-06-08
-**Approved by:** Parthiban — AskUserQuestion 2026-06-08 "Frame-payload hash (Recommended)" + "fix everything".
-**Crate(s) touched:** `tickvault-storage` (+ data-integrity rule).
+**Status:** VERIFIED
+**Date:** 2026-06-09
+**Approved by:** Parthiban — AskUserQuestion 2026-06-09 "Zero-tick-loss hardening first" (renewed "no Dhan frame ever lost, in any situation").
+**Crate(s) touched:** `tickvault-storage` (`ws_frame_spill.rs`), `tickvault-common` (`error_code.rs` + metrics catalog test) + a new runbook rule file.
 
 ## Context
 
-Deep audit of the tick-ingest path found the one genuine internal loss/duplicate suspect: the
-`ticks` DEDUP key `(ts, security_id, segment, received_at)` used `received_at` (local `Utc::now()`
-nanos, stamped at processing time) as the sub-second tiebreaker. Two flaws:
-1. **Not unique by construction** — relied on the wall clock returning a distinct nanosecond per
-   tick; two distinct same-second ticks could in theory collide → one silently lost.
-2. **Replay-unsafe** — on WAL/reconnect replay the same frame is re-stamped with a NEW `received_at`
-   → the key differs → a true duplicate would NOT collapse → duplicate row.
-Dhan's protocol has NO per-tick sequence number, so a content fingerprint is the only deterministic,
-replay-stable uniqueness basis.
+A hostile reliability audit of the full Dhan-frame → durable-persist path found the path is well
+defended (capture-before-broadcast is real and ordered; ring→spill→DLQ tiers are alarmed) with ONE
+genuine unmitigated loss vector — the WAL frame-spill **writer thread**:
+
+1. **`append()` `Disconnected` arm is SILENT** (`ws_frame_spill.rs:201`): when the background writer
+   thread has died, `spill_tx.try_send` returns `Disconnected`, and the arm returns
+   `AppendOutcome::Dropped` with **no `error!`, no counter** — unlike the `Full` arm directly above
+   (:175-200) which increments `tv_ws_frame_spill_drop_critical` + `tv_ticks_lost_total` and logs.
+2. **No supervisor/respawn for the writer thread**: `writer_loop` propagates any disk I/O error
+   (`write_record?`, `flush?`, `open_new_segment?`) out of the thread, the thread exits, and from
+   then on EVERY frame hits the silent `Disconnected` arm → the durable WAL floor is permanently
+   gone with near-zero signal. Contrast WS-GAP-05 (pool supervisor) and DISK-WATCHER-01 (disk
+   watcher) which both respawn.
+
+This is the exact "a Dhan frame lost in any situation, silently" case the operator forbids.
 
 ## Design
 
-1. **`tick_payload_hash(&ParsedTick) -> i64`** — deterministic FNV-1a (FIXED offset basis, NOT
-   `DefaultHasher`) over the value-bearing fields (ltp, exchange_timestamp, ltq, atp, volume,
-   buy/sell qty, oi, day o/h/l/c). Zero-alloc, `#[inline]`, O(1) over a fixed field set.
-2. **`DEDUP_KEY_TICKS`** `(ts, security_id, segment, received_at)` → `(ts, security_id, segment,
-   payload_hash)`. `received_at` stays a stored COLUMN (latency analysis), removed from the key.
-3. **DDL** adds `payload_hash LONG`; **brownfield migration** `ALTER TABLE ticks ADD COLUMN IF NOT
-   EXISTS payload_hash LONG` runs BEFORE the DEDUP ENABLE (so the existing-table auto-recover
-   DROP+CREATE path can never fire on the new key — no data loss).
-4. **Doc + data-integrity rule** updated to the new key + the determinism/replay rationale.
+Two layers — prevention first, then detection:
 
-Result: distinct ticks differ in ≥1 field → different hash → BOTH kept (no loss); a true duplicate /
-WAL-replay / reconnect re-send is byte-identical → same hash → collapsed (idempotent). Achieves the
-"a distinct tick can never be collapsed" goal AND fixes replay idempotency.
+1. **Prevention — resilient `writer_loop` (never dies on transient I/O):** restructure so a per-batch
+   `write_record`/`flush`/segment-rotation I/O error does NOT return out of the thread. On error:
+   `error!(code = WS-SPILL-01)` + `tv_ws_frame_spill_write_errors_total++`, attempt to open a FRESH
+   segment, brief bounded backoff on repeated failure, and **continue draining the channel**. The
+   only `Ok(())` return is `rx.recv()` reporting all senders dropped (clean shutdown — preserves the
+   existing roundtrip test semantics).
+2. **Prevention — respawn-on-panic wrapper:** the spawned thread body wraps `writer_loop(&rx, …)` in
+   `std::panic::catch_unwind(AssertUnwindSafe(…))` inside a `loop`. On a caught panic (or belt-and-
+   suspenders Err return), `error!(code = WS-SPILL-01)` + `tv_ws_frame_spill_writer_respawn_total++`,
+   bounded backoff, and **re-enter `writer_loop` with the SAME `rx`** (borrowed, still alive → channel
+   never becomes `Disconnected` from a panic). Clean channel-close exits the outer loop.
+3. **Detection — alarm the `Disconnected` arm:** mirror the `Full` arm — `drop_critical++`,
+   `tv_ws_frame_spill_drop_critical{reason}`, `tv_ticks_lost_total{source="spill_writer_dead"}`,
+   `error!(code = WS-SPILL-01, "CRITICAL: WAL spill writer DEAD — frame dropped")`. With (1)+(2) this
+   arm is now practically unreachable, but it is the honest last-resort signal.
+4. **New `ErrorCode::WsSpill01WriterDead`** (`code_str "WS-SPILL-01"`, `Severity::Critical`,
+   `runbook_path` → new rule file) wired into `all()` + `from_str` + the cross-ref rule file.
+5. **Metrics:** two new presence-guarded counters in `crates/common/tests/metrics_catalog.rs`.
+
+Net: a transient disk hiccup or a writer panic no longer tears down the durable WAL floor — the
+thread self-heals and keeps capturing every Dhan frame; if the impossible happens, it is loud.
 
 ## Edge Cases
 
-- Two same-second different-price ticks → different hash → both kept. ✅
-- Same frame replayed with a fresh `received_at` → same hash → collapsed. ✅ (test pins this)
-- Same-second identical-content ticks → collapse (information-identical duplicate — correct).
-- `usize`/overflow: FNV uses `wrapping_mul`; `u64`→`i64` via bit-reinterpret (full range, no panic).
-- Brownfield table missing the column → ADD COLUMN IF NOT EXISTS first → DEDUP never hits
-  "key column not found" → no accidental DROP TABLE.
+- Clean shutdown (all `Sender`s dropped) → `rx.recv()` Err → `writer_loop` returns `Ok(())` → outer
+  loop breaks → thread exits. (Preserves `test_append_spill_and_replay_roundtrip`.)
+- Panic mid-`write_record` → partial bytes in the current segment → tail corruption → existing
+  replay stops-at-boundary logic handles it (already tested by `test_replay_detects_crc_corruption`).
+- Repeated `open_new_segment` failure (disk full at rotation) → bounded backoff + continue; records
+  during the outage are counted in `tv_ws_frame_spill_write_errors_total` (honest), thread stays
+  alive so post-recovery frames are durable again.
+- Respawn hot-loop (writer panics every iteration) → bounded `WAL_WRITER_RESPAWN_BACKOFF` sleep caps
+  CPU; each respawn increments the counter so the alert fires.
 
 ## Failure Modes
 
-- ADD COLUMN fails (QuestDB down at boot) → logged WARN; DEDUP enable may then auto-recover. The
-  app's own ring→spill→DLQ still protects ticks. No new panic path (no unwrap/expect added).
-- Hot path: + ~48 byte-ops/tick, zero-alloc — negligible; DHAT-safe.
+- New code adds NO `unwrap`/`expect`/panic path (rust-code rule). `catch_unwind` only CATCHES panics.
+- `AssertUnwindSafe` is sound here: the only state crossing the boundary is `&Receiver` (Send) +
+  `&AtomicU64` + `&Path` — no `&mut` aliasing, no lock that could be left poisoned.
+- Hot path `append()` unchanged in the happy (`Spilled`) path — still O(1), zero-alloc, non-blocking.
+- Worst residual: disk down for the entire session AND app crashes → frames drained-but-not-durable
+  are lost, but now COUNTED + ALARMED (was silent). This is the documented beyond-envelope tier.
 
 ## Test Plan
 
-`cargo test -p tickvault-storage --lib tick_persistence::tests` (271 pass) + new hash tests:
-- `test_payload_hash_is_deterministic_across_fresh_ticks`
-- `test_payload_hash_ignores_received_at_replay_safe` (the replay-safety guarantee)
-- `test_payload_hash_differs_on_distinct_price` / `_volume` / `_exchange_timestamp`
-- `test_tick_dedup_key_includes_segment` updated (key == `security_id, segment, payload_hash`)
-- `dedup_segment_meta_guard` (5) still green (key includes segment).
+`cargo test -p tickvault-storage --lib ws_frame_spill` + targeted tests + `-p tickvault-common`:
+- `test_writer_survives_io_error_and_keeps_persisting` — inject a transient write failure (first
+  segment dir made read-only / a failing writer), assert later frames still persist + the thread did
+  NOT exit (channel still accepts, `persisted_count` advances after recovery).
+- `test_writer_respawns_after_panic` — force a panic in the writer body (test-only hook), assert the
+  thread respawns and subsequent `append`s still `Spilled` (never `Dropped`).
+- `test_disconnected_arm_alarms` — construct a spill whose writer is stopped, assert `append` →
+  `Dropped` AND `drop_critical_count()` incremented (the arm is no longer silent).
+- Existing green tests MUST stay green: `test_append_spill_and_replay_roundtrip`,
+  `test_replay_detects_crc_corruption`, `chaos_ws_frame_wal_replay` (4), `chaos_ws_frame_spill_saturation` (3),
+  `chaos_disk_full_ulimit` (1), `chaos_zero_tick_loss` (5), `ws_frame_order_preservation_guard` (2),
+  `zero_tick_loss_sla_guard` (3), `zero_tick_loss_alert_guard` (4).
+- `crates/common` ErrorCode ratchets: `error_code_rule_file_crossref`, `error_code_tag_guard`,
+  `test_all_list_length_matches_catalogue_size`, `from_str` roundtrip — all green.
+- `crates/common/tests/metrics_catalog.rs` — new metric names present.
+- `FULL_QA=1` workspace test (crates/common touched → escalates per testing-scope rule).
 
 ## Rollback
 
-Revert the commit. The `payload_hash` column is additive (harmless if left). DEDUP key reverts to
-`received_at`. No data migration beyond the additive column. `git revert`-clean.
+Single self-contained PR; revert restores the prior behavior exactly (the `Disconnected` arm reverts
+to the silent return, the writer reverts to exit-on-error). No schema change, no data migration, no
+wire-format change — the on-disk WAL record format is untouched. Feature is always-on (resilience is
+not gated); rollback = `git revert <sha>`.
 
 ## Observability
 
-- No new error code. The fingerprint is internal; existing tick metrics unchanged. The 15:31 Dhan
-  1m cross-verify remains the end-to-end completeness detector.
-
-## ⚠️ Deploy window
-
-This migrates the LIVE `ticks` table (adds a column + changes the DEDUP key). **Deploy AFTER market
-close (≥15:30 IST)** — the brownfield ADD-COLUMN-before-DEDUP ordering makes it safe, but a schema
-change on the actively-written table is best done off-session.
+- New `error!(code = WS-SPILL-01)` at the drop + respawn sites → 5-sink fan-out + Telegram.
+- New counters `tv_ws_frame_spill_write_errors_total`, `tv_ws_frame_spill_writer_respawn_total`
+  (presence-guarded by metrics_catalog). Existing `tv_ws_frame_spill_drop_critical` +
+  `tv_ticks_lost_total{source="spill_writer_dead"}` now also fire on writer death.
+- New rule file `.claude/rules/project/ws-frame-spill-error-codes.md` documents WS-SPILL-01 triage.
 
 ## Per-item guarantee matrix
 
-All 15 "100% everything" rows + 7 resilience rows from
-`.claude/rules/project/per-wave-guarantee-matrix.md` apply. O(1) per-tick hash (zero-alloc), no
-hot-path allocation, composite-key uniqueness strengthened, replay-idempotent, ratcheted by the 5
-new hash tests + the updated dedup-key test + the dedup_segment_meta_guard.
+All 15 "100% everything" + 7 resilience rows from `per-wave-guarantee-matrix.md` apply. Hot path
+`append()` happy-path unchanged (O(1), zero-alloc, DHAT-safe); the new resilience is on the writer
+thread (cold path). Zero-tick-loss envelope strengthened: the one silent loss vector becomes
+self-healing + alarmed. Ratcheted by the 3 new unit tests + the unchanged chaos/guard suite + the
+ErrorCode cross-ref/tag guards.
 
 ## Plan Items
 
-- [x] Add deterministic `tick_payload_hash` (FNV-1a, fixed seed)
-  - Files: crates/storage/src/tick_persistence.rs
-  - Tests: test_payload_hash_is_deterministic_across_fresh_ticks, _ignores_received_at_replay_safe, _differs_on_distinct_price, _differs_on_distinct_volume, _differs_on_exchange_timestamp
-- [x] Swap DEDUP key received_at → payload_hash + DDL + brownfield ADD COLUMN before DEDUP
-  - Files: crates/storage/src/tick_persistence.rs
-  - Tests: test_tick_dedup_key_includes_segment, dedup_segment_meta_guard
-- [x] Sync the data-integrity rule to the new key + determinism/replay rationale
-  - Files: .claude/rules/project/data-integrity.md
-  - Tests: n/a (docs)
+- [x] Resilient `writer_loop` (survive per-batch I/O error: alarm + reopen segment + continue; only exit on clean channel-close)
+  - Files: crates/storage/src/ws_frame_spill.rs
+  - Tests: test_writer_survives_unwritable_dir_then_recovers, test_open_segment_resilient_returns_none_on_unopenable_path
+- [x] Respawn-on-panic wrapper around the writer thread (catch_unwind + bounded backoff + re-enter with same rx)
+  - Files: crates/storage/src/ws_frame_spill.rs
+  - Tests: test_writer_respawns_after_panic_sentinel
+- [x] Alarm the `Disconnected` arm in `append()` (drop_critical + counters + error! WS-SPILL-02)
+  - Files: crates/storage/src/ws_frame_spill.rs
+  - Tests: test_disconnected_arm_alarms
+- [x] New `ErrorCode::WsSpill01WriterRespawn` + `WsSpill02FrameDropped` (code_str/severity/runbook/from_str/all) + cross-ref rule file
+  - Files: crates/common/src/error_code.rs, .claude/rules/project/ws-frame-spill-error-codes.md
+  - Tests: every_error_code_variant_appears_in_a_rule_file, test_all_list_length_matches_catalogue_size, test_code_str_follows_expected_prefix_pattern
+- [x] Register the 2 new counters in the metrics catalog
+  - Files: crates/common/tests/metrics_catalog.rs
+  - Tests: metrics_catalog_every_required_metric_is_emitted
+
+## Scenarios
+
+| # | Scenario | Expected |
+|---|----------|----------|
+| 1 | Writer hits a transient disk write error mid-session | Thread alarms + reopens segment + keeps draining; later frames persist; channel never `Disconnected` |
+| 2 | Writer thread panics | Caught, alarmed (WS-SPILL-01), respawned with same rx; `append` keeps returning `Spilled` |
+| 3 | Writer genuinely dead at an `append` instant | `append` → `Dropped` AND loud (counter + error!) — no longer silent |
+| 4 | Clean shutdown (all senders dropped) | Writer drains remaining + exits cleanly (roundtrip test unaffected) |
