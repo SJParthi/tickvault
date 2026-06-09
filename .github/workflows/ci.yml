@@ -101,6 +101,25 @@ jobs:
         run: bash .claude/hooks/plan-gate.sh "${{ github.workspace }}"
 
   # -------------------------------------------------------------------------
+  # Deploy Lint — the SSM `--parameters 'commands=[ ... ]'` block in the deploy
+  # workflows is a SINGLE-QUOTED runner string; a literal apostrophe inside it
+  # closes the quote early and a following `(` then fails the whole deploy with
+  # "syntax error near unexpected token `('" (regression: CI run 27210316913,
+  # 2026-06-09). This guard fails the build if that ever reappears.
+  # -------------------------------------------------------------------------
+  deploy-lint:
+    name: "Deploy Lint (SSM quoting)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Validate SSM commands[] quoting in deploy workflows
+        shell: bash
+        run: bash scripts/validate-deploy-ssm-quoting.sh "${{ github.workspace }}"
+
+  # -------------------------------------------------------------------------
   # Build & Verify — fmt + clippy + lib tests per crate.
   #
   # Split fmt + clippy (fast, one runner) from per-crate `cargo nextest run
