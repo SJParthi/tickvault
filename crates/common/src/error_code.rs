@@ -208,6 +208,20 @@ pub enum ErrorCode {
     /// (respawn self-heals; the `tv_disk_watcher_respawn_total` counter
     /// feeds a CloudWatch alarm that pages on a flapping watcher).
     DiskWatcher01Respawned,
+    /// WS-SPILL-01: the WAL frame-spill writer thread died (panic or a
+    /// transient disk I/O error) and the supervisor respawned it — mirrors
+    /// WS-GAP-05 (pool supervisor) and DISK-WATCHER-01 (disk watcher).
+    /// Self-healing: respawning with the same channel preserves the durable
+    /// WAL floor so no Dhan frame is silently lost across a writer hiccup.
+    /// Severity::High (a flapping WAL writer means the disk is failing).
+    WsSpill01WriterRespawn,
+    /// WS-SPILL-02: a Dhan frame was dropped on the hot path because the WAL
+    /// spill writer thread was dead at that instant (crossbeam channel
+    /// reported `Disconnected`). The WS-SPILL-01 respawn makes this
+    /// practically unreachable, but it is the honest last-resort
+    /// durable-loss signal — previously this arm returned silently.
+    /// Severity::Critical.
+    WsSpill02FrameDropped,
     /// AUTH-GAP-03: token force-renewed on WebSocket wake.
     AuthGap03TokenForceRenewedOnWake,
     /// BOOT-01: slow-boot QuestDB readiness deadline approaching (>30s).
@@ -608,6 +622,8 @@ impl ErrorCode {
             Self::WsGap06TickGapSummary => "WS-GAP-06",
             Self::WsGap07LiveChannelClosed => "WS-GAP-07",
             Self::DiskWatcher01Respawned => "DISK-WATCHER-01",
+            Self::WsSpill01WriterRespawn => "WS-SPILL-01",
+            Self::WsSpill02FrameDropped => "WS-SPILL-02",
             Self::AuthGap03TokenForceRenewedOnWake => "AUTH-GAP-03",
             Self::Boot01QuestDbSlow => "BOOT-01",
             Self::Boot02DeadlineExceeded => "BOOT-02",
@@ -728,7 +744,9 @@ impl ErrorCode {
             | Self::InstrFetch02SchemaValidationFailed
             | Self::InstrFetch03DanglingReferences
             | Self::InstrFetch04UniverseSizeOutOfBounds
-            | Self::NtmConstituency01SourceDegraded => Severity::Critical,
+            | Self::NtmConstituency01SourceDegraded
+            // WS-SPILL-02 — durable frame dropped (writer dead at append instant)
+            | Self::WsSpill02FrameDropped => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
             Self::Selftest01Passed
             | Self::Slo01Healthy
@@ -763,7 +781,9 @@ impl ErrorCode {
             | Self::CrossVerify1m01MismatchFound
             | Self::CrossVerify1m02FetchDegraded
             // WS-GAP-07 — live frame channel closed (tick consumer died)
-            | Self::WsGap07LiveChannelClosed => Severity::High,
+            | Self::WsGap07LiveChannelClosed
+            // WS-SPILL-01 — WAL writer respawned (flapping writer = disk dying)
+            | Self::WsSpill01WriterRespawn => Severity::High,
             // Medium: data pipeline correctness
             // PR #6b (2026-05-19): I-P0-01/02/04/05 retired with their modules.
             Self::InstrumentP1CrossSegmentCollision
@@ -860,6 +880,9 @@ impl ErrorCode {
             | Self::PrevClose02FirstSeenInconsistency
             | Self::PrevOi01CacheEmptyAtBoot
             | Self::PrevClose04CacheEmptyAtBoot => ".claude/rules/project/wave-1-error-codes.md",
+            Self::WsSpill01WriterRespawn | Self::WsSpill02FrameDropped => {
+                ".claude/rules/project/ws-frame-spill-error-codes.md"
+            }
             Self::WsGap04PostCloseSleep
             | Self::WsGap05PoolRespawn
             | Self::WsGap06TickGapSummary
@@ -1036,6 +1059,8 @@ impl ErrorCode {
             Self::WsGap06TickGapSummary,
             Self::WsGap07LiveChannelClosed,
             Self::DiskWatcher01Respawned,
+            Self::WsSpill01WriterRespawn,
+            Self::WsSpill02FrameDropped,
             Self::AuthGap03TokenForceRenewedOnWake,
             Self::Boot01QuestDbSlow,
             Self::Boot02DeadlineExceeded,
@@ -1348,7 +1373,9 @@ mod tests {
         // AGGREGATOR-LAG-01 (candle aggregator broadcast Lagged — now loud).
         // 2026-06-06 (NTM Sub-PR #10a, §31): bumped 102 -> 103 for
         // NTM-CONSTITUENCY-01 (niftyindices source degraded — core universe continues).
-        assert_eq!(ErrorCode::all().len(), 103);
+        // 2026-06-09 (zero-tick-loss WAL writer hardening): bumped 103 -> 105 for
+        // WS-SPILL-01 (writer respawned) + WS-SPILL-02 (durable frame dropped — now loud).
+        assert_eq!(ErrorCode::all().len(), 105);
     }
 
     #[test]
@@ -1404,6 +1431,8 @@ mod tests {
                 || s.starts_with("CROSS-VERIFY-1M-")
                 // zero-tick-loss PR-5 (G3): supervised disk-health watcher
                 || s.starts_with("DISK-WATCHER-")
+                // zero-tick-loss 2026-06-09: WAL frame-spill writer hardening
+                || s.starts_with("WS-SPILL-")
                 // NTM Sub-PR #10a (§31): niftyindices constituent source degrade
                 || s.starts_with("NTM-CONSTITUENCY-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
