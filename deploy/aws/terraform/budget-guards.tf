@@ -32,11 +32,37 @@ from datetime import datetime, timedelta, timezone
 ce  = boto3.client('ce', region_name='us-east-1')  # Cost Explorer is us-east-1 only
 sns = boto3.client('sns')
 
-INR_PER_USD = 85
+INR_PER_USD = 85    # rupee display rate (what you actually pay incl GST)
 GST_MULT    = 1.18  # India GST 18%
-BUDGET_INR  = 2000  # monthly target per aws-budget.md
+# The REAL ceiling is the AWS Budget that auto-stops the box (budget.tf:20):
+# $25/month measured on UnblendedCost (pre-GST USD). Comparing month-to-date
+# USD against $25 makes the digest "% used" match the kill-switch EXACTLY —
+# previously it compared rupees-with-GST against a separate ₹2000 number, so
+# the percentage you saw did NOT line up with what actually stopped the box.
+BUDGET_USD  = 25.0
 
-def get_cost(start, end):
+# Friendly labels for the Cost Explorer SERVICE dimension (substring match).
+SERVICE_LABELS = [
+    ('Elastic Compute Cloud', 'EC2 compute'),
+    ('EC2 - Other',           'EBS + transfer'),
+    ('Virtual Private Cloud', 'Public IP / VPC'),
+    ('CloudWatch',            'CloudWatch'),
+    ('Simple Storage',        'S3 storage'),
+    ('Simple Notification',   'SNS alerts'),
+    ('Lambda',                'Lambda'),
+    ('Key Management',        'KMS'),
+]
+
+def label_for(svc):
+    for needle, nice in SERVICE_LABELS:
+        if needle in svc:
+            return nice
+    return svc
+
+def inr(usd):
+    return usd * INR_PER_USD * GST_MULT
+
+def get_total(start, end):
     r = ce.get_cost_and_usage(
         TimePeriod={'Start': start, 'End': end},
         Granularity='DAILY',
@@ -44,39 +70,61 @@ def get_cost(start, end):
     )
     return sum(float(d['Total']['UnblendedCost']['Amount']) for d in r['ResultsByTime'])
 
+def get_by_service(start, end):
+    r = ce.get_cost_and_usage(
+        TimePeriod={'Start': start, 'End': end},
+        Granularity='DAILY',
+        Metrics=['UnblendedCost'],
+        GroupBy=[{'Type': 'DIMENSION', 'Key': 'SERVICE'}],
+    )
+    agg = {}
+    for d in r['ResultsByTime']:
+        for g in d['Groups']:
+            usd = float(g['Metrics']['UnblendedCost']['Amount'])
+            if usd <= 0:
+                continue
+            key = label_for(g['Keys'][0])
+            agg[key] = agg.get(key, 0.0) + usd
+    return agg
+
 def handler(event, context):
     today_utc = datetime.now(timezone.utc).date()
     yest_utc  = today_utc - timedelta(days=1)
     mtd_start = today_utc.replace(day=1)
 
     # Cost Explorer "end" is exclusive — yesterday's full day = today as end
-    today_usd = get_cost(str(yest_utc), str(today_utc))
-    mtd_usd   = get_cost(str(mtd_start), str(today_utc))
+    yday_usd = get_total(str(yest_utc), str(today_utc))
+    mtd_usd  = get_total(str(mtd_start), str(today_utc))
+    by_svc   = get_by_service(str(mtd_start), str(today_utc))
 
-    today_inr = today_usd * INR_PER_USD * GST_MULT
-    mtd_inr   = mtd_usd   * INR_PER_USD * GST_MULT
-    pct       = (mtd_inr / BUDGET_INR) * 100 if BUDGET_INR else 0
-
+    pct = (mtd_usd / BUDGET_USD) * 100 if BUDGET_USD else 0
     emoji = '🟢' if pct < 50 else ('🟡' if pct < 80 else ('🟠' if pct < 100 else '🔴'))
 
     days_in_month  = (today_utc.replace(month=today_utc.month % 12 + 1, day=1) - timedelta(days=1)).day if today_utc.month < 12 else 31
     days_remaining = days_in_month - today_utc.day
-    forecast_inr   = (mtd_inr / today_utc.day) * days_in_month if today_utc.day else mtd_inr
+    forecast_usd   = (mtd_usd / today_utc.day) * days_in_month if today_utc.day else mtd_usd
 
-    msg = (
-        f"{emoji} *Daily Budget Digest*\n"
-        f"_yesterday_: ₹{today_inr:.0f}\n"
-        f"_MTD_:       ₹{mtd_inr:.0f} / ₹{BUDGET_INR} ({pct:.0f}%)\n"
-        f"_forecast_:  ₹{forecast_inr:.0f} EOM\n"
-        f"_days left_: {days_remaining}\n"
-    )
+    lines = [
+        f"{emoji} *AWS Cost — tickvault*",
+        f"_Yesterday_:   ₹{inr(yday_usd):.0f}   (${yday_usd:.2f})",
+        f"_This month_:  ₹{inr(mtd_usd):.0f}   (${mtd_usd:.2f})",
+        f"_Of $25 stop-budget_: {pct:.0f}%",
+        f"_Forecast EOM_: ₹{inr(forecast_usd):.0f}   (${forecast_usd:.2f})",
+        f"_Days left_:   {days_remaining}",
+        "",
+        "*Where it goes (this month):*",
+    ]
+    for nice, usd in sorted(by_svc.items(), key=lambda kv: -kv[1]):
+        lines.append(f"  {nice:<16} ₹{inr(usd):.0f}  (${usd:.2f})")
+    if not by_svc:
+        lines.append("  (no spend yet this month)")
 
     sns.publish(
         TopicArn=os.environ['ALERTS_TOPIC_ARN'],
-        Subject='[BUDGET] daily digest',
-        Message=msg,
+        Subject='[BUDGET] daily AWS cost',
+        Message="\n".join(lines),
     )
-    return {'ok': True, 'mtd_inr': mtd_inr, 'pct': pct}
+    return {'ok': True, 'mtd_usd': mtd_usd, 'pct': pct}
 PYEOF
     filename = "index.py"
   }
