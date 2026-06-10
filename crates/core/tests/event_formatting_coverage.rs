@@ -88,8 +88,6 @@ fn test_ws_pool_event_messages() {
     let m = render(&NotificationEvent::MarketOpenStreamingConfirmation {
         main_feed_active: 1,
         main_feed_total: 1,
-        depth_20_active: 0,
-        depth_200_active: 0,
         order_update_active: true,
     });
     assert!(m.contains("Streaming live") && m.contains("1/1"), "{m}");
@@ -97,8 +95,6 @@ fn test_ws_pool_event_messages() {
     let m = render(&NotificationEvent::MarketOpenStreamingFailed {
         main_feed_active: 0,
         main_feed_total: 1,
-        depth_20_active: 0,
-        depth_200_active: 0,
         order_update_active: false,
     });
     assert!(m.contains("STREAMING FAILED") && m.contains("0/1"), "{m}");
@@ -106,8 +102,6 @@ fn test_ws_pool_event_messages() {
     let m = render(&NotificationEvent::MarketOpenReadinessConfirmation {
         main_feed_active: 1,
         main_feed_total: 1,
-        depth_20_active: 0,
-        depth_200_active: 0,
         order_update_active: true,
         token_remaining_secs: 6 * 3600,
     });
