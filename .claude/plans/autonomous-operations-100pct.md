@@ -11,8 +11,8 @@
 |---|---|---|---|
 | 1. Observe | Read metrics, logs, alerts, traces, data from any Claude session on any branch, Mac + AWS | **M1 — this PR** | `claude/autonomous-ops-m1` |
 | 2. Diagnose | Classify errors via signature hashing + errors.summary.md | ✅ Shipped (Phases 1-5 of zero-touch plan) | — |
-| 3. Decide | Rule-based triage — classifier picks safe auto-fix action per error code | Partial (7/53 codes covered) | M2 |
-| 4. Act | Auto-fix script per rule; every classifier rule has a runnable remediation | Partial (3 scaffolded, 1 functional) | M3 |
+| 3. Decide | Rule-based triage — classifier picks safe auto-fix action per error code | ✅ Shipped — 100% variant coverage + TRIAGE-EXEMPT ratchet (PRs #1083 + prior incremental) | M2 (merged 2026-06-10) |
+| 4. Act | Auto-fix script per rule; every classifier rule has a runnable remediation | ✅ CLOSED tooling-only (operator decision 2026-06-10, PR #1087 comment): scripts + rollbacks + guards are operator-runbook tools; runtime auto-execution stays escalate-only BY DESIGN; mutating endpoints deferred to the live-trading phase | M3 (closed 2026-06-10) |
 | 5. Verify + Rollback | Post-fix metric re-probe; auto-revert if fix made things worse | Not built | M4 |
 | 6. Runtime scaling + chaos | AWS autoscale, EBS resize, Dhan plan upgrade; nightly chaos tests prove self-heal | Not built (deferred post-AWS-provision) | M5 |
 
@@ -47,22 +47,70 @@
 
 After that, any Claude session anywhere can query your live stack live.
 
-## Milestone 2 (next PR) — Full triage rule coverage
+## Milestone 2 — Full triage rule coverage — ✅ COMPLETE (2026-06-10, PR #1083)
 
-**Goal:** every one of the 53 ErrorCode variants has a classifier rule in `.claude/triage/error-rules.yaml`.
+**Goal:** every ErrorCode variant has a classifier rule in `.claude/triage/error-rules.yaml`.
 
-**Deliverables:**
+**Shipped state (measured 2026-06-10):** all 105 live ErrorCode variants have
+rules (113 blocks; the "53 variants / 46 missing" figures below were stale —
+coverage was filled incrementally by prior PRs). PR #1083 added the milestone's
+ratchet clause: a future variant must carry a rule OR a documented
+`# TRIAGE-EXEMPT: <CODE> — <reason>` exclusion (column-0, pinned in the test's
+PINNED_EXEMPTIONS allowlist, never allowed for non-`is_auto_triage_safe()`
+codes), with build failure on neither. Guards live in
+`crates/common/tests/triage_rules_full_coverage_guard.rs` (12 tests) +
+`triage_rules_guard.rs` (7 tests).
+
+**Original deliverables (historical):**
 - 46 new classifier rules (one per ErrorCode variant not yet covered)
 - Each rule: severity, signature pattern, decision (`auto-fix` | `escalate-only` | `observe`)
 - Safety default: anything with severity Critical or confidence < 0.95 → `escalate-only`
 - Meta-guard: `crates/common/tests/triage_rules_full_coverage_guard.rs` fails the build if any ErrorCode variant has no rule
 - Expected runtime: Claude's `/loop` runbook polls `errors.summary.md`, routes to rule, decides.
 
-## Milestone 3 (next PR) — Full auto-fix script catalogue
+## Milestone 3 — Full auto-fix script catalogue — ✅ CLOSED AS TOOLING-ONLY (operator decision 2026-06-10)
 
 **Goal:** every `auto-fix` rule in M2 has a runnable remediation script with bounded side effects.
 
-**Deliverables:**
+**Measured state (2026-06-10 audit):**
+- ✅ 6 fix + 6 rollback script pairs exist under `scripts/auto-fix-*.sh`
+  (clear-spill, drain-spill, refresh-instruments, reset-ws-pool, rotate-token,
+  activate-kill-switch). All support `--dry-run`, all audit-log to
+  `data/logs/auto-fix.log`, M3+ scripts carry `corr_id=`.
+- ✅ M4 dispatchers `scripts/triage/verify.sh` + `rollback.sh` exist.
+- ✅ Meta-guard `crates/common/tests/autonomous_ops_m3_m4_guard.rs` enforces
+  pair-completeness, rollback contract, rule→script existence.
+- ✅ The stale `restart-depth` pair was RETIRED 2026-06-10 (depth-20/200 is
+  deleted forever per `websocket-connection-scope-lock.md`; no rule referenced it).
+- ❌ **ZERO scripts have a working endpoint.** The API was narrowed to 12
+  read-only observability routes post-AWS-lifecycle; `/api/instruments/rebuild`
+  was retired in PR #6b (2026-05-19). Every script fails safely (exit 1/2 +
+  audit log), and the 3 rules referencing scripts (DATA-813, STORAGE-GAP-01,
+  DATA-807) are at 0.85 confidence → escalate. The runtime triage chain is
+  fail-safe but performs ZERO automated remediation today.
+- The original "~20-30 scripts" target assumed the pre-narrowing runtime
+  (depth, movers, greeks, Valkey — all deleted). It no longer applies.
+
+**RESOLVED OPERATOR DECISION (Parthiban, 2026-06-10, PR #1087 comment —
+the dated authority for this closure):** option (b) — **M3 closes as
+done-as-tooling.**
+- The API stays READ-ONLY. NO mutating auto-fix endpoints
+  (`/api/spill/drain`, `/api/ws/reset-pool`, `/api/auth/rotate`,
+  `/api/kill-switch/*`, `/api/instruments/rebuild`) are to be added during
+  the no-real-orders data-pull phase.
+- Auto-fix scripts remain operator-runbook tools; triage auto-execution stays
+  escalate-only (detect + page, never act).
+- A designed endpoint subset may be revisited ONLY when live trading nears,
+  with a fresh dated operator quote + design-first plan + security review per
+  the charter.
+
+(The superseded decision framing, for history: option (a) would have meant
+re-introducing authenticated MUTATING endpoints to the deliberately read-only
+API — new attack surface incl. token-rotation and order-kill-switch over HTTP,
+contradicting the post-AWS-lifecycle narrowing and PR #6b's retirement of
+`/api/instruments/rebuild`, which the daily-universe lock §3 also constrains.)
+
+**Original deliverables (historical, for context):**
 - ~20-30 new auto-fix scripts under `.claude/triage/auto-fix/`
 - Each script: idempotent, side-effect bounded, emits audit log to `data/logs/auto-fix.log`
 - Examples: `restart-websocket-pool.sh`, `rotate-token.sh`, `clear-questdb-wal.sh`, `restart-depth-rebalancer.sh`, `refresh-instrument-master.sh`, `kill-switch-activate.sh`, etc.

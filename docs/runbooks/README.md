@@ -47,7 +47,7 @@ the remediation steps.
 | **OMS-GAP-06** DryRunSafety | Critical | `.claude/rules/project/gap-enforcement.md` | — | **no** |
 | **WS-GAP-01** DisconnectClassification | Medium | `.claude/rules/dhan/live-market-feed.md` | — | yes |
 | **WS-GAP-02** SubscriptionBatching | Medium | `.claude/rules/dhan/live-market-feed.md` | — | yes |
-| **WS-GAP-03** ConnectionState | Medium | `.claude/rules/dhan/live-market-feed.md` | `scripts/auto-fix-restart-depth.sh` (depth only) | yes |
+| **WS-GAP-03** ConnectionState | Medium | `.claude/rules/dhan/live-market-feed.md` | — (depth auto-fix retired 2026-06-10; depth-20/200 deleted forever per websocket-connection-scope-lock.md) | yes |
 | **RISK-GAP-01** PreTrade | High | `.claude/rules/project/gap-enforcement.md` | — | yes |
 | **RISK-GAP-02** PositionPnl | High | `.claude/rules/project/gap-enforcement.md` | — | yes |
 | **RISK-GAP-03** TickGap | Medium | `.claude/rules/project/gap-enforcement.md` | — | yes |
