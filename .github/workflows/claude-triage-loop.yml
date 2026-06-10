@@ -72,15 +72,36 @@ jobs:
         with:
           fetch-depth: 1
 
+      # Fail-soft when the ANTHROPIC_API_KEY secret is absent/empty:
+      # without this guard the schedule fires every 10 minutes and every
+      # run goes RED (observed 2026-06-09/10 — chronic failure noise on
+      # main). A missing key is an operator-setup state, not a code
+      # failure, so we annotate loudly and skip instead of failing.
+      - name: Check ANTHROPIC_API_KEY is configured
+        id: keycheck
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::warning title=Triage loop skipped::ANTHROPIC_API_KEY repo secret is empty — add it in Settings > Secrets and variables > Actions to enable the zero-touch triage loop."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Run Claude Co-work triage pass
+        if: steps.keycheck.outputs.present == 'true'
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          timeout_minutes: 9
           # Inherit the repo's universal .mcp.json — attaches github,
           # postgres, and tickvault-logs MCP servers automatically.
-          mcp_config: .mcp.json
-          direct_prompt: |
+          # (claude-code-action v1 dropped the `mcp_config`,
+          # `direct_prompt` and `timeout_minutes` inputs — config now
+          # flows through `claude_args`/`prompt`; the 10-minute
+          # job-level timeout-minutes bounds the pass.)
+          claude_args: "--mcp-config .mcp.json"
+          prompt: |
             You are the tickvault 24/7 zero-touch operator. Follow the
             runbook at `.claude/triage/claude-loop-prompt.md` EXACTLY —
             do not re-implement its logic.
