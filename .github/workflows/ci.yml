@@ -294,6 +294,15 @@ jobs:
           # produced coverage.json. DHAT-vs-coverage is a known incompatibility.
           # Skip the dhat_* tests HERE only; they STILL run + enforce zero-alloc
           # in the normal Test (core)/Test (storage) jobs, so the guarantee holds.
+          #
+          # cargo-llvm-cov does NOT create parent directories for
+          # --output-path: once the api env-race was fixed (#1072) and the
+          # test phase finally passed, report generation failed with
+          # "failed to create file target/llvm-cov/coverage.json: No such
+          # file or directory" (main run 27248515406). The chronic test
+          # failure had masked this second bug for days. Create the dir
+          # AFTER `clean` (which removes coverage artifacts).
+          mkdir -p target/llvm-cov
           cargo llvm-cov --workspace --no-fail-fast --json \
             --output-path target/llvm-cov/coverage.json \
             -- --skip dhat_
