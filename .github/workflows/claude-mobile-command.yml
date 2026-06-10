@@ -83,13 +83,16 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          timeout_minutes: 25
           # Inherit the universal .mcp.json at repo root — attaches
           # github, postgres, and tickvault-logs MCP servers so the
           # mobile command can query logs, metrics, QuestDB, Grafana
           # without extra setup.
-          mcp_config: .mcp.json
-          direct_prompt: |
+          # (claude-code-action v1 dropped the `mcp_config`,
+          # `direct_prompt` and `timeout_minutes` inputs — config now
+          # flows through `claude_args`/`prompt`; the 30-minute
+          # job-level timeout-minutes bounds the run.)
+          claude_args: "--mcp-config .mcp.json"
+          prompt: |
             # Mobile Command — Run ${{ github.run_id }}
 
             ## Operator instruction (verbatim)
