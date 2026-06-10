@@ -64,6 +64,17 @@ pub fn boot_covers_full_session(boot_secs_of_day_ist: u32) -> bool {
     boot_secs_of_day_ist < MARKET_OPEN_SECS_OF_DAY_IST
 }
 
+/// The single source of truth for the WS-frame WAL directory — the SAME
+/// derivation as main.rs STAGE-C boot wiring. Hostile-review H1: the env
+/// derivation was previously copy-pasted at two main.rs sites and could
+/// drift; both now call this.
+#[must_use]
+pub fn ws_wal_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var("TV_WS_WAL_DIR").unwrap_or_else(|_| "./data/ws_wal".to_string()), // O(1) EXEMPT: boot-time
+    )
+}
+
 /// Decision for WHEN the conservation audit should fire. Mirrors
 /// `cross_verify_1m_boot::CrossVerifyStart`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,15 +196,27 @@ impl OutcomeCounters {
 
 /// The two conservation residuals. Pure.
 ///
-/// `delivery_residual = wal_tick_frames − processed` — positive means frames
-/// Dhan delivered (durably in the WAL) never reached the processor.
+/// `delivery_residual = wal_tick_frames − (processed − replay_recovered)` —
+/// positive means frames Dhan delivered (durably in the WAL) never reached
+/// the processor. Hostile-review H2: `processed` counts BOTH live-path
+/// ticks AND boot-replayed frames from earlier sessions, so the boot
+/// replay count (scraped `tv_wal_replay_recovered_total`) is subtracted
+/// (bounded by `processed`) before comparing against today's WAL count.
 /// `outcome_residual = processed − (persisted + junk + stale_day +
 /// outside_hours + dedup + storage_errors)` — positive means an in-process
-/// leak. Negative values are possible (boot replay re-processing yesterday's
-/// frames inflates `processed` vs today's WAL count) and are NOT leaks.
+/// leak. NEGATIVE residuals mean the identity is not clean (replay
+/// inflation beyond the adjustment, rescue-drain double counting) — the
+/// caller classifies those as `partial`, never as a silent "balanced"
+/// (hostile-review H2: a negative bias of N could otherwise mask a real
+/// same-day leak ≤ N).
 #[must_use]
-pub fn compute_residuals(wal_tick_frames: u64, c: &OutcomeCounters) -> (i64, i64) {
+pub fn compute_residuals(
+    wal_tick_frames: u64,
+    replay_recovered: u64,
+    c: &OutcomeCounters,
+) -> (i64, i64) {
     let processed = c.processed.unwrap_or(0);
+    let processed_live = processed.saturating_sub(replay_recovered.min(processed));
     let accounted = c
         .persisted
         .unwrap_or(0)
@@ -205,7 +228,7 @@ pub fn compute_residuals(wal_tick_frames: u64, c: &OutcomeCounters) -> (i64, i64
     // APPROVED: i64::try_from of realistic daily counts (≪ i64::MAX); clamp
     // keeps the arithmetic total for adversarial inputs.
     let to_i64 = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
-    let delivery = to_i64(wal_tick_frames).saturating_sub(to_i64(processed));
+    let delivery = to_i64(wal_tick_frames).saturating_sub(to_i64(processed_live));
     let outcome = to_i64(processed).saturating_sub(to_i64(accounted));
     (delivery, outcome)
 }
@@ -215,7 +238,10 @@ pub fn compute_residuals(wal_tick_frames: u64, c: &OutcomeCounters) -> (i64, i64
 /// `partial` wins over `leak`: when coverage is incomplete the residuals are
 /// not trustworthy numbers, so the row says "cannot vouch" instead of paging
 /// with arithmetic built on missing inputs (false-OK Rule 11 — and equally,
-/// no false ALARM from a known-incomplete identity).
+/// no false ALARM from a known-incomplete identity). NEGATIVE residuals are
+/// likewise `partial` (hostile-review H2): an inflated counter set cannot
+/// vouch for the day, and reporting it "balanced" would let the negative
+/// bias mask a real leak of equal size.
 #[must_use]
 pub fn classify_outcome(
     delivery_residual: i64,
@@ -227,6 +253,9 @@ pub fn classify_outcome(
     }
     if delivery_residual > 0 || outcome_residual > 0 {
         return ConservationOutcome::Leak;
+    }
+    if delivery_residual < 0 || outcome_residual < 0 {
+        return ConservationOutcome::Partial;
     }
     ConservationOutcome::Balanced
 }
@@ -279,14 +308,27 @@ pub async fn run_tick_conservation_audit(
         .build()
         .ok();
 
+    // Hostile-review H1/M2: a dead or degraded WAL source must flip the
+    // verdict to `partial`, never report zero-counts as "balanced". A scan
+    // that found NO segments while ticks were processed, or hit ANY
+    // unreadable segment, cannot vouch for the delivery identity.
+    let mut sources_complete = true;
+    let mut wal_scan_healthy = wal.corrupted_segments == 0;
+
     // 2. Self-scrape the outcome counters from the app's own exporter.
     let mut counters = OutcomeCounters::default();
-    let mut sources_complete = true;
+    let mut replay_recovered: u64 = 0;
     if let Some(ref client) = client {
         let url = format!("http://127.0.0.1:{metrics_port}/metrics");
         match client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => match resp.text().await {
-                Ok(body) => counters = OutcomeCounters::from_metrics_body(&body),
+                Ok(body) => {
+                    counters = OutcomeCounters::from_metrics_body(&body);
+                    // H2: boot-replay inflation adjustment for the delivery
+                    // identity (frames re-injected from earlier sessions).
+                    replay_recovered =
+                        parse_prom_counter(&body, "tv_wal_replay_recovered_total").unwrap_or(0);
+                }
                 Err(err) => {
                     warn!(?err, "tick_conservation: metrics body read failed");
                 }
@@ -297,6 +339,19 @@ pub async fn run_tick_conservation_audit(
     }
     if !counters.identity_complete() {
         sources_complete = false;
+    }
+    if wal.segments_scanned == 0 && counters.processed.unwrap_or(0) > 0 {
+        // Ticks flowed but the WAL scan saw nothing — wrong dir / dead
+        // writer / wiped disk. The delivery identity is meaningless.
+        wal_scan_healthy = false;
+    }
+    if !wal_scan_healthy {
+        sources_complete = false;
+        warn!(
+            segments_scanned = wal.segments_scanned,
+            corrupted_segments = wal.corrupted_segments,
+            "tick_conservation: WAL scan degraded — verdict capped at partial"
+        );
     }
 
     // 3. QuestDB row count for the IST day window. `ts` stores IST-epoch
@@ -337,7 +392,8 @@ pub async fn run_tick_conservation_audit(
     }
 
     // 4. Residuals + verdict (pure).
-    let (delivery_residual, outcome_residual) = compute_residuals(wal.tick_frames, &counters);
+    let (delivery_residual, outcome_residual) =
+        compute_residuals(wal.tick_frames, replay_recovered, &counters);
     let partial_coverage = !boot_covered_full_session || !sources_complete;
     let outcome = classify_outcome(delivery_residual, outcome_residual, partial_coverage);
 
@@ -502,17 +558,26 @@ mod tests {
             storage_errors: Some(5),
             dropped_total: Some(0),
         };
-        // 900+10+40+30+15+5 = 1000 → outcome balanced; WAL 1_000 → delivery 0.
-        assert_eq!(compute_residuals(1_000, &c), (0, 0));
+        // 900+10+40+30+15+5 = 1000 → outcome balanced; WAL 1_000, no
+        // replay → delivery 0.
+        assert_eq!(compute_residuals(1_000, 0, &c), (0, 0));
         // WAL saw 1_050 frames but only 1_000 processed → delivery leak 50.
-        assert_eq!(compute_residuals(1_050, &c), (50, 0));
-        // Boot replay can legitimately make processed exceed today's WAL
-        // count → negative delivery residual is NOT a leak.
-        assert_eq!(compute_residuals(900, &c).0, -100);
+        assert_eq!(compute_residuals(1_050, 0, &c), (50, 0));
+        // Hostile-review H2: boot replay inflates `processed` — the replay
+        // count is subtracted before the delivery comparison. 1_000 WAL
+        // frames + 1_000 processed of which 100 were replays → live
+        // processed 900 → delivery residual +100 (a REAL leak no longer
+        // masked by the replay inflation).
+        assert_eq!(compute_residuals(1_000, 100, &c), (100, 0));
+        // Unadjusted replay inflation → negative residual (classified
+        // partial by classify_outcome, never silently balanced).
+        assert_eq!(compute_residuals(900, 0, &c).0, -100);
+        // Replay bound: replay_recovered > processed never underflows.
+        assert_eq!(compute_residuals(0, 5_000, &c), (0, 0));
         // An unaccounted outcome: drop persisted by 25 → outcome leak 25.
         let mut leaky = c;
         leaky.persisted = Some(875);
-        assert_eq!(compute_residuals(1_000, &leaky), (0, 25));
+        assert_eq!(compute_residuals(1_000, 0, &leaky), (0, 25));
     }
 
     #[test]
@@ -521,12 +586,24 @@ mod tests {
         assert_eq!(classify_outcome(0, 0, false), O::Balanced);
         assert_eq!(classify_outcome(1, 0, false), O::Leak);
         assert_eq!(classify_outcome(0, 1, false), O::Leak);
-        // Negative residuals (boot replay inflation) are NOT leaks.
-        assert_eq!(classify_outcome(-100, 0, false), O::Balanced);
+        // Hostile-review H2: NEGATIVE residuals are PARTIAL, not balanced —
+        // an inflated identity cannot vouch for the day and could mask a
+        // real leak of equal size.
+        assert_eq!(classify_outcome(-100, 0, false), O::Partial);
+        assert_eq!(classify_outcome(0, -1, false), O::Partial);
         // Partial coverage wins over leak — residuals on missing inputs are
         // not trustworthy numbers (no false alarm, no false OK).
         assert_eq!(classify_outcome(50, 50, true), O::Partial);
         assert_eq!(classify_outcome(0, 0, true), O::Partial);
+    }
+
+    #[test]
+    fn test_ws_wal_dir_default() {
+        // Single source of truth for the WAL dir (hostile-review H1) —
+        // default matches the STAGE-C boot wiring.
+        if std::env::var("TV_WS_WAL_DIR").is_err() {
+            assert_eq!(ws_wal_dir(), std::path::PathBuf::from("./data/ws_wal"));
+        }
     }
 
     #[test]

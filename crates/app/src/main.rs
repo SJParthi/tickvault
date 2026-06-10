@@ -418,8 +418,10 @@ async fn main() -> Result<()> {
     // remain in `ws_frame_spill::WsType` as orphan; any replayed records
     // of those types are silently dropped here.
     // -----------------------------------------------------------------------
-    let ws_wal_dir = std::env::var("TV_WS_WAL_DIR").unwrap_or_else(|_| "./data/ws_wal".to_string()); // O(1) EXEMPT: boot-time
-    let ws_wal_path = std::path::PathBuf::from(&ws_wal_dir);
+    // Single source of truth for the WAL dir (hostile-review H1: shared
+    // with the 15:40 conservation audit so the two sites can never drift).
+    let ws_wal_path = tickvault_app::tick_conservation_boot::ws_wal_dir();
+    let ws_wal_dir = ws_wal_path.display().to_string(); // O(1) EXEMPT: boot-time
     // Replay first — this MUST happen before any WS connection opens so we
     // never race a fresh append against a stale segment rotation.
     // TICK-SEQ-01: carry each replayed frame's `frame_seq` so re-injected
@@ -7006,10 +7008,8 @@ fn spawn_post_market_tasks(
         let tc_qcfg = config.questdb.clone();
         let tc_metrics_port = config.observability.metrics_port;
         let tc_calendar = std::sync::Arc::clone(&trading_calendar);
-        // Same WAL dir derivation as the STAGE-C boot wiring.
-        let tc_wal_dir = std::path::PathBuf::from(
-            std::env::var("TV_WS_WAL_DIR").unwrap_or_else(|_| "./data/ws_wal".to_string()), // O(1) EXEMPT: boot-time
-        );
+        // Single source of truth for the WAL dir (shared with STAGE-C).
+        let tc_wal_dir = tickvault_app::tick_conservation_boot::ws_wal_dir();
         tokio::spawn(async move {
             use chrono::{FixedOffset, TimeZone, Timelike, Utc};
             use tickvault_app::tick_conservation_boot::{

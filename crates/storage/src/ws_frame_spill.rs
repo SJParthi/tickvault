@@ -672,9 +672,15 @@ pub fn classify_frame_for_day(
         return None;
     }
     let code = first_payload_byte?;
+    // Hostile-review C1: the dispatcher parses BOTH code 1 (index ticker)
+    // and code 2 (ticker) into `ParsedFrame::Tick` — under the IDX_I-heavy
+    // universe, omitting code 1 here would bias delivery_residual
+    // permanently negative and mask real leaks. Tick classes = {1, 2, 4, 8},
+    // exactly the dispatcher arms that increment `tv_ticks_processed_total`.
     Some(matches!(
         code,
-        tickvault_common::constants::RESPONSE_CODE_TICKER
+        tickvault_common::constants::RESPONSE_CODE_INDEX_TICKER
+            | tickvault_common::constants::RESPONSE_CODE_TICKER
             | tickvault_common::constants::RESPONSE_CODE_QUOTE
             | tickvault_common::constants::RESPONSE_CODE_FULL
     ))
@@ -706,9 +712,12 @@ pub fn count_frames_for_ist_day<P: AsRef<Path>>(
             }
             // Pre-filter: skip segments created too long before the target
             // day to carry its frames (bounds the archive scan forever).
+            // Hostile-review M1: allow created_day == target_day + 1 — a
+            // frame stamped 23:59:59 can be drained into a segment whose
+            // creation nanos land just past the IST midnight boundary.
             if let Some(nanos) = segment_creation_nanos(&path) {
                 let created_day = ist_day_of_wall_nanos(nanos);
-                if created_day > target_ist_day
+                if created_day > target_ist_day.saturating_add(1)
                     || created_day
                         < target_ist_day.saturating_sub(CONSERVATION_SEGMENT_LOOKBACK_DAYS)
                 {
