@@ -12,7 +12,7 @@
 | 1. Observe | Read metrics, logs, alerts, traces, data from any Claude session on any branch, Mac + AWS | **M1 — this PR** | `claude/autonomous-ops-m1` |
 | 2. Diagnose | Classify errors via signature hashing + errors.summary.md | ✅ Shipped (Phases 1-5 of zero-touch plan) | — |
 | 3. Decide | Rule-based triage — classifier picks safe auto-fix action per error code | ✅ Shipped — 100% variant coverage + TRIAGE-EXEMPT ratchet (PRs #1083 + prior incremental) | M2 (merged 2026-06-10) |
-| 4. Act | Auto-fix script per rule; every classifier rule has a runnable remediation | Scripts + rollbacks + guards shipped, but ALL endpoints retired — see M3 status 2026-06-10 below | M3 (blocked on operator decision) |
+| 4. Act | Auto-fix script per rule; every classifier rule has a runnable remediation | ✅ CLOSED tooling-only (operator decision 2026-06-10, PR #1087 comment): scripts + rollbacks + guards are operator-runbook tools; runtime auto-execution stays escalate-only BY DESIGN; mutating endpoints deferred to the live-trading phase | M3 (closed 2026-06-10) |
 | 5. Verify + Rollback | Post-fix metric re-probe; auto-revert if fix made things worse | Not built | M4 |
 | 6. Runtime scaling + chaos | AWS autoscale, EBS resize, Dhan plan upgrade; nightly chaos tests prove self-heal | Not built (deferred post-AWS-provision) | M5 |
 
@@ -68,7 +68,7 @@ codes), with build failure on neither. Guards live in
 - Meta-guard: `crates/common/tests/triage_rules_full_coverage_guard.rs` fails the build if any ErrorCode variant has no rule
 - Expected runtime: Claude's `/loop` runbook polls `errors.summary.md`, routes to rule, decides.
 
-## Milestone 3 — Full auto-fix script catalogue — ⚠ STATUS 2026-06-10: scripts done, endpoints retired, BLOCKED ON OPERATOR DECISION
+## Milestone 3 — Full auto-fix script catalogue — ✅ CLOSED AS TOOLING-ONLY (operator decision 2026-06-10)
 
 **Goal:** every `auto-fix` rule in M2 has a runnable remediation script with bounded side effects.
 
@@ -91,19 +91,24 @@ codes), with build failure on neither. Guards live in
 - The original "~20-30 scripts" target assumed the pre-narrowing runtime
   (depth, movers, greeks, Valkey — all deleted). It no longer applies.
 
-**OPEN OPERATOR DECISION (required before any further M3 code):**
-completing M3 means re-introducing authenticated MUTATING endpoints to the
-deliberately read-only API — `/api/auth/rotate` (Dhan token rotation over
-HTTP), `/api/kill-switch/activate` (order-control surface), `/api/spill/drain`,
-`/api/ws/reset-pool`, possibly re-adding `/api/instruments/rebuild` (which
-PR #6b retired, and which the daily-universe lock §3 constrains). This is new
-attack surface contradicting the post-AWS-lifecycle narrowing and touches the
-security charter. Options:
-- (a) Approve a designed subset (e.g. spill-drain + ws-reset only; never
-  kill-switch/token over HTTP), each behind GAP-SEC-01 auth + design-first plan.
-- (b) Re-scope M3 as DONE-as-tooling: scripts remain operator-runbook tools,
-  auto-execution stays escalate-only forever, M3 closes.
-Until one is chosen, no endpoint code lands.
+**RESOLVED OPERATOR DECISION (Parthiban, 2026-06-10, PR #1087 comment —
+the dated authority for this closure):** option (b) — **M3 closes as
+done-as-tooling.**
+- The API stays READ-ONLY. NO mutating auto-fix endpoints
+  (`/api/spill/drain`, `/api/ws/reset-pool`, `/api/auth/rotate`,
+  `/api/kill-switch/*`, `/api/instruments/rebuild`) are to be added during
+  the no-real-orders data-pull phase.
+- Auto-fix scripts remain operator-runbook tools; triage auto-execution stays
+  escalate-only (detect + page, never act).
+- A designed endpoint subset may be revisited ONLY when live trading nears,
+  with a fresh dated operator quote + design-first plan + security review per
+  the charter.
+
+(The superseded decision framing, for history: option (a) would have meant
+re-introducing authenticated MUTATING endpoints to the deliberately read-only
+API — new attack surface incl. token-rotation and order-kill-switch over HTTP,
+contradicting the post-AWS-lifecycle narrowing and PR #6b's retirement of
+`/api/instruments/rebuild`, which the daily-universe lock §3 also constrains.)
 
 **Original deliverables (historical, for context):**
 - ~20-30 new auto-fix scripts under `.claude/triage/auto-fix/`
