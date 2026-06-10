@@ -448,14 +448,14 @@ mod tests {
         // 10ms window so we can drain quickly.
         let c = make_coalescer(10);
         for i in 0..3 {
-            c.observe("DepthRebalanced", Severity::Low, || format!("rebal #{i}"));
+            c.observe("TickGapsSummary", Severity::Low, || format!("rebal #{i}"));
         }
         // Sleep beyond the window so all buckets are mature.
         std::thread::sleep(Duration::from_millis(20));
         let summaries = c.drain_mature();
         assert_eq!(summaries.len(), 1);
         let s = &summaries[0];
-        assert_eq!(s.topic, "DepthRebalanced");
+        assert_eq!(s.topic, "TickGapsSummary");
         assert_eq!(s.severity, Severity::Low);
         assert_eq!(s.count, 3);
         assert_eq!(s.samples.len(), 3);
@@ -465,7 +465,7 @@ mod tests {
         let msg = s.render_message();
         // Wave-Holiday-Gate (2026-05-09): terse format — no preamble,
         // no IST timestamp line, no "Samples:" keyword.
-        assert!(msg.contains("DepthRebalanced x3"));
+        assert!(msg.contains("TickGapsSummary x3"));
         assert!(msg.contains("rebal #0"));
         assert!(!msg.contains("Coalesced summary"));
         assert!(!msg.contains("Samples:"));

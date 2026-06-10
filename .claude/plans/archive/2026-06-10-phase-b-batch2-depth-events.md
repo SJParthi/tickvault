@@ -1,6 +1,6 @@
 # Implementation Plan: Phase B batch 2 — unconstructed depth-era NotificationEvent variants
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-06-10
 **Approved by:** Parthiban, 2026-06-10: "yes go ahead with your recommendation" (Phase B of the deletion audit — step 5 "delete unused events.rs NotificationEvent variants (DepthRebalance*, … Depth20Dyn*…)"), reaffirmed same day: "once it gets merged go ahead with the plan always". Batch 1 merged as #1084.
 
