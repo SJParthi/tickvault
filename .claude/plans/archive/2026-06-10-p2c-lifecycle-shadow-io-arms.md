@@ -1,91 +1,112 @@
-# Implementation Plan: P2c — lifecycle + shadow persistence error-arm coverage
+# Implementation Plan: M3 reality-sync — retire dead depth auto-fix pair + honest milestone status
 
 **Status:** VERIFIED
 **Date:** 2026-06-10
-**Approved by:** Parthiban (operator, 2026-06-10: "once it gets merged go ahead with the plan always" — P2 approved as "write the plain missing unit tests (error branches)"; P2c follows merged P2b #1082)
-**Authority:** `.claude/plans/research/coverage-gaps.md` §5 ranks 15+18 + §6 P2 (merged #1076).
+**Approved by:** Parthiban (standing directive 2026-06-10: "once it gets merged go ahead with the plan always" — continuing `.claude/plans/autonomous-operations-100pct.md` after M2 merged via #1083; this is the autonomous-SAFE slice of M3. The architecturally significant remainder — re-introducing mutating HTTP endpoints — is explicitly DEFERRED to an operator decision, documented in the milestone doc update below.)
+**Authority:** `.claude/plans/autonomous-operations-100pct.md` Milestone 3.
 
-**Per-item guarantee matrix:** cross-references `.claude/rules/project/per-wave-guarantee-matrix.md`. Deltas: test-only additions inside the two files' existing `#[cfg(test)] mod tests` — zero production lines changed, no hot path, no new pub fn, no new dep (mock HTTP/TCP helpers replicate the file-local idiom already used in `tick_persistence.rs::tests`).
-
-## Plan Items
-
-- [x] Cover instrument_lifecycle_persistence HTTP/ILP I/O fns (152 missed lines)
-  - Files: crates/storage/src/instrument_lifecycle_persistence.rs
-  - Tests: test_ensure_lifecycle_tables_with_mock_200,
-    test_append_lifecycle_row_mock_200_and_500,
-    test_append_lifecycle_audit_row_mock_200_and_500,
-    test_update_state_and_bump_last_seen_mock_200_and_500,
-    test_append_lifecycle_rows_ilp_drain_and_error,
-    test_append_lifecycle_audit_rows_ilp_drain_and_error
-  - Mock-HTTP 200/500 covers the `/exec` happy + bail arms of
-    `append_instrument_lifecycle_row`, `append_instrument_lifecycle_audit_row`,
-    `update_lifecycle_state`, `bump_active_last_seen`, and both `ensure_*`
-    DDL walks; a TCP drain server covers the ILP plural fns (+ empty-slice
-    early return + connect-failure Err arm via port 1).
-
-- [x] Cover shadow_persistence DDL walk + legacy-drop marker lifecycle (116 missed)
-  - Files: crates/storage/src/shadow_persistence.rs
-  - Tests: test_ensure_shadow_candle_tables_with_mock_200,
-    test_ensure_shadow_candle_tables_with_mock_400,
-    test_drop_legacy_candle_objects_marker_lifecycle
-  - Mock-HTTP 200 + 400 cover `ensure_shadow_candle_tables` (21-table DDL +
-    DEDUP + ALTER walk, both arms). The marker test runs the legacy-drop
-    sweep against mock 200 (marker absent → full sweep → marker written),
-    then re-runs to hit the early-skip arm; the cwd-relative marker file is
-    removed before AND after (self-cleaning, no repo pollution).
+**Per-item guarantee matrix:** cross-references `.claude/rules/project/per-wave-guarantee-matrix.md` per its "or cross-reference it" clause. Deltas: shell scripts + one meta-guard test file + plan docs only; no production crate `src/` change, no hot path, no new pub fn, no dep, no schema.
 
 ## Design
 
-Black-box via the files' pub async fns, pointed at file-local mock servers
-(same `spawn_mock_http_server` / `spawn_tcp_drain_server` idioms as
-`tick_persistence.rs::tests` — kept module-local per repo convention).
-Existing `sample_index_row()` / `sample_audit_row()` fixtures are reused for
-row payloads. No live QuestDB, no Docker, deterministic.
+**Measured baseline (2026-06-10 audit):** M3 is further along AND further behind
+than the plan doc says. Already shipped by prior sessions: 7 fix + 7 rollback
+script pairs (all `--dry-run`-capable, all audit-logging to
+`data/logs/auto-fix.log`), `scripts/triage/verify.sh` + `rollback.sh` (M4
+dispatchers), and meta-guard `crates/common/tests/autonomous_ops_m3_m4_guard.rs`.
+BUT: **zero of the 7 scripts has a working endpoint** — the API was narrowed to
+12 read-only observability routes post-AWS-lifecycle; `/api/instruments/rebuild`
+(the one endpoint a script header still claims "is already exposed") was retired
+in PR #6b. All scripts fail safely (exit 1/2 + audit log) and every referencing
+YAML rule is at 0.85 confidence → escalates, so the runtime triage chain is
+fail-safe today.
+
+**This PR ships only the autonomous-safe slice:**
+1. Retire `auto-fix-restart-depth.sh` + `-rollback.sh` — depth-20/200 is deleted
+   FOREVER per `websocket-connection-scope-lock.md`; its endpoint can never
+   exist; no YAML rule references it. Keeping it invites a future session to
+   "implement" a forbidden subsystem.
+2. DEFERRED (documented): correcting the false "already exposed and
+   idempotent" header claim in `auto-fix-refresh-instruments.sh` — this session
+   can only land commits via the GitHub contents/trees API (local pre-commit
+   hooks cannot run: the container's rustup 1.95.0 toolchain is missing its
+   cargo binary), and an API write to a `.sh` strips the executable bit, which
+   would fail `triage_yaml_auto_fix_targets_all_exist_and_executable` with no
+   API path to restore `+x`. The false claim is instead corrected in the
+   milestone doc (item 4); the one-line comment fix goes to the next
+   local-git-capable session.
+3. Update `autonomous_ops_m3_m4_guard.rs` PRE_M3_EXEMPT list (drop the deleted
+   script's entry).
+4. Update `.claude/plans/autonomous-operations-100pct.md` M2+M3 status to the
+   measured reality, and record the OPEN OPERATOR DECISION for the M3 remainder:
+   whether to (a) re-introduce authenticated mutating endpoints
+   (`/api/auth/rotate`, `/api/spill/drain`, `/api/ws/reset-pool`,
+   `/api/kill-switch/activate`, possibly `/api/instruments/rebuild`) against the
+   deliberately read-only API — new attack surface incl. token-rotation and
+   order-kill-switch over HTTP, contradicting the post-AWS-lifecycle narrowing —
+   or (b) re-scope M3: scripts remain operator-runbook tools and auto-execution
+   stays escalate-only. NO endpoint code is written in this PR.
 
 ## Edge Cases
 
-- Non-2xx `/exec` response: body reflected into the error capped at 200 chars
-  (asserted via a 500 with a long body NOT exceeding the cap in the message).
-- Empty `rows` slice on both ILP plural fns → Ok without connecting.
-- ILP connect failure (port 1) → Err surfaces, no panic.
-- Legacy-drop marker present → entire sweep skipped (early return).
-- Marker write best-effort semantics untouched (not asserted on failure —
-  needs an unwritable cwd; out of scope, flagged honest).
+- Guard test scans `scripts/auto-fix-*.sh` dynamically: deleting BOTH halves of
+  the restart-depth pair keeps the pair-completeness test green; the stale
+  PRE_M3_EXEMPT entry is removed in the same PR so the list never names a
+  nonexistent file.
+- `make triage-dry-run` / `error-triage.sh` never reference restart-depth (no
+  YAML rule does) — no runtime path changes.
+- refresh-instruments stays referenced by the DATA-813 rule; behaviour is
+  unchanged (404 → exit 2 + audit log) — only the lying comment is fixed.
 
 ## Failure Modes
 
-- If a refactor breaks the non-2xx bail (silent Ok on QuestDB error), the
-  mock-500 assertions fail.
-- If the ILP plural path stops building rows or starts panicking on connect
-  failure, the drain/error tests fail.
-- If the marker gate inverts (sweep re-runs every boot), the second-run
-  assertion fails.
-- Flake surface: none — loopback sockets bound to port 0 (OS-assigned), no
-  timing assumptions; the marker test owns its path exclusively and cleans up.
+- A future variant of the depth subsystem returning is governed by the WS-scope
+  lock's re-approval protocol, not by keeping a dead script around.
+- If the guard test had hardcoded restart-depth elsewhere, the build would fail
+  loudly in CI — grep shows only the PRE_M3_EXEMPT entry.
 
 ## Test Plan
 
-- `cargo test -p tickvault-storage --lib` new tests green.
-- Scoped suite `cargo test -p tickvault-storage --features daily_universe_fetcher`.
-- `cargo fmt --check`; pre-commit invariant gates on warm cache.
+- `cargo test -p tickvault-common --test autonomous_ops_m3_m4_guard` green after
+  the deletions + exemption-list edit.
+- `cargo test -p tickvault-common --test triage_rules_guard --test
+  triage_rules_full_coverage_guard` green (script-reference tests).
+- `bash scripts/auto-fix-refresh-instruments.sh --dry-run` still exits 0/1
+  exactly as before (comment-only change).
+- banned-pattern scanner clean.
 
 ## Rollback
 
-`git revert` of the single squash commit removes only `#[cfg(test)]` code.
+Single revert restores the two scripts, the exemption entry, and the doc text.
+No runtime, data, or schema surface.
 
 ## Observability
 
-- N/A at runtime (cfg(test)-only). CI effect: storage coverage rises further
-  (~+200 lines ≈ +1.6pp vs the 91.35 baseline); floors ratchet on the next
-  re-measured baseline, not in this PR.
+No runtime change. The milestone doc becomes the accurate source for the next
+session (this session was itself misled by the stale "46 missing rules" claim —
+this PR prevents the same wasted re-discovery).
+
+## Plan Items
+
+- [x] Retire the dead depth auto-fix pair (deletes the two restart-depth
+      scripts named in Design item 1; verifier note: deleted paths are
+      intentionally not listed as Files since they no longer exist)
+  - Files: crates/common/tests/autonomous_ops_m3_m4_guard.rs
+  - Tests: every_auto_fix_script_has_matching_rollback
+
+- [x] Drop the deleted script from PRE_M3_EXEMPT
+  - Files: crates/common/tests/autonomous_ops_m3_m4_guard.rs
+  - Tests: auto_fix_scripts_emit_correlation_id_in_logs
+
+- [x] Honest-state corrections (milestone doc; script-comment fix deferred
+      per Design item 2's executable-bit constraint)
+  - Files: .claude/plans/autonomous-operations-100pct.md
+  - Tests: auto_fix_actions_must_reference_an_existing_script (existing; path unchanged)
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | All lifecycle HTTP fns vs mock 200 | Ok |
-| 2 | Same fns vs mock 500 | Err containing status, no panic |
-| 3 | ILP plural appends vs drain server | Ok; empty slice short-circuits |
-| 4 | ILP plural appends vs port 1 | Err, no panic |
-| 5 | Shadow DDL walk vs mock 200 / 400 | completes both arms, no panic |
-| 6 | Legacy drop: no marker → sweep + marker; marker → skip | both arms execute |
+| 1 | Guard suite after deletions | all green (dynamic pair scan) |
+| 2 | DATA-813 rule still resolves its script | triage_rules_guard green |
+| 3 | Operator reads milestone doc next session | accurate state + explicit pending decision |
