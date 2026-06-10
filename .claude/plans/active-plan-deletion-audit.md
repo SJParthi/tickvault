@@ -1,8 +1,10 @@
 # Deletion Audit — Tickvault Indices-4-Only Cleanup
 
-**Status:** DRAFT (audit only — NO code changes proposed in this document)
-**Date:** 2026-05-25
+**Status:** APPROVED (Phase A — docs/rules cleanup ONLY)
+**Date:** 2026-05-25 (audit) / 2026-06-10 (Phase A approval)
 **Author:** Claude audit pass
+**Approved by:** Parthiban, 2026-06-10 (verbatim): "TASK: Execute Phase A (docs/rules cleanup ONLY) of .claude/plans/active-plan-deletion-audit.md. First flip its Status to APPROVED quoting my message authorizing it. Delete ONLY files the audit lists for Phase A; for each, grep the whole repo for inbound references first and paste the zero-hit proof. No crates/ changes in this session. After each batch: full gate run, then ONE PR per the protocol, monitored to merge."
+**Phase A execution constraint (operator, 2026-06-10):** whole-file deletions + plan archiving only. Phase A actions requiring `crates/` edits (wave-error-code SECTION deletions that would orphan live `ErrorCode` variants against `error_code_rule_file_crossref.rs`; deletion of `crates/common/tests/loki_alloy_profile_guard.rs`) are DEFERRED to a later session per the "No crates/ changes" constraint.
 **Scope:** Identify dead code, deps, tests, rules, docs under the LOCKED runtime scope (4 IDX_I SIDs, 2 WebSockets, QuestDB+CloudWatch only).
 **Cross-references:**
 - `.claude/plans/aws-lifecycle/deletion-surface-map.md` (older 2026-05-18 plan, partially executed)
@@ -637,6 +639,18 @@ Per `operator-charter-forever.md` §A-§I:
 - The 3-agent adversarial review pattern.
 
 ---
+
+## Phase A execution log (2026-06-10)
+
+Verified against live repo state (the audit is dated 2026-05-25; two Phase A actions were already executed by intervening sessions, and one verdict went stale):
+
+| Phase A action | Finding 2026-06-10 | Disposition |
+|---|---|---|
+| 1. Delete 8-10 Dhan rule files | `traders-control.md`, `super-order.md`, `forever-order.md`, `conditional-trigger.md`, `edis.md`, `postback.md`, `statements.md`, `funds-margin.md` — ALL already absent from `.claude/rules/dhan/` (12 KEEP files remain). `instrument-master.md` was RECREATED 2026-05-29 as the always-on digest for the daily-universe CSV architecture (post-dates this audit) — verdict STALE, file is now KEEP. | ALREADY DONE (8 files); `instrument-master.md` verdict superseded — KEEP |
+| 2. Delete dead wave-error-code sections | Section deletions would orphan live `ErrorCode` variants against `crates/common/tests/error_code_rule_file_crossref.rs` — requires paired `crates/` edits | DEFERRED (operator "No crates/ changes" constraint, 2026-06-10) |
+| 3. Delete runbooks + phase blocks | `alertmanager-telegram.md`, `dashboards.md`, `phase-4b-movers-cleanup.md`, `block-01-master-instrument-download.md`, `block-04-tradingview-terminal.md` — ALL already absent | ALREADY DONE |
+| 4. Archive historical plans | 14 files archived this session with `git mv` + date prefix (13 zero-inbound-reference historical plans + the VERIFIED `active-plan.md` for merged #1069). Zero-hit proof: repo-wide grep per file, hits only in self/this audit. KEPT (inbound refs from `crates/` guards, CI, or kept docs): `100pct-audit-tracker.md`, `autonomous-operations-100pct.md`, `pr-288-completion.md`, `v2-architecture.md`, `v2-phases.md`, `v2-ratchets.md`, `v2-risks.md`, `aws-lifecycle/*`, `friday-may-15-mega/*`, `research/*` | DONE 2026-06-10 |
+| 5. Update `observability-architecture.md` (CloudWatch-only, drop 5-sink Loki/Alloy refs) | Coupled to dropping `crates/common/tests/loki_alloy_profile_guard.rs` (a `crates/` change) | DEFERRED with action 2 |
 
 ## What to do next (3 bullets)
 
