@@ -1,6 +1,6 @@
 # Implementation Plan: Make the 15:31 post-market cross-verify VISIBLE
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-06-10
 **Approved by:** Parthiban (operator directive 2026-06-10 — "Write the 6-section APPROVED plan first", task brief authorizes implementation; confirmed live 2026-06-10: CSV written 15:33, zero mismatches, zero Telegram, nothing on portal)
 
@@ -193,19 +193,19 @@ redeploy via the existing deploy workflow picks up the reverted handler.
 
 ## Plan Items
 
-- [ ] Item 1 — Typed events + emit wiring
+- [x] Item 1 — Typed events + emit wiring (events.rs variants + arms + 10 tests; main.rs inner-spawn/outer-supervisor emit sites)
   - Files: crates/core/src/notification/events.rs, crates/app/src/main.rs
   - Tests: test_cross_verify_1m_summary_clean_is_info, test_cross_verify_1m_summary_mismatch_is_high, test_cross_verify_1m_summary_degraded_is_high, test_cross_verify_1m_aborted_is_high, test_cross_verify_1m_summary_message_format
-- [ ] Item 2 — summary.json artefact
+- [x] Item 2 — summary.json artefact (summary_json_contents + write_summary_file, 2 tests)
   - Files: crates/app/src/cross_verify_1m_boot.rs
   - Tests: summary_json_contents_round_trips_fields, summary_json_marks_degraded
-- [ ] Item 3 — GET /api/debug/cross-verify/latest
+- [x] Item 3 — GET /api/debug/cross-verify/latest (handler + route, 6 tests)
   - Files: crates/api/src/handlers/debug.rs, crates/api/src/lib.rs
   - Tests: cross_verify_latest_returns_404_when_missing, cross_verify_latest_returns_200_with_content, cross_verify_latest_merges_summary_json
-- [ ] Item 4 — Portal Cross-verify card
+- [x] Item 4 — Portal Cross-verify card (action + card + JS, 7 Lambda tests)
   - Files: deploy/aws/lambda/operator-control/handler.py, deploy/aws/lambda/operator-control/test_handler.py
   - Tests: test_parse_cross_verify, test_html_has_cross_verify_card, test_cross_verify_action_is_read_only
-- [ ] Item 5 — Source-scan ratchet
+- [x] Item 5 — Source-scan ratchet (3 guard tests)
   - Files: crates/app/tests/cross_verify_1m_visibility_guard.rs
   - Tests: emit_call_site_for_summary_is_pinned, emit_call_site_for_aborted_is_pinned, summary_json_write_is_pinned
 

@@ -535,6 +535,47 @@ def _parse_storage(stdout: str) -> dict:
     }
 
 
+# ------------------------------------------------------------ cross-verify snap
+# The 15:31 IST daily candle check vs the exchange record (visibility
+# directive 2026-06-10). Reads the app's read-only endpoint on the box and
+# re-emits ONLY the summary as labeled lines — the mismatch CSV itself stays
+# on the box (SSM command output is size-capped). Read-only; degrades to
+# blank fields when the box/app is down or no run has happened yet.
+_CROSS_VERIFY_COMMANDS = [
+    "set +e",
+    (
+        "curl -fsS --max-time 4 http://127.0.0.1:3001/api/debug/cross-verify/latest 2>/dev/null | "
+        'python3 -c \'import json,sys; d=json.load(sys.stdin); s=d.get("summary") or {}; '
+        'print("CV_DATE="+str(d.get("date",""))); '
+        'print("CV_MISMATCH_ROWS="+str(d.get("mismatch_rows",""))); '
+        'print("CV_INSTRUMENTS="+str(s.get("instruments_checked",""))); '
+        'print("CV_COMPARED="+str(s.get("compared",""))); '
+        'print("CV_MISSING="+str(s.get("missing_ours",""))); '
+        'print("CV_DEGRADED="+str(s.get("degraded","")))\' '
+        "2>/dev/null || echo CV_DATE="
+    ),
+]
+
+
+def _parse_cross_verify(stdout: str) -> dict:
+    """Parse the labeled cross-verify snapshot into a dict (pure). Blank
+    fields mean: box stopped, app down, or no run yet — the card shows a
+    truthful 'no run yet', never a fabricated PASS."""
+    f: dict[str, str] = {}
+    for line in (stdout or "").splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            f[k.strip()] = v.strip()
+    return {
+        "date": f.get("CV_DATE", ""),
+        "mismatch_rows": f.get("CV_MISMATCH_ROWS", ""),
+        "instruments": f.get("CV_INSTRUMENTS", ""),
+        "compared": f.get("CV_COMPARED", ""),
+        "missing": f.get("CV_MISSING", ""),
+        "degraded": f.get("CV_DEGRADED", ""),
+    }
+
+
 # ---------------------------------------------------------------- GitHub helper
 def _gh(method: str, path: str, body: dict | None = None) -> tuple[int, object]:
     """Minimal GitHub REST call using urllib (no deps). Returns (status, json)."""
@@ -812,6 +853,11 @@ def lambda_handler(event, _context):
             return _resp(200, {"ok": True, "action": "logs", "raw": out})
         if action == "latency":
             return _resp(200, {"ok": True, "action": "latency", **_parse_latency(_ssm_shell_sync(_LATENCY_COMMANDS, timeout=_LATENCY_TIMEOUT_SECS))})
+        if action == "cross_verify":
+            # READ-ONLY (not in _DESTRUCTIVE): the 15:31 IST daily candle
+            # check vs the exchange record. Bearer auth already enforced by
+            # the top-level _authorized() gate.
+            return _resp(200, {"ok": True, "action": "cross_verify", **_parse_cross_verify(_ssm_shell_sync(_CROSS_VERIFY_COMMANDS))})
 
         # ---- github ----
         if action == "gh_prs":
@@ -1025,6 +1071,11 @@ def _console_html() -> str:
     <!-- DATA -->
     <section data-tab="data" hidden>
       <div class="card"><div class="lbl">candles sealed today (per timeframe)</div><div id="bars"></div></div>
+      <div class="card"><div class="lbl">cross-verify — daily candle check vs exchange record (3:31 PM IST)</div>
+        <div class="row" style="margin-bottom:10px"><button class="b-blu" onclick="loadCrossVerify()">🔄 Load result</button></div>
+        <div class="shields" id="cvshields"></div>
+        <div class="muted" id="cvnote" style="margin-top:8px"></div>
+      </div>
       <div class="card"><div class="lbl">QuestDB query (read-only)</div>
         <textarea id="sql" placeholder="SELECT ts, security_id, count() FROM ticks WHERE ts IN today() GROUP BY ts, security_id ORDER BY 3 DESC LIMIT 20"></textarea>
         <div class="row" style="margin-top:10px"><button class="b-blu" onclick="runSql()">▶ Run query</button></div>
@@ -1101,6 +1152,7 @@ function lock(){ TOKEN=''; localStorage.removeItem('tv_token'); $('tok').value='
 function tab(name){ curTab=name; document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.t===name));
   document.querySelectorAll('section[data-tab]').forEach(s=>s.hidden=s.dataset.tab!==name);
   if(name==='github' && !$('prs').dataset.loaded) loadGithub();
+  if(name==='data' && !$('cvshields').dataset.loaded) loadCrossVerify();
   if(name==='aws' && !$('alarms').dataset.loaded) loadAws();
   if(name==='latency' && !$('latnet').dataset.loaded) loadLatency();
   if(name==='logs' && $('logErr').textContent==='—') loadLogs(); }
@@ -1185,6 +1237,32 @@ async function loadAws(){ $('alarms').dataset.loaded='1'; $('alarms').innerHTML=
     shield('Disk free', (j.disk_free_gb?j.disk_free_gb+' GB':'—'), freeOk)+
     shield('Disk used', (j.disk_used_gb?j.disk_used_gb+' GB ('+(j.disk_pct||'')+')':'—'), pctOk)+
     shield('Database size', (j.db_size_gb?j.db_size_gb+' GB':'—'), true); }
+
+// Cross-verify card (3:31 PM IST daily candle check vs exchange record).
+// PASS requires the hardened condition: zero mismatches AND zero missing
+// minutes AND not degraded AND at least one minute actually compared —
+// "nothing compared" must never render as PASS. All string values are
+// rendered through esc() (operator data never lands raw in HTML).
+async function loadCrossVerify(){ $('cvshields').dataset.loaded='1'; $('cvshields').innerHTML='<span class="muted">loading…</span>'; $('cvnote').textContent='';
+  const j=await call('cross_verify'); if(!j){ $('cvshields').innerHTML=''; return; }
+  if(!j.date){ $('cvshields').innerHTML='<span class="muted">no run yet — the check fires at 3:31 PM IST on trading days (box must be running)</span>'; return; }
+  const mis=parseInt(j.mismatch_rows,10)||0, missing=parseInt(j.missing,10)||0, compared=parseInt(j.compared,10)||0;
+  const degraded=String(j.degraded).toLowerCase()==='true';
+  const hasSummary=(j.compared!=null && j.compared!=='');
+  const pass = hasSummary ? (mis===0 && missing===0 && !degraded && compared>0) : false;
+  const good = hasSummary ? pass : (mis===0 && !degraded);
+  const badge = hasSummary ? (pass?'PASS ✅':'FAIL ⚠') : (good?'OK (no summary)':'FAIL ⚠');
+  $('cvshields').innerHTML=
+    shield('Result', badge, good)+
+    shield('Date', esc(j.date||'—'), true)+
+    shield('Instruments', esc(j.instruments||'—'), true)+
+    shield('Minutes compared', esc(j.compared||'—'), !hasSummary||compared>0)+
+    shield('Mismatches', esc(j.mismatch_rows||'0'), mis===0)+
+    shield('Missing minutes', esc(j.missing||'—'), missing===0);
+  $('cvnote').textContent = degraded ? 'Coverage was PARTIAL — the check could not vouch for the full universe.'
+    : (pass ? 'Every 1-minute candle matches the exchange record exactly.'
+    : (hasSummary ? 'Differences found — review which minutes differ from the exchange record.'
+    : 'This run pre-dates the summary artefact — mismatch count shown from the day\'s file.')); }
 
 function fmtNs(n){ if(n==null||n==='') return '—'; n=Number(n); if(n<1000) return n.toFixed(0)+' ns';
   if(n<1e6) return (n/1e3).toFixed(2)+' µs'; if(n<1e9) return (n/1e6).toFixed(2)+' ms'; return (n/1e9).toFixed(2)+' s'; }
