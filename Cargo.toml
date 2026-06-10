@@ -21,7 +21,9 @@ tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-native-roots"]
 futures-util = "0.3.32"
 
 # ---- Section 2: Backend Core — Zero-Copy Parsing ----
-zerocopy = { version = "0.8.50", features = ["derive"] }
+# zerocopy removed 2026-06-10 (operator-approved dead-pin cleanup): declared
+# in crates/core but zero call sites — binary parsing uses fixed-offset
+# from_le_bytes reads, never the zerocopy derive machinery.
 
 # ---- Section 2: Backend Core — Dispatch ----
 enum_dispatch = "0.3.13"
@@ -31,7 +33,8 @@ papaya = "0.2.4"
 dashmap = "6.2.1"
 crossbeam-channel = "0.5.15"
 rtrb = "0.3.4"
-ringbuf = "0.4.8"
+# ringbuf removed 2026-06-10 (operator-approved dead-pin cleanup): zero
+# consumers — hot-path ring buffers use rtrb + crossbeam-channel.
 # Wave 6 Sub-PR #1 (2026-05-10): per-cell mutex for the multi-TF
 # aggregator's `[Mutex<LiveCandleState>; 9]` per-instrument array.
 # Operator-approved alternative to `crossbeam_utils::atomic::AtomicCell`
@@ -56,23 +59,28 @@ hdrhistogram = "7.5.4"
 quanta = "0.12.6"
 
 # ---- Section 5: Observability — OpenTelemetry ----
-# Versions pinned to 0.31.0 to match tracing-opentelemetry 0.32.1 (which depends on opentelemetry 0.31.0)
-opentelemetry = "0.31.0"
-opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31.1", features = ["grpc-tonic"] }
+# The 4 otel crates are a MATCHED SET: tracing-opentelemetry 0.33.0 depends on
+# opentelemetry/opentelemetry_sdk/opentelemetry-otlp ^0.32. Bump all 4 together
+# or none (single-crate bumps split the dependency tree and fail to compile —
+# see .claude/plans/research/dep-decisions.md §1, dependabot PR #938 post-mortem).
+opentelemetry = "0.32.0"
+opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic"] }
 
 # ---- Section 5: Observability — Tracing ----
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
-tracing-opentelemetry = "0.32.1"
+tracing-opentelemetry = "0.33.0"
 # Phase 2 of plans/active-plan.md: hourly-rotated ERROR-only JSONL stream
 # at data/logs/errors.jsonl so Claude Code / Loki / summary_writer can tail
 # a structured, append-only file instead of parsing journald prose.
 tracing-appender = "0.2.5"
 
 # ---- Section 6: Trading Domain — Auth ----
+# jsonwebtoken removed 2026-06-10 (operator-approved dead-pin cleanup): zero
+# consumers anywhere in the repo — the Dhan JWT is handled as an opaque
+# Secret<String>, never decoded locally.
 arc-swap = "1.9.1"
-jsonwebtoken = "10.3.0"
 totp-rs = { version = "5.7.1", features = ["gen_secret", "otpauth"] }
 
 # ---- Section 6: Trading Domain — OMS & Risk ----
