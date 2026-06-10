@@ -526,6 +526,83 @@ async fn run_ddl(client: &Client, base_url: &str, table: &str, ddl: &str) {
 mod tests {
     use super::*;
 
+    // ========================================================================
+    // P2c (coverage-gaps #1076): DDL-walk + legacy-drop arm coverage via a
+    // file-local mock HTTP server (same idiom as tick_persistence::tests).
+    // ========================================================================
+
+    const P2C_HTTP_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+    const P2C_HTTP_400: &str =
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 13\r\n\r\n{\"error\":\"x\"}";
+
+    async fn p2c_spawn_mock_http(response: &'static str) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 8192];
+                        let _ = stream.read(&mut buf).await;
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    });
+                }
+            }
+        });
+        port
+    }
+
+    fn p2c_cfg(http_port: u16) -> QuestDbConfig {
+        QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port,
+            pg_port: 1,
+            ilp_port: 1,
+        }
+    }
+
+    /// P2c: the 21-table DDL walk (CREATE + DEDUP + self-heal ALTERs)
+    /// completes without panic against a 200-everything QuestDB.
+    #[tokio::test]
+    async fn test_ensure_shadow_candle_tables_with_mock_200() {
+        let port = p2c_spawn_mock_http(P2C_HTTP_200).await;
+        ensure_shadow_candle_tables(&p2c_cfg(port)).await;
+    }
+
+    /// P2c: a 400-everything QuestDB exercises every error/warn arm of the
+    /// DDL walk; the function is best-effort and must not panic or hang.
+    #[tokio::test]
+    async fn test_ensure_shadow_candle_tables_with_mock_400() {
+        let port = p2c_spawn_mock_http(P2C_HTTP_400).await;
+        ensure_shadow_candle_tables(&p2c_cfg(port)).await;
+    }
+
+    /// P2c: legacy-drop marker lifecycle — first run (marker absent) sweeps
+    /// every legacy object against the mock and writes the one-shot marker;
+    /// second run takes the early-skip arm. Self-cleaning: the cwd-relative
+    /// marker is removed before AND after so no repo pollution survives.
+    #[tokio::test]
+    async fn test_drop_legacy_candle_objects_marker_lifecycle() {
+        let marker = std::path::Path::new(LEGACY_DROP_MARKER_PATH);
+        let _ = std::fs::remove_file(marker);
+
+        let port = p2c_spawn_mock_http(P2C_HTTP_200).await;
+        drop_legacy_candle_objects(&p2c_cfg(port)).await;
+        assert!(
+            marker.exists(),
+            "first run must write the one-shot marker (PR #798 gate)"
+        );
+
+        // Second run: marker present → early skip (no HTTP traffic needed).
+        drop_legacy_candle_objects(&p2c_cfg(1)).await;
+
+        let _ = std::fs::remove_file(marker);
+        if let Some(parent) = marker.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+
     #[test]
     fn test_candle_table_names_has_twenty_one_entries() {
         assert_eq!(candle_table_names().len(), TF_COUNT);
