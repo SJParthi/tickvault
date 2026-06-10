@@ -57,9 +57,18 @@ criterion = { workspace = true }
 dhat = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
+# full_tick_processing bench only: install the SAME recorder family
+# production uses (workspace-pinned, already a crates/app dependency) so
+# per-tick counter/histogram costs are measured against real registry
+# atomics, not the no-op recorder.
+metrics-exporter-prometheus = { workspace = true }
 
 [[bench]]
 name = "tick_parser"
+harness = false
+
+[[bench]]
+name = "full_tick_processing"
 harness = false
 
 [[bench]]
