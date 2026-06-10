@@ -1,6 +1,6 @@
 # Operator portal Lambda — action backend for the single-page operator portal
 # (Overview / Data / GitHub / Logs / AWS / Latency tabs).
-# Re-trigger marker: bump to fire terraform-apply (re-zips handler.py). (2026-06-05b — nuke surfaces REAL outcome via command-status poll (no false-OK); dedup-key panel query URL-encodes the `=` so it stops showing "?")
+# Re-trigger marker: bump to fire terraform-apply (re-zips handler.py). (2026-06-10 — PR #1091 windowed latency: Latency tab gains live p50/p99/avg per-tick shields + DB-batch-flush meter from the double-scrape bucket deltas; lifetime mean falls back when the probe window saw 0 ticks)
 #
 # WHY: the operator wants ONE place (console URL + Telegram) to view AND control
 # the box, without the AWS console or GitHub UI. Grafana = view; this = control.
