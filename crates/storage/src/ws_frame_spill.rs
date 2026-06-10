@@ -690,9 +690,7 @@ pub fn classify_frame_for_day(
 /// segments and `<wal_dir>/archive/`. READ-ONLY — never archives, never
 /// deletes; safe to run while the writer is appending (the replay parser
 /// stops cleanly at a partial tail). Cold path: once per trading day.
-// TEST-EXEMPT: orchestration over replay_segment; the classification +
-// day-attribution logic is unit-tested via classify_frame_for_day /
-// ist_day_of_wall_nanos / the test_count_frames_* suite below.
+// TEST-EXEMPT: orchestration over replay_segment; classification + day-attribution unit-tested via the test_count_frames_* suite
 pub fn count_frames_for_ist_day<P: AsRef<Path>>(
     wal_dir: P,
     target_ist_day: u64,

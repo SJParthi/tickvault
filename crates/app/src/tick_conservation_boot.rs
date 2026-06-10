@@ -274,9 +274,7 @@ pub fn parse_questdb_count(body: &str) -> Option<i64> {
 /// never camouflaged as a zero.
 // APPROVED: cold-path orchestrator — 7 independent live inputs (wal dir, questdb cfg, metrics port, day numbers, run ts, boot coverage flag); bundling would only relocate the arity.
 #[allow(clippy::too_many_arguments)]
-// TEST-EXEMPT: orchestration over unit-tested pure parts (decide/parse/
-// residuals/classify/persistence); a direct test needs live QuestDB +
-// metrics endpoints — covered operationally by TICKVAULT_TICK_CONSERVE_NOW.
+// TEST-EXEMPT: orchestration over unit-tested pure parts (decide/parse/residuals/classify/persistence); a direct test needs live QuestDB + metrics endpoints — covered operationally by TICKVAULT_TICK_CONSERVE_NOW
 pub async fn run_tick_conservation_audit(
     wal_dir: &Path,
     questdb_config: &QuestDbConfig,

@@ -158,8 +158,7 @@ pub fn tick_conservation_audit_create_ddl() -> String {
 /// Create the audit table if absent (idempotent, schema-self-heal pattern).
 /// Failures log at `error!` (Telegram-routable) but do NOT block the audit —
 /// the run still reports its numbers via the log/Telegram path.
-// TEST-EXEMPT: live-QuestDB DDL runner (DDL string unit-tested via
-// tick_conservation_audit_create_ddl tests).
+// TEST-EXEMPT: live-QuestDB DDL runner (DDL string unit-tested via the tick_conservation_audit_create_ddl tests)
 pub async fn ensure_tick_conservation_audit_table(questdb_config: &QuestDbConfig) {
     let base_url = format!(
         "http://{}:{}/exec",
@@ -209,8 +208,7 @@ pub struct TickConservationAuditWriter {
 impl TickConservationAuditWriter {
     /// Production constructor — connects via ILP TCP, lazy on failure.
     #[must_use]
-    // TEST-EXEMPT: production ILP-connect constructor (needs live QuestDB);
-    // disconnected/append/flush paths are covered via for_test().
+    // TEST-EXEMPT: production ILP-connect constructor (needs live QuestDB); disconnected/append/flush paths covered via for_test()
     pub fn new(config: &QuestDbConfig) -> Self {
         let conf = format!("tcp::addr={}:{};", config.host, config.ilp_port);
         match Sender::from_conf(&conf) {
