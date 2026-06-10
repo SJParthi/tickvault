@@ -2858,6 +2858,9 @@ mod tests {
 
     /// P2b: direct buffer flush while QuestDB is down must surface an Err
     /// (reconnect fails) — never a silent Ok with data stuck in the buffer.
+    // APPROVED: the deprecated fn is still pub API; this test pins its
+    // error contract until the fn is physically deleted.
+    #[allow(deprecated)]
     #[test]
     fn test_flush_buffer_direct_disconnected_returns_error() {
         let mut writer = TickPersistenceWriter::new_disconnected(&disconnected_cfg());
