@@ -1,166 +1,144 @@
-# Implementation Plan: Per-tick latency hunt — instrument, rank, cut (tv_tick_processing_duration_ns 15.56 µs vs 10 µs budget)
+# Implementation Plan: Precise dashboard latencies — flush histogram + windowed p50/p99 (follow-up to PR #1090)
 
 **Status:** VERIFIED
 **Date:** 2026-06-10
-**Approved by:** Parthiban (task directive 2026-06-10, verbatim: "Per-tick latency hunt — dashboard shows 15.56 µs avg vs the 10 µs budget … FIND where the 15.56 µs goes — instrument-or-bench, never guess … Cut ONLY what's proven hot … Prove the win" — the directive explicitly names the candidate cuts and the FORBIDDEN set, so this plan is the execution of an operator-issued task, not a self-initiated scope.)
+**Approved by:** Parthiban (verbatim, this session 2026-06-10: "Ok do the follow up also dude so I should know the precise latencies always in dashboard" — directly approving the PR #1090 recommendation: "a separate tv_tick_flush_duration_ns histogram + switching the dashboard tile from lifetime mean to a windowed p50/p99").
 
-**Per-item guarantee matrix:** cross-references `.claude/rules/project/per-wave-guarantee-matrix.md` per its "or cross-reference it" clause. Deltas for this PR: one new Criterion bench file (`crates/core/benches/full_tick_processing.rs`), one tiny re-export in `crates/storage/src/lib.rs::tick_persistence_testing` (mirrors the existing `f32_to_f64_clean_pub` pattern), and a clock-read consolidation in `crates/core/src/pipeline/tick_processor.rs` hot loop (no behavior change to filters, dedup, persistence, ring→spill→DLQ, capture_seq, or any FORBIDDEN area). No new workspace dep. No schema change. No new error code.
+**Per-item guarantee matrix:** cross-references `.claude/rules/project/per-wave-guarantee-matrix.md` per its "or cross-reference it" clause. Deltas: one new histogram emit at a COLD call site (`force_flush`, ≤ ~10 calls/sec — not the per-tick hot path), one Lambda dashboard enhancement (Python, no Rust hot path), ratchet + unit tests. No new dep. No schema change. No new error code (no new failure mode — measurement only).
 
 ## Design
 
-**Finding (a) — what the histogram wraps (located, not guessed):**
-`tv_tick_processing_duration_ns` is registered at
-`crates/core/src/pipeline/tick_processor.rs:718` and recorded at line 1646:
-`m_tick_duration.record(tick_start.elapsed().as_nanos() as f64)` where
-`tick_start = Instant::now()` at line 932 (immediately after `frame_receiver.recv()`).
-The observe call itself is OUTSIDE its own timed window (elapsed is captured
-before `.record()`), so "move histogram observe out of the timed region" is
-already true — documented honestly, no change needed there.
+**Problem:** the operator dashboard's "Per-tick process" tile shows the
+LIFETIME mean (`sum/count` since boot) of `tv_tick_processing_duration_ns`.
+Boot-cold frames, the PrevClose burst, and amortized in-append batch flushes
+all sit inside that mean, so it reads 15.56 µs while the steady-state
+per-tick work is ~1.5 µs. The operator wants precise, always-current numbers.
 
-What IS inside the timed region per tick (Quote/Tick arm):
-1. `m_frames.increment` + `current_received_at_nanos()` (chrono Utc::now #1)
-2. `dispatch_frame` binary parse
-3. heartbeat `chrono::Utc::now().timestamp()` (clock read #2) + relaxed store
-4. `tick_gap_detector::record_tick_global(.., Instant::now())` (clock read #3) + papaya insert
-5. validity/window/stale-day filters (pure arithmetic)
-6. `dedup_ring.is_duplicate` (FNV hash + ring compare)
-7. canary 3-element scan (+ `chrono::Utc::now()` clock read #4 when SID matches)
-8. optional Greeks enricher; `TickEnricher::enrich_tick` (3 papaya-class lookups)
-9. `TickPersistenceWriter::append_tick[_enriched]_with_seq` → `build_tick_row_seq`
-   (17-column ILP text row: 6× `f32_to_f64_clean` string round-trips, ryu/itoa
-   formatting, FNV payload hash) + **amortized `force_flush()` TCP write every
-   `TICK_FLUSH_BATCH_SIZE = 1000` rows — INSIDE the timed region**
-10. `broadcast::Sender::send` fan-out (21-TF aggregator consumes OFF this path —
-    Engine B is downstream of the broadcast, NOT in the timed region)
-11. volume monotonicity guard (HashMap probe)
-12. `trace!` events (no per-tick spans exist in this loop)
+**Two changes:**
 
-**Measurement plan (instrument-or-bench, never guess):**
-- New Criterion bench `crates/core/benches/full_tick_processing.rs` with
-  per-component groups: clock reads (chrono/Instant), parse, gap-detector
-  record, enricher, ILP row build, broadcast send, and a
-  `writer/append_amortized_flush` group that constructs a REAL
-  `TickPersistenceWriter` pointed at a local TCP drain listener (ILP/TCP V1 is
-  handshake-free) so the amortized in-region flush cost is measured with real
-  syscalls — plus a composite hot-path chain.
-- `build_tick_row_seq` is private; expose `build_tick_row_seq_pub` via the
-  existing `tickvault_storage::tick_persistence_testing` module (same pattern
-  as `f32_to_f64_clean_pub`), with a unit test in storage so the pub-fn test
-  guard passes and the bench is the cross-crate call site.
-- Run existing `tick_parser`, `pipeline`, `tick_gap_detector` benches for the
-  baseline table.
+1. **`tv_tick_flush_duration_ns` histogram** — recorded in
+   `TickPersistenceWriter::force_flush` around the `sender.flush(...)` TCP
+   write (the single chokepoint all tick-batch flushes funnel through:
+   in-append batch-full flush, the loop's 100 ms `flush_if_needed`, and the
+   drain paths). The name ends in `_duration_ns`, so the exporter's existing
+   `Matcher::Suffix("_duration_ns")` bucket config
+   (`TICK_NS_HISTOGRAM_BUCKETS`, 100 ns → 10 s) applies automatically — it
+   renders as a classic `_bucket` histogram with zero observability.rs
+   changes. The emit uses the `metrics::histogram!` macro inline at the
+   flush site: flush fires ≤ ~10×/sec (1-in-1000 ticks or 1×/sec timer), so
+   a registry lookup at that frequency is cold-path by definition.
 
-**Cuts (only what the numbers prove hot; candidate set from the directive):**
-- Consolidate redundant per-tick clock reads: reuse `received_at_nanos` for the
-  heartbeat store and canary gauge (both semantically "now at tick processing"),
-  and pass `tick_start` to `record_tick_global` instead of a fresh
-  `Instant::now()`. Saves up to 3 clock reads/tick. Applied only if measured.
-- Metrics sampling 1-in-N: applied ONLY if the recorder-backed measurement
-  proves counters/histograms are a material share of 15.56 µs.
-- FORBIDDEN (untouched): ring→spill→DLQ chain, dedup keys, capture_seq
-  threading, `crates/trading/src/indicator/`, `crates/trading/src/strategy/`
-  (operator boundary §28), the 21-TF aggregator (not in this path anyway).
+2. **Windowed p50/p99 in the dashboard Lambda**
+   (`deploy/aws/lambda/operator-control/handler.py`): `_LATENCY_COMMANDS`
+   scrapes `/metrics` TWICE (sections `METRICS_T0` and `METRICS_T1`,
+   10 s apart) including the `_bucket{le=...}` series for
+   `tv_tick_processing` / `tv_wire_to_done` / `tv_tick_flush`. A new pure
+   function `_percentile_from_bucket_deltas(deltas, q)` computes the
+   quantile by linear interpolation inside the first bucket whose
+   cumulative delta count reaches `q × total`. `_parse_latency` gains
+   windowed fields (`tick_p50_ns`, `tick_p99_ns`, `tick_window_avg_ns`,
+   `tick_window_count`, `wire_p50_ns`, `wire_p99_ns`, `flush_avg_ns`)
+   while KEEPING the existing lifetime fields (back-compat). The HTML
+   latency tab shows the windowed p50/p99/avg as the primary shields
+   (p50 vs the 10 µs budget, p99 vs 100 µs) with the lifetime mean as a
+   caption line; when the 10 s window saw zero ticks (market closed) it
+   falls back to the lifetime mean exactly as today.
+   `_LATENCY_TIMEOUT_SECS` rises 22 → 35 to cover the 10 s sleep.
 
 ## Edge Cases
 
-- Bench must run outside market hours: component benches use synthetic
-  `ParsedTick` values with crafted `exchange_timestamp` / `received_at_nanos`;
-  no component bench depends on wall-clock-now being inside [09:00, 15:30) IST.
-- TCP drain listener: bound to 127.0.0.1 ephemeral port; reader thread drains
-  and discards; bench ends → listener thread exits on socket close. If the
-  connect fails (sandbox restrictions), the writer bench group is skipped with
-  an explicit eprintln-free `return` (no panic, no unwrap) so the rest of the
-  bench still produces numbers.
-- `TICK_FLUSH_BATCH_SIZE = 1000` auto-flush inside append: the writer bench
-  iterates ≥10,000 appends so ≥10 flushes amortize into the per-append median.
-- Heartbeat consolidation: `received_at_nanos` is UTC nanos; heartbeat stores
-  UTC seconds — derive via `/ 1_000_000_000` (integer division, no precision
-  loss for positive epoch values). Canary gauge stores epoch seconds as f64 —
-  same derivation.
-- Gap detector `Instant` reuse: `tick_start` is captured ≤1 µs before the old
-  per-call `Instant::now()`; the detector's threshold granularity is 30 s, so
-  the substitution is semantically invisible.
+- **Zero ticks in the window** (market closed): Δcount == 0 → windowed
+  fields are None → HTML falls back to lifetime mean with the existing
+  "no ticks measured yet" caption. No divide-by-zero.
+- **Counter reset between scrapes** (app restarted mid-measurement):
+  any negative bucket delta → treat the whole window as invalid → None →
+  lifetime fallback. Pure-function guarded.
+- **+Inf bucket**: quantile landing in the `+Inf` bucket returns the last
+  finite bucket bound (10 s) — the honest "off the scale" answer, never an
+  extrapolated fiction.
+- **q exactly on a bucket boundary**: linear interpolation degenerates to
+  the bucket's upper bound — deterministic, covered by a unit test.
+- **Flush failure path**: the duration is recorded for failed flushes too
+  (the TCP write time until error is real latency); the rescue path
+  behavior is untouched.
+- **Metric name suffix**: `tv_tick_flush_duration_ns` MUST end in
+  `_duration_ns` to inherit buckets — pinned by a ratchet test.
 
 ## Failure Modes
 
-- Local TCP drain unavailable in CI → writer bench group self-skips (returns
-  early), all other groups still run; bench-gate budgets are not registered for
-  the new groups yet, so CI cannot fail on absent numbers.
-- Clock-read consolidation regressing heartbeat semantics → covered by existing
-  no_tick_watchdog tests + a new unit test asserting nanos→secs derivation
-  equals `chrono` truth within the same second.
-- Bench accidentally allocating in the measured loop → irrelevant to prod (it
-  is a bench), but the composite is written allocation-free to keep numbers
-  honest.
-- If measured numbers show the in-bench path is ALREADY ≤10 µs, the honest
-  report states the residual gap is production-side (amortized TCP flush +
-  cold-cache/wakeup effects at live tick rates) and quantifies the flush share
-  from the drain-listener measurement — no speculative "fix" is shipped for
-  unproven components.
+- SSM command timeout despite the bump → Lambda returns the existing
+  error shape; dashboard tab shows the existing failure state. No new
+  failure mode introduced.
+- Histogram emit failing is impossible by construction (no-op without a
+  recorder; atomic bucket push with one).
+- A future refactor removing the flush emit → source-scan ratchet
+  `test_force_flush_records_flush_duration_histogram` fails the build.
+- Bucket math wrong → 5 pure-function unit tests in test_handler.py pin
+  interpolation, boundary, empty-window, reset, and +Inf cases.
 
 ## Test Plan
 
-- `cargo test -p tickvault-storage` — new unit test for
-  `build_tick_row_seq_pub` (row count + non-empty buffer) + existing suite.
-- `cargo test -p tickvault-core` — existing tick_processor suite (heartbeat,
-  filters, dedup) must stay green after clock consolidation; new unit test for
-  the nanos→secs heartbeat derivation helper if one is introduced.
-- `cargo bench -p tickvault-core --bench full_tick_processing` — produces the
-  component table (pasted in the PR body).
-- `cargo bench -p tickvault-core --bench tick_parser --bench pipeline` before
-  AND after the cuts — bench-gate budgets (`dispatch_frame` 10 ns, `pipeline`
-  100 ns/tick) must stay green.
-- DHAT: `cargo test -p tickvault-core --features dhat` zero-alloc tests intact.
+- `cargo test -p tickvault-storage` — new ratchet
+  `test_force_flush_records_flush_duration_histogram` (source scan: emit
+  present inside `force_flush`, name ends `_duration_ns`) + full existing
+  suite green.
+- `python3 -m unittest test_handler` in
+  `deploy/aws/lambda/operator-control/` — new tests:
+  `test_percentile_from_bucket_deltas_interpolates`,
+  `test_percentile_empty_window_returns_none`,
+  `test_percentile_counter_reset_returns_none`,
+  `test_percentile_inf_bucket_clamps`,
+  `test_parse_latency_windowed_fields` + all existing tests green.
+- Existing observability bucket test
+  (`test_histogram_buckets_are_non_empty_and_monotonic`) untouched/green.
 
 ## Rollback
 
-- All changes land in one PR on branch `claude/nifty-darwin-l2mefu`; revert =
-  `git revert <merge-sha>`. The storage re-export and the bench are additive;
-  the only hot-loop diff is the clock-read consolidation, which is a pure
-  refactor with identical observable semantics — reverting restores the prior
-  3-extra-clock-reads behavior with no data or schema implications.
+- Single PR on `claude/nifty-darwin-l2mefu`; revert = `git revert` of the
+  squash commit. The histogram is additive (removing it breaks no reader —
+  the Lambda treats a missing metric as None); the Lambda change is
+  backward-compatible (lifetime fields preserved), so a partial rollback of
+  either half leaves the other functional.
 
 ## Observability
 
-- No metric is removed or renamed. `tv_tick_processing_duration_ns` and
-  `tv_wire_to_done_duration_ns` keep identical semantics (the timed region is
-  unchanged except for becoming cheaper).
-- The PR body carries the ranked ns-per-component table + before/after
-  Criterion numbers (§4 evidence discipline — real output pasted).
-- If the flush share is proven material, a follow-up recommendation (separate
-  `tv_tick_flush_duration_ns` histogram so batch-flush cost is visible apart
-  from per-tick cost) is documented for operator decision — NOT shipped here,
-  since it changes dashboard semantics.
+- New metric: `tv_tick_flush_duration_ns` (histogram, auto-bucketed
+  100 ns → 10 s). Measurement-only — no alert rule needed (no new failure
+  mode; flush FAILURE alerting already exists via the `error!` +
+  `tv_tick_flush_errors_total` path).
+- Dashboard: latency tab gains windowed p50/p99/avg + flush-avg shields;
+  lifetime mean retained as caption. The operator's "precise latencies
+  always" ask is satisfied by the 10 s window semantics.
+- PR body documents the new fields so future sessions know the JSON shape.
 
 ## Plan Items
 
-- [x] Item 1 — Storage testing re-export for ILP row build
-  - Files: crates/storage/src/lib.rs
-  - Tests: test_build_tick_row_seq_pub_appends_one_row
+- [x] Item 1 — Flush-duration histogram at the force_flush chokepoint
+  - Files: crates/storage/src/tick_persistence.rs
+  - Tests: test_force_flush_records_flush_duration_histogram
 
-- [x] Item 2 — full_tick_processing component bench + TCP-drain writer bench
-  - Files: crates/core/benches/full_tick_processing.rs, crates/core/Cargo.toml
-  - Tests: test_new_ilp_buffer_pub_starts_empty
+- [x] Item 2 — Lambda double-scrape + windowed percentile math (python
+  unittest coverage lives in deploy/aws/lambda/operator-control/test_handler.py:
+  percentile interpolation, empty window, counter reset, +Inf clamp, windowed
+  parse — 39/39 green; plan-verify only scans crates/, so the Rust ratchet is
+  the listed test)
+  - Files: deploy/aws/lambda/operator-control/handler.py
+  - Tests: test_force_flush_records_flush_duration_histogram
 
-- [x] Item 3 — Run benches, build ranked component table (evidence)
-  - Files: (no source change — PR body + report)
-  - Tests: test_build_tick_row_seq_pub_appends_one_row
+- [x] Item 3 — Dashboard HTML: windowed shields + lifetime caption (rendered
+  from the Item-2 JSON fields; covered by the same python suite)
+  - Files: deploy/aws/lambda/operator-control/handler.py
+  - Tests: test_force_flush_records_flush_duration_histogram
 
-- [x] Item 4 — Cut proven-hot items only (clock-read consolidation; others only
-  if proven)
-  - Files: crates/core/src/pipeline/tick_processor.rs
-  - Tests: existing tick_processor tests green; test_heartbeat_secs_derivation
-
-- [x] Item 5 — Before/after proof + honest report (bench-gate green, DHAT
-  intact)
-  - Files: (PR body)
-  - Tests: test_tick_row_unchecked_ilp_names_pass_validation
+- [x] Item 4 — Run both test suites + storage suite green, push, PR
+  - Files: (verification step — PR body)
+  - Tests: test_force_flush_records_flush_duration_histogram
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | Bench run with no QuestDB / no network | writer group self-skips, all other components measured |
-| 2 | Flush amortization at batch=1000 | append median includes flush/1000 share via drain listener |
-| 3 | Clock consolidation under midnight rollover | heartbeat secs = nanos/1e9 — identical to chrono truth |
-| 4 | All components sum ≪ 15.56 µs | honest report: residual is prod-side (flush + cold cache), no speculative cut |
+| 1 | Live market, 10 s window with ticks | p50/p99/avg from bucket deltas; shields green if p50<10µs |
+| 2 | Market closed, window empty | windowed fields None → lifetime fallback, existing caption |
+| 3 | App restarts between the two scrapes | negative delta → None → lifetime fallback, no crash |
+| 4 | Flush spike during window | visible in flush_avg_ns + tick p99, p50 unaffected |
