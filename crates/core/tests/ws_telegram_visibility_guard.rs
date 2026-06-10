@@ -62,32 +62,6 @@ fn events_rs_declares_all_ws_event_variants() {
         src.contains("WebSocketReconnected"),
         "events.rs must declare WebSocketReconnected"
     );
-    // Depth-20
-    assert!(
-        src.contains("DepthTwentyConnected"),
-        "events.rs must declare DepthTwentyConnected"
-    );
-    assert!(
-        src.contains("DepthTwentyDisconnected"),
-        "events.rs must declare DepthTwentyDisconnected"
-    );
-    assert!(
-        src.contains("DepthTwentyReconnected"),
-        "events.rs must declare DepthTwentyReconnected (added 2026-04-21)"
-    );
-    // Depth-200
-    assert!(
-        src.contains("DepthTwoHundredConnected"),
-        "events.rs must declare DepthTwoHundredConnected"
-    );
-    assert!(
-        src.contains("DepthTwoHundredDisconnected"),
-        "events.rs must declare DepthTwoHundredDisconnected"
-    );
-    assert!(
-        src.contains("DepthTwoHundredReconnected"),
-        "events.rs must declare DepthTwoHundredReconnected (added 2026-04-21)"
-    );
     // Order-update
     assert!(
         src.contains("OrderUpdateConnected"),
@@ -106,14 +80,6 @@ fn events_rs_declares_all_ws_event_variants() {
 #[test]
 fn events_rs_formats_all_reconnect_variants_in_to_message() {
     let src = read("crates/core/src/notification/events.rs");
-    assert!(
-        src.contains("Self::DepthTwentyReconnected"),
-        "events.rs to_message() must handle DepthTwentyReconnected — otherwise Telegram fires an empty message."
-    );
-    assert!(
-        src.contains("Self::DepthTwoHundredReconnected"),
-        "events.rs to_message() must handle DepthTwoHundredReconnected."
-    );
     assert!(
         src.contains("Self::OrderUpdateReconnected"),
         "events.rs to_message() must handle OrderUpdateReconnected."

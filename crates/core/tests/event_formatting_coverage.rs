@@ -9,7 +9,7 @@
 //! asserted verbatim. Every constructed event is also routed through
 //! `severity()` + `dispatch_policy()` so those arms execute too.
 
-use tickvault_core::notification::events::{BootPathLabel, DepthDiffEntry, NotificationEvent};
+use tickvault_core::notification::events::{BootPathLabel, NotificationEvent};
 
 /// Renders and sanity-checks one event; returns the message for
 /// variant-specific assertions.
@@ -169,105 +169,6 @@ fn test_ws_sleep_wake_event_messages() {
         threshold_secs: 14_400,
     });
     assert!(m.contains("FEED-MAIN-33"), "{m}");
-}
-
-#[test]
-fn test_depth_lifecycle_event_messages() {
-    let m = render(&NotificationEvent::DepthTwentyConnected {
-        underlying: "UL-NIFTY-91".to_string(),
-    });
-    assert!(m.contains("UL-NIFTY-91"), "{m}");
-
-    let m = render(&NotificationEvent::DepthTwentyDisconnected {
-        underlying: "UL-NIFTY-92".to_string(),
-        reason: "RSN-D20-101".to_string(),
-    });
-    assert!(m.contains("RSN-D20-101"), "{m}");
-
-    let m = render(&NotificationEvent::DepthTwentyDisconnectedOffHours {
-        underlying: "UL-NIFTY-93".to_string(),
-        reason: "RSN-D20-102".to_string(),
-    });
-    assert!(m.contains("UL-NIFTY-93"), "{m}");
-
-    let m = render(&NotificationEvent::DepthTwentyReconnected {
-        underlying: "UL-NIFTY-94".to_string(),
-    });
-    assert!(m.contains("UL-NIFTY-94"), "{m}");
-
-    let m = render(&NotificationEvent::DepthTwoHundredConnected {
-        contract: "CT-48000CE-11".to_string(),
-        security_id: 987_651,
-    });
-    assert!(m.contains("CT-48000CE-11"), "{m}");
-
-    let m = render(&NotificationEvent::DepthTwoHundredDisconnected {
-        contract: "CT-48000CE-12".to_string(),
-        security_id: 987_652,
-        reason: "RSN-D200-201".to_string(),
-    });
-    assert!(m.contains("RSN-D200-201"), "{m}");
-
-    let m = render(&NotificationEvent::DepthTwoHundredDisconnectedOffHours {
-        contract: "CT-48000CE-13".to_string(),
-        security_id: 987_653,
-        reason: "RSN-D200-202".to_string(),
-    });
-    assert!(m.contains("CT-48000CE-13"), "{m}");
-
-    let m = render(&NotificationEvent::DepthTwoHundredReconnected {
-        contract: "CT-48000CE-14".to_string(),
-        security_id: 987_654,
-    });
-    assert!(m.contains("CT-48000CE-14"), "{m}");
-
-    let m = render(&NotificationEvent::DepthIndexLtpTimeout { waited_secs: 4271 });
-    assert!(m.contains("4271"), "{m}");
-
-    let m = render(&NotificationEvent::DepthUnderlyingMissing {
-        underlying: "UL-FINNIFTY-96".to_string(),
-        reason: "RSN-MISS-401".to_string(),
-    });
-    assert!(m.contains("RSN-MISS-401"), "{m}");
-}
-
-#[test]
-fn test_depth_dynamic_event_messages() {
-    // The big 42-line arm: entries rendered + the unresolved-drop
-    // discrepancy branch (stats_added > added.len()) + HTML escaping of a
-    // hostile display label.
-    let hostile = DepthDiffEntry {
-        security_id: 555_001,
-        exchange_segment: "NSE_FNO",
-        display_label: "EVIL<b>&CO 48000 CE".to_string(),
-        underlying_symbol: "EVIL".to_string(),
-    };
-    assert!(hostile.format_line().contains("&lt;b&gt;&amp;CO"));
-    let m = render(&NotificationEvent::DepthDynamicV2DiffApplied {
-        feed: "depth-20-dynamic",
-        added: vec![hostile],
-        removed: vec![DepthDiffEntry {
-            security_id: 555_002,
-            exchange_segment: "NSE_FNO",
-            display_label: "BANKNIFTY 47000 PE 2026-12-25".to_string(),
-            underlying_symbol: "BANKNIFTY".to_string(),
-        }],
-        retained_count: 46,
-        stats_added: 3,
-        stats_removed: 1,
-    });
-    assert!(m.contains("555001") && m.contains("&lt;"), "{m}");
-
-    // Empty-diff branch.
-    let m = render(&NotificationEvent::DepthDynamicV2DiffApplied {
-        feed: "depth-200-dynamic",
-        added: vec![],
-        removed: vec![],
-        retained_count: 5,
-        stats_added: 0,
-        stats_removed: 0,
-    });
-    assert!(m.contains("depth-200-dynamic") || m.contains("5"), "{m}");
 }
 
 #[test]

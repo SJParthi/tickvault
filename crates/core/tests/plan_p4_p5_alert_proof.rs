@@ -4,7 +4,6 @@
 //! - QuestDB alert text carries real buffer data, never hardcoded zeros
 //! - QuestDB alert text does not promise misleading auto-reconnect cadence
 //! - All 4 WS notification events include identifiers (connection_id, security_id, etc.)
-//! - Depth-200 events include security_id for Dhan support correlation
 
 use tickvault_core::notification::events::NotificationEvent;
 
@@ -101,53 +100,6 @@ fn test_questdb_disconnected_alert_text_is_factual() {
     );
 }
 
-// ─── P5.1/P5.2: Depth-200 events include security_id ───
-
-/// Depth-200 connected event must include security_id in both the struct
-/// and the Telegram message text, so operators can quote the exact instrument
-/// when escalating to Dhan support.
-#[test]
-fn test_depth_200_logs_include_security_id_on_connect() {
-    let event = NotificationEvent::DepthTwoHundredConnected {
-        contract: "NIFTY-Apr2026-22500-CE".to_string(),
-        security_id: 54816,
-    };
-    let msg = event.to_message();
-
-    assert!(
-        msg.contains("54816"),
-        "Depth-200 connected message must include security_id, got: {msg}"
-    );
-    assert!(
-        msg.contains("NIFTY-Apr2026-22500-CE"),
-        "Depth-200 connected message must include contract label, got: {msg}"
-    );
-}
-
-/// Depth-200 disconnected event must include security_id AND the reason.
-#[test]
-fn test_depth_200_disconnected_includes_security_id_and_reason() {
-    let event = NotificationEvent::DepthTwoHundredDisconnected {
-        contract: "BANKNIFTY-Apr2026-48000-PE".to_string(),
-        security_id: 54817,
-        reason: "TCP ResetWithoutClosingHandshake".to_string(),
-    };
-    let msg = event.to_message();
-
-    assert!(
-        msg.contains("54817"),
-        "Must include security_id, got: {msg}"
-    );
-    assert!(
-        msg.contains("BANKNIFTY-Apr2026-48000-PE"),
-        "Must include contract label, got: {msg}"
-    );
-    assert!(
-        msg.contains("ResetWithoutClosingHandshake"),
-        "Must include disconnect reason, got: {msg}"
-    );
-}
-
 // ─── P5.6: All 4 WS notification events include identifiers ───
 
 /// Every WebSocket type's connected/disconnected notification must carry
@@ -171,29 +123,6 @@ fn test_all_4_ws_notification_events_include_identifiers() {
         msg.contains("4/") && msg.contains("disconnected"),
         "Live feed disconnect must include 1-indexed connection (expected \
          'WebSocket 4/N'), got: {msg}"
-    );
-
-    // Depth 20 — underlying.
-    let depth20_disc = NotificationEvent::DepthTwentyDisconnected {
-        underlying: "NIFTY".to_string(),
-        reason: "code 805".to_string(),
-    };
-    let msg = depth20_disc.to_message();
-    assert!(
-        msg.contains("NIFTY"),
-        "Depth-20 disconnect must include underlying, got: {msg}"
-    );
-
-    // Depth 200 — contract + security_id.
-    let depth200_disc = NotificationEvent::DepthTwoHundredDisconnected {
-        contract: "NIFTY-ATM-CE".to_string(),
-        security_id: 63422,
-        reason: "TCP reset".to_string(),
-    };
-    let msg = depth200_disc.to_message();
-    assert!(
-        msg.contains("63422"),
-        "Depth-200 disconnect must include security_id, got: {msg}"
     );
 
     // Order Update — reason classification.
