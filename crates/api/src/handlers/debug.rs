@@ -241,7 +241,27 @@ async fn read_text_file(
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Process-global env-var lock. Plain `cargo test` runs every `#[test]`
+    /// in this binary as a parallel THREAD of ONE process, and
+    /// `LOGS_DIR_ENV` / `SPILL_DIR_ENV` are process-global state — two
+    /// tests mutating them concurrently race. Reproduced locally at 3/60
+    /// runs (`spill_status_reports_real_counts_when_dir_populated` reads
+    /// `"exists":false` after its sibling swaps the var); on CI this was
+    /// the chronic "Coverage & Perf" red, because that job runs plain
+    /// `cargo test` under llvm-cov while the green Test (api) job uses
+    /// nextest, whose process-per-test isolation masks the race.
+    /// Every test that sets/removes/depends-on these vars takes this lock
+    /// first. Poison is swallowed so one failing test doesn't cascade.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     /// Minimal tempdir helper — avoids pulling in the `tempfile` crate
     /// (which isn't in the workspace deps). Returns a unique
@@ -271,9 +291,9 @@ mod tests {
 
     #[test]
     fn resolve_logs_dir_respects_env_override() {
-        // Safety: tests run serially per #[test] and read env vars.
-        // SAFETY: set_var/remove_var require a mutable environment which
-        // is safe within a single-threaded test execution.
+        let _env = env_guard();
+        // SAFETY: set_var/remove_var mutate the process environment; the
+        // ENV_LOCK guard above serializes every test that touches it.
         unsafe {
             std::env::set_var(LOGS_DIR_ENV, "/tmp/tickvault-debug-test");
         }
@@ -286,6 +306,7 @@ mod tests {
 
     #[test]
     fn resolve_logs_dir_default_when_env_unset() {
+        let _env = env_guard();
         unsafe {
             std::env::remove_var(LOGS_DIR_ENV);
         }
@@ -295,6 +316,7 @@ mod tests {
 
     #[test]
     fn resolve_logs_dir_ignores_whitespace_env() {
+        let _env = env_guard();
         unsafe {
             std::env::set_var(LOGS_DIR_ENV, "   ");
         }
@@ -365,6 +387,7 @@ mod tests {
 
     #[tokio::test]
     async fn logs_summary_returns_404_when_file_missing() {
+        let _env = env_guard();
         unsafe {
             std::env::set_var(LOGS_DIR_ENV, "/nonexistent-tickvault-logs-test");
         }
@@ -377,6 +400,7 @@ mod tests {
 
     #[tokio::test]
     async fn logs_jsonl_latest_returns_404_when_dir_empty() {
+        let _env = env_guard();
         let tmp = mktemp("test");
         unsafe {
             std::env::set_var(LOGS_DIR_ENV, tmp.path().to_str().unwrap());
@@ -390,6 +414,7 @@ mod tests {
 
     #[test]
     fn resolve_spill_dir_default_when_env_unset() {
+        let _env = env_guard();
         unsafe {
             std::env::remove_var(SPILL_DIR_ENV);
         }
@@ -398,6 +423,7 @@ mod tests {
 
     #[test]
     fn resolve_spill_dir_respects_env_override() {
+        let _env = env_guard();
         unsafe {
             std::env::set_var(SPILL_DIR_ENV, "/tmp/tv-spill-test");
         }
@@ -438,6 +464,7 @@ mod tests {
 
     #[tokio::test]
     async fn spill_status_returns_200_with_categories_even_when_dir_missing() {
+        let _env = env_guard();
         unsafe {
             std::env::set_var(SPILL_DIR_ENV, "/nonexistent/spill-test-dir-xyz");
         }
@@ -459,6 +486,7 @@ mod tests {
 
     #[tokio::test]
     async fn spill_status_reports_real_counts_when_dir_populated() {
+        let _env = env_guard();
         let tmp = mktemp("spill_status");
         // Create category subdirs with one bin each
         for kind in ["ticks", "candles", "depth"] {
