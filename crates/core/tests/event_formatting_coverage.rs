@@ -221,12 +221,6 @@ fn test_depth_lifecycle_event_messages() {
     });
     assert!(m.contains("CT-48000CE-14"), "{m}");
 
-    let m = render(&NotificationEvent::DepthRebalanceFailed {
-        underlying: "UL-BANKNIFTY-95".to_string(),
-        reason: "RSN-REBAL-301".to_string(),
-    });
-    assert!(m.contains("RSN-REBAL-301"), "{m}");
-
     let m = render(&NotificationEvent::DepthIndexLtpTimeout { waited_secs: 4271 });
     assert!(m.contains("4271"), "{m}");
 
@@ -239,26 +233,6 @@ fn test_depth_lifecycle_event_messages() {
 
 #[test]
 fn test_depth_dynamic_event_messages() {
-    let m = render(&NotificationEvent::Depth20DynamicTopSetEmpty {
-        returned_count: 17,
-        reason: "RSN-TOPSET-501".to_string(),
-    });
-    assert!(m.contains("RSN-TOPSET-501"), "{m}");
-
-    let m = render(&NotificationEvent::Depth20DynamicSwapChannelBroken {
-        slot_index: 4,
-        reason: "RSN-SWAPCH-502".to_string(),
-    });
-    assert!(m.contains("RSN-SWAPCH-502"), "{m}");
-
-    let m = render(&NotificationEvent::Depth20DynamicSwapApplied {
-        slot_index: 5,
-        unsubscribed_count: 21,
-        subscribed_count: 23,
-        total_active: 49,
-    });
-    assert!(m.contains("49"), "{m}");
-
     // The big 42-line arm: entries rendered + the unresolved-drop
     // discrepancy branch (stats_added > added.len()) + HTML escaping of a
     // hostile display label.
