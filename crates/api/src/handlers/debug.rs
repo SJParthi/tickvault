@@ -210,6 +210,10 @@ const CROSS_VERIFY_DIR_ENV: &str = "TV_CROSS_VERIFY_DIR";
 const CROSS_VERIFY_CSV_PREFIX: &str = "cross-verify-1m-";
 const CROSS_VERIFY_CSV_SUFFIX: &str = ".csv";
 const CROSS_VERIFY_SUMMARY_SUFFIX: &str = ".summary.json";
+/// RAM cap for serving the mismatch CSV inline. A normal day's file is a
+/// few KB (mismatch rows only); beyond this cap the endpoint serves the
+/// summary with `csv: null` instead of slurping the file into memory.
+const MAX_CROSS_VERIFY_CSV_BYTES: u64 = 10 * 1024 * 1024;
 
 fn resolve_cross_verify_dir() -> PathBuf {
     if let Ok(custom) = std::env::var(CROSS_VERIFY_DIR_ENV)
@@ -261,18 +265,42 @@ fn newest_cross_verify_csv(dir: &Path) -> Option<PathBuf> {
 /// NOT disclosed. Read-only; never blocks the app.
 pub async fn cross_verify_latest() -> impl IntoResponse {
     let dir = resolve_cross_verify_dir();
+    // Dynamic operator data — never cache (post-impl security review).
+    let headers = || {
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ]
+    };
     let not_found = || {
         (
             StatusCode::NOT_FOUND,
-            [(header::CONTENT_TYPE, "application/json")],
+            headers(),
             "{\"error\":\"no cross-verify run yet\"}".to_string(),
         )
     };
     let Some(csv_path) = newest_cross_verify_csv(&dir) else {
         return not_found();
     };
-    let Ok(csv) = tokio::fs::read_to_string(&csv_path).await else {
-        return not_found();
+    // Bounded read (post-impl security review): a pathological mismatch
+    // file is not slurped into RAM — `csv` goes null and the caller falls
+    // back to the sibling summary counts.
+    let csv_bytes = tokio::fs::metadata(&csv_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let (csv, mismatch_rows) = if csv_bytes > MAX_CROSS_VERIFY_CSV_BYTES {
+        (serde_json::Value::Null, serde_json::Value::Null)
+    } else {
+        let Ok(csv) = tokio::fs::read_to_string(&csv_path).await else {
+            return not_found();
+        };
+        // The CSV is header + one line per mismatched field-cell.
+        let rows = csv.lines().filter(|l| !l.trim().is_empty()).count() as u64;
+        (
+            serde_json::Value::String(csv),
+            serde_json::json!(rows.saturating_sub(1)),
+        )
     };
     let file_name = csv_path
         .file_name()
@@ -284,9 +312,6 @@ pub async fn cross_verify_latest() -> impl IntoResponse {
         .and_then(|rest| rest.strip_suffix(CROSS_VERIFY_CSV_SUFFIX))
         .unwrap_or_default()
         .to_string();
-    // The CSV is header + one line per mismatched field-cell.
-    let mismatch_rows = csv.lines().filter(|l| !l.trim().is_empty()).count() as u64;
-    let mismatch_rows = mismatch_rows.saturating_sub(1);
     // Sibling summary JSON (written by the same run); null when absent
     // or unparseable (runs that pre-date the summary artefact).
     let summary_path = dir.join(format!(
@@ -301,16 +326,13 @@ pub async fn cross_verify_latest() -> impl IntoResponse {
     let body = serde_json::json!({
         "date": date,
         "csv_file": file_name,
+        "csv_bytes": csv_bytes,
         "mismatch_rows": mismatch_rows,
         "summary": summary,
         "csv": csv,
     })
     .to_string();
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
-        body,
-    )
+    (StatusCode::OK, headers(), body)
 }
 
 fn json_escape(s: &str) -> String {
