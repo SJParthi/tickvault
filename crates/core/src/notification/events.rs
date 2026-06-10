@@ -115,47 +115,6 @@ pub enum DispatchPolicy {
     Default,
 }
 
-/// Which depth levels participate in a routine rebalance swap.
-///
-/// `TwentyOnly` — the underlying has only a 20-level feed (FINNIFTY,
-/// MIDCPNIFTY today).
-/// `TwentyAndTwoHundred` — NIFTY and BANKNIFTY. Both 20-level (ATM ± 24)
-/// and 200-level (ATM CE + PE) are swapped on the same socket without
-/// disconnect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DepthRebalanceLevels {
-    /// 20-level only (FINNIFTY, MIDCPNIFTY).
-    TwentyOnly,
-    /// 20-level + 200-level (NIFTY, BANKNIFTY).
-    TwentyAndTwoHundred,
-}
-
-impl DepthRebalanceLevels {
-    /// Title fragment used in the Telegram message headline so the operator
-    /// can tell the swap scope at a glance without reading the Action line.
-    pub fn title_fragment(&self) -> &'static str {
-        match self {
-            Self::TwentyOnly => "Depth-20",
-            Self::TwentyAndTwoHundred => "Depth-20+200",
-        }
-    }
-
-    /// Body line describing the action taken. Kept consistent with the
-    /// prior inline `Custom` wording (zero-disconnect swap on same socket)
-    /// so operators skimming history see continuity.
-    pub fn action_line(&self) -> &'static str {
-        match self {
-            Self::TwentyOnly => {
-                "Action: zero-disconnect swap — 20-level unsub old / sub new on same socket \
-                 (no 200-level for this underlying)"
-            }
-            Self::TwentyAndTwoHundred => {
-                "Action: zero-disconnect swap — 20-level + 200-level unsub old / sub new on same socket"
-            }
-        }
-    }
-}
-
 /// Which boot path was used to bring the WebSocket pool online.
 ///
 /// Per operator policy 2026-05-04 + `boot_helpers::should_fast_boot`:
@@ -586,46 +545,6 @@ pub enum NotificationEvent {
     /// WS events).
     DepthTwoHundredReconnected { contract: String, security_id: u32 },
 
-    /// Depth rebalance SUCCESS — routine zero-disconnect swap on spot drift.
-    ///
-    /// Fires at `Severity::Low` (green): the swap is a planned working-as-
-    /// designed event per `.claude/rules/project/depth-subscription.md`. The
-    /// previous `[HIGH]` amber alert via `Custom { message: … }` was alert
-    /// noise (fired every 60s on drift) and has been replaced by this typed
-    /// variant (Parthiban directive 2026-04-24).
-    ///
-    /// Title format: `Depth-20 rebalance: <UL>` for indices without 200-level,
-    /// `Depth-20+200 rebalance: <UL>` for NIFTY / BANKNIFTY. Level is visible
-    /// at a glance — operator doesn't have to read the Action line.
-    DepthRebalanced {
-        /// Underlying symbol (e.g. `NIFTY`, `BANKNIFTY`, `FINNIFTY`, `MIDCPNIFTY`).
-        underlying: String,
-        /// Previous spot price (from drift check).
-        previous_spot: f64,
-        /// Current spot price (from drift check).
-        current_spot: f64,
-        /// Old CE contract label (e.g. `NIFTY 28 APR 25000 CALL (SID 12345)`).
-        old_ce: String,
-        /// Old PE contract label.
-        old_pe: String,
-        /// New CE contract label.
-        new_ce: String,
-        /// New PE contract label.
-        new_pe: String,
-        /// Which depth levels participate in the swap.
-        levels: DepthRebalanceLevels,
-    },
-
-    /// Depth rebalance FAILURE — command channel broken, new ATM unresolved,
-    /// or Swap command not acknowledged. Fires at `Severity::High` because
-    /// depth-subscription quality degrades until next successful rebalance.
-    DepthRebalanceFailed {
-        /// Underlying symbol.
-        underlying: String,
-        /// Human-readable failure reason.
-        reason: String,
-    },
-
     /// Order update WebSocket connected.
     OrderUpdateConnected,
 
@@ -996,49 +915,6 @@ pub enum NotificationEvent {
 
     /// Custom alert from any component.
     Custom { message: String },
-
-    // -----------------------------------------------------------------------
-    // Depth-20 dynamic top-150 selector (Phase 7, 2026-04-28 — see
-    // `.claude/plans/v2-architecture.md` Section I)
-    // -----------------------------------------------------------------------
-    /// Top-150 dynamic selector returned an empty (or sub-50) set —
-    /// `option_movers` table stale, market closed, or no contracts had
-    /// `change_pct > 0` in the last 90 seconds. Edge-triggered: fires once
-    /// on rising edge (selector starts returning < 50). Severity::High.
-    /// `code = ErrorCode::Depth20Dyn01TopSetEmpty`.
-    Depth20DynamicTopSetEmpty {
-        /// Number of contracts the selector returned (< 50 considered empty).
-        returned_count: usize,
-        /// Reason the set is empty (e.g. `"market_closed"`, `"option_movers_stale"`,
-        /// `"no_positive_gainers"`).
-        reason: String,
-    },
-
-    /// `mpsc::Sender<DepthCommand>::send` returned `SendError` for one of
-    /// the three dynamic depth-20 connection slots. Receiver task panicked
-    /// or was deallocated. Pool supervisor (WS-GAP-05) respawn should
-    /// recover within 5s. Severity::Critical.
-    /// `code = ErrorCode::Depth20Dyn02SwapChannelBroken`.
-    Depth20DynamicSwapChannelBroken {
-        /// Slot index (3, 4, or 5 — slots 1+2 are the static NIFTY+BANKNIFTY ATM±24).
-        slot_index: u8,
-        /// Description of the send failure.
-        reason: String,
-    },
-
-    /// Dynamic top-150 selector emitted a successful Swap20 with delta —
-    /// positive ping (informational). Edge-triggered: fires only when the
-    /// set actually changed. Severity::Low.
-    Depth20DynamicSwapApplied {
-        /// Slot index (3, 4, or 5).
-        slot_index: u8,
-        /// Number of contracts unsubscribed (leavers).
-        unsubscribed_count: usize,
-        /// Number of contracts subscribed (entrants).
-        subscribed_count: usize,
-        /// Total active contracts in this slot after the swap.
-        total_active: usize,
-    },
 
     /// 2026-05-02 — pipeline_v2 (PR-C2) diff cycle applied a non-no-op
     /// rebalance. Operator-requested symbol-level visibility:
@@ -1766,35 +1642,6 @@ impl NotificationEvent {
                     "<b>Depth 200-level reconnected</b>\nContract: {contract}\nSecurityId: {security_id}"
                 )
             }
-            Self::DepthRebalanced {
-                underlying,
-                previous_spot,
-                current_spot,
-                old_ce,
-                old_pe,
-                new_ce,
-                new_pe,
-                levels,
-            } => {
-                format!(
-                    "<b>{title}: {underlying}</b>\n\
-                     Spot: {previous_spot:.2} → {current_spot:.2}\n\
-                     Old CE: {old_ce}\n\
-                     Old PE: {old_pe}\n\
-                     New CE: {new_ce}\n\
-                     New PE: {new_pe}\n\
-                     {action}",
-                    title = format_args!("{} rebalance", levels.title_fragment()),
-                    action = levels.action_line(),
-                )
-            }
-            Self::DepthRebalanceFailed { underlying, reason } => {
-                format!(
-                    "<b>Depth rebalance FAILED: {underlying}</b>\n\
-                     {reason}\n\
-                     Depth subscription quality degraded until next successful rebalance."
-                )
-            }
             Self::OrderUpdateConnected => "<b>Order Update WS connected</b>".to_string(),
             Self::OrderUpdateAuthenticated => {
                 "<b>Order Update WS authenticated</b>\nDhan accepted token — streaming live."
@@ -2136,37 +1983,6 @@ impl NotificationEvent {
                 )
             }
             Self::Custom { message } => message.clone(),
-            Self::Depth20DynamicTopSetEmpty {
-                returned_count,
-                reason,
-            } => format!(
-                "<b>Depth-20 dynamic top-150: empty set</b>\n\
-                 code: <code>DEPTH-DYN-01</code>\n\
-                 returned_count: <code>{returned_count}</code>\n\
-                 reason: <code>{reason}</code>\n\
-                 ACTION: check option_movers freshness via \
-                 <code>SELECT count(*) FROM option_movers WHERE ts &gt; now() - 5m</code>"
-            ),
-            Self::Depth20DynamicSwapChannelBroken { slot_index, reason } => format!(
-                "<b>Depth-20 dynamic Swap20 channel BROKEN</b>\n\
-                 code: <code>DEPTH-DYN-02</code>\n\
-                 slot: <code>{slot_index}</code>\n\
-                 reason: <code>{reason}</code>\n\
-                 ACTION: pool supervisor (WS-GAP-05) should respawn within 5s; \
-                 if not, restart the app"
-            ),
-            Self::Depth20DynamicSwapApplied {
-                slot_index,
-                unsubscribed_count,
-                subscribed_count,
-                total_active,
-            } => format!(
-                "<b>Depth-20 dynamic top-150: swap applied</b>\n\
-                 slot: <code>{slot_index}</code>\n\
-                 unsubscribed: <code>{unsubscribed_count}</code>\n\
-                 subscribed: <code>{subscribed_count}</code>\n\
-                 active: <code>{total_active}</code>"
-            ),
             Self::DepthDynamicV2DiffApplied {
                 feed,
                 added,
@@ -2342,8 +2158,6 @@ impl NotificationEvent {
                 "DepthTwoHundredDisconnectedOffHours"
             }
             Self::DepthTwoHundredReconnected { .. } => "DepthTwoHundredReconnected",
-            Self::DepthRebalanced { .. } => "DepthRebalanced",
-            Self::DepthRebalanceFailed { .. } => "DepthRebalanceFailed",
             Self::OrderUpdateConnected => "OrderUpdateConnected",
             Self::OrderUpdateAuthenticated => "OrderUpdateAuthenticated",
             Self::OrderUpdateDisconnected { .. } => "OrderUpdateDisconnected",
@@ -2383,9 +2197,6 @@ impl NotificationEvent {
             Self::RealtimeGuaranteeDegraded { .. } => "RealtimeGuaranteeDegraded",
             Self::RealtimeGuaranteeCritical { .. } => "RealtimeGuaranteeCritical",
             Self::Custom { .. } => "Custom",
-            Self::Depth20DynamicTopSetEmpty { .. } => "Depth20DynamicTopSetEmpty",
-            Self::Depth20DynamicSwapChannelBroken { .. } => "Depth20DynamicSwapChannelBroken",
-            Self::Depth20DynamicSwapApplied { .. } => "Depth20DynamicSwapApplied",
             Self::DepthDynamicV2DiffApplied { .. } => "DepthDynamicV2DiffApplied",
             Self::LastTickAfterBoundary { .. } => "LastTickAfterBoundary",
             Self::OptionChainFetchFailed { .. } => "OptionChainFetchFailed",
@@ -2442,9 +2253,7 @@ impl NotificationEvent {
             // `Custom` routing made every 60s drift fire [HIGH] amber; see
             // Fix #9 in .claude/plans/active-plan.md and .claude/rules/project/
             // depth-subscription.md for the working-as-designed rationale.
-            Self::DepthRebalanced { .. } => Severity::Low,
             // Swap itself failed — depth quality degraded until next rebalance.
-            Self::DepthRebalanceFailed { .. } => Severity::High,
             Self::OrderUpdateDisconnected { .. } => Severity::High,
             Self::OrderUpdateReconnected { .. } => Severity::Low,
             Self::NoLiveTicksDuringMarketHours { .. } => Severity::Critical,
@@ -2529,9 +2338,6 @@ impl NotificationEvent {
             Self::BarMismatchCrossCheckFailed { .. } => Severity::Critical,
             Self::StartupComplete { .. } => Severity::Info,
             Self::ShutdownComplete => Severity::Info,
-            Self::Depth20DynamicTopSetEmpty { .. } => Severity::High,
-            Self::Depth20DynamicSwapChannelBroken { .. } => Severity::Critical,
-            Self::Depth20DynamicSwapApplied { .. } => Severity::Low,
             Self::DepthDynamicV2DiffApplied { .. } => Severity::Low,
             Self::LastTickAfterBoundary { .. } => Severity::Info,
             Self::OptionChainFetchFailed { .. } => Severity::High,
@@ -2707,19 +2513,6 @@ mod tests {
                     reason: "x".into(),
                 },
                 "WebSocketDisconnectedOffHours",
-            ),
-            (
-                NotificationEvent::DepthRebalanced {
-                    underlying: "NIFTY".into(),
-                    previous_spot: 25_000.0,
-                    current_spot: 25_050.0,
-                    old_ce: "old_ce".into(),
-                    old_pe: "old_pe".into(),
-                    new_ce: "new_ce".into(),
-                    new_pe: "new_pe".into(),
-                    levels: DepthRebalanceLevels::TwentyOnly,
-                },
-                "DepthRebalanced",
             ),
             (
                 NotificationEvent::RiskHalt {
@@ -2915,119 +2708,6 @@ mod tests {
             "message must distinguish off-hours variant: {msg}"
         );
         assert!(msg.contains("BANKNIFTY-CE-deferred"));
-    }
-
-    // -----------------------------------------------------------------
-    // Fix #9 (2026-04-24): routine zero-disconnect depth rebalance is
-    // `Severity::Low`, not `Severity::High`. Ratchet against regression
-    // back to the old `Custom { message: … }` path.
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn test_depth_rebalance_success_is_low_severity() {
-        let event = NotificationEvent::DepthRebalanced {
-            underlying: "BANKNIFTY".to_string(),
-            previous_spot: 55000.0,
-            current_spot: 55150.0,
-            old_ce: "BANKNIFTY 24 APR 55000 CALL (SID 11111)".to_string(),
-            old_pe: "BANKNIFTY 24 APR 55000 PUT (SID 22222)".to_string(),
-            new_ce: "BANKNIFTY 24 APR 55150 CALL (SID 33333)".to_string(),
-            new_pe: "BANKNIFTY 24 APR 55150 PUT (SID 44444)".to_string(),
-            levels: DepthRebalanceLevels::TwentyAndTwoHundred,
-        };
-        assert_eq!(
-            event.severity(),
-            Severity::Low,
-            "routine drift swap MUST NOT escalate to High — see \
-             .claude/rules/project/depth-subscription.md"
-        );
-    }
-
-    #[test]
-    fn test_depth_rebalance_failure_is_high_severity() {
-        // Severity-flip guard: failures MUST stay High so the operator
-        // gets SMS when depth quality degrades.
-        let event = NotificationEvent::DepthRebalanceFailed {
-            underlying: "NIFTY".to_string(),
-            reason: "command channel closed".to_string(),
-        };
-        assert_eq!(event.severity(), Severity::High);
-    }
-
-    // -----------------------------------------------------------------
-    // Fix #10 (2026-04-24): title fragment includes the level(s).
-    // `Depth-20 rebalance: …` for FINNIFTY / MIDCPNIFTY,
-    // `Depth-20+200 rebalance: …` for NIFTY / BANKNIFTY.
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn test_depth_rebalance_title_20_only() {
-        let event = NotificationEvent::DepthRebalanced {
-            underlying: "FINNIFTY".to_string(),
-            previous_spot: 23500.0,
-            current_spot: 23610.0,
-            old_ce: "FINNIFTY 29 APR 23500 CALL (SID 71111)".to_string(),
-            old_pe: "FINNIFTY 29 APR 23500 PUT (SID 71112)".to_string(),
-            new_ce: "FINNIFTY 29 APR 23600 CALL (SID 71121)".to_string(),
-            new_pe: "FINNIFTY 29 APR 23600 PUT (SID 71122)".to_string(),
-            levels: DepthRebalanceLevels::TwentyOnly,
-        };
-        let msg = event.to_message();
-        assert!(
-            msg.contains("<b>Depth-20 rebalance: FINNIFTY</b>"),
-            "FINNIFTY (no 200-level) title must read `Depth-20 rebalance: …`: {msg}"
-        );
-        assert!(
-            !msg.contains("Depth-20+200"),
-            "FINNIFTY must NOT claim 200-level in title: {msg}"
-        );
-        assert!(msg.contains("no 200-level for this underlying"));
-    }
-
-    #[test]
-    fn test_depth_rebalance_title_20_plus_200() {
-        let event = NotificationEvent::DepthRebalanced {
-            underlying: "NIFTY".to_string(),
-            previous_spot: 23800.0,
-            current_spot: 23710.0,
-            old_ce: "NIFTY 24 APR 23800 CALL (SID 62001)".to_string(),
-            old_pe: "NIFTY 24 APR 23800 PUT (SID 62002)".to_string(),
-            new_ce: "NIFTY 24 APR 23700 CALL (SID 62011)".to_string(),
-            new_pe: "NIFTY 24 APR 23700 PUT (SID 62012)".to_string(),
-            levels: DepthRebalanceLevels::TwentyAndTwoHundred,
-        };
-        let msg = event.to_message();
-        assert!(
-            msg.contains("<b>Depth-20+200 rebalance: NIFTY</b>"),
-            "NIFTY (has 200-level) title must read `Depth-20+200 rebalance: …`: {msg}"
-        );
-        assert!(msg.contains("20-level + 200-level unsub old"));
-    }
-
-    #[test]
-    fn test_depth_rebalance_levels_title_fragment() {
-        assert_eq!(
-            DepthRebalanceLevels::TwentyOnly.title_fragment(),
-            "Depth-20"
-        );
-        assert_eq!(
-            DepthRebalanceLevels::TwentyAndTwoHundred.title_fragment(),
-            "Depth-20+200"
-        );
-    }
-
-    #[test]
-    fn test_depth_rebalance_levels_action_line() {
-        // The action line explicitly distinguishes "20-level only" from
-        // "20-level + 200-level" so the operator knows the swap scope
-        // without reading the full message body.
-        let twenty = DepthRebalanceLevels::TwentyOnly.action_line();
-        assert!(twenty.contains("20-level unsub old"));
-        assert!(twenty.contains("no 200-level for this underlying"));
-
-        let both = DepthRebalanceLevels::TwentyAndTwoHundred.action_line();
-        assert!(both.contains("20-level + 200-level unsub old"));
-        assert!(!both.contains("no 200-level"));
     }
 
     #[test]

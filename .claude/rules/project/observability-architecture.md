@@ -170,23 +170,21 @@ summary file and drives the above flow.
 6. **Do not log at ERROR without a `code =` field** if the message
    mentions a known code prefix (I-P*, OMS-*, WS-*, STORAGE-*, etc.).
    The tag-guard fails the build.
-7. **Do not upgrade `DepthRebalanced` back to `Severity::High`.**
-   2026-04-24 PR #337 downgraded routine zero-disconnect drift swaps
-   from `[HIGH]` (via `NotificationEvent::Custom`) to `Severity::Low`
-   via the new typed `DepthRebalanced` variant. Amber alerts every 60s
-   on drift are pager fatigue. The `[HIGH]` tier is reserved for the
-   separate `DepthRebalanceFailed` variant (swap command channel
-   broken, new ATM unresolved). Ratchet:
-   `test_depth_rebalance_success_is_low_severity` +
-   `test_depth_rebalance_failure_is_high_severity`.
-8. **Do not drop the swap-level from the depth-rebalance Telegram title.**
-   Titles MUST read `Depth-20 rebalance: <UL>` or
-   `Depth-20+200 rebalance: <UL>`. Operators tell swap scope at a glance;
-   the 2026-04-22 operator incident (BANKNIFTY rebalance scared the
-   operator because the title didn't say "swap, not reconnect") proved
-   this is a safety-critical wording concern. Enforced by
-   `DepthRebalanceLevels::title_fragment()` + ratchets
-   `test_depth_rebalance_title_20_only` / `test_depth_rebalance_title_20_plus_200`.
+7. **RETIRED 2026-06-10 (Phase B batch 2 of the deletion audit).**
+   Originally: do not upgrade `DepthRebalanced` back to `Severity::High`.
+   The `DepthRebalanced` / `DepthRebalanceFailed` variants and their
+   severity ratchets were DELETED — the depth rebalancer that emitted
+   them was removed in AWS-lifecycle PR #4 (2026-05-19) and the variants
+   had zero production constructors since. Retained for historical
+   audit: 2026-04-24 PR #337 downgraded routine zero-disconnect drift
+   swaps from `[HIGH]` to `Severity::Low` to stop pager fatigue.
+8. **RETIRED 2026-06-10 (Phase B batch 2).** Originally: do not drop
+   the swap-level from the depth-rebalance Telegram title
+   (`Depth-20 rebalance: <UL>` / `Depth-20+200 rebalance: <UL>`).
+   `DepthRebalanceLevels::title_fragment()` and its title ratchets were
+   DELETED with the variants. Historical context: the 2026-04-22
+   BANKNIFTY incident proved swap-scope-at-a-glance wording was
+   safety-critical while depth feeds existed.
 9. **Do not regress the `websocket_connections` counter write.**
    `spawn_pool_watchdog_task` MUST call
    `health.set_websocket_connections(active_count)` every 5s.
@@ -194,22 +192,17 @@ summary file and drives the above flow.
    heartbeat revealed on 2026-04-24. Ratchet:
    `test_pool_watchdog_task_accepts_health_status` (source-scan guard
    in `crates/api/tests/health_counter_fix7_guard.rs`).
-10. **Do not re-route `DepthRebalanced` (Severity::Low) to Telegram.**
-    2026-05-11 PR shipped explicit suppression at the top of
-    `NotificationService::notify()` for the routine zero-disconnect
-    swap variant — operators reported 10-30 Telegram messages per day
-    during volatile sessions and zero of them were actionable. The
-    audit trail lives in 4 other sinks: QuestDB `depth_rebalance_audit`
-    (AUDIT-02, SEBI-relevant), Grafana `depth-flow.json` panel,
-    Prometheus `tv_depth_rebalances_total{underlying}`, and Loki
-    `data/logs/errors.jsonl.*`. Telegram is reserved for eyes-on-now
-    events. The companion `DepthRebalanceFailed` (Severity::High —
-    swap command channel broken, ATM unresolved) is NOT suppressed
-    and still pages. Suppression is observable via Prometheus counter
-    `tv_depth_rebalance_telegram_suppressed_total`. Ratchets:
-    `crates/core/tests/depth_rebalance_telegram_suppression_guard.rs`
-    (3 source-scan tests pinning suppression presence, failure-variant
-    exclusion, and counter metric name).
+10. **RETIRED 2026-06-10 (Phase B batch 2).** Originally: do not
+    re-route `DepthRebalanced` (Severity::Low) to Telegram. The
+    suppression block in `NotificationService::notify()`, the
+    `tv_depth_rebalance_telegram_suppressed_total` counter, and the
+    suppression-guard ratchets were DELETED along with the
+    `DepthRebalanced` variant itself (zero production emitters since
+    the depth feeds were removed in AWS-lifecycle PR #4). Historical
+    context: the 2026-05-11 suppression existed because operators
+    reported 10-30 non-actionable Telegram messages/day; the principle
+    it encoded — Telegram is reserved for eyes-on-now events — remains
+    in force for all surviving events.
 
 ## Completion status of the Zero-Touch plan
 
