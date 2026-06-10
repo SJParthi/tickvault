@@ -365,8 +365,6 @@ pub enum NotificationEvent {
     MarketOpenStreamingConfirmation {
         main_feed_active: usize,
         main_feed_total: usize,
-        depth_20_active: usize,
-        depth_200_active: usize,
         order_update_active: bool,
     },
 
@@ -381,8 +379,6 @@ pub enum NotificationEvent {
     MarketOpenStreamingFailed {
         main_feed_active: usize,
         main_feed_total: usize,
-        depth_20_active: usize,
-        depth_200_active: usize,
         order_update_active: bool,
     },
 
@@ -399,8 +395,6 @@ pub enum NotificationEvent {
     MarketOpenReadinessConfirmation {
         main_feed_active: usize,
         main_feed_total: usize,
-        depth_20_active: usize,
-        depth_200_active: usize,
         order_update_active: bool,
         token_remaining_secs: u64,
     },
@@ -1559,32 +1553,24 @@ impl NotificationEvent {
             Self::MarketOpenStreamingConfirmation {
                 main_feed_active,
                 main_feed_total,
-                depth_20_active,
-                depth_200_active,
                 order_update_active,
             } => {
                 let oms = if *order_update_active { "1/1" } else { "0/1" };
                 format!(
                     "<b>Streaming live @ 09:15:30 IST</b>\n\
                      Main feed: {main_feed_active}/{main_feed_total}\n\
-                     Depth-20: {depth_20_active}/4\n\
-                     Depth-200: {depth_200_active}/4\n\
                      Order updates: {oms}"
                 )
             }
             Self::MarketOpenStreamingFailed {
                 main_feed_active,
                 main_feed_total,
-                depth_20_active,
-                depth_200_active,
                 order_update_active,
             } => {
                 let oms = if *order_update_active { "1/1" } else { "0/1" };
                 format!(
                     "<b>MARKET OPEN STREAMING FAILED @ 09:15:30 IST</b>\n\
                      Main feed: {main_feed_active}/{main_feed_total} — NO CONNECTIONS\n\
-                     Depth-20: {depth_20_active}/4\n\
-                     Depth-200: {depth_200_active}/4\n\
                      Order updates: {oms}\n\
                      Action: check pool watchdog, token validity, Dhan status."
                 )
@@ -1592,8 +1578,6 @@ impl NotificationEvent {
             Self::MarketOpenReadinessConfirmation {
                 main_feed_active,
                 main_feed_total,
-                depth_20_active,
-                depth_200_active,
                 order_update_active,
                 token_remaining_secs,
             } => {
@@ -1602,8 +1586,6 @@ impl NotificationEvent {
                 format!(
                     "<b>READY for market open @ 09:14:00 IST</b>\n\
                      Main feed: {main_feed_active}/{main_feed_total}\n\
-                     Depth-20: {depth_20_active}/4\n\
-                     Depth-200: {depth_200_active}/4\n\
                      Order updates: {oms}\n\
                      Token headroom: {token_hours:.1}h\n\
                      Bell rings in 60s."
@@ -4185,8 +4167,6 @@ mod tests {
         let ev = NotificationEvent::MarketOpenStreamingConfirmation {
             main_feed_active: 5,
             main_feed_total: 5,
-            depth_20_active: 4,
-            depth_200_active: 4,
             order_update_active: true,
         };
         assert_eq!(ev.severity(), Severity::Info);
@@ -4197,15 +4177,11 @@ mod tests {
         let ev = NotificationEvent::MarketOpenStreamingConfirmation {
             main_feed_active: 5,
             main_feed_total: 5,
-            depth_20_active: 4,
-            depth_200_active: 4,
             order_update_active: true,
         };
         let msg = ev.to_message();
         assert!(msg.contains("Streaming live"), "got: {msg}");
         assert!(msg.contains("Main feed: 5/5"), "got: {msg}");
-        assert!(msg.contains("Depth-20: 4/4"), "got: {msg}");
-        assert!(msg.contains("Depth-200: 4/4"), "got: {msg}");
         assert!(msg.contains("Order updates: 1/1"), "got: {msg}");
         assert!(
             msg.contains("09:15:30"),
@@ -4218,8 +4194,6 @@ mod tests {
         let ev = NotificationEvent::MarketOpenStreamingConfirmation {
             main_feed_active: 5,
             main_feed_total: 5,
-            depth_20_active: 4,
-            depth_200_active: 4,
             order_update_active: false,
         };
         let msg = ev.to_message();
@@ -4241,8 +4215,6 @@ mod tests {
         let ev = NotificationEvent::MarketOpenReadinessConfirmation {
             main_feed_active: 5,
             main_feed_total: 5,
-            depth_20_active: 4,
-            depth_200_active: 4,
             order_update_active: true,
             token_remaining_secs: 8 * 3600,
         };
@@ -4254,8 +4226,6 @@ mod tests {
         let ev = NotificationEvent::MarketOpenReadinessConfirmation {
             main_feed_active: 5,
             main_feed_total: 5,
-            depth_20_active: 4,
-            depth_200_active: 4,
             order_update_active: true,
             token_remaining_secs: 8 * 3600,
         };
@@ -4263,8 +4233,6 @@ mod tests {
         assert!(msg.contains("READY for market open"), "got: {msg}");
         assert!(msg.contains("09:14:00 IST"), "got: {msg}");
         assert!(msg.contains("Main feed: 5/5"), "got: {msg}");
-        assert!(msg.contains("Depth-20: 4/4"), "got: {msg}");
-        assert!(msg.contains("Depth-200: 4/4"), "got: {msg}");
         assert!(msg.contains("Order updates: 1/1"), "got: {msg}");
     }
 
@@ -4277,8 +4245,6 @@ mod tests {
         let ev = NotificationEvent::MarketOpenReadinessConfirmation {
             main_feed_active: 5,
             main_feed_total: 5,
-            depth_20_active: 4,
-            depth_200_active: 4,
             order_update_active: true,
             token_remaining_secs: 8 * 3600 + 1800, // 8.5 hours
         };
@@ -4300,8 +4266,6 @@ mod tests {
         let ev = NotificationEvent::MarketOpenReadinessConfirmation {
             main_feed_active: 5,
             main_feed_total: 5,
-            depth_20_active: 4,
-            depth_200_active: 4,
             order_update_active: true,
             token_remaining_secs: 0,
         };
@@ -4320,8 +4284,6 @@ mod tests {
         let ev = NotificationEvent::MarketOpenReadinessConfirmation {
             main_feed_active: 5,
             main_feed_total: 5,
-            depth_20_active: 4,
-            depth_200_active: 4,
             order_update_active: true,
             token_remaining_secs: 8 * 3600,
         };
