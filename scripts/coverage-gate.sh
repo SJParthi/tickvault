@@ -73,14 +73,26 @@ for entry in data.get('data', []):
         count = summary.get('count', 0)
         covered = summary.get('covered', 0)
 
-        # Extract crate name from path: crates/<crate_name>/src/...
-        match = re.match(r'crates/([^/]+)/', filename)
+        # Extract crate name from path: .../crates/<crate_name>/src/...
+        # cargo-llvm-cov emits ABSOLUTE paths (/home/runner/work/.../crates/...),
+        # so this must be re.search, NOT re.match (start-anchored re.match
+        # matched zero files and made the gate pass vacuously — see
+        # .claude/plans/research/coverage-gaps.md §2, GAP #0).
+        match = re.search(r'crates/([^/]+)/', filename)
         if match:
             crate_name = match.group(1)
             if crate_name not in crate_lines:
                 crate_lines[crate_name] = {'count': 0, 'covered': 0}
             crate_lines[crate_name]['count'] += count
             crate_lines[crate_name]['covered'] += covered
+
+# FAIL-CLOSED: an empty aggregation map means the report's paths matched no
+# crate at all — checking nothing must never count as passing (audit-findings
+# Rule 11: no false-OK signals).
+if not crate_lines:
+    print('  ERROR: gate matched 0 files under crates/ — refusing vacuous pass.')
+    print('         (coverage JSON paths did not contain \"crates/<name>/\")')
+    sys.exit(1)
 
 failed = False
 for crate_name in sorted(crate_lines.keys()):
