@@ -53,10 +53,13 @@ resource "aws_iam_role_policy" "start_watchdog" {
       {
         # Self-heal (2026-06-10 incident, repeat of 2026-06-02): when the
         # 08:45 IST check finds the box not running, the watchdog issues
-        # StartInstances itself instead of only paging. Scoped to the one
-        # tv-app instance — this Lambda can start nothing else.
+        # StartInstances itself instead of only paging. Same evening, the
+        # 16:30 stop ALSO silently failed (box still running at 18:18 IST),
+        # so the 16:45 stop_check gained StopInstances on the same terms.
+        # Scoped to the one tv-app instance — this Lambda can touch
+        # nothing else.
         Effect   = "Allow"
-        Action   = ["ec2:StartInstances"]
+        Action   = ["ec2:StartInstances", "ec2:StopInstances"]
         Resource = "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/${aws_instance.tv_app.id}"
       },
       {
@@ -166,6 +169,32 @@ resource "aws_lambda_permission" "start_watchdog_check" {
   function_name = aws_lambda_function.start_watchdog.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.start_watchdog_check.arn
+}
+
+# 16:45 IST stop-check — added 2026-06-10 after BOTH schedule directions
+# failed silently the same day (start at 08:30, stop at 16:30). Verifies the
+# 16:30 daily_stop actually stopped the box; self-heals (stop) ONLY when the
+# box has been running since before 16:30 — a manual evening start (launch
+# after 16:30) is the operator's deliberate session and is never touched.
+resource "aws_cloudwatch_event_rule" "start_watchdog_stop_check" {
+  name                = "tv-${var.environment}-start-watchdog-stop-check"
+  description         = "16:45 IST (Mon-Fri) verify the box actually stopped; self-heal + page if not"
+  schedule_expression = "cron(15 11 ? * MON-FRI *)"
+}
+
+resource "aws_cloudwatch_event_target" "start_watchdog_stop_check" {
+  rule      = aws_cloudwatch_event_rule.start_watchdog_stop_check.name
+  target_id = "start-watchdog-stop-check"
+  arn       = aws_lambda_function.start_watchdog.arn
+  input     = jsonencode({ mode = "stop_check" })
+}
+
+resource "aws_lambda_permission" "start_watchdog_stop_check" {
+  statement_id  = "AllowExecutionFromEventBridgeStopCheck"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.start_watchdog.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.start_watchdog_stop_check.arn
 }
 
 output "start_watchdog_function_name" {
