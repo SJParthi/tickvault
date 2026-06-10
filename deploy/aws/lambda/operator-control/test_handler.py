@@ -202,6 +202,93 @@ class Latency(unittest.TestCase):
         self.assertEqual(out["dhan_tcp_ms"], "")
         self.assertIsNone(out["tick_process_avg_ns"])
         self.assertEqual(out["tick_count"], "")
+        # Windowed fields degrade to None / 0 with no scrapes at all.
+        self.assertIsNone(out["tick_p50_ns"])
+        self.assertIsNone(out["tick_p99_ns"])
+        self.assertEqual(out["tick_window_count"], 0)
+
+    # ---- windowed percentile math (operator directive 2026-06-10) ----
+
+    @staticmethod
+    def _two_scrape_stdout() -> str:
+        """T0 → 1000 ticks lifetime; T1 → 1200 ticks. The 200-tick window:
+        100 ticks ≤1000ns, 190 ≤5000ns, 200 ≤10000ns (10 in the 5–10µs
+        bucket), so p50=1000ns exactly and p99 lands inside (5000,10000]."""
+        return (
+            "T0=100.0\n"
+            "METRICS_T0_BEGIN\n"
+            'tv_tick_processing_duration_ns_bucket{le="1000"} 500\n'
+            'tv_tick_processing_duration_ns_bucket{le="5000"} 900\n'
+            'tv_tick_processing_duration_ns_bucket{le="10000"} 1000\n'
+            'tv_tick_processing_duration_ns_bucket{le="+Inf"} 1000\n'
+            "tv_tick_processing_duration_ns_sum 2000000\n"
+            "tv_tick_processing_duration_ns_count 1000\n"
+            "METRICS_T0_END\n"
+            "DHAN_BEGIN\n"
+            "0.012 0.030\n"
+            "DHAN_END\n"
+            "QDB=0.0021\n"
+            "SKEW=0.000123\n"
+            "T1=110.0\n"
+            "METRICS_BEGIN\n"
+            'tv_tick_processing_duration_ns_bucket{le="1000"} 600\n'
+            'tv_tick_processing_duration_ns_bucket{le="5000"} 1090\n'
+            'tv_tick_processing_duration_ns_bucket{le="10000"} 1200\n'
+            'tv_tick_processing_duration_ns_bucket{le="+Inf"} 1200\n'
+            "tv_tick_processing_duration_ns_sum 2400000\n"
+            "tv_tick_processing_duration_ns_count 1200\n"
+            "METRICS_END\n"
+        )
+
+    def test_parse_latency_windowed_fields(self) -> None:
+        out = handler._parse_latency(self._two_scrape_stdout())
+        # Window: 200 ticks, Δsum=400000 → windowed avg 2000ns.
+        self.assertEqual(out["tick_window_count"], 200)
+        self.assertEqual(out["tick_window_avg_ns"], 2000.0)
+        # p50: target=100 of 200; first bucket delta (le=1000) = 100 → cum
+        # reaches target exactly at le=1000 → interpolation lands on 1000.
+        self.assertEqual(out["tick_p50_ns"], 1000.0)
+        # p99: target=198; cum ≤5000 is 190; lands in (5000,10000] bucket
+        # with width 10 ticks → 5000 + (198-190)/10 * 5000 = 9000.
+        self.assertEqual(out["tick_p99_ns"], 9000.0)
+        self.assertEqual(out["window_secs"], "10.0")
+        # Lifetime fields still served from the second scrape (back-compat).
+        self.assertEqual(out["tick_process_avg_ns"], 2000.0)
+        self.assertEqual(out["tick_count"], "1200")
+
+    def test_percentile_from_bucket_deltas_interpolates(self) -> None:
+        deltas = {"buckets": {100.0: 0.0, 500.0: 50.0, 1000.0: 100.0}, "sum": 1.0, "count": 100.0}
+        # p50 → target 50 → reached exactly at le=500.
+        self.assertEqual(handler._percentile_from_bucket_deltas(deltas, 0.50), 500.0)
+        # p75 → target 75 → halfway through the (500,1000] bucket → 750.
+        self.assertEqual(handler._percentile_from_bucket_deltas(deltas, 0.75), 750.0)
+
+    def test_percentile_empty_window_returns_none(self) -> None:
+        self.assertIsNone(handler._percentile_from_bucket_deltas(None, 0.5))
+        self.assertIsNone(
+            handler._bucket_deltas(
+                {"buckets": {100.0: 5.0}, "sum": 10.0, "count": 5.0},
+                {"buckets": {100.0: 5.0}, "sum": 10.0, "count": 5.0},
+            )
+        )
+
+    def test_percentile_counter_reset_returns_none(self) -> None:
+        # T1 counts BELOW T0 (app restarted mid-window) → whole window invalid.
+        self.assertIsNone(
+            handler._bucket_deltas(
+                {"buckets": {100.0: 500.0}, "sum": 100.0, "count": 500.0},
+                {"buckets": {100.0: 20.0}, "sum": 5.0, "count": 30.0},
+            )
+        )
+
+    def test_percentile_inf_bucket_clamps(self) -> None:
+        # All window samples beyond the last finite bucket → clamp to it.
+        deltas = {
+            "buckets": {100.0: 0.0, float("inf"): 10.0},
+            "sum": 1.0,
+            "count": 10.0,
+        }
+        self.assertEqual(handler._percentile_from_bucket_deltas(deltas, 0.99), 100.0)
 
 
 class ParseStorage(unittest.TestCase):

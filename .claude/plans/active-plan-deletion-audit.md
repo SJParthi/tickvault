@@ -652,6 +652,23 @@ Verified against live repo state (the audit is dated 2026-05-25; two Phase A act
 | 4. Archive historical plans | 14 files archived this session with `git mv` + date prefix (13 zero-inbound-reference historical plans + the VERIFIED `active-plan.md` for merged #1069). Zero-hit proof: repo-wide grep per file, hits only in self/this audit. KEPT (inbound refs from `crates/` guards, CI, or kept docs): `100pct-audit-tracker.md`, `autonomous-operations-100pct.md`, `pr-288-completion.md`, `v2-architecture.md`, `v2-phases.md`, `v2-ratchets.md`, `v2-risks.md`, `aws-lifecycle/*`, `friday-may-15-mega/*`, `research/*` | DONE 2026-06-10 |
 | 5. Update `observability-architecture.md` (CloudWatch-only, drop 5-sink Loki/Alloy refs) | Coupled to dropping `crates/common/tests/loki_alloy_profile_guard.rs` (a `crates/` change) | DEFERRED with action 2 |
 
+## Phase B execution log (2026-06-10)
+
+Operator approval (verbatim): "yes go ahead with your recommendation" (2026-06-10), with the added constraint "Do NOT touch indicators/ or strategy/ (operator boundary §28)". Verified every Phase B step against live repo state — the audit (2026-05-25) predates the daily-universe lock (2026-05-27), the §31 NTM expansion (2026-06-06), and the S7 sandbox-trading work; most steps are stale. Companion plan: `active-plan-phase-b-module-deletions.md`.
+
+| Phase B step | Finding 2026-06-10 | Disposition |
+|---|---|---|
+| 1. api::state dead AtomicU64s | Confirmed dead — `set_depth_20/200_connections` have ZERO production callers (grep: only test files); counters permanently 0; `/health` emitted perpetual "disconnected" noise; market-open Telegram printed dead "Depth-20: 0/4" lines daily. Extended scope to the full plumbing chain: state.rs + health.rs + main.rs (readiness/heartbeat/SLO reads) + events.rs depth fields on the 3 MarketOpen* variants. | DONE 2026-06-10 (this PR) |
+| 2. TF 21→2 collapse | SUPERSEDED — operator Quote 3 (2026-05-27) locks "entire 21 timeframes"; §31 (2026-06-06) budgets RAM at ~1,000 SIDs × 21 TFs. | SKIPPED (stale verdict) |
+| 3. core_pinning.rs | File already absent. | ALREADY DONE |
+| 4. bin/smoke_test.rs | FALSE PREMISE — it is the S7-Step4 AWS deploy gate (config/sandbox/spill/locked-facts), NOT the depth-200 smoke test (that was `boot_smoke_test.rs`, already deleted). Lockdown guard `smoke_test_binary_wiring.rs` pins it. | SKIPPED — KEEP |
+| 5. events.rs dead variants | `DepthRebalanced`/`DepthRebalanceFailed`/`Depth20Dynamic*`/`Phase2Complete`/`Phase2Failed`/`MidMarketBootComplete` have zero external construction sites BUT are pinned by `depth_rebalance_telegram_suppression_guard.rs` ratchets + observability-architecture clauses 7/8/10 — needs a coordinated rules+code PR with its own plan. Depth FIELDS on the 3 MarketOpen* variants removed in step 1's chain. | PARTIAL (fields done); variant deletion = named follow-up |
+| 6. observability.rs Prom/OTLP slim | Owned by `active-plan-observability-cloudwatch-only.md`; otel quartet version-bumped in #1077 (actively maintained). | DEFERRED to that plan |
+| 7. trading oms/risk/indicator/strategy drop + 8. trading_pipeline drop | SUPERSEDED — post-audit S7 sandbox work: `[strategy] mode="sandbox"`, `sandbox_only_until="2026-06-30"`; `config/strategies.toml` exists so the pipeline SPAWNS at boot; deploy smoke gate checks the sandbox window. Also mechanically blocked: gap-enforcement mandates OMS-GAP-01..06 + RISK-GAP-01..03 tests; `oms::rate_limiter` consumed by `prev_day_ohlcv_boot.rs` + `cross_verify_1m_boot.rs`; `risk::tick_gap_tracker` wired at main.rs boot; indicators/strategy off-limits per §28. Requires fresh operator decision post-2026-06-30. | SKIPPED (stale + blocked) |
+| 9-13. 4-SID slims (candle_fetcher, subscription_planner, tick_processor, connection_pool, events bulk) | SUPERSEDED — premised on 4-SID LOCKED_UNIVERSE; replaced by ~250-SID daily universe + NTM (§31, cap 1200). | SKIPPED (stale verdicts) |
+| 14. order_types.rs | OMS stays (step 7 skipped) → stays. | SKIPPED |
+| 15. dead-test sweep | Scoped to parents: 4 dead-setter test fns removed with step 1; test-count baseline 6831→6829 updated with justification. | DONE for executed scope |
+
 ## What to do next (3 bullets)
 
 1. **Operator approval gate.** Before any code touches, get explicit approval on this audit's three biggest investigation calls: (a) collapse `TF_COUNT` from 21 → 2 (1m + 5m only); (b) drop `crates/trading/*` modules except `candles/` + `in_mem/` + `orphan_position_watchdog.rs`; (c) drop the entire OpenTelemetry/Prometheus exporter stack now that the CloudWatch-only migration is locked. Each is a >1,000 LoC change that must be a separate PR per the serial-PR protocol.

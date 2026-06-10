@@ -115,47 +115,6 @@ pub enum DispatchPolicy {
     Default,
 }
 
-/// Which depth levels participate in a routine rebalance swap.
-///
-/// `TwentyOnly` — the underlying has only a 20-level feed (FINNIFTY,
-/// MIDCPNIFTY today).
-/// `TwentyAndTwoHundred` — NIFTY and BANKNIFTY. Both 20-level (ATM ± 24)
-/// and 200-level (ATM CE + PE) are swapped on the same socket without
-/// disconnect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DepthRebalanceLevels {
-    /// 20-level only (FINNIFTY, MIDCPNIFTY).
-    TwentyOnly,
-    /// 20-level + 200-level (NIFTY, BANKNIFTY).
-    TwentyAndTwoHundred,
-}
-
-impl DepthRebalanceLevels {
-    /// Title fragment used in the Telegram message headline so the operator
-    /// can tell the swap scope at a glance without reading the Action line.
-    pub fn title_fragment(&self) -> &'static str {
-        match self {
-            Self::TwentyOnly => "Depth-20",
-            Self::TwentyAndTwoHundred => "Depth-20+200",
-        }
-    }
-
-    /// Body line describing the action taken. Kept consistent with the
-    /// prior inline `Custom` wording (zero-disconnect swap on same socket)
-    /// so operators skimming history see continuity.
-    pub fn action_line(&self) -> &'static str {
-        match self {
-            Self::TwentyOnly => {
-                "Action: zero-disconnect swap — 20-level unsub old / sub new on same socket \
-                 (no 200-level for this underlying)"
-            }
-            Self::TwentyAndTwoHundred => {
-                "Action: zero-disconnect swap — 20-level + 200-level unsub old / sub new on same socket"
-            }
-        }
-    }
-}
-
 /// Which boot path was used to bring the WebSocket pool online.
 ///
 /// Per operator policy 2026-05-04 + `boot_helpers::should_fast_boot`:
@@ -350,12 +309,6 @@ pub enum NotificationEvent {
     /// Fired on `WatchdogVerdict::Halt`.
     WebSocketPoolHalt { down_secs: u64 },
 
-    /// Depth setup timed out waiting for the main-feed index LTPs needed
-    /// for ATM strike selection. Depth connections proceed with a fallback
-    /// strike (median). `waited_secs` reflects how long we waited before
-    /// giving up.
-    DepthIndexLtpTimeout { waited_secs: u64 },
-
     /// Plan item #5 (2026-04-22): once-per-day positive confirmation that
     /// every feed is actually streaming live data at market open. Fires
     /// at 09:15:30 IST on each trading day. Answers Parthiban's "how do I
@@ -365,8 +318,6 @@ pub enum NotificationEvent {
     MarketOpenStreamingConfirmation {
         main_feed_active: usize,
         main_feed_total: usize,
-        depth_20_active: usize,
-        depth_200_active: usize,
         order_update_active: bool,
     },
 
@@ -381,8 +332,6 @@ pub enum NotificationEvent {
     MarketOpenStreamingFailed {
         main_feed_active: usize,
         main_feed_total: usize,
-        depth_20_active: usize,
-        depth_200_active: usize,
         order_update_active: bool,
     },
 
@@ -399,8 +348,6 @@ pub enum NotificationEvent {
     MarketOpenReadinessConfirmation {
         main_feed_active: usize,
         main_feed_total: usize,
-        depth_20_active: usize,
-        depth_200_active: usize,
         order_update_active: bool,
         token_remaining_secs: u64,
     },
@@ -436,13 +383,6 @@ pub enum NotificationEvent {
         /// refresh before the next opening bell.
         token_remaining_hours: u64,
     },
-
-    /// Option C (2026-04-17): Depth setup dropped a specific underlying —
-    /// the grace window expired without a valid spot price OR the option
-    /// chain was missing. Complements `DepthIndexLtpTimeout` which fires
-    /// once for the bundle; this fires per missing underlying so operators
-    /// see exactly which ones were skipped (e.g. FINNIFTY).
-    DepthUnderlyingMissing { underlying: String, reason: String },
 
     // PR #4 (2026-05-19): DepthSpotPriceStale variant retired alongside
     // the deleted depth-20/200 infrastructure (operator lock 2026-05-15).
@@ -532,104 +472,6 @@ pub enum NotificationEvent {
         connection_index: usize,
         remaining_secs_before: i64,
         threshold_secs: i64,
-    },
-
-    /// 20-level depth WebSocket connected for an underlying.
-    DepthTwentyConnected { underlying: String },
-
-    /// 20-level depth WebSocket disconnected.
-    DepthTwentyDisconnected { underlying: String, reason: String },
-
-    /// 20-level depth WebSocket disconnected OUTSIDE market hours, OR with a
-    /// placeholder (SecurityId=0) subscription. Fires at `Severity::Low` so
-    /// the operator sees the event in Telegram but gets no SMS escalation.
-    ///
-    /// Rationale (Q5, 2026-04-23): a post-market boot cannot populate
-    /// `SharedSpotPrices` (main feed streams zero ticks after 15:30 IST),
-    /// so the ATM selector falls through to the "deferred" placeholder
-    /// (SecurityId=0). The depth connection then hits Dhan's TCP-reset
-    /// after 60 reconnect attempts and fires a `[HIGH]` disconnect alert
-    /// — which is exactly the anti-pattern we killed for the 15:45 IST
-    /// depth-stale-spot storm. Same rule as `WebSocketDisconnectedOffHours`.
-    DepthTwentyDisconnectedOffHours { underlying: String, reason: String },
-
-    /// 20-level depth WebSocket reconnected after a transient disconnect.
-    /// Fires on every successful reconnect, inside or outside market
-    /// hours (Parthiban directive 2026-04-21 — full audit trail on all
-    /// WS events).
-    DepthTwentyReconnected { underlying: String },
-
-    /// 200-level depth WebSocket connected.
-    ///
-    /// `contract` is the precise contract label (e.g. `NIFTY-Apr2026-22500-CE`)
-    /// and `security_id` is the exact Dhan security ID — both are required so
-    /// the operator can quote the exact instrument when escalating to Dhan
-    /// support. 200-depth is 1 instrument per connection, so a generic
-    /// underlying label would lose the strike/expiry/side information.
-    DepthTwoHundredConnected { contract: String, security_id: u32 },
-
-    /// 200-level depth WebSocket disconnected.
-    DepthTwoHundredDisconnected {
-        contract: String,
-        security_id: u32,
-        reason: String,
-    },
-
-    /// 200-level depth disconnected OUTSIDE market hours, OR with a
-    /// placeholder (SecurityId=0) subscription. Fires at `Severity::Low` so
-    /// a post-market boot storm (4× contracts × 60 reconnect attempts)
-    /// doesn't escalate to SMS. See [`Self::DepthTwentyDisconnectedOffHours`]
-    /// for the full rationale — same rule, 200-level variant.
-    DepthTwoHundredDisconnectedOffHours {
-        contract: String,
-        security_id: u32,
-        reason: String,
-    },
-
-    /// 200-level depth WebSocket reconnected after a transient disconnect.
-    /// Fires on every successful reconnect, inside or outside market
-    /// hours (Parthiban directive 2026-04-21 — full audit trail on all
-    /// WS events).
-    DepthTwoHundredReconnected { contract: String, security_id: u32 },
-
-    /// Depth rebalance SUCCESS — routine zero-disconnect swap on spot drift.
-    ///
-    /// Fires at `Severity::Low` (green): the swap is a planned working-as-
-    /// designed event per `.claude/rules/project/depth-subscription.md`. The
-    /// previous `[HIGH]` amber alert via `Custom { message: … }` was alert
-    /// noise (fired every 60s on drift) and has been replaced by this typed
-    /// variant (Parthiban directive 2026-04-24).
-    ///
-    /// Title format: `Depth-20 rebalance: <UL>` for indices without 200-level,
-    /// `Depth-20+200 rebalance: <UL>` for NIFTY / BANKNIFTY. Level is visible
-    /// at a glance — operator doesn't have to read the Action line.
-    DepthRebalanced {
-        /// Underlying symbol (e.g. `NIFTY`, `BANKNIFTY`, `FINNIFTY`, `MIDCPNIFTY`).
-        underlying: String,
-        /// Previous spot price (from drift check).
-        previous_spot: f64,
-        /// Current spot price (from drift check).
-        current_spot: f64,
-        /// Old CE contract label (e.g. `NIFTY 28 APR 25000 CALL (SID 12345)`).
-        old_ce: String,
-        /// Old PE contract label.
-        old_pe: String,
-        /// New CE contract label.
-        new_ce: String,
-        /// New PE contract label.
-        new_pe: String,
-        /// Which depth levels participate in the swap.
-        levels: DepthRebalanceLevels,
-    },
-
-    /// Depth rebalance FAILURE — command channel broken, new ATM unresolved,
-    /// or Swap command not acknowledged. Fires at `Severity::High` because
-    /// depth-subscription quality degrades until next successful rebalance.
-    DepthRebalanceFailed {
-        /// Underlying symbol.
-        underlying: String,
-        /// Human-readable failure reason.
-        reason: String,
     },
 
     /// Order update WebSocket connected.
@@ -1003,79 +845,6 @@ pub enum NotificationEvent {
     /// Custom alert from any component.
     Custom { message: String },
 
-    // -----------------------------------------------------------------------
-    // Depth-20 dynamic top-150 selector (Phase 7, 2026-04-28 — see
-    // `.claude/plans/v2-architecture.md` Section I)
-    // -----------------------------------------------------------------------
-    /// Top-150 dynamic selector returned an empty (or sub-50) set —
-    /// `option_movers` table stale, market closed, or no contracts had
-    /// `change_pct > 0` in the last 90 seconds. Edge-triggered: fires once
-    /// on rising edge (selector starts returning < 50). Severity::High.
-    /// `code = ErrorCode::Depth20Dyn01TopSetEmpty`.
-    Depth20DynamicTopSetEmpty {
-        /// Number of contracts the selector returned (< 50 considered empty).
-        returned_count: usize,
-        /// Reason the set is empty (e.g. `"market_closed"`, `"option_movers_stale"`,
-        /// `"no_positive_gainers"`).
-        reason: String,
-    },
-
-    /// `mpsc::Sender<DepthCommand>::send` returned `SendError` for one of
-    /// the three dynamic depth-20 connection slots. Receiver task panicked
-    /// or was deallocated. Pool supervisor (WS-GAP-05) respawn should
-    /// recover within 5s. Severity::Critical.
-    /// `code = ErrorCode::Depth20Dyn02SwapChannelBroken`.
-    Depth20DynamicSwapChannelBroken {
-        /// Slot index (3, 4, or 5 — slots 1+2 are the static NIFTY+BANKNIFTY ATM±24).
-        slot_index: u8,
-        /// Description of the send failure.
-        reason: String,
-    },
-
-    /// Dynamic top-150 selector emitted a successful Swap20 with delta —
-    /// positive ping (informational). Edge-triggered: fires only when the
-    /// set actually changed. Severity::Low.
-    Depth20DynamicSwapApplied {
-        /// Slot index (3, 4, or 5).
-        slot_index: u8,
-        /// Number of contracts unsubscribed (leavers).
-        unsubscribed_count: usize,
-        /// Number of contracts subscribed (entrants).
-        subscribed_count: usize,
-        /// Total active contracts in this slot after the swap.
-        total_active: usize,
-    },
-
-    /// 2026-05-02 — pipeline_v2 (PR-C2) diff cycle applied a non-no-op
-    /// rebalance. Operator-requested symbol-level visibility:
-    ///
-    /// - Listed by precise instrument label (e.g. "NIFTY 23000 CE 2026-06-26"),
-    ///   not raw SecurityId. Resolution happens via `InstrumentRegistry::
-    ///   get_with_segment(security_id, segment)` (O(1) per-op lookup).
-    /// - Severity::Low — fires every cycle that produces a change. No-op
-    ///   cycles (rank-set unchanged) emit NOTHING.
-    DepthDynamicV2DiffApplied {
-        /// `"depth-20-dynamic"` or `"depth-200-dynamic"`.
-        feed: &'static str,
-        /// Instruments newly subscribed this cycle. May be SHORTER than
-        /// `stats_added` if registry resolution dropped an entry —
-        /// `stats_added - added.len()` = unresolved drops, surfaced in
-        /// the rendered message so the operator sees the discrepancy.
-        added: Vec<DepthDiffEntry>,
-        /// Instruments unsubscribed this cycle. Same drift semantics.
-        removed: Vec<DepthDiffEntry>,
-        /// Instruments unchanged from previous cycle (silent — no frames sent).
-        retained_count: usize,
-        /// 2026-05-02 (hostile-bug-hunt HIGH fix) — actual count of Add ops
-        /// produced by `DynamicSubscriptionState::diff()`. Renders authoritative
-        /// in Telegram so the operator sees `stats_added=5` even if registry
-        /// resolution dropped 2 entries (audit-findings 2026-04-17 Rule 11:
-        /// no false-OK accounting).
-        stats_added: usize,
-        /// Authoritative count of Remove ops from the diff state machine.
-        stats_removed: usize,
-    },
-
     /// Phase 0 Item 12 — Info-severity Telegram fired when a tick arrives
     /// with an exchange_timestamp at or after `MARKET_CLOSE_IST_NANOS`
     /// (15:30:00.000 IST). This SHOULD be zero — Dhan's session ends at
@@ -1164,80 +933,6 @@ pub enum NotificationEvent {
         /// to fix the TOML directly.
         reason: String,
     },
-}
-
-/// One symbol-level entry inside [`NotificationEvent::DepthDynamicV2DiffApplied`].
-/// Resolved from `(security_id, exchange_segment)` via the instrument
-/// registry's O(1) `get_with_segment` lookup. Preserves the composite-key
-/// uniqueness invariant per I-P1-11.
-///
-/// 2026-05-02 (hot-path-reviewer fix): `exchange_segment` is `&'static str`
-/// (not `String`) because `ExchangeSegment::as_str()` already returns a
-/// compile-time constant. Eliminates ~250 String allocations per cycle on
-/// a full reshuffle — bounded but unnecessary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DepthDiffEntry {
-    pub security_id: u32,
-    /// Stable SYMBOL value (`"NSE_FNO"`, `"BSE_FNO"`, etc.).
-    pub exchange_segment: &'static str,
-    /// Human-readable contract label, e.g. `"NIFTY 23000 CE 2026-06-26"`.
-    pub display_label: String,
-    /// Bare underlying, e.g. `"NIFTY"`.
-    pub underlying_symbol: String,
-}
-
-impl DepthDiffEntry {
-    /// Symbol + sid + segment in one Telegram-friendly line.
-    ///
-    /// 2026-05-02 (security-reviewer HIGH fix): HTML-escape the
-    /// `display_label` and truncate at 80 chars before interpolation.
-    /// The Dhan instrument CSV is not operator-validated; a tampered
-    /// `DISPLAY_NAME` containing `</b><a href="http://attacker.com">` would
-    /// otherwise inject a clickable phishing link into the operator's
-    /// HTML-mode Telegram message. Truncation prevents 4096-char message
-    /// overflow on a 10-entry rebalance with maliciously long labels.
-    #[must_use]
-    pub fn format_line(&self) -> String {
-        format!(
-            "  • {} (sid={}, {})",
-            html_escape(&truncate_display_label(&self.display_label)),
-            self.security_id,
-            self.exchange_segment
-        )
-    }
-}
-
-/// Maximum length of a `display_label` after which it gets truncated
-/// before interpolation into a Telegram HTML message. 80 chars covers
-/// the longest legitimate Dhan label ("BANKNIFTY 47000 PE 2026-12-25"
-/// = 28 chars, with x4 headroom for verbose labels). Pinned by ratchet.
-pub const DISPLAY_LABEL_MAX_LEN: usize = 80;
-
-/// HTML-escape the 3 reserved characters Telegram's HTML parse_mode
-/// recognises: `&`, `<`, `>`. Keeps the message both renderable AND
-/// safe from `<a href>` / `</b>` injection from a tampered Dhan CSV.
-fn html_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            other => out.push(other),
-        }
-    }
-    out
-}
-
-/// Truncate to [`DISPLAY_LABEL_MAX_LEN`] characters at a char boundary.
-/// Adds an ellipsis if truncated.
-fn truncate_display_label(s: &str) -> String {
-    if s.chars().count() <= DISPLAY_LABEL_MAX_LEN {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(DISPLAY_LABEL_MAX_LEN).collect();
-    out.push('…');
-    out
 }
 
 /// Formats a `usize` with comma thousand separators for human-readable
@@ -1559,32 +1254,24 @@ impl NotificationEvent {
             Self::MarketOpenStreamingConfirmation {
                 main_feed_active,
                 main_feed_total,
-                depth_20_active,
-                depth_200_active,
                 order_update_active,
             } => {
                 let oms = if *order_update_active { "1/1" } else { "0/1" };
                 format!(
                     "<b>Streaming live @ 09:15:30 IST</b>\n\
                      Main feed: {main_feed_active}/{main_feed_total}\n\
-                     Depth-20: {depth_20_active}/4\n\
-                     Depth-200: {depth_200_active}/4\n\
                      Order updates: {oms}"
                 )
             }
             Self::MarketOpenStreamingFailed {
                 main_feed_active,
                 main_feed_total,
-                depth_20_active,
-                depth_200_active,
                 order_update_active,
             } => {
                 let oms = if *order_update_active { "1/1" } else { "0/1" };
                 format!(
                     "<b>MARKET OPEN STREAMING FAILED @ 09:15:30 IST</b>\n\
                      Main feed: {main_feed_active}/{main_feed_total} — NO CONNECTIONS\n\
-                     Depth-20: {depth_20_active}/4\n\
-                     Depth-200: {depth_200_active}/4\n\
                      Order updates: {oms}\n\
                      Action: check pool watchdog, token validity, Dhan status."
                 )
@@ -1592,8 +1279,6 @@ impl NotificationEvent {
             Self::MarketOpenReadinessConfirmation {
                 main_feed_active,
                 main_feed_total,
-                depth_20_active,
-                depth_200_active,
                 order_update_active,
                 token_remaining_secs,
             } => {
@@ -1602,8 +1287,6 @@ impl NotificationEvent {
                 format!(
                     "<b>READY for market open @ 09:14:00 IST</b>\n\
                      Main feed: {main_feed_active}/{main_feed_total}\n\
-                     Depth-20: {depth_20_active}/4\n\
-                     Depth-200: {depth_200_active}/4\n\
                      Order updates: {oms}\n\
                      Token headroom: {token_hours:.1}h\n\
                      Bell rings in 60s."
@@ -1634,21 +1317,6 @@ impl NotificationEvent {
                      Main feed: {main_feed_active}/{main_feed_total}\n\
                      Token headroom: {token_remaining_hours}h\n\
                      {close_status}{token_warning}"
-                )
-            }
-            Self::DepthIndexLtpTimeout { waited_secs } => {
-                format!(
-                    "<b>Depth ATM timeout</b>\nWaited {waited_secs}s for index LTPs \
-                     — proceeding with partial set. See DepthUnderlyingMissing \
-                     alerts for the specific symbols that were dropped."
-                )
-            }
-            Self::DepthUnderlyingMissing { underlying, reason } => {
-                format!(
-                    "<b>Depth underlying missing</b>\nUnderlying: {underlying}\n\
-                     Reason: {reason}\nDepth connections for this symbol were NOT \
-                     spawned this boot — feed will have no order-book depth for \
-                     {underlying} until the next restart."
                 )
             }
             // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
@@ -1734,83 +1402,6 @@ impl NotificationEvent {
                 format!(
                     "<b>AUTH-GAP-03 {feed} feed (slot {}) wake-time token renewed</b>\nRemaining before renewal: {remaining_secs_before}s (threshold {threshold_secs}s)",
                     connection_index.saturating_add(1)
-                )
-            }
-            Self::DepthTwentyConnected { underlying } => {
-                format!("<b>Depth 20-level connected</b>\nUnderlying: {underlying}")
-            }
-            Self::DepthTwentyDisconnected { underlying, reason } => {
-                format!("<b>Depth 20-level DISCONNECTED</b>\nUnderlying: {underlying}\n{reason}")
-            }
-            Self::DepthTwentyDisconnectedOffHours { underlying, reason } => {
-                format!(
-                    "<b>Depth 20-level disconnected (off-hours / no-data)</b>\nUnderlying: {underlying}\n{reason}"
-                )
-            }
-            Self::DepthTwentyReconnected { underlying } => {
-                format!("<b>Depth 20-level reconnected</b>\nUnderlying: {underlying}")
-            }
-            Self::DepthTwoHundredConnected {
-                contract,
-                security_id,
-            } => {
-                format!(
-                    "<b>Depth 200-level connected</b>\nContract: {contract}\nSecurityId: {security_id}"
-                )
-            }
-            Self::DepthTwoHundredDisconnected {
-                contract,
-                security_id,
-                reason,
-            } => {
-                format!(
-                    "<b>Depth 200-level DISCONNECTED</b>\nContract: {contract}\nSecurityId: {security_id}\n{reason}"
-                )
-            }
-            Self::DepthTwoHundredDisconnectedOffHours {
-                contract,
-                security_id,
-                reason,
-            } => {
-                format!(
-                    "<b>Depth 200-level disconnected (off-hours / no-data)</b>\nContract: {contract}\nSecurityId: {security_id}\n{reason}"
-                )
-            }
-            Self::DepthTwoHundredReconnected {
-                contract,
-                security_id,
-            } => {
-                format!(
-                    "<b>Depth 200-level reconnected</b>\nContract: {contract}\nSecurityId: {security_id}"
-                )
-            }
-            Self::DepthRebalanced {
-                underlying,
-                previous_spot,
-                current_spot,
-                old_ce,
-                old_pe,
-                new_ce,
-                new_pe,
-                levels,
-            } => {
-                format!(
-                    "<b>{title}: {underlying}</b>\n\
-                     Spot: {previous_spot:.2} → {current_spot:.2}\n\
-                     Old CE: {old_ce}\n\
-                     Old PE: {old_pe}\n\
-                     New CE: {new_ce}\n\
-                     New PE: {new_pe}\n\
-                     {action}",
-                    title = format_args!("{} rebalance", levels.title_fragment()),
-                    action = levels.action_line(),
-                )
-            }
-            Self::DepthRebalanceFailed { underlying, reason } => {
-                format!(
-                    "<b>Depth rebalance FAILED: {underlying}</b>\n\
-                     {reason}\n\
-                     Depth subscription quality degraded until next successful rebalance."
                 )
             }
             Self::OrderUpdateConnected => "<b>Order Update WS connected</b>".to_string(),
@@ -2154,104 +1745,6 @@ impl NotificationEvent {
                 )
             }
             Self::Custom { message } => message.clone(),
-            Self::Depth20DynamicTopSetEmpty {
-                returned_count,
-                reason,
-            } => format!(
-                "<b>Depth-20 dynamic top-150: empty set</b>\n\
-                 code: <code>DEPTH-DYN-01</code>\n\
-                 returned_count: <code>{returned_count}</code>\n\
-                 reason: <code>{reason}</code>\n\
-                 ACTION: check option_movers freshness via \
-                 <code>SELECT count(*) FROM option_movers WHERE ts &gt; now() - 5m</code>"
-            ),
-            Self::Depth20DynamicSwapChannelBroken { slot_index, reason } => format!(
-                "<b>Depth-20 dynamic Swap20 channel BROKEN</b>\n\
-                 code: <code>DEPTH-DYN-02</code>\n\
-                 slot: <code>{slot_index}</code>\n\
-                 reason: <code>{reason}</code>\n\
-                 ACTION: pool supervisor (WS-GAP-05) should respawn within 5s; \
-                 if not, restart the app"
-            ),
-            Self::Depth20DynamicSwapApplied {
-                slot_index,
-                unsubscribed_count,
-                subscribed_count,
-                total_active,
-            } => format!(
-                "<b>Depth-20 dynamic top-150: swap applied</b>\n\
-                 slot: <code>{slot_index}</code>\n\
-                 unsubscribed: <code>{unsubscribed_count}</code>\n\
-                 subscribed: <code>{subscribed_count}</code>\n\
-                 active: <code>{total_active}</code>"
-            ),
-            Self::DepthDynamicV2DiffApplied {
-                feed,
-                added,
-                removed,
-                retained_count,
-                stats_added,
-                stats_removed,
-            } => {
-                // Operator-requested 2026-05-02: show display_label + sid + segment.
-                // 2026-05-02 hostile-bug-hunt HIGH fix: render counts from
-                // `stats_added` / `stats_removed` (authoritative diff-state
-                // machine output), not `added.len()` / `removed.len()` which
-                // could be lower if registry resolution dropped entries.
-                // Surface unresolved counts so operator sees the discrepancy.
-                // Final 4000-char overflow guard prevents Telegram 400 on
-                // pathological labels (security-reviewer MEDIUM fix).
-                const MAX_LINES_PER_SECTION: usize = 10;
-                const MAX_MESSAGE_LEN: usize = 4000;
-
-                let unresolved_added = stats_added.saturating_sub(added.len());
-                let unresolved_removed = stats_removed.saturating_sub(removed.len());
-
-                let mut lines: Vec<String> = Vec::with_capacity(2 + added.len() + removed.len());
-                let unresolved_tail = if unresolved_added + unresolved_removed > 0 {
-                    format!(
-                        "  unresolved: <code>{}</code> (registry lookup miss)",
-                        unresolved_added + unresolved_removed
-                    )
-                } else {
-                    String::new()
-                };
-                lines.push(format!(
-                    "<b>{feed}: diff applied</b>\nadded: <code>{}</code>  removed: <code>{}</code>  retained: <code>{}</code>{}",
-                    stats_added,
-                    stats_removed,
-                    retained_count,
-                    unresolved_tail
-                ));
-                if !added.is_empty() {
-                    lines.push("\n<b>➕ Added</b>".to_string());
-                    for entry in added.iter().take(MAX_LINES_PER_SECTION) {
-                        lines.push(entry.format_line());
-                    }
-                    if added.len() > MAX_LINES_PER_SECTION {
-                        lines.push(format!("  • +{} more", added.len() - MAX_LINES_PER_SECTION));
-                    }
-                }
-                if !removed.is_empty() {
-                    lines.push("\n<b>➖ Removed</b>".to_string());
-                    for entry in removed.iter().take(MAX_LINES_PER_SECTION) {
-                        lines.push(entry.format_line());
-                    }
-                    if removed.len() > MAX_LINES_PER_SECTION {
-                        lines.push(format!(
-                            "  • +{} more",
-                            removed.len() - MAX_LINES_PER_SECTION
-                        ));
-                    }
-                }
-                let mut joined = lines.join("\n");
-                // Defence-in-depth: enforce Telegram's 4096 hard cap.
-                if joined.chars().count() > MAX_MESSAGE_LEN {
-                    let truncated: String = joined.chars().take(MAX_MESSAGE_LEN).collect();
-                    joined = format!("{truncated}\n…(truncated to fit Telegram limit)");
-                }
-                joined
-            }
             Self::LastTickAfterBoundary {
                 security_id,
                 exchange_segment,
@@ -2335,12 +1828,10 @@ impl NotificationEvent {
             Self::WebSocketPoolDegraded { .. } => "WebSocketPoolDegraded",
             Self::WebSocketPoolRecovered { .. } => "WebSocketPoolRecovered",
             Self::WebSocketPoolHalt { .. } => "WebSocketPoolHalt",
-            Self::DepthIndexLtpTimeout { .. } => "DepthIndexLtpTimeout",
             Self::MarketOpenStreamingConfirmation { .. } => "MarketOpenStreamingConfirmation",
             Self::MarketOpenStreamingFailed { .. } => "MarketOpenStreamingFailed",
             Self::MarketOpenReadinessConfirmation { .. } => "MarketOpenReadinessConfirmation",
             Self::EndOfDayDigest { .. } => "EndOfDayDigest",
-            Self::DepthUnderlyingMissing { .. } => "DepthUnderlyingMissing",
             // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
             // name arms retired.
             // PR #6a (2026-05-19): NseBhavcopyCheck* name arms retired.
@@ -2350,18 +1841,6 @@ impl NotificationEvent {
             Self::WebSocketSleepEntered { .. } => "WebSocketSleepEntered",
             Self::WebSocketSleepResumed { .. } => "WebSocketSleepResumed",
             Self::WebSocketTokenForceRenewedOnWake { .. } => "WebSocketTokenForceRenewedOnWake",
-            Self::DepthTwentyConnected { .. } => "DepthTwentyConnected",
-            Self::DepthTwentyDisconnected { .. } => "DepthTwentyDisconnected",
-            Self::DepthTwentyDisconnectedOffHours { .. } => "DepthTwentyDisconnectedOffHours",
-            Self::DepthTwentyReconnected { .. } => "DepthTwentyReconnected",
-            Self::DepthTwoHundredConnected { .. } => "DepthTwoHundredConnected",
-            Self::DepthTwoHundredDisconnected { .. } => "DepthTwoHundredDisconnected",
-            Self::DepthTwoHundredDisconnectedOffHours { .. } => {
-                "DepthTwoHundredDisconnectedOffHours"
-            }
-            Self::DepthTwoHundredReconnected { .. } => "DepthTwoHundredReconnected",
-            Self::DepthRebalanced { .. } => "DepthRebalanced",
-            Self::DepthRebalanceFailed { .. } => "DepthRebalanceFailed",
             Self::OrderUpdateConnected => "OrderUpdateConnected",
             Self::OrderUpdateAuthenticated => "OrderUpdateAuthenticated",
             Self::OrderUpdateDisconnected { .. } => "OrderUpdateDisconnected",
@@ -2401,10 +1880,6 @@ impl NotificationEvent {
             Self::RealtimeGuaranteeDegraded { .. } => "RealtimeGuaranteeDegraded",
             Self::RealtimeGuaranteeCritical { .. } => "RealtimeGuaranteeCritical",
             Self::Custom { .. } => "Custom",
-            Self::Depth20DynamicTopSetEmpty { .. } => "Depth20DynamicTopSetEmpty",
-            Self::Depth20DynamicSwapChannelBroken { .. } => "Depth20DynamicSwapChannelBroken",
-            Self::Depth20DynamicSwapApplied { .. } => "Depth20DynamicSwapApplied",
-            Self::DepthDynamicV2DiffApplied { .. } => "DepthDynamicV2DiffApplied",
             Self::LastTickAfterBoundary { .. } => "LastTickAfterBoundary",
             Self::OptionChainFetchFailed { .. } => "OptionChainFetchFailed",
             Self::OptionChainCacheFallback { .. } => "OptionChainCacheFallback",
@@ -2450,19 +1925,11 @@ impl NotificationEvent {
                 Severity::Low
             }
             Self::WebSocketTokenForceRenewedOnWake { .. } => Severity::Low,
-            Self::DepthTwentyDisconnected { .. } => Severity::High,
-            Self::DepthTwentyDisconnectedOffHours { .. } => Severity::Low,
-            Self::DepthTwentyReconnected { .. } => Severity::Medium,
-            Self::DepthTwoHundredDisconnected { .. } => Severity::High,
-            Self::DepthTwoHundredDisconnectedOffHours { .. } => Severity::Low,
-            Self::DepthTwoHundredReconnected { .. } => Severity::Medium,
             // Routine zero-disconnect drift swap — green by design. Prior
             // `Custom` routing made every 60s drift fire [HIGH] amber; see
             // Fix #9 in .claude/plans/active-plan.md and .claude/rules/project/
             // depth-subscription.md for the working-as-designed rationale.
-            Self::DepthRebalanced { .. } => Severity::Low,
             // Swap itself failed — depth quality degraded until next rebalance.
-            Self::DepthRebalanceFailed { .. } => Severity::High,
             Self::OrderUpdateDisconnected { .. } => Severity::High,
             Self::OrderUpdateReconnected { .. } => Severity::Low,
             Self::NoLiveTicksDuringMarketHours { .. } => Severity::Critical,
@@ -2506,8 +1973,6 @@ impl NotificationEvent {
             Self::RealtimeGuaranteeDegraded { .. } => Severity::Low,
             Self::RealtimeGuaranteeCritical { .. } => Severity::Low,
             Self::SelfTestCritical { .. } => Severity::Critical,
-            Self::DepthIndexLtpTimeout { .. } => Severity::High,
-            Self::DepthUnderlyingMissing { .. } => Severity::High,
             // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
             // severity arms retired.
             // Wave 5 Item 26 L2 — operator triages FAIL/MISSING_OUR rows
@@ -2515,8 +1980,6 @@ impl NotificationEvent {
             // happy path. The dedicated `NseBhavcopyCheckFailed` variant
             // is High (per audit-findings Rule 11 — no false-OK class).
             // PR #6a (2026-05-19): NseBhavcopyCheck* severity arms retired.
-            Self::DepthTwentyConnected { .. } => Severity::Low,
-            Self::DepthTwoHundredConnected { .. } => Severity::Low,
             Self::OrderUpdateConnected => Severity::Low,
             Self::OrderUpdateAuthenticated => Severity::Medium,
             Self::TokenRenewed => Severity::Low,
@@ -2547,10 +2010,6 @@ impl NotificationEvent {
             Self::BarMismatchCrossCheckFailed { .. } => Severity::Critical,
             Self::StartupComplete { .. } => Severity::Info,
             Self::ShutdownComplete => Severity::Info,
-            Self::Depth20DynamicTopSetEmpty { .. } => Severity::High,
-            Self::Depth20DynamicSwapChannelBroken { .. } => Severity::Critical,
-            Self::Depth20DynamicSwapApplied { .. } => Severity::Low,
-            Self::DepthDynamicV2DiffApplied { .. } => Severity::Low,
             Self::LastTickAfterBoundary { .. } => Severity::Info,
             Self::OptionChainFetchFailed { .. } => Severity::High,
             Self::OptionChainCacheFallback { .. } => Severity::Medium,
@@ -2577,20 +2036,17 @@ impl NotificationEvent {
             // Boot-success milestones — operator's at-a-glance "is the
             // boot OK?" Telegram pings. PR #526 added the first 4
             // (Auth/Instruments/PoolOnline/Phase2Complete). PR #6
-            // (2026-05-09 operator request) added the 3 per-WS connect
-            // events so depth-20 / depth-200 / order-update successful
-            // handshakes ship as instant green ✅ pings instead of
-            // coalescing for 60s. Rationale: the Saturday mock-session
-            // boot showed `WebSocketConnected x5` arriving 60s after
-            // `TickVault is live` — operator needs each WS surface to
-            // confirm in real time, not as a delayed batch.
+            // (2026-05-09 operator request) made per-WS connect events
+            // ship as instant green ✅ pings instead of coalescing for
+            // 60s (Saturday mock-session boot showed `WebSocketConnected
+            // x5` arriving 60s after `TickVault is live`). The depth-20 /
+            // depth-200 connect events were deleted 2026-06-10 (Phase B
+            // batch 3); OrderUpdateConnected is the surviving WS ping.
             Self::AuthenticationSuccess
             | Self::InstrumentBuildSuccess { .. }
             | Self::WebSocketPoolOnline { .. }
             | Self::WebSocketPoolDeferredOffHours { .. }
             // PR #5 (2026-05-19): Phase2Complete retired.
-            | Self::DepthTwentyConnected { .. }
-            | Self::DepthTwoHundredConnected { .. }
             | Self::OrderUpdateConnected => DispatchPolicy::Immediate,
             _ => DispatchPolicy::Default,
         }
@@ -2612,86 +2068,6 @@ impl NotificationEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_depth_diff_entry_format_line_uses_symbol_sid_and_segment() {
-        // Operator-requested 2026-05-02: precise symbol + sid + segment.
-        let entry = DepthDiffEntry {
-            security_id: 70123,
-            exchange_segment: "NSE_FNO",
-            display_label: "NIFTY 23000 CE 2026-06-26".to_string(),
-            underlying_symbol: "NIFTY".to_string(),
-        };
-        assert_eq!(
-            entry.format_line(),
-            "  • NIFTY 23000 CE 2026-06-26 (sid=70123, NSE_FNO)"
-        );
-    }
-
-    /// 2026-05-02 (security-reviewer HIGH fix): HTML-escape the
-    /// `display_label` so a tampered Dhan CSV cannot inject `<a href>`
-    /// or `</b>` into the operator's HTML-mode Telegram message.
-    #[test]
-    fn test_depth_diff_entry_format_line_html_escapes_display_label() {
-        let entry = DepthDiffEntry {
-            security_id: 99999,
-            exchange_segment: "NSE_FNO",
-            display_label: r#"</b><a href="http://attacker.com">click</a><b>"#.to_string(),
-            underlying_symbol: "EVIL".to_string(),
-        };
-        let line = entry.format_line();
-        // No raw `<` or `>` from the input (legitimate `<` from format!
-        // would only appear in the angle-bracket of `</b>` etc, which
-        // is the very thing we're escaping). Easier check: ensure
-        // escaped sequences appear AND no raw `<a href` substring.
-        assert!(
-            !line.contains("<a href"),
-            "raw <a href> must not appear in rendered line: {line}"
-        );
-        assert!(
-            line.contains("&lt;a href="),
-            "escaped &lt;a href= must appear in rendered line: {line}"
-        );
-        assert!(
-            line.contains("&lt;/b&gt;"),
-            "escaped &lt;/b&gt; must appear in rendered line: {line}"
-        );
-    }
-
-    /// Truncates `display_label` at DISPLAY_LABEL_MAX_LEN chars so a
-    /// 10-entry rebalance with maliciously long labels cannot push the
-    /// full Telegram message past the 4096-char hard cap.
-    #[test]
-    fn test_depth_diff_entry_format_line_truncates_long_display_label() {
-        let long = "A".repeat(200);
-        let entry = DepthDiffEntry {
-            security_id: 1,
-            exchange_segment: "NSE_FNO",
-            display_label: long,
-            underlying_symbol: "TEST".to_string(),
-        };
-        let line = entry.format_line();
-        // The truncation appends an ellipsis; the rendered line must
-        // contain at most DISPLAY_LABEL_MAX_LEN A's followed by …
-        let a_count = line.chars().filter(|c| *c == 'A').count();
-        assert!(
-            a_count <= DISPLAY_LABEL_MAX_LEN,
-            "display_label exceeded DISPLAY_LABEL_MAX_LEN ({DISPLAY_LABEL_MAX_LEN}) chars after truncation, got {a_count}"
-        );
-        assert!(
-            line.contains('…'),
-            "truncation marker must be present: {line}"
-        );
-    }
-
-    /// Pin DISPLAY_LABEL_MAX_LEN at 80 — covers longest legitimate
-    /// Dhan label with x4 headroom. Reducing this would reject
-    /// legitimate labels; raising it without a 4000-char overall guard
-    /// re-introduces the message-overflow risk.
-    #[test]
-    fn test_display_label_max_len_pinned_at_80() {
-        assert_eq!(DISPLAY_LABEL_MAX_LEN, 80);
-    }
 
     #[test]
     fn test_severity_as_label_returns_lowercase_string() {
@@ -2725,19 +2101,6 @@ mod tests {
                     reason: "x".into(),
                 },
                 "WebSocketDisconnectedOffHours",
-            ),
-            (
-                NotificationEvent::DepthRebalanced {
-                    underlying: "NIFTY".into(),
-                    previous_spot: 25_000.0,
-                    current_spot: 25_050.0,
-                    old_ce: "old_ce".into(),
-                    old_pe: "old_pe".into(),
-                    new_ce: "new_ce".into(),
-                    new_pe: "new_pe".into(),
-                    levels: DepthRebalanceLevels::TwentyOnly,
-                },
-                "DepthRebalanced",
             ),
             (
                 NotificationEvent::RiskHalt {
@@ -2863,189 +2226,6 @@ mod tests {
             !msg.contains("token=secret"),
             "URL query params must be redacted: {msg}"
         );
-    }
-
-    // Q5 regression pins (2026-04-23): post-market depth disconnects fire
-    // Low, not High. A boot at 18:05 IST with 4× [HIGH] depth-200 alerts
-    // (all SecurityId=0, contracts labeled "*-deferred") was pure Telegram
-    // noise because no live spot LTP arrived after 15:30 IST to populate
-    // the ATM selector. These pins enforce the Low routing.
-
-    #[test]
-    fn test_depth_20_disconnected_off_hours_is_low() {
-        let event = NotificationEvent::DepthTwentyDisconnectedOffHours {
-            underlying: "NIFTY".to_string(),
-            reason: "Reconnection failed after 20 attempts".to_string(),
-        };
-        assert_eq!(
-            event.severity(),
-            Severity::Low,
-            "post-market depth-20 disconnect must be Low to avoid SMS escalation"
-        );
-    }
-
-    #[test]
-    fn test_depth_200_disconnected_off_hours_is_low() {
-        let event = NotificationEvent::DepthTwoHundredDisconnectedOffHours {
-            contract: "NIFTY-PE-deferred".to_string(),
-            security_id: 0,
-            reason: "Reconnection failed after 60 attempts".to_string(),
-        };
-        assert_eq!(
-            event.severity(),
-            Severity::Low,
-            "post-market / SID=0 depth-200 disconnect must be Low"
-        );
-    }
-
-    #[test]
-    fn test_depth_20_disconnected_in_hours_still_high() {
-        // Severity-flip guard: a real in-market-hours disconnect must
-        // stay High so the operator gets SMS. If this ever flips to Low
-        // by accident, we'd go silent on real outages.
-        let event = NotificationEvent::DepthTwentyDisconnected {
-            underlying: "NIFTY".to_string(),
-            reason: "Dhan TCP reset".to_string(),
-        };
-        assert_eq!(event.severity(), Severity::High);
-    }
-
-    #[test]
-    fn test_depth_200_disconnected_in_hours_still_high() {
-        let event = NotificationEvent::DepthTwoHundredDisconnected {
-            contract: "NIFTY-Jun2026-25650-CE".to_string(),
-            security_id: 72271,
-            reason: "Dhan TCP reset".to_string(),
-        };
-        assert_eq!(event.severity(), Severity::High);
-    }
-
-    #[test]
-    fn test_depth_200_disconnected_off_hours_message_mentions_off_hours() {
-        let event = NotificationEvent::DepthTwoHundredDisconnectedOffHours {
-            contract: "BANKNIFTY-CE-deferred".to_string(),
-            security_id: 0,
-            reason: "no reason".to_string(),
-        };
-        let msg = event.to_message();
-        assert!(
-            msg.contains("off-hours") || msg.contains("no-data"),
-            "message must distinguish off-hours variant: {msg}"
-        );
-        assert!(msg.contains("BANKNIFTY-CE-deferred"));
-    }
-
-    // -----------------------------------------------------------------
-    // Fix #9 (2026-04-24): routine zero-disconnect depth rebalance is
-    // `Severity::Low`, not `Severity::High`. Ratchet against regression
-    // back to the old `Custom { message: … }` path.
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn test_depth_rebalance_success_is_low_severity() {
-        let event = NotificationEvent::DepthRebalanced {
-            underlying: "BANKNIFTY".to_string(),
-            previous_spot: 55000.0,
-            current_spot: 55150.0,
-            old_ce: "BANKNIFTY 24 APR 55000 CALL (SID 11111)".to_string(),
-            old_pe: "BANKNIFTY 24 APR 55000 PUT (SID 22222)".to_string(),
-            new_ce: "BANKNIFTY 24 APR 55150 CALL (SID 33333)".to_string(),
-            new_pe: "BANKNIFTY 24 APR 55150 PUT (SID 44444)".to_string(),
-            levels: DepthRebalanceLevels::TwentyAndTwoHundred,
-        };
-        assert_eq!(
-            event.severity(),
-            Severity::Low,
-            "routine drift swap MUST NOT escalate to High — see \
-             .claude/rules/project/depth-subscription.md"
-        );
-    }
-
-    #[test]
-    fn test_depth_rebalance_failure_is_high_severity() {
-        // Severity-flip guard: failures MUST stay High so the operator
-        // gets SMS when depth quality degrades.
-        let event = NotificationEvent::DepthRebalanceFailed {
-            underlying: "NIFTY".to_string(),
-            reason: "command channel closed".to_string(),
-        };
-        assert_eq!(event.severity(), Severity::High);
-    }
-
-    // -----------------------------------------------------------------
-    // Fix #10 (2026-04-24): title fragment includes the level(s).
-    // `Depth-20 rebalance: …` for FINNIFTY / MIDCPNIFTY,
-    // `Depth-20+200 rebalance: …` for NIFTY / BANKNIFTY.
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn test_depth_rebalance_title_20_only() {
-        let event = NotificationEvent::DepthRebalanced {
-            underlying: "FINNIFTY".to_string(),
-            previous_spot: 23500.0,
-            current_spot: 23610.0,
-            old_ce: "FINNIFTY 29 APR 23500 CALL (SID 71111)".to_string(),
-            old_pe: "FINNIFTY 29 APR 23500 PUT (SID 71112)".to_string(),
-            new_ce: "FINNIFTY 29 APR 23600 CALL (SID 71121)".to_string(),
-            new_pe: "FINNIFTY 29 APR 23600 PUT (SID 71122)".to_string(),
-            levels: DepthRebalanceLevels::TwentyOnly,
-        };
-        let msg = event.to_message();
-        assert!(
-            msg.contains("<b>Depth-20 rebalance: FINNIFTY</b>"),
-            "FINNIFTY (no 200-level) title must read `Depth-20 rebalance: …`: {msg}"
-        );
-        assert!(
-            !msg.contains("Depth-20+200"),
-            "FINNIFTY must NOT claim 200-level in title: {msg}"
-        );
-        assert!(msg.contains("no 200-level for this underlying"));
-    }
-
-    #[test]
-    fn test_depth_rebalance_title_20_plus_200() {
-        let event = NotificationEvent::DepthRebalanced {
-            underlying: "NIFTY".to_string(),
-            previous_spot: 23800.0,
-            current_spot: 23710.0,
-            old_ce: "NIFTY 24 APR 23800 CALL (SID 62001)".to_string(),
-            old_pe: "NIFTY 24 APR 23800 PUT (SID 62002)".to_string(),
-            new_ce: "NIFTY 24 APR 23700 CALL (SID 62011)".to_string(),
-            new_pe: "NIFTY 24 APR 23700 PUT (SID 62012)".to_string(),
-            levels: DepthRebalanceLevels::TwentyAndTwoHundred,
-        };
-        let msg = event.to_message();
-        assert!(
-            msg.contains("<b>Depth-20+200 rebalance: NIFTY</b>"),
-            "NIFTY (has 200-level) title must read `Depth-20+200 rebalance: …`: {msg}"
-        );
-        assert!(msg.contains("20-level + 200-level unsub old"));
-    }
-
-    #[test]
-    fn test_depth_rebalance_levels_title_fragment() {
-        assert_eq!(
-            DepthRebalanceLevels::TwentyOnly.title_fragment(),
-            "Depth-20"
-        );
-        assert_eq!(
-            DepthRebalanceLevels::TwentyAndTwoHundred.title_fragment(),
-            "Depth-20+200"
-        );
-    }
-
-    #[test]
-    fn test_depth_rebalance_levels_action_line() {
-        // The action line explicitly distinguishes "20-level only" from
-        // "20-level + 200-level" so the operator knows the swap scope
-        // without reading the full message body.
-        let twenty = DepthRebalanceLevels::TwentyOnly.action_line();
-        assert!(twenty.contains("20-level unsub old"));
-        assert!(twenty.contains("no 200-level for this underlying"));
-
-        let both = DepthRebalanceLevels::TwentyAndTwoHundred.action_line();
-        assert!(both.contains("20-level + 200-level unsub old"));
-        assert!(!both.contains("no 200-level"));
     }
 
     #[test]
@@ -3902,16 +3082,7 @@ mod tests {
     /// real time. Blocks regression to the coalesced-by-default pattern.
     #[test]
     fn test_per_ws_connect_events_are_immediate_low() {
-        let events = [
-            NotificationEvent::DepthTwentyConnected {
-                underlying: "NIFTY".to_string(),
-            },
-            NotificationEvent::DepthTwoHundredConnected {
-                contract: "NIFTY-Jun2026-25000-CE".to_string(),
-                security_id: 12345,
-            },
-            NotificationEvent::OrderUpdateConnected,
-        ];
+        let events = [NotificationEvent::OrderUpdateConnected];
         for event in events {
             assert_eq!(
                 event.dispatch_policy(),
@@ -4185,8 +3356,6 @@ mod tests {
         let ev = NotificationEvent::MarketOpenStreamingConfirmation {
             main_feed_active: 5,
             main_feed_total: 5,
-            depth_20_active: 4,
-            depth_200_active: 4,
             order_update_active: true,
         };
         assert_eq!(ev.severity(), Severity::Info);
@@ -4197,15 +3366,11 @@ mod tests {
         let ev = NotificationEvent::MarketOpenStreamingConfirmation {
             main_feed_active: 5,
             main_feed_total: 5,
-            depth_20_active: 4,
-            depth_200_active: 4,
             order_update_active: true,
         };
         let msg = ev.to_message();
         assert!(msg.contains("Streaming live"), "got: {msg}");
         assert!(msg.contains("Main feed: 5/5"), "got: {msg}");
-        assert!(msg.contains("Depth-20: 4/4"), "got: {msg}");
-        assert!(msg.contains("Depth-200: 4/4"), "got: {msg}");
         assert!(msg.contains("Order updates: 1/1"), "got: {msg}");
         assert!(
             msg.contains("09:15:30"),
@@ -4218,8 +3383,6 @@ mod tests {
         let ev = NotificationEvent::MarketOpenStreamingConfirmation {
             main_feed_active: 5,
             main_feed_total: 5,
-            depth_20_active: 4,
-            depth_200_active: 4,
             order_update_active: false,
         };
         let msg = ev.to_message();
@@ -4241,8 +3404,6 @@ mod tests {
         let ev = NotificationEvent::MarketOpenReadinessConfirmation {
             main_feed_active: 5,
             main_feed_total: 5,
-            depth_20_active: 4,
-            depth_200_active: 4,
             order_update_active: true,
             token_remaining_secs: 8 * 3600,
         };
@@ -4254,8 +3415,6 @@ mod tests {
         let ev = NotificationEvent::MarketOpenReadinessConfirmation {
             main_feed_active: 5,
             main_feed_total: 5,
-            depth_20_active: 4,
-            depth_200_active: 4,
             order_update_active: true,
             token_remaining_secs: 8 * 3600,
         };
@@ -4263,8 +3422,6 @@ mod tests {
         assert!(msg.contains("READY for market open"), "got: {msg}");
         assert!(msg.contains("09:14:00 IST"), "got: {msg}");
         assert!(msg.contains("Main feed: 5/5"), "got: {msg}");
-        assert!(msg.contains("Depth-20: 4/4"), "got: {msg}");
-        assert!(msg.contains("Depth-200: 4/4"), "got: {msg}");
         assert!(msg.contains("Order updates: 1/1"), "got: {msg}");
     }
 
@@ -4277,8 +3434,6 @@ mod tests {
         let ev = NotificationEvent::MarketOpenReadinessConfirmation {
             main_feed_active: 5,
             main_feed_total: 5,
-            depth_20_active: 4,
-            depth_200_active: 4,
             order_update_active: true,
             token_remaining_secs: 8 * 3600 + 1800, // 8.5 hours
         };
@@ -4300,8 +3455,6 @@ mod tests {
         let ev = NotificationEvent::MarketOpenReadinessConfirmation {
             main_feed_active: 5,
             main_feed_total: 5,
-            depth_20_active: 4,
-            depth_200_active: 4,
             order_update_active: true,
             token_remaining_secs: 0,
         };
@@ -4320,8 +3473,6 @@ mod tests {
         let ev = NotificationEvent::MarketOpenReadinessConfirmation {
             main_feed_active: 5,
             main_feed_total: 5,
-            depth_20_active: 4,
-            depth_200_active: 4,
             order_update_active: true,
             token_remaining_secs: 8 * 3600,
         };

@@ -57,8 +57,9 @@ fn guard_offhours_ws_disconnected_variant_exists() {
 // #509d — the depth-rebalance Telegram wording moved from inline
 // `Custom { message }` strings in main.rs to the typed
 // `DepthRebalanced` notification variant per the 2026-04-24 PR #337
-// migration. Variant ratchets live in events.rs::tests
-// (`test_depth_rebalance_*`).
+// migration. The variant + its `test_depth_rebalance_*` ratchets were
+// deleted 2026-06-10 (Phase B batch 2 — zero production emitters since
+// the depth feeds were removed in AWS-lifecycle PR #4).
 //
 // `guard_phase2_empty_plan_fires_phase2_failed` retired in PR #509d
 // — `phase2_scheduler.rs` deleted along with the dispatcher chain.

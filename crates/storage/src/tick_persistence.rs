@@ -536,7 +536,23 @@ impl TickPersistenceWriter {
             .as_mut()
             .context("sender unavailable in force_flush")?;
 
-        if let Err(err) = sender.flush(&mut self.buffer) {
+        // Latency-hunt follow-up (operator directive 2026-06-10, PR #1090
+        // recommendation): time the actual ILP TCP write so the dashboard
+        // can show batch-flush cost SEPARATELY from per-tick processing.
+        // The `_duration_ns` suffix auto-inherits the exporter's
+        // TICK_NS_HISTOGRAM_BUCKETS (100 ns → 10 s). Cold path: flushes
+        // fire ≤ ~10×/sec (1-in-1000 ticks or the 1 s timer), so the
+        // macro's registry lookup here is NOT a hot-path cost. Recorded
+        // on the failure path too — the time spent until the TCP error is
+        // real latency the operator should see.
+        let flush_start = std::time::Instant::now();
+        let flush_result = sender.flush(&mut self.buffer);
+        #[allow(clippy::cast_precision_loss)]
+        // APPROVED: same as the tick-duration histogram cast in tick_processor
+        metrics::histogram!("tv_tick_flush_duration_ns")
+            .record(flush_start.elapsed().as_nanos() as f64);
+
+        if let Err(err) = flush_result {
             // Sender is broken — rescue in-flight ticks to ring buffer
             // BEFORE clearing state, so no data is lost.
             self.sender = None;
@@ -1434,7 +1450,24 @@ fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
 /// instead of generating one at persist time. TICK-SEQ-01 threading slice:
 /// this is what makes the live row's `capture_seq` match the WAL-replayed
 /// row's `capture_seq` for the same frame (closes review HIGH #5 / CRITICAL #2).
-fn build_tick_row_seq(buffer: &mut Buffer, tick: &ParsedTick, capture_seq: i64) -> Result<()> {
+///
+/// **Pre-validated ILP names (latency-hunt 2026-06-10):** questdb-rs
+/// re-validates every `&str` table/column name char-by-char on EVERY row;
+/// passing `TableName`/`ColumnName` wrappers skips that (questdb-rs docs:
+/// "it doesn't have to validate it again. This saves CPU cycles.").
+/// Measured on the `ilp_row/*` Criterion pair: 1,736 ns → 1,474 ns per row
+/// (−15%). `new_unchecked` is sound because every literal below is a static
+/// lowercase-ASCII identifier — mechanically proven by the ratchet test
+/// `test_tick_row_unchecked_ilp_names_pass_validation`, which extracts every
+/// string literal passed to `new_unchecked` in this file's source and runs
+/// the checked `::new()` validator over it.
+pub(crate) fn build_tick_row_seq(
+    buffer: &mut Buffer,
+    tick: &ParsedTick,
+    capture_seq: i64,
+) -> Result<()> {
+    use questdb::ingress::{ColumnName, TableName};
+
     // Dhan WebSocket exchange_timestamp is already IST epoch seconds.
     // Store directly — no offset needed.
     let ts_nanos =
@@ -1443,58 +1476,94 @@ fn build_tick_row_seq(buffer: &mut Buffer, tick: &ParsedTick, capture_seq: i64) 
         TimestampNanos::new(tick.received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS));
 
     buffer
-        .table(QUESTDB_TABLE_TICKS)
+        .table(TableName::new_unchecked(QUESTDB_TABLE_TICKS))
         .context("table name")?
         // QuestDB ILP requires ALL symbols before any column_*. `segment`
         // is the only SYMBOL column on the `ticks` table after the #T1c
         // table cleanup retired the `phase` SYMBOL column.
-        .symbol("segment", segment_code_to_str(tick.exchange_segment_code))
+        .symbol(
+            ColumnName::new_unchecked("segment"),
+            segment_code_to_str(tick.exchange_segment_code),
+        )
         .context("segment")?
-        .column_i64("security_id", i64::from(tick.security_id))
+        .column_i64(
+            ColumnName::new_unchecked("security_id"),
+            i64::from(tick.security_id),
+        )
         .context("security_id")?
         .column_f64(
-            "ltp",
+            ColumnName::new_unchecked("ltp"),
             round_to_2dp(f32_to_f64_clean(tick.last_traded_price)),
         )
         .context("ltp")?
-        .column_f64("open", round_to_2dp(f32_to_f64_clean(tick.day_open)))
+        .column_f64(
+            ColumnName::new_unchecked("open"),
+            round_to_2dp(f32_to_f64_clean(tick.day_open)),
+        )
         .context("open")?
-        .column_f64("high", round_to_2dp(f32_to_f64_clean(tick.day_high)))
+        .column_f64(
+            ColumnName::new_unchecked("high"),
+            round_to_2dp(f32_to_f64_clean(tick.day_high)),
+        )
         .context("high")?
-        .column_f64("low", round_to_2dp(f32_to_f64_clean(tick.day_low)))
+        .column_f64(
+            ColumnName::new_unchecked("low"),
+            round_to_2dp(f32_to_f64_clean(tick.day_low)),
+        )
         .context("low")?
-        .column_f64("close", round_to_2dp(f32_to_f64_clean(tick.day_close)))
+        .column_f64(
+            ColumnName::new_unchecked("close"),
+            round_to_2dp(f32_to_f64_clean(tick.day_close)),
+        )
         .context("close")?
-        .column_i64("volume", i64::from(tick.volume))
+        .column_i64(ColumnName::new_unchecked("volume"), i64::from(tick.volume))
         .context("volume")?
-        .column_i64("oi", i64::from(tick.open_interest))
+        .column_i64(
+            ColumnName::new_unchecked("oi"),
+            i64::from(tick.open_interest),
+        )
         .context("oi")?
         .column_f64(
-            "avg_price",
+            ColumnName::new_unchecked("avg_price"),
             round_to_2dp(f32_to_f64_clean(tick.average_traded_price)),
         )
         .context("avg_price")?
-        .column_i64("last_trade_qty", i64::from(tick.last_trade_quantity))
+        .column_i64(
+            ColumnName::new_unchecked("last_trade_qty"),
+            i64::from(tick.last_trade_quantity),
+        )
         .context("last_trade_qty")?
-        .column_i64("total_buy_qty", i64::from(tick.total_buy_quantity))
+        .column_i64(
+            ColumnName::new_unchecked("total_buy_qty"),
+            i64::from(tick.total_buy_quantity),
+        )
         .context("total_buy_qty")?
-        .column_i64("total_sell_qty", i64::from(tick.total_sell_quantity))
+        .column_i64(
+            ColumnName::new_unchecked("total_sell_qty"),
+            i64::from(tick.total_sell_quantity),
+        )
         .context("total_sell_qty")?
-        .column_i64("exchange_timestamp", i64::from(tick.exchange_timestamp))
+        .column_i64(
+            ColumnName::new_unchecked("exchange_timestamp"),
+            i64::from(tick.exchange_timestamp),
+        )
         .context("exchange_timestamp")?
-        .column_ts("received_at", received_nanos)
+        .column_ts(ColumnName::new_unchecked("received_at"), received_nanos)
         .context("received_at")?
         // DEDUP tiebreaker (2026-06-08): deterministic content fingerprint so
         // distinct same-second ticks are both kept and true duplicates/replays
         // collapse. See `tick_payload_hash` + the `DEDUP_KEY_TICKS` doc.
-        .column_i64("payload_hash", tick_payload_hash(tick))
+        .column_i64(
+            ColumnName::new_unchecked("payload_hash"),
+            tick_payload_hash(tick),
+        )
         .context("payload_hash")?
         // TICK-SEQ-01: replay-stable capture sequence. On the live path this is
         // the WS read-loop `frame_seq`; on WAL replay it is the SAME value read
         // back from the v2 record — so a true duplicate collapses and distinct
         // ticks are kept. Still a stored column only in this slice; the DEDUP key
         // flip to capture_seq lands in PR-2b. See `.claude/plans/active-plan.md`.
-        .column_i64("capture_seq", capture_seq)
+        .column_i64(ColumnName::new_unchecked("capture_seq"), capture_seq)
         .context("capture_seq")?
         .at(ts_nanos)
         .context("designated timestamp")?;
@@ -2053,6 +2122,97 @@ mod tests {
             }
         });
         port
+    }
+
+    /// Latency-hunt 2026-06-10 ratchet: `build_tick_row_seq` uses
+    /// `TableName::new_unchecked` / `ColumnName::new_unchecked` to skip
+    /// questdb-rs per-row name validation (−262 ns/row measured). That is
+    /// sound ONLY while every literal passed to `new_unchecked` is a valid
+    /// ILP identifier — this test extracts every string literal passed to
+    /// `new_unchecked` in THIS source file and runs the CHECKED validators
+    /// over it, so an invalid name added later fails the build, not the
+    /// live ILP stream.
+    #[test]
+    fn test_tick_row_unchecked_ilp_names_pass_validation() {
+        let source = include_str!("tick_persistence.rs");
+        // Scope the scan to the PRODUCTION region (everything before the
+        // tests module) — the test code below necessarily mentions the
+        // `new_unchecked(` pattern in its own string literals.
+        let production_region = source
+            .split("mod tests {")
+            .next()
+            .unwrap_or_else(|| panic!("tests module marker missing"));
+        let mut found = 0_usize;
+        for chunk in production_region.split("new_unchecked(\"").skip(1) {
+            let Some(end) = chunk.find('"') else {
+                panic!("unterminated new_unchecked literal");
+            };
+            let name = &chunk[..end];
+            questdb::ingress::ColumnName::new(name)
+                .unwrap_or_else(|e| panic!("invalid ILP column name {name:?}: {e}"));
+            questdb::ingress::TableName::new(name)
+                .unwrap_or_else(|e| panic!("invalid ILP table name {name:?}: {e}"));
+            found += 1;
+        }
+        // 16 wrapped column names in build_tick_row_seq (the `segment`
+        // symbol + 15 columns); the table name goes through the
+        // QUESTDB_TABLE_TICKS constant, validated below. The count is a
+        // floor, not an exact pin, so doc-comment mentions don't break it.
+        assert!(
+            found >= 16,
+            "expected ≥16 new_unchecked literals in tick_persistence.rs, found {found}"
+        );
+        questdb::ingress::TableName::new(QUESTDB_TABLE_TICKS)
+            .unwrap_or_else(|e| panic!("invalid ILP table name {QUESTDB_TABLE_TICKS:?}: {e}"));
+
+        // Hostile-review MEDIUM #2 hardening: a future
+        // `new_unchecked(SOME_CONST)` call would silently dodge the
+        // literal scanner above. In the production region every
+        // `new_unchecked(` call must be either a double-quoted literal
+        // or the one allowlisted QUESTDB_TABLE_TICKS constant — any
+        // other shape fails here.
+        let total_calls = production_region.matches("new_unchecked(").count();
+        let literal_calls = production_region.matches("new_unchecked(\"").count();
+        let allowlisted_const_calls = production_region
+            .matches("new_unchecked(QUESTDB_TABLE_TICKS)")
+            .count();
+        assert_eq!(
+            total_calls,
+            literal_calls + allowlisted_const_calls,
+            "found a new_unchecked call in the production region whose \
+             argument is neither a string literal nor the allowlisted \
+             QUESTDB_TABLE_TICKS constant — the validity ratchet cannot \
+             vouch for it. Validate the new name via the checked ::new() \
+             path or extend this test's allowlist WITH a matching \
+             explicit validation."
+        );
+    }
+
+    /// Latency-hunt follow-up ratchet (operator directive 2026-06-10):
+    /// `force_flush` MUST record the batch-flush duration into
+    /// `tv_tick_flush_duration_ns` so the operator dashboard can show
+    /// flush cost separately from per-tick processing. The `_duration_ns`
+    /// suffix is load-bearing — it is what makes the exporter render the
+    /// metric as a bucketed histogram (Matcher::Suffix in observability.rs).
+    #[test]
+    fn test_force_flush_records_flush_duration_histogram() {
+        let source = include_str!("tick_persistence.rs");
+        let fn_start = source
+            .find("pub fn force_flush(")
+            .unwrap_or_else(|| panic!("force_flush must exist"));
+        let fn_region = &source[fn_start..source.len().min(fn_start + 3000)];
+        assert!(
+            fn_region.contains("tv_tick_flush_duration_ns"),
+            "force_flush must record the tv_tick_flush_duration_ns histogram \
+             around the ILP sender flush — the dashboard's flush-latency tile \
+             reads it"
+        );
+        let metric = "tv_tick_flush_duration_ns";
+        assert!(
+            metric.ends_with("_duration_ns"),
+            "flush metric must keep the _duration_ns suffix so the exporter's \
+             Matcher::Suffix bucket config applies"
+        );
     }
 
     #[test]
@@ -2818,6 +2978,169 @@ mod tests {
             1,
             "enriched path must rescue to ring buffer on connect failure"
         );
+    }
+
+    /// P2b (coverage-gaps #1076): unreachable-config helper shared by the
+    /// error-arm tests below. Port 1 is reserved — connect always fails.
+    fn disconnected_cfg() -> QuestDbConfig {
+        QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        }
+    }
+
+    /// P2b: the TICK-SEQ-01 enriched+seq append must follow the same
+    /// ring-rescue semantics as the non-seq path AND keep the caller's
+    /// replay-stable capture_seq (not mint a fresh one).
+    #[test]
+    fn test_append_tick_enriched_with_seq_disconnected_buffers_and_preserves_seq() {
+        let mut writer = TickPersistenceWriter::new_disconnected(&disconnected_cfg());
+        let tick = make_test_tick(4243, 101.5);
+        let life = TickLifecycle {
+            volume_delta: 10,
+            prev_day_close: 100.0,
+            prev_day_oi: 0,
+            phase: 2,
+        };
+        let res = writer.append_tick_enriched_with_seq(&tick, life, 777_001);
+        assert!(res.is_ok(), "enriched+seq append must succeed (buffered)");
+        assert_eq!(writer.buffered_tick_count(), 1);
+        let (buffered, seq) = writer
+            .tick_buffer
+            .front()
+            .copied()
+            .expect("ring has the tick");
+        assert_eq!(buffered.security_id, 4243);
+        assert_eq!(seq, 777_001, "capture_seq must survive the ring rescue");
+    }
+
+    /// P2b: direct buffer flush while QuestDB is down must surface an Err
+    /// (reconnect fails) — never a silent Ok with data stuck in the buffer.
+    // APPROVED: the deprecated fn is still pub API; this test pins its
+    // error contract until the fn is physically deleted.
+    #[allow(deprecated)]
+    #[test]
+    fn test_flush_buffer_direct_disconnected_returns_error() {
+        let mut writer = TickPersistenceWriter::new_disconnected(&disconnected_cfg());
+        let tick = make_test_tick(4244, 102.5);
+        build_tick_row_seq(writer.buffer_mut(), &tick, 1).expect("row build");
+        let res = writer.flush_buffer_direct();
+        assert!(res.is_err(), "flush with no reachable QuestDB must error");
+    }
+
+    /// P2b: when the ring hits TICK_BUFFER_CAPACITY the next tick spills to
+    /// disk with its capture_seq preserved byte-exact in the spill record.
+    #[test]
+    fn test_buffer_tick_seq_ring_full_spills_with_preserved_seq() {
+        let tmp = std::env::temp_dir().join(format!("tv-p2b-ringfull-{}", std::process::id()));
+        let mut writer = TickPersistenceWriter::new_disconnected(&disconnected_cfg());
+        writer.set_spill_dir_for_test(tmp.clone());
+        let tick = make_test_tick(4245, 103.5);
+        for i in 0..TICK_BUFFER_CAPACITY {
+            writer.buffer_tick_seq(tick, i as i64);
+        }
+        assert_eq!(writer.buffered_tick_count(), TICK_BUFFER_CAPACITY);
+        assert_eq!(writer.ticks_spilled_total(), 0);
+        writer.buffer_tick_seq(tick, 777_002);
+        assert_eq!(
+            writer.ticks_spilled_total(),
+            1,
+            "tick past ring capacity must spill, never drop"
+        );
+        assert_eq!(writer.buffered_tick_count(), TICK_BUFFER_CAPACITY);
+        // Flush the BufWriter so the record is on disk, then round-trip it.
+        writer
+            .spill_writer
+            .as_mut()
+            .expect("spill writer open after spill")
+            .flush()
+            .expect("spill flush");
+        let spill_path = writer.spill_path.clone().expect("spill path set");
+        let bytes = std::fs::read(&spill_path).expect("read spill file");
+        assert_eq!(
+            bytes.len(),
+            TICK_SPILL_RECORD_SIZE,
+            "exactly one spill record"
+        );
+        let mut record = [0u8; TICK_SPILL_RECORD_SIZE];
+        record.copy_from_slice(&bytes);
+        let (spilled, seq) = deserialize_tick_seq(&record);
+        assert_eq!(spilled.security_id, 4245);
+        assert_eq!(seq, 777_002, "capture_seq must survive the disk spill");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// P2b: double fault — spill dir uncreatable, so the spill open fails AND
+    /// the DLQ open fails. The tick is counted permanently dropped (the only
+    /// silent-loss accounting path) and nothing panics.
+    #[test]
+    fn test_spill_open_failure_double_fault_counts_dropped() {
+        let mut writer = TickPersistenceWriter::new_disconnected(&disconnected_cfg());
+        // /proc is not writable — create_dir_all fails for spill AND DLQ.
+        writer.set_spill_dir_for_test(std::path::PathBuf::from(
+            "/proc/tickvault-no-such-dir/spill",
+        ));
+        let tick = make_test_tick(4246, 104.5);
+        writer.spill_tick_to_disk(&tick);
+        assert_eq!(
+            writer.ticks_dropped_total(),
+            1,
+            "double fault must increment the permanent-loss counter"
+        );
+        assert_eq!(writer.dlq_ticks_total(), 0, "DLQ open failed — no DLQ line");
+    }
+
+    /// P2b: the DLQ happy path writes one NDJSON line carrying the literal
+    /// reason + security_id so the tick is audit-recoverable.
+    #[test]
+    fn test_write_to_dlq_success_writes_ndjson_line() {
+        let tmp = std::env::temp_dir().join(format!("tv-p2b-dlq-{}", std::process::id()));
+        let mut writer = TickPersistenceWriter::new_disconnected(&disconnected_cfg());
+        writer.set_spill_dir_for_test(tmp.clone());
+        let tick = make_test_tick(4247, 105.5);
+        writer.write_to_dlq(&tick, "p2b_test_reason");
+        assert_eq!(writer.dlq_ticks_total(), 1);
+        let dlq_path = writer.dlq_path().expect("DLQ path set").to_path_buf();
+        let content = std::fs::read_to_string(&dlq_path).expect("read DLQ file");
+        assert!(content.contains("p2b_test_reason"), "{content}");
+        assert!(content.contains("4247"), "{content}");
+        assert!(
+            content.ends_with('\n'),
+            "NDJSON line must be newline-terminated"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// P2b: draining the disk spill while QuestDB is still down must PRESERVE
+    /// the spill file for the next recovery attempt (flush fails → no delete)
+    /// and rescue the drained tick into the ring (zero loss).
+    #[test]
+    fn test_drain_disk_spill_disconnected_preserves_spill_file() {
+        let tmp = std::env::temp_dir().join(format!("tv-p2b-drain-{}", std::process::id()));
+        let mut writer = TickPersistenceWriter::new_disconnected(&disconnected_cfg());
+        writer.set_spill_dir_for_test(tmp.clone());
+        let tick = make_test_tick(4248, 106.5);
+        writer.spill_tick_to_disk(&tick);
+        let spill_path = writer.spill_path.clone().expect("spill path set");
+        let drained = writer.drain_disk_spill();
+        assert_eq!(drained, 1, "the one spilled record is read back");
+        assert!(
+            spill_path.exists(),
+            "flush failed (no QuestDB) — spill file must be preserved, not deleted"
+        );
+        assert_eq!(
+            writer.spill_path.as_deref(),
+            Some(spill_path.as_path()),
+            "spill_path must be restored for the next recovery"
+        );
+        assert_eq!(
+            writer.buffered_tick_count(),
+            1,
+            "drained tick must be rescued to the ring on flush failure"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// #T1c ratchet: the `ticks` DDL must NOT declare any of the 9 retired

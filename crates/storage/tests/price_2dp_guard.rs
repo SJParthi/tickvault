@@ -61,13 +61,26 @@ fn tick_persistence_price_columns_are_rounded_to_2dp() {
     // between args is normalised away by collapsing runs of spaces.
     let normalised: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
     for col in TICK_PRICE_COLUMNS {
-        let needle = format!("column_f64( \"{col}\", round_to_2dp(");
-        let alt = format!("column_f64(\"{col}\", round_to_2dp(");
+        // Two accepted write-site shapes (both rounded):
+        //   column_f64("ltp", round_to_2dp(            — plain &str name
+        //   column_f64(ColumnName::new_unchecked("ltp"), round_to_2dp(
+        //     — pre-validated name (latency-hunt 2026-06-10; the name
+        //       literal itself is pinned by
+        //       test_tick_row_unchecked_ilp_names_pass_validation)
+        let plain = format!("column_f64(\"{col}\", round_to_2dp(");
+        let plain_spaced = format!("column_f64( \"{col}\", round_to_2dp(");
+        let prevalidated =
+            format!("column_f64( ColumnName::new_unchecked(\"{col}\"), round_to_2dp(");
+        let prevalidated_tight =
+            format!("column_f64(ColumnName::new_unchecked(\"{col}\"), round_to_2dp(");
         assert!(
-            normalised.contains(&needle) || normalised.contains(&alt),
+            normalised.contains(&plain)
+                || normalised.contains(&plain_spaced)
+                || normalised.contains(&prevalidated)
+                || normalised.contains(&prevalidated_tight),
             "tick_persistence.rs production append must write price column \
              `{col}` through `round_to_2dp(...)` (operator 2-decimal contract \
-             2026-05-29). Found a `column_f64(\"{col}\", ...)` that is not \
+             2026-05-29). Found a `column_f64` write for `{col}` that is not \
              wrapped. Wrap it: round_to_2dp(f32_to_f64_clean(...)). Greeks/IV \
              are exempt; this guard covers PRICE columns only."
         );

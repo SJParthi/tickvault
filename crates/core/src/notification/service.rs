@@ -315,26 +315,6 @@ impl NotificationService {
                 sns_client,
                 sns_phone_number,
             } => {
-                // 2026-05-11: routine depth-20/200 zero-disconnect rebalance
-                // swaps fire every ~60s on spot drift during volatile sessions
-                // (10-30 messages/day per underlying). They are NOT pager
-                // events (Severity::Low) and full audit lives in 4 other
-                // sinks: QuestDB `depth_rebalance_audit` (AUDIT-02), Grafana
-                // `depth-flow.json` panel, Prometheus
-                // `tv_depth_rebalances_total`, and Loki `errors.jsonl.*`.
-                // Telegram is the wrong tool for routine state changes —
-                // reserved for eyes-on-now events. The companion
-                // `DepthRebalanceFailed` variant (Severity::High — swap
-                // command channel broken, ATM unresolved) is NOT suppressed
-                // and still pages. See
-                // `.claude/rules/project/observability-architecture.md`
-                // clause 11 + ratchet tests in
-                // `crates/core/tests/depth_rebalance_telegram_suppression_guard.rs`.
-                if matches!(event, NotificationEvent::DepthRebalanced { .. }) {
-                    metrics::counter!("tv_depth_rebalance_telegram_suppressed_total").increment(1);
-                    return;
-                }
-
                 let severity = event.severity();
                 // UX fix 2026-04-17: prefix every Telegram message with a
                 // severity tag + emoji so the operator can visually scan
