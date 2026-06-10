@@ -161,4 +161,4 @@ the exemption count.
 | 4 | Exemption without reason | build fails |
 | 5 | Code has rule AND exemption | build fails (ambiguous) |
 | 6 | Critical (non-auto-triage-safe) code exempted | build fails (safety) |
-| 7 | All current 114 rules unchanged | 6 pre-existing tests still green |
+| 7 | All current 113 rules unchanged | 6 pre-existing tests still green |
