@@ -26,7 +26,8 @@ use tickvault_common::constants::{
     DHAN_TOKEN_GENERATION_COOLDOWN_SECS, TOTP_MAX_RETRIES, TOTP_PERIOD_SECS,
 };
 use tickvault_common::error::ApplicationError;
-use tickvault_common::sanitize::redact_url_params;
+use tickvault_common::sanitize::{capture_rest_error_body, redact_url_params};
+use tickvault_common::url_join::join_api_url;
 
 use super::secret_manager;
 use super::token_cache;
@@ -489,10 +490,11 @@ impl TokenManager {
             Zeroizing::new(token_state.access_token().expose_secret().to_string())
         };
 
-        let url = format!(
-            "{}{}",
-            self.rest_api_base_url,
-            tickvault_common::constants::DHAN_USER_PROFILE_PATH
+        // DHAN-REST-400 item 1b (2026-06-10): join via join_api_url so a
+        // trailing-slash base-URL override can never produce `/v2//profile`.
+        let url = join_api_url(
+            &self.rest_api_base_url,
+            tickvault_common::constants::DHAN_USER_PROFILE_PATH,
         );
 
         let response = self
@@ -516,21 +518,33 @@ impl TokenManager {
         let body_text = response.text().await.unwrap_or_default();
 
         if !status.is_success() {
-            // B2: Log full body for debugging but redact it from the error message
-            // to prevent raw API response (may contain PII) from reaching Telegram alerts.
+            // DHAN-REST-400 (2026-06-10): the previous code dropped Dhan's
+            // response body entirely ("response body redacted from error"),
+            // so a full day of 400s carried zero root-cause signal. Capture a
+            // bounded (≤300 chars), secret-redacted body — Dhan's errorType /
+            // errorCode / errorMessage name the cause (data-plan expiry vs
+            // malformed request vs WAF) — plus the EXACT final request URL
+            // (token-redacted; a `//` after the scheme means a malformed
+            // base-URL override).
             // Audit-2026-05-03 M1: profile failure blocks pre-market validation —
             // must be `error!` (not `warn!`) so Loki routes to Telegram per
             // audit-findings-2026-04-17.md Rule 5.
+            let captured_body = capture_rest_error_body(&body_text);
+            let redacted_url = redact_url_params(&url);
             error!(
                 code = tickvault_common::error_code::ErrorCode::Dh901InvalidAuth.code_str(),
                 severity = tickvault_common::error_code::ErrorCode::Dh901InvalidAuth
                     .severity()
                     .as_str(),
                 status = %status,
-                "DH-901: profile request failed — response body redacted from error"
+                url = %redacted_url,
+                body = %captured_body,
+                "DH-901: profile request failed"
             );
             return Err(ApplicationError::AuthenticationFailed {
-                reason: format!("profile request HTTP {status} — see server logs for details"),
+                reason: format!(
+                    "profile request HTTP {status} url={redacted_url} body={captured_body}"
+                ),
             });
         }
 
@@ -641,7 +655,7 @@ impl TokenManager {
     async fn acquire_token(&self) -> Result<(), ApplicationError> {
         let totp_code = generate_totp_code(&self.credentials.totp_secret)?;
 
-        let url = format!("{}{}", self.auth_base_url, DHAN_GENERATE_TOKEN_PATH);
+        let url = join_api_url(&self.auth_base_url, DHAN_GENERATE_TOKEN_PATH);
 
         // Dhan expects query params: dhanClientId, pin, totp
         // Our SSM `client_secret` maps to Dhan's `pin` (6-digit trading PIN).
@@ -666,10 +680,14 @@ impl TokenManager {
         let body_text = response.text().await.unwrap_or_default();
 
         if !status.is_success() {
+            // DHAN-REST-400 (2026-06-10): bounded secret-redacted body +
+            // final URL (the token-bearing query params are added by reqwest,
+            // not present in `url`; redact defensively anyway).
             return Err(ApplicationError::AuthenticationFailed {
                 reason: format!(
-                    "generateAccessToken HTTP {status}: {}",
-                    redact_url_params(&body_text)
+                    "generateAccessToken HTTP {status} url={} body={}",
+                    redact_url_params(&url),
+                    capture_rest_error_body(&body_text)
                 ),
             });
         }
@@ -689,10 +707,13 @@ impl TokenManager {
         }
 
         let body: DhanGenerateTokenResponse = serde_json::from_str(&body_text).map_err(|err| {
+            // DHAN-REST-400 follow-up (security review LOW): bounded
+            // JWT-redacted capture — a parse-error body could echo token
+            // material that url-param redaction alone would miss.
             ApplicationError::AuthenticationFailed {
                 reason: format!(
                     "failed to parse auth response (HTTP {status}): {err}\nResponse body: {}",
-                    redact_url_params(&body_text)
+                    capture_rest_error_body(&body_text)
                 ),
             }
         })?;
@@ -726,7 +747,7 @@ impl TokenManager {
             }
         })?;
 
-        let url = format!("{}{}", self.rest_api_base_url, DHAN_RENEW_TOKEN_PATH);
+        let url = join_api_url(&self.rest_api_base_url, DHAN_RENEW_TOKEN_PATH);
 
         // Audit-2026-05-03 H1: zeroize the JWT + clientId for the renewal
         // request so plaintext is wiped from heap when this fn returns.
@@ -754,11 +775,14 @@ impl TokenManager {
         let status = response.status();
         if !status.is_success() {
             let body_text = response.text().await.unwrap_or_default();
+            // DHAN-REST-400 (2026-06-10): bounded secret-redacted body +
+            // final URL so a renewal failure names its cause.
             return Err(ApplicationError::TokenRenewalFailed {
                 attempts: 0,
                 reason: format!(
-                    "RenewToken HTTP {status}: {}",
-                    redact_url_params(&body_text)
+                    "RenewToken HTTP {status} url={} body={}",
+                    redact_url_params(&url),
+                    capture_rest_error_body(&body_text)
                 ),
             });
         }
@@ -2149,6 +2173,73 @@ mod tests {
         assert!(
             err_msg.contains("RenewToken HTTP"),
             "error must mention HTTP status, got: {err_msg}"
+        );
+
+        server_handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // get_user_profile — DHAN-REST-400 (2026-06-10) body + URL capture
+    // -----------------------------------------------------------------------
+
+    /// RATCHET (task DHAN-REST-400 items 1 + 1b): a profile HTTP 400 must
+    /// surface Dhan's error body (bounded, secret-redacted) AND the final
+    /// request URL in the error reason — and the JWT must NEVER appear,
+    /// even when the server echoes it back in the body.
+    #[tokio::test]
+    async fn test_profile_400_error_includes_body_and_url_but_never_jwt() {
+        let jwt = format!(
+            "eyJ{}.eyJ{}.{}",
+            "hbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+            "zdWIiOiIxMTA2NjU2ODgyIiwiZXhwIjoxNzgwMDAwMDAwfQ",
+            "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        );
+        let body = format!(
+            r#"{{"errorType":"Invalid_Request","errorCode":"DH-905","errorMessage":"Missing required fields, bad token {jwt}"}}"#
+        );
+        let (url, server_handle) = start_mock_server(400, &body).await;
+
+        let initial_data = DhanAuthResponseData {
+            access_token: jwt.clone(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        // Trailing-slash base: join_api_url must still hit /profile (no `//`).
+        let trailing_slash_base = format!("{url}/");
+        let manager = make_mock_manager(
+            &trailing_slash_base,
+            &trailing_slash_base,
+            Some(TokenState::from_response(&initial_data)),
+        );
+
+        let result = manager.get_user_profile().await;
+        assert!(result.is_err(), "profile 400 must fail");
+        let err_msg = result.unwrap_err().to_string();
+        // Dhan's error fields survive — root-cause visibility.
+        assert!(
+            err_msg.contains("DH-905") && err_msg.contains("Missing required fields"),
+            "Dhan error body must be captured, got: {err_msg}"
+        );
+        // The EXACT final request URL is captured (1b)…
+        assert!(
+            err_msg.contains("/profile"),
+            "final request URL must be captured, got: {err_msg}"
+        );
+        // …and the join produced no `//` after the scheme despite the
+        // trailing-slash base.
+        let after_scheme = err_msg
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(&err_msg);
+        assert!(
+            !after_scheme.contains("//profile"),
+            "trailing-slash base must not produce `//`, got: {err_msg}"
+        );
+        // The token can NEVER appear — neither whole nor in part.
+        assert!(!err_msg.contains(&jwt), "full JWT leaked: {err_msg}");
+        assert!(
+            !err_msg.contains(&jwt[..30]),
+            "JWT prefix leaked: {err_msg}"
         );
 
         server_handle.abort();

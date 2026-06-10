@@ -31,6 +31,8 @@ use tickvault_common::constants::{
     PUBLIC_IP_CHECK_TIMEOUT_SECS, SSM_NETWORK_SERVICE, STATIC_IP_SECRET,
 };
 use tickvault_common::error::ApplicationError;
+use tickvault_common::sanitize::{capture_rest_error_body, redact_url_params};
+use tickvault_common::url_join::join_api_url;
 
 use crate::auth::secret_manager::{
     build_ssm_path, create_ssm_client, fetch_secret, resolve_environment,
@@ -329,10 +331,9 @@ pub async fn set_ip(
     access_token: &str,
     request: &crate::auth::types::SetIpRequest,
 ) -> Result<crate::auth::types::SetIpResponse, ApplicationError> {
-    let url = format!(
-        "{}{}",
+    let url = join_api_url(
         rest_api_base_url,
-        tickvault_common::constants::DHAN_SET_IP_PATH
+        tickvault_common::constants::DHAN_SET_IP_PATH,
     );
 
     let client = reqwest::Client::new();
@@ -352,7 +353,11 @@ pub async fn set_ip(
 
     if !status.is_success() {
         return Err(ApplicationError::IpVerificationFailed {
-            reason: format!("set_ip HTTP {status}: {body}"),
+            reason: format!(
+                "set_ip HTTP {status} url={} body={}",
+                redact_url_params(&url),
+                capture_rest_error_body(&body)
+            ),
         });
     }
 
@@ -372,10 +377,9 @@ pub async fn modify_ip(
     access_token: &str,
     request: &crate::auth::types::ModifyIpRequest,
 ) -> Result<crate::auth::types::ModifyIpResponse, ApplicationError> {
-    let url = format!(
-        "{}{}",
+    let url = join_api_url(
         rest_api_base_url,
-        tickvault_common::constants::DHAN_MODIFY_IP_PATH
+        tickvault_common::constants::DHAN_MODIFY_IP_PATH,
     );
 
     warn!("modifying Dhan IP — 7-day cooldown applies after this operation");
@@ -397,7 +401,11 @@ pub async fn modify_ip(
 
     if !status.is_success() {
         return Err(ApplicationError::IpVerificationFailed {
-            reason: format!("modify_ip HTTP {status}: {body}"),
+            reason: format!(
+                "modify_ip HTTP {status} url={} body={}",
+                redact_url_params(&url),
+                capture_rest_error_body(&body)
+            ),
         });
     }
 
@@ -415,10 +423,12 @@ pub async fn get_ip(
     rest_api_base_url: &str,
     access_token: &str,
 ) -> Result<crate::auth::types::GetIpResponse, ApplicationError> {
-    let url = format!(
-        "{}{}",
+    // DHAN-REST-400 item 1b (2026-06-10): the 08:45 getIP 404 "path not
+    // found" smelled like a malformed URL (`/v2//ip/getIP` from a
+    // trailing-slash base override) — join_api_url makes that impossible.
+    let url = join_api_url(
         rest_api_base_url,
-        tickvault_common::constants::DHAN_GET_IP_PATH
+        tickvault_common::constants::DHAN_GET_IP_PATH,
     );
 
     let client = reqwest::Client::new();
@@ -435,8 +445,19 @@ pub async fn get_ip(
     let body = response.text().await.unwrap_or_default();
 
     if !status.is_success() {
+        // DHAN-REST-400 (2026-06-10): bounded secret-redacted body + the
+        // EXACT final request URL so the operator sees both the cause
+        // (errorType/errorCode/errorMessage) and any malformed-path shape.
+        let captured_body = capture_rest_error_body(&body);
+        let redacted_url = redact_url_params(&url);
+        error!(
+            status = %status,
+            url = %redacted_url,
+            body = %captured_body,
+            "get_ip request returned non-2xx"
+        );
         return Err(ApplicationError::IpVerificationFailed {
-            reason: format!("get_ip HTTP {status}: {body}"),
+            reason: format!("get_ip HTTP {status} url={redacted_url} body={captured_body}"),
         });
     }
 

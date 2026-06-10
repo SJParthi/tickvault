@@ -252,6 +252,116 @@ pub fn sanitize_audit_string(input: &str) -> String {
     out
 }
 
+/// Hard cap on a captured REST error-response body (DHAN-REST-400,
+/// 2026-06-10). Dhan's error envelope (`errorType` / `errorCode` /
+/// `errorMessage`) fits comfortably in 300 chars; a WAF HTML block page is
+/// truncated to its identifying prefix.
+pub const REST_BODY_CAPTURE_MAX_CHARS: usize = 300;
+
+/// Minimum run length of JWT-alphabet characters after `eyJ` for a substring
+/// to be treated as a JWT and redacted. Real Dhan JWTs are hundreds of chars;
+/// 20 keeps false positives (e.g. the literal word "eyJ" in prose) implausible
+/// while never letting a real token through.
+const JWT_MIN_TAIL_LEN: usize = 20;
+
+/// Replaces any JWT-shaped substring (`eyJ` followed by ≥ 20 chars of the
+/// base64url/JWT alphabet `[A-Za-z0-9._-]`) with `[REDACTED-JWT]`.
+///
+/// Defence for REST error bodies that echo the `access-token` header back
+/// (some gateways/WAFs do). Regex-free char scan, cold path.
+#[must_use]
+pub fn redact_jwt_like(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(pos) = rest.find("eyJ") {
+        let (before, candidate) = rest.split_at(pos);
+        out.push_str(before);
+        let tail = &candidate[3..];
+        // `%` included so a (partially) percent-encoded token cannot split
+        // the run and leak a fragment (security review 2026-06-10, MEDIUM).
+        let run_len = tail
+            .find(|c: char| {
+                !(c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' || c == '%')
+            })
+            .unwrap_or(tail.len());
+        if run_len >= JWT_MIN_TAIL_LEN {
+            out.push_str("[REDACTED-JWT]");
+            rest = &tail[run_len..];
+        } else {
+            out.push_str("eyJ");
+            rest = tail;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Bounded, secret-redacted capture of a REST error-response body for error
+/// logs (DHAN-REST-400 root-cause visibility, 2026-06-10).
+///
+/// Pipeline: URL-param / credential redaction ([`redact_url_params`]) →
+/// JWT redaction ([`redact_jwt_like`]) → control-char strip (one-line log
+/// field; no newline injection) → UTF-8-safe truncation to
+/// [`REST_BODY_CAPTURE_MAX_CHARS`].
+///
+/// Guarantee (ratchet-tested): no access-token substring can survive into the
+/// output. Dhan's `errorType` / `errorCode` / `errorMessage` fields DO survive
+/// — they are the entire point of the capture.
+#[must_use]
+pub fn capture_rest_error_body(body: &str) -> String {
+    if body.is_empty() {
+        return String::new();
+    }
+    // ORDER MATTERS: strip control chars FIRST. A token split by an embedded
+    // control char ("eyJab\ncdef…") would evade the JWT scan (short tail at
+    // the control char) and then be re-joined into a leakable contiguous
+    // string if stripping ran after redaction. Truncation runs LAST so a
+    // token can never be half-cut into an unredacted prefix.
+    let stripped: String = body.chars().filter(|c| !c.is_control()).collect();
+    let mut redacted = redact_jwt_like(&redact_url_params(&stripped));
+    // Non-JWT credential shapes (security review 2026-06-10, HIGH): a server
+    // echoing an opaque (non-`eyJ`) credential inside a JSON field must
+    // still be caught. Redact the VALUE of known credential field names.
+    for key in ["accessToken", "access_token", "refreshToken", "app_secret"] {
+        redacted = redact_json_string_field(&redacted, key);
+    }
+    redacted.chars().take(REST_BODY_CAPTURE_MAX_CHARS).collect()
+}
+
+/// Replaces the string VALUE of every `"<key>" : "<value>"` occurrence with
+/// `[REDACTED]`. Regex-free scan; tolerant of whitespace around the colon.
+/// Non-string values (numbers, null) are left untouched.
+fn redact_json_string_field(input: &str, key: &str) -> String {
+    let needle = format!("\"{key}\"");
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(pos) = rest.find(&needle) {
+        let after_key = pos + needle.len();
+        out.push_str(&rest[..after_key]);
+        rest = &rest[after_key..];
+        // Skip whitespace, one colon, whitespace.
+        let trimmed = rest.trim_start();
+        let Some(after_colon) = trimmed.strip_prefix(':') else {
+            continue;
+        };
+        let value_part = after_colon.trim_start();
+        let Some(value_body) = value_part.strip_prefix('"') else {
+            continue;
+        };
+        // Copy the structural chars we just consumed, then the redaction.
+        let consumed_len = rest.len() - value_body.len();
+        out.push_str(&rest[..consumed_len]);
+        out.push_str("[REDACTED]");
+        // Skip the original value up to the closing quote (no escapes in
+        // token material; a backslash would end the redacted span early but
+        // never RE-EXPOSE anything — the value chars are skipped, not kept).
+        let value_end = value_body.find('"').unwrap_or(value_body.len());
+        rest = &value_body[value_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Redacts URL query parameters and known credential patterns from a string.
 ///
 /// Replaces query parameters in URLs (`?key=val&...`) with `?[REDACTED]`.
@@ -377,6 +487,171 @@ mod tests {
     #[test]
     fn test_empty_string() {
         assert_eq!(redact_url_params(""), "");
+    }
+
+    // -----------------------------------------------------------------
+    // capture_rest_error_body + redact_jwt_like (DHAN-REST-400, 2026-06-10)
+    // -----------------------------------------------------------------
+
+    /// A realistic JWT shape (3 base64url segments) for the redaction ratchet.
+    fn fake_jwt() -> String {
+        format!(
+            "eyJ{}.eyJ{}.{}",
+            "hbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+            "zdWIiOiIxMTA2NjU2ODgyIiwiZXhwIjoxNzgwMDAwMDAwfQ",
+            "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        )
+    }
+
+    /// RATCHET (task DHAN-REST-400 item 1): no token substring may EVER
+    /// appear in a captured body. Feeds a body that echoes the full JWT and
+    /// asserts neither the token nor any 20-char window of it survives.
+    #[test]
+    fn test_capture_rest_error_body_redacts_jwt() {
+        let jwt = fake_jwt();
+        let body = format!(
+            r#"{{"errorType":"Invalid_Authentication","errorCode":"DH-901","errorMessage":"token {jwt} rejected"}}"#
+        );
+        let out = capture_rest_error_body(&body);
+        assert!(!out.contains(&jwt), "full JWT leaked: {out}");
+        for start in 0..jwt.len().saturating_sub(20) {
+            let window = &jwt[start..start + 20];
+            assert!(
+                !out.contains(window),
+                "JWT window leaked: {window} in {out}"
+            );
+        }
+        assert!(out.contains("[REDACTED-JWT]"), "marker missing: {out}");
+    }
+
+    #[test]
+    fn test_capture_rest_error_body_preserves_dhan_error_fields() {
+        let body = r#"{"errorType":"Invalid_Request","errorCode":"DH-905","errorMessage":"Missing required fields"}"#;
+        let out = capture_rest_error_body(body);
+        assert!(out.contains("Invalid_Request"));
+        assert!(out.contains("DH-905"));
+        assert!(out.contains("Missing required fields"));
+    }
+
+    #[test]
+    fn test_capture_rest_error_body_truncates_to_300_chars() {
+        let waf_page = "<html>blocked</html>".repeat(100);
+        let out = capture_rest_error_body(&waf_page);
+        assert_eq!(out.chars().count(), REST_BODY_CAPTURE_MAX_CHARS);
+        assert!(out.starts_with("<html>blocked"));
+    }
+
+    #[test]
+    fn test_capture_rest_error_body_utf8_boundary_safe() {
+        let body = "😀".repeat(REST_BODY_CAPTURE_MAX_CHARS * 2);
+        let out = capture_rest_error_body(&body);
+        assert_eq!(out.chars().count(), REST_BODY_CAPTURE_MAX_CHARS);
+        assert!(out.chars().all(|c| c == '😀'));
+    }
+
+    #[test]
+    fn test_capture_rest_error_body_strips_control_chars() {
+        let out = capture_rest_error_body("line1\nline2\r\tline3\0end");
+        assert!(!out.contains('\n'));
+        assert!(!out.contains('\r'));
+        assert!(!out.contains('\t'));
+        assert!(!out.contains('\0'));
+        assert_eq!(out, "line1line2line3end");
+    }
+
+    #[test]
+    fn test_capture_rest_error_body_composes_url_param_redaction() {
+        let body =
+            "retry url https://auth.dhan.co/app/gen?dhanClientId=1106656882&pin=785478 failed";
+        let out = capture_rest_error_body(body);
+        assert!(!out.contains("1106656882"), "client ID leaked: {out}");
+        assert!(!out.contains("785478"), "PIN leaked: {out}");
+        assert!(out.contains("?[REDACTED]"));
+    }
+
+    #[test]
+    fn test_capture_rest_error_body_empty_is_empty() {
+        assert_eq!(capture_rest_error_body(""), "");
+    }
+
+    /// RATCHET (order-of-operations hole, found in self-review 2026-06-10):
+    /// a token split by an embedded control char must NOT be re-joined into
+    /// a leakable contiguous string. Control-strip runs BEFORE redaction.
+    #[test]
+    fn test_capture_rest_error_body_redacts_control_char_split_jwt() {
+        let jwt = fake_jwt();
+        let (head, tail) = jwt.split_at(8);
+        let body = format!("token {head}\n{tail} rejected");
+        let out = capture_rest_error_body(&body);
+        assert!(!out.contains(&jwt), "re-joined JWT leaked: {out}");
+        for start in 0..jwt.len().saturating_sub(20) {
+            let window = &jwt[start..start + 20];
+            assert!(
+                !out.contains(window),
+                "JWT window leaked: {window} in {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_redact_jwt_like_replaces_token() {
+        let jwt = fake_jwt();
+        let out = redact_jwt_like(&format!("token={jwt} end"));
+        assert!(!out.contains(&jwt));
+        assert!(out.contains("[REDACTED-JWT]"));
+        assert!(out.ends_with(" end"));
+    }
+
+    /// RATCHET (security review 2026-06-10, HIGH): an OPAQUE (non-`eyJ`)
+    /// credential echoed in a known JSON token field must still be redacted.
+    #[test]
+    fn test_capture_rest_error_body_redacts_opaque_token_json_fields() {
+        let body = r#"{"errorCode":"DH-901","accessToken":"opaque-key-9f8e7d6c5b4a3210","access_token": "another-opaque-value-123456","refreshToken":"rt-aabbccddeeff00112233","app_secret":"shh-secret-value-998877"}"#;
+        let out = capture_rest_error_body(body);
+        for leaked in [
+            "opaque-key-9f8e7d6c5b4a3210",
+            "another-opaque-value-123456",
+            "rt-aabbccddeeff00112233",
+            "shh-secret-value-998877",
+        ] {
+            assert!(
+                !out.contains(leaked),
+                "credential leaked: {leaked} in {out}"
+            );
+        }
+        assert!(out.contains("DH-901"), "error field must survive: {out}");
+        assert!(out.contains("[REDACTED]"));
+    }
+
+    /// RATCHET (security review 2026-06-10, MEDIUM): a percent-encoded JWT
+    /// fragment must not split the redaction run and leak.
+    #[test]
+    fn test_redact_jwt_like_handles_percent_encoded_run() {
+        let body = "token eyJhbGciOiJIUzI1%2BNiIsInR5cCI6IkpXVCJ9 end";
+        let out = redact_jwt_like(body);
+        assert!(!out.contains("hbGciOiJIUzI1"), "encoded JWT leaked: {out}");
+        assert!(out.contains("[REDACTED-JWT]"));
+    }
+
+    #[test]
+    fn test_redact_jwt_like_keeps_short_eyj_prose() {
+        // "eyJ" with a short tail is not a token — must survive verbatim.
+        let input = "the prefix eyJabc is not a token";
+        assert_eq!(redact_jwt_like(input), input);
+    }
+
+    #[test]
+    fn test_redact_jwt_like_multiple_tokens_all_redacted() {
+        let jwt = fake_jwt();
+        let out = redact_jwt_like(&format!("a {jwt} b {jwt} c"));
+        assert!(!out.contains(&jwt));
+        assert_eq!(out.matches("[REDACTED-JWT]").count(), 2);
+    }
+
+    #[test]
+    fn test_rest_body_capture_max_chars_is_300() {
+        // Pin the constant (task: bounded ≤300 chars).
+        assert_eq!(REST_BODY_CAPTURE_MAX_CHARS, 300);
     }
 
     #[test]

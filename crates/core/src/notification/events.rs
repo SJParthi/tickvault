@@ -1378,11 +1378,28 @@ impl NotificationEvent {
                          Mismatches: 0 | Missing: 0\n\
                          Every 1-minute candle matches the exchange record exactly."
                     )
+                } else if *compared == 0 {
+                    // DHAN-REST-400 (2026-06-10): the BLIND day. 776/776
+                    // fetch failures produced a header-only report file that
+                    // LOOKED like a perfect day. Say BLIND loudly — an empty
+                    // mismatch list must never read as a pass.
+                    format!(
+                        "\u{1f198} <b>Daily candle check @ 3:31 PM IST — BLIND</b>\n\
+                         Date: {trading_date_ist}\n\
+                         Checked NOTHING today. \
+                         Nothing could be compared — today's check cannot \
+                         vouch for the day's candles.\n\
+                         The day's report is empty because every data request \
+                         failed or returned nothing, NOT because the data was \
+                         perfect.\n\
+                         Instruments: {instruments} | Minutes compared: 0\n\
+                         What to do RIGHT NOW:\n\
+                         1. Check the REST health alerts for why requests failed.\n\
+                         2. Open the Cross-verify card on the operator portal.\n\
+                         3. Confirm the live feed itself stayed healthy today."
+                    )
                 } else {
-                    let coverage_note = if *compared == 0 {
-                        "\nNothing could be compared — today's check cannot \
-                         vouch for the day's candles."
-                    } else if *degraded {
+                    let coverage_note = if *degraded {
                         "\nCoverage was PARTIAL — some instrument data could \
                          not be fetched, so today's check cannot vouch for \
                          the full universe."
@@ -4089,6 +4106,23 @@ mod tests {
             event.to_message().contains("Nothing could be compared"),
             "compared==0 must carry the honest no-coverage wording"
         );
+    }
+
+    /// RATCHET (task DHAN-REST-400 item 2, 2026-06-10 incident): a
+    /// 776/776-fetch-failure day must say BLIND loudly — the empty-report
+    /// trap is spelled out so a header-only CSV can never again read as a
+    /// perfect day.
+    #[test]
+    fn test_cross_verify_1m_summary_blind_message_is_loud() {
+        let msg = cv_summary(0, 0, 0, true).to_message();
+        assert!(msg.contains("BLIND"), "{msg}");
+        assert!(msg.contains("Checked NOTHING today"), "{msg}");
+        assert!(
+            msg.contains("NOT because the data was perfect"),
+            "the empty-report trap must be spelled out: {msg}"
+        );
+        assert!(msg.contains("REST health alerts"), "{msg}");
+        assert!(!msg.contains("PASS"), "BLIND must never render PASS: {msg}");
     }
 
     #[test]
