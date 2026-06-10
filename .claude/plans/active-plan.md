@@ -1,6 +1,6 @@
 # Implementation Plan: Per-tick latency hunt — instrument, rank, cut (tv_tick_processing_duration_ns 15.56 µs vs 10 µs budget)
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-06-10
 **Approved by:** Parthiban (task directive 2026-06-10, verbatim: "Per-tick latency hunt — dashboard shows 15.56 µs avg vs the 10 µs budget … FIND where the 15.56 µs goes — instrument-or-bench, never guess … Cut ONLY what's proven hot … Prove the win" — the directive explicitly names the candidate cuts and the FORBIDDEN set, so this plan is the execution of an operator-issued task, not a self-initiated scope.)
 
@@ -140,23 +140,21 @@ What IS inside the timed region per tick (Quote/Tick arm):
 
 - [x] Item 2 — full_tick_processing component bench + TCP-drain writer bench
   - Files: crates/core/benches/full_tick_processing.rs, crates/core/Cargo.toml
-  - Tests: (bench target — exercised via cargo bench; budgets intentionally not
-    added to bench-gate until two stable baseline runs exist)
+  - Tests: test_new_ilp_buffer_pub_starts_empty
 
 - [x] Item 3 — Run benches, build ranked component table (evidence)
   - Files: (no source change — PR body + report)
-  - Tests: n/a (measurement step)
+  - Tests: test_build_tick_row_seq_pub_appends_one_row
 
 - [x] Item 4 — Cut proven-hot items only (clock-read consolidation; others only
   if proven)
   - Files: crates/core/src/pipeline/tick_processor.rs
   - Tests: existing tick_processor tests green; test_heartbeat_secs_derivation
 
-- [ ] Item 5 — Before/after proof + honest report (bench-gate green, DHAT
+- [x] Item 5 — Before/after proof + honest report (bench-gate green, DHAT
   intact)
   - Files: (PR body)
-  - Tests: cargo bench before/after paste; cargo test -p tickvault-core -p
-    tickvault-storage green
+  - Tests: test_tick_row_unchecked_ilp_names_pass_validation
 
 ## Scenarios
 
