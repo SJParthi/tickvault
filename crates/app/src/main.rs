@@ -3460,14 +3460,10 @@ async fn main() -> Result<()> {
                     tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
 
                     let main_active = readiness_health.websocket_connections() as usize;
-                    let d20 = readiness_health.depth_20_connections() as usize;
-                    let d200 = readiness_health.depth_200_connections() as usize;
                     let oms = readiness_health.order_update_connected();
                     let token_secs = readiness_health.token_remaining_secs();
                     info!(
                         main_feed = main_active,
-                        depth_20 = d20,
-                        depth_200 = d200,
                         order_update = oms,
                         token_remaining_secs = token_secs,
                         "PROOF: market-open readiness confirmation fired @ 09:14:00 IST"
@@ -3483,8 +3479,6 @@ async fn main() -> Result<()> {
                             config.subscription.scope,
                             config.dhan.max_websocket_connections,
                         ),
-                        depth_20_active: d20,
-                        depth_200_active: d200,
                         order_update_active: oms,
                         token_remaining_secs: token_secs,
                     });
@@ -3538,13 +3532,9 @@ async fn main() -> Result<()> {
                     tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
 
                     let main_active = heartbeat_health.websocket_connections() as usize;
-                    let d20 = heartbeat_health.depth_20_connections() as usize;
-                    let d200 = heartbeat_health.depth_200_connections() as usize;
                     let oms = heartbeat_health.order_update_connected();
                     info!(
                         main_feed = main_active,
-                        depth_20 = d20,
-                        depth_200 = d200,
                         order_update = oms,
                         "PROOF: market-open streaming confirmation fired @ 09:15:30 IST"
                     );
@@ -3565,8 +3555,6 @@ async fn main() -> Result<()> {
                         heartbeat_notifier.notify(NotificationEvent::MarketOpenStreamingFailed {
                             main_feed_active: main_active,
                             main_feed_total: expected_main_feed_total,
-                            depth_20_active: d20,
-                            depth_200_active: d200,
                             order_update_active: oms,
                         });
                     } else {
@@ -3574,8 +3562,6 @@ async fn main() -> Result<()> {
                             NotificationEvent::MarketOpenStreamingConfirmation {
                                 main_feed_active: main_active,
                                 main_feed_total: expected_main_feed_total,
-                                depth_20_active: d20,
-                                depth_200_active: d200,
                                 order_update_active: oms,
                             },
                         );
@@ -3943,14 +3929,12 @@ async fn main() -> Result<()> {
 
                         // ---- WS_health -----------------------------------
                         let active_main = slo_health.websocket_connections() as f64;
-                        let active_d20 = slo_health.depth_20_connections() as f64;
-                        let active_d200 = slo_health.depth_200_connections() as f64;
                         let active_ou = if slo_health.order_update_connected() {
                             1.0
                         } else {
                             0.0
                         };
-                        let active_total = active_main + active_d20 + active_d200 + active_ou;
+                        let active_total = active_main + active_ou;
                         let raw_ws_health = active_total / slo_ws_expected_total;
                         // Off-hours: by-design sleeping connections must
                         // NOT degrade the SLO. Pin to 1.0.
