@@ -201,6 +201,140 @@ fn scan_legacy_spill(dir: &Path) -> (u64, u64, Option<String>) {
     (count, bytes, newest.map(|(_, n)| n))
 }
 
+/// Default cross-verify artefact directory. Matches `CROSS_VERIFY_CSV_DIR`
+/// in `crates/app/src/cross_verify_1m_boot.rs` (the 15:31 IST post-market
+/// run writes `cross-verify-1m-YYYY-MM-DD.csv` + a sibling
+/// `cross-verify-1m-YYYY-MM-DD.summary.json` there).
+const DEFAULT_CROSS_VERIFY_DIR: &str = "data/cross-verify";
+const CROSS_VERIFY_DIR_ENV: &str = "TV_CROSS_VERIFY_DIR";
+const CROSS_VERIFY_CSV_PREFIX: &str = "cross-verify-1m-";
+const CROSS_VERIFY_CSV_SUFFIX: &str = ".csv";
+const CROSS_VERIFY_SUMMARY_SUFFIX: &str = ".summary.json";
+/// RAM cap for serving the mismatch CSV inline. A normal day's file is a
+/// few KB (mismatch rows only); beyond this cap the endpoint serves the
+/// summary with `csv: null` instead of slurping the file into memory.
+const MAX_CROSS_VERIFY_CSV_BYTES: u64 = 10 * 1024 * 1024;
+
+fn resolve_cross_verify_dir() -> PathBuf {
+    if let Ok(custom) = std::env::var(CROSS_VERIFY_DIR_ENV)
+        && !custom.trim().is_empty()
+    {
+        return PathBuf::from(custom);
+    }
+    PathBuf::from(DEFAULT_CROSS_VERIFY_DIR)
+}
+
+/// Newest per-day mismatch CSV by lexical order (filenames embed
+/// ISO-8601 dates). STRICT filename predicate — both the
+/// `cross-verify-1m-` prefix AND the `.csv` suffix are required, so the
+/// sibling `.summary.json` (which shares the prefix and sorts AFTER the
+/// `.csv` for the same date) and any foreign/symlinked file are never
+/// selected (2026-06-10 pre-impl security review).
+fn newest_cross_verify_csv(dir: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut matches: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                n.starts_with(CROSS_VERIFY_CSV_PREFIX) && n.ends_with(CROSS_VERIFY_CSV_SUFFIX)
+            })
+        })
+        .collect();
+    matches.sort();
+    matches.pop()
+}
+
+/// GET /api/debug/cross-verify/latest — the latest post-market 1-minute
+/// cross-verification artefacts (visibility directive 2026-06-10).
+///
+/// Returns JSON:
+/// ```json
+/// {
+///   "date": "2026-06-10",
+///   "csv_file": "cross-verify-1m-2026-06-10.csv",
+///   "mismatch_rows": 0,
+///   "summary": { "compared": 91230, "mismatches": 0, ... } | null,
+///   "csv": "run_ts,trading_date,...\n"
+/// }
+/// ```
+///
+/// `summary` is the parsed sibling `.summary.json` (null for runs that
+/// pre-date the summary artefact). 404 with a GENERIC error body when no
+/// run has happened yet — the resolved filesystem path is deliberately
+/// NOT disclosed. Read-only; never blocks the app.
+pub async fn cross_verify_latest() -> impl IntoResponse {
+    let dir = resolve_cross_verify_dir();
+    // Dynamic operator data — never cache (post-impl security review).
+    let headers = || {
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ]
+    };
+    let not_found = || {
+        (
+            StatusCode::NOT_FOUND,
+            headers(),
+            "{\"error\":\"no cross-verify run yet\"}".to_string(),
+        )
+    };
+    let Some(csv_path) = newest_cross_verify_csv(&dir) else {
+        return not_found();
+    };
+    // Bounded read (post-impl security review): a pathological mismatch
+    // file is not slurped into RAM — `csv` goes null and the caller falls
+    // back to the sibling summary counts.
+    let csv_bytes = tokio::fs::metadata(&csv_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let (csv, mismatch_rows) = if csv_bytes > MAX_CROSS_VERIFY_CSV_BYTES {
+        (serde_json::Value::Null, serde_json::Value::Null)
+    } else {
+        let Ok(csv) = tokio::fs::read_to_string(&csv_path).await else {
+            return not_found();
+        };
+        // The CSV is header + one line per mismatched field-cell.
+        let rows = csv.lines().filter(|l| !l.trim().is_empty()).count() as u64;
+        (
+            serde_json::Value::String(csv),
+            serde_json::json!(rows.saturating_sub(1)),
+        )
+    };
+    let file_name = csv_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let date = file_name
+        .strip_prefix(CROSS_VERIFY_CSV_PREFIX)
+        .and_then(|rest| rest.strip_suffix(CROSS_VERIFY_CSV_SUFFIX))
+        .unwrap_or_default()
+        .to_string();
+    // Sibling summary JSON (written by the same run); null when absent
+    // or unparseable (runs that pre-date the summary artefact).
+    let summary_path = dir.join(format!(
+        "{CROSS_VERIFY_CSV_PREFIX}{date}{CROSS_VERIFY_SUMMARY_SUFFIX}"
+    ));
+    let summary: serde_json::Value = match tokio::fs::read_to_string(&summary_path).await {
+        Ok(body) => serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
+        Err(_) => serde_json::Value::Null,
+    };
+    // serde_json builds the body — the CSV payload (newlines, quotes) is
+    // escaped correctly by construction, never by hand.
+    let body = serde_json::json!({
+        "date": date,
+        "csv_file": file_name,
+        "csv_bytes": csv_bytes,
+        "mismatch_rows": mismatch_rows,
+        "summary": summary,
+        "csv": csv,
+    })
+    .to_string();
+    (StatusCode::OK, headers(), body)
+}
+
 fn json_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -481,6 +615,132 @@ mod tests {
         assert!(body_str.contains("\"file_count\":0"));
         unsafe {
             std::env::remove_var(SPILL_DIR_ENV);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // GET /api/debug/cross-verify/latest (visibility directive 2026-06-10)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn newest_cross_verify_csv_excludes_summary_json_and_foreign_files() {
+        // Pre-impl findings H3 + S-H2: the sibling .summary.json shares the
+        // prefix and sorts AFTER the .csv for the same date — the strict
+        // .csv suffix predicate must keep it (and foreign files) out.
+        let tmp = mktemp("cv_newest");
+        let dir = tmp.path();
+        fs::write(dir.join("cross-verify-1m-2026-06-09.csv"), "h\n").unwrap();
+        fs::write(dir.join("cross-verify-1m-2026-06-10.csv"), "h\n").unwrap();
+        fs::write(dir.join("cross-verify-1m-2026-06-10.summary.json"), "{}").unwrap();
+        fs::write(dir.join("evil.csv"), "h\n").unwrap();
+        fs::write(dir.join("unrelated.txt"), "x").unwrap();
+        let newest = newest_cross_verify_csv(dir).expect("should find a csv");
+        assert_eq!(
+            newest.file_name().unwrap().to_str().unwrap(),
+            "cross-verify-1m-2026-06-10.csv"
+        );
+    }
+
+    #[test]
+    fn newest_cross_verify_csv_returns_none_when_dir_missing_or_empty() {
+        assert!(newest_cross_verify_csv(Path::new("/nonexistent/cv-test")).is_none());
+        let tmp = mktemp("cv_empty");
+        assert!(newest_cross_verify_csv(tmp.path()).is_none());
+    }
+
+    #[tokio::test]
+    async fn cross_verify_latest_returns_404_when_missing() {
+        let _env = env_guard();
+        unsafe {
+            std::env::set_var(CROSS_VERIFY_DIR_ENV, "/nonexistent-tv-cross-verify-test");
+        }
+        let response = cross_verify_latest().await.into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert!(body_str.contains("no cross-verify run yet"));
+        // Pre-impl finding S-M1: the resolved filesystem path must NOT be
+        // disclosed in the 404 body.
+        assert!(!body_str.contains("nonexistent-tv-cross-verify-test"));
+        unsafe {
+            std::env::remove_var(CROSS_VERIFY_DIR_ENV);
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_verify_latest_returns_200_with_content() {
+        let _env = env_guard();
+        let tmp = mktemp("cv_latest");
+        let csv = "run_ts,trading_date,security_id\n1,2026-06-10,13\n";
+        fs::write(tmp.path().join("cross-verify-1m-2026-06-10.csv"), csv).unwrap();
+        unsafe {
+            std::env::set_var(CROSS_VERIFY_DIR_ENV, tmp.path().to_str().unwrap());
+        }
+        let response = cross_verify_latest().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert_eq!(v["date"], "2026-06-10");
+        assert_eq!(v["csv_file"], "cross-verify-1m-2026-06-10.csv");
+        assert_eq!(v["mismatch_rows"], 1, "header excluded from the count");
+        assert!(v["summary"].is_null(), "no summary.json on disk → null");
+        assert_eq!(v["csv"].as_str().unwrap(), csv, "CSV served verbatim");
+        unsafe {
+            std::env::remove_var(CROSS_VERIFY_DIR_ENV);
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_verify_latest_merges_summary_json() {
+        let _env = env_guard();
+        let tmp = mktemp("cv_summary");
+        fs::write(
+            tmp.path().join("cross-verify-1m-2026-06-10.csv"),
+            "header-only\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("cross-verify-1m-2026-06-10.summary.json"),
+            r#"{"compared":91230,"mismatches":0,"degraded":false}"#,
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var(CROSS_VERIFY_DIR_ENV, tmp.path().to_str().unwrap());
+        }
+        let response = cross_verify_latest().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert_eq!(v["mismatch_rows"], 0, "header-only CSV = zero mismatches");
+        assert_eq!(v["summary"]["compared"], 91_230);
+        assert_eq!(v["summary"]["degraded"], false);
+        unsafe {
+            std::env::remove_var(CROSS_VERIFY_DIR_ENV);
+        }
+    }
+
+    #[test]
+    fn resolve_cross_verify_dir_default_and_override() {
+        let _env = env_guard();
+        unsafe {
+            std::env::remove_var(CROSS_VERIFY_DIR_ENV);
+        }
+        assert_eq!(
+            resolve_cross_verify_dir(),
+            PathBuf::from(DEFAULT_CROSS_VERIFY_DIR)
+        );
+        unsafe {
+            std::env::set_var(CROSS_VERIFY_DIR_ENV, "/tmp/tv-cv-test");
+        }
+        assert_eq!(resolve_cross_verify_dir(), PathBuf::from("/tmp/tv-cv-test"));
+        unsafe {
+            std::env::remove_var(CROSS_VERIFY_DIR_ENV);
         }
     }
 

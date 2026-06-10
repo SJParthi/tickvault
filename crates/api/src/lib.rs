@@ -7,6 +7,7 @@
 //! - `GET /api/debug/logs/summary` — Claude MCP read-only log summary
 //! - `GET /api/debug/logs/jsonl/latest` — Claude MCP read-only error JSONL
 //! - `GET /api/debug/spill/status` — spill disk-health snapshot
+//! - `GET /api/debug/cross-verify/latest` — latest 15:31 IST cross-verify CSV + summary
 //!
 //! # AWS-lifecycle PR #7d (2026-05-19) — frontend retired
 //! Every `/portal/*` HTML route + the dead `/api/option-chain`,
@@ -131,6 +132,13 @@ pub fn build_router_with_auth(
         .route(
             "/api/debug/spill/status",
             axum::routing::get(handlers::debug::spill_status),
+        )
+        // Visibility directive 2026-06-10: latest post-market 1-minute
+        // cross-verify artefacts (CSV + summary) for the operator portal
+        // Cross-verify card + MCP sessions.
+        .route(
+            "/api/debug/cross-verify/latest",
+            axum::routing::get(handlers::debug::cross_verify_latest),
         );
 
     // PR #2 (2026-05-18): conditional `/api/movers/v2` route + the

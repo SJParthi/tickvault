@@ -437,5 +437,59 @@ class HtmlWipeButton(unittest.TestCase):
         self.assertIn("audit", html)
 
 
+class ParseCrossVerify(unittest.TestCase):
+    def test_parse_cross_verify(self) -> None:
+        stdout = (
+            "CV_DATE=2026-06-10\n"
+            "CV_MISMATCH_ROWS=0\n"
+            "CV_INSTRUMENTS=243\n"
+            "CV_COMPARED=91230\n"
+            "CV_MISSING=0\n"
+            "CV_DEGRADED=False\n"
+        )
+        got = handler._parse_cross_verify(stdout)
+        self.assertEqual(got["date"], "2026-06-10")
+        self.assertEqual(got["mismatch_rows"], "0")
+        self.assertEqual(got["instruments"], "243")
+        self.assertEqual(got["compared"], "91230")
+        self.assertEqual(got["missing"], "0")
+        self.assertEqual(got["degraded"], "False")
+
+    def test_parse_cross_verify_empty_stdout_yields_blank_fields(self) -> None:
+        # Box stopped / app down / no run yet → blank fields → the card
+        # shows a truthful "no run yet", never a fabricated PASS.
+        got = handler._parse_cross_verify("")
+        self.assertEqual(got["date"], "")
+        self.assertEqual(got["compared"], "")
+        self.assertEqual(got["degraded"], "")
+
+
+class CrossVerifyCard(unittest.TestCase):
+    def test_html_has_cross_verify_card(self) -> None:
+        html = handler._console_html()
+        self.assertIn("loadCrossVerify()", html)
+        self.assertIn('id="cvshields"', html)
+        self.assertIn("cross-verify — daily candle check vs exchange record", html)
+        self.assertIn("3:31 PM IST", html)
+
+    def test_card_renders_values_through_esc(self) -> None:
+        # 2026-06-10 pre-impl security review (S-H1): every box-derived
+        # string field in the card must pass through esc() before landing
+        # in innerHTML.
+        html = handler._console_html()
+        for field in ("j.date", "j.instruments", "j.compared", "j.mismatch_rows", "j.missing"):
+            self.assertIn(f"esc({field}", html, f"{field} must be esc()-wrapped")
+
+    def test_card_pass_requires_compared_positive(self) -> None:
+        # False-OK guard parity with the Telegram event severity: PASS
+        # requires compared>0 — "nothing compared" must never render PASS.
+        html = handler._console_html()
+        self.assertIn("compared>0", html)
+
+    def test_cross_verify_action_is_read_only(self) -> None:
+        # Read-only action: must NOT be market-hours-blocked.
+        self.assertNotIn("cross_verify", handler._DESTRUCTIVE)
+
+
 if __name__ == "__main__":
     unittest.main()
