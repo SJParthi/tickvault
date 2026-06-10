@@ -577,6 +577,7 @@ pub async fn run_cross_verify_1m(
     }
 
     write_csv_file(csv_dir, trading_date, &csv).await;
+    write_summary_file(csv_dir, trading_date, &summary).await;
 
     if summary.stats.mismatches > 0 {
         error!(
@@ -675,6 +676,54 @@ async fn write_csv_file(csv_dir: &str, trading_date: NaiveDate, contents: &str) 
         error!(?err, path = %path.display(), "cross_verify_1m: CSV write failed");
     } else {
         info!(path = %path.display(), "cross_verify_1m: mismatch CSV written");
+    }
+}
+
+/// Build the per-day machine-readable summary JSON written next to the
+/// mismatch CSV (`cross-verify-1m-YYYY-MM-DD.summary.json`). Consumed by
+/// `GET /api/debug/cross-verify/latest` and the operator-portal
+/// Cross-verify card (visibility directive 2026-06-10). Pure.
+#[must_use]
+pub fn summary_json_contents(trading_date: NaiveDate, summary: &CrossVerify1mSummary) -> String {
+    json!({
+        "trading_date": trading_date.format("%Y-%m-%d").to_string(),
+        "instruments_checked": summary.instruments_checked,
+        "compared": summary.stats.compared,
+        "mismatches": summary.stats.mismatches,
+        "missing_ours": summary.stats.missing_ours,
+        "fetch_failures": summary.fetch_failures,
+        "degraded": summary.degraded,
+    })
+    .to_string()
+}
+
+/// Write the day's summary JSON to
+/// `<csv_dir>/cross-verify-1m-YYYY-MM-DD.summary.json`. Fail-soft like the
+/// CSV: a write error logs but never blocks (the audit table + the Telegram
+/// event built from the in-memory summary remain the durable record). The
+/// path is a fixed dir + strict date string — cannot traverse.
+async fn write_summary_file(
+    csv_dir: &str,
+    trading_date: NaiveDate,
+    summary: &CrossVerify1mSummary,
+) {
+    if let Err(err) = tokio::fs::create_dir_all(csv_dir).await {
+        warn!(
+            ?err,
+            csv_dir, "cross_verify_1m: could not create summary dir"
+        );
+        return;
+    }
+    let file_name = format!(
+        "cross-verify-1m-{}.summary.json",
+        trading_date.format("%Y-%m-%d")
+    );
+    let path = std::path::Path::new(csv_dir).join(file_name);
+    let contents = summary_json_contents(trading_date, summary);
+    if let Err(err) = tokio::fs::write(&path, contents).await {
+        error!(?err, path = %path.display(), "cross_verify_1m: summary JSON write failed");
+    } else {
+        info!(path = %path.display(), "cross_verify_1m: summary JSON written");
     }
 }
 
@@ -907,5 +956,42 @@ mod tests {
     #[test]
     fn default_csv_dir_is_under_data() {
         assert_eq!(default_csv_dir(), "data/cross-verify");
+    }
+
+    #[test]
+    fn summary_json_contents_round_trips_fields() {
+        let date = NaiveDate::from_ymd_opt(2026, 6, 10).expect("date");
+        let summary = CrossVerify1mSummary {
+            instruments_checked: 243,
+            fetch_failures: 2,
+            stats: CompareStats {
+                compared: 91_230,
+                mismatches: 42,
+                missing_ours: 15,
+            },
+            degraded: false,
+        };
+        let json = summary_json_contents(date, &summary);
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(v["trading_date"], "2026-06-10");
+        assert_eq!(v["instruments_checked"], 243);
+        assert_eq!(v["compared"], 91_230);
+        assert_eq!(v["mismatches"], 42);
+        assert_eq!(v["missing_ours"], 15);
+        assert_eq!(v["fetch_failures"], 2);
+        assert_eq!(v["degraded"], false);
+    }
+
+    #[test]
+    fn summary_json_marks_degraded() {
+        let date = NaiveDate::from_ymd_opt(2026, 6, 10).expect("date");
+        let summary = CrossVerify1mSummary {
+            degraded: true,
+            ..Default::default()
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&summary_json_contents(date, &summary)).expect("valid JSON");
+        assert_eq!(v["degraded"], true);
+        assert_eq!(v["compared"], 0);
     }
 }
