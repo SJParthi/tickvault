@@ -214,10 +214,10 @@ Branch protection ON: Build & Verify, Security & Audit, Commit Lint, Secret Scan
 | Database | questdb-rs | 6.1.0 |
 | Cache | redis | 1.1.0 |
 | Metrics | metrics + prometheus-exporter | 0.24.3 / 0.18.1 |
-| Tracing | tracing + opentelemetry | 0.1.44 / 0.31.0 |
+| Tracing | tracing + opentelemetry | 0.1.44 / 0.32.0 |
 | Serialization | serde + serde_json | 1.0.228 / 1.0.149 |
 | Zero-copy | rkyv | 0.8.15 |
-| Auth | arc-swap + jsonwebtoken + totp-rs | 1.9.0 / 10.3.0 / 5.7.1 |
+| Auth | arc-swap + totp-rs | 1.9.0 / 5.7.1 |
 | Secrets | secrecy + zeroize | 0.10.3 / 1.8.2 |
 | AWS | aws-config + aws-sdk-ssm + aws-sdk-sns | 1.8.15 / 1.108.0 / 1.98.0 |
 | Config | figment + toml | 0.10.19 / 1.1.0 |
