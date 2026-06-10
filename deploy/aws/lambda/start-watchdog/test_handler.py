@@ -36,11 +36,14 @@ class _FakeEc2:
         state: str | None,
         launch_time: datetime | None = None,
         start_raises: bool = False,
+        stop_raises: bool = False,
     ) -> None:
         self._state = state
         self._launch_time = launch_time
         self._start_raises = start_raises
+        self._stop_raises = stop_raises
         self.start_calls: list[list[str]] = []
+        self.stop_calls: list[list[str]] = []
 
     def describe_instances(self, *, InstanceIds: list[str]) -> dict[str, Any]:  # noqa: N803
         if self._state is None:
@@ -55,6 +58,12 @@ class _FakeEc2:
             raise RuntimeError("AccessDenied")
         self.start_calls.append(InstanceIds)
         return {"StartingInstances": [{"InstanceId": InstanceIds[0]}]}
+
+    def stop_instances(self, *, InstanceIds: list[str]) -> dict[str, Any]:  # noqa: N803
+        if self._stop_raises:
+            raise RuntimeError("AccessDenied")
+        self.stop_calls.append(InstanceIds)
+        return {"StoppingInstances": [{"InstanceId": InstanceIds[0]}]}
 
 
 def _wire(monkeypatch, sns: _FakeSns, ec2: _FakeEc2, now: datetime = IN_WINDOW_NOW) -> None:
@@ -140,6 +149,67 @@ def test_check_describe_error_treated_as_not_running(monkeypatch) -> None:
     # An error means we can't confirm 'running' → must alert, not stay silent.
     assert out["alerted"] is True
     assert out["state"] == "unknown"
+
+
+# Stop-check window: 16:45 IST = 11:15 UTC; the stop trigger is 11:00 UTC.
+STOP_CHECK_NOW = datetime(2026, 6, 10, 11, 15, tzinfo=timezone.utc)
+MORNING_LAUNCH = datetime(2026, 6, 10, 3, 13, tzinfo=timezone.utc)  # since morning
+EVENING_LAUNCH = datetime(2026, 6, 10, 11, 46, tzinfo=timezone.utc)  # manual 17:16 IST
+
+
+def test_stop_check_stopped_box_stays_silent(monkeypatch) -> None:
+    sns = _FakeSns()
+    ec2 = _FakeEc2("stopped")
+    _wire(monkeypatch, sns, ec2, now=STOP_CHECK_NOW)
+    out = handler.lambda_handler({"mode": "stop_check"})
+    assert out["alerted"] is False
+    assert sns.published == []
+
+
+def test_stop_check_running_since_morning_self_stops_and_pages(monkeypatch) -> None:
+    """2026-06-10 incident: 16:30 stop silently failed; box (up since 08:43)
+    still running at 18:18 IST. The 16:45 stop_check must stop it + page."""
+    sns = _FakeSns()
+    ec2 = _FakeEc2("running", launch_time=MORNING_LAUNCH)
+    _wire(monkeypatch, sns, ec2, now=STOP_CHECK_NOW)
+    out = handler.lambda_handler({"mode": "stop_check"})
+    assert out["alerted"] is True
+    assert out["self_stopped"] is True
+    assert ec2.stop_calls == [["i-0test"]]
+    assert "stopped the box itself" in sns.published[0]["subject"]
+
+
+def test_stop_check_manual_evening_session_is_never_touched(monkeypatch) -> None:
+    """Operator lock: out-of-window runs are manual + deliberate. A box
+    launched AFTER the 16:30 trigger must be left alone, silently."""
+    sns = _FakeSns()
+    ec2 = _FakeEc2("running", launch_time=EVENING_LAUNCH)
+    _wire(monkeypatch, sns, ec2, now=STOP_CHECK_NOW)
+    out = handler.lambda_handler({"mode": "stop_check"})
+    assert out["alerted"] is False
+    assert ec2.stop_calls == []
+    assert sns.published == []
+
+
+def test_stop_check_unknown_launch_pages_but_never_stops(monkeypatch) -> None:
+    sns = _FakeSns()
+    ec2 = _FakeEc2("running", launch_time=None)
+    _wire(monkeypatch, sns, ec2, now=STOP_CHECK_NOW)
+    out = handler.lambda_handler({"mode": "stop_check"})
+    assert out["alerted"] is True
+    assert out["self_stopped"] is False
+    assert ec2.stop_calls == []  # fail-safe: never kill a possible manual session
+    assert "still running" in sns.published[0]["subject"]
+
+
+def test_stop_check_self_stop_failure_pages_manual(monkeypatch) -> None:
+    sns = _FakeSns()
+    ec2 = _FakeEc2("running", launch_time=MORNING_LAUNCH, stop_raises=True)
+    _wire(monkeypatch, sns, ec2, now=STOP_CHECK_NOW)
+    out = handler.lambda_handler({"mode": "stop_check"})
+    assert out["alerted"] is True
+    assert out["self_stopped"] is False
+    assert "manual stop NEEDED" in sns.published[0]["subject"]
 
 
 def test_default_mode_is_check(monkeypatch) -> None:

@@ -55,6 +55,9 @@ ALERTS_TOPIC_ARN = os.environ.get("ALERTS_TOPIC_ARN", "")
 # The daily_start EventBridge rule fires at 03:00 UTC (= 08:30 IST, Mon-Fri).
 START_TRIGGER_UTC_HOUR = 3
 START_TRIGGER_UTC_MINUTE = 0
+# The daily_stop EventBridge rule fires at 11:00 UTC (= 16:30 IST, Mon-Fri).
+STOP_TRIGGER_UTC_HOUR = 11
+STOP_TRIGGER_UTC_MINUTE = 0
 # EC2 start -> running takes <1 min; anything launched more than this many
 # minutes after the trigger means the scheduled start did NOT do it.
 LATE_START_GRACE_MINUTES = 5
@@ -102,6 +105,21 @@ def _try_self_start(ec2_client: Any, instance_id: str) -> bool:
         return False
 
 
+def _try_self_stop(ec2_client: Any, instance_id: str) -> bool:
+    """Issue ec2:StopInstances. Returns True if the call was accepted.
+
+    Never raises — if the self-heal fails, the page tells the operator to
+    stop the box manually instead.
+    """
+    try:
+        ec2_client.stop_instances(InstanceIds=[instance_id])
+        logger.info("self-heal stop_instances issued for %s", instance_id)
+        return True
+    except Exception as exc:  # noqa: BLE001 — watchdog must never crash
+        logger.error("self-heal stop_instances FAILED: %s", exc)
+        return False
+
+
 def _publish(sns_client: Any, subject: str, message: str) -> None:
     if not ALERTS_TOPIC_ARN:
         logger.warning("ALERTS_TOPIC_ARN unset — cannot publish: %s", subject)
@@ -126,6 +144,76 @@ def lambda_handler(event: dict[str, Any], _context: Any = None) -> dict[str, Any
             "8:45 AM watchdog will check and start the box itself if needed.",
         )
         return {"mode": "ping", "published": True}
+
+    if mode == "stop_check":
+        # @ 16:45 IST (11:15 UTC Mon-Fri): the daily_stop EventBridge rule
+        # fired at 16:30 IST — verify the box actually stopped. 2026-06-10
+        # incident: BOTH the 08:30 start AND the 16:30 stop silently failed
+        # the same day (EventBridge -> SSM breakage is systemic, not
+        # transient). Self-heal rule: stop ONLY a box whose LaunchTime is
+        # BEFORE today's 16:30 trigger (i.e. left running by the failed
+        # cron). A box launched AFTER 16:30 is an operator's deliberate
+        # manual evening session ("whenever manually i need to run the
+        # instance i will do it") and is NEVER touched.
+        ec2_client = boto3.client("ec2")
+        state, launch_time = _instance_info(ec2_client, EC2_INSTANCE_ID)
+        if state != "running":
+            logger.info("stop_check OK — instance is '%s'; staying silent", state)
+            return {"mode": "stop_check", "state": state, "alerted": False}
+        now = _now()
+        stop_trigger = now.replace(
+            hour=STOP_TRIGGER_UTC_HOUR,
+            minute=STOP_TRIGGER_UTC_MINUTE,
+            second=0,
+            microsecond=0,
+        )
+        if launch_time is not None and launch_time >= stop_trigger:
+            logger.info(
+                "stop_check — running but launched %s (after 16:30 IST): manual "
+                "evening session, leaving it alone",
+                launch_time,
+            )
+            return {"mode": "stop_check", "state": state, "alerted": False}
+        if launch_time is None:
+            # Can't prove it isn't a manual session — page, don't stop.
+            _publish(
+                sns_client,
+                "16:30 auto-stop FAILED — box still running",
+                "🆘 The 4:30 PM IST auto-stop did NOT stop the box and I could "
+                "not read its launch time, so I won't risk killing a manual "
+                "session. If you are NOT using it right now, press "
+                "'Stop instance' on the portal — it bills every hour it runs.",
+            )
+            logger.error("stop_check FAILED — running, launch_time unknown — paged")
+            return {"mode": "stop_check", "state": state, "alerted": True, "self_stopped": False}
+        self_stopped = _try_self_stop(ec2_client, EC2_INSTANCE_ID)
+        if self_stopped:
+            _publish(
+                sns_client,
+                "16:30 auto-stop FAILED — watchdog stopped the box itself",
+                "🆘 The 4:30 PM IST auto-stop did NOT stop the box (it had been "
+                "running since before 4:30 PM). I have sent the stop command "
+                "myself. If you WANTED it running this evening, just press "
+                "'Start instance' on the portal — a box you start manually "
+                "after 4:30 PM is never auto-stopped. Also investigate why the "
+                "4:30 PM stop failed: AWS console → Systems Manager → "
+                "Automation executions for AWS-StopEC2Instance.",
+            )
+        else:
+            _publish(
+                sns_client,
+                "16:30 auto-stop FAILED — manual stop NEEDED",
+                f"🆘 The 4:30 PM IST auto-stop did NOT stop the box — and the "
+                "watchdog's own stop attempt ALSO failed. Press 'Stop instance' "
+                "on the portal, or run "
+                f"`aws ec2 stop-instances --instance-ids {EC2_INSTANCE_ID} "
+                "--region ap-south-1`. It bills every hour it runs.",
+            )
+        logger.error(
+            "stop_check FAILED — instance running past stop, self_stopped=%s — paged",
+            self_stopped,
+        )
+        return {"mode": "stop_check", "state": state, "alerted": True, "self_stopped": self_stopped}
 
     # mode == "check" (default): verify the box actually started — and fix it.
     ec2_client = boto3.client("ec2")
