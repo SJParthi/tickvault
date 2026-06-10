@@ -143,3 +143,44 @@ All pins below equal `max_stable_version` on 2026-06-10 → **hold (current), no
 4. **uuid 1.23.3, zerocopy 0.8.52:** patch-level, zero/trivial call-site exposure — hold, fold into the next approved maintenance window.
 5. **Everything else (64 pins): already at latest, audit-clean — hold.**
 6. **Optional:** dependabot `groups:` config for the otel family to prevent recurring un-mergeable single-crate bumps.
+
+---
+
+## 6. 🧃 EASY VIEW — the auto-driver scoreboard (operator-charter §G format)
+
+> Sir, imagine your juice shop has **73 ingredients** on the shelf. We checked every single
+> one against the market today: **64 are the freshest available 🟢, 0 have any poison/safety
+> problem 🛡️, 9 need a look 🟡 — and the delivery boy (dependabot) tried to swap ONE part of
+> a 4-part juicer motor with a new part that doesn't fit the other 3. We say NO to that
+> delivery ❌.**
+
+### The big scoreboard
+
+| What we checked | Result | Score |
+|---|---|---|
+| 🛡️ Security / poison check (CVE scan, 521 packages deep) | ZERO problems found | ✅ 100% clean |
+| 🟢 Already the newest version available | 64 of 73 | ✅ 88% perfectly fresh |
+| 🟡 Newer version exists | 9 of 73 | see §3 |
+| 💀 Bought but NEVER used (wasted shelf space) | 3 found (jsonwebtoken, ringbuf, zerocopy) | flagged for removal |
+
+### The delivery we reject — dependabot PR #938
+
+| Question | Answer |
+|---|---|
+| What did the robot try? | Upgrade **1 of 4** telemetry parts (`opentelemetry_sdk` 0.31 → 0.32) |
+| Why is that bad? | The 4 parts are a **matched set** — like 4 tyres of one car. One new tyre + 3 old tyres = the build won't even compile |
+| Proof? | The PR's own lockfile shows TWO copies of the same library fighting each other (§1) |
+| Verdict | 🔴 **CLOSE this PR** |
+| Right way? | ✅ ONE upgrade changing **all 4 tyres together** — only after operator dated approval |
+
+### The 3 buttons for the operator (nothing done without approval)
+
+| # | Decision | Recommendation |
+|---|---|---|
+| 1 | Dependabot PR #938 | ❌ Close — cannot compile by design |
+| 2 | 4-together telemetry upgrade (otel 0.32.0 + sdk 0.32.1 + otlp 0.32.0 + tracing-otel 0.33.0) | ✅ Approve one combined PR — every call site checked, zero breakage hits us |
+| 3 | Delete the 3 never-used ingredients | 🗑️ Approve — less to audit, less to worry |
+
+**Honest envelope:** "fresh" = crates.io snapshot 2026-06-10; the 4-together upgrade is
+verified by release notes + call-site grep, and gets its compile-proof in that upgrade
+PR's own CI. Nothing was bumped in this research.
