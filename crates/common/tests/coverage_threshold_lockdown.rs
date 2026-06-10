@@ -1,24 +1,42 @@
-//! S3-7: Coverage threshold lockdown.
+//! S3-7: Coverage threshold lockdown — RATCHET FLOORS edition.
 //!
 //! Reads `quality/crate-coverage-thresholds.toml` and enforces that:
 //!
-//! 1. The `default` threshold is exactly `100.0`
-//! 2. Every declared crate is at exactly `100.0`
-//! 3. The file itself exists and is non-empty
+//! 1. The file exists and is non-empty
+//! 2. The `default` threshold is at or above the PINNED floor below
+//! 3. Every declared crate is at or above its PINNED floor below
+//! 4. All six workspace crates are listed
 //!
-//! This prevents a hidden-in-a-PR weakening of coverage. `scripts/coverage-gate.sh`
-//! reads this file in CI and blocks merges on regression, but the threshold
-//! VALUE itself was previously unlocked — any PR could silently set
-//! `common = 95.0` to ship a half-tested crate. This test blocks that at
-//! push time via pre-push Gate 9 (locked facts).
+//! History: this test originally demanded exactly `100.0` everywhere.
+//! PR #1079 (P0 of the coverage-gaps plan, operator-approved 2026-06-10)
+//! replaced the fictional, never-enforced 100.0 values with REAL measured
+//! ratchet floors and made `scripts/coverage-gate.sh` fail-closed — but
+//! missed updating this lockdown, leaving `Test (common)` latently red
+//! (first exposed by PR #1083, the next change to touch crates/common).
+//! This edition keeps the lockdown's actual purpose intact: LOWERING any
+//! floor still requires editing the pinned table below in the same PR,
+//! which forces a visible review. RAISING a floor in the TOML is always
+//! allowed (ratchet rule: floors only move up; re-pin here in the same PR
+//! per the policy header in the TOML).
 //!
-//! Any attempt to lower a threshold requires editing this test in the same
-//! commit, which forces a visible review.
+//! 100% stays the documented TARGET; the floors are the enforced minimum.
 
 use std::path::Path;
 
-/// Policy: 100% line coverage for every crate. No exceptions.
-const MIN_COVERAGE: f64 = 100.0;
+/// Pinned ratchet floors — must match or under-cut
+/// `quality/crate-coverage-thresholds.toml` (P0 baseline, main @ a6fe35c4:
+/// common 99.57 | api 98.71 | trading 97.02 | storage 91.35 | core 90.38 |
+/// app 63.43, each floored ~0.1 below measured). Lowering a TOML value
+/// below its pin fails this test; raising it is always allowed.
+const PINNED_DEFAULT_FLOOR: f64 = 63.0;
+const PINNED_CRATE_FLOORS: &[(&str, f64)] = &[
+    ("common", 99.5),
+    ("core", 90.2),
+    ("trading", 96.9),
+    ("storage", 91.2),
+    ("api", 98.6),
+    ("app", 63.3),
+];
 
 fn read_thresholds_toml() -> String {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -38,7 +56,7 @@ fn read_thresholds_toml() -> String {
     })
 }
 
-/// Strips whitespace and comments to produce a line we can match regexes on.
+/// Strips whitespace and comments to produce a line we can match on.
 fn canonical_lines(raw: &str) -> Vec<String> {
     raw.lines()
         .map(|l| match l.find('#') {
@@ -48,6 +66,13 @@ fn canonical_lines(raw: &str) -> Vec<String> {
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect()
+}
+
+/// Parse `<name> = <value>` returning the f64 value, or None.
+fn parse_threshold_line(line: &str) -> Option<(String, f64)> {
+    let (name, value) = line.split_once('=')?;
+    let value: f64 = value.trim().parse().ok()?;
+    Some((name.trim().to_string(), value))
 }
 
 #[test]
@@ -60,31 +85,31 @@ fn coverage_lockdown_file_exists() {
 }
 
 #[test]
-fn coverage_lockdown_default_is_100() {
+fn coverage_lockdown_default_at_or_above_pinned_floor() {
     let content = read_thresholds_toml();
     let lines = canonical_lines(&content);
     let default_line = lines
         .iter()
         .find(|l| l.starts_with("default"))
         .expect("S3-7: coverage threshold file must declare `default = ...`"); // APPROVED: test
-    // Expect `default = 100.0` or `default = 100`.
+    let (_, value) =
+        parse_threshold_line(default_line).expect("S3-7: `default = <number>` must parse"); // APPROVED: test
     assert!(
-        default_line.contains("100"),
-        "S3-7: default coverage threshold MUST be 100.0, got: {default_line}. \
-         Policy is 100% line coverage for every crate. Do NOT weaken without \
-         parity enforcement elsewhere."
+        value >= PINNED_DEFAULT_FLOOR,
+        "S3-7: default coverage threshold {value} is BELOW the pinned floor \
+         {PINNED_DEFAULT_FLOOR}. Floors only move UP (ratchet rule, PR #1079 \
+         P0 policy). Lowering requires editing PINNED_DEFAULT_FLOOR in this \
+         test in the same PR — a visible, reviewable act."
     );
-    // Extra safety: no threshold below MIN_COVERAGE should appear on the default line.
-    let _ = MIN_COVERAGE; // referenced for docs; actual parse intentionally loose
 }
 
 #[test]
-fn coverage_lockdown_every_crate_is_100() {
+fn coverage_lockdown_every_crate_at_or_above_pinned_floor() {
     let content = read_thresholds_toml();
     let lines = canonical_lines(&content);
-    // Find every `<crate> = <value>` line inside the [crates] section.
     let mut in_crates_section = false;
     let mut violations: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
     for line in &lines {
         if line == "[crates]" {
             in_crates_section = true;
@@ -97,20 +122,33 @@ fn coverage_lockdown_every_crate_is_100() {
         if !in_crates_section {
             continue;
         }
-        // Parse `<name> = <number>`
-        if let Some((name, value)) = line.split_once('=') {
-            let name = name.trim();
-            let value = value.trim();
-            // Value must contain "100" and not start with a digit less than 100.
-            // A parse-and-compare would be cleaner but adds a TOML dep; keep it
-            // simple with substring checks.
-            if !value.contains("100") {
-                violations.push(format!("crate {name} is set to {value} — MUST be 100.0"));
+        let Some((name, value)) = parse_threshold_line(line) else {
+            violations.push(format!("unparseable [crates] line: {line}"));
+            continue;
+        };
+        seen.push(name.clone());
+        match PINNED_CRATE_FLOORS.iter().find(|(n, _)| *n == name) {
+            Some((_, floor)) => {
+                if value < *floor {
+                    violations.push(format!(
+                        "crate {name} is set to {value} — BELOW pinned floor \
+                         {floor}. Floors only move UP; lowering requires \
+                         editing PINNED_CRATE_FLOORS in this test (visible \
+                         review, same PR)."
+                    ));
+                }
             }
-            // Catch "99.9" which contains "99" not "100"
-            if value.starts_with("99") || value.starts_with("95") || value.starts_with("90") {
-                violations.push(format!("crate {name} is set to {value} — MUST be 100.0"));
-            }
+            None => violations.push(format!(
+                "crate {name} has no pinned floor in PINNED_CRATE_FLOORS — \
+                 add the pin in this test in the same PR."
+            )),
+        }
+    }
+    for (name, _) in PINNED_CRATE_FLOORS {
+        if !seen.iter().any(|s| s == name) {
+            violations.push(format!(
+                "pinned crate {name} missing from the [crates] section"
+            ));
         }
     }
     assert!(
@@ -127,7 +165,7 @@ fn coverage_lockdown_required_crates_are_listed() {
     let required = ["common", "core", "trading", "storage", "api", "app"];
     let mut missing = Vec::new();
     for crate_name in required {
-        // Expect a line like `common  = 100.0` inside [crates].
+        // Expect a line like `common  = 99.5` inside [crates].
         let looking_for = format!("{crate_name} ");
         if !content.contains(&looking_for) && !content.contains(&format!("{crate_name}=")) {
             missing.push(crate_name);
@@ -137,4 +175,28 @@ fn coverage_lockdown_required_crates_are_listed() {
         missing.is_empty(),
         "S3-7: required crate(s) not listed in coverage thresholds: {missing:?}"
     );
+}
+
+#[test]
+fn coverage_lockdown_pinned_floors_are_sane() {
+    // The pins themselves must stay in (0, 100] and cover all 6 crates —
+    // guards against a typo'd pin (e.g. 9.5 instead of 99.5) silently
+    // weakening the lockdown.
+    assert_eq!(
+        PINNED_CRATE_FLOORS.len(),
+        6,
+        "S3-7: expected exactly 6 pinned crate floors"
+    );
+    assert!(PINNED_DEFAULT_FLOOR > 0.0 && PINNED_DEFAULT_FLOOR <= 100.0);
+    for (name, floor) in PINNED_CRATE_FLOORS {
+        assert!(
+            *floor > 0.0 && *floor <= 100.0,
+            "S3-7: pinned floor for {name} out of range: {floor}"
+        );
+        assert!(
+            *floor >= PINNED_DEFAULT_FLOOR,
+            "S3-7: pinned floor for {name} ({floor}) below the default floor \
+             ({PINNED_DEFAULT_FLOOR}) — pins must not under-cut the default"
+        );
+    }
 }
