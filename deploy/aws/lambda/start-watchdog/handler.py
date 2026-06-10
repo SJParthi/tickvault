@@ -1,20 +1,29 @@
-"""Instance start watchdog Lambda — answers "who monitors the 08:00 start?".
+"""Instance start watchdog Lambda — answers "who monitors the 08:30 start?".
 
 Two EventBridge schedules invoke this Lambda with a `mode` input:
 
-  * mode="ping"  @ 08:00 IST (02:30 UTC Mon-Fri) — fires WITH the daily_start
+  * mode="ping"  @ 08:30 IST (03:00 UTC Mon-Fri) — fires WITH the daily_start
     EventBridge rule. Publishes a positive "start triggered" Telegram so the
     operator sees the morning kick-off even before the app boots (~3 min later).
 
-  * mode="check" @ 08:15 IST (02:45 UTC Mon-Fri) — 15 min after the start was
-    triggered. Calls ec2:DescribeInstances; if the box is NOT "running" it
-    publishes a Severity::Critical Telegram ("08:00 auto-start FAILED"). This is
-    the AWS-native answer to the 2026-06-02 incident, where the EventBridge ->
-    SSM-Automation start silently failed and NOTHING alerted the operator until
-    he noticed by hand. Because this Lambda runs IN AWS (not on a GitHub Actions
-    runner like aws-autopilot), it alerts even if the box — or GitHub — is dead.
+  * mode="check" @ 08:45 IST (03:15 UTC Mon-Fri) — 15 min after the start was
+    triggered. Calls ec2:DescribeInstances and:
+      - box NOT running  -> SELF-HEALS: issues ec2:StartInstances itself, then
+        publishes a Severity::Critical Telegram saying the 08:30 auto-start
+        failed and the watchdog started the box. (2026-06-10 incident: the
+        EventBridge -> SSM-Automation start silently failed AGAIN — repeat of
+        2026-06-02 — and the operator had to start the box by hand at 08:43.
+        Detection alone proved insufficient; the watchdog now fixes first,
+        pages second.)
+      - box running but its LaunchTime is AFTER the 08:30 trigger + grace ->
+        the auto-start failed and something/someone started it late (exactly
+        the 2026-06-10 masking case, where a manual 08:43 start beat the 08:45
+        check and the failure went unflagged). Publishes a warning so the
+        broken start path is investigated instead of silently rotting.
+      - box running on time -> SILENT. No spam.
 
-On a healthy "check" (box running) it stays SILENT — no spam.
+Because this Lambda runs IN AWS (not on a GitHub Actions runner like
+aws-autopilot), it detects and heals even if the box — or GitHub — is dead.
 
 Publishes to the operator's `tv_alerts` SNS topic with Subject + Message, the
 same shape the telegram-webhook Lambda (PR #781) already renders.
@@ -31,6 +40,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import boto3
@@ -42,9 +52,22 @@ logger.setLevel(LOG_LEVEL)
 EC2_INSTANCE_ID = os.environ.get("EC2_INSTANCE_ID", "")
 ALERTS_TOPIC_ARN = os.environ.get("ALERTS_TOPIC_ARN", "")
 
+# The daily_start EventBridge rule fires at 03:00 UTC (= 08:30 IST, Mon-Fri).
+START_TRIGGER_UTC_HOUR = 3
+START_TRIGGER_UTC_MINUTE = 0
+# EC2 start -> running takes <1 min; anything launched more than this many
+# minutes after the trigger means the scheduled start did NOT do it.
+LATE_START_GRACE_MINUTES = 5
+IST_OFFSET = timedelta(hours=5, minutes=30)
 
-def _instance_state(ec2_client: Any, instance_id: str) -> str:
-    """Return the EC2 instance lifecycle state, or 'unknown' on any error.
+
+def _now() -> datetime:
+    """Wall clock, UTC. Separate fn so tests can monkeypatch it."""
+    return datetime.now(timezone.utc)
+
+
+def _instance_info(ec2_client: Any, instance_id: str) -> tuple[str, datetime | None]:
+    """Return (lifecycle state, launch time) — ('unknown', None) on any error.
 
     Never raises — a watchdog that crashes is worse than one that reports
     'unknown' (which itself is not 'running' and therefore alerts).
@@ -53,14 +76,30 @@ def _instance_state(ec2_client: Any, instance_id: str) -> str:
         resp = ec2_client.describe_instances(InstanceIds=[instance_id])
         reservations = resp.get("Reservations", [])
         if not reservations:
-            return "not-found"
+            return "not-found", None
         instances = reservations[0].get("Instances", [])
         if not instances:
-            return "not-found"
-        return instances[0].get("State", {}).get("Name", "unknown")
+            return "not-found", None
+        state = instances[0].get("State", {}).get("Name", "unknown")
+        return state, instances[0].get("LaunchTime")
     except Exception as exc:  # noqa: BLE001 — watchdog must never crash
         logger.error("describe_instances failed: %s", exc)
-        return "unknown"
+        return "unknown", None
+
+
+def _try_self_start(ec2_client: Any, instance_id: str) -> bool:
+    """Issue ec2:StartInstances. Returns True if the call was accepted.
+
+    Never raises — if the self-heal fails, the page tells the operator to
+    start the box manually instead.
+    """
+    try:
+        ec2_client.start_instances(InstanceIds=[instance_id])
+        logger.info("self-heal start_instances issued for %s", instance_id)
+        return True
+    except Exception as exc:  # noqa: BLE001 — watchdog must never crash
+        logger.error("self-heal start_instances FAILED: %s", exc)
+        return False
 
 
 def _publish(sns_client: Any, subject: str, message: str) -> None:
@@ -81,25 +120,71 @@ def lambda_handler(event: dict[str, Any], _context: Any = None) -> dict[str, Any
         _publish(
             sns_client,
             "Instance start triggered",
-            "🟢 08:00 IST instance start triggered (Mon-Fri). "
-            "The app should report live in ~3 min. "
-            "If you do NOT also get a 'tickvault started' message by 08:10, check the box.",
+            "🟢 8:30 AM IST instance start triggered (Mon-Fri). "
+            "The app should report live in ~3 minutes. "
+            "If you do NOT get a 'tickvault started' message by 8:40 AM, the "
+            "8:45 AM watchdog will check and start the box itself if needed.",
         )
         return {"mode": "ping", "published": True}
 
-    # mode == "check" (default): verify the box actually started.
+    # mode == "check" (default): verify the box actually started — and fix it.
     ec2_client = boto3.client("ec2")
-    state = _instance_state(ec2_client, EC2_INSTANCE_ID)
-    if state == "running":
-        logger.info("check OK — instance is running; staying silent")
-        return {"mode": "check", "state": state, "alerted": False}
+    state, launch_time = _instance_info(ec2_client, EC2_INSTANCE_ID)
 
-    _publish(
-        sns_client,
-        "08:00 auto-start FAILED",
-        f"🆘 The 08:00 IST auto-start did NOT bring the box up — it is '{state}' at "
-        f"08:15 IST. Market opens 09:15. Start it NOW: portal 'Start instance' or "
-        f"`aws ec2 start-instances --instance-ids {EC2_INSTANCE_ID} --region ap-south-1`.",
+    if state == "running":
+        # Late-start detection: only meaningful inside the scheduled check
+        # window (03:00-04:00 UTC). A manual `mode=check` at another hour
+        # must not misread an afternoon manual start as "late".
+        now = _now()
+        in_window = now.hour == START_TRIGGER_UTC_HOUR
+        deadline = now.replace(
+            hour=START_TRIGGER_UTC_HOUR,
+            minute=START_TRIGGER_UTC_MINUTE,
+            second=0,
+            microsecond=0,
+        ) + timedelta(minutes=LATE_START_GRACE_MINUTES)
+        if in_window and launch_time is not None and launch_time > deadline:
+            launched_ist = (launch_time + IST_OFFSET).strftime("%I:%M %p").lstrip("0")
+            _publish(
+                sns_client,
+                "08:30 auto-start FAILED — box was started late",
+                f"⚠️ The box is running now, but it only came up at {launched_ist} IST — "
+                "the scheduled 8:30 AM start did NOT work and something (or someone) "
+                "started it later. Trading is OK for today. Investigate why the 8:30 "
+                "start failed: AWS console → Systems Manager → Automation executions "
+                "for AWS-StartEC2Instance, and the EventBridge rule's FailedInvocations.",
+            )
+            logger.error("check — running but launched LATE at %s — paged", launch_time)
+            return {"mode": "check", "state": state, "alerted": True, "self_started": False}
+        logger.info("check OK — instance is running; staying silent")
+        return {"mode": "check", "state": state, "alerted": False, "self_started": False}
+
+    # Box is NOT running at 08:45 IST — fix first, page second.
+    self_started = _try_self_start(ec2_client, EC2_INSTANCE_ID)
+    if self_started:
+        _publish(
+            sns_client,
+            "08:30 auto-start FAILED — watchdog started the box itself",
+            f"🆘 The 8:30 AM IST auto-start did NOT bring the box up — it was "
+            f"'{state}' at 8:45 AM. I have sent the start command myself; expect the "
+            "'tickvault started' message by about 8:52 AM. Market opens 9:15 AM. "
+            "If no started-message arrives by 8:55 AM, press 'Start instance' on the "
+            "portal. Also investigate why the 8:30 start failed: AWS console → "
+            "Systems Manager → Automation executions for AWS-StartEC2Instance.",
+        )
+    else:
+        _publish(
+            sns_client,
+            "08:30 auto-start FAILED — manual start NEEDED NOW",
+            f"🆘 The 8:30 AM IST auto-start did NOT bring the box up — it is "
+            f"'{state}' at 8:45 AM — and the watchdog's own start attempt ALSO "
+            "failed. Market opens 9:15 AM. Start it NOW: portal 'Start instance' or "
+            f"`aws ec2 start-instances --instance-ids {EC2_INSTANCE_ID} "
+            "--region ap-south-1`.",
+        )
+    logger.error(
+        "check FAILED — instance state=%s self_started=%s — operator paged",
+        state,
+        self_started,
     )
-    logger.error("check FAILED — instance state=%s — operator paged", state)
-    return {"mode": "check", "state": state, "alerted": True}
+    return {"mode": "check", "state": state, "alerted": True, "self_started": self_started}
