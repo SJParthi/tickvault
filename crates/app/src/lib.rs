@@ -22,6 +22,10 @@ pub mod bar_cache_loader;
 // Operator directive 2026-06-02: post-market (15:31 IST) 1-minute
 // cross-verification of live candles_1m vs Dhan intraday — CSV + audit + count.
 pub mod cross_verify_1m_boot;
+// Operator task DHAN-REST-400 (2026-06-10): scheduled REST-health canary —
+// GET /v2/profile at 09:05 / 12:00 / 15:25 IST, pages HIGH with the captured
+// (bounded, secret-redacted) body + final URL on any non-2xx.
+pub mod rest_canary_boot;
 pub mod tick_conservation_boot;
 // PR #8a (2026-05-19) — Slice 1: 09:15:00 IST `DayOhlcTracker::arm_sid()`
 // boot wiring per `index-day-ohlc-tracker-error-codes.md`. Closes the

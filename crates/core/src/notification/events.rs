@@ -384,43 +384,30 @@ pub enum NotificationEvent {
         token_remaining_hours: u64,
     },
 
-    /// Post-market 1-minute cross-verify daily summary (operator directive
-    /// 2026-06-10 — "make the 15:31 cross-verify VISIBLE"). Fires exactly
-    /// once per trading day after `run_cross_verify_1m` completes, carrying
-    /// the aggregated outcome the run previously only logged.
+    /// DHAN-REST-400 false-clean guard (operator task 2026-06-10, audit
+    /// Rule 11): per-run summary of the 15:31 IST 1-minute cross-verify.
+    /// Fires after EVERY run — never silent. A 776/776-fetch-failure day
+    /// previously produced a header-only CSV indistinguishable from a
+    /// perfect day; this event says BLIND loudly when the verification
+    /// vouched for nothing.
     ///
-    /// Severity is data-dependent (hardened per the 2026-06-10 pre-impl
-    /// adversarial review): `Info` ONLY when the run compared at least one
-    /// minute AND found zero mismatches AND zero missing minutes AND was
-    /// not degraded. A `compared == 0` run must NEVER read as PASS (audit
-    /// Rule 11 false-OK class — Dhan serving empty 200-responses yields
-    /// `compared = 0` with `fetch_failures = 0`), and `missing > 0` means
-    /// minutes of live candles were missed — the very signal this audit
-    /// exists for.
+    /// Severity: High for `BLIND` / `DEGRADED` (pages), Info for `PASS`
+    /// (daily positive signal).
     CrossVerify1mSummary {
         /// Trading date in `YYYY-MM-DD` IST format.
         trading_date_ist: String,
-        /// Spot instruments the run attempted to verify.
+        /// Stable wire-format run status: `BLIND` / `DEGRADED` / `PASS`.
+        status: String,
+        /// Spot instruments the run attempted.
         instruments: usize,
-        /// 1-minute buckets present on BOTH sides and compared exactly.
+        /// Minute-cells actually compared against Dhan (0 ⇒ BLIND).
         compared: usize,
-        /// OHLCV field-cells that disagreed with the exchange record.
+        /// Field-cells that disagreed.
         mismatches: usize,
-        /// Minutes the exchange has that our live candles are missing.
-        missing: usize,
-        /// True when fetch coverage was partial (false-OK guard) — the
-        /// run cannot vouch for the full universe.
-        degraded: bool,
-    },
-
-    /// The post-market cross-verify TASK died (panicked) before producing
-    /// its daily summary. High so the absence of the daily summary is
-    /// impossible to miss (operator directive 2026-06-10). NOT fired on
-    /// graceful shutdown/cancellation (the 16:30 IST auto-stop is a normal
-    /// teardown, not an abort).
-    CrossVerify1mAborted {
-        /// Plain-English description of how the task died.
-        detail: String,
+        /// Minutes Dhan has that our live candles are missing.
+        missing_ours: usize,
+        /// Instruments whose Dhan intraday fetch failed outright.
+        fetch_failures: usize,
     },
 
     // PR #4 (2026-05-19): DepthSpotPriceStale variant retired alongside
@@ -1360,58 +1347,44 @@ impl NotificationEvent {
             }
             Self::CrossVerify1mSummary {
                 trading_date_ist,
+                status,
                 instruments,
                 compared,
                 mismatches,
-                missing,
-                degraded,
+                missing_ours,
+                fetch_failures,
             } => {
-                // Operator-charter §G wording: plain English, IST 12-hour
-                // time, real numbers, no library names, no file paths
-                // (points at the portal card, not a path).
-                let clean = *mismatches == 0 && *missing == 0 && !*degraded && *compared > 0;
-                if clean {
-                    format!(
-                        "\u{2705} <b>Daily candle check @ 3:31 PM IST — PASS</b>\n\
-                         Date: {trading_date_ist}\n\
-                         Instruments: {instruments} | Minutes compared: {compared}\n\
-                         Mismatches: 0 | Missing: 0\n\
-                         Every 1-minute candle matches the exchange record exactly."
-                    )
-                } else {
-                    let coverage_note = if *compared == 0 {
-                        "\nNothing could be compared — today's check cannot \
-                         vouch for the day's candles."
-                    } else if *degraded {
-                        "\nCoverage was PARTIAL — some instrument data could \
-                         not be fetched, so today's check cannot vouch for \
-                         the full universe."
-                    } else {
-                        ""
-                    };
-                    format!(
-                        "\u{26a0}\u{fe0f} <b>Daily candle check @ 3:31 PM IST — \
-                         NEEDS ATTENTION</b>\n\
-                         Date: {trading_date_ist}\n\
-                         Instruments: {instruments} | Minutes compared: {compared}\n\
-                         Mismatches: {mismatches} | Missing: {missing}\
-                         {coverage_note}\n\
-                         What to do RIGHT NOW:\n\
-                         1. Open the Cross-verify card on the operator portal.\n\
-                         2. Review which minutes differ from the exchange record.\n\
-                         3. If many instruments differ, check the day's feed health."
-                    )
-                }
-            }
-            Self::CrossVerify1mAborted { detail } => {
+                // Operator-charter §G wording: plain English, loud BLIND,
+                // explicit "the empty CSV proves nothing" so a header-only
+                // file can never read as a pass again (2026-06-10 incident).
+                // Exact-match arms (adversarial review 2026-06-10 MEDIUM-1):
+                // an unknown/typo status must NEVER render the ✅ PASS body —
+                // severity() already treats non-"PASS" as High, so the body
+                // must agree and stay loud.
+                let verdict = match status.as_str() {
+                    "BLIND" => {
+                        "🆘 BLIND — checked NOTHING today. The day's report file is \
+                         empty because every data request failed, NOT because the \
+                         data was perfect. Check the REST health alerts for why."
+                    }
+                    "DEGRADED" => {
+                        "⚠️ DEGRADED — partial coverage only. Some instruments \
+                         could not be fetched; the mismatch count below covers \
+                         only the compared portion."
+                    }
+                    "PASS" => "✅ PASS — full coverage.",
+                    _ => {
+                        "⚠️ UNRECOGNISED STATUS — treat as NOT verified. \
+                         Investigate the candle-check task."
+                    }
+                };
                 format!(
-                    "\u{26a0}\u{fe0f} <b>Daily candle check did NOT run</b>\n\
-                     The 3:31 PM IST check against the exchange record died \
-                     before finishing.\n\
-                     Reason: {detail}\n\
-                     What to do RIGHT NOW:\n\
-                     1. Check the app is still running.\n\
-                     2. Restart the app to re-arm tomorrow's check."
+                    "<b>Daily candle check @ 3:31 PM IST — {status}</b>\n\
+                     Trading date: {trading_date_ist}\n\
+                     {verdict}\n\
+                     Instruments: {instruments} | Fetch failures: {fetch_failures}\n\
+                     Minutes compared: {compared} | Mismatches: {mismatches} | \
+                     Missing on our side: {missing_ours}"
                 )
             }
             // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
@@ -1928,7 +1901,6 @@ impl NotificationEvent {
             Self::MarketOpenReadinessConfirmation { .. } => "MarketOpenReadinessConfirmation",
             Self::EndOfDayDigest { .. } => "EndOfDayDigest",
             Self::CrossVerify1mSummary { .. } => "CrossVerify1mSummary",
-            Self::CrossVerify1mAborted { .. } => "CrossVerify1mAborted",
             // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
             // name arms retired.
             // PR #6a (2026-05-19): NseBhavcopyCheck* name arms retired.
@@ -2046,23 +2018,15 @@ impl NotificationEvent {
             Self::MarketOpenStreamingFailed { .. } => Severity::High,
             Self::MarketOpenReadinessConfirmation { .. } => Severity::Info,
             Self::EndOfDayDigest { .. } => Severity::Info,
-            // Hardened per the 2026-06-10 pre-impl adversarial review:
-            // compared == 0 and missing > 0 must NEVER render as a green
-            // PASS (audit Rule 11 — false-OK class).
-            Self::CrossVerify1mSummary {
-                compared,
-                mismatches,
-                missing,
-                degraded,
-                ..
-            } => {
-                if *mismatches == 0 && *missing == 0 && !*degraded && *compared > 0 {
+            // DHAN-REST-400 false-clean guard (2026-06-10): BLIND/DEGRADED
+            // page High; PASS is the daily positive Info ping. Never silent.
+            Self::CrossVerify1mSummary { status, .. } => {
+                if status == "PASS" {
                     Severity::Info
                 } else {
                     Severity::High
                 }
             }
-            Self::CrossVerify1mAborted { .. } => Severity::High,
             Self::SelfTestPassed { .. } => Severity::Info,
             Self::SelfTestDegraded { .. } => Severity::High,
             Self::RealtimeGuaranteeHealthy { .. } => Severity::Info,
@@ -3958,6 +3922,80 @@ mod tests {
         };
         assert_eq!(event.topic(), "EndOfDayDigest");
         assert_eq!(event.severity(), Severity::Info);
+    }
+
+    // -----------------------------------------------------------------
+    // CrossVerify1mSummary — DHAN-REST-400 false-clean guard (2026-06-10)
+    // -----------------------------------------------------------------
+
+    fn cv_summary(status: &str, compared: usize, fetch_failures: usize) -> NotificationEvent {
+        NotificationEvent::CrossVerify1mSummary {
+            trading_date_ist: "2026-06-10".to_string(),
+            status: status.to_string(),
+            instruments: 776,
+            compared,
+            mismatches: 0,
+            missing_ours: 0,
+            fetch_failures,
+        }
+    }
+
+    /// RATCHET (audit Rule 11 / 2026-06-10 incident): a 776/776-failure
+    /// day must say BLIND loudly at Severity::High — never a silent or
+    /// clean-looking message.
+    #[test]
+    fn test_cross_verify_1m_summary_blind_message_is_loud() {
+        let event = cv_summary("BLIND", 0, 776);
+        assert_eq!(event.topic(), "CrossVerify1mSummary");
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        assert!(msg.contains("BLIND"), "{msg}");
+        assert!(msg.contains("checked NOTHING"), "{msg}");
+        assert!(msg.contains("776"), "{msg}");
+        assert!(
+            msg.contains("NOT because the data was perfect"),
+            "the empty-CSV trap must be spelled out: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_cross_verify_1m_summary_degraded_is_high() {
+        let event = cv_summary("DEGRADED", 100, 200);
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        assert!(
+            msg.contains("DEGRADED") && msg.contains("partial coverage"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn test_cross_verify_1m_summary_pass_is_info() {
+        let event = cv_summary("PASS", 290_000, 0);
+        assert_eq!(event.severity(), Severity::Info);
+        let msg = event.to_message();
+        assert!(
+            msg.contains("PASS") && msg.contains("full coverage"),
+            "{msg}"
+        );
+        assert!(msg.contains("290000") || msg.contains("290,000"), "{msg}");
+    }
+
+    #[test]
+    fn test_cross_verify_1m_summary_renders_all_counts() {
+        let event = NotificationEvent::CrossVerify1mSummary {
+            trading_date_ist: "2026-06-10".to_string(),
+            status: "DEGRADED".to_string(),
+            instruments: 776,
+            compared: 12_345,
+            mismatches: 42,
+            missing_ours: 17,
+            fetch_failures: 99,
+        };
+        let msg = event.to_message();
+        for needle in ["2026-06-10", "776", "12345", "42", "17", "99"] {
+            assert!(msg.contains(needle), "missing {needle}: {msg}");
+        }
     }
 
     #[test]

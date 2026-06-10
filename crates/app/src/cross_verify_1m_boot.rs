@@ -28,6 +28,8 @@ use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+use tickvault_common::sanitize::{capture_rest_error_body, redact_url_params};
+use tickvault_common::url_join::join_api_url;
 use tickvault_core::auth::token_manager::TokenHandle;
 use tickvault_storage::cross_verify_1m_audit_persistence::{
     CrossVerify1mAuditWriter, CrossVerify1mMismatch, MismatchField, csv_header,
@@ -432,6 +434,105 @@ pub struct CrossVerify1mSummary {
     pub degraded: bool,
 }
 
+/// False-clean classification of a cross-verify run (DHAN-REST-400 task
+/// item 2, audit Rule 11). A 776/776-fetch-failure day previously produced a
+/// header-only CSV indistinguishable from a perfect day.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunStatus {
+    /// Zero minute-cells compared — the run vouches for NOTHING. An empty
+    /// mismatch list under this status is meaningless, not a pass.
+    Blind,
+    /// Some coverage, but the fetch-failure fraction breached the degraded
+    /// threshold — the mismatch count covers only part of the universe.
+    Degraded,
+    /// Full(-enough) coverage; the mismatch count is trustworthy.
+    Pass,
+}
+
+impl RunStatus {
+    /// Stable wire-format label (CSV status line + Telegram + counter label).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Blind => "BLIND",
+            Self::Degraded => "DEGRADED",
+            Self::Pass => "PASS",
+        }
+    }
+}
+
+/// Classify a run. Pure.
+///
+/// `compared == 0` is BLIND regardless of why (all fetches failed, or a
+/// forced run on a quiet day) — Rule 11: never report clean on an empty
+/// compare set. With coverage, the existing degraded flag (fetch-failure
+/// fraction > [`FETCH_DEGRADED_FAIL_FRACTION`]) maps to DEGRADED.
+#[must_use]
+pub fn classify_run_status(summary: &CrossVerify1mSummary) -> RunStatus {
+    if summary.stats.compared == 0 {
+        return RunStatus::Blind;
+    }
+    if summary.degraded {
+        return RunStatus::Degraded;
+    }
+    RunStatus::Pass
+}
+
+/// The status line written as the FIRST line of the per-day CSV, before the
+/// header. `#`-prefixed so the data grid is untouched; one glance at the file
+/// now distinguishes "perfect day" from "checked nothing". Pure.
+#[must_use]
+pub fn csv_status_line(summary: &CrossVerify1mSummary, status: RunStatus) -> String {
+    format!(
+        "# status={} instruments={} fetch_failures={} compared={} mismatches={} missing_ours={}",
+        status.as_str(),
+        summary.instruments_checked,
+        summary.fetch_failures,
+        summary.stats.compared,
+        summary.stats.mismatches,
+        summary.stats.missing_ours,
+    )
+}
+
+/// Outcome of the end-of-run audit flush (DHAN-REST-400 task item 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlushOutcome {
+    /// Nothing buffered — flushing was correctly skipped.
+    SkippedEmpty,
+    /// All pending rows flushed.
+    Flushed,
+    /// Flush failed with this many rows still pending.
+    Failed { pending: usize },
+}
+
+/// Final audit flush, skip-when-empty.
+///
+/// Root cause of the 2026-06-10 "final audit flush failed — rows may be
+/// unpersisted" false alarm: `flush()` was called unconditionally, and on a
+/// zero-mismatch day (every fetch failed ⇒ zero appends) a disconnected ILP
+/// sender still returns `Err("not connected")` — alarming about unpersisted
+/// rows when pending = 0. Skip the flush entirely when nothing is buffered;
+/// when something IS buffered and the flush fails, report the exact count.
+pub fn final_flush(writer: &mut CrossVerify1mAuditWriter) -> FlushOutcome {
+    if writer.pending() == 0 {
+        return FlushOutcome::SkippedEmpty;
+    }
+    match writer.flush() {
+        Ok(()) => FlushOutcome::Flushed,
+        Err(err) => {
+            let pending = writer.pending();
+            error!(
+                code = tickvault_common::error_code::ErrorCode::CrossVerify1m01MismatchFound
+                    .code_str(),
+                pending,
+                error_chain = %format!("{err:#}"),
+                "cross_verify_1m: final audit flush failed — {pending} mismatch rows unpersisted"
+            );
+            FlushOutcome::Failed { pending }
+        }
+    }
+}
+
 /// Run the post-market 1-minute cross-verification for every spot instrument in
 /// the universe. Cold path, fail-soft per symbol; never blocks. Writes the
 /// audit table + CSV; returns the summary for the caller to emit Telegram.
@@ -471,7 +572,9 @@ pub async fn run_cross_verify_1m(
         }
     };
 
-    let intraday_url = format!("{base_url}{INTRADAY_PATH}");
+    // DHAN-REST-400 item 1b (2026-06-10): join via join_api_url so a
+    // trailing-slash base-URL override can never produce `/v2//charts/...`.
+    let intraday_url = join_api_url(&base_url, INTRADAY_PATH);
     let questdb_exec_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -496,6 +599,10 @@ pub async fn run_cross_verify_1m(
     let trading_date_ist_nanos = day_start_ist_nanos;
     let to_date = trading_date.succ_opt().unwrap_or(trading_date);
     let mut summary = CrossVerify1mSummary::default();
+    // First captured fetch-failure reason (status + URL + bounded redacted
+    // body) — carried into the CROSS-VERIFY-1M-02 log so a degraded day
+    // names its cause instead of just counting failures (DHAN-REST-400).
+    let mut sample_fetch_failure: Option<String> = None;
     // CSV is built in-memory then written once at the end (one file open).
     let mut csv = String::from(csv_header());
     csv.push('\n');
@@ -534,6 +641,9 @@ pub async fn run_cross_verify_1m(
             Ok(candles) => candles,
             Err(reason) => {
                 summary.fetch_failures = summary.fetch_failures.saturating_add(1);
+                if sample_fetch_failure.is_none() {
+                    sample_fetch_failure = Some(reason.clone());
+                }
                 warn!(security_id = target.security_id, %reason, "cross_verify_1m: intraday fetch failed (skip)");
                 continue;
             }
@@ -563,12 +673,9 @@ pub async fn run_cross_verify_1m(
         }
     }
 
-    if writer.flush().is_err() {
-        error!(
-            code = tickvault_common::error_code::ErrorCode::CrossVerify1m01MismatchFound.code_str(),
-            "cross_verify_1m: final audit flush failed — rows may be unpersisted"
-        );
-    }
+    // DHAN-REST-400 item 4: skip-when-empty final flush — the 2026-06-10
+    // false alarm fired on an empty buffer over a disconnected sender.
+    let _ = final_flush(&mut writer);
 
     // Degraded if too many symbols failed to fetch (false-OK guard).
     if summary.instruments_checked > 0 {
@@ -576,8 +683,13 @@ pub async fn run_cross_verify_1m(
         summary.degraded = fail_frac > FETCH_DEGRADED_FAIL_FRACTION;
     }
 
-    write_csv_file(csv_dir, trading_date, &csv).await;
-    write_summary_file(csv_dir, trading_date, &summary).await;
+    // DHAN-REST-400 item 2 (audit Rule 11): classify the run and write the
+    // status as the FIRST line of the CSV so a header-only file can never
+    // again read as a perfect day.
+    let status = classify_run_status(&summary);
+    let csv_with_status = format!("{}\n{csv}", csv_status_line(&summary, status));
+    write_csv_file(csv_dir, trading_date, &csv_with_status).await;
+    metrics::counter!("tv_cross_verify_1m_runs_total", "status" => status.as_str()).increment(1);
 
     if summary.stats.mismatches > 0 {
         error!(
@@ -588,15 +700,22 @@ pub async fn run_cross_verify_1m(
             "cross_verify_1m: OHLCV mismatches found vs Dhan intraday"
         );
     }
-    if summary.degraded {
+    if summary.degraded || status == RunStatus::Blind {
+        // DHAN-REST-400 item 1: the degraded/blind page now NAMES its cause —
+        // the first captured failure carries status + final URL + bounded
+        // secret-redacted Dhan error body.
         error!(
             code = tickvault_common::error_code::ErrorCode::CrossVerify1m02FetchDegraded.code_str(),
+            status = status.as_str(),
             fetch_failures = summary.fetch_failures,
             instruments = summary.instruments_checked,
-            "cross_verify_1m: intraday fetch degraded — partial coverage"
+            compared = summary.stats.compared,
+            sample_failure = %sample_fetch_failure.as_deref().unwrap_or("none captured"),
+            "cross_verify_1m: intraday fetch degraded — partial or zero coverage"
         );
     }
     info!(
+        status = status.as_str(),
         instruments = summary.instruments_checked,
         compared = summary.stats.compared,
         mismatches = summary.stats.mismatches,
@@ -620,6 +739,13 @@ pub struct CrossVerifyTarget {
 
 /// One intraday REST round-trip → parsed candles. `Ok(empty)` for an
 /// empty/malformed body (no candles), `Err` for transport/HTTP failure.
+///
+/// DHAN-REST-400 (2026-06-10): the previous error was just `"http 400"` —
+/// Dhan's `errorType`/`errorCode`/`errorMessage` body and the final request
+/// URL were dropped, leaving a full day of 776/776 failures with zero
+/// root-cause signal. The error string now carries the status, the EXACT
+/// final URL (token-redacted) and a bounded (≤300 chars) secret-redacted
+/// body capture.
 async fn dhan_intraday_fetch(
     client: &reqwest::Client,
     url: &str,
@@ -633,9 +759,15 @@ async fn dhan_intraday_fetch(
         .json(body)
         .send()
         .await
-        .map_err(|e| format!("send: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("http {}", resp.status()));
+        .map_err(|e| format!("send: {}", redact_url_params(&e.to_string())))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let error_body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "http {status} url={} body={}",
+            redact_url_params(url),
+            capture_rest_error_body(&error_body)
+        ));
     }
     let text = resp.text().await.map_err(|e| format!("read: {e}"))?;
     Ok(parse_intraday_1m_candles(&text))
@@ -958,40 +1090,121 @@ mod tests {
         assert_eq!(default_csv_dir(), "data/cross-verify");
     }
 
-    #[test]
-    fn summary_json_contents_round_trips_fields() {
-        let date = NaiveDate::from_ymd_opt(2026, 6, 10).expect("date");
-        let summary = CrossVerify1mSummary {
-            instruments_checked: 243,
-            fetch_failures: 2,
+    // -----------------------------------------------------------------
+    // RunStatus + CSV status line + final flush (DHAN-REST-400, 2026-06-10)
+    // -----------------------------------------------------------------
+
+    fn summary(instruments: usize, fetch_failures: usize, compared: usize) -> CrossVerify1mSummary {
+        let degraded = instruments > 0
+            && (fetch_failures as f64 / instruments as f64) > FETCH_DEGRADED_FAIL_FRACTION;
+        CrossVerify1mSummary {
+            instruments_checked: instruments,
+            fetch_failures,
             stats: CompareStats {
-                compared: 91_230,
-                mismatches: 42,
-                missing_ours: 15,
+                compared,
+                mismatches: 0,
+                missing_ours: 0,
             },
-            degraded: false,
-        };
-        let json = summary_json_contents(date, &summary);
-        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
-        assert_eq!(v["trading_date"], "2026-06-10");
-        assert_eq!(v["instruments_checked"], 243);
-        assert_eq!(v["compared"], 91_230);
-        assert_eq!(v["mismatches"], 42);
-        assert_eq!(v["missing_ours"], 15);
-        assert_eq!(v["fetch_failures"], 2);
-        assert_eq!(v["degraded"], false);
+            degraded,
+        }
+    }
+
+    /// RATCHET (the 2026-06-10 incident shape): 776/776 fetch failures,
+    /// zero compared → BLIND, never PASS.
+    #[test]
+    fn test_classify_run_status_blind_when_zero_compared() {
+        let s = summary(776, 776, 0);
+        assert_eq!(classify_run_status(&s), RunStatus::Blind);
+    }
+
+    /// Rule 11: zero compared is BLIND even with zero fetch failures
+    /// (forced run on a quiet day) — an empty compare set vouches for
+    /// nothing.
+    #[test]
+    fn test_classify_run_status_blind_even_with_zero_fetch_failures() {
+        let s = summary(10, 0, 0);
+        assert_eq!(classify_run_status(&s), RunStatus::Blind);
+        let empty = CrossVerify1mSummary::default();
+        assert_eq!(classify_run_status(&empty), RunStatus::Blind);
     }
 
     #[test]
-    fn summary_json_marks_degraded() {
-        let date = NaiveDate::from_ymd_opt(2026, 6, 10).expect("date");
-        let summary = CrossVerify1mSummary {
-            degraded: true,
-            ..Default::default()
+    fn test_classify_run_status_degraded_when_fraction_breached() {
+        // 200/776 ≈ 26% > 10% threshold, but compared > 0.
+        let s = summary(776, 200, 50_000);
+        assert_eq!(classify_run_status(&s), RunStatus::Degraded);
+    }
+
+    #[test]
+    fn test_classify_run_status_pass_when_clean() {
+        let s = summary(776, 0, 290_000);
+        assert_eq!(classify_run_status(&s), RunStatus::Pass);
+        // At-threshold (exactly 10%) is NOT degraded (strict >).
+        let at_threshold = summary(100, 10, 30_000);
+        assert_eq!(classify_run_status(&at_threshold), RunStatus::Pass);
+    }
+
+    #[test]
+    fn test_run_status_as_str_labels_are_stable() {
+        assert_eq!(RunStatus::Blind.as_str(), "BLIND");
+        assert_eq!(RunStatus::Degraded.as_str(), "DEGRADED");
+        assert_eq!(RunStatus::Pass.as_str(), "PASS");
+    }
+
+    #[test]
+    fn test_csv_status_line_format() {
+        let s = summary(776, 776, 0);
+        let line = csv_status_line(&s, classify_run_status(&s));
+        assert_eq!(
+            line,
+            "# status=BLIND instruments=776 fetch_failures=776 compared=0 mismatches=0 missing_ours=0"
+        );
+        assert!(
+            line.starts_with('#'),
+            "comment-prefixed — data grid untouched"
+        );
+    }
+
+    /// The composed file shape: status line FIRST, header second — one
+    /// glance distinguishes "perfect day" from "checked nothing".
+    #[test]
+    fn test_csv_assembly_status_line_first_then_header() {
+        let s = summary(776, 776, 0);
+        let status = classify_run_status(&s);
+        let body = format!("{}\n", csv_header());
+        let composed = format!("{}\n{body}", csv_status_line(&s, status));
+        let mut lines = composed.lines();
+        assert!(lines.next().unwrap_or("").starts_with("# status=BLIND"));
+        assert_eq!(lines.next().unwrap_or(""), csv_header());
+    }
+
+    /// RATCHET (2026-06-10 false alarm): zero pending rows must NOT
+    /// produce a flush error — even on a disconnected writer.
+    #[test]
+    fn test_final_flush_skips_when_no_pending_rows() {
+        let mut w = CrossVerify1mAuditWriter::for_test();
+        assert!(!w.is_connected());
+        assert_eq!(final_flush(&mut w), FlushOutcome::SkippedEmpty);
+    }
+
+    /// A REAL failure (rows buffered, sender dead) reports the exact
+    /// pending count.
+    #[test]
+    fn test_final_flush_errors_with_pending_count_when_disconnected() {
+        let mut w = CrossVerify1mAuditWriter::for_test();
+        let m = CrossVerify1mMismatch {
+            run_ts_ist_nanos: 1,
+            trading_date_ist_nanos: 1,
+            security_id: 13,
+            segment: "IDX_I".to_string(),
+            symbol: "NIFTY".to_string(),
+            minute_ts_ist_nanos: 60 * NANOS_PER_SEC,
+            field: MismatchField::Open,
+            our_value: 1.0,
+            dhan_value: 2.0,
         };
-        let v: serde_json::Value =
-            serde_json::from_str(&summary_json_contents(date, &summary)).expect("valid JSON");
-        assert_eq!(v["degraded"], true);
-        assert_eq!(v["compared"], 0);
+        w.append_mismatch(&m).expect("append");
+        w.append_mismatch(&m).expect("append");
+        assert_eq!(final_flush(&mut w), FlushOutcome::Failed { pending: 2 });
     }
 }

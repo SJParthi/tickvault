@@ -1661,3 +1661,24 @@ rules:
       against the 60s conservation ledger. Operator inspects the
       tick_conservation_audit row for the exact per-stage numbers. Fires at
       most once per trading day by construction (15:40 scheduler).
+
+  # -----------------------------------------------------------------------
+  # REST-health canary (2026-06-10, task DHAN-REST-400)
+  # -----------------------------------------------------------------------
+
+  - name: rest-canary-01-probe-failed-escalate
+    match:
+      code: REST-CANARY-01
+    action: escalate
+    runbook_path: .claude/rules/project/dhan-rest-canary-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      REST-CANARY-01 = a scheduled GET /v2/profile health probe (09:05 /
+      12:00 / 15:25 IST) returned non-2xx or failed to send after one 30s
+      retry. Severity::High, NOT auto-fixable: the captured body names the
+      cause (data-plan expiry vs DH-901 token vs WAF/malformed URL) and
+      each requires a different operator action (renew plan on Dhan portal /
+      rotate token / fix base-URL override). Fires at most 3 times per
+      trading day by construction (3 fixed probe times). The operator reads
+      the body + url fields in the error payload per the runbook triage.

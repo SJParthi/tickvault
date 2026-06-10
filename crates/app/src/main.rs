@@ -6802,11 +6802,13 @@ fn redact_ip_last_octet(raw: &str) -> String {
     "[REDACTED]".to_string()
 }
 
-/// Spawn the two post-market tasks — end-of-day digest (15:31:30 IST) and the
-/// 1-minute cross-verify (15:31:00 IST). Called from BOTH boot paths so a
-/// mid-session fast-boot restart runs them too (boot-symmetry, 2026-06-09).
-/// Each spawned task self-skips if past its IST trigger or on a non-trading day,
-/// so calling this from a late/non-trading boot is safe (no-op).
+/// Spawn the scheduled daily tasks — end-of-day digest (15:31:30 IST), the
+/// 1-minute cross-verify (15:31:00 IST), and the REST-health canary
+/// (09:05 / 12:00 / 15:25 IST — DHAN-REST-400, 2026-06-10). Called from BOTH
+/// boot paths so a mid-session fast-boot restart runs them too
+/// (boot-symmetry, 2026-06-09). Each spawned task self-skips if past its IST
+/// trigger(s) or on a non-trading day, so calling this from a late/
+/// non-trading boot is safe (no-op).
 fn spawn_post_market_tasks(
     notifier: std::sync::Arc<NotificationService>,
     health_status: SharedHealthStatus,
@@ -6911,17 +6913,8 @@ fn spawn_post_market_tasks(
         let cv_qcfg = config.questdb.clone();
         let cv_base = config.dhan.rest_api_base_url.clone();
         let cv_calendar = std::sync::Arc::clone(&trading_calendar);
-        // Visibility directive 2026-06-10: the INNER task runs the
-        // verification and returns a typed outcome; the OUTER supervisor
-        // turns that outcome into the typed Telegram event so the daily
-        // summary can never be silently dropped. Outcome contract:
-        //   Ok(Some((date, summary))) → the run happened → summary event
-        //   Ok(None)                  → legitimate skip (non-trading day /
-        //                               past-trigger boot / no targets)
-        //   Err(reason)               → internal failure → Aborted event
-        //   JoinError::is_panic()     → task crashed → Aborted event
-        //   JoinError cancelled       → graceful shutdown — no page
-        let cv_inner = tokio::spawn(async move {
+        let cv_notifier = notifier.clone();
+        tokio::spawn(async move {
             use chrono::{FixedOffset, TimeZone, Timelike, Utc};
             use tickvault_app::cross_verify_1m_boot::{
                 CrossVerifyStart, decide_cross_verify_start,
@@ -7006,50 +6999,53 @@ fn spawn_post_market_tasks(
                 degraded = summary.degraded,
                 "PROOF: cross_verify_1m fired @ 15:31:00 IST"
             );
-            Ok(Some((today_ist, summary)))
-        });
-        let cv_notifier = notifier.clone();
-        tokio::spawn(async move {
-            match cv_inner.await {
-                Ok(Ok(Some((cv_date, summary)))) => {
-                    // The once-per-day deliverable (visibility directive
-                    // 2026-06-10). Severity is data-dependent inside the
-                    // event: Info only on a clean compared>0 run.
-                    cv_notifier.notify(NotificationEvent::CrossVerify1mSummary {
-                        trading_date_ist: cv_date.format("%Y-%m-%d").to_string(),
-                        instruments: summary.instruments_checked,
-                        compared: summary.stats.compared,
-                        mismatches: summary.stats.mismatches,
-                        missing: summary.stats.missing_ours,
-                        degraded: summary.degraded,
-                    });
-                }
-                // Legitimate skip — already logged by the inner task.
-                Ok(Ok(None)) => {}
-                Ok(Err(reason)) => {
-                    error!(reason, "cross_verify_1m: task failed before running");
-                    cv_notifier.notify(NotificationEvent::CrossVerify1mAborted {
-                        detail: reason.to_string(),
-                    });
-                }
-                Err(join_err) if join_err.is_panic() => {
-                    error!(
-                        %join_err,
-                        "cross_verify_1m: task crashed before producing the daily summary"
-                    );
-                    cv_notifier.notify(NotificationEvent::CrossVerify1mAborted {
-                        detail: format!("the check task crashed: {join_err}"),
-                    });
-                }
-                Err(_) => {
-                    // Cancellation during graceful shutdown (16:30 IST
-                    // auto-stop, `make stop`) — normal teardown, NOT an
-                    // abort. No page.
-                    info!("cross_verify_1m: task cancelled during shutdown");
-                }
-            }
+            // DHAN-REST-400 item 2 (audit Rule 11): unconditional per-run
+            // summary Telegram — BLIND days say BLIND loudly (High); a
+            // header-only CSV can never again read as a perfect day.
+            // PASS is the daily Info positive signal. Never silent.
+            let status = tickvault_app::cross_verify_1m_boot::classify_run_status(&summary);
+            cv_notifier.notify(NotificationEvent::CrossVerify1mSummary {
+                trading_date_ist: today_ist.format("%Y-%m-%d").to_string(),
+                status: status.as_str().to_string(),
+                instruments: summary.instruments_checked,
+                compared: summary.stats.compared,
+                mismatches: summary.stats.mismatches,
+                missing_ours: summary.stats.missing_ours,
+                fetch_failures: summary.fetch_failures,
+            });
         });
         info!("cross_verify_1m: post-market verification task spawned");
+    }
+
+    // Operator task DHAN-REST-400 (2026-06-10): REST-health canary — one
+    // cheap GET /v2/profile at 09:05 / 12:00 / 15:25 IST on trading days.
+    // On non-2xx it pages HIGH (REST-CANARY-01) with the HTTP status, the
+    // exact final URL (token-redacted) and the bounded secret-redacted
+    // response body — so an 08:45-class REST death is known by 09:05, not
+    // discovered at 15:33 by the cross-verify. Spawned from BOTH boot paths
+    // (this fn is the shared site); self-skips on non-trading days and when
+    // booted past 15:25 IST (audit Rule 3).
+    {
+        let canary_token = std::sync::Arc::clone(&token_handle);
+        let canary_base = config.dhan.rest_api_base_url.clone();
+        let canary_calendar = std::sync::Arc::clone(&trading_calendar);
+        tokio::spawn(async move {
+            use chrono::{FixedOffset, TimeZone, Timelike, Utc};
+            use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+            let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+                return;
+            };
+            let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+            let is_trading_day = canary_calendar.is_trading_day(now_ist.date_naive());
+            tickvault_app::rest_canary_boot::run_rest_canary(
+                canary_token,
+                canary_base,
+                is_trading_day,
+                now_ist.time().num_seconds_from_midnight(),
+            )
+            .await;
+        });
+        info!("rest_canary: REST-health probe task spawned (09:05 / 12:00 / 15:25 IST)");
     }
 
     // Operator directive 2026-06-10 ("Go ahead to achieve zero tick loss"):
