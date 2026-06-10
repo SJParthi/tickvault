@@ -141,13 +141,13 @@ const WAL_WRITER_BUFFER: usize = 256 * 1024;
 /// Backoff before the supervisor re-enters the writer loop after a panic or a
 /// fatal return, so a hard-failing writer cannot pin a CPU in a hot respawn
 /// loop. Mirrors the WS-GAP-05 pool-supervisor / DISK-WATCHER-01 backoff.
-const WAL_WRITER_RESPAWN_BACKOFF: Duration = Duration::from_millis(200);
+const WAL_WRITER_RESPAWN_BACKOFF: Duration = Duration::from_millis(200); // APPROVED: this IS the named constant the rule asks for
 
 /// Backoff after a transient disk write/flush/segment-open error before the
 /// writer retries, so a full or contended disk does not spin. The thread stays
 /// alive and keeps draining the channel — it never tears down the durable
 /// WAL floor for a transient I/O hiccup.
-const WAL_WRITER_IO_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+const WAL_WRITER_IO_RETRY_BACKOFF: Duration = Duration::from_millis(50); // APPROVED: this IS the named constant the rule asks for
 
 // ---------------------------------------------------------------------------
 // WsFrameSpill
@@ -597,6 +597,172 @@ fn crc32_ieee_of(chunks: &[&[u8]]) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// Daily conservation count — READ-ONLY scan for the 15:40 IST audit
+// (TICK-CONSERVE-01, operator directive 2026-06-10 "Go ahead to achieve
+// zero tick loss"). Unlike `replay_all` this NEVER archives or mutates —
+// it only counts frames attributable to one IST trading day across the
+// live segments AND `<wal_dir>/archive/` (where the boot replay moves
+// processed segments).
+// ---------------------------------------------------------------------------
+
+/// Per-day WAL frame counts for the daily tick-conservation audit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalDayFrameCounts {
+    /// Live-feed frames whose payload response code is a tick class
+    /// (Ticker=2 / Quote=4 / Full=8) attributed to the target IST day.
+    pub tick_frames: u64,
+    /// Live-feed frames of any other response code (OI, PrevClose,
+    /// MarketStatus, Disconnect, …) attributed to the target IST day.
+    pub other_frames: u64,
+    /// Records that cannot be day-attributed: legacy v1 records
+    /// (`frame_seq == 0`) or empty payloads. Counted EXPLICITLY so the
+    /// audit identity never silently miscounts them.
+    pub unattributable: u64,
+    /// Segments actually parsed (after the filename pre-filter).
+    pub segments_scanned: u64,
+    /// Segments that failed to open/parse (logged, scan continues).
+    pub corrupted_segments: u64,
+}
+
+/// Only scan segments created within this many days BEFORE the target day.
+/// Segments rotate at 128 MB and the prod box restarts daily, so a segment
+/// older than this cannot realistically carry target-day frames; the bound
+/// keeps the archive scan O(recent days) forever.
+const CONSERVATION_SEGMENT_LOOKBACK_DAYS: u64 = 3;
+
+/// IST day number (days since epoch, IST wall clock) for a wall-nanos value.
+/// `frame_seq` is wall-nanos-seeded and strictly monotonic, so it doubles as
+/// the frame's capture timestamp for day attribution.
+#[inline]
+#[must_use]
+pub fn ist_day_of_wall_nanos(wall_nanos: u64) -> u64 {
+    let secs = wall_nanos / 1_000_000_000;
+    let offset = i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS);
+    // APPROVED: offset is the positive +19800 IST constant; saturating add
+    // keeps the arithmetic total for any u64 input.
+    let ist_secs = secs.saturating_add(offset.unsigned_abs());
+    ist_secs / u64::from(tickvault_common::constants::SECONDS_PER_DAY)
+}
+
+/// Parses the creation-nanos out of a `ws-frames-{nanos:020}.wal` filename.
+/// Returns `None` for any other name shape (counted as scan-eligible so an
+/// unexpected name is never silently skipped).
+fn segment_creation_nanos(path: &Path) -> Option<u64> {
+    let stem = path.file_stem()?.to_str()?;
+    let digits = stem.strip_prefix("ws-frames-")?;
+    digits.parse::<u64>().ok()
+}
+
+/// Classifies one replayed frame into the audit buckets for `target_ist_day`.
+/// Pure — extracted for unit testing.
+#[must_use]
+pub fn classify_frame_for_day(
+    ws_type_is_live_feed: bool,
+    frame_seq: u64,
+    first_payload_byte: Option<u8>,
+    target_ist_day: u64,
+) -> Option<bool> {
+    // Returns: None = not countable for this day (other day / not live feed
+    // / unattributable handled by caller via frame_seq==0 check);
+    // Some(true) = tick frame; Some(false) = other live-feed frame.
+    if !ws_type_is_live_feed || frame_seq == 0 {
+        return None;
+    }
+    if ist_day_of_wall_nanos(frame_seq) != target_ist_day {
+        return None;
+    }
+    let code = first_payload_byte?;
+    // Hostile-review C1: the dispatcher parses BOTH code 1 (index ticker)
+    // and code 2 (ticker) into `ParsedFrame::Tick` — under the IDX_I-heavy
+    // universe, omitting code 1 here would bias delivery_residual
+    // permanently negative and mask real leaks. Tick classes = {1, 2, 4, 8},
+    // exactly the dispatcher arms that increment `tv_ticks_processed_total`.
+    Some(matches!(
+        code,
+        tickvault_common::constants::RESPONSE_CODE_INDEX_TICKER
+            | tickvault_common::constants::RESPONSE_CODE_TICKER
+            | tickvault_common::constants::RESPONSE_CODE_QUOTE
+            | tickvault_common::constants::RESPONSE_CODE_FULL
+    ))
+}
+
+/// Counts WAL frames attributable to `target_ist_day` across the live
+/// segments and `<wal_dir>/archive/`. READ-ONLY — never archives, never
+/// deletes; safe to run while the writer is appending (the replay parser
+/// stops cleanly at a partial tail). Cold path: once per trading day.
+// TEST-EXEMPT: orchestration over replay_segment; classification + day-attribution unit-tested via the test_count_frames_* suite
+pub fn count_frames_for_ist_day<P: AsRef<Path>>(
+    wal_dir: P,
+    target_ist_day: u64,
+) -> WalDayFrameCounts {
+    let wal_dir = wal_dir.as_ref();
+    let mut counts = WalDayFrameCounts::default();
+
+    let mut segments: Vec<PathBuf> = Vec::new();
+    for dir in [wal_dir.to_path_buf(), wal_dir.join("archive")] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("wal") {
+                continue;
+            }
+            // Pre-filter: skip segments created too long before the target
+            // day to carry its frames (bounds the archive scan forever).
+            // Hostile-review M1: allow created_day == target_day + 1 — a
+            // frame stamped 23:59:59 can be drained into a segment whose
+            // creation nanos land just past the IST midnight boundary.
+            if let Some(nanos) = segment_creation_nanos(&path) {
+                let created_day = ist_day_of_wall_nanos(nanos);
+                if created_day > target_ist_day.saturating_add(1)
+                    || created_day
+                        < target_ist_day.saturating_sub(CONSERVATION_SEGMENT_LOOKBACK_DAYS)
+                {
+                    continue;
+                }
+            }
+            segments.push(path);
+        }
+    }
+    segments.sort();
+
+    for path in &segments {
+        match replay_segment(path) {
+            Ok(batch) => {
+                counts.segments_scanned = counts.segments_scanned.saturating_add(1);
+                for frame in &batch {
+                    let is_live = matches!(frame.ws_type, WsType::LiveFeed);
+                    if is_live && frame.frame_seq == 0 {
+                        counts.unattributable = counts.unattributable.saturating_add(1);
+                        continue;
+                    }
+                    match classify_frame_for_day(
+                        is_live,
+                        frame.frame_seq,
+                        frame.frame.first().copied(),
+                        target_ist_day,
+                    ) {
+                        Some(true) => {
+                            counts.tick_frames = counts.tick_frames.saturating_add(1);
+                        }
+                        Some(false) => {
+                            counts.other_frames = counts.other_frames.saturating_add(1);
+                        }
+                        None => {}
+                    }
+                }
+            }
+            Err(err) => {
+                counts.corrupted_segments = counts.corrupted_segments.saturating_add(1);
+                warn!(segment = ?path, error = %err, "conservation count: segment unreadable; continuing");
+            }
+        }
+    }
+    counts
+}
+
+// ---------------------------------------------------------------------------
 // Replay — walk every `.wal` file, parse records, return recovered frames.
 // Corrupted / truncated tails are logged and skipped. Processed segments are
 // moved to `<wal_dir>/archive/` so the next session starts clean.
@@ -811,6 +977,117 @@ mod tests {
         // CRC32 of "123456789" = 0xCBF43926
         let c = crc32_ieee_of(&[b"123456789"]);
         assert_eq!(c, 0xCBF4_3926);
+    }
+
+    // --- TICK-CONSERVE-01: daily conservation count (read-only scan) ---
+
+    fn now_wall_nanos() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn test_count_frames_for_ist_day_classifies_tick_codes() {
+        let dir = tmp_dir("conserve-classify");
+        let today = ist_day_of_wall_nanos(now_wall_nanos());
+        {
+            let spill = WsFrameSpill::new(&dir).unwrap();
+            // 3 tick-class frames (response codes 2, 4, 8 in byte 0)...
+            spill.append(WsType::LiveFeed, vec![2, 0, 0, 0]);
+            spill.append(WsType::LiveFeed, vec![4, 0, 0, 0]);
+            spill.append(WsType::LiveFeed, vec![8, 0, 0, 0]);
+            // ...one non-tick live frame (PrevClose=6) and one order-update.
+            spill.append(WsType::LiveFeed, vec![6, 0, 0, 0]);
+            spill.append(WsType::OrderUpdate, b"{}".to_vec());
+            wait_until_persisted(&spill, 5);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        let counts = count_frames_for_ist_day(&dir, today);
+        assert_eq!(counts.tick_frames, 3, "{counts:?}");
+        assert_eq!(counts.other_frames, 1, "{counts:?}");
+        assert_eq!(counts.unattributable, 0, "{counts:?}");
+        assert!(counts.segments_scanned >= 1);
+        assert_eq!(counts.corrupted_segments, 0);
+
+        // Read-only invariant: counting again yields the SAME numbers
+        // (replay_all would have archived; this must not).
+        let again = count_frames_for_ist_day(&dir, today);
+        assert_eq!(again, counts, "count scan must be read-only/idempotent");
+
+        // A different target day attributes nothing.
+        let other_day = count_frames_for_ist_day(&dir, today.saturating_sub(2));
+        assert_eq!(other_day.tick_frames, 0);
+        assert_eq!(other_day.other_frames, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_classify_frame_for_day_and_ist_day_of_wall_nanos() {
+        // Pure-fn surface: classification + day attribution.
+        let nanos_today = now_wall_nanos();
+        let today = ist_day_of_wall_nanos(nanos_today);
+        // tick code on today → Some(true)
+        assert_eq!(
+            classify_frame_for_day(true, nanos_today, Some(4), today),
+            Some(true)
+        );
+        // non-tick code on today → Some(false)
+        assert_eq!(
+            classify_frame_for_day(true, nanos_today, Some(6), today),
+            Some(false)
+        );
+        // wrong day → None
+        assert_eq!(
+            classify_frame_for_day(true, nanos_today, Some(4), today + 1),
+            None
+        );
+        // order-update ws_type → None
+        assert_eq!(
+            classify_frame_for_day(false, nanos_today, Some(4), today),
+            None
+        );
+        // v1 legacy (frame_seq == 0) → None (caller buckets as unattributable)
+        assert_eq!(classify_frame_for_day(true, 0, Some(4), today), None);
+        // empty payload → None
+        assert_eq!(classify_frame_for_day(true, nanos_today, None, today), None);
+        // IST midnight boundary: 18:30 UTC == 00:00 IST next day.
+        let utc_1829 = 1_770_000_000_u64; // arbitrary anchor
+        let day_a = ist_day_of_wall_nanos(utc_1829 * 1_000_000_000);
+        let day_b = ist_day_of_wall_nanos((utc_1829 + 86_400) * 1_000_000_000);
+        assert_eq!(day_b, day_a + 1, "IST day must advance exactly daily");
+    }
+
+    #[test]
+    fn test_count_frames_scans_archive_dir() {
+        let dir = tmp_dir("conserve-archive");
+        let today = ist_day_of_wall_nanos(now_wall_nanos());
+        {
+            let spill = WsFrameSpill::new(&dir).unwrap();
+            spill.append(WsType::LiveFeed, vec![4, 1, 2, 3]);
+            wait_until_persisted(&spill, 1);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Simulate the boot replay's archive move, then count: the frame
+        // must STILL be found (archive/ is part of the day's record).
+        let archive = dir.join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        for entry in std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()) {
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("wal") {
+                let dst = archive.join(p.file_name().unwrap());
+                std::fs::rename(&p, dst).unwrap();
+            }
+        }
+
+        let counts = count_frames_for_ist_day(&dir, today);
+        assert_eq!(counts.tick_frames, 1, "{counts:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

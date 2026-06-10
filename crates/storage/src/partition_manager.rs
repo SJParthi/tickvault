@@ -60,6 +60,9 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     "prev_day_ohlcv",
     "cross_verify_1m_audit",
     "index_constituency",
+    // TICK-CONSERVE-01 (2026-06-10): one row per daily conservation-audit
+    // run — same SEBI-audit class + DAY partitioning as cross_verify_1m_audit.
+    "tick_conservation_audit",
 ];
 
 /// Tables EXEMPT from retention sweeping — NEVER detached or dropped.
