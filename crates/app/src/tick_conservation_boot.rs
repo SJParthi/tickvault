@@ -1,0 +1,559 @@
+//! Daily end-to-end tick-conservation audit (TICK-CONSERVE-01).
+//!
+//! Operator directive 2026-06-10 (verbatim): *"Go ahead to achieve zero tick
+//! loss"* — following the suspicion *"maybe in some cases we are removing
+//! ticks … or dropping or … duplicating or … missing or … miss replaying or
+//! wal or being buffer or spill or dlq or in memory ram or db"*.
+//!
+//! At **15:40:00 IST** each trading day (after the 15:31 cross-verify and the
+//! post-close flushes) this auditor reconciles the THREE independent tick
+//! record stores end-to-end and writes one forensic row to
+//! `tick_conservation_audit`:
+//!
+//! 1. **WAL disk log** — every frame Dhan delivered, captured durably at the
+//!    socket (`ws_frame_spill::count_frames_for_ist_day`, read-only scan).
+//! 2. **Processor outcome counters** — self-scraped from the app's own
+//!    `/metrics` endpoint (loopback).
+//! 3. **QuestDB `ticks` rows** — `select count()` windowed to the IST day.
+//!
+//! The conservation identities (pure functions, unit-tested):
+//!
+//! ```text
+//! delivery_residual = wal_tick_frames − processed
+//! outcome_residual  = processed − (persisted + junk + stale_day
+//!                                  + outside_hours + dedup + storage_errors)
+//! ```
+//!
+//! Both zero + full-session coverage → `balanced` (`info!`). Either positive
+//! → `error!` with `code = TICK-CONSERVE-01` (→ Telegram via the 5-sink
+//! chain). Missing sources or a mid-session boot → `partial` (honest "cannot
+//! vouch", never a false OK — audit-findings Rule 11).
+//!
+//! Runbook: `.claude/rules/project/tick-conservation-audit-error-codes.md`.
+
+use std::path::Path;
+use std::time::Duration;
+
+use tracing::{error, info, warn};
+
+use tickvault_common::config::QuestDbConfig;
+use tickvault_common::error_code::ErrorCode;
+use tickvault_storage::tick_conservation_audit_persistence::{
+    ConservationOutcome, TickConservationAuditWriter, TickConservationRow,
+    ensure_tick_conservation_audit_table,
+};
+use tickvault_storage::ws_frame_spill::{WalDayFrameCounts, count_frames_for_ist_day};
+
+/// IST seconds-of-day for the conservation-audit trigger (15:40:00) — after
+/// the 15:31 cross-verify and the post-close flush windows.
+const CONSERVATION_TRIGGER_SECS_OF_DAY_IST: u32 = 15 * 3600 + 40 * 60; // 56_400
+
+/// IST seconds-of-day for market open (09:00:00). A process that booted at or
+/// after this instant cannot have counters covering the full session →
+/// `partial_coverage`.
+const MARKET_OPEN_SECS_OF_DAY_IST: u32 = 9 * 3600;
+
+/// HTTP timeout for the loopback metrics scrape + QuestDB count query.
+const AUDIT_HTTP_TIMEOUT_SECS: u64 = 10;
+
+/// `true` when a process that booted at `boot_secs_of_day_ist` covers the
+/// full trading session — i.e. its since-boot counters can vouch for every
+/// market-hours tick. Pure; the spawn site captures boot time once.
+#[must_use]
+pub fn boot_covers_full_session(boot_secs_of_day_ist: u32) -> bool {
+    boot_secs_of_day_ist < MARKET_OPEN_SECS_OF_DAY_IST
+}
+
+/// Decision for WHEN the conservation audit should fire. Mirrors
+/// `cross_verify_1m_boot::CrossVerifyStart`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConservationStart {
+    /// Not a trading day and not forced → do not run.
+    SkipNonTradingDay,
+    /// Past 15:40 IST on a normal (non-forced) boot → mid-evening boot, skip.
+    SkipPastTrigger,
+    /// Run immediately — operator forced an on-demand run.
+    RunNow,
+    /// Sleep this many seconds, then run at 15:40:00 IST.
+    SleepThenRun(u64),
+}
+
+/// Pure decision: when should the conservation audit fire.
+///
+/// `force_now` (the `TICKVAULT_TICK_CONSERVE_NOW` env var) overrides both
+/// gates so the operator can prove the pipeline on demand; a forced run on a
+/// quiet day simply produces a `partial`/zero-count row, never fabricated
+/// numbers.
+#[must_use]
+pub fn decide_conservation_start(
+    now_secs_of_day_ist: u32,
+    is_trading_day: bool,
+    force_now: bool,
+) -> ConservationStart {
+    if force_now {
+        return ConservationStart::RunNow;
+    }
+    if !is_trading_day {
+        return ConservationStart::SkipNonTradingDay;
+    }
+    if now_secs_of_day_ist >= CONSERVATION_TRIGGER_SECS_OF_DAY_IST {
+        return ConservationStart::SkipPastTrigger;
+    }
+    ConservationStart::SleepThenRun(u64::from(
+        CONSERVATION_TRIGGER_SECS_OF_DAY_IST - now_secs_of_day_ist,
+    ))
+}
+
+/// Parses one counter value out of a Prometheus exposition body. Pure.
+///
+/// Matches the EXACT metric name as a whole token (no label set — the tick
+/// outcome counters are all label-free) and parses its value as f64 →
+/// truncated u64 (exporter renders counters as floats, e.g. `1.23e6`).
+/// Returns `None` when the metric is absent or unparseable — the caller
+/// treats that as `partial` coverage, never as zero.
+#[must_use]
+pub fn parse_prom_counter(body: &str, name: &str) -> Option<u64> {
+    for line in body.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let (Some(metric), Some(raw)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if metric == name {
+            let v = raw.parse::<f64>().ok()?;
+            if !v.is_finite() || v < 0.0 {
+                return None;
+            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            // APPROVED: counter values are non-negative finite; u64 truncation
+            // of an exact integral float is the intended conversion.
+            return Some(v as u64);
+        }
+    }
+    None
+}
+
+/// The processor outcome counters scraped from `/metrics`. Every field is
+/// `Option` — a missing counter marks the run `partial`, never silently zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutcomeCounters {
+    pub processed: Option<u64>,
+    pub persisted: Option<u64>,
+    pub junk: Option<u64>,
+    pub stale_day: Option<u64>,
+    pub outside_hours: Option<u64>,
+    pub dedup: Option<u64>,
+    pub parse_errors: Option<u64>,
+    pub storage_errors: Option<u64>,
+    pub dropped_total: Option<u64>,
+}
+
+impl OutcomeCounters {
+    /// Parses all nine counters from one exposition body. Pure.
+    #[must_use]
+    pub fn from_metrics_body(body: &str) -> Self {
+        Self {
+            processed: parse_prom_counter(body, "tv_ticks_processed_total"),
+            persisted: parse_prom_counter(body, "tv_ticks_persisted_total"),
+            junk: parse_prom_counter(body, "tv_junk_ticks_filtered_total"),
+            stale_day: parse_prom_counter(body, "tv_stale_day_filtered_total"),
+            outside_hours: parse_prom_counter(body, "tv_outside_hours_filtered_total"),
+            dedup: parse_prom_counter(body, "tv_dedup_filtered_total"),
+            parse_errors: parse_prom_counter(body, "tv_parse_errors_total"),
+            storage_errors: parse_prom_counter(body, "tv_storage_errors_total"),
+            dropped_total: parse_prom_counter(body, "tv_ticks_dropped_total"),
+        }
+    }
+
+    /// `true` when every identity-bearing counter is present. (`parse_errors`
+    /// and `dropped_total` are reported but not part of the tick identities —
+    /// parse errors never became ticks; drops are a subset of storage flow.)
+    #[must_use]
+    pub fn identity_complete(&self) -> bool {
+        self.processed.is_some()
+            && self.persisted.is_some()
+            && self.junk.is_some()
+            && self.stale_day.is_some()
+            && self.outside_hours.is_some()
+            && self.dedup.is_some()
+            && self.storage_errors.is_some()
+    }
+}
+
+/// The two conservation residuals. Pure.
+///
+/// `delivery_residual = wal_tick_frames − processed` — positive means frames
+/// Dhan delivered (durably in the WAL) never reached the processor.
+/// `outcome_residual = processed − (persisted + junk + stale_day +
+/// outside_hours + dedup + storage_errors)` — positive means an in-process
+/// leak. Negative values are possible (boot replay re-processing yesterday's
+/// frames inflates `processed` vs today's WAL count) and are NOT leaks.
+#[must_use]
+pub fn compute_residuals(wal_tick_frames: u64, c: &OutcomeCounters) -> (i64, i64) {
+    let processed = c.processed.unwrap_or(0);
+    let accounted = c
+        .persisted
+        .unwrap_or(0)
+        .saturating_add(c.junk.unwrap_or(0))
+        .saturating_add(c.stale_day.unwrap_or(0))
+        .saturating_add(c.outside_hours.unwrap_or(0))
+        .saturating_add(c.dedup.unwrap_or(0))
+        .saturating_add(c.storage_errors.unwrap_or(0));
+    // APPROVED: i64::try_from of realistic daily counts (≪ i64::MAX); clamp
+    // keeps the arithmetic total for adversarial inputs.
+    let to_i64 = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+    let delivery = to_i64(wal_tick_frames).saturating_sub(to_i64(processed));
+    let outcome = to_i64(processed).saturating_sub(to_i64(accounted));
+    (delivery, outcome)
+}
+
+/// Final verdict. Pure.
+///
+/// `partial` wins over `leak`: when coverage is incomplete the residuals are
+/// not trustworthy numbers, so the row says "cannot vouch" instead of paging
+/// with arithmetic built on missing inputs (false-OK Rule 11 — and equally,
+/// no false ALARM from a known-incomplete identity).
+#[must_use]
+pub fn classify_outcome(
+    delivery_residual: i64,
+    outcome_residual: i64,
+    partial_coverage: bool,
+) -> ConservationOutcome {
+    if partial_coverage {
+        return ConservationOutcome::Partial;
+    }
+    if delivery_residual > 0 || outcome_residual > 0 {
+        return ConservationOutcome::Leak;
+    }
+    ConservationOutcome::Balanced
+}
+
+/// Parses the QuestDB `/exec` count response (`{"dataset":[[N]]}`). Pure.
+#[must_use]
+pub fn parse_questdb_count(body: &str) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    v.get("dataset")?.get(0)?.get(0)?.as_i64()
+}
+
+/// Runs the end-to-end conservation audit once. Cold path (once/day).
+///
+/// Fail-soft everywhere: a missing source flips the row to `partial` and the
+/// run still records whatever it could measure — absence of a source is
+/// never camouflaged as a zero.
+// APPROVED: cold-path orchestrator — 7 independent live inputs (wal dir, questdb cfg, metrics port, day numbers, run ts, boot coverage flag); bundling would only relocate the arity.
+#[allow(clippy::too_many_arguments)]
+// TEST-EXEMPT: orchestration over unit-tested pure parts (decide/parse/
+// residuals/classify/persistence); a direct test needs live QuestDB +
+// metrics endpoints — covered operationally by TICKVAULT_TICK_CONSERVE_NOW.
+pub async fn run_tick_conservation_audit(
+    wal_dir: &Path,
+    questdb_config: &QuestDbConfig,
+    metrics_port: u16,
+    target_ist_day: u64,
+    trading_date_ist_nanos: i64,
+    run_ts_ist_nanos: i64,
+    boot_covered_full_session: bool,
+) {
+    ensure_tick_conservation_audit_table(questdb_config).await;
+
+    // 1. WAL disk-log counts (read-only scan; blocking file I/O off the
+    //    async worker via spawn_blocking).
+    let wal_dir_owned = wal_dir.to_path_buf();
+    let wal: WalDayFrameCounts = match tokio::task::spawn_blocking(move || {
+        count_frames_for_ist_day(&wal_dir_owned, target_ist_day)
+    })
+    .await
+    {
+        Ok(c) => c,
+        Err(err) => {
+            error!(?err, "tick_conservation: WAL count task failed");
+            WalDayFrameCounts::default()
+        }
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(AUDIT_HTTP_TIMEOUT_SECS))
+        .build()
+        .ok();
+
+    // 2. Self-scrape the outcome counters from the app's own exporter.
+    let mut counters = OutcomeCounters::default();
+    let mut sources_complete = true;
+    if let Some(ref client) = client {
+        let url = format!("http://127.0.0.1:{metrics_port}/metrics");
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.text().await {
+                Ok(body) => counters = OutcomeCounters::from_metrics_body(&body),
+                Err(err) => {
+                    warn!(?err, "tick_conservation: metrics body read failed");
+                }
+            },
+            Ok(resp) => warn!(status = %resp.status(), "tick_conservation: metrics scrape non-2xx"),
+            Err(err) => warn!(?err, "tick_conservation: metrics scrape failed"),
+        }
+    }
+    if !counters.identity_complete() {
+        sources_complete = false;
+    }
+
+    // 3. QuestDB row count for the IST day window. `ts` stores IST-epoch
+    //    nanos, so the day window is [day*86400, (day+1)*86400) seconds in
+    //    ts-space (data-integrity.md).
+    let mut db_rows: i64 = -1;
+    if let Some(ref client) = client {
+        // APPROVED: u64→i64 — IST day numbers are ~20K, far below i64::MAX.
+        let day_start_nanos = i64::try_from(target_ist_day)
+            .unwrap_or(0)
+            .saturating_mul(86_400)
+            .saturating_mul(1_000_000_000);
+        let day_end_nanos = day_start_nanos.saturating_add(86_400_000_000_000);
+        let sql = format!(
+            "select count() from ticks where ts >= {day_start_nanos} and ts < {day_end_nanos}"
+        );
+        let url = format!(
+            "http://{}:{}/exec",
+            questdb_config.host, questdb_config.http_port
+        );
+        match client
+            .get(&url)
+            .query(&[("query", sql.as_str())])
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(body) = resp.text().await {
+                    db_rows = parse_questdb_count(&body).unwrap_or(-1);
+                }
+            }
+            Ok(resp) => warn!(status = %resp.status(), "tick_conservation: ticks count non-2xx"),
+            Err(err) => warn!(?err, "tick_conservation: ticks count query failed"),
+        }
+    }
+    if db_rows < 0 {
+        sources_complete = false;
+    }
+
+    // 4. Residuals + verdict (pure).
+    let (delivery_residual, outcome_residual) = compute_residuals(wal.tick_frames, &counters);
+    let partial_coverage = !boot_covered_full_session || !sources_complete;
+    let outcome = classify_outcome(delivery_residual, outcome_residual, partial_coverage);
+
+    metrics::counter!("tv_tick_conservation_audit_runs_total", "outcome" => outcome.as_str())
+        .increment(1);
+
+    let to_i64 = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+    let row = TickConservationRow {
+        run_ts_ist_nanos,
+        trading_date_ist_nanos,
+        wal_tick_frames: to_i64(wal.tick_frames),
+        wal_other_frames: to_i64(wal.other_frames),
+        wal_unattributable: to_i64(wal.unattributable),
+        db_rows,
+        processed: to_i64(counters.processed.unwrap_or(0)),
+        persisted: to_i64(counters.persisted.unwrap_or(0)),
+        junk: to_i64(counters.junk.unwrap_or(0)),
+        stale_day: to_i64(counters.stale_day.unwrap_or(0)),
+        outside_hours: to_i64(counters.outside_hours.unwrap_or(0)),
+        dedup: to_i64(counters.dedup.unwrap_or(0)),
+        parse_errors: to_i64(counters.parse_errors.unwrap_or(0)),
+        storage_errors: to_i64(counters.storage_errors.unwrap_or(0)),
+        dropped_total: to_i64(counters.dropped_total.unwrap_or(0)),
+        delivery_residual,
+        outcome_residual,
+        partial_coverage,
+        outcome,
+    };
+
+    // 5. Operator signal (audit Rule 5: a leak is error! with code).
+    match outcome {
+        ConservationOutcome::Leak => {
+            error!(
+                code = ErrorCode::TickConserve01DailyResidual.code_str(),
+                wal_tick_frames = wal.tick_frames,
+                processed = counters.processed.unwrap_or(0),
+                persisted = counters.persisted.unwrap_or(0),
+                db_rows,
+                delivery_residual,
+                outcome_residual,
+                "TICK-CONSERVE-01: daily conservation residual — ticks delivered \
+                 by Dhan did not all reach a known outcome (WAL still holds them; \
+                 see tick_conservation_audit + runbook)"
+            );
+        }
+        ConservationOutcome::Partial => {
+            warn!(
+                wal_tick_frames = wal.tick_frames,
+                db_rows,
+                boot_covered_full_session,
+                sources_complete,
+                "tick_conservation: PARTIAL coverage — cannot vouch for the full \
+                 session (mid-day boot or a source unavailable); row recorded"
+            );
+        }
+        ConservationOutcome::Balanced => {
+            info!(
+                wal_tick_frames = wal.tick_frames,
+                wal_other_frames = wal.other_frames,
+                db_rows,
+                processed = counters.processed.unwrap_or(0),
+                persisted = counters.persisted.unwrap_or(0),
+                "tick conservation BALANCED — every tick Dhan delivered reached a \
+                 known outcome (WAL == processed == persisted + filters; see \
+                 tick_conservation_audit)"
+            );
+        }
+    }
+
+    // 6. Forensic row (fail-soft).
+    let mut writer = TickConservationAuditWriter::new(questdb_config);
+    if let Err(err) = writer.append_row(&row) {
+        error!(?err, "tick_conservation: audit row append failed");
+        return;
+    }
+    if let Err(err) = writer.flush() {
+        error!(
+            ?err,
+            "tick_conservation: audit row flush failed (QuestDB down?)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decide_conservation_start_before_after_force() {
+        // 15:39:00 IST → sleep 60s to 15:40:00.
+        let now = 15 * 3600 + 39 * 60;
+        assert_eq!(
+            decide_conservation_start(now, true, false),
+            ConservationStart::SleepThenRun(60)
+        );
+        // At/after the trigger → skip (mid-evening boot).
+        assert_eq!(
+            decide_conservation_start(CONSERVATION_TRIGGER_SECS_OF_DAY_IST, true, false),
+            ConservationStart::SkipPastTrigger
+        );
+        // Non-trading day → skip.
+        assert_eq!(
+            decide_conservation_start(now, false, false),
+            ConservationStart::SkipNonTradingDay
+        );
+        // Force overrides both gates.
+        assert_eq!(
+            decide_conservation_start(now + 7200, false, true),
+            ConservationStart::RunNow
+        );
+        // Trigger constant pin: 15:40:00 IST.
+        assert_eq!(CONSERVATION_TRIGGER_SECS_OF_DAY_IST, 56_400);
+        assert_eq!(MARKET_OPEN_SECS_OF_DAY_IST, 32_400);
+        // Boot-coverage helper: pre-09:00 boot covers the session; later not.
+        assert!(boot_covers_full_session(8 * 3600 + 35 * 60));
+        assert!(!boot_covers_full_session(MARKET_OPEN_SECS_OF_DAY_IST));
+        assert!(!boot_covers_full_session(11 * 3600));
+    }
+
+    #[test]
+    fn test_parse_prom_counter() {
+        let body = "# HELP tv_ticks_processed_total x\n\
+                    # TYPE tv_ticks_processed_total counter\n\
+                    tv_ticks_processed_total 123456\n\
+                    tv_ticks_persisted_total 1.23e3\n\
+                    tv_junk_ticks_filtered_total{label=\"x\"} 7\n";
+        assert_eq!(
+            parse_prom_counter(body, "tv_ticks_processed_total"),
+            Some(123_456)
+        );
+        // Float exposition format parses.
+        assert_eq!(
+            parse_prom_counter(body, "tv_ticks_persisted_total"),
+            Some(1_230)
+        );
+        // A labelled series does NOT match the bare name (exact token).
+        assert_eq!(
+            parse_prom_counter(body, "tv_junk_ticks_filtered_total"),
+            None
+        );
+        // Absent metric → None (never silently zero).
+        assert_eq!(parse_prom_counter(body, "tv_absent_total"), None);
+        // Negative / non-finite → None.
+        assert_eq!(parse_prom_counter("m -1\n", "m"), None);
+        assert_eq!(parse_prom_counter("m NaN\n", "m"), None);
+    }
+
+    #[test]
+    fn test_compute_residuals() {
+        let c = OutcomeCounters {
+            processed: Some(1_000),
+            persisted: Some(900),
+            junk: Some(10),
+            stale_day: Some(40),
+            outside_hours: Some(30),
+            dedup: Some(15),
+            parse_errors: Some(0),
+            storage_errors: Some(5),
+            dropped_total: Some(0),
+        };
+        // 900+10+40+30+15+5 = 1000 → outcome balanced; WAL 1_000 → delivery 0.
+        assert_eq!(compute_residuals(1_000, &c), (0, 0));
+        // WAL saw 1_050 frames but only 1_000 processed → delivery leak 50.
+        assert_eq!(compute_residuals(1_050, &c), (50, 0));
+        // Boot replay can legitimately make processed exceed today's WAL
+        // count → negative delivery residual is NOT a leak.
+        assert_eq!(compute_residuals(900, &c).0, -100);
+        // An unaccounted outcome: drop persisted by 25 → outcome leak 25.
+        let mut leaky = c;
+        leaky.persisted = Some(875);
+        assert_eq!(compute_residuals(1_000, &leaky), (0, 25));
+    }
+
+    #[test]
+    fn test_classify_outcome_partial_leak_balanced() {
+        use ConservationOutcome as O;
+        assert_eq!(classify_outcome(0, 0, false), O::Balanced);
+        assert_eq!(classify_outcome(1, 0, false), O::Leak);
+        assert_eq!(classify_outcome(0, 1, false), O::Leak);
+        // Negative residuals (boot replay inflation) are NOT leaks.
+        assert_eq!(classify_outcome(-100, 0, false), O::Balanced);
+        // Partial coverage wins over leak — residuals on missing inputs are
+        // not trustworthy numbers (no false alarm, no false OK).
+        assert_eq!(classify_outcome(50, 50, true), O::Partial);
+        assert_eq!(classify_outcome(0, 0, true), O::Partial);
+    }
+
+    #[test]
+    fn test_parse_questdb_count() {
+        assert_eq!(
+            parse_questdb_count(r#"{"dataset":[[42]],"count":1}"#),
+            Some(42)
+        );
+        assert_eq!(parse_questdb_count(r#"{"dataset":[]}"#), None);
+        assert_eq!(parse_questdb_count("not json"), None);
+    }
+
+    #[test]
+    fn test_outcome_counters_identity_complete() {
+        let mut c = OutcomeCounters {
+            processed: Some(1),
+            persisted: Some(1),
+            junk: Some(0),
+            stale_day: Some(0),
+            outside_hours: Some(0),
+            dedup: Some(0),
+            parse_errors: None, // not identity-bearing
+            storage_errors: Some(0),
+            dropped_total: None, // not identity-bearing
+        };
+        assert!(c.identity_complete());
+        c.persisted = None;
+        assert!(!c.identity_complete());
+    }
+}
