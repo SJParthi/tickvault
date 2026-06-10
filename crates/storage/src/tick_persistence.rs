@@ -536,7 +536,23 @@ impl TickPersistenceWriter {
             .as_mut()
             .context("sender unavailable in force_flush")?;
 
-        if let Err(err) = sender.flush(&mut self.buffer) {
+        // Latency-hunt follow-up (operator directive 2026-06-10, PR #1090
+        // recommendation): time the actual ILP TCP write so the dashboard
+        // can show batch-flush cost SEPARATELY from per-tick processing.
+        // The `_duration_ns` suffix auto-inherits the exporter's
+        // TICK_NS_HISTOGRAM_BUCKETS (100 ns → 10 s). Cold path: flushes
+        // fire ≤ ~10×/sec (1-in-1000 ticks or the 1 s timer), so the
+        // macro's registry lookup here is NOT a hot-path cost. Recorded
+        // on the failure path too — the time spent until the TCP error is
+        // real latency the operator should see.
+        let flush_start = std::time::Instant::now();
+        let flush_result = sender.flush(&mut self.buffer);
+        #[allow(clippy::cast_precision_loss)]
+        // APPROVED: same as the tick-duration histogram cast in tick_processor
+        metrics::histogram!("tv_tick_flush_duration_ns")
+            .record(flush_start.elapsed().as_nanos() as f64);
+
+        if let Err(err) = flush_result {
             // Sender is broken — rescue in-flight ticks to ring buffer
             // BEFORE clearing state, so no data is lost.
             self.sender = None;
@@ -2169,6 +2185,33 @@ mod tests {
              vouch for it. Validate the new name via the checked ::new() \
              path or extend this test's allowlist WITH a matching \
              explicit validation."
+        );
+    }
+
+    /// Latency-hunt follow-up ratchet (operator directive 2026-06-10):
+    /// `force_flush` MUST record the batch-flush duration into
+    /// `tv_tick_flush_duration_ns` so the operator dashboard can show
+    /// flush cost separately from per-tick processing. The `_duration_ns`
+    /// suffix is load-bearing — it is what makes the exporter render the
+    /// metric as a bucketed histogram (Matcher::Suffix in observability.rs).
+    #[test]
+    fn test_force_flush_records_flush_duration_histogram() {
+        let source = include_str!("tick_persistence.rs");
+        let fn_start = source
+            .find("pub fn force_flush(")
+            .unwrap_or_else(|| panic!("force_flush must exist"));
+        let fn_region = &source[fn_start..source.len().min(fn_start + 3000)];
+        assert!(
+            fn_region.contains("tv_tick_flush_duration_ns"),
+            "force_flush must record the tv_tick_flush_duration_ns histogram \
+             around the ILP sender flush — the dashboard's flush-latency tile \
+             reads it"
+        );
+        let metric = "tv_tick_flush_duration_ns";
+        assert!(
+            metric.ends_with("_duration_ns"),
+            "flush metric must keep the _duration_ns suffix so the exporter's \
+             Matcher::Suffix bucket config applies"
         );
     }
 
