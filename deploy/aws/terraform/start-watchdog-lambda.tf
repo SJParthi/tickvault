@@ -1,16 +1,23 @@
-# Instance start-watchdog Lambda — answers "who monitors the 08:00 start?".
+# Instance start-watchdog Lambda — answers "who monitors the 08:30 start?".
 #
 # 2026-06-02 incident: the EventBridge -> SSM-Automation 08:30 start silently
-# failed and NOTHING alerted the operator until he noticed by hand. aws-autopilot
-# (GitHub Actions, every 15 min) now covers it, but it depends on the GH runner
-# firing. This Lambda is the AWS-native belt-and-suspenders: it runs IN AWS, so
-# it alerts even if GitHub Actions is down.
+# failed and NOTHING alerted the operator until he noticed by hand.
+# 2026-06-10 REPEAT: same silent start failure; the operator's manual 08:43
+# start beat the 08:45 check, so detection alone stayed silent and the broken
+# start path went unflagged. The Lambda therefore now (a) SELF-HEALS — issues
+# ec2:StartInstances itself when the box is down at 08:45 — and (b) flags a
+# running-but-launched-LATE box so a masked auto-start failure still pages.
+# aws-autopilot (GitHub Actions, every 15 min) also covers it, but depends on
+# the GH runner firing. This Lambda is the AWS-native belt-and-suspenders: it
+# runs IN AWS, so it detects AND heals even if GitHub Actions is down.
 #
 # Two EventBridge schedules invoke the same Lambda with a `mode` input:
 #   * ping  @ 03:00 UTC = 08:30 IST (fires with daily_start) -> positive
 #     "start triggered" Telegram.
 #   * check @ 03:15 UTC = 08:45 IST -> ec2:DescribeInstances; if NOT running,
-#     Severity::Critical "08:30 auto-start FAILED" Telegram. Silent if healthy.
+#     ec2:StartInstances (self-heal) + Severity::Critical Telegram. If running
+#     but LaunchTime is after 03:05 UTC, a "started late" warning. Silent only
+#     when the box came up on time.
 #
 # Cost: 2 invokes/weekday (~44/mo) — free tier (1M req/mo). Effectively ₹0.
 
@@ -42,6 +49,15 @@ resource "aws_iam_role_policy" "start_watchdog" {
         Effect   = "Allow"
         Action   = ["ec2:DescribeInstances"]
         Resource = "*"
+      },
+      {
+        # Self-heal (2026-06-10 incident, repeat of 2026-06-02): when the
+        # 08:45 IST check finds the box not running, the watchdog issues
+        # StartInstances itself instead of only paging. Scoped to the one
+        # tv-app instance — this Lambda can start nothing else.
+        Effect   = "Allow"
+        Action   = ["ec2:StartInstances"]
+        Resource = "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/${aws_instance.tv_app.id}"
       },
       {
         Effect   = "Allow"
