@@ -2820,6 +2820,166 @@ mod tests {
         );
     }
 
+    /// P2b (coverage-gaps #1076): unreachable-config helper shared by the
+    /// error-arm tests below. Port 1 is reserved — connect always fails.
+    fn disconnected_cfg() -> QuestDbConfig {
+        QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        }
+    }
+
+    /// P2b: the TICK-SEQ-01 enriched+seq append must follow the same
+    /// ring-rescue semantics as the non-seq path AND keep the caller's
+    /// replay-stable capture_seq (not mint a fresh one).
+    #[test]
+    fn test_append_tick_enriched_with_seq_disconnected_buffers_and_preserves_seq() {
+        let mut writer = TickPersistenceWriter::new_disconnected(&disconnected_cfg());
+        let tick = make_test_tick(4243, 101.5);
+        let life = TickLifecycle {
+            volume_delta: 10,
+            prev_day_close: 100.0,
+            prev_day_oi: 0,
+            phase: 2,
+        };
+        let res = writer.append_tick_enriched_with_seq(&tick, life, 777_001);
+        assert!(res.is_ok(), "enriched+seq append must succeed (buffered)");
+        assert_eq!(writer.buffered_tick_count(), 1);
+        let (buffered, seq) = writer
+            .tick_buffer
+            .front()
+            .copied()
+            .expect("ring has the tick");
+        assert_eq!(buffered.security_id, 4243);
+        assert_eq!(seq, 777_001, "capture_seq must survive the ring rescue");
+    }
+
+    /// P2b: direct buffer flush while QuestDB is down must surface an Err
+    /// (reconnect fails) — never a silent Ok with data stuck in the buffer.
+    #[test]
+    fn test_flush_buffer_direct_disconnected_returns_error() {
+        let mut writer = TickPersistenceWriter::new_disconnected(&disconnected_cfg());
+        let tick = make_test_tick(4244, 102.5);
+        build_tick_row_seq(writer.buffer_mut(), &tick, 1).expect("row build");
+        let res = writer.flush_buffer_direct();
+        assert!(res.is_err(), "flush with no reachable QuestDB must error");
+    }
+
+    /// P2b: when the ring hits TICK_BUFFER_CAPACITY the next tick spills to
+    /// disk with its capture_seq preserved byte-exact in the spill record.
+    #[test]
+    fn test_buffer_tick_seq_ring_full_spills_with_preserved_seq() {
+        let tmp = std::env::temp_dir().join(format!("tv-p2b-ringfull-{}", std::process::id()));
+        let mut writer = TickPersistenceWriter::new_disconnected(&disconnected_cfg());
+        writer.set_spill_dir_for_test(tmp.clone());
+        let tick = make_test_tick(4245, 103.5);
+        for i in 0..TICK_BUFFER_CAPACITY {
+            writer.buffer_tick_seq(tick, i as i64);
+        }
+        assert_eq!(writer.buffered_tick_count(), TICK_BUFFER_CAPACITY);
+        assert_eq!(writer.ticks_spilled_total(), 0);
+        writer.buffer_tick_seq(tick, 777_002);
+        assert_eq!(
+            writer.ticks_spilled_total(),
+            1,
+            "tick past ring capacity must spill, never drop"
+        );
+        assert_eq!(writer.buffered_tick_count(), TICK_BUFFER_CAPACITY);
+        // Flush the BufWriter so the record is on disk, then round-trip it.
+        writer
+            .spill_writer
+            .as_mut()
+            .expect("spill writer open after spill")
+            .flush()
+            .expect("spill flush");
+        let spill_path = writer.spill_path.clone().expect("spill path set");
+        let bytes = std::fs::read(&spill_path).expect("read spill file");
+        assert_eq!(
+            bytes.len(),
+            TICK_SPILL_RECORD_SIZE,
+            "exactly one spill record"
+        );
+        let mut record = [0u8; TICK_SPILL_RECORD_SIZE];
+        record.copy_from_slice(&bytes);
+        let (spilled, seq) = deserialize_tick_seq(&record);
+        assert_eq!(spilled.security_id, 4245);
+        assert_eq!(seq, 777_002, "capture_seq must survive the disk spill");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// P2b: double fault — spill dir uncreatable, so the spill open fails AND
+    /// the DLQ open fails. The tick is counted permanently dropped (the only
+    /// silent-loss accounting path) and nothing panics.
+    #[test]
+    fn test_spill_open_failure_double_fault_counts_dropped() {
+        let mut writer = TickPersistenceWriter::new_disconnected(&disconnected_cfg());
+        // /proc is not writable — create_dir_all fails for spill AND DLQ.
+        writer.set_spill_dir_for_test(std::path::PathBuf::from(
+            "/proc/tickvault-no-such-dir/spill",
+        ));
+        let tick = make_test_tick(4246, 104.5);
+        writer.spill_tick_to_disk(&tick);
+        assert_eq!(
+            writer.ticks_dropped_total(),
+            1,
+            "double fault must increment the permanent-loss counter"
+        );
+        assert_eq!(writer.dlq_ticks_total(), 0, "DLQ open failed — no DLQ line");
+    }
+
+    /// P2b: the DLQ happy path writes one NDJSON line carrying the literal
+    /// reason + security_id so the tick is audit-recoverable.
+    #[test]
+    fn test_write_to_dlq_success_writes_ndjson_line() {
+        let tmp = std::env::temp_dir().join(format!("tv-p2b-dlq-{}", std::process::id()));
+        let mut writer = TickPersistenceWriter::new_disconnected(&disconnected_cfg());
+        writer.set_spill_dir_for_test(tmp.clone());
+        let tick = make_test_tick(4247, 105.5);
+        writer.write_to_dlq(&tick, "p2b_test_reason");
+        assert_eq!(writer.dlq_ticks_total(), 1);
+        let dlq_path = writer.dlq_path().expect("DLQ path set").to_path_buf();
+        let content = std::fs::read_to_string(&dlq_path).expect("read DLQ file");
+        assert!(content.contains("p2b_test_reason"), "{content}");
+        assert!(content.contains("4247"), "{content}");
+        assert!(
+            content.ends_with('\n'),
+            "NDJSON line must be newline-terminated"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// P2b: draining the disk spill while QuestDB is still down must PRESERVE
+    /// the spill file for the next recovery attempt (flush fails → no delete)
+    /// and rescue the drained tick into the ring (zero loss).
+    #[test]
+    fn test_drain_disk_spill_disconnected_preserves_spill_file() {
+        let tmp = std::env::temp_dir().join(format!("tv-p2b-drain-{}", std::process::id()));
+        let mut writer = TickPersistenceWriter::new_disconnected(&disconnected_cfg());
+        writer.set_spill_dir_for_test(tmp.clone());
+        let tick = make_test_tick(4248, 106.5);
+        writer.spill_tick_to_disk(&tick);
+        let spill_path = writer.spill_path.clone().expect("spill path set");
+        let drained = writer.drain_disk_spill();
+        assert_eq!(drained, 1, "the one spilled record is read back");
+        assert!(
+            spill_path.exists(),
+            "flush failed (no QuestDB) — spill file must be preserved, not deleted"
+        );
+        assert_eq!(
+            writer.spill_path.as_deref(),
+            Some(spill_path.as_path()),
+            "spill_path must be restored for the next recovery"
+        );
+        assert_eq!(
+            writer.buffered_tick_count(),
+            1,
+            "drained tick must be rescued to the ring on flush failure"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// #T1c ratchet: the `ticks` DDL must NOT declare any of the 9 retired
     /// columns, and the schema-self-heal DROP list must cover all of them.
     #[test]
