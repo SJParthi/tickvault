@@ -6802,11 +6802,13 @@ fn redact_ip_last_octet(raw: &str) -> String {
     "[REDACTED]".to_string()
 }
 
-/// Spawn the two post-market tasks — end-of-day digest (15:31:30 IST) and the
-/// 1-minute cross-verify (15:31:00 IST). Called from BOTH boot paths so a
-/// mid-session fast-boot restart runs them too (boot-symmetry, 2026-06-09).
-/// Each spawned task self-skips if past its IST trigger or on a non-trading day,
-/// so calling this from a late/non-trading boot is safe (no-op).
+/// Spawn the scheduled daily tasks — end-of-day digest (15:31:30 IST), the
+/// 1-minute cross-verify (15:31:00 IST), and the REST-health canary
+/// (09:05 / 12:00 / 15:25 IST — DHAN-REST-400, 2026-06-10). Called from BOTH
+/// boot paths so a mid-session fast-boot restart runs them too
+/// (boot-symmetry, 2026-06-09). Each spawned task self-skips if past its IST
+/// trigger(s) or on a non-trading day, so calling this from a late/
+/// non-trading boot is safe (no-op).
 fn spawn_post_market_tasks(
     notifier: std::sync::Arc<NotificationService>,
     health_status: SharedHealthStatus,
@@ -6911,6 +6913,7 @@ fn spawn_post_market_tasks(
         let cv_qcfg = config.questdb.clone();
         let cv_base = config.dhan.rest_api_base_url.clone();
         let cv_calendar = std::sync::Arc::clone(&trading_calendar);
+        let cv_notifier = notifier.clone();
         tokio::spawn(async move {
             use chrono::{FixedOffset, TimeZone, Timelike, Utc};
             use tickvault_app::cross_verify_1m_boot::{
@@ -6992,8 +6995,53 @@ fn spawn_post_market_tasks(
                 degraded = summary.degraded,
                 "PROOF: cross_verify_1m fired @ 15:31:00 IST"
             );
+            // DHAN-REST-400 item 2 (audit Rule 11): unconditional per-run
+            // summary Telegram — BLIND days say BLIND loudly (High); a
+            // header-only CSV can never again read as a perfect day.
+            // PASS is the daily Info positive signal. Never silent.
+            let status = tickvault_app::cross_verify_1m_boot::classify_run_status(&summary);
+            cv_notifier.notify(NotificationEvent::CrossVerify1mSummary {
+                trading_date_ist: today_ist.format("%Y-%m-%d").to_string(),
+                status: status.as_str().to_string(),
+                instruments: summary.instruments_checked,
+                compared: summary.stats.compared,
+                mismatches: summary.stats.mismatches,
+                missing_ours: summary.stats.missing_ours,
+                fetch_failures: summary.fetch_failures,
+            });
         });
         info!("cross_verify_1m: post-market verification task spawned");
+    }
+
+    // Operator task DHAN-REST-400 (2026-06-10): REST-health canary — one
+    // cheap GET /v2/profile at 09:05 / 12:00 / 15:25 IST on trading days.
+    // On non-2xx it pages HIGH (REST-CANARY-01) with the HTTP status, the
+    // exact final URL (token-redacted) and the bounded secret-redacted
+    // response body — so an 08:45-class REST death is known by 09:05, not
+    // discovered at 15:33 by the cross-verify. Spawned from BOTH boot paths
+    // (this fn is the shared site); self-skips on non-trading days and when
+    // booted past 15:25 IST (audit Rule 3).
+    {
+        let canary_token = std::sync::Arc::clone(&token_handle);
+        let canary_base = config.dhan.rest_api_base_url.clone();
+        let canary_calendar = std::sync::Arc::clone(&trading_calendar);
+        tokio::spawn(async move {
+            use chrono::{FixedOffset, TimeZone, Timelike, Utc};
+            use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+            let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+                return;
+            };
+            let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+            let is_trading_day = canary_calendar.is_trading_day(now_ist.date_naive());
+            tickvault_app::rest_canary_boot::run_rest_canary(
+                canary_token,
+                canary_base,
+                is_trading_day,
+                now_ist.time().num_seconds_from_midnight(),
+            )
+            .await;
+        });
+        info!("rest_canary: REST-health probe task spawned (09:05 / 12:00 / 15:25 IST)");
     }
 
     // Operator directive 2026-06-10 ("Go ahead to achieve zero tick loss"):

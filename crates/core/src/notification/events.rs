@@ -384,6 +384,32 @@ pub enum NotificationEvent {
         token_remaining_hours: u64,
     },
 
+    /// DHAN-REST-400 false-clean guard (operator task 2026-06-10, audit
+    /// Rule 11): per-run summary of the 15:31 IST 1-minute cross-verify.
+    /// Fires after EVERY run — never silent. A 776/776-fetch-failure day
+    /// previously produced a header-only CSV indistinguishable from a
+    /// perfect day; this event says BLIND loudly when the verification
+    /// vouched for nothing.
+    ///
+    /// Severity: High for `BLIND` / `DEGRADED` (pages), Info for `PASS`
+    /// (daily positive signal).
+    CrossVerify1mSummary {
+        /// Trading date in `YYYY-MM-DD` IST format.
+        trading_date_ist: String,
+        /// Stable wire-format run status: `BLIND` / `DEGRADED` / `PASS`.
+        status: String,
+        /// Spot instruments the run attempted.
+        instruments: usize,
+        /// Minute-cells actually compared against Dhan (0 ⇒ BLIND).
+        compared: usize,
+        /// Field-cells that disagreed.
+        mismatches: usize,
+        /// Minutes Dhan has that our live candles are missing.
+        missing_ours: usize,
+        /// Instruments whose Dhan intraday fetch failed outright.
+        fetch_failures: usize,
+    },
+
     // PR #4 (2026-05-19): DepthSpotPriceStale variant retired alongside
     // the deleted depth-20/200 infrastructure (operator lock 2026-05-15).
     // PR #5 (2026-05-19): 7 Phase2* variants retired alongside the
@@ -1319,6 +1345,48 @@ impl NotificationEvent {
                      {close_status}{token_warning}"
                 )
             }
+            Self::CrossVerify1mSummary {
+                trading_date_ist,
+                status,
+                instruments,
+                compared,
+                mismatches,
+                missing_ours,
+                fetch_failures,
+            } => {
+                // Operator-charter §G wording: plain English, loud BLIND,
+                // explicit "the empty CSV proves nothing" so a header-only
+                // file can never read as a pass again (2026-06-10 incident).
+                // Exact-match arms (adversarial review 2026-06-10 MEDIUM-1):
+                // an unknown/typo status must NEVER render the ✅ PASS body —
+                // severity() already treats non-"PASS" as High, so the body
+                // must agree and stay loud.
+                let verdict = match status.as_str() {
+                    "BLIND" => {
+                        "🆘 BLIND — checked NOTHING today. The day's report file is \
+                         empty because every data request failed, NOT because the \
+                         data was perfect. Check the REST health alerts for why."
+                    }
+                    "DEGRADED" => {
+                        "⚠️ DEGRADED — partial coverage only. Some instruments \
+                         could not be fetched; the mismatch count below covers \
+                         only the compared portion."
+                    }
+                    "PASS" => "✅ PASS — full coverage.",
+                    _ => {
+                        "⚠️ UNRECOGNISED STATUS — treat as NOT verified. \
+                         Investigate the candle-check task."
+                    }
+                };
+                format!(
+                    "<b>Daily candle check @ 3:31 PM IST — {status}</b>\n\
+                     Trading date: {trading_date_ist}\n\
+                     {verdict}\n\
+                     Instruments: {instruments} | Fetch failures: {fetch_failures}\n\
+                     Minutes compared: {compared} | Mismatches: {mismatches} | \
+                     Missing on our side: {missing_ours}"
+                )
+            }
             // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
             // Display arms retired with their variants.
             // PR #6a (2026-05-19): NseBhavcopyCheck* Display arms retired.
@@ -1832,6 +1900,7 @@ impl NotificationEvent {
             Self::MarketOpenStreamingFailed { .. } => "MarketOpenStreamingFailed",
             Self::MarketOpenReadinessConfirmation { .. } => "MarketOpenReadinessConfirmation",
             Self::EndOfDayDigest { .. } => "EndOfDayDigest",
+            Self::CrossVerify1mSummary { .. } => "CrossVerify1mSummary",
             // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
             // name arms retired.
             // PR #6a (2026-05-19): NseBhavcopyCheck* name arms retired.
@@ -1949,6 +2018,15 @@ impl NotificationEvent {
             Self::MarketOpenStreamingFailed { .. } => Severity::High,
             Self::MarketOpenReadinessConfirmation { .. } => Severity::Info,
             Self::EndOfDayDigest { .. } => Severity::Info,
+            // DHAN-REST-400 false-clean guard (2026-06-10): BLIND/DEGRADED
+            // page High; PASS is the daily positive Info ping. Never silent.
+            Self::CrossVerify1mSummary { status, .. } => {
+                if status == "PASS" {
+                    Severity::Info
+                } else {
+                    Severity::High
+                }
+            }
             Self::SelfTestPassed { .. } => Severity::Info,
             Self::SelfTestDegraded { .. } => Severity::High,
             Self::RealtimeGuaranteeHealthy { .. } => Severity::Info,
@@ -3839,6 +3917,80 @@ mod tests {
         };
         assert_eq!(event.topic(), "EndOfDayDigest");
         assert_eq!(event.severity(), Severity::Info);
+    }
+
+    // -----------------------------------------------------------------
+    // CrossVerify1mSummary — DHAN-REST-400 false-clean guard (2026-06-10)
+    // -----------------------------------------------------------------
+
+    fn cv_summary(status: &str, compared: usize, fetch_failures: usize) -> NotificationEvent {
+        NotificationEvent::CrossVerify1mSummary {
+            trading_date_ist: "2026-06-10".to_string(),
+            status: status.to_string(),
+            instruments: 776,
+            compared,
+            mismatches: 0,
+            missing_ours: 0,
+            fetch_failures,
+        }
+    }
+
+    /// RATCHET (audit Rule 11 / 2026-06-10 incident): a 776/776-failure
+    /// day must say BLIND loudly at Severity::High — never a silent or
+    /// clean-looking message.
+    #[test]
+    fn test_cross_verify_1m_summary_blind_message_is_loud() {
+        let event = cv_summary("BLIND", 0, 776);
+        assert_eq!(event.topic(), "CrossVerify1mSummary");
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        assert!(msg.contains("BLIND"), "{msg}");
+        assert!(msg.contains("checked NOTHING"), "{msg}");
+        assert!(msg.contains("776"), "{msg}");
+        assert!(
+            msg.contains("NOT because the data was perfect"),
+            "the empty-CSV trap must be spelled out: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_cross_verify_1m_summary_degraded_is_high() {
+        let event = cv_summary("DEGRADED", 100, 200);
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        assert!(
+            msg.contains("DEGRADED") && msg.contains("partial coverage"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn test_cross_verify_1m_summary_pass_is_info() {
+        let event = cv_summary("PASS", 290_000, 0);
+        assert_eq!(event.severity(), Severity::Info);
+        let msg = event.to_message();
+        assert!(
+            msg.contains("PASS") && msg.contains("full coverage"),
+            "{msg}"
+        );
+        assert!(msg.contains("290000") || msg.contains("290,000"), "{msg}");
+    }
+
+    #[test]
+    fn test_cross_verify_1m_summary_renders_all_counts() {
+        let event = NotificationEvent::CrossVerify1mSummary {
+            trading_date_ist: "2026-06-10".to_string(),
+            status: "DEGRADED".to_string(),
+            instruments: 776,
+            compared: 12_345,
+            mismatches: 42,
+            missing_ours: 17,
+            fetch_failures: 99,
+        };
+        let msg = event.to_message();
+        for needle in ["2026-06-10", "776", "12345", "42", "17", "99"] {
+            assert!(msg.contains(needle), "missing {needle}: {msg}");
+        }
     }
 
     #[test]

@@ -41,3 +41,4 @@ pub mod segment;
 pub mod tick_types;
 pub mod trading_calendar;
 pub mod types;
+pub mod url_join;
