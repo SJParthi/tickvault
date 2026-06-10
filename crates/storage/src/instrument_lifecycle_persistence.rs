@@ -1542,6 +1542,163 @@ mod tests {
         }
     }
 
+    // ========================================================================
+    // P2c (coverage-gaps #1076): HTTP /exec + ILP I/O arm coverage via
+    // file-local mock servers (same idiom as tick_persistence::tests).
+    // ========================================================================
+
+    const P2C_HTTP_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+    const P2C_HTTP_500: &str =
+        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 13\r\n\r\n{\"error\":\"x\"}";
+
+    async fn p2c_spawn_mock_http(response: &'static str) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 8192];
+                        let _ = stream.read(&mut buf).await;
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    });
+                }
+            }
+        });
+        port
+    }
+
+    fn p2c_spawn_tcp_drain() -> u16 {
+        use std::io::Read as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 65536];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            }
+        });
+        port
+    }
+
+    fn p2c_cfg(http_port: u16, ilp_port: u16) -> QuestDbConfig {
+        QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port,
+            pg_port: 1,
+            ilp_port,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ensure_lifecycle_tables_with_mock_200() {
+        let port = p2c_spawn_mock_http(P2C_HTTP_200).await;
+        let cfg = p2c_cfg(port, 1);
+        // Both DDL walks (CREATE + self-heal ALTERs + DEDUP) complete
+        // without panic against a 200-everything QuestDB.
+        ensure_instrument_lifecycle_table(&cfg).await;
+        ensure_instrument_lifecycle_audit_table(&cfg).await;
+    }
+
+    #[tokio::test]
+    async fn test_append_lifecycle_row_mock_200_and_500() {
+        let ok_port = p2c_spawn_mock_http(P2C_HTTP_200).await;
+        let row = sample_index_row();
+        let res = append_instrument_lifecycle_row(&p2c_cfg(ok_port, 1), &row).await;
+        assert!(res.is_ok(), "200 insert must be Ok: {res:?}");
+
+        let err_port = p2c_spawn_mock_http(P2C_HTTP_500).await;
+        let res = append_instrument_lifecycle_row(&p2c_cfg(err_port, 1), &row).await;
+        let err = res.expect_err("500 insert must surface an error");
+        assert!(err.to_string().contains("non-2xx"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_append_lifecycle_audit_row_mock_200_and_500() {
+        let ok_port = p2c_spawn_mock_http(P2C_HTTP_200).await;
+        let row = sample_audit_row();
+        let res = append_instrument_lifecycle_audit_row(&p2c_cfg(ok_port, 1), &row).await;
+        assert!(res.is_ok(), "200 audit insert must be Ok: {res:?}");
+
+        let err_port = p2c_spawn_mock_http(P2C_HTTP_500).await;
+        let res = append_instrument_lifecycle_audit_row(&p2c_cfg(err_port, 1), &row).await;
+        let err = res.expect_err("500 audit insert must surface an error");
+        assert!(err.to_string().contains("non-2xx"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_update_state_and_bump_last_seen_mock_200_and_500() {
+        let ok_port = p2c_spawn_mock_http(P2C_HTTP_200).await;
+        let cfg = p2c_cfg(ok_port, 1);
+        let res = update_lifecycle_state(
+            &cfg,
+            99887,
+            "NSE_FNO",
+            LifecycleState::ExpiredContract,
+            1_700_000_000_000_000_000,
+            1_700_000_000_000_000_000,
+        )
+        .await;
+        assert!(res.is_ok(), "200 state update must be Ok: {res:?}");
+        let res =
+            bump_active_last_seen(&cfg, 1_699_920_000_000_000_000, 1_700_000_000_000_000_000).await;
+        assert!(res.is_ok(), "200 bump must be Ok: {res:?}");
+
+        let err_port = p2c_spawn_mock_http(P2C_HTTP_500).await;
+        let cfg = p2c_cfg(err_port, 1);
+        let res = update_lifecycle_state(
+            &cfg,
+            99887,
+            "NSE_FNO",
+            LifecycleState::ExpiredContract,
+            1_700_000_000_000_000_000,
+            1_700_000_000_000_000_000,
+        )
+        .await;
+        assert!(res.is_err(), "500 state update must error");
+        let res =
+            bump_active_last_seen(&cfg, 1_699_920_000_000_000_000, 1_700_000_000_000_000_000).await;
+        assert!(res.is_err(), "500 bump must error");
+    }
+
+    #[tokio::test]
+    async fn test_append_lifecycle_rows_ilp_drain_and_error() {
+        // Empty slice short-circuits without connecting anywhere.
+        let res = append_instrument_lifecycle_rows(&p2c_cfg(1, 1), &[]).await;
+        assert!(res.is_ok(), "empty slice must be Ok without I/O");
+
+        let drain_port = p2c_spawn_tcp_drain();
+        let row = sample_index_row();
+        let res = append_instrument_lifecycle_rows(&p2c_cfg(1, drain_port), &[row]).await;
+        assert!(res.is_ok(), "ILP flush to drain server must be Ok: {res:?}");
+
+        // Port 1 — connect refused → Err, no panic.
+        let row = sample_index_row();
+        let res = append_instrument_lifecycle_rows(&p2c_cfg(1, 1), &[row]).await;
+        assert!(res.is_err(), "ILP connect failure must surface an error");
+    }
+
+    #[tokio::test]
+    async fn test_append_lifecycle_audit_rows_ilp_drain_and_error() {
+        let res = append_instrument_lifecycle_audit_rows(&p2c_cfg(1, 1), &[]).await;
+        assert!(res.is_ok(), "empty slice must be Ok without I/O");
+
+        let drain_port = p2c_spawn_tcp_drain();
+        let row = sample_audit_row();
+        let res = append_instrument_lifecycle_audit_rows(&p2c_cfg(1, drain_port), &[row]).await;
+        assert!(res.is_ok(), "ILP flush to drain server must be Ok: {res:?}");
+
+        let row = sample_audit_row();
+        let res = append_instrument_lifecycle_audit_rows(&p2c_cfg(1, 1), &[row]).await;
+        assert!(res.is_err(), "ILP connect failure must surface an error");
+    }
+
     #[test]
     fn test_audit_insert_column_list_has_16_columns() {
         assert_eq!(
