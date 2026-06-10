@@ -94,10 +94,11 @@ _IST_OFFSET_SECS = 19800  # +05:30
 
 _VIEW_TIMEOUT_SECS = 6.0
 _VIEW_POLL_SECS = 0.4
-# Latency probes run 3×curl-to-Dhan (--max-time 3) + QuestDB + metrics ON the
-# box (~9-12s wall-clock), so the poll window must be longer than the view's.
-# Lambda timeout is 30s, so 22s leaves margin.
-_LATENCY_TIMEOUT_SECS = 22.0
+# Latency probes run metrics-scrape-T0 + 3×curl-to-Dhan (--max-time 3) +
+# QuestDB + a 4s window floor + metrics-scrape-T1 ON the box (~14-17s
+# wall-clock), so the poll window must be longer than the view's.
+# Lambda timeout is 30s, so 26s leaves margin.
+_LATENCY_TIMEOUT_SECS = 26.0
 
 # Read-only SQL gate: the first keyword must be one of these.
 _SQL_ALLOWED_PREFIXES = ("select", "show", "explain", "with")
@@ -266,13 +267,28 @@ def _parse_view(stdout: str) -> dict:
 #  * wall-clock skew vs chrony's NTP source.
 _LATENCY_COMMANDS = [
     "set +e",
+    # Windowed-percentile design (operator directive 2026-06-10): scrape the
+    # metrics endpoint TWICE — once BEFORE and once AFTER the ~10 s of Dhan +
+    # QuestDB network probes — and let the Lambda compute p50/p99 + avg from
+    # the histogram-bucket DELTAS between the two scrapes. The probe time IS
+    # the measurement window (no added sleep, no Lambda-timeout pressure).
+    # `_bucket` lines are included so percentiles are computable; sum/count
+    # lines feed both the windowed avg (delta) and the legacy lifetime avg.
+    'echo "T0=$(date +%s.%N)"',
+    'echo "METRICS_T0_BEGIN"',
+    "curl -fsS --max-time 3 http://127.0.0.1:9091/metrics 2>/dev/null | grep -E '^tv_(tick_processing|wire_to_done|order_placement|tick_flush)_duration_ns' || echo none",
+    'echo "METRICS_T0_END"',
     'echo "DHAN_BEGIN"',
     "for i in 1 2 3; do curl -o /dev/null -s -w '%{time_connect} %{time_appconnect}\\n' --max-time 3 https://api-feed.dhan.co/ 2>/dev/null || echo 'x x'; done",
     'echo "DHAN_END"',
     "echo \"QDB=$(curl -o /dev/null -s -w '%{time_total}' --max-time 3 'http://127.0.0.1:9000/exec?query=SELECT%201' 2>/dev/null)\"",
     "echo \"SKEW=$(chronyc tracking 2>/dev/null | awk '/Last offset/{print $4}')\"",
+    # Floor the window at ~4 s so a fast-failing Dhan probe (network down →
+    # instant curl errors) still leaves a meaningful sample window.
+    "sleep 4",
+    'echo "T1=$(date +%s.%N)"',
     'echo "METRICS_BEGIN"',
-    "curl -fsS --max-time 3 http://127.0.0.1:9091/metrics 2>/dev/null | grep -E '^tv_(tick_processing|wire_to_done|order_placement)_duration_ns_(sum|count)' || echo none",
+    "curl -fsS --max-time 3 http://127.0.0.1:9091/metrics 2>/dev/null | grep -E '^tv_(tick_processing|wire_to_done|order_placement|tick_flush)_duration_ns' || echo none",
     'echo "METRICS_END"',
 ]
 
@@ -287,18 +303,115 @@ def _avg_ns(sum_v: str, count_v: str) -> float | None:
         return None
 
 
+def _parse_bucket_lines(lines: list[str]) -> dict:
+    """Parse Prometheus exposition lines into {metric: {"buckets": {le: count},
+    "sum": float, "count": float}}. Pure. Unparseable lines are skipped."""
+    out: dict = {}
+    for line in lines:
+        bits = line.split()
+        if len(bits) != 2:
+            continue
+        name, raw_val = bits
+        try:
+            val = float(raw_val)
+        except ValueError:
+            continue
+        if "_bucket{" in name:
+            base = name.split("_bucket{", 1)[0]
+            # le label, e.g. tv_x_duration_ns_bucket{le="10000"} or le="+Inf"
+            le_part = name.split('le="', 1)
+            if len(le_part) != 2:
+                continue
+            le_raw = le_part[1].split('"', 1)[0]
+            le = float("inf") if le_raw == "+Inf" else None
+            if le is None:
+                try:
+                    le = float(le_raw)
+                except ValueError:
+                    continue
+            out.setdefault(base, {"buckets": {}, "sum": 0.0, "count": 0.0})
+            out[base]["buckets"][le] = val
+        elif name.endswith("_sum"):
+            base = name[: -len("_sum")]
+            out.setdefault(base, {"buckets": {}, "sum": 0.0, "count": 0.0})
+            out[base]["sum"] = val
+        elif name.endswith("_count"):
+            base = name[: -len("_count")]
+            out.setdefault(base, {"buckets": {}, "sum": 0.0, "count": 0.0})
+            out[base]["count"] = val
+    return out
+
+
+def _bucket_deltas(t0: dict, t1: dict) -> dict | None:
+    """Per-bucket cumulative-count deltas between two scrapes of ONE metric.
+    Returns {"buckets": {le: delta}, "sum": dsum, "count": dcount} or None
+    when the window is empty/invalid (no ticks, or counter reset between
+    scrapes — any negative delta invalidates the whole window). Pure."""
+    if not t0 or not t1:
+        return None
+    d_count = t1.get("count", 0.0) - t0.get("count", 0.0)
+    d_sum = t1.get("sum", 0.0) - t0.get("sum", 0.0)
+    if d_count <= 0 or d_sum < 0:
+        return None
+    deltas: dict = {}
+    for le, c1 in t1.get("buckets", {}).items():
+        c0 = t0.get("buckets", {}).get(le, 0.0)
+        d = c1 - c0
+        if d < 0:
+            return None  # counter reset mid-window — whole window invalid
+        deltas[le] = d
+    if not deltas:
+        return None
+    return {"buckets": deltas, "sum": d_sum, "count": d_count}
+
+
+def _percentile_from_bucket_deltas(deltas: dict | None, q: float) -> float | None:
+    """Quantile (0<q<1) from windowed cumulative-bucket deltas, linear
+    interpolation inside the owning bucket. A quantile landing in the +Inf
+    bucket clamps to the last finite bound (honest 'off the scale'). Pure."""
+    if not deltas:
+        return None
+    total = deltas.get("count", 0.0)
+    if total <= 0:
+        return None
+    target = q * total
+    prev_bound = 0.0
+    prev_cum = 0.0
+    for le in sorted(deltas["buckets"].keys()):
+        cum = deltas["buckets"][le]
+        if cum >= target:
+            if le == float("inf"):
+                return prev_bound  # clamp: off the top of the scale
+            width = cum - prev_cum
+            if width <= 0:
+                return le
+            frac = (target - prev_cum) / width
+            return prev_bound + (le - prev_bound) * frac
+        prev_bound = 0.0 if le == float("inf") else le
+        prev_cum = cum
+    return prev_bound
+
+
 def _parse_latency(stdout: str) -> dict:
-    """Parse the labeled latency snapshot into a structured dict (pure)."""
+    """Parse the labeled latency snapshot into a structured dict (pure).
+
+    Windowed-percentile design (2026-06-10): the box emits TWO metric
+    scrapes — METRICS_T0 (before the network probes) and METRICS (after).
+    Lifetime averages come from the second scrape (back-compat); the
+    p50/p99 + windowed averages come from the bucket DELTAS between them.
+    """
     dhan_tcp: list[float] = []
     dhan_tls: list[float] = []
     metrics: dict[str, str] = {}
+    t0_lines: list[str] = []
+    t1_lines: list[str] = []
     fields: dict[str, str] = {}
     mode = ""
     for line in (stdout or "").splitlines():
-        if line in ("DHAN_BEGIN", "METRICS_BEGIN"):
-            mode = line.split("_")[0]
+        if line in ("DHAN_BEGIN", "METRICS_BEGIN", "METRICS_T0_BEGIN"):
+            mode = "T0" if line == "METRICS_T0_BEGIN" else line.split("_")[0]
             continue
-        if line in ("DHAN_END", "METRICS_END"):
+        if line in ("DHAN_END", "METRICS_END", "METRICS_T0_END"):
             mode = ""
             continue
         if mode == "DHAN":
@@ -310,8 +423,12 @@ def _parse_latency(stdout: str) -> dict:
                 except ValueError:
                     pass
             continue
+        if mode == "T0":
+            t0_lines.append(line)
+            continue
         if mode == "METRICS":
             # e.g. "tv_tick_processing_duration_ns_sum 1.23e6"
+            t1_lines.append(line)
             bits = line.split()
             if len(bits) == 2:
                 metrics[bits[0]] = bits[1]
@@ -334,6 +451,36 @@ def _parse_latency(stdout: str) -> dict:
         a = _avg_ns(metrics.get(name + "_sum", ""), metrics.get(name + "_count", ""))
         return round(a, 1) if a is not None else None
 
+    # Windowed stats from bucket deltas between the two scrapes. None when
+    # the window saw no samples (market closed) or a counter reset — the
+    # dashboard falls back to the lifetime averages in that case.
+    t0 = _parse_bucket_lines(t0_lines)
+    t1 = _parse_bucket_lines(t1_lines)
+
+    def windowed(name: str) -> tuple[float | None, float | None, float | None, float]:
+        d = _bucket_deltas(t0.get(name, {}), t1.get(name, {}))
+        if d is None:
+            return (None, None, None, 0.0)
+        p50 = _percentile_from_bucket_deltas(d, 0.50)
+        p99 = _percentile_from_bucket_deltas(d, 0.99)
+        w_avg = d["sum"] / d["count"] if d["count"] > 0 else None
+        return (
+            round(p50, 1) if p50 is not None else None,
+            round(p99, 1) if p99 is not None else None,
+            round(w_avg, 1) if w_avg is not None else None,
+            d["count"],
+        )
+
+    tick_p50, tick_p99, tick_wavg, tick_wcount = windowed("tv_tick_processing_duration_ns")
+    wire_p50, wire_p99, wire_wavg, _ = windowed("tv_wire_to_done_duration_ns")
+    flush_p50, flush_p99, flush_wavg, _ = windowed("tv_tick_flush_duration_ns")
+
+    def window_secs() -> str:
+        try:
+            return f"{float(fields.get('T1', '')) - float(fields.get('T0', '')):.1f}"
+        except (TypeError, ValueError):
+            return ""
+
     return {
         "dhan_tcp_ms": ms(dhan_tcp),
         "dhan_tls_ms": ms(dhan_tls),
@@ -343,6 +490,19 @@ def _parse_latency(stdout: str) -> dict:
         "wire_to_done_avg_ns": avg("tv_wire_to_done_duration_ns"),
         "order_place_avg_ns": avg("tv_order_placement_duration_ns"),
         "tick_count": metrics.get("tv_tick_processing_duration_ns_count", ""),
+        # Windowed precise latencies (operator directive 2026-06-10) —
+        # computed over the probe window (~10 s), None when no live ticks.
+        "window_secs": window_secs(),
+        "tick_window_count": int(tick_wcount),
+        "tick_p50_ns": tick_p50,
+        "tick_p99_ns": tick_p99,
+        "tick_window_avg_ns": tick_wavg,
+        "wire_p50_ns": wire_p50,
+        "wire_p99_ns": wire_p99,
+        "wire_window_avg_ns": wire_wavg,
+        "flush_p50_ns": flush_p50,
+        "flush_p99_ns": flush_p99,
+        "flush_window_avg_ns": flush_wavg,
     }
 
 
@@ -1037,11 +1197,24 @@ async function loadLatency(){ $('latnet').dataset.loaded='1'; $('latnet').innerH
     shield('+ TLS handshake', fmtMs(j.dhan_tls_ms), true)+
     shield('QuestDB round-trip', fmtMs(j.questdb_ms), true)+
     shield('Clock skew', fmtMs(j.clock_skew_ms), isNaN(skew)||skew<50);
-  $('latproc').innerHTML=
-    shield('Per-tick process', fmtNs(j.tick_process_avg_ns), (j.tick_process_avg_ns||1e12)<10000)+
-    shield('Wire → done (full)', fmtNs(j.wire_to_done_avg_ns), (j.wire_to_done_avg_ns||1e12)<100000)+
-    shield('Order placement', fmtNs(j.order_place_avg_ns), true);
-  $('lattick').textContent = j.tick_count? ('averaged over '+Number(j.tick_count).toLocaleString()+' ticks since boot') : 'no ticks measured yet (market closed?)'; }
+  // Windowed precise latencies (live ticks during the ~10s probe window).
+  // Falls back to lifetime averages when the window saw no ticks (market closed).
+  const live = j.tick_p50_ns != null;
+  $('latproc').innerHTML = live ? (
+    shield('Per-tick p50 (live)', fmtNs(j.tick_p50_ns), j.tick_p50_ns<10000)+
+    shield('Per-tick p99 (live)', fmtNs(j.tick_p99_ns), j.tick_p99_ns<100000)+
+    shield('Per-tick avg (live)', fmtNs(j.tick_window_avg_ns), j.tick_window_avg_ns<10000)+
+    shield('Wire → done p99 (live)', fmtNs(j.wire_p99_ns), (j.wire_p99_ns||1e12)<100000)+
+    shield('DB batch flush avg', fmtNs(j.flush_window_avg_ns), true)+
+    shield('Order placement', fmtNs(j.order_place_avg_ns), true)
+  ) : (
+    shield('Per-tick process (lifetime)', fmtNs(j.tick_process_avg_ns), (j.tick_process_avg_ns||1e12)<10000)+
+    shield('Wire → done (lifetime)', fmtNs(j.wire_to_done_avg_ns), (j.wire_to_done_avg_ns||1e12)<100000)+
+    shield('Order placement', fmtNs(j.order_place_avg_ns), true)
+  );
+  $('lattick').textContent = live
+    ? ('measured live over '+Number(j.tick_window_count).toLocaleString()+' ticks in a '+(j.window_secs||'~10')+'s window — lifetime avg '+fmtNs(j.tick_process_avg_ns)+' over '+Number(j.tick_count||0).toLocaleString()+' ticks since boot')
+    : (j.tick_count? ('no live ticks in the probe window (market closed?) — lifetime avg over '+Number(j.tick_count).toLocaleString()+' ticks since boot') : 'no ticks measured yet (market closed?)'); }
 
 async function act(action){ if(!confirm('Run "'+action+'" on the trading box?')) return; const force=$('force').checked; toast(action+'…');
   const j=await call(action,{force}); if(j){ toast('✅ '+action+' sent'); setTimeout(loadOverview,1600); } }
