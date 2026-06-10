@@ -114,7 +114,7 @@ operator sees the relationship without a false alarm.
 - storage: unit tests for `count_frames_for_ist_day` (tick/non-tick
   classification, day attribution, v1-unattributable, archive+live merge,
   filename pre-filter) + DDL/DEDUP tests for the new audit table
-  (`test_conservation_ddl_contains_expected_columns`,
+  (`test_tick_conservation_audit_create_ddl_contains_expected_columns`,
   `test_conservation_dedup_key_includes_designated_timestamp`).
 - app: pure-fn tests for `decide_conservation_start` (before/at/after
   15:40, non-trading-day, force), `parse_prom_counter`,
@@ -144,11 +144,11 @@ operator sees the relationship without a false alarm.
 
 - [x] Item 1 — WAL day-count scan (read-only) in ws_frame_spill
   - Files: crates/storage/src/ws_frame_spill.rs
-  - Tests: test_count_frames_for_ist_day_classifies_tick_codes, test_count_frames_day_attribution_and_v1_unattributable, test_count_frames_scans_archive_dir
+  - Tests: test_count_frames_for_ist_day_classifies_tick_codes, test_classify_frame_for_day_and_ist_day_of_wall_nanos, test_count_frames_scans_archive_dir
 
 - [x] Item 2 — tick_conservation_audit table + ILP writer
   - Files: crates/storage/src/tick_conservation_audit_persistence.rs, crates/storage/src/lib.rs
-  - Tests: test_conservation_ddl_contains_expected_columns, test_conservation_dedup_key_includes_designated_timestamp
+  - Tests: test_tick_conservation_audit_create_ddl_contains_expected_columns, test_conservation_dedup_key_includes_designated_timestamp
 
 - [x] Item 3 — ErrorCode TICK-CONSERVE-01 + runbook rule file
   - Files: crates/common/src/error_code.rs, .claude/rules/project/tick-conservation-audit-error-codes.md

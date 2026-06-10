@@ -617,6 +617,39 @@ mod tests {
     }
 
     #[test]
+    fn test_boot_covers_full_session_boundaries() {
+        // Pre-09:00 IST boot covers the session; at/after does not.
+        assert!(boot_covers_full_session(8 * 3600 + 35 * 60));
+        assert!(!boot_covers_full_session(MARKET_OPEN_SECS_OF_DAY_IST));
+        assert!(!boot_covers_full_session(11 * 3600));
+    }
+
+    #[test]
+    fn test_outcome_counters_from_metrics_body() {
+        let body = "tv_ticks_processed_total 100\n\
+                    tv_ticks_persisted_total 90\n\
+                    tv_junk_ticks_filtered_total 1\n\
+                    tv_stale_day_filtered_total 2\n\
+                    tv_outside_hours_filtered_total 3\n\
+                    tv_dedup_filtered_total 4\n\
+                    tv_parse_errors_total 0\n\
+                    tv_storage_errors_total 0\n\
+                    tv_ticks_dropped_total 0\n";
+        let c = OutcomeCounters::from_metrics_body(body);
+        assert_eq!(c.processed, Some(100));
+        assert_eq!(c.persisted, Some(90));
+        assert_eq!(c.junk, Some(1));
+        assert_eq!(c.stale_day, Some(2));
+        assert_eq!(c.outside_hours, Some(3));
+        assert_eq!(c.dedup, Some(4));
+        assert!(c.identity_complete());
+        // Empty body → all None.
+        let empty = OutcomeCounters::from_metrics_body("");
+        assert!(!empty.identity_complete());
+        assert_eq!(empty.processed, None);
+    }
+
+    #[test]
     fn test_outcome_counters_identity_complete() {
         let mut c = OutcomeCounters {
             processed: Some(1),

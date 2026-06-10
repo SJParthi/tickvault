@@ -366,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn test_conservation_ddl_contains_expected_columns() {
+    fn test_tick_conservation_audit_create_ddl_contains_expected_columns() {
         let ddl = tick_conservation_audit_create_ddl();
         for col in [
             "ts ",
@@ -408,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn test_conservation_outcome_labels_stable() {
+    fn test_conservation_outcome_as_str_labels_stable() {
         assert_eq!(ConservationOutcome::Balanced.as_str(), "balanced");
         assert_eq!(ConservationOutcome::Leak.as_str(), "leak");
         assert_eq!(ConservationOutcome::Partial.as_str(), "partial");

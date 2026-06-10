@@ -1028,7 +1028,7 @@ mod tests {
     }
 
     #[test]
-    fn test_count_frames_day_attribution_and_v1_unattributable() {
+    fn test_classify_frame_for_day_and_ist_day_of_wall_nanos() {
         // Pure-fn surface: classification + day attribution.
         let nanos_today = now_wall_nanos();
         let today = ist_day_of_wall_nanos(nanos_today);
