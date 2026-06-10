@@ -997,12 +997,14 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 m_ticks.increment(1);
 
                 // No-tick watchdog heartbeat (Parthiban directive 2026-04-21).
-                // Single relaxed atomic store. Utc::now() goes through the
-                // vDSO clock_gettime — tens of nanoseconds. The spawned
-                // watchdog reads this atomic every 30s.
+                // Single relaxed atomic store. Latency-hunt 2026-06-10:
+                // derive seconds from the frame's `received_at_nanos`
+                // (captured once per frame above) instead of a second
+                // `Utc::now()` vDSO read (~57 ns measured) — identical
+                // wall-clock second; the watchdog threshold is 30 s.
                 if let Some(ref hb) = tick_heartbeat {
                     hb.store(
-                        chrono::Utc::now().timestamp(),
+                        received_at_nanos.saturating_div(1_000_000_000),
                         std::sync::atomic::Ordering::Relaxed,
                     );
                 }
@@ -1034,15 +1036,14 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 // Wave 2 Item 8 (G4) — record this tick observation in
                 // the global gap detector. O(1) hot-path: single
                 // OnceLock read + one papaya insert. No-op when the
-                // detector is not installed.
+                // detector is not installed. Latency-hunt 2026-06-10:
+                // reuse `tick_start` (captured ≤1 µs earlier) instead of
+                // a third per-tick clock read (~30 ns measured); the
+                // detector's silence threshold is 30 s.
                 if let Some(seg) =
                     tickvault_common::types::ExchangeSegment::from_byte(tick.exchange_segment_code)
                 {
-                    super::tick_gap_detector::record_tick_global(
-                        tick.security_id,
-                        seg,
-                        std::time::Instant::now(),
-                    );
+                    super::tick_gap_detector::record_tick_global(tick.security_id, seg, tick_start);
                 }
 
                 // Filter junk ticks: NaN/Infinity, zero/negative LTP,
@@ -1170,9 +1171,17 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 // cache line and the comparisons are all u32 equality.
                 // O(1) in the strict sense: bounded at 3 iterations
                 // regardless of tick rate or universe size.
+                // Latency-hunt 2026-06-10: derive the epoch-seconds gauge
+                // value from `received_at_nanos` instead of a fresh
+                // `Utc::now()` (~59 ns measured) — index ticks hit this
+                // branch on every frame and the probe granularity is
+                // seconds.
                 for (idx, (sid, _name)) in CANARY_UNDERLYINGS.iter().enumerate() {
                     if *sid == tick.security_id {
-                        canary_gauges[idx].set(chrono::Utc::now().timestamp() as f64);
+                        #[allow(clippy::cast_precision_loss)]
+                        // APPROVED: epoch seconds (~1.7e9) are exactly representable in f64
+                        canary_gauges[idx]
+                            .set(received_at_nanos.saturating_div(1_000_000_000) as f64);
                         break;
                     }
                 }
@@ -1317,10 +1326,11 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 m_ticks.increment(1);
 
                 // No-tick watchdog heartbeat — same pattern as the Tick
-                // branch above. See `no_tick_watchdog` module.
+                // branch above (incl. the latency-hunt 2026-06-10
+                // received_at-derived seconds). See `no_tick_watchdog`.
                 if let Some(ref hb) = tick_heartbeat {
                     hb.store(
-                        chrono::Utc::now().timestamp(),
+                        received_at_nanos.saturating_div(1_000_000_000),
                         std::sync::atomic::Ordering::Relaxed,
                     );
                 }

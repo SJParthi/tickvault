@@ -153,6 +153,29 @@ pub mod tick_persistence_testing {
     pub fn f32_to_f64_clean_pub(v: f32) -> f64 {
         crate::tick_persistence::f32_to_f64_clean(v)
     }
+
+    /// Re-export of the private `build_tick_row_seq` (the 17-column ILP row
+    /// encoder on the tick hot path) for the `full_tick_processing` Criterion
+    /// bench in `crates/core/benches/`. Measurement-only surface — production
+    /// code keeps calling the writer methods, never this.
+    ///
+    /// # Errors
+    /// Propagates the underlying ILP buffer error (table/column append failure).
+    pub fn build_tick_row_seq_pub(
+        buffer: &mut questdb::ingress::Buffer,
+        tick: &tickvault_common::tick_types::ParsedTick,
+        capture_seq: i64,
+    ) -> anyhow::Result<()> {
+        crate::tick_persistence::build_tick_row_seq(buffer, tick, capture_seq)
+    }
+
+    /// Constructs an ILP V1 buffer of the same protocol version the live
+    /// `TickPersistenceWriter` uses — lets cross-crate benches build rows
+    /// without naming `questdb` types (questdb-rs is not a dep of core).
+    #[must_use]
+    pub fn new_ilp_buffer_pub() -> questdb::ingress::Buffer {
+        questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1)
+    }
 }
 
 /// Shared process-wide mutex for tests that touch the real global
@@ -218,5 +241,45 @@ mod tests {
     #[test]
     fn test_f32_to_f64_clean_pub_negative() {
         assert_eq!(f32_to_f64_clean_pub(-100.5), -100.5);
+    }
+
+    #[test]
+    fn test_new_ilp_buffer_pub_starts_empty() {
+        let buffer = super::tick_persistence_testing::new_ilp_buffer_pub();
+        assert_eq!(buffer.row_count(), 0);
+        assert_eq!(buffer.len(), 0);
+    }
+
+    #[test]
+    fn test_build_tick_row_seq_pub_appends_one_row() {
+        let mut buffer = super::tick_persistence_testing::new_ilp_buffer_pub();
+        let tick = tickvault_common::tick_types::ParsedTick {
+            security_id: 13,
+            exchange_segment_code: 0,
+            last_traded_price: 23_146.45,
+            last_trade_quantity: 0,
+            exchange_timestamp: 1_770_000_000,
+            received_at_nanos: 1_770_000_000_000_000_000,
+            average_traded_price: 0.0,
+            volume: 0,
+            total_sell_quantity: 0,
+            total_buy_quantity: 0,
+            day_open: 23_100.0,
+            day_close: 23_050.0,
+            day_high: 23_200.0,
+            day_low: 23_000.0,
+            open_interest: 0,
+            oi_day_high: 0,
+            oi_day_low: 0,
+            iv: f64::NAN,
+            delta: f64::NAN,
+            gamma: f64::NAN,
+            theta: f64::NAN,
+            vega: f64::NAN,
+        };
+        super::tick_persistence_testing::build_tick_row_seq_pub(&mut buffer, &tick, 42)
+            .expect("row build must succeed for a valid tick");
+        assert_eq!(buffer.row_count(), 1);
+        assert!(buffer.len() > 0, "encoded ILP row must be non-empty");
     }
 }
