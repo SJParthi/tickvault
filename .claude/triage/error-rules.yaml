@@ -38,7 +38,28 @@
 #   2. The auto-fix script actually existing under scripts/
 #   3. A runbook path that the cross-ref tests can resolve
 #
-# Current rule count: 6 seeds. The YAML parser is deliberately strict —
+# FULL-COVERAGE RATCHET (Milestone 2 of autonomous-operations-100pct.md):
+# every `ErrorCode` variant in crates/common/src/error_code.rs MUST have
+# either a rule block below OR a documented exclusion line of the form
+#
+#   "# TRIAGE-EXEMPT: <CODE> — <one-line reason why no triage rule applies>"
+#
+# written as a SINGLE `#` at COLUMN 0 (never indented, never `##` —
+# a column-0 comment can never be block-scalar string content, which is
+# what makes the parse unambiguous). Enforced by
+# crates/common/tests/triage_rules_full_coverage_guard.rs
+# (`every_error_code_variant_has_a_triage_rule`). Exclusion hygiene is
+# also ratcheted there: an exemption must name a LIVE variant (stale
+# exemptions for deleted codes fail the build), must carry a non-empty
+# reason, must not coexist with a rule block for the same code, must be
+# mirrored in the test's PINNED_EXEMPTIONS allowlist (two-file change by
+# design), and may NEVER be used for a code whose `is_auto_triage_safe()`
+# is false (Critical-class codes always need an escalate rule). As of
+# 2026-06-10 all variants have rules; the pinned allowlist is empty.
+#
+# Rule count: grew from the 6 Phase-6 seeds to full ErrorCode coverage
+# (113 blocks as of 2026-06-10; `rule_count_matches_or_exceeds_variant_count`
+# keeps it >= the variant count). The YAML parser is deliberately strict —
 # unknown fields fail the hook rather than silently ignoring a typo.
 
 version: 1
