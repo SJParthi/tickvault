@@ -253,14 +253,14 @@ fn auto_fix_scripts_emit_correlation_id_in_logs() {
     for fix in list_autofix_scripts(&scripts) {
         let src = std::fs::read_to_string(&fix).unwrap();
         let fname = fix.file_name().unwrap().to_string_lossy().into_owned();
-        // Two old pre-M3 scripts (clear-spill, refresh-instruments, restart-depth)
+        // Two old pre-M3 scripts (clear-spill, refresh-instruments)
         // pre-date the correlation_id contract. Skip them for this test —
-        // they're exempt until the next refactor.
-        const PRE_M3_EXEMPT: &[&str] = &[
-            "auto-fix-clear-spill.sh",
-            "auto-fix-refresh-instruments.sh",
-            "auto-fix-restart-depth.sh",
-        ];
+        // they're exempt until the next refactor. (restart-depth was
+        // retired 2026-06-10: depth-20/200 is deleted forever per
+        // websocket-connection-scope-lock.md, so its endpoint can never
+        // exist and the script was unreferenced by any triage rule.)
+        const PRE_M3_EXEMPT: &[&str] =
+            &["auto-fix-clear-spill.sh", "auto-fix-refresh-instruments.sh"];
         if PRE_M3_EXEMPT.contains(&fname.as_str()) {
             continue;
         }
