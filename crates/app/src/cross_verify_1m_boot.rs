@@ -685,10 +685,12 @@ pub async fn run_cross_verify_1m(
 
     // DHAN-REST-400 item 2 (audit Rule 11): classify the run and write the
     // status as the FIRST line of the CSV so a header-only file can never
-    // again read as a perfect day.
+    // again read as a perfect day. The per-day summary JSON (#1097) is
+    // written alongside for the portal card + API endpoint.
     let status = classify_run_status(&summary);
     let csv_with_status = format!("{}\n{csv}", csv_status_line(&summary, status));
     write_csv_file(csv_dir, trading_date, &csv_with_status).await;
+    write_summary_file(csv_dir, trading_date, &summary).await;
     metrics::counter!("tv_cross_verify_1m_runs_total", "status" => status.as_str()).increment(1);
 
     if summary.stats.mismatches > 0 {
@@ -1206,5 +1208,42 @@ mod tests {
         w.append_mismatch(&m).expect("append");
         w.append_mismatch(&m).expect("append");
         assert_eq!(final_flush(&mut w), FlushOutcome::Failed { pending: 2 });
+    }
+
+    #[test]
+    fn summary_json_contents_round_trips_fields() {
+        let date = NaiveDate::from_ymd_opt(2026, 6, 10).expect("date");
+        let summary = CrossVerify1mSummary {
+            instruments_checked: 243,
+            fetch_failures: 2,
+            stats: CompareStats {
+                compared: 91_230,
+                mismatches: 42,
+                missing_ours: 15,
+            },
+            degraded: false,
+        };
+        let json = summary_json_contents(date, &summary);
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(v["trading_date"], "2026-06-10");
+        assert_eq!(v["instruments_checked"], 243);
+        assert_eq!(v["compared"], 91_230);
+        assert_eq!(v["mismatches"], 42);
+        assert_eq!(v["missing_ours"], 15);
+        assert_eq!(v["fetch_failures"], 2);
+        assert_eq!(v["degraded"], false);
+    }
+
+    #[test]
+    fn summary_json_marks_degraded() {
+        let date = NaiveDate::from_ymd_opt(2026, 6, 10).expect("date");
+        let summary = CrossVerify1mSummary {
+            degraded: true,
+            ..Default::default()
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&summary_json_contents(date, &summary)).expect("valid JSON");
+        assert_eq!(v["degraded"], true);
+        assert_eq!(v["compared"], 0);
     }
 }
