@@ -6,17 +6,31 @@
 # All values are line coverage percentages.
 # Any crate not listed uses the default threshold.
 #
-# POLICY: 100% minimum coverage for ALL crates. No exceptions.
-# Mechanical enforcement: CI blocks merge if any crate falls below threshold.
+# POLICY (updated 2026-06-10, P0 of the coverage-gaps plan):
+#   * 100% remains the TARGET for every crate.
+#   * The values below are ENFORCED RATCHET FLOORS, set from the first real
+#     measurement (main @ a6fe35c4, run #3112 reproduction — see
+#     .claude/plans/research/coverage-gaps.md §3). The previous 100.0 values
+#     were never actually enforced: the gate matched zero files and passed
+#     vacuously (report §2, GAP #0). Honest enforced floors replace a
+#     fictional unenforced 100 — and the gate is now fail-closed.
+#   * RATCHET RULE: floors may only move UP, never down. When P1–P4 of the
+#     coverage-gaps action plan raise real coverage, raise the floor in the
+#     same PR (floor = measured, rounded DOWN to one decimal, minus 0.1).
+#   * Floors sit 0.07–0.13 below the measured value so ordinary line-count
+#     drift does not flap the post-merge Coverage & Perf job.
+#
+# Measured baseline (2026-06-10, main @ a6fe35c4):
+#   common 99.57 | api 98.71 | trading 97.02 | storage 91.35 | core 90.38 | app 63.43
 # =============================================================================
 
 # Default threshold for any crate not explicitly listed
-default = 100.0
+default = 63.0
 
 [crates]
-common  = 100.0
-core    = 100.0
-trading = 100.0
-storage = 100.0
-api     = 100.0
-app     = 100.0
+common  = 99.5
+core    = 90.2
+trading = 96.9
+storage = 91.2
+api     = 98.6
+app     = 63.3
