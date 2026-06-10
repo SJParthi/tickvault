@@ -418,8 +418,10 @@ async fn main() -> Result<()> {
     // remain in `ws_frame_spill::WsType` as orphan; any replayed records
     // of those types are silently dropped here.
     // -----------------------------------------------------------------------
-    let ws_wal_dir = std::env::var("TV_WS_WAL_DIR").unwrap_or_else(|_| "./data/ws_wal".to_string()); // O(1) EXEMPT: boot-time
-    let ws_wal_path = std::path::PathBuf::from(&ws_wal_dir);
+    // Single source of truth for the WAL dir (hostile-review H1: shared
+    // with the 15:40 conservation audit so the two sites can never drift).
+    let ws_wal_path = tickvault_app::tick_conservation_boot::ws_wal_dir();
+    let ws_wal_dir = ws_wal_path.display().to_string(); // O(1) EXEMPT: boot-time
     // Replay first — this MUST happen before any WS connection opens so we
     // never race a fresh append against a stale segment rotation.
     // TICK-SEQ-01: carry each replayed frame's `frame_seq` so re-injected
@@ -6992,5 +6994,87 @@ fn spawn_post_market_tasks(
             );
         });
         info!("cross_verify_1m: post-market verification task spawned");
+    }
+
+    // Operator directive 2026-06-10 ("Go ahead to achieve zero tick loss"):
+    // daily end-to-end tick-conservation audit at 15:40:00 IST. Reconciles
+    // the WAL disk log (every frame Dhan delivered) against the processor
+    // outcome counters (self-scraped from /metrics) and the QuestDB `ticks`
+    // row count, then writes one forensic row to `tick_conservation_audit`.
+    // Residual > 0 → error! TICK-CONSERVE-01 (Telegram). Cold path,
+    // fail-soft, market-hours-gated (audit Rule 3). Runbook:
+    // `.claude/rules/project/tick-conservation-audit-error-codes.md`.
+    {
+        let tc_qcfg = config.questdb.clone();
+        let tc_metrics_port = config.observability.metrics_port;
+        let tc_calendar = std::sync::Arc::clone(&trading_calendar);
+        // Single source of truth for the WAL dir (shared with STAGE-C).
+        let tc_wal_dir = tickvault_app::tick_conservation_boot::ws_wal_dir();
+        tokio::spawn(async move {
+            use chrono::{FixedOffset, TimeZone, Timelike, Utc};
+            use tickvault_app::tick_conservation_boot::{
+                ConservationStart, boot_covers_full_session, decide_conservation_start,
+                run_tick_conservation_audit,
+            };
+            use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+            let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+                return;
+            };
+            let boot_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+            let today_ist = boot_ist.date_naive();
+            let boot_secs_of_day = boot_ist.time().num_seconds_from_midnight();
+            let force_now = std::env::var("TICKVAULT_TICK_CONSERVE_NOW")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let is_trading_day = tc_calendar.is_trading_day(today_ist);
+            match decide_conservation_start(boot_secs_of_day, is_trading_day, force_now) {
+                ConservationStart::SkipNonTradingDay => {
+                    info!("tick_conservation: skipping (non-trading day)");
+                    return;
+                }
+                ConservationStart::SkipPastTrigger => {
+                    debug!(
+                        now = %boot_ist.time(),
+                        "tick_conservation: skipping (past 15:40 — mid-evening boot)"
+                    );
+                    return;
+                }
+                ConservationStart::RunNow => {
+                    info!(
+                        "tick_conservation: TICKVAULT_TICK_CONSERVE_NOW set — running \
+                         on-demand NOW (operator dry-run)"
+                    );
+                }
+                ConservationStart::SleepThenRun(secs_until) => {
+                    info!(secs_until, "tick_conservation: sleeping until 15:40:00 IST");
+                    tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+                }
+            }
+
+            // IST day number for WAL attribution + the ticks-table window
+            // (ts stores IST-epoch nanos — data-integrity.md).
+            let now_utc_secs = Utc::now().timestamp();
+            let ist_secs = now_utc_secs.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+            // APPROVED: epoch day number fits u64 trivially.
+            let target_ist_day = ist_secs.max(0) as u64 / 86_400;
+            let trading_date_ist_nanos = i64::try_from(target_ist_day)
+                .unwrap_or(0)
+                .saturating_mul(86_400)
+                .saturating_mul(1_000_000_000);
+            let run_ts_ist_nanos = ist_secs.saturating_mul(1_000_000_000);
+
+            run_tick_conservation_audit(
+                &tc_wal_dir,
+                &tc_qcfg,
+                tc_metrics_port,
+                target_ist_day,
+                trading_date_ist_nanos,
+                run_ts_ist_nanos,
+                boot_covers_full_session(boot_secs_of_day),
+            )
+            .await;
+            info!("PROOF: tick_conservation audit fired @ 15:40:00 IST");
+        });
+        info!("tick_conservation: daily WAL-vs-DB audit task spawned");
     }
 }
