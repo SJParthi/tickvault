@@ -418,8 +418,10 @@ async fn main() -> Result<()> {
     // remain in `ws_frame_spill::WsType` as orphan; any replayed records
     // of those types are silently dropped here.
     // -----------------------------------------------------------------------
-    let ws_wal_dir = std::env::var("TV_WS_WAL_DIR").unwrap_or_else(|_| "./data/ws_wal".to_string()); // O(1) EXEMPT: boot-time
-    let ws_wal_path = std::path::PathBuf::from(&ws_wal_dir);
+    // Single source of truth for the WAL dir (hostile-review H1: shared
+    // with the 15:40 conservation audit so the two sites can never drift).
+    let ws_wal_path = tickvault_app::tick_conservation_boot::ws_wal_dir();
+    let ws_wal_dir = ws_wal_path.display().to_string(); // O(1) EXEMPT: boot-time
     // Replay first — this MUST happen before any WS connection opens so we
     // never race a fresh append against a stale segment rotation.
     // TICK-SEQ-01: carry each replayed frame's `frame_seq` so re-injected
@@ -6800,11 +6802,13 @@ fn redact_ip_last_octet(raw: &str) -> String {
     "[REDACTED]".to_string()
 }
 
-/// Spawn the two post-market tasks — end-of-day digest (15:31:30 IST) and the
-/// 1-minute cross-verify (15:31:00 IST). Called from BOTH boot paths so a
-/// mid-session fast-boot restart runs them too (boot-symmetry, 2026-06-09).
-/// Each spawned task self-skips if past its IST trigger or on a non-trading day,
-/// so calling this from a late/non-trading boot is safe (no-op).
+/// Spawn the scheduled daily tasks — end-of-day digest (15:31:30 IST), the
+/// 1-minute cross-verify (15:31:00 IST), and the REST-health canary
+/// (09:05 / 12:00 / 15:25 IST — DHAN-REST-400, 2026-06-10). Called from BOTH
+/// boot paths so a mid-session fast-boot restart runs them too
+/// (boot-symmetry, 2026-06-09). Each spawned task self-skips if past its IST
+/// trigger(s) or on a non-trading day, so calling this from a late/
+/// non-trading boot is safe (no-op).
 fn spawn_post_market_tasks(
     notifier: std::sync::Arc<NotificationService>,
     health_status: SharedHealthStatus,
@@ -6909,26 +6913,40 @@ fn spawn_post_market_tasks(
         let cv_qcfg = config.questdb.clone();
         let cv_base = config.dhan.rest_api_base_url.clone();
         let cv_calendar = std::sync::Arc::clone(&trading_calendar);
-        tokio::spawn(async move {
+        // Visibility directive 2026-06-10: the INNER task runs the
+        // verification and returns a typed outcome; the OUTER supervisor
+        // turns that outcome into the typed Telegram event so the daily
+        // summary can never be silently dropped. Outcome contract:
+        //   Ok(Some((date, summary))) → the run happened → summary event
+        //   Ok(None)                  → legitimate skip (non-trading day /
+        //                               past-trigger boot / no targets)
+        //   Err(reason)               → internal failure → Aborted event
+        //   JoinError::is_panic()     → task crashed → Aborted event
+        //   JoinError cancelled       → graceful shutdown — no page
+        let cv_inner = tokio::spawn(async move {
             use chrono::{FixedOffset, TimeZone, Timelike, Utc};
             use tickvault_app::cross_verify_1m_boot::{
                 CrossVerifyStart, decide_cross_verify_start,
             };
             use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
             let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
-                return;
+                // Effectively unreachable (constant offset) — surfaced as
+                // an abort, never a silent skip.
+                return Err("IST offset construction failed");
             };
             let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
             let today_ist = now_ist.date_naive();
             if cv_targets.is_empty() {
                 info!("cross_verify_1m: no spot targets — skipping");
-                return;
+                return Ok(None);
             }
             // Operator on-demand override: `make cross-verify-now` sets
             // TICKVAULT_CROSS_VERIFY_NOW=1 to run the verification right
             // now (proving the pipeline without waiting for 15:31 IST on
             // a live trading day). Fail-soft: a forced run on a quiet day
-            // just yields an empty/degraded report, never fabricated data.
+            // just yields an empty/degraded report, never fabricated data
+            // (and the summary event renders it honestly as
+            // "nothing could be compared", never a green PASS).
             let force_now = std::env::var("TICKVAULT_CROSS_VERIFY_NOW")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
@@ -6937,14 +6955,14 @@ fn spawn_post_market_tasks(
             match decide_cross_verify_start(now_secs_of_day, is_trading_day, force_now) {
                 CrossVerifyStart::SkipNonTradingDay => {
                     info!("cross_verify_1m: skipping (non-trading day)");
-                    return;
+                    return Ok(None);
                 }
                 CrossVerifyStart::SkipPastTrigger => {
                     debug!(
                         now = %now_ist.time(),
                         "cross_verify_1m: skipping (past 15:31 — mid-evening boot)"
                     );
-                    return;
+                    return Ok(None);
                 }
                 CrossVerifyStart::RunNow => {
                     info!(
@@ -6990,7 +7008,162 @@ fn spawn_post_market_tasks(
                 degraded = summary.degraded,
                 "PROOF: cross_verify_1m fired @ 15:31:00 IST"
             );
+            Ok(Some((today_ist, summary)))
+        });
+        let cv_notifier = notifier.clone();
+        tokio::spawn(async move {
+            match cv_inner.await {
+                Ok(Ok(Some((cv_date, summary)))) => {
+                    // The once-per-day deliverable (visibility directive
+                    // 2026-06-10). Severity is data-dependent inside the
+                    // event: Info only on a clean compared>0 run.
+                    cv_notifier.notify(NotificationEvent::CrossVerify1mSummary {
+                        trading_date_ist: cv_date.format("%Y-%m-%d").to_string(),
+                        instruments: summary.instruments_checked,
+                        compared: summary.stats.compared,
+                        mismatches: summary.stats.mismatches,
+                        missing: summary.stats.missing_ours,
+                        degraded: summary.degraded,
+                    });
+                }
+                // Legitimate skip — already logged by the inner task.
+                Ok(Ok(None)) => {}
+                Ok(Err(reason)) => {
+                    error!(reason, "cross_verify_1m: task failed before running");
+                    cv_notifier.notify(NotificationEvent::CrossVerify1mAborted {
+                        detail: reason.to_string(),
+                    });
+                }
+                Err(join_err) if join_err.is_panic() => {
+                    error!(
+                        %join_err,
+                        "cross_verify_1m: task crashed before producing the daily summary"
+                    );
+                    cv_notifier.notify(NotificationEvent::CrossVerify1mAborted {
+                        detail: format!("the check task crashed: {join_err}"),
+                    });
+                }
+                Err(_) => {
+                    // Cancellation during graceful shutdown (16:30 IST
+                    // auto-stop, `make stop`) — normal teardown, NOT an
+                    // abort. No page.
+                    info!("cross_verify_1m: task cancelled during shutdown");
+                }
+            }
         });
         info!("cross_verify_1m: post-market verification task spawned");
+    }
+
+    // Operator task DHAN-REST-400 (2026-06-10): REST-health canary — one
+    // cheap GET /v2/profile at 09:05 / 12:00 / 15:25 IST on trading days.
+    // On non-2xx it pages HIGH (REST-CANARY-01) with the HTTP status, the
+    // exact final URL (token-redacted) and the bounded secret-redacted
+    // response body — so an 08:45-class REST death is known by 09:05, not
+    // discovered at 15:33 by the cross-verify. Spawned from BOTH boot paths
+    // (this fn is the shared site); self-skips on non-trading days and when
+    // booted past 15:25 IST (audit Rule 3).
+    {
+        let canary_token = std::sync::Arc::clone(&token_handle);
+        let canary_base = config.dhan.rest_api_base_url.clone();
+        let canary_calendar = std::sync::Arc::clone(&trading_calendar);
+        tokio::spawn(async move {
+            use chrono::{FixedOffset, TimeZone, Timelike, Utc};
+            use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+            let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+                return;
+            };
+            let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+            let is_trading_day = canary_calendar.is_trading_day(now_ist.date_naive());
+            tickvault_app::rest_canary_boot::run_rest_canary(
+                canary_token,
+                canary_base,
+                is_trading_day,
+                now_ist.time().num_seconds_from_midnight(),
+            )
+            .await;
+        });
+        info!("rest_canary: REST-health probe task spawned (09:05 / 12:00 / 15:25 IST)");
+    }
+
+    // Operator directive 2026-06-10 ("Go ahead to achieve zero tick loss"):
+    // daily end-to-end tick-conservation audit at 15:40:00 IST. Reconciles
+    // the WAL disk log (every frame Dhan delivered) against the processor
+    // outcome counters (self-scraped from /metrics) and the QuestDB `ticks`
+    // row count, then writes one forensic row to `tick_conservation_audit`.
+    // Residual > 0 → error! TICK-CONSERVE-01 (Telegram). Cold path,
+    // fail-soft, market-hours-gated (audit Rule 3). Runbook:
+    // `.claude/rules/project/tick-conservation-audit-error-codes.md`.
+    {
+        let tc_qcfg = config.questdb.clone();
+        let tc_metrics_port = config.observability.metrics_port;
+        let tc_calendar = std::sync::Arc::clone(&trading_calendar);
+        // Single source of truth for the WAL dir (shared with STAGE-C).
+        let tc_wal_dir = tickvault_app::tick_conservation_boot::ws_wal_dir();
+        tokio::spawn(async move {
+            use chrono::{FixedOffset, TimeZone, Timelike, Utc};
+            use tickvault_app::tick_conservation_boot::{
+                ConservationStart, boot_covers_full_session, decide_conservation_start,
+                run_tick_conservation_audit,
+            };
+            use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+            let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+                return;
+            };
+            let boot_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+            let today_ist = boot_ist.date_naive();
+            let boot_secs_of_day = boot_ist.time().num_seconds_from_midnight();
+            let force_now = std::env::var("TICKVAULT_TICK_CONSERVE_NOW")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let is_trading_day = tc_calendar.is_trading_day(today_ist);
+            match decide_conservation_start(boot_secs_of_day, is_trading_day, force_now) {
+                ConservationStart::SkipNonTradingDay => {
+                    info!("tick_conservation: skipping (non-trading day)");
+                    return;
+                }
+                ConservationStart::SkipPastTrigger => {
+                    debug!(
+                        now = %boot_ist.time(),
+                        "tick_conservation: skipping (past 15:40 — mid-evening boot)"
+                    );
+                    return;
+                }
+                ConservationStart::RunNow => {
+                    info!(
+                        "tick_conservation: TICKVAULT_TICK_CONSERVE_NOW set — running \
+                         on-demand NOW (operator dry-run)"
+                    );
+                }
+                ConservationStart::SleepThenRun(secs_until) => {
+                    info!(secs_until, "tick_conservation: sleeping until 15:40:00 IST");
+                    tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+                }
+            }
+
+            // IST day number for WAL attribution + the ticks-table window
+            // (ts stores IST-epoch nanos — data-integrity.md).
+            let now_utc_secs = Utc::now().timestamp();
+            let ist_secs = now_utc_secs.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+            // APPROVED: epoch day number fits u64 trivially.
+            let target_ist_day = ist_secs.max(0) as u64 / 86_400;
+            let trading_date_ist_nanos = i64::try_from(target_ist_day)
+                .unwrap_or(0)
+                .saturating_mul(86_400)
+                .saturating_mul(1_000_000_000);
+            let run_ts_ist_nanos = ist_secs.saturating_mul(1_000_000_000);
+
+            run_tick_conservation_audit(
+                &tc_wal_dir,
+                &tc_qcfg,
+                tc_metrics_port,
+                target_ist_day,
+                trading_date_ist_nanos,
+                run_ts_ist_nanos,
+                boot_covers_full_session(boot_secs_of_day),
+            )
+            .await;
+            info!("PROOF: tick_conservation audit fired @ 15:40:00 IST");
+        });
+        info!("tick_conservation: daily WAL-vs-DB audit task spawned");
     }
 }

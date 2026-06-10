@@ -1637,3 +1637,48 @@ rules:
       Severity::Critical — NEVER auto-action. Escalate (Telegram + draft Issue)
       paired with the WS-SPILL-01 respawn so the operator fixes the disk
       failure that killed the writer.
+
+  # -----------------------------------------------------------------------
+  # Daily end-to-end tick-conservation audit (2026-06-10, operator
+  # directive "Go ahead to achieve zero tick loss")
+  # -----------------------------------------------------------------------
+
+  - name: tick-conserve-01-daily-residual-escalate
+    match:
+      code: TICK-CONSERVE-01
+    action: escalate
+    runbook_path: .claude/rules/project/tick-conservation-audit-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      TICK-CONSERVE-01 = the 15:40 IST end-to-end conservation audit found a
+      positive residual: ticks Dhan delivered (counted durably in the WAL
+      disk log) did not all reach a known outcome (DB row / filter counter).
+      Severity::High, data-accounting signal — NOT auto-fixable: a positive
+      delivery_residual means frames are in the WAL awaiting next-boot
+      replay (verify tv_wal_replay_recovered_total picks them up); a
+      positive outcome_residual is a true in-process leak needing root-cause
+      against the 60s conservation ledger. Operator inspects the
+      tick_conservation_audit row for the exact per-stage numbers. Fires at
+      most once per trading day by construction (15:40 scheduler).
+
+  # -----------------------------------------------------------------------
+  # REST-health canary (2026-06-10, task DHAN-REST-400)
+  # -----------------------------------------------------------------------
+
+  - name: rest-canary-01-probe-failed-escalate
+    match:
+      code: REST-CANARY-01
+    action: escalate
+    runbook_path: .claude/rules/project/dhan-rest-canary-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      REST-CANARY-01 = a scheduled GET /v2/profile health probe (09:05 /
+      12:00 / 15:25 IST) returned non-2xx or failed to send after one 30s
+      retry. Severity::High, NOT auto-fixable: the captured body names the
+      cause (data-plan expiry vs DH-901 token vs WAF/malformed URL) and
+      each requires a different operator action (renew plan on Dhan portal /
+      rotate token / fix base-URL override). Fires at most 3 times per
+      trading day by construction (3 fixed probe times). The operator reads
+      the body + url fields in the error payload per the runbook triage.

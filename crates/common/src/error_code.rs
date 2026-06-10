@@ -505,6 +505,25 @@ pub enum ErrorCode {
     CrossVerify1m02FetchDegraded,
 
     // -----------------------------------------------------------------------
+    /// TICK-CONSERVE-01: the daily 15:40 IST end-to-end tick-conservation
+    /// audit found a positive residual — ticks Dhan delivered (counted in
+    /// the WAL disk log) did not all reach a known outcome
+    /// (DB row / filter counter). The audit row in `tick_conservation_audit`
+    /// carries the exact per-stage numbers. Severity::High (operator
+    /// directive 2026-06-10 "Go ahead to achieve zero tick loss").
+    TickConserve01DailyResidual,
+
+    // -----------------------------------------------------------------------
+    /// REST-CANARY-01: a scheduled REST-health probe (`GET /v2/profile` at
+    /// 09:05 / 12:00 / 15:25 IST) returned non-2xx or failed to send after a
+    /// retry. Carries the HTTP status, the final (token-redacted) request URL
+    /// and the bounded secret-redacted response body so the operator learns
+    /// WHY the Dhan REST surface is down the moment it dies — not at the
+    /// 15:31 cross-verify (DHAN-REST-400 incident, 2026-06-10).
+    /// Severity::High.
+    RestCanary01ProbeFailed,
+
+    // -----------------------------------------------------------------------
     // PR #1 (AWS-lifecycle 14-PR sequence): contract stubs for the future
     // option_chain module. Variants exist so downstream PR #8 can wire
     // its emit sites against stable identifiers. NO production emit sites
@@ -696,6 +715,9 @@ impl ErrorCode {
             // Operator 2026-06-02: post-market 1-minute cross-verification
             Self::CrossVerify1m01MismatchFound => "CROSS-VERIFY-1M-01",
             Self::CrossVerify1m02FetchDegraded => "CROSS-VERIFY-1M-02",
+            Self::TickConserve01DailyResidual => "TICK-CONSERVE-01",
+            // DHAN-REST-400 (2026-06-10): scheduled REST-health canary
+            Self::RestCanary01ProbeFailed => "REST-CANARY-01",
             // PR #1 (AWS-lifecycle): option_chain stubs
             Self::OptionChain01FetchFailed => "OPTION-CHAIN-01",
             Self::OptionChain02Dh904Exhausted => "OPTION-CHAIN-02",
@@ -780,6 +802,15 @@ impl ErrorCode {
             // Operator 2026-06-02 — post-market 1m cross-verify (both High)
             | Self::CrossVerify1m01MismatchFound
             | Self::CrossVerify1m02FetchDegraded
+            // Operator 2026-06-10 — daily tick-conservation residual (High:
+            // delivered-but-unaccounted ticks need operator eyes; the WAL
+            // still holds them durably, so this is not Critical data loss)
+            | Self::TickConserve01DailyResidual
+            // DHAN-REST-400 (2026-06-10) — REST canary probe failed (High:
+            // the data path may still be alive via WS; operator must inspect
+            // the captured body to decide between data-plan expiry, malformed
+            // URL, and Dhan-side outage)
+            | Self::RestCanary01ProbeFailed
             // WS-GAP-07 — live frame channel closed (tick consumer died)
             | Self::WsGap07LiveChannelClosed
             // WS-SPILL-01 — WAL writer respawned (flapping writer = disk dying)
@@ -962,6 +993,14 @@ impl ErrorCode {
             Self::CrossVerify1m01MismatchFound | Self::CrossVerify1m02FetchDegraded => {
                 ".claude/rules/project/cross-verify-1m-error-codes.md"
             }
+            // Operator 2026-06-10: daily tick-conservation audit
+            Self::TickConserve01DailyResidual => {
+                ".claude/rules/project/tick-conservation-audit-error-codes.md"
+            }
+            // DHAN-REST-400 (2026-06-10): REST-health canary
+            Self::RestCanary01ProbeFailed => {
+                ".claude/rules/project/dhan-rest-canary-error-codes.md"
+            }
             // PR #1 (AWS-lifecycle): option_chain stubs
             Self::OptionChain01FetchFailed
             | Self::OptionChain02Dh904Exhausted
@@ -1106,6 +1145,9 @@ impl ErrorCode {
             // Operator 2026-06-02: post-market 1-minute cross-verification
             Self::CrossVerify1m01MismatchFound,
             Self::CrossVerify1m02FetchDegraded,
+            Self::TickConserve01DailyResidual,
+            // DHAN-REST-400 (2026-06-10) — REST-health canary
+            Self::RestCanary01ProbeFailed,
             // PR #1 (AWS-lifecycle 14-PR sequence) — option_chain stubs
             Self::OptionChain01FetchFailed,
             Self::OptionChain02Dh904Exhausted,
@@ -1375,7 +1417,11 @@ mod tests {
         // NTM-CONSTITUENCY-01 (niftyindices source degraded — core universe continues).
         // 2026-06-09 (zero-tick-loss WAL writer hardening): bumped 103 -> 105 for
         // WS-SPILL-01 (writer respawned) + WS-SPILL-02 (durable frame dropped — now loud).
-        assert_eq!(ErrorCode::all().len(), 105);
+        // 2026-06-10 (operator "Go ahead to achieve zero tick loss"): bumped
+        // 105 -> 106 for TICK-CONSERVE-01 (daily WAL-vs-DB conservation audit).
+        // 2026-06-10 (DHAN-REST-400): bumped 106 -> 107 for REST-CANARY-01
+        // (scheduled REST-health probe failed).
+        assert_eq!(ErrorCode::all().len(), 107);
     }
 
     #[test]
@@ -1410,6 +1456,8 @@ mod tests {
                 || s.starts_with("CORE-PIN-")
                 // Wave 5 Item 26 L1: volume cumulative-monotonicity guard.
                 || s.starts_with("VOLUME-")
+                // DHAN-REST-400 (2026-06-10): scheduled REST-health canary.
+                || s.starts_with("REST-CANARY-")
                 // PR #450 commit 8b (2026-05-03): prev_oi cache state.
                 || s.starts_with("PREVOI-")
                 // Wave 6 Sub-PR #1: multi-TF aggregator + boundary timer.
@@ -1434,7 +1482,9 @@ mod tests {
                 // zero-tick-loss 2026-06-09: WAL frame-spill writer hardening
                 || s.starts_with("WS-SPILL-")
                 // NTM Sub-PR #10a (§31): niftyindices constituent source degrade
-                || s.starts_with("NTM-CONSTITUENCY-");
+                || s.starts_with("NTM-CONSTITUENCY-")
+                // Operator 2026-06-10: daily end-to-end tick-conservation audit
+                || s.starts_with("TICK-CONSERVE-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

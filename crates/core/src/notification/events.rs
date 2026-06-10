@@ -384,6 +384,45 @@ pub enum NotificationEvent {
         token_remaining_hours: u64,
     },
 
+    /// Post-market 1-minute cross-verify daily summary (operator directive
+    /// 2026-06-10 — "make the 15:31 cross-verify VISIBLE"). Fires exactly
+    /// once per trading day after `run_cross_verify_1m` completes, carrying
+    /// the aggregated outcome the run previously only logged.
+    ///
+    /// Severity is data-dependent (hardened per the 2026-06-10 pre-impl
+    /// adversarial review): `Info` ONLY when the run compared at least one
+    /// minute AND found zero mismatches AND zero missing minutes AND was
+    /// not degraded. A `compared == 0` run must NEVER read as PASS (audit
+    /// Rule 11 false-OK class — Dhan serving empty 200-responses yields
+    /// `compared = 0` with `fetch_failures = 0`), and `missing > 0` means
+    /// minutes of live candles were missed — the very signal this audit
+    /// exists for.
+    CrossVerify1mSummary {
+        /// Trading date in `YYYY-MM-DD` IST format.
+        trading_date_ist: String,
+        /// Spot instruments the run attempted to verify.
+        instruments: usize,
+        /// 1-minute buckets present on BOTH sides and compared exactly.
+        compared: usize,
+        /// OHLCV field-cells that disagreed with the exchange record.
+        mismatches: usize,
+        /// Minutes the exchange has that our live candles are missing.
+        missing: usize,
+        /// True when fetch coverage was partial (false-OK guard) — the
+        /// run cannot vouch for the full universe.
+        degraded: bool,
+    },
+
+    /// The post-market cross-verify TASK died (panicked) before producing
+    /// its daily summary. High so the absence of the daily summary is
+    /// impossible to miss (operator directive 2026-06-10). NOT fired on
+    /// graceful shutdown/cancellation (the 16:30 IST auto-stop is a normal
+    /// teardown, not an abort).
+    CrossVerify1mAborted {
+        /// Plain-English description of how the task died.
+        detail: String,
+    },
+
     // PR #4 (2026-05-19): DepthSpotPriceStale variant retired alongside
     // the deleted depth-20/200 infrastructure (operator lock 2026-05-15).
     // PR #5 (2026-05-19): 7 Phase2* variants retired alongside the
@@ -1319,6 +1358,79 @@ impl NotificationEvent {
                      {close_status}{token_warning}"
                 )
             }
+            Self::CrossVerify1mSummary {
+                trading_date_ist,
+                instruments,
+                compared,
+                mismatches,
+                missing,
+                degraded,
+            } => {
+                // Operator-charter §G wording: plain English, IST 12-hour
+                // time, real numbers, no library names, no file paths
+                // (points at the portal card, not a path).
+                let clean = *mismatches == 0 && *missing == 0 && !*degraded && *compared > 0;
+                if clean {
+                    format!(
+                        "\u{2705} <b>Daily candle check @ 3:31 PM IST — PASS</b>\n\
+                         Date: {trading_date_ist}\n\
+                         Instruments: {instruments} | Minutes compared: {compared}\n\
+                         Mismatches: 0 | Missing: 0\n\
+                         Every 1-minute candle matches the exchange record exactly."
+                    )
+                } else if *compared == 0 {
+                    // DHAN-REST-400 (2026-06-10): the BLIND day. 776/776
+                    // fetch failures produced a header-only report file that
+                    // LOOKED like a perfect day. Say BLIND loudly — an empty
+                    // mismatch list must never read as a pass.
+                    format!(
+                        "\u{1f198} <b>Daily candle check @ 3:31 PM IST — BLIND</b>\n\
+                         Date: {trading_date_ist}\n\
+                         Checked NOTHING today. \
+                         Nothing could be compared — today's check cannot \
+                         vouch for the day's candles.\n\
+                         The day's report is empty because every data request \
+                         failed or returned nothing, NOT because the data was \
+                         perfect.\n\
+                         Instruments: {instruments} | Minutes compared: 0\n\
+                         What to do RIGHT NOW:\n\
+                         1. Check the REST health alerts for why requests failed.\n\
+                         2. Open the Cross-verify card on the operator portal.\n\
+                         3. Confirm the live feed itself stayed healthy today."
+                    )
+                } else {
+                    let coverage_note = if *degraded {
+                        "\nCoverage was PARTIAL — some instrument data could \
+                         not be fetched, so today's check cannot vouch for \
+                         the full universe."
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "\u{26a0}\u{fe0f} <b>Daily candle check @ 3:31 PM IST — \
+                         NEEDS ATTENTION</b>\n\
+                         Date: {trading_date_ist}\n\
+                         Instruments: {instruments} | Minutes compared: {compared}\n\
+                         Mismatches: {mismatches} | Missing: {missing}\
+                         {coverage_note}\n\
+                         What to do RIGHT NOW:\n\
+                         1. Open the Cross-verify card on the operator portal.\n\
+                         2. Review which minutes differ from the exchange record.\n\
+                         3. If many instruments differ, check the day's feed health."
+                    )
+                }
+            }
+            Self::CrossVerify1mAborted { detail } => {
+                format!(
+                    "\u{26a0}\u{fe0f} <b>Daily candle check did NOT run</b>\n\
+                     The 3:31 PM IST check against the exchange record died \
+                     before finishing.\n\
+                     Reason: {detail}\n\
+                     What to do RIGHT NOW:\n\
+                     1. Check the app is still running.\n\
+                     2. Restart the app to re-arm tomorrow's check."
+                )
+            }
             // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
             // Display arms retired with their variants.
             // PR #6a (2026-05-19): NseBhavcopyCheck* Display arms retired.
@@ -1832,6 +1944,8 @@ impl NotificationEvent {
             Self::MarketOpenStreamingFailed { .. } => "MarketOpenStreamingFailed",
             Self::MarketOpenReadinessConfirmation { .. } => "MarketOpenReadinessConfirmation",
             Self::EndOfDayDigest { .. } => "EndOfDayDigest",
+            Self::CrossVerify1mSummary { .. } => "CrossVerify1mSummary",
+            Self::CrossVerify1mAborted { .. } => "CrossVerify1mAborted",
             // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
             // name arms retired.
             // PR #6a (2026-05-19): NseBhavcopyCheck* name arms retired.
@@ -1949,6 +2063,23 @@ impl NotificationEvent {
             Self::MarketOpenStreamingFailed { .. } => Severity::High,
             Self::MarketOpenReadinessConfirmation { .. } => Severity::Info,
             Self::EndOfDayDigest { .. } => Severity::Info,
+            // Hardened per the 2026-06-10 pre-impl adversarial review:
+            // compared == 0 and missing > 0 must NEVER render as a green
+            // PASS (audit Rule 11 — false-OK class).
+            Self::CrossVerify1mSummary {
+                compared,
+                mismatches,
+                missing,
+                degraded,
+                ..
+            } => {
+                if *mismatches == 0 && *missing == 0 && !*degraded && *compared > 0 {
+                    Severity::Info
+                } else {
+                    Severity::High
+                }
+            }
+            Self::CrossVerify1mAborted { .. } => Severity::High,
             Self::SelfTestPassed { .. } => Severity::Info,
             Self::SelfTestDegraded { .. } => Severity::High,
             Self::RealtimeGuaranteeHealthy { .. } => Severity::Info,
@@ -2048,6 +2179,11 @@ impl NotificationEvent {
             | Self::WebSocketPoolDeferredOffHours { .. }
             // PR #5 (2026-05-19): Phase2Complete retired.
             | Self::OrderUpdateConnected => DispatchPolicy::Immediate,
+            // 2026-06-10 (pre-impl finding M1): the once-per-day post-market
+            // summary must arrive AT 15:31, not coalesced into a 60s bucket
+            // that re-renders the body — Severity::Info would otherwise be
+            // batched by the default routing.
+            Self::CrossVerify1mSummary { .. } => DispatchPolicy::Immediate,
             _ => DispatchPolicy::Default,
         }
     }
@@ -3911,5 +4047,153 @@ mod tests {
             token_remaining_hours: 11,
         };
         assert!(warn.to_message().contains("refresh TOTP"));
+    }
+
+    // -----------------------------------------------------------------------
+    // CrossVerify1mSummary + CrossVerify1mAborted (2026-06-10 — visibility)
+    // -----------------------------------------------------------------------
+
+    fn cv_summary(
+        compared: usize,
+        mismatches: usize,
+        missing: usize,
+        degraded: bool,
+    ) -> NotificationEvent {
+        NotificationEvent::CrossVerify1mSummary {
+            trading_date_ist: "2026-06-10".to_string(),
+            instruments: 243,
+            compared,
+            mismatches,
+            missing,
+            degraded,
+        }
+    }
+
+    #[test]
+    fn test_cross_verify_1m_summary_clean_is_info() {
+        let event = cv_summary(91_230, 0, 0, false);
+        assert_eq!(event.topic(), "CrossVerify1mSummary");
+        assert_eq!(event.severity(), Severity::Info);
+    }
+
+    #[test]
+    fn test_cross_verify_1m_summary_mismatch_is_high() {
+        // Exactly one mismatch must already page (no tolerance band).
+        assert_eq!(cv_summary(91_230, 1, 0, false).severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_cross_verify_1m_summary_missing_is_high() {
+        // Pre-impl finding H1: missing minutes ARE missed live candles —
+        // the very signal this audit exists for. Never a green PASS.
+        assert_eq!(cv_summary(91_230, 0, 1, false).severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_cross_verify_1m_summary_degraded_is_high() {
+        // False-OK guard: degraded coverage with zero mismatches must
+        // still page (audit Rule 11).
+        assert_eq!(cv_summary(91_230, 0, 0, true).severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_cross_verify_1m_summary_compared_zero_is_high() {
+        // Pre-impl finding C1: Dhan serving empty 200-responses yields
+        // compared=0 with fetch_failures=0 — must NEVER read as PASS.
+        let event = cv_summary(0, 0, 0, false);
+        assert_eq!(event.severity(), Severity::High);
+        assert!(
+            event.to_message().contains("Nothing could be compared"),
+            "compared==0 must carry the honest no-coverage wording"
+        );
+    }
+
+    /// RATCHET (task DHAN-REST-400 item 2, 2026-06-10 incident): a
+    /// 776/776-fetch-failure day must say BLIND loudly — the empty-report
+    /// trap is spelled out so a header-only CSV can never again read as a
+    /// perfect day.
+    #[test]
+    fn test_cross_verify_1m_summary_blind_message_is_loud() {
+        let msg = cv_summary(0, 0, 0, true).to_message();
+        assert!(msg.contains("BLIND"), "{msg}");
+        assert!(msg.contains("Checked NOTHING today"), "{msg}");
+        assert!(
+            msg.contains("NOT because the data was perfect"),
+            "the empty-report trap must be spelled out: {msg}"
+        );
+        assert!(msg.contains("REST health alerts"), "{msg}");
+        assert!(!msg.contains("PASS"), "BLIND must never render PASS: {msg}");
+    }
+
+    #[test]
+    fn test_cross_verify_1m_summary_clean_message_format() {
+        // 10-commandments check: emoji-first subject, IST 12-hour time,
+        // real numbers, no file paths, no library names.
+        let msg = cv_summary(91_230, 0, 0, false).to_message();
+        assert!(msg.starts_with('\u{2705}'), "clean summary leads with ✅");
+        assert!(msg.contains("3:31 PM IST"), "IST 12-hour time");
+        assert!(msg.contains("PASS"));
+        assert!(msg.contains("Date: 2026-06-10"));
+        assert!(msg.contains("Instruments: 243"));
+        assert!(msg.contains("Minutes compared: 91230"));
+        assert!(msg.contains("matches the exchange record exactly"));
+        assert!(!msg.contains("data/"), "no file paths in operator text");
+        assert!(!msg.contains("QuestDB"), "no infrastructure names");
+    }
+
+    #[test]
+    fn test_cross_verify_1m_summary_failure_message_has_action_lines() {
+        let msg = cv_summary(91_230, 42, 15, false).to_message();
+        assert!(msg.starts_with('\u{26a0}'), "failure summary leads with ⚠️");
+        assert!(msg.contains("NEEDS ATTENTION"));
+        assert!(msg.contains("Mismatches: 42 | Missing: 15"));
+        assert!(msg.contains("What to do RIGHT NOW"));
+        assert!(msg.contains("Cross-verify card on the operator portal"));
+    }
+
+    #[test]
+    fn test_cross_verify_1m_summary_degraded_message_has_partial_wording() {
+        // Pre-impl finding L3: the no-JWT path returns degraded with
+        // instruments=0 — the message must read honestly, not as a PASS.
+        let event = NotificationEvent::CrossVerify1mSummary {
+            trading_date_ist: "2026-06-10".to_string(),
+            instruments: 243,
+            compared: 80_000,
+            mismatches: 0,
+            missing: 0,
+            degraded: true,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("Coverage was PARTIAL"));
+        assert!(msg.contains("cannot vouch for"));
+        assert!(!msg.contains("PASS"));
+    }
+
+    #[test]
+    fn test_cross_verify_1m_summary_dispatch_is_immediate() {
+        // Pre-impl finding M1: the Info variant must NOT coalesce for 60s
+        // and re-render as a bucket summary — it is the once-per-day
+        // 15:31 deliverable.
+        assert_eq!(
+            cv_summary(91_230, 0, 0, false).dispatch_policy(),
+            DispatchPolicy::Immediate
+        );
+        assert_eq!(
+            cv_summary(91_230, 42, 0, false).dispatch_policy(),
+            DispatchPolicy::Immediate
+        );
+    }
+
+    #[test]
+    fn test_cross_verify_1m_aborted_is_high_with_action_lines() {
+        let event = NotificationEvent::CrossVerify1mAborted {
+            detail: "task panicked".to_string(),
+        };
+        assert_eq!(event.topic(), "CrossVerify1mAborted");
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        assert!(msg.contains("did NOT run"));
+        assert!(msg.contains("Reason: task panicked"));
+        assert!(msg.contains("What to do RIGHT NOW"));
     }
 }
