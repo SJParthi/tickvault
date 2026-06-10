@@ -8,12 +8,18 @@ from __future__ import annotations
 
 import importlib
 import os
+from datetime import datetime, timezone
 from typing import Any
 
 os.environ.setdefault("EC2_INSTANCE_ID", "i-0test")
 os.environ.setdefault("ALERTS_TOPIC_ARN", "arn:aws:sns:ap-south-1:1:tv-prod-alerts")
 
 handler = importlib.import_module("handler")
+
+# Inside the scheduled check window (03:00-04:00 UTC = 08:30-09:30 IST).
+IN_WINDOW_NOW = datetime(2026, 6, 10, 3, 15, tzinfo=timezone.utc)
+ON_TIME_LAUNCH = datetime(2026, 6, 10, 3, 1, tzinfo=timezone.utc)
+LATE_LAUNCH = datetime(2026, 6, 10, 3, 13, tzinfo=timezone.utc)  # 08:43 IST
 
 
 class _FakeSns:
@@ -25,13 +31,35 @@ class _FakeSns:
 
 
 class _FakeEc2:
-    def __init__(self, state: str | None) -> None:
+    def __init__(
+        self,
+        state: str | None,
+        launch_time: datetime | None = None,
+        start_raises: bool = False,
+    ) -> None:
         self._state = state
+        self._launch_time = launch_time
+        self._start_raises = start_raises
+        self.start_calls: list[list[str]] = []
 
     def describe_instances(self, *, InstanceIds: list[str]) -> dict[str, Any]:  # noqa: N803
         if self._state is None:
             raise RuntimeError("boom")
-        return {"Reservations": [{"Instances": [{"State": {"Name": self._state}}]}]}
+        inst: dict[str, Any] = {"State": {"Name": self._state}}
+        if self._launch_time is not None:
+            inst["LaunchTime"] = self._launch_time
+        return {"Reservations": [{"Instances": [inst]}]}
+
+    def start_instances(self, *, InstanceIds: list[str]) -> dict[str, Any]:  # noqa: N803
+        if self._start_raises:
+            raise RuntimeError("AccessDenied")
+        self.start_calls.append(InstanceIds)
+        return {"StartingInstances": [{"InstanceId": InstanceIds[0]}]}
+
+
+def _wire(monkeypatch, sns: _FakeSns, ec2: _FakeEc2, now: datetime = IN_WINDOW_NOW) -> None:
+    monkeypatch.setattr(handler.boto3, "client", lambda svc: ec2 if svc == "ec2" else sns)
+    monkeypatch.setattr(handler, "_now", lambda: now)
 
 
 def test_ping_publishes_positive_signal(monkeypatch) -> None:
@@ -41,31 +69,73 @@ def test_ping_publishes_positive_signal(monkeypatch) -> None:
     assert out["published"] is True
     assert len(sns.published) == 1
     assert "start triggered" in sns.published[0]["subject"].lower()
+    # Stale-wording regression lock: the schedule is 08:30 IST, not 08:00.
+    assert "8:30" in sns.published[0]["message"]
+    assert "08:00" not in sns.published[0]["message"]
 
 
-def test_check_running_stays_silent(monkeypatch) -> None:
+def test_check_running_on_time_stays_silent(monkeypatch) -> None:
     sns = _FakeSns()
-    ec2 = _FakeEc2("running")
-    monkeypatch.setattr(handler.boto3, "client", lambda svc: ec2 if svc == "ec2" else sns)
+    ec2 = _FakeEc2("running", launch_time=ON_TIME_LAUNCH)
+    _wire(monkeypatch, sns, ec2)
     out = handler.lambda_handler({"mode": "check"})
     assert out["alerted"] is False
     assert sns.published == []  # no spam on a healthy box
 
 
-def test_check_stopped_alerts_critical(monkeypatch) -> None:
+def test_check_running_late_launch_pages_warning(monkeypatch) -> None:
+    """2026-06-10 masking case: manual 08:43 start beat the 08:45 check —
+    the box is running, but the 08:30 auto-start FAILED and must be flagged."""
+    sns = _FakeSns()
+    ec2 = _FakeEc2("running", launch_time=LATE_LAUNCH)
+    _wire(monkeypatch, sns, ec2)
+    out = handler.lambda_handler({"mode": "check"})
+    assert out["alerted"] is True
+    assert out["self_started"] is False
+    assert ec2.start_calls == []  # running box is never re-started
+    assert "started late" in sns.published[0]["subject"]
+
+
+def test_check_running_late_launch_outside_window_stays_silent(monkeypatch) -> None:
+    """A manual `mode=check` in the afternoon must not misread an afternoon
+    manual start as 'late' — late detection applies only in the 03:xx UTC window."""
+    sns = _FakeSns()
+    afternoon = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+    ec2 = _FakeEc2("running", launch_time=datetime(2026, 6, 10, 11, 30, tzinfo=timezone.utc))
+    _wire(monkeypatch, sns, ec2, now=afternoon)
+    out = handler.lambda_handler({"mode": "check"})
+    assert out["alerted"] is False
+    assert sns.published == []
+
+
+def test_check_stopped_self_starts_and_pages(monkeypatch) -> None:
     sns = _FakeSns()
     ec2 = _FakeEc2("stopped")
-    monkeypatch.setattr(handler.boto3, "client", lambda svc: ec2 if svc == "ec2" else sns)
+    _wire(monkeypatch, sns, ec2)
     out = handler.lambda_handler({"mode": "check"})
     assert out["alerted"] is True
     assert out["state"] == "stopped"
+    assert out["self_started"] is True
+    assert ec2.start_calls == [["i-0test"]]  # the self-heal actually fired
     assert "FAILED" in sns.published[0]["subject"]
+    assert "started the box itself" in sns.published[0]["subject"]
+
+
+def test_check_stopped_self_start_failure_still_pages_manual(monkeypatch) -> None:
+    sns = _FakeSns()
+    ec2 = _FakeEc2("stopped", start_raises=True)
+    _wire(monkeypatch, sns, ec2)
+    out = handler.lambda_handler({"mode": "check"})
+    assert out["alerted"] is True
+    assert out["self_started"] is False
+    assert "manual start NEEDED NOW" in sns.published[0]["subject"]
+    assert "start-instances" in sns.published[0]["message"]
 
 
 def test_check_describe_error_treated_as_not_running(monkeypatch) -> None:
     sns = _FakeSns()
     ec2 = _FakeEc2(None)  # describe_instances raises
-    monkeypatch.setattr(handler.boto3, "client", lambda svc: ec2 if svc == "ec2" else sns)
+    _wire(monkeypatch, sns, ec2)
     out = handler.lambda_handler({"mode": "check"})
     # An error means we can't confirm 'running' → must alert, not stay silent.
     assert out["alerted"] is True
@@ -74,7 +144,7 @@ def test_check_describe_error_treated_as_not_running(monkeypatch) -> None:
 
 def test_default_mode_is_check(monkeypatch) -> None:
     sns = _FakeSns()
-    ec2 = _FakeEc2("running")
-    monkeypatch.setattr(handler.boto3, "client", lambda svc: ec2 if svc == "ec2" else sns)
+    ec2 = _FakeEc2("running", launch_time=ON_TIME_LAUNCH)
+    _wire(monkeypatch, sns, ec2)
     out = handler.lambda_handler({})
     assert out["mode"] == "check"
