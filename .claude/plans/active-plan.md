@@ -1,6 +1,6 @@
 # Implementation Plan: Daily end-to-end tick-conservation audit (WAL vs DB) — TICK-CONSERVE-01
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-06-10
 **Approved by:** Parthiban (verbatim, this session 2026-06-10: "Go ahead to achieve zero tick loss" — directly approving the proposed Future #1: "Daily end-to-end count audit: WAL disk-log frame count vs DB row count per day — one more independent 'not one tick unaccounted' number", following his "I suspect maybe in some cases we are removing ticks … or dropping … or duplicating … or missing … wal or buffer or spill or dlq or in memory ram or db … how do you guarantee this area").
 
@@ -142,23 +142,23 @@ operator sees the relationship without a false alarm.
 
 ## Plan Items
 
-- [ ] Item 1 — WAL day-count scan (read-only) in ws_frame_spill
+- [x] Item 1 — WAL day-count scan (read-only) in ws_frame_spill
   - Files: crates/storage/src/ws_frame_spill.rs
   - Tests: test_count_frames_for_ist_day_classifies_tick_codes, test_count_frames_day_attribution_and_v1_unattributable, test_count_frames_scans_archive_dir
 
-- [ ] Item 2 — tick_conservation_audit table + ILP writer
+- [x] Item 2 — tick_conservation_audit table + ILP writer
   - Files: crates/storage/src/tick_conservation_audit_persistence.rs, crates/storage/src/lib.rs
   - Tests: test_conservation_ddl_contains_expected_columns, test_conservation_dedup_key_includes_designated_timestamp
 
-- [ ] Item 3 — ErrorCode TICK-CONSERVE-01 + runbook rule file
+- [x] Item 3 — ErrorCode TICK-CONSERVE-01 + runbook rule file
   - Files: crates/common/src/error_code.rs, .claude/rules/project/tick-conservation-audit-error-codes.md
   - Tests: test_all_variants_have_unique_code_str
 
-- [ ] Item 4 — scheduler + runner + main.rs spawn
+- [x] Item 4 — scheduler + runner + main.rs spawn
   - Files: crates/app/src/tick_conservation_boot.rs, crates/app/src/lib.rs, crates/app/src/main.rs
   - Tests: test_decide_conservation_start_before_after_force, test_parse_prom_counter, test_compute_residuals, test_classify_outcome_partial_leak_balanced
 
-- [ ] Item 5 — workspace verification + 3-agent review + PR to merge
+- [x] Item 5 — workspace verification + 3-agent review + PR to merge
   - Files: (verification — PR body)
   - Tests: test_classify_outcome_partial_leak_balanced
 
