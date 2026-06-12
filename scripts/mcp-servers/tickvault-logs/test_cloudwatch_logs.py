@@ -100,13 +100,20 @@ check(server.filter_and_trim_portal_events(pevs, "nomatch", 100) == [], "no matc
 # --- portal preferred when env set: a failed call is ok=False, source=portal, never crashes ---
 import os as _os
 
-_os.environ["TICKVAULT_PORTAL_URL"] = "http://127.0.0.1:1/unreachable"
 _os.environ["TICKVAULT_PORTAL_TOKEN"] = "test-token"
 try:
+    # https unreachable -> ok=False via the urlopen-failure path (no crash).
+    _os.environ["TICKVAULT_PORTAL_URL"] = "https://127.0.0.1:1/unreachable"
     pres = server.tool_cloudwatch_logs(minutes=5, limit=3)
     check(pres.get("source") == "portal", f"portal path should be preferred when env set: {pres}")
     check(pres.get("ok") is False, f"unreachable portal -> ok=False (no crash): {pres}")
     check(bool(pres.get("error")), "portal failure should carry an error message")
+
+    # SECURITY: plaintext http:// must be REFUSED before any token is sent.
+    _os.environ["TICKVAULT_PORTAL_URL"] = "http://127.0.0.1:1/unreachable"
+    hres = server.tool_cloudwatch_logs(minutes=5, limit=3)
+    check(hres.get("ok") is False, f"http:// portal must be refused: {hres}")
+    check("https" in (hres.get("error") or "").lower(), f"refusal must cite https: {hres}")
 finally:
     _os.environ.pop("TICKVAULT_PORTAL_URL", None)
     _os.environ.pop("TICKVAULT_PORTAL_TOKEN", None)
