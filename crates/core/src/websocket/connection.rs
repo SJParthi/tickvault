@@ -347,6 +347,15 @@ pub struct WebSocketConnection {
     /// operator distinguish "1 long retry" from "60 short retries" when
     /// debugging a long outage.
     attempts_since_last_disconnect: std::sync::atomic::AtomicU32,
+
+    /// 2026-06-12 — the authoritative Dhan disconnect code (805/807/etc.) of
+    /// the most recent disconnect, when one was present. `u32::MAX` sentinel =
+    /// none (a transport/TLS error carries no Dhan code). Lets BOTH the
+    /// disconnect log AND the matching reconnect log classify the PRECISE
+    /// source via `classify_disconnect_cause(reason, Some(code))` instead of
+    /// the digit-blind string heuristic — operator demanded the precise
+    /// failure source, and the code is the ground truth.
+    last_disconnect_dhan_code: std::sync::atomic::AtomicU32,
     /// Consecutive Dhan feed rate-limit (HTTP 429 / DATA-805 class) connect
     /// failures since the last successful connect. Drives the post-429
     /// reconnect floor in `wait_with_backoff` (Dhan guidance: "stop all
@@ -459,6 +468,8 @@ impl WebSocketConnection {
             last_disconnect_reason: std::sync::Mutex::new(None),
             last_disconnect_at_epoch_secs: std::sync::atomic::AtomicI64::new(0),
             attempts_since_last_disconnect: std::sync::atomic::AtomicU32::new(0),
+            // u32::MAX sentinel = "no Dhan code recorded yet".
+            last_disconnect_dhan_code: std::sync::atomic::AtomicU32::new(u32::MAX),
             rate_limit_streak: std::sync::atomic::AtomicU32::new(0),
         }
     }
@@ -615,7 +626,8 @@ impl WebSocketConnection {
                         // + attempts) captured at the matching disconnect
                         // sites and emit it with the reconnect event so the
                         // Telegram message surfaces WHY + HOW LONG + HOW MANY.
-                        let (reason, down_secs, attempts) = self.take_disconnect_context();
+                        let (reason, down_secs, attempts, dhan_code) =
+                            self.take_disconnect_context();
                         // G1 (zero-tick-loss PR-3): quantify reconnect-gap time so
                         // dashboards + a CloudWatch rate-alarm can see sustained or
                         // excessive reconnect churn (Dhan packets carry no sequence
@@ -627,6 +639,31 @@ impl WebSocketConnection {
                         metrics::counter!("tv_ws_reconnect_total", "feed" => "main").increment(1);
                         metrics::counter!("tv_ws_reconnect_gap_seconds_total", "feed" => "main")
                             .increment(down_secs);
+                        // 2026-06-12: structured log so EVERY reconnect lands in
+                        // CloudWatch (app.log), not just Telegram. Cold path.
+                        let source = reason
+                            .as_deref()
+                            .map(|r| {
+                                tickvault_common::disconnect_cause::classify_disconnect_cause(
+                                    r, dhan_code,
+                                )
+                                .label()
+                            })
+                            .unwrap_or("unknown");
+                        // SECURITY: redact any token-bearing URL in the reason
+                        // before it reaches CloudWatch/app.log (the reason can
+                        // be a TLS-handshake error embedding `?token=<JWT>`).
+                        let safe_reason = reason
+                            .as_deref()
+                            .map(tickvault_common::sanitize::redact_url_params);
+                        info!(
+                            connection_id = usize::from(self.connection_id),
+                            reason = ?safe_reason,
+                            source = source,
+                            down_secs,
+                            attempts,
+                            "WebSocket reconnected"
+                        );
                         if let Some(ref n) = self.notifier {
                             n.notify(crate::notification::events::NotificationEvent::WebSocketReconnected {
                                 connection_index: usize::from(self.connection_id),
@@ -701,7 +738,7 @@ impl WebSocketConnection {
                             // O(1) EXEMPT: cold path — fires at most once per disconnect cycle, never per tick
                             let reason = format!("Non-reconnectable: {code}");
                             // O(1) EXEMPT: cold path — reason needs to flow to both state slot + Telegram event
-                            self.record_disconnect(reason.clone());
+                            self.record_disconnect(reason.clone(), Some(code.as_u16()));
                             if let Some(ref n) = self.notifier {
                                 n.notify(crate::notification::events::NotificationEvent::WebSocketDisconnected {
                                     connection_index: usize::from(self.connection_id),
@@ -726,7 +763,7 @@ impl WebSocketConnection {
                             // O(1) EXEMPT: cold path — once per 807 event, never per tick
                             let reason = format!("Token expired ({code}) — waiting for renewal");
                             // O(1) EXEMPT: cold path — reason needs to flow to both state slot + Telegram event
-                            self.record_disconnect(reason.clone());
+                            self.record_disconnect(reason.clone(), Some(code.as_u16()));
                             if let Some(ref n) = self.notifier {
                                 n.notify(crate::notification::events::NotificationEvent::WebSocketDisconnected {
                                     connection_index: usize::from(self.connection_id),
@@ -752,16 +789,20 @@ impl WebSocketConnection {
                             // variant — audit trail preserved, no alert
                             // escalation. In-market disconnects still fire
                             // HIGH via the original variant.
-                            warn!(
-                                connection_id = self.connection_id,
-                                error = %err,
-                                "WebSocket disconnected — will reconnect"
-                            );
                             // PR #790b: record reason so the next reconnect Telegram surfaces it.
                             // O(1) EXEMPT: cold path — reconnection error, never per tick
                             let reason = format!("{err}");
-                            // O(1) EXEMPT: cold path — reason needs to flow to both state slot + Telegram event
-                            self.record_disconnect(reason.clone());
+                            // SECURITY (2026-06-12): a TLS/handshake error can embed
+                            // the feed URL with the token — redact before logging the
+                            // error detail so no JWT reaches CloudWatch/app.log.
+                            let safe_err = tickvault_common::sanitize::redact_url_params(&reason);
+                            warn!(
+                                connection_id = self.connection_id,
+                                error = %safe_err,
+                                "WebSocket disconnected — will reconnect"
+                            );
+                            // O(1) EXEMPT: cold path — transport error carries no Dhan code
+                            self.record_disconnect(reason.clone(), None);
                             if let Some(ref n) = self.notifier {
                                 let event =
                                     if tickvault_common::market_hours::is_within_market_hours_ist()
@@ -787,16 +828,19 @@ impl WebSocketConnection {
                     // Telegram + WARN log on EVERY connect-failed event,
                     // regardless of market hours. Mirrors the disconnect
                     // branch above for full audit parity.
-                    warn!(
-                        connection_id = self.connection_id,
-                        error = %err,
-                        "WebSocket connection failed — will retry"
-                    );
                     // PR #790b: record reason so the next reconnect Telegram surfaces it.
                     // O(1) EXEMPT: cold path — connect-failed, never per tick
                     let reason = format!("connect failed: {err}");
-                    // O(1) EXEMPT: cold path — reason needs to flow to both state slot + Telegram event
-                    self.record_disconnect(reason.clone());
+                    // SECURITY (2026-06-12): redact any token-bearing URL in the
+                    // connect error before logging it to CloudWatch/app.log.
+                    let safe_err = tickvault_common::sanitize::redact_url_params(&reason);
+                    warn!(
+                        connection_id = self.connection_id,
+                        error = %safe_err,
+                        "WebSocket connection failed — will retry"
+                    );
+                    // O(1) EXEMPT: cold path — connect-failed transport error carries no Dhan code
+                    self.record_disconnect(reason.clone(), None);
                     if let Some(ref n) = self.notifier {
                         // Parthiban override (2026-04-22): same off-hours
                         // severity split as the disconnect branch above.
@@ -1286,12 +1330,15 @@ impl WebSocketConnection {
                     let frame_seq = tickvault_storage::ws_frame_spill::next_frame_seq();
                     if let Some(spill) = self.wal_spill.as_ref() {
                         // Zero-tick-loss PR-8a (H1): hand the WAL spill an O(1)
-                        // `Bytes` Arc-refcount clone instead of a per-frame
+                        // `Bytes` Arc-refcount handle instead of a per-frame
                         // `Vec<u8>` malloc. `data` is already `Bytes` (the live
-                        // forward below also moves it zero-copy), so `data.clone()`
-                        // is a refcount bump — no heap allocation on the read loop.
+                        // forward below also moves it zero-copy), so cloning the
+                        // handle is a refcount bump — no heap allocation on the
+                        // read loop.
+                        // O(1) EXEMPT: begin — Bytes Arc-refcount bump, not a heap alloc (PR-8a H1).
                         let outcome =
                             spill.append_with_seq(WsType::LiveFeed, data.clone(), frame_seq);
+                        // O(1) EXEMPT: end
                         if outcome == tickvault_storage::ws_frame_spill::AppendOutcome::Dropped {
                             error!(
                                 connection_id = self.connection_id,
@@ -1737,8 +1784,35 @@ impl WebSocketConnection {
     /// total downtime (not just the last step).
     ///
     /// COLD PATH ONLY. Called from the 4 disconnect emit sites in `run()`.
+    /// `dhan_code` is `Some(805/807/...)` when the disconnect carried an
+    /// authoritative Dhan code, `None` for a transport/TLS error — passing it
+    /// gives the classifier the ground-truth source instead of a digit-blind
+    /// string guess.
     #[allow(clippy::expect_used)] // APPROVED: lock poison is unrecoverable
-    fn record_disconnect(&self, reason: String) {
+    fn record_disconnect(&self, reason: String, dhan_code: Option<u16>) {
+        // 2026-06-12: structured log at the SINGLE disconnect choke point so
+        // EVERY WebSocket disconnect lands in CloudWatch (app.log), not just
+        // Telegram — with the PRECISE source. Cold path (once per disconnect
+        // cycle, never per tick). O(1) EXEMPT.
+        let source =
+            tickvault_common::disconnect_cause::classify_disconnect_cause(&reason, dhan_code)
+                .label();
+        // SECURITY: the reason may embed the feed URL (`wss://...?token=<JWT>`)
+        // on a TLS/handshake error — redact query params so no token reaches
+        // CloudWatch/app.log. Same redaction the #1108 Telegram path uses.
+        let safe_reason = tickvault_common::sanitize::redact_url_params(&reason);
+        warn!(
+            connection_id = usize::from(self.connection_id),
+            reason = %safe_reason,
+            source = source,
+            "WebSocket disconnected"
+        );
+        // Capture the Dhan code (latest wins) so the matching reconnect log can
+        // classify the same PRECISE source. u32::MAX sentinel = none.
+        self.last_disconnect_dhan_code.store(
+            dhan_code.map_or(u32::MAX, u32::from),
+            std::sync::atomic::Ordering::Release,
+        );
         // Capture the reason (latest wins).
         if let Ok(mut slot) = self.last_disconnect_reason.lock() {
             *slot = Some(reason);
@@ -1761,12 +1835,15 @@ impl WebSocketConnection {
     }
 
     /// PR #790b — read disconnect-context for the matching reconnect event,
-    /// then atomically reset state. Returns `(reason, down_secs, attempts)`
-    /// where:
+    /// then atomically reset state. Returns `(reason, down_secs, attempts,
+    /// dhan_code)` where:
     /// * `reason` is `None` if no disconnect was recorded (rare initial path).
     /// * `down_secs` is `0` if `last_disconnect_at_epoch_secs == 0`.
     /// * `attempts` is `0` if no retry was needed.
-    fn take_disconnect_context(&self) -> (Option<String>, u64, u32) {
+    /// * `dhan_code` is `Some(805/807/...)` when the disconnect carried an
+    ///   authoritative Dhan code, `None` otherwise — lets the reconnect log
+    ///   classify the SAME precise source the disconnect log did.
+    fn take_disconnect_context(&self) -> (Option<String>, u64, u32, Option<u16>) {
         let reason = self
             .last_disconnect_reason
             .lock()
@@ -1778,13 +1855,22 @@ impl WebSocketConnection {
         let attempts = self
             .attempts_since_last_disconnect
             .swap(0, std::sync::atomic::Ordering::AcqRel);
+        // Reset the code slot to the none-sentinel as we take it.
+        let raw_code = self
+            .last_disconnect_dhan_code
+            .swap(u32::MAX, std::sync::atomic::Ordering::AcqRel);
+        let dhan_code = if raw_code == u32::MAX {
+            None
+        } else {
+            u16::try_from(raw_code).ok()
+        };
         let down_secs = if last_at == 0 {
             0
         } else {
             let now = chrono::Utc::now().timestamp();
             now.saturating_sub(last_at).max(0) as u64
         };
-        (reason, down_secs, attempts)
+        (reason, down_secs, attempts, dhan_code)
     }
 }
 
@@ -2126,32 +2212,46 @@ mod tests {
         );
 
         // Initial state: no context to take.
-        let (reason0, down0, attempts0) = conn.take_disconnect_context();
+        let (reason0, down0, attempts0, code0) = conn.take_disconnect_context();
         assert!(reason0.is_none(), "no disconnect recorded yet");
         assert_eq!(down0, 0, "no timestamp recorded yet");
         assert_eq!(attempts0, 0, "no attempts recorded yet");
+        assert_eq!(code0, None, "no Dhan code recorded yet");
 
         // Record 3 disconnects (simulating 3 retry failures in one outage).
-        conn.record_disconnect("Reset by peer".to_string());
-        conn.record_disconnect("Reset by peer".to_string());
-        conn.record_disconnect("connect failed: timeout".to_string());
+        // The first carries a Dhan 807 token-expired code; the latest is a
+        // transport error (no code) — so the code slot reflects "latest wins".
+        conn.record_disconnect("Token expired (807)".to_string(), Some(807));
+        conn.record_disconnect("Reset by peer".to_string(), None);
+        conn.record_disconnect("connect failed: timeout".to_string(), None);
 
         // Take the context — should reflect the LATEST reason and the
         // FIRST disconnect's timestamp (so down_secs measures full outage),
-        // with attempts = 3.
-        let (reason1, _down1, attempts1) = conn.take_disconnect_context();
+        // with attempts = 3. The latest disconnect had no Dhan code.
+        let (reason1, _down1, attempts1, code1) = conn.take_disconnect_context();
         assert_eq!(
             reason1.as_deref(),
             Some("connect failed: timeout"),
             "latest reason wins (caller diagnoses the most recent failure)"
         );
         assert_eq!(attempts1, 3, "all 3 disconnects counted");
+        assert_eq!(code1, None, "latest disconnect carried no Dhan code");
+
+        // A Dhan-coded disconnect surfaces the precise code on take.
+        conn.record_disconnect("Token expired (807)".to_string(), Some(807));
+        let (_r, _d, _a, code_coded) = conn.take_disconnect_context();
+        assert_eq!(
+            code_coded,
+            Some(807),
+            "Dhan code threaded through for the reconnect log"
+        );
 
         // After take, state is reset — next take returns empty again.
-        let (reason2, down2, attempts2) = conn.take_disconnect_context();
+        let (reason2, down2, attempts2, code2) = conn.take_disconnect_context();
         assert!(reason2.is_none(), "reason cleared after take");
         assert_eq!(down2, 0, "timestamp cleared after take");
         assert_eq!(attempts2, 0, "attempts cleared after take");
+        assert_eq!(code2, None, "Dhan code cleared after take");
     }
 
     #[test]
