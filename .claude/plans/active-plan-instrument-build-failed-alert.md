@@ -1,8 +1,8 @@
 # Plan: wire the missing `InstrumentBuildFailed` boot-failure alert
 
-**Status:** DRAFT
+**Status:** APPROVED
 **Date:** 2026-06-12
-**Approved by:** pending
+**Approved by:** Parthiban (2026-06-12 — "go ahead with the plan")
 **Branch:** claude/nice-cerf-hemuvn
 **Campaign:** observability dead-variant wiring (slice #2; slice #1 = `QuestDbReconnected` PR #1103, merged)
 **Changed crates:** `app` (wiring), `core` (no code change — variant already complete)
