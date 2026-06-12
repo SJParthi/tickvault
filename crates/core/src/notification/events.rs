@@ -878,12 +878,12 @@ pub enum NotificationEvent {
         attempts: u64,
     },
 
-    /// Token renewal deadline missed — renewal failed past safe window.
-    TokenRenewalDeadlineMissed {
-        /// IST hour when the deadline was crossed.
-        deadline_hour_ist: u32,
-    },
-
+    // RETIRED 2026-06-12: TokenRenewalDeadlineMissed deleted — it was defined
+    // but NEVER emitted (0 production sites) and is redundant with the live
+    // `TokenRenewalFailed` Critical path in token_manager::renewal_loop, which
+    // already pages on renewal exhaustion + circuit-breaker halt. Wiring a
+    // second Critical alert for the same event would double-page the operator
+    // (violates the anti-spam rule). See session 2026-06-12.
     /// QuestDB persistence disconnected — ticks being buffered, not persisted.
     QuestDbDisconnected {
         /// Which writer lost connection (e.g., "tick", "depth", "candle",
@@ -1911,11 +1911,6 @@ impl NotificationEvent {
                     tickvault_common::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT
                 )
             }
-            Self::TokenRenewalDeadlineMissed { deadline_hour_ist } => {
-                format!(
-                    "<b>TOKEN RENEWAL DEADLINE MISSED</b>\nPast {deadline_hour_ist}:00 IST — token not renewed"
-                )
-            }
             Self::QuestDbDisconnected {
                 writer,
                 signal,
@@ -2092,7 +2087,6 @@ impl NotificationEvent {
             Self::RateLimitExhausted { .. } => "RateLimitExhausted",
             Self::RiskHalt { .. } => "RiskHalt",
             Self::WebSocketReconnectionExhausted { .. } => "WebSocketReconnectionExhausted",
-            Self::TokenRenewalDeadlineMissed { .. } => "TokenRenewalDeadlineMissed",
             Self::QuestDbDisconnected { .. } => "QuestDbDisconnected",
             Self::QuestDbReconnected { .. } => "QuestDbReconnected",
             Self::SelfTestPassed { .. } => "SelfTestPassed",
@@ -2136,7 +2130,6 @@ impl NotificationEvent {
             Self::Custom { .. } => Severity::High,
             Self::RiskHalt { .. } => Severity::Critical,
             Self::WebSocketReconnectionExhausted { .. } => Severity::Critical,
-            Self::TokenRenewalDeadlineMissed { .. } => Severity::Critical,
             Self::CircuitBreakerOpened { .. } => Severity::High,
             Self::OrderRejected { .. } => Severity::High,
             Self::RateLimitExhausted { .. } => Severity::High,
@@ -3139,16 +3132,8 @@ mod tests {
         assert_eq!(event.severity(), Severity::Critical);
     }
 
-    #[test]
-    fn test_token_renewal_deadline_missed_notification() {
-        let event = NotificationEvent::TokenRenewalDeadlineMissed {
-            deadline_hour_ist: 14,
-        };
-        let msg = event.to_message();
-        assert!(msg.contains("DEADLINE MISSED"));
-        assert!(msg.contains("14:00 IST"));
-        assert_eq!(event.severity(), Severity::Critical);
-    }
+    // RETIRED 2026-06-12: test_token_renewal_deadline_missed_notification deleted
+    // with the TokenRenewalDeadlineMissed variant (redundant with TokenRenewalFailed).
 
     // =====================================================================
     // Additional coverage: severity for all remaining variants, boot events,
@@ -3512,13 +3497,8 @@ mod tests {
         assert_eq!(event.severity(), Severity::Critical);
     }
 
-    #[test]
-    fn test_token_renewal_deadline_missed_severity_is_critical() {
-        let event = NotificationEvent::TokenRenewalDeadlineMissed {
-            deadline_hour_ist: 10,
-        };
-        assert_eq!(event.severity(), Severity::Critical);
-    }
+    // RETIRED 2026-06-12: test_token_renewal_deadline_missed_severity_is_critical
+    // deleted with the variant.
 
     // PR #6a (2026-05-19): 3 NseBhavcopyCheck* tests retired with the variants.
 
