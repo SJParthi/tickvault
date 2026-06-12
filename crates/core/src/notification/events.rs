@@ -1656,12 +1656,16 @@ impl NotificationEvent {
                 )
             }
             Self::DualInstanceDetected { holder, lock_key } => {
+                // `holder` is read from the Valkey/SSM instance lock (set by a
+                // previous process) and `lock_key` is the lock key string —
+                // both external-origin, so escape before HTML interpolation.
                 let holder_line = if holder.is_empty() {
                     "(holder identity not retrievable — the lock check raced; run `make doctor`)"
                         .to_string()
                 } else {
-                    format!("Live peer: {holder}")
+                    format!("Live peer: {}", html_escape(holder))
                 };
+                let lock_key = html_escape(lock_key);
                 format!(
                     "<b>DUAL-INSTANCE DETECTED</b>\nAnother tickvault process is already running for this Dhan account.\n{holder_line}\nLock key: {lock_key}\n\nBoot blocked — running two instances against one client-id breaks order auth, depth state, and reconciliation. Stop the other instance, then restart this one."
                 )
@@ -1678,10 +1682,12 @@ impl NotificationEvent {
                 sample_symbols,
                 dry_run,
             } => {
+                // `sample_symbols` are tradingSymbol strings from the Dhan
+                // REST `GET /v2/positions` response — external-origin.
                 let sample = if sample_symbols.is_empty() {
                     "(no sample symbols captured)".to_string()
                 } else {
-                    sample_symbols.join(", ")
+                    html_escape(&sample_symbols.join(", "))
                 };
                 let action = if *dry_run {
                     "DRY-RUN: no auto-exit attempted. EXIT MANUALLY via Dhan web UI before 15:30 IST close."
@@ -1705,10 +1711,12 @@ impl NotificationEvent {
                 sample_symbols,
                 cross_check_pass,
             } => {
+                // `sample_symbols` derive from matching against Dhan
+                // historical REST data — external-origin.
                 let sample = if sample_symbols.is_empty() {
                     "(no samples captured)".to_string()
                 } else {
-                    sample_symbols.join(", ")
+                    html_escape(&sample_symbols.join(", "))
                 };
                 format!(
                     "<b>09:15 BAR CORRECTED FROM DHAN HISTORICAL</b>\n\
@@ -1745,6 +1753,7 @@ impl NotificationEvent {
                 deadline_secs,
                 step,
             } => {
+                let step = html_escape(step);
                 format!(
                     "<b>BOOT DEADLINE MISSED</b>\nDeadline: {deadline_secs}s\nBlocked at: {step}"
                 )
@@ -1754,6 +1763,7 @@ impl NotificationEvent {
                 threshold_secs,
                 source,
             } => {
+                let source = html_escape(source);
                 format!(
                     "<b>BOOT-03 CLOCK SKEW EXCEEDED — HALTING</b>\n\
                      Source: {source}\n\
@@ -3954,6 +3964,47 @@ mod tests {
             orders_allowed: false,
             ip_match_status: HOSTILE.to_string(),
             attempts_made: 1,
+        };
+        assert_external_text_escaped(&ev.to_message());
+    }
+
+    // Security-review (PR #1102) follow-on: external-text arms the first
+    // sweep missed — `holder`/`lock_key` from the Valkey/SSM instance lock
+    // and `sample_symbols` from Dhan REST positions / historical responses.
+
+    #[test]
+    fn test_dual_instance_detected_escapes_external_holder_and_lock_key() {
+        let ev = NotificationEvent::DualInstanceDetected {
+            holder: HOSTILE.to_string(),
+            lock_key: "key<x>&y".to_string(),
+        };
+        let body = ev.to_message();
+        assert_external_text_escaped(&body);
+        assert!(!body.contains("key<x>"), "lock_key not escaped: {body}");
+        assert!(
+            body.contains("key&lt;x&gt;&amp;y"),
+            "lock_key escaping wrong: {body}"
+        );
+    }
+
+    #[test]
+    fn test_orphan_position_detected_escapes_external_sample_symbols() {
+        let ev = NotificationEvent::OrphanPositionDetected {
+            count: 1,
+            total_abs_net_qty: 50,
+            sample_symbols: vec![HOSTILE.to_string()],
+            dry_run: true,
+        };
+        assert_external_text_escaped(&ev.to_message());
+    }
+
+    #[test]
+    fn test_bar_mismatch_corrected_escapes_external_sample_symbols() {
+        let ev = NotificationEvent::BarMismatchCorrectedFromHistorical {
+            compared_count: 222,
+            mismatches_count: 1,
+            sample_symbols: vec![HOSTILE.to_string()],
+            cross_check_pass: "post_open_09_16_05",
         };
         assert_external_text_escaped(&ev.to_message());
     }
