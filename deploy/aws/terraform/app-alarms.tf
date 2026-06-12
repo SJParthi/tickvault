@@ -414,6 +414,34 @@ resource "aws_cloudwatch_metric_alarm" "disk_watcher_respawn" {
 }
 
 # ---------------------------------------------------------------------------
+# Post-close tick anomaly — Dhan stamped a tick at/after 15:30:00 IST.
+# Hot-path-safe equivalent of the retired LastTickAfterBoundary Telegram
+# variant (2026-06-12): the per-tick check + tv_late_tick_after_boundary_total
+# counter live in tick_processor.rs; this alarm pages on the counter instead of
+# threading a notifier into the hot path. SHOULD be zero — Dhan's session ends
+# 15:30:00.000 exclusive. The box restarts daily (08:30 IST) so the counter is
+# fresh each session; Maximum > 0 = a post-close tick happened today. Low
+# priority / data-quality (correlate Dhan-side ingestion lag or local clock skew).
+# treat_missing_data = notBreaching: metric is absent when the box is stopped
+# (16:30 IST / weekends) — must not hold the alarm FIRING across that gap.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "late_tick_after_boundary" {
+  alarm_name          = "tv-${var.environment}-late-tick-after-boundary"
+  alarm_description   = "Dhan stamped a tick at/after 15:30:00 IST (post-market close). Informational data-quality signal — should be zero; correlate Dhan-side ingestion lag or local clock skew."
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "tv_late_tick_after_boundary_total"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Maximum"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+  dimensions          = local.app_dimensions
+  alarm_actions       = local.app_alarm_actions
+  ok_actions          = local.app_alarm_ok
+}
+
+# ---------------------------------------------------------------------------
 # Output — operator-facing reminder + alarm list
 # ---------------------------------------------------------------------------
 
@@ -436,5 +464,6 @@ output "app_cloudwatch_alarms" {
     aws_cloudwatch_metric_alarm.ws_frame_dropped_no_wal.alarm_name,
     aws_cloudwatch_metric_alarm.ws_reconnect_gap_high.alarm_name,
     aws_cloudwatch_metric_alarm.disk_watcher_respawn.alarm_name,
+    aws_cloudwatch_metric_alarm.late_tick_after_boundary.alarm_name,
   ]
 }
