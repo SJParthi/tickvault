@@ -61,11 +61,11 @@ or reconnect behaviour.
   `crates/core/src/websocket/connection.rs` (main-feed) — initial connect,
   disconnect (all 4 paths via the `record_disconnect` choke point), reconnect,
   sleep-entered, sleep-resumed — each calls `emit_ws_audit`.
-- Append site (NEXT sub-PR, NOT yet wired): `order_update_connection.rs`
-  (`WsType::OrderUpdate`). The `OrderUpdate` enum variant + the storage append
-  path are already built + tested, so wiring the order-update connection is a
-  thin follow-up that emits with the same `emit_ws_audit` pattern. Until it
-  lands, the order-update connection produces NO `ws_event_audit` rows.
+- Append site (LIVE since #1113): `order_update_connection.rs`
+  (`WsType::OrderUpdate`) — clean-close (`Ok(())`), error-disconnect (`Err`
+  arm), reconnect (`connect_and_listen`), sleep-entered/resumed — each calls
+  `emit_order_update_ws_audit`. Both live WebSockets now write `ws_event_audit`
+  rows. A future depth pool would call the same pattern with its own `WsType`.
 
 ---
 

@@ -868,19 +868,139 @@ def parse_cloudwatch_events(stdout: str, limit: int) -> list[dict[str, Any]]:
     return out[-int(limit):] if limit > 0 else out
 
 
+def _portal_url() -> str:
+    """Operator-control portal base URL (the existing dashboard's API Gateway /
+    Function URL). When set with TICKVAULT_PORTAL_TOKEN, prod logs are read via
+    the portal's `logs` action — no `aws` CLI, no AWS key in this session; the
+    portal Lambda reads the box with its OWN IAM role. The operator already has
+    this URL + bearer secret (it powers the dashboard)."""
+    return os.environ.get("TICKVAULT_PORTAL_URL", "").rstrip("/")
+
+
+def _portal_token() -> str:
+    return os.environ.get("TICKVAULT_PORTAL_TOKEN", "")
+
+
+def parse_portal_logs_raw(raw: str) -> list[dict[str, Any]]:
+    """Pure parser for the portal `logs` action's `raw` field — the box's
+    journalctl tail wrapped in ERR_BEGIN/ERR_END + APP_BEGIN/APP_END markers
+    (see operator-control handler.py `logs` action). Returns
+    `[{section, message}]` in file order (err section first, then app), with the
+    marker lines themselves dropped. Unit-testable without any network/AWS.
+    """
+    out: list[dict[str, Any]] = []
+    section: str | None = None
+    section_for = {
+        "ERR_BEGIN": "err",
+        "APP_BEGIN": "app",
+    }
+    for line in (raw or "").splitlines():
+        stripped = line.strip()
+        if stripped in section_for:
+            section = section_for[stripped]
+            continue
+        if stripped in ("ERR_END", "APP_END"):
+            section = None
+            continue
+        if section is None:
+            continue
+        out.append({"section": section, "message": line.rstrip("\n")})
+    return out
+
+
+def filter_and_trim_portal_events(
+    events: list[dict[str, Any]], filter_pattern: str | None, limit: int
+) -> list[dict[str, Any]]:
+    """Apply a client-side substring `filter_pattern` (the portal `logs` action
+    is a fixed journalctl tail, so filtering is done here, not server-side) and
+    trim to the newest `limit`. Pure."""
+    out = events
+    if filter_pattern:
+        needle = filter_pattern.strip()
+        out = [e for e in out if needle in (e.get("message") or "")]
+    return out[-int(limit):] if limit > 0 else out
+
+
+def _call_portal_logs(url: str, token: str, timeout: float = 30.0) -> dict[str, Any]:
+    """POST {"action":"logs"} to the operator-control portal with Bearer auth,
+    returning the parsed JSON dict. Stdlib-only (urllib) — no aws CLI, no boto3.
+    Raises on transport/HTTP error (caller turns it into an ok=False result)."""
+    import urllib.request  # noqa: PLC0415
+
+    body = json.dumps({"action": "logs"}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — operator-set https URL
+        payload = resp.read().decode("utf-8", "replace")
+    parsed = json.loads(payload) if payload.strip() else {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _tool_cloudwatch_logs_via_portal(
+    filter_pattern: str | None, limit: int
+) -> dict[str, Any]:
+    """Portal-backed log read (preferred): reuses the existing dashboard's
+    `logs` endpoint. The portal returns the box's live journalctl err+app tail.
+    `minutes` is not honoured (the portal serves a fixed recent tail); we apply
+    `filter_pattern` (substring) + `limit` client-side."""
+    url = _portal_url()
+    token = _portal_token()
+    try:
+        parsed = _call_portal_logs(url, token)
+    except Exception as exc:  # noqa: BLE001 — surface as ok=False, never crash
+        return {
+            "ok": False,
+            "source": "portal",
+            "portal_url": url,
+            "error": f"portal logs call failed: {type(exc).__name__}: {exc}",
+        }
+    if not parsed.get("ok"):
+        return {
+            "ok": False,
+            "source": "portal",
+            "portal_url": url,
+            "error": "portal returned ok=false (check the bearer token / box state)",
+            "portal_response": str(parsed)[:400],
+        }
+    events = filter_and_trim_portal_events(
+        parse_portal_logs_raw(str(parsed.get("raw", ""))), filter_pattern, limit
+    )
+    return {
+        "ok": True,
+        "source": "portal",
+        "portal_url": url,
+        "filter_pattern": filter_pattern or "",
+        "returned": len(events),
+        "events": events,
+        "note": "live journalctl err+app tail via the operator portal (no aws CLI / no AWS key needed)",
+    }
+
+
 def tool_cloudwatch_logs(
     minutes: int = 60,
     filter_pattern: str | None = None,
     limit: int = 100,
 ) -> dict[str, Any]:
-    """Read recent events from the prod CloudWatch log group
-    (/tickvault/prod/app) via the read-only `aws` CLI. Looks back `minutes`,
-    optional CloudWatch `filter_pattern` (e.g. `"ERROR"` or `"WS-GAP-05"`),
-    returns up to `limit` newest events. Requires read-only AWS creds in the
-    environment (one-time setup, see note above); fails clearly if absent.
-    """
+    """Read recent prod logs, fully automated. PREFERRED path: the existing
+    operator-control portal's `logs` endpoint (set TICKVAULT_PORTAL_URL +
+    TICKVAULT_PORTAL_TOKEN — no aws CLI, no AWS key; the portal Lambda reads the
+    box with its own role). FALLBACK: the read-only `aws` CLI on the
+    /tickvault/prod/app CloudWatch group. Looks back `minutes` (aws path only),
+    optional `filter_pattern`, up to `limit` newest events. Fails clearly if
+    neither path is configured."""
     import subprocess
     import time as _time
+
+    # PREFERRED: reuse the operator dashboard's already-working logs endpoint.
+    if _portal_url() and _portal_token():
+        return _tool_cloudwatch_logs_via_portal(filter_pattern, limit)
 
     region = _aws_region()
     group = _cloudwatch_log_group()
@@ -893,8 +1013,10 @@ def tool_cloudwatch_logs(
     except FileNotFoundError:
         return {
             "ok": False,
-            "error": "aws CLI not on PATH — wire the read-only AWS credential + aws CLI "
-            "into the session environment once (see CloudWatch setup note in server.py).",
+            "error": "no log reader configured — set TICKVAULT_PORTAL_URL + "
+            "TICKVAULT_PORTAL_TOKEN to read via the existing operator dashboard "
+            "(no aws CLI / no AWS key needed), OR wire a read-only AWS credential "
+            "+ aws CLI. Neither is present in this session.",
             "log_group": group,
         }
     except subprocess.TimeoutExpired:
@@ -904,13 +1026,15 @@ def tool_cloudwatch_logs(
             "ok": False,
             "exit_code": proc.returncode,
             "error": "aws logs call failed — most likely no read-only AWS credentials in "
-            "this environment yet (the one-time setup). stderr below.",
+            "this environment yet. Prefer the portal path (TICKVAULT_PORTAL_URL + "
+            "TICKVAULT_PORTAL_TOKEN). stderr below.",
             "stderr": proc.stderr.strip()[:800],
             "log_group": group,
         }
     events = parse_cloudwatch_events(proc.stdout, limit)
     return {
         "ok": True,
+        "source": "aws_cli",
         "log_group": group,
         "region": region,
         "lookback_minutes": int(minutes),
@@ -1200,12 +1324,14 @@ TOOLS: list[ToolSpec] = [
     ToolSpec(
         name="cloudwatch_logs",
         description=(
-            "Read recent PROD logs directly from the CloudWatch log group "
-            "/tickvault/prod/app — fully automated, no human paste/download. "
-            "Args: minutes (lookback, default 60), filter_pattern (optional "
-            "CloudWatch pattern e.g. \"ERROR\" or \"WS-GAP-05\"), limit "
-            "(default 100). Requires read-only AWS creds in the environment "
-            "(one-time setup); returns a clear error if absent."
+            "Read recent PROD logs — fully automated, no human paste/download. "
+            "PREFERRED: reuses the existing operator-control dashboard's logs "
+            "endpoint (set TICKVAULT_PORTAL_URL + TICKVAULT_PORTAL_TOKEN — no "
+            "aws CLI, no AWS key; the portal Lambda reads the box with its own "
+            "IAM role). FALLBACK: read-only aws CLI on /tickvault/prod/app. "
+            "Args: minutes (lookback, aws path only), filter_pattern (substring "
+            "on the portal path, e.g. \"ERROR\" or \"WS-GAP-05\"), limit "
+            "(default 100). Returns a clear error if neither path is configured."
         ),
         input_schema={
             "type": "object",
