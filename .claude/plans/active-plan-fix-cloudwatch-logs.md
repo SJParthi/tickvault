@@ -62,3 +62,36 @@ the full CI workspace suite (the comprehensive automated check) plus the
   - Files: .github/workflows/deploy-aws.yml
 - [ ] Add non-fatal agent status + log-tail + log-dir diagnostics to the deploy
   - Files: .github/workflows/deploy-aws.yml
+
+## Follow-up (2026-06-12) — CONFIRMED ROOT CAUSE via the diagnostics
+
+The diagnostics added above (deploy run #258, sha 663ff35) revealed the actual
+cause — NOT IAM, NOT timeout. The agent's own log showed:
+
+```
+"status": "stopped", "configstatus": "not configured"
+E! failed to generate YAML configuration validation content:
+   unable to build components in pipeline: prometheus does not have log group name
+E! Cannot translate JSON, ERROR is exit status 1
+```
+
+The `logs.metrics_collected.prometheus` EMF block in the agent config is missing
+the required `log_group_name`. The agent validates the WHOLE config atomically,
+so that one invalid block rejected the entire config → agent "stopped / not
+configured" → shipped nothing, including the valid app-log file collection. (Side
+effect: the EMF metrics feeding `app-alarms.tf` never published either — but the
+operator's Telegram alerts come straight from the app, masking it.)
+
+**Fix:** add `"log_group_name": "/tickvault/<env>/metrics"` to the prometheus
+block (the AWS-documented fix) in BOTH `deploy/aws/cloudwatch-agent.json` (deploy
+path) and `deploy/aws/terraform/user-data.sh.tftpl` (fresh-provision path). With
+`logs:CreateLogGroup` already granted (this plan's IAM item), the agent
+auto-creates the EMF group. This restores BOTH app-log shipping AND the EMF
+safety-metric alarms.
+
+**Verification:** the same on-box diagnostics print in the next deploy; if the
+agent reports "running / configured" and `/tickvault/prod/app` gains streams,
+confirmed. (Cannot be verified from the dev container — one deploy cycle proves it.)
+
+- [ ] Add `log_group_name` to the prometheus EMF block (both config files)
+  - Files: deploy/aws/cloudwatch-agent.json, deploy/aws/terraform/user-data.sh.tftpl
