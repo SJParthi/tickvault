@@ -280,8 +280,10 @@ fn emit_order_update_ws_audit(
     };
     // O(1) EXEMPT: end
     if let Err(err) = tx.try_send(row) {
+        // %err (Display) prints only "full"/"closed" — NOT the dropped row,
+        // whose pre-redaction reason must never reach a log (security review).
         debug!(
-            ?err,
+            reason = %err,
             "order-update ws_event_audit channel full/closed — row dropped (log+Telegram still fired)"
         );
     }
