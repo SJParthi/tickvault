@@ -17,13 +17,35 @@ fn main_src() -> String {
 #[test]
 fn test_ws_event_audit_consumer_is_spawned_at_boot() {
     let src = main_src();
+    // The consumer is spawned via the shared helper, which both the main-feed
+    // pool AND the order-update connection reuse.
     assert!(
-        src.contains("run_ws_event_audit_consumer(ws_audit_rx"),
-        "create_websocket_pool must spawn the ws_event_audit consumer task."
+        src.contains("fn spawn_ws_event_audit_consumer(")
+            && src.contains("run_ws_event_audit_consumer(rx, questdb_cfg)"),
+        "spawn_ws_event_audit_consumer helper must create the channel + spawn the consumer."
     );
     assert!(
         src.contains("Some(ws_audit_tx)"),
         "the audit channel sender must be passed into the WebSocket pool."
+    );
+}
+
+#[test]
+fn test_order_update_connection_is_audit_wired() {
+    // The order-update connection must also stamp ws_event_audit rows — it
+    // creates its own consumer via the shared helper and passes the sender.
+    let src = main_src();
+    let helper_calls = src
+        .matches("spawn_ws_event_audit_consumer(config.questdb.clone())")
+        .count();
+    assert!(
+        helper_calls >= 2,
+        "the order-update spawn site(s) must call spawn_ws_event_audit_consumer too \
+         (found {helper_calls} call(s); expected the pool + at least one order-update site)."
+    );
+    assert!(
+        src.contains("ord_ws_audit_tx") || src.contains("ou_ws_audit_tx"),
+        "the order-update spawn must pass an audit sender into run_order_update_connection."
     );
 }
 
