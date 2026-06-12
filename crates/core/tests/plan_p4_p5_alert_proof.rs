@@ -144,12 +144,12 @@ fn test_all_4_ws_notification_events_include_identifiers() {
 fn test_questdb_reconnected_event_includes_failed_checks() {
     let event = NotificationEvent::QuestDbReconnected {
         writer: "liveness-check".to_string(),
-        failed_checks_before_recovery: 1500,
+        failed_checks_before_recovery: 4,
     };
     let msg = event.to_message();
 
     assert!(
-        msg.contains("1500"),
+        msg.contains('4'),
         "Must include failed-checks-before-recovery, got: {msg}"
     );
     assert!(

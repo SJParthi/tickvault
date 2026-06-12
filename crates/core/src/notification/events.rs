@@ -1895,6 +1895,11 @@ impl NotificationEvent {
                 signal,
                 signal_kind,
             } => {
+                // Defensive HTML-escape: both are String (not &'static str),
+                // so a future call site could pass dynamic text — consistent
+                // with the html_escape() pattern used across to_message().
+                let writer = html_escape(writer);
+                let signal_kind = html_escape(signal_kind);
                 // The numeric `signal` is factual at alert time — either a
                 // consecutive-failure count (liveness-check path) or a dropped
                 // record count (tick-writer lag path). `signal_kind` names
@@ -1911,6 +1916,8 @@ impl NotificationEvent {
                 writer,
                 failed_checks_before_recovery,
             } => {
+                // Defensive HTML-escape (writer is String); numeric field needs none.
+                let writer = html_escape(writer);
                 format!(
                     "<b>QuestDB {writer} RECOVERED</b>\n\
                      Was unreachable for {failed_checks_before_recovery} consecutive liveness checks.\n\

@@ -4803,19 +4803,23 @@ async fn main() -> Result<()> {
                             "QuestDB liveness check failed — below alert threshold"
                         );
                     }
-                } else if should_emit_questdb_reconnected(
-                    questdb_disconnect_alerted,
-                    liveness_success,
-                ) {
-                    // Recovery edge — symmetric with the Critical disconnect
-                    // alert so the operator is told the incident resolved
-                    // (audit-findings Rule 11). Fires exactly once: the flag
-                    // is cleared here and only re-armed by a fresh disconnect.
-                    health_notifier.notify(NotificationEvent::QuestDbReconnected {
-                        writer: "liveness-check".to_string(),
-                        failed_checks_before_recovery: questdb_peak_failed_checks,
-                    });
-                    questdb_disconnect_alerted = false;
+                } else {
+                    // Healthy liveness check.
+                    if should_emit_questdb_reconnected(questdb_disconnect_alerted, liveness_success)
+                    {
+                        // Recovery edge — symmetric with the Critical disconnect
+                        // alert so the operator is told the incident resolved
+                        // (audit-findings Rule 11). Fires exactly once: the flag
+                        // is cleared here and only re-armed by a fresh disconnect.
+                        health_notifier.notify(NotificationEvent::QuestDbReconnected {
+                            writer: "liveness-check".to_string(),
+                            failed_checks_before_recovery: questdb_peak_failed_checks,
+                        });
+                        questdb_disconnect_alerted = false;
+                    }
+                    // Reset the peak on ANY healthy check (incl. after a
+                    // sub-threshold blip that never alerted) so no stale
+                    // residue carries into a future incident's count.
                     questdb_peak_failed_checks = 0;
                 }
                 // C4: Auto-cleanup spill files older than 7 days.
