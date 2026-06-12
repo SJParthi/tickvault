@@ -117,6 +117,24 @@ pub async fn run_order_update_connection(
                 // Clean disconnect — reset backoff and reconnect.
                 consecutive_failures = 0;
                 info!("order update WebSocket disconnected cleanly — reconnecting");
+                // 2026-06-12 (hostile-review fix): a clean server-initiated close
+                // (the documented Dhan idle-RST case) returns Ok(()) — it is STILL
+                // a disconnect and MUST be tracked, else a clean disconnect/reconnect
+                // cycle is invisible in ws_event_audit. Kind mirrors in-market vs
+                // off-hours; no transport error → source "clean close".
+                let ou_clean_kind = if is_within_market_hours(&calendar) {
+                    tickvault_common::ws_event_types::WsEventKind::Disconnected
+                } else {
+                    tickvault_common::ws_event_types::WsEventKind::DisconnectedOffHours
+                };
+                emit_order_update_ws_audit(
+                    ws_audit_tx.as_ref(),
+                    ou_clean_kind,
+                    "clean close",
+                    "order-update connection closed cleanly (server close / stream end)",
+                    0,
+                    0,
+                );
             }
             Err(err) => {
                 let is_timeout = matches!(err, OrderUpdateConnectionError::ReadTimeout);
