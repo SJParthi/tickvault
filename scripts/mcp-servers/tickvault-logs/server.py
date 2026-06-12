@@ -813,6 +813,183 @@ def _aws_region() -> str:
     return os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "ap-south-1"
 
 
+def _aws_credentials() -> tuple[str, str, str | None]:
+    """(access_key, secret_key, session_token|None) from the standard env vars.
+    Empty strings if absent. This is the ONLY thing needed to read CloudWatch
+    directly — no aws CLI, no portal."""
+    return (
+        os.environ.get("AWS_ACCESS_KEY_ID", ""),
+        os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+        os.environ.get("AWS_SESSION_TOKEN") or None,
+    )
+
+
+def _sigv4_signing_key(secret: str, date_stamp: str, region: str, service: str) -> bytes:
+    """Derive the AWS SigV4 signing key (HMAC chain). Pure — unit-testable
+    against AWS's published test vectors."""
+    import hashlib  # noqa: PLC0415
+    import hmac  # noqa: PLC0415
+
+    def _h(key: bytes, msg: str) -> bytes:
+        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+    k_date = _h(("AWS4" + secret).encode("utf-8"), date_stamp)
+    k_region = _h(k_date, region)
+    k_service = _h(k_region, service)
+    return _h(k_service, "aws4_request")
+
+
+def build_cloudwatch_sigv4_request(
+    region: str,
+    log_group: str,
+    start_ms: int,
+    limit: int,
+    filter_pattern: str | None,
+    access_key: str,
+    secret_key: str,
+    session_token: str | None,
+    amz_now,
+) -> tuple[str, bytes, dict[str, str]]:
+    """Pure builder for a SigV4-signed CloudWatch Logs `FilterLogEvents` POST.
+    Returns `(url, body_bytes, headers)`. `amz_now` is a `datetime` (UTC) so the
+    signing is deterministic + testable. No network, no aws CLI, no boto3."""
+    import hashlib  # noqa: PLC0415
+    import hmac  # noqa: PLC0415
+
+    service = "logs"
+    host = f"logs.{region}.amazonaws.com"
+    url = f"https://{host}/"
+    amz_date = amz_now.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = amz_now.strftime("%Y%m%d")
+    target = "Logs_20140328.FilterLogEvents"
+    content_type = "application/x-amz-json-1.1"
+
+    body_obj: dict[str, Any] = {
+        "logGroupName": log_group,
+        "startTime": int(start_ms),
+        "limit": max(1, min(int(limit), 10000)),
+    }
+    if filter_pattern:
+        body_obj["filterPattern"] = filter_pattern
+    body = json.dumps(body_obj, separators=(",", ":")).encode("utf-8")
+    payload_hash = hashlib.sha256(body).hexdigest()
+
+    # Canonical headers MUST be sorted by lowercase name. Build a list and sort,
+    # so x-amz-security-token slots into the correct position (before x-amz-target,
+    # since "...se" < "...ta") when a session token is present — an out-of-order
+    # canonical header set yields an invalid signature (AWS 403).
+    header_pairs: list[tuple[str, str]] = [
+        ("content-type", content_type),
+        ("host", host),
+        ("x-amz-content-sha256", payload_hash),
+        ("x-amz-date", amz_date),
+        ("x-amz-target", target),
+    ]
+    if session_token:
+        header_pairs.append(("x-amz-security-token", session_token))
+    header_pairs.sort(key=lambda kv: kv[0])
+    canon_headers = "".join(f"{name}:{value}\n" for name, value in header_pairs)
+    signed_headers = ";".join(name for name, _ in header_pairs)
+
+    canonical_request = (
+        f"POST\n/\n\n{canon_headers}\n{signed_headers}\n{payload_hash}"
+    )
+    scope = f"{date_stamp}/{region}/{service}/aws4_request"
+    string_to_sign = (
+        "AWS4-HMAC-SHA256\n"
+        f"{amz_date}\n"
+        f"{scope}\n"
+        f"{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+    )
+    signing_key = _sigv4_signing_key(secret_key, date_stamp, region, service)
+    signature = hmac.new(
+        signing_key, string_to_sign.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    authorization = (
+        f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+    headers = {
+        "Content-Type": content_type,
+        "X-Amz-Date": amz_date,
+        "X-Amz-Content-Sha256": payload_hash,
+        "X-Amz-Target": target,
+        "Authorization": authorization,
+    }
+    if session_token:
+        headers["X-Amz-Security-Token"] = session_token
+    return url, body, headers
+
+
+def _tool_cloudwatch_logs_via_sigv4(
+    minutes: int, filter_pattern: str | None, limit: int
+) -> dict[str, Any]:
+    """Direct CloudWatch Logs read via SigV4-signed HTTPS — the path the
+    operator wants: drop an AWS read-only key in the env and logs flow, no aws
+    CLI, no portal. Uses stdlib only. Single-page (no nextToken paging): returns
+    up to `limit` (server-capped at 10000, and one response page is ~1 MB), which
+    is ample for a 'recent logs' tail."""
+    import datetime as _dt  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
+    import urllib.request  # noqa: PLC0415
+
+    import re as _re  # noqa: PLC0415
+
+    region = _aws_region()
+    group = _cloudwatch_log_group()
+    # Validate region charset before it lands in the request host — a region
+    # with `/`, `@`, `:` etc. would build a malformed/attacker-shaped host.
+    # AWS region names are only lowercase letters, digits and hyphens.
+    if not _re.fullmatch(r"[a-z0-9-]+", region):
+        return {
+            "ok": False,
+            "source": "cloudwatch_sigv4",
+            "log_group": group,
+            "error": "invalid AWS region — set AWS_DEFAULT_REGION to a region like "
+            "ap-south-1 (lowercase letters, digits, hyphens only).",
+        }
+    access_key, secret_key, session_token = _aws_credentials()
+    start_ms = int((_time.time() - max(1, int(minutes)) * 60) * 1000)
+    url, body, headers = build_cloudwatch_sigv4_request(
+        region,
+        group,
+        start_ms,
+        limit,
+        filter_pattern,
+        access_key,
+        secret_key,
+        session_token,
+        _dt.datetime.now(_dt.timezone.utc),
+    )
+    req = urllib.request.Request(url, data=body, method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 — signed https to AWS
+            payload = resp.read().decode("utf-8", "replace")
+    except Exception as exc:  # noqa: BLE001 — surface as ok=False, never crash
+        # Bound the exception text and use only the type + a short str — never
+        # the request object — so a future stdlib change can't echo a signed
+        # header (the secret is not in any header, but defence-in-depth).
+        return {
+            "ok": False,
+            "source": "cloudwatch_sigv4",
+            "log_group": group,
+            "region": region,
+            "error": f"CloudWatch FilterLogEvents failed: {type(exc).__name__}: "
+            f"{str(exc)[:300]}",
+        }
+    events = parse_cloudwatch_events(payload, limit)
+    return {
+        "ok": True,
+        "source": "cloudwatch_sigv4",
+        "log_group": group,
+        "region": region,
+        "lookback_minutes": int(minutes),
+        "filter_pattern": filter_pattern or "",
+        "returned": len(events),
+        "events": events,
+    }
+
+
 def build_cloudwatch_filter_args(
     log_group: str,
     region: str,
@@ -998,17 +1175,28 @@ def tool_cloudwatch_logs(
     filter_pattern: str | None = None,
     limit: int = 100,
 ) -> dict[str, Any]:
-    """Read recent prod logs, fully automated. PREFERRED path: the existing
-    operator-control portal's `logs` endpoint (set TICKVAULT_PORTAL_URL +
-    TICKVAULT_PORTAL_TOKEN — no aws CLI, no AWS key; the portal Lambda reads the
-    box with its own role). FALLBACK: the read-only `aws` CLI on the
-    /tickvault/prod/app CloudWatch group. Looks back `minutes` (aws path only),
-    optional `filter_pattern`, up to `limit` newest events. Fails clearly if
-    neither path is configured."""
+    """Read recent prod logs, fully automated. PREFERRED path: direct CloudWatch
+    read via a SigV4-signed HTTPS call — the ONLY input is a read-only AWS key in
+    the env (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY [+ AWS_SESSION_TOKEN];
+    no aws CLI, no portal, no boto3). NEXT: the operator-control portal's `logs`
+    endpoint (set TICKVAULT_PORTAL_URL + TICKVAULT_PORTAL_TOKEN — the portal
+    Lambda reads the box with its own role). FALLBACK: the read-only `aws` CLI on
+    the /tickvault/prod/app CloudWatch group. Looks back `minutes` (SigV4 + aws
+    paths), optional `filter_pattern` (server-side CloudWatch filter on the SigV4
+    + aws paths; substring on the portal path), up to `limit` newest events.
+    Fails clearly (ok=False) if none of the three paths is configured. The AWS
+    secret/token is NEVER logged nor placed in the returned dict."""
     import subprocess
     import time as _time
 
-    # PREFERRED: reuse the operator dashboard's already-working logs endpoint.
+    # PREFERRED (operator goal): direct CloudWatch read with a SigV4-signed
+    # HTTPS request — only a read-only AWS key in the env is needed. Chosen
+    # first whenever both key parts are present (no aws CLI, no portal).
+    access_key, secret_key, _session_token = _aws_credentials()
+    if access_key and secret_key:
+        return _tool_cloudwatch_logs_via_sigv4(minutes, filter_pattern, limit)
+
+    # NEXT: reuse the operator dashboard's already-working logs endpoint.
     if _portal_url() and _portal_token():
         return _tool_cloudwatch_logs_via_portal(filter_pattern, limit)
 
@@ -1023,10 +1211,11 @@ def tool_cloudwatch_logs(
     except FileNotFoundError:
         return {
             "ok": False,
-            "error": "no log reader configured — set TICKVAULT_PORTAL_URL + "
-            "TICKVAULT_PORTAL_TOKEN to read via the existing operator dashboard "
-            "(no aws CLI / no AWS key needed), OR wire a read-only AWS credential "
-            "+ aws CLI. Neither is present in this session.",
+            "error": "no log reader configured — set AWS_ACCESS_KEY_ID + "
+            "AWS_SECRET_ACCESS_KEY (+ AWS_DEFAULT_REGION) for the direct SigV4 "
+            "path (no aws CLI, no portal), OR set TICKVAULT_PORTAL_URL + "
+            "TICKVAULT_PORTAL_TOKEN to read via the operator dashboard, OR wire "
+            "a read-only AWS credential + aws CLI. None is present in this session.",
             "log_group": group,
         }
     except subprocess.TimeoutExpired:
@@ -1036,7 +1225,8 @@ def tool_cloudwatch_logs(
             "ok": False,
             "exit_code": proc.returncode,
             "error": "aws logs call failed — most likely no read-only AWS credentials in "
-            "this environment yet. Prefer the portal path (TICKVAULT_PORTAL_URL + "
+            "this environment yet. Prefer the direct SigV4 path (AWS_ACCESS_KEY_ID + "
+            "AWS_SECRET_ACCESS_KEY) or the portal path (TICKVAULT_PORTAL_URL + "
             "TICKVAULT_PORTAL_TOKEN). stderr below.",
             "stderr": proc.stderr.strip()[:800],
             "log_group": group,
@@ -1335,13 +1525,16 @@ TOOLS: list[ToolSpec] = [
         name="cloudwatch_logs",
         description=(
             "Read recent PROD logs — fully automated, no human paste/download. "
-            "PREFERRED: reuses the existing operator-control dashboard's logs "
-            "endpoint (set TICKVAULT_PORTAL_URL + TICKVAULT_PORTAL_TOKEN — no "
-            "aws CLI, no AWS key; the portal Lambda reads the box with its own "
-            "IAM role). FALLBACK: read-only aws CLI on /tickvault/prod/app. "
-            "Args: minutes (lookback, aws path only), filter_pattern (substring "
-            "on the portal path, e.g. \"ERROR\" or \"WS-GAP-05\"), limit "
-            "(default 100). Returns a clear error if neither path is configured."
+            "PREFERRED: direct CloudWatch read via a SigV4-signed HTTPS request — "
+            "the ONLY input is a read-only AWS key in the env (AWS_ACCESS_KEY_ID + "
+            "AWS_SECRET_ACCESS_KEY [+ AWS_SESSION_TOKEN], AWS_DEFAULT_REGION); no "
+            "aws CLI, no portal, no boto3. NEXT: the operator-control dashboard's "
+            "logs endpoint (TICKVAULT_PORTAL_URL + TICKVAULT_PORTAL_TOKEN). "
+            "FALLBACK: read-only aws CLI on /tickvault/prod/app. Args: minutes "
+            "(lookback; SigV4 + aws paths), filter_pattern (CloudWatch filter on "
+            "SigV4 + aws, substring on portal, e.g. \"ERROR\" or \"WS-GAP-05\"), "
+            "limit (default 100). The AWS secret/token is NEVER logged nor "
+            "returned. Clear ok=false error if no path is configured."
         ),
         input_schema={
             "type": "object",
