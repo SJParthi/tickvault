@@ -86,7 +86,7 @@ def _github_token() -> str:
 
 
 # Destructive box actions blocked during market hours unless force=true.
-_DESTRUCTIVE = {"stop", "reboot", "restart-app", "stop-app", "wipe-questdb", "docker-reset"}
+_DESTRUCTIVE = {"stop", "reboot", "restart-app", "stop-app", "wipe-questdb", "docker-reset", "docker-nuke-bare"}
 
 _MKT_OPEN_SECS = 9 * 3600 + 15 * 60
 _MKT_CLOSE_SECS = 15 * 3600 + 30 * 60
@@ -814,6 +814,55 @@ def lambda_handler(event, _context):
             cid = _ssm_shell(cmds)
             return _resp(200, {"ok": True, "action": action, "command_id": cid})
 
+        if action == "docker-nuke-bare":
+            # TRUE BARE WIPE (operator request 2026-06-12): behave EXACTLY like
+            # opening Docker Desktop and deleting all containers + all images +
+            # all volumes by hand — everything GONE and it STAYS gone. Unlike
+            # `docker-reset` (which wipes then REBUILDS QuestDB + restarts the
+            # app, so the empty shells reappear — the source of "it didn't
+            # delete"), this does NOT rebuild and does NOT restart the app. The
+            # box is left completely bare: no containers, no images, no volumes,
+            # no app running, until the operator redeploys.
+            if not force:
+                return _resp(
+                    409,
+                    {
+                        "error": 'docker-nuke-bare deletes ALL containers+images+volumes and '
+                        'LEAVES THE BOX DEAD (no rebuild, no app). re-send with {"force": true}',
+                        "action": action,
+                    },
+                )
+            data_dir = "/opt/tickvault/data"
+            cmds = [
+                "set +e",
+                # 1. stop + disable the app so nothing re-ups Docker mid-wipe
+                "systemctl stop tickvault || true",
+                "systemctl disable tickvault || true",
+                # 2. remove ALL containers (running + stopped) — like Docker
+                #    Desktop "delete all containers"
+                "docker ps -aq | xargs -r docker rm -f 2>/dev/null || true",
+                # 3. remove ALL images
+                "docker images -aq | xargs -r docker rmi -f 2>/dev/null || true",
+                # 4. remove ALL volumes
+                "docker volume ls -q | xargs -r docker volume rm -f 2>/dev/null || true",
+                # 5. final sweep for anything dangling (networks/build cache too)
+                "docker system prune -af --volumes 2>/dev/null || true",
+                # 6. wipe HOST app caches so the box truly looks fresh (logs KEPT
+                #    for forensics — they are not a Docker object)
+                f"rm -rf {data_dir}/instrument-cache {data_dir}/spill {data_dir}/dlq 2>/dev/null || true",
+                # 7. VERIFY + report the exact remaining counts — truthful, never
+                #    a fake OK. 0/0/0 => bare-nuke-complete; otherwise PARTIAL
+                #    (something is still in-use) so the operator is not misled.
+                "C=$(docker ps -aq 2>/dev/null | wc -l | tr -d ' '); "
+                "I=$(docker images -aq 2>/dev/null | wc -l | tr -d ' '); "
+                "V=$(docker volume ls -q 2>/dev/null | wc -l | tr -d ' '); "
+                'echo "BARE-NUKE-RESULT containers=$C images=$I volumes=$V"; '
+                'if [ "$C" = 0 ] && [ "$I" = 0 ] && [ "$V" = 0 ]; then echo bare-nuke-complete; '
+                "else echo 'bare-nuke-PARTIAL: something is still present (likely in-use)'; fi",
+            ]
+            cid = _ssm_shell(cmds)
+            return _resp(200, {"ok": True, "action": action, "command_id": cid})
+
         # ---- overview / data ----
         if action in ("status", "view"):
             inst = _client("ec2").describe_instances(InstanceIds=[INSTANCE_ID])["Reservations"][0]["Instances"][0]
@@ -1064,6 +1113,8 @@ def _console_html() -> str:
         <div class="muted" style="margin-top:6px">Deletes every tick &amp; candle and restarts empty (audit tables kept). Run when the box is RUNNING; next session = fresh data. Asks you to type WIPE.</div>
         <div class="row" style="margin-top:18px"><button class="b-stop" onclick="dockerReset()">💥 Full Docker reset → wipe EVERYTHING</button></div>
         <div class="muted" style="margin-top:6px">⚠️ NUCLEAR: deletes Docker containers + volumes + images and rebuilds from scratch. Wipes <b>ALL</b> data INCLUDING the SEBI-retention audit tables. Box must be RUNNING. Asks you to type NUKE.</div>
+        <div class="row" style="margin-top:18px"><button class="b-stop" onclick="bareNuke()">☢️ Bare Nuke → delete ALL &amp; leave EMPTY</button></div>
+        <div class="muted" style="margin-top:6px">☢️ Like Docker Desktop "delete all": removes <b>every</b> container + image + volume and does <b>NOT</b> rebuild — the box is left completely bare with <b>nothing running</b> (trading OFF until you redeploy). Asks you to type ERASE.</div>
         <div class="row" style="margin-top:14px"><button class="b-ghost" onclick="lock()">🔒 Lock / forget this device</button></div>
       </div>
     </section>
@@ -1311,17 +1362,26 @@ async function dockerReset(){
   if(!(j&&j.ok)){ toast((j&&j.error)||'docker-reset failed — is the box running?'); return; }
   if(!j.command_id){ toast('⚠️ nuke dispatched but no command id — re-check the ticks count in ~3 min'); setTimeout(loadOverview,8000); return; }
   pollNuke(j.command_id,0); }
+async function bareNuke(){
+  if(prompt('☢️ BARE NUKE. Deletes EVERY Docker container + image + volume and LEAVES THE BOX COMPLETELY EMPTY — nothing rebuilt, nothing running, trading OFF until you redeploy (exactly like deleting all three in Docker Desktop). Type ERASE to confirm:')!=='ERASE'){ toast('cancelled'); return; }
+  if(!confirm('Final check: the box is left BARE and DEAD (no QuestDB, no app). You will need to redeploy to bring it back. Continue?')){ toast('cancelled'); return; }
+  toast('☢️ bare nuke dispatched → erasing everything…');
+  const j=await call('docker-nuke-bare',{force:true});
+  if(!(j&&j.ok)){ toast((j&&j.error)||'bare-nuke failed — is the box running?'); return; }
+  if(!j.command_id){ toast('⚠️ dispatched but no command id — re-check the box in ~1 min'); return; }
+  pollNuke(j.command_id,0); }
 // Poll the REAL nuke outcome instead of claiming success the instant it is
-// dispatched. The teardown (down -v + prune -af + image re-pull + up) runs for
-// minutes; we show the truthful result: complete, FAILED (hard gate — volume
-// still in-use, data NOT wiped), or still-running.
+// dispatched. The teardown runs for a minute or two; we show the truthful
+// result: complete, FAILED/PARTIAL (something still in-use), or still-running.
 async function pollNuke(cid,n){
-  if(n>40){ toast('⏳ nuke still running after 3+ min — re-check the ticks count manually'); setTimeout(loadOverview,4000); return; }
+  if(n>40){ toast('⏳ nuke still running after 3+ min — re-check the box manually'); setTimeout(loadOverview,4000); return; }
   const s=await call('command-status',{command_id:cid}); const st=(s&&s.status)||'', out=(s&&s.stdout_tail)||'';
   if(st==='Success'||st==='Failed'||st==='Cancelled'||st==='TimedOut'){
     if(out.indexOf('DOCKER-RESET-FAILED')>=0){ toast('🔴 NUKE FAILED — QuestDB volume still in use, data NOT wiped. Check the box.'); }
+    else if(out.indexOf('bare-nuke-complete')>=0){ toast('☢️ BARE NUKE complete — 0 containers, 0 images, 0 volumes. Box is empty + DEAD (redeploy to restart).'); }
+    else if(out.indexOf('bare-nuke-PARTIAL')>=0){ toast('🟠 bare nuke PARTIAL — something is still in-use. '+(out.match(/BARE-NUKE-RESULT[^\n]*/)||[''])[0]); }
     else if(out.indexOf('docker-reset-dispatched')>=0){ toast('✅ nuke complete — empty DB; app restarting'); }
-    else { toast('⚠️ nuke finished ('+st+') — re-check the ticks count'); }
+    else { toast('⚠️ nuke finished ('+st+') — re-check the box'); }
     setTimeout(loadOverview,6000); return; }
   setTimeout(()=>pollNuke(cid,n+1),5000); }
 
