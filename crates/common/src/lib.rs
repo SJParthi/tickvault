@@ -43,3 +43,4 @@ pub mod tick_types;
 pub mod trading_calendar;
 pub mod types;
 pub mod url_join;
+pub mod ws_event_types;
