@@ -333,4 +333,30 @@ mod tests {
             assert!(!c.confirm_hint().is_empty(), "{c:?} hint empty");
         }
     }
+
+    #[test]
+    fn test_classify_disconnect_cause_is_total_and_deterministic() {
+        // Summary coverage: classify_disconnect_cause is a TOTAL function (every
+        // input yields a valid variant, never panics) and deterministic (same
+        // input -> same output).
+        for r in [
+            "",
+            "connection reset without closing handshake",
+            "handshake not finished",
+            "dns resolution failed",
+            "broken pipe",
+            "some novel unmatched error",
+        ] {
+            let a = classify_disconnect_cause(r, None);
+            let b = classify_disconnect_cause(r, None);
+            assert_eq!(
+                a, b,
+                "classify_disconnect_cause not deterministic for {r:?}"
+            );
+        }
+        assert_eq!(
+            classify_disconnect_cause("x", Some(805)),
+            DisconnectCause::DhanTooManyConnections
+        );
+    }
 }
