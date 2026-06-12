@@ -813,6 +813,160 @@ def _aws_region() -> str:
     return os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "ap-south-1"
 
 
+def _aws_credentials() -> tuple[str, str, str | None]:
+    """(access_key, secret_key, session_token|None) from the standard env vars.
+    Empty strings if absent. This is the ONLY thing needed to read CloudWatch
+    directly — no aws CLI, no portal."""
+    return (
+        os.environ.get("AWS_ACCESS_KEY_ID", ""),
+        os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+        os.environ.get("AWS_SESSION_TOKEN") or None,
+    )
+
+
+def _sigv4_signing_key(secret: str, date_stamp: str, region: str, service: str) -> bytes:
+    """Derive the AWS SigV4 signing key (HMAC chain). Pure — unit-testable
+    against AWS's published test vectors."""
+    import hashlib  # noqa: PLC0415
+    import hmac  # noqa: PLC0415
+
+    def _h(key: bytes, msg: str) -> bytes:
+        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+    k_date = _h(("AWS4" + secret).encode("utf-8"), date_stamp)
+    k_region = _h(k_date, region)
+    k_service = _h(k_region, service)
+    return _h(k_service, "aws4_request")
+
+
+def build_cloudwatch_sigv4_request(
+    region: str,
+    log_group: str,
+    start_ms: int,
+    limit: int,
+    filter_pattern: str | None,
+    access_key: str,
+    secret_key: str,
+    session_token: str | None,
+    amz_now,
+) -> tuple[str, bytes, dict[str, str]]:
+    """Pure builder for a SigV4-signed CloudWatch Logs `FilterLogEvents` POST.
+    Returns `(url, body_bytes, headers)`. `amz_now` is a `datetime` (UTC) so the
+    signing is deterministic + testable. No network, no aws CLI, no boto3."""
+    import hashlib  # noqa: PLC0415
+    import hmac  # noqa: PLC0415
+
+    service = "logs"
+    host = f"logs.{region}.amazonaws.com"
+    url = f"https://{host}/"
+    amz_date = amz_now.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = amz_now.strftime("%Y%m%d")
+    target = "Logs_20140328.FilterLogEvents"
+    content_type = "application/x-amz-json-1.1"
+
+    body_obj: dict[str, Any] = {
+        "logGroupName": log_group,
+        "startTime": int(start_ms),
+        "limit": max(1, min(int(limit), 10000)),
+    }
+    if filter_pattern:
+        body_obj["filterPattern"] = filter_pattern
+    body = json.dumps(body_obj, separators=(",", ":")).encode("utf-8")
+    payload_hash = hashlib.sha256(body).hexdigest()
+
+    # Canonical headers MUST be sorted by lowercase name.
+    canon_headers = (
+        f"content-type:{content_type}\n"
+        f"host:{host}\n"
+        f"x-amz-content-sha256:{payload_hash}\n"
+        f"x-amz-date:{amz_date}\n"
+        f"x-amz-target:{target}\n"
+    )
+    signed_headers = "content-type;host;x-amz-content-sha256;x-amz-date;x-amz-target"
+    if session_token:
+        canon_headers += f"x-amz-security-token:{session_token}\n"
+        signed_headers += ";x-amz-security-token"
+
+    canonical_request = (
+        f"POST\n/\n\n{canon_headers}\n{signed_headers}\n{payload_hash}"
+    )
+    scope = f"{date_stamp}/{region}/{service}/aws4_request"
+    string_to_sign = (
+        "AWS4-HMAC-SHA256\n"
+        f"{amz_date}\n"
+        f"{scope}\n"
+        f"{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+    )
+    signing_key = _sigv4_signing_key(secret_key, date_stamp, region, service)
+    signature = hmac.new(
+        signing_key, string_to_sign.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    authorization = (
+        f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+    headers = {
+        "Content-Type": content_type,
+        "X-Amz-Date": amz_date,
+        "X-Amz-Content-Sha256": payload_hash,
+        "X-Amz-Target": target,
+        "Authorization": authorization,
+    }
+    if session_token:
+        headers["X-Amz-Security-Token"] = session_token
+    return url, body, headers
+
+
+def _tool_cloudwatch_logs_via_sigv4(
+    minutes: int, filter_pattern: str | None, limit: int
+) -> dict[str, Any]:
+    """Direct CloudWatch Logs read via SigV4-signed HTTPS — the path the
+    operator wants: drop an AWS read-only key in the env and logs flow, no aws
+    CLI, no portal. Uses stdlib only."""
+    import datetime as _dt  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
+    import urllib.request  # noqa: PLC0415
+
+    region = _aws_region()
+    group = _cloudwatch_log_group()
+    access_key, secret_key, session_token = _aws_credentials()
+    start_ms = int((_time.time() - max(1, int(minutes)) * 60) * 1000)
+    url, body, headers = build_cloudwatch_sigv4_request(
+        region,
+        group,
+        start_ms,
+        limit,
+        filter_pattern,
+        access_key,
+        secret_key,
+        session_token,
+        _dt.datetime.now(_dt.timezone.utc),
+    )
+    req = urllib.request.Request(url, data=body, method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 — signed https to AWS
+            payload = resp.read().decode("utf-8", "replace")
+    except Exception as exc:  # noqa: BLE001 — surface as ok=False, never crash
+        return {
+            "ok": False,
+            "source": "cloudwatch_sigv4",
+            "log_group": group,
+            "region": region,
+            "error": f"CloudWatch FilterLogEvents failed: {type(exc).__name__}: {exc}",
+        }
+    events = parse_cloudwatch_events(payload, limit)
+    return {
+        "ok": True,
+        "source": "cloudwatch_sigv4",
+        "log_group": group,
+        "region": region,
+        "lookback_minutes": int(minutes),
+        "filter_pattern": filter_pattern or "",
+        "returned": len(events),
+        "events": events,
+    }
+
+
 def build_cloudwatch_filter_args(
     log_group: str,
     region: str,
