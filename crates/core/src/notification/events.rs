@@ -24,6 +24,33 @@ fn mask_ip_for_notification(ip: &str) -> String {
     }
 }
 
+/// Escapes the three HTML-significant characters for Telegram's `HTML`
+/// parse mode (`crates/core/src/notification/service.rs` sends
+/// `"parse_mode": "HTML"`). External free-text fields (`reason`, `detail`,
+/// `ip_match_status`, ... sourced from Dhan REST/WS error bodies and
+/// network error strings) are interpolated into message bodies that also
+/// contain trusted `<b>`/`<code>` structural tags. Without escaping, an
+/// external string containing `<`, `>` or `&` (e.g. a TLS error
+/// `peer's certificate contained <...>`, or a literal `a < b`) makes
+/// Telegram's HTML parser return 400 Bad Request and the operator never
+/// sees the alert.
+///
+/// Order matters: `&` is escaped FIRST so the `&` characters this function
+/// introduces (`&lt;`/`&gt;`/`&amp;`) are not re-escaped. `"` is only
+/// significant inside HTML attribute values, which these plain-text
+/// messages never use, so it is intentionally left untouched.
+///
+/// Apply this at the render boundary in `to_message()` (the single place
+/// strings become HTML) — NOT at the 130+ event emit sites. Trusted,
+/// internally-constructed text (e.g. the operator-controlled
+/// `Custom { message }` variant, which may intentionally carry `<b>`
+/// formatting) is deliberately NOT routed through this helper.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// Alert severity level — determines which notification channels fire.
 ///
 /// `Critical` and `High` → Telegram + SNS SMS.
@@ -873,12 +900,19 @@ pub enum NotificationEvent {
         signal_kind: String,
     },
 
-    /// QuestDB persistence reconnected — buffered data draining.
+    /// QuestDB persistence reconnected — buffered data draining. Emitted on
+    /// the recovery edge of a `QuestDbDisconnected` incident (symmetric with
+    /// the Critical disconnect alert, so the operator is told the incident
+    /// resolved — audit-findings Rule 11, no false-OK / anxiety gap).
     QuestDbReconnected {
         /// Which writer recovered.
         writer: String,
-        /// Total ticks/records drained from buffer.
-        drained_count: usize,
+        /// Consecutive failed liveness checks observed before recovery
+        /// (≈ downtime in liveness-poll intervals). The drained-record
+        /// count is NOT knowable at the liveness-loop site (it lives in
+        /// the tick-persistence rescue ring), so this carries the honest,
+        /// available downtime signal rather than a hardcoded zero.
+        failed_checks_before_recovery: u32,
     },
 
     /// Custom alert from any component.
@@ -1126,7 +1160,7 @@ fn format_pool_partial_message(
     out.push_str("\nBroken feeds:\n");
     for (idx, reason) in stuck {
         let display = idx.saturating_add(1);
-        out.push_str(&format!("  Feed {display}: {reason}\n"));
+        out.push_str(&format!("  Feed {display}: {}\n", html_escape(reason)));
     }
     out.push_str(&format!(
         "\n🔄 The system will keep retrying every 5 seconds.\n   Boot path: {path}",
@@ -1158,7 +1192,7 @@ impl NotificationEvent {
             Self::AuthenticationFailed { reason } => {
                 format!(
                     "<b>Auth FAILED</b> — offline mode\n{}",
-                    redact_url_params(reason)
+                    html_escape(&redact_url_params(reason))
                 )
             }
             Self::AuthenticationTransientFailure {
@@ -1176,7 +1210,7 @@ impl NotificationEvent {
                 };
                 format!(
                     "<b>Auth retry {attempt}</b> — transient\n{reason} — retrying in {wait_str}",
-                    reason = redact_url_params(reason),
+                    reason = html_escape(&redact_url_params(reason)),
                 )
             }
             Self::PreMarketProfileCheckFailed {
@@ -1188,6 +1222,7 @@ impl NotificationEvent {
                 } else {
                     "<b>CRITICAL: Pre-market profile check FAILED — investigate before 09:15 IST</b>"
                 };
+                let reason = html_escape(reason);
                 format!(
                     "{header}\n{reason}\n\
                      Run:\n  curl -H \"access-token: $TOKEN\" https://api.dhan.co/v2/profile\n\
@@ -1195,6 +1230,7 @@ impl NotificationEvent {
                 )
             }
             Self::MidSessionProfileInvalidated { reason } => {
+                let reason = html_escape(reason);
                 format!(
                     "<b>CRITICAL: Mid-session profile INVALIDATED</b>\n{reason}\n\
                      Live WS still running — operator action required.\n\
@@ -1208,7 +1244,7 @@ impl NotificationEvent {
             Self::TokenRenewalFailed { attempts, reason } => {
                 format!(
                     "<b>Token renewal FAILED</b> (attempt {attempts})\n{}",
-                    redact_url_params(reason)
+                    html_escape(&redact_url_params(reason))
                 )
             }
             Self::WebSocketConnected {
@@ -1421,6 +1457,7 @@ impl NotificationEvent {
                 }
             }
             Self::CrossVerify1mAborted { detail } => {
+                let detail = html_escape(detail);
                 format!(
                     "\u{26a0}\u{fe0f} <b>Daily candle check did NOT run</b>\n\
                      The 3:31 PM IST check against the exchange record died \
@@ -1439,10 +1476,22 @@ impl NotificationEvent {
                 reason,
             } => {
                 // PR #790a — use scope-locked pool size (1), not Dhan cap (5).
+                // 2026-06-12 — classify the likely SOURCE (Dhan / network / token)
+                // from the raw reason so the operator knows WHO caused it. The raw
+                // error is always shown above, so a wrong guess never hides truth.
+                let cause =
+                    tickvault_common::disconnect_cause::classify_disconnect_cause(reason, None);
+                // SECURITY (review 2026-06-12, HIGH): a WS connect error can embed
+                // the feed URL with the token query-param — redact before display,
+                // matching the auth-event arms.
+                let reason = html_escape(&redact_url_params(reason));
                 format!(
-                    "<b>WebSocket {}/{} disconnected</b>\n{reason}",
+                    "<b>WebSocket {}/{} disconnected</b>\n{reason}\nLikely source: {} — {}\nConfirm: {}",
                     connection_index.saturating_add(1),
-                    tickvault_common::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT
+                    tickvault_common::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT,
+                    cause.label(),
+                    cause.explanation(),
+                    cause.confirm_hint()
                 )
             }
             Self::WebSocketDisconnectedOffHours {
@@ -1450,6 +1499,8 @@ impl NotificationEvent {
                 reason,
             } => {
                 // PR #790a — use scope-locked pool size (1), not Dhan cap (5).
+                // SECURITY (review 2026-06-12, HIGH): redact token-in-URL before display.
+                let reason = html_escape(&redact_url_params(reason));
                 format!(
                     "<b>WebSocket {}/{} disconnected [off-hours, auto-reconnecting]</b>\n{reason}",
                     connection_index.saturating_add(1),
@@ -1474,11 +1525,26 @@ impl NotificationEvent {
                 // Only render the diagnostic line when we actually have
                 // context (the cold path always sets reason; tests + initial
                 // probes may not).
-                match (reason, *down_secs, *attempts) {
+                // 2026-06-12 — classify the likely SOURCE from the raw reason
+                // (the recovery message keeps it to label + explanation; the
+                // full confirm-hint lives on the disconnect message).
+                let source = reason
+                    .as_deref()
+                    .map(|r| {
+                        let c =
+                            tickvault_common::disconnect_cause::classify_disconnect_cause(r, None);
+                        format!("\nLikely source: {} — {}", c.label(), c.explanation())
+                    })
+                    .unwrap_or_default();
+                // SECURITY (review 2026-06-12, HIGH): redact token-in-URL before display.
+                let reason = reason
+                    .as_deref()
+                    .map(|r| html_escape(&redact_url_params(r)));
+                match (reason.as_deref(), *down_secs, *attempts) {
                     (Some(r), d, a) if d > 0 || a > 0 => {
-                        format!("{header}\nReason: {r}\nDown: {d}s · Attempts: {a}")
+                        format!("{header}\nReason: {r}{source}\nDown: {d}s · Attempts: {a}")
                     }
-                    (Some(r), _, _) => format!("{header}\nReason: {r}"),
+                    (Some(r), _, _) => format!("{header}\nReason: {r}{source}"),
                     (None, d, a) if d > 0 || a > 0 => {
                         format!("{header}\nDown: {d}s · Attempts: {a}")
                     }
@@ -1540,7 +1606,10 @@ impl NotificationEvent {
                 )
             }
             Self::OrderUpdateDisconnected { reason } => {
-                format!("<b>Order Update WS DISCONNECTED</b>\n{reason}")
+                format!(
+                    "<b>Order Update WS DISCONNECTED</b>\n{}",
+                    html_escape(reason)
+                )
             }
             Self::InstrumentBuildSuccess {
                 source,
@@ -1557,11 +1626,13 @@ impl NotificationEvent {
             } => {
                 // SECURITY: Do not expose internal API URL in Telegram.
                 let _ = manual_trigger_url; // kept in struct for internal use
+                let reason = html_escape(reason);
                 format!(
                     "<b>Instruments FAILED</b>\n{reason}\n\nRetry via /instruments/rebuild API endpoint"
                 )
             }
             Self::IpVerificationFailed { reason } => {
+                let reason = html_escape(reason);
                 format!(
                     "<b>IP VERIFICATION FAILED</b>\n{reason}\n\nBoot blocked — no Dhan API calls will be made."
                 )
@@ -1603,6 +1674,8 @@ impl NotificationEvent {
                 } else {
                     String::new()
                 };
+                // `ip_match_status` is a Dhan-returned string — escape it.
+                let ip_match_status = html_escape(ip_match_status);
                 format!(
                     "<b>STATIC IP BOOT CHECK FAILED</b>\n{plain_reason}{attempt_line}\n\nDhan reply: ordersAllowed={orders_allowed}, ipMatchStatus=\"{ip_match_status}\"\n\nBoot blocked — no orders will be placed until this is fixed."
                 )
@@ -1616,12 +1689,16 @@ impl NotificationEvent {
                 )
             }
             Self::DualInstanceDetected { holder, lock_key } => {
+                // `holder` is read from the Valkey/SSM instance lock (set by a
+                // previous process) and `lock_key` is the lock key string —
+                // both external-origin, so escape before HTML interpolation.
                 let holder_line = if holder.is_empty() {
                     "(holder identity not retrievable — the lock check raced; run `make doctor`)"
                         .to_string()
                 } else {
-                    format!("Live peer: {holder}")
+                    format!("Live peer: {}", html_escape(holder))
                 };
+                let lock_key = html_escape(lock_key);
                 format!(
                     "<b>DUAL-INSTANCE DETECTED</b>\nAnother tickvault process is already running for this Dhan account.\n{holder_line}\nLock key: {lock_key}\n\nBoot blocked — running two instances against one client-id breaks order auth, depth state, and reconciliation. Stop the other instance, then restart this one."
                 )
@@ -1638,10 +1715,12 @@ impl NotificationEvent {
                 sample_symbols,
                 dry_run,
             } => {
+                // `sample_symbols` are tradingSymbol strings from the Dhan
+                // REST `GET /v2/positions` response — external-origin.
                 let sample = if sample_symbols.is_empty() {
                     "(no sample symbols captured)".to_string()
                 } else {
-                    sample_symbols.join(", ")
+                    html_escape(&sample_symbols.join(", "))
                 };
                 let action = if *dry_run {
                     "DRY-RUN: no auto-exit attempted. EXIT MANUALLY via Dhan web UI before 15:30 IST close."
@@ -1665,10 +1744,12 @@ impl NotificationEvent {
                 sample_symbols,
                 cross_check_pass,
             } => {
+                // `sample_symbols` derive from matching against Dhan
+                // historical REST data — external-origin.
                 let sample = if sample_symbols.is_empty() {
                     "(no samples captured)".to_string()
                 } else {
-                    sample_symbols.join(", ")
+                    html_escape(&sample_symbols.join(", "))
                 };
                 format!(
                     "<b>09:15 BAR CORRECTED FROM DHAN HISTORICAL</b>\n\
@@ -1693,6 +1774,7 @@ impl NotificationEvent {
                 )
             }
             Self::BarMismatchCrossCheckFailed { reason } => {
+                let reason = html_escape(reason);
                 format!(
                     "<b>09:16:05 CROSS-CHECK HARD-FAILED — TRADING BLOCKED</b>\n\
                      Reason: {reason}\n\
@@ -1704,6 +1786,7 @@ impl NotificationEvent {
                 deadline_secs,
                 step,
             } => {
+                let step = html_escape(step);
                 format!(
                     "<b>BOOT DEADLINE MISSED</b>\nDeadline: {deadline_secs}s\nBlocked at: {step}"
                 )
@@ -1713,6 +1796,7 @@ impl NotificationEvent {
                 threshold_secs,
                 source,
             } => {
+                let source = html_escape(source);
                 format!(
                     "<b>BOOT-03 CLOCK SKEW EXCEEDED — HALTING</b>\n\
                      Source: {source}\n\
@@ -1796,6 +1880,8 @@ impl NotificationEvent {
                 correlation_id,
                 reason,
             } => {
+                let correlation_id = html_escape(correlation_id);
+                let reason = html_escape(reason);
                 format!("<b>Order REJECTED</b>\nCorrelation: {correlation_id}\n{reason}")
             }
             Self::CircuitBreakerOpened {
@@ -1812,7 +1898,7 @@ impl NotificationEvent {
                 format!("<b>Rate limit EXHAUSTED</b>\nLimit: {limit_type}")
             }
             Self::RiskHalt { reason } => {
-                format!("<b>RISK HALT</b>\nTrading stopped: {reason}")
+                format!("<b>RISK HALT</b>\nTrading stopped: {}", html_escape(reason))
             }
             Self::WebSocketReconnectionExhausted {
                 connection_index,
@@ -1835,6 +1921,11 @@ impl NotificationEvent {
                 signal,
                 signal_kind,
             } => {
+                // Defensive HTML-escape: both are String (not &'static str),
+                // so a future call site could pass dynamic text — consistent
+                // with the html_escape() pattern used across to_message().
+                let writer = html_escape(writer);
+                let signal_kind = html_escape(signal_kind);
                 // The numeric `signal` is factual at alert time — either a
                 // consecutive-failure count (liveness-check path) or a dropped
                 // record count (tick-writer lag path). `signal_kind` names
@@ -1849,11 +1940,15 @@ impl NotificationEvent {
             }
             Self::QuestDbReconnected {
                 writer,
-                drained_count,
+                failed_checks_before_recovery,
             } => {
+                // Defensive HTML-escape (writer is String); numeric field needs none.
+                let writer = html_escape(writer);
                 format!(
-                    "<b>QuestDB {writer} RECONNECTED</b>\n\
-                     Drained {drained_count} buffered records to QuestDB."
+                    "<b>QuestDB {writer} RECOVERED</b>\n\
+                     Was unreachable for {failed_checks_before_recovery} consecutive liveness checks.\n\
+                     Buffered ticks are now draining from the rescue ring to QuestDB.\n\
+                     No action needed unless this recurs."
                 )
             }
             Self::Custom { message } => message.clone(),
@@ -1875,42 +1970,55 @@ impl NotificationEvent {
                 underlying,
                 attempts_made,
                 reason,
-            } => format!(
-                "<b>Option-chain fetch FAILED</b>\n\
-                 underlying: <code>{underlying}</code>\n\
-                 attempts: <code>{attempts_made}</code>\n\
-                 reason: <code>{reason}</code>\n\
-                 Strategy reading RAM cache fallback. \
-                 Investigate Dhan-side if sustained > 3min."
-            ),
+            } => {
+                let underlying = html_escape(underlying);
+                let reason = html_escape(reason);
+                format!(
+                    "<b>Option-chain fetch FAILED</b>\n\
+                     underlying: <code>{underlying}</code>\n\
+                     attempts: <code>{attempts_made}</code>\n\
+                     reason: <code>{reason}</code>\n\
+                     Strategy reading RAM cache fallback. \
+                     Investigate Dhan-side if sustained > 3min."
+                )
+            }
             Self::OptionChainCacheFallback {
                 underlying,
                 cache_age_secs,
-            } => format!(
-                "<b>Option-chain cache fallback</b>\n\
-                 underlying: <code>{underlying}</code>\n\
-                 cache age: <code>{cache_age_secs}s</code>\n\
-                 (informational — strategy still trading on cached chain)"
-            ),
+            } => {
+                let underlying = html_escape(underlying);
+                format!(
+                    "<b>Option-chain cache fallback</b>\n\
+                     underlying: <code>{underlying}</code>\n\
+                     cache age: <code>{cache_age_secs}s</code>\n\
+                     (informational — strategy still trading on cached chain)"
+                )
+            }
             Self::OptionChainStaleHalt {
                 underlying,
                 cache_age_secs,
                 threshold_secs,
-            } => format!(
-                "<b>🆘 Option-chain STRATEGY HALTED</b>\n\
-                 underlying: <code>{underlying}</code>\n\
-                 cache age: <code>{cache_age_secs}s</code>\n\
-                 threshold: <code>{threshold_secs}s</code>\n\
-                 NEW entries blocked. Existing positions held. \
-                 Operator action: investigate Dhan-side; \
-                 decide go/no-go per kill-switch runbook."
-            ),
-            Self::OptionChainConfigInvalid { reason } => format!(
-                "<b>🆘 Option-chain CONFIG INVALID — BOOT HALTED</b>\n\
-                 {reason}\n\
-                 Fix `[option_chain_minute_snapshot]` in config/base.toml \
-                 + restart."
-            ),
+            } => {
+                let underlying = html_escape(underlying);
+                format!(
+                    "<b>🆘 Option-chain STRATEGY HALTED</b>\n\
+                     underlying: <code>{underlying}</code>\n\
+                     cache age: <code>{cache_age_secs}s</code>\n\
+                     threshold: <code>{threshold_secs}s</code>\n\
+                     NEW entries blocked. Existing positions held. \
+                     Operator action: investigate Dhan-side; \
+                     decide go/no-go per kill-switch runbook."
+                )
+            }
+            Self::OptionChainConfigInvalid { reason } => {
+                let reason = html_escape(reason);
+                format!(
+                    "<b>🆘 Option-chain CONFIG INVALID — BOOT HALTED</b>\n\
+                     {reason}\n\
+                     Fix `[option_chain_minute_snapshot]` in config/base.toml \
+                     + restart."
+                )
+            }
         }
     }
 
@@ -3742,6 +3850,205 @@ mod tests {
             !stripped.contains('>'),
             "Telegram HTML mode rejects unescaped '>' — body was: {body}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // html_escape — external-text Telegram HTML hardening (named follow-up
+    // from #1089 batch-3 security review). Telegram sends parse_mode=HTML;
+    // an external `reason`/`detail`/`ip_match_status` containing `<`/`>`/`&`
+    // would 400-Bad-Request the alert so the operator never sees it. These
+    // tests inject a hostile string into each fixed arm and assert it is
+    // escaped (no raw external bracket) while the trusted `<b>` structural
+    // tag survives.
+    // -----------------------------------------------------------------------
+
+    /// Hostile external string used across the escaping tests.
+    const HOSTILE: &str = "<script>alert(1)</script> a < b & c > d";
+
+    #[test]
+    fn test_html_escape_amp_first_no_double_escape() {
+        // `&` must be escaped before `<`/`>` so the `&` we introduce in
+        // `&lt;`/`&gt;` is not re-escaped into `&amp;lt;`.
+        assert_eq!(super::html_escape("<"), "&lt;");
+        assert_eq!(super::html_escape(">"), "&gt;");
+        assert_eq!(super::html_escape("&"), "&amp;");
+        assert_eq!(super::html_escape("a < b"), "a &lt; b");
+        assert_eq!(super::html_escape("x & y"), "x &amp; y");
+        // The crux: a literal `<` becomes exactly `&lt;`, NOT `&amp;lt;`.
+        assert_eq!(super::html_escape("<b>"), "&lt;b&gt;");
+        assert!(!super::html_escape("<b>").contains("&amp;lt;"));
+    }
+
+    #[test]
+    fn test_html_escape_plain_passthrough_and_empty() {
+        // Common case: no metacharacters → byte-identical output.
+        assert_eq!(super::html_escape(""), "");
+        assert_eq!(
+            super::html_escape("Connection reset, retrying in 200ms"),
+            "Connection reset, retrying in 200ms"
+        );
+        // UTF-8 multi-byte is untouched.
+        assert_eq!(super::html_escape("score ≥ 0.95"), "score ≥ 0.95");
+    }
+
+    /// Asserts a rendered body escaped the injected hostile string: the raw
+    /// `<script>` / external `<`/`>` must be absent, the escaped entities
+    /// present, and the trusted `<b>` structural tag preserved.
+    fn assert_external_text_escaped(body: &str) {
+        assert!(
+            !body.contains("<script>"),
+            "raw external <script> tag leaked into HTML body: {body}"
+        );
+        assert!(
+            body.contains("&lt;script&gt;"),
+            "external '<'/'>' not escaped to entities: {body}"
+        );
+        assert!(
+            body.contains("&amp; c"),
+            "external '&' not escaped to &amp;: {body}"
+        );
+        assert!(
+            body.contains("<b>"),
+            "trusted <b> structural tag must NOT be escaped: {body}"
+        );
+    }
+
+    #[test]
+    fn test_websocket_disconnected_escapes_external_reason() {
+        let ev = NotificationEvent::WebSocketDisconnected {
+            connection_index: 0,
+            reason: HOSTILE.to_string(),
+        };
+        assert_external_text_escaped(&ev.to_message());
+    }
+
+    #[test]
+    fn test_websocket_disconnected_offhours_escapes_external_reason() {
+        let ev = NotificationEvent::WebSocketDisconnectedOffHours {
+            connection_index: 0,
+            reason: HOSTILE.to_string(),
+        };
+        assert_external_text_escaped(&ev.to_message());
+    }
+
+    #[test]
+    fn test_order_update_disconnected_escapes_external_reason() {
+        let ev = NotificationEvent::OrderUpdateDisconnected {
+            reason: HOSTILE.to_string(),
+        };
+        assert_external_text_escaped(&ev.to_message());
+    }
+
+    #[test]
+    fn test_order_rejected_escapes_external_reason_and_correlation() {
+        let ev = NotificationEvent::OrderRejected {
+            correlation_id: "id<x>&y".to_string(),
+            reason: HOSTILE.to_string(),
+        };
+        let body = ev.to_message();
+        assert_external_text_escaped(&body);
+        assert!(
+            !body.contains("id<x>"),
+            "correlation_id not escaped: {body}"
+        );
+        assert!(
+            body.contains("id&lt;x&gt;&amp;y"),
+            "correlation_id escaping wrong: {body}"
+        );
+    }
+
+    #[test]
+    fn test_risk_halt_escapes_external_reason() {
+        let ev = NotificationEvent::RiskHalt {
+            reason: HOSTILE.to_string(),
+        };
+        assert_external_text_escaped(&ev.to_message());
+    }
+
+    #[test]
+    fn test_authentication_failed_escapes_external_reason() {
+        let ev = NotificationEvent::AuthenticationFailed {
+            reason: HOSTILE.to_string(),
+        };
+        assert_external_text_escaped(&ev.to_message());
+    }
+
+    #[test]
+    fn test_mid_session_profile_invalidated_escapes_external_reason() {
+        let ev = NotificationEvent::MidSessionProfileInvalidated {
+            reason: HOSTILE.to_string(),
+        };
+        assert_external_text_escaped(&ev.to_message());
+    }
+
+    #[test]
+    fn test_option_chain_fetch_failed_escapes_external_reason() {
+        let ev = NotificationEvent::OptionChainFetchFailed {
+            underlying: "NIFTY".to_string(),
+            attempts_made: 2,
+            reason: HOSTILE.to_string(),
+        };
+        assert_external_text_escaped(&ev.to_message());
+    }
+
+    #[test]
+    fn test_cross_verify_1m_aborted_escapes_external_detail() {
+        let ev = NotificationEvent::CrossVerify1mAborted {
+            detail: HOSTILE.to_string(),
+        };
+        assert_external_text_escaped(&ev.to_message());
+    }
+
+    #[test]
+    fn test_static_ip_boot_check_failed_escapes_ip_match_status() {
+        let ev = NotificationEvent::StaticIpBootCheckFailed {
+            reason: "match_status_not_ok".to_string(),
+            orders_allowed: false,
+            ip_match_status: HOSTILE.to_string(),
+            attempts_made: 1,
+        };
+        assert_external_text_escaped(&ev.to_message());
+    }
+
+    // Security-review (PR #1102) follow-on: external-text arms the first
+    // sweep missed — `holder`/`lock_key` from the Valkey/SSM instance lock
+    // and `sample_symbols` from Dhan REST positions / historical responses.
+
+    #[test]
+    fn test_dual_instance_detected_escapes_external_holder_and_lock_key() {
+        let ev = NotificationEvent::DualInstanceDetected {
+            holder: HOSTILE.to_string(),
+            lock_key: "key<x>&y".to_string(),
+        };
+        let body = ev.to_message();
+        assert_external_text_escaped(&body);
+        assert!(!body.contains("key<x>"), "lock_key not escaped: {body}");
+        assert!(
+            body.contains("key&lt;x&gt;&amp;y"),
+            "lock_key escaping wrong: {body}"
+        );
+    }
+
+    #[test]
+    fn test_orphan_position_detected_escapes_external_sample_symbols() {
+        let ev = NotificationEvent::OrphanPositionDetected {
+            count: 1,
+            total_abs_net_qty: 50,
+            sample_symbols: vec![HOSTILE.to_string()],
+            dry_run: true,
+        };
+        assert_external_text_escaped(&ev.to_message());
+    }
+
+    #[test]
+    fn test_bar_mismatch_corrected_escapes_external_sample_symbols() {
+        let ev = NotificationEvent::BarMismatchCorrectedFromHistorical {
+            compared_count: 222,
+            mismatches_count: 1,
+            sample_symbols: vec![HOSTILE.to_string()],
+            cross_check_pass: "post_open_09_16_05",
+        };
+        assert_external_text_escaped(&ev.to_message());
     }
 
     // -----------------------------------------------------------------------

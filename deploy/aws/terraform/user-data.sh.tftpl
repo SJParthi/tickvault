@@ -84,6 +84,7 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCFG
     "metrics_collected": {
       "prometheus": {
         "prometheus_config_path": "/opt/aws/amazon-cloudwatch-agent/etc/prometheus.yaml",
+        "log_group_name": "/tickvault/$${ENVIRONMENT}/metrics",
         "emf_processor": {
           "metric_namespace": "Tickvault/Prod",
           "metric_declaration_dedup": true,

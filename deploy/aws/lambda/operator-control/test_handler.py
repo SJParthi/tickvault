@@ -421,6 +421,47 @@ class WipeGate(unittest.TestCase):
         self.assertIn("/opt/tickvault/data/spill", joined)
         self.assertIn("/opt/tickvault/data/dlq", joined)
 
+    def _docker_nuke_bare(self, force: bool):
+        return handler.lambda_handler(
+            {
+                "requestContext": {"http": {"method": "POST"}},
+                "headers": {"authorization": "Bearer s3cret-token"},
+                "body": json.dumps({"action": "docker-nuke-bare", "force": force}),
+            },
+            None,
+        )
+
+    def test_docker_nuke_bare_without_force_is_blocked(self) -> None:
+        self.assertEqual(self._docker_nuke_bare(force=False)["statusCode"], 409)
+
+    def test_docker_nuke_bare_is_in_destructive_set(self) -> None:
+        self.assertIn("docker-nuke-bare", handler._DESTRUCTIVE)
+
+    def test_docker_nuke_bare_forced_deletes_all_and_does_not_rebuild(self) -> None:
+        # Operator request 2026-06-12: behave like Docker Desktop "delete all" —
+        # remove EVERY container + image + volume and DO NOT rebuild (the box is
+        # left bare). This is what distinguishes it from docker-reset.
+        captured: dict = {}
+        orig = handler._ssm_shell
+        handler._ssm_shell = lambda cmds: (captured.__setitem__("cmds", cmds) or "cmd-bare")  # type: ignore[assignment]
+        try:
+            resp = self._docker_nuke_bare(force=True)
+        finally:
+            handler._ssm_shell = orig  # type: ignore[assignment]
+        self.assertEqual(resp["statusCode"], 200)
+        joined = "\n".join(captured["cmds"])
+        # deletes ALL of the three object types
+        self.assertIn("docker ps -aq", joined)
+        self.assertIn("docker images -aq", joined)
+        self.assertIn("docker volume ls -q", joined)
+        # truthful verify line
+        self.assertIn("BARE-NUKE-RESULT", joined)
+        self.assertIn("bare-nuke-complete", joined)
+        # the WHOLE POINT: it must NOT rebuild / restart the app (unlike docker-reset)
+        self.assertNotIn("ensure-questdb.sh", joined)
+        self.assertNotIn("systemctl restart tickvault", joined)
+        self.assertNotIn("docker compose up", joined)
+
 
 class HtmlWipeButton(unittest.TestCase):
     def test_html_has_wipe_button(self) -> None:
@@ -435,6 +476,14 @@ class HtmlWipeButton(unittest.TestCase):
         # The nuke must spell out the SEBI-audit-data loss + require typing NUKE.
         self.assertIn("NUKE", html)
         self.assertIn("audit", html)
+
+    def test_html_has_bare_nuke_button(self) -> None:
+        html = handler._console_html()
+        self.assertIn("bareNuke()", html)
+        self.assertIn("Bare Nuke", html)
+        # must require typing ERASE + spell out that the box is left EMPTY/dead.
+        self.assertIn("ERASE", html)
+        self.assertIn("redeploy", html)
 
 
 class ParseCrossVerify(unittest.TestCase):
