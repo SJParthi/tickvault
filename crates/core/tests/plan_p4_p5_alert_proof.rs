@@ -138,20 +138,28 @@ fn test_all_4_ws_notification_events_include_identifiers() {
 
 // ─── QuestDB reconnected event is factual ───
 
-/// QuestDB reconnected alert must include the writer name and drained count.
+/// QuestDB reconnected alert must include the writer name and the honest
+/// downtime signal (consecutive failed liveness checks before recovery).
 #[test]
-fn test_questdb_reconnected_event_includes_drained_count() {
+fn test_questdb_reconnected_event_includes_failed_checks() {
     let event = NotificationEvent::QuestDbReconnected {
-        writer: "tick".to_string(),
-        drained_count: 1500,
+        writer: "liveness-check".to_string(),
+        failed_checks_before_recovery: 1500,
     };
     let msg = event.to_message();
 
     assert!(
         msg.contains("1500"),
-        "Must include drained count, got: {msg}"
+        "Must include failed-checks-before-recovery, got: {msg}"
     );
-    assert!(msg.contains("tick"), "Must include writer name, got: {msg}");
+    assert!(
+        msg.contains("liveness-check"),
+        "Must include writer name, got: {msg}"
+    );
+    assert!(
+        msg.contains("RECOVERED"),
+        "Must read as a recovery confirmation, got: {msg}"
+    );
 }
 
 // ─── WebSocket reconnection exhausted includes attempts ───

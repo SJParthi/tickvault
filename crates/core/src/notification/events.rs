@@ -900,12 +900,19 @@ pub enum NotificationEvent {
         signal_kind: String,
     },
 
-    /// QuestDB persistence reconnected — buffered data draining.
+    /// QuestDB persistence reconnected — buffered data draining. Emitted on
+    /// the recovery edge of a `QuestDbDisconnected` incident (symmetric with
+    /// the Critical disconnect alert, so the operator is told the incident
+    /// resolved — audit-findings Rule 11, no false-OK / anxiety gap).
     QuestDbReconnected {
         /// Which writer recovered.
         writer: String,
-        /// Total ticks/records drained from buffer.
-        drained_count: usize,
+        /// Consecutive failed liveness checks observed before recovery
+        /// (≈ downtime in liveness-poll intervals). The drained-record
+        /// count is NOT knowable at the liveness-loop site (it lives in
+        /// the tick-persistence rescue ring), so this carries the honest,
+        /// available downtime signal rather than a hardcoded zero.
+        failed_checks_before_recovery: u32,
     },
 
     /// Custom alert from any component.
@@ -1902,11 +1909,13 @@ impl NotificationEvent {
             }
             Self::QuestDbReconnected {
                 writer,
-                drained_count,
+                failed_checks_before_recovery,
             } => {
                 format!(
-                    "<b>QuestDB {writer} RECONNECTED</b>\n\
-                     Drained {drained_count} buffered records to QuestDB."
+                    "<b>QuestDB {writer} RECOVERED</b>\n\
+                     Was unreachable for {failed_checks_before_recovery} consecutive liveness checks.\n\
+                     Buffered ticks are now draining from the rescue ring to QuestDB.\n\
+                     No action needed unless this recurs."
                 )
             }
             Self::Custom { message } => message.clone(),

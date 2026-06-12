@@ -113,6 +113,19 @@ fn trading_day_gate_exit_code(is_trading_day: bool) -> i32 {
     if is_trading_day { 0 } else { 75 }
 }
 
+/// Decides the QuestDB liveness recovery edge: emit `QuestDbReconnected`
+/// iff liveness just succeeded AND a `QuestDbDisconnected` was previously
+/// alerted. Pure so the edge contract is unit-testable without the clock
+/// or a live QuestDB. Edge-triggered per audit-findings Rule 4 — the caller
+/// clears the `prev_disconnect_alerted` flag after a true result so the
+/// recovery alert fires exactly once per incident.
+const fn should_emit_questdb_reconnected(
+    prev_disconnect_alerted: bool,
+    liveness_success: bool,
+) -> bool {
+    prev_disconnect_alerted && liveness_success
+}
+
 /// `--check-trading-day` short-circuit: load config → build the calendar →
 /// evaluate IST today → exit with [`trading_day_gate_exit_code`].
 ///
@@ -4706,6 +4719,14 @@ async fn main() -> Result<()> {
             // not by this in-process cooldown.
             let mut last_spill_alert: Option<Instant> = None;
             let mut last_docker_alert: Option<Instant> = None;
+            // QuestDB liveness recovery-edge state: track whether a
+            // `QuestDbDisconnected` (Critical) was alerted and the peak
+            // consecutive-failure count, so we emit a symmetric
+            // `QuestDbReconnected` (Medium) exactly once on recovery —
+            // audit-findings Rule 11 (no false-OK / anxiety gap) + Rule 4
+            // (edge-triggered, not level-triggered).
+            let mut questdb_disconnect_alerted = false;
+            let mut questdb_peak_failed_checks: u32 = 0;
 
             /// Returns true if cooldown has elapsed (or first alert).
             fn should_alert(last: &mut Option<Instant>, cooldown: std::time::Duration) -> bool {
@@ -4761,14 +4782,20 @@ async fn main() -> Result<()> {
                 // consecutive failures so a single slow query under ingestion
                 // load does not page. Recovery resets the failure counter.
                 let liveness_outcome = infra::check_questdb_liveness(&questdb_config).await;
-                if !liveness_outcome.is_success() {
+                let liveness_success = liveness_outcome.is_success();
+                if !liveness_success {
                     let failures = infra::questdb_liveness_failures();
+                    // `check_questdb_liveness` resets the atomic to 0 on
+                    // success, so capture the peak here while still down —
+                    // it is the honest downtime signal for the recovery alert.
+                    questdb_peak_failed_checks = questdb_peak_failed_checks.max(failures);
                     if failures >= infra::QUESTDB_LIVENESS_FAILURE_THRESHOLD {
                         health_notifier.notify(NotificationEvent::QuestDbDisconnected {
                             writer: "liveness-check".to_string(),
                             signal: u64::from(failures),
                             signal_kind: "Consecutive liveness failures".to_string(),
                         });
+                        questdb_disconnect_alerted = true;
                     } else {
                         tracing::warn!(
                             failures,
@@ -4776,6 +4803,20 @@ async fn main() -> Result<()> {
                             "QuestDB liveness check failed — below alert threshold"
                         );
                     }
+                } else if should_emit_questdb_reconnected(
+                    questdb_disconnect_alerted,
+                    liveness_success,
+                ) {
+                    // Recovery edge — symmetric with the Critical disconnect
+                    // alert so the operator is told the incident resolved
+                    // (audit-findings Rule 11). Fires exactly once: the flag
+                    // is cleared here and only re-armed by a fresh disconnect.
+                    health_notifier.notify(NotificationEvent::QuestDbReconnected {
+                        writer: "liveness-check".to_string(),
+                        failed_checks_before_recovery: questdb_peak_failed_checks,
+                    });
+                    questdb_disconnect_alerted = false;
+                    questdb_peak_failed_checks = 0;
                 }
                 // C4: Auto-cleanup spill files older than 7 days.
                 infra::cleanup_old_spill_files();
@@ -6542,6 +6583,17 @@ mod tests {
     fn test_boot_helper_functions_callable() {
         let _ = compute_market_close_sleep("15:30:00");
         let _ = create_log_file_writer();
+    }
+
+    #[test]
+    fn test_should_emit_questdb_reconnected_edge_semantics() {
+        // Recovery edge: previously alerted disconnect + liveness now OK → emit.
+        assert!(should_emit_questdb_reconnected(true, true));
+        // Never alerted (no incident) + OK → do NOT emit a spurious recovery.
+        assert!(!should_emit_questdb_reconnected(false, true));
+        // Still down (liveness failing) → do NOT emit recovery, regardless of flag.
+        assert!(!should_emit_questdb_reconnected(true, false));
+        assert!(!should_emit_questdb_reconnected(false, false));
     }
 
     #[test]
