@@ -1131,9 +1131,17 @@ async fn main() -> Result<()> {
                 // signal (only success was announced). Fail-closed boot-halt
                 // is preserved — we return Err AFTER alerting. NOT a duplicate
                 // of INSTR-FETCH-* (those infinite-retry, never reach this Err).
-                error!(error = %err, "instrument load failed at boot — alerting operator and halting");
+                // Security (review 2026-06-12): redact the anyhow chain before it
+                // reaches Telegram + the log sinks (authentication.md rule 2 —
+                // a token must never appear in error messages). A future
+                // authenticated call in this path could otherwise carry a
+                // token-in-URL into `reason`. capture_rest_error_body is the
+                // ratchet-guaranteed redactor (URL-param + JWT + credential-field).
+                let safe_reason =
+                    tickvault_common::sanitize::capture_rest_error_body(&err.to_string());
+                error!(error = %safe_reason, "instrument load failed at boot — alerting operator and halting");
                 fast_notifier.notify(NotificationEvent::InstrumentBuildFailed {
-                    reason: err.to_string(),
+                    reason: safe_reason,
                     manual_trigger_url: format!(
                         "http://{}:{}/api/instruments/rebuild",
                         config.api.host, config.api.port
@@ -2697,9 +2705,14 @@ async fn main() -> Result<()> {
             // Mirrors the fast-boot site — the bare `?` previously halted
             // boot with no operator Telegram. Fail-closed halt preserved;
             // NOT a duplicate of INSTR-FETCH-* (those infinite-retry).
-            error!(error = %err, "instrument load failed at boot — alerting operator and halting");
+            // Security (review 2026-06-12): redact the anyhow chain before it
+            // reaches Telegram + the log sinks (authentication.md rule 2 — a
+            // token must never appear in error messages). capture_rest_error_body
+            // is the ratchet-guaranteed redactor (URL-param + JWT + credential).
+            let safe_reason = tickvault_common::sanitize::capture_rest_error_body(&err.to_string());
+            error!(error = %safe_reason, "instrument load failed at boot — alerting operator and halting");
             notifier.notify(NotificationEvent::InstrumentBuildFailed {
-                reason: err.to_string(),
+                reason: safe_reason,
                 manual_trigger_url: format!(
                     "http://{}:{}/api/instruments/rebuild",
                     config.api.host, config.api.port

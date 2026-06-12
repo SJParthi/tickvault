@@ -69,3 +69,24 @@ fn test_instrument_build_failed_preserves_fail_closed_halt() {
          additive; the fail-closed boot-halt must be preserved."
     );
 }
+
+#[test]
+fn test_instrument_build_failed_reason_is_secret_redacted() {
+    // Security (review 2026-06-12): the anyhow chain MUST be routed through
+    // `capture_rest_error_body` (ratchet-guaranteed URL-param + JWT +
+    // credential-field redaction) before it reaches `reason` (Telegram) and
+    // the `error!` log sinks — authentication.md rule 2: a token must never
+    // appear in error messages. Both boot arms must emit `reason: safe_reason`.
+    let src = main_rs_source();
+    assert!(
+        src.contains("capture_rest_error_body(&err.to_string())"),
+        "InstrumentBuildFailed `reason` must be redacted via \
+         capture_rest_error_body(&err.to_string()) before reaching Telegram/logs."
+    );
+    let redacted_emits = src.matches("reason: safe_reason").count();
+    assert!(
+        redacted_emits >= 2,
+        "Both boot arms must emit `reason: safe_reason` (redacted); found \
+         {redacted_emits}. A raw `err.to_string()` in reason can leak a token."
+    );
+}
