@@ -363,6 +363,22 @@ pub struct WebSocketConnection {
     /// after a 429 just keeps the limit alive). Reset to `0` on a clean
     /// connect+subscribe.
     rate_limit_streak: std::sync::atomic::AtomicU32,
+
+    /// 2026-06-12 — optional channel to the `ws_event_audit` writer. Every WS
+    /// lifecycle event (connect/disconnect/reconnect/sleep) on this connection
+    /// also stamps a forensic row with this connection's `ws_type` (MainFeed)
+    /// + `connection_index`. `None` until `with_ws_audit` attaches it. Sending
+    /// is non-blocking (`try_send`) so the audit NEVER stalls the WS loop.
+    ws_audit_tx: Option<WsEventAuditSender>,
+    /// Configured number of connections of this connection's `ws_type` (for the
+    /// audit `pool_size` column — 1 today, up to 5 in the future 16-conn scenario).
+    ws_audit_pool_size: i64,
+    /// The `ws_type` this connection stamps on its audit rows. Carried (not
+    /// hardcoded) so the SAME `WebSocketConnection` can be a main-feed OR a
+    /// future depth connection with the correct label — the operator's explicit
+    /// "no schema change for the 16-connection future" demand. Defaults
+    /// `MainFeed` (the only runtime `ws_type` for this struct today).
+    ws_audit_type: tickvault_common::ws_event_types::WsType,
 }
 
 /// Audit-2026-05-03 H2: static lookup for connection-id labels used by
@@ -371,6 +387,13 @@ pub struct WebSocketConnection {
 /// degenerate case where a future regression bumps `ConnectionId` past
 /// the cap — defensive, never hit in practice.
 const CONNECTION_ID_LABELS: [&str; 6] = ["0", "1", "2", "3", "4", "unknown"];
+
+/// Bounded channel sender a connection uses to hand a forensic
+/// [`tickvault_common::ws_event_types::WsEventAuditRow`] to the `ws_event_audit`
+/// consumer. Alias keeps the (otherwise clippy-`type_complexity`) signatures
+/// readable here and in `connection_pool.rs` / the boot wiring.
+pub type WsEventAuditSender =
+    tokio::sync::mpsc::Sender<tickvault_common::ws_event_types::WsEventAuditRow>;
 
 /// Returns the `&'static str` metric label for a given `ConnectionId`.
 /// Pure function, no I/O, no allocation. O(1) array index.
@@ -471,6 +494,10 @@ impl WebSocketConnection {
             // u32::MAX sentinel = "no Dhan code recorded yet".
             last_disconnect_dhan_code: std::sync::atomic::AtomicU32::new(u32::MAX),
             rate_limit_streak: std::sync::atomic::AtomicU32::new(0),
+            // 2026-06-12: WS-event audit sink attached lazily via with_ws_audit.
+            ws_audit_tx: None,
+            ws_audit_pool_size: 1,
+            ws_audit_type: tickvault_common::ws_event_types::WsType::MainFeed,
         }
     }
 
@@ -483,6 +510,82 @@ impl WebSocketConnection {
     pub fn with_wal_spill(mut self, spill: Arc<WsFrameSpill>) -> Self {
         self.wal_spill = Some(spill);
         self
+    }
+
+    /// 2026-06-12: attach the WS-event audit channel + this pool's size.
+    ///
+    /// Chain after `new()`. Every connect/disconnect/reconnect/sleep on this
+    /// connection then stamps a `ws_event_audit` row with `WsType::MainFeed` +
+    /// this connection's index. Builder form (matches `with_wal_spill`); avoids
+    /// breaking the many `new()` call sites (Rule 17).
+    #[must_use]
+    // TEST-EXEMPT: builder pass-through; emission covered by ws_event_audit_wiring_guard + the storage append tests.
+    pub fn with_ws_audit(
+        mut self,
+        tx: WsEventAuditSender,
+        pool_size: i64,
+        ws_type: tickvault_common::ws_event_types::WsType,
+    ) -> Self {
+        self.ws_audit_tx = Some(tx);
+        self.ws_audit_pool_size = pool_size;
+        self.ws_audit_type = ws_type;
+        self
+    }
+
+    /// Stamp one WS lifecycle event to the `ws_event_audit` table (if attached).
+    ///
+    /// COLD PATH — fires at most once per connect/disconnect/reconnect/sleep,
+    /// NEVER per tick. Non-blocking `try_send`: if the audit channel is full or
+    /// closed the event is dropped (the live WS loop is never stalled by the
+    /// forensic side-record) — the CloudWatch log + Telegram for the same event
+    /// still fired, so no operator-visible signal is lost.
+    fn emit_ws_audit(
+        &self,
+        event_kind: tickvault_common::ws_event_types::WsEventKind,
+        source: &str,
+        reason: &str,
+        dhan_code: Option<u16>,
+        down_secs: u64,
+        attempts: u32,
+    ) {
+        let Some(tx) = self.ws_audit_tx.as_ref() else {
+            return;
+        };
+        // O(1) EXEMPT: begin — COLD PATH. This whole helper fires at most once
+        // per connect/disconnect/reconnect/sleep cycle, NEVER per tick; the two
+        // owned-String allocations for the forensic row are off the tick path.
+        // IST nanos for the designated timestamp + IST-midnight for the day.
+        let now_utc_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let now_ist_nanos =
+            now_utc_nanos.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+        let nanos_per_day: i64 = 86_400 * 1_000_000_000;
+        let trading_date_ist_nanos = now_ist_nanos - now_ist_nanos.rem_euclid(nanos_per_day);
+        let row = tickvault_common::ws_event_types::WsEventAuditRow {
+            event_ts_ist_nanos: now_ist_nanos,
+            trading_date_ist_nanos,
+            ws_type: self.ws_audit_type,
+            connection_index: i64::try_from(usize::from(self.connection_id)).unwrap_or(0),
+            pool_size: self.ws_audit_pool_size,
+            event_kind,
+            source: source.to_string(),
+            reason: reason.to_string(),
+            dhan_code: dhan_code.map_or(
+                tickvault_common::ws_event_types::WS_EVENT_NO_DHAN_CODE,
+                i64::from,
+            ),
+            down_secs: i64::try_from(down_secs).unwrap_or(i64::MAX),
+            attempts: i64::from(attempts),
+            market_hours: tickvault_common::market_hours::is_within_market_hours_ist(),
+        };
+        // O(1) EXEMPT: end
+        // Non-blocking: drop on full/closed — never stall the WS loop.
+        if let Err(err) = tx.try_send(row) {
+            debug!(
+                connection_id = usize::from(self.connection_id),
+                ?err,
+                "ws_event_audit channel full/closed — row dropped (log+Telegram still fired)"
+            );
+        }
     }
 
     /// O1-B (2026-04-17): Attach a runtime subscribe-command channel.
@@ -664,6 +767,16 @@ impl WebSocketConnection {
                             attempts,
                             "WebSocket reconnected"
                         );
+                        // 2026-06-12: stamp the forensic reconnect row (same
+                        // precise source + down_secs + attempts as the log).
+                        self.emit_ws_audit(
+                            tickvault_common::ws_event_types::WsEventKind::Reconnected,
+                            source,
+                            reason.as_deref().unwrap_or(""),
+                            dhan_code,
+                            down_secs,
+                            attempts,
+                        );
                         if let Some(ref n) = self.notifier {
                             n.notify(crate::notification::events::NotificationEvent::WebSocketReconnected {
                                 connection_index: usize::from(self.connection_id),
@@ -672,6 +785,20 @@ impl WebSocketConnection {
                                 attempts,
                             });
                         }
+                    } else {
+                        // 2026-06-12 (B1 fix): the INITIAL connect of every
+                        // connection is also tracked — stamp a `Connected`
+                        // forensic row so "every connect" is true, not just
+                        // reconnects. No Telegram for the initial connect
+                        // (that positive signal is the 09:15:30 heartbeat).
+                        self.emit_ws_audit(
+                            tickvault_common::ws_event_types::WsEventKind::Connected,
+                            "n/a",
+                            "initial connect",
+                            None,
+                            0,
+                            0,
+                        );
                     }
 
                     // STAGE-C.3: Spawn the per-connection activity watchdog
@@ -738,7 +865,12 @@ impl WebSocketConnection {
                             // O(1) EXEMPT: cold path — fires at most once per disconnect cycle, never per tick
                             let reason = format!("Non-reconnectable: {code}");
                             // O(1) EXEMPT: cold path — reason needs to flow to both state slot + Telegram event
-                            self.record_disconnect(reason.clone(), Some(code.as_u16()));
+                            // Always fires WebSocketDisconnected (HIGH) regardless of hours → audit kind Disconnected.
+                            self.record_disconnect(
+                                reason.clone(), // O(1) EXEMPT: cold path — once per disconnect cycle, never per tick
+                                Some(code.as_u16()),
+                                tickvault_common::ws_event_types::WsEventKind::Disconnected,
+                            );
                             if let Some(ref n) = self.notifier {
                                 n.notify(crate::notification::events::NotificationEvent::WebSocketDisconnected {
                                     connection_index: usize::from(self.connection_id),
@@ -763,7 +895,12 @@ impl WebSocketConnection {
                             // O(1) EXEMPT: cold path — once per 807 event, never per tick
                             let reason = format!("Token expired ({code}) — waiting for renewal");
                             // O(1) EXEMPT: cold path — reason needs to flow to both state slot + Telegram event
-                            self.record_disconnect(reason.clone(), Some(code.as_u16()));
+                            // Always fires WebSocketDisconnected (HIGH) regardless of hours → audit kind Disconnected.
+                            self.record_disconnect(
+                                reason.clone(), // O(1) EXEMPT: cold path — once per disconnect cycle, never per tick
+                                Some(code.as_u16()),
+                                tickvault_common::ws_event_types::WsEventKind::Disconnected,
+                            );
                             if let Some(ref n) = self.notifier {
                                 n.notify(crate::notification::events::NotificationEvent::WebSocketDisconnected {
                                     connection_index: usize::from(self.connection_id),
@@ -801,24 +938,31 @@ impl WebSocketConnection {
                                 error = %safe_err,
                                 "WebSocket disconnected — will reconnect"
                             );
+                            // Decide in-market ONCE so the audit kind EXACTLY mirrors
+                            // the Telegram variant this site fires (B3 fix).
+                            let in_market =
+                                tickvault_common::market_hours::is_within_market_hours_ist();
+                            let audit_kind = if in_market {
+                                tickvault_common::ws_event_types::WsEventKind::Disconnected
+                            } else {
+                                tickvault_common::ws_event_types::WsEventKind::DisconnectedOffHours
+                            };
                             // O(1) EXEMPT: cold path — transport error carries no Dhan code
-                            self.record_disconnect(reason.clone(), None);
+                            self.record_disconnect(reason.clone(), None, audit_kind);
                             if let Some(ref n) = self.notifier {
-                                let event =
-                                    if tickvault_common::market_hours::is_within_market_hours_ist()
-                                    {
-                                        crate::notification::events::NotificationEvent::WebSocketDisconnected {
+                                let event = if in_market {
+                                    crate::notification::events::NotificationEvent::WebSocketDisconnected {
                                         connection_index: usize::from(self.connection_id),
                                         // O(1) EXEMPT: cold path — reconnection error, not per tick
                                         reason,
                                     }
-                                    } else {
-                                        crate::notification::events::NotificationEvent::WebSocketDisconnectedOffHours {
+                                } else {
+                                    crate::notification::events::NotificationEvent::WebSocketDisconnectedOffHours {
                                         connection_index: usize::from(self.connection_id),
                                         // O(1) EXEMPT: cold path — off-hours reset, not per tick
                                         reason,
                                     }
-                                    };
+                                };
                                 n.notify(event);
                             }
                         }
@@ -839,13 +983,20 @@ impl WebSocketConnection {
                         error = %safe_err,
                         "WebSocket connection failed — will retry"
                     );
+                    // Decide in-market ONCE so the audit kind EXACTLY mirrors the
+                    // Telegram variant this site fires (B3 fix).
+                    let in_market = tickvault_common::market_hours::is_within_market_hours_ist();
+                    let audit_kind = if in_market {
+                        tickvault_common::ws_event_types::WsEventKind::Disconnected
+                    } else {
+                        tickvault_common::ws_event_types::WsEventKind::DisconnectedOffHours
+                    };
                     // O(1) EXEMPT: cold path — connect-failed transport error carries no Dhan code
-                    self.record_disconnect(reason.clone(), None);
+                    self.record_disconnect(reason.clone(), None, audit_kind);
                     if let Some(ref n) = self.notifier {
                         // Parthiban override (2026-04-22): same off-hours
                         // severity split as the disconnect branch above.
-                        let event = if tickvault_common::market_hours::is_within_market_hours_ist()
-                        {
+                        let event = if in_market {
                             crate::notification::events::NotificationEvent::WebSocketDisconnected {
                                 connection_index: usize::from(self.connection_id),
                                 // O(1) EXEMPT: cold path — connect-failed is not per tick
@@ -1600,6 +1751,16 @@ impl WebSocketConnection {
                             },
                         );
                     }
+                    // 2026-06-12: forensic row — dormant sleep entered; the
+                    // sleep duration is recorded in down_secs.
+                    self.emit_ws_audit(
+                        tickvault_common::ws_event_types::WsEventKind::SleepEntered,
+                        "n/a",
+                        "post-close dormant sleep until next market open",
+                        None,
+                        sleep_secs,
+                        0,
+                    );
                     time::sleep(Duration::from_secs(sleep_secs)).await;
                     info!(
                         connection_id = self.connection_id,
@@ -1659,6 +1820,15 @@ impl WebSocketConnection {
                             },
                         );
                     }
+                    // 2026-06-12: forensic row — resumed from dormant sleep.
+                    self.emit_ws_audit(
+                        tickvault_common::ws_event_types::WsEventKind::SleepResumed,
+                        "n/a",
+                        "resumed from dormant sleep at market open",
+                        None,
+                        sleep_secs,
+                        0,
+                    );
                     // Reset reconnection counter so the post-sleep attempt
                     // starts fresh (3-failure post-close gate is per-cycle).
                     self.total_reconnections.store(0, Ordering::Release);
@@ -1789,7 +1959,12 @@ impl WebSocketConnection {
     /// gives the classifier the ground-truth source instead of a digit-blind
     /// string guess.
     #[allow(clippy::expect_used)] // APPROVED: lock poison is unrecoverable
-    fn record_disconnect(&self, reason: String, dhan_code: Option<u16>) {
+    fn record_disconnect(
+        &self,
+        reason: String,
+        dhan_code: Option<u16>,
+        audit_kind: tickvault_common::ws_event_types::WsEventKind,
+    ) {
         // 2026-06-12: structured log at the SINGLE disconnect choke point so
         // EVERY WebSocket disconnect lands in CloudWatch (app.log), not just
         // Telegram — with the PRECISE source. Cold path (once per disconnect
@@ -1807,6 +1982,14 @@ impl WebSocketConnection {
             source = source,
             "WebSocket disconnected"
         );
+        // 2026-06-12: stamp the forensic ws_event_audit row at the SAME single
+        // choke point so EVERY disconnect (all 4 paths) is durably tracked. The
+        // `audit_kind` is passed BY THE CALL SITE so it mirrors EXACTLY the
+        // Telegram variant that site fires (the 807 / non-reconnectable branches
+        // always fire WebSocketDisconnected regardless of hours; the 2 transport
+        // branches use the in-market vs off-hours split). down_secs / attempts
+        // are reconnect-only (0 here); reason is redacted at the ILP boundary.
+        self.emit_ws_audit(audit_kind, source, &reason, dhan_code, 0, 0);
         // Capture the Dhan code (latest wins) so the matching reconnect log can
         // classify the same PRECISE source. u32::MAX sentinel = none.
         self.last_disconnect_dhan_code.store(
@@ -2221,9 +2404,10 @@ mod tests {
         // Record 3 disconnects (simulating 3 retry failures in one outage).
         // The first carries a Dhan 807 token-expired code; the latest is a
         // transport error (no code) — so the code slot reflects "latest wins".
-        conn.record_disconnect("Token expired (807)".to_string(), Some(807));
-        conn.record_disconnect("Reset by peer".to_string(), None);
-        conn.record_disconnect("connect failed: timeout".to_string(), None);
+        let dk = tickvault_common::ws_event_types::WsEventKind::Disconnected;
+        conn.record_disconnect("Token expired (807)".to_string(), Some(807), dk);
+        conn.record_disconnect("Reset by peer".to_string(), None, dk);
+        conn.record_disconnect("connect failed: timeout".to_string(), None, dk);
 
         // Take the context — should reflect the LATEST reason and the
         // FIRST disconnect's timestamp (so down_secs measures full outage),
@@ -2238,7 +2422,7 @@ mod tests {
         assert_eq!(code1, None, "latest disconnect carried no Dhan code");
 
         // A Dhan-coded disconnect surfaces the precise code on take.
-        conn.record_disconnect("Token expired (807)".to_string(), Some(807));
+        conn.record_disconnect("Token expired (807)".to_string(), Some(807), dk);
         let (_r, _d, _a, code_coded) = conn.take_disconnect_context();
         assert_eq!(
             code_coded,

@@ -5545,6 +5545,20 @@ fn create_websocket_pool(
         metrics::gauge!("tv_subscription_plan_dropped_instruments").set(dropped as f64);
     }
 
+    // 2026-06-12: WS-event audit channel + consumer. Every connect/disconnect/
+    // reconnect/sleep on every connection stamps a forensic `ws_event_audit`
+    // row (future-proof for the 5+5+5+1 = 16-connection scenario). The consumer
+    // owns the ILP writer, ensures the table, drains the bounded channel, and
+    // emits AUDIT-WS-01 on a flush failure. Bounded (events are rare); the
+    // producer `try_send`s and never blocks the WS loop.
+    let (ws_audit_tx, ws_audit_rx) = tokio::sync::mpsc::channel::<
+        tickvault_common::ws_event_types::WsEventAuditRow,
+    >(WS_EVENT_AUDIT_CHANNEL_CAPACITY);
+    let ws_audit_questdb_cfg = config.questdb.clone();
+    tokio::spawn(async move {
+        run_ws_event_audit_consumer(ws_audit_rx, ws_audit_questdb_cfg).await;
+    });
+
     let mut pool = match WebSocketConnectionPool::new_with_optional_wal(
         token_handle.clone(),
         client_id.to_string(),
@@ -5554,6 +5568,7 @@ fn create_websocket_pool(
         feed_mode,
         notifier,
         wal_spill,
+        Some(ws_audit_tx),
     ) {
         Ok(pool) => pool,
         Err(err) => {
@@ -5564,6 +5579,67 @@ fn create_websocket_pool(
 
     let receiver = pool.take_frame_receiver();
     Some((receiver, pool))
+}
+
+/// Bounded capacity for the WS-event audit channel. WS lifecycle events are
+/// rare (a few per connection per day), so a small bound is ample; the producer
+/// `try_send`s and drops on the (practically unreachable) full case rather than
+/// ever blocking the WS read loop.
+const WS_EVENT_AUDIT_CHANNEL_CAPACITY: usize = 1024;
+
+/// Drains the WS-event audit channel into the `ws_event_audit` QuestDB table.
+///
+/// Owns the ILP writer for the table's lifetime, ensures the table exists once
+/// at start, then appends + flushes each row as it arrives. A flush failure
+/// emits AUDIT-WS-01 (Medium) — the WS events still reached CloudWatch logs +
+/// Telegram, so this is a forensic-record gap, never a recovery-path failure.
+/// Exits cleanly when all producers (the pool connections) drop their senders.
+async fn run_ws_event_audit_consumer(
+    mut rx: tokio::sync::mpsc::Receiver<tickvault_common::ws_event_types::WsEventAuditRow>,
+    questdb_cfg: tickvault_common::config::QuestDbConfig,
+) {
+    use tickvault_common::error_code::ErrorCode;
+    use tickvault_storage::ws_event_audit_persistence::{
+        WsEventAuditWriter, ensure_ws_event_audit_table,
+    };
+
+    ensure_ws_event_audit_table(&questdb_cfg).await;
+    let mut writer = WsEventAuditWriter::new(&questdb_cfg);
+    while let Some(row) = rx.recv().await {
+        if let Err(err) = writer.append_row(&row) {
+            error!(
+                code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                ws_type = row.ws_type.as_str(),
+                connection_index = row.connection_index,
+                event_kind = row.event_kind.as_str(),
+                ?err,
+                "ws_event_audit: append failed"
+            );
+            metrics::counter!("tv_ws_event_audit_write_errors_total", "stage" => "append")
+                .increment(1);
+            continue;
+        }
+        if let Err(err) = writer.flush() {
+            error!(
+                code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                ws_type = row.ws_type.as_str(),
+                connection_index = row.connection_index,
+                event_kind = row.event_kind.as_str(),
+                ?err,
+                "ws_event_audit: flush failed"
+            );
+            metrics::counter!("tv_ws_event_audit_write_errors_total", "stage" => "flush")
+                .increment(1);
+        } else {
+            metrics::counter!(
+                "tv_ws_event_audit_rows_total",
+                "ws_type" => row.ws_type.as_str(),
+                "event_kind" => row.event_kind.as_str(),
+            )
+            .increment(1);
+        }
+    }
+    info!("ws_event_audit consumer: all producers dropped — exiting");
 }
 
 /// Spawns all WebSocket connections in the pool (with stagger).
