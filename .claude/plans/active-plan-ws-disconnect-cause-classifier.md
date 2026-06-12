@@ -1,8 +1,8 @@
 # Plan: WebSocket disconnect CAUSE classifier — human-readable AWS / network / Dhan attribution
 
-**Status:** DRAFT
+**Status:** APPROVED
 **Date:** 2026-06-12
-**Approved by:** pending (operator requested this be QUEUED 2026-06-12)
+**Approved by:** Parthiban (2026-06-12 — "go ahead with the plan")
 **Branch:** claude/nice-cerf-hemuvn
 **Changed crates (when implemented):** `common` (classifier enum + pure fn), `core` (notification events + connection wiring)
 

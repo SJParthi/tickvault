@@ -1476,11 +1476,22 @@ impl NotificationEvent {
                 reason,
             } => {
                 // PR #790a — use scope-locked pool size (1), not Dhan cap (5).
-                let reason = html_escape(reason);
+                // 2026-06-12 — classify the likely SOURCE (Dhan / network / token)
+                // from the raw reason so the operator knows WHO caused it. The raw
+                // error is always shown above, so a wrong guess never hides truth.
+                let cause =
+                    tickvault_common::disconnect_cause::classify_disconnect_cause(reason, None);
+                // SECURITY (review 2026-06-12, HIGH): a WS connect error can embed
+                // the feed URL with the token query-param — redact before display,
+                // matching the auth-event arms.
+                let reason = html_escape(&redact_url_params(reason));
                 format!(
-                    "<b>WebSocket {}/{} disconnected</b>\n{reason}",
+                    "<b>WebSocket {}/{} disconnected</b>\n{reason}\nLikely source: {} — {}\nConfirm: {}",
                     connection_index.saturating_add(1),
-                    tickvault_common::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT
+                    tickvault_common::constants::PHASE_0_MAIN_FEED_CONNECTION_COUNT,
+                    cause.label(),
+                    cause.explanation(),
+                    cause.confirm_hint()
                 )
             }
             Self::WebSocketDisconnectedOffHours {
@@ -1488,7 +1499,8 @@ impl NotificationEvent {
                 reason,
             } => {
                 // PR #790a — use scope-locked pool size (1), not Dhan cap (5).
-                let reason = html_escape(reason);
+                // SECURITY (review 2026-06-12, HIGH): redact token-in-URL before display.
+                let reason = html_escape(&redact_url_params(reason));
                 format!(
                     "<b>WebSocket {}/{} disconnected [off-hours, auto-reconnecting]</b>\n{reason}",
                     connection_index.saturating_add(1),
@@ -1513,12 +1525,26 @@ impl NotificationEvent {
                 // Only render the diagnostic line when we actually have
                 // context (the cold path always sets reason; tests + initial
                 // probes may not).
-                let reason = reason.as_deref().map(html_escape);
+                // 2026-06-12 — classify the likely SOURCE from the raw reason
+                // (the recovery message keeps it to label + explanation; the
+                // full confirm-hint lives on the disconnect message).
+                let source = reason
+                    .as_deref()
+                    .map(|r| {
+                        let c =
+                            tickvault_common::disconnect_cause::classify_disconnect_cause(r, None);
+                        format!("\nLikely source: {} — {}", c.label(), c.explanation())
+                    })
+                    .unwrap_or_default();
+                // SECURITY (review 2026-06-12, HIGH): redact token-in-URL before display.
+                let reason = reason
+                    .as_deref()
+                    .map(|r| html_escape(&redact_url_params(r)));
                 match (reason.as_deref(), *down_secs, *attempts) {
                     (Some(r), d, a) if d > 0 || a > 0 => {
-                        format!("{header}\nReason: {r}\nDown: {d}s · Attempts: {a}")
+                        format!("{header}\nReason: {r}{source}\nDown: {d}s · Attempts: {a}")
                     }
-                    (Some(r), _, _) => format!("{header}\nReason: {r}"),
+                    (Some(r), _, _) => format!("{header}\nReason: {r}{source}"),
                     (None, d, a) if d > 0 || a > 0 => {
                         format!("{header}\nDown: {d}s · Attempts: {a}")
                     }
