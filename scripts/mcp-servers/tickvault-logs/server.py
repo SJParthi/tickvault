@@ -874,18 +874,22 @@ def build_cloudwatch_sigv4_request(
     body = json.dumps(body_obj, separators=(",", ":")).encode("utf-8")
     payload_hash = hashlib.sha256(body).hexdigest()
 
-    # Canonical headers MUST be sorted by lowercase name.
-    canon_headers = (
-        f"content-type:{content_type}\n"
-        f"host:{host}\n"
-        f"x-amz-content-sha256:{payload_hash}\n"
-        f"x-amz-date:{amz_date}\n"
-        f"x-amz-target:{target}\n"
-    )
-    signed_headers = "content-type;host;x-amz-content-sha256;x-amz-date;x-amz-target"
+    # Canonical headers MUST be sorted by lowercase name. Build a list and sort,
+    # so x-amz-security-token slots into the correct position (before x-amz-target,
+    # since "...se" < "...ta") when a session token is present — an out-of-order
+    # canonical header set yields an invalid signature (AWS 403).
+    header_pairs: list[tuple[str, str]] = [
+        ("content-type", content_type),
+        ("host", host),
+        ("x-amz-content-sha256", payload_hash),
+        ("x-amz-date", amz_date),
+        ("x-amz-target", target),
+    ]
     if session_token:
-        canon_headers += f"x-amz-security-token:{session_token}\n"
-        signed_headers += ";x-amz-security-token"
+        header_pairs.append(("x-amz-security-token", session_token))
+    header_pairs.sort(key=lambda kv: kv[0])
+    canon_headers = "".join(f"{name}:{value}\n" for name, value in header_pairs)
+    signed_headers = ";".join(name for name, _ in header_pairs)
 
     canonical_request = (
         f"POST\n/\n\n{canon_headers}\n{signed_headers}\n{payload_hash}"
@@ -1152,17 +1156,28 @@ def tool_cloudwatch_logs(
     filter_pattern: str | None = None,
     limit: int = 100,
 ) -> dict[str, Any]:
-    """Read recent prod logs, fully automated. PREFERRED path: the existing
-    operator-control portal's `logs` endpoint (set TICKVAULT_PORTAL_URL +
-    TICKVAULT_PORTAL_TOKEN — no aws CLI, no AWS key; the portal Lambda reads the
-    box with its own role). FALLBACK: the read-only `aws` CLI on the
-    /tickvault/prod/app CloudWatch group. Looks back `minutes` (aws path only),
-    optional `filter_pattern`, up to `limit` newest events. Fails clearly if
-    neither path is configured."""
+    """Read recent prod logs, fully automated. PREFERRED path: direct CloudWatch
+    read via a SigV4-signed HTTPS call — the ONLY input is a read-only AWS key in
+    the env (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY [+ AWS_SESSION_TOKEN];
+    no aws CLI, no portal, no boto3). NEXT: the operator-control portal's `logs`
+    endpoint (set TICKVAULT_PORTAL_URL + TICKVAULT_PORTAL_TOKEN — the portal
+    Lambda reads the box with its own role). FALLBACK: the read-only `aws` CLI on
+    the /tickvault/prod/app CloudWatch group. Looks back `minutes` (SigV4 + aws
+    paths), optional `filter_pattern` (server-side CloudWatch filter on the SigV4
+    + aws paths; substring on the portal path), up to `limit` newest events.
+    Fails clearly (ok=False) if none of the three paths is configured. The AWS
+    secret/token is NEVER logged nor placed in the returned dict."""
     import subprocess
     import time as _time
 
-    # PREFERRED: reuse the operator dashboard's already-working logs endpoint.
+    # PREFERRED (operator goal): direct CloudWatch read with a SigV4-signed
+    # HTTPS request — only a read-only AWS key in the env is needed. Chosen
+    # first whenever both key parts are present (no aws CLI, no portal).
+    access_key, secret_key, _session_token = _aws_credentials()
+    if access_key and secret_key:
+        return _tool_cloudwatch_logs_via_sigv4(minutes, filter_pattern, limit)
+
+    # NEXT: reuse the operator dashboard's already-working logs endpoint.
     if _portal_url() and _portal_token():
         return _tool_cloudwatch_logs_via_portal(filter_pattern, limit)
 
@@ -1177,10 +1192,11 @@ def tool_cloudwatch_logs(
     except FileNotFoundError:
         return {
             "ok": False,
-            "error": "no log reader configured — set TICKVAULT_PORTAL_URL + "
-            "TICKVAULT_PORTAL_TOKEN to read via the existing operator dashboard "
-            "(no aws CLI / no AWS key needed), OR wire a read-only AWS credential "
-            "+ aws CLI. Neither is present in this session.",
+            "error": "no log reader configured — set AWS_ACCESS_KEY_ID + "
+            "AWS_SECRET_ACCESS_KEY (+ AWS_DEFAULT_REGION) for the direct SigV4 "
+            "path (no aws CLI, no portal), OR set TICKVAULT_PORTAL_URL + "
+            "TICKVAULT_PORTAL_TOKEN to read via the operator dashboard, OR wire "
+            "a read-only AWS credential + aws CLI. None is present in this session.",
             "log_group": group,
         }
     except subprocess.TimeoutExpired:
@@ -1190,7 +1206,8 @@ def tool_cloudwatch_logs(
             "ok": False,
             "exit_code": proc.returncode,
             "error": "aws logs call failed — most likely no read-only AWS credentials in "
-            "this environment yet. Prefer the portal path (TICKVAULT_PORTAL_URL + "
+            "this environment yet. Prefer the direct SigV4 path (AWS_ACCESS_KEY_ID + "
+            "AWS_SECRET_ACCESS_KEY) or the portal path (TICKVAULT_PORTAL_URL + "
             "TICKVAULT_PORTAL_TOKEN). stderr below.",
             "stderr": proc.stderr.strip()[:800],
             "log_group": group,
@@ -1489,13 +1506,16 @@ TOOLS: list[ToolSpec] = [
         name="cloudwatch_logs",
         description=(
             "Read recent PROD logs — fully automated, no human paste/download. "
-            "PREFERRED: reuses the existing operator-control dashboard's logs "
-            "endpoint (set TICKVAULT_PORTAL_URL + TICKVAULT_PORTAL_TOKEN — no "
-            "aws CLI, no AWS key; the portal Lambda reads the box with its own "
-            "IAM role). FALLBACK: read-only aws CLI on /tickvault/prod/app. "
-            "Args: minutes (lookback, aws path only), filter_pattern (substring "
-            "on the portal path, e.g. \"ERROR\" or \"WS-GAP-05\"), limit "
-            "(default 100). Returns a clear error if neither path is configured."
+            "PREFERRED: direct CloudWatch read via a SigV4-signed HTTPS request — "
+            "the ONLY input is a read-only AWS key in the env (AWS_ACCESS_KEY_ID + "
+            "AWS_SECRET_ACCESS_KEY [+ AWS_SESSION_TOKEN], AWS_DEFAULT_REGION); no "
+            "aws CLI, no portal, no boto3. NEXT: the operator-control dashboard's "
+            "logs endpoint (TICKVAULT_PORTAL_URL + TICKVAULT_PORTAL_TOKEN). "
+            "FALLBACK: read-only aws CLI on /tickvault/prod/app. Args: minutes "
+            "(lookback; SigV4 + aws paths), filter_pattern (CloudWatch filter on "
+            "SigV4 + aws, substring on portal, e.g. \"ERROR\" or \"WS-GAP-05\"), "
+            "limit (default 100). The AWS secret/token is NEVER logged nor "
+            "returned. Clear ok=false error if no path is configured."
         ),
         input_schema={
             "type": "object",
