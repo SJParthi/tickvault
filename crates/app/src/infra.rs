@@ -888,25 +888,7 @@ pub async fn check_and_restart_containers() -> usize {
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut total_containers: usize = 0;
-    let mut unhealthy_containers: usize = 0;
-    let mut unhealthy_names: Vec<String> = Vec::new();
-
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        total_containers = total_containers.saturating_add(1);
-        // State is the second word: "running", "exited", "restarting", etc.
-        let is_running = line.contains("running");
-        if !is_running {
-            unhealthy_containers = unhealthy_containers.saturating_add(1);
-            if let Some(name) = line.split_whitespace().next() {
-                unhealthy_names.push(name.to_string());
-            }
-        }
-    }
+    let (total_containers, unhealthy_containers, unhealthy_names) = parse_container_health(&stdout);
 
     metrics::gauge!("tv_docker_containers_total").set(total_containers as f64);
     metrics::gauge!("tv_docker_containers_healthy")
@@ -953,6 +935,68 @@ pub async fn check_and_restart_containers() -> usize {
     }
 
     unhealthy_containers
+}
+
+/// Pure parser for `docker compose ps --format "{{.Name}} {{.State}}"` output.
+/// Returns `(total, unhealthy, unhealthy_names)`. A container is "healthy" iff
+/// its line contains `running`; everything else (exited / restarting / created)
+/// counts as unhealthy. Blank lines are skipped. Pure + unit-tested — no I/O.
+#[must_use]
+pub fn parse_container_health(ps_stdout: &str) -> (usize, usize, Vec<String>) {
+    let mut total: usize = 0;
+    let mut unhealthy: usize = 0;
+    let mut unhealthy_names: Vec<String> = Vec::new();
+    for line in ps_stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        total = total.saturating_add(1);
+        // State is the second word: "running", "exited", "restarting", etc.
+        if !line.contains("running") {
+            unhealthy = unhealthy.saturating_add(1);
+            if let Some(name) = line.split_whitespace().next() {
+                unhealthy_names.push(name.to_string());
+            }
+        }
+    }
+    (total, unhealthy, unhealthy_names)
+}
+
+/// One-shot `(services_healthy, services_total)` snapshot for the boot-time
+/// `BootHealthCheck` ping. Runs `docker compose ps` once via the same format as
+/// the watchdog and reuses [`parse_container_health`]. Returns `(0, 0)` when the
+/// Docker daemon is down or the command fails — an honest "nothing healthy"
+/// (the operator wants the ping to fire with the real counts either way).
+// TEST-EXEMPT: thin docker-compose-ps shell-out; the (healthy, total) math is
+// fully covered by parse_container_health unit tests.
+pub async fn container_health_counts() -> (usize, usize) {
+    use tokio::process::Command;
+
+    if !is_docker_daemon_running().await {
+        return (0, 0);
+    }
+    let output = match Command::new("docker")
+        .args([
+            "compose",
+            "-f",
+            DOCKER_COMPOSE_PATH,
+            "ps",
+            "--format",
+            "{{.Name}} {{.State}}",
+        ])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(err) => {
+            warn!(?err, "container_health_counts: docker compose ps failed");
+            return (0, 0);
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (total, unhealthy, _names) = parse_container_health(&stdout);
+    (total.saturating_sub(unhealthy), total)
 }
 
 // ---------------------------------------------------------------------------
@@ -1161,6 +1205,41 @@ async fn wait_for_service_healthy(name: &str, host: &str, port: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_container_health_all_running() {
+        let out = "tv-questdb running\ntv-app running\n";
+        let (total, unhealthy, names) = parse_container_health(out);
+        assert_eq!((total, unhealthy), (2, 0));
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn test_parse_container_health_mixed() {
+        let out = "tv-questdb running\ntv-app exited\ntv-loki restarting\n";
+        let (total, unhealthy, names) = parse_container_health(out);
+        assert_eq!((total, unhealthy), (3, 2));
+        assert_eq!(names, vec!["tv-app".to_string(), "tv-loki".to_string()]);
+        // healthy = total - unhealthy = 1
+        assert_eq!(total.saturating_sub(unhealthy), 1);
+    }
+
+    #[test]
+    fn test_parse_container_health_empty_and_blank_lines() {
+        assert_eq!(parse_container_health(""), (0, 0, vec![]));
+        // Blank lines are skipped, not counted.
+        let (total, unhealthy, _) = parse_container_health("\n   \n\n");
+        assert_eq!((total, unhealthy), (0, 0));
+    }
+
+    #[test]
+    fn test_parse_container_health_all_down() {
+        let out = "tv-questdb exited\ntv-app created\n";
+        let (total, unhealthy, names) = parse_container_health(out);
+        assert_eq!((total, unhealthy), (2, 2));
+        assert_eq!(total.saturating_sub(unhealthy), 0); // 0/2 — honest "nothing healthy"
+        assert_eq!(names.len(), 2);
+    }
 
     #[test]
     fn test_unreachable_service_returns_false() {

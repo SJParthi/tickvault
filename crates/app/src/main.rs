@@ -1427,10 +1427,22 @@ async fn main() -> Result<()> {
         // Notification already initialized above (needed for IP verification).
         // All run concurrently. None of them block tick processing.
         let notifier = fast_notifier.clone();
+        // 2026-06-12: dedicated Arc for the once-per-boot BootHealthCheck ping
+        // (a separate clone so it doesn't contend with `notifier`'s use below).
+        let boot_health_notifier = fast_notifier.clone();
         let (_, deferred_token_manager) = tokio::join!(
             // Docker infra + QuestDB DDL
             async {
                 infra::ensure_infra_running(&config.questdb).await;
+                // Positive boot signal (audit-findings Rule 11): fire the
+                // once-per-boot BootHealthCheck with the real healthy/total
+                // container counts — fires even at 0/0 (honest "nothing
+                // healthy") so the operator always learns the boot outcome.
+                let (services_healthy, services_total) = infra::container_health_counts().await;
+                boot_health_notifier.notify(NotificationEvent::BootHealthCheck {
+                    services_healthy,
+                    services_total,
+                });
                 // Candle-engine re-architecture #T1b — drop legacy candle
                 // objects before creating Engine B's plain tables (see the
                 // slow-boot path for the full rationale).
