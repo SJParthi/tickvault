@@ -364,13 +364,8 @@ fn test_misc_event_messages() {
     });
     assert!(m.contains("4250"), "{m}");
 
-    let m = render(&NotificationEvent::LastTickAfterBoundary {
-        security_id: 987_655,
-        exchange_segment: "NSE_EQ".to_string(),
-        exchange_ts_nanos_of_day: 55_800_000_000_001,
-        nanos_past_close: 1_000_000,
-    });
-    assert!(m.contains("987655"), "{m}");
+    // RETIRED 2026-06-12: LastTickAfterBoundary deleted (redundant with the live
+    // tv_late_tick_after_boundary_total counter; wiring it = hot-path risk).
 
     let m = render(&NotificationEvent::OrphanPositionDetected {
         count: 2,

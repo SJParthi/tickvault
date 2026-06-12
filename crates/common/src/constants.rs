@@ -2528,8 +2528,10 @@ pub const BAR_FINAL_SEAL_OFFSET_SECS: u64 = 60;
 
 /// Soft anomaly threshold — if a tick arrives with `exchange_ts` more
 /// than `LATE_TICK_ANOMALY_THRESHOLD_MS` BEHIND the local wall-clock
-/// receive time, emit a `LastTickAfterBoundary` Info Telegram event.
-/// Helps operators spot Dhan-side ingestion lag or our own clock skew
+/// receive time, it is counted by `tv_late_tick_after_boundary_total`
+/// (the `LastTickAfterBoundary` Telegram variant was retired 2026-06-12 —
+/// redundant with that counter; the per-tick hot path must not carry a
+/// notifier). Helps operators spot Dhan-side ingestion lag or clock skew
 /// without halting tick acceptance.
 pub const LATE_TICK_ANOMALY_THRESHOLD_MS: u64 = 30_000;
 
