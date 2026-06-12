@@ -580,9 +580,11 @@ impl WebSocketConnection {
         // O(1) EXEMPT: end
         // Non-blocking: drop on full/closed — never stall the WS loop.
         if let Err(err) = tx.try_send(row) {
+            // %err (Display) prints only "full"/"closed" — NOT the dropped row,
+            // whose pre-redaction reason must never reach a log (security review).
             debug!(
                 connection_id = usize::from(self.connection_id),
-                ?err,
+                reason = %err,
                 "ws_event_audit channel full/closed — row dropped (log+Telegram still fired)"
             );
         }
