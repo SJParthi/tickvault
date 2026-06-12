@@ -24,6 +24,33 @@ fn mask_ip_for_notification(ip: &str) -> String {
     }
 }
 
+/// Escapes the three HTML-significant characters for Telegram's `HTML`
+/// parse mode (`crates/core/src/notification/service.rs` sends
+/// `"parse_mode": "HTML"`). External free-text fields (`reason`, `detail`,
+/// `ip_match_status`, ... sourced from Dhan REST/WS error bodies and
+/// network error strings) are interpolated into message bodies that also
+/// contain trusted `<b>`/`<code>` structural tags. Without escaping, an
+/// external string containing `<`, `>` or `&` (e.g. a TLS error
+/// `peer's certificate contained <...>`, or a literal `a < b`) makes
+/// Telegram's HTML parser return 400 Bad Request and the operator never
+/// sees the alert.
+///
+/// Order matters: `&` is escaped FIRST so the `&` characters this function
+/// introduces (`&lt;`/`&gt;`/`&amp;`) are not re-escaped. `"` is only
+/// significant inside HTML attribute values, which these plain-text
+/// messages never use, so it is intentionally left untouched.
+///
+/// Apply this at the render boundary in `to_message()` (the single place
+/// strings become HTML) — NOT at the 130+ event emit sites. Trusted,
+/// internally-constructed text (e.g. the operator-controlled
+/// `Custom { message }` variant, which may intentionally carry `<b>`
+/// formatting) is deliberately NOT routed through this helper.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// Alert severity level — determines which notification channels fire.
 ///
 /// `Critical` and `High` → Telegram + SNS SMS.
@@ -1126,7 +1153,7 @@ fn format_pool_partial_message(
     out.push_str("\nBroken feeds:\n");
     for (idx, reason) in stuck {
         let display = idx.saturating_add(1);
-        out.push_str(&format!("  Feed {display}: {reason}\n"));
+        out.push_str(&format!("  Feed {display}: {}\n", html_escape(reason)));
     }
     out.push_str(&format!(
         "\n🔄 The system will keep retrying every 5 seconds.\n   Boot path: {path}",
@@ -1158,7 +1185,7 @@ impl NotificationEvent {
             Self::AuthenticationFailed { reason } => {
                 format!(
                     "<b>Auth FAILED</b> — offline mode\n{}",
-                    redact_url_params(reason)
+                    html_escape(&redact_url_params(reason))
                 )
             }
             Self::AuthenticationTransientFailure {
@@ -1176,7 +1203,7 @@ impl NotificationEvent {
                 };
                 format!(
                     "<b>Auth retry {attempt}</b> — transient\n{reason} — retrying in {wait_str}",
-                    reason = redact_url_params(reason),
+                    reason = html_escape(&redact_url_params(reason)),
                 )
             }
             Self::PreMarketProfileCheckFailed {
@@ -1188,6 +1215,7 @@ impl NotificationEvent {
                 } else {
                     "<b>CRITICAL: Pre-market profile check FAILED — investigate before 09:15 IST</b>"
                 };
+                let reason = html_escape(reason);
                 format!(
                     "{header}\n{reason}\n\
                      Run:\n  curl -H \"access-token: $TOKEN\" https://api.dhan.co/v2/profile\n\
@@ -1195,6 +1223,7 @@ impl NotificationEvent {
                 )
             }
             Self::MidSessionProfileInvalidated { reason } => {
+                let reason = html_escape(reason);
                 format!(
                     "<b>CRITICAL: Mid-session profile INVALIDATED</b>\n{reason}\n\
                      Live WS still running — operator action required.\n\
@@ -1208,7 +1237,7 @@ impl NotificationEvent {
             Self::TokenRenewalFailed { attempts, reason } => {
                 format!(
                     "<b>Token renewal FAILED</b> (attempt {attempts})\n{}",
-                    redact_url_params(reason)
+                    html_escape(&redact_url_params(reason))
                 )
             }
             Self::WebSocketConnected {
@@ -1421,6 +1450,7 @@ impl NotificationEvent {
                 }
             }
             Self::CrossVerify1mAborted { detail } => {
+                let detail = html_escape(detail);
                 format!(
                     "\u{26a0}\u{fe0f} <b>Daily candle check did NOT run</b>\n\
                      The 3:31 PM IST check against the exchange record died \
@@ -1439,6 +1469,7 @@ impl NotificationEvent {
                 reason,
             } => {
                 // PR #790a — use scope-locked pool size (1), not Dhan cap (5).
+                let reason = html_escape(reason);
                 format!(
                     "<b>WebSocket {}/{} disconnected</b>\n{reason}",
                     connection_index.saturating_add(1),
@@ -1450,6 +1481,7 @@ impl NotificationEvent {
                 reason,
             } => {
                 // PR #790a — use scope-locked pool size (1), not Dhan cap (5).
+                let reason = html_escape(reason);
                 format!(
                     "<b>WebSocket {}/{} disconnected [off-hours, auto-reconnecting]</b>\n{reason}",
                     connection_index.saturating_add(1),
@@ -1474,7 +1506,8 @@ impl NotificationEvent {
                 // Only render the diagnostic line when we actually have
                 // context (the cold path always sets reason; tests + initial
                 // probes may not).
-                match (reason, *down_secs, *attempts) {
+                let reason = reason.as_deref().map(html_escape);
+                match (reason.as_deref(), *down_secs, *attempts) {
                     (Some(r), d, a) if d > 0 || a > 0 => {
                         format!("{header}\nReason: {r}\nDown: {d}s · Attempts: {a}")
                     }
@@ -1540,7 +1573,10 @@ impl NotificationEvent {
                 )
             }
             Self::OrderUpdateDisconnected { reason } => {
-                format!("<b>Order Update WS DISCONNECTED</b>\n{reason}")
+                format!(
+                    "<b>Order Update WS DISCONNECTED</b>\n{}",
+                    html_escape(reason)
+                )
             }
             Self::InstrumentBuildSuccess {
                 source,
@@ -1557,11 +1593,13 @@ impl NotificationEvent {
             } => {
                 // SECURITY: Do not expose internal API URL in Telegram.
                 let _ = manual_trigger_url; // kept in struct for internal use
+                let reason = html_escape(reason);
                 format!(
                     "<b>Instruments FAILED</b>\n{reason}\n\nRetry via /instruments/rebuild API endpoint"
                 )
             }
             Self::IpVerificationFailed { reason } => {
+                let reason = html_escape(reason);
                 format!(
                     "<b>IP VERIFICATION FAILED</b>\n{reason}\n\nBoot blocked — no Dhan API calls will be made."
                 )
@@ -1603,6 +1641,8 @@ impl NotificationEvent {
                 } else {
                     String::new()
                 };
+                // `ip_match_status` is a Dhan-returned string — escape it.
+                let ip_match_status = html_escape(ip_match_status);
                 format!(
                     "<b>STATIC IP BOOT CHECK FAILED</b>\n{plain_reason}{attempt_line}\n\nDhan reply: ordersAllowed={orders_allowed}, ipMatchStatus=\"{ip_match_status}\"\n\nBoot blocked — no orders will be placed until this is fixed."
                 )
@@ -1693,6 +1733,7 @@ impl NotificationEvent {
                 )
             }
             Self::BarMismatchCrossCheckFailed { reason } => {
+                let reason = html_escape(reason);
                 format!(
                     "<b>09:16:05 CROSS-CHECK HARD-FAILED — TRADING BLOCKED</b>\n\
                      Reason: {reason}\n\
@@ -1796,6 +1837,8 @@ impl NotificationEvent {
                 correlation_id,
                 reason,
             } => {
+                let correlation_id = html_escape(correlation_id);
+                let reason = html_escape(reason);
                 format!("<b>Order REJECTED</b>\nCorrelation: {correlation_id}\n{reason}")
             }
             Self::CircuitBreakerOpened {
@@ -1812,7 +1855,7 @@ impl NotificationEvent {
                 format!("<b>Rate limit EXHAUSTED</b>\nLimit: {limit_type}")
             }
             Self::RiskHalt { reason } => {
-                format!("<b>RISK HALT</b>\nTrading stopped: {reason}")
+                format!("<b>RISK HALT</b>\nTrading stopped: {}", html_escape(reason))
             }
             Self::WebSocketReconnectionExhausted {
                 connection_index,
@@ -1875,42 +1918,55 @@ impl NotificationEvent {
                 underlying,
                 attempts_made,
                 reason,
-            } => format!(
-                "<b>Option-chain fetch FAILED</b>\n\
-                 underlying: <code>{underlying}</code>\n\
-                 attempts: <code>{attempts_made}</code>\n\
-                 reason: <code>{reason}</code>\n\
-                 Strategy reading RAM cache fallback. \
-                 Investigate Dhan-side if sustained > 3min."
-            ),
+            } => {
+                let underlying = html_escape(underlying);
+                let reason = html_escape(reason);
+                format!(
+                    "<b>Option-chain fetch FAILED</b>\n\
+                     underlying: <code>{underlying}</code>\n\
+                     attempts: <code>{attempts_made}</code>\n\
+                     reason: <code>{reason}</code>\n\
+                     Strategy reading RAM cache fallback. \
+                     Investigate Dhan-side if sustained > 3min."
+                )
+            }
             Self::OptionChainCacheFallback {
                 underlying,
                 cache_age_secs,
-            } => format!(
-                "<b>Option-chain cache fallback</b>\n\
-                 underlying: <code>{underlying}</code>\n\
-                 cache age: <code>{cache_age_secs}s</code>\n\
-                 (informational — strategy still trading on cached chain)"
-            ),
+            } => {
+                let underlying = html_escape(underlying);
+                format!(
+                    "<b>Option-chain cache fallback</b>\n\
+                     underlying: <code>{underlying}</code>\n\
+                     cache age: <code>{cache_age_secs}s</code>\n\
+                     (informational — strategy still trading on cached chain)"
+                )
+            }
             Self::OptionChainStaleHalt {
                 underlying,
                 cache_age_secs,
                 threshold_secs,
-            } => format!(
-                "<b>🆘 Option-chain STRATEGY HALTED</b>\n\
-                 underlying: <code>{underlying}</code>\n\
-                 cache age: <code>{cache_age_secs}s</code>\n\
-                 threshold: <code>{threshold_secs}s</code>\n\
-                 NEW entries blocked. Existing positions held. \
-                 Operator action: investigate Dhan-side; \
-                 decide go/no-go per kill-switch runbook."
-            ),
-            Self::OptionChainConfigInvalid { reason } => format!(
-                "<b>🆘 Option-chain CONFIG INVALID — BOOT HALTED</b>\n\
-                 {reason}\n\
-                 Fix `[option_chain_minute_snapshot]` in config/base.toml \
-                 + restart."
-            ),
+            } => {
+                let underlying = html_escape(underlying);
+                format!(
+                    "<b>🆘 Option-chain STRATEGY HALTED</b>\n\
+                     underlying: <code>{underlying}</code>\n\
+                     cache age: <code>{cache_age_secs}s</code>\n\
+                     threshold: <code>{threshold_secs}s</code>\n\
+                     NEW entries blocked. Existing positions held. \
+                     Operator action: investigate Dhan-side; \
+                     decide go/no-go per kill-switch runbook."
+                )
+            }
+            Self::OptionChainConfigInvalid { reason } => {
+                let reason = html_escape(reason);
+                format!(
+                    "<b>🆘 Option-chain CONFIG INVALID — BOOT HALTED</b>\n\
+                     {reason}\n\
+                     Fix `[option_chain_minute_snapshot]` in config/base.toml \
+                     + restart."
+                )
+            }
         }
     }
 
@@ -3742,6 +3798,164 @@ mod tests {
             !stripped.contains('>'),
             "Telegram HTML mode rejects unescaped '>' — body was: {body}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // html_escape — external-text Telegram HTML hardening (named follow-up
+    // from #1089 batch-3 security review). Telegram sends parse_mode=HTML;
+    // an external `reason`/`detail`/`ip_match_status` containing `<`/`>`/`&`
+    // would 400-Bad-Request the alert so the operator never sees it. These
+    // tests inject a hostile string into each fixed arm and assert it is
+    // escaped (no raw external bracket) while the trusted `<b>` structural
+    // tag survives.
+    // -----------------------------------------------------------------------
+
+    /// Hostile external string used across the escaping tests.
+    const HOSTILE: &str = "<script>alert(1)</script> a < b & c > d";
+
+    #[test]
+    fn test_html_escape_amp_first_no_double_escape() {
+        // `&` must be escaped before `<`/`>` so the `&` we introduce in
+        // `&lt;`/`&gt;` is not re-escaped into `&amp;lt;`.
+        assert_eq!(super::html_escape("<"), "&lt;");
+        assert_eq!(super::html_escape(">"), "&gt;");
+        assert_eq!(super::html_escape("&"), "&amp;");
+        assert_eq!(super::html_escape("a < b"), "a &lt; b");
+        assert_eq!(super::html_escape("x & y"), "x &amp; y");
+        // The crux: a literal `<` becomes exactly `&lt;`, NOT `&amp;lt;`.
+        assert_eq!(super::html_escape("<b>"), "&lt;b&gt;");
+        assert!(!super::html_escape("<b>").contains("&amp;lt;"));
+    }
+
+    #[test]
+    fn test_html_escape_plain_passthrough_and_empty() {
+        // Common case: no metacharacters → byte-identical output.
+        assert_eq!(super::html_escape(""), "");
+        assert_eq!(
+            super::html_escape("Connection reset, retrying in 200ms"),
+            "Connection reset, retrying in 200ms"
+        );
+        // UTF-8 multi-byte is untouched.
+        assert_eq!(super::html_escape("score ≥ 0.95"), "score ≥ 0.95");
+    }
+
+    /// Asserts a rendered body escaped the injected hostile string: the raw
+    /// `<script>` / external `<`/`>` must be absent, the escaped entities
+    /// present, and the trusted `<b>` structural tag preserved.
+    fn assert_external_text_escaped(body: &str) {
+        assert!(
+            !body.contains("<script>"),
+            "raw external <script> tag leaked into HTML body: {body}"
+        );
+        assert!(
+            body.contains("&lt;script&gt;"),
+            "external '<'/'>' not escaped to entities: {body}"
+        );
+        assert!(
+            body.contains("&amp; c"),
+            "external '&' not escaped to &amp;: {body}"
+        );
+        assert!(
+            body.contains("<b>"),
+            "trusted <b> structural tag must NOT be escaped: {body}"
+        );
+    }
+
+    #[test]
+    fn test_websocket_disconnected_escapes_external_reason() {
+        let ev = NotificationEvent::WebSocketDisconnected {
+            connection_index: 0,
+            reason: HOSTILE.to_string(),
+        };
+        assert_external_text_escaped(&ev.to_message());
+    }
+
+    #[test]
+    fn test_websocket_disconnected_offhours_escapes_external_reason() {
+        let ev = NotificationEvent::WebSocketDisconnectedOffHours {
+            connection_index: 0,
+            reason: HOSTILE.to_string(),
+        };
+        assert_external_text_escaped(&ev.to_message());
+    }
+
+    #[test]
+    fn test_order_update_disconnected_escapes_external_reason() {
+        let ev = NotificationEvent::OrderUpdateDisconnected {
+            reason: HOSTILE.to_string(),
+        };
+        assert_external_text_escaped(&ev.to_message());
+    }
+
+    #[test]
+    fn test_order_rejected_escapes_external_reason_and_correlation() {
+        let ev = NotificationEvent::OrderRejected {
+            correlation_id: "id<x>&y".to_string(),
+            reason: HOSTILE.to_string(),
+        };
+        let body = ev.to_message();
+        assert_external_text_escaped(&body);
+        assert!(
+            !body.contains("id<x>"),
+            "correlation_id not escaped: {body}"
+        );
+        assert!(
+            body.contains("id&lt;x&gt;&amp;y"),
+            "correlation_id escaping wrong: {body}"
+        );
+    }
+
+    #[test]
+    fn test_risk_halt_escapes_external_reason() {
+        let ev = NotificationEvent::RiskHalt {
+            reason: HOSTILE.to_string(),
+        };
+        assert_external_text_escaped(&ev.to_message());
+    }
+
+    #[test]
+    fn test_authentication_failed_escapes_external_reason() {
+        let ev = NotificationEvent::AuthenticationFailed {
+            reason: HOSTILE.to_string(),
+        };
+        assert_external_text_escaped(&ev.to_message());
+    }
+
+    #[test]
+    fn test_mid_session_profile_invalidated_escapes_external_reason() {
+        let ev = NotificationEvent::MidSessionProfileInvalidated {
+            reason: HOSTILE.to_string(),
+        };
+        assert_external_text_escaped(&ev.to_message());
+    }
+
+    #[test]
+    fn test_option_chain_fetch_failed_escapes_external_reason() {
+        let ev = NotificationEvent::OptionChainFetchFailed {
+            underlying: "NIFTY".to_string(),
+            attempts_made: 2,
+            reason: HOSTILE.to_string(),
+        };
+        assert_external_text_escaped(&ev.to_message());
+    }
+
+    #[test]
+    fn test_cross_verify_1m_aborted_escapes_external_detail() {
+        let ev = NotificationEvent::CrossVerify1mAborted {
+            detail: HOSTILE.to_string(),
+        };
+        assert_external_text_escaped(&ev.to_message());
+    }
+
+    #[test]
+    fn test_static_ip_boot_check_failed_escapes_ip_match_status() {
+        let ev = NotificationEvent::StaticIpBootCheckFailed {
+            reason: "match_status_not_ok".to_string(),
+            orders_allowed: false,
+            ip_match_status: HOSTILE.to_string(),
+            attempts_made: 1,
+        };
+        assert_external_text_escaped(&ev.to_message());
     }
 
     // -----------------------------------------------------------------------
