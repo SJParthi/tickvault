@@ -336,10 +336,8 @@ fn test_oms_and_questdb_event_messages() {
     });
     assert!(m.contains("LIMIT-DAILY-84"), "{m}");
 
-    let m = render(&NotificationEvent::TokenRenewalDeadlineMissed {
-        deadline_hour_ist: 23,
-    });
-    assert!(m.contains("23"), "{m}");
+    // RETIRED 2026-06-12: TokenRenewalDeadlineMissed variant deleted (redundant
+    // with the live TokenRenewalFailed Critical path).
 
     let m = render(&NotificationEvent::QuestDbDisconnected {
         writer: "WRT-TICK-85".to_string(),
