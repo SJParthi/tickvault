@@ -177,7 +177,13 @@ resource "aws_iam_role_policy" "tv_instance" {
       {
         Effect = "Allow"
         Action = [
+          # CreateLogGroup + DescribeLogStreams added 2026-06-12: the agent
+          # needs them to (re)create the /tickvault/prod/app group + stream and
+          # to verify existing streams; without them PutLogEvents can be denied,
+          # leaving the log group empty (the symptom this change fixes).
+          "logs:CreateLogGroup",
           "logs:CreateLogStream",
+          "logs:DescribeLogStreams",
           "logs:PutLogEvents",
           "cloudwatch:PutMetricData",
           # The amazon-cloudwatch-agent calls ec2:DescribeTags in `-m ec2` mode to
