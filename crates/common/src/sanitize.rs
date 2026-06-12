@@ -364,9 +364,11 @@ fn redact_json_string_field(input: &str, key: &str) -> String {
 
 /// Redacts URL query parameters and known credential patterns from a string.
 ///
-/// Replaces query parameters in URLs (`?key=val&...`) with `?[REDACTED]`.
-/// Also catches standalone `dhanClientId=`, `pin=`, `totp=` patterns
-/// outside of URLs.
+/// Replaces query parameters in URLs (`?key=val&...`) with `?[REDACTED]` for
+/// every scheme in [`REDACT_URL_SCHEMES`] (http/https AND ws/wss — the live
+/// feed URL is `wss://`). Also catches standalone credential params
+/// (`token=`, `clientId=`, `dhanClientId=`, `pin=`, `totp=`, `authType=`)
+/// outside of URLs as defense-in-depth.
 ///
 /// # Performance
 ///
@@ -382,6 +384,12 @@ fn redact_json_string_field(input: &str, key: &str) -> String {
 /// assert!(!safe.contains("123"));
 /// assert!(!safe.contains("456"));
 /// assert!(safe.contains("?[REDACTED]"));
+///
+/// // wss:// feed URL with the 24h JWT must also be fully redacted.
+/// let ws = "TLS error: wss://api-feed.dhan.co?version=2&token=eyJabc&clientId=99&authType=2";
+/// let safe_ws = redact_url_params(ws);
+/// assert!(!safe_ws.contains("eyJabc"));
+/// assert!(!safe_ws.contains("clientId=99"));
 /// ```
 pub fn redact_url_params(input: &str) -> String {
     if input.is_empty() {
@@ -389,15 +397,27 @@ pub fn redact_url_params(input: &str) -> String {
     }
 
     let mut result = redact_urls(input);
+    // Standalone (non-URL) credential params — defense-in-depth for log lines
+    // that print a bare `token=...` without a recognized URL scheme.
+    result = redact_param_value(&result, "token=");
+    result = redact_param_value(&result, "clientId=");
+    result = redact_param_value(&result, "authType=");
     result = redact_param_value(&result, "dhanClientId=");
     result = redact_param_value(&result, "pin=");
     result = redact_param_value(&result, "totp=");
     result
 }
 
+/// Every URL scheme whose query string may carry a secret. `wss://`/`ws://`
+/// are CRITICAL: the Dhan live-feed URL is
+/// `wss://api-feed.dhan.co?version=2&token=<JWT>&clientId=<ID>&authType=2`,
+/// and a TLS/handshake error string embeds that full URL — without `wss://`
+/// here, the 24h JWT would pass through unredacted into CloudWatch/app.log.
+const REDACT_URL_SCHEMES: [&str; 4] = ["https://", "http://", "wss://", "ws://"];
+
 /// Replaces query parameters in URLs with `[REDACTED]`.
 ///
-/// Scans for `https://` or `http://` prefixes, finds the `?` delimiter,
+/// Scans for any scheme in [`REDACT_URL_SCHEMES`], finds the `?` delimiter,
 /// and replaces everything from `?` to the next whitespace, `)`, or
 /// end-of-string with `?[REDACTED]`.
 ///
@@ -407,12 +427,14 @@ fn redact_urls(input: &str) -> String {
     let mut remaining = input;
 
     while !remaining.is_empty() {
-        // Find the earliest URL prefix
-        let url_start = match (remaining.find("http://"), remaining.find("https://")) {
-            (Some(h), Some(hs)) => h.min(hs),
-            (Some(h), None) => h,
-            (None, Some(hs)) => hs,
-            (None, None) => {
+        // Find the earliest URL prefix across ALL secret-bearing schemes.
+        let url_start = match REDACT_URL_SCHEMES
+            .iter()
+            .filter_map(|scheme| remaining.find(scheme))
+            .min()
+        {
+            Some(pos) => pos,
+            None => {
                 result.push_str(remaining);
                 break;
             }
@@ -487,6 +509,66 @@ mod tests {
     #[test]
     fn test_empty_string() {
         assert_eq!(redact_url_params(""), "");
+    }
+
+    /// Regression: 2026-06-12 — `redact_urls` only matched `http(s)://`, so a
+    /// TLS/handshake error embedding the live-feed `wss://...?token=<JWT>` URL
+    /// leaked the 24h Dhan JWT verbatim into CloudWatch/app.log via the new WS
+    /// disconnect/reconnect tracing logs. Both the scheme gap AND the missing
+    /// `token=`/`clientId=` param fallbacks are covered here.
+    #[test]
+    fn test_redact_url_params_redacts_wss_feed_url_with_jwt() {
+        let jwt = fake_jwt();
+        let raw = format!(
+            "Tls(HandshakeFailure) for wss://api-feed.dhan.co?version=2&token={jwt}&clientId=1106656882&authType=2"
+        );
+        let safe = redact_url_params(&raw);
+        // The whole JWT must be gone.
+        assert!(!safe.contains(&jwt), "JWT leaked: {safe}");
+        // No 20-char window of the JWT survives.
+        let jwt_bytes = jwt.as_bytes();
+        for window in jwt_bytes.windows(20) {
+            let frag = std::str::from_utf8(window).unwrap();
+            assert!(
+                !safe.contains(frag),
+                "JWT fragment leaked: {frag} in {safe}"
+            );
+        }
+        // The client id value must be gone too.
+        assert!(!safe.contains("1106656882"), "clientId leaked: {safe}");
+        // And the redaction marker must be present (the query string was hit).
+        assert!(safe.contains("[REDACTED]"), "no redaction marker: {safe}");
+    }
+
+    /// `ws://` (non-TLS) scheme is also covered.
+    #[test]
+    fn test_redact_url_params_redacts_plain_ws_scheme() {
+        let safe = redact_url_params("dial ws://host?token=eyJsecret&authType=2 failed");
+        assert!(!safe.contains("eyJsecret"), "token leaked: {safe}");
+        assert!(safe.contains("?[REDACTED]"), "query not redacted: {safe}");
+    }
+
+    /// Standalone (non-URL) `token=` / `clientId=` are redacted by the param
+    /// fallback even with no recognized URL scheme present.
+    #[test]
+    fn test_redact_url_params_redacts_standalone_token_and_client_id() {
+        let safe = redact_url_params("auth failed token=eyJraw clientId=42 done");
+        assert!(!safe.contains("eyJraw"), "standalone token leaked: {safe}");
+        assert!(
+            !safe.contains("clientId=42"),
+            "standalone clientId leaked: {safe}"
+        );
+    }
+
+    /// Existing http(s):// redaction must STILL work (no regression).
+    #[test]
+    fn test_redact_url_params_still_redacts_https() {
+        let safe = redact_url_params(
+            "error for url (https://auth.dhan.co/app/gen?dhanClientId=123&pin=456)",
+        );
+        assert!(!safe.contains("123"));
+        assert!(!safe.contains("456"));
+        assert!(safe.contains("?[REDACTED]"));
     }
 
     // -----------------------------------------------------------------

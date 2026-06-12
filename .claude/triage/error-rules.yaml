@@ -898,6 +898,21 @@ rules:
       Order audit write failure. SEBI 5-year retention — ALWAYS
       escalate immediately.
 
+  - name: audit-ws-01-event-write-failed-escalate
+    match:
+      code: AUDIT-WS-01
+    action: escalate
+    runbook_path: .claude/rules/project/ws-event-audit-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      ws_event_audit row write failed — a WebSocket lifecycle event
+      (connect/disconnect/reconnect/sleep) could not be persisted to the
+      forensic table. Best-effort (never gates WS recovery); the events still
+      reached CloudWatch logs + Telegram, so escalate so the operator knows
+      the forensic recorder is degraded (likely QuestDB ILP down — cross-check
+      BOOT-01/02).
+
   - name: storage-gap-03-audit-write-coalesce-escalate
     match:
       code: STORAGE-GAP-03

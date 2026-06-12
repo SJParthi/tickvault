@@ -242,6 +242,11 @@ pub enum ErrorCode {
     Audit05SelftestWriteFailed,
     /// AUDIT-06: order audit row write failed.
     Audit06OrderWriteFailed,
+    /// AUDIT-WS-01: `ws_event_audit` row write failed — a WebSocket lifecycle
+    /// event (connect/disconnect/reconnect/sleep) could not be persisted to the
+    /// forensic table. Supersedes the never-shipped AUDIT-03 ws_reconnect concept
+    /// (this table covers ALL 6 WS event kinds, not just reconnect).
+    AuditWs01EventWriteFailed,
     /// STORAGE-GAP-03: audit-table write failure (any table).
     StorageGap03AuditWriteFailed,
     /// STORAGE-GAP-04: S3 archive failure (partition upload).
@@ -653,6 +658,7 @@ impl ErrorCode {
             Self::Audit04BootWriteFailed => "AUDIT-04",
             Self::Audit05SelftestWriteFailed => "AUDIT-05",
             Self::Audit06OrderWriteFailed => "AUDIT-06",
+            Self::AuditWs01EventWriteFailed => "AUDIT-WS-01",
             Self::StorageGap03AuditWriteFailed => "STORAGE-GAP-03",
             Self::StorageGap04S3ArchiveFailed => "STORAGE-GAP-04",
             // Wave 3 — Telegram dispatcher (Item 11)
@@ -850,6 +856,7 @@ impl ErrorCode {
             | Self::Audit04BootWriteFailed
             | Self::Audit05SelftestWriteFailed
             | Self::Audit06OrderWriteFailed
+            | Self::AuditWs01EventWriteFailed
             | Self::StorageGap03AuditWriteFailed
             | Self::StorageGap04S3ArchiveFailed
             | Self::Telegram01Dropped
@@ -929,6 +936,9 @@ impl ErrorCode {
             | Self::Audit06OrderWriteFailed
             | Self::StorageGap03AuditWriteFailed
             | Self::StorageGap04S3ArchiveFailed => ".claude/rules/project/wave-2-error-codes.md",
+            Self::AuditWs01EventWriteFailed => {
+                ".claude/rules/project/ws-event-audit-error-codes.md"
+            }
             Self::Boot03ClockSkewExceeded => ".claude/rules/project/wave-2-c-error-codes.md",
             Self::Telegram01Dropped | Self::Telegram02CoalescerStateInconsistency => {
                 ".claude/rules/project/wave-3-error-codes.md"
@@ -1110,6 +1120,7 @@ impl ErrorCode {
             Self::Audit04BootWriteFailed,
             Self::Audit05SelftestWriteFailed,
             Self::Audit06OrderWriteFailed,
+            Self::AuditWs01EventWriteFailed,
             Self::StorageGap03AuditWriteFailed,
             Self::StorageGap04S3ArchiveFailed,
             Self::Telegram01Dropped,
@@ -1421,7 +1432,10 @@ mod tests {
         // 105 -> 106 for TICK-CONSERVE-01 (daily WAL-vs-DB conservation audit).
         // 2026-06-10 (DHAN-REST-400): bumped 106 -> 107 for REST-CANARY-01
         // (scheduled REST-health probe failed).
-        assert_eq!(ErrorCode::all().len(), 107);
+        // 2026-06-12 (WS lifecycle audit table): bumped 107 -> 108 for
+        // AUDIT-WS-01 (ws_event_audit row write failed — covers all 6 WS
+        // lifecycle event kinds, future-proof for 5+5+5+1 connections).
+        assert_eq!(ErrorCode::all().len(), 108);
     }
 
     #[test]

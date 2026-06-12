@@ -166,6 +166,7 @@ impl WebSocketConnectionPool {
             feed_mode,
             notifier,
             None,
+            None,
         )
     }
 
@@ -186,6 +187,7 @@ impl WebSocketConnectionPool {
         feed_mode: FeedMode,
         notifier: Option<std::sync::Arc<crate::notification::NotificationService>>,
         wal_spill: Option<Arc<WsFrameSpill>>,
+        ws_audit_tx: Option<crate::websocket::connection::WsEventAuditSender>,
     ) -> Result<Self, WebSocketError> {
         let total = instruments.len();
 
@@ -242,6 +244,17 @@ impl WebSocketConnectionPool {
                 );
                 if let Some(spill) = wal_spill.clone() {
                     conn = conn.with_wal_spill(spill);
+                }
+                // 2026-06-12: attach the WS-event audit channel + this pool's
+                // size so every connection stamps forensic rows with its
+                // (ws_type=MainFeed, connection_index) — future-proof for the
+                // 5-main-feed scenario (pool_size reflects num_connections).
+                if let Some(tx) = ws_audit_tx.clone() {
+                    conn = conn.with_ws_audit(
+                        tx,
+                        num_connections as i64,
+                        tickvault_common::ws_event_types::WsType::MainFeed,
+                    );
                 }
                 Arc::new(conn)
             })
