@@ -1117,8 +1117,31 @@ async fn main() -> Result<()> {
         }
 
         // --- Load instruments (sub-1ms from rkyv cache during market hours) ---
-        let (subscription_plan, fresh_universe, _needs_persist) =
-            load_instruments(&config, is_trading, trading_calendar.as_ref()).await?;
+        let (subscription_plan, fresh_universe, _needs_persist) = match load_instruments(
+            &config,
+            is_trading,
+            trading_calendar.as_ref(),
+        )
+        .await
+        {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                // Observability slice #2: emit the symmetric failure alert.
+                // The bare `?` here previously exited boot with no operator
+                // signal (only success was announced). Fail-closed boot-halt
+                // is preserved — we return Err AFTER alerting. NOT a duplicate
+                // of INSTR-FETCH-* (those infinite-retry, never reach this Err).
+                error!(error = %err, "instrument load failed at boot — alerting operator and halting");
+                fast_notifier.notify(NotificationEvent::InstrumentBuildFailed {
+                    reason: err.to_string(),
+                    manual_trigger_url: format!(
+                        "http://{}:{}/api/instruments/rebuild",
+                        config.api.host, config.api.port
+                    ),
+                });
+                return Err(err);
+            }
+        };
 
         // Audit finding #6 (2026-04-24): emit InstrumentBuildSuccess when
         // instruments load successfully. Previously only the FAILURE path
@@ -2661,8 +2684,30 @@ async fn main() -> Result<()> {
     // FreshBuild persists internally (inside load_or_build_instruments).
     // CachedPlan loads from rkyv cache and returns universe for persistence here.
     // To avoid DOUBLE persistence on FreshBuild, only persist if CachedPlan.
-    let (subscription_plan, slow_boot_universe, needs_instrument_persist) =
-        load_instruments(&config, is_trading, trading_calendar.as_ref()).await?;
+    let (subscription_plan, slow_boot_universe, needs_instrument_persist) = match load_instruments(
+        &config,
+        is_trading,
+        trading_calendar.as_ref(),
+    )
+    .await
+    {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            // Observability slice #2: emit the symmetric failure alert.
+            // Mirrors the fast-boot site — the bare `?` previously halted
+            // boot with no operator Telegram. Fail-closed halt preserved;
+            // NOT a duplicate of INSTR-FETCH-* (those infinite-retry).
+            error!(error = %err, "instrument load failed at boot — alerting operator and halting");
+            notifier.notify(NotificationEvent::InstrumentBuildFailed {
+                reason: err.to_string(),
+                manual_trigger_url: format!(
+                    "http://{}:{}/api/instruments/rebuild",
+                    config.api.host, config.api.port
+                ),
+            });
+            return Err(err);
+        }
+    };
 
     // Audit finding #6 (2026-04-24): emit InstrumentBuildSuccess when
     // instruments load successfully on the standard-boot path. Mirrors
