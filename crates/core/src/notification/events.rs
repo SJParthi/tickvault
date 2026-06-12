@@ -918,30 +918,15 @@ pub enum NotificationEvent {
     /// Custom alert from any component.
     Custom { message: String },
 
-    /// Phase 0 Item 12 — Info-severity Telegram fired when a tick arrives
-    /// with an exchange_timestamp at or after `MARKET_CLOSE_IST_NANOS`
-    /// (15:30:00.000 IST). This SHOULD be zero — Dhan's session ends at
-    /// 15:30:00.000 exclusive — but if it happens, the operator wants
-    /// to know so they can correlate against Dhan-side ingestion lag
-    /// or our own clock skew. Edge-triggered: fires at most once per
-    /// trading day per `(security_id, exchange_segment)` to avoid spam
-    /// if Dhan ever ships a 5-minute post-close burst.
-    ///
-    /// Coalesces with the 60s Telegram bucket per
-    /// `.claude/rules/project/wave-3-error-codes.md::TELEGRAM-01`.
-    LastTickAfterBoundary {
-        /// Dhan SecurityId (string form for Telegram readability).
-        security_id: u32,
-        /// Exchange segment (NSE_EQ / NSE_FNO / IDX_I / ...).
-        exchange_segment: String,
-        /// The offending exchange timestamp, IST nanoseconds-of-day.
-        exchange_ts_nanos_of_day: i64,
-        /// Number of nanoseconds past `MARKET_CLOSE_IST_NANOS`. Always
-        /// positive; > 0 by definition (the variant only fires when
-        /// `exchange_ts >= MARKET_CLOSE_IST_NANOS`).
-        nanos_past_close: i64,
-    },
-
+    // RETIRED 2026-06-12: LastTickAfterBoundary deleted — it was defined but
+    // NEVER emitted (0 production sites). The post-close-tick anomaly it
+    // describes is ALREADY tracked by the `tv_late_tick_after_boundary_total`
+    // counter in tick_processor.rs (ratchet-tested), which increments on every
+    // tick stamped >= 15:30:00 IST. Wiring the Telegram form would require
+    // threading a NotificationService into the per-tick HOT PATH
+    // (`run_tick_processor` has no notifier) for an Info-severity event that is
+    // already counted — a hot-path risk for marginal value. The correct,
+    // hot-path-safe alert is a CloudWatch alarm on the existing counter.
     /// Option-chain minute-snapshot pipeline (PR #4a 2026-05-16) —
     /// first failure of a scheduled slot per minute. Edge-triggered:
     /// fires ONCE per `(underlying, minute)` to prevent storms when
@@ -1947,20 +1932,6 @@ impl NotificationEvent {
                 )
             }
             Self::Custom { message } => message.clone(),
-            Self::LastTickAfterBoundary {
-                security_id,
-                exchange_segment,
-                exchange_ts_nanos_of_day,
-                nanos_past_close,
-            } => format!(
-                "<b>Tick arrived after 15:30 close</b>\n\
-                 security_id: <code>{security_id}</code>\n\
-                 segment: <code>{exchange_segment}</code>\n\
-                 exchange_ts_nanos_of_day: <code>{exchange_ts_nanos_of_day}</code>\n\
-                 nanos past close: <code>{nanos_past_close}</code>\n\
-                 (informational — should be zero; correlates Dhan-side \
-                 ingestion lag or local clock skew)"
-            ),
             Self::OptionChainFetchFailed {
                 underlying,
                 attempts_made,
@@ -2096,7 +2067,6 @@ impl NotificationEvent {
             Self::RealtimeGuaranteeDegraded { .. } => "RealtimeGuaranteeDegraded",
             Self::RealtimeGuaranteeCritical { .. } => "RealtimeGuaranteeCritical",
             Self::Custom { .. } => "Custom",
-            Self::LastTickAfterBoundary { .. } => "LastTickAfterBoundary",
             Self::OptionChainFetchFailed { .. } => "OptionChainFetchFailed",
             Self::OptionChainCacheFallback { .. } => "OptionChainCacheFallback",
             Self::OptionChainStaleHalt { .. } => "OptionChainStaleHalt",
@@ -2242,7 +2212,6 @@ impl NotificationEvent {
             Self::BarMismatchCrossCheckFailed { .. } => Severity::Critical,
             Self::StartupComplete { .. } => Severity::Info,
             Self::ShutdownComplete => Severity::Info,
-            Self::LastTickAfterBoundary { .. } => Severity::Info,
             Self::OptionChainFetchFailed { .. } => Severity::High,
             Self::OptionChainCacheFallback { .. } => Severity::Medium,
             Self::OptionChainStaleHalt { .. } => Severity::Critical,
