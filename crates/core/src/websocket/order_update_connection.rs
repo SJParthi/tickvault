@@ -70,6 +70,9 @@ pub async fn run_order_update_connection(
     authenticated_signal: Option<Arc<tokio::sync::Notify>>,
     authenticated_latch: Option<Arc<std::sync::atomic::AtomicBool>>,
     notifier: Option<Arc<crate::notification::NotificationService>>,
+    ws_audit_tx: Option<
+        tokio::sync::mpsc::Sender<tickvault_common::ws_event_types::WsEventAuditRow>,
+    >,
 ) {
     let mut consecutive_failures: u32 = 0;
     let m_reconnections = metrics::counter!("tv_order_update_reconnections_total");
@@ -106,6 +109,7 @@ pub async fn run_order_update_connection(
             authenticated_latch.as_ref(),
             notifier.as_ref(),
             failures_before_attempt,
+            ws_audit_tx.as_ref(),
         )
         .await
         {
@@ -113,11 +117,53 @@ pub async fn run_order_update_connection(
                 // Clean disconnect — reset backoff and reconnect.
                 consecutive_failures = 0;
                 info!("order update WebSocket disconnected cleanly — reconnecting");
+                // 2026-06-12 (hostile-review fix): a clean server-initiated close
+                // (the documented Dhan idle-RST case) returns Ok(()) — it is STILL
+                // a disconnect and MUST be tracked, else a clean disconnect/reconnect
+                // cycle is invisible in ws_event_audit. Kind mirrors in-market vs
+                // off-hours; no transport error → source "clean close".
+                let ou_clean_kind = if is_within_market_hours(&calendar) {
+                    tickvault_common::ws_event_types::WsEventKind::Disconnected
+                } else {
+                    tickvault_common::ws_event_types::WsEventKind::DisconnectedOffHours
+                };
+                emit_order_update_ws_audit(
+                    ws_audit_tx.as_ref(),
+                    ou_clean_kind,
+                    "clean close",
+                    "order-update connection closed cleanly (server close / stream end)",
+                    0,
+                    0,
+                );
             }
             Err(err) => {
                 let is_timeout = matches!(err, OrderUpdateConnectionError::ReadTimeout);
                 let within_hours = is_within_market_hours(&calendar);
                 let tentative_failures = consecutive_failures.saturating_add(1);
+
+                // 2026-06-12: forensic disconnect row for EVERY order-update
+                // disconnect/error (kind mirrors in-market vs off-hours, like
+                // the main-feed choke point). No Dhan disconnect-code surface
+                // here → dhan_code None; source from the transport-error string.
+                // O(1) EXEMPT: begin — COLD PATH, once per disconnect cycle of
+                // the order-update feed, never per order message.
+                let ou_reason = err.to_string();
+                let ou_kind = if within_hours {
+                    tickvault_common::ws_event_types::WsEventKind::Disconnected
+                } else {
+                    tickvault_common::ws_event_types::WsEventKind::DisconnectedOffHours
+                };
+                let ou_source =
+                    tickvault_common::disconnect_cause::classify_disconnect_cause(&ou_reason, None)
+                        .label();
+                emit_order_update_ws_audit(
+                    ws_audit_tx.as_ref(),
+                    ou_kind,
+                    ou_source,
+                    &ou_reason,
+                    0,
+                    tentative_failures,
+                );
 
                 match decide_reconnect_action(is_timeout, within_hours, tentative_failures) {
                     ReconnectAction::ResetAndReconnect => {
@@ -145,6 +191,7 @@ pub async fn run_order_update_connection(
                             &calendar,
                             consecutive_failures,
                             notifier.as_ref(),
+                            ws_audit_tx.as_ref(),
                         )
                         .await;
                         // Reset attempt counter so the post-sleep attempt
@@ -188,6 +235,60 @@ pub async fn run_order_update_connection(
 // Internal
 // ---------------------------------------------------------------------------
 
+/// Stamp one order-update WebSocket lifecycle event to the `ws_event_audit`
+/// table (if the audit channel is attached).
+///
+/// COLD PATH — fires at most once per disconnect/reconnect/sleep, NEVER per
+/// order message. `WsType::OrderUpdate`, single connection (`connection_index`
+/// 0, `pool_size` 1). No Dhan disconnect-code surface on this feed → `dhan_code`
+/// is the none-sentinel. Non-blocking `try_send`: drop on full/closed so the
+/// order-confirmation read loop is never stalled by the forensic side-record.
+fn emit_order_update_ws_audit(
+    ws_audit_tx: Option<
+        &tokio::sync::mpsc::Sender<tickvault_common::ws_event_types::WsEventAuditRow>,
+    >,
+    event_kind: tickvault_common::ws_event_types::WsEventKind,
+    source: &str,
+    reason: &str,
+    down_secs: u64,
+    attempts: u32,
+) {
+    let Some(tx) = ws_audit_tx else {
+        return;
+    };
+    // O(1) EXEMPT: begin — COLD PATH, once per order-update lifecycle event,
+    // never per order message; the owned-String row fields are off the hot path.
+    let now_ist_nanos = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or_default()
+        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+    let nanos_per_day: i64 = 86_400 * 1_000_000_000;
+    let trading_date_ist_nanos = now_ist_nanos - now_ist_nanos.rem_euclid(nanos_per_day);
+    let row = tickvault_common::ws_event_types::WsEventAuditRow {
+        event_ts_ist_nanos: now_ist_nanos,
+        trading_date_ist_nanos,
+        ws_type: tickvault_common::ws_event_types::WsType::OrderUpdate,
+        connection_index: 0,
+        pool_size: 1,
+        event_kind,
+        source: source.to_string(),
+        reason: reason.to_string(),
+        dhan_code: tickvault_common::ws_event_types::WS_EVENT_NO_DHAN_CODE,
+        down_secs: i64::try_from(down_secs).unwrap_or(i64::MAX),
+        attempts: i64::from(attempts),
+        market_hours: tickvault_common::market_hours::is_within_market_hours_ist(),
+    };
+    // O(1) EXEMPT: end
+    if let Err(err) = tx.try_send(row) {
+        // %err (Display) prints only "full"/"closed" — NOT the dropped row,
+        // whose pre-redaction reason must never reach a log (security review).
+        debug!(
+            reason = %err,
+            "order-update ws_event_audit channel full/closed — row dropped (log+Telegram still fired)"
+        );
+    }
+}
+
 /// Wave 2 Item 6 (G1, WS-GAP-04) — order update post-close sleep.
 ///
 /// Mirrors the main-feed + depth sleep paths. Sleeps until the next
@@ -203,6 +304,9 @@ async fn order_update_post_close_sleep(
     calendar: &TradingCalendar,
     attempt: u32,
     notifier: Option<&Arc<crate::notification::NotificationService>>,
+    ws_audit_tx: Option<
+        &tokio::sync::mpsc::Sender<tickvault_common::ws_event_types::WsEventAuditRow>,
+    >,
 ) {
     let now_utc = chrono::Utc::now().timestamp();
     let sleep_secs = calendar
@@ -225,12 +329,30 @@ async fn order_update_post_close_sleep(
             },
         );
     }
+    // 2026-06-12: forensic sleep-entered row (sleep duration in down_secs).
+    emit_order_update_ws_audit(
+        ws_audit_tx,
+        tickvault_common::ws_event_types::WsEventKind::SleepEntered,
+        "n/a",
+        "order-update post-close dormant sleep until next market open",
+        sleep_secs,
+        attempt,
+    );
     time::sleep(Duration::from_secs(sleep_secs)).await;
     info!(
         attempt,
         slept_for_secs = sleep_secs,
         feed = "order_update",
         "Order update WebSocket sleep resumed — attempting reconnect"
+    );
+    // 2026-06-12: forensic sleep-resumed row.
+    emit_order_update_ws_audit(
+        ws_audit_tx,
+        tickvault_common::ws_event_types::WsEventKind::SleepResumed,
+        "n/a",
+        "order-update resumed from dormant sleep at market open",
+        sleep_secs,
+        attempt,
     );
     // AUTH-GAP-03 — proactively renew the token if < 4h validity remains
     // before reattempting connect, preventing the "wake → connect → 901 →
@@ -291,6 +413,9 @@ async fn connect_and_listen(
     authenticated_latch: Option<&Arc<std::sync::atomic::AtomicBool>>,
     notifier: Option<&Arc<crate::notification::NotificationService>>,
     failures_before_attempt: u32,
+    ws_audit_tx: Option<
+        &tokio::sync::mpsc::Sender<tickvault_common::ws_event_types::WsEventAuditRow>,
+    >,
 ) -> Result<(), OrderUpdateConnectionError> {
     // Read current token.
     let token_guard = token_handle.load();
@@ -329,13 +454,22 @@ async fn connect_and_listen(
     // reconnect. A reconnect is defined as "connect() succeeded AND we
     // had >=1 prior consecutive failure". First boot (failures=0) does
     // not qualify — `OrderUpdateConnected` covers that already.
-    if failures_before_attempt > 0
-        && let Some(n) = notifier
-    {
-        n.notify(
-            crate::notification::events::NotificationEvent::OrderUpdateReconnected {
-                consecutive_failures: failures_before_attempt,
-            },
+    if failures_before_attempt > 0 {
+        if let Some(n) = notifier {
+            n.notify(
+                crate::notification::events::NotificationEvent::OrderUpdateReconnected {
+                    consecutive_failures: failures_before_attempt,
+                },
+            );
+        }
+        // 2026-06-12: forensic reconnect row (attempts = prior failure streak).
+        emit_order_update_ws_audit(
+            ws_audit_tx,
+            tickvault_common::ws_event_types::WsEventKind::Reconnected,
+            "n/a",
+            "order-update reconnected after failure streak",
+            0,
+            failures_before_attempt,
         );
     }
 

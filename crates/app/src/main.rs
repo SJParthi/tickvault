@@ -1611,6 +1611,9 @@ async fn main() -> Result<()> {
             let run_signal = Some(std::sync::Arc::clone(&auth_signal));
             let run_latch = Some(std::sync::Arc::clone(&auth_latch));
             let reconnect_notifier = Some(std::sync::Arc::clone(&fast_notifier));
+            // 2026-06-12: order-update lifecycle events → ws_event_audit (its
+            // own consumer, same self-contained helper as the main-feed pool).
+            let ord_ws_audit_tx = Some(spawn_ws_event_audit_consumer(config.questdb.clone()));
             tokio::spawn(async move {
                 run_order_update_connection(
                     url,
@@ -1622,6 +1625,7 @@ async fn main() -> Result<()> {
                     run_signal,
                     run_latch,
                     reconnect_notifier,
+                    ord_ws_audit_tx,
                 )
                 .await;
             })
@@ -4445,6 +4449,8 @@ async fn main() -> Result<()> {
         let run_signal = Some(std::sync::Arc::clone(&auth_signal));
         let run_latch = Some(std::sync::Arc::clone(&auth_latch));
         let ou_reconnect_notifier = Some(std::sync::Arc::clone(&notifier));
+        // 2026-06-12: order-update lifecycle events → ws_event_audit.
+        let ou_ws_audit_tx = Some(spawn_ws_event_audit_consumer(config.questdb.clone()));
         tokio::spawn(async move {
             ou_health.set_order_update_connected(true);
             // Telegram: Order Update WS connected (fires before read loop starts).
@@ -4459,6 +4465,7 @@ async fn main() -> Result<()> {
                 run_signal,
                 run_latch,
                 ou_reconnect_notifier,
+                ou_ws_audit_tx,
             )
             .await;
             // If run_order_update_connection returns, connection terminated
@@ -5547,17 +5554,9 @@ fn create_websocket_pool(
 
     // 2026-06-12: WS-event audit channel + consumer. Every connect/disconnect/
     // reconnect/sleep on every connection stamps a forensic `ws_event_audit`
-    // row (future-proof for the 5+5+5+1 = 16-connection scenario). The consumer
-    // owns the ILP writer, ensures the table, drains the bounded channel, and
-    // emits AUDIT-WS-01 on a flush failure. Bounded (events are rare); the
-    // producer `try_send`s and never blocks the WS loop.
-    let (ws_audit_tx, ws_audit_rx) = tokio::sync::mpsc::channel::<
-        tickvault_common::ws_event_types::WsEventAuditRow,
-    >(WS_EVENT_AUDIT_CHANNEL_CAPACITY);
-    let ws_audit_questdb_cfg = config.questdb.clone();
-    tokio::spawn(async move {
-        run_ws_event_audit_consumer(ws_audit_rx, ws_audit_questdb_cfg).await;
-    });
+    // row (future-proof for the 5+5+5+1 = 16-connection scenario). The
+    // order-update connection reuses the SAME helper (its own consumer).
+    let ws_audit_tx = spawn_ws_event_audit_consumer(config.questdb.clone());
 
     let mut pool = match WebSocketConnectionPool::new_with_optional_wal(
         token_handle.clone(),
@@ -5586,6 +5585,24 @@ fn create_websocket_pool(
 /// `try_send`s and drops on the (practically unreachable) full case rather than
 /// ever blocking the WS read loop.
 const WS_EVENT_AUDIT_CHANNEL_CAPACITY: usize = 1024;
+
+/// Creates the WS-event audit channel + spawns its consumer task, returning the
+/// `Sender` to hand to a WebSocket producer (the main-feed pool OR the
+/// order-update connection). Self-contained: each call owns one consumer
+/// writing to the shared `ws_event_audit` table (ILP appends are independent),
+/// so the order-update connection reuses this exact pattern with no boot
+/// refactor.
+fn spawn_ws_event_audit_consumer(
+    questdb_cfg: tickvault_common::config::QuestDbConfig,
+) -> tokio::sync::mpsc::Sender<tickvault_common::ws_event_types::WsEventAuditRow> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<tickvault_common::ws_event_types::WsEventAuditRow>(
+        WS_EVENT_AUDIT_CHANNEL_CAPACITY,
+    );
+    tokio::spawn(async move {
+        run_ws_event_audit_consumer(rx, questdb_cfg).await;
+    });
+    tx
+}
 
 /// Drains the WS-event audit channel into the `ws_event_audit` QuestDB table.
 ///
