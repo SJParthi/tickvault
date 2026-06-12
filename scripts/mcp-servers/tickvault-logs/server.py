@@ -952,6 +952,16 @@ def _tool_cloudwatch_logs_via_portal(
     `filter_pattern` (substring) + `limit` client-side."""
     url = _portal_url()
     token = _portal_token()
+    # SECURITY: refuse plaintext — a misconfigured http:// would send the
+    # bearer token unencrypted (security review LOW). https only.
+    if not url.startswith("https://"):
+        return {
+            "ok": False,
+            "source": "portal",
+            "portal_url": url,
+            "error": "TICKVAULT_PORTAL_URL must use https:// (refusing to send the "
+            "bearer token over plaintext).",
+        }
     try:
         parsed = _call_portal_logs(url, token)
     except Exception as exc:  # noqa: BLE001 — surface as ok=False, never crash
