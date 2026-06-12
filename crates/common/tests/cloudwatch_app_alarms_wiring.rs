@@ -155,10 +155,16 @@ fn test_app_alarms_count_is_thirteen() {
     // `tv_disk_watcher_respawn_total` — the spill disk-health watcher is
     // now supervised (respawn + alert) instead of fire-and-forget; the
     // counter feeds this rate-alarm so a flapping watcher pages.
+    // 17 (was 16) since 2026-06-12: added `tv_late_tick_after_boundary_total`
+    // — the hot-path-safe CloudWatch equivalent of the RETIRED
+    // LastTickAfterBoundary Telegram variant. Pages if Dhan ever stamps a
+    // tick at/after 15:30 IST, without threading a notifier into the per-tick
+    // hot path. Cost: +1 custom metric (~$0.30/mo) + 1 alarm (~$0.10/mo),
+    // negligible within the ~₹2,058/mo envelope.
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 16,
-        "Z+ L2 VERIFY ratchet: expected exactly 16 app-level CloudWatch alarms \
+        count, 17,
+        "Z+ L2 VERIFY ratchet: expected exactly 17 app-level CloudWatch alarms \
          (one per critical app signal). Found {count}. If you intentionally added \
          or removed one, update aws-budget.md custom-metric cost line AND this guard."
     );
