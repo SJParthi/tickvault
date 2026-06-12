@@ -43,6 +43,18 @@ Single-commit revert restores `timeout 25` + drops the 2 IAM actions + the diagn
 - The PR's entire point is observability: it makes the app's logs reach CloudWatch (`/tickvault/prod/app`) so they're readable in-console, and makes the agent's own failures visible in the deploy output.
 - No new app metric/counter (infra-only change).
 
+## Per-Wave Guarantee Matrix (cross-reference)
+
+See `.claude/rules/project/per-wave-guarantee-matrix.md` — all 15 rows of the
+100% Guarantee Matrix and all 7 rows of the Resilience Demand Matrix apply to
+every item in this plan. This is an infra/CI-only change (no `crates/*/src`
+touched), so the app-code rows (code coverage, DHAT zero-alloc, O(1) hot path,
+Zero ticks lost) are N/A by construction; the rows this PR directly advances are
+**100% monitoring / 100% logging / 100% alerting** — it makes the app's logs
+actually reach CloudWatch and surfaces the agent's own failures. Verification is
+the full CI workspace suite (the comprehensive automated check) plus the
+`terraform-apply` plan job, both green before merge.
+
 ## Plan Items
 - [ ] Add `logs:CreateLogGroup` + `logs:DescribeLogStreams` to `tv_instance` IAM policy
   - Files: deploy/aws/terraform/main.tf
