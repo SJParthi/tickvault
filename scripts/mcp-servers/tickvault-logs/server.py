@@ -785,6 +785,141 @@ def tool_app_log_tail(
     }
 
 
+# ---------------------------------------------------------------------------
+# CloudWatch Logs (PROD) — fully-automated read access for Claude sessions.
+# ---------------------------------------------------------------------------
+#
+# Goal (operator 2026-06-12): "whenever logs need to be read it must be
+# automatic — no per-read permission, no human effort." This tool gives any
+# Claude session direct, read-only access to the prod CloudWatch log group
+# (/tickvault/prod/app) so the operator never pastes/downloads a CSV again.
+#
+# HONEST one-time setup (the ONLY human step, ever — a security boundary that
+# cannot be coded away): read-only AWS credentials must exist in the session
+# environment so the `aws` CLI can call CloudWatch Logs. Wire ONCE via the
+# Claude Code environment config:
+#   - AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY for a read-only IAM user scoped
+#     to logs:FilterLogEvents + logs:GetLogEvents on
+#     arn:aws:logs:ap-south-1:*:log-group:/tickvault/prod/*
+#   - AWS_REGION (default ap-south-1) + the `aws` CLI on PATH.
+# After that: every session reads prod logs automatically, zero further effort.
+
+
+def _cloudwatch_log_group() -> str:
+    return os.environ.get("TICKVAULT_CLOUDWATCH_LOG_GROUP", "/tickvault/prod/app")
+
+
+def _aws_region() -> str:
+    return os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "ap-south-1"
+
+
+def build_cloudwatch_filter_args(
+    log_group: str,
+    region: str,
+    start_ms: int,
+    limit: int,
+    filter_pattern: str | None,
+) -> list[str]:
+    """Pure builder for the `aws logs filter-log-events` argv (unit-testable
+    without AWS access). `filter_pattern` is a CloudWatch filter pattern, e.g.
+    `"ERROR"` or `"WS-GAP-05"`. Empty/None means no server-side filter.
+    """
+    args = [
+        "aws",
+        "logs",
+        "filter-log-events",
+        "--region",
+        region,
+        "--log-group-name",
+        log_group,
+        "--start-time",
+        str(int(start_ms)),
+        "--limit",
+        str(max(1, min(int(limit), 10000))),
+        "--output",
+        "json",
+    ]
+    if filter_pattern:
+        args += ["--filter-pattern", filter_pattern]
+    return args
+
+
+def parse_cloudwatch_events(stdout: str, limit: int) -> list[dict[str, Any]]:
+    """Pure parser: turn `aws logs filter-log-events` JSON into a compact list
+    of `{ts_ms, stream, message}` (newest last), trimmed to `limit`.
+    """
+    try:
+        payload = json.loads(stdout) if stdout.strip() else {}
+    except json.JSONDecodeError:
+        return []
+    events = payload.get("events", []) if isinstance(payload, dict) else []
+    out: list[dict[str, Any]] = []
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        out.append(
+            {
+                "ts_ms": ev.get("timestamp"),
+                "stream": ev.get("logStreamName"),
+                "message": (ev.get("message") or "").rstrip("\n"),
+            }
+        )
+    out.sort(key=lambda e: e.get("ts_ms") or 0)
+    return out[-int(limit):] if limit > 0 else out
+
+
+def tool_cloudwatch_logs(
+    minutes: int = 60,
+    filter_pattern: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Read recent events from the prod CloudWatch log group
+    (/tickvault/prod/app) via the read-only `aws` CLI. Looks back `minutes`,
+    optional CloudWatch `filter_pattern` (e.g. `"ERROR"` or `"WS-GAP-05"`),
+    returns up to `limit` newest events. Requires read-only AWS creds in the
+    environment (one-time setup, see note above); fails clearly if absent.
+    """
+    import subprocess
+    import time as _time
+
+    region = _aws_region()
+    group = _cloudwatch_log_group()
+    start_ms = int((_time.time() - max(1, int(minutes)) * 60) * 1000)
+    argv = build_cloudwatch_filter_args(group, region, start_ms, limit, filter_pattern)
+    try:
+        proc = subprocess.run(
+            argv, check=False, capture_output=True, text=True, timeout=30
+        )
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "error": "aws CLI not on PATH — wire the read-only AWS credential + aws CLI "
+            "into the session environment once (see CloudWatch setup note in server.py).",
+            "log_group": group,
+        }
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "aws logs filter-log-events timed out after 30s"}
+    if proc.returncode != 0:
+        return {
+            "ok": False,
+            "exit_code": proc.returncode,
+            "error": "aws logs call failed — most likely no read-only AWS credentials in "
+            "this environment yet (the one-time setup). stderr below.",
+            "stderr": proc.stderr.strip()[:800],
+            "log_group": group,
+        }
+    events = parse_cloudwatch_events(proc.stdout, limit)
+    return {
+        "ok": True,
+        "log_group": group,
+        "region": region,
+        "lookback_minutes": int(minutes),
+        "filter_pattern": filter_pattern or "",
+        "returned": len(events),
+        "events": events,
+    }
+
+
 @dataclass
 class ToolSpec:
     name: str
@@ -1060,6 +1195,41 @@ TOOLS: list[ToolSpec] = [
         handler=lambda args: tool_app_log_tail(
             limit=int(args.get("limit", 100)),
             date=args.get("date"),
+        ),
+    ),
+    ToolSpec(
+        name="cloudwatch_logs",
+        description=(
+            "Read recent PROD logs directly from the CloudWatch log group "
+            "/tickvault/prod/app — fully automated, no human paste/download. "
+            "Args: minutes (lookback, default 60), filter_pattern (optional "
+            "CloudWatch pattern e.g. \"ERROR\" or \"WS-GAP-05\"), limit "
+            "(default 100). Requires read-only AWS creds in the environment "
+            "(one-time setup); returns a clear error if absent."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "minutes": {
+                    "type": "integer",
+                    "description": "Lookback window in minutes (default 60)",
+                    "default": 60,
+                },
+                "filter_pattern": {
+                    "type": "string",
+                    "description": "Optional CloudWatch filter pattern (e.g. ERROR)",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max events (default 100)",
+                    "default": 100,
+                },
+            },
+        },
+        handler=lambda args: tool_cloudwatch_logs(
+            minutes=int(args.get("minutes", 60)),
+            filter_pattern=args.get("filter_pattern"),
+            limit=int(args.get("limit", 100)),
         ),
     ),
 ]
