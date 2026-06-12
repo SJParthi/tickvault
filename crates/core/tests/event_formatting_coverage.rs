@@ -350,9 +350,12 @@ fn test_oms_and_questdb_event_messages() {
 
     let m = render(&NotificationEvent::QuestDbReconnected {
         writer: "WRT-TICK-87".to_string(),
-        drained_count: 4249,
+        failed_checks_before_recovery: 6,
     });
-    assert!(m.contains("4249"), "{m}");
+    assert!(
+        m.contains('6') && m.contains("WRT-TICK-87") && m.contains("RECOVERED"),
+        "{m}"
+    );
 }
 
 #[test]
