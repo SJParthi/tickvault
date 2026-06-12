@@ -926,13 +926,28 @@ def _tool_cloudwatch_logs_via_sigv4(
 ) -> dict[str, Any]:
     """Direct CloudWatch Logs read via SigV4-signed HTTPS — the path the
     operator wants: drop an AWS read-only key in the env and logs flow, no aws
-    CLI, no portal. Uses stdlib only."""
+    CLI, no portal. Uses stdlib only. Single-page (no nextToken paging): returns
+    up to `limit` (server-capped at 10000, and one response page is ~1 MB), which
+    is ample for a 'recent logs' tail."""
     import datetime as _dt  # noqa: PLC0415
     import time as _time  # noqa: PLC0415
     import urllib.request  # noqa: PLC0415
 
+    import re as _re  # noqa: PLC0415
+
     region = _aws_region()
     group = _cloudwatch_log_group()
+    # Validate region charset before it lands in the request host — a region
+    # with `/`, `@`, `:` etc. would build a malformed/attacker-shaped host.
+    # AWS region names are only lowercase letters, digits and hyphens.
+    if not _re.fullmatch(r"[a-z0-9-]+", region):
+        return {
+            "ok": False,
+            "source": "cloudwatch_sigv4",
+            "log_group": group,
+            "error": "invalid AWS region — set AWS_DEFAULT_REGION to a region like "
+            "ap-south-1 (lowercase letters, digits, hyphens only).",
+        }
     access_key, secret_key, session_token = _aws_credentials()
     start_ms = int((_time.time() - max(1, int(minutes)) * 60) * 1000)
     url, body, headers = build_cloudwatch_sigv4_request(
@@ -951,12 +966,16 @@ def _tool_cloudwatch_logs_via_sigv4(
         with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 — signed https to AWS
             payload = resp.read().decode("utf-8", "replace")
     except Exception as exc:  # noqa: BLE001 — surface as ok=False, never crash
+        # Bound the exception text and use only the type + a short str — never
+        # the request object — so a future stdlib change can't echo a signed
+        # header (the secret is not in any header, but defence-in-depth).
         return {
             "ok": False,
             "source": "cloudwatch_sigv4",
             "log_group": group,
             "region": region,
-            "error": f"CloudWatch FilterLogEvents failed: {type(exc).__name__}: {exc}",
+            "error": f"CloudWatch FilterLogEvents failed: {type(exc).__name__}: "
+            f"{str(exc)[:300]}",
         }
     events = parse_cloudwatch_events(payload, limit)
     return {

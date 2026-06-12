@@ -259,6 +259,15 @@ try:
     _sres_blob = json.dumps(sres)
     check(_SECRET not in _sres_blob, "AWS SECRET leaked into sigv4 result dict")
     check(_TOKEN not in _sres_blob, "AWS SESSION TOKEN leaked into sigv4 result dict")
+
+    # SECURITY: a region with host/path-injection chars is refused BEFORE any
+    # network call (and without leaking the secret/token).
+    _os.environ["AWS_DEFAULT_REGION"] = "evil@attacker.com/x"
+    rres = server.tool_cloudwatch_logs(minutes=5, limit=3)
+    check(rres.get("ok") is False, f"injection region must be refused: {rres}")
+    check("region" in (rres.get("error") or "").lower(), f"refusal must cite region: {rres}")
+    _rres_blob = json.dumps(rres)
+    check(_SECRET not in _rres_blob and _TOKEN not in _rres_blob, "creds leaked into region-refusal dict")
 finally:
     for _k, _v in _saved_sig.items():
         if _v is None:
