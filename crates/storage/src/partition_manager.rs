@@ -63,6 +63,9 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // TICK-CONSERVE-01 (2026-06-10): one row per daily conservation-audit
     // run — same SEBI-audit class + DAY partitioning as cross_verify_1m_audit.
     "tick_conservation_audit",
+    // AUDIT-WS-01 (2026-06-12): one row per WebSocket lifecycle event —
+    // same SEBI-audit class + DAY partitioning as the audit tables above.
+    "ws_event_audit",
 ];
 
 /// Tables EXEMPT from retention sweeping — NEVER detached or dropped.
