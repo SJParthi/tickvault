@@ -22,6 +22,9 @@ pub mod bar_cache_loader;
 // Operator directive 2026-06-02: post-market (15:31 IST) 1-minute
 // cross-verification of live candles_1m vs Dhan intraday — CSV + audit + count.
 pub mod cross_verify_1m_boot;
+// Phase 0 Item 20 (wired 2026-06-13): supervised 15:25 IST orphan-position
+// watchdog — daily open-position safety gate (alert-only in sandbox/dry-run).
+pub mod orphan_position_watchdog_boot;
 // Operator task DHAN-REST-400 (2026-06-10): scheduled REST-health canary —
 // GET /v2/profile at 09:05 / 12:00 / 15:25 IST, pages HIGH with the captured
 // (bounded, secret-redacted) body + final URL on any non-2xx.
