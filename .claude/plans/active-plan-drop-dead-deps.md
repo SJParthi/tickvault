@@ -51,6 +51,20 @@ Each removed dep is a one-line revert in the manifest; `git revert <sha>` restor
 
 No new code paths, counters, or events. The only observable effect is a smaller dependency tree + faster cold build + smaller binary. No telemetry change required.
 
+## Guarantee matrices
+
+See `.claude/rules/project/per-wave-guarantee-matrix.md`. All 15 rows of the
+100% guarantee matrix and all 7 rows of the resilience demand matrix apply to
+every item in this plan. Most rows are N/A by construction — this is a
+manifest-only dependency removal with **no `crates/*/src` changes, no new code
+paths, no hot path, no new tables/events/counters**. The applicable proof:
+code coverage / testing (the `cargo check --workspace --all-targets` green run
+that *is* the no-consumer proof), code checks (pre-push gates + this guarantee
+guard), and extreme check (the removal is reversible by one-line revert).
+Any "100%" wording here means **100% inside the tested envelope, with ratcheted
+regression coverage** — specifically the green workspace compile + the
+unchanged `cargo deny`/`cargo audit` tree (removal only shrinks it).
+
 ## Plan Items
 
 - [ ] Remove 9 deps from root `[workspace.dependencies]`
