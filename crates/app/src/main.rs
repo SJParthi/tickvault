@@ -1810,6 +1810,7 @@ async fn main() -> Result<()> {
             std::sync::Arc::clone(&health_status),
             std::sync::Arc::clone(&trading_calendar),
             std::sync::Arc::clone(&token_handle),
+            client_id.clone(),
             &config,
         );
 
@@ -3666,6 +3667,7 @@ async fn main() -> Result<()> {
                 std::sync::Arc::clone(&health_status),
                 std::sync::Arc::clone(&trading_calendar),
                 std::sync::Arc::clone(&token_handle),
+                ws_client_id.clone(),
                 &config,
             );
 
@@ -7033,8 +7035,25 @@ fn spawn_post_market_tasks(
     health_status: SharedHealthStatus,
     trading_calendar: std::sync::Arc<TradingCalendar>,
     token_handle: TokenHandle,
+    client_id: String,
     config: &ApplicationConfig,
 ) {
+    // Phase 0 Item 20 (wired 2026-06-13): supervised 15:25 IST orphan-position
+    // watchdog — the daily open-position safety gate. Alert-only in
+    // sandbox/dry-run (no order/cancel call exists on any path); pages CRITICAL
+    // every day open positions exist (NOT edge-suppressed — it is a compliance
+    // gate). Supervised respawn + busy-loop floor + secret-redacted REST errors
+    // per the 2026-06-13 3-agent adversarial review. Called from BOTH boot
+    // paths (boot-symmetry) so a mid-session restart re-arms it.
+    let _orphan_watchdog_handle =
+        tickvault_app::orphan_position_watchdog_boot::spawn_supervised_orphan_position_watchdog(
+            token_handle.clone(),
+            notifier.clone(),
+            std::sync::Arc::clone(&trading_calendar),
+            config.dhan.rest_api_base_url.clone(),
+            client_id,
+            config.strategy.dry_run,
+        );
     // Phase 0 Item 22d (2026-05-15): End-of-day digest at
     // 15:31:30 IST — 90s after the 15:30 close so the
     // market-close shutdown signal has settled. Severity::Info
