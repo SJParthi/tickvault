@@ -46,6 +46,32 @@ SUMMARY="$LOG_DIR/session-auto-health.latest.txt"
 
   STATUS="ok"
 
+  # Toolchain self-heal: the pinned toolchain occasionally ships without the
+  # `cargo` proxy binary (the rustup component is "installed" but the binary is
+  # absent), which breaks every build until manually repaired. Detect + repair
+  # automatically so no session needs the manual `rustup component add cargo`.
+  ensure_cargo() {
+    echo "--- stage: cargo-self-heal ---"
+    if cargo --version >/dev/null 2>&1; then
+      echo "[cargo-self-heal] cargo OK"
+      return 0
+    fi
+    local channel
+    channel="$(awk -F'"' '/^channel/{print $2}' "$PROJECT_DIR/rust-toolchain.toml" 2>/dev/null)"
+    channel="${channel:-stable}"
+    echo "[cargo-self-heal] cargo binary missing — repairing toolchain $channel"
+    rustup component remove cargo --toolchain "$channel" >/dev/null 2>&1 || true
+    rustup component add cargo --toolchain "$channel" >/dev/null 2>&1 \
+      || rustup component add cargo >/dev/null 2>&1 || true
+    if cargo --version >/dev/null 2>&1; then
+      echo "[cargo-self-heal] repaired: $(cargo --version)"
+    else
+      echo "[cargo-self-heal] STILL BROKEN — manual rustup needed"
+      STATUS="fail"
+    fi
+  }
+  ensure_cargo
+
   run_stage() {
     local name="$1"
     local cmd="$2"
