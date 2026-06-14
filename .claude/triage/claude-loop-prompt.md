@@ -42,10 +42,22 @@ If no → proceed.
 
 ### Step 4 — Apply the action
 
+> **ESCALATE-ONLY LOCK (operator decision, Parthiban 2026-06-10, PR #1087).**
+> During the no-real-orders data-pull phase the loop **detects + pages, never
+> acts**. It MUST NOT run a fix script against the live system. The auto-fix
+> scripts are **operator-runbook tools**, not loop-driven actions, and the
+> tickvault API is **read-only** (no mutating `/api/...` endpoints exist).
+> A mutating-endpoint subset is revisited only when live trading nears, with a
+> fresh dated operator quote + design-first plan + security review.
+
 - **silence** — append a line to triage-seen.jsonl, take no action.
-- **auto_restart / auto_fix** — run `rule.auto_fix_script --dry-run`
-  first. If dry-run succeeds, run without `--dry-run`. Log the outcome
-  to `data/logs/auto-fix.log`. Append to triage-seen.jsonl.
+- **auto_restart / auto_fix** — under the escalate-only lock these are
+  treated as **escalate**: do NOT execute `rule.auto_fix_script`. Instead,
+  optionally run it with `--dry-run` ONLY to capture a preview for the
+  escalation body, then escalate. Record the dry-run preview (never a live
+  run) in `data/logs/auto-fix.log`. Append to triage-seen.jsonl. (The
+  fix→verify→rollback sequence below is the **operator-run** remediation path,
+  not a loop action.)
 - **escalate** — use the github MCP to open a DRAFT issue titled
   `Novel error signature: <code> — <short message>`. Body should
   include: signature hash, code, severity, target, count, first_seen,
@@ -53,12 +65,33 @@ If no → proceed.
   `.claude/rules/project/observability-architecture.md`. Append to
   triage-seen.jsonl.
 
-**Never action a Critical-severity event** even if the rule says so.
+**Never action a Critical-severity event.**
 `ErrorCode::X.is_auto_triage_safe()` returns false for Critical — the
 Rust enum is the final word.
 
 **Never action a rule with confidence < 0.95.** Lower-confidence rules
 are documented upgrade paths, not current auto-actions.
+
+### Operator-run remediation path (NOT a loop action) — M4 fix → verify → rollback
+
+When the operator chooses to remediate a paged event manually, the M4
+dispatchers make the fix reversible and auditable. This sequence is run by a
+human (or a future, separately-approved auto-execution phase), never by this
+detect-and-page loop:
+
+1. **Fix** — run the matching `scripts/auto-fix-<name>.sh <corr_id>` (preview
+   first with `--dry-run`). It audit-logs to `data/logs/auto-fix.log` with
+   `corr_id=`.
+2. **Verify** — `scripts/triage/verify.sh <corr_id> '<metric_predicate>' [timeout_secs]`
+   polls the `/metrics` exporter until the symptom clears (exit 0) or times out
+   (exit 1).
+3. **Rollback** — if verify exits non-zero, run
+   `scripts/triage/rollback.sh auto-fix-<name> <corr_id>` to reverse the fix.
+   Every `auto-fix-*.sh` has a matching `*-rollback.sh`
+   (enforced by `crates/common/tests/autonomous_ops_m3_m4_guard.rs`).
+
+Use the same `<corr_id>` across all three steps so the audit log correlates the
+fix, its verification, and any rollback.
 
 ### Step 5 — Report
 
@@ -83,9 +116,11 @@ up and replace the normal summary.
 1. **Idempotency** — running the loop twice in a row on the same
    inputs produces the same side effects (modulo the triage-seen
    append). Auto-fix scripts MUST be idempotent too.
-2. **Safety** — never touch live trading state. Auto-fix scripts may
-   hit `POST /api/instruments/rebuild` and similar management
-   endpoints, but MUST NOT place, modify, or cancel orders.
+2. **Safety** — never touch live trading state, and (per the
+   escalate-only lock in Step 4) never auto-execute a fix script. The
+   tickvault API is read-only: there are NO mutating management
+   endpoints (the former `POST /api/instruments/rebuild` was retired in
+   PR #6b). The loop detects + pages only; remediation is operator-run.
 3. **Bounded cost** — the triage pass is O(summary signatures). The
    summary is capped at `DEFAULT_TOP_SIGNATURES = 10`, so each pass
    is O(10) regardless of error volume.
