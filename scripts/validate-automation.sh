@@ -86,10 +86,10 @@ run_check "observability library tests" \
     cargo test -p tickvault-app --lib observability
 run_check "observability_chain_e2e" \
     cargo test -p tickvault-app --test observability_chain_e2e
-run_check "operator_health_dashboard_guard" \
-    cargo test -p tickvault-storage --test operator_health_dashboard_guard
-run_check "resilience_sla_alert_guard" \
-    cargo test -p tickvault-storage --test resilience_sla_alert_guard
+# NOTE (2026-06-14 de-stale): operator_health_dashboard_guard (Grafana, #O1),
+# resilience_sla_alert_guard (Alertmanager/Prometheus, #O2/#O3) and
+# recording_rules_guard (Prometheus) were DELETED in the CloudWatch-only
+# migration. Their checks are removed here so the sweep reflects reality.
 run_check "tickvault_logs_mcp_guard" \
     cargo test -p tickvault-common --test tickvault_logs_mcp_guard
 run_check "claude_triage_lambda_guard" \
@@ -98,8 +98,6 @@ run_check "loki_alloy_profile_guard" \
     cargo test -p tickvault-common --test loki_alloy_profile_guard
 run_check "runbook_cross_link_guard" \
     cargo test -p tickvault-common --test runbook_cross_link_guard
-run_check "recording_rules_guard" \
-    cargo test -p tickvault-common --test recording_rules_guard
 
 echo ""
 echo "--- file-level invariants ---"
@@ -109,8 +107,9 @@ run_check "triage rules YAML exists" \
     test -f .claude/triage/error-rules.yaml
 run_check "claude-loop prompt exists" \
     test -f .claude/triage/claude-loop-prompt.md
-run_check "auto-fix restart-depth executable" \
-    test -x scripts/auto-fix-restart-depth.sh
+# NOTE (2026-06-14 de-stale): auto-fix-restart-depth.sh was retired 2026-06-10
+# (depth-20/200 deleted forever per websocket-connection-scope-lock.md); its
+# executable check is removed.
 run_check "auto-fix refresh-instruments executable" \
     test -x scripts/auto-fix-refresh-instruments.sh
 run_check "auto-fix clear-spill executable" \
@@ -128,8 +127,11 @@ echo ""
 echo "--- source-code invariants ---"
 run_check "flatten_event(true) on errors.jsonl layer" \
     grep -q "flatten_event(true)" crates/app/src/main.rs
+# 2026-06-14 de-stale: the self-heal pattern moved out of instrument_persistence.rs
+# into the per-table persistence modules (tick/shadow/prev_day_ohlcv/index_constituency).
+# Grep the whole storage src tree so this can't false-FAIL on a file move.
 run_check "schema self-heal ALTER TABLE pattern" \
-    grep -q "ADD COLUMN IF NOT EXISTS" crates/storage/src/instrument_persistence.rs
+    grep -rq "ADD COLUMN IF NOT EXISTS" crates/storage/src/
 run_check "must-use deny in every crate" \
     bash -c 'for c in common storage core trading api app; do \
         grep -q "deny(unused_must_use)" crates/$c/src/lib.rs || exit 1; \
