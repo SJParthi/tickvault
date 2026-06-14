@@ -13,8 +13,8 @@
 | 2. Diagnose | Classify errors via signature hashing + errors.summary.md | ✅ Shipped (Phases 1-5 of zero-touch plan) | — |
 | 3. Decide | Rule-based triage — classifier picks safe auto-fix action per error code | ✅ Shipped — 100% variant coverage + TRIAGE-EXEMPT ratchet (PRs #1083 + prior incremental) | M2 (merged 2026-06-10) |
 | 4. Act | Auto-fix script per rule; every classifier rule has a runnable remediation | ✅ CLOSED tooling-only (operator decision 2026-06-10, PR #1087 comment): scripts + rollbacks + guards are operator-runbook tools; runtime auto-execution stays escalate-only BY DESIGN; mutating endpoints deferred to the live-trading phase | M3 (closed 2026-06-10) |
-| 5. Verify + Rollback | Post-fix metric re-probe; auto-revert if fix made things worse | Not built | M4 |
-| 6. Runtime scaling + chaos | AWS autoscale, EBS resize, Dhan plan upgrade; nightly chaos tests prove self-heal | Not built (deferred post-AWS-provision) | M5 |
+| 5. Verify + Rollback | Post-fix metric re-probe; revert if fix made things worse | ✅ **Built as tooling (2026-06-14)** — `scripts/triage/verify.sh` + `rollback.sh` + 6 fix/rollback pairs + guard; loop runbook now documents the **operator-run** fix→verify→rollback path. Runtime auto-revert stays escalate-only per the M3 lock (NOT loop-driven). | M4 |
+| 6. Runtime scaling + chaos | AWS autoscale, EBS resize, Dhan plan upgrade; nightly chaos tests prove self-heal | ⏸ **Partial / AWS-blocked** — local chaos battery shipped (18 `crates/*/tests/chaos_*.rs` in CI prove self-heal); AWS Lambda bridge + EBS/ASG autoscale + nightly CI on a dedicated instance are deferred until the prod instance is provisioned (`aws-budget.md` / daily-universe lock). | M5 |
 
 ## Milestone 1 (THIS PR) — Universal observability
 
@@ -118,9 +118,16 @@ contradicting the post-AWS-lifecycle narrowing and PR #6b's retirement of
 - Dry-run flag (`--dry-run`) on every script so Claude can preview before executing.
 - `make triage-execute` runs the full auto-fix path; already exists, just extends to cover all rules.
 
-## Milestone 4 (next PR) — Verify + rollback loop
+## Milestone 4 — Verify + rollback loop — ✅ BUILT AS TOOLING (2026-06-14)
 
-**Goal:** after Claude triggers a fix, the verify step re-probes metrics/alerts; if the fix didn't clear the symptom OR made things worse, Claude auto-reverts.
+**Measured state (2026-06-14):**
+- ✅ `scripts/triage/verify.sh` (polls the `/metrics` exporter for a predicate, exit 0=clear / 1=timeout / 2=preflight) and `scripts/triage/rollback.sh` (dispatches `scripts/<fix>-rollback.sh`) exist + are guard-enforced.
+- ✅ 6 `auto-fix-*.sh` + `*-rollback.sh` pairs; all `--dry-run` + `corr_id=` audited.
+- ✅ The loop runbook `.claude/triage/claude-loop-prompt.md` now **documents** the fix→verify→rollback sequence as the **OPERATOR-RUN** remediation path (with shared correlation IDs) and was corrected to honor the M3 escalate-only lock — the loop detects + pages, never auto-executes. Stale `POST /api/instruments/rebuild` reference removed.
+- ✅ Ratchets (`crates/common/tests/autonomous_ops_m3_m4_guard.rs`): runbook references verify.sh + rollback.sh, states the escalate-only invariant, contains no live retired-endpoint reference; rollback.sh self-reference names the real guard file.
+- **Honest envelope:** there is NO runtime auto-revert — that would violate the M3 operator lock (auto-execution stays escalate-only during the no-real-orders phase). A loop-driven verify→rollback is revisited only when live trading nears, with a fresh dated operator quote + design-first plan + security review.
+
+**Original goal (historical):** after Claude triggers a fix, the verify step re-probes metrics/alerts; if the fix didn't clear the symptom OR made things worse, Claude auto-reverts.
 
 **Deliverables:**
 - `scripts/triage/verify.sh` — takes fix-id + expected-outcome predicate, polls MCP for 60-180s, pass/fail
@@ -128,9 +135,13 @@ contradicting the post-AWS-lifecycle narrowing and PR #6b's retirement of
 - Claude's loop runbook: fix → verify → (pass: log success, escalate to info) | (fail: rollback → escalate to operator)
 - Audit log: every fix + verify + rollback recorded in `data/logs/auto-fix.log` with correlation IDs.
 
-## Milestone 5 (post-AWS-provision) — Runtime scaling + chaos
+## Milestone 5 (post-AWS-provision) — Runtime scaling + chaos — ⏸ PARTIAL / AWS-BLOCKED
 
-**Goal:** autonomous response to capacity events (tick flood, daily subscription plan exhaustion, EBS fill) + nightly chaos tests that prove self-heal.
+**Measured state (2026-06-14):**
+- ✅ **Local chaos battery shipped** — 18 `crates/*/tests/chaos_*.rs` prove self-heal without operator: QuestDB kill/pause/full-session, disk-full (+ulimit), WS disconnect/SIGKILL/WAL replay, frame-spill saturation, midnight seal burst, zero-tick-loss, triple-failure cascade. These run in `cargo test` / CI today.
+- ❌ **AWS-blocked (deferred until the prod instance is provisioned):** AWS Lambda bridge for credentialed actions (EBS resize, ASG scale, SNS), Dhan plan-upgrade nudge (paid → always escalate, never auto-act), and the nightly chaos CI job against a dedicated AWS instance. These cannot be built or proven until provisioning per `aws-budget.md` + the daily-universe lock. Manufacturing a thin local wrapper to "claim" these would be an illusion (operator charter §F) — explicitly NOT done.
+
+**Original goal (historical):** autonomous response to capacity events (tick flood, daily subscription plan exhaustion, EBS fill) + nightly chaos tests that prove self-heal.
 
 **Deliverables:**
 - AWS Lambda bridge for actions requiring AWS creds (EBS resize, ASG scale, SNS alert)

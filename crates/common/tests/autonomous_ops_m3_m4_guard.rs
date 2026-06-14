@@ -243,6 +243,78 @@ fn auto_fix_scripts_accept_dry_run_flag() {
     );
 }
 
+fn read_loop_runbook() -> String {
+    let path = repo_root().join(".claude/triage/claude-loop-prompt.md");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|_| panic!("loop runbook missing at {}", path.display()))
+}
+
+#[test]
+fn loop_runbook_wires_verify_and_rollback() {
+    // M4's fix->verify->rollback contract must be documented in the runbook
+    // that drives remediation. Before 2026-06-14 the runbook ran auto-fix and
+    // never referenced verify.sh / rollback.sh — the loop was unwired.
+    let runbook = read_loop_runbook();
+    assert!(
+        runbook.contains("scripts/triage/verify.sh"),
+        "loop runbook must reference scripts/triage/verify.sh (the M4 verify step)"
+    );
+    assert!(
+        runbook.contains("scripts/triage/rollback.sh"),
+        "loop runbook must reference scripts/triage/rollback.sh (the M4 rollback step)"
+    );
+}
+
+#[test]
+fn loop_runbook_states_escalate_only_invariant() {
+    // The operator's M3 lock (Parthiban 2026-06-10, PR #1087) keeps triage
+    // auto-execution escalate-only. The runbook MUST state this so a future
+    // edit can't silently re-introduce live auto-execution of fix scripts.
+    let runbook = read_loop_runbook();
+    assert!(
+        runbook.to_lowercase().contains("escalate-only"),
+        "loop runbook must state the escalate-only lock (M3 operator decision)"
+    );
+}
+
+#[test]
+fn loop_runbook_has_no_retired_rebuild_endpoint() {
+    // POST /api/instruments/rebuild was retired in PR #6b; the API is
+    // read-only. The runbook must not present it as a live remediation path.
+    let runbook = read_loop_runbook();
+    let retired = "POST /api/instruments/rebuild";
+    // Allowed only inside an explicit "retired" sentence; reject any other use.
+    for (i, line) in runbook.lines().enumerate() {
+        if line.contains(retired) {
+            assert!(
+                line.to_lowercase().contains("retired"),
+                "loop runbook line {} references the retired endpoint without \
+                 marking it retired: {line:?}",
+                i + 1
+            );
+        }
+    }
+}
+
+#[test]
+fn rollback_dispatcher_self_reference_names_real_guard() {
+    // rollback.sh's header comment must point at the guard file that actually
+    // exists (this file), not the stale autonomous_ops_m4_guard.rs name.
+    let path = repo_root().join("scripts/triage/rollback.sh");
+    let src = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        src.contains("autonomous_ops_m3_m4_guard.rs"),
+        "rollback.sh must reference the real guard file autonomous_ops_m3_m4_guard.rs"
+    );
+    // The real name is `autonomous_ops_m3_m4_guard.rs`, which does NOT contain
+    // the substring `autonomous_ops_m4_guard.rs`, so this cleanly rejects the
+    // stale reference without a false positive on the correct name.
+    assert!(
+        !src.contains("autonomous_ops_m4_guard.rs"),
+        "rollback.sh must not reference the non-existent autonomous_ops_m4_guard.rs"
+    );
+}
+
 #[test]
 fn auto_fix_scripts_emit_correlation_id_in_logs() {
     // Every auto-fix-*.sh MUST emit a `corr_id=...` token in its

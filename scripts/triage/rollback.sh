@@ -12,7 +12,7 @@
 #
 # The dispatcher looks up scripts/<fix_name>-rollback.sh and runs it.
 # Every M3 auto-fix script MUST have a matching *-rollback.sh pair
-# (enforced by crates/common/tests/autonomous_ops_m4_guard.rs).
+# (enforced by crates/common/tests/autonomous_ops_m3_m4_guard.rs).
 #
 # Exit codes:
 #   0   rollback completed (or dry-run ok)
