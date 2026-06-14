@@ -1,6 +1,12 @@
 # Implementation Plan: Wire the 15:25 IST orphan-position watchdog (Phase 0 Item 20)
 
-**Status:** APPROVED
+> **ARCHIVED 2026-06-14** — work completed and merged to `main` as **#1123**
+> (`feat(trading): wire the 15:25 IST orphan-position watchdog (Phase 0 Item 20)`).
+> Status flipped APPROVED → VERIFIED; the three plan items below are ticked to
+> reflect the merged slice. The audit-table follow-up remains deferred per the
+> operator scope decision recorded at approval time.
+
+**Status:** VERIFIED (merged as #1123, 2026-06-13)
 **Date:** 2026-06-13
 **Approved by:** Parthiban, 2026-06-13 (AskUserQuestion): direction = "Wire it + add the real guard"; scope = "Runner + spawn + guard only" (audit table deferred); "Finish the watchdog + merge it".
 
@@ -79,11 +85,11 @@ the deferred follow-up per operator scope decision).
 
 ## Plan Items
 
-- [ ] Add async runner + supervisor in `orphan_position_watchdog_boot.rs`
+- [x] Add async runner + supervisor in `orphan_position_watchdog_boot.rs`
   - Files: crates/app/src/orphan_position_watchdog_boot.rs, crates/app/src/lib.rs
   - Tests: test_ist_date_from_utc_*, test_floor_sleep_exceeds_boundary_zero_window
-- [ ] Wire spawn into `spawn_post_market_tasks` (both boot paths)
+- [x] Wire spawn into `spawn_post_market_tasks` (both boot paths)
   - Files: crates/app/src/main.rs
-- [ ] Add the source-scan wiring guard
+- [x] Add the source-scan wiring guard
   - Files: crates/app/tests/orphan_position_watchdog_wiring_guard.rs
   - Tests: test_orphan_position_watchdog_is_wired_into_main, test_orphan_position_watchdog_spawned_from_post_market_tasks, test_post_market_tasks_called_from_both_boot_paths
