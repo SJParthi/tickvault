@@ -41,6 +41,18 @@
 ## Observability
 - This IS an observability-integrity fix: it restores the truthfulness of the `make validate-automation` signal so a green board means green.
 
+## Guarantee matrix
+
+The full 15-row 100% matrix + 7-row resilience matrix from
+`per-wave-guarantee-matrix.md` apply to this item. Applicable rows: 100% code
+checks (banned-pattern + plan-verify + fmt green), 100% testing
+(`validate-automation` 26/26 + `dedup_uniqueness_proptest` 10/10), 100%
+observability-integrity (this fix restores the truthfulness of the
+`make validate-automation` signal). N/A rows — performance/DHAT/bench, audit
+table, chaos, hot-path O(1) — reason: scripts-only change, zero `crates/*/src`,
+no runtime surface. Any "100% guarantee" claim here is bounded "100% inside the
+tested envelope, with ratcheted regression coverage" per `wave-4-shared-preamble.md` §8.
+
 ## Scenarios
 | # | Scenario | Expected |
 |---|----------|----------|
