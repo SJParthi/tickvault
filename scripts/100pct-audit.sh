@@ -165,21 +165,13 @@ check_cargo_test P "Metrics catalog no-drift" \
     tickvault-common metrics_catalog \
     "crates/common/tests/metrics_catalog.rs"
 
-check_cargo_test P "Recording rules no-drift" \
-    tickvault-common recording_rules_guard \
-    "crates/common/tests/recording_rules_guard.rs"
-
+# 2026-06-14 de-stale: recording_rules_guard, resilience_sla_alert_guard and
+# operator_health_dashboard_guard were DELETED in the CloudWatch-only migration
+# (Prometheus/Alertmanager/Grafana removed, #O1/#O2/#O3). Their audit rows are
+# removed so the 100% board reflects reality.
 check_cargo_test P "Zero-tick-loss alert guard" \
     tickvault-storage zero_tick_loss_alert_guard \
     "crates/storage/tests/zero_tick_loss_alert_guard.rs"
-
-check_cargo_test P "Resilience SLA alert guard (WS+QuestDB)" \
-    tickvault-storage resilience_sla_alert_guard \
-    "crates/storage/tests/resilience_sla_alert_guard.rs"
-
-check_cargo_test P "Operator-health dashboard guard" \
-    tickvault-storage operator_health_dashboard_guard \
-    "crates/storage/tests/operator_health_dashboard_guard.rs"
 
 check_cargo_test P "Triage rules schema guard" \
     tickvault-common triage_rules_guard \
@@ -223,9 +215,11 @@ check_cargo_test P "Live-feed purity (no backfill→ticks)" \
     tickvault-storage live_feed_purity_guard \
     "crates/storage/tests/live_feed_purity_guard.rs (6 tests)"
 
-check_cargo_test P "Instrument uniqueness proptest" \
-    tickvault-storage instrument_uniqueness_guard \
-    "crates/storage/tests/instrument_uniqueness_guard.rs"
+# 2026-06-14 de-stale: instrument_uniqueness_guard.rs was superseded by
+# dedup_uniqueness_proptest.rs (the composite-key uniqueness property guard).
+check_cargo_test P "Composite-key uniqueness proptest" \
+    tickvault-storage dedup_uniqueness_proptest \
+    "crates/storage/tests/dedup_uniqueness_proptest.rs"
 
 # =============================================================================
 # AUTONOMOUS OPS (M1-M4, P)
