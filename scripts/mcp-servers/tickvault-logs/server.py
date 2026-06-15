@@ -931,6 +931,7 @@ def _tool_cloudwatch_logs_via_sigv4(
     is ample for a 'recent logs' tail."""
     import datetime as _dt  # noqa: PLC0415
     import time as _time  # noqa: PLC0415
+    import urllib.error  # noqa: PLC0415
     import urllib.request  # noqa: PLC0415
 
     import re as _re  # noqa: PLC0415
@@ -965,6 +966,25 @@ def _tool_cloudwatch_logs_via_sigv4(
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 — signed https to AWS
             payload = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        # AWS returns the real reason (e.g. {"__type":"ResourceNotFoundException",
+        # "message":"..."} or ExpiredTokenException / AccessDenied) in the HTTP
+        # body. A bare str(HTTPError) is only "HTTP Error 400: Bad Request", which
+        # hides WHY the read failed. Read the (bounded) body so the operator/Claude
+        # sees the actual AWS error type — the body carries no signed headers and
+        # no secret, so this is safe to surface.
+        try:
+            err_body = exc.read().decode("utf-8", "replace")[:400]
+        except Exception:  # noqa: BLE001 — body already consumed / unreadable
+            err_body = ""
+        return {
+            "ok": False,
+            "source": "cloudwatch_sigv4",
+            "log_group": group,
+            "region": region,
+            "error": f"CloudWatch FilterLogEvents HTTP {exc.code}: "
+            f"{err_body or exc.reason}",
+        }
     except Exception as exc:  # noqa: BLE001 — surface as ok=False, never crash
         # Bound the exception text and use only the type + a short str — never
         # the request object — so a future stdlib change can't echo a signed
