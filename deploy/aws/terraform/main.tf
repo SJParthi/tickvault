@@ -480,6 +480,19 @@ resource "aws_cloudwatch_event_target" "daily_start" {
     InstanceId           = [aws_instance.tv_app.id]
     AutomationAssumeRole = [aws_iam_role.eventbridge_ec2_scheduler.arn]
   })
+
+  # Self-heal a transient SSM/EC2 throttle at 08:30 IST instead of silently
+  # dropping the start (the recurring "08:30 auto-start FAILED" incidents).
+  # Retries within a 10-min window keep the box-up attempt going until well
+  # before the 08:45 watchdog; an exhausted ladder dead-letters + alarms.
+  retry_policy {
+    maximum_retry_attempts       = 5
+    maximum_event_age_in_seconds = 600
+  }
+
+  dead_letter_config {
+    arn = aws_sqs_queue.eventbridge_dlq.arn
+  }
 }
 
 resource "aws_cloudwatch_event_target" "daily_stop" {
@@ -492,6 +505,18 @@ resource "aws_cloudwatch_event_target" "daily_stop" {
     InstanceId           = [aws_instance.tv_app.id]
     AutomationAssumeRole = [aws_iam_role.eventbridge_ec2_scheduler.arn]
   })
+
+  # Same resilience on the 16:30 IST stop — a dropped stop means the box bills
+  # 24/7 (~₹5,500/mo vs the locked ~₹2,058/mo per aws-budget.md). Retry + DLQ
+  # + the 16:45 stop-watchdog are the defense in depth.
+  retry_policy {
+    maximum_retry_attempts       = 5
+    maximum_event_age_in_seconds = 600
+  }
+
+  dead_letter_config {
+    arn = aws_sqs_queue.eventbridge_dlq.arn
+  }
 }
 
 # S3 cold-storage bucket for tick data > 14 days old.
