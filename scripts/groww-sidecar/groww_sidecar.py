@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Groww validation sidecar (LOCAL-ONLY, operator lock §32) — the PRODUCER.
 
-Authenticates with the official `growwapi` SDK (api_key + TOTP), subscribes to the
-live feed, and appends each received tick as one NDJSON line to
-`data/groww/live-ticks.ndjson` — the EXACT schema the Rust bridge
-(`crates/app/src/groww_bridge.rs`) parses. Capture-at-receipt: write + flush +
-fsync the instant the callback fires (durable floor one hop downstream of the
-socket; see lock §32.3).
+VERIFIED against the official growwapi-1.5.0 SDK source
+(docs/groww-ref/10-live-feed-mapping-verified.md). The live feed is
+NATS-over-WebSocket + Protobuf; GrowwFeed handles transport + decode. The
+callback receives the topic META; the parsed tick is pulled via get_ltp(),
+shaped `{exchange: {segment: {exchange_token: {ltp, tsInMillis, volume, ...}}}}`.
 
-HONEST: written against the Groww docs; every line that depends on the exact SDK
-tick shape is marked `# VERIFY`. Run `groww_smoke.py` FIRST to confirm the field
-names, then adjust `tick_to_record()` below if needed.
+Each received tick is appended as one NDJSON line to data/groww/live-ticks.ndjson
+— the EXACT schema the Rust bridge (crates/app/src/groww_bridge.rs) parses.
+Capture-at-receipt: write + flush + fsync the instant the callback fires (durable
+floor one hop downstream of the socket; lock §32.3).
 
 Usage:
     export GROWW_API_KEY=...   GROWW_TOTP_SECRET=...
@@ -25,7 +25,7 @@ from datetime import datetime, timezone, timedelta
 import pyotp
 
 try:
-    from growwapi import GrowwAPI, GrowwFeed  # VERIFY import names
+    from growwapi import GrowwAPI, GrowwFeed
 except Exception as exc:  # pragma: no cover
     sys.exit(f"growwapi import failed ({exc}). `pip install -r requirements.txt` first.")
 
@@ -33,57 +33,65 @@ except Exception as exc:  # pragma: no cover
 OUTPUT_PATH = os.environ.get("GROWW_TICK_FILE", "data/groww/live-ticks.ndjson")
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# Map Groww's exchange+segment to our canonical segment string (bridge contract).
-# VERIFY the Groww exchange/segment values against the smoke output.
+# Your validation set. exchange_token comes from Groww's instrument.csv.
+# 2885 = RELIANCE (NSE CASH). Add more dicts to watch more instruments (<=1000).
+WATCH = [{"exchange": "NSE", "segment": "CASH", "exchange_token": "2885"}]
+
+# Groww (exchange, segment) -> our canonical segment string (bridge contract).
+# Verified values: exchange NSE/BSE, segment CASH/FNO.
 SEGMENT_MAP = {
     ("NSE", "CASH"): "NSE_EQ",
     ("NSE", "FNO"): "NSE_FNO",
     ("BSE", "CASH"): "BSE_EQ",
     ("BSE", "FNO"): "BSE_FNO",
-    ("NSE", "INDEX"): "IDX_I",
-    ("BSE", "INDEX"): "IDX_I",
 }
 
 
 def ms_to_ist_nanos(ts_millis: int) -> int:
-    """Groww millisecond timestamp -> IST epoch nanoseconds.
+    """Groww `tsInMillis` (UTC epoch ms) -> IST epoch nanoseconds.
 
-    VERIFY whether Groww's ms is UTC or IST. This assumes the SDK gives a UTC
-    epoch ms (most common) and converts to IST wall-clock nanos to match how the
-    Rust side stores `ts`. If the smoke output shows IST already, drop the +IST
-    offset. Confirm against one known tick's wall-clock time.
+    Mirrors the Dhan "store IST wall-clock directly" rule (data-integrity.md):
+    convert UTC ms -> IST wall clock, then to nanos. Keeps ms precision.
     """
     dt_utc = datetime.fromtimestamp(ts_millis / 1000.0, tz=timezone.utc)
     dt_ist = dt_utc.astimezone(IST)
-    # IST wall-clock seconds-since-epoch * 1e9, mirroring the Dhan "store IST
-    # directly" rule (data-integrity.md). Keep ms precision.
-    ist_epoch_ns = int(dt_ist.replace(tzinfo=timezone.utc).timestamp() * 1_000_000_000)
-    return ist_epoch_ns
+    return int(dt_ist.replace(tzinfo=timezone.utc).timestamp() * 1_000_000_000)
 
 
-def tick_to_record(tick: dict) -> dict | None:
-    """Map one raw Groww tick object to the bridge's NDJSON record.
+def emit_records(out, ltp_tree: dict) -> None:
+    """Flatten get_ltp() `{exchange:{segment:{token:{...}}}}` and append NDJSON.
 
-    VERIFY every key against the smoke output — these are best-guess names.
-    Returns None if the tick is malformed (skipped, not crashed).
+    Verified tick keys: `ltp`, `tsInMillis` (ms), `volume` (cumulative).
+    Instrument identity comes from the tree path (exchange/segment/token), NOT
+    the tick body.
     """
-    try:
-        exchange = str(tick.get("exchange", "NSE"))            # VERIFY
-        seg_raw = str(tick.get("segment", "CASH"))             # VERIFY
-        segment = SEGMENT_MAP.get((exchange, seg_raw))
-        if segment is None:
-            return None
-        ts_millis = int(tick["tick_timestamp_millis"])          # VERIFY key name
-        return {
-            "security_id": int(tick["exchange_token"]),         # VERIFY key name
-            "segment": segment,
-            "ts_ist_nanos": ms_to_ist_nanos(ts_millis),
-            "exchange_ts_millis": ts_millis,
-            "ltp": float(tick["ltp"]),                          # VERIFY key name
-            "cum_volume": int(tick.get("volume", 0)),           # VERIFY key name
-        }
-    except (KeyError, ValueError, TypeError):
-        return None
+    if not isinstance(ltp_tree, dict):
+        return
+    for exchange, segs in ltp_tree.items():
+        if not isinstance(segs, dict):
+            continue
+        for segment, tokens in segs.items():
+            canonical = SEGMENT_MAP.get((str(exchange), str(segment)))
+            if canonical is None or not isinstance(tokens, dict):
+                continue
+            for token, tick in tokens.items():
+                if not isinstance(tick, dict) or "ltp" not in tick:
+                    continue
+                try:
+                    ts_millis = int(tick.get("tsInMillis", 0))
+                    rec = {
+                        "security_id": int(token),
+                        "segment": canonical,
+                        "ts_ist_nanos": ms_to_ist_nanos(ts_millis) if ts_millis else 0,
+                        "exchange_ts_millis": ts_millis,
+                        "ltp": float(tick["ltp"]),
+                        "cum_volume": int(tick.get("volume", 0)),
+                    }
+                except (KeyError, ValueError, TypeError):
+                    continue
+                out.write(json.dumps(rec) + "\n")
+                out.flush()
+                os.fsync(out.fileno())  # capture-at-receipt durability
 
 
 def main() -> None:
@@ -96,32 +104,21 @@ def main() -> None:
     out = open(OUTPUT_PATH, "a", buffering=1)  # line-buffered append
     print(f"groww sidecar → appending NDJSON to {OUTPUT_PATH}", flush=True)
 
-    def on_data(message) -> None:
-        # A message may be one tick or a batch — handle both (VERIFY shape).
-        ticks = message if isinstance(message, list) else [message]
-        for tick in ticks:
-            if not isinstance(tick, dict):
-                continue
-            rec = tick_to_record(tick)
-            if rec is None:
-                continue
-            out.write(json.dumps(rec) + "\n")
-            out.flush()
-            os.fsync(out.fileno())  # capture-at-receipt durability
-
     # Reconnect loop — never give up (lock: not a single received tick missed).
     while True:
         try:
             totp = pyotp.TOTP(totp_secret).now()
-            access_token = GrowwAPI.get_access_token(api_key=api_key, totp=totp)  # VERIFY
+            access_token = GrowwAPI.get_access_token(api_key=api_key, totp=totp)
             groww = GrowwAPI(access_token)
             feed = GrowwFeed(groww)
-            feed.subscribe_live_data(  # VERIFY method + args; subscribe your validation set
-                [{"exchange": "NSE", "segment": "CASH", "exchange_token": "2885"}],  # VERIFY
-                on_data,
-            )
+
+            def on_update(_meta) -> None:
+                # Pull the full parsed LTP tree and emit whatever changed.
+                emit_records(out, feed.get_ltp())
+
+            feed.subscribe_ltp(WATCH, on_update)
             print("subscribed — streaming…", flush=True)
-            feed.consume()  # VERIFY blocking consume
+            feed.consume()  # blocking
         except KeyboardInterrupt:
             print("stopping.", flush=True)
             break
