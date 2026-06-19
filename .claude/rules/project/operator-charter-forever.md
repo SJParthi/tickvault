@@ -231,8 +231,10 @@ For every plan item / new feature / Telegram message / docs:
 >
 > Operator verbatim 2026-05-15:
 > "except [for] this 1 connection main feed websocket and order update websocket we will never ever use anything else"
+>
+> **⚠ SECOND-FEED EXTENSION 2026-06-19 by [`groww-second-feed-scope-2026-06-19.md`](./groww-second-feed-scope-2026-06-19.md):** the Dhan 2-WS lock (1 main-feed + 1 order-update) below is UNCHANGED. The operator authorized **GROWW** as an independent, **default-OFF**, per-feed-toggleable second market-data feed (feed #2), implemented in **native tickvault Rust** (brutex = reference only, no code pulled), reusing the same WAL/ring/spill/DLQ/aggregator chain. It adds NO Dhan connection. See that file for the verbatim authorization + contract.
 
-**The only WebSocket connections this product will EVER open:**
+**The only WebSocket connections this product will EVER open:** (Dhan; the Groww second feed is governed separately per the 2026-06-19 extension above)
 
 | WS type | Count | Allowed instruments | Mode |
 |---|---|---|---|
