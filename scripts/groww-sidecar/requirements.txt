@@ -1,0 +1,4 @@
+# Groww validation sidecar (LOCAL-ONLY, operator lock §32).
+# Pin to the version you verify on your Mac; >= the researched 1.5.0.
+growwapi>=1.5.0
+pyotp>=2.9.0
