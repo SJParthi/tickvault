@@ -237,6 +237,13 @@ async fn main() -> Result<()> {
     // in later PRs of this sequence — until then these WARNs make the partial
     // state explicit (no illusion).
     let feeds = &config.feeds;
+    // Feed-toggle API (operator AskUserQuestion 2026-06-19): ONE shared
+    // `Arc<FeedRuntimeState>` seeded from config, handed to BOTH the API state
+    // (so `POST /api/feeds/{feed}` flips it) AND the Groww bridge (which reads it
+    // live each loop) — so a runtime toggle is observed without a restart.
+    let feed_runtime = std::sync::Arc::new(
+        tickvault_api::feed_state::FeedRuntimeState::from_config(feeds),
+    );
     info!(
         dhan_enabled = feeds.dhan_enabled,
         groww_enabled = feeds.groww_enabled,
@@ -251,12 +258,17 @@ async fn main() -> Result<()> {
         );
     }
     if feeds.groww_enabled {
-        // Groww data-plane schema — ensure the Groww tables exist with the
-        // correct DEDUP keys + `feed` column BEFORE the bridge writes. This runs
-        // for EVERY groww_enabled mode (Groww-only AND Dhan+Groww), and crucially
-        // BEFORE the Step C gate below — so a Groww-only run (which returns at the
-        // gate, skipping the Dhan block's DDL) still gets correct schema instead
-        // of QuestDB ILP auto-creating a keyless, feed-less table (3-agent
+        // Groww data-plane schema — ensure the tables the Groww bridge writes
+        // exist with the correct feed-extended DEDUP keys + `feed` column BEFORE
+        // the bridge writes. Groww uses the SAME tables as Dhan (operator
+        // 2026-06-19 "same tables + feed column"): the SHARED `ticks` + the SHARED
+        // 21 `candles_<tf>` tables (both ensures DELEGATE to the canonical shared
+        // DDL); only `groww_cross_verify_1m_audit` (the live-vs-backtest parity
+        // table) stays an isolated `groww_*` table. This runs for EVERY
+        // groww_enabled mode (Groww-only AND Dhan+Groww), and crucially BEFORE the
+        // Step C gate below — so a Groww-only run (which returns at the gate,
+        // skipping the Dhan block's DDL) still gets correct schema instead of
+        // QuestDB ILP auto-creating a keyless, feed-less table (3-agent
         // hostile-review HIGH, 2026-06-19). Idempotent CREATE/ALTER, cold path.
         tickvault_storage::groww_persistence::ensure_groww_live_ticks_table(&config.questdb).await;
         tickvault_storage::groww_candle_persistence::ensure_groww_candles_1m_table(&config.questdb)
@@ -290,18 +302,46 @@ async fn main() -> Result<()> {
         });
 
         // Groww bridge — consumes the sidecar's capture-at-receipt tick file →
-        // groww_live_ticks + groww_candles_1m (isolated groww_* tables only).
+        // SHARED `ticks` + SHARED `candles_1m`, every row tagged feed='groww'
+        // (distinguished from Dhan's feed='dhan' by the feed-extended DEDUP keys).
         // Dormant (no writes) until the Python sidecar appends; default OFF, so
         // the Dhan boot path is unaffected.
         let groww_qdb = config.questdb.clone();
         info!(
             "[feeds] groww_enabled=true — starting Groww bridge (dormant until the \
-             sidecar tick file appears; isolated groww_* tables, no Dhan impact)"
+             sidecar tick file appears; writes feed='groww' rows into the shared \
+             tables, no Dhan impact)"
         );
         tokio::spawn(tickvault_app::groww_bridge::run_groww_bridge(
             groww_qdb,
             std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
+            std::sync::Arc::clone(&feed_runtime),
         ));
+
+        // Groww sidecar auto-launcher (operator "no manual commands" 2026-06-19).
+        // tickvault itself auto-provisions an isolated Python venv (one-time,
+        // idempotent `python -m venv` + `pip install growwapi pyotp`), fetches the
+        // SSM Groww creds and injects them as env, spawns the producer sidecar, and
+        // supervises it (restart-on-crash with backoff; stop/resume on the runtime
+        // feed toggle). The operator NEVER runs pip/python by hand — flipping
+        // `groww_enabled` (config OR the /api/feeds endpoint) is the only action.
+        // Default OFF; touches NO Dhan path.
+        info!(
+            "[feeds] groww_enabled=true — starting Groww sidecar supervisor \
+             (auto-provisions an isolated Python env + launches/restarts the \
+             producer; no manual commands required)"
+        );
+        tokio::spawn(
+            tickvault_app::groww_sidecar_supervisor::run_groww_sidecar_supervisor(
+                std::sync::Arc::clone(&feed_runtime),
+                tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
+            ),
+        );
+
+        // The Groww lane is now actually running — so the feed-toggle API reports
+        // `groww_lane_running: true` and a runtime toggle genuinely pauses/resumes
+        // it (rather than recording a flag with no lane to act on it).
+        feed_runtime.mark_groww_lane_running();
     }
     // Step C (pluggable-feed-runtime.md §6): the Dhan disable-gate is now LIVE.
     // The actual skip-and-idle branch is below (just before the Dhan fast/slow
@@ -1844,12 +1884,14 @@ async fn main() -> Result<()> {
         // only the 4 indices themselves are tracked.
 
         // --- Background: API server ---
-        let api_state = SharedAppState::new(
+        let api_state = SharedAppState::new_with_feed_runtime(
             config.questdb.clone(),
             config.dhan.clone(),
             config.instrument.clone(),
             // clone (not move) so the post-market task spawn below can also hold it
             health_status.clone(),
+            // SAME feed-runtime Arc the Groww bridge holds → API toggles are live.
+            std::sync::Arc::clone(&feed_runtime),
         );
 
         // 2026-04-25 security audit (PR #357): SSM-only bearer token resolution
@@ -4682,11 +4724,13 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 11: Start axum API server
     // -----------------------------------------------------------------------
-    let api_state = SharedAppState::new(
+    let api_state = SharedAppState::new_with_feed_runtime(
         config.questdb.clone(),
         config.dhan.clone(),
         config.instrument.clone(),
         health_status,
+        // SAME feed-runtime Arc the Groww bridge holds → API toggles are live.
+        std::sync::Arc::clone(&feed_runtime),
     );
 
     // 2026-04-25 security audit (PR #357): API bearer token sourced from AWS

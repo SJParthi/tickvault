@@ -70,9 +70,11 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // separate table — Groww writes the SHARED `ticks` table tagged feed='groww',
     // which is already HOUR-partitioned + retention-swept above. So no
     // `groww_live_ticks` entry here.
-    // Groww second-feed 1-minute candles (operator lock §32): aggregated OHLCV,
-    // PARTITION BY DAY — swept like the Dhan candle tables.
-    "groww_candles_1m",
+    // (2026-06-19 Step 3b-ii) Groww 1-minute candles ALSO no longer have a
+    // separate `groww_candles_1m` table — Groww writes the SHARED `candles_1m`
+    // tagged feed='groww', which is already swept via `candle_table_names()` in
+    // `detach_old_partitions` (the 21 plain candle tables). So no
+    // `groww_candles_1m` entry here.
     // Groww second-feed live-vs-backtest 1m parity mismatches (operator lock §32):
     // one row per mismatched (instrument, minute, field) — same SEBI-audit class +
     // DAY partitioning as cross_verify_1m_audit. Isolated `groww_*` namespace.

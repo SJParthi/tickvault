@@ -56,6 +56,16 @@ fn build_ilp_conf_string(host: &str, ilp_port: u16) -> String {
     format!("tcp::addr={host}:{ilp_port};")
 }
 
+/// Broker-source label this writer stamps on every candle row.
+///
+/// Operator lock 2026-06-19 ("same tables + feed column"): the Dhan candle
+/// writer stamps a constant `feed='dhan'` so a Dhan candle and a Groww
+/// candle (`feed='groww'`) for the SAME `(ts, security_id, segment)` minute
+/// are BOTH kept by the `DEDUP_KEY_CANDLES` 4-column key — distinct broker
+/// feeds are distinct observations, never a duplicate. A `&'static str`
+/// constant: zero-alloc, O(1), replay-stable (never per-row computed).
+pub const CANDLE_FEED_DHAN: &str = "dhan";
+
 /// ILP writer for the 21 plain `candles_<tf>` tables.
 ///
 /// Single producer (the async writer task is the sole owner) —
@@ -193,6 +203,12 @@ impl ShadowCandleWriter {
         self.buffer
             .table(row.table_name)
             .with_context(|| format!("candle append: invalid table name {}", row.table_name))?
+            // Feed-provenance label (operator 2026-06-19, "same tables + feed
+            // column"). Constant `feed='dhan'` — part of the DEDUP key so a Dhan
+            // candle and a Groww candle for the same minute/instrument never
+            // collide. Stamped as a SYMBOL alongside `segment`. Zero-alloc.
+            .symbol("feed", CANDLE_FEED_DHAN)
+            .with_context(|| "candle append: symbol(feed) failed")?
             .symbol("segment", row.segment)
             .with_context(|| "candle append: symbol(segment) failed")?
             .column_i64("security_id", row.security_id)
@@ -416,6 +432,28 @@ mod tests {
         .expect("append");
         let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
         assert!(s.contains("IDX_I"), "expected IDX_I in bytes, got {s}");
+    }
+
+    #[test]
+    fn test_append_seal_stamps_feed_dhan_in_wire_bytes() {
+        // Operator 2026-06-19 "same tables + feed column": every Dhan candle
+        // row MUST carry the constant `feed=dhan` SYMBOL so it never collides
+        // with a Groww candle (`feed=groww`) under the 4-column DEDUP key.
+        let mut w = ShadowCandleWriter::for_test();
+        w.append_seal(&mk_seal(
+            13,
+            EXCHANGE_SEGMENT_IDX_I,
+            TfIndex::M1,
+            1_716_000_900,
+            100.0,
+        ))
+        .expect("append");
+        let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+        assert!(
+            s.contains("feed=dhan"),
+            "expected feed=dhan SYMBOL in ILP bytes, got {s}"
+        );
+        assert_eq!(CANDLE_FEED_DHAN, "dhan", "feed label constant must be dhan");
     }
 
     #[test]

@@ -413,13 +413,21 @@ pub fn parse_our_candles_dataset(body: &str) -> Vec<MinuteCandle> {
 /// trading day. Pure (testable). `trading_date` is the IST date; the day window
 /// is `[date 00:00, date+1 00:00)` in IST nanoseconds (QuestDB stores `ts` in
 /// IST nanos for live candles).
+///
+/// **Feed-scoped (operator 2026-06-19, "same tables + feed column"):** since the
+/// `candles_1m` table is now shared by Dhan and Groww (distinguished by the
+/// `feed` column), this cross-verify — which compares OUR live candles against
+/// Dhan's REST intraday — MUST filter `feed = 'dhan'`. Without it, once Groww is
+/// enabled the SELECT would return two rows per minute (one per feed) and the
+/// minute-by-minute exact compare would see phantom mismatches / double minutes.
 #[must_use]
 pub fn our_candles_select_sql(security_id: i64, segment: &str, day_start_ist_nanos: i64) -> String {
     let day_end = day_start_ist_nanos.saturating_add(86_400 * NANOS_PER_SEC);
+    let feed = tickvault_storage::shadow_candle_writer::CANDLE_FEED_DHAN;
     format!(
         "SELECT (ts / 1) AS ts_nanos, open, high, low, close, volume \
          FROM candles_1m \
-         WHERE security_id = {security_id} AND segment = '{segment}' \
+         WHERE security_id = {security_id} AND segment = '{segment}' AND feed = '{feed}' \
          AND ts >= {day_start_ist_nanos} AND ts < {day_end} ORDER BY ts ASC"
     )
 }
@@ -1038,6 +1046,9 @@ mod tests {
         assert!(sql.contains("FROM candles_1m"));
         assert!(sql.contains("security_id = 13"));
         assert!(sql.contains("segment = 'IDX_I'"));
+        // feed-scoped to Dhan so a shared (Dhan+Groww) candles_1m table does
+        // not double-count minutes in the Dhan-vs-Dhan-historical compare.
+        assert!(sql.contains("feed = 'dhan'"));
         assert!(sql.contains("ORDER BY ts ASC"));
         // day window upper bound = start + 24h in nanos.
         assert!(

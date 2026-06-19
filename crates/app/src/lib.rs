@@ -40,6 +40,9 @@ pub mod day_ohlc_orchestrator;
 pub mod boot_helpers;
 /// Groww second-feed bridge — consumer side (operator lock §32). Default-OFF.
 pub mod groww_bridge;
+/// Groww Python-sidecar auto-launcher + supervisor (operator lock §32 +
+/// "no manual commands" 2026-06-19). Default-OFF.
+pub mod groww_sidecar_supervisor;
 // PR #4 (2026-05-19): depth-20 / depth-200 modules DELETED (operator-locked
 // per websocket-connection-scope-lock.md — 4-IDX_I uses 1 main-feed conn
 // + 1 order-update conn only).
