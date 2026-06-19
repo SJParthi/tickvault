@@ -74,10 +74,19 @@ and replaced with the hard bans in this rule.
    below) is also retired — there is no REST historical fetcher in
    the codebase anymore.
 
-5. **`ticks` table** has ONE write path: `run_tick_processor` in
-   `crates/core/src/pipeline/tick_processor.rs`, which consumes the WAL
-   / SPSC from the WebSocket connection pool. Any NEW writer to `ticks`
-   requires Parthiban approval.
+5. **`ticks` table — MULTI-LIVE-FEED ALLOWED (operator decision 2026-06-19),
+   historical→ticks STILL BANNED.** The `ticks` table is populated EXCLUSIVELY
+   from **LIVE** market-data feeds — Dhan (`run_tick_processor`) AND, when
+   enabled, Groww (the Groww bridge / native client). Both are live sources, so
+   both are allowed; every row carries a `feed` SYMBOL column (`'dhan'` /
+   `'groww'`) and the DEDUP key includes `feed`
+   (`(ts, security_id, segment, capture_seq, feed)`) so feeds never overwrite
+   each other. Operator quote: *"db tables should be same … only new new feeds
+   can be added."* What STAYS banned (unchanged): **synthesized / historical /
+   REST-derived ticks** into `ticks` — `BackfillWorker`, `run_backfill`,
+   `synthesize_ticks`, `append_tick` in any historical/synth path (rules 1-4, 6).
+   A NEW *live* feed writer to `ticks` (tagged `feed`) is allowed under this
+   rule; a NEW *non-live* writer still requires Parthiban approval.
 
 6. **`TickGapTracker`** still detects gaps for observability (metrics +
    Telegram), but the gap event NO LONGER triggers any backfill. Missing
