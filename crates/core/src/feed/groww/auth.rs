@@ -36,7 +36,7 @@ use crate::auth::totp_generator::generate_totp_code;
 use crate::auth::types::GrowwCredentials;
 
 /// Groww access-token endpoint (full URL — single hardcoded const, no joining).
-pub const GROWW_ACCESS_TOKEN_URL: &str = "https://api.groww.in/v1/token/api/access";
+pub const GROWW_TOKEN_ENDPOINT_URL: &str = "https://api.groww.in/v1/token/api/access";
 
 /// Groww API version header name (required on the access-token request).
 pub const GROWW_API_VERSION_HEADER: &str = "x-api-version";
@@ -55,10 +55,11 @@ struct AccessTokenRequest<'a> {
 }
 
 /// Response body for the Groww access-token endpoint. `token` is the documented
-/// field; aliases are accepted defensively in case the SDK label differs.
+/// field; the camelCase `accessToken` alias is accepted defensively (Groww's
+/// JSON is camelCase throughout — `tsInMillis`, `growwOrderId`, etc.).
 #[derive(Debug, Deserialize)]
 struct AccessTokenResponse {
-    #[serde(alias = "access_token", alias = "accessToken")]
+    #[serde(alias = "accessToken")]
     token: String,
 }
 
@@ -110,7 +111,7 @@ pub async fn obtain_groww_access_token(
     })?;
 
     let response = http
-        .post(GROWW_ACCESS_TOKEN_URL)
+        .post(GROWW_TOKEN_ENDPOINT_URL)
         .bearer_auth(creds.api_key.expose_secret())
         .header(GROWW_API_VERSION_HEADER, GROWW_API_VERSION_VALUE)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -176,7 +177,7 @@ mod tests {
     #[test]
     fn test_access_token_url_and_version_are_groww_v1() {
         assert_eq!(
-            GROWW_ACCESS_TOKEN_URL,
+            GROWW_TOKEN_ENDPOINT_URL,
             "https://api.groww.in/v1/token/api/access"
         );
         assert_eq!(GROWW_API_VERSION_HEADER, "x-api-version");
@@ -201,13 +202,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_access_token_response_accepts_aliases() {
-        assert_eq!(
-            parse_access_token_response(r#"{"access_token":"xyz"}"#)
-                .expect("snake alias")
-                .expose_secret(),
-            "xyz"
-        );
+    fn test_parse_access_token_response_accepts_camel_alias() {
+        // Groww JSON is camelCase throughout, so `accessToken` is the defensive
+        // alias for the documented `token` field.
         assert_eq!(
             parse_access_token_response(r#"{"accessToken":"camel"}"#)
                 .expect("camel alias")
