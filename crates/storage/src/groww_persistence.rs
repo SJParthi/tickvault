@@ -1,23 +1,21 @@
 //! Groww live-tick persistence — second feed (operator lock 2026-06-19 §32,
-//! `groww-second-feed-scope-2026-06-19.md`). A SEPARATE QuestDB table holding
-//! raw live ticks from the Groww feed. **This is NOT the Dhan `ticks` table**
-//! and never shares a row with it — the `groww_*` namespace keeps the two feeds
-//! fully isolated (the Dhan path is byte-identical whether Groww is on or off).
+//! `groww-second-feed-scope-2026-06-19.md`). **Updated 2026-06-19 ("same tables
+//! + feed column"):** Groww writes the **SHARED Dhan `ticks` table**, tagged
+//! `feed='groww'` — there is NO separate `groww_live_ticks` table anymore. The
+//! feeds are distinguished by the `feed` SYMBOL column + the shared DEDUP key
+//! `(ts, security_id, segment, capture_seq, feed)`, so a Dhan tick and a Groww
+//! tick for the same instant are BOTH kept (never collide). The Dhan path is
+//! byte-identical when Groww is OFF (default). Groww's MILLISECOND precision is
+//! preserved because the designated `ts` is the producer's IST nanos verbatim.
 //!
-//! ## Schema
+//! ## Schema (the SHARED `ticks` table — see `tick_persistence.rs`)
 //!
-//! ```sql
-//! CREATE TABLE IF NOT EXISTS groww_live_ticks (
-//!     segment             SYMBOL,
-//!     security_id         LONG,    -- Groww exchange_token (composite key w/ segment)
-//!     ts                  TIMESTAMP,-- producer-normalised IST nanos (ms-precise)
-//!     ltp                 DOUBLE,  -- last traded price
-//!     volume              LONG,    -- cumulative day volume
-//!     exchange_ts_millis  LONG,    -- raw Groww millisecond timestamp, VERBATIM
-//!     capture_seq         LONG     -- monotonic replay-stable dedup tiebreaker
-//! ) timestamp(ts) PARTITION BY DAY
-//!   DEDUP UPSERT KEYS(ts, security_id, segment, capture_seq);
-//! ```
+//! Groww writes a subset of the shared `ticks` columns:
+//! `feed='groww'`, `segment`, `security_id`, `ltp`, `volume`,
+//! `exchange_timestamp` (IST epoch seconds), `capture_seq`, and the designated
+//! `ts` (IST nanos, ms-precise). Unset `ticks` columns (open/high/low/close/oi/…)
+//! are null for an LTP feed. DEDUP UPSERT KEYS = `(ts, security_id, segment,
+//! capture_seq, feed)`.
 //!
 //! ## Uniqueness / dedup (I-P1-11 + TICK-SEQ-01)
 //!
@@ -35,10 +33,13 @@
 //!
 //! `ts_ist_nanos` is supplied by the producer ALREADY normalised to IST nanos —
 //! this persistence layer applies NO timezone offset (tz mapping is the
-//! producer's job, discovered against the live Groww feed). Groww's raw
-//! millisecond value is preserved VERBATIM in `exchange_ts_millis` (the
-//! ms-precision advantage that motivated the second feed). `exchange_ts_millis`
-//! is NOT a DEDUP key column.
+//! producer's job, discovered against the live Groww feed). **Groww's
+//! millisecond precision IS preserved** — the designated `ts` column stores the
+//! full IST nanoseconds (`ts_ist_nanos`), so the ms is recoverable from `ts`
+//! itself (the shared `ticks` table has no separate ms column, and the Dhan
+//! feed has none either). The `GrowwLiveTickRow::exchange_ts_millis` field below
+//! is the raw producer ms kept on the in-memory row for reference/debugging; it
+//! is NOT a stored column (the canonical ms is the nanos `ts`).
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
@@ -46,14 +47,15 @@ use tracing::warn;
 
 use tickvault_common::config::QuestDbConfig;
 
-/// QuestDB table name. One row per received Groww live tick.
-pub const GROWW_LIVE_TICKS_TABLE: &str = "groww_live_ticks";
+/// The SHARED `ticks` table — Groww writes here too (operator decision
+/// 2026-06-19, "same tables + feed column"), distinguished by `feed='groww'`.
+/// Its schema + DEDUP key `(ts, security_id, segment, capture_seq, feed)` live in
+/// `tick_persistence.rs` and are ensured at boot via `ensure_tick_table_dedup_keys`.
+pub const SHARED_TICKS_TABLE: &str = "ticks";
 
-/// DEDUP UPSERT key — includes the designated timestamp `ts` (QuestDB requires
-/// it), `segment` per I-P1-11, and `capture_seq` per TICK-SEQ-01. The
-/// `dedup_segment_meta_guard` workspace test scans this constant; it MUST
-/// mention `segment`.
-pub const DEDUP_KEY_GROWW_LIVE_TICKS: &str = "ts, security_id, segment, capture_seq";
+/// Broker-source label for Groww rows in the shared `ticks` table. `&'static str`
+/// → zero-alloc, O(1) symbol write. Mirrors `tick_persistence::TICK_FEED_DHAN`.
+pub const GROWW_FEED_LABEL: &str = "groww";
 
 /// One Groww live tick ready for ILP write. `ltp` is `f64` (the Groww SDK
 /// emits a native float — no `f32_to_f64_clean` widening concern, which is
@@ -72,105 +74,26 @@ pub struct GrowwLiveTickRow {
     pub ltp: f64,
     /// Cumulative day volume.
     pub volume: i64,
-    /// Raw Groww millisecond timestamp, stored VERBATIM. NOT a DEDUP key column.
+    /// Raw Groww millisecond timestamp (reference/debug only — NOT written as a
+    /// column; the canonical ms-precise value is the designated `ts` nanos).
     pub exchange_ts_millis: i64,
     /// Monotonic, replay-stable dedup tiebreaker (TICK-SEQ-01).
     pub capture_seq: i64,
 }
 
-/// The idempotent `CREATE TABLE` DDL for `groww_live_ticks`. Pure (testable
-/// without QuestDB).
-#[must_use]
-pub fn groww_live_ticks_create_ddl() -> String {
-    format!(
-        "CREATE TABLE IF NOT EXISTS {GROWW_LIVE_TICKS_TABLE} (\
-            feed                SYMBOL, \
-            segment             SYMBOL, \
-            security_id         LONG, \
-            ts                  TIMESTAMP, \
-            ltp                 DOUBLE, \
-            volume              LONG, \
-            exchange_ts_millis  LONG, \
-            capture_seq         LONG\
-        ) timestamp(ts) PARTITION BY DAY \
-        DEDUP UPSERT KEYS({DEDUP_KEY_GROWW_LIVE_TICKS});"
-    )
-}
-
-/// Create the `groww_live_ticks` table if absent (idempotent, schema-self-heal
-/// pattern). Failures log at `error!` (Telegram-routable) but do NOT block the
-/// caller. Only invoked when the Groww feed is enabled.
-// Boot wiring lands with the Groww producer PR (the consumer that writes this table).
-// TEST-EXEMPT: live-QuestDB DDL runner (DDL string unit-tested via groww_live_ticks_create_ddl tests).
+/// Ensure the SHARED `ticks` table + its DEDUP keys exist — Groww writes here
+/// tagged `feed='groww'` (operator decision 2026-06-19, "same tables + feed
+/// column"). Delegates to the canonical
+/// `tick_persistence::ensure_tick_table_dedup_keys` so the schema AND the
+/// `(ts, security_id, segment, capture_seq, feed)` key are IDENTICAL to Dhan's —
+/// there is no separate Groww ticks table. Invoked from the `groww_enabled` boot
+/// block so Groww-only mode (which skips the Dhan boot) still has `ticks` ready.
+// TEST-EXEMPT: thin delegate to the tested shared ensurer (needs live QuestDB).
 pub async fn ensure_groww_live_ticks_table(questdb_config: &QuestDbConfig) {
-    use std::time::Duration;
-    use tracing::error;
-
-    let base_url = format!(
-        "http://{}:{}/exec",
-        questdb_config.host, questdb_config.http_port
-    );
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(err) => {
-            error!(
-                ?err,
-                "groww_live_ticks: HTTP client build failed — table not ensured"
-            );
-            return;
-        }
-    };
-    let ddl = groww_live_ticks_create_ddl();
-    match client
-        .get(&base_url)
-        .query(&[("query", ddl.as_str())])
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => {}
-        Ok(resp) => {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            error!(%status, body = %body.chars().take(200).collect::<String>(),
-                "groww_live_ticks: CREATE TABLE returned non-2xx");
-        }
-        Err(err) => error!(?err, "groww_live_ticks: CREATE TABLE request failed"),
-    }
-
-    // Feed-provenance label (operator 2026-06-19): future-ready broker source
-    // column. Additive + idempotent; NON-key. Self-heal so a pre-existing
-    // groww_live_ticks table gains it. Free on every boot.
-    match client
-        .get(&base_url)
-        .query(&[("query", groww_live_ticks_alter_add_feed_ddl())])
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => {}
-        Ok(resp) => {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            error!(%status, body = %body.chars().take(200).collect::<String>(),
-                "groww_live_ticks: ALTER ADD COLUMN feed returned non-2xx");
-        }
-        Err(err) => error!(
-            ?err,
-            "groww_live_ticks: ALTER ADD COLUMN feed request failed"
-        ),
-    }
+    crate::tick_persistence::ensure_tick_table_dedup_keys(questdb_config).await;
 }
 
-/// Idempotent `ALTER TABLE ADD COLUMN IF NOT EXISTS feed SYMBOL`. Pure (testable
-/// without QuestDB). Schema self-heal for the feed-provenance label.
-#[must_use]
-pub fn groww_live_ticks_alter_add_feed_ddl() -> &'static str {
-    "ALTER TABLE groww_live_ticks ADD COLUMN IF NOT EXISTS feed SYMBOL;"
-}
-
-/// Lazy-connect ILP writer for the `groww_live_ticks` table. Mirrors
+/// Lazy-connect ILP writer for Groww rows in the SHARED `ticks` table. Mirrors
 /// `PrevDayOhlcvWriter`: if QuestDB is unreachable at construction the writer
 /// still builds (`sender = None`); `append_row` fills the local buffer and
 /// `flush` returns `Err` until a reconnect lands. The durable floor for Groww
@@ -236,26 +159,36 @@ impl GrowwLiveTickWriter {
         self.pending
     }
 
-    /// Append one Groww tick row to the ILP buffer. O(1), zero alloc beyond the
-    /// buffer's internal growth.
+    /// Append one Groww tick to the ILP buffer — written to the SHARED `ticks`
+    /// table tagged `feed='groww'` (operator decision 2026-06-19, "same tables +
+    /// feed column"). The designated `ts` is `row.ts_ist_nanos` directly, so
+    /// Groww's MILLISECOND precision is preserved (the sidecar already converted
+    /// ms → IST nanos). Uniqueness is the shared key `(ts, security_id, segment,
+    /// capture_seq, feed)` — a Dhan tick and this Groww tick for the same instant
+    /// are BOTH kept. Symbols (`segment`, `feed`) precede all columns per ILP.
+    /// O(1), zero alloc beyond the buffer's internal growth.
     pub fn append_row(&mut self, row: &GrowwLiveTickRow) -> Result<()> {
         self.buffer
-            .table(GROWW_LIVE_TICKS_TABLE)
-            .with_context(|| "groww_live_ticks append: table() failed")?
+            .table(SHARED_TICKS_TABLE)
+            .with_context(|| "groww ticks append: table() failed")?
             .symbol("segment", row.segment)
-            .with_context(|| "groww_live_ticks append: symbol(segment) failed")?
+            .with_context(|| "groww ticks append: symbol(segment) failed")?
+            .symbol("feed", GROWW_FEED_LABEL)
+            .with_context(|| "groww ticks append: symbol(feed) failed")?
             .column_i64("security_id", row.security_id)
-            .with_context(|| "groww_live_ticks append: column_i64(security_id) failed")?
+            .with_context(|| "groww ticks append: column_i64(security_id) failed")?
             .column_f64("ltp", row.ltp)
-            .with_context(|| "groww_live_ticks append: column_f64(ltp) failed")?
+            .with_context(|| "groww ticks append: column_f64(ltp) failed")?
             .column_i64("volume", row.volume)
-            .with_context(|| "groww_live_ticks append: column_i64(volume) failed")?
-            .column_i64("exchange_ts_millis", row.exchange_ts_millis)
-            .with_context(|| "groww_live_ticks append: column_i64(exchange_ts_millis) failed")?
+            .with_context(|| "groww ticks append: column_i64(volume) failed")?
+            // `exchange_timestamp` LONG = IST epoch SECONDS (mirrors the Dhan
+            // column); the full ms lives in the designated `ts` below.
+            .column_i64("exchange_timestamp", row.ts_ist_nanos / 1_000_000_000)
+            .with_context(|| "groww ticks append: column_i64(exchange_timestamp) failed")?
             .column_i64("capture_seq", row.capture_seq)
-            .with_context(|| "groww_live_ticks append: column_i64(capture_seq) failed")?
+            .with_context(|| "groww ticks append: column_i64(capture_seq) failed")?
             .at(TimestampNanos::new(row.ts_ist_nanos))
-            .with_context(|| "groww_live_ticks append: at(ts) failed")?;
+            .with_context(|| "groww ticks append: at(ts) failed")?;
         self.pending = self.pending.saturating_add(1);
         Ok(())
     }
@@ -306,49 +239,11 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_key_includes_segment_and_capture_seq() {
-        // I-P1-11 + dedup_segment_meta_guard + TICK-SEQ-01 contracts.
-        assert!(DEDUP_KEY_GROWW_LIVE_TICKS.contains("segment"));
-        assert!(DEDUP_KEY_GROWW_LIVE_TICKS.contains("security_id"));
-        assert!(DEDUP_KEY_GROWW_LIVE_TICKS.contains("ts"));
-        assert!(DEDUP_KEY_GROWW_LIVE_TICKS.contains("capture_seq"));
-        // exchange_ts_millis is mutable raw data, NOT identity — must NOT be a key.
-        assert!(!DEDUP_KEY_GROWW_LIVE_TICKS.contains("exchange_ts_millis"));
-    }
-
-    #[test]
-    fn test_groww_live_ticks_create_ddl_has_all_columns_and_dedup() {
-        let ddl = groww_live_ticks_create_ddl();
-        for needle in [
-            "groww_live_ticks",
-            "feed                SYMBOL",
-            "segment             SYMBOL",
-            "security_id         LONG",
-            "ts                  TIMESTAMP",
-            "ltp                 DOUBLE",
-            "volume              LONG",
-            "exchange_ts_millis  LONG",
-            "capture_seq         LONG",
-            "DEDUP UPSERT KEYS(ts, security_id, segment, capture_seq)",
-            "PARTITION BY DAY",
-        ] {
-            assert!(ddl.contains(needle), "DDL missing: {needle}\n{ddl}");
-        }
-    }
-
-    #[test]
-    fn test_groww_live_ticks_alter_add_feed_ddl_is_idempotent_add_column() {
-        let alter = groww_live_ticks_alter_add_feed_ddl();
-        assert!(alter.contains("ALTER TABLE groww_live_ticks"));
-        assert!(alter.contains("ADD COLUMN IF NOT EXISTS feed SYMBOL"));
-    }
-
-    #[test]
-    fn test_table_name_is_groww_namespaced_not_dhan_ticks() {
-        // Isolation contract (lock §32): never the Dhan `ticks` table.
-        assert_eq!(GROWW_LIVE_TICKS_TABLE, "groww_live_ticks");
-        assert_ne!(GROWW_LIVE_TICKS_TABLE, "ticks");
-        assert!(GROWW_LIVE_TICKS_TABLE.starts_with("groww_"));
+    fn test_groww_writes_shared_ticks_table_tagged_feed_groww() {
+        // Operator decision 2026-06-19 ("same tables + feed column"): Groww
+        // writes the SHARED `ticks` table, NOT a separate groww_* table.
+        assert_eq!(SHARED_TICKS_TABLE, "ticks");
+        assert_eq!(GROWW_FEED_LABEL, "groww");
     }
 
     #[test]
@@ -360,17 +255,29 @@ mod tests {
     }
 
     #[test]
-    fn test_append_row_serialises_table_segment_and_ms_timestamp() {
+    fn test_append_row_writes_ticks_with_feed_groww_and_ms_ts() {
         let mut w = GrowwLiveTickWriter::for_test();
         w.append_row(&sample_row()).expect("append");
         assert_eq!(w.pending(), 1);
         let text = String::from_utf8_lossy(w.buffer_bytes());
-        assert!(text.contains("groww_live_ticks"), "table name on wire");
-        assert!(text.contains("NSE_EQ"), "segment on wire");
-        // The ms-precision value is preserved verbatim on the wire.
+        // SHARED `ticks` table, tagged feed=groww (NOT a groww_* table).
         assert!(
-            text.contains("exchange_ts_millis=1780000000123"),
-            "raw ms timestamp on wire: {text}"
+            text.starts_with("ticks,"),
+            "shared ticks table on wire: {text}"
+        );
+        assert!(
+            !text.contains("groww_live_ticks"),
+            "must NOT use groww_* table"
+        );
+        assert!(
+            text.contains("feed=groww"),
+            "feed=groww tag on wire: {text}"
+        );
+        assert!(text.contains("NSE_EQ"), "segment on wire");
+        // ms precision is preserved in the designated `ts` (ts_ist_nanos verbatim).
+        assert!(
+            text.contains("1780000000123000000"),
+            "ms-precise ts (nanos) on wire: {text}"
         );
         assert!(text.contains("capture_seq=42"), "capture_seq on wire");
     }
