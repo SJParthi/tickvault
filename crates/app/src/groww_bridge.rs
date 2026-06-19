@@ -35,8 +35,10 @@ use tickvault_core::feed::groww::aggregator_1m::{Groww1mAggregator, Groww1mCandl
 use tickvault_storage::groww_candle_persistence::{GrowwCandle1mRow, GrowwCandle1mWriter};
 use tickvault_storage::groww_persistence::{GrowwLiveTickRow, GrowwLiveTickWriter};
 
+/// Poll interval (milliseconds) for tailing the sidecar's append-only tick file.
+const GROWW_BRIDGE_POLL_MS: u64 = 500;
 /// Poll interval for tailing the sidecar's append-only tick file.
-const GROWW_BRIDGE_POLL: Duration = Duration::from_millis(500);
+const GROWW_BRIDGE_POLL: Duration = Duration::from_millis(GROWW_BRIDGE_POLL_MS);
 
 /// Broker-source provenance label written into the `feed` column.
 pub const GROWW_FEED_NAME: &str = "groww";
@@ -217,7 +219,10 @@ pub async fn run_groww_bridge(qdb: QuestDbConfig, tick_file_path: PathBuf) {
             };
             let seq = next_capture_seq(&capture_seq, parsed.tick.ts_ist_nanos);
             if let Err(err) = live_writer.append_row(&live_tick_row(&parsed, seq)) {
-                error!(?err, "groww bridge: groww_live_ticks append failed");
+                error!(
+                    ?err,
+                    "groww bridge: shared ticks (feed=groww) append failed"
+                );
             } else {
                 wrote_live = true;
             }
@@ -230,7 +235,7 @@ pub async fn run_groww_bridge(qdb: QuestDbConfig, tick_file_path: PathBuf) {
             }
         }
         if wrote_live && let Err(err) = live_writer.flush() {
-            warn!(?err, "groww bridge: groww_live_ticks flush failed");
+            warn!(?err, "groww bridge: shared ticks (feed=groww) flush failed");
         }
         if wrote_candle && let Err(err) = candle_writer.flush() {
             warn!(?err, "groww bridge: groww_candles_1m flush failed");
