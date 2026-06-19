@@ -226,15 +226,41 @@ struct AppStateInner {
     /// Shared HTTP client for QuestDB queries (connection pooling + keep-alive).
     /// Reused across all handler invocations instead of creating per-request.
     questdb_http_client: reqwest::Client,
+    /// Runtime per-feed enable/disable flags (feed-toggle API). The SAME `Arc`
+    /// is shared with the Groww bridge so a `POST /api/feeds/{feed}` toggle is
+    /// observed live by the feed lane. Lock-free O(1) reads.
+    feed_runtime: Arc<crate::feed_state::FeedRuntimeState>,
 }
 
 impl SharedAppState {
-    /// Creates new shared state.
+    /// Creates new shared state with a DEFAULT [`crate::feed_state::FeedRuntimeState`]
+    /// (Dhan ON, Groww OFF). Production uses [`Self::new_with_feed_runtime`] to
+    /// inject the config-seeded, bridge-shared instance; this 4-arg constructor is
+    /// retained unchanged for the existing call sites (tests).
     pub fn new(
         questdb_config: QuestDbConfig,
         dhan_config: DhanConfig,
         instrument_config: InstrumentConfig,
         health_status: SharedHealthStatus,
+    ) -> Self {
+        Self::new_with_feed_runtime(
+            questdb_config,
+            dhan_config,
+            instrument_config,
+            health_status,
+            Arc::new(crate::feed_state::FeedRuntimeState::default()),
+        )
+    }
+
+    /// Creates new shared state, injecting the shared [`crate::feed_state::FeedRuntimeState`]
+    /// `Arc` (the SAME instance passed to the Groww bridge) so the feed-toggle API
+    /// and the feed lanes observe one source of truth.
+    pub fn new_with_feed_runtime(
+        questdb_config: QuestDbConfig,
+        dhan_config: DhanConfig,
+        instrument_config: InstrumentConfig,
+        health_status: SharedHealthStatus,
+        feed_runtime: Arc<crate::feed_state::FeedRuntimeState>,
     ) -> Self {
         // Single shared HTTP client for all QuestDB queries (connection pooling).
         let questdb_http_client = reqwest::Client::builder()
@@ -253,6 +279,7 @@ impl SharedAppState {
                 rebuild_in_progress: AtomicBool::new(false),
                 health_status,
                 questdb_http_client,
+                feed_runtime,
             }),
         }
     }
@@ -288,6 +315,11 @@ impl SharedAppState {
     /// Returns the shared system health status handle.
     pub fn health_status(&self) -> &SharedHealthStatus {
         &self.inner.health_status
+    }
+
+    /// Returns the shared runtime per-feed enable/disable state (feed-toggle API).
+    pub fn feed_runtime(&self) -> &Arc<crate::feed_state::FeedRuntimeState> {
+        &self.inner.feed_runtime
     }
 }
 
@@ -351,6 +383,35 @@ mod tests {
         assert_eq!(state.questdb_config().http_port, 9000);
         // Shared HTTP client is created and accessible
         let _client = state.questdb_http_client();
+    }
+
+    #[test]
+    fn test_new_with_feed_runtime_injects_and_exposes_feed_runtime() {
+        use crate::feed_state::{Feed, FeedRuntimeState};
+        use tickvault_common::config::FeedsConfig;
+        let fr = Arc::new(FeedRuntimeState::from_config(&FeedsConfig {
+            dhan_enabled: true,
+            groww_enabled: true,
+        }));
+        let state = SharedAppState::new_with_feed_runtime(
+            QuestDbConfig {
+                host: "h".to_string(),
+                http_port: 9000,
+                pg_port: 8812,
+                ilp_port: 9009,
+            },
+            test_dhan_config(),
+            test_instrument_config(),
+            test_health_status(),
+            Arc::clone(&fr),
+        );
+        // The accessor returns the SAME shared runtime instance we injected.
+        assert!(state.feed_runtime().is_enabled(Feed::Groww));
+        fr.set_enabled(Feed::Groww, false);
+        assert!(
+            !state.feed_runtime().is_enabled(Feed::Groww),
+            "AppState shares the one Arc — a flip is observed through it"
+        );
     }
 
     #[test]
