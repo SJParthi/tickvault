@@ -137,3 +137,78 @@ Always loaded. Activates on any session that:
 - Adds/edits any file under a `crates/*/src/**/groww*` path or containing `groww`, `GrowwFeed`, `groww_live_ticks`, `groww_candles_1m`, `FeedsConfig`, `feeds.groww_enabled`, `feeds.dhan_enabled`
 - Adds any new `wss://` Groww feed URL constant
 - Edits `.claude/plans/active-plan-groww-second-feed.md`
+
+---
+
+# §32 — Python-SDK live-feed validation path (operator authorization 2026-06-19, evening)
+
+> **Authority:** this section AMENDS §4 of this same lock. The §4 blanket
+> "a `growwapi` Python dependency, or a Python sidecar process = REJECT" is
+> NARROWED below: a Python `growwapi` process is **AUTHORIZED — but ONLY** under
+> the validation contract in this section, default-OFF, isolated, never in the
+> Dhan path. All OTHER §4 REJECT conditions stand unchanged.
+
+## §32.0 The verbatim operator demands (preserve exactly)
+
+**Quote 7 (2026-06-19 evening — use the Python SDK because Groww hides the WS):**
+> "But see when they don't reveal the websocket its best to use their python sdk
+> live feed right dude"
+
+**Quote 8 (2026-06-19 evening — verify the WS URL from inside the SDK / GitHub first):**
+> "how about fetching the websocket url from inside groww python sdk dude?
+> especially does groww display any groww sdk github codes dude meanwhile can you
+> check this also dude?"
+
+**Approval (2026-06-19, AskUserQuestion):** Groww approach = "go ahead" with the
+Python-SDK live feed, after confirming the WS URL is not cleanly extractable for a
+native client today.
+
+## §32.1 Why this amendment (the verified facts — see `docs/groww-ref/02-verified-endpoints.md`)
+
+Research (cited, 2026-06-19) established:
+- Groww publishes **no official SDK source repo**; the live feed is **NATS-over-
+  WebSocket + Protobuf** at `wss://socket-api.groww.in`, with the `.proto` schema +
+  NATS subject grammar **embedded in the PyPI wheel** (not citable open source).
+- `async-nats` (the earlier-approved dep) is **TCP-only** and does NOT speak
+  NATS-over-WebSocket — so a native Rust client is **weeks** of work (NATS-over-WS
+  layer + nkey/JWT + extracted `.proto`), not days.
+- The auth REST URL `POST /v1/token/api/access` is **confirmed** and already
+  shipped natively in `crate::feed::groww::auth` (PR-2) — UNCHANGED.
+
+Therefore, for the operator's actual immediate goal — **"is Groww-live == Groww-
+backtest?"** (a validation question, §0 Quote 1) — the Python SDK is the honest
+fast path; it already contains the NATS-over-WS + nkey + protobuf decode.
+
+## §32.2 The authorized validation contract (LOCKED)
+
+| Constraint | Locked value |
+|---|---|
+| Runtime | **Local validation first** (operator's Mac; Dhan OFF, Groww ON). NO AWS/prod deploy of Python without a further dated quote. |
+| Process model | A **separate `growwapi` Python process** running `GrowwFeed`, default-OFF behind `feeds.groww_enabled`. NEVER imported into the Rust binary; NEVER on the Dhan path. |
+| Capture-at-receipt | The Python callback MUST append each received tick to a **durable append-only file the instant it arrives** (before any IPC), preserving the zero-tick-loss PRINCIPLE one hop downstream of the socket. |
+| Bridge to Rust | Python → durable file/IPC → the **existing** Rust ring→spill→DLQ→aggregator (reused, not redesigned). Rust is the consumer + 1m sealer + parity checker. |
+| Tables | `groww_*` namespaced ONLY (`groww_live_ticks`, `groww_candles_1m`, …). NEVER the Dhan `ticks`/`candles_*`. |
+| Native Rust | **Kept as the production option, not burned.** When the `.proto` is extracted from the wheel + a NATS-over-WS path exists, the Python front-end is swapped for native Rust; everything downstream stays. |
+
+## §32.3 Honest envelope (mandatory per §5 / operator-charter §F)
+
+> "100% inside the tested envelope: the Groww validation path uses the official
+> `growwapi` Python SDK (default-OFF, isolated, `groww_*` tables only); the Dhan
+> path is byte-identical. Zero-tick-loss is preserved as **capture-at-receipt**
+> (durable append-only file in the Python callback) → the existing Rust
+> ring→spill→DLQ chain — an HONEST step down from at-socket capture: a Python
+> crash in the microsecond between socket-recv and file-append is a tiny bounded
+> loss window, far better than none. O(1) is NOT claimed on the Python hop (GIL/GC
+> jitter); it IS preserved on the Rust consumer/aggregator. Native Rust (at-socket
+> O(1) capture) remains the production option once the wheel's `.proto` is
+> extracted."
+
+## §32.4 What still REJECTS (unchanged from §4, except the narrow Python carve-out above)
+
+- Python on the Dhan path, or writing to Dhan tables → REJECT.
+- Python in AWS/prod WITHOUT a further dated operator quote (this carve-out is
+  local-validation-first) → REJECT.
+- Importing `growwapi` into the Rust binary (it stays a separate process) → REJECT.
+- A weaker-than-Dhan resilience guarantee on the Groww path beyond the honestly
+  documented at-receipt window → REJECT.
+- Adding a Dhan WebSocket, or any change to the 2-Dhan-WS lock → REJECT (unchanged).
