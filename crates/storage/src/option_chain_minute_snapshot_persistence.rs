@@ -185,6 +185,35 @@ pub async fn ensure_option_chain_minute_snapshot_table(questdb_config: &QuestDbC
             );
         }
     }
+
+    // Feed-provenance label (operator 2026-06-19, "all tables"): self-heal ALTER
+    // only — additive, idempotent, NON-key; the CREATE DDL + its 27-column
+    // ratchet are untouched. Free on every boot.
+    let alter_feed_ddl = format!(
+        "ALTER TABLE {QUESTDB_TABLE_OPTION_CHAIN_MINUTE_SNAPSHOT} ADD COLUMN IF NOT EXISTS feed SYMBOL"
+    );
+    match client
+        .get(&base_url)
+        .query(&[("query", alter_feed_ddl.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => {
+            warn!(
+                table = QUESTDB_TABLE_OPTION_CHAIN_MINUTE_SNAPSHOT,
+                status = %resp.status(),
+                "ALTER ADD COLUMN feed non-2xx"
+            );
+        }
+        Err(err) => {
+            error!(
+                table = QUESTDB_TABLE_OPTION_CHAIN_MINUTE_SNAPSHOT,
+                ?err,
+                "ALTER ADD COLUMN feed request failed"
+            );
+        }
+    }
 }
 
 /// One row's worth of strike data, in the shape the writer accepts.
