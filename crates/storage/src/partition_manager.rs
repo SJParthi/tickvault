@@ -74,6 +74,10 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // Groww second-feed 1-minute candles (operator lock §32): aggregated OHLCV,
     // PARTITION BY DAY — swept like the Dhan candle tables.
     "groww_candles_1m",
+    // Groww second-feed live-vs-backtest 1m parity mismatches (operator lock §32):
+    // one row per mismatched (instrument, minute, field) — same SEBI-audit class +
+    // DAY partitioning as cross_verify_1m_audit. Isolated `groww_*` namespace.
+    "groww_cross_verify_1m_audit",
 ];
 
 /// Tables EXEMPT from retention sweeping — NEVER detached or dropped.

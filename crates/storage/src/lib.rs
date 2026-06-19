@@ -102,6 +102,11 @@ pub mod disk_health_watcher;
 pub mod groww_persistence;
 // Groww second-feed 1-minute candle persistence (operator lock §32).
 pub mod groww_candle_persistence;
+// Groww second-feed live-vs-backtest 1m parity audit (operator lock §32) — the
+// durable SEBI-retentioned record of every mismatched (instrument, minute,
+// field). Isolated `groww_*` namespace; the Dhan cross_verify_1m_audit is
+// untouched.
+pub mod groww_cross_verify_audit_persistence;
 // §21. DDL + append helpers + Row struct land in Sub-PR #10b-ζ.
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod instrument_fetch_audit_persistence;
