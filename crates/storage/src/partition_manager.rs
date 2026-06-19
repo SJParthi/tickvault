@@ -71,6 +71,9 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // DAY tables. Isolated `groww_*` namespace; the Dhan `ticks` (HOUR) is
     // untouched.
     "groww_live_ticks",
+    // Groww second-feed 1-minute candles (operator lock §32): aggregated OHLCV,
+    // PARTITION BY DAY — swept like the Dhan candle tables.
+    "groww_candles_1m",
 ];
 
 /// Tables EXEMPT from retention sweeping — NEVER detached or dropped.
