@@ -273,6 +273,20 @@ async fn main() -> Result<()> {
                 );
             }
         });
+
+        // Groww bridge — consumes the sidecar's capture-at-receipt tick file →
+        // groww_live_ticks + groww_candles_1m (isolated groww_* tables only).
+        // Dormant (no writes) until the Python sidecar appends; default OFF, so
+        // the Dhan boot path is unaffected.
+        let groww_qdb = config.questdb.clone();
+        info!(
+            "[feeds] groww_enabled=true — starting Groww bridge (dormant until the \
+             sidecar tick file appears; isolated groww_* tables, no Dhan impact)"
+        );
+        tokio::spawn(tickvault_app::groww_bridge::run_groww_bridge(
+            groww_qdb,
+            std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
+        ));
     }
     if !feeds.dhan_enabled {
         warn!(
