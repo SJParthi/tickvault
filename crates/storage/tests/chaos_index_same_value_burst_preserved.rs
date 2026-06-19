@@ -96,8 +96,11 @@ fn chaos_index_same_value_burst_preserved() {
         "FIX: the capture_seq key keeps ALL THREE ticks (45, 75, 45)"
     );
 
-    // The live dedup key really is capture_seq (not payload_hash).
-    assert_eq!(tick_dedup_key(), "security_id, segment, capture_seq");
+    // The live dedup key really is capture_seq (not payload_hash). `feed`
+    // appended 2026-06-19 (operator "same tables + feed column") — within-Dhan
+    // behaviour is unchanged (feed='dhan' constant), so the 45->75->45 burst
+    // still keeps all three.
+    assert_eq!(tick_dedup_key(), "security_id, segment, capture_seq, feed");
 }
 
 #[test]

@@ -76,13 +76,27 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 ///     (idempotent, replay-safe).
 /// `payload_hash` remains a STORED content-integrity column (no longer in the
 /// key); `received_at` likewise remains a column only. The composite
-/// `(ts, security_id, segment, capture_seq)` is the uniqueness guarantee, and
-/// `ORDER BY ts, capture_seq` reproduces exact intra-second arrival order.
+/// `(ts, security_id, segment, capture_seq, feed)` is the uniqueness guarantee,
+/// and `ORDER BY ts, capture_seq` reproduces exact intra-second arrival order.
+///
+/// **`feed` (operator decision 2026-06-19, "same tables + feed column"):** the
+/// broker-source label (`'dhan'`/`'groww'`/…). It is part of the key so a Dhan
+/// tick and a (future) Groww tick for the SAME `(ts, security_id, segment,
+/// capture_seq)` are BOTH kept — they are distinct observations from distinct
+/// feeds, never a duplicate. `feed` is replay-stable (constant per writer), so
+/// it does NOT break the capture_seq replay-idempotency guarantee.
 ///
 /// Enforced by `dedup_segment_meta_guard.rs` (workspace-wide constant scan)
 /// + `test_tick_dedup_key_includes_segment` (STORAGE-GAP-01 integration test)
 /// + `chaos_index_same_value_burst_preserved` (the 45→75→45 regression).
-const DEDUP_KEY_TICKS: &str = "security_id, segment, capture_seq";
+const DEDUP_KEY_TICKS: &str = "security_id, segment, capture_seq, feed";
+
+/// Broker-source label for Dhan-sourced rows written by this writer. The Dhan
+/// `TickPersistenceWriter` always writes Dhan ticks, so it stamps the constant
+/// `feed='dhan'`. A future Groww path stamps `'groww'` (operator decision
+/// 2026-06-19 — same `ticks` table, distinguished by `feed`). `&'static str` →
+/// zero-alloc, O(1) symbol write.
+pub const TICK_FEED_DHAN: &str = "dhan";
 
 /// Returns the DEDUP UPSERT KEY string for the ticks table.
 /// Exposed for gap enforcement integration tests (STORAGE-GAP-01).
@@ -1486,6 +1500,11 @@ pub(crate) fn build_tick_row_seq(
             segment_code_to_str(tick.exchange_segment_code),
         )
         .context("segment")?
+        // `feed` SYMBOL — broker source, part of the DEDUP key (operator 2026-06-19).
+        // ILP requires ALL symbols before any column_*, so it sits with `segment`.
+        // Constant 'dhan' here (Dhan writer); future Groww path stamps 'groww'.
+        .symbol(ColumnName::new_unchecked("feed"), TICK_FEED_DHAN)
+        .context("feed")?
         .column_i64(
             ColumnName::new_unchecked("security_id"),
             i64::from(tick.security_id),
@@ -1810,12 +1829,14 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
         }
     }
 
-    // Step 1d: Feed-provenance label (operator 2026-06-19) — future-ready broker
-    // source column (dhan/groww). Additive + idempotent (`ADD COLUMN IF NOT
-    // EXISTS`); NON-key (the DEDUP key is UNCHANGED, so existing rows + dedup
-    // behaviour are untouched — uniqueness is already O(1) via the composite key
-    // + the separate per-feed `groww_live_ticks` table). Self-heal so existing
-    // live `ticks` tables gain the column at boot.
+    // Step 1d: Feed-provenance label (operator 2026-06-19, "same tables + feed
+    // column") — broker source column (`'dhan'`/`'groww'`). It IS part of the
+    // DEDUP key now (`DEDUP_KEY_TICKS` includes `feed`), so a Dhan tick and a
+    // Groww tick for the same `(ts, security_id, segment, capture_seq)` are BOTH
+    // kept (distinct feeds = distinct observations). MUST run BEFORE the
+    // `DEDUP ENABLE UPSERT KEYS(...)` below so the key column exists on
+    // pre-existing tables. Additive + idempotent (`ADD COLUMN IF NOT EXISTS`);
+    // self-heal so existing live `ticks` tables gain the column at boot.
     let add_feed_sql =
         format!("ALTER TABLE \"{QUESTDB_TABLE_TICKS}\" ADD COLUMN IF NOT EXISTS feed SYMBOL");
     match client
@@ -3254,7 +3275,12 @@ mod tests {
              same-value same-second index ticks (data loss); it stays a stored \
              content-integrity column only"
         );
-        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, capture_seq");
+        assert!(
+            DEDUP_KEY_TICKS.contains("feed"),
+            "feed must be in the dedup key (operator 2026-06-19, same tables) so a \
+             Dhan tick and a Groww tick for the same instant are BOTH kept"
+        );
+        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, capture_seq, feed");
     }
 
     // --- payload_hash dedup tiebreaker (2026-06-08) -------------------------
@@ -4479,8 +4505,9 @@ mod tests {
 
     #[test]
     fn test_tick_dedup_key_exact_value() {
-        // STORAGE-GAP-01 (segment) + sub-second preservation (received_at).
-        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, capture_seq");
+        // STORAGE-GAP-01 (segment) + sub-second preservation (capture_seq) +
+        // multi-feed uniqueness (feed, operator 2026-06-19).
+        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, capture_seq, feed");
     }
 
     #[test]
@@ -4591,7 +4618,7 @@ mod tests {
 
     #[test]
     fn test_dedup_key_ticks_exact_format() {
-        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, capture_seq");
+        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, capture_seq, feed");
     }
 
     #[test]
@@ -9616,10 +9643,35 @@ mod tests {
 
     #[test]
     fn test_dedup_key_is_capture_seq_after_flip() {
-        // TICK-SEQ-01 PR-2b: the dedup tiebreaker is now the replay-stable
+        // TICK-SEQ-01 PR-2b: the dedup tiebreaker is the replay-stable
         // capture_seq (not payload_hash) — the regression pin for the 45->75->45
-        // index tick-loss fix.
-        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, capture_seq");
+        // index tick-loss fix. 2026-06-19: `feed` appended (operator "same tables
+        // + feed column") so multi-feed rows for the same instant never collide.
+        assert_eq!(DEDUP_KEY_TICKS, "security_id, segment, capture_seq, feed");
+    }
+
+    #[test]
+    fn test_dedup_key_includes_feed_and_segment_and_capture_seq() {
+        // Multi-feed uniqueness contract (operator 2026-06-19) + I-P1-11 segment.
+        assert!(DEDUP_KEY_TICKS.contains("feed"));
+        assert!(DEDUP_KEY_TICKS.contains("segment"));
+        assert!(DEDUP_KEY_TICKS.contains("capture_seq"));
+        assert!(DEDUP_KEY_TICKS.contains("security_id"));
+    }
+
+    #[test]
+    fn test_tick_row_stamps_feed_dhan_symbol() {
+        // The Dhan writer stamps feed='dhan' on every ticks row so the DEDUP key
+        // column is populated (a null-feed row would not dedup against a 'dhan' row).
+        let mut writer = TickPersistenceWriter::new_disconnected(&disconnected_cfg());
+        let tick = make_test_tick(13, 24_500.5);
+        build_tick_row_seq(writer.buffer_mut(), &tick, 1).expect("row build");
+        let content = String::from_utf8_lossy(writer.buffer_mut().as_bytes());
+        assert!(
+            content.contains("feed=dhan"),
+            "ILP row must stamp feed=dhan. Got: {content}"
+        );
+        assert_eq!(TICK_FEED_DHAN, "dhan");
     }
 
     // --- CRITICAL #4: ticks-populated parser (never auto-DROP populated table) ---

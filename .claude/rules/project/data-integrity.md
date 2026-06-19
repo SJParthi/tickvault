@@ -14,10 +14,18 @@ paths:
 - QuestDB: designated timestamp + security_id as natural dedup key
 
 ## Tick Deduplication
-- **QuestDB `ticks` DEDUP UPSERT KEY = `(ts, security_id, segment, capture_seq)`**
+- **QuestDB `ticks` DEDUP UPSERT KEY = `(ts, security_id, segment, capture_seq, feed)`**
   (`DEDUP_KEY_TICKS` in `crates/storage/src/tick_persistence.rs`) — TICK-SEQ-01.
   - `ts` = `exchange_timestamp × 1e9` (Dhan LTT, SECOND-granular).
   - `segment` — mandatory (I-P1-11; `security_id` reused across segments).
+  - `feed` — broker source label (`'dhan'`/`'groww'`/…), added 2026-06-19
+    (operator "same tables + feed column"). Part of the key so a Dhan tick and a
+    Groww tick for the SAME `(ts, security_id, segment, capture_seq)` are BOTH
+    kept (distinct feeds = distinct observations, never a duplicate). Replay-
+    stable (constant per writer — the Dhan `TickPersistenceWriter` stamps
+    `TICK_FEED_DHAN='dhan'`), so it does NOT break the capture_seq replay-
+    idempotency guarantee. Pinned by `test_dedup_key_ticks_exact_format` +
+    `test_tick_row_stamps_feed_dhan_symbol`.
   - `capture_seq` — the sub-second tiebreaker AND the replay-idempotency key. It
     is a strictly-monotonic, **replay-stable** sequence stamped ONCE at the WS
     read instant (`ws_frame_spill::next_frame_seq` = `max(prev+1, wall_nanos)`,
