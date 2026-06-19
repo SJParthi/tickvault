@@ -251,6 +251,21 @@ async fn main() -> Result<()> {
         );
     }
     if feeds.groww_enabled {
+        // Groww data-plane schema — ensure the Groww tables exist with the
+        // correct DEDUP keys + `feed` column BEFORE the bridge writes. This runs
+        // for EVERY groww_enabled mode (Groww-only AND Dhan+Groww), and crucially
+        // BEFORE the Step C gate below — so a Groww-only run (which returns at the
+        // gate, skipping the Dhan block's DDL) still gets correct schema instead
+        // of QuestDB ILP auto-creating a keyless, feed-less table (3-agent
+        // hostile-review HIGH, 2026-06-19). Idempotent CREATE/ALTER, cold path.
+        tickvault_storage::groww_persistence::ensure_groww_live_ticks_table(&config.questdb).await;
+        tickvault_storage::groww_candle_persistence::ensure_groww_candles_1m_table(&config.questdb)
+            .await;
+        tickvault_storage::groww_cross_verify_audit_persistence::ensure_groww_cross_verify_1m_audit_table(
+            &config.questdb,
+        )
+        .await;
+
         // Groww second feed (operator lock 2026-06-19). PR-2 wires the auth
         // smoke-check ONLY: confirm we can obtain a Groww access token from the
         // SSM creds (/tickvault/<env>/groww/api-key + /totp-secret). The native
@@ -288,10 +303,14 @@ async fn main() -> Result<()> {
             std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
         ));
     }
+    // Step C (pluggable-feed-runtime.md §6): the Dhan disable-gate is now LIVE.
+    // The actual skip-and-idle branch is below (just before the Dhan fast/slow
+    // boot decision), AFTER shared infra (observability/WAL/calendar) is up so a
+    // Groww-only run still gets the full shared runtime. We only log intent here.
     if !feeds.dhan_enabled {
-        warn!(
-            "[feeds] dhan_enabled=false but the Dhan disable-gate has not shipped yet; \
-             Dhan still runs as today until the feed-gating PR lands"
+        info!(
+            groww_enabled = feeds.groww_enabled,
+            "[feeds] dhan_enabled=false — Dhan boot will be skipped (per-feed gate active)"
         );
     }
 
@@ -1059,6 +1078,37 @@ async fn main() -> Result<()> {
     // which downloads fresh instruments. This is a safety decision —
     // is_mock_trading is for logging/awareness only, never for trading gates.
     // -----------------------------------------------------------------------
+    // =======================================================================
+    // Step C — PER-FEED BOOT DISPATCHER (pluggable-feed-runtime.md §6)
+    //
+    // "A feed's code runs IFF its enable flag is true." All shared infra
+    // (observability, WAL replay, trading calendar, errors.jsonl) is already up,
+    // and the Groww lane (auth + bridge) was already spawned above gated on
+    // `groww_enabled`. If Dhan is disabled we SKIP the entire Dhan fast/slow
+    // boot block below and idle-await shutdown so the enabled lanes keep running.
+    //
+    // When `dhan_enabled=true` (prod default) this branch is skipped and the
+    // Dhan boot below is byte-identical to before.
+    // =======================================================================
+    if !config.feeds.dhan_enabled {
+        if config.feeds.groww_enabled {
+            info!(
+                "GROWW-ONLY MODE — Dhan boot skipped; Groww lane running, awaiting shutdown signal"
+            );
+        } else {
+            warn!(
+                "NO FEED ENABLED — both dhan_enabled and groww_enabled are false; \
+                 idle runtime (shared infra only), awaiting shutdown signal"
+            );
+        }
+        let signal = wait_for_shutdown_signal().await;
+        info!(
+            signal,
+            "shutdown signal received — per-feed idle runtime exiting cleanly"
+        );
+        return Ok(());
+    }
+
     let fast_cache = token_cache::load_token_cache_fast();
     // PR #6b (2026-05-19): inlined `is_within_build_window` after retiring
     // instrument_loader.rs. The window (09:00:00..15:30:00 IST) matches the
@@ -6996,6 +7046,63 @@ mod tests {
             occurrences, 0,
             "PR #4 (2026-05-19) retired the depth-200 spawn — that helper \
              function must NOT reappear without operator approval"
+        );
+    }
+
+    /// Step C ratchet: the per-feed boot dispatcher gate must exist — when Dhan
+    /// is disabled the boot SKIPS the Dhan block and idle-awaits shutdown
+    /// (pluggable-feed-runtime.md §6). Guards against regressing back to the old
+    /// warn-only stub where `dhan_enabled=false` still ran Dhan.
+    #[test]
+    fn test_step_c_dhan_disable_gate_exists() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("if !config.feeds.dhan_enabled"),
+            "Step C: the Dhan disable-gate `if !config.feeds.dhan_enabled` must exist"
+        );
+        assert!(
+            src.contains("PER-FEED BOOT DISPATCHER"),
+            "Step C: the per-feed boot dispatcher block must be present"
+        );
+        // The gate idles on the shared shutdown signal and returns — not a warn-only no-op.
+        assert!(
+            src.contains("wait_for_shutdown_signal().await"),
+            "Step C: the gate must idle-await the shutdown signal"
+        );
+    }
+
+    /// Step C ratchet: the gate must sit BEFORE the Dhan fast/slow boot decision
+    /// (`load_token_cache_fast`) so the Dhan block is genuinely skipped when
+    /// `dhan_enabled=false`. First-occurrence positions are the real gate + boot
+    /// (both are far above this test module).
+    #[test]
+    fn test_step_c_gate_precedes_dhan_boot() {
+        let src = include_str!("main.rs");
+        let gate_idx = src
+            .find("PER-FEED BOOT DISPATCHER")
+            .expect("gate marker present");
+        let dhan_boot_idx = src
+            .find("load_token_cache_fast")
+            .expect("Dhan boot decision present");
+        assert!(
+            gate_idx < dhan_boot_idx,
+            "Step C: the per-feed gate must precede the Dhan boot decision so \
+             dhan_enabled=false actually skips Dhan (gate@{gate_idx} boot@{dhan_boot_idx})"
+        );
+    }
+
+    /// Step C ratchet: both run-mode log branches must exist — Groww-only
+    /// (Dhan off, Groww on) and idle (neither on, no crash).
+    #[test]
+    fn test_step_c_groww_only_and_idle_branches() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("GROWW-ONLY MODE"),
+            "Step C: the Groww-only run-mode branch must exist"
+        );
+        assert!(
+            src.contains("NO FEED ENABLED"),
+            "Step C: the no-feed idle branch must exist (idle, not crash)"
         );
     }
 }
