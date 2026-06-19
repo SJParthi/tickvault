@@ -1,7 +1,8 @@
 //! Groww live-vs-backtest 1-minute parity check — the deliverable that answers
 //! *"is Groww live == Groww backtest?"* (operator lock §32 / §0 Quote 1).
 //!
-//! Pure, in-memory, **exact-match** comparison of our live `groww_candles_1m`
+//! Pure, in-memory, **exact-match** comparison of our live candles (the shared
+//! `candles_1m` table, `feed='groww'`)
 //! against Groww's own backtest 1-minute candles, minute-by-minute,
 //! field-by-field — ZERO tolerance (mirrors the Dhan `cross_verify_1m` zero-EPS
 //! rule). Self-contained (no I/O / network / DB) so it is fully offline-unit-

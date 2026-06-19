@@ -1,7 +1,8 @@
 //! Groww live-vs-backtest 1-minute parity audit (operator lock §32, 2026-06-19).
 //! The durable, queryable, SEBI-retentioned system-of-record for the Groww
 //! parity check: at the post-market run we compare every Groww-subscribed
-//! instrument's live `groww_candles_1m` OHLCV against Groww's OWN backtest
+//! instrument's live candles (the shared `candles_1m` table, `feed='groww'`)
+//! OHLCV against Groww's OWN backtest
 //! 1-minute candles, timestamp-by-timestamp, EXACT match (mirrors the Dhan
 //! `cross_verify_1m_audit` zero-tolerance rule). Each mismatched field-cell is
 //! one row here; the per-day mismatch COUNT is the quality signal that answers
@@ -24,7 +25,7 @@
 //!     security_id      LONG,
 //!     minute_ts_ist    TIMESTAMP,   -- the mismatched 1-min bucket (IST nanos)
 //!     field            SYMBOL,      -- open / high / low / close / volume
-//!     live_value       DOUBLE,      -- our groww_candles_1m value
+//!     live_value       DOUBLE,      -- our candles_1m (feed='groww') value
 //!     backtest_value   DOUBLE       -- Groww's authoritative backtest value
 //! ) timestamp(ts) PARTITION BY DAY
 //!   DEDUP UPSERT KEYS(trading_date_ist, security_id, segment, minute_ts_ist, field);
@@ -104,7 +105,7 @@ pub struct GrowwParityMismatchRow {
     pub minute_ts_ist_nanos: i64,
     /// Which field disagreed.
     pub field: GrowwMismatchField,
-    /// Our `groww_candles_1m` value.
+    /// Our live candle value (shared `candles_1m` table, `feed='groww'`).
     pub live_value: f64,
     /// Groww's authoritative backtest value.
     pub backtest_value: f64,

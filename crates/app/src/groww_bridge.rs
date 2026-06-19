@@ -2,16 +2,18 @@
 //!
 //! The Rust consumer side of the Groww feed: reads the **capture-at-receipt
 //! durable file** the Python `growwapi` sidecar appends (one NDJSON tick per
-//! line), persists each raw tick to `groww_live_ticks`, folds ticks through the
-//! [`Groww1mAggregator`], and persists sealed 1-minute candles to
-//! `groww_candles_1m`.
+//! line), persists each raw tick to the SHARED `ticks` table (tagged
+//! `feed='groww'`), folds ticks through the [`Groww1mAggregator`], and persists
+//! sealed 1-minute candles to the SHARED `candles_1m` table (tagged
+//! `feed='groww'`) — the "same tables + feed column" model (operator 2026-06-19).
 //!
-//! **Default OFF + isolated:** only runs when `feeds.groww_enabled`, writes ONLY
-//! `groww_*` tables, never touches the Dhan path. **Dormant until the sidecar
-//! exists:** the loop is a TEST-EXEMPT I/O driver; the pure, fully-unit-tested
-//! primitives are the line parser, the segment map, and the candle→row mapper.
-//! The NDJSON schema below is the Python↔Rust contract (defined consumer-side;
-//! the sidecar conforms).
+//! **Default OFF + isolated:** only runs when `feeds.groww_enabled`. It writes
+//! ONLY Groww-tagged (`feed='groww'`) rows into the shared tables, distinguished
+//! from Dhan rows (`feed='dhan'`) by the feed-extended DEDUP keys, and never
+//! touches the Dhan write path. **Dormant until the sidecar exists:** the loop is
+//! a TEST-EXEMPT I/O driver; the pure, fully-unit-tested primitives are the line
+//! parser, the segment map, and the candle→row mapper. The NDJSON schema below is
+//! the Python↔Rust contract (defined consumer-side; the sidecar conforms).
 //!
 //! ```jsonc
 //! {"security_id":1333,"segment":"NSE_EQ","ts_ist_nanos":1780000020123000000,
@@ -60,7 +62,7 @@ struct GrowwTickLine {
 }
 
 /// A parsed Groww tick — the aggregator input plus the raw fields needed for the
-/// `groww_live_ticks` row.
+/// shared `ticks` (feed='groww') row.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ParsedGrowwTick {
     tick: Groww1mTick,
@@ -99,8 +101,8 @@ fn parse_groww_tick_line(line: &str) -> Result<ParsedGrowwTick> {
     })
 }
 
-/// Builds the `groww_live_ticks` row for a parsed tick. `capture_seq` is the
-/// monotonic, replay-stable dedup tiebreaker (TICK-SEQ-01). Pure + testable.
+/// Builds the shared `ticks` (feed='groww') row for a parsed tick. `capture_seq`
+/// is the monotonic, replay-stable dedup tiebreaker (TICK-SEQ-01). Pure + testable.
 fn live_tick_row(parsed: &ParsedGrowwTick, capture_seq: i64) -> GrowwLiveTickRow {
     GrowwLiveTickRow {
         ts_ist_nanos: parsed.tick.ts_ist_nanos,
@@ -113,8 +115,9 @@ fn live_tick_row(parsed: &ParsedGrowwTick, capture_seq: i64) -> GrowwLiveTickRow
     }
 }
 
-/// Maps an aggregated [`Groww1mCandle`] to a persistable `groww_candles_1m` row,
-/// stamping the `groww` feed-provenance label. Pure + testable.
+/// Maps an aggregated [`Groww1mCandle`] to a persistable row for the SHARED
+/// `candles_1m` table, stamping the `groww` feed-provenance label (part of the
+/// shared candle DEDUP key). Pure + testable.
 fn candle_row_from_aggregated(candle: &Groww1mCandle) -> GrowwCandle1mRow {
     GrowwCandle1mRow {
         ts_ist_nanos: candle.minute_start_ist_nanos,
@@ -145,10 +148,11 @@ fn next_capture_seq(counter: &AtomicI64, wall_nanos: i64) -> i64 {
 }
 
 /// Dormant consumer driver: tails the sidecar's append-only NDJSON tick file,
-/// persists each raw tick to `groww_live_ticks`, folds them through the 1m
-/// aggregator, and persists sealed candles to `groww_candles_1m`. Runs ONLY when
-/// `feeds.groww_enabled`; writes ONLY `groww_*` tables; never touches the Dhan
-/// path. Idles (no writes) until the Python sidecar starts appending to
+/// persists each raw tick to the SHARED `ticks` table (feed='groww'), folds them
+/// through the 1m aggregator, and persists sealed candles to the SHARED
+/// `candles_1m` table (feed='groww'). Runs ONLY when `feeds.groww_enabled`;
+/// writes ONLY `feed='groww'`-tagged rows; never touches the Dhan write path.
+/// Idles (no writes) until the Python sidecar starts appending to
 /// `tick_file_path`. Loops forever; per-line/flush errors are logged, never
 /// propagated (a bad line or a transient QuestDB blip must not kill the feed).
 // TEST-EXEMPT: file-tail + live-QuestDB ILP I/O driver; the pure primitives it
@@ -228,17 +232,26 @@ pub async fn run_groww_bridge(qdb: QuestDbConfig, tick_file_path: PathBuf) {
             }
             if let Some(candle) = aggregator.on_tick(&parsed.tick) {
                 if let Err(err) = candle_writer.append_row(&candle_row_from_aggregated(&candle)) {
-                    error!(?err, "groww bridge: groww_candles_1m append failed");
+                    error!(
+                        ?err,
+                        "groww bridge: shared candles_1m (feed=groww) append failed"
+                    );
                 } else {
                     wrote_candle = true;
                 }
             }
         }
+        // Flush failures are data-at-risk (ILP-buffered Groww rows may not have
+        // reached QuestDB) — `error!` per audit Rule 5 / charter Rule 6 so they
+        // route to Telegram via ERROR-level Loki routing, never silent `warn!`.
         if wrote_live && let Err(err) = live_writer.flush() {
-            warn!(?err, "groww bridge: shared ticks (feed=groww) flush failed");
+            error!(?err, "groww bridge: shared ticks (feed=groww) flush failed");
         }
         if wrote_candle && let Err(err) = candle_writer.flush() {
-            warn!(?err, "groww bridge: groww_candles_1m flush failed");
+            error!(
+                ?err,
+                "groww bridge: shared candles_1m (feed=groww) flush failed"
+            );
         }
     }
 }

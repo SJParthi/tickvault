@@ -4,7 +4,7 @@
 //! candles. Self-contained (no I/O, no storage/network deps) so it is fully
 //! offline-unit-tested; the bridge PR maps the emitted [`Groww1mCandle`] to
 //! `tickvault_storage::groww_candle_persistence::GrowwCandle1mRow` and persists
-//! it to `groww_candles_1m`.
+//! it to the shared `candles_1m` table (tagged `feed='groww'`).
 //!
 //! ## Design
 //!
