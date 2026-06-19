@@ -214,7 +214,17 @@ async fn ensure_python_env(opts: &GrowwSidecarOptions) -> anyhow::Result<()> {
         return Ok(());
     }
     if let Some(parent) = opts.venv_dir.parent() {
-        tokio::fs::create_dir_all(parent).await.ok();
+        // Surface (don't swallow) a permissions / disk-full failure here so the
+        // operator sees the root cause, instead of a cryptic downstream venv
+        // error (security-review MEDIUM 2026-06-19). Non-fatal: venv creation
+        // below will still fail-and-retry if the dir is truly unusable.
+        if let Err(err) = tokio::fs::create_dir_all(parent).await {
+            warn!(
+                error = %err,
+                dir = %parent.display(),
+                "[feeds] groww sidecar: could not create venv parent dir (will retry via provisioning backoff)"
+            );
+        }
     }
     info!(
         venv = %opts.venv_dir.display(),
