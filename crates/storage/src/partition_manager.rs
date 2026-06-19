@@ -66,11 +66,10 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // AUDIT-WS-01 (2026-06-12): one row per WebSocket lifecycle event —
     // same SEBI-audit class + DAY partitioning as the audit tables above.
     "ws_event_audit",
-    // Groww second-feed live ticks (operator lock §32, 2026-06-19): high-volume
-    // tick table, PARTITION BY DAY — swept past the hot window like the other
-    // DAY tables. Isolated `groww_*` namespace; the Dhan `ticks` (HOUR) is
-    // untouched.
-    "groww_live_ticks",
+    // (2026-06-19 "same tables + feed column") Groww live ticks NO LONGER have a
+    // separate table — Groww writes the SHARED `ticks` table tagged feed='groww',
+    // which is already HOUR-partitioned + retention-swept above. So no
+    // `groww_live_ticks` entry here.
     // Groww second-feed 1-minute candles (operator lock §32): aggregated OHLCV,
     // PARTITION BY DAY — swept like the Dhan candle tables.
     "groww_candles_1m",
