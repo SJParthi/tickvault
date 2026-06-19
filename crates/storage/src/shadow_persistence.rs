@@ -9,15 +9,18 @@
 //!   each get their OWN plain QuestDB table — `candles_<tf>`. Names are
 //!   derived from `TfIndex::table_name()` (the single source of truth).
 //! - Every candle table carries DEDUP UPSERT KEYS
-//!   `(ts, security_id, segment)` — composite per
+//!   `(ts, security_id, segment, feed)` — composite per
 //!   `.claude/rules/project/security-id-uniqueness.md` (I-P1-11), since
 //!   Dhan reuses `security_id` across segments. The designated
-//!   timestamp `ts` is part of the key (QuestDB requires it).
+//!   timestamp `ts` is part of the key (QuestDB requires it). `feed`
+//!   (operator 2026-06-19, "same tables + feed column") keeps Dhan and
+//!   Groww candles for the same minute/instrument distinct, never merged.
 //!
-//! ## Schema (11 columns)
+//! ## Schema (15 columns)
 //!
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS candles_1m (
+//!     feed                     SYMBOL,
 //!     segment                  SYMBOL,
 //!     security_id              LONG,
 //!     ts                       TIMESTAMP,
@@ -33,7 +36,7 @@
 //!     change_pct               DOUBLE,
 //!     open_gap_pct             DOUBLE
 //! ) timestamp(ts) PARTITION BY DAY
-//!   DEDUP UPSERT KEYS(ts, security_id, segment);
+//!   DEDUP UPSERT KEYS(ts, security_id, segment, feed);
 //! ```
 //!
 //! `close_pct_from_prev_day` (re-added 2026-05-28, PR-4b) is the seal-time
@@ -70,6 +73,8 @@ use tracing::{error, info, warn};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_trading::candles::{TF_COUNT, TfIndex};
 
+use crate::shadow_candle_writer::CANDLE_FEED_DHAN;
+
 // ---------------------------------------------------------------------------
 // QuestDB table names — one per timeframe.
 //
@@ -91,9 +96,22 @@ use tickvault_trading::candles::{TF_COUNT, TfIndex};
 // ---------------------------------------------------------------------------
 
 /// DEDUP UPSERT key for every candle table. Includes the designated
-/// timestamp `ts` (QuestDB requires it) and `segment` per I-P1-11. The
-/// same value is returned by `TfIndex::dedup_key()`.
-pub const DEDUP_KEY_CANDLES: &str = "ts, security_id, segment";
+/// timestamp `ts` (QuestDB requires it), `segment` per I-P1-11, and `feed`
+/// (operator 2026-06-19, "same tables + feed column") so a Dhan candle and a
+/// Groww candle for the same `(ts, security_id, segment)` are BOTH kept —
+/// distinct feeds, never collide. `feed` is replay-stable (constant per writer
+/// — the Dhan candle writer stamps `CANDLE_FEED_DHAN='dhan'`), preserving
+/// same-feed minute-bucket idempotency. The same value is returned by
+/// `TfIndex::dedup_key()`.
+///
+/// **Brownfield honesty (no hallucination):** rows persisted under the OLD
+/// 3-column key carry `feed=NULL`. A new `feed='dhan'` row for the same
+/// `(ts, security_id, segment)` would be a DISTINCT key (NULL != 'dhan') and
+/// therefore a DUPLICATE, not an upsert. To eliminate that overlap window
+/// entirely, [`ensure_shadow_candle_tables`] backfills `feed='dhan'` on every
+/// pre-existing NULL-feed row (`UPDATE ... WHERE feed IS NULL`) BEFORE
+/// re-enabling DEDUP — so post-migration same-minute re-seals upsert cleanly.
+pub const DEDUP_KEY_CANDLES: &str = "ts, security_id, segment, feed";
 
 // ---------------------------------------------------------------------------
 // Public helpers — aggregate the table names for downstream consumers.
@@ -215,12 +233,33 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
         let alter_open_gap_pct =
             format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS open_gap_pct DOUBLE;");
         run_ddl(&client, &base_url, table, &alter_open_gap_pct).await;
-        // Feed-provenance label (operator 2026-06-19): future-ready broker
-        // source column (dhan/groww). NON-key (uniqueness already O(1) via the
-        // composite DEDUP key + separate per-feed tables); self-heal so existing
-        // live candle tables gain it. Free on every boot.
+        // Feed-provenance label (operator 2026-06-19, "same tables + feed
+        // column"): broker source (`'dhan'`/`'groww'`). It IS part of the DEDUP
+        // key now (`DEDUP_KEY_CANDLES` includes `feed`), so a Dhan candle and a
+        // Groww candle for the same minute/instrument are BOTH kept. MUST run
+        // BEFORE the DEDUP-ENABLE migration below so the key column exists on
+        // pre-existing tables. Additive + idempotent.
         let alter_feed = format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS feed SYMBOL;");
         run_ddl(&client, &base_url, table, &alter_feed).await;
+        // Brownfield NULL-feed backfill (worst-case coverage, no-hallucination):
+        // rows persisted under the OLD 3-col key have `feed=NULL`. Without this,
+        // a new `feed='dhan'` row for the same `(ts, security_id, segment)` is a
+        // DISTINCT key (NULL != 'dhan') → a DUPLICATE, not an upsert. Stamping
+        // `feed='dhan'` on every legacy NULL row BEFORE re-enabling DEDUP closes
+        // that overlap window. Idempotent + cheap on every subsequent boot:
+        // `WHERE feed IS NULL` matches nothing once backfilled. MUST run BEFORE
+        // the DEDUP-ENABLE below (UPDATE on the live key column is cleanest
+        // before the key is re-applied).
+        let backfill_feed =
+            format!("UPDATE {table} SET feed = '{CANDLE_FEED_DHAN}' WHERE feed IS NULL;");
+        run_ddl(&client, &base_url, table, &backfill_feed).await;
+        // Brownfield DEDUP migration: re-enable the UPSERT key with `feed`
+        // included so EXISTING candle tables (created before the feed-in-key
+        // change) get the new 4-col key. Idempotent — re-enabling the same key
+        // is a no-op; greenfield tables already have it from the CREATE DDL.
+        let dedup_enable =
+            format!("ALTER TABLE {table} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_CANDLES});");
+        run_ddl(&client, &base_url, table, &dedup_enable).await;
     }
 }
 
@@ -663,6 +702,9 @@ mod tests {
         assert!(DEDUP_KEY_CANDLES.contains("ts"));
         assert!(DEDUP_KEY_CANDLES.contains("security_id"));
         assert!(DEDUP_KEY_CANDLES.contains("segment"));
+        // feed-in-key (operator 2026-06-19): a Dhan candle and a Groww candle
+        // for the same minute/instrument are distinct observations, both kept.
+        assert!(DEDUP_KEY_CANDLES.contains("feed"));
     }
 
     #[test]
