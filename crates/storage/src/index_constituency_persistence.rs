@@ -163,6 +163,33 @@ pub async fn ensure_index_constituency_table(questdb_config: &QuestDbConfig) {
             warn!(?err, "index_constituency DDL request failed");
         }
     }
+
+    // Feed-provenance label (operator 2026-06-19, "all tables"): self-heal ALTER
+    // only — additive, idempotent, NON-key; CREATE DDL untouched. Free per boot.
+    let alter_feed_ddl = format!(
+        "ALTER TABLE {QUESTDB_TABLE_INDEX_CONSTITUENCY} ADD COLUMN IF NOT EXISTS feed SYMBOL"
+    );
+    match client
+        .get(&base_url)
+        .query(&[("query", alter_feed_ddl.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => {
+            warn!(
+                table = QUESTDB_TABLE_INDEX_CONSTITUENCY,
+                status = %resp.status(),
+                "index_constituency ALTER ADD COLUMN feed non-2xx"
+            );
+        }
+        Err(err) => {
+            warn!(
+                ?err,
+                "index_constituency ALTER ADD COLUMN feed request failed"
+            );
+        }
+    }
 }
 
 /// Write one `index_constituency` row into an ILP [`Buffer`]. PURE builder
