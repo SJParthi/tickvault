@@ -104,6 +104,7 @@ pub fn prev_day_ist_nanos_from_utc_secs(utc_epoch_secs: i64) -> i64 {
 pub fn prev_day_ohlcv_create_ddl() -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {PREV_DAY_OHLCV_TABLE} (\
+            feed         SYMBOL, \
             segment      SYMBOL, \
             security_id  LONG, \
             ts           TIMESTAMP, \
@@ -179,6 +180,25 @@ pub async fn ensure_prev_day_ohlcv_table(questdb_config: &QuestDbConfig) {
         }
         Err(err) => error!(?err, "prev_day_ohlcv: ALTER ADD COLUMN oi request failed"),
     }
+
+    // Feed-provenance label (operator 2026-06-19): future-ready broker source
+    // column (dhan/groww). Additive + idempotent; NON-key. Self-heal so existing
+    // live prev_day_ohlcv tables gain it. Free on every boot.
+    match client
+        .get(&base_url)
+        .query(&[("query", prev_day_ohlcv_alter_add_feed_ddl())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            error!(%status, body = %body.chars().take(200).collect::<String>(),
+                "prev_day_ohlcv: ALTER ADD COLUMN feed returned non-2xx");
+        }
+        Err(err) => error!(?err, "prev_day_ohlcv: ALTER ADD COLUMN feed request failed"),
+    }
 }
 
 /// Idempotent `ALTER TABLE ADD COLUMN IF NOT EXISTS oi LONG`. Pure (testable
@@ -187,6 +207,14 @@ pub async fn ensure_prev_day_ohlcv_table(questdb_config: &QuestDbConfig) {
 #[must_use]
 pub fn prev_day_ohlcv_alter_add_oi_ddl() -> &'static str {
     "ALTER TABLE prev_day_ohlcv ADD COLUMN IF NOT EXISTS oi LONG;"
+}
+
+/// Idempotent `ALTER TABLE ADD COLUMN IF NOT EXISTS feed SYMBOL`. Pure (testable
+/// without QuestDB). Schema self-heal — the feed-provenance label (broker
+/// source) for tables created before the 2026-06-19 feed-column directive.
+#[must_use]
+pub fn prev_day_ohlcv_alter_add_feed_ddl() -> &'static str {
+    "ALTER TABLE prev_day_ohlcv ADD COLUMN IF NOT EXISTS feed SYMBOL;"
 }
 
 /// Lazy-connect ILP writer for the `prev_day_ohlcv` table. Mirrors
@@ -326,6 +354,7 @@ mod tests {
         let ddl = prev_day_ohlcv_create_ddl();
         for needle in [
             "prev_day_ohlcv",
+            "feed         SYMBOL",
             "segment      SYMBOL",
             "security_id  LONG",
             "ts           TIMESTAMP",
@@ -352,6 +381,13 @@ mod tests {
         let alter = prev_day_ohlcv_alter_add_oi_ddl();
         assert!(alter.contains("ALTER TABLE prev_day_ohlcv"));
         assert!(alter.contains("ADD COLUMN IF NOT EXISTS oi LONG"));
+    }
+
+    #[test]
+    fn test_prev_day_ohlcv_alter_add_feed_ddl_is_idempotent_add_column() {
+        let alter = prev_day_ohlcv_alter_add_feed_ddl();
+        assert!(alter.contains("ALTER TABLE prev_day_ohlcv"));
+        assert!(alter.contains("ADD COLUMN IF NOT EXISTS feed SYMBOL"));
     }
 
     #[test]
