@@ -228,6 +228,42 @@ async fn main() -> Result<()> {
         "S6-Step4: sandbox-only window check passed"
     );
 
+    // Feed selection (Groww second-feed scope, operator lock 2026-06-19 —
+    // .claude/rules/project/groww-second-feed-scope-2026-06-19.md). PR-1
+    // surfaces the `[feeds]` toggle and fails LOUD on a no-feed config or an
+    // enabled-but-not-yet-wired feed, so the flags are never a silent no-op
+    // (audit-findings Rule 14 "enabled=false trap"). The Dhan boot path below
+    // is UNCHANGED; the per-feed spawn gating + the native Groww connector land
+    // in later PRs of this sequence — until then these WARNs make the partial
+    // state explicit (no illusion).
+    let feeds = &config.feeds;
+    info!(
+        dhan_enabled = feeds.dhan_enabled,
+        groww_enabled = feeds.groww_enabled,
+        both_enabled = feeds.both_enabled(),
+        "feed selection: which market-data feeds are configured"
+    );
+    if !feeds.any_enabled() {
+        warn!(
+            "[feeds] both dhan_enabled and groww_enabled are false — no market-data \
+             feed is configured; the Dhan boot path still runs as today until the \
+             feed-gating PR lands"
+        );
+    }
+    if feeds.groww_enabled {
+        warn!(
+            "[feeds] groww_enabled=true but the native Groww connector has not shipped \
+             yet (lands in a later PR of the Groww second-feed sequence); Groww is \
+             IGNORED for now — no Groww ticks will flow"
+        );
+    }
+    if !feeds.dhan_enabled {
+        warn!(
+            "[feeds] dhan_enabled=false but the Dhan disable-gate has not shipped yet; \
+             Dhan still runs as today until the feed-gating PR lands"
+        );
+    }
+
     // S12 wiring: system clock drift check (cold path, boot only).
     // SEBI + tick timestamp integrity requires the system clock to be
     // within a few seconds of UTC. Drift > threshold logs WARN (fires
