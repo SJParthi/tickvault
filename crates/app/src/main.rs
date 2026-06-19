@@ -251,11 +251,28 @@ async fn main() -> Result<()> {
         );
     }
     if feeds.groww_enabled {
-        warn!(
-            "[feeds] groww_enabled=true but the native Groww connector has not shipped \
-             yet (lands in a later PR of the Groww second-feed sequence); Groww is \
-             IGNORED for now — no Groww ticks will flow"
+        // Groww second feed (operator lock 2026-06-19). PR-2 wires the auth
+        // smoke-check ONLY: confirm we can obtain a Groww access token from the
+        // SSM creds (/tickvault/<env>/groww/api-key + /totp-secret). The native
+        // live-feed connector (NATS) lands in a later PR. Spawned in the
+        // background so it never blocks the Dhan boot path; default OFF.
+        let groww_timeout_ms = config.network.request_timeout_ms;
+        info!(
+            "[feeds] groww_enabled=true — starting Groww access-token auth smoke-check \
+             (background; the live-feed connector lands in a later PR, no Groww ticks flow yet)"
         );
+        tokio::spawn(async move {
+            if let Err(err) =
+                tickvault_core::feed::groww::auth::run_groww_auth_smoke_check(groww_timeout_ms)
+                    .await
+            {
+                error!(
+                    error = %err,
+                    "Groww access-token auth smoke-check FAILED — verify \
+                     /tickvault/<env>/groww/api-key + /tickvault/<env>/groww/totp-secret in SSM"
+                );
+            }
+        });
     }
     if !feeds.dhan_enabled {
         warn!(

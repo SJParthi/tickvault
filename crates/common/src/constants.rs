@@ -591,6 +591,23 @@ pub const DHAN_SANDBOX_CLIENT_ID_SECRET: &str = "sandbox-client-id";
 pub const DHAN_SANDBOX_TOKEN_SECRET: &str = "sandbox-token";
 
 // ---------------------------------------------------------------------------
+// SSM Parameter Store — Groww Service (second feed, operator lock 2026-06-19)
+// `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`
+// ---------------------------------------------------------------------------
+
+/// SSM service path segment for Groww credentials.
+/// Full paths: `/tickvault/<env>/groww/api-key` + `/tickvault/<env>/groww/totp-secret`.
+pub const SSM_GROWW_SERVICE: &str = "groww";
+
+/// SSM secret name for the Groww API key (the "TOTP token" from the Groww
+/// trade-api keys page; sent as `Authorization: Bearer <api_key>`).
+pub const GROWW_API_KEY_SECRET: &str = "api-key";
+
+/// SSM secret name for the Groww TOTP secret (the seed for the rotating
+/// 6-digit code; SHA1 / 6 digits / 30s — same as Dhan).
+pub const GROWW_TOTP_SECRET: &str = "totp-secret";
+
+// ---------------------------------------------------------------------------
 // SSM Parameter Store — QuestDB Service
 // ---------------------------------------------------------------------------
 
