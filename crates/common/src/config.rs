@@ -69,6 +69,62 @@ pub struct ApplicationConfig {
     /// See `.claude/plans/friday-may-15-mega/topic-OPTION-CHAIN-MINUTE-SNAPSHOT.md`.
     #[serde(default)]
     pub option_chain_minute_snapshot: OptionChainMinuteSnapshotConfig,
+    /// Pluggable market-data feed selection (Groww second-feed scope,
+    /// operator lock 2026-06-19 — see
+    /// `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`).
+    /// `[feeds]` toggles which feed providers spawn at boot: Dhan
+    /// (feed #1, default ON, unchanged) and Groww (feed #2, default
+    /// OFF). A missing `[feeds]` section keeps today's Dhan-only
+    /// behaviour byte-identical.
+    #[serde(default)]
+    pub feeds: FeedsConfig,
+}
+
+/// `[feeds]` — pluggable market-data feed selection (operator lock
+/// 2026-06-19, Groww second feed). Each feed provider is independently
+/// enable/disable-able so the operator can run Dhan-only (default),
+/// Groww-only, or both in parallel. Mirrors the `NotificationConfig`
+/// simple-boolean-with-`Default`-impl convention.
+///
+/// `dhan_enabled` defaults to `true` (the existing system is UNCHANGED);
+/// `groww_enabled` defaults to `false` so a fresh deployment behaves
+/// exactly like today until Groww is explicitly switched on. Groww is
+/// native tickvault Rust reusing the same WAL/ring/spill/DLQ/aggregator
+/// chain — brutex is a design reference only, no code pulled.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FeedsConfig {
+    /// Dhan live feed (feed #1). Default ON — disabling it is only for
+    /// isolated Groww-only testing.
+    pub dhan_enabled: bool,
+    /// Groww live feed (feed #2). Default OFF — opt-in so prod behaviour
+    /// is unchanged until explicitly enabled.
+    pub groww_enabled: bool,
+}
+
+impl Default for FeedsConfig {
+    fn default() -> Self {
+        Self {
+            dhan_enabled: true,
+            groww_enabled: false,
+        }
+    }
+}
+
+impl FeedsConfig {
+    /// `true` when at least one feed provider is enabled. Boot wiring
+    /// uses this to refuse a no-feed configuration (a trading system
+    /// with every feed disabled has nothing to do). Pure, O(1).
+    #[must_use]
+    pub const fn any_enabled(&self) -> bool {
+        self.dhan_enabled || self.groww_enabled
+    }
+
+    /// `true` when BOTH feeds run in parallel (the cross-check target:
+    /// Dhan + Groww side by side). Pure, O(1).
+    #[must_use]
+    pub const fn both_enabled(&self) -> bool {
+        self.dhan_enabled && self.groww_enabled
+    }
 }
 
 /// Container for the `[in_mem]` TOML section (Wave-5 §K-L10, PR #504d).
@@ -1684,6 +1740,7 @@ mod tests {
             engine: EngineConfig::default(),
             in_mem: InMemConfig::default(),
             option_chain_minute_snapshot: OptionChainMinuteSnapshotConfig::default(),
+            feeds: FeedsConfig::default(),
         }
     }
 
@@ -2855,6 +2912,123 @@ mod tests {
             "movers_v2_enabled MUST default to false until the 14-day \
              RAM=DB parity soak per active-plan §6 row 3 has been \
              cleared by the operator"
+        );
+    }
+
+    // =======================================================================
+    // Groww second-feed scope (operator lock 2026-06-19) — `[feeds]` toggle.
+    // See `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`.
+    // Covers the toggle-permutation rows of the coverage matrix (Section G):
+    // dhan ON/groww OFF (default), groww-only, both, both-off.
+    // =======================================================================
+
+    /// RATCHET: the default MUST keep Dhan ON and Groww OFF so a fresh
+    /// deployment (or a missing `[feeds]` block) behaves byte-identically
+    /// to today's Dhan-only system. Flipping either default requires a
+    /// dated operator quote per the scope rule file.
+    #[test]
+    fn test_feeds_config_default_dhan_on_groww_off() {
+        let feeds = FeedsConfig::default();
+        assert!(
+            feeds.dhan_enabled,
+            "Dhan must default ON (system unchanged)"
+        );
+        assert!(
+            !feeds.groww_enabled,
+            "Groww must default OFF (opt-in; zero prod behaviour change)"
+        );
+    }
+
+    /// A missing `[feeds]` section must fall back to the safe default
+    /// (Dhan ON, Groww OFF) via `#[serde(default)]` — never error.
+    #[test]
+    fn test_feeds_config_missing_section_uses_default() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            feeds: FeedsConfig,
+        }
+        let wrapper: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [feeds] must use defaults, not error");
+        assert!(wrapper.feeds.dhan_enabled);
+        assert!(!wrapper.feeds.groww_enabled);
+    }
+
+    /// All four toggle permutations round-trip via figment and the
+    /// `any_enabled` / `both_enabled` helpers report correctly.
+    #[test]
+    fn test_feeds_config_all_toggle_permutations() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            feeds: FeedsConfig,
+        }
+        // (dhan, groww, any_enabled, both_enabled)
+        let cases = [
+            (true, false, true, false),   // default: Dhan-only
+            (false, true, true, false),   // Groww-only
+            (true, true, true, true),     // both (the cross-check target)
+            (false, false, false, false), // no-feed (boot must guard via any_enabled)
+        ];
+        for (dhan, groww, any, both) in cases {
+            let toml = format!("[feeds]\ndhan_enabled = {dhan}\ngroww_enabled = {groww}\n");
+            let wrapper: Wrapper = Figment::new()
+                .merge(Toml::string(&toml))
+                .extract()
+                .expect("feeds toggle must round-trip");
+            assert_eq!(wrapper.feeds.dhan_enabled, dhan);
+            assert_eq!(wrapper.feeds.groww_enabled, groww);
+            assert_eq!(
+                wrapper.feeds.any_enabled(),
+                any,
+                "any_enabled wrong for dhan={dhan} groww={groww}"
+            );
+            assert_eq!(
+                wrapper.feeds.both_enabled(),
+                both,
+                "both_enabled wrong for dhan={dhan} groww={groww}"
+            );
+        }
+    }
+
+    /// `any_enabled` is the boot no-feed guard signal: false ONLY when
+    /// every feed is disabled.
+    #[test]
+    fn test_feeds_any_enabled_false_only_when_all_off() {
+        assert!(
+            !FeedsConfig {
+                dhan_enabled: false,
+                groww_enabled: false
+            }
+            .any_enabled()
+        );
+        assert!(
+            FeedsConfig {
+                dhan_enabled: true,
+                groww_enabled: false
+            }
+            .any_enabled()
+        );
+        assert!(
+            FeedsConfig {
+                dhan_enabled: false,
+                groww_enabled: true
+            }
+            .any_enabled()
+        );
+        assert!(
+            FeedsConfig {
+                dhan_enabled: true,
+                groww_enabled: true
+            }
+            .any_enabled()
         );
     }
 }

@@ -1611,6 +1611,7 @@ pub struct TickLifecycle {
 /// - `ts` as designated TIMESTAMP (Dhan IST epoch seconds, stored directly)
 const TICKS_CREATE_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS ticks (\
+        feed SYMBOL,\
         segment SYMBOL,\
         security_id LONG,\
         ltp DOUBLE,\
@@ -1806,6 +1807,35 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
         }
         Err(err) => {
             warn!(?err, "ticks.capture_seq ADD COLUMN request failed");
+        }
+    }
+
+    // Step 1d: Feed-provenance label (operator 2026-06-19) — future-ready broker
+    // source column (dhan/groww). Additive + idempotent (`ADD COLUMN IF NOT
+    // EXISTS`); NON-key (the DEDUP key is UNCHANGED, so existing rows + dedup
+    // behaviour are untouched — uniqueness is already O(1) via the composite key
+    // + the separate per-feed `groww_live_ticks` table). Self-heal so existing
+    // live `ticks` tables gain the column at boot.
+    let add_feed_sql =
+        format!("ALTER TABLE \"{QUESTDB_TABLE_TICKS}\" ADD COLUMN IF NOT EXISTS feed SYMBOL");
+    match client
+        .get(&base_url)
+        .query(&[("query", &add_feed_sql)])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            debug!("ticks.feed column ensured (ADD COLUMN IF NOT EXISTS)");
+        }
+        Ok(resp) => {
+            let body = resp.text().await.unwrap_or_default();
+            warn!(
+                body = body.chars().take(200).collect::<String>(),
+                "ticks.feed ADD COLUMN returned non-success"
+            );
+        }
+        Err(err) => {
+            warn!(?err, "ticks.feed ADD COLUMN request failed");
         }
     }
 
@@ -2842,6 +2872,7 @@ mod tests {
 
     #[test]
     fn test_ticks_create_ddl_contains_required_columns() {
+        assert!(TICKS_CREATE_DDL.contains("feed SYMBOL"));
         assert!(TICKS_CREATE_DDL.contains("segment SYMBOL"));
         assert!(TICKS_CREATE_DDL.contains("security_id LONG"));
         assert!(TICKS_CREATE_DDL.contains("ltp DOUBLE"));

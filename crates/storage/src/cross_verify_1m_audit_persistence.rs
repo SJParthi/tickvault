@@ -199,6 +199,30 @@ pub async fn ensure_cross_verify_1m_audit_table(questdb_config: &QuestDbConfig) 
         }
         Err(err) => error!(?err, "cross_verify_1m_audit: CREATE TABLE request failed"),
     }
+
+    // Feed-provenance label (operator 2026-06-19, "all tables"): self-heal ALTER
+    // only — additive, idempotent, NON-key; CREATE DDL + its column ratchet are
+    // untouched. Free on every boot.
+    let alter_feed_ddl =
+        format!("ALTER TABLE {CROSS_VERIFY_1M_AUDIT_TABLE} ADD COLUMN IF NOT EXISTS feed SYMBOL");
+    match client
+        .get(&base_url)
+        .query(&[("query", alter_feed_ddl.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            error!(%status, body = %body.chars().take(200).collect::<String>(),
+                "cross_verify_1m_audit: ALTER ADD COLUMN feed returned non-2xx");
+        }
+        Err(err) => error!(
+            ?err,
+            "cross_verify_1m_audit: ALTER ADD COLUMN feed request failed"
+        ),
+    }
 }
 
 /// Lazy-connect ILP writer for the `cross_verify_1m_audit` table. Mirrors

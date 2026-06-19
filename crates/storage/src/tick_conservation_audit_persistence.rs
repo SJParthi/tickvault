@@ -193,6 +193,30 @@ pub async fn ensure_tick_conservation_audit_table(questdb_config: &QuestDbConfig
         }
         Err(err) => error!(?err, "tick_conservation_audit: CREATE TABLE request failed"),
     }
+
+    // Feed-provenance label (operator 2026-06-19, "all tables"): self-heal ALTER
+    // only — additive, idempotent, NON-key; CREATE DDL + its column ratchet are
+    // untouched. Free on every boot.
+    let alter_feed_ddl =
+        format!("ALTER TABLE {TICK_CONSERVATION_AUDIT_TABLE} ADD COLUMN IF NOT EXISTS feed SYMBOL");
+    match client
+        .get(&base_url)
+        .query(&[("query", alter_feed_ddl.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            error!(%status, body = %body.chars().take(200).collect::<String>(),
+                "tick_conservation_audit: ALTER ADD COLUMN feed returned non-2xx");
+        }
+        Err(err) => error!(
+            ?err,
+            "tick_conservation_audit: ALTER ADD COLUMN feed request failed"
+        ),
+    }
 }
 
 /// Lazy-connect ILP writer for the `tick_conservation_audit` table. Mirrors

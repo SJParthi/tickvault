@@ -228,6 +228,73 @@ async fn main() -> Result<()> {
         "S6-Step4: sandbox-only window check passed"
     );
 
+    // Feed selection (Groww second-feed scope, operator lock 2026-06-19 —
+    // .claude/rules/project/groww-second-feed-scope-2026-06-19.md). PR-1
+    // surfaces the `[feeds]` toggle and fails LOUD on a no-feed config or an
+    // enabled-but-not-yet-wired feed, so the flags are never a silent no-op
+    // (audit-findings Rule 14 "enabled=false trap"). The Dhan boot path below
+    // is UNCHANGED; the per-feed spawn gating + the native Groww connector land
+    // in later PRs of this sequence — until then these WARNs make the partial
+    // state explicit (no illusion).
+    let feeds = &config.feeds;
+    info!(
+        dhan_enabled = feeds.dhan_enabled,
+        groww_enabled = feeds.groww_enabled,
+        both_enabled = feeds.both_enabled(),
+        "feed selection: which market-data feeds are configured"
+    );
+    if !feeds.any_enabled() {
+        warn!(
+            "[feeds] both dhan_enabled and groww_enabled are false — no market-data \
+             feed is configured; the Dhan boot path still runs as today until the \
+             feed-gating PR lands"
+        );
+    }
+    if feeds.groww_enabled {
+        // Groww second feed (operator lock 2026-06-19). PR-2 wires the auth
+        // smoke-check ONLY: confirm we can obtain a Groww access token from the
+        // SSM creds (/tickvault/<env>/groww/api-key + /totp-secret). The native
+        // live-feed connector (NATS) lands in a later PR. Spawned in the
+        // background so it never blocks the Dhan boot path; default OFF.
+        let groww_timeout_ms = config.network.request_timeout_ms;
+        info!(
+            "[feeds] groww_enabled=true — starting Groww access-token auth smoke-check \
+             (background; the live-feed connector lands in a later PR, no Groww ticks flow yet)"
+        );
+        tokio::spawn(async move {
+            if let Err(err) =
+                tickvault_core::feed::groww::auth::run_groww_auth_smoke_check(groww_timeout_ms)
+                    .await
+            {
+                error!(
+                    error = %err,
+                    "Groww access-token auth smoke-check FAILED — verify \
+                     /tickvault/<env>/groww/api-key + /tickvault/<env>/groww/totp-secret in SSM"
+                );
+            }
+        });
+
+        // Groww bridge — consumes the sidecar's capture-at-receipt tick file →
+        // groww_live_ticks + groww_candles_1m (isolated groww_* tables only).
+        // Dormant (no writes) until the Python sidecar appends; default OFF, so
+        // the Dhan boot path is unaffected.
+        let groww_qdb = config.questdb.clone();
+        info!(
+            "[feeds] groww_enabled=true — starting Groww bridge (dormant until the \
+             sidecar tick file appears; isolated groww_* tables, no Dhan impact)"
+        );
+        tokio::spawn(tickvault_app::groww_bridge::run_groww_bridge(
+            groww_qdb,
+            std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
+        ));
+    }
+    if !feeds.dhan_enabled {
+        warn!(
+            "[feeds] dhan_enabled=false but the Dhan disable-gate has not shipped yet; \
+             Dhan still runs as today until the feed-gating PR lands"
+        );
+    }
+
     // S12 wiring: system clock drift check (cold path, boot only).
     // SEBI + tick timestamp integrity requires the system clock to be
     // within a few seconds of UTC. Drift > threshold logs WARN (fires
