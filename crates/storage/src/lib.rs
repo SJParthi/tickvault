@@ -97,6 +97,9 @@ pub mod disk_health_watcher;
 // schema constants + DEDUP key + FetchOutcome enum. Feature-gated under
 // `daily_universe_fetcher` per
 // `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`
+// Groww second-feed live-tick persistence (operator lock 2026-06-19 §32).
+// Isolated `groww_*` namespace; the Dhan path is untouched.
+pub mod groww_persistence;
 // §21. DDL + append helpers + Row struct land in Sub-PR #10b-ζ.
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod instrument_fetch_audit_persistence;
