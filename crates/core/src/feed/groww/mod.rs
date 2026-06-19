@@ -14,6 +14,7 @@
 pub mod aggregator_1m;
 pub mod auth;
 pub mod nats;
+pub mod nkey;
 pub mod parity_1m;
 pub mod proto;
 pub mod subjects;
