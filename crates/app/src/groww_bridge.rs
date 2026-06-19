@@ -103,6 +103,62 @@ fn parse_groww_tick_line(line: &str) -> Result<ParsedGrowwTick> {
     })
 }
 
+/// Lower bound for a plausible IST epoch-nanos tick timestamp (~2020-01-01).
+/// Rejects 0 / negative / pre-2020 garbage that would mis-partition the shared
+/// `ticks` designated timestamp.
+const MIN_PLAUSIBLE_TS_IST_NANOS: i64 = 1_577_836_800_000_000_000;
+/// Upper bound for a plausible IST epoch-nanos tick timestamp (~2100-01-01).
+/// Rejects `i64::MAX` / mangled far-future stamps.
+const MAX_PLAUSIBLE_TS_IST_NANOS: i64 = 4_102_444_800_000_000_000;
+
+/// Why a Groww NDJSON tick is rejected before it can reach the SHARED tables.
+/// Copy + testable; mirrors the Dhan path's `is_valid_ltp` / OHLC-integrity
+/// guards (phase-0-architecture.md Pillar 2) so a misbehaving sidecar cannot
+/// corrupt shared-table data or the 15:31 cross-verify.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GrowwTickReject {
+    /// `ltp` is NaN or ±Inf.
+    NonFinitePrice,
+    /// `ltp` is zero or negative.
+    NonPositivePrice,
+    /// `ltp` exceeds `MAX_PLAUSIBLE_LTP` (~₹10 crore) — absurd-but-finite garbage.
+    ImplausiblePrice,
+    /// `cum_volume` is negative (cumulative day volume can never decrease below 0).
+    NegativeVolume,
+    /// `security_id` is zero or negative.
+    NonPositiveSecurityId,
+    /// `ts_ist_nanos` is outside the plausible `[2020, 2100)` IST window.
+    TimestampOutOfRange,
+}
+
+/// Validates a parsed Groww tick before persist. Pure, O(1) (a handful of
+/// finite/compare checks), no allocation. Mirrors the Dhan `is_valid_ltp`
+/// upper/lower bounds so it can never reject a genuine price.
+fn validate_groww_tick(parsed: &ParsedGrowwTick) -> Result<(), GrowwTickReject> {
+    let ltp = parsed.tick.ltp;
+    if !ltp.is_finite() {
+        return Err(GrowwTickReject::NonFinitePrice);
+    }
+    if ltp <= 0.0 {
+        return Err(GrowwTickReject::NonPositivePrice);
+    }
+    if ltp > f64::from(tickvault_common::constants::MAX_PLAUSIBLE_LTP) {
+        return Err(GrowwTickReject::ImplausiblePrice);
+    }
+    if parsed.tick.cum_volume < 0 {
+        return Err(GrowwTickReject::NegativeVolume);
+    }
+    if parsed.tick.security_id <= 0 {
+        return Err(GrowwTickReject::NonPositiveSecurityId);
+    }
+    if !(MIN_PLAUSIBLE_TS_IST_NANOS..=MAX_PLAUSIBLE_TS_IST_NANOS)
+        .contains(&parsed.tick.ts_ist_nanos)
+    {
+        return Err(GrowwTickReject::TimestampOutOfRange);
+    }
+    Ok(())
+}
+
 /// Builds the shared `ticks` (feed='groww') row for a parsed tick. `capture_seq`
 /// is the monotonic, replay-stable dedup tiebreaker (TICK-SEQ-01). Pure + testable.
 fn live_tick_row(parsed: &ParsedGrowwTick, capture_seq: i64) -> GrowwLiveTickRow {
@@ -239,6 +295,20 @@ pub async fn run_groww_bridge(
                     continue;
                 }
             };
+            // Data-integrity gate (security-review MEDIUM 2026-06-19): a
+            // misbehaving sidecar must NOT write a non-finite/≤0/absurd price,
+            // negative volume, or far-future timestamp into the SHARED
+            // ticks/candles_1m tables (which Dhan also reads + the 15:31
+            // cross-verify compares). Reject + log + skip before persist AND
+            // before the aggregator fold, so one bad tick can't poison a candle.
+            if let Err(reason) = validate_groww_tick(&parsed) {
+                error!(
+                    ?reason,
+                    security_id = parsed.tick.security_id,
+                    "groww bridge: rejecting invalid tick before persist"
+                );
+                continue;
+            }
             let seq = next_capture_seq(&capture_seq, parsed.tick.ts_ist_nanos);
             if let Err(err) = live_writer.append_row(&live_tick_row(&parsed, seq)) {
                 error!(
@@ -312,6 +382,106 @@ mod tests {
         assert!(parse_groww_tick_line("{}").is_err());
         let bad_seg = r#"{"security_id":1,"segment":"XYZ","ts_ist_nanos":1,"exchange_ts_millis":1,"ltp":1.0,"cum_volume":1}"#;
         assert!(parse_groww_tick_line(bad_seg).is_err());
+    }
+
+    /// A known-good parsed tick (ts ~2026, within the plausible window).
+    fn valid_parsed() -> ParsedGrowwTick {
+        parse_groww_tick_line(LINE).expect("parse")
+    }
+
+    #[test]
+    fn test_validate_groww_tick_accepts_valid() {
+        assert_eq!(validate_groww_tick(&valid_parsed()), Ok(()));
+    }
+
+    #[test]
+    fn test_validate_groww_tick_rejects_non_finite_ltp() {
+        let mut p = valid_parsed();
+        p.tick.ltp = f64::NAN;
+        assert_eq!(
+            validate_groww_tick(&p),
+            Err(GrowwTickReject::NonFinitePrice)
+        );
+        p.tick.ltp = f64::INFINITY;
+        assert_eq!(
+            validate_groww_tick(&p),
+            Err(GrowwTickReject::NonFinitePrice)
+        );
+    }
+
+    #[test]
+    fn test_validate_groww_tick_rejects_non_positive_ltp() {
+        let mut p = valid_parsed();
+        p.tick.ltp = 0.0;
+        assert_eq!(
+            validate_groww_tick(&p),
+            Err(GrowwTickReject::NonPositivePrice)
+        );
+        p.tick.ltp = -1.5;
+        assert_eq!(
+            validate_groww_tick(&p),
+            Err(GrowwTickReject::NonPositivePrice)
+        );
+    }
+
+    #[test]
+    fn test_validate_groww_tick_rejects_implausible_ltp() {
+        let mut p = valid_parsed();
+        p.tick.ltp = f64::from(tickvault_common::constants::MAX_PLAUSIBLE_LTP) + 1.0;
+        assert_eq!(
+            validate_groww_tick(&p),
+            Err(GrowwTickReject::ImplausiblePrice)
+        );
+    }
+
+    #[test]
+    fn test_validate_groww_tick_rejects_negative_volume() {
+        let mut p = valid_parsed();
+        p.tick.cum_volume = -1;
+        assert_eq!(
+            validate_groww_tick(&p),
+            Err(GrowwTickReject::NegativeVolume)
+        );
+    }
+
+    #[test]
+    fn test_validate_groww_tick_rejects_non_positive_security_id() {
+        let mut p = valid_parsed();
+        p.tick.security_id = 0;
+        assert_eq!(
+            validate_groww_tick(&p),
+            Err(GrowwTickReject::NonPositiveSecurityId)
+        );
+        p.tick.security_id = -7;
+        assert_eq!(
+            validate_groww_tick(&p),
+            Err(GrowwTickReject::NonPositiveSecurityId)
+        );
+    }
+
+    #[test]
+    fn test_validate_groww_tick_rejects_timestamp_out_of_range() {
+        let mut p = valid_parsed();
+        p.tick.ts_ist_nanos = 0;
+        assert_eq!(
+            validate_groww_tick(&p),
+            Err(GrowwTickReject::TimestampOutOfRange)
+        );
+        p.tick.ts_ist_nanos = -1;
+        assert_eq!(
+            validate_groww_tick(&p),
+            Err(GrowwTickReject::TimestampOutOfRange)
+        );
+        p.tick.ts_ist_nanos = i64::MAX;
+        assert_eq!(
+            validate_groww_tick(&p),
+            Err(GrowwTickReject::TimestampOutOfRange)
+        );
+        // Boundaries are inclusive-valid.
+        p.tick.ts_ist_nanos = MIN_PLAUSIBLE_TS_IST_NANOS;
+        assert_eq!(validate_groww_tick(&p), Ok(()));
+        p.tick.ts_ist_nanos = MAX_PLAUSIBLE_TS_IST_NANOS;
+        assert_eq!(validate_groww_tick(&p), Ok(()));
     }
 
     #[test]
