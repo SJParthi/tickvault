@@ -171,6 +171,7 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
         }
         let create_ddl = format!(
             "CREATE TABLE IF NOT EXISTS {table} (\
+                feed                        SYMBOL, \
                 segment                     SYMBOL, \
                 security_id                 LONG, \
                 ts                          TIMESTAMP, \
@@ -214,6 +215,12 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
         let alter_open_gap_pct =
             format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS open_gap_pct DOUBLE;");
         run_ddl(&client, &base_url, table, &alter_open_gap_pct).await;
+        // Feed-provenance label (operator 2026-06-19): future-ready broker
+        // source column (dhan/groww). NON-key (uniqueness already O(1) via the
+        // composite DEDUP key + separate per-feed tables); self-heal so existing
+        // live candle tables gain it. Free on every boot.
+        let alter_feed = format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS feed SYMBOL;");
+        run_ddl(&client, &base_url, table, &alter_feed).await;
     }
 }
 

@@ -84,6 +84,7 @@ pub struct GrowwLiveTickRow {
 pub fn groww_live_ticks_create_ddl() -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {GROWW_LIVE_TICKS_TABLE} (\
+            feed                SYMBOL, \
             segment             SYMBOL, \
             security_id         LONG, \
             ts                  TIMESTAMP, \
@@ -138,6 +139,35 @@ pub async fn ensure_groww_live_ticks_table(questdb_config: &QuestDbConfig) {
         }
         Err(err) => error!(?err, "groww_live_ticks: CREATE TABLE request failed"),
     }
+
+    // Feed-provenance label (operator 2026-06-19): future-ready broker source
+    // column. Additive + idempotent; NON-key. Self-heal so a pre-existing
+    // groww_live_ticks table gains it. Free on every boot.
+    match client
+        .get(&base_url)
+        .query(&[("query", groww_live_ticks_alter_add_feed_ddl())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            error!(%status, body = %body.chars().take(200).collect::<String>(),
+                "groww_live_ticks: ALTER ADD COLUMN feed returned non-2xx");
+        }
+        Err(err) => error!(
+            ?err,
+            "groww_live_ticks: ALTER ADD COLUMN feed request failed"
+        ),
+    }
+}
+
+/// Idempotent `ALTER TABLE ADD COLUMN IF NOT EXISTS feed SYMBOL`. Pure (testable
+/// without QuestDB). Schema self-heal for the feed-provenance label.
+#[must_use]
+pub fn groww_live_ticks_alter_add_feed_ddl() -> &'static str {
+    "ALTER TABLE groww_live_ticks ADD COLUMN IF NOT EXISTS feed SYMBOL;"
 }
 
 /// Lazy-connect ILP writer for the `groww_live_ticks` table. Mirrors
@@ -291,6 +321,7 @@ mod tests {
         let ddl = groww_live_ticks_create_ddl();
         for needle in [
             "groww_live_ticks",
+            "feed                SYMBOL",
             "segment             SYMBOL",
             "security_id         LONG",
             "ts                  TIMESTAMP",
@@ -303,6 +334,13 @@ mod tests {
         ] {
             assert!(ddl.contains(needle), "DDL missing: {needle}\n{ddl}");
         }
+    }
+
+    #[test]
+    fn test_groww_live_ticks_alter_add_feed_ddl_is_idempotent_add_column() {
+        let alter = groww_live_ticks_alter_add_feed_ddl();
+        assert!(alter.contains("ALTER TABLE groww_live_ticks"));
+        assert!(alter.contains("ADD COLUMN IF NOT EXISTS feed SYMBOL"));
     }
 
     #[test]
