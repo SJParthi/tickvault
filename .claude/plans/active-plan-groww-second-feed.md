@@ -58,6 +58,33 @@ measuring that drift vs Dhan is the goal. Default-OFF guarantees zero prod impac
   - Files: `crates/app/src/main.rs`, `crates/core/src/feed/parity.rs`, `crates/storage/tests/chaos_groww_feed_*.rs`
   - Tests: `test_feed_toggle_all_three_modes`, `chaos_groww_spill_saturation`, `test_dhan_vs_groww_live_parity_report`
 
+- [x] PR-4a — **Feed-toggle API endpoint** (operator AskUserQuestion 2026-06-19: "Feed-toggle API endpoint"). True two-way runtime control: an authenticated endpoint flips a shared `Arc<FeedRuntimeState>` (per-feed `AtomicBool`, O(1) lock-free) that the Groww lane checks LIVE — pause/resume Groww writes mid-session with NO restart. The SAME `Arc` is shared by the Axum API + the Groww bridge so a toggle is seen instantly.
+  - Files: `crates/api/src/feed_state.rs` (NEW — `Feed` enum + `FeedRuntimeState`), `crates/api/src/handlers/feeds.rs` (NEW — `GET /api/feeds`, `POST /api/feeds/{feed}`), `crates/api/src/handlers/mod.rs`, `crates/api/src/lib.rs` (protected routes), `crates/api/src/state.rs` (`new_with_feed_runtime` + accessor), `crates/app/src/main.rs` (construct from config + inject), `crates/app/src/groww_bridge.rs` (live `is_enabled` check)
+  - Tests: `feed_state` unit tests (from_config / is_enabled / set_enabled / snapshot / Feed parse), handler tests (status JSON, toggle flips, bad-feed 400), bridge idles-when-disabled test
+
+### Design (PR-4a)
+A single `Arc<FeedRuntimeState>` is built at boot from `config.feeds` (`dhan_enabled`/`groww_enabled` seed the atomics) and shared into BOTH the API `AppState` (via `new_with_feed_runtime`, leaving the 4-arg `new` unchanged for the 22 existing call sites) AND `run_groww_bridge`. `GET /api/feeds` returns `{dhan: bool, groww: bool}`; `POST /api/feeds/{feed}` with `{enabled: bool}` flips the atomic, behind the existing bearer-auth `protected_routes`. The Groww bridge loop reads `is_enabled(Feed::Groww)` each iteration and idles (no file read, no writes) when disabled — live pause/resume.
+
+### Edge Cases (PR-4a)
+- `POST /api/feeds/dhan` → **400** in this slice (disabling the primary trading feed mid-session is unsafe; Dhan stays config+restart — honest envelope). Groww is the toggleable feed.
+- Unknown feed name → 400 with the allowed list. Missing/invalid JSON body → 400.
+- Toggle Groww OFF while the bridge is mid-batch → the in-flight batch finishes its flush (data-safe), then the loop idles on the next iteration. Toggle ON → resumes tailing from the persisted file offset (no tick loss, no double-read).
+- Unauthenticated request → 401 via existing middleware (the route is in `protected_routes`).
+
+### Failure Modes (PR-4a)
+- API down → the flag is unreadable from outside, but the bridge keeps its last in-memory state (fail-safe: stays whatever it was). No crash.
+- Atomic is lock-free; no poisoning/deadlock possible. Reads/writes are `Ordering::Relaxed` (a toggle is advisory, not a memory-ordering barrier).
+- Disabling Groww does NOT drop the Groww tables or buffered rows — it only stops NEW writes; a pending flush still lands (no data-at-risk).
+
+### Test Plan (PR-4a)
+- Scoped to `api` + `app` (no `common` change → no workspace escalation). `feed_state` pure unit tests; axum handler tests via `tower::ServiceExt::oneshot` (status 200 JSON, toggle 200 + state flip, dhan-disable 400, unknown-feed 400, unauth 401); bridge `is_enabled`-gate unit test. 3-agent adversarial review (hot-path + security + hostile) on the diff.
+
+### Rollback (PR-4a)
+- Config remains the source of truth at boot; the runtime flag only overrides within a session. `git revert` removes the endpoint + the live-check; the Groww lane falls back to the boot-config gate (Step C). Zero impact on Dhan.
+
+### Observability (PR-4a)
+- Each toggle logs `info!(feed, enabled, "feed runtime toggled via API")` + increments `tv_feed_runtime_toggle_total{feed,action}`. `GET /api/feeds` is the live status read. (A `feed_toggle_audit` QuestDB row is a follow-up; the log + counter are the slice-1 signal.)
+
 ## Edge Cases
 - Groww `groww_enabled=false` (default) ⇒ feed never spawns; boot path byte-identical to today.
 - Same `(symbol, exchange)` tick twice ⇒ QuestDB DEDUP UPSERT KEYS collapse it (O(1) amortized).

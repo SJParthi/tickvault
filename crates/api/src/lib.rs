@@ -33,6 +33,7 @@
 #![allow(clippy::doc_lazy_continuation)]
 #![allow(clippy::doc_overindented_list_items)]
 
+pub mod feed_state;
 pub mod handlers;
 pub mod middleware;
 pub mod state;
@@ -93,9 +94,20 @@ pub fn build_router_with_auth(
     // Under 4-IDX_I LOCKED_UNIVERSE there is no CSV to rebuild — the
     // universe is a compile-time constant. The endpoint and its handler
     // (handlers::instruments::rebuild_instruments) are deleted.
-    let protected_routes: Router<SharedAppState> = Router::new().layer(
-        axum::middleware::from_fn_with_state(auth_config, require_bearer_auth),
-    );
+    // Feed-toggle API (operator AskUserQuestion 2026-06-19): authenticated
+    // runtime per-feed enable/disable. `GET /api/feeds` reports state;
+    // `POST /api/feeds/{feed}` flips it (Groww only — slice 1). Behind bearer
+    // auth so only the operator can change the live feed topology.
+    let protected_routes: Router<SharedAppState> = Router::new()
+        .route("/api/feeds", axum::routing::get(handlers::feeds::get_feeds))
+        .route(
+            "/api/feeds/{feed}",
+            axum::routing::post(handlers::feeds::set_feed),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            auth_config,
+            require_bearer_auth,
+        ));
 
     // Public routes — read-only GET endpoints (no auth required).
     //
@@ -407,6 +419,88 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    /// Builds a minimal `SharedAppState` for the auth tests. The Groww feed is
+    /// seeded OFF so the feed-toggle endpoints have deterministic state.
+    fn auth_test_state() -> state::SharedAppState {
+        state::SharedAppState::new(
+            tickvault_common::config::QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: 1,
+                pg_port: 1,
+                ilp_port: 1,
+            },
+            tickvault_common::config::DhanConfig {
+                websocket_url: "wss://test".to_string(),
+                order_update_websocket_url: "wss://test".to_string(),
+                rest_api_base_url: "https://test".to_string(),
+                auth_base_url: "https://test".to_string(),
+                instrument_csv_url: "https://test".to_string(),
+                instrument_csv_fallback_url: "https://test".to_string(),
+                max_instruments_per_connection: 5000,
+                max_websocket_connections: 5,
+                sandbox_base_url: String::new(),
+            },
+            tickvault_common::config::InstrumentConfig {
+                daily_download_time: "08:55:00".to_string(),
+                csv_cache_directory: "/tmp/tv-cache".to_string(),
+                csv_cache_filename: "instruments.csv".to_string(),
+                csv_download_timeout_secs: 120,
+                build_window_start: "08:25:00".to_string(),
+                build_window_end: "08:55:00".to_string(),
+            },
+            std::sync::Arc::new(state::SystemHealthStatus::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_feeds_endpoint_requires_auth_401_without_token() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use secrecy::SecretString;
+        use tower::ServiceExt;
+
+        let auth = ApiAuthConfig::from_token(SecretString::from("secret-tok".to_string()));
+        let router = build_router_with_auth(auth_test_state(), &[], auth);
+
+        // GET /api/feeds with NO Authorization header must be rejected — the
+        // feed-toggle endpoints are in `protected_routes` (a missing-auth toggle
+        // could disable the trading feed). Security regression ratchet.
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/feeds")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_feeds_post_requires_auth_401_without_token() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use secrecy::SecretString;
+        use tower::ServiceExt;
+
+        let auth = ApiAuthConfig::from_token(SecretString::from("secret-tok".to_string()));
+        let router = build_router_with_auth(auth_test_state(), &[], auth);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/feeds/groww")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"enabled":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
     }
 
     // PR #7d (2026-05-19): `test_build_router_portal_endpoint_returns_200`

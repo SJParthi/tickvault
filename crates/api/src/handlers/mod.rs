@@ -15,6 +15,7 @@
 //!   `localhost:9000` for ad-hoc queries.
 
 pub mod debug;
+pub mod feeds;
 pub mod health;
 pub mod quote;
 pub mod stats;

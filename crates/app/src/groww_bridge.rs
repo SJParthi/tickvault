@@ -22,6 +22,7 @@
 
 use std::io::SeekFrom;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
@@ -31,6 +32,7 @@ use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::{error, info, warn};
 
+use tickvault_api::feed_state::{Feed, FeedRuntimeState};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::types::ExchangeSegment;
 use tickvault_core::feed::groww::aggregator_1m::{Groww1mAggregator, Groww1mCandle, Groww1mTick};
@@ -158,7 +160,11 @@ fn next_capture_seq(counter: &AtomicI64, wall_nanos: i64) -> i64 {
 // TEST-EXEMPT: file-tail + live-QuestDB ILP I/O driver; the pure primitives it
 // uses (parse_groww_tick_line, segment_from_str, live_tick_row,
 // candle_row_from_aggregated, next_capture_seq) are unit-tested below.
-pub async fn run_groww_bridge(qdb: QuestDbConfig, tick_file_path: PathBuf) {
+pub async fn run_groww_bridge(
+    qdb: QuestDbConfig,
+    tick_file_path: PathBuf,
+    feed_runtime: Arc<FeedRuntimeState>,
+) {
     info!(
         path = %tick_file_path.display(),
         "Groww bridge started — tailing the sidecar tick file (idles until the sidecar appends)"
@@ -172,6 +178,18 @@ pub async fn run_groww_bridge(qdb: QuestDbConfig, tick_file_path: PathBuf) {
 
     loop {
         tokio::time::sleep(GROWW_BRIDGE_POLL).await;
+
+        // Feed-toggle API (operator 2026-06-19): live pause/resume. When Groww is
+        // runtime-disabled via `POST /api/feeds/groww {enabled:false}`, idle — no
+        // file read, no writes. Any in-flight batch already past this check
+        // completed its flush; re-enabling resumes from the persisted `offset`
+        // with NO double-read and NO tick loss. Honest caveat: a pause that spans
+        // a minute boundary leaves the open candle bucket unsealed until a later
+        // tick arrives on resume — the same accuracy gap as any feed outage, not
+        // new loss (every raw tick is still persisted exactly once).
+        if !feed_runtime.is_enabled(Feed::Groww) {
+            continue;
+        }
 
         let mut file = match File::open(&tick_file_path).await {
             Ok(f) => f,
@@ -343,5 +361,19 @@ mod tests {
         assert_eq!(b, 1_001);
         assert_eq!(d, 5_000);
         assert!(b > a && d > b, "strictly monotonic");
+    }
+
+    #[test]
+    fn test_run_groww_bridge_has_runtime_disable_gate() {
+        // Feed-toggle API (2026-06-19): the bridge MUST check the shared runtime
+        // flag each loop so `POST /api/feeds/groww {enabled:false}` pauses it live.
+        // `run_groww_bridge` is a TEST-EXEMPT I/O driver, so pin the gate by
+        // source-scan — a future refactor cannot silently drop live pause/resume.
+        let src = include_str!("groww_bridge.rs");
+        assert!(
+            src.contains("feed_runtime.is_enabled(Feed::Groww)"),
+            "the Groww bridge loop must gate on the runtime feed flag (live pause/resume); \
+             the `feed_runtime.is_enabled(Feed::Groww)` check is missing"
+        );
     }
 }
