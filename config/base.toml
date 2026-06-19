@@ -293,6 +293,14 @@ inter_batch_delay_ms = 0
 [infrastructure]
 auto_start_docker = true
 
+# Pluggable market-data feed selection (Groww second feed, operator lock
+# 2026-06-19 — .claude/rules/project/groww-second-feed-scope-2026-06-19.md).
+# Dhan = feed #1 (default ON, UNCHANGED). Groww = feed #2 (default OFF,
+# opt-in). Run Dhan-only (today's default), Groww-only, or both.
+[feeds]
+dhan_enabled = true
+groww_enabled = false
+
 # [movers] section retired in PR #2 (2026-05-18) alongside the deleted
 # movers pipeline. Under the 4-IDX_I-only universe top-N gainers/losers/
 # most-active queries are meaningless.
