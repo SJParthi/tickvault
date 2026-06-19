@@ -203,10 +203,20 @@ impl TfIndex {
     /// explicitly — QuestDB rejects a DEDUP key that omits the
     /// designated timestamp column. The composite `(security_id,
     /// segment)` satisfies the I-P1-11 segment-aware uniqueness rule.
+    ///
+    /// `feed` (operator lock 2026-06-19, "same tables + feed column") is
+    /// part of the key so a Dhan candle and a Groww candle for the SAME
+    /// `(ts, security_id, segment)` minute are BOTH kept — distinct broker
+    /// feeds are distinct observations, never a duplicate. The Dhan candle
+    /// writer stamps a constant `feed='dhan'` and the Groww writer a
+    /// constant `feed='groww'`, so the label is replay-stable and does NOT
+    /// break the minute-bucket idempotency guarantee. Must equal
+    /// `DEDUP_KEY_CANDLES` in `shadow_persistence.rs` (pinned by
+    /// `test_dedup_key_candles_matches_tf_index_dedup_key`).
     #[inline]
     #[must_use]
     pub const fn dedup_key(self) -> &'static str {
-        "ts, security_id, segment"
+        "ts, security_id, segment, feed"
     }
 
     /// Bucket size in seconds.
@@ -422,6 +432,12 @@ mod tests {
             assert!(
                 key.contains("segment"),
                 "I-P1-11 violation: {} dedup key {:?} missing segment",
+                tf.display_name(),
+                key
+            );
+            assert!(
+                key.contains("feed"),
+                "feed-in-key (operator 2026-06-19): {} dedup key {:?} missing feed",
                 tf.display_name(),
                 key
             );
