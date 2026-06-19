@@ -54,7 +54,9 @@ drift/missing-tick problem against an independent second source.
 | Feed | Provider | Default | Connection | Reuses tickvault resilience chain | Writes to |
 |---|---|---|---|---|---|
 | **#1 Dhan** | Dhan | **ON** (unchanged) | ≤2 WS (main-feed + order-update) | yes (existing) | `ticks`, `candles_*`, audit tables (UNCHANGED) |
-| **#2 Groww** | Groww | **OFF** | independent Groww live feed — **native Rust client** (token + TOTP); brutex is reference only | **yes — same WAL→ring→spill→DLQ→aggregator, reused unchanged** | `groww_live_ticks`, `groww_candles_1m`, `groww_cross_verify_1m_audit` (NEW, namespaced) |
+| **#2 Groww** | Groww | **OFF** | independent Groww live feed — **native Rust client** (token + TOTP); brutex is reference only | **yes — same WAL→ring→spill→DLQ→aggregator, reused unchanged** | **the SAME shared tables `ticks` / `candles_1m` / audit tables**, every row tagged `feed='groww'` (operator decision 2026-06-19 — supersedes the original `groww_*` namespace) |
+
+> **⚠ TABLE MODEL SUPERSEDED 2026-06-19 (operator decision, AskUserQuestion "SAME tables + feed column"):** Groww does NOT write parallel `groww_*` tables. It writes into the **SAME shared tables** as Dhan (`ticks`, `candles_1m`, `prev_day_ohlcv`, audit tables), distinguished ONLY by the `feed` SYMBOL column (`'dhan'` / `'groww'`). The 3 parallel tables (`groww_live_ticks`, `groww_candles_1m`, `groww_cross_verify_1m_audit`) are RETIRED. Operator quote: *"i clearly told you same tables and extra columns alone"* + *"our entire architecture is same and precise … same codes and everything is same … especially db tables should be same … only new new feeds can be added and whenever some feeds are not needed means then just disable and enable."* Uniqueness across feeds is preserved by adding `feed` to the `ticks` DEDUP key → `(ts, security_id, segment, capture_seq, feed)` (O(1) hash, zero-alloc `&'static str` — a Dhan tick and a Groww tick for the same instrument/second are BOTH kept, never collide). Lane isolation is now by **connection + pipeline instance**, NOT by table.
 
 | Run mode | `feeds.dhan_enabled` | `feeds.groww_enabled` | Behaviour |
 |---|---|---|---|
@@ -72,7 +74,7 @@ drift/missing-tick problem against an independent second source.
 - **Exactly ≤2 Dhan WebSocket connections** (1 main-feed + 1 order-update). Groww does NOT add a Dhan connection. The `SubscriptionScope` enum, `effective_main_feed_pool_size`, the Dhan subscription planner, and `indices4only_scope_lock_guard.rs` are untouched.
 - **Dhan pipeline, tables, boot path** — not modified. Groww default-OFF ⇒ zero behaviour change until explicitly enabled.
 - **The resilience architecture is REUSED, never redesigned** — WAL frame spill (`ws_frame_spill.rs`), rescue ring (`TICK_BUFFER_CAPACITY`), disk spill (NDJSON), DLQ, tick processor, 1-minute aggregator. Groww plugs into these as a second producer; it does not change their design.
-- **Composite uniqueness** `(security_id/symbol, exchange_segment)` per I-P1-11 + DEDUP UPSERT KEYS on every new Groww table.
+- **Composite uniqueness** `(security_id/symbol, exchange_segment)` per I-P1-11 + DEDUP UPSERT KEYS on the SHARED tables, now extended with `feed` so multi-feed rows never collide (`ticks` key = `(ts, security_id, segment, capture_seq, feed)`).
 - **Indicators/strategies boundary** (daily-universe lock §28) — untouched. Groww is feed + 1m candles + parity check only; it drives NO strategy and places NO order.
 
 ---
@@ -81,7 +83,8 @@ drift/missing-tick problem against an independent second source.
 
 - Modifies the Dhan feed, the Dhan pipeline, the Dhan tables, `SubscriptionScope`, or `effective_main_feed_pool_size` in the name of "adding Groww".
 - Redesigns / forks / duplicates the WAL/ring/spill/DLQ/aggregator instead of reusing the existing blocks.
-- Writes Groww ticks into the Dhan `ticks`/`candles_*` tables (must use `groww_*` namespaced tables).
+- Re-introduces parallel `groww_*` data tables (RETIRED 2026-06-19 — Groww writes the SAME shared tables tagged `feed='groww'`).
+- Writes a Groww row to a shared table WITHOUT setting `feed='groww'`, OR omits `feed` from the `ticks` DEDUP key (would let a Groww tick overwrite a Dhan tick = silent loss).
 - Ships Groww **default ON** without a fresh dated operator quote (default is OFF; flipping it on by default changes prod behaviour).
 - Removes the per-feed enable/disable flags or makes a feed un-disableable.
 - Wires Groww into any strategy/order path (parity-check + observability ONLY in this scope).
@@ -187,7 +190,7 @@ fast path; it already contains the NATS-over-WS + nkey + protobuf decode.
 | Process model | A **separate `growwapi` Python process** running `GrowwFeed`, default-OFF behind `feeds.groww_enabled`. NEVER imported into the Rust binary; NEVER on the Dhan path. |
 | Capture-at-receipt | The Python callback MUST append each received tick to a **durable append-only file the instant it arrives** (before any IPC), preserving the zero-tick-loss PRINCIPLE one hop downstream of the socket. |
 | Bridge to Rust | Python → durable file/IPC → the **existing** Rust ring→spill→DLQ→aggregator (reused, not redesigned). Rust is the consumer + 1m sealer + parity checker. |
-| Tables | `groww_*` namespaced ONLY (`groww_live_ticks`, `groww_candles_1m`, …). NEVER the Dhan `ticks`/`candles_*`. |
+| Tables | **The SAME shared tables** (`ticks`, `candles_1m`, audit tables) tagged `feed='groww'` (operator decision 2026-06-19). The original `groww_*`-namespaced-only rule is RETIRED. |
 | Native Rust | **Kept as the production option, not burned.** When the `.proto` is extracted from the wheel + a NATS-over-WS path exists, the Python front-end is swapped for native Rust; everything downstream stays. |
 
 ## §32.3 Honest envelope (mandatory per §5 / operator-charter §F)

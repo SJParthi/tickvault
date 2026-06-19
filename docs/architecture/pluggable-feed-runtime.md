@@ -35,18 +35,19 @@ parallel, isolated. Neither → the process idles (shared infra only), never cra
         │ ring→spill→   │    │ ring→spill→   │    │               │
         │ DLQ→process→  │    │ DLQ→process→  │    │               │
         │ aggregate     │    │ aggregate     │    │               │
-        │   ↓           │    │   ↓           │    │               │
-        │ ticks /       │    │ groww_live_   │    │ feed3_*       │
-        │ candles_*     │    │ ticks /       │    │ tables        │
-        │ (Dhan tables) │    │ groww_*       │    │               │
+        │ feed='dhan'   │    │ feed='groww'  │    │ feed='feed3'  │
         └───────┬───────┘    └───────┬───────┘    └───────┬───────┘
                 └───────────┬────────┴─────────────────────┘
+                            ▼   SHARED TABLES (one set, `feed` column)
+                 ticks · candles_1m · prev_day_ohlcv · audit tables
                             ▼   SHARED RUNTIME (started once)
               config · observability · QuestDB · shutdown signal
 ```
 
-**Each lane is its own sealed pipe.** A lane never reads/writes another lane's tables, never shares a
-connection, never shares a pipeline instance. One lane dying cannot touch another.
+**Each lane is its own sealed pipe up to the write:** a lane never shares a connection or a pipeline
+instance, so one lane dying cannot touch another. They CONVERGE at the **shared tables**, where the
+`feed` column + the `feed`-extended DEDUP key keep every feed's rows distinct and collision-free
+(operator decision 2026-06-19 — same tables, not parallel `groww_*` tables).
 
 ---
 
@@ -78,7 +79,7 @@ connection, never shares a pipeline instance. One lane dying cannot touch anothe
 |---|---|
 | Connection | Dhan WS ≠ Groww NATS — separate sockets, separate auth |
 | Durable capture | each lane has its own WAL segments / ring / spill / DLQ instance |
-| Tables | `ticks`/`candles_*` (Dhan) vs `groww_*` (Groww) vs `feed3_*` — DEDUP-segment + the `groww_*`-namespace guard enforce this |
+| Tables | **SHARED** — ONE `ticks`, ONE `candles_1m`, etc., every row tagged by the `feed` SYMBOL column (`'dhan'`/`'groww'`/…). Isolation across feeds is by the `feed` value + the `feed`-extended DEDUP key (`(ts, security_id, segment, capture_seq, feed)`), NOT by separate tables (operator decision 2026-06-19). |
 | Pipeline | separate tick-processor + aggregator instances |
 | Failure | a lane panic is caught by its own supervisor; the dispatcher + other lanes are untouched |
 
@@ -134,9 +135,10 @@ if !feeds.dhan_enabled {
 ## 7. What a PR violating this design looks like (REJECT)
 
 - Runs Dhan code when `dhan_enabled=false` (the bug we're fixing — the old "warn-only" stub).
-- A lane reads/writes another lane's tables (Groww writing `ticks`, Dhan reading `groww_*`).
+- Re-introduces parallel `groww_*` data tables (RETIRED 2026-06-19 — feeds share `ticks`/`candles_1m`, tagged `feed`).
+- Writes a feed's row to a shared table WITHOUT setting the `feed` column, OR omits `feed` from the `ticks` DEDUP key (lets one feed's tick overwrite another's = silent loss).
 - Adds a feed without a flag, or default-ON for a new feed (must be default-OFF, §incremental).
-- A shared resource (one WS, one ring) multiplexed across feeds — breaks isolation.
+- A shared resource (one WS, one ring) multiplexed across feeds at the SOURCE — each feed still has its own connection + capture + pipeline instance up to the shared write.
 - "No feed enabled" crashes the process instead of idling.
 
 ---
