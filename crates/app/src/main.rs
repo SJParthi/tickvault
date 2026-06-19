@@ -251,12 +251,17 @@ async fn main() -> Result<()> {
         );
     }
     if feeds.groww_enabled {
-        // Groww data-plane schema — ensure the Groww tables exist with the
-        // correct DEDUP keys + `feed` column BEFORE the bridge writes. This runs
-        // for EVERY groww_enabled mode (Groww-only AND Dhan+Groww), and crucially
-        // BEFORE the Step C gate below — so a Groww-only run (which returns at the
-        // gate, skipping the Dhan block's DDL) still gets correct schema instead
-        // of QuestDB ILP auto-creating a keyless, feed-less table (3-agent
+        // Groww data-plane schema — ensure the tables the Groww bridge writes
+        // exist with the correct feed-extended DEDUP keys + `feed` column BEFORE
+        // the bridge writes. Groww uses the SAME tables as Dhan (operator
+        // 2026-06-19 "same tables + feed column"): the SHARED `ticks` + the SHARED
+        // 21 `candles_<tf>` tables (both ensures DELEGATE to the canonical shared
+        // DDL); only `groww_cross_verify_1m_audit` (the live-vs-backtest parity
+        // table) stays an isolated `groww_*` table. This runs for EVERY
+        // groww_enabled mode (Groww-only AND Dhan+Groww), and crucially BEFORE the
+        // Step C gate below — so a Groww-only run (which returns at the gate,
+        // skipping the Dhan block's DDL) still gets correct schema instead of
+        // QuestDB ILP auto-creating a keyless, feed-less table (3-agent
         // hostile-review HIGH, 2026-06-19). Idempotent CREATE/ALTER, cold path.
         tickvault_storage::groww_persistence::ensure_groww_live_ticks_table(&config.questdb).await;
         tickvault_storage::groww_candle_persistence::ensure_groww_candles_1m_table(&config.questdb)
@@ -290,13 +295,15 @@ async fn main() -> Result<()> {
         });
 
         // Groww bridge — consumes the sidecar's capture-at-receipt tick file →
-        // groww_live_ticks + groww_candles_1m (isolated groww_* tables only).
+        // SHARED `ticks` + SHARED `candles_1m`, every row tagged feed='groww'
+        // (distinguished from Dhan's feed='dhan' by the feed-extended DEDUP keys).
         // Dormant (no writes) until the Python sidecar appends; default OFF, so
         // the Dhan boot path is unaffected.
         let groww_qdb = config.questdb.clone();
         info!(
             "[feeds] groww_enabled=true — starting Groww bridge (dormant until the \
-             sidecar tick file appears; isolated groww_* tables, no Dhan impact)"
+             sidecar tick file appears; writes feed='groww' rows into the shared \
+             tables, no Dhan impact)"
         );
         tokio::spawn(tickvault_app::groww_bridge::run_groww_bridge(
             groww_qdb,

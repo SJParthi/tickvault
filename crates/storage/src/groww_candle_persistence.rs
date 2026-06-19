@@ -1,35 +1,34 @@
-//! Groww 1-minute candle persistence — second feed (operator lock §32,
-//! `groww-second-feed-scope-2026-06-19.md`). A SEPARATE QuestDB table holding
-//! the 1-minute OHLCV candles aggregated from the Groww live feed. **This is NOT
-//! the Dhan `candles_1m` table** — the `groww_*` namespace keeps the two feeds
-//! fully isolated, so the live-1m-vs-backtest-1m parity check (the goal of the
-//! second feed) compares Groww-against-Groww without touching Dhan data.
+//! Groww 1-minute candle persistence — second feed (operator lock §32 +
+//! "same tables + feed column" 2026-06-19, `groww-second-feed-scope-2026-06-19.md`).
 //!
-//! ## Schema
+//! **Groww writes the SHARED Dhan `candles_1m` table, tagged `feed='groww'`** —
+//! NOT a separate `groww_candles_1m` table (that namespace was RETIRED in the
+//! same-tables pivot, mirroring the ticks side in Step 3a). The two feeds
+//! coexist in one table, distinguished by the `feed` column which is part of the
+//! shared candle DEDUP key `(ts, security_id, segment, feed)` (`DEDUP_KEY_CANDLES`
+//! in `shadow_persistence.rs`). So a Dhan candle and a Groww candle for the SAME
+//! `(ts, security_id, segment)` minute are BOTH kept — distinct feeds = distinct
+//! observations, never a collision — and "Groww candles only" is an O(1)
+//! `WHERE feed = 'groww'` filter, never a second table.
 //!
-//! ```sql
-//! CREATE TABLE IF NOT EXISTS groww_candles_1m (
-//!     feed         SYMBOL,   -- broker source provenance label ("groww")
-//!     segment      SYMBOL,
-//!     security_id  LONG,     -- Groww exchange_token (composite key w/ segment)
-//!     ts           TIMESTAMP,-- minute-aligned IST nanos
-//!     open         DOUBLE,
-//!     high         DOUBLE,
-//!     low          DOUBLE,
-//!     close        DOUBLE,
-//!     volume       LONG,
-//!     tick_count   LONG      -- # ticks folded into this candle (observability)
-//! ) timestamp(ts) PARTITION BY DAY
-//!   DEDUP UPSERT KEYS(ts, security_id, segment);
-//! ```
+//! The live-1m-vs-backtest-1m parity check (the goal of the second feed) reads
+//! `candles_1m WHERE feed = 'groww'` and compares Groww-against-Groww; the Dhan
+//! rows (`feed = 'dhan'`) are never touched by that compare.
 //!
-//! ## Uniqueness / dedup (I-P1-11)
+//! ## Schema (owned by `shadow_persistence::ensure_shadow_candle_tables`)
 //!
-//! DEDUP key `(ts, security_id, segment)` — one candle per (minute, instrument).
-//! `segment` is mandatory (I-P1-11). NO `capture_seq` (unlike ticks): a sealed
-//! 1-minute candle is uniquely identified by its minute boundary, so re-sealing
-//! the same minute UPSERTs in place (idempotent). `feed` is a provenance LABEL,
-//! NOT a key (the table is groww-only; feeds are physically separated).
+//! The shared `candles_1m` table has the full 15-column Dhan schema. Groww writes
+//! a strict SUBSET — `feed, segment, security_id, ts, open, high, low, close,
+//! volume, tick_count` — leaving `oi` + the 4 `*_pct*` columns NULL for Groww
+//! rows (Groww does not compute OI or prev-day %). QuestDB ILP permits a
+//! per-row column subset; the unwritten columns are NULL for that row only.
+//!
+//! ## Uniqueness / dedup (I-P1-11 + feed)
+//!
+//! The shared candle DEDUP key `(ts, security_id, segment, feed)` is the single
+//! source of truth (`DEDUP_KEY_CANDLES` / `TfIndex::dedup_key()`). A sealed
+//! 1-minute candle is uniquely identified by its minute boundary + instrument +
+//! feed, so re-sealing the same Groww minute UPSERTs in place (idempotent).
 //!
 //! ## Timestamp rule (`data-integrity.md`)
 //!
@@ -41,17 +40,11 @@ use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
 use tracing::warn;
 
 use tickvault_common::config::QuestDbConfig;
+use tickvault_trading::candles::TfIndex;
 
-/// QuestDB table name. One row per (minute, instrument) Groww candle.
-pub const GROWW_CANDLES_1M_TABLE: &str = "groww_candles_1m";
-
-/// DEDUP UPSERT key — `ts` (designated, QuestDB-required) + `segment` per
-/// I-P1-11. The `dedup_segment_meta_guard` workspace test scans this constant;
-/// it MUST mention `segment`.
-pub const DEDUP_KEY_GROWW_CANDLES_1M: &str = "ts, security_id, segment";
-
-/// One Groww 1-minute candle ready for ILP write. All prices `f64` (the Groww
-/// SDK emits native floats — no `f32_to_f64_clean` widening concern).
+/// One Groww 1-minute candle ready for ILP write into the SHARED `candles_1m`
+/// table. All prices `f64` (the Groww SDK emits native floats — no
+/// `f32_to_f64_clean` widening concern).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GrowwCandle1mRow {
     /// Designated timestamp: minute-aligned IST nanoseconds. NO offset here.
@@ -61,85 +54,45 @@ pub struct GrowwCandle1mRow {
     /// Composite-key part 2 (I-P1-11). `&'static` segment string for the
     /// `symbol` column.
     pub segment: &'static str,
-    /// Broker-source provenance label (e.g. `"groww"`). NON-key.
+    /// Broker-source provenance label (e.g. `"groww"`). Part of the shared
+    /// candle DEDUP key — keeps Groww candles distinct from Dhan candles.
     pub feed: &'static str,
     pub open: f64,
     pub high: f64,
     pub low: f64,
     pub close: f64,
     pub volume: i64,
-    /// Number of ticks folded into this candle (observability; NOT a key).
+    /// Number of ticks folded into this candle (observability; NON-key).
     pub tick_count: i64,
 }
 
-/// The idempotent `CREATE TABLE` DDL for `groww_candles_1m`. Pure (testable
-/// without QuestDB).
-#[must_use]
-pub fn groww_candles_1m_create_ddl() -> String {
-    format!(
-        "CREATE TABLE IF NOT EXISTS {GROWW_CANDLES_1M_TABLE} (\
-            feed         SYMBOL, \
-            segment      SYMBOL, \
-            security_id  LONG, \
-            ts           TIMESTAMP, \
-            open         DOUBLE, \
-            high         DOUBLE, \
-            low          DOUBLE, \
-            close        DOUBLE, \
-            volume       LONG, \
-            tick_count   LONG\
-        ) timestamp(ts) PARTITION BY DAY \
-        DEDUP UPSERT KEYS({DEDUP_KEY_GROWW_CANDLES_1M});"
-    )
-}
-
-/// Create the `groww_candles_1m` table if absent (idempotent, schema-self-heal
-/// pattern). Failures log at `error!` (Telegram-routable) but do NOT block the
-/// caller. Only invoked when the Groww feed is enabled.
-// TEST-EXEMPT: live-QuestDB DDL runner (DDL string unit-tested via groww_candles_1m_create_ddl tests).
+/// Ensure the Groww candle target table exists. Groww writes the SHARED
+/// `candles_1m` table, so this DELEGATES to the canonical candle-table DDL —
+/// exactly mirroring how `groww_persistence::ensure_groww_live_ticks_table`
+/// delegates to the shared ticks DDL (Step 3a). Only invoked when the Groww feed
+/// is enabled, so that Groww-only mode (which skips the Dhan boot, where the
+/// candle tables are otherwise ensured) still has `candles_1m` + its 4-col feed
+/// DEDUP key before the bridge writes.
+///
+/// **Drops legacy candle matviews FIRST** (3-agent hostile-review MEDIUM,
+/// 2026-06-19): a pre-`#T1` Engine-C materialized view named `candles_1m` makes
+/// `CREATE TABLE IF NOT EXISTS candles_1m` a silent no-op, after which ILP
+/// appends to that name FAIL (matviews are not ILP-writable). The Dhan boot
+/// always calls `drop_legacy_candle_objects` before `ensure_shadow_candle_tables`
+/// for exactly this reason; a Groww-ONLY run on a brownfield QuestDB volume must
+/// do the same or Groww candles would silently never persist. Both calls are
+/// idempotent (marker-gated drop + `IF NOT EXISTS` create), so this is safe to
+/// run in every mode even when the Dhan path also runs them.
+// TEST-EXEMPT: thin delegation to unit-tested drop_legacy_candle_objects + ensure_shadow_candle_tables.
 pub async fn ensure_groww_candles_1m_table(questdb_config: &QuestDbConfig) {
-    use std::time::Duration;
-    use tracing::error;
-
-    let base_url = format!(
-        "http://{}:{}/exec",
-        questdb_config.host, questdb_config.http_port
-    );
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(err) => {
-            error!(
-                ?err,
-                "groww_candles_1m: HTTP client build failed — table not ensured"
-            );
-            return;
-        }
-    };
-    let ddl = groww_candles_1m_create_ddl();
-    match client
-        .get(&base_url)
-        .query(&[("query", ddl.as_str())])
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => {}
-        Ok(resp) => {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            error!(%status, body = %body.chars().take(200).collect::<String>(),
-                "groww_candles_1m: CREATE TABLE returned non-2xx");
-        }
-        Err(err) => error!(?err, "groww_candles_1m: CREATE TABLE request failed"),
-    }
+    crate::shadow_persistence::drop_legacy_candle_objects(questdb_config).await;
+    crate::shadow_persistence::ensure_shadow_candle_tables(questdb_config).await;
 }
 
-/// Lazy-connect ILP writer for the `groww_candles_1m` table. Mirrors
-/// `PrevDayOhlcvWriter`: if QuestDB is unreachable at construction the writer
-/// still builds (`sender = None`); `append_row` fills the local buffer and
-/// `flush` returns `Err` until a reconnect lands.
+/// Lazy-connect ILP writer for Groww 1-minute candles into the SHARED
+/// `candles_1m` table. Mirrors `PrevDayOhlcvWriter`: if QuestDB is unreachable at
+/// construction the writer still builds (`sender = None`); `append_row` fills the
+/// local buffer and `flush` returns `Err` until a reconnect lands.
 pub struct GrowwCandle1mWriter {
     sender: Option<Sender>,
     buffer: Buffer,
@@ -165,7 +118,7 @@ impl GrowwCandle1mWriter {
             Err(err) => {
                 warn!(
                     ?err,
-                    "groww_candles_1m writer: QuestDB unreachable — buffering locally"
+                    "groww candles writer: QuestDB unreachable — buffering locally"
                 );
                 Self {
                     sender: None,
@@ -200,32 +153,35 @@ impl GrowwCandle1mWriter {
         self.pending
     }
 
-    /// Append one Groww 1m candle row to the ILP buffer. O(1), zero alloc beyond
-    /// the buffer's internal growth.
+    /// Append one Groww 1m candle row to the SHARED `candles_1m` ILP buffer.
+    /// O(1), zero alloc beyond the buffer's internal growth. The target table is
+    /// `TfIndex::M1.table_name()` (the single source of truth for the candle
+    /// table name) — never a separate `groww_*` table. `feed` is stamped as a
+    /// SYMBOL (part of the DEDUP key) so Groww rows never collide with Dhan rows.
     pub fn append_row(&mut self, row: &GrowwCandle1mRow) -> Result<()> {
         self.buffer
-            .table(GROWW_CANDLES_1M_TABLE)
-            .with_context(|| "groww_candles_1m append: table() failed")?
+            .table(TfIndex::M1.table_name())
+            .with_context(|| "groww candle append: table() failed")?
             .symbol("feed", row.feed)
-            .with_context(|| "groww_candles_1m append: symbol(feed) failed")?
+            .with_context(|| "groww candle append: symbol(feed) failed")?
             .symbol("segment", row.segment)
-            .with_context(|| "groww_candles_1m append: symbol(segment) failed")?
+            .with_context(|| "groww candle append: symbol(segment) failed")?
             .column_i64("security_id", row.security_id)
-            .with_context(|| "groww_candles_1m append: column_i64(security_id) failed")?
+            .with_context(|| "groww candle append: column_i64(security_id) failed")?
             .column_f64("open", row.open)
-            .with_context(|| "groww_candles_1m append: column_f64(open) failed")?
+            .with_context(|| "groww candle append: column_f64(open) failed")?
             .column_f64("high", row.high)
-            .with_context(|| "groww_candles_1m append: column_f64(high) failed")?
+            .with_context(|| "groww candle append: column_f64(high) failed")?
             .column_f64("low", row.low)
-            .with_context(|| "groww_candles_1m append: column_f64(low) failed")?
+            .with_context(|| "groww candle append: column_f64(low) failed")?
             .column_f64("close", row.close)
-            .with_context(|| "groww_candles_1m append: column_f64(close) failed")?
+            .with_context(|| "groww candle append: column_f64(close) failed")?
             .column_i64("volume", row.volume)
-            .with_context(|| "groww_candles_1m append: column_i64(volume) failed")?
+            .with_context(|| "groww candle append: column_i64(volume) failed")?
             .column_i64("tick_count", row.tick_count)
-            .with_context(|| "groww_candles_1m append: column_i64(tick_count) failed")?
+            .with_context(|| "groww candle append: column_i64(tick_count) failed")?
             .at(TimestampNanos::new(row.ts_ist_nanos))
-            .with_context(|| "groww_candles_1m append: at(ts) failed")?;
+            .with_context(|| "groww candle append: at(ts) failed")?;
         self.pending = self.pending.saturating_add(1);
         Ok(())
     }
@@ -249,10 +205,10 @@ impl GrowwCandle1mWriter {
         let sender = self
             .sender
             .as_mut()
-            .context("groww_candles_1m flush: not connected to QuestDB")?;
+            .context("groww candles flush: not connected to QuestDB")?;
         sender
             .flush(&mut self.buffer)
-            .context("groww_candles_1m flush: ILP flush failed")?;
+            .context("groww candles flush: ILP flush failed")?;
         self.pending = 0;
         Ok(())
     }
@@ -278,46 +234,6 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_key_includes_segment_excludes_feed() {
-        // I-P1-11 + dedup_segment_meta_guard; feed is a LABEL, not a key.
-        assert!(DEDUP_KEY_GROWW_CANDLES_1M.contains("segment"));
-        assert!(DEDUP_KEY_GROWW_CANDLES_1M.contains("security_id"));
-        assert!(DEDUP_KEY_GROWW_CANDLES_1M.contains("ts"));
-        assert!(!DEDUP_KEY_GROWW_CANDLES_1M.contains("feed"));
-        assert!(!DEDUP_KEY_GROWW_CANDLES_1M.contains("capture_seq"));
-    }
-
-    #[test]
-    fn test_groww_candles_1m_create_ddl_has_all_columns_and_dedup() {
-        let ddl = groww_candles_1m_create_ddl();
-        for needle in [
-            "groww_candles_1m",
-            "feed         SYMBOL",
-            "segment      SYMBOL",
-            "security_id  LONG",
-            "ts           TIMESTAMP",
-            "open         DOUBLE",
-            "high         DOUBLE",
-            "low          DOUBLE",
-            "close        DOUBLE",
-            "volume       LONG",
-            "tick_count   LONG",
-            "DEDUP UPSERT KEYS(ts, security_id, segment)",
-            "PARTITION BY DAY",
-        ] {
-            assert!(ddl.contains(needle), "DDL missing: {needle}\n{ddl}");
-        }
-    }
-
-    #[test]
-    fn test_table_name_is_groww_namespaced_not_dhan_candles() {
-        // Isolation contract (lock §32): never the Dhan `candles_1m` table.
-        assert_eq!(GROWW_CANDLES_1M_TABLE, "groww_candles_1m");
-        assert_ne!(GROWW_CANDLES_1M_TABLE, "candles_1m");
-        assert!(GROWW_CANDLES_1M_TABLE.starts_with("groww_"));
-    }
-
-    #[test]
     fn test_for_test_writer_is_disconnected_and_empty() {
         let w = GrowwCandle1mWriter::for_test();
         assert!(!w.is_connected());
@@ -326,15 +242,32 @@ mod tests {
     }
 
     #[test]
-    fn test_append_row_serialises_table_feed_and_ohlc() {
+    fn test_append_row_writes_shared_candles_1m_tagged_feed_groww() {
+        // Same-tables pivot (operator 2026-06-19): Groww candles go to the SHARED
+        // `candles_1m` table tagged `feed=groww` — NOT a separate `groww_*` table.
         let mut w = GrowwCandle1mWriter::for_test();
         w.append_row(&sample_row()).expect("append");
         assert_eq!(w.pending(), 1);
         let text = String::from_utf8_lossy(w.buffer_bytes());
-        assert!(text.contains("groww_candles_1m"), "table name on wire");
+        assert!(
+            text.contains("candles_1m"),
+            "shared candle table name on wire"
+        );
+        assert!(
+            !text.contains("groww_candles_1m"),
+            "must NOT write a separate groww_candles_1m table (namespace retired)"
+        );
         assert!(text.contains("feed=groww"), "feed provenance on wire");
         assert!(text.contains("NSE_EQ"), "segment on wire");
         assert!(text.contains("tick_count=87"), "tick_count on wire");
+    }
+
+    #[test]
+    fn test_target_table_is_the_shared_m1_candle_table() {
+        // The single source of truth for the candle table name is
+        // `TfIndex::M1.table_name()` — Groww writes exactly that, so the two
+        // feeds share one table (distinguished only by the `feed` column).
+        assert_eq!(TfIndex::M1.table_name(), "candles_1m");
     }
 
     #[test]

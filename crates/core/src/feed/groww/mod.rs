@@ -4,7 +4,8 @@
 //! - **PR-2 (this):** [`auth`] — obtain a Groww access token from the
 //!   `api_key` + a rotating TOTP code (the prerequisite for the live feed).
 //! - Later PRs: NATS connect + subscribe, protobuf tick decode → the same
-//!   WAL/ring/spill/DLQ chain, 1-minute aggregation → `groww_candles_1m`,
+//!   WAL/ring/spill/DLQ chain, 1-minute aggregation → the shared `candles_1m`
+//!   table (tagged `feed='groww'`),
 //!   and the live-1m vs Groww-backtest-1m exact parity check.
 //!
 //! Default OFF — nothing here runs unless `feeds.groww_enabled` is set.
