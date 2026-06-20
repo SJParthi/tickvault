@@ -70,6 +70,19 @@ measuring that drift vs Dhan is the goal. Default-OFF guarantees zero prod impac
   - Files: `crates/app/src/groww_bridge.rs`
   - Tests: `test_validate_groww_tick_accepts_valid`, `test_validate_groww_tick_rejects_non_finite_ltp`, `test_validate_groww_tick_rejects_non_positive_ltp`, `test_validate_groww_tick_rejects_implausible_ltp`, `test_validate_groww_tick_rejects_negative_volume`, `test_validate_groww_tick_rejects_non_positive_security_id`, `test_validate_groww_tick_rejects_timestamp_out_of_range`
 
+- [x] PR-A (Groww hardening — 4-agent audit fixes 2026-06-20) — **bounded chunked read** of the NDJSON tick file (HIGH: prevents multi-GB `read_to_string` OOM at ~779-instrument scale) via `GROWW_BRIDGE_MAX_READ_BYTES`=4MiB/poll + UTF-8-safe byte-residual line splitting (`drain_complete_prefix`); **`MAX_PLAUSIBLE_VOLUME`** guard (`GrowwTickReject::ImplausibleVolume`); **sidecar token-leak fix** (log `type(exc).__name__`, never `{exc!r}` which can embed the access token). Parity check shelved per operator 2026-06-20.
+  - Files: `crates/app/src/groww_bridge.rs`, `scripts/groww-sidecar/groww_sidecar.py`
+  - Tests: `test_drain_complete_prefix_splits_complete_lines_keeps_partial`, `test_drain_complete_prefix_no_newline_returns_empty`, `test_drain_complete_prefix_partial_utf8_tail_buffered`, `test_validate_groww_tick_rejects_implausible_volume`
+
+- [ ] PR-B (Groww universe → ~779 subscribed) — **Rust builds the watch-list** (operator decision 2026-06-20): download Groww master `instrument.csv` (`growwapi-assets.groww.in/instruments/instrument.csv`) + the NIFTY-Total-Market list, join NTM ISINs → Groww `exchange_token` (cash stocks) + NSE indices → `exchange_token`, write a watch file the sidecar reads. Sidecar: read watch file (replace hardcoded WATCH), `subscribe_ltp` (stocks) + `subscribe_index_value` (indices, fixes the IDX_I MEDIUM). ~779 instruments.
+  - Files: `crates/core/src/feed/groww/instruments.rs` (NEW), `crates/app/src/main.rs` (boot wiring), `scripts/groww-sidecar/groww_sidecar.py`
+  - Tests: ISIN-join resolver, watch-file writer, index/cash classification
+
+- [ ] PR-C (Groww-only on Mac) — confirm `dhan_enabled=false` + `groww_enabled=true` boot path runs standalone on a local MacBook; creds via AWS SSM (operator decision 2026-06-20: Mac has AWS creds); docs.
+  - Files: `config/*.toml`, docs
+  - Tests: Groww-only boot-path guard
+
+
 ### Design (PR-4a)
 A single `Arc<FeedRuntimeState>` is built at boot from `config.feeds` (`dhan_enabled`/`groww_enabled` seed the atomics) and shared into BOTH the API `AppState` (via `new_with_feed_runtime`, leaving the 4-arg `new` unchanged for the 22 existing call sites) AND `run_groww_bridge`. `GET /api/feeds` returns `{dhan: bool, groww: bool}`; `POST /api/feeds/{feed}` with `{enabled: bool}` flips the atomic, behind the existing bearer-auth `protected_routes`. The Groww bridge loop reads `is_enabled(Feed::Groww)` each iteration and idles (no file read, no writes) when disabled — live pause/resume.
 

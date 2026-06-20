@@ -44,6 +44,13 @@ const GROWW_BRIDGE_POLL_MS: u64 = 500;
 /// Poll interval for tailing the sidecar's append-only tick file.
 const GROWW_BRIDGE_POLL: Duration = Duration::from_millis(GROWW_BRIDGE_POLL_MS);
 
+/// Max bytes read from the tick file per poll (hostile-review HIGH 2026-06-19).
+/// Bounds the per-poll allocation so a large backlog on restart (e.g. a full
+/// trading day of ~779-instrument NDJSON) is drained in fixed 4 MiB chunks
+/// across polls instead of one multi-GB `read_to_string` that would OOM the
+/// 8 GiB host. At 500 ms/poll this drains ~8 MiB/s — far above the live rate.
+const GROWW_BRIDGE_MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Broker-source provenance label written into the `feed` column.
 pub const GROWW_FEED_NAME: &str = "groww";
 
@@ -111,6 +118,12 @@ const MIN_PLAUSIBLE_TS_IST_NANOS: i64 = 1_577_836_800_000_000_000;
 /// Rejects `i64::MAX` / mangled far-future stamps.
 const MAX_PLAUSIBLE_TS_IST_NANOS: i64 = 4_102_444_800_000_000_000;
 
+/// Upper bound for a plausible cumulative day volume (1 trillion shares).
+/// ~1000× the busiest real NSE day-volume — rejects an absurd-but-finite `i64`
+/// (e.g. a mangled field) before it can reach the shared `ticks` table, while
+/// never rejecting a genuine cumulative volume. Mirrors the LTP upper bound.
+const MAX_PLAUSIBLE_VOLUME: i64 = 1_000_000_000_000;
+
 /// Why a Groww NDJSON tick is rejected before it can reach the SHARED tables.
 /// Copy + testable; mirrors the Dhan path's `is_valid_ltp` / OHLC-integrity
 /// guards (phase-0-architecture.md Pillar 2) so a misbehaving sidecar cannot
@@ -125,6 +138,8 @@ enum GrowwTickReject {
     ImplausiblePrice,
     /// `cum_volume` is negative (cumulative day volume can never decrease below 0).
     NegativeVolume,
+    /// `cum_volume` exceeds `MAX_PLAUSIBLE_VOLUME` — absurd-but-finite garbage.
+    ImplausibleVolume,
     /// `security_id` is zero or negative.
     NonPositiveSecurityId,
     /// `ts_ist_nanos` is outside the plausible `[2020, 2100)` IST window.
@@ -147,6 +162,9 @@ fn validate_groww_tick(parsed: &ParsedGrowwTick) -> Result<(), GrowwTickReject> 
     }
     if parsed.tick.cum_volume < 0 {
         return Err(GrowwTickReject::NegativeVolume);
+    }
+    if parsed.tick.cum_volume > MAX_PLAUSIBLE_VOLUME {
+        return Err(GrowwTickReject::ImplausibleVolume);
     }
     if parsed.tick.security_id <= 0 {
         return Err(GrowwTickReject::NonPositiveSecurityId);
@@ -205,6 +223,19 @@ fn next_capture_seq(counter: &AtomicI64, wall_nanos: i64) -> i64 {
     }
 }
 
+/// Drains all COMPLETE newline-terminated records from `residual`, returning the
+/// drained prefix bytes (up to and including the final `\n`). Any trailing partial
+/// line — including a partial multi-byte UTF-8 char left by the bounded chunked
+/// read — stays in `residual` for the next poll. Splitting on the `0x0A` byte is
+/// UTF-8-safe: a newline byte never occurs inside a multi-byte sequence. Pure +
+/// testable; O(n) single drain (no per-line shift).
+fn drain_complete_prefix(residual: &mut Vec<u8>) -> Vec<u8> {
+    match residual.iter().rposition(|&b| b == b'\n') {
+        Some(last_nl) => residual.drain(..=last_nl).collect(),
+        None => Vec::new(),
+    }
+}
+
 /// Dormant consumer driver: tails the sidecar's append-only NDJSON tick file,
 /// persists each raw tick to the SHARED `ticks` table (feed='groww'), folds them
 /// through the 1m aggregator, and persists sealed candles to the SHARED
@@ -230,7 +261,11 @@ pub async fn run_groww_bridge(
     let mut aggregator = Groww1mAggregator::new();
     let capture_seq = AtomicI64::new(0);
     let mut offset: u64 = 0;
-    let mut residual = String::new();
+    // Byte residual (not String): a bounded chunked read can split a multi-byte
+    // UTF-8 char at the chunk boundary; buffering raw bytes and splitting on the
+    // 0x0A newline (never part of a multi-byte sequence) keeps partial chars +
+    // partial lines safely buffered until the next poll completes them.
+    let mut residual: Vec<u8> = Vec::new();
 
     loop {
         tokio::time::sleep(GROWW_BRIDGE_POLL).await;
@@ -269,8 +304,11 @@ pub async fn run_groww_bridge(
         if file.seek(SeekFrom::Start(offset)).await.is_err() {
             continue;
         }
-        let mut buf = String::new();
-        match file.read_to_string(&mut buf).await {
+        // Bounded chunked read (HIGH fix): read at most GROWW_BRIDGE_MAX_READ_BYTES
+        // this poll — never the whole (possibly multi-GB) file at once.
+        let to_read = (len - offset).min(GROWW_BRIDGE_MAX_READ_BYTES);
+        let mut chunk: Vec<u8> = Vec::new();
+        match (&mut file).take(to_read).read_to_end(&mut chunk).await {
             Ok(n) => offset = offset.saturating_add(n as u64),
             Err(err) => {
                 warn!(?err, "groww bridge: read failed");
@@ -278,13 +316,23 @@ pub async fn run_groww_bridge(
             }
         }
 
-        residual.push_str(&buf);
+        residual.extend_from_slice(&chunk);
         let mut wrote_live = false;
         let mut wrote_candle = false;
-        // Process only COMPLETE lines; keep any trailing partial line buffered.
-        while let Some(nl) = residual.find('\n') {
-            let raw: String = residual.drain(..=nl).collect();
-            let line = raw.trim();
+        // Drain only COMPLETE newline-terminated lines; a trailing partial line
+        // (incl. a partial UTF-8 char from the chunk boundary) stays buffered.
+        let prefix = drain_complete_prefix(&mut residual);
+        for line_bytes in prefix.split(|&b| b == b'\n') {
+            if line_bytes.is_empty() {
+                continue;
+            }
+            let line = match std::str::from_utf8(line_bytes) {
+                Ok(s) => s.trim(),
+                Err(err) => {
+                    error!(?err, "groww bridge: skipping non-UTF-8 tick line");
+                    continue;
+                }
+            };
             if line.is_empty() {
                 continue;
             }
@@ -442,6 +490,48 @@ mod tests {
             validate_groww_tick(&p),
             Err(GrowwTickReject::NegativeVolume)
         );
+    }
+
+    #[test]
+    fn test_validate_groww_tick_rejects_implausible_volume() {
+        let mut p = valid_parsed();
+        p.tick.cum_volume = MAX_PLAUSIBLE_VOLUME + 1;
+        assert_eq!(
+            validate_groww_tick(&p),
+            Err(GrowwTickReject::ImplausibleVolume)
+        );
+        // Boundary is inclusive-valid.
+        p.tick.cum_volume = MAX_PLAUSIBLE_VOLUME;
+        assert_eq!(validate_groww_tick(&p), Ok(()));
+    }
+
+    #[test]
+    fn test_drain_complete_prefix_splits_complete_lines_keeps_partial() {
+        let mut residual: Vec<u8> = b"line1\nline2\npartial".to_vec();
+        let prefix = drain_complete_prefix(&mut residual);
+        assert_eq!(prefix, b"line1\nline2\n");
+        assert_eq!(residual, b"partial");
+        let lines: Vec<&[u8]> = prefix.split(|&b| b == b'\n').collect();
+        // "line1", "line2", "" (trailing after final \n)
+        assert_eq!(lines, vec![&b"line1"[..], &b"line2"[..], &b""[..]]);
+    }
+
+    #[test]
+    fn test_drain_complete_prefix_no_newline_returns_empty() {
+        let mut residual: Vec<u8> = b"no newline yet".to_vec();
+        let prefix = drain_complete_prefix(&mut residual);
+        assert!(prefix.is_empty());
+        assert_eq!(residual, b"no newline yet"); // untouched
+    }
+
+    #[test]
+    fn test_drain_complete_prefix_partial_utf8_tail_buffered() {
+        // A complete line, then the first byte of a 2-byte UTF-8 char (0xC3).
+        let mut residual: Vec<u8> = b"good\n".to_vec();
+        residual.push(0xC3); // partial multi-byte char, no newline
+        let prefix = drain_complete_prefix(&mut residual);
+        assert_eq!(prefix, b"good\n");
+        assert_eq!(residual, vec![0xC3]); // partial byte safely buffered
     }
 
     #[test]
