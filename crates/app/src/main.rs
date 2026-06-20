@@ -317,6 +317,27 @@ async fn main() -> Result<()> {
             std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
             std::sync::Arc::clone(&feed_runtime),
         ));
+
+        // Groww sidecar auto-launcher (operator "no manual commands" 2026-06-19).
+        // tickvault itself auto-provisions an isolated Python venv (one-time,
+        // idempotent `python -m venv` + `pip install growwapi pyotp`), fetches the
+        // SSM Groww creds and injects them as env, spawns the producer sidecar, and
+        // supervises it (restart-on-crash with backoff; stop/resume on the runtime
+        // feed toggle). The operator NEVER runs pip/python by hand — flipping
+        // `groww_enabled` (config OR the /api/feeds endpoint) is the only action.
+        // Default OFF; touches NO Dhan path.
+        info!(
+            "[feeds] groww_enabled=true — starting Groww sidecar supervisor \
+             (auto-provisions an isolated Python env + launches/restarts the \
+             producer; no manual commands required)"
+        );
+        tokio::spawn(
+            tickvault_app::groww_sidecar_supervisor::run_groww_sidecar_supervisor(
+                std::sync::Arc::clone(&feed_runtime),
+                tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
+            ),
+        );
+
         // The Groww lane is now actually running — so the feed-toggle API reports
         // `groww_lane_running: true` and a runtime toggle genuinely pauses/resumes
         // it (rather than recording a flag with no lane to act on it).
