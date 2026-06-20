@@ -123,7 +123,15 @@ def main() -> None:
             print("stopping.", flush=True)
             break
         except Exception as exc:  # noqa: BLE001 - reconnect on any error
-            print(f"groww sidecar error: {exc!r} — reconnecting in 5s", flush=True)
+            # Log ONLY the exception type name, never repr/str: a Groww SDK HTTP
+            # error can embed the response body (and thus the access token /
+            # api_key) in its repr, which the Rust supervisor captures from stdout
+            # (security-review MEDIUM 2026-06-19). The type name is enough to
+            # triage; full detail stays out of the log.
+            print(
+                f"groww sidecar error: {type(exc).__name__} — reconnecting in 5s",
+                flush=True,
+            )
             time.sleep(5)
 
 
