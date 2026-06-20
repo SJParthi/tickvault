@@ -1,0 +1,561 @@
+//! Groww watch-list builder — PURE CORE (PR-B1, operator lock §31/§32, 2026-06-20).
+//!
+//! Builds the ~779-instrument Groww subscription set (NIFTY-Total-Market stocks +
+//! NSE indices) by joining the NTM constituent **ISINs** to Groww's own
+//! `exchange_token`s from Groww's master `instrument.csv`. The resolved set is
+//! written to a watch file the Python sidecar reads (subscribe_ltp for stocks +
+//! subscribe_index_value for indices).
+//!
+//! This module is the **pure, fully-unit-tested core**: CSV parse (header-name
+//! based — Groww adds columns), the O(1) ISIN→token map, the ISIN join with the
+//! 2% NTM tolerance, dedup by `(exchange_token, segment)`, the `[100,1200]`
+//! universe envelope, the 1000-subscription Groww cap, and the deterministic
+//! `max_subscribe` first-run cap (indices first, then stocks by ISIN ascending).
+//! The network download + atomic watch-file write + boot wiring are the
+//! TEST-EXEMPT orchestration that calls these primitives (next slice of PR-B1).
+//!
+//! Honest envelope (operator §F): this builder guarantees **correct, idempotent,
+//! fail-closed token resolution**. It cannot guarantee Groww lists every NTM
+//! stock — the 2% tolerance + by-name logging make any gap VISIBLE, never silent.
+//! Volume is Option A (price-only): the watch set carries no volume concept.
+
+use std::collections::HashMap;
+
+use serde::Serialize;
+
+/// Groww master instrument CSV (public static asset, no auth) — re-exported from
+/// `tickvault_common::constants` so the URL lives in the single constants source.
+pub use tickvault_common::constants::GROWW_INSTRUMENT_CSV_URL;
+
+/// Groww live-feed hard cap: at most this many instruments per subscribe session
+/// (verified `07-feed-websocket.md` / `01-introduction-auth.md`). The resolved
+/// set MUST NOT exceed this.
+pub const GROWW_MAX_SUBSCRIPTIONS: usize = 1000;
+
+/// Lower bound of the sane resolved-universe envelope (§31). Below this, the
+/// Groww master was almost certainly truncated/partial → fail-closed.
+pub const GROWW_MIN_UNIVERSE: usize = 100;
+
+/// Upper bound of the sane resolved-universe envelope (§31, NTM expansion).
+pub const GROWW_MAX_UNIVERSE: usize = 1200;
+
+/// NTM membership tolerance (§31.1(4), operator lock 2026-06-08): if MORE than
+/// this fraction of NTM constituents fail to resolve to a Groww token, the build
+/// is rejected (degrade decision is the caller's per `NTM-CONSTITUENCY-01`).
+pub const GROWW_NTM_DANGLING_TOLERANCE: f64 = 0.02;
+
+/// Which Groww live-feed subscription a watch entry uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchKind {
+    /// Cash equity / derivative → `subscribe_ltp`.
+    Ltp,
+    /// Index → `subscribe_index_value`.
+    IndexValue,
+}
+
+/// One instrument the sidecar should subscribe. Serializes to the watch-file
+/// contract the Python sidecar reads: `{exchange, segment, exchange_token, kind}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct WatchEntry {
+    /// Groww exchange (`NSE` / `BSE`).
+    pub exchange: String,
+    /// Groww segment (`CASH` / `FNO`).
+    pub segment: String,
+    /// Groww exchange token — numeric string for stocks, index NAME for indices.
+    pub exchange_token: String,
+    /// LTP vs index-value subscription.
+    pub kind: WatchKind,
+}
+
+/// The assembled Groww watch set + resolution provenance for observability.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct GrowwWatchSet {
+    /// The instruments to subscribe (deduped, capped, envelope-checked).
+    pub entries: Vec<WatchEntry>,
+    /// Count of NTM stocks that resolved to a Groww token.
+    pub resolved_stocks: usize,
+    /// NTM stock symbols that did NOT resolve (logged by name, never silent).
+    pub unresolved_stocks: Vec<String>,
+    /// Count of indices resolved.
+    pub indices: usize,
+}
+
+/// Why a Groww watch-set build fails (fail-closed). Copy where possible; carries
+/// counts so the operator alert names the exact problem.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WatchBuildError {
+    /// Groww master CSV had no usable rows / no header.
+    GrowwMasterEmpty,
+    /// A mandatory Groww CSV column is missing (header drift) — fail-closed (§26).
+    MissingColumn(&'static str),
+    /// More than `GROWW_NTM_DANGLING_TOLERANCE` of NTM constituents unresolved.
+    NtmDanglingExceeded {
+        /// Unresolved constituent count.
+        unresolved: usize,
+        /// Total NTM constituents considered.
+        total: usize,
+    },
+    /// Resolved universe outside the `[GROWW_MIN_UNIVERSE, GROWW_MAX_UNIVERSE]`
+    /// envelope (after the optional cap is NOT applied — this checks the true set).
+    UniverseSizeOutOfBounds {
+        /// Actual resolved count.
+        actual: usize,
+        /// Min allowed.
+        min: usize,
+        /// Max allowed.
+        max: usize,
+    },
+}
+
+/// One parsed Groww master row (only the columns the builder needs).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GrowwInstrumentRow {
+    /// `exchange` column (`NSE`/`BSE`).
+    pub exchange: String,
+    /// `exchange_token` column.
+    pub exchange_token: String,
+    /// `instrument_type` column (`EQ`/`IDX`/`FUT`/`CE`/`PE`).
+    pub instrument_type: String,
+    /// `segment` column (`CASH`/`FNO`/`COMMODITY`).
+    pub segment: String,
+    /// `series` column (`EQ`/...), may be empty.
+    pub series: String,
+    /// `isin` column, may be empty (indices/derivatives have none).
+    pub isin: String,
+}
+
+/// Resolves a header row to the index of each required column BY NAME (Groww
+/// has already added columns, so position-based parsing is banned — §26 M5).
+fn header_index(header: &str) -> Result<HashMap<String, usize>, WatchBuildError> {
+    let mut idx = HashMap::new();
+    for (i, col) in split_csv_line(header).iter().enumerate() {
+        idx.insert(col.trim().to_string(), i);
+    }
+    // Mandatory columns for the builder.
+    for required in [
+        "exchange",
+        "exchange_token",
+        "instrument_type",
+        "segment",
+        "series",
+        "isin",
+    ] {
+        if !idx.contains_key(required) {
+            return Err(WatchBuildError::MissingColumn(match required {
+                "exchange" => "exchange",
+                "exchange_token" => "exchange_token",
+                "instrument_type" => "instrument_type",
+                "segment" => "segment",
+                "series" => "series",
+                _ => "isin",
+            }));
+        }
+    }
+    Ok(idx)
+}
+
+/// Minimal CSV line splitter handling double-quoted fields with embedded commas.
+/// Pure; tolerant of the simple Groww master format (no embedded quotes/newlines).
+fn split_csv_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    for ch in line.chars() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                fields.push(std::mem::take(&mut cur));
+            }
+            '\r' => {}
+            other => cur.push(other),
+        }
+    }
+    fields.push(cur);
+    fields
+}
+
+/// Parses the Groww master CSV text into the rows the builder needs. Strips a
+/// leading UTF-8 BOM; resolves columns by header name. Rows shorter than the
+/// header are skipped (counted as malformed by the caller via the returned len).
+pub fn parse_groww_master(csv: &str) -> Result<Vec<GrowwInstrumentRow>, WatchBuildError> {
+    let csv = csv.strip_prefix('\u{feff}').unwrap_or(csv);
+    let mut lines = csv.lines();
+    let header = lines.next().ok_or(WatchBuildError::GrowwMasterEmpty)?;
+    let idx = header_index(header)?;
+    let get = |fields: &[String], name: &str| -> String {
+        idx.get(name)
+            .and_then(|&i| fields.get(i))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    };
+    let mut rows = Vec::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields = split_csv_line(line);
+        rows.push(GrowwInstrumentRow {
+            exchange: get(&fields, "exchange"),
+            exchange_token: get(&fields, "exchange_token"),
+            instrument_type: get(&fields, "instrument_type"),
+            segment: get(&fields, "segment"),
+            series: get(&fields, "series"),
+            isin: get(&fields, "isin"),
+        });
+    }
+    if rows.is_empty() {
+        return Err(WatchBuildError::GrowwMasterEmpty);
+    }
+    Ok(rows)
+}
+
+/// Builds the O(1) `ISIN → exchange_token` map over NSE cash-equity rows only.
+/// Strict filter: `exchange=NSE & segment=CASH & instrument_type=EQ & series=EQ`
+/// with a non-empty ISIN + numeric token. An ISIN that maps to MORE than one
+/// token is AMBIGUOUS → excluded from the map and returned in `ambiguous` (never
+/// silently pick one — §C3). Single O(n) pass.
+#[must_use]
+pub fn build_isin_token_map(rows: &[GrowwInstrumentRow]) -> (HashMap<String, String>, Vec<String>) {
+    let mut map: HashMap<String, String> = HashMap::new();
+    let mut collisions: HashMap<String, usize> = HashMap::new();
+    for r in rows {
+        if r.exchange == "NSE"
+            && r.segment == "CASH"
+            && r.instrument_type == "EQ"
+            && r.series == "EQ"
+            && !r.isin.is_empty()
+            && r.exchange_token.parse::<i64>().is_ok()
+        {
+            match map.get(&r.isin) {
+                Some(existing) if existing != &r.exchange_token => {
+                    *collisions.entry(r.isin.clone()).or_insert(1) += 1;
+                }
+                _ => {
+                    map.insert(r.isin.clone(), r.exchange_token.clone());
+                }
+            }
+        }
+    }
+    // Remove every ISIN that ever collided — ambiguous is excluded, not guessed.
+    let mut ambiguous: Vec<String> = Vec::new();
+    for isin in collisions.keys() {
+        map.remove(isin);
+        ambiguous.push(isin.clone());
+    }
+    ambiguous.sort();
+    (map, ambiguous)
+}
+
+/// Extracts NSE index watch entries from the master: `exchange=NSE &
+/// instrument_type=IDX`, non-empty token. Indices subscribe via index_value with
+/// `segment=CASH` and the index NAME as token. Deterministic order (token asc).
+#[must_use]
+pub fn extract_index_entries(rows: &[GrowwInstrumentRow]) -> Vec<WatchEntry> {
+    let mut entries: Vec<WatchEntry> = rows
+        .iter()
+        .filter(|r| {
+            r.exchange == "NSE" && r.instrument_type == "IDX" && !r.exchange_token.is_empty()
+        })
+        .map(|r| WatchEntry {
+            exchange: "NSE".to_string(),
+            segment: "CASH".to_string(),
+            exchange_token: r.exchange_token.clone(),
+            kind: WatchKind::IndexValue,
+        })
+        .collect();
+    entries.sort_by(|a, b| a.exchange_token.cmp(&b.exchange_token));
+    entries.dedup_by(|a, b| a.exchange_token == b.exchange_token);
+    entries
+}
+
+/// Resolves NTM constituents (symbol, ISIN) to Groww stock watch entries via the
+/// ISIN map. Returns the resolved entries (sorted by token for determinism) plus
+/// the symbols that did not resolve (logged by name). O(1) per constituent.
+#[must_use]
+pub fn resolve_stock_entries(
+    constituents: &[(String, String)],
+    isin_map: &HashMap<String, String>,
+) -> (Vec<WatchEntry>, Vec<String>) {
+    let mut entries = Vec::new();
+    let mut unresolved = Vec::new();
+    for (symbol, isin) in constituents {
+        match isin_map.get(isin) {
+            Some(token) => entries.push(WatchEntry {
+                exchange: "NSE".to_string(),
+                segment: "CASH".to_string(),
+                exchange_token: token.clone(),
+                kind: WatchKind::Ltp,
+            }),
+            None => unresolved.push(symbol.clone()),
+        }
+    }
+    entries.sort_by(|a, b| a.exchange_token.cmp(&b.exchange_token));
+    unresolved.sort();
+    (entries, unresolved)
+}
+
+/// Assembles the final watch set: enforces the 2% NTM tolerance, dedups by
+/// `(exchange_token, segment)` (I-P1-11 analogue), checks the `[100,1200]`
+/// envelope on the TRUE resolved size, then applies the optional deterministic
+/// `max_subscribe` first-run cap (indices first — small + high value — then
+/// stocks by token ascending). `max_subscribe` is also clamped to the Groww
+/// 1000-subscription hard cap.
+pub fn assemble_watch_set(
+    index_entries: Vec<WatchEntry>,
+    stock_entries: Vec<WatchEntry>,
+    unresolved_stocks: Vec<String>,
+    ntm_total: usize,
+    max_subscribe: Option<usize>,
+) -> Result<GrowwWatchSet, WatchBuildError> {
+    // 2% NTM tolerance (fail-closed here; the caller decides degrade vs halt).
+    if ntm_total > 0 {
+        let frac = unresolved_stocks.len() as f64 / ntm_total as f64;
+        if frac > GROWW_NTM_DANGLING_TOLERANCE {
+            return Err(WatchBuildError::NtmDanglingExceeded {
+                unresolved: unresolved_stocks.len(),
+                total: ntm_total,
+            });
+        }
+    }
+
+    let resolved_stocks = stock_entries.len();
+    let indices = index_entries.len();
+
+    // Dedup by (exchange_token, segment): a stock can appear in both the index
+    // and stock lists only by error, and an F&O-underlying may duplicate a
+    // constituent. Indices first so an index token wins its slot deterministically.
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut deduped: Vec<WatchEntry> = Vec::new();
+    for entry in index_entries.into_iter().chain(stock_entries.into_iter()) {
+        let key = (entry.exchange_token.clone(), entry.segment.clone());
+        if seen.insert(key) {
+            deduped.push(entry);
+        }
+    }
+
+    // Envelope on the TRUE resolved size (before the first-run cap).
+    let actual = deduped.len();
+    if actual < GROWW_MIN_UNIVERSE || actual > GROWW_MAX_UNIVERSE {
+        return Err(WatchBuildError::UniverseSizeOutOfBounds {
+            actual,
+            min: GROWW_MIN_UNIVERSE,
+            max: GROWW_MAX_UNIVERSE,
+        });
+    }
+
+    // Deterministic cap: clamp to min(max_subscribe, 1000). `deduped` is already
+    // indices-first then token-asc, so a prefix take is deterministic.
+    let cap = max_subscribe
+        .unwrap_or(GROWW_MAX_SUBSCRIPTIONS)
+        .min(GROWW_MAX_SUBSCRIPTIONS);
+    if deduped.len() > cap {
+        deduped.truncate(cap);
+    }
+
+    Ok(GrowwWatchSet {
+        entries: deduped,
+        resolved_stocks,
+        unresolved_stocks,
+        indices,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HEADER: &str = "exchange,exchange_token,trading_symbol,groww_symbol,name,instrument_type,segment,series,isin,underlying_symbol,underlying_exchange_token,expiry_date,strike_price,lot_size,tick_size,freeze_quantity,is_reserved,buy_allowed,sell_allowed,internal_trading_symbol,is_intraday";
+
+    fn eq_row(token: &str, isin: &str) -> String {
+        format!(
+            "NSE,{token},RELIANCE,NSE-RELIANCE,Reliance,EQ,CASH,EQ,{isin},,,,,1,0.05,0,0,1,1,RELIANCE,0"
+        )
+    }
+    fn idx_row(name_token: &str) -> String {
+        format!(
+            "NSE,{name_token},{name_token},NSE-{name_token},,IDX,CASH,,,,,,,,,,0,0,0,{name_token},0"
+        )
+    }
+
+    #[test]
+    fn test_parse_groww_master_header_by_name_and_bom() {
+        let csv = format!("\u{feff}{HEADER}\n{}\n", eq_row("2885", "INE002A01018"));
+        let rows = parse_groww_master(&csv).expect("parse");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].exchange_token, "2885");
+        assert_eq!(rows[0].isin, "INE002A01018");
+        assert_eq!(rows[0].instrument_type, "EQ");
+    }
+
+    #[test]
+    fn test_parse_groww_master_missing_column_fails_closed() {
+        let bad = "exchange,exchange_token,segment\nNSE,1,CASH";
+        assert_eq!(
+            parse_groww_master(bad),
+            Err(WatchBuildError::MissingColumn("instrument_type"))
+        );
+    }
+
+    #[test]
+    fn test_parse_groww_master_empty_fails() {
+        assert_eq!(
+            parse_groww_master(""),
+            Err(WatchBuildError::GrowwMasterEmpty)
+        );
+        let header_only = format!("{HEADER}\n");
+        assert_eq!(
+            parse_groww_master(&header_only),
+            Err(WatchBuildError::GrowwMasterEmpty)
+        );
+    }
+
+    #[test]
+    fn test_build_isin_token_map_filters_to_nse_cash_eq() {
+        let csv = format!(
+            "{HEADER}\n{}\n{}\n",
+            eq_row("2885", "INE002A01018"),
+            // an FNO row with same-looking isin must be ignored
+            "NSE,99,X,Y,,FUT,FNO,,INE002A01018,X,1,,,1,0.05,0,0,1,1,X,0"
+        );
+        let rows = parse_groww_master(&csv).unwrap();
+        let (map, ambiguous) = build_isin_token_map(&rows);
+        assert_eq!(map.get("INE002A01018"), Some(&"2885".to_string()));
+        assert!(ambiguous.is_empty());
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn test_build_isin_token_map_excludes_ambiguous_isin() {
+        let csv = format!(
+            "{HEADER}\n{}\n{}\n",
+            eq_row("2885", "INE002A01018"),
+            eq_row("2886", "INE002A01018") // same ISIN, different token
+        );
+        let rows = parse_groww_master(&csv).unwrap();
+        let (map, ambiguous) = build_isin_token_map(&rows);
+        assert!(map.get("INE002A01018").is_none(), "ambiguous ISIN excluded");
+        assert_eq!(ambiguous, vec!["INE002A01018".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_index_entries_picks_idx_rows() {
+        let csv = format!(
+            "{HEADER}\n{}\n{}\n{}\n",
+            idx_row("NIFTY"),
+            idx_row("BANKNIFTY"),
+            eq_row("2885", "INE002A01018")
+        );
+        let rows = parse_groww_master(&csv).unwrap();
+        let idx = extract_index_entries(&rows);
+        assert_eq!(idx.len(), 2);
+        assert_eq!(idx[0].exchange_token, "BANKNIFTY"); // sorted asc
+        assert_eq!(idx[0].kind, WatchKind::IndexValue);
+        assert_eq!(idx[0].segment, "CASH");
+    }
+
+    #[test]
+    fn test_resolve_stock_entries_join_and_unresolved() {
+        let mut map = HashMap::new();
+        map.insert("INE002A01018".to_string(), "2885".to_string());
+        let constituents = vec![
+            ("RELIANCE".to_string(), "INE002A01018".to_string()),
+            ("GHOST".to_string(), "INE000000000".to_string()),
+        ];
+        let (entries, unresolved) = resolve_stock_entries(&constituents, &map);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].exchange_token, "2885");
+        assert_eq!(entries[0].kind, WatchKind::Ltp);
+        assert_eq!(unresolved, vec!["GHOST".to_string()]);
+    }
+
+    fn stock_entry(token: &str) -> WatchEntry {
+        WatchEntry {
+            exchange: "NSE".to_string(),
+            segment: "CASH".to_string(),
+            exchange_token: token.to_string(),
+            kind: WatchKind::Ltp,
+        }
+    }
+    fn index_entry(name: &str) -> WatchEntry {
+        WatchEntry {
+            exchange: "NSE".to_string(),
+            segment: "CASH".to_string(),
+            exchange_token: name.to_string(),
+            kind: WatchKind::IndexValue,
+        }
+    }
+
+    #[test]
+    fn test_assemble_rejects_when_ntm_tolerance_exceeded() {
+        // 5 unresolved of 100 = 5% > 2% → reject.
+        let stocks: Vec<WatchEntry> = (0..95).map(|i| stock_entry(&i.to_string())).collect();
+        let unresolved: Vec<String> = (0..5).map(|i| format!("U{i}")).collect();
+        let err = assemble_watch_set(vec![], stocks, unresolved, 100, None).unwrap_err();
+        assert!(matches!(
+            err,
+            WatchBuildError::NtmDanglingExceeded {
+                unresolved: 5,
+                total: 100
+            }
+        ));
+    }
+
+    #[test]
+    fn test_assemble_envelope_too_small_fails_closed() {
+        let stocks: Vec<WatchEntry> = (0..50).map(|i| stock_entry(&i.to_string())).collect();
+        let err = assemble_watch_set(vec![], stocks, vec![], 50, None).unwrap_err();
+        assert!(matches!(
+            err,
+            WatchBuildError::UniverseSizeOutOfBounds { actual: 50, .. }
+        ));
+    }
+
+    #[test]
+    fn test_assemble_dedups_by_token_segment() {
+        // 100 unique stocks + 1 duplicate token → deduped to 100.
+        let mut stocks: Vec<WatchEntry> = (0..100).map(|i| stock_entry(&i.to_string())).collect();
+        stocks.push(stock_entry("0")); // dup
+        let set = assemble_watch_set(vec![], stocks, vec![], 100, None).unwrap();
+        assert_eq!(set.entries.len(), 100);
+    }
+
+    #[test]
+    fn test_assemble_deterministic_cap_indices_first() {
+        let indices = vec![index_entry("AAA"), index_entry("BBB")];
+        let stocks: Vec<WatchEntry> = (0..200).map(|i| stock_entry(&format!("{i:04}"))).collect();
+        // cap to 5 → 2 indices first, then 3 stocks (token asc: 0000,0001,0002).
+        let set = assemble_watch_set(indices, stocks, vec![], 200, Some(5)).unwrap();
+        assert_eq!(set.entries.len(), 5);
+        assert_eq!(set.entries[0].kind, WatchKind::IndexValue);
+        assert_eq!(set.entries[1].kind, WatchKind::IndexValue);
+        assert_eq!(set.entries[2].exchange_token, "0000");
+        assert_eq!(set.entries[4].exchange_token, "0002");
+        // resolved_stocks/indices provenance preserved (pre-cap counts).
+        assert_eq!(set.indices, 2);
+        assert_eq!(set.resolved_stocks, 200);
+    }
+
+    #[test]
+    fn test_assemble_cap_clamped_to_groww_1000_hard_cap() {
+        let stocks: Vec<WatchEntry> = (0..1100).map(|i| stock_entry(&format!("{i:05}"))).collect();
+        // 1100 is within [100,1200] envelope; ask for max 5000 → clamps to 1000.
+        let set = assemble_watch_set(vec![], stocks, vec![], 1100, Some(5000)).unwrap();
+        assert_eq!(set.entries.len(), GROWW_MAX_SUBSCRIPTIONS);
+    }
+
+    #[test]
+    fn test_split_csv_line_handles_quoted_comma() {
+        let f = split_csv_line(r#"a,"b,c",d"#);
+        assert_eq!(f, vec!["a".to_string(), "b,c".to_string(), "d".to_string()]);
+    }
+
+    #[test]
+    fn test_watch_entry_serializes_to_sidecar_contract() {
+        let e = stock_entry("2885");
+        let j = serde_json::to_string(&e).unwrap();
+        assert!(j.contains("\"exchange_token\":\"2885\""));
+        assert!(j.contains("\"kind\":\"ltp\""));
+        assert!(j.contains("\"segment\":\"CASH\""));
+    }
+}
