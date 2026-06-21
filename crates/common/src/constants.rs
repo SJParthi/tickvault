@@ -607,6 +607,11 @@ pub const GROWW_API_KEY_SECRET: &str = "api-key";
 /// 6-digit code; SHA1 / 6 digits / 30s — same as Dhan).
 pub const GROWW_TOTP_SECRET: &str = "totp-secret";
 
+/// Groww master instrument CSV (public static asset, no auth). Source of every
+/// Groww `exchange_token` — joined to NTM ISINs to build the watch-list (§31).
+pub const GROWW_INSTRUMENT_CSV_URL: &str =
+    "https://growwapi-assets.groww.in/instruments/instrument.csv"; // APPROVED: constants.rs is the single static-URL source (same as INDEX_CONSTITUENCY_BASE_URL)
+
 // ---------------------------------------------------------------------------
 // SSM Parameter Store — QuestDB Service
 // ---------------------------------------------------------------------------
