@@ -20,8 +20,11 @@
 //! Volume is Option A (price-only): the watch set carries no volume concept.
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::time::Duration;
 
 use serde::Serialize;
+use tracing::{info, warn};
 
 /// Groww master instrument CSV (public static asset, no auth) — re-exported from
 /// `tickvault_common::constants` so the URL lives in the single constants source.
@@ -106,6 +109,10 @@ pub enum WatchBuildError {
         /// Max allowed.
         max: usize,
     },
+    /// A required CSV (Groww master or NTM list) could not be fetched.
+    FetchFailed(String),
+    /// The watch file could not be written.
+    WriteFailed(String),
 }
 
 /// One parsed Groww master row (only the columns the builder needs).
@@ -178,7 +185,7 @@ fn split_csv_line(line: &str) -> Vec<String> {
 /// Parses the Groww master CSV text into the rows the builder needs. Strips a
 /// leading UTF-8 BOM; resolves columns by header name. Rows shorter than the
 /// header are skipped (counted as malformed by the caller via the returned len).
-pub fn parse_groww_master(csv: &str) -> Result<Vec<GrowwInstrumentRow>, WatchBuildError> {
+fn parse_groww_master(csv: &str) -> Result<Vec<GrowwInstrumentRow>, WatchBuildError> {
     let csv = csv.strip_prefix('\u{feff}').unwrap_or(csv);
     let mut lines = csv.lines();
     let header = lines.next().ok_or(WatchBuildError::GrowwMasterEmpty)?;
@@ -216,7 +223,7 @@ pub fn parse_groww_master(csv: &str) -> Result<Vec<GrowwInstrumentRow>, WatchBui
 /// token is AMBIGUOUS → excluded from the map and returned in `ambiguous` (never
 /// silently pick one — §C3). Single O(n) pass.
 #[must_use]
-pub fn build_isin_token_map(rows: &[GrowwInstrumentRow]) -> (HashMap<String, String>, Vec<String>) {
+fn build_isin_token_map(rows: &[GrowwInstrumentRow]) -> (HashMap<String, String>, Vec<String>) {
     let mut map: HashMap<String, String> = HashMap::new();
     let mut collisions: HashMap<String, usize> = HashMap::new();
     for r in rows {
@@ -251,7 +258,7 @@ pub fn build_isin_token_map(rows: &[GrowwInstrumentRow]) -> (HashMap<String, Str
 /// instrument_type=IDX`, non-empty token. Indices subscribe via index_value with
 /// `segment=CASH` and the index NAME as token. Deterministic order (token asc).
 #[must_use]
-pub fn extract_index_entries(rows: &[GrowwInstrumentRow]) -> Vec<WatchEntry> {
+fn extract_index_entries(rows: &[GrowwInstrumentRow]) -> Vec<WatchEntry> {
     let mut entries: Vec<WatchEntry> = rows
         .iter()
         .filter(|r| {
@@ -273,7 +280,7 @@ pub fn extract_index_entries(rows: &[GrowwInstrumentRow]) -> Vec<WatchEntry> {
 /// ISIN map. Returns the resolved entries (sorted by token for determinism) plus
 /// the symbols that did not resolve (logged by name). O(1) per constituent.
 #[must_use]
-pub fn resolve_stock_entries(
+fn resolve_stock_entries(
     constituents: &[(String, String)],
     isin_map: &HashMap<String, String>,
 ) -> (Vec<WatchEntry>, Vec<String>) {
@@ -301,7 +308,7 @@ pub fn resolve_stock_entries(
 /// `max_subscribe` first-run cap (indices first — small + high value — then
 /// stocks by token ascending). `max_subscribe` is also clamped to the Groww
 /// 1000-subscription hard cap.
-pub fn assemble_watch_set(
+fn assemble_watch_set(
     index_entries: Vec<WatchEntry>,
     stock_entries: Vec<WatchEntry>,
     unresolved_stocks: Vec<String>,
@@ -327,7 +334,7 @@ pub fn assemble_watch_set(
     // constituent. Indices first so an index token wins its slot deterministically.
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     let mut deduped: Vec<WatchEntry> = Vec::new();
-    for entry in index_entries.into_iter().chain(stock_entries.into_iter()) {
+    for entry in index_entries.into_iter().chain(stock_entries) {
         let key = (entry.exchange_token.clone(), entry.segment.clone());
         if seen.insert(key) {
             deduped.push(entry);
@@ -336,7 +343,7 @@ pub fn assemble_watch_set(
 
     // Envelope on the TRUE resolved size (before the first-run cap).
     let actual = deduped.len();
-    if actual < GROWW_MIN_UNIVERSE || actual > GROWW_MAX_UNIVERSE {
+    if !(GROWW_MIN_UNIVERSE..=GROWW_MAX_UNIVERSE).contains(&actual) {
         return Err(WatchBuildError::UniverseSizeOutOfBounds {
             actual,
             min: GROWW_MIN_UNIVERSE,
@@ -359,6 +366,209 @@ pub fn assemble_watch_set(
         unresolved_stocks,
         indices,
     })
+}
+
+/// niftyindices slug for the NIFTY Total Market constituent list (§31.1).
+const NTM_SLUG: &str = "ind_niftytotalmarket_list";
+
+/// Default first-run subscription cap (subset-safe). Override at boot via the
+/// `GROWW_MAX_SUBSCRIBE` env var (set to a large value / `1200` for the full
+/// universe). Indices are always included first (deterministic cap order).
+pub const GROWW_DEFAULT_MAX_SUBSCRIBE: usize = 60;
+
+/// Parses the niftyindices NIFTY-Total-Market constituent CSV into `(symbol,
+/// isin)` pairs (uppercased/trimmed). Columns resolved BY NAME (`Symbol`,
+/// `ISIN Code`). Rows missing either are skipped. Pure + testable.
+fn parse_ntm_constituents(csv: &str) -> Result<Vec<(String, String)>, WatchBuildError> {
+    let csv = csv.strip_prefix('\u{feff}').unwrap_or(csv);
+    let mut lines = csv.lines();
+    let header = lines.next().ok_or(WatchBuildError::GrowwMasterEmpty)?;
+    let idx: HashMap<String, usize> = split_csv_line(header)
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.trim().to_string(), i))
+        .collect();
+    let sym_idx = *idx
+        .get("Symbol")
+        .ok_or(WatchBuildError::MissingColumn("Symbol"))?;
+    let isin_idx = *idx
+        .get("ISIN Code")
+        .ok_or(WatchBuildError::MissingColumn("ISIN Code"))?;
+    let mut out = Vec::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields = split_csv_line(line);
+        let symbol = fields
+            .get(sym_idx)
+            .map(|s| s.trim().to_uppercase())
+            .unwrap_or_default();
+        let isin = fields
+            .get(isin_idx)
+            .map(|s| s.trim().to_uppercase())
+            .unwrap_or_default();
+        if !symbol.is_empty() && !isin.is_empty() {
+            out.push((symbol, isin));
+        }
+    }
+    Ok(out)
+}
+
+/// Composes the full watch set from the two raw CSV texts. Pure + fully testable
+/// (the network is the only non-deterministic part, kept in the orchestrator).
+fn build_groww_watch_from_csvs(
+    groww_csv: &str,
+    ntm_csv: &str,
+    max_subscribe: Option<usize>,
+) -> Result<GrowwWatchSet, WatchBuildError> {
+    let rows = parse_groww_master(groww_csv)?;
+    let (isin_map, ambiguous) = build_isin_token_map(&rows);
+    if !ambiguous.is_empty() {
+        warn!(
+            count = ambiguous.len(),
+            "groww watch: excluded ambiguous ISINs (>1 token) — not guessed"
+        );
+    }
+    let index_entries = extract_index_entries(&rows);
+    let ntm = parse_ntm_constituents(ntm_csv)?;
+    let ntm_total = ntm.len();
+    let (stock_entries, unresolved) = resolve_stock_entries(&ntm, &isin_map);
+    assemble_watch_set(
+        index_entries,
+        stock_entries,
+        unresolved,
+        ntm_total,
+        max_subscribe,
+    )
+}
+
+/// On-disk watch-file shape the Python sidecar reads.
+#[derive(Serialize)]
+struct WatchFile<'a> {
+    /// IST trading date this watch set was built for (staleness guard).
+    trading_date_ist: &'a str,
+    /// Provenance label.
+    feed: &'a str,
+    /// Total entries to subscribe.
+    count: usize,
+    /// Resolved NTM stock count (pre-cap).
+    resolved_stocks: usize,
+    /// Index count (pre-cap).
+    indices: usize,
+    /// The instruments to subscribe.
+    entries: &'a [WatchEntry],
+}
+
+/// Serializes the watch set to the sidecar watch-file JSON. Pure + testable.
+fn serialize_watch_file(
+    set: &GrowwWatchSet,
+    trading_date_ist: &str,
+) -> Result<String, WatchBuildError> {
+    let file = WatchFile {
+        trading_date_ist,
+        feed: "groww",
+        count: set.entries.len(),
+        resolved_stocks: set.resolved_stocks,
+        indices: set.indices,
+        entries: &set.entries,
+    };
+    serde_json::to_string_pretty(&file).map_err(|e| WatchBuildError::WriteFailed(e.to_string()))
+}
+
+/// Atomically writes `content` to `path` (write `.tmp` → rename). Creates parent
+/// dirs. Testable via tempdir.
+fn write_watch_file_atomic(path: &Path, content: &str) -> Result<(), WatchBuildError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| WatchBuildError::WriteFailed(e.to_string()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, content).map_err(|e| WatchBuildError::WriteFailed(e.to_string()))?;
+    std::fs::rename(&tmp, path).map_err(|e| WatchBuildError::WriteFailed(e.to_string()))?;
+    Ok(())
+}
+
+/// Builds the §18-hardened HTTP client (no redirects, bounded timeouts, HTTPS).
+// TEST-EXEMPT: constructs a reqwest client (TLS root load); mirrors the audited csv_downloader hardening.
+fn hardened_client() -> Result<reqwest::Client, WatchBuildError> {
+    reqwest::ClientBuilder::new()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(
+            tickvault_common::constants::CSV_CONNECT_TIMEOUT_SECS,
+        ))
+        .timeout(Duration::from_secs(
+            tickvault_common::constants::INSTRUMENT_FETCH_PER_ATTEMPT_TIMEOUT_SECS,
+        ))
+        .https_only(true)
+        .build()
+        .map_err(|e| WatchBuildError::FetchFailed(e.to_string()))
+}
+
+/// One bounded GET → UTF-8 text, body-size-capped at `MAX_CSV_BODY_BYTES`.
+// TEST-EXEMPT: live network GET; the body cap + status check are the hardening, the parse/resolve primitives are unit-tested.
+async fn fetch_text_hardened(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<String, WatchBuildError> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| WatchBuildError::FetchFailed(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(WatchBuildError::FetchFailed(format!(
+            "http {}",
+            resp.status()
+        )));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| WatchBuildError::FetchFailed(e.to_string()))?;
+    if bytes.len() > tickvault_common::constants::MAX_CSV_BODY_BYTES {
+        return Err(WatchBuildError::FetchFailed(format!(
+            "body {} bytes exceeds cap",
+            bytes.len()
+        )));
+    }
+    String::from_utf8(bytes.to_vec()).map_err(|e| WatchBuildError::FetchFailed(e.to_string()))
+}
+
+/// PR-B1 production entry (boot call site): download the Groww master CSV + the
+/// NTM constituent list, resolve the watch set by ISIN, and atomically write the
+/// watch file at `cache_dir/groww-watch-<trading_date>.json`. One attempt; the
+/// boot wiring wraps this in the pull-until-success retry loop. Returns the
+/// built set for logging. The Groww master + NTM are BOTH required (fail-closed
+/// on either; the caller decides degrade-vs-retry).
+// TEST-EXEMPT: network download + filesystem write orchestration; every pure primitive it composes (parse_groww_master / build_isin_token_map / extract_index_entries / parse_ntm_constituents / resolve_stock_entries / assemble_watch_set / serialize_watch_file / write_watch_file_atomic) is unit-tested below.
+pub async fn build_and_write_groww_watch(
+    cache_dir: &Path,
+    trading_date_ist: &str,
+    max_subscribe: Option<usize>,
+) -> Result<GrowwWatchSet, WatchBuildError> {
+    let client = hardened_client()?;
+    info!("groww watch: downloading Groww master instrument.csv");
+    let groww_csv = fetch_text_hardened(&client, GROWW_INSTRUMENT_CSV_URL).await?;
+    let ntm_url = format!(
+        "{}{}.csv",
+        tickvault_common::constants::INDEX_CONSTITUENCY_BASE_URL,
+        NTM_SLUG
+    );
+    info!("groww watch: downloading NIFTY-Total-Market constituent list");
+    let ntm_csv = fetch_text_hardened(&client, &ntm_url).await?;
+    let set = build_groww_watch_from_csvs(&groww_csv, &ntm_csv, max_subscribe)?;
+    let path = cache_dir.join(format!("groww-watch-{trading_date_ist}.json"));
+    let content = serialize_watch_file(&set, trading_date_ist)?;
+    write_watch_file_atomic(&path, &content)?;
+    info!(
+        entries = set.entries.len(),
+        resolved_stocks = set.resolved_stocks,
+        indices = set.indices,
+        unresolved = set.unresolved_stocks.len(),
+        path = %path.display(),
+        "groww watch: watch file written"
+    );
+    Ok(set)
 }
 
 #[cfg(test)]
@@ -557,5 +767,112 @@ mod tests {
         assert!(j.contains("\"exchange_token\":\"2885\""));
         assert!(j.contains("\"kind\":\"ltp\""));
         assert!(j.contains("\"segment\":\"CASH\""));
+    }
+
+    const NTM_CSV: &str = "Company Name,Industry,Symbol,Series,ISIN Code\nReliance Industries,Energy,RELIANCE,EQ,INE002A01018\nInfosys,IT,INFY,EQ,INE009A01021\n";
+
+    #[test]
+    fn test_parse_ntm_constituents_by_header_name() {
+        let ntm = parse_ntm_constituents(NTM_CSV).expect("parse ntm");
+        assert_eq!(ntm.len(), 2);
+        assert_eq!(ntm[0], ("RELIANCE".to_string(), "INE002A01018".to_string()));
+        assert_eq!(ntm[1], ("INFY".to_string(), "INE009A01021".to_string()));
+    }
+
+    #[test]
+    fn test_parse_ntm_constituents_missing_isin_column_fails() {
+        let bad = "Company Name,Symbol\nReliance,RELIANCE";
+        assert_eq!(
+            parse_ntm_constituents(bad),
+            Err(WatchBuildError::MissingColumn("ISIN Code"))
+        );
+    }
+
+    #[test]
+    fn test_build_groww_watch_from_csvs_end_to_end() {
+        // Groww master: 1 index + 120 EQ rows (clears the 100 floor). NTM list
+        // references all 120 by ISIN → 1 index + 120 stocks = 121 entries.
+        let mut groww = format!("{HEADER}\n{}\n", idx_row("NIFTY"));
+        let mut ntm = String::from("Company Name,Industry,Symbol,Series,ISIN Code\n");
+        for i in 0..120 {
+            let isin = format!("INE{i:09}");
+            groww.push_str(&format!("{}\n", eq_row(&format!("{}", 1000 + i), &isin)));
+            ntm.push_str(&format!("Co{i},Ind,SYM{i},EQ,{isin}\n"));
+        }
+        let set = build_groww_watch_from_csvs(&groww, &ntm, None).expect("build ok");
+        assert_eq!(set.indices, 1);
+        assert_eq!(set.resolved_stocks, 120);
+        assert!(set.unresolved_stocks.is_empty());
+        assert_eq!(set.entries.len(), 121);
+        // Index is first (deterministic order).
+        assert_eq!(set.entries[0].kind, WatchKind::IndexValue);
+    }
+
+    #[test]
+    fn test_build_groww_watch_from_csvs_unresolved_under_tolerance_ok() {
+        // 200 NTM stocks, but only 198 exist in Groww master → 2 unresolved =
+        // 1% < 2% tolerance → build succeeds, unresolved logged by name.
+        let mut groww = format!("{HEADER}\n{}\n", idx_row("NIFTY"));
+        let mut ntm = String::from("Company Name,Industry,Symbol,Series,ISIN Code\n");
+        for i in 0..200 {
+            let isin = format!("INE{i:09}");
+            // Only the first 198 go into the Groww master.
+            if i < 198 {
+                groww.push_str(&format!("{}\n", eq_row(&format!("{}", 1000 + i), &isin)));
+            }
+            ntm.push_str(&format!("Co{i},Ind,SYM{i},EQ,{isin}\n"));
+        }
+        let set =
+            build_groww_watch_from_csvs(&groww, &ntm, None).expect("build ok under tolerance");
+        assert_eq!(set.resolved_stocks, 198);
+        assert_eq!(set.unresolved_stocks.len(), 2);
+    }
+
+    #[test]
+    fn test_build_groww_watch_from_csvs_envelope_floor_rejects_tiny() {
+        let groww = format!(
+            "{HEADER}\n{}\n{}\n",
+            idx_row("NIFTY"),
+            eq_row("2885", "INE002A01018")
+        );
+        // NTM has only RELIANCE → 1 index + 1 stock = 2 < 100 floor → reject.
+        let err = build_groww_watch_from_csvs(
+            &groww,
+            "Company Name,Industry,Symbol,Series,ISIN Code\nR,E,RELIANCE,EQ,INE002A01018\n",
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            WatchBuildError::UniverseSizeOutOfBounds { actual: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn test_serialize_watch_file_has_date_feed_entries() {
+        let set = GrowwWatchSet {
+            entries: vec![stock_entry("2885"), index_entry("NIFTY")],
+            resolved_stocks: 1,
+            unresolved_stocks: vec![],
+            indices: 1,
+        };
+        let json = serialize_watch_file(&set, "2026-06-21").expect("serialize");
+        assert!(json.contains("\"trading_date_ist\": \"2026-06-21\""));
+        assert!(json.contains("\"feed\": \"groww\""));
+        assert!(json.contains("\"count\": 2"));
+        assert!(json.contains("\"exchange_token\": \"2885\""));
+        assert!(json.contains("\"kind\": \"index_value\""));
+    }
+
+    #[test]
+    fn test_write_watch_file_atomic_creates_and_writes() {
+        let dir = std::env::temp_dir().join(format!("tv-groww-watch-test-{}", std::process::id()));
+        let path = dir.join("groww-watch-2026-06-21.json");
+        write_watch_file_atomic(&path, "{\"hello\":1}").expect("write");
+        let read = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(read, "{\"hello\":1}");
+        // tmp file is gone after the rename.
+        assert!(!path.with_extension("json.tmp").exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
