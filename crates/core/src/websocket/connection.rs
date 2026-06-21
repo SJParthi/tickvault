@@ -7,7 +7,7 @@
 //! The connection pool creates up to 5 of these.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Test-only override: force the post-market guard inside
@@ -379,7 +379,20 @@ pub struct WebSocketConnection {
     /// "no schema change for the 16-connection future" demand. Defaults
     /// `MainFeed` (the only runtime `ws_type` for this struct today).
     ws_audit_type: tickvault_common::ws_event_types::WsType,
+    /// PR-E (2026-06-21): optional runtime feed-enable flag. `None` = always-on
+    /// (every existing caller). When `Some`, the `run()` loop reads it: `false`
+    /// closes the socket + goes dormant (polling the flag), `true` reconnects.
+    /// Sourced from the shared `FeedRuntimeState` Dhan atomic so the feed-control
+    /// webpage/API can pause/resume the live Dhan feed with no restart.
+    feed_enable_flag: Option<Arc<AtomicBool>>,
 }
+
+/// Polling cadence while the Dhan feed is disabled at runtime (PR-E). Bounds the
+/// re-enable detection latency without busy-spinning.
+const FEED_DISABLE_POLL_SECS: u64 = 2;
+
+/// Polling cadence while the Dhan feed is disabled (PR-E) — typed `Duration`.
+const FEED_DISABLE_POLL: Duration = Duration::from_secs(FEED_DISABLE_POLL_SECS);
 
 /// Audit-2026-05-03 H2: static lookup for connection-id labels used by
 /// metrics. Indexed by `ConnectionId as usize`. Capacity matches
@@ -498,6 +511,10 @@ impl WebSocketConnection {
             ws_audit_tx: None,
             ws_audit_pool_size: 1,
             ws_audit_type: tickvault_common::ws_event_types::WsType::MainFeed,
+            // PR-E (2026-06-21): no runtime feed-enable flag by default — the
+            // feed is always-on (every existing caller + test path). The boot
+            // wiring attaches the shared Dhan flag via `with_feed_enable_flag`.
+            feed_enable_flag: None,
         }
     }
 
@@ -510,6 +527,71 @@ impl WebSocketConnection {
     pub fn with_wal_spill(mut self, spill: Arc<WsFrameSpill>) -> Self {
         self.wal_spill = Some(spill);
         self
+    }
+
+    /// PR-E (2026-06-21): attach the shared runtime feed-enable flag (the Dhan
+    /// atomic from `FeedRuntimeState`). When the flag is `false` the `run()` loop
+    /// closes the socket and idles until it flips back `true`. Chain after
+    /// `new()`. Absent flag (the default) = always-on, identical to pre-PR-E.
+    #[must_use]
+    pub fn with_feed_enable_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.feed_enable_flag = Some(flag);
+        self
+    }
+
+    /// PR-E: is the feed currently enabled? `None` flag = always enabled (every
+    /// pre-PR-E caller). Pure O(1) lock-free read.
+    #[inline]
+    #[must_use]
+    fn feed_enabled(&self) -> bool {
+        self.feed_enable_flag
+            .as_ref()
+            .map_or(true, |f| f.load(Ordering::Relaxed))
+    }
+
+    /// PR-E: park the connection while the Dhan feed is disabled, polling the
+    /// enable flag every `FEED_DISABLE_POLL`. Returns `true` if a graceful
+    /// shutdown was requested during the wait (caller exits), `false` when the
+    /// feed was re-enabled (caller reconnects). Emits one INFO + a forensic
+    /// SleepEntered/SleepResumed audit pair so the dormant window is visible.
+    // TEST-EXEMPT: async dormant poll loop driven by an external Arc<AtomicBool> + Notify; the pure enable decision (feed_enabled) is unit-tested and the integration is exercised by the connection_pool construction paths.
+    async fn wait_until_feed_enabled(&self) -> bool {
+        info!(
+            connection_id = self.connection_id,
+            "PR-E: Dhan feed disabled at runtime — connection dormant until re-enabled"
+        );
+        self.emit_ws_audit(
+            tickvault_common::ws_event_types::WsEventKind::SleepEntered,
+            "n/a",
+            "feed disabled at runtime (operator toggle)",
+            None,
+            0,
+            0,
+        );
+        loop {
+            if self.shutdown_requested.load(Ordering::Acquire) {
+                return true;
+            }
+            if self.feed_enabled() {
+                info!(
+                    connection_id = self.connection_id,
+                    "PR-E: Dhan feed re-enabled at runtime — reconnecting"
+                );
+                self.emit_ws_audit(
+                    tickvault_common::ws_event_types::WsEventKind::SleepResumed,
+                    "n/a",
+                    "feed re-enabled at runtime (operator toggle)",
+                    None,
+                    0,
+                    0,
+                );
+                return false;
+            }
+            tokio::select! {
+                () = self.shutdown_notify.notified() => return true,
+                () = time::sleep(FEED_DISABLE_POLL) => {}
+            }
+        }
     }
 
     /// 2026-06-12: attach the WS-event audit channel + this pool's size.
@@ -696,6 +778,24 @@ impl WebSocketConnection {
         // O(1) EXEMPT: end
 
         loop {
+            // PR-E (2026-06-21): Dhan runtime on/off gate. When the operator
+            // disables the Dhan feed (webpage/API), idle here — socket closed,
+            // gauge 0 — polling the flag until it flips back ON (or shutdown).
+            // This composes with every reconnect path below: a mid-stream
+            // disable returns `WebSocketError::FeedDisabled`, the match arm
+            // `continue`s to the top, and this gate parks the loop dormant.
+            if !self.feed_enabled() {
+                self.set_state(ConnectionState::Disconnected);
+                m_conn_active.set(0.0);
+                if self.wait_until_feed_enabled().await {
+                    // Shutdown requested while dormant — exit cleanly.
+                    return Ok(());
+                }
+                // Re-enabled: start the reconnect counter fresh so the first
+                // post-resume attempt is the instant (0ms) retry, not a backoff.
+                self.total_reconnections.store(0, Ordering::Release);
+            }
+
             self.set_state(ConnectionState::Connecting);
 
             match self.connect_and_subscribe().await {
@@ -853,6 +953,21 @@ impl WebSocketConnection {
                             self.set_state(ConnectionState::Disconnected);
                             m_conn_active.set(0.0);
                             return Ok(());
+                        }
+                        Err(WebSocketError::FeedDisabled) => {
+                            // PR-E: operator disabled the Dhan feed mid-stream.
+                            // The socket is already dropped (read loop returned).
+                            // Skip reconnect/backoff entirely and `continue` to
+                            // the top-of-loop dormant gate, which parks the
+                            // connection until the feed is re-enabled. NOT a
+                            // failure → no reconnect counter bump, no Telegram.
+                            info!(
+                                connection_id = self.connection_id,
+                                "PR-E: Dhan feed disabled at runtime — socket closed, going dormant"
+                            );
+                            self.set_state(ConnectionState::Disconnected);
+                            m_conn_active.set(0.0);
+                            continue;
                         }
                         Err(WebSocketError::DhanDisconnect { code })
                             if !code.is_reconnectable() =>
@@ -1380,6 +1495,30 @@ impl WebSocketConnection {
                     // wants further subscribe commands delivered).
                     *subscribe_rx = None;
                     continue;
+                }
+                // PR-E (2026-06-21): runtime feed-disable arm. Active ONLY when a
+                // feed-enable flag is attached (Dhan main feed); for every other
+                // connection it is `pending()` forever (zero effect). When the
+                // operator disables the feed, this resolves, we drop the socket
+                // (returning `FeedDisabled`), and the outer `run()` loop parks the
+                // connection dormant. The poll cadence is the cold `FEED_DISABLE_POLL`
+                // — no per-frame work, so the hot read path is untouched.
+                () = async {
+                    match self.feed_enable_flag.as_ref() {
+                        Some(flag) => loop {
+                            if !flag.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            time::sleep(FEED_DISABLE_POLL).await;
+                        },
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    info!(
+                        connection_id = self.connection_id,
+                        "PR-E: Dhan feed disabled — closing socket to go dormant"
+                    );
+                    return Err(WebSocketError::FeedDisabled);
                 }
                 // STAGE-B (P1.1): plain read.next().await — no deadline.
                 next_frame = read.next() => next_frame,
@@ -2373,6 +2512,34 @@ mod tests {
         assert_eq!(health.connection_id, 0);
         assert_eq!(health.subscribed_count, 0);
         assert_eq!(health.total_reconnections, 0);
+    }
+
+    #[test]
+    fn test_feed_enable_flag_gates_feed_enabled() {
+        // tests with_feed_enable_flag
+        // PR-E: no flag → always enabled (every pre-PR-E caller). With a flag
+        // attached, `feed_enabled()` mirrors the shared atomic the API toggles.
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![],
+            FeedMode::Ticker,
+            tx,
+            None,
+        );
+        assert!(conn.feed_enabled(), "no flag → always enabled");
+
+        let flag = Arc::new(AtomicBool::new(true));
+        let conn = conn.with_feed_enable_flag(Arc::clone(&flag));
+        assert!(conn.feed_enabled(), "flag true → enabled");
+        flag.store(false, Ordering::Relaxed);
+        assert!(!conn.feed_enabled(), "flag false → disabled (operator OFF)");
+        flag.store(true, Ordering::Relaxed);
+        assert!(conn.feed_enabled(), "flag true again → re-enabled");
     }
 
     /// PR #790b (2026-05-25) — disconnect-context capture ratchet.

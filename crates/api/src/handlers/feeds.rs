@@ -26,6 +26,9 @@ use crate::state::SharedAppState;
 pub struct FeedsStatusResponse {
     pub dhan_enabled: bool,
     pub groww_enabled: bool,
+    /// PR-E: whether the Dhan main-feed lane was spawned this process (Dhan
+    /// enabled at boot). Same honesty signal as `groww_lane_running`.
+    pub dhan_lane_running: bool,
     /// Whether the Groww bridge task is actually running this process. If you set
     /// `groww_enabled=true` but this is `false`, the lane was not spawned at boot
     /// (`groww_enabled` was false then) — the toggle is recorded but takes no
@@ -52,6 +55,7 @@ fn current_status(state: &SharedAppState) -> FeedsStatusResponse {
     FeedsStatusResponse {
         dhan_enabled: snap.dhan_enabled,
         groww_enabled: snap.groww_enabled,
+        dhan_lane_running: snap.dhan_lane_running,
         groww_lane_running: snap.groww_lane_running,
     }
 }
@@ -83,11 +87,24 @@ pub async fn set_feed(
         return Err((
             StatusCode::BAD_REQUEST,
             Json(FeedErrorResponse {
-                error: format!(
-                    "feed '{}' cannot be toggled at runtime (the primary trading feed is \
-                     config+restart only); only 'groww' is runtime-toggleable",
-                    feed.as_str()
-                ),
+                error: format!("feed '{}' cannot be toggled at runtime", feed.as_str()),
+                allowed: vec![Feed::Dhan.as_str(), Feed::Groww.as_str()],
+            }),
+        ));
+    }
+
+    // PR-E safety gate (operator-authorized 2026-06-21): DISABLING Dhan is the
+    // one dangerous direction — it blinds the system. Allowed in the no-orders
+    // data-pull phase (`dry_run`), REFUSED once live trading is on (so the feed
+    // can't be killed mid-trade). Enabling Dhan is always allowed.
+    if feed == Feed::Dhan && !req.enabled && !state.feed_runtime().can_disable_dhan() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(FeedErrorResponse {
+                error: "refusing to disable the Dhan feed while live trading is active \
+                     (orders/positions open) — Dhan can only be turned off in the no-orders \
+                     data-pull phase, so the system is never blinded mid-trade"
+                    .to_string(),
                 allowed: vec![Feed::Groww.as_str()],
             }),
         ));
@@ -109,6 +126,16 @@ pub async fn set_feed(
             "feed 'groww' enabled via API but its lane was not started at boot \
              (groww_enabled=false then) — set groww_enabled=true in config and restart \
              to start it; the API toggle only pauses/resumes a running lane"
+        );
+    }
+    // PR-E: same honesty for Dhan — enabling it via API when the pool was never
+    // spawned at boot (dhan_enabled=false then) records the flag but nothing acts
+    // on it. The response also carries `dhan_lane_running: false` (machine-readable).
+    if feed == Feed::Dhan && req.enabled && !state.feed_runtime().is_dhan_lane_running() {
+        tracing::warn!(
+            "feed 'dhan' enabled via API but its main-feed pool was not started at \
+             boot (dhan_enabled=false then) — set dhan_enabled=true in config and \
+             restart to start it; the API toggle only pauses/resumes a running lane"
         );
     }
     metrics::counter!(
@@ -244,7 +271,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_set_feed_dhan_is_rejected_400() {
+    async fn test_set_feed_dhan_disable_allowed_in_no_orders_phase() {
+        // PR-E: in the default (dry_run / no-orders) phase, disabling Dhan is
+        // now allowed — the live feed loop honours the flag and goes dormant.
         let state = test_state(FeedsConfig::default());
         let res = set_feed(
             State(state.clone()),
@@ -252,12 +281,46 @@ mod tests {
             Json(SetFeedRequest { enabled: false }),
         )
         .await;
+        let Json(resp) = res.expect("dhan disable allowed in no-orders phase");
+        assert!(!resp.dhan_enabled, "dhan now disabled");
+        assert!(!state.feed_runtime().is_enabled(Feed::Dhan));
+    }
+
+    #[tokio::test]
+    async fn test_set_feed_dhan_disable_rejected_when_live_trading() {
+        // PR-E safety gate: once live trading is on, disabling Dhan is refused.
+        let state = test_state(FeedsConfig::default());
+        state.feed_runtime().set_dhan_disable_allowed(false);
+        let res = set_feed(
+            State(state.clone()),
+            Path("dhan".to_string()),
+            Json(SetFeedRequest { enabled: false }),
+        )
+        .await;
         let Err((code, _body)) = res else {
-            panic!("disabling dhan at runtime must be rejected");
+            panic!("disabling dhan while live trading must be rejected");
         };
-        assert_eq!(code, StatusCode::BAD_REQUEST);
-        // Dhan stayed enabled — the rejected toggle did not flip it.
-        assert!(state.feed_runtime().is_enabled(Feed::Dhan));
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert!(
+            state.feed_runtime().is_enabled(Feed::Dhan),
+            "dhan stayed on"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_feed_dhan_enable_always_allowed() {
+        // Enabling Dhan is never gated (only the disable direction is dangerous).
+        let state = test_state(FeedsConfig::default());
+        state.feed_runtime().set_dhan_disable_allowed(false);
+        state.feed_runtime().set_enabled(Feed::Dhan, false);
+        let res = set_feed(
+            State(state.clone()),
+            Path("dhan".to_string()),
+            Json(SetFeedRequest { enabled: true }),
+        )
+        .await;
+        let Json(resp) = res.expect("enabling dhan always allowed");
+        assert!(resp.dhan_enabled);
     }
 
     #[tokio::test]

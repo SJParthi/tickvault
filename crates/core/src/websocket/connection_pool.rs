@@ -9,6 +9,7 @@
 //! Each connection runs independently on its own tokio task.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use tokio::sync::mpsc;
 use tracing::{error, info};
@@ -167,6 +168,7 @@ impl WebSocketConnectionPool {
             notifier,
             None,
             None,
+            None,
         )
     }
 
@@ -188,6 +190,10 @@ impl WebSocketConnectionPool {
         notifier: Option<std::sync::Arc<crate::notification::NotificationService>>,
         wal_spill: Option<Arc<WsFrameSpill>>,
         ws_audit_tx: Option<crate::websocket::connection::WsEventAuditSender>,
+        // PR-E (2026-06-21): shared runtime Dhan feed-enable flag. `None` =
+        // always-on (every existing caller / test). When `Some`, every
+        // connection in the pool reads it and parks dormant while disabled.
+        feed_enable_flag: Option<Arc<AtomicBool>>,
     ) -> Result<Self, WebSocketError> {
         let total = instruments.len();
 
@@ -255,6 +261,11 @@ impl WebSocketConnectionPool {
                         num_connections as i64,
                         tickvault_common::ws_event_types::WsType::MainFeed,
                     );
+                }
+                // PR-E: attach the shared runtime feed-enable flag so each
+                // connection can pause/resume on the operator toggle.
+                if let Some(flag) = feed_enable_flag.clone() {
+                    conn = conn.with_feed_enable_flag(flag);
                 }
                 Arc::new(conn)
             })

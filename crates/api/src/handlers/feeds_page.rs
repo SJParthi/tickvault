@@ -6,8 +6,9 @@
 //! CDN) served at `GET /feeds`. It is the operator-facing front-end for the
 //! already-existing feed-toggle API:
 //! - `GET  /api/feeds`        → reads each feed's live on/off state
-//! - `POST /api/feeds/{feed}` → flips a feed (Groww runtime-toggleable; Dhan is
-//!   config+restart and rendered read-only so the page never lies).
+//! - `POST /api/feeds/{feed}` → flips a feed. PR-E: BOTH Dhan and Groww are
+//!   live-toggleable; the Dhan *disable* direction is safety-gated server-side
+//!   (refused once live trading is on) and the page surfaces that 409 + re-syncs.
 //!
 //! The HTML shell itself carries no secrets, so it is a PUBLIC route; every data
 //! read + toggle action it performs goes through the bearer-auth `/api/feeds`
@@ -88,10 +89,10 @@ const FEEDS_PAGE_HTML: &str = r#"<!DOCTYPE html>
 
 <script>
 // Feed descriptors. Add a row here when the API reports a new feed.
-// toggleable=false renders a read-only switch (config+restart only).
+// toggleable=false would render a read-only switch; both feeds are toggleable now.
 const FEEDS = [
-  { key: "dhan",  label: "Dhan",  toggleable: false,
-    note: "Primary feed — change in config + restart (not live-toggleable)." },
+  { key: "dhan",  label: "Dhan",  toggleable: true,
+    note: "Primary feed — turn on/off live. (Off disconnects the live feed + stops storing ticks; on reconnects + re-subscribes.)" },
   { key: "groww", label: "Groww", toggleable: true,
     note: "Second feed — pause/resume live." },
 ];
@@ -297,14 +298,11 @@ mod tests {
             FEEDS_PAGE_HTML.contains("key: \"groww\""),
             "groww row present"
         );
-        // Dhan is config+restart (rendered read-only); Groww is live-toggleable.
-        assert!(
-            FEEDS_PAGE_HTML.contains("toggleable: false"),
-            "dhan read-only (config+restart) — page never lies about live-toggle"
-        );
+        // PR-E: BOTH feeds are live-toggleable now (Dhan disable is safety-gated
+        // server-side; the page shows the API's 409 + re-syncs on a gated reject).
         assert!(
             FEEDS_PAGE_HTML.contains("toggleable: true"),
-            "groww live-toggleable"
+            "feeds are live-toggleable"
         );
     }
 
