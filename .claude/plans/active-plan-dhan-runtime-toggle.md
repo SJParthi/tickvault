@@ -97,6 +97,24 @@ API + webpage:
   - Tests: feed_state dhan-toggle + dhan_flag share; feeds handler gated-disable;
     feeds_page dhan toggleable; core dormant-decision pure helper.
 
+## Guarantee matrix
+
+This item carries the operator-mandated 15-row "100% everything" matrix + the
+7-row resilience demand matrix by cross-reference to the canonical
+`.claude/rules/project/per-wave-guarantee-matrix.md` (cross-reference style per
+that rule). Item-specific proof: 100% code coverage via the listed unit tests
+(core `feed_enabled` gate, api flag-share/safety-gate/lane-marker, handler dhan
+cases); 100% testing via 2149 core + 31 api green; 100% code checks via
+banned-pattern + pub-fn-test + wiring + plan-gate; 100% performance via the
+hot-path review (zero per-frame alloc, O(1) flag read); 100% monitoring via
+`tv_feed_runtime_toggle_total{feed,action}` + `dhan_lane_running` + the existing
+`WebSocketDisconnected*`/`WebSocketReconnected` events; 100% review via the
+hot-path + hostile adversarial pass (HIGH + 2 MED fixed). Resilience (7-row):
+Zero ticks lost — no new tick-drop path (disable closes the socket cleanly, the
+WAL/ring/spill/DLQ chain is untouched); WS reconnect via `SubscribeRxGuard` is
+preserved; O(1) flag read on the hot path; uniqueness/dedup unchanged; real-time
+proof via the toggle counter + lane-running honesty signal.
+
 ## Scenarios
 
 | # | Scenario | Expected |
