@@ -87,7 +87,7 @@ API + webpage:
 - A toggle log line `error!`/`info!` with the feed + action (existing in set_feed).
 
 ## Plan Items
-- [ ] PR-E — Dhan runtime on/off (fully disconnect), safety-gated, webpage live switch
+- [x] PR-E — Dhan runtime on/off (fully disconnect), safety-gated, webpage live switch. Implemented: `core` `WebSocketConnection` gains `Option<Arc<AtomicBool>>` feed-enable flag (`with_feed_enable_flag`/`feed_enabled`) + top-of-`run()`-loop dormant gate (`wait_until_feed_enabled`) + a read-loop `select!` disable arm returning `WebSocketError::FeedDisabled` (outer match `continue`s to dormant, skipping backoff); pool threads the flag; order-update WS gets a top-of-loop dormant gate. `feed_state` flags are `Arc<AtomicBool>` with `dhan_flag()`; Dhan `is_runtime_toggleable()`→true; `dhan_disable_allowed` safety gate seeded from `dry_run`; `dhan_lane_running` honesty (marked only when dhan_enabled at boot). Handler accepts `dhan`, refuses DISABLE when live trading (409), warns on enable-without-lane. Webpage Dhan `toggleable:true`. main.rs wires the flag at both boot paths + both order-update spawns. Adversarial review: hot-path CLEAN (zero per-frame alloc), hostile HIGH (phantom lane) + 2 MED fixed. Tests: `test_feed_enable_flag_gates_feed_enabled` (core), `test_dhan_flag_shares_the_same_atomic_the_toggle_flips`, `test_dhan_disable_safety_gate`, `test_dhan_lane_running_marker`, `test_both_feeds_runtime_toggleable_after_pr_e`, handler dhan disable/enable/gated (api). 2149 core + 31 api green.
   - Files: `crates/api/src/feed_state.rs`, `crates/api/src/handlers/feeds.rs`,
     `crates/api/src/handlers/feeds_page.rs`, `crates/core/src/websocket/connection.rs`,
     `crates/core/src/websocket/connection_pool.rs`,

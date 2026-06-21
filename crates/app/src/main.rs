@@ -244,6 +244,19 @@ async fn main() -> Result<()> {
     let feed_runtime = std::sync::Arc::new(
         tickvault_api::feed_state::FeedRuntimeState::from_config(feeds),
     );
+    // PR-E (2026-06-21): the Dhan main feed is now runtime-toggleable (webpage).
+    // Safety gate: disabling Dhan is allowed ONLY in the no-orders data-pull
+    // phase (`dry_run`); once live trading is on, the toggle refuses to kill Dhan
+    // mid-trade. The Dhan connection tasks always spawn below (gated dormant when
+    // disabled), so the lane is "running" whenever the pool is built.
+    feed_runtime.set_dhan_disable_allowed(config.strategy.dry_run);
+    // Mark the Dhan lane "running" ONLY when Dhan is enabled at boot — that is
+    // the only case the pool is actually built below. If Dhan is OFF at boot the
+    // pool is never spawned, so reporting it running would be a false-OK
+    // (hostile-review HIGH 2026-06-21) — mirrors the groww_lane_running honesty.
+    if feeds.dhan_enabled {
+        feed_runtime.mark_dhan_lane_running();
+    }
     info!(
         dhan_enabled = feeds.dhan_enabled,
         groww_enabled = feeds.groww_enabled,
@@ -1402,6 +1415,8 @@ async fn main() -> Result<()> {
             true,
             Some(fast_notifier.clone()),
             ws_frame_spill.clone(),
+            // PR-E: hand the Dhan main feed the shared runtime enable flag.
+            Some(feed_runtime.dhan_flag()),
         ) {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
             None => (None, None),
@@ -1851,6 +1866,8 @@ async fn main() -> Result<()> {
             // 2026-06-12: order-update lifecycle events → ws_event_audit (its
             // own consumer, same self-contained helper as the main-feed pool).
             let ord_ws_audit_tx = Some(spawn_ws_event_audit_consumer(config.questdb.clone()));
+            // PR-E: the order-update WS reads the same Dhan enable flag.
+            let ord_dhan_flag = Some(feed_runtime.dhan_flag());
             tokio::spawn(async move {
                 run_order_update_connection(
                     url,
@@ -1863,6 +1880,7 @@ async fn main() -> Result<()> {
                     run_latch,
                     reconnect_notifier,
                     ord_ws_audit_tx,
+                    ord_dhan_flag,
                 )
                 .await;
             })
@@ -3057,6 +3075,8 @@ async fn main() -> Result<()> {
             is_market_hours,
             Some(notifier.clone()),
             ws_frame_spill.clone(),
+            // PR-E: hand the Dhan main feed the shared runtime enable flag.
+            Some(feed_runtime.dhan_flag()),
         ) {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
             None => (None, None),
@@ -4692,6 +4712,8 @@ async fn main() -> Result<()> {
         let ou_reconnect_notifier = Some(std::sync::Arc::clone(&notifier));
         // 2026-06-12: order-update lifecycle events → ws_event_audit.
         let ou_ws_audit_tx = Some(spawn_ws_event_audit_consumer(config.questdb.clone()));
+        // PR-E: the order-update WS reads the same Dhan enable flag.
+        let ou_dhan_flag = Some(feed_runtime.dhan_flag());
         tokio::spawn(async move {
             ou_health.set_order_update_connected(true);
             // Telegram: Order Update WS connected (fires before read loop starts).
@@ -4707,6 +4729,7 @@ async fn main() -> Result<()> {
                 run_latch,
                 ou_reconnect_notifier,
                 ou_ws_audit_tx,
+                ou_dhan_flag,
             )
             .await;
             // If run_order_update_connection returns, connection terminated
@@ -5659,6 +5682,10 @@ fn create_websocket_pool(
     is_market_hours: bool,
     notifier: Option<std::sync::Arc<NotificationService>>,
     wal_spill: Option<std::sync::Arc<tickvault_storage::ws_frame_spill::WsFrameSpill>>,
+    // PR-E (2026-06-21): shared runtime Dhan feed-enable flag (from
+    // FeedRuntimeState::dhan_flag). Every connection reads it to pause/resume on
+    // the operator toggle. `None` only in paths with no runtime control.
+    dhan_feed_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Option<(
     tokio::sync::mpsc::Receiver<(u64, bytes::Bytes)>,
     WebSocketConnectionPool,
@@ -5811,6 +5838,7 @@ fn create_websocket_pool(
         notifier,
         wal_spill,
         Some(ws_audit_tx),
+        dhan_feed_flag,
     ) {
         Ok(pool) => pool,
         Err(err) => {
