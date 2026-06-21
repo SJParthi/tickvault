@@ -16,6 +16,7 @@
 
 pub mod debug;
 pub mod feeds;
+pub mod feeds_page;
 pub mod health;
 pub mod quote;
 pub mod stats;
