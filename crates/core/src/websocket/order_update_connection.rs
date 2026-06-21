@@ -36,6 +36,10 @@ use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType};
 
 use crate::auth::TokenHandle;
 use crate::parser::order_update::{build_order_update_login, parse_order_update};
+
+/// PR-E: poll cadence (secs) while the Dhan feed is disabled at runtime — the
+/// order-update WS idles, re-checking the enable flag at this interval.
+const ORDER_UPDATE_FEED_DISABLE_POLL_SECS: u64 = 2;
 use crate::websocket::activity_watchdog::{
     ActivityWatchdog, WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS, build_heartbeat_gauge,
     spawn_with_panic_notify,
@@ -73,6 +77,10 @@ pub async fn run_order_update_connection(
     ws_audit_tx: Option<
         tokio::sync::mpsc::Sender<tickvault_common::ws_event_types::WsEventAuditRow>,
     >,
+    // PR-E (2026-06-21): shared runtime Dhan feed-enable flag. `None` = always-on.
+    // When `Some` and `false`, the loop does not (re)connect — it idles, polling
+    // the flag — so disabling Dhan from the webpage also stops the order-update WS.
+    dhan_feed_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     let mut consecutive_failures: u32 = 0;
     let m_reconnections = metrics::counter!("tv_order_update_reconnections_total");
@@ -91,6 +99,25 @@ pub async fn run_order_update_connection(
     .await;
 
     loop {
+        // PR-E (2026-06-21): Dhan runtime on/off gate. When the operator disables
+        // Dhan, do not (re)connect the order-update WS — idle here, polling the
+        // flag every 2s, until Dhan is re-enabled. A currently-open socket is left
+        // to close on its next natural disconnect; in the only phase where Dhan
+        // disable is permitted (no orders live), this WS carries nothing.
+        if let Some(flag) = dhan_feed_flag.as_ref() {
+            if !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                info!("PR-E: Dhan disabled — order-update WS dormant until re-enabled");
+                while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        ORDER_UPDATE_FEED_DISABLE_POLL_SECS,
+                    ))
+                    .await;
+                }
+                info!("PR-E: Dhan re-enabled — order-update WS resuming");
+                consecutive_failures = 0;
+            }
+        }
+
         // Snapshot the failure count BEFORE the connect attempt. If the
         // attempt succeeds AND this counter is > 0, we have just
         // recovered from a streak of failures. `connect_and_listen`

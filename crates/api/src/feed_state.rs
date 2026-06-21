@@ -12,6 +12,7 @@
 //! `POST /api/feeds/dhan` (Dhan stays config+restart, per Step C). Dhan's flag is
 //! still reported by `GET /api/feeds` for visibility.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tickvault_common::config::FeedsConfig;
@@ -46,11 +47,14 @@ impl Feed {
         }
     }
 
-    /// Whether this feed may be toggled at runtime. Only Groww in slice 1 —
-    /// disabling the primary Dhan feed mid-session is unsafe (config+restart only).
+    /// Whether this feed may be toggled at runtime. BOTH Dhan and Groww are
+    /// runtime-toggleable as of PR-E (2026-06-21, operator-authorized — see
+    /// `websocket-connection-scope-lock.md` "DHAN RUNTIME-TOGGLE AUTHORIZED").
+    /// The Dhan *disable* direction is additionally safety-gated (orders-live)
+    /// in the handler via [`FeedRuntimeState::can_disable_dhan`].
     #[must_use]
     pub const fn is_runtime_toggleable(self) -> bool {
-        matches!(self, Self::Groww)
+        matches!(self, Self::Groww | Self::Dhan)
     }
 }
 
@@ -67,33 +71,83 @@ pub struct FeedStatus {
     /// RESTART to start the lane (the API toggle is pause/resume for a *running*
     /// lane). Exposing this avoids a misleading "enabled but nothing happens".
     pub groww_lane_running: bool,
+    /// PR-E: whether the Dhan main-feed lane was spawned this process (Dhan
+    /// enabled at boot). Mirrors `groww_lane_running` for honest reporting.
+    pub dhan_lane_running: bool,
+    /// PR-E: whether DISABLING Dhan at runtime is currently permitted. `true`
+    /// in the no-orders data-pull phase (`dry_run`); `false` once live trading
+    /// is on, so the toggle can never blind the system mid-trade.
+    pub dhan_disable_allowed: bool,
 }
 
 /// Lock-free per-feed runtime enable/disable flags. Seeded from `config.feeds` at
 /// boot; flipped live by the feed-toggle API. One shared `Arc` instance binds the
-/// API and the feed lanes together.
+/// API and the feed lanes together. PR-E: the `dhan`/`groww` flags are
+/// `Arc<AtomicBool>` so the SAME atomic can be handed to the `core` Dhan
+/// WebSocket loop (which cannot depend on this crate) via [`Self::dhan_flag`].
 #[derive(Debug)]
 pub struct FeedRuntimeState {
-    dhan: AtomicBool,
-    groww: AtomicBool,
+    dhan: Arc<AtomicBool>,
+    groww: Arc<AtomicBool>,
     /// Set once by the boot wiring when the Groww bridge task is actually
     /// spawned (i.e. `groww_enabled` was true at boot). Read by the API to tell
     /// the operator honestly whether a runtime toggle will take effect.
     groww_lane_running: AtomicBool,
+    /// PR-E: set once by the boot wiring when the Dhan main-feed pool is spawned.
+    dhan_lane_running: AtomicBool,
+    /// PR-E: gate on the Dhan *disable* direction (orders-live safety). Seeded
+    /// from `dry_run` at boot; defaults `true` (no-orders phase).
+    dhan_disable_allowed: AtomicBool,
 }
 
 impl FeedRuntimeState {
     /// Build from the boot config — `dhan_enabled` / `groww_enabled` seed the
     /// atomics. This is the ONLY constructor production uses; the runtime API
     /// only ever flips the atomics afterward, never re-seeds from config.
+    /// PR-E: `dhan_disable_allowed` defaults `true`; the boot wiring narrows it
+    /// to `dry_run` via [`Self::set_dhan_disable_allowed`].
     #[must_use]
     pub fn from_config(feeds: &FeedsConfig) -> Self {
         Self {
-            dhan: AtomicBool::new(feeds.dhan_enabled),
-            groww: AtomicBool::new(feeds.groww_enabled),
+            dhan: Arc::new(AtomicBool::new(feeds.dhan_enabled)),
+            groww: Arc::new(AtomicBool::new(feeds.groww_enabled)),
             // The lane is not running until the boot wiring spawns it.
             groww_lane_running: AtomicBool::new(false),
+            dhan_lane_running: AtomicBool::new(false),
+            dhan_disable_allowed: AtomicBool::new(true),
         }
+    }
+
+    /// PR-E: a clone of the shared Dhan enable atomic, for the `core` Dhan
+    /// WebSocket pool/connection (`with_feed_enable_flag`). The SAME atomic the
+    /// API toggle flips — so a webpage toggle is observed live by the feed loop.
+    #[must_use]
+    pub fn dhan_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.dhan)
+    }
+
+    /// PR-E: boot wiring marks the Dhan main-feed lane as spawned.
+    pub fn mark_dhan_lane_running(&self) {
+        self.dhan_lane_running.store(true, Ordering::Relaxed);
+    }
+
+    /// PR-E: whether the Dhan lane is running this process.
+    #[must_use]
+    pub fn is_dhan_lane_running(&self) -> bool {
+        self.dhan_lane_running.load(Ordering::Relaxed)
+    }
+
+    /// PR-E: narrow the Dhan-disable safety gate (boot wires this to `dry_run`).
+    pub fn set_dhan_disable_allowed(&self, allowed: bool) {
+        self.dhan_disable_allowed.store(allowed, Ordering::Relaxed);
+    }
+
+    /// PR-E: may the operator DISABLE Dhan right now? `false` once live trading
+    /// is on — the handler rejects a Dhan-off toggle so the feed can't be killed
+    /// mid-trade. Enabling Dhan is always allowed.
+    #[must_use]
+    pub fn can_disable_dhan(&self) -> bool {
+        self.dhan_disable_allowed.load(Ordering::Relaxed)
     }
 
     /// Called once by the boot wiring when the Groww bridge task is spawned, so
@@ -135,6 +189,8 @@ impl FeedRuntimeState {
             dhan_enabled: self.is_enabled(Feed::Dhan),
             groww_enabled: self.is_enabled(Feed::Groww),
             groww_lane_running: self.is_groww_lane_running(),
+            dhan_lane_running: self.is_dhan_lane_running(),
+            dhan_disable_allowed: self.can_disable_dhan(),
         }
     }
 }
@@ -163,12 +219,11 @@ mod tests {
     }
 
     #[test]
-    fn test_only_groww_is_runtime_toggleable() {
+    fn test_both_feeds_runtime_toggleable_after_pr_e() {
+        // PR-E (2026-06-21): Dhan is now runtime-toggleable too (operator-
+        // authorized); the Dhan-disable direction is safety-gated separately.
         assert!(Feed::Groww.is_runtime_toggleable());
-        assert!(
-            !Feed::Dhan.is_runtime_toggleable(),
-            "Dhan must NOT be runtime-disable-able (config+restart only)"
-        );
+        assert!(Feed::Dhan.is_runtime_toggleable());
     }
 
     #[test]
@@ -232,6 +287,8 @@ mod tests {
                 dhan_enabled: true,
                 groww_enabled: false,
                 groww_lane_running: false,
+                dhan_lane_running: false,
+                dhan_disable_allowed: true,
             }
         );
         state.set_enabled(Feed::Groww, true);
@@ -241,7 +298,55 @@ mod tests {
                 dhan_enabled: true,
                 groww_enabled: true,
                 groww_lane_running: false,
+                dhan_lane_running: false,
+                dhan_disable_allowed: true,
             }
+        );
+    }
+
+    #[test]
+    fn test_dhan_is_runtime_toggleable_after_pr_e() {
+        assert!(Feed::Dhan.is_runtime_toggleable());
+        assert!(Feed::Groww.is_runtime_toggleable());
+    }
+
+    #[test]
+    fn test_dhan_flag_shares_the_same_atomic_the_toggle_flips() {
+        // The flag handed to the core Dhan WS loop MUST be the very atomic the
+        // API toggle flips — otherwise a webpage toggle would never reach the feed.
+        let state = FeedRuntimeState::default();
+        let flag = state.dhan_flag();
+        assert!(flag.load(Ordering::Relaxed), "seeded enabled");
+        state.set_enabled(Feed::Dhan, false);
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "toggling Dhan off is observed on the shared flag"
+        );
+        state.set_enabled(Feed::Dhan, true);
+        assert!(flag.load(Ordering::Relaxed), "re-enable observed too");
+    }
+
+    #[test]
+    fn test_dhan_disable_safety_gate() {
+        // tests set_dhan_disable_allowed + can_disable_dhan
+        let state = FeedRuntimeState::default();
+        assert!(state.can_disable_dhan(), "default no-orders phase: allowed");
+        state.set_dhan_disable_allowed(false);
+        assert!(!state.can_disable_dhan(), "live trading: disable refused");
+    }
+
+    #[test]
+    fn test_dhan_lane_running_marker() {
+        // tests mark_dhan_lane_running + is_dhan_lane_running
+        let state = FeedRuntimeState::default();
+        assert!(
+            !state.is_dhan_lane_running(),
+            "not marked until boot wiring"
+        );
+        state.mark_dhan_lane_running();
+        assert!(
+            state.is_dhan_lane_running(),
+            "boot wiring marked it running"
         );
     }
 

@@ -261,6 +261,14 @@ pub enum WebSocketError {
     #[error("No valid access token available for WebSocket authentication")]
     NoTokenAvailable,
 
+    /// PR-E (2026-06-21): the Dhan feed was disabled at runtime via the
+    /// feed-control toggle. NOT an error condition — a clean, operator-requested
+    /// disconnect. The `run()` loop closes the socket and goes dormant (polling
+    /// the enable flag) instead of reconnecting or exiting; flipping the feed
+    /// back ON wakes it and reconnects via the normal path.
+    #[error("Dhan feed disabled at runtime — going dormant until re-enabled")]
+    FeedDisabled,
+
     /// Dhan sent a disconnect frame with an error code.
     #[error("Dhan disconnected: {code}")]
     DhanDisconnect { code: DisconnectCode },
