@@ -318,6 +318,74 @@ async fn main() -> Result<()> {
             std::sync::Arc::clone(&feed_runtime),
         ));
 
+        // Groww watch-list build (PR-B1, operator lock §31/§32). Rust downloads
+        // the Groww master instrument.csv + the NIFTY-Total-Market list, joins
+        // by ISIN → Groww exchange_tokens, and atomically writes the ~779 watch
+        // file the sidecar reads (PR-B2 wires the sidecar to consume it).
+        // Pull-until-success retry (operator: never give up); fail-closed on
+        // either CSV. `max_subscribe` defaults to a SAFE SUBSET for the first
+        // run — set the `GROWW_MAX_SUBSCRIBE` env (e.g. 1200) for the full
+        // universe. Default OFF; touches NO Dhan path.
+        let groww_watch_date = (chrono::Utc::now()
+            + chrono::TimeDelta::seconds(tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64))
+        .format("%Y-%m-%d")
+        .to_string();
+        let groww_max_subscribe = std::env::var("GROWW_MAX_SUBSCRIBE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .or(Some(
+                tickvault_core::feed::groww::instruments::GROWW_DEFAULT_MAX_SUBSCRIBE,
+            ));
+        info!(
+            max_subscribe = ?groww_max_subscribe,
+            "[feeds] groww_enabled=true — building Groww watch-list (Rust: master + NTM join by ISIN)"
+        );
+        tokio::spawn(async move {
+            let cache_dir = std::path::PathBuf::from("data/groww");
+            let mut attempt: u32 = 0;
+            loop {
+                attempt = attempt.saturating_add(1);
+                match tickvault_core::feed::groww::instruments::build_and_write_groww_watch(
+                    &cache_dir,
+                    &groww_watch_date,
+                    groww_max_subscribe,
+                )
+                .await
+                {
+                    Ok(set) => {
+                        info!(
+                            entries = set.entries.len(),
+                            indices = set.indices,
+                            resolved_stocks = set.resolved_stocks,
+                            unresolved = set.unresolved_stocks.len(),
+                            "[feeds] Groww watch-list ready"
+                        );
+                        break;
+                    }
+                    Err(err) => {
+                        let backoff =
+                            std::cmp::min(10u64.saturating_mul(1u64 << attempt.min(5)), 300);
+                        if attempt <= 3 {
+                            warn!(
+                                ?err,
+                                attempt,
+                                backoff_secs = backoff,
+                                "[feeds] Groww watch-list build failed — retrying"
+                            );
+                        } else {
+                            error!(
+                                ?err,
+                                attempt,
+                                backoff_secs = backoff,
+                                "[feeds] Groww watch-list build still failing — pull-until-success"
+                            );
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                    }
+                }
+            }
+        });
+
         // Groww sidecar auto-launcher (operator "no manual commands" 2026-06-19).
         // tickvault itself auto-provisions an isolated Python venv (one-time,
         // idempotent `python -m venv` + `pip install growwapi pyotp`), fetches the
