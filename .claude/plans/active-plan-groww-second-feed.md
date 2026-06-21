@@ -75,8 +75,10 @@ measuring that drift vs Dhan is the goal. Default-OFF guarantees zero prod impac
   - Tests: `test_drain_complete_prefix_splits_complete_lines_keeps_partial`, `test_drain_complete_prefix_no_newline_returns_empty`, `test_drain_complete_prefix_partial_utf8_tail_buffered`, `test_validate_groww_tick_rejects_implausible_volume`
 
 - [ ] PR-B (Groww universe → ~779 subscribed) — **Rust builds the watch-list** (operator decision 2026-06-20): download Groww master `instrument.csv` (`growwapi-assets.groww.in/instruments/instrument.csv`) + the NIFTY-Total-Market list, join NTM ISINs → Groww `exchange_token` (cash stocks) + NSE indices → `exchange_token`, write a watch file the sidecar reads. Sidecar: read watch file (replace hardcoded WATCH), `subscribe_ltp` (stocks) + `subscribe_index_value` (indices, fixes the IDX_I MEDIUM). ~779 instruments.
-  - Files: `crates/core/src/feed/groww/instruments.rs` (NEW), `crates/app/src/main.rs` (boot wiring), `scripts/groww-sidecar/groww_sidecar.py`
-  - Tests: ISIN-join resolver, watch-file writer, index/cash classification
+  - [x] PR-B1 — Rust watch-list builder + boot wiring (merged #1165): parse + ISIN-resolve + dedup + envelope + deterministic cap; `build_and_write_groww_watch` downloads master+NTM, writes `data/groww/groww-watch-<date>.json`.
+  - [x] PR-B2 — sidecar reads the watch file → `subscribe_ltp` STOCKS (kind="ltp", numeric token → integer security_id); Option A volume=0; capture-at-receipt NDJSON. Indices counted+logged, deferred to PR-B2i. Files: `scripts/groww-sidecar/groww_sidecar.py`.
+  - [ ] PR-B2i — INDICES: `subscribe_index_value` + name→canonical-SID identity map (Groww NSE index token is a NAME, not the bridge's integer security_id). BLOCKED on a live Groww index row (verify token form + the canonical SID alignment to Dhan for cross-feed comparison).
+
 
 - [ ] PR-C (Groww-only on Mac) — confirm `dhan_enabled=false` + `groww_enabled=true` boot path runs standalone on a local MacBook; creds via AWS SSM (operator decision 2026-06-20: Mac has AWS creds); docs.
   - Files: `config/*.toml`, docs
