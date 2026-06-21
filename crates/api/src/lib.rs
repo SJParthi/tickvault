@@ -2,6 +2,7 @@
 //!
 //! # Endpoints
 //! - `GET /health` — health check
+//! - `GET /feeds` — operator feed-control webpage (turn feeds on/off, single or multiple)
 //! - `GET /api/stats` — QuestDB table counts
 //! - `GET /api/quote/{security_id}` — latest tick for a security (from QuestDB)
 //! - `GET /api/debug/logs/summary` — Claude MCP read-only log summary
@@ -125,6 +126,14 @@ pub fn build_router_with_auth(
         .route(
             "/health",
             axum::routing::get(handlers::health::health_check),
+        )
+        // Operator feed-control webpage (operator directive 2026-06-21): a single
+        // self-contained HTML page to turn feeds on/off (single or multiple). The
+        // HTML shell is public (no secrets); every read/toggle it performs goes
+        // through the bearer-auth `/api/feeds` endpoints below.
+        .route(
+            "/feeds",
+            axum::routing::get(handlers::feeds_page::feeds_page),
         )
         .route("/api/stats", axum::routing::get(handlers::stats::get_stats))
         .route(
@@ -501,6 +510,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_feeds_page_is_public_200_without_auth() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use secrecy::SecretString;
+        use tower::ServiceExt;
+
+        // Even with auth ENABLED, the operator feed-control PAGE (HTML shell) is a
+        // public route — only the data/toggle `/api/feeds` calls it issues are
+        // bearer-gated. The page must load so the operator can paste their token.
+        let auth = ApiAuthConfig::from_token(SecretString::from("secret-tok".to_string()));
+        let router = build_router_with_auth(auth_test_state(), &[], auth);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/feeds")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        // Anti-clickjacking: the page must ship X-Frame-Options (security-review).
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::X_FRAME_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
+            Some("SAMEORIGIN"),
+        );
     }
 
     // PR #7d (2026-05-19): `test_build_router_portal_endpoint_returns_200`

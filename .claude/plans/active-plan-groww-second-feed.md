@@ -84,6 +84,7 @@ measuring that drift vs Dhan is the goal. Default-OFF guarantees zero prod impac
 - [ ] PR-C2 (Groww-only run profile) — confirm `dhan_enabled=false` + `groww_enabled=true` boot path runs standalone; creds via AWS SSM (Mac has AWS creds); operator-facing run doc ("click Run → it does X"). Deferred until operator validates PR-C1 on the Mac.
   - Files: `config/*.toml`, docs
   - Tests: Groww-only boot-path guard
+- [x] PR-D (operator feed-control webpage — operator 2026-06-21 "only choice is in webpage it should allow me to turn on or off the feed — single or multiple feeds") — a single self-contained HTML page (no framework/build/CDN) served at `GET /feeds` by the `api` crate, as the front-end for the existing feed-toggle API. Renders every feed (`dhan` read-only=config+restart, `groww` live-toggleable) with its own on/off switch (single OR multiple), keeps the operator's API token in `localStorage` and sends it as `Authorization: Bearer`, reads `GET /api/feeds`, POSTs `POST /api/feeds/{feed}` on toggle, and surfaces the `groww_lane_running` honesty signal. The HTML shell is a PUBLIC route (no secrets); all reads/toggles go through the bearer-auth `/api/feeds` endpoints. Feed rows are descriptor-list-driven so a future feed is a one-line add. Files: `crates/api/src/handlers/feeds_page.rs`, `crates/api/src/handlers/mod.rs`, `crates/api/src/lib.rs`. Tests: `feeds_page::tests::*` (4) + `tests::test_feeds_page_is_public_200_without_auth` (13/13 api lib green).
 
 
 ### Design (PR-4a)
