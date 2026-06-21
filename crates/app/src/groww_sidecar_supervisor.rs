@@ -10,7 +10,15 @@
 //! 1. **auto-provisions** an isolated Python virtual-env under
 //!    `data/groww/venv` and `pip install`s `growwapi` + `pyotp` into it ONCE
 //!    (idempotent — skipped if the venv python already exists), so the
-//!    operator never types `pip install`;
+//!    operator never types `pip install`. The system interpreter used to
+//!    BUILD the venv is **auto-discovered** ([`discover_system_python`]) across
+//!    every place a normal Mac/AWS host keeps it (Xcode CLT `/usr/bin/python3`,
+//!    Homebrew `/opt/homebrew` + `/usr/local`, versioned `python3.x`, plain
+//!    `python3` on PATH) — so "click Run" self-provisions with no manual
+//!    Python install. (Auto-INSTALLING the OS interpreter is out of scope:
+//!    `brew` is BANNED per CLAUDE.md and an OS package install needs `sudo` —
+//!    neither is one-click-safe; every normal Mac/AWS host already ships one,
+//!    which discovery finds.);
 //! 2. **fetches** the Groww credentials from SSM (the SAME
 //!    `/tickvault/<env>/groww/api-key` + `/totp-secret` the native auth path
 //!    uses) and injects them as env vars into the child — never logged;
@@ -45,6 +53,17 @@
 //!   external input — no command-injection surface. LOW: if `GrowwSidecarOptions`
 //!   is ever wired to a config/API source, the executable + paths MUST stay
 //!   allowlisted.
+//! - The bare-name [`PYTHON_CANDIDATES`] (`python3`, `python3.x`, `python`) are
+//!   `$PATH`-resolved at probe time, so a binary named `python3` placed ahead of
+//!   the real one on `$PATH` would run during discovery (security-review HIGH
+//!   2026-06-21). This is INHERENT to finding `python3` at all (the pre-discovery
+//!   code already spawned bare `python3`), and on this single-app / single-UID
+//!   host a writable-`$PATH` attacker already has code execution — so it is
+//!   accepted defense-in-depth, not a new hole. The three ABSOLUTE candidates
+//!   (`/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`) are PATH-independent
+//!   anchors; eliminating bare names entirely would break discovery on hosts that
+//!   keep `python3` elsewhere. The probe runs `-c "import venv"` (capability
+//!   check), not arbitrary input.
 //!
 //! Honest envelope (operator §F): this is the Python validation path of lock
 //! §32 — capture-at-receipt durability (the sidecar fsyncs each tick the
@@ -66,8 +85,46 @@ use tickvault_api::feed_state::{Feed, FeedRuntimeState};
 use tickvault_core::auth::secret_manager::fetch_groww_credentials;
 
 /// System Python used ONLY to create the isolated venv (never to run the
-/// sidecar — the sidecar runs from the venv's own python).
+/// sidecar — the sidecar runs from the venv's own python). This is the FIRST
+/// candidate tried; [`discover_system_python`] falls through [`PYTHON_CANDIDATES`]
+/// if it is absent.
 pub const SYSTEM_PYTHON_DEFAULT: &str = "python3";
+
+/// Candidate system-Python executables tried (in order) when the preferred
+/// interpreter is absent, so "click Run" self-provisions on any normal host with
+/// ZERO manual install. Covers a clean macOS (`/usr/bin/python3` from Xcode CLT,
+/// Homebrew `/opt/homebrew` on Apple Silicon + `/usr/local` on Intel) and a clean
+/// AWS Linux host (`python3` on PATH + versioned fallbacks). We DISCOVER, never
+/// auto-install: `brew` is BANNED (CLAUDE.md) and OS package install needs `sudo`.
+pub const PYTHON_CANDIDATES: &[&str] = &[
+    "python3",
+    "python3.13",
+    "python3.12",
+    "python3.11",
+    "python3.10",
+    "/opt/homebrew/bin/python3",
+    "/usr/local/bin/python3",
+    "/usr/bin/python3",
+    "python",
+];
+
+/// Pure interpreter picker: returns `preferred` if it works, else the first
+/// [`PYTHON_CANDIDATES`] entry for which `probe` reports a working interpreter,
+/// else `preferred` (so the caller's existing "is python available?" error path
+/// fires when NOTHING works). O(candidates), no I/O — `probe` is injected so the
+/// selection logic is fully unit-tested.
+#[must_use]
+pub fn pick_system_python<F: Fn(&str) -> bool>(preferred: &str, probe: F) -> String {
+    if probe(preferred) {
+        return preferred.to_string();
+    }
+    for candidate in PYTHON_CANDIDATES {
+        if *candidate != preferred && probe(candidate) {
+            return (*candidate).to_string();
+        }
+    }
+    preferred.to_string()
+}
 
 /// Default isolated virtual-env directory (kept under `data/` like the rest of
 /// the runtime state; created once, reused every boot).
@@ -206,6 +263,39 @@ pub fn build_sidecar_run_command(venv_python: &Path, script_path: &Path) -> (Str
     )
 }
 
+/// Probe whether `candidate` is a Python that can ACTUALLY build the venv —
+/// `candidate -c "import venv"` exits 0. This is the exact capability
+/// `ensure_python_env` needs (`-m venv`), so it is stronger than a bare
+/// `--version` check: it rejects a broken PATH shim that prints a version but
+/// can't create a venv (hostile-review LOW 2026-06-21), and it rejects Python 2
+/// (no `venv` module) so the trailing `python` candidate can never be mis-picked.
+/// One cheap child spawn.
+// TEST-EXEMPT: spawns a child process to probe the host's interpreter capability; the selection logic that consumes these facts (pick_system_python) is unit-tested with an injected probe.
+async fn python_works(candidate: &str) -> bool {
+    matches!(
+        Command::new(candidate).args(["-c", "import venv"]).output().await,
+        Ok(out) if out.status.success()
+    )
+}
+
+/// Discover a usable system Python, preferring `preferred`. Gathers which
+/// candidates actually run (`--version`), then delegates the CHOICE to the pure,
+/// unit-tested [`pick_system_python`] — so the I/O (probing) and the decision
+/// (ordering/fallback) stay cleanly separated.
+// TEST-EXEMPT: drives `--version` child spawns to learn which interpreters exist on this host; the ordering/fallback decision it returns is the unit-tested pure pick_system_python.
+async fn discover_system_python(preferred: &str) -> String {
+    let mut working: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if python_works(preferred).await {
+        working.insert(preferred.to_string());
+    }
+    for candidate in PYTHON_CANDIDATES {
+        if !working.contains(*candidate) && python_works(candidate).await {
+            working.insert((*candidate).to_string());
+        }
+    }
+    pick_system_python(preferred, |c| working.contains(c))
+}
+
 /// Provision the isolated venv + dependencies if not already present.
 /// Idempotent: returns early when [`venv_is_provisioned`] is true.
 // TEST-EXEMPT: spawns `python -m venv` + `pip install` child processes + filesystem; the command/arg construction is unit-tested (build_venv_create_command / build_pip_install_command) and the idempotency gate is unit-tested (venv_is_provisioned).
@@ -226,12 +316,16 @@ async fn ensure_python_env(opts: &GrowwSidecarOptions) -> anyhow::Result<()> {
             );
         }
     }
+    // Discover the host interpreter (preferring the configured one) so "click
+    // Run" self-provisions with no manual Python install on Mac OR AWS.
+    let system_python = discover_system_python(&opts.system_python).await;
     info!(
         venv = %opts.venv_dir.display(),
-        "[feeds] groww sidecar: provisioning isolated Python env (one-time, automated — no manual pip)"
+        python = %system_python,
+        "[feeds] groww sidecar: provisioning isolated Python env (one-time, automated — discovered interpreter, no manual pip)"
     );
 
-    let (venv_prog, venv_args) = build_venv_create_command(&opts.system_python, &opts.venv_dir);
+    let (venv_prog, venv_args) = build_venv_create_command(&system_python, &opts.venv_dir);
     let venv_status = tokio::time::timeout(SIDECAR_PROVISION_TIMEOUT, async {
         Command::new(&venv_prog).args(&venv_args).status().await
     })
@@ -243,7 +337,11 @@ async fn ensure_python_env(opts: &GrowwSidecarOptions) -> anyhow::Result<()> {
         )
     })??;
     if !venv_status.success() {
-        anyhow::bail!("python venv creation exited with status {venv_status}");
+        anyhow::bail!(
+            "python venv creation (`{system_python} -m venv`) exited with status {venv_status} \
+             — on a Debian/Ubuntu host the `python3-venv` package may be missing; \
+             Mac (Xcode CLT) and AWS Linux ship it by default"
+        );
     }
 
     let venv_python = venv_python_path(&opts.venv_dir);
@@ -402,6 +500,54 @@ pub async fn run_groww_sidecar_supervisor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_pick_system_python_prefers_working_preferred() {
+        // Preferred works → returned even if other candidates also work.
+        let chosen = pick_system_python("python3", |_| true);
+        assert_eq!(chosen, "python3");
+    }
+
+    #[test]
+    fn test_pick_system_python_falls_through_to_first_working_candidate() {
+        // Preferred ("python3") absent; only /usr/bin/python3 works → pick it.
+        let chosen = pick_system_python("python3", |c| c == "/usr/bin/python3");
+        assert_eq!(chosen, "/usr/bin/python3");
+    }
+
+    #[test]
+    fn test_pick_system_python_respects_candidate_priority_order() {
+        // Both a versioned and the system path work → the earlier candidate
+        // (python3.13 precedes /usr/bin/python3 in PYTHON_CANDIDATES) wins.
+        let chosen =
+            pick_system_python("python3", |c| c == "python3.13" || c == "/usr/bin/python3");
+        assert_eq!(chosen, "python3.13");
+    }
+
+    #[test]
+    fn test_pick_system_python_falls_back_to_preferred_when_nothing_works() {
+        // Nothing works → return preferred so the caller's clear error path fires.
+        let chosen = pick_system_python("python3", |_| false);
+        assert_eq!(chosen, "python3");
+    }
+
+    #[test]
+    fn test_python_candidates_cover_mac_and_aws_locations() {
+        // Regression guard: the discovery list must keep the Mac (Xcode CLT +
+        // Homebrew) and AWS (PATH) interpreter locations so one-click Run keeps
+        // self-provisioning on both.
+        for required in [
+            "python3",
+            "/usr/bin/python3",
+            "/opt/homebrew/bin/python3",
+            "/usr/local/bin/python3",
+        ] {
+            assert!(
+                PYTHON_CANDIDATES.contains(&required),
+                "PYTHON_CANDIDATES must include {required}"
+            );
+        }
+    }
 
     #[test]
     fn test_sidecar_restart_backoff_zero_failures_is_immediate() {
