@@ -58,17 +58,24 @@ pub enum WatchKind {
 }
 
 /// One instrument the sidecar should subscribe. Serializes to the watch-file
-/// contract the Python sidecar reads: `{exchange, segment, exchange_token, kind}`.
+/// contract the Python sidecar reads:
+/// `{exchange, segment, exchange_token, kind, security_id}`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct WatchEntry {
     /// Groww exchange (`NSE` / `BSE`).
     pub exchange: String,
     /// Groww segment (`CASH` / `FNO`).
     pub segment: String,
-    /// Groww exchange token — numeric string for stocks, index NAME for indices.
+    /// Groww exchange token used to SUBSCRIBE — numeric string for stocks,
+    /// index NAME for NSE indices (e.g. `NIFTY`), numeric for BSE indices.
     pub exchange_token: String,
     /// LTP vs index-value subscription.
     pub kind: WatchKind,
+    /// The integer `security_id` STORED in the shared `ticks` table. For stocks
+    /// this is the numeric `exchange_token`; for indices (whose token may be a
+    /// name) this is a Groww-native stable id (operator decision 2026-06-21) —
+    /// Rust is the single source so the sidecar never re-derives it.
+    pub security_id: i64,
 }
 
 /// The assembled Groww watch set + resolution provenance for observability.
@@ -122,6 +129,9 @@ pub struct GrowwInstrumentRow {
     pub exchange: String,
     /// `exchange_token` column.
     pub exchange_token: String,
+    /// `groww_symbol` column (e.g. `NSE-NIFTY`, `BSE-SENSEX`) — the stable,
+    /// globally-unique Groww identity used to derive an index `security_id`.
+    pub groww_symbol: String,
     /// `instrument_type` column (`EQ`/`IDX`/`FUT`/`CE`/`PE`).
     pub instrument_type: String,
     /// `segment` column (`CASH`/`FNO`/`COMMODITY`).
@@ -147,6 +157,7 @@ fn header_index(header: &str) -> Result<HashMap<String, usize>, WatchBuildError>
         "segment",
         "series",
         "isin",
+        "groww_symbol",
     ] {
         if !idx.contains_key(required) {
             return Err(WatchBuildError::MissingColumn(match required {
@@ -155,7 +166,8 @@ fn header_index(header: &str) -> Result<HashMap<String, usize>, WatchBuildError>
                 "instrument_type" => "instrument_type",
                 "segment" => "segment",
                 "series" => "series",
-                _ => "isin",
+                "isin" => "isin",
+                _ => "groww_symbol",
             }));
         }
     }
@@ -205,6 +217,7 @@ fn parse_groww_master(csv: &str) -> Result<Vec<GrowwInstrumentRow>, WatchBuildEr
         rows.push(GrowwInstrumentRow {
             exchange: get(&fields, "exchange"),
             exchange_token: get(&fields, "exchange_token"),
+            groww_symbol: get(&fields, "groww_symbol"),
             instrument_type: get(&fields, "instrument_type"),
             segment: get(&fields, "segment"),
             series: get(&fields, "series"),
@@ -254,21 +267,61 @@ fn build_isin_token_map(rows: &[GrowwInstrumentRow]) -> (HashMap<String, String>
     (map, ambiguous)
 }
 
-/// Extracts NSE index watch entries from the master: `exchange=NSE &
-/// instrument_type=IDX`, non-empty token. Indices subscribe via index_value with
-/// `segment=CASH` and the index NAME as token. Deterministic order (token asc).
+/// The one BSE index we track (`groww_symbol`), per operator §31: NIFTY-set +
+/// indices + exactly ONE BSE SENSEX. Identified by its stable `groww_symbol`
+/// (token is the numeric `"1"`, which alone is not distinctive — the symbol is).
+const BSE_SENSEX_GROWW_SYMBOL: &str = "BSE-SENSEX";
+
+/// Bit set on every index `security_id` to put it in the `[2^62, 2^63)` range,
+/// guaranteeing — STRUCTURALLY, not statistically — that an index id can never
+/// collide with a numeric stock `exchange_token` (which are small, far below
+/// `2^32`). Bit 63 stays clear so the value is always a positive `i64`.
+const INDEX_SECURITY_ID_BIT: i64 = 1 << 62;
+
+/// Derives a deterministic, stable, positive `security_id` for an index from its
+/// globally-unique `groww_symbol` (e.g. `NSE-NIFTY`, `BSE-SENSEX`) via FNV-1a
+/// (64-bit), then forces it into the `[2^62, 2^63)` band via
+/// `INDEX_SECURITY_ID_BIT`. Operator decision 2026-06-21 ("Groww-native stable
+/// IDs"): Rust is the single source — the same symbol always yields the same id
+/// across boots, and the sidecar never re-derives it. Because every index id has
+/// bit 62 set and stock ids (numeric tokens) are far below `2^32`, the two ranges
+/// are DISJOINT by construction — collision is impossible, not merely unlikely.
+#[must_use]
+fn stable_index_security_id(groww_symbol: &str) -> i64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in groww_symbol.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    // Keep the low 62 bits of the hash (distinct symbols → distinct ids) and set
+    // bit 62 → range [2^62, 2^63): positive, and disjoint from stock tokens.
+    ((hash & 0x3fff_ffff_ffff_ffff) as i64) | INDEX_SECURITY_ID_BIT
+}
+
+/// Extracts index watch entries from the master: every `exchange=NSE &
+/// instrument_type=IDX` row PLUS the single `BSE-SENSEX` index (operator §31).
+/// Indices subscribe via index_value with `segment=CASH`; the subscribe token is
+/// the Groww `exchange_token` (a NAME for NSE, the numeric `"1"` for BSE SENSEX),
+/// while the stored `security_id` is the Groww-native stable id derived from the
+/// `groww_symbol`. Deterministic order (token asc), deduped by token.
 #[must_use]
 fn extract_index_entries(rows: &[GrowwInstrumentRow]) -> Vec<WatchEntry> {
     let mut entries: Vec<WatchEntry> = rows
         .iter()
         .filter(|r| {
-            r.exchange == "NSE" && r.instrument_type == "IDX" && !r.exchange_token.is_empty()
+            r.instrument_type == "IDX"
+                && !r.exchange_token.is_empty()
+                && (r.exchange == "NSE"
+                    || (r.exchange == "BSE" && r.groww_symbol == BSE_SENSEX_GROWW_SYMBOL))
         })
         .map(|r| WatchEntry {
-            exchange: "NSE".to_string(),
+            exchange: r.exchange.clone(),
             segment: "CASH".to_string(),
             exchange_token: r.exchange_token.clone(),
             kind: WatchKind::IndexValue,
+            security_id: stable_index_security_id(&r.groww_symbol),
         })
         .collect();
     entries.sort_by(|a, b| a.exchange_token.cmp(&b.exchange_token));
@@ -288,11 +341,14 @@ fn resolve_stock_entries(
     let mut unresolved = Vec::new();
     for (symbol, isin) in constituents {
         match isin_map.get(isin) {
+            // `token` is guaranteed numeric by `build_isin_token_map`'s filter, so
+            // it is the stock's stored `security_id` directly (parse never 0 here).
             Some(token) => entries.push(WatchEntry {
                 exchange: "NSE".to_string(),
                 segment: "CASH".to_string(),
                 exchange_token: token.clone(),
                 kind: WatchKind::Ltp,
+                security_id: token.parse::<i64>().unwrap_or(0),
             }),
             None => unresolved.push(symbol.clone()),
         }
@@ -329,13 +385,20 @@ fn assemble_watch_set(
     let resolved_stocks = stock_entries.len();
     let indices = index_entries.len();
 
-    // Dedup by (exchange_token, segment): a stock can appear in both the index
-    // and stock lists only by error, and an F&O-underlying may duplicate a
-    // constituent. Indices first so an index token wins its slot deterministically.
-    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    // Dedup by (exchange, exchange_token, segment): a stock can appear in both the
+    // index and stock lists only by error, and an F&O-underlying may duplicate a
+    // constituent. `exchange` is in the key so the BSE SENSEX token `"1"` can never
+    // collide with an NSE stock whose numeric token is also `"1"`. Indices first so
+    // an index token wins its slot deterministically.
+    let mut seen: std::collections::HashSet<(String, String, String)> =
+        std::collections::HashSet::new();
     let mut deduped: Vec<WatchEntry> = Vec::new();
     for entry in index_entries.into_iter().chain(stock_entries) {
-        let key = (entry.exchange_token.clone(), entry.segment.clone());
+        let key = (
+            entry.exchange.clone(),
+            entry.exchange_token.clone(),
+            entry.segment.clone(),
+        );
         if seen.insert(key) {
             deduped.push(entry);
         }
@@ -534,6 +597,25 @@ async fn fetch_text_hardened(
     String::from_utf8(bytes.to_vec()).map_err(|e| WatchBuildError::FetchFailed(e.to_string()))
 }
 
+/// Strict `YYYY-MM-DD` check (digits + dashes only, fixed positions). Used to
+/// guard the watch-file path against traversal: `trading_date_ist` is
+/// concatenated into a filename, so a value like `../../etc/x` MUST be rejected
+/// (defense-in-depth, mirrors `instrument_snapshot::is_valid_trading_date`).
+#[must_use]
+fn is_valid_trading_date(date: &str) -> bool {
+    let b = date.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter().enumerate().all(|(i, &c)| {
+            if i == 4 || i == 7 {
+                c == b'-'
+            } else {
+                c.is_ascii_digit()
+            }
+        })
+}
+
 /// PR-B1 production entry (boot call site): download the Groww master CSV + the
 /// NTM constituent list, resolve the watch set by ISIN, and atomically write the
 /// watch file at `cache_dir/groww-watch-<trading_date>.json`. One attempt; the
@@ -546,6 +628,12 @@ pub async fn build_and_write_groww_watch(
     trading_date_ist: &str,
     max_subscribe: Option<usize>,
 ) -> Result<GrowwWatchSet, WatchBuildError> {
+    // Path-traversal guard: trading_date_ist is concatenated into the filename.
+    if !is_valid_trading_date(trading_date_ist) {
+        return Err(WatchBuildError::WriteFailed(format!(
+            "invalid trading_date_ist (expected YYYY-MM-DD): {trading_date_ist}"
+        )));
+    }
     let client = hardened_client()?;
     info!("groww watch: downloading Groww master instrument.csv");
     let groww_csv = fetch_text_hardened(&client, GROWW_INSTRUMENT_CSV_URL).await?;
@@ -586,6 +674,10 @@ mod tests {
         format!(
             "NSE,{name_token},{name_token},NSE-{name_token},,IDX,CASH,,,,,,,,,,0,0,0,{name_token},0"
         )
+    }
+    /// BSE SENSEX master row: numeric token `1`, groww_symbol `BSE-SENSEX`.
+    fn bse_sensex_row() -> String {
+        "BSE,1,SENSEX,BSE-SENSEX,,IDX,CASH,,,,,,,,,,0,0,0,SENSEX,0".to_string()
     }
 
     #[test]
@@ -665,6 +757,58 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_index_entries_includes_bse_sensex() {
+        let csv = format!(
+            "{HEADER}\n{}\n{}\n{}\n",
+            idx_row("NIFTY"),
+            bse_sensex_row(),
+            // a BSE index that is NOT sensex must be excluded.
+            "BSE,99,BANKEX,BSE-BANKEX,,IDX,CASH,,,,,,,,,,0,0,0,BANKEX,0"
+        );
+        let rows = parse_groww_master(&csv).unwrap();
+        let idx = extract_index_entries(&rows);
+        assert_eq!(
+            idx.len(),
+            2,
+            "NSE NIFTY + BSE SENSEX only (BANKEX excluded)"
+        );
+        let sensex = idx
+            .iter()
+            .find(|e| e.exchange == "BSE")
+            .expect("BSE SENSEX present");
+        assert_eq!(sensex.exchange_token, "1");
+        assert_eq!(sensex.kind, WatchKind::IndexValue);
+        assert_eq!(
+            sensex.security_id,
+            stable_index_security_id("BSE-SENSEX"),
+            "BSE SENSEX uses the Groww-native stable id, not its token `1`"
+        );
+        let nifty = idx
+            .iter()
+            .find(|e| e.exchange == "NSE")
+            .expect("NSE NIFTY present");
+        assert_eq!(nifty.exchange_token, "NIFTY");
+        assert_eq!(nifty.security_id, stable_index_security_id("NSE-NIFTY"));
+    }
+
+    #[test]
+    fn test_stable_index_security_id_is_deterministic_positive_and_distinct() {
+        let nifty = stable_index_security_id("NSE-NIFTY");
+        let sensex = stable_index_security_id("BSE-SENSEX");
+        assert!(nifty > 0 && sensex > 0, "always positive");
+        assert_eq!(
+            nifty,
+            stable_index_security_id("NSE-NIFTY"),
+            "deterministic"
+        );
+        assert_ne!(nifty, sensex, "distinct symbols → distinct ids");
+        // STRUCTURAL disjointness: every index id is in [2^62, 2^63), so it can
+        // never collide with a numeric stock token (which is far below 2^32).
+        assert!(nifty >= INDEX_SECURITY_ID_BIT && sensex >= INDEX_SECURITY_ID_BIT);
+        assert!(nifty > i64::from(u32::MAX) && sensex > i64::from(u32::MAX));
+    }
+
+    #[test]
     fn test_resolve_stock_entries_join_and_unresolved() {
         let mut map = HashMap::new();
         map.insert("INE002A01018".to_string(), "2885".to_string());
@@ -676,6 +820,8 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].exchange_token, "2885");
         assert_eq!(entries[0].kind, WatchKind::Ltp);
+        // Stock security_id is the numeric token itself.
+        assert_eq!(entries[0].security_id, 2885);
         assert_eq!(unresolved, vec!["GHOST".to_string()]);
     }
 
@@ -685,6 +831,7 @@ mod tests {
             segment: "CASH".to_string(),
             exchange_token: token.to_string(),
             kind: WatchKind::Ltp,
+            security_id: token.parse::<i64>().unwrap_or(0),
         }
     }
     fn index_entry(name: &str) -> WatchEntry {
@@ -693,6 +840,7 @@ mod tests {
             segment: "CASH".to_string(),
             exchange_token: name.to_string(),
             kind: WatchKind::IndexValue,
+            security_id: stable_index_security_id(&format!("NSE-{name}")),
         }
     }
 
@@ -767,6 +915,7 @@ mod tests {
         assert!(j.contains("\"exchange_token\":\"2885\""));
         assert!(j.contains("\"kind\":\"ltp\""));
         assert!(j.contains("\"segment\":\"CASH\""));
+        assert!(j.contains("\"security_id\":2885"));
     }
 
     const NTM_CSV: &str = "Company Name,Industry,Symbol,Series,ISIN Code\nReliance Industries,Energy,RELIANCE,EQ,INE002A01018\nInfosys,IT,INFY,EQ,INE009A01021\n";
@@ -862,6 +1011,16 @@ mod tests {
         assert!(json.contains("\"count\": 2"));
         assert!(json.contains("\"exchange_token\": \"2885\""));
         assert!(json.contains("\"kind\": \"index_value\""));
+    }
+
+    #[test]
+    fn test_is_valid_trading_date_rejects_traversal_and_malformed() {
+        assert!(is_valid_trading_date("2026-06-21"));
+        assert!(!is_valid_trading_date("../../etc/passwd"));
+        assert!(!is_valid_trading_date("2026/06/21"));
+        assert!(!is_valid_trading_date("2026-6-21"));
+        assert!(!is_valid_trading_date("2026-06-21x"));
+        assert!(!is_valid_trading_date(""));
     }
 
     #[test]
