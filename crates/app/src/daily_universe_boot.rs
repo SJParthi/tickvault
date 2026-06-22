@@ -254,6 +254,12 @@ where
     let fno_flag_count = i64::try_from(universe.fno_underlying_count()).unwrap_or(i64::MAX);
     let index_constituent_count =
         i64::try_from(universe.index_constituent_count()).unwrap_or(i64::MAX);
+    // ROLE-partition count (mutually-exclusive) for the audit-row invariant
+    // `universe_size == index + underlying + index_constituent`. Distinct from
+    // the flag count above, which includes the FnoUnderlying∩IndexConstituent
+    // overlap and would break the 3-role partition sum.
+    let index_constituent_role_count =
+        i64::try_from(universe.count_by_role(InstrumentRole::IndexConstituent)).unwrap_or(i64::MAX);
 
     // §10 ordering: reconcile FIRST (lifecycle UPSERT/UPDATE + lifecycle
     // audit), then the instrument_fetch_audit terminal-success row. A
@@ -284,6 +290,7 @@ where
         universe_size,
         index_count,
         underlying_count,
+        index_constituent_role_count,
         &source_csv_sha256,
         dry_run,
     )
