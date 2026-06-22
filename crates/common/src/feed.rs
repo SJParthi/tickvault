@@ -67,6 +67,17 @@ impl Feed {
     pub const fn is_runtime_toggleable(self) -> bool {
         matches!(self, Self::Groww | Self::Dhan)
     }
+
+    /// Human-readable display name for operator-facing UI (the feed-control page
+    /// renders its switch label from this — single source, so a future feed's row
+    /// appears with zero page edits).
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Dhan => "Dhan",
+            Self::Groww => "Groww",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -113,5 +124,20 @@ mod tests {
         // Pin the exact wire labels — storage DEDUP keys + the API depend on them.
         assert_eq!(Feed::Dhan.as_str(), "dhan");
         assert_eq!(Feed::Groww.as_str(), "groww");
+    }
+
+    #[test]
+    fn test_every_feed_has_a_non_empty_display_name() {
+        // The feed-control page renders its switch label from display_name; every
+        // feed in ALL must have one so a new feed's row is never blank.
+        for &feed in Feed::ALL {
+            assert!(
+                !feed.display_name().is_empty(),
+                "{} must have a display_name",
+                feed.as_str()
+            );
+        }
+        assert_eq!(Feed::Dhan.display_name(), "Dhan");
+        assert_eq!(Feed::Groww.display_name(), "Groww");
     }
 }
