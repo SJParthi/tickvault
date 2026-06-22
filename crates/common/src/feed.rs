@@ -40,6 +40,22 @@ impl Feed {
     /// future feed cannot be silently dropped from a list (NTM 2→3 lesson).
     pub const ALL: &'static [Feed] = &[Feed::Dhan, Feed::Groww];
 
+    /// The number of feeds — derived from [`Feed::ALL`] so fixed-size per-feed
+    /// arrays (e.g. the live-feed health registry) grow automatically with a new
+    /// feed, no hand-counted length.
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// Dense 0-based index for this feed, for indexing per-feed arrays. Stays in
+    /// lockstep with [`Feed::ALL`] order (pinned by a test). A new feed adds an
+    /// arm here (exhaustive match → compile error if forgotten).
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Dhan => 0,
+            Self::Groww => 1,
+        }
+    }
+
     /// The stable wire-format label (`"dhan"` / `"groww"`). `const fn` so it can
     /// seed `const` label declarations in the storage/core writers.
     #[must_use]
@@ -139,5 +155,21 @@ mod tests {
         }
         assert_eq!(Feed::Dhan.display_name(), "Dhan");
         assert_eq!(Feed::Groww.display_name(), "Groww");
+    }
+
+    #[test]
+    fn test_index_is_dense_and_in_lockstep_with_all() {
+        // index() must be a dense 0..COUNT bijection matching ALL order, so per-feed
+        // arrays indexed by index() line up with Feed::ALL.
+        assert_eq!(Feed::COUNT, Feed::ALL.len());
+        for (i, &feed) in Feed::ALL.iter().enumerate() {
+            assert_eq!(
+                feed.index(),
+                i,
+                "{} index must match ALL order",
+                feed.as_str()
+            );
+            assert!(feed.index() < Feed::COUNT);
+        }
     }
 }
