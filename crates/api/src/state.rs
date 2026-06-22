@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 const QUESTDB_HTTP_CLIENT_TIMEOUT_SECS: u64 = 10;
 
 use tickvault_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
+use tickvault_common::feed_health::FeedHealthRegistry;
 
 // PR #6a (2026-05-19): SharedConstituencyMap + IndexConstituencyMap import RETIRED
 // (4-IDX_I LOCKED_UNIVERSE — NSE index composition not tracked).
@@ -230,6 +231,11 @@ struct AppStateInner {
     /// is shared with the Groww bridge so a `POST /api/feeds/{feed}` toggle is
     /// observed live by the feed lane. Lock-free O(1) reads.
     feed_runtime: Arc<crate::feed_state::FeedRuntimeState>,
+    /// Per-feed live-feed health signals (ticks/candles/drops/connected). The
+    /// SAME `Arc` the feed lanes update, so `GET /api/feeds/health` reports the
+    /// truthful live verdict. Lock-free O(1). The 4/5-arg constructors create a
+    /// fresh empty registry (tests); production injects the boot-shared one.
+    feed_health: Arc<FeedHealthRegistry>,
 }
 
 impl SharedAppState {
@@ -262,6 +268,27 @@ impl SharedAppState {
         health_status: SharedHealthStatus,
         feed_runtime: Arc<crate::feed_state::FeedRuntimeState>,
     ) -> Self {
+        Self::new_with_feed_runtime_and_health(
+            questdb_config,
+            dhan_config,
+            instrument_config,
+            health_status,
+            feed_runtime,
+            Arc::new(FeedHealthRegistry::new()),
+        )
+    }
+
+    /// Creates new shared state, also injecting the boot-shared per-feed
+    /// [`FeedHealthRegistry`] `Arc` (the SAME instance the feed lanes update) so
+    /// `GET /api/feeds/health` reports each feed's truthful live verdict.
+    pub fn new_with_feed_runtime_and_health(
+        questdb_config: QuestDbConfig,
+        dhan_config: DhanConfig,
+        instrument_config: InstrumentConfig,
+        health_status: SharedHealthStatus,
+        feed_runtime: Arc<crate::feed_state::FeedRuntimeState>,
+        feed_health: Arc<FeedHealthRegistry>,
+    ) -> Self {
         // Single shared HTTP client for all QuestDB queries (connection pooling).
         let questdb_http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(
@@ -280,6 +307,7 @@ impl SharedAppState {
                 health_status,
                 questdb_http_client,
                 feed_runtime,
+                feed_health,
             }),
         }
     }
@@ -320,6 +348,12 @@ impl SharedAppState {
     /// Returns the shared runtime per-feed enable/disable state (feed-toggle API).
     pub fn feed_runtime(&self) -> &Arc<crate::feed_state::FeedRuntimeState> {
         &self.inner.feed_runtime
+    }
+
+    /// Returns the shared per-feed live-feed health registry (the lanes update it;
+    /// `GET /api/feeds/health` reads it for the truthful per-feed verdict).
+    pub fn feed_health(&self) -> &Arc<FeedHealthRegistry> {
+        &self.inner.feed_health
     }
 }
 
@@ -411,6 +445,35 @@ mod tests {
         assert!(
             !state.feed_runtime().is_enabled(Feed::Groww),
             "AppState shares the one Arc — a flip is observed through it"
+        );
+    }
+
+    #[test]
+    fn test_new_with_feed_runtime_and_health_exposes_feed_health() {
+        use tickvault_common::feed::Feed;
+        use tickvault_common::feed_health::FeedHealthRegistry;
+        let reg = Arc::new(FeedHealthRegistry::new());
+        reg.set_connected(Feed::Dhan, true);
+        let state = SharedAppState::new_with_feed_runtime_and_health(
+            QuestDbConfig {
+                host: "h".to_string(),
+                http_port: 9000,
+                pg_port: 8812,
+                ilp_port: 9009,
+            },
+            test_dhan_config(),
+            test_instrument_config(),
+            test_health_status(),
+            Arc::new(crate::feed_state::FeedRuntimeState::default()),
+            Arc::clone(&reg),
+        );
+        // feed_health() returns the SAME shared registry — a recorded signal is seen.
+        let r = state
+            .feed_health()
+            .snapshot(Feed::Dhan, true, true, true, 0);
+        assert!(
+            r.input.connected,
+            "AppState shares the one health registry Arc"
         );
     }
 

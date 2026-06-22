@@ -125,6 +125,16 @@ impl FeedRuntimeState {
         self.groww_lane_running.load(Ordering::Relaxed)
     }
 
+    /// Generic per-feed lane-running accessor (Feed::ALL-driven — the health
+    /// endpoint iterates feeds). Exhaustive match → a new feed forces an arm here.
+    #[must_use]
+    pub fn lane_running(&self, feed: Feed) -> bool {
+        match feed {
+            Feed::Dhan => self.is_dhan_lane_running(),
+            Feed::Groww => self.is_groww_lane_running(),
+        }
+    }
+
     /// O(1) lock-free read — does this feed's lane currently run? The Groww
     /// bridge calls this every loop iteration.
     #[must_use]
@@ -324,5 +334,19 @@ mod tests {
         state.mark_groww_lane_running();
         assert!(state.is_groww_lane_running());
         assert!(state.snapshot().groww_lane_running);
+    }
+
+    #[test]
+    fn test_lane_running_generic_accessor_matches_per_feed() {
+        // The Feed::ALL-driven generic accessor must agree with the per-feed ones.
+        let state = FeedRuntimeState::default();
+        assert_eq!(state.lane_running(Feed::Dhan), state.is_dhan_lane_running());
+        assert_eq!(
+            state.lane_running(Feed::Groww),
+            state.is_groww_lane_running()
+        );
+        state.mark_dhan_lane_running();
+        assert!(state.lane_running(Feed::Dhan));
+        assert!(!state.lane_running(Feed::Groww));
     }
 }
