@@ -28,6 +28,7 @@ pub mod disconnect_cause;
 pub mod error;
 pub mod error_code;
 pub mod feed;
+pub mod feed_health;
 pub mod feed_parity;
 pub mod formulas;
 pub mod instrument_registry;
