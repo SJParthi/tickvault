@@ -113,7 +113,7 @@ jobs:
       binary_artifact_name: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.0
 
       - name: Install Rust toolchain (host = aarch64-unknown-linux-musl, static binary)
         # MUSL static target eliminates GLIBC version dependency entirely.
@@ -240,7 +240,7 @@ jobs:
     environment: prod
     steps:
       - name: Checkout (for deploy scripts)
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.0
 
       - name: Download built binary
         uses: actions/download-artifact@v4
