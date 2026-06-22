@@ -96,7 +96,10 @@ const DEDUP_KEY_TICKS: &str = "security_id, segment, capture_seq, feed";
 /// `feed='dhan'`. A future Groww path stamps `'groww'` (operator decision
 /// 2026-06-19 — same `ticks` table, distinguished by `feed`). `&'static str` →
 /// zero-alloc, O(1) symbol write.
-pub const TICK_FEED_DHAN: &str = "dhan";
+// SP1: sourced from the single canonical feed identity (`common::feed::Feed`)
+// instead of a duplicated literal — one source of truth. Value is unchanged
+// ("dhan"), so the DEDUP key + replay-stability guarantee are byte-identical.
+pub const TICK_FEED_DHAN: &str = tickvault_common::feed::Feed::Dhan.as_str();
 
 /// Returns the DEDUP UPSERT KEY string for the ticks table.
 /// Exposed for gap enforcement integration tests (STORAGE-GAP-01).

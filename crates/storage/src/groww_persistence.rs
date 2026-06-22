@@ -55,7 +55,7 @@ pub const SHARED_TICKS_TABLE: &str = "ticks";
 
 /// Broker-source label for Groww rows in the shared `ticks` table. `&'static str`
 /// → zero-alloc, O(1) symbol write. Mirrors `tick_persistence::TICK_FEED_DHAN`.
-pub const GROWW_FEED_LABEL: &str = "groww";
+pub const GROWW_FEED_LABEL: &str = tickvault_common::feed::Feed::Groww.as_str();
 
 /// One Groww live tick ready for ILP write. `ltp` is `f64` (the Groww SDK
 /// emits a native float — no `f32_to_f64_clean` widening concern, which is
