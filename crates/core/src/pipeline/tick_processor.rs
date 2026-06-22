@@ -702,6 +702,14 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     // `DailyUniverse::always_on_segments` via
     // `tickvault_common::always_on::current()`.
     always_on: std::sync::Arc<std::collections::HashSet<(u32, u8)>>,
+    // Live-feed health (SP5, 2026-06-22): the shared per-feed registry the
+    // `GET /api/feeds/health` endpoint reads. When `Some`, every parsed Dhan
+    // tick records its WALL-CLOCK receipt time (IST nanos) into the Dhan slot so
+    // the endpoint reports Dhan's freshness truthfully. `None` (unit tests / any
+    // caller not wiring it) is a no-op — byte-identical to the prior hot path.
+    // A single relaxed-atomic record next to the existing no-tick heartbeat;
+    // O(1), zero-alloc, lock-free (3-agent reviewed CLEAR).
+    feed_health: Option<std::sync::Arc<tickvault_common::feed_health::FeedHealthRegistry>>,
 ) {
     // Grab metric handles once before the hot loop — O(1) per tick after this.
     // These are no-ops if no metrics recorder is installed (e.g., in tests).
@@ -1006,6 +1014,24 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     hb.store(
                         received_at_nanos.saturating_div(1_000_000_000),
                         std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+
+                // Live-feed health (SP5): record this Dhan tick's WALL-CLOCK
+                // receipt time as IST nanos. `received_at_nanos` is UTC nanos
+                // (`current_received_at_nanos`), but the health endpoint's
+                // last-tick-age math compares against `Utc::now()+IST` — so we
+                // add the IST offset for clock-consistency (same convention as
+                // the Groww lane + `received_at` in data-integrity.md). Using UTC
+                // here would read ~5.5h in the future → age saturates to 0 →
+                // permanent false-fresh. `saturating_add` avoids the
+                // debug-build overflow-panic path (security review MEDIUM).
+                // One relaxed-atomic record; O(1), zero-alloc.
+                if let Some(ref fh) = feed_health {
+                    fh.record_tick(
+                        tickvault_common::feed::Feed::Dhan,
+                        received_at_nanos
+                            .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS),
                     );
                 }
 
@@ -1332,6 +1358,24 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     hb.store(
                         received_at_nanos.saturating_div(1_000_000_000),
                         std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+
+                // Live-feed health (SP5): record this Dhan tick's WALL-CLOCK
+                // receipt time as IST nanos. `received_at_nanos` is UTC nanos
+                // (`current_received_at_nanos`), but the health endpoint's
+                // last-tick-age math compares against `Utc::now()+IST` — so we
+                // add the IST offset for clock-consistency (same convention as
+                // the Groww lane + `received_at` in data-integrity.md). Using UTC
+                // here would read ~5.5h in the future → age saturates to 0 →
+                // permanent false-fresh. `saturating_add` avoids the
+                // debug-build overflow-panic path (security review MEDIUM).
+                // One relaxed-atomic record; O(1), zero-alloc.
+                if let Some(ref fh) = feed_health {
+                    fh.record_tick(
+                        tickvault_common::feed::Feed::Dhan,
+                        received_at_nanos
+                            .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS),
                     );
                 }
 
@@ -2009,6 +2053,7 @@ mod tests {
             None, // tick_heartbeat — watchdog not exercised in tests
             None, // tick_enricher — Phase 2.5 enricher unused by these tests; legacy append_tick path covers them
             std::sync::Arc::new(std::collections::HashSet::new()), // §30 always-on: empty in tests
+            None, // SP5 feed_health — registry recording covered by feed_health.rs + the wiring guard
         )
         .await;
     }

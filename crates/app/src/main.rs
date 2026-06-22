@@ -1573,6 +1573,9 @@ async fn main() -> Result<()> {
                 ),
             );
             let _ = fast_registry; // PR #2: instrument_registry was used by deleted movers persistence helpers
+            // SP5: dedicated clone moved into the tick-processor coroutine so the
+            // original `feed_health` Arc stays available for the pool watchdog below.
+            let feed_health_for_processor = std::sync::Arc::clone(&feed_health);
             let handle = tokio::spawn(async move {
                 run_tick_processor(
                     receiver,
@@ -1582,6 +1585,7 @@ async fn main() -> Result<()> {
                     Some(fast_tick_heartbeat),
                     None, // tick_enricher — Phase 2.5 wiring deferred until prev_oi_cache + boot ordering gate land in slow boot
                     tickvault_common::always_on::current(), // §30 GIFT exemption
+                    Some(feed_health_for_processor), // SP5: Dhan live-feed health
                 )
                 .await;
             });
@@ -1645,6 +1649,7 @@ async fn main() -> Result<()> {
                 std::sync::Arc::clone(&shutdown_notify),
                 std::sync::Arc::clone(&fast_notifier),
                 std::sync::Arc::clone(&health_status),
+                Some(std::sync::Arc::clone(&feed_health)), // SP5: Dhan connected state
             );
             // FAST BOOT parity with slow boot (main.rs ~1760):
             // emit per-connection + aggregate Telegram alerts so an operator
@@ -3605,6 +3610,9 @@ async fn main() -> Result<()> {
         );
 
         let _ = slow_registry; // PR #2: instrument_registry was used by deleted movers persistence helpers
+        // SP5: dedicated clone moved into the tick-processor coroutine so the
+        // original `feed_health` Arc stays available for the pool watchdog below.
+        let feed_health_for_processor = std::sync::Arc::clone(&feed_health);
         let handle = tokio::spawn(async move {
             run_tick_processor(
                 receiver,
@@ -3622,6 +3630,7 @@ async fn main() -> Result<()> {
                 // legacy zero/PREMARKET defaults.
                 Some(std::sync::Arc::clone(&tick_enricher)),
                 tickvault_common::always_on::current(), // §30 GIFT exemption
+                Some(feed_health_for_processor),        // SP5: Dhan live-feed health
             )
             .await;
         });
@@ -3688,6 +3697,7 @@ async fn main() -> Result<()> {
             std::sync::Arc::clone(&shutdown_notify),
             std::sync::Arc::clone(&notifier),
             std::sync::Arc::clone(&health_status),
+            Some(std::sync::Arc::clone(&feed_health)), // SP5: Dhan connected state
         );
         // FAST BOOT parity: helper emits per-connection + aggregate Telegram
         // alerts on BOTH boot paths (main.rs ~830 for FAST BOOT, here for slow).
@@ -6111,6 +6121,14 @@ fn spawn_pool_watchdog_task(
     shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
     notifier: std::sync::Arc<NotificationService>,
     health: tickvault_api::state::SharedHealthStatus,
+    // Live-feed health (SP5): the shared per-feed registry the `/api/feeds/health`
+    // endpoint reads. The watchdog already counts `active` Connected sockets every
+    // 5s for the `websocket_connections` gauge; we mirror that into the Dhan
+    // connected slot so the endpoint reports Dhan's connect state truthfully.
+    // `None` is a no-op. Reported always (not market-hours-gated) so the connected
+    // state is honest; the classify() market-hours gate (C1 fix) ensures a
+    // pre-market disconnected Dhan reads "idle", never a false Down.
+    feed_health: Option<std::sync::Arc<tickvault_common::feed_health::FeedHealthRegistry>>,
 ) {
     tokio::spawn(async move {
         // 5-second poll interval — cold path, not per tick. Matches the
@@ -6144,6 +6162,18 @@ fn spawn_pool_watchdog_task(
                         })
                         .count() as u64;
                     health.set_websocket_connections(active);
+
+                    // Live-feed health (SP5): mirror the active-socket count into
+                    // the Dhan connected slot so `/api/feeds/health` reports Dhan
+                    // truthfully. `active > 0` = at least one main-feed socket is
+                    // Connected. Honest at all hours; classify()'s market-hours
+                    // gate keeps pre-market disconnection from reading as Down.
+                    if let Some(ref fh) = feed_health {
+                        fh.set_connected(
+                            tickvault_common::feed::Feed::Dhan,
+                            active > 0,
+                        );
+                    }
 
                     let verdict = pool.poll_watchdog();
                     use tickvault_core::websocket::pool_watchdog::WatchdogVerdict;
