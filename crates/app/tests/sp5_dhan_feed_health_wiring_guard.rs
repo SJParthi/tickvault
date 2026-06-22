@@ -7,6 +7,23 @@
 //! source-scan ratchets that fail the build if any record-site or wiring is
 //! silently removed (the same pattern as `health_counter_fix7_guard.rs`).
 
+//! ## Known gap, explicitly tracked → SP5.1 (NOT silent)
+//!
+//! SP5 wires TWO of the three Dhan health dimensions: **connected** (watchdog
+//! `set_connected`) and **freshness** (`record_tick`). The **drops** dimension
+//! is NOT yet wired for Dhan — `record_drops(Feed::Dhan, …)` belongs at the
+//! storage terminal-loss site (`ws_frame_spill::append` drop-critical arms that
+//! emit `tv_ticks_lost_total`) and `record_candle(Feed::Dhan)` at the Dhan seal
+//! site — both storage-layer changes that need their own signature + boot wiring
+//! + 3-agent review. Until SP5.1 lands, a Dhan feed that is connected + fresh but
+//! dropping ticks under extreme backpressure (QuestDB down + ring + spill + DLQ
+//! all full) would read `ok`, not `degraded`. That scenario is independently
+//! alarmed by AGGREGATOR-DROP-01 / WS-SPILL-02 / `tv_ticks_lost_total` /
+//! QuestDB-disconnect Criticals, so the operator is never blind to the loss —
+//! but the feed light should still flip to `degraded`. SP5.1 closes it.
+//! `test_sp5_1_drops_dimension_pending_is_documented` below pins this gap so the
+//! dead `drops>0` branch for Dhan is EXPLICIT, never silently forgotten.
+
 use std::path::PathBuf;
 
 fn read_app_main() -> String {
@@ -86,5 +103,23 @@ fn test_tick_processor_records_dhan_with_ist_offset() {
         "SP5 clock regression: the Dhan record must convert UTC received_at to IST \
          nanos via saturating_add(IST_UTC_OFFSET_NANOS) so the endpoint's age math \
          (which uses IST now) is consistent. Raw UTC = permanent false-fresh."
+    );
+}
+
+/// Pins the KNOWN, EXPLICIT SP5.1 gap so the `drops>0 → Degraded` branch being
+/// dead for Dhan is documented, never silent (hostile-review HIGH 2026-06-22).
+/// SP5 wires connected + freshness; the drops dimension (`record_drops(Dhan)` at
+/// the `ws_frame_spill` terminal-loss site + `record_candle(Dhan)` at the seal
+/// site) lands in SP5.1. When SP5.1 wires it, this test is updated/removed.
+#[test]
+fn test_sp5_1_drops_dimension_pending_is_documented() {
+    let src = read_tick_processor();
+    // SP5 records ticks for Dhan but NOT drops/candles yet — assert the current
+    // (intended, documented) state so a future reader knows the drops branch is
+    // pending, not forgotten. The module-doc above carries the full rationale.
+    assert!(
+        src.contains("fh.record_tick(") && !src.contains("fh.record_drops("),
+        "SP5.1 landed? If `record_drops(Dhan)` is now wired in the tick path, update \
+         this guard + the module doc — the drops dimension is no longer pending."
     );
 }
