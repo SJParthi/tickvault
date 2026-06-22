@@ -56,7 +56,7 @@ pub const DEDUP_KEY_GROWW_CROSS_VERIFY_1M_AUDIT: &str =
 
 /// Feed-provenance label for the additive `feed` SYMBOL column (operator lock
 /// §32 + 2026-06-19 "all tables"). Every Groww-sourced row carries this.
-pub const GROWW_FEED_LABEL: &str = "groww";
+pub const GROWW_FEED_LABEL: &str = tickvault_common::feed::Feed::Groww.as_str();
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 

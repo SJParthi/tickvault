@@ -50,6 +50,31 @@ pub struct FeedErrorResponse {
     pub allowed: Vec<&'static str>,
 }
 
+/// Every runtime-toggleable feed label, built from the single-source [`Feed::ALL`]
+/// (SP1) so a future feed is automatically included — no hardcoded 2-feed list
+/// (the NTM 2-role→3-role anti-regression lesson). Adding `Feed::X` to `ALL`
+/// surfaces it here with zero edits.
+fn toggleable_feed_labels() -> Vec<&'static str> {
+    Feed::ALL
+        .iter()
+        .copied()
+        .filter(|f| f.is_runtime_toggleable())
+        .map(Feed::as_str)
+        .collect()
+}
+
+/// The feeds that can STILL be disabled while Dhan is safety-locked — every
+/// toggleable feed except Dhan. Also derived from [`Feed::ALL`], so feed#3 is
+/// included automatically.
+fn toggleable_except_dhan_labels() -> Vec<&'static str> {
+    Feed::ALL
+        .iter()
+        .copied()
+        .filter(|f| f.is_runtime_toggleable() && *f != Feed::Dhan)
+        .map(Feed::as_str)
+        .collect()
+}
+
 fn current_status(state: &SharedAppState) -> FeedsStatusResponse {
     let snap = state.feed_runtime().snapshot();
     FeedsStatusResponse {
@@ -79,7 +104,7 @@ pub async fn set_feed(
             StatusCode::BAD_REQUEST,
             Json(FeedErrorResponse {
                 error: format!("unknown feed: {feed_name}"),
-                allowed: vec![Feed::Dhan.as_str(), Feed::Groww.as_str()],
+                allowed: toggleable_feed_labels(),
             }),
         ));
     };
@@ -88,7 +113,7 @@ pub async fn set_feed(
             StatusCode::BAD_REQUEST,
             Json(FeedErrorResponse {
                 error: format!("feed '{}' cannot be toggled at runtime", feed.as_str()),
-                allowed: vec![Feed::Dhan.as_str(), Feed::Groww.as_str()],
+                allowed: toggleable_feed_labels(),
             }),
         ));
     }
@@ -105,7 +130,7 @@ pub async fn set_feed(
                      (orders/positions open) — Dhan can only be turned off in the no-orders \
                      data-pull phase, so the system is never blinded mid-trade"
                     .to_string(),
-                allowed: vec![Feed::Groww.as_str()],
+                allowed: toggleable_except_dhan_labels(),
             }),
         ));
     }

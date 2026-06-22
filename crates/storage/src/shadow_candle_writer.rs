@@ -64,7 +64,9 @@ fn build_ilp_conf_string(host: &str, ilp_port: u16) -> String {
 /// are BOTH kept by the `DEDUP_KEY_CANDLES` 4-column key — distinct broker
 /// feeds are distinct observations, never a duplicate. A `&'static str`
 /// constant: zero-alloc, O(1), replay-stable (never per-row computed).
-pub const CANDLE_FEED_DHAN: &str = "dhan";
+// SP1: sourced from the single canonical feed identity (`common::feed::Feed`).
+// Value unchanged ("dhan") → DEDUP key + replay-stability byte-identical.
+pub const CANDLE_FEED_DHAN: &str = tickvault_common::feed::Feed::Dhan.as_str();
 
 /// ILP writer for the 21 plain `candles_<tf>` tables.
 ///
