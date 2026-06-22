@@ -136,28 +136,34 @@ fn classify(i: FeedHealthInput) -> (FeedHealthVerdict, &'static str) {
     if !i.instrumented {
         return (Unknown, "feed health signals not instrumented yet");
     }
-    // Enabled + lane running, but the socket is down → not delivering.
-    if !i.connected {
-        return (Down, "enabled but disconnected — reconnecting");
-    }
-    // Ticks are being dropped → degraded even if still flowing.
+    // Ticks being dropped is a fault at ANY time — the cumulative drop count
+    // reflects a real problem that happened today (checked before the
+    // market-hours gate so a post-close report still surfaces today's drops).
     if i.drops_total > 0 {
         return (Degraded, "ticks are being dropped — investigate spill/DB");
     }
-    // During market hours, silence past the stale threshold (or never a tick) is
-    // a real fault — the feed is connected but delivering nothing.
-    if i.market_open {
-        match i.last_tick_age_secs {
-            None => return (Down, "connected but no ticks received yet"),
-            Some(age) if age > FEED_STALE_TICK_SECS => {
-                return (Down, "connected but ticks have gone silent");
-            }
-            Some(_) => {}
-        }
-        return (Ok, "live — ticks flowing, no loss");
+    // C1 fix (hostile 3-agent review 2026-06-22): the market-open gate MUST
+    // precede the connected/last-tick checks. Outside market hours the feed
+    // legitimately sleeps + disconnects (the WS pool sleeps-until-open by design)
+    // and goes silent — that is EXPECTED, never a fault. Reporting Down
+    // pre-market (when the pool watchdog has pushed connected=false BEFORE the
+    // pool connects) would be a false-RED — the mirror of the no-false-OK rule.
+    // Idle outside market hours = Ok.
+    if !i.market_open {
+        return (Ok, "market closed — idle is normal");
     }
-    // Outside market hours: connected + no drops is healthy; silence is expected.
-    (Ok, "connected — market closed, idle is normal")
+    // --- Market hours below: silence / disconnection IS a real fault. ---
+    // Enabled + lane running + instrumented, but the socket is down → not delivering.
+    if !i.connected {
+        return (Down, "enabled but disconnected — reconnecting");
+    }
+    // Silence past the stale threshold (or never a tick) is a real fault — the
+    // feed is connected but delivering nothing.
+    match i.last_tick_age_secs {
+        None => (Down, "connected but no ticks received yet"),
+        Some(age) if age > FEED_STALE_TICK_SECS => (Down, "connected but ticks have gone silent"),
+        Some(_) => (Ok, "live — ticks flowing, no loss"),
+    }
 }
 
 /// Shared, lock-free per-feed live-signal registry. The feed lanes UPDATE it as
@@ -408,6 +414,29 @@ mod tests {
     }
 
     #[test]
+    fn test_disconnected_outside_market_hours_is_not_down() {
+        // C1 fix (2026-06-22): pre-market / post-close the WS pool legitimately
+        // sleeps + disconnects, so the watchdog pushes connected=false BEFORE the
+        // pool connects. That must NOT read as a scary Down — idle outside market
+        // hours is expected, not a fault. (Same input that IS Down during market
+        // hours via test_registry_disconnected_is_down.)
+        let r = evaluate_feed_health(
+            Feed::Dhan,
+            FeedHealthInput {
+                connected: false,
+                last_tick_age_secs: None,
+                market_open: false,
+                ..base()
+            },
+        );
+        assert_eq!(
+            r.verdict,
+            FeedHealthVerdict::Ok,
+            "disconnected outside market hours is idle, not a false-RED"
+        );
+    }
+
+    #[test]
     fn test_disabled_takes_priority_over_everything() {
         // Off + disconnected + no ticks → still reported as the intentional
         // Disabled, never a scary Down.
@@ -492,6 +521,25 @@ mod tests {
             "Groww slot untouched by Dhan writes"
         );
         assert_eq!(g.input.drops_total, 0);
+    }
+
+    #[test]
+    fn test_registry_unknown_until_first_dhan_signal_then_resolves() {
+        // SP5: before any Dhan lane signal, a fresh registry slot is NOT
+        // instrumented → Unknown (never a false Down), even during market hours.
+        let reg = FeedHealthRegistry::new();
+        let pre = reg.snapshot(Feed::Dhan, true, true, true, T0);
+        assert_eq!(
+            pre.verdict,
+            FeedHealthVerdict::Unknown,
+            "un-wired Dhan slot is Unknown, not a false Down"
+        );
+        // The instant the watchdog reports connected + a tick lands, it resolves
+        // to a real verdict.
+        reg.set_connected(Feed::Dhan, true);
+        reg.record_tick(Feed::Dhan, T0);
+        let post = reg.snapshot(Feed::Dhan, true, true, true, T0 + 2 * 1_000_000_000);
+        assert_eq!(post.verdict, FeedHealthVerdict::Ok);
     }
 
     #[test]
