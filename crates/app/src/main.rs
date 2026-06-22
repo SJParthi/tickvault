@@ -703,7 +703,12 @@ async fn main() -> Result<()> {
                 dir = %ws_wal_dir,
                 "STAGE-C: WsFrameSpill writer thread started"
             );
-            Some(std::sync::Arc::new(spill))
+            // SP5.1: attach the per-feed health registry so a terminal Dhan
+            // live-feed frame drop surfaces as `Degraded` on /api/feeds/health
+            // (closes the SP5 connected+fresh-but-dropping false-OK).
+            Some(std::sync::Arc::new(
+                spill.with_feed_health(Some(std::sync::Arc::clone(&feed_health))),
+            ))
         }
         Err(err) => {
             error!(
