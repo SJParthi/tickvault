@@ -114,7 +114,7 @@ sha2 = "0.11.0"
 
 # ---- Section 12: System & Resilience ----
 core_affinity = "0.8.3"
-memmap2 = "0.9.10"
+memmap2 = "0.9.11"
 notify = "8.2.0"
 # signal-hook-tokio removed in S11 — dead dep with zero references across
 # crates/ and fuzz/. signal-hook itself is kept because crates/app/Cargo.toml
