@@ -45,6 +45,12 @@ pub enum FeedHealthVerdict {
     Degraded,
     /// Enabled but NOT delivering — socket down, or silent during market hours.
     Down,
+    /// Enabled + lane running, but this feed's health signals are NOT instrumented
+    /// yet (no lane has ever reported a tick/connect for it). Honest "we don't
+    /// know" — NOT a false `Down`. Prevents a healthy-but-unwired feed (e.g. a feed
+    /// whose record-sites haven't landed) from showing a scary red. Resolves to a
+    /// real verdict the instant the lane reports its first signal.
+    Unknown,
 }
 
 impl FeedHealthVerdict {
@@ -56,6 +62,7 @@ impl FeedHealthVerdict {
             Self::Ok => "ok",
             Self::Degraded => "degraded",
             Self::Down => "down",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -79,6 +86,11 @@ pub struct FeedHealthInput {
     pub drops_total: u64,
     /// Whether the market is currently open (silence is only a fault when open).
     pub market_open: bool,
+    /// Whether this feed's health signals are instrumented — `true` once any lane
+    /// has reported a tick/candle/drop/connect for it. `false` → the lane's
+    /// record-sites aren't wired yet, so the verdict is `Unknown`, NOT a false
+    /// `Down`. Prevents a healthy-but-unwired feed from showing red.
+    pub instrumented: bool,
 }
 
 /// The per-feed health verdict + the signals it was computed from (so the API can
@@ -105,7 +117,7 @@ pub fn evaluate_feed_health(feed: Feed, input: FeedHealthInput) -> FeedHealthRep
 }
 
 fn classify(i: FeedHealthInput) -> (FeedHealthVerdict, &'static str) {
-    use FeedHealthVerdict::{Degraded, Disabled, Down, Ok};
+    use FeedHealthVerdict::{Degraded, Disabled, Down, Ok, Unknown};
 
     // Switched off by the operator — intentional, the highest-priority state.
     if !i.enabled {
@@ -115,6 +127,14 @@ fn classify(i: FeedHealthInput) -> (FeedHealthVerdict, &'static str) {
     // takes no effect until config + restart (honest, not a silent green).
     if !i.lane_running {
         return (Degraded, "enabled, but the feed was not started at boot");
+    }
+    // Enabled + lane running, but this feed has never reported a health signal —
+    // its record-sites aren't wired yet. Honest "unknown", NOT a false Down (the
+    // feed may be perfectly healthy; we just aren't instrumenting it yet). The
+    // instant the lane reports its first tick/connect, this resolves to a real
+    // verdict below.
+    if !i.instrumented {
+        return (Unknown, "feed health signals not instrumented yet");
     }
     // Enabled + lane running, but the socket is down → not delivering.
     if !i.connected {
@@ -156,6 +176,9 @@ pub struct FeedHealthRegistry {
     candles_total: [AtomicU64; Feed::COUNT],
     drops_total: [AtomicU64; Feed::COUNT],
     connected: [AtomicBool; Feed::COUNT],
+    /// Set `true` the first time ANY signal is recorded for a feed — so an
+    /// un-wired feed reports `Unknown`, never a false `Down`.
+    instrumented: [AtomicBool; Feed::COUNT],
 }
 
 impl Default for FeedHealthRegistry {
@@ -173,7 +196,14 @@ impl FeedHealthRegistry {
             candles_total: std::array::from_fn(|_| AtomicU64::new(0)),
             drops_total: std::array::from_fn(|_| AtomicU64::new(0)),
             connected: std::array::from_fn(|_| AtomicBool::new(false)),
+            instrumented: std::array::from_fn(|_| AtomicBool::new(false)),
         }
+    }
+
+    /// Mark a feed as instrumented (its lane has reported at least one signal). O(1).
+    #[inline]
+    fn mark_instrumented(&self, i: usize) {
+        self.instrumented[i].store(true, Ordering::Relaxed);
     }
 
     /// Record one captured tick for `feed` at IST-nanos `ts`. Hot-path O(1).
@@ -181,21 +211,28 @@ impl FeedHealthRegistry {
         let i = feed.index();
         self.last_tick_ist_nanos[i].store(ts_ist_nanos, Ordering::Relaxed);
         self.ticks_total[i].fetch_add(1, Ordering::Relaxed);
+        self.mark_instrumented(i);
     }
 
     /// Record one sealed candle for `feed`. O(1).
     pub fn record_candle(&self, feed: Feed) {
-        self.candles_total[feed.index()].fetch_add(1, Ordering::Relaxed);
+        let i = feed.index();
+        self.candles_total[i].fetch_add(1, Ordering::Relaxed);
+        self.mark_instrumented(i);
     }
 
     /// Record `n` dropped ticks for `feed` (any tier). O(1).
     pub fn record_drops(&self, feed: Feed, n: u64) {
-        self.drops_total[feed.index()].fetch_add(n, Ordering::Relaxed);
+        let i = feed.index();
+        self.drops_total[i].fetch_add(n, Ordering::Relaxed);
+        self.mark_instrumented(i);
     }
 
     /// Set `feed`'s socket/source connected state. O(1).
     pub fn set_connected(&self, feed: Feed, connected: bool) {
-        self.connected[feed.index()].store(connected, Ordering::Relaxed);
+        let i = feed.index();
+        self.connected[i].store(connected, Ordering::Relaxed);
+        self.mark_instrumented(i);
     }
 
     /// Build `feed`'s truthful health report from the live signals + the
@@ -227,6 +264,7 @@ impl FeedHealthRegistry {
             candles_total: self.candles_total[i].load(Ordering::Relaxed),
             drops_total: self.drops_total[i].load(Ordering::Relaxed),
             market_open,
+            instrumented: self.instrumented[i].load(Ordering::Relaxed),
         };
         evaluate_feed_health(feed, input)
     }
@@ -246,6 +284,7 @@ mod tests {
             candles_total: 10,
             drops_total: 0,
             market_open: true,
+            instrumented: true,
         }
     }
 
@@ -269,6 +308,25 @@ mod tests {
         );
         assert_eq!(r.verdict, FeedHealthVerdict::Disabled);
         assert_eq!(r.verdict.as_str(), "disabled");
+    }
+
+    #[test]
+    fn test_unknown_when_enabled_lane_running_but_not_instrumented() {
+        // Dhan is enabled + lane running, but the feed-health signals are not
+        // yet wired into the Dhan tick/candle path. We must report Unknown,
+        // NOT Down — a missing instrumentation hook is not a feed fault.
+        let r = evaluate_feed_health(
+            Feed::Dhan,
+            FeedHealthInput {
+                instrumented: false,
+                ticks_total: 0,
+                candles_total: 0,
+                last_tick_age_secs: None,
+                ..base()
+            },
+        );
+        assert_eq!(r.verdict, FeedHealthVerdict::Unknown);
+        assert_eq!(r.verdict.as_str(), "unknown");
     }
 
     #[test]
