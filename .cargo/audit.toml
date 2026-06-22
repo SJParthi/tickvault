@@ -24,5 +24,16 @@
 # =============================================================================
 
 [advisories]
-ignore = []
+ignore = [
+    # 2026-06-22 — RUSTSEC-2026-0185 (quinn-proto 0.11.14, HIGH 7.5, QUIC remote
+    # memory exhaustion). UNREACHABLE in our binary: quinn/quinn-proto are pulled
+    # ONLY by reqwest's optional `http3` feature, which we do NOT enable (reqwest
+    # features = json/rustls/charset/http2/query, default-features = false). It is
+    # a phantom Cargo.lock entry — never compiled, so the QUIC stream-reassembly
+    # code can never run. `cargo tree -i quinn-proto -e normal,build` = empty.
+    # Removal condition: drop this once the lock is bumped to quinn-proto >= 0.11.15
+    # in a maintenance sweep (the bump needs `cargo update`, blocked by the local
+    # hook; a follow-up carries it). Full reason mirrored in deny.toml.
+    "RUSTSEC-2026-0185",
+]
 
