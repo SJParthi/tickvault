@@ -4,6 +4,31 @@
 **Date:** 2026-06-22
 **Approved by:** Parthiban (standing approval — "go ahead dude as per the plan", serial SP sequence)
 
+## Per-Item Guarantee Matrix
+
+See `.claude/rules/project/per-wave-guarantee-matrix.md` — all **15 rows** of the
+100% guarantee matrix and all **7 rows** of the resilience demand matrix apply to
+every item in this plan. SP5-specific bindings:
+- **Code/testing coverage:** classify reorder + registry transition tests + the
+  source-scan wiring guard (`sp5_dhan_feed_health_wiring_guard.rs`); core 2149 /
+  app 640 / feed_health 19 green.
+- **Performance / O(1):** 3 relaxed atomics per tick, zero-alloc, lock-free
+  (hot-path-reviewer CLEAR); `feed_health = None` keeps the Dhan hot path
+  byte-identical.
+- **Zero ticks lost / WS resilience:** additive only — no new tick-drop path, no
+  change to ring→spill→DLQ or `SubscribeRxGuard`; the C1 fix removes a false-RED,
+  never suppresses a real fault.
+- **Uniqueness/dedup:** per-feed atomic-array isolation (I-P1-11 per-feed slot);
+  no QuestDB key touched.
+- **Monitoring/logging/alerting/audit/review:** the verdict surfaces on
+  `GET /api/feeds/health`; adversarial 3-agent review run BEFORE impl (hot-path
+  CLEAR, security 1 MEDIUM applied, hostile CRITICAL C1 fixed).
+
+**Honest 100% claim:** 100% inside the tested envelope, with ratcheted regression
+coverage (`sp5_dhan_feed_health_wiring_guard.rs` + the classify/registry tests);
+`feed_health = None` keeps the Dhan hot path byte-identical, and beyond the
+envelope an un-wired feed honestly reports `unknown` (never a false green or red).
+
 ## Design
 
 SP1–SP4 built the truthful per-feed health engine + registry + `GET /api/feeds/health`,
