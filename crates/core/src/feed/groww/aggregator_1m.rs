@@ -29,10 +29,17 @@
 
 use std::collections::HashMap;
 
+use tickvault_common::candle_fold::{
+    FoldOutcome, FoldStrategy, FoldedCandle, LatePolicy, OneMinFoldCell,
+};
 use tickvault_common::types::ExchangeSegment;
 
-/// Nanoseconds in one minute — the candle bucket width.
-const NANOS_PER_MINUTE: i64 = 60_000_000_000;
+/// SP3b: Groww folds through the COMMON cell with the Discard late policy (Groww
+/// drops out-of-order ticks; it never re-folds a sealed minute). One source of
+/// truth for the fold logic — see `tickvault_common::candle_fold`.
+const GROWW_FOLD_STRATEGY: FoldStrategy = FoldStrategy {
+    late_policy: LatePolicy::Discard,
+};
 
 /// A normalised Groww live tick fed into the aggregator. `cum_volume` is the
 /// cumulative day volume (Groww semantics); `ltp` is the last traded price.
@@ -62,53 +69,38 @@ pub struct Groww1mCandle {
     pub tick_count: i64,
 }
 
-/// The open (in-progress) bucket for one instrument.
-#[derive(Clone, Copy, Debug)]
-struct MinuteBucket {
-    minute_start_nanos: i64,
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
-    /// Cumulative volume at the close of the PREVIOUS minute (or this minute's
-    /// first tick for the very first bucket) — the per-minute volume baseline.
-    baseline_cum_volume: i64,
-    last_cum_volume: i64,
-    tick_count: i64,
+/// Floors an IST-nanos timestamp to its minute boundary. O(1). Re-exported from
+/// the common fold cell so the Groww module's public API is unchanged (SP3b).
+#[must_use]
+pub fn floor_to_minute_nanos(ts_ist_nanos: i64) -> i64 {
+    tickvault_common::candle_fold::floor_to_minute_nanos(ts_ist_nanos)
 }
 
-impl MinuteBucket {
-    fn seal(&self, security_id: i64, segment: ExchangeSegment) -> Groww1mCandle {
-        Groww1mCandle {
-            security_id,
-            segment,
-            minute_start_ist_nanos: self.minute_start_nanos,
-            open: self.open,
-            high: self.high,
-            low: self.low,
-            close: self.close,
-            volume: self
-                .last_cum_volume
-                .saturating_sub(self.baseline_cum_volume)
-                .max(0),
-            tick_count: self.tick_count,
-        }
+/// Attach the instrument identity to a common [`FoldedCandle`].
+#[inline]
+fn to_groww_candle(security_id: i64, segment: ExchangeSegment, c: FoldedCandle) -> Groww1mCandle {
+    Groww1mCandle {
+        security_id,
+        segment,
+        minute_start_ist_nanos: c.minute_start_ist_nanos,
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+        volume: c.volume,
+        tick_count: c.tick_count,
     }
 }
 
-/// Floors an IST-nanos timestamp to its minute boundary. O(1).
-#[must_use]
-pub fn floor_to_minute_nanos(ts_ist_nanos: i64) -> i64 {
-    ts_ist_nanos - ts_ist_nanos.rem_euclid(NANOS_PER_MINUTE)
-}
-
-/// In-memory 1-minute candle aggregator for the Groww feed. One open bucket per
-/// `(security_id, segment)`. O(1) per tick.
+/// In-memory 1-minute candle aggregator for the Groww feed. One open
+/// [`OneMinFoldCell`] (the COMMON fold cell, SP3b) per `(security_id, segment)`.
+/// O(1) per tick. The fold logic now lives in `tickvault_common::candle_fold` —
+/// this is the thin per-feed container that holds the cells + the Discard policy.
 #[derive(Debug, Default)]
 pub struct Groww1mAggregator {
     // Composite `(security_id, segment)` key per I-P1-11 (segment-aware) — never
     // `security_id` alone.
-    buckets: HashMap<(i64, ExchangeSegment), MinuteBucket>,
+    cells: HashMap<(i64, ExchangeSegment), OneMinFoldCell>,
     late_ticks: u64,
 }
 
@@ -116,52 +108,62 @@ impl Groww1mAggregator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            buckets: HashMap::new(),
+            cells: HashMap::new(),
             late_ticks: 0,
         }
     }
 
-    /// Fold one tick. Returns a sealed [`Groww1mCandle`] when this tick crosses
-    /// into a new minute for that instrument (sealing the prior minute); `None`
-    /// otherwise (folded in place, or discarded as late). O(1).
+    /// Fold one tick through the common cell. Returns a sealed [`Groww1mCandle`]
+    /// when this tick crosses into a new minute for that instrument; `None`
+    /// otherwise (folded in place, or discarded as late under the Discard policy).
+    /// O(1).
     pub fn on_tick(&mut self, tick: &Groww1mTick) -> Option<Groww1mCandle> {
-        let minute_start = floor_to_minute_nanos(tick.ts_ist_nanos);
         let key = (tick.security_id, tick.segment);
-
-        match self.buckets.get_mut(&key) {
+        match self.cells.get_mut(&key) {
             None => {
-                self.buckets
-                    .insert(key, new_bucket(tick, minute_start, tick.cum_volume));
+                // First tick for this instrument — baseline = its own cumulative
+                // (in-minute delta), matching the prior aggregator semantics.
+                self.cells.insert(
+                    key,
+                    OneMinFoldCell::new(
+                        tick.ts_ist_nanos,
+                        tick.ltp,
+                        tick.cum_volume,
+                        tick.cum_volume,
+                    ),
+                );
                 None
             }
-            Some(bucket) => {
-                if minute_start == bucket.minute_start_nanos {
-                    bucket.high = bucket.high.max(tick.ltp);
-                    bucket.low = bucket.low.min(tick.ltp);
-                    bucket.close = tick.ltp;
-                    bucket.last_cum_volume = tick.cum_volume;
-                    bucket.tick_count = bucket.tick_count.saturating_add(1);
-                    None
-                } else if minute_start > bucket.minute_start_nanos {
-                    let candle = bucket.seal(tick.security_id, tick.segment);
-                    // New minute baseline = the sealed minute's closing cumulative.
-                    *bucket = new_bucket(tick, minute_start, bucket.last_cum_volume);
-                    Some(candle)
-                } else {
-                    // Earlier minute than the open bucket → out-of-order/late.
-                    self.late_ticks = self.late_ticks.saturating_add(1);
-                    None
+            Some(cell) => {
+                match cell.consume(
+                    tick.ts_ist_nanos,
+                    tick.ltp,
+                    tick.cum_volume,
+                    GROWW_FOLD_STRATEGY,
+                ) {
+                    FoldOutcome::Updated => None,
+                    FoldOutcome::Sealed(c) => {
+                        Some(to_groww_candle(tick.security_id, tick.segment, c))
+                    }
+                    // Discard policy never amends, but map defensively for totality.
+                    FoldOutcome::AmendedLate(c) => {
+                        Some(to_groww_candle(tick.security_id, tick.segment, c))
+                    }
+                    FoldOutcome::Discarded => {
+                        self.late_ticks = self.late_ticks.saturating_add(1);
+                        None
+                    }
                 }
             }
         }
     }
 
-    /// Seals and drains every open bucket (e.g. at session end / IST midnight),
+    /// Seals and drains every open cell (e.g. at session end / IST midnight),
     /// returning their candles. O(n) over open instruments. Order unspecified.
     pub fn force_seal_all(&mut self) -> Vec<Groww1mCandle> {
-        let mut out = Vec::with_capacity(self.buckets.len());
-        for ((security_id, segment), bucket) in self.buckets.drain() {
-            out.push(bucket.seal(security_id, segment));
+        let mut out = Vec::with_capacity(self.cells.len());
+        for ((security_id, segment), cell) in self.cells.drain() {
+            out.push(to_groww_candle(security_id, segment, cell.snapshot()));
         }
         out
     }
@@ -172,32 +174,17 @@ impl Groww1mAggregator {
         self.late_ticks
     }
 
-    /// Number of instruments with an open (unsealed) bucket (observability).
+    /// Number of instruments with an open (unsealed) cell (observability).
     #[must_use]
     pub fn open_bucket_count(&self) -> usize {
-        self.buckets.len()
-    }
-}
-
-/// Builds a fresh single-tick bucket. `baseline_cum_volume` is the per-minute
-/// volume baseline (prior minute's closing cumulative, or this tick's cumulative
-/// for an instrument's first bucket).
-fn new_bucket(tick: &Groww1mTick, minute_start: i64, baseline_cum_volume: i64) -> MinuteBucket {
-    MinuteBucket {
-        minute_start_nanos: minute_start,
-        open: tick.ltp,
-        high: tick.ltp,
-        low: tick.ltp,
-        close: tick.ltp,
-        baseline_cum_volume,
-        last_cum_volume: tick.cum_volume,
-        tick_count: 1,
+        self.cells.len()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tickvault_common::candle_fold::NANOS_PER_MINUTE;
 
     const M1: i64 = 1_780_000_020_000_000_000; // some minute-aligned ts
     const SEG: ExchangeSegment = ExchangeSegment::NseEquity;
