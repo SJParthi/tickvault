@@ -177,12 +177,15 @@ pub async fn set_feed(
 #[derive(Debug, Serialize)]
 pub struct FeedHealthRow {
     pub feed: &'static str,
-    /// `ok` / `degraded` / `down` / `disabled`.
+    /// `ok` / `degraded` / `down` / `disabled` / `unknown`.
     pub verdict: &'static str,
     pub reason: &'static str,
     pub enabled: bool,
     pub lane_running: bool,
     pub connected: bool,
+    /// `true` once this feed's lane has reported any health signal. `false` →
+    /// the verdict is `unknown` (record-sites not wired yet), NOT a real fault.
+    pub instrumented: bool,
     /// Seconds since the last tick; `null` = none yet.
     pub last_tick_age_secs: Option<u64>,
     pub ticks_total: u64,
@@ -239,6 +242,7 @@ pub async fn get_feeds_health(State(state): State<SharedAppState>) -> Json<Feeds
                 ticks_total: report.input.ticks_total,
                 candles_total: report.input.candles_total,
                 drops_total: report.input.drops_total,
+                instrumented: report.input.instrumented,
             }
         })
         .collect();

@@ -177,6 +177,19 @@ fn validate_groww_tick(parsed: &ParsedGrowwTick) -> Result<(), GrowwTickReject> 
     Ok(())
 }
 
+/// Wall-clock receipt time in IST epoch nanos (`Utc::now()` + IST offset) — the
+/// instant WE captured a tick. Used ONLY for live-feed-health last-tick-age math
+/// so it is consistent with the `/api/feeds/health` endpoint's clock; never used
+/// for persistence (rows keep the exchange `ts_ist_nanos`). A clock read that
+/// somehow fails saturates to 0 (treated as "very old" — fails safe toward Down,
+/// never a false Ok).
+fn receipt_ist_nanos() -> i64 {
+    chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or(0)
+        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS)
+}
+
 /// Builds the shared `ticks` (feed='groww') row for a parsed tick. `capture_seq`
 /// is the monotonic, replay-stable dedup tiebreaker (TICK-SEQ-01). Pure + testable.
 fn live_tick_row(parsed: &ParsedGrowwTick, capture_seq: i64) -> GrowwLiveTickRow {
@@ -377,7 +390,12 @@ pub async fn run_groww_bridge(
             } else {
                 wrote_live = true;
                 // Live-feed health: a Groww tick was captured (O(1) atomic).
-                feed_health.record_tick(Feed::Groww, parsed.tick.ts_ist_nanos);
+                // Record WALL-CLOCK receipt time, NOT the exchange ts — the
+                // health verdict's last-tick-age math compares against the
+                // endpoint's `Utc::now()+IST` clock, so a stale/replayed
+                // exchange ts (or any exchange-vs-host clock skew) must not be
+                // read as "feed silent". Receipt time = when WE saw the tick.
+                feed_health.record_tick(Feed::Groww, receipt_ist_nanos());
             }
             if let Some(candle) = aggregator.on_tick(&parsed.tick) {
                 if let Err(err) = candle_writer.append_row(&candle_row_from_aggregated(&candle)) {
@@ -411,6 +429,17 @@ mod tests {
     use super::*;
 
     const LINE: &str = r#"{"security_id":1333,"segment":"NSE_EQ","ts_ist_nanos":1780000020123000000,"exchange_ts_millis":1780000020123,"ltp":2847.55,"cum_volume":123456}"#;
+
+    #[test]
+    fn test_receipt_ist_nanos_is_recent_and_in_ist_window() {
+        // Receipt clock must be a plausible "now" in IST nanos (2020..2100) so the
+        // health last-tick-age math is well-formed — never 0/negative/absurd.
+        let now = receipt_ist_nanos();
+        assert!(
+            (MIN_PLAUSIBLE_TS_IST_NANOS..=MAX_PLAUSIBLE_TS_IST_NANOS).contains(&now),
+            "receipt clock {now} outside plausible IST window"
+        );
+    }
 
     #[test]
     fn test_segment_from_str_known_and_unknown() {
