@@ -117,9 +117,21 @@ SP5 adds Dhan's two record-sites to that common engine — no parallel logic.
   `unknown` → `ok`/`down` (connected + last-tick age) and `ticks_total` climbs.
 - No new Prometheus counter needed (the registry IS the observability surface read
   by the endpoint); the existing `tv_websocket_connections` gauge is untouched.
-- Honest envelope: SP5 makes Dhan's light truthful for connect + freshness; drops
-  attribution (`record_drops(Dhan, …)`) is a later optional slice — until then Dhan
-  `drops_total` stays 0 (no false green: a silent/disconnected Dhan still reads Down).
+- Honest envelope (corrected after the after-impl hostile review, HIGH): SP5 makes
+  Dhan's light truthful for the **connect + freshness** dimensions. The **drops**
+  dimension is NOT yet wired for Dhan (`record_drops(Dhan)` belongs at the storage
+  terminal-loss site `ws_frame_spill::append`; `record_candle(Dhan)` at the Dhan
+  seal site — both storage changes needing their own review). **Known gap → SP5.1:**
+  until then, a Dhan feed that is connected + fresh but dropping ticks under extreme
+  backpressure (QuestDB down + ring + spill + DLQ all full) would read `ok`, not
+  `degraded`. That catastrophic scenario is independently alarmed by
+  AGGREGATOR-DROP-01 / WS-SPILL-02 / `tv_ticks_lost_total` / QuestDB-disconnect
+  Criticals, so the operator is never blind to the loss — but the feed light should
+  still flip `degraded`, which SP5.1 wires. The gap is pinned explicitly by
+  `sp5_dhan_feed_health_wiring_guard::test_sp5_1_drops_dimension_pending_is_documented`
+  so the dead `drops>0` branch for Dhan is never silently forgotten. SP5 remains a
+  strict improvement over the prior `unknown` (no connect/freshness false-OK or
+  false-RED; the drops dimension is explicitly pending, not falsely claimed green).
 
 ## Adversarial 3-agent review (BEFORE impl)
 
