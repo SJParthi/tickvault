@@ -19,6 +19,8 @@
 
 use axum::http::header;
 use axum::response::{Html, IntoResponse};
+use serde::Serialize;
+use tickvault_common::feed::Feed;
 
 /// Content-Security-Policy for the page (security-review LOW/MEDIUM): same-origin
 /// only, inline script/style allowed (the page is one self-contained file with no
@@ -88,14 +90,11 @@ const FEEDS_PAGE_HTML: &str = r#"<!DOCTYPE html>
   <div id="status"></div>
 
 <script>
-// Feed descriptors. Add a row here when the API reports a new feed.
-// toggleable=false would render a read-only switch; both feeds are toggleable now.
-const FEEDS = [
-  { key: "dhan",  label: "Dhan",  toggleable: true,
-    note: "Primary feed — turn on/off live. (Off disconnects the live feed + stops storing ticks; on reconnects + re-subscribes.)" },
-  { key: "groww", label: "Groww", toggleable: true,
-    note: "Second feed — pause/resume live." },
-];
+// Feed descriptors — SERVER-RENDERED from common::feed::Feed::ALL (the single
+// source). Adding a feed to the enum makes its switch appear here with ZERO page
+// edits (operator: "no static, always dynamic"). JSON-injected (serde) so values
+// are escape-safe; the DOM render below still uses textContent (XSS-proof).
+const FEEDS = __TV_FEEDS_JSON__;
 
 const tokenEl  = document.getElementById("token");
 const feedsEl  = document.getElementById("feeds");
@@ -144,7 +143,9 @@ function render(data) {
   feedsEl.replaceChildren();
   for (const f of FEEDS) {
     const enabled = !!data[f.key + "_enabled"];
-    const laneStalled = (f.key === "groww" && enabled && data.groww_lane_running === false);
+    // Generic per-feed lane-stalled honesty (dynamic — no hardcoded feed name):
+    // enabled in the API but the lane was not spawned at boot.
+    const laneStalled = (enabled && data[f.key + "_lane_running"] === false);
     const row = document.createElement("div");
     row.className = "feed";
 
@@ -216,17 +217,69 @@ refresh();
 </html>
 "#;
 
+/// Placeholder in [`FEEDS_PAGE_HTML`] replaced at render time with the JSON feed
+/// descriptor array built from [`Feed::ALL`].
+const FEEDS_JSON_MARKER: &str = "__TV_FEEDS_JSON__";
+
+/// One feed's row descriptor for the page's JS — serialised to JSON and injected.
+/// Built entirely from [`Feed::ALL`] so a future feed needs no page edit.
+#[derive(Serialize)]
+struct FeedRowDescriptor {
+    key: &'static str,
+    label: &'static str,
+    toggleable: bool,
+    note: String,
+}
+
+/// Build the per-feed UI note generically (no per-feed hardcoded copy) so any
+/// future feed gets an accurate description automatically.
+fn feed_note(feed: Feed) -> String {
+    if feed.is_runtime_toggleable() {
+        format!(
+            "{} live market-data feed — turn on/off. Off disconnects the live feed + stops \
+             storing; on reconnects + re-subscribes.",
+            feed.display_name()
+        )
+    } else {
+        format!("{} feed — status only.", feed.display_name())
+    }
+}
+
+/// The JSON descriptor array for every feed in [`Feed::ALL`]. `serde_json` escapes
+/// all values, so injecting it into the page script is safe by construction.
+fn feeds_descriptors_json() -> String {
+    let rows: Vec<FeedRowDescriptor> = Feed::ALL
+        .iter()
+        .copied()
+        .map(|feed| FeedRowDescriptor {
+            key: feed.as_str(),
+            label: feed.display_name(),
+            toggleable: feed.is_runtime_toggleable(),
+            note: feed_note(feed),
+        })
+        .collect();
+    // Infallible for this fixed struct; fall back to an empty array rather than panic.
+    serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Render the full feed-control page with the `Feed::ALL`-derived descriptor array
+/// injected (operator: "no static, always dynamic").
+fn render_feeds_page_html() -> String {
+    FEEDS_PAGE_HTML.replace(FEEDS_JSON_MARKER, &feeds_descriptors_json())
+}
+
 /// `GET /feeds` — serve the operator feed-control webpage. Public route (the HTML
 /// shell holds no secrets); all reads/toggles it issues go through the bearer-auth
 /// `/api/feeds` endpoints. Ships `X-Frame-Options: SAMEORIGIN` + a CSP with
-/// `frame-ancestors 'self'` to block click-jacking (security-review).
+/// `frame-ancestors 'self'` to block click-jacking (security-review). The feed rows
+/// are rendered dynamically from [`Feed::ALL`].
 pub async fn feeds_page() -> impl IntoResponse {
     (
         [
             (header::X_FRAME_OPTIONS, "SAMEORIGIN"),
             (header::CONTENT_SECURITY_POLICY, FEEDS_PAGE_CSP),
         ],
-        Html(FEEDS_PAGE_HTML),
+        Html(render_feeds_page_html()),
     )
 }
 
@@ -289,44 +342,71 @@ mod tests {
     #[test]
     fn test_feeds_page_renders_both_feeds_single_or_multiple() {
         // Operator demand: turn feeds on/off, single OR multiple. Each feed has its
-        // own independent switch descriptor.
+        // own independent switch descriptor — now SERVER-RENDERED from Feed::ALL.
+        let html = render_feeds_page_html();
         assert!(
-            FEEDS_PAGE_HTML.contains("key: \"dhan\""),
-            "dhan row present"
+            html.contains("\"key\":\"dhan\""),
+            "dhan row present (rendered)"
         );
         assert!(
-            FEEDS_PAGE_HTML.contains("key: \"groww\""),
-            "groww row present"
+            html.contains("\"key\":\"groww\""),
+            "groww row present (rendered)"
         );
         // PR-E: BOTH feeds are live-toggleable now (Dhan disable is safety-gated
         // server-side; the page shows the API's 409 + re-syncs on a gated reject).
         assert!(
-            FEEDS_PAGE_HTML.contains("toggleable: true"),
-            "feeds are live-toggleable"
+            html.contains("\"toggleable\":true"),
+            "feeds are live-toggleable (rendered)"
         );
     }
 
     #[test]
     fn test_feeds_page_has_a_row_for_every_feed_in_feed_all() {
-        // SP1 anti-regression guard (the NTM 2-role→3-role lesson): the page's
-        // static FEEDS descriptor list MUST cover every feed in the single-source
-        // `Feed::ALL`. Add a feed to the enum → this test FAILS until the page row
-        // is added, so a future feed#3 can never be silently absent from the
-        // operator's control page.
-        for &feed in tickvault_common::feed::Feed::ALL {
-            let needle = format!("key: \"{}\"", feed.as_str());
+        // Anti-regression guard (the NTM 2-role→3-role lesson): the page is now
+        // SERVER-RENDERED from `Feed::ALL`, so structurally it cannot miss a feed —
+        // this test proves every feed key appears in the rendered descriptor JSON.
+        // Add a feed to the enum → its row appears here automatically (zero page
+        // edits), and this test keeps it honest.
+        let html = render_feeds_page_html();
+        for &feed in Feed::ALL {
+            let needle = format!("\"key\":\"{}\"", feed.as_str());
             assert!(
-                FEEDS_PAGE_HTML.contains(&needle),
-                "feed-control page is missing a row for feed '{}' (Feed::ALL); add it to FEEDS",
+                html.contains(&needle),
+                "rendered feed-control page is missing a row for feed '{}' (Feed::ALL)",
+                feed.as_str()
+            );
+            // The label + a non-empty note are present too.
+            assert!(
+                html.contains(feed.display_name()),
+                "rendered page missing display label for '{}'",
                 feed.as_str()
             );
         }
     }
 
     #[test]
+    fn test_feeds_page_is_fully_dynamic_no_static_feed_rows() {
+        // Operator: "no static, always dynamic". The template carries the marker,
+        // NOT a hardcoded feed array; the rows only exist after rendering from
+        // Feed::ALL.
+        assert!(
+            FEEDS_PAGE_HTML.contains(FEEDS_JSON_MARKER),
+            "template must hold the injection marker, not static rows"
+        );
+        assert!(
+            !FEEDS_PAGE_HTML.contains("\"key\":\"dhan\""),
+            "template must NOT contain a hardcoded feed row"
+        );
+    }
+
+    #[test]
     fn test_feeds_page_surfaces_lane_not_running_honesty() {
-        // Mirrors the API's groww_lane_running honesty signal so the operator is
-        // told when a toggle is recorded but the lane wasn't started at boot.
-        assert!(FEEDS_PAGE_HTML.contains("groww_lane_running"));
+        // The lane-stalled honesty signal is now GENERIC per feed (no hardcoded
+        // feed name): `data[f.key + "_lane_running"] === false` covers every feed,
+        // so it reads dhan_lane_running / groww_lane_running / future feed#3 alike.
+        assert!(
+            FEEDS_PAGE_HTML.contains("_lane_running"),
+            "page surfaces the per-feed lane-not-running honesty signal"
+        );
     }
 }
