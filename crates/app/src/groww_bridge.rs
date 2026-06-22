@@ -251,6 +251,9 @@ pub async fn run_groww_bridge(
     qdb: QuestDbConfig,
     tick_file_path: PathBuf,
     feed_runtime: Arc<FeedRuntimeState>,
+    // Live-feed health (operator 2026-06-22): record Groww ticks/candles +
+    // connected-state so GET /api/feeds/health reports the truthful verdict.
+    feed_health: Arc<tickvault_common::feed_health::FeedHealthRegistry>,
 ) {
     info!(
         path = %tick_file_path.display(),
@@ -283,8 +286,16 @@ pub async fn run_groww_bridge(
         }
 
         let mut file = match File::open(&tick_file_path).await {
-            Ok(f) => f,
-            Err(_) => continue, // sidecar not started yet — idle, no writes
+            Ok(f) => {
+                // The sidecar's tick file is present + readable → Groww source up.
+                feed_health.set_connected(Feed::Groww, true);
+                f
+            }
+            Err(_) => {
+                // sidecar not started yet — idle, no writes; report disconnected.
+                feed_health.set_connected(Feed::Groww, false);
+                continue;
+            }
         };
         let len = match file.metadata().await {
             Ok(m) => m.len(),
@@ -365,6 +376,8 @@ pub async fn run_groww_bridge(
                 );
             } else {
                 wrote_live = true;
+                // Live-feed health: a Groww tick was captured (O(1) atomic).
+                feed_health.record_tick(Feed::Groww, parsed.tick.ts_ist_nanos);
             }
             if let Some(candle) = aggregator.on_tick(&parsed.tick) {
                 if let Err(err) = candle_writer.append_row(&candle_row_from_aggregated(&candle)) {
@@ -374,6 +387,7 @@ pub async fn run_groww_bridge(
                     );
                 } else {
                     wrote_candle = true;
+                    feed_health.record_candle(Feed::Groww);
                 }
             }
         }

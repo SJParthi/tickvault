@@ -244,6 +244,10 @@ async fn main() -> Result<()> {
     let feed_runtime = std::sync::Arc::new(
         tickvault_api::feed_state::FeedRuntimeState::from_config(feeds),
     );
+    // Live-feed health check (operator 2026-06-22): the ONE shared per-feed
+    // signal registry. The feed lanes update it (ticks/candles/drops/connected);
+    // the API's GET /api/feeds/health reads the SAME Arc for the truthful verdict.
+    let feed_health = std::sync::Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new());
     // PR-E (2026-06-21): the Dhan main feed is now runtime-toggleable (webpage).
     // Safety gate: disabling Dhan is allowed ONLY in the no-orders data-pull
     // phase (`dry_run`); once live trading is on, the toggle refuses to kill Dhan
@@ -329,6 +333,7 @@ async fn main() -> Result<()> {
             groww_qdb,
             std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
             std::sync::Arc::clone(&feed_runtime),
+            std::sync::Arc::clone(&feed_health),
         ));
 
         // Groww watch-list build (PR-B1, operator lock §31/§32). Rust downloads
@@ -1970,7 +1975,7 @@ async fn main() -> Result<()> {
         // only the 4 indices themselves are tracked.
 
         // --- Background: API server ---
-        let api_state = SharedAppState::new_with_feed_runtime(
+        let api_state = SharedAppState::new_with_feed_runtime_and_health(
             config.questdb.clone(),
             config.dhan.clone(),
             config.instrument.clone(),
@@ -1978,6 +1983,8 @@ async fn main() -> Result<()> {
             health_status.clone(),
             // SAME feed-runtime Arc the Groww bridge holds → API toggles are live.
             std::sync::Arc::clone(&feed_runtime),
+            // SAME health registry the lanes update → GET /api/feeds/health is live.
+            std::sync::Arc::clone(&feed_health),
         );
 
         // 2026-04-25 security audit (PR #357): SSM-only bearer token resolution
@@ -4815,13 +4822,15 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 11: Start axum API server
     // -----------------------------------------------------------------------
-    let api_state = SharedAppState::new_with_feed_runtime(
+    let api_state = SharedAppState::new_with_feed_runtime_and_health(
         config.questdb.clone(),
         config.dhan.clone(),
         config.instrument.clone(),
         health_status,
         // SAME feed-runtime Arc the Groww bridge holds → API toggles are live.
         std::sync::Arc::clone(&feed_runtime),
+        // SAME health registry the lanes update → GET /api/feeds/health is live.
+        std::sync::Arc::clone(&feed_health),
     );
 
     // 2026-04-25 security audit (PR #357): API bearer token sourced from AWS
