@@ -76,21 +76,45 @@ Staged sub-PRs, each additive + gated. The `Feed` move is a re-export (api uncha
 `PARITY-01`/`PARITY-02` (feed in payload) → Telegram + `feed_parity_1m_audit` + CSV. Counters `tv_feed_parity_mismatches_total{feed}`, gauge `tv_feed_parity_compared_minutes{feed}`. Per-feed per-day Telegram summary. Mismatch-count TREND is the signal.
 
 ## Plan Items (serial sub-PRs — one finished+merged before the next)
-- [ ] SP1 — `common::feed::Feed` (move from api, re-export, kill scattered label consts). Files: `crates/common/src/feed.rs`, `crates/common/src/lib.rs`, `crates/api/src/feed_state.rs`, the 3 label-const sites. Tests: feed round-trip.
-- [ ] SP2 — `common` generic `Candle1m` + exact comparator + `Mismatch`. Files: `crates/common/src/feed_parity.rs`. Tests: OHLC/volume-gated compare + false-OK guard.
-- [ ] SP3 — generify the 1-minute fold cell; Groww reuses it (golden seal-parity test) ; delete `Groww1mAggregator`. Files: `crates/trading/src/candles/aggregator_cell.rs`, `crates/core/src/feed/groww/aggregator_1m.rs` (delete), `groww_bridge.rs`.
+- [ ] SP1 — `common::feed::Feed` (move from api, re-export, kill scattered label consts) + `Feed::ALL` single source (MED finding) + `FeedStrategy` type skeleton. Files: `crates/common/src/feed.rs`, `crates/common/src/lib.rs`, `crates/api/src/feed_state.rs`, `crates/api/src/handlers/feeds.rs`, `feeds_page.rs`, the 3 label-const sites. Tests: feed round-trip; every list built from `Feed::ALL`; exhaustive `match` (no `_`).
+- [ ] SP2 — `common` generic `Candle1m` + exact comparator + `Mismatch` with `count_live_only` + `compares_volume` capability flags (CRIT+HIGH findings). Files: `crates/common/src/feed_parity.rs`. Tests: Dhan "ignore live-only" golden; OHLC mismatch flagged; volume gated by flag; positive-signal (non-zero price) guard so all-zero is NOT a false Pass; `compared>0` false-OK guard.
+- [ ] SP3 — generify the 1-minute fold cell with per-feed `FeedStrategy { late_policy: Refold|Discard, volume_width: i64, baseline (required arg) }` (3 CRIT + 2 HIGH/LOW findings); Groww reuses it; delete `Groww1mAggregator`. BLOCKERS: golden test Groww candle UNCHANGED vs today; Groww-cum-volume(i64)-through-shared-cell test; key-width guard (Groww token > u32::MAX must not alias — verify ≤u32 OR widen key to `(i64,ExchangeSegment)`); non-zero baseline-carry test. Files: `crates/trading/src/candles/aggregator_cell.rs`, `crates/core/src/feed/groww/aggregator_1m.rs` (delete), `groww_bridge.rs`.
 - [ ] SP4 — `GenericCandle1mWriter(feed)` merging the two writers. Files: `crates/storage/src/shadow_candle_writer.rs`, `crates/storage/src/groww_candle_persistence.rs` (merge).
-- [ ] SP5 — ONE `feed_parity_1m_audit` table + writer (feed in DEDUP), merging the two audit modules. Files: `crates/storage/src/feed_parity_1m_audit_persistence.rs`, delete `groww_cross_verify_audit_persistence.rs` + `cross_verify_1m_audit_persistence.rs`.
+- [ ] SP5 — ONE `feed_parity_1m_audit` table + writer (feed in DEDUP), merging the two audit modules. MANDATORY migration (HIGH finding): `UPDATE feed='dhan' WHERE feed IS NULL` BEFORE `DEDUP ENABLE UPSERT KEYS(...,feed)` — mirror the candle-table NULL-backfill so no cross-feed overwrite. Files: `crates/storage/src/feed_parity_1m_audit_persistence.rs`, delete `groww_cross_verify_audit_persistence.rs` + `cross_verify_1m_audit_persistence.rs`. Tests: migration backfill + Dhan/Groww coexist without overwrite.
 - [ ] SP6 — `trait BacktestSource` + Dhan REST impl (moved from app) + Groww sidecar impl. Files: `crates/core/src/feed/backtest_source.rs`, `crates/core/src/feed/dhan/intraday.rs`, `crates/core/src/feed/groww/backtest.rs`, `scripts/groww-sidecar/groww_backtest_fetch.py`.
 - [ ] SP7 — generic parity orchestrator `run_parity_1m(feed, BacktestSource)` + boot wiring per enabled feed + generic `PARITY-01/02` error codes + rule file; delete the Groww/Dhan silos. Files: `crates/app/src/feed_parity_1m_boot.rs`, `crates/app/src/main.rs`, `crates/common/src/error_code.rs`, `.claude/rules/project/feed-parity-1m-error-codes.md`.
 
 ## Guarantee matrix
 Carries the 15-row + 7-row matrix by cross-reference to `.claude/rules/project/per-wave-guarantee-matrix.md`. Proof per sub-PR: pure unit tests (comparator, fold cell golden, feed round-trip); audit via the unified DEDUP-keyed table; logging/alerting via `PARITY-01/02` + Telegram + CSV; performance via O(1) per-minute compare + the hot-path fold cell unchanged in complexity (DHAT on the Dhan path must stay green); honest envelope: OHLC-only where a feed lacks live volume, degrade-not-block on fetch failure, never a false "all match". Adversarial 3-agent before+after each hot-path-touching sub-PR (SP3 especially).
 
+## Adversarial deep-research findings (2026-06-22, 3-agent panel) — MANDATORY guards
+
+The hostile agent proved the convergence is NOT "two identical copies" — three per-feed
+POLICIES were being treated as identical and are not. **Resolution: the engine CODE is
+common; per-feed BEHAVIOUR is a small typed `FeedStrategy` parameter (data, not forked
+code).** This is MORE common-runtime/scalable, not less — a future feed supplies a
+`FeedStrategy` value, never new engine code. Every finding below is a build-gated guard.
+
+| Sev | Finding | Mandatory resolution (per-feed strategy param + golden test) | Sub-PR |
+|---|---|---|---|
+| CRIT | Comparator direction differs: Dhan IGNORES live-only minutes (tape authoritative); Groww counts both `missing_in_backtest` + `missing_in_live`. Merging blindly = false alarms on every Dhan run. | comparator takes `count_live_only: bool` capability (Dhan=false, Groww=true). Golden test reproduces Dhan's "ignore live-only" rule. | SP2 |
+| CRIT | Late-tick policy differs: Dhan RE-FOLDS a 1-bucket-late tick (`AmendedLate`); Groww DISCARDS. Forcing Groww onto re-fold CHANGES its candle + breaks the parity vs Groww backtest. | cell gains a per-feed `late_policy: {Refold, Discard}` (Dhan=Refold, Groww=Discard). Golden test asserts Groww candle UNCHANGED vs today; SP3's golden test must NOT bless a silent behaviour change. | SP3 |
+| CRIT | Volume convention + WIDTH clash: Dhan = `u32` volume, caller-passed bucket baseline; Groww = `i64` cumulative (exceeds u32 intraday for liquid stocks), self-managed inter-minute baseline. Shared cell would truncate/overflow Groww volume + lose its baseline logic. | shared cell volume field widened to `i64`; baseline-carry is a REQUIRED typed arg (no default) with a per-feed strategy; Groww-cum-volume-through-shared-cell test is a SP3 BLOCKER (not "before switchover"). | SP3 |
+| HIGH | Key-type truncation: Dhan papaya key `(u32,u8)`; Groww token is `i64`. `as u32` → I-P1-11 collision (two Groww instruments alias one cell → silent candle corruption); invisible because `candles_1m.security_id` is LONG. | verify Groww exchange_token ≤ u32::MAX (cite Groww docs) OR widen the shared container key to `(i64, ExchangeSegment)`. Guard test: token > u32::MAX must not alias. NO silent `as u32`. | SP3 |
+| HIGH | Audit-table merge DEDUP overwrite: both old tables DEDUP on 5 cols WITHOUT `feed`; a NULL-feed Dhan row + a `feed='groww'` row collide → silent cross-feed overwrite until the re-key migration runs. The candle table got a NULL-backfill; the audit plan did not. | SP5 MUST mirror the candle migration: `UPDATE feed='dhan' WHERE feed IS NULL` BEFORE `DEDUP ENABLE UPSERT KEYS(...,feed)`. Migration test. | SP5 |
+| HIGH | `compares_volume=false` false-OK: an all-zero (0.0) Groww candle "matches" a 0.0 backtest → reported clean while a real feed problem hides. | capability flag gates ONLY the volume field, NEVER the false-OK guard; ADD a positive-signal guard (non-zero price present) → all-zero "match" classified Blind/Degraded, not Pass. | SP2 |
+| MED | Hardcoded 2-feed enumerations (`[Feed::Dhan, Feed::Groww]`, `vec![...as_str()]`, JS `FEEDS=[...]`, Dhan-special `can_disable_dhan`) — the SAME NTM 2→3-role panic class. feed#3 would be silently dropped. | add `Feed::ALL: &[Feed]` single source; build every list from it; keep all `match feed` exhaustive (no `_`) so feed#3 forces compile errors everywhere. | SP1 |
+| MED | Groww backtest timezone unverified: Dhan REST is UTC→IST; Groww live is IST; Groww backtest (growwapi) tz is undocumented. Wrong tz → 330-min minute shift → 100% false mismatch. | SP6 pins Groww backtest tz with a parse test against a known candle; assert `minute_ts_ist_nanos == live floor` for a fixture. No assume-parity-with-Dhan. | SP6 |
+| LOW | Baseline-source moves cell-internal→caller; a caller forgetting Groww's prior cumulative → `volume = full_cumulative` (PREVOI-01 "minus zero" class). | baseline = required typed arg, no default; non-zero baseline-carry test. | SP3 |
+
+**Genuinely fine (evidence-checked):** `floor_to_minute_nanos` uses `rem_euclid` (correct for pre-epoch); `candles_1m` shared table + `feed` DEDUP + NULL-backfill is the SAFE template SP4 follows; both false-OK guards (`compared_minutes>0` / `BLIND`) exist and must be preserved, not regressed to one.
+
+**Reframed design law:** common ENGINE + per-feed `FeedStrategy { late_policy, volume_width/baseline, count_live_only, compares_volume, backtest_tz }`. SP3 (cell unification) is the danger zone — it is gated behind these strategy params + golden tests; nothing merges until the golden tests prove each feed's candle is UNCHANGED.
+
 ## Scenarios
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | Add future feed#3 | Write producer + BacktestSource + Feed variant; pipeline untouched |
+| 1 | Add future feed#3 | Write producer + BacktestSource + Feed variant + a `FeedStrategy` value; engine code untouched; `Feed::ALL` forces every list/match to include it (compile error if missed) |
 | 2 | Dhan + Groww both run | Both flow the SAME engine; rows tagged `feed`; one audit table |
 | 3 | Groww live (no volume) vs backtest | OHLC compared exact; volume not counted |
 | 4 | Backtest fetch fails for a feed | PARITY-02 degrade; partial coverage; never false OK |
