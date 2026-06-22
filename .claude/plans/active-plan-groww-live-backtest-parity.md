@@ -42,8 +42,10 @@ Research (2 parallel agents, 2026-06-22, file:line-cited) confirmed:
 
 **Volume stays COMMON, parameterized:** the comparator can compare volume; whether to is a per-feed *capability flag* (`compares_volume: bool`), NOT per-feed code. Groww live carries no volume → its flag is false (OHLC-only); Dhan → true. One comparator, one config knob. Honest envelope preserved without a code fork.
 
-### Aggregator caveat (the one real risk — flagged, not hand-waved)
-Dhan's aggregator is a 21-timeframe concurrent `papaya` engine (hot path); Groww's is a single-TF `std::HashMap`. We generify ONLY the inner per-instrument 1-minute fold cell (already pure, `Copy`, ≤96B) and have Groww reuse it; we do NOT merge the 21-TF concurrent container. Common key = `(i64, ExchangeSegment)`, common late-tick policy = re-fold (`AmendedLate`). Groww's cumulative-volume-delta convention is verified against the shared cell in a test before switchover, never assumed.
+### ALL timeframes from ticks, for EVERY feed (operator lock 2026-06-22: "from ticks always generate all candle timeframes")
+From ticks the common engine generates **ALL 21 timeframes** for every feed — NOT just 1-minute. Today Dhan already does this (21-TF `MultiTfAggregator` → `candles_*` shadow tables); Groww only does 1m. The convergence makes BOTH feeds run the SAME full 21-TF aggregator, every TF tagged `feed`. The 1-minute is merely the slice cross-verified vs backtest (the §0 deliverable); GENERATION is all-TF. So Groww moves to the full `MultiTfAggregator`, and EVERY `candles_<tf>` shadow table gets the `feed` column + `feed` in its DEDUP key (the NULL-backfill template applied to ALL TF tables, not just 1m).
+
+**Aggregator unification (danger zone — gated by golden tests):** Dhan's aggregator is the 21-TF concurrent `papaya` engine (hot path); Groww's is single-TF `std::HashMap`. Make Groww reuse the FULL `MultiTfAggregator`, parameterized by per-feed `FeedStrategy { late_policy, volume_width:i64, baseline, key_width }`. Groww's path is lower-rate (sidecar NDJSON) so feeding the 21-TF container stays O(1)/tick (hot-path agent confirmed sharing is alloc-free). Golden test: Groww's 1m seal through the shared engine == its current 1m candle (no silent change); its other 20 TFs are now produced + persisted. Cum-volume-delta + key-width(i64) verified through the shared engine, never assumed.
 
 ## Edge Cases
 - New feed added: implement producer + BacktestSource + add `Feed` variant + register in `FeedRuntimeState`. Pipeline untouched. (The whole point.)
