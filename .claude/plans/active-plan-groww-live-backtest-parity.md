@@ -1,89 +1,98 @@
-# Implementation Plan: Groww live→backtest 1-minute parity check
+# Implementation Plan: ONE common feed engine (live → 1m → parity), feed = only the fetch/pull
 
 **Status:** APPROVED
 **Date:** 2026-06-22
-**Approved by:** Parthiban — standing authorization in `.claude/rules/project/groww-second-feed-scope-2026-06-19.md` §0 Quote 1 ("generate our one minute especially to check whether atleast groww live feed data and groww backtesting is same or not dude") + 2026-06-22 "continue with the plan dude okay?"
-**Authority for the feature:** the Groww-second-feed lock §0 + §5 (honest envelope) — this IS the locked deliverable of the Groww sequence, not new scope.
+**Approved by:** Parthiban — verbatim 2026-06-22: "only feed live ticks will be fetched and pulled right dude then from there everything is same … if we add other feeds also it should never ever be disturbed … make everything as common runtime dynamic scalable approach"; AskUserQuestion answer "One common engine in one shot"; + Groww-second-feed lock §0 Quote 1 (live↔backtest 1m parity is the locked deliverable).
 
-## Design
+## Design — the ONE principle
 
-Goal: every trading day after close, prove whether **Groww's live 1-minute candles == Groww's own backtest (historical) 1-minute candles**, exact-match, minute-by-minute, per subscribed Groww spot SID — and count the mismatches. This is the whole reason Groww was added (an independent second source to measure Dhan's live-feed drift).
+**Feed-specific = ONLY two small adapters: (1) the live-tick producer (the feed's wire protocol), (2) the historical/backtest fetcher (the feed's history API). EVERYTHING else is ONE common, feed-parameterized runtime.** Adding a future feed = implement those 2 adapters + add a `Feed` enum variant. The shared pipeline is never touched.
 
-The research map (parallel agent, 2026-06-22) confirms the LIVE side + comparator + audit sink already exist:
-- LIVE candles: `candles_1m WHERE feed='groww'` (shared table, DEDUP `(ts, security_id, segment, feed)`).
-- Pure exact-match comparator: `crates/core/src/feed/groww/parity_1m.rs::compare_groww_1m` (zero-tolerance, false-OK guarded).
-- Audit sink (built, unwired): `groww_cross_verify_1m_audit` table + `GrowwCrossVerify1mAuditWriter` (DEDUP `(trading_date_ist, security_id, segment, minute_ts_ist, field)`).
-- Mirror template: `crates/app/src/cross_verify_1m_boot.rs` (the Dhan 15:31 IST cross-verify).
+```
+ FEED-SPECIFIC (2 tiny adapters/feed)        COMMON RUNTIME (shared, feed = a parameter)
+ ┌──────────────────────────────┐     ┌────────────────────────────────────────────────┐
+ │ producer: wire→ParsedTick     │────►│ WAL→ring→spill→DLQ→tick processor→               │
+ │   Dhan=binary WS              │     │ 1-min fold cell→candles_1m (feed column)→        │
+ │   Groww=sidecar NDJSON        │     │ generic exact comparator→feed_parity_1m_audit→   │
+ │ BacktestSource: history→Candle│────►│ CSV→Telegram. ALL generic; `feed` is just a label│
+ │   Dhan=REST /charts/intraday  │     │                                                  │
+ │   Groww=growwapi historical   │     │                                                  │
+ └──────────────────────────────┘     └────────────────────────────────────────────────┘
+```
 
-Two things are MISSING and this plan adds them:
-1. **Backtest fetcher** — pull Groww historical 1m candles. The growwapi SDK exposes `get_historical_candles(exchange, segment, groww_symbol, start_time, end_time, candle_interval=CANDLE_INTERVAL_MIN_1)` (verified `docs/groww-ref/08-master-groww-nse-bse-context.md:83-95`). No code calls it yet. Reuse the EXISTING sidecar venv + auth: a one-shot Python fetch (`scripts/groww-sidecar/groww_backtest_fetch.py`) that, given today's Groww watch list, fetches each SID's 1m candles for the session and dumps `data/groww/backtest-1m-<date>.ndjson` (one `{security_id,segment,minute_ts_ist_nanos,open,high,low,close,volume}` per line). Mirrors the live-capture NDJSON contract so the Rust loader is symmetric.
-2. **Parity orchestrator** — `crates/app/src/groww_cross_verify_1m_boot.rs`, mirroring `cross_verify_1m_boot.rs` scoped to `feed='groww'`: schedule 15:31 IST (+ force-now flag), (a) read live `candles_1m WHERE feed='groww'`, (b) load the backtest NDJSON, (c) `compare_groww_1m`, (d) flush mismatches to `groww_cross_verify_1m_audit` + a CSV `data/cross-verify/groww-parity-1m-<date>.csv`, (e) Telegram per-day summary (compared / mismatches / missing). Boot-wire `ensure_groww_cross_verify_1m_audit_table` + spawn the scheduler, gated by `feeds.groww_enabled`.
+Research (2 parallel agents, 2026-06-22, file:line-cited) confirmed:
+- `candles_1m` is ALREADY one shared table with a `feed` SYMBOL column + DEDUP `(ts, security_id, segment, feed)` (`shadow_persistence.rs:114`). Dhan+Groww rows coexist. The table is already common.
+- The 1-minute fold cell, the exact-match comparator, and the audit-table schema are ALREADY structurally identical across Dhan and Groww — they were just copy-forked. They unify cleanly.
+- The only genuinely feed-specific code is the wire producer + the historical adapter.
 
-**Volume handling (honest envelope, MANDATORY):** Groww LIVE feed carries no traded volume — the sidecar stamps `volume=0` (Option A, `groww_sidecar.py:144`). Groww BACKTEST candles DO carry volume. So a full OHLCV exact-compare would mismatch volume on EVERY minute — a false alarm. Therefore the Groww parity comparator compares **OHLC exact-match only**; volume is reported separately as informational (live=0 by design), never counted as a mismatch. This is documented in the new rule file + the Telegram wording ("OHLC exact; volume not compared — Groww live carries no volume").
+### What moves where (no circular deps; flow common ← core ← trading ← storage ← api ← app)
 
-**Sub-PR split (per stream-resilience B per-PR-set protocol, ≤3):**
-- **Sub-PR 1 (this plan, first):** backtest fetcher (Python one-shot + Rust NDJSON loader `groww_backtest_loader.rs` pure-parse + the OHLC-only comparator option in `parity_1m.rs`) + tests. No boot wiring yet (loader is pure, unit-tested).
-- **Sub-PR 2:** the parity orchestrator + boot wiring + error codes (`GROWW-PARITY-01` mismatch, `GROWW-PARITY-02` backtest-fetch-degraded) + rule file `groww-parity-1m-error-codes.md` + CSV + Telegram. Mirrors `cross_verify_1m_boot.rs`.
+| Common piece | Target crate | Action |
+|---|---|---|
+| `Feed` enum + `as_str`/`parse` + ONE label source | **common** (`common::feed`) | MOVE from `api::feed_state`; kill 3 scattered label consts (`CANDLE_FEED_DHAN`, `GROWW_FEED_LABEL`, `TICK_FEED_*`); `api` re-exports for `FeedRuntimeState` |
+| `Candle1m` type + generic exact comparator + `Mismatch` | **common** | EXTRACT from `parity_1m.rs::compare_groww_1m` + `cross_verify_1m_boot.rs::diff_minute_candles` (identical algos) |
+| 1-minute fold cell (per `(security_id, ExchangeSegment)`) | **trading** (`candles/`) | GENERIFY the inner cell; Groww reuses it; Dhan's 21-TF papaya container keeps using it. Common key `(i64, ExchangeSegment)`, common late-tick = re-fold (`AmendedLate`) |
+| `GenericCandle1mWriter(feed)` | **storage** | MERGE `ShadowCandleWriter` + `GrowwCandle1mWriter` into one feed-param writer |
+| `feed_parity_1m_audit` (ONE table, `feed` in DEDUP) | **storage** | MERGE `cross_verify_1m_audit` + `groww_cross_verify_1m_audit` (byte-identical schemas) → one table, DEDUP `(trading_date_ist, security_id, segment, minute_ts_ist, field, feed)` |
+| `trait BacktestSource { async fn fetch_1m(...) -> Vec<Candle1m> }` + per-feed impls | **core** | NEW trait; Dhan REST impl MOVES from `app`; Groww sidecar impl lives here. Cold path → `dyn` OK |
+| Generic parity orchestrator `run_parity_1m(feed, &dyn BacktestSource)` | **app** | GENERIFY `cross_verify_1m_boot.rs`; one scheduler runs it per enabled feed |
+| Error codes `PARITY-01`/`PARITY-02` (feed label in payload) | **common** | GENERIFY `CROSS-VERIFY-1M-*`; keep old as aliases or migrate |
+
+**Delete/merge:** `core/feed/groww/parity_1m.rs`, `storage/groww_cross_verify_audit_persistence.rs`, the `GrowwCandle1mWriter` half of `groww_candle_persistence.rs`, `Groww1mAggregator` (reuse the common cell), and the Dhan-specific diff/intraday parse inside `cross_verify_1m_boot.rs` (extract→common, move REST→core).
+
+**Volume stays COMMON, parameterized:** the comparator can compare volume; whether to is a per-feed *capability flag* (`compares_volume: bool`), NOT per-feed code. Groww live carries no volume → its flag is false (OHLC-only); Dhan → true. One comparator, one config knob. Honest envelope preserved without a code fork.
+
+### Aggregator caveat (the one real risk — flagged, not hand-waved)
+Dhan's aggregator is a 21-timeframe concurrent `papaya` engine (hot path); Groww's is a single-TF `std::HashMap`. We generify ONLY the inner per-instrument 1-minute fold cell (already pure, `Copy`, ≤96B) and have Groww reuse it; we do NOT merge the 21-TF concurrent container. Common key = `(i64, ExchangeSegment)`, common late-tick policy = re-fold (`AmendedLate`). Groww's cumulative-volume-delta convention is verified against the shared cell in a test before switchover, never assumed.
 
 ## Edge Cases
-
-- Groww disabled (`feeds.groww_enabled=false`): orchestrator never spawns; no fetch, no compare. No-op.
-- Empty live candles (Groww ran but no ticks today): comparator's `compared_minutes>0` false-OK guard reports "blind / nothing to compare", NOT "all match".
-- Backtest fetch partial/failed for some SIDs: degrade honestly (`GROWW-PARITY-02`), compare what we have, report coverage — never a clean "all match" on a partial set (audit Rule 11).
-- Volume: excluded from mismatch count by design (see above); informational only.
-- Backtest candle minute alignment: Groww historical tuple `[ts,o,h,l,c,v,oi]` UTC epoch → IST-minute nanos, same conversion the live aggregator uses, so keys line up exactly.
-- Far-OTM / illiquid SID with no backtest minute: counted as `missing_in_backtest`, not a mismatch.
-- 30-day per-request cap (1m): we only ever fetch ONE day (today), well inside the cap.
+- New feed added: implement producer + BacktestSource + add `Feed` variant + register in `FeedRuntimeState`. Pipeline untouched. (The whole point.)
+- Feed disabled at runtime: orchestrator skips that feed; no fetch, no compare.
+- Feed with no live volume (Groww): `compares_volume=false`; volume reported informational, never a mismatch.
+- Empty/partial live or backtest set: false-OK guard → "Blind/Degraded", never a false "all match" (audit Rule 11).
+- Migration: the two old audit tables → one. New table `CREATE IF NOT EXISTS`; old data stays queryable; no destructive drop.
 
 ## Failure Modes
-
-- Python fetch process crash / SDK auth failure: the orchestrator times out the fetch, emits `GROWW-PARITY-02` (Severity::High, degrade — never blocks), records partial coverage. Next day re-runs.
-- QuestDB unreachable for the live-candle SELECT: degrade, emit, no panic (mirror `cross_verify_1m_boot` Blind/Degraded classification).
-- Audit ILP write failure: best-effort forensic write; the CSV + Telegram still fire (mirror AUDIT-WS-01 honesty).
-- NDJSON parse error on a backtest line: skip the line + count it, never panic (the loader is a pure fallible parser returning `Result`).
+- BacktestSource fetch fails (REST 5xx / sidecar crash): `PARITY-02` degrade, partial coverage, never blocks, next day re-runs.
+- QuestDB unreachable: degrade + emit, no panic (mirror existing classification).
+- Aggregator cell convention drift: caught by the pre-switchover Groww volume/seal parity test.
+- Layering violation introduced: caught at compile time (common can't see core/api).
 
 ## Test Plan
-
-Sub-PR 1:
-- `groww_backtest_loader.rs`: pure-parse unit tests — valid line → row; malformed line → typed Err; UTC→IST-minute conversion; empty file → empty vec.
-- `parity_1m.rs`: OHLC-only compare option — volume difference does NOT count as a mismatch; OHLC difference DOES; `compared_minutes==0` → not-exact (false-OK guard) retained.
-- `scripts/groww-sidecar/groww_backtest_fetch.py`: a `--self-test` / dry mode that validates the watch-file parse + output schema without hitting the network (mirrors the sidecar's existing self-test pattern).
-Sub-PR 2:
-- orchestrator pure helpers (schedule decision, run-status classification, CSV row formatting) unit-tested; the I/O loop TEST-EXEMPT mirroring `cross_verify_1m_boot.rs`.
-- error-code cross-ref + tag-guard satisfied by the new rule file.
-- `cargo test -p tickvault-core -p tickvault-app -p tickvault-storage` green.
+- `common::feed::Feed`: round-trip `as_str`/`parse`, every variant.
+- common comparator: OHLC exact mismatch flagged; volume gated by capability flag; `compared>0` false-OK guard.
+- generic fold cell: Groww ticks through the shared cell produce identical seals to the old `Groww1mAggregator` (golden test before deleting it).
+- generic candle writer: Dhan row + Groww row both land in `candles_1m` with correct `feed` + DEDUP.
+- one audit table: Dhan + Groww mismatches coexist, DEDUP includes `feed`.
+- BacktestSource: Dhan REST parse test (moved), Groww sidecar parse test.
+- orchestrator: schedule decision + run-status classification per feed.
+- `cargo test --workspace` (common change → escalate per testing-scope).
+- Adversarial 3-agent review (hot-path + security + hostile) before AND after.
 
 ## Rollback
-
-Both sub-PRs are additive + gated by `feeds.groww_enabled` (default OFF). Reverting either restores prior behaviour with zero data-model change (the `groww_cross_verify_1m_audit` table is `CREATE IF NOT EXISTS`; an unused table is harmless). The live feed, shared tables, and Dhan path are untouched.
+Staged sub-PRs, each additive + gated. The `Feed` move is a re-export (api unchanged externally). The unified writer/audit are behind the same boot wiring; reverting any sub-PR restores the prior siloed module with zero data loss (shared table unchanged). `feeds.groww_enabled` default OFF.
 
 ## Observability
+`PARITY-01`/`PARITY-02` (feed in payload) → Telegram + `feed_parity_1m_audit` + CSV. Counters `tv_feed_parity_mismatches_total{feed}`, gauge `tv_feed_parity_compared_minutes{feed}`. Per-feed per-day Telegram summary. Mismatch-count TREND is the signal.
 
-- `GROWW-PARITY-01` (mismatch found, Severity::High) + `GROWW-PARITY-02` (backtest fetch degraded, Severity::High) error codes → Telegram via the 5-sink pipeline + the `groww_cross_verify_1m_audit` forensic table + the CSV.
-- `tv_groww_parity_mismatches_total` counter, `tv_groww_parity_compared_minutes` gauge.
-- Per-day Telegram summary (compared / mismatches / missing / "OHLC exact; volume not compared").
-- The mismatch count trend over days IS the quality signal (track trend, not absolute — sampling noise on H/L is expected, sustained O/C drift is the real problem).
-
-## Plan Items
-
-- [ ] Sub-PR 1 — Groww backtest fetcher (Python one-shot `groww_backtest_fetch.py` + Rust `groww_backtest_loader.rs` pure NDJSON loader) + OHLC-only compare option in `parity_1m.rs` + tests.
-  - Files: `scripts/groww-sidecar/groww_backtest_fetch.py`, `crates/core/src/feed/groww/groww_backtest_loader.rs`, `crates/core/src/feed/groww/parity_1m.rs`, `crates/core/src/feed/groww/mod.rs`
-  - Tests: `test_parse_backtest_line_valid`, `test_parse_backtest_line_malformed_errs`, `test_backtest_utc_to_ist_minute`, `test_ohlc_only_compare_ignores_volume`, `test_ohlc_compare_flags_close_drift`
-- [ ] Sub-PR 2 — Groww parity orchestrator (`groww_cross_verify_1m_boot.rs`) + boot wiring + error codes + rule file + CSV + Telegram.
-  - Files: `crates/app/src/groww_cross_verify_1m_boot.rs`, `crates/app/src/main.rs`, `crates/common/src/error_code.rs`, `.claude/rules/project/groww-parity-1m-error-codes.md`, `crates/storage/src/groww_cross_verify_audit_persistence.rs` (wire `ensure_*`)
-  - Tests: orchestrator pure helpers + error-code cross-ref + tag-guard.
+## Plan Items (serial sub-PRs — one finished+merged before the next)
+- [ ] SP1 — `common::feed::Feed` (move from api, re-export, kill scattered label consts). Files: `crates/common/src/feed.rs`, `crates/common/src/lib.rs`, `crates/api/src/feed_state.rs`, the 3 label-const sites. Tests: feed round-trip.
+- [ ] SP2 — `common` generic `Candle1m` + exact comparator + `Mismatch`. Files: `crates/common/src/feed_parity.rs`. Tests: OHLC/volume-gated compare + false-OK guard.
+- [ ] SP3 — generify the 1-minute fold cell; Groww reuses it (golden seal-parity test) ; delete `Groww1mAggregator`. Files: `crates/trading/src/candles/aggregator_cell.rs`, `crates/core/src/feed/groww/aggregator_1m.rs` (delete), `groww_bridge.rs`.
+- [ ] SP4 — `GenericCandle1mWriter(feed)` merging the two writers. Files: `crates/storage/src/shadow_candle_writer.rs`, `crates/storage/src/groww_candle_persistence.rs` (merge).
+- [ ] SP5 — ONE `feed_parity_1m_audit` table + writer (feed in DEDUP), merging the two audit modules. Files: `crates/storage/src/feed_parity_1m_audit_persistence.rs`, delete `groww_cross_verify_audit_persistence.rs` + `cross_verify_1m_audit_persistence.rs`.
+- [ ] SP6 — `trait BacktestSource` + Dhan REST impl (moved from app) + Groww sidecar impl. Files: `crates/core/src/feed/backtest_source.rs`, `crates/core/src/feed/dhan/intraday.rs`, `crates/core/src/feed/groww/backtest.rs`, `scripts/groww-sidecar/groww_backtest_fetch.py`.
+- [ ] SP7 — generic parity orchestrator `run_parity_1m(feed, BacktestSource)` + boot wiring per enabled feed + generic `PARITY-01/02` error codes + rule file; delete the Groww/Dhan silos. Files: `crates/app/src/feed_parity_1m_boot.rs`, `crates/app/src/main.rs`, `crates/common/src/error_code.rs`, `.claude/rules/project/feed-parity-1m-error-codes.md`.
 
 ## Guarantee matrix
-
-Carries the 15-row + 7-row matrix by cross-reference to `.claude/rules/project/per-wave-guarantee-matrix.md`. Item proof: 100% testing via the pure-parse + compare unit tests; 100% audit via `groww_cross_verify_1m_audit` DEDUP-keyed forensic table; 100% logging/alerting via `GROWW-PARITY-01/02` + Telegram + CSV; 100% scenarios via the empty/partial/volume/degrade edge cases; 100% performance via O(1) per-minute compare (HashMap keyed `(security_id, segment, minute)`); honest envelope: OHLC-only exact-match (volume excluded — Groww live carries no volume by design), partial-fetch degrades honestly, never a false "all match".
+Carries the 15-row + 7-row matrix by cross-reference to `.claude/rules/project/per-wave-guarantee-matrix.md`. Proof per sub-PR: pure unit tests (comparator, fold cell golden, feed round-trip); audit via the unified DEDUP-keyed table; logging/alerting via `PARITY-01/02` + Telegram + CSV; performance via O(1) per-minute compare + the hot-path fold cell unchanged in complexity (DHAT on the Dhan path must stay green); honest envelope: OHLC-only where a feed lacks live volume, degrade-not-block on fetch failure, never a false "all match". Adversarial 3-agent before+after each hot-path-touching sub-PR (SP3 especially).
 
 ## Scenarios
-
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | Groww OFF | Orchestrator never runs; no-op |
-| 2 | Live==Backtest OHLC | "All OHLC match", mismatch count 0 |
-| 3 | Close drift on N minutes | N mismatches in audit + CSV + Telegram count |
-| 4 | Volume differs (live=0, backtest>0) | NOT counted (informational only) |
-| 5 | Backtest fetch fails for some SIDs | Degrade (GROWW-PARITY-02), partial coverage reported, never false "all match" |
-| 6 | No live ticks today | "Blind — nothing to compare", not "all match" |
+| 1 | Add future feed#3 | Write producer + BacktestSource + Feed variant; pipeline untouched |
+| 2 | Dhan + Groww both run | Both flow the SAME engine; rows tagged `feed`; one audit table |
+| 3 | Groww live (no volume) vs backtest | OHLC compared exact; volume not counted |
+| 4 | Backtest fetch fails for a feed | PARITY-02 degrade; partial coverage; never false OK |
+| 5 | SP3 cell switchover | Groww seals identical to old aggregator (golden test) before delete |
+| 6 | Revert any sub-PR | Prior siloed module restored; shared table + data intact |
