@@ -26,6 +26,7 @@ pub mod constants;
 pub mod disconnect_cause;
 pub mod error;
 pub mod error_code;
+pub mod feed;
 pub mod formulas;
 pub mod instrument_registry;
 pub mod instrument_types;

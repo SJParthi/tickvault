@@ -16,47 +16,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tickvault_common::config::FeedsConfig;
-
-/// The market-data feeds that can be reported / toggled.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Feed {
-    /// Dhan (feed #1) — the primary trading feed. Status-only at runtime.
-    Dhan,
-    /// Groww (feed #2) — runtime-toggleable (pause/resume live).
-    Groww,
-}
-
-impl Feed {
-    /// The stable wire-format label (`"dhan"` / `"groww"`).
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Dhan => "dhan",
-            Self::Groww => "groww",
-        }
-    }
-
-    /// Parse a feed name from the URL path. Returns `None` for anything that is
-    /// not exactly a known feed label (case-sensitive — the API is machine-facing).
-    #[must_use]
-    pub fn parse(name: &str) -> Option<Self> {
-        match name {
-            "dhan" => Some(Self::Dhan),
-            "groww" => Some(Self::Groww),
-            _ => None,
-        }
-    }
-
-    /// Whether this feed may be toggled at runtime. BOTH Dhan and Groww are
-    /// runtime-toggleable as of PR-E (2026-06-21, operator-authorized — see
-    /// `websocket-connection-scope-lock.md` "DHAN RUNTIME-TOGGLE AUTHORIZED").
-    /// The Dhan *disable* direction is additionally safety-gated (orders-live)
-    /// in the handler via [`FeedRuntimeState::can_disable_dhan`].
-    #[must_use]
-    pub const fn is_runtime_toggleable(self) -> bool {
-        matches!(self, Self::Groww | Self::Dhan)
-    }
-}
+// SP1: `Feed` now lives in `common` (the shared layer every crate depends on),
+// so writers/aggregators/parity can use the SAME enum + label fn. Re-exported
+// here so existing `api::feed_state::Feed` call sites keep compiling unchanged.
+pub use tickvault_common::feed::Feed;
 
 /// A point-in-time snapshot of every feed's enabled state — the `GET /api/feeds`
 /// response payload (serialised by the handler).

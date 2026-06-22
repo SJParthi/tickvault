@@ -307,6 +307,23 @@ mod tests {
     }
 
     #[test]
+    fn test_feeds_page_has_a_row_for_every_feed_in_feed_all() {
+        // SP1 anti-regression guard (the NTM 2-role→3-role lesson): the page's
+        // static FEEDS descriptor list MUST cover every feed in the single-source
+        // `Feed::ALL`. Add a feed to the enum → this test FAILS until the page row
+        // is added, so a future feed#3 can never be silently absent from the
+        // operator's control page.
+        for &feed in tickvault_common::feed::Feed::ALL {
+            let needle = format!("key: \"{}\"", feed.as_str());
+            assert!(
+                FEEDS_PAGE_HTML.contains(&needle),
+                "feed-control page is missing a row for feed '{}' (Feed::ALL); add it to FEEDS",
+                feed.as_str()
+            );
+        }
+    }
+
+    #[test]
     fn test_feeds_page_surfaces_lane_not_running_honesty() {
         // Mirrors the API's groww_lane_running honesty signal so the operator is
         // told when a toggle is recorded but the lane wasn't started at boot.
