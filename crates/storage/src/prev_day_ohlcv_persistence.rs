@@ -4,14 +4,17 @@
 //! fetched ONCE at boot via Dhan REST `/v2/charts/historical` (daily).
 //!
 //! **This is NOT the `ticks` table** and NOT the deleted 90-day historical
-//! chain. One row per (instrument, prev-trading-day). DEDUP UPSERT KEYS
-//! `(ts, security_id, segment)` per I-P1-11 → idempotent re-runs collapse to
-//! one row; cross-segment same-`security_id` instruments stay distinct.
+//! chain. One row per (instrument, prev-trading-day, feed). DEDUP UPSERT KEYS
+//! `(ts, security_id, segment, feed)` per I-P1-11 + per-feed identity
+//! (2026-06-23) → idempotent re-runs collapse to one row; cross-segment
+//! same-`security_id` instruments stay distinct, and each feed (dhan/groww)
+//! keeps its own prev-day candle.
 //!
 //! ## Schema
 //!
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS prev_day_ohlcv (
+//!     feed         SYMBOL,      -- broker source (dhan/groww) — per-feed identity
 //!     segment      SYMBOL,
 //!     security_id  LONG,
 //!     ts           TIMESTAMP,   -- prev trading-day IST midnight (nanos)
@@ -22,7 +25,7 @@
 //!     volume       LONG,
 //!     oi           LONG         -- prev-day open interest (F&O only; 0 for IDX_I/equity)
 //! ) timestamp(ts) PARTITION BY DAY
-//!   DEDUP UPSERT KEYS(ts, security_id, segment);
+//!   DEDUP UPSERT KEYS(ts, security_id, segment, feed);
 //! ```
 //!
 //! ## `oi` column (operator directive 2026-06-02 — 1d historical-only)
@@ -32,7 +35,7 @@
 //! table is now the prev-OI source, so it carries the previous-day open
 //! interest. Dhan REST `/v2/charts/historical` returns `open_interest` as a
 //! columnar array (all-zero for equities/indices where OI is meaningless).
-//! `oi` is NOT a DEDUP key column — only `(ts, security_id, segment)` are.
+//! `oi` is NOT a DEDUP key column — only `(ts, security_id, segment, feed)` are.
 //!
 //! ## Timestamp rule (`data-integrity.md`)
 //!
@@ -54,9 +57,13 @@ use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
 pub const PREV_DAY_OHLCV_TABLE: &str = "prev_day_ohlcv";
 
 /// DEDUP UPSERT key — includes the designated timestamp `ts` (QuestDB
-/// requires it) and `segment` per I-P1-11. The `dedup_segment_meta_guard`
-/// workspace test scans this constant; it MUST mention `segment`.
-pub const DEDUP_KEY_PREV_DAY_OHLCV: &str = "ts, security_id, segment";
+/// requires it), `segment` per I-P1-11, AND `feed` per the per-feed
+/// identity model (operator 2026-06-23): each feed (dhan/groww) has its
+/// OWN previous-day OHLCV (their daily candles can differ), so a Dhan and
+/// a Groww row for the same `(ts, security_id, segment)` are BOTH kept,
+/// never collapsed. The `dedup_segment_meta_guard` workspace test scans
+/// this constant; it MUST mention `segment`.
+pub const DEDUP_KEY_PREV_DAY_OHLCV: &str = "ts, security_id, segment, feed";
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
@@ -65,6 +72,10 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 /// per `data-integrity.md`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PrevDayOhlcvRow {
+    /// Broker feed source (`dhan` / `groww`). Composite-key part (per-feed
+    /// identity, 2026-06-23) — each feed's prev-day candle is a distinct row.
+    /// `&'static str` from `tickvault_common::feed::Feed::as_str()` — zero-alloc.
+    pub feed: &'static str,
     /// Designated timestamp: prev trading-day IST midnight, in nanoseconds.
     pub ts_ist_nanos: i64,
     /// Composite-key part 1 (I-P1-11). Widened to `i64` for `column_i64`.
@@ -199,6 +210,29 @@ pub async fn ensure_prev_day_ohlcv_table(questdb_config: &QuestDbConfig) {
         }
         Err(err) => error!(?err, "prev_day_ohlcv: ALTER ADD COLUMN feed request failed"),
     }
+
+    // Per-feed identity (operator 2026-06-23): re-apply the DEDUP key so it
+    // includes `feed` on tables created before this directive. Runs AFTER the
+    // `feed` column ALTER above so the key column exists. Idempotent; never
+    // drops the table (SEBI). Mirrors the ticks `DEDUP ENABLE` self-heal.
+    match client
+        .get(&base_url)
+        .query(&[("query", prev_day_ohlcv_dedup_reenable_ddl().as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            error!(%status, body = %body.chars().take(200).collect::<String>(),
+                "prev_day_ohlcv: DEDUP ENABLE UPSERT KEYS returned non-2xx");
+        }
+        Err(err) => error!(
+            ?err,
+            "prev_day_ohlcv: DEDUP ENABLE UPSERT KEYS request failed"
+        ),
+    }
 }
 
 /// Idempotent `ALTER TABLE ADD COLUMN IF NOT EXISTS oi LONG`. Pure (testable
@@ -215,6 +249,20 @@ pub fn prev_day_ohlcv_alter_add_oi_ddl() -> &'static str {
 #[must_use]
 pub fn prev_day_ohlcv_alter_add_feed_ddl() -> &'static str {
     "ALTER TABLE prev_day_ohlcv ADD COLUMN IF NOT EXISTS feed SYMBOL;"
+}
+
+/// Idempotent `ALTER TABLE … DEDUP ENABLE UPSERT KEYS(…)` re-applying the
+/// per-feed key on EXISTING tables. A fresh `CREATE TABLE` already sets the
+/// key (via [`prev_day_ohlcv_create_ddl`]), but a table created before the
+/// 2026-06-23 per-feed-identity directive keeps its old `(ts, security_id,
+/// segment)` key until this re-enable runs. Mirrors the `ticks` self-heal
+/// (`ensure_tick_table_dedup_keys`). Idempotent — re-enabling is a no-op.
+/// Never drops the table (SEBI retention). Pure (testable without QuestDB).
+#[must_use]
+pub fn prev_day_ohlcv_dedup_reenable_ddl() -> String {
+    format!(
+        "ALTER TABLE {PREV_DAY_OHLCV_TABLE} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_PREV_DAY_OHLCV});"
+    )
 }
 
 /// Lazy-connect ILP writer for the `prev_day_ohlcv` table. Mirrors
@@ -286,6 +334,8 @@ impl PrevDayOhlcvWriter {
         self.buffer
             .table(PREV_DAY_OHLCV_TABLE)
             .with_context(|| "prev_day_ohlcv append: table() failed")?
+            .symbol("feed", row.feed)
+            .with_context(|| "prev_day_ohlcv append: symbol(feed) failed")?
             .symbol("segment", row.segment)
             .with_context(|| "prev_day_ohlcv append: symbol(segment) failed")?
             .column_i64("security_id", row.security_id)
@@ -350,6 +400,24 @@ mod tests {
     }
 
     #[test]
+    fn test_dedup_key_includes_feed() {
+        // Per-feed identity (2026-06-23): each feed's prev-day candle is a
+        // distinct row, so `feed` MUST be in the DEDUP key.
+        assert!(
+            DEDUP_KEY_PREV_DAY_OHLCV.contains("feed"),
+            "prev_day_ohlcv DEDUP key must include feed: {DEDUP_KEY_PREV_DAY_OHLCV}"
+        );
+        assert_eq!(DEDUP_KEY_PREV_DAY_OHLCV, "ts, security_id, segment, feed");
+    }
+
+    #[test]
+    fn test_prev_day_ohlcv_dedup_reenable_ddl_includes_feed_key() {
+        let ddl = prev_day_ohlcv_dedup_reenable_ddl();
+        assert!(ddl.contains("ALTER TABLE prev_day_ohlcv"));
+        assert!(ddl.contains("DEDUP ENABLE UPSERT KEYS(ts, security_id, segment, feed)"));
+    }
+
+    #[test]
     fn test_prev_day_ohlcv_create_ddl_has_all_columns() {
         let ddl = prev_day_ohlcv_create_ddl();
         for needle in [
@@ -364,14 +432,14 @@ mod tests {
             "close        DOUBLE",
             "volume       LONG",
             "oi           LONG",
-            "DEDUP UPSERT KEYS(ts, security_id, segment)",
+            "DEDUP UPSERT KEYS(ts, security_id, segment, feed)",
             "PARTITION BY DAY",
         ] {
             assert!(ddl.contains(needle), "DDL missing: {needle}\n{ddl}");
         }
         // `oi` must NOT be part of the DEDUP key (it is mutable data, not identity).
         assert!(
-            ddl.contains("DEDUP UPSERT KEYS(ts, security_id, segment)"),
+            !ddl.contains("segment, feed, oi") && !ddl.contains("oi)"),
             "oi must not be a DEDUP key column"
         );
     }
@@ -413,6 +481,7 @@ mod tests {
     fn test_append_row_fills_buffer_with_table_and_segment() {
         let mut w = PrevDayOhlcvWriter::for_test();
         let row = PrevDayOhlcvRow {
+            feed: "dhan",
             ts_ist_nanos: (1_780_012_800_i64 + 19_800) * 1_000_000_000,
             security_id: 13,
             segment: "IDX_I",
@@ -428,6 +497,7 @@ mod tests {
         let bytes = w.buffer_bytes();
         let text = String::from_utf8_lossy(bytes);
         assert!(text.contains("prev_day_ohlcv"), "table name in wire bytes");
+        assert!(text.contains("feed=dhan"), "feed symbol in wire bytes");
         assert!(text.contains("IDX_I"), "segment in wire bytes");
         assert!(text.contains("oi="), "oi column in wire bytes");
     }
@@ -437,6 +507,7 @@ mod tests {
         // F&O contract: OI is meaningful and must reach the wire.
         let mut w = PrevDayOhlcvWriter::for_test();
         let row = PrevDayOhlcvRow {
+            feed: "dhan",
             ts_ist_nanos: 1_000_000_000,
             security_id: 49_081,
             segment: "NSE_FNO",
@@ -465,6 +536,7 @@ mod tests {
     fn test_two_appends_increment_pending() {
         let mut w = PrevDayOhlcvWriter::for_test();
         let row = PrevDayOhlcvRow {
+            feed: "dhan",
             ts_ist_nanos: 1_000_000_000,
             security_id: 25,
             segment: "NSE_EQ",

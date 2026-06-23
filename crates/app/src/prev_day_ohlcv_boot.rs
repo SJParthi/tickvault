@@ -481,6 +481,9 @@ pub async fn run_prev_day_ohlcv_fetch(
                     continue;
                 };
                 let prow = PrevDayOhlcvRow {
+                    // Dhan REST historical is the only prev-day source today; a
+                    // future Groww prev-day fetch stamps Feed::Groww here.
+                    feed: tickvault_common::feed::Feed::Dhan.as_str(),
                     ts_ist_nanos: prev_day_ist_nanos_from_utc_secs(candle.utc_epoch_secs),
                     security_id: sid,
                     segment: segment_static(&row.segment),

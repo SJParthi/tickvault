@@ -645,6 +645,9 @@ impl WebSocketConnection {
         let row = tickvault_common::ws_event_types::WsEventAuditRow {
             event_ts_ist_nanos: now_ist_nanos,
             trading_date_ist_nanos,
+            // This is the Dhan main-feed connection. A future Groww connection
+            // stamps Feed::Groww so their lifecycle events stay distinct rows.
+            feed: tickvault_common::feed::Feed::Dhan,
             ws_type: self.ws_audit_type,
             connection_index: i64::try_from(usize::from(self.connection_id)).unwrap_or(0),
             pool_size: self.ws_audit_pool_size,

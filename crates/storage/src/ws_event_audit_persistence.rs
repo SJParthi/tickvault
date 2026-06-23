@@ -56,7 +56,7 @@ pub const WS_EVENT_AUDIT_TABLE: &str = "ws_event_audit";
 /// `(ws_type, connection_index)` is the composite-unique connection key per
 /// I-P1-11 (extended to WS streams); `event_kind` distinguishes the 6 kinds.
 pub const DEDUP_KEY_WS_EVENT_AUDIT: &str =
-    "ts, trading_date_ist, ws_type, connection_index, event_kind";
+    "ts, trading_date_ist, feed, ws_type, connection_index, event_kind";
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
@@ -67,6 +67,7 @@ pub fn ws_event_audit_create_ddl() -> String {
         "CREATE TABLE IF NOT EXISTS {WS_EVENT_AUDIT_TABLE} (\
             ts                TIMESTAMP, \
             trading_date_ist  TIMESTAMP, \
+            feed              SYMBOL, \
             ws_type           SYMBOL, \
             connection_index  LONG, \
             pool_size         LONG, \
@@ -121,12 +122,11 @@ pub async fn ensure_ws_event_audit_table(questdb_config: &QuestDbConfig) {
         Err(err) => error!(?err, "ws_event_audit: CREATE TABLE request failed"),
     }
 
-    // Feed-provenance label (operator 2026-06-19, "all tables"): self-heal ALTER
-    // only — additive, idempotent, NON-key. Audit tables carry rigid
-    // exact-column-count DDL ratchets, so the column is added via ALTER (lands
-    // on new + existing tables) WITHOUT touching the CREATE DDL string. Cosmetic
-    // here (an audit row is feed-agnostic); present for uniform "every table has
-    // feed". Free on every boot.
+    // Per-feed identity (operator 2026-06-23): `feed` is now a DEDUP-key column —
+    // a Dhan and a Groww connection can share `(ws_type, connection_index)`, so
+    // their lifecycle events must stay distinct rows. Fresh tables get the column
+    // + key from the CREATE DDL above; this self-heal ALTER lands `feed` on tables
+    // created before the directive. Idempotent. Free on every boot.
     let alter_feed_ddl =
         format!("ALTER TABLE {WS_EVENT_AUDIT_TABLE} ADD COLUMN IF NOT EXISTS feed SYMBOL");
     match client
@@ -143,6 +143,32 @@ pub async fn ensure_ws_event_audit_table(questdb_config: &QuestDbConfig) {
                 "ws_event_audit: ALTER ADD COLUMN feed returned non-2xx");
         }
         Err(err) => error!(?err, "ws_event_audit: ALTER ADD COLUMN feed request failed"),
+    }
+
+    // Re-apply the DEDUP key (now including `feed`) on tables created before the
+    // 2026-06-23 directive. Runs AFTER the `feed` column ALTER so the key column
+    // exists. Idempotent; never drops the table (SEBI). Mirrors the ticks +
+    // prev_day_ohlcv `DEDUP ENABLE` self-heal.
+    let dedup_reenable_ddl = format!(
+        "ALTER TABLE {WS_EVENT_AUDIT_TABLE} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_WS_EVENT_AUDIT})"
+    );
+    match client
+        .get(&base_url)
+        .query(&[("query", dedup_reenable_ddl.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            error!(%status, body = %body.chars().take(200).collect::<String>(),
+                "ws_event_audit: DEDUP ENABLE UPSERT KEYS returned non-2xx");
+        }
+        Err(err) => error!(
+            ?err,
+            "ws_event_audit: DEDUP ENABLE UPSERT KEYS request failed"
+        ),
     }
 }
 
@@ -223,6 +249,8 @@ impl WsEventAuditWriter {
         self.buffer
             .table(WS_EVENT_AUDIT_TABLE)
             .context("table")?
+            .symbol("feed", r.feed.as_str())
+            .context("feed")?
             .symbol("ws_type", r.ws_type.as_str())
             .context("ws_type")?
             .symbol("event_kind", r.event_kind.as_str())
@@ -285,6 +313,7 @@ mod tests {
         WsEventAuditRow {
             event_ts_ist_nanos: 1_770_000_000_000_000_000,
             trading_date_ist_nanos: 1_769_990_400_000_000_000,
+            feed: tickvault_common::feed::Feed::Dhan,
             ws_type: WsType::MainFeed,
             connection_index: 0,
             pool_size: 1,
@@ -304,6 +333,7 @@ mod tests {
         for col in [
             "ts ",
             "trading_date_ist",
+            "feed",
             "ws_type",
             "connection_index",
             "pool_size",
@@ -330,6 +360,9 @@ mod tests {
         assert!(DEDUP_KEY_WS_EVENT_AUDIT.contains("ws_type"));
         assert!(DEDUP_KEY_WS_EVENT_AUDIT.contains("connection_index"));
         assert!(DEDUP_KEY_WS_EVENT_AUDIT.contains("event_kind"));
+        // Per-feed identity (2026-06-23): Dhan + Groww connections can share
+        // (ws_type, connection_index), so `feed` MUST be in the key.
+        assert!(DEDUP_KEY_WS_EVENT_AUDIT.contains("feed"));
         let ddl = ws_event_audit_create_ddl();
         assert!(ddl.contains(&format!("DEDUP UPSERT KEYS({DEDUP_KEY_WS_EVENT_AUDIT})")));
     }
