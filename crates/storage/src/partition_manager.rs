@@ -56,7 +56,6 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // Audit + daily-data tables (SEBI 5y → detach to S3 cold when archival ships).
     "instrument_fetch_audit",
     "instrument_lifecycle_audit",
-    "option_chain_minute_snapshot",
     "prev_day_ohlcv",
     "cross_verify_1m_audit",
     "index_constituency",
@@ -403,7 +402,6 @@ mod tests {
         for live in [
             "instrument_fetch_audit",
             "instrument_lifecycle_audit",
-            "option_chain_minute_snapshot",
             "prev_day_ohlcv",
             "cross_verify_1m_audit",
             "index_constituency",
