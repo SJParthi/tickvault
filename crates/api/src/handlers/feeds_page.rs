@@ -59,6 +59,16 @@ const FEEDS_PAGE_HTML: &str = r#"<!DOCTYPE html>
           border-radius: 999px; margin-left: 8px; }
   .pill.on  { background: #15803d22; color: #15803d; }
   .pill.off { background: #99999922; color: #777; }
+  /* Live-feed health verdict badge (SP6) — one colour per truthful verdict. */
+  .badge { font-size: 0.7rem; font-weight: 800; letter-spacing: .03em;
+           padding: 3px 9px; border-radius: 999px; margin-top: 6px;
+           display: inline-block; }
+  .badge.v-ok       { background: #15803d22; color: #15803d; } /* green  */
+  .badge.v-degraded { background: #b4530922; color: #b45309; } /* amber  */
+  .badge.v-down     { background: #b91c1c22; color: #b91c1c; } /* red    */
+  .badge.v-disabled { background: #99999922; color: #777;    } /* grey   */
+  .badge.v-unknown  { background: #6d28d922; color: #6d28d9; } /* purple */
+  .badge.v-none     { background: #8881;     color: #999;    } /* neutral */
   .switch { position: relative; width: 52px; height: 30px; flex: none; }
   .switch input { opacity: 0; width: 0; height: 0; }
   .slider { position: absolute; inset: 0; background: #ccc; border-radius: 999px;
@@ -119,27 +129,65 @@ function setStatus(msg, cls) {
   statusEl.className = cls || "";
 }
 
+// SP6: verdict → badge label + CSS class. Unknown server values fall back to a
+// neutral badge (never a wrong colour, never a crash).
+const VERDICTS = {
+  ok:       { label: "LIVE",     cls: "v-ok"       },
+  degraded: { label: "DEGRADED", cls: "v-degraded" },
+  down:     { label: "DOWN",     cls: "v-down"     },
+  disabled: { label: "OFF",      cls: "v-disabled" },
+  unknown:  { label: "UNKNOWN",  cls: "v-unknown"  },
+};
+
+// SP6 in-flight guard (hostile-review HIGH): refresh() is async with two awaited
+// fetches; the 5s auto-refresh timer + a manual Save on a slow network could
+// otherwise overlap and re-render (replaceChildren) mid-click, snapping a toggle
+// back. A single boolean serialises refreshes — no overlap, no flicker, no leak.
+let refreshing = false;
 async function refresh() {
+  if (refreshing) return;
+  refreshing = true;
   try {
     const res = await fetch("/api/feeds", { headers: authHeaders() });
     if (res.status === 401) {
       setStatus("Unauthorized — enter your API token above.", "err");
-      feedsEl.innerHTML = "";
+      feedsEl.replaceChildren();
       return;
     }
     if (!res.ok) { setStatus("Failed to read feeds (HTTP " + res.status + ").", "err"); return; }
     const data = await res.json();
-    render(data);
+    // SP6: best-effort live-feed health overlay. If it fails, the on/off rows
+    // still render (badge shows a neutral "—") — the control never breaks.
+    const health = await fetchHealth();
+    render(data, health);
     setStatus("Updated " + new Date().toLocaleTimeString(), "ok");
   } catch (e) {
     setStatus("Network error reading feeds.", "err");
+  } finally {
+    refreshing = false;
   }
 }
 
-function render(data) {
+// SP6: fetch GET /api/feeds/health and index the rows by feed key. Best-effort:
+// any error returns an empty map so the page degrades to the on/off rows.
+async function fetchHealth() {
+  try {
+    const res = await fetch("/api/feeds/health", { headers: authHeaders() });
+    if (!res.ok) return {};
+    const body = await res.json();
+    const byKey = {};
+    for (const row of (body.feeds || [])) { byKey[row.feed] = row; }
+    return byKey;
+  } catch (e) {
+    return {};
+  }
+}
+
+function render(data, health) {
   // Build every node with createElement + textContent (never innerHTML) so no
   // value can ever be interpreted as markup — XSS-proof by construction even if a
   // future feed label/description comes from the server (security-review HIGH).
+  health = health || {};
   feedsEl.replaceChildren();
   for (const f of FEEDS) {
     const enabled = !!data[f.key + "_enabled"];
@@ -166,6 +214,38 @@ function render(data) {
 
     left.appendChild(nameDiv);
     left.appendChild(metaDiv);
+
+    // SP6: live-feed health verdict badge + a compact, truthful health line.
+    // The verdict comes straight from GET /api/feeds/health (registry-backed),
+    // so the badge is never a false green — DOWN on disconnect/silence,
+    // DEGRADED on dropped ticks, UNKNOWN if a feed's signals aren't wired.
+    const hv = health[f.key];
+    const badge = document.createElement("div");
+    const vmap = (hv && VERDICTS[hv.verdict]) ? VERDICTS[hv.verdict] : null;
+    badge.className = "badge " + (vmap ? vmap.cls : "v-none");
+    // Honesty (hostile-review LOW): a neutral "—" means we could NOT read the
+    // health — never imply "fine". Tooltip disambiguates the grey badge.
+    if (!vmap) badge.title = "health unavailable — could not read /api/feeds/health";
+    badge.textContent = vmap ? vmap.label : "—";
+    left.appendChild(badge);
+
+    if (hv) {
+      const healthLine = document.createElement("div");
+      healthLine.className = "meta";
+      // Plain-English, no jargon (operator commandments). Numbers are real.
+      const parts = [];
+      if (hv.reason) parts.push(hv.reason);
+      parts.push(hv.connected ? "connected" : "not connected");
+      if (hv.last_tick_age_secs === null || hv.last_tick_age_secs === undefined) {
+        parts.push("no tick yet");
+      } else {
+        parts.push("last tick " + hv.last_tick_age_secs + "s ago");
+      }
+      parts.push((hv.ticks_total || 0) + " ticks");
+      if ((hv.drops_total || 0) > 0) parts.push(hv.drops_total + " dropped");
+      healthLine.textContent = parts.join(" · ");
+      left.appendChild(healthLine);
+    }
 
     const sw = document.createElement("label");
     sw.className = "switch";
@@ -212,6 +292,11 @@ document.getElementById("save").addEventListener("click", () => {
 });
 
 refresh();
+// SP6: auto-refresh every 5s so the health lights update live ("watch in real
+// time"). The on/off control still works between ticks. Skip polling when the
+// tab is hidden (security-review LOW — no needless load on a backgrounded tab);
+// a manual focus/Save still refreshes immediately.
+setInterval(() => { if (!document.hidden) refresh(); }, 5000);
 </script>
 </body>
 </html>
@@ -396,6 +481,68 @@ mod tests {
         assert!(
             !FEEDS_PAGE_HTML.contains("\"key\":\"dhan\""),
             "template must NOT contain a hardcoded feed row"
+        );
+    }
+
+    #[test]
+    fn test_feeds_page_fetches_health_endpoint() {
+        // SP6: the page must read GET /api/feeds/health to render the verdict
+        // badges. Guards against the page drifting from the health API.
+        assert!(
+            FEEDS_PAGE_HTML.contains("/api/feeds/health"),
+            "page fetches the live-feed health endpoint"
+        );
+    }
+
+    #[test]
+    fn test_feeds_page_renders_verdict_badge() {
+        // SP6: a verdict badge element is built (via createElement + textContent,
+        // never innerHTML) and the verdict lookup table is present.
+        assert!(
+            FEEDS_PAGE_HTML.contains("class=\"badge ") || FEEDS_PAGE_HTML.contains("\"badge \""),
+            "renders a verdict badge element"
+        );
+        assert!(
+            FEEDS_PAGE_HTML.contains("const VERDICTS"),
+            "has the verdict → label/colour lookup"
+        );
+        // The badge text/colour come from textContent + className, not innerHTML.
+        assert!(
+            FEEDS_PAGE_HTML.contains("badge.textContent"),
+            "badge label set via textContent (XSS-proof)"
+        );
+    }
+
+    #[test]
+    fn test_feeds_page_has_all_five_verdict_colours() {
+        // SP6: every truthful verdict has a distinct colour class so the operator
+        // can tell OK / DEGRADED / DOWN / DISABLED / UNKNOWN apart at a glance.
+        for cls in ["v-ok", "v-degraded", "v-down", "v-disabled", "v-unknown"] {
+            assert!(
+                FEEDS_PAGE_HTML.contains(cls),
+                "verdict colour class '{cls}' present"
+            );
+        }
+    }
+
+    #[test]
+    fn test_feeds_page_auto_refreshes() {
+        // SP6: the lights must update live (operator: "watch in real time").
+        assert!(
+            FEEDS_PAGE_HTML.contains("setInterval(") && FEEDS_PAGE_HTML.contains("refresh()"),
+            "page auto-refreshes the health on an interval"
+        );
+    }
+
+    #[test]
+    fn test_feeds_page_serialises_refresh_no_overlap() {
+        // SP6 (hostile-review HIGH): the 5s auto-refresh + a manual Save must not
+        // overlap and re-render mid-click. An in-flight guard serialises refreshes.
+        assert!(
+            FEEDS_PAGE_HTML.contains("let refreshing = false")
+                && FEEDS_PAGE_HTML.contains("if (refreshing) return"),
+            "refresh() has an in-flight guard so concurrent refreshes can't race \
+             replaceChildren() mid-toggle"
         );
     }
 
