@@ -92,7 +92,7 @@ reqwest = { version = "0.13.4", features = ["json", "rustls", "charset", "http2"
 # ---- Section 8: HTTP Server ----
 axum = { version = "0.8.9", features = ["macros", "ws"] }
 tower = { version = "0.5.3", features = ["full"] }
-tower-http = { version = "0.6.11", features = ["cors", "trace", "compression-gzip", "fs"] }
+tower-http = { version = "0.7.0", features = ["cors", "trace", "compression-gzip", "fs"] }
 
 # ---- Section 9: Configuration ----
 toml = "1.1.2"
