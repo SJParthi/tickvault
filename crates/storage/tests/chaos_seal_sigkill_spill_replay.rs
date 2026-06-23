@@ -20,6 +20,7 @@
 
 use std::path::PathBuf;
 
+use tickvault_common::feed::Feed;
 use tickvault_storage::seal_spill::{SealSpillWriter, SerializedSeal};
 use tickvault_trading::candles::{BufferedSeal, LiveCandleState, TfIndex};
 
@@ -47,7 +48,7 @@ fn mk_serialized(i: usize) -> SerializedSeal {
     state.bucket_start_cumulative = 1000;
     state.oi = 50_000 + i as i64;
     state.tick_count = 5;
-    let buffered = BufferedSeal::new((i % 11_000) as u32 + 1, 0, TfIndex::M1, state);
+    let buffered = BufferedSeal::new((i % 11_000) as u32 + 1, 0, TfIndex::M1, state, Feed::Dhan);
     SerializedSeal::from(&buffered)
 }
 

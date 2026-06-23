@@ -6523,6 +6523,12 @@ fn spawn_engine_b_aggregator(
                     let stats = agg_clone.consume_tick(
                         &tick,
                         tick.exchange_segment_code,
+                        // Dhan feed: re-fold 1-bucket-late ticks (Option B); the
+                        // `u32` Quote-packet volume needs no override (None ⇒ the
+                        // cell reads tick.volume). Byte-identical to the
+                        // pre-FeedStrategy Dhan behaviour.
+                        tickvault_trading::candles::FeedStrategy::DHAN,
+                        None,
                         |tf, mut state| {
                             // 1d historical-only (operator directive 2026-06-02):
                             // the 1d timeframe is NEVER tick-calculated. It is
@@ -6554,6 +6560,7 @@ fn spawn_engine_b_aggregator(
                                 tick.exchange_segment_code,
                                 tf,
                                 state,
+                                tickvault_common::feed::Feed::Dhan,
                             );
                             if sender.try_send(seal).is_err() {
                                 metrics::counter!("tv_seal_mpsc_dropped_total").increment(1);
@@ -6705,7 +6712,13 @@ fn spawn_engine_b_aggregator(
                 // G3 real-time proof (capture before move) — same contract as
                 // the per-tick seal site above.
                 let close_pct_nonzero = state.close_pct_from_prev_day != 0.0;
-                let seal = BufferedSeal::new(security_id, segment_code, tf, state);
+                let seal = BufferedSeal::new(
+                    security_id,
+                    segment_code,
+                    tf,
+                    state,
+                    tickvault_common::feed::Feed::Dhan,
+                );
                 if sender.try_send(seal).is_err() {
                     metrics::counter!("tv_seal_mpsc_dropped_total").increment(1);
                     dropped = dropped.saturating_add(1);

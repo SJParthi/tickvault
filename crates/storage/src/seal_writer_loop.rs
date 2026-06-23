@@ -148,6 +148,7 @@ pub async fn run_seal_writer_loop(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use tickvault_common::feed::Feed;
     use tickvault_trading::candles::{BufferedSeal, LiveCandleState, TfIndex};
 
     fn temp_pair(name: &str) -> (PathBuf, PathBuf) {
@@ -189,7 +190,7 @@ mod tests {
         state.close_pct_from_prev_day = 1.5;
         state.oi_pct_from_prev_day = -0.2;
         state.volume_pct_from_prev_day = 12.3;
-        BufferedSeal::new(sid, seg, tf, state)
+        BufferedSeal::new(sid, seg, tf, state, Feed::Dhan)
     }
 
     #[test]
