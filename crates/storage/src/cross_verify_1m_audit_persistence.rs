@@ -23,7 +23,7 @@
 //!     our_value        DOUBLE,
 //!     dhan_value       DOUBLE
 //! ) timestamp(ts) PARTITION BY DAY
-//!   DEDUP UPSERT KEYS(trading_date_ist, security_id, segment, minute_ts_ist, field);
+//!   DEDUP UPSERT KEYS(ts, trading_date_ist, security_id, segment, minute_ts_ist, field);
 //! ```
 //!
 //! DEDUP key includes `(security_id, segment)` per I-P1-11 plus the
@@ -48,11 +48,13 @@ use tickvault_common::config::QuestDbConfig;
 /// QuestDB table name. One row per mismatched (instrument, minute, field).
 pub const CROSS_VERIFY_1M_AUDIT_TABLE: &str = "cross_verify_1m_audit";
 
-/// DEDUP UPSERT key — includes the designated timestamp-partition discriminators
-/// plus `(security_id, segment)` per I-P1-11. The `dedup_segment_meta_guard`
-/// workspace test scans this constant; it MUST mention `segment`.
+/// DEDUP UPSERT key — the designated timestamp `ts` FIRST (QuestDB requires the
+/// designated timestamp column in every DEDUP key — 2026-05-18 production HTTP-400
+/// regression), then the discriminators + `(security_id, segment)` per I-P1-11.
+/// The `dedup_segment_meta_guard` workspace test scans this constant; it MUST
+/// mention `ts` AND `segment`.
 pub const DEDUP_KEY_CROSS_VERIFY_1M_AUDIT: &str =
-    "trading_date_ist, security_id, segment, minute_ts_ist, field";
+    "ts, trading_date_ist, security_id, segment, minute_ts_ist, field";
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
@@ -229,6 +231,31 @@ pub async fn ensure_cross_verify_1m_audit_table(questdb_config: &QuestDbConfig) 
             "cross_verify_1m_audit: ALTER ADD COLUMN feed request failed"
         ),
     }
+
+    // Self-heal the DEDUP key on tables created BEFORE the designated-timestamp
+    // fix (2026-06-23): the old key omitted `ts`, which QuestDB rejects. Re-apply
+    // the corrected key in place. Idempotent; never drops the table (SEBI).
+    let dedup_reenable_ddl = format!(
+        "ALTER TABLE {CROSS_VERIFY_1M_AUDIT_TABLE} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_CROSS_VERIFY_1M_AUDIT})"
+    );
+    match client
+        .get(&base_url)
+        .query(&[("query", dedup_reenable_ddl.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            error!(%status, body = %body.chars().take(200).collect::<String>(),
+                "cross_verify_1m_audit: DEDUP ENABLE UPSERT KEYS returned non-2xx");
+        }
+        Err(err) => error!(
+            ?err,
+            "cross_verify_1m_audit: DEDUP ENABLE UPSERT KEYS request failed"
+        ),
+    }
 }
 
 /// Lazy-connect ILP writer for the `cross_verify_1m_audit` table. Mirrors
@@ -372,6 +399,15 @@ mod tests {
         assert!(DEDUP_KEY_CROSS_VERIFY_1M_AUDIT.contains("security_id"));
         assert!(DEDUP_KEY_CROSS_VERIFY_1M_AUDIT.contains("minute_ts_ist"));
         assert!(DEDUP_KEY_CROSS_VERIFY_1M_AUDIT.contains("field"));
+        // QuestDB requires the designated timestamp `ts` in every DEDUP key
+        // (2026-05-18 HTTP-400 regression). Pin it as the first token.
+        assert!(
+            DEDUP_KEY_CROSS_VERIFY_1M_AUDIT
+                .split([',', ' '])
+                .map(str::trim)
+                .any(|t| t == "ts"),
+            "DEDUP key must include the designated timestamp `ts`: {DEDUP_KEY_CROSS_VERIFY_1M_AUDIT}"
+        );
     }
 
     #[test]
@@ -388,7 +424,7 @@ mod tests {
             "our_value        DOUBLE",
             "dhan_value       DOUBLE",
             "PARTITION BY DAY",
-            "DEDUP UPSERT KEYS(trading_date_ist, security_id, segment, minute_ts_ist, field)",
+            "DEDUP UPSERT KEYS(ts, trading_date_ist, security_id, segment, minute_ts_ist, field)",
         ] {
             assert!(ddl.contains(needle), "DDL missing: {needle}\n{ddl}");
         }
