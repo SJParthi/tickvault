@@ -66,7 +66,8 @@ pub fn build_router(state: SharedAppState, allowed_origins: &[String], dry_run: 
     // In dry_run mode: missing token = passthrough (dev mode).
     // In live mode: missing token = auto-generated token, auth still enforced.
     let auth_config = ApiAuthConfig::from_env(dry_run);
-    build_router_with_auth(state, allowed_origins, auth_config)
+    // dry-run → tokenless feed-toggle (operator flips feeds on the page without a token).
+    build_router_with_auth(state, allowed_origins, auth_config, dry_run)
 }
 
 /// Builds the router with a pre-resolved [`ApiAuthConfig`].
@@ -83,11 +84,17 @@ pub fn build_router(state: SharedAppState, allowed_origins: &[String], dry_run: 
 /// * `state` — shared application state for handlers
 /// * `allowed_origins` — list of allowed CORS origin URLs (from config)
 /// * `auth_config` — pre-resolved auth config (SSM-fetched in prod, env-fallback in dev)
+/// * `auth_config` — pre-resolved auth config (SSM-fetched in prod, env-fallback in dev)
+/// * `feed_toggle_public` — when `true` (dry-run/sandbox, no real orders) the mutating
+///   `POST /api/feeds/{feed}` is PUBLIC so the operator flips feeds tokenless on
+///   localhost; when `false` (live trading) it stays bearer-protected. The
+///   Dhan-disable safety gate (`can_disable_dhan`) is unchanged either way.
 // O(1) EXEMPT: begin — cold path, called once at boot
 pub fn build_router_with_auth(
     state: SharedAppState,
     allowed_origins: &[String],
     auth_config: ApiAuthConfig,
+    feed_toggle_public: bool,
 ) -> Router {
     let cors = build_cors_layer(allowed_origins);
 
@@ -99,20 +106,27 @@ pub fn build_router_with_auth(
     // runtime per-feed enable/disable. `GET /api/feeds` reports state;
     // `POST /api/feeds/{feed}` flips it (Groww only — slice 1). Behind bearer
     // auth so only the operator can change the live feed topology.
-    // Only the MUTATING flip stays bearer-protected (operator AskUserQuestion
-    // 2026-06-23: "public read, authed toggle"). The read-only status + health
-    // GETs carry no secrets (FeedHealthRow is &'static str only) and move to the
-    // PUBLIC router below so the /feeds page renders with no token; disabling or
-    // enabling a feed still requires the bearer token.
-    let protected_routes: Router<SharedAppState> = Router::new()
-        .route(
-            "/api/feeds/{feed}",
+    // The read-only status + health GETs carry no secrets (FeedHealthRow is
+    // &'static str only) → always PUBLIC (below) so the /feeds page renders with
+    // no token. The MUTATING flip `POST /api/feeds/{feed}`:
+    //   • dry-run/sandbox (feed_toggle_public=true, no real orders) → PUBLIC, so
+    //     the operator flips feeds tokenless on localhost (operator 2026-06-23);
+    //   • live trading (false) → bearer-protected.
+    // The Dhan-disable safety gate (can_disable_dhan) is unchanged either way.
+    // `auth_config` is consumed by the layer below regardless of branch (so no
+    // unused-variable lint when the toggle is public and the router is empty).
+    const FEED_TOGGLE_PATH: &str = "/api/feeds/{feed}";
+    let protected_base: Router<SharedAppState> = if feed_toggle_public {
+        Router::new()
+    } else {
+        Router::new().route(
+            FEED_TOGGLE_PATH,
             axum::routing::post(handlers::feeds::set_feed),
         )
-        .layer(axum::middleware::from_fn_with_state(
-            auth_config,
-            require_bearer_auth,
-        ));
+    };
+    let protected_routes: Router<SharedAppState> = protected_base.layer(
+        axum::middleware::from_fn_with_state(auth_config, require_bearer_auth),
+    );
 
     // Public routes — read-only GET endpoints (no auth required).
     //
@@ -174,6 +188,18 @@ pub fn build_router_with_auth(
             "/api/debug/cross-verify/latest",
             axum::routing::get(handlers::debug::cross_verify_latest),
         );
+
+    // dry-run/sandbox: the mutating feed-toggle is PUBLIC (tokenless) so the
+    // /feeds page can flip feeds without a token on localhost. In live trading
+    // this branch is skipped and the toggle lives in `protected_routes` above.
+    let public_routes = if feed_toggle_public {
+        public_routes.route(
+            FEED_TOGGLE_PATH,
+            axum::routing::post(handlers::feeds::set_feed),
+        )
+    } else {
+        public_routes
+    };
 
     // PR #2 (2026-05-18): conditional `/api/movers/v2` route + the
     // `cascade_fanout` accessor on AppState retired. See above comment
@@ -316,7 +342,7 @@ mod tests {
         let token = SecretString::from("ssm-fetched-token-test".to_string());
         let auth_config = ApiAuthConfig::from_token(token);
         assert!(auth_config.enabled, "from_token must enable auth");
-        let _router = build_router_with_auth(state, &[], auth_config);
+        let _router = build_router_with_auth(state, &[], auth_config, false);
     }
 
     #[test]
@@ -489,7 +515,7 @@ mod tests {
         // mutating POST /api/feeds/{feed} is bearer-gated (next test). Regression
         // ratchet: this must stay 200 without a token.
         let auth = ApiAuthConfig::from_token(SecretString::from("secret-tok".to_string()));
-        let router = build_router_with_auth(auth_test_state(), &[], auth);
+        let router = build_router_with_auth(auth_test_state(), &[], auth, false);
 
         let response = router
             .oneshot(
@@ -514,7 +540,7 @@ mod tests {
         // FeedHealthRow is &'static str only) so the operator can watch live-feed
         // health without a token.
         let auth = ApiAuthConfig::from_token(SecretString::from("secret-tok".to_string()));
-        let router = build_router_with_auth(auth_test_state(), &[], auth);
+        let router = build_router_with_auth(auth_test_state(), &[], auth, false);
 
         let response = router
             .oneshot(
@@ -536,7 +562,7 @@ mod tests {
         use tower::ServiceExt;
 
         let auth = ApiAuthConfig::from_token(SecretString::from("secret-tok".to_string()));
-        let router = build_router_with_auth(auth_test_state(), &[], auth);
+        let router = build_router_with_auth(auth_test_state(), &[], auth, false);
 
         let response = router
             .oneshot(
@@ -553,6 +579,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_feeds_post_public_200_without_token_in_dry_run() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use secrecy::SecretString;
+        use tower::ServiceExt;
+
+        // operator AskUserQuestion 2026-06-23 ("tokenless toggle in dev"): with
+        // feed_toggle_public=true (dry-run/sandbox, no real orders) the mutating
+        // POST /api/feeds/{feed} is PUBLIC so the operator flips feeds on the page
+        // with no token. Auth is still ENABLED (token present) — proving the route
+        // is public, not that auth is off. Regression ratchet: must stay 200.
+        let auth = ApiAuthConfig::from_token(SecretString::from("secret-tok".to_string()));
+        let router = build_router_with_auth(auth_test_state(), &[], auth, true);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/feeds/groww")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"enabled":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn test_feeds_page_is_public_200_without_auth() {
         use axum::body::Body;
         use axum::http::Request;
@@ -563,7 +618,7 @@ mod tests {
         // public route — only the data/toggle `/api/feeds` calls it issues are
         // bearer-gated. The page must load so the operator can paste their token.
         let auth = ApiAuthConfig::from_token(SecretString::from("secret-tok".to_string()));
-        let router = build_router_with_auth(auth_test_state(), &[], auth);
+        let router = build_router_with_auth(auth_test_state(), &[], auth, false);
 
         let response = router
             .oneshot(

@@ -2015,6 +2015,9 @@ async fn main() -> Result<()> {
             api_state,
             &config.api.allowed_origins,
             api_auth_config_fast,
+            // dry-run/sandbox → tokenless feed-toggle so the /feeds page flips feeds
+            // without a token; live trading keeps the toggle bearer-protected.
+            config.strategy.dry_run,
         );
         let bind_addr: SocketAddr = format_bind_addr(&config.api.host, config.api.port)
             .parse()
@@ -4867,6 +4870,9 @@ async fn main() -> Result<()> {
         api_state,
         &config.api.allowed_origins,
         api_auth_config,
+        // dry-run/sandbox → tokenless feed-toggle so the /feeds page flips feeds
+        // without a token; live trading keeps the toggle bearer-protected.
+        config.strategy.dry_run,
     );
 
     let bind_addr: SocketAddr = format_bind_addr(&config.api.host, config.api.port)
