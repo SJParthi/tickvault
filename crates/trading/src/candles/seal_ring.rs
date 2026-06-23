@@ -48,6 +48,8 @@
 
 use std::collections::VecDeque;
 
+use tickvault_common::feed::Feed;
+
 use crate::candles::{LiveCandleState, TfIndex};
 
 /// Maximum number of sealed bars buffered in RAM before overflow
@@ -82,11 +84,22 @@ pub struct BufferedSeal {
     /// tick_count + 3 pct fields (already stamped by the seal-time
     /// writer per L-H6). Bucket-open IST seconds = `state.bucket_start_ist_secs`.
     pub state: LiveCandleState,
+    /// Broker-source provenance ([`Feed::Dhan`] / [`Feed::Groww`]). The seal
+    /// writer stamps `feed.as_str()` into the `candles_<tf>` `feed` SYMBOL column
+    /// (part of the DEDUP key `(ts, security_id, segment, feed)`), so a Dhan candle
+    /// and a Groww candle for the SAME minute/instrument are BOTH kept — distinct
+    /// feeds = distinct observations, never a collision (operator lock 2026-06-19
+    /// "same tables + feed column"). ONE feed-parameterized writer serves both feeds.
+    pub feed: Feed,
 }
 
 impl BufferedSeal {
     /// Constructs a buffered seal from the per-TF callback the
     /// `MultiTfAggregator::consume_tick` emits.
+    ///
+    /// `feed` is the source feed ([`Feed::Dhan`] / [`Feed::Groww`]); the writer
+    /// stamps it as the `feed` SYMBOL so the two feeds never collide under the
+    /// shared candle DEDUP key.
     ///
     /// Note: the `state.close_pct_from_prev_day` / `oi_pct_from_prev_day` /
     /// `volume_pct_from_prev_day` fields are 0.0 unless the caller
@@ -100,12 +113,14 @@ impl BufferedSeal {
         exchange_segment_code: u8,
         tf: TfIndex,
         state: LiveCandleState,
+        feed: Feed,
     ) -> Self {
         Self {
             security_id,
             exchange_segment_code,
             tf,
             state,
+            feed,
         }
     }
 }
@@ -277,7 +292,13 @@ mod tests {
         bucket_start: u32,
         close_price: f64,
     ) -> BufferedSeal {
-        BufferedSeal::new(sid, seg, tf, mk_state(bucket_start, close_price))
+        BufferedSeal::new(
+            sid,
+            seg,
+            tf,
+            mk_state(bucket_start, close_price),
+            Feed::Dhan,
+        )
     }
 
     #[test]

@@ -206,10 +206,12 @@ impl ShadowCandleWriter {
             .table(row.table_name)
             .with_context(|| format!("candle append: invalid table name {}", row.table_name))?
             // Feed-provenance label (operator 2026-06-19, "same tables + feed
-            // column"). Constant `feed='dhan'` — part of the DEDUP key so a Dhan
-            // candle and a Groww candle for the same minute/instrument never
-            // collide. Stamped as a SYMBOL alongside `segment`. Zero-alloc.
-            .symbol("feed", CANDLE_FEED_DHAN)
+            // column"). Sourced from the SEAL's feed (`Feed::Dhan` / `Feed::Groww`
+            // via `row.feed = seal.feed.as_str()`) — the ONE feed-parameterized
+            // writer stamps whichever feed produced the seal, never a hardcoded
+            // constant. Part of the DEDUP key so a Dhan candle and a Groww candle
+            // for the same minute/instrument never collide. Zero-alloc `&'static str`.
+            .symbol("feed", row.feed)
             .with_context(|| "candle append: symbol(feed) failed")?
             .symbol("segment", row.segment)
             .with_context(|| "candle append: symbol(segment) failed")?
@@ -284,9 +286,17 @@ impl ShadowCandleWriter {
 mod tests {
     use super::*;
     use tickvault_common::constants::{EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_NSE_EQ};
+    use tickvault_common::feed::Feed;
     use tickvault_trading::candles::{LiveCandleState, TfIndex};
 
-    fn mk_seal(sid: u32, seg: u8, tf: TfIndex, bucket: u32, close: f64) -> BufferedSeal {
+    fn mk_seal_feed(
+        sid: u32,
+        seg: u8,
+        tf: TfIndex,
+        bucket: u32,
+        close: f64,
+        feed: Feed,
+    ) -> BufferedSeal {
         let mut state = LiveCandleState::empty();
         state.bucket_start_ist_secs = bucket;
         state.open = 100.0;
@@ -300,7 +310,11 @@ mod tests {
         state.close_pct_from_prev_day = 1.5;
         state.oi_pct_from_prev_day = -0.2;
         state.volume_pct_from_prev_day = 12.3;
-        BufferedSeal::new(sid, seg, tf, state)
+        BufferedSeal::new(sid, seg, tf, state, feed)
+    }
+
+    fn mk_seal(sid: u32, seg: u8, tf: TfIndex, bucket: u32, close: f64) -> BufferedSeal {
+        mk_seal_feed(sid, seg, tf, bucket, close, Feed::Dhan)
     }
 
     #[test]
@@ -456,6 +470,33 @@ mod tests {
             "expected feed=dhan SYMBOL in ILP bytes, got {s}"
         );
         assert_eq!(CANDLE_FEED_DHAN, "dhan", "feed label constant must be dhan");
+    }
+
+    #[test]
+    fn test_append_seal_stamps_feed_from_seal_not_hardcoded() {
+        // ONE feed-parameterized writer: a `Feed::Groww` seal MUST stamp
+        // `feed=groww` (NOT the old hardcoded `feed=dhan`), so the SAME
+        // append_seal path serves both feeds and Groww candles never collide
+        // with Dhan candles under the (ts, security_id, segment, feed) DEDUP key.
+        let mut w = ShadowCandleWriter::for_test();
+        w.append_seal(&mk_seal_feed(
+            13,
+            EXCHANGE_SEGMENT_IDX_I,
+            TfIndex::M1,
+            1_716_000_900,
+            100.0,
+            Feed::Groww,
+        ))
+        .expect("append");
+        let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+        assert!(
+            s.contains("feed=groww"),
+            "Groww seal must stamp feed=groww (the writer is feed-parameterized), got {s}"
+        );
+        assert!(
+            !s.contains("feed=dhan"),
+            "a Groww seal must NOT stamp feed=dhan, got {s}"
+        );
     }
 
     #[test]

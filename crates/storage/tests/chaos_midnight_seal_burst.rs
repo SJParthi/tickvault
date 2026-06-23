@@ -29,6 +29,7 @@
 
 use std::path::PathBuf;
 
+use tickvault_common::feed::Feed;
 use tickvault_storage::seal_absorption::{SealAbsorptionPipeline, SubmitOutcome};
 use tickvault_trading::candles::{BufferedSeal, LiveCandleState, TfIndex};
 
@@ -79,7 +80,7 @@ fn mk_seal(i: usize) -> BufferedSeal {
     state.tick_count = 5;
     // security_id varies across ~11K instruments; segment IDX_I=0; TF M1.
     let sid = (i % 11_000) as u32 + 1;
-    BufferedSeal::new(sid, 0, TfIndex::M1, state)
+    BufferedSeal::new(sid, 0, TfIndex::M1, state, Feed::Dhan)
 }
 
 /// (buffered, spilled, dlq, dropped) tally of a stream of outcomes.
