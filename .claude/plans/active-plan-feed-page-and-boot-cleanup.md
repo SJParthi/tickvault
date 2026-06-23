@@ -14,7 +14,7 @@ NOT change that engine — it removes three things that fight it / mislead the o
 
 ## Plan Items
 
-- [ ] **Item 1 — candle schema script: tables-from-ticks only (no matviews)**
+- [x] **Item 1 — candle schema script: tables-from-ticks only (no matviews)**
   - The standalone `scripts/questdb-init.sh` Phase 3 creates `candles_1m…1M` as
     materialized views, colliding with Engine-B's regular tables → HTTP 400 (the
     `ensure-ready.sh` "13 FAIL"). Engine-B owns every candle table from `ticks`.
@@ -24,7 +24,7 @@ NOT change that engine — it removes three things that fight it / mislead the o
   - Files: scripts/questdb-init.sh
   - Tests: scripts/questdb-init.selftest.sh (new — asserts no `CREATE MATERIALIZED VIEW` + no `candles_1s` remain, and the count parser counts rows)
 
-- [ ] **Item 2 — feed page opens: public read, authed toggle**
+- [x] **Item 2 — feed page opens: public read, authed toggle**
   - `GET /api/feeds` + `GET /api/feeds/health` are read-only and carry NO secrets
     (`FeedHealthRow` is `&'static str` only — verified) → move them to the PUBLIC
     router. `POST /api/feeds/{feed}` (the flip) STAYS bearer-protected. Update the
@@ -33,7 +33,7 @@ NOT change that engine — it removes three things that fight it / mislead the o
   - Files: crates/api/src/lib.rs, crates/api/src/handlers/feeds_page.rs
   - Tests: test_get_feeds_public_200_without_auth, test_get_feeds_health_public_200_without_auth, test_post_feed_still_requires_auth (crates/api/src/lib.rs tests)
 
-- [ ] **Item 3 — boot REST storm: right limiter, no false "order" alarm**
+- [x] **Item 3 — boot REST storm: right limiter, no false "order" alarm**
   - `prev_day_ohlcv_boot` uses the OMS `OrderRateLimiter` (logs `order rate limit
     hit — SEBI max orders/sec exceeded` on every spin) as its data gate → thousands
     of misleading WARNs + busy-wait amplification. Replace with a quiet
@@ -41,7 +41,17 @@ NOT change that engine — it removes three things that fight it / mislead the o
     leaves headroom for the other boot REST callers (option-chain + profile canary)
     so Dhan stops returning HTTP 429. On 429, bounded backoff-retry the symbol.
   - Files: crates/app/src/prev_day_ohlcv_boot.rs
-  - Tests: test_data_api_limiter_emits_no_order_warn (source-scan: no OrderRateLimiter import), existing previous_trading_day / coverage tests stay green
+  - Tests: existing previous_trading_day / coverage tests stay green (25 app prev_day tests pass); governor limiter compiles + clippy-clean; 429 backoff is bounded retry of `fetch_one`
+
+- [x] **Item 5 — merge-readiness: clear toolchain-bump (#1172) clippy debt that blocks CI**
+  - The bumped Rust/clippy promoted 4 pre-existing lints to errors under the CI
+    `-D warnings` gate (all in groww/PR-E branch code, none in Q1–Q4 files).
+    Fixed mechanically (behaviour-preserving): `map_or(true, …)` → `is_none_or`
+    (core connection), nested-if → let-chain (core order-update), complex tuple
+    return → `EquityLookup` type alias (core constituent_resolver), and
+    `Default::default()` + field reassign → struct literal (app groww_bridge).
+  - Files: crates/core/src/websocket/connection.rs, crates/core/src/websocket/order_update_connection.rs, crates/core/src/instrument/constituent_resolver.rs, crates/app/src/groww_bridge.rs
+  - Tests: `cargo clippy --workspace -- -D warnings` clean; core feed_enabled gate test + constituent_resolver/groww_bridge modules compile + pass
 
 ## Design
 

@@ -199,74 +199,24 @@ apply_dedup_keys() {
 }
 
 # ---------------------------------------------------------------------------
-# Phase 3: Materialized Views (18 views, dependency order)
+# Phase 3: Candle tables — owned by the app candle engine (NOT this script)
 # ---------------------------------------------------------------------------
-create_materialized_views() {
-    echo "  Phase 3: Materialized Views (18)"
-    echo "  ---------------------------------"
-
-    # Tier 1: From candles_1s (5 views)
-    execute_ddl "candles_5s" \
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS candles_5s AS (SELECT ts, security_id, segment, first(open) AS open, max(high) AS high, min(low) AS low, last(close) AS close, sum(volume) AS volume, last(oi) AS oi, sum(tick_count) AS tick_count FROM candles_1s SAMPLE BY 5s ALIGN TO CALENDAR WITH OFFSET '00:00')"
-
-    execute_ddl "candles_10s" \
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS candles_10s AS (SELECT ts, security_id, segment, first(open) AS open, max(high) AS high, min(low) AS low, last(close) AS close, sum(volume) AS volume, last(oi) AS oi, sum(tick_count) AS tick_count FROM candles_1s SAMPLE BY 10s ALIGN TO CALENDAR WITH OFFSET '00:00')"
-
-    execute_ddl "candles_15s" \
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS candles_15s AS (SELECT ts, security_id, segment, first(open) AS open, max(high) AS high, min(low) AS low, last(close) AS close, sum(volume) AS volume, last(oi) AS oi, sum(tick_count) AS tick_count FROM candles_1s SAMPLE BY 15s ALIGN TO CALENDAR WITH OFFSET '00:00')"
-
-    execute_ddl "candles_30s" \
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS candles_30s AS (SELECT ts, security_id, segment, first(open) AS open, max(high) AS high, min(low) AS low, last(close) AS close, sum(volume) AS volume, last(oi) AS oi, sum(tick_count) AS tick_count FROM candles_1s SAMPLE BY 30s ALIGN TO CALENDAR WITH OFFSET '00:00')"
-
-    execute_ddl "candles_1m" \
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS candles_1m AS (SELECT ts, security_id, segment, first(open) AS open, max(high) AS high, min(low) AS low, last(close) AS close, sum(volume) AS volume, last(oi) AS oi, sum(tick_count) AS tick_count FROM candles_1s SAMPLE BY 1m ALIGN TO CALENDAR WITH OFFSET '00:00')"
-
-    # Tier 2: From candles_1m (3 views)
-    execute_ddl "candles_2m" \
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS candles_2m AS (SELECT ts, security_id, segment, first(open) AS open, max(high) AS high, min(low) AS low, last(close) AS close, sum(volume) AS volume, last(oi) AS oi FROM candles_1m SAMPLE BY 2m ALIGN TO CALENDAR WITH OFFSET '00:00')"
-
-    execute_ddl "candles_3m" \
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS candles_3m AS (SELECT ts, security_id, segment, first(open) AS open, max(high) AS high, min(low) AS low, last(close) AS close, sum(volume) AS volume, last(oi) AS oi FROM candles_1m SAMPLE BY 3m ALIGN TO CALENDAR WITH OFFSET '00:00')"
-
-    execute_ddl "candles_5m" \
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS candles_5m AS (SELECT ts, security_id, segment, first(open) AS open, max(high) AS high, min(low) AS low, last(close) AS close, sum(volume) AS volume, last(oi) AS oi FROM candles_1m SAMPLE BY 5m ALIGN TO CALENDAR WITH OFFSET '00:00')"
-
-    # Tier 3: From candles_5m (2 views)
-    execute_ddl "candles_10m" \
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS candles_10m AS (SELECT ts, security_id, segment, first(open) AS open, max(high) AS high, min(low) AS low, last(close) AS close, sum(volume) AS volume, last(oi) AS oi FROM candles_5m SAMPLE BY 10m ALIGN TO CALENDAR WITH OFFSET '00:00')"
-
-    execute_ddl "candles_15m" \
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS candles_15m AS (SELECT ts, security_id, segment, first(open) AS open, max(high) AS high, min(low) AS low, last(close) AS close, sum(volume) AS volume, last(oi) AS oi FROM candles_5m SAMPLE BY 15m ALIGN TO CALENDAR WITH OFFSET '00:00')"
-
-    # Tier 4: From candles_15m (1 view)
-    execute_ddl "candles_30m" \
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS candles_30m AS (SELECT ts, security_id, segment, first(open) AS open, max(high) AS high, min(low) AS low, last(close) AS close, sum(volume) AS volume, last(oi) AS oi FROM candles_15m SAMPLE BY 30m ALIGN TO CALENDAR WITH OFFSET '00:00')"
-
-    # Tier 5: From candles_30m (1 view)
-    execute_ddl "candles_1h" \
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS candles_1h AS (SELECT ts, security_id, segment, first(open) AS open, max(high) AS high, min(low) AS low, last(close) AS close, sum(volume) AS volume, last(oi) AS oi FROM candles_30m SAMPLE BY 1h ALIGN TO CALENDAR WITH OFFSET '00:00')"
-
-    # Tier 6: From candles_1h (3 views)
-    execute_ddl "candles_2h" \
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS candles_2h AS (SELECT ts, security_id, segment, first(open) AS open, max(high) AS high, min(low) AS low, last(close) AS close, sum(volume) AS volume, last(oi) AS oi FROM candles_1h SAMPLE BY 2h ALIGN TO CALENDAR WITH OFFSET '00:00')"
-
-    execute_ddl "candles_3h" \
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS candles_3h AS (SELECT ts, security_id, segment, first(open) AS open, max(high) AS high, min(low) AS low, last(close) AS close, sum(volume) AS volume, last(oi) AS oi FROM candles_1h SAMPLE BY 3h ALIGN TO CALENDAR WITH OFFSET '00:00')"
-
-    execute_ddl "candles_4h" \
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS candles_4h AS (SELECT ts, security_id, segment, first(open) AS open, max(high) AS high, min(low) AS low, last(close) AS close, sum(volume) AS volume, last(oi) AS oi FROM candles_1h SAMPLE BY 4h ALIGN TO CALENDAR WITH OFFSET '00:00')"
-
-    # Tier 7: From candles_1h (1 view)
-    execute_ddl "candles_1d" \
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS candles_1d AS (SELECT ts, security_id, segment, first(open) AS open, max(high) AS high, min(low) AS low, last(close) AS close, sum(volume) AS volume, last(oi) AS oi FROM candles_1h SAMPLE BY 1d ALIGN TO CALENDAR WITH OFFSET '00:00')"
-
-    # Tier 8: From candles_1d (2 views)
-    execute_ddl "candles_7d" \
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS candles_7d AS (SELECT ts, security_id, segment, first(open) AS open, max(high) AS high, min(low) AS low, last(close) AS close, sum(volume) AS volume, last(oi) AS oi FROM candles_1d SAMPLE BY 7d ALIGN TO CALENDAR WITH OFFSET '00:00')"
-
-    execute_ddl "candles_1M" \
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS candles_1M AS (SELECT ts, security_id, segment, first(open) AS open, max(high) AS high, min(low) AS low, last(close) AS close, sum(volume) AS volume, last(oi) AS oi FROM candles_1d SAMPLE BY 1M ALIGN TO CALENDAR WITH OFFSET '00:00')"
-
+# Since the "one common candle engine" convergence (#1189), every candle
+# timeframe (candles_1m … candles_1d) is a REAL TABLE that the running app
+# folds directly from `ticks` (O(1) per tick) and seals via its aggregator —
+# NOT a QuestDB materialized view. The app's idempotent boot DDL creates +
+# DEDUP-keys those tables and drops any stale matview squatting the name.
+#
+# This script therefore MUST NOT create candle materialized views: doing so
+# collides with the app-owned tables and returns HTTP 400 (the historical
+# "13 FAIL"). Candles are intentionally left to the engine — `ticks` is the
+# single source of truth, candle tables only (no matviews). Operator
+# 2026-06-23: "using ticks we need all candle tables as tables only — no
+# mat view".
+create_candle_note() {
+    echo "  Phase 3: Candle tables"
+    echo "  ----------------------"
+    echo "  SKIP  candles_* — owned by the app candle engine (tables folded from ticks; no matviews)"
     echo ""
 }
 
@@ -288,7 +238,9 @@ show_dashboard() {
 
     # Count tables
     local table_count
-    table_count=$(echo "${response}" | grep -o '"table_name"' | wc -l 2>/dev/null || echo "?")
+    # QuestDB /exec returns a top-level "count":N (number of dataset rows).
+    # The old `grep '"table_name"'` matched only the column header → always 1.
+    table_count=$(echo "${response}" | grep -oE '"count":[0-9]+' | grep -oE '[0-9]+' | tail -1 2>/dev/null || echo "?")
 
     echo "  Tables in QuestDB: ${table_count}"
     echo ""
@@ -313,5 +265,5 @@ show_dashboard() {
 wait_for_questdb
 create_base_tables
 apply_dedup_keys
-create_materialized_views
+create_candle_note
 show_dashboard

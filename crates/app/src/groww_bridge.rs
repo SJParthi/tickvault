@@ -175,17 +175,19 @@ fn build_parsed_tick(parsed: &ParsedGrowwTick) -> Result<ParsedTick, GrowwAggreg
         .map_err(|_| GrowwAggregateReject::TokenExceedsU32)?;
     let exchange_timestamp = u32::try_from(parsed.tick.ts_ist_nanos / NANOS_PER_SECOND)
         .map_err(|_| GrowwAggregateReject::TimestampExceedsU32)?;
-    let mut t = ParsedTick::default();
-    t.security_id = security_id;
-    t.exchange_segment_code = parsed.tick.segment.binary_code();
-    t.exchange_timestamp = exchange_timestamp;
-    // f64 → f32 for the shared ParsedTick LTP field; the candle cell widens it
-    // back via f32_to_f64_clean. (The raw `ticks` row keeps the full-precision
-    // f64 ltp via live_tick_row, so no precision is lost in the system of record.)
-    t.last_traded_price = parsed.tick.ltp as f32;
-    // Groww cum_volume is i64 and exceeds u32 intraday — it MUST NOT be funnelled
-    // through this u32 field. It flows via the consume_tick override instead.
-    t.volume = 0;
+    let t = ParsedTick {
+        security_id,
+        exchange_segment_code: parsed.tick.segment.binary_code(),
+        exchange_timestamp,
+        // f64 → f32 for the shared ParsedTick LTP field; the candle cell widens it
+        // back via f32_to_f64_clean. (The raw `ticks` row keeps the full-precision
+        // f64 ltp via live_tick_row, so no precision is lost in the system of record.)
+        last_traded_price: parsed.tick.ltp as f32,
+        // Groww cum_volume is i64 and exceeds u32 intraday — it MUST NOT be funnelled
+        // through this u32 field. It flows via the consume_tick override instead.
+        volume: 0,
+        ..Default::default()
+    };
     Ok(t)
 }
 

@@ -546,7 +546,7 @@ impl WebSocketConnection {
     fn feed_enabled(&self) -> bool {
         self.feed_enable_flag
             .as_ref()
-            .map_or(true, |f| f.load(Ordering::Relaxed))
+            .is_none_or(|f| f.load(Ordering::Relaxed))
     }
 
     /// PR-E: park the connection while the Dhan feed is disabled, polling the

@@ -98,15 +98,13 @@ fn is_nse_eq_equity(row: &CsvRow) -> bool {
     row.segment == "NSE_EQ" && row.instrument.eq_ignore_ascii_case("EQUITY")
 }
 
+/// O(1) lookup index: uppercased ISIN (or symbol) → `(security_id, segment)`.
+type EquityLookup = HashMap<String, (String, String)>;
+
 /// Build the two O(1) lookup indexes (ISIN-primary + symbol-fallback) from
 /// the NSE-EQ-EQUITY subset of the Dhan rows. First writer wins on a
 /// duplicate key (Dhan should not have dup ISIN/symbol within NSE-EQ-EQUITY).
-fn build_indexes(
-    dhan_rows: &[CsvRow],
-) -> (
-    HashMap<String, (String, String)>,
-    HashMap<String, (String, String)>,
-) {
+fn build_indexes(dhan_rows: &[CsvRow]) -> (EquityLookup, EquityLookup) {
     let mut by_isin = HashMap::new();
     let mut by_symbol = HashMap::new();
     for row in dhan_rows.iter().filter(|r| is_nse_eq_equity(r)) {
