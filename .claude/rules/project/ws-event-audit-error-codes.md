@@ -26,8 +26,12 @@ the current 2 connections (1 main-feed + 1 order-update) AND a future 16 (5 main
 `append_ws_event(WsType::Depth20, index, ...)`. This does NOT lift the 2-WebSocket runtime lock
 (`websocket-connection-scope-lock.md`); it only makes the tracking ready for that expansion.
 
-Composite-unique key per I-P1-11 discipline (extended to WS streams):
-`(trading_date_ist, ws_type, connection_index, event_kind, ts)`.
+Composite-unique key per I-P1-11 discipline (extended to WS streams), with
+`feed` added for per-feed identity (operator 2026-06-23 — a Dhan and a Groww
+connection can share `(ws_type, connection_index)`, so each feed's lifecycle
+events stay distinct rows; pinned by
+`dedup_segment_meta_guard::per_feed_market_data_dedup_keys_must_include_feed`):
+`(ts, trading_date_ist, feed, ws_type, connection_index, event_kind)`.
 
 ---
 

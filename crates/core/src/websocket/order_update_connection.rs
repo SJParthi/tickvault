@@ -294,6 +294,8 @@ fn emit_order_update_ws_audit(
     let row = tickvault_common::ws_event_types::WsEventAuditRow {
         event_ts_ist_nanos: now_ist_nanos,
         trading_date_ist_nanos,
+        // Order-update WS is Dhan-only (Groww has no order feed in scope).
+        feed: tickvault_common::feed::Feed::Dhan,
         ws_type: tickvault_common::ws_event_types::WsType::OrderUpdate,
         connection_index: 0,
         pool_size: 1,
