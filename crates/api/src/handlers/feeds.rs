@@ -174,6 +174,13 @@ pub async fn set_feed(
 }
 
 /// One feed's live-feed health row in the `GET /api/feeds/health` payload.
+///
+/// SECURITY CONTRACT (security-review MEDIUM, SP6): every string field here MUST
+/// remain `&'static str` — fixed, operator-safe English from the verdict engine.
+/// The `/feeds` web page renders `reason` verbatim (via `textContent`, so it is
+/// XSS-safe regardless), but widening any of these to a runtime `String` could
+/// leak internal detail (error text, queue names) into the operator browser.
+/// Keep them `&'static str`; do NOT interpolate runtime/error data into them.
 #[derive(Debug, Serialize)]
 pub struct FeedHealthRow {
     pub feed: &'static str,
