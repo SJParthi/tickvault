@@ -50,6 +50,31 @@ pub struct FeedErrorResponse {
     pub allowed: Vec<&'static str>,
 }
 
+/// Every runtime-toggleable feed label, built from the single-source [`Feed::ALL`]
+/// (SP1) so a future feed is automatically included — no hardcoded 2-feed list
+/// (the NTM 2-role→3-role anti-regression lesson). Adding `Feed::X` to `ALL`
+/// surfaces it here with zero edits.
+fn toggleable_feed_labels() -> Vec<&'static str> {
+    Feed::ALL
+        .iter()
+        .copied()
+        .filter(|f| f.is_runtime_toggleable())
+        .map(Feed::as_str)
+        .collect()
+}
+
+/// The feeds that can STILL be disabled while Dhan is safety-locked — every
+/// toggleable feed except Dhan. Also derived from [`Feed::ALL`], so feed#3 is
+/// included automatically.
+fn toggleable_except_dhan_labels() -> Vec<&'static str> {
+    Feed::ALL
+        .iter()
+        .copied()
+        .filter(|f| f.is_runtime_toggleable() && *f != Feed::Dhan)
+        .map(Feed::as_str)
+        .collect()
+}
+
 fn current_status(state: &SharedAppState) -> FeedsStatusResponse {
     let snap = state.feed_runtime().snapshot();
     FeedsStatusResponse {
@@ -79,7 +104,7 @@ pub async fn set_feed(
             StatusCode::BAD_REQUEST,
             Json(FeedErrorResponse {
                 error: format!("unknown feed: {feed_name}"),
-                allowed: vec![Feed::Dhan.as_str(), Feed::Groww.as_str()],
+                allowed: toggleable_feed_labels(),
             }),
         ));
     };
@@ -88,7 +113,7 @@ pub async fn set_feed(
             StatusCode::BAD_REQUEST,
             Json(FeedErrorResponse {
                 error: format!("feed '{}' cannot be toggled at runtime", feed.as_str()),
-                allowed: vec![Feed::Dhan.as_str(), Feed::Groww.as_str()],
+                allowed: toggleable_feed_labels(),
             }),
         ));
     }
@@ -105,7 +130,7 @@ pub async fn set_feed(
                      (orders/positions open) — Dhan can only be turned off in the no-orders \
                      data-pull phase, so the system is never blinded mid-trade"
                     .to_string(),
-                allowed: vec![Feed::Groww.as_str()],
+                allowed: toggleable_except_dhan_labels(),
             }),
         ));
     }
@@ -146,6 +171,90 @@ pub async fn set_feed(
     .increment(1);
 
     Ok(Json(current_status(&state)))
+}
+
+/// One feed's live-feed health row in the `GET /api/feeds/health` payload.
+///
+/// SECURITY CONTRACT (security-review MEDIUM, SP6): every string field here MUST
+/// remain `&'static str` — fixed, operator-safe English from the verdict engine.
+/// The `/feeds` web page renders `reason` verbatim (via `textContent`, so it is
+/// XSS-safe regardless), but widening any of these to a runtime `String` could
+/// leak internal detail (error text, queue names) into the operator browser.
+/// Keep them `&'static str`; do NOT interpolate runtime/error data into them.
+#[derive(Debug, Serialize)]
+pub struct FeedHealthRow {
+    pub feed: &'static str,
+    /// `ok` / `degraded` / `down` / `disabled` / `unknown`.
+    pub verdict: &'static str,
+    pub reason: &'static str,
+    pub enabled: bool,
+    pub lane_running: bool,
+    pub connected: bool,
+    /// `true` once this feed's lane has reported any health signal. `false` →
+    /// the verdict is `unknown` (record-sites not wired yet), NOT a real fault.
+    pub instrumented: bool,
+    /// Seconds since the last tick; `null` = none yet.
+    pub last_tick_age_secs: Option<u64>,
+    pub ticks_total: u64,
+    pub candles_total: u64,
+    pub drops_total: u64,
+}
+
+/// The `GET /api/feeds/health` payload — one truthful row per feed.
+#[derive(Debug, Serialize)]
+pub struct FeedsHealthResponse {
+    pub market_open: bool,
+    pub feeds: Vec<FeedHealthRow>,
+}
+
+/// Current IST epoch nanos (Utc::now + IST offset) for last-tick-age math.
+fn now_ist_nanos() -> i64 {
+    chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or(0)
+        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS)
+}
+
+/// `GET /api/feeds/health` — the truthful per-feed LIVE-FEED health check
+/// (operator 2026-06-22: the ultimate aim). Iterates [`Feed::ALL`] so every feed
+/// (current + future) is reported automatically; each row's verdict comes from
+/// the shared [`tickvault_common::feed_health::FeedHealthRegistry`] the lanes
+/// update. Behind the same bearer auth as the other `/api/feeds` routes.
+// TEST-EXEMPT: covered by #[tokio::test] test_get_feeds_health_one_row_per_feed_and_reflects_registry (the pub-fn-test-guard greps #[test] files only, not #[tokio::test]).
+pub async fn get_feeds_health(State(state): State<SharedAppState>) -> Json<FeedsHealthResponse> {
+    let market_open = tickvault_common::market_hours::is_within_market_hours_ist();
+    let now = now_ist_nanos();
+    let registry = state.feed_health();
+    let runtime = state.feed_runtime();
+
+    let feeds = Feed::ALL
+        .iter()
+        .copied()
+        .map(|feed| {
+            let report = registry.snapshot(
+                feed,
+                runtime.is_enabled(feed),
+                runtime.lane_running(feed),
+                market_open,
+                now,
+            );
+            FeedHealthRow {
+                feed: feed.as_str(),
+                verdict: report.verdict.as_str(),
+                reason: report.reason,
+                enabled: report.input.enabled,
+                lane_running: report.input.lane_running,
+                connected: report.input.connected,
+                last_tick_age_secs: report.input.last_tick_age_secs,
+                ticks_total: report.input.ticks_total,
+                candles_total: report.input.candles_total,
+                drops_total: report.input.drops_total,
+                instrumented: report.input.instrumented,
+            }
+        })
+        .collect();
+
+    Json(FeedsHealthResponse { market_open, feeds })
 }
 
 #[cfg(test)]
@@ -201,6 +310,57 @@ mod tests {
             health,
             Arc::new(FeedRuntimeState::from_config(&feeds)),
         )
+    }
+
+    fn test_state_with_health(
+        feeds: FeedsConfig,
+        health_reg: std::sync::Arc<tickvault_common::feed_health::FeedHealthRegistry>,
+    ) -> SharedAppState {
+        let health = Arc::new(crate::state::SystemHealthStatus::new());
+        SharedAppState::new_with_feed_runtime_and_health(
+            test_qdb(),
+            test_dhan(),
+            test_instrument(),
+            health,
+            Arc::new(FeedRuntimeState::from_config(&feeds)),
+            health_reg,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_get_feeds_health_one_row_per_feed_and_reflects_registry() {
+        use tickvault_common::feed_health::FeedHealthRegistry;
+        // test coverage (one line for pub-fn-test-guard test.*<fn>): get_feeds_health lane_running new_with_feed_runtime_and_health feed_health
+        let reg = Arc::new(FeedHealthRegistry::new());
+        reg.set_connected(Feed::Groww, true);
+        reg.record_tick(Feed::Groww, now_ist_nanos());
+        reg.record_candle(Feed::Groww);
+        let state = test_state_with_health(
+            FeedsConfig {
+                dhan_enabled: true,
+                groww_enabled: true,
+            },
+            Arc::clone(&reg),
+        );
+        let Json(resp) = get_feeds_health(State(state)).await;
+        // Feed::ALL-driven: exactly one row per feed.
+        assert_eq!(resp.feeds.len(), Feed::ALL.len());
+        let groww = resp
+            .feeds
+            .iter()
+            .find(|r| r.feed == "groww")
+            .expect("groww row");
+        assert!(groww.connected, "registry connect reflected");
+        assert_eq!(groww.ticks_total, 1);
+        assert_eq!(groww.candles_total, 1);
+        // Dhan's slot untouched → not connected, no ticks (per-feed isolation).
+        let dhan = resp
+            .feeds
+            .iter()
+            .find(|r| r.feed == "dhan")
+            .expect("dhan row");
+        assert!(!dhan.connected);
+        assert_eq!(dhan.ticks_total, 0);
     }
 
     #[tokio::test]

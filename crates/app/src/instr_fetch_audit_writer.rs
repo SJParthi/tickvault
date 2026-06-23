@@ -133,20 +133,25 @@ pub fn build_terminal_success_row<'a>(
     universe_size: i64,
     index_count: i64,
     underlying_count: i64,
+    index_constituent_count: i64,
     source_csv_sha256: &'a str,
     dry_run: bool,
 ) -> Option<InstrumentFetchAuditRow<'a>> {
     let LoopOutcome::Success { attempts_used } = outcome else {
         return None;
     };
-    // The universe has exactly 2 instrument roles (Index, FnoUnderlying),
-    // so total MUST equal index + underlying. Catch a future boot-callsite
-    // (Sub-PR #10) that extracts divergent counts before it silently writes
-    // an inconsistent audit row. Debug-only — no release overhead.
+    // The universe `role` field partitions every SID into exactly THREE
+    // mutually-exclusive primary roles — Index, FnoUnderlying, IndexConstituent
+    // (the NTM constituent stocks added in §31). So the total MUST equal the sum
+    // of the three role counts. `index_constituent_count` here is the
+    // ROLE-partition count (`count_by_role(IndexConstituent)`), NOT the
+    // overlapping `is_index_constituent` flag count. Catches a future
+    // boot-callsite that extracts divergent counts before it silently writes an
+    // inconsistent audit row. Debug-only — no release overhead.
     debug_assert_eq!(
         universe_size,
-        index_count + underlying_count,
-        "universe_size must equal index_count + underlying_count (only 2 roles exist)"
+        index_count + underlying_count + index_constituent_count,
+        "universe_size must equal index + underlying + index_constituent (3 mutually-exclusive roles, §31 NTM)"
     );
     Some(InstrumentFetchAuditRow {
         ts_nanos_ist,
@@ -211,6 +216,7 @@ pub async fn record_terminal_success(
     universe_size: i64,
     index_count: i64,
     underlying_count: i64,
+    index_constituent_count: i64,
     source_csv_sha256: &str,
     dry_run: bool,
 ) -> anyhow::Result<()> {
@@ -222,6 +228,7 @@ pub async fn record_terminal_success(
         universe_size,
         index_count,
         underlying_count,
+        index_constituent_count,
         source_csv_sha256,
         dry_run,
     ) else {
@@ -321,9 +328,10 @@ mod tests {
             1_700_000_000_000_000_000,
             1_699_920_000_000_000_000,
             142_350,
-            248,
+            772,
             30,
             218,
+            524,
             "deadbeef",
             false,
         )
@@ -333,9 +341,37 @@ mod tests {
         assert_eq!(row.error_code, "");
         assert_eq!(row.index_count, 30);
         assert_eq!(row.underlying_count, 218);
-        assert_eq!(row.universe_size, 248);
+        // §31 NTM: universe = index(30) + underlying(218) + index_constituent(524) = 772.
+        assert_eq!(row.universe_size, 772);
         assert_eq!(row.total_rows, 142_350);
         assert_eq!(row.source_csv_sha256, "deadbeef");
+    }
+
+    #[test]
+    fn test_build_terminal_success_row_three_role_partition_holds() {
+        // §31 NTM: the universe partitions into THREE mutually-exclusive roles.
+        // Sum must equal universe_size (the debug_assert guard inside the builder).
+        let outcome = LoopOutcome::Success { attempts_used: 1 };
+        let index = 33;
+        let underlying = 218;
+        let index_constituent = 524;
+        let total = index + underlying + index_constituent;
+        let row = build_terminal_success_row(
+            &outcome,
+            0,
+            0,
+            0,
+            total,
+            index,
+            underlying,
+            index_constituent,
+            "abc",
+            false,
+        )
+        .expect("3-role partition must produce a row");
+        assert_eq!(row.universe_size, total);
+        assert_eq!(row.index_count, index);
+        assert_eq!(row.underlying_count, underlying);
     }
 
     #[test]
@@ -343,7 +379,7 @@ mod tests {
         // Production never terminates on Exhausted (§4 infinite retry);
         // the test-only path must not produce a Success row.
         let outcome = LoopOutcome::Exhausted { attempts_used: 1 };
-        let row = build_terminal_success_row(&outcome, 0, 0, 0, 0, 0, 0, "", false);
+        let row = build_terminal_success_row(&outcome, 0, 0, 0, 0, 0, 0, 0, "", false);
         assert!(row.is_none(), "Exhausted must not map to a Success row");
     }
 
@@ -351,7 +387,7 @@ mod tests {
     fn test_build_terminal_success_row_propagates_dry_run() {
         let outcome = LoopOutcome::Success { attempts_used: 1 };
         let row =
-            build_terminal_success_row(&outcome, 0, 0, 0, 248, 30, 218, "", true).expect("row");
+            build_terminal_success_row(&outcome, 0, 0, 0, 248, 30, 218, 0, "", true).expect("row");
         assert!(row.dry_run, "dry_run flag must propagate to the row");
     }
 
@@ -381,7 +417,7 @@ mod tests {
         let cfg = cfg_unreachable();
         let outcome = LoopOutcome::Success { attempts_used: 1 };
         let result =
-            record_terminal_success(&cfg, &outcome, 0, 0, 100, 248, 30, 218, "sha", false).await;
+            record_terminal_success(&cfg, &outcome, 0, 0, 100, 248, 30, 218, 0, "sha", false).await;
         assert!(result.is_err(), "must propagate transport error");
     }
 
@@ -389,7 +425,7 @@ mod tests {
     async fn test_record_terminal_success_noop_ok_for_exhausted() {
         let cfg = cfg_unreachable();
         let outcome = LoopOutcome::Exhausted { attempts_used: 1 };
-        let result = record_terminal_success(&cfg, &outcome, 0, 0, 0, 0, 0, 0, "", false).await;
+        let result = record_terminal_success(&cfg, &outcome, 0, 0, 0, 0, 0, 0, 0, "", false).await;
         assert!(
             result.is_ok(),
             "Exhausted must be a no-op Ok (no write attempted)"

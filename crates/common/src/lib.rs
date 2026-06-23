@@ -21,11 +21,15 @@
 /// This crate is imported by every other crate in the workspace.
 /// It contains no business logic — only definitions and data structures.
 pub mod always_on;
+pub mod candle_fold;
 pub mod config;
 pub mod constants;
 pub mod disconnect_cause;
 pub mod error;
 pub mod error_code;
+pub mod feed;
+pub mod feed_health;
+pub mod feed_parity;
 pub mod formulas;
 pub mod instrument_registry;
 pub mod instrument_types;

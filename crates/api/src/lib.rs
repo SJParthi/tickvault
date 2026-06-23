@@ -105,6 +105,12 @@ pub fn build_router_with_auth(
             "/api/feeds/{feed}",
             axum::routing::post(handlers::feeds::set_feed),
         )
+        // Live-feed health check (operator 2026-06-22): truthful per-feed
+        // OK/Degraded/Down/Disabled verdict the operator can watch in real time.
+        .route(
+            "/api/feeds/health",
+            axum::routing::get(handlers::feeds::get_feeds_health),
+        )
         .layer(axum::middleware::from_fn_with_state(
             auth_config,
             require_bearer_auth,
