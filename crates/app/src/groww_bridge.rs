@@ -284,12 +284,14 @@ fn live_tick_row(parsed: &ParsedGrowwTick, capture_seq: i64) -> GrowwLiveTickRow
 }
 
 /// Monotonic, replay-stable `capture_seq` source (TICK-SEQ-01): `max(prev+1,
-/// wall_nanos)`. Seeded from wall-clock so it never resets below a prior value
-/// across restarts within a session.
-fn next_capture_seq(counter: &AtomicI64, wall_nanos: i64) -> i64 {
+/// seed_nanos)`. The call site seeds it from the tick's IST epoch-nanos
+/// (`ts_ist_nanos`) — a replay-STABLE value (NOT wall-clock), so `capture_seq`
+/// stays strictly monotonic AND identical on replay of the same tick stream
+/// (a wall-clock seed would differ on replay and create duplicate rows).
+fn next_capture_seq(counter: &AtomicI64, seed_nanos: i64) -> i64 {
     let mut prev = counter.load(Ordering::Relaxed);
     loop {
-        let next = (prev + 1).max(wall_nanos);
+        let next = (prev + 1).max(seed_nanos);
         match counter.compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return next,
             Err(observed) => prev = observed,
@@ -481,12 +483,27 @@ pub async fn run_groww_bridge(
             };
             let seg_code = pt.exchange_segment_code;
             let key = (pt.security_id, seg_code);
+            // Groww cum_volume is i64; `validate_groww_tick` already guarantees
+            // it is >= 0. Convert with `try_from` + reject loudly (security-review
+            // LOW 2026-06-23) — consistent with the token/timestamp width guards,
+            // never a silent `as u64`.
+            let cum_volume_u64 = match u64::try_from(parsed.tick.cum_volume) {
+                Ok(v) => v,
+                Err(_) => {
+                    error!(
+                        security_id = parsed.tick.security_id,
+                        cum_volume = parsed.tick.cum_volume,
+                        "groww bridge: negative cum_volume past validation — dropping tick"
+                    );
+                    continue;
+                }
+            };
             // First sight of this instrument: register it + seed the cumulative
             // baseline so the first 1m bucket's volume matches the legacy Groww
             // (golden-tested). Idempotent — only on the very first tick per key.
             if seeded.insert(key) {
                 aggregator.pre_populate(std::iter::once(key));
-                aggregator.seed_cumulative(pt.security_id, seg_code, parsed.tick.cum_volume as u64);
+                aggregator.seed_cumulative(pt.security_id, seg_code, cum_volume_u64);
             }
             // Route every sealed bar across ALL 21 TFs through the SHARED
             // seal-writer chain, tagged feed=Groww. `Some(cum as u64)` carries
@@ -495,7 +512,7 @@ pub async fn run_groww_bridge(
                 &pt,
                 seg_code,
                 FeedStrategy::GROWW,
-                Some(parsed.tick.cum_volume as u64),
+                Some(cum_volume_u64),
                 |tf, state| {
                     let Some(sender) = global_seal_sender() else {
                         return;

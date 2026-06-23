@@ -324,6 +324,17 @@ impl MultiTfAggregator {
         #[allow(clippy::manual_range_contains)]
         let out_of_session = secs_of_day < MARKET_OPEN_SECS_OF_DAY_IST
             || secs_of_day >= MARKET_CLOSE_SECS_OF_DAY_IST;
+        // Session-window gate applies to EVERY feed (Dhan AND Groww). The bucket
+        // grid is 09:15-anchored (`TfIndex::bucket_start` clamps a pre-open tick
+        // to the first bucket), so a pre-open tick that slipped past this gate
+        // would FOLD INTO (corrupt) the 09:15 candle, not form a distinct pre-open
+        // candle. INTENDED deviation from the legacy `Groww1mAggregator` (which
+        // floored to absolute minute and had no session concept): both feeds'
+        // candle grids begin at 09:15, matching the REST/backtest cross-verify
+        // window. Pinned by `test_groww_pre_open_minute_is_gated_intended`.
+        // (If SP6 finds Groww backtest emits pre-open candles, revisit with a
+        // pre-open-aware bucket grid — a separate, larger change.)
+        // `always_on` still exempts long-session instruments (e.g. GIFT Nifty).
         if !exempt && out_of_session {
             return ConsumeStats {
                 sealed_count: 0,

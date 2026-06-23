@@ -54,6 +54,12 @@ fn groww_tick(ist_secs: u32, ltp: f64) -> ParsedTick {
 /// chosen as a real M1-aligned in-session instant.
 const M1_BASE: u32 = 1_779_354_960; // in-session, divisible by 60
 
+/// A minute-aligned IST second in the PRE-OPEN window (09:00 IST, before the
+/// 09:15 session gate) on the SAME trading day as `M1_BASE` (09:16). The legacy
+/// `Groww1mAggregator` had no session gate, so it sealed pre-open candles — the
+/// shared 21-TF engine must too, for Groww (`session_gated = false`).
+const PRE_OPEN_BASE: u32 = 1_779_354_000; // 09:00:00 IST, divisible by 60
+
 #[test]
 fn test_golden_groww_1m_through_multi_tf_matches_legacy() {
     // Drive the NEW path: Groww feed via the 21-TF engine + GROWW strategy
@@ -116,6 +122,45 @@ fn test_golden_groww_1m_through_multi_tf_matches_legacy() {
     assert_eq!(
         m1.bucket_start_ist_secs, M1_BASE,
         "M1 seal ts = minute-1 bucket start"
+    );
+}
+
+#[test]
+fn test_groww_pre_open_minute_is_gated_intended() {
+    // HIGH-resolution 2026-06-23 (adversarial review): the in-session golden above
+    // is BLIND to pre-open. The legacy Groww1mAggregator floored to the absolute
+    // minute and had NO session concept, so it sealed pre-open candles. The shared
+    // 21-TF engine is 09:15-ANCHORED — `TfIndex::bucket_start` clamps a pre-open
+    // tick to the first (09:15) bucket — so an UNGATED pre-open tick would FOLD
+    // INTO (corrupt) the 09:15 candle, not form a distinct one. We therefore GATE
+    // pre-open for EVERY feed (Dhan AND Groww): each feed's candle grid begins at
+    // 09:15, matching the backtest / REST cross-verify window. This is an INTENDED
+    // deviation from the legacy Groww behaviour; this test pins it so the change is
+    // NOT silent. (If SP6 finds Groww backtest emits pre-open candles, revisit with
+    // a pre-open-aware bucket grid — a separate, larger change.)
+    let agg = MultiTfAggregator::new();
+    agg.pre_populate(std::iter::once((1_333_u32, 1_u8)));
+    agg.seed_cumulative(1_333, 1, 100);
+    let mut sealed = false;
+    // Two ticks inside the 09:00 IST pre-open minute + a cross into the next minute.
+    for (off, ltp, cum) in [(0u32, 100.0, 100u64), (30, 110.0, 150), (60, 111.0, 170)] {
+        agg.consume_tick(
+            &groww_tick(PRE_OPEN_BASE + off, ltp),
+            1,
+            FeedStrategy::GROWW,
+            Some(cum),
+            |_, _| sealed = true,
+        );
+    }
+    assert!(
+        !sealed,
+        "Groww pre-open ticks are GATED (intended) — the 09:15-anchored grid would \
+         otherwise corrupt the 09:15 candle"
+    );
+    let entry = agg.get(1_333, 1).expect("present");
+    assert!(
+        entry.cell.snapshot(TfIndex::M1).is_uninitialised(),
+        "no pre-open bucket opens (session gate applies to every feed)"
     );
 }
 
