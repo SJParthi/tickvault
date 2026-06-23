@@ -76,6 +76,28 @@ fn collect_dedup_key_declarations() -> Vec<(PathBuf, usize, String, String)> {
     out
 }
 
+/// Find a DEDUP-key constant's quoted body by NAME, robust to rustfmt wrapping
+/// the declaration across lines (`const X: &str =\n    "...";`). Used by the
+/// per-feed guard so it can see multi-line constants (e.g.
+/// `DEDUP_KEY_WS_EVENT_AUDIT`) WITHOUT changing the shared single-line collector
+/// the other guards rely on. Returns `(file, body)`.
+fn find_dedup_key_body(const_name: &str) -> Option<(PathBuf, String)> {
+    for (path, content) in read_rust_files(&storage_src_dir()) {
+        let marker = format!("const {const_name}:");
+        if let Some(decl_pos) = content.find(&marker) {
+            // First string literal after the declaration start.
+            let rest = &content[decl_pos..];
+            if let Some(s) = rest.find('"') {
+                let after = &rest[s + 1..];
+                if let Some(e) = after.find('"') {
+                    return Some((path, after[..e].to_string()));
+                }
+            }
+        }
+    }
+    None
+}
+
 // ============================================================================
 // Meta-guard — every DEDUP key touching security_id must include segment
 // ============================================================================
@@ -242,6 +264,52 @@ fn every_audit_dedup_key_must_include_designated_timestamp_ts() {
          .claude/rules/project/phase-0-architecture.md (audit-table template).",
         violations.join("\n\n"),
     );
+}
+
+// ============================================================================
+// Meta-guard — per-feed MARKET-DATA DEDUP keys MUST include `feed`
+// (per-feed identity, operator 2026-06-23)
+// ============================================================================
+//
+// A row that is genuinely ONE feed's market data (a Dhan tick vs a Groww tick,
+// a Dhan 1m candle vs a Groww 1m candle, a Dhan prev-day OHLC vs a Groww one,
+// a Dhan WS lifecycle event vs a Groww one) MUST carry `feed` in its DEDUP key
+// so the two feeds never collapse into one row. This ratchets that contract:
+// removing `feed` from any of these keys fails the build.
+//
+// NOT listed here (intentionally — per-feed value is meaningless/absent):
+//   - cross_verify_1m_audit / groww_cross_verify_1m_audit (Dhan-only / Groww-only
+//     by table; feed is a label, not a key)
+//   - tick_conservation_audit (single combined cross-feed reconciliation)
+//   - the instrument-master / universe tables (one universe shared by both feeds)
+const FEED_KEYED_MARKET_DATA_KEYS: &[&str] = &[
+    "DEDUP_KEY_TICKS",
+    "DEDUP_KEY_CANDLES",
+    "DEDUP_KEY_PREV_DAY_OHLCV",
+    "DEDUP_KEY_WS_EVENT_AUDIT",
+];
+
+#[test]
+fn per_feed_market_data_dedup_keys_must_include_feed() {
+    for expected in FEED_KEYED_MARKET_DATA_KEYS {
+        let (path, body) = find_dedup_key_body(expected).unwrap_or_else(|| {
+            panic!(
+                "per-feed DEDUP key `{expected}` not found in storage src — was it \
+                 renamed/removed? It MUST exist and include `feed` (operator \
+                 2026-06-23 per-feed identity)."
+            )
+        });
+        assert!(
+            body.contains("feed"),
+            "{} — {} = \"{}\" MUST include `feed` in its DEDUP key so a Dhan \
+             and a Groww row for the same instrument/minute stay DISTINCT rows \
+             (per-feed identity, operator 2026-06-23). Removing `feed` would \
+             collapse the two feeds into one row.",
+            path.display(),
+            expected,
+            body
+        );
+    }
 }
 
 // ============================================================================

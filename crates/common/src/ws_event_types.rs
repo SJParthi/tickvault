@@ -128,6 +128,11 @@ pub struct WsEventAuditRow {
     pub event_ts_ist_nanos: i64,
     /// The trading day — IST midnight nanoseconds.
     pub trading_date_ist_nanos: i64,
+    /// Broker feed source (`dhan` / `groww`). Per-feed identity (2026-06-23):
+    /// a Dhan and a Groww connection can share `(ws_type, connection_index)`,
+    /// so `feed` is part of the audit's DEDUP key — their lifecycle events are
+    /// distinct rows, never collapsed.
+    pub feed: crate::feed::Feed,
     /// Which Dhan WebSocket the connection belongs to.
     pub ws_type: WsType,
     /// 0-based index of the connection within its `ws_type` pool.

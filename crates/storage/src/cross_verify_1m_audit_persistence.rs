@@ -88,6 +88,12 @@ impl MismatchField {
 /// verification, once/day), so the allocation is irrelevant.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CrossVerify1mMismatch {
+    /// Broker feed source (`dhan` / `groww`). This Dhan cross-verify audit is
+    /// Dhan-only by design (Groww has its OWN `groww_cross_verify_1m_audit`
+    /// table per lock §32), so this is always `dhan` — a self-describing LABEL,
+    /// NOT a DEDUP-key column (the verification is per-instrument-minute, not
+    /// per-feed within this table).
+    pub feed: &'static str,
     /// When the verification ran — IST nanoseconds.
     pub run_ts_ist_nanos: i64,
     /// The trading day verified — IST midnight nanoseconds.
@@ -301,6 +307,8 @@ impl CrossVerify1mAuditWriter {
         self.buffer
             .table(CROSS_VERIFY_1M_AUDIT_TABLE)
             .with_context(|| "cross_verify_1m_audit append: table() failed")?
+            .symbol("feed", m.feed)
+            .with_context(|| "cross_verify_1m_audit append: symbol(feed) failed")?
             .symbol("segment", m.segment.as_str())
             .with_context(|| "cross_verify_1m_audit append: symbol(segment) failed")?
             .symbol("field", m.field.as_str())
@@ -344,6 +352,7 @@ mod tests {
 
     fn sample() -> CrossVerify1mMismatch {
         CrossVerify1mMismatch {
+            feed: "dhan",
             run_ts_ist_nanos: 1_780_000_000_000_000_000,
             trading_date_ist_nanos: 1_780_000_000_000_000_000,
             security_id: 13,

@@ -55,6 +55,32 @@ paths:
   `45→75→45` test + replay-twice idempotency) + `test_dedup_key_is_capture_seq_after_flip`.
 - Bounded ring buffer for O(1) lookup; log duplicates at WARN.
 
+## Per-Feed Identity in DEDUP keys (operator 2026-06-23)
+
+Every table holding genuinely PER-FEED data carries `feed` (`dhan`/`groww`, from
+`tickvault_common::feed::Feed`) IN its DEDUP UPSERT key, so a Dhan row and a
+Groww row for the same logical key are BOTH kept (distinct feeds = distinct
+observations), never collapsed. The four feed-keyed market-data tables:
+
+| Table | DEDUP key |
+|-------|-----------|
+| `ticks` | `security_id, segment, capture_seq, feed` (+ designated `ts`) |
+| `candles_*` (21) | `ts, security_id, segment, feed` |
+| `prev_day_ohlcv` | `ts, security_id, segment, feed` |
+| `ws_event_audit` | `ts, trading_date_ist, feed, ws_type, connection_index, event_kind` |
+
+Pinned by `dedup_segment_meta_guard::per_feed_market_data_dedup_keys_must_include_feed`
+(removing `feed` from any of these fails the build). Existing tables self-heal
+via `ALTER … ADD COLUMN IF NOT EXISTS feed` + `DEDUP ENABLE UPSERT KEYS(…)` at
+boot — never a populated-table DROP (SEBI).
+
+**`feed` is a LABEL, NOT a key, where the row is not per-feed:**
+`cross_verify_1m_audit` (Dhan-only; Groww has its own table),
+`tick_conservation_audit` (single combined cross-feed reconciliation), and the
+shared instrument-master / universe tables (one universe both feeds watch —
+keying by feed would duplicate the universe, breaking I-P1-11's single-universe
+model).
+
 ## Position Reconciliation
 - After every fill: mismatch = halt trading + alert. End-of-day (immediately after WebSocket disconnect at 15:30 IST): full Dhan vs OMS reconciliation.
 - Both reconciliation types flag mismatches as CRITICAL

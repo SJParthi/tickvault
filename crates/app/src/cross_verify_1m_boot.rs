@@ -244,6 +244,9 @@ pub fn diff_minute_candles(
             // Cold path (post-market, once/day) — owning the segment/symbol
             // Strings per cell is irrelevant to performance.
             out.push(CrossVerify1mMismatch {
+                // Dhan cross-verify (Dhan live vs Dhan REST). Groww parity lives
+                // in its own groww_cross_verify_1m_audit table (lock §32).
+                feed: tickvault_common::feed::Feed::Dhan.as_str(),
                 run_ts_ist_nanos,
                 trading_date_ist_nanos,
                 security_id,
@@ -1206,6 +1209,7 @@ mod tests {
     fn test_final_flush_errors_with_pending_count_when_disconnected() {
         let mut w = CrossVerify1mAuditWriter::for_test();
         let m = CrossVerify1mMismatch {
+            feed: "dhan",
             run_ts_ist_nanos: 1,
             trading_date_ist_nanos: 1,
             security_id: 13,
