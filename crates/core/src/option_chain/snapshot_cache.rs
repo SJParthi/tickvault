@@ -29,9 +29,11 @@
 //!
 //! ## What's NOT stored here
 //!
-//! Disk persistence — that's `option_chain_minute_snapshot_persistence.rs`
-//! (PR #2, already merged). This cache is the HOT path; the table is
-//! the COLD path / SEBI forensic chain.
+//! Disk persistence — there is none. The `option_chain_minute_snapshot`
+//! QuestDB table + its persistence module were dropped 2026-06-23
+//! (operator: ticks are the single source of truth). This RAM cache is
+//! now the ONLY store for option-chain snapshots; the strategy reads it
+//! directly.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

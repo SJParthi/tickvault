@@ -140,7 +140,6 @@ pub mod lifecycle_reconciler;
 // `shadow_persistence::drop_legacy_candle_objects`. The 25 retired
 // `movers_*` matviews + `movers_1s` base table are no longer recreated
 // either (the old `drop_bug3_retired_views` lived in this module).
-pub mod option_chain_minute_snapshot_persistence;
 pub mod partition_manager;
 pub mod prev_day_ohlcv_persistence;
 pub mod questdb_health;

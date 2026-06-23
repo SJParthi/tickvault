@@ -5,8 +5,9 @@
 //!   1. Sleeps until the next scheduled second (`HH:MM:53` etc.) inside
 //!      market hours `[09:15, 15:30) IST`.
 //!   2. Fires `OptionChainClient::fetch_option_chain` for ONE underlying.
-//!   3. Writes the result into the shared [`SnapshotCache`] + the
-//!      QuestDB `option_chain_minute_snapshot` table.
+//!   3. Writes the result into the shared [`SnapshotCache`] (RAM only —
+//!      the QuestDB `option_chain_minute_snapshot` table was dropped
+//!      2026-06-23; the strategy reads the RAM cache).
 //!   4. Emits 4 Prometheus counters + (on first failure of the minute)
 //!      the `OptionChainFetchFailed` Telegram.
 //!
@@ -45,26 +46,18 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use chrono::{NaiveDate, TimeZone, Timelike};
 use tracing::{debug, error, info, warn};
 
-use tickvault_common::config::{
-    OptionChainMinuteSnapshotConfig, OptionChainUnderlyingEntry, QuestDbConfig,
-};
+use tickvault_common::config::{OptionChainMinuteSnapshotConfig, OptionChainUnderlyingEntry};
 use tickvault_common::constants::{
     IST_UTC_OFFSET_SECONDS_I64, OPTION_CHAIN_COOLDOWN_LADDER_SECS, OPTION_CHAIN_FETCH_CADENCE_SECS,
     OPTION_CHAIN_STALE_CYCLES_BEFORE_TELEGRAM, SECONDS_PER_DAY,
 };
 use tickvault_common::market_hours::is_within_market_hours_ist;
-use tickvault_storage::option_chain_minute_snapshot_persistence::{
-    FetchOutcome, OptionChainMinuteSnapshotRow, OptionSide,
-    append_option_chain_minute_snapshot_rows,
-};
 
 use crate::notification::{NotificationEvent, NotificationService};
 use crate::option_chain::client::OptionChainClient;
 use crate::option_chain::snapshot_cache::{CachedSnapshot, SnapshotCache};
-use crate::option_chain::types::OptionChainResponse;
 
 /// Max chars of an error message that get embedded in a Telegram body.
 /// Prevents accidental leak of full HTTP response bodies (which could
@@ -83,13 +76,6 @@ pub const METRIC_FETCHES_TOTAL: &str = "tv_option_chain_fetches_total";
 pub const METRIC_FETCH_ERRORS_TOTAL: &str = "tv_option_chain_fetch_errors_total";
 pub const METRIC_CACHE_AGE_SECS: &str = "tv_option_chain_cache_age_secs";
 pub const METRIC_STRATEGY_HALTS_TOTAL: &str = "tv_option_chain_strategy_halts_total";
-
-/// L5 AUDIT persistence counters — rows written to the QuestDB
-/// `option_chain_minute_snapshot` table, and persist failures.
-pub const METRIC_SNAPSHOT_ROWS_PERSISTED_TOTAL: &str =
-    "tv_option_chain_snapshot_rows_persisted_total";
-pub const METRIC_SNAPSHOT_PERSIST_ERRORS_TOTAL: &str =
-    "tv_option_chain_snapshot_persist_errors_total";
 
 /// State carried across scheduler iterations. Owns the cache handle +
 /// edge-trigger set + the day on which the edge-trigger set was last
@@ -264,7 +250,6 @@ pub fn spawn_snapshot_scheduler(
     cache: SnapshotCache,
     current_expiry_cache: crate::option_chain::current_expiry_cache::CurrentExpiryCache,
     notifier: Arc<NotificationService>,
-    questdb_config: QuestDbConfig,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !config.enabled {
         info!("option_chain_minute_snapshot: disabled by config — scheduler NOT spawned");
@@ -284,15 +269,7 @@ pub fn spawn_snapshot_scheduler(
     );
 
     Some(tokio::spawn(async move {
-        run_snapshot_loop(
-            config,
-            client,
-            cache,
-            current_expiry_cache,
-            notifier,
-            questdb_config,
-        )
-        .await;
+        run_snapshot_loop(config, client, cache, current_expiry_cache, notifier).await;
     }))
 }
 
@@ -305,7 +282,6 @@ async fn run_snapshot_loop(
     cache: SnapshotCache,
     current_expiry_cache: crate::option_chain::current_expiry_cache::CurrentExpiryCache,
     notifier: Arc<NotificationService>,
-    questdb_config: QuestDbConfig,
 ) {
     let mut state = SchedulerState::new(cache.clone());
 
@@ -366,7 +342,6 @@ async fn run_snapshot_loop(
             &notifier,
             &mut state,
             &config,
-            &questdb_config,
         )
         .await;
 
@@ -413,7 +388,6 @@ async fn run_one_slot_fetch(
     notifier: &Arc<NotificationService>,
     state: &mut SchedulerState,
     _config: &OptionChainMinuteSnapshotConfig,
-    questdb_config: &QuestDbConfig,
 ) {
     let underlying = entry.symbol.as_str();
     let segment = entry.segment.as_str();
@@ -546,20 +520,13 @@ async fn run_one_slot_fetch(
     // network call so the cache's `received_at` reflects when the
     // strategy will actually see this data, not when the request
     // started.
-    let response_arc = Arc::new(chain);
     let cached = CachedSnapshot {
-        response: Arc::clone(&response_arc),
+        response: Arc::new(chain),
         received_at: std::time::Instant::now(),
         underlying_symbol: underlying.to_string(),
         expiry: expiry.clone(),
     };
     cache.insert((underlying.to_string(), segment.to_string()), cached);
-
-    // Step 3.5 — L5 AUDIT: persist the fetched chain to QuestDB. Cold
-    // path (at most 3×/min). A persist failure is logged + counted but
-    // never crashes the scheduler or affects the RAM cache the strategy
-    // reads from.
-    persist_snapshot_to_questdb(&response_arc, entry, &expiry, questdb_config).await;
 
     // Step 4 — telemetry. Static labels per audit-findings Rule 12 (no
     // raw counter rendering — dashboards wrap in `increase()` later).
@@ -582,153 +549,6 @@ async fn run_one_slot_fetch(
     }
 
     info!(underlying, expiry, "option-chain snapshot fetched + cached");
-}
-
-/// Maps a fetched option-chain response into persistence rows — one
-/// per `(strike, side)` pair that has data. Strikes whose key does not
-/// parse as `f64` are skipped (defensive — Dhan keys are decimal
-/// strings like `"25650.000000"`).
-///
-/// `*_nanos` arguments are IST wall-clock nanoseconds. Every row carries
-/// `FetchOutcome::Fresh` + `cache_age_used_secs = 0` because this
-/// scheduler reaches the persist path only after a fresh fetch — a
-/// failed fetch returns earlier.
-pub fn map_option_chain_to_snapshot_rows<'a>(
-    response: &OptionChainResponse,
-    underlying_symbol: &'a str,
-    underlying_security_id: u32,
-    exchange_segment: &'a str,
-    ts_nanos_ist: i64,
-    trading_date_ist_nanos: i64,
-    expiry_date_nanos: i64,
-) -> Vec<OptionChainMinuteSnapshotRow<'a>> {
-    let mut rows = Vec::with_capacity(response.data.oc.len() * 2);
-    for (strike_key, strike_data) in &response.data.oc {
-        let Ok(strike) = strike_key.parse::<f64>() else {
-            continue;
-        };
-        for (side, opt) in [
-            (OptionSide::Call, strike_data.ce.as_ref()),
-            (OptionSide::Put, strike_data.pe.as_ref()),
-        ] {
-            let Some(opt) = opt else { continue };
-            rows.push(OptionChainMinuteSnapshotRow {
-                ts_nanos_ist,
-                trading_date_ist_nanos,
-                underlying_symbol,
-                underlying_security_id,
-                exchange_segment,
-                expiry_date_nanos,
-                strike,
-                side,
-                security_id: u32::try_from(opt.security_id).unwrap_or(0),
-                last_price: opt.last_price,
-                average_price: opt.average_price,
-                oi: opt.oi,
-                previous_oi: opt.previous_oi,
-                volume: opt.volume,
-                previous_volume: opt.previous_volume,
-                previous_close_price: opt.previous_close_price,
-                top_bid_price: opt.top_bid_price,
-                top_bid_quantity: opt.top_bid_quantity,
-                top_ask_price: opt.top_ask_price,
-                top_ask_quantity: opt.top_ask_quantity,
-                implied_volatility: opt.implied_volatility,
-                greek_delta: opt.greeks.delta,
-                greek_theta: opt.greeks.theta,
-                greek_gamma: opt.greeks.gamma,
-                greek_vega: opt.greeks.vega,
-                cache_age_used_secs: 0,
-                fetch_outcome: FetchOutcome::Fresh,
-            });
-        }
-    }
-    rows
-}
-
-/// Computes the three IST-nanosecond timestamp fields for a snapshot
-/// row from the current wall-clock + the expiry string. Returns `None`
-/// if `expiry` does not parse as `YYYY-MM-DD`. Pure logic.
-fn compute_snapshot_timestamps(now_utc_secs: i64, expiry: &str) -> Option<(i64, i64, i64)> {
-    let now_ist_secs = now_utc_secs.saturating_add(IST_UTC_OFFSET_SECONDS_I64);
-    // `ts` — minute-aligned IST nanoseconds of the slot (so the row
-    // joins cleanly against the 1m candles).
-    let minute_aligned = now_ist_secs - now_ist_secs.rem_euclid(60);
-    let ts_nanos = minute_aligned.saturating_mul(1_000_000_000);
-    // `trading_date_ist` — IST date midnight nanoseconds.
-    let trading_date_nanos = ist_date_midnight_from_utc(now_utc_secs).saturating_mul(1_000_000_000);
-    // `expiry` — parse YYYY-MM-DD, store its midnight as IST nanos.
-    let expiry_date = NaiveDate::parse_from_str(expiry, "%Y-%m-%d").ok()?;
-    let expiry_secs = expiry_date.and_hms_opt(0, 0, 0)?.and_utc().timestamp();
-    let expiry_nanos = expiry_secs.saturating_mul(1_000_000_000);
-    Some((ts_nanos, trading_date_nanos, expiry_nanos))
-}
-
-/// L5 AUDIT — maps the fetched chain to rows and batch-writes them to
-/// the QuestDB `option_chain_minute_snapshot` table. Cold path. Never
-/// panics; never bubbles errors — a persist failure is logged at
-/// `error!` + counted so the operator sees it, but the scheduler keeps
-/// running and the RAM cache the strategy reads is untouched.
-async fn persist_snapshot_to_questdb(
-    response: &OptionChainResponse,
-    entry: &OptionChainUnderlyingEntry,
-    expiry: &str,
-    questdb_config: &QuestDbConfig,
-) {
-    let underlying = entry.symbol.as_str();
-    let now_utc_secs = chrono::Utc::now().timestamp();
-    let Some((ts_nanos, trading_date_nanos, expiry_nanos)) =
-        compute_snapshot_timestamps(now_utc_secs, expiry)
-    else {
-        error!(
-            underlying,
-            expiry, "option-chain snapshot persist SKIPPED — expiry did not parse as YYYY-MM-DD"
-        );
-        return;
-    };
-
-    let rows = map_option_chain_to_snapshot_rows(
-        response,
-        underlying,
-        entry.security_id,
-        entry.segment.as_str(),
-        ts_nanos,
-        trading_date_nanos,
-        expiry_nanos,
-    );
-    if rows.is_empty() {
-        debug!(underlying, "option-chain snapshot persist — no strike rows");
-        return;
-    }
-    let row_count = rows.len();
-
-    match append_option_chain_minute_snapshot_rows(questdb_config, &rows).await {
-        Ok(()) => {
-            metrics::counter!(
-                METRIC_SNAPSHOT_ROWS_PERSISTED_TOTAL,
-                "underlying" => underlying.to_string(),
-            )
-            .increment(row_count as u64);
-            info!(
-                underlying,
-                rows = row_count,
-                "option-chain snapshot persisted to QuestDB"
-            );
-        }
-        Err(err) => {
-            metrics::counter!(
-                METRIC_SNAPSHOT_PERSIST_ERRORS_TOTAL,
-                "underlying" => underlying.to_string(),
-            )
-            .increment(1);
-            error!(
-                underlying,
-                rows = row_count,
-                ?err,
-                "option-chain snapshot QuestDB persist FAILED"
-            );
-        }
-    }
 }
 
 /// Record a fetch failure: increment error counter, fire edge-triggered
@@ -814,23 +634,6 @@ fn classify_error(reason: &str) -> &'static str {
         "empty_expiries"
     } else {
         "other"
-    }
-}
-
-/// Convert UTC seconds since epoch to IST date midnight (in IST secs
-/// since epoch). Helper used by the wall-clock-day check. Pure.
-#[must_use]
-pub fn ist_date_midnight_from_utc(now_utc_secs: i64) -> i64 {
-    let now_ist = now_utc_secs.saturating_add(IST_UTC_OFFSET_SECONDS_I64);
-    let now_ist_dt = chrono::Utc.timestamp_opt(now_ist, 0).single();
-    match now_ist_dt {
-        Some(dt) => {
-            // Strip H/M/S to get midnight IST.
-            let secs_into_day =
-                (dt.hour() as i64) * 3600 + (dt.minute() as i64) * 60 + (dt.second() as i64);
-            now_ist - secs_into_day
-        }
-        None => 0,
     }
 }
 
@@ -1066,193 +869,12 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_persist_metric_constants_stable() {
-        // L5 AUDIT persistence counters — dashboards depend on the
-        // exact names.
-        assert_eq!(
-            METRIC_SNAPSHOT_ROWS_PERSISTED_TOTAL,
-            "tv_option_chain_snapshot_rows_persisted_total"
-        );
-        assert_eq!(
-            METRIC_SNAPSHOT_PERSIST_ERRORS_TOTAL,
-            "tv_option_chain_snapshot_persist_errors_total"
-        );
-    }
-
-    fn sample_chain_json() -> &'static str {
-        r#"{
-            "data": {
-                "last_price": 23000.0,
-                "oc": {
-                    "23000.000000": {
-                        "ce": {
-                            "average_price": 200.0,
-                            "greeks": {"delta": 0.55, "theta": -10.0, "gamma": 0.001, "vega": 8.0},
-                            "implied_volatility": 15.0,
-                            "last_price": 190.0,
-                            "oi": 500000,
-                            "previous_close_price": 180.0,
-                            "previous_oi": 450000,
-                            "previous_volume": 1000000,
-                            "security_id": 12345,
-                            "top_ask_price": 191.0,
-                            "top_ask_quantity": 100,
-                            "top_bid_price": 189.0,
-                            "top_bid_quantity": 200,
-                            "volume": 2000000
-                        },
-                        "pe": {
-                            "average_price": 180.0,
-                            "greeks": {"delta": -0.45, "theta": -9.5, "gamma": 0.001, "vega": 8.0},
-                            "implied_volatility": 16.0,
-                            "last_price": 170.0,
-                            "oi": 600000,
-                            "previous_close_price": 160.0,
-                            "previous_oi": 550000,
-                            "previous_volume": 800000,
-                            "security_id": 12346,
-                            "top_ask_price": 171.0,
-                            "top_ask_quantity": 150,
-                            "top_bid_price": 169.0,
-                            "top_bid_quantity": 250,
-                            "volume": 1500000
-                        }
-                    },
-                    "23500.000000": {
-                        "ce": {
-                            "average_price": 90.0,
-                            "greeks": {"delta": 0.3, "theta": -8.0, "gamma": 0.002, "vega": 6.0},
-                            "implied_volatility": 14.0,
-                            "last_price": 85.0,
-                            "oi": 120000,
-                            "previous_close_price": 70.0,
-                            "previous_oi": 110000,
-                            "previous_volume": 200000,
-                            "security_id": 12347,
-                            "top_ask_price": 86.0,
-                            "top_ask_quantity": 50,
-                            "top_bid_price": 84.0,
-                            "top_bid_quantity": 60,
-                            "volume": 300000
-                        },
-                        "pe": null
-                    }
-                }
-            },
-            "status": "success"
-        }"#
-    }
-
-    #[test]
-    fn test_map_option_chain_to_snapshot_rows_emits_one_per_side() {
-        let resp: OptionChainResponse =
-            serde_json::from_str(sample_chain_json()).expect("sample JSON parses");
-        let rows = map_option_chain_to_snapshot_rows(
-            &resp,
-            "NIFTY",
-            13,
-            "IDX_I",
-            1_700_000_000_000_000_000,
-            1_699_920_000_000_000_000,
-            1_700_006_400_000_000_000,
-        );
-        // strike 23000 has CE+PE (2 rows); strike 23500 has CE only (1).
-        assert_eq!(rows.len(), 3, "2 sides + 1 side = 3 rows");
-        assert!(rows.iter().all(|r| r.underlying_symbol == "NIFTY"));
-        assert!(rows.iter().all(|r| r.exchange_segment == "IDX_I"));
-        assert!(rows.iter().all(|r| r.fetch_outcome == FetchOutcome::Fresh));
-        assert!(rows.iter().all(|r| r.cache_age_used_secs == 0));
-    }
-
-    #[test]
-    fn test_map_option_chain_maps_ce_and_pe_fields() {
-        let resp: OptionChainResponse =
-            serde_json::from_str(sample_chain_json()).expect("sample JSON parses");
-        let rows = map_option_chain_to_snapshot_rows(&resp, "NIFTY", 13, "IDX_I", 1, 2, 3);
-        let ce = rows
-            .iter()
-            .find(|r| (r.strike - 23000.0).abs() < f64::EPSILON && r.side == OptionSide::Call)
-            .expect("23000 CE row present");
-        assert_eq!(ce.security_id, 12345);
-        assert_eq!(ce.oi, 500_000);
-        assert!((ce.greek_delta - 0.55).abs() < f64::EPSILON);
-        let pe = rows
-            .iter()
-            .find(|r| (r.strike - 23000.0).abs() < f64::EPSILON && r.side == OptionSide::Put)
-            .expect("23000 PE row present");
-        assert_eq!(pe.security_id, 12346);
-        assert!(pe.greek_delta < 0.0, "PE delta is negative");
-    }
-
-    #[test]
-    fn test_map_option_chain_skips_unparseable_strike_key() {
-        let json = r#"{"data":{"last_price":100.0,"oc":{
-            "not-a-number":{"ce":null,"pe":null}
-        }},"status":"success"}"#;
-        let resp: OptionChainResponse = serde_json::from_str(json).expect("parses");
-        let rows = map_option_chain_to_snapshot_rows(&resp, "NIFTY", 13, "IDX_I", 1, 2, 3);
-        assert!(rows.is_empty(), "unparseable strike key → no rows");
-    }
-
-    #[test]
-    fn test_map_option_chain_empty_oc_yields_no_rows() {
-        let json = r#"{"data":{"last_price":100.0,"oc":{}},"status":"success"}"#;
-        let resp: OptionChainResponse = serde_json::from_str(json).expect("parses");
-        let rows = map_option_chain_to_snapshot_rows(&resp, "NIFTY", 13, "IDX_I", 1, 2, 3);
-        assert!(rows.is_empty());
-    }
-
-    #[test]
-    fn test_compute_snapshot_timestamps_minute_aligns_ts() {
-        // UTC 2026-05-16 04:30:37 = IST 10:00:37 — ts must align to
-        // IST 10:00:00.
-        let utc_secs = chrono::Utc
-            .with_ymd_and_hms(2026, 5, 16, 4, 30, 37)
-            .single()
-            .unwrap()
-            .timestamp();
-        let (ts_nanos, trading_date_nanos, expiry_nanos) =
-            compute_snapshot_timestamps(utc_secs, "2026-05-29").expect("valid expiry");
-        assert_eq!(
-            ts_nanos % 60_000_000_000,
-            0,
-            "ts must be minute-aligned IST nanos"
-        );
-        assert!(trading_date_nanos < ts_nanos, "midnight precedes 10:00");
-        assert!(expiry_nanos > trading_date_nanos, "expiry is in the future");
-    }
-
-    #[test]
-    fn test_compute_snapshot_timestamps_rejects_bad_expiry() {
-        assert!(compute_snapshot_timestamps(1_700_000_000, "not-a-date").is_none());
-        assert!(compute_snapshot_timestamps(1_700_000_000, "2026/05/29").is_none());
-        assert!(compute_snapshot_timestamps(1_700_000_000, "").is_none());
-    }
-
-    #[test]
     fn test_telegram_reason_max_len_pinned() {
         // 200 chars is short enough to fit comfortably in a Telegram
         // body but long enough to give the operator real error context.
         // Bumping above ~400 risks pushing the body past Telegram's
         // 4096-char limit on a fully-populated event.
         assert_eq!(TELEGRAM_ERROR_REASON_MAX_LEN, 200);
-    }
-
-    #[test]
-    fn test_ist_date_midnight_from_utc_strips_intraday_secs() {
-        // 2026-05-16 10:00:00 IST = unknown UTC offset, doesn't matter;
-        // function is composition of UTC math + IST shift. Use a known
-        // pair: UTC 2026-05-16 04:30:00 (= IST 10:00:00).
-        let utc_secs = chrono::Utc
-            .with_ymd_and_hms(2026, 5, 16, 4, 30, 0)
-            .single()
-            .unwrap()
-            .timestamp();
-        let midnight_ist = ist_date_midnight_from_utc(utc_secs);
-        // 10:00 IST = 36_000 secs from midnight IST. So midnight =
-        // (UTC+19800) - 36000.
-        let now_ist = utc_secs + IST_UTC_OFFSET_SECONDS_I64;
-        assert_eq!(midnight_ist, now_ist - 36_000);
     }
 
     // -----------------------------------------------------------------
