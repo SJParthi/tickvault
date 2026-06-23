@@ -888,12 +888,11 @@ mod tests {
     // were dropped in the QuestDB table cleanup. (The watchdog
     // evaluator + Telegram variants are unaffected and stay.)
 
-    /// Option-chain pipeline PR #2/5 meta-guard: main.rs MUST include
-    /// `option_chain_minute_snapshot_persistence::ensure_option_chain_minute_snapshot_table`
-    /// in the boot-time DDL `tokio::join!`. Without the DDL, the future
-    /// runtime fetcher (PR #4 in this rollout) writes will 404 against
-    /// QuestDB ILP. See
-    /// `.claude/plans/friday-may-15-mega/topic-OPTION-CHAIN-MINUTE-SNAPSHOT.md`.
+    /// Option-chain pipeline PR #5/5 meta-guard: main.rs MUST spawn the
+    /// option-chain snapshot scheduler so the RAM `SnapshotCache` the
+    /// strategy reads is populated. (The QuestDB mirror table was dropped
+    /// 2026-06-23 — ticks are the single source of truth — so there is no
+    /// boot DDL to assert anymore, only the live scheduler spawn.)
     #[test]
     fn test_option_chain_minute_snapshot_scheduler_is_wired_into_main() {
         // Option-chain pipeline PR #5/5 meta-guard. main.rs MUST spawn
@@ -919,22 +918,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_option_chain_minute_snapshot_table_is_wired_into_boot_ddl() {
-        let main_rs = std::fs::read_to_string("../app/src/main.rs")
-            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
-            .expect("main.rs must be readable from secret_manager test working dir");
-
-        assert!(
-            main_rs.contains("ensure_option_chain_minute_snapshot_table"),
-            "main.rs MUST call \
-             `option_chain_minute_snapshot_persistence::ensure_option_chain_minute_snapshot_table` \
-             inside the boot DDL `tokio::join!`. Without this DDL the \
-             scheduled fetch task (PR #4) will hit a 404 on the QuestDB \
-             ILP `option_chain_minute_snapshot` table. See plan doc at \
-             `.claude/plans/friday-may-15-mega/topic-OPTION-CHAIN-MINUTE-SNAPSHOT.md`."
-        );
-    }
+    // test_option_chain_minute_snapshot_table_is_wired_into_boot_ddl REMOVED
+    // 2026-06-23: the `option_chain_minute_snapshot` QuestDB table was dropped
+    // (operator: ticks are the single source of truth). The scheduler still
+    // runs + populates the RAM `SnapshotCache` for the strategy — guarded by
+    // `test_option_chain_minute_snapshot_scheduler_is_wired_into_main` above —
+    // it just no longer mirrors into a QuestDB table, so there is no boot DDL
+    // to assert. See `.claude/plans/active-plan-drop-option-chain-snapshot-table.md`.
 
     /// Phase 0 Item 19f meta-guard: main.rs MUST wire the
     /// `shutdown_notify` -> heartbeat-`Notify` bridge so the
