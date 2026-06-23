@@ -87,3 +87,46 @@ fn dhan_auth_and_universe_exist_so_the_gate_actually_wraps_work() {
         "Dhan instrument load must exist in main.rs for the dhan_enabled gate to be meaningful."
     );
 }
+
+#[test]
+fn dhan_off_early_returns_before_auth_and_instruments() {
+    // STRENGTHENED proof (operator 2026-06-23 "strengthen it"): it is not enough
+    // that the gate AND the work both exist — the OFF path must EARLY-RETURN
+    // *before* Dhan auth and instrument load are ever reached. We prove this
+    // positionally: the `if !config.feeds.dhan_enabled { … return … }` skip
+    // block appears, and a `return` lives BETWEEN that guard and the Dhan auth
+    // step. So when Dhan is OFF the function exits before touching auth /
+    // instruments — they are unreachable, not merely "behind an if".
+    let src = read_main_rs();
+
+    let guard = src
+        .find("if !config.feeds.dhan_enabled")
+        .expect("the Dhan OFF skip-guard `if !config.feeds.dhan_enabled` must exist");
+    let auth = src
+        .find("authenticating with Dhan")
+        .expect("the Dhan auth step must exist");
+    let instruments = src
+        .find("load_instruments")
+        .or_else(|| src.find("load_daily_universe_plan"))
+        .or_else(|| src.find("daily_universe"))
+        .expect("the Dhan instrument-load step must exist");
+
+    assert!(
+        guard < auth,
+        "the Dhan OFF skip-guard MUST appear before Dhan auth — so OFF never reaches auth."
+    );
+    assert!(
+        guard < instruments,
+        "the Dhan OFF skip-guard MUST appear before the Dhan instrument load — so OFF \
+         never fetches/builds instruments."
+    );
+    // The OFF block must EARLY-RETURN before auth: a `return` must sit between
+    // the guard and the auth step. Without it, OFF would fall through to auth.
+    let between_guard_and_auth = &src[guard..auth];
+    assert!(
+        between_guard_and_auth.contains("return Ok(())"),
+        "the `if !config.feeds.dhan_enabled` block MUST early-return (return Ok(())) \
+         before Dhan auth — proving OFF runs ZERO auth + instrument work (operator \
+         lock 2026-06-23: OFF feed = entire architecture untouched)."
+    );
+}
