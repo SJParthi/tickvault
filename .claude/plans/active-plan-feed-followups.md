@@ -12,8 +12,32 @@
 | **A** | **Feed ON/OFF not working in `/feeds` webpage** | Tokenless toggle in dev/sandbox (operator approved) | small | **THIS PR** |
 | **B** | Remove `option_chain_minute_snapshot` table + its writer/scheduler ONLY | Keep the prev-day-OI fetch so candle `oi_pct_from_prev_day` survives (operator approved "remove only the snapshot table") | medium | next PR |
 | **C** | Per-feed instrument identity + `feed` on data+master tables | Dedicated design PR (operator approved). **Correction:** Groww `exchange_token` max = 1,175,236 → fits u32; NO ID-width change. Per-feed native ID in `security_id`, `feed` distinguishes, `isin` bridges. | large | design PR |
+| **D** | **Fully-dynamic per-feed lifecycle (no restart)** | Operator approved 2026-06-23: flip ON in `/feeds` → LIVE-start that feed's auth + instrument fetch + subscription; OFF → tear down. No restart ever. | **LARGE (design PR)** | queued (priority after #1191) |
 | Q5 | WS-GAP-06 illiquid-SID tick gaps | investigate (likely market reality) | — | queued |
 | Q6 | Telegram egress failures | environment (network) | — | queued |
+
+## Item D — Fully-dynamic per-feed lifecycle (design notes)
+
+**Already true (verified in `main.rs`):** per-feed *boot* isolation — a feed OFF at boot
+touches NO auth/instruments (Dhan skip L261/L436/L1224; Groww gate L277; both-off halt L270).
+So "OFF = nothing runs" already holds at startup.
+
+**Gap D closes:** the runtime `/feeds` toggle today only pauses/resumes a lane started at
+boot. D makes the toggle drive the FULL lifecycle:
+
+| Flip | Dhan lane | Groww lane |
+|---|---|---|
+| ON (was OFF at boot) | auth (TOTP→JWT) → daily-universe instrument fetch → main-feed WS subscribe + order-update WS | access-token auth → master CSV + NTM ISIN join → bridge/sidecar |
+| OFF (was ON) | close WS(es), stop storing, drop token-renewal; keep audit | pause bridge, stop sidecar, stop storing |
+
+**Honest envelope:** NOT "never fails / all permutations" — a bounded, ratcheted per-feed
+`LaneState {Off→Starting→Running→Stopping}` driven by the runtime flag; each transition
+idempotent + audited; Dhan-disable safety gate (`can_disable_dhan`, no live orders)
+preserved; ON-transition reuses the EXISTING boot fns (refactored callable post-boot — no
+duplicate logic); a failed ON (auth/CSV fail) leaves the lane OFF + errors, never half-started
+(Rule 14). 3-agent review (auth + WS + instruments). **Split:** D1 = Groww lane (lower risk,
+default-OFF, no orders); D2 = Dhan lane (higher risk — token + universe + 2 WS). Ships AFTER
+#1191 merges, serial.
 
 ## Item A — Design (THIS PR)
 
