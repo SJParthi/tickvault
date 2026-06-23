@@ -99,17 +99,15 @@ pub fn build_router_with_auth(
     // runtime per-feed enable/disable. `GET /api/feeds` reports state;
     // `POST /api/feeds/{feed}` flips it (Groww only — slice 1). Behind bearer
     // auth so only the operator can change the live feed topology.
+    // Only the MUTATING flip stays bearer-protected (operator AskUserQuestion
+    // 2026-06-23: "public read, authed toggle"). The read-only status + health
+    // GETs carry no secrets (FeedHealthRow is &'static str only) and move to the
+    // PUBLIC router below so the /feeds page renders with no token; disabling or
+    // enabling a feed still requires the bearer token.
     let protected_routes: Router<SharedAppState> = Router::new()
-        .route("/api/feeds", axum::routing::get(handlers::feeds::get_feeds))
         .route(
             "/api/feeds/{feed}",
             axum::routing::post(handlers::feeds::set_feed),
-        )
-        // Live-feed health check (operator 2026-06-22): truthful per-feed
-        // OK/Degraded/Down/Disabled verdict the operator can watch in real time.
-        .route(
-            "/api/feeds/health",
-            axum::routing::get(handlers::feeds::get_feeds_health),
         )
         .layer(axum::middleware::from_fn_with_state(
             auth_config,
@@ -140,6 +138,15 @@ pub fn build_router_with_auth(
         .route(
             "/feeds",
             axum::routing::get(handlers::feeds_page::feeds_page),
+        )
+        // Public read-only feed status + per-feed health (operator 2026-06-23:
+        // "public read, authed toggle"). No secrets — FeedHealthRow is
+        // &'static str only — so the /feeds page renders these with no token.
+        // The MUTATING POST /api/feeds/{feed} stays bearer-protected above.
+        .route("/api/feeds", axum::routing::get(handlers::feeds::get_feeds))
+        .route(
+            "/api/feeds/health",
+            axum::routing::get(handlers::feeds::get_feeds_health),
         )
         .route("/api/stats", axum::routing::get(handlers::stats::get_stats))
         .route(
@@ -470,18 +477,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_feeds_endpoint_requires_auth_401_without_token() {
+    async fn test_feeds_get_is_public_200_without_token() {
         use axum::body::Body;
         use axum::http::Request;
         use secrecy::SecretString;
         use tower::ServiceExt;
 
+        // Operator AskUserQuestion 2026-06-23 ("public read, authed toggle"):
+        // even with auth ENABLED, the read-only GET /api/feeds carries no secrets
+        // and is PUBLIC so the /feeds page renders with no token. Only the
+        // mutating POST /api/feeds/{feed} is bearer-gated (next test). Regression
+        // ratchet: this must stay 200 without a token.
         let auth = ApiAuthConfig::from_token(SecretString::from("secret-tok".to_string()));
         let router = build_router_with_auth(auth_test_state(), &[], auth);
 
-        // GET /api/feeds with NO Authorization header must be rejected — the
-        // feed-toggle endpoints are in `protected_routes` (a missing-auth toggle
-        // could disable the trading feed). Security regression ratchet.
         let response = router
             .oneshot(
                 Request::builder()
@@ -491,7 +500,32 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_feeds_health_is_public_200_without_token() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use secrecy::SecretString;
+        use tower::ServiceExt;
+
+        // Same contract: the read-only per-feed health view is public (no secrets;
+        // FeedHealthRow is &'static str only) so the operator can watch live-feed
+        // health without a token.
+        let auth = ApiAuthConfig::from_token(SecretString::from("secret-tok".to_string()));
+        let router = build_router_with_auth(auth_test_state(), &[], auth);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/feeds/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
     }
 
     #[tokio::test]

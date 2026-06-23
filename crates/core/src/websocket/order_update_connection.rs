@@ -104,18 +104,18 @@ pub async fn run_order_update_connection(
         // flag every 2s, until Dhan is re-enabled. A currently-open socket is left
         // to close on its next natural disconnect; in the only phase where Dhan
         // disable is permitted (no orders live), this WS carries nothing.
-        if let Some(flag) = dhan_feed_flag.as_ref() {
-            if !flag.load(std::sync::atomic::Ordering::Relaxed) {
-                info!("PR-E: Dhan disabled — order-update WS dormant until re-enabled");
-                while !flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        ORDER_UPDATE_FEED_DISABLE_POLL_SECS,
-                    ))
-                    .await;
-                }
-                info!("PR-E: Dhan re-enabled — order-update WS resuming");
-                consecutive_failures = 0;
+        if let Some(flag) = dhan_feed_flag.as_ref()
+            && !flag.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            info!("PR-E: Dhan disabled — order-update WS dormant until re-enabled");
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    ORDER_UPDATE_FEED_DISABLE_POLL_SECS,
+                ))
+                .await;
             }
+            info!("PR-E: Dhan re-enabled — order-update WS resuming");
+            consecutive_failures = 0;
         }
 
         // Snapshot the failure count BEFORE the connect attempt. If the

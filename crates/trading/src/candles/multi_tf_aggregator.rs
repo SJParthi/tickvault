@@ -62,7 +62,7 @@ use papaya::HashMap;
 use tickvault_common::tick_types::ParsedTick;
 
 use crate::candles::tf_index::{MARKET_CLOSE_SECS_OF_DAY_IST, MARKET_OPEN_SECS_OF_DAY_IST};
-use crate::candles::{AggregatorCell, ConsumeOutcome, LiveCandleState, TfIndex};
+use crate::candles::{AggregatorCell, ConsumeOutcome, FeedStrategy, LiveCandleState, TfIndex};
 
 /// Composite key per I-P1-11 — `(security_id, exchange_segment_code)`.
 type AggregatorKey = (u32, u8);
@@ -231,6 +231,37 @@ impl MultiTfAggregator {
         pin.get(&(security_id, exchange_segment_code)).cloned()
     }
 
+    /// Seed the per-instrument `last_cumulative` baseline ONCE, before the
+    /// instrument's FIRST `consume_tick`. Returns `true` if the entry existed
+    /// (seed applied), `false` otherwise.
+    ///
+    /// Why this exists (Groww first-bucket baseline): the per-instrument
+    /// `last_cumulative` atomic initialises to `0`, so the FIRST tick's open
+    /// bucket uses `bucket_start_cumulative = 0` and the bucket's incremental
+    /// volume becomes the FULL cumulative — correct for Dhan (whose cumulative
+    /// starts near 0 at session open) but WRONG for Groww, whose `cum_volume` is
+    /// a running day total already large at first observation. The legacy
+    /// `Groww1mAggregator` used the instrument's first-tick cumulative as the
+    /// baseline (so minute-1 volume = `last_cum − first_cum`). The Groww bridge
+    /// calls this once on first-seen-instrument with the first cumulative so the
+    /// shared engine reproduces that baseline EXACTLY — a Groww-only seed, the
+    /// Dhan path never calls it (its baseline stays 0, behaviour unchanged).
+    /// O(1): one papaya read + one atomic store.
+    pub fn seed_cumulative(
+        &self,
+        security_id: u32,
+        exchange_segment_code: u8,
+        cumulative: u64,
+    ) -> bool {
+        let pin = self.inner.pin();
+        if let Some(entry) = pin.get(&(security_id, exchange_segment_code)) {
+            entry.last_cumulative.store(cumulative, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Folds a single tick into ALL 21 TF slots for its instrument.
     ///
     /// `on_seal(tf, sealed_state)` is called once per TF whose
@@ -249,10 +280,24 @@ impl MultiTfAggregator {
     ///
     /// Total budget: ~300 ns per tick — within the existing tick-parse
     /// budget. The DHAT/Criterion split-budgets land in item 1.6.
+    ///
+    /// `strategy` is the per-feed [`FeedStrategy`] (Dhan = [`FeedStrategy::DHAN`]
+    /// Refold; Groww = [`FeedStrategy::GROWW`] Discard) threaded to every TF cell
+    /// so ONE engine instance serves either feed by VALUE, not forked code.
+    ///
+    /// `cumulative_volume_override` carries a feed's running cumulative day volume
+    /// as a `u64` when it exceeds the `u32` `tick.volume` field (Groww `cum_volume`
+    /// is an `i64`). The Dhan path passes `None` (the per-instrument `last_cumulative`
+    /// atomic + the cell read the `u32` `tick.volume`); Groww passes
+    /// `Some(cum as u64)`, which becomes BOTH the cell's running cumulative AND the
+    /// stored `last_cumulative` baseline for the next bucket — so the i64→u32
+    /// truncation the adversarial review flagged CRITICAL never happens.
     pub fn consume_tick<F>(
         &self,
         tick: &ParsedTick,
         exchange_segment_code: u8,
+        strategy: FeedStrategy,
+        cumulative_volume_override: Option<u64>,
         mut on_seal: F,
     ) -> ConsumeStats
     where
@@ -279,6 +324,17 @@ impl MultiTfAggregator {
         #[allow(clippy::manual_range_contains)]
         let out_of_session = secs_of_day < MARKET_OPEN_SECS_OF_DAY_IST
             || secs_of_day >= MARKET_CLOSE_SECS_OF_DAY_IST;
+        // Session-window gate applies to EVERY feed (Dhan AND Groww). The bucket
+        // grid is 09:15-anchored (`TfIndex::bucket_start` clamps a pre-open tick
+        // to the first bucket), so a pre-open tick that slipped past this gate
+        // would FOLD INTO (corrupt) the 09:15 candle, not form a distinct pre-open
+        // candle. INTENDED deviation from the legacy `Groww1mAggregator` (which
+        // floored to absolute minute and had no session concept): both feeds'
+        // candle grids begin at 09:15, matching the REST/backtest cross-verify
+        // window. Pinned by `test_groww_pre_open_minute_is_gated_intended`.
+        // (If SP6 finds Groww backtest emits pre-open candles, revisit with a
+        // pre-open-aware bucket grid — a separate, larger change.)
+        // `always_on` still exempts long-session instruments (e.g. GIFT Nifty).
         if !exempt && out_of_session {
             return ConsumeStats {
                 sealed_count: 0,
@@ -305,7 +361,10 @@ impl MultiTfAggregator {
         let mut amended_count: u8 = 0;
 
         for tf in TfIndex::ALL {
-            match entry.cell.consume_tick(tf, tick, last_cum) {
+            match entry
+                .cell
+                .consume_tick(tf, tick, last_cum, strategy, cumulative_volume_override)
+            {
                 ConsumeOutcome::Updated => {}
                 ConsumeOutcome::Sealed { sealed_state } => {
                     sealed_count = sealed_count.saturating_add(1);
@@ -328,9 +387,14 @@ impl MultiTfAggregator {
         // racing observer that reads mid-fan-out sees a consistent
         // value (but consume_tick on a SINGLE instrument is expected
         // to be single-threaded — the WS read loop is the only writer).
+        // Use the SAME resolved cumulative the cell used (override when present)
+        // so the next bucket's baseline matches the value just folded — never the
+        // truncated `u32` `tick.volume` when a `u64` override was supplied.
+        let stored_cumulative =
+            cumulative_volume_override.unwrap_or_else(|| u64::from(tick.volume));
         entry
             .last_cumulative
-            .store(u64::from(tick.volume), Ordering::Relaxed);
+            .store(stored_cumulative, Ordering::Relaxed);
 
         ConsumeStats {
             sealed_count,
@@ -452,11 +516,59 @@ mod tests {
     }
 
     #[test]
+    fn test_seed_cumulative_sets_baseline_on_present_instrument() {
+        // Groww-only first-tick baseline seed: stores the first cumulative on
+        // the entry's `last_cumulative` atomic so minute-1 volume folds as
+        // `last_cum − first_cum` (legacy Groww1mAggregator parity).
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(1_333, 1u8)]);
+        let seeded = agg.seed_cumulative(1_333, 1, 100);
+        assert!(seeded, "seed must succeed on a pre-populated instrument");
+        let entry = agg.get(1_333, 1).expect("present");
+        assert_eq!(
+            entry.last_cumulative.load(Ordering::Relaxed),
+            100,
+            "baseline cumulative must be stored verbatim"
+        );
+    }
+
+    #[test]
+    fn test_seed_cumulative_returns_false_for_unknown_instrument() {
+        // Fail-safe: seeding an instrument that was never pre-populated is a
+        // no-op returning false — the Dhan path never calls this, and a Groww
+        // mis-seed must not silently create a slot.
+        let agg = MultiTfAggregator::new();
+        assert!(
+            !agg.seed_cumulative(999, 99, 5_000_000_000),
+            "seed must return false when the instrument is absent"
+        );
+        assert!(agg.get(999, 99).is_none(), "no slot is created on a miss");
+    }
+
+    #[test]
+    fn test_seed_cumulative_accepts_value_above_u32_max() {
+        // The i64-widened cumulative (> u32::MAX) must store losslessly into the
+        // u64 atomic — the truncation the adversarial review flagged CRITICAL.
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(1_333, 1u8)]);
+        let big: u64 = 5_000_000_000; // > u32::MAX (4_294_967_295)
+        assert!(agg.seed_cumulative(1_333, 1, big));
+        let entry = agg.get(1_333, 1).expect("present");
+        assert_eq!(
+            entry.last_cumulative.load(Ordering::Relaxed),
+            big,
+            "cumulative above u32::MAX must survive without truncation"
+        );
+    }
+
+    #[test]
     fn test_consume_tick_returns_instrument_not_found_when_missing() {
         let agg = MultiTfAggregator::new();
         let tick = mk_tick(999, 0, 1_779_354_960, 100.0, 50, 0);
         let mut sealed_callbacks: u32 = 0;
-        let stats = agg.consume_tick(&tick, 0, |_, _| sealed_callbacks += 1);
+        let stats = agg.consume_tick(&tick, 0, FeedStrategy::DHAN, None, |_, _| {
+            sealed_callbacks += 1
+        });
         assert!(!stats.instrument_found);
         assert_eq!(stats.sealed_count, 0);
         assert_eq!(stats.late_count, 0);
@@ -471,7 +583,7 @@ mod tests {
         agg.pre_populate(vec![(13, 0)]);
         // secs_of_day = 72000 = 20:00 IST (base day-aligned + 72000).
         let tick = mk_tick(13, 0, 1_779_235_200 + 72_000, 100.0, 50, 1_000);
-        agg.consume_tick(&tick, 0, |_, _| {});
+        agg.consume_tick(&tick, 0, FeedStrategy::DHAN, None, |_, _| {});
         let entry = agg.get(13, 0).expect("present");
         assert!(
             entry.cell.snapshot(TfIndex::ALL[0]).is_uninitialised(),
@@ -488,7 +600,7 @@ mod tests {
         let agg = MultiTfAggregator::with_capacity(8).with_always_on(Arc::new(set));
         agg.pre_populate(vec![(5024, 0)]);
         let tick = mk_tick(5024, 0, 1_779_235_200 + 72_000, 100.0, 50, 1_000);
-        agg.consume_tick(&tick, 0, |_, _| {});
+        agg.consume_tick(&tick, 0, FeedStrategy::DHAN, None, |_, _| {});
         let entry = agg.get(5024, 0).expect("present");
         assert!(
             !entry.cell.snapshot(TfIndex::ALL[0]).is_uninitialised(),
@@ -502,7 +614,9 @@ mod tests {
         agg.pre_populate(vec![(13, 0)]);
         let tick = mk_tick(13, 0, 1_779_354_960, 100.0, 50, 1_000);
         let mut sealed_callbacks: u32 = 0;
-        let stats = agg.consume_tick(&tick, 0, |_, _| sealed_callbacks += 1);
+        let stats = agg.consume_tick(&tick, 0, FeedStrategy::DHAN, None, |_, _| {
+            sealed_callbacks += 1
+        });
         assert!(stats.instrument_found);
         assert_eq!(stats.sealed_count, 0); // first tick — nothing to seal
         assert_eq!(stats.late_count, 0);
@@ -523,12 +637,12 @@ mod tests {
         let agg = MultiTfAggregator::new();
         agg.pre_populate(vec![(13, 0)]);
         let tick1 = mk_tick(13, 0, 1_779_354_960, 100.0, 50, 1_000);
-        agg.consume_tick(&tick1, 0, |_, _| {});
+        agg.consume_tick(&tick1, 0, FeedStrategy::DHAN, None, |_, _| {});
         let entry = agg.get(13, 0).expect("present");
         assert_eq!(entry.last_cumulative.load(Ordering::Relaxed), 50);
 
         let tick2 = mk_tick(13, 0, 1_779_354_970, 101.0, 75, 1_010);
-        agg.consume_tick(&tick2, 0, |_, _| {});
+        agg.consume_tick(&tick2, 0, FeedStrategy::DHAN, None, |_, _| {});
         assert_eq!(entry.last_cumulative.load(Ordering::Relaxed), 75);
     }
 
@@ -542,10 +656,12 @@ mod tests {
         // TF still hold their `base` bucket.
         let base = 1_779_354_900_u32; // 2026-05-21 09:15:00 IST
         let tick1 = mk_tick(13, 0, base + 10, 100.0, 50, 1_000);
-        agg.consume_tick(&tick1, 0, |_, _| {});
+        agg.consume_tick(&tick1, 0, FeedStrategy::DHAN, None, |_, _| {});
         let tick2 = mk_tick(13, 0, base + 70, 102.0, 80, 1_010);
         let mut sealed_tfs: Vec<TfIndex> = Vec::new();
-        let stats = agg.consume_tick(&tick2, 0, |tf, _| sealed_tfs.push(tf));
+        let stats = agg.consume_tick(&tick2, 0, FeedStrategy::DHAN, None, |tf, _| {
+            sealed_tfs.push(tf)
+        });
         assert!(stats.instrument_found);
         assert_eq!(stats.sealed_count, 1);
         assert_eq!(stats.late_count, 0);
@@ -558,13 +674,15 @@ mod tests {
         agg.pre_populate(vec![(13, 0)]);
         let aligned = 1_779_355_500_u32; // 2026-05-21 09:25:00 IST (M1-aligned)
         let tick1 = mk_tick(13, 0, aligned + 30, 100.0, 50, 0);
-        agg.consume_tick(&tick1, 0, |_, _| {});
+        agg.consume_tick(&tick1, 0, FeedStrategy::DHAN, None, |_, _| {});
         // Late tick belongs to the PREVIOUS M1 bucket, but NO bucket has been
         // sealed yet → no amendable last-sealed bucket → DiscardLate (Option B
         // only amends a bucket that was actually sealed by a newer in-session tick).
         let late_tick = mk_tick(13, 0, aligned - 5, 99.0, 40, 0);
         let mut on_seal_calls: u32 = 0;
-        let stats = agg.consume_tick(&late_tick, 0, |_, _| on_seal_calls += 1);
+        let stats = agg.consume_tick(&late_tick, 0, FeedStrategy::DHAN, None, |_, _| {
+            on_seal_calls += 1
+        });
         assert!(stats.instrument_found);
         assert_eq!(stats.sealed_count, 0);
         assert_eq!(stats.amended_count, 0);
@@ -583,17 +701,35 @@ mod tests {
         let agg = MultiTfAggregator::new();
         agg.pre_populate(vec![(13, 0)]);
         let b1 = 1_779_355_500_u32; // 09:25:00 IST
-        agg.consume_tick(&mk_tick(13, 0, b1 + 30, 100.0, 50, 0), 0, |_, _| {}); // open M1 bucket1
-        agg.consume_tick(&mk_tick(13, 0, b1 + 70, 105.0, 60, 0), 0, |_, _| {}); // cross boundary → seal M1 bucket1
+        agg.consume_tick(
+            &mk_tick(13, 0, b1 + 30, 100.0, 50, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+            |_, _| {},
+        ); // open M1 bucket1
+        agg.consume_tick(
+            &mk_tick(13, 0, b1 + 70, 105.0, 60, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+            |_, _| {},
+        ); // cross boundary → seal M1 bucket1
         // Late tick (LTT 09:25:50) into the just-sealed M1 bucket1, price 110 (new high).
         let mut m1_amend_emits: u32 = 0;
-        let stats = agg.consume_tick(&mk_tick(13, 0, b1 + 50, 110.0, 55, 0), 0, |tf, st| {
-            if tf == TfIndex::M1 {
-                m1_amend_emits += 1;
-                assert_eq!(st.bucket_start_ist_secs, b1);
-                assert_eq!(st.high, 110.0); // corrected high routed for UPSERT
-            }
-        });
+        let stats = agg.consume_tick(
+            &mk_tick(13, 0, b1 + 50, 110.0, 55, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+            |tf, st| {
+                if tf == TfIndex::M1 {
+                    m1_amend_emits += 1;
+                    assert_eq!(st.bucket_start_ist_secs, b1);
+                    assert_eq!(st.high, 110.0); // corrected high routed for UPSERT
+                }
+            },
+        );
         assert!(
             stats.amended_count >= 1,
             "M1 should have amended; got amended_count={}",
@@ -610,7 +746,7 @@ mod tests {
         // Tick both instruments to open all slots.
         for sid in [13_u32, 25] {
             let t = mk_tick(sid, 0, 1_779_354_960, 100.0, 50, 0);
-            agg.consume_tick(&t, 0, |_, _| {});
+            agg.consume_tick(&t, 0, FeedStrategy::DHAN, None, |_, _| {});
         }
         let mut emitted: Vec<(u32, u8, TfIndex)> = Vec::new();
         agg.force_seal_all(|sid, seg, tf, _| emitted.push((sid, seg, tf)));
@@ -649,7 +785,7 @@ mod tests {
         let agg = MultiTfAggregator::new();
         agg.pre_populate(vec![(13, 0u8), (13, 1u8)]);
         let tick_seg0 = mk_tick(13, 0, 1_779_354_960, 100.0, 50, 0);
-        agg.consume_tick(&tick_seg0, 0, |_, _| {});
+        agg.consume_tick(&tick_seg0, 0, FeedStrategy::DHAN, None, |_, _| {});
 
         // Segment 1's entry should still be empty.
         let entry1 = agg.get(13, 1).expect("present");

@@ -55,6 +55,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+use tickvault_common::feed::Feed;
 
 use crate::seal_spill::SerializedSeal;
 
@@ -77,7 +78,11 @@ const SEAL_DLQ_DIR: &str = "data/dlq";
 /// - `close_pct_from_prev_day`, `oi_pct_from_prev_day`,
 ///   `volume_pct_from_prev_day` — Wave-5 stamped-at-seal pct fields
 ///   (per locked decision L-H6).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+// `Copy` dropped 2026-06-23: the `feed: String` field (round-trips broker
+// provenance through the DLQ NDJSON) makes the record non-`Copy`. The DLQ path
+// is the cold last-resort tier (NDJSON serialize/deserialize), never the hot
+// path, so a `Clone`-only record is fine — every conversion uses `&self`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SealDlqRecord {
     #[serde(default)]
     pub security_id: u32,
@@ -120,6 +125,13 @@ pub struct SealDlqRecord {
     /// yesterday's close).
     #[serde(default)]
     pub open_gap_pct: f64,
+    /// Broker-source feed label (`"dhan"` / `"groww"`). `#[serde(default)]` ⇒
+    /// pre-feed DLQ NDJSON records (no `feed` key) deserialise to `""`, which
+    /// the `→ SerializedSeal` conversion maps to `Feed::Dhan` — backward-compatible.
+    /// Round-trips the feed through the DLQ so a Groww seal recovered from the
+    /// last-resort NDJSON still writes `feed='groww'`.
+    #[serde(default)]
+    pub feed: String,
 }
 
 impl From<&SerializedSeal> for SealDlqRecord {
@@ -131,6 +143,8 @@ impl From<&SerializedSeal> for SealDlqRecord {
         Self {
             security_id: s.security_id,
             exchange_segment_code: s.exchange_segment_code,
+            // Round-trip feed provenance through the DLQ NDJSON.
+            feed: s.feed.as_str().to_string(),
             tf_ordinal: s.tf_ordinal,
             bucket_start_ist_secs: s.bucket_start_ist_secs,
             tick_count: s.tick_count,
@@ -160,6 +174,9 @@ impl From<&SealDlqRecord> for SerializedSeal {
         Self {
             security_id: r.security_id,
             exchange_segment_code: r.exchange_segment_code,
+            // Pre-feed DLQ records have feed="" → Feed::Dhan (backward-compatible);
+            // an unknown label also degrades to Dhan rather than panicking.
+            feed: Feed::parse(&r.feed).unwrap_or(Feed::Dhan),
             tf_ordinal: r.tf_ordinal,
             bucket_start_ist_secs: r.bucket_start_ist_secs,
             tick_count: r.tick_count,
@@ -347,6 +364,7 @@ mod tests {
         SerializedSeal {
             security_id: sid,
             exchange_segment_code: seg,
+            feed: Feed::Dhan,
             tf_ordinal: tf,
             bucket_start_ist_secs: bucket,
             tick_count: 5,
@@ -476,6 +494,7 @@ mod tests {
         let s = SerializedSeal {
             security_id: 25,
             exchange_segment_code: 1,
+            feed: Feed::Dhan,
             tf_ordinal: 4,
             bucket_start_ist_secs: 1_716_001_500,
             tick_count: 0,

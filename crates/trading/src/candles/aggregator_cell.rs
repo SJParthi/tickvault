@@ -66,6 +66,58 @@ use tickvault_common::tick_types::ParsedTick;
 use crate::candles::{TF_COUNT, TfIndex};
 
 // ---------------------------------------------------------------------------
+// FeedStrategy — per-feed BEHAVIOUR as a typed parameter (NOT forked code)
+// ---------------------------------------------------------------------------
+
+/// What the cell does with a tick whose minute is EARLIER than the open bucket
+/// but equal to the MOST-RECENTLY sealed bucket (a 1-bucket-late arrival).
+///
+/// The 3-agent adversarial review (2026-06-22, recorded in
+/// `active-plan-groww-live-backtest-parity.md` §48) proved the two feeds differ
+/// in EXACTLY this policy. It is DATA, not forked code — one engine, a per-feed
+/// value, so Groww can join the same 21-TF `MultiTfAggregator` as Dhan:
+///
+/// - **Dhan** [`LatePolicy::Refold`] — re-fold the late tick into the just-sealed
+///   minute's H/L/C and re-emit it ([`ConsumeOutcome::AmendedLate`]) so the writer
+///   UPSERTs that minute in place (operator lock 2026-06-05, Option B).
+/// - **Groww** [`LatePolicy::Discard`] — drop the out-of-order tick (count it via
+///   [`ConsumeOutcome::DiscardLate`]), never touching a sealed candle. Groww's live
+///   feed never re-folds; forcing it onto Refold would CHANGE its candle vs the
+///   Groww backtest (the parity goal).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LatePolicy {
+    /// Re-fold a 1-bucket-late tick into the just-sealed minute (Dhan).
+    Refold,
+    /// Discard the late tick, never amending a sealed candle (Groww).
+    Discard,
+}
+
+/// Per-feed fold policy threaded through [`AggregatorCell::consume_tick`] and
+/// [`crate::candles::MultiTfAggregator::consume_tick`]. `Copy` (a single enum
+/// field) so it is a zero-cost stack argument on the hot path. Adding a future
+/// per-feed knob (e.g. a volume convention flag) extends THIS struct — never a
+/// second engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FeedStrategy {
+    /// How a 1-bucket-late tick is handled. See [`LatePolicy`].
+    pub late_policy: LatePolicy,
+}
+
+impl FeedStrategy {
+    /// Dhan's strategy: re-fold 1-bucket-late ticks (Option B `AmendedLate`).
+    /// This is the BEHAVIOUR the Dhan path has had unconditionally — passing it
+    /// keeps the Dhan candle byte-identical to the pre-`FeedStrategy` code.
+    pub const DHAN: Self = Self {
+        late_policy: LatePolicy::Refold,
+    };
+    /// Groww's strategy: discard out-of-order ticks (never amend a sealed
+    /// candle) — matches the legacy `Groww1mAggregator` semantics exactly.
+    pub const GROWW: Self = Self {
+        late_policy: LatePolicy::Discard,
+    };
+}
+
+// ---------------------------------------------------------------------------
 // LiveCandleState — Copy data struct
 // ---------------------------------------------------------------------------
 
@@ -205,12 +257,22 @@ impl LiveCandleState {
     /// `high` / `low` / `close` ALWAYS track the LTP — never
     /// `day_high` / `day_low` (Dhan mislabels `day_close`, so it is
     /// never used for a candle's close per Ticket #5525125).
+    ///
+    /// `cumulative_volume` is the instrument's running cumulative day volume for
+    /// THIS tick. The caller resolves it: the Dhan path passes
+    /// `u64::from(tick.volume)` (the `u32` Quote-packet field); a feed whose
+    /// cumulative exceeds `u32` (Groww `cum_volume`, an `i64`) passes the widened
+    /// value via [`AggregatorCell::consume_tick`]'s `cumulative_volume_override`.
+    /// Routing it as an explicit `u64` arg — rather than re-reading the `u32`
+    /// `tick.volume` here — is what prevents the i64→u32 truncation the adversarial
+    /// review flagged CRITICAL.
     #[inline]
     fn from_first_tick(
         tick: &ParsedTick,
         bucket_start: u32,
         bucket_start_cumulative: u64,
         use_day_open: bool,
+        cumulative_volume: u64,
     ) -> Self {
         // Operator-spotted 2026-05-25: f64::from(f32) on price fields
         // produces IEEE-754 widening artifacts (e.g. 23925.65_f32 →
@@ -228,7 +290,7 @@ impl LiveCandleState {
         } else {
             price
         };
-        let cumulative = u64::from(tick.volume);
+        let cumulative = cumulative_volume;
         Self {
             bucket_start_ist_secs: bucket_start,
             open,
@@ -267,8 +329,11 @@ impl LiveCandleState {
     /// Folds an in-bucket tick into the running state. Caller has
     /// already verified the tick belongs to THIS bucket (i.e.
     /// `TfIndex::bucket_start(tick.exchange_timestamp) == self.bucket_start_ist_secs`).
+    ///
+    /// `cumulative_volume` — see [`Self::from_first_tick`] for why the caller
+    /// resolves it as a `u64` rather than re-reading `tick.volume`.
     #[inline]
-    fn fold_in_bucket(&mut self, tick: &ParsedTick) {
+    fn fold_in_bucket(&mut self, tick: &ParsedTick, cumulative_volume: u64) {
         // 2026-05-25: f32_to_f64_clean (not f64::from) — see
         // from_first_tick docs above for the IEEE-754 widening rationale.
         let price = tickvault_common::price_precision::f32_to_f64_clean(tick.last_traded_price);
@@ -285,7 +350,7 @@ impl LiveCandleState {
         // Item 28 carry-over: incremental volume from bucket start.
         // saturating_sub guards against rare out-of-order tick where
         // current cumulative < bucket-start.
-        self.volume = u64::from(tick.volume).saturating_sub(self.bucket_start_cumulative);
+        self.volume = cumulative_volume.saturating_sub(self.bucket_start_cumulative);
         self.oi = i64::from(tick.open_interest);
         self.tick_count = self.tick_count.saturating_add(1);
         // Keep the last non-zero prev-day close (Quote `close`). A blank
@@ -452,12 +517,32 @@ impl AggregatorCell {
     /// computes this from the per-instrument cumulative tracker (the
     /// last close-out cumulative becomes the next bucket's start).
     /// Pass `0` on the session's very first tick.
+    ///
+    /// `strategy` is the per-feed [`FeedStrategy`]: Dhan passes [`FeedStrategy::DHAN`]
+    /// ([`LatePolicy::Refold`] — the unconditional pre-`FeedStrategy` behaviour);
+    /// Groww passes [`FeedStrategy::GROWW`] ([`LatePolicy::Discard`] — never amend a
+    /// sealed candle). Under `Discard` the 1-bucket-late re-fold branch is skipped
+    /// and a late tick always returns [`ConsumeOutcome::DiscardLate`].
+    ///
+    /// `cumulative_volume_override` carries a feed's running cumulative day volume
+    /// as a `u64` when it does NOT fit the `u32` `tick.volume` field. The Dhan path
+    /// passes `None` (the cell reads `u64::from(tick.volume)`); the Groww path
+    /// passes `Some(cum_volume as u64)` — Groww `cum_volume` is an `i64` that
+    /// exceeds `u32` intraday for liquid stocks, so funnelling it through
+    /// `tick.volume: u32` would TRUNCATE (the adversarial-review CRITICAL). A `u64`
+    /// arg avoids that with zero allocation.
     pub fn consume_tick(
         &self,
         tf: TfIndex,
         tick: &ParsedTick,
         bucket_start_cumulative: u64,
+        strategy: FeedStrategy,
+        cumulative_volume_override: Option<u64>,
     ) -> ConsumeOutcome {
+        // Resolve the running cumulative ONCE: the override (Groww's widened i64→u64)
+        // when present, else the Dhan `u32` Quote-packet field. No truncation.
+        let cumulative_volume =
+            cumulative_volume_override.unwrap_or_else(|| u64::from(tick.volume));
         let bucket_start = tf.bucket_start(tick.exchange_timestamp);
         let mut guard = self.slots[tf.as_ordinal()].lock();
 
@@ -473,13 +558,14 @@ impl AggregatorCell {
                 bucket_start,
                 bucket_start_cumulative,
                 use_day_open,
+                cumulative_volume,
             );
             return ConsumeOutcome::Updated;
         }
 
         // In-bucket tick — fold and return.
         if bucket_start == guard.bucket_start_ist_secs {
-            guard.fold_in_bucket(tick);
+            guard.fold_in_bucket(tick, cumulative_volume);
             return ConsumeOutcome::Updated;
         }
 
@@ -495,6 +581,7 @@ impl AggregatorCell {
                     bucket_start,
                     bucket_start_cumulative,
                     false,
+                    cumulative_volume,
                 ),
             );
             // Option B: remember this just-sealed INTRADAY bucket so a late tick
@@ -505,17 +592,22 @@ impl AggregatorCell {
             return ConsumeOutcome::Sealed { sealed_state };
         }
 
-        // Tick belongs to an OLDER bucket — late arrival. Option B (operator
-        // lock 2026-06-05): if its LTT floors to the most-recently sealed
-        // bucket, re-fold its high/low into THAT minute and re-emit (the writer
-        // UPSERTs, replacing the row in place). Only a ≥2-bucket-late tick, or
-        // one with no amendable last-sealed bucket (post-force_seal), is dropped.
-        let mut last = self.last_sealed[tf.as_ordinal()].lock();
-        if !last.is_uninitialised() && bucket_start == last.bucket_start_ist_secs {
-            last.fold_late_hlc(tick);
-            return ConsumeOutcome::AmendedLate {
-                amended_state: *last,
-            };
+        // Tick belongs to an OLDER bucket — late arrival. Per-feed `late_policy`:
+        // - Dhan ([`LatePolicy::Refold`], operator lock 2026-06-05): if its LTT
+        //   floors to the most-recently sealed bucket, re-fold its high/low into
+        //   THAT minute and re-emit (the writer UPSERTs, replacing the row in
+        //   place). Only a ≥2-bucket-late tick, or one with no amendable
+        //   last-sealed bucket (post-force_seal), is dropped.
+        // - Groww ([`LatePolicy::Discard`]): never amend a sealed candle — always
+        //   discard, matching the legacy `Groww1mAggregator` semantics exactly.
+        if matches!(strategy.late_policy, LatePolicy::Refold) {
+            let mut last = self.last_sealed[tf.as_ordinal()].lock();
+            if !last.is_uninitialised() && bucket_start == last.bucket_start_ist_secs {
+                last.fold_late_hlc(tick);
+                return ConsumeOutcome::AmendedLate {
+                    amended_state: *last,
+                };
+            }
         }
         ConsumeOutcome::DiscardLate
     }
@@ -620,13 +712,13 @@ mod tests {
         let cell = AggregatorCell::empty();
         let mut t1 = mk_tick(1_779_354_960, 100.0, 50, 1_000);
         t1.day_open = 100.0;
-        cell.consume_tick(TfIndex::M1, &t1, 0);
+        cell.consume_tick(TfIndex::M1, &t1, 0, FeedStrategy::DHAN, None);
         assert_eq!(cell.snapshot(TfIndex::M1).session_open, 100.0);
 
         // A later in-bucket tick keeps session_open + updates close.
         let mut t2 = mk_tick(1_779_354_975, 103.0, 60, 1_010);
         t2.day_open = 100.0;
-        cell.consume_tick(TfIndex::M1, &t2, 0);
+        cell.consume_tick(TfIndex::M1, &t2, 0, FeedStrategy::DHAN, None);
         let snap = cell.snapshot(TfIndex::M1);
         assert_eq!(snap.session_open, 100.0, "session_open preserved");
         assert_eq!(snap.close, 103.0);
@@ -634,7 +726,7 @@ mod tests {
         // A pre-open tick (day_open == 0) must NOT clobber the captured open.
         let mut t3 = mk_tick(1_779_354_990, 104.0, 70, 1_020);
         t3.day_open = 0.0;
-        cell.consume_tick(TfIndex::M1, &t3, 0);
+        cell.consume_tick(TfIndex::M1, &t3, 0, FeedStrategy::DHAN, None);
         assert_eq!(
             cell.snapshot(TfIndex::M1).session_open,
             100.0,
@@ -661,7 +753,13 @@ mod tests {
         // the implicit coverage in every test_consume_*/test_force_seal_*
         // assertion below.
         let cell = AggregatorCell::empty();
-        cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_960, 100.0, 50, 1_000), 0);
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(1_779_354_960, 100.0, 50, 1_000),
+            0,
+            FeedStrategy::DHAN,
+            None,
+        );
         let snap_a = cell.snapshot(TfIndex::M1);
         let snap_b = cell.snapshot(TfIndex::M1);
         assert_eq!(snap_a, snap_b);
@@ -670,7 +768,13 @@ mod tests {
         assert!(snap_m5.is_uninitialised());
         // Mutating the cell after the first snapshot must NOT mutate
         // the previously-returned snapshot (Copy semantics).
-        cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_975, 105.0, 60, 1_010), 0);
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(1_779_354_975, 105.0, 60, 1_010),
+            0,
+            FeedStrategy::DHAN,
+            None,
+        );
         let snap_after = cell.snapshot(TfIndex::M1);
         assert_eq!(snap_a.close, 100.0); // snap_a is a stale copy by design
         assert_eq!(snap_after.close, 105.0);
@@ -693,7 +797,7 @@ mod tests {
     fn test_consume_tick_first_tick_opens_bucket() {
         let cell = AggregatorCell::empty();
         let tick = mk_tick(1_779_354_960, 100.0, 50, 1_000);
-        let outcome = cell.consume_tick(TfIndex::M1, &tick, 0);
+        let outcome = cell.consume_tick(TfIndex::M1, &tick, 0, FeedStrategy::DHAN, None);
         assert_eq!(outcome, ConsumeOutcome::Updated);
         let s = cell.snapshot(TfIndex::M1);
         assert!(!s.is_uninitialised());
@@ -716,12 +820,12 @@ mod tests {
         // First tick carries a real prev-day close (e.g. 09:15+).
         let mut t1 = mk_tick(1_779_354_960, 100.0, 50, 1_000);
         t1.day_close = 95.5;
-        cell.consume_tick(TfIndex::M1, &t1, 0);
+        cell.consume_tick(TfIndex::M1, &t1, 0, FeedStrategy::DHAN, None);
         assert_eq!(cell.snapshot(TfIndex::M1).prev_day_close, 95.5);
         // Subsequent in-bucket tick with day_close=0 must keep 95.5.
         let mut t2 = mk_tick(1_779_354_975, 101.0, 70, 1_010);
         t2.day_close = 0.0;
-        cell.consume_tick(TfIndex::M1, &t2, 0);
+        cell.consume_tick(TfIndex::M1, &t2, 0, FeedStrategy::DHAN, None);
         assert_eq!(
             cell.snapshot(TfIndex::M1).prev_day_close,
             95.5,
@@ -733,9 +837,21 @@ mod tests {
     fn test_consume_tick_in_bucket_tick_folds_high_low_close_volume() {
         let cell = AggregatorCell::empty();
         // Bucket-aligned t=1716000900 (divisible by 60).
-        cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_960, 100.0, 50, 1_000), 0);
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(1_779_354_960, 100.0, 50, 1_000),
+            0,
+            FeedStrategy::DHAN,
+            None,
+        );
         // Same bucket: t=1716000915 still floors to 1716000900.
-        let outcome = cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_975, 105.0, 75, 1_010), 0);
+        let outcome = cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(1_779_354_975, 105.0, 75, 1_010),
+            0,
+            FeedStrategy::DHAN,
+            None,
+        );
         assert_eq!(outcome, ConsumeOutcome::Updated);
         let s = cell.snapshot(TfIndex::M1);
         assert_eq!(s.bucket_start_ist_secs, 1_779_354_960);
@@ -751,8 +867,20 @@ mod tests {
     #[test]
     fn test_consume_tick_low_updates_when_tick_below_open() {
         let cell = AggregatorCell::empty();
-        cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_960, 100.0, 50, 0), 0);
-        let _ = cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_975, 95.0, 60, 0), 0);
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(1_779_354_960, 100.0, 50, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+        );
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(1_779_354_975, 95.0, 60, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+        );
         let s = cell.snapshot(TfIndex::M1);
         assert_eq!(s.low, 95.0);
         assert_eq!(s.high, 100.0); // unchanged
@@ -762,11 +890,29 @@ mod tests {
     fn test_consume_tick_boundary_crossing_seals_previous_bucket() {
         let cell = AggregatorCell::empty();
         // Bucket A: 1716000900..1716000960
-        cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_960, 100.0, 50, 1_000), 0);
-        cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_990, 105.0, 70, 1_005), 0);
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(1_779_354_960, 100.0, 50, 1_000),
+            0,
+            FeedStrategy::DHAN,
+            None,
+        );
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(1_779_354_990, 105.0, 70, 1_005),
+            0,
+            FeedStrategy::DHAN,
+            None,
+        );
         // Bucket B: 1716000960..1716001020 — first tick crosses.
         // Pass bucket_start_cumulative=70 (the last cumulative from bucket A).
-        let outcome = cell.consume_tick(TfIndex::M1, &mk_tick(1_779_355_021, 102.0, 80, 1_010), 70);
+        let outcome = cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(1_779_355_021, 102.0, 80, 1_010),
+            70,
+            FeedStrategy::DHAN,
+            None,
+        );
         let sealed_state = match outcome {
             ConsumeOutcome::Sealed { sealed_state } => sealed_state,
             other => panic!("expected Sealed, got {other:?}"),
@@ -794,12 +940,18 @@ mod tests {
         let cell = AggregatorCell::empty();
         // Open bucket at t=1716001000 (aligned to 60s boundary).
         let aligned_now = 1_779_355_500_u32; // 2026-05-21 09:25:00 IST (M1-aligned)
-        cell.consume_tick(TfIndex::M1, &mk_tick(aligned_now + 30, 100.0, 50, 0), 0);
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(aligned_now + 30, 100.0, 50, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+        );
         // Late tick belongs to the PREVIOUS bucket. NO bucket has been sealed
         // yet (only one bucket was ever opened), so there is no amendable
         // last-sealed bucket → DiscardLate (Option B falls through to discard).
         let late = mk_tick(aligned_now - 5, 99.0, 40, 0);
-        let outcome = cell.consume_tick(TfIndex::M1, &late, 0);
+        let outcome = cell.consume_tick(TfIndex::M1, &late, 0, FeedStrategy::DHAN, None);
         assert_eq!(outcome, ConsumeOutcome::DiscardLate);
         // Slot state unchanged after the discard.
         let s = cell.snapshot(TfIndex::M1);
@@ -814,14 +966,26 @@ mod tests {
         let cell = AggregatorCell::empty();
         let b1 = 1_779_355_500_u32; // 09:25:00 IST, M1-aligned
         // Open bucket1: open=high=low=close=100 @ 09:25:30, volume 50.
-        cell.consume_tick(TfIndex::M1, &mk_tick(b1 + 30, 100.0, 50, 0), 0);
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(b1 + 30, 100.0, 50, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+        );
         // Cross the boundary @ 09:26:10 → seal bucket1, open bucket2.
-        let sealed = cell.consume_tick(TfIndex::M1, &mk_tick(b1 + 70, 105.0, 60, 0), 50);
+        let sealed = cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(b1 + 70, 105.0, 60, 0),
+            50,
+            FeedStrategy::DHAN,
+            None,
+        );
         assert!(matches!(sealed, ConsumeOutcome::Sealed { .. }));
         // Late tick: LTT 09:25:50 belongs to the JUST-SEALED bucket1, price 110
         // (a new high), arriving out of order. The operator's exact case.
         let late = mk_tick(b1 + 50, 110.0, 55, 0);
-        match cell.consume_tick(TfIndex::M1, &late, 50) {
+        match cell.consume_tick(TfIndex::M1, &late, 50, FeedStrategy::DHAN, None) {
             ConsumeOutcome::AmendedLate { amended_state } => {
                 assert_eq!(amended_state.bucket_start_ist_secs, b1);
                 assert_eq!(amended_state.high, 110.0); // raised
@@ -838,12 +1002,24 @@ mod tests {
     fn test_late_amend_keeps_close_when_late_tick_is_earlier_in_minute() {
         let cell = AggregatorCell::empty();
         let b1 = 1_779_355_500_u32;
-        cell.consume_tick(TfIndex::M1, &mk_tick(b1 + 40, 100.0, 50, 0), 0); // close_ts=b1+40
-        cell.consume_tick(TfIndex::M1, &mk_tick(b1 + 70, 105.0, 60, 0), 50); // seal bucket1
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(b1 + 40, 100.0, 50, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+        ); // close_ts=b1+40
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(b1 + 70, 105.0, 60, 0),
+            50,
+            FeedStrategy::DHAN,
+            None,
+        ); // seal bucket1
         // Late tick from EARLIER in bucket1 (LTT b1+10 < close_ts b1+40),
         // price 90 (a new low). low updates; close must NOT regress.
         let late = mk_tick(b1 + 10, 90.0, 55, 0);
-        match cell.consume_tick(TfIndex::M1, &late, 50) {
+        match cell.consume_tick(TfIndex::M1, &late, 50, FeedStrategy::DHAN, None) {
             ConsumeOutcome::AmendedLate { amended_state } => {
                 assert_eq!(amended_state.low, 90.0); // order-independent → updated
                 assert_eq!(amended_state.close, 100.0); // EARLIER tick → close unchanged
@@ -857,18 +1033,36 @@ mod tests {
         let cell = AggregatorCell::empty();
         let b1 = 1_779_355_500_u32; // 09:25:00
         let b2 = b1 + 120; // 09:27:00
-        cell.consume_tick(TfIndex::M1, &mk_tick(b1 + 30, 100.0, 50, 0), 0);
-        cell.consume_tick(TfIndex::M1, &mk_tick(b1 + 70, 105.0, 60, 0), 50); // seal bucket1
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(b1 + 30, 100.0, 50, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+        );
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(b1 + 70, 105.0, 60, 0),
+            50,
+            FeedStrategy::DHAN,
+            None,
+        ); // seal bucket1
         // §4b: a force-seal (IST-midnight / post-15:30) clears the amendable
         // bucket + empties the slot, so a previous-day bar can never be amended.
         let _ = cell.force_seal(TfIndex::M1);
         // A new bucket opens (next session).
-        cell.consume_tick(TfIndex::M1, &mk_tick(b2 + 10, 200.0, 70, 60), 60);
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(b2 + 10, 200.0, 70, 60),
+            60,
+            FeedStrategy::DHAN,
+            None,
+        );
         // A stray late tick whose LTT floors to the OLD (force-sealed) bucket1
         // must NOT amend a cross-day candle — it is dropped.
         let late = mk_tick(b1 + 50, 999.0, 55, 0);
         assert_eq!(
-            cell.consume_tick(TfIndex::M1, &late, 60),
+            cell.consume_tick(TfIndex::M1, &late, 60, FeedStrategy::DHAN, None),
             ConsumeOutcome::DiscardLate
         );
     }
@@ -881,11 +1075,35 @@ mod tests {
         let cell = AggregatorCell::empty();
         let aligned = 1_779_358_500_u32; // 2026-05-21 10:15:00 IST (H1-aligned)
         // Open M1 + H1 at t=aligned+30:
-        cell.consume_tick(TfIndex::M1, &mk_tick(aligned + 30, 100.0, 50, 0), 0);
-        cell.consume_tick(TfIndex::H1, &mk_tick(aligned + 30, 100.0, 50, 0), 0);
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(aligned + 30, 100.0, 50, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+        );
+        cell.consume_tick(
+            TfIndex::H1,
+            &mk_tick(aligned + 30, 100.0, 50, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+        );
         // Cross M1 boundary at t=aligned+90 (still inside the same H1):
-        let outcome_m1 = cell.consume_tick(TfIndex::M1, &mk_tick(aligned + 90, 102.0, 60, 0), 50);
-        let outcome_h1 = cell.consume_tick(TfIndex::H1, &mk_tick(aligned + 90, 102.0, 60, 0), 0);
+        let outcome_m1 = cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(aligned + 90, 102.0, 60, 0),
+            50,
+            FeedStrategy::DHAN,
+            None,
+        );
+        let outcome_h1 = cell.consume_tick(
+            TfIndex::H1,
+            &mk_tick(aligned + 90, 102.0, 60, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+        );
         assert!(matches!(outcome_m1, ConsumeOutcome::Sealed { .. }));
         assert_eq!(outcome_h1, ConsumeOutcome::Updated);
     }
@@ -893,7 +1111,13 @@ mod tests {
     #[test]
     fn test_force_seal_returns_some_when_initialised() {
         let cell = AggregatorCell::empty();
-        cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_960, 100.0, 50, 0), 0);
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(1_779_354_960, 100.0, 50, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+        );
         let sealed = cell.force_seal(TfIndex::M1);
         assert!(sealed.is_some());
         let s = sealed.expect("just asserted some");
@@ -914,8 +1138,20 @@ mod tests {
     #[test]
     fn test_force_seal_only_affects_one_slot() {
         let cell = AggregatorCell::empty();
-        cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_960, 100.0, 50, 0), 0);
-        cell.consume_tick(TfIndex::M5, &mk_tick(1_779_354_960, 100.0, 50, 0), 0);
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(1_779_354_960, 100.0, 50, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+        );
+        cell.consume_tick(
+            TfIndex::M5,
+            &mk_tick(1_779_354_960, 100.0, 50, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+        );
         // Seal M1 only.
         cell.force_seal(TfIndex::M1);
         assert!(cell.snapshot(TfIndex::M1).is_uninitialised());
@@ -928,7 +1164,13 @@ mod tests {
         // volume across bucket boundaries (Item 28 carry-over).
         let cell = AggregatorCell::empty();
         // Open bucket A with cumulative volume = 1000.
-        cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_960, 100.0, 1_050, 0), 1_000);
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(1_779_354_960, 100.0, 1_050, 0),
+            1_000,
+            FeedStrategy::DHAN,
+            None,
+        );
         let s = cell.snapshot(TfIndex::M1);
         assert_eq!(s.volume, 50, "incremental from 1000 baseline = 1050 - 1000");
         assert_eq!(s.bucket_start_cumulative, 1_000);
@@ -939,7 +1181,13 @@ mod tests {
         // The 3 Wave-5 pct fields stay 0.0 until the seal-time writer
         // stamps them from the prev_day cache (locked decision L-H6).
         let cell = AggregatorCell::empty();
-        cell.consume_tick(TfIndex::M1, &mk_tick(1_779_354_960, 100.0, 50, 1_000), 0);
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(1_779_354_960, 100.0, 50, 1_000),
+            0,
+            FeedStrategy::DHAN,
+            None,
+        );
         let s = cell.snapshot(TfIndex::M1);
         assert_eq!(s.close_pct_from_prev_day, 0.0);
         assert_eq!(s.oi_pct_from_prev_day, 0.0);
@@ -987,7 +1235,7 @@ mod tests {
         // must take `open` from `tick.day_open`, NOT the first tick LTP.
         let cell = AggregatorCell::empty();
         let tick = mk_tick_with_day_open(1_779_354_960, 105.0, 100.0);
-        cell.consume_tick(TfIndex::M1, &tick, 0);
+        cell.consume_tick(TfIndex::M1, &tick, 0, FeedStrategy::DHAN, None);
         let s = cell.snapshot(TfIndex::M1);
         assert_eq!(s.open, 100.0, "day's first bar opens at tick.day_open");
         // high/low/close track the LTP, never day_open.
@@ -1006,6 +1254,8 @@ mod tests {
             TfIndex::M1,
             &mk_tick_with_day_open(1_779_354_960, 105.0, 100.0),
             0,
+            FeedStrategy::DHAN,
+            None,
         );
         // Next M1 bucket — boundary crossing. day_open=100 still on the
         // tick, but the slot is disarmed → open must be the LTP 107.0.
@@ -1013,6 +1263,8 @@ mod tests {
             TfIndex::M1,
             &mk_tick_with_day_open(1_779_355_021, 107.0, 100.0),
             0,
+            FeedStrategy::DHAN,
+            None,
         );
         assert!(matches!(outcome, ConsumeOutcome::Sealed { .. }));
         let s = cell.snapshot(TfIndex::M1);
@@ -1029,6 +1281,8 @@ mod tests {
             TfIndex::M1,
             &mk_tick_with_day_open(1_779_354_960, 105.0, 100.0),
             0,
+            FeedStrategy::DHAN,
+            None,
         );
         // IST-midnight force-seal empties + re-arms the slot.
         cell.force_seal(TfIndex::M1);
@@ -1038,6 +1292,8 @@ mod tests {
             TfIndex::M1,
             &mk_tick_with_day_open(1_779_441_360, 210.0, 200.0),
             0,
+            FeedStrategy::DHAN,
+            None,
         );
         let s = cell.snapshot(TfIndex::M1);
         assert_eq!(s.open, 200.0, "day 2's first bar opens at new day_open");
@@ -1052,6 +1308,8 @@ mod tests {
             TfIndex::M1,
             &mk_tick_with_day_open(1_779_354_960, 105.0, 0.0),
             0,
+            FeedStrategy::DHAN,
+            None,
         );
         let s = cell.snapshot(TfIndex::M1);
         assert_eq!(s.open, 105.0, "zero day_open falls back to LTP");
@@ -1066,12 +1324,16 @@ mod tests {
             TfIndex::M1,
             &mk_tick_with_day_open(1_779_354_960, 105.0, 100.0),
             0,
+            FeedStrategy::DHAN,
+            None,
         );
         // M5's first bar must still use day_open.
         cell.consume_tick(
             TfIndex::M5,
             &mk_tick_with_day_open(1_779_354_960, 105.0, 100.0),
             0,
+            FeedStrategy::DHAN,
+            None,
         );
         assert_eq!(cell.snapshot(TfIndex::M1).open, 100.0);
         assert_eq!(cell.snapshot(TfIndex::M5).open, 100.0);

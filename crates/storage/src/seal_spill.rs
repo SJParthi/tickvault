@@ -41,7 +41,8 @@
 //! | 0    | 4 | `security_id: u32`              |
 //! | 4    | 1 | `exchange_segment_code: u8`     |
 //! | 5    | 1 | `tf_ordinal: u8` (0..=20 per `TfIndex`) |
-//! | 6    | 2 | padding                         |
+//! | 6    | 1 | `feed_index: u8` (`Feed::index()` — 0=Dhan, 1=Groww; pre-feed records read 0=Dhan) |
+//! | 7    | 1 | padding                         |
 //! | 8    | 4 | `bucket_start_ist_secs: u32`    |
 //! | 12   | 4 | `tick_count: u32`               |
 //! | 16   | 8 | `volume: u64`                   |
@@ -75,6 +76,7 @@ use chrono::{TimeZone, Utc};
 use tracing::{info, warn};
 
 use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+use tickvault_common::feed::Feed;
 use tickvault_trading::candles::{BufferedSeal, TfIndex};
 
 /// Production spill directory — same parent as `tick_persistence.rs`'s
@@ -98,6 +100,12 @@ pub struct SerializedSeal {
     pub security_id: u32,
     pub exchange_segment_code: u8,
     pub tf_ordinal: u8,
+    /// Broker-source feed (`Feed::index()`: 0=Dhan, 1=Groww). Serialised into
+    /// byte 6 (a previously-zero padding byte) so pre-feed spill records decode
+    /// `feed = Feed::Dhan` (index 0) — backward-compatible. Round-trips the seal's
+    /// `feed` through disk-spill replay so a Groww seal recovered from spill still
+    /// writes `feed='groww'` (never silently re-stamped as Dhan).
+    pub feed: Feed,
     pub bucket_start_ist_secs: u32,
     pub tick_count: u32,
     pub volume: u64,
@@ -133,7 +141,10 @@ impl SerializedSeal {
         buf[0..4].copy_from_slice(&self.security_id.to_le_bytes());
         buf[4] = self.exchange_segment_code;
         buf[5] = self.tf_ordinal;
-        // buf[6..8] = padding (zero)
+        // Feed provenance round-trips through disk spill (byte 6; pre-feed
+        // records have 0 here → Feed::Dhan on read).
+        buf[6] = self.feed.index() as u8;
+        // buf[7] = padding (zero)
         buf[8..12].copy_from_slice(&self.bucket_start_ist_secs.to_le_bytes());
         buf[12..16].copy_from_slice(&self.tick_count.to_le_bytes());
         buf[16..24].copy_from_slice(&self.volume.to_le_bytes());
@@ -163,10 +174,19 @@ impl SerializedSeal {
         if buf.len() < SEAL_SPILL_RECORD_SIZE {
             return None;
         }
+        // Byte 6 = Feed::index(); fall back to Dhan for an out-of-range index
+        // (pre-feed records have 0 here → Dhan; an unknown future index is
+        // never silently mis-attributed to the WRONG known feed — it degrades
+        // to Dhan, the primary feed, and the recovery continues, never panics).
+        let feed = Feed::ALL
+            .get(buf[6] as usize)
+            .copied()
+            .unwrap_or(Feed::Dhan);
         Some(Self {
             security_id: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
             exchange_segment_code: buf[4],
             tf_ordinal: buf[5],
+            feed,
             bucket_start_ist_secs: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
             tick_count: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
             volume: u64::from_le_bytes([
@@ -250,6 +270,7 @@ impl From<&BufferedSeal> for SerializedSeal {
             security_id: b.security_id,
             exchange_segment_code: b.exchange_segment_code,
             tf_ordinal: b.tf.as_ordinal() as u8,
+            feed: b.feed,
             bucket_start_ist_secs: b.state.bucket_start_ist_secs,
             tick_count: b.state.tick_count,
             volume: b.state.volume,
@@ -308,6 +329,7 @@ impl SerializedSeal {
             self.exchange_segment_code,
             tf,
             state,
+            self.feed,
         ))
     }
 }
@@ -519,6 +541,7 @@ mod tests {
             security_id: sid,
             exchange_segment_code: seg,
             tf_ordinal: tf,
+            feed: Feed::Dhan,
             bucket_start_ist_secs: bucket,
             tick_count: 5,
             volume: 1234,
@@ -578,6 +601,7 @@ mod tests {
             security_id: 25,
             exchange_segment_code: 1,
             tf_ordinal: 4,
+            feed: Feed::Dhan,
             bucket_start_ist_secs: 1_716_001_500,
             tick_count: 0,
             volume: 0,
@@ -906,7 +930,7 @@ mod tests {
         state.close_pct_from_prev_day = 1.5;
         state.oi_pct_from_prev_day = -0.2;
         state.volume_pct_from_prev_day = 12.3;
-        BufferedSeal::new(sid, seg, tf, state)
+        BufferedSeal::new(sid, seg, tf, state, Feed::Dhan)
     }
 
     #[test]

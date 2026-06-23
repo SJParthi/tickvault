@@ -3,17 +3,30 @@
 //! The Rust consumer side of the Groww feed: reads the **capture-at-receipt
 //! durable file** the Python `growwapi` sidecar appends (one NDJSON tick per
 //! line), persists each raw tick to the SHARED `ticks` table (tagged
-//! `feed='groww'`), folds ticks through the [`Groww1mAggregator`], and persists
-//! sealed 1-minute candles to the SHARED `candles_1m` table (tagged
-//! `feed='groww'`) — the "same tables + feed column" model (operator 2026-06-19).
+//! `feed='groww'`), and folds ticks through the SAME 21-timeframe
+//! [`MultiTfAggregator`] the Dhan feed uses — ONE common candle engine,
+//! parameterized by the per-feed [`FeedStrategy::GROWW`] (Discard late-policy)
+//! + an `i64`-widened cumulative-volume override. Every sealed bar across ALL
+//! 21 timeframes is routed through the SHARED seal-writer chain
+//! ([`global_seal_sender`]) tagged `feed='groww'` (the `BufferedSeal::feed`
+//! field), landing in the SHARED `candles_<tf>` tables — the "same tables + feed
+//! column" model (operator 2026-06-19).
+//!
+//! Groww therefore now generates ALL 21 timeframes (it previously produced only
+//! 1-minute). The 1-minute slice is the one cross-verified vs the Groww backtest;
+//! GENERATION is full-21-TF, identical to Dhan, through the SAME engine code.
 //!
 //! **Default OFF + isolated:** only runs when `feeds.groww_enabled`. It writes
 //! ONLY Groww-tagged (`feed='groww'`) rows into the shared tables, distinguished
 //! from Dhan rows (`feed='dhan'`) by the feed-extended DEDUP keys, and never
-//! touches the Dhan write path. **Dormant until the sidecar exists:** the loop is
-//! a TEST-EXEMPT I/O driver; the pure, fully-unit-tested primitives are the line
-//! parser, the segment map, and the candle→row mapper. The NDJSON schema below is
-//! the Python↔Rust contract (defined consumer-side; the sidecar conforms).
+//! touches the Dhan write path. The Groww aggregator is a SEPARATE
+//! `MultiTfAggregator` INSTANCE (engine CODE shared, instance per-feed) so the two
+//! feeds never cross-key; the shared writer routes each seal by its `feed`.
+//! **Dormant until the sidecar exists:** the loop is a TEST-EXEMPT I/O driver; the
+//! pure, fully-unit-tested primitives are the line parser, the segment map, the
+//! validation gate, and the `ParsedTick` builder (incl. the u32 token-width +
+//! u32 timestamp-width guards). The NDJSON schema below is the Python↔Rust
+//! contract (defined consumer-side; the sidecar conforms).
 //!
 //! ```jsonc
 //! {"security_id":1333,"segment":"NSE_EQ","ts_ist_nanos":1780000020123000000,
@@ -34,10 +47,16 @@ use tracing::{error, info, warn};
 
 use tickvault_api::feed_state::{Feed, FeedRuntimeState};
 use tickvault_common::config::QuestDbConfig;
+use tickvault_common::tick_types::ParsedTick;
 use tickvault_common::types::ExchangeSegment;
-use tickvault_core::feed::groww::aggregator_1m::{Groww1mAggregator, Groww1mCandle, Groww1mTick};
-use tickvault_storage::groww_candle_persistence::{GrowwCandle1mRow, GrowwCandle1mWriter};
 use tickvault_storage::groww_persistence::{GrowwLiveTickRow, GrowwLiveTickWriter};
+use tickvault_storage::seal_writer_runner::global_seal_sender;
+use tickvault_trading::candles::{BufferedSeal, FeedStrategy, MultiTfAggregator, TfIndex};
+
+/// Capacity hint for the Groww feed's own [`MultiTfAggregator`] instance —
+/// matches the NTM-union universe headroom (operator §31). The container grows
+/// lazily; this only sizes the initial papaya table.
+const GROWW_AGGREGATOR_CAPACITY: usize = 1_200;
 
 /// Poll interval (milliseconds) for tailing the sidecar's append-only tick file.
 const GROWW_BRIDGE_POLL_MS: u64 = 500;
@@ -50,9 +69,6 @@ const GROWW_BRIDGE_POLL: Duration = Duration::from_millis(GROWW_BRIDGE_POLL_MS);
 /// across polls instead of one multi-GB `read_to_string` that would OOM the
 /// 8 GiB host. At 500 ms/poll this drains ~8 MiB/s — far above the live rate.
 const GROWW_BRIDGE_MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
-
-/// Broker-source provenance label written into the `feed` column.
-pub const GROWW_FEED_NAME: &str = "groww";
 
 /// Default path of the Python sidecar's capture-at-receipt append-only tick file.
 pub const GROWW_TICK_FILE_DEFAULT: &str = "data/groww/live-ticks.ndjson";
@@ -70,11 +86,24 @@ struct GrowwTickLine {
     cum_volume: i64,
 }
 
+/// A normalised Groww live tick — the aggregator input. Self-contained (no
+/// dependency on the deleted `Groww1mTick`); `cum_volume` is Groww's cumulative
+/// day volume (`i64`, exceeds `u32` intraday); `ts_ist_nanos` is already IST.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GrowwTick {
+    security_id: i64,
+    segment: ExchangeSegment,
+    /// IST epoch nanoseconds (already IST — NO offset applied here).
+    ts_ist_nanos: i64,
+    ltp: f64,
+    cum_volume: i64,
+}
+
 /// A parsed Groww tick — the aggregator input plus the raw fields needed for the
 /// shared `ticks` (feed='groww') row.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ParsedGrowwTick {
-    tick: Groww1mTick,
+    tick: GrowwTick,
     exchange_ts_millis: i64,
 }
 
@@ -99,7 +128,7 @@ fn parse_groww_tick_line(line: &str) -> Result<ParsedGrowwTick> {
         serde_json::from_str(line).context("groww bridge: tick line is not valid JSON")?;
     let segment = segment_from_str(&l.segment)?;
     Ok(ParsedGrowwTick {
-        tick: Groww1mTick {
+        tick: GrowwTick {
             security_id: l.security_id,
             segment,
             ts_ist_nanos: l.ts_ist_nanos,
@@ -108,6 +137,58 @@ fn parse_groww_tick_line(line: &str) -> Result<ParsedGrowwTick> {
         },
         exchange_ts_millis: l.exchange_ts_millis,
     })
+}
+
+/// Nanoseconds per second — used to derive the cell's IST-second timestamp from
+/// Groww's IST-nanos. The 21-TF candle grid buckets on seconds (minute boundary
+/// is identical), so the millisecond precision is preserved only in the raw
+/// `ticks` row (which keeps `ts_ist_nanos`); the candle bucket is second-granular.
+const NANOS_PER_SECOND: i64 = 1_000_000_000;
+
+/// Why a Groww tick cannot be folded through the shared 21-TF engine (the
+/// engine keys on `(u32 security_id, u8 segment_code)` and buckets on a `u32`
+/// IST-second timestamp). REJECT LOUDLY rather than a silent `as u32` alias.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GrowwAggregateReject {
+    /// `security_id` (Groww `exchange_token`) does not fit `u32` (max observed
+    /// 1,175,236 ≪ u32::MAX, so this is a defense-in-depth guard against a future
+    /// Groww schema change — NEVER a silent truncation per the adversarial review).
+    TokenExceedsU32,
+    /// The IST-second timestamp (`ts_ist_nanos / 1e9`) does not fit `u32`
+    /// (epoch-seconds overflow u32 only ~2106 — an honest documented bound).
+    TimestampExceedsU32,
+}
+
+/// Builds the shared-engine [`ParsedTick`] from a validated Groww tick.
+///
+/// Pure + testable. Performs the two WIDTH guards the adversarial review flagged:
+/// - `security_id: i64 → u32` via `u32::try_from` — REJECT on overflow, never `as u32`.
+/// - `ts_ist_nanos → IST seconds → u32` — REJECT on overflow.
+///
+/// Groww has NO `day_open` / `day_close` / `oi`, so those `ParsedTick` fields are
+/// left 0: the cell opens the day's first bar at the first-tick LTP (day_open=0
+/// fallback), and the pct/oi columns stay 0 (missing data, NOT forked logic).
+/// The `i64` `cum_volume` is NOT placed in `ParsedTick.volume` (a `u32` that would
+/// truncate) — it is carried separately as the consume_tick override.
+fn build_parsed_tick(parsed: &ParsedGrowwTick) -> Result<ParsedTick, GrowwAggregateReject> {
+    let security_id = u32::try_from(parsed.tick.security_id)
+        .map_err(|_| GrowwAggregateReject::TokenExceedsU32)?;
+    let exchange_timestamp = u32::try_from(parsed.tick.ts_ist_nanos / NANOS_PER_SECOND)
+        .map_err(|_| GrowwAggregateReject::TimestampExceedsU32)?;
+    let t = ParsedTick {
+        security_id,
+        exchange_segment_code: parsed.tick.segment.binary_code(),
+        exchange_timestamp,
+        // f64 → f32 for the shared ParsedTick LTP field; the candle cell widens it
+        // back via f32_to_f64_clean. (The raw `ticks` row keeps the full-precision
+        // f64 ltp via live_tick_row, so no precision is lost in the system of record.)
+        last_traded_price: parsed.tick.ltp as f32,
+        // Groww cum_volume is i64 and exceeds u32 intraday — it MUST NOT be funnelled
+        // through this u32 field. It flows via the consume_tick override instead.
+        volume: 0,
+        ..Default::default()
+    };
+    Ok(t)
 }
 
 /// Lower bound for a plausible IST epoch-nanos tick timestamp (~2020-01-01).
@@ -204,31 +285,15 @@ fn live_tick_row(parsed: &ParsedGrowwTick, capture_seq: i64) -> GrowwLiveTickRow
     }
 }
 
-/// Maps an aggregated [`Groww1mCandle`] to a persistable row for the SHARED
-/// `candles_1m` table, stamping the `groww` feed-provenance label (part of the
-/// shared candle DEDUP key). Pure + testable.
-fn candle_row_from_aggregated(candle: &Groww1mCandle) -> GrowwCandle1mRow {
-    GrowwCandle1mRow {
-        ts_ist_nanos: candle.minute_start_ist_nanos,
-        security_id: candle.security_id,
-        segment: candle.segment.as_str(),
-        feed: GROWW_FEED_NAME,
-        open: candle.open,
-        high: candle.high,
-        low: candle.low,
-        close: candle.close,
-        volume: candle.volume,
-        tick_count: candle.tick_count,
-    }
-}
-
 /// Monotonic, replay-stable `capture_seq` source (TICK-SEQ-01): `max(prev+1,
-/// wall_nanos)`. Seeded from wall-clock so it never resets below a prior value
-/// across restarts within a session.
-fn next_capture_seq(counter: &AtomicI64, wall_nanos: i64) -> i64 {
+/// seed_nanos)`. The call site seeds it from the tick's IST epoch-nanos
+/// (`ts_ist_nanos`) — a replay-STABLE value (NOT wall-clock), so `capture_seq`
+/// stays strictly monotonic AND identical on replay of the same tick stream
+/// (a wall-clock seed would differ on replay and create duplicate rows).
+fn next_capture_seq(counter: &AtomicI64, seed_nanos: i64) -> i64 {
     let mut prev = counter.load(Ordering::Relaxed);
     loop {
-        let next = (prev + 1).max(wall_nanos);
+        let next = (prev + 1).max(seed_nanos);
         match counter.compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return next,
             Err(observed) => prev = observed,
@@ -259,7 +324,7 @@ fn drain_complete_prefix(residual: &mut Vec<u8>) -> Vec<u8> {
 /// propagated (a bad line or a transient QuestDB blip must not kill the feed).
 // TEST-EXEMPT: file-tail + live-QuestDB ILP I/O driver; the pure primitives it
 // uses (parse_groww_tick_line, segment_from_str, live_tick_row,
-// candle_row_from_aggregated, next_capture_seq) are unit-tested below.
+// build_parsed_tick, next_capture_seq) are unit-tested below.
 pub async fn run_groww_bridge(
     qdb: QuestDbConfig,
     tick_file_path: PathBuf,
@@ -273,8 +338,16 @@ pub async fn run_groww_bridge(
         "Groww bridge started — tailing the sidecar tick file (idles until the sidecar appends)"
     );
     let mut live_writer = GrowwLiveTickWriter::new(&qdb);
-    let mut candle_writer = GrowwCandle1mWriter::new(&qdb);
-    let mut aggregator = Groww1mAggregator::new();
+    // The Groww feed's OWN 21-TF aggregator INSTANCE — the SAME engine code as
+    // Dhan (`MultiTfAggregator`), parameterized per-feed by FeedStrategy::GROWW.
+    // A separate instance keeps Dhan/Groww from cross-keying; the SHARED
+    // seal-writer (`global_seal_sender`) routes each seal by its `feed`.
+    let aggregator = MultiTfAggregator::with_capacity(GROWW_AGGREGATOR_CAPACITY);
+    // Per-instrument first-seen set: on first sight we pre_populate + seed the
+    // cumulative baseline (Groww's running day-volume) so the first 1m bucket's
+    // volume matches the legacy Groww 1m aggregator behaviour (golden-tested). O(1) lookups.
+    let mut seeded: std::collections::HashSet<(u32, u8)> = std::collections::HashSet::new();
+    let _ = &qdb; // candle persistence is now the shared seal-writer chain, not a Groww writer.
     let capture_seq = AtomicI64::new(0);
     let mut offset: u64 = 0;
     // Byte residual (not String): a bounded chunked read can split a multi-byte
@@ -342,7 +415,6 @@ pub async fn run_groww_bridge(
 
         residual.extend_from_slice(&chunk);
         let mut wrote_live = false;
-        let mut wrote_candle = false;
         // Drain only COMPLETE newline-terminated lines; a trailing partial line
         // (incl. a partial UTF-8 char from the chunk boundary) stays buffered.
         let prefix = drain_complete_prefix(&mut residual);
@@ -397,29 +469,83 @@ pub async fn run_groww_bridge(
                 // read as "feed silent". Receipt time = when WE saw the tick.
                 feed_health.record_tick(Feed::Groww, receipt_ist_nanos());
             }
-            if let Some(candle) = aggregator.on_tick(&parsed.tick) {
-                if let Err(err) = candle_writer.append_row(&candle_row_from_aggregated(&candle)) {
+            // Fold through the SHARED 21-TF engine (ONE common candle engine).
+            // Build the ParsedTick with the u32 token + u32 timestamp WIDTH
+            // guards; reject loudly on overflow (never a silent `as u32` alias).
+            let pt = match build_parsed_tick(&parsed) {
+                Ok(pt) => pt,
+                Err(reason) => {
                     error!(
-                        ?err,
-                        "groww bridge: shared candles_1m (feed=groww) append failed"
+                        ?reason,
+                        security_id = parsed.tick.security_id,
+                        "groww bridge: tick cannot fold through the shared 21-TF engine (width guard)"
                     );
-                } else {
-                    wrote_candle = true;
-                    feed_health.record_candle(Feed::Groww);
+                    continue;
                 }
+            };
+            let seg_code = pt.exchange_segment_code;
+            let key = (pt.security_id, seg_code);
+            // Groww cum_volume is i64; `validate_groww_tick` already guarantees
+            // it is >= 0. Convert with `try_from` + reject loudly (security-review
+            // LOW 2026-06-23) — consistent with the token/timestamp width guards,
+            // never a silent `as u64`.
+            let cum_volume_u64 = match u64::try_from(parsed.tick.cum_volume) {
+                Ok(v) => v,
+                Err(_) => {
+                    error!(
+                        security_id = parsed.tick.security_id,
+                        cum_volume = parsed.tick.cum_volume,
+                        "groww bridge: negative cum_volume past validation — dropping tick"
+                    );
+                    continue;
+                }
+            };
+            // First sight of this instrument: register it + seed the cumulative
+            // baseline so the first 1m bucket's volume matches the legacy Groww
+            // (golden-tested). Idempotent — only on the very first tick per key.
+            if seeded.insert(key) {
+                aggregator.pre_populate(std::iter::once(key));
+                aggregator.seed_cumulative(pt.security_id, seg_code, cum_volume_u64);
+            }
+            // Route every sealed bar across ALL 21 TFs through the SHARED
+            // seal-writer chain, tagged feed=Groww. `Some(cum as u64)` carries
+            // Groww's i64 cumulative without u32 truncation.
+            let stats = aggregator.consume_tick(
+                &pt,
+                seg_code,
+                FeedStrategy::GROWW,
+                Some(cum_volume_u64),
+                |tf, state| {
+                    let Some(sender) = global_seal_sender() else {
+                        return;
+                    };
+                    let seal = BufferedSeal::new(pt.security_id, seg_code, tf, state, Feed::Groww);
+                    if sender.try_send(seal).is_err() {
+                        // Mirror the Dhan path: the seal mpsc is full (writer
+                        // behind). Counter only — the ring→spill→DLQ chain
+                        // downstream is the durable absorber; never panic.
+                        metrics::counter!("tv_seal_mpsc_dropped_total", "feed" => "groww")
+                            .increment(1);
+                    } else if tf == TfIndex::M1 {
+                        // Live-feed health: count one Groww candle per sealed
+                        // 1-minute bar (the cross-verified slice).
+                        feed_health.record_candle(Feed::Groww);
+                    }
+                },
+            );
+            // A lazily-missing instrument cannot happen here (we pre_populate on
+            // first sight), but mirror the Dhan diagnostic defensively.
+            if !stats.instrument_found {
+                aggregator.pre_populate(std::iter::once(key));
             }
         }
         // Flush failures are data-at-risk (ILP-buffered Groww rows may not have
         // reached QuestDB) — `error!` per audit Rule 5 / charter Rule 6 so they
         // route to Telegram via ERROR-level Loki routing, never silent `warn!`.
+        // Candle persistence is now the SHARED seal-writer chain (its own task
+        // owns the flush + ring→spill→DLQ), so only the raw-tick writer flushes here.
         if wrote_live && let Err(err) = live_writer.flush() {
             error!(?err, "groww bridge: shared ticks (feed=groww) flush failed");
-        }
-        if wrote_candle && let Err(err) = candle_writer.flush() {
-            error!(
-                ?err,
-                "groww bridge: shared candles_1m (feed=groww) flush failed"
-            );
         }
     }
 }
@@ -631,27 +757,81 @@ mod tests {
     }
 
     #[test]
-    fn test_candle_row_from_aggregated_stamps_groww_feed() {
-        let candle = Groww1mCandle {
-            security_id: 1333,
-            segment: ExchangeSegment::NseEquity,
-            minute_start_ist_nanos: 1_780_000_020_000_000_000,
-            open: 100.0,
-            high: 110.0,
-            low: 99.0,
-            close: 105.0,
-            volume: 50,
-            tick_count: 7,
-        };
-        let row = candle_row_from_aggregated(&candle);
-        assert_eq!(row.feed, "groww");
-        assert_eq!(row.segment, "NSE_EQ");
-        assert_eq!(row.security_id, 1333);
-        assert_eq!(row.ts_ist_nanos, 1_780_000_020_000_000_000);
-        assert_eq!(row.open, 100.0);
-        assert_eq!(row.close, 105.0);
-        assert_eq!(row.volume, 50);
-        assert_eq!(row.tick_count, 7);
+    fn test_build_parsed_tick_maps_fields_and_segment_code() {
+        // Groww → shared-engine ParsedTick: segment code, IST-second timestamp,
+        // f64→f32 ltp; volume left 0 (the i64 cumulative flows via the override,
+        // NOT this u32 field — no truncation path).
+        let p = valid_parsed();
+        let pt = build_parsed_tick(&p).expect("valid tick builds");
+        assert_eq!(pt.security_id, 1333);
+        assert_eq!(
+            pt.exchange_segment_code,
+            ExchangeSegment::NseEquity.binary_code()
+        );
+        assert_eq!(pt.exchange_timestamp, 1_780_000_020); // ts_ist_nanos / 1e9
+        assert_eq!(pt.last_traded_price, 2847.55_f32);
+        assert_eq!(
+            pt.volume, 0,
+            "i64 cumulative MUST NOT be funnelled through u32 volume"
+        );
+    }
+
+    #[test]
+    fn test_build_parsed_tick_rejects_token_above_u32_max() {
+        // Defense-in-depth (adversarial review): a Groww exchange_token that does
+        // not fit u32 is rejected LOUDLY, never silently aliased via `as u32`.
+        let mut p = valid_parsed();
+        p.tick.security_id = i64::from(u32::MAX) + 1;
+        assert!(
+            matches!(
+                build_parsed_tick(&p),
+                Err(GrowwAggregateReject::TokenExceedsU32)
+            ),
+            "token above u32::MAX must reject loudly, never `as u32` alias"
+        );
+        // Boundary: exactly u32::MAX is accepted.
+        p.tick.security_id = i64::from(u32::MAX);
+        assert!(build_parsed_tick(&p).is_ok());
+    }
+
+    #[test]
+    fn test_build_parsed_tick_rejects_timestamp_seconds_above_u32_max() {
+        // An IST-nanos that floors to > u32::MAX seconds (post-~2106) is rejected
+        // rather than wrapping the candle bucket.
+        let mut p = valid_parsed();
+        p.tick.ts_ist_nanos = (i64::from(u32::MAX) + 1) * 1_000_000_000;
+        assert!(
+            matches!(
+                build_parsed_tick(&p),
+                Err(GrowwAggregateReject::TimestampExceedsU32)
+            ),
+            "timestamp-seconds above u32::MAX must reject, never wrap the bucket"
+        );
+    }
+
+    #[test]
+    fn test_run_groww_bridge_routes_seals_through_shared_writer() {
+        // ONE common candle engine: the bridge MUST fold through the shared 21-TF
+        // MultiTfAggregator + route seals to global_seal_sender (NOT a Groww-only
+        // 1m writer). Pin by source-scan — the I/O driver is TEST-EXEMPT, but a
+        // future refactor cannot silently revert to a separate Groww candle path.
+        let src = include_str!("groww_bridge.rs");
+        assert!(
+            src.contains("MultiTfAggregator")
+                && src.contains("global_seal_sender")
+                && src.contains("FeedStrategy::GROWW"),
+            "the Groww bridge must fold through the shared MultiTfAggregator + \
+             global_seal_sender with FeedStrategy::GROWW (the one common candle engine)"
+        );
+        // Tokens are concatenated at runtime so this assertion's OWN strings do
+        // not trip the `include_str!` self-scan (the literals never appear whole
+        // in the file source).
+        let legacy_agg = format!("Groww1m{}", "Aggregator");
+        let legacy_writer = format!("GrowwCandle1m{}", "Writer");
+        assert!(
+            !src.contains(&legacy_agg) && !src.contains(&legacy_writer),
+            "the Groww-1m-only path (the deleted aggregator + 1m-only writer) must be gone"
+        );
     }
 
     #[test]

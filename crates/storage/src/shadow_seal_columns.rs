@@ -68,6 +68,12 @@ pub struct ShadowSealRow {
     /// `segment_code_to_str` for the questdb-rs `symbol` call. Lands in
     /// the `segment` SYMBOL column.
     pub segment: &'static str,
+    /// Broker-source provenance (`"dhan"` / `"groww"`) from `seal.feed.as_str()`.
+    /// Lands in the `feed` SYMBOL column, which is part of the candle DEDUP key
+    /// `(ts, security_id, segment, feed)` — so a Dhan candle and a Groww candle
+    /// for the SAME minute/instrument are BOTH kept (operator lock 2026-06-19).
+    /// This is the ONE feed-parameterized seal row — no per-feed forked writer.
+    pub feed: &'static str,
     /// `LiveCandleState::open` — already `f64`.
     pub open: f64,
     /// `LiveCandleState::high` — already `f64`.
@@ -134,6 +140,9 @@ impl ShadowSealRow {
             timestamp_ist_nanos,
             security_id: i64::from(seal.security_id),
             segment: segment_code_to_str(seal.exchange_segment_code),
+            // Feed provenance from the seal — the ONE writer stamps whatever feed
+            // produced the seal (Dhan or Groww), never a hardcoded constant.
+            feed: seal.feed.as_str(),
             open: round_to_2dp(seal.state.open),
             high: round_to_2dp(seal.state.high),
             low: round_to_2dp(seal.state.low),
@@ -164,6 +173,7 @@ mod tests {
         EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_MCX_COMM, EXCHANGE_SEGMENT_NSE_CURRENCY,
         EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO,
     };
+    use tickvault_common::feed::Feed;
     use tickvault_trading::candles::{LiveCandleState, TfIndex};
 
     fn mk_seal(sid: u32, seg: u8, tf: TfIndex, bucket: u32, close: f64) -> BufferedSeal {
@@ -177,7 +187,7 @@ mod tests {
         state.bucket_start_cumulative = 1000;
         state.oi = 50_000;
         state.tick_count = 5;
-        BufferedSeal::new(sid, seg, tf, state)
+        BufferedSeal::new(sid, seg, tf, state, Feed::Dhan)
     }
 
     #[test]
@@ -190,7 +200,7 @@ mod tests {
         state.close = 105.0;
         state.prev_day_close = 100.0;
         state.close_pct_from_prev_day = 5.0;
-        let seal = BufferedSeal::new(13, EXCHANGE_SEGMENT_NSE_EQ, TfIndex::M1, state);
+        let seal = BufferedSeal::new(13, EXCHANGE_SEGMENT_NSE_EQ, TfIndex::M1, state, Feed::Dhan);
         let row = ShadowSealRow::from_buffered_seal(&seal);
         assert!((row.close_pct_from_prev_day - 5.0).abs() < f64::EPSILON);
     }
@@ -204,7 +214,7 @@ mod tests {
         state.close = 102.5;
         state.session_open = 100.0;
         state.open_pct = 2.5;
-        let seal = BufferedSeal::new(13, EXCHANGE_SEGMENT_NSE_EQ, TfIndex::M1, state);
+        let seal = BufferedSeal::new(13, EXCHANGE_SEGMENT_NSE_EQ, TfIndex::M1, state, Feed::Dhan);
         let row = ShadowSealRow::from_buffered_seal(&seal);
         assert!((row.open_pct - 2.5).abs() < f64::EPSILON);
     }
@@ -221,7 +231,7 @@ mod tests {
         // change_pct is derived from close_pct_from_prev_day at extraction.
         state.close_pct_from_prev_day = 5.0;
         state.open_gap_pct = 2.0;
-        let seal = BufferedSeal::new(13, EXCHANGE_SEGMENT_NSE_EQ, TfIndex::M1, state);
+        let seal = BufferedSeal::new(13, EXCHANGE_SEGMENT_NSE_EQ, TfIndex::M1, state, Feed::Dhan);
         let row = ShadowSealRow::from_buffered_seal(&seal);
         assert!((row.change_pct - 5.0).abs() < f64::EPSILON);
         assert!((row.open_gap_pct - 2.0).abs() < f64::EPSILON);
@@ -391,7 +401,7 @@ mod tests {
         let mut state = LiveCandleState::empty();
         state.bucket_start_ist_secs = 1_716_000_900;
         state.volume = 1_000_000_000_u64;
-        let seal = BufferedSeal::new(13, 0, TfIndex::M1, state);
+        let seal = BufferedSeal::new(13, 0, TfIndex::M1, state, Feed::Dhan);
         let row = ShadowSealRow::from_buffered_seal(&seal);
         assert_eq!(row.volume, 1_000_000_000_i64);
     }
@@ -401,7 +411,7 @@ mod tests {
         let mut state = LiveCandleState::empty();
         state.bucket_start_ist_secs = 1_716_000_900;
         state.volume = u64::MAX;
-        let seal = BufferedSeal::new(13, 0, TfIndex::M1, state);
+        let seal = BufferedSeal::new(13, 0, TfIndex::M1, state, Feed::Dhan);
         let row = ShadowSealRow::from_buffered_seal(&seal);
         assert_eq!(row.volume, i64::MAX);
         assert!(row.volume > 0, "saturated volume MUST stay positive");
@@ -412,7 +422,7 @@ mod tests {
         let mut state = LiveCandleState::empty();
         state.bucket_start_ist_secs = 1_716_000_900;
         state.oi = -42_000;
-        let seal = BufferedSeal::new(13, 0, TfIndex::M1, state);
+        let seal = BufferedSeal::new(13, 0, TfIndex::M1, state, Feed::Dhan);
         let row = ShadowSealRow::from_buffered_seal(&seal);
         assert_eq!(row.oi, -42_000);
     }
@@ -422,7 +432,7 @@ mod tests {
         let mut state = LiveCandleState::empty();
         state.bucket_start_ist_secs = 1_716_000_900;
         state.tick_count = u32::MAX;
-        let seal = BufferedSeal::new(13, 0, TfIndex::M1, state);
+        let seal = BufferedSeal::new(13, 0, TfIndex::M1, state, Feed::Dhan);
         let row = ShadowSealRow::from_buffered_seal(&seal);
         assert_eq!(row.tick_count, i64::from(u32::MAX));
     }
@@ -475,7 +485,7 @@ mod tests {
         state.bucket_start_cumulative = 999;
         state.oi = 7_777_777;
         state.tick_count = 42;
-        let seal = BufferedSeal::new(99, EXCHANGE_SEGMENT_NSE_FNO, TfIndex::H4, state);
+        let seal = BufferedSeal::new(99, EXCHANGE_SEGMENT_NSE_FNO, TfIndex::H4, state, Feed::Dhan);
         let row = ShadowSealRow::from_buffered_seal(&seal);
         assert_eq!(row.table_name, "candles_4h");
         assert_eq!(row.timestamp_ist_nanos, 1_716_001_500_i64 * 1_000_000_000);

@@ -11,7 +11,6 @@
 //! Default OFF — nothing here runs unless `feeds.groww_enabled` is set.
 //! Reference: `docs/groww-ref/`.
 
-pub mod aggregator_1m;
 pub mod auth;
 pub mod instruments;
 pub mod nats;

@@ -364,6 +364,7 @@ impl TelegramCoalescer {
 
     /// Test-only accessor — number of currently-open buckets.
     #[cfg(test)]
+    // TEST-EXEMPT: #[cfg(test)]-gated test-only accessor, exercised by this module's coalescer tests.
     pub(crate) fn bucket_count(&self) -> usize {
         self.buckets.lock().map(|g| g.len()).unwrap_or(0)
     }
