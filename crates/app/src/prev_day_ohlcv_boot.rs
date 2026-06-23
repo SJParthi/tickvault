@@ -19,6 +19,7 @@ use secrecy::ExposeSecret;
 use serde_json::json;
 use tracing::{error, info, warn};
 
+use governor::{Quota, RateLimiter};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_core::auth::token_manager::TokenHandle;
 use tickvault_core::instrument::daily_universe::{DailyUniverse, InstrumentRole};
@@ -26,10 +27,18 @@ use tickvault_storage::prev_day_ohlcv_persistence::{
     PrevDayOhlcvRow, PrevDayOhlcvWriter, ensure_prev_day_ohlcv_table,
     prev_day_ist_nanos_from_utc_secs,
 };
-use tickvault_trading::oms::rate_limiter::OrderRateLimiter;
 
-/// Dhan Data-API rate limit: 5 requests/second.
-const DATA_API_RPS: u32 = 5;
+/// Conservative prev-day share of the Dhan Data-API 5/sec budget. Held at 4/sec
+/// (NOT the full 5) to leave ~1/sec headroom for the concurrent boot REST
+/// callers (option-chain snapshot + profile canary) so the COMBINED load stays
+/// under Dhan's 5/sec limit and stops the HTTP-429 storm (Q2/Q3, 2026-06-23).
+const DATA_API_RPS: u32 = 4;
+/// HTTP-429 (DH-904) backoff: a rate-limited symbol waits + retries up to
+/// `HTTP_429_MAX_RETRIES` times (escalating waits) before being skipped, so
+/// prev-day coverage is not silently EMPTY when Dhan briefly throttles us.
+const HTTP_429_MAX_RETRIES: u32 = 3;
+/// Escalating backoff (ms) per 429 retry attempt.
+const HTTP_429_BACKOFF_MS: [u64; 3] = [250, 500, 1000];
 /// Per-request REST timeout.
 const REST_TIMEOUT_SECS: u64 = 15;
 /// Dhan daily-historical endpoint (base v2 URL from constants).
@@ -417,7 +426,15 @@ pub async fn run_prev_day_ohlcv_fetch(
             return PrevDayFetchSummary::default();
         }
     };
-    let limiter = OrderRateLimiter::new(DATA_API_RPS);
+    // Quiet Data-API rate gate. Deliberately NOT the OMS `OrderRateLimiter` —
+    // that logs `order rate limit hit — SEBI max orders/sec exceeded` on every
+    // denial, which is misleading here (NO orders involved) and floods the log
+    // (Q3, 2026-06-23). A plain `governor` cell at the Data-API budget paces us
+    // silently.
+    let quota = Quota::per_second(
+        std::num::NonZeroU32::new(DATA_API_RPS).unwrap_or(std::num::NonZeroU32::MIN),
+    );
+    let limiter = RateLimiter::direct(quota);
     let mut writer = PrevDayOhlcvWriter::new(&questdb_config);
     let mut summary = PrevDayFetchSummary::default();
 
@@ -440,7 +457,24 @@ pub async fn run_prev_day_ohlcv_fetch(
             tokio::time::sleep(Duration::from_millis(RATE_GATE_BACKOFF_MS)).await;
         }
 
-        match fetch_one(&client, &url, &jwt, &body).await {
+        // 429-aware bounded backoff (Q2, 2026-06-23): a Dhan HTTP-429 (DH-904)
+        // waits + retries this symbol before it is counted as failed, so
+        // prev-day coverage is not silently EMPTY when Dhan briefly throttles us.
+        let mut attempt_429: u32 = 0;
+        let result = loop {
+            match fetch_one(&client, &url, &jwt, &body).await {
+                Err(reason) if reason.contains("429") && attempt_429 < HTTP_429_MAX_RETRIES => {
+                    let wait_ms = HTTP_429_BACKOFF_MS
+                        .get(attempt_429 as usize)
+                        .copied()
+                        .unwrap_or(1000);
+                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                    attempt_429 = attempt_429.saturating_add(1);
+                }
+                other => break other,
+            }
+        };
+        match result {
             Ok(Some(candle)) => {
                 let Ok(sid) = row.security_id.trim().parse::<i64>() else {
                     summary.skipped = summary.skipped.saturating_add(1);
