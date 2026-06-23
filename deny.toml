@@ -41,7 +41,18 @@ unmaintained = "workspace"
 # (rustls 0.23 + aws-lc-rs). Vulnerable rustls-webpki 0.101.7 is no
 # longer in the lockfile — see Cargo.toml Section 11 for the feature
 # selection. Closed advisories: RUSTSEC-2026-0098, 0099, 0104.
-ignore = []
+#
+# 2026-06-22: RUSTSEC-2026-0185 (quinn-proto 0.11.14, HIGH 7.5 — QUIC remote
+# memory exhaustion from unbounded out-of-order stream reassembly). UNREACHABLE
+# in our binary: quinn/quinn-proto are pulled ONLY by reqwest's optional `http3`
+# feature, which we do NOT enable (reqwest features = json/rustls/charset/http2/
+# query, default-features = false). It is a phantom Cargo.lock entry, never
+# compiled — `cargo tree -i quinn-proto -e normal,build` returns empty. Mirrored
+# in .cargo/audit.toml. Removal condition: bump the lock to quinn-proto >= 0.11.15
+# in a maintenance sweep (the bump needs `cargo update`, blocked by the local
+# pre-tool hook; a follow-up will carry it). Sibling advisory RUSTSEC-2026-0186
+# (memmap2, which IS compiled) was properly fixed by bumping the pin to 0.9.11.
+ignore = ["RUSTSEC-2026-0185"]
 
 # --- Licenses: Block incompatible licenses ---
 [licenses]

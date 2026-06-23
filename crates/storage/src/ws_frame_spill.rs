@@ -157,6 +157,12 @@ pub struct WsFrameSpill {
     spill_tx: Sender<WalRecord>,
     drop_critical: Arc<AtomicU64>,
     persisted_total: Arc<AtomicU64>,
+    /// SP5.1: optional per-feed health registry. When `Some`, a dropped
+    /// LIVE-FEED (Dhan) frame records a Dhan drop so `/api/feeds/health` flips
+    /// `Degraded` — closing the SP5 connected+fresh-but-dropping false-OK.
+    /// `None` keeps the spill feed-health-agnostic (byte-identical hot path).
+    /// Read ONLY in the cold drop arms; never on the hot `Spilled` path.
+    feed_health: Option<Arc<tickvault_common::feed_health::FeedHealthRegistry>>,
 }
 
 impl WsFrameSpill {
@@ -226,7 +232,21 @@ impl WsFrameSpill {
             spill_tx: tx,
             drop_critical,
             persisted_total,
+            feed_health: None,
         })
+    }
+
+    /// SP5.1 builder: attach the per-feed health registry so terminal Dhan
+    /// LIVE-FEED frame drops surface as `Degraded` on `/api/feeds/health`
+    /// (closing the SP5 false-OK). Set ONCE at boot before any `append`;
+    /// `None` keeps the spill feed-health-agnostic.
+    #[must_use]
+    pub fn with_feed_health(
+        mut self,
+        feed_health: Option<Arc<tickvault_common::feed_health::FeedHealthRegistry>>,
+    ) -> Self {
+        self.feed_health = feed_health;
+        self
     }
 
     /// Test-only constructor whose writer thread is already gone: the
@@ -241,6 +261,7 @@ impl WsFrameSpill {
             spill_tx: tx,
             drop_critical: Arc::new(AtomicU64::new(0)),
             persisted_total: Arc::new(AtomicU64::new(0)),
+            feed_health: None,
         }
     }
 
@@ -297,6 +318,7 @@ impl WsFrameSpill {
                     "ws_type" => ws_type.as_str(),
                 )
                 .increment(1);
+                self.record_dhan_drop_for_health(ws_type);
                 AppendOutcome::Dropped
             }
             Err(TrySendError::Disconnected(_)) => {
@@ -327,8 +349,26 @@ impl WsFrameSpill {
                     "ws_type" => ws_type.as_str(),
                 )
                 .increment(1);
+                self.record_dhan_drop_for_health(ws_type);
                 AppendOutcome::Dropped
             }
+        }
+    }
+
+    /// SP5.1: on a terminal drop of a LIVE-FEED (Dhan) frame, record a Dhan drop
+    /// in the per-feed health registry so `/api/feeds/health` flips `Degraded`
+    /// (closing the SP5 connected+fresh-but-dropping false-OK). Called ONLY from
+    /// the two cold drop arms — never the hot `Spilled` path. A LiveFeed-frame
+    /// drop ⊇ tick drop (the frame may be OI/PrevClose/MarketStatus too) — all
+    /// are real Dhan data losses, so `Degraded` is the correct, honest signal.
+    /// `OrderUpdate` drops are NOT recorded (not the market-data feed). O(1),
+    /// zero-alloc, lock-free (one relaxed atomic). `None` registry = no-op.
+    #[inline]
+    fn record_dhan_drop_for_health(&self, ws_type: WsType) {
+        if matches!(ws_type, WsType::LiveFeed)
+            && let Some(ref fh) = self.feed_health
+        {
+            fh.record_drops(tickvault_common::feed::Feed::Dhan, 1);
         }
     }
 
@@ -1308,6 +1348,85 @@ mod tests {
             spill.drop_critical_count(),
             1,
             "writer-dead drop must be counted (WS-SPILL-02), never silent"
+        );
+    }
+
+    // ── SP5.1: terminal Dhan drop → per-feed health Degraded (closes SP5 false-OK) ──
+
+    #[test]
+    fn test_with_feed_health_sets_registry_and_live_feed_drop_records_dhan() {
+        use std::sync::Arc;
+        use tickvault_common::feed::Feed;
+        use tickvault_common::feed_health::{FeedHealthRegistry, FeedHealthVerdict};
+
+        let reg = Arc::new(FeedHealthRegistry::new());
+        let spill =
+            WsFrameSpill::new_with_dead_writer_for_test().with_feed_health(Some(Arc::clone(&reg)));
+        // A dropped LIVE-FEED (Dhan) frame must record a Dhan drop.
+        assert_eq!(
+            spill.append(WsType::LiveFeed, vec![2, 0, 0, 0]),
+            AppendOutcome::Dropped
+        );
+        const T0: i64 = 1_780_000_000_000_000_000;
+        // Connected + fresh, but a durable drop happened → Degraded, NOT Ok.
+        reg.set_connected(Feed::Dhan, true);
+        reg.record_tick(Feed::Dhan, T0);
+        let r = reg.snapshot(Feed::Dhan, true, true, true, T0 + 1_000_000_000);
+        assert!(r.input.drops_total >= 1, "Dhan drop must be recorded");
+        assert_eq!(
+            r.verdict,
+            FeedHealthVerdict::Degraded,
+            "connected+fresh but dropping → Degraded (closes the SP5 false-OK)"
+        );
+    }
+
+    #[test]
+    fn test_order_update_drop_does_not_record_dhan() {
+        use std::sync::Arc;
+        use tickvault_common::feed::Feed;
+        use tickvault_common::feed_health::FeedHealthRegistry;
+
+        let reg = Arc::new(FeedHealthRegistry::new());
+        let spill =
+            WsFrameSpill::new_with_dead_writer_for_test().with_feed_health(Some(Arc::clone(&reg)));
+        // An OrderUpdate drop is NOT the Dhan market feed → no Dhan drop recorded.
+        assert_eq!(
+            spill.append(WsType::OrderUpdate, vec![1]),
+            AppendOutcome::Dropped
+        );
+        const T0: i64 = 1_780_000_000_000_000_000;
+        let r = reg.snapshot(Feed::Dhan, true, true, true, T0);
+        assert_eq!(
+            r.input.drops_total, 0,
+            "OrderUpdate drop must not count as a Dhan market-feed drop"
+        );
+    }
+
+    #[test]
+    fn test_dhan_spill_drop_pre_market_is_degraded_not_ok() {
+        // SP5.1 semantic (operator: "not even a single tick should be missed"):
+        // a REAL durable-loss drop pins Dhan to Degraded even pre/post-market —
+        // distinct from the SP5 C1 disconnect-idle case (Ok outside hours).
+        // classify() checks drops>0 BEFORE the market-open gate, by design; a
+        // spill drop is actual loss, not idle sleep.
+        use std::sync::Arc;
+        use tickvault_common::feed::Feed;
+        use tickvault_common::feed_health::{FeedHealthRegistry, FeedHealthVerdict};
+
+        let reg = Arc::new(FeedHealthRegistry::new());
+        let spill =
+            WsFrameSpill::new_with_dead_writer_for_test().with_feed_health(Some(Arc::clone(&reg)));
+        assert_eq!(
+            spill.append(WsType::LiveFeed, vec![2, 0, 0, 0]),
+            AppendOutcome::Dropped
+        );
+        const T0: i64 = 1_780_000_000_000_000_000;
+        // market_open = FALSE — yet a durable drop still surfaces Degraded.
+        let r = reg.snapshot(Feed::Dhan, true, true, false, T0);
+        assert_eq!(
+            r.verdict,
+            FeedHealthVerdict::Degraded,
+            "a real durable-loss drop surfaces Degraded even pre/post-market"
         );
     }
 
