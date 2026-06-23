@@ -29,7 +29,9 @@ pub mod pct_stamping;
 pub mod seal_ring;
 pub mod tf_index;
 
-pub use aggregator_cell::{AggregatorCell, ConsumeOutcome, LiveCandleState};
+pub use aggregator_cell::{
+    AggregatorCell, ConsumeOutcome, FeedStrategy, LatePolicy, LiveCandleState,
+};
 pub use heartbeat::{AggregatorHeartbeatCounters, AggregatorHeartbeatSnapshot};
 pub use multi_tf_aggregator::{ConsumeStats, InstrumentEntry, MultiTfAggregator};
 pub use pct_stamping::{

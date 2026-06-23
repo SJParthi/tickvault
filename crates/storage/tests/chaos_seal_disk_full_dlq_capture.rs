@@ -27,6 +27,7 @@
 
 use std::path::PathBuf;
 
+use tickvault_common::feed::Feed;
 use tickvault_storage::seal_absorption::{SealAbsorptionPipeline, SubmitOutcome};
 use tickvault_storage::seal_dlq::SealDlqWriter;
 use tickvault_trading::candles::{BufferedSeal, LiveCandleState, TfIndex};
@@ -55,7 +56,7 @@ fn mk_seal(i: usize) -> BufferedSeal {
     state.bucket_start_cumulative = 1000;
     state.oi = 50_000;
     state.tick_count = 5;
-    BufferedSeal::new((i % 11_000) as u32 + 1, 0, TfIndex::M1, state)
+    BufferedSeal::new((i % 11_000) as u32 + 1, 0, TfIndex::M1, state, Feed::Dhan)
 }
 
 #[test]
