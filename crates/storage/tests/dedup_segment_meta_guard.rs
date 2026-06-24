@@ -40,27 +40,23 @@ fn read_rust_files(dir: &Path) -> Vec<(PathBuf, String)> {
 
 /// Returns every line that declares a `DEDUP_KEY_*` constant with its
 /// `"..."` body, across all storage src files.
+/// Returns every `DEDUP_KEY_*` constant with its `"..."` body, across all
+/// storage src files. Robust to rustfmt wrapping the declaration across lines
+/// (`const X: &str =\n    "...";`): when the declaration line has no quote, the
+/// body is found on a following continuation line.
 fn collect_dedup_key_declarations() -> Vec<(PathBuf, usize, String, String)> {
     let mut out = Vec::new();
     for (path, content) in read_rust_files(&storage_src_dir()) {
-        for (idx, line) in content.lines().enumerate() {
+        let lines: Vec<&str> = content.lines().collect();
+        for (idx, line) in lines.iter().enumerate() {
             let trimmed = line.trim_start();
             if !trimmed.contains("DEDUP_KEY_") {
                 continue;
             }
-            // Only match declarations: `const DEDUP_KEY_X: &str = "..."`
+            // Only match declarations: `const DEDUP_KEY_X: &str = "..."`.
             if !trimmed.contains("const ") || !trimmed.contains(": &str") {
                 continue;
             }
-            // Extract the quoted body.
-            let start = match line.find('"') {
-                Some(p) => p + 1,
-                None => continue,
-            };
-            let end = match line[start..].find('"') {
-                Some(p) => start + p,
-                None => continue,
-            };
             // Extract the constant name — between `const ` and `:`.
             let after_const = line.split("const ").nth(1).unwrap_or("");
             let name = after_const
@@ -69,8 +65,21 @@ fn collect_dedup_key_declarations() -> Vec<(PathBuf, usize, String, String)> {
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            let body = line[start..end].to_string();
-            out.push((path.clone(), idx.saturating_add(1), name, body));
+            // The quoted body may be on this line OR a continuation line. Scan
+            // forward up to a few lines until the first `"..."` literal appears.
+            let mut body: Option<String> = None;
+            for probe in lines.iter().skip(idx).take(4) {
+                if let Some(s) = probe.find('"') {
+                    let start = s + 1;
+                    if let Some(e) = probe[start..].find('"') {
+                        body = Some(probe[start..start + e].to_string());
+                        break;
+                    }
+                }
+            }
+            if let Some(body) = body {
+                out.push((path.clone(), idx.saturating_add(1), name, body));
+            }
         }
     }
     out
@@ -291,8 +300,10 @@ const FEED_KEYED_MARKET_DATA_KEYS: &[&str] = &[
 
 #[test]
 fn per_feed_market_data_dedup_keys_must_include_feed() {
+    let decls = collect_dedup_key_declarations();
     for expected in FEED_KEYED_MARKET_DATA_KEYS {
-        let (path, body) = find_dedup_key_body(expected).unwrap_or_else(|| {
+        let found = decls.iter().find(|(_, _, name, _)| name == expected);
+        let (path, line, _name, body) = found.unwrap_or_else(|| {
             panic!(
                 "per-feed DEDUP key `{expected}` not found in storage src — was it \
                  renamed/removed? It MUST exist and include `feed` (operator \
@@ -301,11 +312,12 @@ fn per_feed_market_data_dedup_keys_must_include_feed() {
         });
         assert!(
             body.contains("feed"),
-            "{} — {} = \"{}\" MUST include `feed` in its DEDUP key so a Dhan \
+            "{}:{} — {} = \"{}\" MUST include `feed` in its DEDUP key so a Dhan \
              and a Groww row for the same instrument/minute stay DISTINCT rows \
              (per-feed identity, operator 2026-06-23). Removing `feed` would \
              collapse the two feeds into one row.",
             path.display(),
+            line,
             expected,
             body
         );
