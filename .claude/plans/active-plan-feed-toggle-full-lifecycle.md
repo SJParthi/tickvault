@@ -81,6 +81,18 @@ Today those are inlined in the linear boot. They must be extracted into
 - Per-feed lane state gauge (dormant/starting/running/stopping/degraded) + the existing
   feed-page status; ERROR on cold-start failure.
 
+## Per-Item Guarantee Matrix
+See `.claude/rules/project/per-wave-guarantee-matrix.md` — all 15 rows of the
+100% Guarantee Matrix and all 7 rows of the Resilience Demand Matrix apply to
+EVERY item (PR-1..PR-4) in this plan: 100% code/audit/testing coverage, code
+checks, performance, monitoring, logging, alerting, security + hardening, bug
+fixing, scenario + functionality coverage, code review, extreme check; and the
+7 resilience rows (zero ticks lost, WS reconnect, never slow/locked, QuestDB
+absorb, O(1) hot path UNTOUCHED, composite-key uniqueness + dedup, real-time
+proof). Each PR carries the honest envelope wording ("100% inside the tested
+envelope, with ratcheted regression coverage") and runs the 3-agent adversarial
+review.
+
 ## Honest envelope
 - O(1) is NOT the relevant axis here — this is the COLD control-plane (toggle/boot),
   not the hot tick path. The hot path (already O(1)) is untouched. Claiming "O(1)" for a
