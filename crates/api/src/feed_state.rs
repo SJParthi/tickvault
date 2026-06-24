@@ -116,7 +116,16 @@ impl FeedRuntimeState {
     /// Called once by the boot wiring when the Groww bridge task is spawned, so
     /// the API can report honestly whether a runtime toggle will take effect.
     pub fn mark_groww_lane_running(&self) {
-        self.groww_lane_running.store(true, Ordering::Relaxed);
+        self.set_groww_lane_running(true);
+    }
+
+    /// Set the Groww lane-running flag both ways. The activation watcher
+    /// (`groww_activation`) sets it `true` on the enable rising-edge once the
+    /// tables + watch-list are ready, and `false` on the disable falling-edge —
+    /// so the feed page reports "running" iff the lane is actually live, never a
+    /// false-OK and never a stale DEGRADED after a runtime cold-start.
+    pub fn set_groww_lane_running(&self, running: bool) {
+        self.groww_lane_running.store(running, Ordering::Relaxed);
     }
 
     /// Whether the Groww bridge task was spawned this process (see [`FeedStatus`]).
@@ -334,6 +343,22 @@ mod tests {
         state.mark_groww_lane_running();
         assert!(state.is_groww_lane_running());
         assert!(state.snapshot().groww_lane_running);
+    }
+
+    #[test]
+    fn test_set_groww_lane_running_toggles_both_ways() {
+        // The activation watcher sets the flag true on the enable rising edge
+        // (after the watch-list builds) and false on the disable falling edge.
+        // Both directions must round-trip — the disable path is what clears a
+        // stale "running" so the feed page never lies after a teardown.
+        let state = FeedRuntimeState::default();
+        assert!(!state.is_groww_lane_running(), "default not running");
+        state.set_groww_lane_running(true);
+        assert!(state.is_groww_lane_running(), "set true => running");
+        assert!(state.snapshot().groww_lane_running);
+        state.set_groww_lane_running(false);
+        assert!(!state.is_groww_lane_running(), "set false => stopped");
+        assert!(!state.snapshot().groww_lane_running);
     }
 
     #[test]
