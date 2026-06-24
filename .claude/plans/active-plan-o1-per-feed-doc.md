@@ -1,6 +1,6 @@
 # Implementation Plan: O(1) per-feed uniqueness/dedup/mapping — permanent SoT doc + ratchet
 
-**Status:** APPROVED (operator 2026-06-24: "I need this always … persist … as a committed docs/architecture reference + ratchet … deep research … no illusion")
+**Status:** VERIFIED (operator 2026-06-24: "I need this always … persist … as a committed docs/architecture reference + ratchet … deep research … no illusion")
 **Date:** 2026-06-24
 **Branch:** `claude/o1-per-feed-architecture-doc` (off origin/main).
 
@@ -19,11 +19,11 @@ DEDUP keys all contain `feed`; the doc names the canonical composite key; the
 doc carries the honest-envelope qualifier and does NOT claim "O(1) space").
 
 ## Plan Items
-- [ ] **G1 — write the SoT doc** `docs/architecture/o1-per-feed-uniqueness-dedup-mapping.md`
+- [x] **G1 — write the SoT doc** `docs/architecture/o1-per-feed-uniqueness-dedup-mapping.md`
   - Synthesized ONLY from the 3 agents' verified findings (every claim cite-backed); honest-gaps section; honest-envelope wording; auto-driver explanation; comparison tables.
-- [ ] **G2 — ratchet test** `crates/storage/tests/o1_per_feed_doc_guard.rs`
+- [x] **G2 — ratchet test** `crates/storage/tests/o1_per_feed_doc_guard.rs`
   - doc exists; references each feed-keyed DEDUP const; each of those consts contains `feed`; doc contains the honest-envelope phrase; doc does NOT contain a literal "O(1) space" claim (anti-hallucination pin).
-- [ ] **G3 — cross-link** the doc from `data-integrity.md` (per-feed identity section) so future sessions find it.
+- [x] **G3 — cross-link** the doc from `data-integrity.md` (per-feed identity section) so future sessions find it.
 
 ## Edge Cases
 - A future edit removes `feed` from a DEDUP key → both the existing dedup meta-guard AND this doc-guard fail.

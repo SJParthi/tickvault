@@ -57,6 +57,11 @@ paths:
 
 ## Per-Feed Identity in DEDUP keys (operator 2026-06-23)
 
+> **Full architecture reference:** `docs/architecture/o1-per-feed-uniqueness-dedup-mapping.md`
+> is the permanent single source of truth for O(1) per-feed uniqueness / dedup /
+> mapping / latency (verified 2026-06-24; drift-guarded by
+> `crates/storage/tests/o1_per_feed_doc_guard.rs`).
+
 Every table holding genuinely PER-FEED data carries `feed` (`dhan`/`groww`, from
 `tickvault_common::feed::Feed`) IN its DEDUP UPSERT key, so a Dhan row and a
 Groww row for the same logical key are BOTH kept (distinct feeds = distinct
