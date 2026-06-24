@@ -38,6 +38,9 @@ pub mod day_ohlc_orchestrator;
 // cross-check retired under 4-IDX_I LOCKED_UNIVERSE (operator lock 2026-05-15).
 // Bhavcopy is NSE_FNO-only; no F&O subscriptions remain to cross-check.
 pub mod boot_helpers;
+/// Groww runtime activation watcher — feed toggle cold-starts/teardowns the
+/// whole Groww lane live (operator 2026-06-24). Default-OFF; dormant until enabled.
+pub mod groww_activation;
 /// Groww second-feed bridge — consumer side (operator lock §32). Default-OFF.
 pub mod groww_bridge;
 /// Groww Python-sidecar auto-launcher + supervisor (operator lock §32 +

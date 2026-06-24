@@ -274,161 +274,56 @@ async fn main() -> Result<()> {
              feed-gating PR lands"
         );
     }
-    if feeds.groww_enabled {
-        // Groww data-plane schema — ensure the tables the Groww bridge writes
-        // exist with the correct feed-extended DEDUP keys + `feed` column BEFORE
-        // the bridge writes. Groww uses the SAME tables as Dhan (operator
-        // 2026-06-19 "same tables + feed column"): the SHARED `ticks` + the SHARED
-        // 21 `candles_<tf>` tables (both ensures DELEGATE to the canonical shared
-        // DDL); only `groww_cross_verify_1m_audit` (the live-vs-backtest parity
-        // table) stays an isolated `groww_*` table. This runs for EVERY
-        // groww_enabled mode (Groww-only AND Dhan+Groww), and crucially BEFORE the
-        // Step C gate below — so a Groww-only run (which returns at the gate,
-        // skipping the Dhan block's DDL) still gets correct schema instead of
-        // QuestDB ILP auto-creating a keyless, feed-less table (3-agent
-        // hostile-review HIGH, 2026-06-19). Idempotent CREATE/ALTER, cold path.
-        tickvault_storage::groww_persistence::ensure_groww_live_ticks_table(&config.questdb).await;
-        tickvault_storage::groww_candle_persistence::ensure_groww_candles_1m_table(&config.questdb)
-            .await;
-        tickvault_storage::groww_cross_verify_audit_persistence::ensure_groww_cross_verify_1m_audit_table(
-            &config.questdb,
-        )
-        .await;
-
-        // Groww second feed (operator lock 2026-06-19). PR-2 wires the auth
-        // smoke-check ONLY: confirm we can obtain a Groww access token from the
-        // SSM creds (/tickvault/<env>/groww/api-key + /totp-secret). The native
-        // live-feed connector (NATS) lands in a later PR. Spawned in the
-        // background so it never blocks the Dhan boot path; default OFF.
-        let groww_timeout_ms = config.network.request_timeout_ms;
-        info!(
-            "[feeds] groww_enabled=true — starting Groww access-token auth smoke-check \
-             (background; the live-feed connector lands in a later PR, no Groww ticks flow yet)"
-        );
-        tokio::spawn(async move {
-            if let Err(err) =
-                tickvault_core::feed::groww::auth::run_groww_auth_smoke_check(groww_timeout_ms)
-                    .await
-            {
-                error!(
-                    error = %err,
-                    "Groww access-token auth smoke-check FAILED — verify \
-                     /tickvault/<env>/groww/api-key + /tickvault/<env>/groww/totp-secret in SSM"
-                );
-            }
-        });
-
-        // Groww bridge — consumes the sidecar's capture-at-receipt tick file →
-        // SHARED `ticks` + SHARED `candles_1m`, every row tagged feed='groww'
-        // (distinguished from Dhan's feed='dhan' by the feed-extended DEDUP keys).
-        // Dormant (no writes) until the Python sidecar appends; default OFF, so
-        // the Dhan boot path is unaffected.
-        let groww_qdb = config.questdb.clone();
-        info!(
-            "[feeds] groww_enabled=true — starting Groww bridge (dormant until the \
-             sidecar tick file appears; writes feed='groww' rows into the shared \
-             tables, no Dhan impact)"
-        );
-        tokio::spawn(tickvault_app::groww_bridge::run_groww_bridge(
-            groww_qdb,
-            std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
-            std::sync::Arc::clone(&feed_runtime),
-            std::sync::Arc::clone(&feed_health),
+    // ── Groww second feed: dormant-until-enabled lanes (operator 2026-06-24) ──
+    // The feed toggle must start/stop the ENTIRE Groww lane LIVE — so the bridge,
+    // the Python-sidecar supervisor, AND the activation watcher are ALL spawned
+    // UNCONDITIONALLY at boot. Each self-idles on `is_enabled(Feed::Groww)` (a
+    // poll, zero Groww work) while OFF, so an OFF Groww feed still touches NOTHING
+    // (no auth, no instruments, no Python) — the OFF-feed-isolation guarantee
+    // holds as a *dormant poll* rather than *not-spawned*. On enable (config OR
+    // the /api/feeds webpage toggle, NO restart) the activation watcher — a
+    // level-triggered reconciler that owns one abortable task — runs the
+    // one-shots (ensure tables → auth smoke → build watch-list) and marks the
+    // lane running ONLY after the watch-list builds (no false-OK); on disable it
+    // aborts the in-flight task so no Groww work continues. The sidecar
+    // supervisor provisions the venv + launches the Python producer; the bridge
+    // tails the producer's tick file. Both self-idle on the same enable flag.
+    let groww_watch_date = (chrono::Utc::now()
+        + chrono::TimeDelta::seconds(tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64))
+    .format("%Y-%m-%d")
+    .to_string();
+    let groww_max_subscribe = std::env::var("GROWW_MAX_SUBSCRIBE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .or(Some(
+            tickvault_core::feed::groww::instruments::GROWW_DEFAULT_MAX_SUBSCRIBE,
         ));
-
-        // Groww watch-list build (PR-B1, operator lock §31/§32). Rust downloads
-        // the Groww master instrument.csv + the NIFTY-Total-Market list, joins
-        // by ISIN → Groww exchange_tokens, and atomically writes the ~779 watch
-        // file the sidecar reads (PR-B2 wires the sidecar to consume it).
-        // Pull-until-success retry (operator: never give up); fail-closed on
-        // either CSV. `max_subscribe` defaults to a SAFE SUBSET for the first
-        // run — set the `GROWW_MAX_SUBSCRIBE` env (e.g. 1200) for the full
-        // universe. Default OFF; touches NO Dhan path.
-        let groww_watch_date = (chrono::Utc::now()
-            + chrono::TimeDelta::seconds(tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64))
-        .format("%Y-%m-%d")
-        .to_string();
-        let groww_max_subscribe = std::env::var("GROWW_MAX_SUBSCRIBE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .or(Some(
-                tickvault_core::feed::groww::instruments::GROWW_DEFAULT_MAX_SUBSCRIBE,
-            ));
-        info!(
-            max_subscribe = ?groww_max_subscribe,
-            "[feeds] groww_enabled=true — building Groww watch-list (Rust: master + NTM join by ISIN)"
-        );
-        tokio::spawn(async move {
-            let cache_dir = std::path::PathBuf::from("data/groww");
-            let mut attempt: u32 = 0;
-            loop {
-                attempt = attempt.saturating_add(1);
-                match tickvault_core::feed::groww::instruments::build_and_write_groww_watch(
-                    &cache_dir,
-                    &groww_watch_date,
-                    groww_max_subscribe,
-                )
-                .await
-                {
-                    Ok(set) => {
-                        info!(
-                            entries = set.entries.len(),
-                            indices = set.indices,
-                            resolved_stocks = set.resolved_stocks,
-                            unresolved = set.unresolved_stocks.len(),
-                            "[feeds] Groww watch-list ready"
-                        );
-                        break;
-                    }
-                    Err(err) => {
-                        let backoff =
-                            std::cmp::min(10u64.saturating_mul(1u64 << attempt.min(5)), 300);
-                        if attempt <= 3 {
-                            warn!(
-                                ?err,
-                                attempt,
-                                backoff_secs = backoff,
-                                "[feeds] Groww watch-list build failed — retrying"
-                            );
-                        } else {
-                            error!(
-                                ?err,
-                                attempt,
-                                backoff_secs = backoff,
-                                "[feeds] Groww watch-list build still failing — pull-until-success"
-                            );
-                        }
-                        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-                    }
-                }
-            }
-        });
-
-        // Groww sidecar auto-launcher (operator "no manual commands" 2026-06-19).
-        // tickvault itself auto-provisions an isolated Python venv (one-time,
-        // idempotent `python -m venv` + `pip install growwapi pyotp`), fetches the
-        // SSM Groww creds and injects them as env, spawns the producer sidecar, and
-        // supervises it (restart-on-crash with backoff; stop/resume on the runtime
-        // feed toggle). The operator NEVER runs pip/python by hand — flipping
-        // `groww_enabled` (config OR the /api/feeds endpoint) is the only action.
-        // Default OFF; touches NO Dhan path.
-        info!(
-            "[feeds] groww_enabled=true — starting Groww sidecar supervisor \
-             (auto-provisions an isolated Python env + launches/restarts the \
-             producer; no manual commands required)"
-        );
-        tokio::spawn(
-            tickvault_app::groww_sidecar_supervisor::run_groww_sidecar_supervisor(
-                std::sync::Arc::clone(&feed_runtime),
-                tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
-            ),
-        );
-
-        // The Groww lane is now actually running — so the feed-toggle API reports
-        // `groww_lane_running: true` and a runtime toggle genuinely pauses/resumes
-        // it (rather than recording a flag with no lane to act on it).
-        feed_runtime.mark_groww_lane_running();
-    }
+    info!(
+        groww_enabled = feeds.groww_enabled,
+        "[feeds] Groww lanes spawned dormant (bridge + sidecar + activation watcher); \
+         they activate on enable (config OR /api/feeds toggle) with no restart"
+    );
+    tokio::spawn(tickvault_app::groww_bridge::run_groww_bridge(
+        config.questdb.clone(),
+        std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
+        std::sync::Arc::clone(&feed_runtime),
+        std::sync::Arc::clone(&feed_health),
+    ));
+    tokio::spawn(
+        tickvault_app::groww_sidecar_supervisor::run_groww_sidecar_supervisor(
+            std::sync::Arc::clone(&feed_runtime),
+            tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
+        ),
+    );
+    tokio::spawn(
+        tickvault_app::groww_activation::run_groww_activation_watcher(
+            std::sync::Arc::clone(&feed_runtime),
+            config.questdb.clone(),
+            groww_watch_date,
+            groww_max_subscribe,
+            config.network.request_timeout_ms,
+        ),
+    );
     // Step C (pluggable-feed-runtime.md §6): the Dhan disable-gate is now LIVE.
     // The actual skip-and-idle branch is below (just before the Dhan fast/slow
     // boot decision), AFTER shared infra (observability/WAL/calendar) is up so a
