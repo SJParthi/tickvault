@@ -8,9 +8,14 @@
 //! a shared [`crate::feed_state::FeedRuntimeState`] `Arc` that the Groww bridge
 //! reads every loop iteration — pause/resume Groww writes mid-session, no restart.
 //!
-//! **Honest envelope (slice 1):** only Groww is runtime-toggleable. `POST` for
-//! `dhan` returns 400 — disabling the primary trading feed mid-session is unsafe
-//! (Dhan stays config+restart, per Step C). Dhan's flag is still reported by GET.
+//! **Honest envelope (PR-E / PR-2):** BOTH feeds are runtime-toggleable. The Dhan
+//! *disable* direction is safety-gated — `POST /api/feeds/dhan {enabled:false}` is
+//! allowed only when `can_disable_dhan()` is true (no-orders data-pull phase) and
+//! returns `409 CONFLICT` once live trading is on, so the system is never blinded
+//! mid-trade. Enabling Dhan is always allowed. A boot-ON Dhan toggle is a true
+//! live pause/resume; a boot-OFF Dhan enable records the flag but does NOT mark
+//! the lane running (no false-OK — the `dhan_pool_present` sentinel is false), so
+//! a restart with `dhan_enabled=true` is required to actually stream.
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -100,10 +105,14 @@ pub async fn set_feed(
     Json(req): Json<SetFeedRequest>,
 ) -> Result<Json<FeedsStatusResponse>, (StatusCode, Json<FeedErrorResponse>)> {
     let Some(feed) = Feed::parse(&feed_name) else {
+        // FIX 4 (3-agent: reflected user input): do NOT echo the URL segment back
+        // in the error body. Valid feeds are a closed enum (`Feed::ALL`), and the
+        // `allowed` list already tells the caller every legal value — a static
+        // message keeps unsanitized path input out of the response entirely.
         return Err((
             StatusCode::BAD_REQUEST,
             Json(FeedErrorResponse {
-                error: format!("unknown feed: {feed_name}"),
+                error: "unknown feed".to_string(),
                 allowed: toggleable_feed_labels(),
             }),
         ));
@@ -142,25 +151,34 @@ pub async fn set_feed(
         enabled = req.enabled,
         "feed runtime toggled via API"
     );
-    // Honesty (3-agent hostile review): enabling a lane that was never spawned at
-    // boot is recorded but has NO effect. Tell the operator instead of silently
-    // returning a misleading "enabled" — the response also carries
-    // `groww_lane_running: false` so the truth is machine-readable.
+    // Honesty (3-agent hostile review): the Groww lane is spawned dormant at boot
+    // and the activation watcher cold-STARTS it at runtime on enable — NO restart
+    // needed (PR-1). `groww_lane_running` is still false at this instant because
+    // activation (tables + auth + watch-list build) takes a few seconds; the
+    // response carries it so the truth is machine-readable and the page polls
+    // until it flips to running. This is an info, not a "needs restart".
     if feed == Feed::Groww && req.enabled && !state.feed_runtime().is_groww_lane_running() {
-        tracing::warn!(
-            "feed 'groww' enabled via API but its lane was not started at boot \
-             (groww_enabled=false then) — set groww_enabled=true in config and restart \
-             to start it; the API toggle only pauses/resumes a running lane"
+        info!(
+            "feed 'groww' enabled via API — the dormant lane is cold-starting now \
+             (ensuring tables, auth smoke-check, building the watch-list); no restart \
+             needed. It reports running once the watch-list is built (a few seconds)."
         );
     }
-    // PR-E: same honesty for Dhan — enabling it via API when the pool was never
-    // spawned at boot (dhan_enabled=false then) records the flag but nothing acts
-    // on it. The response also carries `dhan_lane_running: false` (machine-readable).
+    // PR-E / PR-2: honesty for Dhan. If Dhan was ENABLED at boot, the toggle is a
+    // true live pause/resume — the dormant Dhan activation watcher (PR-2) keeps
+    // the `dhan_lane_running` flag truthful both ways and the main-feed pool
+    // reconnects via the shared enable flag (PR-E in-loop dormancy), no restart.
+    // If Dhan was OFF at boot, no main-feed pool was ever spawned, so enabling it
+    // via API records the flag but the full boot-OFF cold-start of the Dhan boot
+    // spine is not yet wired (the deferred residual of feed-toggle-full-lifecycle)
+    // — that still needs `dhan_enabled=true` in config + restart. The response
+    // carries `dhan_lane_running` so the page can tell the two cases apart.
     if feed == Feed::Dhan && req.enabled && !state.feed_runtime().is_dhan_lane_running() {
         tracing::warn!(
             "feed 'dhan' enabled via API but its main-feed pool was not started at \
-             boot (dhan_enabled=false then) — set dhan_enabled=true in config and \
-             restart to start it; the API toggle only pauses/resumes a running lane"
+             boot (dhan_enabled=false then) — runtime pause/resume works for a \
+             boot-ON Dhan feed, but a boot-OFF Dhan feed's full cold-start is not \
+             yet wired; set dhan_enabled=true in config and restart to start it"
         );
     }
     metrics::counter!(
@@ -169,6 +187,41 @@ pub async fn set_feed(
         "action" => action,
     )
     .increment(1);
+
+    // PR-3 (persist): mirror the operator's choice to the SEPARATE
+    // `data/feed-state.json` overlay so it survives a restart (never rewrites
+    // the git-tracked locked config). The FULL snapshot (both flags) is written
+    // so toggling one feed never drops the other's persisted value. A failure
+    // is logged at `error!` (persist failures route to Telegram, audit Rule 5)
+    // but does NOT fail the HTTP response — the runtime toggle already applied
+    // (live this session); only the durable record failed, and a later
+    // successful toggle self-heals it. This call is inside the bearer-auth
+    // handler (GAP-SEC-01) — no new route, no new attack surface.
+    //
+    // FIX 3 (3-agent TOCTOU): we persist `snapshot()` — the ACTUAL atomic
+    // runtime truth AFTER `set_enabled` — NOT `req.enabled` raw, because the
+    // PR-E safety gate above may have refused the requested value (e.g. a Dhan
+    // disable rejected with 409 never reaches here, but persisting the
+    // post-set snapshot is the invariant that keeps the on-disk record equal to
+    // the live state). Concurrent same-feed toggles are EVENTUALLY CONSISTENT:
+    // last-writer-wins, and because each write goes through a unique-tmp +
+    // atomic rename (see `feed_state_persist::persist_feed_state`) the on-disk
+    // file is ALWAYS a complete valid full snapshot — never torn. No lock is
+    // needed; a brief overlap merely means the last toggle's snapshot wins,
+    // which is the desired semantics for a single-operator control surface.
+    let snap = state.feed_runtime().snapshot();
+    if let Err(err) = crate::feed_state_persist::persist_feed_state(
+        &snap,
+        &crate::feed_state_persist::feed_state_path(),
+    ) {
+        tracing::error!(
+            ?err,
+            feed = feed.as_str(),
+            "failed to persist the feed-state overlay (data/feed-state.json) — \
+             the runtime toggle is LIVE this session but will NOT survive a \
+             restart until a feed-state write succeeds"
+        );
+    }
 
     Ok(Json(current_status(&state)))
 }
@@ -409,9 +462,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_enabling_groww_reports_lane_not_running_when_unspawned() {
-        // Honesty: enabling Groww via API when the bridge was not spawned at boot
-        // records the flag but reports groww_lane_running=false (no misleading OK).
+    async fn test_enabling_groww_reports_lane_not_yet_running_during_cold_start() {
+        // Honesty: enabling Groww via API records the flag and the dormant lane
+        // cold-starts at runtime (PR-1, no restart). Immediately after the call the
+        // lane is not YET running (activation takes a few seconds), so the response
+        // reports groww_lane_running=false — an honest transient, not "needs restart".
         let state = test_state(FeedsConfig {
             dhan_enabled: true,
             groww_enabled: false,
@@ -426,7 +481,7 @@ mod tests {
         assert!(resp.groww_enabled, "flag recorded");
         assert!(
             !resp.groww_lane_running,
-            "but the lane is not running (was not spawned at boot) — honest signal"
+            "lane not yet running this instant — it cold-starts within seconds (no restart)"
         );
     }
 
@@ -496,6 +551,12 @@ mod tests {
             panic!("unknown feed must be rejected");
         };
         assert_eq!(code, StatusCode::BAD_REQUEST);
-        assert!(body.error.contains("kite"));
+        // FIX 4: the error body is a STATIC string and must NOT echo the
+        // user-supplied feed name back (no reflected input).
+        assert_eq!(body.error, "unknown feed");
+        assert!(
+            !body.error.contains("kite"),
+            "unknown-feed error must not reflect the URL segment"
+        );
     }
 }

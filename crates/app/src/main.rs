@@ -192,7 +192,7 @@ async fn main() -> Result<()> {
     if let Some(env_path) = tickvault_app::boot_helpers::config_env_path(&config_env) {
         config_figment = config_figment.merge(Toml::file(env_path));
     }
-    let config: ApplicationConfig = config_figment
+    let mut config: ApplicationConfig = config_figment
         .merge(Toml::file(CONFIG_LOCAL_PATH))
         .extract()
         .context("failed to load configuration from config/base.toml")?;
@@ -236,6 +236,35 @@ async fn main() -> Result<()> {
     // is UNCHANGED; the per-feed spawn gating + the native Groww connector land
     // in later PRs of this sequence — until then these WARNs make the partial
     // state explicit (no illusion).
+    //
+    // PR-3 (persist, feed-toggle-full-lifecycle): the operator's LAST webpage
+    // toggle choice is mirrored to a SEPARATE `data/feed-state.json` overlay
+    // (never the git-tracked locked `config/base.toml`). `config.feeds` is the
+    // DEFAULT; if a valid overlay exists it WINS — so the last choice survives a
+    // restart. A missing file → config default (no error); a corrupt/partial
+    // file → config default + a WARN (fail-safe, never a boot crash). The
+    // overlay is applied IN PLACE onto `config.feeds`, so BOTH `feeds.*` below
+    // AND the Dhan-off per-feed boot dispatcher gate (the `config.feeds`
+    // dhan-enabled skip-guard further down) read the EFFECTIVE state with no
+    // further edits.
+    {
+        let overlay_path = tickvault_api::feed_state_persist::feed_state_path();
+        let persisted = tickvault_api::feed_state_persist::load_feed_state(&overlay_path);
+        if persisted.is_some() {
+            info!(
+                "feed-state overlay found (data/feed-state.json) — restoring the last \
+                 webpage toggle choice over the config default"
+            );
+        } else if overlay_path.exists() {
+            // The file exists but did not load (corrupt / unreadable) — fail-safe
+            // to the config default, but make it visible (no silent fall-through).
+            warn!(
+                "feed-state overlay present but unreadable/corrupt (data/feed-state.json) \
+                 — falling back to the config default per-feed enabled state"
+            );
+        }
+        config.feeds = tickvault_api::feed_state_persist::overlay_feeds(config.feeds, persisted);
+    }
     let feeds = &config.feeds;
     // Feed-toggle API (operator AskUserQuestion 2026-06-19): ONE shared
     // `Arc<FeedRuntimeState>` seeded from config, handed to BOTH the API state
@@ -258,8 +287,15 @@ async fn main() -> Result<()> {
     // the only case the pool is actually built below. If Dhan is OFF at boot the
     // pool is never spawned, so reporting it running would be a false-OK
     // (hostile-review HIGH 2026-06-21) — mirrors the groww_lane_running honesty.
+    // PR-2: `mark_dhan_pool_present()` records that a REAL pool exists this
+    // process (the sentinel PR-E's in-loop dormancy needs to resume). On a
+    // boot-OFF run this stays false, so the Dhan activation watcher REFUSES to
+    // mark the lane running on a runtime enable (no pool ⇒ no stream ⇒ no
+    // false-OK) — the boot-OFF cold-start of the inline Dhan spine is the
+    // documented deferred residual (a restart with dhan_enabled=true is required).
     if feeds.dhan_enabled {
         feed_runtime.mark_dhan_lane_running();
+        feed_runtime.mark_dhan_pool_present();
     }
     info!(
         dhan_enabled = feeds.dhan_enabled,
@@ -274,161 +310,73 @@ async fn main() -> Result<()> {
              feed-gating PR lands"
         );
     }
-    if feeds.groww_enabled {
-        // Groww data-plane schema — ensure the tables the Groww bridge writes
-        // exist with the correct feed-extended DEDUP keys + `feed` column BEFORE
-        // the bridge writes. Groww uses the SAME tables as Dhan (operator
-        // 2026-06-19 "same tables + feed column"): the SHARED `ticks` + the SHARED
-        // 21 `candles_<tf>` tables (both ensures DELEGATE to the canonical shared
-        // DDL); only `groww_cross_verify_1m_audit` (the live-vs-backtest parity
-        // table) stays an isolated `groww_*` table. This runs for EVERY
-        // groww_enabled mode (Groww-only AND Dhan+Groww), and crucially BEFORE the
-        // Step C gate below — so a Groww-only run (which returns at the gate,
-        // skipping the Dhan block's DDL) still gets correct schema instead of
-        // QuestDB ILP auto-creating a keyless, feed-less table (3-agent
-        // hostile-review HIGH, 2026-06-19). Idempotent CREATE/ALTER, cold path.
-        tickvault_storage::groww_persistence::ensure_groww_live_ticks_table(&config.questdb).await;
-        tickvault_storage::groww_candle_persistence::ensure_groww_candles_1m_table(&config.questdb)
-            .await;
-        tickvault_storage::groww_cross_verify_audit_persistence::ensure_groww_cross_verify_1m_audit_table(
-            &config.questdb,
-        )
-        .await;
-
-        // Groww second feed (operator lock 2026-06-19). PR-2 wires the auth
-        // smoke-check ONLY: confirm we can obtain a Groww access token from the
-        // SSM creds (/tickvault/<env>/groww/api-key + /totp-secret). The native
-        // live-feed connector (NATS) lands in a later PR. Spawned in the
-        // background so it never blocks the Dhan boot path; default OFF.
-        let groww_timeout_ms = config.network.request_timeout_ms;
-        info!(
-            "[feeds] groww_enabled=true — starting Groww access-token auth smoke-check \
-             (background; the live-feed connector lands in a later PR, no Groww ticks flow yet)"
-        );
-        tokio::spawn(async move {
-            if let Err(err) =
-                tickvault_core::feed::groww::auth::run_groww_auth_smoke_check(groww_timeout_ms)
-                    .await
-            {
-                error!(
-                    error = %err,
-                    "Groww access-token auth smoke-check FAILED — verify \
-                     /tickvault/<env>/groww/api-key + /tickvault/<env>/groww/totp-secret in SSM"
-                );
-            }
-        });
-
-        // Groww bridge — consumes the sidecar's capture-at-receipt tick file →
-        // SHARED `ticks` + SHARED `candles_1m`, every row tagged feed='groww'
-        // (distinguished from Dhan's feed='dhan' by the feed-extended DEDUP keys).
-        // Dormant (no writes) until the Python sidecar appends; default OFF, so
-        // the Dhan boot path is unaffected.
-        let groww_qdb = config.questdb.clone();
-        info!(
-            "[feeds] groww_enabled=true — starting Groww bridge (dormant until the \
-             sidecar tick file appears; writes feed='groww' rows into the shared \
-             tables, no Dhan impact)"
-        );
-        tokio::spawn(tickvault_app::groww_bridge::run_groww_bridge(
-            groww_qdb,
-            std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
-            std::sync::Arc::clone(&feed_runtime),
-            std::sync::Arc::clone(&feed_health),
+    // ── Groww second feed: dormant-until-enabled lanes (operator 2026-06-24) ──
+    // The feed toggle must start/stop the ENTIRE Groww lane LIVE — so the bridge,
+    // the Python-sidecar supervisor, AND the activation watcher are ALL spawned
+    // UNCONDITIONALLY at boot. Each self-idles on `is_enabled(Feed::Groww)` (a
+    // poll, zero Groww work) while OFF, so an OFF Groww feed still touches NOTHING
+    // (no auth, no instruments, no Python) — the OFF-feed-isolation guarantee
+    // holds as a *dormant poll* rather than *not-spawned*. On enable (config OR
+    // the /api/feeds webpage toggle, NO restart) the activation watcher — a
+    // level-triggered reconciler that owns one abortable task — runs the
+    // one-shots (ensure tables → auth smoke → build watch-list) and marks the
+    // lane running ONLY after the watch-list builds (no false-OK); on disable it
+    // aborts the in-flight task so no Groww work continues. The sidecar
+    // supervisor provisions the venv + launches the Python producer; the bridge
+    // tails the producer's tick file. Both self-idle on the same enable flag.
+    // Watch date is computed at ACTIVATION time inside the watcher (so a runtime
+    // re-enable past IST midnight uses today's date, never a stale boot date) —
+    // not pre-computed here.
+    let groww_max_subscribe = std::env::var("GROWW_MAX_SUBSCRIBE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .or(Some(
+            tickvault_core::feed::groww::instruments::GROWW_DEFAULT_MAX_SUBSCRIBE,
         ));
-
-        // Groww watch-list build (PR-B1, operator lock §31/§32). Rust downloads
-        // the Groww master instrument.csv + the NIFTY-Total-Market list, joins
-        // by ISIN → Groww exchange_tokens, and atomically writes the ~779 watch
-        // file the sidecar reads (PR-B2 wires the sidecar to consume it).
-        // Pull-until-success retry (operator: never give up); fail-closed on
-        // either CSV. `max_subscribe` defaults to a SAFE SUBSET for the first
-        // run — set the `GROWW_MAX_SUBSCRIBE` env (e.g. 1200) for the full
-        // universe. Default OFF; touches NO Dhan path.
-        let groww_watch_date = (chrono::Utc::now()
-            + chrono::TimeDelta::seconds(tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64))
-        .format("%Y-%m-%d")
-        .to_string();
-        let groww_max_subscribe = std::env::var("GROWW_MAX_SUBSCRIBE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .or(Some(
-                tickvault_core::feed::groww::instruments::GROWW_DEFAULT_MAX_SUBSCRIBE,
-            ));
-        info!(
-            max_subscribe = ?groww_max_subscribe,
-            "[feeds] groww_enabled=true — building Groww watch-list (Rust: master + NTM join by ISIN)"
-        );
-        tokio::spawn(async move {
-            let cache_dir = std::path::PathBuf::from("data/groww");
-            let mut attempt: u32 = 0;
-            loop {
-                attempt = attempt.saturating_add(1);
-                match tickvault_core::feed::groww::instruments::build_and_write_groww_watch(
-                    &cache_dir,
-                    &groww_watch_date,
-                    groww_max_subscribe,
-                )
-                .await
-                {
-                    Ok(set) => {
-                        info!(
-                            entries = set.entries.len(),
-                            indices = set.indices,
-                            resolved_stocks = set.resolved_stocks,
-                            unresolved = set.unresolved_stocks.len(),
-                            "[feeds] Groww watch-list ready"
-                        );
-                        break;
-                    }
-                    Err(err) => {
-                        let backoff =
-                            std::cmp::min(10u64.saturating_mul(1u64 << attempt.min(5)), 300);
-                        if attempt <= 3 {
-                            warn!(
-                                ?err,
-                                attempt,
-                                backoff_secs = backoff,
-                                "[feeds] Groww watch-list build failed — retrying"
-                            );
-                        } else {
-                            error!(
-                                ?err,
-                                attempt,
-                                backoff_secs = backoff,
-                                "[feeds] Groww watch-list build still failing — pull-until-success"
-                            );
-                        }
-                        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-                    }
-                }
-            }
-        });
-
-        // Groww sidecar auto-launcher (operator "no manual commands" 2026-06-19).
-        // tickvault itself auto-provisions an isolated Python venv (one-time,
-        // idempotent `python -m venv` + `pip install growwapi pyotp`), fetches the
-        // SSM Groww creds and injects them as env, spawns the producer sidecar, and
-        // supervises it (restart-on-crash with backoff; stop/resume on the runtime
-        // feed toggle). The operator NEVER runs pip/python by hand — flipping
-        // `groww_enabled` (config OR the /api/feeds endpoint) is the only action.
-        // Default OFF; touches NO Dhan path.
-        info!(
-            "[feeds] groww_enabled=true — starting Groww sidecar supervisor \
-             (auto-provisions an isolated Python env + launches/restarts the \
-             producer; no manual commands required)"
-        );
-        tokio::spawn(
-            tickvault_app::groww_sidecar_supervisor::run_groww_sidecar_supervisor(
-                std::sync::Arc::clone(&feed_runtime),
-                tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
-            ),
-        );
-
-        // The Groww lane is now actually running — so the feed-toggle API reports
-        // `groww_lane_running: true` and a runtime toggle genuinely pauses/resumes
-        // it (rather than recording a flag with no lane to act on it).
-        feed_runtime.mark_groww_lane_running();
-    }
+    info!(
+        groww_enabled = feeds.groww_enabled,
+        "[feeds] Groww lanes spawned dormant (bridge + sidecar + activation watcher); \
+         they activate on enable (config OR /api/feeds toggle) with no restart"
+    );
+    tokio::spawn(tickvault_app::groww_bridge::run_groww_bridge(
+        config.questdb.clone(),
+        std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
+        std::sync::Arc::clone(&feed_runtime),
+        std::sync::Arc::clone(&feed_health),
+    ));
+    tokio::spawn(
+        tickvault_app::groww_sidecar_supervisor::run_groww_sidecar_supervisor(
+            std::sync::Arc::clone(&feed_runtime),
+            tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
+        ),
+    );
+    tokio::spawn(
+        tickvault_app::groww_activation::run_groww_activation_watcher(
+            std::sync::Arc::clone(&feed_runtime),
+            config.questdb.clone(),
+            groww_max_subscribe,
+            config.network.request_timeout_ms,
+        ),
+    );
+    // ── Dhan dormant activation watcher (PR-2, feed-toggle-full-lifecycle) ──
+    // Spawned UNCONDITIONALLY at boot (like the Groww watcher), BEFORE the
+    // per-feed Dhan-OFF dispatcher below — so it survives a
+    // Dhan-OFF / Groww-only run (that branch awaits the shutdown signal before it
+    // returns, keeping the runtime alive). It is a level-triggered, safety-gated
+    // reconciler that keeps the `dhan_lane_running` UI flag HONEST across runtime
+    // toggles of a boot-ON Dhan feed and enforces the Dhan-disable safety gate at
+    // the supervisor layer (a second layer behind the handler's CONFLICT). It
+    // mutates ONLY the FeedRuntimeState atomics — NO new WS connection/endpoint
+    // (the 2-WS Dhan lock is untouched). Enabled-default is byte-identical: the
+    // inline Dhan boot block below already calls mark_dhan_lane_running(), so the
+    // watcher's first tick sees desired-ON + already-running → None → it does
+    // NOTHING to the boot. (Honest boundary: the full boot-OFF → cold-start lift
+    // of the inline Dhan boot spine is the deferred residual of this plan; see
+    // dhan_activation.rs module docs — PR-E's in-loop dormancy already handles the
+    // live disconnect/reconnect for a boot-ON Dhan feed.)
+    tokio::spawn(tickvault_app::dhan_activation::run_dhan_activation_watcher(
+        std::sync::Arc::clone(&feed_runtime),
+    ));
     // Step C (pluggable-feed-runtime.md §6): the Dhan disable-gate is now LIVE.
     // The actual skip-and-idle branch is below (just before the Dhan fast/slow
     // boot decision), AFTER shared infra (observability/WAL/calendar) is up so a
@@ -3261,7 +3209,10 @@ async fn main() -> Result<()> {
                             "prev-day OHLCV coverage DEGRADED — symbols missing yesterday's candle"
                         ),
                         PrevDayCoverage::Empty => error!(
+                            code = tickvault_common::error_code::ErrorCode::PrevDay01CoverageEmpty
+                                .code_str(),
                             expected = pd_expected,
+                            skipped = summary.skipped,
                             failed = summary.failed,
                             "prev-day OHLCV coverage EMPTY — no yesterday candles fetched"
                         ),
@@ -7285,6 +7236,37 @@ mod tests {
             gate_idx < dhan_boot_idx,
             "Step C: the per-feed gate must precede the Dhan boot decision so \
              dhan_enabled=false actually skips Dhan (gate@{gate_idx} boot@{dhan_boot_idx})"
+        );
+    }
+
+    /// PR-3 ratchet (3-agent hostile recommendation): the persisted feed-state
+    /// overlay MUST be applied to `config.feeds` BEFORE any boot-skip guard reads
+    /// `feeds.dhan_enabled` / `!feeds.dhan_enabled`. If a future refactor moved a
+    /// boot-skip read above the `overlay_feeds(...)` call, that read would observe
+    /// the pre-overlay config default and silently ignore the operator's persisted
+    /// last toggle choice (the whole point of PR-3) — booting the WRONG feed.
+    #[test]
+    fn test_overlay_precedes_boot_skip_guard() {
+        let src = include_str!("main.rs");
+        let overlay_idx = src
+            .find("overlay_feeds(")
+            .expect("the feed-state overlay call must exist");
+        // The first boot-skip guard that reads the per-feed enabled flag. Both
+        // conditional forms gate the Dhan boot path; whichever appears first must
+        // still come AFTER the overlay has been applied.
+        let first_enabled_guard = src.find("if feeds.dhan_enabled");
+        let first_disabled_guard = src.find("if !feeds.dhan_enabled");
+        let first_guard_idx = [first_enabled_guard, first_disabled_guard]
+            .into_iter()
+            .flatten()
+            .min()
+            .expect("a `feeds.dhan_enabled` boot-skip guard must exist");
+        assert!(
+            overlay_idx < first_guard_idx,
+            "overlay_feeds(...) (@{overlay_idx}) must precede the first \
+             feeds.dhan_enabled boot-skip guard (@{first_guard_idx}) so the \
+             boot reads the post-overlay effective feed state, not the config \
+             default"
         );
     }
 

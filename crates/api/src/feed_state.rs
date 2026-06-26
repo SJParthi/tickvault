@@ -7,10 +7,16 @@
 //! pause/resume a feed mid-session with no restart. The flags are lock-free
 //! `AtomicBool`s: O(1), zero-alloc reads on the lane's hot loop.
 //!
-//! **Honest envelope (slice 1):** only Groww is runtime-toggleable. Disabling the
-//! primary Dhan trading feed mid-session is unsafe, so the endpoint rejects
-//! `POST /api/feeds/dhan` (Dhan stays config+restart, per Step C). Dhan's flag is
-//! still reported by `GET /api/feeds` for visibility.
+//! **Honest envelope (PR-E / PR-2):** BOTH Dhan and Groww are runtime-toggleable.
+//! The Dhan *disable* direction is safety-gated — `POST /api/feeds/dhan {enabled:
+//! false}` is permitted only while `can_disable_dhan()` is true (the no-orders
+//! data-pull phase); once live trading is on it returns `409 CONFLICT` so the feed
+//! can never be blinded mid-trade. Enabling Dhan is always allowed. For a Dhan
+//! feed that was ENABLED at boot, a toggle is a true live pause/resume (PR-E
+//! in-loop dormancy). For a Dhan feed that was OFF at boot, no main-feed pool was
+//! spawned, so the `dhan_pool_present` sentinel stays false and a runtime enable
+//! records the desired flag WITHOUT marking the lane running (no false-OK) — a
+//! restart with `dhan_enabled=true` is the documented path to actually stream.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,6 +64,15 @@ pub struct FeedRuntimeState {
     groww_lane_running: AtomicBool,
     /// PR-E: set once by the boot wiring when the Dhan main-feed pool is spawned.
     dhan_lane_running: AtomicBool,
+    /// PR-2: set TRUE exactly where the inline Dhan boot spine spawned the
+    /// main-feed WS pool at boot (i.e. `dhan_enabled` was true AT BOOT). This is
+    /// the "a real pool exists for PR-E's in-loop dormancy to resume" sentinel,
+    /// distinct from `dhan_lane_running` (a transient UI flag the watcher
+    /// toggles). On a boot-OFF run (Dhan disabled at boot, e.g. Groww-only) NO
+    /// pool is spawned, so this stays `false` and a runtime enable must NOT mark
+    /// the lane running — that would be a false-OK (`dhan_lane_running=true` with
+    /// zero connections / zero ticks). Default `false`.
+    dhan_pool_present: AtomicBool,
     /// PR-E: gate on the Dhan *disable* direction (orders-live safety). Seeded
     /// from `dry_run` at boot; defaults `true` (no-orders phase).
     dhan_disable_allowed: AtomicBool,
@@ -77,6 +92,8 @@ impl FeedRuntimeState {
             // The lane is not running until the boot wiring spawns it.
             groww_lane_running: AtomicBool::new(false),
             dhan_lane_running: AtomicBool::new(false),
+            // No pool until the inline Dhan boot spine spawns one (boot-ON only).
+            dhan_pool_present: AtomicBool::new(false),
             dhan_disable_allowed: AtomicBool::new(true),
         }
     }
@@ -100,6 +117,34 @@ impl FeedRuntimeState {
         self.dhan_lane_running.load(Ordering::Relaxed)
     }
 
+    /// PR-2: the inline Dhan boot spine marks that it actually spawned the
+    /// main-feed WS pool at boot (the boot-ON case). Called from the SAME boot
+    /// block that calls [`Self::mark_dhan_lane_running`]. Idempotent.
+    pub fn mark_dhan_pool_present(&self) {
+        self.dhan_pool_present.store(true, Ordering::Relaxed);
+    }
+
+    /// PR-2: does a real Dhan main-feed pool exist this process (spawned at
+    /// boot)? The Dhan activation watcher reads this to refuse marking the lane
+    /// running on a runtime enable when NO pool was ever spawned (boot-OFF run) —
+    /// closing the false-OK where `dhan_lane_running` would claim `true` with zero
+    /// connections. `true` only after a boot-ON Dhan boot spine ran.
+    #[must_use]
+    pub fn is_dhan_pool_present(&self) -> bool {
+        self.dhan_pool_present.load(Ordering::Relaxed)
+    }
+
+    /// PR-2: set the Dhan lane-running flag BOTH ways. `mark_dhan_lane_running`
+    /// (the inline boot's one-way `true`) stays; this is the two-way setter the
+    /// dormant Dhan activation watcher (`dhan_activation`) uses to keep the feed
+    /// page honest across runtime toggles — `true` once the lane is (re)activated,
+    /// `false` on a runtime disable — so the page never shows a stale "running"
+    /// after a teardown (mirrors `set_groww_lane_running`).
+    pub fn set_dhan_lane_running(&self, running: bool) {
+        // Relaxed: UI-status-only flag; no ordering dependency with other shared state.
+        self.dhan_lane_running.store(running, Ordering::Relaxed);
+    }
+
     /// PR-E: narrow the Dhan-disable safety gate (boot wires this to `dry_run`).
     pub fn set_dhan_disable_allowed(&self, allowed: bool) {
         self.dhan_disable_allowed.store(allowed, Ordering::Relaxed);
@@ -116,7 +161,17 @@ impl FeedRuntimeState {
     /// Called once by the boot wiring when the Groww bridge task is spawned, so
     /// the API can report honestly whether a runtime toggle will take effect.
     pub fn mark_groww_lane_running(&self) {
-        self.groww_lane_running.store(true, Ordering::Relaxed);
+        self.set_groww_lane_running(true);
+    }
+
+    /// Set the Groww lane-running flag both ways. The activation watcher
+    /// (`groww_activation`) sets it `true` on the enable rising-edge once the
+    /// tables + watch-list are ready, and `false` on the disable falling-edge —
+    /// so the feed page reports "running" iff the lane is actually live, never a
+    /// false-OK and never a stale DEGRADED after a runtime cold-start.
+    pub fn set_groww_lane_running(&self, running: bool) {
+        // Relaxed: UI-status-only flag; no ordering dependency with other shared state.
+        self.groww_lane_running.store(running, Ordering::Relaxed);
     }
 
     /// Whether the Groww bridge task was spawned this process (see [`FeedStatus`]).
@@ -324,6 +379,42 @@ mod tests {
     }
 
     #[test]
+    fn test_dhan_pool_present_sentinel() {
+        // PR-2 false-OK fix: tests mark_dhan_pool_present + is_dhan_pool_present.
+        // Default/boot-OFF: no pool present, so a runtime enable must NOT mark the
+        // lane running (the watcher gates on this). Boot-ON: the inline spine marks
+        // it, so the watcher may mark the lane running. This is the sentinel that
+        // distinguishes "a real pool exists to resume" from "nothing to resume".
+        let state = FeedRuntimeState::default();
+        assert!(
+            !state.is_dhan_pool_present(),
+            "default/boot-OFF: no pool spawned"
+        );
+        state.mark_dhan_pool_present();
+        assert!(
+            state.is_dhan_pool_present(),
+            "boot-ON: inline spine marked the pool present"
+        );
+    }
+
+    #[test]
+    fn test_set_dhan_lane_running_toggles_both_ways() {
+        // PR-2: the Dhan activation watcher sets the flag true on the enable
+        // (re)activation and false on a runtime disable. Both directions must
+        // round-trip — the disable path is what clears a stale "running" so the
+        // feed page never lies after a teardown (mirrors set_groww_lane_running).
+        let state = FeedRuntimeState::default();
+        // Default mirrors prod: NOT running until the boot wiring / watcher marks it.
+        assert!(!state.is_dhan_lane_running(), "default not running");
+        state.set_dhan_lane_running(true);
+        assert!(state.is_dhan_lane_running(), "set true => running");
+        assert!(state.snapshot().dhan_lane_running);
+        state.set_dhan_lane_running(false);
+        assert!(!state.is_dhan_lane_running(), "set false => stopped");
+        assert!(!state.snapshot().dhan_lane_running);
+    }
+
+    #[test]
     fn test_mark_groww_lane_running_then_is_groww_lane_running_true() {
         // Honest signal (3-agent hostile review): the lane is NOT running until
         // the boot wiring spawns it. A runtime enable on a non-running lane is
@@ -334,6 +425,22 @@ mod tests {
         state.mark_groww_lane_running();
         assert!(state.is_groww_lane_running());
         assert!(state.snapshot().groww_lane_running);
+    }
+
+    #[test]
+    fn test_set_groww_lane_running_toggles_both_ways() {
+        // The activation watcher sets the flag true on the enable rising edge
+        // (after the watch-list builds) and false on the disable falling edge.
+        // Both directions must round-trip — the disable path is what clears a
+        // stale "running" so the feed page never lies after a teardown.
+        let state = FeedRuntimeState::default();
+        assert!(!state.is_groww_lane_running(), "default not running");
+        state.set_groww_lane_running(true);
+        assert!(state.is_groww_lane_running(), "set true => running");
+        assert!(state.snapshot().groww_lane_running);
+        state.set_groww_lane_running(false);
+        assert!(!state.is_groww_lane_running(), "set false => stopped");
+        assert!(!state.snapshot().groww_lane_running);
     }
 
     #[test]

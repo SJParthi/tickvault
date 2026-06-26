@@ -35,6 +35,7 @@
 #![allow(clippy::doc_overindented_list_items)]
 
 pub mod feed_state;
+pub mod feed_state_persist;
 pub mod handlers;
 pub mod middleware;
 pub mod state;

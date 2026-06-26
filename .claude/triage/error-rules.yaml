@@ -1697,3 +1697,22 @@ rules:
       rotate token / fix base-URL override). Fires at most 3 times per
       trading day by construction (3 fixed probe times). The operator reads
       the body + url fields in the error payload per the runbook triage.
+
+  - name: prevday-01-coverage-empty-escalate
+    match:
+      code: PREVDAY-01
+    action: escalate
+    runbook_path: .claude/rules/project/prev-day-ohlcv-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      PREVDAY-01 = the boot-time previous-day OHLCV fetch returned ZERO
+      yesterday candles for the subscribed universe (PrevDayCoverage::Empty).
+      Severity::High, NOT auto-fixable from the app: the cause is upstream
+      (Dhan 200-with-empty-body for every symbol — data-plan / market-closed /
+      far-OTM — or an empty universe build). Boot is fail-soft and never
+      blocks; the prev-day reference cache simply has no rows until the next
+      successful boot, so the *_pct_from_prev_day columns read 0. The operator
+      inspects tv_prev_day_ohlcv_empty_total + the REST canary + the
+      universe-build codes per the runbook, then acts upstream (Dhan portal /
+      scope). Fires at most once per boot.
