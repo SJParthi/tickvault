@@ -1172,20 +1172,31 @@ async fn main() -> Result<()> {
     if !config.feeds.dhan_enabled {
         if config.feeds.groww_enabled {
             info!(
-                "GROWW-ONLY MODE — Dhan boot skipped; Groww lane running, awaiting shutdown signal"
+                "GROWW-ONLY MODE — Dhan boot skipped; Groww lane running, shared infra (API + \
+                 seal-writer + aggregator) coming up"
             );
         } else {
             warn!(
                 "NO FEED ENABLED — both dhan_enabled and groww_enabled are false; \
-                 idle runtime (shared infra only), awaiting shutdown signal"
+                 shared-infra-only runtime (API + seal-writer + aggregator) coming up"
             );
         }
-        let signal = wait_for_shutdown_signal().await;
-        info!(
-            signal,
-            "shutdown signal received — per-feed idle runtime exiting cleanly"
-        );
-        return Ok(());
+        // D2-pre (behaviour-identical hoist): the Dhan-OFF path no longer bare
+        // early-returns. It now brings up the PROCESS-shared infra (HTTP API
+        // server incl. /api/feeds, the candle seal-writer + 21-TF aggregator
+        // Groww candles seal through, and the main run-loop) and only THEN
+        // returns. NO Dhan auth, NO instrument fetch, NO Dhan WebSocket — the
+        // OFF-feed-isolation guarantee is preserved; this returns BEFORE the
+        // Dhan auth/instrument-load below.
+        return run_shared_infra_only(
+            &config,
+            std::sync::Arc::clone(&feed_runtime),
+            std::sync::Arc::clone(&feed_health),
+            std::sync::Arc::clone(&trading_calendar),
+            std::sync::Arc::clone(&prev_day_cache),
+            otel_provider,
+        )
+        .await;
     }
 
     let fast_cache = token_cache::load_token_cache_fast();
@@ -6689,6 +6700,148 @@ fn spawn_engine_b_aggregator(
         }
     });
     tracing::info!("candle-engine #T1b — IST-midnight force-seal task spawned");
+}
+
+// ---------------------------------------------------------------------------
+// D2-pre: PROCESS-shared infra for the Dhan-OFF boot path
+// ---------------------------------------------------------------------------
+//
+// Behaviour-identical HOIST (`active-plan-dhan-cold-start-d2.md` §1.0). The
+// Dhan-ON boot path is UNTOUCHED — it still builds the API server, seal-writer,
+// 21-TF aggregator, and run-loop inline (byte-identical). This function is the
+// Dhan-OFF mirror: it brings up the SAME PROCESS-shared infra so a Dhan-OFF boot
+// is no longer a bare early-return.
+//
+// Why this exists (adversarial review C1/C2, 2026-06-26):
+//   • The HTTP API server (incl. the `/api/feeds` toggle routes) previously
+//     spawned ONLY inside the Dhan block — so a Dhan-OFF boot had NO API server
+//     and the `/api/feeds` endpoint did not exist (C1).
+//   • The candle seal-writer installs the process-wide `global_seal_sender`. The
+//     Groww feed routes its sealed candles through that SAME singleton
+//     (`groww_bridge.rs`). With Dhan OFF the seal-writer never ran, so Groww
+//     candles silently never sealed (C2).
+//
+// This function fixes BOTH for the Dhan-OFF path. It does NOT spawn any Dhan
+// WebSocket, does NOT authenticate, and does NOT fetch instruments — the
+// per-feed OFF-isolation guarantee (operator lock 2026-06-23) is preserved.
+// It adds NO new WebSocket endpoint (the 2-WS Dhan lock is untouched).
+//
+// It is NOT a runtime cold-start path: no Dhan lane is started here. The full
+// boot-OFF → runtime cold-start of the Dhan spine is the deferred residual
+// tracked as D2a/D2b.
+#[allow(clippy::too_many_arguments)] // APPROVED: process-shared infra requires the captured boot state
+async fn run_shared_infra_only(
+    config: &ApplicationConfig,
+    feed_runtime: std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
+    feed_health: std::sync::Arc<tickvault_common::feed_health::FeedHealthRegistry>,
+    trading_calendar: std::sync::Arc<TradingCalendar>,
+    prev_day_cache: std::sync::Arc<tickvault_trading::in_mem::PrevDayCache>,
+    otel_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+) -> Result<()> {
+    // --- Notifier (strict; same policy as the slow-boot path) ---
+    let notifier = match NotificationService::initialize_strict(&config.notification).await {
+        Ok(n) => n,
+        Err(reason) => {
+            error!(
+                reason = %reason,
+                "SHARED-INFRA BOOT: strict notifier init failed — REFUSING BOOT (systemd will restart)"
+            );
+            return Err(anyhow::anyhow!(reason));
+        }
+    };
+    let notifier = if config.features.telegram_bucket_coalescer {
+        NotificationService::enable_coalescer(
+            notifier,
+            tickvault_core::notification::CoalescerConfig::default(),
+        )
+    } else {
+        notifier
+    };
+
+    // --- Health registry (drives /health + /api/feeds/health) ---
+    let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
+
+    // --- Tick + order-update broadcast channels (PROCESS-shared) ---
+    // Held for the process lifetime so the aggregator subscriber never wakes on
+    // a disconnected channel. With Dhan OFF nothing publishes Dhan ticks into
+    // the tick broadcast, but the channel + aggregator still run so the wiring
+    // is identical to the Dhan-ON path (Groww runs its OWN aggregator instance).
+    let (tick_broadcast_sender, _tick_broadcast_default_rx) =
+        tokio::sync::broadcast::channel::<tickvault_common::tick_types::ParsedTick>(
+            tickvault_common::constants::TICK_BROADCAST_CAPACITY,
+        );
+    let (_order_update_sender, _order_update_receiver) =
+        tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(
+            tickvault_common::constants::ORDER_UPDATE_BROADCAST_CAPACITY,
+        );
+
+    // --- Seal-writer + 21-TF aggregator (PROCESS-shared candle pipeline) ---
+    // The seal-writer installs the process-wide `global_seal_sender` the Groww
+    // feed routes its sealed candles through (C2 fix). The Engine-B aggregator
+    // is the Dhan-feed candle engine; with Dhan OFF it idles on the empty tick
+    // broadcast (harmless) — Groww seals via its own aggregator instance.
+    spawn_seal_writer_loop(&config.questdb);
+    spawn_engine_b_aggregator(
+        &tick_broadcast_sender,
+        std::sync::Arc::clone(&prev_day_cache),
+        std::sync::Arc::clone(&trading_calendar),
+    );
+    info!("SHARED-INFRA BOOT: seal-writer + 21-TF aggregator running (Groww candles can seal)");
+
+    // --- HTTP API server (incl. /api/feeds toggle routes) — C1 fix ---
+    let api_state = SharedAppState::new_with_feed_runtime_and_health(
+        config.questdb.clone(),
+        config.dhan.clone(),
+        config.instrument.clone(),
+        std::sync::Arc::clone(&health_status),
+        std::sync::Arc::clone(&feed_runtime),
+        std::sync::Arc::clone(&feed_health),
+    );
+    let api_bearer_token = tickvault_core::auth::secret_manager::fetch_api_bearer_token()
+        .await
+        .context("GAP-SEC-01: SSM fetch for API bearer token failed at /tickvault/<env>/api/bearer-token — store the token via `aws ssm put-parameter --name /tickvault/<env>/api/bearer-token --type SecureString`")?;
+    info!("GAP-SEC-01: API bearer token loaded from SSM (/tickvault/<env>/api/bearer-token)");
+    let api_auth_config = tickvault_api::middleware::ApiAuthConfig::from_token(api_bearer_token);
+    let router = tickvault_api::build_router_with_auth(
+        api_state,
+        &config.api.allowed_origins,
+        api_auth_config,
+        config.strategy.dry_run,
+    );
+    let bind_addr: SocketAddr = format_bind_addr(&config.api.host, config.api.port)
+        .parse()
+        .context("invalid API bind address")?;
+    let listener = tokio::net::TcpListener::bind(bind_addr)
+        .await
+        .context("failed to bind API server")?;
+    info!(address = %bind_addr, "SHARED-INFRA BOOT: API server listening (/api/feeds reachable with Dhan OFF)");
+    let api_handle = tokio::spawn(async move {
+        if let Err(err) = axum::serve(listener, router).await {
+            error!(?err, "API server error");
+        }
+    });
+
+    // --- Main run-loop (PROCESS) ---
+    info!(
+        api_port = config.api.port,
+        groww_enabled = config.feeds.groww_enabled,
+        "SHARED-INFRA BOOT: shared runtime ready (Dhan OFF) — awaiting shutdown signal"
+    );
+    notifier.notify(NotificationEvent::StartupComplete {
+        mode: "SHARED-INFRA (Dhan OFF)",
+    });
+    let signal = wait_for_shutdown_signal().await;
+    info!(
+        signal,
+        "shutdown signal received — shared-infra runtime exiting cleanly"
+    );
+    notifier.notify(NotificationEvent::ShutdownInitiated);
+
+    // --- Graceful teardown of the PROCESS handles brought up here ---
+    api_handle.abort();
+    drop(otel_provider);
+    info!("tickvault stopped (shared-infra / Dhan-OFF runtime)");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

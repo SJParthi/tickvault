@@ -297,14 +297,20 @@ fn dhan_auth_and_universe_exist_so_the_gate_actually_wraps_work() {
 }
 
 #[test]
-fn dhan_off_early_returns_before_auth_and_instruments() {
+fn dhan_off_returns_before_auth_and_instruments() {
     // STRENGTHENED proof (operator 2026-06-23 "strengthen it"): it is not enough
-    // that the gate AND the work both exist — the OFF path must EARLY-RETURN
-    // *before* Dhan auth and instrument load are ever reached. We prove this
-    // positionally: the `if !config.feeds.dhan_enabled { … return … }` skip
-    // block appears, and a `return` lives BETWEEN that guard and the Dhan auth
-    // step. So when Dhan is OFF the function exits before touching auth /
-    // instruments — they are unreachable, not merely "behind an if".
+    // that the gate AND the work both exist — the OFF path must RETURN *before*
+    // Dhan auth and instrument load are ever reached. We prove this positionally:
+    // the `if !config.feeds.dhan_enabled { … return … }` skip block appears, and a
+    // `return` lives BETWEEN that guard and the Dhan auth step. So when Dhan is OFF
+    // the function exits before touching auth / instruments — they are unreachable,
+    // not merely "behind an if".
+    //
+    // D2-pre (behaviour-identical hoist, 2026-06-26): the OFF block now RETURNS the
+    // PROCESS-shared-infra runtime (`return run_shared_infra_only(...).await;`)
+    // instead of a bare `return Ok(())`. It still returns BEFORE auth/instruments
+    // (proven below) and `run_shared_infra_only` itself does NO Dhan auth, NO
+    // instrument fetch, NO Dhan WebSocket — so the OFF-isolation guarantee holds.
     let src = read_main_rs();
 
     let guard = src
@@ -328,13 +334,97 @@ fn dhan_off_early_returns_before_auth_and_instruments() {
         "the Dhan OFF skip-guard MUST appear before the Dhan instrument load — so OFF \
          never fetches/builds instruments."
     );
-    // The OFF block must EARLY-RETURN before auth: a `return` must sit between
-    // the guard and the auth step. Without it, OFF would fall through to auth.
+    // The OFF block must RETURN before auth: a `return` must sit between the guard
+    // and the auth step. Without it, OFF would fall through to auth.
     let between_guard_and_auth = &src[guard..auth];
     assert!(
-        between_guard_and_auth.contains("return Ok(())"),
-        "the `if !config.feeds.dhan_enabled` block MUST early-return (return Ok(())) \
-         before Dhan auth — proving OFF runs ZERO auth + instrument work (operator \
-         lock 2026-06-23: OFF feed = entire architecture untouched)."
+        between_guard_and_auth.contains("return run_shared_infra_only(")
+            || between_guard_and_auth.contains("return Ok(())"),
+        "the `if !config.feeds.dhan_enabled` block MUST return (the shared-infra-only \
+         runtime, or Ok(())) before Dhan auth — proving OFF runs ZERO auth + instrument \
+         work (operator lock 2026-06-23: OFF feed = entire architecture untouched)."
     );
+
+    // D2-pre: the shared-infra function the OFF block returns must NOT itself reach
+    // Dhan auth or instrument load — the OFF-isolation guarantee survives the hoist.
+    let shared = src
+        .find("async fn run_shared_infra_only(")
+        .expect("run_shared_infra_only must exist (D2-pre shared-infra hoist)");
+    let shared_body_end = src[shared..]
+        .find("\nasync fn run_shutdown_fast(")
+        .map(|rel| shared + rel)
+        .unwrap_or(src.len());
+    let shared_body = &src[shared..shared_body_end];
+    assert!(
+        !shared_body.contains("authenticating with Dhan")
+            && !shared_body.contains("load_instruments")
+            && !shared_body.contains("TokenManager::initialize")
+            && !shared_body.contains("create_websocket_pool"),
+        "run_shared_infra_only MUST NOT authenticate, fetch instruments, or spawn a \
+         Dhan WebSocket — it brings up ONLY the PROCESS-shared infra (API server, \
+         seal-writer, aggregator, run-loop). The OFF-feed-isolation guarantee + the \
+         2-WS Dhan lock both hold."
+    );
+}
+
+#[test]
+fn api_server_up_in_dhan_off_mode() {
+    // D2-pre (C1 fix, 2026-06-26): a Dhan-OFF boot must STILL bring up the HTTP
+    // API server (so the `/api/feeds` toggle endpoint is reachable) + the candle
+    // seal-writer (so Groww candles seal — C2) + the main run-loop. Before the
+    // hoist, all of that spawned ONLY inside the Dhan block, so a Dhan-OFF boot
+    // had no API server and `/api/feeds` did not exist.
+    //
+    // SOURCE-SCAN ratchet: the Dhan-OFF branch must return a function that builds
+    // the API server (axum::serve), the seal-writer, the aggregator, and the
+    // run-loop — proving the shared infra is up on the Dhan-OFF path.
+    let src = read_main_rs();
+
+    // (1) The OFF branch routes to the shared-infra runtime (not a bare return).
+    let guard = src
+        .find("if !config.feeds.dhan_enabled")
+        .expect("the Dhan OFF skip-guard must exist");
+    let after_guard = &src[guard..];
+    assert!(
+        after_guard
+            .find("return run_shared_infra_only(")
+            .map(|pos| {
+                // The route must be the FIRST thing the OFF block does after its
+                // logging — well before any fall-through.
+                pos < after_guard
+                    .find("let fast_cache")
+                    .unwrap_or(after_guard.len())
+            })
+            .unwrap_or(false),
+        "the `if !config.feeds.dhan_enabled` block MUST `return run_shared_infra_only(...)` \
+         so a Dhan-OFF boot brings up the PROCESS-shared infra (API server + seal-writer \
+         + aggregator + run-loop) instead of bare-returning."
+    );
+
+    // (2) The shared-infra function must actually spawn the API server, the
+    // seal-writer, the aggregator, and the run-loop.
+    let shared = src
+        .find("async fn run_shared_infra_only(")
+        .expect("run_shared_infra_only must exist (D2-pre)");
+    let shared_body_end = src[shared..]
+        .find("\nasync fn run_shutdown_fast(")
+        .map(|rel| shared + rel)
+        .unwrap_or(src.len());
+    let body = &src[shared..shared_body_end];
+    for (needle, what) in [
+        ("axum::serve", "the HTTP API server"),
+        ("build_router_with_auth", "the /api/feeds toggle routes"),
+        (
+            "spawn_seal_writer_loop",
+            "the candle seal-writer (Groww candles seal — C2)",
+        ),
+        ("spawn_engine_b_aggregator", "the 21-TF aggregator"),
+        ("wait_for_shutdown_signal", "the main run-loop"),
+    ] {
+        assert!(
+            body.contains(needle),
+            "run_shared_infra_only MUST bring up {what} (`{needle}`) so a Dhan-OFF boot \
+             has the PROCESS-shared infra running (C1/C2 fix)."
+        );
+    }
 }
