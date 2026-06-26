@@ -89,8 +89,8 @@ Today those are inlined in the linear boot. They must be extracted into
     `None` (no teardown) AND the handler returns CONFLICT — two-layer defence; pure-tested.
   - **Toggle storm ON→OFF→ON** — level-triggered reconciler converges to the final state
     (no missed edge); proven by `reconcile_dhan_lane_action_sub_poll_flap_converges_no_missed_edge`.
-- [ ] **PR-3 (B, persist):** `data/feed-state.json` overlay (atomic write on toggle,
-  boot overlay-read); GAP-SEC-01 protected; ratchet test.
+- [x] **PR-3 (B, persist):** `data/feed-state.json` overlay (atomic write on toggle,
+  boot overlay-read); GAP-SEC-01 protected; ratchet test. Merged as #1201.
   **Design doc:** scratchpad `pr3-persist-design.md` (committed alongside).
   **Concrete files:**
   - `crates/api/src/feed_state_persist.rs` [NEW] — `PersistedFeedState` serde struct
@@ -134,9 +134,50 @@ Today those are inlined in the linear boot. They must be extracted into
     default. The overlay never half-applies one flag.
   - **Path traversal** — structurally impossible (both path components are fixed `&'static str`
     constants); `validate_feed_state_path` rejects any non-canonical path and the test pins it.
-- [ ] **PR-4 (guards):** update the #1192 boot-isolation guard to the "no work while OFF"
-  invariant; add cold-start/teardown integration + chaos tests (toggle storm, sidecar
-  crash-on-start, auth-fail-on-cold-start, double-toggle idempotency).
+- [x] **PR-4 (guards):** strengthen the #1192 boot-isolation guard to the "no work while OFF"
+  invariant; add deterministic cold-start/teardown lifecycle + chaos guard tests (toggle
+  storm convergence, crash-on-start dead-activation re-Start, double-toggle idempotency,
+  Dhan disable-storm safety gate). PURE-function sequence guards (no live QuestDB/Dhan/Groww)
+  driving the existing `reconcile_*lane_action` / `reconcile_dhan_lane_action_with_gate` /
+  `is_dead_activation` / `start_marks_running` decisions + the `FeedRuntimeState` flag round-trips
+  through hostile sequences — proving the decision logic CONVERGES and is IDEMPOTENT under flapping
+  (the real regression class: missed edge, double-spawn, torn-down-mid-trade, dead-lane-never-restarted).
+  **Design doc:** scratchpad `pr4-guards-design.md` (committed alongside).
+  **Concrete files:**
+  - `crates/app/tests/feed_toggle_lifecycle_guard.rs` [NEW] — deterministic watcher-step model
+    (`step_groww` / `step_dhan` reconcile-one-iteration helpers, no I/O) driving flap sequences.
+  - `crates/app/tests/per_feed_boot_isolation_guard.rs` — one added "no Start while OFF" pure
+    assertion alongside the existing source-scan guards (#1192 source-scan invariants kept intact).
+  **Named tests** (in `feed_toggle_lifecycle_guard.rs`):
+  `groww_toggle_storm_converges_to_final_on`, `groww_toggle_storm_converges_to_final_off`,
+  `dhan_toggle_storm_converges_with_gate_open`, `dhan_toggle_storm_no_double_start`,
+  `groww_dead_activation_triggers_exactly_one_restart`, `dhan_stale_flag_reconverges_then_idles`,
+  `dead_activation_never_restarts_a_running_lane`,
+  `groww_double_enable_is_idempotent`, `groww_double_disable_is_idempotent`,
+  `dhan_double_enable_is_idempotent`, `dhan_double_disable_is_idempotent`,
+  `feed_runtime_lane_flag_round_trips_idempotently`,
+  `off_groww_feed_takes_no_start_action_in_any_state`,
+  `off_dhan_feed_takes_no_start_action_even_with_gate_states`,
+  `dhan_disable_storm_never_tears_down_while_live`,
+  `dhan_disable_storm_tears_down_once_gate_opens`.
+  **Plus** in `per_feed_boot_isolation_guard.rs`: `off_feed_reconciler_never_emits_start`.
+  ### PR-4 Failure Modes (lifecycle guards)
+  - **Toggle storm ON→OFF→ON faster than the 2s poll** — modeled as a level-value sequence; the
+    reconciler converges to the final desired state (no missed edge, no double-Start). Proven by
+    `*_toggle_storm_converges_*` + `dhan_toggle_storm_no_double_start`.
+  - **Crash-on-start (task panics / early-returns before marking running)** — `is_dead_activation`
+    fires → handle cleared → exactly ONE bounded re-Start; the success path (finished AFTER running)
+    never re-Starts. Proven by `groww_dead_activation_triggers_exactly_one_restart`,
+    `dhan_stale_flag_reconverges_then_idles`, `dead_activation_never_restarts_a_running_lane`.
+  - **Double toggle (double ON / double OFF)** — idempotent: second identical poll yields `None`;
+    `set_*_lane_running` round-trips with no extra effect. Proven by the four `*_double_*_idempotent`
+    tests + `feed_runtime_lane_flag_round_trips_idempotently`.
+  - **OFF feed does work** — an OFF feed's reconciler never emits `Start` in any state it can reach,
+    so the dormant watcher takes ZERO cold-start action while OFF. Proven by the two
+    `off_*_feed_takes_no_start_action_*` tests + the source-scan #1192 guard.
+  - **Dhan disable storm while live trading is on** — every Stop is downgraded to None by the gate;
+    the lane is NEVER torn down mid-trade, and DOES tear down the moment the gate re-opens. Proven by
+    `dhan_disable_storm_never_tears_down_while_live` + `dhan_disable_storm_tears_down_once_gate_opens`.
 
 ## Edge cases / worst cases (must cover)
 - Toggle ON then OFF before cold-start finishes (cancel-safe).
@@ -174,6 +215,10 @@ Today those are inlined in the linear boot. They must be extracted into
   `set_groww_lane_running` round-trip test + the 5-assertion boot-isolation guard
   (`groww_lanes_spawn_dormant_and_self_idle_on_the_enable_flag`) proving unconditional
   dormant spawn, self-idle, owned-JoinHandle+abort lifecycle, and no-false-OK ordering.
+  PR-4 shipped: deterministic toggle-storm / dead-activation / double-toggle-idempotency /
+  no-work-while-OFF / Dhan disable-storm safety-gate guards in
+  `feed_toggle_lifecycle_guard.rs` + the `off_feed_reconciler_never_emits_start` assertion
+  in the #1192 boot-isolation guard — all PURE-function sequence guards (no live services).
 
 ## Rollback
 - Feature-flagged supervisor; revert per PR. Persistence overlay is additive (delete the
