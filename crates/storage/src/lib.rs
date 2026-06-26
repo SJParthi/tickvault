@@ -149,6 +149,10 @@ pub mod seal_spill;
 pub mod seal_writer_loop;
 pub mod seal_writer_runner;
 pub mod seal_writer_task;
+// SP4 (groww-live-backtest-parity): the ONE feed-parameterized candle writer,
+// named as an explicit `GenericCandle1mWriter(feed)` facade over the per-seal
+// `ShadowCandleWriter` (the already-converged shared seal-writer chain).
+pub mod generic_candle_writer;
 pub mod shadow_candle_writer;
 pub mod shadow_persistence;
 pub mod shadow_seal_columns;
