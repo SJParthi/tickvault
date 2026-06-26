@@ -59,9 +59,36 @@ Today those are inlined in the linear boot. They must be extracted into
   crates/app/src/main.rs, crates/app/src/lib.rs, crates/api/src/feed_state.rs,
   crates/app/tests/per_feed_boot_isolation_guard.rs. Tests: test_reconcile_lane_action_*,
   test_set_groww_lane_running_toggles_both_ways, groww_lanes_spawn_dormant_and_self_idle_on_the_enable_flag.)
-- [ ] **PR-2 (A, Dhan):** extract `start_dhan_lane`/`stop_dhan_lane` (auth+universe+WS
-  pool); dormant supervisor; honor `dhan_disable_allowed`. (Bigger — Dhan boot is the
-  linear spine.)
+- [ ] **PR-2 (A, Dhan):** dormant `run_dhan_activation_watcher` spawned UNCONDITIONALLY at
+  boot; a level-triggered + **safety-gated** reconciler (`reconcile_dhan_lane_action_with_gate`
+  downgrades `Stop`→`None` while `can_disable_dhan()==false`) drives `start_dhan_lane` /
+  `stop_dhan_lane`, keeping the `dhan_lane_running` UI flag honest across runtime toggles.
+  PR-E (#1170) already shipped the in-loop runtime disconnect/reconnect for a boot-ON Dhan
+  feed (`with_feed_enable_flag` in `connection.rs`); PR-2 adds the dormant supervisor +
+  honest UI-flag lifecycle + the supervisor-side safety gate, mirroring PR-1's SHAPE.
+  **Honest boundary (no illusion, anti-pattern Rule 14 respected):** the FULL boot-OFF→
+  cold-start lift of the ~4000-line inline Dhan boot spine (auth → daily-universe → WS pool)
+  out of `main()` is the documented RESIDUAL — that lift is a multi-day refactor on the
+  SEBI trading spine and is NOT claimed done here; PR-2's pub fns all have REAL call sites
+  doing REAL work (truthful flag + supervisor-side disable gate), not a skeleton.
+  **Enabled-default byte-identical:** the inline Dhan boot block is UNCHANGED; the watcher's
+  first tick sees desired-ON + already-running → `LaneAction::None` → does nothing to boot.
+  (Files: crates/app/src/dhan_activation.rs [NEW], crates/app/src/main.rs [watcher spawn
+  only], crates/app/src/lib.rs, crates/api/src/feed_state.rs [set_dhan_lane_running],
+  crates/api/src/handlers/feeds.rs [enable message], crates/app/tests/per_feed_boot_isolation_guard.rs.
+  Tests: reconcile_dhan_lane_action_* (incl. _with_gate_* + _sub_poll_flap_converges),
+  is_dead_activation_* , test_set_dhan_lane_running_toggles_both_ways,
+  dhan_disable_refused_while_orders_live, dhan_lanes_spawn_dormant_and_self_idle.)
+  ### PR-2 Failure Modes (Dhan cold-start)
+  - **Auth fails on cold-start** — deferred-residual: the inline boot's existing auth-error
+    path (notify + `return`) is UNCHANGED for enabled-default; the boot-OFF→cold-start auth
+    is part of the deferred spine-lift, not claimed here.
+  - **Daily-universe build fails (INSTR-FETCH-*)** — unchanged inline fail-closed behaviour.
+  - **WS-pool spawn fails** — unchanged inline behaviour.
+  - **Disable refused by safety gate** — `reconcile_dhan_lane_action_with_gate` returns
+    `None` (no teardown) AND the handler returns CONFLICT — two-layer defence; pure-tested.
+  - **Toggle storm ON→OFF→ON** — level-triggered reconciler converges to the final state
+    (no missed edge); proven by `reconcile_dhan_lane_action_sub_poll_flap_converges_no_missed_edge`.
 - [ ] **PR-3 (B, persist):** `data/feed-state.json` overlay (atomic write on toggle,
   boot overlay-read); GAP-SEC-01 protected; ratchet test.
 - [ ] **PR-4 (guards):** update the #1192 boot-isolation guard to the "no work while OFF"
