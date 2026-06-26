@@ -65,6 +65,18 @@
 - **Evidence:** After the ENOSPC restart, the session resumed with the repo **re-cloned fresh on `main`** (HEAD reverted from the in-progress feature branch `claude/log-driven-fixes` back to `main`) and the entire scratchpad directory (delivered reports, design docs, the dossier working copy) **wiped** — only branches/PRs already pushed to origin survived. An agent mid-task on a feature branch must detect this and re-`fetch`/`checkout` from origin; any uncommitted/unpushed work or scratchpad-only artifact is lost.
 - **Suggested fix:** Preserve the active working branch + the session scratchpad across resume, OR emit a clear "resume = fresh clone; local-only state discarded; checked out `main`" notice at SessionStart so the agent re-orients deterministically instead of assuming continuity. Workaround that worked: push every branch to origin continuously (system-of-record), persist deliverables to git not just scratchpad.
 
+### REL-08 — the temp-filesystem ENOSPC self-DOS RECURS within one long session (REL-04 is not a one-off)
+- **Severity:** Medium
+- **Tag:** UNIVERSAL
+- **Evidence:** After a first environment restart cleared the full `/tmp/claude-0/<session>/tasks` tmpfs, continued background-worker fan-out re-filled it to **0 MB AGAIN** later in the SAME session, re-blocking ALL Bash a second time and requiring a SECOND restart. The fill rate scales with the number of spawned subagents and there is no GC between fills. This reinforces REL-04's "auto-GC completed task-output files" fix — without it, any sufficiently long agentic session will hit ENOSPC repeatedly, not just once.
+- **Suggested fix:** As REL-04 — auto-GC completed task-output files (size/LRU cap) and warn+rotate before hitting 0 MB; the recurrence within a single session makes the auto-GC a hard requirement rather than a nice-to-have, since a one-time manual clear does not hold for a long session.
+
+### REL-09 — a subagent can die instantly on a transient server rate-limit with zero work done and no auto-retry
+- **Severity:** Low
+- **Tag:** UNIVERSAL
+- **Evidence:** A worker returned `API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited` with **0 tool uses / 0 tokens** — the work simply didn't start. The orchestrator had to detect the no-op death and manually re-launch the worker. The failure is an explicitly-non-usage transient throttle, so it is safely retryable, but nothing retried it automatically.
+- **Suggested fix:** Auto-retry a subagent that dies on a transient (explicitly non-usage) rate-limit with backoff before surfacing it as a failure, so the orchestrator isn't forced to babysit transient throttling.
+
 ---
 
 ## 3. Memory
@@ -97,6 +109,12 @@
 - **Evidence:** In this session the orchestrator / main agent had NO direct Read / Bash / Grep — every file read or shell command required spawning a subagent (~20-60s each). This is excellent for large fan-out, but it adds latency for trivial one-file lookups where a single direct read would suffice.
 - **Suggested fix:** Give the orchestrator lightweight read/grep directly, reserving subagents for heavier isolated work, so trivial lookups don't incur subagent spin-up latency.
 
+### PRO-03 — recurring/fine-grained background scheduling is costly and awkward: the orchestrator has no direct scheduling tool, and recurring cron has a 1-hour floor
+- **Severity:** Medium
+- **Tag:** UNIVERSAL
+- **Evidence:** To honor an operator request for a status update every ~10 minutes, (a) the main loop could NOT call the scheduler directly — every 10-min tick had to spawn a FULL subagent just to call `send_later` to re-arm the next tick, costing a large token spend per re-arm; and (b) `create_trigger`'s cron rejected sub-hourly intervals ("cron expression fires more frequently than once per hour; minimum interval is 1 hour"), so true 10-min recurrence is not server-supported — only a self-re-arming one-shot `send_later` relay, which is exactly what made it expensive. Net effect: the cost of fine-grained recurring background updates pushed us to fall back to an hourly schedule.
+- **Suggested fix:** Expose a direct lightweight scheduling primitive to the main loop (no subagent needed to re-arm), and/or support sub-hourly recurring triggers, so fine-grained recurring background updates don't force either a per-tick subagent spend or a fallback to coarser intervals.
+
 ---
 
 ## 5. Session-UX
@@ -126,7 +144,7 @@
 These findings were collected during a single live Claude Code session on the TickVault repository on 2026-06-26, while running the project's charter-mandated PR workflow (adversarial 3-agent review + GitHub MCP PR lifecycle + background monitor-to-merge). Each entry's **Evidence** describes what was directly observed in that session:
 
 - **Git/toolchain findings (REL-02, REL-03)** reproduce by inspecting the remote clone (`git log`, attempting `git diff origin/main...HEAD`, and running `cargo fmt --check`) in the remote container.
-- **Long-session environment findings (REL-04, REL-05, REL-06, REL-07)** reproduce by running a sustained multi-worker session: launch many large background workers until the task-output temp dir under `/tmp/claude-0/<session>/tasks` fills (ENOSPC), and observe that subsequent Bash/git/cargo calls fail before capturing output, a context-overflowing subagent dies with "Autocompact is thrashing", and a blocked worker cannot `rm -rf` to self-clear without human approval. **REL-07** reproduces by triggering an environment restart (e.g. after the ENOSPC) while mid-task on an unpushed feature branch: on resume, `git rev-parse --abbrev-ref HEAD` reports `main` (not the working branch) and the scratchpad dir is empty — only origin-pushed branches survive.
+- **Long-session environment findings (REL-04, REL-05, REL-06, REL-07, REL-08, REL-09)** reproduce by running a sustained multi-worker session: launch many large background workers until the task-output temp dir under `/tmp/claude-0/<session>/tasks` fills (ENOSPC), and observe that subsequent Bash/git/cargo calls fail before capturing output, a context-overflowing subagent dies with "Autocompact is thrashing", and a blocked worker cannot `rm -rf` to self-clear without human approval. **REL-07** reproduces by triggering an environment restart (e.g. after the ENOSPC) while mid-task on an unpushed feature branch: on resume, `git rev-parse --abbrev-ref HEAD` reports `main` (not the working branch) and the scratchpad dir is empty — only origin-pushed branches survive. **REL-08** reproduces by continuing the multi-worker fan-out AFTER a first ENOSPC restart: the same tmpfs re-fills to 0 MB within the same session, blocking Bash a second time. **REL-09** reproduces (transiently) when a spawned subagent returns "Server is temporarily limiting requests (not your usage limit)" with 0 tool uses / 0 tokens and no automatic re-launch.
 - **Memory findings (MEM-01, MEM-02)** reproduce by listing `.claude/rules/` + reading the APPROVED plan files and comparing their checkbox state against merged PRs on `main`.
 - **Session-UX findings (UX-01, UX-02)** reproduce by ending a turn with plain assistant text in a web-driven session and observing the Stop-hook (`stop-hook-reply-gate.py`) output verbatim. **UX-03** reproduces by launching many long-running background subagents in one session and watching the Background Tasks panel: each running agent shows only title + elapsed time + token/tool-use counters + "View transcript", with no live "current step" line and no stall indicator, so a hung agent is indistinguishable from a working one without opening its transcript.
 - **WINs (REL-01, PRO-01, FIT-01)** reproduce by launching multiple background subagents and observing automatic completion re-prompts and the fan-out/fan-in reconciliation.
