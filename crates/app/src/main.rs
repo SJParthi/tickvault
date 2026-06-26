@@ -192,7 +192,7 @@ async fn main() -> Result<()> {
     if let Some(env_path) = tickvault_app::boot_helpers::config_env_path(&config_env) {
         config_figment = config_figment.merge(Toml::file(env_path));
     }
-    let config: ApplicationConfig = config_figment
+    let mut config: ApplicationConfig = config_figment
         .merge(Toml::file(CONFIG_LOCAL_PATH))
         .extract()
         .context("failed to load configuration from config/base.toml")?;
@@ -236,6 +236,35 @@ async fn main() -> Result<()> {
     // is UNCHANGED; the per-feed spawn gating + the native Groww connector land
     // in later PRs of this sequence — until then these WARNs make the partial
     // state explicit (no illusion).
+    //
+    // PR-3 (persist, feed-toggle-full-lifecycle): the operator's LAST webpage
+    // toggle choice is mirrored to a SEPARATE `data/feed-state.json` overlay
+    // (never the git-tracked locked `config/base.toml`). `config.feeds` is the
+    // DEFAULT; if a valid overlay exists it WINS — so the last choice survives a
+    // restart. A missing file → config default (no error); a corrupt/partial
+    // file → config default + a WARN (fail-safe, never a boot crash). The
+    // overlay is applied IN PLACE onto `config.feeds`, so BOTH `feeds.*` below
+    // AND the Dhan-off per-feed boot dispatcher gate (the `config.feeds`
+    // dhan-enabled skip-guard further down) read the EFFECTIVE state with no
+    // further edits.
+    {
+        let overlay_path = tickvault_api::feed_state_persist::feed_state_path();
+        let persisted = tickvault_api::feed_state_persist::load_feed_state(&overlay_path);
+        if persisted.is_some() {
+            info!(
+                "feed-state overlay found (data/feed-state.json) — restoring the last \
+                 webpage toggle choice over the config default"
+            );
+        } else if overlay_path.exists() {
+            // The file exists but did not load (corrupt / unreadable) — fail-safe
+            // to the config default, but make it visible (no silent fall-through).
+            warn!(
+                "feed-state overlay present but unreadable/corrupt (data/feed-state.json) \
+                 — falling back to the config default per-feed enabled state"
+            );
+        }
+        config.feeds = tickvault_api::feed_state_persist::overlay_feeds(config.feeds, persisted);
+    }
     let feeds = &config.feeds;
     // Feed-toggle API (operator AskUserQuestion 2026-06-19): ONE shared
     // `Arc<FeedRuntimeState>` seeded from config, handed to BOTH the API state
@@ -7204,6 +7233,37 @@ mod tests {
             gate_idx < dhan_boot_idx,
             "Step C: the per-feed gate must precede the Dhan boot decision so \
              dhan_enabled=false actually skips Dhan (gate@{gate_idx} boot@{dhan_boot_idx})"
+        );
+    }
+
+    /// PR-3 ratchet (3-agent hostile recommendation): the persisted feed-state
+    /// overlay MUST be applied to `config.feeds` BEFORE any boot-skip guard reads
+    /// `feeds.dhan_enabled` / `!feeds.dhan_enabled`. If a future refactor moved a
+    /// boot-skip read above the `overlay_feeds(...)` call, that read would observe
+    /// the pre-overlay config default and silently ignore the operator's persisted
+    /// last toggle choice (the whole point of PR-3) — booting the WRONG feed.
+    #[test]
+    fn test_overlay_precedes_boot_skip_guard() {
+        let src = include_str!("main.rs");
+        let overlay_idx = src
+            .find("overlay_feeds(")
+            .expect("the feed-state overlay call must exist");
+        // The first boot-skip guard that reads the per-feed enabled flag. Both
+        // conditional forms gate the Dhan boot path; whichever appears first must
+        // still come AFTER the overlay has been applied.
+        let first_enabled_guard = src.find("if feeds.dhan_enabled");
+        let first_disabled_guard = src.find("if !feeds.dhan_enabled");
+        let first_guard_idx = [first_enabled_guard, first_disabled_guard]
+            .into_iter()
+            .flatten()
+            .min()
+            .expect("a `feeds.dhan_enabled` boot-skip guard must exist");
+        assert!(
+            overlay_idx < first_guard_idx,
+            "overlay_feeds(...) (@{overlay_idx}) must precede the first \
+             feeds.dhan_enabled boot-skip guard (@{first_guard_idx}) so the \
+             boot reads the post-overlay effective feed state, not the config \
+             default"
         );
     }
 

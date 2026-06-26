@@ -59,7 +59,7 @@ Today those are inlined in the linear boot. They must be extracted into
   crates/app/src/main.rs, crates/app/src/lib.rs, crates/api/src/feed_state.rs,
   crates/app/tests/per_feed_boot_isolation_guard.rs. Tests: test_reconcile_lane_action_*,
   test_set_groww_lane_running_toggles_both_ways, groww_lanes_spawn_dormant_and_self_idle_on_the_enable_flag.)
-- [ ] **PR-2 (A, Dhan):** dormant `run_dhan_activation_watcher` spawned UNCONDITIONALLY at
+- [x] **PR-2 (A, Dhan):** dormant `run_dhan_activation_watcher` spawned UNCONDITIONALLY at
   boot; a level-triggered + **safety-gated** reconciler (`reconcile_dhan_lane_action_with_gate`
   downgrades `Stop`→`None` while `can_disable_dhan()==false`) drives `start_dhan_lane` /
   `stop_dhan_lane`, keeping the `dhan_lane_running` UI flag honest across runtime toggles.
@@ -91,6 +91,49 @@ Today those are inlined in the linear boot. They must be extracted into
     (no missed edge); proven by `reconcile_dhan_lane_action_sub_poll_flap_converges_no_missed_edge`.
 - [ ] **PR-3 (B, persist):** `data/feed-state.json` overlay (atomic write on toggle,
   boot overlay-read); GAP-SEC-01 protected; ratchet test.
+  **Design doc:** scratchpad `pr3-persist-design.md` (committed alongside).
+  **Concrete files:**
+  - `crates/api/src/feed_state_persist.rs` [NEW] — `PersistedFeedState` serde struct
+    (`{dhan_enabled, groww_enabled, updated_at_ist}`); `FEED_STATE_DIR="data"` +
+    `FEED_STATE_FILENAME="feed-state.json"` + `feed_state_path()`;
+    `validate_feed_state_path` (filename + parent pinned — traversal structurally
+    impossible); `persist_feed_state(&FeedStatus, &Path)` (tmp `.json.tmp` → `sync_all`
+    → `fs::rename`, mirrors `instrument_snapshot::write_plan_snapshot`);
+    `load_feed_state(&Path) -> Option<PersistedFeedState>` (missing→None, corrupt→None);
+    `overlay_feeds(FeedsConfig, Option<PersistedFeedState>) -> FeedsConfig` (pure).
+  - `crates/api/src/lib.rs` — `pub mod feed_state_persist;`.
+  - `crates/api/src/handlers/feeds.rs` — `set_feed` persists the full `snapshot()` after a
+    successful `set_enabled`; failure logged `error!` (Rule 5), HTTP toggle still 200
+    (live toggle already applied; persistence is the durable add-on).
+  - `crates/app/src/main.rs` — `let mut config`; at the feed-selection block, `load_feed_state`
+    + overlay into `config.feeds` IN PLACE before `let feeds = &config.feeds` so BOTH `feeds.*`
+    AND the `:1143` `if !config.feeds.dhan_enabled` gate read the effective state (the ratchet
+    literal `if !config.feeds.dhan_enabled` is preserved unchanged).
+  **Named tests** (in `feed_state_persist.rs`):
+  `test_feed_state_overlay_atomic_write` (no `.tmp` left; file parses to written flags),
+  `test_persist_feed_state_writes_atomically_and_round_trips`,
+  `test_boot_overlay_read_overrides_config` (persisted dhan-off/groww-on overrides config
+  dhan-on/groww-off), `test_overlay_none_keeps_config_default`,
+  `test_corrupt_feed_state_falls_back_to_config` (garbage bytes → load None → config),
+  `test_missing_feed_state_file_is_none_not_error`,
+  `test_validate_feed_state_path_rejects_traversal` (wrong name/parent → false; canonical → true),
+  `test_persisted_feed_state_serde_round_trip`,
+  `test_persisted_state_without_updated_at_parses` (serde default).
+  ### PR-3 Failure Modes (persistence overlay)
+  - **Missing `data/feed-state.json`** — `load_feed_state` returns `None` (NotFound is not an
+    error) → `overlay_feeds(cfg, None)` returns config unchanged. Pure base.toml behaviour.
+  - **Corrupt / invalid JSON** — `load_feed_state` swallows the parse error → `None` → config
+    default; boot logs a single WARN. NEVER crashes boot (fail-safe by construction).
+  - **Unwritable `data/` dir on toggle** — `persist_feed_state` returns `Err`; the handler logs
+    `error!` (routes to Telegram) but the HTTP response is still 200 — the runtime toggle is
+    LIVE this session; only the durable record failed. A later successful toggle self-heals.
+  - **Partial write (crash mid-write)** — only `{path}.json.tmp` is touched; the real file is
+    swapped in atomically via `fs::rename`, so a crash before the rename leaves the previous
+    good file intact (or none → config default).
+  - **Torn rename / truncated file** — `load_feed_state` fails to parse → `None` → config
+    default. The overlay never half-applies one flag.
+  - **Path traversal** — structurally impossible (both path components are fixed `&'static str`
+    constants); `validate_feed_state_path` rejects any non-canonical path and the test pins it.
 - [ ] **PR-4 (guards):** update the #1192 boot-isolation guard to the "no work while OFF"
   invariant; add cold-start/teardown integration + chaos tests (toggle storm, sidecar
   crash-on-start, auth-fail-on-cold-start, double-toggle idempotency).
