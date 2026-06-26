@@ -318,24 +318,49 @@ fn dhan_off_skips_auth_and_instruments_via_the_lane_gate() {
              `let dhan_lane: Option<DhanLaneRunHandles> = if config.feeds.dhan_enabled {…}` \
              (D2 Stage 2 genuine hoist)",
         );
-    let auth = src
-        .find("authenticating with Dhan")
-        .expect("the slow-arm Dhan auth step must exist");
-    // The slow-arm instrument load (`load_instruments(&config, …)`) — distinct
-    // from the fast crash-recovery arm's own (Dhan-ON-only) load above.
-    let instruments = src
-        .find("load_instruments(&config")
-        .expect("the slow-arm Dhan instrument-load step must exist");
-    assert!(
-        lane_gate < auth,
-        "slow-arm Dhan auth MUST live INSIDE the `if config.feeds.dhan_enabled` lane \
-         wrapper — so a Dhan-OFF boot never authenticates."
+    // D2a (2026-06-26): the slow-arm Dhan auth + instrument-load were extracted
+    // VERBATIM out of the inline gate into the callable `async fn
+    // start_dhan_lane(...)`. The gate now CALLS it — `match
+    // start_dhan_lane(lane_ctx).await` — so the auth + load are reachable ONLY
+    // through that call, which lives INSIDE the `if config.feeds.dhan_enabled`
+    // gate. So a Dhan-OFF boot still never authenticates or fetches instruments.
+    // The guard now asserts (a) the gate calls `start_dhan_lane`, and (b) the
+    // auth + instrument-load steps live INSIDE `start_dhan_lane`.
+    let lane_call = src.find("match start_dhan_lane(lane_ctx).await").expect(
+        "the Dhan lane gate must CALL the extracted \
+             `start_dhan_lane(lane_ctx)` (D2a extraction)",
     );
     assert!(
-        lane_gate < instruments,
-        "the slow-arm Dhan instrument load MUST live INSIDE the \
-         `if config.feeds.dhan_enabled` lane wrapper — so a Dhan-OFF boot never \
-         fetches/builds instruments."
+        lane_gate < lane_call,
+        "the `start_dhan_lane(lane_ctx)` call MUST live INSIDE the \
+         `if config.feeds.dhan_enabled` lane gate — so a Dhan-OFF boot never \
+         starts the Dhan lane (no auth, no instrument fetch, no Dhan WS)."
+    );
+    let lane_fn = src
+        .find("async fn start_dhan_lane(")
+        .expect("the extracted `start_dhan_lane` fn must exist (D2a)");
+    // Bound the body to the `start_dhan_lane` fn only (up to the next
+    // `\nasync fn `), so auth + load are asserted INSIDE this fn, not a later one.
+    let lane_fn_end = src[lane_fn + 1..]
+        .find("\nasync fn ")
+        .map(|rel| lane_fn + 1 + rel)
+        .unwrap_or(src.len());
+    let lane_fn_body = &src[lane_fn..lane_fn_end];
+    let auth = lane_fn_body
+        .find("authenticating with Dhan")
+        .expect("the slow-arm Dhan auth step must live INSIDE start_dhan_lane");
+    // The slow-arm instrument load (`load_instruments(config, …)` — the `&config`
+    // became `config` since the lane re-binds `config: &ApplicationConfig`, and
+    // fmt may wrap the call across lines) — distinct from the fast crash-recovery
+    // arm's own (Dhan-ON-only) load above.
+    let instruments = lane_fn_body
+        .find("load_instruments(")
+        .expect("the slow-arm Dhan instrument-load step must live INSIDE start_dhan_lane");
+    assert!(
+        auth > 0 && instruments > 0,
+        "slow-arm Dhan auth + instrument load MUST live INSIDE `start_dhan_lane`, \
+         which is called only from the `if config.feeds.dhan_enabled` gate — so a \
+         Dhan-OFF boot never authenticates or fetches/builds instruments."
     );
 
     // The FAST crash-recovery arm also loads instruments + authenticates, but it
