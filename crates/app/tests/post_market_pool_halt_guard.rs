@@ -63,10 +63,14 @@ fn pool_watchdog_match_block(src: &str) -> &str {
         .expect("spawn_pool_watchdog_task must contain `let verdict = pool.poll_watchdog();`");
     // The `match verdict {` block ends at the next top-level closing
     // brace pair followed by `Healthy => { ... }` — but the cleanest
-    // bound is just to take the next ~6,000 bytes which comfortably
-    // covers the four match arms without overshooting into the next
-    // helper. We then use literal-substring checks on this slice.
-    let end = (start + 6_000).min(src.len());
+    // bound is just to take the next ~8,500 bytes which comfortably
+    // covers the four match arms (incl. the H7 lane-scoped Halt branch +
+    // the boot-ON `process::exit(2);` that follows it at ~rel 6.1KB, and
+    // the off-hours `reset_watchdog` at ~rel 8.3KB) without overshooting
+    // into the next helper (`spawn_pool_watchdog_task` closes at ~rel 8.5KB).
+    // We then use literal-substring checks on this slice. (Window was 6,000
+    // before the H7 watchdog-arg change added ~870 bytes to the Halt arm.)
+    let end = (start + 8_500).min(src.len());
     &src[start..end]
 }
 
@@ -192,12 +196,15 @@ fn pool_watchdog_is_reset_outside_market_hours() {
     let src = read_main_rs();
     // Scope to the watchdog task body. Use a generous window from the
     // poll_watchdog call so the post-match reset (which sits just after the
-    // verdict match) is comfortably inside it.
+    // verdict match) is comfortably inside it. Window bumped 8,000 → 8,500:
+    // the H7 lane-scoped Halt branch added ~870 bytes to the Halt arm,
+    // pushing the off-hours `reset_watchdog` site (~rel 8.3KB) just past
+    // the old 8,000 window.
     let needle = "let verdict = pool.poll_watchdog();";
     let start = src
         .find(needle)
         .expect("spawn_pool_watchdog_task must contain `let verdict = pool.poll_watchdog();`");
-    let end = (start + 8_000).min(src.len());
+    let end = (start + 8_500).min(src.len());
     let block = &src[start..end];
 
     let reset_idx = block.find("reset_watchdog").expect(
@@ -262,5 +269,149 @@ fn watchdog_metrics_still_increment_outside_market_hours() {
          market-hours gate so post-market degraded events still appear on \
          dashboards even though they don't page the operator. Found metric \
          at {metric_idx}, gate at {if_idx} within the Degraded arm."
+    );
+}
+
+/// H7 (D2b lane-scoped runtime watchdog) source-scan ratchet.
+///
+/// `spawn_pool_watchdog_task` takes a `lane_halt: Option<Arc<Notify>>`
+/// argument (H7). On a 300s-all-down `Halt` verdict during market hours the
+/// watchdog now has TWO mutually-exclusive blast-radius modes inside the
+/// `if in_market_hours` branch of the `WatchdogVerdict::Halt` arm:
+///
+/// - **RUNTIME lane** (`lane_halt.is_some()`): the `if let Some(ref halt) =
+///   lane_halt { ... }` branch fires `halt.notify_waiters()` (so the parked
+///   task drives the FSM `Running → Stopping → Off` via `handle_lane_watchdog_halt`)
+///   and `return`s. It MUST NOT call `std::process::exit` — a lane-local Dhan
+///   fault must never kill the whole process / the independent Groww feed / the
+///   shared seal-writer + aggregator + API server.
+/// - **BOOT-ON** (`lane_halt.is_none()`): the pre-existing single-feed contract
+///   keeps `std::process::exit(2);` so systemd/the supervisor restarts the
+///   WHOLE process. This is preserved exactly.
+///
+/// This ratchet pins BOTH halves so a future refactor cannot:
+///   (a) drop the lane-scoped no-exit path, OR
+///   (b) leak `std::process::exit` into the runtime-lane branch, OR
+///   (c) remove the boot-ON `std::process::exit(2);` pin.
+///
+/// The production code at `crates/app/src/main.rs` carries a
+/// `TEST-EXEMPT: ... runtime_lane_watchdog_does_not_process_exit` reference on
+/// `handle_lane_watchdog_halt`; this is the test that reference points at.
+///
+/// Source-scan is the right tool: the Halt action is async + clock-gated +
+/// FSM-driven, so a behavioural test would need to mock tokio::time +
+/// std::process::exit + the FeedRuntimeState FSM. The invariants we care about
+/// (the `Some(ref halt)` branch fires `notify_waiters()` + `return`s without
+/// exiting; the single `process::exit(2);` lives only AFTER that branch closes,
+/// i.e. on the `None`/boot-ON path) are mechanical and visible in the source.
+#[test]
+fn runtime_lane_watchdog_does_not_process_exit() {
+    let src = read_main_rs();
+
+    // 1. The watchdog must accept the H7 lane-scoped Halt signal argument.
+    assert!(
+        src.contains("lane_halt: Option<std::sync::Arc<tokio::sync::Notify>>"),
+        "spawn_pool_watchdog_task must take a `lane_halt: Option<Arc<Notify>>` \
+         argument (H7). `None` = BOOT-ON (keep process::exit(2)); `Some` = \
+         RUNTIME lane (signal the parked task, NEVER process::exit). Removing \
+         this argument collapses the lane-scoped blast-radius fix and would let \
+         a lane-local Dhan fault kill the whole process + the Groww feed."
+    );
+
+    // Scope to the watchdog task's Halt arm. The window from
+    // `let verdict = pool.poll_watchdog();` comfortably covers the Halt arm's
+    // `if in_market_hours { ... lane_halt ... process::exit(2); }` block (the
+    // `std::process::exit(2);` site sits ~6.1KB in; use an 8KB window).
+    let needle = "let verdict = pool.poll_watchdog();";
+    let start = src
+        .find(needle)
+        .expect("spawn_pool_watchdog_task must contain `let verdict = pool.poll_watchdog();`");
+    let end = (start + 8_000).min(src.len());
+    let block = &src[start..end];
+
+    let halt_arm_idx = block
+        .find("WatchdogVerdict::Halt")
+        .expect("watchdog match block must include the Halt arm");
+
+    // 2. The runtime-lane branch must exist and fire the lane Halt signal.
+    let some_branch_idx = block.find("if let Some(ref halt) = lane_halt").expect(
+        "Halt arm must have an `if let Some(ref halt) = lane_halt { ... }` \
+             runtime-lane branch (H7) so a runtime lane tears itself down via \
+             the FSM instead of exiting the process.",
+    );
+    assert!(
+        halt_arm_idx < some_branch_idx,
+        "the `if let Some(ref halt) = lane_halt` branch must live inside the \
+         Halt arm (found Halt arm at {halt_arm_idx}, lane branch at {some_branch_idx})."
+    );
+
+    let notify_idx = block.find("halt.notify_waiters()").expect(
+        "the runtime-lane Halt branch must fire `halt.notify_waiters()` so the \
+         parked task (`park_running_dhan_lane`) observes it and drives the FSM \
+         `Running → Stopping → Off` via `handle_lane_watchdog_halt` — NOT \
+         `process::exit`.",
+    );
+    assert!(
+        some_branch_idx < notify_idx,
+        "`halt.notify_waiters()` must appear inside the `Some(ref halt)` branch \
+         (found branch at {some_branch_idx}, notify at {notify_idx})."
+    );
+
+    // 3. The single boot-ON process::exit(2); must appear ONLY AFTER the
+    //    runtime-lane branch's `return;` closes it. The lexical proof: the
+    //    `Some(ref halt)` branch contains `notify_waiters()` then `return;`, and
+    //    the only `std::process::exit(2);` site appears strictly AFTER that
+    //    `return;` (the `None`/boot-ON fall-through). If a future edit moved
+    //    `process::exit` into the runtime-lane branch, it would appear BEFORE
+    //    the branch-closing `return;`.
+    let return_idx = block[notify_idx..]
+        .find("return;")
+        .map(|rel| notify_idx + rel)
+        .expect(
+            "the runtime-lane Halt branch must `return;` after `notify_waiters()` \
+             so polling stops (the parked task owns teardown) and the boot-ON \
+             `process::exit(2);` below is NOT reached for a runtime lane.",
+        );
+
+    let exit_idx = block.find("std::process::exit(2);").expect(
+        "the boot-ON Halt path must still call `std::process::exit(2);` (the \
+         pre-existing single-feed contract — systemd/the supervisor restarts the \
+         WHOLE process). Removing this pin would silently break the boot-ON \
+         crash-recovery behaviour.",
+    );
+
+    // The runtime-lane branch's `notify_waiters()` + `return;` must BOTH come
+    // before the boot-ON `process::exit(2);`. This proves `process::exit` is on
+    // the `None` (boot-ON) fall-through, NOT inside the `Some(ref halt)` branch.
+    assert!(
+        notify_idx < return_idx && return_idx < exit_idx,
+        "the runtime-lane branch (`halt.notify_waiters()` @ {notify_idx} then \
+         `return;` @ {return_idx}) must lexically precede the boot-ON \
+         `std::process::exit(2);` @ {exit_idx}. If process::exit moved into the \
+         runtime-lane branch, a lane-local Dhan fault would kill the process + \
+         the Groww feed + shared infra. Ordering violated."
+    );
+
+    // 4. There must be EXACTLY ONE `std::process::exit(2);` in the watchdog
+    //    block — the boot-ON one. A second one anywhere in the block would be a
+    //    process::exit leaking into (or duplicated within) the runtime-lane path.
+    let exit_count = block.matches("std::process::exit(2);").count();
+    assert_eq!(
+        exit_count, 1,
+        "the watchdog Halt arm must contain EXACTLY ONE `std::process::exit(2);` \
+         (the boot-ON path). Found {exit_count}. A second occurrence means \
+         process::exit leaked into the runtime-lane (`Some(ref halt)`) branch, \
+         which would kill the process on a lane-only fault."
+    );
+
+    // 5. Belt-and-braces: the slice of the `Some(ref halt)` branch up to its
+    //    closing `return;` must NOT contain `std::process::exit` at all.
+    let some_branch = &block[some_branch_idx..return_idx];
+    assert!(
+        !some_branch.contains("std::process::exit"),
+        "the runtime-lane Halt branch (the `if let Some(ref halt) = lane_halt` \
+         block ending in `return;`) must NEVER call `std::process::exit` — it \
+         tears the Dhan lane down via the FSM and returns, leaving Groww + \
+         shared infra alive."
     );
 }

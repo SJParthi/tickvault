@@ -8156,6 +8156,10 @@ async fn run_shutdown_fast(
             trading_handle,
             ws_pool_arc,
             shutdown_notify,
+            // H7: BOOT-ON (FAST-boot) handles are not parked — the watchdog
+            // keeps its `process::exit(2)` single-feed contract, so no
+            // lane-scoped Halt signal is needed here.
+            lane_halt_notify: None,
         }),
         api_handle,
         otel_provider,
