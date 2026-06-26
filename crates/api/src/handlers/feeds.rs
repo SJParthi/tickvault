@@ -184,6 +184,29 @@ pub async fn set_feed(
     )
     .increment(1);
 
+    // PR-3 (persist): mirror the operator's choice to the SEPARATE
+    // `data/feed-state.json` overlay so it survives a restart (never rewrites
+    // the git-tracked locked config). The FULL snapshot (both flags) is written
+    // so toggling one feed never drops the other's persisted value. A failure
+    // is logged at `error!` (persist failures route to Telegram, audit Rule 5)
+    // but does NOT fail the HTTP response — the runtime toggle already applied
+    // (live this session); only the durable record failed, and a later
+    // successful toggle self-heals it. This call is inside the bearer-auth
+    // handler (GAP-SEC-01) — no new route, no new attack surface.
+    let snap = state.feed_runtime().snapshot();
+    if let Err(err) = crate::feed_state_persist::persist_feed_state(
+        &snap,
+        &crate::feed_state_persist::feed_state_path(),
+    ) {
+        tracing::error!(
+            ?err,
+            feed = feed.as_str(),
+            "failed to persist the feed-state overlay (data/feed-state.json) — \
+             the runtime toggle is LIVE this session but will NOT survive a \
+             restart until a feed-state write succeeds"
+        );
+    }
+
     Ok(Json(current_status(&state)))
 }
 
