@@ -41,6 +41,24 @@
 - **Evidence:** `cargo fmt --check` failed with "rustfmt ... not applicable to the '1.95.0' toolchain" — the rustfmt component could not be fetched through the proxy. The format gate therefore could not be verified locally; only CI covers it, reducing local pre-merge confidence. **Confirmed 2026-06-26** — the local pre-push gate `.claude/hooks/pre-push-gate.sh [1/8] cargo fmt --check` HARD-FAILS on the missing rustfmt component and blocked even a DOCS-ONLY commit (zero .rs files changed; the [8/8] gate confirmed no .rs files). The gate has no "unrunnable component" detection, so a broken toolchain component is indistinguishable from a real formatting violation, blocking unrelated commits.
 - **Suggested fix:** Ensure pinned toolchain components (e.g., rustfmt, clippy) are present in the remote image so local pre-merge gates can run without depending on outbound component fetches. Additionally, the pre-push fmt gate should detect a missing/unrunnable rustfmt component and skip-with-warning rather than hard-fail, and/or the container image must ship the pinned rustfmt+clippy components.
 
+### REL-04 — Long agentic sessions exhaust the harness temp filesystem → hard stop with no auto-recovery
+- **Severity:** High
+- **Tag:** UNIVERSAL
+- **Evidence:** In a long TickVault session the harness spools every background worker's stdout/stderr to a temp file under `/tmp/claude-0/<session>/tasks`; after ~30 large worker outputs the filesystem hit **0 MB free (ENOSPC)**, after which EVERY Bash/git/cargo invocation failed *before it could even capture output*, AND new background workers could not be launched (their output file couldn't be written). No auto-GC, no pre-emptive warning, no self-recovery; only an environment restart (or manual `rm -rf .../tasks/*`) cleared it. The harness error text itself suggested setting `CLAUDE_CODE_TMPDIR` to a filesystem with room.
+- **Suggested fix:** Auto-GC completed task-output files (size/LRU cap), warn+rotate before hitting 0 MB, and/or default the output-capture temp to a separate/larger volume.
+
+### REL-05 — Subagent dies on context-thrash, silently losing its work
+- **Severity:** Medium
+- **Tag:** UNIVERSAL
+- **Evidence:** A review subagent terminated with "Autocompact is thrashing: the context refilled to the limit within 3 turns of the previous compact, 3 times in a row" and returned no result — a large file/tool-output read overflowed its context and the work was lost.
+- **Suggested fix:** Surface the "reading too much — chunk it" guard earlier / auto-chunk large reads so a worker degrades gracefully instead of dying with no output.
+
+### REL-06 — A blocked worker cannot self-clear an environment problem
+- **Severity:** Low
+- **Tag:** UNIVERSAL
+- **Evidence:** A worker that needed `rm -rf` (to clear the full temp dir) couldn't obtain approval autonomously and stalled; the safety gate is correct, but it's a real autonomy-to-completion friction point (the agent that detects the problem can't fix it without bouncing to the human).
+- **Suggested fix:** A bounded, allow-listed self-maintenance action (e.g. GC its own task-temp) the agent may take without a human round-trip.
+
 ---
 
 ## 3. Memory
@@ -96,6 +114,7 @@
 These findings were collected during a single live Claude Code session on the TickVault repository on 2026-06-26, while running the project's charter-mandated PR workflow (adversarial 3-agent review + GitHub MCP PR lifecycle + background monitor-to-merge). Each entry's **Evidence** describes what was directly observed in that session:
 
 - **Git/toolchain findings (REL-02, REL-03)** reproduce by inspecting the remote clone (`git log`, attempting `git diff origin/main...HEAD`, and running `cargo fmt --check`) in the remote container.
+- **Long-session environment findings (REL-04, REL-05, REL-06)** reproduce by running a sustained multi-worker session: launch many large background workers until the task-output temp dir under `/tmp/claude-0/<session>/tasks` fills (ENOSPC), and observe that subsequent Bash/git/cargo calls fail before capturing output, a context-overflowing subagent dies with "Autocompact is thrashing", and a blocked worker cannot `rm -rf` to self-clear without human approval.
 - **Memory findings (MEM-01, MEM-02)** reproduce by listing `.claude/rules/` + reading the APPROVED plan files and comparing their checkbox state against merged PRs on `main`.
 - **Session-UX findings (UX-01, UX-02)** reproduce by ending a turn with plain assistant text in a web-driven session and observing the Stop-hook (`stop-hook-reply-gate.py`) output verbatim.
 - **WINs (REL-01, PRO-01, FIT-01)** reproduce by launching multiple background subagents and observing automatic completion re-prompts and the fan-out/fan-in reconciliation.
