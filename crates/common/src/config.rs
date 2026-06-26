@@ -11,7 +11,11 @@ use crate::constants::SEBI_MAX_ORDERS_PER_SECOND;
 use crate::trading_calendar::TradingCalendar;
 
 /// Root application configuration.
-#[derive(Debug, Deserialize)]
+// D2b: `Clone` so the runtime Dhan-lane cold-start can capture an owned
+// `Arc<ApplicationConfig>` snapshot at boot (the supervisor outlives `main()`'s
+// owned `config` borrow). Config is loaded ONCE from figment; the clone is a
+// deep copy of immutable boot config — no env re-parse, no drift.
+#[derive(Debug, Clone, Deserialize)]
 pub struct ApplicationConfig {
     pub trading: TradingConfig,
     pub dhan: DhanConfig,
@@ -459,7 +463,7 @@ impl TradingMode {
 }
 
 /// Strategy and paper-trading configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct StrategyConfig {
     /// Path to the strategy TOML config file (relative to working directory).
     #[serde(default = "default_strategy_config_path")]
@@ -555,7 +559,7 @@ const fn default_dry_run() -> bool {
 }
 
 /// Trading session timing configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TradingConfig {
     /// Market open time in IST (e.g., "09:00:00").
     pub market_open_time: String,
@@ -747,7 +751,7 @@ pub struct TokenConfig {
 }
 
 /// Risk management configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RiskConfig {
     /// Maximum allowed daily loss as percentage of capital.
     pub max_daily_loss_percent: f64,
@@ -756,7 +760,7 @@ pub struct RiskConfig {
 }
 
 /// Logging configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct LoggingConfig {
     /// Log level filter (trace, debug, info, warn, error).
     pub level: String,

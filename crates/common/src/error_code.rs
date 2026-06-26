@@ -601,6 +601,31 @@ pub enum ErrorCode {
     /// Severity::High — a real boot-data gap that an operator must see, but
     /// NOT a halt. Auto-triage-safe (visibility-only; operator informs).
     PrevDay01CoverageEmpty,
+    /// D2b (2026-06-26) — runtime Dhan-lane cold-start FAILED at the
+    /// daily-universe-build stage. `start_dhan_lane` returned its
+    /// universe-build boot-abort; the lane FSM is driven back to
+    /// `LaneState::Off` (NO half-running lane) and a bounded backoff retry is
+    /// scheduled. Severity::High. The `reason` carried in the `error!` line is
+    /// a FIXED enum discriminant, never a raw auth body (secret discipline).
+    DhanLane01UniverseBuildFailed,
+    /// D2b (2026-06-26) — runtime Dhan-lane cold-start FAILED at the main-feed
+    /// WS-pool create/spawn stage. `start_dhan_lane` returned its pool-spawn
+    /// boot-abort; every LANE handle spawned so far is dropped/aborted and the
+    /// FSM is driven back to `LaneState::Off` (no orphan sockets).
+    /// Severity::High.
+    DhanLane02WsPoolSpawnFailed,
+    /// D2b (2026-06-26) — runtime Dhan-lane cold-start FAILED at the auth /
+    /// IP-verify / static-IP / dual-instance boot gate (the inline spine's
+    /// `BootAbortClean` path). At RUNTIME this NEVER exits the process — the
+    /// FSM returns to `LaneState::Off` and the operator is paged; bounded
+    /// retry. Severity::High (reuses AUTH-GAP-* semantics).
+    DhanLane03AuthFailed,
+    /// D2b (2026-06-26) — Dhan-lane teardown (`stop_dhan_lane` →
+    /// `teardown_dhan_lane_tasks`) hit the bounded pool-supervisor drain
+    /// timeout and force-aborted the remaining WS handles. The lane still
+    /// reaches `LaneState::Off` (handles joined-or-force-aborted), so this is
+    /// degraded-but-recovered, not data loss. Severity::Medium.
+    DhanLane04TeardownTimeout,
 }
 
 impl ErrorCode {
@@ -749,6 +774,11 @@ impl ErrorCode {
             Self::IndexOhlc02DailyResetFailed => "INDEX-OHLC-02",
             // Boot-time previous-day OHLCV fetch (PR4 2026-06-01)
             Self::PrevDay01CoverageEmpty => "PREVDAY-01",
+            // D2b — runtime Dhan-lane cold-start FSM (2026-06-26)
+            Self::DhanLane01UniverseBuildFailed => "DHAN-LANE-01",
+            Self::DhanLane02WsPoolSpawnFailed => "DHAN-LANE-02",
+            Self::DhanLane03AuthFailed => "DHAN-LANE-03",
+            Self::DhanLane04TeardownTimeout => "DHAN-LANE-04",
         }
     }
 
@@ -836,7 +866,14 @@ impl ErrorCode {
             // WS-GAP-07 — live frame channel closed (tick consumer died)
             | Self::WsGap07LiveChannelClosed
             // WS-SPILL-01 — WAL writer respawned (flapping writer = disk dying)
-            | Self::WsSpill01WriterRespawn => Severity::High,
+            | Self::WsSpill01WriterRespawn
+            // DHAN-LANE-01/02/03 — runtime Dhan-lane cold-start failures (D2b
+            // 2026-06-26): a failed cold-start returns the FSM to Off + pages
+            // the operator, never a half-running lane. High (operator must
+            // know the lane did not come up; bounded retry will re-attempt).
+            | Self::DhanLane01UniverseBuildFailed
+            | Self::DhanLane02WsPoolSpawnFailed
+            | Self::DhanLane03AuthFailed => Severity::High,
             // Medium: data pipeline correctness
             // PR #6b (2026-05-19): I-P0-01/02/04/05 retired with their modules.
             Self::InstrumentP1CrossSegmentCollision
@@ -880,7 +917,11 @@ impl ErrorCode {
             | Self::Boundary01CatchupSeal
             // PR #1 (AWS-lifecycle) — Medium option-chain
             | Self::OptionChain03ParseFailed
-            | Self::OptionChain04VerifyFailedVsWs => Severity::Medium,
+            | Self::OptionChain04VerifyFailedVsWs
+            // DHAN-LANE-04 — teardown drain timeout (D2b 2026-06-26): the lane
+            // still reaches Off (handles force-aborted), so degraded-but-
+            // recovered, not data loss. Medium.
+            | Self::DhanLane04TeardownTimeout => Severity::Medium,
             // Low: trading-day / Dhan other
             // PR #6a (2026-05-19): I-P1-01 (DailyScheduler) + I-P1-02 (DeltaFieldCoverage) retired
             Self::InstrumentP2TradingDayGuard
@@ -1046,6 +1087,13 @@ impl ErrorCode {
             Self::PrevDay01CoverageEmpty => {
                 ".claude/rules/project/prev-day-ohlcv-error-codes.md"
             }
+            // D2b — runtime Dhan-lane cold-start FSM (2026-06-26)
+            Self::DhanLane01UniverseBuildFailed
+            | Self::DhanLane02WsPoolSpawnFailed
+            | Self::DhanLane03AuthFailed
+            | Self::DhanLane04TeardownTimeout => {
+                ".claude/rules/project/dhan-lane-error-codes.md"
+            }
         }
     }
 
@@ -1192,6 +1240,11 @@ impl ErrorCode {
             Self::IndexOhlc02DailyResetFailed,
             // Boot-time previous-day OHLCV fetch coverage (PR4 2026-06-01)
             Self::PrevDay01CoverageEmpty,
+            // D2b — runtime Dhan-lane cold-start FSM (2026-06-26)
+            Self::DhanLane01UniverseBuildFailed,
+            Self::DhanLane02WsPoolSpawnFailed,
+            Self::DhanLane03AuthFailed,
+            Self::DhanLane04TeardownTimeout,
         ]
     }
 }
@@ -1460,7 +1513,10 @@ mod tests {
         // 2026-06-26 (log-driven fixes): bumped 108 -> 109 for PREVDAY-01
         // (boot-time previous-day OHLCV fetch coverage EMPTY — typed +
         // per-empty observability for the 774-silent-empties signature).
-        assert_eq!(ErrorCode::all().len(), 109);
+        // 2026-06-26 (D2b — runtime Dhan-lane cold-start FSM): bumped 109 -> 113
+        // for DHAN-LANE-01..04 (universe-build / ws-pool-spawn / auth-gate
+        // failures + teardown-timeout on the runtime cold-start path).
+        assert_eq!(ErrorCode::all().len(), 113);
     }
 
     #[test]
@@ -1553,7 +1609,9 @@ mod tests {
                 // Operator 2026-06-10: daily end-to-end tick-conservation audit
                 || s.starts_with("TICK-CONSERVE-")
                 // PR4 2026-06-01: boot-time previous-day OHLCV fetch coverage
-                || s.starts_with("PREVDAY-");
+                || s.starts_with("PREVDAY-")
+                // D2b 2026-06-26: runtime Dhan-lane cold-start FSM
+                || s.starts_with("DHAN-LANE-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
