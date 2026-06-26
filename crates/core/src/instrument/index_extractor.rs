@@ -252,6 +252,25 @@ pub fn extract_indices(rows: &[CsvRow]) -> Result<IndexExtraction, IndexExtractE
                 .iter()
                 .position(|allowed| *allowed == norm)
             {
+                // Dual-naming collision guard (hostile-review LOW, 2026-06-26):
+                // matching is now alias-aware, so two DISTINCT-SID Dhan rows can
+                // canonicalize to the SAME allowlist entry (e.g. a master that
+                // ships BOTH `NIFTY NEXT 50` and `NIFTY NXT 50`). Without this
+                // guard both rows would be pushed → two subscription targets for
+                // ONE logical index. `matched[pos]` already records whether this
+                // canonical entry was seen; first-row-wins, the duplicate is
+                // SKIPPED and LOUD-warned (no silent extra subscription).
+                if matched[pos] {
+                    tracing::warn!(
+                        duplicate_symbol = %row.symbol_name,
+                        canonical = NSE_INDEX_ALLOWLIST[pos],
+                        duplicate_security_id = %row.security_id,
+                        "index dual-naming collision: another IDX_I row already \
+                         matched this canonical index; skipping the duplicate \
+                         (first-row-wins) to keep ONE subscription target"
+                    );
+                    continue;
+                }
                 matched[pos] = true;
                 nse_indices.push(row.clone());
             }
@@ -592,6 +611,46 @@ mod tests {
                 "NIFTY NEXT 50 must self-heal for {dhan_symbol}, not be a miss"
             );
         }
+    }
+
+    #[test]
+    fn test_dual_naming_collision_keeps_one_index() {
+        // Hostile-review LOW (2026-06-26): now that matching is alias-aware,
+        // a master that ships BOTH `NIFTY NEXT 50` and `NIFTY NXT 50` as two
+        // DISTINCT-SID IDX_I rows canonicalizes both to `NIFTY NEXT 50`.
+        // Without the dedup guard that would yield TWO subscription targets for
+        // ONE logical index. Assert exactly ONE survives (first-row-wins) and
+        // the canonical name is NOT reported as a miss.
+        let rows = vec![
+            idx_i_row("13", "NSE", "INDEX", "NIFTY"),
+            idx_i_row("38", "NSE", "INDEX", "NIFTY NEXT 50"), // canonical — first, kept
+            idx_i_row("99", "NSE", "INDEX", "NIFTY NXT 50"),  // alias of same — skipped
+            idx_i_row("51", "BSE", "INDEX", "SENSEX"),
+        ];
+        let result = extract_indices(&rows).expect("extract");
+        // Exactly one NIFTY NEXT 50 subscription target.
+        let next50_count = result
+            .nse_indices
+            .iter()
+            .filter(|r| canonicalize_index_symbol(&r.symbol_name) == "NIFTY NEXT 50")
+            .count();
+        assert_eq!(
+            next50_count, 1,
+            "dual-naming collision must yield exactly ONE NIFTY NEXT 50 target"
+        );
+        // First-row-wins: the canonical-named row (sid 38) is the survivor.
+        assert!(
+            result.nse_indices.iter().any(|r| r.security_id == "38"),
+            "first matching row (sid 38) must be the kept one"
+        );
+        assert!(
+            !result.nse_indices.iter().any(|r| r.security_id == "99"),
+            "the duplicate row (sid 99) must be skipped"
+        );
+        // NIFTY + NIFTY NEXT 50 present → 2 NSE indices, not 3.
+        assert_eq!(result.nse_indices.len(), 2);
+        // The canonical index was matched, so it is NOT a miss.
+        assert!(!result.allowlist_misses.contains(&"NIFTY NEXT 50"));
     }
 
     #[test]
