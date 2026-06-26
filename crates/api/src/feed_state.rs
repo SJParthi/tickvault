@@ -125,6 +125,7 @@ impl FeedRuntimeState {
     /// so the feed page reports "running" iff the lane is actually live, never a
     /// false-OK and never a stale DEGRADED after a runtime cold-start.
     pub fn set_groww_lane_running(&self, running: bool) {
+        // Relaxed: UI-status-only flag; no ordering dependency with other shared state.
         self.groww_lane_running.store(running, Ordering::Relaxed);
     }
 
