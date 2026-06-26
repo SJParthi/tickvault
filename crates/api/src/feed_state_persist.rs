@@ -105,14 +105,59 @@ fn now_ist_stamp() -> String {
     now_ist.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+/// A UNIQUE temp path next to `path`, e.g. `data/feed-state.json.<pid>.<nanos>.tmp`.
+///
+/// Per-write uniqueness (process id + nanosecond clock) is the fix for the
+/// 3-agent hostile finding that a FIXED `.tmp` name lets two concurrent toggles
+/// truncate each other's tmp and `rename` a torn file into place. With a unique
+/// tmp per write, each writer fully writes + fsyncs ITS OWN tmp, then atomically
+/// renames — so concurrent toggles are correct last-writer-wins and the on-disk
+/// `feed-state.json` is ALWAYS a complete, valid snapshot (never torn). Mirrors
+/// the unique-tmp-dir pattern already used by this module's tests + summary_writer.
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsString::from)
+        .unwrap_or_else(|| std::ffi::OsString::from(FEED_STATE_FILENAME));
+    name.push(format!(".{}.{}.tmp", std::process::id(), nanos));
+    match path.parent() {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+/// Create the temp file write-only, truncating, with mode `0o600` on Unix
+/// (owner read/write only — defence-in-depth; the file carries no secrets but
+/// least-privilege is good practice). On non-Unix the mode is not set (the
+/// `OpenOptions` still creates+truncates), keeping the code cross-platform.
+fn create_tmp_file(tmp_path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    opts.open(tmp_path)
+}
+
 /// Atomically persist the current per-feed enabled state to `path`.
 ///
 /// The full [`FeedStatus`] snapshot is written (BOTH flags) so the file always
 /// reflects the complete desired state — toggling one feed never drops the
 /// other feed's persisted value (no lost update).
 ///
-/// Write is `{path}.json.tmp` → `sync_all` → `fs::rename` (atomic on the same
-/// filesystem), mirroring `instrument_snapshot::write_plan_snapshot`.
+/// Write is a UNIQUE `{path}.<pid>.<nanos>.tmp` → `sync_all` → `fs::rename`
+/// (atomic on the same filesystem). The unique tmp name (vs the shared
+/// `instrument_snapshot` `.json.tmp`) is the 3-agent fix so two concurrent
+/// toggles can't truncate each other's tmp and promote a torn file —
+/// concurrent same-feed toggles are eventually-consistent last-writer-wins,
+/// and the on-disk file is ALWAYS a complete valid snapshot. The unique tmp is
+/// removed on any error path so a failed write never leaks a stray tmp.
 ///
 /// # Errors
 ///
@@ -138,17 +183,22 @@ pub fn persist_feed_state(status: &FeedStatus, path: &Path) -> std::io::Result<(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp_path = path.with_extension("json.tmp");
-    {
+    let tmp_path = unique_tmp_path(path);
+    // Write+fsync the unique tmp, then atomically rename. On ANY failure clean
+    // up the unique tmp (a stray would never be promoted, but leave no litter).
+    let write_then_rename = || -> std::io::Result<()> {
         use std::io::Write as _;
-        let mut f = std::fs::File::create(&tmp_path)?;
+        let mut f = create_tmp_file(&tmp_path)?;
         f.write_all(&json)?;
         // Durably flush before the rename so a hard power-off can never promote
         // an unflushed tmp into place (matches summary_writer::atomic_write).
         f.sync_all()?;
-    }
-    std::fs::rename(&tmp_path, path)?;
-    Ok(())
+        drop(f);
+        std::fs::rename(&tmp_path, path)
+    };
+    write_then_rename().inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp_path);
+    })
 }
 
 /// Load the persisted overlay from `path`, if a valid one exists.
@@ -270,8 +320,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// After a write no `.tmp` file is left behind, and the real file parses to
-    /// the written flags.
+    /// After a write NO `.tmp` file (unique-named or otherwise) is left behind in
+    /// the directory, and the real file parses to the written flags.
     #[test]
     fn test_feed_state_overlay_atomic_write() {
         let dir = unique_tmp_dir("atomic");
@@ -279,12 +329,64 @@ mod tests {
         std::fs::create_dir_all(&data).unwrap();
         let path = data.join(FEED_STATE_FILENAME);
         persist_feed_state(&status(true, true), &path).expect("persist");
-        // No orphan tmp.
-        let tmp = path.with_extension("json.tmp");
-        assert!(!tmp.exists(), "no .tmp file left after atomic rename");
+        // No orphan tmp of ANY name (the unique `.<pid>.<nanos>.tmp` is renamed
+        // away; scan the whole data dir so a unique-named leftover is caught too).
+        let leftover_tmp = std::fs::read_dir(&data)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp"));
+        assert!(!leftover_tmp, "no .tmp file left after atomic rename");
         // Real file parses to the written flags.
         let loaded = load_feed_state(&path).expect("Some");
         assert!(loaded.dhan_enabled && loaded.groww_enabled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The temp path is UNIQUE per write (pid + nanos), so two concurrent writers
+    /// never share a tmp name and cannot truncate each other into a torn file.
+    /// Two back-to-back writes use distinct tmp names AND the on-disk file is
+    /// always a complete valid snapshot reflecting the last write (FIX 1).
+    #[test]
+    fn test_unique_tmp_path_differs_per_call_and_last_write_wins() {
+        let dir = unique_tmp_dir("unique-tmp");
+        let data = dir.join(FEED_STATE_DIR);
+        std::fs::create_dir_all(&data).unwrap();
+        let path = data.join(FEED_STATE_FILENAME);
+        // Two unique tmp names for the same final path differ (pid same, nanos differ).
+        let a = unique_tmp_path(&path);
+        let b = unique_tmp_path(&path);
+        assert_ne!(a, b, "unique tmp path must differ between calls");
+        assert!(
+            a.to_string_lossy().ends_with(".tmp")
+                && a.parent() == Some(data.as_path())
+                && a.to_string_lossy().contains(FEED_STATE_FILENAME),
+            "unique tmp sits next to the final file and ends with .tmp"
+        );
+        // Last-writer-wins: write two different snapshots; the final file is the
+        // last one, always a complete valid snapshot.
+        persist_feed_state(&status(true, false), &path).expect("first persist");
+        persist_feed_state(&status(false, true), &path).expect("second persist");
+        let loaded = load_feed_state(&path).expect("Some");
+        assert!(
+            !loaded.dhan_enabled && loaded.groww_enabled,
+            "last write wins"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On Unix the overlay file is created with mode `0o600` (owner-only) —
+    /// defence-in-depth least privilege (FIX 2).
+    #[cfg(unix)]
+    #[test]
+    fn test_persisted_file_has_owner_only_permissions_on_unix() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = unique_tmp_dir("perms");
+        let data = dir.join(FEED_STATE_DIR);
+        std::fs::create_dir_all(&data).unwrap();
+        let path = data.join(FEED_STATE_FILENAME);
+        persist_feed_state(&status(true, true), &path).expect("persist");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "feed-state file must be owner read/write only");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
