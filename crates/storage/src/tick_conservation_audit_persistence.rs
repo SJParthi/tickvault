@@ -220,7 +220,7 @@ pub async fn ensure_tick_conservation_audit_table(questdb_config: &QuestDbConfig
 }
 
 /// Lazy-connect ILP writer for the `tick_conservation_audit` table. Mirrors
-/// `CrossVerify1mAuditWriter`: if QuestDB is unreachable at construction the
+/// `FeedParity1mAuditWriter`: if QuestDB is unreachable at construction the
 /// writer still builds (`sender = None`); `append_row` fills the local buffer
 /// and `flush` returns `Err` until QuestDB is reachable.
 pub struct TickConservationAuditWriter {
