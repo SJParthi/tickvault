@@ -100,6 +100,17 @@ impl FeedRuntimeState {
         self.dhan_lane_running.load(Ordering::Relaxed)
     }
 
+    /// PR-2: set the Dhan lane-running flag BOTH ways. `mark_dhan_lane_running`
+    /// (the inline boot's one-way `true`) stays; this is the two-way setter the
+    /// dormant Dhan activation watcher (`dhan_activation`) uses to keep the feed
+    /// page honest across runtime toggles — `true` once the lane is (re)activated,
+    /// `false` on a runtime disable — so the page never shows a stale "running"
+    /// after a teardown (mirrors `set_groww_lane_running`).
+    pub fn set_dhan_lane_running(&self, running: bool) {
+        // Relaxed: UI-status-only flag; no ordering dependency with other shared state.
+        self.dhan_lane_running.store(running, Ordering::Relaxed);
+    }
+
     /// PR-E: narrow the Dhan-disable safety gate (boot wires this to `dry_run`).
     pub fn set_dhan_disable_allowed(&self, allowed: bool) {
         self.dhan_disable_allowed.store(allowed, Ordering::Relaxed);
@@ -331,6 +342,23 @@ mod tests {
             state.is_dhan_lane_running(),
             "boot wiring marked it running"
         );
+    }
+
+    #[test]
+    fn test_set_dhan_lane_running_toggles_both_ways() {
+        // PR-2: the Dhan activation watcher sets the flag true on the enable
+        // (re)activation and false on a runtime disable. Both directions must
+        // round-trip — the disable path is what clears a stale "running" so the
+        // feed page never lies after a teardown (mirrors set_groww_lane_running).
+        let state = FeedRuntimeState::default();
+        // Default mirrors prod: NOT running until the boot wiring / watcher marks it.
+        assert!(!state.is_dhan_lane_running(), "default not running");
+        state.set_dhan_lane_running(true);
+        assert!(state.is_dhan_lane_running(), "set true => running");
+        assert!(state.snapshot().dhan_lane_running);
+        state.set_dhan_lane_running(false);
+        assert!(!state.is_dhan_lane_running(), "set false => stopped");
+        assert!(!state.snapshot().dhan_lane_running);
     }
 
     #[test]
