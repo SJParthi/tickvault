@@ -192,7 +192,7 @@ async fn main() -> Result<()> {
     if let Some(env_path) = tickvault_app::boot_helpers::config_env_path(&config_env) {
         config_figment = config_figment.merge(Toml::file(env_path));
     }
-    let config: ApplicationConfig = config_figment
+    let mut config: ApplicationConfig = config_figment
         .merge(Toml::file(CONFIG_LOCAL_PATH))
         .extract()
         .context("failed to load configuration from config/base.toml")?;
@@ -236,6 +236,34 @@ async fn main() -> Result<()> {
     // is UNCHANGED; the per-feed spawn gating + the native Groww connector land
     // in later PRs of this sequence — until then these WARNs make the partial
     // state explicit (no illusion).
+    //
+    // PR-3 (persist, feed-toggle-full-lifecycle): the operator's LAST webpage
+    // toggle choice is mirrored to a SEPARATE `data/feed-state.json` overlay
+    // (never the git-tracked locked `config/base.toml`). `config.feeds` is the
+    // DEFAULT; if a valid overlay exists it WINS — so the last choice survives a
+    // restart. A missing file → config default (no error); a corrupt/partial
+    // file → config default + a WARN (fail-safe, never a boot crash). The
+    // overlay is applied IN PLACE onto `config.feeds`, so BOTH `feeds.*` below
+    // AND the `if !config.feeds.dhan_enabled` per-feed boot dispatcher gate read
+    // the EFFECTIVE state with no further edits.
+    {
+        let overlay_path = tickvault_api::feed_state_persist::feed_state_path();
+        let persisted = tickvault_api::feed_state_persist::load_feed_state(&overlay_path);
+        if persisted.is_some() {
+            info!(
+                "feed-state overlay found (data/feed-state.json) — restoring the last \
+                 webpage toggle choice over the config default"
+            );
+        } else if overlay_path.exists() {
+            // The file exists but did not load (corrupt / unreadable) — fail-safe
+            // to the config default, but make it visible (no silent fall-through).
+            warn!(
+                "feed-state overlay present but unreadable/corrupt (data/feed-state.json) \
+                 — falling back to the config default per-feed enabled state"
+            );
+        }
+        config.feeds = tickvault_api::feed_state_persist::overlay_feeds(config.feeds, persisted);
+    }
     let feeds = &config.feeds;
     // Feed-toggle API (operator AskUserQuestion 2026-06-19): ONE shared
     // `Arc<FeedRuntimeState>` seeded from config, handed to BOTH the API state
