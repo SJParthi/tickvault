@@ -589,6 +589,18 @@ pub enum ErrorCode {
     /// Severity::High. Operator inspects + manually resets via REST or
     /// restart.
     IndexOhlc02DailyResetFailed,
+
+    // -----------------------------------------------------------------------
+    /// PREVDAY-01: the boot-time previous-day OHLCV fetch
+    /// (`run_prev_day_ohlcv_fetch`) returned ZERO yesterday candles for the
+    /// subscribed universe (`PrevDayCoverage::Empty`). Either Dhan returned
+    /// 200-with-empty-body for every symbol (the 774-silent-empties signature
+    /// observed 2026-06-26) or the universe was empty. Boot is fail-soft and
+    /// never blocks; the prev-day reference cache simply has no rows until the
+    /// next successful boot, so `*_pct_from_prev_day` columns read 0.
+    /// Severity::High — a real boot-data gap that an operator must see, but
+    /// NOT a halt. Auto-triage-safe (visibility-only; operator informs).
+    PrevDay01CoverageEmpty,
 }
 
 impl ErrorCode {
@@ -735,6 +747,8 @@ impl ErrorCode {
             Self::OptionChain08TokenExpiredMidCycle => "OPTION-CHAIN-08",
             // Day OHLC tracker for IDX_I
             Self::IndexOhlc02DailyResetFailed => "INDEX-OHLC-02",
+            // Boot-time previous-day OHLCV fetch (PR4 2026-06-01)
+            Self::PrevDay01CoverageEmpty => "PREVDAY-01",
         }
     }
 
@@ -805,6 +819,8 @@ impl ErrorCode {
             | Self::OptionChain06CycleOverlapSkip
             // PR #2.5 — INDEX-OHLC-02 is High (carry-over wrong but recoverable)
             | Self::IndexOhlc02DailyResetFailed
+            // PR4 2026-06-01 — PREVDAY-01 is High (boot-data gap, not a halt)
+            | Self::PrevDay01CoverageEmpty
             // Operator 2026-06-02 — post-market 1m cross-verify (both High)
             | Self::CrossVerify1m01MismatchFound
             | Self::CrossVerify1m02FetchDegraded
@@ -1026,6 +1042,10 @@ impl ErrorCode {
             Self::IndexOhlc02DailyResetFailed => {
                 ".claude/rules/project/index-day-ohlc-tracker-error-codes.md"
             }
+            // Boot-time previous-day OHLCV fetch (PR4 2026-06-01)
+            Self::PrevDay01CoverageEmpty => {
+                ".claude/rules/project/prev-day-ohlcv-error-codes.md"
+            }
         }
     }
 
@@ -1170,6 +1190,8 @@ impl ErrorCode {
             Self::OptionChain08TokenExpiredMidCycle,
             // Day OHLC tracker for IDX_I (Ticker mode)
             Self::IndexOhlc02DailyResetFailed,
+            // Boot-time previous-day OHLCV fetch coverage (PR4 2026-06-01)
+            Self::PrevDay01CoverageEmpty,
         ]
     }
 }
@@ -1435,7 +1457,38 @@ mod tests {
         // 2026-06-12 (WS lifecycle audit table): bumped 107 -> 108 for
         // AUDIT-WS-01 (ws_event_audit row write failed — covers all 6 WS
         // lifecycle event kinds, future-proof for 5+5+5+1 connections).
-        assert_eq!(ErrorCode::all().len(), 108);
+        // 2026-06-26 (log-driven fixes): bumped 108 -> 109 for PREVDAY-01
+        // (boot-time previous-day OHLCV fetch coverage EMPTY — typed +
+        // per-empty observability for the 774-silent-empties signature).
+        assert_eq!(ErrorCode::all().len(), 109);
+    }
+
+    #[test]
+    fn test_prev_day_01_coverage_empty_contract() {
+        let code = ErrorCode::PrevDay01CoverageEmpty;
+        // Wire-format string + roundtrip via FromStr.
+        assert_eq!(code.code_str(), "PREVDAY-01");
+        assert_eq!("PREVDAY-01".parse::<ErrorCode>(), Ok(code));
+        // High (boot-data gap, not a halt) and therefore auto-triage-safe.
+        assert_eq!(code.severity(), Severity::High);
+        assert!(code.is_auto_triage_safe());
+        // Runbook points at the dedicated rule file and exists on disk.
+        assert_eq!(
+            code.runbook_path(),
+            ".claude/rules/project/prev-day-ohlcv-error-codes.md"
+        );
+        let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map(|root| root.join(code.runbook_path()))
+            .expect("workspace root");
+        assert!(
+            abs.exists(),
+            "PREVDAY-01 runbook missing on disk: {}",
+            abs.display()
+        );
+        // Listed in the catalogue.
+        assert!(ErrorCode::all().contains(&code));
     }
 
     #[test]
@@ -1498,7 +1551,9 @@ mod tests {
                 // NTM Sub-PR #10a (§31): niftyindices constituent source degrade
                 || s.starts_with("NTM-CONSTITUENCY-")
                 // Operator 2026-06-10: daily end-to-end tick-conservation audit
-                || s.starts_with("TICK-CONSERVE-");
+                || s.starts_with("TICK-CONSERVE-")
+                // PR4 2026-06-01: boot-time previous-day OHLCV fetch coverage
+                || s.starts_with("PREVDAY-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
