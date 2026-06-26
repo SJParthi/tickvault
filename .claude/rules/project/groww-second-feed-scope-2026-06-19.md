@@ -145,6 +145,8 @@ Always loaded. Activates on any session that:
 
 # §32 — Python-SDK live-feed validation path (operator authorization 2026-06-19, evening)
 
+> **⚠ PARTIALLY SUPERSEDED 2026-06-26 by §33 below:** §32 was authorized for the live-vs-backtest VALIDATION goal ("is Groww-live == Groww-backtest?"). Per the operator's 2026-06-26 LIVE-FEED-ONLY directive (§33), Groww historical/backtest pulls are now FORBIDDEN, so the §32.1/§32.2 backtest-comparison purpose (the `get_historical_candles` capture, "parity checker" role of the Rust consumer) is HALTED. The §32 Python LIVE-feed front-end itself (default-OFF, local-first, capture-at-receipt → the existing Rust ring→spill→DLQ→aggregator) remains valid for LIVE ticks only — it just no longer feeds a backtest comparator. §32 is retained for audit; read §33 first.
+
 > **Authority:** this section AMENDS §4 of this same lock. The §4 blanket
 > "a `growwapi` Python dependency, or a Python sidecar process = REJECT" is
 > NARROWED below: a Python `growwapi` process is **AUTHORIZED — but ONLY** under
@@ -215,3 +217,75 @@ fast path; it already contains the NATS-over-WS + nkey + protobuf decode.
 - A weaker-than-Dhan resilience guarantee on the Groww path beyond the honestly
   documented at-receipt window → REJECT.
 - Adding a Dhan WebSocket, or any change to the 2-Dhan-WS lock → REJECT (unchanged).
+
+---
+
+# §33 — Groww LIVE-FEED-ONLY (operator lock 2026-06-26)
+
+> **Authority:** this section SUPERSEDES the §0 Quote-1 live-vs-backtest deliverable and
+> HALTS the §32 Python-sidecar backtest-comparison purpose (the `get_historical_candles`
+> capture + the Rust consumer's "parity checker" role). It does NOT lift the §32 Python
+> LIVE-feed front-end for live ticks, and it does NOT touch Dhan. All other locks in this
+> file (the 2-Dhan-WS lock §3, the shared-table model, default-OFF, per-feed enable/disable,
+> native-Rust-only/no-brutex-code, the §4/§32.4 REJECT conditions) stand unchanged.
+
+## §33.0 The verbatim operator demands (preserve exactly, do not paraphrase)
+
+**Quote 9 (2026-06-26 — no Groww historical pulls):**
+> "as of now we should never ever pull any historical data for groww dude okay?"
+
+**Quote 10 (2026-06-26 — Groww is purely live, no backtest focus):**
+> "nowhere focus on the backtest here dude because this is purely for live alone dude okay?"
+
+## §33.1 The rule (one line)
+
+**Groww is LIVE-FEED-ONLY. Pulling ANY Groww historical / backtest / intraday-candle data is
+FORBIDDEN until the operator re-authorizes with a fresh dated quote. The live-vs-backtest
+1-minute parity track is CANCELLED.**
+
+## §33.2 What this HALTS / CANCELS
+
+| Cancelled | Detail |
+|---|---|
+| §0 Quote-1 live↔backtest goal | The "check whether at least groww live feed data and groww backtesting is same or not" deliverable is HALTED. Groww has no backtest source to compare against. |
+| §32.1/§32.2 backtest-comparison purpose | The Python sidecar's role is reduced to **live tick capture only**. No `get_historical_candles` / `growwapi` historical call. The Rust consumer is a live 1m/21-TF sealer, NOT a parity checker, for Groww. |
+| Plan parity track | `.claude/plans/active-plan-groww-live-backtest-parity.md` SP5 (parity audit table) / SP6 / SP6a / SP6b (`BacktestSource` trait + Dhan/Groww fetchers) / SP7 (parity orchestrator) are CANCELLED. The abandoned SP6a branch (`claude/parity-sp6-backtest-source`) was discarded. |
+| Any Groww `BacktestSource` impl | `crates/core/src/feed/groww/backtest.rs`, `scripts/groww-sidecar/groww_backtest_fetch.py`, and any Groww historical fetcher MUST NOT be created. |
+
+## §33.3 What is UNCHANGED
+
+- **Dhan is completely unaffected.** Dhan's own historical cross-verify (`crates/app/src/cross_verify_1m_boot.rs`, `cross_verify_1m_audit`) and the boot-time prev-day OHLCV fetch (Dhan REST, fail-soft, NOT a boot-blocker — `prev-day-ohlcv-error-codes.md`) stay exactly as-is. This directive is Groww-only.
+- **The Groww LIVE feed continues.** Groww live ticks → WAL → ring → spill → DLQ → 1m/21-TF candles tagged `feed='groww'`, default-OFF behind `feeds.groww_enabled`, per the §3 shared-table model and the §32 live-capture front-end. Zero-tick-loss capture-at-receipt is preserved.
+- The 2-Dhan-WebSocket lock, the native-Rust-only rule (brutex = reference only), and all §4/§32.4 REJECT conditions remain in force.
+
+## §33.4 What a PR that violates this lock looks like (REJECT)
+
+- Creates or wires ANY Groww historical / backtest / intraday-candle fetcher (`BacktestSource` for Groww, `groww_backtest_fetch.py`, a `growwapi` `get_historical_candles` call, etc.).
+- Re-activates SP5/SP6/SP7 of the parity plan for Groww, or wires a Groww parity orchestrator.
+- Touches the Dhan historical cross-verify or Dhan prev-day OHLCV in the name of this directive (it is Groww-only — leave Dhan alone).
+- Disables the Groww LIVE feed in the name of "no backtest" (live is explicitly KEPT).
+
+Any such PR MUST be rejected in review even if the operator approves verbally — the operator
+must update this §33 FIRST with a fresh dated quote re-authorizing Groww historical, only then
+can the PR land.
+
+## §33.5 Honest envelope (mandatory per §5 / operator-charter §F)
+
+> "Groww is live-feed-only as of 2026-06-26. We capture and seal Groww LIVE ticks (1m + 21 TFs,
+> tagged `feed='groww'`) with the same bounded zero-tick-loss chain as Dhan — but we make NO
+> claim about Groww live-vs-backtest agreement, because we deliberately fetch NO Groww backtest
+> data. The Dhan-side historical cross-verify is the only OHLCV parity signal in the system and
+> is untouched."
+
+## §33.6 Auto-driver / Insta-reel explanation
+
+> Sir, earlier we wanted to hang Groww's LIVE price board next to Groww's OLD record book and
+> check they match. The operator now says: forget the old record book entirely — for Groww we
+> only care about the LIVE board, right now, this second. So we keep the live board running, we
+> stop ordering the old record book completely, and we throw away the half-built "fetch the old
+> book" machine. Nothing about supplier Dhan changes — Dhan keeps both its boards.
+
+## §33.7 Trigger (auto-loaded)
+
+Always loaded (this file is under `.claude/rules/project/`). Reinforced on any session that
+edits Groww feed code, the parity plan, or proposes any Groww historical/backtest fetch.
