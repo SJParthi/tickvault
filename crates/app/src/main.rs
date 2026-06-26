@@ -244,8 +244,9 @@ async fn main() -> Result<()> {
     // restart. A missing file → config default (no error); a corrupt/partial
     // file → config default + a WARN (fail-safe, never a boot crash). The
     // overlay is applied IN PLACE onto `config.feeds`, so BOTH `feeds.*` below
-    // AND the `if !config.feeds.dhan_enabled` per-feed boot dispatcher gate read
-    // the EFFECTIVE state with no further edits.
+    // AND the Dhan-off per-feed boot dispatcher gate (the `config.feeds`
+    // dhan-enabled skip-guard further down) read the EFFECTIVE state with no
+    // further edits.
     {
         let overlay_path = tickvault_api::feed_state_persist::feed_state_path();
         let persisted = tickvault_api::feed_state_persist::load_feed_state(&overlay_path);
