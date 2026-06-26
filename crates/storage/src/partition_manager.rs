@@ -77,7 +77,14 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // Groww second-feed live-vs-backtest 1m parity mismatches (operator lock §32):
     // one row per mismatched (instrument, minute, field) — same SEBI-audit class +
     // DAY partitioning as cross_verify_1m_audit. Isolated `groww_*` namespace.
+    // RETAINED (NEVER dropped, SEBI 5y) even after SP5 unified the writer — these
+    // two siloed tables hold pre-SP5 history (the Dhan one) / are empty (the Groww
+    // one); new mismatches go to `feed_parity_1m_audit` below.
     "groww_cross_verify_1m_audit",
+    // SP5 (parity plan): the ONE unified live-vs-backtest 1m parity audit table —
+    // both feeds write here, `feed` is in the DEDUP key. Same SEBI-audit class +
+    // DAY partitioning as the two siloed tables it merges.
+    "feed_parity_1m_audit",
 ];
 
 /// Tables EXEMPT from retention sweeping — NEVER detached or dropped.
