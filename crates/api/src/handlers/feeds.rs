@@ -105,10 +105,14 @@ pub async fn set_feed(
     Json(req): Json<SetFeedRequest>,
 ) -> Result<Json<FeedsStatusResponse>, (StatusCode, Json<FeedErrorResponse>)> {
     let Some(feed) = Feed::parse(&feed_name) else {
+        // FIX 4 (3-agent: reflected user input): do NOT echo the URL segment back
+        // in the error body. Valid feeds are a closed enum (`Feed::ALL`), and the
+        // `allowed` list already tells the caller every legal value — a static
+        // message keeps unsanitized path input out of the response entirely.
         return Err((
             StatusCode::BAD_REQUEST,
             Json(FeedErrorResponse {
-                error: format!("unknown feed: {feed_name}"),
+                error: "unknown feed".to_string(),
                 allowed: toggleable_feed_labels(),
             }),
         ));
@@ -193,6 +197,18 @@ pub async fn set_feed(
     // (live this session); only the durable record failed, and a later
     // successful toggle self-heals it. This call is inside the bearer-auth
     // handler (GAP-SEC-01) — no new route, no new attack surface.
+    //
+    // FIX 3 (3-agent TOCTOU): we persist `snapshot()` — the ACTUAL atomic
+    // runtime truth AFTER `set_enabled` — NOT `req.enabled` raw, because the
+    // PR-E safety gate above may have refused the requested value (e.g. a Dhan
+    // disable rejected with 409 never reaches here, but persisting the
+    // post-set snapshot is the invariant that keeps the on-disk record equal to
+    // the live state). Concurrent same-feed toggles are EVENTUALLY CONSISTENT:
+    // last-writer-wins, and because each write goes through a unique-tmp +
+    // atomic rename (see `feed_state_persist::persist_feed_state`) the on-disk
+    // file is ALWAYS a complete valid full snapshot — never torn. No lock is
+    // needed; a brief overlap merely means the last toggle's snapshot wins,
+    // which is the desired semantics for a single-operator control surface.
     let snap = state.feed_runtime().snapshot();
     if let Err(err) = crate::feed_state_persist::persist_feed_state(
         &snap,
@@ -535,6 +551,12 @@ mod tests {
             panic!("unknown feed must be rejected");
         };
         assert_eq!(code, StatusCode::BAD_REQUEST);
-        assert!(body.error.contains("kite"));
+        // FIX 4: the error body is a STATIC string and must NOT echo the
+        // user-supplied feed name back (no reflected input).
+        assert_eq!(body.error, "unknown feed");
+        assert!(
+            !body.error.contains("kite"),
+            "unknown-feed error must not reflect the URL segment"
+        );
     }
 }
