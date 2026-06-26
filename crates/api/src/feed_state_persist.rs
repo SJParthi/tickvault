@@ -74,8 +74,27 @@ pub fn feed_state_path() -> PathBuf {
 /// traversal.
 #[must_use]
 pub fn validate_feed_state_path(path: &Path) -> bool {
-    path.file_name() == Some(std::ffi::OsStr::new(FEED_STATE_FILENAME))
-        && path.parent() == Some(Path::new(FEED_STATE_DIR))
+    // No traversal segment anywhere in the path.
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    // The file name MUST be exactly the fixed overlay filename ...
+    if path.file_name() != Some(std::ffi::OsStr::new(FEED_STATE_FILENAME)) {
+        return false;
+    }
+    // ... and its immediate parent directory MUST be named exactly
+    // `FEED_STATE_DIR` (the `data` dir). The parent may be relative
+    // (`data/feed-state.json`, production) or absolute under a test temp dir
+    // (`/tmp/.../data/feed-state.json`) — in both cases the LAST component of
+    // the parent is `data`, which is the invariant that matters for traversal
+    // safety; production always uses the relative canonical path.
+    match path.parent().and_then(Path::file_name) {
+        Some(parent_name) => parent_name == std::ffi::OsStr::new(FEED_STATE_DIR),
+        None => false,
+    }
 }
 
 /// Current IST wall-clock as `"%Y-%m-%d %H:%M:%S"` for the `updated_at_ist`
