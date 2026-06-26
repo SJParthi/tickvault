@@ -10,6 +10,20 @@ operator's 2026-06-26 live boot logs. Changed crates: **core** (Fix A),
 
 ---
 
+## Per-Item Guarantee Matrix
+
+See `.claude/rules/project/per-wave-guarantee-matrix.md`. All 15 rows of the
+Guarantee Matrix and all 7 rows of the Resilience Demand Matrix apply to every
+item in this plan. Both fixes are cold-path / observability-only: Fix A
+(alias-aware index allowlist + canonical-name dedup) is O(1) in the once-daily
+index extraction and preserves composite `(security_id, exchange_segment)`
+uniqueness; Fix B (PREVDAY-01 typed error + per-empty counter/coalesced log)
+adds no tick-drop path and no hot-path allocation. Coverage: index_extractor
+alias + collision tests, ErrorCode catalogue/cross-ref/tag-guard, triage-rule
+coverage guard — all ratcheted.
+
+---
+
 ## Design
 
 ### Fix A — alias-aware index allowlist (NIFTY NEXT 50 self-heal)
