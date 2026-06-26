@@ -5,7 +5,7 @@
 > **Authority:** `.claude/rules/project/live-feed-purity.md` rule 11,
 > `.claude/rules/project/cross-verify-1m-error-codes.md`.
 > **Code:** `crates/app/src/cross_verify_1m_boot.rs`,
-> `crates/storage/src/cross_verify_1m_audit_persistence.rs`, wired in
+> `crates/storage/src/feed_parity_1m_audit_persistence.rs`, wired in
 > `crates/app/src/main.rs`.
 
 ## TL;DR
