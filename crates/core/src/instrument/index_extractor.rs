@@ -40,6 +40,7 @@
 #![cfg(feature = "daily_universe_fetcher")]
 
 use thiserror::Error;
+use tickvault_common::constants::INDEX_SYMBOL_ALIASES;
 
 use super::csv_parser::CsvRow;
 
@@ -137,6 +138,31 @@ pub fn normalize_index_symbol(symbol: &str) -> String {
         .to_ascii_uppercase()
 }
 
+/// Normalize a Dhan IDX_I row symbol, then resolve it through
+/// [`INDEX_SYMBOL_ALIASES`] (alias → canonical) so symbols Dhan renamed map
+/// back to their [`NSE_INDEX_ALLOWLIST`] form. Returns the canonical allowlist
+/// string when an alias matches, otherwise the normalized symbol unchanged.
+///
+/// This is the SELF-HEAL for the 2026-06-26 live WARN
+/// `index allowlist MISS ... NIFTY NEXT 50`: Dhan publishes that index as
+/// `NIFTY NXT 50` / `NIFTYNXT50`, neither of which equals the allowlisted
+/// `NIFTY NEXT 50` under an EXACT match. The alias map carries both forms →
+/// canonical `NIFTY NEXT 50`, so the row is no longer silently dropped.
+///
+/// O(1) EXEMPT: cold-path boot only (once per CSV index row); the alias map is
+/// a fixed small slice scanned linearly with no allocation beyond the one
+/// `normalize_index_symbol` `String`.
+#[must_use]
+pub fn canonicalize_index_symbol(symbol: &str) -> String {
+    let norm = normalize_index_symbol(symbol);
+    for (alias, canonical) in INDEX_SYMBOL_ALIASES {
+        if *alias == norm {
+            return (*canonical).to_string();
+        }
+    }
+    norm
+}
+
 /// Result of the index extraction pass.
 #[derive(Debug, Clone)]
 pub struct IndexExtraction {
@@ -217,11 +243,34 @@ pub fn extract_indices(rows: &[CsvRow]) -> Result<IndexExtraction, IndexExtractE
             // Operator lock 2026-06-01 §30: keep ONLY the 31 allowlisted
             // NSE indices (the Dhan Index-tab set). The master carries
             // 119 NSE index rows; the other 88 are dropped here.
-            let norm = normalize_index_symbol(&row.symbol_name);
+            // Alias-aware (2026-06-26): resolve Dhan renames (e.g.
+            // `NIFTY NXT 50` / `NIFTYNXT50` → `NIFTY NEXT 50`) via
+            // `INDEX_SYMBOL_ALIASES` so a renamed index self-heals instead
+            // of being dropped.
+            let norm = canonicalize_index_symbol(&row.symbol_name);
             if let Some(pos) = NSE_INDEX_ALLOWLIST
                 .iter()
                 .position(|allowed| *allowed == norm)
             {
+                // Dual-naming collision guard (hostile-review LOW, 2026-06-26):
+                // matching is now alias-aware, so two DISTINCT-SID Dhan rows can
+                // canonicalize to the SAME allowlist entry (e.g. a master that
+                // ships BOTH `NIFTY NEXT 50` and `NIFTY NXT 50`). Without this
+                // guard both rows would be pushed → two subscription targets for
+                // ONE logical index. `matched[pos]` already records whether this
+                // canonical entry was seen; first-row-wins, the duplicate is
+                // SKIPPED and LOUD-warned (no silent extra subscription).
+                if matched[pos] {
+                    tracing::warn!(
+                        duplicate_symbol = %row.symbol_name,
+                        canonical = NSE_INDEX_ALLOWLIST[pos],
+                        duplicate_security_id = %row.security_id,
+                        "index dual-naming collision: another IDX_I row already \
+                         matched this canonical index; skipping the duplicate \
+                         (first-row-wins) to keep ONE subscription target"
+                    );
+                    continue;
+                }
                 matched[pos] = true;
                 nse_indices.push(row.clone());
             }
@@ -522,6 +571,86 @@ mod tests {
             "NIFTY MID100 FREE"
         );
         assert_eq!(normalize_index_symbol("giftnifty"), "GIFTNIFTY");
+    }
+
+    #[test]
+    fn canonicalize_index_symbol_resolves_aliases_and_passes_through() {
+        // Alias hits → canonical allowlist form.
+        assert_eq!(canonicalize_index_symbol("NIFTY NXT 50"), "NIFTY NEXT 50");
+        assert_eq!(canonicalize_index_symbol("NIFTYNXT50"), "NIFTY NEXT 50");
+        // Lowercase / extra-space variants normalize first, then alias-resolve.
+        assert_eq!(canonicalize_index_symbol("nifty nxt 50"), "NIFTY NEXT 50");
+        assert_eq!(canonicalize_index_symbol("  niftynxt50 "), "NIFTY NEXT 50");
+        // No alias → normalized passthrough.
+        assert_eq!(canonicalize_index_symbol("NIFTY"), "NIFTY");
+        assert_eq!(canonicalize_index_symbol("nifty 50"), "NIFTY 50");
+        // Already-canonical allowlist form is a no-op.
+        assert_eq!(canonicalize_index_symbol("NIFTY NEXT 50"), "NIFTY NEXT 50");
+    }
+
+    #[test]
+    fn test_nifty_next_50_resolves_via_alias() {
+        // Regression: 2026-06-26 — Dhan publishes NIFTY NEXT 50 as
+        // `NIFTY NXT 50` / `NIFTYNXT50`; the EXACT-match allowlist dropped it
+        // (live WARN `index allowlist MISS ... NIFTY NEXT 50`). Both forms must
+        // now land in nse_indices as the allowlisted `NIFTY NEXT 50`.
+        for dhan_symbol in ["NIFTY NXT 50", "NIFTYNXT50"] {
+            let rows = vec![
+                idx_i_row("13", "NSE", "INDEX", "NIFTY"),
+                idx_i_row("38", "NSE", "INDEX", dhan_symbol),
+                idx_i_row("51", "BSE", "INDEX", "SENSEX"),
+            ];
+            let result = extract_indices(&rows).expect("extract");
+            assert!(
+                result.nse_indices.iter().any(|r| r.security_id == "38"),
+                "Dhan symbol {dhan_symbol} must be kept via alias"
+            );
+            // The allowlisted canonical name must NOT be reported as a miss.
+            assert!(
+                !result.allowlist_misses.contains(&"NIFTY NEXT 50"),
+                "NIFTY NEXT 50 must self-heal for {dhan_symbol}, not be a miss"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dual_naming_collision_keeps_one_index() {
+        // Hostile-review LOW (2026-06-26): now that matching is alias-aware,
+        // a master that ships BOTH `NIFTY NEXT 50` and `NIFTY NXT 50` as two
+        // DISTINCT-SID IDX_I rows canonicalizes both to `NIFTY NEXT 50`.
+        // Without the dedup guard that would yield TWO subscription targets for
+        // ONE logical index. Assert exactly ONE survives (first-row-wins) and
+        // the canonical name is NOT reported as a miss.
+        let rows = vec![
+            idx_i_row("13", "NSE", "INDEX", "NIFTY"),
+            idx_i_row("38", "NSE", "INDEX", "NIFTY NEXT 50"), // canonical — first, kept
+            idx_i_row("99", "NSE", "INDEX", "NIFTY NXT 50"),  // alias of same — skipped
+            idx_i_row("51", "BSE", "INDEX", "SENSEX"),
+        ];
+        let result = extract_indices(&rows).expect("extract");
+        // Exactly one NIFTY NEXT 50 subscription target.
+        let next50_count = result
+            .nse_indices
+            .iter()
+            .filter(|r| canonicalize_index_symbol(&r.symbol_name) == "NIFTY NEXT 50")
+            .count();
+        assert_eq!(
+            next50_count, 1,
+            "dual-naming collision must yield exactly ONE NIFTY NEXT 50 target"
+        );
+        // First-row-wins: the canonical-named row (sid 38) is the survivor.
+        assert!(
+            result.nse_indices.iter().any(|r| r.security_id == "38"),
+            "first matching row (sid 38) must be the kept one"
+        );
+        assert!(
+            !result.nse_indices.iter().any(|r| r.security_id == "99"),
+            "the duplicate row (sid 99) must be skipped"
+        );
+        // NIFTY + NIFTY NEXT 50 present → 2 NSE indices, not 3.
+        assert_eq!(result.nse_indices.len(), 2);
+        // The canonical index was matched, so it is NOT a miss.
+        assert!(!result.allowlist_misses.contains(&"NIFTY NEXT 50"));
     }
 
     #[test]

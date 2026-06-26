@@ -3209,7 +3209,10 @@ async fn main() -> Result<()> {
                             "prev-day OHLCV coverage DEGRADED — symbols missing yesterday's candle"
                         ),
                         PrevDayCoverage::Empty => error!(
+                            code = tickvault_common::error_code::ErrorCode::PrevDay01CoverageEmpty
+                                .code_str(),
                             expected = pd_expected,
+                            skipped = summary.skipped,
                             failed = summary.failed,
                             "prev-day OHLCV coverage EMPTY — no yesterday candles fetched"
                         ),
