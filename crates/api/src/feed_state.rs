@@ -379,6 +379,25 @@ mod tests {
     }
 
     #[test]
+    fn test_dhan_pool_present_sentinel() {
+        // PR-2 false-OK fix: tests mark_dhan_pool_present + is_dhan_pool_present.
+        // Default/boot-OFF: no pool present, so a runtime enable must NOT mark the
+        // lane running (the watcher gates on this). Boot-ON: the inline spine marks
+        // it, so the watcher may mark the lane running. This is the sentinel that
+        // distinguishes "a real pool exists to resume" from "nothing to resume".
+        let state = FeedRuntimeState::default();
+        assert!(
+            !state.is_dhan_pool_present(),
+            "default/boot-OFF: no pool spawned"
+        );
+        state.mark_dhan_pool_present();
+        assert!(
+            state.is_dhan_pool_present(),
+            "boot-ON: inline spine marked the pool present"
+        );
+    }
+
+    #[test]
     fn test_set_dhan_lane_running_toggles_both_ways() {
         // PR-2: the Dhan activation watcher sets the flag true on the enable
         // (re)activation and false on a runtime disable. Both directions must
