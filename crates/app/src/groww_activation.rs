@@ -49,6 +49,17 @@ use tracing::{error, info, warn};
 const GROWW_ACTIVATION_POLL_SECS: u64 = 2;
 const GROWW_ACTIVATION_POLL: Duration = Duration::from_secs(GROWW_ACTIVATION_POLL_SECS);
 
+/// Today's IST date as `YYYY-MM-DD`. Computed at ACTIVATION time (not boot) so a
+/// runtime re-enable past IST midnight uses today's watch date, never a stale
+/// boot-day date (security-review MEDIUM: a date frozen at boot would build the
+/// wrong day's watch-list after an overnight re-enable). Pure wall-clock read.
+fn today_ist_date() -> String {
+    (chrono::Utc::now()
+        + chrono::TimeDelta::seconds(tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64))
+    .format("%Y-%m-%d")
+    .to_string()
+}
+
 /// What the reconciler decides to do this tick, given the desired enable state
 /// vs whether the lane is currently activated. Pure (unit-tested) so the watcher
 /// loop stays a trivial poll around this decision. Level-triggered: it compares
@@ -76,6 +87,22 @@ pub fn reconcile_lane_action(desired_enabled: bool, currently_activated: bool) -
     }
 }
 
+/// Detect a DEAD activation task: the lane is desired ON, the activation task
+/// has finished, yet the lane never came up. This is the panic / early-return
+/// blind-spot — the task ended (panicked, or returned before marking running)
+/// but `set_groww_lane_running(false)` was its last word, so `reconcile` (which
+/// reads `active_task.is_some()`) would see an activated lane forever and never
+/// re-Start it → silently dead lane (desired ON, running=false, no alert).
+///
+/// Pure + total so the watcher loop stays a trivial poll around this decision.
+/// Returns true ONLY for `(desired=ON, task finished, lane NOT running)` — a
+/// task that finished AFTER marking the lane running (the success path) is NOT
+/// a dead lane and must NOT be re-started.
+#[must_use]
+pub fn is_dead_activation(desired_enabled: bool, task_finished: bool, lane_running: bool) -> bool {
+    desired_enabled && task_finished && !lane_running
+}
+
 // Run the activation watcher for the process lifetime. Spawned UNCONDITIONALLY
 // at boot. Level-triggered: it reconciles the live `is_enabled(Feed::Groww)`
 // flag against the lane's activated state every poll, so a feed ENABLED at boot
@@ -88,7 +115,6 @@ pub fn reconcile_lane_action(desired_enabled: bool, currently_activated: bool) -
 pub async fn run_groww_activation_watcher(
     feed_runtime: Arc<FeedRuntimeState>,
     questdb: QuestDbConfig,
-    watch_date: String,
     max_subscribe: Option<usize>,
     auth_timeout_ms: u64,
 ) {
@@ -99,6 +125,29 @@ pub async fn run_groww_activation_watcher(
     let mut active_task: Option<JoinHandle<()>> = None;
     loop {
         let desired = feed_runtime.is_enabled(Feed::Groww);
+
+        // Dead-task watchdog (panic blind-spot): if the activation task finished
+        // WITHOUT bringing the lane up (a panic, or an early return), clear the
+        // handle so this same tick's reconcile re-Starts it (bounded: one re-spawn
+        // per poll, each doing real async work — not a tight loop). A task that
+        // finished AFTER marking the lane running is the success path and is left
+        // as-is. Mirrors the WS-GAP-05 pool-supervisor respawn pattern.
+        let dead = active_task.as_ref().is_some_and(|h| {
+            is_dead_activation(
+                desired,
+                h.is_finished(),
+                feed_runtime.is_groww_lane_running(),
+            )
+        });
+        if dead {
+            error!(
+                "[feeds] Groww activation task ended without bringing the lane up \
+                 (panic or early return) — re-starting activation so the desired-ON \
+                 feed is not left silently dead"
+            );
+            active_task = None;
+        }
+
         match reconcile_lane_action(desired, active_task.is_some()) {
             LaneAction::Start => {
                 info!(
@@ -114,7 +163,6 @@ pub async fn run_groww_activation_watcher(
                 let task = tokio::spawn(activate_groww_lane(
                     Arc::clone(&feed_runtime),
                     questdb.clone(),
-                    watch_date.clone(),
                     max_subscribe,
                     auth_timeout_ms,
                 ));
@@ -149,16 +197,23 @@ pub async fn run_groww_activation_watcher(
 /// it earlier would be a false-OK on the feed page (operator 2026-06-24: "no
 /// illusion"). All steps run INLINE (no detached children) so the watcher's
 /// `abort()` on a disable cancels every in-flight step.
+///
+/// The watch date is computed HERE (at activation time) via `today_ist_date()`,
+/// never frozen at boot — so a runtime re-enable past IST midnight builds today's
+/// watch-list, not a stale boot-day one (security-review MEDIUM).
 async fn activate_groww_lane(
     feed_runtime: Arc<FeedRuntimeState>,
     questdb: QuestDbConfig,
-    watch_date: String,
     max_subscribe: Option<usize>,
     auth_timeout_ms: u64,
 ) {
     // Not live until the watch-list is built; clear any stale true from a prior
     // ON period so the feed page reports honestly during activation.
     feed_runtime.set_groww_lane_running(false);
+
+    // Compute the watch date NOW (activation time), not at boot — an overnight
+    // re-enable must use today's date, never the boot-day's stale date.
+    let watch_date = today_ist_date();
 
     // Fail-closed date guard (defense-in-depth, operator "cover all worst cases").
     // `watch_date` is system-generated (`%Y-%m-%d`) and never attacker-controlled,
@@ -295,5 +350,36 @@ mod tests {
         // A feed toggle is cold control-plane; 2s observation latency is fine and
         // the loop does zero Groww work while OFF.
         assert_eq!(GROWW_ACTIVATION_POLL, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_is_dead_activation_true_when_finished_and_lane_not_running() {
+        // Panic / early-return blind-spot: desired ON, task finished, lane never
+        // came up → dead lane, must re-start.
+        assert!(is_dead_activation(true, true, false));
+    }
+
+    #[test]
+    fn test_is_dead_activation_false_on_success_path() {
+        // Task finished AFTER marking the lane running → success, NOT dead;
+        // re-starting would needlessly rebuild a live lane.
+        assert!(!is_dead_activation(true, true, true));
+    }
+
+    #[test]
+    fn test_is_dead_activation_false_while_still_running() {
+        // Task still in-flight (not finished) → not dead, regardless of the
+        // running flag (running is false until the watch-list builds).
+        assert!(!is_dead_activation(true, false, false));
+        assert!(!is_dead_activation(true, false, true));
+    }
+
+    #[test]
+    fn test_is_dead_activation_false_when_disabled() {
+        // Desired OFF → the Stop path owns teardown; the dead-task watchdog must
+        // never fire (it only re-starts a DESIRED-ON lane).
+        assert!(!is_dead_activation(false, true, false));
+        assert!(!is_dead_activation(false, true, true));
+        assert!(!is_dead_activation(false, false, false));
     }
 }

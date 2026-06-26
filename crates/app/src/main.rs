@@ -288,10 +288,9 @@ async fn main() -> Result<()> {
     // aborts the in-flight task so no Groww work continues. The sidecar
     // supervisor provisions the venv + launches the Python producer; the bridge
     // tails the producer's tick file. Both self-idle on the same enable flag.
-    let groww_watch_date = (chrono::Utc::now()
-        + chrono::TimeDelta::seconds(tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64))
-    .format("%Y-%m-%d")
-    .to_string();
+    // Watch date is computed at ACTIVATION time inside the watcher (so a runtime
+    // re-enable past IST midnight uses today's date, never a stale boot date) —
+    // not pre-computed here.
     let groww_max_subscribe = std::env::var("GROWW_MAX_SUBSCRIBE")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -319,7 +318,6 @@ async fn main() -> Result<()> {
         tickvault_app::groww_activation::run_groww_activation_watcher(
             std::sync::Arc::clone(&feed_runtime),
             config.questdb.clone(),
-            groww_watch_date,
             groww_max_subscribe,
             config.network.request_timeout_ms,
         ),
