@@ -113,6 +113,12 @@
 - **Evidence:** The Stop-hook reminder text is self-contradictory / mis-templated. It tells the agent to "Call `mcp__slackbot__reply` / `mcp__slackbot__react` / `mcp__slackbot__no_reply_needed`", while the actually-available tools are `mcp__webagent__*` and NO slackbot tools exist in the session. The verbatim hook output in this session mixed both integrations in one message, which is confusing and points the agent at a non-present tool set.
 - **Suggested fix:** Template the hook per the active integration (webagent vs slackbot) so it never references a tool set that is not present in the session.
 
+### UX-03 — Background / parallel tasks lack a live human-readable progress signal, so the operator can't tell "working" from "stuck/hung"
+- **Severity:** Medium
+- **Tag:** UNIVERSAL
+- **Evidence:** In a session that fanned out ~30 background subagents, the Background Tasks panel renders each running agent only as a title + elapsed time + raw token/tool-use counters + a "View transcript" link (e.g., *"Implement PR-4 toggle guards — Agent 6m 45s — 315.1k tokens, 40 tool uses, Bash"*). There is NO live "current action / latest step" line, no phase/percent, and no stall indicator. During long agent runs (several were 10-20 min, one 1m+ token spend) the operator repeatedly could not tell whether an agent was making progress, merely thinking, or actually hung — causing real, recurring anxiety across the session. The orchestrator's own `update_status` checklist is session-LEVEL, not per-background-agent, so it doesn't close this gap.
+- **Suggested fix:** Surface a live one-line "current step / most-recent tool" per background task in the task list (the agent's latest action, or a periodic self-reported status), plus a phase/progress hint and a stall/heartbeat warning when there's been no tool activity for N minutes — so a hung agent is visually distinct from a working one without opening the transcript.
+
 ---
 
 ## How to reproduce / methodology
@@ -122,7 +128,7 @@ These findings were collected during a single live Claude Code session on the Ti
 - **Git/toolchain findings (REL-02, REL-03)** reproduce by inspecting the remote clone (`git log`, attempting `git diff origin/main...HEAD`, and running `cargo fmt --check`) in the remote container.
 - **Long-session environment findings (REL-04, REL-05, REL-06, REL-07)** reproduce by running a sustained multi-worker session: launch many large background workers until the task-output temp dir under `/tmp/claude-0/<session>/tasks` fills (ENOSPC), and observe that subsequent Bash/git/cargo calls fail before capturing output, a context-overflowing subagent dies with "Autocompact is thrashing", and a blocked worker cannot `rm -rf` to self-clear without human approval. **REL-07** reproduces by triggering an environment restart (e.g. after the ENOSPC) while mid-task on an unpushed feature branch: on resume, `git rev-parse --abbrev-ref HEAD` reports `main` (not the working branch) and the scratchpad dir is empty — only origin-pushed branches survive.
 - **Memory findings (MEM-01, MEM-02)** reproduce by listing `.claude/rules/` + reading the APPROVED plan files and comparing their checkbox state against merged PRs on `main`.
-- **Session-UX findings (UX-01, UX-02)** reproduce by ending a turn with plain assistant text in a web-driven session and observing the Stop-hook (`stop-hook-reply-gate.py`) output verbatim.
+- **Session-UX findings (UX-01, UX-02)** reproduce by ending a turn with plain assistant text in a web-driven session and observing the Stop-hook (`stop-hook-reply-gate.py`) output verbatim. **UX-03** reproduces by launching many long-running background subagents in one session and watching the Background Tasks panel: each running agent shows only title + elapsed time + token/tool-use counters + "View transcript", with no live "current step" line and no stall indicator, so a hung agent is indistinguishable from a working one without opening its transcript.
 - **WINs (REL-01, PRO-01, FIT-01)** reproduce by launching multiple background subagents and observing automatic completion re-prompts and the fan-out/fan-in reconciliation.
 
 ## Open questions for the EAP team
