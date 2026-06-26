@@ -297,61 +297,67 @@ fn dhan_auth_and_universe_exist_so_the_gate_actually_wraps_work() {
 }
 
 #[test]
-fn dhan_off_returns_before_auth_and_instruments() {
-    // STRENGTHENED proof (operator 2026-06-23 "strengthen it"): it is not enough
-    // that the gate AND the work both exist — the OFF path must RETURN *before*
-    // Dhan auth and instrument load are ever reached. We prove this positionally:
-    // the `if !config.feeds.dhan_enabled { … return … }` skip block appears, and a
-    // `return` lives BETWEEN that guard and the Dhan auth step. So when Dhan is OFF
-    // the function exits before touching auth / instruments — they are unreachable,
-    // not merely "behind an if".
-    //
-    // D2-pre (behaviour-identical hoist, 2026-06-26): the OFF block now RETURNS the
-    // PROCESS-shared-infra runtime (`return run_shared_infra_only(...).await;`)
-    // instead of a bare `return Ok(())`. It still returns BEFORE auth/instruments
-    // (proven below) and `run_shared_infra_only` itself does NO Dhan auth, NO
-    // instrument fetch, NO Dhan WebSocket — so the OFF-isolation guarantee holds.
+fn dhan_off_skips_auth_and_instruments_via_the_lane_gate() {
+    // D2 Stage 2 (genuine shared-infra hoist, 2026-06-26): the OFF path no longer
+    // early-returns into a duplicate `run_shared_infra_only`. Instead the Dhan
+    // LANE (auth + instruments + WS) is WRAPPED in a single
+    // `if config.feeds.dhan_enabled { … }` expression, and the PROCESS-shared
+    // infra (`build_shared_infra`) is hoisted ABOVE the lane gate. So when Dhan
+    // is OFF the lane block is skipped entirely (no auth, no instrument fetch, no
+    // Dhan WS) and `dhan_lane` is `None` — the OFF-isolation guarantee holds by
+    // construction.
     let src = read_main_rs();
 
-    let guard = src
-        .find("if !config.feeds.dhan_enabled")
-        .expect("the Dhan OFF skip-guard `if !config.feeds.dhan_enabled` must exist");
+    // (1) The Dhan lane is a `let dhan_lane: Option<DhanLaneRunHandles> =
+    //     if config.feeds.dhan_enabled { … }` wrapper, and BOTH Dhan auth and the
+    //     instrument load live INSIDE it (after the wrapper opens).
+    let lane_gate = src
+        .find("let dhan_lane: Option<DhanLaneRunHandles> = if config.feeds.dhan_enabled")
+        .expect(
+            "the Dhan LANE must be wrapped in \
+             `let dhan_lane: Option<DhanLaneRunHandles> = if config.feeds.dhan_enabled {…}` \
+             (D2 Stage 2 genuine hoist)",
+        );
     let auth = src
         .find("authenticating with Dhan")
-        .expect("the Dhan auth step must exist");
+        .expect("the slow-arm Dhan auth step must exist");
+    // The slow-arm instrument load (`load_instruments(&config, …)`) — distinct
+    // from the fast crash-recovery arm's own (Dhan-ON-only) load above.
     let instruments = src
-        .find("load_instruments")
-        .or_else(|| src.find("load_daily_universe_plan"))
-        .or_else(|| src.find("daily_universe"))
-        .expect("the Dhan instrument-load step must exist");
-
+        .find("load_instruments(&config")
+        .expect("the slow-arm Dhan instrument-load step must exist");
     assert!(
-        guard < auth,
-        "the Dhan OFF skip-guard MUST appear before Dhan auth — so OFF never reaches auth."
+        lane_gate < auth,
+        "slow-arm Dhan auth MUST live INSIDE the `if config.feeds.dhan_enabled` lane \
+         wrapper — so a Dhan-OFF boot never authenticates."
     );
     assert!(
-        guard < instruments,
-        "the Dhan OFF skip-guard MUST appear before the Dhan instrument load — so OFF \
-         never fetches/builds instruments."
-    );
-    // The OFF block must RETURN before auth: a `return` must sit between the guard
-    // and the auth step. Without it, OFF would fall through to auth.
-    let between_guard_and_auth = &src[guard..auth];
-    assert!(
-        between_guard_and_auth.contains("return run_shared_infra_only(")
-            || between_guard_and_auth.contains("return Ok(())"),
-        "the `if !config.feeds.dhan_enabled` block MUST return (the shared-infra-only \
-         runtime, or Ok(())) before Dhan auth — proving OFF runs ZERO auth + instrument \
-         work (operator lock 2026-06-23: OFF feed = entire architecture untouched)."
+        lane_gate < instruments,
+        "the slow-arm Dhan instrument load MUST live INSIDE the \
+         `if config.feeds.dhan_enabled` lane wrapper — so a Dhan-OFF boot never \
+         fetches/builds instruments."
     );
 
-    // D2-pre: the shared-infra function the OFF block returns must NOT itself reach
-    // Dhan auth or instrument load — the OFF-isolation guarantee survives the hoist.
+    // The FAST crash-recovery arm also loads instruments + authenticates, but it
+    // is Dhan-ON-only: its `fast_cache.filter(...)` gate includes
+    // `config.feeds.dhan_enabled`, so a Dhan-OFF boot can never enter it.
+    assert!(
+        src.contains("is_market_hours && config.feeds.dhan_enabled"),
+        "the FAST arm's `fast_cache.filter(...)` gate MUST include \
+         `config.feeds.dhan_enabled` so a Dhan-OFF boot never enters the fast arm \
+         (which does Dhan auth + instrument load)."
+    );
+
+    // (2) The hoisted `build_shared_infra` (which runs for BOTH OFF and ON,
+    //     UNCONDITIONALLY before the lane gate) must NOT itself authenticate,
+    //     fetch instruments, or spawn a Dhan WebSocket. So the work the OFF path
+    //     DOES run (the shared prefix) is Dhan-free — the OFF-isolation +
+    //     2-WS-Dhan-lock guarantees both hold.
     let shared = src
-        .find("async fn run_shared_infra_only(")
-        .expect("run_shared_infra_only must exist (D2-pre shared-infra hoist)");
+        .find("async fn build_shared_infra(")
+        .expect("build_shared_infra must exist (D2 Stage 2 shared-infra hoist)");
     let shared_body_end = src[shared..]
-        .find("\nasync fn run_shutdown_fast(")
+        .find("\nasync fn ")
         .map(|rel| shared + rel)
         .unwrap_or(src.len());
     let shared_body = &src[shared..shared_body_end];
@@ -360,54 +366,58 @@ fn dhan_off_returns_before_auth_and_instruments() {
             && !shared_body.contains("load_instruments")
             && !shared_body.contains("TokenManager::initialize")
             && !shared_body.contains("create_websocket_pool"),
-        "run_shared_infra_only MUST NOT authenticate, fetch instruments, or spawn a \
-         Dhan WebSocket — it brings up ONLY the PROCESS-shared infra (API server, \
-         seal-writer, aggregator, run-loop). The OFF-feed-isolation guarantee + the \
-         2-WS Dhan lock both hold."
+        "build_shared_infra MUST NOT authenticate, fetch instruments, or spawn a \
+         Dhan WebSocket — it brings up ONLY the PROCESS-shared infra (notifier, \
+         health, seal-writer, broadcasts, subscribers, API server). The \
+         OFF-feed-isolation guarantee + the 2-WS Dhan lock both hold."
+    );
+
+    // (3) The duplicate `run_shared_infra_only` is DELETED — the genuine hoist
+    //     means BOTH paths share the ONE `build_shared_infra` construction.
+    assert!(
+        !src.contains("fn run_shared_infra_only"),
+        "the D2-pre duplicate `run_shared_infra_only` MUST be deleted — D2 Stage 2 \
+         hoists shared infra into the single `build_shared_infra`, shared by BOTH the \
+         Dhan-OFF and Dhan-ON-slow paths."
     );
 }
 
 #[test]
 fn api_server_up_in_dhan_off_mode() {
-    // D2-pre (C1 fix, 2026-06-26): a Dhan-OFF boot must STILL bring up the HTTP
-    // API server (so the `/api/feeds` toggle endpoint is reachable) + the candle
-    // seal-writer (so Groww candles seal — C2) + the main run-loop. Before the
-    // hoist, all of that spawned ONLY inside the Dhan block, so a Dhan-OFF boot
-    // had no API server and `/api/feeds` did not exist.
+    // D2 Stage 2 (C1 fix preserved, 2026-06-26): a Dhan-OFF boot must STILL bring
+    // up the HTTP API server (so the `/api/feeds` toggle endpoint is reachable) +
+    // the candle seal-writer (so Groww candles seal — C2) + the 21-TF aggregator
+    // + the main run-loop. After the genuine hoist, all of that is built by
+    // `build_shared_infra`, which runs UNCONDITIONALLY before the
+    // `if config.feeds.dhan_enabled` lane gate — so it runs on BOTH the OFF and ON
+    // paths.
     //
-    // SOURCE-SCAN ratchet: the Dhan-OFF branch must return a function that builds
-    // the API server (axum::serve), the seal-writer, the aggregator, and the
-    // run-loop — proving the shared infra is up on the Dhan-OFF path.
+    // SOURCE-SCAN ratchet: `build_shared_infra` must build the API server
+    // (axum::serve + /api/feeds routes), the seal-writer, and the aggregator; and
+    // the shared `run_process_runloop` must run for BOTH paths.
     let src = read_main_rs();
 
-    // (1) The OFF branch routes to the shared-infra runtime (not a bare return).
-    let guard = src
-        .find("if !config.feeds.dhan_enabled")
-        .expect("the Dhan OFF skip-guard must exist");
-    let after_guard = &src[guard..];
+    // (1) build_shared_infra is called BEFORE the Dhan lane gate (so OFF gets it).
+    let shared_call = src
+        .find("build_shared_infra(")
+        .expect("main() must call build_shared_infra(...) to build the shared prefix");
+    let lane_gate = src
+        .find("let dhan_lane: Option<DhanLaneRunHandles> = if config.feeds.dhan_enabled")
+        .expect("the Dhan lane wrapper must exist");
     assert!(
-        after_guard
-            .find("return run_shared_infra_only(")
-            .map(|pos| {
-                // The route must be the FIRST thing the OFF block does after its
-                // logging — well before any fall-through.
-                pos < after_guard
-                    .find("let fast_cache")
-                    .unwrap_or(after_guard.len())
-            })
-            .unwrap_or(false),
-        "the `if !config.feeds.dhan_enabled` block MUST `return run_shared_infra_only(...)` \
-         so a Dhan-OFF boot brings up the PROCESS-shared infra (API server + seal-writer \
-         + aggregator + run-loop) instead of bare-returning."
+        shared_call < lane_gate,
+        "build_shared_infra MUST be called BEFORE the `if config.feeds.dhan_enabled` \
+         lane gate so the PROCESS-shared infra (API + seal-writer + aggregator) is up \
+         on a Dhan-OFF boot too (C1/C2 fix)."
     );
 
-    // (2) The shared-infra function must actually spawn the API server, the
-    // seal-writer, the aggregator, and the run-loop.
+    // (2) build_shared_infra must actually build the API server, /api/feeds routes,
+    //     the seal-writer, and the aggregator.
     let shared = src
-        .find("async fn run_shared_infra_only(")
-        .expect("run_shared_infra_only must exist (D2-pre)");
+        .find("async fn build_shared_infra(")
+        .expect("build_shared_infra must exist (D2 Stage 2)");
     let shared_body_end = src[shared..]
-        .find("\nasync fn run_shutdown_fast(")
+        .find("\nasync fn ")
         .map(|rel| shared + rel)
         .unwrap_or(src.len());
     let body = &src[shared..shared_body_end];
@@ -419,12 +429,26 @@ fn api_server_up_in_dhan_off_mode() {
             "the candle seal-writer (Groww candles seal — C2)",
         ),
         ("spawn_engine_b_aggregator", "the 21-TF aggregator"),
-        ("wait_for_shutdown_signal", "the main run-loop"),
     ] {
         assert!(
             body.contains(needle),
-            "run_shared_infra_only MUST bring up {what} (`{needle}`) so a Dhan-OFF boot \
+            "build_shared_infra MUST bring up {what} (`{needle}`) so a Dhan-OFF boot \
              has the PROCESS-shared infra running (C1/C2 fix)."
         );
     }
+
+    // (3) The single PROCESS run-loop runs for BOTH paths (lane = Some on ON, None
+    //     on OFF). It is the LAST statement of main(), after the lane gate.
+    let runloop_call = src
+        .find("run_process_runloop(\n        dhan_lane,")
+        .or_else(|| src.find("run_process_runloop(dhan_lane,"))
+        .expect(
+            "main() must end with a single `run_process_runloop(dhan_lane, …)` shared by \
+             BOTH the Dhan-OFF and Dhan-ON-slow paths",
+        );
+    assert!(
+        lane_gate < runloop_call,
+        "the shared `run_process_runloop(dhan_lane, …)` MUST come AFTER the lane gate \
+         so it runs the run-loop over the hoisted shared infra for BOTH paths."
+    );
 }
