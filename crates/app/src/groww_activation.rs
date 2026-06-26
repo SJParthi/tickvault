@@ -87,6 +87,22 @@ pub fn reconcile_lane_action(desired_enabled: bool, currently_activated: bool) -
     }
 }
 
+/// Detect a DEAD activation task: the lane is desired ON, the activation task
+/// has finished, yet the lane never came up. This is the panic / early-return
+/// blind-spot — the task ended (panicked, or returned before marking running)
+/// but `set_groww_lane_running(false)` was its last word, so `reconcile` (which
+/// reads `active_task.is_some()`) would see an activated lane forever and never
+/// re-Start it → silently dead lane (desired ON, running=false, no alert).
+///
+/// Pure + total so the watcher loop stays a trivial poll around this decision.
+/// Returns true ONLY for `(desired=ON, task finished, lane NOT running)` — a
+/// task that finished AFTER marking the lane running (the success path) is NOT
+/// a dead lane and must NOT be re-started.
+#[must_use]
+pub fn is_dead_activation(desired_enabled: bool, task_finished: bool, lane_running: bool) -> bool {
+    desired_enabled && task_finished && !lane_running
+}
+
 // Run the activation watcher for the process lifetime. Spawned UNCONDITIONALLY
 // at boot. Level-triggered: it reconciles the live `is_enabled(Feed::Groww)`
 // flag against the lane's activated state every poll, so a feed ENABLED at boot
@@ -109,6 +125,29 @@ pub async fn run_groww_activation_watcher(
     let mut active_task: Option<JoinHandle<()>> = None;
     loop {
         let desired = feed_runtime.is_enabled(Feed::Groww);
+
+        // Dead-task watchdog (panic blind-spot): if the activation task finished
+        // WITHOUT bringing the lane up (a panic, or an early return), clear the
+        // handle so this same tick's reconcile re-Starts it (bounded: one re-spawn
+        // per poll, each doing real async work — not a tight loop). A task that
+        // finished AFTER marking the lane running is the success path and is left
+        // as-is. Mirrors the WS-GAP-05 pool-supervisor respawn pattern.
+        let dead = active_task.as_ref().is_some_and(|h| {
+            is_dead_activation(
+                desired,
+                h.is_finished(),
+                feed_runtime.is_groww_lane_running(),
+            )
+        });
+        if dead {
+            error!(
+                "[feeds] Groww activation task ended without bringing the lane up \
+                 (panic or early return) — re-starting activation so the desired-ON \
+                 feed is not left silently dead"
+            );
+            active_task = None;
+        }
+
         match reconcile_lane_action(desired, active_task.is_some()) {
             LaneAction::Start => {
                 info!(
@@ -311,5 +350,36 @@ mod tests {
         // A feed toggle is cold control-plane; 2s observation latency is fine and
         // the loop does zero Groww work while OFF.
         assert_eq!(GROWW_ACTIVATION_POLL, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_is_dead_activation_true_when_finished_and_lane_not_running() {
+        // Panic / early-return blind-spot: desired ON, task finished, lane never
+        // came up → dead lane, must re-start.
+        assert!(is_dead_activation(true, true, false));
+    }
+
+    #[test]
+    fn test_is_dead_activation_false_on_success_path() {
+        // Task finished AFTER marking the lane running → success, NOT dead;
+        // re-starting would needlessly rebuild a live lane.
+        assert!(!is_dead_activation(true, true, true));
+    }
+
+    #[test]
+    fn test_is_dead_activation_false_while_still_running() {
+        // Task still in-flight (not finished) → not dead, regardless of the
+        // running flag (running is false until the watch-list builds).
+        assert!(!is_dead_activation(true, false, false));
+        assert!(!is_dead_activation(true, false, true));
+    }
+
+    #[test]
+    fn test_is_dead_activation_false_when_disabled() {
+        // Desired OFF → the Stop path owns teardown; the dead-task watchdog must
+        // never fire (it only re-starts a DESIRED-ON lane).
+        assert!(!is_dead_activation(false, true, false));
+        assert!(!is_dead_activation(false, true, true));
+        assert!(!is_dead_activation(false, false, false));
     }
 }
