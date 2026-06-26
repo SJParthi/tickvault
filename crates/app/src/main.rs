@@ -6845,156 +6845,51 @@ async fn run_shared_infra_only(
 }
 
 // ---------------------------------------------------------------------------
-// Helper: Graceful shutdown (shared by fast and slow boot paths)
+// Dhan-lane runtime handles (D2 genuine-hoist) — the tasks a STARTED Dhan lane
+// owns, bundled so the PROCESS run-loop can tear them down. `None` (no lane)
+// is the Dhan-OFF / Groww-only case: the run-loop keeps the shared infra alive
+// with nothing Dhan-specific to stop.
+//
+// This is the teardown-side half of the D2 design's `DhanLaneHandles` (§1.3).
+// D2b will reuse `teardown_dhan_lane_tasks` from `stop_dhan_lane` for the
+// runtime ON→OFF path; for THIS PR the run-loop calls it so boot teardown
+// behaviour is preserved.
 // ---------------------------------------------------------------------------
-
-#[allow(clippy::too_many_arguments)] // APPROVED: shutdown orchestration requires all handles
-async fn run_shutdown_fast(
+struct DhanLaneRunHandles {
     ws_handles: Vec<tokio::task::JoinHandle<Result<(), WebSocketError>>>,
     processor_handle: Option<tokio::task::JoinHandle<()>>,
     renewal_handle: Option<tokio::task::JoinHandle<()>>,
     order_update_handle: Option<tokio::task::JoinHandle<()>>,
-    api_handle: Option<tokio::task::JoinHandle<()>>,
     trading_handle: Option<tokio::task::JoinHandle<()>>,
-    otel_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
-    notifier: &std::sync::Arc<NotificationService>,
-    config: &ApplicationConfig,
-    // S4-T1b: shared pool handle + shutdown notifier. `ws_pool_arc` is
-    // None when no WebSocket pool was spawned (e.g., historical-replay
-    // mode). `shutdown_notify` is fired before the abort loop so the
-    // pool watchdog task stops polling (prevents a false-positive Halt
-    // during intentional teardown).
+    // S4-T1b: shared pool handle + shutdown notifier. `ws_pool_arc` is None
+    // when no WebSocket pool was spawned. `shutdown_notify` is fired before
+    // the abort loop so the pool watchdog stops polling (no false-positive
+    // Halt during intentional teardown).
     ws_pool_arc: Option<std::sync::Arc<WebSocketConnectionPool>>,
     shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
-    // 2026-05-02: gate the 15:30 Post-Market Telegram on trading-day
-    // calendar (Saturday/Sunday/holiday suppression). See
-    // `boot_helpers::should_emit_post_market_alert`.
-    trading_calendar: std::sync::Arc<TradingCalendar>,
-) -> Result<()> {
-    let mode = "LIVE";
-    info!(
-        mode,
-        api_port = config.api.port,
-        "system ready — press Ctrl+C to stop"
-    );
+}
 
-    notifier.notify(NotificationEvent::StartupComplete { mode });
-
-    // --- Post-market WebSocket disconnect timer ---
-    // Compute sleep duration until market_close_time (15:30 IST).
-    // After market close, WS connections are stopped but API/dashboard stays up.
-    let market_close_sleep = compute_market_close_sleep(&config.trading.market_close_time);
-
-    // Phase 1: Wait for EITHER market close OR shutdown signal (SIGINT/SIGTERM)
-    let shutdown_reason = tokio::select! {
-        _ = tokio::time::sleep(market_close_sleep), if market_close_sleep > std::time::Duration::ZERO => {
-            "market_close"
-        }
-        reason = wait_for_shutdown_signal() => {
-            reason
-        }
-    };
-
-    if shutdown_reason == "market_close" {
-        info!("market close reached — disconnecting WebSockets, keeping API alive");
-        // 2026-05-02: suppress the Post-Market Telegram on non-trading
-        // days (Saturday / Sunday / NSE holidays) where no market open
-        // ever occurred. The 15:30 sleep is wall-clock based and fires
-        // every day; without this gate operators see misleading
-        // `[HIGH] Market closed` alerts on weekends. See
-        // boot_helpers::should_emit_post_market_alert + ratchet tests.
-        let today_ist = chrono::Utc::now()
-            .with_timezone(&tickvault_common::trading_calendar::ist_offset())
-            .date_naive();
-        if should_emit_post_market_alert(&trading_calendar, today_ist) {
-            notifier.notify(NotificationEvent::Custom {
-                message:
-                    "<b>Post-Market</b>\nMarket closed — WebSockets disconnected, API stays up"
-                        .to_string(),
-            });
-        } else {
-            info!(
-                date = %today_ist,
-                "non-trading day — suppressing Post-Market Telegram emission"
-            );
-        }
-
-        // Drain buffer: let in-flight ticks (last 15:29 candle) reach the
-        // tick processor channel BEFORE aborting WebSocket read loops.
-        let drain = std::time::Duration::from_secs(
-            tickvault_common::constants::MARKET_CLOSE_DRAIN_BUFFER_SECS,
-        );
-        tokio::time::sleep(drain).await;
-
-        // Stop real-time market data pipeline (market feed + depth WS only).
-        // Order update WS stays alive until app shutdown (16:00 IST or Ctrl+C)
-        // to capture AMO status updates and post-market order notifications.
-        for handle in &ws_handles {
-            handle.abort();
-        }
-        // Give tick processor time to flush remaining ticks before aborting
-        if processor_handle.is_some() {
-            let flush_timeout = std::time::Duration::from_secs(
-                tickvault_common::constants::GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
-            );
-            tokio::time::sleep(flush_timeout).await;
-        }
-        if let Some(ref handle) = trading_handle {
-            handle.abort();
-        }
-
-        // Post-market: detach old QuestDB partitions (Phase B).
-        // Runs daily after pipeline stops — keeps hot data bounded to retention_days.
-        {
-            let retention_days = config.partition_retention.retention_days;
-            if retention_days > 0 {
-                match tickvault_storage::partition_manager::PartitionManager::new(
-                    &config.questdb,
-                    retention_days,
-                ) {
-                    Ok(pm) => match pm.detach_old_partitions().await {
-                        Ok(count) => {
-                            info!(
-                                detached = count,
-                                retention_days, "post-market partition detach complete"
-                            );
-                        }
-                        Err(err) => {
-                            warn!(?err, "post-market partition detach failed (non-critical)");
-                        }
-                    },
-                    Err(err) => {
-                        warn!(?err, "partition manager creation failed (non-critical)");
-                    }
-                }
-            }
-        }
-
-        info!(
-            "post-market: real-time pipeline stopped, historical fetch + cross-verify in progress"
-        );
-
-        // Phase 2: App runs 24/7. Only Ctrl+C / SIGTERM stops it.
-        // No auto-shutdown — the daily reset signal at 16:00 IST handles
-        // candle aggregator reset, indicator flush, etc. without stopping the app.
-        info!("post-market tasks running — app stays alive (Ctrl+C to stop)");
-        let reason = wait_for_shutdown_signal().await;
-        info!(
-            reason,
-            "shutdown signal received — stopping remaining services"
-        );
-    } else {
-        info!("shutdown signal received — stopping gracefully");
-    }
-
-    notifier.notify(NotificationEvent::ShutdownInitiated);
-
-    // Second Ctrl+C → force exit.
-    tokio::spawn(async {
-        let _ = tokio::signal::ctrl_c().await;
-        warn!("second shutdown signal received — forcing immediate exit");
-        std::process::exit(1);
-    });
+/// Teardown of the Dhan-lane runtime tasks ONLY (renewal → order-update →
+/// graceful WS close → tick-processor flush → trading pipeline).
+///
+/// This is the lane-scoped teardown the D2 design (C3) splits out of the old
+/// `run_shutdown_fast`. It NEVER touches PROCESS-shared infra (API server,
+/// seal-writer, aggregator, otel) and NEVER runs the market-close timer /
+/// partition-detach / `wait_for_shutdown_signal` — those belong to the PROCESS
+/// run-loop. D2b's runtime `stop_dhan_lane` will call this directly.
+///
+/// Order matches the old `run_shutdown_fast` steps 1–5 exactly so boot
+/// behaviour is preserved.
+async fn teardown_dhan_lane_tasks(lane: DhanLaneRunHandles) {
+    let DhanLaneRunHandles {
+        ws_handles,
+        processor_handle,
+        renewal_handle,
+        order_update_handle,
+        trading_handle,
+        ws_pool_arc,
+        shutdown_notify,
+    } = lane;
 
     // 1. Stop token renewal.
     if let Some(handle) = renewal_handle {
@@ -7066,17 +6961,216 @@ async fn run_shutdown_fast(
     if let Some(handle) = trading_handle {
         handle.abort();
     }
+}
 
-    // 6. Stop API server.
+// ---------------------------------------------------------------------------
+// Helper: PROCESS run-loop (shared by Dhan-ON-slow, Dhan-OFF, and — via the
+// thin `run_shutdown_fast` wrapper — the fast boot arm).
+//
+// Owns the market-close timer, post-market partition-detach, and the shutdown
+// wait. On teardown it calls `teardown_dhan_lane_tasks` for the (optional) Dhan
+// lane, then stops the PROCESS API server + flushes otel. When `lane` is None
+// (Dhan-OFF / Groww-only) there is no Dhan teardown — the shared infra stays up
+// for Groww until the shutdown signal, then the API + otel are torn down.
+// ---------------------------------------------------------------------------
+#[allow(clippy::too_many_arguments)] // APPROVED: run-loop orchestration requires all handles
+async fn run_process_runloop(
+    lane: Option<DhanLaneRunHandles>,
+    api_handle: Option<tokio::task::JoinHandle<()>>,
+    otel_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+    notifier: &std::sync::Arc<NotificationService>,
+    config: &ApplicationConfig,
+    // 2026-05-02: gate the 15:30 Post-Market Telegram on trading-day
+    // calendar (Saturday/Sunday/holiday suppression). See
+    // `boot_helpers::should_emit_post_market_alert`.
+    trading_calendar: std::sync::Arc<TradingCalendar>,
+) -> Result<()> {
+    let mode = "LIVE";
+    info!(
+        mode,
+        api_port = config.api.port,
+        "system ready — press Ctrl+C to stop"
+    );
+
+    notifier.notify(NotificationEvent::StartupComplete { mode });
+
+    // --- Post-market WebSocket disconnect timer ---
+    // Compute sleep duration until market_close_time (15:30 IST).
+    // After market close, WS connections are stopped but API/dashboard stays up.
+    let market_close_sleep = compute_market_close_sleep(&config.trading.market_close_time);
+
+    // Phase 1: Wait for EITHER market close OR shutdown signal (SIGINT/SIGTERM)
+    let shutdown_reason = tokio::select! {
+        _ = tokio::time::sleep(market_close_sleep), if market_close_sleep > std::time::Duration::ZERO => {
+            "market_close"
+        }
+        reason = wait_for_shutdown_signal() => {
+            reason
+        }
+    };
+
+    if shutdown_reason == "market_close" {
+        info!("market close reached — disconnecting WebSockets, keeping API alive");
+        // 2026-05-02: suppress the Post-Market Telegram on non-trading
+        // days (Saturday / Sunday / NSE holidays) where no market open
+        // ever occurred. The 15:30 sleep is wall-clock based and fires
+        // every day; without this gate operators see misleading
+        // `[HIGH] Market closed` alerts on weekends. See
+        // boot_helpers::should_emit_post_market_alert + ratchet tests.
+        let today_ist = chrono::Utc::now()
+            .with_timezone(&tickvault_common::trading_calendar::ist_offset())
+            .date_naive();
+        if should_emit_post_market_alert(&trading_calendar, today_ist) {
+            notifier.notify(NotificationEvent::Custom {
+                message:
+                    "<b>Post-Market</b>\nMarket closed — WebSockets disconnected, API stays up"
+                        .to_string(),
+            });
+        } else {
+            info!(
+                date = %today_ist,
+                "non-trading day — suppressing Post-Market Telegram emission"
+            );
+        }
+
+        // Drain buffer: let in-flight ticks (last 15:29 candle) reach the
+        // tick processor channel BEFORE aborting WebSocket read loops.
+        let drain = std::time::Duration::from_secs(
+            tickvault_common::constants::MARKET_CLOSE_DRAIN_BUFFER_SECS,
+        );
+        tokio::time::sleep(drain).await;
+
+        // Stop real-time market data pipeline (market feed + depth WS only).
+        // Order update WS stays alive until app shutdown (16:00 IST or Ctrl+C)
+        // to capture AMO status updates and post-market order notifications.
+        // Dhan-OFF (`lane` is None) has no feed to disconnect — skip cleanly.
+        if let Some(ref lane) = lane {
+            for handle in &lane.ws_handles {
+                handle.abort();
+            }
+            // Give tick processor time to flush remaining ticks before aborting
+            if lane.processor_handle.is_some() {
+                let flush_timeout = std::time::Duration::from_secs(
+                    tickvault_common::constants::GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
+                );
+                tokio::time::sleep(flush_timeout).await;
+            }
+            if let Some(ref handle) = lane.trading_handle {
+                handle.abort();
+            }
+        }
+
+        // Post-market: detach old QuestDB partitions (Phase B).
+        // Runs daily after pipeline stops — keeps hot data bounded to retention_days.
+        {
+            let retention_days = config.partition_retention.retention_days;
+            if retention_days > 0 {
+                match tickvault_storage::partition_manager::PartitionManager::new(
+                    &config.questdb,
+                    retention_days,
+                ) {
+                    Ok(pm) => match pm.detach_old_partitions().await {
+                        Ok(count) => {
+                            info!(
+                                detached = count,
+                                retention_days, "post-market partition detach complete"
+                            );
+                        }
+                        Err(err) => {
+                            warn!(?err, "post-market partition detach failed (non-critical)");
+                        }
+                    },
+                    Err(err) => {
+                        warn!(?err, "partition manager creation failed (non-critical)");
+                    }
+                }
+            }
+        }
+
+        info!(
+            "post-market: real-time pipeline stopped, historical fetch + cross-verify in progress"
+        );
+
+        // Phase 2: App runs 24/7. Only Ctrl+C / SIGTERM stops it.
+        // No auto-shutdown — the daily reset signal at 16:00 IST handles
+        // candle aggregator reset, indicator flush, etc. without stopping the app.
+        info!("post-market tasks running — app stays alive (Ctrl+C to stop)");
+        let reason = wait_for_shutdown_signal().await;
+        info!(
+            reason,
+            "shutdown signal received — stopping remaining services"
+        );
+    } else {
+        info!("shutdown signal received — stopping gracefully");
+    }
+
+    notifier.notify(NotificationEvent::ShutdownInitiated);
+
+    // Second Ctrl+C → force exit.
+    tokio::spawn(async {
+        let _ = tokio::signal::ctrl_c().await;
+        warn!("second shutdown signal received — forcing immediate exit");
+        std::process::exit(1);
+    });
+
+    // Steps 1–5: tear down the Dhan-lane tasks (renewal → order-update →
+    // graceful WS close → tick-processor flush → trading pipeline). On a
+    // Dhan-OFF / Groww-only runtime (`lane` is None) there is nothing
+    // Dhan-specific to stop — the PROCESS infra below is torn down regardless.
+    if let Some(lane) = lane {
+        teardown_dhan_lane_tasks(lane).await;
+    }
+
+    // 6. Stop API server (PROCESS-shared).
     if let Some(handle) = api_handle {
         handle.abort();
     }
 
-    // 7. Flush OpenTelemetry.
+    // 7. Flush OpenTelemetry (PROCESS-shared).
     drop(otel_provider);
 
     info!("tickvault stopped");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Helper: thin compatibility wrapper preserving the original
+// `run_shutdown_fast(...)` call shape used by the FAST boot arm (which stays
+// byte-identical, design L10/D2d). It bundles the lane handles into
+// `DhanLaneRunHandles` and delegates to `run_process_runloop`.
+// ---------------------------------------------------------------------------
+#[allow(clippy::too_many_arguments)] // APPROVED: shutdown orchestration requires all handles
+async fn run_shutdown_fast(
+    ws_handles: Vec<tokio::task::JoinHandle<Result<(), WebSocketError>>>,
+    processor_handle: Option<tokio::task::JoinHandle<()>>,
+    renewal_handle: Option<tokio::task::JoinHandle<()>>,
+    order_update_handle: Option<tokio::task::JoinHandle<()>>,
+    api_handle: Option<tokio::task::JoinHandle<()>>,
+    trading_handle: Option<tokio::task::JoinHandle<()>>,
+    otel_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+    notifier: &std::sync::Arc<NotificationService>,
+    config: &ApplicationConfig,
+    ws_pool_arc: Option<std::sync::Arc<WebSocketConnectionPool>>,
+    shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
+    trading_calendar: std::sync::Arc<TradingCalendar>,
+) -> Result<()> {
+    run_process_runloop(
+        Some(DhanLaneRunHandles {
+            ws_handles,
+            processor_handle,
+            renewal_handle,
+            order_update_handle,
+            trading_handle,
+            ws_pool_arc,
+            shutdown_notify,
+        }),
+        api_handle,
+        otel_provider,
+        notifier,
+        config,
+        trading_calendar,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
