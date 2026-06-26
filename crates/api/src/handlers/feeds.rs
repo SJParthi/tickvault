@@ -142,15 +142,17 @@ pub async fn set_feed(
         enabled = req.enabled,
         "feed runtime toggled via API"
     );
-    // Honesty (3-agent hostile review): enabling a lane that was never spawned at
-    // boot is recorded but has NO effect. Tell the operator instead of silently
-    // returning a misleading "enabled" — the response also carries
-    // `groww_lane_running: false` so the truth is machine-readable.
+    // Honesty (3-agent hostile review): the Groww lane is spawned dormant at boot
+    // and the activation watcher cold-STARTS it at runtime on enable — NO restart
+    // needed (PR-1). `groww_lane_running` is still false at this instant because
+    // activation (tables + auth + watch-list build) takes a few seconds; the
+    // response carries it so the truth is machine-readable and the page polls
+    // until it flips to running. This is an info, not a "needs restart".
     if feed == Feed::Groww && req.enabled && !state.feed_runtime().is_groww_lane_running() {
-        tracing::warn!(
-            "feed 'groww' enabled via API but its lane was not started at boot \
-             (groww_enabled=false then) — set groww_enabled=true in config and restart \
-             to start it; the API toggle only pauses/resumes a running lane"
+        info!(
+            "feed 'groww' enabled via API — the dormant lane is cold-starting now \
+             (ensuring tables, auth smoke-check, building the watch-list); no restart \
+             needed. It reports running once the watch-list is built (a few seconds)."
         );
     }
     // PR-E: same honesty for Dhan — enabling it via API when the pool was never
@@ -409,9 +411,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_enabling_groww_reports_lane_not_running_when_unspawned() {
-        // Honesty: enabling Groww via API when the bridge was not spawned at boot
-        // records the flag but reports groww_lane_running=false (no misleading OK).
+    async fn test_enabling_groww_reports_lane_not_yet_running_during_cold_start() {
+        // Honesty: enabling Groww via API records the flag and the dormant lane
+        // cold-starts at runtime (PR-1, no restart). Immediately after the call the
+        // lane is not YET running (activation takes a few seconds), so the response
+        // reports groww_lane_running=false — an honest transient, not "needs restart".
         let state = test_state(FeedsConfig {
             dhan_enabled: true,
             groww_enabled: false,
@@ -426,7 +430,7 @@ mod tests {
         assert!(resp.groww_enabled, "flag recorded");
         assert!(
             !resp.groww_lane_running,
-            "but the lane is not running (was not spawned at boot) — honest signal"
+            "lane not yet running this instant — it cold-starts within seconds (no restart)"
         );
     }
 
