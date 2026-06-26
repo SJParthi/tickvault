@@ -1169,34 +1169,29 @@ async fn main() -> Result<()> {
     // When `dhan_enabled=true` (prod default) this branch is skipped and the
     // Dhan boot below is byte-identical to before.
     // =======================================================================
+    // D2 Stage 2 (genuine shared-infra hoist): the Dhan-OFF path no longer
+    // early-returns into a duplicate `run_shared_infra_only`. It now falls
+    // through to the SAME hoisted PROCESS-shared infra prefix below (notifier,
+    // health, seal-writer, broadcasts, the 3 subscriber tasks, API server incl.
+    // /api/feeds) and the SAME `run_process_runloop`, with the Dhan LANE skipped
+    // via the `if config.feeds.dhan_enabled` wrapper. The OFF-feed-isolation
+    // guarantee is preserved by construction: NO Dhan auth, NO instrument fetch,
+    // NO Dhan WebSocket runs when `dhan_enabled=false` (all of that lives inside
+    // the lane wrapper). Both the fast-arm guard below and the lane wrapper
+    // further down read `config.feeds.dhan_enabled`.
     if !config.feeds.dhan_enabled {
         if config.feeds.groww_enabled {
             info!(
                 "GROWW-ONLY MODE — Dhan boot skipped; Groww lane running, shared infra (API + \
-                 seal-writer + aggregator) coming up"
+                 seal-writer + aggregator) coming up via the unified hoisted prefix"
             );
         } else {
             warn!(
                 "NO FEED ENABLED — both dhan_enabled and groww_enabled are false; \
-                 shared-infra-only runtime (API + seal-writer + aggregator) coming up"
+                 shared-infra-only runtime (API + seal-writer + aggregator) coming up via the \
+                 unified hoisted prefix"
             );
         }
-        // D2-pre (behaviour-identical hoist): the Dhan-OFF path no longer bare
-        // early-returns. It now brings up the PROCESS-shared infra (HTTP API
-        // server incl. /api/feeds, the candle seal-writer + 21-TF aggregator
-        // Groww candles seal through, and the main run-loop) and only THEN
-        // returns. NO Dhan auth, NO instrument fetch, NO Dhan WebSocket — the
-        // OFF-feed-isolation guarantee is preserved; this returns BEFORE the
-        // Dhan auth/instrument-load below.
-        return run_shared_infra_only(
-            &config,
-            std::sync::Arc::clone(&feed_runtime),
-            std::sync::Arc::clone(&feed_health),
-            std::sync::Arc::clone(&trading_calendar),
-            std::sync::Arc::clone(&prev_day_cache),
-            otel_provider,
-        )
-        .await;
     }
 
     let fast_cache = token_cache::load_token_cache_fast();
@@ -1219,7 +1214,13 @@ async fn main() -> Result<()> {
         info!("token cache exists but outside market hours / non-trading day — using slow boot");
     }
 
-    if let Some(cache_result) = fast_cache.filter(|_| is_market_hours) {
+    // D2 Stage 2: the FAST crash-recovery arm is Dhan-ON-only. It is reached
+    // ONLY at boot with a valid token cache in market hours and is left
+    // byte-identical (design L10/D2d). The extra `config.feeds.dhan_enabled`
+    // guard prevents a Dhan-OFF boot (which no longer early-returns) from ever
+    // entering the fast arm — a Dhan-OFF runtime has no Dhan lane to fast-boot.
+    if let Some(cache_result) = fast_cache.filter(|_| is_market_hours && config.feeds.dhan_enabled)
+    {
         // =================================================================
         // FAST BOOT PATH (market-hours crash restart with valid cache)
         //
@@ -2070,122 +2071,124 @@ async fn main() -> Result<()> {
         info!("standard boot — no valid token cache, full auth sequence");
     }
 
-    // -----------------------------------------------------------------------
-    // Steps 4+5: Notification + Docker infra (parallel — independent of each other)
-    // -----------------------------------------------------------------------
-    info!("initializing notification service + checking Docker infra (parallel)");
-    // C1: strict notifier init — the app must refuse to boot in no-op mode.
-    let (notifier_result, _) = tokio::join!(
-        NotificationService::initialize_strict(&config.notification),
-        async {
-            if config.infrastructure.auto_start_docker {
-                infra::ensure_infra_running(&config.questdb).await;
-            } else {
-                info!(
-                    "Docker auto-start disabled (infrastructure.auto_start_docker = false). \
-                     Run `make docker-up` manually before starting the app."
-                );
-            }
-        },
-    );
-    let notifier = match notifier_result {
-        Ok(n) => n,
-        Err(reason) => {
-            error!(
-                reason = %reason,
-                "STANDARD BOOT: strict notifier init failed — REFUSING BOOT (systemd will restart)"
-            );
-            return Err(anyhow::anyhow!(reason));
-        }
-    };
-    // Wave 3-B Item 11: opt-in Telegram bucket-coalescer based on the
-    // `features.telegram_bucket_coalescer` flag. Defaults to `true`.
-    let notifier = if config.features.telegram_bucket_coalescer {
-        NotificationService::enable_coalescer(
-            notifier,
-            tickvault_core::notification::CoalescerConfig::default(),
-        )
-    } else {
-        notifier
-    };
+    // =======================================================================
+    // D2 Stage 2 — HOISTED PROCESS-SHARED INFRA (BOTH Dhan-OFF and Dhan-ON-slow)
+    //
+    // Build the PROCESS-shared infra ONCE here: notifier (+ Docker auto-start),
+    // health registry, seal-writer (installs the process-wide global_seal_sender),
+    // the tick + order-update broadcasts, the obs / 21-TF aggregator / tick-storage
+    // subscriber tasks (which `.subscribe()` BEFORE the lane's tick processor
+    // publishes — subscribe-before-publish preserved by construction), and the
+    // axum API server (incl. /api/feeds, so the toggle endpoint exists with Dhan
+    // OFF). The Dhan LANE below is wrapped in `if config.feeds.dhan_enabled` and
+    // references these shared handles; the single `run_process_runloop` runs for
+    // BOTH paths (lane = Some on ON-slow, None on OFF/Groww-only).
+    // =======================================================================
+    let SharedInfraHandles {
+        notifier,
+        health_status,
+        tick_broadcast_sender,
+        order_update_sender,
+        api_handle,
+    } = build_shared_infra(
+        &config,
+        std::sync::Arc::clone(&feed_runtime),
+        std::sync::Arc::clone(&feed_health),
+        std::sync::Arc::clone(&trading_calendar),
+        std::sync::Arc::clone(&prev_day_cache),
+        std::sync::Arc::clone(&tick_storage),
+    )
+    .await?;
 
-    // -----------------------------------------------------------------------
-    // Step 5.5: Verify public IP matches SSM static IP (BLOCKS BOOT on failure)
-    // -----------------------------------------------------------------------
-    // Sandbox mode: skip IP verification (sandbox doesn't require registered IP).
-    // Live mode: MUST verify IP before any Dhan API call.
-    // Paper mode: skip (no Dhan API calls at all).
-    let trading_mode = config.strategy.mode;
-    if trading_mode.is_live() {
-        info!("verifying public IP against SSM static IP");
-        match ip_verifier::verify_public_ip().await {
-            Ok(result) => {
-                notifier.notify(NotificationEvent::IpVerificationSuccess {
-                    verified_ip: result.verified_ip,
-                });
+    // =======================================================================
+    // DHAN LANE (Dhan-ON slow boot ONLY) — wrapped in the per-feed gate.
+    //
+    // Everything from IP-verify through the periodic health check is Dhan-lane
+    // work: it builds its own auth / universe / WS-pool / tick-processor /
+    // order-update / renewal on top of the hoisted shared infra above and
+    // produces a `DhanLaneRunHandles` for the run-loop to tear down. When
+    // `dhan_enabled=false` (Groww-only / no-feed) the whole block is skipped and
+    // `dhan_lane` is `None` — preserving OFF-feed isolation (no Dhan auth, no
+    // instrument fetch, no Dhan WebSocket).
+    // =======================================================================
+    let dhan_lane: Option<DhanLaneRunHandles> = if config.feeds.dhan_enabled {
+        // -----------------------------------------------------------------------
+        // Step 5.5: Verify public IP matches SSM static IP (BLOCKS BOOT on failure)
+        // -----------------------------------------------------------------------
+        // Sandbox mode: skip IP verification (sandbox doesn't require registered IP).
+        // Live mode: MUST verify IP before any Dhan API call.
+        // Paper mode: skip (no Dhan API calls at all).
+        let trading_mode = config.strategy.mode;
+        if trading_mode.is_live() {
+            info!("verifying public IP against SSM static IP");
+            match ip_verifier::verify_public_ip().await {
+                Ok(result) => {
+                    notifier.notify(NotificationEvent::IpVerificationSuccess {
+                        verified_ip: result.verified_ip,
+                    });
+                }
+                Err(err) => {
+                    // GAP-NET-01: static-IP verification rejected boot.
+                    error!(
+                        code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
+                        severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
+                            .severity()
+                            .as_str(),
+                        error = %err,
+                        "GAP-NET-01: IP verification failed, BLOCKING BOOT"
+                    );
+                    notifier.notify(NotificationEvent::IpVerificationFailed {
+                        reason: err.to_string(),
+                    });
+                    return Ok(());
+                }
             }
-            Err(err) => {
-                // GAP-NET-01: static-IP verification rejected boot.
+        } else {
+            info!(
+                mode = trading_mode.as_str(),
+                "IP verification skipped — not required for {} mode",
+                trading_mode.as_str()
+            );
+        }
+
+        // -----------------------------------------------------------------------
+        // Step 6: Authenticate with Dhan API (infinite retry for transient errors)
+        // -----------------------------------------------------------------------
+        info!("authenticating with Dhan API via SSM → TOTP → JWT");
+
+        let token_init_timeout =
+            std::time::Duration::from_secs(tickvault_common::constants::TOKEN_INIT_TIMEOUT_SECS);
+        let token_manager = match tokio::time::timeout(
+            token_init_timeout,
+            TokenManager::initialize(&config.dhan, &config.token, &config.network, &notifier),
+        )
+        .await
+        {
+            Ok(Ok(manager)) => manager,
+            Ok(Err(err)) => {
+                // Permanent auth error or Ctrl+C.
+                // DH-901: auth attempt exhausted; app is halting.
                 error!(
-                    code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
-                    severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
+                    code = tickvault_common::error_code::ErrorCode::Dh901InvalidAuth.code_str(),
+                    severity = tickvault_common::error_code::ErrorCode::Dh901InvalidAuth
                         .severity()
                         .as_str(),
                     error = %err,
-                    "GAP-NET-01: IP verification failed, BLOCKING BOOT"
+                    "DH-901: authentication failed permanently — exiting"
                 );
-                notifier.notify(NotificationEvent::IpVerificationFailed {
-                    reason: err.to_string(),
-                });
+                notifier.notify(
+                    tickvault_core::notification::events::NotificationEvent::AuthenticationFailed {
+                        reason: format!("PERMANENT: {err}"),
+                    },
+                );
                 return Ok(());
             }
-        }
-    } else {
-        info!(
-            mode = trading_mode.as_str(),
-            "IP verification skipped — not required for {} mode",
-            trading_mode.as_str()
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Step 6: Authenticate with Dhan API (infinite retry for transient errors)
-    // -----------------------------------------------------------------------
-    info!("authenticating with Dhan API via SSM → TOTP → JWT");
-
-    let token_init_timeout =
-        std::time::Duration::from_secs(tickvault_common::constants::TOKEN_INIT_TIMEOUT_SECS);
-    let token_manager = match tokio::time::timeout(
-        token_init_timeout,
-        TokenManager::initialize(&config.dhan, &config.token, &config.network, &notifier),
-    )
-    .await
-    {
-        Ok(Ok(manager)) => manager,
-        Ok(Err(err)) => {
-            // Permanent auth error or Ctrl+C.
-            // DH-901: auth attempt exhausted; app is halting.
-            error!(
-                code = tickvault_common::error_code::ErrorCode::Dh901InvalidAuth.code_str(),
-                severity = tickvault_common::error_code::ErrorCode::Dh901InvalidAuth
-                    .severity()
-                    .as_str(),
-                error = %err,
-                "DH-901: authentication failed permanently — exiting"
-            );
-            notifier.notify(
-                tickvault_core::notification::events::NotificationEvent::AuthenticationFailed {
-                    reason: format!("PERMANENT: {err}"),
-                },
-            );
-            return Ok(());
-        }
-        Err(_elapsed) => {
-            error!(
-                timeout_secs = tickvault_common::constants::TOKEN_INIT_TIMEOUT_SECS,
-                "authentication timed out — Dhan API may be unreachable"
-            );
-            notifier.notify(
+            Err(_elapsed) => {
+                error!(
+                    timeout_secs = tickvault_common::constants::TOKEN_INIT_TIMEOUT_SECS,
+                    "authentication timed out — Dhan API may be unreachable"
+                );
+                notifier.notify(
                 tickvault_core::notification::events::NotificationEvent::AuthenticationFailed {
                     reason: format!(
                         "TIMEOUT: initial auth did not complete within {}s — check Dhan API and network",
@@ -2193,2106 +2196,2032 @@ async fn main() -> Result<()> {
                     ),
                 },
             );
-            return Ok(());
-        }
-    };
-
-    // -----------------------------------------------------------------------
-    // Step 6a-prime: Dual-instance SSM lock (Phase 0 Item 19)
-    // -----------------------------------------------------------------------
-    // RESILIENCE-01: only ONE tickvault process per Dhan client-id may
-    // ever be live. Two processes against the same account fight over
-    // static-IP enforcement (Item 18), fragment the 5-conn WebSocket
-    // budget, and silently break order reconciliation. We hold an
-    // SSM-Parameter-Store-backed lock (90s TTL, 30s heartbeat) for the
-    // lifetime of the process; this gate fails the boot if another
-    // live peer is already holding it. SSM is the source of truth so
-    // an AWS prod instance and a dev Mac sharing the same env name
-    // cannot accidentally run in parallel.
-    //
-    // Runs AFTER auth (Step 6) so the boot-halt Telegram + SNS path
-    // is fully wired. Runs BEFORE Step 6a static IP boot gate so we
-    // don't burn Dhan API quota on a peer-side race we'd lose anyway.
-    //
-    // Like the static IP gate, this is live-mode only — sandbox/paper
-    // modes don't subscribe to depth or place real orders, so a second
-    // sandbox instance is not a regulatory hazard.
-    // Phase 0 Item 19f — chain bridge from the broader `shutdown_notify`
-    // (constructed at Step 8b below) to the heartbeat's own `Notify`.
-    // `None` outside live mode or when the lock acquire path skips the
-    // heartbeat spawn.
-    let mut instance_lock_shutdown_chain: Option<std::sync::Arc<tokio::sync::Notify>> = None;
-    let instance_lock_handle: Option<tokio::task::JoinHandle<()>> = if trading_mode.is_live() {
-        info!("Phase 0 Item 19: acquiring dual-instance SSM lock");
-
-        // SSM is the source of truth for the lock (operator lock
-        // 2026-05-24 — replaced the earlier in-memory KV implementation
-        // alongside the CloudWatch-only migration). Constructing the
-        // client here keeps the lock self-contained; no auxiliary
-        // service needs to be running. Costs: standard-tier SSM
-        // PutParameter is free; ~2,880 calls/day at the 30 s heartbeat
-        // interval is well under the 40 TPS SSM rate cap.
-        let ssm_client = std::sync::Arc::new(
-            tickvault_core::auth::secret_manager::create_ssm_client_public().await,
-        );
-
-        // host_id composition: pid + boot_random + aws_instance_id (when
-        // present). The instance lock path is env-qualified, so dev /
-        // sandbox / prod cannot collide.
-        let env = tickvault_core::auth::secret_manager::resolve_environment()
-            .context("Phase 0 Item 19: cannot resolve environment for lock path")?;
-        let host_id = tickvault_core::instance_lock::generate_host_id(
-            std::process::id(),
-            // Boot-once 64-bit value derived from nanos-since-UNIX-EPOCH.
-            // Not cryptographically random, but the goal here is
-            // cross-host uniqueness within the 90s TTL window — two
-            // boxes booting at the same nanosecond is exceedingly
-            // unlikely, and rand isn't a workspace dep.
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0),
-            None,
-        );
-        let lock_key = tickvault_core::instance_lock::compute_instance_lock_path(&env);
-
-        match tickvault_core::instance_lock::try_acquire_instance_lock(&ssm_client, &env, &host_id)
-            .await
-        {
-            Ok(tickvault_core::instance_lock::AcquireOutcome::Acquired) => {
-                info!(
-                    env = %env,
-                    host_id = %host_id,
-                    lock_key = %lock_key,
-                    ttl_secs = tickvault_core::instance_lock::INSTANCE_LOCK_TTL_SECS,
-                    "Phase 0 Item 19: dual-instance lock acquired"
-                );
+                return Ok(());
             }
-            Ok(tickvault_core::instance_lock::AcquireOutcome::AlreadyHeld { holder }) => {
-                error!(
-                    code = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected
-                        .code_str(),
-                    severity = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected
-                        .severity()
-                        .as_str(),
-                    env = %env,
-                    host_id = %host_id,
-                    lock_key = %lock_key,
-                    peer = %holder,
-                    "Phase 0 Item 19: another tickvault process holds the lock — BLOCKING BOOT"
-                );
-                notifier.notify(
+        };
+
+        // -----------------------------------------------------------------------
+        // Step 6a-prime: Dual-instance SSM lock (Phase 0 Item 19)
+        // -----------------------------------------------------------------------
+        // RESILIENCE-01: only ONE tickvault process per Dhan client-id may
+        // ever be live. Two processes against the same account fight over
+        // static-IP enforcement (Item 18), fragment the 5-conn WebSocket
+        // budget, and silently break order reconciliation. We hold an
+        // SSM-Parameter-Store-backed lock (90s TTL, 30s heartbeat) for the
+        // lifetime of the process; this gate fails the boot if another
+        // live peer is already holding it. SSM is the source of truth so
+        // an AWS prod instance and a dev Mac sharing the same env name
+        // cannot accidentally run in parallel.
+        //
+        // Runs AFTER auth (Step 6) so the boot-halt Telegram + SNS path
+        // is fully wired. Runs BEFORE Step 6a static IP boot gate so we
+        // don't burn Dhan API quota on a peer-side race we'd lose anyway.
+        //
+        // Like the static IP gate, this is live-mode only — sandbox/paper
+        // modes don't subscribe to depth or place real orders, so a second
+        // sandbox instance is not a regulatory hazard.
+        // Phase 0 Item 19f — chain bridge from the broader `shutdown_notify`
+        // (constructed at Step 8b below) to the heartbeat's own `Notify`.
+        // `None` outside live mode or when the lock acquire path skips the
+        // heartbeat spawn.
+        let mut instance_lock_shutdown_chain: Option<std::sync::Arc<tokio::sync::Notify>> = None;
+        let instance_lock_handle: Option<tokio::task::JoinHandle<()>> = if trading_mode.is_live() {
+            info!("Phase 0 Item 19: acquiring dual-instance SSM lock");
+
+            // SSM is the source of truth for the lock (operator lock
+            // 2026-05-24 — replaced the earlier in-memory KV implementation
+            // alongside the CloudWatch-only migration). Constructing the
+            // client here keeps the lock self-contained; no auxiliary
+            // service needs to be running. Costs: standard-tier SSM
+            // PutParameter is free; ~2,880 calls/day at the 30 s heartbeat
+            // interval is well under the 40 TPS SSM rate cap.
+            let ssm_client = std::sync::Arc::new(
+                tickvault_core::auth::secret_manager::create_ssm_client_public().await,
+            );
+
+            // host_id composition: pid + boot_random + aws_instance_id (when
+            // present). The instance lock path is env-qualified, so dev /
+            // sandbox / prod cannot collide.
+            let env = tickvault_core::auth::secret_manager::resolve_environment()
+                .context("Phase 0 Item 19: cannot resolve environment for lock path")?;
+            let host_id = tickvault_core::instance_lock::generate_host_id(
+                std::process::id(),
+                // Boot-once 64-bit value derived from nanos-since-UNIX-EPOCH.
+                // Not cryptographically random, but the goal here is
+                // cross-host uniqueness within the 90s TTL window — two
+                // boxes booting at the same nanosecond is exceedingly
+                // unlikely, and rand isn't a workspace dep.
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0),
+                None,
+            );
+            let lock_key = tickvault_core::instance_lock::compute_instance_lock_path(&env);
+
+            match tickvault_core::instance_lock::try_acquire_instance_lock(
+                &ssm_client,
+                &env,
+                &host_id,
+            )
+            .await
+            {
+                Ok(tickvault_core::instance_lock::AcquireOutcome::Acquired) => {
+                    info!(
+                        env = %env,
+                        host_id = %host_id,
+                        lock_key = %lock_key,
+                        ttl_secs = tickvault_core::instance_lock::INSTANCE_LOCK_TTL_SECS,
+                        "Phase 0 Item 19: dual-instance lock acquired"
+                    );
+                }
+                Ok(tickvault_core::instance_lock::AcquireOutcome::AlreadyHeld { holder }) => {
+                    error!(
+                        code = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected
+                            .code_str(),
+                        severity = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected
+                            .severity()
+                            .as_str(),
+                        env = %env,
+                        host_id = %host_id,
+                        lock_key = %lock_key,
+                        peer = %holder,
+                        "Phase 0 Item 19: another tickvault process holds the lock — BLOCKING BOOT"
+                    );
+                    notifier.notify(
                     tickvault_core::notification::events::NotificationEvent::DualInstanceDetected {
                         holder,
                         lock_key,
                     },
                 );
-                return Ok(());
-            }
-            Err(err) => {
-                // SSM PutParameter / GetParameter failed (network blip,
-                // IAM denial, throttle). Same HALT semantics as
-                // already-held: we cannot prove there's no peer.
-                error!(
-                    code = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected
-                        .code_str(),
-                    severity = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected
-                        .severity()
-                        .as_str(),
-                    error = %err,
-                    env = %env,
-                    host_id = %host_id,
-                    lock_key = %lock_key,
-                    "Phase 0 Item 19: SSM acquire-attempt failed — BLOCKING BOOT"
-                );
-                notifier.notify(
+                    return Ok(());
+                }
+                Err(err) => {
+                    // SSM PutParameter / GetParameter failed (network blip,
+                    // IAM denial, throttle). Same HALT semantics as
+                    // already-held: we cannot prove there's no peer.
+                    error!(
+                        code = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected
+                            .code_str(),
+                        severity = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected
+                            .severity()
+                            .as_str(),
+                        error = %err,
+                        env = %env,
+                        host_id = %host_id,
+                        lock_key = %lock_key,
+                        "Phase 0 Item 19: SSM acquire-attempt failed — BLOCKING BOOT"
+                    );
+                    notifier.notify(
                     tickvault_core::notification::events::NotificationEvent::DualInstanceDetected {
                         holder: format!("(ssm-error: {err})"),
                         lock_key,
                     },
                 );
-                return Ok(());
-            }
-        }
-
-        // Lock held — spawn the heartbeat. The heartbeat owns its
-        // own `Notify` shutdown source; main.rs's broader
-        // `shutdown_notify` (constructed at the Step 8b stage) is
-        // chained into it via the bridge task installed further
-        // down (Item 19f). On the bridge firing, the heartbeat
-        // releases the lock by deleting the SSM Parameter so the next
-        // boot sees a clean slate immediately.
-        let heartbeat_shutdown_inner = std::sync::Arc::new(tokio::sync::Notify::new());
-        let heartbeat_shutdown_for_chain = heartbeat_shutdown_inner.clone();
-        let heartbeat_handle = tickvault_core::instance_lock::spawn_instance_lock_heartbeat(
-            ssm_client,
-            env,
-            host_id,
-            heartbeat_shutdown_inner,
-        );
-        instance_lock_shutdown_chain = Some(heartbeat_shutdown_for_chain);
-        Some(heartbeat_handle)
-    } else {
-        info!(
-            "Phase 0 Item 19: skipping dual-instance lock (mode={:?} — sandbox/paper do not \
-             place real orders)",
-            trading_mode
-        );
-        None
-    };
-    // Keep the heartbeat handle alive for the lifetime of main.
-    // Dropped on return (boot-halt or graceful shutdown). The task
-    // itself observes the dropped Notify on shutdown when Item 19e
-    // wires the chained shutdown.
-    let _instance_lock_handle = instance_lock_handle;
-
-    // -----------------------------------------------------------------------
-    // Step 6a: Dhan-side static IP boot gate (Phase 0 Item 18 + 18b)
-    // -----------------------------------------------------------------------
-    // Step 5.5 above already confirmed our egress IP matches the SSM
-    // value (public IP-echo vs SSM). This second gate asks Dhan itself
-    // — `/v2/ip/getIP` reports `ordersAllowed` which is the same flag
-    // the exchange reads at order-acceptance time. Without this check
-    // an IP that looks correct to the world but hasn't propagated to
-    // Dhan's whitelist would let boot proceed and then orders would
-    // silently be rejected at trade time.
-    //
-    // Item 18b: when Dhan returns `orders_allowed = false` we retry up
-    // to STATIC_IP_BOOT_RETRY_MAX_ATTEMPTS times with a 60s interval
-    // (max 30 min). Structural failures (empty response,
-    // match_status_not_ok) halt immediately — retrying them would just
-    // burn API quota.
-    //
-    // Skipped outside live mode for the same reason as Step 5.5
-    // (sandbox + paper modes do not place real orders).
-    if trading_mode.is_live() {
-        info!(
-            max_attempts = tickvault_common::constants::STATIC_IP_BOOT_RETRY_MAX_ATTEMPTS,
-            interval_secs = tickvault_common::constants::STATIC_IP_BOOT_RETRY_INTERVAL_SECS,
-            "Phase 0 Item 18+18b: verifying Dhan-side static IP whitelist (/v2/ip/getIP)"
-        );
-        let access_token = {
-            use secrecy::ExposeSecret;
-            let guard = token_manager.token_handle().load();
-            match guard.as_ref().as_ref() {
-                Some(state) => state.access_token().expose_secret().to_string(),
-                None => {
-                    // The auth step above succeeded, so the token MUST be
-                    // present here. If it isn't, fail boot loudly rather
-                    // than skip the check.
-                    error!(
-                        code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
-                        severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
-                            .severity()
-                            .as_str(),
-                        "Phase 0 Item 18: token unavailable immediately after auth — BLOCKING BOOT"
-                    );
-                    notifier.notify(NotificationEvent::StaticIpBootCheckFailed {
-                        reason: "empty_response".to_string(),
-                        orders_allowed: false,
-                        ip_match_status: String::new(),
-                        attempts_made: 1,
-                    });
                     return Ok(());
                 }
             }
-        };
 
-        let max_attempts = tickvault_common::constants::STATIC_IP_BOOT_RETRY_MAX_ATTEMPTS;
-        let retry_interval = std::time::Duration::from_secs(
-            tickvault_common::constants::STATIC_IP_BOOT_RETRY_INTERVAL_SECS,
-        );
-        let mut attempts_made: u32 = 0;
-        let halt_reason: Option<&'static str> = loop {
-            attempts_made = attempts_made.saturating_add(1);
-            let outcome_result = ip_verifier::verify_static_ip_at_boot(
-                &config.dhan.rest_api_base_url,
-                &access_token,
-            )
-            .await;
-            let outcome = match outcome_result {
-                Ok(o) => o,
-                Err(err) => {
-                    error!(
-                        code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
-                        severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
-                            .severity()
-                            .as_str(),
-                        error = %err,
-                        attempts_made,
-                        "Phase 0 Item 18: /v2/ip/getIP request failed — BLOCKING BOOT"
-                    );
-                    break Some("empty_response");
+            // Lock held — spawn the heartbeat. The heartbeat owns its
+            // own `Notify` shutdown source; main.rs's broader
+            // `shutdown_notify` (constructed at the Step 8b stage) is
+            // chained into it via the bridge task installed further
+            // down (Item 19f). On the bridge firing, the heartbeat
+            // releases the lock by deleting the SSM Parameter so the next
+            // boot sees a clean slate immediately.
+            let heartbeat_shutdown_inner = std::sync::Arc::new(tokio::sync::Notify::new());
+            let heartbeat_shutdown_for_chain = heartbeat_shutdown_inner.clone();
+            let heartbeat_handle = tickvault_core::instance_lock::spawn_instance_lock_heartbeat(
+                ssm_client,
+                env,
+                host_id,
+                heartbeat_shutdown_inner,
+            );
+            instance_lock_shutdown_chain = Some(heartbeat_shutdown_for_chain);
+            Some(heartbeat_handle)
+        } else {
+            info!(
+                "Phase 0 Item 19: skipping dual-instance lock (mode={:?} — sandbox/paper do not \
+             place real orders)",
+                trading_mode
+            );
+            None
+        };
+        // Keep the heartbeat handle alive for the lifetime of main.
+        // Dropped on return (boot-halt or graceful shutdown). The task
+        // itself observes the dropped Notify on shutdown when Item 19e
+        // wires the chained shutdown.
+        let _instance_lock_handle = instance_lock_handle;
+
+        // -----------------------------------------------------------------------
+        // Step 6a: Dhan-side static IP boot gate (Phase 0 Item 18 + 18b)
+        // -----------------------------------------------------------------------
+        // Step 5.5 above already confirmed our egress IP matches the SSM
+        // value (public IP-echo vs SSM). This second gate asks Dhan itself
+        // — `/v2/ip/getIP` reports `ordersAllowed` which is the same flag
+        // the exchange reads at order-acceptance time. Without this check
+        // an IP that looks correct to the world but hasn't propagated to
+        // Dhan's whitelist would let boot proceed and then orders would
+        // silently be rejected at trade time.
+        //
+        // Item 18b: when Dhan returns `orders_allowed = false` we retry up
+        // to STATIC_IP_BOOT_RETRY_MAX_ATTEMPTS times with a 60s interval
+        // (max 30 min). Structural failures (empty response,
+        // match_status_not_ok) halt immediately — retrying them would just
+        // burn API quota.
+        //
+        // Skipped outside live mode for the same reason as Step 5.5
+        // (sandbox + paper modes do not place real orders).
+        if trading_mode.is_live() {
+            info!(
+                max_attempts = tickvault_common::constants::STATIC_IP_BOOT_RETRY_MAX_ATTEMPTS,
+                interval_secs = tickvault_common::constants::STATIC_IP_BOOT_RETRY_INTERVAL_SECS,
+                "Phase 0 Item 18+18b: verifying Dhan-side static IP whitelist (/v2/ip/getIP)"
+            );
+            let access_token = {
+                use secrecy::ExposeSecret;
+                let guard = token_manager.token_handle().load();
+                match guard.as_ref().as_ref() {
+                    Some(state) => state.access_token().expose_secret().to_string(),
+                    None => {
+                        // The auth step above succeeded, so the token MUST be
+                        // present here. If it isn't, fail boot loudly rather
+                        // than skip the check.
+                        error!(
+                            code =
+                                tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
+                            severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
+                                .severity()
+                                .as_str(),
+                            "Phase 0 Item 18: token unavailable immediately after auth — BLOCKING BOOT"
+                        );
+                        notifier.notify(NotificationEvent::StaticIpBootCheckFailed {
+                            reason: "empty_response".to_string(),
+                            orders_allowed: false,
+                            ip_match_status: String::new(),
+                            attempts_made: 1,
+                        });
+                        return Ok(());
+                    }
                 }
             };
 
-            let action = ip_verifier::classify_static_ip_boot_retry_action(
-                &outcome,
-                attempts_made,
-                max_attempts,
+            let max_attempts = tickvault_common::constants::STATIC_IP_BOOT_RETRY_MAX_ATTEMPTS;
+            let retry_interval = std::time::Duration::from_secs(
+                tickvault_common::constants::STATIC_IP_BOOT_RETRY_INTERVAL_SECS,
             );
-            match action {
-                ip_verifier::StaticIpBootRetryAction::Pass => {
-                    info!(
-                        attempts_made,
-                        "Phase 0 Item 18: Dhan reports orders allowed from this IP"
-                    );
-                    let ip_flag =
-                        match ip_verifier::get_ip(&config.dhan.rest_api_base_url, &access_token)
-                            .await
+            let mut attempts_made: u32 = 0;
+            let halt_reason: Option<&'static str> = loop {
+                attempts_made = attempts_made.saturating_add(1);
+                let outcome_result = ip_verifier::verify_static_ip_at_boot(
+                    &config.dhan.rest_api_base_url,
+                    &access_token,
+                )
+                .await;
+                let outcome = match outcome_result {
+                    Ok(o) => o,
+                    Err(err) => {
+                        error!(
+                            code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
+                            severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
+                                .severity()
+                                .as_str(),
+                            error = %err,
+                            attempts_made,
+                            "Phase 0 Item 18: /v2/ip/getIP request failed — BLOCKING BOOT"
+                        );
+                        break Some("empty_response");
+                    }
+                };
+
+                let action = ip_verifier::classify_static_ip_boot_retry_action(
+                    &outcome,
+                    attempts_made,
+                    max_attempts,
+                );
+                match action {
+                    ip_verifier::StaticIpBootRetryAction::Pass => {
+                        info!(
+                            attempts_made,
+                            "Phase 0 Item 18: Dhan reports orders allowed from this IP"
+                        );
+                        let ip_flag = match ip_verifier::get_ip(
+                            &config.dhan.rest_api_base_url,
+                            &access_token,
+                        )
+                        .await
                         {
                             Ok(resp) => resp.ip_flag,
                             Err(_) => String::new(),
                         };
-                    notifier.notify(NotificationEvent::StaticIpBootCheckPassed {
-                        ip_flag: ip_flag.clone(),
-                    });
-                    break None;
+                        notifier.notify(NotificationEvent::StaticIpBootCheckPassed {
+                            ip_flag: ip_flag.clone(),
+                        });
+                        break None;
+                    }
+                    ip_verifier::StaticIpBootRetryAction::Retry { next_attempt } => {
+                        info!(
+                            next_attempt,
+                            max_attempts,
+                            "Phase 0 Item 18b: Dhan reports orders not allowed — sleeping before retry"
+                        );
+                        notifier.notify(NotificationEvent::StaticIpBootCheckRetrying {
+                            attempt: next_attempt,
+                            max_attempts,
+                        });
+                        tokio::time::sleep(retry_interval).await;
+                    }
+                    ip_verifier::StaticIpBootRetryAction::Halt { reason } => {
+                        error!(
+                            code =
+                                tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
+                            severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
+                                .severity()
+                                .as_str(),
+                            reason,
+                            attempts_made,
+                            "Phase 0 Item 18: Dhan static IP check FAILED — BLOCKING BOOT"
+                        );
+                        break Some(reason);
+                    }
                 }
-                ip_verifier::StaticIpBootRetryAction::Retry { next_attempt } => {
-                    info!(
-                        next_attempt,
-                        max_attempts,
-                        "Phase 0 Item 18b: Dhan reports orders not allowed — sleeping before retry"
-                    );
-                    notifier.notify(NotificationEvent::StaticIpBootCheckRetrying {
-                        attempt: next_attempt,
-                        max_attempts,
-                    });
-                    tokio::time::sleep(retry_interval).await;
-                }
-                ip_verifier::StaticIpBootRetryAction::Halt { reason } => {
-                    error!(
-                        code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
-                        severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
-                            .severity()
-                            .as_str(),
-                        reason,
-                        attempts_made,
-                        "Phase 0 Item 18: Dhan static IP check FAILED — BLOCKING BOOT"
-                    );
-                    break Some(reason);
-                }
-            }
-        };
+            };
 
-        if let Some(reason_label) = halt_reason {
-            // Best-effort re-read of the raw fields for the Telegram
-            // payload + audit row. If this also fails the operator
-            // still sees the typed reason which is the actionable
-            // signal.
-            let (orders_allowed, ip_match_status, _ip_flag) =
-                match ip_verifier::get_ip(&config.dhan.rest_api_base_url, &access_token).await {
+            if let Some(reason_label) = halt_reason {
+                // Best-effort re-read of the raw fields for the Telegram
+                // payload + audit row. If this also fails the operator
+                // still sees the typed reason which is the actionable
+                // signal.
+                let (orders_allowed, ip_match_status, _ip_flag) = match ip_verifier::get_ip(
+                    &config.dhan.rest_api_base_url,
+                    &access_token,
+                )
+                .await
+                {
                     Ok(resp) => (resp.orders_allowed, resp.ip_match_status, resp.ip_flag),
                     Err(_) => (false, String::new(), String::new()),
                 };
-            notifier.notify(NotificationEvent::StaticIpBootCheckFailed {
-                reason: reason_label.to_string(),
-                orders_allowed,
-                ip_match_status,
-                attempts_made,
-            });
-            return Ok(());
-        }
-    } else {
-        info!(
-            mode = trading_mode.as_str(),
-            "Phase 0 Item 18: Dhan static IP check skipped — not required for {} mode",
-            trading_mode.as_str()
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Step 6b: Set up QuestDB tick persistence (best-effort)
-    // -----------------------------------------------------------------------
-    info!("setting up QuestDB tables (ticks + candles + option_chain + historical_candles)");
-
-    // Wave 2 Item 7 (G14) — block until QuestDB is reachable. Escalating
-    // logs at +5/+10/+20s; BOOT-01 ERROR @+30s; BOOT-02 HALT @+60s.
-    // Prevents the legacy "tick processor starts before QuestDB is up"
-    // race that dropped early-boot ticks before this gate existed.
-    let _probe_started = std::time::Instant::now();
-    let _boot_id = format!(
-        "boot-{}",
-        chrono::Utc::now()
-            .with_timezone(&tickvault_common::trading_calendar::ist_offset())
-            .format("%Y-%m-%d-%H%M%S")
-    );
-    if let Err(e) = tickvault_storage::boot_probe::wait_for_questdb_ready(
-        &config.questdb,
-        tickvault_storage::boot_probe::BOOT_DEADLINE_SECS,
-    )
-    .await
-    {
-        tracing::error!(
-            error = ?e,
-            code = tickvault_common::error_code::ErrorCode::Boot02DeadlineExceeded.code_str(),
-            "BOOT-02 QuestDB never reached ready state — halting"
-        );
-        anyhow::bail!("BOOT-02 QuestDB readiness deadline exceeded: {e}");
-    }
-
-    // Wave 2-C Item 7.3 (G8) — boot-time wall-clock skew probe. Runs
-    // AFTER `wait_for_questdb_ready` so the QuestDB `SELECT now()`
-    // fallback is reachable when chrony is unavailable. On
-    // `ThresholdExceeded` the boot HALTS (BOOT-03). On `Unavailable`
-    // the boot proceeds with a WARN — a missing chronyc + unreachable
-    // QuestDB after the readiness probe is a rare ordering issue, not
-    // a correctness defect.
-    {
-        let threshold = tickvault_common::constants::CLOCK_SKEW_HALT_THRESHOLD_SECS;
-        match tickvault_app::infra::enforce_clock_skew_at_boot(&config.questdb, threshold).await {
-            Ok(sample) => {
-                tracing::info!(
-                    skew_secs = sample.skew_secs,
-                    source = sample.source,
-                    threshold_secs = threshold,
-                    "BOOT-03 clock-skew probe within tolerance"
-                );
+                notifier.notify(NotificationEvent::StaticIpBootCheckFailed {
+                    reason: reason_label.to_string(),
+                    orders_allowed,
+                    ip_match_status,
+                    attempts_made,
+                });
+                return Ok(());
             }
-            Err(tickvault_app::infra::ClockSkewError::ThresholdExceeded {
-                skew_secs,
-                threshold_secs,
-                source,
-            }) => {
-                tracing::error!(
+        } else {
+            info!(
+                mode = trading_mode.as_str(),
+                "Phase 0 Item 18: Dhan static IP check skipped — not required for {} mode",
+                trading_mode.as_str()
+            );
+        }
+
+        // -----------------------------------------------------------------------
+        // Step 6b: Set up QuestDB tick persistence (best-effort)
+        // -----------------------------------------------------------------------
+        info!("setting up QuestDB tables (ticks + candles + option_chain + historical_candles)");
+
+        // Wave 2 Item 7 (G14) — block until QuestDB is reachable. Escalating
+        // logs at +5/+10/+20s; BOOT-01 ERROR @+30s; BOOT-02 HALT @+60s.
+        // Prevents the legacy "tick processor starts before QuestDB is up"
+        // race that dropped early-boot ticks before this gate existed.
+        let _probe_started = std::time::Instant::now();
+        let _boot_id = format!(
+            "boot-{}",
+            chrono::Utc::now()
+                .with_timezone(&tickvault_common::trading_calendar::ist_offset())
+                .format("%Y-%m-%d-%H%M%S")
+        );
+        if let Err(e) = tickvault_storage::boot_probe::wait_for_questdb_ready(
+            &config.questdb,
+            tickvault_storage::boot_probe::BOOT_DEADLINE_SECS,
+        )
+        .await
+        {
+            tracing::error!(
+                error = ?e,
+                code = tickvault_common::error_code::ErrorCode::Boot02DeadlineExceeded.code_str(),
+                "BOOT-02 QuestDB never reached ready state — halting"
+            );
+            anyhow::bail!("BOOT-02 QuestDB readiness deadline exceeded: {e}");
+        }
+
+        // Wave 2-C Item 7.3 (G8) — boot-time wall-clock skew probe. Runs
+        // AFTER `wait_for_questdb_ready` so the QuestDB `SELECT now()`
+        // fallback is reachable when chrony is unavailable. On
+        // `ThresholdExceeded` the boot HALTS (BOOT-03). On `Unavailable`
+        // the boot proceeds with a WARN — a missing chronyc + unreachable
+        // QuestDB after the readiness probe is a rare ordering issue, not
+        // a correctness defect.
+        {
+            let threshold = tickvault_common::constants::CLOCK_SKEW_HALT_THRESHOLD_SECS;
+            match tickvault_app::infra::enforce_clock_skew_at_boot(&config.questdb, threshold).await
+            {
+                Ok(sample) => {
+                    tracing::info!(
+                        skew_secs = sample.skew_secs,
+                        source = sample.source,
+                        threshold_secs = threshold,
+                        "BOOT-03 clock-skew probe within tolerance"
+                    );
+                }
+                Err(tickvault_app::infra::ClockSkewError::ThresholdExceeded {
                     skew_secs,
                     threshold_secs,
                     source,
-                    code =
-                        tickvault_common::error_code::ErrorCode::Boot03ClockSkewExceeded.code_str(),
-                    "BOOT-03 wall-clock skew exceeds threshold — HALTING"
-                );
-                metrics::counter!("tv_boot_clock_skew_halt_total").increment(1);
-                let event = tickvault_core::notification::events::NotificationEvent::BootClockSkewExceeded {
+                }) => {
+                    tracing::error!(
+                        skew_secs,
+                        threshold_secs,
+                        source,
+                        code = tickvault_common::error_code::ErrorCode::Boot03ClockSkewExceeded
+                            .code_str(),
+                        "BOOT-03 wall-clock skew exceeds threshold — HALTING"
+                    );
+                    metrics::counter!("tv_boot_clock_skew_halt_total").increment(1);
+                    let event = tickvault_core::notification::events::NotificationEvent::BootClockSkewExceeded {
                     skew_secs,
                     threshold_secs,
                     source: source.to_string(),
                 };
-                notifier.notify(event);
-                anyhow::bail!(
-                    "BOOT-03 clock skew {skew_secs:+.3}s exceeds threshold {threshold_secs:.2}s \
+                    notifier.notify(event);
+                    anyhow::bail!(
+                        "BOOT-03 clock skew {skew_secs:+.3}s exceeds threshold {threshold_secs:.2}s \
                      (source: {source}) — fix `chronyc tracking` then restart"
-                );
-            }
-            Err(tickvault_app::infra::ClockSkewError::Unavailable { primary, fallback }) => {
-                tracing::warn!(
-                    primary = %primary,
-                    fallback = %fallback,
-                    "BOOT-03 clock-skew probe unavailable — boot proceeding without skew check"
-                );
-                metrics::counter!("tv_boot_clock_skew_unavailable_total").increment(1);
-            }
-        }
-    }
-
-    // Step 6c (daily-universe instrument fetch) moved into `load_instruments`
-    // (the `DailyUniverse` scope arm) so the built universe flows straight
-    // into the subscription plan. See `load_daily_universe_plan`.
-
-    // Candle-engine re-architecture #T1b — drop the legacy candle objects
-    // (Engine A `candles_1s` base table + Engine C's 9 `candles_<tf>`
-    // materialized views + the retired Wave-6 `candles_<tf>_shadow`
-    // tables) BEFORE `ensure_shadow_candle_tables` creates Engine B's
-    // 21 plain `candles_<tf>` tables. The 9 matviews are NAMED
-    // `candles_1m` … `candles_1d` — the exact plain-table names — so a
-    // surviving matview makes `CREATE TABLE IF NOT EXISTS candles_1m`
-    // a silent no-op. Must run sequentially before the join.
-    tickvault_storage::shadow_persistence::drop_legacy_candle_objects(&config.questdb).await;
-
-    // All table creation queries are independent — run in parallel for faster boot.
-    // NOTE: the boot audit row for the `questdb_ready` step is appended AFTER this
-    // join — `ensure_boot_audit_table` lives inside the join (line ~1985) and
-    // writing to `boot_audit` before the table exists caused AUDIT-04 to fire on
-    // every clean boot until 2026-04-28.
-    tokio::join!(
-        ensure_tick_table_dedup_keys(&config.questdb),
-        // PR-E (2026-05-26): historical_candles table retired.
-        // Candle-engine re-architecture #T1b: `ensure_candle_views`
-        // (Engine C — `candles_1s` matview cascade) RETIRED. The 21
-        // plain `candles_<tf>` tables are created by
-        // `ensure_shadow_candle_tables` below; the legacy matviews are
-        // dropped by `drop_legacy_candle_objects` before this join.
-        // PR #3 (2026-05-19): `ensure_greeks_tables` retired alongside
-        // the deleted greeks_persistence module.
-        // PR #4 (2026-05-19): `ensure_deep_depth_table` retired alongside
-        // the deleted depth-20/200 pipelines (operator lock 2026-05-15).
-        // #T4 (2026-05-20): `ensure_depth_and_prev_close_tables`,
-        // `calendar_persistence`, `indicator_snapshot_persistence`,
-        // `obi_persistence`, `previous_close_persistence` ensure_* calls
-        // retired — market_depth / nse_holidays / indicator_snapshots /
-        // obi_snapshots / previous_close tables dropped.
-        // #T2b (2026-05-20): the 8 audit-table ensure_* calls
-        // (ws_reconnect / auth_renewal / boot / selftest / order /
-        // gap_fill / last_tick / orphan_position) were removed with
-        // their persistence modules in the QuestDB table cleanup.
-        // Option-chain minute-snapshot QuestDB table DROPPED 2026-06-23
-        // (operator: ticks are the single source of truth; the dormant
-        // never-written table is gone). The scheduler keeps populating
-        // the RAM `SnapshotCache` for the strategy — it just no longer
-        // mirrors into QuestDB.
-        // Wave 6 Sub-PR #1 item 1.4a — shadow candle tables (9 timeframes)
-        // + aggregator_seal_audit forensic table. The future writer task
-        // (item 1.4b) writes sealed candles into these tables; the boot
-        // DDL must run first so the ILP writes don't 404. Idempotent
-        // CREATE TABLE IF NOT EXISTS — safe to call on every boot.
-        tickvault_storage::shadow_persistence::ensure_shadow_candle_tables(&config.questdb),
-    );
-
-    // Wave 6 Sub-PR #1 item 1.4b — spawn the seal-writer tokio loop.
-    // This drains the SealAbsorptionPipeline ring (filled by the
-    // future producer-side wiring in item 1.4c) → ShadowCandleWriter
-    // ILP buffer → flush every 100 ms. On flush failure the rescue
-    // cascade walks ring → spill → DLQ → AGGREGATOR-DROP-01.
-    //
-    // During this slice (1.4b) the producer side is NOT yet wired —
-    // the loop runs idle (mpsc empty, ring empty, drain reports
-    // is_idle()) at zero CPU cost. The boot wiring is in place so
-    // item 1.4c is a thin call-site change in tick_processor.rs.
-    //
-    // Cancel bridge: the existing `shutdown_notify` Arc<Notify> drives
-    // the global graceful-shutdown sequence. We spawn a tiny bridge
-    // task that subscribes to it and flips the watch::Sender<bool>
-    // that `run_seal_writer_loop` listens on. This keeps the loop's
-    // signature unchanged (still uses `tokio::sync::watch` per the
-    // shipped 1.2f.5 contract) while integrating with the codebase's
-    // existing shutdown pattern.
-    {
-        use tickvault_storage::seal_writer_loop::{run_seal_writer_loop, seal_drain_interval};
-        use tickvault_storage::seal_writer_runner::SealWriterRunner;
-
-        // Bound the per-cycle drain — 1024 seals × 100 ms cycle =
-        // 10,240 seals/sec sustained throughput, well above the
-        // ~99K-seal IST-midnight burst absorbed across ~10 cycles.
-        const SEAL_MAX_DRAIN_PER_CYCLE: usize = 1_024;
-
-        match SealWriterRunner::new(&config.questdb, SEAL_MAX_DRAIN_PER_CYCLE) {
-            Ok(runner) => {
-                // Wave 6 Sub-PR #1 item 1.4c — publish the seal Sender
-                // GLOBALLY before moving `runner` into the spawn block.
-                // The future tick-broadcast subscriber task (item 1.4d,
-                // declared in a deeper scope where `fast_tick_broadcast_sender`
-                // is in scope) reads this via
-                // `tickvault_storage::seal_writer_runner::global_seal_sender()`
-                // and clones it to push BufferedSeal payloads from the
-                // aggregator's seal callback.
-                if !tickvault_storage::seal_writer_runner::set_global_seal_sender(runner.sender()) {
-                    tracing::warn!(
-                        "global seal sender was already installed (idempotent skip) — first installer wins"
                     );
                 }
-                let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-                // Hold `cancel_tx` alive for the lifetime of `main` so the
-                // watch channel does not disconnect (which would wake the
-                // loop's `.changed().await` immediately). The full graceful-
-                // shutdown bridge (subscribe to `shutdown_notify` →
-                // `cancel_tx.send(true)` → loop performs final drain) is
-                // wired in item 1.4c when the producer side becomes
-                // observable. For now: forget() leaks the sender to the
-                // 'static lifetime; on process exit Linux reclaims it.
-                std::mem::forget(cancel_tx);
-                tokio::spawn(async move {
-                    let _final_outcome =
-                        run_seal_writer_loop(runner, seal_drain_interval(), cancel_rx).await;
-                    tracing::info!("seal writer loop exited gracefully");
-                });
-                tracing::info!(
-                    interval_ms = seal_drain_interval().as_millis(),
-                    max_drain_per_cycle = SEAL_MAX_DRAIN_PER_CYCLE,
-                    "Wave 6 Sub-PR #1 item 1.4b — seal writer task spawned"
-                );
-            }
-            Err(err) => {
-                // Constructing the runner fails only if QuestDB ILP is
-                // catastrophically misconfigured (the lazy connect path
-                // already absorbs unreachable QuestDB). Log + continue —
-                // legacy candles_1s path is still active so trading
-                // does not stop, but shadow tables will not populate.
-                tracing::error!(
-                    ?err,
-                    "failed to construct SealWriterRunner — shadow tables will NOT populate this session"
-                );
+                Err(tickvault_app::infra::ClockSkewError::Unavailable { primary, fallback }) => {
+                    tracing::warn!(
+                        primary = %primary,
+                        fallback = %fallback,
+                        "BOOT-03 clock-skew probe unavailable — boot proceeding without skew check"
+                    );
+                    metrics::counter!("tv_boot_clock_skew_unavailable_total").increment(1);
+                }
             }
         }
-    }
 
-    // #T2b (2026-05-20): the boot_audit row write was removed with the
-    // boot_audit table (QuestDB table cleanup).
+        // Step 6c (daily-universe instrument fetch) moved into `load_instruments`
+        // (the `DailyUniverse` scope arm) so the built universe flows straight
+        // into the subscription plan. See `load_daily_universe_plan`.
 
-    // Wave 1 Item 0.d — boot-time idempotent init for the index prev_close
-    // cache directory. Hoisted out of the tick hot path (was a per-packet
-    // `std::fs::create_dir_all` call on every PrevClose code-6 frame).
-    // Failure here is non-fatal: the hot-path enqueue will surface the
-    // io::Error in the writer task's ERROR arm and movers will simply not
-    // have an index baseline cached for mid-day restart recovery.
-    if let Err(err) = tickvault_core::pipeline::init_prev_close_cache_dir() {
-        warn!(
-            ?err,
-            "init_prev_close_cache_dir failed (non-critical, mid-day index baseline cache will be unavailable)"
+        // Candle-engine re-architecture #T1b — drop the legacy candle objects
+        // (Engine A `candles_1s` base table + Engine C's 9 `candles_<tf>`
+        // materialized views + the retired Wave-6 `candles_<tf>_shadow`
+        // tables) BEFORE `ensure_shadow_candle_tables` creates Engine B's
+        // 21 plain `candles_<tf>` tables. The 9 matviews are NAMED
+        // `candles_1m` … `candles_1d` — the exact plain-table names — so a
+        // surviving matview makes `CREATE TABLE IF NOT EXISTS candles_1m`
+        // a silent no-op. Must run sequentially before the join.
+        tickvault_storage::shadow_persistence::drop_legacy_candle_objects(&config.questdb).await;
+
+        // All table creation queries are independent — run in parallel for faster boot.
+        // NOTE: the boot audit row for the `questdb_ready` step is appended AFTER this
+        // join — `ensure_boot_audit_table` lives inside the join (line ~1985) and
+        // writing to `boot_audit` before the table exists caused AUDIT-04 to fire on
+        // every clean boot until 2026-04-28.
+        tokio::join!(
+            ensure_tick_table_dedup_keys(&config.questdb),
+            // PR-E (2026-05-26): historical_candles table retired.
+            // Candle-engine re-architecture #T1b: `ensure_candle_views`
+            // (Engine C — `candles_1s` matview cascade) RETIRED. The 21
+            // plain `candles_<tf>` tables are created by
+            // `ensure_shadow_candle_tables` below; the legacy matviews are
+            // dropped by `drop_legacy_candle_objects` before this join.
+            // PR #3 (2026-05-19): `ensure_greeks_tables` retired alongside
+            // the deleted greeks_persistence module.
+            // PR #4 (2026-05-19): `ensure_deep_depth_table` retired alongside
+            // the deleted depth-20/200 pipelines (operator lock 2026-05-15).
+            // #T4 (2026-05-20): `ensure_depth_and_prev_close_tables`,
+            // `calendar_persistence`, `indicator_snapshot_persistence`,
+            // `obi_persistence`, `previous_close_persistence` ensure_* calls
+            // retired — market_depth / nse_holidays / indicator_snapshots /
+            // obi_snapshots / previous_close tables dropped.
+            // #T2b (2026-05-20): the 8 audit-table ensure_* calls
+            // (ws_reconnect / auth_renewal / boot / selftest / order /
+            // gap_fill / last_tick / orphan_position) were removed with
+            // their persistence modules in the QuestDB table cleanup.
+            // Option-chain minute-snapshot QuestDB table DROPPED 2026-06-23
+            // (operator: ticks are the single source of truth; the dormant
+            // never-written table is gone). The scheduler keeps populating
+            // the RAM `SnapshotCache` for the strategy — it just no longer
+            // mirrors into QuestDB.
+            // Wave 6 Sub-PR #1 item 1.4a — shadow candle tables (9 timeframes)
+            // + aggregator_seal_audit forensic table. The future writer task
+            // (item 1.4b) writes sealed candles into these tables; the boot
+            // DDL must run first so the ILP writes don't 404. Idempotent
+            // CREATE TABLE IF NOT EXISTS — safe to call on every boot.
+            tickvault_storage::shadow_persistence::ensure_shadow_candle_tables(&config.questdb),
         );
-    }
 
-    // Wave 1 Item 0.a — boot-time idempotent init for the async PrevClose
-    // cache writer. Spawns a `tokio::task::spawn_blocking` consumer task
-    // owning a bounded `tokio::sync::mpsc::channel(64)`. Hot path uses
-    // `prev_close_writer::try_enqueue_global` (non-blocking, drops oldest
-    // on overflow with `tv_prev_close_writer_dropped_total`).
-    tickvault_core::pipeline::prev_close_writer::init();
+        // D2 Stage 2: the seal-writer (item 1.4b) is now spawned ONCE in the hoisted
+        // `build_shared_infra` prefix (via `spawn_seal_writer_loop`) so it runs for
+        // BOTH the Dhan-OFF and Dhan-ON-slow paths and installs the process-wide
+        // `global_seal_sender` Groww routes through. The duplicate inline lane copy
+        // is removed.
 
-    // Wave 1 Item 4.3/4.4 — boot-time idempotent init for the
-    // FirstSeenSet (gates first-Quote/Full per (security_id, segment)
-    // per IST trading day) + the PrevClose persist drain task (forwards
-    // hot-path enqueues to QuestDB via ILP). Plus the IST-midnight
-    // reset task that flips first_seen back to empty at IST 00:00.
-    let first_seen = tickvault_core::pipeline::first_seen_set::init_global();
-    let _first_seen_reset_handle =
-        tickvault_core::pipeline::first_seen_set::spawn_ist_midnight_reset_task(first_seen);
+        // #T2b (2026-05-20): the boot_audit row write was removed with the
+        // boot_audit table (QuestDB table cleanup).
 
-    // Wave 1 Item 0.b part 2 — async tick spill drain. Adds an mpsc(8192)
-    // layer in front of the existing sync BufWriter spill so the hot path
-    // gets non-blocking enqueue semantics under slow-disk conditions
-    // (chaos-mode tests, full-disk recovery, host I/O glitches). The
-    // sync BufWriter + DLQ safety net stays intact — this is additional
-    // capacity, not a replacement.
-    let async_spill_path = std::path::PathBuf::from("data/spill").join(format!(
-        "ticks-async-{}.bin",
-        chrono::Utc::now().format("%Y%m%d")
-    ));
-    if let Err(err) = tickvault_storage::tick_spill_drain::init(async_spill_path).await {
-        warn!(
-            ?err,
-            "tick_spill_drain init failed (non-critical, sync spill path \
+        // Wave 1 Item 0.d — boot-time idempotent init for the index prev_close
+        // cache directory. Hoisted out of the tick hot path (was a per-packet
+        // `std::fs::create_dir_all` call on every PrevClose code-6 frame).
+        // Failure here is non-fatal: the hot-path enqueue will surface the
+        // io::Error in the writer task's ERROR arm and movers will simply not
+        // have an index baseline cached for mid-day restart recovery.
+        if let Err(err) = tickvault_core::pipeline::init_prev_close_cache_dir() {
+            warn!(
+                ?err,
+                "init_prev_close_cache_dir failed (non-critical, mid-day index baseline cache will be unavailable)"
+            );
+        }
+
+        // Wave 1 Item 0.a — boot-time idempotent init for the async PrevClose
+        // cache writer. Spawns a `tokio::task::spawn_blocking` consumer task
+        // owning a bounded `tokio::sync::mpsc::channel(64)`. Hot path uses
+        // `prev_close_writer::try_enqueue_global` (non-blocking, drops oldest
+        // on overflow with `tv_prev_close_writer_dropped_total`).
+        tickvault_core::pipeline::prev_close_writer::init();
+
+        // Wave 1 Item 4.3/4.4 — boot-time idempotent init for the
+        // FirstSeenSet (gates first-Quote/Full per (security_id, segment)
+        // per IST trading day) + the PrevClose persist drain task (forwards
+        // hot-path enqueues to QuestDB via ILP). Plus the IST-midnight
+        // reset task that flips first_seen back to empty at IST 00:00.
+        let first_seen = tickvault_core::pipeline::first_seen_set::init_global();
+        let _first_seen_reset_handle =
+            tickvault_core::pipeline::first_seen_set::spawn_ist_midnight_reset_task(first_seen);
+
+        // Wave 1 Item 0.b part 2 — async tick spill drain. Adds an mpsc(8192)
+        // layer in front of the existing sync BufWriter spill so the hot path
+        // gets non-blocking enqueue semantics under slow-disk conditions
+        // (chaos-mode tests, full-disk recovery, host I/O glitches). The
+        // sync BufWriter + DLQ safety net stays intact — this is additional
+        // capacity, not a replacement.
+        let async_spill_path = std::path::PathBuf::from("data/spill").join(format!(
+            "ticks-async-{}.bin",
+            chrono::Utc::now().format("%Y%m%d")
+        ));
+        if let Err(err) = tickvault_storage::tick_spill_drain::init(async_spill_path).await {
+            warn!(
+                ?err,
+                "tick_spill_drain init failed (non-critical, sync spill path \
              remains active)"
-        );
-    }
+            );
+        }
 
-    // 2026-04-28 audit gap closure: spawn the disk-health watcher.
-    // Closes the highest-risk hole in the zero-loss chain ("disk full +
-    // QuestDB down simultaneously"). Operator now gets ~hours of warning
-    // via `tv_spill_dir_free_bytes` gauge before the spill disk fills.
-    //
-    // G3 (zero-tick-loss audit PR-5): run the watcher UNDER A SUPERVISOR
-    // (mirrors the WS-GAP-05 pool supervisor) so a panic in the watcher
-    // respawns it + logs DISK-WATCHER-01 + increments
-    // `tv_disk_watcher_respawn_total` (CloudWatch-alarmed) instead of
-    // silently vanishing — previously this handle was bound to `_` and a
-    // watcher panic killed disk-free monitoring with no signal.
-    let _disk_health_watcher_supervisor =
-        tickvault_storage::disk_health_watcher::spawn_supervised_spill_disk_health_watcher(
-            std::path::PathBuf::from("data/spill"),
-        );
+        // 2026-04-28 audit gap closure: spawn the disk-health watcher.
+        // Closes the highest-risk hole in the zero-loss chain ("disk full +
+        // QuestDB down simultaneously"). Operator now gets ~hours of warning
+        // via `tv_spill_dir_free_bytes` gauge before the spill disk fills.
+        //
+        // G3 (zero-tick-loss audit PR-5): run the watcher UNDER A SUPERVISOR
+        // (mirrors the WS-GAP-05 pool supervisor) so a panic in the watcher
+        // respawns it + logs DISK-WATCHER-01 + increments
+        // `tv_disk_watcher_respawn_total` (CloudWatch-alarmed) instead of
+        // silently vanishing — previously this handle was bound to `_` and a
+        // watcher panic killed disk-free monitoring with no signal.
+        let _disk_health_watcher_supervisor =
+            tickvault_storage::disk_health_watcher::spawn_supervised_spill_disk_health_watcher(
+                std::path::PathBuf::from("data/spill"),
+            );
 
-    // Health status — created early so tick persistence status can be set.
-    let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
+        // D2 Stage 2: `health_status` is now built ONCE in the hoisted
+        // `build_shared_infra` prefix and destructured into `main()` scope above, so
+        // the lane references the SAME Arc the API server + run-loop hold. The
+        // tick-persistence flag below sets state on that shared registry.
 
-    let tick_writer = match TickPersistenceWriter::new(&config.questdb) {
-        Ok(mut writer) => {
-            info!("QuestDB tick writer connected");
-            health_status.set_tick_persistence_connected(true);
-            // A1: Recover stale spill files from previous crashes.
-            let recovered = writer.recover_stale_spill_files();
-            if recovered > 0 {
-                info!(
-                    recovered,
-                    "recovered stale tick spill files from previous crashes"
-                );
-                notifier.notify(
+        let tick_writer = match TickPersistenceWriter::new(&config.questdb) {
+            Ok(mut writer) => {
+                info!("QuestDB tick writer connected");
+                health_status.set_tick_persistence_connected(true);
+                // A1: Recover stale spill files from previous crashes.
+                let recovered = writer.recover_stale_spill_files();
+                if recovered > 0 {
+                    info!(
+                        recovered,
+                        "recovered stale tick spill files from previous crashes"
+                    );
+                    notifier.notify(
                     tickvault_core::notification::events::NotificationEvent::Custom {
                         message: format!(
                             "<b>Tick Recovery</b>\nRecovered {recovered} orphaned ticks from previous crash spill files."
                         ),
                     },
                 );
+                }
+                Some(writer)
             }
-            Some(writer)
-        }
-        Err(err) => {
-            // A3: Start in disconnected buffering mode instead of giving up.
-            // Ticks are buffered in ring buffer + disk spill until QuestDB comes back.
-            warn!(
-                ?err,
-                "QuestDB tick writer failed to connect — starting in DISCONNECTED BUFFERING mode"
-            );
-            notifier.notify(
+            Err(err) => {
+                // A3: Start in disconnected buffering mode instead of giving up.
+                // Ticks are buffered in ring buffer + disk spill until QuestDB comes back.
+                warn!(
+                    ?err,
+                    "QuestDB tick writer failed to connect — starting in DISCONNECTED BUFFERING mode"
+                );
+                notifier.notify(
                 tickvault_core::notification::events::NotificationEvent::Custom {
                     message: format!(
                         "<b>CRITICAL: QuestDB UNAVAILABLE</b>\nTick writer in BUFFERING mode: {err}\nTicks buffered to ring buffer + disk spill. Will drain when QuestDB recovers."
                     ),
                 },
             );
-            // A3: Create writer in disconnected mode — zero tick loss.
-            let mut writer = TickPersistenceWriter::new_disconnected(&config.questdb);
-            // Also recover any stale spill files (will skip since sender is None,
-            // but sets up the path for when reconnect succeeds).
-            // recover_stale_spill_files returns count, not Result — no error to handle.
-            let recovered = writer.recover_stale_spill_files();
-            if recovered > 0 {
-                info!(
-                    recovered,
-                    "recovered stale tick spill files from previous crash"
-                );
+                // A3: Create writer in disconnected mode — zero tick loss.
+                let mut writer = TickPersistenceWriter::new_disconnected(&config.questdb);
+                // Also recover any stale spill files (will skip since sender is None,
+                // but sets up the path for when reconnect succeeds).
+                // recover_stale_spill_files returns count, not Result — no error to handle.
+                let recovered = writer.recover_stale_spill_files();
+                if recovered > 0 {
+                    info!(
+                        recovered,
+                        "recovered stale tick spill files from previous crash"
+                    );
+                }
+                Some(writer)
             }
-            Some(writer)
-        }
-    };
+        };
 
-    // #T4 (2026-05-20): depth_writer construction removed — `market_depth`
-    // table dropped; the IDX_I-only universe runs Quote mode (no depth).
+        // #T4 (2026-05-20): depth_writer construction removed — `market_depth`
+        // table dropped; the IDX_I-only universe runs Quote mode (no depth).
 
-    // -----------------------------------------------------------------------
-    // Step 6c: Pre-market readiness check (Parthiban directive 2026-04-21)
-    // -----------------------------------------------------------------------
-    // Three-zone behaviour:
-    //   - 08:00–09:14 IST (pre-market): run + CRITICAL Telegram on failure,
-    //     but boot CONTINUES so operator has 75min to rotate the token /
-    //     reactivate dataPlan before 09:15.
-    //   - 09:15–15:30 IST (market hours): run + CRITICAL Telegram on failure
-    //     AND HALT the boot — we refuse to start trading against a bad
-    //     profile (expired dataPlan, revoked Derivative segment, or
-    //     4h-expiring token would all cause silent data loss).
-    //   - Off-hours / non-trading: skip (nothing to check against).
-    //
-    // Checks: dataPlan == "Active", activeSegment contains "Derivative",
-    // token expires > 4 hours from now.
-    if is_trading {
-        let now_ist =
-            chrono::Utc::now() + chrono::Duration::hours(5) + chrono::Duration::minutes(30);
-        let hour = now_ist.hour();
-        let minute = now_ist.minute();
-        let in_pre_market = hour == 8 || (hour == 9 && minute < 15);
-        let in_market_hours =
-            (hour == 9 && minute >= 15) || (10..=14).contains(&hour) || (hour == 15 && minute < 30);
-        if in_pre_market || in_market_hours {
-            info!(
-                in_pre_market,
-                in_market_hours, "running pre-market readiness check"
-            );
-            match token_manager.pre_market_check().await {
-                Ok(()) => info!("pre-market readiness check passed"),
-                Err(err) => {
-                    // I12 (2026-04-21): auto-diagnostic. On pre-market HALT,
-                    // fetch /v2/profile and /v2/ip/getIP directly and embed
-                    // their responses (redacted) in the CRITICAL Telegram
-                    // message. Operators previously had to run curl manually
-                    // while the market clock ticked — now the diagnosis
-                    // arrives in the same page.
-                    let diagnostics = build_pre_market_diagnostics(
-                        &token_manager,
-                        &config.dhan.rest_api_base_url,
-                    )
-                    .await;
-                    let reason = format!("{err}\n\n{diagnostics}");
-                    // Critical Telegram event — always fires (pre-market or market-hours).
-                    notifier.notify(NotificationEvent::PreMarketProfileCheckFailed {
-                        reason: reason.clone(),
-                        within_market_hours: in_market_hours,
-                    });
-                    // The profile/IP pre-market check is a LIVE-ORDER-TRADING
-                    // gate (dataPlan / activeSegment / static-IP must be valid
-                    // before placing real orders). In the no-orders DATA-CAPTURE
-                    // phase (mode != Live, e.g. Paper) it must NOT block boot —
-                    // capturing ticks needs neither a validated profile nor a
-                    // static IP, and a HALT here just crash-loops the app and
-                    // stops all data capture. Only HALT when we will trade live.
-                    if in_market_hours && config.strategy.mode.is_live() {
-                        // HALT — we refuse to boot into a live trading session
-                        // with a bad profile. systemd will restart on the next
-                        // attempt but the underlying cause (dataPlan / segment
-                        // / token) must be fixed first.
+        // -----------------------------------------------------------------------
+        // Step 6c: Pre-market readiness check (Parthiban directive 2026-04-21)
+        // -----------------------------------------------------------------------
+        // Three-zone behaviour:
+        //   - 08:00–09:14 IST (pre-market): run + CRITICAL Telegram on failure,
+        //     but boot CONTINUES so operator has 75min to rotate the token /
+        //     reactivate dataPlan before 09:15.
+        //   - 09:15–15:30 IST (market hours): run + CRITICAL Telegram on failure
+        //     AND HALT the boot — we refuse to start trading against a bad
+        //     profile (expired dataPlan, revoked Derivative segment, or
+        //     4h-expiring token would all cause silent data loss).
+        //   - Off-hours / non-trading: skip (nothing to check against).
+        //
+        // Checks: dataPlan == "Active", activeSegment contains "Derivative",
+        // token expires > 4 hours from now.
+        if is_trading {
+            let now_ist =
+                chrono::Utc::now() + chrono::Duration::hours(5) + chrono::Duration::minutes(30);
+            let hour = now_ist.hour();
+            let minute = now_ist.minute();
+            let in_pre_market = hour == 8 || (hour == 9 && minute < 15);
+            let in_market_hours = (hour == 9 && minute >= 15)
+                || (10..=14).contains(&hour)
+                || (hour == 15 && minute < 30);
+            if in_pre_market || in_market_hours {
+                info!(
+                    in_pre_market,
+                    in_market_hours, "running pre-market readiness check"
+                );
+                match token_manager.pre_market_check().await {
+                    Ok(()) => info!("pre-market readiness check passed"),
+                    Err(err) => {
+                        // I12 (2026-04-21): auto-diagnostic. On pre-market HALT,
+                        // fetch /v2/profile and /v2/ip/getIP directly and embed
+                        // their responses (redacted) in the CRITICAL Telegram
+                        // message. Operators previously had to run curl manually
+                        // while the market clock ticked — now the diagnosis
+                        // arrives in the same page.
+                        let diagnostics = build_pre_market_diagnostics(
+                            &token_manager,
+                            &config.dhan.rest_api_base_url,
+                        )
+                        .await;
+                        let reason = format!("{err}\n\n{diagnostics}");
+                        // Critical Telegram event — always fires (pre-market or market-hours).
+                        notifier.notify(NotificationEvent::PreMarketProfileCheckFailed {
+                            reason: reason.clone(),
+                            within_market_hours: in_market_hours,
+                        });
+                        // The profile/IP pre-market check is a LIVE-ORDER-TRADING
+                        // gate (dataPlan / activeSegment / static-IP must be valid
+                        // before placing real orders). In the no-orders DATA-CAPTURE
+                        // phase (mode != Live, e.g. Paper) it must NOT block boot —
+                        // capturing ticks needs neither a validated profile nor a
+                        // static IP, and a HALT here just crash-loops the app and
+                        // stops all data capture. Only HALT when we will trade live.
+                        if in_market_hours && config.strategy.mode.is_live() {
+                            // HALT — we refuse to boot into a live trading session
+                            // with a bad profile. systemd will restart on the next
+                            // attempt but the underlying cause (dataPlan / segment
+                            // / token) must be fixed first.
+                            error!(
+                                error = %err,
+                                "HALTING BOOT — pre-market profile check failed during market hours"
+                            );
+                            anyhow::bail!(
+                                "pre-market profile check FAILED during market hours — HALT: {reason}"
+                            );
+                        }
+                        // Pre-market window OR non-live (data-capture) mode: log
+                        // ERROR (triggers Telegram) but allow boot to CONTINUE so
+                        // the market-data feed + tick capture still run. No live
+                        // orders are placed in this mode, so a bad profile/IP is
+                        // not a trading-safety risk.
                         error!(
                             error = %err,
-                            "HALTING BOOT — pre-market profile check failed during market hours"
-                        );
-                        anyhow::bail!(
-                            "pre-market profile check FAILED during market hours — HALT: {reason}"
+                            mode = ?config.strategy.mode,
+                            "pre-market profile check FAILED — continuing (data-capture mode or pre-09:15; no live orders placed)"
                         );
                     }
-                    // Pre-market window OR non-live (data-capture) mode: log
-                    // ERROR (triggers Telegram) but allow boot to CONTINUE so
-                    // the market-data feed + tick capture still run. No live
-                    // orders are placed in this mode, so a bad profile/IP is
-                    // not a trading-safety risk.
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Step 7: Load or build instruments (three-layer defense)
+        // -----------------------------------------------------------------------
+        // FreshBuild persists internally (inside load_or_build_instruments).
+        // CachedPlan loads from rkyv cache and returns universe for persistence here.
+        // To avoid DOUBLE persistence on FreshBuild, only persist if CachedPlan.
+        let (subscription_plan, slow_boot_universe, needs_instrument_persist) =
+            match load_instruments(&config, is_trading, trading_calendar.as_ref()).await {
+                Ok(loaded) => loaded,
+                Err(err) => {
+                    // Observability slice #2: emit the symmetric failure alert.
+                    // Mirrors the fast-boot site — the bare `?` previously halted
+                    // boot with no operator Telegram. Fail-closed halt preserved;
+                    // NOT a duplicate of INSTR-FETCH-* (those infinite-retry).
+                    // Security (review 2026-06-12): redact the anyhow chain before it
+                    // reaches Telegram + the log sinks (authentication.md rule 2 — a
+                    // token must never appear in error messages). capture_rest_error_body
+                    // is the ratchet-guaranteed redactor (URL-param + JWT + credential).
+                    let safe_reason =
+                        tickvault_common::sanitize::capture_rest_error_body(&err.to_string());
+                    error!(error = %safe_reason, "instrument load failed at boot — alerting operator and halting");
+                    notifier.notify(NotificationEvent::InstrumentBuildFailed {
+                        reason: safe_reason,
+                        manual_trigger_url: format!(
+                            "http://{}:{}/api/instruments/rebuild",
+                            config.api.host, config.api.port
+                        ),
+                    });
+                    return Err(err);
+                }
+            };
+
+        // Audit finding #6 (2026-04-24): emit InstrumentBuildSuccess when
+        // instruments load successfully on the standard-boot path. Mirrors
+        // the fast-boot emission above. Before this, only failure produced
+        // a Telegram — operators had no positive "instruments rebuilt OK"
+        // signal.
+        if let Some(ref u) = slow_boot_universe {
+            let source = if needs_instrument_persist {
+                "rkyv_cache"
+            } else {
+                "fresh_csv_build"
+            };
+            notifier.notify(NotificationEvent::InstrumentBuildSuccess {
+                source: source.to_string(),
+                derivative_count: u.derivative_contracts.len(),
+                underlying_count: u.underlyings.len(),
+            });
+        }
+
+        // Boot-timing proof Telegram (DailyUniverse scope only — sentinel-guarded
+        // so Indices4Only emits nothing). Reads the wall-clock stashed by
+        // `load_daily_universe_plan`; gives the operator REAL daily evidence the
+        // O(1) warm path is working: warm-skip boots are sub-second regardless of
+        // the applicable-F&O master size; a full rebuild is the batched-seconds
+        // cold path.
+        if let Some(message) = format_instrument_load_telegram(
+            INSTRUMENT_LOAD_ELAPSED_MS.load(std::sync::atomic::Ordering::Relaxed),
+            INSTRUMENT_LOAD_WARM_SKIPPED.load(std::sync::atomic::Ordering::Relaxed),
+            INSTRUMENT_LOAD_TOTAL_ROWS.load(std::sync::atomic::Ordering::Relaxed),
+        ) {
+            notifier.notify(NotificationEvent::Custom { message });
+        }
+
+        // Only persist for CachedPlan (not yet persisted). FreshBuild already
+        // persisted inside load_or_build_instruments — double-write creates
+        // duplicate rows in the same timestamp second.
+        // -----------------------------------------------------------------------
+        // Step 8: Build WebSocket connection pool (only if authenticated + plan ready)
+        // -----------------------------------------------------------------------
+        let token_handle = token_manager.token_handle();
+
+        // Wave 2 Item 5.4 (AUTH-GAP-03) — install global TokenManager so the
+        // WebSocket sleep-wake path can call `force_renewal_if_stale()`
+        // without holding a back-reference per connection.
+        if !tickvault_core::auth::token_manager::set_global_token_manager(token_manager.clone()) {
+            tracing::warn!("global TokenManager already installed — skipping");
+        }
+
+        // Fetch credentials ONCE for all downstream consumers (WS pool, order update WS, trading pipeline).
+        // Previously fetched 3 separate times — each SSM call is a network roundtrip to AWS.
+        let ws_client_id = {
+            let credentials = secret_manager::fetch_dhan_credentials()
+                .await
+                .context("failed to fetch Dhan client ID for WebSocket + trading")?;
+            credentials.client_id.expose_secret().to_string()
+        };
+
+        // Depth-200 uses the same shared TOTP/APP `token_handle` as Live Feed,
+        // Depth-20 and Order-Update. Dhan removed the server-side `tokenConsumerType`
+        // gate on `wss://full-depth-api.dhan.co` (Ticket #5610706, 2026-05-02 —
+        // "either a SELF token or an APP token, and both should now work
+        // seamlessly for fetching the 200-level market depth data"), so the
+        // separate `Depth200SelfTokenManager` workaround is retired. Git
+        // history preserves the SELF code if Dhan ever regresses.
+
+        // Step 8a: Create WebSocket pool (channel + connections, NOT yet spawned).
+        // Step 9 starts tick processor BEFORE connections are spawned so frames
+        // are consumed immediately — prevents frame send timeouts during stagger.
+        //
+        // GUARD: Skip WebSocket connections on non-trading days (weekends/holidays).
+        // Dhan's WebSocket server sends stale market data (last-traded prices from
+        // the previous trading day) even on non-trading days. Without this guard,
+        // stale ticks pollute the pipeline.
+        //
+        // WebSocket connects IMMEDIATELY on trading/mock/muhurat days regardless of
+        // current time. Pre-market stale ticks are dropped by the tick processor's
+        // ingestion gate: [data_collection_start, data_collection_end) IST.
+        // This ensures all 5 connections are warm and ready before 9:00 AM market open.
+        // At 15:30 PM (market close), market feed + depth WS are disconnected.
+        // Order update WS stays alive until app shutdown.
+        let should_connect_ws =
+            subscription_plan.is_some() && (is_trading || is_mock_trading || is_muhurat);
+
+        let (pool_receiver, ws_pool_ready) = if should_connect_ws {
+            match create_websocket_pool(
+                &token_handle,
+                &ws_client_id,
+                &subscription_plan,
+                &config,
+                is_market_hours,
+                Some(notifier.clone()),
+                ws_frame_spill.clone(),
+                // PR-E: hand the Dhan main feed the shared runtime enable flag.
+                Some(feed_runtime.dhan_flag()),
+            ) {
+                Some((receiver, pool)) => (Some(receiver), Some(pool)),
+                None => (None, None),
+            }
+        } else if !is_trading && !is_mock_trading {
+            info!("WebSocket pool skipped — non-trading day (no live market data to capture)");
+            (None, None)
+        } else {
+            warn!("WebSocket pool skipped — running in offline mode");
+            (None, None)
+        };
+
+        // STAGE-C.2b: Slow-boot mirror of the fast-boot re-injection path.
+        // Re-inject replayed LiveFeed frames into the pool's mpsc BEFORE the
+        // tick processor spawns, so recovered frames land ahead of any live
+        // frames and are persisted idempotently via QuestDB dedup keys.
+        if !ws_wal_replay_live_feed.is_empty() {
+            if let Some(ref pool) = ws_pool_ready {
+                let sender = pool.frame_sender_clone();
+                let capacity = sender.capacity();
+                let to_inject = std::mem::take(&mut ws_wal_replay_live_feed);
+                let count = to_inject.len();
+                info!(
+                    frames = count,
+                    channel_capacity = capacity,
+                    "STAGE-C.2b: re-injecting replayed LiveFeed frames into pool mpsc (slow boot)"
+                );
+                let mut injected = 0u64;
+                let mut dropped = 0u64;
+                for frame in to_inject {
+                    match sender.try_send(frame) {
+                        Ok(()) => injected += 1,
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+                        | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => dropped += 1,
+                    }
+                }
+                metrics::counter!(
+                    "tv_ws_frame_wal_reinjected_total",
+                    "ws_type" => "live_feed"
+                )
+                .increment(injected);
+                if dropped > 0 {
                     error!(
-                        error = %err,
-                        mode = ?config.strategy.mode,
-                        "pre-market profile check FAILED — continuing (data-capture mode or pre-09:15; no live orders placed)"
+                        dropped,
+                        injected,
+                        "STAGE-C.2b: LiveFeed re-injection dropped frames (slow boot) — \
+                     channel full/closed, frames remain in WAL archive"
+                    );
+                    metrics::counter!(
+                        "tv_ws_frame_wal_reinjected_dropped_total",
+                        "ws_type" => "live_feed"
+                    )
+                    .increment(dropped);
+                } else {
+                    info!(
+                        injected,
+                        "STAGE-C.2b: LiveFeed re-injection complete (slow boot)"
+                    );
+                }
+            } else {
+                warn!(
+                    frames = ws_wal_replay_live_feed.len(),
+                    "STAGE-C.2b: LiveFeed replay frames held but no pool (slow boot) — \
+                 frames remain in WAL archive, not re-injected"
+                );
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Step 9: Spawn tick processor FIRST (before WS connections send frames)
+        // -----------------------------------------------------------------------
+        // PR #2 (2026-05-18): `shared_movers` snapshot retired alongside
+        // the deleted `top_movers` / `option_movers` modules.
+
+        // D2 Stage 2: the tick broadcast (`tick_broadcast_sender`) is now created
+        // ONCE in the hoisted `build_shared_infra` prefix and destructured into
+        // `main()` scope above. The lane references that SAME sender so the obs /
+        // aggregator / tick-storage subscribers (also spawned in the prefix, having
+        // already `.subscribe()`d) receive every tick this lane processor publishes.
+
+        // S12 wiring: heartbeat watchdog (slow boot).
+        // Same responsibilities as the fast-boot watchdog above. Spawned
+        // after token_handle + tick_broadcast_sender are both available.
+        // Runs until the process exits. (LANE — depends on the lane-built token_handle.)
+        let _slow_heartbeat_handle = spawn_heartbeat_watchdog(
+            std::sync::Arc::clone(&token_handle),
+            tick_broadcast_sender.clone(),
+        );
+
+        // In-market gap-backfill is DISABLED by user policy. Historical
+        // candle data must NOT be injected into the live `ticks` table.
+        // Post-market historical fetch runs on a separate cold path and
+        // writes only to `historical_candles`.
+        //
+        // D2 Stage 2: the slow-boot observability consumer is now spawned in the
+        // hoisted `build_shared_infra` prefix (subscribe-before-publish), not here.
+
+        // PR4 (operator 2026-06-01): bounded prev-day OHLCV fetch. Cold path —
+        // fetches yesterday's single daily candle per subscribed SID into the
+        // separate `prev_day_ohlcv` table (never `ticks`); fail-soft per symbol;
+        // never blocks live ticks. Only runs when the daily universe was built
+        // (`stashed_universe()` is `None` under Indices4Only or on build failure).
+        if let Some(pd_universe) = tickvault_app::prev_day_ohlcv_boot::stashed_universe() {
+            match TradingCalendar::from_config(&config.trading) {
+                Ok(cal) => {
+                    // Compute the dates HERE (calendar in scope) so the task
+                    // doesn't need to move the non-Clone TradingConfig/Calendar.
+                    let now_ist = chrono::Utc::now()
+                        + chrono::Duration::seconds(i64::from(
+                            tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+                        ));
+                    let today = now_ist.date_naive();
+                    let from =
+                        tickvault_app::prev_day_ohlcv_boot::previous_trading_day(today, |d| {
+                            cal.is_trading_day(d)
+                        });
+                    // Capture the expected universe size BEFORE the Arc moves into
+                    // the fetch, so the post-fetch coverage verification can compare.
+                    let pd_expected = pd_universe.subscription_targets.len();
+                    let pd_token = std::sync::Arc::clone(&token_handle);
+                    let pd_qcfg = config.questdb.clone();
+                    let pd_base = config.dhan.rest_api_base_url.clone();
+                    tokio::spawn(async move {
+                        use tickvault_app::prev_day_ohlcv_boot::{
+                            PrevDayCoverage, evaluate_prev_day_coverage, prev_day_csv_dir,
+                            write_prev_day_coverage_csv,
+                        };
+                        let summary = tickvault_app::prev_day_ohlcv_boot::run_prev_day_ohlcv_fetch(
+                            pd_universe,
+                            pd_token,
+                            pd_qcfg,
+                            pd_base,
+                            from,
+                            today,
+                        )
+                        .await;
+                        // Verify coverage (false-OK guard) + write the operator-
+                        // visible CSV (`make prev-day-show`). Fail-soft on FS error.
+                        if let Err(err) = write_prev_day_coverage_csv(
+                            prev_day_csv_dir(),
+                            today,
+                            pd_expected,
+                            &summary,
+                        ) {
+                            warn!(?err, "prev_day_ohlcv: coverage CSV write failed");
+                        }
+                        match evaluate_prev_day_coverage(pd_expected, summary.fetched) {
+                            PrevDayCoverage::Ok { pct } => info!(
+                                pct,
+                                fetched = summary.fetched,
+                                expected = pd_expected,
+                                "PROOF: prev-day OHLCV coverage OK"
+                            ),
+                            PrevDayCoverage::Degraded { pct } => warn!(
+                                pct,
+                                fetched = summary.fetched,
+                                expected = pd_expected,
+                                skipped = summary.skipped,
+                                failed = summary.failed,
+                                "prev-day OHLCV coverage DEGRADED — symbols missing yesterday's candle"
+                            ),
+                            PrevDayCoverage::Empty => error!(
+                                code =
+                                    tickvault_common::error_code::ErrorCode::PrevDay01CoverageEmpty
+                                        .code_str(),
+                                expected = pd_expected,
+                                skipped = summary.skipped,
+                                failed = summary.failed,
+                                "prev-day OHLCV coverage EMPTY — no yesterday candles fetched"
+                            ),
+                        }
+                    });
+                    info!("prev-day OHLCV boot fetch task spawned");
+                }
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        "prev_day_ohlcv: calendar build failed — boot fetch skipped"
                     );
                 }
             }
         }
-    }
 
-    // -----------------------------------------------------------------------
-    // Step 7: Load or build instruments (three-layer defense)
-    // -----------------------------------------------------------------------
-    // FreshBuild persists internally (inside load_or_build_instruments).
-    // CachedPlan loads from rkyv cache and returns universe for persistence here.
-    // To avoid DOUBLE persistence on FreshBuild, only persist if CachedPlan.
-    let (subscription_plan, slow_boot_universe, needs_instrument_persist) = match load_instruments(
-        &config,
-        is_trading,
-        trading_calendar.as_ref(),
-    )
-    .await
-    {
-        Ok(loaded) => loaded,
-        Err(err) => {
-            // Observability slice #2: emit the symmetric failure alert.
-            // Mirrors the fast-boot site — the bare `?` previously halted
-            // boot with no operator Telegram. Fail-closed halt preserved;
-            // NOT a duplicate of INSTR-FETCH-* (those infinite-retry).
-            // Security (review 2026-06-12): redact the anyhow chain before it
-            // reaches Telegram + the log sinks (authentication.md rule 2 — a
-            // token must never appear in error messages). capture_rest_error_body
-            // is the ratchet-guaranteed redactor (URL-param + JWT + credential).
-            let safe_reason = tickvault_common::sanitize::capture_rest_error_body(&err.to_string());
-            error!(error = %safe_reason, "instrument load failed at boot — alerting operator and halting");
-            notifier.notify(NotificationEvent::InstrumentBuildFailed {
-                reason: safe_reason,
-                manual_trigger_url: format!(
-                    "http://{}:{}/api/instruments/rebuild",
-                    config.api.host, config.api.port
-                ),
-            });
-            return Err(err);
-        }
-    };
+        // D2 Stage 2: the 21-TF Engine-B aggregator and the L10 tick-storage
+        // broadcast consumer are now spawned ONCE in the hoisted `build_shared_infra`
+        // prefix — BEFORE this lane's tick processor publishes (subscribe-before-
+        // publish, preserved by construction). Both subscribe to the SAME hoisted
+        // `tick_broadcast_sender` this lane references.
 
-    // Audit finding #6 (2026-04-24): emit InstrumentBuildSuccess when
-    // instruments load successfully on the standard-boot path. Mirrors
-    // the fast-boot emission above. Before this, only failure produced
-    // a Telegram — operators had no positive "instruments rebuilt OK"
-    // signal.
-    if let Some(ref u) = slow_boot_universe {
-        let source = if needs_instrument_persist {
-            "rkyv_cache"
-        } else {
-            "fresh_csv_build"
-        };
-        notifier.notify(NotificationEvent::InstrumentBuildSuccess {
-            source: source.to_string(),
-            derivative_count: u.derivative_contracts.len(),
-            underlying_count: u.underlyings.len(),
-        });
-    }
+        // PR #450 commit 6 (2026-05-03): V2 snapshot handle DELETED.
+        // The legacy /api/movers (V2) route + handler + in-memory
+        // MoversTrackerV2 + V2 pipeline are gone. The new unified
+        // /api/movers handler (commit 4) reads from the canonical
+        // movers_1s + 25 mat views via QuestDB SQL.
 
-    // Boot-timing proof Telegram (DailyUniverse scope only — sentinel-guarded
-    // so Indices4Only emits nothing). Reads the wall-clock stashed by
-    // `load_daily_universe_plan`; gives the operator REAL daily evidence the
-    // O(1) warm path is working: warm-skip boots are sub-second regardless of
-    // the applicable-F&O master size; a full rebuild is the batched-seconds
-    // cold path.
-    if let Some(message) = format_instrument_load_telegram(
-        INSTRUMENT_LOAD_ELAPSED_MS.load(std::sync::atomic::Ordering::Relaxed),
-        INSTRUMENT_LOAD_WARM_SKIPPED.load(std::sync::atomic::Ordering::Relaxed),
-        INSTRUMENT_LOAD_TOTAL_ROWS.load(std::sync::atomic::Ordering::Relaxed),
-    ) {
-        notifier.notify(NotificationEvent::Custom { message });
-    }
+        // PR #4 (2026-05-19): SharedSpotPrices map RETIRED — depth-20/200 +
+        // movers pipelines that consumed it are deleted per operator lock
+        // 2026-05-15 (websocket-connection-scope-lock.md).
 
-    // Only persist for CachedPlan (not yet persisted). FreshBuild already
-    // persisted inside load_or_build_instruments — double-write creates
-    // duplicate rows in the same timestamp second.
-    // -----------------------------------------------------------------------
-    // Step 8: Build WebSocket connection pool (only if authenticated + plan ready)
-    // -----------------------------------------------------------------------
-    let token_handle = token_manager.token_handle();
+        let processor_handle = if let Some(receiver) = pool_receiver {
+            // Candle-engine re-architecture #T1b: Engine A (the legacy 1s
+            // `CandleAggregator` + `LiveCandleWriter` → `candles_1s` path)
+            // DELETED. Engine B (the multi-TF aggregator → 21 plain
+            // `candles_<tf>` tables) is the only candle engine.
+            // PR #2 (2026-05-18): TopMoversTracker / OptionMoversTracker
+            // / shared_movers snapshot retired alongside the deleted movers
+            // pipeline. Under the 4-IDX_I-only universe a top-N gainers/
+            // losers/most-active snapshot is meaningless.
+            let tick_broadcast_for_processor = Some(tick_broadcast_sender.clone());
 
-    // Wave 2 Item 5.4 (AUTH-GAP-03) — install global TokenManager so the
-    // WebSocket sleep-wake path can call `force_renewal_if_stale()`
-    // without holding a back-reference per connection.
-    if !tickvault_core::auth::token_manager::set_global_token_manager(token_manager.clone()) {
-        tracing::warn!("global TokenManager already installed — skipping");
-    }
+            // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
+            let greeks_enricher = build_inline_greeks_enricher(&config, &subscription_plan);
 
-    // Fetch credentials ONCE for all downstream consumers (WS pool, order update WS, trading pipeline).
-    // Previously fetched 3 separate times — each SSM call is a network roundtrip to AWS.
-    let ws_client_id = {
-        let credentials = secret_manager::fetch_dhan_credentials()
-            .await
-            .context("failed to fetch Dhan client ID for WebSocket + trading")?;
-        credentials.client_id.expose_secret().to_string()
-    };
+            // O(1) EXEMPT: cold path — clone registry once for tick processor enrichment.
+            let slow_registry = subscription_plan
+                .as_ref()
+                .map(|p| std::sync::Arc::new(p.registry.clone()));
 
-    // Depth-200 uses the same shared TOTP/APP `token_handle` as Live Feed,
-    // Depth-20 and Order-Update. Dhan removed the server-side `tokenConsumerType`
-    // gate on `wss://full-depth-api.dhan.co` (Ticket #5610706, 2026-05-02 —
-    // "either a SELF token or an APP token, and both should now work
-    // seamlessly for fetching the 200-level market depth data"), so the
-    // separate `Depth200SelfTokenManager` workaround is retired. Git
-    // history preserves the SELF code if Dhan ever regresses.
-
-    // Step 8a: Create WebSocket pool (channel + connections, NOT yet spawned).
-    // Step 9 starts tick processor BEFORE connections are spawned so frames
-    // are consumed immediately — prevents frame send timeouts during stagger.
-    //
-    // GUARD: Skip WebSocket connections on non-trading days (weekends/holidays).
-    // Dhan's WebSocket server sends stale market data (last-traded prices from
-    // the previous trading day) even on non-trading days. Without this guard,
-    // stale ticks pollute the pipeline.
-    //
-    // WebSocket connects IMMEDIATELY on trading/mock/muhurat days regardless of
-    // current time. Pre-market stale ticks are dropped by the tick processor's
-    // ingestion gate: [data_collection_start, data_collection_end) IST.
-    // This ensures all 5 connections are warm and ready before 9:00 AM market open.
-    // At 15:30 PM (market close), market feed + depth WS are disconnected.
-    // Order update WS stays alive until app shutdown.
-    let should_connect_ws =
-        subscription_plan.is_some() && (is_trading || is_mock_trading || is_muhurat);
-
-    let (pool_receiver, ws_pool_ready) = if should_connect_ws {
-        match create_websocket_pool(
-            &token_handle,
-            &ws_client_id,
-            &subscription_plan,
-            &config,
-            is_market_hours,
-            Some(notifier.clone()),
-            ws_frame_spill.clone(),
-            // PR-E: hand the Dhan main feed the shared runtime enable flag.
-            Some(feed_runtime.dhan_flag()),
-        ) {
-            Some((receiver, pool)) => (Some(receiver), Some(pool)),
-            None => (None, None),
-        }
-    } else if !is_trading && !is_mock_trading {
-        info!("WebSocket pool skipped — non-trading day (no live market data to capture)");
-        (None, None)
-    } else {
-        warn!("WebSocket pool skipped — running in offline mode");
-        (None, None)
-    };
-
-    // STAGE-C.2b: Slow-boot mirror of the fast-boot re-injection path.
-    // Re-inject replayed LiveFeed frames into the pool's mpsc BEFORE the
-    // tick processor spawns, so recovered frames land ahead of any live
-    // frames and are persisted idempotently via QuestDB dedup keys.
-    if !ws_wal_replay_live_feed.is_empty() {
-        if let Some(ref pool) = ws_pool_ready {
-            let sender = pool.frame_sender_clone();
-            let capacity = sender.capacity();
-            let to_inject = std::mem::take(&mut ws_wal_replay_live_feed);
-            let count = to_inject.len();
-            info!(
-                frames = count,
-                channel_capacity = capacity,
-                "STAGE-C.2b: re-injecting replayed LiveFeed frames into pool mpsc (slow boot)"
-            );
-            let mut injected = 0u64;
-            let mut dropped = 0u64;
-            for frame in to_inject {
-                match sender.try_send(frame) {
-                    Ok(()) => injected += 1,
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_))
-                    | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => dropped += 1,
-                }
-            }
-            metrics::counter!(
-                "tv_ws_frame_wal_reinjected_total",
-                "ws_type" => "live_feed"
-            )
-            .increment(injected);
-            if dropped > 0 {
-                error!(
-                    dropped,
-                    injected,
-                    "STAGE-C.2b: LiveFeed re-injection dropped frames (slow boot) — \
-                     channel full/closed, frames remain in WAL archive"
-                );
-                metrics::counter!(
-                    "tv_ws_frame_wal_reinjected_dropped_total",
-                    "ws_type" => "live_feed"
-                )
-                .increment(dropped);
-            } else {
-                info!(
-                    injected,
-                    "STAGE-C.2b: LiveFeed re-injection complete (slow boot)"
-                );
-            }
-        } else {
-            warn!(
-                frames = ws_wal_replay_live_feed.len(),
-                "STAGE-C.2b: LiveFeed replay frames held but no pool (slow boot) — \
-                 frames remain in WAL archive, not re-injected"
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Step 9: Spawn tick processor FIRST (before WS connections send frames)
-    // -----------------------------------------------------------------------
-    // PR #2 (2026-05-18): `shared_movers` snapshot retired alongside
-    // the deleted `top_movers` / `option_movers` modules.
-
-    // Tick broadcast: fan-out parsed ticks to the trading pipeline (cold path consumer).
-    // A2: Use constant capacity (65536) to absorb bursts without lagging cold-path consumers.
-    let (tick_broadcast_sender, _tick_broadcast_default_rx) =
-        tokio::sync::broadcast::channel::<tickvault_common::tick_types::ParsedTick>(
-            tickvault_common::constants::TICK_BROADCAST_CAPACITY,
-        );
-
-    // S12 wiring: heartbeat watchdog (slow boot).
-    // Same responsibilities as the fast-boot watchdog above. Spawned
-    // after token_handle + tick_broadcast_sender are both available.
-    // Runs until the process exits.
-    let _slow_heartbeat_handle = spawn_heartbeat_watchdog(
-        std::sync::Arc::clone(&token_handle),
-        tick_broadcast_sender.clone(),
-    );
-
-    // In-market gap-backfill is DISABLED by user policy. Historical
-    // candle data must NOT be injected into the live `ticks` table.
-    // Post-market historical fetch runs on a separate cold path and
-    // writes only to `historical_candles`.
-
-    // Spawn the observability-only consumer (gap tracker + HTTP health).
-    {
-        let obs_rx = tick_broadcast_sender.subscribe();
-        let questdb_cfg = config.questdb.clone();
-        tokio::spawn(async move {
-            run_slow_boot_observability(obs_rx, questdb_cfg).await;
-        });
-        info!("slow-boot observability consumer started");
-    }
-
-    // PR4 (operator 2026-06-01): bounded prev-day OHLCV fetch. Cold path —
-    // fetches yesterday's single daily candle per subscribed SID into the
-    // separate `prev_day_ohlcv` table (never `ticks`); fail-soft per symbol;
-    // never blocks live ticks. Only runs when the daily universe was built
-    // (`stashed_universe()` is `None` under Indices4Only or on build failure).
-    if let Some(pd_universe) = tickvault_app::prev_day_ohlcv_boot::stashed_universe() {
-        match TradingCalendar::from_config(&config.trading) {
-            Ok(cal) => {
-                // Compute the dates HERE (calendar in scope) so the task
-                // doesn't need to move the non-Clone TradingConfig/Calendar.
-                let now_ist = chrono::Utc::now()
-                    + chrono::Duration::seconds(i64::from(
-                        tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
-                    ));
-                let today = now_ist.date_naive();
-                let from = tickvault_app::prev_day_ohlcv_boot::previous_trading_day(today, |d| {
-                    cal.is_trading_day(d)
-                });
-                // Capture the expected universe size BEFORE the Arc moves into
-                // the fetch, so the post-fetch coverage verification can compare.
-                let pd_expected = pd_universe.subscription_targets.len();
-                let pd_token = std::sync::Arc::clone(&token_handle);
-                let pd_qcfg = config.questdb.clone();
-                let pd_base = config.dhan.rest_api_base_url.clone();
-                tokio::spawn(async move {
-                    use tickvault_app::prev_day_ohlcv_boot::{
-                        PrevDayCoverage, evaluate_prev_day_coverage, prev_day_csv_dir,
-                        write_prev_day_coverage_csv,
-                    };
-                    let summary = tickvault_app::prev_day_ohlcv_boot::run_prev_day_ohlcv_fetch(
-                        pd_universe,
-                        pd_token,
-                        pd_qcfg,
-                        pd_base,
-                        from,
-                        today,
+            // 2026-05-09 PR 5c.5-final — movers infrastructure RETIRED.
+            // The `movers_writer` + `movers_base_persistence` modules and
+            // the `movers_pipeline` orchestrator are deleted in this commit.
+            // Operator directive: only `ticks` and the 9 cascade-fed
+            // candle timeframes remain in QuestDB. The block below preserves
+            // the prev_oi / prev_day cache loaders (consumed by the cascade
+            // seal-time pct-stamping path + the tick enricher) but no longer
+            // drives any QuestDB-backed movers writer.
+            //
+            // Operator note: bhavcopy 16:30 IST cross-check (also reads
+            // `movers_1s`) is left intact — it will report `MISSING_OUR`
+            // for every NSE row from tomorrow's run until a follow-up PR
+            // migrates that query to a non-movers source. Operator has
+            // explicitly opted into this trade-off ("skip bhavcopy").
+            if let Some(_registry) = slow_registry.as_ref() {
+                // 2026-05-09: prev_oi loader simplified to overlay-only.
+                // Wave-5 indices-only scope subscribes only NIFTY /
+                // BANKNIFTY / SENSEX derivatives — exactly the 3
+                // underlyings the Option Chain REST overlay covers. The
+                // bhavcopy fetch + macOS `unzip` shell-out (recurring
+                // PREVOI-01 broken-pipe failures on macOS Info-ZIP 6.00)
+                // is retired per operator directive.
+                let prev_oi_cache =
+                    tickvault_app::prev_oi_loader::load_prev_oi_cache_at_boot_with_overlay(
+                        token_handle.clone(),
+                        ws_client_id.clone(),
+                        config.dhan.rest_api_base_url.clone(),
                     )
                     .await;
-                    // Verify coverage (false-OK guard) + write the operator-
-                    // visible CSV (`make prev-day-show`). Fail-soft on FS error.
-                    if let Err(err) = write_prev_day_coverage_csv(
-                        prev_day_csv_dir(),
-                        today,
-                        pd_expected,
-                        &summary,
-                    ) {
-                        warn!(?err, "prev_day_ohlcv: coverage CSV write failed");
-                    }
-                    match evaluate_prev_day_coverage(pd_expected, summary.fetched) {
-                        PrevDayCoverage::Ok { pct } => info!(
-                            pct,
-                            fetched = summary.fetched,
-                            expected = pd_expected,
-                            "PROOF: prev-day OHLCV coverage OK"
-                        ),
-                        PrevDayCoverage::Degraded { pct } => warn!(
-                            pct,
-                            fetched = summary.fetched,
-                            expected = pd_expected,
-                            skipped = summary.skipped,
-                            failed = summary.failed,
-                            "prev-day OHLCV coverage DEGRADED — symbols missing yesterday's candle"
-                        ),
-                        PrevDayCoverage::Empty => error!(
-                            code = tickvault_common::error_code::ErrorCode::PrevDay01CoverageEmpty
-                                .code_str(),
-                            expected = pd_expected,
-                            skipped = summary.skipped,
-                            failed = summary.failed,
-                            "prev-day OHLCV coverage EMPTY — no yesterday candles fetched"
-                        ),
-                    }
-                });
-                info!("prev-day OHLCV boot fetch task spawned");
-            }
-            Err(err) => {
-                warn!(
-                    ?err,
-                    "prev_day_ohlcv: calendar build failed — boot fetch skipped"
-                );
-            }
-        }
-    }
-
-    // Candle-engine re-architecture #T1b — wire Engine B (the only
-    // candle engine). Engine C (`candles_1s` → `CandleEngineMap<Tf1s>`
-    // → `CascadeFanout` matview cascade + `run_midnight_rollover_task_with_fanout`)
-    // DELETED. The shared `spawn_engine_b_aggregator` helper spawns the
-    // subscriber + heartbeat + IST-midnight force-seal tasks (the
-    // force-seal task replaces the deleted cascade midnight rollover).
-    spawn_engine_b_aggregator(
-        &tick_broadcast_sender,
-        std::sync::Arc::clone(&prev_day_cache),
-        std::sync::Arc::clone(&trading_calendar),
-    );
-    // L10 (Wave-5 #504d): tick_storage broadcast consumer. Subscribes
-    // to the same `tick_broadcast_sender` used by the cascade so every
-    // tick lands in the in-RAM ring without coupling the tick_processor
-    // hot path to TickStorage's lock latency.
-    {
-        let tick_storage_rx = tick_broadcast_sender.subscribe();
-        let storage_for_consumer = std::sync::Arc::clone(&tick_storage);
-        tokio::spawn(async move {
-            tickvault_trading::in_mem::run_tick_storage_consumer(
-                tick_storage_rx,
-                storage_for_consumer,
-            )
-            .await;
-        });
-        info!(
-            per_instrument_capacity = config.in_mem.tick_storage.per_instrument_capacity,
-            "L10 tick_storage broadcast consumer spawned + IST 09:15 reset task running"
-        );
-    }
-
-    // PR #450 commit 6 (2026-05-03): V2 snapshot handle DELETED.
-    // The legacy /api/movers (V2) route + handler + in-memory
-    // MoversTrackerV2 + V2 pipeline are gone. The new unified
-    // /api/movers handler (commit 4) reads from the canonical
-    // movers_1s + 25 mat views via QuestDB SQL.
-
-    // PR #4 (2026-05-19): SharedSpotPrices map RETIRED — depth-20/200 +
-    // movers pipelines that consumed it are deleted per operator lock
-    // 2026-05-15 (websocket-connection-scope-lock.md).
-
-    let processor_handle = if let Some(receiver) = pool_receiver {
-        // Candle-engine re-architecture #T1b: Engine A (the legacy 1s
-        // `CandleAggregator` + `LiveCandleWriter` → `candles_1s` path)
-        // DELETED. Engine B (the multi-TF aggregator → 21 plain
-        // `candles_<tf>` tables) is the only candle engine.
-        // PR #2 (2026-05-18): TopMoversTracker / OptionMoversTracker
-        // / shared_movers snapshot retired alongside the deleted movers
-        // pipeline. Under the 4-IDX_I-only universe a top-N gainers/
-        // losers/most-active snapshot is meaningless.
-        let tick_broadcast_for_processor = Some(tick_broadcast_sender.clone());
-
-        // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
-        let greeks_enricher = build_inline_greeks_enricher(&config, &subscription_plan);
-
-        // O(1) EXEMPT: cold path — clone registry once for tick processor enrichment.
-        let slow_registry = subscription_plan
-            .as_ref()
-            .map(|p| std::sync::Arc::new(p.registry.clone()));
-
-        // 2026-05-09 PR 5c.5-final — movers infrastructure RETIRED.
-        // The `movers_writer` + `movers_base_persistence` modules and
-        // the `movers_pipeline` orchestrator are deleted in this commit.
-        // Operator directive: only `ticks` and the 9 cascade-fed
-        // candle timeframes remain in QuestDB. The block below preserves
-        // the prev_oi / prev_day cache loaders (consumed by the cascade
-        // seal-time pct-stamping path + the tick enricher) but no longer
-        // drives any QuestDB-backed movers writer.
-        //
-        // Operator note: bhavcopy 16:30 IST cross-check (also reads
-        // `movers_1s`) is left intact — it will report `MISSING_OUR`
-        // for every NSE row from tomorrow's run until a follow-up PR
-        // migrates that query to a non-movers source. Operator has
-        // explicitly opted into this trade-off ("skip bhavcopy").
-        if let Some(_registry) = slow_registry.as_ref() {
-            // 2026-05-09: prev_oi loader simplified to overlay-only.
-            // Wave-5 indices-only scope subscribes only NIFTY /
-            // BANKNIFTY / SENSEX derivatives — exactly the 3
-            // underlyings the Option Chain REST overlay covers. The
-            // bhavcopy fetch + macOS `unzip` shell-out (recurring
-            // PREVOI-01 broken-pipe failures on macOS Info-ZIP 6.00)
-            // is retired per operator directive.
-            let prev_oi_cache =
-                tickvault_app::prev_oi_loader::load_prev_oi_cache_at_boot_with_overlay(
-                    token_handle.clone(),
-                    ws_client_id.clone(),
-                    config.dhan.rest_api_base_url.clone(),
-                )
-                .await;
-            if prev_oi_cache.is_empty() {
-                warn!(
-                    code = tickvault_common::error_code::ErrorCode::PrevOi01CacheEmptyAtBoot
-                        .code_str(),
-                    "prev_oi cache EMPTY at boot — Option Chain overlay returned \
+                if prev_oi_cache.is_empty() {
+                    warn!(
+                        code = tickvault_common::error_code::ErrorCode::PrevOi01CacheEmptyAtBoot
+                            .code_str(),
+                        "prev_oi cache EMPTY at boot — Option Chain overlay returned \
                      zero entries for NIFTY/BANKNIFTY/SENSEX; downstream consumers \
                      will see `current_OI - 0 = current_OI` until next boot."
-                );
-            } else {
-                info!(
-                    cache_size = prev_oi_cache.len(),
-                    "prev_oi cache populated via Option Chain overlay — \
+                    );
+                } else {
+                    info!(
+                        cache_size = prev_oi_cache.len(),
+                        "prev_oi cache populated via Option Chain overlay — \
                      downstream OI Change is Dhan-precise"
-                );
-            }
-            // #T4 (2026-05-20): the `previous_close` QuestDB table was
-            // dropped. The boot-time `prev_day_cache_loader` SELECT
-            // against it is retired — `PrevDayCache` stays empty and
-            // the cascade seal-time pct path falls back to 0.0 pct
-            // fields per the documented div-by-zero policy.
-        } else {
-            warn!(
-                "prev_oi cache loader NOT spawned — slow_registry is None \
-                 (subscription_plan absent)"
-            );
-        }
-
-        // PR #6a (2026-05-19): bhavcopy 16:30 IST cross-check task RETIRED.
-        // Under 4-IDX_I LOCKED_UNIVERSE (operator lock 2026-05-15) there are
-        // no F&O subscriptions to cross-check against NSE bhavcopy. The
-        // bhavcopy_cross_check + bhavcopy_fetcher + bhavcopy_scheduler modules
-        // and the bhavcopy_pipeline.rs app-side runner are all deleted.
-        // volume_nse_audit QuestDB table is KEPT on disk per SEBI 5-year
-        // retention pending operator-triggered DROP TABLE migration.
-
-        // Parthiban directive (2026-04-21): no-tick-during-market-hours
-        // watchdog (slow boot path). Same pattern as fast boot above.
-        let slow_tick_heartbeat = tickvault_core::pipeline::no_tick_watchdog::new_tick_heartbeat();
-        let _slow_no_tick_watchdog_handle =
-            tickvault_core::pipeline::no_tick_watchdog::spawn_no_tick_watchdog(
-                std::sync::Arc::clone(&slow_tick_heartbeat),
-                Some(std::sync::Arc::clone(&notifier)),
-            );
-
-        // 29-tf engine plan Phase 2.6 — Phase 2 lifecycle enricher.
-        //
-        // Construct the enricher and load the prev_oi_cache from
-        // QuestDB candles_1d BEFORE spawning the tick processor (L14
-        // boot ordering: cache → engines → replay → THEN subscribe).
-        // The DDL setup at line 2103 has already created candles_1d,
-        // so `LATEST ON ts PARTITION BY (security_id, segment)` will
-        // either return yesterday's row per instrument or empty
-        // (fresh deploy). Either way is graceful — empty cache → 0
-        // prev_day_oi → formulas.rs returns 0.0 pct (documented
-        // degradation).
-        //
-        // We block on the load so the prev_day_oi column is populated
-        // for the FIRST tick after subscribe fires. The internal
-        // timeout (PREV_OI_LOAD_TIMEOUT_SECS = 30s) caps the wait so
-        // a hung QuestDB cannot stall boot indefinitely.
-        //
-        // The BootOrderingGate (L14 helper) tracks the four boot
-        // phases. Phase 3 (in-memory engines) and the explicit replay
-        // phase land in Phase 3 of the plan; we mark them ready
-        // immediately because the slow-boot SubscribeRxGuard
-        // machinery already performs the equivalent backfill via the
-        // SPSC consumer. The gate gives operators a single positive
-        // assertion that L14 was satisfied before subscribe fired.
-        let boot_ordering_gate = std::sync::Arc::new(
-            tickvault_core::pipeline::boot_ordering_gate::BootOrderingGate::new(),
-        );
-        let tick_enricher =
-            std::sync::Arc::new(tickvault_core::pipeline::tick_enricher::TickEnricher::new());
-        // 1d-historical-only regression fix (2026-06-02): the prev_oi cache
-        // now loads from `prev_day_ohlcv` (repointed from `candles_1d` in
-        // PR #979). Unlike `candles_1d` — which is always CREATEd early in boot
-        // by `ensure_shadow_candle_tables` — `prev_day_ohlcv` is a NEW table
-        // whose `ensure_*` runs inside the concurrently-spawned boot fetch
-        // task, so on a fresh box's first boot with the new binary it may not
-        // exist yet when the gate-blocking load below runs. A missing table
-        // makes `load_from_questdb` return Err → the boot-ordering gate stays
-        // `AwaitingOiCache` → `try_authorize_subscribe()` fails →
-        // `std::process::exit(1)` → systemd marks tickvault.service failed →
-        // the deploy aborts. Ensure the table exists HERE (idempotent
-        // CREATE TABLE IF NOT EXISTS) so the load hits an existing — possibly
-        // empty (Ok count=0, graceful) — table. A genuine QuestDB-unreachable
-        // still Errs and fail-closes as designed (L14 invariant preserved).
-        tickvault_storage::prev_day_ohlcv_persistence::ensure_prev_day_ohlcv_table(&config.questdb)
-            .await;
-        // Phase 2.8 H4 fix: only mark the gate ready on Ok. On Err the
-        // gate stays in `AwaitingOiCache` and `try_authorize_subscribe`
-        // refuses authorization — the operator gets a typed ERROR
-        // (PREVCLOSE-01) and Telegram, not a False-OK. Loading
-        // graceful-degrades on truly empty candles_1d (Ok with
-        // count=0), only flagging the actual QuestDB-unreachable /
-        // schema-broken cases as failures.
-        let oi_cache_load_succeeded = match tick_enricher
-            .prev_oi_cache
-            .load_from_questdb(&config.questdb)
-            .await
-        {
-            Ok(count) => {
-                tracing::info!(
-                    entries = count,
-                    "prev_oi_cache loaded for tick enricher (Phase 2.6 production attach)"
-                );
-                metrics::counter!("tv_prev_oi_cache_load_total", "outcome" => "ok").increment(1);
-                if count == 0 {
-                    // Phase 2.8 H3 partial fix: emit a Prom counter +
-                    // structured signal so an empty candles_1d doesn't
-                    // silently produce 0% OI changes for the day. The
-                    // gate still authorizes (count=0 is valid for fresh
-                    // deploy / first trading day), but operator sees
-                    // the diagnostic.
-                    //
-                    // Wave-Holiday-Gate (2026-05-09): only escalate to
-                    // `warn!` (Loki → Telegram) inside the trading
-                    // session — outside it (off-hours, weekend, holiday
-                    // boots) an empty cache is the expected state, not
-                    // a signal of degradation. Same noise-reduction
-                    // pattern as PR #542 item B (PREVCLOSE-04).
-                    metrics::counter!("tv_prev_oi_cache_empty_total").increment(1);
-                    if tickvault_common::market_hours::is_within_trading_session_ist() {
-                        tracing::warn!(
-                            "prev_oi_cache loaded zero entries — fresh deploy or candles_1d \
-                             empty for the prior trading day. OI Change panels will read 0% \
-                             until the next IST midnight rollover repopulates the cache."
-                        );
-                    } else {
-                        tracing::info!(
-                            "prev_oi_cache loaded zero entries (off-hours / weekend boot — \
-                             expected; OI Change panels will read 0% until live ticks \
-                             populate candles_1d during the next trading session)"
-                        );
-                    }
+                    );
                 }
-                true
-            }
-            Err(err) => {
-                tracing::error!(
-                    code = tickvault_common::error_code::ErrorCode::PrevClose01IlpFailed.code_str(),
-                    ?err,
-                    "prev_oi_cache load FAILED — boot ordering gate stays \
-                     AwaitingOiCache, subscribe will not be authorized this boot. \
-                     Investigate QuestDB candles_1d availability."
+                // #T4 (2026-05-20): the `previous_close` QuestDB table was
+                // dropped. The boot-time `prev_day_cache_loader` SELECT
+                // against it is retired — `PrevDayCache` stays empty and
+                // the cascade seal-time pct path falls back to 0.0 pct
+                // fields per the documented div-by-zero policy.
+            } else {
+                warn!(
+                    "prev_oi cache loader NOT spawned — slow_registry is None \
+                 (subscription_plan absent)"
                 );
-                metrics::counter!("tv_prev_oi_cache_load_total", "outcome" => "err").increment(1);
-                false
             }
-        };
-        if oi_cache_load_succeeded {
-            boot_ordering_gate.mark_oi_cache_loaded();
-        }
-        boot_ordering_gate.mark_engines_ready();
-        boot_ordering_gate.mark_replay_completed();
-        // Phase 2.9 H1 fix (hostile bug-hunt): the BootOrderingGate was
-        // previously informational — a failed authorization logged ERROR
-        // but boot continued, so the WS subscribe still went out with
-        // potentially stale state. The H4 fix in Phase 2.8 (skip
-        // `mark_oi_cache_loaded` on Err) means this branch will fire
-        // when QuestDB candles_1d is unreachable. Treating it as a
-        // panic gives binary-level L14 enforcement: the process refuses
-        // to subscribe with an unhealthy state.
-        //
-        // We use `std::process::exit(1)` rather than `panic!` so the
-        // exit cleanly skips destructors that might try to flush partial
-        // state. systemd / docker restart policy handles the recovery
-        // loop. The 30s prev_oi_cache timeout caps the worst-case wait
-        // before this fires.
-        if !boot_ordering_gate.try_authorize_subscribe() {
-            // PR #5 (2026-05-19): retagged from Phase2Ready01PreflightFailed
-            // (retired with the Phase 2 dispatcher) to PrevClose01IlpFailed
-            // which matches the message's "PREVCLOSE-01" reference per the
-            // error_code_tag_guard meta-test invariant.
-            tracing::error!(
-                code = tickvault_common::error_code::ErrorCode::PrevClose01IlpFailed.code_str(),
-                readiness = ?boot_ordering_gate.readiness(),
-                "L14 boot-ordering gate refused to authorize subscribe — \
-                 prev_oi_cache load likely failed (see PREVCLOSE-01 above). \
-                 HARD-FAIL: process::exit(1) so systemd/docker restart \
-                 the boot rather than subscribe with unhealthy state."
-            );
-            metrics::counter!("tv_l14_boot_authorization_refused_total").increment(1);
-            // Allow tests to exercise this branch without killing the
-            // test runner — gated on TICKVAULT_BOOT_DRY_RUN env var
-            // which production never sets.
-            if std::env::var("TICKVAULT_BOOT_DRY_RUN").is_err() {
-                std::process::exit(1);
-            }
-        } else {
-            tracing::info!(
-                "L14 boot-ordering gate authorized subscribe (Phase 2.6: \
-                 prev_oi_cache loaded, engines ready, replay completed)"
-            );
-            metrics::counter!("tv_l14_boot_authorization_total").increment(1);
-        }
-        // Reference the gate so it isn't optimized out — future commits
-        // can pass `boot_ordering_gate.clone()` into the WS subscribe
-        // dispatcher to gate the actual frame send.
-        drop(std::sync::Arc::clone(&boot_ordering_gate));
 
-        // 29-tf engine Phase 2.7 (hostile bug-hunt CRITICAL C1 fix):
-        // spawn the IST midnight rollover task. Without this, the
-        // volume_delta tracker accumulates baselines across day
-        // boundaries and the first ~24,300 ticks at 09:15 IST on
-        // Day N+1 trigger false VOLUME-MONO-01 alerts (per L13).
-        //
-        // The task sleeps until next IST 00:00:00, performs the
-        // atomic phase transition (clear volume baselines + clear
-        // prev_day_close stamps + reload prev_oi_cache from
-        // candles_1d), then loops. Cancelable via the JoinHandle
-        // returned by spawn_midnight_rollover_task.
-        let _midnight_rollover_handle =
-            tickvault_core::pipeline::tick_enricher::spawn_midnight_rollover_task(
-                std::sync::Arc::clone(&tick_enricher),
-                config.questdb.clone(),
-            );
-        tracing::info!(
-            "midnight rollover task spawned (Phase 2.7 — L13 atomic state \
-             transition at IST 00:00:00 every trading day)"
-        );
+            // PR #6a (2026-05-19): bhavcopy 16:30 IST cross-check task RETIRED.
+            // Under 4-IDX_I LOCKED_UNIVERSE (operator lock 2026-05-15) there are
+            // no F&O subscriptions to cross-check against NSE bhavcopy. The
+            // bhavcopy_cross_check + bhavcopy_fetcher + bhavcopy_scheduler modules
+            // and the bhavcopy_pipeline.rs app-side runner are all deleted.
+            // volume_nse_audit QuestDB table is KEPT on disk per SEBI 5-year
+            // retention pending operator-triggered DROP TABLE migration.
 
-        // Phase 2.11 (hostile bug-hunt M2 + M4 fix): periodic
-        // prev_oi_cache refresh task. Covers two scenarios that
-        // boot-time load + midnight rollover do NOT cover:
-        //   (a) Fresh deploy with empty `candles_1d` — boot returned
-        //       Ok(count=0), cache stays empty until next midnight,
-        //       OI Change panels read 0% all day. Refresh polls every
-        //       5min until candles_1d gets populated.
-        //   (b) QuestDB matview chain still building post-boot —
-        //       Phase 2.9 hard-fail only fires on outright load
-        //       failure, not on empty result. Refresh covers the
-        //       gap if the matview catches up after boot.
-        // Self-exits once cache becomes non-empty; midnight task
-        // takes over from there.
-        let _prev_oi_refresh_handle =
-            tickvault_core::pipeline::tick_enricher::spawn_prev_oi_cache_refresh_task(
-                std::sync::Arc::clone(&tick_enricher),
-                config.questdb.clone(),
-            );
-        tracing::info!(
-            "prev_oi_cache periodic refresh task spawned (Phase 2.11 — \
-             5min poll for fresh-deploy / matview-catchup recovery)"
-        );
+            // Parthiban directive (2026-04-21): no-tick-during-market-hours
+            // watchdog (slow boot path). Same pattern as fast boot above.
+            let slow_tick_heartbeat =
+                tickvault_core::pipeline::no_tick_watchdog::new_tick_heartbeat();
+            let _slow_no_tick_watchdog_handle =
+                tickvault_core::pipeline::no_tick_watchdog::spawn_no_tick_watchdog(
+                    std::sync::Arc::clone(&slow_tick_heartbeat),
+                    Some(std::sync::Arc::clone(&notifier)),
+                );
 
-        let _ = slow_registry; // PR #2: instrument_registry was used by deleted movers persistence helpers
-        // SP5: dedicated clone moved into the tick-processor coroutine so the
-        // original `feed_health` Arc stays available for the pool watchdog below.
-        let feed_health_for_processor = std::sync::Arc::clone(&feed_health);
-        let handle = tokio::spawn(async move {
-            run_tick_processor(
-                receiver,
-                tick_writer,
-                tick_broadcast_for_processor,
-                greeks_enricher,
-                Some(slow_tick_heartbeat),
-                // 29-tf engine Phase 2.6 — production-attach the
-                // lifecycle enricher. The prev_oi_cache was loaded
-                // synchronously above (or skipped on QuestDB error
-                // → empty cache, graceful degradation). From this
-                // point every live tick that reaches QuestDB writes
-                // populated `volume_delta`, `prev_day_close`,
-                // `prev_day_oi`, `phase` columns instead of the
-                // legacy zero/PREMARKET defaults.
-                Some(std::sync::Arc::clone(&tick_enricher)),
-                tickvault_common::always_on::current(), // §30 GIFT exemption
-                Some(feed_health_for_processor),        // SP5: Dhan live-feed health
+            // 29-tf engine plan Phase 2.6 — Phase 2 lifecycle enricher.
+            //
+            // Construct the enricher and load the prev_oi_cache from
+            // QuestDB candles_1d BEFORE spawning the tick processor (L14
+            // boot ordering: cache → engines → replay → THEN subscribe).
+            // The DDL setup at line 2103 has already created candles_1d,
+            // so `LATEST ON ts PARTITION BY (security_id, segment)` will
+            // either return yesterday's row per instrument or empty
+            // (fresh deploy). Either way is graceful — empty cache → 0
+            // prev_day_oi → formulas.rs returns 0.0 pct (documented
+            // degradation).
+            //
+            // We block on the load so the prev_day_oi column is populated
+            // for the FIRST tick after subscribe fires. The internal
+            // timeout (PREV_OI_LOAD_TIMEOUT_SECS = 30s) caps the wait so
+            // a hung QuestDB cannot stall boot indefinitely.
+            //
+            // The BootOrderingGate (L14 helper) tracks the four boot
+            // phases. Phase 3 (in-memory engines) and the explicit replay
+            // phase land in Phase 3 of the plan; we mark them ready
+            // immediately because the slow-boot SubscribeRxGuard
+            // machinery already performs the equivalent backfill via the
+            // SPSC consumer. The gate gives operators a single positive
+            // assertion that L14 was satisfied before subscribe fired.
+            let boot_ordering_gate = std::sync::Arc::new(
+                tickvault_core::pipeline::boot_ordering_gate::BootOrderingGate::new(),
+            );
+            let tick_enricher =
+                std::sync::Arc::new(tickvault_core::pipeline::tick_enricher::TickEnricher::new());
+            // 1d-historical-only regression fix (2026-06-02): the prev_oi cache
+            // now loads from `prev_day_ohlcv` (repointed from `candles_1d` in
+            // PR #979). Unlike `candles_1d` — which is always CREATEd early in boot
+            // by `ensure_shadow_candle_tables` — `prev_day_ohlcv` is a NEW table
+            // whose `ensure_*` runs inside the concurrently-spawned boot fetch
+            // task, so on a fresh box's first boot with the new binary it may not
+            // exist yet when the gate-blocking load below runs. A missing table
+            // makes `load_from_questdb` return Err → the boot-ordering gate stays
+            // `AwaitingOiCache` → `try_authorize_subscribe()` fails →
+            // `std::process::exit(1)` → systemd marks tickvault.service failed →
+            // the deploy aborts. Ensure the table exists HERE (idempotent
+            // CREATE TABLE IF NOT EXISTS) so the load hits an existing — possibly
+            // empty (Ok count=0, graceful) — table. A genuine QuestDB-unreachable
+            // still Errs and fail-closes as designed (L14 invariant preserved).
+            tickvault_storage::prev_day_ohlcv_persistence::ensure_prev_day_ohlcv_table(
+                &config.questdb,
             )
             .await;
-        });
-        info!("tick processor started (with candle aggregation + trading broadcast)");
-        // Phase 2.12 (hostile L1 fix): boot-mode gauge for slow boot.
-        // value=1 indicates the lifecycle enricher is attached and the
-        // 4 ticks-table lifecycle columns will be populated this
-        // session. Operators can chart the time series:
-        //   tv_lifecycle_enricher_attached{boot_mode="slow"} 1
-        // → operator sees mode-switch (fast↔slow) in Prometheus
-        // history independent of the boot log.
-        metrics::gauge!(
-            "tv_lifecycle_enricher_attached",
-            "boot_mode" => "slow"
-        )
-        .set(1.0);
-        info!(
-            boot_mode = "slow",
-            enricher_attached = true,
-            "BOOT MODE: slow (production path) — TickEnricher attached, \
+            // Phase 2.8 H4 fix: only mark the gate ready on Ok. On Err the
+            // gate stays in `AwaitingOiCache` and `try_authorize_subscribe`
+            // refuses authorization — the operator gets a typed ERROR
+            // (PREVCLOSE-01) and Telegram, not a False-OK. Loading
+            // graceful-degrades on truly empty candles_1d (Ok with
+            // count=0), only flagging the actual QuestDB-unreachable /
+            // schema-broken cases as failures.
+            let oi_cache_load_succeeded = match tick_enricher
+                .prev_oi_cache
+                .load_from_questdb(&config.questdb)
+                .await
+            {
+                Ok(count) => {
+                    tracing::info!(
+                        entries = count,
+                        "prev_oi_cache loaded for tick enricher (Phase 2.6 production attach)"
+                    );
+                    metrics::counter!("tv_prev_oi_cache_load_total", "outcome" => "ok")
+                        .increment(1);
+                    if count == 0 {
+                        // Phase 2.8 H3 partial fix: emit a Prom counter +
+                        // structured signal so an empty candles_1d doesn't
+                        // silently produce 0% OI changes for the day. The
+                        // gate still authorizes (count=0 is valid for fresh
+                        // deploy / first trading day), but operator sees
+                        // the diagnostic.
+                        //
+                        // Wave-Holiday-Gate (2026-05-09): only escalate to
+                        // `warn!` (Loki → Telegram) inside the trading
+                        // session — outside it (off-hours, weekend, holiday
+                        // boots) an empty cache is the expected state, not
+                        // a signal of degradation. Same noise-reduction
+                        // pattern as PR #542 item B (PREVCLOSE-04).
+                        metrics::counter!("tv_prev_oi_cache_empty_total").increment(1);
+                        if tickvault_common::market_hours::is_within_trading_session_ist() {
+                            tracing::warn!(
+                                "prev_oi_cache loaded zero entries — fresh deploy or candles_1d \
+                             empty for the prior trading day. OI Change panels will read 0% \
+                             until the next IST midnight rollover repopulates the cache."
+                            );
+                        } else {
+                            tracing::info!(
+                                "prev_oi_cache loaded zero entries (off-hours / weekend boot — \
+                             expected; OI Change panels will read 0% until live ticks \
+                             populate candles_1d during the next trading session)"
+                            );
+                        }
+                    }
+                    true
+                }
+                Err(err) => {
+                    tracing::error!(
+                        code = tickvault_common::error_code::ErrorCode::PrevClose01IlpFailed
+                            .code_str(),
+                        ?err,
+                        "prev_oi_cache load FAILED — boot ordering gate stays \
+                     AwaitingOiCache, subscribe will not be authorized this boot. \
+                     Investigate QuestDB candles_1d availability."
+                    );
+                    metrics::counter!("tv_prev_oi_cache_load_total", "outcome" => "err")
+                        .increment(1);
+                    false
+                }
+            };
+            if oi_cache_load_succeeded {
+                boot_ordering_gate.mark_oi_cache_loaded();
+            }
+            boot_ordering_gate.mark_engines_ready();
+            boot_ordering_gate.mark_replay_completed();
+            // Phase 2.9 H1 fix (hostile bug-hunt): the BootOrderingGate was
+            // previously informational — a failed authorization logged ERROR
+            // but boot continued, so the WS subscribe still went out with
+            // potentially stale state. The H4 fix in Phase 2.8 (skip
+            // `mark_oi_cache_loaded` on Err) means this branch will fire
+            // when QuestDB candles_1d is unreachable. Treating it as a
+            // panic gives binary-level L14 enforcement: the process refuses
+            // to subscribe with an unhealthy state.
+            //
+            // We use `std::process::exit(1)` rather than `panic!` so the
+            // exit cleanly skips destructors that might try to flush partial
+            // state. systemd / docker restart policy handles the recovery
+            // loop. The 30s prev_oi_cache timeout caps the worst-case wait
+            // before this fires.
+            if !boot_ordering_gate.try_authorize_subscribe() {
+                // PR #5 (2026-05-19): retagged from Phase2Ready01PreflightFailed
+                // (retired with the Phase 2 dispatcher) to PrevClose01IlpFailed
+                // which matches the message's "PREVCLOSE-01" reference per the
+                // error_code_tag_guard meta-test invariant.
+                tracing::error!(
+                    code = tickvault_common::error_code::ErrorCode::PrevClose01IlpFailed.code_str(),
+                    readiness = ?boot_ordering_gate.readiness(),
+                    "L14 boot-ordering gate refused to authorize subscribe — \
+                     prev_oi_cache load likely failed (see PREVCLOSE-01 above). \
+                     HARD-FAIL: process::exit(1) so systemd/docker restart \
+                     the boot rather than subscribe with unhealthy state."
+                );
+                metrics::counter!("tv_l14_boot_authorization_refused_total").increment(1);
+                // Allow tests to exercise this branch without killing the
+                // test runner — gated on TICKVAULT_BOOT_DRY_RUN env var
+                // which production never sets.
+                if std::env::var("TICKVAULT_BOOT_DRY_RUN").is_err() {
+                    std::process::exit(1);
+                }
+            } else {
+                tracing::info!(
+                    "L14 boot-ordering gate authorized subscribe (Phase 2.6: \
+                 prev_oi_cache loaded, engines ready, replay completed)"
+                );
+                metrics::counter!("tv_l14_boot_authorization_total").increment(1);
+            }
+            // Reference the gate so it isn't optimized out — future commits
+            // can pass `boot_ordering_gate.clone()` into the WS subscribe
+            // dispatcher to gate the actual frame send.
+            drop(std::sync::Arc::clone(&boot_ordering_gate));
+
+            // 29-tf engine Phase 2.7 (hostile bug-hunt CRITICAL C1 fix):
+            // spawn the IST midnight rollover task. Without this, the
+            // volume_delta tracker accumulates baselines across day
+            // boundaries and the first ~24,300 ticks at 09:15 IST on
+            // Day N+1 trigger false VOLUME-MONO-01 alerts (per L13).
+            //
+            // The task sleeps until next IST 00:00:00, performs the
+            // atomic phase transition (clear volume baselines + clear
+            // prev_day_close stamps + reload prev_oi_cache from
+            // candles_1d), then loops. Cancelable via the JoinHandle
+            // returned by spawn_midnight_rollover_task.
+            let _midnight_rollover_handle =
+                tickvault_core::pipeline::tick_enricher::spawn_midnight_rollover_task(
+                    std::sync::Arc::clone(&tick_enricher),
+                    config.questdb.clone(),
+                );
+            tracing::info!(
+                "midnight rollover task spawned (Phase 2.7 — L13 atomic state \
+             transition at IST 00:00:00 every trading day)"
+            );
+
+            // Phase 2.11 (hostile bug-hunt M2 + M4 fix): periodic
+            // prev_oi_cache refresh task. Covers two scenarios that
+            // boot-time load + midnight rollover do NOT cover:
+            //   (a) Fresh deploy with empty `candles_1d` — boot returned
+            //       Ok(count=0), cache stays empty until next midnight,
+            //       OI Change panels read 0% all day. Refresh polls every
+            //       5min until candles_1d gets populated.
+            //   (b) QuestDB matview chain still building post-boot —
+            //       Phase 2.9 hard-fail only fires on outright load
+            //       failure, not on empty result. Refresh covers the
+            //       gap if the matview catches up after boot.
+            // Self-exits once cache becomes non-empty; midnight task
+            // takes over from there.
+            let _prev_oi_refresh_handle =
+                tickvault_core::pipeline::tick_enricher::spawn_prev_oi_cache_refresh_task(
+                    std::sync::Arc::clone(&tick_enricher),
+                    config.questdb.clone(),
+                );
+            tracing::info!(
+                "prev_oi_cache periodic refresh task spawned (Phase 2.11 — \
+             5min poll for fresh-deploy / matview-catchup recovery)"
+            );
+
+            let _ = slow_registry; // PR #2: instrument_registry was used by deleted movers persistence helpers
+            // SP5: dedicated clone moved into the tick-processor coroutine so the
+            // original `feed_health` Arc stays available for the pool watchdog below.
+            let feed_health_for_processor = std::sync::Arc::clone(&feed_health);
+            let handle = tokio::spawn(async move {
+                run_tick_processor(
+                    receiver,
+                    tick_writer,
+                    tick_broadcast_for_processor,
+                    greeks_enricher,
+                    Some(slow_tick_heartbeat),
+                    // 29-tf engine Phase 2.6 — production-attach the
+                    // lifecycle enricher. The prev_oi_cache was loaded
+                    // synchronously above (or skipped on QuestDB error
+                    // → empty cache, graceful degradation). From this
+                    // point every live tick that reaches QuestDB writes
+                    // populated `volume_delta`, `prev_day_close`,
+                    // `prev_day_oi`, `phase` columns instead of the
+                    // legacy zero/PREMARKET defaults.
+                    Some(std::sync::Arc::clone(&tick_enricher)),
+                    tickvault_common::always_on::current(), // §30 GIFT exemption
+                    Some(feed_health_for_processor),        // SP5: Dhan live-feed health
+                )
+                .await;
+            });
+            info!("tick processor started (with candle aggregation + trading broadcast)");
+            // Phase 2.12 (hostile L1 fix): boot-mode gauge for slow boot.
+            // value=1 indicates the lifecycle enricher is attached and the
+            // 4 ticks-table lifecycle columns will be populated this
+            // session. Operators can chart the time series:
+            //   tv_lifecycle_enricher_attached{boot_mode="slow"} 1
+            // → operator sees mode-switch (fast↔slow) in Prometheus
+            // history independent of the boot log.
+            metrics::gauge!(
+                "tv_lifecycle_enricher_attached",
+                "boot_mode" => "slow"
+            )
+            .set(1.0);
+            info!(
+                boot_mode = "slow",
+                enricher_attached = true,
+                "BOOT MODE: slow (production path) — TickEnricher attached, \
              prev_oi_cache loaded, BootOrderingGate authorized, midnight \
              rollover + periodic refresh tasks spawned. Lifecycle columns \
              (volume_delta, prev_day_close, prev_day_oi, phase) will be \
              populated for every live tick this session."
-        );
-        // Pipeline-active wiring (slow boot): mirror the fast-boot flip
-        // above so the System Overview "Pipeline Status" tile reads
-        // RUNNING and /health reports `pipeline.active` instead of
-        // `pipeline.inactive`. `health_status` is created earlier in the
-        // slow-boot sequence and is in scope here.
-        health_status.set_pipeline_active(true);
-        Some(handle)
-    } else {
-        info!("tick processor skipped — no frame source available");
-        None
-    };
-
-    // Step 8b: NOW spawn WebSocket connections (tick processor is already consuming).
-    // S4-T1a/T1b: shared shutdown_notify for pool watchdog + graceful shutdown.
-    let shutdown_notify = std::sync::Arc::new(tokio::sync::Notify::new());
-
-    // Phase 0 Item 19f — chain `shutdown_notify` into the instance-lock
-    // heartbeat's own Notify. Without this bridge the heartbeat would
-    // only see the broader shutdown when its own Notify fires (never,
-    // in practice); now Ctrl-C / 15:30 IST close / pool-halt all
-    // trigger the heartbeat's `GracefulRelease` audit row + lock
-    // release before the process exits.
-    if let Some(heartbeat_shutdown) = instance_lock_shutdown_chain.take() {
-        let shutdown_signal = shutdown_notify.clone();
-        tokio::spawn(async move {
-            shutdown_signal.notified().await;
-            heartbeat_shutdown.notify_one();
-        });
-    }
-
-    let (ws_handles, ws_pool_arc) = if let Some(pool) = ws_pool_ready {
-        let pool_arc = std::sync::Arc::new(pool);
-        // O1-B (2026-04-17): install per-connection runtime subscribe
-        // channels BEFORE spawn — same as the FAST BOOT path (main.rs ~830).
-        pool_arc.install_subscribe_channels().await;
-        let handles = spawn_websocket_connections(std::sync::Arc::clone(&pool_arc)).await;
-        spawn_pool_watchdog_task(
-            std::sync::Arc::clone(&pool_arc),
-            std::sync::Arc::clone(&shutdown_notify),
-            std::sync::Arc::clone(&notifier),
-            std::sync::Arc::clone(&health_status),
-            Some(std::sync::Arc::clone(&feed_health)), // SP5: Dhan connected state
-        );
-        // FAST BOOT parity: helper emits per-connection + aggregate Telegram
-        // alerts on BOTH boot paths (main.rs ~830 for FAST BOOT, here for slow).
-        // PR #458: now polls pool.health() for truthful state.
-        emit_websocket_connected_alerts(
-            &notifier,
-            &pool_arc,
-            tickvault_core::notification::events::BootPathLabel::Slow,
-            boot_start,
-        )
-        .await;
-        (handles, Some(pool_arc))
-    } else {
-        (Vec::new(), None)
-    };
-
-    // -----------------------------------------------------------------------
-    // Step 8d: PR #4 (2026-05-19) — depth-20/200 rebalancer RETIRED per
-    // operator lock 2026-05-15 (websocket-connection-scope-lock.md).
-    // The pre-open snapshotter + Phase 2 recovery + readiness/heartbeat
-    // schedulers + SLO score scheduler remain inside this block because
-    // they are not depth-specific.
-    // -----------------------------------------------------------------------
-    if should_connect_ws && subscription_plan.is_some() {
-        // C1 fix (PR-2): the DayOhlcTracker + 09:14 readiness + 09:15:30
-        // streaming-confirmation tasks below are NOT universe-specific — they
-        // filter ticks by segment, not by an instrument list. They must run
-        // whenever a subscription plan exists, under BOTH Indices4Only and
-        // DailyUniverse. Previously this was gated on `slow_boot_universe`
-        // being Some; under DailyUniverse the universe is None (the ~250-SID
-        // plan is the source of truth, not an FnoUniverse), which silently
-        // skipped all three tasks — a false-OK regression. The outer
-        // `subscription_plan.is_some()` (above) is the correct gate.
-        {
-            // -----------------------------------------------------------------
-            // DayOhlcTracker boot wiring (post 2026-05-26 simplification).
-            //
-            // Per operator directive 2026-05-26 the Dhan historical /
-            // pre-market buffer code was removed. `day_open` for the 4
-            // LOCKED IDX_I SIDs is now the FIRST OBSERVED LIVE TICK LTP
-            // after the IST midnight reset — no external arming required.
-            //
-            // Two tokio tasks spawned here:
-            //   1. tick consumer  — drain tick broadcast, route IDX_I ticks
-            //                       to update_tick() which auto-arms on
-            //                       first call and advances day_high/low/
-            //                       close on subsequent calls.
-            //   2. midnight reset — IST 00:00:00 clears prev-day state so
-            //                       the next live tick re-arms.
-            // -----------------------------------------------------------------
-            let day_ohlc_tracker =
-                std::sync::Arc::new(tickvault_trading::in_mem::DayOhlcTracker::new());
-            {
-                let consumer_tracker = std::sync::Arc::clone(&day_ohlc_tracker);
-                let consumer_rx = tick_broadcast_sender.subscribe();
-                let _consumer_handle =
-                    tickvault_app::day_ohlc_orchestrator::spawn_day_ohlc_tick_consumer(
-                        consumer_tracker,
-                        consumer_rx,
-                    );
-            }
-            {
-                let reset_tracker = std::sync::Arc::clone(&day_ohlc_tracker);
-                let _reset_handle =
-                    tickvault_app::day_ohlc_orchestrator::spawn_midnight_reset_task(reset_tracker);
-            }
-            info!(
-                "DayOhlcTracker boot wired (tick consumer + midnight reset; day_open = first live tick LTP)"
             );
+            // Pipeline-active wiring (slow boot): mirror the fast-boot flip
+            // above so the System Overview "Pipeline Status" tile reads
+            // RUNNING and /health reports `pipeline.active` instead of
+            // `pipeline.inactive`. `health_status` is created earlier in the
+            // slow-boot sequence and is in scope here.
+            health_status.set_pipeline_active(true);
+            Some(handle)
+        } else {
+            info!("tick processor skipped — no frame source available");
+            None
+        };
 
-            // Audit Finding #5 (2026-05-03): Pre-market positive readiness
-            // ping at 09:14:00 IST — exactly 60s before the NSE opening bell.
-            // Closes the false-OK gap from audit-findings-2026-04-17.md
-            // Rule 11: previously the operator had ZERO positive signals
-            // before the bell, only the post-open 09:15:30 confirmation.
-            // Severity::Info — never pages, only confirms readiness.
-            //
-            // Audit-findings Rule 3: market-hours-aware. Trading day check +
-            // late-start past 09:14:00 → skip silently.
+        // Step 8b: NOW spawn WebSocket connections (tick processor is already consuming).
+        // S4-T1a/T1b: shared shutdown_notify for pool watchdog + graceful shutdown.
+        let shutdown_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+
+        // Phase 0 Item 19f — chain `shutdown_notify` into the instance-lock
+        // heartbeat's own Notify. Without this bridge the heartbeat would
+        // only see the broader shutdown when its own Notify fires (never,
+        // in practice); now Ctrl-C / 15:30 IST close / pool-halt all
+        // trigger the heartbeat's `GracefulRelease` audit row + lock
+        // release before the process exits.
+        if let Some(heartbeat_shutdown) = instance_lock_shutdown_chain.take() {
+            let shutdown_signal = shutdown_notify.clone();
+            tokio::spawn(async move {
+                shutdown_signal.notified().await;
+                heartbeat_shutdown.notify_one();
+            });
+        }
+
+        let (ws_handles, ws_pool_arc) = if let Some(pool) = ws_pool_ready {
+            let pool_arc = std::sync::Arc::new(pool);
+            // O1-B (2026-04-17): install per-connection runtime subscribe
+            // channels BEFORE spawn — same as the FAST BOOT path (main.rs ~830).
+            pool_arc.install_subscribe_channels().await;
+            let handles = spawn_websocket_connections(std::sync::Arc::clone(&pool_arc)).await;
+            spawn_pool_watchdog_task(
+                std::sync::Arc::clone(&pool_arc),
+                std::sync::Arc::clone(&shutdown_notify),
+                std::sync::Arc::clone(&notifier),
+                std::sync::Arc::clone(&health_status),
+                Some(std::sync::Arc::clone(&feed_health)), // SP5: Dhan connected state
+            );
+            // FAST BOOT parity: helper emits per-connection + aggregate Telegram
+            // alerts on BOTH boot paths (main.rs ~830 for FAST BOOT, here for slow).
+            // PR #458: now polls pool.health() for truthful state.
+            emit_websocket_connected_alerts(
+                &notifier,
+                &pool_arc,
+                tickvault_core::notification::events::BootPathLabel::Slow,
+                boot_start,
+            )
+            .await;
+            (handles, Some(pool_arc))
+        } else {
+            (Vec::new(), None)
+        };
+
+        // -----------------------------------------------------------------------
+        // Step 8d: PR #4 (2026-05-19) — depth-20/200 rebalancer RETIRED per
+        // operator lock 2026-05-15 (websocket-connection-scope-lock.md).
+        // The pre-open snapshotter + Phase 2 recovery + readiness/heartbeat
+        // schedulers + SLO score scheduler remain inside this block because
+        // they are not depth-specific.
+        // -----------------------------------------------------------------------
+        if should_connect_ws && subscription_plan.is_some() {
+            // C1 fix (PR-2): the DayOhlcTracker + 09:14 readiness + 09:15:30
+            // streaming-confirmation tasks below are NOT universe-specific — they
+            // filter ticks by segment, not by an instrument list. They must run
+            // whenever a subscription plan exists, under BOTH Indices4Only and
+            // DailyUniverse. Previously this was gated on `slow_boot_universe`
+            // being Some; under DailyUniverse the universe is None (the ~250-SID
+            // plan is the source of truth, not an FnoUniverse), which silently
+            // skipped all three tasks — a false-OK regression. The outer
+            // `subscription_plan.is_some()` (above) is the correct gate.
             {
-                let readiness_notifier = notifier.clone();
-                let readiness_health = health_status.clone();
-                let readiness_calendar = std::sync::Arc::clone(&trading_calendar);
-                tokio::spawn(async move {
-                    use chrono::{FixedOffset, NaiveTime, TimeZone, Utc};
-                    use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
-                    let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
-                        return;
-                    };
-                    let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
-                    let today_ist = now_ist.date_naive();
-                    if !readiness_calendar.is_trading_day(today_ist) {
-                        info!("market-open readiness: skipping (non-trading day)");
-                        return;
-                    }
-                    let Some(target) = NaiveTime::from_hms_opt(9, 14, 0) else {
-                        return;
-                    };
-                    let now_time = now_ist.time();
-                    if now_time >= target {
-                        // Mid-session boot past 09:14:00 — skip silently per
-                        // 09:15:30 heartbeat precedent (audit-findings Rule 3).
-                        debug!(
-                            now = %now_time,
-                            "market-open readiness: skipping (past 09:14:00 — mid-session boot)"
+                // -----------------------------------------------------------------
+                // DayOhlcTracker boot wiring (post 2026-05-26 simplification).
+                //
+                // Per operator directive 2026-05-26 the Dhan historical /
+                // pre-market buffer code was removed. `day_open` for the 4
+                // LOCKED IDX_I SIDs is now the FIRST OBSERVED LIVE TICK LTP
+                // after the IST midnight reset — no external arming required.
+                //
+                // Two tokio tasks spawned here:
+                //   1. tick consumer  — drain tick broadcast, route IDX_I ticks
+                //                       to update_tick() which auto-arms on
+                //                       first call and advances day_high/low/
+                //                       close on subsequent calls.
+                //   2. midnight reset — IST 00:00:00 clears prev-day state so
+                //                       the next live tick re-arms.
+                // -----------------------------------------------------------------
+                let day_ohlc_tracker =
+                    std::sync::Arc::new(tickvault_trading::in_mem::DayOhlcTracker::new());
+                {
+                    let consumer_tracker = std::sync::Arc::clone(&day_ohlc_tracker);
+                    let consumer_rx = tick_broadcast_sender.subscribe();
+                    let _consumer_handle =
+                        tickvault_app::day_ohlc_orchestrator::spawn_day_ohlc_tick_consumer(
+                            consumer_tracker,
+                            consumer_rx,
                         );
-                        return;
-                    }
-                    let secs_until = (target - now_time).num_seconds().max(0) as u64;
-                    info!(
-                        secs_until,
-                        "market-open readiness: sleeping until 09:14:00 IST"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
-
-                    let main_active = readiness_health.websocket_connections() as usize;
-                    let oms = readiness_health.order_update_connected();
-                    let token_secs = readiness_health.token_remaining_secs();
-                    info!(
-                        main_feed = main_active,
-                        order_update = oms,
-                        token_remaining_secs = token_secs,
-                        "PROOF: market-open readiness confirmation fired @ 09:14:00 IST"
-                    );
-                    // Phase 0 Item 2 hostile-review HIGH #3 fix (2026-05-13):
-                    // `main_feed_total` is the operator's EXPECTED count for
-                    // the day, NOT the Dhan slot ceiling. Under Phase 0 the
-                    // expected total is 1; reading "1/5" would falsely
-                    // suggest 4 missing connections.
-                    readiness_notifier.notify(NotificationEvent::MarketOpenReadinessConfirmation {
-                        main_feed_active: main_active,
-                        main_feed_total: tickvault_common::config::effective_main_feed_pool_size(
-                            config.subscription.scope,
-                            config.dhan.max_websocket_connections,
-                        ),
-                        order_update_active: oms,
-                        token_remaining_secs: token_secs,
-                    });
-                });
-            }
-
-            // Plan item #5 (2026-04-22): Market-open streaming confirmation
-            // Telegram. Fires once per trading day at 09:15:30 IST with the
-            // count of active feeds. Answers Parthiban's "how do I know if
-            // connected" question without needing Grafana or curl.
-            //
-            // Audit-findings Rule 3: market-hours-aware. Trading day check +
-            // post-market skip + late-start past 09:15:30 → skip silently.
-            {
-                let heartbeat_notifier = notifier.clone();
-                let heartbeat_health = health_status.clone();
-                let heartbeat_calendar = std::sync::Arc::clone(&trading_calendar);
-                tokio::spawn(async move {
-                    use chrono::{FixedOffset, NaiveTime, TimeZone, Utc};
-                    use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
-                    let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
-                        return;
-                    };
-                    let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
-                    let today_ist = now_ist.date_naive();
-                    if !heartbeat_calendar.is_trading_day(today_ist) {
-                        info!("market-open heartbeat: skipping (non-trading day)");
-                        return;
-                    }
-                    let Some(target) = NaiveTime::from_hms_opt(9, 15, 30) else {
-                        return;
-                    };
-                    let now_time = now_ist.time();
-                    if now_time >= target {
-                        // 2026-04-24 Fix D: demoted INFO → DEBUG. A mid-session
-                        // fresh boot (e.g. 12:07 IST) legitimately runs past
-                        // 09:15:30, and this INFO log reads like "something is
-                        // broken". Real streaming confirmation happens via
-                        // boot-time spot-wait + depth ATM selection.
-                        debug!(
-                            now = %now_time,
-                            "market-open heartbeat: skipping (past 09:15:30 — expected on mid-session boot)"
+                }
+                {
+                    let reset_tracker = std::sync::Arc::clone(&day_ohlc_tracker);
+                    let _reset_handle =
+                        tickvault_app::day_ohlc_orchestrator::spawn_midnight_reset_task(
+                            reset_tracker,
                         );
-                        return;
-                    }
-                    let secs_until = (target - now_time).num_seconds().max(0) as u64;
-                    info!(
-                        secs_until,
-                        "market-open heartbeat: sleeping until 09:15:30 IST"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+                }
+                info!(
+                    "DayOhlcTracker boot wired (tick consumer + midnight reset; day_open = first live tick LTP)"
+                );
 
-                    let main_active = heartbeat_health.websocket_connections() as usize;
-                    let oms = heartbeat_health.order_update_connected();
-                    info!(
-                        main_feed = main_active,
-                        order_update = oms,
-                        "PROOF: market-open streaming confirmation fired @ 09:15:30 IST"
-                    );
-                    // Audit finding #8 (2026-04-24): when main feed is 0 at the
-                    // 09:15:30 heartbeat, this is NOT a positive "streaming live"
-                    // signal — it's a catastrophic missed market open. Route to
-                    // the High-severity Failed variant so the operator pages,
-                    // not to the Info-severity Confirmation that reads confusingly
-                    // as "Streaming live / Main feed: 0/5".
-                    // Phase 0 Item 2 hostile-review HIGH #3 fix (2026-05-13):
-                    // see MarketOpenReadinessConfirmation above for rationale.
-                    let expected_main_feed_total =
-                        tickvault_common::config::effective_main_feed_pool_size(
-                            config.subscription.scope,
-                            config.dhan.max_websocket_connections,
+                // Audit Finding #5 (2026-05-03): Pre-market positive readiness
+                // ping at 09:14:00 IST — exactly 60s before the NSE opening bell.
+                // Closes the false-OK gap from audit-findings-2026-04-17.md
+                // Rule 11: previously the operator had ZERO positive signals
+                // before the bell, only the post-open 09:15:30 confirmation.
+                // Severity::Info — never pages, only confirms readiness.
+                //
+                // Audit-findings Rule 3: market-hours-aware. Trading day check +
+                // late-start past 09:14:00 → skip silently.
+                {
+                    let readiness_notifier = notifier.clone();
+                    let readiness_health = health_status.clone();
+                    let readiness_calendar = std::sync::Arc::clone(&trading_calendar);
+                    tokio::spawn(async move {
+                        use chrono::{FixedOffset, NaiveTime, TimeZone, Utc};
+                        use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+                        let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+                            return;
+                        };
+                        let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+                        let today_ist = now_ist.date_naive();
+                        if !readiness_calendar.is_trading_day(today_ist) {
+                            info!("market-open readiness: skipping (non-trading day)");
+                            return;
+                        }
+                        let Some(target) = NaiveTime::from_hms_opt(9, 14, 0) else {
+                            return;
+                        };
+                        let now_time = now_ist.time();
+                        if now_time >= target {
+                            // Mid-session boot past 09:14:00 — skip silently per
+                            // 09:15:30 heartbeat precedent (audit-findings Rule 3).
+                            debug!(
+                                now = %now_time,
+                                "market-open readiness: skipping (past 09:14:00 — mid-session boot)"
+                            );
+                            return;
+                        }
+                        let secs_until = (target - now_time).num_seconds().max(0) as u64;
+                        info!(
+                            secs_until,
+                            "market-open readiness: sleeping until 09:14:00 IST"
                         );
-                    if main_active == 0 {
-                        heartbeat_notifier.notify(NotificationEvent::MarketOpenStreamingFailed {
-                            main_feed_active: main_active,
-                            main_feed_total: expected_main_feed_total,
-                            order_update_active: oms,
-                        });
-                    } else {
-                        heartbeat_notifier.notify(
-                            NotificationEvent::MarketOpenStreamingConfirmation {
+                        tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+
+                        let main_active = readiness_health.websocket_connections() as usize;
+                        let oms = readiness_health.order_update_connected();
+                        let token_secs = readiness_health.token_remaining_secs();
+                        info!(
+                            main_feed = main_active,
+                            order_update = oms,
+                            token_remaining_secs = token_secs,
+                            "PROOF: market-open readiness confirmation fired @ 09:14:00 IST"
+                        );
+                        // Phase 0 Item 2 hostile-review HIGH #3 fix (2026-05-13):
+                        // `main_feed_total` is the operator's EXPECTED count for
+                        // the day, NOT the Dhan slot ceiling. Under Phase 0 the
+                        // expected total is 1; reading "1/5" would falsely
+                        // suggest 4 missing connections.
+                        readiness_notifier.notify(
+                            NotificationEvent::MarketOpenReadinessConfirmation {
                                 main_feed_active: main_active,
-                                main_feed_total: expected_main_feed_total,
+                                main_feed_total:
+                                    tickvault_common::config::effective_main_feed_pool_size(
+                                        config.subscription.scope,
+                                        config.dhan.max_websocket_connections,
+                                    ),
                                 order_update_active: oms,
+                                token_remaining_secs: token_secs,
                             },
                         );
-                    }
-                });
-            }
+                    });
+                }
 
-            // Post-market tasks (EOD digest 15:31:30 IST + 1-minute cross-verify
-            // 15:31:00 IST). Extracted to spawn_post_market_tasks so the fast-boot
-            // path runs them too (boot-symmetry, 2026-06-09).
-            spawn_post_market_tasks(
-                notifier.clone(),
-                std::sync::Arc::clone(&health_status),
-                std::sync::Arc::clone(&trading_calendar),
-                std::sync::Arc::clone(&token_handle),
-                ws_client_id.clone(),
-                &config,
-            );
-
-            // Wave 3-C Item 12 (2026-04-28): market-open self-test at
-            // 09:16:00 IST — a single tri-state verdict
-            // (Passed / Degraded / Critical) over 7 sub-checks. Fires
-            // 30s after the 09:15:30 streaming-confirmation heartbeat
-            // so any racy boot-time wiring has settled.
-            //
-            // Audit-findings Rule 3 (market-hours-aware): trading-day
-            // check + skip if past 09:16. Late-start mid-session boot
-            // legitimately runs past 09:16 — do not fire then.
-            //
-            // Persistence: outcome row → `selftest_audit` table
-            // (Wave-2-D Item 9). DEDUP key `(trading_date_ist, check_name)`.
-            //
-            // Gated on `config.features.market_open_self_test`.
-            if config.features.market_open_self_test {
-                let st_notifier = notifier.clone();
-                let st_health = health_status.clone();
-                let st_calendar = std::sync::Arc::clone(&trading_calendar);
-                let st_qcfg = config.questdb.clone();
-                tokio::spawn(async move {
-                    use chrono::{FixedOffset, NaiveTime, TimeZone, Utc};
-                    use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
-                    use tickvault_core::instrument::market_open_self_test::{
-                        MarketOpenSelfTestInputs, MarketOpenSelfTestOutcome, evaluate_self_test,
-                    };
-                    let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
-                        return;
-                    };
-                    let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
-                    let today_ist = now_ist.date_naive();
-                    if !st_calendar.is_trading_day(today_ist) {
-                        info!("market-open self-test: skipping (non-trading day)");
-                        return;
-                    }
-                    let Some(target) = NaiveTime::from_hms_opt(9, 16, 0) else {
-                        return;
-                    };
-                    let now_time = now_ist.time();
-                    if now_time >= target {
-                        debug!(
-                            now = %now_time,
-                            "market-open self-test: skipping (past 09:16 — expected on mid-session boot)"
-                        );
-                        return;
-                    }
-                    let secs_until = (target - now_time).num_seconds().max(0) as u64;
-                    info!(
-                        secs_until,
-                        "market-open self-test: sleeping until 09:16:00 IST"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
-
-                    // #T2b (2026-05-20): the selftest_audit DB pre-check
-                    // was removed with the table. The scheduler fires
-                    // once per process; `already_fired` stays false.
-                    let already_fired = false;
-                    if already_fired {
+                // Plan item #5 (2026-04-22): Market-open streaming confirmation
+                // Telegram. Fires once per trading day at 09:15:30 IST with the
+                // count of active feeds. Answers Parthiban's "how do I know if
+                // connected" question without needing Grafana or curl.
+                //
+                // Audit-findings Rule 3: market-hours-aware. Trading day check +
+                // post-market skip + late-start past 09:15:30 → skip silently.
+                {
+                    let heartbeat_notifier = notifier.clone();
+                    let heartbeat_health = health_status.clone();
+                    let heartbeat_calendar = std::sync::Arc::clone(&trading_calendar);
+                    tokio::spawn(async move {
+                        use chrono::{FixedOffset, NaiveTime, TimeZone, Utc};
+                        use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+                        let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+                            return;
+                        };
+                        let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+                        let today_ist = now_ist.date_naive();
+                        if !heartbeat_calendar.is_trading_day(today_ist) {
+                            info!("market-open heartbeat: skipping (non-trading day)");
+                            return;
+                        }
+                        let Some(target) = NaiveTime::from_hms_opt(9, 15, 30) else {
+                            return;
+                        };
+                        let now_time = now_ist.time();
+                        if now_time >= target {
+                            // 2026-04-24 Fix D: demoted INFO → DEBUG. A mid-session
+                            // fresh boot (e.g. 12:07 IST) legitimately runs past
+                            // 09:15:30, and this INFO log reads like "something is
+                            // broken". Real streaming confirmation happens via
+                            // boot-time spot-wait + depth ATM selection.
+                            debug!(
+                                now = %now_time,
+                                "market-open heartbeat: skipping (past 09:15:30 — expected on mid-session boot)"
+                            );
+                            return;
+                        }
+                        let secs_until = (target - now_time).num_seconds().max(0) as u64;
                         info!(
-                            "market-open self-test: skipping notify (already fired today; audit-row UPSERT only)"
+                            secs_until,
+                            "market-open heartbeat: sleeping until 09:15:30 IST"
                         );
-                    }
+                        tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
 
-                    // Sample live state. All eight sub-checks now have
-                    // production sources: seven from `health_status`
-                    // gauges + token manager, and `last_tick_age_secs`
-                    // from the global `TickGapDetector::scan_gaps_top_n`
-                    // (returns the worst-stale instrument's gap).
-                    let main_active = st_health.websocket_connections() as usize;
-                    let oms = st_health.order_update_connected();
-                    let pipeline = st_health.pipeline_active();
-                    let questdb_ok =
-                        tickvault_storage::boot_probe::wait_for_questdb_ready(&st_qcfg, 3)
-                            .await
-                            .is_ok();
-                    let token_headroom_secs =
-                        tickvault_core::auth::token_manager::global_token_manager()
-                            .map(|tm| tm.seconds_until_expiry())
-                            .unwrap_or(0);
-                    let worst_gap_secs =
-                        tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
-                            .map(|d| {
-                                let (top, _total) = d.scan_gaps_top_n(std::time::Instant::now(), 1);
-                                top.first().map(|(_, _, gap)| *gap).unwrap_or(0)
-                            })
-                            .unwrap_or(0);
-                    // §31 universe-completeness — read the live universe the
-                    // boot stashed (same source as the post-market cross-check
-                    // above). None (no universe at 09:16) → (0, 0) → both
-                    // sub-checks fail loudly, which is correct.
-                    let (index_values, ntm_constituents) =
-                        tickvault_app::prev_day_ohlcv_boot::stashed_universe()
-                            .map(|u| {
-                                use tickvault_core::instrument::daily_universe::InstrumentRole;
-                                (
-                                    u.count_by_role(InstrumentRole::Index),
-                                    u.index_constituent_count(),
-                                )
-                            })
-                            .unwrap_or((0, 0));
-                    let inputs = MarketOpenSelfTestInputs {
-                        main_feed_active: main_active,
-                        order_update_active: oms,
-                        pipeline_active: pipeline,
-                        last_tick_age_secs: worst_gap_secs,
-                        questdb_connected: questdb_ok,
-                        token_expiry_headroom_secs: token_headroom_secs,
-                        index_values_subscribed: index_values,
-                        ntm_constituents_subscribed: ntm_constituents,
-                    };
-                    let started = std::time::Instant::now();
-                    let outcome = evaluate_self_test(&inputs);
-                    let _duration_ms =
-                        i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+                        let main_active = heartbeat_health.websocket_connections() as usize;
+                        let oms = heartbeat_health.order_update_connected();
+                        info!(
+                            main_feed = main_active,
+                            order_update = oms,
+                            "PROOF: market-open streaming confirmation fired @ 09:15:30 IST"
+                        );
+                        // Audit finding #8 (2026-04-24): when main feed is 0 at the
+                        // 09:15:30 heartbeat, this is NOT a positive "streaming live"
+                        // signal — it's a catastrophic missed market open. Route to
+                        // the High-severity Failed variant so the operator pages,
+                        // not to the Info-severity Confirmation that reads confusingly
+                        // as "Streaming live / Main feed: 0/5".
+                        // Phase 0 Item 2 hostile-review HIGH #3 fix (2026-05-13):
+                        // see MarketOpenReadinessConfirmation above for rationale.
+                        let expected_main_feed_total =
+                            tickvault_common::config::effective_main_feed_pool_size(
+                                config.subscription.scope,
+                                config.dhan.max_websocket_connections,
+                            );
+                        if main_active == 0 {
+                            heartbeat_notifier.notify(
+                                NotificationEvent::MarketOpenStreamingFailed {
+                                    main_feed_active: main_active,
+                                    main_feed_total: expected_main_feed_total,
+                                    order_update_active: oms,
+                                },
+                            );
+                        } else {
+                            heartbeat_notifier.notify(
+                                NotificationEvent::MarketOpenStreamingConfirmation {
+                                    main_feed_active: main_active,
+                                    main_feed_total: expected_main_feed_total,
+                                    order_update_active: oms,
+                                },
+                            );
+                        }
+                    });
+                }
 
-                    info!(
-                        result = outcome.outcome_str(),
-                        code = outcome.error_code().code_str(),
-                        main_feed = main_active,
-                        order_update = oms,
-                        questdb_connected = questdb_ok,
-                        token_expiry_headroom_secs = token_headroom_secs,
-                        index_values,
-                        ntm_constituents,
-                        "PROOF: market-open self-test fired @ 09:16:00 IST"
-                    );
+                // Post-market tasks (EOD digest 15:31:30 IST + 1-minute cross-verify
+                // 15:31:00 IST). Extracted to spawn_post_market_tasks so the fast-boot
+                // path runs them too (boot-symmetry, 2026-06-09).
+                spawn_post_market_tasks(
+                    notifier.clone(),
+                    std::sync::Arc::clone(&health_status),
+                    std::sync::Arc::clone(&trading_calendar),
+                    std::sync::Arc::clone(&token_handle),
+                    ws_client_id.clone(),
+                    &config,
+                );
 
-                    metrics::counter!(
-                        "tv_self_test_total",
-                        "result" => outcome.outcome_str()
-                    )
-                    .increment(1);
+                // Wave 3-C Item 12 (2026-04-28): market-open self-test at
+                // 09:16:00 IST — a single tri-state verdict
+                // (Passed / Degraded / Critical) over 7 sub-checks. Fires
+                // 30s after the 09:15:30 streaming-confirmation heartbeat
+                // so any racy boot-time wiring has settled.
+                //
+                // Audit-findings Rule 3 (market-hours-aware): trading-day
+                // check + skip if past 09:16. Late-start mid-session boot
+                // legitimately runs past 09:16 — do not fire then.
+                //
+                // Persistence: outcome row → `selftest_audit` table
+                // (Wave-2-D Item 9). DEDUP key `(trading_date_ist, check_name)`.
+                //
+                // Gated on `config.features.market_open_self_test`.
+                if config.features.market_open_self_test {
+                    let st_notifier = notifier.clone();
+                    let st_health = health_status.clone();
+                    let st_calendar = std::sync::Arc::clone(&trading_calendar);
+                    let st_qcfg = config.questdb.clone();
+                    tokio::spawn(async move {
+                        use chrono::{FixedOffset, NaiveTime, TimeZone, Utc};
+                        use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+                        use tickvault_core::instrument::market_open_self_test::{
+                            MarketOpenSelfTestInputs, MarketOpenSelfTestOutcome, evaluate_self_test,
+                        };
+                        let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+                            return;
+                        };
+                        let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+                        let today_ist = now_ist.date_naive();
+                        if !st_calendar.is_trading_day(today_ist) {
+                            info!("market-open self-test: skipping (non-trading day)");
+                            return;
+                        }
+                        let Some(target) = NaiveTime::from_hms_opt(9, 16, 0) else {
+                            return;
+                        };
+                        let now_time = now_ist.time();
+                        if now_time >= target {
+                            debug!(
+                                now = %now_time,
+                                "market-open self-test: skipping (past 09:16 — expected on mid-session boot)"
+                            );
+                            return;
+                        }
+                        let secs_until = (target - now_time).num_seconds().max(0) as u64;
+                        info!(
+                            secs_until,
+                            "market-open self-test: sleeping until 09:16:00 IST"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
 
-                    if !already_fired {
-                        match &outcome {
-                            MarketOpenSelfTestOutcome::Passed { checks_passed } => {
-                                st_notifier.notify(
+                        // #T2b (2026-05-20): the selftest_audit DB pre-check
+                        // was removed with the table. The scheduler fires
+                        // once per process; `already_fired` stays false.
+                        let already_fired = false;
+                        if already_fired {
+                            info!(
+                                "market-open self-test: skipping notify (already fired today; audit-row UPSERT only)"
+                            );
+                        }
+
+                        // Sample live state. All eight sub-checks now have
+                        // production sources: seven from `health_status`
+                        // gauges + token manager, and `last_tick_age_secs`
+                        // from the global `TickGapDetector::scan_gaps_top_n`
+                        // (returns the worst-stale instrument's gap).
+                        let main_active = st_health.websocket_connections() as usize;
+                        let oms = st_health.order_update_connected();
+                        let pipeline = st_health.pipeline_active();
+                        let questdb_ok =
+                            tickvault_storage::boot_probe::wait_for_questdb_ready(&st_qcfg, 3)
+                                .await
+                                .is_ok();
+                        let token_headroom_secs =
+                            tickvault_core::auth::token_manager::global_token_manager()
+                                .map(|tm| tm.seconds_until_expiry())
+                                .unwrap_or(0);
+                        let worst_gap_secs =
+                            tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
+                                .map(|d| {
+                                    let (top, _total) =
+                                        d.scan_gaps_top_n(std::time::Instant::now(), 1);
+                                    top.first().map(|(_, _, gap)| *gap).unwrap_or(0)
+                                })
+                                .unwrap_or(0);
+                        // §31 universe-completeness — read the live universe the
+                        // boot stashed (same source as the post-market cross-check
+                        // above). None (no universe at 09:16) → (0, 0) → both
+                        // sub-checks fail loudly, which is correct.
+                        let (index_values, ntm_constituents) =
+                            tickvault_app::prev_day_ohlcv_boot::stashed_universe()
+                                .map(|u| {
+                                    use tickvault_core::instrument::daily_universe::InstrumentRole;
+                                    (
+                                        u.count_by_role(InstrumentRole::Index),
+                                        u.index_constituent_count(),
+                                    )
+                                })
+                                .unwrap_or((0, 0));
+                        let inputs = MarketOpenSelfTestInputs {
+                            main_feed_active: main_active,
+                            order_update_active: oms,
+                            pipeline_active: pipeline,
+                            last_tick_age_secs: worst_gap_secs,
+                            questdb_connected: questdb_ok,
+                            token_expiry_headroom_secs: token_headroom_secs,
+                            index_values_subscribed: index_values,
+                            ntm_constituents_subscribed: ntm_constituents,
+                        };
+                        let started = std::time::Instant::now();
+                        let outcome = evaluate_self_test(&inputs);
+                        let _duration_ms =
+                            i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+
+                        info!(
+                            result = outcome.outcome_str(),
+                            code = outcome.error_code().code_str(),
+                            main_feed = main_active,
+                            order_update = oms,
+                            questdb_connected = questdb_ok,
+                            token_expiry_headroom_secs = token_headroom_secs,
+                            index_values,
+                            ntm_constituents,
+                            "PROOF: market-open self-test fired @ 09:16:00 IST"
+                        );
+
+                        metrics::counter!(
+                            "tv_self_test_total",
+                            "result" => outcome.outcome_str()
+                        )
+                        .increment(1);
+
+                        if !already_fired {
+                            match &outcome {
+                                MarketOpenSelfTestOutcome::Passed { checks_passed } => {
+                                    st_notifier.notify(
                                     tickvault_core::notification::events::NotificationEvent::SelfTestPassed {
                                         checks_passed: *checks_passed,
                                     },
                                 );
-                            }
-                            MarketOpenSelfTestOutcome::Degraded {
-                                checks_passed,
-                                checks_failed,
-                                failed,
-                            } => {
-                                st_notifier.notify(
+                                }
+                                MarketOpenSelfTestOutcome::Degraded {
+                                    checks_passed,
+                                    checks_failed,
+                                    failed,
+                                } => {
+                                    st_notifier.notify(
                                     tickvault_core::notification::events::NotificationEvent::SelfTestDegraded {
                                         checks_passed: *checks_passed,
                                         checks_failed: *checks_failed,
                                         failed: failed.clone(),
                                     },
                                 );
-                            }
-                            MarketOpenSelfTestOutcome::Critical {
-                                checks_failed,
-                                failed,
-                            } => {
-                                st_notifier.notify(
+                                }
+                                MarketOpenSelfTestOutcome::Critical {
+                                    checks_failed,
+                                    failed,
+                                } => {
+                                    st_notifier.notify(
                                     tickvault_core::notification::events::NotificationEvent::SelfTestCritical {
                                         checks_failed: *checks_failed,
                                         failed: failed.clone(),
                                     },
                                 );
+                                }
                             }
                         }
-                    }
 
-                    // #T2b (2026-05-20): the selftest_audit outcome row
-                    // write was removed with the table. The self-test
-                    // result is still delivered via Telegram + Loki.
-                });
-            }
+                        // #T2b (2026-05-20): the selftest_audit outcome row
+                        // write was removed with the table. The self-test
+                        // result is still delivered via Telegram + Loki.
+                    });
+                }
 
-            // Wave 3-D Item 13 — composite real-time guarantee score.
-            // Every 10s, sample 6 dimensions (WS, QDB, tick freshness,
-            // token, spill, Phase 2), compute composite score
-            // ∈ [0.0, 1.0], emit `tv_realtime_guarantee_score` gauge +
-            // 6 per-dimension gauges, and on rising-tier transitions
-            // (Healthy → Degraded / Healthy → Critical / Degraded →
-            // Critical) fire edge-triggered Telegram with severity
-            // matching the new tier.
-            //
-            // Audit-findings Rule 3 (market-hours-aware): off-hours we
-            // pin WS / tick / Phase2 dimensions to 1.0 because their
-            // by-design state (sleeping connections, no ticks, no
-            // Phase 2 trigger yet) is not a degradation — only QDB,
-            // token, spill remain genuine off-hours signals.
-            //
-            // Audit-findings Rule 4 (edge-trigger): sustained-degraded
-            // ticks do NOT spam Telegram. The Prometheus alert
-            // `tv-realtime-score-degraded` (5m sustained < 0.95) is
-            // the sustained-condition channel.
-            //
-            // Gated on `config.features.realtime_guarantee_score`.
-            if config.features.realtime_guarantee_score {
-                // 2026-05-11 v3: SLO Telegram dispatch removed — see the
-                // `slo_notifier.notify(...)` removal note in the
-                // `cur_tier > prev_tier` block below. The clone is
-                // retained under `_` so a future "re-enable SLO Telegram"
-                // PR has a one-line revert (drop the underscore + restore
-                // the notify() calls).
-                let _slo_notifier = notifier.clone();
-                let slo_health = health_status.clone();
-                let slo_qcfg = config.questdb.clone();
-                // PR #509d (Wave-5 §R.1): the Phase 2 dispatcher chain is
-                // retired. The phase2_health SLO dimension is permanently
-                // pinned to 1.0 inside the score loop — see comment there.
-                tokio::spawn(async move {
-                    use std::time::{Duration, Instant};
-                    use tickvault_common::constants::{IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY};
-                    use tickvault_common::error_code::ErrorCode;
-                    use tickvault_core::instrument::slo_score::{
-                        SloInputs, SloOutcome, evaluate_slo_score,
-                    };
+                // Wave 3-D Item 13 — composite real-time guarantee score.
+                // Every 10s, sample 6 dimensions (WS, QDB, tick freshness,
+                // token, spill, Phase 2), compute composite score
+                // ∈ [0.0, 1.0], emit `tv_realtime_guarantee_score` gauge +
+                // 6 per-dimension gauges, and on rising-tier transitions
+                // (Healthy → Degraded / Healthy → Critical / Degraded →
+                // Critical) fire edge-triggered Telegram with severity
+                // matching the new tier.
+                //
+                // Audit-findings Rule 3 (market-hours-aware): off-hours we
+                // pin WS / tick / Phase2 dimensions to 1.0 because their
+                // by-design state (sleeping connections, no ticks, no
+                // Phase 2 trigger yet) is not a degradation — only QDB,
+                // token, spill remain genuine off-hours signals.
+                //
+                // Audit-findings Rule 4 (edge-trigger): sustained-degraded
+                // ticks do NOT spam Telegram. The Prometheus alert
+                // `tv-realtime-score-degraded` (5m sustained < 0.95) is
+                // the sustained-condition channel.
+                //
+                // Gated on `config.features.realtime_guarantee_score`.
+                if config.features.realtime_guarantee_score {
+                    // 2026-05-11 v3: SLO Telegram dispatch removed — see the
+                    // `slo_notifier.notify(...)` removal note in the
+                    // `cur_tier > prev_tier` block below. The clone is
+                    // retained under `_` so a future "re-enable SLO Telegram"
+                    // PR has a one-line revert (drop the underscore + restore
+                    // the notify() calls).
+                    let _slo_notifier = notifier.clone();
+                    let slo_health = health_status.clone();
+                    let slo_qcfg = config.questdb.clone();
+                    // PR #509d (Wave-5 §R.1): the Phase 2 dispatcher chain is
+                    // retired. The phase2_health SLO dimension is permanently
+                    // pinned to 1.0 inside the score loop — see comment there.
+                    tokio::spawn(async move {
+                        use std::time::{Duration, Instant};
+                        use tickvault_common::constants::{
+                            IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY,
+                        };
+                        use tickvault_common::error_code::ErrorCode;
+                        use tickvault_core::instrument::slo_score::{
+                            SloInputs, SloOutcome, evaluate_slo_score,
+                        };
 
-                    /// Sum of expected connections across the four pools:
-                    /// Default = 12. Breakdown: 5 main feed, 4 depth-20 (NIFTY,
-                    /// BANKNIFTY, FINNIFTY, MIDCPNIFTY per pre-2026-04-25
-                    /// universe; rebuild reduced to 2 but pool capacity still
-                    /// permits 4), 2 depth-200 (NIFTY ATM CE/PE + BANKNIFTY
-                    /// ATM CE/PE), 1 order-update.
-                    ///
-                    /// Phase 0 Item 2 fix (operator-locked 2026-05-13,
-                    /// hostile-review CRITICAL #1): main-feed component
-                    /// scope-aware. Under `IndicesUnderlyingsOnly` the main
-                    /// pool is clamped to `PHASE_0_MAIN_FEED_CONNECTION_COUNT
-                    /// = 1`, so the expected denominator must match the
-                    /// effective pool size — otherwise `ws_health = 8/12 =
-                    /// 0.667` → `SLO-02 Critical` Telegram every 10s during
-                    /// market hours (pager fatigue).
-                    ///
-                    /// Phase 0 Item 3 (operator-locked 2026-05-13): depth-20
-                    /// + depth-200 expected components ALSO scope-aware via
-                    /// `should_spawn_depth_dynamic_pipeline`. Under
-                    /// `IndicesUnderlyingsOnly` the depth pipeline is parked
-                    /// → expected count is 0, matching the actual 0 active.
-                    /// Phase 0 denominator: `1 + 0 + 0 + 1 = 2` (matches
-                    /// active when main + OMS up → `ws_health = 1.0`).
-                    // PR #4 (2026-05-19): depth-20 + depth-200 expected
-                    // components dropped — depth pipelines retired entirely
-                    // per operator lock 2026-05-15.
-                    const SLO_WS_EXPECTED_ORDER_UPDATE: f64 = 1.0;
-                    let slo_ws_expected_main_feed: f64 =
-                        tickvault_common::config::effective_main_feed_pool_size(
-                            config.subscription.scope,
-                            config.dhan.max_websocket_connections,
-                        ) as f64;
-                    let slo_ws_expected_total: f64 =
-                        slo_ws_expected_main_feed + SLO_WS_EXPECTED_ORDER_UPDATE;
+                        /// Sum of expected connections across the four pools:
+                        /// Default = 12. Breakdown: 5 main feed, 4 depth-20 (NIFTY,
+                        /// BANKNIFTY, FINNIFTY, MIDCPNIFTY per pre-2026-04-25
+                        /// universe; rebuild reduced to 2 but pool capacity still
+                        /// permits 4), 2 depth-200 (NIFTY ATM CE/PE + BANKNIFTY
+                        /// ATM CE/PE), 1 order-update.
+                        ///
+                        /// Phase 0 Item 2 fix (operator-locked 2026-05-13,
+                        /// hostile-review CRITICAL #1): main-feed component
+                        /// scope-aware. Under `IndicesUnderlyingsOnly` the main
+                        /// pool is clamped to `PHASE_0_MAIN_FEED_CONNECTION_COUNT
+                        /// = 1`, so the expected denominator must match the
+                        /// effective pool size — otherwise `ws_health = 8/12 =
+                        /// 0.667` → `SLO-02 Critical` Telegram every 10s during
+                        /// market hours (pager fatigue).
+                        ///
+                        /// Phase 0 Item 3 (operator-locked 2026-05-13): depth-20
+                        /// + depth-200 expected components ALSO scope-aware via
+                        /// `should_spawn_depth_dynamic_pipeline`. Under
+                        /// `IndicesUnderlyingsOnly` the depth pipeline is parked
+                        /// → expected count is 0, matching the actual 0 active.
+                        /// Phase 0 denominator: `1 + 0 + 0 + 1 = 2` (matches
+                        /// active when main + OMS up → `ws_health = 1.0`).
+                        // PR #4 (2026-05-19): depth-20 + depth-200 expected
+                        // components dropped — depth pipelines retired entirely
+                        // per operator lock 2026-05-15.
+                        const SLO_WS_EXPECTED_ORDER_UPDATE: f64 = 1.0;
+                        let slo_ws_expected_main_feed: f64 =
+                            tickvault_common::config::effective_main_feed_pool_size(
+                                config.subscription.scope,
+                                config.dhan.max_websocket_connections,
+                            ) as f64;
+                        let slo_ws_expected_total: f64 =
+                            slo_ws_expected_main_feed + SLO_WS_EXPECTED_ORDER_UPDATE;
 
-                    /// Tick-freshness threshold during market hours: a tick
-                    /// gap >= this many seconds drives `tick_freshness = 0.0`.
-                    /// Aligned with the operator's "silent socket" boundary
-                    /// used elsewhere (the 60s pool watchdog).
-                    const SLO_TICK_FRESHNESS_DEGRADED_SECS: u64 = 30;
+                        /// Tick-freshness threshold during market hours: a tick
+                        /// gap >= this many seconds drives `tick_freshness = 0.0`.
+                        /// Aligned with the operator's "silent socket" boundary
+                        /// used elsewhere (the 60s pool watchdog).
+                        const SLO_TICK_FRESHNESS_DEGRADED_SECS: u64 = 30;
 
-                    /// Token headroom threshold: < this many seconds remaining
-                    /// drives `token_freshness = 0.0`. Aligned with
-                    /// `force_renewal_if_stale(threshold_secs = 14400)` used
-                    /// by the post-sleep WebSocket wake path (AUTH-GAP-03).
-                    const SLO_TOKEN_HEADROOM_THRESHOLD_SECS: u64 = 4 * 3600;
+                        /// Token headroom threshold: < this many seconds remaining
+                        /// drives `token_freshness = 0.0`. Aligned with
+                        /// `force_renewal_if_stale(threshold_secs = 14400)` used
+                        /// by the post-sleep WebSocket wake path (AUTH-GAP-03).
+                        const SLO_TOKEN_HEADROOM_THRESHOLD_SECS: u64 = 4 * 3600;
 
-                    // PR #509d: SLO_PHASE2_* grace constants retired with the
-                    // dispatcher chain. phase2_health is pinned to 1.0
-                    // unconditionally below.
+                        // PR #509d: SLO_PHASE2_* grace constants retired with the
+                        // dispatcher chain. phase2_health is pinned to 1.0
+                        // unconditionally below.
 
-                    /// Uniform boot-relative grace covering ALL six SLO
-                    /// dimensions (ws_health, qdb_health, tick_freshness,
-                    /// token_freshness, spill_health, phase2_health).
-                    /// During the first 60s after the scheduler starts,
-                    /// the composite score is pinned to `1.0` regardless
-                    /// of inputs.
-                    ///
-                    /// Rationale: at boot the scheduler's 10s tick can
-                    /// fire before all 12 expected WS connections are
-                    /// up (DEGRADED with weakest=ws_health) or before the
-                    /// tick-gap coalescer's 30s window has filled
-                    /// (CRITICAL with weakest=tick_freshness). Both are
-                    /// transient partial-state reads, not real
-                    /// degradation. Live incident 2026-04-28 15:06–15:07
-                    /// IST proved this: DEGRADED at boot+10s, CRITICAL
-                    /// at boot+60s, both recovered on their own once
-                    /// the system steady-stated.
-                    ///
-                    /// 60s is the same magnitude as the per-dimension
-                    /// grace and is comfortably longer than the typical
-                    /// boot settle window (~30s for connections + ~30s
-                    /// for tick-gap coalescer).
-                    const SLO_BOOT_UNIFORM_GRACE_SECS: u64 = 60;
+                        /// Uniform boot-relative grace covering ALL six SLO
+                        /// dimensions (ws_health, qdb_health, tick_freshness,
+                        /// token_freshness, spill_health, phase2_health).
+                        /// During the first 60s after the scheduler starts,
+                        /// the composite score is pinned to `1.0` regardless
+                        /// of inputs.
+                        ///
+                        /// Rationale: at boot the scheduler's 10s tick can
+                        /// fire before all 12 expected WS connections are
+                        /// up (DEGRADED with weakest=ws_health) or before the
+                        /// tick-gap coalescer's 30s window has filled
+                        /// (CRITICAL with weakest=tick_freshness). Both are
+                        /// transient partial-state reads, not real
+                        /// degradation. Live incident 2026-04-28 15:06–15:07
+                        /// IST proved this: DEGRADED at boot+10s, CRITICAL
+                        /// at boot+60s, both recovered on their own once
+                        /// the system steady-stated.
+                        ///
+                        /// 60s is the same magnitude as the per-dimension
+                        /// grace and is comfortably longer than the typical
+                        /// boot settle window (~30s for connections + ~30s
+                        /// for tick-gap coalescer).
+                        const SLO_BOOT_UNIFORM_GRACE_SECS: u64 = 60;
 
-                    /// Sample interval. SCOPE §13.1.
-                    const SLO_TICK_INTERVAL_SECS: u64 = 10;
+                        /// Sample interval. SCOPE §13.1.
+                        const SLO_TICK_INTERVAL_SECS: u64 = 10;
 
-                    /// Hard upper-bound for the per-tick QDB-readiness probe.
-                    /// Adversarial review (general-purpose, 2026-04-28
-                    /// HIGH #3): caps `wait_for_questdb_ready` so a hung
-                    /// TCP connect cannot stretch the 10s scheduler tick.
-                    const SLO_QDB_PROBE_TIMEOUT_SECS: u64 = 2;
+                        /// Hard upper-bound for the per-tick QDB-readiness probe.
+                        /// Adversarial review (general-purpose, 2026-04-28
+                        /// HIGH #3): caps `wait_for_questdb_ready` so a hung
+                        /// TCP connect cannot stretch the 10s scheduler tick.
+                        const SLO_QDB_PROBE_TIMEOUT_SECS: u64 = 2;
 
-                    /// Helper: returns true iff `now_ist_secs_of_day` falls
-                    /// inside the data-collection window
-                    /// `[09:00, 16:00)` IST. Off-hours we relax 3 of 6
-                    /// dimensions to avoid false-positive pages on
-                    /// by-design idle state.
-                    // Wave-Holiday-Gate (2026-05-09): delegate to the
-                    // canonical helper so weekend boots no longer drive
-                    // the SLO score to 0.0 via tick_freshness/ws_health.
-                    // The legacy `secs_of_day` argument is unused now;
-                    // call sites pass it but the helper ignores it.
-                    fn is_within_market_hours_ist(_now_ist_secs_of_day: u32) -> bool {
-                        tickvault_common::market_hours::is_within_trading_session_ist()
-                    }
+                        /// Helper: returns true iff `now_ist_secs_of_day` falls
+                        /// inside the data-collection window
+                        /// `[09:00, 16:00)` IST. Off-hours we relax 3 of 6
+                        /// dimensions to avoid false-positive pages on
+                        /// by-design idle state.
+                        // Wave-Holiday-Gate (2026-05-09): delegate to the
+                        // canonical helper so weekend boots no longer drive
+                        // the SLO score to 0.0 via tick_freshness/ws_health.
+                        // The legacy `secs_of_day` argument is unused now;
+                        // call sites pass it but the helper ignores it.
+                        fn is_within_market_hours_ist(_now_ist_secs_of_day: u32) -> bool {
+                            tickvault_common::market_hours::is_within_trading_session_ist()
+                        }
 
-                    let mut interval =
-                        tokio::time::interval(Duration::from_secs(SLO_TICK_INTERVAL_SECS));
-                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                    // Skip the immediate first tick — let other systems boot.
-                    interval.tick().await;
-
-                    // Edge-trigger state. Initial tier 0 (Healthy) so a
-                    // genuine first-tick Degraded/Critical fires Telegram
-                    // exactly once on the rising edge.
-                    let mut prev_tier: u8 = 0;
-                    // Spill delta tracker — saturate-subtract previous total
-                    // to detect any new drops in the last 10s.
-                    let mut last_spill_total: u64 = slo_health.ticks_spilled();
-                    // Scheduler boot instant — used by the boot-relative
-                    // Phase 2 grace below to suppress SLO-02 false-positive
-                    // on mid-market boots (live incident 2026-04-28).
-                    let scheduler_boot_at = std::time::Instant::now();
-
-                    info!("Wave 3-D SLO score scheduler: started (10s tick)");
-
-                    loop {
+                        let mut interval =
+                            tokio::time::interval(Duration::from_secs(SLO_TICK_INTERVAL_SECS));
+                        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        // Skip the immediate first tick — let other systems boot.
                         interval.tick().await;
 
-                        // Compute "now" in IST for market-hours + Phase 2
-                        // gates. `chrono::Utc::now()` is the canonical
-                        // wall-clock source per existing usage in this file.
-                        let now_utc_secs = chrono::Utc::now().timestamp();
-                        let now_ist_secs =
-                            now_utc_secs.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
-                        let secs_of_day =
-                            now_ist_secs.rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
-                        let in_market = is_within_market_hours_ist(secs_of_day);
+                        // Edge-trigger state. Initial tier 0 (Healthy) so a
+                        // genuine first-tick Degraded/Critical fires Telegram
+                        // exactly once on the rising edge.
+                        let mut prev_tier: u8 = 0;
+                        // Spill delta tracker — saturate-subtract previous total
+                        // to detect any new drops in the last 10s.
+                        let mut last_spill_total: u64 = slo_health.ticks_spilled();
+                        // Scheduler boot instant — used by the boot-relative
+                        // Phase 2 grace below to suppress SLO-02 false-positive
+                        // on mid-market boots (live incident 2026-04-28).
+                        let scheduler_boot_at = std::time::Instant::now();
 
-                        // ---- WS_health -----------------------------------
-                        let active_main = slo_health.websocket_connections() as f64;
-                        let active_ou = if slo_health.order_update_connected() {
-                            1.0
-                        } else {
-                            0.0
-                        };
-                        let active_total = active_main + active_ou;
-                        let raw_ws_health = active_total / slo_ws_expected_total;
-                        // Off-hours: by-design sleeping connections must
-                        // NOT degrade the SLO. Pin to 1.0.
-                        let ws_health = if !in_market { 1.0 } else { raw_ws_health };
+                        info!("Wave 3-D SLO score scheduler: started (10s tick)");
 
-                        // ---- QDB_health ---------------------------------
-                        // 1s probe wrapped in tokio::time::timeout(2s) as a
-                        // hard upper-bound. Adversarial review (general-
-                        // purpose, 2026-04-28 HIGH #3): the boot probe's
-                        // internal max_wait_secs may not strictly cap on a
-                        // hung TCP connect (OS-default connect timeout can
-                        // be 20-75s). Timeout-bounding here keeps the 10s
-                        // scheduler interval from compounding into a
-                        // slow-loop under prolonged QDB outages.
-                        let qdb_ok = tokio::time::timeout(
-                            Duration::from_secs(SLO_QDB_PROBE_TIMEOUT_SECS),
-                            tickvault_storage::boot_probe::wait_for_questdb_ready(&slo_qcfg, 1),
-                        )
-                        .await
-                        .is_ok_and(|res| res.is_ok());
-                        let qdb_health = if qdb_ok { 1.0 } else { 0.0 };
+                        loop {
+                            interval.tick().await;
 
-                        // ---- Tick_freshness ------------------------------
-                        // 2026-05-26: INDIA VIX (SID 21) is a derived
-                        // volatility index that legitimately ticks every
-                        // 30-60s during quiet sessions — its silence is
-                        // not a degradation, so excluding it stops the
-                        // SLO-02 flap the operator saw on 2026-05-26.
-                        // We scan the top-N gaps and take the worst that
-                        // is NOT a SLO-excluded SID. N=10 is comfortably
-                        // above 4 (the entire universe) so we always see
-                        // the full picture when called.
-                        const SLO_TICK_FRESHNESS_EXCLUDED_SIDS: &[u32] = &[21]; // INDIA VIX
-                        const SLO_TICK_FRESHNESS_SCAN_TOP_N: usize = 10;
-                        let tick_freshness = if !in_market {
-                            1.0
-                        } else {
-                            let worst_gap = tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
+                            // Compute "now" in IST for market-hours + Phase 2
+                            // gates. `chrono::Utc::now()` is the canonical
+                            // wall-clock source per existing usage in this file.
+                            let now_utc_secs = chrono::Utc::now().timestamp();
+                            let now_ist_secs =
+                                now_utc_secs.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+                            let secs_of_day =
+                                now_ist_secs.rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
+                            let in_market = is_within_market_hours_ist(secs_of_day);
+
+                            // ---- WS_health -----------------------------------
+                            let active_main = slo_health.websocket_connections() as f64;
+                            let active_ou = if slo_health.order_update_connected() {
+                                1.0
+                            } else {
+                                0.0
+                            };
+                            let active_total = active_main + active_ou;
+                            let raw_ws_health = active_total / slo_ws_expected_total;
+                            // Off-hours: by-design sleeping connections must
+                            // NOT degrade the SLO. Pin to 1.0.
+                            let ws_health = if !in_market { 1.0 } else { raw_ws_health };
+
+                            // ---- QDB_health ---------------------------------
+                            // 1s probe wrapped in tokio::time::timeout(2s) as a
+                            // hard upper-bound. Adversarial review (general-
+                            // purpose, 2026-04-28 HIGH #3): the boot probe's
+                            // internal max_wait_secs may not strictly cap on a
+                            // hung TCP connect (OS-default connect timeout can
+                            // be 20-75s). Timeout-bounding here keeps the 10s
+                            // scheduler interval from compounding into a
+                            // slow-loop under prolonged QDB outages.
+                            let qdb_ok = tokio::time::timeout(
+                                Duration::from_secs(SLO_QDB_PROBE_TIMEOUT_SECS),
+                                tickvault_storage::boot_probe::wait_for_questdb_ready(&slo_qcfg, 1),
+                            )
+                            .await
+                            .is_ok_and(|res| res.is_ok());
+                            let qdb_health = if qdb_ok { 1.0 } else { 0.0 };
+
+                            // ---- Tick_freshness ------------------------------
+                            // 2026-05-26: INDIA VIX (SID 21) is a derived
+                            // volatility index that legitimately ticks every
+                            // 30-60s during quiet sessions — its silence is
+                            // not a degradation, so excluding it stops the
+                            // SLO-02 flap the operator saw on 2026-05-26.
+                            // We scan the top-N gaps and take the worst that
+                            // is NOT a SLO-excluded SID. N=10 is comfortably
+                            // above 4 (the entire universe) so we always see
+                            // the full picture when called.
+                            const SLO_TICK_FRESHNESS_EXCLUDED_SIDS: &[u32] = &[21]; // INDIA VIX
+                            const SLO_TICK_FRESHNESS_SCAN_TOP_N: usize = 10;
+                            let tick_freshness = if !in_market {
+                                1.0
+                            } else {
+                                let worst_gap = tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
                                 .map(|d| {
                                     let (top, _total) = d.scan_gaps_top_n(
                                         Instant::now(),
@@ -4306,871 +4235,851 @@ async fn main() -> Result<()> {
                                         .unwrap_or(0)
                                 })
                                 .unwrap_or(0);
-                            if worst_gap < SLO_TICK_FRESHNESS_DEGRADED_SECS {
+                                if worst_gap < SLO_TICK_FRESHNESS_DEGRADED_SECS {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            };
+
+                            // ---- Token_freshness -----------------------------
+                            let token_secs =
+                                tickvault_core::auth::token_manager::global_token_manager()
+                                    .map(|tm| tm.seconds_until_expiry())
+                                    .unwrap_or(0);
+                            let token_freshness = if token_secs > SLO_TOKEN_HEADROOM_THRESHOLD_SECS
+                            {
                                 1.0
                             } else {
                                 0.0
-                            }
-                        };
+                            };
 
-                        // ---- Token_freshness -----------------------------
-                        let token_secs =
-                            tickvault_core::auth::token_manager::global_token_manager()
-                                .map(|tm| tm.seconds_until_expiry())
-                                .unwrap_or(0);
-                        let token_freshness = if token_secs > SLO_TOKEN_HEADROOM_THRESHOLD_SECS {
-                            1.0
-                        } else {
-                            0.0
-                        };
+                            // ---- Spill_health --------------------------------
+                            // Delta over the last 10s sample window. Strict
+                            // signal — any new drop drives 0.0 for one tick.
+                            let cur_spill = slo_health.ticks_spilled();
+                            let spill_delta = cur_spill.saturating_sub(last_spill_total);
+                            last_spill_total = cur_spill;
+                            let spill_health = if spill_delta == 0 { 1.0 } else { 0.0 };
 
-                        // ---- Spill_health --------------------------------
-                        // Delta over the last 10s sample window. Strict
-                        // signal — any new drop drives 0.0 for one tick.
-                        let cur_spill = slo_health.ticks_spilled();
-                        let spill_delta = cur_spill.saturating_sub(last_spill_total);
-                        last_spill_total = cur_spill;
-                        let spill_health = if spill_delta == 0 { 1.0 } else { 0.0 };
+                            // ---- Phase2_health -------------------------------
+                            // PR #509d (Wave-5 §R.1): the legacy Phase 2 dispatcher
+                            // was retired. The phase2_health SLO dimension is
+                            // permanently pinned to 1.0 — the dispatcher chain no
+                            // longer exists, there is no outcome to consult.
+                            // Future scope re-enabling stock F&O will introduce a
+                            // new dispatch path with its own health dimension.
+                            let phase2_health = 1.0_f64;
 
-                        // ---- Phase2_health -------------------------------
-                        // PR #509d (Wave-5 §R.1): the legacy Phase 2 dispatcher
-                        // was retired. The phase2_health SLO dimension is
-                        // permanently pinned to 1.0 — the dispatcher chain no
-                        // longer exists, there is no outcome to consult.
-                        // Future scope re-enabling stock F&O will introduce a
-                        // new dispatch path with its own health dimension.
-                        let phase2_health = 1.0_f64;
+                            let inputs = SloInputs {
+                                ws_health,
+                                qdb_health,
+                                tick_freshness,
+                                token_freshness,
+                                spill_health,
+                                phase2_health,
+                            };
+                            // Uniform boot grace: pin Healthy across ALL
+                            // dimensions during the first 60s after the
+                            // scheduler started. See
+                            // SLO_BOOT_UNIFORM_GRACE_SECS docstring.
+                            let outcome = if scheduler_boot_at.elapsed().as_secs()
+                                < SLO_BOOT_UNIFORM_GRACE_SECS
+                            {
+                                SloOutcome::Healthy { score: 1.0 }
+                            } else {
+                                evaluate_slo_score(&inputs)
+                            };
 
-                        let inputs = SloInputs {
-                            ws_health,
-                            qdb_health,
-                            tick_freshness,
-                            token_freshness,
-                            spill_health,
-                            phase2_health,
-                        };
-                        // Uniform boot grace: pin Healthy across ALL
-                        // dimensions during the first 60s after the
-                        // scheduler started. See
-                        // SLO_BOOT_UNIFORM_GRACE_SECS docstring.
-                        let outcome = if scheduler_boot_at.elapsed().as_secs()
-                            < SLO_BOOT_UNIFORM_GRACE_SECS
-                        {
-                            SloOutcome::Healthy { score: 1.0 }
-                        } else {
-                            evaluate_slo_score(&inputs)
-                        };
+                            // Always emit gauges (operator dashboard reads them
+                            // in real-time, off-hours included). Clamp each
+                            // per-dimension gauge value into [0, 1] before
+                            // emit so that a future regression that lets a
+                            // raw f64 (e.g. NaN from div-by-zero or > 1.0
+                            // from a misconfigured `slo_ws_expected_total`)
+                            // cannot pollute the dashboard. `evaluate_slo_score`
+                            // already clamps internally for the composite —
+                            // this is the same defense for the per-dimension
+                            // panels (hot-path-reviewer hardening, 2026-04-28).
+                            let dim_clamp = |v: f64| -> f64 {
+                                if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) }
+                            };
+                            metrics::gauge!("tv_realtime_guarantee_score").set(outcome.score());
+                            metrics::gauge!(
+                                "tv_realtime_guarantee_dimension",
+                                "name" => "ws_health"
+                            )
+                            .set(dim_clamp(ws_health));
+                            metrics::gauge!(
+                                "tv_realtime_guarantee_dimension",
+                                "name" => "qdb_health"
+                            )
+                            .set(dim_clamp(qdb_health));
+                            metrics::gauge!(
+                                "tv_realtime_guarantee_dimension",
+                                "name" => "tick_freshness"
+                            )
+                            .set(dim_clamp(tick_freshness));
+                            metrics::gauge!(
+                                "tv_realtime_guarantee_dimension",
+                                "name" => "token_freshness"
+                            )
+                            .set(dim_clamp(token_freshness));
+                            metrics::gauge!(
+                                "tv_realtime_guarantee_dimension",
+                                "name" => "spill_health"
+                            )
+                            .set(dim_clamp(spill_health));
+                            metrics::gauge!(
+                                "tv_realtime_guarantee_dimension",
+                                "name" => "phase2_health"
+                            )
+                            .set(dim_clamp(phase2_health));
 
-                        // Always emit gauges (operator dashboard reads them
-                        // in real-time, off-hours included). Clamp each
-                        // per-dimension gauge value into [0, 1] before
-                        // emit so that a future regression that lets a
-                        // raw f64 (e.g. NaN from div-by-zero or > 1.0
-                        // from a misconfigured `slo_ws_expected_total`)
-                        // cannot pollute the dashboard. `evaluate_slo_score`
-                        // already clamps internally for the composite —
-                        // this is the same defense for the per-dimension
-                        // panels (hot-path-reviewer hardening, 2026-04-28).
-                        let dim_clamp =
-                            |v: f64| -> f64 { if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) } };
-                        metrics::gauge!("tv_realtime_guarantee_score").set(outcome.score());
-                        metrics::gauge!(
-                            "tv_realtime_guarantee_dimension",
-                            "name" => "ws_health"
-                        )
-                        .set(dim_clamp(ws_health));
-                        metrics::gauge!(
-                            "tv_realtime_guarantee_dimension",
-                            "name" => "qdb_health"
-                        )
-                        .set(dim_clamp(qdb_health));
-                        metrics::gauge!(
-                            "tv_realtime_guarantee_dimension",
-                            "name" => "tick_freshness"
-                        )
-                        .set(dim_clamp(tick_freshness));
-                        metrics::gauge!(
-                            "tv_realtime_guarantee_dimension",
-                            "name" => "token_freshness"
-                        )
-                        .set(dim_clamp(token_freshness));
-                        metrics::gauge!(
-                            "tv_realtime_guarantee_dimension",
-                            "name" => "spill_health"
-                        )
-                        .set(dim_clamp(spill_health));
-                        metrics::gauge!(
-                            "tv_realtime_guarantee_dimension",
-                            "name" => "phase2_health"
-                        )
-                        .set(dim_clamp(phase2_health));
+                            let cur_tier = outcome.tier();
 
-                        let cur_tier = outcome.tier();
-
-                        // 2026-05-11 hotfix v3 — Telegram-suppress ALL three
-                        // SLO transitions (Degraded, Critical, Healthy).
-                        // Operator directive: the composite SLO score is
-                        // computed from six dimensions (ws_health,
-                        // qdb_health, tick_freshness, token_freshness,
-                        // spill_health, phase2_health) and the underlying
-                        // typed errors for each dimension (WS-GAP-06,
-                        // BOOT-01/02, AUTH-GAP-03, STORAGE-GAP-03,
-                        // PHASE2-01) ALREADY fire their own Telegram alerts.
-                        // SLO-02 paging is duplicate operator noise — the
-                        // 10s scheduler flaps multiple times per minute
-                        // because `tick_freshness` momentarily reads 0 when
-                        // illiquid IDX_I instruments don't tick within the
-                        // 30s window (normal market behaviour). Keep the
-                        // log (warn / info) + counter for the
-                        // operator-health Grafana dashboard, but DO NOT
-                        // dispatch to the notification service.
-                        // Defense-in-depth: events.rs also demotes
-                        // `RealtimeGuaranteeCritical` to Severity::Low so
-                        // any accidental future notify() call still does
-                        // not page.
-                        if in_market {
-                            if cur_tier > prev_tier {
-                                match &outcome {
-                                    SloOutcome::Healthy { .. } => {
-                                        // Cannot reach: tier 0 is Healthy
-                                        // and prev_tier > 0 contradicts
-                                        // cur_tier > prev_tier with
-                                        // cur_tier == 0. Defensive only.
+                            // 2026-05-11 hotfix v3 — Telegram-suppress ALL three
+                            // SLO transitions (Degraded, Critical, Healthy).
+                            // Operator directive: the composite SLO score is
+                            // computed from six dimensions (ws_health,
+                            // qdb_health, tick_freshness, token_freshness,
+                            // spill_health, phase2_health) and the underlying
+                            // typed errors for each dimension (WS-GAP-06,
+                            // BOOT-01/02, AUTH-GAP-03, STORAGE-GAP-03,
+                            // PHASE2-01) ALREADY fire their own Telegram alerts.
+                            // SLO-02 paging is duplicate operator noise — the
+                            // 10s scheduler flaps multiple times per minute
+                            // because `tick_freshness` momentarily reads 0 when
+                            // illiquid IDX_I instruments don't tick within the
+                            // 30s window (normal market behaviour). Keep the
+                            // log (warn / info) + counter for the
+                            // operator-health Grafana dashboard, but DO NOT
+                            // dispatch to the notification service.
+                            // Defense-in-depth: events.rs also demotes
+                            // `RealtimeGuaranteeCritical` to Severity::Low so
+                            // any accidental future notify() call still does
+                            // not page.
+                            if in_market {
+                                if cur_tier > prev_tier {
+                                    match &outcome {
+                                        SloOutcome::Healthy { .. } => {
+                                            // Cannot reach: tier 0 is Healthy
+                                            // and prev_tier > 0 contradicts
+                                            // cur_tier > prev_tier with
+                                            // cur_tier == 0. Defensive only.
+                                        }
+                                        SloOutcome::Degraded { score, weakest } => {
+                                            warn!(
+                                                code = ErrorCode::Slo02Degraded.code_str(),
+                                                score = *score,
+                                                weakest = weakest,
+                                                "SLO score crossed below 0.95 — DEGRADED (log-only, Telegram suppressed)"
+                                            );
+                                        }
+                                        SloOutcome::Critical { score, weakest } => {
+                                            warn!(
+                                                code = ErrorCode::Slo02Degraded.code_str(),
+                                                score = *score,
+                                                weakest = weakest,
+                                                "SLO score crossed below 0.80 — CRITICAL (log-only, Telegram suppressed)"
+                                            );
+                                        }
                                     }
-                                    SloOutcome::Degraded { score, weakest } => {
-                                        warn!(
-                                            code = ErrorCode::Slo02Degraded.code_str(),
-                                            score = *score,
-                                            weakest = weakest,
-                                            "SLO score crossed below 0.95 — DEGRADED (log-only, Telegram suppressed)"
-                                        );
-                                    }
-                                    SloOutcome::Critical { score, weakest } => {
-                                        warn!(
-                                            code = ErrorCode::Slo02Degraded.code_str(),
-                                            score = *score,
-                                            weakest = weakest,
-                                            "SLO score crossed below 0.80 — CRITICAL (log-only, Telegram suppressed)"
-                                        );
-                                    }
+                                } else if cur_tier < prev_tier && cur_tier == 0 {
+                                    // Recovery to Healthy — log-only (no
+                                    // Telegram ping per operator directive
+                                    // 2026-05-11; the underlying typed events
+                                    // already announced their own recovery).
+                                    info!(
+                                        code = ErrorCode::Slo01Healthy.code_str(),
+                                        score = outcome.score(),
+                                        "SLO score recovered to healthy (log-only, Telegram suppressed)"
+                                    );
                                 }
-                            } else if cur_tier < prev_tier && cur_tier == 0 {
-                                // Recovery to Healthy — log-only (no
-                                // Telegram ping per operator directive
-                                // 2026-05-11; the underlying typed events
-                                // already announced their own recovery).
-                                info!(
-                                    code = ErrorCode::Slo01Healthy.code_str(),
-                                    score = outcome.score(),
-                                    "SLO score recovered to healthy (log-only, Telegram suppressed)"
-                                );
                             }
-                        }
-                        prev_tier = cur_tier;
+                            prev_tier = cur_tier;
 
-                        metrics::counter!(
-                            "tv_realtime_guarantee_evaluations_total",
-                            "tier" => outcome.outcome_str()
-                        )
-                        .increment(1);
-                    }
-                });
+                            metrics::counter!(
+                                "tv_realtime_guarantee_evaluations_total",
+                                "tier" => outcome.outcome_str()
+                            )
+                            .increment(1);
+                        }
+                    });
+                }
             }
         }
-    }
 
-    // -----------------------------------------------------------------------
-    // Step 9.5: Historical candle fetch — RETIRED (PR-C 2026-05-26)
-    // Operator directive 2026-05-26 removed the entire Dhan historical
-    // fetch chain (candle_fetcher + cross_verify + post_open_cross_check
-    // + cross_verify_scheduler + post_market_fetch_window). Spot-only
-    // NIFTY 50 strategy locked; no VWAP, no futures, no historical fetch.
-    // -----------------------------------------------------------------------
+        // -----------------------------------------------------------------------
+        // Step 9.5: Historical candle fetch — RETIRED (PR-C 2026-05-26)
+        // Operator directive 2026-05-26 removed the entire Dhan historical
+        // fetch chain (candle_fetcher + cross_verify + post_open_cross_check
+        // + cross_verify_scheduler + post_market_fetch_window). Spot-only
+        // NIFTY 50 strategy locked; no VWAP, no futures, no historical fetch.
+        // -----------------------------------------------------------------------
 
-    // -----------------------------------------------------------------------
-    // Step 9.6: Background greeks pipeline (option chain fetch → compute → persist)
-    //
-    // Phase 0 Item 7 follow-up (operator-locked 2026-05-13): this second
-    // PR #3 (2026-05-19): greeks pipeline RETIRED — see slow-boot site
-    // earlier in this file for the full rationale.
-    // -----------------------------------------------------------------------
-    info!("greeks pipeline retired (PR #3)");
+        // -----------------------------------------------------------------------
+        // Step 9.6: Background greeks pipeline (option chain fetch → compute → persist)
+        //
+        // Phase 0 Item 7 follow-up (operator-locked 2026-05-13): this second
+        // PR #3 (2026-05-19): greeks pipeline RETIRED — see slow-boot site
+        // earlier in this file for the full rationale.
+        // -----------------------------------------------------------------------
+        info!("greeks pipeline retired (PR #3)");
 
-    // -----------------------------------------------------------------------
-    // Option-chain minute-snapshot scheduler (PR #5 of 5 — 2026-05-16)
-    //
-    // Drives the 3-times-per-minute Dhan option-chain fetch (operator-
-    // locked schedule: SENSEX :53 / BANKNIFTY :56 / NIFTY :59) into a
-    // shared RAM cache that the future BRUTEX strategy reads from.
-    //
-    // The scheduler is opt-in (`config.option_chain_minute_snapshot.enabled
-    // = false` by default) so a fresh deployment doesn't surprise-fetch.
-    //
-    // Boot-time validator (`option_chain_schedule::validate_option_chain_schedule`)
-    // runs before spawn — invalid TOML HALTs the app via
-    // `OptionChainConfigInvalid` Severity::Critical Telegram instead of
-    // silently running a broken schedule.
-    //
-    // See `.claude/plans/friday-may-15-mega/topic-OPTION-CHAIN-MINUTE-SNAPSHOT.md`.
-    // -----------------------------------------------------------------------
-    if config.option_chain_minute_snapshot.enabled {
-        match tickvault_common::option_chain_schedule::validate_option_chain_schedule(
-            &config.option_chain_minute_snapshot.underlyings,
-        ) {
-            Ok(()) => {
-                info!(
-                    underlyings = config.option_chain_minute_snapshot.underlyings.len(),
-                    "option-chain minute-snapshot schedule validated — spawning scheduler"
-                );
-                let oc_token = token_handle.clone();
-                let oc_client_id = ws_client_id.clone();
-                let oc_base_url = config.dhan.rest_api_base_url.clone();
-                let oc_config = config.option_chain_minute_snapshot.clone();
-                let oc_notifier = notifier.clone();
-                let oc_cache = tickvault_core::option_chain::snapshot_cache::SnapshotCache::new();
-                // The cache handle is stored on the app-wide state in
-                // a follow-up so the future strategy can read from it.
-                // For now (PR #5), spawning is sufficient — the cache
-                // accumulates snapshots ready for the next consumer.
-                // Clone OWNED inputs once so the warmup-client constructor
-                // below (which also takes ownership) can reuse them.
-                let oc_token_for_warmup = oc_token.clone();
-                let oc_client_id_for_warmup = oc_client_id.clone();
-                let oc_base_url_for_warmup = oc_base_url.clone();
+        // -----------------------------------------------------------------------
+        // Option-chain minute-snapshot scheduler (PR #5 of 5 — 2026-05-16)
+        //
+        // Drives the 3-times-per-minute Dhan option-chain fetch (operator-
+        // locked schedule: SENSEX :53 / BANKNIFTY :56 / NIFTY :59) into a
+        // shared RAM cache that the future BRUTEX strategy reads from.
+        //
+        // The scheduler is opt-in (`config.option_chain_minute_snapshot.enabled
+        // = false` by default) so a fresh deployment doesn't surprise-fetch.
+        //
+        // Boot-time validator (`option_chain_schedule::validate_option_chain_schedule`)
+        // runs before spawn — invalid TOML HALTs the app via
+        // `OptionChainConfigInvalid` Severity::Critical Telegram instead of
+        // silently running a broken schedule.
+        //
+        // See `.claude/plans/friday-may-15-mega/topic-OPTION-CHAIN-MINUTE-SNAPSHOT.md`.
+        // -----------------------------------------------------------------------
+        if config.option_chain_minute_snapshot.enabled {
+            match tickvault_common::option_chain_schedule::validate_option_chain_schedule(
+                &config.option_chain_minute_snapshot.underlyings,
+            ) {
+                Ok(()) => {
+                    info!(
+                        underlyings = config.option_chain_minute_snapshot.underlyings.len(),
+                        "option-chain minute-snapshot schedule validated — spawning scheduler"
+                    );
+                    let oc_token = token_handle.clone();
+                    let oc_client_id = ws_client_id.clone();
+                    let oc_base_url = config.dhan.rest_api_base_url.clone();
+                    let oc_config = config.option_chain_minute_snapshot.clone();
+                    let oc_notifier = notifier.clone();
+                    let oc_cache =
+                        tickvault_core::option_chain::snapshot_cache::SnapshotCache::new();
+                    // The cache handle is stored on the app-wide state in
+                    // a follow-up so the future strategy can read from it.
+                    // For now (PR #5), spawning is sufficient — the cache
+                    // accumulates snapshots ready for the next consumer.
+                    // Clone OWNED inputs once so the warmup-client constructor
+                    // below (which also takes ownership) can reuse them.
+                    let oc_token_for_warmup = oc_token.clone();
+                    let oc_client_id_for_warmup = oc_client_id.clone();
+                    let oc_base_url_for_warmup = oc_base_url.clone();
 
-                match tickvault_core::option_chain::client::OptionChainClient::new(
-                    oc_token,
-                    oc_client_id,
-                    oc_base_url,
-                ) {
-                    Ok(oc_client) => {
-                        // 2026-05-25 — Per-day current-expiry cache.
-                        // Shared between (a) boot REHYDRATE from
-                        // QuestDB (`option_chain_cache_loader`),
-                        // (b) 09:00:30 IST warmup task
-                        // (`expiry_warmup::spawn_expiry_warmup_task`),
-                        // and (c) the minute-snapshot scheduler
-                        // (`spawn_snapshot_scheduler`). All three hold
-                        // cloned handles to the same papaya map.
-                        let current_expiry_cache = tickvault_core::option_chain::current_expiry_cache::CurrentExpiryCache::new();
+                    match tickvault_core::option_chain::client::OptionChainClient::new(
+                        oc_token,
+                        oc_client_id,
+                        oc_base_url,
+                    ) {
+                        Ok(oc_client) => {
+                            // 2026-05-25 — Per-day current-expiry cache.
+                            // Shared between (a) boot REHYDRATE from
+                            // QuestDB (`option_chain_cache_loader`),
+                            // (b) 09:00:30 IST warmup task
+                            // (`expiry_warmup::spawn_expiry_warmup_task`),
+                            // and (c) the minute-snapshot scheduler
+                            // (`spawn_snapshot_scheduler`). All three hold
+                            // cloned handles to the same papaya map.
+                            let current_expiry_cache = tickvault_core::option_chain::current_expiry_cache::CurrentExpiryCache::new();
 
-                        // L3 RECONCILE — rehydrate cache from QuestDB
-                        // (fast crash recovery, <1s). Logs at
-                        // info!/warn!/error! per outcome.
-                        tickvault_app::option_chain_cache_loader::rehydrate_and_log(
-                            &config.questdb,
-                            &current_expiry_cache,
-                        )
-                        .await;
+                            // L3 RECONCILE — rehydrate cache from QuestDB
+                            // (fast crash recovery, <1s). Logs at
+                            // info!/warn!/error! per outcome.
+                            tickvault_app::option_chain_cache_loader::rehydrate_and_log(
+                                &config.questdb,
+                                &current_expiry_cache,
+                            )
+                            .await;
 
-                        // L4 PREVENT — daily 09:00:30 IST warmup task.
-                        // Reuses the same token/client_id/base_url
-                        // constructors as the scheduler.
-                        match tickvault_core::option_chain::client::OptionChainClient::new(
-                            oc_token_for_warmup,
-                            oc_client_id_for_warmup,
-                            oc_base_url_for_warmup,
-                        ) {
-                            Ok(warmup_client) => {
-                                let _warmup_handle = tickvault_core::option_chain::expiry_warmup::spawn_expiry_warmup_task(
+                            // L4 PREVENT — daily 09:00:30 IST warmup task.
+                            // Reuses the same token/client_id/base_url
+                            // constructors as the scheduler.
+                            match tickvault_core::option_chain::client::OptionChainClient::new(
+                                oc_token_for_warmup,
+                                oc_client_id_for_warmup,
+                                oc_base_url_for_warmup,
+                            ) {
+                                Ok(warmup_client) => {
+                                    let _warmup_handle = tickvault_core::option_chain::expiry_warmup::spawn_expiry_warmup_task(
                                     warmup_client,
                                     current_expiry_cache.clone(),
                                     oc_notifier.clone(),
                                 );
-                                info!("option-chain 09:00:30 IST expiry warmup task spawned");
-                            }
-                            Err(err) => {
-                                error!(
-                                    ?err,
-                                    "option-chain warmup client construction failed — \
+                                    info!("option-chain 09:00:30 IST expiry warmup task spawned");
+                                }
+                                Err(err) => {
+                                    error!(
+                                        ?err,
+                                        "option-chain warmup client construction failed — \
                                      warmup task NOT spawned (scheduler will inline-fallback)"
-                                );
+                                    );
+                                }
                             }
-                        }
 
-                        let _ = tickvault_core::option_chain::snapshot_scheduler::spawn_snapshot_scheduler(
+                            let _ = tickvault_core::option_chain::snapshot_scheduler::spawn_snapshot_scheduler(
                             oc_config,
                             oc_client,
                             oc_cache,
                             current_expiry_cache,
                             oc_notifier,
                         );
-                        info!("option-chain minute-snapshot scheduler spawned");
-                    }
-                    Err(err) => {
-                        error!(
-                            ?err,
-                            "option-chain client construction failed — scheduler NOT spawned"
-                        );
+                            info!("option-chain minute-snapshot scheduler spawned");
+                        }
+                        Err(err) => {
+                            error!(
+                                ?err,
+                                "option-chain client construction failed — scheduler NOT spawned"
+                            );
+                        }
                     }
                 }
+                Err(schedule_err) => {
+                    // Operator-charter §F: invalid config is a HALT-class
+                    // event. Fire the typed Telegram + exit instead of
+                    // silently disabling the feature.
+                    error!(
+                        error = %schedule_err,
+                        "option-chain schedule INVALID — refusing to spawn scheduler"
+                    );
+                    notifier.notify(
+                        tickvault_core::notification::NotificationEvent::OptionChainConfigInvalid {
+                            reason: schedule_err.to_string(),
+                        },
+                    );
+                }
             }
-            Err(schedule_err) => {
-                // Operator-charter §F: invalid config is a HALT-class
-                // event. Fire the typed Telegram + exit instead of
-                // silently disabling the feature.
-                error!(
-                    error = %schedule_err,
-                    "option-chain schedule INVALID — refusing to spawn scheduler"
-                );
-                notifier.notify(
-                    tickvault_core::notification::NotificationEvent::OptionChainConfigInvalid {
-                        reason: schedule_err.to_string(),
-                    },
-                );
-            }
+        } else {
+            info!("option-chain minute-snapshot pipeline disabled in config");
         }
-    } else {
-        info!("option-chain minute-snapshot pipeline disabled in config");
-    }
 
-    // -----------------------------------------------------------------------
-    // Step 10: Spawn order update WebSocket connection
-    // -----------------------------------------------------------------------
-    let (order_update_sender, _order_update_receiver) =
-        tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(
-            tickvault_common::constants::ORDER_UPDATE_BROADCAST_CAPACITY,
-        );
+        // -----------------------------------------------------------------------
+        // Step 10: Spawn order update WebSocket connection
+        // -----------------------------------------------------------------------
+        // D2 Stage 2: the `order_update_sender` broadcast is now created ONCE in the
+        // hoisted `build_shared_infra` prefix and destructured into `main()` scope
+        // above. This lane references that SAME sender for the WAL-replay drain, the
+        // order-update WS publisher, and the trading-pipeline subscriber.
 
-    // STAGE-C.2b: Slow-boot mirror of the fast-boot order-update replay
-    // drain. Drains recovered JSON frames into the live broadcast before
-    // the WebSocket starts.
-    if !ws_wal_replay_order_update.is_empty() {
-        let frames = std::mem::take(&mut ws_wal_replay_order_update);
-        let (parsed, broadcast_count, parse_errors) =
-            tickvault_app::boot_helpers::drain_replayed_order_updates_to_broadcast(
-                frames,
-                &order_update_sender,
+        // STAGE-C.2b: Slow-boot mirror of the fast-boot order-update replay
+        // drain. Drains recovered JSON frames into the live broadcast before
+        // the WebSocket starts.
+        if !ws_wal_replay_order_update.is_empty() {
+            let frames = std::mem::take(&mut ws_wal_replay_order_update);
+            let (parsed, broadcast_count, parse_errors) =
+                tickvault_app::boot_helpers::drain_replayed_order_updates_to_broadcast(
+                    frames,
+                    &order_update_sender,
+                );
+            info!(
+                parsed,
+                broadcast_count,
+                parse_errors,
+                "STAGE-C.2b: OrderUpdate WAL replay drain complete (slow boot)"
             );
-        info!(
-            parsed,
-            broadcast_count,
-            parse_errors,
-            "STAGE-C.2b: OrderUpdate WAL replay drain complete (slow boot)"
-        );
-        metrics::counter!(
-            "tv_ws_frame_wal_reinjected_total",
-            "ws_type" => "order_update"
-        )
-        .increment(broadcast_count);
-        if parse_errors > 0 {
             metrics::counter!(
-                "tv_ws_frame_wal_reinjected_parse_errors_total",
+                "tv_ws_frame_wal_reinjected_total",
                 "ws_type" => "order_update"
             )
-            .increment(parse_errors);
+            .increment(broadcast_count);
+            if parse_errors > 0 {
+                metrics::counter!(
+                    "tv_ws_frame_wal_reinjected_parse_errors_total",
+                    "ws_type" => "order_update"
+                )
+                .increment(parse_errors);
+            }
         }
-    }
 
-    let order_update_handle = {
-        let url = config.dhan.order_update_websocket_url.clone();
-        let order_ws_client_id = ws_client_id.clone();
-        let token = token_manager.token_handle();
-        let sender = order_update_sender.clone();
-        let cal = trading_calendar.clone();
-        let ou_notifier = notifier.clone();
-        let ou_connect_notifier = notifier.clone();
-        let ou_health = health_status.clone();
-        let ou_wal_spill = ws_frame_spill.clone();
-        // O2 (2026-04-17): authenticated signal — fires once after first
-        // successful parse_order_update or AuthResponseKind::Success. The
-        // `OrderUpdateConnected` event below is "task spawned" semantics;
-        // `OrderUpdateAuthenticated` is "Dhan accepted the token and is
-        // streaming". Operators see both so they know where in the handshake
-        // they are.
-        let auth_signal = std::sync::Arc::new(tokio::sync::Notify::new());
-        let auth_latch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let order_update_handle = {
+            let url = config.dhan.order_update_websocket_url.clone();
+            let order_ws_client_id = ws_client_id.clone();
+            let token = token_manager.token_handle();
+            let sender = order_update_sender.clone();
+            let cal = trading_calendar.clone();
+            let ou_notifier = notifier.clone();
+            let ou_connect_notifier = notifier.clone();
+            let ou_health = health_status.clone();
+            let ou_wal_spill = ws_frame_spill.clone();
+            // O2 (2026-04-17): authenticated signal — fires once after first
+            // successful parse_order_update or AuthResponseKind::Success. The
+            // `OrderUpdateConnected` event below is "task spawned" semantics;
+            // `OrderUpdateAuthenticated` is "Dhan accepted the token and is
+            // streaming". Operators see both so they know where in the handshake
+            // they are.
+            let auth_signal = std::sync::Arc::new(tokio::sync::Notify::new());
+            let auth_latch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            {
+                let listener_signal = std::sync::Arc::clone(&auth_signal);
+                let listener_notifier = notifier.clone();
+                tokio::spawn(async move {
+                    listener_signal.notified().await;
+                    listener_notifier.notify(NotificationEvent::OrderUpdateAuthenticated);
+                });
+            }
+            let run_signal = Some(std::sync::Arc::clone(&auth_signal));
+            let run_latch = Some(std::sync::Arc::clone(&auth_latch));
+            let ou_reconnect_notifier = Some(std::sync::Arc::clone(&notifier));
+            // 2026-06-12: order-update lifecycle events → ws_event_audit.
+            let ou_ws_audit_tx = Some(spawn_ws_event_audit_consumer(config.questdb.clone()));
+            // PR-E: the order-update WS reads the same Dhan enable flag.
+            let ou_dhan_flag = Some(feed_runtime.dhan_flag());
+            tokio::spawn(async move {
+                ou_health.set_order_update_connected(true);
+                // Telegram: Order Update WS connected (fires before read loop starts).
+                ou_connect_notifier.notify(NotificationEvent::OrderUpdateConnected);
+                run_order_update_connection(
+                    url,
+                    order_ws_client_id,
+                    token,
+                    sender,
+                    cal,
+                    ou_wal_spill,
+                    run_signal,
+                    run_latch,
+                    ou_reconnect_notifier,
+                    ou_ws_audit_tx,
+                    ou_dhan_flag,
+                )
+                .await;
+                // If run_order_update_connection returns, connection terminated
+                ou_notifier.notify(NotificationEvent::OrderUpdateDisconnected {
+                    reason: "connection task exited".to_string(),
+                });
+                ou_health.set_order_update_connected(false);
+            })
+        };
+        info!("order update WebSocket started");
+
+        // -----------------------------------------------------------------------
+        // Step 10.5: Spawn daily reset signal (16:00 IST)
+        // -----------------------------------------------------------------------
+        let daily_reset_signal = std::sync::Arc::new(tokio::sync::Notify::new());
         {
-            let listener_signal = std::sync::Arc::clone(&auth_signal);
-            let listener_notifier = notifier.clone();
-            tokio::spawn(async move {
-                listener_signal.notified().await;
-                listener_notifier.notify(NotificationEvent::OrderUpdateAuthenticated);
-            });
-        }
-        let run_signal = Some(std::sync::Arc::clone(&auth_signal));
-        let run_latch = Some(std::sync::Arc::clone(&auth_latch));
-        let ou_reconnect_notifier = Some(std::sync::Arc::clone(&notifier));
-        // 2026-06-12: order-update lifecycle events → ws_event_audit.
-        let ou_ws_audit_tx = Some(spawn_ws_event_audit_consumer(config.questdb.clone()));
-        // PR-E: the order-update WS reads the same Dhan enable flag.
-        let ou_dhan_flag = Some(feed_runtime.dhan_flag());
-        tokio::spawn(async move {
-            ou_health.set_order_update_connected(true);
-            // Telegram: Order Update WS connected (fires before read loop starts).
-            ou_connect_notifier.notify(NotificationEvent::OrderUpdateConnected);
-            run_order_update_connection(
-                url,
-                order_ws_client_id,
-                token,
-                sender,
-                cal,
-                ou_wal_spill,
-                run_signal,
-                run_latch,
-                ou_reconnect_notifier,
-                ou_ws_audit_tx,
-                ou_dhan_flag,
-            )
-            .await;
-            // If run_order_update_connection returns, connection terminated
-            ou_notifier.notify(NotificationEvent::OrderUpdateDisconnected {
-                reason: "connection task exited".to_string(),
-            });
-            ou_health.set_order_update_connected(false);
-        })
-    };
-    info!("order update WebSocket started");
-
-    // -----------------------------------------------------------------------
-    // Step 10.5: Spawn daily reset signal (16:00 IST)
-    // -----------------------------------------------------------------------
-    let daily_reset_signal = std::sync::Arc::new(tokio::sync::Notify::new());
-    {
-        let signal = std::sync::Arc::clone(&daily_reset_signal);
-        let reset_sleep =
-            compute_market_close_sleep(tickvault_common::constants::APP_DAILY_RESET_TIME_IST);
-        if reset_sleep > std::time::Duration::ZERO {
-            tokio::spawn(async move {
-                tokio::time::sleep(reset_sleep).await;
-                info!("16:00 IST reached — firing daily reset signal");
-                signal.notify_waiters();
-            });
-        }
-    }
-
-    // Step 10.5: Spawn market close signal (15:30 IST)
-    let market_close_signal = std::sync::Arc::new(tokio::sync::Notify::new());
-    {
-        let signal = std::sync::Arc::clone(&market_close_signal);
-        let close_sleep = compute_market_close_sleep(&config.trading.market_close_time);
-        if close_sleep > std::time::Duration::ZERO {
-            tokio::spawn(async move {
-                tokio::time::sleep(close_sleep).await;
-                info!("15:30 IST reached — firing market close signal to trading pipeline");
-                signal.notify_waiters();
-            });
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Step 10.5: Spawn trading pipeline (indicators → strategies → OMS)
-    // -----------------------------------------------------------------------
-    let trading_handle = {
-        let tick_rx = tick_broadcast_sender.subscribe();
-        let order_rx = order_update_sender.subscribe();
-
-        match trading_pipeline::init_trading_pipeline(
-            &config,
-            &token_manager.token_handle(),
-            &ws_client_id,
-        ) {
-            Some((pipeline_config, hot_reloader)) => {
-                let handle = trading_pipeline::spawn_trading_pipeline_full(
-                    pipeline_config,
-                    tick_rx,
-                    order_rx,
-                    hot_reloader,
-                    Some(std::sync::Arc::clone(&daily_reset_signal)),
-                    Some(std::sync::Arc::clone(&market_close_signal)),
-                );
-                info!("trading pipeline started (paper trading)");
-                Some(handle)
-            }
-            None => {
-                info!("trading pipeline disabled — no strategy config");
-                None
+            let signal = std::sync::Arc::clone(&daily_reset_signal);
+            let reset_sleep =
+                compute_market_close_sleep(tickvault_common::constants::APP_DAILY_RESET_TIME_IST);
+            if reset_sleep > std::time::Duration::ZERO {
+                tokio::spawn(async move {
+                    tokio::time::sleep(reset_sleep).await;
+                    info!("16:00 IST reached — firing daily reset signal");
+                    signal.notify_waiters();
+                });
             }
         }
-    };
 
-    // -----------------------------------------------------------------------
-    // Step 10.5: Index constituency data (best-effort, NON-BLOCKING)
-    // -----------------------------------------------------------------------
-    // PR #6a (2026-05-19): index-constituency loader RETIRED under
-    // 4-IDX_I LOCKED_UNIVERSE. NSE index composition (which stocks are in
-    // NIFTY, etc.) isn't needed when only the 4 indices themselves are
-    // tracked. The niftyindices.com download was previously gated behind
-    // is_market_hours to avoid blocking boot; both paths now removed.
-
-    // -----------------------------------------------------------------------
-    // Step 11: Start axum API server
-    // -----------------------------------------------------------------------
-    let api_state = SharedAppState::new_with_feed_runtime_and_health(
-        config.questdb.clone(),
-        config.dhan.clone(),
-        config.instrument.clone(),
-        health_status,
-        // SAME feed-runtime Arc the Groww bridge holds → API toggles are live.
-        std::sync::Arc::clone(&feed_runtime),
-        // SAME health registry the lanes update → GET /api/feeds/health is live.
-        std::sync::Arc::clone(&feed_health),
-    );
-
-    // 2026-04-25 security audit (PR #357): API bearer token sourced from AWS
-    // SSM Parameter Store ONLY — `/tickvault/<env>/api/bearer-token`. Same
-    // rule as Dhan, Telegram, Grafana, QuestDB credentials per
-    // `.claude/rules/project/rust-code.md` ("always real AWS, never mocks";
-    // local Mac uses `~/.aws/credentials` to reach the same SSM endpoint).
-    //
-    // Hard-fail on SSM error — matches the existing `fetch_dhan_credentials`
-    // / `fetch_telegram_credentials` boot-time semantics. There is NO env
-    // var fallback. If SSM is unreachable the app cannot boot, period.
-    let api_bearer_token = tickvault_core::auth::secret_manager::fetch_api_bearer_token()
-        .await
-        .context("GAP-SEC-01: SSM fetch for API bearer token failed at /tickvault/<env>/api/bearer-token — store the token via `aws ssm put-parameter --name /tickvault/<env>/api/bearer-token --type SecureString`")?;
-    info!("GAP-SEC-01: API bearer token loaded from SSM (/tickvault/<env>/api/bearer-token)");
-    let api_auth_config = tickvault_api::middleware::ApiAuthConfig::from_token(api_bearer_token);
-
-    let router = tickvault_api::build_router_with_auth(
-        api_state,
-        &config.api.allowed_origins,
-        api_auth_config,
-        // dry-run/sandbox → tokenless feed-toggle so the /feeds page flips feeds
-        // without a token; live trading keeps the toggle bearer-protected.
-        config.strategy.dry_run,
-    );
-
-    let bind_addr: SocketAddr = format_bind_addr(&config.api.host, config.api.port)
-        .parse()
-        .context("invalid API bind address")?;
-
-    let listener = tokio::net::TcpListener::bind(bind_addr)
-        .await
-        .context("failed to bind API server")?;
-
-    info!(address = %bind_addr, "API server listening");
-
-    // PR #7d (2026-05-19): `/portal/*` HTML frontend retired. The
-    // post-boot browser auto-open + `api.auto_open_portal` config flag
-    // are both gone. Replacement surface for operator UX is Grafana
-    // (auto-opened above by the infra block), Telegram alerts, MCP
-    // tools, and the QuestDB Console at `localhost:9000`.
-
-    let api_handle = tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, router).await {
-            error!(?err, "API server error");
+        // Step 10.5: Spawn market close signal (15:30 IST)
+        let market_close_signal = std::sync::Arc::new(tokio::sync::Notify::new());
+        {
+            let signal = std::sync::Arc::clone(&market_close_signal);
+            let close_sleep = compute_market_close_sleep(&config.trading.market_close_time);
+            if close_sleep > std::time::Duration::ZERO {
+                tokio::spawn(async move {
+                    tokio::time::sleep(close_sleep).await;
+                    info!("15:30 IST reached — firing market close signal to trading pipeline");
+                    signal.notify_waiters();
+                });
+            }
         }
-    });
 
-    // -----------------------------------------------------------------------
-    // Step 12: Spawn token renewal background task
-    // -----------------------------------------------------------------------
-    let renewal_handle = token_manager.spawn_renewal_task();
-    info!("token renewal task started");
+        // -----------------------------------------------------------------------
+        // Step 10.5: Spawn trading pipeline (indicators → strategies → OMS)
+        // -----------------------------------------------------------------------
+        let trading_handle = {
+            let tick_rx = tick_broadcast_sender.subscribe();
+            let order_rx = order_update_sender.subscribe();
 
-    // -----------------------------------------------------------------------
-    // Step 12a: Spawn mid-session profile watchdog (queue item I7)
-    // -----------------------------------------------------------------------
-    // Every 15 minutes during market hours, re-runs `pre_market_check`
-    // (dataPlan == "Active", activeSegment contains "Derivative", token
-    // expires > 4h). On rising-edge failure fires CRITICAL Telegram via
-    // NotificationEvent::MidSessionProfileInvalidated. Does NOT HALT —
-    // dropping the live WS feed mid-session costs more than the
-    // silent-failure risk we're monitoring.
-    let _mid_session_watchdog_handle =
-        tickvault_core::auth::mid_session_watchdog::spawn_mid_session_profile_watchdog(
-            std::sync::Arc::clone(&token_manager),
-            Some(std::sync::Arc::clone(&notifier)),
-        );
-    info!("mid-session profile watchdog spawned (15-min cadence, market-hours only)");
-
-    // -----------------------------------------------------------------------
-    // Step 12b: Spawn periodic token-sweep (Audit Finding #6, 2026-05-03)
-    // -----------------------------------------------------------------------
-    // The primary `renewal_loop` sleeps until refresh window and uses
-    // retry+circuit-breaker, but if the circuit breaker halts the loop,
-    // there is no automatic recovery. The token-sweep is a parallel
-    // safety-net: every TOKEN_SWEEP_INTERVAL_SECS (4h) it calls
-    // `force_renewal_if_stale(TOKEN_SWEEP_STALENESS_THRESHOLD_SECS)`
-    // which renews iff < 4h headroom remains. Independent of the primary
-    // loop — keeps trying even if the loop has halted.
-    {
-        let sweep_token_manager = std::sync::Arc::clone(&token_manager);
-        tokio::spawn(async move {
-            use std::time::Duration;
-            use tickvault_common::constants::{
-                TOKEN_SWEEP_INTERVAL_SECS, TOKEN_SWEEP_STALENESS_THRESHOLD_SECS,
-            };
-            let interval = Duration::from_secs(TOKEN_SWEEP_INTERVAL_SECS);
-            info!(
-                interval_secs = TOKEN_SWEEP_INTERVAL_SECS,
-                threshold_secs = TOKEN_SWEEP_STALENESS_THRESHOLD_SECS,
-                "token sweep task started (Audit Finding #6 — backstop for renewal_loop)"
-            );
-            loop {
-                tokio::time::sleep(interval).await;
-                match sweep_token_manager
-                    .force_renewal_if_stale(TOKEN_SWEEP_STALENESS_THRESHOLD_SECS)
-                    .await
-                {
-                    Ok(true) => {
-                        info!("token sweep: renewed stale token (< 4h headroom)");
-                        metrics::counter!(
-                            "tv_token_sweep_renewals_total",
-                            "result" => "renewed"
-                        )
-                        .increment(1);
-                    }
-                    Ok(false) => {
-                        debug!("token sweep: token still fresh, no action");
-                        metrics::counter!(
-                            "tv_token_sweep_renewals_total",
-                            "result" => "fresh"
-                        )
-                        .increment(1);
-                    }
-                    Err(err) => {
-                        // The renewal_loop's own retry+circuit-breaker
-                        // path will pick this up. We just record the
-                        // failure for observability.
-                        warn!(
-                            error = %err,
-                            "token sweep: force_renewal_if_stale failed (renewal_loop retries independently)"
-                        );
-                        metrics::counter!(
-                            "tv_token_sweep_renewals_total",
-                            "result" => "failed"
-                        )
-                        .increment(1);
-                    }
+            match trading_pipeline::init_trading_pipeline(
+                &config,
+                &token_manager.token_handle(),
+                &ws_client_id,
+            ) {
+                Some((pipeline_config, hot_reloader)) => {
+                    let handle = trading_pipeline::spawn_trading_pipeline_full(
+                        pipeline_config,
+                        tick_rx,
+                        order_rx,
+                        hot_reloader,
+                        Some(std::sync::Arc::clone(&daily_reset_signal)),
+                        Some(std::sync::Arc::clone(&market_close_signal)),
+                    );
+                    info!("trading pipeline started (paper trading)");
+                    Some(handle)
+                }
+                None => {
+                    info!("trading pipeline disabled — no strategy config");
+                    None
                 }
             }
-        });
-    }
-    info!("token sweep spawned (4h cadence, parallel safety-net to renewal_loop)");
+        };
 
-    // -----------------------------------------------------------------------
-    // Boot duration check — alert if boot exceeded BOOT_TIMEOUT_SECS
-    // -----------------------------------------------------------------------
-    // Audit Finding #7 (2026-05-03) — per-step boot timeout strategy:
-    //
-    // Umbrella deadline: `BOOT_TIMEOUT_SECS` (120s) — the global check
-    // immediately below alerts CRITICAL if total boot exceeds this.
-    //
-    // Per-step deadlines (each must be <= umbrella):
-    //   - Step 6 (Dhan auth):  TOKEN_INIT_TIMEOUT_SECS (90s)
-    //   - Step 7 (QuestDB):    BOOT_DEADLINE_SECS (60s)
-    //
-    // Pinned by `crates/common/tests/boot_timeout_consistency_guard.rs`
-    // — that test fails the build if any per-step timeout exceeds the
-    // umbrella, preventing the false-positive alert pattern the audit
-    // caught (TOKEN_INIT was 300s while umbrella was 120s, so umbrella
-    // would page mid-Dhan-auth).
-    //
-    // Wave-6 W6-3 backlog: wrap each remaining boot step (1-5, 8-14)
-    // in `tokio::time::timeout` with named per-step alerts so the
-    // umbrella alert can name WHICH step blew, not just "boot took too
-    // long". Today the umbrella is the only signal for steps without
-    // their own timeout.
-    let boot_elapsed = boot_start.elapsed();
-    // 2026-04-24 fix: gate the boot deadline CRITICAL alert on market
-    // hours. Post-market boots are legitimately slower because index
-    // LTPs never arrive (Dhan stops streaming at 15:30 IST), so the
-    // 09:00 IST 120s budget is the wrong yardstick for a 19:00 IST
-    // operator-test boot. The 2026-04-17 audit already documented this
-    // (Option C v3 was supposed to fix it but only addressed the LTP
-    // wait, not the deadline alert itself). Outside market hours we
-    // log INFO + emit a metric but do NOT page the operator. Ratchet:
-    // crates/app/tests/post_market_pool_halt_guard.rs.
-    if boot_elapsed.as_secs() > tickvault_common::constants::BOOT_TIMEOUT_SECS {
-        // Wave-Holiday-Gate (2026-05-09): trading-session gate replaces
-        // the legacy time-of-day-only gate. Saturday/Sunday boots are
-        // legitimately slower (no LTPs ever) — suppress the CRITICAL.
-        let in_market_hours = tickvault_common::market_hours::is_within_trading_session_ist();
-        if in_market_hours {
-            error!(
-                elapsed_secs = boot_elapsed.as_secs(),
-                timeout_secs = tickvault_common::constants::BOOT_TIMEOUT_SECS,
-                "BOOT TIMEOUT EXCEEDED"
+        // -----------------------------------------------------------------------
+        // Step 10.5: Index constituency data (best-effort, NON-BLOCKING)
+        // -----------------------------------------------------------------------
+        // PR #6a (2026-05-19): index-constituency loader RETIRED under
+        // 4-IDX_I LOCKED_UNIVERSE. NSE index composition (which stocks are in
+        // NIFTY, etc.) isn't needed when only the 4 indices themselves are
+        // tracked. The niftyindices.com download was previously gated behind
+        // is_market_hours to avoid blocking boot; both paths now removed.
+
+        // -----------------------------------------------------------------------
+        // Step 11: axum API server — D2 Stage 2: HOISTED.
+        // -----------------------------------------------------------------------
+        // The API server (incl. /api/feeds toggle routes), its SSM bearer-token
+        // fetch, and the axum::serve bind are now done ONCE in the hoisted
+        // `build_shared_infra` prefix so the API binds exactly once for BOTH the
+        // Dhan-OFF and Dhan-ON-slow paths and exists with Dhan OFF (the toggle
+        // endpoint is reachable to turn Dhan ON at runtime). The `api_handle` is
+        // destructured into `main()` scope above and handed to `run_process_runloop`.
+
+        // -----------------------------------------------------------------------
+        // Step 12: Spawn token renewal background task
+        // -----------------------------------------------------------------------
+        let renewal_handle = token_manager.spawn_renewal_task();
+        info!("token renewal task started");
+
+        // -----------------------------------------------------------------------
+        // Step 12a: Spawn mid-session profile watchdog (queue item I7)
+        // -----------------------------------------------------------------------
+        // Every 15 minutes during market hours, re-runs `pre_market_check`
+        // (dataPlan == "Active", activeSegment contains "Derivative", token
+        // expires > 4h). On rising-edge failure fires CRITICAL Telegram via
+        // NotificationEvent::MidSessionProfileInvalidated. Does NOT HALT —
+        // dropping the live WS feed mid-session costs more than the
+        // silent-failure risk we're monitoring.
+        let _mid_session_watchdog_handle =
+            tickvault_core::auth::mid_session_watchdog::spawn_mid_session_profile_watchdog(
+                std::sync::Arc::clone(&token_manager),
+                Some(std::sync::Arc::clone(&notifier)),
             );
-            notifier.notify(NotificationEvent::BootDeadlineMissed {
-                deadline_secs: tickvault_common::constants::BOOT_TIMEOUT_SECS,
-                step: format!(
-                    "boot completed in {}s (over {}s limit)",
-                    boot_elapsed.as_secs(),
-                    tickvault_common::constants::BOOT_TIMEOUT_SECS,
-                ),
+        info!("mid-session profile watchdog spawned (15-min cadence, market-hours only)");
+
+        // -----------------------------------------------------------------------
+        // Step 12b: Spawn periodic token-sweep (Audit Finding #6, 2026-05-03)
+        // -----------------------------------------------------------------------
+        // The primary `renewal_loop` sleeps until refresh window and uses
+        // retry+circuit-breaker, but if the circuit breaker halts the loop,
+        // there is no automatic recovery. The token-sweep is a parallel
+        // safety-net: every TOKEN_SWEEP_INTERVAL_SECS (4h) it calls
+        // `force_renewal_if_stale(TOKEN_SWEEP_STALENESS_THRESHOLD_SECS)`
+        // which renews iff < 4h headroom remains. Independent of the primary
+        // loop — keeps trying even if the loop has halted.
+        {
+            let sweep_token_manager = std::sync::Arc::clone(&token_manager);
+            tokio::spawn(async move {
+                use std::time::Duration;
+                use tickvault_common::constants::{
+                    TOKEN_SWEEP_INTERVAL_SECS, TOKEN_SWEEP_STALENESS_THRESHOLD_SECS,
+                };
+                let interval = Duration::from_secs(TOKEN_SWEEP_INTERVAL_SECS);
+                info!(
+                    interval_secs = TOKEN_SWEEP_INTERVAL_SECS,
+                    threshold_secs = TOKEN_SWEEP_STALENESS_THRESHOLD_SECS,
+                    "token sweep task started (Audit Finding #6 — backstop for renewal_loop)"
+                );
+                loop {
+                    tokio::time::sleep(interval).await;
+                    match sweep_token_manager
+                        .force_renewal_if_stale(TOKEN_SWEEP_STALENESS_THRESHOLD_SECS)
+                        .await
+                    {
+                        Ok(true) => {
+                            info!("token sweep: renewed stale token (< 4h headroom)");
+                            metrics::counter!(
+                                "tv_token_sweep_renewals_total",
+                                "result" => "renewed"
+                            )
+                            .increment(1);
+                        }
+                        Ok(false) => {
+                            debug!("token sweep: token still fresh, no action");
+                            metrics::counter!(
+                                "tv_token_sweep_renewals_total",
+                                "result" => "fresh"
+                            )
+                            .increment(1);
+                        }
+                        Err(err) => {
+                            // The renewal_loop's own retry+circuit-breaker
+                            // path will pick this up. We just record the
+                            // failure for observability.
+                            warn!(
+                                error = %err,
+                                "token sweep: force_renewal_if_stale failed (renewal_loop retries independently)"
+                            );
+                            metrics::counter!(
+                                "tv_token_sweep_renewals_total",
+                                "result" => "failed"
+                            )
+                            .increment(1);
+                        }
+                    }
+                }
             });
-        } else {
-            info!(
-                elapsed_secs = boot_elapsed.as_secs(),
-                timeout_secs = tickvault_common::constants::BOOT_TIMEOUT_SECS,
-                "boot exceeded {}s budget but outside market hours \
+        }
+        info!("token sweep spawned (4h cadence, parallel safety-net to renewal_loop)");
+
+        // -----------------------------------------------------------------------
+        // Boot duration check — alert if boot exceeded BOOT_TIMEOUT_SECS
+        // -----------------------------------------------------------------------
+        // Audit Finding #7 (2026-05-03) — per-step boot timeout strategy:
+        //
+        // Umbrella deadline: `BOOT_TIMEOUT_SECS` (120s) — the global check
+        // immediately below alerts CRITICAL if total boot exceeds this.
+        //
+        // Per-step deadlines (each must be <= umbrella):
+        //   - Step 6 (Dhan auth):  TOKEN_INIT_TIMEOUT_SECS (90s)
+        //   - Step 7 (QuestDB):    BOOT_DEADLINE_SECS (60s)
+        //
+        // Pinned by `crates/common/tests/boot_timeout_consistency_guard.rs`
+        // — that test fails the build if any per-step timeout exceeds the
+        // umbrella, preventing the false-positive alert pattern the audit
+        // caught (TOKEN_INIT was 300s while umbrella was 120s, so umbrella
+        // would page mid-Dhan-auth).
+        //
+        // Wave-6 W6-3 backlog: wrap each remaining boot step (1-5, 8-14)
+        // in `tokio::time::timeout` with named per-step alerts so the
+        // umbrella alert can name WHICH step blew, not just "boot took too
+        // long". Today the umbrella is the only signal for steps without
+        // their own timeout.
+        let boot_elapsed = boot_start.elapsed();
+        // 2026-04-24 fix: gate the boot deadline CRITICAL alert on market
+        // hours. Post-market boots are legitimately slower because index
+        // LTPs never arrive (Dhan stops streaming at 15:30 IST), so the
+        // 09:00 IST 120s budget is the wrong yardstick for a 19:00 IST
+        // operator-test boot. The 2026-04-17 audit already documented this
+        // (Option C v3 was supposed to fix it but only addressed the LTP
+        // wait, not the deadline alert itself). Outside market hours we
+        // log INFO + emit a metric but do NOT page the operator. Ratchet:
+        // crates/app/tests/post_market_pool_halt_guard.rs.
+        if boot_elapsed.as_secs() > tickvault_common::constants::BOOT_TIMEOUT_SECS {
+            // Wave-Holiday-Gate (2026-05-09): trading-session gate replaces
+            // the legacy time-of-day-only gate. Saturday/Sunday boots are
+            // legitimately slower (no LTPs ever) — suppress the CRITICAL.
+            let in_market_hours = tickvault_common::market_hours::is_within_trading_session_ist();
+            if in_market_hours {
+                error!(
+                    elapsed_secs = boot_elapsed.as_secs(),
+                    timeout_secs = tickvault_common::constants::BOOT_TIMEOUT_SECS,
+                    "BOOT TIMEOUT EXCEEDED"
+                );
+                notifier.notify(NotificationEvent::BootDeadlineMissed {
+                    deadline_secs: tickvault_common::constants::BOOT_TIMEOUT_SECS,
+                    step: format!(
+                        "boot completed in {}s (over {}s limit)",
+                        boot_elapsed.as_secs(),
+                        tickvault_common::constants::BOOT_TIMEOUT_SECS,
+                    ),
+                });
+            } else {
+                info!(
+                    elapsed_secs = boot_elapsed.as_secs(),
+                    timeout_secs = tickvault_common::constants::BOOT_TIMEOUT_SECS,
+                    "boot exceeded {}s budget but outside market hours \
                  (09:00-15:30 IST) — suppressed CRITICAL alert (Dhan idle, \
                  LTP-dependent boot steps legitimately slower post-market)",
-                tickvault_common::constants::BOOT_TIMEOUT_SECS,
+                    tickvault_common::constants::BOOT_TIMEOUT_SECS,
+                );
+            }
+        } else {
+            info!(
+                elapsed_ms = boot_elapsed.as_millis() as u64,
+                "boot sequence completed"
             );
         }
-    } else {
-        info!(
-            elapsed_ms = boot_elapsed.as_millis() as u64,
-            "boot sequence completed"
-        );
-    }
 
-    // C1: Notify systemd that boot is complete (no-op outside systemd).
-    infra::notify_systemd_ready();
+        // C1: Notify systemd that boot is complete (no-op outside systemd).
+        infra::notify_systemd_ready();
 
-    // -----------------------------------------------------------------------
-    // Step 12b: Background periodic health check (disk space + memory RSS + spill + QuestDB)
-    // -----------------------------------------------------------------------
-    // C3: Runs every 5 minutes, fires Telegram CRITICAL on disk <10% or RSS >threshold.
-    // Alert dedup: each category sends at most 1 alert per ALERT_COOLDOWN_SECS
-    // to avoid spamming Telegram when a condition persists across intervals.
-    {
-        let health_notifier = notifier.clone();
-        let questdb_config = config.questdb.clone();
-        tokio::spawn(async move {
-            use std::time::Instant;
+        // -----------------------------------------------------------------------
+        // Step 12b: Background periodic health check (disk space + memory RSS + spill + QuestDB)
+        // -----------------------------------------------------------------------
+        // C3: Runs every 5 minutes, fires Telegram CRITICAL on disk <10% or RSS >threshold.
+        // Alert dedup: each category sends at most 1 alert per ALERT_COOLDOWN_SECS
+        // to avoid spamming Telegram when a condition persists across intervals.
+        {
+            let health_notifier = notifier.clone();
+            let questdb_config = config.questdb.clone();
+            tokio::spawn(async move {
+                use std::time::Instant;
 
-            /// Minimum seconds between repeated alerts of the same category.
-            const ALERT_COOLDOWN_SECS: u64 = 1800; // 30 minutes
-            let cooldown = std::time::Duration::from_secs(ALERT_COOLDOWN_SECS);
+                /// Minimum seconds between repeated alerts of the same category.
+                const ALERT_COOLDOWN_SECS: u64 = 1800; // 30 minutes
+                let cooldown = std::time::Duration::from_secs(ALERT_COOLDOWN_SECS);
 
-            // Per-category last-alert timestamps for dedup.
-            let mut last_disk_alert: Option<Instant> = None;
-            // L122: `last_memory_alert` was retired alongside
-            // `MEMORY_RSS_ALERT_MB`. The per-component memory alert is
-            // managed by Prometheus over `tv_subsystem_memory_estimated_bytes`,
-            // not by this in-process cooldown.
-            let mut last_spill_alert: Option<Instant> = None;
-            let mut last_docker_alert: Option<Instant> = None;
-            // QuestDB liveness recovery-edge state: track whether a
-            // `QuestDbDisconnected` (Critical) was alerted and the peak
-            // consecutive-failure count, so we emit a symmetric
-            // `QuestDbReconnected` (Medium) exactly once on recovery —
-            // audit-findings Rule 11 (no false-OK / anxiety gap) + Rule 4
-            // (edge-triggered, not level-triggered).
-            let mut questdb_disconnect_alerted = false;
-            let mut questdb_peak_failed_checks: u32 = 0;
+                // Per-category last-alert timestamps for dedup.
+                let mut last_disk_alert: Option<Instant> = None;
+                // L122: `last_memory_alert` was retired alongside
+                // `MEMORY_RSS_ALERT_MB`. The per-component memory alert is
+                // managed by Prometheus over `tv_subsystem_memory_estimated_bytes`,
+                // not by this in-process cooldown.
+                let mut last_spill_alert: Option<Instant> = None;
+                let mut last_docker_alert: Option<Instant> = None;
+                // QuestDB liveness recovery-edge state: track whether a
+                // `QuestDbDisconnected` (Critical) was alerted and the peak
+                // consecutive-failure count, so we emit a symmetric
+                // `QuestDbReconnected` (Medium) exactly once on recovery —
+                // audit-findings Rule 11 (no false-OK / anxiety gap) + Rule 4
+                // (edge-triggered, not level-triggered).
+                let mut questdb_disconnect_alerted = false;
+                let mut questdb_peak_failed_checks: u32 = 0;
 
-            /// Returns true if cooldown has elapsed (or first alert).
-            fn should_alert(last: &mut Option<Instant>, cooldown: std::time::Duration) -> bool {
-                let now = Instant::now();
-                match last {
-                    Some(t) if now.duration_since(*t) < cooldown => false,
-                    _ => {
-                        *last = Some(now);
-                        true
+                /// Returns true if cooldown has elapsed (or first alert).
+                fn should_alert(last: &mut Option<Instant>, cooldown: std::time::Duration) -> bool {
+                    let now = Instant::now();
+                    match last {
+                        Some(t) if now.duration_since(*t) < cooldown => false,
+                        _ => {
+                            *last = Some(now);
+                            true
+                        }
                     }
                 }
-            }
 
-            let interval = std::time::Duration::from_secs(
-                tickvault_common::constants::PERIODIC_HEALTH_CHECK_INTERVAL_SECS,
-            );
-            loop {
-                tokio::time::sleep(interval).await;
-                // Disk space check
-                if let Some(percent_free) = infra::check_disk_space()
-                    && percent_free < infra::MIN_FREE_DISK_PERCENT
-                    && should_alert(&mut last_disk_alert, cooldown)
-                {
-                    health_notifier.notify(NotificationEvent::Custom {
-                        message: format!(
-                            "CRITICAL: LOW DISK SPACE — only {percent_free}% free. \
-                             Tick spill files may fail if disk fills up."
-                        ),
-                    });
-                }
-                // Memory RSS — legacy `MEMORY_RSS_ALERT_MB > 1024` alert
-                // RETIRED 2026-05-08 per L122 (Wave-5 plan §AA / BUG-C2)
-                // because the in-memory-store design (~2.31 GB total) would
-                // breach the 1 GB threshold instantly with zero diagnostic
-                // signal. Replaced by the per-component
-                // `tv-rss-per-subsystem-high` Prometheus alert over
-                // `tv_subsystem_memory_estimated_bytes{component=...}`
-                // (registered by `subsystem_memory::SubsystemMemoryHandles`).
-                // C2: Spill file size check — export metric + alert if large.
-                let spill_bytes = infra::check_spill_file_size();
-                if spill_bytes > 500 * 1024 * 1024 && should_alert(&mut last_spill_alert, cooldown)
-                {
-                    // > 500 MB of spill files — QuestDB likely down for extended period.
-                    health_notifier.notify(NotificationEvent::Custom {
-                        message: format!(
-                            "WARNING: Tick spill files total {:.1} MB — QuestDB may be \
-                             down. Data safe on disk but investigate.",
-                            spill_bytes as f64 / (1024.0 * 1024.0)
-                        ),
-                    });
-                }
-                // C3: QuestDB liveness ping (SELECT 1) — alert only after N
-                // consecutive failures so a single slow query under ingestion
-                // load does not page. Recovery resets the failure counter.
-                let liveness_outcome = infra::check_questdb_liveness(&questdb_config).await;
-                let liveness_success = liveness_outcome.is_success();
-                if !liveness_success {
-                    let failures = infra::questdb_liveness_failures();
-                    // `check_questdb_liveness` resets the atomic to 0 on
-                    // success, so capture the peak here while still down —
-                    // it is the honest downtime signal for the recovery alert.
-                    questdb_peak_failed_checks = questdb_peak_failed_checks.max(failures);
-                    if failures >= infra::QUESTDB_LIVENESS_FAILURE_THRESHOLD {
-                        health_notifier.notify(NotificationEvent::QuestDbDisconnected {
-                            writer: "liveness-check".to_string(),
-                            signal: u64::from(failures),
-                            signal_kind: "Consecutive liveness failures".to_string(),
-                        });
-                        questdb_disconnect_alerted = true;
-                    } else {
-                        tracing::warn!(
-                            failures,
-                            threshold = infra::QUESTDB_LIVENESS_FAILURE_THRESHOLD,
-                            "QuestDB liveness check failed — below alert threshold"
-                        );
-                    }
-                } else {
-                    // Healthy liveness check.
-                    if should_emit_questdb_reconnected(questdb_disconnect_alerted, liveness_success)
+                let interval = std::time::Duration::from_secs(
+                    tickvault_common::constants::PERIODIC_HEALTH_CHECK_INTERVAL_SECS,
+                );
+                loop {
+                    tokio::time::sleep(interval).await;
+                    // Disk space check
+                    if let Some(percent_free) = infra::check_disk_space()
+                        && percent_free < infra::MIN_FREE_DISK_PERCENT
+                        && should_alert(&mut last_disk_alert, cooldown)
                     {
-                        // Recovery edge — symmetric with the Critical disconnect
-                        // alert so the operator is told the incident resolved
-                        // (audit-findings Rule 11). Fires exactly once: the flag
-                        // is cleared here and only re-armed by a fresh disconnect.
-                        health_notifier.notify(NotificationEvent::QuestDbReconnected {
-                            writer: "liveness-check".to_string(),
-                            failed_checks_before_recovery: questdb_peak_failed_checks,
+                        health_notifier.notify(NotificationEvent::Custom {
+                            message: format!(
+                                "CRITICAL: LOW DISK SPACE — only {percent_free}% free. \
+                             Tick spill files may fail if disk fills up."
+                            ),
                         });
-                        questdb_disconnect_alerted = false;
                     }
-                    // Reset the peak on ANY healthy check (incl. after a
-                    // sub-threshold blip that never alerted) so no stale
-                    // residue carries into a future incident's count.
-                    questdb_peak_failed_checks = 0;
-                }
-                // C4: Auto-cleanup spill files older than 7 days.
-                infra::cleanup_old_spill_files();
-                // C5: Docker container watchdog — detect and restart unhealthy containers.
-                let unhealthy = infra::check_and_restart_containers().await;
-                if unhealthy > 0 && should_alert(&mut last_docker_alert, cooldown) {
-                    health_notifier.notify(NotificationEvent::Custom {
-                        message: format!(
-                            "[Watchdog] {unhealthy} unhealthy Docker container(s) detected. \
+                    // Memory RSS — legacy `MEMORY_RSS_ALERT_MB > 1024` alert
+                    // RETIRED 2026-05-08 per L122 (Wave-5 plan §AA / BUG-C2)
+                    // because the in-memory-store design (~2.31 GB total) would
+                    // breach the 1 GB threshold instantly with zero diagnostic
+                    // signal. Replaced by the per-component
+                    // `tv-rss-per-subsystem-high` Prometheus alert over
+                    // `tv_subsystem_memory_estimated_bytes{component=...}`
+                    // (registered by `subsystem_memory::SubsystemMemoryHandles`).
+                    // C2: Spill file size check — export metric + alert if large.
+                    let spill_bytes = infra::check_spill_file_size();
+                    if spill_bytes > 500 * 1024 * 1024
+                        && should_alert(&mut last_spill_alert, cooldown)
+                    {
+                        // > 500 MB of spill files — QuestDB likely down for extended period.
+                        health_notifier.notify(NotificationEvent::Custom {
+                            message: format!(
+                                "WARNING: Tick spill files total {:.1} MB — QuestDB may be \
+                             down. Data safe on disk but investigate.",
+                                spill_bytes as f64 / (1024.0 * 1024.0)
+                            ),
+                        });
+                    }
+                    // C3: QuestDB liveness ping (SELECT 1) — alert only after N
+                    // consecutive failures so a single slow query under ingestion
+                    // load does not page. Recovery resets the failure counter.
+                    let liveness_outcome = infra::check_questdb_liveness(&questdb_config).await;
+                    let liveness_success = liveness_outcome.is_success();
+                    if !liveness_success {
+                        let failures = infra::questdb_liveness_failures();
+                        // `check_questdb_liveness` resets the atomic to 0 on
+                        // success, so capture the peak here while still down —
+                        // it is the honest downtime signal for the recovery alert.
+                        questdb_peak_failed_checks = questdb_peak_failed_checks.max(failures);
+                        if failures >= infra::QUESTDB_LIVENESS_FAILURE_THRESHOLD {
+                            health_notifier.notify(NotificationEvent::QuestDbDisconnected {
+                                writer: "liveness-check".to_string(),
+                                signal: u64::from(failures),
+                                signal_kind: "Consecutive liveness failures".to_string(),
+                            });
+                            questdb_disconnect_alerted = true;
+                        } else {
+                            tracing::warn!(
+                                failures,
+                                threshold = infra::QUESTDB_LIVENESS_FAILURE_THRESHOLD,
+                                "QuestDB liveness check failed — below alert threshold"
+                            );
+                        }
+                    } else {
+                        // Healthy liveness check.
+                        if should_emit_questdb_reconnected(
+                            questdb_disconnect_alerted,
+                            liveness_success,
+                        ) {
+                            // Recovery edge — symmetric with the Critical disconnect
+                            // alert so the operator is told the incident resolved
+                            // (audit-findings Rule 11). Fires exactly once: the flag
+                            // is cleared here and only re-armed by a fresh disconnect.
+                            health_notifier.notify(NotificationEvent::QuestDbReconnected {
+                                writer: "liveness-check".to_string(),
+                                failed_checks_before_recovery: questdb_peak_failed_checks,
+                            });
+                            questdb_disconnect_alerted = false;
+                        }
+                        // Reset the peak on ANY healthy check (incl. after a
+                        // sub-threshold blip that never alerted) so no stale
+                        // residue carries into a future incident's count.
+                        questdb_peak_failed_checks = 0;
+                    }
+                    // C4: Auto-cleanup spill files older than 7 days.
+                    infra::cleanup_old_spill_files();
+                    // C5: Docker container watchdog — detect and restart unhealthy containers.
+                    let unhealthy = infra::check_and_restart_containers().await;
+                    if unhealthy > 0 && should_alert(&mut last_docker_alert, cooldown) {
+                        health_notifier.notify(NotificationEvent::Custom {
+                            message: format!(
+                                "[Watchdog] {unhealthy} unhealthy Docker container(s) detected. \
                              Auto-restart triggered via docker compose up -d."
-                        ),
-                    });
+                            ),
+                        });
+                    }
                 }
-            }
-        });
-        info!("background periodic health check started (every 5 minutes)");
-    }
+            });
+            info!("background periodic health check started (every 5 minutes)");
+        }
 
-    // -----------------------------------------------------------------------
-    // Step 13: Await shutdown signal
-    // -----------------------------------------------------------------------
-    run_shutdown_fast(
-        ws_handles,
-        processor_handle,
-        Some(renewal_handle),
-        Some(order_update_handle),
+        // -----------------------------------------------------------------------
+        // Step 13: D2 Stage 2 — produce the Dhan-lane handles for the PROCESS
+        // run-loop. The shared infra (API + otel) is torn down by the run-loop
+        // BELOW (outside this `if config.feeds.dhan_enabled` lane), not here.
+        // -----------------------------------------------------------------------
+        Some(DhanLaneRunHandles {
+            ws_handles,
+            processor_handle,
+            renewal_handle: Some(renewal_handle),
+            order_update_handle: Some(order_update_handle),
+            trading_handle,
+            ws_pool_arc,
+            shutdown_notify,
+        })
+    } else {
+        // Dhan-OFF (Groww-only / no-feed): no Dhan lane. The shared infra built
+        // by `build_shared_infra` keeps the process alive via the run-loop.
+        info!(
+            groww_enabled = config.feeds.groww_enabled,
+            "DHAN LANE SKIPPED (dhan_enabled=false) — shared-infra-only runtime; \
+             the unified run-loop keeps the API + seal-writer + aggregator alive"
+        );
+        None
+    };
+
+    // =======================================================================
+    // PROCESS RUN-LOOP (BOTH Dhan-OFF and Dhan-ON-slow).
+    //
+    // Built once over the hoisted shared infra: market-close timer,
+    // partition-detach, shutdown wait, then `teardown_dhan_lane_tasks(lane)`
+    // when a lane exists, then API + otel teardown. Replaces the old separate
+    // `run_shutdown_fast` slow-arm call AND the deleted `run_shared_infra_only`.
+    // =======================================================================
+    run_process_runloop(
+        dhan_lane,
         Some(api_handle),
-        trading_handle,
         otel_provider,
         &notifier,
         &config,
-        ws_pool_arc,
-        shutdown_notify,
         trading_calendar.clone(),
     )
     .await
@@ -6730,16 +6639,69 @@ fn spawn_engine_b_aggregator(
 // boot-OFF → runtime cold-start of the Dhan spine is the deferred residual
 // tracked as D2a/D2b.
 #[allow(clippy::too_many_arguments)] // APPROVED: process-shared infra requires the captured boot state
-async fn run_shared_infra_only(
+// ---------------------------------------------------------------------------
+// D2 Stage 2 (genuine shared-infra hoist) — the PROCESS-shared infra built ONCE
+// by `build_shared_infra` and shared by BOTH the Dhan-OFF and Dhan-ON-slow
+// paths. This replaces the old duplicate `run_shared_infra_only` (deleted): the
+// shared construction now lives in exactly one place and `main()` builds the
+// optional Dhan lane on top of it.
+// ---------------------------------------------------------------------------
+struct SharedInfraHandles {
+    /// Strict-initialised notifier (coalescer-wrapped per config). Used by the
+    /// lane, the run-loop, and the periodic-health task.
+    notifier: std::sync::Arc<NotificationService>,
+    /// Drives `/health` + `/api/feeds/health`. The lane updates it; the API
+    /// server reads it.
+    health_status: SharedHealthStatus,
+    /// The PROCESS-shared tick broadcast. The 3 subscriber tasks (obs,
+    /// aggregator, tick-storage) are spawned in `build_shared_infra` and have
+    /// already `.subscribe()`d to this BEFORE any Dhan tick processor publishes.
+    /// The lane's `run_tick_processor` is the only publisher.
+    tick_broadcast_sender: tokio::sync::broadcast::Sender<tickvault_common::tick_types::ParsedTick>,
+    /// The PROCESS-shared order-update broadcast (lane order-update WS publishes;
+    /// trading pipeline subscribes).
+    order_update_sender: tokio::sync::broadcast::Sender<tickvault_common::order_types::OrderUpdate>,
+    /// The hoisted axum API server handle (binds exactly once, incl. /api/feeds).
+    api_handle: tokio::task::JoinHandle<()>,
+}
+
+/// Builds the PROCESS-shared infra ONCE for BOTH the Dhan-OFF and Dhan-ON-slow
+/// boot paths: strict notifier (+ optional coalescer), health registry,
+/// seal-writer (installs the process-wide `global_seal_sender`), the 21-TF
+/// Engine-B aggregator, the tick + order-update broadcast channels, the
+/// observability + tick-storage subscriber tasks (which `.subscribe()` to the
+/// tick broadcast BEFORE the lane's tick processor publishes — the
+/// subscribe-before-publish / zero-tick-loss invariant, preserved by
+/// construction), and the axum API server (incl. /api/feeds — so the toggle
+/// endpoint exists even with Dhan OFF).
+///
+/// The Docker auto-start side-effect is gated on `config.infrastructure
+/// .auto_start_docker` exactly as the slow-boot path always was; it runs in
+/// parallel with the strict notifier init (same `tokio::join!` as before).
+async fn build_shared_infra(
     config: &ApplicationConfig,
     feed_runtime: std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
     feed_health: std::sync::Arc<tickvault_common::feed_health::FeedHealthRegistry>,
     trading_calendar: std::sync::Arc<TradingCalendar>,
     prev_day_cache: std::sync::Arc<tickvault_trading::in_mem::PrevDayCache>,
-    otel_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
-) -> Result<()> {
-    // --- Notifier (strict; same policy as the slow-boot path) ---
-    let notifier = match NotificationService::initialize_strict(&config.notification).await {
+    tick_storage: std::sync::Arc<tickvault_trading::in_mem::TickStorage>,
+) -> Result<SharedInfraHandles> {
+    // --- Notifier (strict) + Docker infra (parallel — independent) ---
+    // C1: strict notifier init — the app must refuse to boot in no-op mode.
+    let (notifier_result, _) = tokio::join!(
+        NotificationService::initialize_strict(&config.notification),
+        async {
+            if config.infrastructure.auto_start_docker {
+                infra::ensure_infra_running(&config.questdb).await;
+            } else {
+                info!(
+                    "Docker auto-start disabled (infrastructure.auto_start_docker = false). \
+                     Run `make docker-up` manually before starting the app."
+                );
+            }
+        },
+    );
+    let notifier = match notifier_result {
         Ok(n) => n,
         Err(reason) => {
             error!(
@@ -6749,6 +6711,7 @@ async fn run_shared_infra_only(
             return Err(anyhow::anyhow!(reason));
         }
     };
+    // Wave 3-B Item 11: opt-in Telegram bucket-coalescer (defaults to `true`).
     let notifier = if config.features.telegram_bucket_coalescer {
         NotificationService::enable_coalescer(
             notifier,
@@ -6761,6 +6724,9 @@ async fn run_shared_infra_only(
     // --- Health registry (drives /health + /api/feeds/health) ---
     let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
 
+    // --- Seal-writer (installs the process-wide global_seal_sender) ---
+    spawn_seal_writer_loop(&config.questdb);
+
     // --- Tick + order-update broadcast channels (PROCESS-shared) ---
     // Held for the process lifetime so the aggregator subscriber never wakes on
     // a disconnected channel. With Dhan OFF nothing publishes Dhan ticks into
@@ -6770,22 +6736,43 @@ async fn run_shared_infra_only(
         tokio::sync::broadcast::channel::<tickvault_common::tick_types::ParsedTick>(
             tickvault_common::constants::TICK_BROADCAST_CAPACITY,
         );
-    let (_order_update_sender, _order_update_receiver) =
+    let (order_update_sender, _order_update_receiver) =
         tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(
             tickvault_common::constants::ORDER_UPDATE_BROADCAST_CAPACITY,
         );
 
-    // --- Seal-writer + 21-TF aggregator (PROCESS-shared candle pipeline) ---
-    // The seal-writer installs the process-wide `global_seal_sender` the Groww
-    // feed routes its sealed candles through (C2 fix). The Engine-B aggregator
-    // is the Dhan-feed candle engine; with Dhan OFF it idles on the empty tick
-    // broadcast (harmless) — Groww seals via its own aggregator instance.
-    spawn_seal_writer_loop(&config.questdb);
+    // --- Subscriber tasks: obs + 21-TF aggregator + tick-storage ---
+    // ALL three `.subscribe()` to `tick_broadcast_sender` HERE, in the hoisted
+    // prefix, BEFORE the lane's `run_tick_processor` (the only publisher) runs.
+    // Subscribe-before-publish is therefore preserved by construction.
+    {
+        let obs_rx = tick_broadcast_sender.subscribe();
+        let questdb_cfg = config.questdb.clone();
+        tokio::spawn(async move {
+            run_slow_boot_observability(obs_rx, questdb_cfg).await;
+        });
+        info!("slow-boot observability consumer started");
+    }
     spawn_engine_b_aggregator(
         &tick_broadcast_sender,
         std::sync::Arc::clone(&prev_day_cache),
         std::sync::Arc::clone(&trading_calendar),
     );
+    {
+        let tick_storage_rx = tick_broadcast_sender.subscribe();
+        let storage_for_consumer = std::sync::Arc::clone(&tick_storage);
+        tokio::spawn(async move {
+            tickvault_trading::in_mem::run_tick_storage_consumer(
+                tick_storage_rx,
+                storage_for_consumer,
+            )
+            .await;
+        });
+        info!(
+            per_instrument_capacity = config.in_mem.tick_storage.per_instrument_capacity,
+            "L10 tick_storage broadcast consumer spawned + IST 09:15 reset task running"
+        );
+    }
     info!("SHARED-INFRA BOOT: seal-writer + 21-TF aggregator running (Groww candles can seal)");
 
     // --- HTTP API server (incl. /api/feeds toggle routes) — C1 fix ---
@@ -6814,34 +6801,20 @@ async fn run_shared_infra_only(
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .context("failed to bind API server")?;
-    info!(address = %bind_addr, "SHARED-INFRA BOOT: API server listening (/api/feeds reachable with Dhan OFF)");
+    info!(address = %bind_addr, "SHARED-INFRA BOOT: API server listening (/api/feeds reachable regardless of Dhan ON/OFF)");
     let api_handle = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, router).await {
             error!(?err, "API server error");
         }
     });
 
-    // --- Main run-loop (PROCESS) ---
-    info!(
-        api_port = config.api.port,
-        groww_enabled = config.feeds.groww_enabled,
-        "SHARED-INFRA BOOT: shared runtime ready (Dhan OFF) — awaiting shutdown signal"
-    );
-    notifier.notify(NotificationEvent::StartupComplete {
-        mode: "SHARED-INFRA (Dhan OFF)",
-    });
-    let signal = wait_for_shutdown_signal().await;
-    info!(
-        signal,
-        "shutdown signal received — shared-infra runtime exiting cleanly"
-    );
-    notifier.notify(NotificationEvent::ShutdownInitiated);
-
-    // --- Graceful teardown of the PROCESS handles brought up here ---
-    api_handle.abort();
-    drop(otel_provider);
-    info!("tickvault stopped (shared-infra / Dhan-OFF runtime)");
-    Ok(())
+    Ok(SharedInfraHandles {
+        notifier,
+        health_status,
+        tick_broadcast_sender,
+        order_update_sender,
+        api_handle,
+    })
 }
 
 // ---------------------------------------------------------------------------
