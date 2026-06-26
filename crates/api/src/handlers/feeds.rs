@@ -8,9 +8,14 @@
 //! a shared [`crate::feed_state::FeedRuntimeState`] `Arc` that the Groww bridge
 //! reads every loop iteration — pause/resume Groww writes mid-session, no restart.
 //!
-//! **Honest envelope (slice 1):** only Groww is runtime-toggleable. `POST` for
-//! `dhan` returns 400 — disabling the primary trading feed mid-session is unsafe
-//! (Dhan stays config+restart, per Step C). Dhan's flag is still reported by GET.
+//! **Honest envelope (PR-E / PR-2):** BOTH feeds are runtime-toggleable. The Dhan
+//! *disable* direction is safety-gated — `POST /api/feeds/dhan {enabled:false}` is
+//! allowed only when `can_disable_dhan()` is true (no-orders data-pull phase) and
+//! returns `409 CONFLICT` once live trading is on, so the system is never blinded
+//! mid-trade. Enabling Dhan is always allowed. A boot-ON Dhan toggle is a true
+//! live pause/resume; a boot-OFF Dhan enable records the flag but does NOT mark
+//! the lane running (no false-OK — the `dhan_pool_present` sentinel is false), so
+//! a restart with `dhan_enabled=true` is required to actually stream.
 
 use axum::Json;
 use axum::extract::{Path, State};
