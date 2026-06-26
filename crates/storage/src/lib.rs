@@ -79,14 +79,13 @@ mod global_qcfg_tests {
 }
 
 pub mod boot_probe;
-// Operator directive 2026-06-02: post-market 1-minute cross-verification audit
-// + CSV (narrowed replacement for the deleted cross_verify.rs — 1m/spot/today
-// only). See live-feed-purity.md rule 11.
-pub mod cross_verify_1m_audit_persistence;
-// SP5 (parity plan): ONE unified live-vs-backtest 1m parity audit table + writer
-// (`feed` IN the DEDUP key) merging the Dhan `cross_verify_1m_audit_persistence`
-// + Groww `groww_cross_verify_audit_persistence` modules. Both feeds write here.
-// See docs/design/sp5-unified-parity-audit-design.md.
+// SP5 (parity plan, operator directive 2026-06-02 narrowed cross-verify): ONE
+// unified post-market live-vs-backtest 1m parity audit table + writer + CSV
+// (`feed` IN the DEDUP key). Merges the two former siloed modules
+// (`cross_verify_1m_audit_persistence` Dhan + `groww_cross_verify_audit_persistence`
+// Groww — both DELETED in SP5). Both feeds write here. See live-feed-purity.md
+// rule 11 + docs/design/sp5-unified-parity-audit-design.md. The two old physical
+// QuestDB tables are RETAINED on disk (SEBI 5y) but no longer written.
 pub mod feed_parity_1m_audit_persistence;
 pub mod tick_conservation_audit_persistence;
 pub mod ws_event_audit_persistence;
@@ -107,11 +106,9 @@ pub mod disk_health_watcher;
 pub mod groww_persistence;
 // Groww second-feed 1-minute candle persistence (operator lock §32).
 pub mod groww_candle_persistence;
-// Groww second-feed live-vs-backtest 1m parity audit (operator lock §32) — the
-// durable SEBI-retentioned record of every mismatched (instrument, minute,
-// field). Isolated `groww_*` namespace; the Dhan cross_verify_1m_audit is
-// untouched.
-pub mod groww_cross_verify_audit_persistence;
+// (SP5) The Groww live-vs-backtest 1m parity audit module was MERGED into the
+// unified `feed_parity_1m_audit_persistence` above (one table, `feed` in the
+// DEDUP key). Its empty `groww_cross_verify_1m_audit` table is retained on disk.
 // §21. DDL + append helpers + Row struct land in Sub-PR #10b-ζ.
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod instrument_fetch_audit_persistence;
