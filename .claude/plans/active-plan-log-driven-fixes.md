@@ -140,13 +140,13 @@ allowlist (the prior behaviour). No data written, no live-feed path touched.
 
 ## Plan Items
 
-- [ ] Fix A — alias-aware index allowlist
+- [x] Fix A — alias-aware index allowlist
   - Files: crates/core/src/instrument/index_extractor.rs, crates/common/src/constants.rs
   - Tests: test_nifty_next_50_resolves_via_alias, canonicalize_index_symbol unit tests, allowlist_has_exactly_32_nse_indices (preserved)
 
-- [ ] Fix B — typed PREVDAY-01 + per-empty observability
-  - Files: crates/common/src/error_code.rs, crates/app/src/main.rs, crates/app/src/prev_day_ohlcv_boot.rs, .claude/rules/project/prev-day-ohlcv-error-codes.md
-  - Tests: error_code roundtrip/severity/runbook-exists for PrevDay01CoverageEmpty, error_code_rule_file_crossref, error_code_tag_guard, catalogue-size
+- [x] Fix B — typed PREVDAY-01 + per-empty observability
+  - Files: crates/common/src/error_code.rs, crates/app/src/main.rs, crates/app/src/prev_day_ohlcv_boot.rs, .claude/rules/project/prev-day-ohlcv-error-codes.md, .claude/triage/error-rules.yaml
+  - Tests: error_code roundtrip/severity/runbook-exists for PrevDay01CoverageEmpty, error_code_rule_file_crossref, error_code_tag_guard, catalogue-size, triage_rules_full_coverage_guard
 
 ## Scenarios
 
