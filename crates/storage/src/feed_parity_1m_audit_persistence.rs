@@ -419,7 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_ddl_has_all_columns_and_feed_in_dedup() {
+    fn test_feed_parity_1m_audit_create_ddl_has_all_columns_and_feed_in_dedup() {
         let ddl = feed_parity_1m_audit_create_ddl();
         for needle in [
             "feed_parity_1m_audit",
@@ -500,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn test_append_dhan_mismatch_fills_buffer() {
+    fn test_append_mismatch_dhan_fills_buffer() {
         let mut w = FeedParity1mAuditWriter::for_test();
         w.append_mismatch(&sample_dhan()).expect("append");
         assert_eq!(w.pending(), 1);
