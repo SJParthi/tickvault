@@ -1071,10 +1071,24 @@ pub const DHAN_NSE_HOLIDAY_CROSS_CHECK_URL: &str =
 // F&O Universe — Index Aliases (FNO symbol → IDX_I symbol)
 // ---------------------------------------------------------------------------
 
-/// Aliases for indices whose FNO underlying symbol differs from IDX_I row symbol.
-/// Format: (fno_underlying_symbol, idx_i_symbol_name).
-pub const INDEX_SYMBOL_ALIASES: &[(&str, &str)] =
-    &[("NIFTYNXT50", "NIFTY NEXT 50"), ("SENSEX50", "SNSX50")];
+/// Aliases for indices whose published symbol differs from the canonical
+/// allowlist / IDX_I-row symbol.
+///
+/// Format: `(alias_symbol, canonical_symbol)`. Both sides are stored
+/// already-normalized (uppercase, single-spaced) so the lookup matches a
+/// `normalize_index_symbol`-normalized input directly. Used in two directions:
+/// (a) FNO underlying symbol → IDX_I row symbol, and (b) Dhan IDX_I row symbol
+/// → canonical NSE-index-allowlist entry (`index_extractor::canonicalize_index_symbol`).
+///
+/// `NIFTY NEXT 50` is published by Dhan as both `NIFTYNXT50` and the spaced
+/// `NIFTY NXT 50`; both must resolve to the allowlisted `NIFTY NEXT 50`, else
+/// that index value is dropped at boot (live WARN `index allowlist MISS ...
+/// NIFTY NEXT 50`, observed 2026-06-26).
+pub const INDEX_SYMBOL_ALIASES: &[(&str, &str)] = &[
+    ("NIFTYNXT50", "NIFTY NEXT 50"),
+    ("NIFTY NXT 50", "NIFTY NEXT 50"),
+    ("SENSEX50", "SNSX50"),
+];
 
 // ---------------------------------------------------------------------------
 // F&O Universe — Validation: Must-Exist Price IDs
@@ -3565,5 +3579,27 @@ mod tests {
                 "cooldown ladder must be strictly increasing"
             );
         }
+    }
+
+    #[test]
+    fn test_index_symbol_aliases_cover_nifty_next_50_published_forms() {
+        // 2026-06-26: Dhan publishes NIFTY NEXT 50 as both `NIFTYNXT50` and
+        // the spaced `NIFTY NXT 50`; BOTH must alias to the canonical
+        // `NIFTY NEXT 50` so the index-extractor self-heals the rename.
+        let has = |alias: &str, canonical: &str| {
+            INDEX_SYMBOL_ALIASES
+                .iter()
+                .any(|(a, c)| *a == alias && *c == canonical)
+        };
+        assert!(
+            has("NIFTYNXT50", "NIFTY NEXT 50"),
+            "compact NIFTYNXT50 alias preserved"
+        );
+        assert!(
+            has("NIFTY NXT 50", "NIFTY NEXT 50"),
+            "spaced NIFTY NXT 50 alias added (2026-06-26)"
+        );
+        // The pre-existing FNO-direction alias is untouched.
+        assert!(has("SENSEX50", "SNSX50"), "SENSEX50 alias preserved");
     }
 }
