@@ -155,14 +155,21 @@ pub async fn set_feed(
              needed. It reports running once the watch-list is built (a few seconds)."
         );
     }
-    // PR-E: same honesty for Dhan — enabling it via API when the pool was never
-    // spawned at boot (dhan_enabled=false then) records the flag but nothing acts
-    // on it. The response also carries `dhan_lane_running: false` (machine-readable).
+    // PR-E / PR-2: honesty for Dhan. If Dhan was ENABLED at boot, the toggle is a
+    // true live pause/resume — the dormant Dhan activation watcher (PR-2) keeps
+    // the `dhan_lane_running` flag truthful both ways and the main-feed pool
+    // reconnects via the shared enable flag (PR-E in-loop dormancy), no restart.
+    // If Dhan was OFF at boot, no main-feed pool was ever spawned, so enabling it
+    // via API records the flag but the full boot-OFF cold-start of the Dhan boot
+    // spine is not yet wired (the deferred residual of feed-toggle-full-lifecycle)
+    // — that still needs `dhan_enabled=true` in config + restart. The response
+    // carries `dhan_lane_running` so the page can tell the two cases apart.
     if feed == Feed::Dhan && req.enabled && !state.feed_runtime().is_dhan_lane_running() {
         tracing::warn!(
             "feed 'dhan' enabled via API but its main-feed pool was not started at \
-             boot (dhan_enabled=false then) — set dhan_enabled=true in config and \
-             restart to start it; the API toggle only pauses/resumes a running lane"
+             boot (dhan_enabled=false then) — runtime pause/resume works for a \
+             boot-ON Dhan feed, but a boot-OFF Dhan feed's full cold-start is not \
+             yet wired; set dhan_enabled=true in config and restart to start it"
         );
     }
     metrics::counter!(
