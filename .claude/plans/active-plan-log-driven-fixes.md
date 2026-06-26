@@ -157,3 +157,15 @@ allowlist (the prior behaviour). No data written, no live-feed path touched.
 | 3 | Dhan IDX_I row `Nifty GS 10Yr` | dropped (not allowlisted, no alias) |
 | 4 | prev-day fetch returns `Ok(None)` for a symbol | counter++ + coalesced debug; counted as skipped |
 | 5 | prev-day coverage EMPTY at boot | `error!(code="PREVDAY-01")` → Telegram |
+
+---
+
+## Per-Item Guarantee Matrix
+
+See `.claude/rules/project/per-wave-guarantee-matrix.md`. All 15 rows of the
+Guarantee Matrix and all 7 rows of the Resilience Demand Matrix apply to every
+item in this plan. Both fixes are cold-path / observability-only — Fix A
+(alias-aware index allowlist + canonical-name dedup) is O(1) in the once-daily
+index extraction and preserves composite `(security_id, exchange_segment)`
+uniqueness; Fix B (PREVDAY-01 typed error + per-empty counter/coalesced log)
+adds no tick-drop path and no hot-path allocation.

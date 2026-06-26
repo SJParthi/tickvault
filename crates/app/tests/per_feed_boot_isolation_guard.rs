@@ -234,6 +234,41 @@ fn dhan_lanes_spawn_dormant_and_self_idle() {
 }
 
 #[test]
+fn off_feed_reconciler_never_emits_start() {
+    // PR-4 strengthening of the #1192 "OFF feed = nothing touched" invariant from a
+    // SOURCE-SCAN of the spawn shape to a BEHAVIOURAL proof of the dormancy decision:
+    // an OFF feed's pure reconciler must NEVER emit `Start` (the only action that
+    // triggers cold-start auth/instrument/connect work), in ANY activated state it
+    // could legally reach while OFF. So the dormant watcher does ZERO start work
+    // while the feed is OFF — the stronger, true invariant (operator lock 2026-06-23).
+    // The exhaustive sequence storms live in `feed_toggle_lifecycle_guard.rs`; this
+    // sits beside the spawn-shape guards so the #1192 file alone pins both halves.
+    use tickvault_app::{dhan_activation, groww_activation};
+
+    for &activated in &[false, true] {
+        assert_ne!(
+            groww_activation::reconcile_lane_action(false, activated),
+            groww_activation::LaneAction::Start,
+            "OFF Groww feed must never reconcile to Start (activated={activated})"
+        );
+        // Dhan via the safety-gated reconciler, across both gate states — a disable
+        // may yield None (gate closed) or Stop (gate open) but never Start.
+        for &disable_allowed in &[false, true] {
+            assert_ne!(
+                dhan_activation::reconcile_dhan_lane_action_with_gate(
+                    false,
+                    activated,
+                    disable_allowed
+                ),
+                dhan_activation::LaneAction::Start,
+                "OFF Dhan feed must never reconcile to Start \
+                 (activated={activated}, gate={disable_allowed})"
+            );
+        }
+    }
+}
+
+#[test]
 fn both_feeds_off_is_handled_explicitly() {
     let src = read_main_rs();
     // When NEITHER feed is enabled the app must NOT silently do feed work — it
