@@ -8,9 +8,14 @@
 //! a shared [`crate::feed_state::FeedRuntimeState`] `Arc` that the Groww bridge
 //! reads every loop iteration — pause/resume Groww writes mid-session, no restart.
 //!
-//! **Honest envelope (slice 1):** only Groww is runtime-toggleable. `POST` for
-//! `dhan` returns 400 — disabling the primary trading feed mid-session is unsafe
-//! (Dhan stays config+restart, per Step C). Dhan's flag is still reported by GET.
+//! **Honest envelope (PR-E / PR-2):** BOTH feeds are runtime-toggleable. The Dhan
+//! *disable* direction is safety-gated — `POST /api/feeds/dhan {enabled:false}` is
+//! allowed only when `can_disable_dhan()` is true (no-orders data-pull phase) and
+//! returns `409 CONFLICT` once live trading is on, so the system is never blinded
+//! mid-trade. Enabling Dhan is always allowed. A boot-ON Dhan toggle is a true
+//! live pause/resume; a boot-OFF Dhan enable records the flag but does NOT mark
+//! the lane running (no false-OK — the `dhan_pool_present` sentinel is false), so
+//! a restart with `dhan_enabled=true` is required to actually stream.
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -155,14 +160,21 @@ pub async fn set_feed(
              needed. It reports running once the watch-list is built (a few seconds)."
         );
     }
-    // PR-E: same honesty for Dhan — enabling it via API when the pool was never
-    // spawned at boot (dhan_enabled=false then) records the flag but nothing acts
-    // on it. The response also carries `dhan_lane_running: false` (machine-readable).
+    // PR-E / PR-2: honesty for Dhan. If Dhan was ENABLED at boot, the toggle is a
+    // true live pause/resume — the dormant Dhan activation watcher (PR-2) keeps
+    // the `dhan_lane_running` flag truthful both ways and the main-feed pool
+    // reconnects via the shared enable flag (PR-E in-loop dormancy), no restart.
+    // If Dhan was OFF at boot, no main-feed pool was ever spawned, so enabling it
+    // via API records the flag but the full boot-OFF cold-start of the Dhan boot
+    // spine is not yet wired (the deferred residual of feed-toggle-full-lifecycle)
+    // — that still needs `dhan_enabled=true` in config + restart. The response
+    // carries `dhan_lane_running` so the page can tell the two cases apart.
     if feed == Feed::Dhan && req.enabled && !state.feed_runtime().is_dhan_lane_running() {
         tracing::warn!(
             "feed 'dhan' enabled via API but its main-feed pool was not started at \
-             boot (dhan_enabled=false then) — set dhan_enabled=true in config and \
-             restart to start it; the API toggle only pauses/resumes a running lane"
+             boot (dhan_enabled=false then) — runtime pause/resume works for a \
+             boot-ON Dhan feed, but a boot-OFF Dhan feed's full cold-start is not \
+             yet wired; set dhan_enabled=true in config and restart to start it"
         );
     }
     metrics::counter!(
