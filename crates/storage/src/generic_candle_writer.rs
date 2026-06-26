@@ -304,6 +304,25 @@ mod tests {
     }
 
     #[test]
+    fn test_append_candle_increments_pending_and_buffers_row() {
+        // Name-matched coverage for the `append_candle` pub fn: a matching-feed
+        // seal increments pending_count and writes a row into the ILP buffer.
+        let mut w = GenericCandle1mWriter::for_test(Feed::Dhan);
+        assert_eq!(w.pending_count(), 0);
+        w.append_candle(&mk_seal_feed(
+            13,
+            EXCHANGE_SEGMENT_IDX_I,
+            1_716_000_900,
+            100.0,
+            Feed::Dhan,
+        ))
+        .expect("append");
+        assert_eq!(w.pending_count(), 1);
+        assert_eq!(w.buffer_row_count(), 1);
+        assert!(w.buffer_byte_count() > 0);
+    }
+
+    #[test]
     fn test_generic_writer_delegates_flush_disconnected() {
         // Behaviour preserved: flush returns Err when disconnected.
         let mut w = GenericCandle1mWriter::for_test(Feed::Dhan);
