@@ -49,6 +49,17 @@ use tracing::{error, info, warn};
 const GROWW_ACTIVATION_POLL_SECS: u64 = 2;
 const GROWW_ACTIVATION_POLL: Duration = Duration::from_secs(GROWW_ACTIVATION_POLL_SECS);
 
+/// Today's IST date as `YYYY-MM-DD`. Computed at ACTIVATION time (not boot) so a
+/// runtime re-enable past IST midnight uses today's watch date, never a stale
+/// boot-day date (security-review MEDIUM: a date frozen at boot would build the
+/// wrong day's watch-list after an overnight re-enable). Pure wall-clock read.
+fn today_ist_date() -> String {
+    (chrono::Utc::now()
+        + chrono::TimeDelta::seconds(tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64))
+    .format("%Y-%m-%d")
+    .to_string()
+}
+
 /// What the reconciler decides to do this tick, given the desired enable state
 /// vs whether the lane is currently activated. Pure (unit-tested) so the watcher
 /// loop stays a trivial poll around this decision. Level-triggered: it compares
@@ -88,7 +99,6 @@ pub fn reconcile_lane_action(desired_enabled: bool, currently_activated: bool) -
 pub async fn run_groww_activation_watcher(
     feed_runtime: Arc<FeedRuntimeState>,
     questdb: QuestDbConfig,
-    watch_date: String,
     max_subscribe: Option<usize>,
     auth_timeout_ms: u64,
 ) {
@@ -114,7 +124,6 @@ pub async fn run_groww_activation_watcher(
                 let task = tokio::spawn(activate_groww_lane(
                     Arc::clone(&feed_runtime),
                     questdb.clone(),
-                    watch_date.clone(),
                     max_subscribe,
                     auth_timeout_ms,
                 ));
@@ -149,16 +158,23 @@ pub async fn run_groww_activation_watcher(
 /// it earlier would be a false-OK on the feed page (operator 2026-06-24: "no
 /// illusion"). All steps run INLINE (no detached children) so the watcher's
 /// `abort()` on a disable cancels every in-flight step.
+///
+/// The watch date is computed HERE (at activation time) via `today_ist_date()`,
+/// never frozen at boot — so a runtime re-enable past IST midnight builds today's
+/// watch-list, not a stale boot-day one (security-review MEDIUM).
 async fn activate_groww_lane(
     feed_runtime: Arc<FeedRuntimeState>,
     questdb: QuestDbConfig,
-    watch_date: String,
     max_subscribe: Option<usize>,
     auth_timeout_ms: u64,
 ) {
     // Not live until the watch-list is built; clear any stale true from a prior
     // ON period so the feed page reports honestly during activation.
     feed_runtime.set_groww_lane_running(false);
+
+    // Compute the watch date NOW (activation time), not at boot — an overnight
+    // re-enable must use today's date, never the boot-day's stale date.
+    let watch_date = today_ist_date();
 
     // Fail-closed date guard (defense-in-depth, operator "cover all worst cases").
     // `watch_date` is system-generated (`%Y-%m-%d`) and never attacker-controlled,
