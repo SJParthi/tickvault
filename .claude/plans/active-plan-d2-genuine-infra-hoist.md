@@ -1,6 +1,14 @@
 # Implementation Plan: D2 genuine shared-infra hoist (prerequisite for start_dhan_lane)
 
 **Status:** IN_PROGRESS
+
+> **HONEST PROGRESS (2026-06-26):** Stage 1 (the `run_shutdown_fast` →
+> `run_process_runloop` + `teardown_dhan_lane_tasks` split, design C3) is
+> COMPLETE, compiled clean, and behaviour-identical (verified — all boot-isolation
+> + lifecycle + shutdown guards green). Stage 2 (the actual scatter-relocation of
+> notifier/health/seal-writer/broadcast/aggregator/API ABOVE the Dhan lane to
+> eliminate the duplicate `run_shared_infra_only`) is NOT done — see §"Stage 2
+> blocker" below. This PR ships Stage 1 only, as a verified prerequisite.
 **Date:** 2026-06-26
 **Approved by:** operator (coordinator-authorized "do everything"; held as DRAFT for boot-test)
 **Branch:** `claude/d2-genuine-infra-hoist`
@@ -101,6 +109,53 @@ kept as a thin wrapper) so the fast path stays byte-identical.
 - This PR does NOT add the runtime cold-start path (D2b), the `LaneState` FSM, or
   `start_dhan_lane`. It ONLY hoists shared infra + splits the run-loop so D2a/D2b
   become tractable. No new pub surface without a call site (Rule 14).
+
+### Stage 2 blocker (why the full hoist is NOT in this PR — Rule 14 honesty)
+
+A verified map of the slow arm (`crates/app/src/main.rs`) shows the PROCESS-shared
+items are scattered across ~2,750 lines, deeply interleaved with the Dhan-LANE
+work and with load-bearing ordering between them:
+
+```
+2076  notifier + Docker        (PROC)   ◀ shared
+2113  IP verify                (LANE)
+2152  auth (TokenManager)      (LANE)
+2201-2337 instance-lock        (LANE)
+2589  universe load            (LANE)
+2669  seal-writer (inline)     (PROC)   ◀ shared, AFTER auth/universe
+2728-2783 boot-inits           (LANE-ish: prev_close/first_seen/spill/disk — Dhan tick path)
+2786  health_status            (PROC)   ◀ shared
+2788  tick_writer              (LANE)   ◀ feeds the LANE processor
+3044  WS-pool create           (LANE)
+3130  tick_broadcast_sender    (PROC)   ◀ shared
+3151  obs subscribe            (PROC)   ◀ shared, MUST precede processor publish
+3249  aggregator subscribe     (PROC)   ◀ shared, MUST precede processor publish
+3259  tick-storage subscribe   (PROC)   ◀ shared
+3582  tick PROCESSOR           (LANE)   ◀ the only publisher into the broadcast
+3659  WS spawn                 (LANE)
+3689-4625 schedulers           (LANE)   ◀ subscribe to broadcast + use health_status
+4630  order_update_sender      (PROC)   ◀ shared
+4702  order-update WS          (LANE)
+4759  trading pipeline         (LANE)
+4825  API server               (PROC)   ◀ shared
+4859  token renewal/sweep      (LANE)
+```
+
+The genuine hoist requires RELOCATING the 7 scattered shared blocks (notifier,
+health, seal-writer, broadcast, order_broadcast, the 3 subscriber tasks, API)
+ABOVE a single `if config.feeds.dhan_enabled { …lane… }` wrapper, while preserving
+the subscribe-before-publish ordering (obs/aggregator/tick-storage `.subscribe()`
+BEFORE the lane processor publishes). The relocations are individually
+order-safe (every shared item depends only on PROCESS-prefix values — proven), so
+the hoist is TRACTABLE, but it is a ~9-block scatter-relocation + wrapping ~2,700
+lines in an `if`, on the SEBI-critical live-trading boot. A single mis-placed
+`.subscribe()` silently breaks zero-tick-loss; a double API bind breaks boot.
+
+Per the operator's "correctness is paramount / STOP if you cannot complete the
+hoist with provably-preserved ordering + a clean compile / do NOT ship a
+semantics-changing half-refactor" directive (Rule 14), Stage 2 is deferred to a
+focused follow-up rather than rushed in this pass. Stage 1 (the run-loop split)
+is the load-bearing prerequisite D2b needs and is shippable + verified on its own.
 
 ---
 
