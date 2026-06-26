@@ -208,8 +208,14 @@ function render(data, health) {
 
     const metaDiv = document.createElement("div");
     metaDiv.className = "meta" + (laneStalled ? " warn" : "");
+    // Groww cold-starts its lane at runtime on enable (no restart) — a brief
+    // not-yet-running window while it ensures tables + auth + builds the watch-list.
+    // Other feeds (Dhan) are config+restart for cold start; the toggle only
+    // pauses/resumes a running pool, so they still need a restart if off at boot.
     metaDiv.textContent = laneStalled
-      ? "Enabled, but the feed was not started at boot — set it on in config and restart to actually stream."
+      ? (f.key === "groww"
+          ? "Enabled — cold-starting now (preparing the watch-list); it begins streaming in a few seconds, no restart needed."
+          : "Enabled, but the feed was not started at boot — set it on in config and restart to actually stream.")
       : f.note;
 
     left.appendChild(nameDiv);
