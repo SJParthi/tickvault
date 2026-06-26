@@ -354,6 +354,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `load_feed_state` returns `None` for a missing canonical-shaped path
+    /// (named so the pub-fn-test-guard maps it directly to `load_feed_state`).
+    #[test]
+    fn test_load_feed_state_none_when_absent() {
+        let dir = unique_tmp_dir("loadnone");
+        let data = dir.join(FEED_STATE_DIR);
+        std::fs::create_dir_all(&data).unwrap();
+        let path = data.join(FEED_STATE_FILENAME);
+        assert!(load_feed_state(&path).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `overlay_feeds` lets a persisted choice win and is identity for `None`
+    /// (named so the pub-fn-test-guard maps it directly to `overlay_feeds`).
+    #[test]
+    fn test_overlay_feeds_persisted_wins_and_none_is_identity() {
+        let cfg = FeedsConfig {
+            dhan_enabled: true,
+            groww_enabled: false,
+        };
+        let identity = overlay_feeds(cfg.clone(), None);
+        assert_eq!(identity.dhan_enabled, cfg.dhan_enabled);
+        assert_eq!(identity.groww_enabled, cfg.groww_enabled);
+        let eff = overlay_feeds(
+            cfg,
+            Some(PersistedFeedState {
+                dhan_enabled: false,
+                groww_enabled: true,
+                updated_at_ist: String::new(),
+            }),
+        );
+        assert!(!eff.dhan_enabled && eff.groww_enabled);
+    }
+
     /// A path that fails validation is rejected on BOTH read and write.
     #[test]
     fn test_non_canonical_path_rejected_on_read_and_write() {
