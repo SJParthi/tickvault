@@ -322,6 +322,25 @@ async fn main() -> Result<()> {
             config.network.request_timeout_ms,
         ),
     );
+    // ── Dhan dormant activation watcher (PR-2, feed-toggle-full-lifecycle) ──
+    // Spawned UNCONDITIONALLY at boot (like the Groww watcher), BEFORE the
+    // per-feed Dhan-OFF dispatcher below — so it survives a
+    // Dhan-OFF / Groww-only run (that branch awaits the shutdown signal before it
+    // returns, keeping the runtime alive). It is a level-triggered, safety-gated
+    // reconciler that keeps the `dhan_lane_running` UI flag HONEST across runtime
+    // toggles of a boot-ON Dhan feed and enforces the Dhan-disable safety gate at
+    // the supervisor layer (a second layer behind the handler's CONFLICT). It
+    // mutates ONLY the FeedRuntimeState atomics — NO new WS connection/endpoint
+    // (the 2-WS Dhan lock is untouched). Enabled-default is byte-identical: the
+    // inline Dhan boot block below already calls mark_dhan_lane_running(), so the
+    // watcher's first tick sees desired-ON + already-running → None → it does
+    // NOTHING to the boot. (Honest boundary: the full boot-OFF → cold-start lift
+    // of the inline Dhan boot spine is the deferred residual of this plan; see
+    // dhan_activation.rs module docs — PR-E's in-loop dormancy already handles the
+    // live disconnect/reconnect for a boot-ON Dhan feed.)
+    tokio::spawn(tickvault_app::dhan_activation::run_dhan_activation_watcher(
+        std::sync::Arc::clone(&feed_runtime),
+    ));
     // Step C (pluggable-feed-runtime.md §6): the Dhan disable-gate is now LIVE.
     // The actual skip-and-idle branch is below (just before the Dhan fast/slow
     // boot decision), AFTER shared infra (observability/WAL/calendar) is up so a

@@ -165,6 +165,75 @@ fn groww_lanes_spawn_dormant_and_self_idle_on_the_enable_flag() {
 }
 
 #[test]
+fn dhan_lanes_spawn_dormant_and_self_idle() {
+    // PR-2 (feed-toggle-full-lifecycle): mirror the Groww dormant-watcher guard
+    // for the Dhan lane. The Dhan activation watcher is spawned UNCONDITIONALLY
+    // at boot (so a runtime toggle has a supervisor behind it) and is a
+    // level-triggered, SAFETY-GATED reconciler that keeps the `dhan_lane_running`
+    // UI flag honest and refuses a teardown while live trading is on.
+    //
+    // This guard proves the new invariant mechanically so a future edit cannot
+    // (a) drop the unconditional watcher spawn, OR (b) drop the enable-flag read /
+    // safety-gate / JoinHandle-free pure-reconciler shape that makes it correct.
+    //
+    // NOTE: PR-2 does NOT relax the existing Dhan-OFF early-return guards below —
+    // the inline Dhan boot spine is still gated by `if !config.feeds.dhan_enabled`
+    // (enabled-default byte-identical). The watcher spawn is added BEFORE that
+    // branch, so the positional early-return assertions still hold.
+    let main = read_main_rs();
+
+    // (1) The watcher is spawned (the lane's supervisor exists for the toggle).
+    assert!(
+        main.contains("run_dhan_activation_watcher"),
+        "main.rs MUST spawn `run_dhan_activation_watcher` so the Dhan lane has a \
+         dormant supervisor behind the runtime toggle (PR-2)."
+    );
+
+    // (2) The spawn is UNCONDITIONAL, proven positionally: it appears BEFORE the
+    //     `if !config.feeds.dhan_enabled` per-feed dispatcher early-return, so it
+    //     runs regardless of which feed is enabled (a Dhan-OFF / Groww-only run
+    //     still spawns it and it survives because that branch awaits shutdown).
+    let watcher_pos = main
+        .find("run_dhan_activation_watcher")
+        .expect("main.rs must spawn run_dhan_activation_watcher");
+    let dhan_skip = main
+        .find("if !config.feeds.dhan_enabled")
+        .expect("main.rs must have the Dhan-off per-feed dispatcher skip-guard");
+    assert!(
+        watcher_pos < dhan_skip,
+        "the Dhan activation watcher MUST spawn BEFORE the \
+         `if !config.feeds.dhan_enabled` early-return — otherwise a Dhan-OFF run \
+         would return before spawning it and the runtime toggle would have no \
+         supervisor behind it."
+    );
+
+    // (3) The watcher module drives off the LIVE enable flag AND honours the
+    //     Dhan-disable safety gate (the supervisor-layer half of the two-layer
+    //     gate; the handler returns CONFLICT for the other half).
+    let dhan_act = read_app_src("dhan_activation.rs");
+    assert!(
+        dhan_act.contains("is_enabled(Feed::Dhan)"),
+        "dhan_activation.rs MUST read `is_enabled(Feed::Dhan)` so the lane state is \
+         driven by the live enable flag."
+    );
+    assert!(
+        dhan_act.contains("can_disable_dhan()")
+            && dhan_act.contains("reconcile_dhan_lane_action_with_gate"),
+        "dhan_activation.rs MUST consult `can_disable_dhan()` via \
+         `reconcile_dhan_lane_action_with_gate` so a runtime disable is REFUSED \
+         while live trading is on (supervisor-layer safety gate, PR-E)."
+    );
+
+    // (4) Honest UI flag both ways — the watcher uses the two-way setter so the
+    //     feed page never shows a stale "running" after a runtime teardown.
+    assert!(
+        dhan_act.contains("set_dhan_lane_running"),
+        "dhan_activation.rs MUST use `set_dhan_lane_running` (both-ways) so the \
+         feed page reports the truth across runtime toggles (no false-OK)."
+    );
+}
+
+#[test]
 fn both_feeds_off_is_handled_explicitly() {
     let src = read_main_rs();
     // When NEITHER feed is enabled the app must NOT silently do feed work — it
