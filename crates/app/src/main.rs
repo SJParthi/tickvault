@@ -258,8 +258,15 @@ async fn main() -> Result<()> {
     // the only case the pool is actually built below. If Dhan is OFF at boot the
     // pool is never spawned, so reporting it running would be a false-OK
     // (hostile-review HIGH 2026-06-21) — mirrors the groww_lane_running honesty.
+    // PR-2: `mark_dhan_pool_present()` records that a REAL pool exists this
+    // process (the sentinel PR-E's in-loop dormancy needs to resume). On a
+    // boot-OFF run this stays false, so the Dhan activation watcher REFUSES to
+    // mark the lane running on a runtime enable (no pool ⇒ no stream ⇒ no
+    // false-OK) — the boot-OFF cold-start of the inline Dhan spine is the
+    // documented deferred residual (a restart with dhan_enabled=true is required).
     if feeds.dhan_enabled {
         feed_runtime.mark_dhan_lane_running();
+        feed_runtime.mark_dhan_pool_present();
     }
     info!(
         dhan_enabled = feeds.dhan_enabled,

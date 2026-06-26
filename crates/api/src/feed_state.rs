@@ -7,10 +7,16 @@
 //! pause/resume a feed mid-session with no restart. The flags are lock-free
 //! `AtomicBool`s: O(1), zero-alloc reads on the lane's hot loop.
 //!
-//! **Honest envelope (slice 1):** only Groww is runtime-toggleable. Disabling the
-//! primary Dhan trading feed mid-session is unsafe, so the endpoint rejects
-//! `POST /api/feeds/dhan` (Dhan stays config+restart, per Step C). Dhan's flag is
-//! still reported by `GET /api/feeds` for visibility.
+//! **Honest envelope (PR-E / PR-2):** BOTH Dhan and Groww are runtime-toggleable.
+//! The Dhan *disable* direction is safety-gated — `POST /api/feeds/dhan {enabled:
+//! false}` is permitted only while `can_disable_dhan()` is true (the no-orders
+//! data-pull phase); once live trading is on it returns `409 CONFLICT` so the feed
+//! can never be blinded mid-trade. Enabling Dhan is always allowed. For a Dhan
+//! feed that was ENABLED at boot, a toggle is a true live pause/resume (PR-E
+//! in-loop dormancy). For a Dhan feed that was OFF at boot, no main-feed pool was
+//! spawned, so the `dhan_pool_present` sentinel stays false and a runtime enable
+//! records the desired flag WITHOUT marking the lane running (no false-OK) — a
+//! restart with `dhan_enabled=true` is the documented path to actually stream.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,6 +64,15 @@ pub struct FeedRuntimeState {
     groww_lane_running: AtomicBool,
     /// PR-E: set once by the boot wiring when the Dhan main-feed pool is spawned.
     dhan_lane_running: AtomicBool,
+    /// PR-2: set TRUE exactly where the inline Dhan boot spine spawned the
+    /// main-feed WS pool at boot (i.e. `dhan_enabled` was true AT BOOT). This is
+    /// the "a real pool exists for PR-E's in-loop dormancy to resume" sentinel,
+    /// distinct from `dhan_lane_running` (a transient UI flag the watcher
+    /// toggles). On a boot-OFF run (Dhan disabled at boot, e.g. Groww-only) NO
+    /// pool is spawned, so this stays `false` and a runtime enable must NOT mark
+    /// the lane running — that would be a false-OK (`dhan_lane_running=true` with
+    /// zero connections / zero ticks). Default `false`.
+    dhan_pool_present: AtomicBool,
     /// PR-E: gate on the Dhan *disable* direction (orders-live safety). Seeded
     /// from `dry_run` at boot; defaults `true` (no-orders phase).
     dhan_disable_allowed: AtomicBool,
@@ -77,6 +92,8 @@ impl FeedRuntimeState {
             // The lane is not running until the boot wiring spawns it.
             groww_lane_running: AtomicBool::new(false),
             dhan_lane_running: AtomicBool::new(false),
+            // No pool until the inline Dhan boot spine spawns one (boot-ON only).
+            dhan_pool_present: AtomicBool::new(false),
             dhan_disable_allowed: AtomicBool::new(true),
         }
     }
@@ -98,6 +115,23 @@ impl FeedRuntimeState {
     #[must_use]
     pub fn is_dhan_lane_running(&self) -> bool {
         self.dhan_lane_running.load(Ordering::Relaxed)
+    }
+
+    /// PR-2: the inline Dhan boot spine marks that it actually spawned the
+    /// main-feed WS pool at boot (the boot-ON case). Called from the SAME boot
+    /// block that calls [`Self::mark_dhan_lane_running`]. Idempotent.
+    pub fn mark_dhan_pool_present(&self) {
+        self.dhan_pool_present.store(true, Ordering::Relaxed);
+    }
+
+    /// PR-2: does a real Dhan main-feed pool exist this process (spawned at
+    /// boot)? The Dhan activation watcher reads this to refuse marking the lane
+    /// running on a runtime enable when NO pool was ever spawned (boot-OFF run) —
+    /// closing the false-OK where `dhan_lane_running` would claim `true` with zero
+    /// connections. `true` only after a boot-ON Dhan boot spine ran.
+    #[must_use]
+    pub fn is_dhan_pool_present(&self) -> bool {
+        self.dhan_pool_present.load(Ordering::Relaxed)
     }
 
     /// PR-2: set the Dhan lane-running flag BOTH ways. `mark_dhan_lane_running`
