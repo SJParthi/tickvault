@@ -59,6 +59,12 @@
 - **Evidence:** A worker that needed `rm -rf` (to clear the full temp dir) couldn't obtain approval autonomously and stalled; the safety gate is correct, but it's a real autonomy-to-completion friction point (the agent that detects the problem can't fix it without bouncing to the human).
 - **Suggested fix:** A bounded, allow-listed self-maintenance action (e.g. GC its own task-temp) the agent may take without a human round-trip.
 
+### REL-07 — a session "resume" re-clones a fresh container, silently discarding local-only state (working branch + scratchpad)
+- **Severity:** Medium
+- **Tag:** UNIVERSAL
+- **Evidence:** After the ENOSPC restart, the session resumed with the repo **re-cloned fresh on `main`** (HEAD reverted from the in-progress feature branch `claude/log-driven-fixes` back to `main`) and the entire scratchpad directory (delivered reports, design docs, the dossier working copy) **wiped** — only branches/PRs already pushed to origin survived. An agent mid-task on a feature branch must detect this and re-`fetch`/`checkout` from origin; any uncommitted/unpushed work or scratchpad-only artifact is lost.
+- **Suggested fix:** Preserve the active working branch + the session scratchpad across resume, OR emit a clear "resume = fresh clone; local-only state discarded; checked out `main`" notice at SessionStart so the agent re-orients deterministically instead of assuming continuity. Workaround that worked: push every branch to origin continuously (system-of-record), persist deliverables to git not just scratchpad.
+
 ---
 
 ## 3. Memory
@@ -114,7 +120,7 @@
 These findings were collected during a single live Claude Code session on the TickVault repository on 2026-06-26, while running the project's charter-mandated PR workflow (adversarial 3-agent review + GitHub MCP PR lifecycle + background monitor-to-merge). Each entry's **Evidence** describes what was directly observed in that session:
 
 - **Git/toolchain findings (REL-02, REL-03)** reproduce by inspecting the remote clone (`git log`, attempting `git diff origin/main...HEAD`, and running `cargo fmt --check`) in the remote container.
-- **Long-session environment findings (REL-04, REL-05, REL-06)** reproduce by running a sustained multi-worker session: launch many large background workers until the task-output temp dir under `/tmp/claude-0/<session>/tasks` fills (ENOSPC), and observe that subsequent Bash/git/cargo calls fail before capturing output, a context-overflowing subagent dies with "Autocompact is thrashing", and a blocked worker cannot `rm -rf` to self-clear without human approval.
+- **Long-session environment findings (REL-04, REL-05, REL-06, REL-07)** reproduce by running a sustained multi-worker session: launch many large background workers until the task-output temp dir under `/tmp/claude-0/<session>/tasks` fills (ENOSPC), and observe that subsequent Bash/git/cargo calls fail before capturing output, a context-overflowing subagent dies with "Autocompact is thrashing", and a blocked worker cannot `rm -rf` to self-clear without human approval. **REL-07** reproduces by triggering an environment restart (e.g. after the ENOSPC) while mid-task on an unpushed feature branch: on resume, `git rev-parse --abbrev-ref HEAD` reports `main` (not the working branch) and the scratchpad dir is empty — only origin-pushed branches survive.
 - **Memory findings (MEM-01, MEM-02)** reproduce by listing `.claude/rules/` + reading the APPROVED plan files and comparing their checkbox state against merged PRs on `main`.
 - **Session-UX findings (UX-01, UX-02)** reproduce by ending a turn with plain assistant text in a web-driven session and observing the Stop-hook (`stop-hook-reply-gate.py`) output verbatim.
 - **WINs (REL-01, PRO-01, FIT-01)** reproduce by launching multiple background subagents and observing automatic completion re-prompts and the fan-out/fan-in reconciliation.
