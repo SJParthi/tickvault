@@ -40,6 +40,7 @@
 #![cfg(feature = "daily_universe_fetcher")]
 
 use thiserror::Error;
+use tickvault_common::constants::INDEX_SYMBOL_ALIASES;
 
 use super::csv_parser::CsvRow;
 
@@ -137,6 +138,31 @@ pub fn normalize_index_symbol(symbol: &str) -> String {
         .to_ascii_uppercase()
 }
 
+/// Normalize a Dhan IDX_I row symbol, then resolve it through
+/// [`INDEX_SYMBOL_ALIASES`] (alias → canonical) so symbols Dhan renamed map
+/// back to their [`NSE_INDEX_ALLOWLIST`] form. Returns the canonical allowlist
+/// string when an alias matches, otherwise the normalized symbol unchanged.
+///
+/// This is the SELF-HEAL for the 2026-06-26 live WARN
+/// `index allowlist MISS ... NIFTY NEXT 50`: Dhan publishes that index as
+/// `NIFTY NXT 50` / `NIFTYNXT50`, neither of which equals the allowlisted
+/// `NIFTY NEXT 50` under an EXACT match. The alias map carries both forms →
+/// canonical `NIFTY NEXT 50`, so the row is no longer silently dropped.
+///
+/// O(1) EXEMPT: cold-path boot only (once per CSV index row); the alias map is
+/// a fixed small slice scanned linearly with no allocation beyond the one
+/// `normalize_index_symbol` `String`.
+#[must_use]
+pub fn canonicalize_index_symbol(symbol: &str) -> String {
+    let norm = normalize_index_symbol(symbol);
+    for (alias, canonical) in INDEX_SYMBOL_ALIASES {
+        if *alias == norm {
+            return (*canonical).to_string();
+        }
+    }
+    norm
+}
+
 /// Result of the index extraction pass.
 #[derive(Debug, Clone)]
 pub struct IndexExtraction {
@@ -217,7 +243,11 @@ pub fn extract_indices(rows: &[CsvRow]) -> Result<IndexExtraction, IndexExtractE
             // Operator lock 2026-06-01 §30: keep ONLY the 31 allowlisted
             // NSE indices (the Dhan Index-tab set). The master carries
             // 119 NSE index rows; the other 88 are dropped here.
-            let norm = normalize_index_symbol(&row.symbol_name);
+            // Alias-aware (2026-06-26): resolve Dhan renames (e.g.
+            // `NIFTY NXT 50` / `NIFTYNXT50` → `NIFTY NEXT 50`) via
+            // `INDEX_SYMBOL_ALIASES` so a renamed index self-heals instead
+            // of being dropped.
+            let norm = canonicalize_index_symbol(&row.symbol_name);
             if let Some(pos) = NSE_INDEX_ALLOWLIST
                 .iter()
                 .position(|allowed| *allowed == norm)
@@ -522,6 +552,46 @@ mod tests {
             "NIFTY MID100 FREE"
         );
         assert_eq!(normalize_index_symbol("giftnifty"), "GIFTNIFTY");
+    }
+
+    #[test]
+    fn canonicalize_index_symbol_resolves_aliases_and_passes_through() {
+        // Alias hits → canonical allowlist form.
+        assert_eq!(canonicalize_index_symbol("NIFTY NXT 50"), "NIFTY NEXT 50");
+        assert_eq!(canonicalize_index_symbol("NIFTYNXT50"), "NIFTY NEXT 50");
+        // Lowercase / extra-space variants normalize first, then alias-resolve.
+        assert_eq!(canonicalize_index_symbol("nifty nxt 50"), "NIFTY NEXT 50");
+        assert_eq!(canonicalize_index_symbol("  niftynxt50 "), "NIFTY NEXT 50");
+        // No alias → normalized passthrough.
+        assert_eq!(canonicalize_index_symbol("NIFTY"), "NIFTY");
+        assert_eq!(canonicalize_index_symbol("nifty 50"), "NIFTY 50");
+        // Already-canonical allowlist form is a no-op.
+        assert_eq!(canonicalize_index_symbol("NIFTY NEXT 50"), "NIFTY NEXT 50");
+    }
+
+    #[test]
+    fn test_nifty_next_50_resolves_via_alias() {
+        // Regression: 2026-06-26 — Dhan publishes NIFTY NEXT 50 as
+        // `NIFTY NXT 50` / `NIFTYNXT50`; the EXACT-match allowlist dropped it
+        // (live WARN `index allowlist MISS ... NIFTY NEXT 50`). Both forms must
+        // now land in nse_indices as the allowlisted `NIFTY NEXT 50`.
+        for dhan_symbol in ["NIFTY NXT 50", "NIFTYNXT50"] {
+            let rows = vec![
+                idx_i_row("13", "NSE", "INDEX", "NIFTY"),
+                idx_i_row("38", "NSE", "INDEX", dhan_symbol),
+                idx_i_row("51", "BSE", "INDEX", "SENSEX"),
+            ];
+            let result = extract_indices(&rows).expect("extract");
+            assert!(
+                result.nse_indices.iter().any(|r| r.security_id == "38"),
+                "Dhan symbol {dhan_symbol} must be kept via alias"
+            );
+            // The allowlisted canonical name must NOT be reported as a miss.
+            assert!(
+                !result.allowlist_misses.contains(&"NIFTY NEXT 50"),
+                "NIFTY NEXT 50 must self-heal for {dhan_symbol}, not be a miss"
+            );
+        }
     }
 
     #[test]

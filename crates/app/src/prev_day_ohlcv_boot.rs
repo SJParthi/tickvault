@@ -437,6 +437,10 @@ pub async fn run_prev_day_ohlcv_fetch(
     let limiter = RateLimiter::direct(quota);
     let mut writer = PrevDayOhlcvWriter::new(&questdb_config);
     let mut summary = PrevDayFetchSummary::default();
+    // Count of `Ok(None)` (Dhan 200-with-empty-body) outcomes — a SUBSET of
+    // `summary.skipped` — surfaced once as a coalesced summary after the loop
+    // (NOT one log line per symbol). 2026-06-26: 774 of these were silent.
+    let mut empty_bodies: usize = 0;
 
     for target in &universe.subscription_targets {
         let row = &target.csv_row;
@@ -501,7 +505,14 @@ pub async fn run_prev_day_ohlcv_fetch(
                 }
             }
             Ok(None) => {
-                // No candle for this symbol (illiquid / holiday / far OTM).
+                // No candle for this symbol (Dhan 200-with-empty-body —
+                // illiquid / holiday / far OTM). Counted as skipped. Before
+                // 2026-06-26 this arm was SILENT, so 774 empties were
+                // invisible. Per-empty static-label counter + a single
+                // coalesced debug summary after the loop make a future
+                // all-empty event diagnosable WITHOUT 774 log lines.
+                metrics::counter!("tv_prev_day_ohlcv_empty_total").increment(1);
+                empty_bodies = empty_bodies.saturating_add(1);
                 summary.skipped = summary.skipped.saturating_add(1);
             }
             Err(reason) => {
@@ -514,9 +525,19 @@ pub async fn run_prev_day_ohlcv_fetch(
     if writer.flush().is_err() {
         error!("prev_day_ohlcv: final flush failed — rows may be unpersisted");
     }
+    // Coalesced empty-body summary (NOT one line per symbol). Only when there
+    // was at least one Dhan 200-with-empty-body so a quiet run stays quiet.
+    if empty_bodies > 0 {
+        tracing::debug!(
+            empty_bodies,
+            of_targets = universe.subscription_targets.len(),
+            "prev_day_ohlcv: symbols with empty/malformed body (counted as skipped)"
+        );
+    }
     info!(
         fetched = summary.fetched,
         skipped = summary.skipped,
+        empty_bodies,
         failed = summary.failed,
         from = %from_date,
         "prev_day_ohlcv: boot fetch complete"
