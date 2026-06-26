@@ -1638,6 +1638,10 @@ async fn main() -> Result<()> {
                 std::sync::Arc::clone(&fast_notifier),
                 std::sync::Arc::clone(&health_status),
                 Some(std::sync::Arc::clone(&feed_health)), // SP5: Dhan connected state
+                // BOOT-ON fast crash-recovery path: keep the single-feed
+                // `process::exit(2)` Halt contract (H7 boot-ON is a separate
+                // tracked follow-up).
+                None,
             );
             // FAST BOOT parity with slow boot (main.rs ~1760):
             // emit per-connection + aggregate Telegram alerts so an operator
@@ -2192,6 +2196,9 @@ async fn main() -> Result<()> {
             boot_start,
             ws_wal_replay_live_feed,
             ws_wal_replay_order_update,
+            // BOOT-ON: keep the pre-existing single-feed `process::exit(2)` Halt
+            // contract (H7 boot-ON blast-radius is a tracked separate follow-up).
+            lane_scoped: false,
         };
         match start_dhan_lane(lane_ctx).await {
             Ok(handles) => {
@@ -3146,8 +3153,16 @@ async fn emit_websocket_connected_alerts(
 ///   fires once per down-cycle — the watchdog's internal
 ///   `degraded_alert_fired` flag de-duplicates).
 /// - `Recovered` → `WebSocketPoolRecovered { was_down_secs }`.
-/// - `Halt` → `WebSocketPoolHalt { down_secs }` + `std::process::exit(2)`
-///   so the supervisor restarts us.
+/// - `Halt` → `WebSocketPoolHalt { down_secs }`. The Halt action depends on the
+///   `lane_halt` blast-radius mode (H7):
+///   - `None` (BOOT-ON, single-feed contract) → `std::process::exit(2)` so
+///     systemd/the supervisor restarts the WHOLE process. This is the
+///     pre-existing behaviour and is preserved exactly.
+///   - `Some(notify)` (RUNTIME lane) → fire `notify.notify_waiters()` instead of
+///     `process::exit`, so the parked task tears the Dhan lane down + drives the
+///     FSM to `Off` (the runtime supervisor re-cold-starts it with bounded
+///     backoff). A lane-local Dhan fault MUST NOT take down the independent Groww
+///     feed or the shared seal-writer / aggregator / API server.
 /// - `Degrading` / `Healthy` → gauge update only, no Telegram.
 ///
 /// The task stops when the `shutdown_notify` is fired (during graceful
@@ -3166,6 +3181,10 @@ fn spawn_pool_watchdog_task(
     // state is honest; the classify() market-hours gate (C1 fix) ensures a
     // pre-market disconnected Dhan reads "idle", never a false Down.
     feed_health: Option<std::sync::Arc<tickvault_common::feed_health::FeedHealthRegistry>>,
+    // H7 lane-scoped blast-radius mode. `None` = BOOT-ON: keep `process::exit(2)`
+    // on Halt (single-feed contract). `Some(notify)` = RUNTIME lane: signal the
+    // parked task to tear down + drive the FSM to `Off`, NEVER `process::exit`.
+    lane_halt: Option<std::sync::Arc<tokio::sync::Notify>>,
 ) {
     tokio::spawn(async move {
         // 5-second poll interval — cold path, not per tick. Matches the
@@ -3264,17 +3283,44 @@ fn spawn_pool_watchdog_task(
                         WatchdogVerdict::Halt { down_for } => {
                             metrics::counter!("tv_pool_self_halts_total").increment(1);
                             if in_market_hours {
+                                notifier.notify(NotificationEvent::WebSocketPoolHalt {
+                                    down_secs: down_for.as_secs(),
+                                });
+                                // Give notifications + metrics flush a moment.
+                                tokio::time::sleep(std::time::Duration::from_secs(2)).await; // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
+                                if let Some(ref halt) = lane_halt {
+                                    // H7 RUNTIME lane: a lane-local Dhan fault MUST
+                                    // NOT take down the process / the independent
+                                    // Groww feed / the shared seal-writer +
+                                    // aggregator + API server. Signal the parked
+                                    // task to tear the lane down + drive the FSM to
+                                    // `Off` (the runtime supervisor re-cold-starts
+                                    // it with bounded backoff). NEVER process::exit.
+                                    error!(
+                                        down_for_secs = down_for.as_secs(),
+                                        "S4-T1a FATAL: pool watchdog fired Halt verdict \
+                                         (runtime lane). Tearing down the Dhan lane + \
+                                         driving the FSM to Off so the supervisor \
+                                         re-cold-starts it — Groww + shared infra stay \
+                                         alive. All main-feed WebSocket connections have \
+                                         been down for >300s."
+                                    );
+                                    metrics::counter!("tv_dhan_lane_watchdog_halt_total")
+                                        .increment(1);
+                                    halt.notify_waiters();
+                                    // The parked task owns the teardown from here;
+                                    // stop polling so we do not re-Halt mid-teardown.
+                                    return;
+                                }
+                                // BOOT-ON single-feed contract (pre-existing): exit
+                                // so systemd/the supervisor restarts the WHOLE
+                                // process.
                                 error!(
                                     down_for_secs = down_for.as_secs(),
                                     "S4-T1a FATAL: pool watchdog fired Halt verdict. \
                                      Exiting process with status 2 so the supervisor restarts us. \
                                      All main-feed WebSocket connections have been down for >300s."
                                 );
-                                notifier.notify(NotificationEvent::WebSocketPoolHalt {
-                                    down_secs: down_for.as_secs(),
-                                });
-                                // Give notifications + metrics flush a moment.
-                                tokio::time::sleep(std::time::Duration::from_secs(2)).await; // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
                                 std::process::exit(2);
                             } else {
                                 info!(
@@ -4050,6 +4096,16 @@ struct DhanLaneContext<'a> {
     /// consumes them — hence owned fields + `ctx` taken by value below.
     ws_wal_replay_live_feed: Vec<(u64, bytes::Bytes)>,
     ws_wal_replay_order_update: Vec<Vec<u8>>,
+    /// H7 lane-scoped watchdog (cross-feed blast-radius fix). `false` for a
+    /// BOOT-ON start (the inline boot spine — the pre-existing single-feed
+    /// contract keeps the `process::exit(2)` + systemd-restart Halt behaviour).
+    /// `true` for a RUNTIME-started lane (`run_dhan_lane_cold_start`) — its pool
+    /// watchdog MUST NOT `process::exit` on a 300s-all-down Halt (that would kill
+    /// the WHOLE process incl. the independent Groww feed + the shared seal-writer
+    /// / aggregator / API server). Instead the lane-scoped watchdog signals the
+    /// lane to tear down + drive the FSM to `Off` so the runtime supervisor
+    /// re-cold-starts it, leaving Groww + shared infra ALIVE.
+    lane_scoped: bool,
 }
 
 /// Why `start_dhan_lane` ended early. Maps 1:1 to the inline gate's two
@@ -4090,6 +4146,7 @@ async fn start_dhan_lane(
     let is_muhurat = ctx.is_muhurat;
     let is_mock_trading = ctx.is_mock_trading;
     let boot_start = ctx.boot_start;
+    let lane_scoped = ctx.lane_scoped;
     let mut ws_wal_replay_live_feed = ctx.ws_wal_replay_live_feed;
     let mut ws_wal_replay_order_update = ctx.ws_wal_replay_order_update;
 
@@ -5537,6 +5594,18 @@ async fn start_dhan_lane(
         });
     }
 
+    // H7 lane-scoped watchdog Halt signal. For a RUNTIME lane (`lane_scoped`)
+    // the pool watchdog signals this on a 300s-all-down Halt INSTEAD of
+    // `process::exit(2)`; the parked task (`park_running_dhan_lane`) observes it
+    // and tears the lane down + drives the FSM to `Off` so the supervisor
+    // re-cold-starts it — Groww + shared infra stay ALIVE. `None` for a BOOT-ON
+    // start (the watchdog keeps its `process::exit(2)` single-feed contract).
+    let lane_halt_notify: Option<std::sync::Arc<tokio::sync::Notify>> = if lane_scoped {
+        Some(std::sync::Arc::new(tokio::sync::Notify::new()))
+    } else {
+        None
+    };
+
     let (ws_handles, ws_pool_arc) = if let Some(pool) = ws_pool_ready {
         let pool_arc = std::sync::Arc::new(pool);
         // O1-B (2026-04-17): install per-connection runtime subscribe
@@ -5549,6 +5618,8 @@ async fn start_dhan_lane(
             std::sync::Arc::clone(&notifier),
             std::sync::Arc::clone(&health_status),
             Some(std::sync::Arc::clone(&feed_health)), // SP5: Dhan connected state
+            // H7: lane-scoped Halt handler. `Some` only for a runtime lane.
+            lane_halt_notify.as_ref().map(std::sync::Arc::clone),
         );
         // FAST BOOT parity: helper emits per-connection + aggregate Telegram
         // alerts on BOTH boot paths (main.rs ~830 for FAST BOOT, here for slow).
@@ -7019,6 +7090,10 @@ async fn start_dhan_lane(
         trading_handle,
         ws_pool_arc,
         shutdown_notify,
+        // H7: `Some` only for a runtime lane — the parked task watches this for
+        // the lane-scoped watchdog Halt signal. `None` for boot-ON (the watchdog
+        // keeps its `process::exit(2)` contract; boot-ON handles are not parked).
+        lane_halt_notify,
     })
 }
 
@@ -7045,6 +7120,13 @@ struct DhanLaneRunHandles {
     // Halt during intentional teardown).
     ws_pool_arc: Option<std::sync::Arc<WebSocketConnectionPool>>,
     shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
+    /// H7 lane-scoped watchdog Halt signal. `Some` ONLY for a RUNTIME lane: the
+    /// pool watchdog fires `notify_waiters()` on a 300s-all-down Halt instead of
+    /// `process::exit(2)`, and `park_running_dhan_lane` `select!`s on it to tear
+    /// the lane down + drive the FSM to `Off` (supervisor re-cold-starts it,
+    /// Groww + shared infra ALIVE). `None` for a BOOT-ON lane (not parked; the
+    /// watchdog keeps the pre-existing single-feed `process::exit(2)` behaviour).
+    lane_halt_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 /// Teardown of the Dhan-lane runtime tasks ONLY (renewal → order-update →
@@ -7067,6 +7149,8 @@ async fn teardown_dhan_lane_tasks(lane: DhanLaneRunHandles) {
         trading_handle,
         ws_pool_arc,
         shutdown_notify,
+        // H7: consumed by the parked task's `select!`, not needed during teardown.
+        lane_halt_notify: _,
     } = lane;
 
     // 1. Stop token renewal.
@@ -7437,6 +7521,32 @@ pub async fn run_dhan_lane_runtime_supervisor(
                     "[dhan-lane] cold-start task ended without bringing the lane up — reset to \
                      Off for a clean respawn"
                 );
+            } else if feed_runtime.dhan_lane_state() == LaneState::Running {
+                // Defensive (hostile-review LOW): the owned task finished while the
+                // FSM is still `Running` — i.e. `park_running_dhan_lane` panicked
+                // (or returned) BEFORE its `Running→Stopping→Off` teardown drove
+                // the FSM down. Without a recovery arm the lane stays stuck
+                // `Running` with a dead owner: `should_spawn_cold_start` (which
+                // requires `Off`) never fires, so the feed is dead forever. The
+                // `StartFailed` CAS above only fires from `Starting`, so it cannot
+                // recover a stuck `Running`. Force the FSM to `Off` + clear the
+                // running flag (safe: the owner is `is_finished`, so nothing else
+                // will drive the FSM; the dead task's `start_dhan_lane`/teardown
+                // already aborted its own spawns, so no double pool). The next
+                // desired-ON tick re-cold-starts the lane.
+                feed_runtime.set_dhan_lane_state(LaneState::Off);
+                feed_runtime.set_dhan_lane_running(false);
+                record_dhan_lane_transition(LaneState::Running, LaneState::Off);
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::DhanLane03AuthFailed.code_str(),
+                    severity = tickvault_common::error_code::ErrorCode::DhanLane03AuthFailed
+                        .severity()
+                        .as_str(),
+                    reason = "park_task_ended_while_running",
+                    stage = "supervisor",
+                    "[dhan-lane] parked lane task ended while still Running (panic before \
+                     teardown) — forced to Off for a clean respawn"
+                );
             }
             active_task = None;
         }
@@ -7571,6 +7681,10 @@ pub async fn run_dhan_lane_cold_start(ctx: std::sync::Arc<DhanLaneRuntimeContext
             boot_start: std::time::Instant::now(),
             ws_wal_replay_live_feed: Vec::new(),
             ws_wal_replay_order_update: Vec::new(),
+            // RUNTIME (H7): lane-scoped watchdog — a 300s-all-down Halt MUST NOT
+            // kill the process / Groww feed. It drives the lane FSM to Off so the
+            // supervisor re-cold-starts it (bounded backoff), shared infra ALIVE.
+            lane_scoped: true,
         };
 
         match start_dhan_lane(lane_ctx).await {
@@ -7659,11 +7773,35 @@ async fn park_running_dhan_lane(
     handles: DhanLaneRunHandles,
 ) {
     use tickvault_api::feed_state::{Feed, LaneEvent, LaneState};
+    // H7: the lane-scoped pool-watchdog Halt signal (always `Some` for a runtime
+    // lane — `start_dhan_lane` built it because `lane_scoped == true`). On a
+    // 300s-all-down Halt the watchdog fires this instead of `process::exit(2)`,
+    // and we tear the lane down + drive the FSM to `Off` so the supervisor
+    // re-cold-starts it (Groww + shared infra stay ALIVE).
+    let lane_halt = handles.lane_halt_notify.clone();
     let mut handles = Some(handles);
     loop {
         let desired_on = ctx.feed_runtime.is_enabled(Feed::Dhan);
         if desired_on {
-            tokio::time::sleep(DHAN_LANE_RUNTIME_POLL).await;
+            // Park: idle until EITHER the next poll tick (re-check the enable
+            // flag) OR the lane-scoped watchdog Halt fires. The Halt path is the
+            // H7 cross-feed blast-radius fix — a lane-local Dhan fault tears down
+            // ONLY this lane, never the process / Groww / shared infra.
+            if let Some(ref halt) = lane_halt {
+                tokio::select! {
+                    () = halt.notified() => {
+                        if let Some(owned) = handles.take() {
+                            handle_lane_watchdog_halt(&ctx, owned).await;
+                        }
+                        // Return so the supervisor's `should_spawn_cold_start`
+                        // re-cold-starts the lane (desired-ON + Off + no task).
+                        return;
+                    }
+                    () = tokio::time::sleep(DHAN_LANE_RUNTIME_POLL) => {}
+                }
+            } else {
+                tokio::time::sleep(DHAN_LANE_RUNTIME_POLL).await;
+            }
             continue;
         }
         // Desired OFF. The teardown is the safety-critical direction. H5:
@@ -7753,6 +7891,69 @@ async fn park_running_dhan_lane(
         });
         return;
     }
+}
+
+/// H7 cross-feed blast-radius fix — handle a RUNTIME lane's pool-watchdog Halt
+/// (all main-feed sockets down ≥300s during market hours) WITHOUT killing the
+/// process.
+///
+/// Unlike the boot-ON watchdog (which `std::process::exit(2)`s so systemd
+/// restarts the whole process), a runtime lane drives `Running→Stopping→Off`
+/// through the same FSM + lane-scoped `teardown_dhan_lane_tasks` as an operator
+/// disable, then RETURNS so the runtime supervisor re-cold-starts it with its
+/// bounded backoff. The independent Groww feed + the shared seal-writer /
+/// aggregator / API server stay ALIVE.
+///
+/// This is a FAULT-restart, NOT an operator disable, so it does NOT re-assert the
+/// H5 `can_disable_dhan()` gate: the feed's sockets are already dead (300s down),
+/// so there is nothing to "blind mid-trade" — the only action is to bring the
+/// dead feed back. The H8 abort-safety still holds: `teardown_dhan_lane_tasks`
+/// joins-or-force-aborts every lane handle the failed lane spawned.
+// TEST-EXEMPT: orchestration around the unit-tested FSM (advance_dhan_lane) + the live teardown_dhan_lane_tasks; the live Halt-restart path is exercised by the boot-deploy follow. The lane-scoped no-exit contract is pinned by the source-scan ratchet `runtime_lane_watchdog_does_not_process_exit`.
+async fn handle_lane_watchdog_halt(
+    ctx: &std::sync::Arc<DhanLaneRuntimeContext>,
+    owned: DhanLaneRunHandles,
+) {
+    use tickvault_api::feed_state::{LaneEvent, LaneState};
+    error!(
+        "[dhan-lane] runtime pool-watchdog Halt — tearing the lane down + driving the FSM \
+         to Off (supervisor re-cold-starts); Groww + shared infra stay alive"
+    );
+    // Drive Running→Stopping. If the FSM is no longer Running (a concurrent
+    // operator disable already drove it), the teardown below is still safe
+    // (handles are joined-or-force-aborted) and we converge to Off.
+    if ctx.feed_runtime.advance_dhan_lane(LaneEvent::StopRequested) == Some(LaneState::Stopping) {
+        record_dhan_lane_transition(LaneState::Running, LaneState::Stopping);
+    }
+    // H6 join (bounded drain) BEFORE reporting Stopping→Off. NEVER touches the
+    // PROCESS API server / seal-writer / aggregator / otel (C2).
+    let teardown = teardown_dhan_lane_tasks(owned);
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(DHAN_LANE_TEARDOWN_DRAIN_TIMEOUT_SECS),
+        teardown,
+    )
+    .await
+    .is_err()
+    {
+        let code = tickvault_common::error_code::ErrorCode::DhanLane04TeardownTimeout;
+        error!(
+            code = code.code_str(),
+            severity = code.severity().as_str(),
+            "[dhan-lane] watchdog-Halt teardown drain timed out — handles force-aborted; \
+             lane still reaches Off"
+        );
+        metrics::counter!("tv_dhan_lane_teardown_forced_total").increment(1);
+    }
+    // Drive Stopping→Off ONLY after the join, so the supervisor's
+    // `should_spawn_cold_start` (desired-ON + Off + no active task) re-cold-starts.
+    if ctx.feed_runtime.advance_dhan_lane(LaneEvent::StopJoined) == Some(LaneState::Off) {
+        record_dhan_lane_transition(LaneState::Stopping, LaneState::Off);
+    }
+    ctx.feed_runtime.set_dhan_lane_running(false);
+    info!(
+        "[dhan-lane] watchdog-Halt teardown complete (→Off) — supervisor will re-cold-start \
+         the lane on the next tick"
+    );
 }
 
 // ---------------------------------------------------------------------------
