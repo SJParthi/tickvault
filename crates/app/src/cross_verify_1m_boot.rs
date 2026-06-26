@@ -31,9 +31,9 @@ use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
 use tickvault_common::sanitize::{capture_rest_error_body, redact_url_params};
 use tickvault_common::url_join::join_api_url;
 use tickvault_core::auth::token_manager::TokenHandle;
-use tickvault_storage::cross_verify_1m_audit_persistence::{
-    CrossVerify1mAuditWriter, CrossVerify1mMismatch, MismatchField, csv_header,
-    ensure_cross_verify_1m_audit_table, mismatch_to_csv_line,
+use tickvault_storage::feed_parity_1m_audit_persistence::{
+    FeedParity1mAuditWriter, FeedParity1mMismatch, MismatchField, csv_header,
+    ensure_feed_parity_1m_audit_table, mismatch_to_csv_line,
 };
 
 /// Dhan Data-API rate limit: 5 requests/second.
@@ -215,7 +215,7 @@ impl CompareStats {
 /// EXACT timestamp-keyed OHLCV diff for ONE instrument. Pure — O(N) with an
 /// O(1) HashMap join on the IST-minute bucket. For every minute Dhan reports:
 /// if we have the same minute, compare all 5 fields exactly and emit one
-/// `CrossVerify1mMismatch` per differing field; otherwise count it as
+/// `FeedParity1mMismatch` per differing field; otherwise count it as
 /// `missing_ours`. Minutes we have but Dhan does NOT are ignored (Dhan's tape
 /// is authoritative — we only flag where Dhan disagrees or we are missing).
 #[must_use]
@@ -227,7 +227,7 @@ pub fn diff_minute_candles(
     trading_date_ist_nanos: i64,
     ours: &[MinuteCandle],
     dhan: &[MinuteCandle],
-) -> (Vec<CrossVerify1mMismatch>, CompareStats) {
+) -> (Vec<FeedParity1mMismatch>, CompareStats) {
     let mut by_minute: HashMap<i64, MinuteCandle> = HashMap::with_capacity(ours.len());
     for c in ours {
         by_minute.insert(c.minute_ts_ist_nanos, *c);
@@ -240,12 +240,13 @@ pub fn diff_minute_candles(
             continue;
         };
         stats.compared = stats.compared.saturating_add(1);
-        let mut push = |field: MismatchField, our_value: f64, dhan_value: f64| {
+        let mut push = |field: MismatchField, live_value: f64, backtest_value: f64| {
             // Cold path (post-market, once/day) — owning the segment/symbol
             // Strings per cell is irrelevant to performance.
-            out.push(CrossVerify1mMismatch {
-                // Dhan cross-verify (Dhan live vs Dhan REST). Groww parity lives
-                // in its own groww_cross_verify_1m_audit table (lock §32).
+            out.push(FeedParity1mMismatch {
+                // Dhan parity (Dhan live vs Dhan REST tape = the backtest). Routes
+                // to the unified feed_parity_1m_audit table (SP5); `feed` is in the
+                // DEDUP key so Dhan + Groww rows for the same cell both persist.
                 feed: tickvault_common::feed::Feed::Dhan.as_str(),
                 run_ts_ist_nanos,
                 trading_date_ist_nanos,
@@ -254,8 +255,8 @@ pub fn diff_minute_candles(
                 symbol: symbol.to_string(),
                 minute_ts_ist_nanos: d.minute_ts_ist_nanos,
                 field,
-                our_value,
-                dhan_value,
+                live_value,
+                backtest_value,
             });
             stats.mismatches = stats.mismatches.saturating_add(1);
         };
@@ -524,7 +525,7 @@ pub enum FlushOutcome {
 /// sender still returns `Err("not connected")` — alarming about unpersisted
 /// rows when pending = 0. Skip the flush entirely when nothing is buffered;
 /// when something IS buffered and the flush fails, report the exact count.
-pub fn final_flush(writer: &mut CrossVerify1mAuditWriter) -> FlushOutcome {
+pub fn final_flush(writer: &mut FeedParity1mAuditWriter) -> FlushOutcome {
     if writer.pending() == 0 {
         return FlushOutcome::SkippedEmpty;
     }
@@ -563,7 +564,7 @@ pub async fn run_cross_verify_1m(
     run_ts_ist_nanos: i64,
     csv_dir: &str,
 ) -> CrossVerify1mSummary {
-    ensure_cross_verify_1m_audit_table(&questdb_config).await;
+    ensure_feed_parity_1m_audit_table(&questdb_config).await;
 
     let jwt = {
         let guard = token_handle.load();
@@ -605,7 +606,7 @@ pub async fn run_cross_verify_1m(
         }
     };
     let limiter = tickvault_trading::oms::rate_limiter::OrderRateLimiter::new(DATA_API_RPS);
-    let mut writer = CrossVerify1mAuditWriter::new(&questdb_config);
+    let mut writer = FeedParity1mAuditWriter::new(&questdb_config);
 
     let trading_date_ist_nanos = day_start_ist_nanos;
     let to_date = trading_date.succ_opt().unwrap_or(trading_date);
@@ -961,8 +962,10 @@ mod tests {
         assert_eq!(m.run_ts_ist_nanos, 777);
         assert_eq!(m.trading_date_ist_nanos, 555);
         assert_eq!(m.minute_ts_ist_nanos, ts);
-        assert_eq!(m.our_value, 100.0);
-        assert_eq!(m.dhan_value, 200.0);
+        assert_eq!(m.live_value, 100.0);
+        assert_eq!(m.backtest_value, 200.0);
+        // Dhan parity rows route to the unified table with feed='dhan'.
+        assert_eq!(m.feed, tickvault_common::feed::Feed::Dhan.as_str());
     }
 
     #[test]
@@ -1198,7 +1201,7 @@ mod tests {
     /// produce a flush error — even on a disconnected writer.
     #[test]
     fn test_final_flush_skips_when_no_pending_rows() {
-        let mut w = CrossVerify1mAuditWriter::for_test();
+        let mut w = FeedParity1mAuditWriter::for_test();
         assert!(!w.is_connected());
         assert_eq!(final_flush(&mut w), FlushOutcome::SkippedEmpty);
     }
@@ -1207,8 +1210,8 @@ mod tests {
     /// pending count.
     #[test]
     fn test_final_flush_errors_with_pending_count_when_disconnected() {
-        let mut w = CrossVerify1mAuditWriter::for_test();
-        let m = CrossVerify1mMismatch {
+        let mut w = FeedParity1mAuditWriter::for_test();
+        let m = FeedParity1mMismatch {
             feed: "dhan",
             run_ts_ist_nanos: 1,
             trading_date_ist_nanos: 1,
@@ -1217,8 +1220,8 @@ mod tests {
             symbol: "NIFTY".to_string(),
             minute_ts_ist_nanos: 60 * NANOS_PER_SEC,
             field: MismatchField::Open,
-            our_value: 1.0,
-            dhan_value: 2.0,
+            live_value: 1.0,
+            backtest_value: 2.0,
         };
         w.append_mismatch(&m).expect("append");
         w.append_mismatch(&m).expect("append");

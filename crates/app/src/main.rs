@@ -7478,7 +7478,7 @@ fn spawn_post_market_tasks(
     // cross-verification at 15:31:00 IST. For every subscribed SPOT
     // instrument, compare our live `candles_1m` OHLCV against Dhan's
     // authoritative intraday 1-minute candles, EXACT match, and write
-    // mismatches to the `cross_verify_1m_audit` table + a per-day CSV
+    // mismatches to the unified `feed_parity_1m_audit` table + a per-day CSV
     // (`data/cross-verify/`). The per-day mismatch COUNT is the quality
     // signal. Cold path, fail-soft, market-hours-gated (audit Rule 3).
     if let Some(cv_universe) = tickvault_app::prev_day_ohlcv_boot::stashed_universe() {

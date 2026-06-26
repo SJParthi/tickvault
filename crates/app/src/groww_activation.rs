@@ -231,11 +231,13 @@ async fn activate_groww_lane(
     }
 
     // Groww shares Dhan's `ticks` + 21 `candles_<tf>` tables (operator
-    // 2026-06-19); these ensures DELEGATE to the canonical shared DDL. Only
-    // `groww_cross_verify_1m_audit` is an isolated groww_* table. Idempotent.
+    // 2026-06-19); these ensures DELEGATE to the canonical shared DDL. SP5: the
+    // 1m parity audit is now the ONE unified `feed_parity_1m_audit` table (both
+    // feeds write it, `feed` in the DEDUP key) — Groww ensures the same table the
+    // Dhan path does (idempotent).
     tickvault_storage::groww_persistence::ensure_groww_live_ticks_table(&questdb).await;
     tickvault_storage::groww_candle_persistence::ensure_groww_candles_1m_table(&questdb).await;
-    tickvault_storage::groww_cross_verify_audit_persistence::ensure_groww_cross_verify_1m_audit_table(
+    tickvault_storage::feed_parity_1m_audit_persistence::ensure_feed_parity_1m_audit_table(
         &questdb,
     )
     .await;
