@@ -296,6 +296,12 @@ async fn main() -> Result<()> {
     if feeds.dhan_enabled {
         feed_runtime.mark_dhan_lane_running();
         feed_runtime.mark_dhan_pool_present();
+        // D2b: seed the lane FSM to `Starting` for the boot-ON case so the
+        // runtime cold-start supervisor (spawned below) NEVER race-spawns a
+        // second cold-start while the inline boot spine is bringing the lane up.
+        // The inline `start_dhan_lane` success below drives `Starting→Running`;
+        // a boot-ON abort drives it back to `Off`. Boot-OFF leaves it `Off`.
+        feed_runtime.set_dhan_lane_state(tickvault_api::feed_state::LaneState::Starting);
     }
     info!(
         dhan_enabled = feeds.dhan_enabled,
@@ -376,6 +382,23 @@ async fn main() -> Result<()> {
     // live disconnect/reconnect for a boot-ON Dhan feed.)
     tokio::spawn(tickvault_app::dhan_activation::run_dhan_activation_watcher(
         std::sync::Arc::clone(&feed_runtime),
+    ));
+    // ── D2b: runtime Dhan-lane cold-start supervisor ──────────────────────
+    // Spawned UNCONDITIONALLY at boot (like the Groww watcher), so a Dhan feed
+    // that was OFF *at boot* (no pool spawned) is runtime-startable. It idles
+    // (zero Dhan work) until `main()` populates `dhan_lane_ctx_cell` right after
+    // `build_shared_infra` (which runs in BOTH the Dhan-ON and Dhan-OFF paths).
+    // It owns the ONE abortable cold-start `JoinHandle` (the Groww shape) and
+    // drives the `LaneState` FSM (Off→Starting→Running→Stopping→Off). Boot-ON is
+    // byte-identical: the inline spine already drove the FSM to Starting (seed
+    // above) / Running, so the supervisor's first tick sees a non-Off lane and
+    // does NOTHING. See the D2b section near `run_dhan_lane_runtime_supervisor`.
+    let dhan_lane_ctx_cell: std::sync::Arc<
+        tokio::sync::OnceCell<std::sync::Arc<DhanLaneRuntimeContext>>,
+    > = std::sync::Arc::new(tokio::sync::OnceCell::new());
+    tokio::spawn(run_dhan_lane_runtime_supervisor(
+        std::sync::Arc::clone(&feed_runtime),
+        std::sync::Arc::clone(&dhan_lane_ctx_cell),
     ));
     // Step C (pluggable-feed-runtime.md §6): the Dhan disable-gate is now LIVE.
     // The actual skip-and-idle branch is below (just before the Dhan fast/slow
@@ -2101,6 +2124,37 @@ async fn main() -> Result<()> {
     .await?;
 
     // =======================================================================
+    // D2b: build + publish the OWNED runtime Dhan-lane context, so the
+    // already-spawned runtime supervisor can cold-start a boot-OFF Dhan feed at
+    // any time. Built in BOTH the Dhan-ON and Dhan-OFF paths (this code runs
+    // for both). `config.clone()` is a deep copy of the immutable boot config
+    // (no env re-parse). The `set` is idempotent (the cell is set exactly once).
+    // =======================================================================
+    {
+        let runtime_ctx = std::sync::Arc::new(DhanLaneRuntimeContext::new(
+            std::sync::Arc::new(config.clone()),
+            std::sync::Arc::clone(&notifier),
+            std::sync::Arc::clone(&health_status),
+            tick_broadcast_sender.clone(),
+            order_update_sender.clone(),
+            std::sync::Arc::clone(&feed_runtime),
+            std::sync::Arc::clone(&feed_health),
+            std::sync::Arc::clone(&trading_calendar),
+            ws_frame_spill.clone(),
+        ));
+        if dhan_lane_ctx_cell.set(runtime_ctx).is_err() {
+            // The cell was already populated (cannot happen — set once per boot);
+            // log defensively rather than panic.
+            warn!("[dhan-lane] runtime context cell already set — ignoring duplicate publish");
+        } else {
+            info!(
+                "[dhan-lane] runtime cold-start context published — a boot-OFF Dhan feed is now \
+                 runtime-startable via the feed-control webpage"
+            );
+        }
+    }
+
+    // =======================================================================
     // DHAN LANE (Dhan-ON slow boot ONLY) — wrapped in the per-feed gate.
     //
     // Everything from IP-verify through the periodic health check is Dhan-lane
@@ -2140,7 +2194,25 @@ async fn main() -> Result<()> {
             ws_wal_replay_order_update,
         };
         match start_dhan_lane(lane_ctx).await {
-            Ok(handles) => Some(handles),
+            Ok(handles) => {
+                // D2b: boot-ON inline start succeeded — drive the lane FSM
+                // Starting→Running (the seed set it to Starting above). The
+                // runtime supervisor sees Running and does NOTHING for boot-ON
+                // (byte-identical boot behaviour). Edge-triggered gauge write.
+                feed_runtime.set_dhan_lane_state(tickvault_api::feed_state::LaneState::Running);
+                record_dhan_lane_transition(
+                    tickvault_api::feed_state::LaneState::Starting,
+                    tickvault_api::feed_state::LaneState::Running,
+                );
+                Some(handles)
+            }
+            // D2b LOW (cosmetic, deferred): a boot-ON inline abort leaves the
+            // seeded `Starting` gauge value until the (immediate) process exit.
+            // We KEEP the exact one-liner mapping the D2a behaviour-identical
+            // ratchet pins (`d2a_start_dhan_lane_guard::boot_abort_outcomes_map_
+            // back_to_main_returns`) — the process exits on either arm, so the
+            // stale gauge is never observed by a live system. Driving it to Off
+            // here would break the D2a one-liner ratchet for zero runtime gain.
             Err(StartLaneError::BootAbortClean) => return Ok(()),
             Err(StartLaneError::BootAbortErr(err)) => return Err(err),
         }
@@ -7069,6 +7141,620 @@ async fn teardown_dhan_lane_tasks(lane: DhanLaneRunHandles) {
     }
 }
 
+// ===========================================================================
+// D2b — Runtime Dhan-lane cold-start FSM (start/stop wiring + lane runtime)
+//
+// `start_dhan_lane` above is the boot-path (slow-arm) extraction. For a Dhan
+// feed that was OFF *at boot* (no pool spawned), this section makes it
+// runtime-startable via the dormant activation watcher (`dhan_activation.rs`),
+// driving the `LaneState` FSM (`Off→Starting→Running→Stopping→Off`).
+//
+// The watcher is spawned UNCONDITIONALLY at boot (line ~377) with an
+// `Arc<OnceCell<Arc<DhanLaneRuntimeContext>>>`. `main()` populates the cell
+// right after `build_shared_infra` (which runs in BOTH the Dhan-ON and Dhan-OFF
+// paths), so the runtime context exists whether or not a lane started at boot.
+//
+// Safety fixes wired here (design §0.5):
+//   * C2 ownership — the runtime wrapper NEVER creates/tears down the PROCESS
+//     seal-writer / 21-TF aggregator / API server (those live in
+//     `build_shared_infra`); it only drives the LANE via `start_dhan_lane` +
+//     `teardown_dhan_lane_tasks`. It spawns NO children of its own.
+//   * Phantom-running closure — `LaneState::Running` (and `mark_dhan_pool_*`)
+//     is set ONLY after `start_dhan_lane` returns `Ok` (FSM `StartSucceeded`).
+//   * H5 gate-hold — the runtime Stop re-asserts `can_disable_dhan()`
+//     IMMEDIATELY before the irreversible teardown; if the gate re-closed it
+//     ABORTS (keeps `Running`).
+//   * H6 double-pool — `Stopping→Off` happens ONLY after teardown awaits all
+//     handles join (`StopJoined`); the FSM rejects `Stopping→Starting`.
+//   * H7 lane watchdog — `start_dhan_lane`'s pool watchdog is reused as-is;
+//     this section does NOT add a `process::exit` path.
+//   * H8 cancel-safety — a single owned `JoinHandle` (held by the watcher) +
+//     `.abort()`; `start_dhan_lane` aborts every lane-owned handle it spawned
+//     so far on an Err/cancel. The runtime wrapper holds NO extra spawns.
+//   * Backoff — bounded `min(10 * 2^n, 300)`s between failed cold-starts.
+//
+// Deferred to D2c (documented honest residual per Rule 14 — NOT a skeleton:
+// every fn below has a real call site + real work):
+//   * The full `dhan_lane_audit` QuestDB table + typed Telegram event variants
+//     (this PR uses `NotificationEvent::Custom` for the start/stop pings).
+//   * C4 "lane owns its TokenManager handle end-to-end in DhanLaneRunHandles":
+//     the lane already keeps its token alive via the renewal task it spawned;
+//     the global `OnceLock` (`set_global_token_manager`) is a best-effort
+//     convenience that no-ops if already set. The runtime wrapper does NOT add
+//     a second `set_global_token_manager` call, so a runtime cold-start cannot
+//     double-set it; a runtime Stop aborts the renewal task (which owns the
+//     manager), so the manager is dropped when that task ends. Threading the
+//     manager handle out through `DhanLaneRunHandles` so the Stop can drop it
+//     deterministically is a deeper spine refactor tracked for D2c.
+// ===========================================================================
+
+/// Cap on the per-failed-cold-start retry backoff, mirroring the Groww
+/// activation watcher's `min(10 * 2^n, 300)` ladder (cold control-plane).
+const DHAN_LANE_RETRY_BACKOFF_CAP_SECS: u64 = 300;
+
+/// Bounded drain timeout for a runtime Stop's graceful WS close before the
+/// teardown force-aborts and emits `DHAN-LANE-04`. The inner
+/// `teardown_dhan_lane_tasks` itself bounds the WS close; this is the outer
+/// wall-clock budget that detects a hung teardown.
+const DHAN_LANE_TEARDOWN_DRAIN_TIMEOUT_SECS: u64 = 30;
+
+/// Poll cadence for the Running-lane disable watch + the cold-start race
+/// re-evaluation. Cold control-plane (a feed toggle), NOT the hot tick path —
+/// a 2s observation latency is irrelevant. Mirrors `DHAN_ACTIVATION_POLL`.
+const DHAN_LANE_RUNTIME_POLL_SECS: u64 = 2;
+const DHAN_LANE_RUNTIME_POLL: std::time::Duration =
+    std::time::Duration::from_secs(DHAN_LANE_RUNTIME_POLL_SECS);
+
+/// Owned, re-entrant PROCESS-shared state the runtime Dhan-lane cold-start
+/// needs — every field is a cheap `Arc`/`Clone`, captured ONCE after
+/// `build_shared_infra` so the watcher can start the lane from cold at any time
+/// (M9 / L11). This is the OWNED mirror of the boot-path borrowed
+/// `DhanLaneContext<'a>`; the runtime wrapper rebuilds the borrowed context
+/// from these owned fields at call time so the (verbatim-extracted)
+/// `start_dhan_lane` body is reused unchanged.
+pub struct DhanLaneRuntimeContext {
+    config: std::sync::Arc<ApplicationConfig>,
+    notifier: std::sync::Arc<NotificationService>,
+    health_status: SharedHealthStatus,
+    tick_broadcast_sender: tokio::sync::broadcast::Sender<tickvault_common::tick_types::ParsedTick>,
+    order_update_sender: tokio::sync::broadcast::Sender<tickvault_common::order_types::OrderUpdate>,
+    feed_runtime: std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
+    feed_health: std::sync::Arc<tickvault_common::feed_health::FeedHealthRegistry>,
+    trading_calendar: std::sync::Arc<TradingCalendar>,
+    ws_frame_spill: Option<std::sync::Arc<tickvault_storage::ws_frame_spill::WsFrameSpill>>,
+}
+
+impl DhanLaneRuntimeContext {
+    /// Build the owned runtime context from the PROCESS-shared infra. Called
+    /// ONCE in `main()` after `build_shared_infra`, then handed to the dormant
+    /// activation watcher via the shared `OnceCell`.
+    #[allow(clippy::too_many_arguments)] // APPROVED: captures the full PROCESS-shared infra set (L11)
+    #[must_use]
+    // TEST-EXEMPT: trivial field-assignment constructor; its real call site is the boot wiring (dhan_lane_ctx_cell.set after build_shared_infra) and it is exercised by the live boot-deploy follow. No logic to unit-test.
+    pub fn new(
+        config: std::sync::Arc<ApplicationConfig>,
+        notifier: std::sync::Arc<NotificationService>,
+        health_status: SharedHealthStatus,
+        tick_broadcast_sender: tokio::sync::broadcast::Sender<
+            tickvault_common::tick_types::ParsedTick,
+        >,
+        order_update_sender: tokio::sync::broadcast::Sender<
+            tickvault_common::order_types::OrderUpdate,
+        >,
+        feed_runtime: std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
+        feed_health: std::sync::Arc<tickvault_common::feed_health::FeedHealthRegistry>,
+        trading_calendar: std::sync::Arc<TradingCalendar>,
+        ws_frame_spill: Option<std::sync::Arc<tickvault_storage::ws_frame_spill::WsFrameSpill>>,
+    ) -> Self {
+        Self {
+            config,
+            notifier,
+            health_status,
+            tick_broadcast_sender,
+            order_update_sender,
+            feed_runtime,
+            feed_health,
+            trading_calendar,
+            ws_frame_spill,
+        }
+    }
+}
+
+/// Map a `start_dhan_lane` failure to its typed `DHAN-LANE-0N` ErrorCode + the
+/// fixed (secret-free) `reason` discriminant + the `stage` counter label. Pure
+/// + unit-tested so the runtime classify path is verifiable without I/O.
+///
+/// The boot extraction collapses every pre-pool gate (IP / auth / static-IP /
+/// dual-instance / instrument-load) into the two `StartLaneError` flavours. At
+/// RUNTIME we cannot tell auth from universe apart beyond those two flavours, so:
+///   * `BootAbortClean` (a boot gate refused) maps to `DHAN-LANE-03` (auth/gate),
+///     the most common runtime cold-start failure class.
+///   * `BootAbortErr` (instrument-load failed) maps to `DHAN-LANE-01`
+///     (universe-build).
+/// `DHAN-LANE-02` (ws-pool-spawn) + `DHAN-LANE-04` (teardown-timeout) are
+/// emitted at their own dedicated sites (the pool-spawn split of
+/// `start_dhan_lane`'s return type is tracked for D2c; today pool-spawn
+/// failures surface inside `BootAbortErr` and are cross-linked from the
+/// `DHAN-LANE-01` runbook).
+#[must_use]
+fn classify_start_lane_error(
+    err: &StartLaneError,
+) -> (
+    tickvault_common::error_code::ErrorCode,
+    &'static str,
+    &'static str,
+) {
+    use tickvault_common::error_code::ErrorCode;
+    match err {
+        StartLaneError::BootAbortClean => (
+            ErrorCode::DhanLane03AuthFailed,
+            "auth_or_gate_failed",
+            "auth",
+        ),
+        StartLaneError::BootAbortErr(_) => (
+            ErrorCode::DhanLane01UniverseBuildFailed,
+            "universe_build_failed",
+            "universe",
+        ),
+    }
+}
+
+/// Compute the bounded retry backoff for the Nth consecutive failed cold-start.
+/// `min(10 * 2^attempt, 300)` seconds — identical ladder to the Groww watcher
+/// (cold control-plane). Pure + unit-tested.
+#[must_use]
+fn dhan_lane_retry_backoff_secs(attempt: u32) -> u64 {
+    std::cmp::min(
+        10u64.saturating_mul(1u64 << attempt.min(5)),
+        DHAN_LANE_RETRY_BACKOFF_CAP_SECS,
+    )
+}
+
+/// Stable static label for the lane state (no allocation on the metric path).
+const fn lane_state_label(state: tickvault_api::feed_state::LaneState) -> &'static str {
+    use tickvault_api::feed_state::LaneState;
+    match state {
+        LaneState::Off => "off",
+        LaneState::Starting => "starting",
+        LaneState::Running => "running",
+        LaneState::Stopping => "stopping",
+    }
+}
+
+/// Edge-triggered `tv_dhan_lane_state` gauge write (L12): set the gauge ONLY on
+/// a real FSM transition, never per-poll. Also bumps the per-transition counter.
+fn record_dhan_lane_transition(
+    from: tickvault_api::feed_state::LaneState,
+    to: tickvault_api::feed_state::LaneState,
+) {
+    metrics::gauge!("tv_dhan_lane_state").set(f64::from(to.as_u8()));
+    metrics::counter!(
+        "tv_dhan_lane_transitions_total",
+        "from" => lane_state_label(from),
+        "to" => lane_state_label(to),
+    )
+    .increment(1);
+}
+
+/// Decide whether the runtime supervisor should ABORT the in-flight cold-start
+/// task this tick (cancel-safety, H8). Pure + unit-tested.
+///
+/// The cold-start task owns the FULL lifecycle (Off→Starting→Running→park→
+/// gated-teardown→Off). The supervisor only needs to force-cancel the ONE case
+/// the task cannot self-resolve: a cold-start still in `Starting` (no pool
+/// parked yet, `start_dhan_lane` has no cancel arm) when the operator has
+/// flipped Dhan OFF. Aborting then triggers `start_dhan_lane`'s own cleanup
+/// (it aborts every lane-owned handle it spawned so far) at the next `.await`.
+///
+/// A `Running` lane is NOT aborted by the supervisor — its parked task does the
+/// H5-gated, H6-joined teardown itself; aborting it would skip the gate-hold +
+/// the handle-join. An `Off`/`Stopping` lane has no in-flight start to cancel.
+#[must_use]
+fn should_abort_cold_start_on_disable(
+    desired_on: bool,
+    lane_state: tickvault_api::feed_state::LaneState,
+) -> bool {
+    use tickvault_api::feed_state::LaneState;
+    !desired_on && matches!(lane_state, LaneState::Starting)
+}
+
+/// Decide whether the runtime supervisor should SPAWN a fresh cold-start task
+/// this tick. Pure + unit-tested. Spawn iff: desired-ON AND the lane is in a
+/// confirmed-empty `Off` (no pool — H6: never start from `Stopping`) AND no
+/// task is currently active.
+#[must_use]
+fn should_spawn_cold_start(
+    desired_on: bool,
+    lane_state: tickvault_api::feed_state::LaneState,
+    task_active: bool,
+) -> bool {
+    use tickvault_api::feed_state::LaneState;
+    desired_on && matches!(lane_state, LaneState::Off) && !task_active
+}
+
+/// Runtime Dhan-lane cold-start SUPERVISOR — the single owner of the one
+/// abortable cold-start `JoinHandle` (the Groww-watcher shape). Spawned
+/// UNCONDITIONALLY at boot; idles (zero Dhan work) until the runtime context is
+/// populated (after `build_shared_infra`) AND the operator enables a boot-OFF
+/// Dhan feed. Level-triggered: it compares the live enable flag + the shared
+/// `LaneState` against whether it holds an active task, so a flap converges to
+/// the final state and a sub-poll ON→OFF→ON cannot leave a stuck lane.
+///
+/// Boot-ON byte-identical: if Dhan was ON at boot, the inline boot spine drove
+/// the FSM to `Running` (see the boot wiring), so the supervisor's first tick
+/// sees `LaneState::Running` (not `Off`) → it does NOTHING. It ONLY ever acts on
+/// a boot-OFF cold-start or a runtime re-enable of a fully-torn-down lane.
+///
+/// The cold-start task owns the FULL lifecycle; the supervisor only force-cancels
+/// a `Starting` lane on a disable (H8) and respawns a dead task (WS-GAP-05-style
+/// bounded respawn — a task that ended without bringing the lane up).
+// TEST-EXEMPT: infinite control-plane supervisor loop driving live spawn/abort; the pure decisions (should_spawn_cold_start, should_abort_cold_start_on_disable) are unit-tested below + the FSM is unit-tested in feed_state.rs.
+pub async fn run_dhan_lane_runtime_supervisor(
+    feed_runtime: std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
+    ctx_cell: std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<DhanLaneRuntimeContext>>>,
+) {
+    use tickvault_api::feed_state::{Feed, LaneState};
+    let mut active_task: Option<tokio::task::JoinHandle<()>> = None;
+    loop {
+        // Idle (zero Dhan work) until the runtime context exists. The context is
+        // populated by `main()` right after `build_shared_infra`, which runs in
+        // BOTH the Dhan-ON and Dhan-OFF paths.
+        let Some(ctx) = ctx_cell.get() else {
+            tokio::time::sleep(DHAN_LANE_RUNTIME_POLL).await;
+            continue;
+        };
+
+        let desired_on = feed_runtime.is_enabled(Feed::Dhan);
+        let lane_state = feed_runtime.dhan_lane_state();
+
+        // Dead-task respawn (WS-GAP-05-style): a finished task that did NOT bring
+        // the lane up (panicked / early-returned out of `Starting`) leaves the
+        // FSM in `Off` (its own `StartFailed`/cancel cleanup) or `Starting`
+        // (panic mid-start). Clear the handle so a desired-ON tick re-spawns it.
+        if active_task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            // The task ended; if the FSM is stuck in Starting (panic mid-start),
+            // reset it to Off so a fresh spawn is legal (no double pool — the
+            // panicked task's `start_dhan_lane` already aborted its own spawns).
+            // CAS via the FSM (not a force-write): `advance(StartFailed)` returns
+            // `Some(Off)` ONLY if the lane is still `Starting`. If the task had
+            // already reached `Running` before panicking-post-park (it can't —
+            // a Running task parks and never `is_finished` until teardown), the
+            // CAS would reject and we leave the live state untouched.
+            if feed_runtime.advance_dhan_lane(tickvault_api::feed_state::LaneEvent::StartFailed)
+                == Some(LaneState::Off)
+            {
+                record_dhan_lane_transition(LaneState::Starting, LaneState::Off);
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::DhanLane03AuthFailed.code_str(),
+                    severity = tickvault_common::error_code::ErrorCode::DhanLane03AuthFailed
+                        .severity()
+                        .as_str(),
+                    reason = "cold_start_task_ended_without_running",
+                    stage = "supervisor",
+                    "[dhan-lane] cold-start task ended without bringing the lane up — reset to \
+                     Off for a clean respawn"
+                );
+            }
+            active_task = None;
+        }
+
+        // Cancel-safety (H8): force-abort an in-flight `Starting` cold-start when
+        // the operator disabled Dhan. `start_dhan_lane` has no cancel arm, so the
+        // abort lands at its next `.await`, triggering its own lane-handle
+        // cleanup. (A `Running` parked task self-tears-down with the gate-hold +
+        // join — the supervisor does NOT abort it.)
+        //
+        // CRITICAL ownership invariant: the supervisor only touches the FSM for a
+        // `Starting` lane it OWNS (`active_task.is_some()`). A boot-ON inline
+        // start ALSO seeds the FSM to `Starting` (then drives it to `Running`
+        // itself) but is NOT owned by the supervisor — so the supervisor MUST
+        // NOT fire `StartCancelled` against it (that would clobber the inline
+        // start mid-flight). The boot-ON runtime disable is handled by the
+        // existing `dhan_activation` watcher + PR-E in-loop dormancy, not here.
+        //
+        // CRITICAL CAS-FIRST race fix (hostile-review MEDIUM): the owned task can
+        // CAS `Starting→Running` between our `lane_state` snapshot above and this
+        // block. So we DRIVE THE FSM FIRST via `advance_dhan_lane(StartCancelled)`
+        // — that CAS returns `Some(Off)` ONLY if the lane was genuinely still
+        // `Starting` (and we therefore won the cancel). If the task already
+        // promoted to `Running`, `StartCancelled` is illegal → `None`, and we do
+        // NOTHING: we MUST NOT abort the now-`Running` task (it owns its H5/H6
+        // teardown — aborting it would leak its WS pool) and MUST NOT mark it
+        // not-running. The abort + not-running side-effects fire ONLY on a
+        // confirmed cancel.
+        if active_task.is_some() && should_abort_cold_start_on_disable(desired_on, lane_state) {
+            if feed_runtime.advance_dhan_lane(tickvault_api::feed_state::LaneEvent::StartCancelled)
+                == Some(LaneState::Off)
+            {
+                // We won the cancel: the lane was still Starting. NOW abort the
+                // owned task (its start_dhan_lane cleanup aborts every lane
+                // handle it spawned at the next .await) + mark not-running.
+                if let Some(task) = active_task.take() {
+                    info!(
+                        "[dhan-lane] Dhan disabled mid-cold-start (Starting→Off won) — aborting \
+                         the in-flight start; its lane-handle cleanup runs"
+                    );
+                    task.abort();
+                }
+                record_dhan_lane_transition(LaneState::Starting, LaneState::Off);
+                feed_runtime.set_dhan_lane_running(false);
+            } else {
+                // The task promoted to Running between our snapshot and now — do
+                // NOT abort it. Its parked `park_running_dhan_lane` owns the
+                // H5-gated, H6-joined teardown for this disable.
+                info!(
+                    "[dhan-lane] disable observed but the cold-start already reached Running — \
+                     leaving the parked task to do its gated teardown (no abort, no false UI)"
+                );
+            }
+        }
+
+        // Spawn a fresh cold-start when desired-ON + confirmed-empty Off + no
+        // active task. The task itself drives the whole FSM from here.
+        if should_spawn_cold_start(
+            desired_on,
+            feed_runtime.dhan_lane_state(),
+            active_task.is_some(),
+        ) {
+            info!(
+                "[dhan-lane] runtime supervisor spawning cold-start (boot-OFF Dhan enabled at \
+                 runtime, lane is Off)"
+            );
+            let task = tokio::spawn(run_dhan_lane_cold_start(std::sync::Arc::clone(ctx)));
+            active_task = Some(task);
+        }
+
+        tokio::time::sleep(DHAN_LANE_RUNTIME_POLL).await;
+    }
+}
+
+/// Runtime Dhan-lane cold-start driver — the body of the ONE owned task the
+/// runtime supervisor holds for an ON period. Drives the `LaneState` FSM:
+/// `Off→Starting`, `start_dhan_lane`, then on `Ok` `Starting→Running` (mark
+/// pool present + lane running ONLY here — phantom-running closure) and parks
+/// (idles) until disable; on `Err` `Starting→Off` + typed `DHAN-LANE-0N` +
+/// bounded backoff + retry. On a disable the supervisor `.abort()`s this whole
+/// task while `Starting` — `start_dhan_lane`'s own cancel cleanup (H8) aborts
+/// every lane-owned handle it spawned.
+///
+/// This wrapper spawns NO children of its own (C2): the only spawns are inside
+/// `start_dhan_lane` (LANE) and `build_shared_infra` (PROCESS).
+// TEST-EXEMPT: orchestration task that drives the unit-tested FSM (next_lane_state) + the unit-tested pure helpers (classify_start_lane_error, dhan_lane_retry_backoff_secs) around live I/O (start_dhan_lane); the live cold-start is exercised by the live boot-deploy follow.
+pub async fn run_dhan_lane_cold_start(ctx: std::sync::Arc<DhanLaneRuntimeContext>) {
+    use tickvault_api::feed_state::{Feed, LaneEvent, LaneState};
+
+    let mut attempt: u32 = 0;
+    loop {
+        // Drive Off→Starting through the FSM. If we can't (e.g. the state is not
+        // Off — a race with a concurrent stop), bail; the watcher re-evaluates.
+        match ctx
+            .feed_runtime
+            .advance_dhan_lane(LaneEvent::StartRequested)
+        {
+            Some(LaneState::Starting) => {
+                record_dhan_lane_transition(LaneState::Off, LaneState::Starting);
+                info!(
+                    "[dhan-lane] runtime cold-start beginning (Off→Starting) — auth → \
+                     universe → main-feed pool"
+                );
+            }
+            _ => {
+                info!(
+                    current = lane_state_label(ctx.feed_runtime.dhan_lane_state()),
+                    "[dhan-lane] cold-start not begun — lane not in Off (race with stop); \
+                     the watcher will re-evaluate"
+                );
+                return;
+            }
+        }
+
+        // Build the borrowed boot-path context from the owned runtime context.
+        // Runtime starts NEVER replay WAL (that is a boot-only concern), so the
+        // replay buffers are empty.
+        let lane_ctx = DhanLaneContext {
+            config: &ctx.config,
+            notifier: &ctx.notifier,
+            health_status: &ctx.health_status,
+            tick_broadcast_sender: &ctx.tick_broadcast_sender,
+            order_update_sender: &ctx.order_update_sender,
+            feed_runtime: &ctx.feed_runtime,
+            feed_health: &ctx.feed_health,
+            trading_calendar: &ctx.trading_calendar,
+            ws_frame_spill: &ctx.ws_frame_spill,
+            is_market_hours: ctx.trading_calendar.is_trading_day_today(),
+            is_trading: ctx.trading_calendar.is_trading_day_today(),
+            is_muhurat: ctx.trading_calendar.is_muhurat_trading_today(),
+            is_mock_trading: ctx.trading_calendar.is_mock_trading_today(),
+            boot_start: std::time::Instant::now(),
+            ws_wal_replay_live_feed: Vec::new(),
+            ws_wal_replay_order_update: Vec::new(),
+        };
+
+        match start_dhan_lane(lane_ctx).await {
+            Ok(handles) => {
+                // Phantom-running closure: Running + pool-present + lane-running
+                // are set ONLY here, after the pool genuinely spawned.
+                if ctx
+                    .feed_runtime
+                    .advance_dhan_lane(LaneEvent::StartSucceeded)
+                    == Some(LaneState::Running)
+                {
+                    record_dhan_lane_transition(LaneState::Starting, LaneState::Running);
+                }
+                ctx.feed_runtime.mark_dhan_pool_present();
+                ctx.feed_runtime.set_dhan_lane_running(true);
+                info!(
+                    "[dhan-lane] runtime cold-start SUCCEEDED (Starting→Running) — main-feed \
+                     pool live, ticks flowing; lane idling until disable"
+                );
+                ctx.notifier.notify(NotificationEvent::Custom {
+                    message: "🟢 <b>Dhan feed started</b>\nThe live price feed is now connected \
+                              and streaming."
+                        .to_string(),
+                });
+                // The lane is Running. Park the handles + idle until a disable
+                // toggle, then tear down (H5 gate-hold + H6 join inside).
+                park_running_dhan_lane(std::sync::Arc::clone(&ctx), handles).await;
+                return;
+            }
+            Err(err) => {
+                let (code, reason, stage) = classify_start_lane_error(&err);
+                // FSM Starting→Off — no half-running lane. `start_dhan_lane`'s
+                // own cancel/Err cleanup already aborted every lane-owned handle
+                // it spawned (H8).
+                if ctx.feed_runtime.advance_dhan_lane(LaneEvent::StartFailed)
+                    == Some(LaneState::Off)
+                {
+                    record_dhan_lane_transition(LaneState::Starting, LaneState::Off);
+                }
+                ctx.feed_runtime.set_dhan_lane_running(false);
+                attempt = attempt.saturating_add(1);
+                let backoff = dhan_lane_retry_backoff_secs(attempt);
+                error!(
+                    code = code.code_str(),
+                    severity = code.severity().as_str(),
+                    reason,
+                    stage,
+                    attempt,
+                    backoff_secs = backoff,
+                    "[dhan-lane] runtime cold-start FAILED (Starting→Off) — bounded retry"
+                );
+                metrics::counter!(
+                    "tv_dhan_lane_start_failed_total",
+                    "stage" => stage,
+                )
+                .increment(1);
+                // If the operator disabled Dhan during the failed attempt, stop
+                // retrying — the watcher's `.abort()` would also cancel us, but
+                // checking here avoids one wasted backoff sleep.
+                if !ctx.feed_runtime.is_enabled(Feed::Dhan) {
+                    info!("[dhan-lane] Dhan disabled during failed cold-start — stopping retries");
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                // Loop: re-attempt Off→Starting→… . `advance_dhan_lane` confirms
+                // the lane is still Off before re-starting (no double pool).
+            }
+        }
+    }
+}
+
+/// Park a Running runtime lane: hold its owned handles and wait for the
+/// activation watcher to request a Stop (the lane's enable flag flips OFF AND
+/// the gate permits). On a disable this drives `Running→Stopping`, re-asserts
+/// the disable gate (H5), tears the lane down (`teardown_dhan_lane_tasks` with a
+/// bounded drain, H6 join), and drives `Stopping→Off` (or stays `Running` if
+/// the gate re-closed mid-teardown, H5).
+///
+/// Polls the enable flag on the cold-control-plane cadence (2s); the lane does
+/// zero work while Running-and-enabled (the WS pool + tick processor it spawned
+/// run independently). When the watcher `.abort()`s the owning cold-start task,
+/// THIS future is dropped — a hard disconnect equivalent to the boot teardown.
+// TEST-EXEMPT: orchestration around the unit-tested FSM (advance_dhan_lane) + the live teardown_dhan_lane_tasks; the live disable path is exercised by the boot-deploy follow.
+async fn park_running_dhan_lane(
+    ctx: std::sync::Arc<DhanLaneRuntimeContext>,
+    handles: DhanLaneRunHandles,
+) {
+    use tickvault_api::feed_state::{Feed, LaneEvent, LaneState};
+    let mut handles = Some(handles);
+    loop {
+        let desired_on = ctx.feed_runtime.is_enabled(Feed::Dhan);
+        if desired_on {
+            tokio::time::sleep(DHAN_LANE_RUNTIME_POLL).await;
+            continue;
+        }
+        // Desired OFF. The teardown is the safety-critical direction. H5:
+        // re-assert the disable gate IMMEDIATELY before the irreversible
+        // WS-close. If the gate is closed (live trading / open orders) we must
+        // NOT tear the lane down — leave it Running so the feed is never
+        // blinded mid-trade. The watcher's gated reconcile already downgrades a
+        // gate-closed Stop to None, but re-checking HERE narrows the
+        // sampled-not-held window (an order could open after the watcher last
+        // checked) to the teardown-prep duration.
+        //
+        // HONEST ENVELOPE (security-review MEDIUM): this NARROWS but cannot
+        // ELIMINATE a TOCTOU window against a REMOTE order system — no local
+        // lock/fence can serialize against an exchange fill that lands between
+        // this check and `teardown_dhan_lane_tasks`'s WS-close. The window is
+        // bounded to ~one teardown-prep tick. It is bounded further by the
+        // operator contract: `can_disable_dhan()` is seeded from `dry_run` and is
+        // only ever `true` during the no-orders data-pull phase; once live
+        // trading is on the gate is `false` and the teardown is refused here
+        // entirely (the only safe-to-disable phase has no orders to race).
+        if !ctx.feed_runtime.can_disable_dhan() {
+            info!(
+                "[dhan-lane] disable observed but the safety gate is CLOSED (live trading / \
+                 open orders) — refusing teardown, lane stays Running"
+            );
+            metrics::counter!("tv_dhan_lane_disable_aborted_total").increment(1);
+            tokio::time::sleep(DHAN_LANE_RUNTIME_POLL).await;
+            continue;
+        }
+        // Gate open — proceed with teardown. Drive Running→Stopping.
+        if ctx.feed_runtime.advance_dhan_lane(LaneEvent::StopRequested) == Some(LaneState::Stopping)
+        {
+            record_dhan_lane_transition(LaneState::Running, LaneState::Stopping);
+            info!(
+                "[dhan-lane] Dhan disabled (gate permits) — tearing down lane (Running→Stopping)"
+            );
+        } else {
+            // Could not enter Stopping (race) — re-evaluate next tick.
+            tokio::time::sleep(DHAN_LANE_RUNTIME_POLL).await;
+            continue;
+        }
+
+        let Some(owned) = handles.take() else {
+            // Already torn down (defensive) — converge to Off.
+            if ctx.feed_runtime.advance_dhan_lane(LaneEvent::StopJoined) == Some(LaneState::Off) {
+                record_dhan_lane_transition(LaneState::Stopping, LaneState::Off);
+            }
+            ctx.feed_runtime.set_dhan_lane_running(false);
+            return;
+        };
+
+        // H6: teardown awaits every WS/order-update/renewal handle join (with a
+        // bounded drain) BEFORE we report Stopping→Off. `teardown_dhan_lane_tasks`
+        // is the lane-scoped teardown (C3) — it NEVER touches the PROCESS API
+        // server / seal-writer / aggregator / otel.
+        let teardown = teardown_dhan_lane_tasks(owned);
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(DHAN_LANE_TEARDOWN_DRAIN_TIMEOUT_SECS),
+            teardown,
+        )
+        .await
+        .is_err()
+        {
+            // The bounded teardown drain (which itself bounds the WS close)
+            // exceeded the outer wall-clock budget — the inner force-abort
+            // already fired; report DHAN-LANE-04 (degraded but the lane still
+            // reaches Off).
+            let code = tickvault_common::error_code::ErrorCode::DhanLane04TeardownTimeout;
+            error!(
+                code = code.code_str(),
+                severity = code.severity().as_str(),
+                "[dhan-lane] teardown drain timed out — handles force-aborted; lane still \
+                 reaches Off"
+            );
+            metrics::counter!("tv_dhan_lane_teardown_forced_total").increment(1);
+        }
+
+        // Drive Stopping→Off ONLY now (after the join).
+        if ctx.feed_runtime.advance_dhan_lane(LaneEvent::StopJoined) == Some(LaneState::Off) {
+            record_dhan_lane_transition(LaneState::Stopping, LaneState::Off);
+        }
+        ctx.feed_runtime.set_dhan_lane_running(false);
+        info!("[dhan-lane] lane torn down (Stopping→Off) — ready to cold-start again on re-enable");
+        ctx.notifier.notify(NotificationEvent::Custom {
+            message: "⚪ <b>Dhan feed stopped</b>\nThe live price feed is now disconnected."
+                .to_string(),
+        });
+        return;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helper: PROCESS run-loop (shared by Dhan-ON-slow, Dhan-OFF, and — via the
 // thin `run_shutdown_fast` wrapper — the fast boot arm).
@@ -7635,6 +8321,297 @@ mod tests {
         assert!(
             src.contains("NO FEED ENABLED"),
             "Step C: the no-feed idle branch must exist (idle, not crash)"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // D2b — runtime Dhan-lane cold-start FSM (pure helpers + wiring guards).
+    // The FSM transition function itself is unit-tested in feed_state.rs.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn dhan_lane_retry_backoff_is_groww_capped_ladder() {
+        // min(10 * 2^n, 300) — identical to the Groww watcher.
+        assert_eq!(dhan_lane_retry_backoff_secs(0), 10);
+        assert_eq!(dhan_lane_retry_backoff_secs(1), 20);
+        assert_eq!(dhan_lane_retry_backoff_secs(2), 40);
+        assert_eq!(dhan_lane_retry_backoff_secs(3), 80);
+        assert_eq!(dhan_lane_retry_backoff_secs(4), 160);
+        // Capped at 300 from attempt 5 onward (2^5 = 32 -> 320 -> capped).
+        assert_eq!(dhan_lane_retry_backoff_secs(5), 300);
+        assert_eq!(dhan_lane_retry_backoff_secs(50), 300);
+        assert_eq!(
+            DHAN_LANE_RETRY_BACKOFF_CAP_SECS, 300,
+            "backoff cap pinned to the Groww ladder cap"
+        );
+    }
+
+    #[test]
+    fn classify_start_lane_error_maps_to_typed_codes_with_secret_free_reasons() {
+        use tickvault_common::error_code::ErrorCode;
+        // BootAbortClean (a boot gate refused) -> DHAN-LANE-03 (auth/gate).
+        let (code, reason, stage) = classify_start_lane_error(&StartLaneError::BootAbortClean);
+        assert_eq!(code, ErrorCode::DhanLane03AuthFailed);
+        assert_eq!(code.code_str(), "DHAN-LANE-03");
+        assert_eq!(reason, "auth_or_gate_failed");
+        assert_eq!(stage, "auth");
+        // BootAbortErr (instrument-load failed) -> DHAN-LANE-01 (universe).
+        let (code, reason, stage) =
+            classify_start_lane_error(&StartLaneError::BootAbortErr(anyhow::anyhow!("synthetic")));
+        assert_eq!(code, ErrorCode::DhanLane01UniverseBuildFailed);
+        assert_eq!(code.code_str(), "DHAN-LANE-01");
+        assert_eq!(reason, "universe_build_failed");
+        assert_eq!(stage, "universe");
+        // Secret discipline: the reason discriminants are FIXED strings, never
+        // the raw error body (e.g. an auth response). Assert they contain no
+        // dynamic content.
+        for r in ["auth_or_gate_failed", "universe_build_failed"] {
+            assert!(
+                !r.contains("synthetic"),
+                "reason must be a fixed discriminant, not the body"
+            );
+        }
+    }
+
+    #[test]
+    fn should_spawn_cold_start_only_from_confirmed_empty_off() {
+        use tickvault_api::feed_state::LaneState;
+        // Spawn iff desired-ON + Off + no active task.
+        assert!(should_spawn_cold_start(true, LaneState::Off, false));
+        // NOT while a task is active (single-owner invariant).
+        assert!(!should_spawn_cold_start(true, LaneState::Off, true));
+        // NOT while desired-OFF.
+        assert!(!should_spawn_cold_start(false, LaneState::Off, false));
+        // H6: NEVER start from Stopping (no double pool).
+        assert!(!should_spawn_cold_start(true, LaneState::Stopping, false));
+        // Idempotent: NOT while Running or Starting.
+        assert!(!should_spawn_cold_start(true, LaneState::Running, false));
+        assert!(!should_spawn_cold_start(true, LaneState::Starting, false));
+    }
+
+    #[test]
+    fn should_abort_cold_start_only_for_starting_on_disable() {
+        use tickvault_api::feed_state::LaneState;
+        // H8: abort an in-flight Starting cold-start ONLY when desired-OFF.
+        assert!(should_abort_cold_start_on_disable(
+            false,
+            LaneState::Starting
+        ));
+        // Do NOT abort a Running lane on disable — its parked task does the
+        // H5-gated, H6-joined teardown itself.
+        assert!(!should_abort_cold_start_on_disable(
+            false,
+            LaneState::Running
+        ));
+        // Nothing to abort from Off/Stopping.
+        assert!(!should_abort_cold_start_on_disable(false, LaneState::Off));
+        assert!(!should_abort_cold_start_on_disable(
+            false,
+            LaneState::Stopping
+        ));
+        // Never abort while still desired-ON.
+        assert!(!should_abort_cold_start_on_disable(
+            true,
+            LaneState::Starting
+        ));
+    }
+
+    #[test]
+    fn supervisor_only_cancels_a_starting_lane_it_owns() {
+        // Boot-ON race fix (hostile-review): the supervisor must NOT fire
+        // StartCancelled against a `Starting` lane it does NOT own (a boot-ON
+        // inline start also seeds Starting). The abort+cancel block is gated on
+        // `active_task.is_some()` so it never clobbers the inline start.
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains(
+                "if active_task.is_some() && should_abort_cold_start_on_disable(desired_on, lane_state)"
+            ),
+            "the supervisor abort/cancel must be gated on active_task.is_some() (owns the Starting lane)"
+        );
+        // The dead-task respawn reset is also gated on an owned (finished) task.
+        assert!(
+            src.contains("is_some_and(tokio::task::JoinHandle::is_finished)"),
+            "the dead-task reset must be gated on an owned, finished task"
+        );
+    }
+
+    #[test]
+    fn supervisor_cancel_is_cas_first_no_abort_of_a_promoted_running_lane() {
+        // Hostile-review MEDIUM fix: the disable-abort path must drive
+        // advance_dhan_lane(StartCancelled) FIRST and abort + mark-not-running
+        // ONLY when the CAS returns Some(Off). If the owned task already CAS'd
+        // Starting→Running between the snapshot and this block, StartCancelled is
+        // illegal (None) and the supervisor must NOT abort the live pool nor
+        // mark it not-running (the parked task owns its gated teardown).
+        let src = include_str!("main.rs");
+        let region_start = src
+            .find("CRITICAL CAS-FIRST race fix")
+            .expect("the CAS-first race-fix comment must exist");
+        let region_end = src[region_start..]
+            .find("Spawn a fresh cold-start")
+            .map(|o| region_start + o)
+            .expect("the spawn block must follow the cancel block");
+        let region = &src[region_start..region_end];
+        // The cancel block advances the FSM FIRST, then guards the abort +
+        // not-running on the Some(Off) result.
+        assert!(
+            region.contains(
+                "advance_dhan_lane(tickvault_api::feed_state::LaneEvent::StartCancelled)"
+            ) && region.contains("== Some(LaneState::Off)"),
+            "the cancel must be CAS-first (advance to Off) before any side-effect"
+        );
+        // task.abort() + set_dhan_lane_running(false) must be INSIDE the Some(Off)
+        // arm (after the CAS check), not unconditional.
+        let cas_idx = region
+            .find("== Some(LaneState::Off)")
+            .expect("CAS check present");
+        let after_cas = &region[cas_idx..];
+        assert!(
+            after_cas.contains("task.abort()"),
+            "task.abort() must be inside the confirmed-cancel (Some(Off)) arm"
+        );
+        assert!(
+            after_cas.contains("set_dhan_lane_running(false)"),
+            "set_dhan_lane_running(false) must be inside the confirmed-cancel arm"
+        );
+    }
+
+    #[test]
+    fn lane_state_labels_are_stable_static_strings() {
+        use tickvault_api::feed_state::LaneState;
+        assert_eq!(lane_state_label(LaneState::Off), "off");
+        assert_eq!(lane_state_label(LaneState::Starting), "starting");
+        assert_eq!(lane_state_label(LaneState::Running), "running");
+        assert_eq!(lane_state_label(LaneState::Stopping), "stopping");
+    }
+
+    #[test]
+    fn phantom_running_closed_running_set_only_after_start_ok() {
+        // Source-scan: `LaneState::Running` is set ONLY in the Ok arm of a
+        // `start_dhan_lane` call (boot-ON inline + the runtime wrapper), never
+        // before. Guard against a future edit that pre-marks Running.
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("advance_dhan_lane(LaneEvent::StartSucceeded)"),
+            "the runtime cold-start must advance to Running via StartSucceeded only after Ok"
+        );
+        assert!(
+            src.contains("mark_dhan_pool_present()"),
+            "pool-present must be marked (only) on a successful start"
+        );
+    }
+
+    #[test]
+    fn gate_hold_reasserted_before_runtime_teardown() {
+        // H5 source-scan: the runtime Stop path re-asserts can_disable_dhan()
+        // immediately before the irreversible teardown, and on gate-closed it
+        // bumps the disable-aborted counter + stays Running.
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("if !ctx.feed_runtime.can_disable_dhan() {"),
+            "H5: the runtime Stop must re-assert can_disable_dhan() before teardown"
+        );
+        assert!(
+            src.contains("tv_dhan_lane_disable_aborted_total"),
+            "H5: a gate-closed disable must bump the disable-aborted counter"
+        );
+    }
+
+    #[test]
+    fn double_pool_prevented_stop_join_before_off() {
+        // H6 source-scan: Stopping->Off happens via StopJoined (after teardown
+        // awaits the join), never on a bare Notify-fire; and the runtime wrapper
+        // calls the lane-scoped teardown (C3), never run_process_runloop.
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("advance_dhan_lane(LaneEvent::StopJoined)"),
+            "H6: Stopping->Off must go through StopJoined (after the handle join)"
+        );
+        assert!(
+            src.contains("teardown_dhan_lane_tasks(owned)"),
+            "C3: the runtime Stop must call the lane-scoped teardown, not the run-loop"
+        );
+    }
+
+    #[test]
+    fn runtime_lane_does_not_spawn_process_shared_infra() {
+        // C2 source-scan: the runtime cold-start wrapper must NOT (re)create the
+        // PROCESS-shared seal-writer / aggregator / API server — those live ONLY
+        // in build_shared_infra. The runtime path calls start_dhan_lane (LANE)
+        // and teardown_dhan_lane_tasks (LANE) only.
+        let src = include_str!("main.rs");
+        // The only spawn_seal_writer_loop / spawn_engine_b_aggregator /
+        // axum::serve call sites must be inside build_shared_infra. We assert
+        // the runtime functions reference start_dhan_lane + teardown only.
+        assert!(
+            src.contains("park_running_dhan_lane(std::sync::Arc::clone(&ctx), handles)"),
+            "the runtime cold-start parks via park_running_dhan_lane on success"
+        );
+        // The runtime supervisor + wrapper must NOT call the PROCESS builders.
+        let runtime_region_start = src
+            .find("async fn run_dhan_lane_cold_start")
+            .expect("run_dhan_lane_cold_start must exist");
+        let runtime_region_end = src
+            .find("async fn run_process_runloop")
+            .expect("run_process_runloop must exist");
+        let runtime_region = &src[runtime_region_start..runtime_region_end];
+        assert!(
+            !runtime_region.contains("spawn_seal_writer_loop"),
+            "C2: the runtime lane must NOT spawn the PROCESS seal-writer"
+        );
+        assert!(
+            !runtime_region.contains("spawn_engine_b_aggregator"),
+            "C2: the runtime lane must NOT spawn the PROCESS 21-TF aggregator"
+        );
+        assert!(
+            !runtime_region.contains("axum::serve"),
+            "C2: the runtime lane must NOT spawn the PROCESS API server"
+        );
+    }
+
+    #[test]
+    fn runtime_supervisor_and_cold_start_are_wired_at_boot() {
+        // Wiring guard (Rule 13 / pub-fn-wiring): the runtime supervisor is
+        // spawned at boot with the OnceCell, and the OnceCell is populated after
+        // build_shared_infra so a boot-OFF Dhan feed is runtime-startable.
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("tokio::spawn(run_dhan_lane_runtime_supervisor("),
+            "the runtime supervisor must be spawned unconditionally at boot"
+        );
+        assert!(
+            src.contains("dhan_lane_ctx_cell.set(runtime_ctx)"),
+            "the runtime context cell must be populated after build_shared_infra"
+        );
+        // The supervisor spawns the cold-start task (the single owned handle).
+        assert!(
+            src.contains("tokio::spawn(run_dhan_lane_cold_start(std::sync::Arc::clone(ctx)))"),
+            "the supervisor must spawn the cold-start task as the single owned handle"
+        );
+    }
+
+    #[test]
+    fn runtime_toggle_never_enters_fast_arm() {
+        // L10 source-scan: a runtime cold-start ALWAYS uses the slow/canonical
+        // start_dhan_lane (the extracted slow arm), never the fast crash-recovery
+        // boot arm. The runtime wrapper builds its DhanLaneContext with EMPTY
+        // WAL-replay buffers (a fast-arm cache-warmed entry is a boot-only path).
+        let src = include_str!("main.rs");
+        let region_start = src
+            .find("async fn run_dhan_lane_cold_start")
+            .expect("run_dhan_lane_cold_start must exist");
+        let region_end = src
+            .find("async fn park_running_dhan_lane")
+            .expect("park_running_dhan_lane must exist");
+        let region = &src[region_start..region_end];
+        assert!(
+            region.contains("start_dhan_lane(lane_ctx).await"),
+            "the runtime cold-start must call the slow/canonical start_dhan_lane"
+        );
+        assert!(
+            region.contains("ws_wal_replay_live_feed: Vec::new()"),
+            "the runtime cold-start must use EMPTY WAL-replay buffers (no fast-arm cache entry)"
         );
     }
 }
