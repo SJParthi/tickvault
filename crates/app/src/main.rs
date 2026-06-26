@@ -7236,6 +7236,37 @@ mod tests {
         );
     }
 
+    /// PR-3 ratchet (3-agent hostile recommendation): the persisted feed-state
+    /// overlay MUST be applied to `config.feeds` BEFORE any boot-skip guard reads
+    /// `feeds.dhan_enabled` / `!feeds.dhan_enabled`. If a future refactor moved a
+    /// boot-skip read above the `overlay_feeds(...)` call, that read would observe
+    /// the pre-overlay config default and silently ignore the operator's persisted
+    /// last toggle choice (the whole point of PR-3) — booting the WRONG feed.
+    #[test]
+    fn test_overlay_precedes_boot_skip_guard() {
+        let src = include_str!("main.rs");
+        let overlay_idx = src
+            .find("overlay_feeds(")
+            .expect("the feed-state overlay call must exist");
+        // The first boot-skip guard that reads the per-feed enabled flag. Both
+        // conditional forms gate the Dhan boot path; whichever appears first must
+        // still come AFTER the overlay has been applied.
+        let first_enabled_guard = src.find("if feeds.dhan_enabled");
+        let first_disabled_guard = src.find("if !feeds.dhan_enabled");
+        let first_guard_idx = [first_enabled_guard, first_disabled_guard]
+            .into_iter()
+            .flatten()
+            .min()
+            .expect("a `feeds.dhan_enabled` boot-skip guard must exist");
+        assert!(
+            overlay_idx < first_guard_idx,
+            "overlay_feeds(...) (@{overlay_idx}) must precede the first \
+             feeds.dhan_enabled boot-skip guard (@{first_guard_idx}) so the \
+             boot reads the post-overlay effective feed state, not the config \
+             default"
+        );
+    }
+
     /// Step C ratchet: both run-mode log branches must exist — Groww-only
     /// (Dhan off, Groww on) and idle (neither on, no crash).
     #[test]
