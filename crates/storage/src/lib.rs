@@ -83,6 +83,11 @@ pub mod boot_probe;
 // + CSV (narrowed replacement for the deleted cross_verify.rs — 1m/spot/today
 // only). See live-feed-purity.md rule 11.
 pub mod cross_verify_1m_audit_persistence;
+// SP5 (parity plan): ONE unified live-vs-backtest 1m parity audit table + writer
+// (`feed` IN the DEDUP key) merging the Dhan `cross_verify_1m_audit_persistence`
+// + Groww `groww_cross_verify_audit_persistence` modules. Both feeds write here.
+// See docs/design/sp5-unified-parity-audit-design.md.
+pub mod feed_parity_1m_audit_persistence;
 pub mod tick_conservation_audit_persistence;
 pub mod ws_event_audit_persistence;
 // PR-E (2026-05-26): `candle_persistence` module deleted alongside the
