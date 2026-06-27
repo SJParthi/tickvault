@@ -44,44 +44,33 @@ fn code_only(content: &str) -> String {
         .join("\n")
 }
 
-/// The live tick-persist price columns. Each must be written as
-/// `column_f64("<name>", round_to_2dp(...))` in the production append path.
+/// The live tick-persist price columns. Each must have its VALUE constructed
+/// through `round_to_2dp(...)` at the `RawTickFields` build site in
+/// `tick_persistence.rs::build_tick_row_seq` (C1 convergence moved the literal
+/// `column_f64(...)` writes into the shared `tick_row_builder`, but the operator
+/// 2-decimal contract is applied here, at value-construction time, BEFORE the
+/// value enters the feed-agnostic `RawTickFields`).
 const TICK_PRICE_COLUMNS: &[&str] = &["ltp", "open", "high", "low", "close", "avg_price"];
 
 #[test]
 fn tick_persistence_price_columns_are_rounded_to_2dp() {
     let code = code_only(&storage_src("tick_persistence.rs"));
-    // The production append fn lives before the `#[cfg(test)]` mod; the
-    // test-helper writers (raw column_f64 literals) live after it. We pin
-    // the PRODUCTION write path by requiring the `round_to_2dp(` token to
-    // appear on the same logical statement as each price column there.
-    //
-    // Pragmatic source-scan: require that for each price column, a
-    // `column_f64("<col>", round_to_2dp(` occurrence exists. Whitespace
-    // between args is normalised away by collapsing runs of spaces.
+    // Post-C1 the Dhan `build_tick_row_seq` constructs a `RawTickFields` whose
+    // price values are pre-rounded, then delegates to the shared builder. The
+    // 2-decimal contract lives at this value-construction site. Accepted shapes
+    // (whitespace normalised) for each price column `<col>`:
+    //   <col>: round_to_2dp(                  — required-for-both field (ltp)
+    //   <col>: Some(round_to_2dp(             — per-feed Option field (open/…/avg_price)
     let normalised: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
     for col in TICK_PRICE_COLUMNS {
-        // Two accepted write-site shapes (both rounded):
-        //   column_f64("ltp", round_to_2dp(            — plain &str name
-        //   column_f64(ColumnName::new_unchecked("ltp"), round_to_2dp(
-        //     — pre-validated name (latency-hunt 2026-06-10; the name
-        //       literal itself is pinned by
-        //       test_tick_row_unchecked_ilp_names_pass_validation)
-        let plain = format!("column_f64(\"{col}\", round_to_2dp(");
-        let plain_spaced = format!("column_f64( \"{col}\", round_to_2dp(");
-        let prevalidated =
-            format!("column_f64( ColumnName::new_unchecked(\"{col}\"), round_to_2dp(");
-        let prevalidated_tight =
-            format!("column_f64(ColumnName::new_unchecked(\"{col}\"), round_to_2dp(");
+        let required_field = format!("{col}: round_to_2dp(");
+        let optional_field = format!("{col}: Some(round_to_2dp(");
         assert!(
-            normalised.contains(&plain)
-                || normalised.contains(&plain_spaced)
-                || normalised.contains(&prevalidated)
-                || normalised.contains(&prevalidated_tight),
-            "tick_persistence.rs production append must write price column \
+            normalised.contains(&required_field) || normalised.contains(&optional_field),
+            "tick_persistence.rs::build_tick_row_seq must construct the price field \
              `{col}` through `round_to_2dp(...)` (operator 2-decimal contract \
-             2026-05-29). Found a `column_f64` write for `{col}` that is not \
-             wrapped. Wrap it: round_to_2dp(f32_to_f64_clean(...)). Greeks/IV \
+             2026-05-29) before it enters RawTickFields. Found a `{col}:` field set \
+             without rounding. Wrap it: round_to_2dp(f32_to_f64_clean(...)). Greeks/IV \
              are exempt; this guard covers PRICE columns only."
         );
     }

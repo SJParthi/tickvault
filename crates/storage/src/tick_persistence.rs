@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use questdb::ingress::{Buffer, Sender, TimestampNanos};
+use questdb::ingress::{Buffer, Sender};
 use reqwest::Client;
 use tracing::{debug, error, info, warn};
 
@@ -37,6 +37,8 @@ use tickvault_common::constants::{
 };
 use tickvault_common::segment::segment_code_to_str;
 use tickvault_common::tick_types::ParsedTick;
+
+use crate::tick_row_builder::{RawTickFields, build_tick_row_for_feed};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1483,114 +1485,40 @@ pub(crate) fn build_tick_row_seq(
     tick: &ParsedTick,
     capture_seq: i64,
 ) -> Result<()> {
-    use questdb::ingress::{ColumnName, TableName};
+    // C1 convergence: construct the feed-agnostic `RawTickFields` and emit the
+    // ILP row via the ONE shared builder. The Dhan branch fills EVERY column
+    // (none NULL); the per-feed-optional columns therefore all carry `Some(...)`,
+    // so the on-wire bytes are byte-IDENTICAL to the pre-C1 hand-written row.
+    // The f32→f64-clean + 2dp price conversion stays HERE (per-feed) so Groww's
+    // native f64 is never widened through the Dhan path.
+    //
+    // Dhan WebSocket `exchange_timestamp` is already IST epoch seconds → ×1e9
+    // for the designated `ts`, NO offset (`data-integrity.md`). `received_at`
+    // comes from `Utc::now()` (UTC) → +IST offset to align with IST `ts`.
+    let fields = RawTickFields {
+        security_id: i64::from(tick.security_id),
+        segment: segment_code_to_str(tick.exchange_segment_code),
+        ltp: round_to_2dp(f32_to_f64_clean(tick.last_traded_price)),
+        // Dhan ParsedTick.volume is u32; widens losslessly to the i64 carrier.
+        volume: i64::from(tick.volume),
+        ts_ist_nanos: i64::from(tick.exchange_timestamp).saturating_mul(1_000_000_000),
+        capture_seq,
+        open: Some(round_to_2dp(f32_to_f64_clean(tick.day_open))),
+        high: Some(round_to_2dp(f32_to_f64_clean(tick.day_high))),
+        low: Some(round_to_2dp(f32_to_f64_clean(tick.day_low))),
+        close: Some(round_to_2dp(f32_to_f64_clean(tick.day_close))),
+        oi: Some(i64::from(tick.open_interest)),
+        avg_price: Some(round_to_2dp(f32_to_f64_clean(tick.average_traded_price))),
+        last_trade_qty: Some(i64::from(tick.last_trade_quantity)),
+        total_buy_qty: Some(i64::from(tick.total_buy_quantity)),
+        total_sell_qty: Some(i64::from(tick.total_sell_quantity)),
+        exchange_timestamp: Some(i64::from(tick.exchange_timestamp)),
+        received_at_ist_nanos: Some(tick.received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS)),
+        // DEDUP tiebreaker content fingerprint (2026-06-08). Stored column only.
+        payload_hash: Some(tick_payload_hash(tick)),
+    };
 
-    // Dhan WebSocket exchange_timestamp is already IST epoch seconds.
-    // Store directly — no offset needed.
-    let ts_nanos =
-        TimestampNanos::new(i64::from(tick.exchange_timestamp).saturating_mul(1_000_000_000));
-    let received_nanos =
-        TimestampNanos::new(tick.received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS));
-
-    buffer
-        .table(TableName::new_unchecked(QUESTDB_TABLE_TICKS))
-        .context("table name")?
-        // QuestDB ILP requires ALL symbols before any column_*. `segment`
-        // is the only SYMBOL column on the `ticks` table after the #T1c
-        // table cleanup retired the `phase` SYMBOL column.
-        .symbol(
-            ColumnName::new_unchecked("segment"),
-            segment_code_to_str(tick.exchange_segment_code),
-        )
-        .context("segment")?
-        // `feed` SYMBOL — broker source, part of the DEDUP key (operator 2026-06-19).
-        // ILP requires ALL symbols before any column_*, so it sits with `segment`.
-        // Constant 'dhan' here (Dhan writer); future Groww path stamps 'groww'.
-        .symbol(ColumnName::new_unchecked("feed"), TICK_FEED_DHAN)
-        .context("feed")?
-        .column_i64(
-            ColumnName::new_unchecked("security_id"),
-            i64::from(tick.security_id),
-        )
-        .context("security_id")?
-        .column_f64(
-            ColumnName::new_unchecked("ltp"),
-            round_to_2dp(f32_to_f64_clean(tick.last_traded_price)),
-        )
-        .context("ltp")?
-        .column_f64(
-            ColumnName::new_unchecked("open"),
-            round_to_2dp(f32_to_f64_clean(tick.day_open)),
-        )
-        .context("open")?
-        .column_f64(
-            ColumnName::new_unchecked("high"),
-            round_to_2dp(f32_to_f64_clean(tick.day_high)),
-        )
-        .context("high")?
-        .column_f64(
-            ColumnName::new_unchecked("low"),
-            round_to_2dp(f32_to_f64_clean(tick.day_low)),
-        )
-        .context("low")?
-        .column_f64(
-            ColumnName::new_unchecked("close"),
-            round_to_2dp(f32_to_f64_clean(tick.day_close)),
-        )
-        .context("close")?
-        .column_i64(ColumnName::new_unchecked("volume"), i64::from(tick.volume))
-        .context("volume")?
-        .column_i64(
-            ColumnName::new_unchecked("oi"),
-            i64::from(tick.open_interest),
-        )
-        .context("oi")?
-        .column_f64(
-            ColumnName::new_unchecked("avg_price"),
-            round_to_2dp(f32_to_f64_clean(tick.average_traded_price)),
-        )
-        .context("avg_price")?
-        .column_i64(
-            ColumnName::new_unchecked("last_trade_qty"),
-            i64::from(tick.last_trade_quantity),
-        )
-        .context("last_trade_qty")?
-        .column_i64(
-            ColumnName::new_unchecked("total_buy_qty"),
-            i64::from(tick.total_buy_quantity),
-        )
-        .context("total_buy_qty")?
-        .column_i64(
-            ColumnName::new_unchecked("total_sell_qty"),
-            i64::from(tick.total_sell_quantity),
-        )
-        .context("total_sell_qty")?
-        .column_i64(
-            ColumnName::new_unchecked("exchange_timestamp"),
-            i64::from(tick.exchange_timestamp),
-        )
-        .context("exchange_timestamp")?
-        .column_ts(ColumnName::new_unchecked("received_at"), received_nanos)
-        .context("received_at")?
-        // DEDUP tiebreaker (2026-06-08): deterministic content fingerprint so
-        // distinct same-second ticks are both kept and true duplicates/replays
-        // collapse. See `tick_payload_hash` + the `DEDUP_KEY_TICKS` doc.
-        .column_i64(
-            ColumnName::new_unchecked("payload_hash"),
-            tick_payload_hash(tick),
-        )
-        .context("payload_hash")?
-        // TICK-SEQ-01: replay-stable capture sequence. On the live path this is
-        // the WS read-loop `frame_seq`; on WAL replay it is the SAME value read
-        // back from the v2 record — so a true duplicate collapses and distinct
-        // ticks are kept. Still a stored column only in this slice; the DEDUP key
-        // flip to capture_seq lands in PR-2b. See `.claude/plans/active-plan.md`.
-        .column_i64(ColumnName::new_unchecked("capture_seq"), capture_seq)
-        .context("capture_seq")?
-        .at(ts_nanos)
-        .context("designated timestamp")?;
-
-    Ok(())
+    build_tick_row_for_feed(buffer, &fields, tickvault_common::feed::Feed::Dhan)
 }
 
 /// Lifecycle values produced by `crates/core/src/pipeline/tick_enricher.rs`
@@ -2084,7 +2012,7 @@ fn current_time_ms() -> u64 {
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test-only arithmetic is not on hot path
 mod tests {
     use super::*;
-    use questdb::ingress::ProtocolVersion;
+    use questdb::ingress::{ProtocolVersion, TimestampNanos};
     use tickvault_common::constants::{
         EXCHANGE_SEGMENT_BSE_CURRENCY, EXCHANGE_SEGMENT_BSE_EQ, EXCHANGE_SEGMENT_BSE_FNO,
         EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_MCX_COMM, EXCHANGE_SEGMENT_NSE_CURRENCY,
@@ -2134,6 +2062,42 @@ mod tests {
         }
     }
 
+    /// C1 byte-preservation golden test — the Dhan `build_tick_row_seq` output
+    /// (now routed through the shared `build_tick_row_for_feed`) must be
+    /// byte-IDENTICAL to the pre-C1 hand-written row for a representative Dhan
+    /// tick. The golden string below is the exact ILP line the hand-written
+    /// builder produced (captured from the pre-refactor code); any drift in the
+    /// converged builder fails the build, not the live ILP stream.
+    #[test]
+    fn dhan_tick_row_is_byte_identical_golden() {
+        use questdb::ingress::ProtocolVersion;
+        // NSE_FNO tick, ltp 21000.0; payload_hash + received_at are deterministic.
+        let tick = make_test_tick(49081, 21_000.0);
+        let mut buf = Buffer::new(ProtocolVersion::V1);
+        build_tick_row_seq(&mut buf, &tick, 777).expect("build");
+        let got = String::from_utf8_lossy(buf.as_bytes()).into_owned();
+
+        // received_at = (received_at_nanos + IST offset), serialized by ILP
+        // `column_ts` as MICROSECONDS (nanos / 1000, `t` suffix) — exactly as the
+        // pre-C1 hand-written row did. payload_hash from tick_payload_hash(tick).
+        // Both computed here to keep the golden self-checking rather than a frozen
+        // magic string for those two fields.
+        let received = tick.received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS) / 1_000;
+        let phash = tick_payload_hash(&tick);
+        let ts = i64::from(tick.exchange_timestamp).saturating_mul(1_000_000_000);
+        let expected = format!(
+            "ticks,segment=NSE_FNO,feed=dhan \
+             security_id=49081i,ltp=21000.0,open=20950.0,high=21020.0,low=20920.0,\
+             close=20900.0,volume=50000i,oi=120000i,avg_price=20990.0,last_trade_qty=75i,\
+             total_buy_qty=25000i,total_sell_qty=25000i,exchange_timestamp=1740556500i,\
+             received_at={received}t,payload_hash={phash}i,capture_seq=777i {ts}\n"
+        );
+        assert_eq!(
+            got, expected,
+            "Dhan ILP row must be byte-identical to golden"
+        );
+    }
+
     /// Spawn a background TCP server that accepts one connection and drains
     /// all data until EOF. Returns the port. Consolidates 10 identical
     /// spawn-accept-drain patterns into one site.
@@ -2178,14 +2142,19 @@ mod tests {
         port
     }
 
-    /// Latency-hunt 2026-06-10 ratchet: `build_tick_row_seq` uses
-    /// `TableName::new_unchecked` / `ColumnName::new_unchecked` to skip
-    /// questdb-rs per-row name validation (−262 ns/row measured). That is
-    /// sound ONLY while every literal passed to `new_unchecked` is a valid
-    /// ILP identifier — this test extracts every string literal passed to
-    /// `new_unchecked` in THIS source file and runs the CHECKED validators
-    /// over it, so an invalid name added later fails the build, not the
-    /// live ILP stream.
+    /// Latency-hunt 2026-06-10 ratchet (UPDATED by C1 convergence): the
+    /// `new_unchecked` ILP-name literals that this test originally scanned in
+    /// `build_tick_row_seq` MOVED into the shared
+    /// `tick_row_builder::build_tick_row_for_feed` (C1). Their CHECKED-validator
+    /// ratchet now lives there
+    /// (`tick_row_builder::tests::shared_builder_unchecked_ilp_names_pass_validation`).
+    ///
+    /// This test is retained to mechanically prove the literals are GONE from
+    /// `tick_persistence.rs` (the Dhan row build delegates), AND to keep the
+    /// "no non-literal `new_unchecked(`" hardening for any `new_unchecked` calls
+    /// that might be re-introduced into this file later — every such call must
+    /// still be a string literal (validated below) or the allowlisted
+    /// `QUESTDB_TABLE_TICKS` constant.
     #[test]
     fn test_tick_row_unchecked_ilp_names_pass_validation() {
         let source = include_str!("tick_persistence.rs");
@@ -2196,7 +2165,9 @@ mod tests {
             .split("mod tests {")
             .next()
             .unwrap_or_else(|| panic!("tests module marker missing"));
-        let mut found = 0_usize;
+        // Every `new_unchecked("…")` literal still in the production region must
+        // be a valid ILP identifier (defence-in-depth for a future re-introduced
+        // hand-built row). Zero is expected post-C1 (all moved to the builder).
         for chunk in production_region.split("new_unchecked(\"").skip(1) {
             let Some(end) = chunk.find('"') else {
                 panic!("unterminated new_unchecked literal");
@@ -2206,25 +2177,14 @@ mod tests {
                 .unwrap_or_else(|e| panic!("invalid ILP column name {name:?}: {e}"));
             questdb::ingress::TableName::new(name)
                 .unwrap_or_else(|e| panic!("invalid ILP table name {name:?}: {e}"));
-            found += 1;
         }
-        // 16 wrapped column names in build_tick_row_seq (the `segment`
-        // symbol + 15 columns); the table name goes through the
-        // QUESTDB_TABLE_TICKS constant, validated below. The count is a
-        // floor, not an exact pin, so doc-comment mentions don't break it.
-        assert!(
-            found >= 16,
-            "expected ≥16 new_unchecked literals in tick_persistence.rs, found {found}"
-        );
         questdb::ingress::TableName::new(QUESTDB_TABLE_TICKS)
             .unwrap_or_else(|e| panic!("invalid ILP table name {QUESTDB_TABLE_TICKS:?}: {e}"));
 
-        // Hostile-review MEDIUM #2 hardening: a future
-        // `new_unchecked(SOME_CONST)` call would silently dodge the
-        // literal scanner above. In the production region every
-        // `new_unchecked(` call must be either a double-quoted literal
-        // or the one allowlisted QUESTDB_TABLE_TICKS constant — any
-        // other shape fails here.
+        // Hostile-review MEDIUM #2 hardening (retained): any `new_unchecked(`
+        // call in the production region must be either a double-quoted literal
+        // (validated above) or the one allowlisted QUESTDB_TABLE_TICKS constant
+        // — any other shape fails here.
         let total_calls = production_region.matches("new_unchecked(").count();
         let literal_calls = production_region.matches("new_unchecked(\"").count();
         let allowlisted_const_calls = production_region

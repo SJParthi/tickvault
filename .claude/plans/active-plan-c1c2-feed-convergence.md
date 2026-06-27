@@ -1,8 +1,9 @@
 # Implementation Plan: C1+C2 — Feed-Writer / Consumer-Loop Convergence
 
-**Status:** DRAFT
+**Status:** IN_PROGRESS
 **Date:** 2026-06-27
-**Approved by:** pending
+**Approved by:** pending (C1 implemented as a DRAFT PR — code shipped behind the
+shared builder; C2 still design-only)
 
 > **Scope:** This is a DESIGN document (docs-only). It plans, but does NOT yet
 > implement, the convergence of the two remaining per-feed code duplications
@@ -32,9 +33,64 @@
 
 ---
 
+## Design-review corrections (folded into C1, 2026-06-27)
+
+A 6-point adversarial design review of the C1 plan above produced these
+corrections. They are now the authoritative C1 contract (the prose above the
+line is the original DRAFT and is superseded where it conflicts):
+
+1. **Headline deliverable = the shared BUILDER fn, not a facade.** C1 ships ONE
+   `tick_row_builder::build_tick_row_for_feed(&mut Buffer, &RawTickFields, Feed)`
+   — the single source of the `ticks` ILP wire bytes for BOTH feeds. The facade
+   is incidental, NOT the precedent — only the shared row builder eliminates the
+   duplicated ILP append. (The `GenericTickWriter`-facade framing in the original
+   §C1 is dropped; the resilience tiers stay as-is per correction #5.)
+2. **First task = define `RawTickFields` (i64 volume + f64 LTP carrier), proven
+   BEFORE the builder lands.** The widen/passthrough test (E3) asserts Dhan
+   `u32` volume → `i64` in `RawTickFields` and Groww `i64` volume passes through
+   unchanged, and the f32→f64-clean LTP widen (E4) is proven, BEFORE asserting
+   any row bytes.
+3. **`received_at` is per-feed-OMITTED.** Add it to the Groww-NULL list: Dhan
+   writes `received_at`; Groww does NOT. A test asserts NO `received_at=` token
+   on a Groww row.
+4. **Corrected column inventory (recounted against the real `tick_persistence.rs`
+   source, NOT the original "19/9" claim):** the Dhan row is **2 SYMBOLs
+   (`segment`, `feed`) + 16 columns** (security_id, ltp, open, high, low, close,
+   volume, oi, avg_price, last_trade_qty, total_buy_qty, total_sell_qty,
+   exchange_timestamp, received_at, payload_hash, capture_seq) = 18
+   `new_unchecked` literals. The Groww row is **2 SYMBOLs + 5 columns**
+   (security_id, ltp, volume, exchange_timestamp, capture_seq). The remaining 11
+   columns are NULL for Groww.
+5. **Honest envelope:** C1 removes ~25 lines of duplicated ILP-append; it does
+   NOT unify the resilience tier. Dhan keeps ring→spill→DLQ; Groww keeps its
+   lazy-connect buffer (durable floor = sidecar capture-at-receipt file, §32).
+6. **What STAYS per-feed:** the pull/parse adapter; the `FeedStrategy` constant;
+   the per-feed numeric source typing (f32→f64-clean applied for Dhan at the
+   call site, skipped for Groww); the resilience tier; AND the **`capture_seq`
+   SOURCE** (Dhan = WAL `frame_seq`; Groww = `next_capture_seq` seeded from
+   `ts_ist_nanos`). Only the row STRING build is shared.
+
+**C1 shipped (DRAFT PR):**
+- `crates/storage/src/tick_row_builder.rs` — `RawTickFields` + `build_tick_row_for_feed`.
+- `crates/storage/src/tick_persistence.rs::build_tick_row_seq` — rewired to build
+  `RawTickFields` (all columns `Some`) + call the shared builder; byte-identical.
+- `crates/storage/src/groww_persistence.rs::append_row` — rewired to build
+  `RawTickFields` (Dhan-only columns `None` → NULL) + call the shared builder.
+- Tests: `tick_row_builder::tests` (E1 NULL-not-0, E3 widen, E4 ltp-widen,
+  feed-symbol, capture_seq, unchecked-name validity), the Dhan golden
+  byte-preservation test in `tick_persistence.rs`, the one-builder source guard
+  `crates/storage/tests/feed_tick_writer_convergence_guard.rs`, and the DHAT
+  zero-alloc test `crates/storage/tests/dhat_tick_row_builder.rs`.
+
+---
+
 ## Plan Items
 
-- [ ] **Item C1 — Sub-PR #1: unify the raw-tick WRITER (feed-parameterized)**
+- [x] **Item C1 — Sub-PR #1: unify the raw-tick WRITER row-builder (feed-parameterized)**
+  - Files: `crates/storage/src/tick_row_builder.rs` (new), `crates/storage/src/tick_persistence.rs`, `crates/storage/src/groww_persistence.rs`, `crates/storage/src/lib.rs`, `crates/storage/tests/feed_tick_writer_convergence_guard.rs` (new), `crates/storage/tests/dhat_tick_row_builder.rs` (new)
+  - Tests: `volume_carrier_dhan_u32_widens_and_groww_i64_passes_through`, `ltp_carrier_dhan_f32_widens_exactly`, `groww_row_omits_dhan_only_columns_null_not_zero`, `groww_row_has_no_received_at_token`, `dhan_row_contains_every_column`, `dhan_tick_row_is_byte_identical_golden`, `exactly_one_ticks_row_builder_function_exists`, `dhat_build_tick_row_for_feed_zero_alloc`, `shared_builder_unchecked_ilp_names_pass_validation`
+
+- [ ] **Item C1 (ORIGINAL DRAFT) — Sub-PR #1: unify the raw-tick WRITER (feed-parameterized)**
   - Files: `crates/storage/src/tick_persistence.rs`, `crates/storage/src/groww_persistence.rs`, `crates/storage/src/lib.rs`, `crates/app/src/groww_bridge.rs` (call-site swap), `crates/storage/tests/feed_tick_writer_convergence_guard.rs` (new)
   - Tests: `test_generic_tick_writer_dhan_full_columns`, `test_generic_tick_writer_groww_subset_columns_null_not_zero`, `test_generic_tick_writer_dedup_key_unchanged`, `test_generic_tick_writer_dhan_uses_f32_to_f64_clean`, `test_generic_tick_writer_groww_native_f64`, `test_one_raw_tick_writer_path_guard`, DHAT `dhat_generic_tick_writer_zero_alloc`
 
