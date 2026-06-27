@@ -153,3 +153,46 @@ Two independent live market-data feeds write to the SAME shared QuestDB tables (
 ## Auto-driver explanation
 
 > Sir, the juice shop now has TWO price boards — one from Dhan, one from Groww — hanging side by side, each with its own ON/OFF switch. Dhan's board has run for weeks and is trusted. Groww's board is brand-new and has never been switched on even once, and its key is still missing from the locker (the SSM creds). So tonight we get the key, switch on Groww quietly after the market closes, and watch both boards fill the register with no red marks. Only if that test is clean do we trust both boards on Monday morning. The register keeps both boards' prices in separate columns so they never overwrite each other.
+
+---
+
+## Per-Item Guarantee Matrix
+
+> **Cross-reference:** the canonical matrices live in
+> `.claude/rules/project/per-wave-guarantee-matrix.md` (the 15-row 100% Guarantee
+> Matrix + the 7-row Resilience Demand Matrix). All 15 + 7 rows below apply to
+> EVERY item / engineering serial PR in this plan; each PR's body carries the
+> per-item proof column. The matrices are reproduced inline here so this plan is
+> self-contained.
+
+### The 15-row 100% Guarantee Matrix (mandatory)
+
+| Demand | Mechanical proof artefact | Real-time check | Per-item gate |
+|---|---|---|---|
+| 100% code coverage | `quality/crate-coverage-thresholds.toml` 100% min per crate; `scripts/coverage-gate.sh` | post-merge llvm-cov report | item PR includes coverage delta |
+| 100% audit coverage | `<event>_audit` table per typed event with DEDUP UPSERT KEYS | `mcp__tickvault-logs__questdb_sql` | item adds/extends audit table |
+| 100% testing coverage | 22 test categories per `testing.md` (unit/integration/property/loom/dhat/fuzz/mutation/sanitizer/coverage/etc.) | `cargo test --workspace` green | item declares which 22 it covers |
+| 100% code checks | banned-pattern + pub-fn-test + pub-fn-wiring + plan-verify + secret-scan + 8 pre-commit gates | pre-push mandatory | all gates green |
+| 100% code performance | DHAT zero-alloc + Criterion p99 budgets + bench-gate ≤5% regression | `cargo bench` + `scripts/bench-gate.sh` | DHAT test if hot path |
+| 100% monitoring | 7-layer telemetry (Prom counter + gauge + tracing span + Loki log + Telegram event + Grafana panel + audit table) | `mcp__tickvault-logs__run_doctor` | 9-box completes 7 layers |
+| 100% logging | tracing macros mandatory (no println!/dbg!); ERROR → Telegram | hourly errors.jsonl rotation | every error path uses `error!` with `code` |
+| 100% alerting | `alerts.yml` Prom rule + `resilience_sla_alert_guard.rs` ratchet | `mcp__tickvault-logs__run_doctor` (CloudWatch alarms) | item adds alert for new failure |
+| 100% security | banned-pattern + secret-scan + `Secret<T>` + security-reviewer agent | `cargo audit` post-deploy | item runs security-reviewer |
+| 100% security hardening | static IP enforcement + pre-commit secret scan + `unused_must_use` lint | post-deploy IP verify | item declares attack-surface delta |
+| 100% bugs fixing | adversarial 3-agent review (proven 4-bug catch rate) | pre-PR + post-impl agent pass | item runs all 3 agents |
+| 100% scenarios covering | 9-box + chaos test for new failure mode | chaos suite | item declares scenarios in ratchet |
+| 100% functionalities covering | every pub fn has call site + test (`pub-fn-wiring-guard.sh` + `pub-fn-test-guard.sh`) | pre-push gates 6+11 | item adds tests for every new pub fn |
+| 100% code review | adversarial 3-agent on diff before AND after impl | per-PR | item PR includes both passes |
+| 100% extreme check | all of above + ratchet tests fail build on regression | every commit | item adds ratchet test |
+
+### The 7-row Resilience Demand Matrix (mandatory)
+
+| Demand | Honest envelope | Per-item proof |
+|---|---|---|
+| Zero ticks lost | Bounded zero loss inside chaos envelope: ring 2M → spill NDJSON → DLQ | item must not introduce new tick-drop path |
+| WS never disconnects | DETECT ≤5s, reconnect with `SubscribeRxGuard`, sleep-until-open post-close | item must not break SubscribeRxGuard or pool watchdog |
+| Never slow/locked/hanged | DHAT ≤4 alloc blocks/8KB across 10K calls; Criterion p99 ≤100ns; tick-gap >30s Telegram; core_affinity Core 0 | item must not add hot-path allocation |
+| QuestDB never fails | ABSORB via 3-tier rescue→spill→DLQ + schema self-heal | item must not break self-heal |
+| O(1) latency | `from_le_bytes` + `papaya` + `Arc<HashMap>` + SPSC bounded; bench-gate ≤5% regression | item adds Criterion bench if hot path |
+| Uniqueness + dedup | Composite `(security_id, exchange_segment)` per I-P1-11 + DEDUP UPSERT KEYS + meta-guard | item DEDUP key includes segment |
+| Real-time proof | 7-layer telemetry + SLO-01/SLO-02 @ 10s + market-open self-test @ 09:16:30 IST | item ratchet pins all 7 layers |
