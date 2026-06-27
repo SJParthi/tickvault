@@ -43,7 +43,7 @@ fn pool_watchdog_is_within_market_hours() -> bool {
     (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST).contains(&sec_of_day)
 }
 
-use crate::auth::TokenHandle;
+use crate::auth::{TokenHandle, TokenManager};
 use crate::websocket::connection::WebSocketConnection;
 use crate::websocket::pool_watchdog::{PoolWatchdog, WatchdogVerdict};
 use crate::websocket::types::{ConnectionHealth, InstrumentSubscription, WebSocketError};
@@ -169,6 +169,7 @@ impl WebSocketConnectionPool {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -194,6 +195,12 @@ impl WebSocketConnectionPool {
         // always-on (every existing caller / test). When `Some`, every
         // connection in the pool reads it and parks dormant while disabled.
         feed_enable_flag: Option<Arc<AtomicBool>>,
+        // D2c (closes C4): LANE-OWNED `TokenManager` for the sleep-wake
+        // renewal. `None` = global `OnceLock` fallback (boot-ON / fast arm).
+        // When `Some` (runtime cold-start via `start_dhan_lane`), every
+        // connection in the pool targets THIS manager on wake-renewal so a
+        // stop→re-start renews the manager the live pool is actually using.
+        lane_token_manager: Option<Arc<TokenManager>>,
     ) -> Result<Self, WebSocketError> {
         let total = instruments.len();
 
@@ -266,6 +273,12 @@ impl WebSocketConnectionPool {
                 // connection can pause/resume on the operator toggle.
                 if let Some(flag) = feed_enable_flag.clone() {
                     conn = conn.with_feed_enable_flag(flag);
+                }
+                // D2c (C4): attach the LANE-OWNED TokenManager so each
+                // connection's sleep-wake renewal targets the live lane manager
+                // (not the stale global) after a runtime stop→re-start.
+                if let Some(tm) = lane_token_manager.clone() {
+                    conn = conn.with_token_manager(tm);
                 }
                 Arc::new(conn)
             })

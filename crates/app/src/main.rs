@@ -1410,6 +1410,17 @@ async fn main() -> Result<()> {
             ws_frame_spill.clone(),
             // PR-E: hand the Dhan main feed the shared runtime enable flag.
             Some(feed_runtime.dhan_flag()),
+            // D2c (C4): the FAST crash-recovery arm `return run_shutdown_fast`s
+            // (below, ~main.rs:2074) BEFORE the inline spine's
+            // `set_global_token_manager` (~main.rs:4991) is ever reached — so on
+            // the fast arm the global `OnceLock` is UNSET and
+            // `wake_renewal_token_manager()` returns `None`. Wake-renewal therefore
+            // silently no-ops here: the fast arm runs ONLY at boot with a valid
+            // cached token (market-hours crash restart), so it relies on that cached
+            // token rather than proactive wake-renewal. Passing `None` for the
+            // lane-owned manager is correct (no runtime lane to inject). This is
+            // PRE-EXISTING fast-arm behaviour, made explicit here — NOT a D2c change.
+            None,
         ) {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
             None => (None, None),
@@ -2749,6 +2760,15 @@ fn create_websocket_pool(
     // FeedRuntimeState::dhan_flag). Every connection reads it to pause/resume on
     // the operator toggle. `None` only in paths with no runtime control.
     dhan_feed_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    // D2c (closes C4): LANE-OWNED `TokenManager` for the WS sleep-wake renewal.
+    // `Some(lane manager)` from `start_dhan_lane` (the canonical cold path used
+    // by every runtime cold-start) so the wake renews the manager the live pool
+    // is actually using; `None` from the fast crash-recovery arm — that arm
+    // `return run_shutdown_fast`s before the inline spine's
+    // `set_global_token_manager`, so the global `OnceLock` is UNSET there and
+    // wake-renewal no-ops (the fast arm relies on its cached token; no proactive
+    // wake-renewal). Closes the stop→re-start "renew the wrong token" race.
+    lane_token_manager: Option<std::sync::Arc<tickvault_core::auth::TokenManager>>,
 ) -> Option<(
     tokio::sync::mpsc::Receiver<(u64, bytes::Bytes)>,
     WebSocketConnectionPool,
@@ -2902,6 +2922,7 @@ fn create_websocket_pool(
         wal_spill,
         Some(ws_audit_tx),
         dhan_feed_flag,
+        lane_token_manager,
     ) {
         Ok(pool) => pool,
         Err(err) => {
@@ -4980,6 +5001,15 @@ async fn start_dhan_lane(
         tracing::warn!("global TokenManager already installed — skipping");
     }
 
+    // D2c (C4): install THIS lane's TokenManager as the live health-gauge source,
+    // OVERWRITING any prior (now-dead) manager from an earlier cold-start. Unlike
+    // the global `OnceLock` above (set-once at first boot, immutable thereafter),
+    // this slot tracks the CURRENT lane manager — so after a runtime stop→re-start
+    // the self-test token-headroom + SLO token-freshness gauges read the NEW
+    // manager's remaining seconds, not the stale boot-time one. Cleared at every
+    // lane→Off transition (operator disable / watchdog-Halt / already-torn-down).
+    feed_runtime.set_live_token_manager(token_manager.clone());
+
     // Fetch credentials ONCE for all downstream consumers (WS pool, order update WS, trading pipeline).
     // Previously fetched 3 separate times — each SSM call is a network roundtrip to AWS.
     let ws_client_id = {
@@ -5027,6 +5057,10 @@ async fn start_dhan_lane(
             ws_frame_spill.clone(),
             // PR-E: hand the Dhan main feed the shared runtime enable flag.
             Some(feed_runtime.dhan_flag()),
+            // D2c (C4): hand the LANE-OWNED TokenManager so a runtime
+            // stop→re-start renews the live lane manager on wake, not the
+            // stale global. This is the canonical cold path.
+            Some(token_manager.clone()),
         ) {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
             None => (None, None),
@@ -5886,6 +5920,9 @@ async fn start_dhan_lane(
                 let st_health = health_status.clone();
                 let st_calendar = std::sync::Arc::clone(&trading_calendar);
                 let st_qcfg = config.questdb.clone();
+                // D2c (C4): capture the shared feed state so the token-headroom
+                // sub-check reads the LIVE lane manager (preferred) over the global.
+                let st_feed_runtime = std::sync::Arc::clone(&feed_runtime);
                 tokio::spawn(async move {
                     use chrono::{FixedOffset, NaiveTime, TimeZone, Utc};
                     use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
@@ -5941,10 +5978,11 @@ async fn start_dhan_lane(
                         tickvault_storage::boot_probe::wait_for_questdb_ready(&st_qcfg, 3)
                             .await
                             .is_ok();
-                    let token_headroom_secs =
-                        tickvault_core::auth::token_manager::global_token_manager()
-                            .map(|tm| tm.seconds_until_expiry())
-                            .unwrap_or(0);
+                    // D2c (C4): prefer the LIVE lane-owned manager over the global
+                    // OnceLock — after a runtime stop→re-start the global points at
+                    // the dead boot-time manager, which would show a misleading
+                    // token-headroom on the exact path D2c targets.
+                    let token_headroom_secs = gauge_token_headroom_secs(&st_feed_runtime);
                     let worst_gap_secs =
                         tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
                             .map(|d| {
@@ -6072,6 +6110,10 @@ async fn start_dhan_lane(
                 let _slo_notifier = notifier.clone();
                 let slo_health = health_status.clone();
                 let slo_qcfg = config.questdb.clone();
+                // D2c (C4): capture the shared feed state so the token-freshness
+                // SLO dimension reads the LIVE lane manager (preferred) over the
+                // global OnceLock after a runtime stop→re-start.
+                let slo_feed_runtime = std::sync::Arc::clone(&feed_runtime);
                 // D2a: pre-extract the Copy config fields (see the readiness
                 // spawn above) so the `'static` SLO task does not capture the
                 // lane-lifetime `&config`. Behaviour-identical.
@@ -6285,10 +6327,10 @@ async fn start_dhan_lane(
                         };
 
                         // ---- Token_freshness -----------------------------
-                        let token_secs =
-                            tickvault_core::auth::token_manager::global_token_manager()
-                                .map(|tm| tm.seconds_until_expiry())
-                                .unwrap_or(0);
+                        // D2c (C4): prefer the LIVE lane-owned manager over the
+                        // global OnceLock so a runtime stop→re-start reports the new
+                        // manager's headroom, not the dead boot-time manager's.
+                        let token_secs = gauge_token_headroom_secs(&slo_feed_runtime);
                         let token_freshness = if token_secs > SLO_TOKEN_HEADROOM_THRESHOLD_SECS {
                             1.0
                         } else {
@@ -7394,6 +7436,32 @@ fn dhan_lane_retry_backoff_secs(attempt: u32) -> u64 {
     )
 }
 
+/// D2c (C4): token-headroom (seconds-until-expiry) for the PROCESS-level health
+/// gauges (market-open self-test token-headroom + SLO token-freshness).
+///
+/// PREFERS the live lane-owned `TokenManager` stored on `FeedRuntimeState` and
+/// falls back to the global `OnceLock` only when no lane is running (boot-OFF /
+/// Groww-only / pre-start). This is the fix for the misleading reading after a
+/// runtime Dhan-lane stop→re-start: the global `OnceLock` is set-once at first
+/// boot and forever points at the dead boot-time (manager-A); the live slot
+/// tracks the CURRENT lane manager (manager-B/C/…), so the gauges report the
+/// running lane's real remaining seconds. Returns `0` when neither is present —
+/// the same "no token" sentinel the gauges used before.
+///
+/// Off-hot-path: called on the once-per-trading-day self-test and the 10s SLO
+/// cadences, never per-tick. The `live_token_manager()` read takes a brief,
+/// uncontended `Mutex` and clones an `Arc` out (no `.await` held).
+fn gauge_token_headroom_secs(
+    feed_runtime: &std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
+) -> u64 {
+    if let Some(lane_tm) = feed_runtime.live_token_manager() {
+        return lane_tm.seconds_until_expiry();
+    }
+    tickvault_core::auth::token_manager::global_token_manager()
+        .map(|tm| tm.seconds_until_expiry())
+        .unwrap_or(0)
+}
+
 /// Stable static label for the lane state (no allocation on the metric path).
 const fn lane_state_label(state: tickvault_api::feed_state::LaneState) -> &'static str {
     use tickvault_api::feed_state::LaneState;
@@ -7536,6 +7604,11 @@ pub async fn run_dhan_lane_runtime_supervisor(
                 // desired-ON tick re-cold-starts the lane.
                 feed_runtime.set_dhan_lane_state(LaneState::Off);
                 feed_runtime.set_dhan_lane_running(false);
+                // D2c (C4): lane forced Off (dead owner) — drop the live token-
+                // manager so the health gauges fall back to the global instead of
+                // reading this lane's now-dead manager until the supervisor
+                // re-cold-starts it.
+                feed_runtime.clear_live_token_manager();
                 record_dhan_lane_transition(LaneState::Running, LaneState::Off);
                 error!(
                     code = tickvault_common::error_code::ErrorCode::DhanLane03AuthFailed.code_str(),
@@ -7591,6 +7664,12 @@ pub async fn run_dhan_lane_runtime_supervisor(
                 }
                 record_dhan_lane_transition(LaneState::Starting, LaneState::Off);
                 feed_runtime.set_dhan_lane_running(false);
+                // D2c (C4): cold-start cancelled (Starting→Off won) — drop the live
+                // token-manager so the health gauges fall back to the global instead
+                // of reading the aborted start's manager. (The slot may already be
+                // None if the abort landed before set_live_token_manager; clearing is
+                // idempotent.)
+                feed_runtime.clear_live_token_manager();
             } else {
                 // The task promoted to Running between our snapshot and now — do
                 // NOT abort it. Its parked `park_running_dhan_lane` owns the
@@ -7725,6 +7804,12 @@ pub async fn run_dhan_lane_cold_start(ctx: std::sync::Arc<DhanLaneRuntimeContext
                     record_dhan_lane_transition(LaneState::Starting, LaneState::Off);
                 }
                 ctx.feed_runtime.set_dhan_lane_running(false);
+                // D2c (C4): cold-start FAILED (Starting→Off) — drop the live token-
+                // manager so the health gauges fall back to the global instead of
+                // reading the failed start's manager during the bounded retry
+                // backoff. (Idempotent if the failure landed before
+                // set_live_token_manager ran.)
+                ctx.feed_runtime.clear_live_token_manager();
                 attempt = attempt.saturating_add(1);
                 let backoff = dhan_lane_retry_backoff_secs(attempt);
                 error!(
@@ -7850,6 +7935,9 @@ async fn park_running_dhan_lane(
                 record_dhan_lane_transition(LaneState::Stopping, LaneState::Off);
             }
             ctx.feed_runtime.set_dhan_lane_running(false);
+            // D2c (C4): lane is Off — drop the live token-manager so the health
+            // gauges fall back to the global instead of reading a dead manager.
+            ctx.feed_runtime.clear_live_token_manager();
             return;
         };
 
@@ -7884,6 +7972,9 @@ async fn park_running_dhan_lane(
             record_dhan_lane_transition(LaneState::Stopping, LaneState::Off);
         }
         ctx.feed_runtime.set_dhan_lane_running(false);
+        // D2c (C4): lane is Off — drop the live token-manager so the health gauges
+        // fall back to the global instead of reading this stopped lane's manager.
+        ctx.feed_runtime.clear_live_token_manager();
         info!("[dhan-lane] lane torn down (Stopping→Off) — ready to cold-start again on re-enable");
         ctx.notifier.notify(NotificationEvent::Custom {
             message: "⚪ <b>Dhan feed stopped</b>\nThe live price feed is now disconnected."
@@ -7950,6 +8041,10 @@ async fn handle_lane_watchdog_halt(
         record_dhan_lane_transition(LaneState::Stopping, LaneState::Off);
     }
     ctx.feed_runtime.set_dhan_lane_running(false);
+    // D2c (C4): lane is Off after the Halt teardown — drop the live token-manager
+    // so the health gauges fall back to the global until the supervisor re-cold-
+    // starts the lane (which installs a fresh manager via set_live_token_manager).
+    ctx.feed_runtime.clear_live_token_manager();
     info!(
         "[dhan-lane] watchdog-Halt teardown complete (→Off) — supervisor will re-cold-start \
          the lane on the next tick"
@@ -8817,6 +8912,157 @@ mod tests {
         assert!(
             region.contains("ws_wal_replay_live_feed: Vec::new()"),
             "the runtime cold-start must use EMPTY WAL-replay buffers (no fast-arm cache entry)"
+        );
+    }
+
+    #[test]
+    fn gauge_token_headroom_falls_back_to_global_when_no_live_lane() {
+        // D2c (C4) behavioural: with no live lane manager installed (boot-OFF /
+        // Groww-only / pre-start), `gauge_token_headroom_secs` falls back to the
+        // global OnceLock. In an isolated test binary the global is unset, so the
+        // helper returns the `0` "no token" sentinel — the same value the gauges
+        // used before this fix. This proves the fallback arm + the sentinel.
+        let feed_runtime =
+            std::sync::Arc::new(tickvault_api::feed_state::FeedRuntimeState::default());
+        assert!(
+            feed_runtime.live_token_manager().is_none(),
+            "fresh state has no live lane manager (fallback path)"
+        );
+        assert_eq!(
+            super::gauge_token_headroom_secs(&feed_runtime),
+            0,
+            "no live lane + no global → 0 (the pre-fix 'no token' sentinel)"
+        );
+    }
+
+    #[test]
+    fn slo_token_gauge_prefers_live_lane_manager() {
+        // D2c (C4) source-scan ratchet: BOTH PROCESS-level token gauges (the
+        // market-open self-test token-headroom AND the SLO token-freshness) MUST
+        // read via `gauge_token_headroom_secs` (which prefers the LIVE lane-owned
+        // manager) and MUST NOT read the global `OnceLock` directly — otherwise a
+        // runtime stop→re-start would show the dead boot-time manager's headroom on
+        // the exact path D2c targets. The ONLY allowed `global_token_manager()` call
+        // is inside the `gauge_token_headroom_secs` fallback arm.
+        let src = include_str!("main.rs");
+
+        // Both gauges call the shared helper.
+        assert!(
+            src.contains("let token_headroom_secs = gauge_token_headroom_secs(&st_feed_runtime);"),
+            "the self-test token-headroom gauge must read via gauge_token_headroom_secs (live lane preferred)"
+        );
+        assert!(
+            src.contains("let token_secs = gauge_token_headroom_secs(&slo_feed_runtime);"),
+            "the SLO token-freshness gauge must read via gauge_token_headroom_secs (live lane preferred)"
+        );
+
+        // The helper prefers the live lane manager before any global fallback.
+        let helper_start = src
+            .find("fn gauge_token_headroom_secs(")
+            .expect("gauge_token_headroom_secs must exist");
+        let helper_end = src[helper_start..]
+            .find("\n}\n")
+            .map(|rel| helper_start + rel)
+            .expect("gauge_token_headroom_secs must have a body");
+        let helper = &src[helper_start..helper_end];
+        let live_pos = helper
+            .find("feed_runtime.live_token_manager()")
+            .expect("helper must read the live lane manager");
+        let global_pos = helper
+            .find("global_token_manager()")
+            .expect("helper must have the global fallback");
+        assert!(
+            live_pos < global_pos,
+            "the helper must PREFER the live lane manager (read it before the global fallback)"
+        );
+
+        // The global OnceLock must be read ONLY inside the helper's fallback —
+        // never again in the closure bodies (which would re-introduce the bug).
+        // Scope the count to the PRODUCTION region (before `#[cfg(test)]`) so this
+        // test's own string literals do not inflate it.
+        let prod_region = &src[..src
+            .find("#[cfg(test)]")
+            .expect("main.rs must have a #[cfg(test)] module")];
+        let direct_global_reads = prod_region.matches("global_token_manager()").count();
+        assert_eq!(
+            direct_global_reads, 1,
+            "global_token_manager() must be read exactly once (the helper fallback); \
+             the two gauge closures must NOT read it directly"
+        );
+    }
+
+    #[test]
+    fn every_lane_not_running_site_clears_the_live_token_manager() {
+        // D2c (C4) clear-completeness ratchet: in the lane supervisor / cold-start /
+        // teardown / watchdog-Halt region, EVERY `set_dhan_lane_running(false)` call
+        // (i.e. every "lane is now Off / not-running" site) MUST be immediately
+        // followed — within a small window — by a `clear_live_token_manager()` call.
+        // Otherwise a failure arm that forgets the clear leaves the health gauges
+        // reading a dead lane's TokenManager during the failed-start backoff — the
+        // exact stale-gauge bug D2c fixes. A future failure arm that omits the clear
+        // fails THIS test (not just the happy-path gauge test).
+        let src = include_str!("main.rs");
+
+        // Scope to the lane control-plane region only (supervisor → run-loop). This
+        // excludes the early `set_live_token_manager` install at boot and any
+        // `#[cfg(test)]` string literals (the test module lives far below run_loop).
+        let region_start = src
+            .find("pub async fn run_dhan_lane_runtime_supervisor")
+            .expect("the lane runtime supervisor must exist");
+        let region_end = src
+            .find("async fn run_process_runloop")
+            .filter(|&o| o > region_start)
+            .expect("run_process_runloop must follow the lane region");
+        let region = &src[region_start..region_end];
+
+        // Every not-running marker in this region must be paired with a clear.
+        let marker = "set_dhan_lane_running(false);";
+        let marker_count = region.matches(marker).count();
+        assert!(
+            marker_count >= 6,
+            "expected the 6 lane-Off sites (3 clean paths + 3 failure arms); found {marker_count} \
+             — a site was removed or the region boundary drifted"
+        );
+
+        // The number of `set_dhan_lane_running(false)` sites and the number of
+        // `clear_live_token_manager()` clears in the region must MATCH — one clear
+        // per not-running site. (Both are O(1) substring counts over the region.)
+        let clear_count = region.matches("clear_live_token_manager();").count();
+        assert_eq!(
+            clear_count, marker_count,
+            "every lane-Off / not-running site ({marker_count}) must have a matching \
+             clear_live_token_manager() ({clear_count}) — a failure arm forgot the clear"
+        );
+
+        // Positional check: each not-running marker is followed by a clear within a
+        // short window (no intervening other marker), so the pairing is genuine and
+        // a clear cannot be "borrowed" from a distant unrelated site.
+        let mut search_from = 0usize;
+        let mut paired = 0usize;
+        while let Some(rel) = region[search_from..].find(marker) {
+            let marker_abs = search_from + rel;
+            let after = &region[marker_abs..];
+            let clear_at = after.find("clear_live_token_manager();");
+            let next_marker_at = after[marker.len()..].find(marker).map(|o| o + marker.len());
+            // A clear must exist after this marker AND occur before the next marker.
+            match (clear_at, next_marker_at) {
+                (Some(c), Some(n)) => assert!(
+                    c < n,
+                    "a lane-Off site at byte {marker_abs} is not followed by a clear before the \
+                     next lane-Off site — the failure arm forgot clear_live_token_manager()"
+                ),
+                (Some(_), None) => {}
+                (None, _) => panic!(
+                    "a lane-Off site at byte {marker_abs} has no following \
+                     clear_live_token_manager() in the lane region"
+                ),
+            }
+            paired += 1;
+            search_from = marker_abs + marker.len();
+        }
+        assert_eq!(
+            paired, marker_count,
+            "every lane-Off marker must be positionally paired with a clear"
         );
     }
 }
