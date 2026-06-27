@@ -1410,6 +1410,10 @@ async fn main() -> Result<()> {
             ws_frame_spill.clone(),
             // PR-E: hand the Dhan main feed the shared runtime enable flag.
             Some(feed_runtime.dhan_flag()),
+            // D2c (C4): the FAST crash-recovery arm runs ONLY at boot with a
+            // valid cache (never from a runtime toggle), so wake-renewal uses
+            // the global `OnceLock` set at boot — no lane injection needed.
+            None,
         ) {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
             None => (None, None),
@@ -2749,6 +2753,13 @@ fn create_websocket_pool(
     // FeedRuntimeState::dhan_flag). Every connection reads it to pause/resume on
     // the operator toggle. `None` only in paths with no runtime control.
     dhan_feed_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    // D2c (closes C4): LANE-OWNED `TokenManager` for the WS sleep-wake renewal.
+    // `Some(lane manager)` from `start_dhan_lane` (the canonical cold path used
+    // by every runtime cold-start) so the wake renews the manager the live pool
+    // is actually using; `None` from the fast crash-recovery arm (boot-ON only,
+    // uses the global `OnceLock`). Closes the stop→re-start "renew the wrong
+    // token" race.
+    lane_token_manager: Option<std::sync::Arc<tickvault_core::auth::TokenManager>>,
 ) -> Option<(
     tokio::sync::mpsc::Receiver<(u64, bytes::Bytes)>,
     WebSocketConnectionPool,
@@ -2902,6 +2913,7 @@ fn create_websocket_pool(
         wal_spill,
         Some(ws_audit_tx),
         dhan_feed_flag,
+        lane_token_manager,
     ) {
         Ok(pool) => pool,
         Err(err) => {
@@ -5027,6 +5039,10 @@ async fn start_dhan_lane(
             ws_frame_spill.clone(),
             // PR-E: hand the Dhan main feed the shared runtime enable flag.
             Some(feed_runtime.dhan_flag()),
+            // D2c (C4): hand the LANE-OWNED TokenManager so a runtime
+            // stop→re-start renews the live lane manager on wake, not the
+            // stale global. This is the canonical cold path.
+            Some(token_manager.clone()),
         ) {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
             None => (None, None),
