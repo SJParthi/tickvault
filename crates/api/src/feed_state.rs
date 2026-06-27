@@ -360,6 +360,12 @@ impl FeedRuntimeState {
     /// lock we recover the inner guard (`into_inner`) rather than panic — losing the
     /// live handle is benign (the gauges fall back to the global), and a health-slot
     /// write must never abort the lane.
+    // Needs a real `Arc<TokenManager>` to exercise, but `core`'s only constructor
+    // (`new_for_test`) is `#[cfg(test)] pub(crate)` — unreachable from this crate.
+    // The set path is one line; its read/clear companions (`live_token_manager` /
+    // `clear_live_token_manager`) ARE unit-tested, and the live call site is
+    // `start_dhan_lane` (boot-deploy follow exercises it).
+    // TEST-EXEMPT: cross-crate test-constructor barrier (see comment above).
     pub fn set_live_token_manager(&self, manager: Arc<TokenManager>) {
         match self.live_lane_token_manager.lock() {
             Ok(mut slot) => *slot = Some(manager),
