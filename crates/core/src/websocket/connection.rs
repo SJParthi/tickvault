@@ -2600,6 +2600,115 @@ mod tests {
         assert!(conn.feed_enabled(), "flag true again → re-enabled");
     }
 
+    /// D2c (C4) — `with_token_manager` stores the lane manager and
+    /// `wake_renewal_token_manager()` returns THAT exact manager, even when a
+    /// (different) global is installed. This is the core of the stop→re-start
+    /// fix: the wake renews the manager the live pool actually holds, never the
+    /// stale global `OnceLock`.
+    #[test]
+    fn wake_renewal_token_manager_prefers_injected_over_global() {
+        use crate::auth::TokenManager;
+        // Install SOME global so the fallback path is non-trivially different
+        // from the injected one (idempotent — a no-op if already set by another
+        // test in this binary; either way it is a DIFFERENT Arc instance from
+        // `lane_mgr` below, so the pointer assertion is meaningful).
+        let global_mgr = TokenManager::new_for_test(None);
+        let _ = crate::auth::token_manager::set_global_token_manager(global_mgr);
+
+        // The lane-owned manager — a distinct instance.
+        let lane_mgr = TokenManager::new_for_test(None);
+
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![],
+            FeedMode::Ticker,
+            tx,
+            None,
+        )
+        .with_token_manager(Arc::clone(&lane_mgr));
+
+        let selected = conn
+            .wake_renewal_token_manager()
+            .expect("injected lane manager must be returned");
+        assert!(
+            Arc::ptr_eq(selected, &lane_mgr),
+            "wake-renewal MUST target the injected lane manager, not the global \
+             OnceLock — this is the C4 stop→re-start fix"
+        );
+    }
+
+    /// D2c (C4) — without injection (the boot-ON / fast crash-recovery arm),
+    /// `wake_renewal_token_manager()` returns EXACTLY the global `OnceLock`
+    /// value, preserving pre-D2c behaviour. Ordering-robust: asserts the helper
+    /// result pointer-matches whatever `global_token_manager()` currently is
+    /// (including `None` if no global has been installed in this binary yet).
+    #[test]
+    fn wake_renewal_token_manager_falls_back_to_global_when_not_injected() {
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![],
+            FeedMode::Ticker,
+            tx,
+            None,
+        );
+        // No `with_token_manager` → must mirror the global accessor exactly.
+        let selected = conn.wake_renewal_token_manager();
+        let global = crate::auth::token_manager::global_token_manager();
+        match (selected, global) {
+            (Some(s), Some(g)) => assert!(
+                Arc::ptr_eq(s, g),
+                "no injection → wake-renewal must use the global OnceLock"
+            ),
+            (None, None) => { /* no global installed in this binary — consistent */ }
+            (s, g) => panic!(
+                "no-injection helper must mirror global_token_manager(): \
+                 selected.is_some()={}, global.is_some()={}",
+                s.is_some(),
+                g.is_some()
+            ),
+        }
+    }
+
+    /// D2c (C4) — `with_token_manager` actually populates the field (builder
+    /// wiring ratchet). Asserts via the selection helper that the injected
+    /// manager is the one returned.
+    #[test]
+    fn with_token_manager_sets_the_field() {
+        use crate::auth::TokenManager;
+        let lane_mgr = TokenManager::new_for_test(None);
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![],
+            FeedMode::Ticker,
+            tx,
+            None,
+        )
+        .with_token_manager(Arc::clone(&lane_mgr));
+        assert!(
+            conn.token_manager.is_some(),
+            "with_token_manager must populate the field"
+        );
+        assert!(
+            Arc::ptr_eq(conn.token_manager.as_ref().expect("just set"), &lane_mgr),
+            "stored manager must be the exact injected Arc"
+        );
+    }
+
     /// PR #790b (2026-05-25) — disconnect-context capture ratchet.
     ///
     /// `record_disconnect` MUST capture (reason, timestamp, attempt count)
