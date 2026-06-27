@@ -42,10 +42,13 @@
 //! is NOT a stored column (the canonical ms is the nanos `ts`).
 
 use anyhow::{Context, Result};
-use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
+use questdb::ingress::{Buffer, ProtocolVersion, Sender};
 use tracing::warn;
 
 use tickvault_common::config::QuestDbConfig;
+use tickvault_common::feed::Feed;
+
+use crate::tick_row_builder::{RawTickFields, build_tick_row_for_feed};
 
 /// The SHARED `ticks` table — Groww writes here too (operator decision
 /// 2026-06-19, "same tables + feed column"), distinguished by `feed='groww'`.
@@ -168,27 +171,38 @@ impl GrowwLiveTickWriter {
     /// are BOTH kept. Symbols (`segment`, `feed`) precede all columns per ILP.
     /// O(1), zero alloc beyond the buffer's internal growth.
     pub fn append_row(&mut self, row: &GrowwLiveTickRow) -> Result<()> {
-        self.buffer
-            .table(SHARED_TICKS_TABLE)
-            .with_context(|| "groww ticks append: table() failed")?
-            .symbol("segment", row.segment)
-            .with_context(|| "groww ticks append: symbol(segment) failed")?
-            .symbol("feed", GROWW_FEED_LABEL)
-            .with_context(|| "groww ticks append: symbol(feed) failed")?
-            .column_i64("security_id", row.security_id)
-            .with_context(|| "groww ticks append: column_i64(security_id) failed")?
-            .column_f64("ltp", row.ltp)
-            .with_context(|| "groww ticks append: column_f64(ltp) failed")?
-            .column_i64("volume", row.volume)
-            .with_context(|| "groww ticks append: column_i64(volume) failed")?
+        // C1 convergence: emit the row via the ONE shared `ticks` builder. Groww
+        // is an LTP-only feed, so every Dhan-only column is `None` → the builder
+        // OMITS its token → the cell is NULL (never `0`). The designated `ts` is
+        // `row.ts_ist_nanos` verbatim, so Groww's MILLISECOND precision is
+        // preserved. `ltp` is native f64 (no f32→f64 widening — that is a
+        // Dhan-WebSocket-f32 concern, not Groww's; `data-integrity.md`).
+        let fields = RawTickFields {
+            security_id: row.security_id,
+            segment: row.segment,
+            ltp: row.ltp,
+            volume: row.volume,
+            ts_ist_nanos: row.ts_ist_nanos,
+            capture_seq: row.capture_seq,
             // `exchange_timestamp` LONG = IST epoch SECONDS (mirrors the Dhan
-            // column); the full ms lives in the designated `ts` below.
-            .column_i64("exchange_timestamp", row.ts_ist_nanos / 1_000_000_000)
-            .with_context(|| "groww ticks append: column_i64(exchange_timestamp) failed")?
-            .column_i64("capture_seq", row.capture_seq)
-            .with_context(|| "groww ticks append: column_i64(capture_seq) failed")?
-            .at(TimestampNanos::new(row.ts_ist_nanos))
-            .with_context(|| "groww ticks append: at(ts) failed")?;
+            // column); the full ms lives in the designated `ts`.
+            exchange_timestamp: Some(row.ts_ist_nanos / 1_000_000_000),
+            // Groww supplies none of the OHLC / OI / qty / avg_price /
+            // payload_hash / received_at columns → NULL (not 0).
+            open: None,
+            high: None,
+            low: None,
+            close: None,
+            oi: None,
+            avg_price: None,
+            last_trade_qty: None,
+            total_buy_qty: None,
+            total_sell_qty: None,
+            received_at_ist_nanos: None,
+            payload_hash: None,
+        };
+        build_tick_row_for_feed(&mut self.buffer, &fields, Feed::Groww)
+            .with_context(|| "groww ticks append: shared row build failed")?;
         self.pending = self.pending.saturating_add(1);
         Ok(())
     }
