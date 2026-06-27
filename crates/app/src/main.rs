@@ -1410,9 +1410,16 @@ async fn main() -> Result<()> {
             ws_frame_spill.clone(),
             // PR-E: hand the Dhan main feed the shared runtime enable flag.
             Some(feed_runtime.dhan_flag()),
-            // D2c (C4): the FAST crash-recovery arm runs ONLY at boot with a
-            // valid cache (never from a runtime toggle), so wake-renewal uses
-            // the global `OnceLock` set at boot — no lane injection needed.
+            // D2c (C4): the FAST crash-recovery arm `return run_shutdown_fast`s
+            // (below, ~main.rs:2074) BEFORE the inline spine's
+            // `set_global_token_manager` (~main.rs:4991) is ever reached — so on
+            // the fast arm the global `OnceLock` is UNSET and
+            // `wake_renewal_token_manager()` returns `None`. Wake-renewal therefore
+            // silently no-ops here: the fast arm runs ONLY at boot with a valid
+            // cached token (market-hours crash restart), so it relies on that cached
+            // token rather than proactive wake-renewal. Passing `None` for the
+            // lane-owned manager is correct (no runtime lane to inject). This is
+            // PRE-EXISTING fast-arm behaviour, made explicit here — NOT a D2c change.
             None,
         ) {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
@@ -2756,9 +2763,11 @@ fn create_websocket_pool(
     // D2c (closes C4): LANE-OWNED `TokenManager` for the WS sleep-wake renewal.
     // `Some(lane manager)` from `start_dhan_lane` (the canonical cold path used
     // by every runtime cold-start) so the wake renews the manager the live pool
-    // is actually using; `None` from the fast crash-recovery arm (boot-ON only,
-    // uses the global `OnceLock`). Closes the stop→re-start "renew the wrong
-    // token" race.
+    // is actually using; `None` from the fast crash-recovery arm — that arm
+    // `return run_shutdown_fast`s before the inline spine's
+    // `set_global_token_manager`, so the global `OnceLock` is UNSET there and
+    // wake-renewal no-ops (the fast arm relies on its cached token; no proactive
+    // wake-renewal). Closes the stop→re-start "renew the wrong token" race.
     lane_token_manager: Option<std::sync::Arc<tickvault_core::auth::TokenManager>>,
 ) -> Option<(
     tokio::sync::mpsc::Receiver<(u64, bytes::Bytes)>,
@@ -4992,6 +5001,15 @@ async fn start_dhan_lane(
         tracing::warn!("global TokenManager already installed — skipping");
     }
 
+    // D2c (C4): install THIS lane's TokenManager as the live health-gauge source,
+    // OVERWRITING any prior (now-dead) manager from an earlier cold-start. Unlike
+    // the global `OnceLock` above (set-once at first boot, immutable thereafter),
+    // this slot tracks the CURRENT lane manager — so after a runtime stop→re-start
+    // the self-test token-headroom + SLO token-freshness gauges read the NEW
+    // manager's remaining seconds, not the stale boot-time one. Cleared at every
+    // lane→Off transition (operator disable / watchdog-Halt / already-torn-down).
+    feed_runtime.set_live_token_manager(token_manager.clone());
+
     // Fetch credentials ONCE for all downstream consumers (WS pool, order update WS, trading pipeline).
     // Previously fetched 3 separate times — each SSM call is a network roundtrip to AWS.
     let ws_client_id = {
@@ -5902,6 +5920,9 @@ async fn start_dhan_lane(
                 let st_health = health_status.clone();
                 let st_calendar = std::sync::Arc::clone(&trading_calendar);
                 let st_qcfg = config.questdb.clone();
+                // D2c (C4): capture the shared feed state so the token-headroom
+                // sub-check reads the LIVE lane manager (preferred) over the global.
+                let st_feed_runtime = std::sync::Arc::clone(&feed_runtime);
                 tokio::spawn(async move {
                     use chrono::{FixedOffset, NaiveTime, TimeZone, Utc};
                     use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
@@ -5957,10 +5978,11 @@ async fn start_dhan_lane(
                         tickvault_storage::boot_probe::wait_for_questdb_ready(&st_qcfg, 3)
                             .await
                             .is_ok();
-                    let token_headroom_secs =
-                        tickvault_core::auth::token_manager::global_token_manager()
-                            .map(|tm| tm.seconds_until_expiry())
-                            .unwrap_or(0);
+                    // D2c (C4): prefer the LIVE lane-owned manager over the global
+                    // OnceLock — after a runtime stop→re-start the global points at
+                    // the dead boot-time manager, which would show a misleading
+                    // token-headroom on the exact path D2c targets.
+                    let token_headroom_secs = gauge_token_headroom_secs(&st_feed_runtime);
                     let worst_gap_secs =
                         tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
                             .map(|d| {
@@ -6088,6 +6110,10 @@ async fn start_dhan_lane(
                 let _slo_notifier = notifier.clone();
                 let slo_health = health_status.clone();
                 let slo_qcfg = config.questdb.clone();
+                // D2c (C4): capture the shared feed state so the token-freshness
+                // SLO dimension reads the LIVE lane manager (preferred) over the
+                // global OnceLock after a runtime stop→re-start.
+                let slo_feed_runtime = std::sync::Arc::clone(&feed_runtime);
                 // D2a: pre-extract the Copy config fields (see the readiness
                 // spawn above) so the `'static` SLO task does not capture the
                 // lane-lifetime `&config`. Behaviour-identical.
@@ -6301,10 +6327,10 @@ async fn start_dhan_lane(
                         };
 
                         // ---- Token_freshness -----------------------------
-                        let token_secs =
-                            tickvault_core::auth::token_manager::global_token_manager()
-                                .map(|tm| tm.seconds_until_expiry())
-                                .unwrap_or(0);
+                        // D2c (C4): prefer the LIVE lane-owned manager over the
+                        // global OnceLock so a runtime stop→re-start reports the new
+                        // manager's headroom, not the dead boot-time manager's.
+                        let token_secs = gauge_token_headroom_secs(&slo_feed_runtime);
                         let token_freshness = if token_secs > SLO_TOKEN_HEADROOM_THRESHOLD_SECS {
                             1.0
                         } else {
@@ -7410,6 +7436,32 @@ fn dhan_lane_retry_backoff_secs(attempt: u32) -> u64 {
     )
 }
 
+/// D2c (C4): token-headroom (seconds-until-expiry) for the PROCESS-level health
+/// gauges (market-open self-test token-headroom + SLO token-freshness).
+///
+/// PREFERS the live lane-owned `TokenManager` stored on `FeedRuntimeState` and
+/// falls back to the global `OnceLock` only when no lane is running (boot-OFF /
+/// Groww-only / pre-start). This is the fix for the misleading reading after a
+/// runtime Dhan-lane stop→re-start: the global `OnceLock` is set-once at first
+/// boot and forever points at the dead boot-time (manager-A); the live slot
+/// tracks the CURRENT lane manager (manager-B/C/…), so the gauges report the
+/// running lane's real remaining seconds. Returns `0` when neither is present —
+/// the same "no token" sentinel the gauges used before.
+///
+/// Off-hot-path: called on the once-per-trading-day self-test and the 10s SLO
+/// cadences, never per-tick. The `live_token_manager()` read takes a brief,
+/// uncontended `Mutex` and clones an `Arc` out (no `.await` held).
+fn gauge_token_headroom_secs(
+    feed_runtime: &std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
+) -> u64 {
+    if let Some(lane_tm) = feed_runtime.live_token_manager() {
+        return lane_tm.seconds_until_expiry();
+    }
+    tickvault_core::auth::token_manager::global_token_manager()
+        .map(|tm| tm.seconds_until_expiry())
+        .unwrap_or(0)
+}
+
 /// Stable static label for the lane state (no allocation on the metric path).
 const fn lane_state_label(state: tickvault_api::feed_state::LaneState) -> &'static str {
     use tickvault_api::feed_state::LaneState;
@@ -7866,6 +7918,9 @@ async fn park_running_dhan_lane(
                 record_dhan_lane_transition(LaneState::Stopping, LaneState::Off);
             }
             ctx.feed_runtime.set_dhan_lane_running(false);
+            // D2c (C4): lane is Off — drop the live token-manager so the health
+            // gauges fall back to the global instead of reading a dead manager.
+            ctx.feed_runtime.clear_live_token_manager();
             return;
         };
 
@@ -7900,6 +7955,9 @@ async fn park_running_dhan_lane(
             record_dhan_lane_transition(LaneState::Stopping, LaneState::Off);
         }
         ctx.feed_runtime.set_dhan_lane_running(false);
+        // D2c (C4): lane is Off — drop the live token-manager so the health gauges
+        // fall back to the global instead of reading this stopped lane's manager.
+        ctx.feed_runtime.clear_live_token_manager();
         info!("[dhan-lane] lane torn down (Stopping→Off) — ready to cold-start again on re-enable");
         ctx.notifier.notify(NotificationEvent::Custom {
             message: "⚪ <b>Dhan feed stopped</b>\nThe live price feed is now disconnected."
@@ -7966,6 +8024,10 @@ async fn handle_lane_watchdog_halt(
         record_dhan_lane_transition(LaneState::Stopping, LaneState::Off);
     }
     ctx.feed_runtime.set_dhan_lane_running(false);
+    // D2c (C4): lane is Off after the Halt teardown — drop the live token-manager
+    // so the health gauges fall back to the global until the supervisor re-cold-
+    // starts the lane (which installs a fresh manager via set_live_token_manager).
+    ctx.feed_runtime.clear_live_token_manager();
     info!(
         "[dhan-lane] watchdog-Halt teardown complete (→Off) — supervisor will re-cold-start \
          the lane on the next tick"
@@ -8833,6 +8895,82 @@ mod tests {
         assert!(
             region.contains("ws_wal_replay_live_feed: Vec::new()"),
             "the runtime cold-start must use EMPTY WAL-replay buffers (no fast-arm cache entry)"
+        );
+    }
+
+    #[test]
+    fn gauge_token_headroom_falls_back_to_global_when_no_live_lane() {
+        // D2c (C4) behavioural: with no live lane manager installed (boot-OFF /
+        // Groww-only / pre-start), `gauge_token_headroom_secs` falls back to the
+        // global OnceLock. In an isolated test binary the global is unset, so the
+        // helper returns the `0` "no token" sentinel — the same value the gauges
+        // used before this fix. This proves the fallback arm + the sentinel.
+        let feed_runtime =
+            std::sync::Arc::new(tickvault_api::feed_state::FeedRuntimeState::default());
+        assert!(
+            feed_runtime.live_token_manager().is_none(),
+            "fresh state has no live lane manager (fallback path)"
+        );
+        assert_eq!(
+            super::gauge_token_headroom_secs(&feed_runtime),
+            0,
+            "no live lane + no global → 0 (the pre-fix 'no token' sentinel)"
+        );
+    }
+
+    #[test]
+    fn slo_token_gauge_prefers_live_lane_manager() {
+        // D2c (C4) source-scan ratchet: BOTH PROCESS-level token gauges (the
+        // market-open self-test token-headroom AND the SLO token-freshness) MUST
+        // read via `gauge_token_headroom_secs` (which prefers the LIVE lane-owned
+        // manager) and MUST NOT read the global `OnceLock` directly — otherwise a
+        // runtime stop→re-start would show the dead boot-time manager's headroom on
+        // the exact path D2c targets. The ONLY allowed `global_token_manager()` call
+        // is inside the `gauge_token_headroom_secs` fallback arm.
+        let src = include_str!("main.rs");
+
+        // Both gauges call the shared helper.
+        assert!(
+            src.contains("let token_headroom_secs = gauge_token_headroom_secs(&st_feed_runtime);"),
+            "the self-test token-headroom gauge must read via gauge_token_headroom_secs (live lane preferred)"
+        );
+        assert!(
+            src.contains("let token_secs = gauge_token_headroom_secs(&slo_feed_runtime);"),
+            "the SLO token-freshness gauge must read via gauge_token_headroom_secs (live lane preferred)"
+        );
+
+        // The helper prefers the live lane manager before any global fallback.
+        let helper_start = src
+            .find("fn gauge_token_headroom_secs(")
+            .expect("gauge_token_headroom_secs must exist");
+        let helper_end = src[helper_start..]
+            .find("\n}\n")
+            .map(|rel| helper_start + rel)
+            .expect("gauge_token_headroom_secs must have a body");
+        let helper = &src[helper_start..helper_end];
+        let live_pos = helper
+            .find("feed_runtime.live_token_manager()")
+            .expect("helper must read the live lane manager");
+        let global_pos = helper
+            .find("global_token_manager()")
+            .expect("helper must have the global fallback");
+        assert!(
+            live_pos < global_pos,
+            "the helper must PREFER the live lane manager (read it before the global fallback)"
+        );
+
+        // The global OnceLock must be read ONLY inside the helper's fallback —
+        // never again in the closure bodies (which would re-introduce the bug).
+        // Scope the count to the PRODUCTION region (before `#[cfg(test)]`) so this
+        // test's own string literals do not inflate it.
+        let prod_region = &src[..src
+            .find("#[cfg(test)]")
+            .expect("main.rs must have a #[cfg(test)] module")];
+        let direct_global_reads = prod_region.matches("global_token_manager()").count();
+        assert_eq!(
+            direct_global_reads, 1,
+            "global_token_manager() must be read exactly once (the helper fallback); \
+             the two gauge closures must NOT read it directly"
         );
     }
 }

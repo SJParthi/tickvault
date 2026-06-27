@@ -47,7 +47,7 @@ The 2-WS lock + the `dhan_disable_allowed` gate are untouched (lifecycle only).
 
 | # | Case | Behaviour |
 |---|---|---|
-| 1 | boot-ON (fast or slow arm), never toggled | slow arm injects the lane manager; fast arm injects `None` → global fallback. Both renew the SAME real manager. No behaviour change. |
+| 1 | boot-ON (fast or slow arm), never toggled | **slow arm:** injects the lane manager → wake-renewal renews that live manager. **fast crash-recovery arm:** injects `None`, AND it `return run_shutdown_fast`s (`~main.rs:2074`) BEFORE the inline spine's `set_global_token_manager` (`~main.rs:4991`), so the global `OnceLock` is UNSET → `wake_renewal_token_manager()` returns `None` → wake-renewal silently NO-OPS. The fast arm has NO proactive wake-renewal; it relies on its cached boot token (benign, pre-existing — NOT a D2c regression). Corrected 2026-06-27: the earlier "fast arm → global fallback, both renew the same real manager" wording was WRONG (the global is never set on the fast arm). |
 | 2 | runtime cold-start after a prior STOP (the C4 case) | the new lane builds manager-B; the pool's connections hold manager-B via injection → wake-renewal renews manager-B, never the dead global manager-A. |
 | 3 | injected manager present but token still fresh | `force_renewal_if_stale` short-circuits `Ok(false)` exactly as today — no renewal, no Telegram. |
 | 4 | no manager available (test binaries / no global set, no injection) | helper returns `None` → wake-renewal block skipped (identical to today's `if let Some(tm) = global…`). |
@@ -113,7 +113,32 @@ AUTH-GAP-03 signals.
 100% inside the tested envelope: a runtime Dhan-lane stop→re-start now renews the
 manager the live pool actually uses (lane-owned injection), with ratcheted
 regression coverage (`wake_renewal_token_manager_prefers_injected_over_global`).
-The boot-ON fast crash-recovery arm is byte-identical (global fallback). NOT
-claimed: the global `OnceLock` is still read by the process-level SLO/self-test
-gauges — that is an observability approximation, not the renewal path, and is
-out of C4 scope.
+The boot-ON fast crash-recovery arm is byte-identical (global fallback — and,
+honestly, that "fallback" is a NO-OP on the fast arm: the global is never set
+there, so the fast arm has no proactive wake-renewal and relies on its cached
+boot token; pre-existing, benign).
+
+## D2c PR follow-up (2026-06-27) — two review findings closed in this PR
+
+**MEDIUM (gauge fix — FULL fix taken, not deferred):** the two PROCESS-level
+health gauges (market-open self-test `token_headroom_secs`, SLO `token_freshness`)
+previously read the global `OnceLock` directly — after a runtime stop→re-start
+they showed the dead boot-time manager's remaining seconds (a misleading reading
+on the exact path D2c targets). Now both read via a single helper
+`gauge_token_headroom_secs(feed_runtime)` that PREFERS the live lane-owned manager
+(a new `Mutex<Option<Arc<TokenManager>>>` slot on `FeedRuntimeState`, SET on
+`start_dhan_lane` success, CLEARED at every lane→Off transition) and falls back to
+the global only when no lane runs (boot-OFF / Groww-only). The set/clear lifecycle
+is co-located with the existing `set_dhan_lane_running` calls (1 set + 3 clears),
+so it is mechanical, not the "non-trivial/risky" case — the full fix was taken.
+Off-hot-path (self-test once/day, SLO every 10s); zero per-tick impact. Ratchets:
+`slo_token_gauge_prefers_live_lane_manager` (source-scan — both gauges go through
+the helper; the global is read exactly once, in the helper's fallback) +
+`gauge_token_headroom_falls_back_to_global_when_no_live_lane` (behavioural) +
+3 `feed_state` slot tests.
+
+**LOW (comment fix):** the fast-arm comments (`~main.rs:1413`, `~main.rs:2766`) and
+this plan's Edge Cases #1 previously claimed the fast arm "uses the global
+`OnceLock` set at boot". Corrected: the fast arm returns BEFORE
+`set_global_token_manager`, so the global is UNSET there and wake-renewal no-ops
+(cached token; benign, pre-existing — NOT a D2c regression).
