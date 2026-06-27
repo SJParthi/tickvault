@@ -50,6 +50,9 @@ pub mod groww_bridge;
 /// Groww Python-sidecar auto-launcher + supervisor (operator lock §32 +
 /// "no manual commands" 2026-06-19). Default-OFF.
 pub mod groww_sidecar_supervisor;
+/// Shared per-seal routing for BOTH feeds (Dhan + Groww) — the single
+/// `route_seal` body the two `on_seal` call sites invoke (C2, behavior-preserving).
+pub mod seal_routing;
 // PR #4 (2026-05-19): depth-20 / depth-200 modules DELETED (operator-locked
 // per websocket-connection-scope-lock.md — 4-IDX_I uses 1 main-feed conn
 // + 1 order-update conn only).

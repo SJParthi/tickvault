@@ -51,7 +51,7 @@ use tickvault_common::tick_types::ParsedTick;
 use tickvault_common::types::ExchangeSegment;
 use tickvault_storage::groww_persistence::{GrowwLiveTickRow, GrowwLiveTickWriter};
 use tickvault_storage::seal_writer_runner::global_seal_sender;
-use tickvault_trading::candles::{BufferedSeal, FeedStrategy, MultiTfAggregator, TfIndex};
+use tickvault_trading::candles::{FeedStrategy, MultiTfAggregator};
 
 /// Capacity hint for the Groww feed's own [`MultiTfAggregator`] instance —
 /// matches the NTM-union universe headroom (operator §31). The container grows
@@ -519,18 +519,26 @@ pub async fn run_groww_bridge(
                     let Some(sender) = global_seal_sender() else {
                         return;
                     };
-                    let seal = BufferedSeal::new(pt.security_id, seg_code, tf, state, Feed::Groww);
-                    if sender.try_send(seal).is_err() {
-                        // Mirror the Dhan path: the seal mpsc is full (writer
-                        // behind). Counter only — the ring→spill→DLQ chain
-                        // downstream is the durable absorber; never panic.
-                        metrics::counter!("tv_seal_mpsc_dropped_total", "feed" => "groww")
-                            .increment(1);
-                    } else if tf == TfIndex::M1 {
-                        // Live-feed health: count one Groww candle per sealed
-                        // 1-minute bar (the cross-verified slice).
-                        feed_health.record_candle(Feed::Groww);
-                    }
+                    // C2 (behavior-preserving): the per-seal routing body now
+                    // lives in the shared `route_seal`. Groww policy: route EVERY
+                    // TF (no D1-drop), NO pct-stamp, the `feed=groww`-labeled drop
+                    // counter, and `record_candle(Groww)` on the M1 seal. The
+                    // emitted output is byte-identical to the pre-C2 inline
+                    // closure.
+                    crate::seal_routing::route_seal(
+                        crate::seal_routing::SealRouteParams {
+                            feed: Feed::Groww,
+                            drop_d1: false,
+                            prev_day_cache: None,
+                            heartbeat: None,
+                            feed_health_on_m1: Some(feed_health.as_ref()),
+                        },
+                        pt.security_id,
+                        seg_code,
+                        tf,
+                        state,
+                        sender,
+                    );
                 },
             );
             // A lazily-missing instrument cannot happen here (we pre_populate on

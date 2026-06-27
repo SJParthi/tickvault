@@ -3588,10 +3588,10 @@ fn spawn_engine_b_aggregator(
     trading_calendar: std::sync::Arc<TradingCalendar>,
 ) {
     use tickvault_storage::seal_writer_runner::global_seal_sender;
-    use tickvault_trading::candles::{
-        AggregatorHeartbeatCounters, BufferedSeal, MultiTfAggregator, TfIndex,
-        stamp_seal_pct_fields,
-    };
+    // C2: `BufferedSeal` / `TfIndex` / `stamp_seal_pct_fields` are no longer used
+    // directly here — the per-seal routing body moved into
+    // `tickvault_app::seal_routing::route_seal` (behavior-preserving).
+    use tickvault_trading::candles::{AggregatorHeartbeatCounters, MultiTfAggregator};
 
     // 11K-instrument capacity (matches MAX_TOTAL_SUBSCRIPTIONS headroom
     // per `aws-budget.md`). HashMap grows lazily so this is a hint.
@@ -3628,51 +3628,30 @@ fn spawn_engine_b_aggregator(
                         // pre-FeedStrategy Dhan behaviour.
                         tickvault_trading::candles::FeedStrategy::DHAN,
                         None,
-                        |tf, mut state| {
-                            // 1d historical-only (operator directive 2026-06-02):
-                            // the 1d timeframe is NEVER tick-calculated. It is
-                            // pulled once each morning from Dhan historical into
-                            // `prev_day_ohlcv`. Drop any D1 seal the aggregator
-                            // emits so it never reaches `candles_1d`. The
-                            // aggregator still seals all 21 TFs internally
-                            // (fixed 21-slot arrays + `42 = 2×21` unit test
-                            // intact); only this write boundary skips D1.
-                            if tf == TfIndex::D1 {
-                                return;
-                            }
-                            let mut refs = prev_day_cache_for_agg
-                                .lookup(tick.security_id, tick.exchange_segment_code)
-                                .unwrap_or_default();
-                            // Operator decision 2026-05-28: take the prev-day
-                            // close straight from the live ticks `close`
-                            // column (captured into the candle state), not the
-                            // QuestDB PrevDayCache (which is empty in the
-                            // Engine-B runtime). Drives close_pct_from_prev_day.
-                            refs.prev_day_close = state.prev_day_close;
-                            stamp_seal_pct_fields(&mut state, refs);
-                            // G3 real-time proof: capture the % BEFORE `state`
-                            // is moved into the seal. A non-zero value proves
-                            // the percentage-change column is populating live.
-                            let close_pct_nonzero = state.close_pct_from_prev_day != 0.0;
-                            let seal = BufferedSeal::new(
+                        |tf, state| {
+                            // C2 (behavior-preserving): the per-seal routing body
+                            // now lives in the shared `route_seal`. Dhan policy:
+                            // drop the D1 seal (1d is historical-only per
+                            // `live-feed-purity.md` rule 10), stamp the prev-day
+                            // pct fields from `prev_day_cache_for_agg`, and drive
+                            // the heartbeat + `tv_aggregator_*` counters. The
+                            // emitted output (counters, drop label, BufferedSeal
+                            // fields, D1-drop, pct-stamp) is byte-identical to the
+                            // pre-C2 inline closure.
+                            tickvault_app::seal_routing::route_seal(
+                                tickvault_app::seal_routing::SealRouteParams {
+                                    feed: tickvault_common::feed::Feed::Dhan,
+                                    drop_d1: true,
+                                    prev_day_cache: Some(prev_day_cache_for_agg.as_ref()),
+                                    heartbeat: Some(&heartbeat_writer),
+                                    feed_health_on_m1: None,
+                                },
                                 tick.security_id,
                                 tick.exchange_segment_code,
                                 tf,
                                 state,
-                                tickvault_common::feed::Feed::Dhan,
+                                sender,
                             );
-                            if sender.try_send(seal).is_err() {
-                                metrics::counter!("tv_seal_mpsc_dropped_total").increment(1);
-                                heartbeat_writer.record_drop();
-                            } else {
-                                metrics::counter!("tv_aggregator_seals_emitted_total").increment(1);
-                                heartbeat_writer.record_emit();
-                                if close_pct_nonzero {
-                                    metrics::counter!("tv_aggregator_close_pct_nonzero_total")
-                                        .increment(1);
-                                    heartbeat_writer.record_close_pct_nonzero();
-                                }
-                            }
                         },
                     );
                     if stats.late_count > 0 {
@@ -3794,39 +3773,37 @@ fn spawn_engine_b_aggregator(
 
             let mut sealed: u64 = 0;
             let mut dropped: u64 = 0;
-            agg_for_boundary.force_seal_all(|security_id, segment_code, tf, mut state| {
-                // 1d historical-only (operator directive 2026-06-02): D1 is
-                // never tick-sealed — drop it at this write boundary too. See
-                // the per-tick seal site above for the full rationale.
-                if tf == TfIndex::D1 {
-                    return;
-                }
-                let mut refs = prev_day_cache_for_boundary
-                    .lookup(security_id, segment_code)
-                    .unwrap_or_default();
-                // Live prev-day close from the candle state (see per-tick
-                // seal site above) — operator decision 2026-05-28.
-                refs.prev_day_close = state.prev_day_close;
-                stamp_seal_pct_fields(&mut state, refs);
-                // G3 real-time proof (capture before move) — same contract as
-                // the per-tick seal site above.
-                let close_pct_nonzero = state.close_pct_from_prev_day != 0.0;
-                let seal = BufferedSeal::new(
+            agg_for_boundary.force_seal_all(|security_id, segment_code, tf, state| {
+                // C2 (behavior-preserving): the per-seal routing body now lives
+                // in the shared `route_seal`. This IST-midnight Dhan path uses
+                // the SAME Dhan policy as the per-tick site (drop D1, pct-stamp,
+                // fire the `tv_aggregator_*` counters) but carries NO heartbeat —
+                // it keeps its own local `sealed`/`dropped` running counts from
+                // the returned `SealOutcome`. Byte-identical to the pre-C2 inline
+                // closure.
+                match tickvault_app::seal_routing::route_seal(
+                    tickvault_app::seal_routing::SealRouteParams {
+                        feed: tickvault_common::feed::Feed::Dhan,
+                        drop_d1: true,
+                        prev_day_cache: Some(prev_day_cache_for_boundary.as_ref()),
+                        heartbeat: None,
+                        feed_health_on_m1: None,
+                    },
                     security_id,
                     segment_code,
                     tf,
                     state,
-                    tickvault_common::feed::Feed::Dhan,
-                );
-                if sender.try_send(seal).is_err() {
-                    metrics::counter!("tv_seal_mpsc_dropped_total").increment(1);
-                    dropped = dropped.saturating_add(1);
-                } else {
-                    metrics::counter!("tv_aggregator_seals_emitted_total").increment(1);
-                    sealed = sealed.saturating_add(1);
-                    if close_pct_nonzero {
-                        metrics::counter!("tv_aggregator_close_pct_nonzero_total").increment(1);
+                    sender,
+                ) {
+                    tickvault_app::seal_routing::SealOutcome::Sent => {
+                        sealed = sealed.saturating_add(1);
                     }
+                    tickvault_app::seal_routing::SealOutcome::DroppedFull => {
+                        dropped = dropped.saturating_add(1);
+                    }
+                    // D1 is dropped at the write boundary — not counted as a
+                    // mpsc-full drop (matches the pre-C2 early-`return`).
+                    tickvault_app::seal_routing::SealOutcome::DroppedD1 => {}
                 }
             });
             tracing::info!(
