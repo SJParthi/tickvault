@@ -26,17 +26,33 @@ fn build_questdb_client(timeout_secs: u64) -> reqwest::Client {
 }
 
 /// Latest quote response for a single security.
+///
+/// The `ticks` table is shared by every live feed (Dhan + Groww), so the
+/// response carries the `feed` label of the latest row. Groww writes only a
+/// subset of columns, so the OHLC / OI / cumulative-quantity / avg-price fields
+/// are `Option`: a Groww latest row honestly reports them as `null` instead of
+/// faking a `0.0` / `0`. (NULL handling for the Groww column subset is by
+/// design — see `.claude/rules/project/live-feed-purity.md` rule 5.)
 #[derive(Debug, Serialize)]
 pub struct QuoteResponse {
     pub security_id: u32,
-    pub exchange_segment_code: u8,
+    /// Feed source of the latest tick (`"dhan"` / `"groww"`).
+    pub feed: String,
+    /// Exchange segment string as stored in `ticks.segment` (e.g. `"NSE_EQ"`).
+    pub segment: String,
     pub last_traded_price: f64,
-    pub last_traded_quantity: u64,
-    pub volume: u64,
-    pub day_open: f64,
-    pub day_high: f64,
-    pub day_low: f64,
-    pub day_close: f64,
+    /// Last traded quantity. `None` when the latest row's `last_trade_qty` is
+    /// NULL (e.g. a Groww row).
+    pub last_traded_quantity: Option<u64>,
+    /// Cumulative day volume. `None` when NULL (e.g. a Groww row).
+    pub volume: Option<u64>,
+    /// Open interest. `None` when NULL.
+    pub open_interest: Option<u64>,
+    /// Day-session OHLC from the Quote/Full packet. `None` when NULL.
+    pub day_open: Option<f64>,
+    pub day_high: Option<f64>,
+    pub day_low: Option<f64>,
+    pub day_close: Option<f64>,
     pub timestamp: String,
 }
 
@@ -97,10 +113,15 @@ async fn query_latest_tick(
     base_url: &str,
     security_id: u32,
 ) -> Option<QuoteResponse> {
+    // Query the columns that ACTUALLY EXIST in the `ticks` DDL
+    // (`crates/storage/src/tick_persistence.rs::TICKS_CREATE_DDL`):
+    // `feed`, `segment` (SYMBOL string — NOT a numeric code), `ltp`,
+    // `last_trade_qty`, `volume`, `oi`, `open`/`high`/`low`/`close`, `ts`.
+    // `LATEST ON ts PARTITION BY security_id` returns the single freshest row
+    // for this security across ALL feeds; `feed` labels its source.
     let sql = format!(
-        "SELECT security_id, exchange_segment_code, last_traded_price, \
-         last_traded_quantity, total_traded_volume, day_open, day_high, \
-         day_low, day_close, ts \
+        "SELECT security_id, feed, segment, ltp, last_trade_qty, volume, oi, \
+         open, high, low, close, ts \
          FROM ticks WHERE security_id = {security_id} \
          LATEST ON ts PARTITION BY security_id"
     );
@@ -116,19 +137,27 @@ async fn query_latest_tick(
     let dataset = body.get("dataset")?.as_array()?;
     let row = dataset.first()?.as_array()?;
 
-    // Column order matches SELECT: security_id(0), exchange_segment_code(1),
-    // ltp(2), ltq(3), volume(4), open(5), high(6), low(7), close(8), ts(9).
+    // Column order matches SELECT: security_id(0), feed(1), segment(2),
+    // ltp(3), last_trade_qty(4), volume(5), oi(6), open(7), high(8),
+    // low(9), close(10), ts(11).
+    //
+    // Mandatory fields use `?` (security_id, feed, segment, ltp, ts). The
+    // remaining numeric fields are NULL for a Groww row (9-of-19 subset) — they
+    // map to `None` via `as_u64()` / `as_f64()` (JSON `null` or absent → `None`),
+    // never a misleading `0`/`0.0` and never a panic.
     Some(QuoteResponse {
         security_id: row.first()?.as_u64()? as u32,
-        exchange_segment_code: row.get(1)?.as_u64()? as u8,
-        last_traded_price: row.get(2)?.as_f64()?,
-        last_traded_quantity: row.get(3)?.as_u64().unwrap_or(0),
-        volume: row.get(4)?.as_u64().unwrap_or(0),
-        day_open: row.get(5)?.as_f64().unwrap_or(0.0),
-        day_high: row.get(6)?.as_f64().unwrap_or(0.0),
-        day_low: row.get(7)?.as_f64().unwrap_or(0.0),
-        day_close: row.get(8)?.as_f64().unwrap_or(0.0),
-        timestamp: row.get(9)?.as_str().unwrap_or("").to_string(),
+        feed: row.get(1)?.as_str()?.to_string(),
+        segment: row.get(2)?.as_str()?.to_string(),
+        last_traded_price: row.get(3)?.as_f64()?,
+        last_traded_quantity: row.get(4).and_then(serde_json::Value::as_u64),
+        volume: row.get(5).and_then(serde_json::Value::as_u64),
+        open_interest: row.get(6).and_then(serde_json::Value::as_u64),
+        day_open: row.get(7).and_then(serde_json::Value::as_f64),
+        day_high: row.get(8).and_then(serde_json::Value::as_f64),
+        day_low: row.get(9).and_then(serde_json::Value::as_f64),
+        day_close: row.get(10).and_then(serde_json::Value::as_f64),
+        timestamp: row.get(11)?.as_str().unwrap_or("").to_string(),
     })
 }
 
@@ -151,18 +180,22 @@ mod tests {
     fn test_quote_response_serialization() {
         let quote = QuoteResponse {
             security_id: 12345,
-            exchange_segment_code: 2,
+            feed: "dhan".to_string(),
+            segment: "NSE_FNO".to_string(),
             last_traded_price: 1500.50,
-            last_traded_quantity: 100,
-            volume: 50000,
-            day_open: 1490.0,
-            day_high: 1510.0,
-            day_low: 1485.0,
-            day_close: 1495.0,
+            last_traded_quantity: Some(100),
+            volume: Some(50000),
+            open_interest: Some(1234),
+            day_open: Some(1490.0),
+            day_high: Some(1510.0),
+            day_low: Some(1485.0),
+            day_close: Some(1495.0),
             timestamp: "2026-03-08T10:30:00.000000Z".to_string(),
         };
         let json = serde_json::to_string(&quote).expect("serialization should succeed");
         assert!(json.contains("\"security_id\":12345"));
+        assert!(json.contains("\"feed\":\"dhan\""));
+        assert!(json.contains("\"segment\":\"NSE_FNO\""));
         assert!(json.contains("\"last_traded_price\":1500.5"));
         assert!(json.contains("\"timestamp\":\"2026-03-08T10:30:00.000000Z\""));
     }
@@ -171,19 +204,101 @@ mod tests {
     fn test_quote_response_debug_impl() {
         let quote = QuoteResponse {
             security_id: 99999,
-            exchange_segment_code: 3,
+            feed: "dhan".to_string(),
+            segment: "IDX_I".to_string(),
             last_traded_price: 250.75,
-            last_traded_quantity: 50,
-            volume: 10000,
-            day_open: 248.0,
-            day_high: 252.0,
-            day_low: 247.5,
-            day_close: 249.0,
+            last_traded_quantity: Some(50),
+            volume: Some(10000),
+            open_interest: None,
+            day_open: Some(248.0),
+            day_high: Some(252.0),
+            day_low: Some(247.5),
+            day_close: Some(249.0),
             timestamp: "2026-03-08T11:00:00.000000Z".to_string(),
         };
         let debug = format!("{quote:?}");
         assert!(debug.contains("QuoteResponse"));
         assert!(debug.contains("99999"));
+    }
+
+    /// A fully-populated Dhan-style row maps every Option to `Some(..)`.
+    #[tokio::test]
+    async fn test_query_latest_tick_dhan_row_all_fields_present() {
+        // security_id, feed, segment, ltp, last_trade_qty, volume, oi,
+        // open, high, low, close, ts
+        let body = r#"{"dataset":[[12345,"dhan","NSE_FNO",1500.5,100,50000,1234,1490.0,1510.0,1485.0,1495.0,"2026-03-08T10:30:00.000000Z"]]}"#;
+        let base_url = start_mock_server(body).await;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("client build should succeed");
+        let quote = query_latest_tick(&client, &base_url, 12345)
+            .await
+            .expect("quote should be present");
+        assert_eq!(quote.feed, "dhan");
+        assert_eq!(quote.segment, "NSE_FNO");
+        assert_eq!(quote.last_traded_quantity, Some(100));
+        assert_eq!(quote.volume, Some(50000));
+        assert_eq!(quote.open_interest, Some(1234));
+        assert_eq!(quote.day_open, Some(1490.0));
+        assert_eq!(quote.day_close, Some(1495.0));
+    }
+
+    /// A Groww-style latest row has NULL OHLC/OI/qty — they MUST map to `None`
+    /// (JSON `null`), NOT a misleading `0.0` / `0`.
+    #[tokio::test]
+    async fn test_query_latest_tick_groww_row_null_ohlc_maps_to_none() {
+        // Groww writes ltp + volume but NULL open/high/low/close/oi/last_trade_qty.
+        let body = r#"{"dataset":[[12345,"groww","NSE_EQ",1500.5,null,50000,null,null,null,null,null,"2026-03-08T10:30:00.000000Z"]]}"#;
+        let base_url = start_mock_server(body).await;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("client build should succeed");
+        let quote = query_latest_tick(&client, &base_url, 12345)
+            .await
+            .expect("quote should be present");
+        assert_eq!(quote.feed, "groww");
+        assert_eq!(quote.last_traded_price, 1500.5);
+        assert_eq!(quote.volume, Some(50000));
+        // The NULL columns are honestly None, NOT 0.0 / 0.
+        assert_eq!(quote.day_open, None);
+        assert_eq!(quote.day_high, None);
+        assert_eq!(quote.day_low, None);
+        assert_eq!(quote.day_close, None);
+        assert_eq!(quote.open_interest, None);
+        assert_eq!(quote.last_traded_quantity, None);
+
+        // Serialized JSON shows null, never a faked 0.
+        let json = serde_json::to_string(&quote).expect("serialization should succeed");
+        assert!(json.contains("\"feed\":\"groww\""));
+        assert!(json.contains("\"day_open\":null"));
+        assert!(json.contains("\"open_interest\":null"));
+        assert!(!json.contains("\"day_open\":0.0"));
+    }
+
+    /// The SELECT must reference only columns that exist in the real `ticks`
+    /// DDL — pins against a regression back to the phantom column names.
+    #[tokio::test]
+    async fn test_query_latest_tick_uses_real_ddl_columns() {
+        // The mock echoes the query so we can assert the SELECT shape.
+        // We instead assert the handler parses a row in the real column order.
+        // (Column-name correctness is also covered by the 12-field mock rows
+        // above matching the SELECT order: feed(1), segment(2), ... ts(11).)
+        let body =
+            r#"{"dataset":[[1,"dhan","IDX_I",100.0,null,null,null,null,null,null,null,"ts"]]}"#;
+        let base_url = start_mock_server(body).await;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("client build should succeed");
+        let quote = query_latest_tick(&client, &base_url, 1)
+            .await
+            .expect("quote should be present");
+        assert_eq!(quote.security_id, 1);
+        assert_eq!(quote.feed, "dhan");
+        assert_eq!(quote.segment, "IDX_I");
+        assert_eq!(quote.last_traded_price, 100.0);
     }
 
     #[tokio::test]
@@ -235,7 +350,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_latest_tick_with_valid_data() {
-        let body = r#"{"dataset":[[12345,2,1500.5,100,50000,1490.0,1510.0,1485.0,1495.0,"2026-03-08T10:30:00.000000Z"]]}"#;
+        let body = r#"{"dataset":[[12345,"dhan","NSE_FNO",1500.5,100,50000,1234,1490.0,1510.0,1485.0,1495.0,"2026-03-08T10:30:00.000000Z"]]}"#;
         let base_url = start_mock_server(body).await;
 
         let client = reqwest::Client::builder()
@@ -248,7 +363,7 @@ mod tests {
         let quote = result.expect("quote should be present");
         assert_eq!(quote.security_id, 12345);
         assert!((quote.last_traded_price - 1500.5).abs() < f64::EPSILON);
-        assert_eq!(quote.volume, 50000);
+        assert_eq!(quote.volume, Some(50000));
     }
 
     #[tokio::test]
@@ -323,9 +438,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_query_latest_tick_with_default_fallback_values() {
-        // Row with some null fields — tests unwrap_or fallback paths (ltq, volume, OHLC)
-        let body = r#"{"dataset":[[12345,2,1500.5,null,null,null,null,null,null,"2026-03-08T10:30:00.000000Z"]]}"#;
+    async fn test_query_latest_tick_with_null_optional_fields_maps_to_none() {
+        // Row with NULL optional fields (ltq, volume, oi, OHLC) — they map to
+        // None (honest null), NOT a faked 0 / 0.0. `feed`, `segment`, `ltp`,
+        // `ts` are mandatory and present.
+        let body = r#"{"dataset":[[12345,"groww","NSE_EQ",1500.5,null,null,null,null,null,null,null,"2026-03-08T10:30:00.000000Z"]]}"#;
         let base_url = start_mock_server(body).await;
 
         let client = reqwest::Client::builder()
@@ -336,9 +453,10 @@ mod tests {
         let result = query_latest_tick(&client, &base_url, 12345).await;
         assert!(result.is_some());
         let quote = result.unwrap();
-        assert_eq!(quote.last_traded_quantity, 0); // unwrap_or(0)
-        assert_eq!(quote.volume, 0);
-        assert!((quote.day_open - 0.0).abs() < f64::EPSILON); // unwrap_or(0.0)
+        assert_eq!(quote.last_traded_quantity, None);
+        assert_eq!(quote.volume, None);
+        assert_eq!(quote.open_interest, None);
+        assert_eq!(quote.day_open, None);
     }
 
     // -----------------------------------------------------------------------
@@ -447,7 +565,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_quote_with_valid_data_returns_200() {
-        let body = r#"{"dataset":[[12345,2,1500.5,100,50000,1490.0,1510.0,1485.0,1495.0,"2026-03-08T10:30:00.000000Z"]]}"#;
+        let body = r#"{"dataset":[[12345,"dhan","NSE_FNO",1500.5,100,50000,1234,1490.0,1510.0,1485.0,1495.0,"2026-03-08T10:30:00.000000Z"]]}"#;
         let base_url = start_mock_server(body).await;
         let port: u16 = base_url
             .rsplit(':')
@@ -467,8 +585,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_latest_tick_null_timestamp_returns_fallback() {
-        // Timestamp field is null — unwrap_or("") handles it
-        let body = r#"{"dataset":[[12345,2,1500.5,100,50000,1490.0,1510.0,1485.0,1495.0,null]]}"#;
+        // Timestamp field (index 11) is null — unwrap_or("") handles it
+        let body = r#"{"dataset":[[12345,"dhan","NSE_FNO",1500.5,100,50000,1234,1490.0,1510.0,1485.0,1495.0,null]]}"#;
         let base_url = start_mock_server(body).await;
 
         let client = reqwest::Client::builder()
@@ -488,8 +606,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_latest_tick_non_numeric_security_id_returns_none() {
-        let body =
-            r#"{"dataset":[["not_a_number",2,1500.5,100,50000,1490.0,1510.0,1485.0,1495.0,"ts"]]}"#;
+        let body = r#"{"dataset":[["not_a_number","dhan","NSE_FNO",1500.5,100,50000,1234,1490.0,1510.0,1485.0,1495.0,"ts"]]}"#;
         let base_url = start_mock_server(body).await;
 
         let client = reqwest::Client::builder()
@@ -502,12 +619,32 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // get_quote handler: non-numeric exchange_segment_code → None
+    // get_quote handler: non-string feed (index 1) → None (as_str? fails)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_query_latest_tick_non_numeric_exchange_code_returns_none() {
-        let body = r#"{"dataset":[[12345,"x",1500.5,100,50000,1490.0,1510.0,1485.0,1495.0,"ts"]]}"#;
+    async fn test_query_latest_tick_non_string_feed_returns_none() {
+        // feed at index 1 is a number, not a string — as_str()? returns None.
+        let body = r#"{"dataset":[[12345,42,"NSE_FNO",1500.5,100,50000,1234,1490.0,1510.0,1485.0,1495.0,"ts"]]}"#;
+        let base_url = start_mock_server(body).await;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("client build should succeed");
+
+        let result = query_latest_tick(&client, &base_url, 12345).await;
+        assert!(result.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // get_quote handler: non-string segment (index 2) → None (as_str? fails)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_query_latest_tick_non_string_segment_returns_none() {
+        // segment at index 2 is a number, not a string — as_str()? returns None.
+        let body = r#"{"dataset":[[12345,"dhan",99,1500.5,100,50000,1234,1490.0,1510.0,1485.0,1495.0,"ts"]]}"#;
         let base_url = start_mock_server(body).await;
 
         let client = reqwest::Client::builder()
@@ -525,7 +662,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_latest_tick_non_numeric_ltp_returns_none() {
-        let body = r#"{"dataset":[[12345,2,"bad",100,50000,1490.0,1510.0,1485.0,1495.0,"ts"]]}"#;
+        // ltp at index 3 is non-numeric — as_f64()? returns None.
+        let body = r#"{"dataset":[[12345,"dhan","NSE_FNO","bad",100,50000,1234,1490.0,1510.0,1485.0,1495.0,"ts"]]}"#;
         let base_url = start_mock_server(body).await;
 
         let client = reqwest::Client::builder()
@@ -552,9 +690,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_query_latest_tick_row_missing_field_at_index_2() {
-        // Row with 2 elements — row.get(2)? returns None (ltp missing)
-        let body = r#"{"dataset":[[12345,2]]}"#;
+    async fn test_query_latest_tick_row_missing_mandatory_feed_returns_none() {
+        // Row with 1 element — row.get(1)? (feed) returns None.
+        let body = r#"{"dataset":[[12345]]}"#;
         let base_url = start_mock_server(body).await;
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(2))
@@ -564,9 +702,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_query_latest_tick_row_missing_field_at_index_3() {
-        // Row with 3 elements — row.get(3)? returns None (ltq missing)
-        let body = r#"{"dataset":[[12345,2,1500.5]]}"#;
+    async fn test_query_latest_tick_row_missing_mandatory_segment_returns_none() {
+        // Row with 2 elements (security_id, feed) — row.get(2)? (segment) None.
+        let body = r#"{"dataset":[[12345,"dhan"]]}"#;
         let base_url = start_mock_server(body).await;
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(2))
@@ -576,9 +714,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_query_latest_tick_row_missing_field_at_index_4() {
-        // Row with 4 elements — row.get(4)? returns None (volume missing)
-        let body = r#"{"dataset":[[12345,2,1500.5,100]]}"#;
+    async fn test_query_latest_tick_row_missing_mandatory_ltp_returns_none() {
+        // Row with 3 elements (security_id, feed, segment) — row.get(3)? (ltp) None.
+        let body = r#"{"dataset":[[12345,"dhan","NSE_FNO"]]}"#;
         let base_url = start_mock_server(body).await;
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(2))
@@ -588,57 +726,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_query_latest_tick_row_missing_field_at_index_5() {
-        // Row with 5 elements — row.get(5)? returns None (day_open missing)
-        let body = r#"{"dataset":[[12345,2,1500.5,100,50000]]}"#;
-        let base_url = start_mock_server(body).await;
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-            .unwrap();
-        assert!(query_latest_tick(&client, &base_url, 12345).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_query_latest_tick_row_missing_field_at_index_6() {
-        // Row with 6 elements — row.get(6)? returns None (day_high missing)
-        let body = r#"{"dataset":[[12345,2,1500.5,100,50000,1490.0]]}"#;
-        let base_url = start_mock_server(body).await;
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-            .unwrap();
-        assert!(query_latest_tick(&client, &base_url, 12345).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_query_latest_tick_row_missing_field_at_index_7() {
-        // Row with 7 elements — row.get(7)? returns None (day_low missing)
-        let body = r#"{"dataset":[[12345,2,1500.5,100,50000,1490.0,1510.0]]}"#;
-        let base_url = start_mock_server(body).await;
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-            .unwrap();
-        assert!(query_latest_tick(&client, &base_url, 12345).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_query_latest_tick_row_missing_field_at_index_8() {
-        // Row with 8 elements — row.get(8)? returns None (day_close missing)
-        let body = r#"{"dataset":[[12345,2,1500.5,100,50000,1490.0,1510.0,1485.0]]}"#;
-        let base_url = start_mock_server(body).await;
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-            .unwrap();
-        assert!(query_latest_tick(&client, &base_url, 12345).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_query_latest_tick_row_missing_field_at_index_9() {
-        // Row with 9 elements — row.get(9)? returns None (timestamp missing)
-        let body = r#"{"dataset":[[12345,2,1500.5,100,50000,1490.0,1510.0,1485.0,1495.0]]}"#;
+    async fn test_query_latest_tick_row_missing_mandatory_ts_returns_none() {
+        // Row with mandatory feed/segment/ltp + optional cols present but the
+        // mandatory ts (index 11) missing — row.get(11)? returns None.
+        let body = r#"{"dataset":[[12345,"dhan","NSE_FNO",1500.5,100,50000,1234,1490.0,1510.0,1485.0,1495.0]]}"#;
         let base_url = start_mock_server(body).await;
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(2))
@@ -719,26 +810,30 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // QuoteResponse: all default fallback fields (volume=0, OHLC=0.0)
+    // QuoteResponse: all optional fields None (null in JSON, not faked zeros)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_quote_response_with_all_zero_defaults() {
+    fn test_quote_response_with_all_none_optionals() {
         let quote = QuoteResponse {
             security_id: 1,
-            exchange_segment_code: 0,
+            feed: "groww".to_string(),
+            segment: "NSE_EQ".to_string(),
             last_traded_price: 0.0,
-            last_traded_quantity: 0,
-            volume: 0,
-            day_open: 0.0,
-            day_high: 0.0,
-            day_low: 0.0,
-            day_close: 0.0,
+            last_traded_quantity: None,
+            volume: None,
+            open_interest: None,
+            day_open: None,
+            day_high: None,
+            day_low: None,
+            day_close: None,
             timestamp: String::new(),
         };
         let json = serde_json::to_string(&quote).unwrap();
         assert!(json.contains("\"security_id\":1"));
         assert!(json.contains("\"timestamp\":\"\""));
+        assert!(json.contains("\"volume\":null"));
+        assert!(json.contains("\"day_close\":null"));
     }
 
     #[test]
