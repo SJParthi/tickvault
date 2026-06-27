@@ -159,6 +159,7 @@ pub mod shadow_candle_writer;
 pub mod shadow_persistence;
 pub mod shadow_seal_columns;
 pub mod tick_persistence;
+pub mod tick_row_builder;
 pub mod tick_spill_drain;
 // `valkey_cache` module DELETED in #O4 (2026-05-24) — no production caller
 // remained after PR #764 migrated the dual-instance lock to SSM.
