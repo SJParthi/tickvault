@@ -7604,6 +7604,11 @@ pub async fn run_dhan_lane_runtime_supervisor(
                 // desired-ON tick re-cold-starts the lane.
                 feed_runtime.set_dhan_lane_state(LaneState::Off);
                 feed_runtime.set_dhan_lane_running(false);
+                // D2c (C4): lane forced Off (dead owner) — drop the live token-
+                // manager so the health gauges fall back to the global instead of
+                // reading this lane's now-dead manager until the supervisor
+                // re-cold-starts it.
+                feed_runtime.clear_live_token_manager();
                 record_dhan_lane_transition(LaneState::Running, LaneState::Off);
                 error!(
                     code = tickvault_common::error_code::ErrorCode::DhanLane03AuthFailed.code_str(),
@@ -7659,6 +7664,12 @@ pub async fn run_dhan_lane_runtime_supervisor(
                 }
                 record_dhan_lane_transition(LaneState::Starting, LaneState::Off);
                 feed_runtime.set_dhan_lane_running(false);
+                // D2c (C4): cold-start cancelled (Starting→Off won) — drop the live
+                // token-manager so the health gauges fall back to the global instead
+                // of reading the aborted start's manager. (The slot may already be
+                // None if the abort landed before set_live_token_manager; clearing is
+                // idempotent.)
+                feed_runtime.clear_live_token_manager();
             } else {
                 // The task promoted to Running between our snapshot and now — do
                 // NOT abort it. Its parked `park_running_dhan_lane` owns the
@@ -7793,6 +7804,12 @@ pub async fn run_dhan_lane_cold_start(ctx: std::sync::Arc<DhanLaneRuntimeContext
                     record_dhan_lane_transition(LaneState::Starting, LaneState::Off);
                 }
                 ctx.feed_runtime.set_dhan_lane_running(false);
+                // D2c (C4): cold-start FAILED (Starting→Off) — drop the live token-
+                // manager so the health gauges fall back to the global instead of
+                // reading the failed start's manager during the bounded retry
+                // backoff. (Idempotent if the failure landed before
+                // set_live_token_manager ran.)
+                ctx.feed_runtime.clear_live_token_manager();
                 attempt = attempt.saturating_add(1);
                 let backoff = dhan_lane_retry_backoff_secs(attempt);
                 error!(
@@ -8971,6 +8988,81 @@ mod tests {
             direct_global_reads, 1,
             "global_token_manager() must be read exactly once (the helper fallback); \
              the two gauge closures must NOT read it directly"
+        );
+    }
+
+    #[test]
+    fn every_lane_not_running_site_clears_the_live_token_manager() {
+        // D2c (C4) clear-completeness ratchet: in the lane supervisor / cold-start /
+        // teardown / watchdog-Halt region, EVERY `set_dhan_lane_running(false)` call
+        // (i.e. every "lane is now Off / not-running" site) MUST be immediately
+        // followed — within a small window — by a `clear_live_token_manager()` call.
+        // Otherwise a failure arm that forgets the clear leaves the health gauges
+        // reading a dead lane's TokenManager during the failed-start backoff — the
+        // exact stale-gauge bug D2c fixes. A future failure arm that omits the clear
+        // fails THIS test (not just the happy-path gauge test).
+        let src = include_str!("main.rs");
+
+        // Scope to the lane control-plane region only (supervisor → run-loop). This
+        // excludes the early `set_live_token_manager` install at boot and any
+        // `#[cfg(test)]` string literals (the test module lives far below run_loop).
+        let region_start = src
+            .find("pub async fn run_dhan_lane_runtime_supervisor")
+            .expect("the lane runtime supervisor must exist");
+        let region_end = src
+            .find("async fn run_process_runloop")
+            .filter(|&o| o > region_start)
+            .expect("run_process_runloop must follow the lane region");
+        let region = &src[region_start..region_end];
+
+        // Every not-running marker in this region must be paired with a clear.
+        let marker = "set_dhan_lane_running(false);";
+        let marker_count = region.matches(marker).count();
+        assert!(
+            marker_count >= 6,
+            "expected the 6 lane-Off sites (3 clean paths + 3 failure arms); found {marker_count} \
+             — a site was removed or the region boundary drifted"
+        );
+
+        // The number of `set_dhan_lane_running(false)` sites and the number of
+        // `clear_live_token_manager()` clears in the region must MATCH — one clear
+        // per not-running site. (Both are O(1) substring counts over the region.)
+        let clear_count = region.matches("clear_live_token_manager();").count();
+        assert_eq!(
+            clear_count, marker_count,
+            "every lane-Off / not-running site ({marker_count}) must have a matching \
+             clear_live_token_manager() ({clear_count}) — a failure arm forgot the clear"
+        );
+
+        // Positional check: each not-running marker is followed by a clear within a
+        // short window (no intervening other marker), so the pairing is genuine and
+        // a clear cannot be "borrowed" from a distant unrelated site.
+        let mut search_from = 0usize;
+        let mut paired = 0usize;
+        while let Some(rel) = region[search_from..].find(marker) {
+            let marker_abs = search_from + rel;
+            let after = &region[marker_abs..];
+            let clear_at = after.find("clear_live_token_manager();");
+            let next_marker_at = after[marker.len()..].find(marker).map(|o| o + marker.len());
+            // A clear must exist after this marker AND occur before the next marker.
+            match (clear_at, next_marker_at) {
+                (Some(c), Some(n)) => assert!(
+                    c < n,
+                    "a lane-Off site at byte {marker_abs} is not followed by a clear before the \
+                     next lane-Off site — the failure arm forgot clear_live_token_manager()"
+                ),
+                (Some(_), None) => {}
+                (None, _) => panic!(
+                    "a lane-Off site at byte {marker_abs} has no following \
+                     clear_live_token_manager() in the lane region"
+                ),
+            }
+            paired += 1;
+            search_from = marker_abs + marker.len();
+        }
+        assert_eq!(
+            paired, marker_count,
+            "every lane-Off marker must be positionally paired with a clear"
         );
     }
 }
