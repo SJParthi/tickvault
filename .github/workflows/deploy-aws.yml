@@ -525,7 +525,7 @@ jobs:
               "# invokes the sidecar via RELATIVE paths (scripts/groww-sidecar/groww_sidecar.py +",
               "# scripts/groww-sidecar/requirements.txt) which resolve under that WD. The deploy",
               "# ships only the compiled binaries, so without this copy the sidecar crash-loops with",
-              "# `can't open file '/opt/tickvault/scripts/groww-sidecar/groww_sidecar.py'`. Mirrors the",
+              "# a `cannot open file \"/opt/tickvault/scripts/groww-sidecar/groww_sidecar.py\"` error. Mirrors the",
               "# config/systemd sync above: copy from the refreshed repo clone, idempotent.",
               "if [ ! -d repo/scripts/groww-sidecar ]; then echo FATAL: repo/scripts/groww-sidecar missing after git clone; exit 1; fi",
               "mkdir -p scripts/groww-sidecar",
