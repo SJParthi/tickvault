@@ -1148,6 +1148,41 @@ impl TokenManager {
         let guard = self.token.load();
         guard.as_ref().as_ref().map(|state| state.expires_at())
     }
+
+    /// Test-only constructor for a `TokenManager` with no live auth I/O.
+    /// Crate-visible so sibling-module tests (e.g. the WebSocket `connection`
+    /// sleep-wake ratchets, D2c/C4) can build a real `Arc<TokenManager>` to
+    /// exercise the lane-owned-vs-global wake-renewal selection without
+    /// reaching SSM/Dhan. `initial_token = None` means "no token loaded".
+    /// Gated to `#[cfg(test)]` — never part of the production surface.
+    #[cfg(test)]
+    // TEST-EXEMPT: #[cfg(test)]-only test constructor (no production surface); exercised by every make_test_manager / new_for_test caller across the auth + websocket test modules.
+    pub(crate) fn new_for_test(initial_token: Option<TokenState>) -> Arc<Self> {
+        let token: TokenHandle = Arc::new(ArcSwap::new(Arc::new(initial_token)));
+        Arc::new(Self {
+            token,
+            credentials: crate::auth::types::DhanCredentials {
+                client_id: secrecy::SecretString::from("test-client-id".to_string()),
+                client_secret: secrecy::SecretString::from("test-secret".to_string()),
+                totp_secret: secrecy::SecretString::from("test-totp".to_string()),
+            },
+            rest_api_base_url: "https://api.example.com".to_string(),
+            auth_base_url: "https://auth.example.com".to_string(),
+            http_client: reqwest::Client::new(),
+            token_config: TokenConfig {
+                refresh_before_expiry_hours: 1,
+                token_validity_hours: 24,
+            },
+            network_config: NetworkConfig {
+                request_timeout_ms: 5000,
+                websocket_connect_timeout_ms: 5000,
+                retry_initial_delay_ms: 100,
+                retry_max_delay_ms: 1000,
+                retry_max_attempts: 3,
+            },
+            notifier: crate::notification::service::NotificationService::disabled(),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1197,33 +1232,10 @@ mod tests {
 
     /// Helper: constructs a `TokenManager` directly (no SSM, no network).
     /// Used to test private helper methods that don't require a real token.
+    /// Delegates to the crate-visible `TokenManager::new_for_test` (D2c) so the
+    /// test-only construction lives in one place.
     fn make_test_manager(initial_token: Option<TokenState>) -> Arc<TokenManager> {
-        let token: TokenHandle = Arc::new(ArcSwap::new(Arc::new(initial_token)));
-        let http_client = reqwest::Client::new();
-
-        Arc::new(TokenManager {
-            token,
-            credentials: crate::auth::types::DhanCredentials {
-                client_id: secrecy::SecretString::from("test-client-id".to_string()),
-                client_secret: secrecy::SecretString::from("test-secret".to_string()),
-                totp_secret: secrecy::SecretString::from("test-totp".to_string()),
-            },
-            rest_api_base_url: "https://api.example.com".to_string(),
-            auth_base_url: "https://auth.example.com".to_string(),
-            http_client,
-            token_config: TokenConfig {
-                refresh_before_expiry_hours: 1,
-                token_validity_hours: 24,
-            },
-            network_config: NetworkConfig {
-                request_timeout_ms: 5000,
-                websocket_connect_timeout_ms: 5000,
-                retry_initial_delay_ms: 100,
-                retry_max_delay_ms: 1000,
-                retry_max_attempts: 3,
-            },
-            notifier: crate::notification::service::NotificationService::disabled(),
-        })
+        TokenManager::new_for_test(initial_token)
     }
 
     #[test]

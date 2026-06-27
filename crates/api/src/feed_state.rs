@@ -19,9 +19,15 @@
 //! restart with `dhan_enabled=true` is the documented path to actually stream.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use tickvault_common::config::FeedsConfig;
+// D2c (C4 follow-up): the live lane-owned TokenManager handle. Stored here so the
+// PROCESS-level health gauges (self-test token-headroom + SLO token-freshness) can
+// read the CURRENT lane manager instead of the dead boot-time global `OnceLock`
+// after a runtime stop→re-start. `api` already depends on `core`.
+use tickvault_core::auth::TokenManager;
 // SP1: `Feed` now lives in `common` (the shared layer every crate depends on),
 // so writers/aggregators/parity can use the SAME enum + label fn. Re-exported
 // here so existing `api::feed_state::Feed` call sites keep compiling unchanged.
@@ -171,7 +177,11 @@ pub struct FeedStatus {
 /// API and the feed lanes together. PR-E: the `dhan`/`groww` flags are
 /// `Arc<AtomicBool>` so the SAME atomic can be handed to the `core` Dhan
 /// WebSocket loop (which cannot depend on this crate) via [`Self::dhan_flag`].
-#[derive(Debug)]
+///
+/// `Debug` is hand-written (not derived) because the `live_lane_token_manager`
+/// slot holds a `TokenManager`, which is intentionally NOT `Debug` (it owns
+/// credentials). The manual impl renders that slot as a presence flag only —
+/// never the manager's contents — so no secret can leak through a debug format.
 pub struct FeedRuntimeState {
     dhan: Arc<AtomicBool>,
     groww: Arc<AtomicBool>,
@@ -199,6 +209,20 @@ pub struct FeedRuntimeState {
     /// all read/write THIS atomic, so the lane state can never disagree between
     /// the boot path and the watcher. Defaults `Off` (no lane yet).
     dhan_lane_state: AtomicU8,
+    /// D2c (C4 follow-up): the CURRENTLY-live lane-owned `TokenManager`. SET when
+    /// `start_dhan_lane` succeeds (overwriting any prior, dead manager) and CLEARED
+    /// at every lane→`Off` transition. The two PROCESS-level health gauges
+    /// (self-test token-headroom + SLO token-freshness) prefer THIS handle and
+    /// fall back to the global `OnceLock` only when no lane is running (boot-OFF /
+    /// Groww-only) — so after a runtime stop→re-start they read the NEW manager's
+    /// remaining seconds, not the stale boot-time manager's.
+    ///
+    /// A `std::sync::Mutex` is correct here: set/clear happen on the cold-path lane
+    /// lifecycle (start/stop), and the read happens on the periodic self-test (once
+    /// per trading day) + SLO (every 10s) cadences — NEVER on the per-tick hot path,
+    /// so the lock is uncontended and has zero hot-path impact. `Option<Arc<_>>` is
+    /// cheap to clone out under the lock; the lock is never held across an `.await`.
+    live_lane_token_manager: Mutex<Option<Arc<TokenManager>>>,
 }
 
 impl FeedRuntimeState {
@@ -221,6 +245,8 @@ impl FeedRuntimeState {
             // D2b: the lane FSM starts Off; the boot-ON inline start drives it
             // Off→Starting→Running, exactly like a runtime enable does.
             dhan_lane_state: AtomicU8::new(LaneState::Off.as_u8()),
+            // D2c (C4): no lane manager until `start_dhan_lane` installs one.
+            live_lane_token_manager: Mutex::new(None),
         }
     }
 
@@ -324,6 +350,54 @@ impl FeedRuntimeState {
             .map(|_| next)
     }
 
+    /// D2c (C4): install the CURRENTLY-live lane-owned `TokenManager`. Called by
+    /// `start_dhan_lane` after a successful cold-start, OVERWRITING any prior
+    /// (now-dead) manager. The two PROCESS-level health gauges read this via
+    /// [`Self::live_token_manager`] so, after a runtime stop→re-start, they report
+    /// the NEW manager's remaining-seconds rather than the stale boot-time global.
+    ///
+    /// Off-hot-path (lane lifecycle only); the `Mutex` is uncontended. On a poisoned
+    /// lock we recover the inner guard (`into_inner`) rather than panic — losing the
+    /// live handle is benign (the gauges fall back to the global), and a health-slot
+    /// write must never abort the lane.
+    // Needs a real `Arc<TokenManager>` to exercise, but `core`'s only constructor
+    // (`new_for_test`) is `#[cfg(test)] pub(crate)` — unreachable from this crate.
+    // The set path is one line; its read/clear companions (`live_token_manager` /
+    // `clear_live_token_manager`) ARE unit-tested, and the live call site is
+    // `start_dhan_lane` (boot-deploy follow exercises it).
+    // TEST-EXEMPT: cross-crate test-constructor barrier (see comment above).
+    pub fn set_live_token_manager(&self, manager: Arc<TokenManager>) {
+        match self.live_lane_token_manager.lock() {
+            Ok(mut slot) => *slot = Some(manager),
+            Err(poisoned) => *poisoned.into_inner() = Some(manager),
+        }
+    }
+
+    /// D2c (C4): clear the live lane-owned `TokenManager`. Called at every
+    /// lane→`Off` transition (operator disable, watchdog-Halt, and the
+    /// already-torn-down convergence) so the gauges fall back to the global handle
+    /// while no lane runs (boot-OFF / Groww-only) instead of reading a dead manager.
+    /// Idempotent. Off-hot-path; poison-tolerant (see [`Self::set_live_token_manager`]).
+    pub fn clear_live_token_manager(&self) {
+        match self.live_lane_token_manager.lock() {
+            Ok(mut slot) => *slot = None,
+            Err(poisoned) => *poisoned.into_inner() = None,
+        }
+    }
+
+    /// D2c (C4): the CURRENTLY-live lane-owned `TokenManager`, or `None` when no
+    /// lane is running. The health gauges prefer this and fall back to the global
+    /// `OnceLock` only on `None`, so a runtime stop→re-start reports the live
+    /// manager's headroom. Clones the `Arc` out under the lock (cheap, no `.await`
+    /// held). Called on the periodic self-test/SLO cadence, never per-tick.
+    #[must_use]
+    pub fn live_token_manager(&self) -> Option<Arc<TokenManager>> {
+        match self.live_lane_token_manager.lock() {
+            Ok(slot) => slot.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
     /// Called once by the boot wiring when the Groww bridge task is spawned, so
     /// the API can report honestly whether a runtime toggle will take effect.
     pub fn mark_groww_lane_running(&self) {
@@ -389,6 +463,31 @@ impl FeedRuntimeState {
     }
 }
 
+impl std::fmt::Debug for FeedRuntimeState {
+    /// Manual impl: renders the live-token-manager slot as a presence flag only
+    /// (`TokenManager` is not `Debug` — it owns credentials), so no secret can
+    /// leak through a `{:?}` format. Every other field is shown directly.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let live_token_manager_present = self
+            .live_lane_token_manager
+            .lock()
+            .map_or(true, |slot| slot.is_some());
+        f.debug_struct("FeedRuntimeState")
+            .field("dhan", &self.dhan)
+            .field("groww", &self.groww)
+            .field("groww_lane_running", &self.groww_lane_running)
+            .field("dhan_lane_running", &self.dhan_lane_running)
+            .field("dhan_pool_present", &self.dhan_pool_present)
+            .field("dhan_disable_allowed", &self.dhan_disable_allowed)
+            .field("dhan_lane_state", &self.dhan_lane_state)
+            .field(
+                "live_lane_token_manager_present",
+                &live_token_manager_present,
+            )
+            .finish()
+    }
+}
+
 impl Default for FeedRuntimeState {
     /// Default mirrors `FeedsConfig::default()` — Dhan ON, Groww OFF. Used by the
     /// 4-arg `AppState::new` (tests); production injects the config-seeded one via
@@ -436,6 +535,39 @@ mod tests {
         let state = FeedRuntimeState::default();
         assert!(state.is_enabled(Feed::Dhan));
         assert!(!state.is_enabled(Feed::Groww));
+    }
+
+    #[test]
+    fn test_live_token_manager_defaults_none() {
+        // D2c (C4): a fresh state has no lane manager — the gauges must fall
+        // back to the global `OnceLock` (boot-OFF / Groww-only / pre-start).
+        let state = FeedRuntimeState::default();
+        assert!(
+            state.live_token_manager().is_none(),
+            "live lane token-manager slot must start empty"
+        );
+    }
+
+    #[test]
+    fn test_clear_live_token_manager_is_idempotent_when_empty() {
+        // Clearing an already-empty slot is a no-op (the watchdog-Halt and the
+        // already-torn-down convergence can both fire the clear).
+        let state = FeedRuntimeState::default();
+        state.clear_live_token_manager();
+        state.clear_live_token_manager();
+        assert!(state.live_token_manager().is_none());
+    }
+
+    #[test]
+    fn test_debug_renders_live_token_manager_presence_flag_only() {
+        // The manual Debug impl must expose only a presence flag, never the
+        // manager's contents (it owns credentials). Empty slot → present=false.
+        let state = FeedRuntimeState::default();
+        let dbg = format!("{state:?}");
+        assert!(
+            dbg.contains("live_lane_token_manager_present: false"),
+            "Debug must show the presence flag (false when empty); got: {dbg}"
+        );
     }
 
     #[test]
