@@ -1716,3 +1716,80 @@ rules:
       inspects tv_prev_day_ohlcv_empty_total + the REST canary + the
       universe-build codes per the runbook, then acts upstream (Dhan portal /
       scope). Fires at most once per boot.
+
+  # ── D2b: runtime Dhan-lane cold-start FSM (2026-06-26) ──────────────────
+  # DHAN-LANE-01/02/03 = a runtime Dhan-lane cold-start (a boot-OFF Dhan feed
+  # enabled at runtime) failed at the universe-build / ws-pool-spawn / auth-gate
+  # stage. The FSM returns to Off (no half-running lane) and a bounded backoff
+  # retry re-attempts automatically — but the operator MUST know the lane did
+  # not come up (the cause is usually upstream: Dhan CSV / niftyindices source,
+  # TLS/DNS, token/static-IP). Escalate; the retry self-heals if the upstream
+  # recovers. NOT auto-fixable from the app (no in-app fix for an upstream
+  # auth/universe/network failure). The PROCESS-shared infra stays up, so the
+  # Groww feed is unaffected throughout.
+  - name: dhan-lane-01-universe-build-failed-escalate
+    match:
+      code: DHAN-LANE-01
+    action: escalate
+    runbook_path: .claude/rules/project/dhan-lane-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      DHAN-LANE-01 = runtime Dhan-lane cold-start failed at the daily-universe
+      build stage (the inline spine's instrument-load failure surfaced at
+      runtime). The FSM is driven Starting->Off; a bounded min(10*2^n,300)s
+      backoff re-attempts. Cause is upstream (Dhan/niftyindices CSV source) —
+      cross-check the INSTR-FETCH-* / NTM-CONSTITUENCY-01 codes. Operator action
+      required if it persists; the retry self-heals if the source recovers.
+
+  - name: dhan-lane-02-ws-pool-spawn-failed-escalate
+    match:
+      code: DHAN-LANE-02
+    action: escalate
+    runbook_path: .claude/rules/project/dhan-lane-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      DHAN-LANE-02 = runtime Dhan-lane cold-start failed at the main-feed
+      WS-pool create/spawn stage. start_dhan_lane's own cancel cleanup aborted
+      every lane-owned handle it spawned so far (no orphan sockets); the FSM is
+      driven Starting->Off; bounded retry. Cause is usually TLS/DNS or a
+      Dhan-side handshake failure — cross-check tv_websocket_connections_active.
+      The 2-Dhan-WS lock is untouched. Operator inspection per the runbook.
+
+  - name: dhan-lane-03-auth-failed-escalate
+    match:
+      code: DHAN-LANE-03
+    action: escalate
+    runbook_path: .claude/rules/project/dhan-lane-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      DHAN-LANE-03 = runtime Dhan-lane cold-start failed at the IP-verify /
+      TOTP->JWT auth / static-IP / dual-instance boot gate. At RUNTIME this
+      NEVER exits the process (unlike the boot path); the FSM returns to Off and
+      bounded retry re-attempts. Reuse AUTH-GAP-* semantics: check
+      tv_token_remaining_seconds, the SSM TOTP secret, and the static-IP
+      whitelist. The lane owns its own TokenManager (C4) so a cold-start cannot
+      renew a stale global token. Operator action per the runbook.
+
+  # DHAN-LANE-04 = the runtime Stop's teardown hit the bounded drain timeout and
+  # force-aborted the remaining WS handles. The lane STILL reaches Off
+  # (degraded-but-recovered, not data loss). Medium, auto-triage-safe — silence:
+  # the only loss is the in-flight graceful-close of an ALREADY-disabled feed;
+  # the operator notes it but no action is required unless it recurs every
+  # disable (then inspect the WS graceful-close path per the runbook).
+  - name: dhan-lane-04-teardown-timeout-silence
+    match:
+      code: DHAN-LANE-04
+    action: silence
+    runbook_path: .claude/rules/project/dhan-lane-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      DHAN-LANE-04 = the runtime Dhan-lane teardown drain timed out; the inner
+      teardown force-aborted the remaining WS handles and the lane STILL reached
+      Off. Degraded-but-recovered, not data loss — the only loss is the
+      graceful-close of an already-disabled feed. Silence (counter +
+      tv_dhan_lane_teardown_forced_total record the event); the operator
+      inspects only if it recurs on every disable per the runbook.

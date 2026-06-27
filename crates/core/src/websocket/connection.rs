@@ -385,6 +385,23 @@ pub struct WebSocketConnection {
     /// Sourced from the shared `FeedRuntimeState` Dhan atomic so the feed-control
     /// webpage/API can pause/resume the live Dhan feed with no restart.
     feed_enable_flag: Option<Arc<AtomicBool>>,
+
+    /// D2c (closes C4): optional LANE-OWNED `TokenManager` for the sleep-wake
+    /// `force_renewal_if_stale` path. `None` = use the global `OnceLock`
+    /// (`global_token_manager()`) — the boot-ON / fast crash-recovery arm, which
+    /// installs the manager globally once at boot. When `Some` (every runtime
+    /// cold-start via `start_dhan_lane`), the wake-renewal targets THIS manager —
+    /// the one the live pool is actually using — instead of the stale global.
+    ///
+    /// Why this exists: `set_global_token_manager` is a `OnceLock` that no-ops on
+    /// the 2nd set. After a runtime lane STOP (drops manager-A) → re-START
+    /// (lane-owned manager-B with a fresh JWT), the global still points at the
+    /// dead manager-A, so a global-only wake-renewal would renew the WRONG token.
+    /// Injecting the lane manager here makes the wake renew manager-B.
+    ///
+    /// COLD PATH: read at most once per connect/disconnect/sleep cycle in
+    /// `wake_renewal_token_manager()`, NEVER per tick.
+    token_manager: Option<Arc<crate::auth::TokenManager>>,
 }
 
 /// Polling cadence while the Dhan feed is disabled at runtime (PR-E). Bounds the
@@ -515,6 +532,11 @@ impl WebSocketConnection {
             // feed is always-on (every existing caller + test path). The boot
             // wiring attaches the shared Dhan flag via `with_feed_enable_flag`.
             feed_enable_flag: None,
+            // D2c (C4): no lane-owned TokenManager by default — wake-renewal
+            // falls back to the global `OnceLock`. The runtime cold-start
+            // (`start_dhan_lane`) injects the lane manager via
+            // `with_token_manager` so the wake renews the LIVE manager.
+            token_manager: None,
         }
     }
 
@@ -547,6 +569,32 @@ impl WebSocketConnection {
         self.feed_enable_flag
             .as_ref()
             .is_none_or(|f| f.load(Ordering::Relaxed))
+    }
+
+    /// D2c (closes C4): attach the LANE-OWNED `TokenManager` used by the
+    /// sleep-wake `force_renewal_if_stale` path. Chain after `new()`. When set,
+    /// `wake_renewal_token_manager()` returns THIS manager instead of the global
+    /// `OnceLock`, so a runtime Dhan-lane stop→re-start renews the manager the
+    /// live pool is actually using (not the stale boot-time global). Absent
+    /// injection (the default) = global fallback, identical to pre-D2c.
+    #[must_use]
+    pub fn with_token_manager(mut self, tm: Arc<crate::auth::TokenManager>) -> Self {
+        self.token_manager = Some(tm);
+        self
+    }
+
+    /// D2c (C4): the `TokenManager` the wake-renewal path must target. Prefers
+    /// the LANE-OWNED injected manager (the live pool's manager); falls back to
+    /// the global `OnceLock` for the boot-ON / fast crash-recovery arm that
+    /// installs the manager globally and does not inject. Pure `Option`
+    /// selection — never panics, never allocates. COLD PATH (per sleep-wake,
+    /// never per tick).
+    #[inline]
+    #[must_use]
+    fn wake_renewal_token_manager(&self) -> Option<&Arc<crate::auth::TokenManager>> {
+        self.token_manager
+            .as_ref()
+            .or_else(|| crate::auth::token_manager::global_token_manager())
     }
 
     /// PR-E: park the connection while the Dhan feed is disabled, polling the
@@ -1915,9 +1963,16 @@ impl WebSocketConnection {
                     // token if it has < 4h validity left BEFORE attempting
                     // the post-sleep reconnect. Prevents the legacy
                     // "wake → reconnect → DH-901 → renew → reconnect"
-                    // 30-second cascade. Uses the global TokenManager
-                    // handle installed at boot.
-                    if let Some(tm) = crate::auth::token_manager::global_token_manager() {
+                    // 30-second cascade.
+                    //
+                    // D2c (closes C4): target the LANE-OWNED TokenManager when
+                    // injected (every runtime cold-start via start_dhan_lane),
+                    // falling back to the global `OnceLock` for the boot-ON /
+                    // fast crash-recovery arm. After a runtime lane stop→re-start
+                    // the global still points at the dead prior manager, so a
+                    // global-only renewal would renew the WRONG token; the
+                    // injected lane manager is the one the live pool is using.
+                    if let Some(tm) = self.wake_renewal_token_manager() {
                         // Snapshot remaining seconds for the typed Telegram event.
                         let remaining_secs_before = tm
                             .next_renewal_at()
@@ -2543,6 +2598,115 @@ mod tests {
         assert!(!conn.feed_enabled(), "flag false → disabled (operator OFF)");
         flag.store(true, Ordering::Relaxed);
         assert!(conn.feed_enabled(), "flag true again → re-enabled");
+    }
+
+    /// D2c (C4) — `with_token_manager` stores the lane manager and
+    /// `wake_renewal_token_manager()` returns THAT exact manager, even when a
+    /// (different) global is installed. This is the core of the stop→re-start
+    /// fix: the wake renews the manager the live pool actually holds, never the
+    /// stale global `OnceLock`.
+    #[test]
+    fn wake_renewal_token_manager_prefers_injected_over_global() {
+        use crate::auth::TokenManager;
+        // Install SOME global so the fallback path is non-trivially different
+        // from the injected one (idempotent — a no-op if already set by another
+        // test in this binary; either way it is a DIFFERENT Arc instance from
+        // `lane_mgr` below, so the pointer assertion is meaningful).
+        let global_mgr = TokenManager::new_for_test(None);
+        let _ = crate::auth::token_manager::set_global_token_manager(global_mgr);
+
+        // The lane-owned manager — a distinct instance.
+        let lane_mgr = TokenManager::new_for_test(None);
+
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![],
+            FeedMode::Ticker,
+            tx,
+            None,
+        )
+        .with_token_manager(Arc::clone(&lane_mgr));
+
+        let selected = conn
+            .wake_renewal_token_manager()
+            .expect("injected lane manager must be returned");
+        assert!(
+            Arc::ptr_eq(selected, &lane_mgr),
+            "wake-renewal MUST target the injected lane manager, not the global \
+             OnceLock — this is the C4 stop→re-start fix"
+        );
+    }
+
+    /// D2c (C4) — without injection (the boot-ON / fast crash-recovery arm),
+    /// `wake_renewal_token_manager()` returns EXACTLY the global `OnceLock`
+    /// value, preserving pre-D2c behaviour. Ordering-robust: asserts the helper
+    /// result pointer-matches whatever `global_token_manager()` currently is
+    /// (including `None` if no global has been installed in this binary yet).
+    #[test]
+    fn wake_renewal_token_manager_falls_back_to_global_when_not_injected() {
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![],
+            FeedMode::Ticker,
+            tx,
+            None,
+        );
+        // No `with_token_manager` → must mirror the global accessor exactly.
+        let selected = conn.wake_renewal_token_manager();
+        let global = crate::auth::token_manager::global_token_manager();
+        match (selected, global) {
+            (Some(s), Some(g)) => assert!(
+                Arc::ptr_eq(s, g),
+                "no injection → wake-renewal must use the global OnceLock"
+            ),
+            (None, None) => { /* no global installed in this binary — consistent */ }
+            (s, g) => panic!(
+                "no-injection helper must mirror global_token_manager(): \
+                 selected.is_some()={}, global.is_some()={}",
+                s.is_some(),
+                g.is_some()
+            ),
+        }
+    }
+
+    /// D2c (C4) — `with_token_manager` actually populates the field (builder
+    /// wiring ratchet). Asserts via the selection helper that the injected
+    /// manager is the one returned.
+    #[test]
+    fn with_token_manager_sets_the_field() {
+        use crate::auth::TokenManager;
+        let lane_mgr = TokenManager::new_for_test(None);
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            0,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![],
+            FeedMode::Ticker,
+            tx,
+            None,
+        )
+        .with_token_manager(Arc::clone(&lane_mgr));
+        assert!(
+            conn.token_manager.is_some(),
+            "with_token_manager must populate the field"
+        );
+        assert!(
+            Arc::ptr_eq(conn.token_manager.as_ref().expect("just set"), &lane_mgr),
+            "stored manager must be the exact injected Arc"
+        );
     }
 
     /// PR #790b (2026-05-25) — disconnect-context capture ratchet.
