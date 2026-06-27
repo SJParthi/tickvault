@@ -75,6 +75,61 @@ CANONICAL_INDEX_SEGMENT = "IDX_I"
 WATCH_POLL_SECS = 5
 
 
+def _redact(text: str, secrets) -> str:
+    """Scrub known secret values out of a string before it is logged.
+
+    A Groww SDK HTTP error's str/repr can embed the request that carried the
+    access token / api_key, or echo the response body (security-review MEDIUM
+    2026-06-19). We DO want the cause (status code, error message, SDK detail)
+    for triage, so instead of dropping the whole detail we surface it with every
+    known secret value masked. Anything secret-shaped that we did not anticipate
+    is still a residual risk, so callers also cap the length.
+    """
+    if not text:
+        return text
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "***REDACTED***")
+    return text
+
+
+def _exception_detail(exc, secrets, max_len: int = 600) -> str:
+    """Build a redacted, length-capped one-line detail string for `exc`.
+
+    Surfaces the WHY (str(exc), HTTP status, response body) so the operator can
+    tell a credential error (auth fails) from an off-market feed reject (auth OK,
+    connect fails) — with every known secret masked and the whole thing capped.
+    """
+    parts = []
+    detail = _redact(str(exc), secrets)
+    if detail:
+        parts.append(detail)
+    # Optional HTTP detail some SDK exceptions carry.
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None) if response is not None else None
+    if status is not None:
+        parts.append(f"status={status}")
+    body = None
+    response = getattr(exc, "response", None)
+    if response is not None:
+        body = getattr(response, "text", None) or getattr(response, "body", None)
+    if body is None:
+        body = getattr(exc, "body", None)
+    if body:
+        parts.append(f"body={_redact(str(body), secrets)}")
+    if not parts:
+        # Fall back to the args tuple if nothing else was informative.
+        args_detail = _redact(repr(getattr(exc, "args", ())), secrets)
+        if args_detail:
+            parts.append(args_detail)
+    summary = " | ".join(parts)
+    if len(summary) > max_len:
+        summary = summary[:max_len] + "…(truncated)"
+    return summary or "(no detail available)"
+
+
 def ms_to_ist_nanos(ts_millis: int) -> int:
     """Groww `tsInMillis` (UTC epoch ms) -> IST epoch nanoseconds.
 
@@ -248,14 +303,30 @@ def main() -> None:
 
     stock_list, index_list, sid_map = wait_for_subscriptions()
 
+    # Secrets to mask out of any logged exception detail (never log their values).
+    secrets = (api_key, totp_secret)
+
     # Reconnect loop — never give up (lock: not a single received tick missed).
     while True:
+        # Track which phase fails so the log names auth vs feed-connect vs
+        # subscribe vs consume (the cause is otherwise indistinguishable).
+        phase = "auth"
         try:
             totp = pyotp.TOTP(totp_secret).now()
             access_token = GrowwAPI.get_access_token(api_key=api_key, totp=totp)
+            # Explicit auth-success signal — distinguishes "auth succeeded, feed
+            # connect failed" from "auth failed". Log only the token LENGTH, never
+            # the token value.
+            print(
+                f"groww auth OK: access token acquired (len={len(access_token or '')})",
+                flush=True,
+            )
+
+            phase = "feed-connect"
             groww = GrowwAPI(access_token)
             feed = GrowwFeed(groww)
 
+            phase = "subscribe"
             if stock_list:
                 def on_ltp(_meta) -> None:
                     emit_ltp_records(out, feed.get_ltp(), sid_map)
@@ -272,18 +343,22 @@ def main() -> None:
                 f"— streaming…",
                 flush=True,
             )
+            phase = "consume"
             feed.consume()  # blocking
         except KeyboardInterrupt:
             print("stopping.", flush=True)
             break
         except Exception as exc:  # noqa: BLE001 - reconnect on any error
-            # Log ONLY the exception type name, never repr/str: a Groww SDK HTTP
-            # error can embed the response body (and thus the access token /
-            # api_key) in its repr, which the Rust supervisor captures from stdout
-            # (security-review MEDIUM 2026-06-19). The type name is enough to
-            # triage; full detail stays out of the log.
+            # Surface the WHY for triage, with every known secret value masked and
+            # the detail length-capped: a Groww SDK HTTP error can embed the
+            # response body (and thus the access token / api_key) in its
+            # str/repr/response, which the Rust supervisor captures from stdout
+            # (security-review MEDIUM 2026-06-19). `_exception_detail` redacts the
+            # api_key + TOTP secret and caps length so the cause is visible without
+            # leaking the credentials.
             print(
-                f"groww sidecar error: {type(exc).__name__} — reconnecting in 5s",
+                f"groww sidecar error [{phase}]: {type(exc).__name__}: "
+                f"{_exception_detail(exc, secrets)} — reconnecting in 5s",
                 flush=True,
             )
             time.sleep(5)
