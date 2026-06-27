@@ -176,6 +176,8 @@ jobs:
               "docker ps --format \"{{.Names}} {{.Status}}\" 2>/dev/null || echo none",
               "echo ===ROWS===",
               "for t in ticks candles_1m option_chain_minute_snapshot instrument_lifecycle; do c=$(curl -s \"http://localhost:9000/exec?query=select%20count(*)%20from%20$t\" 2>/dev/null | grep -oE \"\\[\\[[0-9]+\" | grep -oE \"[0-9]+\" | head -1); echo \"$t=${c:-NA}\"; done",
+              "echo ===FEED_SPLIT===",
+              "fs=$(curl -s \"http://localhost:9000/exec?query=select%20feed%2C%20count(*)%20from%20ticks%20group%20by%20feed\" 2>/dev/null | grep -oE \"\\[\\\"[^\\\"]+\\\",[0-9]+\\]\" | sed -E \"s/\\[\\\"([^\\\"]+)\\\",([0-9]+)\\]/\\1=\\2/\"); if [ -n \"$fs\" ]; then echo \"$fs\"; else echo no-feed-rows; fi",
               "echo ===LOGS===",
               "journalctl -u tickvault -n 12 --no-pager 2>/dev/null | tail -12 || echo no-logs",
               "echo ===ERRORS===",
@@ -199,7 +201,8 @@ jobs:
           # Parse sections.
           app=$(echo "$OUT" | awk '/===APP===/{f=1;next}/===DOCKER===/{f=0}f' | tr -d '[:space:]')
           docker=$(echo "$OUT" | awk '/===DOCKER===/{f=1;next}/===ROWS===/{f=0}f')
-          rows=$(echo "$OUT" | awk '/===ROWS===/{f=1;next}/===LOGS===/{f=0}f')
+          rows=$(echo "$OUT" | awk '/===ROWS===/{f=1;next}/===FEED_SPLIT===/{f=0}f')
+          feedsplit=$(echo "$OUT" | awk '/===FEED_SPLIT===/{f=1;next}/===LOGS===/{f=0}f')
           logs=$(echo "$OUT" | awk '/===LOGS===/{f=1;next}/===ERRORS===/{f=0}f')
           errs=$(echo "$OUT" | awk '/===ERRORS===/{f=1;next}f')
 
@@ -225,6 +228,12 @@ jobs:
           echo "## 📈 Data captured (QuestDB row counts)" >> "$S"
           echo '```' >> "$S"; echo "$rows" >> "$S"; echo '```' >> "$S"
           echo "_ticks/candles climb during market hours; 0 off-market or pre-deploy is normal._" >> "$S"
+          echo "" >> "$S"
+
+          # ---- Per-feed tick split (Dhan vs Groww) ----
+          echo "## 🔀 Ticks captured per feed" >> "$S"
+          echo '```' >> "$S"; echo "$feedsplit" >> "$S"; echo '```' >> "$S"
+          echo "_dhan=… is the primary feed; groww=… appears only when the Groww second feed is enabled (staging dry-run)._" >> "$S"
           echo "" >> "$S"
 
           # ---- Recent logs ----
