@@ -68,6 +68,14 @@ Environment=RUST_LOG=info
 # real api.dhan.co + requires the registered static EIP (enable_eip=true). See
 # config/production.toml + config/staging.toml.
 Environment=TV_ENVIRONMENT=staging
+# GROWW_MAX_SUBSCRIBE caps the first-run Groww subscription set. Default in code
+# is 60 (subset-safe); set to 1000 here to subscribe the FULL ~779-instrument
+# Groww universe (NTM-union: indices + F&O underlyings + NIFTY-Total-Market
+# constituents). The builder clamps to GROWW_MAX_SUBSCRIPTIONS=1000 (a max, not
+# a floor — a prefix-take, indices-first then token-ascending), so 1000 cleanly
+# covers the live ~779 count with headroom. Per .claude/rules/project/
+# groww-second-feed-scope-2026-06-19.md.
+Environment=GROWW_MAX_SUBSCRIBE=1000
 
 # Resource limits
 LimitNOFILE=65536
