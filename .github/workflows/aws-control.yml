@@ -181,7 +181,9 @@ jobs:
               "echo ===LOGS===",
               "journalctl -u tickvault -n 12 --no-pager 2>/dev/null | tail -12 || echo no-logs",
               "echo ===ERRORS===",
-              "tail -3 /opt/tickvault/data/logs/errors.summary.md 2>/dev/null || echo no-summary"
+              "tail -3 /opt/tickvault/data/logs/errors.summary.md 2>/dev/null || echo no-summary",
+              "echo ===GROWW===",
+              "journalctl -u tickvault -n 400 --no-pager 2>/dev/null | grep -iE \"groww|pyotp|pip|venv\" | tail -30 || echo no-groww-lines"
             ]' \
             --query Command.CommandId --output text 2>/dev/null || echo "")
 
@@ -204,7 +206,8 @@ jobs:
           rows=$(echo "$OUT" | awk '/===ROWS===/{f=1;next}/===FEED_SPLIT===/{f=0}f')
           feedsplit=$(echo "$OUT" | awk '/===FEED_SPLIT===/{f=1;next}/===LOGS===/{f=0}f')
           logs=$(echo "$OUT" | awk '/===LOGS===/{f=1;next}/===ERRORS===/{f=0}f')
-          errs=$(echo "$OUT" | awk '/===ERRORS===/{f=1;next}f')
+          errs=$(echo "$OUT" | awk '/===ERRORS===/{f=1;next}/===GROWW===/{f=0}f')
+          groww=$(echo "$OUT" | awk '/===GROWW===/{f=1;next}f')
 
           # ---- App health ----
           echo "## 🟢 App" >> "$S"
@@ -244,6 +247,12 @@ jobs:
           # ---- Errors summary ----
           echo "## 🚨 Errors" >> "$S"
           echo '```' >> "$S"; echo "$errs" >> "$S"; echo '```' >> "$S"
+          echo "" >> "$S"
+
+          # ---- Groww sidecar log view (feed/venv/pip/pyotp) ----
+          echo "## 🟣 Groww sidecar (last 30 matching log lines)" >> "$S"
+          echo '```' >> "$S"; echo "${groww:-no-groww-lines}" >> "$S"; echo '```' >> "$S"
+          echo "_Shows Groww feed + Python venv/pip/pyotp lines. Empty/no-groww-lines is normal when the Groww second feed is disabled._" >> "$S"
           echo "" >> "$S"
 
           # ---- Plain-English verdict ----
