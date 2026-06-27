@@ -39,34 +39,53 @@ fn read(rel: &str) -> String {
 }
 
 const MAIN_RS: &str = "crates/app/src/main.rs";
+// C2 (behavior-preserving): the per-seal routing body — including the G3
+// real-time-proof emission — moved out of the two inline `main.rs` closures into
+// the single shared `route_seal`. The signal is STILL emitted at every seal site
+// (both Dhan paths route through `route_seal`); it is just emitted from ONE place
+// now. The wiring scan therefore targets the shared module.
+const SEAL_ROUTING_RS: &str = "crates/app/src/seal_routing.rs";
 const METRIC: &str = "tv_aggregator_close_pct_nonzero_total";
 
 #[test]
 fn seal_site_emits_close_pct_nonzero_prometheus_counter() {
-    let src = read(MAIN_RS);
-    let hits = src.matches(METRIC).count();
+    // The metric is emitted once in the shared `route_seal` (Dhan-feed gate),
+    // which BOTH Dhan seal sites (per-tick + IST-midnight) invoke. Confirm the
+    // shared emit exists AND that both main.rs sites route through it.
+    let routing = read(SEAL_ROUTING_RS);
     assert!(
-        hits >= 2,
-        "main.rs must emit `{METRIC}` at BOTH seal sites (per-tick + \
-         IST-midnight force-seal), found {hits}. This is the G3 real-time \
-         proof that close_pct_from_prev_day populates live — without it a \
+        routing.contains(METRIC),
+        "seal_routing.rs (route_seal) must emit `{METRIC}` — the G3 real-time \
+         proof that close_pct_from_prev_day populates live. Without it a \
          silently-zero % column has no positive operator signal \
          (audit-findings Rule 11)."
+    );
+    let main_rs = read(MAIN_RS);
+    let route_hits = main_rs.matches("seal_routing::route_seal").count();
+    assert!(
+        route_hits >= 2,
+        "main.rs must route BOTH Dhan seal sites (per-tick + IST-midnight \
+         force-seal) through `seal_routing::route_seal`, found {route_hits} — \
+         so the shared G3 emit fires at both."
     );
 }
 
 #[test]
 fn per_tick_seal_site_records_heartbeat_close_pct_nonzero() {
-    let src = read(MAIN_RS);
+    // The heartbeat record now lives in route_seal (gated on the per-tick Dhan
+    // heartbeat param). The per-minute AGGREGATOR-HB-01 `info!` line stays in
+    // main.rs.
+    let routing = read(SEAL_ROUTING_RS);
     assert!(
-        src.contains("record_close_pct_nonzero()"),
-        "main.rs per-tick seal site must call \
-         `heartbeat_writer.record_close_pct_nonzero()` so the per-minute \
-         AGGREGATOR-HB-01 heartbeat carries the positive signal."
+        routing.contains("record_close_pct_nonzero()"),
+        "seal_routing.rs (route_seal) must call \
+         `hb.record_close_pct_nonzero()` so the per-minute AGGREGATOR-HB-01 \
+         heartbeat carries the positive signal for the per-tick Dhan path."
     );
+    let main_rs = read(MAIN_RS);
     assert!(
-        src.contains("close_pct_nonzero = snap.close_pct_nonzero"),
-        "the aggregator heartbeat `info!` line must include \
+        main_rs.contains("close_pct_nonzero = snap.close_pct_nonzero"),
+        "the aggregator heartbeat `info!` line in main.rs must include \
          `close_pct_nonzero = snap.close_pct_nonzero` so the operator can \
          tail it (AGGREGATOR-HB-01)."
     );
@@ -74,15 +93,16 @@ fn per_tick_seal_site_records_heartbeat_close_pct_nonzero() {
 
 #[test]
 fn close_pct_nonzero_is_guarded_by_a_nonzero_check_not_unconditional() {
-    let src = read(MAIN_RS);
+    let routing = read(SEAL_ROUTING_RS);
     // The signal must be conditional on a real non-zero %, not fired on
     // every seal (which would make it a meaningless duplicate of
     // seals_emitted and defeat the false-OK detection).
     assert!(
-        src.contains("state.close_pct_from_prev_day != 0.0"),
-        "the G3 signal must be gated on `state.close_pct_from_prev_day != 0.0` \
-         (captured before the seal move), not emitted unconditionally — \
-         otherwise it cannot distinguish a populating % from a flat one."
+        routing.contains("state.close_pct_from_prev_day != 0.0"),
+        "the G3 signal in seal_routing.rs (route_seal) must be gated on \
+         `state.close_pct_from_prev_day != 0.0` (captured before the seal \
+         move), not emitted unconditionally — otherwise it cannot distinguish \
+         a populating % from a flat one."
     );
 }
 
