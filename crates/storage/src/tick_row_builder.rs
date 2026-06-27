@@ -334,6 +334,73 @@ mod tests {
         }
     }
 
+    /// `build_tick_row_for_feed` must lay the row out in the EXACT legacy Dhan
+    /// order: ALL symbols (`segment`, `feed`) first (ILP requirement), then the
+    /// fixed column sequence `security_id → ltp → open → high → low → close →
+    /// volume → oi → avg_price → last_trade_qty → total_buy_qty →
+    /// total_sell_qty → exchange_timestamp → received_at → payload_hash →
+    /// capture_seq`. The docstring pins this as byte-identical-golden; the other
+    /// tests only assert token PRESENCE, so this is the only check of ORDER.
+    #[test]
+    fn test_build_tick_row_for_feed_dhan_emits_legacy_column_order() {
+        let text = build(&dhan_shape_fields(), Feed::Dhan);
+
+        // Both symbols must appear before ANY `column_*` token. The first
+        // `=`-column token is `security_id=`; everything left of it is the
+        // table + symbol region.
+        let first_col = text
+            .find("security_id=")
+            .expect("security_id column present");
+        let symbol_region = &text[..first_col];
+        assert!(
+            symbol_region.contains("segment=") && symbol_region.contains("feed=dhan"),
+            "both symbols (segment, feed) must precede the first column: {text}"
+        );
+
+        // The 16 columns must appear strictly left-to-right in the legacy order.
+        let ordered = [
+            "security_id=",
+            "ltp=",
+            "open=",
+            "high=",
+            "low=",
+            "close=",
+            "volume=",
+            "oi=",
+            "avg_price=",
+            "last_trade_qty=",
+            "total_buy_qty=",
+            "total_sell_qty=",
+            "exchange_timestamp=",
+            "received_at=",
+            "payload_hash=",
+            "capture_seq=",
+        ];
+        let mut cursor = first_col;
+        for token in ordered {
+            let pos = text[cursor..]
+                .find(token)
+                .map(|rel| cursor + rel)
+                .unwrap_or_else(|| panic!("column {token} missing or out of order: {text}"));
+            assert!(
+                pos >= cursor,
+                "column {token} must not precede the prior column (pos={pos}, cursor={cursor}): {text}"
+            );
+            cursor = pos + token.len();
+        }
+
+        // capture_seq is the LAST column, and the designated timestamp `at(ts)`
+        // closes the line — so no column token may follow capture_seq's value.
+        let cap = text.find("capture_seq=").expect("capture_seq present");
+        let tail = &text[cap..];
+        for following in ["ltp=", "open=", "volume=", "oi=", "received_at="] {
+            assert!(
+                !tail.contains(following),
+                "no column ({following}) may appear after capture_seq: {text}"
+            );
+        }
+    }
+
     /// E1 + NULL-not-0: a Groww row OMITS every Dhan-only column entirely
     /// (→ NULL), and never emits a `=0` placeholder for them.
     #[test]
