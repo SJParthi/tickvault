@@ -37,6 +37,7 @@ Usage (auto-launched by the Rust supervisor; no manual run needed):
 import glob
 import json
 import os
+import random
 import sys
 import time
 from datetime import datetime, timezone, timedelta
@@ -73,6 +74,74 @@ CANONICAL_INDEX_SEGMENT = "IDX_I"
 
 # How long to wait between checks for the Rust-built watch file at startup.
 WATCH_POLL_SECS = 5
+
+# Reconnect/auth backoff (charter: exponential backoff, NO retry storms). The old
+# flat 5s re-auth every loop made the sidecar 429 itself (GrowwAPIRateLimitException
+# in the [auth] phase): Groww rate-limits the token endpoint, and a fixed 5s retry
+# is a storm. We now back off exponentially per consecutive failure, capped, with
+# jitter, and back off LONGER on a rate-limit, so a clean token call gets through.
+RECONNECT_BACKOFF_BASE_SECS = 5
+RECONNECT_BACKOFF_CAP_SECS = 300
+# A rate-limit means we are being throttled — wait much longer before retrying so
+# the limiter window clears (a short retry just extends the throttle).
+RATE_LIMIT_BACKOFF_BASE_SECS = 60
+# Multiplicative jitter band (±20%) so concurrent retries don't align into bursts.
+BACKOFF_JITTER_FRAC = 0.2
+
+
+def _is_rate_limit_error(exc) -> bool:
+    """True if `exc` is (or wraps) a Groww rate-limit / HTTP 429.
+
+    Matches by exception class name (GrowwAPIRateLimitException) and by HTTP 429
+    status on the exception or its `.response`, without importing SDK-internal
+    types (they are not part of the public surface we depend on).
+    """
+    if "ratelimit" in type(exc).__name__.replace("_", "").lower():
+        return True
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None) if response is not None else None
+    return status == 429
+
+
+def _retry_after_secs(exc):
+    """Return a server-advised retry-after (seconds) if the exception exposes one.
+
+    Honors a `retry_after` attribute or a `Retry-After` header on `exc.response`
+    (numeric seconds form). Returns None if absent/unparseable.
+    """
+    candidate = getattr(exc, "retry_after", None)
+    if candidate is None:
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", None) if response is not None else None
+        if headers is not None:
+            try:
+                candidate = headers.get("Retry-After") or headers.get("retry-after")
+            except (AttributeError, TypeError):
+                candidate = None
+    if candidate is None:
+        return None
+    try:
+        secs = float(candidate)
+    except (ValueError, TypeError):
+        return None
+    return secs if secs > 0 else None
+
+
+def _backoff_secs(consecutive_failures: int, rate_limited: bool, retry_after) -> float:
+    """Exponential backoff with jitter for the Nth consecutive failure.
+
+    Base 5s (60s when rate-limited), doubling per consecutive failure, capped at
+    300s, ±20% jitter. A server-advised retry-after (if larger) takes precedence.
+    """
+    base = RATE_LIMIT_BACKOFF_BASE_SECS if rate_limited else RECONNECT_BACKOFF_BASE_SECS
+    exp = base * (2 ** max(0, consecutive_failures - 1))
+    delay = min(exp, RECONNECT_BACKOFF_CAP_SECS)
+    if retry_after is not None:
+        delay = max(delay, min(retry_after, RECONNECT_BACKOFF_CAP_SECS))
+    jitter = 1.0 + random.uniform(-BACKOFF_JITTER_FRAC, BACKOFF_JITTER_FRAC)
+    return delay * jitter
 
 
 def _redact(text: str, secrets) -> str:
@@ -306,21 +375,36 @@ def main() -> None:
     # Secrets to mask out of any logged exception detail (never log their values).
     secrets = (api_key, totp_secret)
 
+    # Cached access token, reused across FEED reconnects so a feed-connect /
+    # subscribe / consume failure does NOT re-hit the rate-limited token endpoint.
+    # We re-acquire ONLY when there is no token yet or the previous failure was an
+    # auth-class error (token actually invalid/expired). This, plus the exponential
+    # backoff below, is what stops the self-inflicted [auth] rate-limit storm.
+    access_token = None
+    # Count of consecutive failed cycles — drives the exponential backoff. Reset to
+    # 0 after a fully successful cycle (auth OK + connected + consuming).
+    consecutive_failures = 0
+
     # Reconnect loop — never give up (lock: not a single received tick missed).
     while True:
         # Track which phase fails so the log names auth vs feed-connect vs
         # subscribe vs consume (the cause is otherwise indistinguishable).
         phase = "auth"
         try:
-            totp = pyotp.TOTP(totp_secret).now()
-            access_token = GrowwAPI.get_access_token(api_key=api_key, totp=totp)
-            # Explicit auth-success signal — distinguishes "auth succeeded, feed
-            # connect failed" from "auth failed". Log only the token LENGTH, never
-            # the token value.
-            print(
-                f"groww auth OK: access token acquired (len={len(access_token or '')})",
-                flush=True,
-            )
+            if access_token is None:
+                totp = pyotp.TOTP(totp_secret).now()
+                access_token = GrowwAPI.get_access_token(api_key=api_key, totp=totp)
+                # Explicit auth-success signal — distinguishes "auth succeeded, feed
+                # connect failed" from "auth failed". Log only the token LENGTH,
+                # never the token value.
+                print(
+                    f"groww auth OK: access token acquired (len={len(access_token or '')})",
+                    flush=True,
+                )
+            else:
+                # Reusing the still-valid token from a previous successful auth —
+                # no token-endpoint call, so no rate-limit pressure on reconnect.
+                print("groww auth OK: reusing cached access token", flush=True)
 
             phase = "feed-connect"
             groww = GrowwAPI(access_token)
@@ -343,12 +427,26 @@ def main() -> None:
                 f"— streaming…",
                 flush=True,
             )
+            # A full cycle succeeded up to the blocking consume — reset backoff so
+            # the next genuine disconnect retries quickly, not at the capped delay.
+            consecutive_failures = 0
             phase = "consume"
             feed.consume()  # blocking
         except KeyboardInterrupt:
             print("stopping.", flush=True)
             break
         except Exception as exc:  # noqa: BLE001 - reconnect on any error
+            consecutive_failures += 1
+            rate_limited = _is_rate_limit_error(exc)
+            retry_after = _retry_after_secs(exc)
+            # Drop the cached token only on an auth-class failure (token actually
+            # bad/expired) so the NEXT iteration re-acquires it. A feed-side failure
+            # keeps the token cached → reconnect the feed without re-hitting the
+            # rate-limited token endpoint. A rate-limit in the [auth] phase is NOT
+            # an invalid token — keep any token we already have.
+            if phase == "auth" and not rate_limited:
+                access_token = None
+            delay = _backoff_secs(consecutive_failures, rate_limited, retry_after)
             # Surface the WHY for triage, with every known secret value masked and
             # the detail length-capped: a Groww SDK HTTP error can embed the
             # response body (and thus the access token / api_key) in its
@@ -356,12 +454,14 @@ def main() -> None:
             # (security-review MEDIUM 2026-06-19). `_exception_detail` redacts the
             # api_key + TOTP secret and caps length so the cause is visible without
             # leaking the credentials.
+            rl_note = " [rate-limited — backing off longer]" if rate_limited else ""
             print(
                 f"groww sidecar error [{phase}]: {type(exc).__name__}: "
-                f"{_exception_detail(exc, secrets)} — reconnecting in 5s",
+                f"{_exception_detail(exc, secrets)}{rl_note} — reconnecting in "
+                f"{delay:.0f}s (attempt {consecutive_failures})",
                 flush=True,
             )
-            time.sleep(5)
+            time.sleep(delay)
 
 
 if __name__ == "__main__":
