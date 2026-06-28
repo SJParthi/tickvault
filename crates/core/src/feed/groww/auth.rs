@@ -47,6 +47,63 @@ pub const GROWW_API_VERSION_VALUE: &str = "1.0";
 /// `key_type` for the TOTP auth flow (vs the daily-approval `"approval"` flow).
 pub const GROWW_KEY_TYPE_TOTP: &str = "totp";
 
+/// Typed outcome of the boot/activation Groww auth smoke-check, so the CALLER can
+/// distinguish a credential REJECTION (Groww answered with a non-2xx) from a
+/// TRANSPORT failure (could not reach Groww) from a CREDENTIALS failure (SSM
+/// fetch failed). The activation watcher uses this to set the feed-health
+/// `auth_rejected` flag ONLY on a genuine rejection — never on a network blip.
+///
+/// SECURITY: no variant ever carries the api-key or TOTP. `Rejected.body` is the
+/// Groww response body already passed through [`capture_rest_error_body`]
+/// (JWT/PIN/TOTP/clientId redacted); `Transport`/`Credentials` carry only the
+/// underlying error's `Display`, which our auth path constructs without secrets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrowwAuthSmokeError {
+    /// Groww RECEIVED the request and rejected the credential (HTTP non-2xx).
+    /// `status` is the HTTP status code; `body` is the redacted, truncated
+    /// response body (Groww's own error text, e.g. "Token key not found or
+    /// inactive"). This is the actionable "refresh the api-key" case.
+    Rejected { status: u16, body: String },
+    /// Could not reach Groww (DNS, TLS, timeout, connection reset). Transient —
+    /// the api-key is NOT to blame, so the caller MUST NOT mark auth-rejected.
+    Transport(String),
+    /// SSM credential fetch or HTTP client build failed before any request went
+    /// out. Not a Groww-side rejection.
+    Credentials(String),
+}
+
+impl std::fmt::Display for GrowwAuthSmokeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected { status, body } => {
+                write!(f, "Groww rejected the credential (HTTP {status}): {body}")
+            }
+            Self::Transport(reason) => write!(f, "could not reach Groww: {reason}"),
+            Self::Credentials(reason) => write!(f, "Groww credential setup failed: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for GrowwAuthSmokeError {}
+
+/// Pure classifier: map a non-2xx Groww HTTP status + (already-redacted) response
+/// body to the [`GrowwAuthSmokeError::Rejected`] variant. Kept pure so the
+/// reject-vs-not decision is unit-tested offline. The caller is responsible for
+/// passing a body that has already been through [`capture_rest_error_body`].
+///
+/// Every non-2xx from Groww's access-token endpoint is a credential rejection
+/// (Groww answered — the request reached it; it just refused the key/TOTP), so
+/// this always returns `Rejected`. It exists as a named, tested seam so future
+/// status-specific handling (e.g. distinguishing 429 throttling) has one place
+/// to live.
+#[must_use]
+pub fn classify_groww_auth_failure(status: u16, redacted_body: &str) -> GrowwAuthSmokeError {
+    GrowwAuthSmokeError::Rejected {
+        status,
+        body: redacted_body.to_string(),
+    }
+}
+
 /// Request body for the Groww access-token endpoint (TOTP flow).
 #[derive(Debug, Serialize)]
 struct AccessTokenRequest<'a> {
@@ -89,25 +146,36 @@ fn parse_access_token_response(body: &str) -> Result<SecretString, ApplicationEr
 /// request, and parses the token. The token is returned as a `SecretString` and
 /// is never logged.
 ///
+/// Returns a typed [`GrowwAuthSmokeError`] so the caller can distinguish a
+/// credential REJECTION (Groww answered non-2xx, or a 2xx with an unusable body)
+/// from a TRANSPORT failure (could not reach Groww) from a CREDENTIALS failure
+/// (local TOTP / serialization fault). The HTTP request (URL, Bearer scheme,
+/// `x-api-version`, body) is unchanged — only the error typing changed.
+///
 /// # Errors
 ///
-/// `ApplicationError::AuthenticationFailed` on TOTP failure, network error,
-/// non-2xx status (with the redacted/truncated error body for triage), or an
-/// unparseable/empty token.
+/// [`GrowwAuthSmokeError::Credentials`] on TOTP-generation / serialization
+/// failure, [`GrowwAuthSmokeError::Transport`] on a send failure, and
+/// [`GrowwAuthSmokeError::Rejected`] on a non-2xx response or an unusable token.
 #[instrument(skip_all)]
-// TEST-EXEMPT: network call to the Groww access-token endpoint; the pure request body + response parsing are unit-tested (test_access_token_request_serializes_totp_flow + parse_access_token_response tests).
+// TEST-EXEMPT: network call to the Groww access-token endpoint; the pure request body + response parsing + classify_groww_auth_failure are unit-tested.
 pub async fn obtain_groww_access_token(
     http: &reqwest::Client,
     creds: &GrowwCredentials,
-) -> Result<SecretString, ApplicationError> {
-    let totp_code = generate_totp_code(&creds.totp_secret)?;
+) -> Result<SecretString, GrowwAuthSmokeError> {
+    // TOTP failure is a LOCAL credential problem (bad secret), not a Groww-side
+    // rejection — classify Credentials so the caller does not blame the api-key.
+    let totp_code = generate_totp_code(&creds.totp_secret)
+        .map_err(|err| GrowwAuthSmokeError::Credentials(err.to_string()))?;
 
     let request_body = serde_json::to_string(&AccessTokenRequest {
         key_type: GROWW_KEY_TYPE_TOTP,
         totp: &totp_code,
     })
-    .map_err(|err| ApplicationError::AuthenticationFailed {
-        reason: format!("failed to serialize Groww access-token request: {err}"),
+    .map_err(|err| {
+        GrowwAuthSmokeError::Credentials(format!(
+            "failed to serialize Groww access-token request: {err}"
+        ))
     })?;
 
     let response = http
@@ -118,26 +186,33 @@ pub async fn obtain_groww_access_token(
         .body(request_body)
         .send()
         .await
-        .map_err(|err| ApplicationError::AuthenticationFailed {
-            reason: format!("Groww access-token request failed to send: {err}"),
-        })?;
+        // A send failure = we never reached Groww (DNS/TLS/timeout/reset).
+        .map_err(|err| GrowwAuthSmokeError::Transport(err.to_string()))?;
 
     let status = response.status();
     let body_text = response.text().await.unwrap_or_default();
 
     if !status.is_success() {
-        // Error body is safe to capture (no token on a failure) — redact +
-        // truncate per the same helper the Dhan REST canary uses.
-        return Err(ApplicationError::AuthenticationFailed {
-            reason: format!(
-                "Groww access-token request returned HTTP {}: {}",
-                status.as_u16(),
-                capture_rest_error_body(&body_text)
-            ),
-        });
+        // Groww answered + refused: a credential rejection. The body is safe to
+        // capture (no token on a failure) — redact + truncate per the same helper
+        // the Dhan REST canary uses, then classify.
+        return Err(classify_groww_auth_failure(
+            status.as_u16(),
+            &capture_rest_error_body(&body_text),
+        ));
     }
 
-    parse_access_token_response(&body_text)
+    // 2xx but an unparseable/empty token is still a Groww-side problem with the
+    // response — surface it as a rejection so the operator investigates. SECURITY:
+    // a 2xx body carries the secret token, so we DELIBERATELY do NOT interpolate
+    // the parse error (`serde_json::Error` can carry a quoted body fragment) into
+    // the captured `body` — only a FIXED message. The operator action ("the 2xx
+    // response did not contain a usable token") is identical regardless of the
+    // serde detail; the real diagnosis is the response shape, never the value.
+    parse_access_token_response(&body_text).map_err(|_| GrowwAuthSmokeError::Rejected {
+        status: status.as_u16(),
+        body: "2xx response did not contain a usable token".to_string(),
+    })
 }
 
 /// Boot-time Groww auth smoke-check: fetch credentials from SSM, obtain an
@@ -145,23 +220,37 @@ pub async fn obtain_groww_access_token(
 /// when `feeds.groww_enabled` is true (the live feed connector lands in a later
 /// PR; this verifies auth end-to-end first so the operator gets a clear signal).
 ///
+/// Returns a typed [`GrowwAuthSmokeError`] so the caller (the activation watcher)
+/// can distinguish a genuine credential REJECTION (Groww answered non-2xx) — the
+/// "refresh the SSM api-key" case that should light up the Feed Control page —
+/// from a TRANSPORT blip (must NOT blame the key) and a CREDENTIALS (SSM) failure.
+/// The HTTP request itself (URL, Bearer scheme, `x-api-version`, body) is
+/// unchanged from [`obtain_groww_access_token`]; this is the diagnosis-aware
+/// wrapper.
+///
 /// # Errors
 ///
-/// Propagates `ApplicationError` from SSM fetch, HTTP client build, or the
-/// access-token request.
+/// [`GrowwAuthSmokeError::Credentials`] on SSM fetch / HTTP-client-build failure,
+/// [`GrowwAuthSmokeError::Transport`] on a send failure (could not reach Groww),
+/// [`GrowwAuthSmokeError::Rejected`] on a non-2xx Groww response.
 #[instrument(skip_all)]
-// TEST-EXEMPT: boot orchestration (SSM fetch + HTTP client build + live network token request); no live SSM/Groww endpoint in unit tests.
-pub async fn run_groww_auth_smoke_check(request_timeout_ms: u64) -> Result<(), ApplicationError> {
-    let creds = fetch_groww_credentials().await?;
+// TEST-EXEMPT: boot orchestration (SSM fetch + HTTP client build + live network token request); the pure classifier classify_groww_auth_failure + the request/response parsing are unit-tested.
+pub async fn run_groww_auth_smoke_check(
+    request_timeout_ms: u64,
+) -> Result<(), GrowwAuthSmokeError> {
+    let creds = fetch_groww_credentials()
+        .await
+        .map_err(|err| GrowwAuthSmokeError::Credentials(err.to_string()))?;
 
     let http = reqwest::Client::builder()
         .timeout(Duration::from_millis(request_timeout_ms))
         .build()
-        .map_err(|err| ApplicationError::AuthenticationFailed {
-            reason: format!("Groww HTTP client creation failed: {err}"),
+        .map_err(|err| {
+            GrowwAuthSmokeError::Credentials(format!("Groww HTTP client creation failed: {err}"))
         })?;
 
-    let _token = obtain_groww_access_token(&http, &creds).await?;
+    // Single source of truth for the request + outcome classification.
+    obtain_groww_access_token(&http, &creds).await?;
 
     info!(
         "Groww access-token auth OK — credentials valid; the Groww live-feed \
@@ -234,5 +323,57 @@ mod tests {
     fn test_parse_access_token_response_rejects_garbage() {
         assert!(parse_access_token_response("not json at all").is_err());
         assert!(parse_access_token_response("").is_err());
+    }
+
+    #[test]
+    fn test_classify_groww_auth_failure_is_rejected_with_status_and_body() {
+        // A non-2xx Groww response (the body is already redacted by the caller)
+        // maps to the actionable Rejected variant carrying the verbatim status.
+        let err = classify_groww_auth_failure(400, "Token key not found or inactive");
+        match err {
+            GrowwAuthSmokeError::Rejected { status, body } => {
+                assert_eq!(status, 400);
+                assert_eq!(body, "Token key not found or inactive");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_groww_auth_failure_preserves_any_status() {
+        for status in [401u16, 403, 429, 500] {
+            assert!(matches!(
+                classify_groww_auth_failure(status, "x"),
+                GrowwAuthSmokeError::Rejected { status: s, .. } if s == status
+            ));
+        }
+    }
+
+    #[test]
+    fn test_groww_auth_smoke_error_display_never_panics_and_carries_status() {
+        // Display is what the activation watcher logs — confirm each variant
+        // renders and the Rejected variant surfaces the status for triage.
+        let rejected = GrowwAuthSmokeError::Rejected {
+            status: 400,
+            body: "redacted body".to_string(),
+        };
+        let s = rejected.to_string();
+        assert!(s.contains("400"), "display: {s}");
+        assert!(s.contains("redacted body"), "display: {s}");
+
+        let transport = GrowwAuthSmokeError::Transport("dns failure".to_string());
+        assert!(transport.to_string().contains("could not reach Groww"));
+
+        let creds = GrowwAuthSmokeError::Credentials("ssm down".to_string());
+        assert!(creds.to_string().contains("credential setup failed"));
+    }
+
+    #[test]
+    fn test_classify_distinct_from_transport_and_credentials() {
+        // The three outcomes are distinct so the caller can act differently:
+        // only Rejected should mark the feed auth-rejected.
+        let rejected = classify_groww_auth_failure(400, "x");
+        assert_ne!(rejected, GrowwAuthSmokeError::Transport("x".to_string()));
+        assert_ne!(rejected, GrowwAuthSmokeError::Credentials("x".to_string()));
     }
 }

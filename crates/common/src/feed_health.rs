@@ -86,6 +86,13 @@ pub struct FeedHealthInput {
     pub drops_total: u64,
     /// Whether the market is currently open (silence is only a fault when open).
     pub market_open: bool,
+    /// Whether the feed's auth credential was REJECTED by the provider (e.g. Groww
+    /// answered HTTP 400 "Token key not found or inactive"). A confirmed rejection
+    /// is a `Down` with an actionable "refresh the SSM api-key" message — it wins
+    /// over the generic disconnected/no-ticks reasons but NOT over `Disabled`. Set
+    /// by the feed's activation path ONLY on a genuine provider rejection (never on
+    /// a transient network blip), and cleared on a successful auth.
+    pub auth_rejected: bool,
     /// Whether this feed's health signals are instrumented — `true` once any lane
     /// has reported a tick/candle/drop/connect for it. `false` → the lane's
     /// record-sites aren't wired yet, so the verdict is `Unknown`, NOT a false
@@ -136,6 +143,17 @@ fn classify(i: FeedHealthInput) -> (FeedHealthVerdict, &'static str) {
     if !i.instrumented {
         return (Unknown, "feed health signals not instrumented yet");
     }
+    // The provider REJECTED our auth credential (Groww answered with a non-2xx,
+    // e.g. "Token key not found or inactive"). This is a confirmed, actionable
+    // failure — it must win over the generic disconnected / no-ticks reasons so
+    // the operator sees WHAT to fix, not just a bare Down. It does NOT win over
+    // Disabled (a switched-off feed is intentional, handled above) and is placed
+    // after the not-started / not-instrumented states so a feed that never came
+    // up does not show a misleading auth-rejected. The message is a fixed
+    // `&'static str` (security contract — no runtime/error data interpolated).
+    if i.auth_rejected {
+        return (Down, "auth rejected — refresh the Groww SSM api-key");
+    }
     // Ticks being dropped is a fault at ANY time — the cumulative drop count
     // reflects a real problem that happened today (checked before the
     // market-hours gate so a post-close report still surfaces today's drops).
@@ -182,6 +200,9 @@ pub struct FeedHealthRegistry {
     candles_total: [AtomicU64; Feed::COUNT],
     drops_total: [AtomicU64; Feed::COUNT],
     connected: [AtomicBool; Feed::COUNT],
+    /// `true` when the provider rejected this feed's auth credential. Set on a
+    /// confirmed rejection, cleared on a successful auth.
+    auth_rejected: [AtomicBool; Feed::COUNT],
     /// Set `true` the first time ANY signal is recorded for a feed — so an
     /// un-wired feed reports `Unknown`, never a false `Down`.
     instrumented: [AtomicBool; Feed::COUNT],
@@ -202,6 +223,7 @@ impl FeedHealthRegistry {
             candles_total: std::array::from_fn(|_| AtomicU64::new(0)),
             drops_total: std::array::from_fn(|_| AtomicU64::new(0)),
             connected: std::array::from_fn(|_| AtomicBool::new(false)),
+            auth_rejected: std::array::from_fn(|_| AtomicBool::new(false)),
             instrumented: std::array::from_fn(|_| AtomicBool::new(false)),
         }
     }
@@ -241,6 +263,16 @@ impl FeedHealthRegistry {
         self.mark_instrumented(i);
     }
 
+    /// Set `feed`'s auth-rejected state. Pass `true` on a confirmed provider
+    /// credential rejection (e.g. Groww HTTP 400) and `false` on a successful
+    /// auth. Marks the feed instrumented so a rejection surfaces as the
+    /// actionable `Down` ("refresh the api-key"), never `Unknown`. O(1).
+    pub fn set_auth_rejected(&self, feed: Feed, rejected: bool) {
+        let i = feed.index();
+        self.auth_rejected[i].store(rejected, Ordering::Relaxed);
+        self.mark_instrumented(i);
+    }
+
     /// Build `feed`'s truthful health report from the live signals + the
     /// caller-supplied operator state (`enabled`/`lane_running` from
     /// `FeedRuntimeState`) and the clock/market context. Pure read, O(1).
@@ -270,6 +302,7 @@ impl FeedHealthRegistry {
             candles_total: self.candles_total[i].load(Ordering::Relaxed),
             drops_total: self.drops_total[i].load(Ordering::Relaxed),
             market_open,
+            auth_rejected: self.auth_rejected[i].load(Ordering::Relaxed),
             instrumented: self.instrumented[i].load(Ordering::Relaxed),
         };
         evaluate_feed_health(feed, input)
@@ -290,6 +323,7 @@ mod tests {
             candles_total: 10,
             drops_total: 0,
             market_open: true,
+            auth_rejected: false,
             instrumented: true,
         }
     }
@@ -453,6 +487,68 @@ mod tests {
     }
 
     #[test]
+    fn test_auth_rejected_is_down_with_refresh_message() {
+        // A confirmed provider rejection surfaces as an actionable Down naming
+        // the fix — not a bare "disconnected".
+        let r = evaluate_feed_health(
+            Feed::Groww,
+            FeedHealthInput {
+                auth_rejected: true,
+                ..base()
+            },
+        );
+        assert_eq!(r.verdict, FeedHealthVerdict::Down);
+        assert_eq!(r.reason, "auth rejected — refresh the Groww SSM api-key");
+    }
+
+    #[test]
+    fn test_auth_rejected_false_does_not_trigger() {
+        // The default (no rejection) must NOT show the auth-rejected message —
+        // a healthy feed stays Ok.
+        let r = evaluate_feed_health(
+            Feed::Groww,
+            FeedHealthInput {
+                auth_rejected: false,
+                ..base()
+            },
+        );
+        assert_eq!(r.verdict, FeedHealthVerdict::Ok);
+        assert_ne!(r.reason, "auth rejected — refresh the Groww SSM api-key");
+    }
+
+    #[test]
+    fn test_disabled_wins_over_auth_rejected() {
+        // A switched-off feed is intentional even if a stale auth-rejected flag
+        // lingers — show the calm Disabled, never the scary auth-rejected Down.
+        let r = evaluate_feed_health(
+            Feed::Groww,
+            FeedHealthInput {
+                enabled: false,
+                auth_rejected: true,
+                ..base()
+            },
+        );
+        assert_eq!(r.verdict, FeedHealthVerdict::Disabled);
+    }
+
+    #[test]
+    fn test_auth_rejected_wins_over_disconnected_during_market() {
+        // During market hours, a confirmed auth-rejection must name the fix
+        // rather than the generic "disconnected — reconnecting".
+        let r = evaluate_feed_health(
+            Feed::Groww,
+            FeedHealthInput {
+                auth_rejected: true,
+                connected: false,
+                last_tick_age_secs: None,
+                ..base()
+            },
+        );
+        assert_eq!(r.verdict, FeedHealthVerdict::Down);
+        assert_eq!(r.reason, "auth rejected — refresh the Groww SSM api-key");
+    }
+
+    #[test]
     fn test_verdict_labels_are_stable() {
         assert_eq!(FeedHealthVerdict::Ok.as_str(), "ok");
         assert_eq!(FeedHealthVerdict::Degraded.as_str(), "degraded");
@@ -462,7 +558,7 @@ mod tests {
 
     // ── FeedHealthRegistry (the live-signal store the lanes update) ──
     // test coverage (one line for the pub-fn-test-guard test.*<fn> heuristic): the
-    // tests below exercise record_tick record_candle record_drops set_connected snapshot new
+    // tests below exercise record_tick record_candle record_drops set_connected set_auth_rejected snapshot new
     const T0: i64 = 1_780_000_000_000_000_000;
 
     #[test]
@@ -540,6 +636,35 @@ mod tests {
         reg.record_tick(Feed::Dhan, T0);
         let post = reg.snapshot(Feed::Dhan, true, true, true, T0 + 2 * 1_000_000_000);
         assert_eq!(post.verdict, FeedHealthVerdict::Ok);
+    }
+
+    #[test]
+    fn test_registry_set_auth_rejected_round_trip_and_clear() {
+        let reg = FeedHealthRegistry::new();
+        reg.set_connected(Feed::Groww, true);
+        reg.record_tick(Feed::Groww, T0);
+        // Provider rejected the credential → actionable Down even with a fresh tick.
+        reg.set_auth_rejected(Feed::Groww, true);
+        let r = reg.snapshot(Feed::Groww, true, true, true, T0 + 1_000_000_000);
+        assert!(r.input.auth_rejected);
+        assert_eq!(r.verdict, FeedHealthVerdict::Down);
+        assert_eq!(r.reason, "auth rejected — refresh the Groww SSM api-key");
+        // Auth recovers → flag cleared → resolves back to a normal verdict.
+        reg.set_auth_rejected(Feed::Groww, false);
+        let r2 = reg.snapshot(Feed::Groww, true, true, true, T0 + 2 * 1_000_000_000);
+        assert!(!r2.input.auth_rejected);
+        assert_eq!(r2.verdict, FeedHealthVerdict::Ok);
+    }
+
+    #[test]
+    fn test_registry_auth_rejected_marks_instrumented() {
+        // A confirmed rejection is a real signal — it must instrument the slot so
+        // the page shows the actionable Down, not the Unknown placeholder.
+        let reg = FeedHealthRegistry::new();
+        reg.set_auth_rejected(Feed::Groww, true);
+        let r = reg.snapshot(Feed::Groww, true, true, true, T0);
+        assert!(r.input.instrumented);
+        assert_eq!(r.verdict, FeedHealthVerdict::Down);
     }
 
     #[test]

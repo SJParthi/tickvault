@@ -4,10 +4,12 @@
 //! and Telegram tokens from real AWS SSM (ap-south-1). Same code path
 //! in dev and prod — secrets are managed via AWS Console.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use aws_config::Region;
 use aws_sdk_ssm::Client as SsmClient;
 use secrecy::SecretString;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use tickvault_common::constants::{
     DEFAULT_SSM_ENVIRONMENT, DHAN_CLIENT_ID_SECRET, DHAN_CLIENT_SECRET_SECRET,
@@ -26,7 +28,23 @@ use super::types::{DhanCredentials, GrowwCredentials, QuestDbCredentials, Telegr
 /// Constructs the full SSM parameter path.
 ///
 /// Format: `/tickvault/<environment>/<service>/<secret_name>`
-pub(crate) fn build_ssm_path(environment: &str, service: &str, secret_name: &str) -> String {
+///
+/// `pub` so boot/activation diagnostics (e.g. the Groww auth-failure hint) can
+/// name the EXACT path read — never the value — instead of a `<env>` placeholder.
+pub fn build_ssm_path(environment: &str, service: &str, secret_name: &str) -> String {
+    if environment.is_empty() || service.is_empty() || secret_name.is_empty() {
+        // Empty components yield a malformed path (`/tickvault//groww/...`) that
+        // would 404 on every SSM read. We do NOT panic/debug_assert — an existing
+        // test calls this with empty strings — but we WARN so a real boot-time
+        // misconfig is visible in the log. The returned string is unchanged.
+        warn!(
+            environment_empty = environment.is_empty(),
+            service_empty = service.is_empty(),
+            secret_name_empty = secret_name.is_empty(),
+            "build_ssm_path called with an empty path component — the resulting SSM \
+             path is malformed and will not resolve"
+        );
+    }
     format!(
         "{}/{}/{}/{}",
         SSM_SECRET_BASE_PATH, environment, service, secret_name
@@ -68,7 +86,21 @@ pub fn resolve_environment() -> Result<String, ApplicationError> {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
         })
-        .unwrap_or_else(|| DEFAULT_SSM_ENVIRONMENT.to_string());
+        .unwrap_or_else(|| {
+            // Neither var was set / non-empty — we fall back to the compiled
+            // default. Warn ONCE per process so the operator knows every secret
+            // is being read from `/tickvault/<default>/*` (e.g. on a box that
+            // forgot to export TV_ENVIRONMENT). The returned value is unchanged.
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                warn!(
+                    default_env = DEFAULT_SSM_ENVIRONMENT,
+                    "TV_ENVIRONMENT/ENVIRONMENT unset — defaulting SSM environment; \
+                     secrets read from /tickvault/<default>/*"
+                );
+            }
+            DEFAULT_SSM_ENVIRONMENT.to_string()
+        });
     validate_environment(&env)
 }
 
