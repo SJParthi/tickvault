@@ -39,7 +39,7 @@ use tracing::{error, info, warn};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_storage::tick_conservation_audit_persistence::{
-    ConservationOutcome, TickConservationAuditWriter, TickConservationRow,
+    CONSERVATION_FEED_DHAN, ConservationOutcome, TickConservationAuditWriter, TickConservationRow,
     ensure_tick_conservation_audit_table,
 };
 use tickvault_storage::ws_frame_spill::{WalDayFrameCounts, count_frames_for_ist_day};
@@ -419,6 +419,9 @@ pub async fn run_tick_conservation_audit(
         outcome_residual,
         partial_coverage,
         outcome,
+        // operator override 2026-06-28: feed in-key. The 15:40 IST conservation
+        // audit reconciles the Dhan stores today.
+        feed: CONSERVATION_FEED_DHAN,
     };
 
     // 5. Operator signal (audit Rule 5: a leak is error! with code).

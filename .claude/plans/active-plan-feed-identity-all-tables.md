@@ -1,6 +1,35 @@
+> **⚠ OVERRIDE 2026-06-28 — `feed` IN-KEY ON EVERY PERSISTED TABLE (SUPERSEDES the 2026-06-23 "masters = label-only" decision below).**
+>
+> Operator override 2026-06-28: every persisted QuestDB table's DEDUP UPSERT key
+> MUST include `feed`, accepting the per-feed-duplicate-universe consequence
+> (each feed gets its OWN row for the same logical key on the previously-shared
+> master/audit tables). This REVERSES the 2026-06-23 "Label-only, NOT in key"
+> verified decision for the 5 master/audit tables.
+>
+> **Implemented (PR `claude/feed-everywhere-in-key`):** `feed` moved INTO the
+> DEDUP key + CREATE DDL + writer + brownfield self-heal
+> (ALTER ADD COLUMN → backfill NULL→'dhan' → DEDUP ENABLE) for:
+> `instrument_lifecycle`, `instrument_lifecycle_audit`, `instrument_fetch_audit`,
+> `index_constituency`, `tick_conservation_audit`. (`cross_verify_1m_audit` has no
+> live storage module; `ws_event_audit` + `feed_parity_1m_audit` were already
+> feed-keyed.)
+>
+> **Honest envelope:** this is FORWARD-COMPATIBLE PLUMBING ONLY — all writers
+> stamp `'dhan'` today; no Groww master-writer exists, so no duplicate rows
+> appear until that SEPARATE follow-up lands. The brownfield NULL→'dhan' backfill
+> closes the migration overlap window. Ratchet: the NEW
+> `every_persisted_table_dedup_key_must_include_feed` meta-guard (empty
+> allowlist) in `dedup_segment_meta_guard.rs` fails the build if any persisted
+> key drops `feed`.
+>
+> The 2026-06-23 contents below are RETAINED for audit only; their "Label-only"
+> verdict for the master/audit tables is NO LONGER the effective contract.
+
+---
+
 # Implementation Plan: C — per-feed `feed` identity across all tables
 
-**Status:** VERIFIED (operator AskUserQuestion 2026-06-23: master tables = "Label-only, NOT in key")
+**Status:** VERIFIED (operator AskUserQuestion 2026-06-23: master tables = "Label-only, NOT in key") — SUPERSEDED by the 2026-06-28 OVERRIDE above for the 5 master/audit tables.
 **Date:** 2026-06-23
 **Branch:** `claude/feed-identity-all-tables` (off origin/main).
 **Operator choice:** AskUserQuestion 2026-06-23 → "All tables, in DEDUP keys (full)".

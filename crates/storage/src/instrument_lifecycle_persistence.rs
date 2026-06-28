@@ -105,6 +105,13 @@ use tickvault_common::sanitize::{sanitize_audit_string, sanitize_ilp_string, san
 /// by the other `*_persistence` modules in the storage crate.
 const QUESTDB_EXEC_TIMEOUT_SECS: u64 = 10;
 
+/// Broker-source label stamped on EVERY row this module writes today
+/// (operator override 2026-06-28 — `feed` is now part of the DEDUP key on
+/// every persisted table). The lifecycle master is built ONLY by the Dhan
+/// daily reconciler today; a future Groww master-writer would stamp its own
+/// label. Replay-stable `&'static str` from the canonical `Feed` enum.
+pub const LIFECYCLE_FEED_DHAN: &str = tickvault_common::feed::Feed::Dhan.as_str();
+
 /// Wire-format table name for the current-state lifecycle table.
 /// Stable across releases — operators, the reconciler, and the
 /// `partition_manager` S3 archive job depend on the exact string.
@@ -119,7 +126,7 @@ pub const QUESTDB_TABLE_INSTRUMENT_LIFECYCLE_AUDIT: &str = "instrument_lifecycle
 /// designated-timestamp-in-DEDUP requirement; `security_id` +
 /// `exchange_segment` are the I-P1-11 composite business key (Dhan
 /// reuses `security_id` across segments, so segment is mandatory).
-pub const DEDUP_KEY_INSTRUMENT_LIFECYCLE: &str = "ts, security_id, exchange_segment";
+pub const DEDUP_KEY_INSTRUMENT_LIFECYCLE: &str = "ts, security_id, exchange_segment, feed";
 
 /// DEDUP key for `instrument_lifecycle_audit` — append one row per
 /// transition.
@@ -134,7 +141,7 @@ pub const DEDUP_KEY_INSTRUMENT_LIFECYCLE: &str = "ts, security_id, exchange_segm
 // (which matches `const … : &str = "…"` on a single line) detects it and
 // verifies both the I-P1-11 segment-pairing and the designated-`ts` token.
 #[rustfmt::skip]
-pub const DEDUP_KEY_INSTRUMENT_LIFECYCLE_AUDIT: &str = "ts, trading_date_ist, security_id, exchange_segment, transition_kind";
+pub const DEDUP_KEY_INSTRUMENT_LIFECYCLE_AUDIT: &str = "ts, trading_date_ist, security_id, exchange_segment, transition_kind, feed";
 
 /// The pinned constant designated timestamp (epoch 0) for the
 /// UPSERT-in-place `instrument_lifecycle` table. See module docs
@@ -290,12 +297,12 @@ impl TransitionKind {
 
 /// Column list shared by the DDL and the INSERT helper, in exact schema
 /// order. One constant so the writer and the table definition cannot
-/// drift. 24 columns.
+/// drift. 25 columns (24 + `feed`).
 const LIFECYCLE_INSERT_COLUMN_LIST: &str = "ts, last_update_ts, security_id, exchange_segment, \
      exchange_id, instrument_type, symbol_name, display_name, underlying_security_id, \
      underlying_symbol, lot_size, tick_size, expiry_date, strike_price, option_type, \
      lifecycle_state, lifecycle_state_locked, first_seen_date, last_seen_date, last_active_date, \
-     expired_date, prev_symbol_chain, source_csv_sha256, dry_run";
+     expired_date, prev_symbol_chain, source_csv_sha256, dry_run, feed";
 
 /// One `instrument_lifecycle` row in the shape the writer accepts.
 ///
@@ -350,6 +357,12 @@ pub struct InstrumentLifecycleRow<'a> {
     /// §27 — `true` for `--dry-run-universe` rows; the reconciler reads
     /// only `WHERE dry_run = false` for the next-day delta.
     pub dry_run: bool,
+    /// Broker-source label (`dhan`/`groww`). Part of the DEDUP key
+    /// (operator override 2026-06-28) so a future Groww master-writer's row
+    /// for the same `(security_id, exchange_segment)` is a DISTINCT row,
+    /// never an upsert over the Dhan one. Always non-empty (stamped
+    /// [`LIFECYCLE_FEED_DHAN`] today).
+    pub feed: &'a str,
 }
 
 /// Creates the `instrument_lifecycle` table if absent. Idempotent.
@@ -395,7 +408,8 @@ pub async fn ensure_instrument_lifecycle_table(questdb_config: &QuestDbConfig) {
             expired_date TIMESTAMP, \
             prev_symbol_chain STRING, \
             source_csv_sha256 SYMBOL, \
-            dry_run BOOLEAN\
+            dry_run BOOLEAN, \
+            feed SYMBOL\
         ) timestamp(ts) PARTITION BY DAY WAL \
         DEDUP UPSERT KEYS({DEDUP_KEY_INSTRUMENT_LIFECYCLE});"
     );
@@ -424,6 +438,62 @@ pub async fn ensure_instrument_lifecycle_table(questdb_config: &QuestDbConfig) {
                 ?err,
                 "DDL request failed"
             );
+        }
+    }
+
+    // ── Brownfield feed-in-key self-heal (operator override 2026-06-28). ──
+    // Mirrors the proven `shadow_persistence` / `prev_day_ohlcv` migration,
+    // IN THIS ORDER: ADD COLUMN → backfill NULL→'dhan' → re-enable DEDUP with
+    // `feed` in the key. The CREATE above already ships the new column+key on
+    // greenfield; these run for tables created before this change. The backfill
+    // MUST precede the DEDUP-ENABLE so a new `feed='dhan'` row upserts over a
+    // legacy NULL-feed row instead of duplicating it (NULL != 'dhan').
+    run_lifecycle_feed_self_heal(
+        &client,
+        &base_url,
+        QUESTDB_TABLE_INSTRUMENT_LIFECYCLE,
+        DEDUP_KEY_INSTRUMENT_LIFECYCLE,
+    )
+    .await;
+}
+
+/// Run the additive, idempotent feed-in-key migration on one lifecycle table:
+/// `ALTER ADD COLUMN IF NOT EXISTS feed SYMBOL` → `UPDATE … SET feed='dhan'
+/// WHERE feed IS NULL` → `DEDUP ENABLE UPSERT KEYS(<key incl feed>)`. Each
+/// step logs (does not return Err) so a transient hiccup matches the CREATE
+/// DDL's error handling; never drops the table (SEBI retention).
+// TEST-EXEMPT: live-QuestDB DDL runner; the DDL strings are pinned by the
+// feed-in-key ratchet tests + the dedup_segment_meta_guard.
+async fn run_lifecycle_feed_self_heal(
+    client: &Client,
+    base_url: &str,
+    table: &str,
+    dedup_key: &str,
+) {
+    let steps = [
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS feed SYMBOL;"),
+        format!("UPDATE {table} SET feed = '{LIFECYCLE_FEED_DHAN}' WHERE feed IS NULL;"),
+        format!("ALTER TABLE {table} DEDUP ENABLE UPSERT KEYS({dedup_key});"),
+    ];
+    for ddl in &steps {
+        match client
+            .get(base_url)
+            .query(&[("query", ddl.as_str())])
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) => {
+                warn!(table, status = %resp.status(), ddl = ddl.as_str(), "feed self-heal non-2xx");
+            }
+            Err(err) => {
+                error!(
+                    table,
+                    ?err,
+                    ddl = ddl.as_str(),
+                    "feed self-heal request failed"
+                );
+            }
         }
     }
 }
@@ -471,6 +541,7 @@ fn format_lifecycle_row_tuple(row: &InstrumentLifecycleRow<'_>) -> String {
     let last_active_micros = row.last_active_date_nanos / 1_000;
     let expired_micros = row.expired_date_nanos / 1_000;
     let dry_run = row.dry_run;
+    let feed = sanitize_audit_string(row.feed);
     format!(
         "({ts_micros}, {last_update_micros}, {security_id}, '{exchange_segment}', \
           '{exchange_id}', '{instrument_type}', '{symbol_name}', '{display_name}', \
@@ -478,7 +549,7 @@ fn format_lifecycle_row_tuple(row: &InstrumentLifecycleRow<'_>) -> String {
           {expiry_micros}, {strike_price}, '{option_type}', '{lifecycle_state}', \
           {lifecycle_state_locked}, {first_seen_micros}, {last_seen_micros}, \
           {last_active_micros}, {expired_micros}, '{prev_symbol_chain}', \
-          '{source_csv_sha256}', {dry_run})"
+          '{source_csv_sha256}', {dry_run}, '{feed}')"
     )
 }
 
@@ -565,6 +636,10 @@ fn build_lifecycle_ilp_row(
     )?;
     buffer.symbol("symbol_name", sanitize_ilp_symbol(row.symbol_name).as_ref())?;
     buffer.symbol("lifecycle_state", row.lifecycle_state.as_str())?;
+    // `feed` is a DEDUP-key SYMBOL — ALWAYS written (never skipped, since a
+    // NULL would let two feeds collapse). Stamped 'dhan' by the only writer
+    // today (operator override 2026-06-28).
+    buffer.symbol("feed", sanitize_ilp_symbol(row.feed).as_ref())?;
     buffer.symbol(
         "source_csv_sha256",
         sanitize_ilp_symbol(row.source_csv_sha256).as_ref(),
@@ -666,11 +741,11 @@ pub async fn append_instrument_lifecycle_rows(
 // ============================================================================
 
 /// Column list shared by the audit DDL + INSERT helper, in exact schema
-/// order. One constant so writer + table can't drift. 16 columns.
+/// order. One constant so writer + table can't drift. 17 columns (16 + `feed`).
 const LIFECYCLE_AUDIT_INSERT_COLUMN_LIST: &str = "ts, trading_date_ist, security_id, \
      exchange_segment, from_state, to_state, transition_kind, field_deltas, source_csv_sha256, \
      operator_note, lifecycle_state_after, lot_size_after, tick_size_after, expiry_date_after, \
-     symbol_name_after, dry_run";
+     symbol_name_after, dry_run, feed";
 
 /// One `instrument_lifecycle_audit` row — the forensic record of a single
 /// state transition (§6 + §25 point-in-time snapshot columns + §27).
@@ -711,6 +786,9 @@ pub struct InstrumentLifecycleAuditRow<'a> {
     pub symbol_name_after: &'a str,
     /// §27 — dry-run isolation.
     pub dry_run: bool,
+    /// Broker-source label (`dhan`/`groww`). Part of the DEDUP key (operator
+    /// override 2026-06-28). Always non-empty (stamped [`LIFECYCLE_FEED_DHAN`]).
+    pub feed: &'a str,
 }
 
 /// Creates the `instrument_lifecycle_audit` table if absent. Idempotent.
@@ -747,7 +825,8 @@ pub async fn ensure_instrument_lifecycle_audit_table(questdb_config: &QuestDbCon
             tick_size_after DOUBLE, \
             expiry_date_after TIMESTAMP, \
             symbol_name_after SYMBOL, \
-            dry_run BOOLEAN\
+            dry_run BOOLEAN, \
+            feed SYMBOL\
         ) timestamp(ts) PARTITION BY DAY WAL \
         DEDUP UPSERT KEYS({DEDUP_KEY_INSTRUMENT_LIFECYCLE_AUDIT});"
     );
@@ -778,6 +857,16 @@ pub async fn ensure_instrument_lifecycle_audit_table(questdb_config: &QuestDbCon
             );
         }
     }
+
+    // Brownfield feed-in-key self-heal (operator override 2026-06-28) — same
+    // ADD COLUMN → backfill → DEDUP-ENABLE order as the lifecycle table.
+    run_lifecycle_feed_self_heal(
+        &client,
+        &base_url,
+        QUESTDB_TABLE_INSTRUMENT_LIFECYCLE_AUDIT,
+        DEDUP_KEY_INSTRUMENT_LIFECYCLE_AUDIT,
+    )
+    .await;
 }
 
 /// Formats one audit row as a QuestDB `VALUES (...)` tuple in schema order.
@@ -802,12 +891,13 @@ fn format_lifecycle_audit_row_tuple(row: &InstrumentLifecycleAuditRow<'_>) -> St
     let expiry_after_micros = row.expiry_date_after_nanos / 1_000;
     let symbol_name_after = sanitize_audit_string(row.symbol_name_after);
     let dry_run = row.dry_run;
+    let feed = sanitize_audit_string(row.feed);
     format!(
         "({ts_micros}, {trading_date_micros}, {security_id}, '{exchange_segment}', \
           '{from_state}', '{to_state}', '{transition_kind}', '{field_deltas}', \
           '{source_csv_sha256}', '{operator_note}', '{lifecycle_state_after}', \
           {lot_size_after}, {tick_size_after}, {expiry_after_micros}, \
-          '{symbol_name_after}', {dry_run})"
+          '{symbol_name_after}', {dry_run}, '{feed}')"
     )
 }
 
@@ -874,6 +964,8 @@ fn build_lifecycle_audit_ilp_row(
     )?;
     buffer.symbol("to_state", row.to_state.as_str())?;
     buffer.symbol("transition_kind", row.transition_kind.as_str())?;
+    // `feed` is a DEDUP-key SYMBOL — ALWAYS written (operator override 2026-06-28).
+    buffer.symbol("feed", sanitize_ilp_symbol(row.feed).as_ref())?;
     buffer.symbol(
         "source_csv_sha256",
         sanitize_ilp_symbol(row.source_csv_sha256).as_ref(),
@@ -1127,10 +1219,17 @@ mod tests {
             DEDUP_KEY_INSTRUMENT_LIFECYCLE.contains("exchange_segment"),
             "I-P1-11: security_id must be paired with exchange_segment"
         );
+        assert!(
+            DEDUP_KEY_INSTRUMENT_LIFECYCLE
+                .split([',', ' '])
+                .map(str::trim)
+                .any(|t| t == "feed"),
+            "operator override 2026-06-28: feed must be in the DEDUP key"
+        );
         assert_eq!(
             DEDUP_KEY_INSTRUMENT_LIFECYCLE.matches(',').count() + 1,
-            3,
-            "lifecycle DEDUP key has exactly 3 columns"
+            4,
+            "lifecycle DEDUP key has exactly 4 columns (ts, security_id, exchange_segment, feed)"
         );
     }
 
@@ -1149,10 +1248,17 @@ mod tests {
             "without transition_kind two same-day transitions for one \
              instrument would collapse to a single row (§6)"
         );
+        assert!(
+            DEDUP_KEY_INSTRUMENT_LIFECYCLE_AUDIT
+                .split([',', ' '])
+                .map(str::trim)
+                .any(|t| t == "feed"),
+            "operator override 2026-06-28: feed must be in the audit DEDUP key"
+        );
         assert_eq!(
             DEDUP_KEY_INSTRUMENT_LIFECYCLE_AUDIT.matches(',').count() + 1,
-            5,
-            "audit DEDUP key has exactly 5 columns"
+            6,
+            "audit DEDUP key has exactly 6 columns (… + feed)"
         );
     }
 
@@ -1339,16 +1445,54 @@ mod tests {
             prev_symbol_chain: "",
             source_csv_sha256: "deadbeef",
             dry_run: false,
+            feed: LIFECYCLE_FEED_DHAN,
         }
     }
 
     #[test]
-    fn test_lifecycle_insert_column_list_has_24_columns() {
+    fn test_lifecycle_insert_column_list_has_25_columns() {
         assert_eq!(
             LIFECYCLE_INSERT_COLUMN_LIST.matches(',').count() + 1,
-            24,
-            "INSERT column list must name all 24 schema columns"
+            25,
+            "INSERT column list must name all 25 schema columns (24 + feed)"
         );
+    }
+
+    #[test]
+    fn test_lifecycle_row_tuple_stamps_feed() {
+        // operator override 2026-06-28: every persisted row carries feed in-key.
+        let tuple = format_lifecycle_row_tuple(&sample_index_row());
+        assert!(
+            tuple.ends_with(", 'dhan')"),
+            "lifecycle tuple must end with the feed label: {tuple}"
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_ilp_row_writes_feed_symbol() {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        build_lifecycle_ilp_row(&mut buffer, &sample_index_row()).expect("build");
+        let line = String::from_utf8(buffer.as_bytes().to_vec()).expect("utf8");
+        assert!(
+            line.contains(",feed=dhan"),
+            "ILP must write feed tag: {line}"
+        );
+    }
+
+    #[test]
+    fn test_two_feeds_same_instrument_are_distinct_rows() {
+        // Regression: a Dhan and a (hypothetical) Groww row for the same
+        // (security_id, exchange_segment) must NOT collapse — feed makes the
+        // DEDUP key distinct. We assert the two formatted tuples differ ONLY
+        // in the feed label (so both upsert to different keys).
+        let dhan = sample_index_row();
+        let mut groww = sample_index_row();
+        groww.feed = "groww";
+        let t_dhan = format_lifecycle_row_tuple(&dhan);
+        let t_groww = format_lifecycle_row_tuple(&groww);
+        assert_ne!(t_dhan, t_groww, "feed must distinguish the two rows");
+        assert!(t_dhan.ends_with("'dhan')"));
+        assert!(t_groww.ends_with("'groww')"));
     }
 
     #[test]
@@ -1369,7 +1513,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lifecycle_ddl_contains_all_24_columns() {
+    fn test_lifecycle_ddl_contains_all_25_columns() {
         let source = include_str!("instrument_lifecycle_persistence.rs");
         let columns = [
             "ts TIMESTAMP",
@@ -1396,6 +1540,7 @@ mod tests {
             "prev_symbol_chain STRING",
             "source_csv_sha256 SYMBOL",
             "dry_run BOOLEAN",
+            "feed SYMBOL",
         ];
         for col in columns {
             assert!(
@@ -1417,14 +1562,14 @@ mod tests {
     }
 
     #[test]
-    fn test_lifecycle_tuple_has_24_fields() {
+    fn test_lifecycle_tuple_has_25_fields() {
         let tuple = format_lifecycle_row_tuple(&sample_index_row());
         assert!(tuple.starts_with('(') && tuple.ends_with(')'));
         let inner = &tuple[1..tuple.len() - 1];
         assert_eq!(
             inner.matches(',').count(),
-            23,
-            "24 columns → 23 separating commas"
+            24,
+            "25 columns → 24 separating commas"
         );
     }
 
@@ -1539,7 +1684,28 @@ mod tests {
             expiry_date_after_nanos: 1_700_100_000_000_000_000,
             symbol_name_after: "TCS",
             dry_run: false,
+            feed: LIFECYCLE_FEED_DHAN,
         }
+    }
+
+    #[test]
+    fn test_lifecycle_audit_tuple_stamps_feed() {
+        let tuple = format_lifecycle_audit_row_tuple(&sample_audit_row());
+        assert!(
+            tuple.ends_with(", 'dhan')"),
+            "audit tuple must end with the feed label: {tuple}"
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_audit_ilp_row_writes_feed_symbol() {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        build_lifecycle_audit_ilp_row(&mut buffer, &sample_audit_row()).expect("build");
+        let line = String::from_utf8(buffer.as_bytes().to_vec()).expect("utf8");
+        assert!(
+            line.contains(",feed=dhan"),
+            "audit ILP must write feed tag: {line}"
+        );
     }
 
     // ========================================================================
@@ -1700,11 +1866,11 @@ mod tests {
     }
 
     #[test]
-    fn test_audit_insert_column_list_has_16_columns() {
+    fn test_audit_insert_column_list_has_17_columns() {
         assert_eq!(
             LIFECYCLE_AUDIT_INSERT_COLUMN_LIST.matches(',').count() + 1,
-            16,
-            "audit INSERT column list must name all 16 schema columns"
+            17,
+            "audit INSERT column list must name all 17 schema columns (16 + feed)"
         );
     }
 
@@ -1721,7 +1887,7 @@ mod tests {
     }
 
     #[test]
-    fn test_audit_ddl_contains_all_16_columns() {
+    fn test_audit_ddl_contains_all_17_columns() {
         let source = include_str!("instrument_lifecycle_persistence.rs");
         let columns = [
             "ts TIMESTAMP",
@@ -1740,6 +1906,7 @@ mod tests {
             "expiry_date_after TIMESTAMP",
             "symbol_name_after SYMBOL",
             "dry_run BOOLEAN",
+            "feed SYMBOL",
         ];
         for col in columns {
             assert!(
@@ -1750,14 +1917,14 @@ mod tests {
     }
 
     #[test]
-    fn test_audit_tuple_has_16_fields() {
+    fn test_audit_tuple_has_17_fields() {
         let tuple = format_lifecycle_audit_row_tuple(&sample_audit_row());
         assert!(tuple.starts_with('(') && tuple.ends_with(')'));
         let inner = &tuple[1..tuple.len() - 1];
         assert_eq!(
             inner.matches(',').count(),
-            15,
-            "16 columns → 15 separating commas"
+            16,
+            "17 columns → 16 separating commas"
         );
     }
 

@@ -264,11 +264,11 @@ fn every_audit_dedup_key_must_include_designated_timestamp_ts() {
 // so the two feeds never collapse into one row. This ratchets that contract:
 // removing `feed` from any of these keys fails the build.
 //
-// NOT listed here (intentionally — per-feed value is meaningless/absent):
-//   - cross_verify_1m_audit / groww_cross_verify_1m_audit (Dhan-only / Groww-only
-//     by table; feed is a label, not a key)
-//   - tick_conservation_audit (single combined cross-feed reconciliation)
-//   - the instrument-master / universe tables (one universe shared by both feeds)
+// This is the ORIGINAL (pre-2026-06-28) per-feed MARKET-DATA subset. The
+// broader rule "feed in EVERY persisted table's key" is enforced by
+// `every_persisted_table_dedup_key_must_include_feed` below (operator override
+// 2026-06-28 — see that test). This subset is retained as the live-feed
+// market-data core; both guards now require `feed` on all of these.
 const FEED_KEYED_MARKET_DATA_KEYS: &[&str] = &[
     "DEDUP_KEY_TICKS",
     "DEDUP_KEY_CANDLES",
@@ -300,6 +300,67 @@ fn per_feed_market_data_dedup_keys_must_include_feed() {
             body
         );
     }
+}
+
+// ============================================================================
+// Meta-guard — EVERY persisted-table DEDUP key MUST include `feed`
+// (operator override 2026-06-28 — feed in-key on every persisted table)
+// ============================================================================
+//
+// Operator override 2026-06-28 SUPERSEDES the 2026-06-23 "masters = label-only"
+// decision: every persisted QuestDB table's DEDUP UPSERT key must now include
+// `feed`, accepting the per-feed-duplicate-universe consequence (each feed gets
+// its own row for the same logical key). All writers stamp `'dhan'` today; the
+// per-feed-populate work is a SEPARATE follow-up.
+//
+// Scans EVERY `DEDUP_KEY_*` constant in storage src and fails if any omits the
+// bare `feed` token. The allowlist is EMPTY — there is no persisted table
+// exempt from the rule. Removing `feed` from ANY persisted key fails the build.
+const FEED_NOT_APPLICABLE_KEYS: &[&str] = &[];
+
+#[test]
+fn every_persisted_table_dedup_key_must_include_feed() {
+    let decls = collect_dedup_key_declarations();
+    assert!(
+        !decls.is_empty(),
+        "no DEDUP_KEY_* declarations found — did the storage module move?"
+    );
+
+    let mut violations: Vec<String> = Vec::new();
+    for (path, line, name, body) in &decls {
+        if FEED_NOT_APPLICABLE_KEYS.contains(&name.as_str()) {
+            continue;
+        }
+        // Match `feed` as a whole token (split on ',' and ' ') so a column like
+        // `feed_seq` (none today) could not falsely satisfy the check.
+        let has_feed = body
+            .split([',', ' '])
+            .map(str::trim)
+            .any(|tok| tok == "feed");
+        if !has_feed {
+            violations.push(format!(
+                "{}:{} — {} = \"{}\" omits `feed`. operator override 2026-06-28: \
+                 feed must be in the DEDUP key of EVERY persisted table so a Dhan \
+                 and a (future) Groww row for the same logical key stay DISTINCT \
+                 rows. Add `feed` to the key (and the CREATE DDL + the \
+                 ALTER/backfill/DEDUP-ENABLE self-heal). If a table is genuinely \
+                 exempt, add its constant name to FEED_NOT_APPLICABLE_KEYS WITH a \
+                 dated operator quote justifying it.",
+                path.display(),
+                line,
+                name,
+                body
+            ));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "feed-in-key violation (operator override 2026-06-28) — every persisted \
+         DEDUP key MUST include `feed`:\n\n{}\n\n\
+         Rule: .claude/rules/project/data-integrity.md (feed-in-key everywhere)",
+        violations.join("\n\n")
+    );
 }
 
 // ============================================================================

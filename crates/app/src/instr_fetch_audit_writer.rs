@@ -52,7 +52,7 @@ use tickvault_common::error_code::ErrorCode;
 use tickvault_core::instrument::instr_fetch_loop::LoopOutcome;
 use tickvault_core::instrument::instr_fetch_retry_adapter::TelegramEmit;
 use tickvault_storage::instrument_fetch_audit_persistence::{
-    FetchOutcome, InstrumentFetchAuditRow, append_instrument_fetch_audit_row,
+    FETCH_AUDIT_FEED_DHAN, FetchOutcome, InstrumentFetchAuditRow, append_instrument_fetch_audit_row,
 };
 
 /// Map a per-attempt [`ErrorCode`] (carried by a [`TelegramEmit`]) to the
@@ -108,6 +108,9 @@ pub fn build_attempt_failure_row<'a>(
         source_csv_sha256: "",
         dry_run,
         detail,
+        // operator override 2026-06-28: feed in-key on every persisted table.
+        // The instrument-fetch chain is Dhan-only today.
+        feed: FETCH_AUDIT_FEED_DHAN,
     })
 }
 
@@ -166,6 +169,8 @@ pub fn build_terminal_success_row<'a>(
         source_csv_sha256,
         dry_run,
         detail: "",
+        // operator override 2026-06-28: feed in-key (Dhan-only fetch chain today).
+        feed: FETCH_AUDIT_FEED_DHAN,
     })
 }
 
