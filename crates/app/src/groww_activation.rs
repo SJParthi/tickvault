@@ -331,6 +331,7 @@ async fn activate_groww_lane(
             Ok(set) => {
                 info!(
                     entries = set.entries.len(),
+                    master_entries = set.master_entries.len(),
                     indices = set.indices,
                     resolved_stocks = set.resolved_stocks,
                     unresolved = set.unresolved_stocks.len(),
