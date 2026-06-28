@@ -440,7 +440,9 @@ fn test_oms_inline_endpoint_paths_documented() {
 
     // --- Grand total (2026-06-28: option_chain client removed, −2) ---
     // 16 constants-backed REST endpoints
-    // + 16 inline OMS endpoints (orders=5 unique + super=3 + forever=3 + alerts=2 + edis=3 + statements=2; option-chain's 2 inline base paths removed 2026-06-28)
+    // + 16 inline base paths in api_client.rs (was 18 = the OMS inline set +
+    //   the 2 option_chain/client.rs local-constant paths; the option_chain
+    //   client was deleted 2026-06-28, so the 2 option-chain paths are gone → 16)
     // + 14 parameterized variants ({order-id}, {correlation-id}, {alertId}, {isin}, {leg}, {dates})
     // + 4 WebSocket endpoints
     let constants_rest_count: usize = 16;
