@@ -107,6 +107,12 @@ use tickvault_common::sanitize::sanitize_audit_string;
 /// by every other `*_audit_persistence` module in the storage crate.
 const QUESTDB_EXEC_TIMEOUT_SECS: u64 = 10;
 
+/// Broker-source label stamped on every fetch-audit row today (operator
+/// override 2026-06-28 — `feed` is in the DEDUP key on every persisted table).
+/// The instrument-fetch chain is Dhan-only today; a future Groww master-fetch
+/// would stamp its own. Replay-stable `&'static str` from the `Feed` enum.
+pub const FETCH_AUDIT_FEED_DHAN: &str = tickvault_common::feed::Feed::Dhan.as_str();
+
 /// Wire-format table name. Stable across releases — operators,
 /// dashboards, and the `partition_manager` S3 archive job depend on
 /// the exact string. Pinned by
@@ -121,7 +127,7 @@ pub const QUESTDB_TABLE_INSTRUMENT_FETCH_AUDIT: &str = "instrument_fetch_audit";
 /// presence dominates the equality check before the higher-cardinality
 /// `attempt` integer; `ts` last because microsecond-level granularity is
 /// the tie-breaker for rapid-succession rows of the same kind.
-pub const DEDUP_KEY_INSTRUMENT_FETCH_AUDIT: &str = "trading_date_ist, outcome, attempt, ts";
+pub const DEDUP_KEY_INSTRUMENT_FETCH_AUDIT: &str = "trading_date_ist, outcome, attempt, ts, feed";
 
 /// Stable wire-format strings for the `outcome` SYMBOL column. Operators
 /// query this column by exact string match in QuestDB SQL and
@@ -238,7 +244,7 @@ impl FetchOutcome {
 /// drift. 12 columns.
 const INSERT_COLUMN_LIST: &str = "ts, trading_date_ist, outcome, attempt, error_code, \
      total_rows, universe_size, index_count, underlying_count, source_csv_sha256, \
-     dry_run, detail";
+     dry_run, detail, feed";
 
 /// One `instrument_fetch_audit` row in the shape the writer accepts.
 ///
@@ -290,6 +296,9 @@ pub struct InstrumentFetchAuditRow<'a> {
     /// this carries the operator's required note (§20). NOT escaped here
     /// — `sanitize_audit_string` is applied internally.
     pub detail: &'a str,
+    /// Broker-source label (`dhan`/`groww`). Part of the DEDUP key (operator
+    /// override 2026-06-28). Always non-empty (stamped [`FETCH_AUDIT_FEED_DHAN`]).
+    pub feed: &'a str,
 }
 
 /// Creates the audit table if absent. Idempotent — safe to call on every
@@ -318,7 +327,8 @@ pub async fn ensure_instrument_fetch_audit_table(questdb_config: &QuestDbConfig)
             underlying_count INT, \
             source_csv_sha256 SYMBOL, \
             dry_run BOOLEAN, \
-            detail STRING\
+            detail STRING, \
+            feed SYMBOL\
         ) timestamp(ts) PARTITION BY DAY WAL \
         DEDUP UPSERT KEYS({DEDUP_KEY_INSTRUMENT_FETCH_AUDIT});"
     );
@@ -347,6 +357,53 @@ pub async fn ensure_instrument_fetch_audit_table(questdb_config: &QuestDbConfig)
                 ?err,
                 "DDL request failed"
             );
+        }
+    }
+
+    // ── Brownfield feed-in-key self-heal (operator override 2026-06-28). ──
+    // This table had NO prior self-heal; add the standard ADD COLUMN → backfill
+    // NULL→'dhan' → DEDUP-ENABLE sequence (the proven shadow/prev_day order).
+    // The backfill MUST precede DEDUP-ENABLE so a re-keyed table upserts over a
+    // legacy NULL-feed row instead of duplicating it. Each step logs (does not
+    // halt boot); never drops the table (SEBI retention).
+    let self_heal = [
+        format!(
+            "ALTER TABLE {QUESTDB_TABLE_INSTRUMENT_FETCH_AUDIT} \
+             ADD COLUMN IF NOT EXISTS feed SYMBOL;"
+        ),
+        format!(
+            "UPDATE {QUESTDB_TABLE_INSTRUMENT_FETCH_AUDIT} \
+             SET feed = '{FETCH_AUDIT_FEED_DHAN}' WHERE feed IS NULL;"
+        ),
+        format!(
+            "ALTER TABLE {QUESTDB_TABLE_INSTRUMENT_FETCH_AUDIT} \
+             DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_INSTRUMENT_FETCH_AUDIT});"
+        ),
+    ];
+    for ddl in &self_heal {
+        match client
+            .get(&base_url)
+            .query(&[("query", ddl.as_str())])
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) => {
+                warn!(
+                    table = QUESTDB_TABLE_INSTRUMENT_FETCH_AUDIT,
+                    status = %resp.status(),
+                    ddl = ddl.as_str(),
+                    "feed self-heal non-2xx"
+                );
+            }
+            Err(err) => {
+                error!(
+                    table = QUESTDB_TABLE_INSTRUMENT_FETCH_AUDIT,
+                    ?err,
+                    ddl = ddl.as_str(),
+                    "feed self-heal request failed"
+                );
+            }
         }
     }
 }
@@ -386,10 +443,11 @@ fn format_row_values_tuple(row: &InstrumentFetchAuditRow<'_>) -> String {
     let index_count = row.index_count;
     let underlying_count = row.underlying_count;
     let dry_run = row.dry_run;
+    let feed = sanitize_audit_string(row.feed);
     format!(
         "({ts_micros}, {trading_date_micros}, '{outcome}', {attempt}, '{error_code}', \
           {total_rows}, {universe_size}, {index_count}, {underlying_count}, \
-          '{source_csv_sha256}', {dry_run}, '{detail}')"
+          '{source_csv_sha256}', {dry_run}, '{detail}', '{feed}')"
     )
 }
 
@@ -578,16 +636,23 @@ mod tests {
             "DEDUP key must include the bare `ts` token \
              (regression class 2026-04-28: QuestDB rejects DDL without designated-timestamp column)"
         );
+        assert!(
+            DEDUP_KEY_INSTRUMENT_FETCH_AUDIT
+                .split([',', ' '])
+                .map(str::trim)
+                .any(|tok| tok == "feed"),
+            "operator override 2026-06-28: feed must be in the DEDUP key"
+        );
     }
 
     #[test]
-    fn test_dedup_key_has_exactly_four_columns() {
-        // Lock the contract surface — Sub-PR #10b-ζ's DDL must match.
-        // Comma-count + 1 is the simplest invariant check.
+    fn test_dedup_key_has_exactly_five_columns() {
+        // Lock the contract surface. Comma-count + 1 is the simplest check.
+        // 5 = the original 4 (trading_date_ist, outcome, attempt, ts) + feed.
         let column_count = DEDUP_KEY_INSTRUMENT_FETCH_AUDIT.matches(',').count() + 1;
         assert_eq!(
-            column_count, 4,
-            "DEDUP key must have exactly 4 columns; got {column_count} in \"{DEDUP_KEY_INSTRUMENT_FETCH_AUDIT}\""
+            column_count, 5,
+            "DEDUP key must have exactly 5 columns; got {column_count} in \"{DEDUP_KEY_INSTRUMENT_FETCH_AUDIT}\""
         );
     }
 
@@ -778,22 +843,23 @@ mod tests {
             source_csv_sha256: "abc123def456",
             dry_run: false,
             detail: "",
+            feed: FETCH_AUDIT_FEED_DHAN,
         }
     }
 
     #[test]
-    fn test_insert_column_list_has_twelve_columns() {
+    fn test_insert_column_list_has_thirteen_columns() {
         // The shared column list must name every schema column so the
         // INSERT helper and the DDL stay aligned.
         assert_eq!(
             INSERT_COLUMN_LIST.matches(',').count() + 1,
-            12,
-            "INSERT column list must name all 12 schema columns"
+            13,
+            "INSERT column list must name all 13 schema columns (12 + feed)"
         );
     }
 
     #[test]
-    fn test_ddl_contains_all_twelve_columns() {
+    fn test_ddl_contains_all_thirteen_columns() {
         // Source-scan: every schema column must be declared in the DDL
         // string. Any drift between code + schema fails the build.
         let source = include_str!("instrument_fetch_audit_persistence.rs");
@@ -810,6 +876,7 @@ mod tests {
             "source_csv_sha256 SYMBOL",
             "dry_run BOOLEAN",
             "detail STRING",
+            "feed SYMBOL",
         ];
         for col in columns {
             assert!(
@@ -848,19 +915,29 @@ mod tests {
     }
 
     #[test]
-    fn test_format_row_values_tuple_has_twelve_fields() {
+    fn test_format_row_values_tuple_has_thirteen_fields() {
         let tuple = format_row_values_tuple(&sample_success_row());
         assert!(
             tuple.starts_with('(') && tuple.ends_with(')'),
             "tuple must be paren-wrapped"
         );
         // No nested parens/commas in any sanitized field → comma count
-        // is exact: 12 columns → 11 separating commas.
+        // is exact: 13 columns → 12 separating commas.
         let inner = &tuple[1..tuple.len() - 1];
         assert_eq!(
             inner.matches(',').count(),
-            11,
-            "12 columns → 11 separating commas"
+            12,
+            "13 columns → 12 separating commas"
+        );
+    }
+
+    #[test]
+    fn test_format_row_values_tuple_stamps_feed() {
+        // operator override 2026-06-28: every fetch-audit row carries feed in-key.
+        let tuple = format_row_values_tuple(&sample_success_row());
+        assert!(
+            tuple.ends_with(", 'dhan')"),
+            "fetch-audit tuple must end with the feed label: {tuple}"
         );
     }
 

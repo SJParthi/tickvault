@@ -61,8 +61,8 @@ use std::collections::HashMap;
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::sanitize::sanitize_audit_string;
 use tickvault_storage::instrument_lifecycle_persistence::{
-    InstrumentLifecycleAuditRow, InstrumentLifecycleRow, LifecycleState, TransitionKind,
-    append_instrument_lifecycle_audit_rows, append_instrument_lifecycle_rows,
+    InstrumentLifecycleAuditRow, InstrumentLifecycleRow, LIFECYCLE_FEED_DHAN, LifecycleState,
+    TransitionKind, append_instrument_lifecycle_audit_rows, append_instrument_lifecycle_rows,
     update_lifecycle_state,
 };
 use tracing::{error, info};
@@ -119,6 +119,9 @@ pub struct OwnedLifecycleAuditRow {
     pub expiry_date_after_nanos: i64,
     pub symbol_name_after: String,
     pub dry_run: bool,
+    /// Broker-source label (operator override 2026-06-28 — feed in-key on every
+    /// persisted table). Stamped `'dhan'` today (Dhan-only reconciler).
+    pub feed: String,
 }
 
 impl OwnedLifecycleAuditRow {
@@ -142,6 +145,7 @@ impl OwnedLifecycleAuditRow {
             expiry_date_after_nanos: self.expiry_date_after_nanos,
             symbol_name_after: &self.symbol_name_after,
             dry_run: self.dry_run,
+            feed: &self.feed,
         }
     }
 }
@@ -173,6 +177,9 @@ pub struct OwnedLifecycleRow {
     pub prev_symbol_chain: String,
     pub source_csv_sha256: String,
     pub dry_run: bool,
+    /// Broker-source label (operator override 2026-06-28). Stamped `'dhan'`
+    /// today (Dhan-only daily reconciler).
+    pub feed: String,
 }
 
 impl OwnedLifecycleRow {
@@ -203,6 +210,7 @@ impl OwnedLifecycleRow {
             prev_symbol_chain: &self.prev_symbol_chain,
             source_csv_sha256: &self.source_csv_sha256,
             dry_run: self.dry_run,
+            feed: &self.feed,
         }
     }
 }
@@ -352,6 +360,7 @@ pub fn build_audit_row_for_action(
         expiry_date_after_nanos: expiry_after,
         symbol_name_after: action.symbol_name.clone(),
         dry_run,
+        feed: LIFECYCLE_FEED_DHAN.to_string(),
     }
 }
 
@@ -401,6 +410,7 @@ pub fn build_lifecycle_upsert_row(
         prev_symbol_chain: String::new(),
         source_csv_sha256: source_csv_sha256.to_string(),
         dry_run,
+        feed: LIFECYCLE_FEED_DHAN.to_string(),
     };
     (row, malformed)
 }

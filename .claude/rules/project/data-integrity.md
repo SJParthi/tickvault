@@ -80,11 +80,38 @@ via `ALTER … ADD COLUMN IF NOT EXISTS feed` + `DEDUP ENABLE UPSERT KEYS(…)` 
 boot — never a populated-table DROP (SEBI).
 
 **`feed` is a LABEL, NOT a key, where the row is not per-feed:**
-`cross_verify_1m_audit` (Dhan-only; Groww has its own table),
-`tick_conservation_audit` (single combined cross-feed reconciliation), and the
-shared instrument-master / universe tables (one universe both feeds watch —
-keying by feed would duplicate the universe, breaking I-P1-11's single-universe
-model).
+`cross_verify_1m_audit` (Dhan-only; Groww has its own table). (This was the
+2026-06-23 model; the 2026-06-28 override below moved the master/audit tables'
+`feed` INTO their key.)
+
+## feed-in-key EVERYWHERE (operator override 2026-06-28)
+
+> **OVERRIDE 2026-06-28 (SUPERSEDES the 2026-06-23 "masters = label-only"
+> decision above):** every PERSISTED QuestDB table's DEDUP UPSERT key MUST
+> include `feed`, accepting the per-feed-duplicate-universe consequence (each
+> feed gets its OWN row for the same logical key). The 5 master/audit tables
+> previously LABEL-only now carry `feed` IN-KEY:
+
+| Table | new DEDUP key |
+|-------|---------------|
+| `instrument_lifecycle` | `ts, security_id, exchange_segment, feed` |
+| `instrument_lifecycle_audit` | `ts, trading_date_ist, security_id, exchange_segment, transition_kind, feed` |
+| `instrument_fetch_audit` | `trading_date_ist, outcome, attempt, ts, feed` |
+| `index_constituency` | `ts, index_name, security_id, exchange_segment, feed` |
+| `tick_conservation_audit` | `ts, trading_date_ist, feed` |
+
+Pinned by the NEW
+`dedup_segment_meta_guard::every_persisted_table_dedup_key_must_include_feed`
+(EMPTY allowlist — NO persisted table is exempt; removing `feed` from any key
+fails the build), alongside the existing
+`per_feed_market_data_dedup_keys_must_include_feed`. Each table self-heals at
+boot via `ALTER … ADD COLUMN IF NOT EXISTS feed` → `UPDATE … SET feed='dhan'
+WHERE feed IS NULL` → `DEDUP ENABLE UPSERT KEYS(…)` (in THAT order, so a re-keyed
+table upserts a legacy NULL-feed row in place instead of duplicating it) — never
+a populated-table DROP (SEBI). `cross_verify_1m_audit` is unchanged (no live
+storage module). **Honest envelope:** PLUMBING ONLY — every writer stamps
+`'dhan'` today; the Groww master-writer that would populate the second feed is a
+SEPARATE follow-up, so no per-feed duplicate rows appear until then.
 
 ## Position Reconciliation
 - After every fill: mismatch = halt trading + alert. End-of-day (immediately after WebSocket disconnect at 15:30 IST): full Dhan vs OMS reconciliation.

@@ -38,7 +38,8 @@ use tickvault_core::instrument::csv_parser::parse_detailed_csv;
 use tickvault_core::instrument::index_constituency::build_constituency_map;
 use tickvault_core::instrument::index_constituency::downloader::ConstituencyDownloader;
 use tickvault_storage::index_constituency_persistence::{
-    IndexConstituencyRow, append_index_constituency_rows, ensure_index_constituency_table,
+    INDEX_CONSTITUENCY_FEED_DHAN, IndexConstituencyRow, append_index_constituency_rows,
+    ensure_index_constituency_table,
 };
 
 /// One fully-resolved (index, stock) mapping row — OWNED so the pure builder is
@@ -175,6 +176,8 @@ pub async fn persist_index_constituency_mapping(
             via_isin: r.via_isin,
             source: "niftyindices",
             dry_run,
+            // operator override 2026-06-28: feed in-key (Dhan-resolved SIDs today).
+            feed: INDEX_CONSTITUENCY_FEED_DHAN,
         })
         .collect();
 
