@@ -36,6 +36,7 @@ use crate::auth::totp_generator::generate_totp_code;
 use crate::auth::types::GrowwCredentials;
 
 /// Groww access-token endpoint (full URL — single hardcoded const, no joining).
+// APPROVED: fixed Groww auth endpoint — the verified wire contract (docs/groww-ref/01-introduction-auth.md), a single hardcoded const with no path joining, mirrors the Dhan auth URL consts.
 pub const GROWW_TOKEN_ENDPOINT_URL: &str = "https://api.groww.in/v1/token/api/access";
 
 /// Groww API version header name (required on the access-token request).
@@ -126,9 +127,14 @@ struct AccessTokenResponse {
 /// `ApplicationError::AuthenticationFailed`. The body is NOT echoed into the
 /// error (a 2xx body carries the secret token).
 fn parse_access_token_response(body: &str) -> Result<SecretString, ApplicationError> {
+    // SECURITY: a 2xx body carries the secret token, and `serde_json::Error`'s
+    // Display can embed a quoted fragment of the input (the raw token). NEVER
+    // interpolate the serde error — use a FIXED `&'static str` reason. The
+    // operator action ("the response shape was wrong") is identical regardless
+    // of the serde detail.
     let parsed: AccessTokenResponse =
-        serde_json::from_str(body).map_err(|err| ApplicationError::AuthenticationFailed {
-            reason: format!("Groww access-token response was not valid JSON: {err}"),
+        serde_json::from_str(body).map_err(|_| ApplicationError::AuthenticationFailed {
+            reason: "Groww access-token response was not valid JSON".to_string(),
         })?;
 
     if parsed.token.trim().is_empty() {
@@ -190,7 +196,15 @@ pub async fn obtain_groww_access_token(
         .map_err(|err| GrowwAuthSmokeError::Transport(err.to_string()))?;
 
     let status = response.status();
-    let body_text = response.text().await.unwrap_or_default();
+    // A body-read failure means the connection broke mid-response (the read leg
+    // failed) — a TRANSPORT problem, not a credential rejection. Propagate it so
+    // the caller does NOT silently treat an unreadable body as an empty one and
+    // mis-classify it. SECURITY: a body-read transport error carries no token, so
+    // its Display is safe to surface.
+    let body_text = response
+        .text()
+        .await
+        .map_err(|err| GrowwAuthSmokeError::Transport(err.to_string()))?;
 
     if !status.is_success() {
         // Groww answered + refused: a credential rejection. The body is safe to
@@ -323,6 +337,30 @@ mod tests {
     fn test_parse_access_token_response_rejects_garbage() {
         assert!(parse_access_token_response("not json at all").is_err());
         assert!(parse_access_token_response("").is_err());
+    }
+
+    #[test]
+    fn test_parse_access_token_response_error_does_not_echo_input_bytes() {
+        // SECURITY: a malformed 2xx body could be (or carry a fragment of) the
+        // secret token. The error message MUST be a fixed string — it must NOT
+        // interpolate the serde error, which can quote the offending input.
+        // Feed a unique marker and assert it never appears in the error's
+        // Display or Debug rendering.
+        const MARKER: &str = "SECRETMARKER123";
+        let malformed = format!(r#"{{"token": {MARKER} broken json"#);
+        let err = parse_access_token_response(&malformed).unwrap_err();
+
+        let display = err.to_string();
+        let debug = format!("{err:?}");
+        assert!(
+            !display.contains(MARKER),
+            "error Display leaked input bytes: {display}"
+        );
+        assert!(
+            !debug.contains(MARKER),
+            "error Debug leaked input bytes: {debug}"
+        );
+        assert!(matches!(err, ApplicationError::AuthenticationFailed { .. }));
     }
 
     #[test]
