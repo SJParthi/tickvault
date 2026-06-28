@@ -326,13 +326,13 @@ fn test_skipped_endpoints_documented() {
 /// - Conditional triggers (5): create, modify, delete, get-one, get-all
 /// - EDIS (3): tpin, form, inquire
 /// - Statements (2): ledger, trade-history
-/// - Option chain (2): chain, expiry-list
+/// - Option chain: REMOVED 2026-06-28 (option_chain client deleted)
 /// - Portfolio via constant (3): holdings, positions, positions/convert
 /// - Funds/margin via constant (3): margin-calc, margin-multi, fund-limit
 /// - Trader's control via constant (2): killswitch, pnl-exit
 /// - Exit-all (DELETE /positions) shares DHAN_POSITIONS_PATH (1, counted above)
 ///
-/// Total unique paths: 16 (constants) + 18 (inline in api_client) + 2 (inline in option_chain/client.rs) = 36
+/// Total unique paths: 16 (constants) + 16 (inline in api_client) = 32 (option_chain's 2 removed 2026-06-28)
 /// Plus 4 WebSocket URLs = 40 endpoint URLs
 /// Plus 14 parameterized variants (e.g., /orders/{id}) that share base paths
 /// Grand total of distinct API operations: 54
@@ -424,17 +424,11 @@ fn test_oms_inline_endpoint_paths_documented() {
         "Statements: 2 endpoint operations"
     );
 
-    // --- Option chain (docs/dhan-ref/06-option-chain.md) ---
-    // These are defined as local constants in crates/core/src/option_chain/client.rs
-    let option_chain_paths: &[(&str, &str)] = &[
-        ("/optionchain", "POST — full option chain with Greeks"),
-        ("/optionchain/expirylist", "POST — expiry list"),
-    ];
-    assert_eq!(
-        option_chain_paths.len(),
-        2,
-        "Option chain: 2 endpoint operations"
-    );
+    // --- Option chain — REMOVED 2026-06-28 ---
+    // The option_chain REST client (crates/core/src/option_chain/client.rs)
+    // was deleted with the entire option_chain subsystem (operator directive
+    // 2026-06-28). The `/optionchain` + `/optionchain/expirylist` endpoints
+    // are no longer implemented in our codebase.
 
     // --- Exit all positions ---
     // Uses DELETE on DHAN_POSITIONS_PATH (/positions), already counted above.
@@ -444,15 +438,13 @@ fn test_oms_inline_endpoint_paths_documented() {
         "Exit-all shares the /positions path (DELETE method)"
     );
 
-    // --- Grand total: 54 distinct API operations ---
+    // --- Grand total (2026-06-28: option_chain client removed, −2) ---
     // 16 constants-backed REST endpoints
-    // + 18 inline OMS endpoints (orders=5 unique + super=3 + forever=3 + alerts=2 + edis=3 + statements=2)
-    // + 2 option chain endpoints (local constants in client.rs)
+    // + 16 inline OMS endpoints (orders=5 unique + super=3 + forever=3 + alerts=2 + edis=3 + statements=2; option-chain's 2 inline base paths removed 2026-06-28)
     // + 14 parameterized variants ({order-id}, {correlation-id}, {alertId}, {isin}, {leg}, {dates})
     // + 4 WebSocket endpoints
-    // = 54 total
     let constants_rest_count: usize = 16;
-    let inline_base_paths: usize = 18; // unique base paths in api_client.rs + option_chain
+    let inline_base_paths: usize = 16; // unique base paths in api_client.rs (option_chain removed 2026-06-28)
     let parameterized_variants: usize = 14; // {id} variants
     let websocket_count: usize = 4;
     let skipped_count: usize = 4;
@@ -460,15 +452,15 @@ fn test_oms_inline_endpoint_paths_documented() {
     let total_implemented =
         constants_rest_count + inline_base_paths + parameterized_variants + websocket_count;
     assert_eq!(
-        total_implemented, 52,
-        "52 implemented endpoint operations (54 total - 2 shared-path ops counted in base)"
+        total_implemented, 50,
+        "50 implemented endpoint operations (option_chain's 2 removed 2026-06-28)"
     );
 
-    // Plus the 4 intentionally skipped = 56 total Dhan API endpoints known
+    // Plus the 4 intentionally skipped = total Dhan API endpoints known
     let total_known = total_implemented + skipped_count;
     assert_eq!(
-        total_known, 56,
-        "56 total known Dhan API endpoints (52 implemented + 4 skipped)"
+        total_known, 54,
+        "54 total known Dhan API endpoints (50 implemented + 4 skipped)"
     );
 }
 

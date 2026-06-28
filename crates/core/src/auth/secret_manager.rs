@@ -920,43 +920,13 @@ mod tests {
     // were dropped in the QuestDB table cleanup. (The watchdog
     // evaluator + Telegram variants are unaffected and stay.)
 
-    /// Option-chain pipeline PR #5/5 meta-guard: main.rs MUST spawn the
-    /// option-chain snapshot scheduler so the RAM `SnapshotCache` the
-    /// strategy reads is populated. (The QuestDB mirror table was dropped
-    /// 2026-06-23 — ticks are the single source of truth — so there is no
-    /// boot DDL to assert anymore, only the live scheduler spawn.)
-    #[test]
-    fn test_option_chain_minute_snapshot_scheduler_is_wired_into_main() {
-        // Option-chain pipeline PR #5/5 meta-guard. main.rs MUST spawn
-        // `option_chain::snapshot_scheduler::spawn_snapshot_scheduler`
-        // when `config.option_chain_minute_snapshot.enabled == true`.
-        // Without the boot wiring, the scheduler module + cache + 4
-        // Telegram variants + 4 Prometheus counters all exist as dead
-        // code (per audit-findings Rule 13).
-        let main_rs = std::fs::read_to_string("../app/src/main.rs")
-            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
-            .expect("main.rs must be readable");
-        assert!(
-            main_rs.contains("spawn_snapshot_scheduler("),
-            "main.rs MUST call `option_chain::snapshot_scheduler::spawn_snapshot_scheduler` \
-             from the boot path. See plan doc \
-             `.claude/plans/friday-may-15-mega/topic-OPTION-CHAIN-MINUTE-SNAPSHOT.md` PR #5."
-        );
-        assert!(
-            main_rs.contains("validate_option_chain_schedule"),
-            "main.rs MUST call `validate_option_chain_schedule` BEFORE spawning the \
-             scheduler. Invalid TOML must HALT boot via `OptionChainConfigInvalid` \
-             Telegram, not silently run a broken schedule."
-        );
-    }
-
-    // test_option_chain_minute_snapshot_table_is_wired_into_boot_ddl REMOVED
-    // 2026-06-23: the `option_chain_minute_snapshot` QuestDB table was dropped
-    // (operator: ticks are the single source of truth). The scheduler still
-    // runs + populates the RAM `SnapshotCache` for the strategy — guarded by
-    // `test_option_chain_minute_snapshot_scheduler_is_wired_into_main` above —
-    // it just no longer mirrors into a QuestDB table, so there is no boot DDL
-    // to assert. See `.claude/plans/active-plan-drop-option-chain-snapshot-table.md`.
+    // test_option_chain_minute_snapshot_scheduler_is_wired_into_main REMOVED
+    // 2026-06-28: the entire option_chain REST subsystem (scheduler + client +
+    // expiry warmup + caches + config + error codes + notifications) was deleted
+    // per operator directive 2026-06-28 ("drop the option chain entire
+    // implementations and its table also"). It was disabled since 2026-06-02
+    // with no live consumer; its QuestDB table was dropped 2026-06-23. There is
+    // no scheduler spawn to assert anymore.
 
     /// Phase 0 Item 19f meta-guard: main.rs MUST wire the
     /// `shutdown_notify` -> heartbeat-`Notify` bridge so the

@@ -917,7 +917,6 @@ pub enum NotificationEvent {
 
     /// Custom alert from any component.
     Custom { message: String },
-
     // RETIRED 2026-06-12: LastTickAfterBoundary deleted — it was defined but
     // NEVER emitted (0 production sites). The post-close-tick anomaly it
     // describes is ALREADY tracked by the `tv_late_tick_after_boundary_total`
@@ -927,70 +926,12 @@ pub enum NotificationEvent {
     // (`run_tick_processor` has no notifier) for an Info-severity event that is
     // already counted — a hot-path risk for marginal value. The correct,
     // hot-path-safe alert is a CloudWatch alarm on the existing counter.
-    /// Option-chain minute-snapshot pipeline (PR #4a 2026-05-16) —
-    /// first failure of a scheduled slot per minute. Edge-triggered:
-    /// fires ONCE per `(underlying, minute)` to prevent storms when
-    /// Dhan has a sustained outage. Severity::High pages the operator
-    /// because BRUTEX strike-selection degrades to the RAM cache.
-    ///
-    /// See plan doc
-    /// `.claude/plans/friday-may-15-mega/topic-OPTION-CHAIN-MINUTE-SNAPSHOT.md` §7.
-    OptionChainFetchFailed {
-        /// Operator-visible label (e.g. "SENSEX", "NIFTY"). Matches
-        /// `OptionChainUnderlyingEntry::symbol` from config.
-        underlying: String,
-        /// Number of attempts made within this minute's retry budget
-        /// (`fetch_retry_max_attempts` from config — default 2).
-        attempts_made: u32,
-        /// Truncated reason string. ILP-safe via sanitize_audit_string
-        /// at the persistence site; this field is operator-readable
-        /// (e.g. "DH-904 rate limit", "timeout 10s", "5xx server").
-        reason: String,
-    },
 
-    /// Option-chain minute-snapshot pipeline (PR #4a) — strategy read
-    /// the RAM cache instead of a fresh fetch. Severity::Medium —
-    /// informational; the strategy IS still making decisions, but on
-    /// data 60+ seconds old. Operator should investigate sustained
-    /// occurrence (> 3/min indicates Dhan-side problem).
-    OptionChainCacheFallback {
-        /// Which underlying's cache was read.
-        underlying: String,
-        /// How old the cache was at read time, in whole seconds.
-        cache_age_secs: u32,
-    },
-
-    /// Option-chain minute-snapshot pipeline (PR #4a) — cache age
-    /// exceeded the hard-halt threshold (`cache_max_stale_secs` —
-    /// default 300 = 5 min). Strategy refuses new entries until the
-    /// cache refreshes. Severity::Critical — pages the operator
-    /// immediately because real money may be on the table.
-    ///
-    /// Existing positions are held; only NEW entries are blocked.
-    /// Operator decides go/no-go per `docs/runbooks/kill-switch.md`.
-    OptionChainStaleHalt {
-        /// Which underlying's cache went stale.
-        underlying: String,
-        /// Actual cache age at the moment of halt detection.
-        cache_age_secs: u32,
-        /// Configured threshold the cache crossed
-        /// (`cache_max_stale_secs`).
-        threshold_secs: u32,
-    },
-
-    /// Option-chain minute-snapshot pipeline (PR #4a) — boot-time
-    /// validator REJECTED the operator's `[option_chain_minute_snapshot]`
-    /// TOML config. App HALTS — strategy would otherwise run blind
-    /// on the wrong underlyings or with the wrong schedule.
-    ///
-    /// The `reason` field carries the `Display` impl of `ScheduleError`
-    /// from `option_chain_schedule.rs` (always names the offending
-    /// TOML section + line). Severity::Critical.
-    OptionChainConfigInvalid {
-        /// Display-formatted `ScheduleError` — actionable by operator
-        /// to fix the TOML directly.
-        reason: String,
-    },
+    // RETIRED 2026-06-28: OptionChainFetchFailed / OptionChainCacheFallback /
+    // OptionChainStaleHalt / OptionChainConfigInvalid deleted with the entire
+    // option_chain REST subsystem (operator directive 2026-06-28 — "drop the
+    // option chain entire implementations and its table also"). The subsystem
+    // was disabled since 2026-06-02 with no live consumer.
 }
 
 /// Formats a `usize` with comma thousand separators for human-readable
@@ -1932,59 +1873,6 @@ impl NotificationEvent {
                 )
             }
             Self::Custom { message } => message.clone(),
-            Self::OptionChainFetchFailed {
-                underlying,
-                attempts_made,
-                reason,
-            } => {
-                let underlying = html_escape(underlying);
-                let reason = html_escape(reason);
-                format!(
-                    "<b>Option-chain fetch FAILED</b>\n\
-                     underlying: <code>{underlying}</code>\n\
-                     attempts: <code>{attempts_made}</code>\n\
-                     reason: <code>{reason}</code>\n\
-                     Strategy reading RAM cache fallback. \
-                     Investigate Dhan-side if sustained > 3min."
-                )
-            }
-            Self::OptionChainCacheFallback {
-                underlying,
-                cache_age_secs,
-            } => {
-                let underlying = html_escape(underlying);
-                format!(
-                    "<b>Option-chain cache fallback</b>\n\
-                     underlying: <code>{underlying}</code>\n\
-                     cache age: <code>{cache_age_secs}s</code>\n\
-                     (informational — strategy still trading on cached chain)"
-                )
-            }
-            Self::OptionChainStaleHalt {
-                underlying,
-                cache_age_secs,
-                threshold_secs,
-            } => {
-                let underlying = html_escape(underlying);
-                format!(
-                    "<b>🆘 Option-chain STRATEGY HALTED</b>\n\
-                     underlying: <code>{underlying}</code>\n\
-                     cache age: <code>{cache_age_secs}s</code>\n\
-                     threshold: <code>{threshold_secs}s</code>\n\
-                     NEW entries blocked. Existing positions held. \
-                     Operator action: investigate Dhan-side; \
-                     decide go/no-go per kill-switch runbook."
-                )
-            }
-            Self::OptionChainConfigInvalid { reason } => {
-                let reason = html_escape(reason);
-                format!(
-                    "<b>🆘 Option-chain CONFIG INVALID — BOOT HALTED</b>\n\
-                     {reason}\n\
-                     Fix `[option_chain_minute_snapshot]` in config/base.toml \
-                     + restart."
-                )
-            }
         }
     }
 
@@ -2067,10 +1955,6 @@ impl NotificationEvent {
             Self::RealtimeGuaranteeDegraded { .. } => "RealtimeGuaranteeDegraded",
             Self::RealtimeGuaranteeCritical { .. } => "RealtimeGuaranteeCritical",
             Self::Custom { .. } => "Custom",
-            Self::OptionChainFetchFailed { .. } => "OptionChainFetchFailed",
-            Self::OptionChainCacheFallback { .. } => "OptionChainCacheFallback",
-            Self::OptionChainStaleHalt { .. } => "OptionChainStaleHalt",
-            Self::OptionChainConfigInvalid { .. } => "OptionChainConfigInvalid",
         }
     }
 
@@ -2212,10 +2096,6 @@ impl NotificationEvent {
             Self::BarMismatchCrossCheckFailed { .. } => Severity::Critical,
             Self::StartupComplete { .. } => Severity::Info,
             Self::ShutdownComplete => Severity::Info,
-            Self::OptionChainFetchFailed { .. } => Severity::High,
-            Self::OptionChainCacheFallback { .. } => Severity::Medium,
-            Self::OptionChainStaleHalt { .. } => Severity::Critical,
-            Self::OptionChainConfigInvalid { .. } => Severity::Critical,
         }
     }
 
@@ -3925,16 +3805,6 @@ mod tests {
     #[test]
     fn test_mid_session_profile_invalidated_escapes_external_reason() {
         let ev = NotificationEvent::MidSessionProfileInvalidated {
-            reason: HOSTILE.to_string(),
-        };
-        assert_external_text_escaped(&ev.to_message());
-    }
-
-    #[test]
-    fn test_option_chain_fetch_failed_escapes_external_reason() {
-        let ev = NotificationEvent::OptionChainFetchFailed {
-            underlying: "NIFTY".to_string(),
-            attempts_made: 2,
             reason: HOSTILE.to_string(),
         };
         assert_external_text_escaped(&ev.to_message());

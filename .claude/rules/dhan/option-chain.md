@@ -1,5 +1,7 @@
 # Dhan Option Chain Enforcement
 
+> **⚠ MODULE RETIRED 2026-06-28.** The `crates/core/src/option_chain/` REST subsystem (client + minute scheduler + expiry warmup + caches), its config, its `OPTION-CHAIN-01..08` error codes, and its notifications were DELETED per operator directive 2026-06-28 ("drop the option chain entire implementations and its table also"). It was disabled since 2026-06-02 (no Dhan Option Chain Data API entitlement) with no live consumer; its QuestDB table was dropped 2026-06-23. This enforcement file is retained for reference IF the option-chain REST API is ever re-introduced; the trigger paths below currently match no live code.
+>
 > **Ground truth:** `docs/dhan-ref/06-option-chain.md`
 > **Scope:** Any file touching option chain fetching, expiry list, strike parsing, or greeks.
 > **Cross-reference:** `docs/dhan-ref/08-annexure-enums.md` (ExchangeSegment), `docs/dhan-ref/09-instrument-master.md` (SecurityId)
