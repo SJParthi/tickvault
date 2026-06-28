@@ -21,11 +21,19 @@
 //! self-contained, fully-tested persistence layer first.
 //!
 //! ## Schema invariants (mirrors the canonical `instrument_lifecycle` template)
-//! * **Composite DEDUP** `(ts, index_name, security_id, exchange_segment)` —
-//!   I-P1-11 (Dhan reuses `security_id` across segments, so segment is
-//!   mandatory) + `index_name` (a stock is in many indices) + `ts` (the IST
-//!   trading-date midnight, which is the QuestDB designated timestamp, so DEDUP
-//!   keeps one row per (index, stock) per day with daily rebalance history).
+//! * **Composite DEDUP** `(ts, index_name, security_id, exchange_segment, feed)`
+//!   — I-P1-11 (Dhan reuses `security_id` across segments, so segment is
+//!   mandatory) + `index_name` (a stock is in many indices) + `feed`
+//!   (operator override 2026-06-28) + `ts`. The designated `ts` is PINNED to a
+//!   CONSTANT epoch 0 ([`index_constituency_designated_ts_nanos`]) — exactly
+//!   like `instrument_lifecycle` (`lifecycle_designated_ts_nanos() -> 0`,
+//!   I-P1-08). QuestDB requires the designated `ts` in the DEDUP key, so we pin
+//!   it to 0 and let the business key
+//!   `(index_name, security_id, exchange_segment, feed)` do the deduplication.
+//!   This is a CURRENT-STATE map (one row per (index, stock) per feed,
+//!   overwritten in place each boot) — NOT per-day history. Pinning `ts`
+//!   eliminates the cross-day duplicate accumulation (~742 rows/day) the
+//!   previous day-floored `trading_date_ist` caused.
 //! * Idempotent `CREATE TABLE IF NOT EXISTS` + `ALTER ADD COLUMN IF NOT EXISTS`
 //!   (schema self-heal — `observability-architecture.md`).
 //! * ILP bulk ingest (port 9009) — the per-index mapping is large (~46 indices ×
@@ -41,7 +49,7 @@ use std::time::Duration;
 use anyhow::Context;
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
 use reqwest::Client;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::sanitize::sanitize_ilp_symbol;
@@ -59,14 +67,31 @@ pub const INDEX_CONSTITUENCY_FEED_DHAN: &str = tickvault_common::feed::Feed::Dha
 /// S3 archive job depend on the exact string.
 pub const QUESTDB_TABLE_INDEX_CONSTITUENCY: &str = "index_constituency";
 
-/// Composite DEDUP key — one row per (index, stock) per trading day.
+/// Composite DEDUP key — one CURRENT-STATE row per (index, stock, feed).
 ///
-/// `ts` (the IST trading-date midnight) is the designated timestamp, satisfying
-/// QuestDB's designated-ts-in-DEDUP requirement AND giving daily rebalance
-/// history. `index_name` distinguishes the same stock across its many indices.
+/// `ts` is the designated timestamp, satisfying QuestDB's
+/// designated-ts-in-DEDUP requirement; it is PINNED to a constant epoch 0
+/// ([`index_constituency_designated_ts_nanos`]) so DEDUP fires on the business
+/// key alone and the table never accumulates a fresh row-set per trading day.
+/// `index_name` distinguishes the same stock across its many indices.
 /// `security_id` + `exchange_segment` is the I-P1-11 composite identity.
+/// `feed` is in-key per the 2026-06-28 operator override.
 pub const DEDUP_KEY_INDEX_CONSTITUENCY: &str =
     "ts, index_name, security_id, exchange_segment, feed";
+
+/// The pinned constant designated timestamp (epoch 0) for the
+/// UPSERT-in-place `index_constituency` current-state master table.
+///
+/// Mirrors `instrument_lifecycle_persistence::lifecycle_designated_ts_nanos()`
+/// — the I-P1-08 rationale: QuestDB requires the designated `ts` in the DEDUP
+/// key, so we pin it to 0 and let the business key
+/// `(index_name, security_id, exchange_segment, feed)` do the deduplication.
+/// Prevents the cross-day duplicate accumulation (~742 rows/day) the
+/// day-floored `trading_date_ist` caused.
+#[must_use]
+pub const fn index_constituency_designated_ts_nanos() -> i64 {
+    0
+}
 
 /// Column list shared by the DDL — one source so the writer + table cannot
 /// drift. (The ILP writer names each column explicitly; this constant pins the
@@ -93,7 +118,12 @@ const INDEX_CONSTITUENCY_COLUMNS: &[&str] = &[
 /// per row beyond the ILP buffer.
 #[derive(Debug, Clone, Copy)]
 pub struct IndexConstituencyRow<'a> {
-    /// IST trading-date midnight, nanoseconds (the designated `ts`).
+    /// IST trading-date midnight, nanoseconds. RETAINED for caller
+    /// compatibility (both feed call sites still pass it); it is NO LONGER the
+    /// stamped designated `ts` — the builder pins `ts` to the constant
+    /// [`index_constituency_designated_ts_nanos`] (epoch 0) so cross-day
+    /// duplicates collapse. Kept on the struct for a stable ABI + zero churn at
+    /// the call sites.
     pub trading_date_ist_nanos: i64,
     /// Index display name (e.g. `"Nifty Bank"`).
     pub index_name: &'a str,
@@ -224,18 +254,157 @@ pub async fn ensure_index_constituency_table(questdb_config: &QuestDbConfig) {
     }
 }
 
+/// One-shot marker file path for the ts-pin migration. After the legacy
+/// day-floored `index_constituency` rows are cleared ONCE on a deployment, this
+/// file records the fact so subsequent boots skip the TRUNCATE entirely. To
+/// force a re-run (e.g. after restoring an older QuestDB backup), delete it.
+/// Mirrors the `shadow_persistence` marker-gate convention (`data/state/…`).
+pub const INDEX_CONSTITUENCY_TS_PIN_MARKER_PATH: &str =
+    "data/state/index_constituency_ts_pin_v1.done";
+
+/// PURE marker-gate predicate: should the one-shot ts-pin migration run?
+///
+/// `true` when the marker file is ABSENT (migration not yet done on this
+/// deployment); `false` when PRESENT (already done → skip). Split out so the
+/// one-shot semantics are unit-testable without live QuestDB.
+#[must_use]
+pub fn index_constituency_migration_should_run(marker_path: &std::path::Path) -> bool {
+    !marker_path.exists()
+}
+
+/// One-time, marker-gated `TRUNCATE TABLE index_constituency` to clear the
+/// legacy day-floored rows accumulated before the `ts`-pin fix.
+///
+/// Before this fix the designated `ts` was the day-floored IST trading-date
+/// midnight, so each trading day wrote a fresh ~742-row set that DEDUP never
+/// collapsed (the day value was in the key). With `ts` now pinned to epoch 0
+/// the NEW writes UPSERT in place, but the legacy rows (at the old per-day `ts`
+/// values) never get overwritten — they must be cleared ONCE. After the
+/// truncate, the same boot's normal `index_constituency` write rewrites the
+/// current ~742-row set at `ts=0`.
+///
+/// **Degrade-safe** (operator-charter Rule 6 — this is a cold-path master
+/// migration, NOT the ticks/order path):
+/// * marker PRESENT → skip (one-shot).
+/// * TRUNCATE fails / QuestDB down → `error!` (Telegram-routable), the marker
+///   is NOT written so a later healthy boot retries, and boot is NEVER blocked.
+/// * TRUNCATE succeeds → `info!` + write the marker so subsequent boots skip.
+///
+/// MUST be awaited BEFORE the table's normal boot write so the order is
+/// truncate → write. `index_constituency` is fully re-derivable from the
+/// niftyindices/Dhan CSV on every boot, so clearing it loses no record that
+/// was not already reproducible (SEBI-safe, same current-state model as
+/// `instrument_lifecycle`).
+// WIRING-EXEMPT: boot wiring lives in crates/app/src/index_constituency_boot.rs before the normal write.
+// TEST-EXEMPT: network I/O orchestration (live QuestDB TRUNCATE) — the pure marker-gate predicate `index_constituency_migration_should_run` is unit-tested.
+pub async fn migrate_index_constituency_truncate_once(questdb_config: &QuestDbConfig) {
+    let marker_path = std::path::Path::new(INDEX_CONSTITUENCY_TS_PIN_MARKER_PATH);
+    if !index_constituency_migration_should_run(marker_path) {
+        tracing::debug!(
+            marker = INDEX_CONSTITUENCY_TS_PIN_MARKER_PATH,
+            "index_constituency ts-pin migration already done on this deployment — skipping"
+        );
+        return;
+    }
+
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = match Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
+        .build()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            error!(
+                ?err,
+                table = QUESTDB_TABLE_INDEX_CONSTITUENCY,
+                "index_constituency ts-pin migration: HTTP client build failed — \
+                 marker NOT written, will retry next boot"
+            );
+            return;
+        }
+    };
+
+    let truncate_ddl = format!("TRUNCATE TABLE {QUESTDB_TABLE_INDEX_CONSTITUENCY};");
+    match client
+        .get(&base_url)
+        .query(&[("query", truncate_ddl.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            info!(
+                table = QUESTDB_TABLE_INDEX_CONSTITUENCY,
+                "one-time ts-pin migration: truncated legacy day-floored rows"
+            );
+        }
+        Ok(resp) => {
+            error!(
+                table = QUESTDB_TABLE_INDEX_CONSTITUENCY,
+                status = %resp.status(),
+                "index_constituency ts-pin migration: TRUNCATE non-2xx — \
+                 marker NOT written, will retry next boot"
+            );
+            return;
+        }
+        Err(err) => {
+            error!(
+                ?err,
+                table = QUESTDB_TABLE_INDEX_CONSTITUENCY,
+                "index_constituency ts-pin migration: TRUNCATE request failed — \
+                 marker NOT written, will retry next boot"
+            );
+            return;
+        }
+    }
+
+    // Best-effort marker write so subsequent boots skip the TRUNCATE. If it
+    // can't be written, the migration just repeats next boot (harmless — the
+    // table is immediately rewritten from CSV).
+    if let Some(parent) = marker_path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        warn!(
+            ?err,
+            path = %parent.display(),
+            "index_constituency ts-pin migration: failed to create data/state/ dir for marker"
+        );
+        return;
+    }
+    if let Err(err) = std::fs::write(
+        marker_path,
+        "index_constituency ts-pin migration — legacy day-floored rows cleared on this deployment.\n",
+    ) {
+        warn!(
+            ?err,
+            path = INDEX_CONSTITUENCY_TS_PIN_MARKER_PATH,
+            "index_constituency ts-pin migration: failed to write marker (will repeat next boot)"
+        );
+    } else {
+        info!(
+            path = INDEX_CONSTITUENCY_TS_PIN_MARKER_PATH,
+            "index_constituency ts-pin migration complete — marker written"
+        );
+    }
+}
+
 /// Write one `index_constituency` row into an ILP [`Buffer`]. PURE builder
 /// (no network) — deterministically unit-tested via `buffer.as_bytes()`.
 ///
-/// ILP rules: all SYMBOLs before any field; empty optional SYMBOLs (`isin`)
-/// are SKIPPED (→ NULL, not the empty symbol `''`). The designated `ts` is the
-/// IST trading-date midnight so DEDUP fires on the (date, index, stock) key.
+/// ILP rules: all symbol tags before any field; an empty optional symbol tag
+/// (`isin`) is SKIPPED (→ NULL, not the empty symbol `''`). The designated `ts` is
+/// PINNED to constant epoch 0 ([`index_constituency_designated_ts_nanos`]) so
+/// DEDUP fires on the business key `(index_name, security_id, exchange_segment,
+/// feed)` alone — a current-state map, never per-day history. `row.trading_date_ist_nanos`
+/// is intentionally NOT used as the designated ts (retained for caller ABI).
 fn build_index_constituency_ilp_row(
     buffer: &mut Buffer,
     row: &IndexConstituencyRow<'_>,
 ) -> anyhow::Result<()> {
     buffer.table(QUESTDB_TABLE_INDEX_CONSTITUENCY)?;
-    // ── SYMBOLs first (ILP requires all tags before any field). ──
+    // ── symbol tags first (ILP requires all tags before any field). ──
     buffer.symbol("index_name", sanitize_ilp_symbol(row.index_name).as_ref())?;
     buffer.symbol(
         "exchange_segment",
@@ -253,7 +422,9 @@ fn build_index_constituency_ilp_row(
     buffer.column_i64("security_id", row.security_id)?;
     buffer.column_bool("via_isin", row.via_isin)?;
     buffer.column_bool("dry_run", row.dry_run)?;
-    buffer.at(TimestampNanos::new(row.trading_date_ist_nanos))?;
+    // Pin the designated ts to constant epoch 0 (NOT row.trading_date_ist_nanos)
+    // so DEDUP collapses cross-day duplicates — mirrors lifecycle_designated_ts_nanos().
+    buffer.at(TimestampNanos::new(index_constituency_designated_ts_nanos()))?;
     Ok(())
 }
 
@@ -394,6 +565,102 @@ mod tests {
         let tag_pos = line.find("index_name=").expect("tag present");
         let field_pos = line.find("security_id=").expect("field present");
         assert!(tag_pos < field_pos, "symbols must precede fields: {line}");
+    }
+
+    #[test]
+    fn test_index_constituency_designated_ts_nanos_is_epoch_zero() {
+        // ts-pin fix (2026-06-28): mirrors lifecycle_designated_ts_nanos() — the
+        // designated ts is pinned to constant epoch 0 so DEDUP fires on the
+        // business key alone and cross-day duplicates collapse.
+        assert_eq!(index_constituency_designated_ts_nanos(), 0);
+    }
+
+    #[test]
+    fn test_builder_stamps_constant_ts_regardless_of_trading_date() {
+        // THE HEADLINE REGRESSION: two DIFFERENT trading_date_ist_nanos values
+        // (June28 vs June29 IST-midnight) for the SAME (index, stock, feed) must
+        // produce ILP rows that stamp the SAME designated ts (epoch 0) — proving
+        // the day value no longer reaches the DEDUP key, so the table can no
+        // longer accumulate 742 rows per day (1484 after two days).
+        const JUNE28_IST_MIDNIGHT_NANOS: i64 = 1_782_950_400_000_000_000; // 2026-06-28 00:00 IST
+        const JUNE29_IST_MIDNIGHT_NANOS: i64 = 1_783_036_800_000_000_000; // 2026-06-29 00:00 IST
+        assert_ne!(
+            JUNE28_IST_MIDNIGHT_NANOS, JUNE29_IST_MIDNIGHT_NANOS,
+            "test setup: the two trading dates must differ"
+        );
+
+        let mut day28_row = sample_row();
+        day28_row.trading_date_ist_nanos = JUNE28_IST_MIDNIGHT_NANOS;
+        let mut day29_row = sample_row();
+        day29_row.trading_date_ist_nanos = JUNE29_IST_MIDNIGHT_NANOS;
+
+        let mut buf28 = Buffer::new(ProtocolVersion::V1);
+        build_index_constituency_ilp_row(&mut buf28, &day28_row).expect("build day28");
+        let mut buf29 = Buffer::new(ProtocolVersion::V1);
+        build_index_constituency_ilp_row(&mut buf29, &day29_row).expect("build day29");
+
+        let line28 = String::from_utf8(buf28.as_bytes().to_vec()).expect("utf8");
+        let line29 = String::from_utf8(buf29.as_bytes().to_vec()).expect("utf8");
+
+        // ILP V1 line format: `... <fields> <designated_ts_nanos>\n`. The
+        // trailing nanos token is the designated ts — it MUST be `0` for both
+        // days (same full DEDUP key → cross-day collapse), and identical to each
+        // other regardless of the differing trading_date_ist_nanos input.
+        let ts28 = line28.trim_end().rsplit(' ').next().expect("ts token 28");
+        let ts29 = line29.trim_end().rsplit(' ').next().expect("ts token 29");
+        assert_eq!(
+            ts28, "0",
+            "day28 designated ts must be epoch 0, got: {line28}"
+        );
+        assert_eq!(
+            ts29, "0",
+            "day29 designated ts must be epoch 0, got: {line29}"
+        );
+        assert_eq!(
+            ts28, ts29,
+            "different trading dates must stamp the SAME designated ts (cross-day collapse)"
+        );
+    }
+
+    #[test]
+    fn test_index_constituency_migration_should_run_only_when_marker_absent() {
+        // Pure marker-gate predicate: absent → run; present → skip.
+        let dir = std::env::temp_dir().join(format!(
+            "tv_idxconst_mig_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("mk tmp dir");
+        let marker = dir.join("index_constituency_ts_pin_v1.done");
+
+        // Absent → should run.
+        assert!(
+            index_constituency_migration_should_run(&marker),
+            "migration must run when marker is absent"
+        );
+
+        // Present → should skip.
+        std::fs::write(&marker, b"done").expect("write marker");
+        assert!(
+            !index_constituency_migration_should_run(&marker),
+            "migration must skip when marker is present"
+        );
+
+        // Cleanup (best-effort).
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_marker_path_is_under_data_state() {
+        // Mirrors the shadow_persistence marker convention.
+        assert_eq!(
+            INDEX_CONSTITUENCY_TS_PIN_MARKER_PATH,
+            "data/state/index_constituency_ts_pin_v1.done"
+        );
     }
 
     #[test]

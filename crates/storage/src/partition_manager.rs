@@ -58,7 +58,12 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     "instrument_lifecycle_audit",
     "prev_day_ohlcv",
     "cross_verify_1m_audit",
-    "index_constituency",
+    // NOTE: `index_constituency` was moved to RETENTION_EXEMPT_TABLES (2026-06-28,
+    // ts-pin fix). Its designated `ts` is now pinned to constant epoch 0, so ALL
+    // rows land in the `1970-01-01` partition; if it stayed in the DAY sweep list
+    // the retention pass would DETACH that >90d partition every run, silently
+    // removing the live current-state master. It is now exempt, exactly like
+    // `instrument_lifecycle` (also a pinned-ts current-state master).
     // TICK-CONSERVE-01 (2026-06-10): one row per daily conservation-audit
     // run — same SEBI-audit class + DAY partitioning as cross_verify_1m_audit.
     "tick_conservation_audit",
@@ -93,7 +98,14 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
 /// EVER observed, never deleted (daily-universe §5/§25). It must stay whole for
 /// point-in-time reconstruction, so it is never swept even though it is
 /// `PARTITION BY DAY`. It is small (~219K rows) so it does not need sweeping.
-pub(crate) const RETENTION_EXEMPT_TABLES: &[&str] = &["instrument_lifecycle"];
+///
+/// `index_constituency` (added 2026-06-28, ts-pin fix) is a CURRENT-STATE
+/// index→constituents master with its designated `ts` pinned to constant epoch
+/// 0 — so EVERY row sits in the `1970-01-01` partition. If it were swept, that
+/// (always >90d-old) partition would be detached every run, removing the live
+/// master. It is small (~742 rows) + fully re-derivable from CSV each boot, so
+/// it is exempt exactly like `instrument_lifecycle`.
+pub(crate) const RETENTION_EXEMPT_TABLES: &[&str] = &["instrument_lifecycle", "index_constituency"];
 
 // ---------------------------------------------------------------------------
 // Partition Manager
@@ -406,18 +418,47 @@ mod tests {
         // The DAY const holds ONLY the audit/data tables; candle tables are
         // swept via candle_table_names() in detach_old_partitions (see
         // test_candle_tables_are_real_plain_names).
+        // NOTE: `index_constituency` was MOVED out of this list to
+        // RETENTION_EXEMPT_TABLES (2026-06-28, ts-pin fix) — see
+        // test_index_constituency_is_exempt_never_swept below.
         for live in [
             "instrument_fetch_audit",
             "instrument_lifecycle_audit",
             "prev_day_ohlcv",
             "cross_verify_1m_audit",
-            "index_constituency",
         ] {
             assert!(
                 DAY_PARTITIONED_TABLES.contains(&live),
                 "audit/data table not covered by retention sweep: {live}"
             );
         }
+        // index_constituency must NOT be in the DAY sweep list anymore — its
+        // pinned-ts rows all sit in the 1970 partition, which the sweep would
+        // detach every run.
+        assert!(
+            !DAY_PARTITIONED_TABLES.contains(&"index_constituency"),
+            "index_constituency must be RETENTION_EXEMPT, not DAY-swept (ts pinned to epoch 0)"
+        );
+    }
+
+    #[test]
+    fn test_index_constituency_is_exempt_never_swept() {
+        // ts-pin fix (2026-06-28): `index_constituency` is a CURRENT-STATE master
+        // with its designated ts pinned to epoch 0 → all rows in the 1970
+        // partition. It must be exempt (like instrument_lifecycle) so the
+        // retention sweep never detaches that >90d partition.
+        assert!(
+            RETENTION_EXEMPT_TABLES.contains(&"index_constituency"),
+            "index_constituency must be retention-exempt (pinned-ts current-state master)"
+        );
+        assert!(
+            !DAY_PARTITIONED_TABLES.contains(&"index_constituency"),
+            "index_constituency must NOT be DAY-swept"
+        );
+        assert!(
+            !HOUR_PARTITIONED_TABLES.contains(&"index_constituency"),
+            "index_constituency must NOT be HOUR-swept"
+        );
     }
 
     #[test]
