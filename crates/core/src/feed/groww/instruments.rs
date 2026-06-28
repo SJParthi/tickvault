@@ -99,8 +99,19 @@ pub struct WatchEntry {
 /// The assembled Groww watch set + resolution provenance for observability.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct GrowwWatchSet {
-    /// The instruments to subscribe (deduped, capped, envelope-checked).
+    /// The instruments to SUBSCRIBE live (deduped, **capped**, envelope-checked).
+    /// This is the live-feed set the sidecar reads — bounded by `max_subscribe`
+    /// (clamped to the Groww 1000 hard cap).
     pub entries: Vec<WatchEntry>,
+    /// The FULL deduped, envelope-checked resolved universe BEFORE the optional
+    /// `max_subscribe` cap (COLD-PATH provenance, PR — full-universe master). The
+    /// shared `instrument_lifecycle` / `index_constituency` master tables iterate
+    /// THIS, not `entries`, so the master always records the entire ~767-instrument
+    /// universe regardless of the (smaller) live-subscribe cap — exactly as the Dhan
+    /// side persists the full `DailyUniverse` independent of subscription. When no
+    /// sub-cap is applied (the default), `master_entries == entries`. Cold-path
+    /// only (daily build), so the owned clone costs nothing on the hot path.
+    pub master_entries: Vec<WatchEntry>,
     /// Count of NTM stocks that resolved to a Groww token.
     pub resolved_stocks: usize,
     /// NTM stock symbols that did NOT resolve (logged by name, never silent).
@@ -442,6 +453,13 @@ fn assemble_watch_set(
         });
     }
 
+    // Capture the FULL pre-cap universe for the master tables BEFORE truncating the
+    // live-subscribe set. The master (`instrument_lifecycle` / `index_constituency`)
+    // must record the entire ~767-instrument universe regardless of the live-feed
+    // cap, exactly as Dhan persists the full `DailyUniverse` independent of its
+    // subscription. Cold-path daily build, so this one owned clone is free.
+    let master_entries = deduped.clone();
+
     // Deterministic cap: clamp to min(max_subscribe, 1000). `deduped` is already
     // indices-first then token-asc, so a prefix take is deterministic.
     let cap = max_subscribe
@@ -453,6 +471,7 @@ fn assemble_watch_set(
 
     Ok(GrowwWatchSet {
         entries: deduped,
+        master_entries,
         resolved_stocks,
         unresolved_stocks,
         indices,
@@ -462,10 +481,20 @@ fn assemble_watch_set(
 /// niftyindices slug for the NIFTY Total Market constituent list (§31.1).
 const NTM_SLUG: &str = "ind_niftytotalmarket_list";
 
-/// Default first-run subscription cap (subset-safe). Override at boot via the
-/// `GROWW_MAX_SUBSCRIBE` env var (set to a large value / `1200` for the full
-/// universe). Indices are always included first (deterministic cap order).
-pub const GROWW_DEFAULT_MAX_SUBSCRIBE: usize = 60;
+/// Default live-subscription cap. Set to the Groww hard cap
+/// ([`GROWW_MAX_SUBSCRIPTIONS`] = 1000) so the FULL resolved universe (~767, which
+/// fits under 1000) streams live by default — matching the Dhan side, which
+/// subscribes its full universe. There is therefore NO artificial sub-cap below
+/// the Groww hard cap; `assemble_watch_set` still clamps to that 1000 hard cap
+/// (`cap.min(GROWW_MAX_SUBSCRIPTIONS)`), so this can never exceed Groww's limit.
+/// Operator can still cap the live set at boot via the `GROWW_MAX_SUBSCRIBE` env
+/// override (e.g. `60`) — the master tables stay full-universe regardless, because
+/// they iterate `master_entries` (the pre-cap set), not `entries`.
+///
+/// HONEST envelope: ~767 LIVE subscriptions is the INTENDED config; it is
+/// unverified at full scale until the next market open. It is config, not a
+/// proven-at-scale claim.
+pub const GROWW_DEFAULT_MAX_SUBSCRIBE: usize = GROWW_MAX_SUBSCRIPTIONS;
 
 /// Parses the niftyindices NIFTY-Total-Market constituent CSV into `(symbol,
 /// isin)` pairs (uppercased/trimmed). Columns resolved BY NAME (`Symbol`,
@@ -678,6 +707,7 @@ pub async fn build_and_write_groww_watch(
     write_watch_file_atomic(&path, &content)?;
     info!(
         entries = set.entries.len(),
+        master_entries = set.master_entries.len(),
         resolved_stocks = set.resolved_stocks,
         indices = set.indices,
         unresolved = set.unresolved_stocks.len(),
@@ -963,6 +993,63 @@ mod tests {
         // 1100 is within [100,1200] envelope; ask for max 5000 → clamps to 1000.
         let set = assemble_watch_set(vec![], stocks, vec![], 1100, Some(5000)).unwrap();
         assert_eq!(set.entries.len(), GROWW_MAX_SUBSCRIPTIONS);
+        // The master records the FULL pre-cap universe (1100), even though the live
+        // subscribe set is clamped to the 1000 hard cap.
+        assert_eq!(
+            set.master_entries.len(),
+            1100,
+            "master_entries holds the full pre-cap universe, not the 1000-clamped live set"
+        );
+    }
+
+    #[test]
+    fn test_assemble_master_entries_full_when_capped() {
+        // Decoupling proof: a small explicit cap shrinks the live `entries` but
+        // NEVER the master. 200 stocks, cap=10 → entries=10, master_entries=200.
+        let stocks: Vec<WatchEntry> = (0..200).map(|i| stock_entry(&format!("{i:04}"))).collect();
+        let set = assemble_watch_set(vec![], stocks, vec![], 200, Some(10)).unwrap();
+        assert_eq!(set.entries.len(), 10, "live subscribe set is capped to 10");
+        assert_eq!(
+            set.master_entries.len(),
+            200,
+            "master_entries is the FULL pre-cap universe regardless of the live cap"
+        );
+        // The capped `entries` is a prefix of the (indices-first, token-asc) master.
+        assert_eq!(set.entries, set.master_entries[..10].to_vec());
+    }
+
+    #[test]
+    fn test_assemble_master_equals_entries_when_uncapped() {
+        // With no sub-cap below the universe size, the live set and master set are
+        // identical — the production default (no GROWW_MAX_SUBSCRIBE override).
+        let stocks: Vec<WatchEntry> = (0..150).map(|i| stock_entry(&format!("{i:04}"))).collect();
+        let set = assemble_watch_set(vec![], stocks, vec![], 150, None).unwrap();
+        assert_eq!(set.entries, set.master_entries);
+        assert_eq!(set.entries.len(), 150);
+    }
+
+    #[test]
+    fn test_default_max_subscribe_is_groww_hard_cap() {
+        // FIX B: the boot default is now the Groww 1000 hard cap (no artificial
+        // sub-cap below it), so a ~767-style universe streams live in full — it is
+        // NOT truncated, and entries == master_entries.
+        assert_eq!(GROWW_DEFAULT_MAX_SUBSCRIBE, GROWW_MAX_SUBSCRIPTIONS);
+        // 767 stocks + the default cap (1000) → no truncation.
+        let stocks: Vec<WatchEntry> = (0..767).map(|i| stock_entry(&format!("{i:04}"))).collect();
+        let set = assemble_watch_set(
+            vec![],
+            stocks,
+            vec![],
+            767,
+            Some(GROWW_DEFAULT_MAX_SUBSCRIBE),
+        )
+        .unwrap();
+        assert_eq!(
+            set.entries.len(),
+            767,
+            "full universe streams live (not capped at 60)"
+        );
+        assert_eq!(set.entries, set.master_entries);
     }
 
     #[test]
@@ -1062,8 +1149,10 @@ mod tests {
 
     #[test]
     fn test_serialize_watch_file_has_date_feed_entries() {
+        let entries = vec![stock_entry("2885"), index_entry("NIFTY")];
         let set = GrowwWatchSet {
-            entries: vec![stock_entry("2885"), index_entry("NIFTY")],
+            master_entries: entries.clone(),
+            entries,
             resolved_stocks: 1,
             unresolved_stocks: vec![],
             indices: 1,
