@@ -162,7 +162,11 @@ pub fn build_groww_lifecycle_rows<'a>(
         InstrumentLifecycleRow, LifecycleState,
     };
 
-    set.entries
+    // Iterate the FULL pre-cap universe (`master_entries`), NOT the capped live
+    // `entries` — the master table records every resolved instrument regardless of
+    // the (smaller) live-subscribe cap, exactly as the Dhan side persists its full
+    // `DailyUniverse` independent of subscription.
+    set.master_entries
         .iter()
         .map(|e| {
             let is_index = e.kind == WatchKind::IndexValue;
@@ -232,7 +236,10 @@ pub fn build_groww_constituency_rows<'a>(
     /// refactor while NTM is the only membership). The test pins the documented assumption.
     const GROWW_NTM_INDEX_NAME: &str = "NIFTY Total Market";
 
-    set.entries
+    // Iterate the FULL pre-cap universe (`master_entries`), NOT the capped live
+    // `entries` — every resolved NTM stock is a constituent regardless of the
+    // live-subscribe cap.
+    set.master_entries
         .iter()
         .filter(|e| e.kind == WatchKind::Ltp && e.symbol_name.is_some())
         .map(|e| IndexConstituencyRow {
@@ -423,8 +430,29 @@ mod tests {
             .filter(|e| e.kind == WatchKind::IndexValue)
             .count();
         let resolved_stocks = entries.iter().filter(|e| e.kind == WatchKind::Ltp).count();
+        // Uncapped case: the live-subscribe set and the master set are identical.
+        let master_entries = entries.clone();
         GrowwWatchSet {
             entries,
+            master_entries,
+            resolved_stocks,
+            unresolved_stocks: Vec::new(),
+            indices,
+        }
+    }
+
+    /// Builds a set where the live-subscribe `entries` is CAPPED to `entries`, but
+    /// the master `master_entries` is the FULL pre-cap superset — the decoupling the
+    /// row builders must honor. Used by the "uses master_entries not capped" tests.
+    fn capped_set(capped: Vec<WatchEntry>, full: Vec<WatchEntry>) -> GrowwWatchSet {
+        let indices = full
+            .iter()
+            .filter(|e| e.kind == WatchKind::IndexValue)
+            .count();
+        let resolved_stocks = full.iter().filter(|e| e.kind == WatchKind::Ltp).count();
+        GrowwWatchSet {
+            entries: capped,
+            master_entries: full,
             resolved_stocks,
             unresolved_stocks: Vec::new(),
             indices,
@@ -608,6 +636,55 @@ mod tests {
         assert!(r.via_isin);
         assert_eq!(r.source, "groww");
         assert_eq!(r.index_name, "NIFTY Total Market");
+    }
+
+    // ── full-universe master: builders iterate master_entries, not capped entries ──
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_build_groww_lifecycle_rows_uses_master_entries_not_capped() {
+        // Regression: the master must record the FULL pre-cap universe. Live
+        // `entries` is capped to 2, but `master_entries` holds the full 5 → the
+        // lifecycle builder MUST emit 5 rows, not 2.
+        let full = vec![
+            index("NIFTY", "NSE", 999),
+            stock("2885", "INE002A01018", "RELIANCE"),
+            stock("1594", "INE009A01021", "INFY"),
+            stock("3045", "INE040A01034", "HDFCBANK"),
+            stock("4963", "INE467B01029", "TCS"),
+        ];
+        let capped = full[..2].to_vec();
+        let set = capped_set(capped, full);
+        assert_eq!(set.entries.len(), 2, "live subscribe set is capped");
+        let rows = build_groww_lifecycle_rows(&set, 111, 222, false);
+        assert_eq!(
+            rows.len(),
+            5,
+            "lifecycle rows must cover the full master universe, not the capped entries"
+        );
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_build_groww_constituency_rows_uses_master_entries_not_capped() {
+        // Same decoupling for constituency: full master has 4 stocks (+1 index);
+        // live `entries` capped to 1 → constituency builder MUST emit 4 rows (the
+        // index is filtered out), not be limited by the cap.
+        let full = vec![
+            index("NIFTY", "NSE", 999),
+            stock("2885", "INE002A01018", "RELIANCE"),
+            stock("1594", "INE009A01021", "INFY"),
+            stock("3045", "INE040A01034", "HDFCBANK"),
+            stock("4963", "INE467B01029", "TCS"),
+        ];
+        let capped = full[..1].to_vec();
+        let set = capped_set(capped, full);
+        let rows = build_groww_constituency_rows(&set, 222, false);
+        assert_eq!(
+            rows.len(),
+            4,
+            "constituency rows must cover every full-master stock (4), not the capped entries"
+        );
     }
 
     // ── F1: dry-run builds rows but skips the append (§27 isolation) ──

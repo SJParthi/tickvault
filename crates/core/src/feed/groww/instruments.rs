@@ -99,8 +99,19 @@ pub struct WatchEntry {
 /// The assembled Groww watch set + resolution provenance for observability.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct GrowwWatchSet {
-    /// The instruments to subscribe (deduped, capped, envelope-checked).
+    /// The instruments to SUBSCRIBE live (deduped, **capped**, envelope-checked).
+    /// This is the live-feed set the sidecar reads — bounded by `max_subscribe`
+    /// (clamped to the Groww 1000 hard cap).
     pub entries: Vec<WatchEntry>,
+    /// The FULL deduped, envelope-checked resolved universe BEFORE the optional
+    /// `max_subscribe` cap (COLD-PATH provenance, PR — full-universe master). The
+    /// shared `instrument_lifecycle` / `index_constituency` master tables iterate
+    /// THIS, not `entries`, so the master always records the entire ~767-instrument
+    /// universe regardless of the (smaller) live-subscribe cap — exactly as the Dhan
+    /// side persists the full `DailyUniverse` independent of subscription. When no
+    /// sub-cap is applied (the default), `master_entries == entries`. Cold-path
+    /// only (daily build), so the owned clone costs nothing on the hot path.
+    pub master_entries: Vec<WatchEntry>,
     /// Count of NTM stocks that resolved to a Groww token.
     pub resolved_stocks: usize,
     /// NTM stock symbols that did NOT resolve (logged by name, never silent).
@@ -352,6 +363,40 @@ fn extract_index_entries(rows: &[GrowwInstrumentRow]) -> Vec<WatchEntry> {
     entries
 }
 
+/// Cross-checks the resolved Groww NSE index set against Dhan's
+/// [`NSE_INDEX_ALLOWLIST`] and returns the canonical names of the
+/// Dhan-tracked indices that have NO matching Groww IDX row, in allowlist
+/// order. This makes the genuine Groww-master limitation (10 sectoral /
+/// broad indices Groww does not publish as an `IDX` row, 2026-06-28)
+/// VISIBLE rather than silently dropped — mirroring the Dhan-side
+/// `allowlist_misses` audit. Reuses `index_extractor`'s own
+/// `canonicalize_index_symbol` so Dhan renames/aliases resolve identically
+/// on both feeds; no parallel matcher is introduced.
+///
+/// O(1) EXEMPT: cold-path daily build only (once per Groww master load),
+/// not the per-tick path. Bounded by the 32-entry allowlist × resolved
+/// NSE index count.
+#[cfg(feature = "daily_universe_fetcher")]
+#[must_use]
+fn groww_indices_absent_vs_dhan(index_entries: &[WatchEntry]) -> Vec<&'static str> {
+    use crate::instrument::index_extractor::{NSE_INDEX_ALLOWLIST, canonicalize_index_symbol};
+
+    // Canonicalize every resolved Groww NSE index name (the bare NSE name is the
+    // `exchange_token` for NSE indices). BSE SENSEX (`exchange == "BSE"`) is
+    // excluded — the allowlist is NSE-only, SENSEX is tracked separately.
+    let resolved_canonical: std::collections::HashSet<String> = index_entries
+        .iter()
+        .filter(|e| e.exchange == "NSE")
+        .map(|e| canonicalize_index_symbol(&e.exchange_token))
+        .collect();
+
+    NSE_INDEX_ALLOWLIST
+        .iter()
+        .filter(|allowed| !resolved_canonical.contains(&canonicalize_index_symbol(allowed)))
+        .copied()
+        .collect()
+}
+
 /// Resolves NTM constituents (symbol, ISIN) to Groww stock watch entries via the
 /// ISIN map. Returns the resolved entries (sorted by token for determinism) plus
 /// the symbols that did not resolve (logged by name). O(1) per constituent.
@@ -442,6 +487,13 @@ fn assemble_watch_set(
         });
     }
 
+    // Capture the FULL pre-cap universe for the master tables BEFORE truncating the
+    // live-subscribe set. The master (`instrument_lifecycle` / `index_constituency`)
+    // must record the entire ~767-instrument universe regardless of the live-feed
+    // cap, exactly as Dhan persists the full `DailyUniverse` independent of its
+    // subscription. Cold-path daily build, so this one owned clone is free.
+    let master_entries = deduped.clone();
+
     // Deterministic cap: clamp to min(max_subscribe, 1000). `deduped` is already
     // indices-first then token-asc, so a prefix take is deterministic.
     let cap = max_subscribe
@@ -453,6 +505,7 @@ fn assemble_watch_set(
 
     Ok(GrowwWatchSet {
         entries: deduped,
+        master_entries,
         resolved_stocks,
         unresolved_stocks,
         indices,
@@ -462,10 +515,20 @@ fn assemble_watch_set(
 /// niftyindices slug for the NIFTY Total Market constituent list (§31.1).
 const NTM_SLUG: &str = "ind_niftytotalmarket_list";
 
-/// Default first-run subscription cap (subset-safe). Override at boot via the
-/// `GROWW_MAX_SUBSCRIBE` env var (set to a large value / `1200` for the full
-/// universe). Indices are always included first (deterministic cap order).
-pub const GROWW_DEFAULT_MAX_SUBSCRIBE: usize = 60;
+/// Default live-subscription cap. Set to the Groww hard cap
+/// ([`GROWW_MAX_SUBSCRIPTIONS`] = 1000) so the FULL resolved universe (~767, which
+/// fits under 1000) streams live by default — matching the Dhan side, which
+/// subscribes its full universe. There is therefore NO artificial sub-cap below
+/// the Groww hard cap; `assemble_watch_set` still clamps to that 1000 hard cap
+/// (`cap.min(GROWW_MAX_SUBSCRIPTIONS)`), so this can never exceed Groww's limit.
+/// Operator can still cap the live set at boot via the `GROWW_MAX_SUBSCRIBE` env
+/// override (e.g. `60`) — the master tables stay full-universe regardless, because
+/// they iterate `master_entries` (the pre-cap set), not `entries`.
+///
+/// HONEST envelope: ~767 LIVE subscriptions is the INTENDED config; it is
+/// unverified at full scale until the next market open. It is config, not a
+/// proven-at-scale claim.
+pub const GROWW_DEFAULT_MAX_SUBSCRIBE: usize = GROWW_MAX_SUBSCRIPTIONS;
 
 /// Parses the niftyindices NIFTY-Total-Market constituent CSV into `(symbol,
 /// isin)` pairs (uppercased/trimmed). Columns resolved BY NAME (`Symbol`,
@@ -522,6 +585,34 @@ fn build_groww_watch_from_csvs(
         );
     }
     let index_entries = extract_index_entries(&rows);
+    // FIX C (2026-06-28): audit Groww vs Dhan index coverage. Emit ONE boot
+    // line naming the Dhan-tracked indices that Groww's master does not carry
+    // as an IDX row, so the genuine Groww limitation is VISIBLE, never silently
+    // dropped. Cold-path, once per master load; feature-gated because the Dhan
+    // `index_extractor` (the allowlist + canonicalizer) lives behind it.
+    #[cfg(feature = "daily_universe_fetcher")]
+    {
+        use crate::instrument::index_extractor::NSE_INDEX_ALLOWLIST;
+        let absent = groww_indices_absent_vs_dhan(&index_entries);
+        let groww_resolved = index_entries.iter().filter(|e| e.exchange == "NSE").count();
+        if absent.is_empty() {
+            info!(
+                groww_resolved,
+                dhan_tracked = NSE_INDEX_ALLOWLIST.len(),
+                absent_on_groww = 0,
+                "Groww index coverage vs Dhan allowlist — full coverage"
+            );
+        } else {
+            metrics::counter!("tv_groww_index_absent_total").increment(absent.len() as u64);
+            warn!(
+                groww_resolved,
+                dhan_tracked = NSE_INDEX_ALLOWLIST.len(),
+                absent_on_groww = absent.len(),
+                absent_names = %absent.join(","),
+                "Groww index coverage vs Dhan allowlist — indices absent on Groww (genuine Groww-master limitation)"
+            );
+        }
+    }
     let ntm = parse_ntm_constituents(ntm_csv)?;
     let ntm_total = ntm.len();
     let (stock_entries, unresolved) = resolve_stock_entries(&ntm, &isin_map);
@@ -678,6 +769,7 @@ pub async fn build_and_write_groww_watch(
     write_watch_file_atomic(&path, &content)?;
     info!(
         entries = set.entries.len(),
+        master_entries = set.master_entries.len(),
         resolved_stocks = set.resolved_stocks,
         indices = set.indices,
         unresolved = set.unresolved_stocks.len(),
@@ -963,6 +1055,63 @@ mod tests {
         // 1100 is within [100,1200] envelope; ask for max 5000 → clamps to 1000.
         let set = assemble_watch_set(vec![], stocks, vec![], 1100, Some(5000)).unwrap();
         assert_eq!(set.entries.len(), GROWW_MAX_SUBSCRIPTIONS);
+        // The master records the FULL pre-cap universe (1100), even though the live
+        // subscribe set is clamped to the 1000 hard cap.
+        assert_eq!(
+            set.master_entries.len(),
+            1100,
+            "master_entries holds the full pre-cap universe, not the 1000-clamped live set"
+        );
+    }
+
+    #[test]
+    fn test_assemble_master_entries_full_when_capped() {
+        // Decoupling proof: a small explicit cap shrinks the live `entries` but
+        // NEVER the master. 200 stocks, cap=10 → entries=10, master_entries=200.
+        let stocks: Vec<WatchEntry> = (0..200).map(|i| stock_entry(&format!("{i:04}"))).collect();
+        let set = assemble_watch_set(vec![], stocks, vec![], 200, Some(10)).unwrap();
+        assert_eq!(set.entries.len(), 10, "live subscribe set is capped to 10");
+        assert_eq!(
+            set.master_entries.len(),
+            200,
+            "master_entries is the FULL pre-cap universe regardless of the live cap"
+        );
+        // The capped `entries` is a prefix of the (indices-first, token-asc) master.
+        assert_eq!(set.entries, set.master_entries[..10].to_vec());
+    }
+
+    #[test]
+    fn test_assemble_master_equals_entries_when_uncapped() {
+        // With no sub-cap below the universe size, the live set and master set are
+        // identical — the production default (no GROWW_MAX_SUBSCRIBE override).
+        let stocks: Vec<WatchEntry> = (0..150).map(|i| stock_entry(&format!("{i:04}"))).collect();
+        let set = assemble_watch_set(vec![], stocks, vec![], 150, None).unwrap();
+        assert_eq!(set.entries, set.master_entries);
+        assert_eq!(set.entries.len(), 150);
+    }
+
+    #[test]
+    fn test_default_max_subscribe_is_groww_hard_cap() {
+        // FIX B: the boot default is now the Groww 1000 hard cap (no artificial
+        // sub-cap below it), so a ~767-style universe streams live in full — it is
+        // NOT truncated, and entries == master_entries.
+        assert_eq!(GROWW_DEFAULT_MAX_SUBSCRIBE, GROWW_MAX_SUBSCRIPTIONS);
+        // 767 stocks + the default cap (1000) → no truncation.
+        let stocks: Vec<WatchEntry> = (0..767).map(|i| stock_entry(&format!("{i:04}"))).collect();
+        let set = assemble_watch_set(
+            vec![],
+            stocks,
+            vec![],
+            767,
+            Some(GROWW_DEFAULT_MAX_SUBSCRIBE),
+        )
+        .unwrap();
+        assert_eq!(
+            set.entries.len(),
+            767,
+            "full universe streams live (not capped at 60)"
+        );
+        assert_eq!(set.entries, set.master_entries);
     }
 
     #[test]
@@ -1062,8 +1211,10 @@ mod tests {
 
     #[test]
     fn test_serialize_watch_file_has_date_feed_entries() {
+        let entries = vec![stock_entry("2885"), index_entry("NIFTY")];
         let set = GrowwWatchSet {
-            entries: vec![stock_entry("2885"), index_entry("NIFTY")],
+            master_entries: entries.clone(),
+            entries,
             resolved_stocks: 1,
             unresolved_stocks: vec![],
             indices: 1,
@@ -1096,5 +1247,99 @@ mod tests {
         // tmp file is gone after the rename.
         assert!(!path.with_extension("json.tmp").exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // FIX C (2026-06-28): the 10 Dhan-allowlisted indices Groww's master does
+    // NOT publish as an IDX row (genuine Groww limitation). Canonical
+    // (allowlist) spelling — the assertion is canonicalized so it is resilient
+    // to whitespace/alias differences.
+    #[cfg(feature = "daily_universe_fetcher")]
+    const KNOWN_ABSENT_ON_GROWW: &[&str] = &[
+        "NIFTY 200",
+        "GIFTNIFTY",
+        "NIFTY ENERGY",
+        "NIFTYINFRA",
+        "NIFTY MNC",
+        "NIFTY CONSUMPTION",
+        "NIFTY SERV SECTOR",
+        "NIFTY MID100 FREE",
+        "NIFTY SMALLCAP 50",
+        "NIFTY MICROCAP250",
+    ];
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_groww_indices_absent_vs_dhan_is_exactly_the_ten() {
+        use crate::instrument::index_extractor::{NSE_INDEX_ALLOWLIST, canonicalize_index_symbol};
+
+        let absent_canon: std::collections::HashSet<String> = KNOWN_ABSENT_ON_GROWW
+            .iter()
+            .map(|n| canonicalize_index_symbol(n))
+            .collect();
+
+        // Build a Groww master that carries EVERY allowlisted NSE index EXCEPT
+        // the 10 known-absent ones — exactly the live-master situation.
+        let present: Vec<&&str> = NSE_INDEX_ALLOWLIST
+            .iter()
+            .filter(|name| !absent_canon.contains(&canonicalize_index_symbol(name)))
+            .collect();
+        let mut csv = String::from(HEADER);
+        for name in &present {
+            csv.push('\n');
+            csv.push_str(&idx_row(name));
+        }
+        // BSE SENSEX is present on Groww but is NOT an NSE-allowlist member — it
+        // must not appear in the absent set either way.
+        csv.push('\n');
+        csv.push_str(&bse_sensex_row());
+        csv.push('\n');
+
+        let rows = parse_groww_master(&csv).unwrap();
+        let index_entries = extract_index_entries(&rows);
+
+        // No resolved index was dropped: every NSE name we put in resolves back.
+        let resolved_canon: std::collections::HashSet<String> = index_entries
+            .iter()
+            .filter(|e| e.exchange == "NSE")
+            .map(|e| canonicalize_index_symbol(&e.exchange_token))
+            .collect();
+        assert_eq!(
+            resolved_canon.len(),
+            present.len(),
+            "every present Groww NSE index must remain resolved (none dropped)"
+        );
+
+        let absent = groww_indices_absent_vs_dhan(&index_entries);
+        let absent_set: std::collections::HashSet<String> = absent
+            .iter()
+            .map(|n| canonicalize_index_symbol(n))
+            .collect();
+        assert_eq!(
+            absent_set, absent_canon,
+            "absent_on_groww must be EXACTLY the 10 known indices (canonicalized)"
+        );
+        assert_eq!(absent.len(), 10, "exactly 10 indices absent on Groww");
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_groww_indices_absent_vs_dhan_empty_when_full_coverage() {
+        use crate::instrument::index_extractor::NSE_INDEX_ALLOWLIST;
+
+        // A (hypothetical) Groww master carrying every allowlisted NSE index →
+        // no absences. Proves the audit does not over-report.
+        let mut csv = String::from(HEADER);
+        for name in NSE_INDEX_ALLOWLIST {
+            csv.push('\n');
+            csv.push_str(&idx_row(name));
+        }
+        csv.push('\n');
+        let rows = parse_groww_master(&csv).unwrap();
+        let index_entries = extract_index_entries(&rows);
+        let absent = groww_indices_absent_vs_dhan(&index_entries);
+        assert!(
+            absent.is_empty(),
+            "full coverage must report zero absent, got {absent:?}"
+        );
     }
 }
