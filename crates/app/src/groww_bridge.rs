@@ -740,6 +740,14 @@ pub async fn run_groww_bridge(
         // runtime-disabled, idle — no file read, no writes. Re-enabling resumes
         // from the persisted `offset` with NO double-read and NO tick loss.
         if !feed_runtime.is_enabled(Feed::Groww) {
+            // Clear the stale `connected` bit on disable: the feed is no longer
+            // streaming, so leaving it `true` would report a misleading green
+            // (false-OK). Re-arm the connect-log + streaming latches so a later
+            // re-enable re-emits the ONE CONNECTED log and re-gates `connected`
+            // on fresh streaming, never on the pre-disable carry-over.
+            feed_health.set_connected(Feed::Groww, false);
+            connect_logged = false;
+            streaming_observed = false;
             continue;
         }
 
@@ -1254,6 +1262,74 @@ mod tests {
         assert!(
             src.contains("feed_health.set_subscribed(Feed::Groww"),
             "the bridge must record the subscribe counts in feed-health"
+        );
+    }
+
+    #[test]
+    fn test_runtime_disable_clears_connected_and_rearms_latches() {
+        // LOW 4c: when Groww is runtime-disabled the bridge `continue`s. Before this
+        // fix it left `connected = true` (a stale false-OK green) and kept the
+        // connect-log / streaming latches latched, so a later re-enable would NOT
+        // re-emit the CONNECTED log. The disable branch MUST clear the connected bit
+        // and re-arm both latches. Pin the disable-branch behaviour by source-scan
+        // (`run_groww_bridge` is a TEST-EXEMPT I/O driver).
+        let src = include_str!("groww_bridge.rs");
+        // Build the needle at runtime so this test's literal does not self-match the
+        // include_str! scan (the disable branch is the only real occurrence).
+        let clear = format!("feed_health.set_connected(Feed::Groww, {}false)", "");
+        assert!(
+            src.contains(&clear),
+            "the runtime-disable branch must clear the connected bit (no stale green)"
+        );
+        // The re-arm of both latches must live alongside the disable clear.
+        let disable_idx = src
+            .find("if !feed_runtime.is_enabled(Feed::Groww) {")
+            .expect("disable branch present");
+        let after = &src[disable_idx..disable_idx + 600];
+        assert!(
+            after.contains(&clear)
+                && after.contains("connect_logged = false")
+                && after.contains("streaming_observed = false"),
+            "the disable branch must clear connected AND re-arm connect_logged + \
+             streaming_observed so a re-enable re-emits CONNECTED on fresh streaming"
+        );
+    }
+
+    #[test]
+    fn test_feed_health_connected_roundtrip_on_disable_then_reenable() {
+        // Drive the REAL feed-health state the disable branch + re-enable path use:
+        // streaming → connected=true; disable clears it → connected=false; a fresh
+        // streaming observation after re-enable flips it back to true. Proves the
+        // `set_connected` calls the bridge makes produce the honest verdict signal.
+        let reg = tickvault_common::feed_health::FeedHealthRegistry::new();
+        // Use bool vars (not adjacent bool literals) so this test's source does not
+        // self-trip the connected-true false-OK source-scan in
+        // `test_bridge_connected_gate_is_streaming_not_file_existence`.
+        let streaming = true;
+        let disabled = false;
+        // Streaming observed → connected.
+        reg.set_connected(Feed::Groww, streaming);
+        assert!(
+            reg.snapshot(Feed::Groww, true, true, true, 0)
+                .input
+                .connected,
+            "streaming → connected true"
+        );
+        // Runtime-disable clears it (no stale green).
+        reg.set_connected(Feed::Groww, disabled);
+        assert!(
+            !reg.snapshot(Feed::Groww, false, false, true, 0)
+                .input
+                .connected,
+            "runtime-disable → connected false (stale green cleared)"
+        );
+        // Re-enable + fresh streaming → connected true again.
+        reg.set_connected(Feed::Groww, streaming);
+        assert!(
+            reg.snapshot(Feed::Groww, true, true, true, 0)
+                .input
+                .connected,
+            "re-enable + fresh streaming → connected true again"
         );
     }
 }
