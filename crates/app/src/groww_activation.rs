@@ -336,6 +336,24 @@ async fn activate_groww_lane(
                     unresolved = set.unresolved_stocks.len(),
                     "[feeds] Groww watch-list ready"
                 );
+                // PR-A: persist the Groww instrument set into the SHARED
+                // `instrument_lifecycle` (+ `index_constituency`) master tables
+                // tagged `feed='groww'`. Fire-and-forget + degrade-safe — a
+                // persist failure logs GROWW-MASTER-01 and returns; it never
+                // blocks lane activation or the live feed (cold-path forensic
+                // master write). The Groww lane has no dry-run universe, so
+                // `dry_run=false`.
+                let persist_questdb = questdb.clone();
+                let persist_date = watch_date.clone();
+                tokio::spawn(async move {
+                    tickvault_core::feed::groww::shared_master_writer::persist_groww_instruments(
+                        &persist_questdb,
+                        &set,
+                        &persist_date,
+                        false,
+                    )
+                    .await;
+                });
                 break;
             }
             Err(err) => {

@@ -47,7 +47,10 @@ dhat = []
 # Sub-PR #9 (lifecycle reconciler) + Sub-PR #10 (boot orchestrator) —
 # until then the feature is dormant and the gated code is dead. Per
 # `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md` §21.
-daily_universe_fetcher = []
+# PR-A (2026-06-28): forwards to storage so the gated
+# `index_constituency_persistence` module (which the Groww shared-master writer
+# reuses) is compiled whenever core's `daily_universe_fetcher` is enabled.
+daily_universe_fetcher = ["tickvault-storage/daily_universe_fetcher"]
 
 [dev-dependencies]
 proptest = { workspace = true }

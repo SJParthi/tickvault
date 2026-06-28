@@ -591,6 +591,14 @@ pub enum ErrorCode {
     /// reaches `LaneState::Off` (handles joined-or-force-aborted), so this is
     /// degraded-but-recovered, not data loss. Severity::Medium.
     DhanLane04TeardownTimeout,
+    /// GROWW-MASTER-01 (PR-A 2026-06-28) — the best-effort cold-path write of
+    /// the Groww instrument set into the SHARED `instrument_lifecycle` /
+    /// `index_constituency` master tables (tagged `feed='groww'`) failed
+    /// (QuestDB ILP unreachable / flush error). The Groww feed activation and
+    /// the live tick path are UNAFFECTED — this is a forensic master/metadata
+    /// write, never on the data-correctness or recovery path. Idempotent DEDUP
+    /// UPSERT, so the next boot re-runs. Severity::Medium (auto-triage-safe).
+    GrowwMaster01PersistFailed,
 }
 
 impl ErrorCode {
@@ -735,6 +743,8 @@ impl ErrorCode {
             Self::DhanLane02WsPoolSpawnFailed => "DHAN-LANE-02",
             Self::DhanLane03AuthFailed => "DHAN-LANE-03",
             Self::DhanLane04TeardownTimeout => "DHAN-LANE-04",
+            // PR-A (2026-06-28): Groww shared-master persist
+            Self::GrowwMaster01PersistFailed => "GROWW-MASTER-01",
         }
     }
 
@@ -865,7 +875,10 @@ impl ErrorCode {
             // DHAN-LANE-04 — teardown drain timeout (D2b 2026-06-26): the lane
             // still reaches Off (handles force-aborted), so degraded-but-
             // recovered, not data loss. Medium.
-            | Self::DhanLane04TeardownTimeout => Severity::Medium,
+            | Self::DhanLane04TeardownTimeout
+            // GROWW-MASTER-01 (PR-A 2026-06-28): best-effort cold-path master
+            // write failed; feed + ticks unaffected, next boot re-runs. Medium.
+            | Self::GrowwMaster01PersistFailed => Severity::Medium,
             // Low: trading-day / Dhan other
             // PR #6a (2026-05-19): I-P1-01 (DailyScheduler) + I-P1-02 (DeltaFieldCoverage) retired
             Self::InstrumentP2TradingDayGuard
@@ -1027,6 +1040,10 @@ impl ErrorCode {
             | Self::DhanLane04TeardownTimeout => {
                 ".claude/rules/project/dhan-lane-error-codes.md"
             }
+            // PR-A (2026-06-28): Groww shared-master persist
+            Self::GrowwMaster01PersistFailed => {
+                ".claude/rules/project/groww-shared-master-error-codes.md"
+            }
         }
     }
 
@@ -1169,6 +1186,8 @@ impl ErrorCode {
             Self::DhanLane02WsPoolSpawnFailed,
             Self::DhanLane03AuthFailed,
             Self::DhanLane04TeardownTimeout,
+            // PR-A (2026-06-28): Groww shared-master persist
+            Self::GrowwMaster01PersistFailed,
         ]
     }
 }
@@ -1444,7 +1463,10 @@ mod tests {
         // removing OPTION-CHAIN-01..08 (the entire option_chain REST subsystem
         // was deleted per operator directive — disabled since 2026-06-02 with
         // no live consumer; its QuestDB table was dropped 2026-06-23).
-        assert_eq!(ErrorCode::all().len(), 105);
+        // 2026-06-28 (PR-A Groww shared-master): bumped 105 -> 106 for
+        // GROWW-MASTER-01 (Groww instrument persist into the shared
+        // instrument_lifecycle + index_constituency tables, feed='groww').
+        assert_eq!(ErrorCode::all().len(), 106);
     }
 
     #[test]
@@ -1537,7 +1559,9 @@ mod tests {
                 // PR4 2026-06-01: boot-time previous-day OHLCV fetch coverage
                 || s.starts_with("PREVDAY-")
                 // D2b 2026-06-26: runtime Dhan-lane cold-start FSM
-                || s.starts_with("DHAN-LANE-");
+                || s.starts_with("DHAN-LANE-")
+                // PR-A 2026-06-28: Groww shared-master persist
+                || s.starts_with("GROWW-MASTER-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
