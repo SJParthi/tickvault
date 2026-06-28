@@ -161,6 +161,12 @@ pub struct GrowwInstrumentRow {
     /// `groww_symbol` column (e.g. `NSE-NIFTY`, `BSE-SENSEX`) — the stable,
     /// globally-unique Groww identity used to derive an index `security_id`.
     pub groww_symbol: String,
+    /// `name` column — the human DISPLAY name (e.g. "NIFTY 50", "Nifty Next 50",
+    /// "NIFTY Auto"). For NSE indices this is the field that canonicalizes to the
+    /// descriptive Dhan-allowlist entries (`NIFTY AUTO`, `NIFTY NEXT 50`); the
+    /// `exchange_token` (short code `NIFTYJR`/`NIFTYAUTO`) covers the
+    /// trading-symbol allowlist entries (`NIFTY`, `BANKNIFTY`). May be empty.
+    pub name: String,
     /// `instrument_type` column (`EQ`/`IDX`/`FUT`/`CE`/`PE`).
     pub instrument_type: String,
     /// `segment` column (`CASH`/`FNO`/`COMMODITY`).
@@ -247,6 +253,10 @@ fn parse_groww_master(csv: &str) -> Result<Vec<GrowwInstrumentRow>, WatchBuildEr
             exchange: get(&fields, "exchange"),
             exchange_token: get(&fields, "exchange_token"),
             groww_symbol: get(&fields, "groww_symbol"),
+            // `name` is OPTIONAL (defaults empty if the column is absent), so it
+            // is NOT a mandatory header column — its absence only degrades the
+            // index audit to token-only matching, it never fails the build.
+            name: get(&fields, "name"),
             instrument_type: get(&fields, "instrument_type"),
             segment: get(&fields, "segment"),
             series: get(&fields, "series"),
@@ -352,15 +362,76 @@ fn extract_index_entries(rows: &[GrowwInstrumentRow]) -> Vec<WatchEntry> {
             kind: WatchKind::IndexValue,
             security_id: stable_index_security_id(&r.groww_symbol),
             // PR-A cold-path provenance: indices have no ISIN; carry the stable
-            // `groww_symbol` as the master-row `index_name`/`symbol_name`.
+            // `groww_symbol` as the master-row `index_name`. FIX (2026-06-28):
+            // also carry the Groww DISPLAY `name` (e.g. "NIFTY Auto",
+            // "Nifty Next 50") as `symbol_name` so `groww_indices_absent_vs_dhan`
+            // can canonicalize it against the descriptive Dhan-allowlist entries
+            // (the short `exchange_token` only covers the trading-symbol entries).
+            // `None` if the master row has no `name` value (token-only fallback).
             isin: None,
-            symbol_name: None,
+            symbol_name: (!r.name.is_empty()).then(|| r.name.clone()),
             index_name: Some(r.groww_symbol.clone()),
         })
         .collect();
     entries.sort_by(|a, b| a.exchange_token.cmp(&b.exchange_token));
     entries.dedup_by(|a, b| a.exchange_token == b.exchange_token);
     entries
+}
+
+/// Cross-checks the resolved Groww NSE index set against Dhan's
+/// [`NSE_INDEX_ALLOWLIST`] and returns the canonical names of the
+/// Dhan-tracked indices that have NO matching Groww IDX row, in allowlist
+/// order. This makes the genuine Groww-master limitation (10 sectoral /
+/// broad indices Groww does not publish as an `IDX` row, 2026-06-28)
+/// VISIBLE rather than silently dropped — mirroring the Dhan-side
+/// `allowlist_misses` audit. Reuses `index_extractor`'s own
+/// `canonicalize_index_symbol` so Dhan renames/aliases resolve identically
+/// on both feeds; no parallel matcher is introduced.
+///
+/// FIX (2026-06-28): the Dhan `NSE_INDEX_ALLOWLIST` mixes *trading symbols*
+/// (`NIFTY`, `BANKNIFTY`, `MIDCPNIFTY`, `NIFTYMCAP50`, `NIFTYIT`) and
+/// *descriptive names* (`NIFTY AUTO`, `NIFTY NEXT 50`). A Groww index row
+/// carries BOTH a short `exchange_token` (e.g. `NIFTYJR`, `NIFTYAUTO`) AND a
+/// human display `name` (e.g. "Nifty Next 50", "NIFTY Auto"). Neither field
+/// ALONE canonicalizes to every allowlist entry — the token matches the
+/// trading-symbol entries, the name matches the descriptive entries. So an
+/// allowlist entry is PRESENT if EITHER the canonicalized token OR the
+/// canonicalized display name resolves to it. (The previous version
+/// canonicalized only the short token, falsely flagging ~22 present indices
+/// absent — the live `absent_on_groww=28` bug.)
+///
+/// O(1) EXEMPT: cold-path daily build only (once per Groww master load),
+/// not the per-tick path. Bounded by the 32-entry allowlist × resolved
+/// NSE index count.
+#[cfg(feature = "daily_universe_fetcher")]
+#[must_use]
+fn groww_indices_absent_vs_dhan(index_entries: &[WatchEntry]) -> Vec<&'static str> {
+    use crate::instrument::index_extractor::{NSE_INDEX_ALLOWLIST, canonicalize_index_symbol};
+
+    // Canonicalize BOTH the short subscribe token AND the display name of every
+    // resolved Groww NSE index into one present-set. BSE SENSEX
+    // (`exchange == "BSE"`) is excluded — the allowlist is NSE-only, SENSEX is
+    // tracked separately. The 3 spelling bridges that neither field resolves
+    // directly (Nifty Midcap Select → MIDCPNIFTY, NIFTY Midcap 50 → NIFTYMCAP50,
+    // Nifty Total Market → NIFTY TOTAL MKT) live in the shared
+    // `INDEX_SYMBOL_ALIASES`, so `canonicalize_index_symbol` resolves them.
+    let resolved_canonical: std::collections::HashSet<String> = index_entries
+        .iter()
+        .filter(|e| e.exchange == "NSE")
+        .flat_map(|e| {
+            let mut keys = vec![canonicalize_index_symbol(&e.exchange_token)];
+            if let Some(name) = e.symbol_name.as_deref() {
+                keys.push(canonicalize_index_symbol(name));
+            }
+            keys
+        })
+        .collect();
+
+    NSE_INDEX_ALLOWLIST
+        .iter()
+        .filter(|allowed| !resolved_canonical.contains(&canonicalize_index_symbol(allowed)))
+        .copied()
+        .collect()
 }
 
 /// Resolves NTM constituents (symbol, ISIN) to Groww stock watch entries via the
@@ -551,6 +622,34 @@ fn build_groww_watch_from_csvs(
         );
     }
     let index_entries = extract_index_entries(&rows);
+    // FIX C (2026-06-28): audit Groww vs Dhan index coverage. Emit ONE boot
+    // line naming the Dhan-tracked indices that Groww's master does not carry
+    // as an IDX row, so the genuine Groww limitation is VISIBLE, never silently
+    // dropped. Cold-path, once per master load; feature-gated because the Dhan
+    // `index_extractor` (the allowlist + canonicalizer) lives behind it.
+    #[cfg(feature = "daily_universe_fetcher")]
+    {
+        use crate::instrument::index_extractor::NSE_INDEX_ALLOWLIST;
+        let absent = groww_indices_absent_vs_dhan(&index_entries);
+        let groww_resolved = index_entries.iter().filter(|e| e.exchange == "NSE").count();
+        if absent.is_empty() {
+            info!(
+                groww_resolved,
+                dhan_tracked = NSE_INDEX_ALLOWLIST.len(),
+                absent_on_groww = 0,
+                "Groww index coverage vs Dhan allowlist — full coverage"
+            );
+        } else {
+            metrics::counter!("tv_groww_index_absent_total").increment(absent.len() as u64);
+            warn!(
+                groww_resolved,
+                dhan_tracked = NSE_INDEX_ALLOWLIST.len(),
+                absent_on_groww = absent.len(),
+                absent_names = %absent.join(","),
+                "Groww index coverage vs Dhan allowlist — indices absent on Groww (genuine Groww-master limitation)"
+            );
+        }
+    }
     let ntm = parse_ntm_constituents(ntm_csv)?;
     let ntm_total = ntm.len();
     let (stock_entries, unresolved) = resolve_stock_entries(&ntm, &isin_map);
@@ -733,6 +832,12 @@ mod tests {
             "NSE,{name_token},{name_token},NSE-{name_token},,IDX,CASH,,,,,,,,,,0,0,0,{name_token},0"
         )
     }
+    /// Index row carrying a SHORT subscribe `exchange_token` AND a separate
+    /// human DISPLAY `name` — mirrors the REAL Groww master (e.g. token `NIFTYJR`
+    /// + name "Nifty Next 50"). The 5th column is `name`.
+    fn idx_row_named(token: &str, name: &str) -> String {
+        format!("NSE,{token},{token},NSE-{token},{name},IDX,CASH,,,,,,,,,,0,0,0,{token},0")
+    }
     /// BSE SENSEX master row: numeric token `1`, groww_symbol `BSE-SENSEX`.
     fn bse_sensex_row() -> String {
         "BSE,1,SENSEX,BSE-SENSEX,,IDX,CASH,,,,,,,,,,0,0,0,SENSEX,0".to_string()
@@ -746,6 +851,16 @@ mod tests {
         assert_eq!(rows[0].exchange_token, "2885");
         assert_eq!(rows[0].isin, "INE002A01018");
         assert_eq!(rows[0].instrument_type, "EQ");
+    }
+
+    #[test]
+    fn test_parse_groww_master_parses_name_column() {
+        // FIX (2026-06-28): the `name` display column is now parsed (was discarded).
+        let csv = format!("{HEADER}\n{}\n", idx_row_named("NIFTYJR", "Nifty Next 50"));
+        let rows = parse_groww_master(&csv).expect("parse");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].exchange_token, "NIFTYJR");
+        assert_eq!(rows[0].name, "Nifty Next 50");
     }
 
     #[test]
@@ -909,7 +1024,21 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].index_name.as_deref(), Some("NSE-NIFTY"));
         assert_eq!(entries[0].isin, None);
+        // Empty `name` column → `symbol_name` stays None (token-only fallback).
         assert_eq!(entries[0].symbol_name, None);
+    }
+
+    #[test]
+    fn test_extract_index_entries_retains_display_name() {
+        // FIX (2026-06-28): a Groww index row with a display `name` carries it as
+        // `symbol_name` so the coverage audit can canonicalize it.
+        let csv = format!("{HEADER}\n{}", idx_row_named("NIFTYAUTO", "NIFTY Auto"));
+        let rows = parse_groww_master(&csv).unwrap();
+        let entries = extract_index_entries(&rows);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].exchange_token, "NIFTYAUTO");
+        assert_eq!(entries[0].symbol_name.as_deref(), Some("NIFTY Auto"));
+        assert_eq!(entries[0].index_name.as_deref(), Some("NSE-NIFTYAUTO"));
     }
 
     fn stock_entry(token: &str) -> WatchEntry {
@@ -1185,5 +1314,177 @@ mod tests {
         // tmp file is gone after the rename.
         assert!(!path.with_extension("json.tmp").exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // FIX C (2026-06-28): the 10 Dhan-allowlisted indices Groww's master does
+    // NOT publish as an IDX row (genuine Groww limitation). Canonical
+    // (allowlist) spelling — the assertion is canonicalized so it is resilient
+    // to whitespace/alias differences.
+    #[cfg(feature = "daily_universe_fetcher")]
+    const KNOWN_ABSENT_ON_GROWW: &[&str] = &[
+        "NIFTY 200",
+        "GIFTNIFTY",
+        "NIFTY ENERGY",
+        "NIFTYINFRA",
+        "NIFTY MNC",
+        "NIFTY CONSUMPTION",
+        "NIFTY SERV SECTOR",
+        "NIFTY MID100 FREE",
+        "NIFTY SMALLCAP 50",
+        "NIFTY MICROCAP250",
+    ];
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_groww_indices_absent_vs_dhan_is_exactly_the_ten() {
+        use crate::instrument::index_extractor::{NSE_INDEX_ALLOWLIST, canonicalize_index_symbol};
+
+        let absent_canon: std::collections::HashSet<String> = KNOWN_ABSENT_ON_GROWW
+            .iter()
+            .map(|n| canonicalize_index_symbol(n))
+            .collect();
+
+        // Build a Groww master that carries EVERY allowlisted NSE index EXCEPT
+        // the 10 known-absent ones — exactly the live-master situation.
+        let present: Vec<&&str> = NSE_INDEX_ALLOWLIST
+            .iter()
+            .filter(|name| !absent_canon.contains(&canonicalize_index_symbol(name)))
+            .collect();
+        let mut csv = String::from(HEADER);
+        for name in &present {
+            csv.push('\n');
+            csv.push_str(&idx_row(name));
+        }
+        // BSE SENSEX is present on Groww but is NOT an NSE-allowlist member — it
+        // must not appear in the absent set either way.
+        csv.push('\n');
+        csv.push_str(&bse_sensex_row());
+        csv.push('\n');
+
+        let rows = parse_groww_master(&csv).unwrap();
+        let index_entries = extract_index_entries(&rows);
+
+        // No resolved index was dropped: every NSE name we put in resolves back.
+        let resolved_canon: std::collections::HashSet<String> = index_entries
+            .iter()
+            .filter(|e| e.exchange == "NSE")
+            .map(|e| canonicalize_index_symbol(&e.exchange_token))
+            .collect();
+        assert_eq!(
+            resolved_canon.len(),
+            present.len(),
+            "every present Groww NSE index must remain resolved (none dropped)"
+        );
+
+        let absent = groww_indices_absent_vs_dhan(&index_entries);
+        let absent_set: std::collections::HashSet<String> = absent
+            .iter()
+            .map(|n| canonicalize_index_symbol(n))
+            .collect();
+        assert_eq!(
+            absent_set, absent_canon,
+            "absent_on_groww must be EXACTLY the 10 known indices (canonicalized)"
+        );
+        assert_eq!(absent.len(), 10, "exactly 10 indices absent on Groww");
+    }
+
+    /// The 24 REAL Groww NSE index `(exchange_token, display name)` pairs from
+    /// the live master (2026-06-28). The short tokens (`NIFTYJR`, `NIFTYAUTO`)
+    /// match the trading-symbol allowlist entries; the display names
+    /// ("Nifty Next 50", "NIFTY Auto") match the descriptive entries. The OLD
+    /// audit (token-only) would falsely flag ~22 of these absent → the live
+    /// `absent_on_groww=28` bug. This is the regression the synthetic FIX-C test
+    /// missed (it fed allowlist-spelled tokens, so token-only matched trivially).
+    #[cfg(feature = "daily_universe_fetcher")]
+    const REAL_GROWW_NSE_INDICES: &[(&str, &str)] = &[
+        ("NIFTY", "NIFTY 50"),
+        ("BANKNIFTY", "NIFTY Bank"),
+        ("FINNIFTY", "Nifty Financial Services"),
+        ("INDIAVIX", "India Vix"),
+        ("NIFTYJR", "Nifty Next 50"),
+        ("MIDCAP50", "NIFTY MIDCAP 50"),
+        ("NIFTY100", "NIFTY 100"),
+        ("NIFTY500", "NIFTY 500"),
+        ("NIFTYAUTO", "NIFTY Auto"),
+        ("NIFTYCDTY", "NIFTY Commodities"),
+        ("NIFTYFMCG", "NIFTY FMCG"),
+        ("NIFTYIT", "NIFTY IT"),
+        ("NIFTYMEDIA", "NIFTY Media"),
+        ("NIFTYMETAL", "NIFTY Metal"),
+        ("NIFTYMIDCAP", "NIFTY Midcap 100"),
+        ("NIFTYMIDCAP150", "NIFTY Midcap 150"),
+        ("NIFTYMIDSELECT", "Nifty Midcap Select"),
+        ("NIFTYPHARMA", "NIFTY Pharma"),
+        ("NIFTYPSUBANK", "NIFTY PSU Bank"),
+        ("NIFTYPVTBANK", "NIFTY Pvt Bank"),
+        ("NIFTYREALTY", "NIFTY Realty"),
+        ("NIFTYSMALL", "NIFTY Smallcap 100"),
+        ("NIFTYSMALLCAP250", "NIFTY Smallcap 250"),
+        ("NIFTYTOTALMCAP", "Nifty Total Market"),
+    ];
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_groww_indices_absent_vs_dhan_is_exactly_the_ten_real_spellings() {
+        use crate::instrument::index_extractor::canonicalize_index_symbol;
+
+        // Build a Groww master from the REAL 24 NSE index rows (short token +
+        // display name) plus BSE SENSEX (present on Groww, NOT an NSE-allowlist
+        // member → must not appear in the absent set).
+        let mut csv = String::from(HEADER);
+        for (token, name) in REAL_GROWW_NSE_INDICES {
+            csv.push('\n');
+            csv.push_str(&idx_row_named(token, name));
+        }
+        csv.push('\n');
+        csv.push_str(&bse_sensex_row());
+        csv.push('\n');
+
+        let rows = parse_groww_master(&csv).unwrap();
+        let index_entries = extract_index_entries(&rows);
+
+        let absent = groww_indices_absent_vs_dhan(&index_entries);
+        let absent_set: std::collections::HashSet<String> = absent
+            .iter()
+            .map(|n| canonicalize_index_symbol(n))
+            .collect();
+        let expected: std::collections::HashSet<String> = KNOWN_ABSENT_ON_GROWW
+            .iter()
+            .map(|n| canonicalize_index_symbol(n))
+            .collect();
+
+        // The exact operator-confirmed truth: 10, NOT the buggy 28.
+        assert_eq!(
+            absent.len(),
+            10,
+            "real Groww short-code spellings must yield EXACTLY 10 absent \
+             (the live bug reported 28); got {absent:?}"
+        );
+        assert_eq!(
+            absent_set, expected,
+            "absent_on_groww must be EXACTLY the 10 known-absent indices"
+        );
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_groww_indices_absent_vs_dhan_empty_when_full_coverage() {
+        use crate::instrument::index_extractor::NSE_INDEX_ALLOWLIST;
+
+        // A (hypothetical) Groww master carrying every allowlisted NSE index →
+        // no absences. Proves the audit does not over-report.
+        let mut csv = String::from(HEADER);
+        for name in NSE_INDEX_ALLOWLIST {
+            csv.push('\n');
+            csv.push_str(&idx_row(name));
+        }
+        csv.push('\n');
+        let rows = parse_groww_master(&csv).unwrap();
+        let index_entries = extract_index_entries(&rows);
+        let absent = groww_indices_absent_vs_dhan(&index_entries);
+        assert!(
+            absent.is_empty(),
+            "full coverage must report zero absent, got {absent:?}"
+        );
     }
 }

@@ -29,6 +29,7 @@
 use tracing::warn;
 
 use tickvault_common::config::QuestDbConfig;
+use tickvault_common::sanitize::sanitize_audit_string;
 
 use super::instruments::{GrowwWatchSet, WatchEntry, WatchKind};
 
@@ -67,9 +68,15 @@ pub fn groww_segment_label(entry: &WatchEntry) -> &'static str {
                 ("NSE", true) => "NSE_FNO",
                 ("BSE", true) => "BSE_FNO",
                 (other, _) => {
+                    // `other` + `entry.segment` are CSV-derived (attacker-influenceable
+                    // via a crafted Groww master row), so sanitize before logging:
+                    // `sanitize_audit_string` strips control chars / newlines / BiDi
+                    // overrides so a hostile row cannot inject forged lines into the
+                    // structured log → CloudWatch/Telegram (rust-code.md "never log
+                    // unsanitized untrusted input"). Message stays `&'static str`.
                     warn!(
-                        exchange = %other,
-                        segment = %entry.segment,
+                        exchange = %sanitize_audit_string(other),
+                        segment = %sanitize_audit_string(&entry.segment),
                         "groww shared-master: unexpected exchange for an Ltp entry; \
                          defaulting segment label to NSE_EQ (no panic, surfaced)"
                     );
@@ -494,6 +501,59 @@ mod tests {
     fn test_groww_segment_label_unknown_exchange_falls_back_to_nse_eq_no_panic() {
         // Cannot occur from the resolvers, but must never panic — defensive fallback.
         assert_eq!(groww_segment_label(&ltp("MCX", "CASH")), "NSE_EQ");
+    }
+
+    /// LOW 1 (Groww adversarial security review, 2026-06-28): the unknown-exchange
+    /// `warn!` logs the CSV-derived `exchange` + `segment`. A crafted Groww master
+    /// row could embed a newline/control char to forge log lines (log injection →
+    /// CloudWatch/Telegram). The fix sanitizes both values with
+    /// `sanitize_audit_string` BEFORE logging. This source-scan ratchet pins that
+    /// the warn path uses the sanitizer (a future refactor that drops it fails the
+    /// build), and the assertion below proves the sanitizer actually strips the
+    /// injection chars from a hostile exchange value.
+    #[test]
+    fn test_unknown_exchange_warn_sanitizes_csv_derived_values() {
+        use tickvault_common::sanitize::sanitize_audit_string;
+
+        // 1) Calling the fallback path with a hostile exchange must not panic and
+        //    still returns the safe `&'static str` label (the log line is the only
+        //    place the raw value would have appeared).
+        let hostile = ltp("EVIL\n[FORGED] credential=leaked\r", "CA\nSH");
+        assert_eq!(
+            groww_segment_label(&hostile),
+            "NSE_EQ",
+            "hostile exchange still maps to the safe fallback label"
+        );
+
+        // 2) The sanitizer strips the injection vectors a crafted row would carry.
+        let clean = sanitize_audit_string("EVIL\n[FORGED] credential=leaked\r");
+        assert!(!clean.contains('\n'), "newline must be stripped: {clean}");
+        assert!(
+            !clean.contains('\r'),
+            "carriage return must be stripped: {clean}"
+        );
+
+        // 3) Source-scan ratchet: the unknown-exchange warn arm MUST route the
+        //    CSV-derived values through sanitize_audit_string. Scope to the
+        //    `groww_segment_label` body so the scan can't be satisfied by this
+        //    test's own text.
+        let file = include_str!("shared_master_writer.rs");
+        let start = file
+            .find("pub fn groww_segment_label(")
+            .expect("groww_segment_label present");
+        let end = file[start..]
+            .find("fn watch_date_to_ist_midnight_nanos")
+            .map(|o| start + o)
+            .expect("next fn follows groww_segment_label");
+        let body = &file[start..end];
+        assert!(
+            body.contains("sanitize_audit_string(other)"),
+            "the unknown-exchange warn must sanitize the CSV-derived `exchange`"
+        );
+        assert!(
+            body.contains("sanitize_audit_string(&entry.segment)"),
+            "the unknown-exchange warn must sanitize the CSV-derived `segment`"
+        );
     }
 
     // ── build_groww_lifecycle_rows (feature-gated: storage row type) ──
