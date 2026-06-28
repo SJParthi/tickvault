@@ -28,24 +28,44 @@ fn read_src(file: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// Extract the body of the named fn (from its signature line to the next
-/// top-level `fn ` / end-of-buffer marker), so we scan ONLY that builder.
+/// Extract the body of the named fn by BRACE-MATCHING: from the signature
+/// marker, find the first `{`, then walk counting `{`/`}` depth and return the
+/// slice from that `{` to the matching `}` at depth 0.
+///
+/// Brace-matching (vs the old "cut at the next `\nfn `/`\npub `" heuristic) makes
+/// the extracted region EXACT regardless of any nested fn / closure inside a
+/// builder — a future inline helper or closure can no longer terminate the
+/// extraction early and silently under-count the sanitize-wrapped writes.
 fn extract_fn_body<'a>(src: &'a str, fn_sig_marker: &str) -> &'a str {
     let start = src
         .find(fn_sig_marker)
         .unwrap_or_else(|| panic!("fn marker not found: {fn_sig_marker}"));
     let rest = &src[start..];
-    // The builder fns are short and immediately followed by `fn ` (another
-    // builder/append) or `pub async fn`. Cut at the next `\nfn ` or `\npub `
-    // after the opening, whichever comes first; fall back to end.
-    let after = &rest[fn_sig_marker.len()..];
-    let cut = after
-        .find("\nfn ")
-        .into_iter()
-        .chain(after.find("\npub "))
-        .min()
-        .unwrap_or(after.len());
-    &rest[..fn_sig_marker.len() + cut]
+    // Byte offset of the first `{` after the signature marker — the start of
+    // the body block. (The marker ends with `(`, so this is the body brace, not
+    // a brace inside the signature.)
+    let open_rel = rest
+        .find('{')
+        .unwrap_or_else(|| panic!("no opening brace for fn: {fn_sig_marker}"));
+    let mut depth: usize = 0;
+    let mut close_rel: Option<usize> = None;
+    for (i, b) in rest.as_bytes().iter().enumerate().skip(open_rel) {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close_rel = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close_rel =
+        close_rel.unwrap_or_else(|| panic!("unbalanced braces for fn: {fn_sig_marker}"));
+    // Inclusive of the closing brace so the body slice is the full `{ … }` block.
+    &rest[open_rel..=close_rel]
 }
 
 /// For every `.symbol(...)` / `.column_str(...)` STATEMENT (which rustfmt may wrap
