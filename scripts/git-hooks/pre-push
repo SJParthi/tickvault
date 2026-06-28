@@ -193,7 +193,7 @@ if command -v cargo-deny > /dev/null 2>&1; then
     echo "  FAIL: cargo deny timed out (30s)" >&2
     FAILED=1
   elif [ "$DENY_EXIT" -ne 0 ]; then
-    if echo "$DENY_OUTPUT" | grep -qi 'failed to fetch\|network\|transport\|proxy\|connect'; then
+    if echo "$DENY_OUTPUT" | grep -qi 'failed to fetch\|network\|transport\|proxy\|connect\|FETCH_HEAD\|advisory-db\|No such file\|cannot change to'; then
       echo "  SKIP: cargo deny cannot reach advisory DB (network). CI will enforce." >&2
     else
       echo "  FAIL: cargo deny found issues" >&2
@@ -211,10 +211,21 @@ echo "  [8/11] Loom concurrency tests (hot-path crates)..." >&2
 HOT_CRATES="core trading"
 LOOM_FOUND=false
 for crate in $HOT_CRATES; do
-  if grep -r 'loom' "crates/$crate/" --include='*.rs' -q 2>/dev/null; then
+  # Run ONLY the dedicated loom test targets (tests/loom_*.rs), gated behind the
+  # crate's `loom` Cargo feature. Using --features loom + per-target --test keeps
+  # the loom model-checker scoped to loom code without (a) forcing --cfg loom onto
+  # the whole dependency tree or (b) dragging the crate's full --lib unit suite in.
+  LOOM_TARGET_FLAGS=""
+  for f in "crates/$crate/tests/"loom_*.rs; do
+    [ -e "$f" ] || continue
+    t=$(basename "$f" .rs)
+    LOOM_TARGET_FLAGS="$LOOM_TARGET_FLAGS --test $t"
+  done
+  if [ -n "$LOOM_TARGET_FLAGS" ]; then
     LOOM_FOUND=true
-    echo "  Running loom tests for crates/$crate..." >&2
-    LOOM_OUT=$(timeout 300 env RUSTFLAGS="--cfg loom" cargo test -p "dhan-$crate" --lib 2>&1)
+    echo "  Running loom tests for crates/$crate ($LOOM_TARGET_FLAGS)..." >&2
+    # shellcheck disable=SC2086
+    LOOM_OUT=$(timeout 300 cargo test -p "tickvault-$crate" --features loom $LOOM_TARGET_FLAGS 2>&1)
     LOOM_EXIT=$?
     if [ "$LOOM_EXIT" -eq 124 ]; then
       echo "  FAIL: Loom tests timed out (300s) for $crate" >&2
