@@ -350,6 +350,10 @@ async fn main() -> Result<()> {
         std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_STATUS_FILE_DEFAULT),
         std::sync::Arc::clone(&feed_runtime),
         std::sync::Arc::clone(&feed_health),
+        // ws_event_audit forensic sender (2026-06-29): one `feed='groww'` row per
+        // Groww connect/disconnect/reconnect, drained by the SAME consumer Dhan +
+        // order-update use. Closes the audit gap (Groww connected but wrote no row).
+        Some(spawn_ws_event_audit_consumer(config.questdb.clone())),
     ));
     tokio::spawn(
         tickvault_app::groww_sidecar_supervisor::run_groww_sidecar_supervisor(

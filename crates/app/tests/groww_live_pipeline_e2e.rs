@@ -223,6 +223,7 @@ async fn groww_ticks_and_candles_land_tagged_feed_groww() {
         status_file.clone(),
         Arc::clone(&feed_runtime),
         Arc::clone(&feed_health),
+        None,
     ));
 
     // --- Assert the 5 ticks landed in `ticks` tagged feed='groww' ---
@@ -378,6 +379,7 @@ async fn malformed_ndjson_line_is_skipped_and_valid_lines_land() {
         status_file.clone(),
         Arc::clone(&feed_runtime),
         Arc::clone(&feed_health),
+        None,
     ));
 
     let ticks_sql =
@@ -444,6 +446,7 @@ async fn replay_same_ndjson_is_idempotent_no_duplicate_rows() {
             status_file.clone(),
             Arc::clone(&feed_runtime),
             Arc::clone(&feed_health),
+            None,
         ));
         let _ = wait_until_count(&ticks_sql, 3, Duration::from_secs(15)).await;
         bridge.abort();

@@ -44,12 +44,15 @@ use notify::{EventKind, RecursiveMode, Watcher};
 use serde::Deserialize;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use tickvault_api::feed_state::{Feed, FeedRuntimeState};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::tick_types::ParsedTick;
 use tickvault_common::types::ExchangeSegment;
+use tickvault_common::ws_event_types::{
+    WS_EVENT_NO_DHAN_CODE, WsEventAuditRow, WsEventKind, WsType,
+};
 use tickvault_storage::groww_persistence::{GrowwLiveTickRow, GrowwLiveTickWriter};
 use tickvault_storage::seal_writer_runner::global_seal_sender;
 use tickvault_trading::candles::{FeedStrategy, MultiTfAggregator};
@@ -89,6 +92,75 @@ pub const GROWW_STATUS_FILE_DEFAULT: &str = "data/groww/groww-status.json";
 const GROWW_BRIDGE_FALLBACK_POLL_MS: u64 = 1_000;
 /// Fallback (watcher-down) poll interval.
 const GROWW_BRIDGE_FALLBACK_POLL: Duration = Duration::from_millis(GROWW_BRIDGE_FALLBACK_POLL_MS);
+
+/// Build ONE `ws_event_audit` row for a Groww bridge lifecycle transition.
+///
+/// Mirrors the Dhan `WebSocketConnection::emit_ws_audit`
+/// (`crates/core/src/websocket/connection.rs`) but stamps `feed='groww'` +
+/// `ws_type='groww_bridge'` so a Groww lifecycle row never collides with a Dhan
+/// row (per-feed identity in the DEDUP key). Pure builder — no I/O — so the
+/// transition mapping is unit-testable without a live QuestDB.
+///
+/// COLD PATH: fired at most once per connect/disconnect/reconnect transition,
+/// NEVER per tick — the single owned-`String` reason is off the tick path.
+fn build_groww_ws_audit_row(
+    event_kind: WsEventKind,
+    source: &str,
+    reason: &str,
+) -> WsEventAuditRow {
+    // IST nanos for the designated timestamp + IST-midnight for the day —
+    // identical math to the Dhan helper (`connection.rs:688-692`).
+    let now_utc_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let now_ist_nanos =
+        now_utc_nanos.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+    let nanos_per_day: i64 = 86_400 * 1_000_000_000;
+    let trading_date_ist_nanos = now_ist_nanos - now_ist_nanos.rem_euclid(nanos_per_day);
+    WsEventAuditRow {
+        event_ts_ist_nanos: now_ist_nanos,
+        trading_date_ist_nanos,
+        feed: Feed::Groww,
+        ws_type: WsType::GrowwBridge,
+        // Single Groww bridge (pool_size 1) — matches the single-conn convention
+        // and the DEDUP composite `(ws_type, connection_index)`.
+        connection_index: 0,
+        pool_size: 1,
+        event_kind,
+        source: source.to_string(),
+        reason: reason.to_string(),
+        // Groww has no Dhan disconnect codes.
+        dhan_code: WS_EVENT_NO_DHAN_CODE,
+        down_secs: 0,
+        attempts: 0,
+        market_hours: tickvault_common::market_hours::is_within_market_hours_ist(),
+    }
+}
+
+/// Emit ONE Groww `ws_event_audit` row, best-effort (`try_send`).
+///
+/// Non-blocking: drop on full/closed exactly like the Dhan helper — the bridge
+/// loop is NEVER stalled by the forensic side-record (the CloudWatch log +
+/// `feed_health` for the same event still fired, so no operator-visible signal is
+/// lost; an ILP outage is AUDIT-WS-01 Medium on the shared consumer). No-op when
+/// no audit channel is attached (defensive / test builds).
+fn emit_groww_ws_audit(
+    tx: Option<&tokio::sync::mpsc::Sender<WsEventAuditRow>>,
+    event_kind: WsEventKind,
+    source: &str,
+    reason: &str,
+) {
+    let Some(tx) = tx else {
+        return;
+    };
+    let row = build_groww_ws_audit_row(event_kind, source, reason);
+    if let Err(err) = tx.try_send(row) {
+        // %err (Display) prints only "full"/"closed" — NOT the dropped row, whose
+        // pre-redaction reason must never reach a log (security review).
+        debug!(
+            reason = %err,
+            "groww ws_event_audit channel full/closed — row dropped (log+feed_health still fired)"
+        );
+    }
+}
 
 /// One line of the sidecar's PROOF status file. `event` is `"subscribed"` or
 /// `"streaming"`; the counts are the SIDs the sidecar actually subscribed today.
@@ -687,6 +759,11 @@ pub async fn run_groww_bridge(
     // Live-feed health (operator 2026-06-22): record Groww ticks/candles +
     // connected-state so GET /api/feeds/health reports the truthful verdict.
     feed_health: Arc<tickvault_common::feed_health::FeedHealthRegistry>,
+    // ws_event_audit forensic sender (2026-06-29): one `feed='groww'` row per
+    // Groww connect/disconnect/reconnect, drained by the SAME consumer Dhan uses
+    // (`spawn_ws_event_audit_consumer`). `Option` mirrors the Dhan `ws_audit_tx`
+    // convention so a `None` build (defensive / test) is a no-op.
+    ws_audit_tx: Option<tokio::sync::mpsc::Sender<WsEventAuditRow>>,
 ) {
     info!(
         path = %tick_file_path.display(),
@@ -717,6 +794,13 @@ pub async fn run_groww_bridge(
     // zero-poll path alive across a transient watcher failure.
     let mut connect_logged = false;
     let mut streaming_observed = false;
+    // ws_event_audit edge latches (2026-06-29, audit-findings Rule 4 — edge-trigger
+    // only): `audited_connected` gates the Connected/Reconnected emit to fire ONCE
+    // per streaming rising edge (never per loop turn). `prior_disconnect` is set when
+    // a Disconnected/DisconnectedOffHours row was emitted on a disable falling edge,
+    // so the NEXT rising edge is classified Reconnected (not a second Connected).
+    let mut audited_connected = false;
+    let mut prior_disconnect = false;
 
     loop {
         // Wake on EITHER a filesystem event (zero-latency) OR the fallback timer.
@@ -754,6 +838,26 @@ pub async fn run_groww_bridge(
             // re-enable re-emits the ONE CONNECTED log and re-gates `connected`
             // on fresh streaming, never on the pre-disable carry-over.
             feed_health.set_connected(Feed::Groww, false);
+            // ws_event_audit falling edge: emit ONE Disconnected row on the
+            // transition out of a previously-audited connected state (off-hours →
+            // DisconnectedOffHours Low, else Disconnected). Gated on
+            // `audited_connected` so a disable while already-disconnected (or
+            // never-connected) does not spam a row each idle turn.
+            if audited_connected {
+                let kind = if tickvault_common::market_hours::is_within_market_hours_ist() {
+                    WsEventKind::Disconnected
+                } else {
+                    WsEventKind::DisconnectedOffHours
+                };
+                emit_groww_ws_audit(
+                    ws_audit_tx.as_ref(),
+                    kind,
+                    "feed_disabled",
+                    "groww disabled",
+                );
+                prior_disconnect = true;
+            }
+            audited_connected = false;
             connect_logged = false;
             streaming_observed = false;
             continue;
@@ -803,6 +907,21 @@ pub async fn run_groww_bridge(
         // is NOT connected — the verdict engine then reports the honest Unknown/Down,
         // never a misleading green.
         feed_health.set_connected(Feed::Groww, streaming_observed);
+
+        // ws_event_audit rising edge: on the FIRST streaming observation since the
+        // last (re)arm, emit ONE row — Reconnected if a Disconnected was emitted
+        // since the last connect, else Connected. Gated on `audited_connected` so
+        // it fires once per rising edge, never per loop turn (audit-findings Rule 4).
+        if streaming_observed && !audited_connected {
+            let (kind, source) = if prior_disconnect {
+                (WsEventKind::Reconnected, "groww_resumed")
+            } else {
+                (WsEventKind::Connected, "groww_sidecar")
+            };
+            emit_groww_ws_audit(ws_audit_tx.as_ref(), kind, source, "groww streaming");
+            audited_connected = true;
+            prior_disconnect = false;
+        }
     }
 }
 
@@ -1409,7 +1528,9 @@ mod tests {
         let disable_idx = src
             .find("if !feed_runtime.is_enabled(Feed::Groww) {")
             .expect("disable branch present");
-        let after = &src[disable_idx..disable_idx + 600];
+        // Window widened (PR-10) to span the inserted ws_event_audit falling-edge
+        // emit block — the latch re-arm now lives just below it.
+        let after = &src[disable_idx..disable_idx + 1600];
         assert!(
             after.contains(&clear)
                 && after.contains("connect_logged = false")
@@ -1454,6 +1575,121 @@ mod tests {
                 .input
                 .connected,
             "re-enable + fresh streaming → connected true again"
+        );
+    }
+
+    // --- PR-10: Groww ws_event_audit emit (the audit-gap fix) ---
+
+    #[test]
+    fn test_groww_connected_transition_builds_connected_row() {
+        // First streaming/parsed-tick rising edge → a Connected row, feed=Groww.
+        let row =
+            build_groww_ws_audit_row(WsEventKind::Connected, "groww_sidecar", "groww streaming");
+        assert_eq!(row.event_kind, WsEventKind::Connected);
+        assert_eq!(row.feed, Feed::Groww);
+        assert_eq!(row.source, "groww_sidecar");
+    }
+
+    #[test]
+    fn test_groww_disable_builds_disconnected_offhours_or_disconnected_row() {
+        // The disable falling edge classifies on market hours: DisconnectedOffHours
+        // when out-of-session, Disconnected in-session. Assert the builder honours
+        // BOTH kinds (the bridge picks the kind; the builder stamps it faithfully).
+        let off = build_groww_ws_audit_row(
+            WsEventKind::DisconnectedOffHours,
+            "feed_disabled",
+            "groww disabled",
+        );
+        assert_eq!(off.event_kind, WsEventKind::DisconnectedOffHours);
+        assert_eq!(off.feed, Feed::Groww);
+        let on =
+            build_groww_ws_audit_row(WsEventKind::Disconnected, "feed_disabled", "groww disabled");
+        assert_eq!(on.event_kind, WsEventKind::Disconnected);
+        assert_eq!(on.source, "feed_disabled");
+    }
+
+    #[test]
+    fn test_groww_reconnect_builds_reconnected_row() {
+        // A second streaming edge after a disable → Reconnected (NOT a 2nd Connected).
+        let row =
+            build_groww_ws_audit_row(WsEventKind::Reconnected, "groww_resumed", "groww streaming");
+        assert_eq!(row.event_kind, WsEventKind::Reconnected);
+        assert_eq!(row.feed, Feed::Groww);
+        assert_eq!(row.source, "groww_resumed");
+    }
+
+    #[test]
+    fn test_groww_audit_row_stamps_feed_groww_and_growwbridge_wstype() {
+        // The row identity that keeps a Groww row distinct from a Dhan row in the
+        // feed-keyed DEDUP, and the no-Dhan-code/single-conn convention.
+        let row =
+            build_groww_ws_audit_row(WsEventKind::Connected, "groww_sidecar", "groww streaming");
+        assert_eq!(row.feed, Feed::Groww);
+        assert_eq!(row.ws_type, WsType::GrowwBridge);
+        assert_eq!(row.connection_index, 0);
+        assert_eq!(row.pool_size, 1);
+        assert_eq!(row.dhan_code, WS_EVENT_NO_DHAN_CODE);
+        assert_eq!(row.down_secs, 0);
+        assert_eq!(row.attempts, 0);
+        // Round-trips cleanly through the SAME multi-feed append path Dhan uses.
+        let mut writer =
+            tickvault_storage::ws_event_audit_persistence::WsEventAuditWriter::for_test();
+        writer
+            .append_row(&row)
+            .expect("groww row appends to the shared writer");
+        assert_eq!(writer.pending(), 1);
+    }
+
+    #[test]
+    fn test_emit_groww_ws_audit_is_noop_when_tx_none() {
+        // The Option<Sender> convention: a None build is a no-op (defensive/test),
+        // exactly like the Dhan `emit_ws_audit` early-return. No panic, no work.
+        emit_groww_ws_audit(
+            None,
+            WsEventKind::Connected,
+            "groww_sidecar",
+            "groww streaming",
+        );
+    }
+
+    #[test]
+    fn test_emit_groww_ws_audit_sends_row_when_tx_present() {
+        // With a channel attached, one emit lands exactly one row.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<WsEventAuditRow>(4);
+        emit_groww_ws_audit(
+            Some(&tx),
+            WsEventKind::Connected,
+            "groww_sidecar",
+            "groww streaming",
+        );
+        let row = rx.try_recv().expect("one groww audit row was sent");
+        assert_eq!(row.feed, Feed::Groww);
+        assert_eq!(row.ws_type, WsType::GrowwBridge);
+        assert_eq!(row.event_kind, WsEventKind::Connected);
+    }
+
+    #[test]
+    fn test_groww_bridge_emits_ws_event_audit_on_connect_and_disconnect() {
+        // Source-scan ratchet (mirrors the other bridge source-scan guards): a future
+        // refactor cannot silently drop the audit emit on the connect rising edge OR
+        // the disable falling edge. `run_groww_bridge` is a TEST-EXEMPT I/O driver.
+        let src = include_str!("groww_bridge.rs");
+        // Build the needle at runtime so this test literal does not self-match the scan.
+        let connected = format!("WsEventKind::{}", "Connected");
+        let disconnected = format!("WsEventKind::{}", "Disconnected");
+        // The connect rising edge must emit on a Connected/Reconnected kind.
+        assert!(
+            src.contains("emit_groww_ws_audit(") && src.contains(&connected),
+            "the bridge must emit a ws_event_audit row on the connect rising edge"
+        );
+        // The disable falling edge must emit on a Disconnected/DisconnectedOffHours kind.
+        let disable_idx = src
+            .find("if !feed_runtime.is_enabled(Feed::Groww) {")
+            .expect("disable branch present");
+        let after = &src[disable_idx..disable_idx + 1600];
+        assert!(
+            after.contains("emit_groww_ws_audit(") && after.contains(&disconnected),
+            "the disable branch must emit a Disconnected/DisconnectedOffHours audit row"
         );
     }
 }
