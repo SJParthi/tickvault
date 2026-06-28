@@ -363,6 +363,40 @@ fn extract_index_entries(rows: &[GrowwInstrumentRow]) -> Vec<WatchEntry> {
     entries
 }
 
+/// Cross-checks the resolved Groww NSE index set against Dhan's
+/// [`NSE_INDEX_ALLOWLIST`] and returns the canonical names of the
+/// Dhan-tracked indices that have NO matching Groww IDX row, in allowlist
+/// order. This makes the genuine Groww-master limitation (10 sectoral /
+/// broad indices Groww does not publish as an `IDX` row, 2026-06-28)
+/// VISIBLE rather than silently dropped — mirroring the Dhan-side
+/// `allowlist_misses` audit. Reuses `index_extractor`'s own
+/// `canonicalize_index_symbol` so Dhan renames/aliases resolve identically
+/// on both feeds; no parallel matcher is introduced.
+///
+/// O(1) EXEMPT: cold-path daily build only (once per Groww master load),
+/// not the per-tick path. Bounded by the 32-entry allowlist × resolved
+/// NSE index count.
+#[cfg(feature = "daily_universe_fetcher")]
+#[must_use]
+fn groww_indices_absent_vs_dhan(index_entries: &[WatchEntry]) -> Vec<&'static str> {
+    use crate::instrument::index_extractor::{NSE_INDEX_ALLOWLIST, canonicalize_index_symbol};
+
+    // Canonicalize every resolved Groww NSE index name (the bare NSE name is the
+    // `exchange_token` for NSE indices). BSE SENSEX (`exchange == "BSE"`) is
+    // excluded — the allowlist is NSE-only, SENSEX is tracked separately.
+    let resolved_canonical: std::collections::HashSet<String> = index_entries
+        .iter()
+        .filter(|e| e.exchange == "NSE")
+        .map(|e| canonicalize_index_symbol(&e.exchange_token))
+        .collect();
+
+    NSE_INDEX_ALLOWLIST
+        .iter()
+        .filter(|allowed| !resolved_canonical.contains(&canonicalize_index_symbol(allowed)))
+        .copied()
+        .collect()
+}
+
 /// Resolves NTM constituents (symbol, ISIN) to Groww stock watch entries via the
 /// ISIN map. Returns the resolved entries (sorted by token for determinism) plus
 /// the symbols that did not resolve (logged by name). O(1) per constituent.
@@ -551,6 +585,34 @@ fn build_groww_watch_from_csvs(
         );
     }
     let index_entries = extract_index_entries(&rows);
+    // FIX C (2026-06-28): audit Groww vs Dhan index coverage. Emit ONE boot
+    // line naming the Dhan-tracked indices that Groww's master does not carry
+    // as an IDX row, so the genuine Groww limitation is VISIBLE, never silently
+    // dropped. Cold-path, once per master load; feature-gated because the Dhan
+    // `index_extractor` (the allowlist + canonicalizer) lives behind it.
+    #[cfg(feature = "daily_universe_fetcher")]
+    {
+        use crate::instrument::index_extractor::NSE_INDEX_ALLOWLIST;
+        let absent = groww_indices_absent_vs_dhan(&index_entries);
+        let groww_resolved = index_entries.iter().filter(|e| e.exchange == "NSE").count();
+        if absent.is_empty() {
+            info!(
+                groww_resolved,
+                dhan_tracked = NSE_INDEX_ALLOWLIST.len(),
+                absent_on_groww = 0,
+                "Groww index coverage vs Dhan allowlist — full coverage"
+            );
+        } else {
+            metrics::counter!("tv_groww_index_absent_total").increment(absent.len() as u64);
+            warn!(
+                groww_resolved,
+                dhan_tracked = NSE_INDEX_ALLOWLIST.len(),
+                absent_on_groww = absent.len(),
+                absent_names = %absent.join(","),
+                "Groww index coverage vs Dhan allowlist — indices absent on Groww (genuine Groww-master limitation)"
+            );
+        }
+    }
     let ntm = parse_ntm_constituents(ntm_csv)?;
     let ntm_total = ntm.len();
     let (stock_entries, unresolved) = resolve_stock_entries(&ntm, &isin_map);
@@ -1185,5 +1247,99 @@ mod tests {
         // tmp file is gone after the rename.
         assert!(!path.with_extension("json.tmp").exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // FIX C (2026-06-28): the 10 Dhan-allowlisted indices Groww's master does
+    // NOT publish as an IDX row (genuine Groww limitation). Canonical
+    // (allowlist) spelling — the assertion is canonicalized so it is resilient
+    // to whitespace/alias differences.
+    #[cfg(feature = "daily_universe_fetcher")]
+    const KNOWN_ABSENT_ON_GROWW: &[&str] = &[
+        "NIFTY 200",
+        "GIFTNIFTY",
+        "NIFTY ENERGY",
+        "NIFTYINFRA",
+        "NIFTY MNC",
+        "NIFTY CONSUMPTION",
+        "NIFTY SERV SECTOR",
+        "NIFTY MID100 FREE",
+        "NIFTY SMALLCAP 50",
+        "NIFTY MICROCAP250",
+    ];
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_groww_indices_absent_vs_dhan_is_exactly_the_ten() {
+        use crate::instrument::index_extractor::{NSE_INDEX_ALLOWLIST, canonicalize_index_symbol};
+
+        let absent_canon: std::collections::HashSet<String> = KNOWN_ABSENT_ON_GROWW
+            .iter()
+            .map(|n| canonicalize_index_symbol(n))
+            .collect();
+
+        // Build a Groww master that carries EVERY allowlisted NSE index EXCEPT
+        // the 10 known-absent ones — exactly the live-master situation.
+        let present: Vec<&&str> = NSE_INDEX_ALLOWLIST
+            .iter()
+            .filter(|name| !absent_canon.contains(&canonicalize_index_symbol(name)))
+            .collect();
+        let mut csv = String::from(HEADER);
+        for name in &present {
+            csv.push('\n');
+            csv.push_str(&idx_row(name));
+        }
+        // BSE SENSEX is present on Groww but is NOT an NSE-allowlist member — it
+        // must not appear in the absent set either way.
+        csv.push('\n');
+        csv.push_str(&bse_sensex_row());
+        csv.push('\n');
+
+        let rows = parse_groww_master(&csv).unwrap();
+        let index_entries = extract_index_entries(&rows);
+
+        // No resolved index was dropped: every NSE name we put in resolves back.
+        let resolved_canon: std::collections::HashSet<String> = index_entries
+            .iter()
+            .filter(|e| e.exchange == "NSE")
+            .map(|e| canonicalize_index_symbol(&e.exchange_token))
+            .collect();
+        assert_eq!(
+            resolved_canon.len(),
+            present.len(),
+            "every present Groww NSE index must remain resolved (none dropped)"
+        );
+
+        let absent = groww_indices_absent_vs_dhan(&index_entries);
+        let absent_set: std::collections::HashSet<String> = absent
+            .iter()
+            .map(|n| canonicalize_index_symbol(n))
+            .collect();
+        assert_eq!(
+            absent_set, absent_canon,
+            "absent_on_groww must be EXACTLY the 10 known indices (canonicalized)"
+        );
+        assert_eq!(absent.len(), 10, "exactly 10 indices absent on Groww");
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_groww_indices_absent_vs_dhan_empty_when_full_coverage() {
+        use crate::instrument::index_extractor::NSE_INDEX_ALLOWLIST;
+
+        // A (hypothetical) Groww master carrying every allowlisted NSE index →
+        // no absences. Proves the audit does not over-report.
+        let mut csv = String::from(HEADER);
+        for name in NSE_INDEX_ALLOWLIST {
+            csv.push('\n');
+            csv.push_str(&idx_row(name));
+        }
+        csv.push('\n');
+        let rows = parse_groww_master(&csv).unwrap();
+        let index_entries = extract_index_entries(&rows);
+        let absent = groww_indices_absent_vs_dhan(&index_entries);
+        assert!(
+            absent.is_empty(),
+            "full coverage must report zero absent, got {absent:?}"
+        );
     }
 }

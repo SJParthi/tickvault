@@ -134,3 +134,13 @@ build). New struct fields only (no new pub fn) → pub-fn ratchet stays ≤ base
 | 2 | GROWW_MAX_SUBSCRIBE=60 override | entries=60, master_entries=767; master tables still get full 767/742 |
 | 3 | QuestDB down during persist | GROWW-MASTER-01 logged, feed unaffected (unchanged) |
 | 4 | Dhan + Groww same id+segment | distinct rows under (security_id,exchange_segment,feed) (unchanged) |
+
+## Per-Item Guarantee Matrix
+
+The full 15-row 100% Guarantee Matrix and the 7-row Resilience Demand Matrix
+from `per-wave-guarantee-matrix.md` apply to every item in this plan. See
+`See per-wave-guarantee-matrix.md` (Item 22 / Item 24 canonical form). All
+15 + 7 rows apply to each item above: cold-path master persistence reuses the
+existing DEDUP `(security_id, exchange_segment, feed)` composite-key uniqueness
+(I-P1-11), the `GROWW-MASTER-01` typed ErrorCode + runbook covers logging /
+alerting / audit, and no hot path or tick-drop path is touched.
