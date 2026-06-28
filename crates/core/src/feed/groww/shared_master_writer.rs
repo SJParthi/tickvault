@@ -107,8 +107,12 @@ fn watch_date_to_ist_midnight_nanos(watch_date: &str) -> i64 {
 /// but NO ILP append runs, so a Day-1 dry-run never leaks into the live tables.
 /// Pure, zero-alloc, no I/O — extracted from [`persist_groww_instruments`] so the
 /// dry-run decision is unit-testable without touching QuestDB.
+///
+/// Module-internal (`fn`, not `pub`): the only caller is [`persist_groww_instruments`]
+/// in this module; the in-module `#[cfg(test)]` tests call it directly. Keeping it
+/// private (no external surface) is the correct shape for a module-local pure helper.
 #[must_use]
-pub fn should_skip_master_append(dry_run: bool) -> bool {
+fn should_skip_master_append(dry_run: bool) -> bool {
     dry_run
 }
 
@@ -121,9 +125,14 @@ pub fn should_skip_master_append(dry_run: bool) -> bool {
 /// (wire `GROWW-MASTER-01`). TOTAL — never panics, has no else-less arm. The
 /// caller only logs+counts+returns with this; it NEVER aborts the feed, an
 /// order, or a tick. Extracted so the degrade contract is unit-testable.
+///
+/// Module-internal (`fn`, not `pub`): the only callers are the two failure arms
+/// of [`persist_groww_instruments`] in this module; the in-module `#[cfg(test)]`
+/// tests call it directly. Keeping it private is the correct shape for a
+/// module-local pure helper.
 #[cfg(feature = "daily_universe_fetcher")]
 #[must_use]
-pub fn classify_persist_failure(stage: &'static str) -> (&'static str, ErrorCode) {
+fn classify_persist_failure(stage: &'static str) -> (&'static str, ErrorCode) {
     (stage, ErrorCode::GrowwMaster01PersistFailed)
 }
 
@@ -255,10 +264,8 @@ pub fn build_groww_constituency_rows<'a>(
 /// `index_constituency`) and their row types / append fns live behind the storage
 /// `daily_universe_fetcher` feature. The non-gated stub below keeps the call site compiling
 /// when the feature is off (in which case the master tables themselves do not exist).
-// TEST-EXEMPT: network/QuestDB I/O orchestration — the pure builders (groww_segment_label /
-// build_groww_lifecycle_rows / build_groww_constituency_rows) are unit-tested below; the bulk
-// append fns it reuses are unit-tested + boot-integration-exercised in the storage crate.
 #[cfg(feature = "daily_universe_fetcher")]
+// TEST-EXEMPT: cold-path ILP I/O orchestration; not unit-testable without live QuestDB. The pure builders (groww_segment_label / build_groww_lifecycle_rows / build_groww_constituency_rows) + the should_skip_master_append / classify_persist_failure gates are unit-tested below; the bulk append fns it reuses are unit-tested + boot-integration-exercised in the storage crate.
 pub async fn persist_groww_instruments(
     questdb: &QuestDbConfig,
     set: &GrowwWatchSet,
@@ -353,6 +360,7 @@ pub async fn persist_groww_instruments(
 /// storage modules) don't exist in that build, so there is nothing to persist. Keeps the
 /// `groww_activation` call site compiling identically regardless of feature.
 #[cfg(not(feature = "daily_universe_fetcher"))]
+// TEST-EXEMPT: empty no-op stub (feature OFF — no master surface to write); exercised by test_persist_is_noop_when_feature_off.
 pub async fn persist_groww_instruments(
     _questdb: &QuestDbConfig,
     _set: &GrowwWatchSet,

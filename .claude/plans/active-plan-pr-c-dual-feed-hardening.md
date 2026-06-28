@@ -18,16 +18,19 @@ The Groww shared-master writer (`crates/core/src/feed/groww/shared_master_writer
 persists the daily `GrowwWatchSet` into the SAME shared `instrument_lifecycle` +
 `index_constituency` QuestDB tables Dhan uses, every row tagged `feed='groww'`
 (operator lock `groww-second-feed-scope-2026-06-19.md`; feed-in-key override
-2026-06-28). The network orchestration `persist_groww_instruments` is correctly
-`// TEST-EXEMPT` (I/O), but its DECISION LOGIC was untested. This PR extracts the
-two pure decision points into pure fns so they ARE testable, then ratchets the 6
-gaps with tests:
+2026-06-28). The network orchestration `persist_groww_instruments` is cold-path
+ILP I/O (not unit-testable without live QuestDB), but its DECISION LOGIC was
+untested. This PR extracts the two pure decision points into pure fns so they ARE
+testable, then ratchets the 6 gaps with tests:
 
 - **F1** — pure `should_skip_master_append(dry_run)` gate; dry-run builds rows
-  but appends nothing (rule §27 isolation).
+  but appends nothing (rule §27 isolation). Module-internal (`fn`, not `pub`):
+  only caller is `persist_groww_instruments`; in-module `#[cfg(test)]` tests call
+  it directly, so coverage is unchanged.
 - **F2** — pure `classify_persist_failure(stage)` returning
   `(stage, ErrorCode::GrowwMaster01PersistFailed)`; the calling arm only
-  logs+counts+returns (degrade-safe, never panics/aborts).
+  logs+counts+returns (degrade-safe, never panics/aborts). Module-internal
+  (`fn`, not `pub`) for the same reason as F1.
 - **F3** — feature-off `persist_groww_instruments` is a compiled no-op.
 - **F4** — source-scan ratchet: both storage append fns wrap every string/symbol
   row field in `sanitize_ilp_*`.
@@ -36,8 +39,14 @@ gaps with tests:
 - **F6** — Groww IST-midnight nanos == Dhan reconciler date→nanos convention;
   pin the hardcoded NTM `index_name` assumption with a comment + test.
 
-The two new pure helpers are `#[must_use] fn`s with no allocation and no I/O, so
-the network path stays `// TEST-EXEMPT` while its logic is now covered.
+The two new pure helpers are module-internal `#[must_use] fn`s (NOT `pub`) with no
+allocation and no I/O, so they carry no public surface and the pub-fn-test ratchet
+does not flag them. The cold-path I/O `persist_groww_instruments` (both the gated
+impl and the feature-off no-op stub) carries an explicit `// TEST-EXEMPT:` marker
+on the line immediately above each `pub async fn` declaration (added/repositioned
+in this PR — the gated marker previously sat above the `#[cfg]` attribute where the
+guard does not read it, and the stub had none), so the untested-pub-fn ratchet
+(116 baseline) is satisfied honestly without bumping the baseline upward.
 
 ## Edge Cases
 
@@ -90,10 +99,12 @@ tickvault-storage groww_master_ilp_sanitize_guard --features daily_universe_fetc
 
 ## Rollback
 
-Pure test-only + two tiny pure helper fns + one comment. Revert the single commit
-to restore the exact pre-PR behaviour — there is no runtime/data-path change, no
-schema change, no config change. The helpers are referenced by `persist_groww_instruments`
-(so they have call sites; pub-fn-wiring stays green) and by tests.
+Pure test-only + two tiny module-internal pure helper fns + TEST-EXEMPT comment
+markers. Revert the commit(s) to restore the exact pre-PR behaviour — there is no
+runtime/data-path change, no schema change, no config change. The helpers are
+referenced by `persist_groww_instruments` (call site present; pub-fn-wiring stays
+green) and by tests. Because they are `fn` (private), they carry no public surface,
+so the pub-fn-test ratchet does not flag them.
 
 ## Observability
 
