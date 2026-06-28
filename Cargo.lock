@@ -3855,6 +3855,7 @@ dependencies = [
  "governor",
  "metrics",
  "metrics-exporter-prometheus",
+ "notify",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

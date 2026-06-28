@@ -254,6 +254,14 @@ pub struct FeedHealthRow {
     pub ticks_total: u64,
     pub candles_total: u64,
     pub drops_total: u64,
+    /// STOCK instruments this feed subscribed at startup (the connect+subscribe
+    /// PROOF — operator 2026-06-28). `0` until the feed reports its subscribe count.
+    pub subscribed_stocks: u64,
+    /// INDEX instruments this feed subscribed at startup.
+    pub subscribed_indices: u64,
+    /// Total instruments subscribed (`stocks + indices`) — the at-a-glance proof
+    /// number the `/feeds` page renders ("subscribed 767").
+    pub subscribed_total: u64,
 }
 
 /// The `GET /api/feeds/health` payload — one truthful row per feed.
@@ -307,6 +315,9 @@ pub async fn get_feeds_health(State(state): State<SharedAppState>) -> Json<Feeds
                 drops_total: report.input.drops_total,
                 instrumented: report.input.instrumented,
                 auth_rejected: report.input.auth_rejected,
+                subscribed_stocks: report.input.subscribed_stocks,
+                subscribed_indices: report.input.subscribed_indices,
+                subscribed_total: report.input.subscribed_stocks + report.input.subscribed_indices,
             }
         })
         .collect();
@@ -392,6 +403,7 @@ mod tests {
         reg.set_connected(Feed::Groww, true);
         reg.record_tick(Feed::Groww, now_ist_nanos());
         reg.record_candle(Feed::Groww);
+        reg.set_subscribed(Feed::Groww, 765, 2);
         let state = test_state_with_health(
             FeedsConfig {
                 dhan_enabled: true,
@@ -410,6 +422,10 @@ mod tests {
         assert!(groww.connected, "registry connect reflected");
         assert_eq!(groww.ticks_total, 1);
         assert_eq!(groww.candles_total, 1);
+        // Connect+subscribe PROOF (2026-06-28): the subscribe counts surface.
+        assert_eq!(groww.subscribed_stocks, 765);
+        assert_eq!(groww.subscribed_indices, 2);
+        assert_eq!(groww.subscribed_total, 767);
         // Dhan's slot untouched → not connected, no ticks (per-feed isolation).
         let dhan = resp
             .feeds
