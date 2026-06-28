@@ -70,6 +70,15 @@ or reconnect behaviour.
   arm), reconnect (`connect_and_listen`), sleep-entered/resumed — each calls
   `emit_order_update_ws_audit`. Both live WebSockets now write `ws_event_audit`
   rows. A future depth pool would call the same pattern with its own `WsType`.
+- Append site (LIVE since PR-10, 2026-06-29): the Groww second-feed bridge
+  `crates/app/src/groww_bridge.rs` (`WsType::GrowwBridge`, `feed='groww'`) —
+  `emit_groww_ws_audit` fires one row per Groww lifecycle transition (Connected
+  on the first streaming rising edge, Disconnected/DisconnectedOffHours on the
+  feed-disable falling edge, Reconnected on a later streaming edge), edge-latched
+  so it never spams per loop turn. Closes the gap where Groww connected but wrote
+  no `ws_event_audit` row even though the table is already feed-keyed. Best-effort
+  `try_send` through the SAME consumer Dhan uses — an ILP failure is still
+  AUDIT-WS-01 (no new ErrorCode).
 
 ---
 
