@@ -100,6 +100,33 @@ fn watch_date_to_ist_midnight_nanos(watch_date: &str) -> i64 {
         .saturating_mul(1_000_000_000)
 }
 
+/// Pure gate: should the master-table APPEND be SKIPPED for this run?
+///
+/// Returns `true` exactly when `dry_run` is set — the §27 isolation rule: in a
+/// dry run the rows are still BUILT (so the would-write counts are observable),
+/// but NO ILP append runs, so a Day-1 dry-run never leaks into the live tables.
+/// Pure, zero-alloc, no I/O — extracted from [`persist_groww_instruments`] so the
+/// dry-run decision is unit-testable without touching QuestDB.
+#[must_use]
+pub fn should_skip_master_append(dry_run: bool) -> bool {
+    dry_run
+}
+
+/// Pure classifier for a master-table persist FAILURE.
+///
+/// Maps the failing stage (`"lifecycle"` / `"constituency"`, or any other label
+/// defensively) to the `(stage, ErrorCode)` pair the degrade-safe failure arm
+/// emits: the stage label echoes back verbatim for the `tv_groww_master_persist_errors_total{stage}`
+/// counter, and the code is ALWAYS [`ErrorCode::GrowwMaster01PersistFailed`]
+/// (wire `GROWW-MASTER-01`). TOTAL — never panics, has no else-less arm. The
+/// caller only logs+counts+returns with this; it NEVER aborts the feed, an
+/// order, or a tick. Extracted so the degrade contract is unit-testable.
+#[cfg(feature = "daily_universe_fetcher")]
+#[must_use]
+pub fn classify_persist_failure(stage: &'static str) -> (&'static str, ErrorCode) {
+    (stage, ErrorCode::GrowwMaster01PersistFailed)
+}
+
 /// Builds the `instrument_lifecycle` rows for the Groww watch set, all tagged `feed='groww'`.
 ///
 /// Spot/index-only sentinels per the row contract (no derivatives in the watch set):
@@ -186,6 +213,14 @@ pub fn build_groww_constituency_rows<'a>(
 
     /// The NTM membership every resolved Groww stock belongs to (§31.1 — the Groww watch
     /// stock set is the NIFTY-Total-Market-resolved set).
+    ///
+    /// PINNED ASSUMPTION (test `test_groww_constituency_index_name_is_ntm_pinned`): today
+    /// the Groww watch STOCK set is EXACTLY the NIFTY-Total-Market-resolved set
+    /// (`instruments.rs`), so a single `index_name` is trivially correct for every
+    /// constituent row. If the Groww watch set ever resolves stocks from MORE than one
+    /// index, this hardcode becomes wrong and the per-entry `index_name` must be threaded
+    /// through `WatchEntry` instead — tracked as a follow-up, NOT done here (no risky
+    /// refactor while NTM is the only membership). The test pins the documented assumption.
     const GROWW_NTM_INDEX_NAME: &str = "NIFTY Total Market";
 
     set.entries
@@ -240,7 +275,7 @@ pub async fn persist_groww_instruments(
         build_groww_lifecycle_rows(set, now_ist_nanos, trading_date_ist_nanos, dry_run);
     let constituency_rows = build_groww_constituency_rows(set, trading_date_ist_nanos, dry_run);
 
-    if dry_run {
+    if should_skip_master_append(dry_run) {
         info!(
             lifecycle_rows = lifecycle_rows.len(),
             constituency_rows = constituency_rows.len(),
@@ -266,11 +301,14 @@ pub async fn persist_groww_instruments(
             );
         }
         Err(err) => {
-            metrics::counter!("tv_groww_master_persist_errors_total", "stage" => "lifecycle")
+            // Degrade-safe: log + count + RETURN (continue to the next table). The
+            // classifier keeps the stage label + GROWW-MASTER-01 code in one place.
+            let (stage, code) = classify_persist_failure("lifecycle");
+            metrics::counter!("tv_groww_master_persist_errors_total", "stage" => stage)
                 .increment(1);
             error!(
-                code = ErrorCode::GrowwMaster01PersistFailed.code_str(),
-                stage = "lifecycle",
+                code = code.code_str(),
+                stage,
                 rows = lifecycle_rows.len(),
                 ?err,
                 "[feeds] Groww instrument_lifecycle persist failed — best-effort cold-path \
@@ -295,11 +333,13 @@ pub async fn persist_groww_instruments(
             );
         }
         Err(err) => {
-            metrics::counter!("tv_groww_master_persist_errors_total", "stage" => "constituency")
+            // Degrade-safe: log + count + RETURN. Same classifier, never aborts.
+            let (stage, code) = classify_persist_failure("constituency");
+            metrics::counter!("tv_groww_master_persist_errors_total", "stage" => stage)
                 .increment(1);
             error!(
-                code = ErrorCode::GrowwMaster01PersistFailed.code_str(),
-                stage = "constituency",
+                code = code.code_str(),
+                stage,
                 rows = constituency_rows.len(),
                 ?err,
                 "[feeds] Groww index_constituency persist failed — best-effort cold-path \
@@ -369,8 +409,6 @@ mod tests {
         }
     }
 
-    // Used only by the feature-gated row-builder tests below.
-    #[cfg(feature = "daily_universe_fetcher")]
     fn set_of(entries: Vec<WatchEntry>) -> GrowwWatchSet {
         let indices = entries
             .iter()
@@ -562,5 +600,211 @@ mod tests {
         assert!(r.via_isin);
         assert_eq!(r.source, "groww");
         assert_eq!(r.index_name, "NIFTY Total Market");
+    }
+
+    // ── F1: dry-run builds rows but skips the append (§27 isolation) ──
+
+    #[test]
+    fn test_persist_dry_run_skips_append() {
+        // The pure gate: dry_run=true → SKIP append; dry_run=false → do append.
+        assert!(
+            should_skip_master_append(true),
+            "dry_run must skip the master append (isolation)"
+        );
+        assert!(
+            !should_skip_master_append(false),
+            "live run must NOT skip the append"
+        );
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_persist_dry_run_builds_rows_but_skips_append() {
+        // Even when the append is skipped, the rows are still BUILT (so the
+        // would-write counts are observable) — "build-but-don't-write".
+        let set = set_of(vec![
+            stock("2885", "INE002A01018", "RELIANCE"),
+            index("NIFTY", "NSE", 999),
+        ]);
+        let lifecycle = build_groww_lifecycle_rows(&set, 111, 222, true);
+        let constituency = build_groww_constituency_rows(&set, 222, true);
+        assert!(should_skip_master_append(true), "dry-run skips the write");
+        assert!(
+            !lifecycle.is_empty(),
+            "dry-run STILL builds lifecycle rows (build-but-don't-write)"
+        );
+        assert!(
+            !constituency.is_empty(),
+            "dry-run STILL builds constituency rows"
+        );
+        // The dry_run flag is stamped on every built row so the isolation column
+        // (`dry_run`) is correct if these rows were ever inspected.
+        assert!(lifecycle.iter().all(|r| r.dry_run));
+        assert!(constituency.iter().all(|r| r.dry_run));
+    }
+
+    // ── F2: persist-failure classifies GROWW-MASTER-01, degrade-safe (no abort) ──
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_persist_failure_classifies_groww_master_01_without_abort() {
+        // Pure classifier is TOTAL — every stage maps to GROWW-MASTER-01, echoing
+        // the stage label back for the per-stage counter. It returns a value (it
+        // never panics / aborts), proving the failure arm only logs+counts+returns.
+        for stage in ["lifecycle", "constituency", "unexpected_stage"] {
+            let (echoed, code) = classify_persist_failure(stage);
+            assert_eq!(echoed, stage, "stage label echoes back for the counter");
+            assert_eq!(
+                code.code_str(),
+                "GROWW-MASTER-01",
+                "every persist failure is GROWW-MASTER-01"
+            );
+        }
+        // Source-scan: the persist orchestration only log+count+returns on failure —
+        // never aborts the feed. Scope the scan to the PRODUCTION fn body (between its
+        // signature and the `#[cfg(not(...))]` stub) so this test's own assertion
+        // strings — which necessarily NAME the banned tokens — are not self-matched.
+        let file = include_str!("shared_master_writer.rs");
+        let start = file
+            .find("pub async fn persist_groww_instruments(")
+            .expect("persist fn present");
+        let end = file[start..]
+            .find("#[cfg(not(feature = \"daily_universe_fetcher\"))]")
+            .map(|o| start + o)
+            .expect("non-gated stub follows the gated impl");
+        let persist_body = &file[start..end];
+        for banned in [
+            "panic!(",
+            "process::exit",
+            "unreachable!(",
+            "todo!(",
+            ".abort(",
+        ] {
+            assert!(
+                !persist_body.contains(banned),
+                "degrade-safe persist_groww_instruments must never use {banned} — \
+                 failure arms log+count+return"
+            );
+        }
+        // Both failure arms must route through the classifier + bump the counter.
+        assert!(
+            persist_body.matches("classify_persist_failure(").count() >= 2,
+            "both failure arms must route through classify_persist_failure"
+        );
+        assert!(
+            persist_body.contains("tv_groww_master_persist_errors_total"),
+            "failure arms must increment the per-stage counter"
+        );
+    }
+
+    // ── F5: brownfield — a legacy feed=NULL/"" row never collides with dhan/groww ──
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_null_feed_row_distinct_from_groww_under_key() {
+        // Regression: 2026-06-28 — feed-in-key brownfield. A backfilled/legacy row
+        // with feed="" (NULL before self-heal stamps 'dhan') must be DISTINCT from
+        // both the dhan and groww rows for the same (security_id, exchange_segment).
+        use std::collections::HashSet;
+        let set = set_of(vec![stock("2885", "INE002A01018", "RELIANCE")]);
+        let groww = &build_groww_lifecycle_rows(&set, 1, 2, false)[0];
+
+        let legacy_key = (groww.security_id, groww.exchange_segment, "");
+        let dhan_key = (groww.security_id, groww.exchange_segment, "dhan");
+        let groww_key = (groww.security_id, groww.exchange_segment, groww.feed);
+
+        // Same id + segment across all three; only `feed` differs.
+        assert_eq!(legacy_key.0, groww_key.0);
+        assert_eq!(legacy_key.1, groww_key.1);
+        assert_ne!(legacy_key.2, dhan_key.2);
+        assert_ne!(legacy_key.2, groww_key.2);
+
+        let mut keys: HashSet<(i64, &str, &str)> = HashSet::new();
+        assert!(keys.insert(legacy_key), "legacy NULL-feed row inserts");
+        assert!(keys.insert(dhan_key), "dhan row inserts distinctly");
+        assert!(keys.insert(groww_key), "groww row inserts distinctly");
+        assert_eq!(
+            keys.len(),
+            3,
+            "legacy(NULL)/dhan/groww are 3 DISTINCT rows under the composite key"
+        );
+    }
+
+    // ── F6: IST-midnight convention matches the Dhan reconciler date→nanos ──
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_groww_ist_midnight_matches_dhan_lifecycle_convention() {
+        // The Dhan daily-universe orchestrator (crates/app/src/main.rs) computes the
+        // designated trading-date nanos as:
+        //     now_ist.date_naive().and_hms_opt(0,0,0).and_utc().timestamp_nanos_opt()
+        // i.e. IST-midnight epoch nanos with NO UTC offset added (data-integrity.md).
+        // The Groww writer's `watch_date_to_ist_midnight_nanos` must produce the
+        // IDENTICAL value for the same date, else dhan + groww rows for the same date
+        // would carry different `ts` and silently split. Both reduce to
+        // days_since_epoch * 86400 * 1e9, so they are exactly equal for every
+        // parseable date — proven here against the Dhan formula directly.
+        fn dhan_convention(date: chrono::NaiveDate) -> i64 {
+            date.and_hms_opt(0, 0, 0)
+                .and_then(|m| m.and_utc().timestamp_nanos_opt())
+                .unwrap_or(0)
+        }
+        for ymd in [
+            "1970-01-01",
+            "1970-01-02",
+            "2025-12-25",
+            "2026-06-28",
+            "2024-02-29", // leap day
+        ] {
+            let date = chrono::NaiveDate::parse_from_str(ymd, "%Y-%m-%d").unwrap();
+            assert_eq!(
+                watch_date_to_ist_midnight_nanos(ymd),
+                dhan_convention(date),
+                "Groww IST-midnight nanos must equal the Dhan reconciler convention for {ymd}"
+            );
+        }
+        // Unparseable → 0 (defense-in-depth), never a panic.
+        assert_eq!(watch_date_to_ist_midnight_nanos("not-a-date"), 0);
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_groww_constituency_index_name_is_ntm_pinned() {
+        // Pins the documented single-membership assumption: today the Groww watch
+        // stock set is exactly the NIFTY-Total-Market-resolved set, so every
+        // constituency row carries `index_name = "NIFTY Total Market"`. If the watch
+        // set ever spans multiple indices, this test fails — forcing the per-entry
+        // index_name follow-up noted in the builder's doc comment.
+        let set = set_of(vec![
+            stock("2885", "INE002A01018", "RELIANCE"),
+            stock("1594", "INE009A01021", "INFY"),
+        ]);
+        let rows = build_groww_constituency_rows(&set, 222, false);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().all(|r| r.index_name == "NIFTY Total Market"),
+            "all Groww constituents are pinned to the single NTM membership"
+        );
+    }
+
+    // ── F3: feature OFF — persist_groww_instruments is a compiled no-op ──
+
+    #[cfg(not(feature = "daily_universe_fetcher"))]
+    #[tokio::test]
+    async fn test_persist_is_noop_when_feature_off() {
+        // With `daily_universe_fetcher` OFF the shared master tables don't exist, so
+        // the stub must compile + return WITHOUT touching QuestDB. We call it with an
+        // empty set + a bogus questdb config; it must return cleanly (no connect, no
+        // panic). Proves the call site compiles identically regardless of feature.
+        use tickvault_common::config::QuestDbConfig;
+        let set = set_of(vec![]);
+        let questdb = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            pg_port: 8812,
+            ilp_port: 9009,
+        };
+        // Returns () without any network I/O — the stub body is empty.
+        persist_groww_instruments(&questdb, &set, "2026-06-28", false).await;
     }
 }
