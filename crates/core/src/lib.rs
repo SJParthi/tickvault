@@ -47,7 +47,6 @@ pub mod instance_lock;
 pub mod instrument;
 pub mod network;
 pub mod notification;
-pub mod option_chain;
 pub mod parser;
 pub mod pipeline;
 pub mod scheduler;

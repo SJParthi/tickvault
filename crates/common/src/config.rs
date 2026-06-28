@@ -66,13 +66,6 @@ pub struct ApplicationConfig {
     /// triggering Vec realloc.
     #[serde(default)]
     pub in_mem: InMemConfig,
-    /// Option-chain minute-snapshot pipeline (2026-05-16, BRUTEX
-    /// strike-selection feeder). 3-times-per-minute Dhan REST fetch
-    /// staggered at `:53/:56/:59` per the operator-approved schedule.
-    /// Default `enabled = false` so a fresh deployment is opt-in.
-    /// See `.claude/plans/friday-may-15-mega/topic-OPTION-CHAIN-MINUTE-SNAPSHOT.md`.
-    #[serde(default)]
-    pub option_chain_minute_snapshot: OptionChainMinuteSnapshotConfig,
     /// Pluggable market-data feed selection (Groww second-feed scope,
     /// operator lock 2026-06-19 — see
     /// `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`).
@@ -169,88 +162,6 @@ impl Default for TickStorageConfig {
             per_instrument_capacity: Self::default_per_instrument_capacity(),
         }
     }
-}
-
-/// Container for the `[option_chain_minute_snapshot]` TOML section.
-/// Drives the 3-times-per-minute option-chain fetch pipeline that feeds
-/// BRUTEX strike-selection.
-///
-/// **Why config-driven, not hardcoded:** the underlyings list + slot
-/// times must be runtime-tunable so adding MIDCPNIFTY (or any future
-/// underlying) is a TOML edit + restart, NOT a code change. Operator-
-/// charter §C "dynamic + scalable" non-negotiable.
-///
-/// See `.claude/plans/friday-may-15-mega/topic-OPTION-CHAIN-MINUTE-SNAPSHOT.md`
-/// for the full 5-layer-defense design.
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct OptionChainMinuteSnapshotConfig {
-    /// Master enable. When `false`, the scheduler task is not spawned
-    /// at boot — no fetches fire, no rows persist, no Telegram fires.
-    /// Default `false` so a fresh deployment doesn't surprise-fetch.
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// Hard staleness threshold (seconds). Strategy refuses new
-    /// entries once cache age exceeds this. `OptionChainStaleHalt`
-    /// Severity::Critical Telegram fires at the threshold crossing.
-    /// Default 300 (5 min).
-    #[serde(default = "OptionChainMinuteSnapshotConfig::default_cache_max_stale_secs")]
-    pub cache_max_stale_secs: u32,
-
-    /// How many strikes around ATM to keep in the RAM cache.
-    /// Total cached entries per underlying = `2 * strike_window_atm_each_side + 1`
-    /// CE + same for PE. Default 25 = 51 strikes × 2 = 102 entries/underlying.
-    #[serde(default = "OptionChainMinuteSnapshotConfig::default_strike_window_atm_each_side")]
-    pub strike_window_atm_each_side: u32,
-
-    /// Per-underlying same-minute retry budget. Default 2 = up to 3
-    /// total attempts (initial + 2 retries) inside one minute.
-    /// Retries fire 3s apart to respect Dhan rate limit.
-    #[serde(default = "OptionChainMinuteSnapshotConfig::default_fetch_retry_max_attempts")]
-    pub fetch_retry_max_attempts: u32,
-
-    /// The list of underlyings to fetch each minute. ORDER does not
-    /// matter — slots are derived from each entry's `slot_sec` field.
-    /// Boot-time validator ensures slot uniqueness + rate-limit safety.
-    #[serde(default)]
-    pub underlyings: Vec<OptionChainUnderlyingEntry>,
-}
-
-impl OptionChainMinuteSnapshotConfig {
-    const fn default_cache_max_stale_secs() -> u32 {
-        300
-    }
-    const fn default_strike_window_atm_each_side() -> u32 {
-        25
-    }
-    const fn default_fetch_retry_max_attempts() -> u32 {
-        2
-    }
-}
-
-/// One row in the `[[option_chain_minute_snapshot.underlyings]]` TOML
-/// table-array. Each entry maps to one Dhan Option Chain API request
-/// fired at `slot_sec` of every market-hours minute.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct OptionChainUnderlyingEntry {
-    /// Human-readable display label. Used in Telegram + audit rows +
-    /// log lines. MUST be unique across entries.
-    pub symbol: String,
-
-    /// Dhan `UnderlyingScrip` integer (the index SecurityId, e.g.
-    /// NIFTY=13, BANKNIFTY=25, SENSEX=51). MUST be unique across entries.
-    pub security_id: u32,
-
-    /// Dhan `UnderlyingSeg` string enum. For index options the value
-    /// is always `"IDX_I"`. Future stock-options support would use
-    /// `"NSE_EQ"` / `"BSE_EQ"`.
-    pub segment: String,
-
-    /// Second-of-minute slot when this underlying's fetch fires.
-    /// MUST be in `[50, 59]` — fetch fires in the last 10 seconds of
-    /// every minute so the snapshot is freshest possible vs the
-    /// next-minute candle boundary at `HH:MM+1:00`.
-    pub slot_sec: u32,
 }
 
 /// Container for the `[engine.timeframes]` TOML section. L8 pins the
@@ -1743,7 +1654,6 @@ mod tests {
             features: FeaturesConfig::default(),
             engine: EngineConfig::default(),
             in_mem: InMemConfig::default(),
-            option_chain_minute_snapshot: OptionChainMinuteSnapshotConfig::default(),
             feeds: FeedsConfig::default(),
         }
     }

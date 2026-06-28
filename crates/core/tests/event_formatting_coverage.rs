@@ -221,33 +221,9 @@ fn test_self_test_and_slo_event_messages() {
     assert!(m.contains("qdb_health"), "{m}");
 }
 
-#[test]
-fn test_option_chain_event_messages() {
-    let m = render(&NotificationEvent::OptionChainFetchFailed {
-        underlying: "UL-SENSEX-97".to_string(),
-        attempts_made: 2,
-        reason: "RSN-OC-701".to_string(),
-    });
-    assert!(m.contains("RSN-OC-701"), "{m}");
-
-    let m = render(&NotificationEvent::OptionChainCacheFallback {
-        underlying: "UL-SENSEX-98".to_string(),
-        cache_age_secs: 4244,
-    });
-    assert!(m.contains("4244"), "{m}");
-
-    let m = render(&NotificationEvent::OptionChainStaleHalt {
-        underlying: "UL-SENSEX-99".to_string(),
-        cache_age_secs: 4245,
-        threshold_secs: 60,
-    });
-    assert!(m.contains("4245"), "{m}");
-
-    let m = render(&NotificationEvent::OptionChainConfigInvalid {
-        reason: "RSN-OCCFG-702".to_string(),
-    });
-    assert!(m.contains("RSN-OCCFG-702"), "{m}");
-}
+// 2026-06-28: test_option_chain_event_messages REMOVED — the 4 OptionChain*
+// NotificationEvent variants were deleted with the option_chain REST subsystem
+// (operator directive 2026-06-28).
 
 #[test]
 fn test_boot_and_infra_event_messages() {

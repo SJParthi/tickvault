@@ -40,13 +40,6 @@
 //! per `.claude/rules/project/security-id-uniqueness.md`. At the 4-SID
 //! scope the composite is degenerate (all four are `IdxI`), but the
 //! invariant holds for future scope extension.
-//!
-//! ## Option chain underlyings (3 of the 4)
-//!
-//! `INDIA VIX` (security_id = 21) has NO option chain — it's a
-//! volatility-index value, not an optionable underlying. The
-//! `OPTION_CHAIN_UNDERLYINGS` slice drops VIX for the option-chain REST
-//! loop while keeping it in `LOCKED_UNIVERSE` for live tick subscription.
 
 use crate::types::ExchangeSegment;
 
@@ -57,8 +50,7 @@ use crate::types::ExchangeSegment;
 /// `.claude/rules/project/live-market-feed-subscription.md` Wave 5
 /// Update and `.claude/rules/project/websocket-connection-scope-lock.md`.
 ///
-/// `INDIA VIX` (21) is included here for live tick subscription but
-/// excluded from `OPTION_CHAIN_UNDERLYINGS` below (VIX has no options).
+/// `INDIA VIX` (21) is included here for live tick subscription.
 pub const LOCKED_UNIVERSE: &[(u32, &str, ExchangeSegment)] = &[
     (13, "NIFTY", ExchangeSegment::IdxI),
     (25, "BANKNIFTY", ExchangeSegment::IdxI),
@@ -66,26 +58,10 @@ pub const LOCKED_UNIVERSE: &[(u32, &str, ExchangeSegment)] = &[
     (21, "INDIA VIX", ExchangeSegment::IdxI),
 ];
 
-/// Option-chain underlyings for the 50-second REST poll loop.
-/// 3 of the 4 LOCKED_UNIVERSE entries — INDIA VIX excluded (no options).
-///
-/// Per `docs/architecture/option-chain-z-plus-heart-piece.md` §2 + §3.
-pub const OPTION_CHAIN_UNDERLYINGS: &[(u32, &str)] =
-    &[(13, "NIFTY"), (25, "BANKNIFTY"), (51, "SENSEX")];
-
-/// Operator-locked sequential fetch order for the option-chain minute
-/// scheduler (2026-05-25). At every `:50` of each market-hours minute,
-/// the scheduler fires fetches in THIS order — SENSEX first
-/// (slowest-to-update per operator's profiling), then BANKNIFTY, then
-/// NIFTY. Sequential (not parallel) to stay inside Dhan's
-/// 1-request-per-3-seconds-per-underlying rate limit; total burst
-/// completes in ~18s, finishing before the next minute boundary.
-///
-/// Re-ordering this slice requires a rule-file edit per operator
-/// directive and an explicit ratchet test update. The order is
-/// pinned by `tests/option_chain_warmup_wiring.rs`.
-pub const OPTION_CHAIN_FETCH_SEQUENCE: &[(u32, &str)] =
-    &[(51, "SENSEX"), (25, "BANKNIFTY"), (13, "NIFTY")];
+// 2026-06-28: OPTION_CHAIN_UNDERLYINGS, OPTION_CHAIN_FETCH_SEQUENCE, and
+// has_option_chain() were REMOVED with the option_chain REST subsystem
+// (operator directive 2026-06-28). They served only the deleted REST poll
+// loop / expiry-warmup task — not live tick subscription.
 
 /// Convenience: lookup an underlying name by security_id in the locked
 /// universe. Returns `None` for any SID not in the 4-entry slice.
@@ -126,22 +102,6 @@ pub const fn is_locked_universe_sid(security_id: u32) -> bool {
     name_for_security_id(security_id).is_some()
 }
 
-/// True iff the given security_id has an option chain (= in
-/// `OPTION_CHAIN_UNDERLYINGS`). False for INDIA VIX (no options) AND
-/// for any SID not in `LOCKED_UNIVERSE`.
-#[must_use]
-pub const fn has_option_chain(security_id: u32) -> bool {
-    let mut i = 0;
-    while i < OPTION_CHAIN_UNDERLYINGS.len() {
-        let (sid, _name) = OPTION_CHAIN_UNDERLYINGS[i];
-        if sid == security_id {
-            return true;
-        }
-        i += 1;
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,23 +135,6 @@ mod tests {
                 "{name} (sid={sid}) must be IDX_I — operator-charter §I"
             );
         }
-    }
-
-    #[test]
-    fn test_option_chain_underlyings_has_exactly_three_entries() {
-        assert_eq!(OPTION_CHAIN_UNDERLYINGS.len(), 3);
-    }
-
-    #[test]
-    fn test_option_chain_underlyings_excludes_india_vix() {
-        let sids: Vec<u32> = OPTION_CHAIN_UNDERLYINGS.iter().map(|(s, _)| *s).collect();
-        assert!(
-            !sids.contains(&21),
-            "INDIA VIX (21) has no option chain — must NOT be in OPTION_CHAIN_UNDERLYINGS"
-        );
-        assert!(sids.contains(&13), "NIFTY (13) has options");
-        assert!(sids.contains(&25), "BANKNIFTY (25) has options");
-        assert!(sids.contains(&51), "SENSEX (51) has options");
     }
 
     #[test]
@@ -240,46 +183,12 @@ mod tests {
     }
 
     #[test]
-    fn test_has_option_chain_true_for_three_underlyings() {
-        assert!(has_option_chain(13));
-        assert!(has_option_chain(25));
-        assert!(has_option_chain(51));
-    }
-
-    #[test]
-    fn test_has_option_chain_false_for_india_vix() {
-        assert!(
-            !has_option_chain(21),
-            "INDIA VIX has no option chain — operator-locked"
-        );
-    }
-
-    #[test]
-    fn test_has_option_chain_false_for_unknown() {
-        assert!(!has_option_chain(999));
-        assert!(!has_option_chain(0));
-    }
-
-    #[test]
     fn test_const_fns_usable_in_const_context() {
         // Compile-time evaluation — proves these are genuinely const fn.
         const NIFTY_NAME: Option<&str> = name_for_security_id(13);
-        const VIX_HAS_OC: bool = has_option_chain(21);
         const VIX_IN_UNIVERSE: bool = is_locked_universe_sid(21);
 
         assert_eq!(NIFTY_NAME, Some("NIFTY"));
-        assert!(!VIX_HAS_OC);
         assert!(VIX_IN_UNIVERSE);
-    }
-
-    #[test]
-    fn test_option_chain_underlyings_is_subset_of_locked_universe() {
-        // Every option-chain underlying must also be in LOCKED_UNIVERSE.
-        for (oc_sid, _) in OPTION_CHAIN_UNDERLYINGS {
-            assert!(
-                is_locked_universe_sid(*oc_sid),
-                "option-chain SID {oc_sid} must also be in LOCKED_UNIVERSE"
-            );
-        }
     }
 }

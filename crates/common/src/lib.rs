@@ -37,7 +37,6 @@ pub mod locked_universe;
 pub mod market_hours;
 pub mod open_price_rest_fallback;
 pub mod open_price_source;
-pub mod option_chain_schedule;
 pub mod order_types;
 pub mod phase;
 pub mod price_precision;

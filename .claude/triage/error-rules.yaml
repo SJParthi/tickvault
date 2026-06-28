@@ -1097,116 +1097,10 @@ rules:
       preceding the respawn.
 
   # -----------------------------------------------------------------------
-  # PR #1 (AWS-lifecycle 14-PR sequence) — option_chain + cross_verify stubs
-  # -----------------------------------------------------------------------
-
-  - name: option-chain-01-fetch-failed-escalate
-    match:
-      code: OPTION-CHAIN-01
-    action: escalate
-    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
-    confidence: 0.9
-    cooldown_secs: 60
-    justification: >-
-      OPTION-CHAIN-01 = REST fetch failed (network timeout / 5xx).
-      Severity::High. Transient — next 50s cycle retries automatically.
-      Escalate via Telegram if sustained > 3 cycles. Cross-check Dhan
-      /v2/profile reachability if persistent.
-
-  - name: option-chain-02-dh904-exhausted-escalate
-    match:
-      code: OPTION-CHAIN-02
-    action: escalate
-    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 60
-    justification: >-
-      OPTION-CHAIN-02 = DH-904 backoff ladder (10→20→40→80s) exhausted.
-      Severity::High. Sustained rate-limit signal from Dhan; cycle
-      skipped. Operator checks cycle-overlap counter + ensures we're
-      not exceeding 1 unique request per 3s per underlying.
-
-  - name: option-chain-03-parse-failed-escalate
-    match:
-      code: OPTION-CHAIN-03
-    action: escalate
-    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
-    confidence: 0.8
-    cooldown_secs: 60
-    justification: >-
-      OPTION-CHAIN-03 = response parse failure (malformed JSON / missing
-      oc map). Severity::Medium. Retry once; mark stale on repeat.
-      Operator compares raw body in option_chain_raw table to expected
-      schema; opens Dhan support ticket if persistent.
-
-  - name: option-chain-04-verify-failed-vs-ws-escalate
-    match:
-      code: OPTION-CHAIN-04
-    action: escalate
-    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
-    confidence: 0.7
-    cooldown_secs: 60
-    justification: >-
-      OPTION-CHAIN-04 = option-chain LTP disagrees with live WS LTP
-      beyond 0.5% tolerance. Severity::Medium. Possible parser bug
-      OR Dhan-side data anomaly. Operator inspection required —
-      data-integrity issue.
-
-  - name: option-chain-05-cache-stale-escalate
-    match:
-      code: OPTION-CHAIN-05
-    action: escalate
-    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      OPTION-CHAIN-05 = cache age > 60s during market hours; strategy
-      fail-closed. Severity::Critical. Operator paged via 4-channel
-      SNS fan-out (SMS + Telegram + Email + Amazon Connect call).
-      Operator inspects option_chain_request_audit for upstream
-      failure history. NEVER auto-action — strategy halt requires
-      operator confirmation.
-
-  - name: option-chain-06-cycle-overlap-escalate
-    match:
-      code: OPTION-CHAIN-06
-    action: escalate
-    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
-    confidence: 0.8
-    cooldown_secs: 60
-    justification: >-
-      OPTION-CHAIN-06 = previous cycle still running when next 50s
-      tick fires. Severity::High. Mutex-guarded skip-next-cycle
-      policy. If 2 skips in a row, alarm escalates. Operator checks
-      per-call latency in option_chain_request_audit.
-
-  - name: option-chain-07-expiry-rollover-silence
-    match:
-      code: OPTION-CHAIN-07
-    action: silence
-    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      OPTION-CHAIN-07 = Thursday expiry rollover detected; RAM cache
-      rebuilt for new nearest expiry. Severity::Info. Operational
-      signal only — no action required. Silenced from Telegram
-      noise; available in CloudWatch Logs for audit.
-
-  - name: option-chain-08-token-expired-mid-cycle-escalate
-    match:
-      code: OPTION-CHAIN-08
-    action: escalate
-    runbook_path: .claude/rules/project/option-chain-cross-verify-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      OPTION-CHAIN-08 = HTTP 401 mid-cycle. JWT expired between cycles.
-      Severity::Critical. Token-manager force-refresh fires; if refresh
-      itself fails (TOTP rotated, SSM unreachable), strategy cannot
-      operate. Operator verifies SSM /tickvault/prod/dhan_totp_secret
-      matches Dhan web UI. Re-registers TOTP if rotated.
-
+  # OPTION-CHAIN-01..08 triage rules REMOVED 2026-06-28 with the entire
+  # option_chain REST subsystem (operator directive 2026-06-28). The
+  # ErrorCode variants are gone, so triage_rules_guard requires these
+  # `code:` entries be removed in lockstep.
   # PR-C (2026-05-26): CROSS-VERIFY-01..04 rules retired alongside
   # the deleted cross_verify chain (no emit sites left).
 
@@ -1278,19 +1172,9 @@ rules:
   # auto-triage decisions on the same underlying ErrorCode.
   # -----------------------------------------------------------------------
 
-  - name: dh904-rate-limit-during-option-chain-cycle-escalate
-    match:
-      code: DH-904
-      message_substring: "option_chain"
-    action: escalate
-    runbook_path: .claude/rules/dhan/api-introduction.md
-    confidence: 0.95
-    cooldown_secs: 30
-    justification: >-
-      DH-904 fan-out: rate-limit hit during option_chain 50s cycle.
-      Distinguishes from order-API DH-904 (different runbook).
-      Severity::High — option chain may not refresh; strategy may
-      fail-closed if cache age exceeds 60s.
+  # dh904-rate-limit-during-option-chain-cycle-escalate REMOVED 2026-06-28
+  # with the option_chain REST subsystem (its message_substring matched
+  # option_chain fetch logs that no longer exist).
 
   - name: dh904-rate-limit-during-historical-fetch-escalate
     match:
@@ -1302,9 +1186,8 @@ rules:
     cooldown_secs: 60
     justification: >-
       DH-904 fan-out: rate-limit hit during cross-verify intraday
-      fetch at 15:31 IST. Different impact than option-chain DH-904 —
-      cross-verify is daily, not 50s cycle. CROSS-VERIFY-02 fires
-      next.
+      fetch at 15:31 IST. cross-verify is daily, not a 50s cycle.
+      CROSS-VERIFY-1M-02 fires next.
 
   - name: oms-gap-state-machine-during-place-escalate
     match:

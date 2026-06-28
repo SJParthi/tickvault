@@ -529,47 +529,12 @@ pub enum ErrorCode {
     RestCanary01ProbeFailed,
 
     // -----------------------------------------------------------------------
-    // PR #1 (AWS-lifecycle 14-PR sequence): contract stubs for the future
-    // option_chain module. Variants exist so downstream PR #8 can wire
-    // its emit sites against stable identifiers. NO production emit sites
-    // yet — pub-fn-test guards apply when consumers land.
-    //
-    // (PR-C 2026-05-26: CROSS-VERIFY-01..04 stubs retired along with the
-    // entire cross_verify chain.)
-    //
-    // See:
-    // - docs/architecture/option-chain-z-plus-heart-piece.md §8
+    // OPTION-CHAIN-01..08 REMOVED 2026-06-28 along with the entire
+    // option_chain REST subsystem (operator directive 2026-06-28 — "drop the
+    // option chain entire implementations and its table also"). The subsystem
+    // was disabled since 2026-06-02 with no live consumer. (PR-C 2026-05-26:
+    // CROSS-VERIFY-01..04 stubs were retired earlier.)
     // -----------------------------------------------------------------------
-    /// OPTION-CHAIN-01: REST fetch failed (network timeout / 5xx). Retried
-    /// once with 2s delay; if still failing, the cycle marks that underlying
-    /// stale. Severity::High. Strategy fail-closed if cache age > 60s.
-    OptionChain01FetchFailed,
-    /// OPTION-CHAIN-02: DH-904 backoff ladder exhausted (10s → 80s).
-    /// Sustained rate-limit signal from Dhan. Severity::High.
-    OptionChain02Dh904Exhausted,
-    /// OPTION-CHAIN-03: response parse failure (malformed JSON, missing
-    /// `oc` map, wrong types). Retry once; mark underlying stale on repeat.
-    /// Severity::Medium.
-    OptionChain03ParseFailed,
-    /// OPTION-CHAIN-04: option-chain `last_price` of underlying disagrees
-    /// with live WebSocket index LTP beyond 0.5% tolerance. Possible parser
-    /// bug or Dhan-side data anomaly. Severity::Medium.
-    OptionChain04VerifyFailedVsWs,
-    /// OPTION-CHAIN-05: cache age > 60s during market hours. Strategy
-    /// fail-closes (refuses to emit signals). Severity::Critical.
-    /// Operator paged via 4-channel SNS fan-out.
-    OptionChain05CacheStaleHaltStrategy,
-    /// OPTION-CHAIN-06: previous cycle still running when next 50s tick
-    /// fires. Mutex-guarded skip-next-cycle policy. Severity::High.
-    OptionChain06CycleOverlapSkip,
-    /// OPTION-CHAIN-07: Thursday 15:30 IST expiry rollover detected mid-day;
-    /// expiry-list re-fetched and RAM cache rebuilt for new nearest expiry.
-    /// Severity::Info — operational signal, no action required.
-    OptionChain07ExpiryRollover,
-    /// OPTION-CHAIN-08: HTTP 401 mid-cycle — JWT expired between cycles.
-    /// Token-manager force-refresh; retry within same cycle. Severity::Critical
-    /// because option chain freshness is strategy-blocking.
-    OptionChain08TokenExpiredMidCycle,
 
     // -----------------------------------------------------------------------
     // PR #2.5 (AWS-lifecycle 14-PR sequence): Day OHLC tracker for IDX_I
@@ -761,15 +726,6 @@ impl ErrorCode {
             Self::TickConserve01DailyResidual => "TICK-CONSERVE-01",
             // DHAN-REST-400 (2026-06-10): scheduled REST-health canary
             Self::RestCanary01ProbeFailed => "REST-CANARY-01",
-            // PR #1 (AWS-lifecycle): option_chain stubs
-            Self::OptionChain01FetchFailed => "OPTION-CHAIN-01",
-            Self::OptionChain02Dh904Exhausted => "OPTION-CHAIN-02",
-            Self::OptionChain03ParseFailed => "OPTION-CHAIN-03",
-            Self::OptionChain04VerifyFailedVsWs => "OPTION-CHAIN-04",
-            Self::OptionChain05CacheStaleHaltStrategy => "OPTION-CHAIN-05",
-            Self::OptionChain06CycleOverlapSkip => "OPTION-CHAIN-06",
-            Self::OptionChain07ExpiryRollover => "OPTION-CHAIN-07",
-            Self::OptionChain08TokenExpiredMidCycle => "OPTION-CHAIN-08",
             // Day OHLC tracker for IDX_I
             Self::IndexOhlc02DailyResetFailed => "INDEX-OHLC-02",
             // Boot-time previous-day OHLCV fetch (PR4 2026-06-01)
@@ -808,9 +764,6 @@ impl ErrorCode {
             | Self::BarMismatch01CorrectedFromHistorical
             | Self::BarMismatch02CrossCheckInconclusive
             | Self::BarMismatch03CrossCheckFailed
-            // PR #1 (AWS-lifecycle) — Critical option-chain
-            | Self::OptionChain05CacheStaleHaltStrategy
-            | Self::OptionChain08TokenExpiredMidCycle
             // Sub-PR #9 — all 4 INSTR-FETCH codes are HALT-class
             | Self::InstrFetch01CsvHardFailed
             | Self::InstrFetch02SchemaValidationFailed
@@ -822,9 +775,7 @@ impl ErrorCode {
             // Info: positive-ping / lifecycle confirmations
             Self::Selftest01Passed
             | Self::Slo01Healthy
-            | Self::AggregatorHb01Heartbeat
-            // PR #1 (AWS-lifecycle) — Info option-chain rollover signal
-            | Self::OptionChain07ExpiryRollover => Severity::Info,
+            | Self::AggregatorHb01Heartbeat => Severity::Info,
             // High: composite SLO degradation summary signal
             Self::Slo02Degraded => Severity::High,
             // High: regulatory / order / risk / rate-limit
@@ -843,10 +794,6 @@ impl ErrorCode {
             | Self::Volume01MonotonicityBreach
             | Self::AggregatorLate01
             | Self::AggregatorLag01TickLagDropped
-            // PR #1 (AWS-lifecycle) — High option-chain
-            | Self::OptionChain01FetchFailed
-            | Self::OptionChain02Dh904Exhausted
-            | Self::OptionChain06CycleOverlapSkip
             // PR #2.5 — INDEX-OHLC-02 is High (carry-over wrong but recoverable)
             | Self::IndexOhlc02DailyResetFailed
             // PR4 2026-06-01 — PREVDAY-01 is High (boot-data gap, not a halt)
@@ -915,9 +862,6 @@ impl ErrorCode {
             | Self::Telegram01Dropped
             | Self::AggregatorSeal01IlpFailed
             | Self::Boundary01CatchupSeal
-            // PR #1 (AWS-lifecycle) — Medium option-chain
-            | Self::OptionChain03ParseFailed
-            | Self::OptionChain04VerifyFailedVsWs
             // DHAN-LANE-04 — teardown drain timeout (D2b 2026-06-26): the lane
             // still reaches Off (handles force-aborted), so degraded-but-
             // recovered, not data loss. Medium.
@@ -1068,17 +1012,6 @@ impl ErrorCode {
             Self::RestCanary01ProbeFailed => {
                 ".claude/rules/project/dhan-rest-canary-error-codes.md"
             }
-            // PR #1 (AWS-lifecycle): option_chain stubs
-            Self::OptionChain01FetchFailed
-            | Self::OptionChain02Dh904Exhausted
-            | Self::OptionChain03ParseFailed
-            | Self::OptionChain04VerifyFailedVsWs
-            | Self::OptionChain05CacheStaleHaltStrategy
-            | Self::OptionChain06CycleOverlapSkip
-            | Self::OptionChain07ExpiryRollover
-            | Self::OptionChain08TokenExpiredMidCycle => {
-                ".claude/rules/project/option-chain-cross-verify-error-codes.md"
-            }
             // Day OHLC tracker for IDX_I
             Self::IndexOhlc02DailyResetFailed => {
                 ".claude/rules/project/index-day-ohlc-tracker-error-codes.md"
@@ -1227,15 +1160,6 @@ impl ErrorCode {
             Self::TickConserve01DailyResidual,
             // DHAN-REST-400 (2026-06-10) — REST-health canary
             Self::RestCanary01ProbeFailed,
-            // PR #1 (AWS-lifecycle 14-PR sequence) — option_chain stubs
-            Self::OptionChain01FetchFailed,
-            Self::OptionChain02Dh904Exhausted,
-            Self::OptionChain03ParseFailed,
-            Self::OptionChain04VerifyFailedVsWs,
-            Self::OptionChain05CacheStaleHaltStrategy,
-            Self::OptionChain06CycleOverlapSkip,
-            Self::OptionChain07ExpiryRollover,
-            Self::OptionChain08TokenExpiredMidCycle,
             // Day OHLC tracker for IDX_I (Ticker mode)
             Self::IndexOhlc02DailyResetFailed,
             // Boot-time previous-day OHLCV fetch coverage (PR4 2026-06-01)
@@ -1516,7 +1440,11 @@ mod tests {
         // 2026-06-26 (D2b — runtime Dhan-lane cold-start FSM): bumped 109 -> 113
         // for DHAN-LANE-01..04 (universe-build / ws-pool-spawn / auth-gate
         // failures + teardown-timeout on the runtime cold-start path).
-        assert_eq!(ErrorCode::all().len(), 113);
+        // 2026-06-28 (option_chain subsystem removal): bumped 113 -> 105 by
+        // removing OPTION-CHAIN-01..08 (the entire option_chain REST subsystem
+        // was deleted per operator directive — disabled since 2026-06-02 with
+        // no live consumer; its QuestDB table was dropped 2026-06-23).
+        assert_eq!(ErrorCode::all().len(), 105);
     }
 
     #[test]
@@ -1592,8 +1520,6 @@ mod tests {
                 || s.starts_with("ORPHAN-POSITION-")
                 // Phase 0 Items 15+28+29: 09:16:05 IST post-open cross-check.
                 || s.starts_with("BAR-MISMATCH-")
-                // PR #1 (AWS-lifecycle 14-PR sequence): option_chain stubs
-                || s.starts_with("OPTION-CHAIN-")
                 // PR #2.5 (AWS-lifecycle): Day OHLC tracker for IDX_I
                 || s.starts_with("INDEX-OHLC-")
                 // Sub-PR #9 of 2026-05-27 daily-universe expansion

@@ -69,8 +69,9 @@ pub const CATEGORY_LIVE_TICKS_DIR: &str = "data/logs/live_ticks";
 pub const CATEGORY_LIVE_TICKS_PREFIX: &str = "live_ticks";
 // PR-D (2026-05-26): CATEGORY_HISTORICAL_* constants retired alongside
 // the deleted Dhan historical fetch chain.
-pub const CATEGORY_OPTION_CHAIN_DIR: &str = "data/logs/option_chain";
-pub const CATEGORY_OPTION_CHAIN_PREFIX: &str = "option_chain";
+// 2026-06-28: CATEGORY_OPTION_CHAIN_* + LogCategory::OptionChain retired
+// with the entire option_chain REST subsystem (operator directive
+// 2026-06-28 — disabled since 2026-06-02 with no live consumer).
 
 /// Stable identifier for the log categories.
 ///
@@ -81,7 +82,6 @@ pub const CATEGORY_OPTION_CHAIN_PREFIX: &str = "option_chain";
 pub enum LogCategory {
     Candles,
     LiveTicks,
-    OptionChain,
 }
 
 impl LogCategory {
@@ -90,7 +90,6 @@ impl LogCategory {
         match self {
             Self::Candles => CATEGORY_CANDLES_DIR,
             Self::LiveTicks => CATEGORY_LIVE_TICKS_DIR,
-            Self::OptionChain => CATEGORY_OPTION_CHAIN_DIR,
         }
     }
 
@@ -99,14 +98,13 @@ impl LogCategory {
         match self {
             Self::Candles => CATEGORY_CANDLES_PREFIX,
             Self::LiveTicks => CATEGORY_LIVE_TICKS_PREFIX,
-            Self::OptionChain => CATEGORY_OPTION_CHAIN_PREFIX,
         }
     }
 
     /// Every variant. Used by retention sweepers + tests.
     #[must_use]
-    pub fn all() -> [Self; 3] {
-        [Self::Candles, Self::LiveTicks, Self::OptionChain]
+    pub fn all() -> [Self; 2] {
+        [Self::Candles, Self::LiveTicks]
     }
 }
 
@@ -146,11 +144,8 @@ pub fn build_category_targets(cat: LogCategory) -> &'static [&'static str] {
         ],
         // PR-D (2026-05-26): LogCategory::Historical variant retired
         // alongside the deleted Dhan historical fetch chain.
-        LogCategory::OptionChain => &[
-            "tickvault_core::option_chain",
-            // PR #3 (2026-05-19): `tickvault_trading::greeks` and
-            // `tickvault_storage::greeks_persistence` modules retired.
-        ],
+        // 2026-06-28: LogCategory::OptionChain variant retired with the
+        // deleted option_chain REST subsystem.
     }
 }
 
@@ -1296,13 +1291,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_log_category_all_returns_exactly_three_variants() {
-        // PR-D (2026-05-26): 3 categories — candles, live ticks, option chain.
-        // `LogCategory::Historical` retired alongside the deleted Dhan
-        // historical fetch chain. `LogCategory::Movers` was retired
-        // earlier (PR #539) — its targets folded into LiveTicks.
+    fn test_log_category_all_returns_exactly_two_variants() {
+        // 2026-06-28: 2 categories — candles, live ticks. `LogCategory::OptionChain`
+        // retired with the deleted option_chain REST subsystem.
+        // `LogCategory::Historical` retired earlier alongside the deleted Dhan
+        // historical fetch chain; `LogCategory::Movers` (PR #539) folded into
+        // LiveTicks.
         let all = LogCategory::all();
-        assert_eq!(all.len(), 3);
+        assert_eq!(all.len(), 2);
     }
 
     #[test]
@@ -1313,8 +1309,6 @@ mod tests {
         assert_eq!(LogCategory::Candles.prefix(), "candles");
         assert_eq!(LogCategory::LiveTicks.dir(), "data/logs/live_ticks");
         assert_eq!(LogCategory::LiveTicks.prefix(), "live_ticks");
-        assert_eq!(LogCategory::OptionChain.dir(), "data/logs/option_chain");
-        assert_eq!(LogCategory::OptionChain.prefix(), "option_chain");
     }
 
     /// 2026-05-09 ratchet: the 4 RAM-tracker tracing targets that
