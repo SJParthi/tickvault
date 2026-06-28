@@ -359,6 +359,7 @@ async fn main() -> Result<()> {
     tokio::spawn(
         tickvault_app::groww_activation::run_groww_activation_watcher(
             std::sync::Arc::clone(&feed_runtime),
+            std::sync::Arc::clone(&feed_health),
             config.questdb.clone(),
             groww_max_subscribe,
             config.network.request_timeout_ms,
