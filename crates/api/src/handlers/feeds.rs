@@ -262,6 +262,12 @@ pub struct FeedHealthRow {
     /// Total instruments subscribed (`stocks + indices`) — the at-a-glance proof
     /// number the `/feeds` page renders ("subscribed 767").
     pub subscribed_total: u64,
+    /// Records the feed's producer DECODED+EMITTED into the pipeline (honest-feed
+    /// PROOF — operator 2026-06-29). `0` until the feed reports a decode count.
+    pub decoded_emitted: u64,
+    /// Records the producer DECODED but DROPPED (sid-map miss / missing field).
+    /// Non-zero makes a key-map mismatch ("streaming but 0 ticks") visible.
+    pub decoded_dropped: u64,
 }
 
 /// The `GET /api/feeds/health` payload — one truthful row per feed.
@@ -318,6 +324,8 @@ pub async fn get_feeds_health(State(state): State<SharedAppState>) -> Json<Feeds
                 subscribed_stocks: report.input.subscribed_stocks,
                 subscribed_indices: report.input.subscribed_indices,
                 subscribed_total: report.input.subscribed_stocks + report.input.subscribed_indices,
+                decoded_emitted: report.input.decoded_emitted,
+                decoded_dropped: report.input.decoded_dropped,
             }
         })
         .collect();
@@ -398,12 +406,13 @@ mod tests {
     #[tokio::test]
     async fn test_get_feeds_health_one_row_per_feed_and_reflects_registry() {
         use tickvault_common::feed_health::FeedHealthRegistry;
-        // test coverage (one line for pub-fn-test-guard test.*<fn>): get_feeds_health lane_running new_with_feed_runtime_and_health feed_health
+        // test coverage (one line for pub-fn-test-guard test.*<fn>): get_feeds_health lane_running new_with_feed_runtime_and_health feed_health set_decode_counts
         let reg = Arc::new(FeedHealthRegistry::new());
         reg.set_connected(Feed::Groww, true);
         reg.record_tick(Feed::Groww, now_ist_nanos());
         reg.record_candle(Feed::Groww);
         reg.set_subscribed(Feed::Groww, 765, 2);
+        reg.set_decode_counts(Feed::Groww, 1500, 12);
         let state = test_state_with_health(
             FeedsConfig {
                 dhan_enabled: true,
@@ -426,6 +435,9 @@ mod tests {
         assert_eq!(groww.subscribed_stocks, 765);
         assert_eq!(groww.subscribed_indices, 2);
         assert_eq!(groww.subscribed_total, 767);
+        // Honest-feed PROOF (2026-06-29): the decoded+emitted / dropped counts surface.
+        assert_eq!(groww.decoded_emitted, 1500);
+        assert_eq!(groww.decoded_dropped, 12);
         // Dhan's slot untouched → not connected, no ticks (per-feed isolation).
         let dhan = resp
             .feeds

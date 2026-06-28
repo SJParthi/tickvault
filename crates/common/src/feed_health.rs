@@ -107,6 +107,16 @@ pub struct FeedHealthInput {
     /// Number of INDEX instruments this feed subscribed at startup. See
     /// `subscribed_stocks`.
     pub subscribed_indices: u64,
+    /// Number of records the producer DECODED and successfully EMITTED into the
+    /// pipeline (the honest-feed PROOF — operator 2026-06-29). `0` until the feed
+    /// reports an emit count (e.g. the Groww bridge reads the sidecar's `emitted`
+    /// status field). Display-only — it does NOT change the verdict; it answers
+    /// "is the feed actually decoding+emitting ticks, or just connected?".
+    pub decoded_emitted: u64,
+    /// Number of records the producer DECODED but DROPPED (a `sid_map` miss or a
+    /// missing price field) — previously a silent `continue`. A non-zero value
+    /// makes a key-map mismatch visible ("streaming but 0 ticks"). Display-only.
+    pub decoded_dropped: u64,
 }
 
 /// The per-feed health verdict + the signals it was computed from (so the API can
@@ -213,6 +223,10 @@ pub struct FeedHealthRegistry {
     subscribed_stocks: [AtomicU64; Feed::COUNT],
     /// INDEX instruments subscribed at startup.
     subscribed_indices: [AtomicU64; Feed::COUNT],
+    /// Records the producer DECODED + EMITTED into the pipeline (honest-feed PROOF).
+    decoded_emitted: [AtomicU64; Feed::COUNT],
+    /// Records the producer DECODED but DROPPED (sid-map miss / missing field).
+    decoded_dropped: [AtomicU64; Feed::COUNT],
     /// `true` when the provider rejected this feed's auth credential. Set on a
     /// confirmed rejection, cleared on a successful auth.
     auth_rejected: [AtomicBool; Feed::COUNT],
@@ -238,6 +252,8 @@ impl FeedHealthRegistry {
             connected: std::array::from_fn(|_| AtomicBool::new(false)),
             subscribed_stocks: std::array::from_fn(|_| AtomicU64::new(0)),
             subscribed_indices: std::array::from_fn(|_| AtomicU64::new(0)),
+            decoded_emitted: std::array::from_fn(|_| AtomicU64::new(0)),
+            decoded_dropped: std::array::from_fn(|_| AtomicU64::new(0)),
             auth_rejected: std::array::from_fn(|_| AtomicBool::new(false)),
             instrumented: std::array::from_fn(|_| AtomicBool::new(false)),
         }
@@ -290,6 +306,20 @@ impl FeedHealthRegistry {
         self.mark_instrumented(i);
     }
 
+    /// Record how many records `feed` DECODED+EMITTED vs DECODED-but-DROPPED — the
+    /// honest-feed PROOF (operator 2026-06-29). Makes the previously-SILENT
+    /// decode-but-drop (a `sid_map` miss / missing price field) a visible number,
+    /// so "streaming but 0 ticks" has an immediate cause. Marks the feed
+    /// instrumented (a decode count is a real signal). O(1), Relaxed. Idempotent
+    /// overwrite (the producer reports cumulative totals). Does NOT change the
+    /// verdict — it is the "is the feed actually emitting ticks?" answer.
+    pub fn set_decode_counts(&self, feed: Feed, emitted: u64, dropped: u64) {
+        let i = feed.index();
+        self.decoded_emitted[i].store(emitted, Ordering::Relaxed);
+        self.decoded_dropped[i].store(dropped, Ordering::Relaxed);
+        self.mark_instrumented(i);
+    }
+
     /// Set `feed`'s auth-rejected state. Pass `true` on a confirmed provider
     /// credential rejection (e.g. Groww HTTP 400) and `false` on a successful
     /// auth. Marks the feed instrumented so a rejection surfaces as the
@@ -333,6 +363,8 @@ impl FeedHealthRegistry {
             instrumented: self.instrumented[i].load(Ordering::Relaxed),
             subscribed_stocks: self.subscribed_stocks[i].load(Ordering::Relaxed),
             subscribed_indices: self.subscribed_indices[i].load(Ordering::Relaxed),
+            decoded_emitted: self.decoded_emitted[i].load(Ordering::Relaxed),
+            decoded_dropped: self.decoded_dropped[i].load(Ordering::Relaxed),
         };
         evaluate_feed_health(feed, input)
     }
@@ -356,6 +388,8 @@ mod tests {
             instrumented: true,
             subscribed_stocks: 0,
             subscribed_indices: 0,
+            decoded_emitted: 0,
+            decoded_dropped: 0,
         }
     }
 
@@ -589,7 +623,7 @@ mod tests {
 
     // ── FeedHealthRegistry (the live-signal store the lanes update) ──
     // test coverage (one line for the pub-fn-test-guard test.*<fn> heuristic): the
-    // tests below exercise record_tick record_candle record_drops set_connected set_auth_rejected set_subscribed snapshot new
+    // tests below exercise record_tick record_candle record_drops set_connected set_auth_rejected set_subscribed set_decode_counts snapshot new
     const T0: i64 = 1_780_000_000_000_000_000;
 
     #[test]
@@ -722,6 +756,40 @@ mod tests {
         let r2 = reg.snapshot(Feed::Groww, true, true, true, T0);
         assert_eq!(r2.input.subscribed_stocks, 770);
         assert_eq!(r2.input.subscribed_indices, 3);
+    }
+
+    #[test]
+    fn test_registry_set_decode_counts_round_trip() {
+        // The honest-feed PROOF (2026-06-29): set_decode_counts records the
+        // emitted/dropped counts, marks the feed instrumented, the snapshot
+        // surfaces them, and it is per-feed isolated. It is display-only — it does
+        // NOT by itself change the verdict (a connected feed with a fresh tick is
+        // still Ok even with drops surfaced; drops drive Degraded via record_drops,
+        // which is a separate signal — decode_dropped is a producer-side count).
+        let reg = FeedHealthRegistry::new();
+        reg.set_connected(Feed::Groww, true);
+        reg.record_tick(Feed::Groww, T0);
+        reg.set_decode_counts(Feed::Groww, 765, 12);
+        let r = reg.snapshot(Feed::Groww, true, true, true, T0 + 1_000_000_000);
+        assert_eq!(r.input.decoded_emitted, 765);
+        assert_eq!(r.input.decoded_dropped, 12);
+        assert!(
+            r.input.instrumented,
+            "a decode count is a real signal → instrumented"
+        );
+        // Display-only: surfacing 12 producer-side drops does NOT flip the verdict
+        // (the feed is connected with a fresh tick → Ok). drops_total is the
+        // separate spill/DB drop signal that drives Degraded.
+        assert_eq!(r.verdict, FeedHealthVerdict::Ok);
+        // Per-feed isolation: Dhan slot untouched.
+        let d = reg.snapshot(Feed::Dhan, true, true, true, T0 + 1_000_000_000);
+        assert_eq!(d.input.decoded_emitted, 0);
+        assert_eq!(d.input.decoded_dropped, 0);
+        // Idempotent overwrite (the producer reports cumulative totals).
+        reg.set_decode_counts(Feed::Groww, 800, 13);
+        let r2 = reg.snapshot(Feed::Groww, true, true, true, T0 + 2_000_000_000);
+        assert_eq!(r2.input.decoded_emitted, 800);
+        assert_eq!(r2.input.decoded_dropped, 13);
     }
 
     #[test]

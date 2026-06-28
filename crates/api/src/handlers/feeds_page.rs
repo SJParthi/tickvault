@@ -244,6 +244,11 @@ function render(data, health) {
       parts.push(hv.connected ? "connected" : "not connected");
       // Connect+subscribe PROOF (2026-06-28): how many SIDs the feed subscribed today.
       if ((hv.subscribed_total || 0) > 0) parts.push("subscribed " + hv.subscribed_total);
+      // Honest-feed PROOF (2026-06-29): records the producer DECODED+EMITTED vs
+      // DECODED-but-DROPPED (e.g. an unmapped instrument) — makes "streaming but 0
+      // ticks" show its cause. "unmatched" is the plain word for a sid-map miss.
+      if ((hv.decoded_emitted || 0) > 0) parts.push("decoded " + hv.decoded_emitted);
+      if ((hv.decoded_dropped || 0) > 0) parts.push(hv.decoded_dropped + " unmatched");
       if (hv.last_tick_age_secs === null || hv.last_tick_age_secs === undefined) {
         parts.push("no tick yet");
       } else {
@@ -541,6 +546,23 @@ mod tests {
             FEEDS_PAGE_HTML.contains("subscribed_total")
                 && FEEDS_PAGE_HTML.contains("\"subscribed \""),
             "page must render the subscribe count from the health row"
+        );
+    }
+
+    #[test]
+    fn test_feeds_page_renders_decode_counts() {
+        // Honest-feed PROOF (2026-06-29): the page health line surfaces the
+        // producer-side decoded+emitted ("decoded N") and decoded-but-dropped
+        // ("N unmatched") counts so a sid-map mismatch ("streaming but 0 ticks")
+        // is visible. Read from the health row's decoded_emitted / decoded_dropped.
+        assert!(
+            FEEDS_PAGE_HTML.contains("decoded_emitted") && FEEDS_PAGE_HTML.contains("\"decoded \""),
+            "page must render the decoded+emitted count from the health row"
+        );
+        assert!(
+            FEEDS_PAGE_HTML.contains("decoded_dropped")
+                && FEEDS_PAGE_HTML.contains("\" unmatched\""),
+            "page must render the decoded-but-dropped count from the health row"
         );
     }
 

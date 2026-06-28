@@ -92,6 +92,10 @@ const GROWW_BRIDGE_FALLBACK_POLL: Duration = Duration::from_millis(GROWW_BRIDGE_
 
 /// One line of the sidecar's PROOF status file. `event` is `"subscribed"` or
 /// `"streaming"`; the counts are the SIDs the sidecar actually subscribed today.
+/// `emitted`/`dropped` are the honest-feed PROOF (operator 2026-06-29): records the
+/// producer DECODED+EMITTED vs DECODED-but-DROPPED (a `sid_map` miss / missing
+/// field). Both are `#[serde(default)]` so an OLD sidecar status (no fields) parses
+/// to 0 — forward-safe, no error.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
 struct GrowwStatusLine {
     event: GrowwStatusEvent,
@@ -99,6 +103,10 @@ struct GrowwStatusLine {
     stocks: u64,
     #[serde(default)]
     indices: u64,
+    #[serde(default)]
+    emitted: u64,
+    #[serde(default)]
+    dropped: u64,
 }
 
 /// The sidecar's two PROOF status events. `Unknown` tolerates a future/unexpected
@@ -771,6 +779,12 @@ pub async fn run_groww_bridge(
                 // Keep the counts fresh on a re-subscribe (reconnect) without re-logging.
                 feed_health.set_subscribed(Feed::Groww, status.stocks, status.indices);
             }
+            // HONEST-FEED PROOF (operator 2026-06-29): surface the producer-side
+            // decoded+emitted vs decoded-but-dropped counts so a sid-map mismatch
+            // ("streaming but 0 ticks") is a VISIBLE number, not a silent drop.
+            // Always refreshed from the latest status (the sidecar reports cumulative
+            // totals); display-only, never changes the verdict or `connected`.
+            feed_health.set_decode_counts(Feed::Groww, status.emitted, status.dropped);
             if status.event == GrowwStatusEvent::Streaming {
                 streaming_observed = true;
             }
@@ -1140,6 +1154,116 @@ mod tests {
         assert!(parse_groww_status_line("   ").is_none());
         assert!(parse_groww_status_line("{\"event\":\"subscr").is_none());
         assert!(parse_groww_status_line("not json").is_none());
+    }
+
+    #[test]
+    fn test_parse_groww_status_line_decode_counts() {
+        // Honest-feed PROOF (2026-06-29): the `emitted`/`dropped` fields parse, and
+        // the events keep their connected-gating semantics — `subscribed` does NOT
+        // mean streaming, `streaming` DOES.
+        let subscribed = r#"{"event":"subscribed","stocks":765,"indices":2,"total":767,"emitted":0,"dropped":3}"#;
+        let s = parse_groww_status_line(subscribed).expect("parse subscribed");
+        assert_eq!(s.event, GrowwStatusEvent::Subscribed);
+        assert_ne!(
+            s.event,
+            GrowwStatusEvent::Streaming,
+            "a `subscribed` status must NOT read as streaming (no false-OK)"
+        );
+        assert_eq!(s.emitted, 0);
+        assert_eq!(s.dropped, 3);
+
+        let streaming = r#"{"event":"streaming","stocks":765,"indices":2,"total":767,"emitted":1500,"dropped":12}"#;
+        let st = parse_groww_status_line(streaming).expect("parse streaming");
+        assert_eq!(
+            st.event,
+            GrowwStatusEvent::Streaming,
+            "a `streaming` status DOES mean ticks are flowing (flips connected)"
+        );
+        assert_eq!(st.emitted, 1500);
+        assert_eq!(st.dropped, 12);
+    }
+
+    #[test]
+    fn test_parse_groww_status_line_decode_counts_default() {
+        // Mixed-deploy safety: an OLD sidecar status (no emitted/dropped fields)
+        // still parses — the `#[serde(default)]` fields read 0, never an error.
+        let old = r#"{"event":"streaming","stocks":765,"indices":2,"total":767}"#;
+        let got = parse_groww_status_line(old).expect("old status parses");
+        assert_eq!(got.event, GrowwStatusEvent::Streaming);
+        assert_eq!(got.emitted, 0, "absent emitted → serde default 0");
+        assert_eq!(got.dropped, 0, "absent dropped → serde default 0");
+    }
+
+    #[test]
+    fn test_bridge_records_decode_counts_from_status() {
+        // The honest-feed surface (2026-06-29): the bridge MUST push the sidecar's
+        // emitted/dropped counts into feed-health via set_decode_counts on each
+        // status read. Pin by source-scan — `run_groww_bridge` is a TEST-EXEMPT I/O
+        // driver, so a future refactor cannot silently drop the decode-count surface.
+        let src = include_str!("groww_bridge.rs");
+        assert!(
+            src.contains("set_decode_counts(Feed::Groww, status.emitted, status.dropped)"),
+            "the bridge must record the producer-side decoded+emitted / dropped \
+             counts in feed-health from the status read"
+        );
+    }
+
+    #[test]
+    fn test_sidecar_streaming_is_honest_not_optimistic() {
+        // HONEST-FEED FIX (operator 2026-06-29): the Python sidecar must NOT write the
+        // `streaming` status optimistically BEFORE `feed.consume()` (the false-OK the
+        // diagnosis flagged). It must instead write `streaming` only on the FIRST real
+        // decoded+emitted tick (note_emit), and COUNT the previously-silent drops
+        // (note_drop). Pin the contract by source-scanning the sidecar so a future
+        // edit cannot silently reintroduce the optimistic write.
+        let sidecar = include_str!("../../../scripts/groww-sidecar/groww_sidecar.py");
+        // The two emit functions count emits + drops, and the first emit drives streaming.
+        assert!(
+            sidecar.contains("def note_emit(") && sidecar.contains("def note_drop("),
+            "the sidecar must count decoded-emitted and decoded-dropped records"
+        );
+        assert!(
+            sidecar.contains("write_status(\"streaming\""),
+            "the sidecar must still write the `streaming` status (now on first emit)"
+        );
+        // The `streaming` status must be written ONLY from inside note_emit (driven by
+        // a REAL decoded+emitted tick) — note_emit legitimately writes it twice (the
+        // first-emit branch + the throttled periodic re-write). The contract to enforce
+        // is that the consume BLOCK (between the `phase = "consume"` marker and the
+        // blocking `feed.consume()`) contains NO optimistic, uncommented streaming write.
+        let consume_idx = sidecar
+            .find("feed.consume()")
+            .expect("sidecar must call feed.consume()");
+        let consume_phase_idx = sidecar
+            .find("phase = \"consume\"")
+            .expect("sidecar must mark the consume phase");
+        assert!(
+            consume_phase_idx < consume_idx,
+            "the consume-phase marker must precede the blocking consume call"
+        );
+        // Scan ONLY the consume-block window line-by-line; a `write_status("streaming"`
+        // here is a real optimistic write ONLY if the line is NOT a comment. The removed
+        // optimistic write lived exactly here, so a non-comment occurrence is the bug.
+        let consume_block = &sidecar[consume_phase_idx..consume_idx];
+        let optimistic_writes = consume_block
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with('#') && trimmed.contains("write_status(\"streaming\"")
+            })
+            .count();
+        assert_eq!(
+            optimistic_writes, 0,
+            "the optimistic pre-consume write_status(\"streaming\") must be gone — \
+             `streaming` is written ONLY inside note_emit on the first real decoded tick"
+        );
+        // And note_emit MUST itself drive the streaming status (first real tick).
+        let note_emit_idx = sidecar.find("def note_emit(").expect("note_emit defined");
+        let after_note_emit = &sidecar[note_emit_idx..];
+        assert!(
+            after_note_emit.contains("write_status(\"streaming\""),
+            "note_emit must write the `streaming` status (driven by a real decoded tick)"
+        );
     }
 
     #[test]
