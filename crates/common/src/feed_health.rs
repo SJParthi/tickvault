@@ -98,6 +98,15 @@ pub struct FeedHealthInput {
     /// record-sites aren't wired yet, so the verdict is `Unknown`, NOT a false
     /// `Down`. Prevents a healthy-but-unwired feed from showing red.
     pub instrumented: bool,
+    /// Number of STOCK instruments this feed subscribed at startup (the live
+    /// connect+subscribe PROOF — operator 2026-06-28). `0` until the feed reports
+    /// a subscribe count (e.g. the Groww bridge observes the sidecar's `subscribed`
+    /// status). Display-only — it does NOT change the verdict, it answers "how
+    /// many SIDs did the feed actually subscribe today?".
+    pub subscribed_stocks: u64,
+    /// Number of INDEX instruments this feed subscribed at startup. See
+    /// `subscribed_stocks`.
+    pub subscribed_indices: u64,
 }
 
 /// The per-feed health verdict + the signals it was computed from (so the API can
@@ -200,6 +209,10 @@ pub struct FeedHealthRegistry {
     candles_total: [AtomicU64; Feed::COUNT],
     drops_total: [AtomicU64; Feed::COUNT],
     connected: [AtomicBool; Feed::COUNT],
+    /// STOCK instruments subscribed at startup (the live connect+subscribe PROOF).
+    subscribed_stocks: [AtomicU64; Feed::COUNT],
+    /// INDEX instruments subscribed at startup.
+    subscribed_indices: [AtomicU64; Feed::COUNT],
     /// `true` when the provider rejected this feed's auth credential. Set on a
     /// confirmed rejection, cleared on a successful auth.
     auth_rejected: [AtomicBool; Feed::COUNT],
@@ -223,6 +236,8 @@ impl FeedHealthRegistry {
             candles_total: std::array::from_fn(|_| AtomicU64::new(0)),
             drops_total: std::array::from_fn(|_| AtomicU64::new(0)),
             connected: std::array::from_fn(|_| AtomicBool::new(false)),
+            subscribed_stocks: std::array::from_fn(|_| AtomicU64::new(0)),
+            subscribed_indices: std::array::from_fn(|_| AtomicU64::new(0)),
             auth_rejected: std::array::from_fn(|_| AtomicBool::new(false)),
             instrumented: std::array::from_fn(|_| AtomicBool::new(false)),
         }
@@ -260,6 +275,18 @@ impl FeedHealthRegistry {
     pub fn set_connected(&self, feed: Feed, connected: bool) {
         let i = feed.index();
         self.connected[i].store(connected, Ordering::Relaxed);
+        self.mark_instrumented(i);
+    }
+
+    /// Record how many STOCK + INDEX instruments `feed` subscribed at startup —
+    /// the live connect+subscribe PROOF (operator 2026-06-28). Marks the feed
+    /// instrumented (a subscribe count is a real signal). O(1), Relaxed. Idempotent
+    /// overwrite (a re-subscribe on reconnect updates the counts). Does NOT change
+    /// the verdict — it is the "how many SIDs did we actually subscribe?" answer.
+    pub fn set_subscribed(&self, feed: Feed, stocks: u64, indices: u64) {
+        let i = feed.index();
+        self.subscribed_stocks[i].store(stocks, Ordering::Relaxed);
+        self.subscribed_indices[i].store(indices, Ordering::Relaxed);
         self.mark_instrumented(i);
     }
 
@@ -304,6 +331,8 @@ impl FeedHealthRegistry {
             market_open,
             auth_rejected: self.auth_rejected[i].load(Ordering::Relaxed),
             instrumented: self.instrumented[i].load(Ordering::Relaxed),
+            subscribed_stocks: self.subscribed_stocks[i].load(Ordering::Relaxed),
+            subscribed_indices: self.subscribed_indices[i].load(Ordering::Relaxed),
         };
         evaluate_feed_health(feed, input)
     }
@@ -325,6 +354,8 @@ mod tests {
             market_open: true,
             auth_rejected: false,
             instrumented: true,
+            subscribed_stocks: 0,
+            subscribed_indices: 0,
         }
     }
 
@@ -558,7 +589,7 @@ mod tests {
 
     // ── FeedHealthRegistry (the live-signal store the lanes update) ──
     // test coverage (one line for the pub-fn-test-guard test.*<fn> heuristic): the
-    // tests below exercise record_tick record_candle record_drops set_connected set_auth_rejected snapshot new
+    // tests below exercise record_tick record_candle record_drops set_connected set_auth_rejected set_subscribed snapshot new
     const T0: i64 = 1_780_000_000_000_000_000;
 
     #[test]
@@ -665,6 +696,32 @@ mod tests {
         let r = reg.snapshot(Feed::Groww, true, true, true, T0);
         assert!(r.input.instrumented);
         assert_eq!(r.verdict, FeedHealthVerdict::Down);
+    }
+
+    #[test]
+    fn test_registry_set_subscribed_surfaces_counts_and_instruments() {
+        // The connect+subscribe PROOF (2026-06-28): set_subscribed records the
+        // stock/index counts, marks the feed instrumented, and the snapshot
+        // surfaces them. It is display-only — it does NOT by itself flip the
+        // verdict (a subscribed-but-silent feed during market hours is still Down).
+        let reg = FeedHealthRegistry::new();
+        reg.set_subscribed(Feed::Groww, 765, 2);
+        let r = reg.snapshot(Feed::Groww, true, true, true, T0);
+        assert_eq!(r.input.subscribed_stocks, 765);
+        assert_eq!(r.input.subscribed_indices, 2);
+        assert!(
+            r.input.instrumented,
+            "a subscribe count is a real signal → instrumented"
+        );
+        // Per-feed isolation: Dhan slot untouched.
+        let d = reg.snapshot(Feed::Dhan, true, true, true, T0);
+        assert_eq!(d.input.subscribed_stocks, 0);
+        assert_eq!(d.input.subscribed_indices, 0);
+        // Idempotent overwrite (a re-subscribe updates the counts).
+        reg.set_subscribed(Feed::Groww, 770, 3);
+        let r2 = reg.snapshot(Feed::Groww, true, true, true, T0);
+        assert_eq!(r2.input.subscribed_stocks, 770);
+        assert_eq!(r2.input.subscribed_indices, 3);
     }
 
     #[test]

@@ -56,6 +56,11 @@ except Exception as exc:  # pragma: no cover
 
 # The path the Rust bridge tails (GROWW_TICK_FILE_DEFAULT in groww_bridge.rs).
 OUTPUT_PATH = os.environ.get("GROWW_TICK_FILE", "data/groww/live-ticks.ndjson")
+# The connect+subscribe PROOF status file the Rust bridge reads (operator
+# 2026-06-28). Written ATOMICALLY (temp + rename) so the bridge never reads a
+# half-written file; carries ONLY counts + an event tag + a timestamp — NEVER any
+# credential. Default mirrors GROWW_STATUS_FILE_DEFAULT in groww_bridge.rs.
+STATUS_PATH = os.environ.get("GROWW_STATUS_FILE", "data/groww/groww-status.json")
 # Directory the Rust watch-list builder writes groww-watch-<date>.json into.
 WATCH_DIR = os.environ.get("GROWW_WATCH_DIR", "data/groww")
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -208,6 +213,47 @@ def ms_to_ist_nanos(ts_millis: int) -> int:
     dt_utc = datetime.fromtimestamp(ts_millis / 1000.0, tz=timezone.utc)
     dt_ist = dt_utc.astimezone(IST)
     return int(dt_ist.replace(tzinfo=timezone.utc).timestamp() * 1_000_000_000)
+
+
+def now_ist_nanos() -> int:
+    """Current wall-clock time as IST epoch nanoseconds (for the status file ts)."""
+    return int(datetime.now(tz=IST).timestamp() * 1_000_000_000)
+
+
+def write_status(event: str, stocks: int, indices: int) -> None:
+    """Atomically write the connect+subscribe PROOF status the Rust bridge reads.
+
+    The bridge (crates/app/src/groww_bridge.rs) tails this file to emit the ONE
+    structured "Groww live feed CONNECTED — subscribed N stocks + M indices" log,
+    record the subscribe counts in feed-health, and flip `connected=true` only on
+    the `streaming` event (no false-OK). Contains ONLY: event tag + counts + a
+    timestamp — NEVER a credential. Atomic temp+rename so the bridge never reads a
+    torn file. Best-effort: a write failure is logged (type only) and ignored — the
+    stream itself is unaffected, and the bridge's first-tick fallback still flips
+    connected.
+    """
+    rec = {
+        "event": event,
+        "stocks": int(stocks),
+        "indices": int(indices),
+        "total": int(stocks) + int(indices),
+        "ts_ist_nanos": now_ist_nanos(),
+    }
+    try:
+        directory = os.path.dirname(STATUS_PATH) or "."
+        os.makedirs(directory, exist_ok=True)
+        tmp = f"{STATUS_PATH}.{os.getpid()}.tmp"
+        with open(tmp, "w") as fh:
+            fh.write(json.dumps(rec))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, STATUS_PATH)  # atomic rename
+    except OSError as exc:
+        # Never embed paths/values that could leak anything; type only.
+        print(
+            f"groww sidecar: status write failed ({type(exc).__name__}); continuing",
+            flush=True,
+        )
 
 
 def latest_watch_file(watch_dir: str):
@@ -427,10 +473,17 @@ def main() -> None:
                 f"— streaming…",
                 flush=True,
             )
+            # Connect+subscribe PROOF (2026-06-28): write the atomic status the Rust
+            # bridge reads → it emits the ONE structured CONNECT log + records the
+            # subscribe counts in feed-health. Counts only, never a credential.
+            write_status("subscribed", len(stock_list), len(index_list))
             # A full cycle succeeded up to the blocking consume — reset backoff so
             # the next genuine disconnect retries quickly, not at the capped delay.
             consecutive_failures = 0
             phase = "consume"
+            # `streaming` flips the bridge's `connected=true` (the gate is now
+            # streaming-or-first-tick, NOT mere file existence — no false-OK).
+            write_status("streaming", len(stock_list), len(index_list))
             feed.consume()  # blocking
         except KeyboardInterrupt:
             print("stopping.", flush=True)

@@ -242,6 +242,8 @@ function render(data, health) {
       const parts = [];
       if (hv.reason) parts.push(hv.reason);
       parts.push(hv.connected ? "connected" : "not connected");
+      // Connect+subscribe PROOF (2026-06-28): how many SIDs the feed subscribed today.
+      if ((hv.subscribed_total || 0) > 0) parts.push("subscribed " + hv.subscribed_total);
       if (hv.last_tick_age_secs === null || hv.last_tick_age_secs === undefined) {
         parts.push("no tick yet");
       } else {
@@ -529,6 +531,17 @@ mod tests {
                 "verdict colour class '{cls}' present"
             );
         }
+    }
+
+    #[test]
+    fn test_feeds_page_renders_subscribed_count() {
+        // Connect+subscribe PROOF (2026-06-28): the page health line shows how many
+        // SIDs the feed actually subscribed today ("subscribed 767").
+        assert!(
+            FEEDS_PAGE_HTML.contains("subscribed_total")
+                && FEEDS_PAGE_HTML.contains("\"subscribed \""),
+            "page must render the subscribe count from the health row"
+        );
     }
 
     #[test]

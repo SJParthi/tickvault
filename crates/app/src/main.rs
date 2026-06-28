@@ -347,6 +347,7 @@ async fn main() -> Result<()> {
     tokio::spawn(tickvault_app::groww_bridge::run_groww_bridge(
         config.questdb.clone(),
         std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
+        std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_STATUS_FILE_DEFAULT),
         std::sync::Arc::clone(&feed_runtime),
         std::sync::Arc::clone(&feed_health),
     ));
