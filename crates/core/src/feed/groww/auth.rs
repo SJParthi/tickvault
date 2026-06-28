@@ -267,8 +267,8 @@ pub async fn run_groww_auth_smoke_check(
     obtain_groww_access_token(&http, &creds).await?;
 
     info!(
-        "Groww access-token auth OK — credentials valid; the Groww live-feed \
-         connector lands in a later PR of the second-feed sequence"
+        "Groww access-token auth OK — credentials valid; live ticks stream via \
+         the Python growwapi sidecar (the native-Rust NATS connector is deferred)"
     );
     Ok(())
 }
