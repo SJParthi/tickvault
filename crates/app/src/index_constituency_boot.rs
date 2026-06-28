@@ -39,7 +39,7 @@ use tickvault_core::instrument::index_constituency::build_constituency_map;
 use tickvault_core::instrument::index_constituency::downloader::ConstituencyDownloader;
 use tickvault_storage::index_constituency_persistence::{
     INDEX_CONSTITUENCY_FEED_DHAN, IndexConstituencyRow, append_index_constituency_rows,
-    ensure_index_constituency_table,
+    ensure_index_constituency_table, migrate_index_constituency_truncate_once,
 };
 
 /// One fully-resolved (index, stock) mapping row — OWNED so the pure builder is
@@ -181,8 +181,13 @@ pub async fn persist_index_constituency_mapping(
         })
         .collect();
 
-    // 5. Persist (idempotent UPSERT). Ensure the table first (self-heal).
+    // 5. Persist (idempotent UPSERT). Ensure the table first (self-heal), then
+    //    run the one-time, marker-gated ts-pin migration BEFORE the write so the
+    //    order is truncate → write: it clears the legacy day-floored rows once
+    //    (the `ts` is now pinned to epoch 0, so new writes UPSERT in place but
+    //    can't overwrite the old per-day rows). Degrade-safe — never blocks.
     ensure_index_constituency_table(&questdb).await;
+    migrate_index_constituency_truncate_once(&questdb).await;
     match append_index_constituency_rows(&questdb, &ilp_rows).await {
         Ok(()) => {
             info!(
