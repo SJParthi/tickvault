@@ -76,6 +76,24 @@ pub struct WatchEntry {
     /// name) this is a Groww-native stable id (operator decision 2026-06-21) —
     /// Rust is the single source so the sidecar never re-derives it.
     pub security_id: i64,
+    /// COLD-PATH provenance (PR-A) — the constituent ISIN this stock resolved
+    /// from (`None` for indices, which have no ISIN). Retained here ONLY for the
+    /// daily `instrument_lifecycle` / `index_constituency` master-row build; the
+    /// sidecar watch-file contract is unchanged (skipped when `None`, and stocks
+    /// always carry it). `WatchEntry` is a cold-path daily-build struct (NOT the
+    /// per-tick path — verified: referenced only in this module + tests), so the
+    /// owned `String` here costs nothing on the hot path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isin: Option<String>,
+    /// COLD-PATH provenance (PR-A) — the human ticker (NTM `Symbol` for stocks).
+    /// `None` for indices (they carry `index_name` instead). Cold-path only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_name: Option<String>,
+    /// COLD-PATH provenance (PR-A) — the Groww `groww_symbol` for indices (e.g.
+    /// `NSE-NIFTY`, `BSE-SENSEX`), used as the `index_name` + `symbol_name` of
+    /// the master row. `None` for stocks. Cold-path only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_name: Option<String>,
 }
 
 /// The assembled Groww watch set + resolution provenance for observability.
@@ -322,6 +340,11 @@ fn extract_index_entries(rows: &[GrowwInstrumentRow]) -> Vec<WatchEntry> {
             exchange_token: r.exchange_token.clone(),
             kind: WatchKind::IndexValue,
             security_id: stable_index_security_id(&r.groww_symbol),
+            // PR-A cold-path provenance: indices have no ISIN; carry the stable
+            // `groww_symbol` as the master-row `index_name`/`symbol_name`.
+            isin: None,
+            symbol_name: None,
+            index_name: Some(r.groww_symbol.clone()),
         })
         .collect();
     entries.sort_by(|a, b| a.exchange_token.cmp(&b.exchange_token));
@@ -349,6 +372,11 @@ fn resolve_stock_entries(
                 exchange_token: token.clone(),
                 kind: WatchKind::Ltp,
                 security_id: token.parse::<i64>().unwrap_or(0),
+                // PR-A cold-path provenance: retain the constituent ISIN + ticker
+                // for the daily master-row build (was discarded at this boundary).
+                isin: Some(isin.clone()),
+                symbol_name: Some(symbol.clone()),
+                index_name: None,
             }),
             None => unresolved.push(symbol.clone()),
         }
@@ -825,6 +853,35 @@ mod tests {
         assert_eq!(unresolved, vec!["GHOST".to_string()]);
     }
 
+    #[test]
+    fn test_resolve_stock_entries_retains_isin_and_symbol() {
+        // PR-A: the resolver MUST retain the constituent ISIN + ticker on the
+        // (cold-path) WatchEntry so the daily master-row build can populate
+        // `index_constituency` / `instrument_lifecycle`.
+        let mut map = HashMap::new();
+        map.insert("INE002A01018".to_string(), "2885".to_string());
+        let constituents = vec![("RELIANCE".to_string(), "INE002A01018".to_string())];
+        let (entries, _unresolved) = resolve_stock_entries(&constituents, &map);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].isin.as_deref(), Some("INE002A01018"));
+        assert_eq!(entries[0].symbol_name.as_deref(), Some("RELIANCE"));
+        // Stocks carry no index name.
+        assert_eq!(entries[0].index_name, None);
+    }
+
+    #[test]
+    fn test_extract_index_entries_retains_index_name() {
+        // PR-A: index entries MUST retain the stable `groww_symbol` as the
+        // master-row `index_name`, and carry no ISIN/symbol_name.
+        let csv = format!("{HEADER}\n{}", idx_row("NIFTY"));
+        let rows = parse_groww_master(&csv).unwrap();
+        let entries = extract_index_entries(&rows);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].index_name.as_deref(), Some("NSE-NIFTY"));
+        assert_eq!(entries[0].isin, None);
+        assert_eq!(entries[0].symbol_name, None);
+    }
+
     fn stock_entry(token: &str) -> WatchEntry {
         WatchEntry {
             exchange: "NSE".to_string(),
@@ -832,6 +889,9 @@ mod tests {
             exchange_token: token.to_string(),
             kind: WatchKind::Ltp,
             security_id: token.parse::<i64>().unwrap_or(0),
+            isin: Some(format!("INE{token:0>9}")),
+            symbol_name: Some(format!("SYM{token}")),
+            index_name: None,
         }
     }
     fn index_entry(name: &str) -> WatchEntry {
@@ -841,6 +901,9 @@ mod tests {
             exchange_token: name.to_string(),
             kind: WatchKind::IndexValue,
             security_id: stable_index_security_id(&format!("NSE-{name}")),
+            isin: None,
+            symbol_name: None,
+            index_name: Some(format!("NSE-{name}")),
         }
     }
 

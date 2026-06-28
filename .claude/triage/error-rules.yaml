@@ -1676,3 +1676,27 @@ rules:
       graceful-close of an already-disabled feed. Silence (counter +
       tv_dhan_lane_teardown_forced_total record the event); the operator
       inspects only if it recurs on every disable per the runbook.
+
+  # GROWW-MASTER-01 = the best-effort cold-path write of the Groww instrument
+  # set into the SHARED instrument_lifecycle + index_constituency master tables
+  # (tagged feed='groww') failed (QuestDB ILP unreachable / flush error). It is a
+  # forensic master/metadata write, NEVER on the data-correctness or recovery
+  # path — Groww feed activation, the live tick path, and the Dhan master rows
+  # are all UNAFFECTED. The append is idempotent (DEDUP UPSERT) so the next boot
+  # re-runs. Medium, auto-triage-safe — silence: the counter
+  # (tv_groww_master_persist_errors_total) records it; the operator inspects only
+  # if it persists (then it is the same QuestDB-ILP-degraded signal as BOOT-01/02).
+  - name: groww-master-01-persist-failed-silence
+    match:
+      code: GROWW-MASTER-01
+    action: silence
+    runbook_path: .claude/rules/project/groww-shared-master-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      GROWW-MASTER-01 = the Groww shared-master persist (instrument_lifecycle +
+      index_constituency, feed='groww') failed via QuestDB ILP. Best-effort
+      cold-path forensic write — the Groww feed, the live tick path, and the
+      Dhan master rows are unaffected, and the idempotent DEDUP UPSERT means the
+      next boot re-runs. Silence (counter records it); escalate only if it
+      persists, which is the same QuestDB-ILP-degraded condition as BOOT-01/02.
