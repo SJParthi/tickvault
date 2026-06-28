@@ -1088,6 +1088,15 @@ pub const INDEX_SYMBOL_ALIASES: &[(&str, &str)] = &[
     ("NIFTYNXT50", "NIFTY NEXT 50"),
     ("NIFTY NXT 50", "NIFTY NEXT 50"),
     ("SENSEX50", "SNSX50"),
+    // Groww→Dhan spelling bridges (2026-06-28): the Groww index DISPLAY `name`
+    // for these three differs from the Dhan-allowlist trading-symbol spelling,
+    // so the Groww index-coverage audit would falsely flag them absent. Additive
+    // (alias→canonical) — they only ADD a fallback match, never remove one, so
+    // the Dhan-side `extract_indices` path is unaffected for already-matching
+    // rows. Stored already-normalized (uppercase, single-spaced).
+    ("NIFTY MIDCAP SELECT", "MIDCPNIFTY"),
+    ("NIFTY MIDCAP 50", "NIFTYMCAP50"),
+    ("NIFTY TOTAL MARKET", "NIFTY TOTAL MKT"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -3416,5 +3425,21 @@ mod tests {
         );
         // The pre-existing FNO-direction alias is untouched.
         assert!(has("SENSEX50", "SNSX50"), "SENSEX50 alias preserved");
+    }
+
+    #[test]
+    fn test_index_symbol_aliases_cover_groww_dhan_spelling_bridges() {
+        // 2026-06-28: the Groww index DISPLAY name for these three differs from
+        // the Dhan-allowlist trading-symbol spelling; the additive bridge aliases
+        // let the Groww index-coverage audit canonicalize them correctly so they
+        // are not falsely flagged absent.
+        let has = |alias: &str, canonical: &str| {
+            INDEX_SYMBOL_ALIASES
+                .iter()
+                .any(|(a, c)| *a == alias && *c == canonical)
+        };
+        assert!(has("NIFTY MIDCAP SELECT", "MIDCPNIFTY"));
+        assert!(has("NIFTY MIDCAP 50", "NIFTYMCAP50"));
+        assert!(has("NIFTY TOTAL MARKET", "NIFTY TOTAL MKT"));
     }
 }
