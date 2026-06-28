@@ -60,9 +60,16 @@ pub const TICK_CONSERVATION_AUDIT_TABLE: &str = "tick_conservation_audit";
 /// DEDUP UPSERT key. Designated timestamp first (2026-04-28 regression rule);
 /// `trading_date_ist` second so per-day queries hit the partition cleanly.
 /// No `security_id` → I-P1-11 N/A (per-run table, no instrument key).
-pub const DEDUP_KEY_TICK_CONSERVATION_AUDIT: &str = "ts, trading_date_ist";
+pub const DEDUP_KEY_TICK_CONSERVATION_AUDIT: &str = "ts, trading_date_ist, feed";
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
+
+/// Broker-source label stamped on every conservation-audit row today (operator
+/// override 2026-06-28 — `feed` is in the DEDUP key on every persisted table).
+/// The 15:40 IST audit reconciles the Dhan WAL/processor/ticks stores today; a
+/// future per-feed reconciliation would stamp its own. Replay-stable
+/// `&'static str` from the canonical `Feed` enum.
+pub const CONSERVATION_FEED_DHAN: &str = tickvault_common::feed::Feed::Dhan.as_str();
 
 /// Audit verdict for the `outcome` SYMBOL column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +131,9 @@ pub struct TickConservationRow {
     pub partial_coverage: bool,
     /// The verdict.
     pub outcome: ConservationOutcome,
+    /// Broker-source label (`dhan`/`groww`). Part of the DEDUP key (operator
+    /// override 2026-06-28). Always non-empty (stamped [`CONSERVATION_FEED_DHAN`]).
+    pub feed: &'static str,
 }
 
 /// The idempotent `CREATE TABLE` DDL. Pure (testable without QuestDB).
@@ -149,7 +159,8 @@ pub fn tick_conservation_audit_create_ddl() -> String {
             delivery_residual  LONG, \
             outcome_residual   LONG, \
             partial_coverage   BOOLEAN, \
-            outcome            SYMBOL\
+            outcome            SYMBOL, \
+            feed               SYMBOL\
         ) timestamp(ts) PARTITION BY DAY \
         DEDUP UPSERT KEYS({DEDUP_KEY_TICK_CONSERVATION_AUDIT});"
     )
@@ -194,28 +205,44 @@ pub async fn ensure_tick_conservation_audit_table(questdb_config: &QuestDbConfig
         Err(err) => error!(?err, "tick_conservation_audit: CREATE TABLE request failed"),
     }
 
-    // Feed-provenance label (operator 2026-06-19, "all tables"): self-heal ALTER
-    // only — additive, idempotent, NON-key; CREATE DDL + its column ratchet are
-    // untouched. Free on every boot.
-    let alter_feed_ddl =
-        format!("ALTER TABLE {TICK_CONSERVATION_AUDIT_TABLE} ADD COLUMN IF NOT EXISTS feed SYMBOL");
-    match client
-        .get(&base_url)
-        .query(&[("query", alter_feed_ddl.as_str())])
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => {}
-        Ok(resp) => {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            error!(%status, body = %body.chars().take(200).collect::<String>(),
-                "tick_conservation_audit: ALTER ADD COLUMN feed returned non-2xx");
-        }
-        Err(err) => error!(
-            ?err,
-            "tick_conservation_audit: ALTER ADD COLUMN feed request failed"
+    // Feed-in-key self-heal (operator override 2026-06-28 — supersedes the
+    // 2026-06-19 NON-key label). Additive + idempotent, IN THIS ORDER:
+    // ADD COLUMN → backfill NULL→'dhan' → re-enable DEDUP with `feed` in the
+    // key. The CREATE above already ships the column+key on greenfield; these
+    // run for tables created before this change. The backfill MUST precede the
+    // DEDUP-ENABLE so a re-keyed table upserts over a legacy NULL-feed row
+    // instead of duplicating it. Never drops the table (SEBI retention).
+    let self_heal = [
+        format!(
+            "ALTER TABLE {TICK_CONSERVATION_AUDIT_TABLE} ADD COLUMN IF NOT EXISTS feed SYMBOL;"
         ),
+        format!(
+            "UPDATE {TICK_CONSERVATION_AUDIT_TABLE} SET feed = '{CONSERVATION_FEED_DHAN}' WHERE feed IS NULL;"
+        ),
+        format!(
+            "ALTER TABLE {TICK_CONSERVATION_AUDIT_TABLE} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_TICK_CONSERVATION_AUDIT});"
+        ),
+    ];
+    for ddl in &self_heal {
+        match client
+            .get(&base_url)
+            .query(&[("query", ddl.as_str())])
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                error!(%status, ddl = ddl.as_str(), body = %body.chars().take(200).collect::<String>(),
+                    "tick_conservation_audit: feed self-heal returned non-2xx");
+            }
+            Err(err) => error!(
+                ?err,
+                ddl = ddl.as_str(),
+                "tick_conservation_audit: feed self-heal request failed"
+            ),
+        }
     }
 }
 
@@ -293,6 +320,10 @@ impl TickConservationAuditWriter {
             .context("table")?
             .symbol("outcome", r.outcome.as_str())
             .context("outcome")?
+            // `feed` is a DEDUP-key SYMBOL — ALWAYS written (operator override
+            // 2026-06-28). Must precede the fields (ILP tags-before-fields rule).
+            .symbol("feed", r.feed)
+            .context("feed")?
             .column_ts(
                 "trading_date_ist",
                 TimestampNanos::new(r.trading_date_ist_nanos),
@@ -384,6 +415,7 @@ mod tests {
             outcome_residual: 0,
             partial_coverage: false,
             outcome: ConservationOutcome::Balanced,
+            feed: CONSERVATION_FEED_DHAN,
         }
     }
 
@@ -410,6 +442,7 @@ mod tests {
             "outcome_residual",
             "partial_coverage",
             "outcome",
+            "feed",
         ] {
             assert!(ddl.contains(col), "DDL missing column {col:?}: {ddl}");
         }
@@ -418,15 +451,43 @@ mod tests {
     }
 
     #[test]
-    fn test_conservation_dedup_key_includes_designated_timestamp() {
+    fn test_conservation_dedup_key_includes_designated_timestamp_and_feed() {
         // 2026-04-28 regression rule: the designated timestamp MUST be in
-        // the DEDUP key. The table is per-run (no instrument key) — pin both.
-        assert!(DEDUP_KEY_TICK_CONSERVATION_AUDIT.contains("ts"));
+        // the DEDUP key. operator override 2026-06-28: + feed.
+        let has_token = |t: &str| {
+            DEDUP_KEY_TICK_CONSERVATION_AUDIT
+                .split([',', ' '])
+                .map(str::trim)
+                .any(|tok| tok == t)
+        };
+        assert!(has_token("ts"));
         assert!(DEDUP_KEY_TICK_CONSERVATION_AUDIT.contains("trading_date_ist"));
+        assert!(
+            has_token("feed"),
+            "operator override 2026-06-28: feed must be in the DEDUP key"
+        );
+        assert_eq!(
+            DEDUP_KEY_TICK_CONSERVATION_AUDIT.matches(',').count() + 1,
+            3,
+            "DEDUP key has exactly 3 columns (ts, trading_date_ist, feed)"
+        );
         let ddl = tick_conservation_audit_create_ddl();
         assert!(ddl.contains(&format!(
             "DEDUP UPSERT KEYS({DEDUP_KEY_TICK_CONSERVATION_AUDIT})"
         )));
+    }
+
+    #[test]
+    fn test_conservation_append_row_writes_feed_symbol() {
+        // operator override 2026-06-28: every conservation-audit row carries
+        // feed in-key. Stamp 'dhan' (the only writer today).
+        let mut w = TickConservationAuditWriter::for_test();
+        w.append_row(&sample_row()).expect("append must succeed");
+        let line = String::from_utf8(w.buffer.as_bytes().to_vec()).expect("utf8");
+        assert!(
+            line.contains(",feed=dhan"),
+            "ILP must write feed tag: {line}"
+        );
     }
 
     #[test]

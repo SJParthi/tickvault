@@ -38,6 +38,7 @@ use std::time::Duration;
 
 use tickvault_api::feed_state::{Feed, FeedRuntimeState};
 use tickvault_common::config::QuestDbConfig;
+use tickvault_common::feed_health::FeedHealthRegistry;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
@@ -114,6 +115,7 @@ pub fn is_dead_activation(desired_enabled: bool, task_finished: bool, lane_runni
 // TEST-EXEMPT: infinite control-plane poll loop driving live I/O; pure decision (reconcile_lane_action) unit-tested below.
 pub async fn run_groww_activation_watcher(
     feed_runtime: Arc<FeedRuntimeState>,
+    feed_health: Arc<FeedHealthRegistry>,
     questdb: QuestDbConfig,
     max_subscribe: Option<usize>,
     auth_timeout_ms: u64,
@@ -162,6 +164,7 @@ pub async fn run_groww_activation_watcher(
                 }
                 let task = tokio::spawn(activate_groww_lane(
                     Arc::clone(&feed_runtime),
+                    Arc::clone(&feed_health),
                     questdb.clone(),
                     max_subscribe,
                     auth_timeout_ms,
@@ -203,6 +206,7 @@ pub async fn run_groww_activation_watcher(
 /// watch-list, not a stale boot-day one (security-review MEDIUM).
 async fn activate_groww_lane(
     feed_runtime: Arc<FeedRuntimeState>,
+    feed_health: Arc<FeedHealthRegistry>,
     questdb: QuestDbConfig,
     max_subscribe: Option<usize>,
     auth_timeout_ms: u64,
@@ -245,14 +249,69 @@ async fn activate_groww_lane(
     // Auth smoke-check (diagnostic; inline so a disable aborts it). A failure is
     // logged but does NOT abort activation — the watch-list build + sidecar may
     // still succeed if the token recovers; the smoke-check is an early warning.
-    if let Err(err) =
-        tickvault_core::feed::groww::auth::run_groww_auth_smoke_check(auth_timeout_ms).await
-    {
-        error!(
-            error = %err,
-            "Groww access-token auth smoke-check FAILED — verify \
-             /tickvault/<env>/groww/api-key + /tickvault/<env>/groww/totp-secret in SSM"
-        );
+    // The hint names the RESOLVED environment + the EXACT SSM paths read (never
+    // the values) so the failure is self-diagnosing — no literal `<env>`.
+    use tickvault_core::auth::secret_manager::{build_ssm_path, resolve_environment};
+    use tickvault_core::feed::groww::auth::GrowwAuthSmokeError;
+    let env = resolve_environment().unwrap_or_else(|_| "<unresolved>".to_string());
+    let api_key_path = build_ssm_path(
+        &env,
+        tickvault_common::constants::SSM_GROWW_SERVICE,
+        tickvault_common::constants::GROWW_API_KEY_SECRET,
+    );
+    let totp_path = build_ssm_path(
+        &env,
+        tickvault_common::constants::SSM_GROWW_SERVICE,
+        tickvault_common::constants::GROWW_TOTP_SECRET,
+    );
+    match tickvault_core::feed::groww::auth::run_groww_auth_smoke_check(auth_timeout_ms).await {
+        Ok(()) => {
+            // Auth recovered / valid — clear any stale auth-rejected flag so the
+            // Feed Control page resolves back to a normal verdict.
+            feed_health.set_auth_rejected(Feed::Groww, false);
+        }
+        Err(GrowwAuthSmokeError::Rejected { status, body }) => {
+            // Groww RECEIVED the request and refused the credential — the
+            // actionable "refresh the SSM api-key" case. Surface it on the Feed
+            // Control page AND name the env + both SSM paths + Groww's verbatim
+            // (already-redacted) status+body in the log. The api-key/TOTP values
+            // are NEVER in `body` (it is the response body, not the request).
+            feed_health.set_auth_rejected(Feed::Groww, true);
+            error!(
+                env = %env,
+                api_key_path = %api_key_path,
+                totp_secret_path = %totp_path,
+                status,
+                body = %body,
+                "Groww access-token auth REJECTED by Groww — refresh the Groww SSM \
+                 api-key. Ensure the SSM api-key is a Groww TOTP token (not a \
+                 regular API Key) and the Trading API subscription is active"
+            );
+        }
+        Err(GrowwAuthSmokeError::Transport(reason)) => {
+            // Could not reach Groww — a network blip, NOT a credential fault. Do
+            // NOT set auth-rejected (would falsely blame the key + stick red).
+            error!(
+                env = %env,
+                api_key_path = %api_key_path,
+                totp_secret_path = %totp_path,
+                reason = %reason,
+                "Groww access-token auth smoke-check could not reach Groww \
+                 (transient) — the credential is NOT marked rejected; retrying \
+                 via the watch-list build / sidecar"
+            );
+        }
+        Err(GrowwAuthSmokeError::Credentials(reason)) => {
+            // SSM fetch / local setup failed before the request went out.
+            error!(
+                env = %env,
+                api_key_path = %api_key_path,
+                totp_secret_path = %totp_path,
+                reason = %reason,
+                "Groww access-token auth smoke-check failed before reaching Groww \
+                 — verify the api-key + totp-secret exist at the SSM paths above"
+            );
+        }
     }
 
     // Watch-list build — pull-until-success, inline. The watcher's `abort()` on a
@@ -277,6 +336,24 @@ async fn activate_groww_lane(
                     unresolved = set.unresolved_stocks.len(),
                     "[feeds] Groww watch-list ready"
                 );
+                // PR-A: persist the Groww instrument set into the SHARED
+                // `instrument_lifecycle` (+ `index_constituency`) master tables
+                // tagged `feed='groww'`. Fire-and-forget + degrade-safe — a
+                // persist failure logs GROWW-MASTER-01 and returns; it never
+                // blocks lane activation or the live feed (cold-path forensic
+                // master write). The Groww lane has no dry-run universe, so
+                // `dry_run=false`.
+                let persist_questdb = questdb.clone();
+                let persist_date = watch_date.clone();
+                tokio::spawn(async move {
+                    tickvault_core::feed::groww::shared_master_writer::persist_groww_instruments(
+                        &persist_questdb,
+                        &set,
+                        &persist_date,
+                        false,
+                    )
+                    .await;
+                });
                 break;
             }
             Err(err) => {

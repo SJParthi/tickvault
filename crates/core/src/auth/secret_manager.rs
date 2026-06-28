@@ -4,10 +4,12 @@
 //! and Telegram tokens from real AWS SSM (ap-south-1). Same code path
 //! in dev and prod — secrets are managed via AWS Console.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use aws_config::Region;
 use aws_sdk_ssm::Client as SsmClient;
 use secrecy::SecretString;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use tickvault_common::constants::{
     DEFAULT_SSM_ENVIRONMENT, DHAN_CLIENT_ID_SECRET, DHAN_CLIENT_SECRET_SECRET,
@@ -26,7 +28,23 @@ use super::types::{DhanCredentials, GrowwCredentials, QuestDbCredentials, Telegr
 /// Constructs the full SSM parameter path.
 ///
 /// Format: `/tickvault/<environment>/<service>/<secret_name>`
-pub(crate) fn build_ssm_path(environment: &str, service: &str, secret_name: &str) -> String {
+///
+/// `pub` so boot/activation diagnostics (e.g. the Groww auth-failure hint) can
+/// name the EXACT path read — never the value — instead of a `<env>` placeholder.
+pub fn build_ssm_path(environment: &str, service: &str, secret_name: &str) -> String {
+    if environment.is_empty() || service.is_empty() || secret_name.is_empty() {
+        // Empty components yield a malformed path (`/tickvault//groww/...`) that
+        // would 404 on every SSM read. We do NOT panic/debug_assert — an existing
+        // test calls this with empty strings — but we WARN so a real boot-time
+        // misconfig is visible in the log. The returned string is unchanged.
+        warn!(
+            environment_empty = environment.is_empty(),
+            service_empty = service.is_empty(),
+            secret_name_empty = secret_name.is_empty(),
+            "build_ssm_path called with an empty path component — the resulting SSM \
+             path is malformed and will not resolve"
+        );
+    }
     format!(
         "{}/{}/{}/{}",
         SSM_SECRET_BASE_PATH, environment, service, secret_name
@@ -68,7 +86,21 @@ pub fn resolve_environment() -> Result<String, ApplicationError> {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
         })
-        .unwrap_or_else(|| DEFAULT_SSM_ENVIRONMENT.to_string());
+        .unwrap_or_else(|| {
+            // Neither var was set / non-empty — we fall back to the compiled
+            // default. Warn ONCE per process so the operator knows every secret
+            // is being read from `/tickvault/<default>/*` (e.g. on a box that
+            // forgot to export TV_ENVIRONMENT). The returned value is unchanged.
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                warn!(
+                    default_env = DEFAULT_SSM_ENVIRONMENT,
+                    "TV_ENVIRONMENT/ENVIRONMENT unset — defaulting SSM environment; \
+                     secrets read from /tickvault/<default>/*"
+                );
+            }
+            DEFAULT_SSM_ENVIRONMENT.to_string()
+        });
     validate_environment(&env)
 }
 
@@ -888,43 +920,13 @@ mod tests {
     // were dropped in the QuestDB table cleanup. (The watchdog
     // evaluator + Telegram variants are unaffected and stay.)
 
-    /// Option-chain pipeline PR #5/5 meta-guard: main.rs MUST spawn the
-    /// option-chain snapshot scheduler so the RAM `SnapshotCache` the
-    /// strategy reads is populated. (The QuestDB mirror table was dropped
-    /// 2026-06-23 — ticks are the single source of truth — so there is no
-    /// boot DDL to assert anymore, only the live scheduler spawn.)
-    #[test]
-    fn test_option_chain_minute_snapshot_scheduler_is_wired_into_main() {
-        // Option-chain pipeline PR #5/5 meta-guard. main.rs MUST spawn
-        // `option_chain::snapshot_scheduler::spawn_snapshot_scheduler`
-        // when `config.option_chain_minute_snapshot.enabled == true`.
-        // Without the boot wiring, the scheduler module + cache + 4
-        // Telegram variants + 4 Prometheus counters all exist as dead
-        // code (per audit-findings Rule 13).
-        let main_rs = std::fs::read_to_string("../app/src/main.rs")
-            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
-            .expect("main.rs must be readable");
-        assert!(
-            main_rs.contains("spawn_snapshot_scheduler("),
-            "main.rs MUST call `option_chain::snapshot_scheduler::spawn_snapshot_scheduler` \
-             from the boot path. See plan doc \
-             `.claude/plans/friday-may-15-mega/topic-OPTION-CHAIN-MINUTE-SNAPSHOT.md` PR #5."
-        );
-        assert!(
-            main_rs.contains("validate_option_chain_schedule"),
-            "main.rs MUST call `validate_option_chain_schedule` BEFORE spawning the \
-             scheduler. Invalid TOML must HALT boot via `OptionChainConfigInvalid` \
-             Telegram, not silently run a broken schedule."
-        );
-    }
-
-    // test_option_chain_minute_snapshot_table_is_wired_into_boot_ddl REMOVED
-    // 2026-06-23: the `option_chain_minute_snapshot` QuestDB table was dropped
-    // (operator: ticks are the single source of truth). The scheduler still
-    // runs + populates the RAM `SnapshotCache` for the strategy — guarded by
-    // `test_option_chain_minute_snapshot_scheduler_is_wired_into_main` above —
-    // it just no longer mirrors into a QuestDB table, so there is no boot DDL
-    // to assert. See `.claude/plans/active-plan-drop-option-chain-snapshot-table.md`.
+    // test_option_chain_minute_snapshot_scheduler_is_wired_into_main REMOVED
+    // 2026-06-28: the entire option_chain REST subsystem (scheduler + client +
+    // expiry warmup + caches + config + error codes + notifications) was deleted
+    // per operator directive 2026-06-28 ("drop the option chain entire
+    // implementations and its table also"). It was disabled since 2026-06-02
+    // with no live consumer; its QuestDB table was dropped 2026-06-23. There is
+    // no scheduler spawn to assert anymore.
 
     /// Phase 0 Item 19f meta-guard: main.rs MUST wire the
     /// `shutdown_notify` -> heartbeat-`Notify` bridge so the

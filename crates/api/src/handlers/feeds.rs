@@ -246,6 +246,9 @@ pub struct FeedHealthRow {
     /// `true` once this feed's lane has reported any health signal. `false` →
     /// the verdict is `unknown` (record-sites not wired yet), NOT a real fault.
     pub instrumented: bool,
+    /// `true` when the provider rejected this feed's auth credential (e.g. Groww
+    /// HTTP 400). Drives the `down` + "refresh the api-key" verdict/reason above.
+    pub auth_rejected: bool,
     /// Seconds since the last tick; `null` = none yet.
     pub last_tick_age_secs: Option<u64>,
     pub ticks_total: u64,
@@ -303,6 +306,7 @@ pub async fn get_feeds_health(State(state): State<SharedAppState>) -> Json<Feeds
                 candles_total: report.input.candles_total,
                 drops_total: report.input.drops_total,
                 instrumented: report.input.instrumented,
+                auth_rejected: report.input.auth_rejected,
             }
         })
         .collect();

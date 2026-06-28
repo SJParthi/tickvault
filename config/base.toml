@@ -345,87 +345,20 @@ list = [
 per_instrument_capacity = 5000
 
 # --------------------------------------------------------------------
-# Option-chain minute-snapshot pipeline (2026-05-16, BRUTEX feeder)
+# Option-chain config sections REMOVED 2026-06-28.
+# The entire option_chain REST subsystem (and its
+# `[option_chain_minute_snapshot]` config + the `[option_chain]` PR-stub)
+# was deleted per operator directive 2026-06-28 ("drop the option chain
+# entire implementations and its table also"). It was disabled since
+# 2026-06-02 (no Dhan Option Chain Data API entitlement) with no live
+# consumer; its QuestDB table was dropped 2026-06-23.
 # --------------------------------------------------------------------
-# Three-times-per-minute Dhan REST fetch of the option chain (current
-# expiry) for the configured underlyings. Staggered slots respect
-# Dhan's "1 unique request per 3 seconds" rate limit.
-#
-# Strategy reads the freshest snapshot from a bounded RAM cache; it
-# NEVER awaits the fetch. Hard halt + Critical Telegram when cache
-# age exceeds `cache_max_stale_secs`.
-#
-# Design doc:
-# .claude/plans/friday-may-15-mega/topic-OPTION-CHAIN-MINUTE-SNAPSHOT.md
-[option_chain_minute_snapshot]
-enabled = false                    # 2026-06-02: DISABLED per operator. The Dhan account lacks the Option Chain Data API entitlement, so /v2/optionchain/expirylist returns 404 every minute (NIFTY/BANKNIFTY/SENSEX) and pages [HIGH]. Spot tick capture is unaffected. Re-enable once the account has the Option Chain Data API. (Was true 2026-05-25.)
-cache_max_stale_secs = 300         # 5 min hard halt threshold
-strike_window_atm_each_side = 25   # ATM ± 25 strikes cached per underlying
-fetch_retry_max_attempts = 2       # same-minute retries per underlying
-
-[[option_chain_minute_snapshot.underlyings]]
-symbol      = "SENSEX"
-security_id = 51
-segment     = "IDX_I"
-slot_sec    = 49           # 2026-05-26: bumped from :50 → :49 to widen S→B→N spacing to 5s. The previous 3s spacing sat right at Dhan's "1 unique request per 3 seconds" rate-limit boundary and produced ~1 DH-904 429 every 5 minutes (see live logs 2026-05-26). 5s spacing eliminates the rate-limit hits with no change to the 50s overall cadence.
-
-[[option_chain_minute_snapshot.underlyings]]
-symbol      = "BANKNIFTY"
-security_id = 25
-segment     = "IDX_I"
-slot_sec    = 54
-
-[[option_chain_minute_snapshot.underlyings]]
-symbol      = "NIFTY"
-security_id = 13
-segment     = "IDX_I"
-slot_sec    = 59
 
 # ===========================================================================
-# PR #1 (AWS-lifecycle 14-PR sequence) — CONTRACT STUB sections.
-#
-# These two sections define the configuration shape for PR #8 (option_chain
-# module) and PR #9 (cross_verify module). No Rust consumer reads them yet
-# — the current `ApplicationConfig` struct has no fields for them, so they
-# are silently ignored by the TOML parser (deny_unknown_fields is NOT set).
-#
-# When PR #8 lands, it adds `#[serde] struct OptionChainConfig` and wires
-# it via `ApplicationConfig::option_chain: OptionChainConfig`. Same for PR #9.
-#
-# See:
-# - docs/architecture/option-chain-z-plus-heart-piece.md §7 + §8
-# - docs/architecture/aws-indices-only-locked-architecture.md §14
-# - .claude/plans/aws-lifecycle/THE-FINAL-PLAN.md §5 (14-PR sequence)
+# PR #1 (AWS-lifecycle 14-PR sequence) — CONTRACT STUB section.
+# The [cross_verify] doc-stub below defines config shape for PR #9
+# (cross_verify module). No Rust consumer reads it yet (no struct field).
 # ===========================================================================
-
-[option_chain]
-# Operator-locked 2026-05-18: 50-60s cadence window. Strategy fail-closes
-# if cache age exceeds `max_cache_age_secs`.
-cadence_secs            = 50
-max_cycle_latency_secs  = 60   # alarm if cycle exceeds this
-max_cache_age_secs      = 60   # strategy fail-closed threshold
-fetch_timeout_secs      = 5
-retry_count             = 1
-backoff_ladder_secs     = [10, 20, 40, 80]   # DH-904 backoff per dhan-annexure-enums rule 11
-verify_ltp_tolerance_pct = 0.005             # 0.5% LTP-vs-WS tolerance (OPTION-CHAIN-04)
-stale_cycles_before_telegram = 3
-expirylist_refresh_ist  = "15:31:00"          # daily Thursday rollover detection
-
-# 3 underlyings (NIFTY/BANKNIFTY/SENSEX). INDIA VIX has NO option chain.
-[[option_chain.underlyings]]
-security_id = 13
-name        = "NIFTY"
-segment     = "IDX_I"
-
-[[option_chain.underlyings]]
-security_id = 25
-name        = "BANKNIFTY"
-segment     = "IDX_I"
-
-[[option_chain.underlyings]]
-security_id = 51
-name        = "SENSEX"
-segment     = "IDX_I"
 
 [cross_verify]
 # Operator-locked 2026-05-18:

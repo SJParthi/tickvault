@@ -50,6 +50,9 @@ pub mod groww_bridge;
 /// Groww Python-sidecar auto-launcher + supervisor (operator lock §32 +
 /// "no manual commands" 2026-06-19). Default-OFF.
 pub mod groww_sidecar_supervisor;
+/// Shared per-seal routing for BOTH feeds (Dhan + Groww) — the single
+/// `route_seal` body the two `on_seal` call sites invoke (C2, behavior-preserving).
+pub mod seal_routing;
 // PR #4 (2026-05-19): depth-20 / depth-200 modules DELETED (operator-locked
 // per websocket-connection-scope-lock.md — 4-IDX_I uses 1 main-feed conn
 // + 1 order-update conn only).
@@ -67,7 +70,6 @@ pub mod infra;
 // in-memory cache (consumed by the cascade seal-time pct-stamping
 // path + tick enricher) is Dhan-precise from the first tick.
 pub mod prev_day_ohlcv_boot;
-pub mod prev_oi_loader;
 // F2 (Wave-5 #504e follow-up) — boot-time loader for `PrevDayCache`
 // so the cascade seal-time pct-stamping path (PR #520 / F1) sees
 // non-zero `prev_day_close` values from QuestDB's `previous_close`
@@ -121,10 +123,5 @@ pub mod lifecycle_reconcile_orchestrator;
 // §21; the main.rs Step-6c task spawn is the final wiring PR.
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod daily_universe_boot;
-// 2026-05-25 — Crash-recovery REHYDRATE of the option-chain current-
-// expiry cache from QuestDB's `option_chain_minute_snapshot` table.
-// See `option_chain_cache_loader.rs` module docs for the 3-tier
-// recovery contract.
-pub mod option_chain_cache_loader;
 pub mod subsystem_memory;
 pub mod trading_pipeline;

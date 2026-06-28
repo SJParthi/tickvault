@@ -42,3 +42,14 @@ format = "json"
 [api]
 # Different port so staging + prod can coexist on the same machine.
 port = 3002
+
+[feeds]
+# Enable the Groww second feed on staging for the tonight's dry-run.
+# Dhan (feed #1) stays ON; Groww (feed #2) is flipped ON here ONLY for staging
+# per the operator-locked per-feed enable/disable contract
+# (.claude/rules/project/groww-second-feed-scope-2026-06-19.md §2). Groww is a
+# SEPARATE, isolated live-feed lane (default-OFF in base.toml) that cannot crash
+# Dhan — deploying staging with this flag is the dry-run. Live-feed-only per §33
+# (no Groww historical/backtest pull).
+dhan_enabled = true
+groww_enabled = true

@@ -359,6 +359,7 @@ async fn main() -> Result<()> {
     tokio::spawn(
         tickvault_app::groww_activation::run_groww_activation_watcher(
             std::sync::Arc::clone(&feed_runtime),
+            std::sync::Arc::clone(&feed_health),
             config.questdb.clone(),
             groww_max_subscribe,
             config.network.request_timeout_ms,
@@ -3588,10 +3589,10 @@ fn spawn_engine_b_aggregator(
     trading_calendar: std::sync::Arc<TradingCalendar>,
 ) {
     use tickvault_storage::seal_writer_runner::global_seal_sender;
-    use tickvault_trading::candles::{
-        AggregatorHeartbeatCounters, BufferedSeal, MultiTfAggregator, TfIndex,
-        stamp_seal_pct_fields,
-    };
+    // C2: `BufferedSeal` / `TfIndex` / `stamp_seal_pct_fields` are no longer used
+    // directly here — the per-seal routing body moved into
+    // `tickvault_app::seal_routing::route_seal` (behavior-preserving).
+    use tickvault_trading::candles::{AggregatorHeartbeatCounters, MultiTfAggregator};
 
     // 11K-instrument capacity (matches MAX_TOTAL_SUBSCRIPTIONS headroom
     // per `aws-budget.md`). HashMap grows lazily so this is a hint.
@@ -3628,51 +3629,30 @@ fn spawn_engine_b_aggregator(
                         // pre-FeedStrategy Dhan behaviour.
                         tickvault_trading::candles::FeedStrategy::DHAN,
                         None,
-                        |tf, mut state| {
-                            // 1d historical-only (operator directive 2026-06-02):
-                            // the 1d timeframe is NEVER tick-calculated. It is
-                            // pulled once each morning from Dhan historical into
-                            // `prev_day_ohlcv`. Drop any D1 seal the aggregator
-                            // emits so it never reaches `candles_1d`. The
-                            // aggregator still seals all 21 TFs internally
-                            // (fixed 21-slot arrays + `42 = 2×21` unit test
-                            // intact); only this write boundary skips D1.
-                            if tf == TfIndex::D1 {
-                                return;
-                            }
-                            let mut refs = prev_day_cache_for_agg
-                                .lookup(tick.security_id, tick.exchange_segment_code)
-                                .unwrap_or_default();
-                            // Operator decision 2026-05-28: take the prev-day
-                            // close straight from the live ticks `close`
-                            // column (captured into the candle state), not the
-                            // QuestDB PrevDayCache (which is empty in the
-                            // Engine-B runtime). Drives close_pct_from_prev_day.
-                            refs.prev_day_close = state.prev_day_close;
-                            stamp_seal_pct_fields(&mut state, refs);
-                            // G3 real-time proof: capture the % BEFORE `state`
-                            // is moved into the seal. A non-zero value proves
-                            // the percentage-change column is populating live.
-                            let close_pct_nonzero = state.close_pct_from_prev_day != 0.0;
-                            let seal = BufferedSeal::new(
+                        |tf, state| {
+                            // C2 (behavior-preserving): the per-seal routing body
+                            // now lives in the shared `route_seal`. Dhan policy:
+                            // drop the D1 seal (1d is historical-only per
+                            // `live-feed-purity.md` rule 10), stamp the prev-day
+                            // pct fields from `prev_day_cache_for_agg`, and drive
+                            // the heartbeat + `tv_aggregator_*` counters. The
+                            // emitted output (counters, drop label, BufferedSeal
+                            // fields, D1-drop, pct-stamp) is byte-identical to the
+                            // pre-C2 inline closure.
+                            tickvault_app::seal_routing::route_seal(
+                                tickvault_app::seal_routing::SealRouteParams {
+                                    feed: tickvault_common::feed::Feed::Dhan,
+                                    drop_d1: true,
+                                    prev_day_cache: Some(prev_day_cache_for_agg.as_ref()),
+                                    heartbeat: Some(&heartbeat_writer),
+                                    feed_health_on_m1: None,
+                                },
                                 tick.security_id,
                                 tick.exchange_segment_code,
                                 tf,
                                 state,
-                                tickvault_common::feed::Feed::Dhan,
+                                sender,
                             );
-                            if sender.try_send(seal).is_err() {
-                                metrics::counter!("tv_seal_mpsc_dropped_total").increment(1);
-                                heartbeat_writer.record_drop();
-                            } else {
-                                metrics::counter!("tv_aggregator_seals_emitted_total").increment(1);
-                                heartbeat_writer.record_emit();
-                                if close_pct_nonzero {
-                                    metrics::counter!("tv_aggregator_close_pct_nonzero_total")
-                                        .increment(1);
-                                    heartbeat_writer.record_close_pct_nonzero();
-                                }
-                            }
                         },
                     );
                     if stats.late_count > 0 {
@@ -3794,39 +3774,37 @@ fn spawn_engine_b_aggregator(
 
             let mut sealed: u64 = 0;
             let mut dropped: u64 = 0;
-            agg_for_boundary.force_seal_all(|security_id, segment_code, tf, mut state| {
-                // 1d historical-only (operator directive 2026-06-02): D1 is
-                // never tick-sealed — drop it at this write boundary too. See
-                // the per-tick seal site above for the full rationale.
-                if tf == TfIndex::D1 {
-                    return;
-                }
-                let mut refs = prev_day_cache_for_boundary
-                    .lookup(security_id, segment_code)
-                    .unwrap_or_default();
-                // Live prev-day close from the candle state (see per-tick
-                // seal site above) — operator decision 2026-05-28.
-                refs.prev_day_close = state.prev_day_close;
-                stamp_seal_pct_fields(&mut state, refs);
-                // G3 real-time proof (capture before move) — same contract as
-                // the per-tick seal site above.
-                let close_pct_nonzero = state.close_pct_from_prev_day != 0.0;
-                let seal = BufferedSeal::new(
+            agg_for_boundary.force_seal_all(|security_id, segment_code, tf, state| {
+                // C2 (behavior-preserving): the per-seal routing body now lives
+                // in the shared `route_seal`. This IST-midnight Dhan path uses
+                // the SAME Dhan policy as the per-tick site (drop D1, pct-stamp,
+                // fire the `tv_aggregator_*` counters) but carries NO heartbeat —
+                // it keeps its own local `sealed`/`dropped` running counts from
+                // the returned `SealOutcome`. Byte-identical to the pre-C2 inline
+                // closure.
+                match tickvault_app::seal_routing::route_seal(
+                    tickvault_app::seal_routing::SealRouteParams {
+                        feed: tickvault_common::feed::Feed::Dhan,
+                        drop_d1: true,
+                        prev_day_cache: Some(prev_day_cache_for_boundary.as_ref()),
+                        heartbeat: None,
+                        feed_health_on_m1: None,
+                    },
                     security_id,
                     segment_code,
                     tf,
                     state,
-                    tickvault_common::feed::Feed::Dhan,
-                );
-                if sender.try_send(seal).is_err() {
-                    metrics::counter!("tv_seal_mpsc_dropped_total").increment(1);
-                    dropped = dropped.saturating_add(1);
-                } else {
-                    metrics::counter!("tv_aggregator_seals_emitted_total").increment(1);
-                    sealed = sealed.saturating_add(1);
-                    if close_pct_nonzero {
-                        metrics::counter!("tv_aggregator_close_pct_nonzero_total").increment(1);
+                    sender,
+                ) {
+                    tickvault_app::seal_routing::SealOutcome::Sent => {
+                        sealed = sealed.saturating_add(1);
                     }
+                    tickvault_app::seal_routing::SealOutcome::DroppedFull => {
+                        dropped = dropped.saturating_add(1);
+                    }
+                    // D1 is dropped at the write boundary — not counted as a
+                    // mpsc-full drop (matches the pre-C2 early-`return`).
+                    tickvault_app::seal_routing::SealOutcome::DroppedD1 => {}
                 }
             });
             tracing::info!(
@@ -4568,7 +4546,7 @@ async fn start_dhan_lane(
     // -----------------------------------------------------------------------
     // Step 6b: Set up QuestDB tick persistence (best-effort)
     // -----------------------------------------------------------------------
-    info!("setting up QuestDB tables (ticks + candles + option_chain + historical_candles)");
+    info!("setting up QuestDB tables (ticks + candles + historical_candles)");
 
     // Wave 2 Item 7 (G14) — block until QuestDB is reachable. Escalating
     // logs at +5/+10/+20s; BOOT-01 ERROR @+30s; BOOT-02 HALT @+60s.
@@ -5291,47 +5269,18 @@ async fn start_dhan_lane(
         // for every NSE row from tomorrow's run until a follow-up PR
         // migrates that query to a non-movers source. Operator has
         // explicitly opted into this trade-off ("skip bhavcopy").
-        if let Some(_registry) = slow_registry.as_ref() {
-            // 2026-05-09: prev_oi loader simplified to overlay-only.
-            // Wave-5 indices-only scope subscribes only NIFTY /
-            // BANKNIFTY / SENSEX derivatives — exactly the 3
-            // underlyings the Option Chain REST overlay covers. The
-            // bhavcopy fetch + macOS `unzip` shell-out (recurring
-            // PREVOI-01 broken-pipe failures on macOS Info-ZIP 6.00)
-            // is retired per operator directive.
-            let prev_oi_cache =
-                tickvault_app::prev_oi_loader::load_prev_oi_cache_at_boot_with_overlay(
-                    token_handle.clone(),
-                    ws_client_id.clone(),
-                    config.dhan.rest_api_base_url.clone(),
-                )
-                .await;
-            if prev_oi_cache.is_empty() {
-                warn!(
-                    code = tickvault_common::error_code::ErrorCode::PrevOi01CacheEmptyAtBoot
-                        .code_str(),
-                    "prev_oi cache EMPTY at boot — Option Chain overlay returned \
-                     zero entries for NIFTY/BANKNIFTY/SENSEX; downstream consumers \
-                     will see `current_OI - 0 = current_OI` until next boot."
-                );
-            } else {
-                info!(
-                    cache_size = prev_oi_cache.len(),
-                    "prev_oi cache populated via Option Chain overlay — \
-                     downstream OI Change is Dhan-precise"
-                );
-            }
-            // #T4 (2026-05-20): the `previous_close` QuestDB table was
-            // dropped. The boot-time `prev_day_cache_loader` SELECT
-            // against it is retired — `PrevDayCache` stays empty and
-            // the cascade seal-time pct path falls back to 0.0 pct
-            // fields per the documented div-by-zero policy.
-        } else {
-            warn!(
-                "prev_oi cache loader NOT spawned — slow_registry is None \
-                 (subscription_plan absent)"
-            );
-        }
+        // 2026-06-28: the boot-time Option Chain REST prev_oi OVERLAY was
+        // REMOVED with the entire option_chain subsystem (operator directive
+        // 2026-06-28 — "drop the option chain entire implementations and its
+        // table also"; the subsystem was disabled since 2026-06-02 with no
+        // Data API entitlement). The orphaned overlay built a `prev_oi_cache`
+        // that was immediately shadowed by the tick-enricher's own
+        // `prev_day_ohlcv`-sourced load below — so its removal is behaviour-
+        // neutral. The LIVE OI-change path (tick enricher reads OI from the
+        // `prev_day_ohlcv` table) is untouched and remains the sole prev_oi
+        // source. #T4 (2026-05-20): the `previous_close` QuestDB boot SELECT
+        // was already retired; `PrevDayCache` stays empty and the cascade
+        // seal-time pct path falls back to 0.0 pct per the div-by-zero policy.
 
         // PR #6a (2026-05-19): bhavcopy 16:30 IST cross-check task RETIRED.
         // Under 4-IDX_I LOCKED_UNIVERSE (operator lock 2026-05-15) there are
@@ -6510,132 +6459,18 @@ async fn start_dhan_lane(
     info!("greeks pipeline retired (PR #3)");
 
     // -----------------------------------------------------------------------
-    // Option-chain minute-snapshot scheduler (PR #5 of 5 — 2026-05-16)
+    // Option-chain minute-snapshot scheduler — REMOVED 2026-06-28.
     //
-    // Drives the 3-times-per-minute Dhan option-chain fetch (operator-
-    // locked schedule: SENSEX :53 / BANKNIFTY :56 / NIFTY :59) into a
-    // shared RAM cache that the future BRUTEX strategy reads from.
-    //
-    // The scheduler is opt-in (`config.option_chain_minute_snapshot.enabled
-    // = false` by default) so a fresh deployment doesn't surprise-fetch.
-    //
-    // Boot-time validator (`option_chain_schedule::validate_option_chain_schedule`)
-    // runs before spawn — invalid TOML HALTs the app via
-    // `OptionChainConfigInvalid` Severity::Critical Telegram instead of
-    // silently running a broken schedule.
-    //
-    // See `.claude/plans/friday-may-15-mega/topic-OPTION-CHAIN-MINUTE-SNAPSHOT.md`.
+    // The entire option_chain REST subsystem (client + minute scheduler +
+    // expiry warmup + current-expiry cache + snapshot cache) was deleted per
+    // operator directive 2026-06-28 ("drop the option chain entire
+    // implementations and its table also"). It had been config-gated OFF
+    // since 2026-06-02 (the account lacks the Dhan Option Chain Data API
+    // entitlement) with no live consumer, and its `option_chain_minute_snapshot`
+    // QuestDB table was already dropped 2026-06-23. The strategy reads no
+    // option-chain RAM cache; the live OI-change feature sources OI from the
+    // `prev_day_ohlcv` table via the tick enricher (earlier in this file).
     // -----------------------------------------------------------------------
-    if config.option_chain_minute_snapshot.enabled {
-        match tickvault_common::option_chain_schedule::validate_option_chain_schedule(
-            &config.option_chain_minute_snapshot.underlyings,
-        ) {
-            Ok(()) => {
-                info!(
-                    underlyings = config.option_chain_minute_snapshot.underlyings.len(),
-                    "option-chain minute-snapshot schedule validated — spawning scheduler"
-                );
-                let oc_token = token_handle.clone();
-                let oc_client_id = ws_client_id.clone();
-                let oc_base_url = config.dhan.rest_api_base_url.clone();
-                let oc_config = config.option_chain_minute_snapshot.clone();
-                let oc_notifier = notifier.clone();
-                let oc_cache = tickvault_core::option_chain::snapshot_cache::SnapshotCache::new();
-                // The cache handle is stored on the app-wide state in
-                // a follow-up so the future strategy can read from it.
-                // For now (PR #5), spawning is sufficient — the cache
-                // accumulates snapshots ready for the next consumer.
-                // Clone OWNED inputs once so the warmup-client constructor
-                // below (which also takes ownership) can reuse them.
-                let oc_token_for_warmup = oc_token.clone();
-                let oc_client_id_for_warmup = oc_client_id.clone();
-                let oc_base_url_for_warmup = oc_base_url.clone();
-
-                match tickvault_core::option_chain::client::OptionChainClient::new(
-                    oc_token,
-                    oc_client_id,
-                    oc_base_url,
-                ) {
-                    Ok(oc_client) => {
-                        // 2026-05-25 — Per-day current-expiry cache.
-                        // Shared between (a) boot REHYDRATE from
-                        // QuestDB (`option_chain_cache_loader`),
-                        // (b) 09:00:30 IST warmup task
-                        // (`expiry_warmup::spawn_expiry_warmup_task`),
-                        // and (c) the minute-snapshot scheduler
-                        // (`spawn_snapshot_scheduler`). All three hold
-                        // cloned handles to the same papaya map.
-                        let current_expiry_cache = tickvault_core::option_chain::current_expiry_cache::CurrentExpiryCache::new();
-
-                        // L3 RECONCILE — rehydrate cache from QuestDB
-                        // (fast crash recovery, <1s). Logs at
-                        // info!/warn!/error! per outcome.
-                        tickvault_app::option_chain_cache_loader::rehydrate_and_log(
-                            &config.questdb,
-                            &current_expiry_cache,
-                        )
-                        .await;
-
-                        // L4 PREVENT — daily 09:00:30 IST warmup task.
-                        // Reuses the same token/client_id/base_url
-                        // constructors as the scheduler.
-                        match tickvault_core::option_chain::client::OptionChainClient::new(
-                            oc_token_for_warmup,
-                            oc_client_id_for_warmup,
-                            oc_base_url_for_warmup,
-                        ) {
-                            Ok(warmup_client) => {
-                                let _warmup_handle = tickvault_core::option_chain::expiry_warmup::spawn_expiry_warmup_task(
-                                    warmup_client,
-                                    current_expiry_cache.clone(),
-                                    oc_notifier.clone(),
-                                );
-                                info!("option-chain 09:00:30 IST expiry warmup task spawned");
-                            }
-                            Err(err) => {
-                                error!(
-                                    ?err,
-                                    "option-chain warmup client construction failed — \
-                                     warmup task NOT spawned (scheduler will inline-fallback)"
-                                );
-                            }
-                        }
-
-                        let _ = tickvault_core::option_chain::snapshot_scheduler::spawn_snapshot_scheduler(
-                            oc_config,
-                            oc_client,
-                            oc_cache,
-                            current_expiry_cache,
-                            oc_notifier,
-                        );
-                        info!("option-chain minute-snapshot scheduler spawned");
-                    }
-                    Err(err) => {
-                        error!(
-                            ?err,
-                            "option-chain client construction failed — scheduler NOT spawned"
-                        );
-                    }
-                }
-            }
-            Err(schedule_err) => {
-                // Operator-charter §F: invalid config is a HALT-class
-                // event. Fire the typed Telegram + exit instead of
-                // silently disabling the feature.
-                error!(
-                    error = %schedule_err,
-                    "option-chain schedule INVALID — refusing to spawn scheduler"
-                );
-                notifier.notify(
-                    tickvault_core::notification::NotificationEvent::OptionChainConfigInvalid {
-                        reason: schedule_err.to_string(),
-                    },
-                );
-            }
-        }
-    } else {
-        info!("option-chain minute-snapshot pipeline disabled in config");
-    }
 
     // -----------------------------------------------------------------------
     // Step 10: Spawn order update WebSocket connection

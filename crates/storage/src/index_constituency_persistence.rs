@@ -49,6 +49,12 @@ use tickvault_common::sanitize::sanitize_ilp_symbol;
 /// `/exec` HTTP timeout for DDL. Matches the other `*_persistence` modules.
 const QUESTDB_EXEC_TIMEOUT_SECS: u64 = 10;
 
+/// Broker-source label stamped on every constituency row today (operator
+/// override 2026-06-28 — `feed` is in the DEDUP key on every persisted table).
+/// The index→constituents map is built ONLY from Dhan-resolved SIDs today.
+/// Replay-stable `&'static str` from the canonical `Feed` enum.
+pub const INDEX_CONSTITUENCY_FEED_DHAN: &str = tickvault_common::feed::Feed::Dhan.as_str();
+
 /// Wire-format table name. Stable across releases — operator SQL + any future
 /// S3 archive job depend on the exact string.
 pub const QUESTDB_TABLE_INDEX_CONSTITUENCY: &str = "index_constituency";
@@ -59,7 +65,8 @@ pub const QUESTDB_TABLE_INDEX_CONSTITUENCY: &str = "index_constituency";
 /// QuestDB's designated-ts-in-DEDUP requirement AND giving daily rebalance
 /// history. `index_name` distinguishes the same stock across its many indices.
 /// `security_id` + `exchange_segment` is the I-P1-11 composite identity.
-pub const DEDUP_KEY_INDEX_CONSTITUENCY: &str = "ts, index_name, security_id, exchange_segment";
+pub const DEDUP_KEY_INDEX_CONSTITUENCY: &str =
+    "ts, index_name, security_id, exchange_segment, feed";
 
 /// Column list shared by the DDL — one source so the writer + table cannot
 /// drift. (The ILP writer names each column explicitly; this constant pins the
@@ -79,6 +86,7 @@ const INDEX_CONSTITUENCY_COLUMNS: &[&str] = &[
     "via_isin",
     "source",
     "dry_run",
+    "feed",
 ];
 
 /// One `index_constituency` row — borrows so the bulk writer allocates nothing
@@ -103,6 +111,10 @@ pub struct IndexConstituencyRow<'a> {
     pub source: &'a str,
     /// `true` for a `--dry-run-universe` boot (isolation per §27).
     pub dry_run: bool,
+    /// Broker-source label (`dhan`/`groww`). Part of the DEDUP key (operator
+    /// override 2026-06-28). Always non-empty (stamped
+    /// [`INDEX_CONSTITUENCY_FEED_DHAN`] today).
+    pub feed: &'a str,
 }
 
 /// Idempotent `CREATE TABLE IF NOT EXISTS` for `index_constituency`.
@@ -136,7 +148,8 @@ pub async fn ensure_index_constituency_table(questdb_config: &QuestDbConfig) {
             isin SYMBOL, \
             via_isin BOOLEAN, \
             source SYMBOL, \
-            dry_run BOOLEAN\
+            dry_run BOOLEAN, \
+            feed SYMBOL\
         ) timestamp(ts) PARTITION BY DAY WAL \
         DEDUP UPSERT KEYS({DEDUP_KEY_INDEX_CONSTITUENCY});"
     );
@@ -164,30 +177,49 @@ pub async fn ensure_index_constituency_table(questdb_config: &QuestDbConfig) {
         }
     }
 
-    // Feed-provenance label (operator 2026-06-19, "all tables"): self-heal ALTER
-    // only — additive, idempotent, NON-key; CREATE DDL untouched. Free per boot.
-    let alter_feed_ddl = format!(
-        "ALTER TABLE {QUESTDB_TABLE_INDEX_CONSTITUENCY} ADD COLUMN IF NOT EXISTS feed SYMBOL"
-    );
-    match client
-        .get(&base_url)
-        .query(&[("query", alter_feed_ddl.as_str())])
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => {}
-        Ok(resp) => {
-            warn!(
-                table = QUESTDB_TABLE_INDEX_CONSTITUENCY,
-                status = %resp.status(),
-                "index_constituency ALTER ADD COLUMN feed non-2xx"
-            );
-        }
-        Err(err) => {
-            warn!(
-                ?err,
-                "index_constituency ALTER ADD COLUMN feed request failed"
-            );
+    // Feed-in-key self-heal (operator override 2026-06-28 — supersedes the
+    // 2026-06-19 NON-key label). Additive + idempotent, IN THIS ORDER:
+    // ADD COLUMN → backfill NULL→'dhan' → re-enable DEDUP with `feed` in the
+    // key. The CREATE above already ships the new column+key on greenfield;
+    // these run for tables created before this change. The backfill MUST precede
+    // the DEDUP-ENABLE so a new `feed='dhan'` row upserts over a legacy NULL-feed
+    // row instead of duplicating it. Never drops the table (SEBI retention).
+    let self_heal = [
+        format!(
+            "ALTER TABLE {QUESTDB_TABLE_INDEX_CONSTITUENCY} ADD COLUMN IF NOT EXISTS feed SYMBOL;"
+        ),
+        format!(
+            "UPDATE {QUESTDB_TABLE_INDEX_CONSTITUENCY} \
+             SET feed = '{INDEX_CONSTITUENCY_FEED_DHAN}' WHERE feed IS NULL;"
+        ),
+        format!(
+            "ALTER TABLE {QUESTDB_TABLE_INDEX_CONSTITUENCY} \
+             DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_INDEX_CONSTITUENCY});"
+        ),
+    ];
+    for ddl in &self_heal {
+        match client
+            .get(&base_url)
+            .query(&[("query", ddl.as_str())])
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) => {
+                warn!(
+                    table = QUESTDB_TABLE_INDEX_CONSTITUENCY,
+                    status = %resp.status(),
+                    ddl = ddl.as_str(),
+                    "index_constituency feed self-heal non-2xx"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    ddl = ddl.as_str(),
+                    "index_constituency feed self-heal request failed"
+                );
+            }
         }
     }
 }
@@ -211,6 +243,8 @@ fn build_index_constituency_ilp_row(
     )?;
     buffer.symbol("symbol_name", sanitize_ilp_symbol(row.symbol_name).as_ref())?;
     buffer.symbol("source", sanitize_ilp_symbol(row.source).as_ref())?;
+    // `feed` is a DEDUP-key SYMBOL — ALWAYS written (operator override 2026-06-28).
+    buffer.symbol("feed", sanitize_ilp_symbol(row.feed).as_ref())?;
     // Optional SYMBOL — skip when empty (→ NULL, not empty ILP symbol).
     if !row.isin.is_empty() {
         buffer.symbol("isin", sanitize_ilp_symbol(row.isin).as_ref())?;
@@ -278,12 +312,24 @@ mod tests {
             DEDUP_KEY_INDEX_CONSTITUENCY.starts_with("ts"),
             "designated ts must be in the DEDUP key (QuestDB requirement)"
         );
+        assert!(
+            DEDUP_KEY_INDEX_CONSTITUENCY
+                .split([',', ' '])
+                .map(str::trim)
+                .any(|t| t == "feed"),
+            "operator override 2026-06-28: feed must be in the DEDUP key"
+        );
+        assert_eq!(
+            DEDUP_KEY_INDEX_CONSTITUENCY.matches(',').count() + 1,
+            5,
+            "DEDUP key has exactly 5 columns (ts, index_name, security_id, exchange_segment, feed)"
+        );
     }
 
     #[test]
     fn test_ddl_columns_constant_matches_schema() {
-        // The 9 columns the DDL writes, pinned so the writer can't drift.
-        assert_eq!(INDEX_CONSTITUENCY_COLUMNS.len(), 9);
+        // The 10 columns the DDL writes, pinned so the writer can't drift.
+        assert_eq!(INDEX_CONSTITUENCY_COLUMNS.len(), 10);
         for col in [
             "ts",
             "index_name",
@@ -294,6 +340,7 @@ mod tests {
             "via_isin",
             "source",
             "dry_run",
+            "feed",
         ] {
             assert!(
                 INDEX_CONSTITUENCY_COLUMNS.contains(&col),
@@ -313,7 +360,20 @@ mod tests {
             via_isin: true,
             source: "niftyindices",
             dry_run: false,
+            feed: INDEX_CONSTITUENCY_FEED_DHAN,
         }
+    }
+
+    #[test]
+    fn test_build_ilp_row_writes_feed_symbol() {
+        // operator override 2026-06-28: every row carries feed in-key.
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        build_index_constituency_ilp_row(&mut buffer, &sample_row()).expect("build");
+        let line = String::from_utf8(buffer.as_bytes().to_vec()).expect("utf8");
+        assert!(
+            line.contains(",feed=dhan"),
+            "ILP must write feed tag: {line}"
+        );
     }
 
     #[test]

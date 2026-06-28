@@ -1,6 +1,8 @@
-# Option Chain + Cross-Verify Error Codes (PR #1 stubs)
+# Option Chain + Cross-Verify Error Codes (RETIRED)
 
-> **Status:** CONTRACT STUBS. Production emit sites land in PR #8 (option_chain module) and PR #9 (cross_verify module) of the AWS-lifecycle 14-PR sequence per `.claude/plans/aws-lifecycle/THE-FINAL-PLAN.md` §5.
+> **⚠ RETIRED 2026-06-28.** The 8 `OPTION-CHAIN-01..08` `ErrorCode` variants and the entire `option_chain` REST subsystem were DELETED per operator directive 2026-06-28 ("drop the option chain entire implementations and its table also"). The subsystem was disabled since 2026-06-02 (no Dhan Option Chain Data API entitlement) with no live consumer; its QuestDB table was dropped 2026-06-23. The §1 historical content below is retained for audit only — NONE of these codes exist as enum variants anymore. (The §2 CROSS-VERIFY codes were already retired 2026-05-26.)
+>
+> **Status:** CONTRACT STUBS (historical). Production emit sites land in PR #8 (option_chain module) and PR #9 (cross_verify module) of the AWS-lifecycle 14-PR sequence per `.claude/plans/aws-lifecycle/THE-FINAL-PLAN.md` §5.
 > **Authority:** CLAUDE.md > operator-charter-forever.md > this file.
 > **Companion docs:**
 > - `docs/architecture/option-chain-z-plus-heart-piece.md` §8 — 8 OPTION-CHAIN codes
@@ -16,7 +18,11 @@ When the option_chain REST fetch loop (every 50s for NIFTY/BANKNIFTY/SENSEX) and
 
 ---
 
-## §1. Option Chain codes (8 variants — Z+ heart-piece)
+## §1. Option Chain codes (8 variants — Z+ heart-piece) — RETIRED 2026-06-28
+
+> **RETIRED 2026-06-28** with the deleted `option_chain` REST subsystem. The
+> `OptionChain01..08` `ErrorCode` variants no longer exist. The descriptions
+> below are historical only.
 
 Per `option-chain-z-plus-heart-piece.md` §8. The option_chain REST fetcher runs every 50s for 3 underlyings concurrently, populates a RAM cache, async-flushes to QuestDB. Strategy fail-closes if cache age > 60s.
 

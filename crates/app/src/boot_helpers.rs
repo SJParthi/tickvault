@@ -237,7 +237,6 @@ pub fn create_log_file_writer() -> Option<std::fs::File> {
 /// | Target | Reason |
 /// |---|---|
 /// | `tickvault_storage::tick_persistence` | tick flush noise |
-/// | `tickvault_core::option_chain::client` | per-request rate-limit + fetched debug |
 /// | `tickvault_core::auth::secret_manager` | per-secret SSM fetch debug |
 /// | `aws_config::profile::credentials` | already suppressed at `warn` for credential leak |
 /// | `aws_smithy_http_client` / `aws_smithy_runtime` | HTTP request/response noise |
@@ -254,7 +253,6 @@ pub fn build_app_log_filter_directive(base_level: &str) -> String {
     format!(
         "{base},\
          tickvault_storage::tick_persistence=info,\
-         tickvault_core::option_chain::client=info,\
          tickvault_core::auth::secret_manager=info,\
          aws_config::profile::credentials=warn,\
          aws_smithy_http_client=warn,\
@@ -601,7 +599,6 @@ mod tests {
         // The whole point: even with `debug` as the base, the chatty
         // targets must be downgraded.
         assert!(d.contains("tickvault_storage::tick_persistence=info"));
-        assert!(d.contains("tickvault_core::option_chain::client=info"));
         assert!(d.contains("aws_config::profile::credentials=warn"));
     }
 

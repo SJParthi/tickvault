@@ -10,6 +10,15 @@
 **`security_id` alone is NOT unique. The only unique instrument key is
 `(security_id, exchange_segment)`.**
 
+> **EXTENSION (operator override 2026-06-28 — feed-in-key everywhere):** on
+> PERSISTED QuestDB tables the composite identity is now
+> `(security_id, exchange_segment, feed)` — the I-P1-11 pair is EXTENDED with
+> `feed` (`dhan`/`groww`), NOT weakened. `exchange_segment` remains mandatory
+> exactly as before; `feed` is an ADDITIONAL key column so a Dhan row and a
+> (future) Groww row for the same instrument stay DISTINCT rows. Every code-side
+> collection / lookup rule below is unchanged — the per-feed split lives only in
+> the QuestDB DEDUP keys (see `data-integrity.md` "feed-in-key EVERYWHERE").
+
 ## The bug class this rule prevents
 
 Dhan's instrument master CSV reuses the same numeric `security_id`

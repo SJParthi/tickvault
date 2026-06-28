@@ -82,7 +82,9 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use tickvault_api::feed_state::{Feed, FeedRuntimeState};
-use tickvault_core::auth::secret_manager::fetch_groww_credentials;
+use tickvault_core::auth::secret_manager::{
+    build_ssm_path, fetch_groww_credentials, resolve_environment,
+};
 
 /// System Python used ONLY to create the isolated venv (never to run the
 /// sidecar — the sidecar runs from the venv's own python). This is the FIRST
@@ -433,11 +435,28 @@ pub async fn run_groww_sidecar_supervisor(
             Err(err) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
                 let backoff = sidecar_restart_backoff(consecutive_failures);
+                // Name the RESOLVED env + the EXACT SSM paths read (never the
+                // values) so the hint is self-diagnosing — no literal `<env>`.
+                let env = resolve_environment().unwrap_or_else(|_| "<unresolved>".to_string());
+                let api_key_path = build_ssm_path(
+                    &env,
+                    tickvault_common::constants::SSM_GROWW_SERVICE,
+                    tickvault_common::constants::GROWW_API_KEY_SECRET,
+                );
+                let totp_path = build_ssm_path(
+                    &env,
+                    tickvault_common::constants::SSM_GROWW_SERVICE,
+                    tickvault_common::constants::GROWW_TOTP_SECRET,
+                );
                 error!(
                     error = %err,
+                    env = %env,
+                    api_key_path = %api_key_path,
+                    totp_secret_path = %totp_path,
                     backoff_secs = backoff.as_secs(),
-                    "[feeds] groww sidecar: SSM credential fetch failed — verify \
-                     /tickvault/<env>/groww/api-key + /totp-secret; retrying with backoff"
+                    "[feeds] groww sidecar: SSM credential fetch failed — verify the \
+                     api-key + totp-secret exist at the SSM paths above; retrying \
+                     with backoff"
                 );
                 sleep(backoff).await;
                 continue;
