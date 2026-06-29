@@ -620,7 +620,12 @@ impl GrowwBridgeState {
         }
 
         self.residual.extend_from_slice(&chunk);
-        let mut wrote_live = false;
+        // Most-recent receipt ts of a row appended this wake (0 if none). The
+        // dashboard "ticks" counter is bumped by the number of rows ACTUALLY
+        // persisted on a successful flush (NOT per append) — so it reflects rows
+        // written to QuestDB, never in-memory buffer appends (the 0-rows-despite-
+        // counter bug, 2026-06-29).
+        let mut last_receipt_ist_nanos: i64 = 0;
         let mut parsed_any = false;
         // Drain only COMPLETE newline-terminated lines; a trailing partial line
         // (incl. a partial UTF-8 char from the chunk boundary) stays buffered.
@@ -668,10 +673,10 @@ impl GrowwBridgeState {
                     "groww bridge: shared ticks (feed=groww) append failed"
                 );
             } else {
-                wrote_live = true;
-                // Live-feed health: a Groww tick was captured (O(1) atomic).
-                // Record WALL-CLOCK receipt time, NOT the exchange ts.
-                feed_health.record_tick(Feed::Groww, receipt_ist_nanos());
+                // The dashboard counter is bumped ONLY on a successful flush below,
+                // by the number of rows actually persisted. Stamp the WALL-CLOCK
+                // receipt time (NOT the exchange ts) for the most-recent row.
+                last_receipt_ist_nanos = receipt_ist_nanos();
             }
             // Fold through the SHARED 21-TF engine (ONE common candle engine).
             let pt = match build_parsed_tick(&parsed) {
@@ -735,10 +740,34 @@ impl GrowwBridgeState {
                 self.aggregator.pre_populate(std::iter::once(key));
             }
         }
+        // Flush the buffered rows. The dashboard "ticks" counter is bumped ONLY by
+        // the number of rows ACTUALLY persisted to QuestDB (the flush return value),
+        // so it reflects rows written — not in-memory buffer appends. A flush
+        // failure leaves the buffer + rows intact (the writer reconnects on the next
+        // flush) and the counter is NOT bumped (honest — nothing was persisted).
         // Flush failures are data-at-risk — `error!` per audit Rule 5 / charter
         // Rule 6 so they route to Telegram via ERROR-level Loki routing.
-        if wrote_live && let Err(err) = self.live_writer.flush() {
-            error!(?err, "groww bridge: shared ticks (feed=groww) flush failed");
+        // Gate on the writer's OWN pending count, NOT this wake's appends: a prior
+        // wake whose flush failed leaves rows buffered with `pending > 0` but
+        // `appended_this_wake == 0` — those retained rows must still be re-attempted
+        // on a quiet wake (otherwise they sit unflushed until the next NEW tick,
+        // exactly during a post-burst quiet period — hostile-review MEDIUM finding).
+        if self.live_writer.pending() > 0 {
+            // For a quiet wake (no new appends), `last_receipt_ist_nanos` is 0 — use
+            // the wall-clock receipt time so record_ticks never stamps a 1970 ts.
+            let ts = if last_receipt_ist_nanos != 0 {
+                last_receipt_ist_nanos
+            } else {
+                receipt_ist_nanos()
+            };
+            match self.live_writer.flush() {
+                Ok(persisted) => {
+                    feed_health.record_ticks(Feed::Groww, persisted as u64, ts);
+                }
+                Err(err) => {
+                    error!(?err, "groww bridge: shared ticks (feed=groww) flush failed");
+                }
+            }
         }
         parsed_any
     }

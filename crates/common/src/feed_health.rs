@@ -273,6 +273,22 @@ impl FeedHealthRegistry {
         self.mark_instrumented(i);
     }
 
+    /// Record `n` captured ticks for `feed` in ONE O(1) atomic add (NOT a loop),
+    /// stamping `ts_ist_nanos` as the most-recent tick time. Used by feeds that
+    /// count PERSISTED rows in batches (e.g. the Groww bridge increments by the
+    /// number of rows actually flushed to QuestDB, so the dashboard "ticks"
+    /// reflects rows written, not in-memory buffer appends). `n == 0` is a no-op
+    /// on the count and does not stamp the time.
+    pub fn record_ticks(&self, feed: Feed, n: u64, ts_ist_nanos: i64) {
+        if n == 0 {
+            return;
+        }
+        let i = feed.index();
+        self.last_tick_ist_nanos[i].store(ts_ist_nanos, Ordering::Relaxed);
+        self.ticks_total[i].fetch_add(n, Ordering::Relaxed);
+        self.mark_instrumented(i);
+    }
+
     /// Record one sealed candle for `feed`. O(1).
     pub fn record_candle(&self, feed: Feed) {
         let i = feed.index();
@@ -623,7 +639,7 @@ mod tests {
 
     // ── FeedHealthRegistry (the live-signal store the lanes update) ──
     // test coverage (one line for the pub-fn-test-guard test.*<fn> heuristic): the
-    // tests below exercise record_tick record_candle record_drops set_connected set_auth_rejected set_subscribed set_decode_counts snapshot new
+    // tests below exercise record_tick record_ticks record_candle record_drops set_connected set_auth_rejected set_subscribed set_decode_counts snapshot new
     const T0: i64 = 1_780_000_000_000_000_000;
 
     #[test]
@@ -638,6 +654,30 @@ mod tests {
         assert_eq!(r.input.ticks_total, 1);
         assert_eq!(r.input.candles_total, 1);
         assert_eq!(r.input.last_tick_age_secs, Some(3));
+    }
+
+    #[test]
+    fn test_record_ticks_bumps_total_by_n() {
+        // The honest-counter helper: increment ticks_total by exactly N in one
+        // atomic add (Groww counts PERSISTED rows in flush-sized batches).
+        let reg = FeedHealthRegistry::new();
+        reg.set_connected(Feed::Groww, true);
+        reg.record_ticks(Feed::Groww, 5, T0);
+        let r = reg.snapshot(Feed::Groww, true, true, true, T0 + 1_000_000_000);
+        assert_eq!(r.input.ticks_total, 5, "record_ticks must add exactly N");
+        assert_eq!(r.input.last_tick_age_secs, Some(1), "ts stamped");
+    }
+
+    #[test]
+    fn test_record_ticks_zero_is_noop() {
+        // A flush that persisted 0 rows must NOT bump the count or stamp the time
+        // (no false "tick arrived" signal — audit Rule 11).
+        let reg = FeedHealthRegistry::new();
+        reg.set_connected(Feed::Groww, true);
+        reg.record_ticks(Feed::Groww, 0, T0);
+        let r = reg.snapshot(Feed::Groww, true, true, true, T0);
+        assert_eq!(r.input.ticks_total, 0, "n=0 must not bump the count");
+        assert_eq!(r.input.last_tick_age_secs, None, "n=0 must not stamp ts");
     }
 
     #[test]
