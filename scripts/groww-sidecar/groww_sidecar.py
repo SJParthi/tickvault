@@ -36,6 +36,7 @@ Usage (auto-launched by the Rust supervisor; no manual run needed):
 """
 import glob
 import json
+import logging
 import os
 import random
 import sys
@@ -45,6 +46,22 @@ import traceback
 from datetime import datetime, timezone, timedelta
 
 import pyotp
+
+# DIAGNOSTIC (2026-06-29): turn ON the Groww SDK's OWN logging so the per-frame
+# decode errors it currently SWALLOWS (the bare "Error:" lines with no detail)
+# print with full context to stderr. The SDK's blocking consume() decodes
+# NATS/Protobuf internally and logs swallowed errors through the standard
+# `logging` module at DEBUG/ERROR — but only if a handler is configured. Without
+# this, those errors vanish. Routed to STDERR (the Rust supervisor captures both
+# streams) and scoped to the `growwapi` logger at DEBUG; redaction of OUR
+# credentials is unaffected because the SDK logs protocol detail, not our
+# api_key/TOTP (and the supervisor-captured stream is operator-local per lock §32).
+logging.basicConfig(
+    level=logging.DEBUG,
+    stream=sys.stderr,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logging.getLogger("growwapi").setLevel(logging.DEBUG)
 
 try:
     from growwapi import GrowwAPI, GrowwFeed
@@ -581,6 +598,9 @@ def main() -> None:
     # successful subscribe), not per reconnect cycle — it watches the global
     # decoded counters for the whole process lifetime.
     watchdog_started = False
+    # Print the SDK version + the REAL feed methods available in this environment
+    # exactly ONCE (first feed-connect), not per reconnect cycle.
+    feed_introspection_printed = False
 
     # Reconnect loop — never give up (lock: not a single received tick missed).
     while True:
@@ -606,6 +626,26 @@ def main() -> None:
             phase = "feed-connect"
             groww = GrowwAPI(access_token)
             feed = GrowwFeed(groww)
+
+            # DIAGNOSTIC (2026-06-29): print the installed SDK version + the REAL
+            # public feed methods available in THIS environment, exactly once. This
+            # definitively resolves whether `subscribe_index_value` exists (vs only
+            # `subscribe_ltp` with segment="CASH" for indices) instead of guessing
+            # from the docs — `dir(feed)` is the ground truth of the running wheel.
+            if not feed_introspection_printed:
+                try:
+                    import growwapi as _growwapi_mod
+                    sdk_version = getattr(_growwapi_mod, "__version__", "unknown")
+                except Exception:  # noqa: BLE001 - introspection must never break the feed
+                    sdk_version = "unknown"
+                feed_methods = sorted(m for m in dir(feed) if not m.startswith("_"))
+                print(
+                    f"groww sidecar DIAGNOSTIC: growwapi.__version__={sdk_version} | "
+                    f"feed methods={feed_methods}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                feed_introspection_printed = True
 
             phase = "subscribe"
             # Cache the subscribe counts so the first-emit `streaming` status write
