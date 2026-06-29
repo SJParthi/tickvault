@@ -13,8 +13,9 @@
 /// This struct is `Copy` for zero-allocation on the hot path.
 #[derive(Debug, Clone, Copy)]
 pub struct ParsedTick {
-    /// Dhan security identifier.
-    pub security_id: u32,
+    /// Security identifier (u64 — holds both Dhan's 4-byte wire id and Groww's
+    /// native exchange_token, which sets bit 62 for indices).
+    pub security_id: u64,
     /// Binary exchange segment code (0=IDX, 1=NSE_EQ, 2=NSE_FNO, etc.).
     pub exchange_segment_code: u8,
     /// Last traded price in rupees (f32).

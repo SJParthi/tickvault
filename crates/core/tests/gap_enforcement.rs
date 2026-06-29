@@ -389,7 +389,7 @@ mod ws_subscription_builder {
             .map(|i| {
                 InstrumentSubscription::new(
                     ExchangeSegment::NseFno,
-                    1000_u32.saturating_add(i as u32),
+                    1000_u64.saturating_add(i as u64),
                 )
             })
             .collect()

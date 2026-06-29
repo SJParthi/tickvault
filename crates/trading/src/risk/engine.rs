@@ -39,9 +39,9 @@ pub struct RiskEngine {
     /// Trading capital for daily loss calculation (in rupees).
     capital: f64,
     /// Per-instrument positions keyed by security_id.
-    positions: HashMap<u32, PositionInfo>,
+    positions: HashMap<u64, PositionInfo>,
     /// Latest market prices keyed by security_id (for unrealized P&L).
-    market_prices: HashMap<u32, f64>,
+    market_prices: HashMap<u64, f64>,
     /// Sum of all realized P&L from closed trades today.
     total_realized_pnl: f64,
     /// Whether trading is halted due to a risk breach.
@@ -106,7 +106,7 @@ impl RiskEngine {
     /// # Performance
     /// O(1) — HashMap lookup + arithmetic comparison.
     #[instrument(skip_all, fields(security_id))]
-    pub fn check_order(&mut self, security_id: u32, order_lots: i32) -> RiskCheck {
+    pub fn check_order(&mut self, security_id: u64, order_lots: i32) -> RiskCheck {
         self.total_checks = self.total_checks.saturating_add(1);
 
         // Auto-halt: reject all orders once halted
@@ -171,7 +171,7 @@ impl RiskEngine {
     /// * `lot_size` — contract lot size (e.g., 25 for NIFTY options)
     pub fn record_fill(
         &mut self,
-        security_id: u32,
+        security_id: u64,
         filled_lots: i32,
         fill_price: f64,
         lot_size: u32,
@@ -225,7 +225,7 @@ impl RiskEngine {
     ///
     /// # Performance
     /// O(1) — HashMap lookup + field update.
-    pub fn update_market_price(&mut self, security_id: u32, current_price: f64) {
+    pub fn update_market_price(&mut self, security_id: u64, current_price: f64) {
         // RISK-GAP-02: Reject non-positive and non-finite prices.
         if !current_price.is_finite() || current_price <= 0.0 {
             return;
@@ -272,7 +272,7 @@ impl RiskEngine {
     }
 
     /// Returns the net lots for a specific security (positive = long, negative = short, 0 = flat).
-    pub fn net_lots_for(&self, security_id: u32) -> i32 {
+    pub fn net_lots_for(&self, security_id: u64) -> i32 {
         self.positions.get(&security_id).map_or(0, |p| p.net_lots)
     }
 
@@ -302,7 +302,7 @@ impl RiskEngine {
     }
 
     /// Returns the position info for a specific instrument.
-    pub fn position(&self, security_id: u32) -> Option<&PositionInfo> {
+    pub fn position(&self, security_id: u64) -> Option<&PositionInfo> {
         self.positions.get(&security_id)
     }
 

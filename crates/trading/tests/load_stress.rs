@@ -26,7 +26,7 @@ fn stress_risk_engine_100k_checks() {
     let start = Instant::now();
 
     for i in 0..100_000_u32 {
-        let security_id = 50000 + (i % 1000);
+        let security_id = 50000_u64 + u64::from(i % 1000);
         let lots = ((i % 10) as i32) + 1;
         let _ = engine.check_order(security_id, lots);
 
@@ -87,7 +87,7 @@ fn stress_no_unbounded_growth_risk_engine() {
 
     // Open and close positions repeatedly on same instruments
     for round in 0..100_u32 {
-        for sec in 0..100_u32 {
+        for sec in 0..100_u64 {
             engine.record_fill(sec, 10, 100.0 + round as f64, 25);
             engine.record_fill(sec, -10, 101.0 + round as f64, 25);
         }

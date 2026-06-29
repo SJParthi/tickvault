@@ -776,7 +776,7 @@ mod proptest_risk {
         /// Risk engine must never panic for any valid order parameters.
         #[test]
         fn check_order_never_panics(
-            security_id in 1..=100_000_u32,
+            security_id in 1..=100_000_u64,
             order_lots in -1000..=1000_i32,
         ) {
             let mut engine = RiskEngine::new(2.0, 100, 1_000_000.0);
@@ -786,7 +786,7 @@ mod proptest_risk {
         /// Record fill must never panic for any valid parameters.
         #[test]
         fn record_fill_never_panics(
-            security_id in 1..=100_000_u32,
+            security_id in 1..=100_000_u64,
             lots in -100..=100_i32,
             price in 0.01..=100_000.0_f64,
             lot_size in 1..=1000_u32,

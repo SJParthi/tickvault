@@ -382,7 +382,7 @@ impl IndicatorEngine {
     // O(1) EXEMPT: begin — cold path startup warmup (runs once before tick processing)
     pub fn warmup_from_candles(
         &mut self,
-        security_id: u32,
+        security_id: u64,
         candles: &[(f64, f64, f64, f64, f64)], // (open, high, low, close, volume)
     ) -> usize {
         let sid = security_id as usize;
@@ -422,7 +422,7 @@ impl IndicatorEngine {
     }
 
     /// Returns the warmup count for a given security.
-    pub fn warmup_count(&self, security_id: u32) -> u16 {
+    pub fn warmup_count(&self, security_id: u64) -> u16 {
         let sid = security_id as usize;
         if sid >= self.states.len() {
             return 0;
@@ -440,7 +440,7 @@ mod tests {
     use super::*;
     use tickvault_common::constants::MAX_INDICATOR_WARMUP_TICKS;
 
-    fn make_tick(security_id: u32, ltp: f32, high: f32, low: f32, volume: u32) -> ParsedTick {
+    fn make_tick(security_id: u64, ltp: f32, high: f32, low: f32, volume: u32) -> ParsedTick {
         ParsedTick {
             security_id,
             last_traded_price: ltp,
@@ -485,12 +485,12 @@ mod tests {
     fn test_out_of_bounds_security_id_returns_default_snapshot() {
         let mut engine = default_engine();
         let tick = ParsedTick {
-            security_id: u32::MAX,
+            security_id: u64::from(u32::MAX),
             last_traded_price: 100.0,
             ..Default::default()
         };
         let snap = engine.update(&tick);
-        assert_eq!(snap.security_id, u32::MAX);
+        assert_eq!(snap.security_id, u64::from(u32::MAX));
         assert!(!snap.is_warm);
         // All indicators should be default (0.0)
         assert_eq!(snap.ema_fast, 0.0);
@@ -851,7 +851,7 @@ mod tests {
     fn test_out_of_bounds_security_id_preserves_id_in_snapshot() {
         let mut engine = default_engine();
         // Use a security_id that is >= MAX_INDICATOR_INSTRUMENTS
-        let large_id = MAX_INDICATOR_INSTRUMENTS as u32;
+        let large_id = MAX_INDICATOR_INSTRUMENTS as u64;
         let tick = ParsedTick {
             security_id: large_id,
             last_traded_price: 500.0,
@@ -885,7 +885,7 @@ mod tests {
     #[test]
     fn test_max_valid_security_id() {
         let mut engine = default_engine();
-        let max_valid = (MAX_INDICATOR_INSTRUMENTS - 1) as u32;
+        let max_valid = (MAX_INDICATOR_INSTRUMENTS - 1) as u64;
         let tick = make_tick(max_valid, 200.0, 210.0, 190.0, 500);
         let snap = engine.update(&tick);
         assert_eq!(snap.security_id, max_valid);
@@ -939,7 +939,7 @@ mod tests {
     #[test]
     fn test_out_of_bounds_security_id_one_above_max_returns_default() {
         let mut engine = default_engine();
-        let oob_id = MAX_INDICATOR_INSTRUMENTS as u32;
+        let oob_id = MAX_INDICATOR_INSTRUMENTS as u64;
         let tick = make_tick(oob_id, 500.0, 510.0, 490.0, 10000);
         let snap = engine.update(&tick);
         assert_eq!(snap.security_id, oob_id);
@@ -1134,7 +1134,7 @@ mod tests {
         let params = IndicatorParams::default();
         let mut engine = IndicatorEngine::new(params);
         let candles = vec![(100.0, 101.0, 99.0, 100.0, 1000.0)];
-        let processed = engine.warmup_from_candles(u32::MAX, &candles);
+        let processed = engine.warmup_from_candles(u64::from(u32::MAX), &candles);
         assert_eq!(processed, 0); // Out of bounds
     }
 
@@ -1154,7 +1154,7 @@ mod tests {
     fn test_warmup_count_oob() {
         let params = IndicatorParams::default();
         let engine = IndicatorEngine::new(params);
-        assert_eq!(engine.warmup_count(u32::MAX), 0);
+        assert_eq!(engine.warmup_count(u64::from(u32::MAX)), 0);
     }
 
     // -----------------------------------------------------------------------

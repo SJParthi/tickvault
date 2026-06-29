@@ -84,8 +84,10 @@ const SEAL_DLQ_DIR: &str = "data/dlq";
 // path, so a `Clone`-only record is fine — every conversion uses `&self`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SealDlqRecord {
+    // `u64` (2026-06-29 widening) — the seal DLQ carries BOTH Dhan (≤u32) and
+    // Groww (bit-62 index ids > u32) seals; NDJSON round-trips u64 natively.
     #[serde(default)]
-    pub security_id: u32,
+    pub security_id: u64,
     #[serde(default)]
     pub exchange_segment_code: u8,
     #[serde(default)]

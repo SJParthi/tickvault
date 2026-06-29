@@ -156,10 +156,10 @@ fn hotfix_locked_universe_planner_emits_all_4_idx_i_sids() {
     let today = NaiveDate::from_ymd_opt(2026, 5, 19).unwrap();
     let plan = build_subscription_plan(&universe, &cfg, today, &HashMap::new(), None);
 
-    let emitted: std::collections::HashSet<u32> =
+    let emitted: std::collections::HashSet<u64> =
         plan.registry.iter().map(|i| i.security_id).collect();
 
-    for sid in [13_u32, 25, 51, 21] {
+    for sid in [13_u64, 25, 51, 21] {
         assert!(
             emitted.contains(&sid),
             "LOCKED_UNIVERSE SID {sid} missing from plan — got {emitted:?}; \
@@ -206,7 +206,7 @@ fn indices4only_lock_planner_emits_4_idx_i_only() {
         &cfg,
         tickvault_common::constants::INDIA_VIX_SECURITY_ID
     ));
-    for stray_sid in [14_u32, 17, 19, 23] {
+    for stray_sid in [14_u64, 17, 19, 23] {
         assert!(
             !is_display_index_allowed_under_scope(&cfg, stray_sid),
             "LOCK: display index SID {stray_sid} must be PARKED"

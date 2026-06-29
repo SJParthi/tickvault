@@ -43,7 +43,7 @@ const WALL_MULTIPLIER: f64 = 10.0;
 #[derive(Debug, Clone, Copy)]
 pub struct ObiSnapshot {
     /// Security ID this snapshot belongs to.
-    pub security_id: u32,
+    pub security_id: u64,
     /// Exchange segment byte code.
     pub segment_code: u8,
     /// Simple OBI: (total_bid - total_ask) / (total_bid + total_ask).
@@ -108,7 +108,7 @@ impl Default for ObiSnapshot {
 /// O(1) — iterates exactly `min(len, 20)` levels per side. No allocation.
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: all arithmetic is bounded f64/u64 with finite checks
 pub fn compute_obi(
-    security_id: u32,
+    security_id: u64,
     segment_code: u8,
     bid_levels: &[DeepDepthLevel],
     ask_levels: &[DeepDepthLevel],

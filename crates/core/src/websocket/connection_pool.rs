@@ -834,7 +834,7 @@ mod tests {
 
     fn make_instruments(count: usize) -> Vec<InstrumentSubscription> {
         (0..count)
-            .map(|i| InstrumentSubscription::new(ExchangeSegment::NseFno, (i as u32) + 1000))
+            .map(|i| InstrumentSubscription::new(ExchangeSegment::NseFno, (i as u64) + 1000))
             .collect()
     }
 

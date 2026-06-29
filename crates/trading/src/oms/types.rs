@@ -25,7 +25,7 @@ pub struct ManagedOrder {
     /// Our UUID v4 correlation ID (idempotency key).
     pub correlation_id: String,
     /// Dhan security identifier.
-    pub security_id: u32,
+    pub security_id: u64,
     /// Buy or sell.
     pub transaction_type: TransactionType,
     /// Order execution type (LIMIT, MARKET, etc.).
@@ -88,7 +88,7 @@ impl ManagedOrder {
 #[derive(Debug, Clone)]
 pub struct PlaceOrderRequest {
     /// Dhan security identifier.
-    pub security_id: u32,
+    pub security_id: u64,
     /// Buy or sell.
     pub transaction_type: TransactionType,
     /// Order execution type.
@@ -1386,7 +1386,7 @@ pub enum OmsError {
     /// I-P0-03: Order rejected because the derivative contract has expired.
     #[error("expired contract: security_id {security_id} expired on {expiry_date}")]
     ExpiredContract {
-        security_id: u32,
+        security_id: u64,
         expiry_date: String,
     },
 

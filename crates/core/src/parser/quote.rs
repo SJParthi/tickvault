@@ -110,7 +110,7 @@ mod tests {
             response_code: 4,
             message_length: QUOTE_PACKET_SIZE as u16,
             exchange_segment_code: segment,
-            security_id,
+            security_id: u64::from(security_id),
         };
         (buf, hdr)
     }
@@ -437,7 +437,7 @@ mod tests {
             f32::MAX, // low
         );
         let tick = parse_quote_packet(&buf, &hdr, i64::MAX).unwrap();
-        assert_eq!(tick.security_id, u32::MAX);
+        assert_eq!(tick.security_id, u64::from(u32::MAX));
         assert_eq!(tick.last_trade_quantity, u16::MAX);
         assert_eq!(tick.exchange_timestamp, u32::MAX);
         assert_eq!(tick.volume, u32::MAX);

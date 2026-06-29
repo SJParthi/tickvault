@@ -26,15 +26,15 @@ use crate::constants::INDIA_VIX_SECURITY_ID;
 /// `subscription_planner.rs::FULL_CHAIN_INDEX_SYMBOLS` (verified at
 /// CSV ingest time per `test_india_vix_security_id_constant_pinned_at_21`
 /// pattern; this constant mirrors the same idea for NIFTY).
-pub const NIFTY_SECURITY_ID: u32 = 13;
+pub const NIFTY_SECURITY_ID: crate::types::SecurityId = 13;
 
 /// BANKNIFTY index value `security_id` on the IDX_I segment.
-pub const BANKNIFTY_SECURITY_ID: u32 = 25;
+pub const BANKNIFTY_SECURITY_ID: crate::types::SecurityId = 25;
 
 /// SENSEX index value `security_id` on the IDX_I segment. BSE-derived;
 /// our NSE pre-open buffer does NOT capture it, so the fallback is the
 /// first WS tick (with a cross-verify flag).
-pub const SENSEX_SECURITY_ID: u32 = 51;
+pub const SENSEX_SECURITY_ID: crate::types::SecurityId = 51;
 
 /// Pre-open call-auction equilibrium freeze time per NSE. Captured by
 /// the pre-open buffer's last slot (09:08–09:15). Plan §9.
@@ -98,7 +98,7 @@ pub enum OpenSource {
 #[inline]
 #[must_use]
 pub const fn classify_instrument_for_open_source(
-    security_id: u32,
+    security_id: crate::types::SecurityId,
     is_idx_i: bool,
 ) -> OpenSourceClass {
     if is_idx_i {

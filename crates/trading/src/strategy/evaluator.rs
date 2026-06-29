@@ -407,7 +407,7 @@ mod tests {
         }
     }
 
-    fn make_warm_snapshot(security_id: u32, ltp: f64, rsi: f64, atr: f64) -> IndicatorSnapshot {
+    fn make_warm_snapshot(security_id: u64, ltp: f64, rsi: f64, atr: f64) -> IndicatorSnapshot {
         IndicatorSnapshot {
             security_id,
             last_traded_price: ltp,

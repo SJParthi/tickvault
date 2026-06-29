@@ -9,7 +9,7 @@ use tickvault_common::constants::INDICATOR_RING_BUFFER_CAPACITY;
 use tickvault_common::tick_types::ParsedTick;
 
 /// Helper: create a tick with the given LTP, high, low, volume.
-fn make_tick(security_id: u32, ltp: f32, high: f32, low: f32, volume: u32) -> ParsedTick {
+fn make_tick(security_id: u64, ltp: f32, high: f32, low: f32, volume: u32) -> ParsedTick {
     ParsedTick {
         security_id,
         last_traded_price: ltp,
@@ -436,10 +436,10 @@ fn warmup_false_until_threshold() {
 #[test]
 fn out_of_bounds_security_id_returns_default() {
     let mut engine = IndicatorEngine::new(IndicatorParams::default());
-    let tick = make_tick(u32::MAX, 100.0, 101.0, 99.0, 1000);
+    let tick = make_tick(u64::from(u32::MAX), 100.0, 101.0, 99.0, 1000);
     let snap = engine.update(&tick);
 
-    assert_eq!(snap.security_id, u32::MAX);
+    assert_eq!(snap.security_id, u64::from(u32::MAX));
     assert!(!snap.is_warm);
     assert!((snap.ema_fast).abs() < f64::EPSILON);
 }

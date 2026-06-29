@@ -100,5 +100,14 @@ harness = false
 name = "slo_score"
 harness = false
 
+# The NTM constituent proof harness imports `daily_universe_fetcher`-gated
+# modules (constituent_resolver / index_constituency / csv_parser), so it can
+# only build with that feature on. Without this declaration, auto-discovery
+# tries to build it under the default `cargo test` and fails to resolve the
+# configured-out modules.
+[[example]]
+name = "ntm_subscription_proof"
+required-features = ["daily_universe_fetcher"]
+
 [package.metadata.cargo-machete]
 ignored = ["ahash", "arrayvec", "bytes", "chrono-tz", "failsafe", "loom", "papaya", "rtrb"]
