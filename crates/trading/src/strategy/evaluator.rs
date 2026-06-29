@@ -407,7 +407,7 @@ mod tests {
         }
     }
 
-    fn make_warm_snapshot(security_id: u32, ltp: f64, rsi: f64, atr: f64) -> IndicatorSnapshot {
+    fn make_warm_snapshot(security_id: u64, ltp: f64, rsi: f64, atr: f64) -> IndicatorSnapshot {
         IndicatorSnapshot {
             security_id,
             last_traded_price: ltp,
@@ -1127,7 +1127,7 @@ mod tests {
         let mut instance = StrategyInstance::new(def, max_sid);
 
         // security_id == max_security_id (states.len() == max_sid, valid indices 0..max_sid-1)
-        let snap = make_warm_snapshot(max_sid as u32, 250.0, 25.0, 5.0);
+        let snap = make_warm_snapshot(max_sid as u64, 250.0, 25.0, 5.0);
         let signal = instance.evaluate(&snap);
         assert_eq!(
             signal,
@@ -1143,7 +1143,7 @@ mod tests {
         let mut instance = StrategyInstance::new(def, max_sid);
 
         // security_id == max_security_id - 1 (last valid index)
-        let snap = make_warm_snapshot((max_sid - 1) as u32, 250.0, 25.0, 5.0);
+        let snap = make_warm_snapshot((max_sid - 1) as u64, 250.0, 25.0, 5.0);
         let signal = instance.evaluate(&snap);
         assert!(
             matches!(signal, Signal::EnterLong { .. }),

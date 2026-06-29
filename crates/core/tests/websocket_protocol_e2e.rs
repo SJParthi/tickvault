@@ -1125,7 +1125,7 @@ fn test_subscription_batch_splitting() {
 
     // 250 instruments should split into 3 batches (100+100+50)
     let instruments: Vec<InstrumentSubscription> = (0..250)
-        .map(|i| InstrumentSubscription::new(ExchangeSegment::NseEquity, i as u32))
+        .map(|i| InstrumentSubscription::new(ExchangeSegment::NseEquity, i as u64))
         .collect();
 
     let messages =
@@ -1203,7 +1203,7 @@ fn test_security_id_is_string_in_subscription_json() {
 
     let instruments = vec![InstrumentSubscription::new(
         ExchangeSegment::NseEquity,
-        u32::MAX,
+        u64::from(u32::MAX),
     )];
     let messages =
         build_subscription_messages(&instruments, FeedMode::Ticker, SUBSCRIPTION_BATCH_SIZE);
@@ -1433,7 +1433,11 @@ fn test_all_fields_are_little_endian() {
     let result = dispatch_frame(&frame, 0).unwrap();
     match result {
         tickvault_core::parser::types::ParsedFrame::Tick(tick) => {
-            assert_eq!(tick.security_id, security_id, "LE parsed correctly");
+            assert_eq!(
+                tick.security_id,
+                u64::from(security_id),
+                "LE parsed correctly"
+            );
         }
         other => panic!("expected Tick, got {other:?}"),
     }
@@ -1462,7 +1466,7 @@ fn test_subscription_exactly_100_instruments_one_batch() {
     use tickvault_core::websocket::types::InstrumentSubscription;
 
     let instruments: Vec<InstrumentSubscription> = (0..100)
-        .map(|i| InstrumentSubscription::new(ExchangeSegment::NseEquity, i as u32))
+        .map(|i| InstrumentSubscription::new(ExchangeSegment::NseEquity, i as u64))
         .collect();
 
     let messages =
@@ -1477,7 +1481,7 @@ fn test_subscription_101_instruments_two_batches() {
     use tickvault_core::websocket::types::InstrumentSubscription;
 
     let instruments: Vec<InstrumentSubscription> = (0..101)
-        .map(|i| InstrumentSubscription::new(ExchangeSegment::NseEquity, i as u32))
+        .map(|i| InstrumentSubscription::new(ExchangeSegment::NseEquity, i as u64))
         .collect();
 
     let messages =

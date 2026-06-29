@@ -41,7 +41,7 @@ use std::sync::Arc;
 use papaya::HashMap;
 
 /// Composite key per I-P1-11.
-type TrackerKey = (u32, u8);
+type TrackerKey = (u64, u8);
 
 /// Lock-free per-instrument cumulative-volume tracker.
 ///
@@ -87,7 +87,7 @@ impl VolumeDeltaTracker {
     #[inline]
     pub fn record_tick(
         &self,
-        security_id: u32,
+        security_id: u64,
         segment_code: u8,
         current_volume: u32,
     ) -> DeltaOutcome {
@@ -119,7 +119,7 @@ impl VolumeDeltaTracker {
     /// without updating the baseline. Useful for diagnostics; on the
     /// hot path use `record_tick`.
     #[inline]
-    pub fn get_last_seen(&self, security_id: u32, segment_code: u8) -> Option<u32> {
+    pub fn get_last_seen(&self, security_id: u64, segment_code: u8) -> Option<u32> {
         let guard = self.inner.guard();
         self.inner
             .get(&(security_id, segment_code), &guard)
@@ -296,8 +296,8 @@ mod tests {
     #[test]
     fn test_reasonable_memory_bound_at_25k_entries() {
         let t = VolumeDeltaTracker::new();
-        for i in 0..25_000_u32 {
-            t.record_tick(i, 1, 100 + i);
+        for i in 0..25_000_u64 {
+            t.record_tick(i, 1, 100 + i as u32);
         }
         assert_eq!(t.len(), 25_000);
         assert_eq!(t.get_last_seen(0, 1), Some(100));

@@ -1525,7 +1525,7 @@ threshold = 25.0
 
         for i in 0..5_u32 {
             let request = PlaceOrderRequest {
-                security_id: 50000 + i,
+                security_id: 50000 + u64::from(i),
                 transaction_type: if i % 2 == 0 {
                     TransactionType::Buy
                 } else {
@@ -2263,7 +2263,7 @@ threshold = 70.0
         // Send a few ticks
         for i in 0..10_u32 {
             let mut tick = ParsedTick::default();
-            tick.security_id = 100 + i;
+            tick.security_id = 100 + u64::from(i);
             tick.last_traded_price = 250.0 + i as f32;
             let _ = tick_tx.send(tick);
         }
@@ -2943,7 +2943,7 @@ threshold = 30.0
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
 
         // Send ticks for multiple securities
-        for sec_id in [100_u32, 200, 300] {
+        for sec_id in [100_u64, 200, 300] {
             for i in 0..10_u32 {
                 let mut tick = ParsedTick::default();
                 tick.security_id = sec_id;
@@ -2985,7 +2985,7 @@ threshold = 30.0
         );
 
         // Place orders for different securities
-        for sec_id in [100_u32, 200, 300] {
+        for sec_id in [100_u64, 200, 300] {
             let request = PlaceOrderRequest {
                 security_id: sec_id,
                 transaction_type: TransactionType::Buy,
@@ -3343,7 +3343,7 @@ threshold = 50.0
         // Send ticks and order updates interleaved
         for i in 0..10_u32 {
             let mut tick = ParsedTick::default();
-            tick.security_id = 100 + i;
+            tick.security_id = 100 + u64::from(i);
             tick.last_traded_price = 200.0 + i as f32;
             let _ = tick_tx.send(tick);
 
@@ -3629,7 +3629,7 @@ threshold = 35.0
         // Send a few ticks (no strategies, so no orders, but exercises the tick path)
         for i in 0..5_u32 {
             let mut tick = ParsedTick::default();
-            tick.security_id = 10 + i;
+            tick.security_id = 10 + u64::from(i);
             tick.last_traded_price = 100.0 + i as f32;
             tick.volume = 500;
             let _ = tick_tx.send(tick);

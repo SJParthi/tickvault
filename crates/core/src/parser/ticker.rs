@@ -77,7 +77,7 @@ mod tests {
             response_code: 2,
             message_length: TICKER_PACKET_SIZE as u16,
             exchange_segment_code: segment,
-            security_id,
+            security_id: u64::from(security_id),
         };
         (buf, hdr)
     }

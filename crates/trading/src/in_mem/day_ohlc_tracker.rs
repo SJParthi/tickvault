@@ -153,7 +153,7 @@ impl Default for DayOhlc {
 /// for future scope extension to other segments.
 #[derive(Debug, Clone)]
 pub struct DayOhlcTracker {
-    inner: Arc<PapayaHashMap<(u32, ExchangeSegment), Mutex<DayOhlc>>>,
+    inner: Arc<PapayaHashMap<(u64, ExchangeSegment), Mutex<DayOhlc>>>,
 }
 
 impl DayOhlcTracker {
@@ -185,7 +185,7 @@ impl DayOhlcTracker {
     ///
     /// Returns `true` always (the call is now infallible — auto-arm + update).
     #[inline]
-    pub fn update_tick(&self, security_id: u32, segment: ExchangeSegment, last_price: f64) -> bool {
+    pub fn update_tick(&self, security_id: u64, segment: ExchangeSegment, last_price: f64) -> bool {
         let pinned = self.inner.pin();
         let key = (security_id, segment);
         if let Some(slot) = pinned.get(&key) {
@@ -202,7 +202,7 @@ impl DayOhlcTracker {
     /// Snapshot the current OHLC for one instrument. Returns `None` if no
     /// tick has been observed yet (slot does not exist).
     #[must_use]
-    pub fn snapshot(&self, security_id: u32, segment: ExchangeSegment) -> Option<DayOhlc> {
+    pub fn snapshot(&self, security_id: u64, segment: ExchangeSegment) -> Option<DayOhlc> {
         let pinned = self.inner.pin();
         let key = (security_id, segment);
         let slot = pinned.get(&key)?;
@@ -276,11 +276,11 @@ pub fn ist_seconds_of_day() -> u32 {
 mod tests {
     use super::*;
 
-    fn nifty() -> (u32, ExchangeSegment) {
+    fn nifty() -> (u64, ExchangeSegment) {
         (13, ExchangeSegment::IdxI)
     }
 
-    fn banknifty() -> (u32, ExchangeSegment) {
+    fn banknifty() -> (u64, ExchangeSegment) {
         (25, ExchangeSegment::IdxI)
     }
 

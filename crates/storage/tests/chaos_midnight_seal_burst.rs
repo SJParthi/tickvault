@@ -79,7 +79,7 @@ fn mk_seal(i: usize) -> BufferedSeal {
     state.oi = 50_000;
     state.tick_count = 5;
     // security_id varies across ~11K instruments; segment IDX_I=0; TF M1.
-    let sid = (i % 11_000) as u32 + 1;
+    let sid = (i % 11_000) as u64 + 1;
     BufferedSeal::new(sid, 0, TfIndex::M1, state, Feed::Dhan)
 }
 

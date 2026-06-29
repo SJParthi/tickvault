@@ -98,7 +98,7 @@ impl RingBuffer {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IndicatorSnapshot {
     /// Security identifier (for routing to correct strategy).
-    pub security_id: u32,
+    pub security_id: u64,
 
     // --- Moving Averages ---
     /// Exponential Moving Average (fast period, typically 12).

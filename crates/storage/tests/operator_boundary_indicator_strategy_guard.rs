@@ -42,13 +42,15 @@ const FROZEN_DIRS: &[&str] = &[
 const ENGINE_REL: &str = "crates/trading/src/indicator/engine.rs";
 const ENGINE_STATES_FIELD: &str = "states: Vec<IndicatorState>,";
 
-/// Content pin captured 2026-06-06 (pre-edit tree). Tuple =
+/// Content pin captured 2026-06-06; re-blessed 2026-06-29 for the §28.1 narrow
+/// `security_id` u32→u64 widening lift (operator-approved plan
+/// `active-plan-groww-security-id-u64.md`). Tuple =
 /// (path-relative-to-repo-root, fnv1a64, byte_len, line_count).
 const BOUNDARY_FILES: &[(&str, u64, usize, usize)] = &[
     (
         "crates/trading/src/indicator/engine.rs",
-        0xbce7f1b6f74e271d,
-        51785,
+        0x28130b652738efeb,
+        51829,
         1436,
     ),
     (
@@ -59,19 +61,19 @@ const BOUNDARY_FILES: &[(&str, u64, usize, usize)] = &[
     ),
     (
         "crates/trading/src/indicator/obi.rs",
-        0xb7cc209c5154456b,
+        0x2917677e0aec6fff,
         19913,
         576,
     ),
     (
         "crates/trading/src/indicator/tests.rs",
-        0x77678111f6fa34cf,
-        14525,
+        0xc660274629c37552,
+        14547,
         463,
     ),
     (
         "crates/trading/src/indicator/types.rs",
-        0x5ad0c8a7f906943b,
+        0x00b6a1289e81f81e,
         32025,
         968,
     ),
@@ -89,7 +91,7 @@ const BOUNDARY_FILES: &[(&str, u64, usize, usize)] = &[
     ),
     (
         "crates/trading/src/strategy/evaluator.rs",
-        0xa438888365d4671f,
+        0xf20f51ffa10334c0,
         76706,
         2089,
     ),
@@ -107,7 +109,7 @@ const BOUNDARY_FILES: &[(&str, u64, usize, usize)] = &[
     ),
     (
         "crates/trading/src/strategy/tests.rs",
-        0xdeb17a1ba308349a,
+        0x9a83670568b0260f,
         15843,
         515,
     ),

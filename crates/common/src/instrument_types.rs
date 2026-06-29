@@ -3430,7 +3430,7 @@ mod tests {
         assert_eq!(u.security_id_to_symbol(49001), Some("RELIANCE"));
         // Unknown
         assert!(u.security_id_to_symbol(0).is_none());
-        assert!(u.security_id_to_symbol(u32::MAX).is_none());
+        assert!(u.security_id_to_symbol(u64::from(u32::MAX)).is_none());
     }
 
     #[test]
@@ -3689,7 +3689,7 @@ mod tests {
     fn test_locked_4_idx_i_instrument_info_populated_with_four_entries() {
         let u = FnoUniverse::locked_4_idx_i();
         assert_eq!(u.instrument_info.len(), 4);
-        for sid in [13_u32, 25, 51, 21] {
+        for sid in [13_u64, 25, 51, 21] {
             assert!(u.instrument_info.contains_key(&sid), "missing SID {sid}");
         }
     }

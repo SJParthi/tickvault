@@ -181,7 +181,7 @@ fn test_stress_concurrent_registry_access() {
     // Build a registry with 5000 instruments (max per connection).
     let instruments: Vec<SubscribedInstrument> = (0..5000_u32)
         .map(|i| SubscribedInstrument {
-            security_id: 50000 + i,
+            security_id: 50000 + u64::from(i),
             exchange_segment: ExchangeSegment::NseFno,
             category: SubscriptionCategory::StockDerivative,
             display_label: format!("INST_{i}"),
@@ -203,7 +203,7 @@ fn test_stress_concurrent_registry_access() {
             std::thread::spawn(move || {
                 let mut found = 0_u64;
                 for i in 0..100_000_u32 {
-                    let security_id = 50000 + ((i + thread_idx * 12345) % 5000);
+                    let security_id = 50000 + u64::from((i + thread_idx * 12345) % 5000);
                     if reg.get(security_id).is_some() {
                         found += 1;
                     }
@@ -239,7 +239,7 @@ fn test_stress_subscription_builder_max_load() {
 
     // Build 5000 instruments (max per connection).
     let instruments: Vec<InstrumentSubscription> = (0..5000_u32)
-        .map(|i| InstrumentSubscription::new(ExchangeSegment::NseFno, 50000 + i))
+        .map(|i| InstrumentSubscription::new(ExchangeSegment::NseFno, 50000 + u64::from(i)))
         .collect();
 
     let start = Instant::now();

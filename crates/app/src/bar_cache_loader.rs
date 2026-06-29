@@ -266,7 +266,7 @@ pub async fn populate_and_log(questdb_config: &QuestDbConfig, cache: &BarCache) 
 /// dimensions needed to insert into [`BarCache`] in one shot.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BarCacheRow {
-    pub security_id: u32,
+    pub security_id: u64,
     pub exchange_segment_code: u8,
     pub tf: TfIndex,
     pub bar: CompactBar,
@@ -356,10 +356,14 @@ fn parse_single_row(row: &Value) -> ParseOutcome {
     let Some(security_id_i64) = cols[2].as_i64() else {
         return ParseOutcome::Malformed;
     };
-    if !(0..=i64::from(u32::MAX)).contains(&security_id_i64) {
+    // Groww 64-bit tokens occupy the bit-62 range [2^62, 2^63), so the
+    // security_id read-back must accept the full u64 range. Mirror the
+    // prev_oi cache pattern (`prev_oi_cache.rs`): `u64::try_from` rejects
+    // ONLY negatives (no instrument has a negative id) and accepts every
+    // non-negative value, including Dhan ids and Groww 64-bit tokens.
+    let Ok(security_id) = u64::try_from(security_id_i64) else {
         return ParseOutcome::Malformed;
-    }
-    let security_id = security_id_i64 as u32;
+    };
     let Some(bucket_start_i64) = cols[3].as_i64() else {
         return ParseOutcome::Malformed;
     };
@@ -543,23 +547,20 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_skips_security_id_overflow() {
+    fn test_parse_accepts_groww_64bit_security_id() {
+        // A Groww bit-62 token (range [2^62, 2^63)) exceeds u32::MAX. The
+        // read-back parse MUST accept it (mirror the prev_oi cache pattern)
+        // so Groww instruments rehydrate their sealed bars on app restart.
+        // Pre-fix this asserted the row was SKIPPED — that pinned the
+        // u32-truncation bug that dropped Groww ids on rehydration.
+        let groww_id: i64 = (1i64 << 62) | 12345;
         let row = json!([
-            "NSE_FNO",
-            "1m",
-            5_000_000_000i64,
-            540,
-            100.0,
-            105.0,
-            95.0,
-            102.0,
-            1000,
-            0,
-            42
+            "NSE_FNO", "1m", groww_id, 540, 100.0, 105.0, 95.0, 102.0, 1000, 0, 42
         ]);
         let result = parse_questdb_bar_dataset(&json!([row]));
-        assert!(result.rows.is_empty());
-        assert_eq!(result.skipped_malformed, 1);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.skipped_malformed, 0);
+        assert_eq!(result.rows[0].security_id, (1u64 << 62) | 12345);
     }
 
     #[test]

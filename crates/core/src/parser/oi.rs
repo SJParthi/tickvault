@@ -46,7 +46,7 @@ mod tests {
             response_code: 5,
             message_length: OI_PACKET_SIZE as u16,
             exchange_segment_code: 2,
-            security_id,
+            security_id: u64::from(security_id),
         };
         (buf, hdr)
     }

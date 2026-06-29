@@ -131,7 +131,7 @@ fn aggregator_pre_populates_1200_composite_keys_without_collision() {
     // Synthetic full-cap universe: mix of segments to stress
     // composite-key uniqueness. Use both NSE_EQ (segment_code=1) and
     // IDX_I (segment_code=0) per the §2 universe scope.
-    let keys: Vec<(u32, u8)> = (0..MAX_DAILY_UNIVERSE_SIZE as u32)
+    let keys: Vec<(u64, u8)> = (0..MAX_DAILY_UNIVERSE_SIZE as u64)
         .map(|i| {
             // First ~30 are IDX_I indices (segment 0), rest are
             // NSE_EQ underlyings (segment 1).
@@ -172,7 +172,7 @@ fn aggregator_distinguishes_same_sid_across_segments_per_i_p1_11() {
 #[test]
 fn force_seal_all_iterates_all_1200_entries_without_panic() {
     let agg = MultiTfAggregator::with_capacity(MAX_DAILY_UNIVERSE_SIZE);
-    let keys: Vec<(u32, u8)> = (0..MAX_DAILY_UNIVERSE_SIZE as u32)
+    let keys: Vec<(u64, u8)> = (0..MAX_DAILY_UNIVERSE_SIZE as u64)
         .map(|i| (i, 1u8))
         .collect();
     agg.pre_populate(keys.into_iter());

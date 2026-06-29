@@ -498,7 +498,7 @@ async fn main() -> Result<()> {
                 }
                 metrics::counter!("tv_tick_gap_summary_total").increment(1);
                 metrics::gauge!("tv_tick_gap_instruments_silent").set(total_silent as f64);
-                let top: Vec<(u32, &'static str, u64)> = gaps
+                let top: Vec<(u64, &'static str, u64)> = gaps
                     .iter()
                     .take(10)
                     .map(|(id, seg, gap)| (*id, seg.as_str(), *gap))
@@ -6322,7 +6322,7 @@ async fn start_dhan_lane(
                         // is NOT a SLO-excluded SID. N=10 is comfortably
                         // above 4 (the entire universe) so we always see
                         // the full picture when called.
-                        const SLO_TICK_FRESHNESS_EXCLUDED_SIDS: &[u32] = &[21]; // INDIA VIX
+                        const SLO_TICK_FRESHNESS_EXCLUDED_SIDS: &[u64] = &[21]; // INDIA VIX
                         const SLO_TICK_FRESHNESS_SCAN_TOP_N: usize = 10;
                         let tick_freshness = if !in_market {
                             1.0
