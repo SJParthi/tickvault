@@ -300,7 +300,7 @@ mod stress_risk_engine {
 
         // Every subsequent order must be rejected.
         for i in 0..1000_u32 {
-            let check = engine.check_order(50000 + i, 1);
+            let check = engine.check_order(50000_u64 + u64::from(i), 1);
             assert!(
                 !check.is_approved(),
                 "order {i} must be rejected after halt"
@@ -334,7 +334,7 @@ mod stress_risk_engine {
         let start = Instant::now();
 
         for i in 0..100_000_u32 {
-            let security_id = 50000 + (i % 500);
+            let security_id = 50000_u64 + u64::from(i % 500);
             let lots = ((i % 5) as i32) + 1;
 
             let _ = engine.check_order(security_id, lots);
@@ -375,7 +375,7 @@ mod stress_risk_engine {
         ];
 
         for (i, &price) in prices.iter().enumerate() {
-            let sid = 50000 + (i as u32);
+            let sid = 50000_u64 + (i as u64);
             engine.record_fill(sid, 1, price, 25);
             engine.update_market_price(sid, price * 1.1);
         }
@@ -424,7 +424,7 @@ mod stress_indicator_engine {
     use tickvault_trading::indicator::engine::IndicatorEngine;
     use tickvault_trading::indicator::types::IndicatorParams;
 
-    fn make_tick(security_id: u32, ltp: f32, volume: u32) -> ParsedTick {
+    fn make_tick(security_id: u64, ltp: f32, volume: u32) -> ParsedTick {
         ParsedTick {
             security_id,
             exchange_segment_code: 2,
@@ -445,7 +445,7 @@ mod stress_indicator_engine {
         let start = Instant::now();
 
         for i in 0..100_000_u32 {
-            let security_id = i % 1000;
+            let security_id = u64::from(i % 1000);
             let ltp = 100.0 + (i as f32 * 0.01);
             let tick = make_tick(security_id, ltp, i + 1);
             let snapshot = engine.update(&tick);
@@ -484,10 +484,10 @@ mod stress_indicator_engine {
         let mut engine = IndicatorEngine::new(params);
 
         // Security ID beyond MAX_INDICATOR_INSTRUMENTS must return default snapshot.
-        let tick = make_tick(u32::MAX, 100.0, 1);
+        let tick = make_tick(u64::from(u32::MAX), 100.0, 1);
         let snapshot = engine.update(&tick);
 
-        assert_eq!(snapshot.security_id, u32::MAX);
+        assert_eq!(snapshot.security_id, u64::from(u32::MAX));
         assert_eq!(snapshot.ema_fast, 0.0);
         assert!(!snapshot.is_warm);
     }

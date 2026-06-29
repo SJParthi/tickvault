@@ -246,7 +246,7 @@ mod indicator_mutations {
         IndicatorParams::default()
     }
 
-    fn make_tick(sid: u32, ltp: f32, high: f32, low: f32, volume: u32) -> ParsedTick {
+    fn make_tick(sid: u64, ltp: f32, high: f32, low: f32, volume: u32) -> ParsedTick {
         ParsedTick {
             security_id: sid,
             last_traded_price: ltp,

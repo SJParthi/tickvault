@@ -598,7 +598,7 @@ mod tests {
         // GIFT Nifty (sid 5024, IDX_I=0) in the always-on set aggregates
         // at 20:00 IST — its candle MUST open.
         let mut set = HashSet::new();
-        set.insert((5024_u32, 0_u8));
+        set.insert((5024_u64, 0_u8));
         let agg = MultiTfAggregator::with_capacity(8).with_always_on(Arc::new(set));
         agg.pre_populate(vec![(5024, 0)]);
         let tick = mk_tick(5024, 0, 1_779_235_200 + 72_000, 100.0, 50, 1_000);
