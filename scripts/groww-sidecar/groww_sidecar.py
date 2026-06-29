@@ -92,6 +92,44 @@ SEGMENT_MAP = {
     ("BSE", "CASH"): "BSE_EQ",
     ("BSE", "FNO"): "BSE_FNO",
 }
+# The set of exchange names that legitimately appear as the TOP-LEVEL keys of a
+# BARE get_ltp()/get_index_value() tree. Used to DEFENSIVELY UNWRAP a possible
+# top-level wrapper (2026-06-29): our two Groww docs CONTRADICT on the get_ltp()
+# shape — docs/groww-ref/07-feed-websocket.md shows it WRAPPED under a top-level
+# "ltp" key (`{"ltp": {"NSE": {...}}}`), docs/groww-ref/10-live-feed-mapping-
+# verified.md shows it BARE (`{"NSE": {...}}`). If the live SDK returns the
+# WRAPPED form, the top-level key is the literal "ltp" (or a similar wrapper),
+# no exchange matches, and EVERY tick is silently dropped → 0 ticks. We handle
+# BOTH shapes by descending into a known wrapper key only when the inner dict's
+# keys actually look like exchanges, so a correct BARE tree is NEVER mangled.
+KNOWN_EXCHANGES = {"NSE", "BSE", "MCX", "NCDEX"}
+
+# One-shot shape introspection (2026-06-29): the very first time each feed
+# callback fires, print the REAL top-level keys of get_ltp()/get_index_value()
+# to stderr ONCE so the NEXT run definitively reveals which doc shape is correct
+# — zero ambiguity, no guessing. Module-level flags so it prints only once each.
+_ltp_shape_logged = False
+_index_shape_logged = False
+
+
+def _unwrap_feed_tree(tree, wrapper_keys):
+    """Descend through a possible top-level wrapper so BOTH doc shapes work.
+
+    If `tree`'s top-level keys do NOT look like exchanges (none in
+    KNOWN_EXCHANGES) AND one of `wrapper_keys` (e.g. "ltp"/"value") maps to a
+    dict whose OWN keys DO look like exchanges, return that inner dict. Otherwise
+    return `tree` unchanged. Conservative on purpose: a correct BARE tree (whose
+    top-level keys are already exchanges) is returned untouched, never mangled.
+    """
+    if not isinstance(tree, dict):
+        return tree
+    if set(tree) & KNOWN_EXCHANGES:
+        return tree  # already a BARE exchange-keyed tree — leave it alone.
+    for wrapper_key in wrapper_keys:
+        inner = tree.get(wrapper_key)
+        if isinstance(inner, dict) and (set(inner) & KNOWN_EXCHANGES):
+            return inner
+    return tree
 # All index ticks (whatever exchange/segment Groww uses) store as IDX_I — matches
 # the Dhan index convention + the bridge's segment_from_str("IDX_I").
 CANONICAL_INDEX_SEGMENT = "IDX_I"
@@ -440,6 +478,19 @@ def emit_ltp_records(out, ltp_tree: dict, sid_map: dict) -> None:
     """
     if not isinstance(ltp_tree, dict):
         return
+    # One-shot shape proof: reveal the REAL top-level keys ONCE so the next run
+    # confirms which doc (07 WRAPPED vs 10 BARE) is correct — zero ambiguity.
+    global _ltp_shape_logged
+    if not _ltp_shape_logged:
+        print(
+            f"groww get_ltp() top-level keys: {sorted(map(str, ltp_tree.keys()))}",
+            file=sys.stderr,
+            flush=True,
+        )
+        _ltp_shape_logged = True
+    # Defensively UNWRAP a possible top-level "ltp"/"stockLivePrice" wrapper so
+    # BOTH the WRAPPED (doc 07) and BARE (doc 10) shapes work (2026-06-29).
+    ltp_tree = _unwrap_feed_tree(ltp_tree, ("ltp", "stockLivePrice"))
     for exchange, segs in ltp_tree.items():
         if not isinstance(segs, dict):
             continue
@@ -477,6 +528,23 @@ def emit_index_records(out, index_tree: dict, sid_map: dict) -> None:
     """
     if not isinstance(index_tree, dict):
         return
+    # One-shot shape proof: reveal the REAL top-level keys ONCE. Doc 07 shows the
+    # index tree BARE (no wrapper), but harden it the same way in case the live
+    # SDK wraps it under "value"/"stocksLiveIndices"/"indexValue".
+    global _index_shape_logged
+    if not _index_shape_logged:
+        print(
+            f"groww get_index_value() top-level keys: "
+            f"{sorted(map(str, index_tree.keys()))}",
+            file=sys.stderr,
+            flush=True,
+        )
+        _index_shape_logged = True
+    # Defensively UNWRAP a possible top-level index wrapper so a BARE (doc 07)
+    # or a WRAPPED tree both work; conservative — never mangles a BARE tree.
+    index_tree = _unwrap_feed_tree(
+        index_tree, ("value", "stocksLiveIndices", "indexValue")
+    )
     for exchange, segs in index_tree.items():
         if not isinstance(segs, dict):
             continue
