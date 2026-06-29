@@ -129,6 +129,34 @@ impl SidecarLineClass {
         )
     }
 
+    /// True ONLY for the classes that represent a CONFIRMED auth / entitlement
+    /// reject — the cases where the operator must "refresh the Groww SSM
+    /// api-key". This is DELIBERATELY narrower than [`Self::triggers_alert`].
+    ///
+    /// The generic [`Self::Error`] class (a NATS/SDK reconnect line, a recovered
+    /// `traceback`/`error:`, the bare SDK `Error:` line) is a TRANSIENT /
+    /// degraded condition, NOT a credential fault — so it must NOT latch the
+    /// `auth_rejected` health bit. Before this split, `Error` shared the same bit
+    /// as a real reject and produced a false "refresh the api-key" RED for a
+    /// non-auth condition (the root of the false-auth family). `Error` still
+    /// fires its visibility alert (via `triggers_alert`) + its `error!` log; it
+    /// just no longer claims the credential is bad.
+    #[must_use]
+    pub const fn sets_auth_rejected(self) -> bool {
+        matches!(self, Self::EntitlementRejected | Self::AuthRejected)
+    }
+
+    /// True for the positive / streaming classes that confirm the feed is alive
+    /// again — a NON-TICK recovery edge. The supervisor uses this to clear a
+    /// stale `auth_rejected` flag the instant the sidecar reports `groww auth OK`
+    /// / an NDJSON append, so a tick-silent window can no longer latch the
+    /// false-RED for the whole session. `Subscribed` is a one-shot startup line,
+    /// not proof the stream recovered, so only `Streaming` qualifies.
+    #[must_use]
+    pub const fn clears_auth_rejected(self) -> bool {
+        matches!(self, Self::Streaming)
+    }
+
     /// The fixed, plain-English reason shown to the operator for an
     /// alert-triggering class. A FIXED `&'static str` per class — never the raw
     /// child line — so no runtime/credential text can reach Telegram
@@ -567,6 +595,15 @@ where
                     }
                 }
             }
+            // A confirmed streaming / auth-OK line is a NON-TICK recovery edge:
+            // clear any stale auth_rejected so a tick-silent window can't latch
+            // the false-RED for the whole session (edge-triggered, no-op when
+            // already clear). Reset the per-child `alerted` latch too so a later
+            // genuine reject can re-fire its one-shot alert.
+            if class.clears_auth_rejected() {
+                feed_health.clear_auth_rejected(Feed::Groww);
+                alerted.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
             // A SILENT-FEED watchdog line only counts as an operator-actionable
             // reject DURING market hours — after-hours silence must not mark the
             // feed Down or fire a Telegram page (consistent with #1260's page).
@@ -576,7 +613,14 @@ where
                 // Edge-trigger: fire the operator-facing side-effects ONCE per
                 // running child, even if the same error prints 100×.
                 if !alerted.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    feed_health.set_auth_rejected(Feed::Groww, true);
+                    // Latch the actionable auth-rejected RED ONLY for a CONFIRMED
+                    // auth / entitlement reject — NOT for the generic transient
+                    // `Error` class. `Error` keeps its `error!` log + this Telegram
+                    // visibility alert, but must not claim the credential is bad
+                    // (the root false-"refresh the api-key" fix).
+                    if class.sets_auth_rejected() {
+                        feed_health.set_auth_rejected(Feed::Groww, true);
+                    }
                     if let (Some(notifier), Some(reason)) = (&notifier, class.alert_reason()) {
                         notifier.notify(NotificationEvent::GrowwSidecarRejected {
                             reason: reason.to_string(),
@@ -1044,7 +1088,7 @@ mod tests {
 
     // ── classify_sidecar_line (the pure diagnostic classifier) ──
     // pub-fn-test-guard one-liner: these tests exercise classify_sidecar_line +
-    // SidecarLineClass triggers_alert + alert_reason across every class below.
+    // SidecarLineClass triggers_alert + sets_auth_rejected + clears_auth_rejected + alert_reason across every class below.
 
     #[test]
     fn test_classify_silent_feed_and_entitlement_are_entitlement_rejected() {
@@ -1159,6 +1203,69 @@ mod tests {
         assert!(!SidecarLineClass::Subscribed.triggers_alert());
         assert!(!SidecarLineClass::Streaming.triggers_alert());
         assert!(!SidecarLineClass::Info.triggers_alert());
+    }
+
+    #[test]
+    fn test_sidecar_line_class_sets_auth_rejected_only_for_hard_reject_classes() {
+        // MEDIUM (root) fix: the actionable auth-rejected RED ("refresh the SSM
+        // api-key") must latch ONLY for a CONFIRMED auth / entitlement reject —
+        // NEVER for the generic transient `Error` class (a NATS/SDK reconnect or a
+        // recovered traceback). This is strictly narrower than triggers_alert.
+        assert!(SidecarLineClass::AuthRejected.sets_auth_rejected());
+        assert!(SidecarLineClass::EntitlementRejected.sets_auth_rejected());
+        assert!(
+            !SidecarLineClass::Error.sets_auth_rejected(),
+            "the generic Error class must NOT latch the false 'refresh the api-key' RED"
+        );
+        assert!(!SidecarLineClass::Subscribed.sets_auth_rejected());
+        assert!(!SidecarLineClass::Streaming.sets_auth_rejected());
+        assert!(!SidecarLineClass::Info.sets_auth_rejected());
+        // sets_auth_rejected ⊆ triggers_alert (a class that latches the RED must
+        // also alert; but not every alert class latches the RED — that's Error).
+        for class in [
+            SidecarLineClass::AuthRejected,
+            SidecarLineClass::EntitlementRejected,
+            SidecarLineClass::Error,
+            SidecarLineClass::Subscribed,
+            SidecarLineClass::Streaming,
+            SidecarLineClass::Info,
+        ] {
+            if class.sets_auth_rejected() {
+                assert!(
+                    class.triggers_alert(),
+                    "any auth-latching class must also be an alert class: {class:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_error_class_drives_an_alert_without_latching_auth_rejected() {
+        // The exact MEDIUM scenario: a benign NATS reconnect / recovered
+        // `error:` line classifies as Error → it IS an alert (visibility) but is
+        // NOT an auth latch (no false "refresh the api-key" Down).
+        let class = classify_sidecar_line("Error: nats connection reset, reconnecting");
+        assert_eq!(class, SidecarLineClass::Error);
+        assert!(class.triggers_alert(), "Error keeps its visibility alert");
+        assert!(
+            !class.sets_auth_rejected(),
+            "Error must not latch the actionable auth-rejected RED"
+        );
+    }
+
+    #[test]
+    fn test_sidecar_line_class_clears_auth_rejected_only_for_streaming() {
+        // HIGH-2: a confirmed streaming / auth-OK line is the NON-TICK recovery
+        // edge that clears a stale auth_rejected. Only `Streaming` qualifies —
+        // `Subscribed` is a one-shot startup line, not proof the stream recovered.
+        assert!(SidecarLineClass::Streaming.clears_auth_rejected());
+        assert!(!SidecarLineClass::Subscribed.clears_auth_rejected());
+        assert!(!SidecarLineClass::AuthRejected.clears_auth_rejected());
+        assert!(!SidecarLineClass::EntitlementRejected.clears_auth_rejected());
+        assert!(!SidecarLineClass::Error.clears_auth_rejected());
+        assert!(!SidecarLineClass::Info.clears_auth_rejected());
+        // A real `groww auth OK` line classifies as Streaming → clears.
+        assert!(classify_sidecar_line("groww auth OK").clears_auth_rejected());
     }
 
     #[test]
