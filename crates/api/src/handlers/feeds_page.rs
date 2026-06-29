@@ -241,9 +241,25 @@ function render(data, health) {
       // Plain-English, no jargon (operator commandments). Numbers are real.
       const parts = [];
       if (hv.reason) parts.push(hv.reason);
-      parts.push(hv.connected ? "connected" : "not connected");
+      // Connection wording (operator 2026-06-29 — kill the "not connected ·
+      // subscribed 767" self-contradiction): `connected` reflects STREAMING, not
+      // the socket, so a subscribed-but-not-yet-streaming feed (e.g. market
+      // closed) had connected=false yet subscribed=767. A successful subscribe IS
+      // proof the socket was up (you cannot subscribe without a live socket), so
+      // when there is a subscribe proof but no stream yet, say "connected ·
+      // awaiting first tick" — never a blunt "not connected" beside a subscribe
+      // count. "not connected" stays only when there is NO subscribe proof.
+      const subscribed = (hv.subscribed_total || 0) > 0;
+      if (hv.connected) {
+        parts.push("connected");
+      } else if (subscribed) {
+        parts.push("connected");
+        parts.push("awaiting first tick");
+      } else {
+        parts.push("not connected");
+      }
       // Connect+subscribe PROOF (2026-06-28): how many SIDs the feed subscribed today.
-      if ((hv.subscribed_total || 0) > 0) parts.push("subscribed " + hv.subscribed_total);
+      if (subscribed) parts.push("subscribed " + hv.subscribed_total);
       // Honest-feed PROOF (2026-06-29): records the producer DECODED+EMITTED vs
       // DECODED-but-DROPPED (e.g. an unmapped instrument) — makes "streaming but 0
       // ticks" show its cause. "unmatched" is the plain word for a sid-map miss.
@@ -546,6 +562,30 @@ mod tests {
             FEEDS_PAGE_HTML.contains("subscribed_total")
                 && FEEDS_PAGE_HTML.contains("\"subscribed \""),
             "page must render the subscribe count from the health row"
+        );
+    }
+
+    #[test]
+    fn test_feeds_page_subscribed_implies_connected_when_not_streaming() {
+        // Operator 2026-06-29: a subscribed-but-not-yet-streaming feed (e.g.
+        // market closed) must NOT show a self-contradictory "not connected ·
+        // subscribed 767". A successful subscribe proves the socket was up, so the
+        // page derives "awaiting first tick" from connected + subscribed_total
+        // rather than blurting "not connected" next to a subscribe count.
+        assert!(
+            FEEDS_PAGE_HTML.contains("awaiting first tick"),
+            "page must render 'awaiting first tick' for a subscribed-but-not-streaming feed"
+        );
+        // The derivation reads BOTH the existing connected + subscribed_total
+        // fields (no new API field) — guards the branch against drifting back to
+        // an unconditional 'not connected'.
+        assert!(
+            FEEDS_PAGE_HTML.contains("const subscribed = (hv.subscribed_total || 0) > 0"),
+            "connection wording must be derived from the subscribe proof"
+        );
+        assert!(
+            FEEDS_PAGE_HTML.contains("} else if (subscribed) {"),
+            "subscribed-but-not-connected branch present"
         );
     }
 
