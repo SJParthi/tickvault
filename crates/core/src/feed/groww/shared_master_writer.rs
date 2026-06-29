@@ -42,6 +42,24 @@ use tickvault_common::feed::Feed;
 #[cfg(feature = "daily_universe_fetcher")]
 use tracing::{error, info};
 
+// Audit-chain (feed='groww') support — pure diff + prior-snapshot read-back.
+// Mirrors the Dhan reconciler (`crates/app/src/apply_reconcile_plan.rs`), but scoped
+// to `crates/core` to avoid a core→app dependency, and tagged `feed='groww'`.
+#[cfg(feature = "daily_universe_fetcher")]
+use serde_json::Value;
+#[cfg(feature = "daily_universe_fetcher")]
+use std::collections::HashMap;
+#[cfg(feature = "daily_universe_fetcher")]
+use std::time::Duration;
+#[cfg(feature = "daily_universe_fetcher")]
+use tickvault_storage::instrument_lifecycle_persistence::{
+    InstrumentLifecycleAuditRow, LifecycleState, QUESTDB_TABLE_INSTRUMENT_LIFECYCLE, TransitionKind,
+};
+#[cfg(feature = "daily_universe_fetcher")]
+use tickvault_storage::lifecycle_reconciler::{
+    ReconcileInput, classify_transition, is_stock_split,
+};
+
 /// Returns the canonical shared-table `exchange_segment` label for a Groww watch entry as a
 /// ZERO-ALLOC `&'static str`.
 ///
@@ -264,6 +282,478 @@ pub fn build_groww_constituency_rows<'a>(
         .collect()
 }
 
+// ============================================================================
+// instrument_lifecycle_audit (feed='groww') — pure diff + prior-snapshot read
+// ============================================================================
+//
+// Closes the audit-coverage gap (operator 2026-06-29): the Groww master writer
+// persisted `instrument_lifecycle` DATA rows but emitted ZERO transition rows,
+// so `instrument_lifecycle_audit WHERE feed='groww'` was empty — no forensic
+// "what changed in the Groww universe day-over-day" chain. We mirror the Dhan
+// reconciler (`crates/app/src/apply_reconcile_plan.rs` + the pure storage
+// `classify_transition`), tagged `feed='groww'`, scoped to `crates/core`.
+
+/// Composite identity per I-P1-11 — `security_id` ALONE is not unique.
+#[cfg(feature = "daily_universe_fetcher")]
+type GrowwLifecycleKey = (i64, String);
+
+/// HTTP timeout for the boot read-back SELECT of the prior `feed='groww'` snapshot.
+#[cfg(feature = "daily_universe_fetcher")]
+const GROWW_LIFECYCLE_QUERY_TIMEOUT_SECS: u64 = 15;
+
+/// Hard cap on the QuestDB `/exec` success-response body we will buffer before
+/// JSON-deserialize. The prior-snapshot read-back is at most a few hundred KB
+/// (a few hundred `feed='groww'` rows), so 32 MiB is a generous ceiling that
+/// still bounds a malformed / runaway QuestDB response. Over the cap → degrade
+/// safe: return an error so the caller logs `GROWW-MASTER-01`, builds NO audit
+/// rows, and continues (the data UPSERT still runs; next boot re-emits).
+#[cfg(feature = "daily_universe_fetcher")]
+const MAX_GROWW_EXEC_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Prior per-instrument attributes (the `feed='groww'` snapshot) the diff classifier
+/// compares against today's set. Mirror of the Dhan `PrevLifecycleAttrs`, scoped here.
+#[cfg(feature = "daily_universe_fetcher")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct GrowwPriorAttrs {
+    pub state: LifecycleState,
+    pub locked: bool,
+    pub instrument_type: String,
+    pub lot_size: i32,
+    pub tick_size: f64,
+    pub symbol_name: String,
+}
+
+/// Today's primitive attributes for one Groww instrument (master-entry derived).
+#[cfg(feature = "daily_universe_fetcher")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct GrowwTodayAttrs {
+    pub security_id: i64,
+    pub exchange_segment: String,
+    pub instrument_type: String,
+    pub lot_size: i32,
+    pub tick_size: f64,
+    pub symbol_name: String,
+}
+
+/// Owned audit row so the pure diff can return `String`-backed values the async
+/// loop borrows from (the persistence struct holds `&str`). Mirror of the Dhan
+/// `OwnedLifecycleAuditRow`, `feed` fixed to `groww`.
+#[cfg(feature = "daily_universe_fetcher")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct OwnedGrowwAuditRow {
+    pub ts_nanos_ist: i64,
+    pub trading_date_ist_nanos: i64,
+    pub security_id: i64,
+    pub exchange_segment: String,
+    pub from_state: Option<LifecycleState>,
+    pub to_state: LifecycleState,
+    pub transition_kind: TransitionKind,
+    pub symbol_name_after: String,
+    pub lot_size_after: i32,
+    pub tick_size_after: f64,
+    /// §27 dry-run isolation flag, stamped at construction so the audit row's
+    /// `dry_run` column is honest if these rows are ever appended by a direct
+    /// caller during a dry-run. Today `emit_groww_lifecycle_audit` is reached
+    /// only when `dry_run == false` (the `should_skip_master_append` early
+    /// return guards it), so behaviour is unchanged — this is hardening.
+    pub dry_run: bool,
+}
+
+#[cfg(feature = "daily_universe_fetcher")]
+impl OwnedGrowwAuditRow {
+    /// Borrow as the persistence-layer row for one batched append. `field_deltas`
+    /// / `operator_note` / snapshot-only columns are left empty/sentinel — the
+    /// Groww spot/index master carries no expiry/strike, and the simple
+    /// appeared/updated/expired chain does not need a JSON field-delta payload.
+    #[must_use]
+    pub fn as_row(&self) -> InstrumentLifecycleAuditRow<'_> {
+        InstrumentLifecycleAuditRow {
+            ts_nanos_ist: self.ts_nanos_ist,
+            trading_date_ist_nanos: self.trading_date_ist_nanos,
+            security_id: self.security_id,
+            exchange_segment: &self.exchange_segment,
+            from_state: self.from_state,
+            to_state: self.to_state,
+            transition_kind: self.transition_kind,
+            field_deltas: "",
+            source_csv_sha256: "",
+            operator_note: "",
+            lifecycle_state_after: self.to_state,
+            lot_size_after: self.lot_size_after,
+            tick_size_after: self.tick_size_after,
+            expiry_date_after_nanos: 0,
+            symbol_name_after: &self.symbol_name_after,
+            dry_run: self.dry_run,
+            feed: Feed::Groww.as_str(),
+        }
+    }
+}
+
+/// Build the read-back SELECT for the prior `feed='groww'` lifecycle snapshot.
+/// PURE. Reads ALL rows (active AND expired) so the diff can detect reactivation;
+/// excludes §27 dry-run rows; scoped to `feed='groww'` so it never sees Dhan rows.
+#[cfg(feature = "daily_universe_fetcher")]
+#[must_use]
+pub fn build_groww_lifecycle_select_sql() -> String {
+    format!(
+        "SELECT security_id, exchange_segment, lifecycle_state, lifecycle_state_locked, \
+         instrument_type, lot_size, tick_size, symbol_name \
+         FROM {QUESTDB_TABLE_INSTRUMENT_LIFECYCLE} WHERE feed = 'groww' AND dry_run = false"
+    )
+}
+
+/// Parse the QuestDB `dataset` array into the prior-attrs map. PURE — no I/O.
+/// Unknown `lifecycle_state` / malformed rows are SKIPPED (counted by the caller
+/// only implicitly — never guessed), mirroring the Dhan loader's discipline.
+#[cfg(feature = "daily_universe_fetcher")]
+#[must_use]
+pub fn parse_groww_lifecycle_dataset(
+    dataset: &Value,
+) -> HashMap<GrowwLifecycleKey, GrowwPriorAttrs> {
+    let mut out: HashMap<GrowwLifecycleKey, GrowwPriorAttrs> = HashMap::new();
+    let Some(rows) = dataset.as_array() else {
+        return out;
+    };
+    for row in rows {
+        let Some(cells) = row.as_array() else {
+            continue;
+        };
+        if cells.len() < 8 {
+            continue;
+        }
+        let (
+            Some(security_id),
+            Some(exchange_segment),
+            Some(state_str),
+            Some(locked),
+            Some(instrument_type),
+            Some(lot_size),
+            Some(tick_size),
+            Some(symbol_name),
+        ) = (
+            cells[0].as_i64(),
+            cells[1].as_str(),
+            cells[2].as_str(),
+            cells[3].as_bool(),
+            cells[4].as_str(),
+            cells[5].as_i64(),
+            cells[6].as_f64(),
+            cells[7].as_str(),
+        )
+        else {
+            continue;
+        };
+        let Some(state) = LifecycleState::from_wire(state_str) else {
+            continue; // schema drift — counted-not-guessed (skipped).
+        };
+        out.insert(
+            (security_id, exchange_segment.to_string()),
+            GrowwPriorAttrs {
+                state,
+                locked,
+                instrument_type: instrument_type.to_string(),
+                lot_size: i32::try_from(lot_size).unwrap_or(0),
+                tick_size,
+                symbol_name: symbol_name.to_string(),
+            },
+        );
+    }
+    out
+}
+
+/// Extract today's primitive attrs from the Groww master set. PURE. Iterates the
+/// FULL pre-cap `master_entries` (not the capped live `entries`), exactly like the
+/// lifecycle-row + constituency builders, so the audit chain covers the whole
+/// universe regardless of the live-subscribe cap. Spot/index sentinels: `lot=0`,
+/// `tick=0.0`. `instrument_type` is `INDEX` for an index value else `EQUITY`.
+#[cfg(feature = "daily_universe_fetcher")]
+#[must_use]
+pub fn groww_today_attrs(set: &GrowwWatchSet) -> Vec<GrowwTodayAttrs> {
+    set.master_entries
+        .iter()
+        .map(|e| {
+            let is_index = e.kind == WatchKind::IndexValue;
+            let symbol_name: &str = if is_index {
+                e.index_name.as_deref().unwrap_or(&e.exchange_token)
+            } else {
+                e.symbol_name.as_deref().unwrap_or(&e.exchange_token)
+            };
+            GrowwTodayAttrs {
+                security_id: e.security_id,
+                exchange_segment: groww_segment_label(e).to_string(),
+                instrument_type: if is_index { "INDEX" } else { "EQUITY" }.to_string(),
+                lot_size: 0,
+                tick_size: 0.0,
+                symbol_name: symbol_name.to_string(),
+            }
+        })
+        .collect()
+}
+
+/// PURE diff classifier — produce one `instrument_lifecycle_audit` (feed='groww')
+/// row per state transition, given today's master attrs + the prior `feed='groww'`
+/// snapshot. Reuses the SAME pure `classify_transition` the Dhan reconciler uses
+/// (appeared / updated / split / reactivated / expired / segment_moved / no-op).
+///
+/// Two passes mirror `compute_reconcile_plan`:
+/// 1. present today → classify vs prior (None prior ⇒ `appeared`).
+/// 2. disappeared (prior key absent today) → `expired` / `segment_moved`.
+///
+/// Day-1 (empty `prior`) ⇒ every today row is `appeared`, no expired pass — the
+/// same bootstrap behaviour the Dhan side has. Composite `(security_id,
+/// exchange_segment)` identity per I-P1-11. NO I/O; deterministic.
+///
+/// `now_ist_nanos` stamps the audit `ts`; `today_ist_nanos` is the IST-midnight
+/// business/partition date. `dry_run` is stamped on every emitted row so the
+/// §27 isolation column is honest for any direct caller.
+#[cfg(feature = "daily_universe_fetcher")]
+#[must_use]
+pub fn build_groww_audit_rows(
+    prior: &HashMap<GrowwLifecycleKey, GrowwPriorAttrs>,
+    today: &[GrowwTodayAttrs],
+    now_ist_nanos: i64,
+    today_ist_nanos: i64,
+    dry_run: bool,
+) -> Vec<OwnedGrowwAuditRow> {
+    use std::collections::HashSet;
+
+    let mut rows = Vec::new();
+
+    let today_keys: HashSet<GrowwLifecycleKey> = today
+        .iter()
+        .map(|t| (t.security_id, t.exchange_segment.clone()))
+        .collect();
+    // §23 segment-move detection: which segments does each security_id span today.
+    let mut today_sid_segments: HashMap<i64, HashSet<String>> = HashMap::new();
+    for t in today {
+        today_sid_segments
+            .entry(t.security_id)
+            .or_default()
+            .insert(t.exchange_segment.clone());
+    }
+
+    // ── Pass 1: present today ──
+    for t in today {
+        let key = (t.security_id, t.exchange_segment.clone());
+        let prev = prior.get(&key);
+        let prev_state = prev.map(|p| p.state);
+        let prev_locked = prev.is_some_and(|p| p.locked);
+        let fields_changed = prev.is_some_and(|p| {
+            p.lot_size != t.lot_size
+                || (p.tick_size - t.tick_size).abs() > f64::EPSILON
+                || p.symbol_name != t.symbol_name
+                || p.instrument_type != t.instrument_type
+        });
+        let is_split =
+            prev.is_some_and(|p| is_stock_split(p.lot_size, t.lot_size, p.tick_size, t.tick_size));
+        let input = ReconcileInput {
+            prev_state,
+            prev_locked,
+            present_in_today_csv: true,
+            segment_changed: false, // segment moves are recorded on the OLD key's disappearance
+            fields_changed,
+            is_split,
+            instrument_type: &t.instrument_type,
+        };
+        if let Some((kind, to_state)) = classify_transition(&input) {
+            rows.push(OwnedGrowwAuditRow {
+                ts_nanos_ist: now_ist_nanos,
+                trading_date_ist_nanos: today_ist_nanos,
+                security_id: t.security_id,
+                exchange_segment: t.exchange_segment.clone(),
+                from_state: prev_state,
+                to_state,
+                transition_kind: kind,
+                symbol_name_after: t.symbol_name.clone(),
+                lot_size_after: t.lot_size,
+                tick_size_after: t.tick_size,
+                dry_run,
+            });
+        }
+    }
+
+    // ── Pass 2: disappeared (prior rows not in today's set) ──
+    for (key, p) in prior {
+        if today_keys.contains(key) {
+            continue; // handled in pass 1
+        }
+        let (security_id, old_segment) = key;
+        let segment_changed = today_sid_segments
+            .get(security_id)
+            .is_some_and(|segs| segs.iter().any(|s| s != old_segment));
+        let input = ReconcileInput {
+            prev_state: Some(p.state),
+            prev_locked: p.locked,
+            present_in_today_csv: false,
+            segment_changed,
+            fields_changed: false,
+            is_split: false,
+            instrument_type: &p.instrument_type,
+        };
+        if let Some((kind, to_state)) = classify_transition(&input) {
+            rows.push(OwnedGrowwAuditRow {
+                ts_nanos_ist: now_ist_nanos,
+                trading_date_ist_nanos: today_ist_nanos,
+                security_id: *security_id,
+                exchange_segment: old_segment.clone(),
+                from_state: Some(p.state),
+                to_state,
+                transition_kind: kind,
+                // Disappearance carries the PRIOR attrs forward (no fresh values today).
+                symbol_name_after: p.symbol_name.clone(),
+                lot_size_after: p.lot_size,
+                tick_size_after: p.tick_size,
+                dry_run,
+            });
+        }
+    }
+
+    rows
+}
+
+/// Read the prior `feed='groww'` lifecycle snapshot for the audit diff. Best-effort
+/// — returns `Err` on QuestDB unavailability so the caller logs `GROWW-MASTER-01`
+/// and continues with NO audit rows (a Day-1 / empty table yields an empty map,
+/// which the diff treats as "every today row is `appeared`").
+///
+/// Cold path — called once per Groww master persist.
+#[cfg(feature = "daily_universe_fetcher")]
+// TEST-EXEMPT: live HTTP read-back; the pure SQL builder + parser are unit-tested.
+async fn load_prev_groww_lifecycle(
+    questdb: &QuestDbConfig,
+) -> anyhow::Result<HashMap<GrowwLifecycleKey, GrowwPriorAttrs>> {
+    use anyhow::Context;
+
+    let url = format!("http://{}:{}/exec", questdb.host, questdb.http_port);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(GROWW_LIFECYCLE_QUERY_TIMEOUT_SECS))
+        .build()
+        .context("build reqwest client for Groww lifecycle read-back")?;
+    let sql = build_groww_lifecycle_select_sql();
+    let resp = client
+        .get(&url)
+        .query(&[("query", sql.as_str())])
+        .send()
+        .await
+        .context("HTTP GET Groww lifecycle read-back against QuestDB")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body: String = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect();
+        anyhow::bail!("QuestDB Groww lifecycle read-back returned HTTP {status}: {body}");
+    }
+    #[derive(serde::Deserialize)]
+    struct ExecResponse {
+        #[serde(default)]
+        dataset: Value,
+    }
+    // Bound the success body before buffering+deserialize (the error path already
+    // caps at 200 chars above). Read the connection-timeout-bounded bytes and reject
+    // anything over the cap so a malformed / runaway QuestDB response cannot force an
+    // unbounded allocation. Degrade-safe: an error here means NO audit rows.
+    let body = resp
+        .bytes()
+        .await
+        .context("read QuestDB Groww lifecycle read-back body")?;
+    if body.len() > MAX_GROWW_EXEC_RESPONSE_BYTES {
+        anyhow::bail!(
+            "QuestDB Groww lifecycle read-back body {} bytes exceeds cap {} bytes",
+            body.len(),
+            MAX_GROWW_EXEC_RESPONSE_BYTES
+        );
+    }
+    let parsed: ExecResponse = serde_json::from_slice(&body)
+        .context("parse QuestDB JSON dataset for Groww lifecycle read-back")?;
+    Ok(parse_groww_lifecycle_dataset(&parsed.dataset))
+}
+
+/// Emit the `instrument_lifecycle_audit` (feed='groww') transition chain for one
+/// Groww master persist. COLD-PATH, best-effort, degrade-safe: ANY failure logs
+/// `error!(code=GROWW-MASTER-01)`, bumps
+/// `tv_groww_master_persist_errors_total{stage="lifecycle_audit"}`, and RETURNS —
+/// it NEVER aborts Groww activation, the live feed, or any order/tick path. Called
+/// audit-first (§24), BEFORE the lifecycle DATA UPSERT, so a crash never leaves a
+/// data row without its forensic row.
+#[cfg(feature = "daily_universe_fetcher")]
+// TEST-EXEMPT: cold-path ILP/HTTP orchestration; the pure diff/parser/builders + the degrade-safe failure arm (source-scanned) carry coverage; the bulk audit append is unit-tested + boot-integration-exercised in storage.
+async fn emit_groww_lifecycle_audit(
+    questdb: &QuestDbConfig,
+    set: &GrowwWatchSet,
+    now_ist_nanos: i64,
+    trading_date_ist_nanos: i64,
+    dry_run: bool,
+) {
+    // Load the prior snapshot. On failure: degrade-safe — log+count, build NO audit
+    // rows, and RETURN (the data UPSERT still runs; next boot re-emits the chain).
+    let prior = match load_prev_groww_lifecycle(questdb).await {
+        Ok(prior) => prior,
+        Err(err) => {
+            let (stage, code) = classify_persist_failure("lifecycle_audit");
+            metrics::counter!("tv_groww_master_persist_errors_total", "stage" => stage)
+                .increment(1);
+            error!(
+                code = code.code_str(),
+                stage,
+                ?err,
+                "[feeds] Groww lifecycle-audit prior-snapshot read failed — best-effort cold-path \
+                 forensic chain; feed + ticks unaffected, next boot re-emits"
+            );
+            return;
+        }
+    };
+
+    let today = groww_today_attrs(set);
+    let owned = build_groww_audit_rows(
+        &prior,
+        &today,
+        now_ist_nanos,
+        trading_date_ist_nanos,
+        dry_run,
+    );
+    if owned.is_empty() {
+        info!("[feeds] Groww lifecycle-audit: no transitions to record (feed=groww)");
+        return;
+    }
+    let audit_rows: Vec<InstrumentLifecycleAuditRow<'_>> =
+        owned.iter().map(OwnedGrowwAuditRow::as_row).collect();
+
+    tickvault_storage::instrument_lifecycle_persistence::ensure_instrument_lifecycle_audit_table(
+        questdb,
+    )
+    .await;
+    match tickvault_storage::instrument_lifecycle_persistence::append_instrument_lifecycle_audit_rows(
+        questdb,
+        &audit_rows,
+    )
+    .await
+    {
+        Ok(()) => {
+            info!(
+                audit_rows = audit_rows.len(),
+                "[feeds] Groww instrument_lifecycle_audit transition rows persisted (feed=groww)"
+            );
+        }
+        Err(err) => {
+            let (stage, code) = classify_persist_failure("lifecycle_audit");
+            metrics::counter!("tv_groww_master_persist_errors_total", "stage" => stage)
+                .increment(1);
+            error!(
+                code = code.code_str(),
+                stage,
+                rows = audit_rows.len(),
+                ?err,
+                "[feeds] Groww instrument_lifecycle_audit persist failed — best-effort cold-path \
+                 forensic chain; feed + ticks unaffected, next boot re-emits"
+            );
+        }
+    }
+}
+
 /// Persist the Groww instrument set into the SHARED `instrument_lifecycle` +
 /// `index_constituency` master tables, tagged `feed='groww'`.
 ///
@@ -305,6 +795,13 @@ pub async fn persist_groww_instruments(
         );
         return;
     }
+
+    // ── instrument_lifecycle_audit (feed='groww') — AUDIT-FIRST (§24) ──
+    // Diff today's master set against yesterday's `feed='groww'` snapshot and emit
+    // the appeared/updated/expired transition chain BEFORE the lifecycle DATA UPSERT,
+    // so a crash never leaves a data row without its forensic row. Best-effort +
+    // degrade-safe internally — never aborts the data writes below.
+    emit_groww_lifecycle_audit(questdb, set, now_ist_nanos, trading_date_ist_nanos, dry_run).await;
 
     // ── instrument_lifecycle ──
     tickvault_storage::instrument_lifecycle_persistence::ensure_instrument_lifecycle_table(questdb)
@@ -810,8 +1307,11 @@ mod tests {
         // signature and the `#[cfg(not(...))]` stub) so this test's own assertion
         // strings — which necessarily NAME the banned tokens — are not self-matched.
         let file = include_str!("shared_master_writer.rs");
+        // NB: the needle is split with `concat!` so this assertion string does not
+        // itself trip the pub-fn-test-guard's `pub async fn ` grep (it is a string
+        // literal, not a declaration). The runtime value is identical.
         let start = file
-            .find("pub async fn persist_groww_instruments(")
+            .find(concat!("pub async f", "n persist_groww_instruments("))
             .expect("persist fn present");
         let end = file[start..]
             .find("#[cfg(not(feature = \"daily_universe_fetcher\"))]")
@@ -929,6 +1429,293 @@ mod tests {
         assert!(
             rows.iter().all(|r| r.index_name == "NIFTY Total Market"),
             "all Groww constituents are pinned to the single NTM membership"
+        );
+    }
+
+    // ── AUDIT CHAIN (feed='groww'): diff + parser ──────────────────────────
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    fn groww_prior(
+        state: LifecycleState,
+        locked: bool,
+        itype: &str,
+        lot: i32,
+        tick: f64,
+        sym: &str,
+    ) -> GrowwPriorAttrs {
+        GrowwPriorAttrs {
+            state,
+            locked,
+            instrument_type: itype.to_string(),
+            lot_size: lot,
+            tick_size: tick,
+            symbol_name: sym.to_string(),
+        }
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_groww_today_attrs_index_and_stock_shapes() {
+        let set = set_of(vec![
+            index("NIFTY", "NSE", 999),
+            stock("2885", "INE002A01018", "RELIANCE"),
+        ]);
+        let today = groww_today_attrs(&set);
+        assert_eq!(today.len(), 2);
+        let idx = today.iter().find(|t| t.security_id == 999).unwrap();
+        assert_eq!(idx.instrument_type, "INDEX");
+        assert_eq!(idx.exchange_segment, "IDX_I");
+        assert_eq!(idx.symbol_name, "NSE-NIFTY");
+        assert_eq!(idx.lot_size, 0);
+        let stk = today.iter().find(|t| t.security_id == 2885).unwrap();
+        assert_eq!(stk.instrument_type, "EQUITY");
+        assert_eq!(stk.exchange_segment, "NSE_EQ");
+        assert_eq!(stk.symbol_name, "RELIANCE");
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_build_groww_audit_rows_day1_all_appeared() {
+        // Empty prior (Day-1) → every today row is `appeared`, NO expired pass,
+        // every row tagged feed='groww'.
+        let set = set_of(vec![
+            index("NIFTY", "NSE", 999),
+            stock("2885", "INE002A01018", "RELIANCE"),
+        ]);
+        let today = groww_today_attrs(&set);
+        let prior = HashMap::new();
+        let rows = build_groww_audit_rows(&prior, &today, 111, 222, false);
+        assert_eq!(rows.len(), 2, "both appeared");
+        for r in &rows {
+            assert_eq!(r.transition_kind, TransitionKind::Appeared);
+            assert_eq!(r.to_state, LifecycleState::Active);
+            assert_eq!(r.from_state, None);
+            assert_eq!(r.ts_nanos_ist, 111);
+            assert_eq!(r.trading_date_ist_nanos, 222);
+            assert_eq!(r.as_row().feed, "groww");
+            // Live run → dry_run stamped false on the row AND propagated to as_row().
+            assert!(!r.dry_run);
+            assert!(!r.as_row().dry_run);
+        }
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_build_groww_audit_rows_dry_run_propagates_to_as_row() {
+        // §27 isolation: a dry-run build stamps dry_run=true on every emitted row,
+        // and `as_row()` propagates it (NOT a hardcoded false) so a future direct
+        // caller during a dry-run can never write dry_run=false audit rows.
+        let set = set_of(vec![
+            index("NIFTY", "NSE", 999),
+            stock("2885", "INE002A01018", "RELIANCE"),
+        ]);
+        let today = groww_today_attrs(&set);
+        let prior = HashMap::new();
+        let rows = build_groww_audit_rows(&prior, &today, 1, 2, true);
+        assert_eq!(rows.len(), 2, "both appeared on Day-1");
+        for r in &rows {
+            assert!(r.dry_run, "dry_run must be stamped on the built row");
+            assert!(
+                r.as_row().dry_run,
+                "as_row() must propagate dry_run, not hardcode false"
+            );
+        }
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_build_groww_audit_rows_unchanged_is_no_row() {
+        // Present both days, no field change → NO audit row.
+        let set = set_of(vec![stock("2885", "INE002A01018", "RELIANCE")]);
+        let today = groww_today_attrs(&set);
+        let mut prior = HashMap::new();
+        prior.insert(
+            (2885, "NSE_EQ".to_string()),
+            groww_prior(LifecycleState::Active, false, "EQUITY", 0, 0.0, "RELIANCE"),
+        );
+        let rows = build_groww_audit_rows(&prior, &today, 1, 2, false);
+        assert!(rows.is_empty(), "unchanged active row → no audit row");
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_build_groww_audit_rows_symbol_change_is_updated() {
+        // symbol_name changed RELIANCE → RELIANCE-NEW → `updated`.
+        let set = set_of(vec![stock("2885", "INE002A01018", "RELIANCE-NEW")]);
+        let today = groww_today_attrs(&set);
+        let mut prior = HashMap::new();
+        prior.insert(
+            (2885, "NSE_EQ".to_string()),
+            groww_prior(LifecycleState::Active, false, "EQUITY", 0, 0.0, "RELIANCE"),
+        );
+        let rows = build_groww_audit_rows(&prior, &today, 1, 2, false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].transition_kind, TransitionKind::Updated);
+        assert_eq!(rows[0].to_state, LifecycleState::Active);
+        assert_eq!(rows[0].symbol_name_after, "RELIANCE-NEW");
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_build_groww_audit_rows_disappeared_is_expired() {
+        // In prior, absent today → `expired`, carrying the prior attrs.
+        let set = set_of(vec![]);
+        let today = groww_today_attrs(&set);
+        let mut prior = HashMap::new();
+        prior.insert(
+            (2885, "NSE_EQ".to_string()),
+            groww_prior(LifecycleState::Active, false, "EQUITY", 0, 0.0, "RELIANCE"),
+        );
+        let rows = build_groww_audit_rows(&prior, &today, 1, 2, false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].transition_kind, TransitionKind::Expired);
+        // EQUITY disappearance → ExpiredFromFno.
+        assert_eq!(rows[0].to_state, LifecycleState::ExpiredFromFno);
+        assert_eq!(rows[0].from_state, Some(LifecycleState::Active));
+        assert_eq!(rows[0].symbol_name_after, "RELIANCE");
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_build_groww_audit_rows_reactivation() {
+        // Was expired, reappears today → `reactivated`.
+        let set = set_of(vec![stock("2885", "INE002A01018", "RELIANCE")]);
+        let today = groww_today_attrs(&set);
+        let mut prior = HashMap::new();
+        prior.insert(
+            (2885, "NSE_EQ".to_string()),
+            groww_prior(
+                LifecycleState::ExpiredFromFno,
+                false,
+                "EQUITY",
+                0,
+                0.0,
+                "RELIANCE",
+            ),
+        );
+        let rows = build_groww_audit_rows(&prior, &today, 1, 2, false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].transition_kind, TransitionKind::Reactivated);
+        assert_eq!(rows[0].to_state, LifecycleState::Active);
+        assert_eq!(rows[0].from_state, Some(LifecycleState::ExpiredFromFno));
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_build_groww_audit_rows_locked_disappeared_skipped() {
+        // A locked prior row that disappears must NOT auto-expire.
+        let set = set_of(vec![]);
+        let today = groww_today_attrs(&set);
+        let mut prior = HashMap::new();
+        prior.insert(
+            (2885, "NSE_EQ".to_string()),
+            groww_prior(LifecycleState::Active, true, "EQUITY", 0, 0.0, "RELIANCE"),
+        );
+        let rows = build_groww_audit_rows(&prior, &today, 1, 2, false);
+        assert!(rows.is_empty(), "locked row must not auto-expire");
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_build_groww_lifecycle_select_sql_scopes_to_groww_feed() {
+        let sql = build_groww_lifecycle_select_sql();
+        assert!(sql.contains("FROM instrument_lifecycle"));
+        assert!(
+            sql.contains("feed = 'groww'"),
+            "must scope the prior snapshot to feed='groww'"
+        );
+        assert!(
+            sql.contains("dry_run = false"),
+            "must exclude §27 dry-run rows"
+        );
+        assert!(sql.contains("security_id"));
+        assert!(sql.contains("exchange_segment"));
+        assert!(sql.contains("lifecycle_state"));
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_parse_groww_lifecycle_dataset_well_formed_and_skips() {
+        let dataset = serde_json::json!([
+            [
+                2885, "NSE_EQ", "active", false, "EQUITY", 0, 0.0, "RELIANCE"
+            ],
+            // unknown state → skipped (counted-not-guessed).
+            [3, "NSE_EQ", "future_state", false, "EQUITY", 0, 0.0, "X"],
+            // < 8 cells → skipped.
+            [9, "NSE_EQ", "active", false],
+            // not an array → skipped.
+            "garbage"
+        ]);
+        let prior = parse_groww_lifecycle_dataset(&dataset);
+        assert_eq!(
+            prior.len(),
+            1,
+            "only the well-formed known-state row survives"
+        );
+        let attrs = prior
+            .get(&(2885, "NSE_EQ".to_string()))
+            .expect("row present");
+        assert_eq!(attrs.state, LifecycleState::Active);
+        assert_eq!(attrs.symbol_name, "RELIANCE");
+        assert!(!attrs.locked);
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_parse_groww_lifecycle_dataset_empty_and_non_array() {
+        assert!(parse_groww_lifecycle_dataset(&serde_json::json!([])).is_empty());
+        assert!(parse_groww_lifecycle_dataset(&serde_json::json!({"x": 1})).is_empty());
+    }
+
+    /// Source-scan ratchet: the Groww audit emitter MUST be degrade-safe — its
+    /// failure arms log+count+return, never panic/abort, and the `emit_*` call is
+    /// wired audit-FIRST into the persist orchestration. Scoped to the production
+    /// fn bodies so the assertion strings don't self-match.
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_groww_audit_emitter_is_degrade_safe_and_wired() {
+        let file = include_str!("shared_master_writer.rs");
+        let start = file
+            .find("async fn emit_groww_lifecycle_audit(")
+            .expect("emit fn present");
+        let end = file[start..]
+            .find(concat!("pub async f", "n persist_groww_instruments("))
+            .map(|o| start + o)
+            .expect("persist fn follows emit");
+        let emit_body = &file[start..end];
+        for banned in ["panic!(", "process::exit", "unreachable!(", "todo!("] {
+            assert!(
+                !emit_body.contains(banned),
+                "degrade-safe emit_groww_lifecycle_audit must never use {banned}"
+            );
+        }
+        // Both failure arms route through the classifier + bump the counter.
+        assert!(
+            emit_body
+                .matches("classify_persist_failure(\"lifecycle_audit\")")
+                .count()
+                >= 2,
+            "both audit failure arms must classify as lifecycle_audit/GROWW-MASTER-01"
+        );
+        assert!(
+            emit_body.contains("tv_groww_master_persist_errors_total"),
+            "audit failure arms must increment the per-stage counter"
+        );
+        // Wired audit-FIRST: the emit call precedes the lifecycle DATA UPSERT.
+        let persist_start = file
+            .find(concat!("pub async f", "n persist_groww_instruments("))
+            .expect("persist fn present");
+        let persist_body = &file[persist_start..];
+        let emit_call = persist_body
+            .find("emit_groww_lifecycle_audit(questdb")
+            .expect("emit call wired into persist");
+        let lifecycle_upsert = persist_body
+            .find("append_instrument_lifecycle_rows(")
+            .expect("lifecycle UPSERT present");
+        assert!(
+            emit_call < lifecycle_upsert,
+            "audit emission must run BEFORE the lifecycle DATA UPSERT (§24 audit-first)"
         );
     }
 
