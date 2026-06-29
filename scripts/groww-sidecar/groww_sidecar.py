@@ -36,13 +36,32 @@ Usage (auto-launched by the Rust supervisor; no manual run needed):
 """
 import glob
 import json
+import logging
 import os
 import random
 import sys
+import threading
 import time
+import traceback
 from datetime import datetime, timezone, timedelta
 
 import pyotp
+
+# DIAGNOSTIC (2026-06-29): turn ON the Groww SDK's OWN logging so the per-frame
+# decode errors it currently SWALLOWS (the bare "Error:" lines with no detail)
+# print with full context to stderr. The SDK's blocking consume() decodes
+# NATS/Protobuf internally and logs swallowed errors through the standard
+# `logging` module at DEBUG/ERROR — but only if a handler is configured. Without
+# this, those errors vanish. Routed to STDERR (the Rust supervisor captures both
+# streams) and scoped to the `growwapi` logger at DEBUG; redaction of OUR
+# credentials is unaffected because the SDK logs protocol detail, not our
+# api_key/TOTP (and the supervisor-captured stream is operator-local per lock §32).
+logging.basicConfig(
+    level=logging.DEBUG,
+    stream=sys.stderr,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logging.getLogger("growwapi").setLevel(logging.DEBUG)
 
 try:
     from growwapi import GrowwAPI, GrowwFeed
@@ -79,6 +98,20 @@ CANONICAL_INDEX_SEGMENT = "IDX_I"
 
 # How long to wait between checks for the Rust-built watch file at startup.
 WATCH_POLL_SECS = 5
+
+# Silent-feed watchdog (2026-06-29). The Groww SDK's blocking `consume()` decodes
+# NATS/Protobuf frames internally and can swallow per-frame errors (printing a bare
+# SDK-internal "Error:" line) WITHOUT raising — so our `except` never fires and we
+# sit "subscribed but 0 ticks" with no actionable cause. This watchdog runs in a
+# daemon thread: if no record is DECODED (neither emitted nor dropped) within the
+# deadline after we subscribe, it prints ONE loud, actionable diagnostic to stderr
+# (and then a quieter periodic reminder with live counts) so the operator sees the
+# real "feed silent" signal + the most-likely causes instead of staring at the
+# SDK's empty "Error:" lines. A DROP-only flow (decoded but key-map miss) is a
+# DIFFERENT, already-surfaced signal (note_drop counters), so the watchdog treats
+# decoded==0 as the silent case.
+SILENT_FEED_FIRST_WARN_SECS = 30
+SILENT_FEED_REWARN_SECS = 60
 
 # Honest-feed counters (operator 2026-06-29). EMITTED_TOTAL = records we DECODED
 # and successfully wrote as a tick; DROPPED_TOTAL = records we DECODED but had to
@@ -184,18 +217,42 @@ def _redact(text: str, secrets) -> str:
     return text
 
 
-def _exception_detail(exc, secrets, max_len: int = 600) -> str:
-    """Build a redacted, length-capped one-line detail string for `exc`.
+def _exception_detail(exc, secrets, max_len: int = 1200) -> str:
+    """Build a redacted, length-capped detail string for `exc`.
 
-    Surfaces the WHY (str(exc), HTTP status, response body) so the operator can
-    tell a credential error (auth fails) from an off-market feed reject (auth OK,
-    connect fails) — with every known secret masked and the whole thing capped.
+    Surfaces the WHY so the operator can tell a credential error (auth fails)
+    from an off-market feed reject / no-entitlement (auth OK, feed rejects) —
+    with every known secret masked and the whole thing capped.
+
+    CRITICAL (2026-06-29): the Groww SDK exceptions store their real detail in
+    `.msg` + `.code` attributes (docs/groww-ref/05-exceptions.md), NOT in
+    `str(exc)`. For `GrowwBaseException`/`GrowwFeedException`/`GrowwAPIException`
+    a bare `str(exc)` is frequently EMPTY — which is exactly why the operator saw
+    a blank message. We now read `.msg`/`.code` FIRST, fall back to `repr(exc)`
+    (never empty), and ALWAYS append the redacted, capped traceback so we can
+    never again be blind to the cause.
     """
     parts = []
+    # 1. SDK-native detail: Groww exceptions carry their message in `.msg` and an
+    #    error code in `.code` (see docs/groww-ref/05-exceptions.md). These are the
+    #    fields that are populated when `str(exc)` is empty.
+    msg = getattr(exc, "msg", None)
+    if msg:
+        parts.append(f"msg={_redact(str(msg), secrets)}")
+    code = getattr(exc, "code", None)
+    if code is not None and code != "":
+        parts.append(f"code={_redact(str(code), secrets)}")
+    # GrowwFeedNotSubscribedException carries the topic that must be subscribed.
+    topic = getattr(exc, "topic", None)
+    if topic:
+        parts.append(f"topic={_redact(str(topic), secrets)}")
+    # 2. str(exc) — may duplicate `.msg`, may be empty; include only if it adds
+    #    info (compare REDACTED-to-REDACTED so a redacted `.msg` doesn't re-appear).
     detail = _redact(str(exc), secrets)
-    if detail:
+    msg_redacted = _redact(str(msg), secrets) if msg else ""
+    if detail and detail != msg_redacted:
         parts.append(detail)
-    # Optional HTTP detail some SDK exceptions carry.
+    # 3. Optional HTTP detail some SDK exceptions carry.
     status = getattr(exc, "status_code", None)
     if status is None:
         response = getattr(exc, "response", None)
@@ -210,12 +267,11 @@ def _exception_detail(exc, secrets, max_len: int = 600) -> str:
         body = getattr(exc, "body", None)
     if body:
         parts.append(f"body={_redact(str(body), secrets)}")
-    if not parts:
-        # Fall back to the args tuple if nothing else was informative.
-        args_detail = _redact(repr(getattr(exc, "args", ())), secrets)
-        if args_detail:
-            parts.append(args_detail)
-    summary = " | ".join(parts)
+    # 4. repr(exc) is NEVER empty (it always carries the class name) — the final
+    #    guarantee that the line is never blank even if every attribute above is
+    #    empty/absent.
+    parts.append(f"repr={_redact(repr(exc), secrets)}")
+    summary = " | ".join(p for p in parts if p)
     if len(summary) > max_len:
         summary = summary[:max_len] + "…(truncated)"
     return summary or "(no detail available)"
@@ -475,6 +531,45 @@ def wait_for_subscriptions():
         time.sleep(WATCH_POLL_SECS)
 
 
+def silent_feed_watchdog(stocks: int, indices: int) -> None:
+    """Warn LOUDLY (stderr) if subscribed but NO record decodes within the deadline.
+
+    Runs as a daemon thread. The SDK's blocking `consume()` can swallow per-frame
+    decode errors without raising, leaving us "subscribed but 0 ticks" with no
+    actionable cause on stdout/stderr. This surfaces that truth: it samples the
+    DECODED total (emitted + dropped) and, if it is still 0 after the first
+    deadline, prints the most-likely causes; thereafter it re-warns periodically
+    with the live counts until data flows, then goes quiet.
+    """
+    time.sleep(SILENT_FEED_FIRST_WARN_SECS)
+    if EMITTED_TOTAL + DROPPED_TOTAL > 0:
+        return  # data is decoding — nothing to warn about.
+    print(
+        f"groww sidecar: SILENT FEED — subscribed {stocks} stocks + {indices} "
+        f"indices but received NO live records in {SILENT_FEED_FIRST_WARN_SECS}s. "
+        "Auth succeeded (token acquired) and subscribe returned, so the most "
+        "likely causes are: (1) this Groww account lacks a LIVE market-data "
+        "feed entitlement (the socket connects but streams nothing); (2) the "
+        "market is closed / pre-open for these instruments; (3) a Groww-side "
+        "feed/socket reject the SDK is swallowing internally (look for the SDK's "
+        "own 'Error:' lines above). The feed will keep retrying; it is NOT "
+        "marked streaming until a real tick arrives.",
+        file=sys.stderr,
+        flush=True,
+    )
+    while EMITTED_TOTAL + DROPPED_TOTAL == 0:
+        time.sleep(SILENT_FEED_REWARN_SECS)
+        if EMITTED_TOTAL + DROPPED_TOTAL > 0:
+            break
+        print(
+            "groww sidecar: STILL SILENT — 0 live records decoded "
+            f"(emitted={EMITTED_TOTAL}, dropped={DROPPED_TOTAL}). "
+            "See the first SILENT FEED diagnostic above for likely causes.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def main() -> None:
     api_key = os.environ.get("GROWW_API_KEY")
     totp_secret = os.environ.get("GROWW_TOTP_SECRET")
@@ -499,6 +594,13 @@ def main() -> None:
     # Count of consecutive failed cycles — drives the exponential backoff. Reset to
     # 0 after a fully successful cycle (auth OK + connected + consuming).
     consecutive_failures = 0
+    # Start the silent-feed watchdog at most ONCE (the first time we reach a
+    # successful subscribe), not per reconnect cycle — it watches the global
+    # decoded counters for the whole process lifetime.
+    watchdog_started = False
+    # Print the SDK version + the REAL feed methods available in this environment
+    # exactly ONCE (first feed-connect), not per reconnect cycle.
+    feed_introspection_printed = False
 
     # Reconnect loop — never give up (lock: not a single received tick missed).
     while True:
@@ -524,6 +626,26 @@ def main() -> None:
             phase = "feed-connect"
             groww = GrowwAPI(access_token)
             feed = GrowwFeed(groww)
+
+            # DIAGNOSTIC (2026-06-29): print the installed SDK version + the REAL
+            # public feed methods available in THIS environment, exactly once. This
+            # definitively resolves whether `subscribe_index_value` exists (vs only
+            # `subscribe_ltp` with segment="CASH" for indices) instead of guessing
+            # from the docs — `dir(feed)` is the ground truth of the running wheel.
+            if not feed_introspection_printed:
+                try:
+                    import growwapi as _growwapi_mod
+                    sdk_version = getattr(_growwapi_mod, "__version__", "unknown")
+                except Exception:  # noqa: BLE001 - introspection must never break the feed
+                    sdk_version = "unknown"
+                feed_methods = sorted(m for m in dir(feed) if not m.startswith("_"))
+                print(
+                    f"groww sidecar DIAGNOSTIC: growwapi.__version__={sdk_version} | "
+                    f"feed methods={feed_methods}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                feed_introspection_printed = True
 
             phase = "subscribe"
             # Cache the subscribe counts so the first-emit `streaming` status write
@@ -555,6 +677,18 @@ def main() -> None:
             # A full cycle succeeded up to the blocking consume — reset backoff so
             # the next genuine disconnect retries quickly, not at the capped delay.
             consecutive_failures = 0
+            # Arm the silent-feed watchdog once: if the SDK's blocking consume()
+            # streams nothing (swallowed feed reject / no entitlement / closed
+            # market), it surfaces a loud, actionable diagnostic to stderr instead
+            # of leaving the operator with only the SDK's empty "Error:" lines.
+            if not watchdog_started:
+                threading.Thread(
+                    target=silent_feed_watchdog,
+                    args=(len(stock_list), len(index_list)),
+                    name="groww-silent-feed-watchdog",
+                    daemon=True,
+                ).start()
+                watchdog_started = True
             phase = "consume"
             # HONEST-FEED FIX (2026-06-29): the optimistic pre-consume
             # write_status("streaming", …) was REMOVED. "streaming" (which flips the
@@ -583,14 +717,33 @@ def main() -> None:
             # str/repr/response, which the Rust supervisor captures from stdout
             # (security-review MEDIUM 2026-06-19). `_exception_detail` redacts the
             # api_key + TOTP secret and caps length so the cause is visible without
-            # leaking the credentials.
+            # leaking the credentials. We print to STDERR (errors belong there; the
+            # supervisor captures both) with the exception TYPE + the full redacted
+            # detail (now incl. the SDK `.msg`/`.code`, never just an empty str).
             rl_note = " [rate-limited — backing off longer]" if rate_limited else ""
             print(
                 f"groww sidecar error [{phase}]: {type(exc).__name__}: "
                 f"{_exception_detail(exc, secrets)}{rl_note} — reconnecting in "
                 f"{delay:.0f}s (attempt {consecutive_failures})",
+                file=sys.stderr,
                 flush=True,
             )
+            # Full traceback — surfaced on the FIRST failure and then every 100th so
+            # a fast-looping `consume()` that returns-then-raises can never flood the
+            # log, while the operator still always sees the real stack on the first
+            # occurrence (the deliverable that unblocks diagnosis). Redacted + capped
+            # so it can never leak the api_key / TOTP secret that an SDK frame's
+            # locals/repr might embed.
+            if consecutive_failures == 1 or consecutive_failures % 100 == 0:
+                tb = _redact(traceback.format_exc(), secrets)
+                if len(tb) > 4000:
+                    tb = tb[:4000] + "…(traceback truncated)"
+                print(
+                    f"groww sidecar error [{phase}] traceback "
+                    f"(failure #{consecutive_failures}):\n{tb}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             time.sleep(delay)
 
 
