@@ -1433,7 +1433,11 @@ fn test_all_fields_are_little_endian() {
     let result = dispatch_frame(&frame, 0).unwrap();
     match result {
         tickvault_core::parser::types::ParsedFrame::Tick(tick) => {
-            assert_eq!(tick.security_id, u64::from(security_id), "LE parsed correctly");
+            assert_eq!(
+                tick.security_id,
+                u64::from(security_id),
+                "LE parsed correctly"
+            );
         }
         other => panic!("expected Tick, got {other:?}"),
     }

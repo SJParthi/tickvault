@@ -481,7 +481,11 @@ mod stress_parser_specific {
 
             match result {
                 ParsedFrame::Tick(tick) => {
-                    assert_eq!(tick.security_id, u64::from(sid), "security_id mismatch at i={i}");
+                    assert_eq!(
+                        tick.security_id,
+                        u64::from(sid),
+                        "security_id mismatch at i={i}"
+                    );
                     assert!(
                         (tick.last_traded_price - ltp).abs() < f32::EPSILON,
                         "ltp mismatch at i={i}: expected {ltp}, got {}",
