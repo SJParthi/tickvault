@@ -2876,8 +2876,8 @@ mod tests {
     #[test]
     fn test_dedup_ring_max_values() {
         let mut ring = TickDedupRing::new(8);
-        assert!(!ring.is_duplicate(u8::MAX, u32::MAX, u32::MAX, i64::MAX));
-        assert!(ring.is_duplicate(u8::MAX, u32::MAX, u32::MAX, i64::MAX));
+        assert!(!ring.is_duplicate(u8::MAX, u64::from(u32::MAX), u32::MAX, i64::MAX));
+        assert!(ring.is_duplicate(u8::MAX, u64::from(u32::MAX), u32::MAX, i64::MAX));
     }
 
     #[test]
@@ -2888,7 +2888,7 @@ mod tests {
         let mut ring = TickDedupRing::new(8); // 256 slots
         assert!(!ring.is_duplicate(SEG_FNO, 13, today_ist_epoch_at(10, 0, 0), 1_000));
         for i in 1..=512_i64 {
-            ring.is_duplicate(SEG_FNO, (i + 100) as u32, today_ist_epoch_at(10, 0, 0), i);
+            ring.is_duplicate(SEG_FNO, (i + 100) as u64, today_ist_epoch_at(10, 0, 0), i);
         }
         let _ = ring.is_duplicate(SEG_FNO, 13, today_ist_epoch_at(10, 0, 0), 1_000);
     }
@@ -3648,7 +3648,7 @@ mod tests {
         // Operator lock 2026-06-01 §30: GIFT Nifty (sid 5024, IDX_I=0) is
         // exempt; everything else is not. Composite (sid, segment) key.
         let mut set = std::collections::HashSet::new();
-        set.insert((5024_u32, 0_u8));
+        set.insert((5024_u64, 0_u8));
         assert!(is_window_exempt(&set, 5024, 0), "GIFT Nifty exempt");
         assert!(!is_window_exempt(&set, 13, 0), "NIFTY not exempt");
         assert!(!is_window_exempt(&set, 5024, 1), "same sid, wrong segment");
@@ -4066,7 +4066,7 @@ mod tests {
         // arrivals 1 ms apart (production never has security_id == received_at).
         let base_recv = 1_700_000_000_000_000_000_i64;
         let recv = |i: i64| base_recv.wrapping_add(i.wrapping_mul(1_000_000));
-        let sec = |i: i64| (i as u32).wrapping_add(100);
+        let sec = |i: i64| (i as u64).wrapping_add(100);
         let mut ring = TickDedupRing::new(16); // 65536 slots
         // Insert many unique frames.
         for i in 0..1000_i64 {
@@ -4095,7 +4095,7 @@ mod tests {
 
     #[test]
     fn test_dedup_ring_fingerprint_max_inputs() {
-        let fp = TickDedupRing::fingerprint(u8::MAX, u32::MAX, u32::MAX, i64::MAX);
+        let fp = TickDedupRing::fingerprint(u8::MAX, u64::from(u32::MAX), u32::MAX, i64::MAX);
         assert_ne!(fp, u64::MAX);
         assert_ne!(fp, 0);
     }
@@ -4988,7 +4988,7 @@ mod tests {
     /// silently disables the canary for that index.
     #[test]
     fn test_zl_p0_2_canary_underlyings_contains_nifty_banknifty_sensex() {
-        let sids: Vec<u32> = CANARY_UNDERLYINGS.iter().map(|(sid, _)| *sid).collect();
+        let sids: Vec<u64> = CANARY_UNDERLYINGS.iter().map(|(sid, _)| *sid).collect();
         assert!(
             sids.contains(&13),
             "NIFTY (SID 13) must be a canary underlying"

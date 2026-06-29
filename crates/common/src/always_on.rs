@@ -70,7 +70,7 @@ mod tests {
 
         // After init → reflects the set (GIFT Nifty sid 5024, IDX_I=0).
         let mut set = HashSet::new();
-        set.insert((5024_u32, 0_u8));
+        set.insert((5024_u64, 0_u8));
         init_always_on_segments(set);
 
         let now = current();

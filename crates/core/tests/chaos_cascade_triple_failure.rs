@@ -92,13 +92,13 @@ fn dead_questdb_config() -> QuestDbConfig {
 
 /// Minimal NSE_EQ tick (Greeks NaN, non-F&O default), monotonic per `i` so the
 /// stream is distinguishable. Mirrors `tick_resilience::make_tick`.
-fn make_tick(id: u32, price: f32) -> ParsedTick {
+fn make_tick(id: u64, price: f32) -> ParsedTick {
     ParsedTick {
         security_id: id,
         exchange_segment_code: 1, // NSE_EQ
         last_traded_price: price,
         last_trade_quantity: 100,
-        exchange_timestamp: 1_700_000_000_u32.saturating_add(id),
+        exchange_timestamp: 1_700_000_000_u32.saturating_add(id as u32),
         received_at_nanos: 0,
         average_traded_price: price,
         volume: 1000,
@@ -213,7 +213,7 @@ fn cascade_01_triple_failure_loses_zero_durable_data() {
         }
 
         // LEG 2 — persist the parsed tick (QuestDB down → ring buffer).
-        let tick = make_tick(i as u32, 100.0 + (i % 1000) as f32);
+        let tick = make_tick(i as u64, 100.0 + (i % 1000) as f32);
         tick_writer
             .append_tick(&tick)
             .expect("append_tick must return Ok even with QuestDB down");
@@ -364,7 +364,7 @@ fn cascade_01_legs_are_independent_zero_loss_each() {
     tick_writer.set_spill_dir_for_test(spill_dir.clone());
     for i in 0..1_000u32 {
         tick_writer
-            .append_tick(&make_tick(i, 250.0 + i as f32))
+            .append_tick(&make_tick(u64::from(i), 250.0 + i as f32))
             .expect("append_tick ok while disconnected");
     }
     assert_eq!(tick_writer.ticks_dropped_total(), 0, "tick belt zero drops");

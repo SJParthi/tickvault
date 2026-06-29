@@ -208,7 +208,7 @@ mod tests {
             other => panic!("expected TickWithDepth, got {other:?}"),
         }
     }
-    fn unwrap_oi(frame: ParsedFrame) -> (u32, u8, u32) {
+    fn unwrap_oi(frame: ParsedFrame) -> (u64, u8, u32) {
         match frame {
             ParsedFrame::OiUpdate {
                 security_id,
@@ -218,7 +218,7 @@ mod tests {
             other => panic!("expected OiUpdate, got {other:?}"),
         }
     }
-    fn unwrap_prev_close(frame: ParsedFrame) -> (u32, u8, f32, u32) {
+    fn unwrap_prev_close(frame: ParsedFrame) -> (u64, u8, f32, u32) {
         match frame {
             ParsedFrame::PreviousClose {
                 security_id,
@@ -234,7 +234,7 @@ mod tests {
             other => panic!("expected PreviousClose, got {other:?}"),
         }
     }
-    fn unwrap_market_status(frame: ParsedFrame) -> (u32, u8) {
+    fn unwrap_market_status(frame: ParsedFrame) -> (u64, u8) {
         match frame {
             ParsedFrame::MarketStatus {
                 security_id,
@@ -540,7 +540,7 @@ mod tests {
         let mut buf = make_minimal_packet(RESPONSE_CODE_INDEX_TICKER, TICKER_PACKET_SIZE);
         buf[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
         let tick = unwrap_tick(dispatch_frame(&buf, 0).unwrap());
-        assert_eq!(tick.security_id, u32::MAX);
+        assert_eq!(tick.security_id, u64::from(u32::MAX));
     }
 
     #[test]

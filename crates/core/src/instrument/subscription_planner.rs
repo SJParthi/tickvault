@@ -1405,8 +1405,8 @@ mod tests {
         let mut calls = Vec::new();
         let mut puts = Vec::new();
         for (i, &strike) in strikes.iter().enumerate() {
-            let ce_id = 50100 + i as u32;
-            let pe_id = 50200 + i as u32;
+            let ce_id = 50100 + i as u64;
+            let pe_id = 50200 + i as u64;
 
             derivative_contracts.insert(
                 ce_id,
@@ -1560,8 +1560,8 @@ mod tests {
         let mut stock_calls = Vec::new();
         let mut stock_puts = Vec::new();
         for (i, &strike) in stock_strikes.iter().enumerate() {
-            let ce_id = 60100 + i as u32;
-            let pe_id = 60200 + i as u32;
+            let ce_id = 60100 + i as u64;
+            let pe_id = 60200 + i as u64;
 
             derivative_contracts.insert(
                 ce_id,
@@ -1779,8 +1779,8 @@ mod tests {
         );
 
         // Verify no duplicates by checking total equals unique count
-        let ids: Vec<u32> = plan.registry.iter().map(|i| i.security_id).collect();
-        let unique: HashSet<u32> = ids.iter().copied().collect();
+        let ids: Vec<u64> = plan.registry.iter().map(|i| i.security_id).collect();
+        let unique: HashSet<u64> = ids.iter().copied().collect();
         assert_eq!(ids.len(), unique.len(), "Duplicate security_ids in plan");
     }
 
@@ -2010,8 +2010,8 @@ mod tests {
             None,
         );
 
-        let mut ids1: Vec<u32> = plan1.registry.iter().map(|i| i.security_id).collect();
-        let mut ids2: Vec<u32> = plan2.registry.iter().map(|i| i.security_id).collect();
+        let mut ids1: Vec<u64> = plan1.registry.iter().map(|i| i.security_id).collect();
+        let mut ids2: Vec<u64> = plan2.registry.iter().map(|i| i.security_id).collect();
         ids1.sort();
         ids2.sort();
         assert_eq!(ids1, ids2, "Plans should produce identical instrument sets");
@@ -2033,8 +2033,8 @@ mod tests {
             None,
         );
 
-        let ids: Vec<u32> = plan.registry.iter().map(|i| i.security_id).collect();
-        let unique: HashSet<u32> = ids.iter().copied().collect();
+        let ids: Vec<u64> = plan.registry.iter().map(|i| i.security_id).collect();
+        let unique: HashSet<u64> = ids.iter().copied().collect();
         assert_eq!(
             ids.len(),
             unique.len(),
@@ -2072,7 +2072,7 @@ mod tests {
             },
         );
         for i in 0..3u32 {
-            let ce_id = 70100 + i;
+            let ce_id: u64 = 70100 + u64::from(i);
             universe.derivative_contracts.insert(
                 ce_id,
                 DerivativeContract {
@@ -2172,7 +2172,7 @@ mod tests {
         // 3 INFY calls, NO puts
         let mut infy_calls = Vec::new();
         for i in 0..3u32 {
-            let ce_id = 80100 + i;
+            let ce_id: u64 = 80100 + u64::from(i);
             universe.derivative_contracts.insert(
                 ce_id,
                 DerivativeContract {
@@ -2687,11 +2687,11 @@ mod tests {
         // Create 50 stocks, each with 600 options (300 CE + 300 PE)
         // Total: 50 stocks * 600 options = 30,000 + 50 futures = 30,050
         // Plus 50 equity feeds = 30,100 → exceeds MAX_TOTAL_SUBSCRIPTIONS (25,000)
-        let mut base_id: u32 = 100_000;
+        let mut base_id: u64 = 100_000;
         for stock_idx in 0..50u32 {
             let symbol = format!("STOCK{stock_idx}");
-            let underlying_id = 90_000 + stock_idx;
-            let equity_id = 80_000 + stock_idx;
+            let underlying_id = 90_000 + u64::from(stock_idx);
+            let equity_id = 80_000 + u64::from(stock_idx);
 
             underlyings.insert(
                 symbol.clone(),
@@ -3207,16 +3207,16 @@ mod tests {
         let mut expiry_calendars = HashMap::new();
 
         // Create 30 stocks with 1000 options each = 30,000 + 30 futures = 30,030
-        let mut base_id: u32 = 200_000;
+        let mut base_id: u64 = 200_000;
         for stock_idx in 0..30u32 {
             let symbol = format!("CAP{stock_idx}");
-            let equity_id = 180_000 + stock_idx;
+            let equity_id = 180_000 + u64::from(stock_idx);
 
             underlyings.insert(
                 symbol.clone(),
                 FnoUnderlying {
                     underlying_symbol: symbol.clone(),
-                    underlying_security_id: 190_000 + stock_idx,
+                    underlying_security_id: 190_000 + u64::from(stock_idx),
                     price_feed_security_id: equity_id,
                     price_feed_segment: ExchangeSegment::NseEquity,
                     derivative_segment: ExchangeSegment::NseFno,
@@ -3834,9 +3834,9 @@ mod tests {
         // Insert 1 future + 1 CE per expiry (3 expiries × 2 contracts = 6 total)
         for (i, exp) in [nearest, mid, far].iter().enumerate() {
             derivative_contracts.insert(
-                70000 + i as u32,
+                70000 + i as u64,
                 DerivativeContract {
-                    security_id: 70000 + i as u32,
+                    security_id: 70000 + i as u64,
                     underlying_symbol: "NIFTY".to_string(),
                     instrument_kind: DhanInstrumentKind::FutureIndex,
                     exchange_segment: ExchangeSegment::NseFno,
@@ -3850,9 +3850,9 @@ mod tests {
                 },
             );
             derivative_contracts.insert(
-                70010 + i as u32,
+                70010 + i as u64,
                 DerivativeContract {
-                    security_id: 70010 + i as u32,
+                    security_id: 70010 + i as u64,
                     underlying_symbol: "NIFTY".to_string(),
                     instrument_kind: DhanInstrumentKind::OptionIndex,
                     exchange_segment: ExchangeSegment::NseFno,
@@ -3910,7 +3910,7 @@ mod tests {
         // Operator-confirmed 2026-05-02: every future expiry of the 3
         // full-chain indices must be subscribed for term-structure
         // visibility. Yields ~10-11K live contracts in production.
-        let subscribed_ids: HashSet<u32> = plan.registry.iter().map(|i| i.security_id).collect();
+        let subscribed_ids: HashSet<u64> = plan.registry.iter().map(|i| i.security_id).collect();
 
         for (label, sid) in [
             ("Nearest-expiry NIFTY future", 70000_u32),
@@ -4159,7 +4159,7 @@ mod tests {
             Some(&cal),
         );
 
-        let subscribed_ids: HashSet<u32> = plan.registry.iter().map(|i| i.security_id).collect();
+        let subscribed_ids: HashSet<u64> = plan.registry.iter().map(|i| i.security_id).collect();
 
         // BOTH NEAREST FUT and NEAREST CE must be DROPPED (rolled away).
         assert!(
@@ -4804,7 +4804,7 @@ mod tests {
             None,
         );
 
-        let majors: std::collections::HashSet<u32> = plan
+        let majors: std::collections::HashSet<u64> = plan
             .registry
             .iter()
             .filter(|i| i.category == SubscriptionCategory::MajorIndexValue)

@@ -477,8 +477,8 @@ mod tests {
         let body = r#"{"dataset":[[1234,"NSE_EQ",50000],[5678,"NSE_FNO",75000]]}"#;
         let result = parse_questdb_dataset(body).unwrap();
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0], ((1234u32, 1u8), 50_000_i64));
-        assert_eq!(result[1], ((5678u32, 2u8), 75_000_i64));
+        assert_eq!(result[0], ((1234u64, 1u8), 50_000_i64));
+        assert_eq!(result[1], ((5678u64, 2u8), 75_000_i64));
     }
 
     #[test]
@@ -490,7 +490,7 @@ mod tests {
 
     #[test]
     fn test_parse_questdb_dataset_negative_security_id_errors() {
-        // u32 cannot hold a negative value — must error rather than truncate.
+        // u64 cannot hold a negative value — must error rather than truncate.
         let body = r#"{"dataset":[[-1,"NSE_EQ",50000]]}"#;
         let result = parse_questdb_dataset(body);
         assert!(matches!(result, Err(LoadError::MalformedSecurityId)));
@@ -501,7 +501,7 @@ mod tests {
         // A fresh listing or expired contract may have oi=0 — valid.
         let body = r#"{"dataset":[[1234,"NSE_EQ",0]]}"#;
         let result = parse_questdb_dataset(body).unwrap();
-        assert_eq!(result[0], ((1234u32, 1u8), 0_i64));
+        assert_eq!(result[0], ((1234u64, 1u8), 0_i64));
     }
 
     #[test]

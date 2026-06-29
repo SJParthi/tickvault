@@ -264,7 +264,7 @@ mod tests {
         // disaster-recovery doc. The stamper must handle the full
         // working set without panic and remain queryable.
         let s = PrevDayCloseStamper::new();
-        for i in 0..25_000_u32 {
+        for i in 0..25_000_u64 {
             s.get_or_stamp(i, 1, 100.0 + (i as f32) * 0.01);
         }
         assert_eq!(s.len(), 25_000);

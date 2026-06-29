@@ -515,7 +515,7 @@ mod tests {
     fn test_scan_gaps_top_n_zero_cap_returns_empty_vec_with_total_count() {
         let d = TickGapDetector::new(30);
         let t0 = Instant::now();
-        for id in 0u32..5 {
+        for id in 0u64..5 {
             d.record_tick(id, ExchangeSegment::IdxI, t0);
         }
         // Advance 60s — all 5 entries are silent.
@@ -530,7 +530,7 @@ mod tests {
         let d = TickGapDetector::new(30);
         let t0 = Instant::now();
         // Record 100 instruments silent for varying durations.
-        for id in 0u32..100 {
+        for id in 0u64..100 {
             d.record_tick(id, ExchangeSegment::IdxI, t0);
         }
         let now = t0 + Duration::from_secs(60);
@@ -583,7 +583,7 @@ mod tests {
             ExchangeSegment::BseFno,
         ];
         for (i, seg) in segments.iter().enumerate() {
-            d.record_tick(i as u32, *seg, t0);
+            d.record_tick(i as u64, *seg, t0);
         }
         let now = t0 + Duration::from_secs(60);
         let (entries, total) = d.scan_gaps_top_n(now, 10);
@@ -628,7 +628,7 @@ mod tests {
         // operator-visible "universe-wide silence" scenario.
         let d = TickGapDetector::new(30);
         let t0 = Instant::now();
-        for id in 0u32..5000 {
+        for id in 0u64..5000 {
             d.record_tick(id, ExchangeSegment::IdxI, t0);
         }
         let now = t0 + Duration::from_secs(60);

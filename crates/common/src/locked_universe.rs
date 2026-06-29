@@ -113,7 +113,7 @@ mod tests {
 
     #[test]
     fn test_locked_universe_contains_nifty_banknifty_sensex_vix() {
-        let sids: Vec<u32> = LOCKED_UNIVERSE.iter().map(|(s, _, _)| *s).collect();
+        let sids: Vec<u64> = LOCKED_UNIVERSE.iter().map(|(s, _, _)| *s).collect();
         assert!(sids.contains(&13), "NIFTY = 13 must be in LOCKED_UNIVERSE");
         assert!(
             sids.contains(&25),

@@ -30,7 +30,7 @@ use tickvault_common::types::{ExchangeSegment, FeedMode};
 // 1. Cross-segment collision counter properties
 // ============================================================================
 
-fn make_inst(security_id: u32, segment: ExchangeSegment, symbol: &str) -> SubscribedInstrument {
+fn make_inst(security_id: u64, segment: ExchangeSegment, symbol: &str) -> SubscribedInstrument {
     SubscribedInstrument {
         security_id,
         exchange_segment: segment,
@@ -48,9 +48,9 @@ fn make_inst(security_id: u32, segment: ExchangeSegment, symbol: &str) -> Subscr
 /// Proptest strategy: generate a list of (id, segment_idx) pairs where
 /// segment_idx picks one of 3 valid Dhan segments. Some pairs will
 /// collide on id, producing cross-segment collisions; others won't.
-fn id_segment_pairs_strategy() -> impl Strategy<Value = Vec<(u32, u8)>> {
+fn id_segment_pairs_strategy() -> impl Strategy<Value = Vec<(u64, u8)>> {
     // Constrain id to a small range so collisions are common.
-    prop::collection::vec((0u32..16u32, 0u8..3u8), 0..32)
+    prop::collection::vec((0u64..16u64, 0u8..3u8), 0..32)
 }
 
 fn segment_from_byte(b: u8) -> ExchangeSegment {
@@ -79,7 +79,7 @@ proptest! {
         let registry = InstrumentRegistry::from_instruments(instruments);
 
         // Compute expected collision count: count ids that appear in >1 segment.
-        let mut id_to_segments: std::collections::HashMap<u32, std::collections::HashSet<ExchangeSegment>> =
+        let mut id_to_segments: std::collections::HashMap<u64, std::collections::HashSet<ExchangeSegment>> =
             std::collections::HashMap::new();
         for &(id, seg) in &seen {
             id_to_segments.entry(id).or_default().insert(seg);
@@ -164,7 +164,7 @@ proptest! {
         }
         let registry = InstrumentRegistry::from_instruments(instruments);
 
-        let iterated: std::collections::HashSet<(u32, ExchangeSegment)> =
+        let iterated: std::collections::HashSet<(u64, ExchangeSegment)> =
             registry.iter().map(|i| (i.security_id, i.exchange_segment)).collect();
         prop_assert_eq!(iterated, seen);
     }

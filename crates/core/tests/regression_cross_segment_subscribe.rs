@@ -21,7 +21,7 @@ use tickvault_core::websocket::subscription_builder::build_subscription_messages
 use tickvault_core::websocket::types::InstrumentSubscription;
 
 fn make_instrument(
-    security_id: u32,
+    security_id: u64,
     segment: ExchangeSegment,
     symbol: &str,
     category: SubscriptionCategory,

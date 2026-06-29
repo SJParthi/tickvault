@@ -312,7 +312,7 @@ mod tests {
         let _ = init_global();
         // First observation today returns true; second false.
         // Use a security_id unlikely to collide with other tests.
-        let sid = 999_999u32;
+        let sid = 999_999u64;
         let seg = ExchangeSegment::NseFno;
         let first = try_insert_global(sid, seg);
         let second = try_insert_global(sid, seg);

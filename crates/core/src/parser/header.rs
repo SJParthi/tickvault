@@ -93,7 +93,7 @@ mod tests {
     fn test_parse_header_max_security_id() {
         let buf = make_header(RESPONSE_CODE_TICKER, 16, 0, u32::MAX);
         let hdr = parse_header(&buf).unwrap();
-        assert_eq!(hdr.security_id, u32::MAX);
+        assert_eq!(hdr.security_id, u64::from(u32::MAX));
     }
 
     #[test]

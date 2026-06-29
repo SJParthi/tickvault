@@ -299,7 +299,7 @@ mod stress_subscription_builder {
 
     fn make_instruments(count: usize) -> Vec<InstrumentSubscription> {
         (0..count)
-            .map(|i| InstrumentSubscription::new(ExchangeSegment::NseFno, (50000 + i) as u32))
+            .map(|i| InstrumentSubscription::new(ExchangeSegment::NseFno, (50000 + i) as u64))
             .collect()
     }
 
@@ -481,7 +481,7 @@ mod stress_parser_specific {
 
             match result {
                 ParsedFrame::Tick(tick) => {
-                    assert_eq!(tick.security_id, sid, "security_id mismatch at i={i}");
+                    assert_eq!(tick.security_id, u64::from(sid), "security_id mismatch at i={i}");
                     assert!(
                         (tick.last_traded_price - ltp).abs() < f32::EPSILON,
                         "ltp mismatch at i={i}: expected {ltp}, got {}",
@@ -505,7 +505,7 @@ mod stress_parser_specific {
 
             match result {
                 ParsedFrame::Tick(tick) => {
-                    assert_eq!(tick.security_id, sid);
+                    assert_eq!(tick.security_id, u64::from(sid));
                     assert!(
                         (tick.last_traded_price - ltp).abs() < f32::EPSILON,
                         "ltp mismatch at i={i}"
@@ -732,7 +732,7 @@ mod stress_cross_component {
             let result = dispatch_frame(&packet, 0).unwrap();
             match result {
                 ParsedFrame::Tick(tick) => {
-                    assert_eq!(tick.security_id, sid);
+                    assert_eq!(tick.security_id, u64::from(sid));
                 }
                 other => panic!("expected Tick, got {other:?} for sid={sid}"),
             }

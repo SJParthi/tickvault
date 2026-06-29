@@ -296,8 +296,8 @@ mod tests {
     #[test]
     fn test_reasonable_memory_bound_at_25k_entries() {
         let t = VolumeDeltaTracker::new();
-        for i in 0..25_000_u32 {
-            t.record_tick(i, 1, 100 + i);
+        for i in 0..25_000_u64 {
+            t.record_tick(i, 1, 100 + i as u32);
         }
         assert_eq!(t.len(), 25_000);
         assert_eq!(t.get_last_seen(0, 1), Some(100));

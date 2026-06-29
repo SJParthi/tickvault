@@ -671,12 +671,12 @@ mod tests {
 
         // The exact (security_id, segment) set must match — this is the
         // I-P1-11 composite identity that the WS dispatcher subscribes.
-        let mut set_a: Vec<(u32, ExchangeSegment)> = plan_a
+        let mut set_a: Vec<(u64, ExchangeSegment)> = plan_a
             .registry
             .iter()
             .map(|i| (i.security_id, i.exchange_segment))
             .collect();
-        let mut set_b: Vec<(u32, ExchangeSegment)> = plan_b
+        let mut set_b: Vec<(u64, ExchangeSegment)> = plan_b
             .registry
             .iter()
             .map(|i| (i.security_id, i.exchange_segment))
