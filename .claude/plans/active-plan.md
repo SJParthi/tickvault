@@ -1,160 +1,170 @@
-# Implementation Plan: Honest Groww feed status — market-closed idle ≠ "auth rejected"
+# Implementation Plan: Durable fix for the false "auth rejected — refresh the Groww SSM api-key" RED
 
 **Status:** APPROVED
 **Date:** 2026-06-29
-**Approved by:** Parthiban (operator) — grounded directive, this session (the
-Feed Control page showed a CONNECTED+SUBSCRIBED-but-market-closed Groww feed as
-"auth rejected — refresh the Groww SSM api-key · not connected · DOWN", sending
-the operator to chase a non-existent SSM-key problem at 22:30 IST).
+**Approved by:** Parthiban (operator) — grounded directive, this session (audit-driven, code-cited)
+
+Crates touched: **tickvault-common** (`crates/common/src/feed_health.rs`,
+`crates/common/src/market_hours.rs`), **tickvault-api**
+(`crates/api/src/handlers/feeds.rs`), **tickvault-app**
+(`crates/app/src/groww_sidecar_supervisor.rs`, `crates/app/src/main.rs`).
+
+PR #1260 only partially fixed the recurring false "auth rejected — refresh the
+Groww SSM api-key" RED. A deep audit found it can still recur via THREE paths.
+This plan fixes all three durably, contained to the feed-health / status-display
+layer — NOTHING touches ticks / dedup / persist / orders.
+
+## Plan Items
+
+- [ ] **HIGH-1 — trading-day-aware market-closed gate.** The `/feeds` health
+  market-closed bypass uses **time-of-day-only** `is_within_market_hours_ist()`,
+  which returns `true` inside [09:00,15:30) on a Saturday/Sunday/NSE holiday →
+  the market-closed-idle bypass never fires → a latched `auth_rejected`
+  re-surfaces the false RED. Fix: thread a **trading-day-aware** market-open
+  decision into the verdict. Install a global `TradingCalendar` handle in
+  `common::market_hours` (mirrors the `core::websocket::connection`
+  `set_market_calendar` `OnceLock` precedent, but in `common` so the api crate
+  can read it) + a `is_trading_session_now()` free fn = weekday-gated
+  `is_within_trading_session_ist()` AND `calendar.is_trading_day_today()`
+  (falls back to the weekday-only gate when no calendar is installed). The
+  `/feeds` handler computes `market_open` from it. `main.rs` installs the
+  calendar at boot.
+  - Files: `crates/common/src/market_hours.rs`, `crates/api/src/handlers/feeds.rs`, `crates/app/src/main.rs`
+  - Tests: `weekend_or_holiday_is_not_trading_session_when_calendar_installed`, `trading_session_now_falls_back_to_weekday_gate_when_no_calendar`, `set_market_calendar_for_session_is_idempotent`
+
+- [ ] **HIGH-2 — non-tick recovery edge for `auth_rejected`.** Today the ONLY
+  mid-session clear is a real persisted tick (`record_tick`/`record_ticks(n>0)`);
+  in a legitimately tick-silent window a stale `auth_rejected` latches for the
+  whole session. Fix: add a public `FeedHealthRegistry::clear_auth_rejected(feed)`
+  edge-triggered clear (reusing the existing private
+  `clear_auth_rejected_on_recovery`), and call it from the sidecar supervisor on
+  a confirmed `Streaming` line (`groww auth OK` / NDJSON append) — a genuine
+  non-tick "the alert is over" recovery edge. The no-false-OK rule is preserved:
+  a 0-row flush still does NOT clear; only a real streaming/auth-OK signal does.
+  - Files: `crates/common/src/feed_health.rs`, `crates/app/src/groww_sidecar_supervisor.rs`
+  - Tests: `test_registry_clear_auth_rejected_clears_when_set`, `test_registry_clear_auth_rejected_is_noop_when_clear`, `streaming_class_clears_auth_rejected` (supervisor)
+
+- [ ] **MEDIUM (root) — generic `Error` class must NOT set `auth_rejected`.** The
+  sidecar stderr classifier routes a non-auth NATS/SDK reconnect line or a
+  recovered `traceback`/`error:` into the generic `Error` class, which shared the
+  SAME `auth_rejected` bit as a real credential reject → "refresh the api-key" RED
+  for a non-auth condition. Fix: add `SidecarLineClass::sets_auth_rejected()`
+  (true ONLY for `AuthRejected` + `EntitlementRejected`); the supervisor sets
+  `auth_rejected` ONLY when that predicate is true. `Error` keeps its `error!`
+  log + (via the existing `triggers_alert`) its visibility, but no longer latches
+  the actionable auth RED. This is the root that makes the whole false-auth
+  family possible.
+  - Files: `crates/app/src/groww_sidecar_supervisor.rs`
+  - Tests: `error_class_does_not_set_auth_rejected`, `auth_and_entitlement_classes_set_auth_rejected`, `sets_auth_rejected_predicate_matches_only_hard_reject_classes`
 
 ## Design
 
-The `/feeds` page health line is assembled by `feeds_page.rs` JS from
-`GET /api/feeds/health`, which serialises the `FeedHealthRegistry` snapshot
-(`crates/api/src/handlers/feeds.rs`). The snapshot's verdict + reason come from
-the pure classifier `classify()` in `crates/common/src/feed_health.rs`. Two
-independent fields combine into the operator's contradictory line:
+The defect family lives entirely in the **status-display verdict layer**. The
+real-time tick/dedup/persist/order paths are untouched. Three precise edits:
 
-1. **`auth_rejected=true` wins over market-closed.** `classify()` checks
-   `auth_rejected` (→ `Down("auth rejected — refresh the Groww SSM api-key")`,
-   `feed_health.rs:173`) BEFORE the market-closed gate (`:189`). The flag is set
-   `true` by the sidecar-stderr text classifier
-   (`groww_sidecar_supervisor.rs:511` via `classify_sidecar_line`) — a heuristic
-   substring match, not a real HTTP non-200. So a benign sidecar line latches the
-   flag, and once latched outside market hours nothing clears it (the
-   `record_ticks`-clears-on-recovery path can't fire when no tick can flow).
-   Result: a feed that authed (`auth OK`) + subscribed (767) is shown DOWN with
-   "refresh the SSM api-key" at 22:30 IST, market closed.
+1. **Trading-day-aware `market_open`** (HIGH-1). The `feed_health` verdict is a
+   pure function that already takes a `market_open: bool`. The bug is that the
+   caller computes that bool from a time-of-day-only helper. We make the caller
+   compute it from a **trading-day-aware** helper. Holiday awareness needs a
+   `TradingCalendar`, which lives in `common`; the api handler has no calendar
+   handle. We add a global `OnceLock<Arc<TradingCalendar>>` in
+   `common::market_hours` + `is_trading_session_now()` (weekday gate AND
+   `is_trading_day_today()`), installed once by `main.rs` at boot. The verdict
+   logic in `feed_health.rs` is unchanged — only its `market_open` input becomes
+   honest. Reuse over duplication: `is_within_trading_session_ist()` (the
+   existing weekday gate) is the fallback and the base of the new fn.
 
-   **Fix (this plan):** move the **market-closed gate ABOVE the `auth_rejected`
-   check** in `classify()`. Outside market hours no auth is attempted and no tick
-   can flow, so a latched `auth_rejected` is *unverifiable stale state*, not a
-   live confirmed rejection — surfacing it then is a false-RED (the mirror of the
-   no-false-OK rule). This is identical in spirit to the existing C1 fix that
-   already placed the market-closed gate above the `connected`/`last_tick` checks.
-   During market hours the `auth_rejected` check still fires exactly as before
-   (every existing market-hours auth-rejected test uses `market_open: true`).
+2. **Non-tick clear edge** (HIGH-2). `auth_rejected` is an `AtomicBool` per feed.
+   The existing private `clear_auth_rejected_on_recovery` is the exact
+   edge-triggered (`load` → single `compare_exchange true→false`) primitive we
+   need; we expose a thin public `clear_auth_rejected(feed)` over it and call it
+   on a `Streaming` sidecar line — the genuine non-tick recovery signal.
 
-2. **"not connected · subscribed 767" self-contradiction.** `connected` reflects
-   STREAMING (`groww_bridge.rs:1070` sets it to `streaming_observed`), which is
-   only true once a tick flips the sidecar status to `streaming`. With the market
-   closed no tick arrives, so `connected=false` while `set_subscribed(767)` fired.
-   The page JS (`feeds_page.rs:244`) prints a blunt "not connected" next to
-   "subscribed 767".
-
-   **Fix (this plan):** in the page JS, when a feed has a subscribe proof
-   (`subscribed_total > 0`) but is not yet streaming (`!connected`), render
-   "connected · awaiting first tick" instead of "not connected" — a successful
-   subscribe IS proof the socket was connected (you cannot subscribe without a
-   live socket). "not connected" is shown only when there is NO subscribe proof
-   AND `!connected`. No new field, no API change — derived from the two existing
-   `connected` + `subscribed_total` fields already in the health row.
-
-Net operator-facing result for the reported scenario (Groww authed + subscribed
-767, market closed):
-- Before: `DOWN` · "auth rejected — refresh the Groww SSM api-key · not connected
-  · subscribed 767 · no tick yet · 0 ticks".
-- After: `LIVE` (verdict Ok, market-closed idle) · "market closed — idle is normal
-  · connected · subscribed 767 · awaiting first tick · 0 ticks".
-
-"auth rejected — refresh the Groww SSM api-key" now appears ONLY during market
-hours (when auth is actually exercisable), never as a default for market-closed
-silence.
+3. **Split visibility-alert from the auth latch** (MEDIUM). `triggers_alert`
+   currently means BOTH "fire Telegram" AND "latch auth_rejected". We split the
+   second meaning into `sets_auth_rejected()` (only hard auth/entitlement reject
+   classes). `Error` stays an alert (Telegram + `error!`) but stops latching the
+   actionable auth RED.
 
 ## Edge Cases
 
-- **Market OPEN + real auth rejection:** unchanged — `auth_rejected` check still
-  runs (it is now second, after the market-closed gate which is false during
-  market hours), so a genuine rejection during trading still shows the actionable
-  Down. All existing market-hours auth-rejected tests (`market_open: true`) pass.
-- **Disabled feed:** `Disabled` still wins (checked first, before market-closed).
-- **Not started / not instrumented:** still win (checked before market-closed and
-  before auth_rejected — order preserved for those; only the auth_rejected vs
-  market-closed pair swaps).
-- **Drops present + market closed:** the `drops_total > 0 → Degraded` check stays
-  ABOVE the market-closed gate (a real drop today is surfaced post-close by
-  design); only the auth_rejected check moves below it.
-- **Page: connected + subscribed:** shows "connected" (subscribe branch only
-  rewrites the `!connected` case).
-- **Page: not connected + no subscribe proof:** still shows "not connected"
-  (e.g. Dhan OFF: "switched off by operator · not connected · no tick yet").
-- **Page: subscribed but disconnected DURING market hours:** verdict is the
-  real Down (auth-rejected or "disconnected — reconnecting" / "no ticks yet"),
-  and the line reads "<down reason> · connected · awaiting first tick" — the
-  "connected" here means "did subscribe (socket was up)"; the DOWN reason already
-  tells the operator it is not streaming, so no false-OK (the badge is RED).
+- Boot before `set_market_calendar_for_session` is installed (e.g. unit tests,
+  or the brief boot window): `is_trading_session_now()` falls back to the
+  weekday-only gate (still kills the dominant ~104 weekend days/year; holidays
+  covered once installed). No panic, no false RED worse than today.
+- `TEST_FORCE_IN_MARKET_HOURS` set: `is_trading_session_now()` honours it
+  (returns `true`) so existing market-hours tests keep working.
+- A 0-row Groww flush during a silent window: `record_ticks(0)` is still a no-op;
+  the `Streaming` clear edge fires only on a real `groww auth OK`/NDJSON-append
+  line, never on an empty flush (no false recovery — audit Rule 11).
+- A real hard auth reject (`error [auth]`) followed by a benign `Streaming` line
+  while the credential is genuinely dead: the sidecar only prints `groww auth OK`
+  AFTER a successful re-auth, so clearing on it is correct; if the credential is
+  truly dead the sidecar prints the auth-reject line again (re-latch). Edge-safe.
+- Idempotent calendar install: second `set_*` call returns `false` (OnceLock),
+  logged, no effect.
+- Holiday that is ALSO a weekend: `is_trading_day_today()` returns false for both
+  — no double-counting, single false-path closed.
 
 ## Failure Modes
 
-- Pure classifier reorder + pure page-JS string derivation — no I/O, no new
-  state, no schema, no config, no allocation on any hot path. The classifier is
-  O(1) and called only from the cold `/api/feeds/health` read path.
-- If the market-hours helper ever misreports (e.g. clock skew), worst case is the
-  same as today's behaviour for that window (it already gates `connected` checks);
-  no new failure introduced.
-- Page JS is XSS-safe by construction (textContent only) — the new branch adds
-  only static strings.
+- Calendar `OnceLock` not installed → fallback weekday gate (degraded, not
+  broken; never a worse false-RED than the pre-PR state).
+- `clear_auth_rejected` racing a re-set from a concurrent hard reject → the
+  `compare_exchange` loses via `Err` and the re-set wins (the credential really
+  is bad) — the correct outcome.
+- `sets_auth_rejected()` mis-classification → covered by unit tests pinning every
+  class; a regression that makes `Error` latch again fails the build.
+- No new allocation, no new lock on any hot path (all changes are cold-path
+  status/display + supervisor stderr drain).
 
 ## Test Plan
 
-`cargo test -p tickvault-common feed_health` (classifier):
-- NEW `test_market_closed_idle_wins_over_stale_auth_rejected` — `auth_rejected:
-  true, market_open: false` → verdict `Ok`, reason "market closed — idle is
-  normal" (the operator's exact scenario). Pins the new ordering.
-- Existing `test_auth_rejected_is_down_with_refresh_message`,
-  `test_auth_rejected_wins_over_disconnected_during_market` (both `market_open:
-  true`) still pass — auth-rejected during market hours unchanged.
-- Existing `test_ok_when_market_closed_and_silent`,
-  `test_disabled_wins_over_auth_rejected` still pass.
-
-`cargo test -p tickvault-api feeds_page` (page render):
-- NEW `test_feeds_page_subscribed_implies_connected_when_not_streaming` — the
-  rendered HTML carries the "awaiting first tick" wording + the
-  `subscribed_total` / `connected` derivation, so a subscribed-but-not-streaming
-  feed is not shown a blunt "not connected".
+Pure functions make every fix testable without a live feed:
+- `common/feed_health.rs` unit tests: `clear_auth_rejected` clears-when-set and
+  is-noop-when-clear (no false recovery).
+- `common/market_hours.rs` unit tests: weekend/holiday → not a trading session
+  when a calendar is installed; weekday fallback when none; idempotent install.
+- `app/groww_sidecar_supervisor.rs` unit tests: `Error` does NOT set
+  auth_rejected; `AuthRejected`/`EntitlementRejected` DO; `sets_auth_rejected`
+  predicate matches only the hard-reject classes; `Streaming` clears.
+- Run `cargo test -p tickvault-common`, `-p tickvault-api`, `-p tickvault-app`
+  (the touched crates) all clean. Run `bash .claude/hooks/banned-pattern-scanner.sh`
+  + `bash .claude/hooks/pub-fn-test-guard.sh "$PWD" all`. Do NOT trip
+  `crates/storage/tests/error_level_meta_guard.rs` (no flush/persist phrase
+  downgraded — `Error` stays `error!`).
 
 ## Rollback
 
-Two contained changes (a statement reorder in `feed_health.rs::classify` + a
-string-derivation branch in the `feeds_page.rs` HTML JS) + tests. Revert the
-single commit (`git revert <sha>`) restores the exact prior behaviour. No schema,
-no config, no migration, no data, no API contract change. No feature flag needed
-(a bug fix that makes the existing fields honest).
+Each fix is independent and contained to the display layer. To roll back:
+revert the single PR. No schema change, no migration, no data path touched, so a
+revert is byte-safe — the system returns to the pre-PR (#1261) behaviour with the
+known false-RED, never to a worse state. The global calendar `OnceLock` is
+install-once and read-only; reverting simply stops installing it and the verdict
+falls back to the time-of-day gate.
 
 ## Observability
 
-No new counter / log / Telegram. The fix's EFFECT is already observable — the
-`/feeds` page re-reads the live snapshot each 5s refresh and the verdict + reason
-recompute. The existing `GrowwSidecarRejected` Telegram event (the SET edge) is
-untouched, so a REAL market-hours rejection still pages exactly as before. The
-`auth_rejected` AtomicBool still latches/clears via the existing set + recovery
-paths; this only changes how a latched flag is PRESENTED when the market is
-closed.
+- No new `error!` codes needed — this is a status-display correctness fix.
+- The `/feeds` health row already echoes `auth_rejected`, `verdict`, `reason`,
+  `market_open` — those become honest (the operator literally sees
+  `market_open=false` + `verdict=ok` on weekends/holidays instead of the false
+  Down). The existing `GrowwSidecarRejected` Telegram still fires for hard
+  rejects; the generic `Error` keeps its `error!` log (5-sink → CloudWatch) but
+  no longer pages "refresh the api-key".
+- Honest envelope: after this PR the actionable "auth rejected — refresh the
+  Groww SSM api-key" Down appears ONLY on a confirmed auth/entitlement reject
+  DURING an actual trading session, and self-clears on a confirmed re-auth /
+  streaming edge without needing a tick — 100% inside the tested verdict
+  envelope, ratcheted by the unit tests above.
 
-## Per-Item Guarantee Matrix
+## Scenarios
 
-See `.claude/rules/project/per-wave-guarantee-matrix.md` — all 15 rows of the
-100% guarantee matrix and all 7 rows of the resilience demand matrix apply.
-Specifics:
-- 100% code coverage: new unit tests cover the new ordering branch + the page
-  derivation; existing tests pin the unchanged market-hours behaviour.
-- 100% testing coverage: unit (classifier) + render-string (page).
-- 100% code performance / O(1): classifier stays a branch sequence over a
-  `Copy` struct — O(1), zero-alloc; the page change is static-string assembly.
-- Uniqueness + dedup: untouched (per-feed slot by `Feed::index()`).
-- Real-time proof: `/feeds` snapshot recomputes the verdict each refresh.
-- Zero ticks lost / WS / QuestDB / hot path: NONE touched — this is cold
-  control-plane status presentation only.
-
-### Honest 100% claim
-
-100% inside the tested envelope, with ratcheted regression coverage: outside
-market hours a (possibly stale) `auth_rejected` flag no longer produces a
-false-RED "refresh the SSM api-key" Down — the market-closed idle verdict wins,
-proven by `feed_health` unit tests; during market hours a genuine rejection still
-shows the actionable Down unchanged (existing tests, `market_open: true`); a
-subscribed-but-not-yet-streaming feed reads "connected · awaiting first tick"
-instead of a self-contradictory "not connected · subscribed 767". Beyond the
-envelope (a clock-skew that misreports market hours), behaviour degrades to
-today's existing market-hours-gated behaviour for that window — no new failure
-mode.
+| # | Scenario | Expected |
+|---|----------|----------|
+| 1 | Saturday 11:00 IST, latched auth_rejected, calendar installed | verdict=Ok, reason="market closed — idle is normal" |
+| 2 | NSE holiday 11:00 IST, latched auth_rejected, calendar installed | verdict=Ok (not trading day) |
+| 3 | Weekday 11:00 IST, genuine auth reject | verdict=Down, "auth rejected — refresh the Groww SSM api-key" |
+| 4 | Benign NATS reconnect `error:` line during market hours | Error class: error! log + Telegram, but auth_rejected NOT set → no false RED |
+| 5 | Stale auth_rejected, then `groww auth OK` streaming line, no tick yet | auth_rejected cleared (non-tick recovery edge) |
+| 6 | No calendar installed (boot window / tests), Saturday | falls back to weekday gate → not a trading session |

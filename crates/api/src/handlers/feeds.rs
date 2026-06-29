@@ -292,7 +292,14 @@ fn now_ist_nanos() -> i64 {
 /// update. Behind the same bearer auth as the other `/api/feeds` routes.
 // TEST-EXEMPT: covered by #[tokio::test] test_get_feeds_health_one_row_per_feed_and_reflects_registry (the pub-fn-test-guard greps #[test] files only, not #[tokio::test]).
 pub async fn get_feeds_health(State(state): State<SharedAppState>) -> Json<FeedsHealthResponse> {
-    let market_open = tickvault_common::market_hours::is_within_market_hours_ist();
+    // Trading-day-aware (weekend + NSE-holiday gated), NOT time-of-day-only.
+    // On a Saturday/Sunday/holiday inside the 09:00–15:30 clock window the old
+    // `is_within_market_hours_ist()` read `true`, so the verdict's
+    // market-closed-idle bypass never fired and a stale `auth_rejected` flag
+    // re-surfaced the false "refresh the SSM api-key" Down.
+    // `is_trading_session_now()` closes that hole (weekend gate + the
+    // boot-installed TradingCalendar).
+    let market_open = tickvault_common::market_hours::is_trading_session_now();
     let now = now_ist_nanos();
     let registry = state.feed_health();
     let runtime = state.feed_runtime();

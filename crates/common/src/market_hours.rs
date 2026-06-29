@@ -24,10 +24,92 @@
 //! never reads it. Callers that already define their own `TEST_FORCE_*`
 //! atomic should migrate to [`set_test_force_in_market_hours`].
 
+use std::sync::{Arc, OnceLock};
+
 use crate::constants::{
     IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST,
     TICK_PERSIST_START_SECS_OF_DAY_IST,
 };
+use crate::trading_calendar::TradingCalendar;
+
+/// Global process-wide trading-calendar handle, installed ONCE at boot via
+/// [`set_market_calendar_for_session`]. When present, [`is_trading_session_now`]
+/// uses it to treat NSE holidays (not just weekends) as market-closed. When
+/// absent (unit tests, or the brief boot window before install), the helper
+/// falls back to the weekday-only [`is_within_trading_session_ist`] gate.
+///
+/// Mirrors the `tickvault_core::websocket::connection` `MARKET_CALENDAR`
+/// `OnceLock` precedent, but lives in `common` so the api crate's `/feeds`
+/// health handler — which has no calendar handle threaded through `AppState`
+/// — can ask the trading-day-aware question without a wider refactor.
+static SESSION_CALENDAR: OnceLock<Arc<TradingCalendar>> = OnceLock::new();
+
+/// Install the process-wide trading calendar so [`is_trading_session_now`] is
+/// holiday-aware. Idempotent: returns `true` on the first install and `false`
+/// on every subsequent attempt (the `OnceLock` keeps the first value).
+///
+/// Called once from boot (`main.rs`). Read-only thereafter — no per-tick cost.
+// TEST-EXEMPT: covered by `set_market_calendar_for_session_is_idempotent` + `trading_session_now_uses_installed_calendar_for_holidays` below (the OnceLock can only be installed once per test binary, so these own the install).
+pub fn set_market_calendar_for_session(calendar: Arc<TradingCalendar>) -> bool {
+    SESSION_CALENDAR.set(calendar).is_ok()
+}
+
+/// The trading-day-aware "is the market open RIGHT NOW?" answer used by the
+/// `/feeds` live-feed health verdict.
+///
+/// Returns `true` ONLY when the IST wall-clock is inside `[09:00, 15:30)` AND
+/// today is an actual NSE trading day:
+/// - If a calendar was installed via [`set_market_calendar_for_session`], today
+///   must be a trading day per [`TradingCalendar::is_trading_day_today`] (covers
+///   weekends AND NSE weekday holidays).
+/// - If no calendar is installed yet, falls back to the weekday-only
+///   [`is_within_trading_session_ist`] gate (still closes the dominant ~104
+///   weekend days/year; holidays become covered once the calendar installs).
+///
+/// # Why (feed-health false-RED fix, 2026-06-29)
+/// The `/feeds` page previously computed "market open" from the time-of-day-only
+/// [`is_within_market_hours_ist`], so on a Saturday/Sunday/holiday inside the
+/// 09:00–15:30 clock window it read `true` — the market-closed-idle bypass never
+/// fired and a stale `auth_rejected` flag re-surfaced the false "refresh the SSM
+/// api-key" Down. Gating on the trading day closes that hole.
+///
+/// # Complexity
+/// O(1): one relaxed atomic load (`OnceLock::get`) + one
+/// [`is_within_trading_session_ist`] call (+ one `is_trading_day_today` map
+/// lookup when a calendar is installed). Cold path — called per `/feeds`
+/// request only.
+///
+/// # Test override
+/// Honours `TEST_FORCE_IN_MARKET_HOURS` (via the inner helpers) so existing
+/// market-hours tests keep working.
+#[must_use]
+#[inline]
+pub fn is_trading_session_now() -> bool {
+    // If a calendar is installed, the trading-day answer is its real-clock
+    // `is_trading_day_today` (covers weekends AND NSE weekday holidays). No
+    // calendar → `None`, and the pure combiner falls back to the weekday-only
+    // in-session gate.
+    let calendar_trading_day_today = SESSION_CALENDAR.get().map(|c| c.is_trading_day_today());
+    combine_trading_session(is_within_trading_session_ist(), calendar_trading_day_today)
+}
+
+/// Pure combiner for [`is_trading_session_now`] — unit-testable without a clock.
+///
+/// `in_weekday_session` is the time-of-day + weekday gate
+/// ([`is_within_trading_session_ist`]). `calendar_trading_day_today` is
+/// `Some(is_trading_day)` when a calendar is installed, `None` otherwise.
+///
+/// Open ⇔ in the weekday session AND (no calendar OR the calendar says today is
+/// a trading day). A calendar that says "today is a holiday" forces closed even
+/// inside the weekday clock window — the exact false-RED hole this closes.
+#[must_use]
+#[inline]
+fn combine_trading_session(
+    in_weekday_session: bool,
+    calendar_trading_day_today: Option<bool>,
+) -> bool {
+    in_weekday_session && calendar_trading_day_today.unwrap_or(true)
+}
 
 /// Test-only override: force `is_within_market_hours_ist()` to return the
 /// set value regardless of wall-clock.
@@ -298,6 +380,114 @@ mod tests {
             src.contains("chrono::Weekday::Sat | chrono::Weekday::Sun"),
             "is_within_trading_session_ist must guard against Sat/Sun"
         );
+    }
+
+    // ----- is_trading_session_now + combine_trading_session (feed-health
+    //        trading-day-aware gate, 2026-06-29) -----------------------------
+    // pub-fn-test-guard one-liner: these tests exercise is_trading_session_now + combine_trading_session across every calendar state.
+
+    /// The pure combiner: open ⇔ in the weekday session AND (no calendar OR the
+    /// calendar says today is a trading day). This is the deterministic,
+    /// clock-free heart of `is_trading_session_now`.
+    #[test]
+    fn combine_trading_session_truth_table() {
+        // No calendar installed → falls back to the weekday-session bool.
+        assert!(
+            combine_trading_session(true, None),
+            "weekday session, no cal → open"
+        );
+        assert!(
+            !combine_trading_session(false, None),
+            "outside weekday session, no cal → closed"
+        );
+        // Calendar present + today IS a trading day → mirrors the session bool.
+        assert!(
+            combine_trading_session(true, Some(true)),
+            "session + trading day → open"
+        );
+        assert!(
+            !combine_trading_session(false, Some(true)),
+            "trading day but outside session → closed"
+        );
+        // Calendar present + today is NOT a trading day (weekend/holiday) →
+        // forced CLOSED even inside the weekday clock window. This is the exact
+        // hole the fix closes: a holiday at 11:00 IST must read closed so the
+        // market-closed-idle bypass fires and a stale auth_rejected stays calm.
+        assert!(
+            !combine_trading_session(true, Some(false)),
+            "holiday/weekend per calendar must force closed even mid-window"
+        );
+        assert!(!combine_trading_session(false, Some(false)));
+    }
+
+    /// `is_trading_session_now()` returns a bool without panic (real clock).
+    #[test]
+    fn trading_session_now_returns_bool_without_panic() {
+        let _ = is_trading_session_now();
+    }
+
+    /// When NO calendar is installed, `is_trading_session_now()` must equal the
+    /// weekday-only `is_within_trading_session_ist()` fallback — never a worse
+    /// false-RED than today's weekday gate. (This test binary may or may not
+    /// have had a calendar installed by `set_market_calendar_for_session_*`; we
+    /// only assert the fallback identity holds when the calendar is absent.)
+    #[test]
+    fn trading_session_now_falls_back_to_weekday_gate_when_no_calendar() {
+        set_test_force_in_market_hours(false);
+        if SESSION_CALENDAR.get().is_none() {
+            assert_eq!(
+                is_trading_session_now(),
+                is_within_trading_session_ist(),
+                "no calendar → must mirror the weekday-only gate"
+            );
+        }
+    }
+
+    /// Install the session calendar ONCE (this test owns the `OnceLock` per
+    /// binary) and prove (a) the install is idempotent, and (b) a calendar that
+    /// reports today as a non-trading day forces `is_trading_session_now` closed
+    /// even when the in-hours weekday gate is forced true. This is the
+    /// holiday/weekend false-RED fix end-to-end.
+    #[test]
+    fn set_market_calendar_for_session_is_idempotent_and_gates_holidays() {
+        use crate::config::TradingConfig;
+        let cfg = TradingConfig {
+            market_open_time: "09:00:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "15:30:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![],
+            muhurat_trading_dates: vec![],
+            nse_mock_trading_dates: vec![],
+        };
+        let cal = std::sync::Arc::new(TradingCalendar::from_config(&cfg).unwrap());
+
+        let first = set_market_calendar_for_session(cal.clone());
+        let second = set_market_calendar_for_session(cal.clone());
+        // Whichever call won first must be the only Ok — idempotent.
+        assert!(
+            first ^ second || (!first && !second),
+            "set_market_calendar_for_session must install at most once"
+        );
+
+        // With a calendar installed, force the in-hours weekday gate true. The
+        // combined answer must equal the calendar's is_trading_day_today() — so
+        // on a weekend/holiday (calendar says false) it is CLOSED despite the
+        // forced in-hours flag, and on a real weekday it is OPEN.
+        set_test_force_in_market_hours(true);
+        let expected = SESSION_CALENDAR
+            .get()
+            .map(|c| c.is_trading_day_today())
+            .unwrap_or(true);
+        assert_eq!(
+            is_trading_session_now(),
+            expected,
+            "with a calendar installed, the session gate must follow is_trading_day_today"
+        );
+        set_test_force_in_market_hours(false);
     }
 
     /// Guard: the window bounds come from common constants, not hardcoded
