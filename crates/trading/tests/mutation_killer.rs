@@ -246,7 +246,7 @@ mod indicator_mutations {
         IndicatorParams::default()
     }
 
-    fn make_tick(sid: u32, ltp: f32, high: f32, low: f32, volume: u32) -> ParsedTick {
+    fn make_tick(sid: u64, ltp: f32, high: f32, low: f32, volume: u32) -> ParsedTick {
         ParsedTick {
             security_id: sid,
             last_traded_price: ltp,
@@ -262,7 +262,7 @@ mod indicator_mutations {
     #[test]
     fn mutation_indicator_out_of_bounds_sid_returns_default() {
         let mut engine = IndicatorEngine::new(default_params());
-        let tick = make_tick(u32::MAX, 100.0, 110.0, 90.0, 1000);
+        let tick = make_tick(u64::from(u32::MAX), 100.0, 110.0, 90.0, 1000);
         let snap = engine.update(&tick);
         assert_eq!(
             snap.ema_fast, 0.0,

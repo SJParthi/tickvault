@@ -46,7 +46,7 @@ const INITIAL_CAPACITY: usize = 25_000;
 /// tick processor's hot path, the metrics scraper, and the IST-midnight
 /// reset task can all touch this set in parallel without contention.
 pub struct FirstSeenSet {
-    seen: PapayaMap<(u32, ExchangeSegment), ()>,
+    seen: PapayaMap<(u64, ExchangeSegment), ()>,
 }
 
 impl Default for FirstSeenSet {
@@ -75,7 +75,7 @@ impl FirstSeenSet {
     ///
     /// O(1) — single papaya `insert` call. Lock-free.
     #[inline]
-    pub fn try_insert(&self, security_id: u32, segment: ExchangeSegment) -> bool {
+    pub fn try_insert(&self, security_id: u64, segment: ExchangeSegment) -> bool {
         // PapayaMap::pin returns a guard scoped to the current thread.
         // Insert returns `Some(prev)` if the key existed, `None` otherwise.
         self.seen.pin().insert((security_id, segment), ()).is_none()
@@ -85,7 +85,7 @@ impl FirstSeenSet {
     /// recording a new observation. Useful for read-only queries
     /// (e.g. metrics, debug logs).
     #[inline]
-    pub fn contains(&self, security_id: u32, segment: ExchangeSegment) -> bool {
+    pub fn contains(&self, security_id: u64, segment: ExchangeSegment) -> bool {
         self.seen.pin().contains_key(&(security_id, segment))
     }
 
@@ -156,7 +156,7 @@ pub fn init_global() -> Arc<FirstSeenSet> {
 /// dedup constraint is a *persistence-side* DEDUP UPSERT KEY, so a
 /// missed gate is at most a redundant ILP write that QuestDB collapses.
 #[inline]
-pub fn try_insert_global(security_id: u32, segment: ExchangeSegment) -> bool {
+pub fn try_insert_global(security_id: u64, segment: ExchangeSegment) -> bool {
     match GLOBAL.get() {
         Some(set) => set.try_insert(security_id, segment),
         None => true,
@@ -312,7 +312,7 @@ mod tests {
         let _ = init_global();
         // First observation today returns true; second false.
         // Use a security_id unlikely to collide with other tests.
-        let sid = 999_999u32;
+        let sid = 999_999u64;
         let seg = ExchangeSegment::NseFno;
         let first = try_insert_global(sid, seg);
         let second = try_insert_global(sid, seg);

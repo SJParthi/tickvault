@@ -31,7 +31,7 @@ const PROPTEST_CASES: u32 = 10;
 /// Generates an arbitrary `ParsedTick` with random field values.
 fn arb_parsed_tick() -> impl Strategy<Value = ParsedTick> {
     (
-        any::<u32>(),                                             // security_id
+        any::<u64>(),                                             // security_id
         0u8..=8u8,                           // exchange_segment_code (valid range)
         any::<f32>(),                        // last_traded_price
         any::<u16>(),                        // last_trade_quantity
@@ -136,7 +136,7 @@ proptest! {
         let base_count = 500_usize;
         for i in 0..(base_count + extra_count) {
             let tick = ParsedTick {
-                security_id: i as u32,
+                security_id: i as u64,
                 exchange_segment_code: 1,
                 last_traded_price: 100.0,
                 last_trade_quantity: 1,
@@ -224,7 +224,7 @@ proptest! {
 
         for i in 0..tick_count {
             let tick = ParsedTick {
-                security_id: i as u32,
+                security_id: i as u64,
                 exchange_segment_code: 2,
                 last_traded_price: 100.0 + i as f32,
                 last_trade_quantity: 75,

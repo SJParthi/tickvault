@@ -911,7 +911,7 @@ pub const MAX_TOTAL_SUBSCRIPTIONS_TARGET: usize = 24_500;
 /// `DISPLAY_INDICES` entry `("INDIA VIX", 21, "Volatility")` above. Used by
 /// Phase 0 planner to filter display indices to VIX only under the
 /// `IndicesUnderlyingsOnly` scope (Item 1 of `topic-PHASE-0-LEAN-LOCKED.md`).
-pub const INDIA_VIX_SECURITY_ID: u32 = 21;
+pub const INDIA_VIX_SECURITY_ID: crate::types::SecurityId = 21;
 
 /// Phase 0 IDX_I subscription whitelist (4 SIDs in Ticker mode):
 /// NIFTY (13) + BANKNIFTY (25) + SENSEX (51) + INDIA VIX (21).

@@ -290,7 +290,7 @@ mod tests {
     use tickvault_trading::candles::{LiveCandleState, TfIndex};
 
     fn mk_seal_feed(
-        sid: u32,
+        sid: u64,
         seg: u8,
         tf: TfIndex,
         bucket: u32,
@@ -313,7 +313,7 @@ mod tests {
         BufferedSeal::new(sid, seg, tf, state, feed)
     }
 
-    fn mk_seal(sid: u32, seg: u8, tf: TfIndex, bucket: u32, close: f64) -> BufferedSeal {
+    fn mk_seal(sid: u64, seg: u8, tf: TfIndex, bucket: u32, close: f64) -> BufferedSeal {
         mk_seal_feed(sid, seg, tf, bucket, close, Feed::Dhan)
     }
 
@@ -379,7 +379,13 @@ mod tests {
     fn test_append_seal_increments_buffer_row_count() {
         let mut w = ShadowCandleWriter::for_test();
         for i in 0..5 {
-            let s = mk_seal(13 + i, 0, TfIndex::M1, 1_716_000_900 + i, 100.0 + i as f64);
+            let s = mk_seal(
+                u64::from(13 + i),
+                0,
+                TfIndex::M1,
+                1_716_000_900 + i,
+                100.0 + i as f64,
+            );
             w.append_seal(&s).expect("append");
         }
         assert_eq!(w.buffer_row_count(), 5);
@@ -624,7 +630,13 @@ mod tests {
         let n = 10;
         let mut prev_bytes = 0;
         for i in 0..n {
-            let s = mk_seal(13 + i, 0, TfIndex::M1, 1_716_000_900 + i, 100.0 + i as f64);
+            let s = mk_seal(
+                u64::from(13 + i),
+                0,
+                TfIndex::M1,
+                1_716_000_900 + i,
+                100.0 + i as f64,
+            );
             w.append_seal(&s).expect("append");
             let now = w.buffer_byte_count();
             assert!(now > prev_bytes, "buffer must grow on each append");

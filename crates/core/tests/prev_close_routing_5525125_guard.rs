@@ -60,7 +60,7 @@ fn make_header(response_code: u8, segment: u8, security_id: u32, msg_len: u16) -
         response_code,
         message_length: msg_len,
         exchange_segment_code: segment,
-        security_id,
+        security_id: u64::from(security_id),
     }
 }
 
@@ -112,7 +112,7 @@ fn test_prev_close_routing_idx_i_from_code6_bytes_8_to_11() {
     // The header is the segment carrier — ratchet that the segment
     // round-trips through it as well.
     assert_eq!(header.exchange_segment_code, EXCHANGE_SEGMENT_IDX_I);
-    assert_eq!(header.security_id, NIFTY_SECURITY_ID);
+    assert_eq!(header.security_id, u64::from(NIFTY_SECURITY_ID));
 }
 
 /// NSE_EQ (RELIANCE) — previous-day close is INSIDE the Quote packet
@@ -158,7 +158,7 @@ fn test_prev_close_routing_nse_eq_from_quote_close_field_bytes_38_to_41() {
         got = tick.day_close,
         expected = RELIANCE_PREV_CLOSE,
     );
-    assert_eq!(tick.security_id, RELIANCE_SECURITY_ID);
+    assert_eq!(tick.security_id, u64::from(RELIANCE_SECURITY_ID));
     assert_eq!(tick.exchange_segment_code, EXCHANGE_SEGMENT_NSE_EQ);
     assert_eq!(
         QUOTE_OFFSET_CLOSE, 38,
@@ -207,7 +207,7 @@ fn test_prev_close_routing_nse_fno_from_full_close_field_bytes_50_to_53() {
         got = tick.day_close,
         expected = NIFTY_OPTION_PREV_CLOSE,
     );
-    assert_eq!(tick.security_id, NIFTY_OPTION_SECURITY_ID);
+    assert_eq!(tick.security_id, u64::from(NIFTY_OPTION_SECURITY_ID));
     assert_eq!(tick.exchange_segment_code, EXCHANGE_SEGMENT_NSE_FNO);
     assert_eq!(
         FULL_OFFSET_CLOSE, 50,

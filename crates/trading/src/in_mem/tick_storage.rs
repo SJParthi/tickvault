@@ -64,7 +64,7 @@ use papaya::HashMap;
 use tickvault_common::tick_types::ParsedTick;
 
 /// Composite key per I-P1-11 — `(security_id, exchange_segment_code)`.
-type TickKey = (u32, u8);
+type TickKey = (u64, u8);
 
 /// Default per-instrument tick Vec capacity reserved at first push.
 ///
@@ -170,7 +170,7 @@ impl TickStorage {
     /// inserted in the map OR last reset cleared it before any new
     /// push).
     #[must_use]
-    pub fn snapshot(&self, security_id: u32, exchange_segment_code: u8) -> Option<Vec<ParsedTick>> {
+    pub fn snapshot(&self, security_id: u64, exchange_segment_code: u8) -> Option<Vec<ParsedTick>> {
         let pin = self.inner.pin();
         let entry = pin.get(&(security_id, exchange_segment_code))?;
         let guard = entry.lock().ok()?;
@@ -258,7 +258,7 @@ impl TickStorage {
 mod tests {
     use super::*;
 
-    fn make_tick(security_id: u32, segment: u8, ltp: f32) -> ParsedTick {
+    fn make_tick(security_id: u64, segment: u8, ltp: f32) -> ParsedTick {
         ParsedTick {
             security_id,
             exchange_segment_code: segment,

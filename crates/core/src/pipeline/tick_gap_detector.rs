@@ -25,7 +25,7 @@ pub const TICK_GAP_COALESCE_WINDOW_SECS_DEFAULT: u64 = 60;
 pub const TICK_GAP_TOP_N_DEFAULT: usize = 64;
 
 /// Composite key per I-P1-11. Wave 2 Item 8.
-pub type TickGapKey = (u32, ExchangeSegment);
+pub type TickGapKey = (u64, ExchangeSegment);
 
 // Wave-2-D Fix 4 — hot-path `Copy` compile-time ratchet. The
 // `record_tick` call is on the tick-processor hot path and builds
@@ -81,7 +81,7 @@ impl TickGapDetector {
     ///
     /// Wave 2 Item 8: this is the ONLY method that should be called
     /// from the tick-processor hot loop. `scan_gaps` is the cold path.
-    pub fn record_tick(&self, security_id: u32, segment: ExchangeSegment, now: Instant) {
+    pub fn record_tick(&self, security_id: u64, segment: ExchangeSegment, now: Instant) {
         let pin = self.last_seen.pin();
         // O(1) EXEMPT: papaya insert is amortised constant; the map is
         // bounded by the universe size (~25K entries) and never grows
@@ -122,9 +122,9 @@ impl TickGapDetector {
     /// the coalesce task only needs the top-N — see `scan_gaps_top_n`
     /// for the bounded variant.
     #[must_use]
-    pub fn scan_gaps(&self, now: Instant) -> Vec<(u32, ExchangeSegment, u64)> {
+    pub fn scan_gaps(&self, now: Instant) -> Vec<(u64, ExchangeSegment, u64)> {
         let pin = self.last_seen.pin();
-        let mut out: Vec<(u32, ExchangeSegment, u64)> = pin
+        let mut out: Vec<(u64, ExchangeSegment, u64)> = pin
             .iter()
             .filter_map(|(key, last)| {
                 let gap = now.saturating_duration_since(*last).as_secs();
@@ -158,7 +158,7 @@ impl TickGapDetector {
         &self,
         now: Instant,
         cap: usize,
-    ) -> (Vec<(u32, ExchangeSegment, u64)>, usize) {
+    ) -> (Vec<(u64, ExchangeSegment, u64)>, usize) {
         if cap == 0 {
             // Still need the total count for the gauge — walk without
             // collecting.
@@ -179,7 +179,7 @@ impl TickGapDetector {
         // ExchangeSegment itself.
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
-        let mut heap: BinaryHeap<Reverse<(u64, u32, u8)>> =
+        let mut heap: BinaryHeap<Reverse<(u64, u64, u8)>> =
             BinaryHeap::with_capacity(cap.saturating_add(1));
         let mut total: usize = 0;
         for (key, last) in pin.iter() {
@@ -205,7 +205,7 @@ impl TickGapDetector {
         // needed. Decode the u8 segment back to ExchangeSegment via
         // `from_byte`; on the (impossible) None path we skip the entry
         // rather than panic per `dhan-annexure-enums.md` Rule 15.
-        let out: Vec<(u32, ExchangeSegment, u64)> = heap
+        let out: Vec<(u64, ExchangeSegment, u64)> = heap
             .into_sorted_vec()
             .into_iter()
             .filter_map(|Reverse((gap, id, seg_code))| {
@@ -312,7 +312,7 @@ pub fn set_global_tick_gap_detector(detector: SharedTickGapDetector) -> bool {
 /// O(1) — single OnceLock read + one papaya insert. Safe to call from
 /// the tick processor's hot loop.
 #[inline]
-pub fn record_tick_global(security_id: u32, segment: ExchangeSegment, now: Instant) {
+pub fn record_tick_global(security_id: u64, segment: ExchangeSegment, now: Instant) {
     if let Some(d) = GLOBAL_TICK_GAP_DETECTOR.get() {
         d.record_tick(security_id, segment, now);
     }
@@ -515,7 +515,7 @@ mod tests {
     fn test_scan_gaps_top_n_zero_cap_returns_empty_vec_with_total_count() {
         let d = TickGapDetector::new(30);
         let t0 = Instant::now();
-        for id in 0u32..5 {
+        for id in 0u64..5 {
             d.record_tick(id, ExchangeSegment::IdxI, t0);
         }
         // Advance 60s — all 5 entries are silent.
@@ -530,7 +530,7 @@ mod tests {
         let d = TickGapDetector::new(30);
         let t0 = Instant::now();
         // Record 100 instruments silent for varying durations.
-        for id in 0u32..100 {
+        for id in 0u64..100 {
             d.record_tick(id, ExchangeSegment::IdxI, t0);
         }
         let now = t0 + Duration::from_secs(60);
@@ -583,7 +583,7 @@ mod tests {
             ExchangeSegment::BseFno,
         ];
         for (i, seg) in segments.iter().enumerate() {
-            d.record_tick(i as u32, *seg, t0);
+            d.record_tick(i as u64, *seg, t0);
         }
         let now = t0 + Duration::from_secs(60);
         let (entries, total) = d.scan_gaps_top_n(now, 10);
@@ -628,7 +628,7 @@ mod tests {
         // operator-visible "universe-wide silence" scenario.
         let d = TickGapDetector::new(30);
         let t0 = Instant::now();
-        for id in 0u32..5000 {
+        for id in 0u64..5000 {
             d.record_tick(id, ExchangeSegment::IdxI, t0);
         }
         let now = t0 + Duration::from_secs(60);

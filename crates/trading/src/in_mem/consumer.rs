@@ -103,7 +103,7 @@ pub async fn run_tick_storage_consumer(
 mod tests {
     use super::*;
 
-    fn make_tick(security_id: u32, segment: u8, ltp: f32) -> ParsedTick {
+    fn make_tick(security_id: u64, segment: u8, ltp: f32) -> ParsedTick {
         ParsedTick {
             security_id,
             exchange_segment_code: segment,

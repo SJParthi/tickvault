@@ -312,8 +312,14 @@ impl From<&ArchivedOptionType> for OptionType {
     }
 }
 
-/// Unique identifier for a security in the Dhan system.
-pub type SecurityId = u32;
+/// Unique identifier for a security.
+///
+/// Widened u32 → u64 (2026-06-29) so Groww's native exchange_token ids — which
+/// set bit 62 for indices and therefore exceed `u32` — fold through the SAME
+/// pipeline as Dhan. Dhan's wire SecurityId is a 4-byte LE field
+/// (`live-market-feed.md` rule 14) and is widened LOSSLESSLY via `u64::from`
+/// at the parser struct boundary; the wire read width is unchanged.
+pub type SecurityId = u64;
 
 // ---------------------------------------------------------------------------
 // Tests

@@ -25,7 +25,7 @@ fn test_config() -> QuestDbConfig {
 /// Greeks fields set to NaN (non-F&O default).
 fn make_tick(id: u32, price: f32) -> ParsedTick {
     ParsedTick {
-        security_id: id,
+        security_id: u64::from(id),
         exchange_segment_code: 1, // NSE_EQ
         last_traded_price: price,
         last_trade_quantity: 100,

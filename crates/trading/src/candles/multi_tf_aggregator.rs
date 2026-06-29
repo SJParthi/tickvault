@@ -65,7 +65,9 @@ use crate::candles::tf_index::{MARKET_CLOSE_SECS_OF_DAY_IST, MARKET_OPEN_SECS_OF
 use crate::candles::{AggregatorCell, ConsumeOutcome, FeedStrategy, LiveCandleState, TfIndex};
 
 /// Composite key per I-P1-11 — `(security_id, exchange_segment_code)`.
-type AggregatorKey = (u32, u8);
+/// `security_id` is `u64` (2026-06-29 widening) so Groww's native exchange_token
+/// (bit-62 index ids) keys the SAME aggregator as Dhan's 4-byte wire id.
+type AggregatorKey = (u64, u8);
 
 /// One papaya entry. Holds the 9-TF cell plus the per-instrument
 /// last-seen cumulative-volume tracker.
@@ -149,7 +151,7 @@ pub struct MultiTfAggregator {
     /// pairs exempt from the 09:15–15:30 IST candle-window gate (GIFT
     /// Nifty trades ~21 h/day). Empty by default → no exemptions →
     /// today's behavior. Set once at boot via `with_always_on`.
-    always_on: Arc<HashSet<(u32, u8)>>,
+    always_on: Arc<HashSet<(u64, u8)>>,
 }
 
 impl MultiTfAggregator {
@@ -179,7 +181,7 @@ impl MultiTfAggregator {
     /// safe empty default.
     #[must_use]
     // TEST-EXEMPT: builder exercised by test_gift_nifty_exempt_tick_aggregates_outside_window.
-    pub fn with_always_on(mut self, always_on: Arc<HashSet<(u32, u8)>>) -> Self {
+    pub fn with_always_on(mut self, always_on: Arc<HashSet<(u64, u8)>>) -> Self {
         self.always_on = always_on;
         self
     }
@@ -226,7 +228,7 @@ impl MultiTfAggregator {
     /// if the instrument was pre-populated; `None` otherwise.
     /// Used by tests and by the boundary timer for force-sealing.
     #[must_use]
-    pub fn get(&self, security_id: u32, exchange_segment_code: u8) -> Option<Arc<InstrumentEntry>> {
+    pub fn get(&self, security_id: u64, exchange_segment_code: u8) -> Option<Arc<InstrumentEntry>> {
         let pin = self.inner.pin();
         pin.get(&(security_id, exchange_segment_code)).cloned()
     }
@@ -249,7 +251,7 @@ impl MultiTfAggregator {
     /// O(1): one papaya read + one atomic store.
     pub fn seed_cumulative(
         &self,
-        security_id: u32,
+        security_id: u64,
         exchange_segment_code: u8,
         cumulative: u64,
     ) -> bool {
@@ -415,7 +417,7 @@ impl MultiTfAggregator {
     /// at most once per minute boundary, not on the per-tick fast path.
     pub fn force_seal_all<F>(&self, mut on_seal: F)
     where
-        F: FnMut(u32, u8, TfIndex, LiveCandleState),
+        F: FnMut(u64, u8, TfIndex, LiveCandleState),
     {
         let pin = self.inner.pin();
         for (key, entry) in pin.iter() {
@@ -438,7 +440,7 @@ mod tests {
     use super::*;
     use tickvault_common::tick_types::ParsedTick;
 
-    fn mk_tick(sid: u32, seg: u8, secs: u32, price: f32, volume: u32, oi: u32) -> ParsedTick {
+    fn mk_tick(sid: u64, seg: u8, secs: u32, price: f32, volume: u32, oi: u32) -> ParsedTick {
         let mut t = ParsedTick::default();
         t.security_id = sid;
         t.exchange_segment_code = seg;
@@ -596,7 +598,7 @@ mod tests {
         // GIFT Nifty (sid 5024, IDX_I=0) in the always-on set aggregates
         // at 20:00 IST — its candle MUST open.
         let mut set = HashSet::new();
-        set.insert((5024_u32, 0_u8));
+        set.insert((5024_u64, 0_u8));
         let agg = MultiTfAggregator::with_capacity(8).with_always_on(Arc::new(set));
         agg.pre_populate(vec![(5024, 0)]);
         let tick = mk_tick(5024, 0, 1_779_235_200 + 72_000, 100.0, 50, 1_000);
@@ -744,11 +746,11 @@ mod tests {
         let agg = MultiTfAggregator::new();
         agg.pre_populate(vec![(13, 0), (25, 0)]);
         // Tick both instruments to open all slots.
-        for sid in [13_u32, 25] {
+        for sid in [13_u64, 25] {
             let t = mk_tick(sid, 0, 1_779_354_960, 100.0, 50, 0);
             agg.consume_tick(&t, 0, FeedStrategy::DHAN, None, |_, _| {});
         }
-        let mut emitted: Vec<(u32, u8, TfIndex)> = Vec::new();
+        let mut emitted: Vec<(u64, u8, TfIndex)> = Vec::new();
         agg.force_seal_all(|sid, seg, tf, _| emitted.push((sid, seg, tf)));
         assert_eq!(
             emitted.len(),
@@ -757,7 +759,7 @@ mod tests {
             emitted.len()
         );
         // Every slot is now empty.
-        for sid in [13_u32, 25] {
+        for sid in [13_u64, 25] {
             let entry = agg.get(sid, 0).expect("present");
             for tf in TfIndex::ALL {
                 assert!(entry.cell.snapshot(tf).is_uninitialised());

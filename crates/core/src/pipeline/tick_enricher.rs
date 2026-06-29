@@ -358,7 +358,7 @@ pub fn spawn_prev_oi_cache_refresh_task(
 mod tests {
     use super::*;
 
-    fn make_tick(security_id: u32, segment_code: u8, volume: u32, day_close: f32) -> ParsedTick {
+    fn make_tick(security_id: u64, segment_code: u8, volume: u32, day_close: f32) -> ParsedTick {
         ParsedTick {
             security_id,
             exchange_segment_code: segment_code,

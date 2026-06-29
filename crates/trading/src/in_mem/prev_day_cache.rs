@@ -46,7 +46,7 @@ use papaya::HashMap;
 use crate::candles::pct_stamping::PrevDayRefs;
 
 /// Composite key per I-P1-11 — `(security_id, exchange_segment_code)`.
-type PrevDayKey = (u32, u8);
+type PrevDayKey = (u64, u8);
 
 /// In-RAM cache of frozen-per-day reference values per instrument.
 ///
@@ -73,7 +73,7 @@ impl PrevDayCache {
     /// (typically ~11K calls, all before market open). The papaya
     /// pin / insert costs ~50 ns per call → ~550 µs total at boot,
     /// well within the 8s pre-market budget.
-    pub fn insert(&self, security_id: u32, exchange_segment_code: u8, refs: PrevDayRefs) {
+    pub fn insert(&self, security_id: u64, exchange_segment_code: u8, refs: PrevDayRefs) {
         let pin = self.inner.pin();
         pin.insert((security_id, exchange_segment_code), refs);
     }
@@ -86,7 +86,7 @@ impl PrevDayCache {
     /// `get` totals ~30 ns. Acceptable on the SEAL path (called once
     /// per timeframe boundary, not per tick).
     #[must_use]
-    pub fn lookup(&self, security_id: u32, exchange_segment_code: u8) -> Option<PrevDayRefs> {
+    pub fn lookup(&self, security_id: u64, exchange_segment_code: u8) -> Option<PrevDayRefs> {
         let pin = self.inner.pin();
         pin.get(&(security_id, exchange_segment_code)).copied()
     }

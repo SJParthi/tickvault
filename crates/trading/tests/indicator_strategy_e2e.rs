@@ -34,7 +34,7 @@ use tickvault_trading::strategy::types::{
 // =========================================================================
 
 fn make_tick(
-    security_id: u32,
+    security_id: u64,
     ltp: f32,
     high: f32,
     low: f32,
@@ -53,7 +53,7 @@ fn make_tick(
     }
 }
 
-fn make_simple_tick(security_id: u32, price: f32) -> ParsedTick {
+fn make_simple_tick(security_id: u64, price: f32) -> ParsedTick {
     make_tick(security_id, price, price + 10.0, price - 10.0, 1000, price)
 }
 
@@ -794,10 +794,10 @@ fn test_engine_warmup_persists_after_threshold() {
 fn test_engine_out_of_bounds_security_id_returns_default() {
     let mut engine = IndicatorEngine::new(IndicatorParams::default());
 
-    let tick = make_simple_tick(u32::MAX, 100.0);
+    let tick = make_simple_tick(u64::from(u32::MAX), 100.0);
     let snap = engine.update(&tick);
 
-    assert_eq!(snap.security_id, u32::MAX);
+    assert_eq!(snap.security_id, u64::from(u32::MAX));
     assert!(!snap.is_warm);
     assert_eq!(snap.ema_fast, 0.0, "OOB returns default snapshot");
 }
@@ -1596,7 +1596,7 @@ mod proptest_strategy {
             rsi in 0.0f64..100.0,
             ltp in 0.01f64..100000.0,
             atr in 0.0f64..1000.0,
-            sid in 0u32..100,
+            sid in 0u64..100,
         ) {
             let def = test_strategy();
             let mut instance = StrategyInstance::new(def, 101);

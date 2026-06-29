@@ -30,7 +30,7 @@ fn degradation_risk_engine_daily_reset_clears_all() {
     let mut engine = RiskEngine::new(2.0, 100, 1_000_000.0);
 
     // Build up complex state
-    for sec in 0..50_u32 {
+    for sec in 0..50_u64 {
         engine.record_fill(sec, 50, 100.0 + sec as f64, 25);
     }
     engine.manual_halt();

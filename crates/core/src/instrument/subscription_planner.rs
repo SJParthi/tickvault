@@ -260,7 +260,7 @@ pub const fn should_subscribe_index_derivatives(_config: &SubscriptionConfig) ->
 #[must_use]
 pub const fn is_display_index_allowed_under_scope(
     _config: &SubscriptionConfig,
-    security_id: u32,
+    security_id: tickvault_common::types::SecurityId,
 ) -> bool {
     security_id == tickvault_common::constants::INDIA_VIX_SECURITY_ID
 }
@@ -286,7 +286,7 @@ pub fn build_subscription_plan(
     // is why FINNIFTY's IDX_I subscription never went out and the depth
     // ATM selector had no spot price for it. Correct dedup key is
     // `(security_id, segment)`.
-    let mut seen_ids: HashSet<(u32, ExchangeSegment)> =
+    let mut seen_ids: HashSet<(u64, ExchangeSegment)> =
         HashSet::with_capacity(MAX_TOTAL_SUBSCRIPTIONS);
     let mut stocks_skipped_no_chain: usize = 0;
 
@@ -783,7 +783,7 @@ pub fn build_subscription_plan(
 ///
 /// The instrument segment is derived from the target ROLE, which is
 /// authoritative per rule §2 (indices → IDX_I; F&O underlyings resolve to
-/// their NSE_EQ spot row). Rows whose `security_id` is not a valid `u32`
+/// their NSE_EQ spot row). Rows whose `security_id` is not a valid `u64`
 /// are skipped + counted — never panics on malformed CSV-derived data.
 #[cfg(feature = "daily_universe_fetcher")]
 pub fn build_subscription_plan_from_daily_universe(universe: &DailyUniverse) -> SubscriptionPlan {
@@ -793,12 +793,12 @@ pub fn build_subscription_plan_from_daily_universe(universe: &DailyUniverse) -> 
     let mut instruments: Vec<SubscribedInstrument> =
         Vec::with_capacity(universe.subscription_targets.len());
     // I-P1-11: dedup on the composite (security_id, segment) key.
-    let mut seen_ids: HashSet<(u32, ExchangeSegment)> =
+    let mut seen_ids: HashSet<(u64, ExchangeSegment)> =
         HashSet::with_capacity(universe.subscription_targets.len());
     let mut skipped_unparsable_sid: usize = 0;
 
     for target in &universe.subscription_targets {
-        let Ok(security_id) = target.csv_row.security_id.parse::<u32>() else {
+        let Ok(security_id) = target.csv_row.security_id.parse::<u64>() else {
             skipped_unparsable_sid += 1;
             continue;
         };
@@ -913,7 +913,7 @@ pub fn build_subscription_plan_from_archived(
     // must use `(security_id, segment)` so an id that exists in both
     // IDX_I and NSE_EQ (e.g. FINNIFTY=27) is NOT silently collapsed to
     // whichever one appeared first.
-    let mut seen_ids: HashSet<(u32, ExchangeSegment)> =
+    let mut seen_ids: HashSet<(u64, ExchangeSegment)> =
         HashSet::with_capacity(MAX_TOTAL_SUBSCRIPTIONS);
     let mut stocks_skipped_no_chain: usize = 0;
 
@@ -1108,8 +1108,8 @@ pub fn build_subscription_plan_from_archived(
 
             // Future for this expiry
             if let Some(archived_future_id) = chain.future_security_id.as_ref() {
-                let future_id: u32 = archived_future_id.to_native();
-                let archived_key = rkyv::rend::u32_le::from_native(future_id);
+                let future_id: u64 = archived_future_id.to_native();
+                let archived_key = rkyv::rend::u64_le::from_native(future_id);
                 if let Some(future_contract) = universe.derivative_contracts.get(&archived_key) {
                     let future_seg = ExchangeSegment::from(&future_contract.exchange_segment);
                     if seen_ids.insert((future_id, future_seg)) {
@@ -1137,7 +1137,7 @@ pub fn build_subscription_plan_from_archived(
                     .min(call_count);
                 for entry in &chain.calls[start..end] {
                     let sec_id = entry.security_id.to_native();
-                    let archived_key = rkyv::rend::u32_le::from_native(sec_id);
+                    let archived_key = rkyv::rend::u64_le::from_native(sec_id);
                     if let Some(contract) = universe.derivative_contracts.get(&archived_key)
                         && seen_ids
                             .insert((sec_id, ExchangeSegment::from(&contract.exchange_segment)))
@@ -1162,7 +1162,7 @@ pub fn build_subscription_plan_from_archived(
                     .min(put_count);
                 for entry in &chain.puts[start..end] {
                     let sec_id = entry.security_id.to_native();
-                    let archived_key = rkyv::rend::u32_le::from_native(sec_id);
+                    let archived_key = rkyv::rend::u64_le::from_native(sec_id);
                     if let Some(contract) = universe.derivative_contracts.get(&archived_key)
                         && seen_ids
                             .insert((sec_id, ExchangeSegment::from(&contract.exchange_segment)))
@@ -1196,7 +1196,7 @@ pub fn build_subscription_plan_from_archived(
         // O(1) EXEMPT: begin — planner runs once at startup, not per tick
         let count_before_stage2 = instruments.len();
 
-        let mut remaining_stock_derivatives: Vec<(u32, NaiveDate, &str, &_)> = universe
+        let mut remaining_stock_derivatives: Vec<(u64, NaiveDate, &str, &_)> = universe
             .derivative_contracts
             .values()
             .filter_map(|c| {
@@ -1405,8 +1405,8 @@ mod tests {
         let mut calls = Vec::new();
         let mut puts = Vec::new();
         for (i, &strike) in strikes.iter().enumerate() {
-            let ce_id = 50100 + i as u32;
-            let pe_id = 50200 + i as u32;
+            let ce_id = 50100 + i as u64;
+            let pe_id = 50200 + i as u64;
 
             derivative_contracts.insert(
                 ce_id,
@@ -1560,8 +1560,8 @@ mod tests {
         let mut stock_calls = Vec::new();
         let mut stock_puts = Vec::new();
         for (i, &strike) in stock_strikes.iter().enumerate() {
-            let ce_id = 60100 + i as u32;
-            let pe_id = 60200 + i as u32;
+            let ce_id = 60100 + i as u64;
+            let pe_id = 60200 + i as u64;
 
             derivative_contracts.insert(
                 ce_id,
@@ -1779,8 +1779,8 @@ mod tests {
         );
 
         // Verify no duplicates by checking total equals unique count
-        let ids: Vec<u32> = plan.registry.iter().map(|i| i.security_id).collect();
-        let unique: HashSet<u32> = ids.iter().copied().collect();
+        let ids: Vec<u64> = plan.registry.iter().map(|i| i.security_id).collect();
+        let unique: HashSet<u64> = ids.iter().copied().collect();
         assert_eq!(ids.len(), unique.len(), "Duplicate security_ids in plan");
     }
 
@@ -2010,8 +2010,8 @@ mod tests {
             None,
         );
 
-        let mut ids1: Vec<u32> = plan1.registry.iter().map(|i| i.security_id).collect();
-        let mut ids2: Vec<u32> = plan2.registry.iter().map(|i| i.security_id).collect();
+        let mut ids1: Vec<u64> = plan1.registry.iter().map(|i| i.security_id).collect();
+        let mut ids2: Vec<u64> = plan2.registry.iter().map(|i| i.security_id).collect();
         ids1.sort();
         ids2.sort();
         assert_eq!(ids1, ids2, "Plans should produce identical instrument sets");
@@ -2033,8 +2033,8 @@ mod tests {
             None,
         );
 
-        let ids: Vec<u32> = plan.registry.iter().map(|i| i.security_id).collect();
-        let unique: HashSet<u32> = ids.iter().copied().collect();
+        let ids: Vec<u64> = plan.registry.iter().map(|i| i.security_id).collect();
+        let unique: HashSet<u64> = ids.iter().copied().collect();
         assert_eq!(
             ids.len(),
             unique.len(),
@@ -2072,7 +2072,7 @@ mod tests {
             },
         );
         for i in 0..3u32 {
-            let ce_id = 70100 + i;
+            let ce_id: u64 = 70100 + u64::from(i);
             universe.derivative_contracts.insert(
                 ce_id,
                 DerivativeContract {
@@ -2172,7 +2172,7 @@ mod tests {
         // 3 INFY calls, NO puts
         let mut infy_calls = Vec::new();
         for i in 0..3u32 {
-            let ce_id = 80100 + i;
+            let ce_id: u64 = 80100 + u64::from(i);
             universe.derivative_contracts.insert(
                 ce_id,
                 DerivativeContract {
@@ -2687,11 +2687,11 @@ mod tests {
         // Create 50 stocks, each with 600 options (300 CE + 300 PE)
         // Total: 50 stocks * 600 options = 30,000 + 50 futures = 30,050
         // Plus 50 equity feeds = 30,100 → exceeds MAX_TOTAL_SUBSCRIPTIONS (25,000)
-        let mut base_id: u32 = 100_000;
+        let mut base_id: u64 = 100_000;
         for stock_idx in 0..50u32 {
             let symbol = format!("STOCK{stock_idx}");
-            let underlying_id = 90_000 + stock_idx;
-            let equity_id = 80_000 + stock_idx;
+            let underlying_id = 90_000 + u64::from(stock_idx);
+            let equity_id = 80_000 + u64::from(stock_idx);
 
             underlyings.insert(
                 symbol.clone(),
@@ -3207,16 +3207,16 @@ mod tests {
         let mut expiry_calendars = HashMap::new();
 
         // Create 30 stocks with 1000 options each = 30,000 + 30 futures = 30,030
-        let mut base_id: u32 = 200_000;
+        let mut base_id: u64 = 200_000;
         for stock_idx in 0..30u32 {
             let symbol = format!("CAP{stock_idx}");
-            let equity_id = 180_000 + stock_idx;
+            let equity_id = 180_000 + u64::from(stock_idx);
 
             underlyings.insert(
                 symbol.clone(),
                 FnoUnderlying {
                     underlying_symbol: symbol.clone(),
-                    underlying_security_id: 190_000 + stock_idx,
+                    underlying_security_id: 190_000 + u64::from(stock_idx),
                     price_feed_security_id: equity_id,
                     price_feed_segment: ExchangeSegment::NseEquity,
                     derivative_segment: ExchangeSegment::NseFno,
@@ -3470,7 +3470,7 @@ mod tests {
     // same numeric security_id across different segments (e.g. id=13 is
     // FINNIFTY in IDX_I AND is some other instrument in NSE_EQ). The old
     // `HashSet<u32>` dedup silently dropped the second-seen instance.
-    // These tests prove the new `HashSet<(u32, ExchangeSegment)>` dedup
+    // These tests prove the new `HashSet<(u64, ExchangeSegment)>` dedup
     // keeps BOTH.
     // ========================================================================
 
@@ -3592,11 +3592,11 @@ mod tests {
     #[test]
     fn test_regression_seen_ids_key_type_is_pair() {
         // Compile-time / type-level assertion: the dedup HashSet must be
-        // typed as `HashSet<(u32, ExchangeSegment)>` so a future refactor
+        // typed as `HashSet<(u64, ExchangeSegment)>` so a future refactor
         // that reverts to `HashSet<u32>` fails to compile before this
         // test even runs. We assert via a tiny synthetic HashSet that
         // matches the production type.
-        let mut set: std::collections::HashSet<(u32, ExchangeSegment)> =
+        let mut set: std::collections::HashSet<(u64, ExchangeSegment)> =
             std::collections::HashSet::new();
         // Inserting the same id under two different segments must return
         // true for both — the pair is the key.
@@ -3834,9 +3834,9 @@ mod tests {
         // Insert 1 future + 1 CE per expiry (3 expiries × 2 contracts = 6 total)
         for (i, exp) in [nearest, mid, far].iter().enumerate() {
             derivative_contracts.insert(
-                70000 + i as u32,
+                70000 + i as u64,
                 DerivativeContract {
-                    security_id: 70000 + i as u32,
+                    security_id: 70000 + i as u64,
                     underlying_symbol: "NIFTY".to_string(),
                     instrument_kind: DhanInstrumentKind::FutureIndex,
                     exchange_segment: ExchangeSegment::NseFno,
@@ -3850,9 +3850,9 @@ mod tests {
                 },
             );
             derivative_contracts.insert(
-                70010 + i as u32,
+                70010 + i as u64,
                 DerivativeContract {
-                    security_id: 70010 + i as u32,
+                    security_id: 70010 + i as u64,
                     underlying_symbol: "NIFTY".to_string(),
                     instrument_kind: DhanInstrumentKind::OptionIndex,
                     exchange_segment: ExchangeSegment::NseFno,
@@ -3910,7 +3910,7 @@ mod tests {
         // Operator-confirmed 2026-05-02: every future expiry of the 3
         // full-chain indices must be subscribed for term-structure
         // visibility. Yields ~10-11K live contracts in production.
-        let subscribed_ids: HashSet<u32> = plan.registry.iter().map(|i| i.security_id).collect();
+        let subscribed_ids: HashSet<u64> = plan.registry.iter().map(|i| i.security_id).collect();
 
         for (label, sid) in [
             ("Nearest-expiry NIFTY future", 70000_u32),
@@ -4159,7 +4159,7 @@ mod tests {
             Some(&cal),
         );
 
-        let subscribed_ids: HashSet<u32> = plan.registry.iter().map(|i| i.security_id).collect();
+        let subscribed_ids: HashSet<u64> = plan.registry.iter().map(|i| i.security_id).collect();
 
         // BOTH NEAREST FUT and NEAREST CE must be DROPPED (rolled away).
         assert!(
@@ -4804,7 +4804,7 @@ mod tests {
             None,
         );
 
-        let majors: std::collections::HashSet<u32> = plan
+        let majors: std::collections::HashSet<u64> = plan
             .registry
             .iter()
             .filter(|i| i.category == SubscriptionCategory::MajorIndexValue)
