@@ -75,7 +75,7 @@ proptest! {
 
         match parsed {
             ParsedFrame::Tick(tick) => {
-                prop_assert_eq!(tick.security_id, security_id);
+                prop_assert_eq!(tick.security_id, u64::from(security_id));
                 prop_assert_eq!(tick.exchange_segment_code, EXCHANGE_SEGMENT_NSE_FNO);
                 prop_assert_eq!(tick.exchange_timestamp, ltt);
                 // LTP should round-trip exactly (same f32 bits)
@@ -102,7 +102,7 @@ proptest! {
 
         match parsed {
             ParsedFrame::Tick(tick) => {
-                prop_assert_eq!(tick.security_id, security_id);
+                prop_assert_eq!(tick.security_id, u64::from(security_id));
                 prop_assert_eq!(tick.last_traded_price, ltp);
                 prop_assert_eq!(tick.volume, volume);
                 prop_assert_eq!(tick.received_at_nanos, 42);
@@ -133,7 +133,7 @@ proptest! {
 
         match parsed {
             ParsedFrame::OiUpdate { security_id: sid, open_interest, .. } => {
-                prop_assert_eq!(sid, security_id);
+                prop_assert_eq!(sid, u64::from(security_id));
                 prop_assert_eq!(open_interest, oi);
             }
             other => prop_assert!(false, "expected OiUpdate, got: {other:?}"),
@@ -186,7 +186,7 @@ proptest! {
 
         match parsed {
             ParsedFrame::PreviousClose { security_id: sid, previous_close, previous_oi, .. } => {
-                prop_assert_eq!(sid, security_id);
+                prop_assert_eq!(sid, u64::from(security_id));
                 prop_assert_eq!(previous_close, prev_close);
                 prop_assert_eq!(previous_oi, prev_oi);
             }
@@ -214,7 +214,7 @@ proptest! {
 
         match parsed {
             ParsedFrame::TickWithDepth(tick, depth) => {
-                prop_assert_eq!(tick.security_id, security_id);
+                prop_assert_eq!(tick.security_id, u64::from(security_id));
                 prop_assert_eq!(depth.len(), 5);
             }
             other => prop_assert!(false, "expected TickWithDepth, got: {other:?}"),
@@ -298,7 +298,7 @@ proptest! {
 
         match parsed {
             ParsedFrame::MarketStatus { security_id: sid, exchange_segment_code } => {
-                prop_assert_eq!(sid, security_id);
+                prop_assert_eq!(sid, u64::from(security_id));
                 prop_assert_eq!(exchange_segment_code, segment);
             }
             other => prop_assert!(false, "expected MarketStatus, got: {other:?}"),

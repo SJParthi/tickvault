@@ -344,17 +344,45 @@ async fn main() -> Result<()> {
         "[feeds] Groww lanes spawned dormant (bridge + sidecar + activation watcher); \
          they activate on enable (config OR /api/feeds toggle) with no restart"
     );
+    // Trading calendar for the Groww IST-midnight force-seal boundary task. The
+    // shared `Arc<TradingCalendar>` for the Dhan path is built later in boot
+    // (after the clock-drift check), but the Groww bridge spawns here; both are
+    // built from the SAME `config.trading` (immutable read-only calendar data),
+    // so the trading-day gate is identical. Config is already validated.
+    let groww_trading_calendar = std::sync::Arc::new(
+        TradingCalendar::from_config(&config.trading)
+            .context("failed to build Groww trading calendar")?,
+    );
     tokio::spawn(tickvault_app::groww_bridge::run_groww_bridge(
         config.questdb.clone(),
         std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
         std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_STATUS_FILE_DEFAULT),
         std::sync::Arc::clone(&feed_runtime),
         std::sync::Arc::clone(&feed_health),
+        // ws_event_audit forensic sender (2026-06-29): one `feed='groww'` row per
+        // Groww connect/disconnect/reconnect, drained by the SAME consumer Dhan +
+        // order-update use. Closes the audit gap (Groww connected but wrote no row).
+        Some(spawn_ws_event_audit_consumer(config.questdb.clone())),
+        // Trading calendar (2026-06-29): drives the Groww IST-midnight force-seal
+        // boundary task's trading-day gate — built from the SAME `config.trading`
+        // the Dhan IST-midnight force-seal calendar uses.
+        groww_trading_calendar,
     ));
+    // Deferred Telegram slot for the Groww sidecar supervisor: the supervisor is
+    // spawned here (before the notifier is built), so it gets a shared slot that
+    // is filled with the live `NotificationService` once it exists (below). On a
+    // sidecar auth/entitlement/error diagnostic the supervisor fires ONE
+    // `GrowwSidecarRejected` Telegram event + marks Groww rejected in feed_health
+    // — so the operator sees WHY Groww has 0 ticks instead of a silent log line.
+    let groww_sidecar_notifier_slot: std::sync::Arc<
+        arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>,
+    > = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
     tokio::spawn(
         tickvault_app::groww_sidecar_supervisor::run_groww_sidecar_supervisor(
             std::sync::Arc::clone(&feed_runtime),
             tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
+            std::sync::Arc::clone(&feed_health),
+            std::sync::Arc::clone(&groww_sidecar_notifier_slot),
         ),
     );
     tokio::spawn(
@@ -494,7 +522,7 @@ async fn main() -> Result<()> {
                 }
                 metrics::counter!("tv_tick_gap_summary_total").increment(1);
                 metrics::gauge!("tv_tick_gap_instruments_silent").set(total_silent as f64);
-                let top: Vec<(u32, &'static str, u64)> = gaps
+                let top: Vec<(u64, &'static str, u64)> = gaps
                     .iter()
                     .take(10)
                     .map(|(id, seg, gap)| (*id, seg.as_str(), *gap))
@@ -1324,6 +1352,10 @@ async fn main() -> Result<()> {
         } else {
             fast_notifier
         };
+        // Fill the Groww sidecar supervisor's deferred Telegram slot now that the
+        // notifier exists: a subsequent sidecar reject diagnostic can page the
+        // operator. Stored once; the supervisor resolves it lazily per child.
+        groww_sidecar_notifier_slot.store(Some(std::sync::Arc::clone(&fast_notifier)));
         match ip_result {
             Ok(result) => {
                 if fast_trading_mode.is_live() {
@@ -1655,6 +1687,9 @@ async fn main() -> Result<()> {
                 // `process::exit(2)` Halt contract (H7 boot-ON is a separate
                 // tracked follow-up).
                 None,
+                // PR-E: runtime Dhan-OFF gate — same atomic the WS read loop
+                // consults; a dormant Dhan-OFF pool must not be paged/halted.
+                Some(feed_runtime.dhan_flag()),
             );
             // FAST BOOT parity with slow boot (main.rs ~1760):
             // emit per-connection + aggregate Telegram alerts so an operator
@@ -3191,6 +3226,31 @@ async fn emit_websocket_connected_alerts(
 /// The task stops when the `shutdown_notify` is fired (during graceful
 /// shutdown) to avoid a false-positive Halt during the intentional
 /// teardown.
+/// Pure decision: should the pool watchdog ACT on a `Degraded`/`Halt` verdict
+/// (page Telegram + `process::exit`/lane-teardown), or treat the down pool as
+/// EXPECTED IDLE and stay quiet?
+///
+/// The watchdog acts ONLY when BOTH hold:
+/// - `in_market_hours` — outside [09:00, 15:30) IST Dhan stops streaming and a
+///   60s/300s silence is normal (the 2026-04-24 post-market `process::exit(2)`
+///   cascade fix).
+/// - `dhan_enabled` — the operator has NOT deliberately switched Dhan OFF from
+///   the feed-control page (PR-E runtime toggle). When Dhan is toggled OFF its
+///   main-feed connections go dormant by design, so the resulting 0-connection
+///   pool must NOT be read as "fully degraded": no page, no `process::exit`, no
+///   lane teardown — exactly like the off-hours expected-idle branch. Without
+///   this, a runtime Dhan-OFF self-halted the whole process every ~300s, which
+///   also killed the independent Groww feed.
+///
+/// Returns `true` to ACT, `false` to treat as expected idle.
+#[must_use]
+const fn pool_watchdog_should_act_on_degradation(
+    in_market_hours: bool,
+    dhan_enabled: bool,
+) -> bool {
+    in_market_hours && dhan_enabled
+}
+
 fn spawn_pool_watchdog_task(
     pool: std::sync::Arc<WebSocketConnectionPool>,
     shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
@@ -3208,6 +3268,14 @@ fn spawn_pool_watchdog_task(
     // on Halt (single-feed contract). `Some(notify)` = RUNTIME lane: signal the
     // parked task to tear down + drive the FSM to `Off`, NEVER `process::exit`.
     lane_halt: Option<std::sync::Arc<tokio::sync::Notify>>,
+    // PR-E runtime Dhan-OFF gate. A clone of the SAME `FeedRuntimeState::dhan`
+    // atomic the Dhan WS read/reconnect loop consults — when the operator
+    // toggles Dhan OFF on the feed-control page, this flips `false` and the
+    // main-feed connections go dormant by design. The watchdog reads it so a
+    // deliberately-dormant 0-connection pool is treated as expected idle (no
+    // page, no `process::exit`, no lane teardown), never as "fully degraded".
+    // `None` keeps the legacy always-enabled behaviour (treated as on).
+    dhan_enabled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) {
     tokio::spawn(async move {
         // 5-second poll interval — cold path, not per tick. Matches the
@@ -3268,10 +3336,24 @@ fn spawn_pool_watchdog_task(
                     // crates/app/tests/post_market_pool_halt_guard.rs.
                     let in_market_hours =
                         tickvault_common::market_hours::is_within_market_hours_ist();
+                    // PR-E runtime Dhan-OFF gate. `None` (legacy) = treated as
+                    // enabled. When the operator toggles Dhan OFF on the
+                    // feed-control page this reads `false`, its main-feed
+                    // connections go dormant by design, and the resulting
+                    // 0-connection pool must be treated as expected idle —
+                    // never paged/halted. Read once per poll (Relaxed: a
+                    // UI-status flag with no ordering dependency).
+                    let dhan_on = dhan_enabled
+                        .as_ref()
+                        .map_or(true, |f| f.load(std::sync::atomic::Ordering::Relaxed));
+                    // ACT (page + exit/teardown) ONLY when in market hours AND
+                    // Dhan is enabled; otherwise the down pool is expected idle.
+                    let should_act =
+                        pool_watchdog_should_act_on_degradation(in_market_hours, dhan_on);
                     match verdict {
                         WatchdogVerdict::Degraded { down_for } => {
                             metrics::counter!("tv_pool_degraded_alerts_total").increment(1);
-                            if in_market_hours {
+                            if should_act {
                                 error!(
                                     down_for_secs = down_for.as_secs(),
                                     "S4-T1a CRITICAL: pool watchdog Degraded verdict — \
@@ -3283,8 +3365,11 @@ fn spawn_pool_watchdog_task(
                             } else {
                                 info!(
                                     down_for_secs = down_for.as_secs(),
-                                    "S4-T1a: pool Degraded verdict outside market hours \
-                                     (09:00-15:30 IST) — Dhan idle, no Telegram, no exit"
+                                    in_market_hours,
+                                    dhan_enabled = dhan_on,
+                                    "S4-T1a: pool Degraded verdict but expected idle \
+                                     (off-hours 09:00-15:30 IST, or Dhan toggled OFF) — \
+                                     Dhan idle, no Telegram, no exit"
                                 );
                             }
                         }
@@ -3296,8 +3381,9 @@ fn spawn_pool_watchdog_task(
                             metrics::counter!("tv_pool_recoveries_total").increment(1);
                             // Recovery is informational; only Telegram-page the
                             // operator if the original Degraded fired (i.e. we
-                            // were inside market hours when the down-cycle hit).
-                            if in_market_hours {
+                            // were inside market hours AND Dhan was enabled when
+                            // the down-cycle hit).
+                            if should_act {
                                 notifier.notify(NotificationEvent::WebSocketPoolRecovered {
                                     was_down_secs: was_down_for.as_secs(),
                                 });
@@ -3305,7 +3391,7 @@ fn spawn_pool_watchdog_task(
                         }
                         WatchdogVerdict::Halt { down_for } => {
                             metrics::counter!("tv_pool_self_halts_total").increment(1);
-                            if in_market_hours {
+                            if should_act {
                                 notifier.notify(NotificationEvent::WebSocketPoolHalt {
                                     down_secs: down_for.as_secs(),
                                 });
@@ -3348,9 +3434,12 @@ fn spawn_pool_watchdog_task(
                             } else {
                                 info!(
                                     down_for_secs = down_for.as_secs(),
-                                    "S4-T1a: pool Halt verdict outside market hours \
-                                     (09:00-15:30 IST) — Dhan idle, suppressing Telegram \
-                                     and process exit. Watchdog will reset on next market open."
+                                    in_market_hours,
+                                    dhan_enabled = dhan_on,
+                                    "S4-T1a: pool Halt verdict but expected idle \
+                                     (off-hours 09:00-15:30 IST, or Dhan toggled OFF) — \
+                                     Dhan idle, suppressing Telegram and process exit. \
+                                     Watchdog will reset/resume when Dhan is active again."
                                 );
                             }
                         }
@@ -3376,8 +3465,16 @@ fn spawn_pool_watchdog_task(
                     // starts a FRESH 300s window, giving the deferred feed
                     // its normal reconnect time; the genuine in-market
                     // "all-down for 300s → halt" safety property (the
-                    // Halt arm above, gated by in_market_hours) is unchanged.
-                    if !in_market_hours {
+                    // Halt arm above, gated by `should_act`) is unchanged.
+                    //
+                    // PR-E: also reset while Dhan is deliberately toggled OFF.
+                    // Its connections are dormant by design, so a stale
+                    // `AllDown { since }` would otherwise accumulate and trip
+                    // Halt the instant Dhan is re-enabled mid-market. Resetting
+                    // here gives the re-enabled feed a fresh 300s window. The
+                    // genuine "Dhan enabled + all-down for 300s → halt" safety
+                    // property (the `should_act`-gated Halt arm) is unchanged.
+                    if !should_act {
                         pool.reset_watchdog();
                     }
                 }
@@ -5604,6 +5701,9 @@ async fn start_dhan_lane(
             Some(std::sync::Arc::clone(&feed_health)), // SP5: Dhan connected state
             // H7: lane-scoped Halt handler. `Some` only for a runtime lane.
             lane_halt_notify.as_ref().map(std::sync::Arc::clone),
+            // PR-E: runtime Dhan-OFF gate — same atomic the WS read loop
+            // consults; a dormant Dhan-OFF pool must not be paged/halted.
+            Some(feed_runtime.dhan_flag()),
         );
         // FAST BOOT parity: helper emits per-connection + aggregate Telegram
         // alerts on BOTH boot paths (main.rs ~830 for FAST BOOT, here for slow).
@@ -6250,7 +6350,7 @@ async fn start_dhan_lane(
                         // is NOT a SLO-excluded SID. N=10 is comfortably
                         // above 4 (the entire universe) so we always see
                         // the full picture when called.
-                        const SLO_TICK_FRESHNESS_EXCLUDED_SIDS: &[u32] = &[21]; // INDIA VIX
+                        const SLO_TICK_FRESHNESS_EXCLUDED_SIDS: &[u64] = &[21]; // INDIA VIX
                         const SLO_TICK_FRESHNESS_SCAN_TOP_N: usize = 10;
                         let tick_freshness = if !in_market {
                             1.0
@@ -8192,6 +8292,33 @@ mod tests {
     fn test_boot_helper_functions_callable() {
         let _ = compute_market_close_sleep("15:30:00");
         let _ = create_log_file_writer();
+    }
+
+    #[test]
+    fn test_pool_watchdog_should_act_on_degradation_truth_table() {
+        // ACT (page + exit/teardown) ONLY when in market hours AND Dhan enabled.
+        assert!(
+            pool_watchdog_should_act_on_degradation(true, true),
+            "in-market + Dhan enabled: a real all-down pool must page/halt"
+        );
+        // Dhan deliberately toggled OFF (PR-E) during market hours: the dormant
+        // 0-connection pool is EXPECTED IDLE — do NOT page/halt. This is the bug
+        // fix: previously the watchdog self-halted the whole process (killing
+        // Groww too) ~300s after a runtime Dhan-OFF.
+        assert!(
+            !pool_watchdog_should_act_on_degradation(true, false),
+            "Dhan toggled OFF in-market: dormant pool is expected idle, no page/halt"
+        );
+        // Off-hours, Dhan enabled: pre-existing post-market suppression.
+        assert!(
+            !pool_watchdog_should_act_on_degradation(false, true),
+            "off-hours: Dhan idle, no page/halt (2026-04-24 cascade fix)"
+        );
+        // Off-hours AND Dhan off: both reasons to stay quiet.
+        assert!(
+            !pool_watchdog_should_act_on_degradation(false, false),
+            "off-hours + Dhan off: expected idle, no page/halt"
+        );
     }
 
     #[test]

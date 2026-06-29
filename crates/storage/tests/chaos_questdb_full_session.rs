@@ -59,7 +59,7 @@ fn make_test_config() -> QuestDbConfig {
 
 fn make_synthetic_tick(security_id: u32, ltp_paise: u32, ltt_ist_secs: u32) -> ParsedTick {
     ParsedTick {
-        security_id,
+        security_id: u64::from(security_id),
         exchange_segment_code: 1, // NSE_EQ
         last_traded_price: (ltp_paise as f32) / 100.0,
         exchange_timestamp: ltt_ist_secs,

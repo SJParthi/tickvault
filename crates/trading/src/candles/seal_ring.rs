@@ -75,7 +75,7 @@ pub const SEAL_BUFFER_CAPACITY: usize = 200_000;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BufferedSeal {
     /// Composite-key part 1 (per I-P1-11).
-    pub security_id: u32,
+    pub security_id: u64,
     /// Composite-key part 2 (per I-P1-11).
     pub exchange_segment_code: u8,
     /// Which timeframe sealed this bar.
@@ -109,7 +109,7 @@ impl BufferedSeal {
     #[inline]
     #[must_use]
     pub const fn new(
-        security_id: u32,
+        security_id: u64,
         exchange_segment_code: u8,
         tf: TfIndex,
         state: LiveCandleState,
@@ -286,7 +286,7 @@ mod tests {
     }
 
     fn mk_seal(
-        sid: u32,
+        sid: u64,
         seg: u8,
         tf: TfIndex,
         bucket_start: u32,

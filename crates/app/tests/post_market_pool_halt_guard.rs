@@ -63,14 +63,15 @@ fn pool_watchdog_match_block(src: &str) -> &str {
         .expect("spawn_pool_watchdog_task must contain `let verdict = pool.poll_watchdog();`");
     // The `match verdict {` block ends at the next top-level closing
     // brace pair followed by `Healthy => { ... }` — but the cleanest
-    // bound is just to take the next ~8,500 bytes which comfortably
+    // bound is just to take the next ~10,360 bytes which comfortably
     // covers the four match arms (incl. the H7 lane-scoped Halt branch +
-    // the boot-ON `process::exit(2);` that follows it at ~rel 6.1KB, and
-    // the off-hours `reset_watchdog` at ~rel 8.3KB) without overshooting
-    // into the next helper (`spawn_pool_watchdog_task` closes at ~rel 8.5KB).
-    // We then use literal-substring checks on this slice. (Window was 6,000
-    // before the H7 watchdog-arg change added ~870 bytes to the Halt arm.)
-    let end = (start + 8_500).min(src.len());
+    // the boot-ON `process::exit(2);` that follows it, and the
+    // expected-idle `reset_watchdog` at ~rel 10.3KB) without overshooting
+    // into the next helper (`spawn_pool_watchdog_task` closes at ~rel 10.4KB).
+    // We then use literal-substring checks on this slice. (Window grew
+    // 8,500 → 10,360 when PR-E's runtime Dhan-OFF gate added the
+    // `should_act` helper call + the dhan_enabled doc/log lines.)
+    let end = (start + 10_360).min(src.len());
     &src[start..end]
 }
 
@@ -196,15 +197,15 @@ fn pool_watchdog_is_reset_outside_market_hours() {
     let src = read_main_rs();
     // Scope to the watchdog task body. Use a generous window from the
     // poll_watchdog call so the post-match reset (which sits just after the
-    // verdict match) is comfortably inside it. Window bumped 8,000 → 8,500:
-    // the H7 lane-scoped Halt branch added ~870 bytes to the Halt arm,
-    // pushing the off-hours `reset_watchdog` site (~rel 8.3KB) just past
-    // the old 8,000 window.
+    // verdict match) is comfortably inside it. Window bumped 8,500 → 10,360:
+    // PR-E's runtime Dhan-OFF gate added the `should_act` helper call + the
+    // dhan_enabled doc/log lines, pushing the expected-idle `reset_watchdog`
+    // site (~rel 10.3KB) just past the old 8,500 window.
     let needle = "let verdict = pool.poll_watchdog();";
     let start = src
         .find(needle)
         .expect("spawn_pool_watchdog_task must contain `let verdict = pool.poll_watchdog();`");
-    let end = (start + 8_500).min(src.len());
+    let end = (start + 10_360).min(src.len());
     let block = &src[start..end];
 
     let reset_idx = block.find("reset_watchdog").expect(
@@ -213,18 +214,21 @@ fn pool_watchdog_is_reset_outside_market_hours() {
          300s Halt at 09:00:00. Removing it re-introduces the daily forced restart \
          + [HIGH] WS POOL HALT + [HIGH] FAST BOOT pages observed 2026-06-03 09:00 IST.",
     );
-    // The reset MUST be gated on `!in_market_hours` — resetting in-hours
-    // would defeat the genuine 300s all-down Halt that protects against a
-    // real mid-session feed outage.
-    let gate_idx = block.find("if !in_market_hours").expect(
-        "reset_watchdog must be gated by `if !in_market_hours` — it may run ONLY \
-         off-hours. Resetting during market hours would silently disable the \
-         genuine 300s all-down → Halt safety property.",
+    // The reset MUST be gated on `!should_act` — i.e. it runs when the pool is
+    // EXPECTED IDLE (off-hours OR Dhan toggled OFF, PR-E). Resetting when the
+    // pool should be acted on (in-market AND Dhan enabled) would defeat the
+    // genuine 300s all-down Halt that protects against a real mid-session
+    // feed outage. The combined gate is `pool_watchdog_should_act_on_degradation`.
+    let gate_idx = block.find("if !should_act").expect(
+        "reset_watchdog must be gated by `if !should_act` — it may run ONLY when \
+         the pool is expected idle (off-hours or Dhan toggled OFF, PR-E). Resetting \
+         while Dhan is enabled in-market would silently disable the genuine 300s \
+         all-down → Halt safety property.",
     );
     assert!(
         gate_idx < reset_idx,
-        "the `if !in_market_hours` gate must lexically precede the reset_watchdog \
-         call (the reset lives inside the off-hours branch). Found gate at {gate_idx}, \
+        "the `if !should_act` gate must lexically precede the reset_watchdog \
+         call (the reset lives inside the expected-idle branch). Found gate at {gate_idx}, \
          reset at {reset_idx}."
     );
     // The gate must IMMEDIATELY precede the reset (same block, `if
@@ -260,14 +264,19 @@ fn watchdog_metrics_still_increment_outside_market_hours() {
     let metric_idx = degraded_arm
         .find("tv_pool_degraded_alerts_total")
         .expect("Degraded arm must increment tv_pool_degraded_alerts_total");
+    // PR-E (runtime Dhan-OFF gate): the Degraded/Halt action gate is now
+    // `if should_act` — the combined `in_market_hours && dhan_enabled` decision
+    // from `pool_watchdog_should_act_on_degradation`. The metric must still
+    // increment BEFORE that gate so post-market AND Dhan-OFF degraded events
+    // still appear on dashboards even though they don't page the operator.
     let if_idx = degraded_arm
-        .find("if in_market_hours")
-        .expect("Degraded arm must have an `if in_market_hours` gate");
+        .find("if should_act")
+        .expect("Degraded arm must have an `if should_act` gate (PR-E)");
     assert!(
         metric_idx < if_idx,
         "tv_pool_degraded_alerts_total counter must increment BEFORE the \
-         market-hours gate so post-market degraded events still appear on \
-         dashboards even though they don't page the operator. Found metric \
+         should_act gate so post-market / Dhan-OFF degraded events still appear \
+         on dashboards even though they don't page the operator. Found metric \
          at {metric_idx}, gate at {if_idx} within the Degraded arm."
     );
 }
@@ -413,5 +422,85 @@ fn runtime_lane_watchdog_does_not_process_exit() {
          block ending in `return;`) must NEVER call `std::process::exit` — it \
          tears the Dhan lane down via the FSM and returns, leaving Groww + \
          shared infra alive."
+    );
+}
+
+/// PR-E runtime Dhan-OFF gate source-scan ratchet.
+///
+/// When the operator toggles Dhan OFF from the feed-control page, the Dhan
+/// main-feed connections go dormant by design. Before this fix, the pool
+/// watchdog still read the resulting 0-connection pool as "fully degraded" and
+/// fired the 300s `Halt` → `process::exit(2)`, self-killing the whole process
+/// (which also killed the independent Groww feed). Live evidence:
+/// `A4 FATAL: WebSocket pool ... FULLY DEGRADED for >300s — initiating process halt`.
+///
+/// The fix threads the SAME `FeedRuntimeState::dhan` atomic the WS read/reconnect
+/// loop consults into `spawn_pool_watchdog_task`, and gates the Degraded/Halt
+/// ACTION on the combined `pool_watchdog_should_act_on_degradation(in_market_hours,
+/// dhan_enabled)` decision — so a deliberately-dormant Dhan-OFF pool is treated
+/// as expected idle (no page, no exit, no teardown), exactly like off-hours.
+///
+/// Source-scan is the right tool: the action is async + clock-gated + reads a
+/// shared atomic; a behavioural test would need to mock tokio::time +
+/// process::exit + the notification service. The pure decision itself has a
+/// direct unit test (`main.rs::tests::test_pool_watchdog_should_act_on_degradation_truth_table`);
+/// this ratchet pins the wiring so a refactor can't silently drop the gate.
+#[test]
+fn pool_watchdog_gates_on_runtime_dhan_enable_flag() {
+    let src = read_main_rs();
+
+    // 1. The watchdog must accept the runtime Dhan-enable flag argument.
+    assert!(
+        src.contains("dhan_enabled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>"),
+        "spawn_pool_watchdog_task must take a \
+         `dhan_enabled: Option<Arc<AtomicBool>>` argument — a clone of the SAME \
+         FeedRuntimeState::dhan atomic the WS read/reconnect loop consults. \
+         Without it a runtime Dhan-OFF dormant pool self-halts the whole process \
+         (killing Groww too) ~300s after the toggle (A4 FATAL incident)."
+    );
+
+    // 2. The pure decision helper must exist.
+    assert!(
+        src.contains("fn pool_watchdog_should_act_on_degradation("),
+        "the combined gate helper `pool_watchdog_should_act_on_degradation(\
+         in_market_hours, dhan_enabled)` must exist (unit-tested separately)."
+    );
+
+    let block = pool_watchdog_match_block(&src);
+
+    // 3. The Degraded and Halt action gates must use the combined `should_act`
+    //    decision (derived from the helper), NOT raw `in_market_hours` alone.
+    assert!(
+        block.contains("let should_act ="),
+        "the watchdog must compute `let should_act = \
+         pool_watchdog_should_act_on_degradation(in_market_hours, dhan_on);` and \
+         gate the Degraded/Halt action on it, so a runtime Dhan-OFF pool is \
+         treated as expected idle."
+    );
+    assert!(
+        block.contains("pool_watchdog_should_act_on_degradation(in_market_hours, dhan_on)"),
+        "should_act must be derived from \
+         pool_watchdog_should_act_on_degradation(in_market_hours, dhan_on)."
+    );
+
+    // 4. The Halt arm's action must be gated by `if should_act` (the combined
+    //    gate), so a deliberately-disabled Dhan never reaches process::exit /
+    //    lane teardown. The boot-ON `std::process::exit(2);` must sit AFTER the
+    //    `if should_act` gate.
+    let halt_idx = block
+        .find("WatchdogVerdict::Halt")
+        .expect("watchdog match block must include the Halt arm");
+    let halt_gate_idx = block[halt_idx..]
+        .find("if should_act")
+        .map(|rel| halt_idx + rel)
+        .expect("the Halt arm must gate its action on `if should_act` (PR-E gate)");
+    let exit_idx = block
+        .find("std::process::exit(2);")
+        .expect("Halt arm must still call std::process::exit(2); (boot-ON path)");
+    assert!(
+        halt_gate_idx < exit_idx,
+        "the `if should_act` gate must lexically precede the boot-ON \
+         std::process::exit(2) so a runtime Dhan-OFF (should_act == false) never \
+         reaches it. Found gate at {halt_gate_idx}, exit at {exit_idx}."
     );
 }

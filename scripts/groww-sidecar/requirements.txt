@@ -1,4 +1,6 @@
 # Groww validation sidecar (LOCAL-ONLY, operator lock §32).
-# Pin to the version you verify on your Mac; >= the researched 1.5.0.
-growwapi>=1.5.0
-pyotp>=2.9.0
+# Every version exact-pinned per the project "every version pinned" rule.
+# growwapi==1.5.0 is the EXACT wheel the native proto/subjects were extracted
+# from (docs/groww-ref/README.md + 10-live-feed-mapping-verified.md).
+growwapi==1.5.0
+pyotp==2.9.0

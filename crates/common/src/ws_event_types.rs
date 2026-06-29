@@ -34,6 +34,12 @@ pub enum WsType {
     Depth200,
     /// `wss://api-order-update.dhan.co` order-update feed (always 1 conn).
     OrderUpdate,
+    /// The Groww second feed (operator §32) — NOT a Dhan binary WS but a
+    /// Python-sidecar NDJSON tail bridge. A distinct `ws_type` keeps the broker
+    /// meaning of the SYMBOL honest: a `where ws_type='groww_bridge'` query reads
+    /// cleanly, and re-using a Dhan label (`main_feed`/`order_update`) would
+    /// silently mix two brokers in operator filters. Pairs with `feed='groww'`.
+    GrowwBridge,
 }
 
 impl WsType {
@@ -45,18 +51,20 @@ impl WsType {
             Self::Depth20 => "depth_20",
             Self::Depth200 => "depth_200",
             Self::OrderUpdate => "order_update",
+            Self::GrowwBridge => "groww_bridge",
         }
     }
 
     /// All variants — lets tests assert exhaustiveness + wire-label uniqueness
     /// without drifting from the enum.
     #[must_use]
-    pub const fn all() -> [WsType; 4] {
+    pub const fn all() -> [WsType; 5] {
         [
             Self::MainFeed,
             Self::Depth20,
             Self::Depth200,
             Self::OrderUpdate,
+            Self::GrowwBridge,
         ]
     }
 }
@@ -166,7 +174,13 @@ mod tests {
         // Stable values the QuestDB SYMBOL column depends on.
         assert_eq!(
             labels,
-            vec!["main_feed", "depth_20", "depth_200", "order_update"]
+            vec![
+                "main_feed",
+                "depth_20",
+                "depth_200",
+                "order_update",
+                "groww_bridge"
+            ]
         );
         // No two variants share a wire label.
         let unique: HashSet<&str> = labels.iter().copied().collect();
@@ -199,7 +213,7 @@ mod tests {
     fn test_all_arrays_match_variant_counts() {
         // If a variant is added, `all()` must be updated — these pin the count so
         // a new WS type / event kind cannot silently escape the audit schema.
-        assert_eq!(WsType::all().len(), 4);
+        assert_eq!(WsType::all().len(), 5);
         assert_eq!(WsEventKind::all().len(), 6);
     }
 

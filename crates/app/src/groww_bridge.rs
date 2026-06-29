@@ -44,12 +44,15 @@ use notify::{EventKind, RecursiveMode, Watcher};
 use serde::Deserialize;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use tickvault_api::feed_state::{Feed, FeedRuntimeState};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::tick_types::ParsedTick;
 use tickvault_common::types::ExchangeSegment;
+use tickvault_common::ws_event_types::{
+    WS_EVENT_NO_DHAN_CODE, WsEventAuditRow, WsEventKind, WsType,
+};
 use tickvault_storage::groww_persistence::{GrowwLiveTickRow, GrowwLiveTickWriter};
 use tickvault_storage::seal_writer_runner::global_seal_sender;
 use tickvault_trading::candles::{FeedStrategy, MultiTfAggregator};
@@ -89,6 +92,75 @@ pub const GROWW_STATUS_FILE_DEFAULT: &str = "data/groww/groww-status.json";
 const GROWW_BRIDGE_FALLBACK_POLL_MS: u64 = 1_000;
 /// Fallback (watcher-down) poll interval.
 const GROWW_BRIDGE_FALLBACK_POLL: Duration = Duration::from_millis(GROWW_BRIDGE_FALLBACK_POLL_MS);
+
+/// Build ONE `ws_event_audit` row for a Groww bridge lifecycle transition.
+///
+/// Mirrors the Dhan `WebSocketConnection::emit_ws_audit`
+/// (`crates/core/src/websocket/connection.rs`) but stamps `feed='groww'` +
+/// `ws_type='groww_bridge'` so a Groww lifecycle row never collides with a Dhan
+/// row (per-feed identity in the DEDUP key). Pure builder — no I/O — so the
+/// transition mapping is unit-testable without a live QuestDB.
+///
+/// COLD PATH: fired at most once per connect/disconnect/reconnect transition,
+/// NEVER per tick — the single owned-`String` reason is off the tick path.
+fn build_groww_ws_audit_row(
+    event_kind: WsEventKind,
+    source: &str,
+    reason: &str,
+) -> WsEventAuditRow {
+    // IST nanos for the designated timestamp + IST-midnight for the day —
+    // identical math to the Dhan helper (`connection.rs:688-692`).
+    let now_utc_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let now_ist_nanos =
+        now_utc_nanos.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+    let nanos_per_day: i64 = 86_400 * 1_000_000_000;
+    let trading_date_ist_nanos = now_ist_nanos - now_ist_nanos.rem_euclid(nanos_per_day);
+    WsEventAuditRow {
+        event_ts_ist_nanos: now_ist_nanos,
+        trading_date_ist_nanos,
+        feed: Feed::Groww,
+        ws_type: WsType::GrowwBridge,
+        // Single Groww bridge (pool_size 1) — matches the single-conn convention
+        // and the DEDUP composite `(ws_type, connection_index)`.
+        connection_index: 0,
+        pool_size: 1,
+        event_kind,
+        source: source.to_string(),
+        reason: reason.to_string(),
+        // Groww has no Dhan disconnect codes.
+        dhan_code: WS_EVENT_NO_DHAN_CODE,
+        down_secs: 0,
+        attempts: 0,
+        market_hours: tickvault_common::market_hours::is_within_market_hours_ist(),
+    }
+}
+
+/// Emit ONE Groww `ws_event_audit` row, best-effort (`try_send`).
+///
+/// Non-blocking: drop on full/closed exactly like the Dhan helper — the bridge
+/// loop is NEVER stalled by the forensic side-record (the CloudWatch log +
+/// `feed_health` for the same event still fired, so no operator-visible signal is
+/// lost; an ILP outage is AUDIT-WS-01 Medium on the shared consumer). No-op when
+/// no audit channel is attached (defensive / test builds).
+fn emit_groww_ws_audit(
+    tx: Option<&tokio::sync::mpsc::Sender<WsEventAuditRow>>,
+    event_kind: WsEventKind,
+    source: &str,
+    reason: &str,
+) {
+    let Some(tx) = tx else {
+        return;
+    };
+    let row = build_groww_ws_audit_row(event_kind, source, reason);
+    if let Err(err) = tx.try_send(row) {
+        // %err (Display) prints only "full"/"closed" — NOT the dropped row, whose
+        // pre-redaction reason must never reach a log (security review).
+        debug!(
+            reason = %err,
+            "groww ws_event_audit channel full/closed — row dropped (log+feed_health still fired)"
+        );
+    }
+}
 
 /// One line of the sidecar's PROOF status file. `event` is `"subscribed"` or
 /// `"streaming"`; the counts are the SIDs the sidecar actually subscribed today.
@@ -208,14 +280,16 @@ fn parse_groww_tick_line(line: &str) -> Result<ParsedGrowwTick> {
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
 /// Why a Groww tick cannot be folded through the shared 21-TF engine (the
-/// engine keys on `(u32 security_id, u8 segment_code)` and buckets on a `u32`
-/// IST-second timestamp). REJECT LOUDLY rather than a silent `as u32` alias.
+/// engine keys on `(u64 security_id, u8 segment_code)` and buckets on a `u32`
+/// IST-second timestamp). REJECT LOUDLY rather than a silent alias.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GrowwAggregateReject {
-    /// `security_id` (Groww `exchange_token`) does not fit `u32` (max observed
-    /// 1,175,236 ≪ u32::MAX, so this is a defense-in-depth guard against a future
-    /// Groww schema change — NEVER a silent truncation per the adversarial review).
-    TokenExceedsU32,
+    /// `security_id` (Groww `exchange_token`) is negative. Groww's native
+    /// exchange_token is non-negative and — since the 2026-06-29 `SecurityId`
+    /// u32→u64 widening — fits `u64` directly (indices set bit 62, well within
+    /// `u64`). This is a defence-in-depth gate that only rejects a truly negative
+    /// id; `validate_groww_tick` already filters `security_id <= 0` upstream.
+    NegativeSecurityId,
     /// The IST-second timestamp (`ts_ist_nanos / 1e9`) does not fit `u32`
     /// (epoch-seconds overflow u32 only ~2106 — an honest documented bound).
     TimestampExceedsU32,
@@ -223,8 +297,11 @@ enum GrowwAggregateReject {
 
 /// Builds the shared-engine [`ParsedTick`] from a validated Groww tick.
 ///
-/// Pure + testable. Performs the two WIDTH guards the adversarial review flagged:
-/// - `security_id: i64 → u32` via `u32::try_from` — REJECT on overflow, never `as u32`.
+/// Pure + testable. Performs the guards the adversarial review flagged:
+/// - `security_id: i64 → u64` via `u64::try_from` — REJECT only on a negative id
+///   (since the 2026-06-29 `SecurityId` u32→u64 widening, Groww's native
+///   exchange_token — including bit-62 index ids — folds losslessly; no width
+///   rejection). This is the payoff: every Groww index tick now reaches a candle.
 /// - `ts_ist_nanos → IST seconds → u32` — REJECT on overflow.
 ///
 /// Groww has NO `day_open` / `day_close` / `oi`, so those `ParsedTick` fields are
@@ -233,8 +310,8 @@ enum GrowwAggregateReject {
 /// The `i64` `cum_volume` is NOT placed in `ParsedTick.volume` (a `u32` that would
 /// truncate) — it is carried separately as the consume_tick override.
 fn build_parsed_tick(parsed: &ParsedGrowwTick) -> Result<ParsedTick, GrowwAggregateReject> {
-    let security_id = u32::try_from(parsed.tick.security_id)
-        .map_err(|_| GrowwAggregateReject::TokenExceedsU32)?;
+    let security_id = u64::try_from(parsed.tick.security_id)
+        .map_err(|_| GrowwAggregateReject::NegativeSecurityId)?;
     let exchange_timestamp = u32::try_from(parsed.tick.ts_ist_nanos / NANOS_PER_SECOND)
         .map_err(|_| GrowwAggregateReject::TimestampExceedsU32)?;
     let t = ParsedTick {
@@ -456,8 +533,10 @@ pub(crate) struct GrowwBridgeState {
     /// Dhan (`MultiTfAggregator`), parameterized per-feed by FeedStrategy::GROWW.
     aggregator: MultiTfAggregator,
     /// Per-instrument first-seen set: on first sight pre_populate + seed the
-    /// cumulative baseline (Groww running day-volume). O(1) lookups.
-    seeded: std::collections::HashSet<(u32, u8)>,
+    /// cumulative baseline (Groww running day-volume). O(1) lookups. Keyed on the
+    /// `u64` security_id (post-2026-06-29 widening) so the SAME id keys both the
+    /// `ticks` row and the candle fold for Groww's native exchange_token.
+    seeded: std::collections::HashSet<(u64, u8)>,
     /// Monotonic, replay-stable dedup tiebreaker source (TICK-SEQ-01).
     capture_seq: AtomicI64,
     /// Byte read offset into the tick file (resumes across wakes).
@@ -470,11 +549,19 @@ pub(crate) struct GrowwBridgeState {
 }
 
 impl GrowwBridgeState {
-    /// Build a fresh bridge state with a live ILP writer (lazy-connect).
-    pub(crate) fn new(qdb: &QuestDbConfig) -> Self {
+    /// Build a bridge state around a CALLER-OWNED aggregator.
+    ///
+    /// `MultiTfAggregator` is `Clone` over a shared `Arc<HashMap>` (papaya
+    /// concurrent map; every method takes `&self`), so the caller can keep a
+    /// `.clone()` that shares the SAME underlying buckets. `run_groww_bridge`
+    /// uses this so the IST-midnight force-seal boundary task can `force_seal_all`
+    /// the SAME aggregator the per-tick path folds into — parity with the Dhan
+    /// IST-midnight force-seal (`crates/app/src/main.rs`). The per-tick fold path
+    /// (`drain_new_data`) is UNCHANGED.
+    pub(crate) fn with_aggregator(qdb: &QuestDbConfig, aggregator: MultiTfAggregator) -> Self {
         Self {
             live_writer: GrowwLiveTickWriter::new(qdb),
-            aggregator: MultiTfAggregator::with_capacity(GROWW_AGGREGATOR_CAPACITY),
+            aggregator,
             seeded: std::collections::HashSet::new(),
             capture_seq: AtomicI64::new(0),
             offset: 0,
@@ -657,6 +744,109 @@ impl GrowwBridgeState {
     }
 }
 
+/// Spawn the IST-midnight force-seal boundary task for the Groww aggregator.
+///
+/// PARITY WITH DHAN: this mirrors the Dhan IST-midnight force-seal task in
+/// `crates/app/src/main.rs` (the only other production `force_seal_all` call
+/// site). At IST 00:00 each trading day it force-seals every open bucket across
+/// all 21 timeframes so day-N candle state never fuses into day-(N+1)'s first
+/// bar. WITHOUT this, the LAST open bucket of each of the 21 Groww timeframes
+/// each day is silently overwritten by the next day's first tick — the verified
+/// candle-loss bug this task fixes.
+///
+/// `aggregator` is a `.clone()` of the bridge's aggregator — `MultiTfAggregator`
+/// shares its papaya `Arc<HashMap>` across clones, so this seals the SAME buckets
+/// the per-tick path folds into. Each sealed bar routes through the SAME shared
+/// seal-writer chain (`global_seal_sender`) tagged `feed: Feed::Groww` — exactly
+/// the per-tick Groww policy (`drop_d1: false` ⇒ D1 is routed for Groww; no
+/// prev-day pct-stamp; no Dhan heartbeat). The cell's `force_seal` re-arms
+/// `armed_for_day_open` and clears `last_sealed` internally, so no closure-level
+/// re-arm is needed (identical to the Dhan path).
+///
+/// Gated TWICE: skips on a non-trading-day midnight (`is_trading_day_today`) AND
+/// when Groww is runtime-disabled (`feed_runtime.is_enabled(Feed::Groww)`). An
+/// empty aggregator is a natural no-op (`force_seal_all` iterates zero entries).
+// TEST-EXEMPT: cold-path tokio I/O driver (sleep loop + boundary gate). The
+// load-bearing seal-routing closure is unit-tested via `route_seal`
+// (`test_groww_force_seal_routes_with_feed_groww`); the wiring is pinned by the
+// source-scan ratchet `test_run_groww_bridge_spawns_ist_midnight_force_seal`.
+fn spawn_groww_ist_midnight_force_seal(
+    aggregator: MultiTfAggregator,
+    feed_runtime: Arc<FeedRuntimeState>,
+    trading_calendar: Arc<tickvault_common::trading_calendar::TradingCalendar>,
+) {
+    tokio::spawn(async move {
+        loop {
+            // Sleep until the next IST midnight (bounded helper, ≤ 24h) — the
+            // SAME helper the Dhan IST-midnight force-seal uses.
+            let sleep_secs = tickvault_common::market_hours::secs_until_next_ist_midnight().max(1);
+            tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+
+            // Only force-seal on trading days — a non-trading-day midnight has no
+            // open buckets worth flushing (mirrors the Dhan task).
+            if !trading_calendar.is_trading_day_today() {
+                debug!("Groww IST-midnight force-seal: skipping (non-trading day)");
+                continue;
+            }
+
+            // Skip when Groww is runtime-disabled: a disabled feed produces no
+            // ticks, so there is nothing to seal (and we must not emit Groww
+            // candles while the feed is off). The flag is read into a local so
+            // this gate does not collide with the `run_groww_bridge` disable-branch
+            // source-scan anchor (which `find`s the FIRST literal occurrence).
+            let groww_enabled = feed_runtime.is_enabled(Feed::Groww);
+            if !groww_enabled {
+                debug!("Groww IST-midnight force-seal: skipping (Groww feed disabled)");
+                continue;
+            }
+
+            let Some(sender) = global_seal_sender() else {
+                warn!("Groww IST-midnight force-seal: seal sender not installed — skipping");
+                continue;
+            };
+
+            let mut sealed: u64 = 0;
+            let mut dropped: u64 = 0;
+            aggregator.force_seal_all(|security_id, segment_code, tf, state| {
+                // SAME shared per-seal routing as the per-tick Groww path:
+                // feed=Groww, drop_d1=false (Groww routes D1), no prev-day
+                // pct-stamp, no Dhan heartbeat, no per-M1 feed-health record
+                // (this is the EOD flush, not a live tick).
+                match crate::seal_routing::route_seal(
+                    crate::seal_routing::SealRouteParams {
+                        feed: Feed::Groww,
+                        drop_d1: false,
+                        prev_day_cache: None,
+                        heartbeat: None,
+                        feed_health_on_m1: None,
+                    },
+                    security_id,
+                    segment_code,
+                    tf,
+                    state,
+                    sender,
+                ) {
+                    crate::seal_routing::SealOutcome::Sent => {
+                        sealed = sealed.saturating_add(1);
+                    }
+                    crate::seal_routing::SealOutcome::DroppedFull => {
+                        dropped = dropped.saturating_add(1);
+                    }
+                    // Groww never drops D1 (drop_d1=false), so DroppedD1 is
+                    // unreachable here — handled for exhaustiveness only.
+                    crate::seal_routing::SealOutcome::DroppedD1 => {}
+                }
+            });
+            info!(
+                sealed,
+                dropped,
+                "Groww IST-midnight force-seal complete — open buckets flushed (feed=groww)"
+            );
+        }
+    });
+    info!("Groww bridge — IST-midnight force-seal task spawned (parity with Dhan)");
+}
+
 /// Consumer driver: EVENT-DRIVEN (zero-poll) tail of the sidecar's append-only
 /// NDJSON tick file (operator 2026-06-28: "true zero latency, no polling"). A
 /// `notify` filesystem watcher wakes the loop sub-ms on each append; the loop reads
@@ -687,6 +877,15 @@ pub async fn run_groww_bridge(
     // Live-feed health (operator 2026-06-22): record Groww ticks/candles +
     // connected-state so GET /api/feeds/health reports the truthful verdict.
     feed_health: Arc<tickvault_common::feed_health::FeedHealthRegistry>,
+    // ws_event_audit forensic sender (2026-06-29): one `feed='groww'` row per
+    // Groww connect/disconnect/reconnect, drained by the SAME consumer Dhan uses
+    // (`spawn_ws_event_audit_consumer`). `Option` mirrors the Dhan `ws_audit_tx`
+    // convention so a `None` build (defensive / test) is a no-op.
+    ws_audit_tx: Option<tokio::sync::mpsc::Sender<WsEventAuditRow>>,
+    // Trading calendar (2026-06-29): drives the IST-midnight force-seal boundary
+    // task's trading-day gate, using the SAME calendar handle the Dhan
+    // IST-midnight force-seal uses (`crates/app/src/main.rs`). Shared `Arc`.
+    trading_calendar: Arc<tickvault_common::trading_calendar::TradingCalendar>,
 ) {
     info!(
         path = %tick_file_path.display(),
@@ -694,7 +893,17 @@ pub async fn run_groww_bridge(
         "Groww bridge started — EVENT-DRIVEN tail of the sidecar tick file (zero-poll; \
          fallback watchdog only if the watcher drops). Idles until the sidecar appends."
     );
-    let mut state = GrowwBridgeState::new(&qdb);
+    // Build the Groww aggregator ONCE and hand a `.clone()` (shared papaya map)
+    // to the IST-midnight force-seal boundary task — parity with the Dhan
+    // IST-midnight force-seal (`main.rs`). The per-tick fold path keeps the SAME
+    // instance via `GrowwBridgeState`.
+    let aggregator = MultiTfAggregator::with_capacity(GROWW_AGGREGATOR_CAPACITY);
+    spawn_groww_ist_midnight_force_seal(
+        aggregator.clone(),
+        Arc::clone(&feed_runtime),
+        trading_calendar,
+    );
+    let mut state = GrowwBridgeState::with_aggregator(&qdb, aggregator);
 
     // PRIMARY path: install the event-driven filesystem watcher. If it fails, the
     // fallback poll alone keeps the bridge working (degraded, logged once). The
@@ -717,6 +926,13 @@ pub async fn run_groww_bridge(
     // zero-poll path alive across a transient watcher failure.
     let mut connect_logged = false;
     let mut streaming_observed = false;
+    // ws_event_audit edge latches (2026-06-29, audit-findings Rule 4 — edge-trigger
+    // only): `audited_connected` gates the Connected/Reconnected emit to fire ONCE
+    // per streaming rising edge (never per loop turn). `prior_disconnect` is set when
+    // a Disconnected/DisconnectedOffHours row was emitted on a disable falling edge,
+    // so the NEXT rising edge is classified Reconnected (not a second Connected).
+    let mut audited_connected = false;
+    let mut prior_disconnect = false;
 
     loop {
         // Wake on EITHER a filesystem event (zero-latency) OR the fallback timer.
@@ -754,6 +970,26 @@ pub async fn run_groww_bridge(
             // re-enable re-emits the ONE CONNECTED log and re-gates `connected`
             // on fresh streaming, never on the pre-disable carry-over.
             feed_health.set_connected(Feed::Groww, false);
+            // ws_event_audit falling edge: emit ONE Disconnected row on the
+            // transition out of a previously-audited connected state (off-hours →
+            // DisconnectedOffHours Low, else Disconnected). Gated on
+            // `audited_connected` so a disable while already-disconnected (or
+            // never-connected) does not spam a row each idle turn.
+            if audited_connected {
+                let kind = if tickvault_common::market_hours::is_within_market_hours_ist() {
+                    WsEventKind::Disconnected
+                } else {
+                    WsEventKind::DisconnectedOffHours
+                };
+                emit_groww_ws_audit(
+                    ws_audit_tx.as_ref(),
+                    kind,
+                    "feed_disabled",
+                    "groww disabled",
+                );
+                prior_disconnect = true;
+            }
+            audited_connected = false;
             connect_logged = false;
             streaming_observed = false;
             continue;
@@ -803,6 +1039,21 @@ pub async fn run_groww_bridge(
         // is NOT connected — the verdict engine then reports the honest Unknown/Down,
         // never a misleading green.
         feed_health.set_connected(Feed::Groww, streaming_observed);
+
+        // ws_event_audit rising edge: on the FIRST streaming observation since the
+        // last (re)arm, emit ONE row — Reconnected if a Disconnected was emitted
+        // since the last connect, else Connected. Gated on `audited_connected` so
+        // it fires once per rising edge, never per loop turn (audit-findings Rule 4).
+        if streaming_observed && !audited_connected {
+            let (kind, source) = if prior_disconnect {
+                (WsEventKind::Reconnected, "groww_resumed")
+            } else {
+                (WsEventKind::Connected, "groww_sidecar")
+            };
+            emit_groww_ws_audit(ws_audit_tx.as_ref(), kind, source, "groww streaming");
+            audited_connected = true;
+            prior_disconnect = false;
+        }
     }
 }
 
@@ -1033,21 +1284,44 @@ mod tests {
     }
 
     #[test]
-    fn test_build_parsed_tick_rejects_token_above_u32_max() {
-        // Defense-in-depth (adversarial review): a Groww exchange_token that does
-        // not fit u32 is rejected LOUDLY, never silently aliased via `as u32`.
+    fn test_build_parsed_tick_folds_64bit_token_with_bit62_set() {
+        // THE PAYOFF of the u32→u64 SecurityId widening (2026-06-29): a Groww
+        // native exchange_token that sets bit 62 (the index-id encoding, see
+        // instruments.rs) exceeds u32 and was PREVIOUSLY rejected
+        // (TokenExceedsU32) so every Groww index tick was silently lost. It now
+        // folds losslessly through the shared 21-TF engine.
         let mut p = valid_parsed();
-        p.tick.security_id = i64::from(u32::MAX) + 1;
+        let sixty_four_bit_id: i64 = (1_i64 << 62) | 12_345;
+        p.tick.security_id = sixty_four_bit_id;
+        let pt = build_parsed_tick(&p).expect("64-bit bit-62 Groww id must fold, NOT reject");
+        assert_eq!(
+            pt.security_id,
+            (1_u64 << 62) | 12_345,
+            "the full u64 id (incl. bit 62) must be carried, not truncated"
+        );
+        // Boundary: exactly u32::MAX is accepted (was the old upper bound).
+        p.tick.security_id = i64::from(u32::MAX);
+        assert!(build_parsed_tick(&p).is_ok());
+        // u64::MAX-range value (i64::MAX) also folds — no width rejection.
+        p.tick.security_id = i64::MAX;
+        let pt_max = build_parsed_tick(&p).expect("i64::MAX id must fold");
+        assert_eq!(pt_max.security_id, i64::MAX as u64);
+    }
+
+    #[test]
+    fn test_build_parsed_tick_rejects_negative_security_id() {
+        // Defence-in-depth: a negative id (which validate_groww_tick already
+        // filters upstream) is rejected LOUDLY by the u64::try_from gate, never
+        // wrapped into a huge u64.
+        let mut p = valid_parsed();
+        p.tick.security_id = -7;
         assert!(
             matches!(
                 build_parsed_tick(&p),
-                Err(GrowwAggregateReject::TokenExceedsU32)
+                Err(GrowwAggregateReject::NegativeSecurityId)
             ),
-            "token above u32::MAX must reject loudly, never `as u32` alias"
+            "negative security_id must reject loudly"
         );
-        // Boundary: exactly u32::MAX is accepted.
-        p.tick.security_id = i64::from(u32::MAX);
-        assert!(build_parsed_tick(&p).is_ok());
     }
 
     #[test]
@@ -1360,12 +1634,15 @@ mod tests {
         // yet (sidecar not started), drain_new_data is a no-op returning false — the
         // loop simply idles. Proves the bridge survives the watcher-unavailable case.
         let reg = tickvault_common::feed_health::FeedHealthRegistry::new();
-        let mut state = GrowwBridgeState::new(&QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: 9000,
-            pg_port: 8812,
-            ilp_port: 9009,
-        });
+        let mut state = GrowwBridgeState::with_aggregator(
+            &QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: 9000,
+                pg_port: 8812,
+                ilp_port: 9009,
+            },
+            MultiTfAggregator::with_capacity(GROWW_AGGREGATOR_CAPACITY),
+        );
         let missing = std::path::Path::new("/nonexistent-tv-groww-tick-file-xyz.ndjson");
         let parsed = state.drain_new_data(missing, &reg).await;
         assert!(
@@ -1409,7 +1686,9 @@ mod tests {
         let disable_idx = src
             .find("if !feed_runtime.is_enabled(Feed::Groww) {")
             .expect("disable branch present");
-        let after = &src[disable_idx..disable_idx + 600];
+        // Window widened (PR-10) to span the inserted ws_event_audit falling-edge
+        // emit block — the latch re-arm now lives just below it.
+        let after = &src[disable_idx..disable_idx + 1600];
         assert!(
             after.contains(&clear)
                 && after.contains("connect_logged = false")
@@ -1454,6 +1733,210 @@ mod tests {
                 .input
                 .connected,
             "re-enable + fresh streaming → connected true again"
+        );
+    }
+
+    // --- PR-10: Groww ws_event_audit emit (the audit-gap fix) ---
+
+    #[test]
+    fn test_groww_connected_transition_builds_connected_row() {
+        // First streaming/parsed-tick rising edge → a Connected row, feed=Groww.
+        let row =
+            build_groww_ws_audit_row(WsEventKind::Connected, "groww_sidecar", "groww streaming");
+        assert_eq!(row.event_kind, WsEventKind::Connected);
+        assert_eq!(row.feed, Feed::Groww);
+        assert_eq!(row.source, "groww_sidecar");
+    }
+
+    #[test]
+    fn test_groww_disable_builds_disconnected_offhours_or_disconnected_row() {
+        // The disable falling edge classifies on market hours: DisconnectedOffHours
+        // when out-of-session, Disconnected in-session. Assert the builder honours
+        // BOTH kinds (the bridge picks the kind; the builder stamps it faithfully).
+        let off = build_groww_ws_audit_row(
+            WsEventKind::DisconnectedOffHours,
+            "feed_disabled",
+            "groww disabled",
+        );
+        assert_eq!(off.event_kind, WsEventKind::DisconnectedOffHours);
+        assert_eq!(off.feed, Feed::Groww);
+        let on =
+            build_groww_ws_audit_row(WsEventKind::Disconnected, "feed_disabled", "groww disabled");
+        assert_eq!(on.event_kind, WsEventKind::Disconnected);
+        assert_eq!(on.source, "feed_disabled");
+    }
+
+    #[test]
+    fn test_groww_reconnect_builds_reconnected_row() {
+        // A second streaming edge after a disable → Reconnected (NOT a 2nd Connected).
+        let row =
+            build_groww_ws_audit_row(WsEventKind::Reconnected, "groww_resumed", "groww streaming");
+        assert_eq!(row.event_kind, WsEventKind::Reconnected);
+        assert_eq!(row.feed, Feed::Groww);
+        assert_eq!(row.source, "groww_resumed");
+    }
+
+    #[test]
+    fn test_groww_audit_row_stamps_feed_groww_and_growwbridge_wstype() {
+        // The row identity that keeps a Groww row distinct from a Dhan row in the
+        // feed-keyed DEDUP, and the no-Dhan-code/single-conn convention.
+        let row =
+            build_groww_ws_audit_row(WsEventKind::Connected, "groww_sidecar", "groww streaming");
+        assert_eq!(row.feed, Feed::Groww);
+        assert_eq!(row.ws_type, WsType::GrowwBridge);
+        assert_eq!(row.connection_index, 0);
+        assert_eq!(row.pool_size, 1);
+        assert_eq!(row.dhan_code, WS_EVENT_NO_DHAN_CODE);
+        assert_eq!(row.down_secs, 0);
+        assert_eq!(row.attempts, 0);
+        // Round-trips cleanly through the SAME multi-feed append path Dhan uses.
+        let mut writer =
+            tickvault_storage::ws_event_audit_persistence::WsEventAuditWriter::for_test();
+        writer
+            .append_row(&row)
+            .expect("groww row appends to the shared writer");
+        assert_eq!(writer.pending(), 1);
+    }
+
+    #[test]
+    fn test_emit_groww_ws_audit_is_noop_when_tx_none() {
+        // The Option<Sender> convention: a None build is a no-op (defensive/test),
+        // exactly like the Dhan `emit_ws_audit` early-return. No panic, no work.
+        emit_groww_ws_audit(
+            None,
+            WsEventKind::Connected,
+            "groww_sidecar",
+            "groww streaming",
+        );
+    }
+
+    #[test]
+    fn test_emit_groww_ws_audit_sends_row_when_tx_present() {
+        // With a channel attached, one emit lands exactly one row.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<WsEventAuditRow>(4);
+        emit_groww_ws_audit(
+            Some(&tx),
+            WsEventKind::Connected,
+            "groww_sidecar",
+            "groww streaming",
+        );
+        let row = rx.try_recv().expect("one groww audit row was sent");
+        assert_eq!(row.feed, Feed::Groww);
+        assert_eq!(row.ws_type, WsType::GrowwBridge);
+        assert_eq!(row.event_kind, WsEventKind::Connected);
+    }
+
+    #[test]
+    fn test_groww_bridge_emits_ws_event_audit_on_connect_and_disconnect() {
+        // Source-scan ratchet (mirrors the other bridge source-scan guards): a future
+        // refactor cannot silently drop the audit emit on the connect rising edge OR
+        // the disable falling edge. `run_groww_bridge` is a TEST-EXEMPT I/O driver.
+        let src = include_str!("groww_bridge.rs");
+        // Build the needle at runtime so this test literal does not self-match the scan.
+        let connected = format!("WsEventKind::{}", "Connected");
+        let disconnected = format!("WsEventKind::{}", "Disconnected");
+        // The connect rising edge must emit on a Connected/Reconnected kind.
+        assert!(
+            src.contains("emit_groww_ws_audit(") && src.contains(&connected),
+            "the bridge must emit a ws_event_audit row on the connect rising edge"
+        );
+        // The disable falling edge must emit on a Disconnected/DisconnectedOffHours kind.
+        let disable_idx = src
+            .find("if !feed_runtime.is_enabled(Feed::Groww) {")
+            .expect("disable branch present");
+        let after = &src[disable_idx..disable_idx + 1600];
+        assert!(
+            after.contains("emit_groww_ws_audit(") && after.contains(&disconnected),
+            "the disable branch must emit a Disconnected/DisconnectedOffHours audit row"
+        );
+    }
+
+    // --- IST-midnight / EOD force-seal parity with Dhan (2026-06-29) ---
+
+    #[tokio::test]
+    async fn test_groww_force_seal_routes_with_feed_groww() {
+        // The load-bearing contract of the Groww IST-midnight force-seal closure:
+        // it routes each sealed bar through the SHARED seal-writer chain tagged
+        // `feed: Feed::Groww`, with `drop_d1: false` (Groww routes EVERY TF,
+        // including D1 — unlike Dhan which drops D1). This is the EXACT
+        // SealRouteParams the boundary task in `spawn_groww_ist_midnight_force_seal`
+        // passes; driving `route_seal` directly proves a force-sealed Groww bucket
+        // lands in the channel with the right feed tag for a non-D1 AND a D1 TF.
+        use tickvault_trading::candles::{BufferedSeal, LiveCandleState, TfIndex};
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<BufferedSeal>(8);
+        let params = crate::seal_routing::SealRouteParams {
+            feed: Feed::Groww,
+            drop_d1: false,
+            prev_day_cache: None,
+            heartbeat: None,
+            feed_health_on_m1: None,
+        };
+
+        // A non-D1 force-sealed bar routes, tagged feed=Groww.
+        let out = crate::seal_routing::route_seal(
+            params,
+            1333,
+            1,
+            TfIndex::M1,
+            LiveCandleState::empty(),
+            &tx,
+        );
+        assert_eq!(out, crate::seal_routing::SealOutcome::Sent);
+        let m1 = rx.try_recv().expect("Groww force-sealed M1 bar must route");
+        assert_eq!(
+            m1.feed,
+            Feed::Groww,
+            "force-sealed Groww bar must carry feed=Groww"
+        );
+        assert_eq!(m1.security_id, 1333);
+        assert_eq!(m1.tf, TfIndex::M1);
+
+        // D1 is NOT dropped for Groww (drop_d1=false) — the last open day-bucket
+        // is sealed, not silently lost (the bug this task fixes).
+        let out = crate::seal_routing::route_seal(
+            params,
+            1333,
+            1,
+            TfIndex::D1,
+            LiveCandleState::empty(),
+            &tx,
+        );
+        assert_eq!(out, crate::seal_routing::SealOutcome::Sent);
+        let d1 = rx
+            .try_recv()
+            .expect("Groww force-sealed D1 bar must route (no drop)");
+        assert_eq!(d1.tf, TfIndex::D1);
+        assert_eq!(d1.feed, Feed::Groww);
+    }
+
+    #[test]
+    fn test_run_groww_bridge_spawns_ist_midnight_force_seal() {
+        // PARITY WITH DHAN (the verified bug fix): the bridge MUST spawn an
+        // IST-midnight force-seal boundary task that flushes every open bucket of
+        // every Groww timeframe at day rollover — WITHOUT it the last bucket of
+        // each day is silently overwritten by the next day's first tick. Pin the
+        // wiring by source-scan (the spawn helper is a TEST-EXEMPT cold-path I/O
+        // driver), so a future refactor cannot silently drop the EOD seal.
+        let src = include_str!("groww_bridge.rs");
+        assert!(
+            src.contains("fn spawn_groww_ist_midnight_force_seal")
+                && src.contains("spawn_groww_ist_midnight_force_seal("),
+            "the bridge must define AND call an IST-midnight force-seal spawn helper"
+        );
+        assert!(
+            src.contains("force_seal_all")
+                && src.contains("secs_until_next_ist_midnight")
+                && src.contains("is_trading_day_today"),
+            "the force-seal task must call force_seal_all, sleep until IST midnight, \
+             and gate on the trading-day calendar (mirroring the Dhan task)"
+        );
+        // Build the feed-tag needle at runtime so this assertion's OWN literal does
+        // not self-match the include_str! scan — the real occurrence is the
+        // boundary closure's SealRouteParams.
+        let groww_feed = format!("feed: Feed::{}", "Groww");
+        assert!(
+            src.contains(&groww_feed),
+            "the force-seal closure must route with feed: Feed::Groww (drop_d1: false)"
         );
     }
 }

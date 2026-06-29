@@ -276,7 +276,7 @@ mod tests {
 
     fn make_instruments(count: usize) -> Vec<InstrumentSubscription> {
         (0..count)
-            .map(|i| InstrumentSubscription::new(ExchangeSegment::NseFno, (i as u32) + 1000))
+            .map(|i| InstrumentSubscription::new(ExchangeSegment::NseFno, (i as u64) + 1000))
             .collect()
     }
 
@@ -452,7 +452,7 @@ mod tests {
     fn test_large_security_id_u32_max_as_string() {
         let instruments = vec![InstrumentSubscription::new(
             ExchangeSegment::NseFno,
-            u32::MAX,
+            u64::from(u32::MAX),
         )];
         let messages = build_subscription_messages(&instruments, FeedMode::Ticker, 100);
         assert!(messages[0].contains(&format!("\"SecurityId\":\"{}\"", u32::MAX)));

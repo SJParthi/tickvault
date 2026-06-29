@@ -53,7 +53,7 @@ pub enum VolumeObservation {
 /// scheduled task that drains other midnight resets).
 pub struct VolumeMonotonicityGuard {
     /// Composite key (I-P1-11) — DO NOT regress to single-u32 key.
-    last_seen: HashMap<(u32, u8), u32>,
+    last_seen: HashMap<(u64, u8), u32>,
     /// Cumulative breaches observed since the last `clear()`. Exposed as
     /// the canonical Prom counter `tv_volume_monotonicity_breaches_total`
     /// in production (the in-memory copy here is for tests + diagnostics).
@@ -90,7 +90,7 @@ impl VolumeMonotonicityGuard {
     #[inline]
     pub fn observe(
         &mut self,
-        security_id: u32,
+        security_id: u64,
         exchange_segment_code: u8,
         volume: u32,
     ) -> VolumeObservation {

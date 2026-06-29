@@ -65,7 +65,7 @@ fn test_golden_groww_1m_through_multi_tf_matches_legacy() {
     // Drive the NEW path: Groww feed via the 21-TF engine + GROWW strategy
     // (Discard) + i64 cumulative-volume override (the Groww cumulative).
     let agg = MultiTfAggregator::new();
-    agg.pre_populate(std::iter::once((1_333_u32, 1_u8)));
+    agg.pre_populate(std::iter::once((1_333_u64, 1_u8)));
     // Groww bridge seeds the first-tick cumulative as the baseline (legacy parity).
     agg.seed_cumulative(1_333, 1, 100);
 
@@ -139,7 +139,7 @@ fn test_groww_pre_open_minute_is_gated_intended() {
     // NOT silent. (If SP6 finds Groww backtest emits pre-open candles, revisit with
     // a pre-open-aware bucket grid — a separate, larger change.)
     let agg = MultiTfAggregator::new();
-    agg.pre_populate(std::iter::once((1_333_u32, 1_u8)));
+    agg.pre_populate(std::iter::once((1_333_u64, 1_u8)));
     agg.seed_cumulative(1_333, 1, 100);
     let mut sealed = false;
     // Two ticks inside the 09:00 IST pre-open minute + a cross into the next minute.
@@ -171,7 +171,7 @@ fn test_groww_through_multi_tf_produces_all_21_tfs() {
     // day-spanning jump) must emit a seal for all 21 TFs — Groww now generates
     // the full timeframe set, not just 1m.
     let agg = MultiTfAggregator::new();
-    agg.pre_populate(std::iter::once((1_333_u32, 1_u8)));
+    agg.pre_populate(std::iter::once((1_333_u64, 1_u8)));
 
     // Open every TF's first bucket of the day at market open.
     agg.consume_tick(
@@ -218,7 +218,7 @@ fn test_groww_cumulative_volume_above_u32_max_not_truncated() {
     // truncated (the bug that would happen if it were funnelled through the u32
     // ParsedTick.volume field).
     let agg = MultiTfAggregator::new();
-    agg.pre_populate(std::iter::once((1_333_u32, 1_u8)));
+    agg.pre_populate(std::iter::once((1_333_u64, 1_u8)));
 
     let baseline: u64 = 5_000_000_000; // > u32::MAX (4_294_967_295)
     let last: u64 = 5_000_000_500; // +500 within the SAME minute (minute 1)
@@ -266,7 +266,7 @@ fn test_groww_discard_late_policy_never_amends() {
     // tick reports as late, NOT amended — proving the per-feed strategy preserves
     // Groww's exact behaviour (a Dhan Refold would have amended).
     let agg = MultiTfAggregator::new();
-    agg.pre_populate(std::iter::once((1_333_u32, 1_u8)));
+    agg.pre_populate(std::iter::once((1_333_u64, 1_u8)));
 
     agg.consume_tick(
         &groww_tick(M1_BASE, 100.0),
@@ -310,7 +310,7 @@ fn test_dhan_refold_policy_still_amends_one_bucket_late() {
     // amend a 1-bucket-late tick — proving the two feeds' behaviours diverge by
     // VALUE (the strategy), not by forked engine code.
     let agg = MultiTfAggregator::new();
-    agg.pre_populate(std::iter::once((1_333_u32, 1_u8)));
+    agg.pre_populate(std::iter::once((1_333_u64, 1_u8)));
 
     agg.consume_tick(
         &groww_tick(M1_BASE, 100.0),

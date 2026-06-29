@@ -68,7 +68,7 @@ mod tests {
             response_code: 6,
             message_length: PREVIOUS_CLOSE_PACKET_SIZE as u16,
             exchange_segment_code: 0,
-            security_id,
+            security_id: u64::from(security_id),
         };
         (buf, hdr)
     }

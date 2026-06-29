@@ -30,8 +30,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tickvault_api::feed_state::{Feed, FeedRuntimeState};
-use tickvault_common::config::{FeedsConfig, QuestDbConfig};
+use tickvault_common::config::{FeedsConfig, QuestDbConfig, TradingConfig};
 use tickvault_common::feed_health::FeedHealthRegistry;
+use tickvault_common::trading_calendar::TradingCalendar;
 
 const QDB_HTTP_PORT: u16 = 9000;
 const QDB_ILP_PORT: u16 = 9009;
@@ -56,6 +57,26 @@ fn test_qdb() -> QuestDbConfig {
         pg_port: 8812,
         ilp_port: QDB_ILP_PORT,
     }
+}
+
+/// A shared `Arc<TradingCalendar>` for the `run_groww_bridge` 7th argument (the
+/// IST-midnight/EOD force-seal boundary task's trading-day gate). Empty holiday
+/// set is fine here — these e2e tests feed synthetic NDJSON and abort the bridge
+/// before any boundary fires; the calendar only needs to construct cleanly.
+fn test_calendar() -> Arc<TradingCalendar> {
+    let trading = TradingConfig {
+        market_open_time: "09:00:00".to_string(),
+        market_close_time: "15:30:00".to_string(),
+        order_cutoff_time: "15:29:00".to_string(),
+        data_collection_start: "09:00:00".to_string(),
+        data_collection_end: "15:30:00".to_string(),
+        timezone: "Asia/Kolkata".to_string(),
+        max_orders_per_second: 10,
+        nse_holidays: vec![],
+        muhurat_trading_dates: vec![],
+        nse_mock_trading_dates: vec![],
+    };
+    Arc::new(TradingCalendar::from_config(&trading).expect("valid test calendar")) // APPROVED: test-only
 }
 
 /// True when QuestDB's HTTP `/exec` answers 200 AND the ILP TCP port accepts a
@@ -223,6 +244,8 @@ async fn groww_ticks_and_candles_land_tagged_feed_groww() {
         status_file.clone(),
         Arc::clone(&feed_runtime),
         Arc::clone(&feed_health),
+        None,
+        test_calendar(),
     ));
 
     // --- Assert the 5 ticks landed in `ticks` tagged feed='groww' ---
@@ -378,6 +401,8 @@ async fn malformed_ndjson_line_is_skipped_and_valid_lines_land() {
         status_file.clone(),
         Arc::clone(&feed_runtime),
         Arc::clone(&feed_health),
+        None,
+        test_calendar(),
     ));
 
     let ticks_sql =
@@ -444,6 +469,8 @@ async fn replay_same_ndjson_is_idempotent_no_duplicate_rows() {
             status_file.clone(),
             Arc::clone(&feed_runtime),
             Arc::clone(&feed_health),
+            None,
+            test_calendar(),
         ));
         let _ = wait_until_count(&ticks_sql, 3, Duration::from_secs(15)).await;
         bridge.abort();

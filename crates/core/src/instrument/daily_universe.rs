@@ -177,7 +177,7 @@ impl DailyUniverse {
     ///
     /// O(1) EXEMPT: cold-path, runs once per boot over ~250 targets.
     #[must_use]
-    pub fn always_on_segments(&self) -> std::collections::HashSet<(u32, u8)> {
+    pub fn always_on_segments(&self) -> std::collections::HashSet<(u64, u8)> {
         use super::index_extractor::{GIFT_NIFTY_SYMBOL, normalize_index_symbol};
         let mut set = std::collections::HashSet::new();
         for t in &self.subscription_targets {
@@ -191,10 +191,10 @@ impl DailyUniverse {
             // Rule 11 (no silent false-OK): if a found GIFT row can't resolve,
             // the exemption is silently empty → GIFT ticks wrongly dropped
             // outside 09:15–15:30. Surface it loudly instead.
-            let Ok(sid) = t.csv_row.security_id.trim().parse::<u32>() else {
+            let Ok(sid) = t.csv_row.security_id.trim().parse::<u64>() else {
                 tracing::warn!(
                     security_id = %t.csv_row.security_id,
-                    "always-on: GIFT Nifty row found but security_id did not parse as u32 — \
+                    "always-on: GIFT Nifty row found but security_id did not parse as u64 — \
                      market-hours exemption will be EMPTY for GIFT this session"
                 );
                 continue;

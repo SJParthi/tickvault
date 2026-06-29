@@ -48,7 +48,7 @@ use tickvault_storage::tick_persistence::{tick_dedup_key, tick_payload_hash};
 /// DEDUP UPSERT KEYS `(ts, security_id, segment, payload_hash)` EXACTLY by
 /// calling the production `tick_payload_hash`. (2026-06-08: `received_at` was
 /// replaced by the content fingerprint `payload_hash` — see the module header.)
-fn dedup_tuple(tick: &ParsedTick) -> (u32, u32, u8, i64) {
+fn dedup_tuple(tick: &ParsedTick) -> (u32, u64, u8, i64) {
     (
         tick.exchange_timestamp,
         tick.security_id,
@@ -59,7 +59,7 @@ fn dedup_tuple(tick: &ParsedTick) -> (u32, u32, u8, i64) {
 
 fn arb_tick() -> impl Strategy<Value = ParsedTick> {
     (
-        any::<u32>(),       // security_id
+        any::<u64>(),       // security_id
         any::<u8>(),        // exchange_segment_code
         any::<u32>(),       // exchange_timestamp
         1_f32..100_000_f32, // ltp (bounded to realistic prices)
@@ -120,7 +120,7 @@ proptest! {
     #[test]
     fn prop_different_security_id_different_tuple(
         base in arb_tick(),
-        new_sid in any::<u32>(),
+        new_sid in any::<u64>(),
     ) {
         prop_assume!(new_sid != base.security_id);
         let mut changed = base;

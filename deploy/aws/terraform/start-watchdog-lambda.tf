@@ -105,7 +105,11 @@ resource "aws_lambda_function" "start_watchdog" {
     variables = {
       EC2_INSTANCE_ID  = aws_instance.tv_app.id
       ALERTS_TOPIC_ARN = aws_sns_topic.tv_alerts.arn
-      LOG_LEVEL        = "INFO"
+      # App port for the Feed Control page link in the 08:30 IST start ping
+      # (config/base.toml [api] port). The ping reads the instance's live
+      # public IP via the existing ec2:DescribeInstances grant — no new IAM.
+      DASHBOARD_PORT = "3001"
+      LOG_LEVEL      = "INFO"
     }
   }
 
