@@ -402,6 +402,37 @@ pub fn build_groww_lifecycle_select_sql() -> String {
     )
 }
 
+/// PURE classifier: does a non-2xx QuestDB `/exec` response mean "the table does
+/// not exist yet" (a fresh / brand-new database) rather than a genuine outage?
+///
+/// On a fresh-clone / fresh-QuestDB boot the `instrument_lifecycle` table is not
+/// created until LATER in the persist orchestration, so the audit prior-snapshot
+/// SELECT runs against a missing table. QuestDB answers that with HTTP 400 and a
+/// body containing `table does not exist` (sometimes `does not exist` /
+/// `table not found`). That is NOT a QuestDB outage — it is the Day-1 empty-prior
+/// case, and the diff MUST treat it as an empty prior (every today row `appeared`),
+/// not as a hard read failure that suppresses ALL audit rows.
+///
+/// Returns `true` ONLY when the response is a client error (4xx — QuestDB rejected
+/// the query) AND the body names a missing/absent table. A 5xx, a connection
+/// refusal, or any other body is NOT classified as table-missing, so a genuine
+/// outage still degrades safely (the caller bails → logs `GROWW-MASTER-01` →
+/// builds no audit rows → next boot re-emits).
+///
+/// PURE, zero-I/O — extracted so the table-missing → empty-prior decision is
+/// unit-testable without a live QuestDB.
+#[cfg(feature = "daily_universe_fetcher")]
+#[must_use]
+fn is_table_missing_response(is_client_error: bool, body: &str) -> bool {
+    if !is_client_error {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("table does not exist")
+        || lower.contains("does not exist")
+        || lower.contains("table not found")
+}
+
 /// Parse the QuestDB `dataset` array into the prior-attrs map. PURE — no I/O.
 /// Unknown `lifecycle_state` / malformed rows are SKIPPED (counted by the caller
 /// only implicitly — never guessed), mirroring the Dhan loader's discipline.
@@ -638,6 +669,7 @@ async fn load_prev_groww_lifecycle(
         .context("HTTP GET Groww lifecycle read-back against QuestDB")?;
     if !resp.status().is_success() {
         let status = resp.status();
+        let is_client_error = status.is_client_error();
         let body: String = resp
             .text()
             .await
@@ -645,6 +677,19 @@ async fn load_prev_groww_lifecycle(
             .chars()
             .take(200)
             .collect();
+        // Fresh DB: the `instrument_lifecycle` table does not exist yet (it is
+        // created later in the persist orchestration). QuestDB returns 4xx +
+        // "table does not exist". Treat that as an EMPTY prior snapshot (Day-1 →
+        // every today row `appeared`) — NOT a hard read failure that would
+        // suppress all audit rows. A genuine outage (5xx / refused / other body)
+        // still bails → degrade-safe per the caller's GROWW-MASTER-01 arm.
+        if is_table_missing_response(is_client_error, &body) {
+            info!(
+                "[feeds] Groww lifecycle prior-snapshot: instrument_lifecycle table absent \
+                 (fresh DB) — treating as empty prior (Day-1, all appeared)"
+            );
+            return Ok(HashMap::new());
+        }
         anyhow::bail!("QuestDB Groww lifecycle read-back returned HTTP {status}: {body}");
     }
     #[derive(serde::Deserialize)]
@@ -796,6 +841,18 @@ pub async fn persist_groww_instruments(
         return;
     }
 
+    // ── instrument_lifecycle table — CREATE FIRST (fresh-DB fix) ──
+    // The audit emit below reads the prior `feed='groww'` snapshot from
+    // `instrument_lifecycle`. On a fresh-clone / fresh-QuestDB boot that table does
+    // not exist yet, and (before this) the SELECT 4xx'd → the audit took its
+    // degrade-safe early return → ZERO `instrument_lifecycle_audit` rows on Day-1.
+    // Ensuring the (idempotent) table FIRST means the read targets a real (empty)
+    // table → Day-1 classifies all entries as `appeared`. The `load_prev_*` reader
+    // also treats a table-missing response as an empty prior, so this is
+    // belt-and-suspenders, not the sole guard.
+    tickvault_storage::instrument_lifecycle_persistence::ensure_instrument_lifecycle_table(questdb)
+        .await;
+
     // ── instrument_lifecycle_audit (feed='groww') — AUDIT-FIRST (§24) ──
     // Diff today's master set against yesterday's `feed='groww'` snapshot and emit
     // the appeared/updated/expired transition chain BEFORE the lifecycle DATA UPSERT,
@@ -803,9 +860,7 @@ pub async fn persist_groww_instruments(
     // degrade-safe internally — never aborts the data writes below.
     emit_groww_lifecycle_audit(questdb, set, now_ist_nanos, trading_date_ist_nanos, dry_run).await;
 
-    // ── instrument_lifecycle ──
-    tickvault_storage::instrument_lifecycle_persistence::ensure_instrument_lifecycle_table(questdb)
-        .await;
+    // ── instrument_lifecycle DATA UPSERT ──
     match tickvault_storage::instrument_lifecycle_persistence::append_instrument_lifecycle_rows(
         questdb,
         &lifecycle_rows,
@@ -1666,6 +1721,168 @@ mod tests {
     fn test_parse_groww_lifecycle_dataset_empty_and_non_array() {
         assert!(parse_groww_lifecycle_dataset(&serde_json::json!([])).is_empty());
         assert!(parse_groww_lifecycle_dataset(&serde_json::json!({"x": 1})).is_empty());
+    }
+
+    // ── FRESH-DB FIX: table-missing 4xx → empty prior (Day-1), not a hard bail ──
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_is_table_missing_response_classifies_questdb_missing_table() {
+        // QuestDB returns 4xx + this body when the table has not been created yet
+        // (fresh-clone / fresh-DB boot). It MUST be classified as table-missing so
+        // the reader returns an empty prior (Day-1) instead of suppressing all
+        // audit rows. The exact body QuestDB emits, plus its variants.
+        for body in [
+            r#"{"error":"table does not exist"}"#,
+            r#"{"error":"table does not exist [table=instrument_lifecycle]"}"#,
+            "table not found",
+            // Case-insensitive match (QuestDB casing has varied across versions).
+            "TABLE DOES NOT EXIST",
+        ] {
+            assert!(
+                is_table_missing_response(true, body),
+                "client-error + missing-table body must classify as table-missing: {body}"
+            );
+        }
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_is_table_missing_response_rejects_genuine_outage() {
+        // A 5xx (server error / genuine QuestDB outage) is NOT table-missing even if
+        // the body somehow mentioned "exist" — only a CLIENT error (4xx, query
+        // rejected) counts. This preserves the degrade-safe bail for real outages.
+        assert!(
+            !is_table_missing_response(false, r#"{"error":"table does not exist"}"#),
+            "a 5xx (server error) must NOT be classified as table-missing — genuine outage bails"
+        );
+        // A 4xx whose body is some OTHER rejection (e.g. a syntax error) is NOT
+        // table-missing → still bails, so we never silently swallow a real query bug.
+        assert!(
+            !is_table_missing_response(true, r#"{"error":"unexpected token: GROWW"}"#),
+            "a 4xx with an unrelated body must NOT be treated as table-missing"
+        );
+        assert!(
+            !is_table_missing_response(true, ""),
+            "an empty body is NOT table-missing — degrade-safe bail"
+        );
+    }
+
+    /// Day-1 / fresh-DB behaviour, end-to-end on the PURE path: an empty prior
+    /// (which is exactly what the table-missing classifier now returns) makes the
+    /// diff classify EVERY Groww master entry as `appeared`, so a brand-new
+    /// database DOES get its `instrument_lifecycle_audit` (feed='groww') rows on the
+    /// first boot. This is the regression that was silently empty before this fix.
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_fresh_db_empty_prior_yields_day1_appeared_audit_rows() {
+        // A representative Groww master set (indices + resolved stocks).
+        let set = set_of(vec![
+            index("NIFTY", "NSE", 999),
+            stock("2885", "INE002A01018", "RELIANCE"),
+            stock("1594", "INE009A01021", "INFY"),
+        ]);
+        let today = groww_today_attrs(&set);
+
+        // The fresh-DB read now returns an empty prior (table-missing → empty map).
+        let empty_prior: HashMap<GrowwLifecycleKey, GrowwPriorAttrs> = HashMap::new();
+        assert!(
+            is_table_missing_response(true, r#"{"error":"table does not exist"}"#),
+            "the fresh-DB response classifies as table-missing → empty prior"
+        );
+
+        let rows = build_groww_audit_rows(&empty_prior, &today, 111, 222, false);
+        assert_eq!(
+            rows.len(),
+            3,
+            "fresh DB must produce one Day-1 `appeared` audit row per master entry, not zero"
+        );
+        for r in &rows {
+            assert_eq!(r.transition_kind, TransitionKind::Appeared);
+            assert_eq!(r.from_state, None);
+            assert_eq!(r.as_row().feed, "groww");
+        }
+    }
+
+    /// Source-scan ratchet (Fix 2 wiring): the persist orchestration MUST create the
+    /// `instrument_lifecycle` table BEFORE the audit emit reads its prior snapshot,
+    /// so a fresh DB never reads a missing table. Pins the ordering so a future
+    /// refactor cannot silently reintroduce the Day-1 empty-audit bug.
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_persist_ensures_lifecycle_table_before_audit_emit() {
+        let file = include_str!("shared_master_writer.rs");
+        let persist_start = file
+            .find(concat!("pub async f", "n persist_groww_instruments("))
+            .expect("persist fn present");
+        let persist_body = &file[persist_start..];
+        let ensure = persist_body
+            .find("ensure_instrument_lifecycle_table(questdb)")
+            .expect("ensure_instrument_lifecycle_table call present in persist");
+        let emit = persist_body
+            .find("emit_groww_lifecycle_audit(questdb")
+            .expect("audit emit call present in persist");
+        assert!(
+            ensure < emit,
+            "instrument_lifecycle table must be ensured BEFORE the audit prior-snapshot read \
+             (fresh-DB Day-1 fix)"
+        );
+        // §24 audit-first is still preserved: the emit precedes the DATA UPSERT.
+        let upsert = persist_body
+            .find("append_instrument_lifecycle_rows(")
+            .expect("lifecycle DATA UPSERT present");
+        assert!(
+            emit < upsert,
+            "audit emission must still run BEFORE the lifecycle DATA UPSERT (§24 audit-first)"
+        );
+    }
+
+    /// Fix 3 regression: the `index_constituency` persist creates its table BEFORE
+    /// appending rows, so it does NOT share the Day-1 fresh-DB ordering bug that
+    /// affected the audit read. (The operator's "0 constituency rows" observation
+    /// was a stale-binary artifact — the current main code, pinned here, writes
+    /// constituency rows on the first boot.) Source-scan pins ensure-before-append.
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_persist_ensures_constituency_table_before_append() {
+        let file = include_str!("shared_master_writer.rs");
+        let persist_start = file
+            .find(concat!("pub async f", "n persist_groww_instruments("))
+            .expect("persist fn present");
+        let persist_body = &file[persist_start..];
+        let ensure = persist_body
+            .find("ensure_index_constituency_table(questdb)")
+            .expect("ensure_index_constituency_table call present in persist");
+        let append = persist_body
+            .find("append_index_constituency_rows(")
+            .expect("append_index_constituency_rows call present in persist");
+        assert!(
+            ensure < append,
+            "index_constituency table must be ensured BEFORE appending rows — \
+             constituency persist is immune to the fresh-DB ordering bug"
+        );
+    }
+
+    /// Fix 3 regression: the constituency builder DOES produce rows for a resolved
+    /// Groww stock set (the build itself is not the reason for 0 rows). A resolved
+    /// stock always carries `symbol_name: Some(_)` (the resolver sets it), so every
+    /// resolved stock becomes a constituency row.
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_constituency_build_is_nonempty_for_resolved_stock_set() {
+        let set = set_of(vec![
+            index("NIFTY", "NSE", 999), // filtered out (not a constituent)
+            stock("2885", "INE002A01018", "RELIANCE"),
+            stock("1594", "INE009A01021", "INFY"),
+            stock("3045", "INE040A01034", "HDFCBANK"),
+        ]);
+        let rows = build_groww_constituency_rows(&set, 222, false);
+        assert_eq!(
+            rows.len(),
+            3,
+            "every resolved stock (symbol_name set) yields one constituency row; the index is filtered"
+        );
+        assert!(rows.iter().all(|r| r.feed == "groww"));
     }
 
     /// Source-scan ratchet: the Groww audit emitter MUST be degrade-safe — its
