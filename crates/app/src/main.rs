@@ -344,6 +344,15 @@ async fn main() -> Result<()> {
         "[feeds] Groww lanes spawned dormant (bridge + sidecar + activation watcher); \
          they activate on enable (config OR /api/feeds toggle) with no restart"
     );
+    // Trading calendar for the Groww IST-midnight force-seal boundary task. The
+    // shared `Arc<TradingCalendar>` for the Dhan path is built later in boot
+    // (after the clock-drift check), but the Groww bridge spawns here; both are
+    // built from the SAME `config.trading` (immutable read-only calendar data),
+    // so the trading-day gate is identical. Config is already validated.
+    let groww_trading_calendar = std::sync::Arc::new(
+        TradingCalendar::from_config(&config.trading)
+            .context("failed to build Groww trading calendar")?,
+    );
     tokio::spawn(tickvault_app::groww_bridge::run_groww_bridge(
         config.questdb.clone(),
         std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
@@ -354,11 +363,26 @@ async fn main() -> Result<()> {
         // Groww connect/disconnect/reconnect, drained by the SAME consumer Dhan +
         // order-update use. Closes the audit gap (Groww connected but wrote no row).
         Some(spawn_ws_event_audit_consumer(config.questdb.clone())),
+        // Trading calendar (2026-06-29): drives the Groww IST-midnight force-seal
+        // boundary task's trading-day gate — built from the SAME `config.trading`
+        // the Dhan IST-midnight force-seal calendar uses.
+        groww_trading_calendar,
     ));
+    // Deferred Telegram slot for the Groww sidecar supervisor: the supervisor is
+    // spawned here (before the notifier is built), so it gets a shared slot that
+    // is filled with the live `NotificationService` once it exists (below). On a
+    // sidecar auth/entitlement/error diagnostic the supervisor fires ONE
+    // `GrowwSidecarRejected` Telegram event + marks Groww rejected in feed_health
+    // — so the operator sees WHY Groww has 0 ticks instead of a silent log line.
+    let groww_sidecar_notifier_slot: std::sync::Arc<
+        arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>,
+    > = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
     tokio::spawn(
         tickvault_app::groww_sidecar_supervisor::run_groww_sidecar_supervisor(
             std::sync::Arc::clone(&feed_runtime),
             tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
+            std::sync::Arc::clone(&feed_health),
+            std::sync::Arc::clone(&groww_sidecar_notifier_slot),
         ),
     );
     tokio::spawn(
@@ -1328,6 +1352,10 @@ async fn main() -> Result<()> {
         } else {
             fast_notifier
         };
+        // Fill the Groww sidecar supervisor's deferred Telegram slot now that the
+        // notifier exists: a subsequent sidecar reject diagnostic can page the
+        // operator. Stored once; the supervisor resolves it lazily per child.
+        groww_sidecar_notifier_slot.store(Some(std::sync::Arc::clone(&fast_notifier)));
         match ip_result {
             Ok(result) => {
                 if fast_trading_mode.is_live() {

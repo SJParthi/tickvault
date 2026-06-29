@@ -549,11 +549,19 @@ pub(crate) struct GrowwBridgeState {
 }
 
 impl GrowwBridgeState {
-    /// Build a fresh bridge state with a live ILP writer (lazy-connect).
-    pub(crate) fn new(qdb: &QuestDbConfig) -> Self {
+    /// Build a bridge state around a CALLER-OWNED aggregator.
+    ///
+    /// `MultiTfAggregator` is `Clone` over a shared `Arc<HashMap>` (papaya
+    /// concurrent map; every method takes `&self`), so the caller can keep a
+    /// `.clone()` that shares the SAME underlying buckets. `run_groww_bridge`
+    /// uses this so the IST-midnight force-seal boundary task can `force_seal_all`
+    /// the SAME aggregator the per-tick path folds into — parity with the Dhan
+    /// IST-midnight force-seal (`crates/app/src/main.rs`). The per-tick fold path
+    /// (`drain_new_data`) is UNCHANGED.
+    pub(crate) fn with_aggregator(qdb: &QuestDbConfig, aggregator: MultiTfAggregator) -> Self {
         Self {
             live_writer: GrowwLiveTickWriter::new(qdb),
-            aggregator: MultiTfAggregator::with_capacity(GROWW_AGGREGATOR_CAPACITY),
+            aggregator,
             seeded: std::collections::HashSet::new(),
             capture_seq: AtomicI64::new(0),
             offset: 0,
@@ -736,6 +744,109 @@ impl GrowwBridgeState {
     }
 }
 
+/// Spawn the IST-midnight force-seal boundary task for the Groww aggregator.
+///
+/// PARITY WITH DHAN: this mirrors the Dhan IST-midnight force-seal task in
+/// `crates/app/src/main.rs` (the only other production `force_seal_all` call
+/// site). At IST 00:00 each trading day it force-seals every open bucket across
+/// all 21 timeframes so day-N candle state never fuses into day-(N+1)'s first
+/// bar. WITHOUT this, the LAST open bucket of each of the 21 Groww timeframes
+/// each day is silently overwritten by the next day's first tick — the verified
+/// candle-loss bug this task fixes.
+///
+/// `aggregator` is a `.clone()` of the bridge's aggregator — `MultiTfAggregator`
+/// shares its papaya `Arc<HashMap>` across clones, so this seals the SAME buckets
+/// the per-tick path folds into. Each sealed bar routes through the SAME shared
+/// seal-writer chain (`global_seal_sender`) tagged `feed: Feed::Groww` — exactly
+/// the per-tick Groww policy (`drop_d1: false` ⇒ D1 is routed for Groww; no
+/// prev-day pct-stamp; no Dhan heartbeat). The cell's `force_seal` re-arms
+/// `armed_for_day_open` and clears `last_sealed` internally, so no closure-level
+/// re-arm is needed (identical to the Dhan path).
+///
+/// Gated TWICE: skips on a non-trading-day midnight (`is_trading_day_today`) AND
+/// when Groww is runtime-disabled (`feed_runtime.is_enabled(Feed::Groww)`). An
+/// empty aggregator is a natural no-op (`force_seal_all` iterates zero entries).
+// TEST-EXEMPT: cold-path tokio I/O driver (sleep loop + boundary gate). The
+// load-bearing seal-routing closure is unit-tested via `route_seal`
+// (`test_groww_force_seal_routes_with_feed_groww`); the wiring is pinned by the
+// source-scan ratchet `test_run_groww_bridge_spawns_ist_midnight_force_seal`.
+fn spawn_groww_ist_midnight_force_seal(
+    aggregator: MultiTfAggregator,
+    feed_runtime: Arc<FeedRuntimeState>,
+    trading_calendar: Arc<tickvault_common::trading_calendar::TradingCalendar>,
+) {
+    tokio::spawn(async move {
+        loop {
+            // Sleep until the next IST midnight (bounded helper, ≤ 24h) — the
+            // SAME helper the Dhan IST-midnight force-seal uses.
+            let sleep_secs = tickvault_common::market_hours::secs_until_next_ist_midnight().max(1);
+            tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+
+            // Only force-seal on trading days — a non-trading-day midnight has no
+            // open buckets worth flushing (mirrors the Dhan task).
+            if !trading_calendar.is_trading_day_today() {
+                debug!("Groww IST-midnight force-seal: skipping (non-trading day)");
+                continue;
+            }
+
+            // Skip when Groww is runtime-disabled: a disabled feed produces no
+            // ticks, so there is nothing to seal (and we must not emit Groww
+            // candles while the feed is off). The flag is read into a local so
+            // this gate does not collide with the `run_groww_bridge` disable-branch
+            // source-scan anchor (which `find`s the FIRST literal occurrence).
+            let groww_enabled = feed_runtime.is_enabled(Feed::Groww);
+            if !groww_enabled {
+                debug!("Groww IST-midnight force-seal: skipping (Groww feed disabled)");
+                continue;
+            }
+
+            let Some(sender) = global_seal_sender() else {
+                warn!("Groww IST-midnight force-seal: seal sender not installed — skipping");
+                continue;
+            };
+
+            let mut sealed: u64 = 0;
+            let mut dropped: u64 = 0;
+            aggregator.force_seal_all(|security_id, segment_code, tf, state| {
+                // SAME shared per-seal routing as the per-tick Groww path:
+                // feed=Groww, drop_d1=false (Groww routes D1), no prev-day
+                // pct-stamp, no Dhan heartbeat, no per-M1 feed-health record
+                // (this is the EOD flush, not a live tick).
+                match crate::seal_routing::route_seal(
+                    crate::seal_routing::SealRouteParams {
+                        feed: Feed::Groww,
+                        drop_d1: false,
+                        prev_day_cache: None,
+                        heartbeat: None,
+                        feed_health_on_m1: None,
+                    },
+                    security_id,
+                    segment_code,
+                    tf,
+                    state,
+                    sender,
+                ) {
+                    crate::seal_routing::SealOutcome::Sent => {
+                        sealed = sealed.saturating_add(1);
+                    }
+                    crate::seal_routing::SealOutcome::DroppedFull => {
+                        dropped = dropped.saturating_add(1);
+                    }
+                    // Groww never drops D1 (drop_d1=false), so DroppedD1 is
+                    // unreachable here — handled for exhaustiveness only.
+                    crate::seal_routing::SealOutcome::DroppedD1 => {}
+                }
+            });
+            info!(
+                sealed,
+                dropped,
+                "Groww IST-midnight force-seal complete — open buckets flushed (feed=groww)"
+            );
+        }
+    });
+    info!("Groww bridge — IST-midnight force-seal task spawned (parity with Dhan)");
+}
+
 /// Consumer driver: EVENT-DRIVEN (zero-poll) tail of the sidecar's append-only
 /// NDJSON tick file (operator 2026-06-28: "true zero latency, no polling"). A
 /// `notify` filesystem watcher wakes the loop sub-ms on each append; the loop reads
@@ -771,6 +882,10 @@ pub async fn run_groww_bridge(
     // (`spawn_ws_event_audit_consumer`). `Option` mirrors the Dhan `ws_audit_tx`
     // convention so a `None` build (defensive / test) is a no-op.
     ws_audit_tx: Option<tokio::sync::mpsc::Sender<WsEventAuditRow>>,
+    // Trading calendar (2026-06-29): drives the IST-midnight force-seal boundary
+    // task's trading-day gate, using the SAME calendar handle the Dhan
+    // IST-midnight force-seal uses (`crates/app/src/main.rs`). Shared `Arc`.
+    trading_calendar: Arc<tickvault_common::trading_calendar::TradingCalendar>,
 ) {
     info!(
         path = %tick_file_path.display(),
@@ -778,7 +893,17 @@ pub async fn run_groww_bridge(
         "Groww bridge started — EVENT-DRIVEN tail of the sidecar tick file (zero-poll; \
          fallback watchdog only if the watcher drops). Idles until the sidecar appends."
     );
-    let mut state = GrowwBridgeState::new(&qdb);
+    // Build the Groww aggregator ONCE and hand a `.clone()` (shared papaya map)
+    // to the IST-midnight force-seal boundary task — parity with the Dhan
+    // IST-midnight force-seal (`main.rs`). The per-tick fold path keeps the SAME
+    // instance via `GrowwBridgeState`.
+    let aggregator = MultiTfAggregator::with_capacity(GROWW_AGGREGATOR_CAPACITY);
+    spawn_groww_ist_midnight_force_seal(
+        aggregator.clone(),
+        Arc::clone(&feed_runtime),
+        trading_calendar,
+    );
+    let mut state = GrowwBridgeState::with_aggregator(&qdb, aggregator);
 
     // PRIMARY path: install the event-driven filesystem watcher. If it fails, the
     // fallback poll alone keeps the bridge working (degraded, logged once). The
@@ -1509,12 +1634,15 @@ mod tests {
         // yet (sidecar not started), drain_new_data is a no-op returning false — the
         // loop simply idles. Proves the bridge survives the watcher-unavailable case.
         let reg = tickvault_common::feed_health::FeedHealthRegistry::new();
-        let mut state = GrowwBridgeState::new(&QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: 9000,
-            pg_port: 8812,
-            ilp_port: 9009,
-        });
+        let mut state = GrowwBridgeState::with_aggregator(
+            &QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: 9000,
+                pg_port: 8812,
+                ilp_port: 9009,
+            },
+            MultiTfAggregator::with_capacity(GROWW_AGGREGATOR_CAPACITY),
+        );
         let missing = std::path::Path::new("/nonexistent-tv-groww-tick-file-xyz.ndjson");
         let parsed = state.drain_new_data(missing, &reg).await;
         assert!(
@@ -1720,6 +1848,95 @@ mod tests {
         assert!(
             after.contains("emit_groww_ws_audit(") && after.contains(&disconnected),
             "the disable branch must emit a Disconnected/DisconnectedOffHours audit row"
+        );
+    }
+
+    // --- IST-midnight / EOD force-seal parity with Dhan (2026-06-29) ---
+
+    #[tokio::test]
+    async fn test_groww_force_seal_routes_with_feed_groww() {
+        // The load-bearing contract of the Groww IST-midnight force-seal closure:
+        // it routes each sealed bar through the SHARED seal-writer chain tagged
+        // `feed: Feed::Groww`, with `drop_d1: false` (Groww routes EVERY TF,
+        // including D1 — unlike Dhan which drops D1). This is the EXACT
+        // SealRouteParams the boundary task in `spawn_groww_ist_midnight_force_seal`
+        // passes; driving `route_seal` directly proves a force-sealed Groww bucket
+        // lands in the channel with the right feed tag for a non-D1 AND a D1 TF.
+        use tickvault_trading::candles::{BufferedSeal, LiveCandleState, TfIndex};
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<BufferedSeal>(8);
+        let params = crate::seal_routing::SealRouteParams {
+            feed: Feed::Groww,
+            drop_d1: false,
+            prev_day_cache: None,
+            heartbeat: None,
+            feed_health_on_m1: None,
+        };
+
+        // A non-D1 force-sealed bar routes, tagged feed=Groww.
+        let out = crate::seal_routing::route_seal(
+            params,
+            1333,
+            1,
+            TfIndex::M1,
+            LiveCandleState::empty(),
+            &tx,
+        );
+        assert_eq!(out, crate::seal_routing::SealOutcome::Sent);
+        let m1 = rx.try_recv().expect("Groww force-sealed M1 bar must route");
+        assert_eq!(
+            m1.feed,
+            Feed::Groww,
+            "force-sealed Groww bar must carry feed=Groww"
+        );
+        assert_eq!(m1.security_id, 1333);
+        assert_eq!(m1.tf, TfIndex::M1);
+
+        // D1 is NOT dropped for Groww (drop_d1=false) — the last open day-bucket
+        // is sealed, not silently lost (the bug this task fixes).
+        let out = crate::seal_routing::route_seal(
+            params,
+            1333,
+            1,
+            TfIndex::D1,
+            LiveCandleState::empty(),
+            &tx,
+        );
+        assert_eq!(out, crate::seal_routing::SealOutcome::Sent);
+        let d1 = rx
+            .try_recv()
+            .expect("Groww force-sealed D1 bar must route (no drop)");
+        assert_eq!(d1.tf, TfIndex::D1);
+        assert_eq!(d1.feed, Feed::Groww);
+    }
+
+    #[test]
+    fn test_run_groww_bridge_spawns_ist_midnight_force_seal() {
+        // PARITY WITH DHAN (the verified bug fix): the bridge MUST spawn an
+        // IST-midnight force-seal boundary task that flushes every open bucket of
+        // every Groww timeframe at day rollover — WITHOUT it the last bucket of
+        // each day is silently overwritten by the next day's first tick. Pin the
+        // wiring by source-scan (the spawn helper is a TEST-EXEMPT cold-path I/O
+        // driver), so a future refactor cannot silently drop the EOD seal.
+        let src = include_str!("groww_bridge.rs");
+        assert!(
+            src.contains("fn spawn_groww_ist_midnight_force_seal")
+                && src.contains("spawn_groww_ist_midnight_force_seal("),
+            "the bridge must define AND call an IST-midnight force-seal spawn helper"
+        );
+        assert!(
+            src.contains("force_seal_all")
+                && src.contains("secs_until_next_ist_midnight")
+                && src.contains("is_trading_day_today"),
+            "the force-seal task must call force_seal_all, sleep until IST midnight, \
+             and gate on the trading-day calendar (mirroring the Dhan task)"
+        );
+        // Build the feed-tag needle at runtime so this assertion's OWN literal does
+        // not self-match the include_str! scan — the real occurrence is the
+        // boundary closure's SealRouteParams.
+        let groww_feed = format!("feed: Feed::{}", "Groww");
+        assert!(
+            src.contains(&groww_feed),
+            "the force-seal closure must route with feed: Feed::Groww (drop_d1: false)"
         );
     }
 }

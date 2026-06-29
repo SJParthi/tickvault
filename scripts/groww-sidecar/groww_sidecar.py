@@ -36,13 +36,39 @@ Usage (auto-launched by the Rust supervisor; no manual run needed):
 """
 import glob
 import json
+import logging
 import os
 import random
+import re
 import sys
+import threading
 import time
+import traceback
 from datetime import datetime, timezone, timedelta
 
 import pyotp
+
+# DIAGNOSTIC (2026-06-29): turn ON the Groww SDK's OWN logging so the per-frame
+# decode errors it currently SWALLOWS (the bare "Error:" lines with no detail)
+# print with full context to stderr. The SDK's blocking consume() decodes
+# NATS/Protobuf internally and logs swallowed errors through the standard
+# `logging` module at DEBUG/ERROR — but only if a handler is configured. Without
+# this, those errors vanish. Routed to STDERR (the Rust supervisor captures both
+# streams) and scoped to the `growwapi` logger at DEBUG; redaction of OUR
+# credentials is unaffected because the SDK logs protocol detail, not our
+# api_key/TOTP (and the supervisor-captured stream is operator-local per lock §32).
+logging.basicConfig(
+    level=logging.DEBUG,
+    stream=sys.stderr,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logging.getLogger("growwapi").setLevel(logging.DEBUG)
+# The bare "Error:" lines originate from the SDK's NATS client
+# (nats_client.py:151), which logs a SWALLOWED NATS permissions/authorization
+# violation through the `nats` logger. Only the `nats` logger at DEBUG surfaces
+# the real reason text (e.g. the actual "Authorization Violation"/subject the
+# socket was rejected on) — without this it vanishes and we see the empty line.
+logging.getLogger("nats").setLevel(logging.DEBUG)
 
 try:
     from growwapi import GrowwAPI, GrowwFeed
@@ -73,12 +99,263 @@ SEGMENT_MAP = {
     ("BSE", "CASH"): "BSE_EQ",
     ("BSE", "FNO"): "BSE_FNO",
 }
+# The set of exchange names that legitimately appear as the TOP-LEVEL keys of a
+# BARE get_ltp()/get_index_value() tree. Used to DEFENSIVELY UNWRAP a possible
+# top-level wrapper (2026-06-29): our two Groww docs CONTRADICT on the get_ltp()
+# shape — docs/groww-ref/07-feed-websocket.md shows it WRAPPED under a top-level
+# "ltp" key (`{"ltp": {"NSE": {...}}}`), docs/groww-ref/10-live-feed-mapping-
+# verified.md shows it BARE (`{"NSE": {...}}`). If the live SDK returns the
+# WRAPPED form, the top-level key is the literal "ltp" (or a similar wrapper),
+# no exchange matches, and EVERY tick is silently dropped → 0 ticks. We handle
+# BOTH shapes by descending into a known wrapper key only when the inner dict's
+# keys actually look like exchanges, so a correct BARE tree is NEVER mangled.
+KNOWN_EXCHANGES = {"NSE", "BSE", "MCX", "NCDEX"}
+
+# One-shot shape introspection (2026-06-29): the very first time each feed
+# callback fires, print the REAL top-level keys of get_ltp()/get_index_value()
+# to stderr ONCE so the NEXT run definitively reveals which doc shape is correct
+# — zero ambiguity, no guessing. Module-level flags so it prints only once each.
+_ltp_shape_logged = False
+_index_shape_logged = False
+
+
+def _unwrap_feed_tree(tree, wrapper_keys):
+    """Descend through a possible top-level wrapper so BOTH doc shapes work.
+
+    If `tree`'s top-level keys do NOT look like exchanges (none in
+    KNOWN_EXCHANGES) AND one of `wrapper_keys` (e.g. "ltp"/"value") maps to a
+    dict whose OWN keys DO look like exchanges, return that inner dict. Otherwise
+    return `tree` unchanged. Conservative on purpose: a correct BARE tree (whose
+    top-level keys are already exchanges) is returned untouched, never mangled.
+    """
+    if not isinstance(tree, dict):
+        return tree
+    if set(tree) & KNOWN_EXCHANGES:
+        return tree  # already a BARE exchange-keyed tree — leave it alone.
+    for wrapper_key in wrapper_keys:
+        inner = tree.get(wrapper_key)
+        if isinstance(inner, dict) and (set(inner) & KNOWN_EXCHANGES):
+            return inner
+    return tree
 # All index ticks (whatever exchange/segment Groww uses) store as IDX_I — matches
 # the Dhan index convention + the bridge's segment_from_str("IDX_I").
 CANONICAL_INDEX_SEGMENT = "IDX_I"
 
 # How long to wait between checks for the Rust-built watch file at startup.
 WATCH_POLL_SECS = 5
+
+# Silent-feed watchdog (2026-06-29). The Groww SDK's blocking `consume()` decodes
+# NATS/Protobuf frames internally and can swallow per-frame errors (printing a bare
+# SDK-internal "Error:" line) WITHOUT raising — so our `except` never fires and we
+# sit "subscribed but 0 ticks" with no actionable cause. This watchdog runs in a
+# daemon thread: if no record is DECODED (neither emitted nor dropped) within the
+# deadline after we subscribe, it prints ONE loud, actionable diagnostic to stderr
+# (and then a quieter periodic reminder with live counts) so the operator sees the
+# real "feed silent" signal + the most-likely causes instead of staring at the
+# SDK's empty "Error:" lines. A DROP-only flow (decoded but key-map miss) is a
+# DIFFERENT, already-surfaced signal (note_drop counters), so the watchdog treats
+# decoded==0 as the silent case.
+SILENT_FEED_FIRST_WARN_SECS = 30
+SILENT_FEED_REWARN_SECS = 60
+
+# NATS reject-reason surfacing (2026-06-29). VERIFIED against growwapi-1.5.0 +
+# nats-py 2.15.0 source (quoted in groww_sidecar.py header / the plan):
+#   - growwapi.groww.feed.GrowwFeed holds its NATS client at `feed._nats_client`
+#     (feed.py:149); the underlying nats.aio.client.Client is `_nats_client._socket`
+#     (nats_client.py:51).
+#   - The bare empty "Error:" line is growwapi.groww.nats_client.NatsClient
+#     ._on_error_cb (nats_client.py:150-151): `logger.error("Error: %s", e)`.
+#   - nats-py Client._process_err routes a server "-ERR":
+#       * "Authorization Violation" -> stores errors.AuthorizationError() in
+#         Client._err and CLOSES the connection — it NEVER calls _error_cb, so
+#         the real reason reaches NO growwapi callback; it survives ONLY in
+#         `_socket._err` / `_socket.last_error` (a property returning `_err`).
+#       * "...Permissions Violation..." -> stores errors.Error(msg) in _err AND
+#         calls _error_cb(err) -> the growwapi "Error:" line (str non-empty).
+#   So the reliable, durable source of the REAL reason for BOTH classes is the
+#   underlying socket's `last_error` / `_err`. We (a) wrap the SDK's own
+#   callbacks so the empty "Error:" becomes a real repr(), and (b) poll the
+#   socket's last_error and print one edge-triggered GROWW LIVE FEED REJECTED
+#   line + a periodic heartbeat. ALL of this is best-effort: any attribute
+#   mismatch on a future wheel is caught and logged, never breaks the sidecar.
+NATS_REASON_POLL_SECS = 2
+NATS_REASON_HEARTBEAT_SECS = 60
+# Substrings that mark a true authorization / permissions / protocol reject.
+_REJECT_MARKERS = (
+    "authorization",
+    "permissions",
+    "authorization violation",
+    "permissions violation",
+    "-err",
+)
+
+
+def _nats_socket_from_feed(feed):
+    """Best-effort reach the underlying nats.aio.client.Client from a GrowwFeed.
+
+    Returns the socket Client or None. Wrapped so a future-wheel attribute rename
+    NEVER breaks the sidecar — on any failure we log the type once and return None
+    (the silent-feed watchdog still covers the "0 ticks" case).
+    """
+    try:
+        nats_client = getattr(feed, "_nats_client", None)
+        if nats_client is None:
+            return None
+        return getattr(nats_client, "_socket", None)
+    except Exception as exc:  # noqa: BLE001 - reason-surfacing must never break the feed
+        print(
+            f"groww sidecar: could not reach NATS socket ({type(exc).__name__}); "
+            "reason-surfacing degraded (silent-feed watchdog still active)",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+
+
+def _socket_error_detail(socket, secrets):
+    """Return a redacted, non-empty repr of the socket's last error, or None.
+
+    Reads `last_error` (the public property -> Client._err) then `_err` directly.
+    repr() is used because some nats-py errors (e.g. AuthorizationError) render an
+    informative repr while their str may be terse; we surface both when they differ.
+    """
+    if socket is None:
+        return None
+    err = None
+    try:
+        err = getattr(socket, "last_error", None)
+    except Exception:  # noqa: BLE001 - property access must never raise out
+        err = None
+    if err is None:
+        err = getattr(socket, "_err", None)
+    if err is None:
+        return None
+    err_repr = _redact(repr(err), secrets)
+    err_str = _redact(str(err), secrets)
+    if err_str and err_str != err_repr:
+        return f"{err_repr} ({err_str})"
+    return err_repr
+
+
+def _is_reject_reason(detail: str) -> bool:
+    """True if `detail` looks like an authorization / permissions / -ERR reject."""
+    if not detail:
+        return False
+    low = detail.lower()
+    return any(marker in low for marker in _REJECT_MARKERS)
+
+
+def install_nats_reason_hooks(feed, secrets) -> None:
+    """Replace the SDK's empty "Error:" callbacks with REAL-detail versions.
+
+    Monkeypatches the SDK NatsClient instance bound to THIS feed so its
+    `_on_error_cb` / `_on_closed_cb` / `_on_disconnected_cb` print the real
+    exception repr() + the socket's stored last_error instead of an empty string.
+    Best-effort: any failure is logged (type only) and ignored — the original SDK
+    callbacks keep working and the poller below is the backstop.
+    """
+    try:
+        nats_client = getattr(feed, "_nats_client", None)
+        if nats_client is None:
+            return
+        socket = getattr(nats_client, "_socket", None)
+
+        async def on_error(e):  # mirrors growwapi NatsClient._on_error_cb signature
+            detail = _redact(repr(e), secrets)
+            str_detail = _redact(str(e), secrets)
+            if str_detail and str_detail != detail:
+                detail = f"{detail} ({str_detail})"
+            print(
+                f"groww sidecar: NATS error_cb -> {detail}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        async def on_closed():
+            detail = _socket_error_detail(socket, secrets) or "(no stored error)"
+            print(
+                f"groww sidecar: NATS connection closed -> last_error={detail}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        async def on_disconnected():
+            detail = _socket_error_detail(socket, secrets) or "(no stored error)"
+            print(
+                f"groww sidecar: NATS disconnected -> last_error={detail}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        # Bind as the instance's callbacks. The SDK passes these to nats.connect()
+        # at __init__ time (already happened), so nats-py already holds references
+        # to the ORIGINAL bound methods. We therefore ALSO replace the attributes
+        # for any code that re-reads them, AND rely on the poller below as the
+        # guaranteed backstop (nats-py keeps the old refs). The poller is what makes
+        # this robust regardless of when nats captured the callbacks.
+        nats_client._on_error_cb = on_error
+        nats_client._on_closed_cb = on_closed
+        nats_client._on_disconnected_cb = on_disconnected
+    except Exception as exc:  # noqa: BLE001 - never break the feed
+        print(
+            f"groww sidecar: could not install NATS reason hooks "
+            f"({type(exc).__name__}); relying on the last_error poller",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def nats_reject_poller(feed, secrets) -> None:
+    """Daemon thread: surface the REAL NATS reject reason from the socket.
+
+    nats-py stores the swallowed reason in Client._err / Client.last_error even
+    when (for an "Authorization Violation") it never calls any growwapi callback.
+    We poll that store and, on a NEW reject-class reason, print ONE loud
+    `GROWW LIVE FEED REJECTED: <reason>` line (edge-triggered — never spammed every
+    poll). Thereafter a periodic heartbeat repeats the current reason so the
+    operator keeps proof without log flooding. The raw last_error is also printed
+    on each CHANGE so a multi-step reject sequence is fully captured.
+    """
+    socket = _nats_socket_from_feed(feed)
+    if socket is None:
+        return  # nothing to poll; the silent-feed watchdog still covers 0-ticks.
+    last_reported = None
+    last_heartbeat = 0.0
+    while True:
+        time.sleep(NATS_REASON_POLL_SECS)
+        # Stop once real data flows — a reject that streams is not a reject.
+        if EMITTED_TOTAL > 0:
+            return
+        detail = _socket_error_detail(socket, secrets)
+        if detail and detail != last_reported:
+            # New / changed stored error — always print the raw detail.
+            print(
+                f"groww sidecar: NATS last_error -> {detail}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if _is_reject_reason(detail):
+                print(
+                    f"GROWW LIVE FEED REJECTED: {detail}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            last_reported = detail
+            last_heartbeat = time.monotonic()
+            continue
+        # Heartbeat: repeat the standing reject reason periodically (count too).
+        if (
+            last_reported
+            and _is_reject_reason(last_reported)
+            and time.monotonic() - last_heartbeat >= NATS_REASON_HEARTBEAT_SECS
+        ):
+            print(
+                f"groww sidecar: GROWW LIVE FEED STILL REJECTED: {last_reported} "
+                f"(emitted={EMITTED_TOTAL}, dropped={DROPPED_TOTAL})",
+                file=sys.stderr,
+                flush=True,
+            )
+            last_heartbeat = time.monotonic()
 
 # Honest-feed counters (operator 2026-06-29). EMITTED_TOTAL = records we DECODED
 # and successfully wrote as a tick; DROPPED_TOTAL = records we DECODED but had to
@@ -166,6 +443,17 @@ def _backoff_secs(consecutive_failures: int, rate_limited: bool, retry_after) ->
     return delay * jitter
 
 
+# Belt-and-suspenders structural masks (2026-06-29 security fix). Even if a token
+# value is NOT in the `secrets` set (an unanticipated/refreshed shape), these
+# scrub anything secret-SHAPED so a NATS auth error / SDK DEBUG line can never
+# write the Groww bearer token to stderr → the Rust supervisor → CloudWatch.
+#   - JWT: three base64url segments joined by dots, starting `eyJ` (the b64 of
+#     `{"`). Groww/Dhan access tokens are JWTs (`eyJ...`).
+#   - LONG BEARER: a `Bearer <token>` header carrying a long opaque token.
+_JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}")
+_BEARER_RE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{16,}")
+
+
 def _redact(text: str, secrets) -> str:
     """Scrub known secret values out of a string before it is logged.
 
@@ -173,29 +461,180 @@ def _redact(text: str, secrets) -> str:
     access token / api_key, or echo the response body (security-review MEDIUM
     2026-06-19). We DO want the cause (status code, error message, SDK detail)
     for triage, so instead of dropping the whole detail we surface it with every
-    known secret value masked. Anything secret-shaped that we did not anticipate
-    is still a residual risk, so callers also cap the length.
+    known secret value masked. Two layers:
+      1. Exact-match every value in `secrets` (api_key, totp_secret, and — since
+         2026-06-29 — the live access token, kept current across refreshes).
+      2. Structural masks for any JWT-shaped / bearer-ish token even if it is NOT
+         in `secrets` (an unanticipated token shape), so the redaction is no
+         longer purely per-known-value. Callers also cap the length.
     """
     if not text:
         return text
     for secret in secrets:
         if secret:
             text = text.replace(secret, "***REDACTED***")
+    # Structural fallback — mask any JWT / bearer-shaped token we did NOT
+    # anticipate by exact value.
+    text = _JWT_RE.sub("***REDACTED_JWT***", text)
+    text = _BEARER_RE.sub(r"\1***REDACTED***", text)
     return text
 
 
-def _exception_detail(exc, secrets, max_len: int = 600) -> str:
-    """Build a redacted, length-capped one-line detail string for `exc`.
+def _add_secret(secrets: list, value) -> None:
+    """Add `value` to the live redaction set if it is a non-empty new secret.
 
-    Surfaces the WHY (str(exc), HTTP status, response body) so the operator can
-    tell a credential error (auth fails) from an off-market feed reject (auth OK,
-    connect fails) — with every known secret masked and the whole thing capped.
+    `secrets` is a MUTABLE list captured BY REFERENCE by the NATS reason hooks +
+    the reject poller, so adding the access token here (the moment it is acquired
+    / refreshed) makes those long-lived consumers mask it too — no re-arming
+    needed. Short values are skipped to avoid masking incidental substrings.
+    """
+    if value and len(value) >= 8 and value not in secrets:
+        secrets.append(value)
+
+
+class _RedactingLogFilter(logging.Filter):
+    """A logging.Filter that scrubs secrets out of SDK-emitted records.
+
+    The 2026-06-29 diagnostic turns the `growwapi` + `nats` SDK loggers ON at
+    DEBUG (stderr). Those records are emitted by THIRD-PARTY code through Python's
+    logging module, so they NEVER pass through our per-print-call _redact — an
+    auth/connect line the SDK logs at DEBUG (CONNECT frame, connect URL, exception
+    repr) could carry the access token / api_key / TOTP and the Rust supervisor
+    forwards it verbatim to CloudWatch. This filter intercepts each record BEFORE
+    emit, fully materialises its message (msg % args), runs it through _redact
+    (exact-value masks for everything in `secrets` PLUS the structural JWT/bearer
+    masks), then replaces record.msg with the scrubbed text and clears record.args
+    so the handler emits ONLY the redacted form. Holding `secrets` by reference
+    means a later access-token addition applies retroactively. Returns True so the
+    (now-scrubbed) record is still emitted — diagnostics are preserved, secrets
+    are not. Never raises out of filter() (a redaction bug must not drop the line).
+    """
+
+    def __init__(self, secrets: list) -> None:
+        super().__init__()
+        self._secrets = secrets
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003 - logging API
+        try:
+            scrubbed = _redact(record.getMessage(), self._secrets)
+            record.msg = scrubbed
+            record.args = None
+            # A traceback can embed a credential in a frame's locals/repr. Scrub
+            # the cached formatted exception AND drop the raw exc_info 3-tuple so
+            # a formatter that renders exc_info fresh (when exc_text is not yet
+            # cached) cannot re-leak the unredacted traceback (security-review
+            # MEDIUM 2026-06-29). We keep a short, secret-free marker so the
+            # operator still sees that an exception was attached.
+            if record.exc_info is not None or getattr(record, "exc_text", None):
+                if getattr(record, "exc_text", None):
+                    record.exc_text = _redact(record.exc_text, self._secrets)
+                else:
+                    record.exc_text = "(exception detail suppressed by redaction)"
+                record.exc_info = None
+        except Exception:  # noqa: BLE001 - redaction must never drop a log line
+            record.msg = "groww sidecar: <log line suppressed; redaction failed>"
+            record.args = None
+        return True
+
+
+def _install_sdk_log_redaction(secrets: list) -> None:
+    """Scrub SDK-emitted log records before they reach stderr.
+
+    Belt-and-suspenders for the SDK-DEBUG-leak finding (2026-06-29): the
+    diagnostic that enables the `growwapi` + `nats` loggers at DEBUG would
+    otherwise route SDK-emitted records to stderr WITHOUT redaction. We attach the
+    redacting filter at the HANDLER level on the root logger (where basicConfig
+    put the stderr StreamHandler) — a handler-level filter runs for EVERY record
+    that reaches the handler, INCLUDING records that propagate up from arbitrary
+    SDK child loggers (e.g. `growwapi.feed`, `nats.aio.client`), which a
+    logger-level filter on the parent would miss. We ALSO add it directly on the
+    `growwapi`/`nats` loggers as a second layer (covers a future non-propagating
+    handler). Best-effort: any failure is logged (type only) and ignored — and if
+    we could not attach a handler filter at all, the SDK loggers are demoted to
+    WARNING so their unredacted per-frame DEBUG protocol/auth detail is simply not
+    emitted. The reject-reason surfacing (#1254) is OUR print() path, not the SDK
+    logger, so it is unaffected either way.
+    """
+    redactor = _RedactingLogFilter(secrets)
+    handler_attached = False
+    try:
+        root_handlers = list(logging.getLogger().handlers)
+        for h in root_handlers:
+            h.addFilter(redactor)
+            handler_attached = True
+    except Exception as exc:  # noqa: BLE001 - never break the feed
+        print(
+            f"groww sidecar: could not attach root-handler SDK-log redaction "
+            f"({type(exc).__name__})",
+            file=sys.stderr,
+            flush=True,
+        )
+    # Second layer: directly on the SDK loggers (covers records that do NOT
+    # propagate to a root handler).
+    for name in ("growwapi", "nats"):
+        try:
+            logging.getLogger(name).addFilter(redactor)
+        except Exception:  # noqa: BLE001 - never break the feed
+            pass
+    if not handler_attached:
+        # FALLBACK: no handler to scrub through → demote the noisy SDK loggers to
+        # WARNING so their unredacted DEBUG detail cannot reach stderr at all.
+        for name in ("growwapi", "nats"):
+            try:
+                logging.getLogger(name).setLevel(logging.WARNING)
+            except Exception:  # noqa: BLE001
+                pass
+        print(
+            "groww sidecar: SDK-log redaction could not attach a handler filter; "
+            "demoted growwapi+nats loggers to WARNING (no DEBUG leak)",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        print(
+            "groww sidecar: SDK-log redaction filter attached "
+            "(secrets scrubbed before emit)",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _exception_detail(exc, secrets, max_len: int = 1200) -> str:
+    """Build a redacted, length-capped detail string for `exc`.
+
+    Surfaces the WHY so the operator can tell a credential error (auth fails)
+    from an off-market feed reject / no-entitlement (auth OK, feed rejects) —
+    with every known secret masked and the whole thing capped.
+
+    CRITICAL (2026-06-29): the Groww SDK exceptions store their real detail in
+    `.msg` + `.code` attributes (docs/groww-ref/05-exceptions.md), NOT in
+    `str(exc)`. For `GrowwBaseException`/`GrowwFeedException`/`GrowwAPIException`
+    a bare `str(exc)` is frequently EMPTY — which is exactly why the operator saw
+    a blank message. We now read `.msg`/`.code` FIRST, fall back to `repr(exc)`
+    (never empty), and ALWAYS append the redacted, capped traceback so we can
+    never again be blind to the cause.
     """
     parts = []
+    # 1. SDK-native detail: Groww exceptions carry their message in `.msg` and an
+    #    error code in `.code` (see docs/groww-ref/05-exceptions.md). These are the
+    #    fields that are populated when `str(exc)` is empty.
+    msg = getattr(exc, "msg", None)
+    if msg:
+        parts.append(f"msg={_redact(str(msg), secrets)}")
+    code = getattr(exc, "code", None)
+    if code is not None and code != "":
+        parts.append(f"code={_redact(str(code), secrets)}")
+    # GrowwFeedNotSubscribedException carries the topic that must be subscribed.
+    topic = getattr(exc, "topic", None)
+    if topic:
+        parts.append(f"topic={_redact(str(topic), secrets)}")
+    # 2. str(exc) — may duplicate `.msg`, may be empty; include only if it adds
+    #    info (compare REDACTED-to-REDACTED so a redacted `.msg` doesn't re-appear).
     detail = _redact(str(exc), secrets)
-    if detail:
+    msg_redacted = _redact(str(msg), secrets) if msg else ""
+    if detail and detail != msg_redacted:
         parts.append(detail)
-    # Optional HTTP detail some SDK exceptions carry.
+    # 3. Optional HTTP detail some SDK exceptions carry.
     status = getattr(exc, "status_code", None)
     if status is None:
         response = getattr(exc, "response", None)
@@ -210,12 +649,11 @@ def _exception_detail(exc, secrets, max_len: int = 600) -> str:
         body = getattr(exc, "body", None)
     if body:
         parts.append(f"body={_redact(str(body), secrets)}")
-    if not parts:
-        # Fall back to the args tuple if nothing else was informative.
-        args_detail = _redact(repr(getattr(exc, "args", ())), secrets)
-        if args_detail:
-            parts.append(args_detail)
-    summary = " | ".join(parts)
+    # 4. repr(exc) is NEVER empty (it always carries the class name) — the final
+    #    guarantee that the line is never blank even if every attribute above is
+    #    empty/absent.
+    parts.append(f"repr={_redact(repr(exc), secrets)}")
+    summary = " | ".join(p for p in parts if p)
     if len(summary) > max_len:
         summary = summary[:max_len] + "…(truncated)"
     return summary or "(no detail available)"
@@ -384,6 +822,19 @@ def emit_ltp_records(out, ltp_tree: dict, sid_map: dict) -> None:
     """
     if not isinstance(ltp_tree, dict):
         return
+    # One-shot shape proof: reveal the REAL top-level keys ONCE so the next run
+    # confirms which doc (07 WRAPPED vs 10 BARE) is correct — zero ambiguity.
+    global _ltp_shape_logged
+    if not _ltp_shape_logged:
+        print(
+            f"groww get_ltp() top-level keys: {sorted(map(str, ltp_tree.keys()))}",
+            file=sys.stderr,
+            flush=True,
+        )
+        _ltp_shape_logged = True
+    # Defensively UNWRAP a possible top-level "ltp"/"stockLivePrice" wrapper so
+    # BOTH the WRAPPED (doc 07) and BARE (doc 10) shapes work (2026-06-29).
+    ltp_tree = _unwrap_feed_tree(ltp_tree, ("ltp", "stockLivePrice"))
     for exchange, segs in ltp_tree.items():
         if not isinstance(segs, dict):
             continue
@@ -421,6 +872,23 @@ def emit_index_records(out, index_tree: dict, sid_map: dict) -> None:
     """
     if not isinstance(index_tree, dict):
         return
+    # One-shot shape proof: reveal the REAL top-level keys ONCE. Doc 07 shows the
+    # index tree BARE (no wrapper), but harden it the same way in case the live
+    # SDK wraps it under "value"/"stocksLiveIndices"/"indexValue".
+    global _index_shape_logged
+    if not _index_shape_logged:
+        print(
+            f"groww get_index_value() top-level keys: "
+            f"{sorted(map(str, index_tree.keys()))}",
+            file=sys.stderr,
+            flush=True,
+        )
+        _index_shape_logged = True
+    # Defensively UNWRAP a possible top-level index wrapper so a BARE (doc 07)
+    # or a WRAPPED tree both work; conservative — never mangles a BARE tree.
+    index_tree = _unwrap_feed_tree(
+        index_tree, ("value", "stocksLiveIndices", "indexValue")
+    )
     for exchange, segs in index_tree.items():
         if not isinstance(segs, dict):
             continue
@@ -475,6 +943,45 @@ def wait_for_subscriptions():
         time.sleep(WATCH_POLL_SECS)
 
 
+def silent_feed_watchdog(stocks: int, indices: int) -> None:
+    """Warn LOUDLY (stderr) if subscribed but NO record decodes within the deadline.
+
+    Runs as a daemon thread. The SDK's blocking `consume()` can swallow per-frame
+    decode errors without raising, leaving us "subscribed but 0 ticks" with no
+    actionable cause on stdout/stderr. This surfaces that truth: it samples the
+    DECODED total (emitted + dropped) and, if it is still 0 after the first
+    deadline, prints the most-likely causes; thereafter it re-warns periodically
+    with the live counts until data flows, then goes quiet.
+    """
+    time.sleep(SILENT_FEED_FIRST_WARN_SECS)
+    if EMITTED_TOTAL + DROPPED_TOTAL > 0:
+        return  # data is decoding — nothing to warn about.
+    print(
+        f"groww sidecar: SILENT FEED — subscribed {stocks} stocks + {indices} "
+        f"indices but received NO live records in {SILENT_FEED_FIRST_WARN_SECS}s. "
+        "Auth succeeded (token acquired) and subscribe returned, so the most "
+        "likely causes are: (1) this Groww account lacks a LIVE market-data "
+        "feed entitlement (the socket connects but streams nothing); (2) the "
+        "market is closed / pre-open for these instruments; (3) a Groww-side "
+        "feed/socket reject the SDK is swallowing internally (look for the SDK's "
+        "own 'Error:' lines above). The feed will keep retrying; it is NOT "
+        "marked streaming until a real tick arrives.",
+        file=sys.stderr,
+        flush=True,
+    )
+    while EMITTED_TOTAL + DROPPED_TOTAL == 0:
+        time.sleep(SILENT_FEED_REWARN_SECS)
+        if EMITTED_TOTAL + DROPPED_TOTAL > 0:
+            break
+        print(
+            "groww sidecar: STILL SILENT — 0 live records decoded "
+            f"(emitted={EMITTED_TOTAL}, dropped={DROPPED_TOTAL}). "
+            "See the first SILENT FEED diagnostic above for likely causes.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def main() -> None:
     api_key = os.environ.get("GROWW_API_KEY")
     totp_secret = os.environ.get("GROWW_TOTP_SECRET")
@@ -488,7 +995,13 @@ def main() -> None:
     stock_list, index_list, sid_map = wait_for_subscriptions()
 
     # Secrets to mask out of any logged exception detail (never log their values).
-    secrets = (api_key, totp_secret)
+    # A MUTABLE list (not a tuple) so the access token can be added to it the
+    # moment it is acquired/refreshed (line ~886) and the NATS reason hooks +
+    # reject poller — which capture this object by reference — mask it too. Also
+    # installs a redacting logging.Filter on the SDK loggers so SDK-emitted DEBUG
+    # records are scrubbed structurally, not just our own print() lines.
+    secrets = [api_key, totp_secret]
+    _install_sdk_log_redaction(secrets)
 
     # Cached access token, reused across FEED reconnects so a feed-connect /
     # subscribe / consume failure does NOT re-hit the rate-limited token endpoint.
@@ -499,6 +1012,13 @@ def main() -> None:
     # Count of consecutive failed cycles — drives the exponential backoff. Reset to
     # 0 after a fully successful cycle (auth OK + connected + consuming).
     consecutive_failures = 0
+    # Start the silent-feed watchdog at most ONCE (the first time we reach a
+    # successful subscribe), not per reconnect cycle — it watches the global
+    # decoded counters for the whole process lifetime.
+    watchdog_started = False
+    # Print the SDK version + the REAL feed methods available in this environment
+    # exactly ONCE (first feed-connect), not per reconnect cycle.
+    feed_introspection_printed = False
 
     # Reconnect loop — never give up (lock: not a single received tick missed).
     while True:
@@ -509,6 +1029,15 @@ def main() -> None:
             if access_token is None:
                 totp = pyotp.TOTP(totp_secret).now()
                 access_token = GrowwAPI.get_access_token(api_key=api_key, totp=totp)
+                # Add the freshly-acquired bearer token to the live redaction set
+                # (security fix 2026-06-29): a NATS-over-WS auth/handshake error's
+                # repr can embed the CONNECT frame / auth payload carrying this
+                # token, and the Rust supervisor forwards every sidecar stderr line
+                # to CloudWatch — so the token MUST be masked before it can be
+                # logged. The hooks/poller hold `secrets` by reference, so this also
+                # covers a refreshed token without re-arming. (The JWT-shape mask in
+                # _redact is the belt-and-suspenders backstop for any new shape.)
+                _add_secret(secrets, access_token)
                 # Explicit auth-success signal — distinguishes "auth succeeded, feed
                 # connect failed" from "auth failed". Log only the token LENGTH,
                 # never the token value.
@@ -524,6 +1053,26 @@ def main() -> None:
             phase = "feed-connect"
             groww = GrowwAPI(access_token)
             feed = GrowwFeed(groww)
+
+            # DIAGNOSTIC (2026-06-29): print the installed SDK version + the REAL
+            # public feed methods available in THIS environment, exactly once. This
+            # definitively resolves whether `subscribe_index_value` exists (vs only
+            # `subscribe_ltp` with segment="CASH" for indices) instead of guessing
+            # from the docs — `dir(feed)` is the ground truth of the running wheel.
+            if not feed_introspection_printed:
+                try:
+                    import growwapi as _growwapi_mod
+                    sdk_version = getattr(_growwapi_mod, "__version__", "unknown")
+                except Exception:  # noqa: BLE001 - introspection must never break the feed
+                    sdk_version = "unknown"
+                feed_methods = sorted(m for m in dir(feed) if not m.startswith("_"))
+                print(
+                    f"groww sidecar DIAGNOSTIC: growwapi.__version__={sdk_version} | "
+                    f"feed methods={feed_methods}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                feed_introspection_printed = True
 
             phase = "subscribe"
             # Cache the subscribe counts so the first-emit `streaming` status write
@@ -555,6 +1104,34 @@ def main() -> None:
             # A full cycle succeeded up to the blocking consume — reset backoff so
             # the next genuine disconnect retries quickly, not at the capped delay.
             consecutive_failures = 0
+            # Surface the REAL NATS reject reason (2026-06-29). The SDK swallows it:
+            # an "Authorization Violation" never reaches a growwapi callback (it is
+            # stored only on the underlying socket's last_error) and the bare
+            # "Error:" line is empty. (1) Replace the SDK's own callbacks with
+            # real-detail versions; (2) start a daemon poller that reads the socket's
+            # last_error and prints one edge-triggered `GROWW LIVE FEED REJECTED:
+            # <reason>` line + a periodic heartbeat. Both best-effort — a future-wheel
+            # attribute rename is caught and logged, never breaks the feed. Armed once
+            # per process (the poller watches the global counters for the lifetime).
+            if not watchdog_started:
+                install_nats_reason_hooks(feed, secrets)
+                threading.Thread(
+                    target=nats_reject_poller,
+                    args=(feed, secrets),
+                    name="groww-nats-reject-poller",
+                    daemon=True,
+                ).start()
+                # Arm the silent-feed watchdog once: if the SDK's blocking consume()
+                # streams nothing (swallowed feed reject / no entitlement / closed
+                # market), it surfaces a loud, actionable diagnostic to stderr instead
+                # of leaving the operator with only the SDK's empty "Error:" lines.
+                threading.Thread(
+                    target=silent_feed_watchdog,
+                    args=(len(stock_list), len(index_list)),
+                    name="groww-silent-feed-watchdog",
+                    daemon=True,
+                ).start()
+                watchdog_started = True
             phase = "consume"
             # HONEST-FEED FIX (2026-06-29): the optimistic pre-consume
             # write_status("streaming", …) was REMOVED. "streaming" (which flips the
@@ -583,16 +1160,89 @@ def main() -> None:
             # str/repr/response, which the Rust supervisor captures from stdout
             # (security-review MEDIUM 2026-06-19). `_exception_detail` redacts the
             # api_key + TOTP secret and caps length so the cause is visible without
-            # leaking the credentials.
+            # leaking the credentials. We print to STDERR (errors belong there; the
+            # supervisor captures both) with the exception TYPE + the full redacted
+            # detail (now incl. the SDK `.msg`/`.code`, never just an empty str).
             rl_note = " [rate-limited — backing off longer]" if rate_limited else ""
             print(
                 f"groww sidecar error [{phase}]: {type(exc).__name__}: "
                 f"{_exception_detail(exc, secrets)}{rl_note} — reconnecting in "
                 f"{delay:.0f}s (attempt {consecutive_failures})",
+                file=sys.stderr,
                 flush=True,
             )
+            # Full traceback — surfaced on the FIRST failure and then every 100th so
+            # a fast-looping `consume()` that returns-then-raises can never flood the
+            # log, while the operator still always sees the real stack on the first
+            # occurrence (the deliverable that unblocks diagnosis). Redacted + capped
+            # so it can never leak the api_key / TOTP secret that an SDK frame's
+            # locals/repr might embed.
+            if consecutive_failures == 1 or consecutive_failures % 100 == 0:
+                tb = _redact(traceback.format_exc(), secrets)
+                if len(tb) > 4000:
+                    tb = tb[:4000] + "…(traceback truncated)"
+                print(
+                    f"groww sidecar error [{phase}] traceback "
+                    f"(failure #{consecutive_failures}):\n{tb}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             time.sleep(delay)
 
 
+def _selftest_redaction() -> None:
+    """Prove the redaction layers mask (a) a tuple value and (b) a JWT shape.
+
+    Guarded behind `--selftest` so it NEVER runs in prod (prod runs with no args
+    → main()). Run with: `python3 groww_sidecar.py --selftest`.
+    """
+    # (a) exact-value masking of a secret in the set (mutable-list path).
+    secrets = ["my-api-key-12345678", "TOTPSEEDABCDEF"]
+    token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJncm93dyJ9.s3cr3t-SIGNATURE_abcdef"
+    _add_secret(secrets, token)
+    assert token in secrets, "access token must be added to the live redaction set"
+
+    line = (
+        "NATS connect failed: CONNECT {\"auth_token\":\"my-api-key-12345678\"} "
+        f"bearer {token} url=wss://socket-api.groww.in"
+    )
+    red = _redact(line, secrets)
+    assert "my-api-key-12345678" not in red, "api_key value must be masked"
+    assert token not in red, "access token value must be masked"
+    assert "***REDACTED***" in red, "exact-value mask must fire"
+
+    # (b) structural JWT-shape masking even when the token is NOT in `secrets`.
+    unknown_jwt = "eyJ0eXAiOiJKV1QifQ.eyJ1aWQiOiI5OTkifQ.UNKNOWN-sig_0123456789"
+    red2 = _redact(f"auth error: token={unknown_jwt} expired", secrets=[])
+    assert unknown_jwt not in red2, "unanticipated JWT-shaped token must be masked"
+    assert "***REDACTED_JWT***" in red2, "structural JWT mask must fire"
+
+    # (c) the SDK logging filter scrubs a record BEFORE emit (structural path):
+    rec = logging.LogRecord(
+        name="growwapi.feed", level=logging.DEBUG, pathname=__file__, lineno=1,
+        msg="connecting with bearer %s", args=(token,), exc_info=None,
+    )
+    _RedactingLogFilter(secrets).filter(rec)
+    assert token not in rec.getMessage(), "SDK DEBUG record must be scrubbed"
+    assert rec.args is None, "args must be cleared after structural redaction"
+
+    # (d) the filter drops the raw exc_info 3-tuple so a fresh-render formatter
+    # cannot re-leak an unredacted traceback (security-review MEDIUM 2026-06-29).
+    try:
+        raise ValueError(f"boom token={token}")
+    except ValueError:
+        rec2 = logging.LogRecord(
+            name="nats.aio.client", level=logging.ERROR, pathname=__file__,
+            lineno=1, msg="connect failed", args=None, exc_info=sys.exc_info(),
+        )
+    _RedactingLogFilter(secrets).filter(rec2)
+    assert rec2.exc_info is None, "raw exc_info tuple must be cleared"
+
+    print("groww sidecar redaction self-test: PASS")
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--selftest":
+        _selftest_redaction()
+    else:
+        main()
