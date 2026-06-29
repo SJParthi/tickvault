@@ -265,12 +265,52 @@ impl FeedHealthRegistry {
         self.instrumented[i].store(true, Ordering::Relaxed);
     }
 
+    /// Clear `feed`'s auth-rejected flag on a GENUINE same-session recovery — the
+    /// edge where ticks start flowing again. Without this, an alert-class sidecar
+    /// line (set via [`Self::set_auth_rejected`]`(true)`) latches the flag forever
+    /// and the `/feeds` page shows a stuck false-RED "auth rejected" Down even
+    /// after the feed recovers and is streaming fine (the only other clear site is
+    /// the START edge in `groww_activation`, which never fires on same-session
+    /// recovery).
+    ///
+    /// Edge-triggered + hot-path-safe: it `load`s the flag and only attempts a
+    /// single `compare_exchange` true→false. In the overwhelming common case
+    /// (already false) the `load` short-circuits and NO store happens — O(1), no
+    /// per-tick churn.
+    ///
+    /// "Rows actually flowing again" IS the recovery signal: it clears only on a
+    /// genuine tick (`record_ticks(n>0)` counts rows flushed to QuestDB;
+    /// `record_tick` is one captured tick), so an idle/dead feed never self-heals.
+    /// A feed held down by a HARD provider auth rejection produces zero ticks, so
+    /// the clear cannot fire for it. (The Groww supervisor also raises the flag on
+    /// any alert-class line, not only a hard rejection — for those transient
+    /// cases, a resumed tick flow IS the correct "the alert is over" recovery
+    /// edge, which is exactly what this clears.)
+    #[inline]
+    fn clear_auth_rejected_on_recovery(&self, i: usize) {
+        if self.auth_rejected[i].load(Ordering::Relaxed) {
+            // true→false once. A racing re-set (the provider re-rejects in the
+            // same instant) just wins via Err — that is the correct outcome, so
+            // the must-use Result is intentionally consumed without acting on it.
+            let _cas_outcome = self.auth_rejected[i].compare_exchange(
+                true,
+                false,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
     /// Record one captured tick for `feed` at IST-nanos `ts`. Hot-path O(1).
     pub fn record_tick(&self, feed: Feed, ts_ist_nanos: i64) {
         let i = feed.index();
         self.last_tick_ist_nanos[i].store(ts_ist_nanos, Ordering::Relaxed);
         self.ticks_total[i].fetch_add(1, Ordering::Relaxed);
         self.mark_instrumented(i);
+        // A tick flowing is a genuine recovery edge → clear any stale auth-reject
+        // so the page stops showing a false-RED Down (edge-triggered, no-op when
+        // already clear).
+        self.clear_auth_rejected_on_recovery(i);
     }
 
     /// Record `n` captured ticks for `feed` in ONE O(1) atomic add (NOT a loop),
@@ -287,6 +327,11 @@ impl FeedHealthRegistry {
         self.last_tick_ist_nanos[i].store(ts_ist_nanos, Ordering::Relaxed);
         self.ticks_total[i].fetch_add(n, Ordering::Relaxed);
         self.mark_instrumented(i);
+        // Rows actually flowed (n > 0) → genuine recovery edge; clear any stale
+        // auth-reject so the page resolves back to live (edge-triggered, no-op
+        // when already clear). `n == 0` returned early above, so a 0-row flush
+        // never clears (no false-recovery — audit Rule 11).
+        self.clear_auth_rejected_on_recovery(i);
     }
 
     /// Record one sealed candle for `feed`. O(1).
@@ -759,6 +804,67 @@ mod tests {
         let r2 = reg.snapshot(Feed::Groww, true, true, true, T0 + 2 * 1_000_000_000);
         assert!(!r2.input.auth_rejected);
         assert_eq!(r2.verdict, FeedHealthVerdict::Ok);
+    }
+
+    #[test]
+    fn test_registry_record_ticks_clears_auth_rejected_on_recovery() {
+        // The stuck-false-RED fix: once an alert-class sidecar line latches
+        // auth_rejected=true, the next SUCCESSFUL tick flow (record_ticks with
+        // n>0 — rows actually flushed) must clear it so the page stops showing a
+        // permanent "auth rejected" Down after the feed recovered + is streaming.
+        let reg = FeedHealthRegistry::new();
+        reg.set_connected(Feed::Groww, true);
+        reg.set_auth_rejected(Feed::Groww, true);
+        let down = reg.snapshot(Feed::Groww, true, true, true, T0);
+        assert!(down.input.auth_rejected);
+        assert_eq!(down.verdict, FeedHealthVerdict::Down);
+        // Rows flow again → flag self-heals, verdict resolves to live.
+        reg.record_ticks(Feed::Groww, 3, T0);
+        let live = reg.snapshot(Feed::Groww, true, true, true, T0 + 1_000_000_000);
+        assert!(
+            !live.input.auth_rejected,
+            "a successful tick flow must clear the stale auth-rejected flag"
+        );
+        assert_eq!(live.verdict, FeedHealthVerdict::Ok);
+        assert_eq!(live.input.ticks_total, 3);
+    }
+
+    #[test]
+    fn test_registry_record_ticks_zero_does_not_clear_auth_rejected() {
+        // A 0-row flush is NOT a recovery — it must NOT clear the flag (no false
+        // "recovered" signal; audit Rule 11). The early-return on n==0 means the
+        // clear is never reached.
+        let reg = FeedHealthRegistry::new();
+        reg.set_connected(Feed::Groww, true);
+        reg.set_auth_rejected(Feed::Groww, true);
+        reg.record_ticks(Feed::Groww, 0, T0);
+        let r = reg.snapshot(Feed::Groww, true, true, true, T0 + 1_000_000_000);
+        assert!(
+            r.input.auth_rejected,
+            "a 0-row flush must NOT clear the auth-rejected flag"
+        );
+        assert_eq!(r.verdict, FeedHealthVerdict::Down);
+        assert_eq!(r.input.ticks_total, 0);
+    }
+
+    #[test]
+    fn test_registry_record_tick_clears_auth_rejected_on_recovery() {
+        // The single-tick path clears the stale flag symmetrically.
+        let reg = FeedHealthRegistry::new();
+        reg.set_connected(Feed::Groww, true);
+        reg.set_auth_rejected(Feed::Groww, true);
+        assert!(
+            reg.snapshot(Feed::Groww, true, true, true, T0)
+                .input
+                .auth_rejected
+        );
+        reg.record_tick(Feed::Groww, T0);
+        let r = reg.snapshot(Feed::Groww, true, true, true, T0 + 1_000_000_000);
+        assert!(
+            !r.input.auth_rejected,
+            "a single recovered tick must clear the stale auth-rejected flag"
+        );
+        assert_eq!(r.verdict, FeedHealthVerdict::Ok);
     }
 
     #[test]
