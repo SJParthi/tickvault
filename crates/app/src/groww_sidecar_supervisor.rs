@@ -73,18 +73,114 @@
 //! the production option (lock §32.2).
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use secrecy::ExposeSecret;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use tickvault_api::feed_state::{Feed, FeedRuntimeState};
+use tickvault_common::feed_health::FeedHealthRegistry;
 use tickvault_core::auth::secret_manager::{
     build_ssm_path, fetch_groww_credentials, resolve_environment,
 };
+use tickvault_core::notification::{NotificationEvent, NotificationService};
+
+/// Classification of one diagnostic line the Python sidecar prints, used by the
+/// supervisor to route the line to `tracing` at the right level and to decide
+/// whether it is an operator-actionable feed reject (→ feed_health Down + ONE
+/// Telegram event) or just informational. Pure, O(1) (case-insensitive
+/// substring match against the REAL strings the sidecar emits — see
+/// `scripts/groww-sidecar/groww_sidecar.py`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidecarLineClass {
+    /// The Groww account has no LIVE market-data feed entitlement (the sidecar's
+    /// SILENT-FEED watchdog), or the line names a permissions/authorization
+    /// problem. The socket connects but streams nothing.
+    EntitlementRejected,
+    /// An auth-phase reject (`groww sidecar error [auth]`) — the token is
+    /// invalid/expired.
+    AuthRejected,
+    /// A generic sidecar error (feed-connect / subscribe / consume phase, or the
+    /// SDK's bare `Error:` NATS line).
+    Error,
+    /// A subscribe-confirmation line (`subscribed N stocks + M indices`).
+    Subscribed,
+    /// A positive/streaming line (`groww auth OK`, NDJSON append).
+    Streaming,
+    /// Anything else — informational.
+    Info,
+}
+
+impl SidecarLineClass {
+    /// True for the classes that are operator-actionable feed rejects — the
+    /// supervisor marks Groww rejected in feed_health + fires ONE Telegram event
+    /// for these (edge-triggered per running child). `Subscribed`/`Streaming`/
+    /// `Info` are tracing-only.
+    #[must_use]
+    pub const fn triggers_alert(self) -> bool {
+        matches!(
+            self,
+            Self::EntitlementRejected | Self::AuthRejected | Self::Error
+        )
+    }
+
+    /// The fixed, plain-English reason shown to the operator for an
+    /// alert-triggering class. A FIXED `&'static str` per class — never the raw
+    /// child line — so no runtime/credential text can reach Telegram
+    /// (defense-in-depth). `None` for the non-alert classes.
+    #[must_use]
+    pub const fn alert_reason(self) -> Option<&'static str> {
+        match self {
+            Self::EntitlementRejected => Some(
+                "account lacks a live market-data feed entitlement (or feed permissions denied)",
+            ),
+            Self::AuthRejected => Some("authentication rejected — refresh the Groww api-key"),
+            Self::Error => Some("the feed reported an error and is retrying"),
+            Self::Subscribed | Self::Streaming | Self::Info => None,
+        }
+    }
+}
+
+/// Classify one sidecar diagnostic line. Pure, O(1), case-insensitive substring
+/// match against the REAL strings `scripts/groww-sidecar/groww_sidecar.py`
+/// prints. Order matters: the most-specific / most-actionable class wins.
+#[must_use]
+pub fn classify_sidecar_line(line: &str) -> SidecarLineClass {
+    let l = line.to_ascii_lowercase();
+    // Auth reject is the most specific cause — check before the generic error.
+    if l.contains("error [auth]") {
+        return SidecarLineClass::AuthRejected;
+    }
+    // Entitlement / permissions: the SILENT-FEED watchdog + permissions text.
+    if l.contains("silent feed")
+        || l.contains("still silent")
+        || l.contains("entitlement")
+        || l.contains("permission")
+        || l.contains("authoriz")
+    {
+        return SidecarLineClass::EntitlementRejected;
+    }
+    // Any other error phase, or the SDK's bare "Error:" NATS line.
+    if l.contains("sidecar error")
+        || l.contains("traceback")
+        || l.starts_with("error:")
+        || l.contains(" error:")
+    {
+        return SidecarLineClass::Error;
+    }
+    if l.contains("subscribed ") {
+        return SidecarLineClass::Subscribed;
+    }
+    if l.contains("auth ok") || l.contains("appending ndjson") || l.contains("→ appending") {
+        return SidecarLineClass::Streaming;
+    }
+    SidecarLineClass::Info
+}
 
 /// System Python used ONLY to create the isolated venv (never to run the
 /// sidecar — the sidecar runs from the venv's own python). This is the FIRST
@@ -371,15 +467,99 @@ async fn ensure_python_env(opts: &GrowwSidecarOptions) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Drain one captured child pipe line-by-line. Each line is classified and
+/// forwarded to `tracing` at the right level; on the FIRST alert-class line
+/// (edge-triggered via the shared `alerted` latch) it marks Groww rejected in
+/// `feed_health` (→ the `/feeds` dashboard shows the actionable Down) and fires
+/// ONE typed Telegram event with a FIXED per-class reason (never the raw child
+/// text). The task ends naturally when the pipe closes (child exit). Non-blocking,
+/// cold-path. `pipe_name` is only a tracing label.
+fn spawn_pipe_drain<R>(
+    pipe: R,
+    pipe_name: &'static str,
+    feed_health: Arc<FeedHealthRegistry>,
+    notifier: Option<Arc<NotificationService>>,
+    alerted: Arc<std::sync::atomic::AtomicBool>,
+) -> tokio::task::JoinHandle<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(pipe).lines();
+        // next_line() is cancel-safe and ends with Ok(None) on EOF (pipe closed).
+        while let Ok(Some(line)) = lines.next_line().await {
+            let class = classify_sidecar_line(&line);
+            // Forward the child's OWN (already-redacted) line to tracing at the
+            // level its class implies, so it reaches the 5-sink → CloudWatch.
+            match class {
+                SidecarLineClass::AuthRejected
+                | SidecarLineClass::EntitlementRejected
+                | SidecarLineClass::Error => {
+                    error!(stream = pipe_name, "[feeds] groww sidecar: {line}");
+                }
+                SidecarLineClass::Subscribed | SidecarLineClass::Streaming => {
+                    info!(stream = pipe_name, "[feeds] groww sidecar: {line}");
+                }
+                SidecarLineClass::Info => {
+                    info!(stream = pipe_name, "[feeds] groww sidecar: {line}");
+                }
+            }
+            if class.triggers_alert() {
+                // Edge-trigger: fire the operator-facing side-effects ONCE per
+                // running child, even if the same error prints 100×.
+                if !alerted.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    feed_health.set_auth_rejected(Feed::Groww, true);
+                    if let (Some(notifier), Some(reason)) = (&notifier, class.alert_reason()) {
+                        notifier.notify(NotificationEvent::GrowwSidecarRejected {
+                            reason: reason.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    })
+}
+
 /// Watch a running child until it exits OR the operator disables the Groww
-/// feed at runtime. Returns `true` if it was stopped because of a disable
-/// toggle (graceful, not a failure), `false` if the child exited on its own
-/// (a crash/exit → counts toward restart backoff).
-// TEST-EXEMPT: drives a live child process + runtime toggle via tokio::select!; the disable gate it reads (FeedRuntimeState::is_enabled) is unit-tested in the api crate.
+/// feed at runtime, while draining its stdout + stderr (each line → tracing,
+/// classified; alert classes → feed_health Down + ONE Telegram event).
+/// Returns `true` if it was stopped because of a disable toggle (graceful, not
+/// a failure), `false` if the child exited on its own (a crash/exit → counts
+/// toward restart backoff). The two drain tasks are aborted on return so they
+/// never leak across restarts.
+// TEST-EXEMPT: drives a live child process + runtime toggle via tokio::select!; the disable gate it reads (FeedRuntimeState::is_enabled) is unit-tested in the api crate; the pure line classifier (classify_sidecar_line) + its alert routing (SidecarLineClass) are unit-tested below.
 async fn supervise_child(
     child: &mut tokio::process::Child,
     feed_runtime: &FeedRuntimeState,
+    feed_health: &Arc<FeedHealthRegistry>,
+    notifier: &Option<Arc<NotificationService>>,
 ) -> bool {
+    // One latch per running child so the alert fires at most once per instance.
+    let alerted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut drains: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        drains.push(spawn_pipe_drain(
+            stdout,
+            "stdout",
+            Arc::clone(feed_health),
+            notifier.clone(),
+            Arc::clone(&alerted),
+        ));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        drains.push(spawn_pipe_drain(
+            stderr,
+            "stderr",
+            Arc::clone(feed_health),
+            notifier.clone(),
+            Arc::clone(&alerted),
+        ));
+    }
+    let abort_drains = || {
+        for h in &drains {
+            h.abort();
+        }
+    };
     loop {
         tokio::select! {
             exit = child.wait() => {
@@ -393,6 +573,7 @@ async fn supervise_child(
                         "[feeds] groww sidecar wait() failed — will relaunch with backoff"
                     ),
                 }
+                abort_drains();
                 return false;
             }
             () = sleep(SIDECAR_DISABLE_POLL) => {
@@ -401,6 +582,7 @@ async fn supervise_child(
                         warn!(error = %err, "[feeds] groww sidecar kill signal failed (already exiting?)");
                     }
                     let _status = child.wait().await;
+                    abort_drains();
                     info!("[feeds] groww disabled at runtime — sidecar stopped (will resume on re-enable)");
                     return true;
                 }
@@ -416,6 +598,18 @@ async fn supervise_child(
 pub async fn run_groww_sidecar_supervisor(
     feed_runtime: Arc<FeedRuntimeState>,
     opts: GrowwSidecarOptions,
+    // Live-feed health (operator 2026-06-22): on a sidecar auth/entitlement/error
+    // diagnostic, mark Groww rejected so `GET /api/feeds/health` + the `/feeds`
+    // page show the actionable Down with the cause — never a silent 0-ticks.
+    feed_health: Arc<FeedHealthRegistry>,
+    // Telegram dispatcher, DEFERRED: the supervisor is spawned early at boot
+    // (before the notifier is built), so it receives a shared slot that main
+    // fills once `NotificationService` is ready. The supervisor resolves it
+    // lazily at each child launch; an empty slot (defensive / test / pre-notifier
+    // boot window) is a no-op — feed_health + tracing still fire. Fires ONE
+    // `GrowwSidecarRejected` event per running child reject so the operator sees
+    // WHY Groww has 0 ticks.
+    notifier: Arc<arc_swap::ArcSwapOption<NotificationService>>,
 ) {
     let mut consecutive_failures: u32 = 0;
     loop {
@@ -484,6 +678,12 @@ pub async fn run_groww_sidecar_supervisor(
                 "GROWW_STATUS_FILE",
                 opts.status_file.to_string_lossy().as_ref(),
             )
+            // Capture the child's stdout + stderr so its diagnostic lines (the
+            // SDK's bare `Error:`, the SILENT-FEED entitlement line, auth/permission
+            // rejects, the redacted traceback) reach `tracing` → CloudWatch +
+            // feed_health + Telegram instead of being lost to inherited stdio.
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             // Reap the child deterministically if the supervisor task is dropped
             // (e.g. runtime shutdown / daily AWS stop). Without this, a dropped
             // `Child` leaves the Python sidecar orphaned + still appending to the
@@ -512,7 +712,11 @@ pub async fn run_groww_sidecar_supervisor(
             "[feeds] groww sidecar launched — appending capture-at-receipt ticks for the bridge"
         );
 
-        let stopped_by_disable = supervise_child(&mut child, &feed_runtime).await;
+        // Resolve the deferred notifier slot at launch time: by the time a child
+        // first prints a reject line, main has stored the live notifier here.
+        let notifier_now: Option<Arc<NotificationService>> = notifier.load_full();
+        let stopped_by_disable =
+            supervise_child(&mut child, &feed_runtime, &feed_health, &notifier_now).await;
         if stopped_by_disable {
             // Graceful runtime stop — reset the failure curve so re-enabling
             // relaunches immediately.
@@ -709,6 +913,175 @@ mod tests {
             src.contains(&env_key) && src.contains("opts.status_file.to_string_lossy"),
             "the supervisor must inject GROWW_STATUS_FILE (the connect+subscribe \
              proof status file) into the sidecar child"
+        );
+    }
+
+    // ── classify_sidecar_line (the pure diagnostic classifier) ──
+    // pub-fn-test-guard one-liner: these tests exercise classify_sidecar_line +
+    // SidecarLineClass triggers_alert + alert_reason across every class below.
+
+    #[test]
+    fn test_classify_silent_feed_and_entitlement_are_entitlement_rejected() {
+        // The sidecar's SILENT-FEED watchdog line + its "account lacks … live
+        // market-data feed entitlement" phrasing → EntitlementRejected.
+        assert_eq!(
+            classify_sidecar_line(
+                "groww sidecar: SILENT FEED — subscribed 765 stocks + 2 indices but received NO live records"
+            ),
+            SidecarLineClass::EntitlementRejected
+        );
+        assert_eq!(
+            classify_sidecar_line("groww sidecar: STILL SILENT — 0 live records decoded"),
+            SidecarLineClass::EntitlementRejected
+        );
+        assert_eq!(
+            classify_sidecar_line(
+                "this Groww account lacks a LIVE market-data feed entitlement (socket connects but streams nothing)"
+            ),
+            SidecarLineClass::EntitlementRejected
+        );
+    }
+
+    #[test]
+    fn test_classify_permissions_and_authorization_are_entitlement_rejected() {
+        // The SDK's swallowed NATS permissions/authorization wording.
+        assert_eq!(
+            classify_sidecar_line("NATS permissions violation for subscription"),
+            SidecarLineClass::EntitlementRejected
+        );
+        assert_eq!(
+            classify_sidecar_line("not authorized to subscribe to this subject"),
+            SidecarLineClass::EntitlementRejected
+        );
+    }
+
+    #[test]
+    fn test_classify_auth_phase_error_is_auth_rejected() {
+        // The auth-phase reject is the most specific cause — beats the generic Error.
+        assert_eq!(
+            classify_sidecar_line(
+                "groww sidecar error [auth]: ApiException: Token key not found or inactive — reconnecting in 10s"
+            ),
+            SidecarLineClass::AuthRejected
+        );
+    }
+
+    #[test]
+    fn test_classify_bare_error_and_other_phases_are_error() {
+        // The SDK's bare "Error:" NATS line (its swallowed per-frame errors).
+        assert_eq!(classify_sidecar_line("Error:"), SidecarLineClass::Error);
+        assert_eq!(
+            classify_sidecar_line("Error: nats: connection closed"),
+            SidecarLineClass::Error
+        );
+        // Other phase rejects (feed-connect / subscribe / consume) → Error.
+        assert_eq!(
+            classify_sidecar_line(
+                "groww sidecar error [feed-connect]: ConnectionError: refused — reconnecting in 4s"
+            ),
+            SidecarLineClass::Error
+        );
+        assert_eq!(
+            classify_sidecar_line("groww sidecar error [consume] traceback (failure #1):"),
+            SidecarLineClass::Error
+        );
+    }
+
+    #[test]
+    fn test_classify_subscribed_line() {
+        assert_eq!(
+            classify_sidecar_line("subscribed 765 stocks + 2 indices — awaiting first tick…"),
+            SidecarLineClass::Subscribed
+        );
+    }
+
+    #[test]
+    fn test_classify_positive_and_info_lines() {
+        assert_eq!(
+            classify_sidecar_line("groww auth OK: access token acquired (len=512)"),
+            SidecarLineClass::Streaming
+        );
+        assert_eq!(
+            classify_sidecar_line("groww sidecar → appending NDJSON to data/groww/ticks.ndjson"),
+            SidecarLineClass::Streaming
+        );
+        // A real LTP/NDJSON data line / anything else → Info (no side-effect).
+        assert_eq!(
+            classify_sidecar_line(r#"{"sid":1333,"ltp":2847.5,"ts":1780000000123}"#),
+            SidecarLineClass::Info
+        );
+        assert_eq!(classify_sidecar_line(""), SidecarLineClass::Info);
+    }
+
+    #[test]
+    fn test_classify_is_case_insensitive() {
+        assert_eq!(
+            classify_sidecar_line("SILENT feed warning"),
+            SidecarLineClass::EntitlementRejected
+        );
+        assert_eq!(
+            classify_sidecar_line("GROWW SIDECAR ERROR [AUTH]: bad token"),
+            SidecarLineClass::AuthRejected
+        );
+    }
+
+    #[test]
+    fn test_sidecar_line_class_triggers_alert_only_for_reject_classes() {
+        assert!(SidecarLineClass::EntitlementRejected.triggers_alert());
+        assert!(SidecarLineClass::AuthRejected.triggers_alert());
+        assert!(SidecarLineClass::Error.triggers_alert());
+        assert!(!SidecarLineClass::Subscribed.triggers_alert());
+        assert!(!SidecarLineClass::Streaming.triggers_alert());
+        assert!(!SidecarLineClass::Info.triggers_alert());
+    }
+
+    #[test]
+    fn test_alert_reason_present_only_for_alert_classes_and_is_plain_english() {
+        // Every alert class has a fixed plain-English reason; non-alert classes
+        // have none. The reasons carry no library names / file paths / raw input.
+        for class in [
+            SidecarLineClass::EntitlementRejected,
+            SidecarLineClass::AuthRejected,
+            SidecarLineClass::Error,
+        ] {
+            let reason = class
+                .alert_reason()
+                .expect("alert class must have a reason");
+            assert!(!reason.is_empty());
+            assert!(!reason.contains(".rs"), "file path in reason: {reason}");
+            assert!(!reason.contains("Stdio"), "lib jargon in reason: {reason}");
+        }
+        assert!(SidecarLineClass::Subscribed.alert_reason().is_none());
+        assert!(SidecarLineClass::Streaming.alert_reason().is_none());
+        assert!(SidecarLineClass::Info.alert_reason().is_none());
+    }
+
+    #[test]
+    fn test_supervisor_pipes_and_drains_child_stdio() {
+        // The verified bug fix: the supervisor MUST pipe stdout + stderr and drain
+        // them (so the sidecar's diagnostic lines reach tracing + feed_health +
+        // Telegram instead of inherited stdio). The supervise loop is a TEST-EXEMPT
+        // process driver, so pin the wiring by source-scan — a future refactor
+        // cannot silently restore the inherited-stdio blindness.
+        let src = include_str!("groww_sidecar_supervisor.rs");
+        assert!(
+            src.contains("Stdio::piped()"),
+            "the supervisor must pipe the child's stdout + stderr"
+        );
+        assert!(
+            src.contains(".stdout(Stdio::piped())") && src.contains(".stderr(Stdio::piped())"),
+            "BOTH stdout and stderr must be piped"
+        );
+        assert!(
+            src.contains("spawn_pipe_drain")
+                && src.contains("child.stdout.take()")
+                && src.contains("child.stderr.take()"),
+            "the supervisor must drain both captured pipes"
+        );
+        assert!(
+            src.contains("feed_health.set_auth_rejected(Feed::Groww, true)")
+                && src.contains("NotificationEvent::GrowwSidecarRejected"),
+            "an alert-class line must mark feed_health rejected + fire the typed Telegram event"
         );
     }
 }

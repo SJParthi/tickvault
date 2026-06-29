@@ -915,6 +915,17 @@ pub enum NotificationEvent {
         failed_checks_before_recovery: u32,
     },
 
+    /// The Groww Python sidecar printed a diagnostic line classifying as a
+    /// genuine auth / entitlement / error reject (e.g. its watchdog's
+    /// "account lacks a live market-data feed entitlement" line, or a
+    /// "sidecar error [auth]" line). Previously these lines reached only the
+    /// container logs because the supervisor inherited the child's stdio — so
+    /// the operator was blind to WHY Groww streamed 0 ticks. The supervisor now
+    /// fires this ONCE per running-child reject (edge-triggered) with a fixed
+    /// plain-English `reason` per class (never the raw child text — defense in
+    /// depth so no runtime/credential data reaches Telegram). Severity::High.
+    GrowwSidecarRejected { reason: String },
+
     /// Custom alert from any component.
     Custom { message: String },
     // RETIRED 2026-06-12: LastTickAfterBoundary deleted — it was defined but
@@ -1872,6 +1883,17 @@ impl NotificationEvent {
                      No action needed unless this recurs."
                 )
             }
+            Self::GrowwSidecarRejected { reason } => {
+                // `reason` is a fixed per-class &'static str mapped to String by
+                // the supervisor (never raw child text), but html_escape it
+                // anyway for defense-in-depth, consistent with every String arm.
+                format!(
+                    "🆘 <b>Groww live feed rejected</b>\n{}\n\nThe Groww feed is \
+                     connected but receiving nothing. Until this is fixed, Groww \
+                     prices will not flow.",
+                    html_escape(reason)
+                )
+            }
             Self::Custom { message } => message.clone(),
         }
     }
@@ -1954,6 +1976,7 @@ impl NotificationEvent {
             Self::RealtimeGuaranteeHealthy { .. } => "RealtimeGuaranteeHealthy",
             Self::RealtimeGuaranteeDegraded { .. } => "RealtimeGuaranteeDegraded",
             Self::RealtimeGuaranteeCritical { .. } => "RealtimeGuaranteeCritical",
+            Self::GrowwSidecarRejected { .. } => "GrowwSidecarRejected",
             Self::Custom { .. } => "Custom",
         }
     }
@@ -2096,6 +2119,9 @@ impl NotificationEvent {
             Self::BarMismatchCrossCheckFailed { .. } => Severity::Critical,
             Self::StartupComplete { .. } => Severity::Info,
             Self::ShutdownComplete => Severity::Info,
+            // A genuine Groww feed reject (auth / entitlement / error) is
+            // operator-actionable — pages so the 0-ticks cause is visible.
+            Self::GrowwSidecarRejected { .. } => Severity::High,
         }
     }
 
@@ -2231,6 +2257,45 @@ mod tests {
         assert!(!msg.contains("Prometheus"), "retired in #O3: {msg}");
         assert!(!msg.contains("Alertmanager"), "retired in #O2: {msg}");
         assert!(!msg.contains("Valkey"), "retired in #O4: {msg}");
+    }
+
+    #[test]
+    fn test_groww_sidecar_rejected_renders_reason_and_topic_and_severity() {
+        let event = NotificationEvent::GrowwSidecarRejected {
+            reason: "account lacks live market-data feed entitlement".to_string(),
+        };
+        let msg = event.to_message();
+        // The plain-English reason reaches the operator…
+        assert!(
+            msg.contains("account lacks live market-data feed entitlement"),
+            "reason missing from message: {msg}"
+        );
+        // …with a status emoji at the start (10 commandments rule 5/10)…
+        assert!(msg.contains("🆘"), "severity emoji missing: {msg}");
+        assert!(msg.contains("Groww"), "feed name missing: {msg}");
+        // …no library names / file paths / version numbers (10 commandments).
+        assert!(!msg.contains("Stdio"), "lib jargon leaked: {msg}");
+        assert!(!msg.contains(".rs"), "file path leaked: {msg}");
+        assert!(!msg.contains("growwapi"), "lib name leaked: {msg}");
+        // Stable topic + High severity so it pages.
+        assert_eq!(event.topic(), "GrowwSidecarRejected");
+        assert_eq!(event.severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_groww_sidecar_rejected_html_escapes_reason() {
+        // Defense-in-depth: even though the supervisor only passes a fixed
+        // &'static str reason, any angle brackets are escaped at the render
+        // boundary (consistent with every other String arm).
+        let event = NotificationEvent::GrowwSidecarRejected {
+            reason: "<script>".to_string(),
+        };
+        let msg = event.to_message();
+        assert!(!msg.contains("<script>"), "raw HTML not escaped: {msg}");
+        assert!(
+            msg.contains("&lt;script&gt;"),
+            "expected escaped form: {msg}"
+        );
     }
 
     #[test]
