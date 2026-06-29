@@ -162,34 +162,43 @@ fn classify(i: FeedHealthInput) -> (FeedHealthVerdict, &'static str) {
     if !i.instrumented {
         return (Unknown, "feed health signals not instrumented yet");
     }
-    // The provider REJECTED our auth credential (Groww answered with a non-2xx,
-    // e.g. "Token key not found or inactive"). This is a confirmed, actionable
-    // failure — it must win over the generic disconnected / no-ticks reasons so
-    // the operator sees WHAT to fix, not just a bare Down. It does NOT win over
-    // Disabled (a switched-off feed is intentional, handled above) and is placed
-    // after the not-started / not-instrumented states so a feed that never came
-    // up does not show a misleading auth-rejected. The message is a fixed
-    // `&'static str` (security contract — no runtime/error data interpolated).
-    if i.auth_rejected {
-        return (Down, "auth rejected — refresh the Groww SSM api-key");
-    }
     // Ticks being dropped is a fault at ANY time — the cumulative drop count
     // reflects a real problem that happened today (checked before the
     // market-hours gate so a post-close report still surfaces today's drops).
     if i.drops_total > 0 {
         return (Degraded, "ticks are being dropped — investigate spill/DB");
     }
-    // C1 fix (hostile 3-agent review 2026-06-22): the market-open gate MUST
-    // precede the connected/last-tick checks. Outside market hours the feed
-    // legitimately sleeps + disconnects (the WS pool sleeps-until-open by design)
-    // and goes silent — that is EXPECTED, never a fault. Reporting Down
-    // pre-market (when the pool watchdog has pushed connected=false BEFORE the
-    // pool connects) would be a false-RED — the mirror of the no-false-OK rule.
-    // Idle outside market hours = Ok.
+    // C1 fix (hostile 3-agent review 2026-06-22) + market-closed-idle fix
+    // (operator 2026-06-29): the market-open gate MUST precede BOTH the
+    // connected/last-tick checks AND the auth-rejected check. Outside market
+    // hours the feed legitimately sleeps + disconnects (the WS pool
+    // sleeps-until-open by design) and goes silent — that is EXPECTED, never a
+    // fault. Critically, a latched `auth_rejected` flag is *unverifiable stale
+    // state* when the market is closed: no auth is being attempted and no tick
+    // can flow to re-confirm or self-heal it (the record_ticks recovery-clear
+    // can only fire on a live tick). Surfacing the actionable "refresh the SSM
+    // api-key" Down then is a false-RED — the mirror of the no-false-OK rule —
+    // and it sent the operator chasing a non-existent key problem at 22:30 IST
+    // for a feed that had authed + subscribed 767 fine. Idle outside market
+    // hours = Ok, regardless of a stale auth-reject flag.
     if !i.market_open {
         return (Ok, "market closed — idle is normal");
     }
     // --- Market hours below: silence / disconnection IS a real fault. ---
+    // The provider REJECTED our auth credential (Groww answered with a non-2xx,
+    // e.g. "Token key not found or inactive"). This is a confirmed, actionable
+    // failure — it must win over the generic disconnected / no-ticks reasons so
+    // the operator sees WHAT to fix, not just a bare Down. It is checked DURING
+    // market hours only (above the connected/last-tick checks but below the
+    // market-closed gate) so a stale flag never produces a false "refresh the
+    // api-key" Down outside trading hours. It does NOT win over Disabled (a
+    // switched-off feed is intentional, handled above) and is placed after the
+    // not-started / not-instrumented states so a feed that never came up does
+    // not show a misleading auth-rejected. The message is a fixed `&'static str`
+    // (security contract — no runtime/error data interpolated).
+    if i.auth_rejected {
+        return (Down, "auth rejected — refresh the Groww SSM api-key");
+    }
     // Enabled + lane running + instrumented, but the socket is down → not delivering.
     if !i.connected {
         return (Down, "enabled but disconnected — reconnecting");
@@ -655,6 +664,33 @@ mod tests {
             },
         );
         assert_eq!(r.verdict, FeedHealthVerdict::Disabled);
+    }
+
+    #[test]
+    fn test_market_closed_idle_wins_over_stale_auth_rejected() {
+        // The operator's exact 2026-06-29 22:30 IST scenario: Groww authed +
+        // subscribed 767, but a stale auth_rejected flag was latched. Market is
+        // CLOSED → no auth attempt, no tick possible, so the flag is unverifiable
+        // stale state. It must NOT produce the scary "refresh the SSM api-key"
+        // Down — market-closed idle wins (false-RED avoidance). During market
+        // hours the SAME flag IS a real Down (see the two tests below).
+        let r = evaluate_feed_health(
+            Feed::Groww,
+            FeedHealthInput {
+                auth_rejected: true,
+                connected: false,
+                last_tick_age_secs: None,
+                market_open: false,
+                ..base()
+            },
+        );
+        assert_eq!(
+            r.verdict,
+            FeedHealthVerdict::Ok,
+            "stale auth-reject outside market hours must not be a false-RED Down"
+        );
+        assert_eq!(r.reason, "market closed — idle is normal");
+        assert_ne!(r.reason, "auth rejected — refresh the Groww SSM api-key");
     }
 
     #[test]
