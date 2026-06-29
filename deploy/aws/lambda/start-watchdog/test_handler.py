@@ -37,11 +37,13 @@ class _FakeEc2:
         launch_time: datetime | None = None,
         start_raises: bool = False,
         stop_raises: bool = False,
+        public_ip: str | None = None,
     ) -> None:
         self._state = state
         self._launch_time = launch_time
         self._start_raises = start_raises
         self._stop_raises = stop_raises
+        self._public_ip = public_ip
         self.start_calls: list[list[str]] = []
         self.stop_calls: list[list[str]] = []
 
@@ -51,6 +53,8 @@ class _FakeEc2:
         inst: dict[str, Any] = {"State": {"Name": self._state}}
         if self._launch_time is not None:
             inst["LaunchTime"] = self._launch_time
+        if self._public_ip is not None:
+            inst["PublicIpAddress"] = self._public_ip
         return {"Reservations": [{"Instances": [inst]}]}
 
     def start_instances(self, *, InstanceIds: list[str]) -> dict[str, Any]:  # noqa: N803
@@ -73,7 +77,8 @@ def _wire(monkeypatch, sns: _FakeSns, ec2: _FakeEc2, now: datetime = IN_WINDOW_N
 
 def test_ping_publishes_positive_signal(monkeypatch) -> None:
     sns = _FakeSns()
-    monkeypatch.setattr(handler.boto3, "client", lambda svc: sns)
+    ec2 = _FakeEc2("running", public_ip="13.200.1.2")
+    _wire(monkeypatch, sns, ec2)
     out = handler.lambda_handler({"mode": "ping"})
     assert out["published"] is True
     assert len(sns.published) == 1
@@ -81,6 +86,49 @@ def test_ping_publishes_positive_signal(monkeypatch) -> None:
     # Stale-wording regression lock: the schedule is 08:30 IST, not 08:00.
     assert "8:30" in sns.published[0]["message"]
     assert "08:00" not in sns.published[0]["message"]
+
+
+def test_ping_includes_dashboard_link(monkeypatch) -> None:
+    """The operator's 08:30 start ping must carry a tappable Feed Control link
+    (http://<public_ip>:3001/feeds) built from the live public IP + port."""
+    sns = _FakeSns()
+    ec2 = _FakeEc2("running", public_ip="13.200.1.2")
+    _wire(monkeypatch, sns, ec2)
+    handler.lambda_handler({"mode": "ping"})
+    msg = sns.published[0]["message"]
+    assert "/feeds" in msg
+    assert "3001" in msg
+    assert "http://13.200.1.2:3001/feeds" in msg
+    # The original start-triggered text must remain intact.
+    assert "start triggered" in msg.lower()
+
+
+def test_ping_missing_public_ip_degrades_gracefully(monkeypatch) -> None:
+    """No public IP yet → the start message STILL sends, with no link and a
+    clear 'not ready' line — never a silent omission, never a crash."""
+    sns = _FakeSns()
+    ec2 = _FakeEc2("pending", public_ip=None)  # box up but no IP assigned yet
+    _wire(monkeypatch, sns, ec2)
+    out = handler.lambda_handler({"mode": "ping"})
+    assert out["published"] is True
+    msg = sns.published[0]["message"]
+    assert "http://" not in msg
+    assert "3001/feeds" not in msg
+    assert "not ready yet" in msg
+    assert "8:30" in msg  # start signal preserved
+
+
+def test_ping_describe_error_degrades_gracefully(monkeypatch) -> None:
+    """describe_instances raising must not crash the ping — it still sends the
+    start message without a dashboard link."""
+    sns = _FakeSns()
+    ec2 = _FakeEc2(None)  # describe_instances raises RuntimeError
+    _wire(monkeypatch, sns, ec2)
+    out = handler.lambda_handler({"mode": "ping"})
+    assert out["published"] is True
+    msg = sns.published[0]["message"]
+    assert "http://" not in msg
+    assert "not ready yet" in msg
 
 
 def test_check_running_on_time_stays_silent(monkeypatch) -> None:
