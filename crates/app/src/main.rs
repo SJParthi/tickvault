@@ -355,10 +355,21 @@ async fn main() -> Result<()> {
         // order-update use. Closes the audit gap (Groww connected but wrote no row).
         Some(spawn_ws_event_audit_consumer(config.questdb.clone())),
     ));
+    // Deferred Telegram slot for the Groww sidecar supervisor: the supervisor is
+    // spawned here (before the notifier is built), so it gets a shared slot that
+    // is filled with the live `NotificationService` once it exists (below). On a
+    // sidecar auth/entitlement/error diagnostic the supervisor fires ONE
+    // `GrowwSidecarRejected` Telegram event + marks Groww rejected in feed_health
+    // — so the operator sees WHY Groww has 0 ticks instead of a silent log line.
+    let groww_sidecar_notifier_slot: std::sync::Arc<
+        arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>,
+    > = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
     tokio::spawn(
         tickvault_app::groww_sidecar_supervisor::run_groww_sidecar_supervisor(
             std::sync::Arc::clone(&feed_runtime),
             tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
+            std::sync::Arc::clone(&feed_health),
+            std::sync::Arc::clone(&groww_sidecar_notifier_slot),
         ),
     );
     tokio::spawn(
@@ -1328,6 +1339,10 @@ async fn main() -> Result<()> {
         } else {
             fast_notifier
         };
+        // Fill the Groww sidecar supervisor's deferred Telegram slot now that the
+        // notifier exists: a subsequent sidecar reject diagnostic can page the
+        // operator. Stored once; the supervisor resolves it lazily per child.
+        groww_sidecar_notifier_slot.store(Some(std::sync::Arc::clone(&fast_notifier)));
         match ip_result {
             Ok(result) => {
                 if fast_trading_mode.is_live() {
