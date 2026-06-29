@@ -114,32 +114,54 @@ at INFO via the existing logger.
 | 2 | 08:30 ping, no public IP yet | message sends, no link, "not ready yet" line |
 | 3 | 08:30 ping, describe_instances errors | message sends, no link, no crash |
 
-## Per-Item Guarantee Matrix
+## Per-Item / Per-Plan Guarantee Matrix
 
-This plan cross-references the canonical 15-row + 7-row guarantee matrix in
-`.claude/rules/project/per-wave-guarantee-matrix.md`; every row applies to each
-item above with the honest envelope below (inside the tested envelope, with
-ratcheted regression coverage).
+This plan carries the project-wide guarantee contract by cross-reference to
+`.claude/rules/project/per-wave-guarantee-matrix.md` (the 15-row "100% everything"
+matrix + the 7-row resilience matrix), mirroring
+`.claude/plans/active-plan-groww-log-hardening.md`. This is a **Python AWS-Lambda-only**
+change — it touches NO Rust crate, NO hot path, NO tick/persist/order path — so the
+hot-path / DHAT / Criterion / coverage-gate / DEDUP / Rust-ratchet rows are honestly
+**N/A** with the reason stated. The real, applicable proof is the Lambda pytest suite +
+`py_compile` + the graceful IP-missing degrade + Telegram-commandments compliance.
 
-This change is a Lambda (Python) + Terraform change ONLY — it touches no Rust
-crate, no hot path, no QuestDB table, no WebSocket, and no tick pipeline.
-Therefore the Rust-resilience rows of the 7-row matrix are N/A here, justified
-per row:
+### 15-row "100% everything" matrix (honest, per-row)
 
-- **Zero ticks lost** — N/A: no tick path touched (Lambda message text only).
-- **WS never disconnects** — N/A: no WebSocket code changed.
-- **Never slow/locked/hanged** — N/A: no Rust hot path; the EC2 read is a
-  cold-path, one-shot, exception-wrapped boto3 call at 08:30 IST.
-- **QuestDB never fails** — N/A: no QuestDB interaction.
-- **O(1) latency** — N/A: not a per-tick/per-lookup hot path.
-- **Uniqueness + dedup** — N/A: no QuestDB table / composite key involved.
-- **Real-time proof** — covered: the link rides the existing 08:30 IST
-  "Instance start triggered" Telegram; IP-missing path emits an explicit
-  "not ready yet" line (false-OK avoidance per audit Rule 11), and the
-  resolved IP is logged at INFO to CloudWatch.
+| Demand | Proof for THIS change |
+|---|---|
+| 100% code coverage | N/A for the Rust `scripts/coverage-gate.sh` (no crate touched). Applicable proof: the 4 Lambda pytest cases cover every new branch — link present, IP-missing degrade, describe-error degrade, and the updated positive-signal test (`test_handler.py`). |
+| 100% audit coverage | N/A — no new typed event, no `<event>_audit` QuestDB table; the link rides the EXISTING "Instance start triggered" SNS message. |
+| 100% testing coverage | `python -m pytest deploy/aws/lambda/start-watchdog/test_handler.py` (fallback `python -m py_compile`). Rust 22-category battery N/A (no crate touched). |
+| 100% code checks | Plan-gate + per-item-guarantee + secret-scan apply; Rust banned-pattern / pub-fn guards N/A (Python-only diff). |
+| 100% code performance | N/A — cold-path Lambda invoked once/day at 08:30 IST; no hot path, no DHAT/Criterion budget applies. |
+| 100% monitoring | Existing CloudWatch Logs for the Lambda record the resolved IP at INFO; no new metric needed. |
+| 100% logging | `logger` (Python `logging`) only; no secret logged (the public IP is operator-authorized for the body per the dated directive). |
+| 100% alerting | N/A — reuses the EXISTING 08:30 IST start ping; no new alert class. |
+| 100% security | The IP exposure is a dated operator-authorized scope reversal of `mask_ip_for_notification`, limited to this one start ping; no secret/token exposed (the `/feeds` shell is public, toggles bearer-authed). No new IAM permission (existing `ec2:DescribeInstances`). |
+| 100% security hardening | EC2 read wrapped so any failure degrades to the no-link message; the ping never crashes (fail-soft). |
+| 100% bug fixing | 3 graceful-degrade paths (IP `None`, `describe_instances` raises, `DASHBOARD_PORT` unset) each have a dedicated test. |
+| 100% scenarios covering | The 3-row Scenarios table above maps 1:1 to the 3 degrade/link tests. |
+| 100% functionalities covering | Every new code path (IP resolver helper, link append, "not ready yet" note) is exercised by a test. |
+| 100% code review | Diff is plan-gated + reviewer-visible; small Python surface. |
+| 100% extreme check | The pytest suite fails CI on regression of any of the link/degrade paths. |
 
-The applicable 15-row rows (code coverage, testing coverage, logging, code
-review, scenarios covering, functionalities covering, extreme check) are
-satisfied by the three pytest cases in the Test Plan above + the graceful
-degrade paths in Edge Cases / Failure Modes, exercised by
-`deploy/aws/lambda/start-watchdog/test_handler.py`.
+### 7-row "Resilience demand" matrix (honest, per-row)
+
+| Demand | Proof for THIS change |
+|---|---|
+| Zero ticks lost | N/A — no tick path touched; ring→spill→DLQ untouched. |
+| WS never disconnects | N/A — no WebSocket code touched; `SubscribeRxGuard` / pool watchdog untouched. |
+| Never slow/locked/hanged | N/A — no hot path; the once-daily Lambda EC2 read is bounded by boto3 defaults and wrapped to degrade. |
+| QuestDB never fails | N/A — no QuestDB write touched; schema self-heal untouched. |
+| O(1) latency | N/A — no Rust lookup/hot path; the single `describe_instances` call is a cold-path AWS API call, honestly NOT claimed O(1). |
+| Uniqueness + dedup | N/A — no DEDUP key / composite key touched. |
+| Real-time proof | The dashboard link is verified by the pytest assertions on the published SNS message body. |
+
+### Honest 100% claim
+
+100% inside the tested envelope, with ratcheted regression coverage: the 4 Lambda
+pytest cases (link-present + IP-missing-degrade + describe-error-degrade + updated
+positive-signal) fail CI on regression, and `py_compile` guards syntax. This is a
+Python-Lambda-only, cold-path change that cannot affect ticks, persistence, the live
+feed, or any order path; the Rust hot-path / DHAT / Criterion / coverage-gate / DEDUP
+rows are honestly N/A because no crate is touched.
