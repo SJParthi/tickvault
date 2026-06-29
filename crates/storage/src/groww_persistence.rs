@@ -96,16 +96,34 @@ pub async fn ensure_groww_live_ticks_table(questdb_config: &QuestDbConfig) {
     crate::tick_persistence::ensure_tick_table_dedup_keys(questdb_config).await;
 }
 
-/// Lazy-connect ILP writer for Groww rows in the SHARED `ticks` table. Mirrors
-/// `PrevDayOhlcvWriter`: if QuestDB is unreachable at construction the writer
-/// still builds (`sender = None`); `append_row` fills the local buffer and
-/// `flush` returns `Err` until a reconnect lands. The durable floor for Groww
-/// ticks is the producer's capture-at-receipt file (lock §32), so a flush
-/// failure here is recoverable, not data loss.
+/// Lazy-connect, self-reconnecting ILP writer for Groww rows in the SHARED
+/// `ticks` table. Mirrors the Dhan `TickPersistenceWriter` resilience pattern:
+/// if QuestDB is unreachable at construction the writer still builds
+/// (`sender = None`) and `append_row` fills the local buffer; the NEXT `flush`
+/// then attempts a reconnect via the retained `ilp_conf` string before flushing.
+/// On a flush error from an EXISTING sender, `sender` is set back to `None` so
+/// the following flush reconnects (drop-and-reconnect). The buffer is RETAINED on
+/// any flush/reconnect failure — no buffered row is ever silently discarded. The
+/// durable floor for Groww ticks is the producer's capture-at-receipt file
+/// (lock §32), so a transient flush failure here is recoverable, not data loss.
+///
+/// **The bug this fixes (2026-06-29):** the previous fire-once design had NO
+/// reconnect — if `Sender::from_conf` failed at `new()` (e.g. the bridge is
+/// spawned before the QuestDB-ready gate), `sender` stayed `None` for the whole
+/// process. Every `append_row` still succeeded into the in-RAM buffer, but every
+/// `flush` returned `Err`, so the buffer never drained and ZERO rows reached the
+/// `ticks` table for `feed='groww'` — even though the dashboard counter (then
+/// bumped per append) showed hundreds of thousands of "ticks". The honest
+/// counter (now bumped per PERSISTED row on a successful flush) lives in the
+/// bridge; the reconnect lives here.
 pub struct GrowwLiveTickWriter {
     sender: Option<Sender>,
     buffer: Buffer,
     pending: usize,
+    /// Retained ILP conf string for reconnection (mirrors
+    /// `TickPersistenceWriter::ilp_conf_string`). Holds NO secret (host + port
+    /// only), so it is safe to keep and never logged with a token.
+    ilp_conf: String,
 }
 
 impl GrowwLiveTickWriter {
@@ -122,23 +140,26 @@ impl GrowwLiveTickWriter {
                     sender: Some(s),
                     buffer: b,
                     pending: 0,
+                    ilp_conf: conf,
                 }
             }
             Err(err) => {
                 warn!(
                     ?err,
-                    "groww_live_ticks writer: QuestDB unreachable — buffering locally"
+                    "groww_live_ticks writer: QuestDB unreachable — buffering locally (will reconnect on next flush)"
                 );
                 Self {
                     sender: None,
                     buffer: Buffer::new(ProtocolVersion::V1),
                     pending: 0,
+                    ilp_conf: conf,
                 }
             }
         }
     }
 
-    /// Test constructor — disconnected writer, empty buffer.
+    /// Test constructor — disconnected writer, empty buffer. The conf points at an
+    /// unreachable loopback port so a `flush()` reconnect attempt fails fast.
     #[must_use]
     // TEST-EXEMPT: test-only helper used by append/flush unit tests below.
     pub fn for_test() -> Self {
@@ -146,7 +167,16 @@ impl GrowwLiveTickWriter {
             sender: None,
             buffer: Buffer::new(ProtocolVersion::V1),
             pending: 0,
+            // Port 1 is reserved/refused on every platform → reconnect fails fast
+            // in the disconnected-flush test without hanging.
+            ilp_conf: "tcp::addr=127.0.0.1:1;".to_string(),
         }
+    }
+
+    /// The retained ILP conf string (observability + reconnect test).
+    #[must_use]
+    pub fn ilp_conf(&self) -> &str {
+        &self.ilp_conf
     }
 
     /// `true` when a live ILP sender is held.
@@ -221,17 +251,52 @@ impl GrowwLiveTickWriter {
         self.buffer.as_bytes()
     }
 
-    /// Flush the buffer to QuestDB. `Err` if disconnected (caller logs + the
-    /// producer's capture file remains the durable record; no data loss).
-    pub fn flush(&mut self) -> Result<()> {
+    /// Flush the buffer to QuestDB, returning the number of rows ACTUALLY
+    /// persisted (so the caller can count persisted rows, not buffer appends).
+    ///
+    /// Resilience (mirrors the Dhan `TickPersistenceWriter`):
+    /// - If `sender` is `None` (never connected, or dropped after a prior flush
+    ///   error), reconnect via the retained `ilp_conf` BEFORE flushing. The
+    ///   reconnect creates a FRESH `Buffer` bound to the new sender, so any rows
+    ///   appended while disconnected are migrated into it first (no row lost).
+    /// - On a flush error from an EXISTING sender, set `sender = None` so the NEXT
+    ///   flush reconnects (drop-and-reconnect). The buffer is RETAINED.
+    /// - `Err` if (re)connect or flush fails — the buffer + `pending` are kept and
+    ///   the producer's capture-at-receipt file remains the durable record (no
+    ///   data loss). The caller logs the error.
+    pub fn flush(&mut self) -> Result<usize> {
+        if self.sender.is_none() {
+            self.reconnect()
+                .context("groww_live_ticks flush: reconnect to QuestDB failed")?;
+        }
         let sender = self
             .sender
             .as_mut()
             .context("groww_live_ticks flush: not connected to QuestDB")?;
-        sender
-            .flush(&mut self.buffer)
-            .context("groww_live_ticks flush: ILP flush failed")?;
+        if let Err(err) = sender.flush(&mut self.buffer) {
+            // Drop the broken sender so the next flush reconnects. The buffer is
+            // RETAINED (questdb's `flush` does not clear it on error), so no row
+            // is lost — it is re-attempted on the next flush.
+            self.sender = None;
+            return Err(err).context("groww_live_ticks flush: ILP flush failed");
+        }
+        let flushed = self.pending;
         self.pending = 0;
+        Ok(flushed)
+    }
+
+    /// (Re)establish the ILP sender from the retained conf. The EXISTING buffer is
+    /// KEPT — its already-appended rows are flushed by the new sender (both the
+    /// disconnected `Buffer::new(ProtocolVersion::V1)` and a connected
+    /// `new_buffer()` use the V1 TCP line protocol with the default name-length
+    /// limit, so the buffer is valid to flush through the fresh sender). This
+    /// means rows appended while disconnected are NOT lost — they drain on the
+    /// first successful flush after reconnect. Cold path: only runs when `sender`
+    /// is `None`.
+    fn reconnect(&mut self) -> Result<()> {
+        let new_sender =
+            Sender::from_conf(&self.ilp_conf).context("groww_live_ticks: ILP reconnect failed")?;
+        self.sender = Some(new_sender);
         Ok(())
     }
 }
@@ -316,7 +381,46 @@ mod tests {
     #[test]
     fn test_flush_when_disconnected_errors_not_panics() {
         let mut w = GrowwLiveTickWriter::for_test();
+        // for_test()'s conf points at refused port 1 → reconnect fails → flush Errs
+        // (never panics). Returns Result<usize> now; .is_err() still holds.
         assert!(w.flush().is_err(), "disconnected flush must Err, not panic");
+    }
+
+    #[test]
+    fn test_writer_stores_conf_for_reconnect() {
+        // The retained conf is what flush() uses to reconnect; it must be present
+        // and must NOT contain a token/secret (host+port only).
+        let w = GrowwLiveTickWriter::for_test();
+        assert!(
+            w.ilp_conf().starts_with("tcp::addr="),
+            "conf: {}",
+            w.ilp_conf()
+        );
+        assert!(
+            !w.ilp_conf().to_lowercase().contains("token"),
+            "ilp conf must not carry a token/secret"
+        );
+    }
+
+    #[test]
+    fn test_disconnected_flush_retains_buffer_and_pending() {
+        // The bug fix's core invariant: a failed flush (reconnect to refused port)
+        // must NOT discard the buffered rows — they stay for the next flush.
+        let mut w = GrowwLiveTickWriter::for_test();
+        w.append_row(&sample_row()).expect("append");
+        let bytes_before = w.buffer_byte_count();
+        assert_eq!(w.pending(), 1);
+        assert!(w.flush().is_err(), "reconnect to refused port must Err");
+        assert_eq!(
+            w.pending(),
+            1,
+            "pending must be retained on flush failure (no silent loss)"
+        );
+        assert_eq!(
+            w.buffer_byte_count(),
+            bytes_before,
+            "buffer bytes must be retained on flush failure"
+        );
     }
 
     #[test]
