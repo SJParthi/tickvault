@@ -1,6 +1,8 @@
 //! HTTP API server — axum endpoints for health, stats, quote, and debug.
 //!
 //! # Endpoints
+//! - `GET /` — redirect to `/dashboard`
+//! - `GET /dashboard` — comprehensive operator dashboard (feeds + ticks + candles + DB + health)
 //! - `GET /health` — health check
 //! - `GET /feeds` — operator feed-control webpage (turn feeds on/off, single or multiple)
 //! - `GET /api/stats` — QuestDB table counts
@@ -142,6 +144,20 @@ pub fn build_router_with_auth(
     // - PR #6a (2026-05-19): 3 index-constituency routes + diagnostic route.
     // - PR #6b (2026-05-19): /api/instruments/rebuild route.
     let public_routes = Router::new()
+        // Comprehensive operator dashboard (operator directive 2026-06-29: "the full
+        // everything dashboard page"). A single self-contained HTML page showing
+        // per-feed status + live tick counts + candles + DB row counts + overall
+        // health. Pure VIEW — it client-side fetches the existing `/health`,
+        // `/api/feeds`, `/api/feeds/health`, `/api/stats` endpoints (no new backend).
+        // The HTML shell is public (no secrets); `GET /` lands the operator here.
+        .route(
+            "/",
+            axum::routing::get(handlers::dashboard_page::root_redirect),
+        )
+        .route(
+            "/dashboard",
+            axum::routing::get(handlers::dashboard_page::dashboard_page),
+        )
         .route(
             "/health",
             axum::routing::get(handlers::health::health_check),
@@ -638,6 +654,69 @@ mod tests {
                 .get(axum::http::header::X_FRAME_OPTIONS)
                 .and_then(|v| v.to_str().ok()),
             Some("SAMEORIGIN"),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_router_dashboard_endpoint_returns_200_html() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // Comprehensive operator dashboard (operator 2026-06-29). Public route —
+        // the HTML shell holds no secrets; it must serve 200 + text/html with the
+        // anti-clickjacking header, even with auth disabled (dry-run).
+        let router = build_router(auth_test_state(), &[], true);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.contains("text/html")),
+            "dashboard must serve text/html",
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::X_FRAME_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
+            Some("SAMEORIGIN"),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_router_root_redirects_to_dashboard() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // `GET /` lands the operator on the everything view by redirecting.
+        let router = build_router(auth_test_state(), &[], true);
+        let response = router
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_redirection(),
+            "root must redirect (3xx), got {}",
+            response.status()
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("/dashboard"),
         );
     }
 
