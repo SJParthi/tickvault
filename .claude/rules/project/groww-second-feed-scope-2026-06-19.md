@@ -97,6 +97,14 @@ must update this rule file FIRST with a dated quote, only then can the PR land.
 
 ---
 
+> **2026-06-29 audit-coverage close-out (operator 100%-audit-coverage directive):** the Groww
+> shared-master writer now ALSO emits `instrument_lifecycle_audit` TRANSITION rows tagged
+> `feed='groww'` (appeared/updated/expired/reactivated/segment_moved, diffed vs yesterday's
+> `feed='groww'` snapshot via the SAME pure `classify_transition` the Dhan reconciler uses),
+> audit-first (§24) + best-effort/degrade-safe (`GROWW-MASTER-01`, stage `lifecycle_audit`).
+> This closes the gap where Groww wrote `instrument_lifecycle`/`index_constituency` DATA rows but
+> ZERO audit rows. See `groww-shared-master-error-codes.md` §0 (2026-06-29 close-out).
+
 ## §5. Honest envelope (mandatory per `operator-charter-forever.md` §F)
 
 When any PR / commit / Telegram for this work invokes "100% guarantee", qualify it exactly:
