@@ -62,6 +62,12 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logging.getLogger("growwapi").setLevel(logging.DEBUG)
+# The bare "Error:" lines originate from the SDK's NATS client
+# (nats_client.py:151), which logs a SWALLOWED NATS permissions/authorization
+# violation through the `nats` logger. Only the `nats` logger at DEBUG surfaces
+# the real reason text (e.g. the actual "Authorization Violation"/subject the
+# socket was rejected on) — without this it vanishes and we see the empty line.
+logging.getLogger("nats").setLevel(logging.DEBUG)
 
 try:
     from growwapi import GrowwAPI, GrowwFeed
