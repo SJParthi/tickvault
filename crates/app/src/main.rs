@@ -344,6 +344,15 @@ async fn main() -> Result<()> {
         "[feeds] Groww lanes spawned dormant (bridge + sidecar + activation watcher); \
          they activate on enable (config OR /api/feeds toggle) with no restart"
     );
+    // Trading calendar for the Groww IST-midnight force-seal boundary task. The
+    // shared `Arc<TradingCalendar>` for the Dhan path is built later in boot
+    // (after the clock-drift check), but the Groww bridge spawns here; both are
+    // built from the SAME `config.trading` (immutable read-only calendar data),
+    // so the trading-day gate is identical. Config is already validated.
+    let groww_trading_calendar = std::sync::Arc::new(
+        TradingCalendar::from_config(&config.trading)
+            .context("failed to build Groww trading calendar")?,
+    );
     tokio::spawn(tickvault_app::groww_bridge::run_groww_bridge(
         config.questdb.clone(),
         std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
@@ -354,6 +363,10 @@ async fn main() -> Result<()> {
         // Groww connect/disconnect/reconnect, drained by the SAME consumer Dhan +
         // order-update use. Closes the audit gap (Groww connected but wrote no row).
         Some(spawn_ws_event_audit_consumer(config.questdb.clone())),
+        // Trading calendar (2026-06-29): drives the Groww IST-midnight force-seal
+        // boundary task's trading-day gate — built from the SAME `config.trading`
+        // the Dhan IST-midnight force-seal calendar uses.
+        groww_trading_calendar,
     ));
     // Deferred Telegram slot for the Groww sidecar supervisor: the supervisor is
     // spawned here (before the notifier is built), so it gets a shared slot that
