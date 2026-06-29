@@ -113,3 +113,33 @@ at INFO via the existing logger.
 | 1 | 08:30 ping, box has public IP 13.x.x.x | message has `📊 Dashboard: http://13.x.x.x:3001/feeds` |
 | 2 | 08:30 ping, no public IP yet | message sends, no link, "not ready yet" line |
 | 3 | 08:30 ping, describe_instances errors | message sends, no link, no crash |
+
+## Per-Item Guarantee Matrix
+
+This plan cross-references the canonical 15-row + 7-row guarantee matrix in
+`.claude/rules/project/per-wave-guarantee-matrix.md`; every row applies to each
+item above with the honest envelope below (inside the tested envelope, with
+ratcheted regression coverage).
+
+This change is a Lambda (Python) + Terraform change ONLY — it touches no Rust
+crate, no hot path, no QuestDB table, no WebSocket, and no tick pipeline.
+Therefore the Rust-resilience rows of the 7-row matrix are N/A here, justified
+per row:
+
+- **Zero ticks lost** — N/A: no tick path touched (Lambda message text only).
+- **WS never disconnects** — N/A: no WebSocket code changed.
+- **Never slow/locked/hanged** — N/A: no Rust hot path; the EC2 read is a
+  cold-path, one-shot, exception-wrapped boto3 call at 08:30 IST.
+- **QuestDB never fails** — N/A: no QuestDB interaction.
+- **O(1) latency** — N/A: not a per-tick/per-lookup hot path.
+- **Uniqueness + dedup** — N/A: no QuestDB table / composite key involved.
+- **Real-time proof** — covered: the link rides the existing 08:30 IST
+  "Instance start triggered" Telegram; IP-missing path emits an explicit
+  "not ready yet" line (false-OK avoidance per audit Rule 11), and the
+  resolved IP is logged at INFO to CloudWatch.
+
+The applicable 15-row rows (code coverage, testing coverage, logging, code
+review, scenarios covering, functionalities covering, extreme check) are
+satisfied by the three pytest cases in the Test Plan above + the graceful
+degrade paths in Edge Cases / Failure Modes, exercised by
+`deploy/aws/lambda/start-watchdog/test_handler.py`.
