@@ -400,6 +400,27 @@ impl FeedHealthRegistry {
         self.mark_instrumented(i);
     }
 
+    /// Clear `feed`'s auth-rejected flag on a NON-TICK recovery edge — a
+    /// confirmed re-auth / streaming signal (e.g. the Groww sidecar's
+    /// `groww auth OK` / NDJSON-append line) that proves the alert is over even
+    /// when no tick has been persisted yet.
+    ///
+    /// Why this exists (false-RED durable fix, 2026-06-29): the only other
+    /// mid-session clear is a real persisted tick
+    /// ([`Self::record_tick`]/[`Self::record_ticks`]`(n>0)`), so in a
+    /// legitimately tick-silent window a stale `auth_rejected` (e.g. latched by a
+    /// transient blip) stuck for the whole session. A confirmed streaming/auth-OK
+    /// signal is a genuine non-tick recovery edge that this clears. It does NOT
+    /// instrument the slot or clear on anything but a real positive signal (the
+    /// caller decides the edge), so the no-false-OK rule (audit Rule 11) holds.
+    ///
+    /// Edge-triggered + O(1): delegates to the same `load` →
+    /// single-`compare_exchange(true→false)` primitive as the tick-based
+    /// recovery clear, so it is a no-op (one relaxed load) when already clear.
+    pub fn clear_auth_rejected(&self, feed: Feed) {
+        self.clear_auth_rejected_on_recovery(feed.index());
+    }
+
     /// Build `feed`'s truthful health report from the live signals + the
     /// caller-supplied operator state (`enabled`/`lane_running` from
     /// `FeedRuntimeState`) and the clock/market context. Pure read, O(1).
@@ -720,7 +741,7 @@ mod tests {
 
     // ── FeedHealthRegistry (the live-signal store the lanes update) ──
     // test coverage (one line for the pub-fn-test-guard test.*<fn> heuristic): the
-    // tests below exercise record_tick record_ticks record_candle record_drops set_connected set_auth_rejected set_subscribed set_decode_counts snapshot new
+    // tests below exercise record_tick record_ticks record_candle record_drops set_connected set_auth_rejected clear_auth_rejected set_subscribed set_decode_counts snapshot new
     const T0: i64 = 1_780_000_000_000_000_000;
 
     #[test]
@@ -881,6 +902,48 @@ mod tests {
         );
         assert_eq!(r.verdict, FeedHealthVerdict::Down);
         assert_eq!(r.input.ticks_total, 0);
+    }
+
+    #[test]
+    fn test_registry_clear_auth_rejected_clears_when_set() {
+        // HIGH-2: a non-tick recovery edge (a confirmed streaming / auth-OK
+        // sidecar line) must clear a stale auth_rejected WITHOUT needing a tick,
+        // so a tick-silent window can no longer latch the false-RED for the
+        // whole session.
+        let reg = FeedHealthRegistry::new();
+        reg.set_connected(Feed::Groww, true);
+        reg.set_auth_rejected(Feed::Groww, true);
+        let down = reg.snapshot(Feed::Groww, true, true, true, T0);
+        assert!(down.input.auth_rejected);
+        assert_eq!(down.verdict, FeedHealthVerdict::Down);
+        // Streaming/auth-OK edge — NO tick recorded.
+        reg.clear_auth_rejected(Feed::Groww);
+        let after = reg.snapshot(Feed::Groww, true, true, true, T0 + 1_000_000_000);
+        assert!(
+            !after.input.auth_rejected,
+            "a confirmed non-tick recovery edge must clear the stale auth-reject"
+        );
+        // Note: ticks_total stays 0 — this clear did NOT fabricate a tick.
+        assert_eq!(after.input.ticks_total, 0);
+    }
+
+    #[test]
+    fn test_registry_clear_auth_rejected_is_noop_when_clear() {
+        // When the flag is already clear, clear_auth_rejected is a pure no-op
+        // (no spurious instrumentation, no state change) — the load short-
+        // circuits before any compare_exchange.
+        let reg = FeedHealthRegistry::new();
+        reg.set_connected(Feed::Groww, true);
+        reg.record_tick(Feed::Groww, T0);
+        assert!(
+            !reg.snapshot(Feed::Groww, true, true, true, T0)
+                .input
+                .auth_rejected
+        );
+        reg.clear_auth_rejected(Feed::Groww);
+        let r = reg.snapshot(Feed::Groww, true, true, true, T0 + 1_000_000_000);
+        assert!(!r.input.auth_rejected, "no-op clear leaves the flag clear");
+        assert_eq!(r.verdict, FeedHealthVerdict::Ok);
     }
 
     #[test]

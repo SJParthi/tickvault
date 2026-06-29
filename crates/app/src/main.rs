@@ -470,6 +470,17 @@ async fn main() -> Result<()> {
         tracing::warn!("global TradingCalendar already installed — skipping");
     }
 
+    // Feed-health false-RED fix (2026-06-29) — install the SAME calendar in
+    // `common::market_hours` so the `/feeds` health verdict's `market_open`
+    // (`is_trading_session_now`) is trading-day-aware: weekends AND NSE
+    // holidays inside the 09:00–15:30 clock window read as market-closed, so a
+    // stale `auth_rejected` flag never re-surfaces the false "refresh the SSM
+    // api-key" Down. Without this install the verdict falls back to the
+    // weekday-only gate (still safe; holidays just aren't covered).
+    if !tickvault_common::market_hours::set_market_calendar_for_session(trading_calendar.clone()) {
+        tracing::warn!("session TradingCalendar already installed — skipping");
+    }
+
     // Wave 2 — install global QuestDB config so any module can emit
     // audit rows without holding a config reference.
     if !tickvault_storage::set_global_questdb_config(config.questdb.clone()) {
