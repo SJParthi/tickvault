@@ -9,7 +9,7 @@ use tickvault_common::constants::INDICATOR_RING_BUFFER_CAPACITY;
 use tickvault_common::tick_types::ParsedTick;
 
 /// Helper: create a tick with the given LTP, high, low, volume.
-fn make_tick(security_id: u32, ltp: f32, high: f32, low: f32, volume: u32) -> ParsedTick {
+fn make_tick(security_id: u64, ltp: f32, high: f32, low: f32, volume: u32) -> ParsedTick {
     ParsedTick {
         security_id,
         last_traded_price: ltp,

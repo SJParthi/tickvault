@@ -49,7 +49,7 @@ use tickvault_common::price_precision::f32_to_f64_clean;
 use tickvault_common::tick_types::ParsedTick;
 
 /// Composite key per I-P1-11 — `(security_id, exchange_segment_code)`.
-type PctChangeKey = (u32, u8);
+type PctChangeKey = (u64, u8);
 
 /// Live percentage-change snapshot for one instrument.
 ///
@@ -149,7 +149,7 @@ impl PctChangeCache {
     /// Cold/warm path — called by API / Telegram / operator queries,
     /// not per-tick.
     #[must_use]
-    pub fn lookup(&self, security_id: u32, exchange_segment_code: u8) -> Option<PctChange> {
+    pub fn lookup(&self, security_id: u64, exchange_segment_code: u8) -> Option<PctChange> {
         let pin = self.inner.pin();
         pin.get(&(security_id, exchange_segment_code)).copied()
     }
@@ -193,7 +193,7 @@ mod tests {
     use super::*;
 
     fn make_tick(
-        security_id: u32,
+        security_id: u64,
         segment_code: u8,
         ltp: f32,
         day_open: f32,

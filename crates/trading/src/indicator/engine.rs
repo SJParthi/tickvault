@@ -382,7 +382,7 @@ impl IndicatorEngine {
     // O(1) EXEMPT: begin — cold path startup warmup (runs once before tick processing)
     pub fn warmup_from_candles(
         &mut self,
-        security_id: u32,
+        security_id: u64,
         candles: &[(f64, f64, f64, f64, f64)], // (open, high, low, close, volume)
     ) -> usize {
         let sid = security_id as usize;
@@ -422,7 +422,7 @@ impl IndicatorEngine {
     }
 
     /// Returns the warmup count for a given security.
-    pub fn warmup_count(&self, security_id: u32) -> u16 {
+    pub fn warmup_count(&self, security_id: u64) -> u16 {
         let sid = security_id as usize;
         if sid >= self.states.len() {
             return 0;
@@ -440,7 +440,7 @@ mod tests {
     use super::*;
     use tickvault_common::constants::MAX_INDICATOR_WARMUP_TICKS;
 
-    fn make_tick(security_id: u32, ltp: f32, high: f32, low: f32, volume: u32) -> ParsedTick {
+    fn make_tick(security_id: u64, ltp: f32, high: f32, low: f32, volume: u32) -> ParsedTick {
         ParsedTick {
             security_id,
             last_traded_price: ltp,

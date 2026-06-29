@@ -109,7 +109,7 @@ pub enum SealOutcome {
 #[inline]
 pub fn route_seal(
     params: SealRouteParams<'_>,
-    security_id: u32,
+    security_id: u64,
     exchange_segment_code: u8,
     tf: TfIndex,
     mut state: LiveCandleState,

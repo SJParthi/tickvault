@@ -280,14 +280,16 @@ fn parse_groww_tick_line(line: &str) -> Result<ParsedGrowwTick> {
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
 /// Why a Groww tick cannot be folded through the shared 21-TF engine (the
-/// engine keys on `(u32 security_id, u8 segment_code)` and buckets on a `u32`
-/// IST-second timestamp). REJECT LOUDLY rather than a silent `as u32` alias.
+/// engine keys on `(u64 security_id, u8 segment_code)` and buckets on a `u32`
+/// IST-second timestamp). REJECT LOUDLY rather than a silent alias.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GrowwAggregateReject {
-    /// `security_id` (Groww `exchange_token`) does not fit `u32` (max observed
-    /// 1,175,236 ≪ u32::MAX, so this is a defense-in-depth guard against a future
-    /// Groww schema change — NEVER a silent truncation per the adversarial review).
-    TokenExceedsU32,
+    /// `security_id` (Groww `exchange_token`) is negative. Groww's native
+    /// exchange_token is non-negative and — since the 2026-06-29 `SecurityId`
+    /// u32→u64 widening — fits `u64` directly (indices set bit 62, well within
+    /// `u64`). This is a defence-in-depth gate that only rejects a truly negative
+    /// id; `validate_groww_tick` already filters `security_id <= 0` upstream.
+    NegativeSecurityId,
     /// The IST-second timestamp (`ts_ist_nanos / 1e9`) does not fit `u32`
     /// (epoch-seconds overflow u32 only ~2106 — an honest documented bound).
     TimestampExceedsU32,
@@ -295,8 +297,11 @@ enum GrowwAggregateReject {
 
 /// Builds the shared-engine [`ParsedTick`] from a validated Groww tick.
 ///
-/// Pure + testable. Performs the two WIDTH guards the adversarial review flagged:
-/// - `security_id: i64 → u32` via `u32::try_from` — REJECT on overflow, never `as u32`.
+/// Pure + testable. Performs the guards the adversarial review flagged:
+/// - `security_id: i64 → u64` via `u64::try_from` — REJECT only on a negative id
+///   (since the 2026-06-29 `SecurityId` u32→u64 widening, Groww's native
+///   exchange_token — including bit-62 index ids — folds losslessly; no width
+///   rejection). This is the payoff: every Groww index tick now reaches a candle.
 /// - `ts_ist_nanos → IST seconds → u32` — REJECT on overflow.
 ///
 /// Groww has NO `day_open` / `day_close` / `oi`, so those `ParsedTick` fields are
@@ -305,8 +310,8 @@ enum GrowwAggregateReject {
 /// The `i64` `cum_volume` is NOT placed in `ParsedTick.volume` (a `u32` that would
 /// truncate) — it is carried separately as the consume_tick override.
 fn build_parsed_tick(parsed: &ParsedGrowwTick) -> Result<ParsedTick, GrowwAggregateReject> {
-    let security_id = u32::try_from(parsed.tick.security_id)
-        .map_err(|_| GrowwAggregateReject::TokenExceedsU32)?;
+    let security_id = u64::try_from(parsed.tick.security_id)
+        .map_err(|_| GrowwAggregateReject::NegativeSecurityId)?;
     let exchange_timestamp = u32::try_from(parsed.tick.ts_ist_nanos / NANOS_PER_SECOND)
         .map_err(|_| GrowwAggregateReject::TimestampExceedsU32)?;
     let t = ParsedTick {
@@ -528,8 +533,10 @@ pub(crate) struct GrowwBridgeState {
     /// Dhan (`MultiTfAggregator`), parameterized per-feed by FeedStrategy::GROWW.
     aggregator: MultiTfAggregator,
     /// Per-instrument first-seen set: on first sight pre_populate + seed the
-    /// cumulative baseline (Groww running day-volume). O(1) lookups.
-    seeded: std::collections::HashSet<(u32, u8)>,
+    /// cumulative baseline (Groww running day-volume). O(1) lookups. Keyed on the
+    /// `u64` security_id (post-2026-06-29 widening) so the SAME id keys both the
+    /// `ticks` row and the candle fold for Groww's native exchange_token.
+    seeded: std::collections::HashSet<(u64, u8)>,
     /// Monotonic, replay-stable dedup tiebreaker source (TICK-SEQ-01).
     capture_seq: AtomicI64,
     /// Byte read offset into the tick file (resumes across wakes).
@@ -1152,21 +1159,44 @@ mod tests {
     }
 
     #[test]
-    fn test_build_parsed_tick_rejects_token_above_u32_max() {
-        // Defense-in-depth (adversarial review): a Groww exchange_token that does
-        // not fit u32 is rejected LOUDLY, never silently aliased via `as u32`.
+    fn test_build_parsed_tick_folds_64bit_token_with_bit62_set() {
+        // THE PAYOFF of the u32→u64 SecurityId widening (2026-06-29): a Groww
+        // native exchange_token that sets bit 62 (the index-id encoding, see
+        // instruments.rs) exceeds u32 and was PREVIOUSLY rejected
+        // (TokenExceedsU32) so every Groww index tick was silently lost. It now
+        // folds losslessly through the shared 21-TF engine.
         let mut p = valid_parsed();
-        p.tick.security_id = i64::from(u32::MAX) + 1;
+        let sixty_four_bit_id: i64 = (1_i64 << 62) | 12_345;
+        p.tick.security_id = sixty_four_bit_id;
+        let pt = build_parsed_tick(&p).expect("64-bit bit-62 Groww id must fold, NOT reject");
+        assert_eq!(
+            pt.security_id,
+            (1_u64 << 62) | 12_345,
+            "the full u64 id (incl. bit 62) must be carried, not truncated"
+        );
+        // Boundary: exactly u32::MAX is accepted (was the old upper bound).
+        p.tick.security_id = i64::from(u32::MAX);
+        assert!(build_parsed_tick(&p).is_ok());
+        // u64::MAX-range value (i64::MAX) also folds — no width rejection.
+        p.tick.security_id = i64::MAX;
+        let pt_max = build_parsed_tick(&p).expect("i64::MAX id must fold");
+        assert_eq!(pt_max.security_id, i64::MAX as u64);
+    }
+
+    #[test]
+    fn test_build_parsed_tick_rejects_negative_security_id() {
+        // Defence-in-depth: a negative id (which validate_groww_tick already
+        // filters upstream) is rejected LOUDLY by the u64::try_from gate, never
+        // wrapped into a huge u64.
+        let mut p = valid_parsed();
+        p.tick.security_id = -7;
         assert!(
             matches!(
                 build_parsed_tick(&p),
-                Err(GrowwAggregateReject::TokenExceedsU32)
+                Err(GrowwAggregateReject::NegativeSecurityId)
             ),
-            "token above u32::MAX must reject loudly, never `as u32` alias"
+            "negative security_id must reject loudly"
         );
-        // Boundary: exactly u32::MAX is accepted.
-        p.tick.security_id = i64::from(u32::MAX);
-        assert!(build_parsed_tick(&p).is_ok());
     }
 
     #[test]

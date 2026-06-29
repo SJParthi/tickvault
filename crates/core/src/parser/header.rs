@@ -33,12 +33,16 @@ pub fn parse_header(raw: &[u8]) -> Result<PacketHeader, ParseError> {
         raw[HEADER_OFFSET_MESSAGE_LENGTH + 1],
     ]);
     let exchange_segment_code = raw[HEADER_OFFSET_EXCHANGE_SEGMENT];
-    let security_id = u32::from_le_bytes([
+    // Dhan's wire SecurityId is a 4-byte LE field (`live-market-feed.md` rule
+    // 14). The wire read width stays `u32`; the value is widened LOSSLESSLY to
+    // the `u64` `PacketHeader.security_id` so it folds through the same pipeline
+    // as Groww's native exchange_token (which sets bit 62 and needs `u64`).
+    let security_id = u64::from(u32::from_le_bytes([
         raw[HEADER_OFFSET_SECURITY_ID],
         raw[HEADER_OFFSET_SECURITY_ID + 1],
         raw[HEADER_OFFSET_SECURITY_ID + 2],
         raw[HEADER_OFFSET_SECURITY_ID + 3],
-    ]);
+    ]));
 
     Ok(PacketHeader {
         response_code,

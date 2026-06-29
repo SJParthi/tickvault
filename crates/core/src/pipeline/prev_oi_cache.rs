@@ -46,7 +46,7 @@ use tickvault_common::config::QuestDbConfig;
 /// Composite key per I-P1-11: `(security_id, exchange_segment_code)`.
 /// Using `u8` for the segment code matches `ParsedTick::exchange_segment_code`
 /// and avoids the larger `ExchangeSegment` enum on the hot path.
-type CacheKey = (u32, u8);
+type CacheKey = (u64, u8);
 
 /// HTTP timeout for the QuestDB `/exec` query that loads the cache.
 const PREV_OI_LOAD_TIMEOUT_SECS: u64 = 30;
@@ -89,7 +89,7 @@ impl PrevOiCache {
     ///
     /// O(1), lock-free, zero-alloc — safe to call on the hot path.
     #[inline]
-    pub fn get(&self, security_id: u32, segment_code: u8) -> Option<i64> {
+    pub fn get(&self, security_id: u64, segment_code: u8) -> Option<i64> {
         let guard = self.inner.guard();
         self.inner
             .get(&(security_id, segment_code), &guard)
@@ -142,7 +142,7 @@ impl PrevOiCache {
     /// Inserts a single entry. Useful for unit tests and the
     /// midnight-rollover loader to populate without going through the
     /// `replace_with` clear-then-refill path.
-    pub fn insert(&self, security_id: u32, segment_code: u8, prev_oi: i64) {
+    pub fn insert(&self, security_id: u64, segment_code: u8, prev_oi: i64) {
         let guard = self.inner.guard();
         self.inner
             .insert((security_id, segment_code), prev_oi, &guard);
@@ -303,9 +303,9 @@ fn parse_questdb_dataset(body: &str) -> Result<Vec<(CacheKey, i64)>, LoadError> 
     let parsed: Resp = serde_json::from_str(body).map_err(LoadError::JsonParse)?;
     let mut out = Vec::with_capacity(parsed.dataset.len());
     for Row(sid_v, seg_v, oi_v) in parsed.dataset {
-        let security_id: u32 = sid_v
+        let security_id: u64 = sid_v
             .as_i64()
-            .and_then(|v| u32::try_from(v).ok())
+            .and_then(|v| u64::try_from(v).ok())
             .ok_or(LoadError::MalformedSecurityId)?;
         let segment_str = seg_v.as_str().ok_or(LoadError::MalformedSegment)?;
         let segment_code = segment_str_to_code(segment_str).ok_or(LoadError::UnknownSegment)?;

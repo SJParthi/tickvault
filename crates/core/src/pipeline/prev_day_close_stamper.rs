@@ -31,7 +31,7 @@ use std::sync::Arc;
 use papaya::HashMap;
 
 /// Composite key per I-P1-11.
-type StamperKey = (u32, u8);
+type StamperKey = (u64, u8);
 
 /// Lock-free first-seen stamper.
 ///
@@ -69,7 +69,7 @@ impl PrevDayCloseStamper {
     #[inline]
     pub fn get_or_stamp(
         &self,
-        security_id: u32,
+        security_id: u64,
         segment_code: u8,
         candidate_prev_close: f32,
     ) -> f32 {
@@ -95,7 +95,7 @@ impl PrevDayCloseStamper {
     /// Returns the currently-stamped value without inserting. Useful
     /// for diagnostics; on the hot path prefer `get_or_stamp`.
     #[inline]
-    pub fn get(&self, security_id: u32, segment_code: u8) -> Option<f32> {
+    pub fn get(&self, security_id: u64, segment_code: u8) -> Option<f32> {
         let guard = self.inner.guard();
         self.inner
             .get(&(security_id, segment_code), &guard)

@@ -53,7 +53,7 @@ struct SecurityFeedState {
 /// This prevents console flooding from illiquid F&O instruments.
 pub struct TickGapTracker {
     /// Per-security feed state.
-    states: HashMap<u32, SecurityFeedState>,
+    states: HashMap<u64, SecurityFeedState>,
     /// Total gap warnings emitted (for metrics/alerting).
     total_warnings: u64,
     /// Total gap errors emitted (for metrics/alerting).
@@ -62,7 +62,7 @@ pub struct TickGapTracker {
     total_stale_alerts: u64,
     /// Aggregated warning gaps since last summary log (security_id, gap_secs).
     /// Flushed every LOG_SUMMARY_INTERVAL_SECS into a single summary line.
-    pending_warn_gaps: Vec<(u32, u32)>,
+    pending_warn_gaps: Vec<(u64, u32)>,
     /// Wall-clock of last summary log emission.
     last_summary_log: Instant,
 }
@@ -94,7 +94,7 @@ impl TickGapTracker {
     ///
     /// # Returns
     /// `TickGapResult` indicating whether a gap was detected.
-    pub fn record_tick(&mut self, security_id: u32, exchange_timestamp: u32) -> TickGapResult {
+    pub fn record_tick(&mut self, security_id: u64, exchange_timestamp: u32) -> TickGapResult {
         // Compute current IST epoch seconds for the backlog-tick age check
         // inside `record_tick_with_now_ist`. The `#[cfg(test)]` twin
         // `record_tick_with_now_ist` below allows tests to inject a
@@ -112,7 +112,7 @@ impl TickGapTracker {
     /// this module (and only those) can control time deterministically.
     pub(crate) fn record_tick_with_now_ist(
         &mut self,
-        security_id: u32,
+        security_id: u64,
         exchange_timestamp: u32,
         now_ist_secs: u64,
     ) -> TickGapResult {
@@ -356,7 +356,7 @@ impl TickGapTracker {
     ///
     /// Cold path — runs once per Phase 2 dispatch, not per tick. O(n)
     /// in `ids.len()`.
-    pub fn reset_for_securities(&mut self, ids: &[u32]) {
+    pub fn reset_for_securities(&mut self, ids: &[u64]) {
         for sid in ids {
             self.states.remove(sid);
         }
@@ -388,7 +388,7 @@ impl TickGapTracker {
     /// feeding directly into [`GapBackfillRequest`] construction.
     /// Securities still in warmup are excluded (they have no real
     /// gap history yet).
-    pub fn snapshot_active_window(&self, window_secs: u64) -> Vec<(u32, u32)> {
+    pub fn snapshot_active_window(&self, window_secs: u64) -> Vec<(u64, u32)> {
         let now = Instant::now();
         let window = std::time::Duration::from_secs(window_secs);
         let mut out = Vec::with_capacity(self.states.len());
@@ -416,7 +416,7 @@ impl TickGapTracker {
         &self,
         connection_label: &str,
         window_secs: u64,
-    ) -> Vec<(u32, u32)> {
+    ) -> Vec<(u64, u32)> {
         let active = self.snapshot_active_window(window_secs);
         metrics::counter!(
             "tv_ws_reconnect_recently_active_securities_total",
@@ -487,7 +487,7 @@ impl TickGapTracker {
     ///   routes to Telegram.
     pub fn detect_timestamp_backwards_jump(
         &mut self,
-        security_id: u32,
+        security_id: u64,
         exchange_timestamp: u32,
     ) -> BackwardsJumpResult {
         use std::collections::hash_map::Entry;

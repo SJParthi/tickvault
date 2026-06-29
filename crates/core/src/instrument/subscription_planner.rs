@@ -260,7 +260,7 @@ pub const fn should_subscribe_index_derivatives(_config: &SubscriptionConfig) ->
 #[must_use]
 pub const fn is_display_index_allowed_under_scope(
     _config: &SubscriptionConfig,
-    security_id: u32,
+    security_id: tickvault_common::types::SecurityId,
 ) -> bool {
     security_id == tickvault_common::constants::INDIA_VIX_SECURITY_ID
 }
@@ -286,7 +286,7 @@ pub fn build_subscription_plan(
     // is why FINNIFTY's IDX_I subscription never went out and the depth
     // ATM selector had no spot price for it. Correct dedup key is
     // `(security_id, segment)`.
-    let mut seen_ids: HashSet<(u32, ExchangeSegment)> =
+    let mut seen_ids: HashSet<(u64, ExchangeSegment)> =
         HashSet::with_capacity(MAX_TOTAL_SUBSCRIPTIONS);
     let mut stocks_skipped_no_chain: usize = 0;
 
@@ -783,7 +783,7 @@ pub fn build_subscription_plan(
 ///
 /// The instrument segment is derived from the target ROLE, which is
 /// authoritative per rule §2 (indices → IDX_I; F&O underlyings resolve to
-/// their NSE_EQ spot row). Rows whose `security_id` is not a valid `u32`
+/// their NSE_EQ spot row). Rows whose `security_id` is not a valid `u64`
 /// are skipped + counted — never panics on malformed CSV-derived data.
 #[cfg(feature = "daily_universe_fetcher")]
 pub fn build_subscription_plan_from_daily_universe(universe: &DailyUniverse) -> SubscriptionPlan {
@@ -793,12 +793,12 @@ pub fn build_subscription_plan_from_daily_universe(universe: &DailyUniverse) -> 
     let mut instruments: Vec<SubscribedInstrument> =
         Vec::with_capacity(universe.subscription_targets.len());
     // I-P1-11: dedup on the composite (security_id, segment) key.
-    let mut seen_ids: HashSet<(u32, ExchangeSegment)> =
+    let mut seen_ids: HashSet<(u64, ExchangeSegment)> =
         HashSet::with_capacity(universe.subscription_targets.len());
     let mut skipped_unparsable_sid: usize = 0;
 
     for target in &universe.subscription_targets {
-        let Ok(security_id) = target.csv_row.security_id.parse::<u32>() else {
+        let Ok(security_id) = target.csv_row.security_id.parse::<u64>() else {
             skipped_unparsable_sid += 1;
             continue;
         };
@@ -913,7 +913,7 @@ pub fn build_subscription_plan_from_archived(
     // must use `(security_id, segment)` so an id that exists in both
     // IDX_I and NSE_EQ (e.g. FINNIFTY=27) is NOT silently collapsed to
     // whichever one appeared first.
-    let mut seen_ids: HashSet<(u32, ExchangeSegment)> =
+    let mut seen_ids: HashSet<(u64, ExchangeSegment)> =
         HashSet::with_capacity(MAX_TOTAL_SUBSCRIPTIONS);
     let mut stocks_skipped_no_chain: usize = 0;
 
@@ -1108,8 +1108,8 @@ pub fn build_subscription_plan_from_archived(
 
             // Future for this expiry
             if let Some(archived_future_id) = chain.future_security_id.as_ref() {
-                let future_id: u32 = archived_future_id.to_native();
-                let archived_key = rkyv::rend::u32_le::from_native(future_id);
+                let future_id: u64 = archived_future_id.to_native();
+                let archived_key = rkyv::rend::u64_le::from_native(future_id);
                 if let Some(future_contract) = universe.derivative_contracts.get(&archived_key) {
                     let future_seg = ExchangeSegment::from(&future_contract.exchange_segment);
                     if seen_ids.insert((future_id, future_seg)) {
@@ -1137,7 +1137,7 @@ pub fn build_subscription_plan_from_archived(
                     .min(call_count);
                 for entry in &chain.calls[start..end] {
                     let sec_id = entry.security_id.to_native();
-                    let archived_key = rkyv::rend::u32_le::from_native(sec_id);
+                    let archived_key = rkyv::rend::u64_le::from_native(sec_id);
                     if let Some(contract) = universe.derivative_contracts.get(&archived_key)
                         && seen_ids
                             .insert((sec_id, ExchangeSegment::from(&contract.exchange_segment)))
@@ -1162,7 +1162,7 @@ pub fn build_subscription_plan_from_archived(
                     .min(put_count);
                 for entry in &chain.puts[start..end] {
                     let sec_id = entry.security_id.to_native();
-                    let archived_key = rkyv::rend::u32_le::from_native(sec_id);
+                    let archived_key = rkyv::rend::u64_le::from_native(sec_id);
                     if let Some(contract) = universe.derivative_contracts.get(&archived_key)
                         && seen_ids
                             .insert((sec_id, ExchangeSegment::from(&contract.exchange_segment)))
@@ -1196,7 +1196,7 @@ pub fn build_subscription_plan_from_archived(
         // O(1) EXEMPT: begin — planner runs once at startup, not per tick
         let count_before_stage2 = instruments.len();
 
-        let mut remaining_stock_derivatives: Vec<(u32, NaiveDate, &str, &_)> = universe
+        let mut remaining_stock_derivatives: Vec<(u64, NaiveDate, &str, &_)> = universe
             .derivative_contracts
             .values()
             .filter_map(|c| {
@@ -3470,7 +3470,7 @@ mod tests {
     // same numeric security_id across different segments (e.g. id=13 is
     // FINNIFTY in IDX_I AND is some other instrument in NSE_EQ). The old
     // `HashSet<u32>` dedup silently dropped the second-seen instance.
-    // These tests prove the new `HashSet<(u32, ExchangeSegment)>` dedup
+    // These tests prove the new `HashSet<(u64, ExchangeSegment)>` dedup
     // keeps BOTH.
     // ========================================================================
 
@@ -3592,11 +3592,11 @@ mod tests {
     #[test]
     fn test_regression_seen_ids_key_type_is_pair() {
         // Compile-time / type-level assertion: the dedup HashSet must be
-        // typed as `HashSet<(u32, ExchangeSegment)>` so a future refactor
+        // typed as `HashSet<(u64, ExchangeSegment)>` so a future refactor
         // that reverts to `HashSet<u32>` fails to compile before this
         // test even runs. We assert via a tiny synthetic HashSet that
         // matches the production type.
-        let mut set: std::collections::HashSet<(u32, ExchangeSegment)> =
+        let mut set: std::collections::HashSet<(u64, ExchangeSegment)> =
             std::collections::HashSet::new();
         // Inserting the same id under two different segments must return
         // true for both — the pair is the key.

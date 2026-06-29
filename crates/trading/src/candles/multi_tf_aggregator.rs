@@ -65,7 +65,9 @@ use crate::candles::tf_index::{MARKET_CLOSE_SECS_OF_DAY_IST, MARKET_OPEN_SECS_OF
 use crate::candles::{AggregatorCell, ConsumeOutcome, FeedStrategy, LiveCandleState, TfIndex};
 
 /// Composite key per I-P1-11 — `(security_id, exchange_segment_code)`.
-type AggregatorKey = (u32, u8);
+/// `security_id` is `u64` (2026-06-29 widening) so Groww's native exchange_token
+/// (bit-62 index ids) keys the SAME aggregator as Dhan's 4-byte wire id.
+type AggregatorKey = (u64, u8);
 
 /// One papaya entry. Holds the 9-TF cell plus the per-instrument
 /// last-seen cumulative-volume tracker.
@@ -149,7 +151,7 @@ pub struct MultiTfAggregator {
     /// pairs exempt from the 09:15–15:30 IST candle-window gate (GIFT
     /// Nifty trades ~21 h/day). Empty by default → no exemptions →
     /// today's behavior. Set once at boot via `with_always_on`.
-    always_on: Arc<HashSet<(u32, u8)>>,
+    always_on: Arc<HashSet<(u64, u8)>>,
 }
 
 impl MultiTfAggregator {
@@ -179,7 +181,7 @@ impl MultiTfAggregator {
     /// safe empty default.
     #[must_use]
     // TEST-EXEMPT: builder exercised by test_gift_nifty_exempt_tick_aggregates_outside_window.
-    pub fn with_always_on(mut self, always_on: Arc<HashSet<(u32, u8)>>) -> Self {
+    pub fn with_always_on(mut self, always_on: Arc<HashSet<(u64, u8)>>) -> Self {
         self.always_on = always_on;
         self
     }
@@ -226,7 +228,7 @@ impl MultiTfAggregator {
     /// if the instrument was pre-populated; `None` otherwise.
     /// Used by tests and by the boundary timer for force-sealing.
     #[must_use]
-    pub fn get(&self, security_id: u32, exchange_segment_code: u8) -> Option<Arc<InstrumentEntry>> {
+    pub fn get(&self, security_id: u64, exchange_segment_code: u8) -> Option<Arc<InstrumentEntry>> {
         let pin = self.inner.pin();
         pin.get(&(security_id, exchange_segment_code)).cloned()
     }
@@ -249,7 +251,7 @@ impl MultiTfAggregator {
     /// O(1): one papaya read + one atomic store.
     pub fn seed_cumulative(
         &self,
-        security_id: u32,
+        security_id: u64,
         exchange_segment_code: u8,
         cumulative: u64,
     ) -> bool {
@@ -415,7 +417,7 @@ impl MultiTfAggregator {
     /// at most once per minute boundary, not on the per-tick fast path.
     pub fn force_seal_all<F>(&self, mut on_seal: F)
     where
-        F: FnMut(u32, u8, TfIndex, LiveCandleState),
+        F: FnMut(u64, u8, TfIndex, LiveCandleState),
     {
         let pin = self.inner.pin();
         for (key, entry) in pin.iter() {

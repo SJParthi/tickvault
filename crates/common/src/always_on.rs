@@ -30,14 +30,14 @@ use std::sync::{Arc, OnceLock};
 /// Boot-set-once exempt set. `(security_id, exchange_segment_code)`.
 /// Production sets this exactly once after the daily universe is built;
 /// it is read-only thereafter.
-static ALWAYS_ON: OnceLock<Arc<HashSet<(u32, u8)>>> = OnceLock::new();
+static ALWAYS_ON: OnceLock<Arc<HashSet<(u64, u8)>>> = OnceLock::new();
 
 /// Install the boot-computed always-on set. Idempotent: the first call
 /// wins; later calls are ignored (boot runs once). Safe to never call —
 /// [`current`] then returns an empty set (today's behavior: nothing is
 /// exempt).
 // TEST-EXEMPT: covered by tests::current_before_init_is_empty_then_reflects_init.
-pub fn init_always_on_segments(set: HashSet<(u32, u8)>) {
+pub fn init_always_on_segments(set: HashSet<(u64, u8)>) {
     // First call wins; a second call returns Err(rejected_set) which we
     // intentionally discard (boot runs once). `drop` uses the #[must_use].
     drop(ALWAYS_ON.set(Arc::new(set)));
@@ -48,7 +48,7 @@ pub fn init_always_on_segments(set: HashSet<(u32, u8)>) {
 /// `Indices4Only` scope, or any test that does not boot the universe).
 // TEST-EXEMPT: covered by tests::current_before_init_is_empty_then_reflects_init.
 #[must_use]
-pub fn current() -> Arc<HashSet<(u32, u8)>> {
+pub fn current() -> Arc<HashSet<(u64, u8)>> {
     ALWAYS_ON
         .get()
         .cloned()

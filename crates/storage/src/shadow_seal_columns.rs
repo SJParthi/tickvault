@@ -138,7 +138,10 @@ impl ShadowSealRow {
         Self {
             table_name: seal.tf.table_name(),
             timestamp_ist_nanos,
-            security_id: i64::from(seal.security_id),
+            // `seal.security_id` is `u64` (2026-06-29 widening); the LONG column
+            // is `i64`. Dhan ids fit u32, Groww uses bit 62 (≤ i64::MAX), so this
+            // is lossless; `try_from` saturates only a never-produced bit-63 id.
+            security_id: i64::try_from(seal.security_id).unwrap_or(i64::MAX),
             segment: segment_code_to_str(seal.exchange_segment_code),
             // Feed provenance from the seal — the ONE writer stamps whatever feed
             // produced the seal (Dhan or Groww), never a hardcoded constant.

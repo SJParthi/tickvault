@@ -41,7 +41,7 @@
 //! scope the composite is degenerate (all four are `IdxI`), but the
 //! invariant holds for future scope extension.
 
-use crate::types::ExchangeSegment;
+use crate::types::{ExchangeSegment, SecurityId};
 
 /// The 4 IDX_I instruments tickvault subscribes to via the main-feed
 /// WebSocket. Each tuple is `(security_id, display_name, exchange_segment)`.
@@ -51,7 +51,7 @@ use crate::types::ExchangeSegment;
 /// Update and `.claude/rules/project/websocket-connection-scope-lock.md`.
 ///
 /// `INDIA VIX` (21) is included here for live tick subscription.
-pub const LOCKED_UNIVERSE: &[(u32, &str, ExchangeSegment)] = &[
+pub const LOCKED_UNIVERSE: &[(SecurityId, &str, ExchangeSegment)] = &[
     (13, "NIFTY", ExchangeSegment::IdxI),
     (25, "BANKNIFTY", ExchangeSegment::IdxI),
     (51, "SENSEX", ExchangeSegment::IdxI),
@@ -69,7 +69,7 @@ pub const LOCKED_UNIVERSE: &[(u32, &str, ExchangeSegment)] = &[
 /// O(1) bounded — at most 4 comparisons. Const-fn compatible for use
 /// in compile-time contexts.
 #[must_use]
-pub const fn name_for_security_id(security_id: u32) -> Option<&'static str> {
+pub const fn name_for_security_id(security_id: SecurityId) -> Option<&'static str> {
     let mut i = 0;
     while i < LOCKED_UNIVERSE.len() {
         let (sid, name, _seg) = LOCKED_UNIVERSE[i];
@@ -84,7 +84,7 @@ pub const fn name_for_security_id(security_id: u32) -> Option<&'static str> {
 /// Convenience: lookup the exchange segment for a security_id in the
 /// locked universe. Returns `None` for any SID not in the 4-entry slice.
 #[must_use]
-pub const fn segment_for_security_id(security_id: u32) -> Option<ExchangeSegment> {
+pub const fn segment_for_security_id(security_id: SecurityId) -> Option<ExchangeSegment> {
     let mut i = 0;
     while i < LOCKED_UNIVERSE.len() {
         let (sid, _name, seg) = LOCKED_UNIVERSE[i];
@@ -98,7 +98,7 @@ pub const fn segment_for_security_id(security_id: u32) -> Option<ExchangeSegment
 
 /// True iff the given security_id is in the LOCKED_UNIVERSE.
 #[must_use]
-pub const fn is_locked_universe_sid(security_id: u32) -> bool {
+pub const fn is_locked_universe_sid(security_id: SecurityId) -> bool {
     name_for_security_id(security_id).is_some()
 }
 

@@ -91,7 +91,7 @@ pub fn init_prev_close_cache_dir() -> std::io::Result<()> {
 /// Verified via existing test `tests::test_header_parse` which uses
 /// SID 13 for NIFTY, and by the live universe seeded from the
 /// instrument master at boot.
-const CANARY_UNDERLYINGS: &[(u32, &str)] = &[(13, "NIFTY"), (25, "BANKNIFTY"), (51, "SENSEX")];
+const CANARY_UNDERLYINGS: &[(u64, &str)] = &[(13, "NIFTY"), (25, "BANKNIFTY"), (51, "SENSEX")];
 
 // Phase 4b (2026-05-05): `MOVERS_PERSIST_START_SECS_OF_DAY_IST`
 // constant DELETED — only used by the now-removed legacy
@@ -143,8 +143,8 @@ fn is_today_ist(exchange_timestamp: u32, today_ist_day_number: u32) -> bool {
 /// (usually ≤1 entry), so this is O(1).
 #[inline(always)]
 fn is_window_exempt(
-    always_on: &std::collections::HashSet<(u32, u8)>,
-    security_id: u32,
+    always_on: &std::collections::HashSet<(u64, u8)>,
+    security_id: u64,
     exchange_segment_code: u8,
 ) -> bool {
     // O(1) EXEMPT: HashSet `contains` is O(1) hashing, not an O(n) Vec scan.
@@ -523,7 +523,7 @@ impl TickDedupRing {
     fn is_duplicate(
         &mut self,
         exchange_segment_code: u8,
-        security_id: u32,
+        security_id: u64,
         exchange_timestamp: u32,
         received_at_nanos: i64,
     ) -> bool {
@@ -548,7 +548,7 @@ impl TickDedupRing {
     #[inline(always)]
     fn fingerprint(
         exchange_segment_code: u8,
-        security_id: u32,
+        security_id: u64,
         exchange_timestamp: u32,
         received_at_nanos: i64,
     ) -> u64 {
@@ -701,7 +701,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     // behavior for every instrument. Boot wires this from
     // `DailyUniverse::always_on_segments` via
     // `tickvault_common::always_on::current()`.
-    always_on: std::sync::Arc<std::collections::HashSet<(u32, u8)>>,
+    always_on: std::sync::Arc<std::collections::HashSet<(u64, u8)>>,
     // Live-feed health (SP5, 2026-06-22): the shared per-feed registry the
     // `GET /api/feeds/health` endpoint reads. When `Some`, every parsed Dhan
     // tick records its WALL-CLOCK receipt time (IST nanos) into the Dhan slot so
@@ -794,10 +794,10 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     // stamping logic that downstream consumers (prev_close_persist,
     // bar enrichers) rely on.
     // O(1) EXEMPT: begin — boot-time file read + HashMap for ~28 indices
-    let mut index_prev_close_cache: std::collections::HashMap<u32, f32> = {
+    let mut index_prev_close_cache: std::collections::HashMap<u64, f32> = {
         let path = INDEX_PREV_CLOSE_CACHE_PATH;
         match std::fs::read_to_string(path) {
-            Ok(json) => match serde_json::from_str::<std::collections::HashMap<u32, f32>>(&json) {
+            Ok(json) => match serde_json::from_str::<std::collections::HashMap<u64, f32>>(&json) {
                 Ok(cached) => {
                     info!(
                         cached_indices = cached.len(),

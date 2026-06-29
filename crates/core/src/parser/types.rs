@@ -24,8 +24,9 @@ pub struct PacketHeader {
     pub message_length: u16,
     /// Binary exchange segment code (0=IDX, 1=NSE_EQ, 2=NSE_FNO, etc.).
     pub exchange_segment_code: u8,
-    /// Dhan security identifier.
-    pub security_id: u32,
+    /// Security identifier (u64 — Dhan's 4-byte wire id widened losslessly;
+    /// Groww's native exchange_token also fits).
+    pub security_id: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -43,20 +44,20 @@ pub enum ParsedFrame {
     TickWithDepth(ParsedTick, [MarketDepthLevel; 5]),
     /// Standalone OI update packet.
     OiUpdate {
-        security_id: u32,
+        security_id: u64,
         exchange_segment_code: u8,
         open_interest: u32,
     },
     /// Previous close + previous OI packet.
     PreviousClose {
-        security_id: u32,
+        security_id: u64,
         exchange_segment_code: u8,
         previous_close: f32,
         previous_oi: u32,
     },
     /// Market status change notification.
     MarketStatus {
-        security_id: u32,
+        security_id: u64,
         exchange_segment_code: u8,
     },
     // PR #4 (2026-05-19): `DeepDepth` variant retired.

@@ -183,7 +183,12 @@ fn serialize_tick(tick: &ParsedTick) -> [u8; TICK_SPILL_RECORD_SIZE] {
 /// `(ts, security_id, segment, capture_seq)` dedup key. O(1), zero allocation.
 fn serialize_tick_seq(tick: &ParsedTick, capture_seq: i64) -> [u8; TICK_SPILL_RECORD_SIZE] {
     let mut buf = [0u8; TICK_SPILL_RECORD_SIZE];
-    buf[0..4].copy_from_slice(&tick.security_id.to_le_bytes());
+    // On-disk Dhan spill record keeps a 4-byte security_id (Dhan's wire id is a
+    // 4-byte LE field — always fits u32). `ParsedTick.security_id` is `u64`
+    // (2026-06-29 widening) but this Dhan-only spill never holds a >u32 id, so
+    // the low-32-bit cast is LOSSLESS here; the record size + SEBI-retained
+    // format are unchanged. (Groww does NOT use this spill path.)
+    buf[0..4].copy_from_slice(&(tick.security_id as u32).to_le_bytes());
     buf[4] = tick.exchange_segment_code;
     // buf[5] = padding
     buf[6..10].copy_from_slice(&tick.last_traded_price.to_le_bytes());
@@ -214,7 +219,8 @@ fn serialize_tick_seq(tick: &ParsedTick, capture_seq: i64) -> [u8; TICK_SPILL_RE
 /// Deserialize a `ParsedTick` from a fixed-size byte array.
 fn deserialize_tick(buf: &[u8; TICK_SPILL_RECORD_SIZE]) -> ParsedTick {
     ParsedTick {
-        security_id: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+        // 4-byte on-disk Dhan id widened losslessly to the u64 ParsedTick field.
+        security_id: u64::from(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])),
         exchange_segment_code: buf[4],
         last_traded_price: f32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]),
         last_trade_quantity: u16::from_le_bytes([buf[10], buf[11]]),
@@ -1496,7 +1502,12 @@ pub(crate) fn build_tick_row_seq(
     // for the designated `ts`, NO offset (`data-integrity.md`). `received_at`
     // comes from `Utc::now()` (UTC) → +IST offset to align with IST `ts`.
     let fields = RawTickFields {
-        security_id: i64::from(tick.security_id),
+        // `ParsedTick.security_id` is `u64` (2026-06-29 widening); the ILP
+        // `security_id` LONG column is `i64`. Dhan ids fit u32 and Groww's
+        // native exchange_token uses bit 62 (≤ i64::MAX), so this is lossless;
+        // `try_from` saturates only a (never-produced) bit-63 id rather than
+        // wrapping it negative.
+        security_id: i64::try_from(tick.security_id).unwrap_or(i64::MAX),
         segment: segment_code_to_str(tick.exchange_segment_code),
         ltp: round_to_2dp(f32_to_f64_clean(tick.last_traded_price)),
         // Dhan ParsedTick.volume is u32; widens losslessly to the i64 carrier.

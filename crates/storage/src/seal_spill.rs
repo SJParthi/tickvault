@@ -38,7 +38,7 @@
 //!
 //! | Offset | Size | Field |
 //! |---|---|---|
-//! | 0    | 4 | `security_id: u32`              |
+//! | 0    | 4 | `security_id` low-32 (legacy/Dhan; full u64 at 120-128) |
 //! | 4    | 1 | `exchange_segment_code: u8`     |
 //! | 5    | 1 | `tf_ordinal: u8` (0..=20 per `TfIndex`) |
 //! | 6    | 1 | `feed_index: u8` (`Feed::index()` — 0=Dhan, 1=Groww; pre-feed records read 0=Dhan) |
@@ -58,7 +58,7 @@
 //! | 96   | 8 | `open_pct: f64` (§31 Option 2)  |
 //! | 104  | 8 | `change_pct: f64` (2026-06-02)  |
 //! | 112  | 8 | `open_gap_pct: f64` (2026-06-02)|
-//! | 120  | 8 | reserved padding (zero-filled)  |
+//! | 120  | 8 | `security_id: u64` full (2026-06-29; zero in legacy records → low-32 at 0-4) |
 //!
 //! Total: 128 bytes. The trailing 8-byte padding region (bytes 120..128)
 //! is reserved for future field additions WITHOUT a file-format break —
@@ -97,7 +97,14 @@ pub const SEAL_SPILL_RECORD_SIZE: usize = 128;
 /// `TfIndex::from_ordinal` round-trip.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SerializedSeal {
-    pub security_id: u32,
+    /// `u64` (2026-06-29 widening) — the seal spill carries BOTH Dhan (≤u32)
+    /// AND Groww (bit-62 index ids > u32) seals, so the full u64 MUST survive
+    /// the round-trip. The on-disk format is backward-compatible: bytes 0-4
+    /// keep the legacy low-32 (so old readers see the truncated Dhan id), and
+    /// the full u64 is written to the reserved bytes 120-128. On read, the
+    /// full u64 wins when non-zero; a legacy/Dhan record (zero at 120-128)
+    /// falls back to the low-32 at bytes 0-4. See the layout table above.
+    pub security_id: u64,
     pub exchange_segment_code: u8,
     pub tf_ordinal: u8,
     /// Broker-source feed (`Feed::index()`: 0=Dhan, 1=Groww). Serialised into
@@ -138,7 +145,10 @@ impl SerializedSeal {
     #[must_use]
     pub fn to_bytes(&self) -> [u8; SEAL_SPILL_RECORD_SIZE] {
         let mut buf = [0u8; SEAL_SPILL_RECORD_SIZE];
-        buf[0..4].copy_from_slice(&self.security_id.to_le_bytes());
+        // Legacy low-32 at bytes 0-4 (Dhan-readable, truncates a >u32 Groww id);
+        // the FULL u64 lives in the reserved 120-128 region below so no id is
+        // ever lost on round-trip.
+        buf[0..4].copy_from_slice(&(self.security_id as u32).to_le_bytes());
         buf[4] = self.exchange_segment_code;
         buf[5] = self.tf_ordinal;
         // Feed provenance round-trips through disk spill (byte 6; pre-feed
@@ -162,7 +172,10 @@ impl SerializedSeal {
         // Operator request 2026-06-02: change_pct + open_gap_pct.
         buf[104..112].copy_from_slice(&self.change_pct.to_le_bytes());
         buf[112..120].copy_from_slice(&self.open_gap_pct.to_le_bytes());
-        // buf[120..128] = reserved padding (zero) for future fields
+        // bytes 120-128: full u64 security_id (2026-06-29 widening). Reading
+        // back: non-zero here → full u64; zero → legacy/Dhan record, fall back
+        // to the low-32 at bytes 0-4.
+        buf[120..128].copy_from_slice(&self.security_id.to_le_bytes());
         buf
     }
 
@@ -182,8 +195,19 @@ impl SerializedSeal {
             .get(buf[6] as usize)
             .copied()
             .unwrap_or(Feed::Dhan);
+        // Full u64 security_id from the reserved 120-128 region (2026-06-29
+        // widening). A legacy/Dhan record has zero there → fall back to the
+        // low-32 at bytes 0-4 (Dhan ids fit u32; security_id is never 0).
+        let security_id_full = u64::from_le_bytes([
+            buf[120], buf[121], buf[122], buf[123], buf[124], buf[125], buf[126], buf[127],
+        ]);
+        let security_id = if security_id_full != 0 {
+            security_id_full
+        } else {
+            u64::from(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
+        };
         Some(Self {
-            security_id: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            security_id,
             exchange_segment_code: buf[4],
             tf_ordinal: buf[5],
             feed,
