@@ -125,3 +125,51 @@ path means the change is inert unless the call sites pass the flag.
 | 2 | Dhan ON, in market hours, real all-down for >300s | Genuine Halt fires (page + exit/teardown) — unchanged |
 | 3 | Off-hours, Dhan ON, pool down | Suppressed (pre-existing post-market behaviour) — unchanged |
 | 4 | Dhan re-enabled mid-market after OFF window | Fresh 300s window; no spurious instant Halt |
+
+## Per-Item Guarantee Matrix
+
+Per `.claude/rules/project/per-wave-guarantee-matrix.md` — the canonical 15-row
++ 7-row matrices apply to every item in this plan, filled in for THIS watchdog
+gating fix.
+
+### 15-row "100% Guarantee Matrix"
+
+| Demand | Mechanical proof artefact | Real-time check | Per-item gate |
+|---|---|---|---|
+| 100% code coverage | `quality/crate-coverage-thresholds.toml` per crate; `scripts/coverage-gate.sh` | post-merge llvm-cov | helper + gate covered by the new truth-table + source-scan tests |
+| 100% audit coverage | `<event>_audit` table per typed event with DEDUP UPSERT KEYS | `mcp__tickvault-logs__questdb_sql` | N/A — no new typed event/table; existing audit chain untouched |
+| 100% testing coverage | 22 test categories per `testing.md` | `cargo test -p tickvault-app` green | unit (truth table) + integration source-scan guard |
+| 100% code checks | banned-pattern + pub-fn-test + pub-fn-wiring + plan-verify + secret-scan | pre-push mandatory | all gates green for the app crate |
+| 100% code performance | DHAT zero-alloc + Criterion p99 budgets | `cargo bench` | N/A — pure-bool helper, single `Relaxed` load, not on the tick hot path, no alloc |
+| 100% monitoring | 7-layer telemetry; existing pool counters retained | `mcp__tickvault-logs__run_doctor` | `tv_pool_*` counters still increment before the gate |
+| 100% logging | tracing macros mandatory; expected-idle `info!` with structured fields | hourly errors.jsonl | gated branch logs `in_market_hours` + `dhan_enabled` |
+| 100% alerting | `alerts.yml` Prom rule + ratchet | `mcp__tickvault-logs__run_doctor` (CloudWatch alarms) | N/A — fix REMOVES a false Halt page; no new alert |
+| 100% security | banned-pattern + secret-scan + `Secret<T>` + security-reviewer | `cargo audit` | no secret/attack surface; reads an existing UI-status atomic |
+| 100% security hardening | static IP + secret scan + `unused_must_use` lint | post-deploy IP verify | N/A — no auth/IP/order path touched |
+| 100% bugs fixing | adversarial 3-agent review | pre-PR + post-impl pass | fix targets the A4-FATAL self-halt regression |
+| 100% scenarios covering | 9-box + scenario table | scenario suite | 4 scenarios pinned in §Scenarios above |
+| 100% functionalities covering | every pub fn has call site + test | pre-push gates 6+11 | helper has both call site (watchdog) + truth-table test |
+| 100% code review | adversarial review before AND after impl | per-PR | reviewed against the 2-WS + Dhan-runtime-toggle locks |
+| 100% extreme check | all of above + ratchet tests fail build on regression | every commit | `pool_watchdog_gates_on_runtime_dhan_enable_flag` source-scan |
+
+### 7-row Resilience Demand Matrix
+
+| Demand | Honest envelope | Per-item proof |
+|---|---|---|
+| Zero ticks lost | Bounded zero loss; ring → spill NDJSON → DLQ unchanged | fix touches only the watchdog ACTION gate, not the tick/WAL path |
+| WS never disconnects | DETECT ≤5s, reconnect with `SubscribeRxGuard` | `poll_watchdog` verdict + `SubscribeRxGuard` untouched; only the Halt/Degraded ACTION is gated |
+| Never slow/locked/hanged | pure-bool helper, single `Relaxed` flag read | no hot-path allocation; no lock added |
+| QuestDB never fails | 3-tier rescue→spill→DLQ + schema self-heal | not touched by this fix |
+| O(1) latency | single `Relaxed` atomic load per poll tick | O(1) gate; no per-tick cost |
+| Uniqueness + dedup | Composite `(security_id, exchange_segment)` + DEDUP keys | N/A — no storage key touched |
+| Real-time proof | existing `tv_pool_*` counters + truth-table ratchet | counters increment before the gate; source-scan pins the gate |
+
+### Honest envelope note
+
+This fix is additive and bounded inside the tested envelope, with ratcheted
+regression coverage (the truth-table unit test + the
+`pool_watchdog_gates_on_runtime_dhan_enable_flag` source-scan guard): the
+dormant Dhan-OFF pool no longer trips the 300s self-Halt, while the genuine
+in-market all-down 300s Halt safety property is preserved unchanged. No literal
+"never disconnects / never fails" claim is made — the change only removes a
+false-positive self-halt for the deliberately-dormant Dhan-OFF case.
