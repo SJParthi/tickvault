@@ -276,11 +276,11 @@ pub fn ist_seconds_of_day() -> u32 {
 mod tests {
     use super::*;
 
-    fn nifty() -> (u32, ExchangeSegment) {
+    fn nifty() -> (u64, ExchangeSegment) {
         (13, ExchangeSegment::IdxI)
     }
 
-    fn banknifty() -> (u32, ExchangeSegment) {
+    fn banknifty() -> (u64, ExchangeSegment) {
         (25, ExchangeSegment::IdxI)
     }
 

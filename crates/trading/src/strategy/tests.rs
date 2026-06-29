@@ -37,7 +37,7 @@ fn test_strategy() -> StrategyDefinition {
 }
 
 /// Helper: create an indicator snapshot with given values.
-fn make_snapshot(security_id: u32, rsi: f64, ltp: f64, atr: f64) -> IndicatorSnapshot {
+fn make_snapshot(security_id: u64, rsi: f64, ltp: f64, atr: f64) -> IndicatorSnapshot {
     IndicatorSnapshot {
         security_id,
         rsi,

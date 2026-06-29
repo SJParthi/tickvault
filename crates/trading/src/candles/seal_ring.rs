@@ -286,7 +286,7 @@ mod tests {
     }
 
     fn mk_seal(
-        sid: u32,
+        sid: u64,
         seg: u8,
         tf: TfIndex,
         bucket_start: u32,

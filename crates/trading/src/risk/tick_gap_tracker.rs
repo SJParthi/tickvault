@@ -1545,7 +1545,7 @@ mod tests {
             2,
             "both active securities must be returned on reconnect event"
         );
-        let ids: Vec<u32> = active.iter().map(|(s, _)| *s).collect();
+        let ids: Vec<u64> = active.iter().map(|(s, _)| *s).collect();
         assert!(ids.contains(&4004));
         assert!(ids.contains(&5005));
     }
@@ -1648,7 +1648,7 @@ mod tests {
             // Seed with the larger value so the second call is either Normal
             // (a >= b case becomes Normal for a-then-b when b >= a) or Backwards.
             let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
-            let sid = 9_999_u32;
+            let sid = 9_999_u64;
             let _ = tracker.detect_timestamp_backwards_jump(sid, hi);
             let result = tracker.detect_timestamp_backwards_jump(sid, lo);
             if hi == lo {

@@ -440,7 +440,7 @@ mod tests {
     use super::*;
     use tickvault_common::tick_types::ParsedTick;
 
-    fn mk_tick(sid: u32, seg: u8, secs: u32, price: f32, volume: u32, oi: u32) -> ParsedTick {
+    fn mk_tick(sid: u64, seg: u8, secs: u32, price: f32, volume: u32, oi: u32) -> ParsedTick {
         let mut t = ParsedTick::default();
         t.security_id = sid;
         t.exchange_segment_code = seg;
@@ -746,11 +746,11 @@ mod tests {
         let agg = MultiTfAggregator::new();
         agg.pre_populate(vec![(13, 0), (25, 0)]);
         // Tick both instruments to open all slots.
-        for sid in [13_u32, 25] {
+        for sid in [13_u64, 25] {
             let t = mk_tick(sid, 0, 1_779_354_960, 100.0, 50, 0);
             agg.consume_tick(&t, 0, FeedStrategy::DHAN, None, |_, _| {});
         }
-        let mut emitted: Vec<(u32, u8, TfIndex)> = Vec::new();
+        let mut emitted: Vec<(u64, u8, TfIndex)> = Vec::new();
         agg.force_seal_all(|sid, seg, tf, _| emitted.push((sid, seg, tf)));
         assert_eq!(
             emitted.len(),
@@ -759,7 +759,7 @@ mod tests {
             emitted.len()
         );
         // Every slot is now empty.
-        for sid in [13_u32, 25] {
+        for sid in [13_u64, 25] {
             let entry = agg.get(sid, 0).expect("present");
             for tf in TfIndex::ALL {
                 assert!(entry.cell.snapshot(tf).is_uninitialised());
