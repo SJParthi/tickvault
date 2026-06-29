@@ -157,6 +157,205 @@ WATCH_POLL_SECS = 5
 SILENT_FEED_FIRST_WARN_SECS = 30
 SILENT_FEED_REWARN_SECS = 60
 
+# NATS reject-reason surfacing (2026-06-29). VERIFIED against growwapi-1.5.0 +
+# nats-py 2.15.0 source (quoted in groww_sidecar.py header / the plan):
+#   - growwapi.groww.feed.GrowwFeed holds its NATS client at `feed._nats_client`
+#     (feed.py:149); the underlying nats.aio.client.Client is `_nats_client._socket`
+#     (nats_client.py:51).
+#   - The bare empty "Error:" line is growwapi.groww.nats_client.NatsClient
+#     ._on_error_cb (nats_client.py:150-151): `logger.error("Error: %s", e)`.
+#   - nats-py Client._process_err routes a server "-ERR":
+#       * "Authorization Violation" -> stores errors.AuthorizationError() in
+#         Client._err and CLOSES the connection — it NEVER calls _error_cb, so
+#         the real reason reaches NO growwapi callback; it survives ONLY in
+#         `_socket._err` / `_socket.last_error` (a property returning `_err`).
+#       * "...Permissions Violation..." -> stores errors.Error(msg) in _err AND
+#         calls _error_cb(err) -> the growwapi "Error:" line (str non-empty).
+#   So the reliable, durable source of the REAL reason for BOTH classes is the
+#   underlying socket's `last_error` / `_err`. We (a) wrap the SDK's own
+#   callbacks so the empty "Error:" becomes a real repr(), and (b) poll the
+#   socket's last_error and print one edge-triggered GROWW LIVE FEED REJECTED
+#   line + a periodic heartbeat. ALL of this is best-effort: any attribute
+#   mismatch on a future wheel is caught and logged, never breaks the sidecar.
+NATS_REASON_POLL_SECS = 2
+NATS_REASON_HEARTBEAT_SECS = 60
+# Substrings that mark a true authorization / permissions / protocol reject.
+_REJECT_MARKERS = (
+    "authorization",
+    "permissions",
+    "authorization violation",
+    "permissions violation",
+    "-err",
+)
+
+
+def _nats_socket_from_feed(feed):
+    """Best-effort reach the underlying nats.aio.client.Client from a GrowwFeed.
+
+    Returns the socket Client or None. Wrapped so a future-wheel attribute rename
+    NEVER breaks the sidecar — on any failure we log the type once and return None
+    (the silent-feed watchdog still covers the "0 ticks" case).
+    """
+    try:
+        nats_client = getattr(feed, "_nats_client", None)
+        if nats_client is None:
+            return None
+        return getattr(nats_client, "_socket", None)
+    except Exception as exc:  # noqa: BLE001 - reason-surfacing must never break the feed
+        print(
+            f"groww sidecar: could not reach NATS socket ({type(exc).__name__}); "
+            "reason-surfacing degraded (silent-feed watchdog still active)",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+
+
+def _socket_error_detail(socket, secrets):
+    """Return a redacted, non-empty repr of the socket's last error, or None.
+
+    Reads `last_error` (the public property -> Client._err) then `_err` directly.
+    repr() is used because some nats-py errors (e.g. AuthorizationError) render an
+    informative repr while their str may be terse; we surface both when they differ.
+    """
+    if socket is None:
+        return None
+    err = None
+    try:
+        err = getattr(socket, "last_error", None)
+    except Exception:  # noqa: BLE001 - property access must never raise out
+        err = None
+    if err is None:
+        err = getattr(socket, "_err", None)
+    if err is None:
+        return None
+    err_repr = _redact(repr(err), secrets)
+    err_str = _redact(str(err), secrets)
+    if err_str and err_str != err_repr:
+        return f"{err_repr} ({err_str})"
+    return err_repr
+
+
+def _is_reject_reason(detail: str) -> bool:
+    """True if `detail` looks like an authorization / permissions / -ERR reject."""
+    if not detail:
+        return False
+    low = detail.lower()
+    return any(marker in low for marker in _REJECT_MARKERS)
+
+
+def install_nats_reason_hooks(feed, secrets) -> None:
+    """Replace the SDK's empty "Error:" callbacks with REAL-detail versions.
+
+    Monkeypatches the SDK NatsClient instance bound to THIS feed so its
+    `_on_error_cb` / `_on_closed_cb` / `_on_disconnected_cb` print the real
+    exception repr() + the socket's stored last_error instead of an empty string.
+    Best-effort: any failure is logged (type only) and ignored — the original SDK
+    callbacks keep working and the poller below is the backstop.
+    """
+    try:
+        nats_client = getattr(feed, "_nats_client", None)
+        if nats_client is None:
+            return
+        socket = getattr(nats_client, "_socket", None)
+
+        async def on_error(e):  # mirrors growwapi NatsClient._on_error_cb signature
+            detail = _redact(repr(e), secrets)
+            str_detail = _redact(str(e), secrets)
+            if str_detail and str_detail != detail:
+                detail = f"{detail} ({str_detail})"
+            print(
+                f"groww sidecar: NATS error_cb -> {detail}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        async def on_closed():
+            detail = _socket_error_detail(socket, secrets) or "(no stored error)"
+            print(
+                f"groww sidecar: NATS connection closed -> last_error={detail}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        async def on_disconnected():
+            detail = _socket_error_detail(socket, secrets) or "(no stored error)"
+            print(
+                f"groww sidecar: NATS disconnected -> last_error={detail}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        # Bind as the instance's callbacks. The SDK passes these to nats.connect()
+        # at __init__ time (already happened), so nats-py already holds references
+        # to the ORIGINAL bound methods. We therefore ALSO replace the attributes
+        # for any code that re-reads them, AND rely on the poller below as the
+        # guaranteed backstop (nats-py keeps the old refs). The poller is what makes
+        # this robust regardless of when nats captured the callbacks.
+        nats_client._on_error_cb = on_error
+        nats_client._on_closed_cb = on_closed
+        nats_client._on_disconnected_cb = on_disconnected
+    except Exception as exc:  # noqa: BLE001 - never break the feed
+        print(
+            f"groww sidecar: could not install NATS reason hooks "
+            f"({type(exc).__name__}); relying on the last_error poller",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def nats_reject_poller(feed, secrets) -> None:
+    """Daemon thread: surface the REAL NATS reject reason from the socket.
+
+    nats-py stores the swallowed reason in Client._err / Client.last_error even
+    when (for an "Authorization Violation") it never calls any growwapi callback.
+    We poll that store and, on a NEW reject-class reason, print ONE loud
+    `GROWW LIVE FEED REJECTED: <reason>` line (edge-triggered — never spammed every
+    poll). Thereafter a periodic heartbeat repeats the current reason so the
+    operator keeps proof without log flooding. The raw last_error is also printed
+    on each CHANGE so a multi-step reject sequence is fully captured.
+    """
+    socket = _nats_socket_from_feed(feed)
+    if socket is None:
+        return  # nothing to poll; the silent-feed watchdog still covers 0-ticks.
+    last_reported = None
+    last_heartbeat = 0.0
+    while True:
+        time.sleep(NATS_REASON_POLL_SECS)
+        # Stop once real data flows — a reject that streams is not a reject.
+        if EMITTED_TOTAL > 0:
+            return
+        detail = _socket_error_detail(socket, secrets)
+        if detail and detail != last_reported:
+            # New / changed stored error — always print the raw detail.
+            print(
+                f"groww sidecar: NATS last_error -> {detail}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if _is_reject_reason(detail):
+                print(
+                    f"GROWW LIVE FEED REJECTED: {detail}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            last_reported = detail
+            last_heartbeat = time.monotonic()
+            continue
+        # Heartbeat: repeat the standing reject reason periodically (count too).
+        if (
+            last_reported
+            and _is_reject_reason(last_reported)
+            and time.monotonic() - last_heartbeat >= NATS_REASON_HEARTBEAT_SECS
+        ):
+            print(
+                f"groww sidecar: GROWW LIVE FEED STILL REJECTED: {last_reported} "
+                f"(emitted={EMITTED_TOTAL}, dropped={DROPPED_TOTAL})",
+                file=sys.stderr,
+                flush=True,
+            )
+            last_heartbeat = time.monotonic()
+
 # Honest-feed counters (operator 2026-06-29). EMITTED_TOTAL = records we DECODED
 # and successfully wrote as a tick; DROPPED_TOTAL = records we DECODED but had to
 # drop (a sid_map miss, or a missing ltp/value field) — previously a SILENT
@@ -751,11 +950,27 @@ def main() -> None:
             # A full cycle succeeded up to the blocking consume — reset backoff so
             # the next genuine disconnect retries quickly, not at the capped delay.
             consecutive_failures = 0
-            # Arm the silent-feed watchdog once: if the SDK's blocking consume()
-            # streams nothing (swallowed feed reject / no entitlement / closed
-            # market), it surfaces a loud, actionable diagnostic to stderr instead
-            # of leaving the operator with only the SDK's empty "Error:" lines.
+            # Surface the REAL NATS reject reason (2026-06-29). The SDK swallows it:
+            # an "Authorization Violation" never reaches a growwapi callback (it is
+            # stored only on the underlying socket's last_error) and the bare
+            # "Error:" line is empty. (1) Replace the SDK's own callbacks with
+            # real-detail versions; (2) start a daemon poller that reads the socket's
+            # last_error and prints one edge-triggered `GROWW LIVE FEED REJECTED:
+            # <reason>` line + a periodic heartbeat. Both best-effort — a future-wheel
+            # attribute rename is caught and logged, never breaks the feed. Armed once
+            # per process (the poller watches the global counters for the lifetime).
             if not watchdog_started:
+                install_nats_reason_hooks(feed, secrets)
+                threading.Thread(
+                    target=nats_reject_poller,
+                    args=(feed, secrets),
+                    name="groww-nats-reject-poller",
+                    daemon=True,
+                ).start()
+                # Arm the silent-feed watchdog once: if the SDK's blocking consume()
+                # streams nothing (swallowed feed reject / no entitlement / closed
+                # market), it surfaces a loud, actionable diagnostic to stderr instead
+                # of leaving the operator with only the SDK's empty "Error:" lines.
                 threading.Thread(
                     target=silent_feed_watchdog,
                     args=(len(stock_list), len(index_list)),
