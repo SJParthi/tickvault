@@ -31,6 +31,7 @@ same shape the telegram-webhook Lambda (PR #781) already renders.
 Environment variables (set by Terraform):
   EC2_INSTANCE_ID    — the tv-app instance to watch
   ALERTS_TOPIC_ARN   — operator's tv_alerts SNS topic for Telegram
+  DASHBOARD_PORT     — app port for the Feed Control page link (default 3001)
   LOG_LEVEL          — INFO (default) / DEBUG / WARNING
 
 No pip deps — boto3 is pre-installed in the AWS Lambda Python 3.12 runtime.
@@ -51,6 +52,8 @@ logger.setLevel(LOG_LEVEL)
 
 EC2_INSTANCE_ID = os.environ.get("EC2_INSTANCE_ID", "")
 ALERTS_TOPIC_ARN = os.environ.get("ALERTS_TOPIC_ARN", "")
+# Port the app serves its Feed Control page on (config/base.toml [api] port).
+DASHBOARD_PORT = os.environ.get("DASHBOARD_PORT", "3001")
 
 # The daily_start EventBridge rule fires at 03:00 UTC (= 08:30 IST, Mon-Fri).
 START_TRIGGER_UTC_HOUR = 3
@@ -88,6 +91,28 @@ def _instance_info(ec2_client: Any, instance_id: str) -> tuple[str, datetime | N
     except Exception as exc:  # noqa: BLE001 — watchdog must never crash
         logger.error("describe_instances failed: %s", exc)
         return "unknown", None
+
+
+def _instance_public_ip(ec2_client: Any, instance_id: str) -> str | None:
+    """Return the instance's CURRENT public IP, or None if unavailable.
+
+    The EIP is detached for the no-orders data-pull phase, so the public IP
+    is auto-assigned and changes on every start — we read it live here.
+    Never raises: a missing link must never stop the start-triggered message.
+    """
+    try:
+        resp = ec2_client.describe_instances(InstanceIds=[instance_id])
+        reservations = resp.get("Reservations", [])
+        if not reservations:
+            return None
+        instances = reservations[0].get("Instances", [])
+        if not instances:
+            return None
+        ip = instances[0].get("PublicIpAddress")
+        return ip or None
+    except Exception as exc:  # noqa: BLE001 — watchdog must never crash
+        logger.error("describe_instances for public IP failed: %s", exc)
+        return None
 
 
 def _try_self_start(ec2_client: Any, instance_id: str) -> bool:
@@ -135,14 +160,24 @@ def lambda_handler(event: dict[str, Any], _context: Any = None) -> dict[str, Any
     sns_client = boto3.client("sns")
 
     if mode == "ping":
-        _publish(
-            sns_client,
-            "Instance start triggered",
+        message = (
             "🟢 8:30 AM IST instance start triggered (Mon-Fri). "
             "The app should report live in ~3 minutes. "
             "If you do NOT get a 'tickvault started' message by 8:40 AM, the "
-            "8:45 AM watchdog will check and start the box itself if needed.",
+            "8:45 AM watchdog will check and start the box itself if needed."
         )
+        # Append a tappable Feed Control link so the operator can open the
+        # page from his phone. The IP changes each start (EIP detached), so
+        # we read it live; if it isn't ready yet, degrade gracefully — the
+        # start-triggered message must always send.
+        public_ip = _instance_public_ip(boto3.client("ec2"), EC2_INSTANCE_ID)
+        if public_ip:
+            logger.info("ping — resolved public IP %s for dashboard link", public_ip)
+            message += f"\n📊 Dashboard: http://{public_ip}:{DASHBOARD_PORT}/feeds"
+        else:
+            logger.info("ping — public IP not ready; sending without dashboard link")
+            message += "\n📊 Dashboard link not ready yet — try again in a minute."
+        _publish(sns_client, "Instance start triggered", message)
         return {"mode": "ping", "published": True}
 
     if mode == "stop_check":
