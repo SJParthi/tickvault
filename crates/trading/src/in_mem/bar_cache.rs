@@ -65,7 +65,7 @@ use crate::candles::TfIndex;
 /// the bar opened. Two bars on the same (security_id, segment, tf)
 /// are distinct iff their bucket_start differs — which is the
 /// natural sealing invariant the multi-TF aggregator already enforces.
-type BarKey = (u32, u8, TfIndex, u32);
+type BarKey = (u64, u8, TfIndex, u32);
 
 /// Compact 56-byte representation of a sealed `Bar` for the
 /// indicator/strategy RAM-first read path.
@@ -129,7 +129,7 @@ impl BarCache {
     /// throughput at boot is ~200K/sec — full rehydrate takes ~30 sec.
     pub fn insert(
         &self,
-        security_id: u32,
+        security_id: u64,
         exchange_segment_code: u8,
         tf: TfIndex,
         bar: CompactBar,
@@ -153,7 +153,7 @@ impl BarCache {
     #[must_use]
     pub fn lookup(
         &self,
-        security_id: u32,
+        security_id: u64,
         exchange_segment_code: u8,
         tf: TfIndex,
         bucket_start_ist_secs: u32,
@@ -405,7 +405,12 @@ mod tests {
             let cc = cache.clone();
             handles.push(thread::spawn(move || {
                 for i in 0..PER_THREAD {
-                    cc.insert(thread_idx, 0, TfIndex::M1, make_bar(i, f64::from(i), 0));
+                    cc.insert(
+                        u64::from(thread_idx),
+                        0,
+                        TfIndex::M1,
+                        make_bar(i, f64::from(i), 0),
+                    );
                 }
             }));
         }
@@ -441,7 +446,7 @@ mod tests {
     fn test_estimated_bytes_matches_compact_bar_size() {
         let cache = BarCache::new();
         for i in 0..100u32 {
-            cache.insert(i, 0, TfIndex::M1, make_bar(540, 200.0, 0));
+            cache.insert(u64::from(i), 0, TfIndex::M1, make_bar(540, 200.0, 0));
         }
         let expected = 100 * std::mem::size_of::<CompactBar>() as u64;
         assert_eq!(cache.estimated_bytes(), expected);

@@ -53,7 +53,7 @@ fn dhat_bar_cache_lookup_steady_state_zero_alloc() {
     // acceptable startup cost. The hot-path measurement below
     // exercises ONLY the lookup path, where every read must hit a
     // pre-existing entry and allocate nothing.
-    let instruments: [u32; 100] = std::array::from_fn(|i| i as u32 + 1000);
+    let instruments: [u64; 100] = std::array::from_fn(|i| i as u64 + 1000);
     let bucket_start: u32 = 34_200;
     let tf = TfIndex::M1;
     let segment_code: u8 = 2; // NSE_FNO

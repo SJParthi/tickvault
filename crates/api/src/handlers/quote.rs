@@ -35,7 +35,7 @@ fn build_questdb_client(timeout_secs: u64) -> reqwest::Client {
 /// design — see `.claude/rules/project/live-feed-purity.md` rule 5.)
 #[derive(Debug, Serialize)]
 pub struct QuoteResponse {
-    pub security_id: u32,
+    pub security_id: u64,
     /// Feed source of the latest tick (`"dhan"` / `"groww"`).
     pub feed: String,
     /// Exchange segment string as stored in `ticks.segment` (e.g. `"NSE_EQ"`).
@@ -59,7 +59,7 @@ pub struct QuoteResponse {
 /// `GET /api/quote/:security_id` — fetch the latest tick from QuestDB.
 pub async fn get_quote(
     State(state): State<SharedAppState>,
-    Path(security_id): Path<u32>,
+    Path(security_id): Path<u64>,
 ) -> impl IntoResponse {
     // SECURITY: defense-in-depth guard against invalid security_id.
     // The u32 type from Axum's Path extractor already prevents SQL injection,
@@ -111,7 +111,7 @@ pub async fn get_quote(
 async fn query_latest_tick(
     client: &reqwest::Client,
     base_url: &str,
-    security_id: u32,
+    security_id: u64,
 ) -> Option<QuoteResponse> {
     // Query the columns that ACTUALLY EXIST in the `ticks` DDL
     // (`crates/storage/src/tick_persistence.rs::TICKS_CREATE_DDL`):
@@ -146,7 +146,7 @@ async fn query_latest_tick(
     // map to `None` via `as_u64()` / `as_f64()` (JSON `null` or absent → `None`),
     // never a misleading `0`/`0.0` and never a panic.
     Some(QuoteResponse {
-        security_id: row.first()?.as_u64()? as u32,
+        security_id: row.first()?.as_u64()?,
         feed: row.get(1)?.as_str()?.to_string(),
         segment: row.get(2)?.as_str()?.to_string(),
         last_traded_price: row.get(3)?.as_f64()?,
