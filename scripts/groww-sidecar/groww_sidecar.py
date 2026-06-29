@@ -56,6 +56,11 @@ except Exception as exc:  # pragma: no cover
 
 # The path the Rust bridge tails (GROWW_TICK_FILE_DEFAULT in groww_bridge.rs).
 OUTPUT_PATH = os.environ.get("GROWW_TICK_FILE", "data/groww/live-ticks.ndjson")
+# The connect+subscribe PROOF status file the Rust bridge reads (operator
+# 2026-06-28). Written ATOMICALLY (temp + rename) so the bridge never reads a
+# half-written file; carries ONLY counts + an event tag + a timestamp — NEVER any
+# credential. Default mirrors GROWW_STATUS_FILE_DEFAULT in groww_bridge.rs.
+STATUS_PATH = os.environ.get("GROWW_STATUS_FILE", "data/groww/groww-status.json")
 # Directory the Rust watch-list builder writes groww-watch-<date>.json into.
 WATCH_DIR = os.environ.get("GROWW_WATCH_DIR", "data/groww")
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -74,6 +79,23 @@ CANONICAL_INDEX_SEGMENT = "IDX_I"
 
 # How long to wait between checks for the Rust-built watch file at startup.
 WATCH_POLL_SECS = 5
+
+# Honest-feed counters (operator 2026-06-29). EMITTED_TOTAL = records we DECODED
+# and successfully wrote as a tick; DROPPED_TOTAL = records we DECODED but had to
+# drop (a sid_map miss, or a missing ltp/value field) — previously a SILENT
+# `continue`. The Rust bridge surfaces both via feed-health so a key-map mismatch
+# ("streaming but 0 ticks") is visible instead of invisible.
+EMITTED_TOTAL = 0
+DROPPED_TOTAL = 0
+# Throttle for the periodic status re-write that carries the live emitted/dropped
+# counts: first emit always writes (it flips the bridge's connected=true), then at
+# most once per second so a fast tick stream cannot thrash the atomic-rename write.
+STATUS_REWRITE_MIN_INTERVAL_SECS = 1.0
+_last_status_rewrite_monotonic = 0.0
+# Cached subscribe counts so the periodic status re-write knows N stocks + M indices
+# without threading them through every emit call. Set once after subscribe.
+_SUBSCRIBED_STOCKS = 0
+_SUBSCRIBED_INDICES = 0
 
 # Reconnect/auth backoff (charter: exponential backoff, NO retry storms). The old
 # flat 5s re-auth every loop made the sidecar 429 itself (GrowwAPIRateLimitException
@@ -210,6 +232,87 @@ def ms_to_ist_nanos(ts_millis: int) -> int:
     return int(dt_ist.replace(tzinfo=timezone.utc).timestamp() * 1_000_000_000)
 
 
+def now_ist_nanos() -> int:
+    """Current wall-clock time as IST epoch nanoseconds (for the status file ts)."""
+    return int(datetime.now(tz=IST).timestamp() * 1_000_000_000)
+
+
+def write_status(event: str, stocks: int, indices: int) -> None:
+    """Atomically write the connect+subscribe PROOF status the Rust bridge reads.
+
+    The bridge (crates/app/src/groww_bridge.rs) tails this file to emit the ONE
+    structured "Groww live feed CONNECTED — subscribed N stocks + M indices" log,
+    record the subscribe counts in feed-health, and flip `connected=true` only on
+    the `streaming` event (no false-OK; honest-feed fix 2026-06-29 — `streaming` is
+    now written ONLY on the FIRST real decoded+emitted tick, never optimistically).
+    Contains ONLY: event tag + counts + the live emitted/dropped totals + a
+    timestamp — NEVER a credential. Atomic temp+rename so the bridge never reads a
+    torn file. Best-effort: a write failure is logged (type only) and ignored — the
+    stream itself is unaffected, and the bridge's first-tick fallback still flips
+    connected.
+    """
+    rec = {
+        "event": event,
+        "stocks": int(stocks),
+        "indices": int(indices),
+        "total": int(stocks) + int(indices),
+        # Honest-feed PROOF (2026-06-29): records DECODED+EMITTED vs DECODED-but-
+        # DROPPED so the bridge can surface "streaming but 0 ticks" with a cause.
+        "emitted": int(EMITTED_TOTAL),
+        "dropped": int(DROPPED_TOTAL),
+        "ts_ist_nanos": now_ist_nanos(),
+    }
+    try:
+        directory = os.path.dirname(STATUS_PATH) or "."
+        os.makedirs(directory, exist_ok=True)
+        tmp = f"{STATUS_PATH}.{os.getpid()}.tmp"
+        with open(tmp, "w") as fh:
+            fh.write(json.dumps(rec))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, STATUS_PATH)  # atomic rename
+    except OSError as exc:
+        # Never embed paths/values that could leak anything; type only.
+        print(
+            f"groww sidecar: status write failed ({type(exc).__name__}); continuing",
+            flush=True,
+        )
+
+
+def note_drop() -> None:
+    """Count one DECODED-but-DROPPED record (sid_map miss / missing field).
+
+    Previously these were a SILENT `continue`. Counting them lets the Rust bridge
+    surface "streaming but 0 ticks" with a visible cause (operator 2026-06-29).
+    Does NOT re-write the status file (drops without emits do not flip connected;
+    the count is carried on the next periodic emit re-write).
+    """
+    global DROPPED_TOTAL
+    DROPPED_TOTAL += 1
+
+
+def note_emit() -> None:
+    """Count one DECODED+EMITTED record and drive the honest `streaming` status.
+
+    On the FIRST successful emit (EMITTED_TOTAL 0 -> 1) this writes the
+    `streaming` status — the ONLY place "streaming" is written, now backed by a
+    REAL decoded+emitted tick (the optimistic pre-consume write was removed). After
+    that it re-writes the status (refreshed emitted/dropped) at most once per second
+    so the bridge surfaces live counts without status-file thrash.
+    """
+    global EMITTED_TOTAL, _last_status_rewrite_monotonic
+    EMITTED_TOTAL += 1
+    now = time.monotonic()
+    if EMITTED_TOTAL == 1:
+        # First real tick: this is the honest proof the feed is streaming.
+        write_status("streaming", _SUBSCRIBED_STOCKS, _SUBSCRIBED_INDICES)
+        _last_status_rewrite_monotonic = now
+        return
+    if now - _last_status_rewrite_monotonic >= STATUS_REWRITE_MIN_INTERVAL_SECS:
+        write_status("streaming", _SUBSCRIBED_STOCKS, _SUBSCRIBED_INDICES)
+        _last_status_rewrite_monotonic = now
+
+
 def latest_watch_file(watch_dir: str):
     """Return the path of the most recent groww-watch-*.json, or None."""
     matches = sorted(glob.glob(os.path.join(watch_dir, "groww-watch-*.json")))
@@ -289,18 +392,24 @@ def emit_ltp_records(out, ltp_tree: dict, sid_map: dict) -> None:
             if canonical is None or not isinstance(tokens, dict):
                 continue
             for token, tick in tokens.items():
+                # A decoded record with no `ltp` field — DROP (honest-feed count).
                 if not isinstance(tick, dict) or "ltp" not in tick:
+                    note_drop()
                     continue
                 token = str(token)
                 security_id = sid_map.get((str(exchange), str(segment), token))
                 if security_id is None:
                     security_id = int(token) if token.isdigit() else 0
+                # sid_map miss + non-numeric token → no resolvable id — DROP.
                 if security_id <= 0:
+                    note_drop()
                     continue
                 try:
                     ts_millis = int(tick.get("tsInMillis", 0))
                     _write_record(out, security_id, canonical, ts_millis, tick["ltp"])
+                    note_emit()
                 except (KeyError, ValueError, TypeError):
+                    note_drop()
                     continue
 
 
@@ -319,17 +428,23 @@ def emit_index_records(out, index_tree: dict, sid_map: dict) -> None:
             if not isinstance(tokens, dict):
                 continue
             for token, tick in tokens.items():
+                # A decoded index record with no `value` field — DROP (count it).
                 if not isinstance(tick, dict) or "value" not in tick:
+                    note_drop()
                     continue
                 security_id = sid_map.get((str(exchange), str(segment), str(token)))
+                # sid_map miss (index token may be a NAME — no fallback) — DROP.
                 if security_id is None or security_id <= 0:
+                    note_drop()
                     continue
                 try:
                     ts_millis = int(tick.get("tsInMillis", 0))
                     _write_record(
                         out, security_id, CANONICAL_INDEX_SEGMENT, ts_millis, tick["value"]
                     )
+                    note_emit()
                 except (KeyError, ValueError, TypeError):
+                    note_drop()
                     continue
 
 
@@ -411,6 +526,11 @@ def main() -> None:
             feed = GrowwFeed(groww)
 
             phase = "subscribe"
+            # Cache the subscribe counts so the first-emit `streaming` status write
+            # (driven by note_emit on a REAL decoded tick) knows N stocks + M indices.
+            global _SUBSCRIBED_STOCKS, _SUBSCRIBED_INDICES
+            _SUBSCRIBED_STOCKS = len(stock_list)
+            _SUBSCRIBED_INDICES = len(index_list)
             if stock_list:
                 def on_ltp(_meta) -> None:
                     emit_ltp_records(out, feed.get_ltp(), sid_map)
@@ -424,13 +544,23 @@ def main() -> None:
 
             print(
                 f"subscribed {len(stock_list)} stocks + {len(index_list)} indices "
-                f"— streaming…",
+                f"— awaiting first tick…",
                 flush=True,
             )
+            # Connect+subscribe PROOF (2026-06-28): write the atomic status the Rust
+            # bridge reads → it emits the ONE structured CONNECT log + records the
+            # subscribe counts in feed-health. Counts only, never a credential. This
+            # is the honest "attempted" signal; it does NOT flip `connected=true`.
+            write_status("subscribed", len(stock_list), len(index_list))
             # A full cycle succeeded up to the blocking consume — reset backoff so
             # the next genuine disconnect retries quickly, not at the capped delay.
             consecutive_failures = 0
             phase = "consume"
+            # HONEST-FEED FIX (2026-06-29): the optimistic pre-consume
+            # write_status("streaming", …) was REMOVED. "streaming" (which flips the
+            # bridge's connected=true) is now written ONLY by note_emit() on the
+            # FIRST real decoded+emitted tick — never before any data flows. So a
+            # subscribed-but-silent feed honestly reads NOT streaming.
             feed.consume()  # blocking
         except KeyboardInterrupt:
             print("stopping.", flush=True)

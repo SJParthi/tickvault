@@ -12,6 +12,10 @@ extend-ignore-re = [
     "[0-9a-f]{40,}",
     # Ignore base64-encoded strings
     "[A-Za-z0-9+/]{40,}={0,2}",
+    # Domain phrases / identifiers that read as typos but are intentional:
+    "mis-partition",   # "mis-partition the shared table" — deliberate hyphenation
+    "SELECTed",        # SQL verb used as an English past tense in a comment
+    "unparseable",     # accepted spelling variant of "unparsable"
 ]
 
 [default.extend-words]
@@ -21,6 +25,7 @@ dlt = "dlt"
 valkey = "valkey"
 questdb = "questdb"
 nse = "nse"
+bse = "bse"
 sebi = "sebi"
 totp = "totp"
 ilp = "ilp"
@@ -55,6 +60,7 @@ ist = "ist"
 ine = "ine"
 ot = "ot"
 thr = "thr"
+nd = "nd"
 
 [files]
 extend-exclude = [

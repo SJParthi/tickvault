@@ -177,6 +177,11 @@ pub struct GrowwSidecarOptions {
     /// The capture-at-receipt NDJSON file the sidecar appends and the bridge
     /// tails. Passed to the child as `GROWW_TICK_FILE`.
     pub tick_file: PathBuf,
+    /// The connect+subscribe PROOF status file the sidecar writes atomically and
+    /// the bridge reads (operator 2026-06-28). Passed to the child as
+    /// `GROWW_STATUS_FILE`. Carries ONLY counts + an event tag + a timestamp —
+    /// never a credential.
+    pub status_file: PathBuf,
 }
 
 impl Default for GrowwSidecarOptions {
@@ -187,6 +192,7 @@ impl Default for GrowwSidecarOptions {
             script_path: PathBuf::from(GROWW_SIDECAR_SCRIPT_DEFAULT),
             requirements_path: PathBuf::from(GROWW_SIDECAR_REQUIREMENTS_DEFAULT),
             tick_file: PathBuf::from(crate::groww_bridge::GROWW_TICK_FILE_DEFAULT),
+            status_file: PathBuf::from(crate::groww_bridge::GROWW_STATUS_FILE_DEFAULT),
         }
     }
 }
@@ -470,6 +476,14 @@ pub async fn run_groww_sidecar_supervisor(
             .env("GROWW_API_KEY", creds.api_key.expose_secret())
             .env("GROWW_TOTP_SECRET", creds.totp_secret.expose_secret())
             .env("GROWW_TICK_FILE", opts.tick_file.to_string_lossy().as_ref())
+            // Connect+subscribe PROOF status file (operator 2026-06-28). The sidecar
+            // writes its subscribe counts here atomically; the bridge reads it to emit
+            // the ONE CONNECT log + record the counts + flip `connected` on streaming.
+            // Counts only — never a credential.
+            .env(
+                "GROWW_STATUS_FILE",
+                opts.status_file.to_string_lossy().as_ref(),
+            )
             // Reap the child deterministically if the supervisor task is dropped
             // (e.g. runtime shutdown / daily AWS stop). Without this, a dropped
             // `Child` leaves the Python sidecar orphaned + still appending to the
@@ -671,6 +685,30 @@ mod tests {
         assert_eq!(
             opts.tick_file,
             PathBuf::from(crate::groww_bridge::GROWW_TICK_FILE_DEFAULT)
+        );
+        assert_eq!(
+            opts.status_file,
+            PathBuf::from(crate::groww_bridge::GROWW_STATUS_FILE_DEFAULT)
+        );
+    }
+
+    #[test]
+    fn test_supervisor_injects_status_file_env() {
+        // Connect+subscribe PROOF (2026-06-28): the supervisor MUST inject
+        // GROWW_STATUS_FILE into the child so the sidecar writes its subscribe
+        // counts where the bridge reads them. `run_groww_sidecar_supervisor` is a
+        // TEST-EXEMPT process driver, so pin the injection by source-scan — a
+        // future refactor cannot silently drop it.
+        let src = include_str!("groww_sidecar_supervisor.rs");
+        // Scan the env-var KEY literal + the `opts.status_file` value source
+        // independently — rustfmt may wrap the `.env("GROWW_STATUS_FILE", ...)` call
+        // across lines, so a contiguous-needle scan is brittle. Both tokens present
+        // ⇒ the injection is wired.
+        let env_key = format!("\"GROWW_STATUS{}_FILE\"", "");
+        assert!(
+            src.contains(&env_key) && src.contains("opts.status_file.to_string_lossy"),
+            "the supervisor must inject GROWW_STATUS_FILE (the connect+subscribe \
+             proof status file) into the sidecar child"
         );
     }
 }

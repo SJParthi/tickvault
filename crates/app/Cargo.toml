@@ -45,6 +45,11 @@ chrono-tz = { workspace = true }
 rustls = { workspace = true }
 reqwest = { workspace = true }
 core_affinity = { workspace = true }
+# Event-driven (zero-poll) file watching for the Groww bridge tick-file tail
+# (operator 2026-06-28: "true zero latency, no polling"). Same crate + pin the
+# strategy hot-reloader uses (`crates/trading/src/strategy/hot_reload.rs`) —
+# cross-platform inotify/FSEvents, so Mac dev == AWS prod (common runtime).
+notify = { workspace = true }
 # Only the feature-gated daily-universe boot orchestrator hashes the CSV
 # (source_csv_sha256 provenance); optional so the default build stays lean.
 sha2 = { workspace = true, optional = true }
