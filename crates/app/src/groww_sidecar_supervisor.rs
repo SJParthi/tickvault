@@ -146,6 +146,41 @@ impl SidecarLineClass {
     }
 }
 
+/// True for the sidecar's SILENT-FEED WATCHDOG lines (`SILENT FEED …` /
+/// `STILL SILENT …`) — the time-driven "subscribed but received no records in
+/// 30s" diagnostic. These are EXPECTED + benign when the market is closed
+/// (silence is normal after-hours, exactly what the `/feeds` page now says — PR
+/// #1260) but ARE a real problem during market hours (entitlement gap / reject).
+///
+/// This is DELIBERATELY narrower than [`SidecarLineClass::EntitlementRejected`]:
+/// a line that NAMES a hard entitlement / permission / authorization problem
+/// (e.g. `account lacks a live market-data feed entitlement`, `NATS permissions
+/// violation`) is a real config fault at ANY time and is NOT a silent-feed
+/// watchdog line — so it keeps its `error!` level always. Pure, O(1),
+/// case-insensitive substring match against the REAL watchdog strings the
+/// sidecar prints (see `scripts/groww-sidecar/groww_sidecar.py`).
+#[must_use]
+pub fn is_silent_feed_diagnostic(line: &str) -> bool {
+    let l = line.to_ascii_lowercase();
+    l.contains("silent feed") || l.contains("still silent")
+}
+
+/// Tracing [`Level`](tracing::Level) for a SILENT-FEED watchdog diagnostic,
+/// decided purely by whether the market is open. During market hours prolonged
+/// silence IS abnormal → `ERROR` (operator must be alerted). Outside market
+/// hours silence is EXPECTED → `INFO` (a calm "idle — market closed" note that
+/// must NOT land in `errors.jsonl` / `errors.log` as an ERROR). Pure, O(1) —
+/// the market-hours decision is injected so this is unit-testable without a
+/// live clock or sidecar.
+#[must_use]
+pub fn silent_feed_diagnostic_level(market_open: bool) -> tracing::Level {
+    if market_open {
+        tracing::Level::ERROR
+    } else {
+        tracing::Level::INFO
+    }
+}
+
 /// Classify one sidecar diagnostic line. Pure, O(1), case-insensitive substring
 /// match against the REAL strings `scripts/groww-sidecar/groww_sidecar.py`
 /// prints. Order matters: the most-specific / most-actionable class wins.
@@ -489,22 +524,55 @@ where
         // next_line() is cancel-safe and ends with Ok(None) on EOF (pipe closed).
         while let Ok(Some(line)) = lines.next_line().await {
             let class = classify_sidecar_line(&line);
+            // The sidecar's SILENT-FEED WATCHDOG line ("subscribed N but received
+            // NO records in 30s") is benign when the market is closed (silence is
+            // expected after-hours — matches the `/feeds` page, PR #1260) but is a
+            // real problem during market hours. Decide its level + whether it
+            // alerts by the SAME market-hours helper #1260 used, so the LOG channel
+            // agrees with the page instead of flooding errors.jsonl with red lines
+            // every 60s after close. All OTHER lines (genuine entitlement /
+            // permission / auth / traceback / generic error) keep their class-implied
+            // level + alerting at ALL times.
+            let silent_feed_diag = is_silent_feed_diagnostic(&line);
+            let market_open = tickvault_common::market_hours::is_within_market_hours_ist();
             // Forward the child's OWN (already-redacted) line to tracing at the
             // level its class implies, so it reaches the 5-sink → CloudWatch.
-            match class {
-                SidecarLineClass::AuthRejected
-                | SidecarLineClass::EntitlementRejected
-                | SidecarLineClass::Error => {
-                    error!(stream = pipe_name, "[feeds] groww sidecar: {line}");
+            if silent_feed_diag {
+                // INFO when the market is closed (idle is normal), ERROR during
+                // market hours (prolonged silence is abnormal).
+                match silent_feed_diagnostic_level(market_open) {
+                    tracing::Level::ERROR => {
+                        error!(stream = pipe_name, "[feeds] groww sidecar: {line}");
+                    }
+                    _ => {
+                        info!(
+                            stream = pipe_name,
+                            market_open,
+                            "[feeds] groww idle — market closed, awaiting open: {line}"
+                        );
+                    }
                 }
-                SidecarLineClass::Subscribed | SidecarLineClass::Streaming => {
-                    info!(stream = pipe_name, "[feeds] groww sidecar: {line}");
-                }
-                SidecarLineClass::Info => {
-                    info!(stream = pipe_name, "[feeds] groww sidecar: {line}");
+            } else {
+                match class {
+                    SidecarLineClass::AuthRejected
+                    | SidecarLineClass::EntitlementRejected
+                    | SidecarLineClass::Error => {
+                        error!(stream = pipe_name, "[feeds] groww sidecar: {line}");
+                    }
+                    SidecarLineClass::Subscribed | SidecarLineClass::Streaming => {
+                        info!(stream = pipe_name, "[feeds] groww sidecar: {line}");
+                    }
+                    SidecarLineClass::Info => {
+                        info!(stream = pipe_name, "[feeds] groww sidecar: {line}");
+                    }
                 }
             }
-            if class.triggers_alert() {
+            // A SILENT-FEED watchdog line only counts as an operator-actionable
+            // reject DURING market hours — after-hours silence must not mark the
+            // feed Down or fire a Telegram page (consistent with #1260's page).
+            // Every other alert class fires its side-effects at all times.
+            let triggers_alert = class.triggers_alert() && (!silent_feed_diag || market_open);
+            if triggers_alert {
                 // Edge-trigger: fire the operator-facing side-effects ONCE per
                 // running child, even if the same error prints 100×.
                 if !alerted.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -913,6 +981,64 @@ mod tests {
             src.contains(&env_key) && src.contains("opts.status_file.to_string_lossy"),
             "the supervisor must inject GROWW_STATUS_FILE (the connect+subscribe \
              proof status file) into the sidecar child"
+        );
+    }
+
+    // ── is_silent_feed_diagnostic + silent_feed_diagnostic_level (the
+    // market-hours-aware log re-leveling for the benign-after-close SILENT-FEED
+    // watchdog lines — operator log-flood fix 2026-06-29) ──
+
+    #[test]
+    fn test_is_silent_feed_diagnostic_matches_watchdog_lines() {
+        // The two real watchdog strings the sidecar prints every 30s.
+        assert!(is_silent_feed_diagnostic(
+            "groww sidecar: SILENT FEED — subscribed 742 stocks + 25 indices but received NO live records in 30s"
+        ));
+        assert!(is_silent_feed_diagnostic(
+            "groww sidecar: STILL SILENT — 0 live records decoded (emitted=0, dropped=0)"
+        ));
+        // Case-insensitive.
+        assert!(is_silent_feed_diagnostic("silent feed warning"));
+    }
+
+    #[test]
+    fn test_is_silent_feed_diagnostic_excludes_genuine_faults() {
+        // A hard entitlement / permission / authorization line is a real config
+        // fault at ANY time — NOT a silent-feed watchdog line, so it keeps its
+        // error level always.
+        assert!(!is_silent_feed_diagnostic(
+            "this Groww account lacks a LIVE market-data feed entitlement"
+        ));
+        assert!(!is_silent_feed_diagnostic(
+            "NATS permissions violation for subscription"
+        ));
+        assert!(!is_silent_feed_diagnostic("not authorized to subscribe"));
+        assert!(!is_silent_feed_diagnostic(
+            "groww sidecar error [auth]: bad token"
+        ));
+        assert!(!is_silent_feed_diagnostic("Error: nats: connection closed"));
+        assert!(!is_silent_feed_diagnostic(""));
+    }
+
+    #[test]
+    fn test_silent_feed_diagnostic_level_market_closed_is_info_not_error() {
+        // The fix: market CLOSED → INFO (calm "idle" note, NOT an ERROR that
+        // floods errors.jsonl / errors.log every 60s after close).
+        assert_eq!(
+            silent_feed_diagnostic_level(false),
+            tracing::Level::INFO,
+            "after-hours SILENT-FEED idle must be INFO, never ERROR"
+        );
+    }
+
+    #[test]
+    fn test_silent_feed_diagnostic_level_market_open_is_error() {
+        // During market hours prolonged silence IS abnormal → keep ERROR so the
+        // operator is alerted to a real entitlement gap / reject.
+        assert_eq!(
+            silent_feed_diagnostic_level(true),
+            tracing::Level::ERROR,
+            "during market hours a silent feed must stay ERROR"
         );
     }
 
