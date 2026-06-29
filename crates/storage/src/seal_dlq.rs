@@ -362,7 +362,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn mk_serialized_seal(sid: u32, seg: u8, tf: u8, bucket: u32, close: f64) -> SerializedSeal {
+    fn mk_serialized_seal(sid: u64, seg: u8, tf: u8, bucket: u32, close: f64) -> SerializedSeal {
         SerializedSeal {
             security_id: sid,
             exchange_segment_code: seg,

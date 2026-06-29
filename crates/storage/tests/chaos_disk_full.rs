@@ -54,7 +54,7 @@ fn test_config() -> QuestDbConfig {
 
 fn make_tick(security_id: u32, price: f32) -> ParsedTick {
     ParsedTick {
-        security_id,
+        security_id: u64::from(security_id),
         exchange_segment_code: 1,
         last_traded_price: price,
         exchange_timestamp: 1_700_000_000,

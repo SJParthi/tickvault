@@ -46,7 +46,7 @@ fn nifty_index_tick(price: f32, exchange_timestamp: u32) -> ParsedTick {
 }
 
 /// Models QuestDB's dedup key `(ts, security_id, segment, tiebreaker)`.
-fn key(t: &ParsedTick, tiebreaker: i64) -> (u32, u32, u8, i64) {
+fn key(t: &ParsedTick, tiebreaker: i64) -> (u32, u64, u8, i64) {
     (
         t.exchange_timestamp,
         t.security_id,

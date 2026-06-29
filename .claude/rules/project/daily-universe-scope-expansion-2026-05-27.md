@@ -751,6 +751,45 @@ Operator directive verbatim 2026-05-27:
 - `crates/storage/tests/operator_boundary_indicator_strategy_guard.rs::test_indicator_engine_states_field_unchanged_since_2026_05_27`
   (source-scan: SHA-256 the relevant lines of `engine.rs`; any modification fails the build until the boundary is lifted)
 
+### §28.1 — NARROW LIFT for the `security_id` u32→u64 widening (operator-approved 2026-06-29)
+
+**Authorization:** `.claude/plans/active-plan-groww-security-id-u64.md`
+(Status: APPROVED, Date 2026-06-29, "Approved by: Parthiban (operator) —
+grounded directive, this session"). That plan widens the shared
+`SecurityId` alias and every in-memory SecurityId field from `u32` → `u64`
+so a 64-bit Groww `exchange_token` (indices set bit 62) folds through the
+SAME aggregator/registry/pipeline instead of being silently dropped by the
+`u32::try_from` rejection in the Groww bridge.
+
+**Why this touches the frozen area (unavoidable type cascade, NOT a logic
+change):** `ParsedTick.security_id` is now `u64`, and the indicator engine
+assigns it straight into `IndicatorSnapshot.security_id`
+(`engine.rs` `security_id: tick.security_id`). Keeping the frozen structs at
+`u32` would require an `as u32` truncation that silently corrupts the very
+64-bit Groww ids the change exists to support — strictly worse than the lift.
+So the widening propagates, by the compiler, into exactly four frozen files:
+- `crates/trading/src/indicator/engine.rs` — `warmup_from_candles` /
+  `warmup_count` parameter type + test helpers
+- `crates/trading/src/indicator/types.rs` — `IndicatorSnapshot.security_id`
+- `crates/trading/src/indicator/obi.rs` — `ObiSnapshot.security_id` +
+  `compute_obi` parameter
+- `crates/trading/src/strategy/evaluator.rs` — test-helper signatures
+  (+ the in-module test files `indicator/tests.rs`, `strategy/tests.rs`)
+
+**Scope of THIS lift (narrow, mechanical):** ONLY the `security_id`/SecurityId
+field-and-parameter TYPE may change `u32` → `u64` in the frozen area. NO
+indicator math, NO strategy FSM logic, NO `IndicatorEngine::states` layout
+semantics change — the `states: Vec<IndicatorState>` field and every indicator
+computation are byte-for-byte identical apart from the id type. The two
+hot-path agent CRITICAL findings (C1 warmup gate, C2 `states` flat-Vec I-P1-11)
+remain TRACKED and UN-remediated.
+
+**Re-bless:** the `BOUNDARY_FILES` manifest in
+`operator_boundary_indicator_strategy_guard.rs` is updated (FNV-1a + byte len +
+line count) to the post-widening tree on branch `claude/groww-security-id-u64`.
+The guard remains active — any FURTHER edit to the frozen area beyond this
+recorded lift fails the build again, requiring its own fresh dated quote.
+
 ---
 
 ## §29. Same-day warm-resubscribe snapshot — operator authorization 2026-05-29

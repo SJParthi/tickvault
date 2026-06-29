@@ -560,7 +560,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn mk_seal(sid: u32, seg: u8, tf: u8, bucket: u32, close: f64) -> SerializedSeal {
+    fn mk_seal(sid: u64, seg: u8, tf: u8, bucket: u32, close: f64) -> SerializedSeal {
         SerializedSeal {
             security_id: sid,
             exchange_segment_code: seg,
@@ -720,10 +720,15 @@ mod tests {
             &[0u8; 8],
             "open_gap_pct bytes 112..120 must be written"
         );
-        // The reserved tail now starts at 120.
-        for i in 120..SEAL_SPILL_RECORD_SIZE {
-            assert_eq!(bytes[i], 0, "reserved tail byte at {i} not zero");
-        }
+        // 2026-06-29 u64 widening: bytes 120..128 now carry the FULL u64
+        // security_id (so a >u32 Groww id is not lost to the legacy low-32 at
+        // bytes 0..4). mk_seal sets security_id=13 → non-zero, round-trips here.
+        assert_eq!(
+            &bytes[120..128],
+            &13_u64.to_le_bytes(),
+            "full u64 security_id must be written at bytes 120..128"
+        );
+        // The 128-byte record is now fully populated — no reserved tail remains.
     }
 
     #[test]
@@ -940,7 +945,7 @@ mod tests {
 
     use tickvault_trading::candles::{BufferedSeal, LiveCandleState, TfIndex};
 
-    fn mk_buffered_seal(sid: u32, seg: u8, tf: TfIndex, bucket: u32, close: f64) -> BufferedSeal {
+    fn mk_buffered_seal(sid: u64, seg: u8, tf: TfIndex, bucket: u32, close: f64) -> BufferedSeal {
         let mut state = LiveCandleState::empty();
         state.bucket_start_ist_secs = bucket;
         state.open = 100.0;

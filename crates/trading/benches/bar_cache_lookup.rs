@@ -36,7 +36,7 @@ fn make_bar(bucket_start: u32) -> CompactBar {
 
 fn bench_bar_cache_lookup(c: &mut Criterion) {
     let cache = BarCache::new();
-    let security_id = 1234_u32;
+    let security_id = 1234_u64;
     let segment_code = 2_u8; // NSE_FNO
     let tf = TfIndex::M1;
     let bucket_start = 34_200_u32;

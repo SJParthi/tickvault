@@ -149,7 +149,7 @@ mod tests {
     use tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I;
     use tickvault_trading::candles::{LiveCandleState, TfIndex};
 
-    fn mk_seal_feed(sid: u32, seg: u8, bucket: u32, close: f64, feed: Feed) -> BufferedSeal {
+    fn mk_seal_feed(sid: u64, seg: u8, bucket: u32, close: f64, feed: Feed) -> BufferedSeal {
         let mut state = LiveCandleState::empty();
         state.bucket_start_ist_secs = bucket;
         state.open = 100.0;

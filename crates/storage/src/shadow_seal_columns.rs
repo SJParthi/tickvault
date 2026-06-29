@@ -179,7 +179,7 @@ mod tests {
     use tickvault_common::feed::Feed;
     use tickvault_trading::candles::{LiveCandleState, TfIndex};
 
-    fn mk_seal(sid: u32, seg: u8, tf: TfIndex, bucket: u32, close: f64) -> BufferedSeal {
+    fn mk_seal(sid: u64, seg: u8, tf: TfIndex, bucket: u32, close: f64) -> BufferedSeal {
         let mut state = LiveCandleState::empty();
         state.bucket_start_ist_secs = bucket;
         state.open = 100.0;
@@ -359,7 +359,7 @@ mod tests {
     #[test]
     fn test_security_id_widens_u32_to_i64() {
         let row = ShadowSealRow::from_buffered_seal(&mk_seal(
-            u32::MAX,
+            u64::from(u32::MAX),
             0,
             TfIndex::M1,
             1_716_000_900,

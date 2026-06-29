@@ -277,7 +277,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dlq);
     }
 
-    fn mk_buffered_seal(sid: u32, seg: u8, tf: TfIndex, bucket: u32, close: f64) -> BufferedSeal {
+    fn mk_buffered_seal(sid: u64, seg: u8, tf: TfIndex, bucket: u32, close: f64) -> BufferedSeal {
         let mut state = LiveCandleState::empty();
         state.bucket_start_ist_secs = bucket;
         state.open = 100.0;
@@ -478,7 +478,7 @@ mod tests {
             );
             assert_eq!(p.submit(s, now), SubmitOutcome::Buffered);
         }
-        let mut collected: Vec<u32> = Vec::new();
+        let mut collected: Vec<u64> = Vec::new();
         p.drain_all(|seal| collected.push(seal.security_id));
         assert_eq!(collected, vec![13, 14, 15, 16, 17]);
         assert_eq!(p.ring_len(), 0);
@@ -660,7 +660,7 @@ mod tests {
         p.submit(s1, now);
         p.submit(s2, now);
         p.submit(s3, now);
-        let mut collected: Vec<u32> = Vec::new();
+        let mut collected: Vec<u64> = Vec::new();
         p.drain_all(|seal| collected.push(seal.security_id));
         assert_eq!(collected, vec![25, 51]);
         cleanup(&spill, &dlq);

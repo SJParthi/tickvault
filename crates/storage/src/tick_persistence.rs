@@ -2048,7 +2048,7 @@ mod tests {
 
     fn make_test_tick(security_id: u32, ltp: f32) -> ParsedTick {
         ParsedTick {
-            security_id,
+            security_id: u64::from(security_id),
             exchange_segment_code: 2, // NSE_FNO
             last_traded_price: ltp,
             last_trade_quantity: 75,
@@ -2272,7 +2272,10 @@ mod tests {
             .unwrap()
             .symbol("segment", segment_code_to_str(tick.exchange_segment_code))
             .unwrap()
-            .column_i64("security_id", i64::from(tick.security_id))
+            .column_i64(
+                "security_id",
+                i64::try_from(tick.security_id).unwrap_or(i64::MAX),
+            )
             .unwrap()
             .column_f64("ltp", f64::from(tick.last_traded_price))
             .unwrap()
@@ -2371,7 +2374,10 @@ mod tests {
                 .unwrap()
                 .symbol("segment", segment_code_to_str(tick.exchange_segment_code))
                 .unwrap()
-                .column_i64("security_id", i64::from(tick.security_id))
+                .column_i64(
+                    "security_id",
+                    i64::try_from(tick.security_id).unwrap_or(i64::MAX),
+                )
                 .unwrap()
                 .column_f64("ltp", f64::from(tick.last_traded_price))
                 .unwrap()
@@ -2401,7 +2407,10 @@ mod tests {
             .unwrap()
             .symbol("segment", segment_code_to_str(tick.exchange_segment_code))
             .unwrap()
-            .column_i64("security_id", i64::from(tick.security_id))
+            .column_i64(
+                "security_id",
+                i64::try_from(tick.security_id).unwrap_or(i64::MAX),
+            )
             .unwrap()
             .column_f64("ltp", f64::from(tick.last_traded_price))
             .unwrap()
@@ -2738,7 +2747,7 @@ mod tests {
         // Stress test with max u32 values for numeric fields.
         let mut buffer = Buffer::new(ProtocolVersion::V1);
         let tick = ParsedTick {
-            security_id: u32::MAX,
+            security_id: u64::from(u32::MAX),
             exchange_segment_code: 2,
             last_traded_price: f32::MAX,
             last_trade_quantity: u16::MAX,
@@ -5106,7 +5115,7 @@ mod tests {
         let back = writer.tick_buffer.back().unwrap();
         assert_eq!(
             back.0.security_id,
-            (TICK_BUFFER_CAPACITY - 1) as u32,
+            (TICK_BUFFER_CAPACITY - 1) as u64,
             "ring buffer newest should be the last one that fit"
         );
 
@@ -5451,7 +5460,7 @@ mod tests {
     #[test]
     fn test_tick_serialize_roundtrip_max_values() {
         let tick = ParsedTick {
-            security_id: u32::MAX,
+            security_id: u64::from(u32::MAX),
             exchange_segment_code: 255,
             last_traded_price: f32::MAX,
             last_trade_quantity: u16::MAX,
@@ -5476,7 +5485,7 @@ mod tests {
         };
         let bytes = serialize_tick(&tick);
         let restored = deserialize_tick(&bytes);
-        assert_eq!(restored.security_id, u32::MAX);
+        assert_eq!(restored.security_id, u64::from(u32::MAX));
         assert_eq!(restored.exchange_timestamp, u32::MAX);
         assert_eq!(restored.received_at_nanos, i64::MAX);
     }
@@ -5499,7 +5508,7 @@ mod tests {
             let mut writer = BufWriter::new(file);
             for i in 0..tick_count as u32 {
                 let tick = ParsedTick {
-                    security_id: i,
+                    security_id: u64::from(i),
                     exchange_segment_code: 2,
                     last_traded_price: 24500.0 + i as f32 * 0.05,
                     last_trade_quantity: 75,
@@ -5532,7 +5541,7 @@ mod tests {
                     Ok(()) => {
                         let tick = deserialize_tick(&record);
                         assert_eq!(
-                            tick.security_id, read_count as u32,
+                            tick.security_id, read_count as u64,
                             "tick {read_count}: security_id must match"
                         );
                         assert_eq!(
@@ -5597,7 +5606,7 @@ mod tests {
 
         for i in 0..total_ticks as u32 {
             let tick = ParsedTick {
-                security_id: i,
+                security_id: u64::from(i),
                 exchange_segment_code: 2,
                 last_traded_price: 24500.0 + i as f32 * 0.01,
                 exchange_timestamp: 1_740_556_500 + i,
@@ -5654,7 +5663,7 @@ mod tests {
                     Ok(()) => {
                         let tick = deserialize_tick(&record);
                         // Spilled ticks are the OVERFLOW ticks (id >= TICK_BUFFER_CAPACITY).
-                        let expected_id = (TICK_BUFFER_CAPACITY + read_count) as u32;
+                        let expected_id = (TICK_BUFFER_CAPACITY + read_count) as u64;
                         assert_eq!(
                             tick.security_id, expected_id,
                             "spilled tick {read_count}: id must be {expected_id}"
@@ -5746,7 +5755,7 @@ mod tests {
         let phase1_ticks = 50_usize;
         for i in 0..phase1_ticks as u32 {
             let tick = ParsedTick {
-                security_id: i,
+                security_id: u64::from(i),
                 exchange_segment_code: 2,
                 last_traded_price: 24500.0 + i as f32 * 0.05,
                 exchange_timestamp: 1_740_556_500 + i,
@@ -5783,7 +5792,7 @@ mod tests {
         let phase2_ticks = 200_usize;
         for i in 0..phase2_ticks as u32 {
             let tick = ParsedTick {
-                security_id: phase1_ticks as u32 + i,
+                security_id: u64::from(phase1_ticks as u32 + i),
                 exchange_segment_code: 2,
                 last_traded_price: 25000.0 + i as f32 * 0.05,
                 exchange_timestamp: 1_740_560_000 + i,
@@ -5882,7 +5891,7 @@ mod tests {
 
         for i in 0..total_ticks as u32 {
             let tick = ParsedTick {
-                security_id: i,
+                security_id: u64::from(i),
                 exchange_segment_code: 2,
                 last_traded_price: 24500.0 + i as f32 * 0.01,
                 exchange_timestamp: 1_740_556_500 + i,
@@ -5968,7 +5977,7 @@ mod tests {
         let phase1_count = 100_usize;
         for i in 0..phase1_count as u32 {
             let tick = ParsedTick {
-                security_id: i,
+                security_id: u64::from(i),
                 exchange_segment_code: 2,
                 last_traded_price: 24500.0 + i as f32 * 0.05,
                 exchange_timestamp: 1_740_556_500 + i,
@@ -6009,7 +6018,7 @@ mod tests {
         let phase2_count = 500_usize;
         for i in 0..phase2_count as u32 {
             let tick = ParsedTick {
-                security_id: phase1_count as u32 + i,
+                security_id: u64::from(phase1_count as u32 + i),
                 exchange_segment_code: 2,
                 last_traded_price: 25000.0 + i as f32 * 0.1,
                 exchange_timestamp: 1_740_560_000 + i,
@@ -6147,7 +6156,7 @@ mod tests {
             let mut w = BufWriter::new(f);
             for i in 0..disk_tick_count as u32 {
                 let tick = ParsedTick {
-                    security_id: i,
+                    security_id: u64::from(i),
                     exchange_segment_code: 2,
                     last_traded_price: 24500.0 + i as f32 * 0.01,
                     exchange_timestamp: 1_740_556_500 + i,
@@ -6175,7 +6184,7 @@ mod tests {
             match reader.read_exact(&mut record) {
                 Ok(()) => {
                     let tick = deserialize_tick(&record);
-                    assert_eq!(tick.security_id, verified as u32);
+                    assert_eq!(tick.security_id, verified as u64);
                     assert_eq!(tick.exchange_timestamp, 1_740_556_500 + verified as u32);
                     verified += 1;
                 }
@@ -6262,7 +6271,7 @@ mod tests {
         // Verify the rescued ticks have correct data.
         for (i, tick) in writer.tick_buffer.iter().enumerate() {
             assert_eq!(
-                tick.0.security_id, i as u32,
+                tick.0.security_id, i as u64,
                 "rescued tick {i}: security_id must match"
             );
         }
@@ -6821,7 +6830,7 @@ mod tests {
         let total = TICK_BUFFER_CAPACITY + overflow;
         for i in 0..total as u32 {
             writer.buffer_tick(ParsedTick {
-                security_id: i,
+                security_id: u64::from(i),
                 exchange_segment_code: 2,
                 last_traded_price: 24500.0,
                 exchange_timestamp: 1_740_556_500 + i,
@@ -6878,7 +6887,7 @@ mod tests {
             let mut file = std::fs::File::create(&stale_path).unwrap();
             for i in 0..5_u32 {
                 let tick = ParsedTick {
-                    security_id: i,
+                    security_id: u64::from(i),
                     exchange_segment_code: 2,
                     last_traded_price: 24500.0 + i as f32,
                     exchange_timestamp: 1_740_556_500 + i,

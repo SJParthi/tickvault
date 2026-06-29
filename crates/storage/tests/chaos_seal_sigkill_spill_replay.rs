@@ -48,7 +48,7 @@ fn mk_serialized(i: usize) -> SerializedSeal {
     state.bucket_start_cumulative = 1000;
     state.oi = 50_000 + i as i64;
     state.tick_count = 5;
-    let buffered = BufferedSeal::new((i % 11_000) as u32 + 1, 0, TfIndex::M1, state, Feed::Dhan);
+    let buffered = BufferedSeal::new((i % 11_000) as u64 + 1, 0, TfIndex::M1, state, Feed::Dhan);
     SerializedSeal::from(&buffered)
 }
 
