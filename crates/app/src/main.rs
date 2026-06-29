@@ -7107,6 +7107,38 @@ struct DhanLaneRunHandles {
     lane_halt_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
+/// Defense-in-depth (H8 no-leak floor): if a `DhanLaneRunHandles` is dropped
+/// WITHOUT going through `teardown_dhan_lane_tasks` (which destructures it by
+/// value, leaving this Drop a no-op), fire the shutdown notify + abort every
+/// owned task so the live WebSocket pool can NEVER silently DETACH. Without this,
+/// dropping the `Vec<JoinHandle>` would detach (leak) the spawned WS-pool tasks
+/// — the exact failure of the disable-during-cold-start race. Drop is sync-safe:
+/// `notify_waiters` + `JoinHandle::abort` are non-blocking, hold no lock, do no
+/// `.await`, so there is no deadlock or double-abort hazard (abort on an already
+/// finished/aborted handle is a no-op).
+impl Drop for DhanLaneRunHandles {
+    fn drop(&mut self) {
+        // Stop the pool watchdog polling first (prevents a false-positive Halt
+        // during this implicit teardown), mirroring `teardown_dhan_lane_tasks`.
+        self.shutdown_notify.notify_waiters();
+        for handle in &self.ws_handles {
+            handle.abort();
+        }
+        if let Some(handle) = self.processor_handle.as_ref() {
+            handle.abort();
+        }
+        if let Some(handle) = self.renewal_handle.as_ref() {
+            handle.abort();
+        }
+        if let Some(handle) = self.order_update_handle.as_ref() {
+            handle.abort();
+        }
+        if let Some(handle) = self.trading_handle.as_ref() {
+            handle.abort();
+        }
+    }
+}
+
 /// Teardown of the Dhan-lane runtime tasks ONLY (renewal → order-update →
 /// graceful WS close → tick-processor flush → trading pipeline).
 ///
@@ -7118,26 +7150,36 @@ struct DhanLaneRunHandles {
 ///
 /// Order matches the old `run_shutdown_fast` steps 1–5 exactly so boot
 /// behaviour is preserved.
-async fn teardown_dhan_lane_tasks(lane: DhanLaneRunHandles) {
-    let DhanLaneRunHandles {
-        ws_handles,
-        processor_handle,
-        renewal_handle,
-        order_update_handle,
-        trading_handle,
-        ws_pool_arc,
-        shutdown_notify,
-        // H7: consumed by the parked task's `select!`, not needed during teardown.
-        lane_halt_notify: _,
-    } = lane;
+async fn teardown_dhan_lane_tasks(mut lane: DhanLaneRunHandles) {
+    // CANCEL-SAFETY (hostile-review CRITICAL fix): this future itself can be
+    // dropped MID-FLIGHT — the runtime cold-start's lost-CAS branch calls this
+    // and is concurrently `.abort()`ed by the supervisor (Starting→Off won). If
+    // it is dropped during the graceful 2s WS drain BELOW (an `.await`) the
+    // WebSocket `JoinHandle`s must STILL be aborted, or the live pool DETACHES
+    // (the exact H8/H6 leak this whole change exists to close).
+    //
+    // The guarantee: the WS `JoinHandle`s stay INSIDE `lane` (which implements
+    // the H8 `Drop` abort-floor) across every `.await` until the instant they
+    // are legitimately consumed by `supervise_pool`. So if this future is
+    // dropped before that consumption, `lane`'s `Drop` aborts them. After the
+    // graceful drain we `mem::take` them out and `supervise_pool` owns them
+    // (and the supervisor itself runs to completion — there is no further
+    // mid-flight drop hazard once we are past the only pre-consumption await).
+    //
+    // `DhanLaneRunHandles` implements `Drop`, so fields cannot be moved out by
+    // destructuring (E0509). The fields consumed AFTER an `.await`
+    // (`ws_handles`, `processor_handle`, `trading_handle`) are `take`n out only
+    // at their point of use, so `lane`'s Drop guards them until then. The fields
+    // consumed BEFORE any `.await` are taken out immediately (already aborted on
+    // a later drop — no leak). `Arc` fields are cheaply cloned.
 
-    // 1. Stop token renewal.
-    if let Some(handle) = renewal_handle {
+    // 1. Stop token renewal (no `.await` before this — safe to take + abort now).
+    if let Some(handle) = lane.renewal_handle.take() {
         handle.abort();
     }
 
-    // 2. Abort order update WebSocket.
-    if let Some(handle) = order_update_handle {
+    // 2. Abort order update WebSocket (still no `.await` — safe).
+    if let Some(handle) = lane.order_update_handle.take() {
         handle.abort();
     }
 
@@ -7147,8 +7189,11 @@ async fn teardown_dhan_lane_tasks(lane: DhanLaneRunHandles) {
     //    connections are skipped. Also fires shutdown_notify so the pool
     //    watchdog stops polling (prevents false-positive Halt during
     //    intentional teardown).
-    shutdown_notify.notify_waiters();
-    if let Some(ref pool) = ws_pool_arc {
+    //
+    //    `ws_handles` stays in `lane` across this `.await`: a mid-sleep cancel
+    //    drops `lane` → its `Drop` aborts every WS handle (no detach).
+    lane.shutdown_notify.notify_waiters();
+    if let Some(pool) = lane.ws_pool_arc.clone() {
         let signalled = pool.request_graceful_shutdown();
         info!(
             connections_signalled = signalled,
@@ -7163,6 +7208,12 @@ async fn teardown_dhan_lane_tasks(lane: DhanLaneRunHandles) {
     // supervisor to drain any final exits with structured ERROR logs +
     // metric increments for tasks that panicked / errored vs exited
     // cleanly. Bounded by 5s so a hung handle does not stall shutdown.
+    //
+    // Take `ws_handles` out of `lane` ONLY now, past the graceful-drain await:
+    // they are aborted on the same synchronous run as `supervise_pool` consuming
+    // them, so there is no await between the take and the consumption — no
+    // mid-flight-drop leak window for these handles.
+    let ws_handles = std::mem::take(&mut lane.ws_handles);
     let abort_handles: Vec<_> = ws_handles
         .iter()
         .map(tokio::task::JoinHandle::abort_handle)
@@ -7181,8 +7232,9 @@ async fn teardown_dhan_lane_tasks(lane: DhanLaneRunHandles) {
     )
     .await;
 
-    // 4. Wait for tick processor final flush.
-    if let Some(handle) = processor_handle {
+    // 4. Wait for tick processor final flush. Take it out only here, past the
+    //    WS drain; a drop before this point leaves it in `lane` → Drop aborts it.
+    if let Some(handle) = lane.processor_handle.take() {
         let shutdown_timeout = std::time::Duration::from_secs(
             tickvault_common::constants::GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
         );
@@ -7197,10 +7249,14 @@ async fn teardown_dhan_lane_tasks(lane: DhanLaneRunHandles) {
         }
     }
 
-    // 5. Stop trading pipeline.
-    if let Some(handle) = trading_handle {
+    // 5. Stop trading pipeline (taken out only at its point of use; guarded by
+    //    `lane`'s Drop until here).
+    if let Some(handle) = lane.trading_handle.take() {
         handle.abort();
     }
+    // H7: `lane_halt_notify` is consumed by the parked task's `select!`, not
+    // needed during teardown — left in `lane` (it is not a JoinHandle, so Drop
+    // does not touch it). `lane` drops here as a no-op (all handle fields taken).
 }
 
 // ===========================================================================
@@ -7704,15 +7760,62 @@ pub async fn run_dhan_lane_cold_start(ctx: std::sync::Arc<DhanLaneRuntimeContext
 
         match start_dhan_lane(lane_ctx).await {
             Ok(handles) => {
-                // Phantom-running closure: Running + pool-present + lane-running
-                // are set ONLY here, after the pool genuinely spawned.
+                // Phantom-running closure + disable-during-cold-start race fix:
+                // ALL success side-effects (pool-present + lane-running + the
+                // "started" Telegram + park) are gated on this CAS WINNING
+                // `Starting→Running`. The supervisor can win an
+                // `advance_dhan_lane(StartCancelled)` (Starting→Off) in the
+                // sub-second window where `start_dhan_lane` is returning `Ok`
+                // (operator disabled Dhan mid-cold-start). In that case THIS CAS
+                // is `(Off, StartSucceeded)` → `None` (the FSM is total + rejects
+                // it), and we must NOT mark the lane running, must NOT fire a
+                // phantom "Dhan started" UI, and must NOT park the pool. Parking
+                // it would drop the just-spawned `DhanLaneRunHandles` on the
+                // supervisor's `.abort()` and DETACH (leak) the live WS pool while
+                // the FSM reads `Off` (violates H6 join-before-Off + H8 no-leak).
                 if ctx
                     .feed_runtime
                     .advance_dhan_lane(LaneEvent::StartSucceeded)
-                    == Some(LaneState::Running)
+                    != Some(LaneState::Running)
                 {
-                    record_dhan_lane_transition(LaneState::Starting, LaneState::Running);
+                    // Lost the Starting→Off race to the supervisor's
+                    // StartCancelled. The FSM is already `Off`; gracefully close
+                    // (RequestCode-12 unsubscribe + shutdown_notify) and JOIN the
+                    // just-spawned pool via the bounded lane-scoped teardown — the
+                    // SAME teardown the operator-disable path uses — so no pool
+                    // leaks. Then drop the live token-manager (idempotent) and
+                    // return; the supervisor re-cold-starts the lane if Dhan is
+                    // re-enabled.
+                    info!(
+                        "[dhan-lane] cold-start lost the Starting→Off race to the supervisor \
+                         (StartCancelled won) — tearing down the just-spawned pool instead of \
+                         parking it (no leak, no phantom 'Dhan started')"
+                    );
+                    let teardown = teardown_dhan_lane_tasks(handles);
+                    if tokio::time::timeout(
+                        std::time::Duration::from_secs(DHAN_LANE_TEARDOWN_DRAIN_TIMEOUT_SECS),
+                        teardown,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        let code =
+                            tickvault_common::error_code::ErrorCode::DhanLane04TeardownTimeout;
+                        error!(
+                            code = code.code_str(),
+                            severity = code.severity().as_str(),
+                            "[dhan-lane] lost-race teardown drain timed out — handles \
+                             force-aborted; lane stays Off"
+                        );
+                        metrics::counter!("tv_dhan_lane_teardown_forced_total").increment(1);
+                    }
+                    ctx.feed_runtime.set_dhan_lane_running(false);
+                    ctx.feed_runtime.clear_live_token_manager();
+                    return;
                 }
+                // We won the CAS: the lane is genuinely Running. Pool-present +
+                // lane-running are set ONLY here, after the pool genuinely spawned.
+                record_dhan_lane_transition(LaneState::Starting, LaneState::Running);
                 ctx.feed_runtime.mark_dhan_pool_present();
                 ctx.feed_runtime.set_dhan_lane_running(true);
                 info!(
@@ -8875,6 +8978,146 @@ mod tests {
         assert!(
             region.contains("ws_wal_replay_live_feed: Vec::new()"),
             "the runtime cold-start must use EMPTY WAL-replay buffers (no fast-arm cache entry)"
+        );
+    }
+
+    #[test]
+    fn runtime_cold_start_gates_side_effects_on_cas() {
+        // Disable-during-cold-start race source-scan: the `Ok(handles)` arm of
+        // the runtime cold-start MUST gate its success side-effects (mark-present
+        // / set-running / notify / park) on the `advance_dhan_lane(StartSucceeded)`
+        // CAS, and on LOSING that CAS (supervisor won Starting→Off) it MUST tear
+        // down the just-spawned pool via `teardown_dhan_lane_tasks` instead of
+        // parking it (which would leak the WS pool). Guard against a regression
+        // back to the unconditional mark+park.
+        let src = include_str!("main.rs");
+        let region_start = src
+            .find("async fn run_dhan_lane_cold_start")
+            .expect("run_dhan_lane_cold_start must exist");
+        let region_end = src
+            .find("async fn park_running_dhan_lane")
+            .expect("park_running_dhan_lane must exist");
+        let region = &src[region_start..region_end];
+        // The Ok-arm gates on the CAS NOT winning Running, then tears down.
+        assert!(
+            region.contains("advance_dhan_lane(LaneEvent::StartSucceeded)\n                    != Some(LaneState::Running)")
+                || region.contains("!= Some(LaneState::Running)"),
+            "the cold-start Ok arm must branch on the StartSucceeded CAS losing the Running race"
+        );
+        assert!(
+            region.contains("teardown_dhan_lane_tasks(handles)"),
+            "on the lost-CAS branch the cold-start must tear down (join) the just-spawned pool, \
+             not park + leak it"
+        );
+        // And the success side-effects (park + the 'Dhan started' notify) live
+        // AFTER the lost-race teardown's early return, i.e. they are reachable
+        // ONLY on the won-CAS path.
+        let park_idx = region
+            .find("park_running_dhan_lane(std::sync::Arc::clone(&ctx), handles)")
+            .expect("the cold-start must still park on the won-CAS path");
+        let teardown_idx = region
+            .find("teardown_dhan_lane_tasks(handles)")
+            .expect("lost-race teardown must exist");
+        assert!(
+            teardown_idx < park_idx,
+            "the lost-race teardown must precede the park (park is the won-CAS-only path)"
+        );
+    }
+
+    #[test]
+    fn teardown_keeps_ws_handles_in_lane_across_the_graceful_drain_await() {
+        // Cancel-safety (hostile-review CRITICAL) source-scan: the WS handles
+        // MUST be `mem::take`n out of `lane` only AFTER the graceful 2s drain
+        // `.await`, never before. Otherwise a mid-drain cancel of this future
+        // (the cold-start lost-CAS branch is concurrently `.abort()`ed by the
+        // supervisor) would drop the moved-out `ws_handles` un-aborted → the WS
+        // pool DETACHES. Keeping them in `lane` until past the await means a
+        // mid-drain drop runs `lane`'s `Drop` abort-floor instead.
+        let src = include_str!("main.rs");
+        let fn_start = src
+            .find("async fn teardown_dhan_lane_tasks")
+            .expect("teardown_dhan_lane_tasks must exist");
+        let fn_end = src[fn_start..]
+            .find("\n// ===")
+            .map(|i| fn_start + i)
+            .unwrap_or(src.len());
+        let body = &src[fn_start..fn_end];
+        let sleep_idx = body
+            .find("tokio::time::sleep(std::time::Duration::from_secs(2)).await")
+            .expect("the graceful 2s drain await must exist");
+        let take_idx = body
+            .find("std::mem::take(&mut lane.ws_handles)")
+            .expect("ws_handles must be taken out of lane (not destructured)");
+        assert!(
+            sleep_idx < take_idx,
+            "ws_handles must be taken out of `lane` ONLY AFTER the graceful drain await, so a \
+             mid-drain cancel triggers lane's Drop abort-floor instead of detaching the pool"
+        );
+    }
+
+    #[test]
+    fn dhan_lane_run_handles_has_drop_impl_aborting_pool() {
+        // H8 no-leak floor source-scan: `DhanLaneRunHandles` MUST implement Drop
+        // and that Drop MUST abort the ws pool handles (so an unexpected drop can
+        // never DETACH a live WS pool). Pins the defense-in-depth guard.
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("impl Drop for DhanLaneRunHandles"),
+            "DhanLaneRunHandles must implement Drop (the H8 no-leak floor)"
+        );
+        let drop_start = src
+            .find("impl Drop for DhanLaneRunHandles")
+            .expect("Drop impl must exist");
+        let drop_region = &src[drop_start..drop_start + 1200];
+        assert!(
+            drop_region.contains("for handle in &self.ws_handles")
+                && drop_region.contains(".abort()"),
+            "the Drop impl must abort every ws_handle so the WS pool cannot detach"
+        );
+        assert!(
+            drop_region.contains("self.shutdown_notify.notify_waiters()"),
+            "the Drop impl must fire the shutdown notify (stop the pool watchdog)"
+        );
+    }
+
+    #[tokio::test]
+    async fn dhan_lane_run_handles_drop_aborts_handles() {
+        // Behavioural proof of the H8 floor: a never-completing spawned task held
+        // in `ws_handles` is ABORTED (finished) shortly after the
+        // `DhanLaneRunHandles` is dropped — i.e. Drop tears down rather than
+        // detaches. Uses an abort_handle to observe finishedness after the drop.
+        let never = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        let abort_handle = never.abort_handle();
+        assert!(
+            !abort_handle.is_finished(),
+            "task should be running before drop"
+        );
+
+        let handles = super::DhanLaneRunHandles {
+            ws_handles: vec![never],
+            processor_handle: None,
+            renewal_handle: None,
+            order_update_handle: None,
+            trading_handle: None,
+            ws_pool_arc: None,
+            shutdown_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+            lane_halt_notify: None,
+        };
+        drop(handles);
+
+        // Give the runtime a moment to process the abort.
+        for _ in 0..50 {
+            if abort_handle.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            abort_handle.is_finished(),
+            "dropping DhanLaneRunHandles must abort (not detach) the live ws pool task"
         );
     }
 
