@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -442,6 +443,17 @@ def _backoff_secs(consecutive_failures: int, rate_limited: bool, retry_after) ->
     return delay * jitter
 
 
+# Belt-and-suspenders structural masks (2026-06-29 security fix). Even if a token
+# value is NOT in the `secrets` set (an unanticipated/refreshed shape), these
+# scrub anything secret-SHAPED so a NATS auth error / SDK DEBUG line can never
+# write the Groww bearer token to stderr → the Rust supervisor → CloudWatch.
+#   - JWT: three base64url segments joined by dots, starting `eyJ` (the b64 of
+#     `{"`). Groww/Dhan access tokens are JWTs (`eyJ...`).
+#   - LONG BEARER: a `Bearer <token>` header carrying a long opaque token.
+_JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}")
+_BEARER_RE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{16,}")
+
+
 def _redact(text: str, secrets) -> str:
     """Scrub known secret values out of a string before it is logged.
 
@@ -449,15 +461,142 @@ def _redact(text: str, secrets) -> str:
     access token / api_key, or echo the response body (security-review MEDIUM
     2026-06-19). We DO want the cause (status code, error message, SDK detail)
     for triage, so instead of dropping the whole detail we surface it with every
-    known secret value masked. Anything secret-shaped that we did not anticipate
-    is still a residual risk, so callers also cap the length.
+    known secret value masked. Two layers:
+      1. Exact-match every value in `secrets` (api_key, totp_secret, and — since
+         2026-06-29 — the live access token, kept current across refreshes).
+      2. Structural masks for any JWT-shaped / bearer-ish token even if it is NOT
+         in `secrets` (an unanticipated token shape), so the redaction is no
+         longer purely per-known-value. Callers also cap the length.
     """
     if not text:
         return text
     for secret in secrets:
         if secret:
             text = text.replace(secret, "***REDACTED***")
+    # Structural fallback — mask any JWT / bearer-shaped token we did NOT
+    # anticipate by exact value.
+    text = _JWT_RE.sub("***REDACTED_JWT***", text)
+    text = _BEARER_RE.sub(r"\1***REDACTED***", text)
     return text
+
+
+def _add_secret(secrets: list, value) -> None:
+    """Add `value` to the live redaction set if it is a non-empty new secret.
+
+    `secrets` is a MUTABLE list captured BY REFERENCE by the NATS reason hooks +
+    the reject poller, so adding the access token here (the moment it is acquired
+    / refreshed) makes those long-lived consumers mask it too — no re-arming
+    needed. Short values are skipped to avoid masking incidental substrings.
+    """
+    if value and len(value) >= 8 and value not in secrets:
+        secrets.append(value)
+
+
+class _RedactingLogFilter(logging.Filter):
+    """A logging.Filter that scrubs secrets out of SDK-emitted records.
+
+    The 2026-06-29 diagnostic turns the `growwapi` + `nats` SDK loggers ON at
+    DEBUG (stderr). Those records are emitted by THIRD-PARTY code through Python's
+    logging module, so they NEVER pass through our per-print-call _redact — an
+    auth/connect line the SDK logs at DEBUG (CONNECT frame, connect URL, exception
+    repr) could carry the access token / api_key / TOTP and the Rust supervisor
+    forwards it verbatim to CloudWatch. This filter intercepts each record BEFORE
+    emit, fully materialises its message (msg % args), runs it through _redact
+    (exact-value masks for everything in `secrets` PLUS the structural JWT/bearer
+    masks), then replaces record.msg with the scrubbed text and clears record.args
+    so the handler emits ONLY the redacted form. Holding `secrets` by reference
+    means a later access-token addition applies retroactively. Returns True so the
+    (now-scrubbed) record is still emitted — diagnostics are preserved, secrets
+    are not. Never raises out of filter() (a redaction bug must not drop the line).
+    """
+
+    def __init__(self, secrets: list) -> None:
+        super().__init__()
+        self._secrets = secrets
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003 - logging API
+        try:
+            scrubbed = _redact(record.getMessage(), self._secrets)
+            record.msg = scrubbed
+            record.args = None
+            # A traceback can embed a credential in a frame's locals/repr. Scrub
+            # the cached formatted exception AND drop the raw exc_info 3-tuple so
+            # a formatter that renders exc_info fresh (when exc_text is not yet
+            # cached) cannot re-leak the unredacted traceback (security-review
+            # MEDIUM 2026-06-29). We keep a short, secret-free marker so the
+            # operator still sees that an exception was attached.
+            if record.exc_info is not None or getattr(record, "exc_text", None):
+                if getattr(record, "exc_text", None):
+                    record.exc_text = _redact(record.exc_text, self._secrets)
+                else:
+                    record.exc_text = "(exception detail suppressed by redaction)"
+                record.exc_info = None
+        except Exception:  # noqa: BLE001 - redaction must never drop a log line
+            record.msg = "groww sidecar: <log line suppressed; redaction failed>"
+            record.args = None
+        return True
+
+
+def _install_sdk_log_redaction(secrets: list) -> None:
+    """Scrub SDK-emitted log records before they reach stderr.
+
+    Belt-and-suspenders for the SDK-DEBUG-leak finding (2026-06-29): the
+    diagnostic that enables the `growwapi` + `nats` loggers at DEBUG would
+    otherwise route SDK-emitted records to stderr WITHOUT redaction. We attach the
+    redacting filter at the HANDLER level on the root logger (where basicConfig
+    put the stderr StreamHandler) — a handler-level filter runs for EVERY record
+    that reaches the handler, INCLUDING records that propagate up from arbitrary
+    SDK child loggers (e.g. `growwapi.feed`, `nats.aio.client`), which a
+    logger-level filter on the parent would miss. We ALSO add it directly on the
+    `growwapi`/`nats` loggers as a second layer (covers a future non-propagating
+    handler). Best-effort: any failure is logged (type only) and ignored — and if
+    we could not attach a handler filter at all, the SDK loggers are demoted to
+    WARNING so their unredacted per-frame DEBUG protocol/auth detail is simply not
+    emitted. The reject-reason surfacing (#1254) is OUR print() path, not the SDK
+    logger, so it is unaffected either way.
+    """
+    redactor = _RedactingLogFilter(secrets)
+    handler_attached = False
+    try:
+        root_handlers = list(logging.getLogger().handlers)
+        for h in root_handlers:
+            h.addFilter(redactor)
+            handler_attached = True
+    except Exception as exc:  # noqa: BLE001 - never break the feed
+        print(
+            f"groww sidecar: could not attach root-handler SDK-log redaction "
+            f"({type(exc).__name__})",
+            file=sys.stderr,
+            flush=True,
+        )
+    # Second layer: directly on the SDK loggers (covers records that do NOT
+    # propagate to a root handler).
+    for name in ("growwapi", "nats"):
+        try:
+            logging.getLogger(name).addFilter(redactor)
+        except Exception:  # noqa: BLE001 - never break the feed
+            pass
+    if not handler_attached:
+        # FALLBACK: no handler to scrub through → demote the noisy SDK loggers to
+        # WARNING so their unredacted DEBUG detail cannot reach stderr at all.
+        for name in ("growwapi", "nats"):
+            try:
+                logging.getLogger(name).setLevel(logging.WARNING)
+            except Exception:  # noqa: BLE001
+                pass
+        print(
+            "groww sidecar: SDK-log redaction could not attach a handler filter; "
+            "demoted growwapi+nats loggers to WARNING (no DEBUG leak)",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        print(
+            "groww sidecar: SDK-log redaction filter attached "
+            "(secrets scrubbed before emit)",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _exception_detail(exc, secrets, max_len: int = 1200) -> str:
@@ -856,7 +995,13 @@ def main() -> None:
     stock_list, index_list, sid_map = wait_for_subscriptions()
 
     # Secrets to mask out of any logged exception detail (never log their values).
-    secrets = (api_key, totp_secret)
+    # A MUTABLE list (not a tuple) so the access token can be added to it the
+    # moment it is acquired/refreshed (line ~886) and the NATS reason hooks +
+    # reject poller — which capture this object by reference — mask it too. Also
+    # installs a redacting logging.Filter on the SDK loggers so SDK-emitted DEBUG
+    # records are scrubbed structurally, not just our own print() lines.
+    secrets = [api_key, totp_secret]
+    _install_sdk_log_redaction(secrets)
 
     # Cached access token, reused across FEED reconnects so a feed-connect /
     # subscribe / consume failure does NOT re-hit the rate-limited token endpoint.
@@ -884,6 +1029,15 @@ def main() -> None:
             if access_token is None:
                 totp = pyotp.TOTP(totp_secret).now()
                 access_token = GrowwAPI.get_access_token(api_key=api_key, totp=totp)
+                # Add the freshly-acquired bearer token to the live redaction set
+                # (security fix 2026-06-29): a NATS-over-WS auth/handshake error's
+                # repr can embed the CONNECT frame / auth payload carrying this
+                # token, and the Rust supervisor forwards every sidecar stderr line
+                # to CloudWatch — so the token MUST be masked before it can be
+                # logged. The hooks/poller hold `secrets` by reference, so this also
+                # covers a refreshed token without re-arming. (The JWT-shape mask in
+                # _redact is the belt-and-suspenders backstop for any new shape.)
+                _add_secret(secrets, access_token)
                 # Explicit auth-success signal — distinguishes "auth succeeded, feed
                 # connect failed" from "auth failed". Log only the token LENGTH,
                 # never the token value.
@@ -1036,5 +1190,59 @@ def main() -> None:
             time.sleep(delay)
 
 
+def _selftest_redaction() -> None:
+    """Prove the redaction layers mask (a) a tuple value and (b) a JWT shape.
+
+    Guarded behind `--selftest` so it NEVER runs in prod (prod runs with no args
+    → main()). Run with: `python3 groww_sidecar.py --selftest`.
+    """
+    # (a) exact-value masking of a secret in the set (mutable-list path).
+    secrets = ["my-api-key-12345678", "TOTPSEEDABCDEF"]
+    token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJncm93dyJ9.s3cr3t-SIGNATURE_abcdef"
+    _add_secret(secrets, token)
+    assert token in secrets, "access token must be added to the live redaction set"
+
+    line = (
+        "NATS connect failed: CONNECT {\"auth_token\":\"my-api-key-12345678\"} "
+        f"bearer {token} url=wss://socket-api.groww.in"
+    )
+    red = _redact(line, secrets)
+    assert "my-api-key-12345678" not in red, "api_key value must be masked"
+    assert token not in red, "access token value must be masked"
+    assert "***REDACTED***" in red, "exact-value mask must fire"
+
+    # (b) structural JWT-shape masking even when the token is NOT in `secrets`.
+    unknown_jwt = "eyJ0eXAiOiJKV1QifQ.eyJ1aWQiOiI5OTkifQ.UNKNOWN-sig_0123456789"
+    red2 = _redact(f"auth error: token={unknown_jwt} expired", secrets=[])
+    assert unknown_jwt not in red2, "unanticipated JWT-shaped token must be masked"
+    assert "***REDACTED_JWT***" in red2, "structural JWT mask must fire"
+
+    # (c) the SDK logging filter scrubs a record BEFORE emit (structural path):
+    rec = logging.LogRecord(
+        name="growwapi.feed", level=logging.DEBUG, pathname=__file__, lineno=1,
+        msg="connecting with bearer %s", args=(token,), exc_info=None,
+    )
+    _RedactingLogFilter(secrets).filter(rec)
+    assert token not in rec.getMessage(), "SDK DEBUG record must be scrubbed"
+    assert rec.args is None, "args must be cleared after structural redaction"
+
+    # (d) the filter drops the raw exc_info 3-tuple so a fresh-render formatter
+    # cannot re-leak an unredacted traceback (security-review MEDIUM 2026-06-29).
+    try:
+        raise ValueError(f"boom token={token}")
+    except ValueError:
+        rec2 = logging.LogRecord(
+            name="nats.aio.client", level=logging.ERROR, pathname=__file__,
+            lineno=1, msg="connect failed", args=None, exc_info=sys.exc_info(),
+        )
+    _RedactingLogFilter(secrets).filter(rec2)
+    assert rec2.exc_info is None, "raw exc_info tuple must be cleared"
+
+    print("groww sidecar redaction self-test: PASS")
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--selftest":
+        _selftest_redaction()
+    else:
+        main()
