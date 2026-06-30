@@ -200,6 +200,15 @@ pub enum ErrorCode {
     /// no ticks reach the pipeline until the consumer/app restarts.
     /// Severity::High.
     WsGap07LiveChannelClosed,
+    /// WS-GAP-08: the Dhan-feed rate-limit (HTTP 429 / DATA-805 class)
+    /// cooldown is persisted to disk so it survives a `process::exit` +
+    /// supervisor restart. This variant tags two events: (a) a best-effort
+    /// persist-write failure at the 429 classification site (the in-memory
+    /// streak still applies for the running process), and (b) the boot-time
+    /// wait when a still-active persisted cooldown is honoured before the
+    /// first Dhan WS connect (preventing the instant-429 restart loop).
+    /// Severity::Low — the cooldown is an advisory, fail-open protection.
+    WsGap08RateLimitCooldown,
     /// DISK-WATCHER-01: the spill disk-health watcher task exited
     /// (panic/cancel) and the supervisor respawned it so free-space
     /// monitoring — the early-warning for the "disk full + QuestDB down"
@@ -655,6 +664,7 @@ impl ErrorCode {
             Self::WsGap05PoolRespawn => "WS-GAP-05",
             Self::WsGap06TickGapSummary => "WS-GAP-06",
             Self::WsGap07LiveChannelClosed => "WS-GAP-07",
+            Self::WsGap08RateLimitCooldown => "WS-GAP-08",
             Self::DiskWatcher01Respawned => "DISK-WATCHER-01",
             Self::WsSpill01WriterRespawn => "WS-SPILL-01",
             Self::WsSpill02FrameDropped => "WS-SPILL-02",
@@ -886,6 +896,7 @@ impl ErrorCode {
             | Self::HotPath02WriterQueueDrop
             | Self::WsGap04PostCloseSleep
             | Self::WsGap05PoolRespawn
+            | Self::WsGap08RateLimitCooldown
             | Self::DiskWatcher01Respawned
             | Self::AuthGap03TokenForceRenewedOnWake
             | Self::Telegram02CoalescerStateInconsistency => Severity::Low,
@@ -939,6 +950,7 @@ impl ErrorCode {
             | Self::WsGap05PoolRespawn
             | Self::WsGap06TickGapSummary
             | Self::WsGap07LiveChannelClosed
+            | Self::WsGap08RateLimitCooldown
             | Self::DiskWatcher01Respawned
             | Self::AuthGap03TokenForceRenewedOnWake
             | Self::Boot01QuestDbSlow
@@ -1125,6 +1137,7 @@ impl ErrorCode {
             Self::WsGap05PoolRespawn,
             Self::WsGap06TickGapSummary,
             Self::WsGap07LiveChannelClosed,
+            Self::WsGap08RateLimitCooldown,
             Self::DiskWatcher01Respawned,
             Self::WsSpill01WriterRespawn,
             Self::WsSpill02FrameDropped,
@@ -1466,7 +1479,9 @@ mod tests {
         // 2026-06-28 (PR-A Groww shared-master): bumped 105 -> 106 for
         // GROWW-MASTER-01 (Groww instrument persist into the shared
         // instrument_lifecycle + index_constituency tables, feed='groww').
-        assert_eq!(ErrorCode::all().len(), 106);
+        // 2026-06-30 (WS-429-cooldown): bumped 106 -> 107 for WS-GAP-08
+        // (persisted Dhan 429 rate-limit cooldown — survives process restart).
+        assert_eq!(ErrorCode::all().len(), 107);
     }
 
     #[test]
