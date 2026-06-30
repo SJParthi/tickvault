@@ -9,12 +9,12 @@
 # preserved across the upgrade.
 #
 # This is READY-TO-FIRE TOOLING, not an actual upgrade. The instance-type
-# LOCK stays m8g.large everywhere (Terraform validation +
-# instance_type_lock_guard.rs). Flipping the lock to a bigger type (e.g.
-# r8g.large) requires a dated operator quote + the 4-file lock update FIRST
-# (see daily-universe-scope-expansion-2026-05-27.md §7 Mechanical Rule 1).
-# This script merely lets the operator EXECUTE that flip safely once it is
-# authorized — the safe defaults below are the current locked types.
+# LOCK is r8g.large everywhere (Terraform validation +
+# instance_type_lock_guard.rs) per operator Quote 7 (2026-06-30). Flipping the
+# lock to a different type requires a dated operator quote + the 4-file lock
+# update FIRST (see daily-universe-scope-expansion-2026-05-27.md §7 Mechanical
+# Rule 1). This script merely lets the operator EXECUTE the m8g.large →
+# r8g.large flip safely — the safe defaults below are the current locked types.
 #
 # What it does (each step idempotent / guarded):
 #   1. Discover the instance by Name tag `tv-${ENV}-app` (default env=prod).
@@ -57,8 +57,8 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 ENV="${TV_ENV:-prod}"
 REGION="${AWS_REGION:-ap-south-1}"          # ap-south-1 Mumbai per aws-budget.md
-FROM_TYPE="${FROM_TYPE:-t4g.medium}"        # current locked default (overridable)
-TO_TYPE="${TO_TYPE:-m8g.large}"             # operator lock 2026-05-29 §7 Quote 5
+FROM_TYPE="${FROM_TYPE:-m8g.large}"         # the prior locked type to flip FROM (overridable)
+TO_TYPE="${TO_TYPE:-r8g.large}"             # operator lock 2026-06-30 §7 Quote 7
 NAME_TAG="tv-${ENV}-app"
 
 # Allowlist of upgrade targets. Adding a new type here is NOT the same as

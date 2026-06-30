@@ -25,13 +25,13 @@ variable "environment" {
 }
 
 variable "instance_type" {
-  description = "EC2 instance type. MUST be m8g.large per operator lock 2026-05-29 (Graviton4, 8 GiB, $0.06416/hr ap-south-1; see daily-universe-scope-expansion-2026-05-27.md §7 Quote 5, which supersedes the 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks)."
+  description = "EC2 instance type. MUST be r8g.large per operator lock 2026-06-30 (Graviton4, 2 vCPU / 16 GiB, $0.08258/hr ap-south-1; see daily-universe-scope-expansion-2026-05-27.md §7 Quote 7, which supersedes the 2026-05-29 m8g.large + 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks)."
   type        = string
-  default     = "m8g.large"
+  default     = "r8g.large"
 
   validation {
-    condition     = var.instance_type == "m8g.large"
-    error_message = "Instance type is pinned to m8g.large (Graviton4, 8 GiB) per operator lock 2026-05-29 (Quote 5). 8 GiB at 2 vCPU needs the m-family 4:1 ratio (c8g=4 GiB too small, r8g=16 GiB wasteful). This SUPERSEDES the 2026-05-27 t4g.large lock. See daily-universe-scope-expansion-2026-05-27.md section 7."
+    condition     = var.instance_type == "r8g.large"
+    error_message = "Instance type is pinned to r8g.large (Graviton4, 16 GiB) per operator lock 2026-06-30 (Quote 7) — DOUBLED RAM from m8g.large for the both-feeds + larger-universe workload. This SUPERSEDES the 2026-05-29 m8g.large lock. See daily-universe-scope-expansion-2026-05-27.md section 7."
   }
 }
 
