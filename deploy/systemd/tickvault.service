@@ -50,6 +50,17 @@ WorkingDirectory=/opt/tickvault
 # tv-questdb` + `df -h`).
 ExecStartPre=-/bin/bash /opt/tickvault/repo/scripts/ensure-questdb.sh
 
+# Boot can legitimately exceed systemd's default 90s TimeoutStartSec: the app
+# is Type=notify and only sends READY=1 AFTER its own boot gates complete —
+# QuestDB readiness (BOOT-01/BOOT-02), then the infinite-retry daily-universe
+# cold build (CSV fetch + NTM resolve + ~767-row lifecycle reconcile). On the
+# first-of-day cold boot that whole chain routinely runs past 90s, so the
+# default timer would SIGTERM a healthy boot mid-build, producing a crash-loop.
+# The app's OWN gates decide boot failure (they HALT + page on a real fault);
+# systemd's blunt 90s timer must not pre-empt them. Restart=always (below) still
+# restarts a genuine crash that happens AFTER READY=1.
+TimeoutStartSec=infinity
+
 # Auto-restart on ANY failure. RestartSec prevents tight restart loops.
 Restart=always
 RestartSec=3

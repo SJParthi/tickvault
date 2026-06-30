@@ -290,12 +290,17 @@ jobs:
         #   B. The box is intentionally stopped (overnight / weekend push,
         #      outside the up-window). Do NOT start it (would bill ~₹2/hr off-
         #      schedule, breaching the budget lock). Skip the deploy: set
-        #      DEPLOY_SKIP_REASON so the failure-notify + auto-stop steps below
-        #      stay SILENT (no Telegram spam), then exit non-zero so this run is
-        #      NOT recorded as a successful deploy — the 08:45 IST pre-market
-        #      cron (deploy-aws-after-close) redeploys the same commit once the
-        #      box is up. Honest envelope: an off-hours push shows a red Actions
-        #      run (correct — "couldn't deploy, box is down") but pages nobody.
+        #      DEPLOY_SKIP_REASON so EVERY downstream step (S3 upload, SSM swap,
+        #      monitor, notify, auto-stop) no-ops via its `env.DEPLOY_SKIP_REASON
+        #      == ''` guard and stays SILENT (no Telegram spam), then exit ZERO so
+        #      this intentional skip is recorded GREEN — a deliberate no-op is not
+        #      a deploy FAILURE. The 08:45 IST pre-market cron (deploy-aws-after-
+        #      close) redeploys the same commit once the box is up. Honest
+        #      envelope: an off-hours push shows a GREEN Actions run that did
+        #      nothing-on-purpose (correct — "nothing to deploy, box is down by
+        #      design") and pages nobody. A GENUINE deploy error (box up, smoke
+        #      test failed, SSM error) leaves DEPLOY_SKIP_REASON empty and still
+        #      fails RED + pages, so real-failure detection is unchanged.
         env:
           REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
           IID: ${{ secrets.EC2_INSTANCE_ID }}
@@ -338,7 +343,12 @@ jobs:
           if [ "$SHOULD_BE_UP" != "yes" ]; then
             echo "DEPLOY_SKIP_REASON=intentional_stopped" >> "$GITHUB_ENV"
             echo "::notice::Box is intentionally stopped (outside 08:30-16:30 IST Mon-Fri up-window) and this is an auto push — skipping deploy without paging. The 08:45 IST pre-market cron will redeploy this commit once the box is up."
-            exit 1
+            # Exit ZERO: an intentional skip is a deliberate no-op, not a deploy
+            # failure. DEPLOY_SKIP_REASON is now set, so every downstream step
+            # below is gated `if: env.DEPLOY_SKIP_REASON == ''` and cleanly no-ops
+            # (no SSM against a down box, no false success/failure Telegram). The
+            # run is GREEN. A real failure (box up + error) never reaches here.
+            exit 0
           fi
 
           echo "box stopped but SHOULD be up — starting it (EventBridge start likely failed)"
@@ -376,6 +386,9 @@ jobs:
           echo "instance started + SSM Online — proceeding with deploy"
 
       - name: Verify /tickvault/prod/* secrets present (read-only; operator-populated)
+        # Skipped on an intentional off-hours skip (box stopped on purpose) — the
+        # whole deploy is a no-op; nothing to verify against a down box.
+        if: env.DEPLOY_SKIP_REASON == ''
         # Single real env (operator 2026-06-30): the systemd unit sets
         # TV_ENVIRONMENT=prod, so the app reads SSM at /tickvault/prod/{service}/{key}.
         # The operator populates /tickvault/prod/* MANUALLY, so this step DOES NOT
@@ -413,6 +426,8 @@ jobs:
           fi
 
       - name: Upload both binaries to S3 deploy bucket
+        # Skipped on an intentional off-hours skip — no deploy is happening.
+        if: env.DEPLOY_SKIP_REASON == ''
         run: |
           chmod +x ./dist/tickvault ./dist/smoke_test
           aws s3 cp ./dist/tickvault \
@@ -423,6 +438,10 @@ jobs:
             --region ${{ vars.AWS_REGION || 'ap-south-1' }}
 
       - name: Re-gate market hours at SWAP time (no mid-session restart)
+        # Skipped on an intentional off-hours skip (box down on purpose) — there
+        # is no swap to gate. (This step itself may set a DIFFERENT skip reason,
+        # market_hours_swap_abort, for the build-crossed-the-open case below.)
+        if: env.DEPLOY_SKIP_REASON == ''
         # ROOT-CAUSE FIX 2026-06-02 (incident #2): the `guard_market_hours`
         # job checks the clock at JOB START. PR #971 merged at 09:11:21 IST
         # (4 min before the 09:15 open), passed that guard, then the ~4-5 min
@@ -456,6 +475,9 @@ jobs:
           echo "outside market hours ($HHMM IST, dow=$DOW) — safe to swap"
 
       - name: Run SSM command — download binaries + smoke test + atomic swap
+        # Skipped on an intentional off-hours skip — send-command can't reach a
+        # stopped box (InvalidInstanceId), and there is nothing to deploy.
+        if: env.DEPLOY_SKIP_REASON == ''
         # Target path is /opt/tickvault (matches user-data.sh.tftpl step 4).
         # Smoke test is a SEPARATE binary (crates/app/src/bin/smoke_test.rs),
         # NOT a subcommand of `tickvault`. The previous version
@@ -600,6 +622,8 @@ jobs:
           echo "command_id=$CMD_ID" >> $GITHUB_OUTPUT
 
       - name: Wait for SSM command completion
+        # Skipped on an intentional off-hours skip — no SSM command was sent.
+        if: env.DEPLOY_SKIP_REASON == ''
         # continue-on-error so the box-side output is ALWAYS fetched + printed
         # below, even when the on-box script fails (smoke test, git refresh,
         # systemctl, etc.). Without this the failure reason was hidden — the
@@ -673,6 +697,9 @@ jobs:
 
 
       - name: Monitor first 60 seconds for crashes
+        # Skipped on an intentional off-hours skip — nothing was deployed to the
+        # (stopped) box, so there is no fresh process to monitor.
+        if: env.DEPLOY_SKIP_REASON == ''
         run: |
           REGION="${{ vars.AWS_REGION || 'ap-south-1' }}"
           IID="${{ secrets.EC2_INSTANCE_ID }}"
@@ -748,7 +775,12 @@ jobs:
           echo "DEPLOY VERIFIED: tickvault has been active for 60s"
 
       - name: Notify Telegram on success
-        if: success()
+        # ANTI-FALSE-OK: an intentional off-hours skip now exits the deploy job
+        # GREEN (see the "Ensure instance running" step), so `success()` alone
+        # would fire a "✅ deployed" Telegram for a run that deployed NOTHING.
+        # Gate on DEPLOY_SKIP_REASON == '' so the skip stays silent — a real
+        # deploy (skip reason empty) still pages success as before.
+        if: success() && env.DEPLOY_SKIP_REASON == ''
         run: |
           # The SNS topic has a Telegram webhook subscription; publish a
           # plain-English message so the operator sees the deploy land clearly.
