@@ -74,6 +74,28 @@ variable "ebs_gp3_size_gb" {
   }
 }
 
+variable "ebs_gp3_iops" {
+  description = "Root gp3 EBS provisioned IOPS. 3000 is the gp3 baseline (free, included). Range 3000-16000 — raise alongside throughput when the QuestDB write/read load grows (e.g. both feeds at ~2K SIDs). scripts/aws-upgrade-instance.sh can bump this online (no stop) via aws ec2 modify-volume, then this var keeps Terraform in sync so a later apply does not revert it."
+  type        = number
+  default     = 3000
+
+  validation {
+    condition     = var.ebs_gp3_iops >= 3000 && var.ebs_gp3_iops <= 16000
+    error_message = "ebs_gp3_iops must be 3000-16000 (gp3 range; 3000 is the free baseline)."
+  }
+}
+
+variable "ebs_gp3_throughput" {
+  description = "Root gp3 EBS throughput in MiB/s. 125 is the gp3 baseline (free, included). Range 125-1000 — raise alongside IOPS for heavier QuestDB I/O. scripts/aws-upgrade-instance.sh can bump this online (no stop) via aws ec2 modify-volume; keep this var in sync afterwards."
+  type        = number
+  default     = 125
+
+  validation {
+    condition     = var.ebs_gp3_throughput >= 125 && var.ebs_gp3_throughput <= 1000
+    error_message = "ebs_gp3_throughput must be 125-1000 MiB/s (gp3 range; 125 is the free baseline)."
+  }
+}
+
 variable "key_name" {
   description = "Name of the existing EC2 key pair for SSH. Operator creates via `aws ec2 create-key-pair`."
   type        = string

@@ -289,8 +289,8 @@ resource "aws_instance" "tv_app" {
   root_block_device {
     volume_type           = "gp3"
     volume_size           = var.ebs_gp3_size_gb
-    iops                  = 3000
-    throughput            = 125
+    iops                  = var.ebs_gp3_iops
+    throughput            = var.ebs_gp3_throughput
     encrypted             = true
     delete_on_termination = false
     tags = {
