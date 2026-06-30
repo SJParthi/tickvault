@@ -20,7 +20,9 @@ set -uo pipefail
 
 REGION="${AWS_REGION:-ap-south-1}"
 INSTANCE_ID="${EC2_INSTANCE_ID:-}"
-ENVIRONMENT="${TV_ENVIRONMENT:-staging}"
+# Single real env (operator 2026-06-30): default prod. NO real orders —
+# production.toml locks dry_run=true.
+ENVIRONMENT="${TV_ENVIRONMENT:-prod}"
 STRICT="${STRICT:-no}"
 
 if [ -z "$INSTANCE_ID" ]; then
@@ -226,7 +228,7 @@ if [ "$STATE" = "running" ]; then
     fi
   fi
 
-  # 6. Required SSM secrets present? (re-seed from dev if any staging key missing)
+  # 6. Required SSM secrets present? (operator populates /tickvault/prod/* manually)
   NEED=("dhan/client-id" "dhan/totp-secret" "questdb/pg-password" "telegram/bot-token" "api/bearer-token")
   MISSING=()
   for k in "${NEED[@]}"; do
@@ -238,7 +240,7 @@ if [ "$STATE" = "running" ]; then
   if [ "${#MISSING[@]}" -eq 0 ]; then
     note_ok "all required SSM secrets present (/tickvault/${ENVIRONMENT}/*)"
   else
-    note_issue "missing SSM secrets: ${MISSING[*]} (run seed-staging-ssm workflow)"
+    note_issue "missing SSM secrets: ${MISSING[*]} (populate /tickvault/${ENVIRONMENT}/* manually via aws ssm put-parameter)"
   fi
 fi
 

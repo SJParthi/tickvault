@@ -65,15 +65,17 @@ fn validate_environment(env: &str) -> Result<String, ApplicationError> {
 
 /// Returns the SSM environment from the `TV_ENVIRONMENT` env var (preferred,
 /// set by the systemd unit on AWS), falling back to the legacy `ENVIRONMENT`
-/// var, then to `DEFAULT_SSM_ENVIRONMENT` ("dev").
+/// var, then to `DEFAULT_SSM_ENVIRONMENT` ("prod").
 ///
-/// Precedence (first non-empty wins): `TV_ENVIRONMENT` → `ENVIRONMENT` → `"dev"`.
+/// Precedence (first non-empty wins): `TV_ENVIRONMENT` → `ENVIRONMENT` → `"prod"`.
 /// Unifying on `TV_ENVIRONMENT` keeps the SSM secret prefix
 /// (`/tickvault/<env>/...`) consistent with the config-file env selection in
 /// `boot_helpers::resolve_config_env` — both read the same variable, so the
-/// deployed box's `TV_ENVIRONMENT=staging` drives BOTH the config merge and
-/// the SSM prefix. The legacy `ENVIRONMENT` fallback preserves existing local
-/// dev behaviour.
+/// deployed box's `TV_ENVIRONMENT=prod` drives BOTH the config merge and
+/// the SSM prefix. The default is `prod`: dev/staging were collapsed into the
+/// single prod env (operator 2026-06-30); NO real orders are placed —
+/// `production.toml` locks `dry_run=true`. The legacy `ENVIRONMENT` fallback
+/// is preserved.
 ///
 /// Validates that the environment string contains only alphanumeric
 /// characters and hyphens to prevent path traversal.
@@ -1119,13 +1121,16 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_environment_defaults_to_dev() {
-        // This test depends on ENVIRONMENT not being set, which is racy
-        // in parallel test execution. So just test the underlying validate_environment
-        // which is the core logic.
+    fn test_resolve_environment_defaults_to_prod() {
+        // Single-prod-env consolidation (operator 2026-06-30): the default SSM
+        // environment is now `prod` (dev/staging retired). This test depends on
+        // ENVIRONMENT not being set, which is racy in parallel test execution,
+        // so it tests the underlying validate_environment + the pinned default
+        // constant, which is the core logic.
         let result = validate_environment(DEFAULT_SSM_ENVIRONMENT);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "dev");
+        assert_eq!(result.unwrap(), "prod");
+        assert_eq!(DEFAULT_SSM_ENVIRONMENT, "prod");
     }
 
     #[test]

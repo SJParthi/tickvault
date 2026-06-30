@@ -793,6 +793,25 @@ rules:
       failure is best-effort (in-memory streak still applies). Silence;
       sustained recurrence is visible via tv_ws_rate_limit_cooldown_waited_total.
 
+  - name: ws-gap-09-watchdog-reconnect-in-place-silence
+    match:
+      code: WS-GAP-09
+    action: silence
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      WS-GAP-09 is the pool watchdog reconnecting IN PLACE on a benign
+      bare-Dhan-transport-RST class (every conn streak 0, no non-reconnectable
+      code, token valid, QuestDB reachable) instead of process::exit + a
+      775-SID cold re-subscribe that trips Dhan's per-IP 429. The common
+      reason="bare_dhan_reset" case is the system self-healing — Low severity,
+      no operator action. The rarer reason="ceiling_exceeded" (15-min
+      reconnect-in-place with zero frame recovery) falls back to the legacy
+      restart, which is already operator-visible via tv_pool_self_halts_total.
+      Silence; sustained recurrence is visible via
+      tv_ws_watchdog_reconnect_in_place_total.
+
   - name: disk-watcher-01-respawn-escalate
     match:
       code: DISK-WATCHER-01

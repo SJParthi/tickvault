@@ -44,7 +44,8 @@ permissions:
 
 env:
   AWS_REGION: ap-south-1
-  TV_ENVIRONMENT: staging
+  # Single real env (operator 2026-06-30): prod. NO real orders — dry_run=true.
+  TV_ENVIRONMENT: prod
 
 jobs:
   preflight:
