@@ -29,6 +29,9 @@
 - [x] R1 — pin docker compose arg order (compose subcommand first) regression guard (tickvault-app)
   - Files: crates/app/src/infra.rs
   - Tests: test_docker_compose_up_args_compose_subcommand_first
+- [x] Fix A no-op close (2026-06-30) — wire REAL production QuestDB-liveness into the reconnect-in-place gate (tickvault-app + tickvault-api)
+  - Files: crates/app/src/main.rs, crates/api/tests/health_questdb_reachable_wiring_guard.rs
+  - Tests: test_pool_watchdog_sets_questdb_reachable_from_production, test_questdb_reachable_round_trips, pool_watchdog_halt_arm_gates_process_exit_on_market_hours
 
 ## Design
 Two independent fixes stop the Dhan bare-RST → 5-min-Halt → `process::exit(2)`
@@ -64,6 +67,26 @@ do NOT exit — reset the episode timer, `pool.reset_watchdog()`, emit WS-GAP-09
 ceiling boundary is a pure `reconnect_in_place_ceiling_exceeded(elapsed_secs)`.
 Otherwise (ceiling exceeded OR genuinely-fatal class) → exit / lane-teardown
 exactly as today.
+
+### Design — Fix A no-op close (2026-06-30, rework)
+The shipped `is_bare_reset_class(healths, token_valid, questdb_reachable)` gate
+required `questdb_reachable == true`, but the backing `questdb_reachable`
+`AtomicBool` on `SystemHealthStatus` was set `true` ONLY in `#[cfg(test)]` code
+— so in production `health.questdb_reachable()` was permanently `false`, the gate
+always returned `false`, and the reconnect-in-place branch was DEAD (the watchdog
+still exited → the 429 restart storm still happened). The rework wires a REAL
+production signal: `spawn_pool_watchdog_task` now takes a `QuestDbConfig` and, on
+its existing 5s tick (the same tick that already pushes
+`set_websocket_connections`), probes QuestDB via the canonical
+`boot_probe::wait_for_questdb_ready` wrapped in a 2s `tokio::time::timeout` and
+calls `health.set_questdb_reachable(...)` with the live result. The probe runs
+every 5s INDEPENDENTLY of tick flow (a Dhan bare-RST storm stops ticks while
+QuestDB stays up — exactly when the gate must read it correctly). Both call sites
+(`crates/app/src/main.rs` BOOT-ON fast-boot + slow-boot/lane) pass
+`config.questdb.clone()`. The gate intent is preserved: reconnect-in-place engages
+ONLY when QuestDB is genuinely up; the `rate_limit_streak == 0` /
+`!saw_non_reconnectable` / `token_valid` conditions are untouched (429/805 still
+restart by design).
 
 ## Edge Cases
 Mixed 429+reset in one cycle → streak check fails → genuine-fatal (correct;
@@ -134,3 +157,53 @@ genuine-fatal Halt keeps its existing `WebSocketPoolHalt` Telegram.
 | 6 | In-place episode > 15 min, still zero frames | fall back to exit |
 | 7 | 5s session RST | Fix B floors first reconnect to 3s |
 | 8 | 5-min session drop | Fix B keeps 0ms instant first retry |
+| 9 | Fix-A no-op rework: prod boot, QuestDB up | watchdog 5s probe sets questdb_reachable=true; bare-reset gate can engage |
+| 10 | Fix-A no-op rework: QuestDB genuinely down at Halt | watchdog 2s probe times out → set_questdb_reachable(false) → gate false → genuine-fatal restart (correct) |
+| 11 | Fix-A no-op rework: ticks stopped (RST storm) but QuestDB up | 5s probe runs independent of tick flow → signal stays fresh → gate engages |
+
+### Edge Cases — Fix A no-op close (2026-06-30, rework)
+QuestDB probe times out (hung TCP connect) → 2s `tokio::time::timeout` returns
+`Err` → `is_ok_and(...)` is `false` → `set_questdb_reachable(false)` → the gate
+reads QuestDB-down → genuine-fatal restart (safe, never rides out a Halt while
+persistence is broken). Probe transiently fails for one 5s tick while QuestDB is
+actually up → that single tick reads false; the watchdog Halt only fires after
+300s all-down, by which time many 5s probes have run, so a one-off blip cannot
+mis-gate. The probe builds a fresh reqwest client per call (cold path, 5s cadence,
+not the hot tick path) — acceptable; mirrors the 10s SLO scheduler's existing
+`wait_for_questdb_ready` usage.
+
+### Failure Modes — Fix A no-op close (2026-06-30, rework)
+(6) Probe falsely reports QuestDB up while it is down → would let the gate ride
+out a Halt with broken persistence. Mitigated: the probe is a real `SELECT 1`
+against the same `/exec` endpoint the SLO scheduler + boot probe use; a 2s timeout
+bounds a hung connect; on ANY error/timeout the result is `false` (fail-safe toward
+restart). (7) `spawn_pool_watchdog_task` signature change breaks a call site →
+compile error caught at build; both sites updated in-PR. (8) Source-scan guard
+`test_pool_watchdog_sets_questdb_reachable_from_production` fails the build if the
+production `set_questdb_reachable` call site, the `QuestDbConfig` param, or the
+`wait_for_questdb_ready` probe is removed — so the dead-signal regression cannot
+recur.
+
+### Test Plan — Fix A no-op close (2026-06-30, rework)
+New guard `crates/api/tests/health_questdb_reachable_wiring_guard.rs`:
+`test_questdb_reachable_round_trips` (state setter/getter honesty),
+`test_pool_watchdog_sets_questdb_reachable_from_production` (source-scan: the
+production call site + `QuestDbConfig` param + `wait_for_questdb_ready` probe +
+the Halt arm reading `health.questdb_reachable()` into `is_bare_reset_class` all
+present). Existing `is_bare_reset_class` truth-table + ceiling tests + the
+`post_market_pool_halt_guard.rs` Halt-arm guards remain green. Gates: `cargo build`
++ `cargo test -p tickvault-app -p tickvault-api -p tickvault-storage`,
+banned-pattern, plan-verify, plan-gate.
+
+### Rollback — Fix A no-op close (2026-06-30, rework)
+Additive + self-contained: revert the `questdb_config` parameter + the 5s probe
+block + the two `config.questdb.clone()` call-site args + the new guard test →
+returns to the (no-op) shipped state. No schema, no migration, no persisted state.
+`git revert` of the rework commit is clean.
+
+### Observability — Fix A no-op close (2026-06-30, rework)
+No new counter/log/event — the rework only makes the EXISTING `WS-GAP-09`
+reconnect-in-place gate functional in production by feeding it the live
+`questdb_reachable` signal. `health.questdb_reachable()` now reflects true QuestDB
+state on `/health` + in the SLO/self-test paths that read it, and the bare-reset
+gate's QuestDB predicate is no longer a dead constant `false`.
