@@ -23,7 +23,22 @@
 # budget thought we were at 0%). Dropping the filter makes the budget measure
 # TOTAL account spend. Safe because this AWS account hosts ONLY tickvault.
 resource "aws_budgets_budget" "tv_monthly" {
-  name              = "tv-${var.environment}-monthly-budget"
+  # FORCE-RECREATE (2026-06-30): the AWS provider does NOT reliably diff/apply
+  # the REMOVAL of a `cost_filter` on an EXISTING budget. PR #1273 deleted the
+  # cost_filter block here and was terraform-applied, but the LIVE budget still
+  # filters on the inactive `Project=tickvault` cost-allocation tag → it reads
+  # ActualSpend ~$0 vs the real ~$36/mo total, so it is frozen at 0% and the
+  # 90%/100% STOP_EC2 kill actions can never fire (the killswitch is INERT).
+  # A plain `terraform apply` shows NO budget diff and will NOT fix it.
+  # The budget `name` is a ForceNew attribute, so renaming it makes terraform
+  # DESTROY the stale filtered budget and CREATE a fresh one. Since this code
+  # carries NO cost_filter block, the recreated budget measures TOTAL account
+  # spend (safe — this AWS account hosts ONLY tickvault) and the kill-switch
+  # reads real spend again. The 80/90/100% thresholds, the $55 limit, the
+  # STOP_EC2 action targets, and every internal reference (which use the
+  # `aws_budgets_budget.tv_monthly.name` attribute, not a hardcoded string)
+  # are preserved exactly — the actions re-bind automatically to the new name.
+  name              = "tv-${var.environment}-monthly-budget-v2"
   budget_type       = "COST"
   limit_amount      = "55"
   limit_unit        = "USD"
