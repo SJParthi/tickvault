@@ -324,10 +324,17 @@ mod tests {
 
     #[test]
     fn test_generic_writer_delegates_flush_disconnected() {
-        // Behaviour preserved: flush returns Err when disconnected.
+        // Behaviour change (2026-06-30 candle-reconnect): an EMPTY-buffer flush is
+        // a no-op Ok (nothing to persist → no reconnect, no error). This delegates
+        // to ShadowCandleWriter::flush, so it inherits the same semantics.
         let mut w = GenericCandle1mWriter::for_test(Feed::Dhan);
-        assert!(w.flush().is_err(), "disconnected flush must Err");
-        // With a pending row, flush still Errs and the row is retained.
+        assert!(
+            w.flush().is_ok(),
+            "empty-buffer flush is a no-op Ok, even disconnected"
+        );
+        // With a pending row, a disconnected flush still Errs (the for_test writer
+        // has an empty conf → reconnect fails) AND the row is RETAINED for the
+        // spill re-route — the zero-loss invariant the candle reconnect preserves.
         w.append_candle(&mk_seal_feed(
             13,
             EXCHANGE_SEGMENT_IDX_I,
@@ -336,7 +343,10 @@ mod tests {
             Feed::Dhan,
         ))
         .expect("append");
-        assert!(w.flush().is_err());
+        assert!(
+            w.flush().is_err(),
+            "flush with a pending row on a disconnected writer must Err"
+        );
         assert_eq!(
             w.pending_count(),
             1,

@@ -42,6 +42,7 @@
 //! is NOT a stored column (the canonical ms is the nanos `ts`).
 
 use anyhow::{Context, Result};
+use questdb::ErrorCode as QuestErrorCode;
 use questdb::ingress::{Buffer, ProtocolVersion, Sender};
 use tracing::warn;
 
@@ -59,6 +60,48 @@ pub const SHARED_TICKS_TABLE: &str = "ticks";
 /// Broker-source label for Groww rows in the shared `ticks` table. `&'static str`
 /// → zero-alloc, O(1) symbol write. Mirrors `tick_persistence::TICK_FEED_DHAN`.
 pub const GROWW_FEED_LABEL: &str = tickvault_common::feed::Feed::Groww.as_str();
+
+/// Max in-wake reconnect+replay attempts on a flush that failed with a CONNECTION
+/// error (broken pipe / connection reset / not-connected). Bounded so a sustained
+/// QuestDB outage degrades to the producer's capture-at-receipt spill/DLQ net
+/// (lock §32) instead of stalling the bridge wake forever. After these are
+/// exhausted, `flush` returns `Err` with the buffer + pending RETAINED.
+pub const GROWW_FLUSH_RECONNECT_MAX_RETRIES: usize = 3;
+
+/// Exponential backoff (milliseconds) slept BETWEEN reconnect attempts. Indexed
+/// by `attempt - 1`. Total wall-clock across all 3 retries ≤ 350ms, so the bridge
+/// wake is never blocked for long — well inside the open-burst recovery budget.
+pub const GROWW_FLUSH_RECONNECT_BACKOFF_MS: [u64; GROWW_FLUSH_RECONNECT_MAX_RETRIES] =
+    [50, 100, 200];
+
+/// Outcome of a successful `GrowwLiveTickWriter::flush`. Carries the number of
+/// rows ACTUALLY persisted (so the caller counts persisted rows, not buffer
+/// appends) AND whether the flush had to reconnect+replay after a transient
+/// connection error — so the caller can log a quiet `info!` recovery instead of a
+/// scary `error!` (the `error!` is reserved for the true give-up-to-spill path).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GrowwFlushOutcome {
+    /// Rows confirmed written to QuestDB on the flush that finally succeeded.
+    pub persisted: usize,
+    /// `true` if at least one reconnect+replay was needed before success.
+    pub reconnected: bool,
+}
+
+/// Pure classifier: is this questdb error a recoverable CONNECTION fault (so a
+/// reconnect + replay is worth attempting), as opposed to a structural error
+/// (bad name / API misuse / server-rejected row) that re-sending would NOT fix?
+///
+/// Only `ErrorCode::SocketError` is a transport fault — questdb-rs maps every
+/// broken-pipe / connection-reset / "not connected to database" `io::Error` to
+/// `SocketError` (questdb-rs `sender/mod.rs` `map_io_to_socket_err` +
+/// `flush_impl`'s not-connected guard). Every other code (`InvalidName`,
+/// `InvalidApiCall`, `ServerFlushError`, `InvalidTimestamp`, …) is a property of
+/// the buffered row or the request, NOT the socket — retrying re-hammers a row
+/// that will fail again, so those return `false`. O(1), pure, no I/O.
+#[must_use]
+pub fn is_connection_error(err: &questdb::Error) -> bool {
+    matches!(err.code(), QuestErrorCode::SocketError)
+}
 
 /// One Groww live tick ready for ILP write. `ltp` is `f64` (the Groww SDK
 /// emits a native float — no `f32_to_f64_clean` widening concern, which is
@@ -251,38 +294,131 @@ impl GrowwLiveTickWriter {
         self.buffer.as_bytes()
     }
 
-    /// Flush the buffer to QuestDB, returning the number of rows ACTUALLY
-    /// persisted (so the caller can count persisted rows, not buffer appends).
+    /// Flush the buffer to QuestDB with IN-WAKE reconnect + idempotent replay on a
+    /// transient connection error, returning a [`GrowwFlushOutcome`] (rows actually
+    /// persisted + whether a reconnect was needed).
     ///
-    /// Resilience (mirrors the Dhan `TickPersistenceWriter`):
-    /// - If `sender` is `None` (never connected, or dropped after a prior flush
-    ///   error), reconnect via the retained `ilp_conf` BEFORE flushing. The
-    ///   reconnect creates a FRESH `Buffer` bound to the new sender, so any rows
-    ///   appended while disconnected are migrated into it first (no row lost).
-    /// - On a flush error from an EXISTING sender, set `sender = None` so the NEXT
-    ///   flush reconnects (drop-and-reconnect). The buffer is RETAINED.
-    /// - `Err` if (re)connect or flush fails — the buffer + `pending` are kept and
-    ///   the producer's capture-at-receipt file remains the durable record (no
-    ///   data loss). The caller logs the error.
-    pub fn flush(&mut self) -> Result<usize> {
-        if self.sender.is_none() {
-            self.reconnect()
-                .context("groww_live_ticks flush: reconnect to QuestDB failed")?;
+    /// Zero-drop-at-open contract (operator directive 2026-06-30): the previous
+    /// design dropped the broken sender and deferred recovery to the NEXT flush
+    /// wake — so an open-bell socket reset (`Broken pipe (os error 32)`) left the
+    /// retained rows unflushed until the next tick, and the spill net absorbed the
+    /// gap. This now reconnects + re-flushes the SAME buffer IN this wake, bounded
+    /// to [`GROWW_FLUSH_RECONNECT_MAX_RETRIES`] with [`GROWW_FLUSH_RECONNECT_BACKOFF_MS`]
+    /// backoff, BEFORE falling through to the durable spill/DLQ net.
+    ///
+    /// Resilience contract:
+    /// - **Connection error** (`is_connection_error` ⇒ `ErrorCode::SocketError`,
+    ///   i.e. broken pipe / reset / not-connected): drop the broken sender,
+    ///   reconnect via the retained `ilp_conf`, and re-flush the SAME buffer. The
+    ///   buffer is RETAINED on a questdb flush error (`Sender::flush` only
+    ///   `buf.clear()`s on `Ok`), so the retained rows are re-sent verbatim. Replay
+    ///   is idempotent: the shared `ticks` DEDUP key
+    ///   `(ts, security_id, segment, capture_seq, feed)` collapses any row a
+    ///   partial write had already landed before the pipe broke — never a double
+    ///   count.
+    /// - **Non-connection error** (`InvalidName`, `InvalidApiCall`, `ServerFlushError`,
+    ///   …): NOT retried — re-sending a structurally bad row fails again. Returns
+    ///   `Err` immediately (sender dropped so a later wake can reconnect).
+    /// - **Retries exhausted** (sustained QuestDB outage): returns `Err` with the
+    ///   buffer + `pending` RETAINED. The producer's capture-at-receipt spill/DLQ
+    ///   file (lock §32) remains the durable floor — the caller logs `error!` and
+    ///   the rows are re-attempted on the next wake. Never an infinite loop.
+    pub fn flush(&mut self) -> Result<GrowwFlushOutcome> {
+        let mut reconnected = false;
+        // Attempt 0 is the first flush; attempts 1..=N are reconnect+replay.
+        for attempt in 0..=GROWW_FLUSH_RECONNECT_MAX_RETRIES {
+            // (Re)connect if we have no live sender (cold start, or a prior
+            // connection-error arm dropped it). The retained buffer is KEPT.
+            if self.sender.is_none()
+                && let Err(err) = self.reconnect()
+            {
+                // Reconnect itself failed — treat as a failed attempt. If we
+                // still have retries left, back off and try again; otherwise
+                // surface the error with the buffer + pending RETAINED.
+                if attempt == GROWW_FLUSH_RECONNECT_MAX_RETRIES {
+                    return Err(err).context("groww_live_ticks flush: reconnect to QuestDB failed");
+                }
+                metrics::counter!("tv_groww_ilp_reconnect_attempts_total").increment(1);
+                reconnected = true;
+                Self::backoff_sleep(attempt);
+                continue;
+            }
+
+            match self.try_flush_once() {
+                Ok(flushed) => {
+                    if reconnected {
+                        metrics::counter!("tv_groww_ilp_reconnect_recoveries_total").increment(1);
+                    }
+                    return Ok(GrowwFlushOutcome {
+                        persisted: flushed,
+                        reconnected,
+                    });
+                }
+                Err(err) => {
+                    // Drop the broken sender so the next iteration reconnects. The
+                    // buffer is RETAINED (questdb's `flush` does not clear it on
+                    // error), so no row is lost — it is re-attempted below or on a
+                    // later wake.
+                    self.sender = None;
+
+                    // A structural (non-connection) error will NOT be fixed by a
+                    // reconnect — re-sending the same bad row fails again. Surface
+                    // it immediately so a genuinely bad row is not re-hammered.
+                    if !is_connection_error(&err) {
+                        return Err(err)
+                            .context("groww_live_ticks flush: ILP flush failed (non-connection)");
+                    }
+
+                    // Connection error: out of retries → fall through to the
+                    // durable spill/DLQ net (the caller logs error! + records no
+                    // ticks). Buffer + pending RETAINED.
+                    if attempt == GROWW_FLUSH_RECONNECT_MAX_RETRIES {
+                        return Err(err).context(
+                            "groww_live_ticks flush: ILP flush failed after reconnect retries",
+                        );
+                    }
+
+                    // Retry: count the attempt, back off, reconnect+replay.
+                    metrics::counter!("tv_groww_ilp_reconnect_attempts_total").increment(1);
+                    reconnected = true;
+                    Self::backoff_sleep(attempt);
+                }
+            }
         }
-        let sender = self
-            .sender
-            .as_mut()
-            .context("groww_live_ticks flush: not connected to QuestDB")?;
-        if let Err(err) = sender.flush(&mut self.buffer) {
-            // Drop the broken sender so the next flush reconnects. The buffer is
-            // RETAINED (questdb's `flush` does not clear it on error), so no row
-            // is lost — it is re-attempted on the next flush.
-            self.sender = None;
-            return Err(err).context("groww_live_ticks flush: ILP flush failed");
-        }
+        // Unreachable: the loop returns on success, on a non-connection error, or
+        // on the final attempt. Defensive anyhow error keeps the buffer RETAINED.
+        Err(anyhow::anyhow!(
+            "groww_live_ticks flush: exhausted reconnect retries"
+        ))
+    }
+
+    /// Single flush attempt against the CURRENT sender, returning the raw questdb
+    /// result so `flush` can classify the error. On `Ok`, `pending` is reset (the
+    /// rows are confirmed written); on `Err`, `pending` + buffer are LEFT intact.
+    fn try_flush_once(&mut self) -> std::result::Result<usize, questdb::Error> {
+        let sender = match self.sender.as_mut() {
+            Some(s) => s,
+            None => {
+                return Err(questdb::Error::new(
+                    QuestErrorCode::SocketError,
+                    "groww_live_ticks: not connected to QuestDB",
+                ));
+            }
+        };
+        sender.flush(&mut self.buffer)?;
         let flushed = self.pending;
         self.pending = 0;
         Ok(flushed)
+    }
+
+    /// Sleep the backoff for a given 0-based attempt index. Bounded by
+    /// [`GROWW_FLUSH_RECONNECT_BACKOFF_MS`]; a synchronous sleep is acceptable here
+    /// because this flush runs on the bridge's blocking persist path and the total
+    /// across all retries is ≤ 350ms (well inside the open-burst recovery budget).
+    fn backoff_sleep(attempt: usize) {
+        if let Some(&ms) = GROWW_FLUSH_RECONNECT_BACKOFF_MS.get(attempt) {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
     }
 
     /// (Re)establish the ILP sender from the retained conf. The EXISTING buffer is
@@ -381,8 +517,9 @@ mod tests {
     #[test]
     fn test_flush_when_disconnected_errors_not_panics() {
         let mut w = GrowwLiveTickWriter::for_test();
-        // for_test()'s conf points at refused port 1 → reconnect fails → flush Errs
-        // (never panics). Returns Result<usize> now; .is_err() still holds.
+        // for_test()'s conf points at refused port 1 → every reconnect fails → the
+        // bounded reconnect+replay loop exhausts and flush Errs (never panics).
+        // Returns Result<GrowwFlushOutcome> now; .is_err() still holds.
         assert!(w.flush().is_err(), "disconnected flush must Err, not panic");
     }
 
@@ -429,5 +566,132 @@ mod tests {
         w.append_row(&sample_row()).expect("a1");
         w.append_row(&sample_row()).expect("a2");
         assert_eq!(w.pending(), 2);
+    }
+
+    // ---- reconnect + replay (zero-drop-at-open, operator directive 2026-06-30) ----
+
+    #[test]
+    fn test_is_connection_error_true_for_socket_error() {
+        // A broken pipe / connection reset / not-connected all surface from
+        // questdb-rs as ErrorCode::SocketError — the ONLY class worth a reconnect.
+        let err = questdb::Error::new(
+            QuestErrorCode::SocketError,
+            "Could not flush buffer: Broken pipe (os error 32)",
+        );
+        assert!(
+            is_connection_error(&err),
+            "SocketError must classify as a connection error (retry-worthy)"
+        );
+    }
+
+    #[test]
+    fn test_is_connection_error_false_for_non_socket_error() {
+        // Structural errors must NOT be retried — re-sending a bad row fails again.
+        for code in [
+            QuestErrorCode::InvalidName,
+            QuestErrorCode::InvalidApiCall,
+            QuestErrorCode::ServerFlushError,
+            QuestErrorCode::InvalidTimestamp,
+            QuestErrorCode::CouldNotResolveAddr,
+        ] {
+            let err = questdb::Error::new(code, "structural failure");
+            assert!(
+                !is_connection_error(&err),
+                "non-SocketError code {code:?} must NOT classify as a connection error"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reconnect_backoff_schedule_caps_at_three() {
+        // The retry budget is bounded — total wall-clock ≤ 350ms so the bridge
+        // wake never stalls, and a sustained outage degrades to the spill net.
+        assert_eq!(GROWW_FLUSH_RECONNECT_MAX_RETRIES, 3);
+        assert_eq!(GROWW_FLUSH_RECONNECT_BACKOFF_MS, [50, 100, 200]);
+        assert_eq!(
+            GROWW_FLUSH_RECONNECT_BACKOFF_MS.len(),
+            GROWW_FLUSH_RECONNECT_MAX_RETRIES,
+            "backoff schedule length must match the retry count"
+        );
+        let total_ms: u64 = GROWW_FLUSH_RECONNECT_BACKOFF_MS.iter().sum();
+        assert!(
+            total_ms <= 350,
+            "total backoff must stay bounded (≤350ms), got {total_ms}ms"
+        );
+        // The schedule is monotonic non-decreasing (exponential-ish).
+        assert!(
+            GROWW_FLUSH_RECONNECT_BACKOFF_MS
+                .windows(2)
+                .all(|w| w[0] <= w[1]),
+            "backoff must be non-decreasing"
+        );
+    }
+
+    #[test]
+    fn test_backoff_sleep_out_of_range_is_noop() {
+        // An attempt index past the schedule (defensive) must not panic — the
+        // get() returns None and the sleep is skipped.
+        GrowwLiveTickWriter::backoff_sleep(GROWW_FLUSH_RECONNECT_MAX_RETRIES + 5);
+    }
+
+    #[test]
+    fn test_flush_outcome_struct_fields() {
+        // The outcome distinguishes a clean flush from a recovered one so the
+        // caller can log info! (recovered) vs error! (gave up to spill).
+        let clean = GrowwFlushOutcome {
+            persisted: 7,
+            reconnected: false,
+        };
+        let recovered = GrowwFlushOutcome {
+            persisted: 7,
+            reconnected: true,
+        };
+        assert_eq!(clean.persisted, 7);
+        assert!(!clean.reconnected);
+        assert!(recovered.reconnected);
+        assert_ne!(clean, recovered, "reconnected flag must be observable");
+    }
+
+    #[test]
+    fn test_disconnected_flush_retains_buffer_and_pending_after_retries() {
+        // Zero-loss invariant after the new bounded retry loop: a flush that
+        // exhausts all reconnect attempts (refused port) must STILL retain the
+        // buffered rows — they fall through to the producer's spill net and are
+        // re-attempted on the next wake. No silent discard.
+        let mut w = GrowwLiveTickWriter::for_test();
+        w.append_row(&sample_row()).expect("append");
+        let bytes_before = w.buffer_byte_count();
+        assert_eq!(w.pending(), 1);
+        assert!(
+            w.flush().is_err(),
+            "exhausted reconnect retries must Err (refused port)"
+        );
+        assert_eq!(
+            w.pending(),
+            1,
+            "pending must be retained after exhausted retries (no silent loss)"
+        );
+        assert_eq!(
+            w.buffer_byte_count(),
+            bytes_before,
+            "buffer bytes must be retained after exhausted retries"
+        );
+    }
+
+    #[test]
+    fn test_try_flush_once_when_sender_none_returns_socket_error() {
+        // try_flush_once with no sender returns a SocketError (the retry-worthy
+        // class) rather than panicking — so the loop reconnects, not gives up.
+        let mut w = GrowwLiveTickWriter::for_test();
+        w.append_row(&sample_row()).expect("append");
+        let err = w
+            .try_flush_once()
+            .expect_err("no sender must Err, not flush");
+        assert!(
+            is_connection_error(&err),
+            "no-sender error must be a connection error so the loop reconnects"
+        );
+        // Buffer + pending untouched on the failed attempt.
+        assert_eq!(w.pending(), 1);
     }
 }
