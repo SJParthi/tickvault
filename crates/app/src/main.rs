@@ -1483,6 +1483,14 @@ async fn main() -> Result<()> {
         //
         // If the pool build failed (ws_pool_ready is None) we log a
         // warning but preserve the frames in the WAL archive.
+        //
+        // CRASH-SAFETY (zero-loss MEDIUM fix 2026-06-30): mirror of the
+        // slow-boot staged-then-confirm contract. The fast-boot confirm
+        // (just before notify_systemd_ready below) archives the staged
+        // segments ONLY if this re-injection was clean — i.e. a pool
+        // existed AND no frame was dropped. A dropped/no-pool case keeps
+        // the segments in replaying/ so they re-replay next boot.
+        let mut fast_ws_wal_replay_reinjection_clean = true;
         if !ws_wal_replay_live_feed.is_empty() {
             if let Some(ref pool) = ws_pool_ready {
                 let sender = pool.frame_sender_clone();
@@ -1517,6 +1525,7 @@ async fn main() -> Result<()> {
                     // archive for forensic replay but could not be handed
                     // to the live consumer. This is a degraded mode, not a
                     // data loss (the frames are still on disk).
+                    fast_ws_wal_replay_reinjection_clean = false;
                     error!(
                         dropped,
                         injected,
@@ -1535,6 +1544,7 @@ async fn main() -> Result<()> {
                     );
                 }
             } else {
+                fast_ws_wal_replay_reinjection_clean = false;
                 warn!(
                     frames = ws_wal_replay_live_feed.len(),
                     "STAGE-C.2b: LiveFeed replay frames held but pool build failed — \
@@ -2106,6 +2116,28 @@ async fn main() -> Result<()> {
             message: "<b>FAST BOOT</b>\nCrash recovery: ticks flowing, all services ready"
                 .to_string(),
         });
+
+        // CRASH-SAFETY confirm (fast boot): mirror of the slow-boot confirm
+        // near the end of main(). Archive the staged WAL segments out of
+        // replaying/ ONLY if the LiveFeed re-injection above was clean (pool
+        // existed AND no frame dropped). Without this the fast-boot path
+        // re-replayed every crash-recovery boot — bounded by QuestDB dedup but
+        // growing replaying/ + replay cost on a crash-loop, defeating the
+        // cleanup this fix targets on the exact path it targets. Gated on the
+        // clean flag so a dropped/no-pool re-injection leaves the segments in
+        // replaying/ to re-replay next boot (never confirmed early = no loss).
+        {
+            let fast_ws_wal_path = tickvault_app::tick_conservation_boot::ws_wal_dir();
+            if fast_ws_wal_replay_reinjection_clean {
+                tickvault_storage::ws_frame_spill::confirm_replayed(&fast_ws_wal_path);
+            } else {
+                warn!(
+                    dir = %fast_ws_wal_path.display(),
+                    "STAGE-C.2b: WAL replay NOT confirmed (fast boot — a re-injection dropped or \
+                     pool not ready) — staged segments remain in replaying/ for re-replay next boot"
+                );
+            }
+        }
 
         // CRITICAL: tell systemd the service is up. The unit is Type=notify, so
         // systemd kills the process at TimeoutStartSec (default 90s) unless it
