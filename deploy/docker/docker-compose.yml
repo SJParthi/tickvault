@@ -74,7 +74,10 @@ services:
     # Wave 7-A trim: 2GB sufficient post Wave-6 cascade removal.
     # QuestDB mmaps data files — actual RSS is much lower than limit.
     # Partition manager keeps hot data bounded to ~90 days.
-    mem_limit: 2g
+    # Env-driven so scripts/aws-upgrade-instance.sh --qdb-mem can raise it
+    # on a bigger box (e.g. 4g for both feeds at ~2K SIDs). Default 2g keeps
+    # current behaviour identical when QDB_MEM_LIMIT is unset.
+    mem_limit: ${QDB_MEM_LIMIT:-2g}
     mem_reservation: 1g
     cpus: 2.0
     # OOM protection: prefer killing other containers over QuestDB.
