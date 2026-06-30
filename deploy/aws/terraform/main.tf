@@ -289,8 +289,8 @@ resource "aws_instance" "tv_app" {
   root_block_device {
     volume_type           = "gp3"
     volume_size           = var.ebs_gp3_size_gb
-    iops                  = 3000
-    throughput            = 125
+    iops                  = var.ebs_gp3_iops
+    throughput            = var.ebs_gp3_throughput
     encrypted             = true
     delete_on_termination = false
     tags = {
@@ -322,8 +322,23 @@ resource "aws_instance" "tv_app" {
   #                    var.instance_type validation still documents the desired
   #                    m8g.large for any fresh provision.
   #   - user_data:     bootstrap-only (see note above); deploys are over SSM.
+  #   - root_block_device size/iops/throughput: scripts/aws-upgrade-instance.sh
+  #                    bumps these ONLINE (aws ec2 modify-volume, no stop, no data
+  #                    loss). gp3 can grow but NOT shrink, so a later `terraform
+  #                    apply` must NOT revert a script-bumped value back to the var
+  #                    default (that would degrade QuestDB I/O, and a size revert is
+  #                    impossible anyway). Ignoring them keeps the var as the
+  #                    intent-for-fresh-provision while the live volume is owned by
+  #                    the upgrade script.
   lifecycle {
-    ignore_changes = [ami, instance_type, user_data]
+    ignore_changes = [
+      ami,
+      instance_type,
+      user_data,
+      root_block_device[0].volume_size,
+      root_block_device[0].iops,
+      root_block_device[0].throughput,
+    ]
   }
 }
 
