@@ -448,6 +448,15 @@ Override per environment via `config/{env}.toml` or env vars.
 | Pre-push gates | `.claude/hooks/pre-push-gate.sh` |
 | Active plan | `.claude/plans/active-plan.md` |
 | Codebase map | `docs/architecture/codebase-map.md` |
+| DhanHQ agent skill (READ-ONLY ref) | `.claude/skills/dhanhq/` (from `github.com/dhan-oss/dhanhq-skills`) |
+
+> **DhanHQ agent skill — READ-ONLY API reference.** The `dhanhq` skill in
+> `.claude/skills/dhanhq/` (upstream `github.com/dhan-oss/dhanhq-skills`) is
+> installed ONLY as up-to-date DhanHQ API documentation. **Rule 1:** it is NEVER
+> used to place/modify/cancel live orders before July 2026, and its order/execution
+> scripts + examples are NEVER run. **Rule 2:** its Python reference code must NOT
+> enter the production Rust order path or schema. Use it for fact-checking the Dhan
+> REST/WS surface only — alongside `docs/dhan-ref/*.md`.
 
 ## DHAN SUPPORT COMMUNICATIONS
 
