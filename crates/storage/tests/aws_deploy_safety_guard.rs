@@ -15,8 +15,9 @@
 //!      contract is: upgrades via `scripts/aws-upgrade-instance.sh`, deploys via
 //!      SSM — never via instance replacement.
 //!   3. Revert the weekday-only schedule (MON-FRI) back to daily (Mon-Sun).
-//!   4. Flip `enable_eip` default to true (no orders for 3 months → no Dhan
-//!      static-IP need → EIP off saves ~₹430/mo).
+//!   4. Flip `enable_eip` default back to true (cost-hardening 2026-06-30: no
+//!      orders for 3 months → no Dhan static-IP need → EIP OFF saves ~₹300/mo;
+//!      reachability via auto-assign-public-IP, both attributes pinned below).
 //!   5. Change the EBS default away from 30 GB (hot window sizing for ~₹2,058/mo).
 //!
 //! Each assertion fails the build with an operator-readable message so the next
@@ -149,29 +150,54 @@ fn deploy_schedule_is_weekday_only() {
     );
 }
 
-/// EIP off by default (no orders for 3 months → no Dhan static-IP need).
+/// EIP off by default — cost-hardening "corrected EIP approach" (2026-06-30):
+/// no orders → no Dhan static-IP need → EIP removed (~₹300/mo saved);
+/// reachability comes from auto-assign-public-IP instead.
 #[test]
-fn deploy_eip_is_enabled_by_default() {
+fn deploy_eip_is_disabled_by_default() {
     let vars = squish(&read(VARIABLES_TF));
     assert!(
         vars.contains("variable \"enable_eip\""),
         "variables.tf must declare `enable_eip`."
     );
-    // 2026-05-31: operator flipped enable_eip default false -> true. The manual
-    // t4g -> m8g.large upgrade left the ENI with auto-assign-public-IP OFF, so
-    // the box had NO public IP / no internet path (SSM showed 0 managed nodes,
-    // deploy InvalidInstanceId) until an EIP was attached. EIP is now mandatory.
-    // This guard was previously asserting `default = false` (stale) — updated to
-    // match the operator-approved reality.
+    // 2026-06-30: operator's corrected cost-hardening approach flips enable_eip
+    // default true -> false. The EIP is ONLY needed for live orders (Dhan
+    // static-IP whitelist), and orders are OFF (production.toml dry_run=true).
+    // Reachability instead comes from auto-assign-public-IP. (The 2026-05-31
+    // true default was for the running box whose ENI lost auto-assign after the
+    // manual upgrade — that is now handled by the var.enable_eip OPERATOR ACTION
+    // note + the associate_public_ip_address below, not by paying for an EIP.)
     assert!(
-        vars.contains("type = bool default = true"),
-        "enable_eip must default to true (operator 2026-05-31 — EIP mandatory; \
-         without it the box has no public IP / no SSM / no Dhan path)."
+        vars.contains("type = bool default = false"),
+        "enable_eip must default to false (operator 2026-06-30 cost-hardening — \
+         no orders → no static-IP need → EIP removed)."
     );
     let main = squish(&code_only(&read(MAIN_TF)));
     assert!(
         main.contains("count = var.enable_eip ? 1 : 0"),
         "aws_eip.tv_app must stay count-gated on var.enable_eip."
+    );
+    // With the EIP gone the box must still be reachable: the subnet auto-assigns
+    // a public IP AND the instance pins associate_public_ip_address=true for a
+    // fresh provision. Both must be present so removing the EIP never strands a
+    // freshly-provisioned box.
+    assert!(
+        main.contains("map_public_ip_on_launch = true"),
+        "aws_subnet.public must keep map_public_ip_on_launch=true (auto-assign \
+         replaces the removed EIP for reachability)."
+    );
+    assert!(
+        main.contains("associate_public_ip_address = true"),
+        "aws_instance.tv_app must set associate_public_ip_address=true (a fresh \
+         provision gets a dynamic public IP now that the EIP is off)."
+    );
+    // The CREATE-ONLY auto-assign attribute MUST be in ignore_changes so a
+    // `terraform apply` can never try to add it to the running box (= replace =
+    // QuestDB data wiped).
+    assert!(
+        main.contains("associate_public_ip_address,"),
+        "associate_public_ip_address must be in lifecycle.ignore_changes (it is \
+         create-only; toggling it on the running box would force a replacement)."
     );
 }
 

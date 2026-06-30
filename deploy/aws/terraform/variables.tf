@@ -58,9 +58,9 @@ variable "ami_id" {
 }
 
 variable "enable_eip" {
-  description = "Provision a 24/7 Elastic IP (static public IP). FLIPPED TO TRUE 2026-05-31 (operator approved 'Yes — enable it now'). The 2026-05-29 §7 Quote 5 assumption that 'the instance gets a fresh public IP on each stop/start' proved FALSE: after the manual t4g→m8g.large upgrade (stop/modify/start), the instance's ENI has auto-assign-public-IP OFF (console: 'Auto-assigned IP address: –'), so it had NO public IP and NO internet path at all — it could not reach AWS Systems Manager (Fleet Manager showed 0 managed nodes → deploy `InvalidInstanceId`) NOR Dhan. AWS cannot add an ephemeral public IP to an already-running instance; only an EIP can. So the EIP is now mandatory for the box to function, not optional. Cost ~₹300/mo; needed for live orders anyway (then register this EIP with Dhan; 7-day modify cooldown applies)."
+  description = "Provision a 24/7 Elastic IP (static public IP). FLIPPED BACK TO FALSE 2026-06-30 (operator's corrected cost-hardening approach): the EIP is ONLY needed for live orders (Dhan static-IP whitelist), and orders are OFF for the 3-month data-pull (production.toml locks dry_run=true). Cost-hardening removes the ~₹300/mo EIP. The replacement for reachability is auto-assign-public-IP: the public subnet already has map_public_ip_on_launch=true, and aws_instance.tv_app now sets associate_public_ip_address=true, so a FRESH provision gets a dynamic public IP via the IGW (deploy + operator-control + budget-killswitch all address the box by INSTANCE-ID over SSM/EC2, so a CHANGING dynamic IP does NOT break them). ⚠ OPERATOR ACTION for the EXISTING running box i-0b956d0209231a48b: its current primary ENI (attached 2026-05-24) has NO dynamic public-IP association — map_public_ip_on_launch only applies at ORIGINAL launch, so simply releasing the EIP would leave the running box with no public IP / no internet (the exact failure the 2026-05-31 EIP-flip documented). Before releasing the EIP, ensure the box can still reach the internet via SSM Session Manager / VPC endpoint, OR relaunch the instance so its new ENI auto-assigns a public IP. Flip enable_eip=true to restore the EIP for live orders (then register it with Dhan; 7-day modify cooldown)."
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "ebs_gp3_size_gb" {
@@ -114,15 +114,15 @@ variable "operator_cidr" {
 }
 
 variable "telegram_bot_token_ssm_param" {
-  description = "SSM parameter name where the Telegram bot token is stored. Defaults to the STAGING path because the app runs TV_ENVIRONMENT=staging during the 3-month no-orders data-pull, and the seed populates /tickvault/staging/* (the /tickvault/prod/* path does not exist yet -> ParameterNotFound in the webhook Lambda, 2026-05-30). Flip to /tickvault/prod/telegram/bot-token when going live (TV_ENVIRONMENT=prod)."
+  description = "SSM parameter name where the Telegram bot token is stored. Defaults to /tickvault/prod/telegram/bot-token: the single real env is prod (TV_ENVIRONMENT=prod, operator 2026-06-30 — dev/staging retired), and the operator-populated prod params already EXIST while the old /tickvault/staging/* path is now EMPTY (the stale staging default would 404 ParameterNotFound in the webhook Lambda)."
   type        = string
-  default     = "/tickvault/staging/telegram/bot-token"
+  default     = "/tickvault/prod/telegram/bot-token"
 }
 
 variable "telegram_chat_id_ssm_param" {
-  description = "SSM parameter name where the Telegram chat ID (numeric) is stored. Defaults to the STAGING path (see telegram_bot_token_ssm_param). Flip to /tickvault/prod/telegram/chat-id when going live."
+  description = "SSM parameter name where the Telegram chat ID (numeric) is stored. Defaults to /tickvault/prod/telegram/chat-id (single real prod env; see telegram_bot_token_ssm_param)."
   type        = string
-  default     = "/tickvault/staging/telegram/chat-id"
+  default     = "/tickvault/prod/telegram/chat-id"
 }
 
 variable "dhan_access_token_ssm_param" {
