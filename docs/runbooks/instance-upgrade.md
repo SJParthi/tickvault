@@ -123,9 +123,10 @@ pressure. Recommended retune on a bigger box:
 | Disk size | 30 GB | **60 GB** (`--ebs-size 60`) — more hot window |
 
 The compose file reads `mem_limit: ${QDB_MEM_LIMIT:-2g}`, so `--qdb-mem 4g`
-writes `QDB_MEM_LIMIT=4g` to `deploy/docker/.env` on the box and recreates only
-the `tv-questdb` container. Default stays `2g` when unset (current behaviour
-unchanged). Pass `--apply-ssm` to send the on-box command via SSM
+writes `QDB_MEM_LIMIT=4g` into the compose env file (the `.env` next to the
+compose file, on the box — a runtime-generated, gitignored file) and recreates
+only the `tv-questdb` container. Default stays `2g` when unset (current
+behaviour unchanged). Pass `--apply-ssm` to send the on-box command via SSM
 RunShellScript automatically, or run the printed command yourself.
 
 The Terraform `ebs_gp3_iops` / `ebs_gp3_throughput` variables exist so a later

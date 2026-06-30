@@ -128,11 +128,20 @@ command -v aws >/dev/null || die "aws CLI not found — install + 'aws configure
 # ---------------------------------------------------------------------------
 log "Validating arguments"
 
-# --to must be in the allowlist.
+# --to must be in the allowlist (exact-match — no metacharacters possible).
 case " $ALLOWED_TO_TYPES " in
   *" $TO_TYPE "*) ok "Target type ${TO_TYPE} is allowed." ;;
   *) die "Refusing --to '${TO_TYPE}': not in allowlist {${ALLOWED_TO_TYPES}}. To add a type, update this allowlist AND complete the 4-file lock flip (dated operator quote) first." ;;
 esac
+
+# --from is user-supplied and reaches modify-instance-attribute via run()'s
+# eval. It is also gated to == CUR_TYPE before the flip, but validate its FORMAT
+# strictly here too (defence-in-depth): an EC2 instance type is letters/digits
+# with one dot, e.g. m8g.large / t4g.medium. Reject anything with a shell
+# metacharacter so it can never inject through the eval.
+if [[ ! "$FROM_TYPE" =~ ^[a-z0-9]+\.[a-z0-9]+$ ]]; then
+  die "Refusing --from '${FROM_TYPE}': not a valid EC2 instance type (expected e.g. m8g.large)."
+fi
 
 is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 
@@ -149,10 +158,15 @@ if [ -n "$EBS_THROUGHPUT" ]; then
   { [ "$EBS_THROUGHPUT" -ge 125 ] && [ "$EBS_THROUGHPUT" -le 1000 ]; } || die "--ebs-throughput must be 125–1000 MiB/s (gp3 range; matches Terraform ebs_gp3_throughput)."
 fi
 if [ -n "$QDB_MEM" ]; then
-  case "$QDB_MEM" in
-    [1-9]*[gGmM]) ok "QuestDB mem target ${QDB_MEM}." ;;
-    *) die "--qdb-mem must look like '4g' or '4096m' (docker mem_limit syntax)." ;;
-  esac
+  # STRICT regex anchor — a shell glob ([1-9]*[gGmM]) would let metacharacters
+  # through (e.g. "4g;reboot" / "4g'; curl x|sh; echo '4" end in a letter and
+  # match), and that value flows into run()'s eval AND the remote SSM heredoc =
+  # remote code exec. Anchored [[ =~ ]] permits ONLY digits + a single g/m/G/M.
+  if [[ "$QDB_MEM" =~ ^[1-9][0-9]*[gGmM]$ ]]; then
+    ok "QuestDB mem target ${QDB_MEM}."
+  else
+    die "--qdb-mem must be digits followed by g/m (e.g. '4g' or '4096m', docker mem_limit syntax). Got: '${QDB_MEM}'."
+  fi
 fi
 [ "$APPLY_SSM" -eq 1 ] && [ -z "$QDB_MEM" ] && die "--apply-ssm requires --qdb-mem (nothing to send otherwise)."
 
@@ -387,15 +401,27 @@ EOF
   printf '  Run this ON THE BOX (or it is SSM-sent below):\n\n%s\n\n' "$QDB_CMD"
 
   if [ "$APPLY_SSM" -eq 1 ]; then
+    command -v jq >/dev/null || die "jq not found — required to build the SSM parameters JSON safely. Install jq, or run the command above on the box manually."
     log "Sending the QuestDB retune via SSM RunShellScript"
-    # Build the parameters JSON safely (the command is a single line item).
-    PARAMS=$(printf '{"commands":[%s]}' "$(printf '%s' "$QDB_CMD" | tr '\n' ' ' | sed 's/"/\\"/g; s/^/"/; s/$/"/')")
-    run "aws ssm send-command --region '$REGION' \
-          --document-name 'AWS-RunShellScript' \
-          --targets 'Key=InstanceIds,Values=${IID}' \
-          --comment 'tickvault QuestDB mem_limit retune to ${QDB_MEM}' \
-          --parameters '$PARAMS' \
-          --query 'Command.CommandId' --output text"
+    # Build the --parameters JSON with jq --arg so ANY character in the command
+    # (quotes, backslashes, newlines) is JSON-escaped correctly — never via
+    # printf/sed string-mashing. QDB_MEM is already strict-regex-validated, so
+    # this is defence-in-depth. The single-line command is one array element.
+    QDB_CMD_LINE=$(printf '%s' "$QDB_CMD" | tr '\n' ' ')
+    PARAMS=$(jq -n --arg cmd "$QDB_CMD_LINE" '{commands: [$cmd]}')
+    # Invoke aws DIRECTLY (NOT through run()/eval): pass every interpolation as a
+    # separate, properly-quoted argv element so nothing reaches a shell eval.
+    if [ "$DRY_RUN" -eq 1 ]; then
+      echo "    [dry-run] aws ssm send-command --region $REGION --document-name AWS-RunShellScript --targets Key=InstanceIds,Values=${IID} --comment 'tickvault QuestDB mem_limit retune to ${QDB_MEM}' --parameters <json> --query Command.CommandId --output text"
+    else
+      aws ssm send-command --region "$REGION" \
+        --document-name "AWS-RunShellScript" \
+        --targets "Key=InstanceIds,Values=${IID}" \
+        --comment "tickvault QuestDB mem_limit retune to ${QDB_MEM}" \
+        --parameters "$PARAMS" \
+        --query 'Command.CommandId' --output text \
+        || die "SSM send-command failed. Run the command above on the box manually."
+    fi
     ok "SSM command sent. Track it: aws ssm list-command-invocations --region ${REGION} --details --filters Key=InstanceId,Values=${IID}"
   else
     warn "Not sent automatically. Pass --apply-ssm to send via SSM, or run the command above on the box."
