@@ -777,6 +777,22 @@ rules:
       consumer. Escalate (Telegram + draft Issue) so the operator restarts
       the app per the runbook.
 
+  - name: ws-gap-08-rate-limit-cooldown-silence
+    match:
+      code: WS-GAP-08
+    action: silence
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      WS-GAP-08 is the persisted Dhan 429 rate-limit cooldown. The common
+      case is the boot-time wait (info!) — the system correctly waiting out
+      a real Dhan rate-limit before the first WS connect, which BREAKS the
+      instant-429 restart loop. It is Low severity, fail-open, and bounded
+      at 5 minutes, so no operator action is needed. The rarer persist-write
+      failure is best-effort (in-memory streak still applies). Silence;
+      sustained recurrence is visible via tv_ws_rate_limit_cooldown_waited_total.
+
   - name: disk-watcher-01-respawn-escalate
     match:
       code: DISK-WATCHER-01

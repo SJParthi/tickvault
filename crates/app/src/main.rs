@@ -3071,6 +3071,42 @@ async fn run_ws_event_audit_consumer(
 /// 5s) and the SIGTERM handler (which calls `request_graceful_shutdown()`).
 /// The Arc is cheap (one atomic ref count increment per clone) and required
 /// because all three use cases need to share the same pool instance.
+/// WS-GAP-08: honour a persisted Dhan 429 rate-limit cooldown BEFORE the first
+/// main-feed WS connect, so the cooldown survives a `process::exit(2)` +
+/// supervisor restart and the fresh process does NOT reconnect straight back
+/// into Dhan's still-active 429 window (the instant-429 restart loop).
+///
+/// Fail-open + bounded: a missing / corrupt / stale cooldown file → no wait;
+/// the wait is clamped to `WS_RATE_LIMIT_BACKOFF_CAP_MS` (5 minutes) so a bad
+/// file can never hang boot. The pure `remaining_cooldown_ms` decision is
+/// unit-tested in `tickvault_core::websocket::rate_limit_cooldown`.
+async fn wait_out_persisted_ws_rate_limit_cooldown() {
+    use tickvault_core::websocket::rate_limit_cooldown;
+
+    let Some(cooldown) = rate_limit_cooldown::read_cooldown() else {
+        return; // no/corrupt/stale file → fail-open, no wait
+    };
+    let remaining_ms = rate_limit_cooldown::remaining_cooldown_ms(
+        cooldown.last_hit_epoch_ms,
+        cooldown.floor_ms,
+        rate_limit_cooldown::now_epoch_ms(),
+    )
+    .min(tickvault_common::constants::WS_RATE_LIMIT_BACKOFF_CAP_MS);
+    if remaining_ms == 0 {
+        return;
+    }
+    metrics::counter!("tv_ws_rate_limit_cooldown_waited_total").increment(1);
+    info!(
+        code = tickvault_common::error_code::ErrorCode::WsGap08RateLimitCooldown.code_str(),
+        remaining_secs = remaining_ms / 1_000,
+        streak = cooldown.streak,
+        "WS-GAP-08: Dhan rate-limited us recently — waiting out the persisted \
+         cooldown before the first WebSocket connect (prevents an instant-429 \
+         restart loop)"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(remaining_ms)).await;
+}
+
 async fn spawn_websocket_connections(
     pool: std::sync::Arc<WebSocketConnectionPool>,
 ) -> Vec<tokio::task::JoinHandle<Result<(), WebSocketError>>> {
@@ -5133,6 +5169,18 @@ async fn start_dhan_lane(
     // Order update WS stays alive until app shutdown.
     let should_connect_ws =
         subscription_plan.is_some() && (is_trading || is_mock_trading || is_muhurat);
+
+    // WS-GAP-08: before the FIRST Dhan WS connect, honour any persisted
+    // 429 rate-limit cooldown that survived a `process::exit(2)` + supervisor
+    // restart. Without this, a restart wipes the in-memory `rate_limit_streak`
+    // and the fresh process reconnects with a 0ms first retry straight back
+    // into Dhan's still-active 429 window → instant-429 restart loop. The wait
+    // is fail-open (no/corrupt/stale file → no wait) and bounded by the cap, so
+    // a bad file can never hang boot beyond 5 minutes. Only on a day we will
+    // actually connect.
+    if should_connect_ws {
+        wait_out_persisted_ws_rate_limit_cooldown().await;
+    }
 
     let (pool_receiver, ws_pool_ready) = if should_connect_ws {
         match create_websocket_pool(
