@@ -1,14 +1,14 @@
-# DLT AWS stack — m8g.large budget envelope (~₹2,058/mo incl GST: 270 hrs,
-# 30 GB EBS, no EIP; operator-lock 2026-05-29 in
-# daily-universe-scope-expansion-2026-05-27.md §7 Quotes 5+6, which supersede
-# the 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks).
+# DLT AWS stack — r8g.large budget envelope (~₹2,919/mo incl GST: 270 hrs,
+# 30 GB EBS, +EIP kept; operator-lock 2026-06-30 in
+# daily-universe-scope-expansion-2026-05-27.md §7 Quote 7, which supersedes
+# the 2026-05-29 m8g.large + 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks).
 #
 # Deployed resources:
 #   - VPC with a single public subnet (no NAT to stay under budget)
 #   - Security group: SSH from operator_cidr, no inbound from market
 #   - IAM role: SSM read+write+delete (instance lock) + CloudWatch write +
 #     SNS publish + S3 cold-tier read/write
-#   - EC2 m8g.large (ARM Graviton4, 2 vCPU / 8 GiB) with gp3 30GB root volume
+#   - EC2 r8g.large (ARM Graviton4, 2 vCPU / 16 GiB) with gp3 30GB root volume
 #   - Elastic IP — count-gated on var.enable_eip (DEFAULT false for the 3-month
 #     data-pull: no orders → no Dhan static-IP whitelist need → ~₹430/mo saved.
 #     Flip enable_eip=true before going LIVE with orders; 7-day modify cooldown)
@@ -20,8 +20,8 @@
 #     NSE holidays = OFF unless the operator manually starts the instance)
 #   - CloudWatch log group + metric alarms (5 core infrastructure signals)
 #
-# IN-PLACE UPGRADE CONTRACT (operator lock 2026-05-29): the running instance
-# i-0b956d0209231a48b (tv-prod-app) is upgraded t4g.medium → m8g.large by
+# IN-PLACE UPGRADE CONTRACT (operator lock 2026-06-30 §7 Quote 7): the running
+# instance i-0b956d0209231a48b (tv-prod-app) is upgraded m8g.large → r8g.large by
 # scripts/aws-upgrade-instance.sh (stop → modify-instance-attribute → start) at
 # a controlled off-market time, NOT by `terraform apply`. Terraform therefore
 # IGNORES instance_type + user_data on aws_instance.tv_app (lifecycle block
@@ -273,7 +273,7 @@ resource "aws_instance" "tv_app" {
   # EventBridge stop cron AND scripts/aws-upgrade-instance.sh BOTH need
   # ec2:StopInstances. `disable_api_stop = true` would silently block the
   # daily auto-stop → instance runs 24/7 → ~720 hrs/mo → ~₹5,500 bill instead
-  # of the locked ~₹2,058/mo, and would block the in-place m8g.large upgrade.
+  # of the locked ~₹2,919/mo, and would block the in-place r8g.large upgrade.
   # Stop is reversible (EBS + data survive a stop) so it needs no guard.
   disable_api_termination = true
   disable_api_stop        = false
@@ -314,11 +314,11 @@ resource "aws_instance" "tv_app" {
   # NEVER let `terraform apply` replace or re-type the running box:
   #   - ami:           AMI refresh updates the default for NEW instances only;
   #                    existing instance keeps its AMI (no replace).
-  #   - instance_type: the t4g.medium → m8g.large upgrade is done out-of-band by
+  #   - instance_type: the m8g.large → r8g.large upgrade is done out-of-band by
   #                    scripts/aws-upgrade-instance.sh at a controlled off-market
   #                    time. Terraform must not fight that or revert it. The
   #                    var.instance_type validation still documents the desired
-  #                    m8g.large for any fresh provision.
+  #                    r8g.large for any fresh provision.
   #   - user_data:     bootstrap-only (see note above); deploys are over SSM.
   #   - root_block_device size/iops/throughput: scripts/aws-upgrade-instance.sh
   #                    bumps these ONLINE (aws ec2 modify-volume, no stop, no data
@@ -520,7 +520,7 @@ resource "aws_cloudwatch_event_target" "daily_stop" {
   })
 
   # Same resilience on the 16:30 IST stop — a dropped stop means the box bills
-  # 24/7 (~₹5,500/mo vs the locked ~₹2,058/mo per aws-budget.md). Retry + DLQ
+  # 24/7 (~₹5,500/mo vs the locked ~₹2,919/mo per §7). Retry + DLQ
   # + the 16:45 stop-watchdog are the defense in depth.
   retry_policy {
     maximum_retry_attempts       = 5

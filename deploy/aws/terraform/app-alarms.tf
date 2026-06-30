@@ -443,8 +443,8 @@ resource "aws_cloudwatch_metric_alarm" "late_tick_after_boundary" {
 
 # ---------------------------------------------------------------------------
 # 17. Host memory > 80% — the "time to upgrade" capacity signal.
-# Auto-DETECT, not auto-spend: this alarm tells the operator WHEN the m8g.large
-# 8 GiB box is running hot (e.g. both feeds at ~2K SIDs), so they can decide to
+# Auto-DETECT, not auto-spend: this alarm tells the operator WHEN the r8g.large
+# 16 GiB box is running hot (e.g. both feeds at ~2K SIDs), so they can decide to
 # run scripts/aws-upgrade-instance.sh to a bigger type AFTER the dated-quote +
 # 4-file lock flip — it never resizes anything itself. Mirrors disk_used_high:
 # a CloudWatch Metrics Insights query so we do NOT pin CWAgent mem dimensions.
@@ -452,7 +452,7 @@ resource "aws_cloudwatch_metric_alarm" "late_tick_after_boundary" {
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "mem_used_high" {
   alarm_name          = "tv-${var.environment}-mem-used-high"
-  alarm_description   = "Host memory > 80% on m8g.large (8 GiB). Capacity signal — time to consider an instance upgrade. Run scripts/aws-upgrade-instance.sh --to r8g.large --ebs-size <GB> --qdb-mem 4g AFTER the dated-quote + 4-file lock flip (daily-universe-scope-expansion-2026-05-27.md §7 Mechanical Rule 1). Auto-detect only — never auto-upgrades. See docs/runbooks/instance-upgrade.md."
+  alarm_description   = "Host memory > 80% on r8g.large (16 GiB). Capacity signal — time to consider an instance upgrade. Run scripts/aws-upgrade-instance.sh --to <bigger-type> --ebs-size <GB> --qdb-mem <N>g AFTER the dated-quote + 4-file lock flip (daily-universe-scope-expansion-2026-05-27.md §7 Mechanical Rule 1). Auto-detect only — never auto-upgrades. See docs/runbooks/instance-upgrade.md."
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 3
   threshold           = 80

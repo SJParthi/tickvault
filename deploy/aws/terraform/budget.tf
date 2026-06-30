@@ -1,14 +1,14 @@
 # Monthly cost budget alarm — fires at 80% forecasted + 100% actual.
 #
-# Charter authority: daily-universe-scope-expansion-2026-05-27.md §7 Quote 5
-# (2026-05-29) — m8g.large weekday-only ~₹1,503/mo (supersedes the 2026-05-27
-# t4g.large ~₹1,514/mo + 2026-05-18 t4g.medium ~₹1,022/mo locks). The 80%
+# Charter authority: daily-universe-scope-expansion-2026-05-27.md §7 Quote 7
+# (2026-06-30) — r8g.large weekday-only ~₹2,919/mo incl GST (supersedes the
+# 2026-05-29 m8g.large + 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks). The 80%
 # forecasted alarm fires early enough that the operator can take action
 # (e.g., terminate a rogue stress test) before the bill arrives. The 100%
 # actual alarm is the hard "we crossed the budget" signal.
 #
-# USD vs INR: AWS Budgets uses USD internally (pre-GST). Config: m8g.large,
-# 270-hr ceiling, 30 GB EBS, no EIP = ~$20.52 pre-GST (~₹2,058/mo incl. 18%
+# USD vs INR: AWS Budgets uses USD internally (pre-GST). Config: r8g.large,
+# 270-hr ceiling, 30 GB EBS, +EIP = ~$29.10 pre-GST (~₹2,919/mo incl. 18%
 # GST). Limit set to $55 (raised 2026-06-30 from $25) for honest headroom over
 # the real ~$35 total-account spend below — see the cost_filter note. Lambda/
 # Telegram/monitoring fan-out are free-tier (₹0). If INR/USD swings >10%, EBS
