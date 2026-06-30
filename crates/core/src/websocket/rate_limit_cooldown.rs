@@ -48,6 +48,12 @@ const COOLDOWN_FILE_NAME: &str = "ws-rate-limit-cooldown.json";
 /// scanner treats `crates/core/src/websocket/` as hot-path scope).
 const COOLDOWN_TMP_FILE_NAME: &str = "ws-rate-limit-cooldown.json.tmp";
 
+/// Upper bound on the cooldown file size we will buffer before parsing. The
+/// record serializes to well under 100 bytes; a file larger than 64 KiB is
+/// corrupt (or hostile) and MUST NOT be fully read into memory. Fail-open: an
+/// oversized file is ignored exactly like a missing/corrupt one.
+const MAX_COOLDOWN_FILE_BYTES: u64 = 65_536;
+
 /// The persisted cooldown record. Small + advisory; written best-effort at the
 /// 429 classification site, read fail-open at boot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +131,33 @@ pub fn remaining_cooldown_ms(last_hit_epoch_ms: u64, floor_ms: u64, now_epoch_ms
 #[must_use]
 pub fn read_cooldown() -> Option<PersistedCooldown> {
     let path = cooldown_file_path();
+    // Bound the read so a corrupt/huge file can never be fully buffered: stat
+    // ONCE at boot before reading, and reject anything over the size cap.
+    // O(1) EXEMPT: cold path — stat ONCE at boot before the first WS connect.
+    match std::fs::metadata(&path) {
+        Ok(meta) => {
+            if meta.len() > MAX_COOLDOWN_FILE_BYTES {
+                warn!(
+                    path = %path.display(),
+                    size = meta.len(),
+                    max = MAX_COOLDOWN_FILE_BYTES,
+                    "WS rate-limit cooldown file is oversized — ignoring (fail-open)"
+                );
+                return None;
+            }
+        }
+        Err(err) => {
+            // Missing file is the normal first-boot case — not an error.
+            if err.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "could not stat WS rate-limit cooldown file — ignoring (fail-open)"
+                );
+            }
+            return None;
+        }
+    }
     // O(1) EXEMPT: cold path — read ONCE at boot before the first WS connect.
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
@@ -273,6 +306,36 @@ mod tests {
         assert!(
             read_cooldown().is_none(),
             "corrupt file must fail-open to None"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("TV_WS_WAL_DIR");
+        }
+    }
+
+    #[test]
+    fn test_read_cooldown_rejects_oversized_file() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir =
+            std::env::temp_dir().join(format!("tv-cooldown-oversized-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        // Point TV_WS_WAL_DIR at <dir>/ws_wal so the base dir is <dir>.
+        // SAFETY: tests are single-threaded under ENV_LOCK; no other thread
+        // reads the env concurrently.
+        unsafe {
+            std::env::set_var("TV_WS_WAL_DIR", dir.join("ws_wal"));
+        }
+        let path = cooldown_file_path();
+        // Write a >64 KiB file (valid JSON prefix is irrelevant — the size
+        // guard must reject it before any parse).
+        let oversized = vec![b'a'; (MAX_COOLDOWN_FILE_BYTES as usize) + 1];
+        std::fs::write(&path, &oversized).expect("write oversized file");
+        assert!(
+            read_cooldown().is_none(),
+            "oversized file must fail-open to None"
         );
         let _ = std::fs::remove_dir_all(&dir);
         unsafe {
