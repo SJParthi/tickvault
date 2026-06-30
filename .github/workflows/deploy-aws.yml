@@ -342,6 +342,12 @@ jobs:
           fi
 
           echo "box stopped but SHOULD be up — starting it (EventBridge start likely failed)"
+          # Record that THIS run started a stopped box, so the final auto-stop
+          # step below can stop it again if we are now OUTSIDE the 08:30-16:30
+          # IST Mon-Fri up-window (e.g. an after-close workflow_dispatch deploy).
+          # Without this, an out-of-window deploy would leave the box billing all
+          # night until the next hourly hard-stop guard catches it.
+          echo "DEPLOY_STARTED_STOPPED_BOX=yes" >> "$GITHUB_ENV"
           aws ec2 start-instances --region "$REGION" --instance-ids "$IID" >/dev/null
           # Wait for EC2 'running' (<=3 min).
           for _ in $(seq 1 36); do
@@ -815,3 +821,29 @@ jobs:
             --topic-arn arn:aws:sns:${{ vars.AWS_REGION || 'ap-south-1' }}:${{ steps.acct.outputs.id }}:tv-prod-alerts \
             --subject "🆘 tickvault deploy FAILED" \
             --message "$MSG"
+
+      - name: Stop the box this run self-started (if now outside the up-window)
+        # COST-HARDENING 2026-06-30 (never-cross): when an after-close /
+        # workflow_dispatch deploy self-started a STOPPED box (the step above set
+        # DEPLOY_STARTED_STOPPED_BOX=yes), leave it running ONLY if we are inside
+        # the 08:30-16:30 IST Mon-Fri up-window. If we are OUTSIDE the window, the
+        # box would otherwise bill all night until the hourly hard-stop guard
+        # catches it — so stop it here, immediately, at the end of the deploy.
+        # always() so it runs whether the deploy passed or failed. We NEVER stop a
+        # box this run did not start, and NEVER stop during the trading window.
+        if: always() && env.DEPLOY_STARTED_STOPPED_BOX == 'yes'
+        env:
+          REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+          IID: ${{ secrets.EC2_INSTANCE_ID }}
+        run: |
+          set -uo pipefail
+          DOW=$(TZ='Asia/Kolkata' date +%u)            # 1=Mon..7=Sun
+          HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM))
+          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 830 ] && [ "$HHMM" -le 1630 ]; then
+            echo "Inside 08:30-16:30 IST Mon-Fri window — leaving the box running."
+            exit 0
+          fi
+          echo "Outside the up-window (dow=$DOW time=$HHMM) and THIS run started the box — stopping it to avoid an out-of-window bill."
+          aws ec2 stop-instances --region "$REGION" --instance-ids "$IID" >/dev/null \
+            && echo "stop-instances dispatched for $IID" \
+            || echo "(could not dispatch stop — AWS creds likely not configured at this stage)"
