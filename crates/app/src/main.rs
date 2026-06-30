@@ -1706,6 +1706,12 @@ async fn main() -> Result<()> {
                 // bare-reset classifier can require a live token before
                 // reconnecting in place.
                 Some(token_handle.clone()),
+                // Fix A no-op close (2026-06-30): QuestDB config so the watchdog
+                // pushes the REAL QuestDB-liveness signal into
+                // `health.set_questdb_reachable(...)` every 5s — without it the
+                // bare-reset gate was a production no-op (signal only ever set
+                // in test code).
+                config.questdb.clone(),
             );
             // FAST BOOT parity with slow boot (main.rs ~1760):
             // emit per-connection + aggregate Telegram alerts so an operator
@@ -3382,6 +3388,19 @@ fn spawn_pool_watchdog_task(
     // (no handle wired) reads as token-invalid → genuine-fatal exit preserved
     // (never ride out a Halt when we cannot confirm the token is live).
     token_handle: Option<TokenHandle>,
+    // Fix A no-op close (2026-06-30): the QuestDB config so the watchdog can
+    // push a REAL production QuestDB-liveness signal into
+    // `health.set_questdb_reachable(...)` every 5s. Without this the backing
+    // `questdb_reachable` AtomicBool was only ever set true in test code, so in
+    // prod `health.questdb_reachable()` was permanently `false` →
+    // `is_bare_reset_class` (which requires `questdb_reachable == true`) could
+    // never return true → the reconnect-in-place branch was DEAD. The watchdog
+    // already ticks every 5s and holds `health`, so it is the lowest-risk place
+    // to maintain the signal (mirrors the `set_websocket_connections` wiring).
+    // A cheap `/exec?query=SELECT 1` ping each tick keeps it fresh INDEPENDENTLY
+    // of tick flow — critical, because a Dhan bare-RST storm stops ticks while
+    // QuestDB stays up, which is exactly when the gate must read it correctly.
+    questdb_config: tickvault_common::config::QuestDbConfig,
 ) {
     tokio::spawn(async move {
         // Fix A (2026-06-30): wall-clock start of the current reconnect-in-place
@@ -3420,6 +3439,30 @@ fn spawn_pool_watchdog_task(
                         })
                         .count() as u64;
                     health.set_websocket_connections(active);
+
+                    // Fix A no-op close (2026-06-30): push the REAL production
+                    // QuestDB-liveness signal so `is_bare_reset_class` (which
+                    // requires `questdb_reachable == true`) can actually engage
+                    // on a genuine bare-reset Halt when QuestDB is healthy, and —
+                    // by the same gate — refuses reconnect-in-place when
+                    // persistence is genuinely down. A cheap `/exec?query=SELECT 1`
+                    // probe (the canonical boot-probe, reused) wrapped in a 2s
+                    // hard timeout (mirrors the SLO scheduler so a hung TCP
+                    // connect can't stretch the 5s tick). Runs every 5s
+                    // INDEPENDENTLY of tick flow — a Dhan bare-RST storm stops
+                    // ticks while QuestDB stays up, which is exactly when this
+                    // signal must stay fresh. Cold path, not the hot tick path.
+                    const POOL_WATCHDOG_QDB_PROBE_TIMEOUT_SECS: u64 = 2; // APPROVED: bounds a hung TCP connect on the 5s cold-path watchdog tick
+                    let questdb_reachable_now = tokio::time::timeout(
+                        std::time::Duration::from_secs(POOL_WATCHDOG_QDB_PROBE_TIMEOUT_SECS),
+                        tickvault_storage::boot_probe::wait_for_questdb_ready(
+                            &questdb_config,
+                            1,
+                        ),
+                    )
+                    .await
+                    .is_ok_and(|res| res.is_ok());
+                    health.set_questdb_reachable(questdb_reachable_now);
 
                     // Live-feed health (SP5): mirror the active-socket count into
                     // the Dhan connected slot so `/api/feeds/health` reports Dhan
@@ -5922,6 +5965,12 @@ async fn start_dhan_lane(
             // Fix A (2026-06-30): shared JWT handle for the Halt-arm bare-reset
             // classifier's token-valid predicate.
             Some(std::sync::Arc::clone(&token_handle)),
+            // Fix A no-op close (2026-06-30): QuestDB config so the watchdog
+            // pushes the REAL QuestDB-liveness signal into
+            // `health.set_questdb_reachable(...)` every 5s — without it the
+            // bare-reset gate was a production no-op (signal only ever set in
+            // test code).
+            config.questdb.clone(),
         );
         // FAST BOOT parity: helper emits per-connection + aggregate Telegram
         // alerts on BOTH boot paths (main.rs ~830 for FAST BOOT, here for slow).
