@@ -761,8 +761,20 @@ impl GrowwBridgeState {
                 receipt_ist_nanos()
             };
             match self.live_writer.flush() {
-                Ok(persisted) => {
-                    feed_health.record_ticks(Feed::Groww, persisted as u64, ts);
+                Ok(outcome) => {
+                    feed_health.record_ticks(Feed::Groww, outcome.persisted as u64, ts);
+                    // A transient QuestDB socket reset (broken pipe) that the writer
+                    // reconnected + replayed IN this wake is a SELF-HEALED recovery,
+                    // NOT data-at-risk — log it at info! so it doesn't re-spam the
+                    // operator's ERROR feed (the open-bell `error!` the operator
+                    // flagged 2026-06-30). The give-up-to-spill path below stays
+                    // error! per audit Rule 5 / charter Rule 6.
+                    if outcome.reconnected {
+                        info!(
+                            persisted = outcome.persisted,
+                            "groww bridge: shared ticks (feed=groww) flush recovered via reconnect + replay (zero drop)"
+                        );
+                    }
                 }
                 Err(err) => {
                     error!(?err, "groww bridge: shared ticks (feed=groww) flush failed");
