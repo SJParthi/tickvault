@@ -53,7 +53,7 @@ git push → GitHub Actions terraform-apply.yml fires
   │   ├─ SNS topic + email subscription (check inbox, click confirm)
   │   ├─ EventBridge cron 08:30/16:30 IST weekday-only (MON-FRI) start/stop
   │   ├─ 5 CloudWatch alarms (status×2, CPU, EBS, network)
-  │   ├─ AWS Budget at $25 USD (~₹2,058/mo all-in incl GST)
+  │   ├─ AWS Budget at $55 USD (~₹2,058/mo all-in incl GST)
   │   ├─ S3 cold bucket with 5-year SEBI lifecycle
   │   └─ CloudWatch log group (14d retention)
   └─ SNS publish → Telegram "Terraform apply OK ... instance_id=i-... elastic_ip=X.X.X.X"
