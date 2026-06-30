@@ -64,7 +64,7 @@ variable "enable_eip" {
 }
 
 variable "ebs_gp3_size_gb" {
-  description = "Root EBS volume size in GB. 30 per operator lock 2026-05-29 §7 Quote 6 — 30 GB hot window keeps the all-in bill ~₹2,058/mo; the partition manager auto-archives partitions >90d to the cheaper S3 cold bucket (~4x cheaper than EBS/GB), so EBS holds only hot data. gp3 grows online (no stop, no data loss) — raise this anytime the hot window needs more."
+  description = "Root EBS volume size in GB. 30 per operator lock 2026-05-29 §7 Quote 6 — 30 GB hot window keeps the all-in bill ~₹2,058/mo; the partition manager auto-archives partitions >90d to the cheaper S3 cold bucket (~4x cheaper than EBS/GB), so EBS holds only hot data. gp3 grows online (no stop, no data loss) — raise this anytime the hot window needs more. root_block_device[0].volume_size is in the instance lifecycle.ignore_changes so a later `terraform apply` does NOT revert a script-grown disk (gp3 cannot shrink anyway). This var documents the intended size for a FRESH provision."
   type        = number
   default     = 30
 
@@ -75,7 +75,7 @@ variable "ebs_gp3_size_gb" {
 }
 
 variable "ebs_gp3_iops" {
-  description = "Root gp3 EBS provisioned IOPS. 3000 is the gp3 baseline (free, included). Range 3000-16000 — raise alongside throughput when the QuestDB write/read load grows (e.g. both feeds at ~2K SIDs). scripts/aws-upgrade-instance.sh can bump this online (no stop) via aws ec2 modify-volume, then this var keeps Terraform in sync so a later apply does not revert it."
+  description = "Root gp3 EBS provisioned IOPS. 3000 is the gp3 baseline (free, included). Range 3000-16000 — raise alongside throughput when the QuestDB write/read load grows (e.g. both feeds at ~2K SIDs). scripts/aws-upgrade-instance.sh can bump this online (no stop) via aws ec2 modify-volume; root_block_device[0].iops is in the instance lifecycle.ignore_changes so a later `terraform apply` does NOT revert a script-bumped value. This var documents the intended IOPS for a FRESH provision."
   type        = number
   default     = 3000
 
@@ -86,7 +86,7 @@ variable "ebs_gp3_iops" {
 }
 
 variable "ebs_gp3_throughput" {
-  description = "Root gp3 EBS throughput in MiB/s. 125 is the gp3 baseline (free, included). Range 125-1000 — raise alongside IOPS for heavier QuestDB I/O. scripts/aws-upgrade-instance.sh can bump this online (no stop) via aws ec2 modify-volume; keep this var in sync afterwards."
+  description = "Root gp3 EBS throughput in MiB/s. 125 is the gp3 baseline (free, included). Range 125-1000 — raise alongside IOPS for heavier QuestDB I/O. scripts/aws-upgrade-instance.sh can bump this online (no stop) via aws ec2 modify-volume; root_block_device[0].throughput is in the instance lifecycle.ignore_changes so a later `terraform apply` does NOT revert a script-bumped value. This var documents the intended throughput for a FRESH provision."
   type        = number
   default     = 125
 

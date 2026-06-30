@@ -237,6 +237,27 @@ ok "Root device ${ROOT_DEV} → volume ${VOL_ID}"
 # ---------------------------------------------------------------------------
 if [ "$WANT_EBS" -eq 1 ]; then
   [ "$VOL_ID" != "None" ] || die "Could not resolve the root EBS volume id — cannot resize."
+
+  # gp3 can GROW online but can NEVER shrink. Guard --ebs-size against the
+  # CURRENT volume size: refuse a shrink (would be rejected by AWS / risk data
+  # loss), and skip a no-op when the requested size already matches.
+  if [ -n "$EBS_SIZE" ]; then
+    CUR_VOL_SIZE=$(aws ec2 describe-volumes --region "$REGION" --volume-ids "$VOL_ID" \
+      --query 'Volumes[0].Size' --output text 2>/dev/null || echo "None")
+    is_uint "$CUR_VOL_SIZE" || die "Could not read the current size of ${VOL_ID} (got '${CUR_VOL_SIZE}') — refusing to resize blind."
+    if [ "$EBS_SIZE" -lt "$CUR_VOL_SIZE" ]; then
+      die "--ebs-size ${EBS_SIZE} GB is SMALLER than the current ${CUR_VOL_SIZE} GB. gp3 cannot shrink — refusing. Pass a size >= ${CUR_VOL_SIZE}."
+    fi
+    if [ "$EBS_SIZE" -eq "$CUR_VOL_SIZE" ]; then
+      warn "--ebs-size ${EBS_SIZE} GB equals the current size — skipping the size change (no-op)."
+      EBS_SIZE=""
+      # If size was the ONLY EBS arg, there is nothing left to resize.
+      { [ -n "$EBS_IOPS" ] || [ -n "$EBS_THROUGHPUT" ]; } || WANT_EBS=0
+    fi
+  fi
+fi
+
+if [ "$WANT_EBS" -eq 1 ]; then
   log "Online EBS resize on ${VOL_ID} (size=${EBS_SIZE:-keep} iops=${EBS_IOPS:-keep} throughput=${EBS_THROUGHPUT:-keep})"
   MOD_ARGS="--region '$REGION' --volume-id '$VOL_ID'"
   [ -n "$EBS_SIZE" ]       && MOD_ARGS="$MOD_ARGS --size $EBS_SIZE"
@@ -246,15 +267,21 @@ if [ "$WANT_EBS" -eq 1 ]; then
 
   if [ "$DRY_RUN" -eq 0 ]; then
     log "Polling volume-modification state (optimizing|completed)…"
+    EBS_DONE=0
     for _ in $(seq 1 60); do
       STATE=$(aws ec2 describe-volumes-modifications --region "$REGION" --volume-ids "$VOL_ID" \
         --query 'VolumesModifications[0].ModificationState' --output text 2>/dev/null || echo "None")
       case "$STATE" in
-        optimizing|completed) ok "Modification state: ${STATE} — disk change is live."; break ;;
+        optimizing|completed) ok "Modification state: ${STATE} — disk change is live."; EBS_DONE=1; break ;;
         failed) die "EBS modify-volume FAILED. Inspect: aws ec2 describe-volumes-modifications --volume-ids ${VOL_ID}" ;;
         *) printf '    …state=%s\n' "$STATE"; sleep 5 ;;
       esac
     done
+    # 60 × 5s = 5 min. If we never reached optimizing|completed, do NOT proceed
+    # silently — the modify may still be queued/stuck; the operator must check.
+    if [ "$EBS_DONE" -ne 1 ]; then
+      die "EBS modify-volume did NOT reach optimizing|completed within ~5 minutes (last state='${STATE}'). NOT proceeding to the instance-type flip. Check: aws ec2 describe-volumes-modifications --region ${REGION} --volume-ids ${VOL_ID}"
+    fi
   fi
   ok "EBS resize requested. The in-guest grow commands are printed at the end."
 fi
@@ -283,17 +310,30 @@ if [ "$DO_TYPE_FLIP" -eq 1 ]; then
   log "Clearing stop-protection (disable_api_stop=false) — idempotent"
   run "aws ec2 modify-instance-attribute --region '$REGION' --instance-id '$IID' --no-disable-api-stop"
 
+  # Pre-start steps (stop → modify). If any FAIL, the box is still on
+  # FROM_TYPE — no rollback needed, but message clearly so the operator knows
+  # the box is stopped on the ORIGINAL type and a re-run is safe + idempotent.
   log "Stopping ${IID} (downtime begins)"
-  run "aws ec2 stop-instances --region '$REGION' --instance-ids '$IID' >/dev/null"
-  run "aws ec2 wait instance-stopped --region '$REGION' --instance-ids '$IID'"
+  run "aws ec2 stop-instances --region '$REGION' --instance-ids '$IID' >/dev/null" \
+    || die "stop-instances failed. The box is still ${FROM_TYPE} (not modified). Investigate, then re-run — this script is idempotent."
+  run "aws ec2 wait instance-stopped --region '$REGION' --instance-ids '$IID'" \
+    || die "Timed out waiting for ${IID} to stop. The box is still ${FROM_TYPE} (not modified). Check 'aws ec2 describe-instances --instance-ids ${IID}', then re-run — safe + idempotent."
   ok "Stopped."
 
   log "Modifying instance type ${FROM_TYPE} → ${TO_TYPE}"
-  run "aws ec2 modify-instance-attribute --region '$REGION' --instance-id '$IID' --instance-type '{\"Value\":\"${TO_TYPE}\"}'"
+  run "aws ec2 modify-instance-attribute --region '$REGION' --instance-id '$IID' --instance-type '{\"Value\":\"${TO_TYPE}\"}'" \
+    || die "modify-instance-attribute failed. The box is STOPPED, still ${FROM_TYPE}. Restart it with 'aws ec2 start-instances --instance-ids ${IID}' (it comes back on ${FROM_TYPE}), or re-run this script."
   ok "Attribute set."
 
+  # Start on TO_TYPE. This is the capacity-risk step: a SYNCHRONOUS
+  # InsufficientInstanceCapacity (most likely when flipping to r8g) makes
+  # start-instances itself fail BEFORE the wait below. Wrap BOTH the start AND
+  # the wait so a failure of EITHER triggers rollback to FROM_TYPE. We must NOT
+  # let `set -e` abort before rollback — hence `if ! run ...; then ...`.
   log "Starting ${IID} on ${TO_TYPE}"
-  run "aws ec2 start-instances --region '$REGION' --instance-ids '$IID' >/dev/null"
+  if ! run "aws ec2 start-instances --region '$REGION' --instance-ids '$IID' >/dev/null"; then
+    rollback_type
+  fi
   if [ "$DRY_RUN" -eq 0 ]; then
     if ! aws ec2 wait instance-running --region "$REGION" --instance-ids "$IID" 2>/dev/null; then
       rollback_type
