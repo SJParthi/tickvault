@@ -1702,6 +1702,16 @@ async fn main() -> Result<()> {
                 // PR-E: runtime Dhan-OFF gate — same atomic the WS read loop
                 // consults; a dormant Dhan-OFF pool must not be paged/halted.
                 Some(feed_runtime.dhan_flag()),
+                // Fix A (2026-06-30): shared JWT handle so the Halt-arm
+                // bare-reset classifier can require a live token before
+                // reconnecting in place.
+                Some(token_handle.clone()),
+                // Fix A no-op close (2026-06-30): QuestDB config so the watchdog
+                // pushes the REAL QuestDB-liveness signal into
+                // `health.set_questdb_reachable(...)` every 5s — without it the
+                // bare-reset gate was a production no-op (signal only ever set
+                // in test code).
+                config.questdb.clone(),
             );
             // FAST BOOT parity with slow boot (main.rs ~1760):
             // emit per-connection + aggregate Telegram alerts so an operator
@@ -3299,6 +3309,55 @@ const fn pool_watchdog_should_act_on_degradation(
     in_market_hours && dhan_enabled
 }
 
+/// Fix A (2026-06-30) — pure classifier: is an all-down pool at the `>300s Halt`
+/// verdict a BENIGN bare-Dhan-transport-RST class (ride it out by reconnecting
+/// in place), or a GENUINE FATAL (restart as today)?
+///
+/// Returns `true` ONLY when ALL hold:
+/// - every connection's `rate_limit_streak == 0` — NOT a real Dhan 429/805
+///   (a real 429 means waiting/exiting is correct; #1265's persisted cooldown
+///   then absorbs the restart);
+/// - no connection saw a `NonReconnectableDisconnect` — no genuine-fatal Dhan
+///   disconnect code (807-class / auth / etc.);
+/// - `token_valid` — the JWT is live (a dead token needs the renewed-token
+///   restart path);
+/// - `questdb_reachable` — persistence is up (a dead DB needs a restart).
+///
+/// Any failing predicate → `false` → genuine-fatal path (today's
+/// `process::exit(2)` / lane teardown). Empty `healths` → `false` (no pool to
+/// reconnect — never ride out an absent pool).
+///
+/// Pure function (reads only the snapshot the watchdog already takes + two
+/// booleans). Tested by `test_is_bare_reset_class_*`.
+#[must_use]
+fn is_bare_reset_class(
+    healths: &[tickvault_core::websocket::types::ConnectionHealth],
+    token_valid: bool,
+    questdb_reachable: bool,
+) -> bool {
+    if healths.is_empty() {
+        return false;
+    }
+    token_valid
+        && questdb_reachable
+        && healths
+            .iter()
+            .all(|h| h.rate_limit_streak == 0 && !h.saw_non_reconnectable)
+}
+
+/// Fix A (2026-06-30) — pure ceiling check for reconnect-in-place mode. Returns
+/// `true` when the watchdog has spent `elapsed_secs` or more in reconnect-in-
+/// place for the current down-episode (>= `POOL_RECONNECT_IN_PLACE_CEILING_SECS`,
+/// = 15 min). When `true`, the watchdog falls back to the genuine-fatal exit so
+/// a truly-wedged feed cannot ride out reconnect-in-place forever — the worst
+/// case strictly degrades to today's restart behaviour.
+///
+/// Pure function. Tested by `test_reconnect_in_place_ceiling_*`.
+#[must_use]
+const fn reconnect_in_place_ceiling_exceeded(elapsed_secs: u64) -> bool {
+    elapsed_secs >= tickvault_core::websocket::pool_watchdog::POOL_RECONNECT_IN_PLACE_CEILING_SECS
+}
+
 fn spawn_pool_watchdog_task(
     pool: std::sync::Arc<WebSocketConnectionPool>,
     shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
@@ -3324,8 +3383,31 @@ fn spawn_pool_watchdog_task(
     // page, no `process::exit`, no lane teardown), never as "fully degraded".
     // `None` keeps the legacy always-enabled behaviour (treated as on).
     dhan_enabled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    // Fix A (2026-06-30): the shared JWT token handle so the Halt-arm bare-reset
+    // classifier can require `token_valid` before reconnecting in place. `None`
+    // (no handle wired) reads as token-invalid → genuine-fatal exit preserved
+    // (never ride out a Halt when we cannot confirm the token is live).
+    token_handle: Option<TokenHandle>,
+    // Fix A no-op close (2026-06-30): the QuestDB config so the watchdog can
+    // push a REAL production QuestDB-liveness signal into
+    // `health.set_questdb_reachable(...)` every 5s. Without this the backing
+    // `questdb_reachable` AtomicBool was only ever set true in test code, so in
+    // prod `health.questdb_reachable()` was permanently `false` →
+    // `is_bare_reset_class` (which requires `questdb_reachable == true`) could
+    // never return true → the reconnect-in-place branch was DEAD. The watchdog
+    // already ticks every 5s and holds `health`, so it is the lowest-risk place
+    // to maintain the signal (mirrors the `set_websocket_connections` wiring).
+    // A cheap `/exec?query=SELECT 1` ping each tick keeps it fresh INDEPENDENTLY
+    // of tick flow — critical, because a Dhan bare-RST storm stops ticks while
+    // QuestDB stays up, which is exactly when the gate must read it correctly.
+    questdb_config: tickvault_common::config::QuestDbConfig,
 ) {
     tokio::spawn(async move {
+        // Fix A (2026-06-30): wall-clock start of the current reconnect-in-place
+        // episode. `None` = not currently riding out a bare-reset Halt. Reset to
+        // `None` on any non-Halt verdict (the pool recovered / is no longer
+        // all-down), so the 15-min ceiling measures one continuous episode.
+        let mut reconnect_in_place_since: Option<std::time::Instant> = None;
         // 5-second poll interval — cold path, not per tick. Matches the
         // degrading/halt thresholds (60s/300s) with plenty of resolution.
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5)); // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
@@ -3357,6 +3439,30 @@ fn spawn_pool_watchdog_task(
                         })
                         .count() as u64;
                     health.set_websocket_connections(active);
+
+                    // Fix A no-op close (2026-06-30): push the REAL production
+                    // QuestDB-liveness signal so `is_bare_reset_class` (which
+                    // requires `questdb_reachable == true`) can actually engage
+                    // on a genuine bare-reset Halt when QuestDB is healthy, and —
+                    // by the same gate — refuses reconnect-in-place when
+                    // persistence is genuinely down. A cheap `/exec?query=SELECT 1`
+                    // probe (the canonical boot-probe, reused) wrapped in a 2s
+                    // hard timeout (mirrors the SLO scheduler so a hung TCP
+                    // connect can't stretch the 5s tick). Runs every 5s
+                    // INDEPENDENTLY of tick flow — a Dhan bare-RST storm stops
+                    // ticks while QuestDB stays up, which is exactly when this
+                    // signal must stay fresh. Cold path, not the hot tick path.
+                    const POOL_WATCHDOG_QDB_PROBE_TIMEOUT_SECS: u64 = 2; // APPROVED: bounds a hung TCP connect on the 5s cold-path watchdog tick
+                    let questdb_reachable_now = tokio::time::timeout(
+                        std::time::Duration::from_secs(POOL_WATCHDOG_QDB_PROBE_TIMEOUT_SECS),
+                        tickvault_storage::boot_probe::wait_for_questdb_ready(
+                            &questdb_config,
+                            1,
+                        ),
+                    )
+                    .await
+                    .is_ok_and(|res| res.is_ok());
+                    health.set_questdb_reachable(questdb_reachable_now);
 
                     // Live-feed health (SP5): mirror the active-socket count into
                     // the Dhan connected slot so `/api/feeds/health` reports Dhan
@@ -3427,6 +3533,10 @@ fn spawn_pool_watchdog_task(
                                 "S4-T1a: pool watchdog Recovered verdict — pool back online"
                             );
                             metrics::counter!("tv_pool_recoveries_total").increment(1);
+                            // Fix A (2026-06-30): the pool is back online — the
+                            // bare-reset reconnect-in-place episode is over; clear
+                            // the ceiling timer so the next episode measures fresh.
+                            reconnect_in_place_since = None;
                             // Recovery is informational; only Telegram-page the
                             // operator if the original Degraded fired (i.e. we
                             // were inside market hours AND Dhan was enabled when
@@ -3438,8 +3548,85 @@ fn spawn_pool_watchdog_task(
                             }
                         }
                         WatchdogVerdict::Halt { down_for } => {
-                            metrics::counter!("tv_pool_self_halts_total").increment(1);
                             if should_act {
+                                // Fix A (2026-06-30): classify the down-cause from
+                                // the snapshot we already took + the token/QuestDB
+                                // health signals. A BENIGN bare-Dhan-transport-RST
+                                // class (every conn streak 0, no non-reconnectable
+                                // code, token valid, QuestDB reachable) is ridden
+                                // out by reconnecting IN PLACE instead of
+                                // process::exit + a 775-SID cold re-subscribe that
+                                // trips Dhan's per-IP 429. A 15-min ceiling falls
+                                // back to the genuine-fatal exit so a wedged feed
+                                // can't ride out forever.
+                                let token_valid = token_handle.as_ref().is_some_and(|h| {
+                                    let guard = h.load();
+                                    // First `.as_ref()`: Guard -> &Option<TokenState>;
+                                    // second: Option<&TokenState>.
+                                    guard
+                                        .as_ref()
+                                        .as_ref()
+                                        .is_some_and(|s| s.is_valid())
+                                });
+                                let questdb_reachable = health.questdb_reachable();
+                                let bare_reset =
+                                    is_bare_reset_class(&healths, token_valid, questdb_reachable);
+                                let elapsed_in_place = reconnect_in_place_since
+                                    .map_or(0, |since| since.elapsed().as_secs());
+                                if bare_reset
+                                    && !reconnect_in_place_ceiling_exceeded(elapsed_in_place)
+                                {
+                                    // Start (or continue) the in-place episode.
+                                    if reconnect_in_place_since.is_none() {
+                                        reconnect_in_place_since = Some(std::time::Instant::now());
+                                    }
+                                    metrics::counter!(
+                                        "tv_ws_watchdog_reconnect_in_place_total",
+                                        "reason" => "bare_dhan_reset"
+                                    )
+                                    .increment(1);
+                                    // Restart the 300s AllDown window so the
+                                    // per-connection reconnect loops keep running
+                                    // (SubscribeRxGuard preserves subscriptions);
+                                    // no exit, no cold re-subscribe, no 429.
+                                    pool.reset_watchdog();
+                                    error!(
+                                        down_for_secs = down_for.as_secs(),
+                                        elapsed_in_place_secs = elapsed_in_place,
+                                        code = tickvault_common::error_code::ErrorCode::WsGap09WatchdogReconnectInPlace.code_str(),
+                                        "WS-GAP-09 pool watchdog Halt classified as benign \
+                                         bare-Dhan-reset (token valid, QuestDB reachable, no 429, \
+                                         no non-reconnectable code) — reconnecting IN PLACE instead \
+                                         of restarting; subscriptions preserved, no 429-tripping \
+                                         cold re-subscribe."
+                                    );
+                                    // Skip the genuine-fatal path this cycle.
+                                    continue;
+                                }
+                                // Genuine-fatal (or ceiling exceeded): restart as
+                                // today. If we WERE riding out a bare-reset and the
+                                // ceiling tripped, tag the fallback before exiting.
+                                if bare_reset {
+                                    metrics::counter!(
+                                        "tv_ws_watchdog_reconnect_in_place_total",
+                                        "reason" => "ceiling_exceeded"
+                                    )
+                                    .increment(1);
+                                    error!(
+                                        elapsed_in_place_secs = elapsed_in_place,
+                                        code = tickvault_common::error_code::ErrorCode::WsGap09WatchdogReconnectInPlace.code_str(),
+                                        "WS-GAP-09 reconnect-in-place ceiling exceeded (15 min, \
+                                         zero frame recovery) — falling back to genuine-fatal \
+                                         restart."
+                                    );
+                                }
+                                // (No need to clear `reconnect_in_place_since`
+                                // here — every path below this point diverges
+                                // via lane teardown `return` or `process::exit`.)
+                                // Genuine-fatal Halt: count it (the counter's
+                                // meaning is now sharp — a real restart, never a
+                                // benign reset ride-out).
+                                metrics::counter!("tv_pool_self_halts_total").increment(1);
                                 notifier.notify(NotificationEvent::WebSocketPoolHalt {
                                     down_secs: down_for.as_secs(),
                                 });
@@ -3491,9 +3678,20 @@ fn spawn_pool_watchdog_task(
                                 );
                             }
                         }
-                        WatchdogVerdict::Degrading { .. } | WatchdogVerdict::Healthy => {
+                        WatchdogVerdict::Healthy => {
+                            // Fix A (2026-06-30): the pool is healthy again — any
+                            // bare-reset reconnect-in-place episode has ended;
+                            // clear the ceiling timer so a fresh episode measures
+                            // from zero.
+                            reconnect_in_place_since = None;
+                        }
+                        WatchdogVerdict::Degrading { .. } => {
                             // No alert; watchdog's internal state machine
                             // will upgrade to Degraded / Halt if this persists.
+                            // NOTE: do NOT clear `reconnect_in_place_since` here —
+                            // a still-down pool mid-reconnect-in-place stays
+                            // Degrading after `reset_watchdog()`, and the 15-min
+                            // ceiling must keep accumulating across those polls.
                         }
                     }
 
@@ -5764,6 +5962,15 @@ async fn start_dhan_lane(
             // PR-E: runtime Dhan-OFF gate — same atomic the WS read loop
             // consults; a dormant Dhan-OFF pool must not be paged/halted.
             Some(feed_runtime.dhan_flag()),
+            // Fix A (2026-06-30): shared JWT handle for the Halt-arm bare-reset
+            // classifier's token-valid predicate.
+            Some(std::sync::Arc::clone(&token_handle)),
+            // Fix A no-op close (2026-06-30): QuestDB config so the watchdog
+            // pushes the REAL QuestDB-liveness signal into
+            // `health.set_questdb_reachable(...)` every 5s — without it the
+            // bare-reset gate was a production no-op (signal only ever set in
+            // test code).
+            config.questdb.clone(),
         );
         // FAST BOOT parity: helper emits per-connection + aggregate Telegram
         // alerts on BOTH boot paths (main.rs ~830 for FAST BOOT, here for slow).
@@ -8482,6 +8689,98 @@ mod tests {
             !pool_watchdog_should_act_on_degradation(false, false),
             "off-hours + Dhan off: expected idle, no page/halt"
         );
+    }
+
+    // --- Fix A (2026-06-30): reconnect-in-place bare-reset classifier ---
+
+    fn down_health(
+        id: u8,
+        rate_limit_streak: u32,
+        saw_non_reconnectable: bool,
+    ) -> tickvault_core::websocket::types::ConnectionHealth {
+        tickvault_core::websocket::types::ConnectionHealth {
+            connection_id: id,
+            state: tickvault_core::websocket::types::ConnectionState::Reconnecting,
+            subscribed_count: 0,
+            total_reconnections: 0,
+            last_activity_secs_ago: None,
+            rate_limit_streak,
+            saw_non_reconnectable,
+        }
+    }
+
+    #[test]
+    fn test_is_bare_reset_class_all_benign_true() {
+        // Every conn streak 0, none non-reconnectable, token valid, QuestDB up.
+        let healths = vec![down_health(0, 0, false), down_health(1, 0, false)];
+        assert!(
+            is_bare_reset_class(&healths, true, true),
+            "benign bare-RST class must reconnect in place"
+        );
+    }
+
+    #[test]
+    fn test_is_bare_reset_class_rate_limited_false() {
+        // A real 429 on ANY connection (streak > 0) → genuine-fatal.
+        let healths = vec![down_health(0, 0, false), down_health(1, 1, false)];
+        assert!(
+            !is_bare_reset_class(&healths, true, true),
+            "a real 429 (streak>0) must NOT reconnect in place"
+        );
+    }
+
+    #[test]
+    fn test_is_bare_reset_class_non_reconnectable_false() {
+        // A non-reconnectable Dhan disconnect seen → genuine-fatal.
+        let healths = vec![down_health(0, 0, false), down_health(1, 0, true)];
+        assert!(
+            !is_bare_reset_class(&healths, true, true),
+            "a non-reconnectable disconnect must NOT reconnect in place"
+        );
+    }
+
+    #[test]
+    fn test_is_bare_reset_class_token_invalid_false() {
+        let healths = vec![down_health(0, 0, false)];
+        assert!(
+            !is_bare_reset_class(&healths, false, true),
+            "an invalid token must NOT reconnect in place"
+        );
+    }
+
+    #[test]
+    fn test_is_bare_reset_class_questdb_down_false() {
+        let healths = vec![down_health(0, 0, false)];
+        assert!(
+            !is_bare_reset_class(&healths, true, false),
+            "an unreachable QuestDB must NOT reconnect in place"
+        );
+    }
+
+    #[test]
+    fn test_is_bare_reset_class_empty_pool_false() {
+        // No connections to reconnect → never ride out an absent pool.
+        assert!(!is_bare_reset_class(&[], true, true));
+    }
+
+    #[test]
+    fn test_reconnect_in_place_ceiling_under_continues() {
+        // Under the 15-min ceiling → keep reconnecting in place (false).
+        assert!(!reconnect_in_place_ceiling_exceeded(0));
+        assert!(!reconnect_in_place_ceiling_exceeded(
+            tickvault_core::websocket::pool_watchdog::POOL_RECONNECT_IN_PLACE_CEILING_SECS - 1
+        ));
+    }
+
+    #[test]
+    fn test_reconnect_in_place_ceiling_over_exits() {
+        // At or past the ceiling → fall back to genuine-fatal exit (true).
+        assert!(reconnect_in_place_ceiling_exceeded(
+            tickvault_core::websocket::pool_watchdog::POOL_RECONNECT_IN_PLACE_CEILING_SECS
+        ));
+        assert!(reconnect_in_place_ceiling_exceeded(
+            tickvault_core::websocket::pool_watchdog::POOL_RECONNECT_IN_PLACE_CEILING_SECS + 600
+        ));
     }
 
     #[test]

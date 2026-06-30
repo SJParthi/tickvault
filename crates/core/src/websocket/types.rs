@@ -351,6 +351,19 @@ pub struct ConnectionHealth {
     /// Values > 30 indicate a silent socket — the per-connection
     /// activity watchdog will fire shortly after.
     pub last_activity_secs_ago: Option<u32>,
+    /// Fix A (2026-06-30) — consecutive Dhan-feed rate-limit (HTTP 429 /
+    /// DATA-805 class) connect failures since the last clean connect. `0` =
+    /// not currently rate-limited. The pool watchdog's bare-reset classifier
+    /// requires this to be `0` on EVERY connection to treat an all-down pool as
+    /// a benign transport-RST class (reconnect-in-place) rather than a genuine
+    /// 429 fatal (restart). Mirrors the connection's `rate_limit_streak` atom.
+    pub rate_limit_streak: u32,
+    /// Fix A (2026-06-30) — `true` once this connection has returned a
+    /// `NonReconnectableDisconnect` (a genuine-fatal Dhan disconnect code). The
+    /// classifier treats any `true` here as genuine-fatal (never reconnect-in-
+    /// place). Sticky for the remainder of the process (a non-reconnectable
+    /// disconnect ends the connection's `run()` loop).
+    pub saw_non_reconnectable: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -795,6 +808,8 @@ mod tests {
             subscribed_count: 500,
             total_reconnections: 3,
             last_activity_secs_ago: None,
+            rate_limit_streak: 0,
+            saw_non_reconnectable: false,
         };
         let cloned = health.clone();
         assert_eq!(cloned.connection_id, 2);
@@ -811,6 +826,8 @@ mod tests {
             subscribed_count: 0,
             total_reconnections: 0,
             last_activity_secs_ago: None,
+            rate_limit_streak: 0,
+            saw_non_reconnectable: false,
         };
         assert_eq!(health.connection_id, 0);
         assert_eq!(health.state, ConnectionState::Disconnected);
@@ -1079,6 +1096,8 @@ mod tests {
             subscribed_count: 1000,
             total_reconnections: 7,
             last_activity_secs_ago: None,
+            rate_limit_streak: 0,
+            saw_non_reconnectable: false,
         };
         let debug = format!("{health:?}");
         assert!(debug.contains("ConnectionHealth"));
@@ -1268,6 +1287,8 @@ mod tests {
             subscribed_count: 5000,
             total_reconnections: 99,
             last_activity_secs_ago: Some(7),
+            rate_limit_streak: 0,
+            saw_non_reconnectable: false,
         };
         assert_eq!(health.connection_id, 4);
         assert_eq!(health.state, ConnectionState::Reconnecting);
@@ -1284,6 +1305,8 @@ mod tests {
             subscribed_count: 100,
             total_reconnections: 1,
             last_activity_secs_ago: None,
+            rate_limit_streak: 0,
+            saw_non_reconnectable: false,
         };
         let cloned = original.clone();
         assert_eq!(cloned.connection_id, original.connection_id);

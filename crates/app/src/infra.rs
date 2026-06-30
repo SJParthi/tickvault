@@ -1139,18 +1139,33 @@ fn is_service_reachable(host: &str, port: u16) -> bool {
 /// `--force-recreate` ensures containers with updated configs (healthchecks,
 /// dashboard JSON, Alloy config) are recreated automatically. Docker only
 /// recreates containers whose config hash actually changed — no-op for unchanged.
+/// Pure builder for the boot-time `docker compose up` argument vector.
+///
+/// R1 (2026-06-30) — the args MUST use the MODERN Compose-v2 form where the
+/// `compose` SUBCOMMAND comes FIRST, then `-f <file>`. The LEGACY form
+/// `docker -f <file> compose ... ` (flag before subcommand) fails with
+/// `unknown shorthand flag: 'f'` (exit 125), which makes every retry of the
+/// Docker-startup fail → QuestDB never starts → every subsequent ILP/DB write
+/// fails (the prod cascade this guards against). This extraction makes the
+/// arg ORDER unit-testable so a refactor can never silently reintroduce the
+/// legacy form. Tested by `test_docker_compose_up_args_compose_subcommand_first`.
+#[must_use]
+fn docker_compose_up_args(compose_path: &str) -> [&str; 6] {
+    [
+        "compose",
+        "-f",
+        compose_path,
+        "up",
+        "-d",
+        "--force-recreate",
+    ]
+}
+
 async fn run_docker_compose_up(env_vars: &[(&str, String)]) -> Result<()> {
     use tokio::process::Command;
 
     let mut cmd = Command::new("docker");
-    cmd.args([
-        "compose",
-        "-f",
-        DOCKER_COMPOSE_PATH,
-        "up",
-        "-d",
-        "--force-recreate",
-    ]);
+    cmd.args(docker_compose_up_args(DOCKER_COMPOSE_PATH));
 
     for (key, value) in env_vars {
         cmd.env(key, value);
@@ -2201,6 +2216,37 @@ mod tests {
         assert!(
             COMPOSE_UP_RETRY_DELAY.as_secs() >= 5 && COMPOSE_UP_RETRY_DELAY.as_secs() <= 30,
             "compose retry delay must be between 5s and 30s"
+        );
+    }
+
+    #[test]
+    fn test_docker_compose_up_args_compose_subcommand_first() {
+        // R1 (2026-06-30): the `compose` SUBCOMMAND must come FIRST, then
+        // `-f <file>`. The legacy `docker -f <file> ...` form (flag before
+        // subcommand) fails with `unknown shorthand flag: 'f'` (exit 125),
+        // which makes Docker-startup fail → QuestDB never starts → every ILP/DB
+        // write fails (the prod cascade). This pins the modern order so a
+        // refactor can never reintroduce the legacy form.
+        let args = docker_compose_up_args("deploy/docker/docker-compose.yml");
+        assert_eq!(
+            args[0], "compose",
+            "the `compose` subcommand MUST be the first arg (modern Compose v2), \
+             NOT a `-f` flag — the legacy flag-before-subcommand form fails with \
+             `unknown shorthand flag: 'f'` and stops QuestDB from ever starting"
+        );
+        assert_eq!(
+            args[1], "-f",
+            "the file flag must immediately follow `compose`"
+        );
+        assert_eq!(args[2], "deploy/docker/docker-compose.yml");
+        assert_eq!(args[3], "up");
+        assert_eq!(args[4], "-d");
+        // `compose` must appear BEFORE `-f` in the full vector.
+        let compose_pos = args.iter().position(|a| *a == "compose").unwrap();
+        let f_pos = args.iter().position(|a| *a == "-f").unwrap();
+        assert!(
+            compose_pos < f_pos,
+            "`compose` (at {compose_pos}) must precede `-f` (at {f_pos})"
         );
     }
 
