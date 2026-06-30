@@ -1512,10 +1512,12 @@ mod tests {
         // 2026-06-28 (PR-A Groww shared-master): bumped 105 -> 106 for
         // GROWW-MASTER-01 (Groww instrument persist into the shared
         // instrument_lifecycle + index_constituency tables, feed='groww').
-        // 2026-06-30 (feed-agnostic self-heal): bumped 106 -> 108 for
+        // 2026-06-30 (WS-429-cooldown): bumped 106 -> 107 for WS-GAP-08
+        // (persisted Dhan 429 rate-limit cooldown — survives process restart).
+        // 2026-06-30 (feed-agnostic self-heal): bumped 107 -> 109 for
         // FEED-STALL-01 (silently-stalled sidecar killed+relaunched) +
         // FEED-SUPERVISOR-01 (supervisor task respawned).
-        assert_eq!(ErrorCode::all().len(), 108);
+        assert_eq!(ErrorCode::all().len(), 109);
     }
 
     #[test]
