@@ -473,7 +473,7 @@ resource "aws_cloudwatch_metric_alarm" "mem_used_high" {
 # ---------------------------------------------------------------------------
 
 output "app_cloudwatch_alarms" {
-  description = "17 application-level alarms (15 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights). Cost note: total alarms 6 → 23; overage above the 10 free-tier alarms ≈ $1.30/mo + 15 custom metrics ≈ $0.75/mo ≈ ₹175/mo — well inside the $25 budget cap."
+  description = "17 application-level alarms (15 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights). Cost note: total alarms 6 → 23; overage above the 10 free-tier alarms ≈ $1.30/mo + 15 custom metrics ≈ $0.75/mo ≈ ₹175/mo — well inside the $55 budget cap."
   value = [
     aws_cloudwatch_metric_alarm.disk_used_high.alarm_name,
     aws_cloudwatch_metric_alarm.mem_used_high.alarm_name,

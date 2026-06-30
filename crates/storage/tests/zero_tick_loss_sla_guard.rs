@@ -33,7 +33,9 @@
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType, replay_all};
+use tickvault_storage::ws_frame_spill::{
+    AppendOutcome, WsFrameSpill, WsType, confirm_replayed, replay_all,
+};
 
 /// Per-test scratch dir — namespaced by test name + wall-clock nanos so
 /// parallel test runs don't stomp each other. Cleans up any stale prior
@@ -158,13 +160,25 @@ fn test_zero_tick_loss_spill_survives_crash_and_replay_recovers_all_frames() {
         );
     }
 
-    // ---- Phase 3: second replay returns nothing (archive worked) --------
-    // replay_all moves consumed segments to archive/ so a second call on
-    // the same dir must yield zero frames. Proves no double-replay.
+    // ---- Phase 3: confirmed segments do not re-replay -------------------
+    // Crash-safety contract (zero-loss MEDIUM fix 2026-06-30): replay STAGES
+    // segments in `replaying/`; they re-replay until `confirm_replayed` moves
+    // them to `archive/` (which is never re-globbed). WITHOUT a confirm, a
+    // second replay re-returns the frames (un-confirmed → re-replayed); ONLY
+    // after confirm is the second call empty. This proves both halves of the
+    // fix: no silent strand (re-replay), and no whole-archive re-replay.
+    let unconfirmed = replay_all(&wal_dir).expect("un-confirmed re-replay must succeed");
+    assert_eq!(
+        unconfirmed.len() as u64,
+        expected_total,
+        "un-confirmed segments MUST re-replay; got {} expected {expected_total}",
+        unconfirmed.len()
+    );
+    confirm_replayed(&wal_dir);
     let second = replay_all(&wal_dir).expect("second replay must succeed");
     assert!(
         second.is_empty(),
-        "segments must be archived after first replay; second replay returned {} frames",
+        "segments must be archived after confirm; post-confirm replay returned {} frames",
         second.len()
     );
 }
