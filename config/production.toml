@@ -7,8 +7,38 @@
 # =============================================================================
 
 [strategy]
-# CRITICAL: dry_run = false enables REAL order placement
-dry_run = false
+# ---------------------------------------------------------------------------
+# PRODUCTION CUTOVER — DATA-ONLY phase (no order placement). 2026-06-30.
+# ---------------------------------------------------------------------------
+# We are cutting over to PRODUCTION Dhan endpoints (api.dhan.co) with full
+# IP + auth verification ON, but NO real orders are placed yet. This is the
+# 3-month no-orders data-pull / monitoring phase per the operator data-pull
+# lock (.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md §6
+# Quote: "for the next three months no real orders").
+#
+# How "prod data, no orders" is achieved (verified against the source, NOT
+# guessed — see config.rs TradingMode + engine.rs place_order):
+#   - mode = "live"  → selects api.dhan.co semantics AND turns ON the static-IP
+#                      + auth boot gates (both are gated on `mode.is_live()` in
+#                      crates/app/src/main.rs; sandbox/paper SKIP IP+auth).
+#   - dry_run = true → OmsEngine::place_order returns a simulated PAPER-* order
+#                      at the TOP of the function (engine.rs ~line 208), BEFORE
+#                      any live HTTP path, so NOT A SINGLE real order can leave.
+# This is the only combination that yields prod endpoints + IP/auth ON + zero
+# orders. (sandbox/paper modes would skip IP/auth and hit sandbox.dhan.co.)
+#
+# BOOT-GATE TIMING (operator must know): two source-level date gates
+# (config.rs::validate earliest = 2026-07-01, and check_sandbox_window vs
+# base.toml `sandbox_only_until` = 2026-06-30) FORBID `mode = "live"` until
+# the sandbox window has fully passed. `sandbox_only_until` expires 2026-06-30
+# (today), and live trading is permitted from 2026-07-01. So this config
+# becomes bootable on/after 2026-07-01 — which is exactly when the data-pull
+# phase begins. Deploying this PR earlier than 2026-07-01 will fail-fast at
+# boot with a "SANDBOX GUARD" error by design; that is the intended fail-closed
+# safety, not a bug. (These gates live in crates/*/src/*.rs and are out of
+# scope for this config-only PR.)
+mode = "live"
+dry_run = true
 
 [risk]
 max_daily_loss_percent = 2.0
@@ -16,7 +46,13 @@ max_position_lots = 50
 auto_halt_on_error = true
 
 [dhan]
-# Production uses the same Dhan API — no sandbox
+# Production REST endpoint — PROD Dhan, explicitly pinned here so a future
+# base.toml edit can never silently leak a sandbox URL into prod. The base
+# already points rest_api_base_url at https://api.dhan.co/v2; we restate it
+# to make the prod cutover self-documenting and override-proof.
+rest_api_base_url = "https://api.dhan.co/v2"
+# Production uses the live Dhan API only — clear the sandbox URL so no sandbox
+# endpoint is ever reachable from a prod boot.
 sandbox_base_url = ""
 
 [websocket]

@@ -20,7 +20,11 @@ set -uo pipefail
 
 REGION="${AWS_REGION:-ap-south-1}"
 INSTANCE_ID="${EC2_INSTANCE_ID:-}"
-ENVIRONMENT="${TV_ENVIRONMENT:-staging}"
+# Production cutover (2026-06-30): default to `prod` so manual autopilot runs
+# match the systemd unit (TV_ENVIRONMENT=prod) — prod Dhan endpoints, data-only
+# (dry_run=true), /tickvault/prod/* SSM. Override with TV_ENVIRONMENT=staging
+# for sandbox dry-runs.
+ENVIRONMENT="${TV_ENVIRONMENT:-prod}"
 STRICT="${STRICT:-no}"
 
 if [ -z "$INSTANCE_ID" ]; then
