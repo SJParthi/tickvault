@@ -99,12 +99,27 @@ fn deploy_instance_keeps_terminate_protection() {
 #[test]
 fn deploy_instance_ignores_type_and_user_data_to_prevent_replace() {
     let body = squish(&code_only(&read(MAIN_TF)));
+    // Assert each REQUIRED key is present inside lifecycle.ignore_changes,
+    // rather than an exact closed-list match. Adding MORE ignored keys (e.g.
+    // root_block_device[0].{volume_size,iops,throughput} so a later apply can't
+    // revert an online EBS bump done by scripts/aws-upgrade-instance.sh) is
+    // strictly SAFER and must NOT break this guard. The `ignore_changes = [`
+    // anchor + per-key presence preserves the safety intent (ami / instance_type
+    // / user_data never trigger a replace) without pinning the exact list shape.
     assert!(
-        body.contains("ignore_changes = [ami, instance_type, user_data]"),
-        "aws_instance.tv_app lifecycle must ignore ami + instance_type + \
-         user_data so a merge-triggered apply can NEVER replace/wipe the \
-         running box. Upgrade via scripts/aws-upgrade-instance.sh; deploy via SSM."
+        body.contains("ignore_changes = ["),
+        "aws_instance.tv_app must declare a lifecycle.ignore_changes list so a \
+         merge-triggered apply can NEVER replace/wipe the running box. Upgrade \
+         via scripts/aws-upgrade-instance.sh; deploy via SSM."
     );
+    for key in ["ami", "instance_type", "user_data"] {
+        assert!(
+            body.contains(key),
+            "aws_instance.tv_app lifecycle.ignore_changes must include `{key}` \
+             (alongside ami + instance_type + user_data) so a merge-triggered \
+             apply can NEVER replace/wipe the running box."
+        );
+    }
     assert!(
         body.contains("user_data_replace_on_change = false"),
         "main.tf must set `user_data_replace_on_change = false` — true would \

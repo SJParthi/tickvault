@@ -442,13 +442,41 @@ resource "aws_cloudwatch_metric_alarm" "late_tick_after_boundary" {
 }
 
 # ---------------------------------------------------------------------------
+# 17. Host memory > 80% — the "time to upgrade" capacity signal.
+# Auto-DETECT, not auto-spend: this alarm tells the operator WHEN the m8g.large
+# 8 GiB box is running hot (e.g. both feeds at ~2K SIDs), so they can decide to
+# run scripts/aws-upgrade-instance.sh to a bigger type AFTER the dated-quote +
+# 4-file lock flip — it never resizes anything itself. Mirrors disk_used_high:
+# a CloudWatch Metrics Insights query so we do NOT pin CWAgent mem dimensions.
+# CWAgent already publishes mem_used_percent (user-data.sh.tftpl metrics block).
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "mem_used_high" {
+  alarm_name          = "tv-${var.environment}-mem-used-high"
+  alarm_description   = "Host memory > 80% on m8g.large (8 GiB). Capacity signal — time to consider an instance upgrade. Run scripts/aws-upgrade-instance.sh --to r8g.large --ebs-size <GB> --qdb-mem 4g AFTER the dated-quote + 4-file lock flip (daily-universe-scope-expansion-2026-05-27.md §7 Mechanical Rule 1). Auto-detect only — never auto-upgrades. See docs/runbooks/instance-upgrade.md."
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 3
+  threshold           = 80
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.app_alarm_actions
+  ok_actions          = local.app_alarm_ok
+
+  metric_query {
+    id          = "mem_used"
+    period      = 300
+    return_data = true
+    expression  = "SELECT MAX(mem_used_percent) FROM \"CWAgent\" WHERE InstanceId = '${aws_instance.tv_app.id}'"
+  }
+}
+
+# ---------------------------------------------------------------------------
 # Output — operator-facing reminder + alarm list
 # ---------------------------------------------------------------------------
 
 output "app_cloudwatch_alarms" {
-  description = "16 application-level alarms (15 Prometheus-via-CW-agent + 1 disk-used Metrics-Insights). Cost note: total alarms 6 → 22; overage above the 10 free-tier alarms ≈ $1.20/mo + 15 custom metrics ≈ $0.75/mo ≈ ₹166/mo — well inside the $25 budget cap."
+  description = "17 application-level alarms (15 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights). Cost note: total alarms 6 → 23; overage above the 10 free-tier alarms ≈ $1.30/mo + 15 custom metrics ≈ $0.75/mo ≈ ₹175/mo — well inside the $25 budget cap."
   value = [
     aws_cloudwatch_metric_alarm.disk_used_high.alarm_name,
+    aws_cloudwatch_metric_alarm.mem_used_high.alarm_name,
     aws_cloudwatch_metric_alarm.ws_pool_all_dead.alarm_name,
     aws_cloudwatch_metric_alarm.ws_failed_connections.alarm_name,
     aws_cloudwatch_metric_alarm.order_update_ws_inactive.alarm_name,
