@@ -33,6 +33,26 @@
 >
 > Operator authorized + resolved: (c) EBS gp3 **30 GB** (not 100 — 100 GB pushed the all-in bill to ~₹2,698 incl GST, over the operator's <₹2,000 target; 30 GB hot window + S3 archival of >90d partitions keeps it ~₹2,058. Internal/instance NVMe rejected — wiped on daily stop). gp3 grows online; raise anytime. (d) **Elastic IP excluded** (`enable_eip = false`) for the 3-month no-orders data-pull — saves ~₹430/mo; re-enable before live trading. (e) cost basis = **270 running hrs/month**. (f) Tax = **18% GST** total (IGST inter-state, or CGST 9% + SGST 9% intra-state — same 18%, no extra cess). All-in ≈ **₹2,058/mo incl. GST** (~₹58 over the ₹2,000 target — operator accepted; drop to 20 GB for strictly-under).
 
+**Quote 7 (2026-06-30, instance = r8g.large 16 GiB — supersedes the 2026-05-29 m8g.large lock):**
+> "just upgrade the instance to r8 large + everything related to the infra"
+>
+> Operator authorized: the host instance upgrades from **m8g.large** (2 vCPU /
+> 8 GiB, general-purpose) → **r8g.large** (Graviton4, 2 vCPU / **16 GiB**,
+> memory-optimized r-family) — DOUBLING RAM for the upcoming both-feeds +
+> larger-universe workload. Live ap-south-1 on-demand = **$0.08258/hr**. The
+> **Elastic IP is KEPT** (`enable_eip = true`, the 2026-05-31 flip — without it
+> the box has NO public IP after a stop/modify/start, so it could reach neither
+> SSM nor Dhan; see Terraform `enable_eip` description). Everything related to
+> the infra moves to r8g.large in lockstep per §7 Mechanical Rule 1: this rule
+> file §7, the superseded `aws-budget.md` + `aws-indices-only-locked-architecture.md`
+> §5 markers, the `instance_type_lock_guard.rs` ratchet, the Terraform validation,
+> the upgrade-script `FROM_TYPE` default (now `m8g.large`), and the Docker
+> QuestDB `QDB_MEM_LIMIT` default (2g → 4g, comfortable in 16 GiB). This dated
+> quote satisfies §7 Mechanical Rule 1 for the instance change. The 2K-universe
+> expansion (`MAX_DAILY_UNIVERSE_SIZE` / `SEAL_BUFFER_CAPACITY`) is a SEPARATE
+> later PR gated on a live memory measurement and is NOT changed here;
+> `dry_run` stays `true`.
+
 **Approvals:**
 - 2026-05-27: Approved Sub-PR plan items A–D (infinite retry policy, single `instrument_lifecycle` table, separate `instrument_lifecycle_audit` table, plan growing to 14 sub-PRs)
 - 2026-05-27: Approved options X–Z (EventBridge cron at 08:30 IST, `lifecycle_state_locked` column for operator overrides, `--dry-run-universe` CLI flag for first prod validation)
@@ -40,6 +60,7 @@
 - 2026-05-29: Approved EBS 100 GB + EIP excluded (no orders) + 270-hr basis → ~₹2,698/mo incl GST per Quote 6
 - 2026-06-02: Operator WIDENED the schedule from 08:30–16:30 IST to **08:00–17:00 IST** (verbatim: "instead of 8.30 am make it as 8 am till 5 pm dude so that pre-market and post-market and deployment and all other activities can run without any worries"). Crons: start `cron(30 2 ? * MON-FRI *)` (02:30 UTC = 08:00 IST), stop `cron(30 11 ? * MON-FRI *)` (11:30 UTC = 17:00 IST). Cost: +1 hr/day (~+₹120/mo), still inside the ~₹2,058/mo envelope. This dated quote satisfies §7 Mechanical Rule 1 for the schedule change.
 - 2026-06-05: Operator NARROWED the schedule back from 08:00–17:00 IST to **08:30–16:30 IST** (verbatim: "make the aws instance start and stop from 8.30 am till 4.30 pm dude one and only when it is needed let me start it manually"). Crons: start `cron(0 3 ? * MON-FRI *)` (03:00 UTC = 08:30 IST), stop `cron(0 11 ? * MON-FRI *)` (11:00 UTC = 16:30 IST). The start-watchdog ping/check move to 08:30/08:45 IST; the GitHub-Actions after-close start cron + `aws-autopilot.sh`/`deploy-aws.yml` up-window move to 08:30–16:30 in lockstep. Cost: −1 hr/day (~−₹120/mo). The 08:30 start still gives the documented §10 boot budget before the 09:00 pre-open. This dated quote satisfies §7 Mechanical Rule 1 + §12 for the schedule change and supersedes the 2026-06-02 widening.
+- 2026-06-30: Approved instance UPGRADE m8g.large → **r8g.large** (Graviton4, 2 vCPU / 16 GiB) + EIP KEPT per Quote 7; bill ~₹2,058/mo → ~₹2,919/mo incl GST (270 hrs, 30 GB EBS, +EIP). The 2K-universe expansion is deferred to a separate later PR.
 
 ---
 
@@ -163,41 +184,42 @@ SEBI retention: 5 years (matches the `order_audit` table standard).
 
 ---
 
-## §7. Instance lock — m8g.large (LOCKED 2026-05-29, supersedes the 2026-05-27 t4g.large lock + 2026-05-18 t4g.medium)
+## §7. Instance lock — r8g.large (LOCKED 2026-06-30, supersedes the 2026-05-29 m8g.large + 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks)
 
-**2026-05-29 change (operator Quote 5):** instance lock → **m8g.large**
-(Graviton4, the latest generation, fixed-performance) — SAME 8 GiB RAM, so
-the Mechanical Rule 2 memory budget below is preserved verbatim. Family
-choice rationale: 8 GiB at 2 vCPU requires the **4:1 general-purpose (m)
-ratio** — c8g.large is 4 GiB (too little, would OOM the ~4.1 GB working
-set) and r8g.large is 16 GiB (wasteful + pricier per GiB). m8g.large is
-the only family/size that lands exactly on 2 vCPU / 8 GiB. EBS-backed (NOT
-the `m8gd` local-SSD variant — that NVMe is wiped on every daily auto-stop).
+**2026-06-30 change (operator Quote 7):** instance lock → **r8g.large**
+(Graviton4, the latest generation, memory-optimized) — **16 GiB RAM** (DOUBLED
+from the m8g.large 8 GiB) so the Mechanical Rule 2 memory budget below is
+recomputed for 16 GiB. Family choice rationale: the upcoming both-feeds +
+larger-universe workload wants headroom, and the **r-family 8:1 (memory)
+ratio** gives 16 GiB at the same 2 vCPU — m8g.large (8 GiB, general-purpose
+4:1) was the prior lock; c8g.large (4 GiB, compute 2:1) is too little.
+r8g.large is the right family/size for 2 vCPU / 16 GiB. EBS-backed (NOT the
+`r8gd` local-SSD variant — that NVMe is wiped on every daily auto-stop).
 
 | Spec | Value |
 |---|---|
-| Instance | **m8g.large** — ARM Graviton4, **2 vCPU, 8 GiB RAM** (general-purpose) |
+| Instance | **r8g.large** — ARM Graviton4, **2 vCPU, 16 GiB RAM** (memory-optimized) |
 | Region | ap-south-1 (Mumbai) |
 | Tenancy | Default (Shared) |
-| Pricing | On-demand **$0.06416/hr** (live ap-south-1, 2026-05-29) — no Reserved / Savings Plan / Spot |
+| Pricing | On-demand **$0.08258/hr** (live ap-south-1, 2026-06-30) — no Reserved / Savings Plan / Spot |
 | Schedule | **Trading weekdays only (Mon–Fri), 08:30–16:30 IST auto** (start `cron(0 3 ? * MON-FRI *)`, stop `cron(0 11 ? * MON-FRI *)`) — narrowed back from 08:00–17:00 on 2026-06-05 per operator ("make the aws instance start and stop from 8.30 am till 4.30 pm"; supersedes the 2026-06-02 widening). Out-of-window runs = operator manual start. Weekends + holidays = OFF unless manually started. |
-| EBS | gp3 10 GB (unchanged) |
-| EIP | 1 (24/7, Dhan static-IP mandate — unchanged) |
+| EBS | gp3 30 GB (unchanged) |
+| EIP | 1 (24/7) — **KEPT** (`enable_eip = true`, 2026-05-31 flip; without it the box has no public IP after a stop/modify/start → unreachable by SSM + Dhan) |
 | Network | ENA enabled by default |
 
-### Cost bill (LOCKED ~₹2,698/mo incl. 18% GST — 270 hrs, 100 GB EBS, NO EIP)
+### Cost bill (LOCKED ~₹2,919/mo incl. 18% GST — 270 hrs, 30 GB EBS, +EIP)
 
 Operator-set ceiling **270 running hours/month** (auto weekday schedule
-~176 hrs + manual runs). **EBS 30 GB** (Quote 6). **Elastic IP EXCLUDED**
-(Quote 5/6: the 3-month data-pull places NO orders → Dhan static-IP
-whitelist not needed → `enable_eip = false`). m8g.large @ $0.06416/hr,
-$1 ≈ ₹85. **Every running component is itemised below — monitoring,
-alerting, Docker, Lambdas, Telegram are all included and free-tier.**
+~176 hrs + manual runs). **EBS 30 GB** (Quote 6). **Elastic IP KEPT**
+(`enable_eip = true`, 2026-05-31 — the box needs a public IP at all). r8g.large
+@ $0.08258/hr, $1 ≈ ₹85. **Every running component is itemised below —
+monitoring, alerting, Docker, Lambdas, Telegram are all included and
+free-tier.**
 
 | Line | Calc | USD |
 |---|---|---|
-| EC2 m8g.large (hosts app + Docker + QuestDB) | $0.06416/hr × 270 hrs | $17.32 |
-| Elastic IP | EXCLUDED (no orders → no static-IP need) | $0.00 |
+| EC2 r8g.large (hosts app + Docker + QuestDB) | $0.08258/hr × 270 hrs | $22.30 |
+| Elastic IP (24/7, KEPT) | $0.005/hr × 720 hrs | $3.60 |
 | EBS gp3 30 GB | $0.0912 × 30 | $2.74 |
 | S3 cold (aged-out partitions) | tiny, grows over time | $0.18 |
 | Docker (QuestDB + tickvault containers) | runs on the EC2 host | $0.00 |
@@ -209,24 +231,28 @@ alerting, Docker, Lambdas, Telegram are all included and free-tier.**
 | SNS → Telegram + Email fan-out | free tier (1M / 1k) | $0.00 |
 | SNS → SMS (optional) | ~100 India msgs | $0.28 |
 | Data transfer out | ~14 GB < 100 GB free egress | $0.00 |
-| **Subtotal (pre-GST)** | | **$20.52** |
-| **× ₹85/$** | | **₹1,744** |
-| **+ 18% GST (AWS India)** | | **~₹2,058/mo** |
+| **Subtotal (pre-GST)** | | **$29.10** |
+| **× ₹85/$** | | **₹2,474** |
+| **+ 18% GST (AWS India)** | | **~₹2,919/mo** |
 
-**Honest envelope:** ~**₹2,058/month all-in including GST** at the 270-hr
-ceiling, 30 GB EBS, no EIP. **The entire observability stack — CloudWatch
+**Honest envelope:** ~**₹2,919/month all-in including GST** at the 270-hr
+ceiling, 30 GB EBS, with the EIP kept. The r8g.large upgrade adds ~₹420/mo over
+the prior m8g.large bill (the EC2 line moves $17.32 → $22.30) and the EIP adds
+~₹306/mo vs the superseded EIP-excluded figure — net ~₹2,919 vs the prior
+~₹2,058. **The entire observability stack — CloudWatch
 metrics/alarms/logs/dashboards, all 3 Lambdas, and Telegram + Email alert
 fan-out — costs ₹0** (low-volume control-plane services sit inside AWS's
-permanent free tier per §7 Rule 5's CloudWatch-only design; only optional
-SMS is ~₹24). ~₹58 over the operator's <₹2,000 target — operator accepted;
-dropping EBS to 20 GB lands strictly under (₹1,966). 30 GB chosen over 100
-GB because the partition manager archives >90d data to S3 (~4× cheaper/GB),
-so EBS holds only the hot window; gp3 grows online if needed. EIP excluded
-(saves ~₹430/mo); flip `enable_eip = true` + re-register with Dhan before
-live orders. **Tax:** 18% GST total (IGST inter-state, or CGST 9% + SGST 9%
-intra-state — identical 18%, no extra cess). Verified: m8g.large $0.06416/hr
-console-confirmed (ap-south-1, 2026-05-29); EBS/S3/SNS are AWS list rates.
-Budget alarm ceiling = $25/mo pre-GST. Operator approved 2026-05-29.
+permanent free tier per §7 Rule 5's CloudWatch-only design; only optional SMS
+is ~₹24). 30 GB chosen over 100 GB because the partition manager archives >90d
+data to S3 (~4× cheaper/GB), so EBS holds only the hot window; gp3 grows online
+if needed. The EIP is kept because an `aws ec2 modify-instance-attribute`
+instance-type flip (stop→modify→start) leaves the ENI with NO ephemeral public
+IP (auto-assign-public-IP is a fresh-launch-only attribute), so only the EIP
+gives the box an internet path to SSM + Dhan. **Tax:** 18% GST total (IGST
+inter-state, or CGST 9% + SGST 9% intra-state — identical 18%, no extra cess).
+Verified: r8g.large $0.08258/hr (ap-south-1, 2026-06-30); EIP/EBS/S3/SNS are
+AWS list rates. Budget alarm ceiling = $35/mo pre-GST. Operator approved
+2026-06-30.
 
 > **Note on instance schedule (2026-05-29):** trading WEEKDAYS only
 > (Mon–Fri), **08:30–16:30 IST** auto start/stop. Weekends + NSE holidays
@@ -238,24 +264,26 @@ Budget alarm ceiling = $25/mo pre-GST. Operator approved 2026-05-29.
 
 ### Mechanical Rules (replaces aws-budget.md mechanical rules 1+6)
 
-1. **Instance type is m8g.large. PERIOD.** Changing it (to t4g.large, m7g,
-   r8g, a larger m8g size, etc.) requires:
-   - Operator explicit approval with dated quote (see §0 Quote 5)
+1. **Instance type is r8g.large. PERIOD.** Changing it (to m8g.large, t4g.large,
+   m7g, a larger r8g size, etc.) requires:
+   - Operator explicit approval with dated quote (see §0 Quote 7)
    - Update to this file
    - Update to `aws-indices-only-locked-architecture.md` §5
    - Update to `aws-budget.md` (existing file marked SUPERSEDED)
    - Ratchet test `crates/storage/tests/instance_type_lock_guard.rs` updated to pin the new type
+   - Update to `deploy/aws/terraform/variables.tf` `instance_type` default + validation
+   - Update to `scripts/aws-upgrade-instance.sh` `FROM_TYPE` default
 
-2. **Host memory budget for m8g.large (8 GiB total) — POST CloudWatch-only migration, 250 SIDs across 21 TFs:**
-   - QuestDB process: ~2.5 GB (more write pressure — ~5000 ticks/sec sustained, ~2500 audit rows/min)
-   - Tickvault app: registry + 21-TF aggregator + indicator state + today/yesterday RAM-resident sealed bars (≈3.2 MB × 250 SIDs) ≈ **~800 MB**
+2. **Host memory budget for r8g.large (16 GiB total) — POST CloudWatch-only migration, current universe (~250–1000 SIDs across 21 TFs):**
+   - QuestDB process: ~4 GB (`QDB_MEM_LIMIT=4g`; write pressure ~5000 ticks/sec sustained, ~2500 audit rows/min)
+   - Tickvault app: registry + 21-TF aggregator + indicator state + today/yesterday RAM-resident sealed bars (≈3.2 MB × up to ~1000 SIDs) ≈ **~3.2 GB**
    - App: rescue ring (100K tick cap, fixed): 10 MB
    - App: QuestDB ILP write buffer: 25 MB
    - App: 15+ audit-table buffers: 30 MB
    - Tracing / errors.jsonl rotation buffer: 100 MB
-   - OS + FS cache + kernel TCP buffers: ~600 MB
-   - **Total used: ~4.1 GB**
-   - **Headroom: ~3.9 GB** — well above the 1 GB Linux kswapd floor
+   - OS + FS cache + kernel TCP buffers: ~800 MB
+   - **Total used: ~8.2 GB**
+   - **Headroom: ~7.8 GB** — well above the 1 GB Linux kswapd floor; the doubled RAM is the reason for the r-family upgrade. (The 2K-universe expansion is a SEPARATE later PR — at ~2K SIDs the app working set grows toward ~6.4 GB and is re-measured before go-live.)
 
 3. **EBS = 30 GB gp3** (operator lock 2026-05-29 Quote 6, raised from 10 GB; 30 chosen over 100 to keep the all-in bill ~₹2,058/mo near the operator's <₹2,000 target). The partition manager auto-archives partitions >90d to the S3 cold bucket (~4× cheaper per GB than EBS), so EBS holds only the hot window. gp3 **grows online** (no stop, no data loss) — 30 GB is a floor; raise it live if the hot window grows. Internal/instance (m8gd local NVMe) storage is NOT used — it is wiped on every daily auto-stop, so it cannot hold QuestDB data. Terraform `ebs_gp3_size_gb` default = 30, range 10–200.
 
@@ -265,7 +293,7 @@ Budget alarm ceiling = $25/mo pre-GST. Operator approved 2026-05-29.
 
 6. **RAM-first hot path (mandatory, unchanged):** every indicator + strategy + risk decision reads from RAM. QuestDB is persistence + audit + cold-path boot rehydration only. Banned-pattern scanner enforces.
 
-7. **One-time instance upgrade script:** `scripts/aws-upgrade-instance.sh` performs the in-place instance flip (the already-running instance → **m8g.large**) via `aws ec2 stop-instances` → `aws ec2 modify-instance-attribute` → `aws ec2 start-instances`. EIP + EBS preserved (the script verifies the EIP survives and aborts if it changed). Downtime ~3 minutes, run on a Sunday off-market window. `FROM_TYPE`/`TO_TYPE` in the script are the single source for the flip; the market-hours guard refuses 09:00–15:30 IST Mon–Fri without `--force`.
+7. **One-time instance upgrade script:** `scripts/aws-upgrade-instance.sh` performs the in-place instance flip (the already-running instance → **r8g.large**, via `--from m8g.large --to r8g.large`) using `aws ec2 stop-instances` → `aws ec2 modify-instance-attribute` → `aws ec2 start-instances`. EIP + EBS preserved (the script verifies the EIP survives and aborts if it changed) — the EIP is mandatory because the stop/modify/start leaves the ENI with no ephemeral public IP. Downtime ~3 minutes, run on a Sunday off-market window. `FROM_TYPE`/`TO_TYPE` in the script are the single source for the flip; the market-hours guard refuses 09:00–15:30 IST Mon–Fri without `--force`.
 
 ---
 
@@ -305,7 +333,7 @@ Per `.claude/rules/project/z-plus-defense-doctrine.md`:
 The new `instrument_lifecycle` orchestrator slots between existing Step 6 (auth) and the WebSocket pool spawn:
 
 ```
-08:30 IST  EventBridge cron fires (Mon–Fri only); EC2 m8g.large boots (~60s cold)
+08:30 IST  EventBridge cron fires (Mon–Fri only); EC2 r8g.large boots (~60s cold)
 08:31      Docker compose up (QuestDB + tickvault-app)
 08:31:30   App Step 1-5: CryptoProvider → Config → Observability → Logging → Notification
 08:32      Step 6: Dhan auth (TOTP → JWT) — Valkey dual-instance lock acquired
@@ -365,7 +393,7 @@ The new `instrument_lifecycle` orchestrator slots between existing Step 6 (auth)
 - Subscribes the daily universe to derivative contracts (FUTIDX/OPTIDX/FUTSTK/OPTSTK) — only the UNDERLYING_SECURITY_ID spot rows are subscribed
 - DELETES rows from `instrument_lifecycle` (lifecycle_state transitions are the ONLY allowed mutation; no DELETE statements)
 - Changes `effective_main_feed_pool_size` to anything other than 1
-- Modifies instance type from t4g.large without the 4-file update protocol in §7 Mechanical Rule 1
+- Modifies instance type from r8g.large without the 4-file update protocol in §7 Mechanical Rule 1
 
 Any such PR MUST be rejected in review even if the operator approves verbally — the operator must update this rule file FIRST with a dated quote, only then can the PR land. This prevents accidental scope creep through casual approvals.
 
@@ -380,7 +408,7 @@ When any PR / commit message / Telegram body invokes "100% guarantee" for the da
 > app boot BLOCKS until fresh CSV in hand — never proceeds with stale, partial, or corrupt data;
 > ≤20-second tick burst absorbed via 100K-tick rescue ring (constant `TICK_BUFFER_CAPACITY`, ratcheted by `zero_tick_loss_alert_guard.rs`);
 > beyond 20s, NDJSON spill → DLQ catches every payload as recoverable text;
-> all 21 timeframes RAM-resident for today + yesterday across ~250 SIDs (~800 MB working set on t4g.large 8 GiB host);
+> all 21 timeframes RAM-resident for today + yesterday across the current universe (~250–1000 SIDs; ~3.2 GB working set, ~7.8 GB headroom on the r8g.large 16 GiB host);
 > `instrument_lifecycle` table is SEBI-compliant — NO DELETEs ever, only state transitions to `expired_*` SYMBOLs preserved in `(security_id, exchange_segment)` composite-key history per I-P1-11;
 > daily lifecycle reconciler captures every appearance, disappearance, rename, segment-move, split — logged to `instrument_lifecycle_audit` forensic chain with 5-year SEBI retention."
 
@@ -880,8 +908,8 @@ boot that produced the snapshot.
 - Indicators/strategies boundary (§28) is untouched by this work.
 
 **Honest envelope (mandatory per §13 / operator-charter §F):**
-- RAM at ~1,000 SIDs × 21 TFs ≈ ~3.2 GB working set on the m8g.large 8 GiB host
-  (~3.9 GB headroom). This is a **MEASURED gate** in the persistence/validation
+- RAM at ~1,000 SIDs × 21 TFs ≈ ~3.2 GB working set on the r8g.large 16 GiB host
+  (~7.8 GB headroom). This is a **MEASURED gate** in the persistence/validation
   sub-PR — NOT promised blind. If the measurement exceeds budget, the scope or the
   resident-TF set is revisited with the operator before go-live.
 - "~750 NTM stocks" is the expected count; the EXACT count comes from the live

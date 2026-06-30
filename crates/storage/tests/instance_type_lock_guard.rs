@@ -1,18 +1,20 @@
 //! Sub-PR #1 of 2026-05-27 daily-universe expansion — source-scan ratchet
-//! pinning the **m8g.large instance type lock** documented in
+//! pinning the **r8g.large instance type lock** documented in
 //! `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md` §7.
 //!
 //! Lock history: 2026-05-18 t4g.medium → 2026-05-27 t4g.large → 2026-05-29
-//! **m8g.large** (Graviton4, 8 GiB RAM — operator Quote 5). RAM unchanged at
-//! 8 GiB across the t4g.large→m8g.large change; only the instance string +
-//! pricing moved. This guard fails the build if:
+//! m8g.large (8 GiB) → 2026-06-30 **r8g.large** (Graviton4, 16 GiB RAM —
+//! operator Quote 7). The 2026-06-30 change DOUBLED RAM (8 → 16 GiB,
+//! memory-optimized r-family) for the upcoming both-feeds + larger-universe
+//! workload, and recomputed the §7 cost line (~₹2,058/mo → ~₹2,919/mo incl
+//! GST, 270 hrs, 30 GB EBS, +EIP kept). This guard fails the build if:
 //!
 //!  1. The new authoritative rule file disappears or stops pinning
-//!     `m8g.large`.
+//!     `r8g.large`.
 //!  2. The four superseded rule files lose their SUPERSEDED-BY
 //!     markers (= future readers wouldn't find the new contract).
-//!  3. The instance-type lock value in any of the 5 docs disagrees
-//!     with `t4g.large`.
+//!  3. The instance-type lock value in any of the docs disagrees
+//!     with `r8g.large`.
 //!
 //! See:
 //! - `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`
@@ -39,9 +41,9 @@ fn read(path: &Path) -> String {
 }
 
 /// Section A — the new authoritative rule file MUST exist and pin
-/// `m8g.large` as the locked instance type.
+/// `r8g.large` as the locked instance type.
 #[test]
-fn instance_lock_authoritative_rule_file_pins_m8g_large() {
+fn instance_lock_authoritative_rule_file_pins_r8g_large() {
     let root = repo_root();
     let path = root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md");
     assert!(
@@ -51,16 +53,16 @@ fn instance_lock_authoritative_rule_file_pins_m8g_large() {
     );
     let body = read(&path);
     assert!(
-        body.contains("m8g.large"),
-        "daily-universe rule file must pin `m8g.large` as the new instance lock"
+        body.contains("r8g.large"),
+        "daily-universe rule file must pin `r8g.large` as the new instance lock"
     );
     assert!(
-        body.contains("**m8g.large**"),
-        "daily-universe rule file must bold-pin `m8g.large` in the §7 instance-spec table"
+        body.contains("**r8g.large**"),
+        "daily-universe rule file must bold-pin `r8g.large` in the §7 instance-spec table"
     );
     assert!(
-        body.contains("8 GiB RAM"),
-        "daily-universe rule file must pin 8 GiB RAM for m8g.large"
+        body.contains("16 GiB RAM"),
+        "daily-universe rule file must pin 16 GiB RAM for r8g.large"
     );
 }
 
@@ -129,18 +131,19 @@ fn instance_lock_supersession_markers_present_in_operator_charter() {
 }
 
 /// Section C — the bill in §7 must match the locked figure. Operator
-/// approved ~₹2,058/mo on 2026-05-29 (m8g.large, 270 hrs, 30 GB EBS, no EIP,
-/// incl. 18% GST; supersedes the earlier ~₹1,503 / ~₹1,514 figures). If
+/// approved ~₹2,919/mo on 2026-06-30 (r8g.large, 270 hrs, 30 GB EBS, +EIP
+/// kept, incl. 18% GST; supersedes the earlier ~₹2,058 / ~₹1,514 figures —
+/// the r8g.large upgrade adds ~₹420/mo and the kept EIP adds ~₹306/mo). If
 /// someone re-tunes this in the rule file without operator approval, the
 /// build fails.
 #[test]
-fn instance_lock_monthly_bill_pinned_to_rupees_2058() {
+fn instance_lock_monthly_bill_pinned_to_rupees_2919() {
     let root = repo_root();
     let body =
         read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
     assert!(
-        body.contains("~₹2,058/mo") || body.contains("Rs 2,058/mo"),
-        "rule file §7 must pin the ~₹2,058/mo bill (operator approved 2026-05-29: m8g.large, 270 hrs, 30 GB EBS, no EIP, incl GST)"
+        body.contains("~₹2,919/mo") || body.contains("Rs 2,919/mo"),
+        "rule file §7 must pin the ~₹2,919/mo bill (operator approved 2026-06-30: r8g.large, 270 hrs, 30 GB EBS, +EIP, incl GST)"
     );
 }
 

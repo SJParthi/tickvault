@@ -100,21 +100,27 @@ fn test_terraform_instance_type_pinned() {
     let content =
         std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/variables.tf"))
             .expect("variables.tf must be readable"); // APPROVED: test
-    // Operator-lock 2026-05-29 (daily-universe-scope-expansion-2026-05-27.md §7
-    // Quote 5): m8g.large ONLY (Graviton4, 8 GiB). SUPERSEDES the 2026-05-18
-    // t4g.medium + 2026-05-27 t4g.large locks. Any reintroduction of
-    // c7i.xlarge / c8g.xlarge / t4g.* as the PINNED type fails this test.
+    // Operator-lock 2026-06-30 (daily-universe-scope-expansion-2026-05-27.md §7
+    // Quote 7): r8g.large ONLY (Graviton4, 16 GiB) — DOUBLED RAM from m8g.large
+    // for the both-feeds + larger-universe workload. SUPERSEDES the 2026-05-29
+    // m8g.large + 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks. Any
+    // reintroduction of c7i.xlarge / c8g.xlarge / m8g.large / t4g.* as the
+    // PINNED type fails this test.
     assert!(
-        content.contains("\"m8g.large\""),
-        "variables.tf must pin instance_type to m8g.large (operator lock 2026-05-29, see daily-universe-scope-expansion-2026-05-27.md §7)"
+        content.contains("\"r8g.large\""),
+        "variables.tf must pin instance_type to r8g.large (operator lock 2026-06-30, see daily-universe-scope-expansion-2026-05-27.md §7)"
     );
     assert!(
-        content.contains("var.instance_type == \"m8g.large\""),
+        content.contains("var.instance_type == \"r8g.large\""),
         "variables.tf must VALIDATE instance_type pinning"
     );
     // Negative asserts — block the retired stacks from ever returning as the
-    // validated default (t4g.medium/t4g.large may still appear in SUPERSEDES
-    // comments, so we only forbid them as the validation condition).
+    // validated default (m8g.large/t4g.medium/t4g.large may still appear in
+    // SUPERSEDES comments, so we only forbid them as the validation condition).
+    assert!(
+        !content.contains("var.instance_type == \"m8g.large\""),
+        "m8g.large retired as the pinned type (operator lock 2026-06-30, doubled RAM to r8g.large)"
+    );
     assert!(
         !content.contains("var.instance_type == \"t4g.medium\""),
         "t4g.medium retired as the pinned type (operator lock 2026-05-29)"

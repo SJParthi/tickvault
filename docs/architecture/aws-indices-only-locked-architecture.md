@@ -2,6 +2,8 @@
 
 > **⚠ §5 SUPERSEDED 2026-05-27 by [`.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`](../../.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md):** instance upgraded t4g.medium → t4g.large (8 GiB), bill ~₹1,022/mo → ~₹1,514/mo, cron 08:00 → 08:30 IST, universe 4 IDX_I → ~250 daily-fetched SIDs (all NSE indices + 1 BSE SENSEX + unique F&O underlyings, all Quote mode). Other sections retain 2026-05-18 lock.
 >
+> **⚠ §5 FURTHER SUPERSEDED → r8g.large 16 GiB 2026-06-30 (operator Quote 7 in [`.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`](../../.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md) §7):** instance upgraded m8g.large → **r8g.large** (Graviton4, 2 vCPU / **16 GiB**, memory-optimized — DOUBLED RAM), bill → ~₹2,919/mo incl GST (270 hrs, 30 GB EBS, +EIP kept; r8g.large @ $0.08258/hr). Host memory budget recomputed for 16 GiB (~8.2 GB used, ~7.8 GB headroom at the current ~250–1000-SID universe). EIP kept because a stop/modify/start instance-type flip leaves no ephemeral public IP. The current effective instance lock lives in that file's §7; the t4g.medium spec table below is 2026-05-18 historical audit only.
+>
 > **Status:** LOCKED design (no code shipped). Supersedes `aws-cost-floor-analysis.md` §6 choice — operator picked a path none of the canned options offered. This doc captures it.
 > **Authority:** CLAUDE.md > operator-charter-forever.md > this file > `aws-budget.md` (which now needs major revision per these locks).
 > **Created:** 2026-05-18.
