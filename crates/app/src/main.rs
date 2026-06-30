@@ -3358,6 +3358,84 @@ const fn reconnect_in_place_ceiling_exceeded(elapsed_secs: u64) -> bool {
     elapsed_secs >= tickvault_core::websocket::pool_watchdog::POOL_RECONNECT_IN_PLACE_CEILING_SECS
 }
 
+/// In-window 429 ride-out (2026-06-30) — pure classifier: is an all-down pool at
+/// the `>300s Halt` verdict a BENIGN in-MARKET-HOURS Dhan rate-limit (HTTP 429 /
+/// DATA-805) class that should be RIDDEN OUT in place rather than restarted?
+///
+/// This is the SIBLING of [`is_bare_reset_class`]. That function deliberately
+/// refuses a `rate_limit_streak > 0` (it handles only the streak==0 bare-RST
+/// storm). But a genuine 429 is the EXACT case the per-connection reconnect
+/// loops already absorb in place — they wait out the
+/// `compute_rate_limit_floor_ms` 60s→5m floor and retry, preserving
+/// subscriptions via `SubscribeRxGuard` (and the WS-GAP-08 persisted cooldown
+/// survives a restart). Calling `process::exit(2)` on a 429 turns that benign
+/// in-place wait into a 775-SID cold re-subscribe that just earns the NEXT 429 →
+/// a self-inflicted restart/429 loop (observed 2026-06-30: 61 main-feed 429s in
+/// one market window; the restart loop also 429-starved the Groww feed's auth).
+///
+/// Returns `true` ONLY when ALL hold:
+/// - `in_market_hours` — gate identical to WS-GAP-09; OUTSIDE 09:00–15:30 IST a
+///   down pool is expected idle and the watchdog's `should_act` gate already
+///   handles it (this arm is never reached off-hours). Belt-and-suspenders so the
+///   classifier is honest if reused.
+/// - `token_valid` AND `questdb_reachable` — the SAME genuine-fatal guards as
+///   `is_bare_reset_class`: a dead token / dead DB still needs the restart path.
+/// - non-empty `healths` AND NO connection saw a `NonReconnectableDisconnect`
+///   (a genuine-fatal Dhan code — 807/auth/etc. — still exits, never rides out).
+/// - at least ONE connection has `rate_limit_streak > 0` — i.e. this genuinely IS
+///   the 429 class (distinguishes it from the streak==0 bare-RST class that
+///   `is_bare_reset_class` already admits). It does NOT require streak==0 — that
+///   is the whole point of this fix: it ADMITS the 429.
+///
+/// Any failing predicate → `false` → genuine-fatal path (today's
+/// `process::exit(2)` / lane teardown). Pure function (reads only the snapshot the
+/// watchdog already takes + three booleans). Tested by
+/// `test_in_window_429_rideout_class_*`.
+#[must_use]
+fn is_in_window_429_rideout_class(
+    healths: &[tickvault_core::websocket::types::ConnectionHealth],
+    in_market_hours: bool,
+    token_valid: bool,
+    questdb_reachable: bool,
+) -> bool {
+    if healths.is_empty() {
+        return false;
+    }
+    in_market_hours
+        && token_valid
+        && questdb_reachable
+        // No genuine-fatal Dhan disconnect on any connection.
+        && healths.iter().all(|h| !h.saw_non_reconnectable)
+        // ...and this IS the 429 class: at least one connection is rate-limited.
+        && healths.iter().any(|h| h.rate_limit_streak > 0)
+}
+
+/// In-window 429 ride-out (2026-06-30) — the SINGLE ride-out decision the pool
+/// watchdog's Halt arm consults. An all-down Halt should reconnect IN PLACE
+/// (instead of `process::exit`/lane teardown + a 429-tripping cold re-subscribe)
+/// when it is EITHER:
+/// - a benign streak==0 bare-Dhan-transport-RST storm ([`is_bare_reset_class`]),
+///   OR
+/// - a benign in-market-hours Dhan 429 storm
+///   ([`is_in_window_429_rideout_class`]).
+///
+/// Both classes share the SAME genuine-fatal guards (token valid, QuestDB
+/// reachable, no non-reconnectable code, non-empty pool) and the SAME 15-min
+/// ceiling (`reconnect_in_place_ceiling_exceeded`, checked separately by the
+/// caller) so a truly-wedged feed still falls back to the genuine-fatal restart —
+/// never WORSE than today's behaviour. Pure function. Tested by
+/// `test_should_reconnect_in_place_*`.
+#[must_use]
+fn should_reconnect_in_place(
+    healths: &[tickvault_core::websocket::types::ConnectionHealth],
+    in_market_hours: bool,
+    token_valid: bool,
+    questdb_reachable: bool,
+) -> bool {
+    is_bare_reset_class(healths, token_valid, questdb_reachable)
+        || is_in_window_429_rideout_class(healths, in_market_hours, token_valid, questdb_reachable)
+}
+
 fn spawn_pool_watchdog_task(
     pool: std::sync::Arc<WebSocketConnectionPool>,
     shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
@@ -3569,11 +3647,36 @@ fn spawn_pool_watchdog_task(
                                         .is_some_and(|s| s.is_valid())
                                 });
                                 let questdb_reachable = health.questdb_reachable();
+                                // In-window 429 ride-out (2026-06-30): the
+                                // ride-out decision now covers BOTH the streak==0
+                                // bare-RST storm AND the in-market-hours Dhan 429
+                                // storm. A 429 is the EXACT case the per-connection
+                                // loops already absorb in place (they wait out the
+                                // floor + retry, subs preserved); exiting on it
+                                // just earns the next 429 (self-inflicted
+                                // restart/429 loop — observed 2026-06-30: 61
+                                // main-feed 429s, also 429-starving Groww).
                                 let bare_reset =
                                     is_bare_reset_class(&healths, token_valid, questdb_reachable);
+                                let ride_out = should_reconnect_in_place(
+                                    &healths,
+                                    in_market_hours,
+                                    token_valid,
+                                    questdb_reachable,
+                                );
+                                // Distinguish the two ride-out classes for
+                                // observability: `bare_dhan_reset` = streak==0
+                                // RST storm; `in_window_429_ride_out` = the new
+                                // in-market 429 admit (bare_reset is false but
+                                // ride_out is true ⇒ admitted via the 429 class).
+                                let ride_out_reason = if bare_reset {
+                                    "bare_dhan_reset"
+                                } else {
+                                    "in_window_429_ride_out"
+                                };
                                 let elapsed_in_place = reconnect_in_place_since
                                     .map_or(0, |since| since.elapsed().as_secs());
-                                if bare_reset
+                                if ride_out
                                     && !reconnect_in_place_ceiling_exceeded(elapsed_in_place)
                                 {
                                     // Start (or continue) the in-place episode.
@@ -3582,21 +3685,25 @@ fn spawn_pool_watchdog_task(
                                     }
                                     metrics::counter!(
                                         "tv_ws_watchdog_reconnect_in_place_total",
-                                        "reason" => "bare_dhan_reset"
+                                        "reason" => ride_out_reason
                                     )
                                     .increment(1);
                                     // Restart the 300s AllDown window so the
                                     // per-connection reconnect loops keep running
-                                    // (SubscribeRxGuard preserves subscriptions);
-                                    // no exit, no cold re-subscribe, no 429.
+                                    // (SubscribeRxGuard preserves subscriptions;
+                                    // they ALSO honor the WS-GAP-08 429 cooldown
+                                    // floor in-place); no exit, no cold
+                                    // re-subscribe, no fresh 429.
                                     pool.reset_watchdog();
                                     error!(
                                         down_for_secs = down_for.as_secs(),
                                         elapsed_in_place_secs = elapsed_in_place,
+                                        reason = ride_out_reason,
                                         code = tickvault_common::error_code::ErrorCode::WsGap09WatchdogReconnectInPlace.code_str(),
                                         "WS-GAP-09 pool watchdog Halt classified as benign \
-                                         bare-Dhan-reset (token valid, QuestDB reachable, no 429, \
-                                         no non-reconnectable code) — reconnecting IN PLACE instead \
+                                         ride-out (token valid, QuestDB reachable, no \
+                                         non-reconnectable code; either a streak==0 bare-Dhan-reset \
+                                         OR an in-market Dhan 429) — reconnecting IN PLACE instead \
                                          of restarting; subscriptions preserved, no 429-tripping \
                                          cold re-subscribe."
                                     );
@@ -3604,9 +3711,9 @@ fn spawn_pool_watchdog_task(
                                     continue;
                                 }
                                 // Genuine-fatal (or ceiling exceeded): restart as
-                                // today. If we WERE riding out a bare-reset and the
-                                // ceiling tripped, tag the fallback before exiting.
-                                if bare_reset {
+                                // today. If we WERE riding out (either class) and
+                                // the ceiling tripped, tag the fallback first.
+                                if ride_out {
                                     metrics::counter!(
                                         "tv_ws_watchdog_reconnect_in_place_total",
                                         "reason" => "ceiling_exceeded"
@@ -3614,6 +3721,7 @@ fn spawn_pool_watchdog_task(
                                     .increment(1);
                                     error!(
                                         elapsed_in_place_secs = elapsed_in_place,
+                                        ride_out_reason,
                                         code = tickvault_common::error_code::ErrorCode::WsGap09WatchdogReconnectInPlace.code_str(),
                                         "WS-GAP-09 reconnect-in-place ceiling exceeded (15 min, \
                                          zero frame recovery) — falling back to genuine-fatal \
@@ -8781,6 +8889,157 @@ mod tests {
         assert!(reconnect_in_place_ceiling_exceeded(
             tickvault_core::websocket::pool_watchdog::POOL_RECONNECT_IN_PLACE_CEILING_SECS + 600
         ));
+    }
+
+    // --- In-window 429 ride-out (2026-06-30): the audit's HIGH-finding fix ---
+
+    #[test]
+    fn test_in_window_429_rideout_class_streak_positive_true() {
+        // THE CORE FIX: in market hours, token+QDB ok, no non-reconnectable,
+        // at least one conn rate-limited (streak>0) → ride out the 429 in place
+        // instead of process::exit + 429-tripping cold re-subscribe.
+        let healths = vec![down_health(0, 1, false)];
+        assert!(
+            is_in_window_429_rideout_class(&healths, true, true, true),
+            "an in-market Dhan 429 (streak>0) must reconnect in place, not restart"
+        );
+        // Mixed pool: one rate-limited, one not → still the 429 class.
+        let mixed = vec![down_health(0, 0, false), down_health(1, 2, false)];
+        assert!(
+            is_in_window_429_rideout_class(&mixed, true, true, true),
+            "a 429 on ANY conn is the 429 class"
+        );
+    }
+
+    #[test]
+    fn test_in_window_429_rideout_class_out_of_hours_false() {
+        // Outside market hours the down pool is expected idle — never ride out
+        // here (the watchdog's should_act gate handles off-hours separately).
+        let healths = vec![down_health(0, 1, false)];
+        assert!(
+            !is_in_window_429_rideout_class(&healths, false, true, true),
+            "out of market hours must NOT ride out (expected-idle path owns it)"
+        );
+    }
+
+    #[test]
+    fn test_in_window_429_rideout_class_token_invalid_false() {
+        // A dead token still needs the renewed-token restart path.
+        let healths = vec![down_health(0, 1, false)];
+        assert!(
+            !is_in_window_429_rideout_class(&healths, true, false, true),
+            "an invalid token must NOT ride out — genuine-fatal restart"
+        );
+    }
+
+    #[test]
+    fn test_in_window_429_rideout_class_questdb_down_false() {
+        // A dead DB still needs the restart path.
+        let healths = vec![down_health(0, 1, false)];
+        assert!(
+            !is_in_window_429_rideout_class(&healths, true, true, false),
+            "an unreachable QuestDB must NOT ride out — genuine-fatal restart"
+        );
+    }
+
+    #[test]
+    fn test_in_window_429_rideout_class_non_reconnectable_false() {
+        // A genuine-fatal Dhan disconnect (807/auth/etc.) on ANY conn → exit,
+        // even if another conn is merely rate-limited.
+        let healths = vec![down_health(0, 1, false), down_health(1, 0, true)];
+        assert!(
+            !is_in_window_429_rideout_class(&healths, true, true, true),
+            "a non-reconnectable disconnect must NOT ride out — genuine-fatal restart"
+        );
+    }
+
+    #[test]
+    fn test_in_window_429_rideout_class_no_streak_false() {
+        // All streak==0 is the bare-RST class (is_bare_reset_class handles it),
+        // NOT the 429 class — this classifier must return false.
+        let healths = vec![down_health(0, 0, false), down_health(1, 0, false)];
+        assert!(
+            !is_in_window_429_rideout_class(&healths, true, true, true),
+            "streak==0 is the bare-RST class, not the 429 class"
+        );
+    }
+
+    #[test]
+    fn test_in_window_429_rideout_class_empty_false() {
+        // No connections to reconnect → never ride out an absent pool.
+        assert!(!is_in_window_429_rideout_class(&[], true, true, true));
+    }
+
+    #[test]
+    fn test_should_reconnect_in_place_admits_429_in_window() {
+        // The regression the audit demands: an in-market 429 storm rides out.
+        let healths = vec![down_health(0, 1, false)];
+        assert!(
+            should_reconnect_in_place(&healths, true, true, true),
+            "in-market 429 storm must reconnect in place (the self-loop fix)"
+        );
+    }
+
+    #[test]
+    fn test_should_reconnect_in_place_admits_bare_rst() {
+        // Existing behaviour preserved: streak==0 RST storm still rides out.
+        let healths = vec![down_health(0, 0, false), down_health(1, 0, false)];
+        assert!(
+            should_reconnect_in_place(&healths, true, true, true),
+            "streak==0 bare-RST storm must still reconnect in place"
+        );
+        // ...and a bare-RST storm rides out even OUTSIDE market hours via the
+        // bare-reset class (in_market_hours only gates the 429 class), matching
+        // pre-change is_bare_reset_class behaviour.
+        assert!(
+            should_reconnect_in_place(&healths, false, true, true),
+            "bare-RST class is not market-hours-gated (unchanged)"
+        );
+    }
+
+    #[test]
+    fn test_should_reconnect_in_place_genuine_fatal_token_dead() {
+        // Token dead → neither class → genuine-fatal exit (no wedge).
+        let healths = vec![down_health(0, 1, false)];
+        assert!(
+            !should_reconnect_in_place(&healths, true, false, true),
+            "a dead token must exit, never ride out"
+        );
+    }
+
+    #[test]
+    fn test_should_reconnect_in_place_genuine_fatal_questdb_down() {
+        // QuestDB dead → neither class → genuine-fatal exit (no wedge).
+        let healths = vec![down_health(0, 1, false)];
+        assert!(
+            !should_reconnect_in_place(&healths, true, true, false),
+            "a dead QuestDB must exit, never ride out"
+        );
+    }
+
+    #[test]
+    fn test_should_reconnect_in_place_genuine_fatal_non_reconnectable() {
+        // A non-reconnectable Dhan code → neither class → genuine-fatal exit.
+        let healths = vec![down_health(0, 1, true)];
+        assert!(
+            !should_reconnect_in_place(&healths, true, true, true),
+            "a non-reconnectable disconnect must exit, never ride out"
+        );
+    }
+
+    #[test]
+    fn test_should_reconnect_in_place_ceiling_still_exits() {
+        // The ride-out classifier admits a 429, but the SEPARATE ceiling check
+        // (the watchdog gates `ride_out && !ceiling_exceeded`) still forces the
+        // genuine-fatal exit past 15 min — worst case is NEVER worse than today.
+        let healths = vec![down_health(0, 1, false)];
+        assert!(should_reconnect_in_place(&healths, true, true, true));
+        assert!(
+            reconnect_in_place_ceiling_exceeded(
+                tickvault_core::websocket::pool_watchdog::POOL_RECONNECT_IN_PLACE_CEILING_SECS
+            ),
+            "past the 15-min ceiling the watchdog falls back to genuine-fatal exit"
+        );
     }
 
     #[test]

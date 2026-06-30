@@ -157,15 +157,43 @@ it `pool.reset_watchdog()`s (restarts the 300s `AllDown` window), keeps the
 per-connection `wait_with_backoff` reconnect loops running (subscriptions
 preserved by `SubscribeRxGuard`), and emits this code.
 
-This code tags two events:
+### 2026-06-30 extension — in-window Dhan 429 also rides out in place
+
+The original Fix A above deliberately refused a `rate_limit_streak > 0` (a real
+Dhan HTTP 429): `is_bare_reset_class` requires every connection's streak == 0.
+But that left the audit's HIGH finding open — an in-MARKET-HOURS 429 still
+classified GENUINE-FATAL → `process::exit(2)` → a 775-SID cold re-subscribe →
+another 429 → loop (observed 2026-06-30: 61 main-feed 429s in one market window;
+the restart loop also 429-starved the independent Groww feed's auth). A 429 is
+the EXACT case the per-connection reconnect loops already absorb IN PLACE — they
+wait out the `compute_rate_limit_floor_ms` 60s→5m floor (WS-GAP-08) and retry,
+subscriptions preserved by `SubscribeRxGuard`; exiting on it is the
+self-inflicted harm. So the ride-out decision is widened: the watchdog now
+consults `should_reconnect_in_place(healths, in_market_hours, token_valid,
+questdb_reachable)` = `is_bare_reset_class(...)` OR a NEW sibling
+`is_in_window_429_rideout_class(...)` that admits a 429 ONLY when ALL hold —
+`in_market_hours` (09:00–15:30 IST), token valid, QuestDB reachable, NO
+connection saw a `NonReconnectableDisconnect`, and at least one connection has
+`rate_limit_streak > 0`. Both classes share the SAME genuine-fatal guards and
+the SAME 15-min ceiling, so a dead token / dead DB / non-reconnectable code
+still exits, and a truly-stuck 429 still falls back to the genuine-fatal restart
+after 15 min — never WORSE than today.
+
+This code tags three events:
 
 1. **Benign in-place decision** (`reason="bare_dhan_reset"`) — the common,
-   healthy case: a bare-RST storm with a valid token + reachable QuestDB is
-   ridden out by reconnecting in place, no process restart, no 429.
-2. **Ceiling-exceeded fallback** (`reason="ceiling_exceeded"`) — the
-   second-tier safety valve: if reconnect-in-place persists past
-   `POOL_RECONNECT_IN_PLACE_CEILING_SECS` (= 900s = **15 minutes**) with still
-   zero frame recovery, the watchdog falls back to the genuine-fatal
+   healthy case: a streak==0 bare-RST storm with a valid token + reachable
+   QuestDB is ridden out by reconnecting in place, no process restart, no 429.
+2. **In-window 429 ride-out** (`reason="in_window_429_ride_out"`) — the
+   2026-06-30 extension: an in-MARKET-HOURS Dhan 429 (streak>0) with a valid
+   token + reachable QuestDB + no non-reconnectable code is ridden out in place
+   (the per-connection loops honor the WS-GAP-08 429 cooldown floor), instead of
+   restarting + a cold re-subscribe that just earns the next 429. This is the
+   fix for the self-inflicted restart/429 loop.
+3. **Ceiling-exceeded fallback** (`reason="ceiling_exceeded"`) — the
+   second-tier safety valve (covers BOTH ride-out classes): if reconnect-in-place
+   persists past `POOL_RECONNECT_IN_PLACE_CEILING_SECS` (= 900s = **15 minutes**)
+   with still zero frame recovery, the watchdog falls back to the genuine-fatal
    `process::exit(2)` (or lane teardown). So the worst case degrades to today's
    behaviour, just after 15 min instead of 5 — strictly never worse.
 
@@ -183,19 +211,25 @@ the SELF-INFLICTED restart/429 storm those resets were triggering.
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `WS-GAP-09`; the `reason` field is
-   `bare_dhan_reset` (benign ride-out) or `ceiling_exceeded` (fell back to exit).
+   `bare_dhan_reset` (streak==0 RST ride-out), `in_window_429_ride_out` (a real
+   in-market Dhan 429 ridden out in place — the 2026-06-30 fix), or
+   `ceiling_exceeded` (fell back to exit).
 2. `tv_ws_watchdog_reconnect_in_place_total{reason}` rate — a sustained
-   `bare_dhan_reset` rate during market hours means Dhan is RST-storming; the
-   system is absorbing it. A `ceiling_exceeded` increment means a 15-min
-   reconnect-in-place did NOT recover frames → the process restarted; treat like
-   the legacy Halt and cross-check token / QuestDB / Dhan status.
+   `bare_dhan_reset` rate during market hours means Dhan is RST-storming; a
+   sustained `in_window_429_ride_out` rate means Dhan is 429-storming (check the
+   account's per-IP rate limit + the locked 1 main-feed conn). In BOTH cases the
+   system is ABSORBING it in place instead of self-restarting. A `ceiling_exceeded`
+   increment means a 15-min reconnect-in-place did NOT recover frames → the
+   process restarted; treat like the legacy Halt and cross-check token / QuestDB /
+   Dhan status.
 3. Confirm the feed recovered: `tv_websocket_connections_active` should return to
-   the full count once Dhan stops resetting.
+   the full count once Dhan stops resetting / rate-limiting.
 
-**Auto-triage safe:** YES (Severity::Low; the benign case already self-healed,
+**Auto-triage safe:** YES (Severity::Low; the benign cases already self-healed,
 and the ceiling fallback restarts exactly as the legacy Halt did).
 
 **Source:** `crates/app/src/main.rs` (`is_bare_reset_class` +
+`is_in_window_429_rideout_class` + `should_reconnect_in_place` +
 `reconnect_in_place_ceiling_exceeded` pure helpers + the conditional Halt arm of
 `spawn_pool_watchdog_task`), `crates/core/src/websocket/types.rs`
 (`ConnectionHealth::{rate_limit_streak, saw_non_reconnectable}`),

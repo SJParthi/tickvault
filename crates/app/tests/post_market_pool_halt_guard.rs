@@ -204,12 +204,15 @@ fn pool_watchdog_is_reset_outside_market_hours() {
     // (PR-E), then 10,360 → 18,000 (Fix A 2026-06-30 added the reconnect-in-
     // place classifier block — which ALSO calls `reset_watchdog` inside the
     // Halt arm — pushing the expected-idle `if !should_act { reset_watchdog }`
-    // site past the old window).
+    // site past the old window), then 18,000 → 20,500 (in-window-429 ride-out
+    // 2026-06-30 widened the Halt arm again with the
+    // `should_reconnect_in_place` 429 admit + the new reason label, pushing the
+    // expected-idle gate to ~18,864).
     let needle = "let verdict = pool.poll_watchdog();";
     let start = src
         .find(needle)
         .expect("spawn_pool_watchdog_task must contain `let verdict = pool.poll_watchdog();`");
-    let end = (start + 18_000).min(src.len());
+    let end = (start + 20_500).min(src.len());
     let block = &src[start..end];
 
     // The reset MUST be gated on `!should_act` — i.e. it runs when the pool is
