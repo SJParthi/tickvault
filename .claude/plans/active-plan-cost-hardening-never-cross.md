@@ -1,8 +1,25 @@
-# Implementation Plan: AWS cost-hardening / never-cross + corrected EIP approach
+# Implementation Plan: AWS cost-hardening / never-cross (budget/stop/Telegram only — EIP deferred)
 
 **Status:** VERIFIED
 **Date:** 2026-06-30
 **Approved by:** Parthiban (operator) — directive given this session 2026-06-30 ("build the AWS cost-hardening / never-cross PR including the corrected EIP approach: enable auto-assign-public-IP + REMOVE the EIP since the EIP is only needed for live orders which are OFF").
+
+> **SCOPE REVISION 2026-06-30 (post adversarial-review CRITICAL):** the
+> EIP-off + auto-assign-public-IP + `ip_verification_enabled=false` changes
+> (originally Item 2) are **DEFERRED to the future r8g relaunch PR** and have
+> been REVERTED out of this PR. Reason: `terraform-apply.yml` runs
+> `terraform apply -auto-approve` on infra changes when this branch merges to
+> `main`. Flipping `enable_eip=false` on merge would DISASSOCIATE + RELEASE the
+> EIP currently attached to the running box `i-0b956d0209231a48b` — whose ENI
+> has NO dynamic public-IP association — STRANDING the box (no public IP → no
+> SSM → no Dhan → no internet), the exact failure the 2026-05-31 flip
+> documented. `associate_public_ip_address` is CREATE-ONLY, so it cannot rescue
+> a running box; only a RELAUNCH (the r8g upgrade) safely re-provisions an ENI
+> that auto-assigns a public IP. Therefore the EIP removal is a relaunch-time
+> change and belongs in the r8g PR, NOT here. **This PR is now budget / stop /
+> Telegram hardening ONLY** — every change in it is safe to `terraform apply`
+> against the running box. `enable_eip` default stays `true`,
+> `ip_verification_enabled` stays `true`, no networking attribute changes.
 
 > Guarantee matrices: this item carries the 15-row + 7-row matrices by
 > cross-reference to `.claude/rules/project/per-wave-guarantee-matrix.md`.
@@ -31,15 +48,16 @@ networking approach removes the ~₹300/mo Elastic IP cost:
    hourly hard-stop currently only stop once/day. Make the hard-stop guard
    HOURLY with an out-of-window IST time check; make the deploy self-stop the
    box it started when now outside the 08:30-16:30 IST Mon-Fri window.
-5. **Corrected EIP approach.** The 2026-05-31 EIP-flip note shows the running
-   ENI does NOT auto-assign a dynamic public IP on stop/start. The operator's
-   corrected approach: enable subnet auto-assign + instance
-   `associate_public_ip_address=true` (so a FRESH launch gets a dynamic IP),
-   then count-gate the EIP OFF (`enable_eip=false`). The EIP is only needed for
-   live orders (Dhan static-IP whitelist) which are OFF. Document the
-   operator-side ENI re-association for the *existing* running box + the
-   orphan EIP release. Set `ip_verification_enabled=false` (no orders → no
-   static-IP gate); the real gate is `strategy.mode`/`dry_run` (UNCHANGED).
+5. **Corrected EIP approach — DEFERRED to the r8g relaunch PR (NOT in this PR).**
+   The EIP-off + auto-assign-public-IP + `ip_verification_enabled=false` set is a
+   RELAUNCH-time change: `terraform-apply.yml` auto-applies on merge, and
+   flipping `enable_eip=false` then would release the in-use EIP and strand the
+   running box (its ENI has no dynamic public-IP association;
+   `associate_public_ip_address` is create-only and cannot rescue a running
+   box). The safe moment to drop the EIP is the r8g relaunch, which provisions a
+   fresh ENI that auto-assigns a public IP. So this networking work moves WHOLE
+   to the r8g PR. `enable_eip` default stays `true`,
+   `ip_verification_enabled` stays `true` here.
 6. **Cosmetic correctness.** Flip the telegram-webhook SSM-param defaults
    `/tickvault/staging/telegram/*` → `/tickvault/prod/telegram/*` (verified the
    prod params exist, staging is empty) + fix the stale "TV_ENVIRONMENT=staging"
@@ -50,23 +68,21 @@ networking approach removes the ~₹300/mo Elastic IP cost:
 - **Removing the EIP on the LIVE box would strand it** (no public IP → no SSM
   → no Dhan → no internet) because the existing primary ENI (attached
   2026-05-24) has no dynamic public-IP association of its own and
-  `map_public_ip_on_launch` only applies at original launch. MITIGATION: the
-  IaC change is safe for a FRESH provision; the running box requires an
-  operator-side step (re-create the ENI public-IP association at next start, or
-  relaunch). Captured as a prominent OPERATOR ACTION note in terraform + PR; PR
-  stays DRAFT so the operator decides sequencing. The EIP resource is
-  count-gated, so `enable_eip=false` is a reversible one-line flip.
+  `map_public_ip_on_launch` only applies at original launch, and
+  `terraform-apply.yml` auto-applies on merge. **DECISION: defer ALL EIP /
+  auto-assign / `ip_verification` changes to the r8g relaunch PR** — the
+  relaunch provisions a fresh ENI that auto-assigns a public IP, so the EIP can
+  be dropped safely THEN. This PR makes ZERO networking changes; `enable_eip`
+  stays `true`, so a merge-triggered `terraform apply` from this branch never
+  touches/releases the EIP and never replaces the instance.
 - **Budget filter removal** widens scope to total account; acceptable because
   this account hosts only tickvault. Documented.
 - **Hourly hard-stop must NOT stop during market hours** — the out-of-window
   check force-stops ONLY outside Mon-Fri 08:30-16:30 IST; inside the window it
   is a strict no-op.
-- **`ip_verification_enabled` is an unconsumed key** (not in `NetworkConfig`);
-  setting it false changes no Rust behaviour today but records intent + avoids
-  a future wiring landmine. Commented to that effect.
-- **`enable_eip` guard test** currently asserts default=true; updated to assert
-  default=false + that the subnet keeps `map_public_ip_on_launch=true` and the
-  instance carries `associate_public_ip_address=true`.
+- **`aws_deploy_safety_guard.rs` EIP guard** is UNCHANGED from `origin/main`
+  (`deploy_eip_is_enabled_by_default` asserts `default = true`) since this PR no
+  longer flips the EIP. The updated false-asserting guard moves to the r8g PR.
 
 ## Failure Modes
 
@@ -77,23 +93,29 @@ networking approach removes the ~₹300/mo Elastic IP cost:
   staging path was actively broken (ParameterNotFound), so this only fixes.
 - Deploy self-stop fires during window → guarded by the same IST window check
   the self-start uses; `if: always()` only stops a box THIS run started.
+- **EIP/networking auto-apply strand (ELIMINATED in this PR)** — by deferring
+  the `enable_eip=false` flip to the r8g relaunch PR, a merge-triggered
+  `terraform apply` from THIS branch makes no networking change, so the running
+  box's EIP/internet path is untouched.
 
 ## Test Plan
 
-- `cargo test -p tickvault-storage --test aws_deploy_safety_guard` (updated EIP
-  guard + existing schedule/EBS/upgrade guards green).
+- `cargo test -p tickvault-storage --test aws_deploy_safety_guard` (UNCHANGED
+  from origin/main — EIP guard stays `default=true`; schedule/EBS/upgrade guards
+  green).
 - `cargo test -p tickvault-common --test aws_infra_wiring --test production_config_wiring`
-  (dry_run lock + schedule asserts unaffected).
+  (dry_run lock + schedule + production.toml asserts unaffected — production.toml
+  is now identical to origin/main).
 - `terraform fmt -check` + `terraform validate` (if terraform available).
 - `bash .claude/hooks/banned-pattern-scanner.sh` + `plan-verify.sh` + plan-gate.
 
 ## Rollback
 
-- Every change is a small, reversible IaC/workflow/config edit. `enable_eip` is
-  a one-line flip back to `true`; the EIP resource is count-gated (re-applying
-  `enable_eip=true` re-provisions + re-associates an EIP). The budget filter,
-  limit, Budget Action, hourly cron, and deploy auto-stop each revert by
-  reverting the single commit. No data, no schema, no instance replacement.
+- Every change is a small, reversible IaC/workflow/config edit. The budget
+  filter, limit, Budget Action, hourly cron, and deploy auto-stop each revert by
+  reverting the single commit. No networking change, no EIP change, no data, no
+  schema, no instance replacement — so even a merge-triggered `terraform apply`
+  is non-destructive to the running box.
 
 ## Observability
 
@@ -109,13 +131,19 @@ networking approach removes the ~₹300/mo Elastic IP cost:
   - Files: deploy/aws/terraform/budget.tf, deploy/aws/terraform/budget-guards.tf
   - Tests: cargo test -p tickvault-common --test aws_infra_wiring
 - [x] Item 2 — Corrected EIP approach (auto-assign on + EIP off) + ip_verification=false
-  - Files: deploy/aws/terraform/variables.tf, deploy/aws/terraform/main.tf, config/production.toml, crates/storage/tests/aws_deploy_safety_guard.rs
-  - Tests: deploy_eip_is_enabled_by_default (renamed/updated)
+  — **DEFERRED to the r8g relaunch PR (REVERTED out of this PR — strand-safe).**
+  The EIP-off + auto-assign-public-IP + `ip_verification_enabled=false` changes
+  to `main.tf` / `production.toml` / `aws_deploy_safety_guard.rs` were reverted
+  to `origin/main`; `variables.tf` `enable_eip` default restored to `true`. Only
+  the relaunch (r8g) can safely drop the EIP without stranding the running box.
+  - Files (in r8g PR): deploy/aws/terraform/variables.tf, deploy/aws/terraform/main.tf, config/production.toml, crates/storage/tests/aws_deploy_safety_guard.rs
+  - Tests (in r8g PR): deploy_eip_is_disabled_by_default
 - [x] Item 3 — Hourly out-of-window hard-stop + deploy auto-stop + hourly running digest
   - Files: deploy/aws/terraform/budget-guards.tf, .github/workflows/deploy-aws.yml
   - Tests: cargo test -p tickvault-storage --test aws_deploy_safety_guard
 - [x] Item 4 — Cosmetic: telegram SSM-param prod defaults + stale comment fix
-  - Files: deploy/aws/terraform/variables.tf, deploy/aws/terraform/telegram-webhook-lambda.tf
+  - Files: deploy/aws/terraform/variables.tf (the webhook Lambda reads these
+    `telegram_*_ssm_param` defaults; staging path is now empty → 404, prod exists)
   - Tests: (none — string defaults; verified prod SSM params exist)
 
 ## Scenarios
@@ -125,5 +153,5 @@ networking approach removes the ~₹300/mo Elastic IP cost:
 | 1 | Spend crosses $55 ACTUAL | Native Budget Action stops the box; killswitch Lambda + email also fire |
 | 2 | Box still running at 18:00 IST (EventBridge 16:30 stop missed) | Hourly hard-stop force-stops it + Telegram |
 | 3 | Deploy self-starts box outside window for an after-close run | `if: always()` step stops it again when outside window |
-| 4 | Fresh `terraform apply` with enable_eip=false | Instance gets a dynamic public IP via subnet auto-assign + associate_public_ip_address |
+| 4 | Merge-triggered `terraform apply` from this branch | NO networking change (enable_eip stays true) → EIP untouched, running box not stranded, instance not replaced |
 | 5 | dry_run flipped to false | production_config_wiring + aws_infra_wiring FAIL the build (unchanged guard) |

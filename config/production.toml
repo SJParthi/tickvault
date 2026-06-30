@@ -34,16 +34,8 @@ sandbox_base_url = ""
 reconnect_max_attempts = 0
 
 [network]
-# Static-IP verification is OFF for the 3-month data-pull (cost-hardening
-# 2026-06-30): with no real orders (strategy.dry_run=true) there is no Dhan
-# static-IP whitelist requirement, and the EIP is removed (enable_eip=false in
-# terraform), so the box runs on a dynamic public IP that would FAIL a static-IP
-# gate. NOTE: the ACTUAL boot-time IP gate is keyed on strategy.mode/dry_run
-# (crates/app/src/main.rs — `if fast_trading_mode.is_live() { verify_public_ip }`),
-# so in sandbox/dry_run mode IP verification is ALREADY skipped; this key records
-# intent and guards against a future wiring that reads it. Re-enable (and restore
-# the EIP) when going LIVE with real orders (SEBI static-IP mandate, April 2026).
-ip_verification_enabled = false
+# Static IP verification mandatory for order APIs (SEBI April 2026)
+ip_verification_enabled = true
 ip_check_interval_secs = 300
 
 # [valkey] section removed in #O4 (2026-05-24) — Valkey removed from

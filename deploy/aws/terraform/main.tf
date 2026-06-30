@@ -9,11 +9,9 @@
 #   - IAM role: SSM read+write+delete (instance lock) + CloudWatch write +
 #     SNS publish + S3 cold-tier read/write
 #   - EC2 m8g.large (ARM Graviton4, 2 vCPU / 8 GiB) with gp3 30GB root volume
-#   - Elastic IP — count-gated on var.enable_eip (DEFAULT false 2026-06-30
-#     cost-hardening: no orders → no Dhan static-IP whitelist need → ~₹300/mo
-#     saved. Reachability via auto-assign-public-IP (subnet map_public_ip_on_launch
-#     + instance associate_public_ip_address). Flip enable_eip=true before going
-#     LIVE with orders; 7-day modify cooldown. See var.enable_eip OPERATOR ACTION)
+#   - Elastic IP — count-gated on var.enable_eip (DEFAULT false for the 3-month
+#     data-pull: no orders → no Dhan static-IP whitelist need → ~₹430/mo saved.
+#     Flip enable_eip=true before going LIVE with orders; 7-day modify cooldown)
 #   - SSM parameters for Dhan credentials, Telegram tokens, QuestDB creds,
 #     instance lock (dual-instance prevention — see crates/core/src/instance_lock.rs)
 #   - SNS topic for CRITICAL alerts → 4-channel fan-out (SMS+Telegram+Email+Connect)
@@ -265,16 +263,6 @@ resource "aws_instance" "tv_app" {
   iam_instance_profile   = aws_iam_instance_profile.tv_instance.name
   monitoring             = true
 
-  # Auto-assign a dynamic public IP at launch (cost-hardening 2026-06-30:
-  # replaces the removed EIP — var.enable_eip default flipped to false). The
-  # public subnet's map_public_ip_on_launch=true ALSO sets this, but pinning it
-  # on the instance makes the intent explicit for a FRESH provision. NOTE: this
-  # is a CREATE-ONLY attribute — changing it on the running box would force a
-  # REPLACEMENT (fresh root volume = QuestDB data wiped), so it is in
-  # lifecycle.ignore_changes below. ⚠ The EXISTING running box keeps whatever
-  # public-IP behaviour its current ENI has; see var.enable_eip OPERATOR ACTION.
-  associate_public_ip_address = true
-
   # Terminate-protection ON (terminate destroys the EBS root volume + all
   # QuestDB data — the one truly irreversible action). To intentionally
   # `terraform destroy`, operator first runs:
@@ -348,31 +336,15 @@ resource "aws_instance" "tv_app" {
       root_block_device[0].volume_size,
       root_block_device[0].iops,
       root_block_device[0].throughput,
-      # CREATE-ONLY: AWS cannot toggle auto-assign-public-IP on a running
-      # instance. Ignoring it means a `terraform apply` NEVER tries to replace
-      # the existing box to add it (replace = QuestDB data wiped). The attribute
-      # above is the intent-for-fresh-provision; the live box's reachability is
-      # governed by its current ENI + the var.enable_eip OPERATOR ACTION note.
-      associate_public_ip_address,
     ]
   }
 }
 
-# Elastic IP — count-gated on var.enable_eip (DEFAULT false 2026-06-30 — the
-# cost-hardening "corrected EIP approach": no orders → no Dhan static-IP need →
-# ~₹300/mo saved; reachability comes from auto-assign-public-IP instead, see
-# associate_public_ip_address on the instance above). Flip enable_eip=true before
-# going LIVE with orders to re-provision + register a stable IP with Dhan (7-day
-# modify cooldown). Reversible one-line change.
-#
-# ⚠ OPERATOR — ORPHAN EIP RELEASE: this account has TWO EIPs to release once the
-# box reachability is confirmed via auto-assign (so ~₹600/mo total stops):
-#   - orphan/unassociated: 65.1.58.124  (eipalloc-037b825eee2e1d023)
-#       aws ec2 release-address --allocation-id eipalloc-037b825eee2e1d023
-#   - the terraform-managed primary: 13.234.145.177 (eipalloc-01d43d4debab9217b,
-#       tagged tv-prod-eip) — flipping enable_eip=false + `terraform apply`
-#       disassociates + releases THIS one (do it AFTER confirming the running
-#       box still has internet, per the var.enable_eip OPERATOR ACTION note).
+# Elastic IP — count-gated on var.enable_eip (DEFAULT 0 for the 3-month
+# data-pull; no orders → no Dhan static-IP whitelist need → ~₹430/mo saved).
+# Flip enable_eip=true before going LIVE with orders to provision + register
+# a stable IP with Dhan. Reversible one-line change — matches the
+# operator_phone count-gate pattern in sns-subscriptions.tf.
 resource "aws_eip" "tv_app" {
   count    = var.enable_eip ? 1 : 0
   domain   = "vpc"

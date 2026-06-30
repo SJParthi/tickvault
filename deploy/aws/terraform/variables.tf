@@ -58,9 +58,9 @@ variable "ami_id" {
 }
 
 variable "enable_eip" {
-  description = "Provision a 24/7 Elastic IP (static public IP). FLIPPED BACK TO FALSE 2026-06-30 (operator's corrected cost-hardening approach): the EIP is ONLY needed for live orders (Dhan static-IP whitelist), and orders are OFF for the 3-month data-pull (production.toml locks dry_run=true). Cost-hardening removes the ~₹300/mo EIP. The replacement for reachability is auto-assign-public-IP: the public subnet already has map_public_ip_on_launch=true, and aws_instance.tv_app now sets associate_public_ip_address=true, so a FRESH provision gets a dynamic public IP via the IGW (deploy + operator-control + budget-killswitch all address the box by INSTANCE-ID over SSM/EC2, so a CHANGING dynamic IP does NOT break them). ⚠ OPERATOR ACTION for the EXISTING running box i-0b956d0209231a48b: its current primary ENI (attached 2026-05-24) has NO dynamic public-IP association — map_public_ip_on_launch only applies at ORIGINAL launch, so simply releasing the EIP would leave the running box with no public IP / no internet (the exact failure the 2026-05-31 EIP-flip documented). Before releasing the EIP, ensure the box can still reach the internet via SSM Session Manager / VPC endpoint, OR relaunch the instance so its new ENI auto-assigns a public IP. Flip enable_eip=true to restore the EIP for live orders (then register it with Dhan; 7-day modify cooldown)."
+  description = "Provision a 24/7 Elastic IP (static public IP). FLIPPED TO TRUE 2026-05-31 (operator approved 'Yes — enable it now'). The 2026-05-29 §7 Quote 5 assumption that 'the instance gets a fresh public IP on each stop/start' proved FALSE: after the manual t4g→m8g.large upgrade (stop/modify/start), the instance's ENI has auto-assign-public-IP OFF (console: 'Auto-assigned IP address: –'), so it had NO public IP and NO internet path at all — it could not reach AWS Systems Manager (Fleet Manager showed 0 managed nodes → deploy `InvalidInstanceId`) NOR Dhan. AWS cannot add an ephemeral public IP to an already-running instance; only an EIP can. So the EIP is now mandatory for the box to function, not optional. Cost ~₹300/mo; needed for live orders anyway (then register this EIP with Dhan; 7-day modify cooldown applies)."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "ebs_gp3_size_gb" {
