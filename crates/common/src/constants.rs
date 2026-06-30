@@ -458,6 +458,24 @@ pub const WS_RATE_LIMIT_BACKOFF_BASE_MS: u64 = 60_000;
 /// Cap (ms) for the post-429 main-feed reconnect floor (5 minutes).
 pub const WS_RATE_LIMIT_BACKOFF_CAP_MS: u64 = 300_000;
 
+/// Fix B (2026-06-30) — a main-feed session that stays Connected for LESS than
+/// this many milliseconds before the socket drops is treated as a "short
+/// session". Dhan was observed to silently TCP-RST the main-feed socket ~5-6s
+/// after each connect; the near-instant (0ms) first reconnect then re-subscribes
+/// 775 SIDs immediately, tightening the connect/reset/re-subscribe loop and
+/// hastening Dhan's per-IP 429. After a short session the first reconnect is
+/// floored (see `WS_SHORT_SESSION_RECONNECT_FLOOR_MS`) so the loop slows down.
+/// A session that lived AT OR PAST this threshold keeps the instant first retry
+/// (fast recovery from a genuine long-lived drop is correct).
+pub const WS_SHORT_SESSION_THRESHOLD_MS: u64 = 10_000;
+
+/// Fix B (2026-06-30) — minimum first-reconnect delay (ms) applied ONLY after a
+/// short session (uptime `< WS_SHORT_SESSION_THRESHOLD_MS`). Raises the attempt-0
+/// delay from the near-instant 0ms to ~3s so a Dhan immediate-RST loop backs off
+/// instead of hammering the endpoint. Never applied to attempts 1+, and never to
+/// a long-lived session.
+pub const WS_SHORT_SESSION_RECONNECT_FLOOR_MS: u64 = 3_000;
+
 /// Timeout for the order update WebSocket auth response (seconds).
 /// After sending the LoginReq (MsgCode 42), the server should respond
 /// within this window. 10 seconds is generous for a JSON auth handshake.

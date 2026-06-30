@@ -209,6 +209,19 @@ pub enum ErrorCode {
     /// first Dhan WS connect (preventing the instant-429 restart loop).
     /// Severity::Low — the cooldown is an advisory, fail-open protection.
     WsGap08RateLimitCooldown,
+    /// WS-GAP-09: the pool watchdog reached its `>300s all-down → Halt` verdict
+    /// but the down-cause classified as a benign bare-Dhan-transport-RST class
+    /// (every connection's rate-limit streak is `0`, no non-reconnectable Dhan
+    /// code was seen, the token is valid, and QuestDB is reachable). Instead of
+    /// `process::exit(2)` + a full 775-SID cold re-subscribe (which trips Dhan's
+    /// per-IP 429), the watchdog keeps the pool reconnecting IN PLACE
+    /// (per-connection backoff + `SubscribeRxGuard` preserve subscriptions). A
+    /// 15-minute second-tier ceiling falls back to the genuine-fatal exit if
+    /// zero frames recover, so the worst case strictly degrades to today's
+    /// behaviour. Tags two events: the benign in-place decision
+    /// (`reason="bare_dhan_reset"`) and the ceiling-exceeded fallback
+    /// (`reason="ceiling_exceeded"`). Severity::Low.
+    WsGap09WatchdogReconnectInPlace,
     /// DISK-WATCHER-01: the spill disk-health watcher task exited
     /// (panic/cancel) and the supervisor respawned it so free-space
     /// monitoring — the early-warning for the "disk full + QuestDB down"
@@ -682,6 +695,7 @@ impl ErrorCode {
             Self::WsGap06TickGapSummary => "WS-GAP-06",
             Self::WsGap07LiveChannelClosed => "WS-GAP-07",
             Self::WsGap08RateLimitCooldown => "WS-GAP-08",
+            Self::WsGap09WatchdogReconnectInPlace => "WS-GAP-09",
             Self::DiskWatcher01Respawned => "DISK-WATCHER-01",
             Self::WsSpill01WriterRespawn => "WS-SPILL-01",
             Self::WsSpill02FrameDropped => "WS-SPILL-02",
@@ -923,6 +937,7 @@ impl ErrorCode {
             | Self::WsGap04PostCloseSleep
             | Self::WsGap05PoolRespawn
             | Self::WsGap08RateLimitCooldown
+            | Self::WsGap09WatchdogReconnectInPlace
             | Self::DiskWatcher01Respawned
             | Self::AuthGap03TokenForceRenewedOnWake
             | Self::Telegram02CoalescerStateInconsistency => Severity::Low,
@@ -977,6 +992,7 @@ impl ErrorCode {
             | Self::WsGap06TickGapSummary
             | Self::WsGap07LiveChannelClosed
             | Self::WsGap08RateLimitCooldown
+            | Self::WsGap09WatchdogReconnectInPlace
             | Self::DiskWatcher01Respawned
             | Self::AuthGap03TokenForceRenewedOnWake
             | Self::Boot01QuestDbSlow
@@ -1168,6 +1184,7 @@ impl ErrorCode {
             Self::WsGap06TickGapSummary,
             Self::WsGap07LiveChannelClosed,
             Self::WsGap08RateLimitCooldown,
+            Self::WsGap09WatchdogReconnectInPlace,
             Self::DiskWatcher01Respawned,
             Self::WsSpill01WriterRespawn,
             Self::WsSpill02FrameDropped,
@@ -1517,7 +1534,10 @@ mod tests {
         // 2026-06-30 (feed-agnostic self-heal): bumped 107 -> 109 for
         // FEED-STALL-01 (silently-stalled sidecar killed+relaunched) +
         // FEED-SUPERVISOR-01 (supervisor task respawned).
-        assert_eq!(ErrorCode::all().len(), 109);
+        // 2026-06-30 (Dhan reconnect hardening Fix A): bumped 109 -> 110 for
+        // WS-GAP-09 (watchdog reconnect-in-place on the bare-Dhan-reset class
+        // instead of process::exit + 775-SID re-subscribe → 429).
+        assert_eq!(ErrorCode::all().len(), 110);
     }
 
     #[test]
