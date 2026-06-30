@@ -1700,3 +1700,43 @@ rules:
       Dhan master rows are unaffected, and the idempotent DEDUP UPSERT means the
       next boot re-runs. Silence (counter records it); escalate only if it
       persists, which is the same QuestDB-ILP-degraded condition as BOOT-01/02.
+
+  # FEED-STALL-01 = the feed-agnostic stall-watchdog killed + relaunched a
+  # sidecar that was ALIVE but streaming NOTHING across its whole universe for
+  # longer than the threshold during market hours (the silently-closed NATS
+  # socket that left Groww dead at 10:31 IST). A single restart that recovers is
+  # healthy self-heal, but a flapping restart STORM (escalated with the
+  # rapid-restart count) points at a persistent provider-side reject the relaunch
+  # alone cannot fix — so escalate: the operator must see a stall restart and
+  # check the credential / entitlement if it recurs.
+  - name: feed-stall-01-sidecar-restarted-escalate
+    match:
+      code: FEED-STALL-01
+    action: escalate
+    runbook_path: .claude/rules/project/feed-stall-watchdog-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      FEED-STALL-01 = the stall-watchdog killed + relaunched an alive-but-silent
+      feed sidecar during market hours. The restart already self-heals the
+      socket, but a recurring stall / restart STORM indicates a persistent
+      provider-side reject (entitlement / auth) — escalate so the operator
+      verifies the feed credential + live-data entitlement per the runbook.
+
+  # FEED-SUPERVISOR-01 = a feed sidecar SUPERVISOR task itself died (panic /
+  # unexpected return) and the respawning wrapper re-spawned it so the
+  # stall-watchdog can never die silently. A one-off respawn is benign; a
+  # sustained respawn rate means the supervisor keeps panicking (a real bug) —
+  # escalate so the operator inspects the backtrace per the runbook.
+  - name: feed-supervisor-01-respawned-escalate
+    match:
+      code: FEED-SUPERVISOR-01
+    action: escalate
+    runbook_path: .claude/rules/project/feed-stall-watchdog-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      FEED-SUPERVISOR-01 = the feed sidecar supervisor task died and was
+      respawned (WS-GAP-05 pattern) so the stall-watchdog keeps running. A
+      one-off respawn at shutdown is benign; a sustained respawn rate is a real
+      supervisor bug — escalate so the operator inspects the panic backtrace.

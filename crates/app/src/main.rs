@@ -377,13 +377,14 @@ async fn main() -> Result<()> {
     let groww_sidecar_notifier_slot: std::sync::Arc<
         arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>,
     > = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
-    tokio::spawn(
-        tickvault_app::groww_sidecar_supervisor::run_groww_sidecar_supervisor(
-            std::sync::Arc::clone(&feed_runtime),
-            tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
-            std::sync::Arc::clone(&feed_health),
-            std::sync::Arc::clone(&groww_sidecar_notifier_slot),
-        ),
+    // FEED-SUPERVISOR-01: spawn the feed-agnostic sidecar supervisor under a
+    // respawning wrapper so the stall-watchdog (FEED-STALL-01) can never die
+    // silently — a panic/return respawns it (WS-GAP-05 / DISK-WATCHER-01 pattern).
+    tickvault_app::groww_sidecar_supervisor::spawn_supervised_groww_sidecar_supervisor(
+        std::sync::Arc::clone(&feed_runtime),
+        tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
+        std::sync::Arc::clone(&feed_health),
+        std::sync::Arc::clone(&groww_sidecar_notifier_slot),
     );
     tokio::spawn(
         tickvault_app::groww_activation::run_groww_activation_watcher(
