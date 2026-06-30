@@ -4,9 +4,13 @@
 # Same file on Mac dev and AWS prod (r8g.large ARM Graviton4, 2 vCPUs / 16 GiB,
 # operator-lock 2026-06-30 Quote 7 in daily-universe-scope-expansion-2026-05-27.md §7).
 #
-# Post-CloudWatch-only migration (#O1/#O2/#O3/#O4), current ~250–1000-SID universe:
-#   QuestDB ~4GB (QDB_MEM_LIMIT=4g) + App ~3.2GB + OS/FS-cache ~0.8GB = ~8.2GB total.
-#   ~7.8GB headroom on 16 GiB r8g.large.
+# Post-CloudWatch-only migration (#O1/#O2/#O3/#O4), current ~250–1000-SID universe.
+#   Compose default QDB_MEM_LIMIT=2g — the safe value while the prod box is still
+#   the m8g.large 8 GiB host (the post-merge deploy must not push a 4g ceiling
+#   ahead of the physical resize). scripts/aws-upgrade-instance.sh sets
+#   QDB_MEM_LIMIT=4g coupled to the r8g.large flip; the post-resize r8g.large
+#   steady state is then QuestDB ~4GB + App ~3.2GB + OS/FS-cache ~0.8GB = ~8.2GB
+#   total, ~7.8GB headroom on the 16 GiB r8g.large.
 #
 # REMOVED (CloudWatch-only migration):
 #   - Grafana       -> CloudWatch Dashboards (#O1)
@@ -71,15 +75,19 @@ services:
     container_name: tv-questdb
     hostname: tv-questdb
     restart: unless-stopped
-    # Default 4g on the r8g.large 16 GiB host (operator lock 2026-06-30 §7
-    # Quote 7) — comfortable with ~7.8 GB headroom, sized for the current
-    # ~250–1000-SID universe + the both-feeds workload.
+    # Default 2g is the SAFE value for the current 8 GiB box: the post-merge
+    # deploy fires automatically and the prod box is still m8g.large/8 GiB
+    # until the operator runs scripts/aws-upgrade-instance.sh. A 4g ceiling
+    # deploying ahead of the physical resize is an avoidable OOM-ordering risk.
+    # The resize script SETS QDB_MEM_LIMIT=4g (in deploy/docker/.env) exactly
+    # when the box becomes the r8g.large 16 GiB host — so 4g lands coupled to
+    # the resize, never before it.
     # QuestDB mmaps data files — actual RSS is much lower than limit.
     # Partition manager keeps hot data bounded to ~90 days.
     # Env-driven so scripts/aws-upgrade-instance.sh --qdb-mem can raise it
     # further (e.g. for the deferred 2K-SID universe expansion). Override
     # QDB_MEM_LIMIT to keep a smaller value on a constrained Mac dev box.
-    mem_limit: ${QDB_MEM_LIMIT:-4g}
+    mem_limit: ${QDB_MEM_LIMIT:-2g}
     mem_reservation: 1g
     cpus: 2.0
     # OOM protection: prefer killing other containers over QuestDB.

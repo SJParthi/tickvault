@@ -109,7 +109,7 @@ def handler(event, context):
         f"{emoji} *AWS Cost — tickvault*",
         f"_Yesterday_:   ₹{inr(yday_usd):.0f}   ($${yday_usd:.2f})",
         f"_This month_:  ₹{inr(mtd_usd):.0f}   ($${mtd_usd:.2f})",
-        f"_Of $25 stop-budget_: {pct:.0f}%",
+        f"_Of $55 stop-budget_: {pct:.0f}%",
         f"_Forecast EOM_: ₹{inr(forecast_usd):.0f}   ($${forecast_usd:.2f})",
         f"_Days left_:   {days_remaining}",
         "",
