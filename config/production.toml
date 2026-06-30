@@ -1,44 +1,24 @@
 # =============================================================================
-# tickvault — Production Configuration Override
+# tickvault — Production Configuration Override (the ONLY real env)
 # =============================================================================
-# Layer on top of base.toml. Only settings that DIFFER from dev go here.
-# Secrets come from AWS SSM Parameter Store (/tickvault/prod/...).
+# Layer on top of base.toml. base.toml + production.toml are the ONLY env
+# configs (dev/staging configs were retired in the single-prod-env
+# consolidation, operator 2026-06-30). TV_ENVIRONMENT=prod selects this file
+# AND the /tickvault/prod/... SSM secret prefix.
 # Deploy: config/base.toml + config/production.toml merged via figment.
 # =============================================================================
 
 [strategy]
-# ---------------------------------------------------------------------------
-# PRODUCTION CUTOVER — DATA-ONLY phase (no order placement). 2026-06-30.
-# ---------------------------------------------------------------------------
-# We are cutting over to PRODUCTION Dhan endpoints (api.dhan.co) with full
-# IP + auth verification ON, but NO real orders are placed yet. This is the
-# 3-month no-orders data-pull / monitoring phase per the operator data-pull
-# lock (.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md §6
-# Quote: "for the next three months no real orders").
-#
-# How "prod data, no orders" is achieved (verified against the source, NOT
-# guessed — see config.rs TradingMode + engine.rs place_order):
-#   - mode = "live"  → selects api.dhan.co semantics AND turns ON the static-IP
-#                      + auth boot gates (both are gated on `mode.is_live()` in
-#                      crates/app/src/main.rs; sandbox/paper SKIP IP+auth).
-#   - dry_run = true → OmsEngine::place_order returns a simulated PAPER-* order
-#                      at the TOP of the function (engine.rs ~line 208), BEFORE
-#                      any live HTTP path, so NOT A SINGLE real order can leave.
-# This is the only combination that yields prod endpoints + IP/auth ON + zero
-# orders. (sandbox/paper modes would skip IP/auth and hit sandbox.dhan.co.)
-#
-# BOOT-GATE TIMING (operator must know): two source-level date gates
-# (config.rs::validate earliest = 2026-07-01, and check_sandbox_window vs
-# base.toml `sandbox_only_until` = 2026-06-30) FORBID `mode = "live"` until
-# the sandbox window has fully passed. `sandbox_only_until` expires 2026-06-30
-# (today), and live trading is permitted from 2026-07-01. So this config
-# becomes bootable on/after 2026-07-01 — which is exactly when the data-pull
-# phase begins. Deploying this PR earlier than 2026-07-01 will fail-fast at
-# boot with a "SANDBOX GUARD" error by design; that is the intended fail-closed
-# safety, not a bug. (These gates live in crates/*/src/*.rs and are out of
-# scope for this config-only PR.)
-mode = "live"
+# LOCKED dry_run=true — NO real orders (single-prod-env consolidation, operator
+# 2026-06-30); flipping to live is a separate deliberate change. This is still
+# the data-pull phase. The OMS engine (crates/trading/src/oms/engine.rs) returns
+# BEFORE any live HTTP order call while dry_run==true.
 dry_run = true
+# Belt-and-suspenders defense-in-depth (mirrors the retired staging.toml): even
+# if a future misedit flips mode=live, this far-future cutoff makes accidental
+# real-money promotion mechanically impossible at boot
+# (StrategyConfig::check_sandbox_window panics on mode=Live before this date).
+sandbox_only_until = "2099-12-31"
 
 [risk]
 max_daily_loss_percent = 2.0
@@ -78,5 +58,15 @@ host = "0.0.0.0"
 port = 3001
 
 [notification]
-# Enable SNS SMS alerts in production for CRITICAL events
+# Enable SNS SMS alerts in production for CRITICAL events.
+# NOTE: with sns_enabled=true, prod must have /tickvault/prod/sns/phone-number
+# populated in SSM (operator is populating /tickvault/prod/* manually).
 sns_enabled = true
+
+[feeds]
+# Both market-data feeds run under the single prod env (operator 2026-06-30).
+# Dhan (feed #1) is the primary trading feed; Groww (feed #2) is the
+# independent second live feed per groww-second-feed-scope-2026-06-19.md.
+# Neither feed places orders — dry_run=true above gates all order placement.
+dhan_enabled = true
+groww_enabled = true

@@ -25,13 +25,13 @@ variable "environment" {
 }
 
 variable "instance_type" {
-  description = "EC2 instance type. MUST be m8g.large per operator lock 2026-05-29 (Graviton4, 8 GiB, $0.06416/hr ap-south-1; see daily-universe-scope-expansion-2026-05-27.md §7 Quote 5, which supersedes the 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks)."
+  description = "EC2 instance type. MUST be r8g.large per operator lock 2026-06-30 (Graviton4, 2 vCPU / 16 GiB, $0.08258/hr ap-south-1; see daily-universe-scope-expansion-2026-05-27.md §7 Quote 7, which supersedes the 2026-05-29 m8g.large + 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks)."
   type        = string
-  default     = "m8g.large"
+  default     = "r8g.large"
 
   validation {
-    condition     = var.instance_type == "m8g.large"
-    error_message = "Instance type is pinned to m8g.large (Graviton4, 8 GiB) per operator lock 2026-05-29 (Quote 5). 8 GiB at 2 vCPU needs the m-family 4:1 ratio (c8g=4 GiB too small, r8g=16 GiB wasteful). This SUPERSEDES the 2026-05-27 t4g.large lock. See daily-universe-scope-expansion-2026-05-27.md section 7."
+    condition     = var.instance_type == "r8g.large"
+    error_message = "Instance type is pinned to r8g.large (Graviton4, 16 GiB) per operator lock 2026-06-30 (Quote 7) — DOUBLED RAM from m8g.large for the both-feeds + larger-universe workload. This SUPERSEDES the 2026-05-29 m8g.large lock. See daily-universe-scope-expansion-2026-05-27.md section 7."
   }
 }
 
@@ -114,15 +114,15 @@ variable "operator_cidr" {
 }
 
 variable "telegram_bot_token_ssm_param" {
-  description = "SSM parameter name where the Telegram bot token is stored. Defaults to the STAGING path because the app runs TV_ENVIRONMENT=staging during the 3-month no-orders data-pull, and the seed populates /tickvault/staging/* (the /tickvault/prod/* path does not exist yet -> ParameterNotFound in the webhook Lambda, 2026-05-30). Flip to /tickvault/prod/telegram/bot-token when going live (TV_ENVIRONMENT=prod)."
+  description = "SSM parameter name where the Telegram bot token is stored. Defaults to /tickvault/prod/telegram/bot-token: the single real env is prod (TV_ENVIRONMENT=prod, operator 2026-06-30 — dev/staging retired), and the operator-populated prod params already EXIST while the old /tickvault/staging/* path is now EMPTY (the stale staging default would 404 ParameterNotFound in the webhook Lambda)."
   type        = string
-  default     = "/tickvault/staging/telegram/bot-token"
+  default     = "/tickvault/prod/telegram/bot-token"
 }
 
 variable "telegram_chat_id_ssm_param" {
-  description = "SSM parameter name where the Telegram chat ID (numeric) is stored. Defaults to the STAGING path (see telegram_bot_token_ssm_param). Flip to /tickvault/prod/telegram/chat-id when going live."
+  description = "SSM parameter name where the Telegram chat ID (numeric) is stored. Defaults to /tickvault/prod/telegram/chat-id (single real prod env; see telegram_bot_token_ssm_param)."
   type        = string
-  default     = "/tickvault/staging/telegram/chat-id"
+  default     = "/tickvault/prod/telegram/chat-id"
 }
 
 variable "dhan_access_token_ssm_param" {

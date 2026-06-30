@@ -62,24 +62,12 @@ WatchdogSec=60
 Environment=RUST_LOG=info
 # TV_ENVIRONMENT selects BOTH config/<env>.toml AND the /tickvault/<env>/ SSM
 # prefix (read by boot_helpers::resolve_config_env + secret_manager).
-# `prod` is an accepted alias for config/production.toml (boot_helpers
-# ::config_env_path) AND selects the /tickvault/prod/* SSM prefix verbatim
-# (secret_manager::resolve_environment), so config + secrets always agree.
-#
-# PRODUCTION CUTOVER (2026-06-30, DATA-ONLY): production.toml now runs against
-# PROD Dhan (api.dhan.co) with IP + auth verification ON, but dry_run = true so
-# NO real orders are placed — the 3-month no-orders data-pull phase. This is
-# NOT live trading; it is prod-endpoints monitoring with order placement
-# blocked at the OMS (engine.rs place_order returns a PAPER-* id under
-# dry_run). See config/production.toml for the full semantics + boot-gate
-# timing (mode=live becomes bootable on/after 2026-07-01).
-#
-# OPERATOR ONE-TIME PREREQUISITE before this takes effect:
-#   1. Populate the prod SSM secret VALUES (terraform creates the param shells
-#      with placeholders; operator sets real Dhan creds out-of-band) — see
-#      deploy/aws/terraform/ssm-params-prod.tf.
-#   2. Register the box's static IP with Dhan (mode=live runs the static-IP
-#      boot gate). Ensure enable_eip=true in terraform for prod.
+# Single real env (operator 2026-06-30): prod. dev/staging configs were retired;
+# base.toml + production.toml are the only env configs. This is STILL the
+# no-real-orders data-pull phase — production.toml LOCKS dry_run=true (NO real
+# orders) plus a far-future sandbox_only_until belt-and-suspenders. Flipping to
+# live trading is a separate, deliberate change (set dry_run=false +
+# mode=live AND re-register the static EIP). See config/production.toml.
 Environment=TV_ENVIRONMENT=prod
 # GROWW_MAX_SUBSCRIBE caps the first-run Groww subscription set. Default in code
 # is 60 (subset-safe); set to 1000 here to subscribe the FULL ~779-instrument

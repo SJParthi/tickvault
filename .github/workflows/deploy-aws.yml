@@ -342,6 +342,12 @@ jobs:
           fi
 
           echo "box stopped but SHOULD be up — starting it (EventBridge start likely failed)"
+          # Record that THIS run started a stopped box, so the final auto-stop
+          # step below can stop it again if we are now OUTSIDE the 08:30-16:30
+          # IST Mon-Fri up-window (e.g. an after-close workflow_dispatch deploy).
+          # Without this, an out-of-window deploy would leave the box billing all
+          # night until the next hourly hard-stop guard catches it.
+          echo "DEPLOY_STARTED_STOPPED_BOX=yes" >> "$GITHUB_ENV"
           aws ec2 start-instances --region "$REGION" --instance-ids "$IID" >/dev/null
           # Wait for EC2 'running' (<=3 min).
           for _ in $(seq 1 36); do
@@ -369,19 +375,13 @@ jobs:
           fi
           echo "instance started + SSM Online — proceeding with deploy"
 
-      - name: Auto-seed /tickvault/staging/* from /tickvault/dev/* (idempotent)
-        # The systemd unit sets TV_ENVIRONMENT=staging, so the app reads SSM
-        # at /tickvault/staging/{service}/{key}. If staging is empty (fresh
-        # account / first deploy), boot HALTS with a SecretRetrieval error.
-        #
-        # This step idempotently copies the 9 required keys from /tickvault/dev/*
-        # to /tickvault/staging/* IF the staging key doesn't already exist.
-        # Mirrors aws-control.yml::seed-secrets but runs automatically on every
-        # deploy so the operator never has to remember to run it.
-        #
-        # Z+ L3 RECONCILE: prove staging-secrets state matches desired state
-        # before the app boots. Replaces operator memory with deterministic
-        # automation.
+      - name: Verify /tickvault/prod/* secrets present (read-only; operator-populated)
+        # Single real env (operator 2026-06-30): the systemd unit sets
+        # TV_ENVIRONMENT=prod, so the app reads SSM at /tickvault/prod/{service}/{key}.
+        # The operator populates /tickvault/prod/* MANUALLY, so this step DOES NOT
+        # auto-seed — no put-parameter, no --overwrite, no copy from any other env.
+        # It is a READ-ONLY pre-flight that warns if a boot-halt key is absent;
+        # it NEVER clobbers an operator-set value.
         #
         # Boot-halt keys (per crates/core/src/auth/secret_manager.rs +
         # ip_verifier.rs):
@@ -393,35 +393,26 @@ jobs:
           set +e
           REGION="${{ vars.AWS_REGION || 'ap-south-1' }}"
           KEYS="dhan/client-id dhan/client-secret dhan/totp-secret questdb/pg-user questdb/pg-password telegram/bot-token telegram/chat-id api/bearer-token network/static-ip"
-          SEEDED=0
-          EXISTS=0
-          MISSING_IN_DEV=0
+          PRESENT=0
+          MISSING=0
           for key in $KEYS; do
-            if aws ssm get-parameter --region "$REGION" --name "/tickvault/staging/$key" --with-decryption --output text --query 'Parameter.Value' >/dev/null 2>&1; then
-              EXISTS=$((EXISTS+1))
-              echo "  EXISTS  /tickvault/staging/$key (no-op)"
-              continue
-            fi
-            DEV_VAL=$(aws ssm get-parameter --region "$REGION" --name "/tickvault/dev/$key" --with-decryption --output text --query 'Parameter.Value' 2>/dev/null)
-            DEV_TYPE=$(aws ssm get-parameter --region "$REGION" --name "/tickvault/dev/$key" --output text --query 'Parameter.Type' 2>/dev/null)
-            if [ -n "$DEV_VAL" ] && [ -n "$DEV_TYPE" ]; then
-              aws ssm put-parameter --region "$REGION" --name "/tickvault/staging/$key" --type "$DEV_TYPE" --value "$DEV_VAL" --overwrite >/dev/null 2>&1
-              SEEDED=$((SEEDED+1))
-              echo "  SEEDED  /tickvault/staging/$key <- /tickvault/dev/$key ($DEV_TYPE)"
+            # Existence check only (no --with-decryption, no value read).
+            if aws ssm get-parameter --region "$REGION" --name "/tickvault/prod/$key" >/dev/null 2>&1; then
+              PRESENT=$((PRESENT+1))
+              echo "  PRESENT /tickvault/prod/$key"
             else
-              MISSING_IN_DEV=$((MISSING_IN_DEV+1))
-              echo "  MISSING /tickvault/dev/$key (cannot seed staging; app boot may halt if this key is required)"
+              MISSING=$((MISSING+1))
+              echo "  MISSING /tickvault/prod/$key"
             fi
           done
-          echo "===== Seed summary ====="
-          echo "  existing in staging: $EXISTS"
-          echo "  seeded staging<-dev: $SEEDED"
-          echo "  missing in dev:      $MISSING_IN_DEV"
-          if [ "$MISSING_IN_DEV" -gt 0 ]; then
-            echo "::warning::$MISSING_IN_DEV /tickvault/dev/* keys are missing — staging deploy may still fail at boot. Seed them via aws ssm put-parameter or the seed-staging-ssm workflow."
+          echo "===== Prod-secret pre-flight ====="
+          echo "  present: $PRESENT"
+          echo "  missing: $MISSING"
+          if [ "$MISSING" -gt 0 ]; then
+            echo "::warning::$MISSING /tickvault/prod/* keys are missing — app boot may HALT. Populate them MANUALLY via aws ssm put-parameter (operator-owned; the deploy never auto-seeds prod)."
           fi
 
-      - name: Upload both binaries to S3 staging bucket
+      - name: Upload both binaries to S3 deploy bucket
         run: |
           chmod +x ./dist/tickvault ./dist/smoke_test
           aws s3 cp ./dist/tickvault \
@@ -501,21 +492,21 @@ jobs:
               "# Refresh the repo clone to latest main BEFORE copying config/systemd.",
               "# The clone is shallow (--depth 1) from first boot; without this pull",
               "# the box keeps its first-boot config + systemd unit. CRITICAL: the",
-              "# systemd unit carries TV_ENVIRONMENT (staging = sandbox/no-orders);",
+              "# systemd unit carries TV_ENVIRONMENT (single real env: prod, dry_run=true);",
               "# a stale unit could load an older env and arm the wrong config.",
               "if [ -d repo/.git ]; then sudo -u ec2-user git -C repo fetch --depth 1 origin main && sudo -u ec2-user git -C repo reset --hard origin/main; fi",
               "# Sync config files from the refreshed repo clone (idempotent).",
               "# Failures here MUST surface — previously masked by `2>/dev/null || true`",
               "# which silently swallowed missing dirs / permission errors. After cp,",
-              "# verify the actually-deployed staging.toml line count matches the repo",
+              "# verify the actually-deployed production.toml line count matches the repo",
               "# version. Mismatch = silent cp failure = abort the deploy loudly.",
               "if [ ! -d repo/config ]; then echo FATAL: repo/config missing after git clone; exit 1; fi",
               "cp -f repo/config/*.toml config/",
               "chown -R ec2-user:ec2-user config/",
-              "echo ===== deployed config/staging.toml line count + head =====",
-              "wc -l config/staging.toml repo/config/staging.toml",
-              "diff -q config/staging.toml repo/config/staging.toml || (echo FATAL: deployed config/staging.toml differs from repo/config/staging.toml after cp; diff config/staging.toml repo/config/staging.toml; exit 1)",
-              "# Refresh the systemd unit from the repo (TV_ENVIRONMENT=staging et al).",
+              "echo ===== deployed config/production.toml line count + head =====",
+              "wc -l config/production.toml repo/config/production.toml",
+              "diff -q config/production.toml repo/config/production.toml || (echo FATAL: deployed config/production.toml differs from repo/config/production.toml after cp; diff config/production.toml repo/config/production.toml; exit 1)",
+              "# Refresh the systemd unit from the repo (TV_ENVIRONMENT=prod et al).",
               "# Without this the box runs its first-boot unit forever.",
               "if [ -f repo/deploy/systemd/tickvault.service ]; then cp -f repo/deploy/systemd/tickvault.service /etc/systemd/system/tickvault.service; fi",
               "if [ -f repo/deploy/systemd/tickvault-holiday-gate.service ]; then cp -f repo/deploy/systemd/tickvault-holiday-gate.service /etc/systemd/system/tickvault-holiday-gate.service; fi",
@@ -566,7 +557,7 @@ jobs:
               "# app boots and hits BOOT-02 (QuestDB readiness deadline 60s). Idempotent:",
               "# `docker compose up -d` is a no-op when containers are already running.",
               "# Z+ L3 RECONCILE: prove the running state matches the desired state.",
-              "if [ -f repo/deploy/docker/docker-compose.yml ]; then export TV_QUESTDB_PG_USER=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/staging/questdb/pg-user --with-decryption --output text --query Parameter.Value 2>/dev/null || aws ssm get-parameter --region ap-south-1 --name /tickvault/dev/questdb/pg-user --with-decryption --output text --query Parameter.Value 2>/dev/null || echo admin); export TV_QUESTDB_PG_PASSWORD=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/staging/questdb/pg-password --with-decryption --output text --query Parameter.Value 2>/dev/null || aws ssm get-parameter --region ap-south-1 --name /tickvault/dev/questdb/pg-password --with-decryption --output text --query Parameter.Value 2>/dev/null || echo quest); (cd repo/deploy/docker && TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" docker compose up -d) || (echo FATAL: docker compose up failed; exit 1); else echo FATAL: docker-compose.yml missing from repo/deploy/docker; exit 1; fi",
+              "if [ -f repo/deploy/docker/docker-compose.yml ]; then export TV_QUESTDB_PG_USER=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-user --with-decryption --output text --query Parameter.Value 2>/dev/null || echo admin); export TV_QUESTDB_PG_PASSWORD=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-password --with-decryption --output text --query Parameter.Value 2>/dev/null || echo quest); (cd repo/deploy/docker && TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" docker compose up -d) || (echo FATAL: docker compose up failed; exit 1); else echo FATAL: docker-compose.yml missing from repo/deploy/docker; exit 1; fi",
               "# Verify QuestDB is actually listening on 9000 (HTTP) within 30s",
               "for i in 1 2 3 4 5 6; do if curl -fsS http://127.0.0.1:9000/exec?query=SELECT%201 >/dev/null 2>&1; then echo QUESTDB-UP; break; fi; sleep 5; if [ $i -eq 6 ]; then echo FATAL: QuestDB not responding on :9000 after 30s; docker compose -f repo/deploy/docker/docker-compose.yml ps; exit 1; fi; done",
               "# === TRADING APP FIRST ===",
@@ -830,3 +821,29 @@ jobs:
             --topic-arn arn:aws:sns:${{ vars.AWS_REGION || 'ap-south-1' }}:${{ steps.acct.outputs.id }}:tv-prod-alerts \
             --subject "🆘 tickvault deploy FAILED" \
             --message "$MSG"
+
+      - name: Stop the box this run self-started (if now outside the up-window)
+        # COST-HARDENING 2026-06-30 (never-cross): when an after-close /
+        # workflow_dispatch deploy self-started a STOPPED box (the step above set
+        # DEPLOY_STARTED_STOPPED_BOX=yes), leave it running ONLY if we are inside
+        # the 08:30-16:30 IST Mon-Fri up-window. If we are OUTSIDE the window, the
+        # box would otherwise bill all night until the hourly hard-stop guard
+        # catches it — so stop it here, immediately, at the end of the deploy.
+        # always() so it runs whether the deploy passed or failed. We NEVER stop a
+        # box this run did not start, and NEVER stop during the trading window.
+        if: always() && env.DEPLOY_STARTED_STOPPED_BOX == 'yes'
+        env:
+          REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+          IID: ${{ secrets.EC2_INSTANCE_ID }}
+        run: |
+          set -uo pipefail
+          DOW=$(TZ='Asia/Kolkata' date +%u)            # 1=Mon..7=Sun
+          HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM))
+          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 830 ] && [ "$HHMM" -le 1630 ]; then
+            echo "Inside 08:30-16:30 IST Mon-Fri window — leaving the box running."
+            exit 0
+          fi
+          echo "Outside the up-window (dow=$DOW time=$HHMM) and THIS run started the box — stopping it to avoid an out-of-window bill."
+          aws ec2 stop-instances --region "$REGION" --instance-ids "$IID" >/dev/null \
+            && echo "stop-instances dispatched for $IID" \
+            || echo "(could not dispatch stop — AWS creds likely not configured at this stage)"

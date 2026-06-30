@@ -1,209 +1,136 @@
-# Implementation Plan: Dhan reconnect hardening (Fix A reconnect-in-place + Fix B short-session floor)
+# Implementation Plan: Flip instance lock m8g.large → r8g.large (16 GiB) per operator 2026-06-30
 
-**Status:** VERIFIED
+**Status:** APPROVED
 **Date:** 2026-06-30
-**Approved by:** Parthiban (operator) — "fix everything" 2026-06-30
+**Approved by:** Parthiban (operator) — dated directive this session 2026-06-30: "just upgrade the instance to r8 large + everything related to the infra"
 
-> Crates changed: **tickvault-core** (`connection.rs`, `ConnectionHealth`),
-> **tickvault-common** (`constants.rs`, `ErrorCode::WsGap09*`),
-> **tickvault-app** (`main.rs` pool-watchdog Halt arm + pure classifier/ceiling
-> helpers). Builds on merged `origin/main` (PR #1265 cooldown-survives-restart).
-
-## Plan Items
-
-- [x] Fix B — short-session first-reconnect floor (pure, tickvault-core)
-  - Files: crates/common/src/constants.rs, crates/core/src/websocket/connection.rs
-  - Tests: test_compute_short_session_reconnect_floor_ms_short_session_floored, test_compute_short_session_reconnect_floor_ms_long_session_zero, test_compute_short_session_reconnect_floor_ms_boundary_at_threshold, test_compute_short_session_reconnect_floor_ms_attempt_nonzero_zero, test_compute_short_session_reconnect_floor_ms_zero_uptime_floored
-- [x] Fix A — ErrorCode WS-GAP-09 + runbook + triage rule (tickvault-common)
-  - Files: crates/common/src/error_code.rs, .claude/rules/project/wave-2-error-codes.md, .claude/triage/error-rules.yaml
-  - Tests: test_all_list_length_matches_catalogue_size, every_error_code_variant_appears_in_a_rule_file, every_error_code_variant_has_a_triage_rule
-- [x] Fix A — pure reconnect-in-place classifier + ceiling helpers (tickvault-app)
-  - Files: crates/app/src/main.rs
-  - Tests: test_is_bare_reset_class_all_benign_true, test_is_bare_reset_class_rate_limited_false, test_is_bare_reset_class_non_reconnectable_false, test_is_bare_reset_class_token_invalid_false, test_is_bare_reset_class_questdb_down_false, test_reconnect_in_place_ceiling_under_continues, test_reconnect_in_place_ceiling_over_exits
-- [x] Fix A — surface rate_limit_streak + saw_non_reconnectable on ConnectionHealth (tickvault-core)
-  - Files: crates/core/src/websocket/types.rs, crates/core/src/websocket/connection.rs
-  - Tests: existing pool_watchdog + types constructors updated; cargo test -p tickvault-core green
-- [x] Fix A — wire classifier into the BOOT-ON + lane Halt arms of spawn_pool_watchdog_task (tickvault-app)
-  - Files: crates/app/src/main.rs
-  - Tests: pool_watchdog_halt_arm_gates_process_exit_on_market_hours, pool_watchdog_gates_on_runtime_dhan_enable_flag, runtime_lane_watchdog_does_not_process_exit
-- [x] R1 — pin docker compose arg order (compose subcommand first) regression guard (tickvault-app)
-  - Files: crates/app/src/infra.rs
-  - Tests: test_docker_compose_up_args_compose_subcommand_first
-- [x] Fix A no-op close (2026-06-30) — wire REAL production QuestDB-liveness into the reconnect-in-place gate (tickvault-app + tickvault-api)
-  - Files: crates/app/src/main.rs, crates/api/tests/health_questdb_reachable_wiring_guard.rs
-  - Tests: test_pool_watchdog_sets_questdb_reachable_from_production, test_questdb_reachable_round_trips, pool_watchdog_halt_arm_gates_process_exit_on_market_hours
+> Guarantee matrices: this item carries the 15-row + 7-row matrices by
+> cross-reference to `.claude/rules/project/per-wave-guarantee-matrix.md`
+> (mandatory per `per-item-guarantee-check.sh`). The dominant guarantee for
+> THIS change is the §7 Mechanical Rule 1 four-file instance lock: the new
+> r8g.large/16-GiB type is pinned CONSISTENTLY across the rule file, the
+> superseded budget doc, the architecture doc, the ratchet test, Terraform
+> validation, the upgrade script, and the Docker compose mem default. No
+> path flips `dry_run` (stays `true`) and no path changes the universe cap
+> (`MAX_DAILY_UNIVERSE_SIZE`) or `SEAL_BUFFER_CAPACITY` — the 2K universe
+> expansion is a SEPARATE later PR gated on a memory measurement.
 
 ## Design
-Two independent fixes stop the Dhan bare-RST → 5-min-Halt → `process::exit(2)`
-→ 775-SID re-subscribe → per-IP 429 restart storm (confirmed root cause: Dhan
-silently RSTs the main-feed socket ~5-6s after each connect; the A4 watchdog's
-`>300s all-down → process::exit(2)` in `main.rs` restarts ~27×/hr).
 
-**Fix B (tickvault-core, pure):** a new pure
-`compute_short_session_reconnect_floor_ms(attempt, session_uptime_secs,
-short_session_threshold_secs, floor_ms)` raises ONLY the attempt-0 delay to
-`WS_SHORT_SESSION_RECONNECT_FLOOR_MS` (3000) when the PRIOR session lived
-`< WS_SHORT_SESSION_THRESHOLD_MS` (10_000ms = 10s), via
-`base_delay_ms.max(...)` in `wait_with_backoff`. Session uptime comes from a new
-`connected_at: AtomicI64` (epoch secs) reset to 0 at each connect attempt and
-stamped on successful connect+subscribe (`connection.rs` line 1350). A
-long-lived session (`>= 10s`) keeps the 0ms instant first retry. Attempts 1+
-unchanged.
+The §7 instance lock in `daily-universe-scope-expansion-2026-05-27.md`
+currently pins **m8g.large** (Graviton4, 2 vCPU / 8 GiB) per operator Quote 5
+(2026-05-29). The operator authorized a hardware upgrade on 2026-06-30 to
+**r8g.large** (Graviton4, 2 vCPU / **16 GiB**, memory-optimized r-family),
+doubling RAM headroom for the upcoming both-feeds + larger-universe workload.
 
-**Fix A (tickvault-app + tickvault-core):** at the BOOT-ON pool-watchdog Halt
-arm (`main.rs` `process::exit(2)` site) consult a PURE
-`is_bare_reset_class(healths, token_valid, questdb_reachable)` that returns true
-iff: every connection's `rate_limit_streak == 0` AND no connection saw a
-`NonReconnectableDisconnect` AND `token_valid` AND `questdb_reachable`. New
-`rate_limit_streak: u32` + `saw_non_reconnectable: bool` fields on
-`ConnectionHealth` carry the per-connection signals from the snapshot the
-watchdog already takes. A `TokenHandle` is plumbed into
-`spawn_pool_watchdog_task` for the token signal; `health.questdb_reachable()`
-provides QuestDB. If bare-reset class AND the episode has spent
-`< POOL_RECONNECT_IN_PLACE_CEILING_SECS` (900 = 15 min) in reconnect-in-place:
-do NOT exit — reset the episode timer, `pool.reset_watchdog()`, emit WS-GAP-09
-+ `tv_ws_watchdog_reconnect_in_place_total`, keep reconnecting in place
-(per-connection `wait_with_backoff` + `SubscribeRxGuard` untouched). The
-ceiling boundary is a pure `reconnect_in_place_ceiling_exceeded(elapsed_secs)`.
-Otherwise (ceiling exceeded OR genuinely-fatal class) → exit / lane-teardown
-exactly as today.
+§7 Mechanical Rule 1 requires that ANY instance-type change be applied across
+FOUR authority files + the ratchet test + Terraform + the upgrade script. This
+PR does exactly that hardware lock-flip and nothing else:
 
-### Design — Fix A no-op close (2026-06-30, rework)
-The shipped `is_bare_reset_class(healths, token_valid, questdb_reachable)` gate
-required `questdb_reachable == true`, but the backing `questdb_reachable`
-`AtomicBool` on `SystemHealthStatus` was set `true` ONLY in `#[cfg(test)]` code
-— so in production `health.questdb_reachable()` was permanently `false`, the gate
-always returned `false`, and the reconnect-in-place branch was DEAD (the watchdog
-still exited → the 429 restart storm still happened). The rework wires a REAL
-production signal: `spawn_pool_watchdog_task` now takes a `QuestDbConfig` and, on
-its existing 5s tick (the same tick that already pushes
-`set_websocket_connections`), probes QuestDB via the canonical
-`boot_probe::wait_for_questdb_ready` wrapped in a 2s `tokio::time::timeout` and
-calls `health.set_questdb_reachable(...)` with the live result. The probe runs
-every 5s INDEPENDENTLY of tick flow (a Dhan bare-RST storm stops ticks while
-QuestDB stays up — exactly when the gate must read it correctly). Both call sites
-(`crates/app/src/main.rs` BOOT-ON fast-boot + slow-boot/lane) pass
-`config.questdb.clone()`. The gate intent is preserved: reconnect-in-place engages
-ONLY when QuestDB is genuinely up; the `rate_limit_streak == 0` /
-`!saw_non_reconnectable` / `token_valid` conditions are untouched (429/805 still
-restart by design).
+- `m8g.large` → `r8g.large` everywhere the type is the LOCKED value.
+- `8 GiB` → `16 GiB` everywhere the RAM is the locked value.
+- §7 Rule 2 memory budget recomputed for a 16-GiB host at the CURRENT
+  universe (~250–1000 SIDs across 21 TFs), NOT the deferred 2K expansion.
+- §7 cost line recomputed: r8g.large = $0.08258/hr (verified ap-south-1),
+  weekday 08:30–16:30 IST schedule (270-hr/mo ceiling), + EIP (kept), + 18%
+  GST → ~₹2,919/mo (inside the operator's ~₹2,500–3,200 envelope).
+- Docker QuestDB `QDB_MEM_LIMIT` default raised 2g → 4g (the §7 "both feeds
+  ~2K → --qdb-mem 4g" note; 4g fits comfortably in 16 GiB with ~10+ GiB free).
+
+KEEP (explicitly UNCHANGED by this PR): the Elastic IP (`enable_eip = true`,
+a separately-verified networking decision), `dry_run = true`, the
+`MAX_DAILY_UNIVERSE_SIZE` / `SEAL_BUFFER_CAPACITY` constants, the 2-WebSocket
+lock, and the 08:30–16:30 IST weekday schedule.
 
 ## Edge Cases
-Mixed 429+reset in one cycle → streak check fails → genuine-fatal (correct;
-#1265 persisted cooldown absorbs the restart). Token expiry mid-storm →
-`token_valid` false → genuine-fatal. QuestDB death mid-storm →
-`questdb_reachable()` false → genuine-fatal. Pre-market / Dhan-OFF → unchanged
-(`should_act` already gates the whole arm). Runtime-lane (`lane_halt.is_some()`)
-→ same short-circuit BEFORE lane teardown so a benign reset never tears the lane
-down (Groww + shared infra untouched). Long-lived session drop → Fix B returns
-0ms (instant retry preserved). `connected_at == 0` (no successful session) →
-uptime 0 → floored (errs toward backing off — safe). `reset_watchdog()` restarts
-the 300s AllDown window; the 15-min ceiling timer is SEPARATE, reset only when
-the pool is no longer all-down (a non-Halt verdict observed).
+
+- **Ratchet test text-coupling:** `instance_type_lock_guard.rs` asserts the
+  EXACT bold-pinned string (`**r8g.large**`), the RAM string (`16 GiB RAM`),
+  and the recomputed ₹ bill. All three rule-file edits must match the test's
+  new expectations verbatim or the build fails (intended — the test IS the
+  lock).
+- **Superseded-marker preservation:** the test also asserts the 4 superseded
+  files still carry their `SUPERSEDED 2026-05-27` markers + the link to the
+  authoritative rule file. Those markers are NOT removed — only the instance
+  string inside them (where present) is updated.
+- **Historical mentions:** `m8g.large` / `8 GiB` may remain ONLY as historical
+  / superseded context (e.g. "supersedes the 2026-05-29 m8g.large lock"), never
+  as the current LOCKED value. A grep guard confirms this.
+- **Upgrade-script default flip:** `FROM_TYPE` moves `t4g.medium` → `m8g.large`
+  so the now-canonical flip command is `--from m8g.large --to r8g.large`.
+  `r8g.large` is ALREADY in the `--to` allowlist (no allowlist change needed).
+- **Terraform default:** `instance_type` default + validation condition both
+  move to `r8g.large` so a fresh `terraform apply` provisions the new type.
 
 ## Failure Modes
-(1) Classifier too lenient → a truly-wedged feed reconnects in place up to 15
-min before restart — bounded by the ceiling, strictly degrades to today's 5-min
-behaviour, never worse; **15-min ceiling FLAGGED FOR OPERATOR SIGN-OFF**.
-(2) New `ConnectionHealth` fields break test constructors (`types.rs`,
-`pool_watchdog.rs` test helper) → updated in-PR; `cargo test -p tickvault-core`
-gate. (3) Fix B floor wrongly applied to a long session → guarded by the
-`>= threshold` branch + unit test. (4) `connected_at` unset → uptime 0 → floored
-(safe). (5) Watchdog reads stale `rate_limit_streak` (Acquire) → a real 429 sets
-the streak before the next 5s poll; worst case one extra in-place cycle, caught
-next poll.
+
+- **Inconsistent lock (one file misses the flip):** the grep guard + the
+  ratchet test catch any file still pinning m8g.large as the live value.
+- **Cost/RAM miscompute pinned wrongly:** the `instance_lock_monthly_bill_pinned_to_rupees_*`
+  ratchet pins the recomputed bill; a typo'd figure fails the test.
+- **Accidental scope creep:** if a diff hunk touched `dry_run`,
+  `MAX_DAILY_UNIVERSE_SIZE`, or `SEAL_BUFFER_CAPACITY`, self-review + grep
+  would flag it. This PR touches none of them.
 
 ## Test Plan
-tickvault-common: WsGap09 flows `error_code_rule_file_crossref` +
-`triage_rules_full_coverage_guard` + tag-guard + `test_all_list_length_*`
-(109 -> 110). tickvault-core: 5 pure `compute_short_session_reconnect_floor_ms`
-unit tests; `ConnectionHealth` new fields default + roundtrip;
-`pool_watchdog.rs` test helper updated; existing `test_watchdog_halts_at_300s`
-unchanged. tickvault-app: `is_bare_reset_class` truth table (all-benign true;
-each negated input false); `reconnect_in_place_ceiling_exceeded` boundary
-(under → continue, at/over → exit). Gates:
-`cargo test -p tickvault-common -p tickvault-core`, banned-pattern,
-pub-fn-test, pub-fn-wiring, plan-verify, plan-gate.
+
+- `cargo test -p tickvault-storage --test instance_type_lock_guard` — the
+  rewritten ratchet (all tests) must pass against the new rule-file text.
+- `grep` to confirm no stray `m8g.large` / `8 GiB` remains as the LOCKED value
+  (only historical/superseded mentions allowed).
+- `.claude/hooks/banned-pattern-scanner.sh` clean.
+- `.claude/hooks/plan-verify.sh` + design-first `plan-gate.sh` (this plan,
+  6 sections, APPROVED, references `tickvault-storage`).
+- `terraform fmt -check` on the variables.tf edit (if terraform available).
 
 ## Rollback
-Both fixes additive and self-contained. Fix B: revert the `base_delay_ms.max(..)`
-line + helper + 2 constants + `connected_at` field → instant first retry
-restored. Fix A: revert the Halt-arm branch → unconditional `process::exit(2)`;
-the new `ErrorCode`/counter/`ConnectionHealth` fields + plumbed `TokenHandle`
-are inert if the branch is gone (drop in the same revert). No schema, no
-migration, no persisted state (the 15-min timer is in-process only). `git revert`
-of the single PR is clean.
+
+Single revert of the PR commit restores the m8g.large lock everywhere
+atomically (rule files + ratchet + Terraform + script + compose move together
+in one commit). No data migration, no runtime state — this is a documentation
++ infra-config + ratchet-text change only. The live instance is NOT touched by
+this PR (the actual `aws ec2 modify-instance-attribute` flip is a separate
+operator-run step via `scripts/aws-upgrade-instance.sh`).
 
 ## Observability
-WS-GAP-09 `error!`/`warn!` with `code = ErrorCode::WsGap09WatchdogReconnectInPlace.code_str()`
-on each in-place decision; counter
-`tv_ws_watchdog_reconnect_in_place_total{reason="bare_dhan_reset"|"ceiling_exceeded"}`.
-`tv_pool_self_halts_total` now increments only on genuine-fatal Halt (sharper
-meaning — noted in runbook). Fix B: `info!` in `wait_with_backoff` gains
-`session_uptime_secs` + `short_session_floor_applied`. New WS-GAP-09 section in
-`wave-2-error-codes.md` + triage YAML rule (action: silence, Low). No new audit
-table, no Telegram page for the benign in-place case (Severity::Low); the
-genuine-fatal Halt keeps its existing `WebSocketPoolHalt` Telegram.
+
+No new runtime code, no new ErrorCode, no new counter. The lock-flip is a
+documentation + config + ratchet change. The existing `instance_type_lock_guard.rs`
+ratchet is the observability layer — it FAILS THE BUILD on any future drift
+away from the r8g.large/16-GiB lock. The recomputed cost line documents the new
+CloudWatch budget-alarm ceiling for the operator.
 
 ## Plan Items
+
+- [x] §7 of `daily-universe-scope-expansion-2026-05-27.md`: instance lock
+  m8g.large → r8g.large; dated 2026-06-30 operator-quote block; §7 Rule 2
+  memory budget recomputed for 16 GiB at current universe; cost line recomputed.
+  - Files: .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md
+- [x] `aws-budget.md`: update superseded instance ref + add "superseded → r8g.large
+  2026-06-30" one-line marker.
+  - Files: .claude/rules/project/aws-budget.md
+- [x] `aws-indices-only-locked-architecture.md` §5: same instance/memory/cost
+  update to r8g.large / 16 GiB in the §5 supersession marker.
+  - Files: docs/architecture/aws-indices-only-locked-architecture.md
+- [x] Rewrite ratchet `instance_type_lock_guard.rs`: m8g.large→r8g.large,
+  8 GiB→16 GiB, re-pin the recomputed ₹ bill.
+  - Files: crates/storage/tests/instance_type_lock_guard.rs
+  - Tests: instance_lock_authoritative_rule_file_pins_r8g_large, instance_lock_monthly_bill_pinned_to_rupees
+- [x] Terraform `variables.tf`: `instance_type` validation + default → r8g.large.
+  - Files: deploy/aws/terraform/variables.tf
+- [x] `aws-upgrade-instance.sh`: `FROM_TYPE` default t4g.medium → m8g.large;
+  confirm r8g.large in `--to` allowlist (already present).
+  - Files: scripts/aws-upgrade-instance.sh
+- [x] `docker-compose.yml`: QuestDB `QDB_MEM_LIMIT` default 2g → 4g for 16 GiB;
+  update the host-spec comment.
+  - Files: deploy/docker/docker-compose.yml
+
+## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | Dhan bare-RST storm, token valid, QuestDB up | reconnect-in-place, no exit, WS-GAP-09, <=15min |
-| 2 | Real 429 (streak>0) on any conn at Halt | genuine-fatal exit (today's behaviour) |
-| 3 | Token invalid at Halt | genuine-fatal exit |
-| 4 | QuestDB unreachable at Halt | genuine-fatal exit |
-| 5 | Non-reconnectable Dhan code seen | genuine-fatal exit |
-| 6 | In-place episode > 15 min, still zero frames | fall back to exit |
-| 7 | 5s session RST | Fix B floors first reconnect to 3s |
-| 8 | 5-min session drop | Fix B keeps 0ms instant first retry |
-| 9 | Fix-A no-op rework: prod boot, QuestDB up | watchdog 5s probe sets questdb_reachable=true; bare-reset gate can engage |
-| 10 | Fix-A no-op rework: QuestDB genuinely down at Halt | watchdog 2s probe times out → set_questdb_reachable(false) → gate false → genuine-fatal restart (correct) |
-| 11 | Fix-A no-op rework: ticks stopped (RST storm) but QuestDB up | 5s probe runs independent of tick flow → signal stays fresh → gate engages |
-
-### Edge Cases — Fix A no-op close (2026-06-30, rework)
-QuestDB probe times out (hung TCP connect) → 2s `tokio::time::timeout` returns
-`Err` → `is_ok_and(...)` is `false` → `set_questdb_reachable(false)` → the gate
-reads QuestDB-down → genuine-fatal restart (safe, never rides out a Halt while
-persistence is broken). Probe transiently fails for one 5s tick while QuestDB is
-actually up → that single tick reads false; the watchdog Halt only fires after
-300s all-down, by which time many 5s probes have run, so a one-off blip cannot
-mis-gate. The probe builds a fresh reqwest client per call (cold path, 5s cadence,
-not the hot tick path) — acceptable; mirrors the 10s SLO scheduler's existing
-`wait_for_questdb_ready` usage.
-
-### Failure Modes — Fix A no-op close (2026-06-30, rework)
-(6) Probe falsely reports QuestDB up while it is down → would let the gate ride
-out a Halt with broken persistence. Mitigated: the probe is a real `SELECT 1`
-against the same `/exec` endpoint the SLO scheduler + boot probe use; a 2s timeout
-bounds a hung connect; on ANY error/timeout the result is `false` (fail-safe toward
-restart). (7) `spawn_pool_watchdog_task` signature change breaks a call site →
-compile error caught at build; both sites updated in-PR. (8) Source-scan guard
-`test_pool_watchdog_sets_questdb_reachable_from_production` fails the build if the
-production `set_questdb_reachable` call site, the `QuestDbConfig` param, or the
-`wait_for_questdb_ready` probe is removed — so the dead-signal regression cannot
-recur.
-
-### Test Plan — Fix A no-op close (2026-06-30, rework)
-New guard `crates/api/tests/health_questdb_reachable_wiring_guard.rs`:
-`test_questdb_reachable_round_trips` (state setter/getter honesty),
-`test_pool_watchdog_sets_questdb_reachable_from_production` (source-scan: the
-production call site + `QuestDbConfig` param + `wait_for_questdb_ready` probe +
-the Halt arm reading `health.questdb_reachable()` into `is_bare_reset_class` all
-present). Existing `is_bare_reset_class` truth-table + ceiling tests + the
-`post_market_pool_halt_guard.rs` Halt-arm guards remain green. Gates: `cargo build`
-+ `cargo test -p tickvault-app -p tickvault-api -p tickvault-storage`,
-banned-pattern, plan-verify, plan-gate.
-
-### Rollback — Fix A no-op close (2026-06-30, rework)
-Additive + self-contained: revert the `questdb_config` parameter + the 5s probe
-block + the two `config.questdb.clone()` call-site args + the new guard test →
-returns to the (no-op) shipped state. No schema, no migration, no persisted state.
-`git revert` of the rework commit is clean.
-
-### Observability — Fix A no-op close (2026-06-30, rework)
-No new counter/log/event — the rework only makes the EXISTING `WS-GAP-09`
-reconnect-in-place gate functional in production by feeding it the live
-`questdb_reachable` signal. `health.questdb_reachable()` now reflects true QuestDB
-state on `/health` + in the SLO/self-test paths that read it, and the bare-reset
-gate's QuestDB predicate is no longer a dead constant `false`.
+| 1 | `cargo test -p tickvault-storage --test instance_type_lock_guard` | all pass against new r8g.large/16-GiB text |
+| 2 | grep `m8g.large` as a LOCKED value | only historical/superseded mentions remain |
+| 3 | fresh `terraform apply` | provisions r8g.large (validation passes) |
+| 4 | `aws-upgrade-instance.sh --from m8g.large --to r8g.large` | accepted (allowlist + FROM default) |
+| 5 | `dry_run` / `MAX_DAILY_UNIVERSE_SIZE` / `SEAL_BUFFER_CAPACITY` | UNCHANGED |

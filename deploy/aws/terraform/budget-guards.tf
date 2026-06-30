@@ -34,12 +34,13 @@ sns = boto3.client('sns')
 
 INR_PER_USD = 85    # rupee display rate (what you actually pay incl GST)
 GST_MULT    = 1.18  # India GST 18%
-# The REAL ceiling is the AWS Budget that auto-stops the box (budget.tf:20):
-# $25/month measured on UnblendedCost (pre-GST USD). Comparing month-to-date
-# USD against $25 makes the digest "% used" match the kill-switch EXACTLY —
-# previously it compared rupees-with-GST against a separate ₹2000 number, so
-# the percentage you saw did NOT line up with what actually stopped the box.
-BUDGET_USD  = 25.0
+# The REAL ceiling is the AWS Budget that auto-stops the box (budget.tf
+# limit_amount): $55/month measured on UnblendedCost (pre-GST USD, TOTAL
+# account spend — the budget cost_filter was removed 2026-06-30). Comparing
+# month-to-date USD against $55 makes the digest "% used" match the kill-switch
+# EXACTLY. KEEP THIS IN SYNC with budget.tf limit_amount — the digest reads
+# BUDGET_USD, the native Budget Action + killswitch fire at limit_amount.
+BUDGET_USD  = 55.0
 
 # Friendly labels for the Cost Explorer SERVICE dimension (substring match).
 SERVICE_LABELS = [
@@ -215,7 +216,8 @@ data "archive_file" "tv_hard_stop_guard_zip" {
   output_path = "${path.module}/.tv-hard-stop-guard.zip"
   source {
     content  = <<-PYEOF
-import os, json, boto3
+import os, boto3
+from datetime import datetime, timedelta, timezone
 
 ec2 = boto3.client('ec2')
 sns = boto3.client('sns')
@@ -223,22 +225,72 @@ sns = boto3.client('sns')
 INSTANCE_ID = os.environ['INSTANCE_ID']
 ALERTS_ARN  = os.environ['ALERTS_TOPIC_ARN']
 
+# IST = UTC+5:30. Up-window = Mon-Fri 08:30-16:30 IST (the EventBridge
+# start/stop schedule). The guard now runs HOURLY (2026-06-30) so the box can
+# never bill a full overnight if the 16:30 stop missed; it force-stops the box
+# any time it runs OUTSIDE the up-window, and NEVER touches it DURING the window
+# (a strict no-op in-window so it can't kill a live market-hours session).
+def in_up_window(now_utc):
+    ist = now_utc + timedelta(hours=5, minutes=30)
+    dow = ist.weekday()              # 0=Mon .. 6=Sun
+    hhmm = ist.hour * 100 + ist.minute
+    return dow <= 4 and 830 <= hhmm <= 1630
+
+def mtd_usd():
+    # Best-effort Cost Explorer MTD (us-east-1). Never fails the stop logic.
+    try:
+        ce = boto3.client('ce', region_name='us-east-1')
+        today = datetime.now(timezone.utc).date()
+        start = today.replace(day=1)
+        r = ce.get_cost_and_usage(
+            TimePeriod={'Start': str(start), 'End': str(today)},
+            Granularity='MONTHLY', Metrics=['UnblendedCost'],
+        )
+        return sum(float(d['Total']['UnblendedCost']['Amount']) for d in r['ResultsByTime'])
+    except Exception as e:  # noqa: BLE001 — never let cost lookup break the stop
+        print(f"MTD lookup failed (non-fatal): {e}")
+        return None
+
 def handler(event, context):
+    now_utc = datetime.now(timezone.utc)
     desc = ec2.describe_instances(InstanceIds=[INSTANCE_ID])
-    state = desc['Reservations'][0]['Instances'][0]['State']['Name']
+    inst = desc['Reservations'][0]['Instances'][0]
+    state = inst['State']['Name']
+
     if state in ('stopped', 'stopping', 'shutting-down', 'terminated'):
         print(f"Instance {INSTANCE_ID} already {state}, no-op.")
         return {'ok': True, 'noop': True, 'state': state}
 
-    # Was running outside trading window — force stop + alert
+    if in_up_window(now_utc):
+        # Running DURING the trading window — expected. Hourly "still running"
+        # cost ping so the operator sees the box is up + spend so far. NEVER
+        # stop in-window (would kill a live market-hours session).
+        launch = inst.get('LaunchTime')
+        hrs_up = (now_utc - launch).total_seconds() / 3600 if launch else 0.0
+        usd = mtd_usd()
+        usd_str = f"~$${usd:.2f}" if usd is not None else "n/a"
+        sns.publish(
+            TopicArn=ALERTS_ARN,
+            Subject='[BUDGET] box still running',
+            Message=(
+                "🟢 *Box running (in window)*\n"
+                f"_instance_: `{INSTANCE_ID}`\n"
+                f"_up_: {hrs_up:.1f}h this boot\n"
+                f"_MTD spend_: {usd_str} / $55 stop-budget\n"
+                "In the 08:30-16:30 IST trading window — left running.\n"
+            ),
+        )
+        return {'ok': True, 'noop': True, 'in_window': True, 'state': state}
+
+    # Running OUTSIDE the up-window — force stop + alert (the never-cross guard).
     ec2.stop_instances(InstanceIds=[INSTANCE_ID])
     msg = (
         "🔴 *Hard Auto-Stop Guard Fired*\n"
         f"_instance_: `{INSTANCE_ID}`\n"
         f"_was_state_: {state}\n"
-        "Daily 17:00 IST auto-stop guard found the instance still\n"
-        "running. EventBridge 16:30 IST stop must have missed. Now\n"
-        "stopped to protect the monthly budget.\n"
+        "Hourly out-of-window guard found the box running OUTSIDE the\n"
+        "08:30-16:30 IST Mon-Fri window. EventBridge 16:30 stop (or a\n"
+        "manual start) left it up. Now stopped to protect the budget.\n"
     )
     sns.publish(TopicArn=ALERTS_ARN, Subject='[BUDGET] hard auto-stop guard fired', Message=msg)
     return {'ok': True, 'noop': False, 'was_state': state}
@@ -268,6 +320,13 @@ resource "aws_iam_role_policy" "tv_hard_stop_guard" {
       {
         Effect   = "Allow"
         Action   = ["ec2:DescribeInstances", "ec2:StopInstances"]
+        Resource = "*"
+      },
+      {
+        # Read-only MTD spend for the hourly "still running" cost ping.
+        # Best-effort: the Lambda's stop logic never depends on this.
+        Effect   = "Allow"
+        Action   = ["ce:GetCostAndUsage"]
         Resource = "*"
       },
       {
@@ -306,13 +365,18 @@ resource "aws_cloudwatch_log_group" "tv_hard_stop_guard" {
   retention_in_days = 14
 }
 
-# Run EVERY day (including weekends) at 17:00 IST = 11:30 UTC.
-# Why every day, not just Mon-Fri: a manually-started instance over
-# the weekend should also auto-stop, not run all night.
+# Run HOURLY, every day (2026-06-30 — was once-daily 17:00 IST). The Lambda is
+# window-aware: OUTSIDE the Mon-Fri 08:30-16:30 IST up-window it force-stops a
+# running box (so a missed 16:30 stop or a manual start can NEVER bill a full
+# overnight/weekend); INSIDE the window it is a strict no-op except for an
+# hourly "box still running — Xh, ~$Y MTD" cost ping. Hourly = the box can over-
+# run the budget by at most ~1 EC2-hour (~$0.064) before this catches it, plus
+# the native AWS Budget Action (budget.tf) stops at 90%/100% spend regardless.
+# 1 invocation/hour is well within the Lambda free tier (1M/mo).
 resource "aws_cloudwatch_event_rule" "tv_hard_stop_guard" {
   name                = "tv-prod-hard-stop-guard"
-  description         = "Force-stop instance every day at 17:00 IST (11:30 UTC) — budget safety net"
-  schedule_expression = "cron(30 11 * * ? *)"
+  description         = "Hourly out-of-window force-stop + in-window running cost ping — budget never-cross safety net"
+  schedule_expression = "cron(0 * * * ? *)"
 }
 
 resource "aws_cloudwatch_event_target" "tv_hard_stop_guard" {
