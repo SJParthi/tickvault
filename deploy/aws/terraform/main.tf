@@ -156,15 +156,13 @@ resource "aws_iam_role_policy" "tv_instance" {
           "ssm:DeleteParameter",
         ]
         Resource = [
-          # var.environment names the infra resources (prod). The APP, however,
-          # reads its secrets under the SSM prefix selected by TV_ENVIRONMENT
-          # (systemd unit) — currently "staging" for the 3-month data-pull phase
-          # (sandbox/dry_run, no real orders). Allow BOTH prefixes explicitly so
-          # the box can read /tickvault/staging/* today and /tickvault/prod/*
-          # after the eventual live cutover (TV_ENVIRONMENT=staging -> prod).
-          # Least-privilege: only these two named env prefixes, not /tickvault/*.
-          "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/*",
-          "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/staging/*"
+          # Single real env (operator 2026-06-30): the app's TV_ENVIRONMENT=prod
+          # SSM prefix (systemd unit) and var.environment (prod, names the infra
+          # resources) AGREE, so one grant covers reading /tickvault/prod/*. The
+          # retired /tickvault/staging/* grant was dropped with the dev/staging
+          # consolidation. Least-privilege: only this one named env prefix, not
+          # /tickvault/*. NO real orders — production.toml locks dry_run=true.
+          "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/*"
         ]
       },
       {

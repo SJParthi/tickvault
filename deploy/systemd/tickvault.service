@@ -62,12 +62,13 @@ WatchdogSec=60
 Environment=RUST_LOG=info
 # TV_ENVIRONMENT selects BOTH config/<env>.toml AND the /tickvault/<env>/ SSM
 # prefix (read by boot_helpers::resolve_config_env + secret_manager).
-# staging = sandbox/data-pull (dry_run=true, sandbox.dhan.co, no real orders) —
-# the locked config for the 3-month no-orders monitoring phase.
-# DO NOT change to "prod" until going live: production.toml sets dry_run=false +
-# real api.dhan.co + requires the registered static EIP (enable_eip=true). See
-# config/production.toml + config/staging.toml.
-Environment=TV_ENVIRONMENT=staging
+# Single real env (operator 2026-06-30): prod. dev/staging configs were retired;
+# base.toml + production.toml are the only env configs. This is STILL the
+# no-real-orders data-pull phase — production.toml LOCKS dry_run=true (NO real
+# orders) plus a far-future sandbox_only_until belt-and-suspenders. Flipping to
+# live trading is a separate, deliberate change (set dry_run=false +
+# mode=live AND re-register the static EIP). See config/production.toml.
+Environment=TV_ENVIRONMENT=prod
 # GROWW_MAX_SUBSCRIBE caps the first-run Groww subscription set. Default in code
 # is 60 (subset-safe); set to 1000 here to subscribe the FULL ~779-instrument
 # Groww universe (NTM-union: indices + F&O underlyings + NIFTY-Total-Market

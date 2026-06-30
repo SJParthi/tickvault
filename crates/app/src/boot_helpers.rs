@@ -47,12 +47,15 @@ pub const CONFIG_LOCAL_PATH: &str = "config/local.toml";
 
 /// Resolves the deployment environment name for config-file selection.
 ///
-/// Precedence (first non-empty wins): `TV_ENVIRONMENT` → `ENVIRONMENT` → `"dev"`.
+/// Precedence (first non-empty wins): `TV_ENVIRONMENT` → `ENVIRONMENT` → `"prod"`.
 /// This is the SAME precedence used by
 /// `tickvault_core::auth::secret_manager::resolve_environment`, so the
 /// config-file env and the SSM secret prefix (`/tickvault/<env>/...`) always
-/// agree — the deployed box's `TV_ENVIRONMENT=staging` selects BOTH
-/// `config/staging.toml` AND `/tickvault/staging/...` secrets.
+/// agree — the deployed box's `TV_ENVIRONMENT=prod` selects BOTH
+/// `config/production.toml` AND `/tickvault/prod/...` secrets. The default is
+/// `prod`: dev/staging were collapsed into the single prod env
+/// (operator 2026-06-30). NO real orders are placed — `production.toml` locks
+/// `dry_run=true`.
 pub fn resolve_config_env() -> String {
     std::env::var("TV_ENVIRONMENT")
         .ok()
@@ -62,18 +65,19 @@ pub fn resolve_config_env() -> String {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
         })
-        .unwrap_or_else(|| "dev".to_string())
+        .unwrap_or_else(|| "prod".to_string())
 }
 
 /// Returns the per-environment config override path (`config/<env>.toml`) to
 /// merge BETWEEN base and local, or `None` when no override applies.
 ///
-/// `None` is returned for `dev` and `local` so existing local-dev behaviour
+/// `None` is returned for `dev` and `local` so Mac local-dev behaviour
 /// (base + local only) is byte-identical — there is no `config/dev.toml`, and
-/// `config/local.toml` is already merged separately. For any other env
-/// (`staging`, `production`, `sandbox`) the matching `config/<env>.toml` is
-/// returned. The env name is sanitised to a strict `[a-z0-9-]` allowlist so a
-/// malicious env var can never traverse paths.
+/// `config/local.toml` is already merged separately. For the single real env
+/// (`prod`/`production`) the matching `config/production.toml` is returned
+/// (dev/staging configs retired, operator 2026-06-30). The env name is
+/// sanitised to a strict `[a-z0-9-]` allowlist so a malicious env var can
+/// never traverse paths.
 pub fn config_env_path(env: &str) -> Option<String> {
     let normalized = env.trim().to_ascii_lowercase();
     // dev/local: no dedicated override file (base + local already cover it).
@@ -495,15 +499,17 @@ mod tests {
     use std::net::SocketAddr;
 
     // -----------------------------------------------------------------------
-    // resolve_config_env — env-var precedence (TV_ENVIRONMENT > ENVIRONMENT > dev)
+    // resolve_config_env — env-var precedence (TV_ENVIRONMENT > ENVIRONMENT > prod)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_resolve_config_env_defaults_to_dev_when_unset() {
-        // Process-global env vars are racy across parallel tests, so this test
-        // only asserts the DEFAULT branch under a serialized lock that clears
-        // both vars. The precedence ordering itself is pinned by the pure
-        // `config_env_path` tests below + the documented contract.
+    fn test_resolve_config_env_defaults_to_prod_when_unset() {
+        // Single-prod-env consolidation (operator 2026-06-30): the default env
+        // is now `prod` (dev/staging retired). NO real orders — production.toml
+        // locks dry_run=true. Process-global env vars are racy across parallel
+        // tests, so this test only asserts the DEFAULT branch under a serialized
+        // lock that clears both vars. The precedence ordering itself is pinned by
+        // the pure `config_env_path` tests below + the documented contract.
         use std::sync::Mutex;
         static ENV_LOCK: Mutex<()> = Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -514,7 +520,7 @@ mod tests {
             std::env::remove_var("TV_ENVIRONMENT");
             std::env::remove_var("ENVIRONMENT");
         }
-        assert_eq!(resolve_config_env(), "dev");
+        assert_eq!(resolve_config_env(), "prod");
         unsafe {
             match saved_tv {
                 Some(v) => std::env::set_var("TV_ENVIRONMENT", v),
@@ -543,11 +549,15 @@ mod tests {
     }
 
     #[test]
-    fn test_config_env_path_staging_maps_to_staging_toml() {
-        // The 3-month data-pull phase runs staging = sandbox/dry_run config.
+    fn test_config_env_path_prod_is_the_canonical_override() {
+        // Single-prod-env consolidation (operator 2026-06-30): `prod` is the
+        // ONLY real env override. `config/staging.toml` and `config/dev.toml`
+        // were retired; base.toml + production.toml are the only env configs.
+        // `config_env_path` is the generic env→file mapper, so the prod aliases
+        // below are the live mapping.
         assert_eq!(
-            config_env_path("staging"),
-            Some("config/staging.toml".to_string())
+            config_env_path("prod"),
+            Some("config/production.toml".to_string())
         );
     }
 

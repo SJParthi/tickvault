@@ -1,122 +1,108 @@
-# Implementation Plan: Persist Dhan 429 WS cooldown so it survives a process restart
+# Implementation Plan: Collapse dev/staging into a single `prod` environment (dry_run=true LOCKED)
 
 **Status:** VERIFIED
 **Date:** 2026-06-30
-**Approved by:** Parthiban (operator) — go-ahead given this session 2026-06-30
+**Approved by:** Parthiban (operator) — directive given this session 2026-06-30 ("collapse dev/staging/prod into a single prod env across the entire workspace; preserve dry_run=true / NO real orders")
 
 > Guarantee matrices: this item carries the 15-row + 7-row matrices by
 > cross-reference to `.claude/rules/project/per-wave-guarantee-matrix.md`
-> (mandatory per `per-item-guarantee-check.sh`). Evidence below.
+> (mandatory per `per-item-guarantee-check.sh`). The dominant guarantee for
+> THIS change is the order-safety invariant: `dry_run=true` is preserved in
+> every active config; no path reaches `api_client.place_order`.
 
 ## Design
 
-**Confirmed root cause (pre-audited, not re-investigated):** Dhan rate-limits the
-main-feed WS connect with HTTP 429. The 60s→300s `rate_limit_streak` backoff
-(`connection.rs`) is in-memory only. When all connections are down for
-`POOL_HALT_SECS=300` the pool watchdog returns Halt and the BOOT-ON path calls
-`std::process::exit(2)` so a supervisor restarts the process. That restart wipes
-the in-memory `rate_limit_streak` to 0, and the fresh process reconnects with a
-0ms first retry (`compute_reconnect_base_delay_ms(0)=0`) straight back into Dhan's
-still-active 429 window → instant 429 → 300s → exit → restart → infinite loop.
-There is NO persisted cooldown today.
+The workspace currently models three environments — `dev`, `staging`, `prod`.
+`staging` was the 3-month data-pull env (sandbox/dry_run, no real orders);
+`dev` was local. The operator directive collapses these into a SINGLE real env,
+`prod`, used everywhere — config, systemd, deploy workflows, terraform IAM,
+helper-script defaults, and BOTH feeds (Dhan + Groww). `prod` becomes the only
+real environment while PRESERVING the order-safety lock.
 
-**Fix (FIX B — persist the cooldown so it survives a restart):** a tiny on-disk
-JSON record of the last 429 hit + the current backoff floor. On boot, BEFORE the
-first Dhan WS pool spawn, read it; if cooldown remains, `tokio::time::sleep` first
-(capped at `WS_RATE_LIMIT_BACKOFF_CAP_MS`). Fail-open: a missing/corrupt/stale file
-NEVER blocks boot.
+Hard safety constraint (non-negotiable): `dry_run=true` (NO real orders) MUST be
+preserved. This is still the data-pull phase. `config/production.toml` currently
+sets `dry_run = false` — it is changed to `dry_run = true` with a LOUD comment,
+plus a far-future `sandbox_only_until` belt-and-suspenders (mirroring the deleted
+staging.toml) so even a future misedit flipping `mode=live` is mechanically
+blocked at boot by `StrategyConfig::check_sandbox_window`.
 
-Changed crates: **tickvault-core** (new persistence module + write wiring at the 429
-site), **tickvault-common** (1 new `ErrorCode` variant), **tickvault-app** (boot
-read+wait wiring).
+Semantic (not blind find-replace): only the env-SELECTION strings/defaults change.
+`dev`/`staging` config branches are retired; everything repoints to `prod`.
+`config/base.toml` + `config/production.toml` become the only env configs.
 
-New module `crates/core/src/websocket/rate_limit_cooldown.rs`:
-- `cooldown_file_path()` — `$TV_WS_WAL_DIR`-sibling `./data/ws-rate-limit-cooldown.json`
-  (same base-dir convention as `ws_wal_dir()`).
-- `record_rate_limit_hit(now_epoch_ms, streak, floor_ms)` — best-effort std-fs write
-  (atomic write to a tmp file + rename). A write error logs `error!(code=WS-GAP-08)`
-  and returns — NEVER blocks the WS loop.
-- `remaining_cooldown_ms(last_hit_epoch_ms, floor_ms, now_epoch_ms) -> u64` — PURE.
-  Returns how long to still wait; 0 if expired, 0 if the record is older than the cap
-  (stale), 0 if `now < last_hit` (clock went backwards). Cap-bounded by the caller.
-- `read_cooldown() -> Option<PersistedCooldown>` — reads + parses; `None` on
-  missing/corrupt/stale (fail-open).
-
-Wiring:
-- WRITE: at the 429 classification site in `connection.rs` (~line 1289), after
-  `rate_limit_streak.fetch_add`, compute the new streak + floor and call
-  `record_rate_limit_hit(...)` (best-effort).
-- READ+WAIT: in `crates/app/src/main.rs` `start_dhan_lane`, immediately BEFORE the
-  main-feed WS pool is created/spawned, read the cooldown; if `remaining > 0`,
-  `info!` + increment `tv_ws_rate_limit_cooldown_waited_total` + `tokio::time::sleep`
-  (the wait is already ≤ cap because `remaining_cooldown_ms` clamps to the floor and
-  the floor itself ≤ cap; the caller additionally `.min(WS_RATE_LIMIT_BACKOFF_CAP_MS)`).
-
-Observability: new `ErrorCode::WsGap08RateLimitCooldown` ("WS-GAP-08", Severity::Low,
-runbook `wave-2-error-codes.md`); counter `tv_ws_rate_limit_cooldown_waited_total`.
-
-## Edge Cases
-
-- Missing file (first ever boot) → `read_cooldown()=None` → no wait. Boot normal.
-- Corrupt/truncated JSON → parse fails → `None` → no wait (fail-open, never block).
-- Stale file (older than cap) → `remaining_cooldown_ms=0` → no wait.
-- Clock skew backwards (`now < last_hit`) → `remaining=0` (saturating).
-- Floor larger than cap → caller `.min(cap)` bounds the actual sleep ≤ 300s.
-- Write failure (disk full / read-only) → logs WS-GAP-08, never blocks the WS loop.
-- Concurrent writers (multiple conns): each writes the same file; last-writer-wins is
-  fine — it's a single advisory cooldown, not per-conn state. Atomic tmp+rename avoids
-  torn reads.
-
-## Failure Modes
-
-- A bad/huge file can never hang boot: the sleep is `min(remaining, cap)` ≤ 300s.
-- A persisted cooldown is advisory only — it never gates correctness, only the first
-  connect timing. If the file is wrong, worst case is one extra/short wait, self-healing
-  on the next successful connect (streak resets in-memory; file goes stale).
-- No new tick-drop path; the WS read/reconnect engine + 429 backoff math are untouched.
-
-## Test Plan
-
-Crate: tickvault-core (`cargo test -p tickvault-core`), tickvault-common
-(`cargo test -p tickvault-common` for the ErrorCode invariants).
-- `remaining_cooldown_ms`: active (returns positive), expired (0), exactly-at-boundary,
-  zero floor (0), now<last_hit (0), stale-older-than-cap (0).
-- `read_cooldown`: corrupt-file fail-open returns None; round-trip write→read returns Some.
-- ErrorCode invariants (existing tests cover unique code_str, FromStr roundtrip,
-  runbook path exists, prefix pattern, all() exhaustive) — the new variant flows through.
-- Cross-ref test `error_code_rule_file_crossref.rs` satisfied by the rule-file mention.
-
-## Rollback
-
-Single logical commit on a feature branch. `git revert <sha>` removes the module,
-the write call, the boot read/wait, and the ErrorCode variant. No schema/data
-migration, no config flag — the on-disk file is advisory and ignored if absent.
-
-## Observability
-
-- `error!(code = ErrorCode::WsGap08RateLimitCooldown.code_str(), ...)` on a persist
-  write failure (→ 5-sink + Telegram).
-- `info!(code = WS-GAP-08, ...)` operator-readable line when boot waits out a cooldown.
-- Counter `tv_ws_rate_limit_cooldown_waited_total` (static label) incremented on each
-  boot-time wait.
-- New runbook section in `.claude/rules/project/wave-2-error-codes.md` (WS-GAP-08).
+Changed crates: **tickvault-common** (the build-blocking `aws_infra_wiring.rs`
+test must be rewritten to assert `prod` + the new `dry_run=true` invariant, plus
+the `DEFAULT_SSM_ENVIRONMENT` constant) and **tickvault-core**/**tickvault-app**
+(env default `dev`→`prod` in `secret_manager::resolve_environment` +
+`boot_helpers::resolve_config_env`). Non-crate files: systemd unit, terraform
+`main.tf` IAM grant, deploy/autopilot workflows, helper scripts, config TOMLs.
 
 ## Plan Items
 
-- [x] Add `ErrorCode::WsGap08RateLimitCooldown` (+ code_str/severity/runbook/all) and a
-  `.claude/rules/project/wave-2-error-codes.md` WS-GAP-08 section
-  - Files: crates/common/src/error_code.rs, .claude/rules/project/wave-2-error-codes.md
-  - Tests: existing error_code invariant tests + error_code_rule_file_crossref
-- [x] New module `rate_limit_cooldown.rs` (pure `remaining_cooldown_ms`, `read_cooldown`,
-  `record_rate_limit_hit`, `cooldown_file_path`) + unit tests
-  - Files: crates/core/src/websocket/rate_limit_cooldown.rs, crates/core/src/websocket/mod.rs
-  - Tests: test_remaining_cooldown_ms_active, test_remaining_cooldown_ms_expired_returns_zero,
-    test_remaining_cooldown_ms_stale_record_is_zero, test_remaining_cooldown_ms_clock_backwards_is_zero,
-    test_read_cooldown_corrupt_file_is_none, test_record_rate_limit_hit_round_trip_write_read,
-    test_cooldown_file_path_is_under_data_dir
-- [x] Wire WRITE at the 429 site in connection.rs
-  - Files: crates/core/src/websocket/connection.rs
-  - Tests: test_record_rate_limit_hit_round_trip_write_read
-- [x] Wire READ+WAIT before the main-feed pool spawn in main.rs start_dhan_lane
-  - Files: crates/app/src/main.rs
-  - Tests: test_remaining_cooldown_ms_active
+- [x] `config/production.toml`: `dry_run = true` (LOUD locked comment); `[feeds] dhan_enabled=true` + `groww_enabled=true`; far-future `sandbox_only_until`; keep `ip_verification_enabled=true`, `sns_enabled`.
+  - Files: config/production.toml
+  - Tests: aws_infra_wiring::test_production_toml_locks_dry_run_true_no_real_orders (new)
+- [x] Delete `config/staging.toml`; keep `config/local.toml` (Mac host-dev, still referenced by `CONFIG_LOCAL_PATH`).
+  - Files: config/staging.toml (deleted)
+- [x] Default env → `prod`: `resolve_config_env` (boot_helpers), `resolve_environment` (secret_manager), `DEFAULT_SSM_ENVIRONMENT` const (common/constants); helper-script defaults `staging`→`prod` (aws-autopilot.sh, ensure-questdb.sh, aws-autopilot.yml).
+  - Files: crates/app/src/boot_helpers.rs, crates/core/src/auth/secret_manager.rs, crates/common/src/constants.rs, scripts/aws-autopilot.sh, scripts/ensure-questdb.sh, .github/workflows/aws-autopilot.yml
+  - Tests: boot_helpers config_env_path tests; secret_manager resolve/validate tests (updated)
+- [x] `deploy/systemd/tickvault.service`: `TV_ENVIRONMENT=staging`→`prod` + comment block rewrite.
+  - Files: deploy/systemd/tickvault.service
+- [x] `deploy/aws/terraform/main.tf`: drop the redundant `/tickvault/staging/*` IAM grant (already granted via `var.environment`=prod), rewrite comment.
+  - Files: deploy/aws/terraform/main.tf
+- [x] `.github/workflows/deploy-aws.yml`: retire the auto-seed-to-staging step (operator populates `/tickvault/prod/*` manually); repoint the config-diff + QuestDB SSM reads to prod; rewrite comments.
+  - Files: .github/workflows/deploy-aws.yml
+- [x] Delete the now-dead `.github/workflows/seed-staging-ssm.yml` auto-seed workflow; drop its stale reference in aws-autopilot.sh.
+  - Files: .github/workflows/seed-staging-ssm.yml (deleted), scripts/aws-autopilot.sh
+- [x] Rewrite `crates/common/tests/aws_infra_wiring.rs` env-string tests to assert `prod` + the new invariants; drop the two seed-staging-ssm tests.
+  - Files: crates/common/tests/aws_infra_wiring.rs
+  - Tests: test_terraform_instance_iam_allows_prod_ssm_prefix, test_production_toml_locks_dry_run_true_no_real_orders, test_deploy_aws_workflow_refreshes_repo_and_systemd_unit
+
+## Edge Cases
+
+- A box that already exported `TV_ENVIRONMENT=staging` (stale systemd unit) — the deploy refreshes the systemd unit from the repo, so after this lands the box runs `TV_ENVIRONMENT=prod` and reads `/tickvault/prod/*` (which the operator populates manually + the IAM `var.environment` grant already covers).
+- `config_env_path("prod")` already maps to `production.toml` (pre-existing alias) — no new path logic needed; only the DEFAULT when the env var is unset changes.
+- Path-traversal hostile env var: the strict `[a-z0-9-]` allowlist in `config_env_path` + `validate_environment` is unchanged, so the safety property is preserved.
+- `local.toml`: still selected by `config_env_path` returning `None` for `local`/`dev` and merged separately via `CONFIG_LOCAL_PATH`; left intact for Mac host-dev.
+
+## Failure Modes
+
+- **Real orders accidentally enabled** — the whole point of the lock. Mitigated by: `production.toml dry_run=true`, `base.toml dry_run=true`, `default_dry_run()=true`, far-future `sandbox_only_until`, and the engine.rs dry_run gate that returns before any HTTP. Proven by grep + order-path trace in the PR body.
+- **Box IAM-denied reading its secrets** — `var.environment`=prod already grants `/tickvault/prod/*`; removing the redundant staging grant cannot deny prod.
+- **Deploy FATAL on missing `config/staging.toml`** — the deploy config-diff is repointed to `production.toml`, so deleting staging.toml does not break the deploy verification step.
+- **Build break from the build-blocking `aws_infra_wiring.rs`** — rewritten in the same change so the workspace builds green.
+
+## Test Plan
+
+- `grep -rn 'dry_run' config/` → production.toml = true, no active `false`.
+- `cargo build --workspace` → 0 errors.
+- `cargo test -p tickvault-common -p tickvault-app -p tickvault-core -p tickvault-trading` (env/secret/oms/aws_infra_wiring/dry_run paths) → green; paste result lines.
+- `cargo fmt --check`, banned-pattern-scanner, plan-verify, plan-gate.
+- Adversarial order-safety trace: with `dry_run=true`, no config/code path under `prod` reaches `api_client.place_order`.
+
+## Rollback
+
+Single squash-merge PR. Revert the merge commit to restore the three-env model
+(`config/staging.toml`, the seed-staging-ssm workflow, the `dev`/`staging`
+defaults, and the original `production.toml dry_run=false`). No data migration,
+no schema change, no stored-state dependency — pure config/deploy/test edits.
+
+## Observability
+
+No new runtime telemetry is required — this is a config/deploy consolidation.
+Existing signals remain: `resolve_environment()` warns once if `TV_ENVIRONMENT`
+is unset (now defaulting to `prod`); the OMS engine logs `dry_run=...` at daily
+reset; deploy workflow steps print the deployed config diff. The order-safety
+invariant is enforced mechanically by the rewritten `aws_infra_wiring.rs` test
+(`test_production_toml_locks_dry_run_true_no_real_orders`) which fails the build
+if `production.toml` ever sets `dry_run = false` again.
+
+## Scenarios
+
+| # | Scenario | Expected |
+|---|----------|----------|
+| 1 | `TV_ENVIRONMENT` unset at boot | defaults to `prod`, reads `/tickvault/prod/*`, loads `production.toml` |
+| 2 | Stale box with `TV_ENVIRONMENT=staging` unit | deploy refreshes unit → `prod` |
+| 3 | Future misedit flips `mode=live` in production.toml | boot panics via `check_sandbox_window` (far-future `sandbox_only_until`) |
+| 4 | Operator has not yet populated `/tickvault/prod/*` | boot halts with SecretRetrieval (honest, no silent fallback to dev) — operator is populating manually |

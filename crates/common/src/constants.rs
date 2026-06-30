@@ -1466,8 +1466,10 @@ pub const INTRADAY_TIMEFRAMES: &[(&str, &str)] = &[
 // ---------------------------------------------------------------------------
 
 /// Default environment name for SSM path construction.
-/// Overridden by `ENVIRONMENT` env var if present.
-pub const DEFAULT_SSM_ENVIRONMENT: &str = "dev";
+/// Overridden by `TV_ENVIRONMENT` / `ENVIRONMENT` env var if present.
+/// Single real env (operator 2026-06-30): dev/staging were collapsed into
+/// `prod`. NO real orders are placed — `production.toml` locks `dry_run=true`.
+pub const DEFAULT_SSM_ENVIRONMENT: &str = "prod";
 
 // ---------------------------------------------------------------------------
 // Authentication — Circuit Breaker

@@ -130,32 +130,32 @@ fn test_terraform_instance_type_pinned() {
 }
 
 #[test]
-fn test_seed_staging_ssm_workflow_is_automated_and_secret_safe() {
-    // Full automation: a GitHub Actions workflow copies /tickvault/dev/* ->
-    // /tickvault/staging/* using the AWS creds already in GitHub Secrets, so the
-    // operator never re-types or pastes a secret. It must: (1) exist, (2) be
-    // dispatchable, (3) use --overwrite (idempotent), (4) NEVER echo a secret
-    // value (only names), (5) target the staging prefix.
-    let wf =
-        std::fs::read_to_string(workspace_root().join(".github/workflows/seed-staging-ssm.yml"))
-            .expect("seed-staging-ssm.yml must be readable"); // APPROVED: test
+fn test_deploy_aws_does_not_auto_seed_prod_secrets() {
+    // Single-prod-env consolidation (operator 2026-06-30): the operator
+    // populates /tickvault/prod/* MANUALLY. The deploy workflow MUST NOT
+    // auto-seed prod — the retired seed-staging-ssm workflow + the deploy's
+    // auto-seed step are gone. The deploy's prod-secret step is READ-ONLY:
+    // it never copies from another env and never overwrites an operator value.
     assert!(
-        wf.contains("workflow_dispatch"),
-        "seed workflow must be manually dispatchable (one click in Actions)"
+        !workspace_root()
+            .join(".github/workflows/seed-staging-ssm.yml")
+            .exists(),
+        "the staging-secret auto-seed workflow must be retired (single prod env)"
     );
+    let wf = std::fs::read_to_string(workspace_root().join(".github/workflows/deploy-aws.yml"))
+        .expect("deploy-aws.yml must be readable"); // APPROVED: test
+    // No auto-seed: the deploy must NOT INVOKE `aws ssm put-parameter` anywhere
+    // (it only NAMES the manual command in an operator-facing warning string).
+    // A real invocation would clobber operator-owned /tickvault/prod/* values.
     assert!(
-        wf.contains("/tickvault/${SOURCE_ENV}") && wf.contains("/tickvault/${TARGET_ENV}"),
-        "seed workflow must copy from the dev source path to the staging target path"
+        !wf.contains("aws ssm put-parameter --"),
+        "deploy-aws.yml must NOT invoke `aws ssm put-parameter` — the operator \
+         populates /tickvault/prod/* manually; the deploy is read-only there."
     );
+    // The read-only prod pre-flight must exist and target the prod prefix.
     assert!(
-        wf.contains("--overwrite"),
-        "seed workflow must use --overwrite so re-running is idempotent"
-    );
-    // Secret-safety: the value is piped into put-parameter, NEVER echoed. Assert
-    // there is no `echo` of the value variable.
-    assert!(
-        !wf.contains("echo \"$value\"") && !wf.contains("echo $value"),
-        "seed workflow must NEVER echo a decrypted secret value to the log"
+        wf.contains("/tickvault/prod/$key"),
+        "deploy-aws.yml must read-only pre-flight the /tickvault/prod/* boot-halt keys"
     );
 }
 
@@ -194,31 +194,70 @@ fn test_cloudwatch_operator_dashboard_exists() {
 }
 
 #[test]
-fn test_terraform_instance_iam_allows_staging_ssm_prefix() {
-    // The app reads its secrets under the SSM prefix selected by
-    // TV_ENVIRONMENT (systemd unit) = "staging" for the 3-month data-pull
-    // phase. The instance IAM role is named with var.environment (prod), so
-    // its SSM Resource must EXPLICITLY also allow /tickvault/staging/* —
-    // otherwise the box is IAM-denied reading /tickvault/staging/dhan/* and
-    // boot fails at auth. Regression: 2026-05-30 pre-flight audit caught the
-    // app(staging) vs IAM(prod) SSM-prefix mismatch before first deploy.
-    let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
+fn test_single_prod_env_iam_systemd_and_dry_run_locked() {
+    // Single-prod-env consolidation (operator 2026-06-30): dev/staging were
+    // collapsed into ONE real env, `prod`. The app reads its secrets under the
+    // SSM prefix selected by TV_ENVIRONMENT (systemd unit) = "prod", and the
+    // instance IAM role (named with var.environment = prod) grants
+    // /tickvault/${var.environment}/* — so the box can read /tickvault/prod/*.
+    // The retired /tickvault/staging/* grant must be GONE.
+    //
+    // Hard safety invariant (the operator has insisted on this dozens of times):
+    // this is the NO-real-orders data-pull phase, so production.toml MUST lock
+    // dry_run = true. This test fails the build if a future edit flips
+    // production.toml back to dry_run = false (which would arm real orders).
+    let main_tf = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
         .expect("main.tf must be readable"); // APPROVED: test
+    // IAM grants the prod prefix via var.environment (= prod) and must NOT
+    // retain a literal staging grant.
     assert!(
-        content.contains("parameter/tickvault/staging/*"),
+        main_tf.contains("parameter/tickvault/${var.environment}/*"),
         "main.tf instance IAM role must allow ssm:GetParameter on \
-         /tickvault/staging/* — the app's TV_ENVIRONMENT=staging SSM prefix. \
-         Without it the box is IAM-denied reading its Dhan/Telegram secrets."
+         /tickvault/${{var.environment}}/* (= /tickvault/prod/*) — the app's \
+         TV_ENVIRONMENT=prod SSM prefix."
     );
-    // The systemd unit must agree — TV_ENVIRONMENT=staging is the source of the
-    // staging SSM prefix the IAM line above grants.
+    assert!(
+        !main_tf.contains("parameter/tickvault/staging/*"),
+        "the retired /tickvault/staging/* IAM grant must be removed \
+         (single prod env, operator 2026-06-30)."
+    );
+
+    // The systemd unit must select the single prod env.
     let unit = std::fs::read_to_string(workspace_root().join("deploy/systemd/tickvault.service"))
         .expect("tickvault.service must be readable"); // APPROVED: test
     assert!(
-        unit.contains("TV_ENVIRONMENT=staging"),
-        "tickvault.service must set TV_ENVIRONMENT=staging (data-pull, no real \
-         orders). If this flips to prod, the IAM staging grant + this test must \
-         be revisited together (production.toml arms real money)."
+        unit.contains("TV_ENVIRONMENT=prod"),
+        "tickvault.service must set TV_ENVIRONMENT=prod (single real env). \
+         NO real orders — production.toml locks dry_run=true."
+    );
+    assert!(
+        !unit.contains("TV_ENVIRONMENT=staging"),
+        "the retired TV_ENVIRONMENT=staging must be removed from tickvault.service"
+    );
+
+    // HARD SAFETY: production.toml locks dry_run = true (NO real orders). A
+    // build-failing assertion so dry_run can never silently flip to false again.
+    let prod_cfg = std::fs::read_to_string(workspace_root().join("config/production.toml"))
+        .expect("config/production.toml must be readable"); // APPROVED: test
+    assert!(
+        prod_cfg.contains("dry_run = true"),
+        "config/production.toml MUST set dry_run = true — this is the no-real-orders \
+         data-pull phase. Flipping to live trading is a separate deliberate change."
+    );
+    assert!(
+        !prod_cfg.contains("dry_run = false"),
+        "config/production.toml MUST NOT set dry_run = false — that arms REAL orders."
+    );
+
+    // The retired dev/staging configs must be gone; base.toml + production.toml
+    // are the only env configs.
+    assert!(
+        !workspace_root().join("config/staging.toml").exists(),
+        "config/staging.toml must be retired (single prod env, operator 2026-06-30)"
+    );
+    assert!(
+        !workspace_root().join("config/dev.toml").exists(),
+        "there must be no config/dev.toml (single prod env)"
     );
 }
 
@@ -253,18 +292,11 @@ fn test_terraform_eventbridge_schedules_match_budget() {
 }
 
 #[test]
-fn test_seed_staging_ssm_self_fires_and_cowork_can_dispatch() {
-    // Zero-click automation: the seed workflow self-fires on a daily cron (no
-    // human clicks "Run workflow"), and Claude Cowork (claude-mobile-command)
-    // has actions:write so it can dispatch aws-control / deploy / seed on
-    // request. Both pinned so the self-firing automation can't silently regress.
-    let seed =
-        std::fs::read_to_string(workspace_root().join(".github/workflows/seed-staging-ssm.yml"))
-            .expect("seed-staging-ssm.yml must be readable"); // APPROVED: test
-    assert!(
-        seed.contains("schedule:") && seed.contains("cron:"),
-        "seed-staging-ssm.yml must self-fire on a cron schedule (zero-click)"
-    );
+fn test_cowork_can_dispatch_aws_workflows() {
+    // Claude Cowork (claude-mobile-command) has actions:write so it can dispatch
+    // aws-control / deploy on request. (The staging-secret seed workflow was
+    // retired in the single-prod-env consolidation — the operator populates
+    // /tickvault/prod/* manually, so there is no auto-seed workflow to self-fire.)
     let mobile = std::fs::read_to_string(
         workspace_root().join(".github/workflows/claude-mobile-command.yml"),
     )
@@ -446,10 +478,11 @@ fn test_deploy_aws_workflow_refreshes_repo_and_systemd_unit() {
     // new binary + synced config, but NEVER refreshed the box's repo clone or
     // the systemd unit. The clone is shallow from first boot, so the box would
     // keep its first-boot systemd unit FOREVER. That unit carries TV_ENVIRONMENT
-    // — a stale unit (pre-#898 TV_ENVIRONMENT=prod) would make the new binary
-    // load production.toml = REAL ORDERS, breaking the no-orders data-pull lock.
-    // The deploy must git-pull the clone AND re-copy the systemd unit before
-    // daemon-reload + restart.
+    // — a stale unit would load a stale config. Under the single-prod-env model
+    // (operator 2026-06-30) the unit sets TV_ENVIRONMENT=prod and production.toml
+    // locks dry_run=true (NO real orders), so refreshing the unit keeps the box
+    // on the correct env. The deploy must git-pull the clone AND re-copy the
+    // systemd unit before daemon-reload + restart.
     let content =
         std::fs::read_to_string(workspace_root().join(".github/workflows/deploy-aws.yml"))
             .expect("deploy-aws.yml must be readable"); // APPROVED: test
@@ -464,7 +497,8 @@ fn test_deploy_aws_workflow_refreshes_repo_and_systemd_unit() {
             "cp -f repo/deploy/systemd/tickvault.service /etc/systemd/system/tickvault.service"
         ),
         "deploy-aws.yml SSM command must refresh the systemd unit from the repo \
-         (carries TV_ENVIRONMENT=staging — a stale prod unit would arm real money)."
+         (carries TV_ENVIRONMENT=prod; production.toml locks dry_run=true — a \
+         stale unit could load a stale config)."
     );
 }
 
