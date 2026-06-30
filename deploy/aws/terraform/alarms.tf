@@ -102,16 +102,51 @@ resource "aws_cloudwatch_metric_alarm" "ebs_write_latency" {
   alarm_name          = "tv-${var.environment}-ebs-write-latency-high"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 3
-  metric_name         = "VolumeTotalWriteTime"
-  namespace           = "AWS/EBS"
-  period              = 300
-  statistic           = "Average"
-  threshold           = 50 # milliseconds
-  alarm_description   = "EBS write latency > 50ms for 15 minutes. Tick spill + QuestDB ILP use this volume. See DR runbook §8 (Spill disk)."
+  threshold           = 50 # milliseconds PER WRITE OPERATION
+  alarm_description    = "EBS PER-OP write latency > 50ms/op for 15 minutes. Tick spill + QuestDB ILP use this volume. See DR runbook §8 (Spill disk)."
   treat_missing_data  = "notBreaching"
 
-  dimensions = {
-    VolumeId = aws_instance.tv_app.root_block_device[0].volume_id
+  # FALSE-POSITIVE FIX (production cutover 2026-06-30):
+  # The previous config alarmed on Average(VolumeTotalWriteTime). That is WRONG:
+  # VolumeTotalWriteTime is the SUM of seconds spent on ALL writes in the period,
+  # so under heavy QuestDB ILP write bursts the raw value trivially exceeds the
+  # 50 threshold even when each individual write is fast — a false positive.
+  # Per-operation latency is the only meaningful "slow disk" signal:
+  #     ms_per_write = (VolumeTotalWriteTime / VolumeWriteOps) * 1000
+  # We guard division-by-zero (idle volume → 0 WriteOps) with a 1-op floor so an
+  # idle period reads ~0 ms/op instead of NaN/Infinity (which CloudWatch treats
+  # as missing → no spurious breach).
+  metric_query {
+    id          = "ms_per_write"
+    expression  = "(write_time_seconds / MAX([write_ops, 1])) * 1000"
+    label       = "EBS write latency (ms/op)"
+    return_data = true
+  }
+
+  metric_query {
+    id = "write_time_seconds"
+    metric {
+      metric_name = "VolumeTotalWriteTime"
+      namespace   = "AWS/EBS"
+      period      = 300
+      stat        = "Sum"
+      dimensions = {
+        VolumeId = aws_instance.tv_app.root_block_device[0].volume_id
+      }
+    }
+  }
+
+  metric_query {
+    id = "write_ops"
+    metric {
+      metric_name = "VolumeWriteOps"
+      namespace   = "AWS/EBS"
+      period      = 300
+      stat        = "Sum"
+      dimensions = {
+        VolumeId = aws_instance.tv_app.root_block_device[0].volume_id
+      }
+    }
   }
 
   alarm_actions = [aws_sns_topic.tv_alerts.arn]
