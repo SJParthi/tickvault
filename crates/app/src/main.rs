@@ -5519,6 +5519,11 @@ async fn start_dhan_lane(
     // Re-inject replayed LiveFeed frames into the pool's mpsc BEFORE the
     // tick processor spawns, so recovered frames land ahead of any live
     // frames and are persisted idempotently via QuestDB dedup keys.
+    //
+    // CRASH-SAFETY (zero-loss MEDIUM fix 2026-06-30): same staged-then-confirm
+    // contract as the fast-boot path — see its comment. Confirm only if BOTH
+    // the LiveFeed re-injection and the OrderUpdate drain below are clean.
+    let mut ws_wal_replay_reinjection_clean = true;
     if !ws_wal_replay_live_feed.is_empty() {
         if let Some(ref pool) = ws_pool_ready {
             let sender = pool.frame_sender_clone();
@@ -5545,11 +5550,12 @@ async fn start_dhan_lane(
             )
             .increment(injected);
             if dropped > 0 {
+                ws_wal_replay_reinjection_clean = false;
                 error!(
                     dropped,
                     injected,
                     "STAGE-C.2b: LiveFeed re-injection dropped frames (slow boot) — \
-                     channel full/closed, frames remain in WAL archive"
+                     channel full/closed, frames stay staged in WAL replaying/ and re-replay next boot"
                 );
                 metrics::counter!(
                     "tv_ws_frame_wal_reinjected_dropped_total",
@@ -5563,10 +5569,11 @@ async fn start_dhan_lane(
                 );
             }
         } else {
+            ws_wal_replay_reinjection_clean = false;
             warn!(
                 frames = ws_wal_replay_live_feed.len(),
                 "STAGE-C.2b: LiveFeed replay frames held but no pool (slow boot) — \
-                 frames remain in WAL archive, not re-injected"
+                 frames stay staged in WAL replaying/, not re-injected"
             );
         }
     }
@@ -6983,6 +6990,21 @@ async fn start_dhan_lane(
                 "ws_type" => "order_update"
             )
             .increment(parse_errors);
+        }
+    }
+
+    // CRASH-SAFETY confirm (slow boot): mirror of the fast-boot confirm — only
+    // archive the staged segments if both re-injection legs were clean.
+    {
+        let slow_ws_wal_path = tickvault_app::tick_conservation_boot::ws_wal_dir();
+        if ws_wal_replay_reinjection_clean {
+            tickvault_storage::ws_frame_spill::confirm_replayed(&slow_ws_wal_path);
+        } else {
+            warn!(
+                dir = %slow_ws_wal_path.display(),
+                "STAGE-C.2b: WAL replay NOT confirmed (slow boot — a re-injection dropped or pool \
+                 not ready) — staged segments remain in replaying/ for re-replay next boot"
+            );
         }
     }
 
