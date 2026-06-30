@@ -34,6 +34,7 @@ Usage (auto-launched by the Rust supervisor; no manual run needed):
     export GROWW_API_KEY=...   GROWW_TOTP_SECRET=...
     python3 groww_sidecar.py
 """
+import asyncio
 import glob
 import json
 import logging
@@ -158,6 +159,31 @@ WATCH_POLL_SECS = 5
 SILENT_FEED_FIRST_WARN_SECS = 30
 SILENT_FEED_REWARN_SECS = 60
 
+# ACTIVE self-heal (2026-06-30). The watchdog above only PRINTED; it never
+# recovered. The Groww NATS server can close the socket WITHOUT raising (a
+# swallowed "Authorization Violation"); `nats-py` closes the connection but never
+# raises, so the blocking consume call never returns and the except→reconnect
+# never fires — the feed sits dead forever (the live 10:31 IST incident). The
+# watchdog now FORCE-CLOSES the NATS socket when DECODED records stall during
+# market hours, so `consume()` returns and the reconnect loop re-subscribes.
+# `STALL_DEADLINE_SECS` is the feed-level (whole-universe) silence window: at
+# market open ticks flow every second across the ~767-SID universe, so a short
+# silence is a real dead socket, not illiquidity. It is the IN-PROCESS fast path;
+# the Rust supervisor's process-kill stall-watchdog is the slower backstop.
+STALL_DEADLINE_SECS = 5
+# How often the watchdog samples the decoded counters while consuming.
+STALL_POLL_SECS = 1
+# NSE trading window [09:15, 15:30) IST — the market-hours gate for the ms
+# reconnect ladder + the force-reconnect (off-hours silence is NORMAL; don't
+# fight a legitimately-idle feed).
+MARKET_OPEN_SEC_OF_DAY = 9 * 3600 + 15 * 60   # 09:15:00 IST, inclusive
+MARKET_CLOSE_SEC_OF_DAY = 15 * 3600 + 30 * 60  # 15:30:00 IST, exclusive
+# Market-hours reconnect ladder: start at 50ms and double to a 5s cap so a drop
+# during the session reconnects in milliseconds (operator: "reconnects within
+# seconds and re-subscribes"). NEVER give up while the market is open.
+MARKET_OPEN_RECONNECT_BASE_SECS = 0.05
+MARKET_OPEN_RECONNECT_CAP_SECS = 5.0
+
 # NATS reject-reason surfacing (2026-06-29). VERIFIED against growwapi-1.5.0 +
 # nats-py 2.15.0 source (quoted in groww_sidecar.py header / the plan):
 #   - growwapi.groww.feed.GrowwFeed holds its NATS client at `feed._nats_client`
@@ -210,6 +236,39 @@ def _nats_socket_from_feed(feed):
             flush=True,
         )
         return None
+
+
+def _force_close_nats_socket(feed) -> bool:
+    """Best-effort FORCE the blocking consume call to return by closing the
+    underlying NATS socket from the watchdog thread, so the except→reconnect loop
+    runs and re-subscribes (the active self-heal for the swallowed-close case that
+    left the feed dead at 10:31 IST). Returns True if a close was scheduled.
+
+    nats-py's `Client.close()` is a coroutine running on the SDK's own asyncio
+    loop; we schedule it thread-safely with `run_coroutine_threadsafe` against the
+    socket's loop. ALL of this is best-effort and wrapped: any attribute mismatch
+    on a future wheel is caught + logged and returns False (the Rust supervisor's
+    process-kill stall-watchdog is the backstop). It NEVER raises out of the
+    watchdog thread."""
+    socket = _nats_socket_from_feed(feed)
+    if socket is None:
+        return False
+    try:
+        close_coro = getattr(socket, "close", None)
+        loop = getattr(socket, "_loop", None)
+        if close_coro is None or loop is None:
+            return False
+        # Schedule the async close on the SDK's event loop from this thread.
+        asyncio.run_coroutine_threadsafe(close_coro(), loop)
+        return True
+    except Exception as exc:  # noqa: BLE001 - self-heal must never break the feed
+        print(
+            f"groww sidecar: force-close of NATS socket failed ({type(exc).__name__}); "
+            "relying on the Rust supervisor process-kill backstop",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
 
 
 def _socket_error_detail(socket, secrets):
@@ -428,17 +487,77 @@ def _retry_after_secs(exc):
     return secs if secs > 0 else None
 
 
+def _sec_of_day_ist(now_utc_epoch: float) -> int:
+    """IST second-of-day [0, 86400) for a UTC epoch. Pure (clock injected)."""
+    ist_epoch = now_utc_epoch + 5.5 * 3600
+    return int(ist_epoch) % 86400
+
+
+def _is_within_market_hours_ist(now_utc_epoch: float) -> bool:
+    """True iff `now` is inside the NSE window [09:15, 15:30) IST (start-inclusive,
+    end-exclusive). Pure — the clock is injected so it is unit-testable. Mirrors
+    the Rust `is_within_market_hours_ist` gate so the Python ms ladder + the
+    force-reconnect agree with the Rust stall-watchdog (no fighting a
+    legitimately-idle off-hours feed)."""
+    sec = _sec_of_day_ist(now_utc_epoch)
+    return MARKET_OPEN_SEC_OF_DAY <= sec < MARKET_CLOSE_SEC_OF_DAY
+
+
+def should_force_reconnect(
+    decoded_total: int,
+    last_decode_total: int,
+    secs_since_change: float,
+    market_open: bool,
+    deadline_secs: float,
+) -> bool:
+    """Pure decision: should the silent-feed watchdog FORCE the blocking
+    `consume()` to return (by closing the NATS socket) so the reconnect loop
+    re-subscribes? True ONLY when the market is open, at least one record decoded
+    before (so we are not in the cold pre-first-tick case the diagnostic covers),
+    the decoded total has NOT advanced, and the silence has lasted past the
+    deadline. Off-hours silence is normal → never force-reconnect. O(1), no I/O."""
+    if not market_open:
+        return False
+    if decoded_total == 0:
+        # No record EVER decoded — cold pre-open / entitlement case; the silent-
+        # feed diagnostic + the Rust process-kill backstop handle it, not a
+        # close-loop here (closing a never-streamed socket just churns).
+        return False
+    if decoded_total != last_decode_total:
+        return False  # data is still flowing — not stalled.
+    return secs_since_change >= deadline_secs
+
+
 def _backoff_secs(consecutive_failures: int, rate_limited: bool, retry_after) -> float:
     """Exponential backoff with jitter for the Nth consecutive failure.
 
     Base 5s (60s when rate-limited), doubling per consecutive failure, capped at
     300s, ±20% jitter. A server-advised retry-after (if larger) takes precedence.
+
+    DURING MARKET HOURS (and NOT rate-limited / no server retry-after), use the
+    fast ms ladder (50ms→…→5s cap) instead, so a mid-session drop reconnects in
+    milliseconds (operator: "reconnects within seconds and re-subscribes"). A
+    rate-limit ALWAYS uses the 60s ladder even in market hours — hammering the
+    throttled token endpoint just extends the ban.
     """
-    base = RATE_LIMIT_BACKOFF_BASE_SECS if rate_limited else RECONNECT_BACKOFF_BASE_SECS
+    if rate_limited or retry_after is not None:
+        base = RATE_LIMIT_BACKOFF_BASE_SECS if rate_limited else RECONNECT_BACKOFF_BASE_SECS
+        exp = base * (2 ** max(0, consecutive_failures - 1))
+        delay = min(exp, RECONNECT_BACKOFF_CAP_SECS)
+        if retry_after is not None:
+            delay = max(delay, min(retry_after, RECONNECT_BACKOFF_CAP_SECS))
+        jitter = 1.0 + random.uniform(-BACKOFF_JITTER_FRAC, BACKOFF_JITTER_FRAC)
+        return delay * jitter
+    if _is_within_market_hours_ist(time.time()):
+        # Fast ms ladder while the market is open: 50ms, 100ms, … capped at 5s.
+        exp = MARKET_OPEN_RECONNECT_BASE_SECS * (2 ** max(0, consecutive_failures - 1))
+        delay = min(exp, MARKET_OPEN_RECONNECT_CAP_SECS)
+        jitter = 1.0 + random.uniform(-BACKOFF_JITTER_FRAC, BACKOFF_JITTER_FRAC)
+        return delay * jitter
+    # Off-hours, no rate-limit: the original 5s→300s ladder (don't churn after close).
+    base = RECONNECT_BACKOFF_BASE_SECS
     exp = base * (2 ** max(0, consecutive_failures - 1))
     delay = min(exp, RECONNECT_BACKOFF_CAP_SECS)
-    if retry_after is not None:
-        delay = max(delay, min(retry_after, RECONNECT_BACKOFF_CAP_SECS))
     jitter = 1.0 + random.uniform(-BACKOFF_JITTER_FRAC, BACKOFF_JITTER_FRAC)
     return delay * jitter
 
@@ -943,19 +1062,82 @@ def wait_for_subscriptions():
         time.sleep(WATCH_POLL_SECS)
 
 
-def silent_feed_watchdog(stocks: int, indices: int) -> None:
-    """Warn LOUDLY (stderr) if subscribed but NO record decodes within the deadline.
+# The CURRENT GrowwFeed handle, updated by the reconnect loop each cycle so the
+# long-lived stall-recovery watchdog (armed once per process) always force-closes
+# the LIVE socket, not the stale first-cycle one. A list (1 element) is the
+# simplest thread-safe shared cell — reads/writes of a single reference are atomic
+# under the GIL.
+_CURRENT_FEED = [None]
+
+
+def _stall_recovery_loop(feed_cell) -> None:
+    """ACTIVE self-heal (2026-06-30): once data has started flowing, force the
+    blocking `consume()` to return (by closing the NATS socket) whenever decoded
+    records STALL across the whole universe DURING MARKET HOURS — so the
+    except→reconnect loop re-subscribes within ms. This is the in-process fast
+    path for the swallowed-close case that left the feed dead at 10:31 IST. Runs
+    for the process lifetime as a daemon. Off-hours silence is normal → never
+    force-reconnect (don't fight a legitimately-idle feed). Best-effort: any
+    failure is caught; the Rust supervisor's process-kill stall-watchdog is the
+    backstop. Pure decision via `should_force_reconnect` (unit-tested).
+
+    `feed_cell` is the shared 1-element cell holding the CURRENT GrowwFeed (the
+    reconnect loop updates it each cycle) so a force-close always targets the live
+    socket, never the stale first-cycle one."""
+    last_decoded = EMITTED_TOTAL + DROPPED_TOTAL
+    last_change_monotonic = time.monotonic()
+    while True:
+        time.sleep(STALL_POLL_SECS)
+        decoded = EMITTED_TOTAL + DROPPED_TOTAL
+        if decoded != last_decoded:
+            last_decoded = decoded
+            last_change_monotonic = time.monotonic()
+            continue
+        secs_since_change = time.monotonic() - last_change_monotonic
+        market_open = _is_within_market_hours_ist(time.time())
+        if should_force_reconnect(
+            decoded, last_decoded, secs_since_change, market_open, STALL_DEADLINE_SECS
+        ):
+            print(
+                f"groww sidecar: FEED STALLED — {STALL_DEADLINE_SECS}s with NO new record "
+                f"across the universe during market hours (emitted={EMITTED_TOTAL}, "
+                f"dropped={DROPPED_TOTAL}); force-closing the NATS socket to trigger "
+                "reconnect + re-subscribe (self-heal).",
+                file=sys.stderr,
+                flush=True,
+            )
+            feed = feed_cell[0]
+            if feed is not None:
+                _force_close_nats_socket(feed)
+            # Reset the clock so we don't hammer close() every poll while the
+            # reconnect is in flight; the next real record re-arms the detector.
+            last_change_monotonic = time.monotonic()
+
+
+def silent_feed_watchdog(stocks: int, indices: int, feed_cell=None) -> None:
+    """Warn LOUDLY (stderr) if subscribed but NO record decodes within the deadline,
+    then ACTIVELY self-heal a mid-session stall.
 
     Runs as a daemon thread. The SDK's blocking `consume()` can swallow per-frame
     decode errors without raising, leaving us "subscribed but 0 ticks" with no
     actionable cause on stdout/stderr. This surfaces that truth: it samples the
     DECODED total (emitted + dropped) and, if it is still 0 after the first
     deadline, prints the most-likely causes; thereafter it re-warns periodically
-    with the live counts until data flows, then goes quiet.
+    with the live counts until data flows. Once data IS flowing it hands off to
+    `_stall_recovery_loop`, which force-reconnects on a market-hours stall (the
+    10:31 IST swallowed-close case). `feed_cell` is the shared 1-element cell
+    holding the CURRENT GrowwFeed handle used to reach the NATS socket for the
+    force-close; if None (legacy / test), the active recovery is skipped and only
+    the diagnostic runs.
     """
     time.sleep(SILENT_FEED_FIRST_WARN_SECS)
     if EMITTED_TOTAL + DROPPED_TOTAL > 0:
-        return  # data is decoding — nothing to warn about.
+        # Data already decoding — hand off to the active stall-recovery loop so a
+        # LATER mid-session stall self-heals (the 10:31 case: data flowed, then
+        # stopped). Never returns — it watches for the process lifetime.
+        if feed_cell is not None:
+            _stall_recovery_loop(feed_cell)
+        return
     print(
         f"groww sidecar: SILENT FEED — subscribed {stocks} stocks + {indices} "
         f"indices but received NO live records in {SILENT_FEED_FIRST_WARN_SECS}s. "
@@ -980,6 +1162,10 @@ def silent_feed_watchdog(stocks: int, indices: int) -> None:
             file=sys.stderr,
             flush=True,
         )
+    # Data started flowing after the cold-silent phase → hand off to active
+    # stall-recovery so a later mid-session stall self-heals too.
+    if feed_cell is not None:
+        _stall_recovery_loop(feed_cell)
 
 
 def main() -> None:
@@ -1053,6 +1239,10 @@ def main() -> None:
             phase = "feed-connect"
             groww = GrowwAPI(access_token)
             feed = GrowwFeed(groww)
+            # Publish the CURRENT feed so the long-lived stall-recovery watchdog
+            # always force-closes the live socket on a mid-session stall, not the
+            # stale first-cycle handle (the 10:31 IST self-heal).
+            _CURRENT_FEED[0] = feed
 
             # DIAGNOSTIC (2026-06-29): print the installed SDK version + the REAL
             # public feed methods available in THIS environment, exactly once. This
@@ -1125,9 +1315,12 @@ def main() -> None:
                 # streams nothing (swallowed feed reject / no entitlement / closed
                 # market), it surfaces a loud, actionable diagnostic to stderr instead
                 # of leaving the operator with only the SDK's empty "Error:" lines.
+                # Pass the SHARED current-feed cell so the watchdog's active
+                # stall-recovery (force-close → reconnect) always targets the LIVE
+                # socket across reconnect cycles, not the stale first-cycle one.
                 threading.Thread(
                     target=silent_feed_watchdog,
-                    args=(len(stock_list), len(index_list)),
+                    args=(len(stock_list), len(index_list), _CURRENT_FEED),
                     name="groww-silent-feed-watchdog",
                     daemon=True,
                 ).start()
@@ -1241,8 +1434,52 @@ def _selftest_redaction() -> None:
     print("groww sidecar redaction self-test: PASS")
 
 
+def _selftest_self_heal() -> None:
+    """Prove the ACTIVE self-heal decision functions (2026-06-30). Guarded behind
+    `--selftest` so it NEVER runs in prod. Run: `python3 groww_sidecar.py --selftest`.
+    """
+    # Market-hours gate (start-inclusive 09:15, end-exclusive 15:30 IST).
+    # 06:00 UTC = 11:30 IST → open.
+    assert _is_within_market_hours_ist(_utc_epoch_for_ist(11, 30)), "11:30 IST is open"
+    # 03:30 UTC = 09:00 IST → before open.
+    assert not _is_within_market_hours_ist(_utc_epoch_for_ist(9, 0)), "09:00 IST is pre-open"
+    # exactly 09:15 IST → open (inclusive).
+    assert _is_within_market_hours_ist(_utc_epoch_for_ist(9, 15)), "09:15 IST is open (inclusive)"
+    # exactly 15:30 IST → closed (exclusive).
+    assert not _is_within_market_hours_ist(_utc_epoch_for_ist(15, 30)), "15:30 IST is closed (exclusive)"
+
+    # should_force_reconnect: only fires on a market-hours stall AFTER data flowed.
+    # decoded > 0, no change, past deadline, market open → True.
+    assert should_force_reconnect(10, 10, STALL_DEADLINE_SECS + 1, True, STALL_DEADLINE_SECS), \
+        "a market-hours stall after data flowed must force reconnect"
+    # off-hours → never.
+    assert not should_force_reconnect(10, 10, STALL_DEADLINE_SECS + 1, False, STALL_DEADLINE_SECS), \
+        "off-hours silence must NOT force reconnect"
+    # cold (no record ever decoded) → never (diagnostic + Rust backstop handle it).
+    assert not should_force_reconnect(0, 0, STALL_DEADLINE_SECS + 1, True, STALL_DEADLINE_SECS), \
+        "a never-streamed feed must NOT be close-looped"
+    # data still advancing → never.
+    assert not should_force_reconnect(11, 10, STALL_DEADLINE_SECS + 1, True, STALL_DEADLINE_SECS), \
+        "advancing data is not a stall"
+    # within deadline → never (no premature kill).
+    assert not should_force_reconnect(10, 10, STALL_DEADLINE_SECS - 1, True, STALL_DEADLINE_SECS), \
+        "a brief lull under the deadline must NOT force reconnect"
+
+    print("groww sidecar self-heal self-test: PASS")
+
+
+def _utc_epoch_for_ist(hour: int, minute: int) -> float:
+    """Helper: a UTC epoch whose IST wall-clock is exactly `hour:minute` today.
+    IST = UTC + 5:30, so UTC h:m = IST h:m − 5:30. Pure arithmetic for the test."""
+    ist_sec_of_day = hour * 3600 + minute * 60
+    # Pick a fixed day's UTC midnight, add the IST sec-of-day minus the offset.
+    base_utc_midnight = 1_780_000_000 - (1_780_000_000 % 86400)
+    return float(base_utc_midnight + ist_sec_of_day - int(5.5 * 3600))
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--selftest":
         _selftest_redaction()
+        _selftest_self_heal()
     else:
         main()
