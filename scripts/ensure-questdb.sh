@@ -27,7 +27,8 @@
 set -u
 
 SVC="tv-questdb"
-ENV="${TV_ENVIRONMENT:-staging}"
+# Single real env (operator 2026-06-30): default prod.
+ENV="${TV_ENVIRONMENT:-prod}"
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-ap-south-1}}"
 COMPOSE_FILE="${TV_COMPOSE_FILE:-/opt/tickvault/repo/deploy/docker/docker-compose.yml}"
 IMAGE="questdb/questdb:9.3.5"

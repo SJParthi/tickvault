@@ -1,14 +1,24 @@
 # =============================================================================
-# tickvault — Production Configuration Override
+# tickvault — Production Configuration Override (the ONLY real env)
 # =============================================================================
-# Layer on top of base.toml. Only settings that DIFFER from dev go here.
-# Secrets come from AWS SSM Parameter Store (/tickvault/prod/...).
+# Layer on top of base.toml. base.toml + production.toml are the ONLY env
+# configs (dev/staging configs were retired in the single-prod-env
+# consolidation, operator 2026-06-30). TV_ENVIRONMENT=prod selects this file
+# AND the /tickvault/prod/... SSM secret prefix.
 # Deploy: config/base.toml + config/production.toml merged via figment.
 # =============================================================================
 
 [strategy]
-# CRITICAL: dry_run = false enables REAL order placement
-dry_run = false
+# LOCKED dry_run=true — NO real orders (single-prod-env consolidation, operator
+# 2026-06-30); flipping to live is a separate deliberate change. This is still
+# the data-pull phase. The OMS engine (crates/trading/src/oms/engine.rs) returns
+# BEFORE any live HTTP order call while dry_run==true.
+dry_run = true
+# Belt-and-suspenders defense-in-depth (mirrors the retired staging.toml): even
+# if a future misedit flips mode=live, this far-future cutoff makes accidental
+# real-money promotion mechanically impossible at boot
+# (StrategyConfig::check_sandbox_window panics on mode=Live before this date).
+sandbox_only_until = "2099-12-31"
 
 [risk]
 max_daily_loss_percent = 2.0
@@ -42,5 +52,15 @@ host = "0.0.0.0"
 port = 3001
 
 [notification]
-# Enable SNS SMS alerts in production for CRITICAL events
+# Enable SNS SMS alerts in production for CRITICAL events.
+# NOTE: with sns_enabled=true, prod must have /tickvault/prod/sns/phone-number
+# populated in SSM (operator is populating /tickvault/prod/* manually).
 sns_enabled = true
+
+[feeds]
+# Both market-data feeds run under the single prod env (operator 2026-06-30).
+# Dhan (feed #1) is the primary trading feed; Groww (feed #2) is the
+# independent second live feed per groww-second-feed-scope-2026-06-19.md.
+# Neither feed places orders — dry_run=true above gates all order placement.
+dhan_enabled = true
+groww_enabled = true
