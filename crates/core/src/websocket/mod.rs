@@ -19,6 +19,7 @@ pub mod connection_pool;
 pub mod market_hours_gate;
 pub mod order_update_connection;
 pub mod pool_watchdog;
+pub mod rate_limit_cooldown;
 pub mod subscription_builder;
 pub mod tls;
 pub mod types;

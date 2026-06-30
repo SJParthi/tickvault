@@ -1287,7 +1287,30 @@ impl WebSocketConnection {
                     // floor instead of the instant (0ms) first-retry. Instant
                     // reconnect after a 429 just keeps the limit alive.
                     if response.status().as_u16() == 429 {
-                        self.rate_limit_streak.fetch_add(1, Ordering::Release);
+                        // `fetch_add` returns the PREVIOUS value, so the new
+                        // streak is prev + 1.
+                        let new_streak = self
+                            .rate_limit_streak
+                            .fetch_add(1, Ordering::Release)
+                            .saturating_add(1);
+                        // WS-GAP-08: persist this 429 hit so the cooldown
+                        // survives a `process::exit(2)` + supervisor restart.
+                        // Without this, a restart wipes the in-memory streak
+                        // and the fresh process reconnects with a 0ms first
+                        // retry straight back into Dhan's still-active 429
+                        // window → instant-429 restart loop. Best-effort: a
+                        // write failure logs WS-GAP-08 but never blocks the
+                        // WS loop (the in-memory streak still applies here).
+                        let floor_ms = compute_rate_limit_floor_ms(
+                            new_streak,
+                            tickvault_common::constants::WS_RATE_LIMIT_BACKOFF_BASE_MS,
+                            tickvault_common::constants::WS_RATE_LIMIT_BACKOFF_CAP_MS,
+                        );
+                        crate::websocket::rate_limit_cooldown::record_rate_limit_hit(
+                            crate::websocket::rate_limit_cooldown::now_epoch_ms(),
+                            new_streak,
+                            floor_ms,
+                        );
                     }
                 }
                 return Err(WebSocketError::ConnectionFailed {

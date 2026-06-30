@@ -82,6 +82,64 @@ mid-market (audit Rule 5 — drain failures must be `error!`).
 **Source:** `crates/core/src/websocket/connection.rs` (the
 `TrySendError::Closed` arm of the live-feed `try_send`).
 
+## WS-GAP-08 — Dhan 429 rate-limit cooldown persisted across a process restart
+
+**Trigger:** the main-feed WebSocket connect was rate-limited by Dhan with
+HTTP 429 (DATA-805 "too many requests/connections" class). The in-memory
+`rate_limit_streak` 60s→120s→240s→300s reconnect floor already absorbs this
+WITHIN a running process — but when every connection has been down for
+`POOL_HALT_SECS` (300s) the pool watchdog returns Halt and the BOOT-ON path
+calls `std::process::exit(2)` so a supervisor restarts the process. That
+restart wipes the in-memory streak to `0`, and the fresh process reconnects
+with a `0ms` first retry (`compute_reconnect_base_delay_ms(0) == 0`) straight
+back into Dhan's still-active 429 window → instant 429 → 300s → exit →
+restart → **infinite loop**.
+
+This code tags two events from the persisted-cooldown fix
+(`crates/core/src/websocket/rate_limit_cooldown.rs`):
+
+1. **Boot-time wait (the common, healthy case)** — at boot, BEFORE the first
+   Dhan WS connect, the app reads the persisted cooldown
+   (`./data/ws-rate-limit-cooldown.json`, sibling of the WS-frame WAL). If a
+   cooldown is still active, the app `info!`s with `code = WS-GAP-08`,
+   increments `tv_ws_rate_limit_cooldown_waited_total`, and
+   `tokio::time::sleep`s out the remaining time (capped at
+   `WS_RATE_LIMIT_BACKOFF_CAP_MS` = 300s) so it does NOT reconnect into the
+   still-active 429 window. This is the fix that breaks the loop.
+2. **Persist-write failure (rare)** — `record_rate_limit_hit` could not write
+   the advisory file (disk full / read-only). Logged at `error!` with
+   `code = WS-GAP-08`. Best-effort only: the in-memory streak still applies
+   for the running process; only the cross-restart protection is lost until
+   the disk recovers.
+
+**Severity:** Low. The cooldown is an advisory, **fail-open** protection: a
+missing / corrupt / stale file NEVER blocks boot, and the wait is bounded by
+the cap so a bad file can never hang boot beyond 5 minutes. It does NOT
+change the 429 backoff math (that is correct) and does NOT touch the
+reconnect engine.
+
+**Triage:**
+1. Seeing the boot-time wait `info!` (event 1) is the system working as
+   intended — it is waiting out a real Dhan rate-limit before reconnecting.
+   If it recurs every boot, Dhan is sustainedly rate-limiting this account:
+   check `tv_ws_rate_limit_cooldown_waited_total` rate and the connection
+   count (max 5 WS/account); cross-check DATA-805 in
+   `mcp__tickvault-logs__tail_errors`.
+2. An `error!` (event 2) means the advisory file could not be written:
+   `df -h data/` + `ls -la data/` for disk-full / permission / mount issues.
+   The running process is still protected by its in-memory streak; the gap
+   is only across a restart until the disk is fixed.
+
+**Auto-triage safe:** YES (Severity::Low; the wait is self-bounded and the
+file is fail-open).
+
+**Source:** `crates/core/src/websocket/rate_limit_cooldown.rs`
+(`remaining_cooldown_ms` / `read_cooldown` / `record_rate_limit_hit`),
+the 429 classification write site in
+`crates/core/src/websocket/connection.rs`, the boot read+wait site in
+`crates/app/src/main.rs` (`start_dhan_lane`),
+`crates/common/src/error_code.rs::WsGap08RateLimitCooldown`.
+
 ## AUTH-GAP-03 — token force-renewed on WebSocket wake
 
 **Trigger:** Item 5's wake-from-sleep path observed
