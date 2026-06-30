@@ -27,9 +27,21 @@
 set -euo pipefail
 
 # QuestDB needs vm.max_map_count >= 1048576 (it mmaps every partition/column file).
-# Best-effort: raise on Linux hosts; Docker Desktop (Mac) uses the compose sysctls instead.
+# vm.max_map_count is a NON-namespaced kernel sysctl, so it CANNOT be set via the
+# docker-compose `sysctls:` key — runc refuses to start the container
+# ("sysctl vm.max_map_count is not in a separate kernel namespace"). It must be
+# raised at the HOST / Docker-Desktop-VM level instead (best-effort below).
+#
+# Linux prod hosts: raise it directly on the host kernel.
 if [ "$(uname)" = "Linux" ]; then
   sudo sysctl -w vm.max_map_count=1048576 2>/dev/null || true
+fi
+
+# macOS / Docker Desktop: vm.max_map_count is a NON-namespaced sysctl, so it
+# CANNOT be set via docker-compose `sysctls:` (the container fails to start).
+# Set it inside the Docker Desktop Linux VM instead (best-effort, ignore failure):
+if [ "$(uname)" = "Darwin" ]; then
+  docker run --rm --privileged --pid=host alpine nsenter -t 1 -m -u -n -i sysctl -w vm.max_map_count=1048576 2>/dev/null || true
 fi
 
 RED='\033[0;31m'
