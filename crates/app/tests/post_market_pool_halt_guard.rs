@@ -70,8 +70,11 @@ fn pool_watchdog_match_block(src: &str) -> &str {
     // into the next helper (`spawn_pool_watchdog_task` closes at ~rel 10.4KB).
     // We then use literal-substring checks on this slice. (Window grew
     // 8,500 → 10,360 when PR-E's runtime Dhan-OFF gate added the
-    // `should_act` helper call + the dhan_enabled doc/log lines.)
-    let end = (start + 10_360).min(src.len());
+    // `should_act` helper call + the dhan_enabled doc/log lines; then
+    // 10,360 → 18,000 when Fix A 2026-06-30 added the reconnect-in-place
+    // bare-reset classifier block ahead of the WebSocketPoolHalt notify +
+    // process::exit + the expected-idle reset_watchdog.)
+    let end = (start + 18_000).min(src.len());
     &src[start..end]
 }
 
@@ -197,34 +200,46 @@ fn pool_watchdog_is_reset_outside_market_hours() {
     let src = read_main_rs();
     // Scope to the watchdog task body. Use a generous window from the
     // poll_watchdog call so the post-match reset (which sits just after the
-    // verdict match) is comfortably inside it. Window bumped 8,500 → 10,360:
-    // PR-E's runtime Dhan-OFF gate added the `should_act` helper call + the
-    // dhan_enabled doc/log lines, pushing the expected-idle `reset_watchdog`
-    // site (~rel 10.3KB) just past the old 8,500 window.
+    // verdict match) is comfortably inside it. Window bumped 8,500 → 10,360
+    // (PR-E), then 10,360 → 18,000 (Fix A 2026-06-30 added the reconnect-in-
+    // place classifier block — which ALSO calls `reset_watchdog` inside the
+    // Halt arm — pushing the expected-idle `if !should_act { reset_watchdog }`
+    // site past the old window).
     let needle = "let verdict = pool.poll_watchdog();";
     let start = src
         .find(needle)
         .expect("spawn_pool_watchdog_task must contain `let verdict = pool.poll_watchdog();`");
-    let end = (start + 10_360).min(src.len());
+    let end = (start + 18_000).min(src.len());
     let block = &src[start..end];
 
-    let reset_idx = block.find("reset_watchdog").expect(
-        "spawn_pool_watchdog_task must call pool.reset_watchdog() so the pre-market \
-         DEFERRED window never accumulates a stale AllDown { since } that trips the \
-         300s Halt at 09:00:00. Removing it re-introduces the daily forced restart \
-         + [HIGH] WS POOL HALT + [HIGH] FAST BOOT pages observed 2026-06-03 09:00 IST.",
-    );
     // The reset MUST be gated on `!should_act` — i.e. it runs when the pool is
     // EXPECTED IDLE (off-hours OR Dhan toggled OFF, PR-E). Resetting when the
     // pool should be acted on (in-market AND Dhan enabled) would defeat the
     // genuine 300s all-down Halt that protects against a real mid-session
     // feed outage. The combined gate is `pool_watchdog_should_act_on_degradation`.
+    // NOTE: Fix A's reconnect-in-place path ALSO calls `pool.reset_watchdog()`
+    // (a DIFFERENT, intentional reset on the benign bare-reset class). We anchor
+    // on the `if !should_act` gate and look for the reset that immediately
+    // follows IT, so we pin the expected-idle reset specifically.
     let gate_idx = block.find("if !should_act").expect(
         "reset_watchdog must be gated by `if !should_act` — it may run ONLY when \
          the pool is expected idle (off-hours or Dhan toggled OFF, PR-E). Resetting \
          while Dhan is enabled in-market would silently disable the genuine 300s \
          all-down → Halt safety property.",
     );
+    // The expected-idle reset is the FIRST `reset_watchdog` AT OR AFTER the
+    // `if !should_act` gate (Fix A's benign-bare-reset `reset_watchdog` lives
+    // EARLIER, inside the `if should_act` Halt arm, so we anchor past the gate).
+    let reset_idx = block[gate_idx..]
+        .find("reset_watchdog")
+        .map(|rel| gate_idx + rel)
+        .expect(
+            "spawn_pool_watchdog_task must call pool.reset_watchdog() inside the \
+             `if !should_act` expected-idle branch so the pre-market DEFERRED window \
+             never accumulates a stale AllDown { since } that trips the 300s Halt at \
+             09:00:00. Removing it re-introduces the daily forced restart + [HIGH] WS \
+             POOL HALT + [HIGH] FAST BOOT pages observed 2026-06-03 09:00 IST.",
+        );
     assert!(
         gate_idx < reset_idx,
         "the `if !should_act` gate must lexically precede the reset_watchdog \
@@ -329,13 +344,15 @@ fn runtime_lane_watchdog_does_not_process_exit() {
 
     // Scope to the watchdog task's Halt arm. The window from
     // `let verdict = pool.poll_watchdog();` comfortably covers the Halt arm's
-    // `if in_market_hours { ... lane_halt ... process::exit(2); }` block (the
-    // `std::process::exit(2);` site sits ~6.1KB in; use an 8KB window).
+    // `if should_act { ... lane_halt ... process::exit(2); }` block. Window
+    // bumped 8,000 → 18,000 (Fix A 2026-06-30 added the reconnect-in-place
+    // classifier block ahead of the lane branch + `std::process::exit(2);`,
+    // which now sits ~13.2KB in).
     let needle = "let verdict = pool.poll_watchdog();";
     let start = src
         .find(needle)
         .expect("spawn_pool_watchdog_task must contain `let verdict = pool.poll_watchdog();`");
-    let end = (start + 8_000).min(src.len());
+    let end = (start + 18_000).min(src.len());
     let block = &src[start..end];
 
     let halt_arm_idx = block
