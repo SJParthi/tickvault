@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Claude Code Projects (beta) — Round-3 Feedback</title>
+<style>
+:root{--fg:#1a1a1a;--muted:#5b6470;--bg:#ffffff;--accent:#b4530a;--accent2:#0a5fb4;
+--border:#e2e6ea;--code-bg:#f5f7f9;--quote-bg:#fbf6ef;--quote-border:#e0b070;
+--th-bg:#f0f3f6;--row-alt:#fafbfc;}
+*{box-sizing:border-box;}
+html{-webkit-text-size-adjust:100%;}
+body{margin:0;background:#eef1f4;color:var(--fg);
+font:16px/1.62 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+.wrap{max-width:920px;margin:0 auto;background:var(--bg);padding:46px 56px 80px;
+box-shadow:0 1px 4px rgba(0,0,0,.08);}
+h1{font-size:22px;line-height:1.28;margin:40px 0 12px;letter-spacing:-.01em;
+color:#fff;background:var(--accent2);padding:11px 18px;border-radius:8px;}
+main>h1:first-child{font-size:30px;color:var(--fg);background:none;padding:0;
+margin:0 0 6px;}
+main>h1:first-child+p{color:var(--muted);}
+h2{font-size:25px;margin:42px 0 10px;padding-bottom:6px;border-bottom:2px solid var(--accent);
+letter-spacing:-.01em;}
+h3{font-size:19px;margin:30px 0 6px;color:var(--accent2);}
+h4{font-size:16px;margin:18px 0 4px;color:var(--fg);}
+h5,h6{font-size:15px;margin:14px 0 4px;color:var(--muted);}
+p{margin:9px 0;}
+a{color:var(--accent2);}
+strong{font-weight:650;}
+hr{border:0;border-top:1px solid var(--border);margin:30px 0;}
+ul{margin:8px 0 8px 4px;padding-left:22px;}
+li{margin:4px 0;}
+code{background:var(--code-bg);border:1px solid var(--border);border-radius:4px;
+padding:1px 5px;font:13.5px/1.4 "SF Mono",ui-monospace,Menlo,Consolas,monospace;
+word-break:break-word;}
+pre{background:var(--code-bg);border:1px solid var(--border);border-radius:8px;
+padding:14px 16px;overflow:auto;margin:12px 0;}
+pre code{background:none;border:0;padding:0;font-size:13px;
+white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;}
+blockquote{background:var(--quote-bg);border-left:4px solid var(--quote-border);
+margin:14px 0;padding:8px 18px;border-radius:0 6px 6px 0;}
+blockquote p{margin:6px 0;}
+table{border-collapse:collapse;width:100%;margin:14px 0;font-size:14px;display:block;overflow-x:auto;}
+th,td{border:1px solid var(--border);padding:8px 11px;text-align:left;vertical-align:top;}
+th{background:var(--th-bg);font-weight:650;}
+tbody tr:nth-child(even){background:var(--row-alt);}
+@media (max-width:680px){.wrap{padding:24px 18px 60px;}h1{font-size:24px;}}
+@media print{body{background:#fff;}.wrap{box-shadow:none;max-width:none;padding:0;}}
+</style>
+</head>
+<body>
+<main class="wrap">
+<h1>Claude Code Projects (beta) — Round-3 Feedback</h1>
+<p>Detailed observations, requests, and open questions accompanying the round-3 feedback email. Prepared 2026-06-30. Where we could not prove a cause, we have said so plainly.</p>
+<hr/>
+<h2>Issues at a glance</h2>
+<table>
+<thead><tr><th>#</th><th>Observation</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Transient &ldquo;Server is temporarily limiting requests (not your usage limit) &middot; Rate limited&rdquo; errors recur and terminate sub-agents mid-task; the agent dies with no automatic back-off or resume, so its in-flight work is lost until it is manually re-spawned.</td></tr>
+<tr><td>2</td><td>It appears specifically when <strong>more than one Project is open in parallel on the same repository</strong> (roughly 1&rarr;5 on one repo, 1&ndash;2 on another). With a single Project we did not see it the same way.</td></tr>
+<tr><td>3</td><td><strong>By contrast, normal non-Project sessions never hit it</strong> &mdash; we have run as many as 10 parallel normal sessions with no rate-limiting at any point, which is why this looks specific to the Projects beta rather than to concurrency itself.</td></tr>
+<tr><td>4</td><td>The message says &ldquo;not your usage limit,&rdquo; yet the beta was kindly granted elevated access &mdash; so from our side it is unclear which limit is being reached.</td></tr>
+<tr><td>5</td><td>Sessions under the Projects beta felt noticeably <strong>slower</strong> than a normal, non-Project session &mdash; observed many times, not once.</td></tr>
+<tr><td>6</td><td><em>(Still present from round 2, re-flagged briefly:)</em> sub-agents stay &ldquo;running&rdquo; indefinitely with no auto-termination &mdash; they keep spinning and accumulate, and may compound the load behind items 1 and 5.</td></tr>
+</tbody>
+</table>
+<hr/>
+<h2>What we would love (raised gently)</h2>
+<ul>
+<li><strong>Guidance on the limit</strong> &mdash; a one-line clarification of what class of limit the transient throttle represents under the Projects beta, and whether the elevated beta access covers parallel sub-agent and multi-Project throughput or primarily the main session.</li>
+<li><strong>Confirmation on Projects-per-repo</strong> &mdash; whether opening more than one Project on the same repository is supported / advisable, and if so a safe ceiling (Projects-per-repo and parallel-agent count) we can stay within.</li>
+<li><strong>Automatic back-off and resume</strong> on a transient, server-side (&ldquo;not your usage limit&rdquo;) throttle, so a sub-agent waits and retries rather than dying and losing its work.</li>
+<li><strong>A look at the perceived slowness</strong> under Projects versus a normal session, and what keeps it responsive at this scale.</li>
+<li><strong>A clearer error distinction</strong> between an account usage-limit and a temporary server-side throttle, so a user knows whether to wait or to stop.</li>
+<li><em>(Re-raised from round 2:)</em> idle-agent auto-termination and cleanup, so never-terminated agents stop accumulating.</li>
+</ul>
+<hr/>
+<h2>Open questions</h2>
+<ul>
+<li>We have run up to 10 parallel normal (non-Project) sessions without ever hitting this throttle &mdash; so why would two or more Projects on a single repository trigger it when 10 parallel normal sessions do not? That contrast is what makes us think it is specific to the Projects layer rather than to concurrency.</li>
+<li>Is opening more than one Project on the same repository the trigger &mdash; e.g. do multiple Projects on one repo multiply the effective concurrency against a shared limit? If so, what Projects-per-repo and parallel-agent count would you recommend?</li>
+<li>Does the elevated beta access apply to sub-agent and parallel throughput, or primarily to the main loop?</li>
+<li>Could the signals be linked &mdash; for example, sub-agents that never terminate holding concurrency slots, which in turn drives both the slowness and the rate-limiting? We raise this only as a hypothesis, not a claim.</li>
+<li>Is &ldquo;Server is temporarily limiting requests (not your usage limit)&rdquo; an expected, self-clearing condition we should simply back off on &mdash; or a signal that we are doing something we should not?</li>
+</ul>
+<hr/>
+<h2>Details</h2>
+<h3>1 &mdash; Transient rate-limiting terminates sub-agents, with no resume</h3>
+<p>During Projects-beta sessions we repeatedly saw sub-agents terminate with the exact message below &mdash; in our most recent session it fired twice in a row, back to back. In several cases the failing task was light (a single web fetch, or a short read-only status check), so it did not appear to be a heavy-token operation that tripped it. Retrying after a short wait usually succeeded, which suggests a transient, self-clearing throttle rather than an exhausted account limit. The agent does not wait and retry on its own &mdash; it dies, and its in-flight work is lost until the orchestrator notices and re-spawns it.</p>
+<pre><code>API Error: Server is temporarily limiting requests (not your usage limit) &middot; Rate limited</code></pre>
+<p><strong>Why it matters:</strong> in an unattended multi-agent run, a sub-agent that dies on a transient throttle silently loses its work. A built-in wait-and-retry (back-off and resume) would keep the batch moving on its own.</p>
+<h3>2 &mdash; The trigger: more than one Project on the same repository</h3>
+<p>The clearest pattern we can point to is the number of Projects open on a single repository. With one Project on a repo, we did not see this the same way. Once we had two or more Projects open in parallel against the <strong>same repository</strong> (we worked up from roughly 1 to 5 on one repo, and ran 1&ndash;2 on another), each potentially spawning parallel review and worker sub-agents, the transient rate-limiting and the slowness recurred. We cannot isolate with certainty whether it is the multiple-Projects-per-repo setup, the parallel-agent concurrency, or the overall scale &mdash; but the &ldquo;more than one Project on the same repo&rdquo; condition is the consistent trigger we observed.</p>
+<p><strong>Why it matters:</strong> if multiple Projects on one repository multiply the effective concurrency against a shared limit, knowing that would let us consolidate to a single Project per repo and avoid the throttle entirely.</p>
+<h3>3 &mdash; The contrast: normal sessions never throttle, even 10 in parallel</h3>
+<p>This is the observation that stands out most to us. In normal, non-Project sessions &mdash; same model, same maximum reasoning setting, no Routine &mdash; we have run as many as <strong>10 parallel sessions at once and never hit this rate-limiting, at any point in time</strong>. The throttle only appeared under the Projects beta, and specifically with more than one Project on the same repository. Because 10 parallel normal sessions never tripped it, raw concurrency alone does not seem to be the explanation; something about the Projects layer (or multiple Projects sharing one repo) appears to be the difference. We share this as the cleanest contrast we have, not as a proven mechanism.</p>
+<h3>4 &mdash; &ldquo;not your usage limit&rdquo; versus the granted beta access</h3>
+<p>The message explicitly states it is not our usage limit, and the team kindly granted elevated access for this beta &mdash; so from the user side it is genuinely unclear what limit is being reached. We are not assuming anything is wrong; we simply cannot tell whether the right response is to wait, to slow down, or to reduce the number of Projects on the repo. A one-line clarification would remove the guesswork.</p>
+<h3>5 &mdash; Sessions felt slower than a normal session</h3>
+<p>With the model and reasoning setting held constant, sessions run under the Projects beta felt noticeably slower than our normal, non-Project sessions &mdash; longer pauses between steps, observed many times rather than as a one-off. We could not benchmark it precisely, so we raise it as a perception to investigate, not a measured figure. It tended to coincide with the more-than-one-Project-per-repo condition above, which is why we wonder whether the signals share a root.</p>
+<h3>6 &mdash; Still present from round 2: agents never auto-terminate</h3>
+<p>Briefly, since it is already covered in round 2 and we are only re-flagging that it persists: review and worker sub-agents stayed &ldquo;running&rdquo; for very long stretches with little activity, never auto-terminated, and accumulated. Our only new angle is the hypothesis (open question above) that these never-terminated agents may hold concurrency and feed the slowness and throttling &mdash; raised as a hypothesis, not a claim. The full detail and suggested fix are in our round-2 note.</p>
+<hr/>
+<h2>Screenshots (sent separately with the email)</h2>
+<p>No images are embedded in this document. The screenshots are attached to the email; this list maps each to what it illustrates.</p>
+<ul>
+<li><strong>Inline rate-limit errors in a live session</strong> &mdash; the running session showing two consecutive &ldquo;Service was busy / Server is temporarily limiting requests (not your usage limit) &middot; Rate limited&rdquo; errors back to back (illustrates item 1).</li>
+<li><strong>Background-tasks panel(s)</strong> &mdash; a large multi-agent run in the Projects beta, many sub-agents running in parallel at multi-hour runtimes with few tool uses: the load condition under which the rate-limiting and slowness appeared, and the never-terminated agents themselves (illustrates items 2, 5 and 6).</li>
+<li><strong>Desktop session view</strong> &mdash; the same heavy multi-agent / multiple-Project run in context (illustrates item 2).</li>
+</ul>
+</main>
+</body>
+</html>
