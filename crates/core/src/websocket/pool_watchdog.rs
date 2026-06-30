@@ -38,6 +38,21 @@ pub const POOL_DEGRADED_ALERT_SECS: u64 = 60;
 /// meaningful market activity.
 pub const POOL_HALT_SECS: u64 = 300;
 
+/// Fix A (2026-06-30) — second-tier ceiling (seconds) for the watchdog's
+/// reconnect-in-place mode. When a Halt verdict classifies as a benign
+/// bare-Dhan-transport-RST class (token valid, QuestDB reachable, no 429, no
+/// non-reconnectable code), the watchdog reconnects IN PLACE instead of
+/// `process::exit(2)` + a 775-SID cold re-subscribe (which trips Dhan's per-IP
+/// 429). This ceiling bounds that mode: if the pool stays all-down in
+/// reconnect-in-place for this long with zero frame recovery, the watchdog falls
+/// back to the genuine-fatal exit — so the worst case strictly degrades to
+/// today's behaviour (restart), just after 15 min instead of 5.
+///
+/// **OPERATOR SIGN-OFF FLAGGED:** 900s = 15 min widens the worst-case
+/// truly-wedged-feed outage window from today's 5 min to 15 min. The operator
+/// may prefer 10 min or a tiered "page CRITICAL then exit". Adjust here.
+pub const POOL_RECONNECT_IN_PLACE_CEILING_SECS: u64 = 900;
+
 /// Internal state of the watchdog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolHealthState {
@@ -220,6 +235,8 @@ mod tests {
             subscribed_count: 0,
             total_reconnections: 0,
             last_activity_secs_ago: None,
+            rate_limit_streak: 0,
+            saw_non_reconnectable: false,
         }
     }
 

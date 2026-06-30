@@ -140,6 +140,67 @@ the 429 classification write site in
 `crates/app/src/main.rs` (`start_dhan_lane`),
 `crates/common/src/error_code.rs::WsGap08RateLimitCooldown`.
 
+## WS-GAP-09 — pool watchdog reconnected IN PLACE instead of `process::exit`
+
+**Trigger:** the pool watchdog reached its `>300s all-down → Halt` verdict, but
+the down-cause classified as a **benign bare-Dhan-transport-RST** class rather
+than a genuine fatal. Dhan was observed (CloudWatch, 2026-06-30) to silently
+TCP-RST the main-feed socket ~5-6s after each connect. The legacy behaviour was
+`std::process::exit(2)` → supervisor restart → a full 775-SID cold re-subscribe,
+which trips Dhan's per-IP HTTP 429 (the system restarted ~27×/hr). Fix A
+(2026-06-30) makes that exit CONDITIONAL: the watchdog consults a pure
+`is_bare_reset_class(healths, token_valid, questdb_reachable)` that is true ONLY
+when ALL hold — every connection's `rate_limit_streak == 0` (not a real 429), no
+connection saw a `NonReconnectableDisconnect`, the token is valid, AND QuestDB is
+reachable. When true (and inside the ceiling, below), the watchdog does NOT exit:
+it `pool.reset_watchdog()`s (restarts the 300s `AllDown` window), keeps the
+per-connection `wait_with_backoff` reconnect loops running (subscriptions
+preserved by `SubscribeRxGuard`), and emits this code.
+
+This code tags two events:
+
+1. **Benign in-place decision** (`reason="bare_dhan_reset"`) — the common,
+   healthy case: a bare-RST storm with a valid token + reachable QuestDB is
+   ridden out by reconnecting in place, no process restart, no 429.
+2. **Ceiling-exceeded fallback** (`reason="ceiling_exceeded"`) — the
+   second-tier safety valve: if reconnect-in-place persists past
+   `POOL_RECONNECT_IN_PLACE_CEILING_SECS` (= 900s = **15 minutes**) with still
+   zero frame recovery, the watchdog falls back to the genuine-fatal
+   `process::exit(2)` (or lane teardown). So the worst case degrades to today's
+   behaviour, just after 15 min instead of 5 — strictly never worse.
+
+**Severity:** Low. The benign in-place case is the system self-healing without
+operator action; it does NOT page Telegram (the genuine-fatal Halt keeps its
+existing `WebSocketPoolHalt` page). The `tv_pool_self_halts_total` counter now
+increments ONLY on a genuine-fatal Halt, so its meaning sharpens — a non-zero
+rate there is a real restart, not a benign reset ride-out.
+
+**Honest envelope / operator note:** the 15-minute ceiling is a **second-tier
+backstop flagged for operator sign-off** — it bounds a worst-case
+truly-wedged-feed outage to 15 min (vs today's 5 min) before restarting. It does
+NOT stop Dhan's server-side resets (a Dhan support ticket tracks that); it stops
+the SELF-INFLICTED restart/429 storm those resets were triggering.
+
+**Triage:**
+1. `mcp__tickvault-logs__tail_errors` — find `WS-GAP-09`; the `reason` field is
+   `bare_dhan_reset` (benign ride-out) or `ceiling_exceeded` (fell back to exit).
+2. `tv_ws_watchdog_reconnect_in_place_total{reason}` rate — a sustained
+   `bare_dhan_reset` rate during market hours means Dhan is RST-storming; the
+   system is absorbing it. A `ceiling_exceeded` increment means a 15-min
+   reconnect-in-place did NOT recover frames → the process restarted; treat like
+   the legacy Halt and cross-check token / QuestDB / Dhan status.
+3. Confirm the feed recovered: `tv_websocket_connections_active` should return to
+   the full count once Dhan stops resetting.
+
+**Auto-triage safe:** YES (Severity::Low; the benign case already self-healed,
+and the ceiling fallback restarts exactly as the legacy Halt did).
+
+**Source:** `crates/app/src/main.rs` (`is_bare_reset_class` +
+`reconnect_in_place_ceiling_exceeded` pure helpers + the conditional Halt arm of
+`spawn_pool_watchdog_task`), `crates/core/src/websocket/types.rs`
+(`ConnectionHealth::{rate_limit_streak, saw_non_reconnectable}`),
+`crates/common/src/error_code.rs::WsGap09WatchdogReconnectInPlace`.
+
 ## AUTH-GAP-03 — token force-renewed on WebSocket wake
 
 **Trigger:** Item 5's wake-from-sleep path observed

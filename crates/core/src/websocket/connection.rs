@@ -364,6 +364,23 @@ pub struct WebSocketConnection {
     /// connect+subscribe.
     rate_limit_streak: std::sync::atomic::AtomicU32,
 
+    /// Fix B (2026-06-30) — epoch seconds of the most recent SUCCESSFUL
+    /// connect+subscribe. Reset to `0` at the start of every connect attempt and
+    /// stamped when `connect_and_subscribe` succeeds, so `now - connected_at` is
+    /// the prior session's uptime when the read loop returns. A `0` value (no
+    /// successful session this cycle) reads as uptime 0 → the short-session
+    /// reconnect floor applies (errs toward backing off — safe). Drives
+    /// `compute_short_session_reconnect_floor_ms` in `wait_with_backoff`.
+    connected_at: std::sync::atomic::AtomicI64,
+
+    /// Fix A (2026-06-30) — set `true` once this connection returns a
+    /// `NonReconnectableDisconnect` (a genuine-fatal Dhan disconnect code), so
+    /// the pool watchdog's bare-reset classifier can tell a benign transport RST
+    /// apart from a real fatal. Surfaced on `ConnectionHealth`. Never reset
+    /// within a process — a non-reconnectable disconnect ends `run()`, so this
+    /// connection is fatal for the remainder of the process.
+    saw_non_reconnectable: std::sync::atomic::AtomicBool,
+
     /// 2026-06-12 — optional channel to the `ws_event_audit` writer. Every WS
     /// lifecycle event (connect/disconnect/reconnect/sleep) on this connection
     /// also stamps a forensic row with this connection's `ws_type` (MainFeed)
@@ -524,6 +541,10 @@ impl WebSocketConnection {
             // u32::MAX sentinel = "no Dhan code recorded yet".
             last_disconnect_dhan_code: std::sync::atomic::AtomicU32::new(u32::MAX),
             rate_limit_streak: std::sync::atomic::AtomicU32::new(0),
+            // Fix B (2026-06-30): 0 = no successful session yet this cycle.
+            connected_at: std::sync::atomic::AtomicI64::new(0),
+            // Fix A (2026-06-30): no fatal disconnect observed yet.
+            saw_non_reconnectable: std::sync::atomic::AtomicBool::new(false),
             // 2026-06-12: WS-event audit sink attached lazily via with_ws_audit.
             ws_audit_tx: None,
             ws_audit_pool_size: 1,
@@ -804,6 +825,11 @@ impl WebSocketConnection {
             subscribed_count: self.instruments.len(),
             total_reconnections: self.total_reconnections.load(Ordering::Acquire),
             last_activity_secs_ago,
+            // Fix A (2026-06-30): expose the bare-reset classifier inputs so the
+            // pool watchdog can decide reconnect-in-place vs genuine-fatal exit
+            // from the snapshot it already takes every 5s.
+            rate_limit_streak: self.rate_limit_streak.load(Ordering::Acquire),
+            saw_non_reconnectable: self.saw_non_reconnectable.load(Ordering::Acquire),
         }
     }
 
@@ -848,6 +874,13 @@ impl WebSocketConnection {
             }
 
             self.set_state(ConnectionState::Connecting);
+
+            // Fix B (2026-06-30): clear the prior session's connect stamp before
+            // this attempt. If the connect fails OR the next session is short,
+            // `connected_at` reads 0 (or a fresh recent stamp) so the
+            // short-session reconnect floor is applied — a stale long-ago stamp
+            // can never suppress the floor.
+            self.connected_at.store(0, Ordering::Release);
 
             match self.connect_and_subscribe().await {
                 Ok(ws_stream) => {
@@ -1045,6 +1078,11 @@ impl WebSocketConnection {
                                     reason,
                                 });
                             }
+                            // Fix A (2026-06-30): record the genuine-fatal class
+                            // so the pool watchdog's bare-reset classifier never
+                            // misclassifies a real non-reconnectable Dhan code as
+                            // a benign transport RST.
+                            self.saw_non_reconnectable.store(true, Ordering::Release);
                             self.set_state(ConnectionState::Disconnected);
                             m_conn_active.set(0.0);
                             return Err(WebSocketError::NonReconnectableDisconnect { code });
@@ -1348,6 +1386,13 @@ impl WebSocketConnection {
         // Clean connect + subscribe — clear any feed rate-limit streak so the
         // post-429 reconnect floor resets to normal backoff.
         self.rate_limit_streak.store(0, Ordering::Release);
+
+        // Fix B (2026-06-30): stamp the successful-connect epoch so the NEXT
+        // `wait_with_backoff` can compute this session's uptime (`now -
+        // connected_at`). A session that lives < WS_SHORT_SESSION_THRESHOLD_MS
+        // before dropping gets a floored (non-instant) first reconnect.
+        self.connected_at
+            .store(chrono::Utc::now().timestamp(), Ordering::Release);
 
         // Reunite for the read loop.
         // APPROVED: reuniting same split — cannot fail
@@ -2084,11 +2129,33 @@ impl WebSocketConnection {
         // Phase 0 Item 4 (operator-locked 2026-05-13): first reconnect
         // attempt fires INSTANTLY (0ms). See
         // `compute_reconnect_base_delay_ms` doc for the full rationale.
-        let base_delay_ms = compute_reconnect_base_delay_ms(
+        let mut base_delay_ms = compute_reconnect_base_delay_ms(
             attempt,
             self.ws_config.reconnect_initial_delay_ms,
             self.ws_config.reconnect_max_delay_ms,
         );
+
+        // Fix B (2026-06-30): floor the FIRST reconnect after a short-lived
+        // session. `connected_at == 0` (no successful session this cycle) reads
+        // as uptime 0 → floored (safe). A long-lived (>= threshold) session that
+        // drops keeps the instant first retry. Only RAISES the attempt-0 delay.
+        let connected_at = self.connected_at.load(Ordering::Acquire);
+        let session_uptime_secs = if connected_at == 0 {
+            0
+        } else {
+            chrono::Utc::now()
+                .timestamp()
+                .saturating_sub(connected_at)
+                .max(0)
+        };
+        let short_session_floor_ms = compute_short_session_reconnect_floor_ms(
+            attempt,
+            session_uptime_secs,
+            (tickvault_common::constants::WS_SHORT_SESSION_THRESHOLD_MS / 1000) as i64,
+            tickvault_common::constants::WS_SHORT_SESSION_RECONNECT_FLOOR_MS,
+        );
+        let short_session_floor_applied = short_session_floor_ms > base_delay_ms;
+        base_delay_ms = base_delay_ms.max(short_session_floor_ms);
 
         // B1: add deterministic-but-varying jitter so 5 connections failing
         // together do not synchronize their reconnect attempts and hammer
@@ -2121,6 +2188,8 @@ impl WebSocketConnection {
             base_delay_ms = base_delay_ms,
             delay_ms = delay_ms,
             rate_limit_streak = rl_streak,
+            session_uptime_secs = session_uptime_secs,
+            short_session_floor_applied = short_session_floor_applied,
             "Reconnecting after backoff"
         );
 
@@ -2325,6 +2394,41 @@ pub fn compute_reconnect_base_delay_ms(attempt: u64, initial_ms: u64, max_ms: u6
     initial_ms.saturating_mul(multiplier).min(max_ms)
 }
 
+/// Fix B (2026-06-30) — minimum first-reconnect delay (ms) after a SHORT-lived
+/// session. Dhan was observed to silently TCP-RST the main-feed socket ~5-6s
+/// after each connect; the near-instant (0ms) first reconnect then re-subscribes
+/// 775 SIDs immediately, tightening the connect/reset/re-subscribe loop and
+/// hastening Dhan's per-IP 429. When the PRIOR session lived less than
+/// `short_session_threshold_secs` seconds, this returns `floor_ms` so the caller
+/// can `base_delay_ms.max(floor)` and slow the loop down.
+///
+/// # Contract (pure)
+/// - `attempt != 0` → `0` (later attempts already exponential-backoff — never raised).
+/// - `attempt == 0 && session_uptime_secs >= short_session_threshold_secs` → `0`
+///   (a long-lived session that drops keeps the instant first retry — fast recovery).
+/// - `attempt == 0 && session_uptime_secs < short_session_threshold_secs` → `floor_ms`
+///   (short session, including `session_uptime_secs == 0` = no successful session).
+///
+/// Only ever RAISES the attempt-0 delay (via the caller's `.max`), never lowers it.
+/// Tested by `test_compute_short_session_reconnect_floor_ms_*`.
+#[inline]
+#[must_use]
+pub fn compute_short_session_reconnect_floor_ms(
+    attempt: u64,
+    session_uptime_secs: i64,
+    short_session_threshold_secs: i64,
+    floor_ms: u64,
+) -> u64 {
+    if attempt != 0 {
+        return 0;
+    }
+    if session_uptime_secs < short_session_threshold_secs {
+        floor_ms
+    } else {
+        0
+    }
+}
+
 /// Minimum reconnect wait (ms) after `streak` consecutive Dhan feed
 /// rate-limit (HTTP 429 / DATA-805 class) connect failures:
 /// `base_ms * 2^(streak-1)`, capped at `cap_ms`. A `streak` of `0` returns
@@ -2425,6 +2529,67 @@ mod tests {
     fn test_compute_rate_limit_floor_ms_zero_streak_is_no_floor() {
         // No 429 seen → no floor; normal backoff applies.
         assert_eq!(compute_rate_limit_floor_ms(0, 60_000, 300_000), 0);
+    }
+
+    // --- Fix B (2026-06-30): short-session first-reconnect floor ---
+
+    #[test]
+    fn test_compute_short_session_reconnect_floor_ms_short_session_floored() {
+        // attempt=0, uptime 5s < 10s threshold → floored to 3000ms.
+        assert_eq!(
+            compute_short_session_reconnect_floor_ms(0, 5, 10, 3_000),
+            3_000
+        );
+        // 0s uptime (no successful session) is also "short" → floored.
+        assert_eq!(
+            compute_short_session_reconnect_floor_ms(0, 0, 10, 3_000),
+            3_000
+        );
+    }
+
+    #[test]
+    fn test_compute_short_session_reconnect_floor_ms_long_session_zero() {
+        // attempt=0, uptime 5m >= 10s threshold → NO floor (instant first retry
+        // preserved — fast recovery from a genuine long-lived drop).
+        assert_eq!(
+            compute_short_session_reconnect_floor_ms(0, 300, 10, 3_000),
+            0
+        );
+        assert_eq!(
+            compute_short_session_reconnect_floor_ms(0, 11, 10, 3_000),
+            0
+        );
+    }
+
+    #[test]
+    fn test_compute_short_session_reconnect_floor_ms_boundary_at_threshold() {
+        // Exactly AT the threshold (10s) is NOT short (>= threshold) → no floor.
+        assert_eq!(
+            compute_short_session_reconnect_floor_ms(0, 10, 10, 3_000),
+            0
+        );
+        // One second under the threshold IS short → floored.
+        assert_eq!(
+            compute_short_session_reconnect_floor_ms(0, 9, 10, 3_000),
+            3_000
+        );
+    }
+
+    #[test]
+    fn test_compute_short_session_reconnect_floor_ms_attempt_nonzero_zero() {
+        // Attempts 1+ are never raised — exponential backoff already applies.
+        assert_eq!(compute_short_session_reconnect_floor_ms(1, 0, 10, 3_000), 0);
+        assert_eq!(compute_short_session_reconnect_floor_ms(7, 5, 10, 3_000), 0);
+    }
+
+    #[test]
+    fn test_compute_short_session_reconnect_floor_ms_zero_uptime_floored() {
+        // Defensive: a `connected_at == 0` (never connected this cycle) maps to
+        // uptime 0 → floored, so we err toward backing off, never instant.
+        assert_eq!(
+            compute_short_session_reconnect_floor_ms(0, 0, 10, 3_000),
+            3_000
+        );
     }
 
     #[test]
