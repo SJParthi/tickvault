@@ -83,6 +83,15 @@ services:
     # Shared memory: QuestDB uses mmap heavily for WAL + column storage.
     # Default 64MB causes SIGBUS on large tables. 512MB matches production needs.
     shm_size: 512m
+    # QuestDB mmaps every partition/column file. The kernel default for
+    # vm.max_map_count (262144) throttles mmap under the Groww NTM load
+    # (767 instruments x 31 tables x 21 candle TFs, ~1.2M+ rows/session)
+    # and slows writes/reads; the live console warns
+    # current=262144 recommended=1048576. Docker Desktop (Mac) honors this
+    # per-container sysctl; Linux prod hosts get the host-level raise via
+    # scripts/bootstrap.sh.
+    sysctls:
+      - vm.max_map_count=1048576
     ports:
       # E5 security: bind web console to localhost only (no external access).
       # PG + ILP remain on all interfaces for host app connectivity.
