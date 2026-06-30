@@ -40,12 +40,18 @@
 #
 # Usage:
 #   ./scripts/aws-upgrade-instance.sh                       # type flip only, guarded
+#                                                           # (r8g.large target auto-sets QDB_MEM_LIMIT=4g)
 #   ./scripts/aws-upgrade-instance.sh --dry-run             # print actions, change nothing
 #   ./scripts/aws-upgrade-instance.sh --force               # bypass market-hours guard
 #   ./scripts/aws-upgrade-instance.sh --from m8g.large --to r8g.large \
 #        --ebs-size 60 --ebs-iops 4000 --ebs-throughput 250 --qdb-mem 4g
 #   ./scripts/aws-upgrade-instance.sh --ebs-size 60         # ONLY grow the disk (no type change)
 #   ./scripts/aws-upgrade-instance.sh --qdb-mem 4g --apply-ssm  # retune QuestDB, send via SSM
+#
+# NOTE: an r8g.large flip auto-defaults QDB_MEM_LIMIT=4g (persisted in
+#   deploy/docker/.env) so the 4g QuestDB ceiling lands COUPLED to the 16 GiB
+#   resize, never via the pre-resize auto-deploy (which keeps the compose
+#   default 2g on the current 8 GiB box). Pass an explicit --qdb-mem to override.
 #
 # Env overrides: TV_ENV, AWS_REGION, FROM_TYPE, TO_TYPE.
 # Idempotent: re-running after success is a no-op for steps already applied.
@@ -168,7 +174,12 @@ if [ -n "$QDB_MEM" ]; then
     die "--qdb-mem must be digits followed by g/m (e.g. '4g' or '4096m', docker mem_limit syntax). Got: '${QDB_MEM}'."
   fi
 fi
-[ "$APPLY_SSM" -eq 1 ] && [ -z "$QDB_MEM" ] && die "--apply-ssm requires --qdb-mem (nothing to send otherwise)."
+# --apply-ssm needs something to send. Allow it without an explicit --qdb-mem
+# ONLY when the target is r8g.large, because QDB_MEM is auto-defaulted to 4g
+# below (after instance discovery) for that flip — so there WILL be a value to
+# send. For any other target, --apply-ssm with no --qdb-mem sends nothing.
+[ "$APPLY_SSM" -eq 1 ] && [ -z "$QDB_MEM" ] && [ "$TO_TYPE" != "r8g.large" ] \
+  && die "--apply-ssm requires --qdb-mem (nothing to send otherwise)."
 
 WANT_EBS=0
 { [ -n "$EBS_SIZE" ] || [ -n "$EBS_IOPS" ] || [ -n "$EBS_THROUGHPUT" ]; } && WANT_EBS=1
@@ -217,6 +228,21 @@ if [ "$CUR_TYPE" = "$TO_TYPE" ]; then
   DO_TYPE_FLIP=0
 elif [ "$CUR_TYPE" != "$FROM_TYPE" ]; then
   die "Expected ${FROM_TYPE} but found ${CUR_TYPE}. Refusing — investigate, or pass --from ${CUR_TYPE}."
+fi
+
+# ---------------------------------------------------------------------------
+# Couple QuestDB mem_limit to the r8g.large (16 GiB) resize.
+# The compose default is the safe 2g (current m8g.large 8 GiB box). When this
+# flip targets r8g.large and the operator did NOT pass an explicit --qdb-mem,
+# default it to 4g so Step 8 persists QDB_MEM_LIMIT=4g in deploy/docker/.env
+# EXACTLY when the box becomes 16 GiB — never ahead of the physical resize via
+# the pre-resize auto-deploy. Applies whether the flip happens now
+# (DO_TYPE_FLIP=1) or the box is already r8g.large (idempotent re-run,
+# DO_TYPE_FLIP=0) — in both cases the steady-state box is 16 GiB. Any explicit
+# --qdb-mem the operator passed wins (already validated above).
+if [ -z "$QDB_MEM" ] && [ "$TO_TYPE" = "r8g.large" ]; then
+  QDB_MEM="4g"
+  ok "Target r8g.large (16 GiB): defaulting QuestDB mem_limit to ${QDB_MEM} (set in deploy/docker/.env at Step 8, coupled to the resize)."
 fi
 
 # Now apply the market-hours guard ONLY if a stop will actually happen.
@@ -380,10 +406,13 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 8 — QuestDB mem_limit retune (optional). The compose file reads
-# ${QDB_MEM_LIMIT:-2g}, so we set that env on the box and restart the
-# questdb container. We EMIT the exact command; with --apply-ssm we send it
-# via SSM RunShellScript (only if the operator opts in).
+# Step 8 — QuestDB mem_limit retune. The compose file reads
+# ${QDB_MEM_LIMIT:-2g} (safe default for the 8 GiB box), so we persist that env
+# on the box and restart the questdb container. QDB_MEM is either an explicit
+# --qdb-mem or the 4g auto-default for the r8g.large flip (set above) — so for
+# an r8g.large upgrade this runs automatically, coupling the 4g ceiling to the
+# 16 GiB resize. We EMIT the exact command; with --apply-ssm we send it via SSM
+# RunShellScript (only if the operator opts in).
 # ---------------------------------------------------------------------------
 if [ -n "$QDB_MEM" ]; then
   log "QuestDB mem_limit retune → ${QDB_MEM}"
