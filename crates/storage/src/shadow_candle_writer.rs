@@ -41,7 +41,7 @@
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, warn};
 
 use tickvault_common::config::QuestDbConfig;
@@ -89,8 +89,8 @@ pub struct ShadowCandleWriter {
     /// the QuestDB endpoint and (in conf-string-auth deployments)
     /// could carry credentials — never logged via `Debug`. Read it
     /// back with `.expose_secret()` only at `Sender` construction.
-    // APPROVED: read by the reconnect path; no callers in this slice.
-    #[allow(dead_code)]
+    /// Read by `reconnect()` (the broken-pipe recovery path) — no
+    /// longer dead since the candle-writer reconnect landed 2026-06-30.
     ilp_conf_string: SecretString,
 }
 
@@ -201,7 +201,22 @@ impl ShadowCandleWriter {
     /// The `Buffer` is reused across calls. After N appends the
     /// caller (the writer task) calls [`Self::flush`] to send.
     pub fn append_seal(&mut self, seal: &BufferedSeal) -> Result<()> {
+        // Feed-agnostic by construction: the ONLY feed-dependent input is
+        // `seal.feed.as_str()` inside `ShadowSealRow::from_buffered_seal`. The
+        // write path below stamps `row.feed` verbatim with NO per-feed branch, so
+        // ANY feed (Dhan, Groww, or a feed #3 added later by one `Feed` enum edit)
+        // flows through the SAME candle path automatically. `append_row` is the
+        // feed-agnostic write boundary the generality test exercises directly.
         let row = ShadowSealRow::from_buffered_seal(seal);
+        self.append_row(&row)
+    }
+
+    /// Serialise one already-built [`ShadowSealRow`] into the ILP buffer for its
+    /// target plain `candles_<tf>` table. This is the FEED-AGNOSTIC write boundary:
+    /// `row.feed` is a `&'static str` stamped verbatim — there is NO match on the
+    /// feed anywhere in this method, so a novel feed string flows through
+    /// unchanged. `append_seal` is the thin `BufferedSeal` adapter over this.
+    pub fn append_row(&mut self, row: &ShadowSealRow) -> Result<()> {
         self.buffer
             .table(row.table_name)
             .with_context(|| format!("candle append: invalid table name {}", row.table_name))?
@@ -247,34 +262,130 @@ impl ShadowCandleWriter {
         Ok(())
     }
 
-    /// Flush the buffered ILP rows to QuestDB.
+    /// Flush the buffered candle rows to QuestDB with IN-CYCLE reconnect +
+    /// idempotent replay on a transient connection error.
     ///
-    /// Returns `Err` when the writer is disconnected (caller — the
-    /// future writer task — escalates to spill via the
-    /// `SealAbsorptionPipeline`). On success the buffer is reset and
-    /// `pending_count` returns to 0.
+    /// **The bug this fixes (2026-06-30, operator's #1 blocker):** the candle
+    /// writer previously had NO reconnect — `flush()` returned `Err` whenever the
+    /// sender was `None` and never rebuilt it (the `ilp_conf_string` field was
+    /// stored but `#[allow(dead_code)]`). At the 09:00 market-open burst a QuestDB
+    /// ILP socket reset (`Broken pipe`) broke the candle sender; once a
+    /// `questdb::Sender` is `must_close()` every later `flush()` returns
+    /// `SocketError`, so `drain_once` rescued EVERY sealed candle to spill/DLQ and
+    /// ZERO rows reached `candles_1m` for the rest of the session — 3.6M ticks but
+    /// 0 candles in Groww-only mode. This now reconnects via the retained
+    /// `ilp_conf_string` + replays the SAME buffer BEFORE the caller escalates to
+    /// spill.
     ///
-    /// This method is wired but NOT exercised by unit tests in this
-    /// slice (no live QuestDB). Item 1.2f.3 lands the integration
-    /// test that verifies it end-to-end.
+    /// Resilience contract (mirrors `GrowwLiveTickWriter::flush`):
+    /// - `sender == None` (cold boot, or a prior connection-error arm dropped it):
+    ///   reconnect via `ilp_conf_string` BEFORE flushing.
+    /// - flush returns a CONNECTION error (broken pipe / reset / not-connected ⇒
+    ///   `ErrorCode::SocketError`): drop the sender, reconnect, re-flush the SAME
+    ///   buffer (RETAINED — questdb `flush` only `buf.clear()`s on `Ok`), bounded
+    ///   to [`crate::groww_persistence::GROWW_FLUSH_RECONNECT_MAX_RETRIES`] with
+    ///   [`crate::groww_persistence::GROWW_FLUSH_RECONNECT_BACKOFF_MS`] backoff.
+    ///   Replay is idempotent — `candles_1m` DEDUP `(ts, security_id, segment,
+    ///   feed)` collapses any partially-written row, never a double candle.
+    /// - flush returns a NON-connection error (`InvalidName`, etc.): NOT retried —
+    ///   return `Err` immediately (re-sending a bad row fails again).
+    /// - retries exhausted: return `Err` with the buffer + `pending_count`
+    ///   RETAINED — `drain_once` rescues the seals to the spill/DLQ net (the
+    ///   durable floor, unchanged), and the next cycle re-attempts.
     pub fn flush(&mut self) -> Result<()> {
-        let Some(sender) = self.sender.as_mut() else {
-            return Err(anyhow::anyhow!(
-                "shadow flush: disconnected — sender is None"
-            ));
-        };
         if self.buffer.is_empty() {
+            self.pending_count = 0;
             return Ok(());
         }
-        sender
-            .flush(&mut self.buffer)
-            .context("shadow flush: ILP send failed")?;
-        debug!(
-            flushed_rows = self.pending_count,
-            "shadow candle writer flushed"
-        );
-        self.pending_count = 0;
+        let mut reconnected = false;
+        for attempt in 0..=crate::groww_persistence::GROWW_FLUSH_RECONNECT_MAX_RETRIES {
+            if self.sender.is_none()
+                && let Err(err) = self.reconnect()
+            {
+                if attempt == crate::groww_persistence::GROWW_FLUSH_RECONNECT_MAX_RETRIES {
+                    return Err(err).context("shadow flush: reconnect to QuestDB failed");
+                }
+                metrics::counter!("tv_shadow_candle_reconnect_attempts_total").increment(1);
+                reconnected = true;
+                Self::backoff_sleep(attempt);
+                continue;
+            }
+
+            // SAFETY: `sender` is `Some` here — either it was already connected, or
+            // the reconnect above set it. The flush borrows `&mut self.buffer`
+            // alongside `self.sender`, so split the borrows via take/restore.
+            let mut sender = match self.sender.take() {
+                Some(s) => s,
+                // Unreachable (reconnect set it), but never panic.
+                None => continue,
+            };
+            match sender.flush(&mut self.buffer) {
+                Ok(()) => {
+                    self.sender = Some(sender);
+                    if reconnected {
+                        metrics::counter!("tv_shadow_candle_reconnect_recoveries_total")
+                            .increment(1);
+                        debug!(
+                            flushed_rows = self.pending_count,
+                            "shadow candle writer flush recovered via reconnect + replay"
+                        );
+                    } else {
+                        debug!(
+                            flushed_rows = self.pending_count,
+                            "shadow candle writer flushed"
+                        );
+                    }
+                    self.pending_count = 0;
+                    return Ok(());
+                }
+                Err(err) => {
+                    // Drop the broken sender so the next iteration reconnects. The
+                    // buffer is RETAINED (questdb `flush` does not clear it on err).
+                    self.sender = None;
+                    if !crate::groww_persistence::is_connection_error(&err) {
+                        return Err(err).context("shadow flush: ILP send failed (non-connection)");
+                    }
+                    if attempt == crate::groww_persistence::GROWW_FLUSH_RECONNECT_MAX_RETRIES {
+                        return Err(err)
+                            .context("shadow flush: ILP send failed after reconnect retries");
+                    }
+                    metrics::counter!("tv_shadow_candle_reconnect_attempts_total").increment(1);
+                    reconnected = true;
+                    Self::backoff_sleep(attempt);
+                }
+            }
+        }
+        Err(anyhow::anyhow!("shadow flush: exhausted reconnect retries"))
+    }
+
+    /// (Re)establish the ILP sender from the retained conf. The EXISTING buffer is
+    /// KEPT so its already-appended candles are flushed by the new sender (both the
+    /// disconnected `Buffer::new(V1)` and a connected `new_buffer()` use the V1 TCP
+    /// line protocol). Cold path: only runs when `sender` is `None`.
+    fn reconnect(&mut self) -> Result<()> {
+        let conf = self.ilp_conf_string.expose_secret();
+        if conf.is_empty() {
+            // `for_test()` writers carry an empty conf — there is nothing to
+            // reconnect to. Surface a connection error so the retry loop treats it
+            // as a (futile) connection failure rather than panicking.
+            return Err(anyhow::anyhow!(
+                "shadow reconnect: no ILP conf (disconnected test writer)"
+            ));
+        }
+        let new_sender =
+            Sender::from_conf(conf).context("shadow reconnect: ILP sender rebuild failed")?;
+        self.sender = Some(new_sender);
         Ok(())
+    }
+
+    /// Sleep the bounded backoff for a 0-based attempt index — shares the Groww
+    /// tick-writer schedule (`GROWW_FLUSH_RECONNECT_BACKOFF_MS`, ≤350ms total).
+    /// Synchronous: the seal-writer drain runs on its own task and the total
+    /// across retries is tiny.
+    fn backoff_sleep(attempt: usize) {
+        if let Some(&ms) = crate::groww_persistence::GROWW_FLUSH_RECONNECT_BACKOFF_MS.get(attempt) {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
     }
 }
 
@@ -600,12 +711,20 @@ mod tests {
     }
 
     #[test]
-    fn test_flush_returns_err_when_disconnected() {
+    fn test_flush_empty_buffer_is_noop_ok_even_when_disconnected() {
+        // Behaviour change (2026-06-30 candle-reconnect): an EMPTY-buffer flush is
+        // a no-op `Ok` — there is nothing to persist, so no reconnect is attempted
+        // and no error is raised (mirrors the tick writer + avoids a pointless TCP
+        // round-trip). `drain_once` only calls flush after popping ≥1 seal, so this
+        // empty-Ok never masks a real persist failure. A flush WITH pending rows on
+        // a disconnected writer still Errs — see
+        // `test_flush_returns_err_when_disconnected_with_pending_rows`.
         let mut w = ShadowCandleWriter::for_test();
-        // Buffer empty → flush returns Err (disconnected, can't send
-        // anything; the absent sender is the failure mode).
         let result = w.flush();
-        assert!(result.is_err(), "flush MUST return Err when disconnected");
+        assert!(
+            result.is_ok(),
+            "empty-buffer flush must be a no-op Ok, even disconnected"
+        );
     }
 
     #[test]
@@ -644,5 +763,227 @@ mod tests {
         }
         assert_eq!(w.buffer_row_count(), n as usize);
         assert_eq!(w.pending_count(), n as usize);
+    }
+
+    // ---- candle ILP reconnect (Part B — zero-candles-at-open fix 2026-06-30) ----
+
+    #[test]
+    fn test_shadow_writer_retains_buffer_and_pending_after_failed_flush() {
+        // The candle-writer reconnect's core invariant: a flush that exhausts all
+        // reconnect attempts (for_test writer has an empty conf → reconnect fails)
+        // must RETAIN the buffered candles + pending so drain_once can rescue them
+        // to spill/DLQ AND a later cycle re-attempts — no silent candle loss.
+        let mut w = ShadowCandleWriter::for_test();
+        w.append_seal(&mk_seal(
+            13,
+            EXCHANGE_SEGMENT_IDX_I,
+            TfIndex::M1,
+            1_716_000_900,
+            100.0,
+        ))
+        .expect("append");
+        let bytes_before = w.buffer_byte_count();
+        assert_eq!(w.pending_count(), 1);
+        assert!(
+            w.flush().is_err(),
+            "exhausted reconnect retries must Err (empty conf)"
+        );
+        assert_eq!(
+            w.pending_count(),
+            1,
+            "pending must be retained after exhausted retries (candles re-attempted)"
+        );
+        assert_eq!(
+            w.buffer_byte_count(),
+            bytes_before,
+            "buffer bytes must be retained after exhausted retries"
+        );
+    }
+
+    #[test]
+    fn test_shadow_writer_empty_buffer_flush_is_noop_ok() {
+        // An empty buffer flush is a no-op Ok — no reconnect attempt, no error.
+        let mut w = ShadowCandleWriter::for_test();
+        assert!(w.flush().is_ok(), "empty flush must be Ok (no-op)");
+    }
+
+    #[test]
+    fn test_shadow_writer_reconnect_uses_shared_connection_classifier() {
+        // The candle writer reuses the SAME `is_connection_error` classifier as the
+        // Groww tick writer, so broken-pipe / reset → retry, structural → no retry.
+        // (Proving the classifier wiring without a live QuestDB.)
+        use crate::groww_persistence::is_connection_error;
+        let socket = questdb::Error::new(
+            questdb::ErrorCode::SocketError,
+            "Could not flush buffer: Broken pipe (os error 32)",
+        );
+        let structural = questdb::Error::new(questdb::ErrorCode::InvalidName, "bad name");
+        assert!(
+            is_connection_error(&socket),
+            "broken pipe must be retry-worthy"
+        );
+        assert!(
+            !is_connection_error(&structural),
+            "structural error must NOT be retried"
+        );
+    }
+
+    // ---- FEED-AGNOSTIC generality (operator forever-requirement 2026-06-30) ----
+
+    #[test]
+    fn test_candle_writer_is_feed_agnostic_arbitrary_novel_feed() {
+        // OPERATOR FOREVER-REQUIREMENT: the candle write path must be GENERIC —
+        // ANY future feed (#3, #4, …) produces candles tagged with its own `feed`
+        // through the EXACT SAME path, with ZERO feed-specific code. Proven here by
+        // stamping an ARBITRARY, NOVEL feed string that is NOT Dhan or Groww
+        // straight through the feed-agnostic `append_row` write boundary and
+        // asserting it appears verbatim on the `candles_1m` wire. Because the write
+        // path never matches on the feed (it stamps `row.feed` verbatim), a feed
+        // added later by ONE `Feed` enum edit flows through automatically.
+        let mut w = ShadowCandleWriter::for_test();
+        let novel_row = ShadowSealRow {
+            table_name: TfIndex::M1.table_name(),
+            timestamp_ist_nanos: 1_716_000_900_i64 * 1_000_000_000,
+            security_id: 4242,
+            segment: "NSE_EQ",
+            feed: "future_test_feed",
+            open: 100.0,
+            high: 105.0,
+            low: 99.0,
+            close: 101.0,
+            volume: 1234,
+            oi: 50_000,
+            tick_count: 5,
+            close_pct_from_prev_day: 1.5,
+            open_pct: 0.4,
+            change_pct: 1.5,
+            open_gap_pct: 0.2,
+        };
+        w.append_row(&novel_row).expect("append novel-feed row");
+        let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+        assert!(
+            s.starts_with("candles_1m,"),
+            "novel feed must seal to the SHARED candles_1m table, got {s}"
+        );
+        assert!(
+            s.contains("feed=future_test_feed"),
+            "the candle path must stamp the ARBITRARY feed verbatim (feed-agnostic), got {s}"
+        );
+        assert!(
+            !s.contains("feed=dhan") && !s.contains("feed=groww"),
+            "a novel-feed candle must NOT be relabelled to a known feed, got {s}"
+        );
+    }
+
+    #[test]
+    fn test_candle_writer_seals_every_feed_in_canonical_list() {
+        // Generality across the canonical feed registry: EVERY `Feed::ALL` variant
+        // seals to the SAME candles_1m table tagged with its own `feed.as_str()` —
+        // no per-feed branch. Adding a feed #3 to the `Feed` enum extends `ALL`, so
+        // this loop automatically covers it (the registry IS the single edit point).
+        for feed in Feed::ALL {
+            let mut w = ShadowCandleWriter::for_test();
+            w.append_seal(&mk_seal_feed(
+                13,
+                EXCHANGE_SEGMENT_NSE_EQ,
+                TfIndex::M1,
+                1_716_000_900,
+                100.0,
+                *feed,
+            ))
+            .expect("append");
+            let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+            assert!(
+                s.starts_with("candles_1m,"),
+                "feed {} must seal to the shared candles_1m table, got {s}",
+                feed.as_str()
+            );
+            let expected = format!("feed={}", feed.as_str());
+            assert!(
+                s.contains(&expected),
+                "feed {} must be stamped verbatim ({expected}), got {s}",
+                feed.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn test_candle_writer_covers_all_21_tf_tables_for_arbitrary_feed() {
+        // OPERATOR SCOPE CLARIFICATION 2026-06-30: the candle path must cover
+        // EVERY timeframe table, not just candles_1m — and for ANY feed. Drive one
+        // seal for EVERY TfIndex::ALL (all 21 TFs) tagged an ARBITRARY novel feed
+        // and assert each lands in its OWN candles_<tf> table tagged with that feed.
+        // Proves: one common writer → all 21 TF tables, feed stamped verbatim, no
+        // per-TF and no per-feed branch.
+        let novel_feed = "future_test_feed";
+        let mut seen_tables = std::collections::HashSet::new();
+        for tf in TfIndex::ALL {
+            let mut w = ShadowCandleWriter::for_test();
+            let row = ShadowSealRow {
+                table_name: tf.table_name(),
+                timestamp_ist_nanos: 1_716_000_900_i64 * 1_000_000_000,
+                security_id: 4242,
+                segment: "NSE_EQ",
+                feed: novel_feed,
+                open: 100.0,
+                high: 105.0,
+                low: 99.0,
+                close: 101.0,
+                volume: 1234,
+                oi: 50_000,
+                tick_count: 5,
+                close_pct_from_prev_day: 1.5,
+                open_pct: 0.4,
+                change_pct: 1.5,
+                open_gap_pct: 0.2,
+            };
+            w.append_row(&row).expect("append per-TF row");
+            let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+            let table = tf.table_name();
+            assert!(
+                s.starts_with(&format!("{table},")),
+                "TF {table} must serialise to its OWN candle table, got {s}"
+            );
+            assert!(
+                s.contains("feed=future_test_feed"),
+                "TF {table} must stamp the arbitrary feed verbatim, got {s}"
+            );
+            seen_tables.insert(table);
+        }
+        // All 21 distinct candle tables were exercised.
+        assert_eq!(
+            seen_tables.len(),
+            TfIndex::ALL.len(),
+            "every one of the 21 TF candle tables must be covered"
+        );
+        assert!(seen_tables.contains("candles_1m"));
+        assert!(seen_tables.contains("candles_1d"));
+    }
+
+    #[test]
+    fn test_append_seal_and_append_row_produce_identical_wire_bytes() {
+        // `append_seal` is a thin adapter over the feed-agnostic `append_row`; both
+        // must serialise identically for the same logical candle (proves the
+        // refactor introduced no behavioural drift on the Dhan/Groww path).
+        let seal = mk_seal_feed(
+            13,
+            EXCHANGE_SEGMENT_NSE_EQ,
+            TfIndex::M1,
+            1_716_000_900,
+            100.0,
+            Feed::Groww,
+        );
+        let row = ShadowSealRow::from_buffered_seal(&seal);
+
+        let mut a = ShadowCandleWriter::for_test();
+        a.append_seal(&seal).expect("append_seal");
+        let mut b = ShadowCandleWriter::for_test();
+        b.append_row(&row).expect("append_row");
+
+        assert_eq!(
+            a.buffer_bytes(),
+            b.buffer_bytes(),
+            "append_seal and append_row must produce identical ILP bytes"
+        );
     }
 }

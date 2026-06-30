@@ -608,6 +608,23 @@ pub enum ErrorCode {
     /// write, never on the data-correctness or recovery path. Idempotent DEDUP
     /// UPSERT, so the next boot re-runs. Severity::Medium (auto-triage-safe).
     GrowwMaster01PersistFailed,
+    /// FEED-STALL-01 (2026-06-30) — a live-feed sidecar was ALIVE but streaming
+    /// NOTHING across its whole subscribed universe for longer than the stall
+    /// threshold during market hours (the silently-closed NATS socket that left
+    /// the Groww feed dead at 10:31 IST and never recovering). The FEED-AGNOSTIC
+    /// supervisor stall-watchdog killed + relaunched the sidecar so it re-auths +
+    /// re-subscribes. NOT auto-triage-safe: a stall restart is a real recovery
+    /// action the operator must see (and a flapping restart STORM, escalated with
+    /// the rapid-restart count, points at a persistent provider-side reject).
+    /// Severity::High.
+    FeedStall01SidecarRestarted,
+    /// FEED-SUPERVISOR-01 (2026-06-30) — a feed sidecar SUPERVISOR task itself
+    /// died (panic / unexpected return) and the respawning wrapper (WS-GAP-05
+    /// pattern) re-spawned it so the stall-watchdog can never die silently. The
+    /// feed is briefly unsupervised between death and respawn; the relaunch loop
+    /// resumes on respawn. Severity::High (a supervisor that keeps dying points at
+    /// a real bug), auto-triage-safe (the respawn already self-healed).
+    FeedSupervisor01Respawned,
 }
 
 impl ErrorCode {
@@ -755,6 +772,8 @@ impl ErrorCode {
             Self::DhanLane04TeardownTimeout => "DHAN-LANE-04",
             // PR-A (2026-06-28): Groww shared-master persist
             Self::GrowwMaster01PersistFailed => "GROWW-MASTER-01",
+            Self::FeedStall01SidecarRestarted => "FEED-STALL-01",
+            Self::FeedSupervisor01Respawned => "FEED-SUPERVISOR-01",
         }
     }
 
@@ -840,7 +859,14 @@ impl ErrorCode {
             // know the lane did not come up; bounded retry will re-attempt).
             | Self::DhanLane01UniverseBuildFailed
             | Self::DhanLane02WsPoolSpawnFailed
-            | Self::DhanLane03AuthFailed => Severity::High,
+            | Self::DhanLane03AuthFailed
+            // FEED-STALL-01 / FEED-SUPERVISOR-01 (2026-06-30) — the feed-agnostic
+            // stall-watchdog killed+relaunched a silently-stalled sidecar, or the
+            // supervisor task itself was respawned. High (a real recovery action
+            // the operator must see; a flapping restart STORM points at a
+            // persistent provider-side reject).
+            | Self::FeedStall01SidecarRestarted
+            | Self::FeedSupervisor01Respawned => Severity::High,
             // Medium: data pipeline correctness
             // PR #6b (2026-05-19): I-P0-01/02/04/05 retired with their modules.
             Self::InstrumentP1CrossSegmentCollision
@@ -1056,6 +1082,10 @@ impl ErrorCode {
             Self::GrowwMaster01PersistFailed => {
                 ".claude/rules/project/groww-shared-master-error-codes.md"
             }
+            // 2026-06-30: feed-agnostic sidecar stall-watchdog + supervisor respawn
+            Self::FeedStall01SidecarRestarted | Self::FeedSupervisor01Respawned => {
+                ".claude/rules/project/feed-stall-watchdog-error-codes.md"
+            }
         }
     }
 
@@ -1201,6 +1231,9 @@ impl ErrorCode {
             Self::DhanLane04TeardownTimeout,
             // PR-A (2026-06-28): Groww shared-master persist
             Self::GrowwMaster01PersistFailed,
+            // 2026-06-30: feed-agnostic sidecar stall-watchdog + supervisor respawn
+            Self::FeedStall01SidecarRestarted,
+            Self::FeedSupervisor01Respawned,
         ]
     }
 }
@@ -1479,9 +1512,10 @@ mod tests {
         // 2026-06-28 (PR-A Groww shared-master): bumped 105 -> 106 for
         // GROWW-MASTER-01 (Groww instrument persist into the shared
         // instrument_lifecycle + index_constituency tables, feed='groww').
-        // 2026-06-30 (WS-429-cooldown): bumped 106 -> 107 for WS-GAP-08
-        // (persisted Dhan 429 rate-limit cooldown — survives process restart).
-        assert_eq!(ErrorCode::all().len(), 107);
+        // 2026-06-30 (feed-agnostic self-heal): bumped 106 -> 108 for
+        // FEED-STALL-01 (silently-stalled sidecar killed+relaunched) +
+        // FEED-SUPERVISOR-01 (supervisor task respawned).
+        assert_eq!(ErrorCode::all().len(), 108);
     }
 
     #[test]
@@ -1576,7 +1610,10 @@ mod tests {
                 // D2b 2026-06-26: runtime Dhan-lane cold-start FSM
                 || s.starts_with("DHAN-LANE-")
                 // PR-A 2026-06-28: Groww shared-master persist
-                || s.starts_with("GROWW-MASTER-");
+                || s.starts_with("GROWW-MASTER-")
+                // 2026-06-30: feed-agnostic sidecar stall-watchdog + respawn
+                || s.starts_with("FEED-STALL-")
+                || s.starts_with("FEED-SUPERVISOR-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

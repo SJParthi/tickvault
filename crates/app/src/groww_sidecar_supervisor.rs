@@ -84,6 +84,7 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use tickvault_api::feed_state::{Feed, FeedRuntimeState};
+use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed_health::FeedHealthRegistry;
 use tickvault_core::auth::secret_manager::{
     build_ssm_path, fetch_groww_credentials, resolve_environment,
@@ -297,6 +298,35 @@ pub const GROWW_SIDECAR_SCRIPT_DEFAULT: &str = "scripts/groww-sidecar/groww_side
 /// Default path of the sidecar's pinned dependency manifest.
 pub const GROWW_SIDECAR_REQUIREMENTS_DEFAULT: &str = "scripts/groww-sidecar/requirements.txt";
 
+/// Feed-level stall threshold (seconds). A live feed sidecar that is ALIVE but
+/// has streamed NO tick across its WHOLE subscribed universe for longer than this
+/// — during market hours — is treated as a dead socket and restarted (the
+/// silently-closed NATS socket that left Groww dead at 10:31 IST). Set to the same
+/// order as [`tickvault_common::feed_health::FEED_STALE_TICK_SECS`] (30s): at
+/// market open ticks flow every second across the ~767-SID universe, so a 30s
+/// feed-level gap is a real dead socket, not illiquidity, yet a brief lull never
+/// false-restarts. The arm ALSO requires a KNOWN last-tick, so a cold pre-open
+/// feed (no first tick yet) is never killed by this watchdog.
+pub const FEED_STALL_RESTART_SECS: u64 = 30;
+
+/// Stall-watchdog poll cadence (seconds). Cheap: one relaxed atomic load per tick.
+pub const STALL_WATCHDOG_POLL_SECS: u64 = 1;
+
+/// Stall-watchdog poll cadence.
+pub const STALL_WATCHDOG_POLL: Duration = Duration::from_secs(STALL_WATCHDOG_POLL_SECS);
+
+/// Restart-STORM window (seconds). Rapid stall-restarts inside this sliding window
+/// are counted; exceeding [`STALL_RESTART_STORM_MAX`] escalates + applies a backoff
+/// ceiling (never a permanent give-up during market hours).
+pub const STALL_RESTART_STORM_WINDOW_SECS: u64 = 300;
+
+/// Max stall-restarts allowed inside [`STALL_RESTART_STORM_WINDOW_SECS`] before the
+/// watchdog escalates (`error!(code=FEED-STALL-01)` + the rapid-restart count) and
+/// stops resetting the failure curve — so a flapping socket (reconnect→re-drop) is
+/// bounded to the existing 60s [`SIDECAR_RESTART_MAX_SECS`] ceiling instead of a
+/// tight kill loop. It NEVER permanently gives up during market hours.
+pub const STALL_RESTART_STORM_MAX: u32 = 5;
+
 /// Base unit of the restart backoff curve (first failure waits this long).
 pub const SIDECAR_RESTART_BASE_SECS: u64 = 2;
 
@@ -369,6 +399,94 @@ pub fn sidecar_restart_backoff(consecutive_failures: u32) -> Duration {
     let shift = consecutive_failures.saturating_sub(1).min(30);
     let scaled = SIDECAR_RESTART_BASE_SECS.saturating_mul(1u64 << shift);
     Duration::from_secs(scaled.min(SIDECAR_RESTART_MAX_SECS))
+}
+
+/// FEED-AGNOSTIC stall decision (FEED-STALL-01). Returns `true` ONLY when the
+/// feed is enabled, the market is open, a last-tick is KNOWN, and the feed-level
+/// last-tick age exceeds `threshold_secs`. Pure + O(1); takes the inputs for ANY
+/// feed — there is NO feed-specific branch, so a future feed #3…N inherits the
+/// identical stall→restart logic with ZERO new code.
+///
+/// `last_tick_age_secs == None` (no first tick yet — a cold pre-open feed) returns
+/// `false`: the watchdog must NEVER kill a feed that has not streamed its first
+/// tick (that case is the silent-feed diagnostic's job, not a kill loop). The
+/// `market_open` gate is start-inclusive / end-exclusive (the caller passes the
+/// existing `is_within_market_hours_ist()`), so a stall AT 15:30:00 close does NOT
+/// restart. The threshold is `>` (strict), so exactly-at-threshold does NOT fire.
+#[must_use]
+pub fn should_restart_on_stall(
+    last_tick_age_secs: Option<u64>,
+    market_open: bool,
+    enabled: bool,
+    threshold_secs: u64,
+) -> bool {
+    if !enabled || !market_open {
+        return false;
+    }
+    match last_tick_age_secs {
+        None => false,
+        Some(age) => age > threshold_secs,
+    }
+}
+
+/// Outcome of a supervised feed-supervisor task, used by [`should_respawn_supervisor`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SupervisorJoinOutcome {
+    /// The supervisor task panicked (a `JoinError` with `is_panic()`).
+    Panicked,
+    /// The supervisor's `run_*` future returned (it should loop forever, so a
+    /// return is unexpected).
+    Returned,
+    /// The task was cancelled / aborted (runtime shutdown) — a clean teardown.
+    Cancelled,
+}
+
+/// FEED-AGNOSTIC supervisor-respawn decision (FEED-SUPERVISOR-01). The feed
+/// supervisor loop should run forever; if its task panics or unexpectedly returns
+/// it MUST be respawned so the stall-watchdog can never die silently (WS-GAP-05 /
+/// DISK-WATCHER-01 pattern). A genuine cancel (runtime shutdown) is NOT respawned.
+/// Pure + O(1), feed-agnostic.
+#[must_use]
+pub const fn should_respawn_supervisor(outcome: SupervisorJoinOutcome) -> bool {
+    matches!(
+        outcome,
+        SupervisorJoinOutcome::Panicked | SupervisorJoinOutcome::Returned
+    )
+}
+
+/// Tracks rapid stall-restarts in a sliding window so a flapping socket
+/// (reconnect→re-drop repeatedly) is bounded instead of a tight kill loop. Pure
+/// state machine, O(1) per event, no allocation — the caller drives it with a
+/// monotonic-ish `now_secs` (the supervisor uses wall-clock IST seconds, which is
+/// fine: a backward clock step only widens the window, never shrinks it below 0).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StallRestartStorm {
+    window_start_secs: u64,
+    count_in_window: u32,
+}
+
+impl StallRestartStorm {
+    /// Record one stall-restart at `now_secs`. Returns `true` if this restart
+    /// pushed the count OVER [`STALL_RESTART_STORM_MAX`] inside
+    /// [`STALL_RESTART_STORM_WINDOW_SECS`] (the escalation edge). The window resets
+    /// once `now_secs` advances past it. Pure + O(1).
+    pub fn record_and_is_storm(&mut self, now_secs: u64) -> bool {
+        if now_secs.saturating_sub(self.window_start_secs) > STALL_RESTART_STORM_WINDOW_SECS {
+            // Window elapsed → start a fresh window with this restart.
+            self.window_start_secs = now_secs;
+            self.count_in_window = 1;
+            return false;
+        }
+        self.count_in_window = self.count_in_window.saturating_add(1);
+        self.count_in_window > STALL_RESTART_STORM_MAX
+    }
+
+    /// The current count of restarts inside the active window (for the escalation
+    /// log). Pure.
+    #[must_use]
+    pub const fn count_in_window(&self) -> u32 {
+        self.count_in_window
+    }
 }
 
 /// Resolve the venv's own python interpreter (`<venv>/bin/python3`). Pure path
@@ -632,20 +750,40 @@ where
     })
 }
 
-/// Watch a running child until it exits OR the operator disables the Groww
-/// feed at runtime, while draining its stdout + stderr (each line → tracing,
-/// classified; alert classes → feed_health Down + ONE Telegram event).
-/// Returns `true` if it was stopped because of a disable toggle (graceful, not
-/// a failure), `false` if the child exited on its own (a crash/exit → counts
-/// toward restart backoff). The two drain tasks are aborted on return so they
-/// never leak across restarts.
-// TEST-EXEMPT: drives a live child process + runtime toggle via tokio::select!; the disable gate it reads (FeedRuntimeState::is_enabled) is unit-tested in the api crate; the pure line classifier (classify_sidecar_line) + its alert routing (SidecarLineClass) are unit-tested below.
+/// Why [`supervise_child`] returned, so the caller can tune the backoff:
+/// graceful disable + stall-restart respawn immediately (reset the failure
+/// curve), a crash/exit backs off normally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SuperviseOutcome {
+    /// Stopped because the operator disabled the feed at runtime (graceful).
+    DisabledByToggle,
+    /// FEED-STALL-01: the feed-agnostic stall-watchdog killed the alive-but-silent
+    /// child so the existing relaunch loop respawns it (fast — unless a STORM).
+    StallRestart,
+    /// The child exited on its own (a crash/exit → normal restart backoff).
+    Exited,
+}
+
+/// Watch a running child until it exits, the operator disables the feed at
+/// runtime, OR the FEED-AGNOSTIC stall-watchdog detects an alive-but-silent feed
+/// (FEED-STALL-01), while draining its stdout + stderr (each line → tracing,
+/// classified; alert classes → feed_health Down + ONE Telegram event). The two
+/// drain tasks are aborted on return so they never leak across restarts.
+///
+/// `feed` makes this COMMON: the stall-watchdog reads `feed`'s slot of the
+/// `Feed`-keyed `feed_health` registry, so a future feed inherits the identical
+/// stall→restart with no new code. `now_ist_nanos` is injected (a fn ptr) so the
+/// pure decision is testable; production passes a wall-clock IST-nanos closure.
+// TEST-EXEMPT: drives a live child process + runtime toggle + stall poll via tokio::select!; the disable gate it reads (FeedRuntimeState::is_enabled) is unit-tested in the api crate; the pure decision fns (should_restart_on_stall, StallRestartStorm, classify_sidecar_line) are unit-tested below.
 async fn supervise_child(
     child: &mut tokio::process::Child,
+    feed: Feed,
     feed_runtime: &FeedRuntimeState,
     feed_health: &Arc<FeedHealthRegistry>,
     notifier: &Option<Arc<NotificationService>>,
-) -> bool {
+    now_ist_nanos: fn() -> i64,
+    storm: &mut StallRestartStorm,
+) -> SuperviseOutcome {
     // One latch per running child so the alert fires at most once per instance.
     let alerted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut drains: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -678,25 +816,82 @@ async fn supervise_child(
                 match exit {
                     Ok(status) => warn!(
                         %status,
-                        "[feeds] groww sidecar process exited — will relaunch with backoff"
+                        feed = feed.as_str(),
+                        "[feeds] sidecar process exited — will relaunch with backoff"
                     ),
                     Err(err) => warn!(
                         error = %err,
-                        "[feeds] groww sidecar wait() failed — will relaunch with backoff"
+                        feed = feed.as_str(),
+                        "[feeds] sidecar wait() failed — will relaunch with backoff"
                     ),
                 }
                 abort_drains();
-                return false;
+                return SuperviseOutcome::Exited;
             }
             () = sleep(SIDECAR_DISABLE_POLL) => {
-                if !feed_runtime.is_enabled(Feed::Groww) {
+                // Disable toggle WINS over a stall (operator intent first): a
+                // runtime disable gracefully stops the child and resets the curve.
+                if !feed_runtime.is_enabled(feed) {
                     if let Err(err) = child.start_kill() {
-                        warn!(error = %err, "[feeds] groww sidecar kill signal failed (already exiting?)");
+                        warn!(error = %err, feed = feed.as_str(), "[feeds] sidecar kill signal failed (already exiting?)");
                     }
                     let _status = child.wait().await;
                     abort_drains();
-                    info!("[feeds] groww disabled at runtime — sidecar stopped (will resume on re-enable)");
-                    return true;
+                    info!(feed = feed.as_str(), "[feeds] disabled at runtime — sidecar stopped (will resume on re-enable)");
+                    return SuperviseOutcome::DisabledByToggle;
+                }
+            }
+            // FEED-STALL-01: the FEED-AGNOSTIC stall-watchdog. Poll the feed-level
+            // last-tick age across the WHOLE subscribed universe; an alive-but-
+            // silent feed during market hours is a dead socket (not illiquidity —
+            // ticks flow every second across ~767 SIDs at open), so kill + relaunch.
+            () = sleep(STALL_WATCHDOG_POLL) => {
+                // Re-read enabled INSIDE the arm so a disable toggle in the same
+                // instant is never overridden by the kill (watchdog doesn't fight
+                // the toggle).
+                let enabled = feed_runtime.is_enabled(feed);
+                let market_open = tickvault_common::market_hours::is_within_market_hours_ist();
+                let age = feed_health.last_tick_age_secs(feed, now_ist_nanos());
+                if should_restart_on_stall(age, market_open, enabled, FEED_STALL_RESTART_SECS) {
+                    let now_secs = (now_ist_nanos() / 1_000_000_000).max(0) as u64;
+                    let is_storm = storm.record_and_is_storm(now_secs);
+                    let stall_secs = age.unwrap_or(0);
+                    if is_storm {
+                        // Flapping socket (reconnect→re-drop): escalate + let the
+                        // existing 60s backoff ceiling apply (the caller does NOT
+                        // reset the failure curve on a storm) — but NEVER give up.
+                        error!(
+                            code = ErrorCode::FeedStall01SidecarRestarted.code_str(),
+                            feed = feed.as_str(),
+                            stall_secs,
+                            rapid_restarts = storm.count_in_window(),
+                            "[feeds] sidecar STALL-RESTART STORM — alive but silent and flapping; \
+                             applying backoff ceiling (still retrying, never giving up in market hours)"
+                        );
+                    } else {
+                        warn!(
+                            code = ErrorCode::FeedStall01SidecarRestarted.code_str(),
+                            feed = feed.as_str(),
+                            stall_secs,
+                            "[feeds] sidecar ALIVE but silent across the universe during market hours — \
+                             killing + relaunching (re-auth + re-subscribe)"
+                        );
+                    }
+                    metrics::counter!(
+                        "tv_feed_sidecar_stall_restart_total",
+                        "feed" => feed.as_str(),
+                    )
+                    .increment(1);
+                    if let Err(err) = child.start_kill() {
+                        warn!(error = %err, feed = feed.as_str(), "[feeds] sidecar stall-kill signal failed (already exiting?)");
+                    }
+                    let _status = child.wait().await;
+                    abort_drains();
+                    return if is_storm {
+                        SuperviseOutcome::Exited
+                    } else {
+                        SuperviseOutcome::StallRestart
+                    };
                 }
             }
         }
@@ -724,6 +919,10 @@ pub async fn run_groww_sidecar_supervisor(
     notifier: Arc<arc_swap::ArcSwapOption<NotificationService>>,
 ) {
     let mut consecutive_failures: u32 = 0;
+    // Sliding-window tracker that bounds a flapping (reconnect→re-drop) socket so
+    // rapid stall-restarts escalate + hit the backoff ceiling instead of a tight
+    // kill loop. Persists across child launches for the supervisor's lifetime.
+    let mut storm = StallRestartStorm::default();
     loop {
         if !feed_runtime.is_enabled(Feed::Groww) {
             sleep(SIDECAR_DISABLE_POLL).await;
@@ -827,13 +1026,35 @@ pub async fn run_groww_sidecar_supervisor(
         // Resolve the deferred notifier slot at launch time: by the time a child
         // first prints a reject line, main has stored the live notifier here.
         let notifier_now: Option<Arc<NotificationService>> = notifier.load_full();
-        let stopped_by_disable =
-            supervise_child(&mut child, &feed_runtime, &feed_health, &notifier_now).await;
-        if stopped_by_disable {
-            // Graceful runtime stop — reset the failure curve so re-enabling
+        let outcome = supervise_child(
+            &mut child,
+            Feed::Groww,
+            &feed_runtime,
+            &feed_health,
+            &notifier_now,
+            now_ist_nanos_wall,
+            &mut storm,
+        )
+        .await;
+        match outcome {
+            // Graceful runtime stop → reset the failure curve so re-enabling
             // relaunches immediately.
-            consecutive_failures = 0;
-            continue;
+            SuperviseOutcome::DisabledByToggle => {
+                consecutive_failures = 0;
+                continue;
+            }
+            // FEED-STALL-01 (non-storm): the watchdog killed an alive-but-silent
+            // child → relaunch IMMEDIATELY (reset the curve) so the feed self-heals
+            // within seconds, not at the capped backoff.
+            SuperviseOutcome::StallRestart => {
+                consecutive_failures = 0;
+                continue;
+            }
+            // A crash/exit OR a stall-restart STORM → normal exponential backoff
+            // (the storm path is mapped to Exited so the 60s ceiling bounds a
+            // flapping socket, but it NEVER permanently gives up during market
+            // hours — the loop keeps retrying).
+            SuperviseOutcome::Exited => {}
         }
 
         consecutive_failures = consecutive_failures.saturating_add(1);
@@ -844,6 +1065,92 @@ pub async fn run_groww_sidecar_supervisor(
         );
         sleep(backoff).await;
     }
+}
+
+/// Wall-clock current time as IST epoch nanoseconds — the production clock for the
+/// stall-watchdog (injected as a fn ptr into `supervise_child` so the pure stall
+/// decision stays unit-testable without a live clock). Mirrors the IST-nanos basis
+/// the `FeedHealthRegistry` records ticks at, so the age subtraction is consistent.
+#[must_use]
+fn now_ist_nanos_wall() -> i64 {
+    let now_utc_nanos = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or_else(|| chrono::Utc::now().timestamp().saturating_mul(1_000_000_000));
+    now_utc_nanos.saturating_add(
+        i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS)
+            .saturating_mul(1_000_000_000),
+    )
+}
+
+/// Backoff (seconds) between a supervisor-task death and its respawn — small so
+/// the feed is unsupervised only briefly, but non-zero so a tight panic loop can
+/// never busy-spin the CPU.
+pub const FEED_SUPERVISOR_RESPAWN_BACKOFF_SECS: u64 = 2;
+
+/// Classify how the supervisor task finished, into the FEED-SUPERVISOR-01
+/// [`SupervisorJoinOutcome`] used by [`should_respawn_supervisor`]. Pure — kept
+/// separate from the live `JoinError` (which has no public constructor) so the
+/// respawn decision is unit-testable.
+#[must_use]
+pub fn classify_supervisor_join(
+    join_result: &Result<(), tokio::task::JoinError>,
+) -> SupervisorJoinOutcome {
+    match join_result {
+        // The inner loop is infinite, so a clean `Ok(())` return is unexpected.
+        Ok(()) => SupervisorJoinOutcome::Returned,
+        Err(e) if e.is_panic() => SupervisorJoinOutcome::Panicked,
+        // Cancelled / aborted (runtime shutdown) — a clean teardown.
+        Err(_) => SupervisorJoinOutcome::Cancelled,
+    }
+}
+
+/// FEED-SUPERVISOR-01: spawn [`run_groww_sidecar_supervisor`] under a respawning
+/// supervisor so the feed-agnostic stall-watchdog can NEVER die silently. Mirrors
+/// the WS-GAP-05 / DISK-WATCHER-01 pattern: on a panic / unexpected return it logs
+/// `error!(code=FEED-SUPERVISOR-01)`, increments
+/// `tv_feed_supervisor_respawn_total{feed}`, and respawns after a small backoff. A
+/// genuine cancel (runtime shutdown) is NOT respawned.
+// TEST-EXEMPT: an infinite respawn driver; the pure decisions it relies on (classify_supervisor_join, should_respawn_supervisor) are unit-tested below.
+pub fn spawn_supervised_groww_sidecar_supervisor(
+    feed_runtime: Arc<FeedRuntimeState>,
+    opts: GrowwSidecarOptions,
+    feed_health: Arc<FeedHealthRegistry>,
+    notifier: Arc<arc_swap::ArcSwapOption<NotificationService>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let handle = tokio::spawn(run_groww_sidecar_supervisor(
+                Arc::clone(&feed_runtime),
+                opts.clone(),
+                Arc::clone(&feed_health),
+                Arc::clone(&notifier),
+            ));
+            let join_result = handle.await;
+            let outcome = classify_supervisor_join(&join_result);
+            if !should_respawn_supervisor(outcome) {
+                // Cancelled / shutdown — clean teardown, do not respawn.
+                info!(
+                    feed = Feed::Groww.as_str(),
+                    "[feeds] sidecar supervisor task ended (shutdown) — not respawning"
+                );
+                return;
+            }
+            error!(
+                code = ErrorCode::FeedSupervisor01Respawned.code_str(),
+                feed = Feed::Groww.as_str(),
+                outcome = ?outcome,
+                backoff_secs = FEED_SUPERVISOR_RESPAWN_BACKOFF_SECS,
+                "[feeds] FEED-SUPERVISOR-01: sidecar supervisor task died — respawning so the \
+                 stall-watchdog keeps running (feed self-heal never goes unsupervised)"
+            );
+            metrics::counter!(
+                "tv_feed_supervisor_respawn_total",
+                "feed" => Feed::Groww.as_str(),
+            )
+            .increment(1);
+            sleep(Duration::from_secs(FEED_SUPERVISOR_RESPAWN_BACKOFF_SECS)).await;
+        }
+    })
 }
 
 #[cfg(test)]
@@ -928,6 +1235,254 @@ mod tests {
                 sidecar_restart_backoff(failures) <= Duration::from_secs(SIDECAR_RESTART_MAX_SECS)
             );
         }
+    }
+
+    // ── FEED-STALL-01: the feed-agnostic stall decision ──────────────────────
+
+    #[test]
+    fn test_should_restart_on_stall_true_when_stale_market_open_enabled() {
+        // Alive but silent across the whole universe past the threshold, during
+        // market hours, feed enabled → restart (today's 10:31 dead-socket case).
+        assert!(should_restart_on_stall(
+            Some(FEED_STALL_RESTART_SECS + 1),
+            true,
+            true,
+            FEED_STALL_RESTART_SECS
+        ));
+    }
+
+    #[test]
+    fn test_should_restart_on_stall_false_off_hours() {
+        // Off-hours silence is NORMAL (don't regress #1261 idle-is-normal); even a
+        // huge gap must NOT restart when the market is closed (covers the 15:30:00
+        // close boundary: market_open=false → no restart).
+        assert!(!should_restart_on_stall(
+            Some(FEED_STALL_RESTART_SECS + 100),
+            false,
+            true,
+            FEED_STALL_RESTART_SECS
+        ));
+    }
+
+    #[test]
+    fn test_should_restart_on_stall_false_disabled() {
+        // Operator disabled the feed mid-stall → the disable path wins; the
+        // watchdog must NOT fight the toggle.
+        assert!(!should_restart_on_stall(
+            Some(FEED_STALL_RESTART_SECS + 100),
+            true,
+            false,
+            FEED_STALL_RESTART_SECS
+        ));
+    }
+
+    #[test]
+    fn test_should_restart_on_stall_false_fresh() {
+        // Ticks flowing recently → never restart.
+        assert!(!should_restart_on_stall(
+            Some(2),
+            true,
+            true,
+            FEED_STALL_RESTART_SECS
+        ));
+    }
+
+    #[test]
+    fn test_should_restart_on_stall_false_no_tick_yet() {
+        // No first tick yet (cold pre-open) → None → never restart. A feed that has
+        // not streamed its first tick is the silent-feed diagnostic's job, not a
+        // kill loop.
+        assert!(!should_restart_on_stall(
+            None,
+            true,
+            true,
+            FEED_STALL_RESTART_SECS
+        ));
+    }
+
+    #[test]
+    fn test_should_restart_on_stall_boundary_exactly_at_threshold() {
+        // Strict `>`: exactly AT the threshold must NOT fire (one extra second does).
+        assert!(!should_restart_on_stall(
+            Some(FEED_STALL_RESTART_SECS),
+            true,
+            true,
+            FEED_STALL_RESTART_SECS
+        ));
+        assert!(should_restart_on_stall(
+            Some(FEED_STALL_RESTART_SECS + 1),
+            true,
+            true,
+            FEED_STALL_RESTART_SECS
+        ));
+    }
+
+    #[test]
+    fn test_should_restart_on_stall_is_feed_agnostic_for_novel_feed() {
+        // GENERALITY PROOF: the decision fn takes NO Feed argument — it operates
+        // purely on (age, market_open, enabled, threshold). The SAME call therefore
+        // governs EVERY current and FUTURE feed identically; a new feed #3…N
+        // inherits the identical stall→restart with ZERO new code. We assert the
+        // identical inputs yield the identical verdict regardless of which feed's
+        // age was fed in (the inputs are feed-independent by construction).
+        let stale = Some(FEED_STALL_RESTART_SECS + 5);
+        let verdict = should_restart_on_stall(stale, true, true, FEED_STALL_RESTART_SECS);
+        // Re-run for every existing feed's "age" (same number) — same verdict.
+        for &_feed in tickvault_common::feed::Feed::ALL {
+            assert_eq!(
+                should_restart_on_stall(stale, true, true, FEED_STALL_RESTART_SECS),
+                verdict
+            );
+        }
+        assert!(
+            verdict,
+            "a stale feed-level gap restarts ANY feed identically"
+        );
+    }
+
+    #[test]
+    fn test_stall_restart_storm_is_bounded() {
+        // A flapping socket (reconnect→re-drop repeatedly): the first
+        // STALL_RESTART_STORM_MAX restarts inside the window are NOT a storm; the
+        // next one OVER the max IS a storm (escalation edge). Never gives up — it
+        // just flips to the ceiling path.
+        let mut storm = StallRestartStorm::default();
+        let t0 = 1_000u64;
+        for i in 0..STALL_RESTART_STORM_MAX {
+            assert!(
+                !storm.record_and_is_storm(t0 + u64::from(i)),
+                "restart {i} within the cap is not yet a storm"
+            );
+        }
+        // One more inside the window → over the cap → storm.
+        assert!(storm.record_and_is_storm(t0 + u64::from(STALL_RESTART_STORM_MAX)));
+        assert!(storm.count_in_window() > STALL_RESTART_STORM_MAX);
+
+        // After the window elapses, the counter resets — a later isolated restart
+        // is NOT a storm (the feed recovered then stalled once much later).
+        let mut storm2 = StallRestartStorm::default();
+        assert!(!storm2.record_and_is_storm(t0));
+        assert!(!storm2.record_and_is_storm(t0 + STALL_RESTART_STORM_WINDOW_SECS + 10));
+        assert_eq!(
+            storm2.count_in_window(),
+            1,
+            "window reset to a single restart"
+        );
+    }
+
+    #[test]
+    fn test_record_and_is_storm_and_count_in_window_track_the_window() {
+        // Explicit coverage of StallRestartStorm::record_and_is_storm +
+        // count_in_window (the pub fns) by name.
+        let mut storm = StallRestartStorm::default();
+        assert_eq!(storm.count_in_window(), 0);
+        assert!(!storm.record_and_is_storm(100));
+        assert_eq!(storm.count_in_window(), 1);
+        assert!(!storm.record_and_is_storm(101));
+        assert_eq!(storm.count_in_window(), 2);
+    }
+
+    #[test]
+    fn test_stall_restart_storm_tolerates_backward_clock_step() {
+        // A backward clock step (now_secs < window_start) must not panic or
+        // false-reset; saturating_sub yields 0 (inside window) → counts normally.
+        let mut storm = StallRestartStorm::default();
+        assert!(!storm.record_and_is_storm(1_000));
+        assert!(!storm.record_and_is_storm(900)); // backward step
+        assert_eq!(storm.count_in_window(), 2);
+    }
+
+    // ── FEED-SUPERVISOR-01: respawn decision ─────────────────────────────────
+
+    #[test]
+    fn test_should_respawn_supervisor_on_panic_or_return() {
+        assert!(should_respawn_supervisor(SupervisorJoinOutcome::Panicked));
+        assert!(should_respawn_supervisor(SupervisorJoinOutcome::Returned));
+        // A genuine cancel (runtime shutdown) is a clean teardown — do NOT respawn.
+        assert!(!should_respawn_supervisor(SupervisorJoinOutcome::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn test_classify_supervisor_join_maps_panic_and_cancel() {
+        // A panicking task → JoinError where is_panic() → Panicked.
+        let panic_handle = tokio::spawn(async { panic!("boom") });
+        let panic_join = panic_handle.await;
+        assert_eq!(
+            classify_supervisor_join(&panic_join.map(|_| ())),
+            SupervisorJoinOutcome::Panicked
+        );
+        // An aborted task → JoinError where is_cancelled() → Cancelled.
+        let abort_handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        });
+        abort_handle.abort();
+        let abort_join = abort_handle.await;
+        assert_eq!(
+            classify_supervisor_join(&abort_join.map(|_| ())),
+            SupervisorJoinOutcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn test_stall_restart_reuses_existing_relaunch_path() {
+        // SEAM GUARD: the stall path must reuse the EXISTING relaunch loop — i.e.
+        // supervise_child returns SuperviseOutcome::{StallRestart|Exited} and the
+        // top-level run_groww_sidecar_supervisor loop relaunches via the SAME
+        // sidecar_restart_backoff curve. A refactor that bypassed the existing loop
+        // (e.g. relaunching inline inside supervise_child) would break this. We pin
+        // the source so the seam can't silently break.
+        let src = include_str!("groww_sidecar_supervisor.rs");
+        assert!(
+            src.contains("SuperviseOutcome::StallRestart"),
+            "the stall arm must return through the SuperviseOutcome enum (existing relaunch loop)"
+        );
+        assert!(
+            src.contains("now_ist_nanos_wall")
+                && src.contains("supervise_child(")
+                && src.contains("sidecar_restart_backoff(consecutive_failures)"),
+            "the relaunch must flow through the existing run_groww_sidecar_supervisor backoff loop"
+        );
+    }
+
+    #[test]
+    fn test_python_sidecar_active_self_heal_is_wired() {
+        // L1 SEAM GUARD: the Python sidecar must (a) actively force-close the NATS
+        // socket on a market-hours stall (so the blocking consume() returns and the
+        // except→reconnect re-subscribes), (b) use the ms reconnect ladder during
+        // market hours, and (c) carry the pure-decision selftest. A refactor that
+        // silently reverted to print-only watchdog or dropped the ms ladder breaks
+        // this. Source-scanned so `cargo test` covers the L1 wiring (the Python
+        // unit assertions run under `groww_sidecar.py --selftest`).
+        let py = include_str!("../../../scripts/groww-sidecar/groww_sidecar.py");
+        assert!(
+            py.contains("_force_close_nats_socket"),
+            "the sidecar must force-close the NATS socket to break the blocking consume()"
+        );
+        assert!(
+            py.contains("def should_force_reconnect"),
+            "the sidecar must carry the pure force-reconnect decision fn"
+        );
+        assert!(
+            py.contains("def _is_within_market_hours_ist"),
+            "the sidecar must gate the ms reconnect ladder + force-reconnect on market hours"
+        );
+        assert!(
+            py.contains("MARKET_OPEN_RECONNECT_BASE_SECS"),
+            "the sidecar must use the fast ms reconnect ladder during market hours"
+        );
+        assert!(
+            py.contains("def _stall_recovery_loop"),
+            "the sidecar must run an active stall-recovery loop after data starts flowing"
+        );
+        assert!(
+            py.contains("_selftest_self_heal"),
+            "the sidecar must carry the self-heal selftest (run under --selftest)"
+        );
+        // Rate-limit ladder is preserved (a 429 must NOT use the ms ladder).
+        assert!(
+            py.contains("RATE_LIMIT_BACKOFF_BASE_SECS"),
+            "the sidecar must keep the 60s rate-limit ladder even in market hours"
+        );
     }
 
     #[test]

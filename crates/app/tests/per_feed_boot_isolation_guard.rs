@@ -71,9 +71,13 @@ fn groww_lanes_spawn_dormant_and_self_idle_on_the_enable_flag() {
     let main = read_main_rs();
 
     // (1) All three lanes spawned UNCONDITIONALLY (not inside a groww_enabled if).
+    // The sidecar supervisor is now spawned via its respawning wrapper
+    // `spawn_supervised_groww_sidecar_supervisor` (FEED-SUPERVISOR-01, 2026-06-30)
+    // so the stall-watchdog can never die silently — that wrapper internally calls
+    // `run_groww_sidecar_supervisor`, so the lane still exists for the live toggle.
     for spawn in [
         "run_groww_bridge",
-        "run_groww_sidecar_supervisor",
+        "spawn_supervised_groww_sidecar_supervisor",
         "run_groww_activation_watcher",
     ] {
         assert!(

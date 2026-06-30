@@ -421,10 +421,30 @@ impl FeedHealthRegistry {
         self.clear_auth_rejected_on_recovery(feed.index());
     }
 
+    /// Feed-level age (seconds) of the MOST-RECENT tick across `feed`'s whole
+    /// subscribed universe, or `None` if no tick has been seen yet this session.
+    /// O(1) — one relaxed atomic load + saturating arithmetic. This is the
+    /// FEED-AGNOSTIC liveness signal the sidecar stall-watchdog polls to tell a
+    /// genuinely-dead socket (feed-level gap across all SIDs during market hours)
+    /// from an illiquid single instrument (the feed-level tick is still fresh).
+    ///
+    /// A BACKWARD clock step (NTP) yields age 0 (the `.max(0)` clamp), so a clock
+    /// step can never false-trigger a stall restart. `None` (no tick yet) means a
+    /// cold pre-open feed that has not streamed its first tick — the caller MUST
+    /// NOT restart on `None` (a feed with no first tick is covered by the
+    /// silent-feed diagnostic, not a kill loop).
+    #[must_use]
+    pub fn last_tick_age_secs(&self, feed: Feed, now_ist_nanos: i64) -> Option<u64> {
+        let last_tick = self.last_tick_ist_nanos[feed.index()].load(Ordering::Relaxed);
+        if last_tick == NO_TICK_SENTINEL {
+            return None;
+        }
+        Some((now_ist_nanos.saturating_sub(last_tick).max(0) / NANOS_PER_SEC) as u64)
+    }
+
     /// Build `feed`'s truthful health report from the live signals + the
     /// caller-supplied operator state (`enabled`/`lane_running` from
     /// `FeedRuntimeState`) and the clock/market context. Pure read, O(1).
-    #[must_use]
     pub fn snapshot(
         &self,
         feed: Feed,
@@ -1044,5 +1064,40 @@ mod tests {
         reg.set_connected(Feed::Dhan, false);
         let r = reg.snapshot(Feed::Dhan, true, true, true, T0 + 1_000_000_000);
         assert_eq!(r.verdict, FeedHealthVerdict::Down);
+    }
+
+    #[test]
+    fn test_last_tick_age_secs_none_when_no_tick_yet() {
+        // The FEED-AGNOSTIC liveness signal must report None (not 0) for a feed
+        // that has never streamed a tick — the stall-watchdog must NOT restart a
+        // cold pre-open feed.
+        let reg = FeedHealthRegistry::new();
+        for &feed in Feed::ALL {
+            assert_eq!(reg.last_tick_age_secs(feed, T0), None);
+        }
+    }
+
+    #[test]
+    fn test_last_tick_age_secs_reports_correct_age() {
+        let reg = FeedHealthRegistry::new();
+        reg.record_ticks(Feed::Groww, 5, T0);
+        // 31s later → age 31 (NANOS_PER_SEC apart).
+        let age = reg.last_tick_age_secs(Feed::Groww, T0 + 31 * NANOS_PER_SEC);
+        assert_eq!(age, Some(31));
+        // A different feed is independent (per-feed array).
+        assert_eq!(
+            reg.last_tick_age_secs(Feed::Dhan, T0 + 31 * NANOS_PER_SEC),
+            None
+        );
+    }
+
+    #[test]
+    fn test_last_tick_age_secs_clamps_backward_clock_step_to_zero() {
+        // A BACKWARD NTP step (now < last_tick) must clamp to age 0 so a clock
+        // step can never false-trigger a stall restart.
+        let reg = FeedHealthRegistry::new();
+        reg.record_tick(Feed::Groww, T0);
+        let age = reg.last_tick_age_secs(Feed::Groww, T0 - 5 * NANOS_PER_SEC);
+        assert_eq!(age, Some(0));
     }
 }
