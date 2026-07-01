@@ -20,14 +20,14 @@ Before vs Now:
 Net impact: what used to be zero-click persistent navigation is now repeated manual pin+expand on every context switch — exactly the friction when running 15–20 parallel projects for stress-testing. The ask: bring back an auto-populated recent/active-project list in the sidebar (or make the active project persistent), and keep the project view expanded across switches.
 
 Screenshots attached, in order:
-- Image 1 (evening) — before: "Engineering standards review" session; sidebar shows the auto "Recents" list.
-- Image 2 (evening) — before: "Tickvault AWS" session; same auto "Recents" sidebar. Proves the good behavior existed hours earlier.
-- Image 3 (next morning) — after: Projects grid shows ~18 projects, but the sidebar is now "Pinned"-only and lists just 4.
-- Image 4 — after: inside the TickVault project, "Pinned 0", and TickVault itself is not in the sidebar.
-- Image 5 — after: same view after clicking the pin — TickVault now appears (proves you must manually pin each project).
-- Image 6 — after: "Tickvalut aws" opens as a cramped narrow side panel that must be expanded.
-- Image 7 — after: the "Tick vault dhan skills" session thread, for reference.
-- Image 8 — after: TickVault with the thread panel side-by-side; pin/expand state does not persist across switches.
+- Image 1 (Jun 30, ~10:47 PM IST) — before: "Engineering standards review" session; sidebar shows the auto "Recents" list.
+- Image 2 (Jun 30, ~10:47 PM IST) — before: "Tickvault AWS" session; same auto "Recents" sidebar. Proves the good behavior existed hours earlier.
+- Image 3 (Jul 1, ~7:56 AM IST) — after: Projects grid shows ~18 projects, but the sidebar is now "Pinned"-only and lists just 4.
+- Image 4 (Jul 1, ~7:57 AM IST) — after: inside the TickVault project, "Pinned 0", and TickVault itself is not in the sidebar.
+- Image 5 (Jul 1, ~7:57 AM IST) — after: same view after clicking the pin — TickVault now appears (proves you must manually pin each project).
+- Image 6 (Jul 1, ~7:57 AM IST) — after: "Tickvalut aws" opens as a cramped narrow side panel that must be expanded.
+- Image 7 (Jul 1, ~7:57 AM IST) — after: the "Tick vault dhan skills" session thread, for reference.
+- Image 8 (Jul 1, ~7:57 AM IST) — after: TickVault with the thread panel side-by-side; pin/expand state does not persist across switches.
 
 Thanks,
 Parthi
