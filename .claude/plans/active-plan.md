@@ -1,214 +1,101 @@
-# Implementation Plan: Gate the boot "alive" signal on a live feed
+# Implementation Plan: Gate the boot docker-compose-up CRITICAL on QuestDB health + drop a useless u64 conversion (consolidated boot/CI hardening)
 
-**Status:** VERIFIED
+**Status:** APPROVED
 **Date:** 2026-07-01
-**Approved by:** Parthiban (operator) — standing approval for the permutation-coverage
-audit fix queue (`.claude/plans/permutation-coverage-audit-2026-07-01.md`), cross-cutting
-"alerting hole" hardening surfaced by the recovery re-check, this session 2026-07-01.
+**Approved by:** Parthiban (operator) — false-CRITICAL hardening surfaced by the 2026-07-01
+prod boot re-check (`scratchpad/verify-boot.md` GAP-B: 11:09 IST crash-recovery boot fired
+`docker compose up failed after 5 attempts → Telegram CRITICAL` while QuestDB was already up
+and the app ran healthily). Standing approval for the alerting-hole hardening queue. This
+single consolidated PR combines that `tickvault-app` boot fix with a trivial `tickvault-core`
+clippy cleanup (drop a useless `u64::from` on an already-`u64` `security_id`) per the operator's
+fewer-bigger-PRs preference.
 
-Crate referenced: **tickvault-app** (change lives in `crates/app/src/main.rs` +
-its `crates/app/tests/` guard). Terraform (`deploy/aws/terraform/*liveness*.tf`)
-edited only if a residual market-hours-liveness gap is found — see Design §2.
-
-> Guarantee matrices: carried by cross-reference to
+> **Guarantee matrices:** carried by cross-reference to
 > `.claude/rules/project/per-wave-guarantee-matrix.md` (mandatory per
-> `per-item-guarantee-check.sh`). Dominant guarantee: **strictly-no-worse than
-> today for the boot-heartbeat page** — the emit still fires on a healthy boot;
-> it now ADDITIONALLY withholds "alive" when every enabled feed failed to come
-> up, so the heartbeat alarm (`treat_missing_data="breaching"`) pages exactly in
-> the previously-silent case. No hot-path change (boot is cold path). Does NOT
-> touch `dry_run`, budget, instance lock, WAL spill, `MAX_DAILY_UNIVERSE_SIZE`,
-> `SEAL_BUFFER_CAPACITY`, the 2-WebSocket lock, or feed enablement semantics.
+> `per-item-guarantee-check.sh`). All 15 rows of the 100% Guarantee Matrix and
+> all 7 rows of the Resilience Demand Matrix apply to every item in this plan.
+
+## Included change 2 (trivial): drop useless `u64::from(security_id)` in `tickvault-core`
+
+`crates/core/src/pipeline/tick_processor.rs::TickDedupRing` computes the FNV-1a dedup hash.
+After the `security_id` u32→u64 widening, `security_id` is already `u64`, so `h ^= u64::from(security_id)`
+is a useless same-type conversion (clippy `useless_conversion`). Changed to `h ^= security_id`.
+NO logic change — the hash value, the dedup key, and every downstream behaviour are byte-identical;
+`u64::from(x: u64)` is the identity. This clears a clippy warning that would otherwise fail the
+`clippy -D warnings` CI gate. Rollback = revert the one-line hunk. No new tests needed (the existing
+`TickDedupRing` dedup tests already exercise the hash; the change is provably behaviour-preserving).
 
 ## Design
 
-### Ground truth established (STEP 0, verified against the live tree)
+`crates/app/src/infra.rs::ensure_infra_running` runs `docker compose up -d --force-recreate`
+up to `COMPOSE_UP_MAX_RETRIES = 5` (infra.rs:191-215). `--force-recreate` (infra.rs:1160) is
+NOT idempotent — it tears down + recreates every container on every boot, so on a same-day
+crash-recovery boot (QuestDB already up + busy) the recreate can fail all 5 attempts. On
+failure the code unconditionally fires `tracing::error!("... Telegram CRITICAL alert should
+fire.")` (infra.rs:216-221) and `return`s BEFORE the `wait_for_service_healthy` probe
+(infra.rs:225) — so the CRITICAL never consults whether the service the app actually needs
+(QuestDB) is reachable. Evidence (`verify-boot.md`): the 11:09 boot survived and ran healthily
+(`QuestDB ready — boot probe succeeded`, ticks flowing, tick conservation OK) precisely because
+QuestDB was already up. Paging CRITICAL when the required service is demonstrably healthy is a
+false-CRITICAL that erodes operator trust in the pager.
 
-`emit_boot_completed()` (`crates/app/src/main.rs`) sets the `tv_boot_completed`
-gauge to `1.0`. It is called at TWO boot-completion points, and the CURRENT emit
-condition at each is:
+**Fix (scoped):** when compose-up exhausts its retries, probe the required service (QuestDB)
+via the SAME `is_service_reachable(host, http_port)` used by `wait_for_service_healthy`. Route
+the outcome through a pure, unit-testable decision function
+`classify_compose_outcome(compose_succeeded, required_service_reachable) -> ComposeOutcome`:
 
-- **Slow-boot / normal** (main.rs:7458): fires unconditionally after the
-  boot-complete `if/else` + `notify_systemd_ready()`. For `dhan_enabled=true`,
-  the Dhan lane's `start_dhan_lane` must have returned `Ok` earlier to REACH this
-  line (a Dhan-start failure `return`s/exits before it) — so the Dhan-enabled
-  slow path is *already* effectively gated on the Dhan lane succeeding. BUT the
-  `dhan_enabled=false` / Groww-only branch takes the `None` arm and proceeds to
-  emit even though Groww's activation is an ASYNC spawned watcher
-  (`run_groww_activation_watcher`) that may never come up.
-- **Fast-boot / crash-recovery** (main.rs:2191): fires UNCONDITIONALLY after
-  `notify_systemd_ready()`. This arm is Dhan-ON-only (guarded by
-  `config.feeds.dhan_enabled` at main.rs:1320), but the warm-snapshot re-injects
-  the WS pool asynchronously — a crash-recovery where the pool never reconnects
-  still emits "alive."
+| compose_succeeded | required_service_reachable | ComposeOutcome | Log level |
+|---|---|---|---|
+| true  | (n/a) | `Succeeded`          | info  |
+| false | true  | `DegradedServiceUp` | warn (Low — NOT CRITICAL, no page) |
+| false | false | `Critical`          | error (CRITICAL — real outage, keeps paging) |
 
-**Net current behaviour:** a boot where every enabled feed failed to reach a live
-state can still publish `tv_boot_completed=1` → the boot-heartbeat alarm
-(`treat_missing_data="breaching"`, boot-heartbeat-alarm.tf) does NOT page. **Gap
-is real and OPEN** for the Groww-only and fast-boot-pool-fail permutations.
-
-The async reality: both emit points are SYNCHRONOUS instants, but feed lanes come
-up asynchronously (`mark_dhan_lane_running` inside the `dhan_enabled` block +
-`start_dhan_lane` → Running; `mark_groww_lane_running` only after the async
-watch-list build). A point-in-time `lane_running` snapshot at the emit instant
-would FALSE-NEGATIVE a feed that is still legitimately coming up → a false page.
-
-### The fix
-
-1. **Pure guard helper** `boot_completed_should_emit(dhan_enabled, groww_enabled,
-   dhan_running, groww_running) -> bool`:
-   - No feed enabled (`!dhan_enabled && !groww_enabled`) → `true` (preserve
-     today's behaviour; a deliberately feed-less run must not false-page). The
-     caller logs this explicitly.
-   - At least one feed enabled → `true` iff at least ONE ENABLED feed is running
-     (`(dhan_enabled && dhan_running) || (groww_enabled && groww_running)`).
-     Feed-agnostic: Groww-only-live satisfies it, Dhan-only-live satisfies it,
-     both-enabled needs either.
-   - Both-enabled-none-live / only-enabled-feed-not-live → `false` (withhold
-     "alive" → heartbeat alarm pages).
-
-2. **Bounded liveness wait at each emit site.** Before calling
-   `emit_boot_completed()`, poll `feed_runtime.is_dhan_lane_running()` /
-   `is_groww_lane_running()` against `boot_completed_should_emit(...)` for a
-   bounded window (poll ~1s cadence, capped by a bounded boot-scale timeout). The
-   moment the guard returns `true`, emit and stop waiting. If the window elapses
-   with the guard still `false` (every enabled feed failed to come up), do NOT
-   emit and log an `error!` naming the dead feed(s) — the heartbeat alarm then
-   pages on the MISSING metric, exactly the intended signal. The no-feed-enabled
-   case returns `true` on the first poll (instant emit, unchanged timing).
-
-   Rationale for a bounded WAIT (not an instant snapshot): it removes the async
-   false-negative while keeping the honest end-state — a feed that comes up
-   within the window still yields a prompt "alive"; a feed that never comes up
-   correctly withholds it.
-
-3. **Source-scan wiring guard** in `crates/app/tests/boot_completed_metric_guard.rs`:
-   assert `emit_boot_completed()` is gated by `boot_completed_should_emit(` at
-   BOTH call sites (the emit is no longer a bare unconditional call), and that
-   the helper is defined. Rule-13 "defined-and-wired" ratchet.
-
-### §2 Market-hours liveness alarm
-
-PR #1284 already shipped `deploy/aws/terraform/market-hours-liveness-alarm.tf`:
-an ALWAYS-ON (window-gated 09:20–15:35 IST) alarm that pages when
-`tv_realtime_guarantee_score` is MISSING for ~5 min — i.e. the app is
-wedged/crash-looped/dead during market hours REGARDLESS of the narrow
-08:50–09:10 boot-heartbeat window. It covers "no enabled feed is streaming during
-market hours ⇒ SLO loop stops publishing ⇒ page": a dead feed makes the SLO
-composite loop stop emitting the score. **No duplicate alarm is needed.** This
-plan does NOT add a second market-hours alarm; §2 is a verify, not an extend.
+Only the genuine `compose down + service actually unreachable` case keeps the CRITICAL. The
+false-CRITICAL (`--force-recreate` churn while QuestDB is up) becomes a Low `warn!` that names
+the reason. This does NOT suppress a real compose failure where the service is down.
 
 ## Edge Cases
-
-- **No feed enabled (both off):** helper → `true`, emit fires instantly, logged
-  explicitly (`info!`). Never a false page for a deliberately feed-less run.
-- **Groww-only, Groww comes up in 2s:** bounded wait polls, sees
-  `is_groww_lane_running()` flip true, emits. No false-negative.
-- **Groww-only, Groww never comes up:** window elapses, guard stays false, NO
-  emit, `error!` names Groww dead → heartbeat alarm pages.
-- **Dhan-only slow boot, Dhan start fails:** process `return`s/exits before the
-  emit (unchanged) → metric missing → pages. Guard is belt-and-suspenders here.
-- **Both enabled, one live:** helper → `true` (either satisfies). Correct.
-- **Both enabled, none live:** guard false → no emit → pages.
-- **Fast-boot pool re-inject fails:** bounded wait sees `is_dhan_lane_running()`
-  false for the window → no emit → pages (was silently "alive" before).
-- **Fast-boot pool re-inject succeeds:** `is_dhan_lane_running()` already true
-  (marked at main.rs:330 inside the `dhan_enabled` block) → instant emit.
+- compose-up succeeds first attempt → `Succeeded`, unchanged behaviour (health probe still runs).
+- compose-up fails 5× but QuestDB reachable (the observed 11:09 case) → `DegradedServiceUp`, warn, boot continues, health probe still runs.
+- compose-up fails 5× AND QuestDB unreachable → `Critical`, error (page fires) — a REAL outage, preserved.
+- QuestDB probe itself flaky at the decision instant → single TCP probe with the existing `INFRA_PROBE_TIMEOUT`; a false-negative here just keeps the (correct) CRITICAL — fail-safe toward paging, never toward silence.
+- Docker daemon down / SSM creds missing → EARLY `return` upstream (infra.rs:120-146), never reaches this branch — untouched.
 
 ## Failure Modes
-
-- **Helper returns wrong verdict:** covered by the unit truth-table (both-off,
-  dhan-only-live/dead, groww-only-live/dead, both-live variants,
-  both-enabled-none-live, running-but-disabled-does-not-count).
-- **Bounded wait hangs boot:** capped by a bounded timeout, polls a cheap Relaxed
-  atomic; on timeout it proceeds (no emit + error log), so boot never blocks
-  indefinitely on this check.
-- **Guard regressed to a bare emit:** the source-scan wiring guard fails the
-  build (both call sites must show `boot_completed_should_emit`).
-- **False page on a healthy feed-less run:** prevented by the explicit
-  no-feed-enabled → `true` arm + its dedicated unit test + `info!` log.
+- The probe is best-effort and cannot panic (`is_service_reachable` swallows parse/connect errors → bool).
+- If the probe wrongly reports QuestDB down, we keep CRITICAL (louder, safe). If it wrongly reports up, the downstream `wait_for_service_healthy` + the app's own boot QuestDB probe (BOOT-01/02) still catch a genuinely dead QuestDB — defence in depth, no silent proceed.
+- No new hot-path code (boot-only, cold path). No allocation on any tick path.
 
 ## Test Plan
-
-Unit (in `crates/app/src/main.rs` `#[cfg(test)]`), naming
-`test_boot_completed_should_emit_*`:
-- both-off → true
-- dhan-only enabled + dhan running → true
-- dhan-only enabled + dhan NOT running → false
-- groww-only enabled + groww running → true
-- groww-only enabled + groww NOT running → false
-- both enabled + only dhan running → true
-- both enabled + only groww running → true
-- both enabled + neither running → false
-- dhan disabled + dhan_running true (running-but-disabled) + groww enabled+dead
-  → false (a running-but-disabled feed does not count)
-
-Source-scan guard (`crates/app/tests/boot_completed_metric_guard.rs`):
-- `boot_completed_should_emit(` appears at BOTH emit sites and the helper is
-  defined.
-- existing 4 guard tests still pass (metric name, both-paths, CW scrape filter,
-  alarm repoint) — the emit is still present on both paths, just gated.
-
-Commands: `cargo check -p tickvault-app` then `cargo test -p tickvault-app --lib`
-+ `cargo test -p tickvault-app --test boot_completed_metric_guard`. Paste the
-`test result: ok.` line. Known-unrelated env-only failures (ip_verifier /
-secret_manager "fails without real SSM") confirmed with empty `git diff` on those
-files.
+- Pure-function truth table `classify_compose_outcome`: 3 unit tests (`Succeeded`, `DegradedServiceUp`, `Critical`) + a `ComposeOutcome` `is_critical()`/label stability test.
+- Assert the CRITICAL branch fires ONLY on `(false, false)`.
+- `cargo test -p tickvault-app --lib` (touched crate = app).
+- Hooks: banned-pattern, pub-fn-test, pub-fn-wiring, plan-verify.
 
 ## Rollback
-
-Single-file logic change in `crates/app/src/main.rs` + its guard test. Revert the
-commit to restore the unconditional emit. No schema, no migration, no terraform
-state change (the alarm is untouched — it already pages on MISSING; this PR only
-makes MISSING happen in the dead-feed case). `git revert <sha>` is complete.
+- Single-file change in `crates/app/src/infra.rs` (new pure fn + rewired `!compose_succeeded` branch). Revert the commit to restore the prior unconditional-CRITICAL behaviour. No schema, no config, no data migration, no wire-format change.
 
 ## Observability
-
-- `tv_boot_completed` gauge — unchanged name/semantics; now published ONLY when a
-  live feed exists (or no feed is enabled). MISSING ⇒ boot-heartbeat alarm pages
-  (existing, `treat_missing_data="breaching"`).
-- New `error!` at each emit site when the bounded wait elapses with no live feed:
-  names the dead enabled feed(s) so the operator's Telegram/`errors.jsonl` shows
-  WHY the box will page (no new ErrorCode — boot-path diagnostic routed through
-  the existing 5-sink error pipeline; complements, not replaces, the
-  MISSING-metric page).
-- `info!` on the no-feed-enabled emit path (explicit, per task requirement).
-- Market-hours liveness: covered by the existing PR #1284 alarm (§2 verify).
+- `DegradedServiceUp` logs `warn!` (Low, no Telegram page) with a plain-English reason ("services already up despite compose recreate churn").
+- `Critical` keeps the existing `tracing::error!` CRITICAL (routes to Telegram via the 5-sink pipeline) — now correctly gated on the required service being actually unreachable.
+- New static-label counter `tv_boot_compose_recreate_degraded_total` incremented on the `DegradedServiceUp` path so the operator can see how often `--force-recreate` churns while the service is up (trend signal without paging).
 
 ## Plan Items
-
-- [x] Add pure `boot_completed_should_emit(dhan_enabled, groww_enabled,
-      dhan_running, groww_running) -> bool` helper + unit truth-table tests.
-  - Files: crates/app/src/main.rs
-  - Tests: test_boot_completed_should_emit_both_off_emits,
-    test_boot_completed_should_emit_dhan_only_live,
-    test_boot_completed_should_emit_dhan_only_dead,
-    test_boot_completed_should_emit_groww_only_live,
-    test_boot_completed_should_emit_groww_only_dead,
-    test_boot_completed_should_emit_both_enabled_only_dhan_live,
-    test_boot_completed_should_emit_both_enabled_only_groww_live,
-    test_boot_completed_should_emit_both_enabled_none_live,
-    test_boot_completed_should_emit_running_but_disabled_feed_does_not_count
-
-- [x] Gate BOTH `emit_boot_completed()` call sites behind a bounded liveness wait
-      driven by the helper; error-log + withhold on timeout; info-log the
-      no-feed-enabled path.
-  - Files: crates/app/src/main.rs
-  - Tests: (source-scan) boot_completed_emit_sites_are_gated_on_live_feed
-
-- [x] Extend the source-scan wiring guard so a regression to a bare
-      unconditional emit fails the build.
-  - Files: crates/app/tests/boot_completed_metric_guard.rs
-  - Tests: boot_completed_emit_sites_are_gated_on_live_feed
+- [x] Add pure `ComposeOutcome` enum + `classify_compose_outcome(compose_succeeded, required_service_reachable)` in `crates/app/src/infra.rs`
+  - Files: crates/app/src/infra.rs
+  - Tests: test_classify_compose_outcome_succeeded, test_classify_compose_outcome_degraded_service_up, test_classify_compose_outcome_critical_only_when_service_down, test_compose_outcome_is_critical_stable
+- [x] Rewire the `!compose_succeeded` branch (infra.rs:216-222) to probe QuestDB + route via the pure fn (warn Low vs error CRITICAL); increment `tv_boot_compose_recreate_degraded_total` on the degraded path
+  - Files: crates/app/src/infra.rs
+  - Tests: (covered by the pure-function truth table above)
+- [x] Drop the useless `u64::from(security_id)` in the FNV-1a dedup hash (already-`u64` after the widening) — clippy `useless_conversion` cleanup, behaviour-preserving
+  - Files: crates/core/src/pipeline/tick_processor.rs
+  - Tests: (behaviour-preserving identity conversion; existing `TickDedupRing` dedup tests cover the hash)
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | Both feeds off | emit fires, info-logged, no page |
-| 2 | Groww-only, comes up | emit fires promptly, no page |
-| 3 | Groww-only, never comes up | no emit, error-logged, heartbeat pages |
-| 4 | Both enabled, only Dhan live | emit fires, no page |
-| 5 | Both enabled, neither live | no emit, error-logged, heartbeat pages |
-| 6 | Fast-boot pool re-inject fails | no emit, heartbeat pages (was silent) |
-| 7 | Healthy Dhan slow boot | emit fires (unchanged), no page |
+| 1 | compose-up OK first try | info, health probe runs, no change |
+| 2 | compose-up fails 5×, QuestDB reachable (11:09 case) | warn Low, counter++, boot continues, NO page |
+| 3 | compose-up fails 5×, QuestDB unreachable | error CRITICAL, page fires (real outage) |
+| 4 | `tickvault-core` dedup hash with `u64` `security_id` | identical hash; clippy clean; `cargo check -p tickvault-core` green |
