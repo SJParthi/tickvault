@@ -1516,6 +1516,14 @@ async fn main() -> Result<()> {
         //
         // If the pool build failed (ws_pool_ready is None) we log a
         // warning but preserve the frames in the WAL archive.
+        //
+        // CRASH-SAFETY (zero-loss MEDIUM fix 2026-06-30): mirror of the
+        // slow-boot staged-then-confirm contract. The fast-boot confirm
+        // (just before notify_systemd_ready below) archives the staged
+        // segments ONLY if this re-injection was clean — i.e. a pool
+        // existed AND no frame was dropped. A dropped/no-pool case keeps
+        // the segments in replaying/ so they re-replay next boot.
+        let mut fast_ws_wal_replay_reinjection_clean = true;
         if !ws_wal_replay_live_feed.is_empty() {
             if let Some(ref pool) = ws_pool_ready {
                 let sender = pool.frame_sender_clone();
@@ -1550,6 +1558,7 @@ async fn main() -> Result<()> {
                     // archive for forensic replay but could not be handed
                     // to the live consumer. This is a degraded mode, not a
                     // data loss (the frames are still on disk).
+                    fast_ws_wal_replay_reinjection_clean = false;
                     error!(
                         dropped,
                         injected,
@@ -1568,6 +1577,7 @@ async fn main() -> Result<()> {
                     );
                 }
             } else {
+                fast_ws_wal_replay_reinjection_clean = false;
                 warn!(
                     frames = ws_wal_replay_live_feed.len(),
                     "STAGE-C.2b: LiveFeed replay frames held but pool build failed — \
@@ -2139,6 +2149,28 @@ async fn main() -> Result<()> {
             message: "<b>FAST BOOT</b>\nCrash recovery: ticks flowing, all services ready"
                 .to_string(),
         });
+
+        // CRASH-SAFETY confirm (fast boot): mirror of the slow-boot confirm
+        // near the end of main(). Archive the staged WAL segments out of
+        // replaying/ ONLY if the LiveFeed re-injection above was clean (pool
+        // existed AND no frame dropped). Without this the fast-boot path
+        // re-replayed every crash-recovery boot — bounded by QuestDB dedup but
+        // growing replaying/ + replay cost on a crash-loop, defeating the
+        // cleanup this fix targets on the exact path it targets. Gated on the
+        // clean flag so a dropped/no-pool re-injection leaves the segments in
+        // replaying/ to re-replay next boot (never confirmed early = no loss).
+        {
+            let fast_ws_wal_path = tickvault_app::tick_conservation_boot::ws_wal_dir();
+            if fast_ws_wal_replay_reinjection_clean {
+                tickvault_storage::ws_frame_spill::confirm_replayed(&fast_ws_wal_path);
+            } else {
+                warn!(
+                    dir = %fast_ws_wal_path.display(),
+                    "STAGE-C.2b: WAL replay NOT confirmed (fast boot — a re-injection dropped or \
+                     pool not ready) — staged segments remain in replaying/ for re-replay next boot"
+                );
+            }
+        }
 
         // CRITICAL: tell systemd the service is up. The unit is Type=notify, so
         // systemd kills the process at TimeoutStartSec (default 90s) unless it
@@ -3476,6 +3508,39 @@ fn should_reconnect_in_place(
         || is_in_window_429_rideout_class(healths, in_market_hours, token_valid, questdb_reachable)
 }
 
+/// QuestDB-probe damping (2026-07-01, watchdog-cascade audit HIGH) — number of
+/// CONSECUTIVE failed QuestDB liveness probes the pool watchdog tolerates before
+/// the 429 ride-out EXIT gate treats QuestDB as "down". N=2 (× the 5s tick =
+/// 10s of sustained unreachability). Rationale: the ride-out classifiers
+/// (`is_bare_reset_class` / `is_in_window_429_rideout_class`) HARD-REQUIRE
+/// `questdb_reachable == true`, and the raw signal is a SINGLE un-damped probe
+/// (`timeout(2s, wait_for_questdb_ready(_, 1))`). A single momentary blip (GC
+/// pause / transient HTTP hiccup / the 2s timeout firing under load) during a
+/// live in-market 429 storm flips the raw flag false → `ride_out == false` →
+/// `process::exit(2)` → 775-SID cold re-subscribe → next 429 → the self-inflicted
+/// restart/429 loop #1277 exists to stop. N=2 is the SMALLEST N that absorbs a
+/// one-tick blip while still forcing the exit on a genuine SUSTAINED outage
+/// after 10s (2 consecutive ticks) — well inside the 15-min ride-out ceiling, so
+/// a real dead DB is never worse than today (N=1 = today's undamped bug). Cold
+/// path (5s watchdog tick), not the hot tick path.
+const POOL_WATCHDOG_QDB_EXIT_DAMP_THRESHOLD: u32 = 2; // APPROVED: cold-path watchdog damping threshold, 2026-07-01 audit fix
+
+/// QuestDB-probe damping (2026-07-01) — pure decision: given the count of
+/// CONSECUTIVE failed QuestDB probes seen so far, is QuestDB "reachable" FOR THE
+/// EXIT DECISION? Returns `true` (reachable — keep riding out) until
+/// `consecutive_failures >= threshold`, then `false` (treat as down → the
+/// ride-out gate falls back to the genuine-fatal exit). A single successful
+/// probe resets the caller's counter to 0, so the flip requires N *consecutive*
+/// failures — a real SUSTAINED outage, not a blip.
+///
+/// The RAW single-probe signal (`health.set_questdb_reachable`) is UNCHANGED and
+/// keeps feeding `/health` + `overall_status` — only the exit gate consults this
+/// damped view. Pure function. Tested by `test_damp_questdb_exit_signal_*`.
+#[must_use]
+const fn damp_questdb_exit_signal(consecutive_failures: u32, threshold: u32) -> bool {
+    consecutive_failures < threshold
+}
+
 fn spawn_pool_watchdog_task(
     pool: std::sync::Arc<WebSocketConnectionPool>,
     shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
@@ -3526,6 +3591,14 @@ fn spawn_pool_watchdog_task(
         // `None` on any non-Halt verdict (the pool recovered / is no longer
         // all-down), so the 15-min ceiling measures one continuous episode.
         let mut reconnect_in_place_since: Option<std::time::Instant> = None;
+        // QuestDB-probe damping (2026-07-01 audit fix): count of CONSECUTIVE
+        // failed QuestDB liveness probes. A single successful probe resets it
+        // to 0. Feeds `damp_questdb_exit_signal(..)` → the DAMPED
+        // `questdb_reachable_for_exit_decision` signal the Halt-arm ride-out
+        // gate reads (the RAW `set_questdb_reachable` signal is still pushed
+        // every tick for `/health`). Local to the task (cold-path 5s tick, no
+        // shared state, no hot-path alloc).
+        let mut qdb_consecutive_failures: u32 = 0;
         // 5-second poll interval — cold path, not per tick. Matches the
         // degrading/halt thresholds (60s/300s) with plenty of resolution.
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5)); // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
@@ -3580,7 +3653,26 @@ fn spawn_pool_watchdog_task(
                     )
                     .await
                     .is_ok_and(|res| res.is_ok());
+                    // RAW single-probe signal — feeds `/health` + `overall_status`
+                    // + observability. A single blip legitimately shows here.
                     health.set_questdb_reachable(questdb_reachable_now);
+
+                    // DAMPED exit signal (2026-07-01 audit fix): track CONSECUTIVE
+                    // failures so the 429 ride-out EXIT gate treats QuestDB as
+                    // "down" ONLY after N consecutive failed probes — a single
+                    // blip during an in-market 429 storm no longer forces
+                    // process::exit + a 775-SID cold re-subscribe that trips the
+                    // next 429. A genuine SUSTAINED outage still flips it after N
+                    // ticks (never worse than today for a real dead DB).
+                    if questdb_reachable_now {
+                        qdb_consecutive_failures = 0;
+                    } else {
+                        qdb_consecutive_failures = qdb_consecutive_failures.saturating_add(1);
+                    }
+                    health.set_questdb_reachable_for_exit_decision(damp_questdb_exit_signal(
+                        qdb_consecutive_failures,
+                        POOL_WATCHDOG_QDB_EXIT_DAMP_THRESHOLD,
+                    ));
 
                     // Live-feed health (SP5): mirror the active-socket count into
                     // the Dhan connected slot so `/api/feeds/health` reports Dhan
@@ -3686,7 +3778,16 @@ fn spawn_pool_watchdog_task(
                                         .as_ref()
                                         .is_some_and(|s| s.is_valid())
                                 });
-                                let questdb_reachable = health.questdb_reachable();
+                                // DAMPED signal (2026-07-01 audit fix): the
+                                // ride-out classifiers require QuestDB "reachable",
+                                // but reading the RAW single-probe signal here let
+                                // a single blip force process::exit → 775-SID cold
+                                // re-subscribe → next 429 → restart/429 loop. The
+                                // damped signal is false only after N consecutive
+                                // failed probes, so a blip rides out but a genuine
+                                // SUSTAINED outage still exits (never worse than
+                                // today). `/health` still reads the raw signal.
+                                let questdb_reachable = health.questdb_reachable_for_exit_decision();
                                 // In-window 429 ride-out (2026-06-30): the
                                 // ride-out decision now covers BOTH the streak==0
                                 // bare-RST storm AND the in-market-hours Dhan 429
@@ -8939,6 +9040,82 @@ mod tests {
     fn test_is_bare_reset_class_empty_pool_false() {
         // No connections to reconnect → never ride out an absent pool.
         assert!(!is_bare_reset_class(&[], true, true));
+    }
+
+    // --- QuestDB-probe damping (2026-07-01 audit fix) ---
+
+    #[test]
+    fn test_damp_questdb_exit_signal_threshold_is_two() {
+        // Pin N=2: 10s (2 × 5s tick) of sustained unreachability before the
+        // exit gate treats QuestDB as down — smallest N that absorbs a blip.
+        assert_eq!(POOL_WATCHDOG_QDB_EXIT_DAMP_THRESHOLD, 2);
+    }
+
+    #[test]
+    fn test_damp_questdb_exit_signal_single_blip_stays_reachable() {
+        // 1 failed probe with N=2 ⇒ still "reachable" for the exit gate, so a
+        // single blip during an in-market 429 storm keeps riding out (the fix).
+        assert!(
+            damp_questdb_exit_signal(0, POOL_WATCHDOG_QDB_EXIT_DAMP_THRESHOLD),
+            "zero failures: reachable"
+        );
+        assert!(
+            damp_questdb_exit_signal(1, POOL_WATCHDOG_QDB_EXIT_DAMP_THRESHOLD),
+            "one blip (< N) must NOT flip the exit gate — ride-out continues"
+        );
+    }
+
+    #[test]
+    fn test_damp_questdb_exit_signal_n_consecutive_flips() {
+        // N (and beyond) consecutive failures ⇒ NOT reachable ⇒ the ride-out
+        // classifiers return false ⇒ genuine-fatal exit forced. A real
+        // sustained outage is never worse than today.
+        assert!(
+            !damp_questdb_exit_signal(2, POOL_WATCHDOG_QDB_EXIT_DAMP_THRESHOLD),
+            "N consecutive failures must flip the exit gate (exit forced)"
+        );
+        assert!(
+            !damp_questdb_exit_signal(3, POOL_WATCHDOG_QDB_EXIT_DAMP_THRESHOLD),
+            ">N consecutive failures stays flipped (exit forced)"
+        );
+        assert!(
+            !damp_questdb_exit_signal(100, POOL_WATCHDOG_QDB_EXIT_DAMP_THRESHOLD),
+            "a long sustained outage stays flipped (exit forced)"
+        );
+    }
+
+    #[test]
+    fn test_damp_questdb_exit_signal_success_resets() {
+        // Model the watchdog counter loop: fail, fail, SUCCESS, fail — a success
+        // between failures resets the counter, so it takes N FRESH consecutive
+        // failures to flip. Proves a mid-way success resets (a real outage must
+        // be N *consecutive*, not N cumulative).
+        let n = POOL_WATCHDOG_QDB_EXIT_DAMP_THRESHOLD;
+        let mut counter: u32 = 0;
+
+        // Two failures in a row would flip — but a success interrupts them.
+        let probes = [false, true, false]; // fail, SUCCESS (reset), fail
+        for &reachable in &probes {
+            if reachable {
+                counter = 0;
+            } else {
+                counter = counter.saturating_add(1);
+            }
+        }
+        // After fail→success(reset)→fail the counter is only 1, so the exit
+        // gate still reads "reachable" — the mid-way success reset it.
+        assert_eq!(counter, 1, "success mid-way must reset the counter");
+        assert!(
+            damp_questdb_exit_signal(counter, n),
+            "after a mid-way success it takes N FRESH consecutive failures to flip"
+        );
+
+        // Now the SECOND consecutive fresh failure flips it.
+        counter = counter.saturating_add(1);
+        assert!(
+            !damp_questdb_exit_signal(counter, n),
+            "two fresh consecutive failures after the reset flip the exit gate"
+        );
     }
 
     #[test]
