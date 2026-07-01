@@ -1,136 +1,153 @@
-# Implementation Plan: Flip instance lock m8g.large → r8g.large (16 GiB) per operator 2026-06-30
+# Implementation Plan: Damp the QuestDB-reachable probe feeding the 429 ride-out exit gate
 
-**Status:** APPROVED
-**Date:** 2026-06-30
-**Approved by:** Parthiban (operator) — dated directive this session 2026-06-30: "just upgrade the instance to r8 large + everything related to the infra"
+**Status:** VERIFIED
+**Date:** 2026-07-01
+**Approved by:** Parthiban (operator) — watchdog-cascade audit HIGH finding, this session 2026-07-01
 
-> Guarantee matrices: this item carries the 15-row + 7-row matrices by
-> cross-reference to `.claude/rules/project/per-wave-guarantee-matrix.md`
-> (mandatory per `per-item-guarantee-check.sh`). The dominant guarantee for
-> THIS change is the §7 Mechanical Rule 1 four-file instance lock: the new
-> r8g.large/16-GiB type is pinned CONSISTENTLY across the rule file, the
-> superseded budget doc, the architecture doc, the ratchet test, Terraform
-> validation, the upgrade script, and the Docker compose mem default. No
-> path flips `dry_run` (stays `true`) and no path changes the universe cap
-> (`MAX_DAILY_UNIVERSE_SIZE`) or `SEAL_BUFFER_CAPACITY` — the 2K universe
-> expansion is a SEPARATE later PR gated on a memory measurement.
+Crate referenced: **tickvault-app** (change lives in `crates/app/src/main.rs`) +
+`tickvault-api` (`crates/api/src/state.rs` health-status damped signal).
+
+> Guarantee matrices: carried by cross-reference to
+> `.claude/rules/project/per-wave-guarantee-matrix.md` (mandatory per
+> `per-item-guarantee-check.sh`). Dominant guarantee here: **strictly no worse
+> than today** — a genuine sustained QuestDB outage still forces the exit after
+> N ticks; the 15-min ride-out ceiling stays; token-invalid + non-reconnectable
+> still force exit unchanged. No hot-path change (the probe/counter is the 5s
+> cold watchdog tick). Does NOT touch `dry_run`, budget, instance lock, WAL
+> spill, `MAX_DAILY_UNIVERSE_SIZE`, `SEAL_BUFFER_CAPACITY`, or the #1280 WAL
+> boot-confirm code.
 
 ## Design
 
-The §7 instance lock in `daily-universe-scope-expansion-2026-05-27.md`
-currently pins **m8g.large** (Graviton4, 2 vCPU / 8 GiB) per operator Quote 5
-(2026-05-29). The operator authorized a hardware upgrade on 2026-06-30 to
-**r8g.large** (Graviton4, 2 vCPU / **16 GiB**, memory-optimized r-family),
-doubling RAM headroom for the upcoming both-feeds + larger-universe workload.
+The pool-watchdog (`spawn_pool_watchdog_task`, `crates/app/src/main.rs` ~3479)
+runs one QuestDB liveness probe per 5s tick:
+`timeout(2s, wait_for_questdb_ready(&cfg, 1))` (~main.rs:3574), stores the raw
+result via `health.set_questdb_reachable(...)` (~3583), and later the Halt arm
+reads `health.questdb_reachable()` (~3689) into the ride-out classifiers
+`is_bare_reset_class` (~3373) and `is_in_window_429_rideout_class` (~3435), both
+of which HARD-REQUIRE `questdb_reachable == true`. So a SINGLE momentary QuestDB
+blip (GC pause / transient HTTP hiccup / the 2s timeout firing under load)
+during a live in-market 429 storm flips the flag false → `ride_out == false` →
+`process::exit(2)` → 775-SID cold re-subscribe → next 429 → the self-inflicted
+restart/429 loop that #1277 exists to stop.
 
-§7 Mechanical Rule 1 requires that ANY instance-type change be applied across
-FOUR authority files + the ratchet test + Terraform + the upgrade script. This
-PR does exactly that hardware lock-flip and nothing else:
+**Fix — DAMP only the signal that feeds the EXIT decision.** Add a pure damping
+function and a separate damped atomic on the health status; the raw single-probe
+signal stays untouched for `/health` + `overall_status` + observability.
 
-- `m8g.large` → `r8g.large` everywhere the type is the LOCKED value.
-- `8 GiB` → `16 GiB` everywhere the RAM is the locked value.
-- §7 Rule 2 memory budget recomputed for a 16-GiB host at the CURRENT
-  universe (~250–1000 SIDs across 21 TFs), NOT the deferred 2K expansion.
-- §7 cost line recomputed: r8g.large = $0.08258/hr (verified ap-south-1),
-  weekday 08:30–16:30 IST schedule (270-hr/mo ceiling), + EIP (kept), + 18%
-  GST → ~₹2,919/mo (inside the operator's ~₹2,500–3,200 envelope).
-- Docker QuestDB `QDB_MEM_LIMIT` default raised 2g → 4g (the §7 "both feeds
-  ~2K → --qdb-mem 4g" note; 4g fits comfortably in 16 GiB with ~10+ GiB free).
+1. `crates/api/src/state.rs`:
+   - Add `questdb_reachable_for_exit_decision: AtomicBool` (init `true` — a
+     watchdog that has never probed must not pre-force an exit) + a
+     `set_/get_` pair. This is the DAMPED signal, read ONLY by the exit gate.
+   - `set_questdb_reachable(...)` (raw) is UNCHANGED — `/health`,
+     `overall_status`, and `handlers/health.rs` keep reading the raw probe.
+2. `crates/app/src/main.rs`:
+   - Add pure fn `damp_questdb_exit_signal(consecutive_failures: u32,
+     threshold: u32) -> bool` returning `true` (reachable-for-exit) unless
+     `consecutive_failures >= threshold`.
+   - Add `const POOL_WATCHDOG_QDB_EXIT_DAMP_THRESHOLD: u32 = 2` (N=2).
+   - In the watchdog task, hold a local `qdb_consecutive_failures: u32`
+     alongside `reconnect_in_place_since`. Each tick, after the raw probe:
+     raw `true` → reset counter to 0; raw `false` → saturating-add 1. Compute
+     `damp_questdb_exit_signal(counter, N)` and push it via the new
+     `set_questdb_reachable_for_exit_decision(...)`. Still push the raw result
+     via the existing `set_questdb_reachable(...)`.
+   - The Halt arm reads `health.questdb_reachable_for_exit_decision()` (damped)
+     instead of `health.questdb_reachable()` (raw) for the two ride-out
+     classifiers ONLY.
 
-KEEP (explicitly UNCHANGED by this PR): the Elastic IP (`enable_eip = true`,
-a separately-verified networking decision), `dry_run = true`, the
-`MAX_DAILY_UNIVERSE_SIZE` / `SEAL_BUFFER_CAPACITY` constants, the 2-WebSocket
-lock, and the 08:30–16:30 IST weekday schedule.
+**Chosen N = 2.** Justification: N×5s = 10s of sustained unreachability before
+the exit gate treats QuestDB as down — well within the ~15s self-review budget
+and far below the 15-min ride-out ceiling, so a REAL outage still exits promptly
+(2 consecutive failed 5s ticks). N=1 = today's undamped bug; N=3 (15s) is the
+upper acceptable bound but 2 already absorbs a single blip while exiting a real
+outage in 10s. 2 is the smallest N that fixes the bug — minimal behaviour change.
 
 ## Edge Cases
 
-- **Ratchet test text-coupling:** `instance_type_lock_guard.rs` asserts the
-  EXACT bold-pinned string (`**r8g.large**`), the RAM string (`16 GiB RAM`),
-  and the recomputed ₹ bill. All three rule-file edits must match the test's
-  new expectations verbatim or the build fails (intended — the test IS the
-  lock).
-- **Superseded-marker preservation:** the test also asserts the 4 superseded
-  files still carry their `SUPERSEDED 2026-05-27` markers + the link to the
-  authoritative rule file. Those markers are NOT removed — only the instance
-  string inside them (where present) is updated.
-- **Historical mentions:** `m8g.large` / `8 GiB` may remain ONLY as historical
-  / superseded context (e.g. "supersedes the 2026-05-29 m8g.large lock"), never
-  as the current LOCKED value. A grep guard confirms this.
-- **Upgrade-script default flip:** `FROM_TYPE` moves `t4g.medium` → `m8g.large`
-  so the now-canonical flip command is `--from m8g.large --to r8g.large`.
-  `r8g.large` is ALREADY in the `--to` allowlist (no allowlist change needed).
-- **Terraform default:** `instance_type` default + validation condition both
-  move to `r8g.large` so a fresh `terraform apply` provisions the new type.
+- First-ever tick before any probe: damped atomic inits `true`, so no
+  pre-emptive false-exit; the gate already requires other predicates too.
+- Single blip mid-storm: counter goes 0→1, `damp(1,2)==true` ⇒ ride-out
+  continues (the fix).
+- Two consecutive blips: counter 1→2, `damp(2,2)==false` ⇒ exit forced
+  (genuine sustained outage — never worse than today).
+- Success mid-way: a `true` probe resets counter to 0, so the NEXT single
+  failure starts fresh (a real outage must be N *consecutive*).
+- Off-hours / Dhan-OFF: the `should_act` gate short-circuits before the Halt
+  ride-out arm, so the damped signal is irrelevant there — unchanged.
+- Counter overflow: `saturating_add(1)` — can never wrap.
+- `/health` and `overall_status`: read the RAW signal, so a single blip still
+  shows "unreachable" for that one probe (observability NOT degraded).
 
 ## Failure Modes
 
-- **Inconsistent lock (one file misses the flip):** the grep guard + the
-  ratchet test catch any file still pinning m8g.large as the live value.
-- **Cost/RAM miscompute pinned wrongly:** the `instance_lock_monthly_bill_pinned_to_rupees_*`
-  ratchet pins the recomputed bill; a typo'd figure fails the test.
-- **Accidental scope creep:** if a diff hunk touched `dry_run`,
-  `MAX_DAILY_UNIVERSE_SIZE`, or `SEAL_BUFFER_CAPACITY`, self-review + grep
-  would flag it. This PR touches none of them.
+- Genuine sustained QuestDB outage: 2 consecutive failed probes flip the damped
+  signal false → ride-out classifiers return false → genuine-fatal exit (today's
+  behaviour, +10s). Correct — never a new wedge.
+- Token-invalid / non-reconnectable code: ride-out classifiers still require
+  `token_valid` + no `saw_non_reconnectable` — UNCHANGED by this diff, still
+  force exit.
+- 15-min ceiling: `reconnect_in_place_ceiling_exceeded` is untouched — a
+  ride-out that persists past 15 min still falls back to the genuine-fatal exit.
+- WS-GAP-08 persisted-cooldown / WS-GAP-09 ride-out counters: unchanged.
 
 ## Test Plan
 
-- `cargo test -p tickvault-storage --test instance_type_lock_guard` — the
-  rewritten ratchet (all tests) must pass against the new rule-file text.
-- `grep` to confirm no stray `m8g.large` / `8 GiB` remains as the LOCKED value
-  (only historical/superseded mentions allowed).
-- `.claude/hooks/banned-pattern-scanner.sh` clean.
-- `.claude/hooks/plan-verify.sh` + design-first `plan-gate.sh` (this plan,
-  6 sections, APPROVED, references `tickvault-storage`).
-- `terraform fmt -check` on the variables.tf edit (if terraform available).
+Unit tests (in `crates/app/src/main.rs` `mod tests`, next to the ride-out tests):
+- `test_damp_questdb_exit_signal_single_blip_stays_reachable` — 1 failure with
+  N=2 ⇒ `true` (ride-out continues).
+- `test_damp_questdb_exit_signal_n_consecutive_flips` — 2 (and >2) failures with
+  N=2 ⇒ `false` (exit forced).
+- `test_damp_questdb_exit_signal_success_resets` — model the counter loop: a
+  `true` between failures resets, so it takes N fresh consecutive failures to
+  flip (proves a mid-way success resets).
+- `test_damp_questdb_exit_signal_threshold_is_two` — pin N=2.
+
+Health-status test (in `crates/api/src/state.rs` `mod tests`):
+- `test_questdb_reachable_for_exit_decision_independent_of_raw` — the raw
+  `set_questdb_reachable(false)` does NOT change the damped
+  `questdb_reachable_for_exit_decision()` (still `true` until explicitly set),
+  proving `/health`'s raw signal and the exit signal are separate.
+
+Run `cargo test -p tickvault-app --lib` and `cargo test -p tickvault-api --lib`,
+paste `test result:` lines.
 
 ## Rollback
 
-Single revert of the PR commit restores the m8g.large lock everywhere
-atomically (rule files + ratchet + Terraform + script + compose move together
-in one commit). No data migration, no runtime state — this is a documentation
-+ infra-config + ratchet-text change only. The live instance is NOT touched by
-this PR (the actual `aws ec2 modify-instance-attribute` flip is a separate
-operator-run step via `scripts/aws-upgrade-instance.sh`).
+Single-commit, self-contained. Revert the commit to restore the undamped
+single-probe read (the `health.questdb_reachable()` call at the Halt arm) — no
+schema, no data, no config, no dependency change; nothing to migrate. The new
+`AtomicBool` and pure fn are additive and inert once the Halt-arm read reverts.
 
 ## Observability
 
-No new runtime code, no new ErrorCode, no new counter. The lock-flip is a
-documentation + config + ratchet change. The existing `instance_type_lock_guard.rs`
-ratchet is the observability layer — it FAILS THE BUILD on any future drift
-away from the r8g.large/16-GiB lock. The recomputed cost line documents the new
-CloudWatch budget-alarm ceiling for the operator.
+- The damped signal drives ONLY the exit decision; `/health`,
+  `overall_status`, and `handlers/health.rs` keep the RAW single-probe signal —
+  observability of QuestDB reachability is NOT degraded (a blip still shows on
+  `/health`).
+- The existing WS-GAP-09 `tv_ws_watchdog_reconnect_in_place_total{reason}`
+  counter now correctly stays on the ride-out path through a single blip instead
+  of dropping to `process::exit` — so the counter's meaning sharpens (fewer
+  false genuine-fatal `tv_pool_self_halts_total` increments from blips).
+- No new error code, no new Telegram event, no new metric — this is a damping of
+  an EXISTING gate, not a new failure mode (WS-GAP-09 already covers the ride-out
+  path; no rule-file/ErrorCode addition needed).
 
 ## Plan Items
 
-- [x] §7 of `daily-universe-scope-expansion-2026-05-27.md`: instance lock
-  m8g.large → r8g.large; dated 2026-06-30 operator-quote block; §7 Rule 2
-  memory budget recomputed for 16 GiB at current universe; cost line recomputed.
-  - Files: .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md
-- [x] `aws-budget.md`: update superseded instance ref + add "superseded → r8g.large
-  2026-06-30" one-line marker.
-  - Files: .claude/rules/project/aws-budget.md
-- [x] `aws-indices-only-locked-architecture.md` §5: same instance/memory/cost
-  update to r8g.large / 16 GiB in the §5 supersession marker.
-  - Files: docs/architecture/aws-indices-only-locked-architecture.md
-- [x] Rewrite ratchet `instance_type_lock_guard.rs`: m8g.large→r8g.large,
-  8 GiB→16 GiB, re-pin the recomputed ₹ bill.
-  - Files: crates/storage/tests/instance_type_lock_guard.rs
-  - Tests: instance_lock_authoritative_rule_file_pins_r8g_large, instance_lock_monthly_bill_pinned_to_rupees
-- [x] Terraform `variables.tf`: `instance_type` validation + default → r8g.large.
-  - Files: deploy/aws/terraform/variables.tf
-- [x] `aws-upgrade-instance.sh`: `FROM_TYPE` default t4g.medium → m8g.large;
-  confirm r8g.large in `--to` allowlist (already present).
-  - Files: scripts/aws-upgrade-instance.sh
-- [x] `docker-compose.yml`: QuestDB `QDB_MEM_LIMIT` default 2g → 4g for 16 GiB;
-  update the host-spec comment.
-  - Files: deploy/docker/docker-compose.yml
+- [x] Add damped `questdb_reachable_for_exit_decision` AtomicBool + setter/getter to health status
+  - Files: crates/api/src/state.rs
+  - Tests: test_questdb_reachable_for_exit_decision_independent_of_raw
+
+- [x] Add pure `damp_questdb_exit_signal` fn + N=2 threshold const; wire the watchdog counter + damped setter; switch the Halt-arm read to the damped getter
+  - Files: crates/app/src/main.rs
+  - Tests: test_damp_questdb_exit_signal_single_blip_stays_reachable, test_damp_questdb_exit_signal_n_consecutive_flips, test_damp_questdb_exit_signal_success_resets, test_damp_questdb_exit_signal_threshold_is_two
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | `cargo test -p tickvault-storage --test instance_type_lock_guard` | all pass against new r8g.large/16-GiB text |
-| 2 | grep `m8g.large` as a LOCKED value | only historical/superseded mentions remain |
-| 3 | fresh `terraform apply` | provisions r8g.large (validation passes) |
-| 4 | `aws-upgrade-instance.sh --from m8g.large --to r8g.large` | accepted (allowlist + FROM default) |
-| 5 | `dry_run` / `MAX_DAILY_UNIVERSE_SIZE` / `SEAL_BUFFER_CAPACITY` | UNCHANGED |
+| 1 | 1 blip during in-market 429 storm | ride-out continues (no exit) |
+| 2 | 2 consecutive failed probes (real outage) | exit forced (genuine-fatal) |
+| 3 | success between two failures | counter resets; needs 2 fresh consecutive to flip |
+| 4 | `/health` during 1 blip | raw signal shows "unreachable" (observability intact) |
