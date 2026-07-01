@@ -5513,6 +5513,20 @@ async fn start_dhan_lane(
             std::path::PathBuf::from("data/spill"),
         );
 
+    // BP-07 (PROC-01, 2026-07-01): supervised OOM-kill monitor. Reads the
+    // cgroup-v2 `memory.events` `oom_kill` counter vs a boot baseline every
+    // 60s and pages Critical (`error!(code = "PROC-01")` + `tv_oom_kills_total`)
+    // when the host OOM-killer takes a process in this cgroup. Before this an
+    // OOM was only caught indirectly (die → systemd → missing-SLO page), so an
+    // OOM-loop was indistinguishable from a panic-loop. Always-on (an OOM at
+    // any hour is critical); on a non-cgroup-v2 dev box the probe fails softly
+    // (`tv_oom_monitor_probe_failed_total`, no page, no panic). Supervised so a
+    // monitor panic respawns instead of vanishing (mirrors DISK-WATCHER-01).
+    let _oom_monitor_supervisor =
+        tickvault_storage::oom_monitor::spawn_supervised_oom_monitor(std::path::PathBuf::from(
+            tickvault_storage::oom_monitor::DEFAULT_CGROUP_V2_MEMORY_EVENTS_PATH,
+        ));
+
     // D2 Stage 2: `health_status` is now built ONCE in the hoisted
     // `build_shared_infra` prefix and destructured into `main()` scope above, so
     // the lane references the SAME Arc the API server + run-loop hold. The

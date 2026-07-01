@@ -244,6 +244,14 @@ pub enum ErrorCode {
     /// durable-loss signal — previously this arm returned silently.
     /// Severity::Critical.
     WsSpill02FrameDropped,
+    /// PROC-01: an OOM kill was detected — the cgroup-v2 `memory.events`
+    /// `oom_kill` counter rose above the boot-time baseline. Some process in
+    /// this cgroup (tickvault itself or a sidecar) was killed by the kernel
+    /// OOM killer. Before this signal an OOM was only caught indirectly
+    /// (process dies → systemd → market-hours-liveness page on a missing SLO),
+    /// so an OOM-loop was indistinguishable from a panic-loop with zero OOM
+    /// attribution. Severity::Critical — the host is out of memory.
+    Proc01OomKillDetected,
     /// AUTH-GAP-03: token force-renewed on WebSocket wake.
     AuthGap03TokenForceRenewedOnWake,
     /// BOOT-01: slow-boot QuestDB readiness deadline approaching (>30s).
@@ -699,6 +707,7 @@ impl ErrorCode {
             Self::DiskWatcher01Respawned => "DISK-WATCHER-01",
             Self::WsSpill01WriterRespawn => "WS-SPILL-01",
             Self::WsSpill02FrameDropped => "WS-SPILL-02",
+            Self::Proc01OomKillDetected => "PROC-01",
             Self::AuthGap03TokenForceRenewedOnWake => "AUTH-GAP-03",
             Self::Boot01QuestDbSlow => "BOOT-01",
             Self::Boot02DeadlineExceeded => "BOOT-02",
@@ -824,7 +833,9 @@ impl ErrorCode {
             | Self::InstrFetch04UniverseSizeOutOfBounds
             | Self::NtmConstituency01SourceDegraded
             // WS-SPILL-02 — durable frame dropped (writer dead at append instant)
-            | Self::WsSpill02FrameDropped => Severity::Critical,
+            | Self::WsSpill02FrameDropped
+            // PROC-01 — OOM kill detected (host out of memory)
+            | Self::Proc01OomKillDetected => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
             Self::Selftest01Passed
             | Self::Slo01Healthy
@@ -1047,7 +1058,9 @@ impl ErrorCode {
             | Self::AggregatorSeal01IlpFailed
             | Self::AggregatorHb01Heartbeat
             | Self::Boundary01CatchupSeal => ".claude/rules/project/wave-6-error-codes.md",
-            Self::Resilience01DualInstanceDetected => ".claude/rules/project/wave-4-error-codes.md",
+            Self::Resilience01DualInstanceDetected | Self::Proc01OomKillDetected => {
+                ".claude/rules/project/wave-4-error-codes.md"
+            }
             Self::OrphanPosition01Detected => {
                 ".claude/rules/project/phase-0-item-20-error-codes.md"
             }
@@ -1188,6 +1201,7 @@ impl ErrorCode {
             Self::DiskWatcher01Respawned,
             Self::WsSpill01WriterRespawn,
             Self::WsSpill02FrameDropped,
+            Self::Proc01OomKillDetected,
             Self::AuthGap03TokenForceRenewedOnWake,
             Self::Boot01QuestDbSlow,
             Self::Boot02DeadlineExceeded,
@@ -1537,7 +1551,9 @@ mod tests {
         // 2026-06-30 (Dhan reconnect hardening Fix A): bumped 109 -> 110 for
         // WS-GAP-09 (watchdog reconnect-in-place on the bare-Dhan-reset class
         // instead of process::exit + 775-SID re-subscribe → 429).
-        assert_eq!(ErrorCode::all().len(), 110);
+        // 2026-07-01 (BP-07 / Wave-4-E1): bumped 110 -> 111 for PROC-01
+        // (OOM-kill monitor — cgroup-v2 memory.events oom_kill vs boot baseline).
+        assert_eq!(ErrorCode::all().len(), 111);
     }
 
     #[test]
@@ -1635,7 +1651,9 @@ mod tests {
                 || s.starts_with("GROWW-MASTER-")
                 // 2026-06-30: feed-agnostic sidecar stall-watchdog + respawn
                 || s.starts_with("FEED-STALL-")
-                || s.starts_with("FEED-SUPERVISOR-");
+                || s.starts_with("FEED-SUPERVISOR-")
+                // Wave-4-E1 / BP-07 (2026-07-01): OOM-kill monitor.
+                || s.starts_with("PROC-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
