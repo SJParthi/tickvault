@@ -201,11 +201,21 @@ if [ "$STATE" = "running" ]; then
       if [ "$ENABLED" = "disabled" ]; then
         note_ok "app (tickvault) intentionally stopped (kill-switch — unit disabled); not auto-restarting (re-enable via AWS Control deploy/start when ready)"
       else
-        echo "  app inactive ($APP), unit enabled — restarting via SSM"
-        ssm_run "systemctl restart tickvault 2>/dev/null; sleep 5" >/dev/null
+        # BP-09: a bare `systemctl restart` is a NO-OP on a StartLimit-`failed`
+        # unit. tickvault.service sets StartLimitBurst=8 / StartLimitIntervalSec=600,
+        # so after > 8 restarts in 10 min systemd flips the unit to `failed` and
+        # `restart`/`start` returns "Start request repeated too quickly" and does
+        # nothing until `reset-failed` clears the start-limit counter. A
+        # Dhan-RST-driven crash-loop (see the 2026-06-30 feed-reset incident) trips
+        # exactly this. So: ALWAYS `reset-failed` first (a harmless no-op on a
+        # non-failed unit — it just clears any latched failed/limit state), THEN
+        # `start`. This recovers BOTH a plain enabled-but-inactive unit AND a stuck
+        # `failed` crash-loop with one path, without a human running reset-failed.
+        echo "  app inactive ($APP), unit enabled — reset-failed + start via SSM"
+        ssm_run "systemctl reset-failed tickvault 2>/dev/null; systemctl start tickvault 2>/dev/null; sleep 5" >/dev/null
         APP2=$(ssm_run "systemctl is-active tickvault 2>/dev/null || echo inactive" | tr -d '[:space:]')
         if [ "$APP2" = "active" ]; then
-          note_heal "restarted app (tickvault) — was $APP"
+          note_heal "restarted app (tickvault) — was $APP (reset-failed cleared any crash-loop limit, then start)"
         else
           note_issue "app (tickvault) not active after restart ($APP2) — check journalctl"
         fi
