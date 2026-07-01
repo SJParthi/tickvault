@@ -555,7 +555,7 @@ impl TickDedupRing {
         let mut h = 0xcbf2_9ce4_8422_2325_u64; // FNV-1a 64-bit offset basis
         h ^= u64::from(exchange_segment_code);
         h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV-1a 64-bit prime
-        h ^= u64::from(security_id);
+        h ^= security_id;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
         h ^= u64::from(exchange_timestamp);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
