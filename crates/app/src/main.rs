@@ -1766,6 +1766,10 @@ async fn main() -> Result<()> {
             // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
             let greeks_enricher = build_inline_greeks_enricher(&config, &subscription_plan);
 
+            // NT-15: seed the tick-gap detector with every subscribed SID so a
+            // never-ticking instrument becomes a first-tick black-hole signal.
+            seed_tick_gap_detector_from_plan(&subscription_plan);
+
             // O(1) EXEMPT: cold path — clone registry once for tick processor enrichment.
             let fast_registry = subscription_plan
                 .as_ref()
@@ -6009,6 +6013,10 @@ async fn start_dhan_lane(
         // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
         let greeks_enricher = build_inline_greeks_enricher(config, &subscription_plan);
 
+        // NT-15: seed the tick-gap detector with every subscribed SID so a
+        // never-ticking instrument becomes a first-tick black-hole signal.
+        seed_tick_gap_detector_from_plan(&subscription_plan);
+
         // O(1) EXEMPT: cold path — clone registry once for tick processor enrichment.
         let slow_registry = subscription_plan
             .as_ref()
@@ -8212,6 +8220,35 @@ fn should_abort_cold_start_on_disable(
 ) -> bool {
     use tickvault_api::feed_state::LaneState;
     !desired_on && matches!(lane_state, LaneState::Starting)
+}
+
+/// NT-15 (audit 2026-07-01): seed the global `TickGapDetector` with every
+/// subscribed instrument at boot so a SID that never ticks all session is
+/// still detectable as a per-SID cold black-hole (WS-GAP-06 /
+/// `tv_tick_gap_instruments_silent`), not silently masked by other SIDs that
+/// do tick. Insert-if-absent — never clobbers an entry a real tick already
+/// wrote. Cold path, called once per boot after the subscription plan exists.
+fn seed_tick_gap_detector_from_plan(plan: &Option<SubscriptionPlan>) {
+    let Some(plan) = plan else {
+        return;
+    };
+    let Some(detector) = tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
+    else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let mut seeded = 0u64;
+    // O(1) EXEMPT: cold-path boot seeding, one insert-if-absent per
+    // subscribed instrument (~universe size), never on the hot loop.
+    for inst in plan.registry.iter() {
+        detector.seed_subscribed(inst.security_id, inst.exchange_segment, now);
+        seeded += 1;
+    }
+    info!(
+        seeded,
+        "NT-15: seeded tick-gap detector with subscribed instruments — a \
+         never-ticking SID is now a first-tick black-hole signal"
+    );
 }
 
 /// Decide whether the runtime supervisor should SPAWN a fresh cold-start task
