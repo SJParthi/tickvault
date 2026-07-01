@@ -20,6 +20,30 @@ Documentation=https://github.com/SJParthi/tickvault
 After=network-online.target docker.service
 Wants=network-online.target docker.service
 
+# Crash-loop safety net (interaction-audit MED — "crash-loop hides under a
+# stale gauge"). Restart=always (below) is correct for a genuine one-off crash
+# AFTER READY=1, but WITHOUT a start-rate limit a fast crash-loop (e.g. a
+# post-READY panic that reproduces on every restart) would restart FOREVER,
+# every ~3s, silently. The observability trap: metrics-exporter-prometheus
+# re-renders the boot gauges' last value on each scrape while the process is
+# briefly alive between restarts, so a crash-loop can keep re-publishing a
+# STALE-looking healthy gauge and never surface as a hard failure.
+#
+# StartLimit* makes that crash-loop OBSERVABLE: > StartLimitBurst restarts
+# within StartLimitIntervalSec transitions the unit to `failed` (queryable via
+# `systemctl status` / `systemctl is-failed` / an SSM check), which STOPS the
+# restart churn and STOPS the stale-gauge re-publish — the app is then genuinely
+# dead, its metrics go MISSING, and the market-hours liveness alarm (added in
+# this PR) pages.
+#
+# Values: > 8 restarts in 10 min → `failed`. A healthy slow first boot is ONE
+# start attempt that runs long (guarded by TimeoutStartSec=infinity below), NOT
+# repeated restarts, so this never trips a legitimate boot. These directives are
+# placed in [Unit] (NOT [Service]) per modern systemd — they govern the unit's
+# start-rate, unlike Restart=/RestartSec= which live in [Service].
+StartLimitIntervalSec=600
+StartLimitBurst=8
+
 [Service]
 Type=notify
 # Run as ec2-user (Amazon Linux 2023 default unprivileged account).
@@ -62,6 +86,11 @@ ExecStartPre=-/bin/bash /opt/tickvault/repo/scripts/ensure-questdb.sh
 TimeoutStartSec=infinity
 
 # Auto-restart on ANY failure. RestartSec prevents tight restart loops.
+# Bounded by StartLimitIntervalSec/StartLimitBurst in [Unit]: after > 8
+# restarts in 10 min the unit goes to `failed` and stops restarting (so a true
+# crash-loop becomes an observable hard failure instead of an infinite silent
+# churn under a re-emitted stale gauge). Recover a `failed` unit manually with
+# `systemctl reset-failed tickvault && systemctl start tickvault`.
 Restart=always
 RestartSec=3
 
