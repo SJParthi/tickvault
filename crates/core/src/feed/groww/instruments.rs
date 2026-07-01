@@ -723,8 +723,42 @@ fn hardened_client() -> Result<reqwest::Client, WatchBuildError> {
         .map_err(|e| WatchBuildError::FetchFailed(e.to_string()))
 }
 
+/// Allowed response `Content-Type` values for a CSV body. Rejecting `text/html`
+/// (a WAF block page) and `application/json` (a CDN/error body) prevents feeding
+/// a non-CSV payload to the parser. Mirrors the audited Dhan downloader
+/// (`csv_downloader.rs`, §18 hardening). A MISSING header is allowed — Groww /
+/// niftyindices static CDNs may omit it, and upper-layer row/column validation
+/// still guards.
+const ALLOWED_GROWW_CSV_CONTENT_TYPES: &[&str] =
+    &["text/csv", "application/octet-stream", "text/plain"];
+
+/// Validate a response `Content-Type` against `ALLOWED_GROWW_CSV_CONTENT_TYPES`.
+/// Pure + unit-tested. Missing header → `Ok` (static-CDN omission). Present →
+/// strip the `; charset=…` suffix, lowercase, and allowlist-check.
+fn validate_groww_content_type(
+    header: Option<&reqwest::header::HeaderValue>,
+) -> Result<(), WatchBuildError> {
+    let Some(value) = header else {
+        return Ok(());
+    };
+    let raw = value
+        .to_str()
+        .map_err(|_| WatchBuildError::FetchFailed("content-type: invalid utf-8".to_string()))?;
+    let primary = raw.split(';').next().unwrap_or("").trim().to_lowercase();
+    if ALLOWED_GROWW_CSV_CONTENT_TYPES
+        .iter()
+        .any(|&allowed| allowed == primary)
+    {
+        Ok(())
+    } else {
+        Err(WatchBuildError::FetchFailed(format!(
+            "rejected content-type: {primary}"
+        )))
+    }
+}
+
 /// One bounded GET → UTF-8 text, body-size-capped at `MAX_CSV_BODY_BYTES`.
-// TEST-EXEMPT: live network GET; the body cap + status check are the hardening, the parse/resolve primitives are unit-tested.
+// TEST-EXEMPT: live network GET; the body cap + status + content-type checks are the hardening, the parse/resolve primitives are unit-tested.
 async fn fetch_text_hardened(
     client: &reqwest::Client,
     url: &str,
@@ -740,6 +774,9 @@ async fn fetch_text_hardened(
             resp.status()
         )));
     }
+    // §18-parity: reject a non-CSV Content-Type (WAF/error body) BEFORE reading
+    // the body, so a 200-OK `text/html` block page never reaches the CSV parser.
+    validate_groww_content_type(resp.headers().get(reqwest::header::CONTENT_TYPE))?;
     let bytes = resp
         .bytes()
         .await
@@ -819,6 +856,46 @@ pub async fn build_and_write_groww_watch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // §18-parity Content-Type allowlist guard (2026-07-01 security review).
+    fn ct(v: &'static str) -> reqwest::header::HeaderValue {
+        reqwest::header::HeaderValue::from_static(v)
+    }
+
+    #[test]
+    fn test_content_type_missing_is_accepted() {
+        // Static CDNs (Groww / niftyindices) may omit the header — accept.
+        assert!(validate_groww_content_type(None).is_ok());
+    }
+
+    #[test]
+    fn test_content_type_text_csv_accepted() {
+        assert!(validate_groww_content_type(Some(&ct("text/csv"))).is_ok());
+        assert!(validate_groww_content_type(Some(&ct("application/octet-stream"))).is_ok());
+        assert!(validate_groww_content_type(Some(&ct("text/plain"))).is_ok());
+    }
+
+    #[test]
+    fn test_content_type_charset_suffix_stripped() {
+        assert!(validate_groww_content_type(Some(&ct("text/csv; charset=utf-8"))).is_ok());
+    }
+
+    #[test]
+    fn test_content_type_uppercase_accepted() {
+        assert!(validate_groww_content_type(Some(&ct("TEXT/CSV"))).is_ok());
+    }
+
+    #[test]
+    fn test_content_type_html_rejected() {
+        // A WAF block page (200 OK + text/html) must NOT reach the CSV parser.
+        assert!(validate_groww_content_type(Some(&ct("text/html"))).is_err());
+        assert!(validate_groww_content_type(Some(&ct("text/html; charset=utf-8"))).is_err());
+    }
+
+    #[test]
+    fn test_content_type_json_rejected() {
+        assert!(validate_groww_content_type(Some(&ct("application/json"))).is_err());
+    }
 
     const HEADER: &str = "exchange,exchange_token,trading_symbol,groww_symbol,name,instrument_type,segment,series,isin,underlying_symbol,underlying_exchange_token,expiry_date,strike_price,lot_size,tick_size,freeze_quantity,is_reserved,buy_allowed,sell_allowed,internal_trading_symbol,is_intraday";
 
