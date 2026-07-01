@@ -25,8 +25,21 @@ pub struct SystemHealthStatus {
     order_update_connected: AtomicBool,
     /// Whether the tick pipeline is actively processing.
     pipeline_active: AtomicBool,
-    /// Whether QuestDB was reachable at last check.
+    /// Whether QuestDB was reachable at last check (RAW single-probe signal).
+    /// Read by `/health`, `overall_status`, and observability. A single
+    /// momentary blip flips this — that is correct for observability.
     questdb_reachable: AtomicBool,
+    /// DAMPED QuestDB-reachability signal that feeds the pool-watchdog's 429
+    /// ride-out EXIT decision ONLY. Unlike the raw `questdb_reachable` above,
+    /// this flips `false` only after N *consecutive* failed probes (see
+    /// `damp_questdb_exit_signal` in `crates/app/src/main.rs`), so a single
+    /// blip (GC pause / transient HTTP hiccup / a 2s probe-timeout under load)
+    /// during a live in-market 429 storm no longer forces a `process::exit(2)`
+    /// → 775-SID cold re-subscribe → next 429 restart/429 loop. A genuine
+    /// SUSTAINED outage still flips it after N ticks, so the exit gate is never
+    /// worse than today for a real dead DB. Inits `true` — a watchdog that has
+    /// never probed must not pre-force an exit.
+    questdb_reachable_for_exit_decision: AtomicBool,
     /// Whether the auth token is currently valid.
     token_valid: AtomicBool,
     /// Seconds remaining until token expiry (0 = expired or unknown).
@@ -49,6 +62,11 @@ impl SystemHealthStatus {
             order_update_connected: AtomicBool::new(false),
             pipeline_active: AtomicBool::new(false),
             questdb_reachable: AtomicBool::new(false),
+            // Inits `true`: before the first probe the exit gate must NOT read
+            // "down" (that would pre-force a genuine-fatal exit). The gate has
+            // other predicates (token valid, no non-reconnectable code) so this
+            // default never rides out an absent pool on its own.
+            questdb_reachable_for_exit_decision: AtomicBool::new(true),
             token_valid: AtomicBool::new(false),
             token_remaining_secs: AtomicU64::new(0),
             tick_persistence_connected: AtomicBool::new(false),
@@ -104,9 +122,26 @@ impl SystemHealthStatus {
         self.questdb_reachable.store(reachable, Ordering::Relaxed);
     }
 
-    /// Returns whether QuestDB is reachable.
+    /// Returns whether QuestDB is reachable (RAW single-probe signal).
     pub fn questdb_reachable(&self) -> bool {
         self.questdb_reachable.load(Ordering::Relaxed)
+    }
+
+    /// Sets the DAMPED QuestDB-reachability signal used ONLY by the pool
+    /// watchdog's 429 ride-out exit decision. The watchdog computes this from
+    /// N consecutive failed probes via `damp_questdb_exit_signal`; a single
+    /// success resets. Never read by `/health` — keep that on the raw signal.
+    pub fn set_questdb_reachable_for_exit_decision(&self, reachable: bool) {
+        self.questdb_reachable_for_exit_decision
+            .store(reachable, Ordering::Relaxed);
+    }
+
+    /// Returns the DAMPED QuestDB-reachability signal for the ride-out exit
+    /// gate. `false` only after N consecutive failed probes — so a single blip
+    /// does not force `process::exit`, but a sustained outage still does.
+    pub fn questdb_reachable_for_exit_decision(&self) -> bool {
+        self.questdb_reachable_for_exit_decision
+            .load(Ordering::Relaxed)
     }
 
     /// Marks the auth token as valid/invalid.
@@ -506,6 +541,42 @@ mod tests {
         assert!(!health.token_valid());
         assert!(!health.tick_persistence_connected());
         assert_eq!(health.boot_epoch_secs(), 0);
+    }
+
+    #[test]
+    fn test_questdb_reachable_for_exit_decision_independent_of_raw() {
+        let health = SystemHealthStatus::new();
+        // Damped exit signal inits `true` (never pre-force an exit before any
+        // probe); the raw signal inits `false`.
+        assert!(
+            health.questdb_reachable_for_exit_decision(),
+            "damped exit signal must init true"
+        );
+        assert!(
+            !health.questdb_reachable(),
+            "raw signal inits false (unknown until first probe)"
+        );
+
+        // A single RAW blip (set raw false) must NOT touch the damped exit
+        // signal — `/health` reflects the blip, the exit gate does not.
+        health.set_questdb_reachable(false);
+        assert!(
+            !health.questdb_reachable(),
+            "raw signal reflects the blip (observability intact)"
+        );
+        assert!(
+            health.questdb_reachable_for_exit_decision(),
+            "damped exit signal is independent of a single raw blip"
+        );
+
+        // The two signals move independently in both directions.
+        health.set_questdb_reachable(true);
+        health.set_questdb_reachable_for_exit_decision(false);
+        assert!(health.questdb_reachable(), "raw is now true");
+        assert!(
+            !health.questdb_reachable_for_exit_decision(),
+            "damped exit signal is independently settable to false"
+        );
     }
 
     #[test]
