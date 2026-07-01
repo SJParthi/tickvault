@@ -2407,6 +2407,116 @@ async fn main() -> Result<()> {
     .await?;
 
     // =======================================================================
+    // PROCESS-GLOBAL supervised observability monitors (2026-07-01 per-lane-leak
+    // fix). These four host/process-level monitors used to be spawned inside the
+    // per-lane `start_dhan_lane`, which re-runs on every Dhan enable / stop→restart
+    // / cold-start retry (`run_dhan_lane_cold_start`) — so each re-invocation
+    // leaked a fresh never-aborted monitor (duplicate PROC-01 / RESOURCE-01/02/03 /
+    // INDEX-OHLC-02 / DISK-WATCHER-01 pages + N× metric increments for one real
+    // event, unbounded task growth under toggling), and on a boot-OFF-Dhan
+    // deployment they never started at all until Dhan was toggled on. They are
+    // spawned EXACTLY ONCE here in the process-global prefix (after
+    // `build_shared_infra`, before the Dhan-lane gate) and owned at process scope,
+    // so they run regardless of Dhan enable/disable/restart. This block is placed
+    // AFTER `build_shared_infra` returns (NOT inside it), so the
+    // build-shared-infra isolation guard — which forbids auth / instrument-load /
+    // WebSocket strings in that fn's body — is unaffected (these are pure
+    // observability, none of those strings).
+    // =======================================================================
+
+    // 2026-04-28 audit gap closure: spawn the disk-health watcher.
+    // Closes the highest-risk hole in the zero-loss chain ("disk full +
+    // QuestDB down simultaneously"). Operator now gets ~hours of warning
+    // via `tv_spill_dir_free_bytes` gauge before the spill disk fills.
+    //
+    // G3 (zero-tick-loss audit PR-5): run the watcher UNDER A SUPERVISOR
+    // (mirrors the WS-GAP-05 pool supervisor) so a panic in the watcher
+    // respawns it + logs DISK-WATCHER-01 + increments
+    // `tv_disk_watcher_respawn_total` (CloudWatch-alarmed) instead of
+    // silently vanishing — previously this handle was bound to `_` and a
+    // watcher panic killed disk-free monitoring with no signal.
+    let _disk_health_watcher_supervisor =
+        tickvault_storage::disk_health_watcher::spawn_supervised_spill_disk_health_watcher(
+            std::path::PathBuf::from("data/spill"),
+        );
+
+    // BP-07 (PROC-01, 2026-07-01): supervised OOM-kill monitor. Reads the
+    // cgroup-v2 `memory.events` `oom_kill` counter vs a boot baseline every
+    // 60s and pages Critical (`error!(code = "PROC-01")` + `tv_oom_kills_total`)
+    // when the host OOM-killer takes a process in this cgroup. Before this an
+    // OOM was only caught indirectly (die → systemd → missing-SLO page), so an
+    // OOM-loop was indistinguishable from a panic-loop. Always-on (an OOM at
+    // any hour is critical); on a non-cgroup-v2 dev box the probe fails softly
+    // (`tv_oom_monitor_probe_failed_total`, no page, no panic). Supervised so a
+    // monitor panic respawns instead of vanishing (mirrors DISK-WATCHER-01).
+    let _oom_monitor_supervisor =
+        tickvault_storage::oom_monitor::spawn_supervised_oom_monitor(std::path::PathBuf::from(
+            tickvault_storage::oom_monitor::DEFAULT_CGROUP_V2_MEMORY_EVENTS_PATH,
+        ));
+
+    // BP-08 (RESOURCE-01/02/03, 2026-07-01): supervised process-level resource
+    // early-warning monitor. Samples open fd count vs LimitNOFILE (RESOURCE-01),
+    // VmRSS vs cgroup memory.max (RESOURCE-02), and spill-dir free-percent
+    // (RESOURCE-03) every 60s; pages Critical/High at 80% (fd/RSS) / <20% free
+    // (spill) so the operator acts BEFORE exhaustion — distinct from the host-
+    // aggregate mem_used_high / disk_used_high alarms. Always-on (resource
+    // exhaustion at any hour is critical); non-Linux probes fail softly
+    // (tv_resource_monitor_probe_failed_total, no page, no panic). Supervised so
+    // a monitor panic respawns instead of vanishing (mirrors DISK-WATCHER-01).
+    let _resource_monitor_supervisor =
+        tickvault_storage::resource_monitor::spawn_supervised_resource_monitor(
+            tickvault_storage::resource_monitor::ResourceMonitorPaths::platform_defaults(
+                std::path::PathBuf::from("data/spill"),
+            ),
+        );
+
+    // -----------------------------------------------------------------------
+    // DayOhlcTracker boot wiring (post 2026-05-26 simplification; MOVED to
+    // process-global scope 2026-07-01 to stop the per-lane cold-start leak).
+    //
+    // Per operator directive 2026-05-26 the Dhan historical / pre-market buffer
+    // code was removed. `day_open` for the 4 LOCKED IDX_I SIDs is now the FIRST
+    // OBSERVED LIVE TICK LTP after the IST midnight reset — no external arming
+    // required. The tracker reads the PROCESS-GLOBAL `tick_broadcast_sender`
+    // (filtering IDX_I ticks by segment, not by an instrument list), and the
+    // IST-midnight reset is a host observability task — so the whole wiring is
+    // process-global, spawned ONCE here instead of inside the per-lane
+    // subscription-plan block (which re-ran on every cold-start and leaked a
+    // fresh midnight-reset supervisor → duplicate INDEX-OHLC-02 pages).
+    //
+    // Two tokio tasks spawned here:
+    //   1. tick consumer  — drain tick broadcast, route IDX_I ticks to
+    //                       update_tick() which auto-arms on first call and
+    //                       advances day_high/low/close on subsequent calls.
+    //   2. midnight reset — IST 00:00:00 clears prev-day state so the next live
+    //                       tick re-arms (CCL-02 supervised respawn wrapper,
+    //                       INDEX-OHLC-02).
+    // -----------------------------------------------------------------------
+    let day_ohlc_tracker = std::sync::Arc::new(tickvault_trading::in_mem::DayOhlcTracker::new());
+    {
+        let consumer_tracker = std::sync::Arc::clone(&day_ohlc_tracker);
+        let consumer_rx = tick_broadcast_sender.subscribe();
+        let _consumer_handle = tickvault_app::day_ohlc_orchestrator::spawn_day_ohlc_tick_consumer(
+            consumer_tracker,
+            consumer_rx,
+        );
+    }
+    {
+        // CCL-02: supervised respawn wrapper (INDEX-OHLC-02) so a panic in the
+        // IST-midnight reset task can never silently take the daily reset offline
+        // — mirror WS-GAP-05 / DISK-WATCHER-01.
+        let reset_tracker = std::sync::Arc::clone(&day_ohlc_tracker);
+        let _reset_supervisor_handle =
+            tickvault_app::day_ohlc_orchestrator::spawn_supervised_midnight_reset_task(
+                reset_tracker,
+            );
+    }
+    info!(
+        "DayOhlcTracker boot wired at process scope (tick consumer + midnight reset; \
+         day_open = first live tick LTP)"
+    );
+
+    // =======================================================================
     // D2b: build + publish the OWNED runtime Dhan-lane context, so the
     // already-spawned runtime supervisor can cold-start a boot-OFF Dhan feed at
     // any time. Built in BOTH the Dhan-ON and Dhan-OFF paths (this code runs
@@ -5520,51 +5630,17 @@ async fn start_dhan_lane(
         );
     }
 
-    // 2026-04-28 audit gap closure: spawn the disk-health watcher.
-    // Closes the highest-risk hole in the zero-loss chain ("disk full +
-    // QuestDB down simultaneously"). Operator now gets ~hours of warning
-    // via `tv_spill_dir_free_bytes` gauge before the spill disk fills.
-    //
-    // G3 (zero-tick-loss audit PR-5): run the watcher UNDER A SUPERVISOR
-    // (mirrors the WS-GAP-05 pool supervisor) so a panic in the watcher
-    // respawns it + logs DISK-WATCHER-01 + increments
-    // `tv_disk_watcher_respawn_total` (CloudWatch-alarmed) instead of
-    // silently vanishing — previously this handle was bound to `_` and a
-    // watcher panic killed disk-free monitoring with no signal.
-    let _disk_health_watcher_supervisor =
-        tickvault_storage::disk_health_watcher::spawn_supervised_spill_disk_health_watcher(
-            std::path::PathBuf::from("data/spill"),
-        );
-
-    // BP-07 (PROC-01, 2026-07-01): supervised OOM-kill monitor. Reads the
-    // cgroup-v2 `memory.events` `oom_kill` counter vs a boot baseline every
-    // 60s and pages Critical (`error!(code = "PROC-01")` + `tv_oom_kills_total`)
-    // when the host OOM-killer takes a process in this cgroup. Before this an
-    // OOM was only caught indirectly (die → systemd → missing-SLO page), so an
-    // OOM-loop was indistinguishable from a panic-loop. Always-on (an OOM at
-    // any hour is critical); on a non-cgroup-v2 dev box the probe fails softly
-    // (`tv_oom_monitor_probe_failed_total`, no page, no panic). Supervised so a
-    // monitor panic respawns instead of vanishing (mirrors DISK-WATCHER-01).
-    let _oom_monitor_supervisor =
-        tickvault_storage::oom_monitor::spawn_supervised_oom_monitor(std::path::PathBuf::from(
-            tickvault_storage::oom_monitor::DEFAULT_CGROUP_V2_MEMORY_EVENTS_PATH,
-        ));
-
-    // BP-08 (RESOURCE-01/02/03, 2026-07-01): supervised process-level resource
-    // early-warning monitor. Samples open fd count vs LimitNOFILE (RESOURCE-01),
-    // VmRSS vs cgroup memory.max (RESOURCE-02), and spill-dir free-percent
-    // (RESOURCE-03) every 60s; pages Critical/High at 80% (fd/RSS) / <20% free
-    // (spill) so the operator acts BEFORE exhaustion — distinct from the host-
-    // aggregate mem_used_high / disk_used_high alarms. Always-on (resource
-    // exhaustion at any hour is critical); non-Linux probes fail softly
-    // (tv_resource_monitor_probe_failed_total, no page, no panic). Supervised so
-    // a monitor panic respawns instead of vanishing (mirrors DISK-WATCHER-01).
-    let _resource_monitor_supervisor =
-        tickvault_storage::resource_monitor::spawn_supervised_resource_monitor(
-            tickvault_storage::resource_monitor::ResourceMonitorPaths::platform_defaults(
-                std::path::PathBuf::from("data/spill"),
-            ),
-        );
+    // 2026-07-01 per-lane-leak fix: the three PROCESS-GLOBAL (host-level)
+    // supervised observability monitors — spill disk-health watcher
+    // (DISK-WATCHER-01), OOM-kill monitor (PROC-01), and the fd/RSS/spill-free
+    // resource monitor (RESOURCE-01/02/03) — used to be spawned HERE, inside the
+    // per-lane `start_dhan_lane`. Because `start_dhan_lane` re-runs on every Dhan
+    // enable / stop→restart / cold-start retry (`run_dhan_lane_cold_start`), each
+    // re-invocation leaked a fresh never-aborted monitor → duplicate pages + N×
+    // metric increments for one real event. They are host/process-global, so they
+    // are now spawned EXACTLY ONCE in `main()`'s process-global prefix (right
+    // after `build_shared_infra`, before the Dhan-lane gate) and owned at the
+    // process level — independent of any Dhan enable/disable/restart.
 
     // D2 Stage 2: `health_status` is now built ONCE in the hoisted
     // `build_shared_infra` prefix and destructured into `main()` scope above, so
@@ -6489,45 +6565,22 @@ async fn start_dhan_lane(
         // `subscription_plan.is_some()` (above) is the correct gate.
         {
             // -----------------------------------------------------------------
-            // DayOhlcTracker boot wiring (post 2026-05-26 simplification).
+            // DayOhlcTracker boot wiring — MOVED to process-global scope
+            // (2026-07-01 per-lane-leak fix).
             //
-            // Per operator directive 2026-05-26 the Dhan historical /
-            // pre-market buffer code was removed. `day_open` for the 4
-            // LOCKED IDX_I SIDs is now the FIRST OBSERVED LIVE TICK LTP
-            // after the IST midnight reset — no external arming required.
-            //
-            // Two tokio tasks spawned here:
-            //   1. tick consumer  — drain tick broadcast, route IDX_I ticks
-            //                       to update_tick() which auto-arms on
-            //                       first call and advances day_high/low/
-            //                       close on subsequent calls.
-            //   2. midnight reset — IST 00:00:00 clears prev-day state so
-            //                       the next live tick re-arms.
-            // -----------------------------------------------------------------
-            let day_ohlc_tracker =
-                std::sync::Arc::new(tickvault_trading::in_mem::DayOhlcTracker::new());
-            {
-                let consumer_tracker = std::sync::Arc::clone(&day_ohlc_tracker);
-                let consumer_rx = tick_broadcast_sender.subscribe();
-                let _consumer_handle =
-                    tickvault_app::day_ohlc_orchestrator::spawn_day_ohlc_tick_consumer(
-                        consumer_tracker,
-                        consumer_rx,
-                    );
-            }
-            {
-                // CCL-02: supervised respawn wrapper (INDEX-OHLC-02) so a panic
-                // in the IST-midnight reset task can never silently take the
-                // daily reset offline — mirror WS-GAP-05 / DISK-WATCHER-01.
-                let reset_tracker = std::sync::Arc::clone(&day_ohlc_tracker);
-                let _reset_supervisor_handle =
-                    tickvault_app::day_ohlc_orchestrator::spawn_supervised_midnight_reset_task(
-                        reset_tracker,
-                    );
-            }
-            info!(
-                "DayOhlcTracker boot wired (tick consumer + midnight reset; day_open = first live tick LTP)"
-            );
+            // The DayOhlc tracker + tick consumer + IST-midnight reset supervisor
+            // (INDEX-OHLC-02) used to be spawned HERE, inside the lane-local
+            // `should_connect_ws && subscription_plan.is_some()` block. Because
+            // `start_dhan_lane` re-runs on every Dhan enable / stop→restart /
+            // cold-start retry, each re-invocation leaked a fresh never-aborted
+            // midnight-reset supervisor → duplicate INDEX-OHLC-02 pages. The
+            // tracker reads the PROCESS-GLOBAL `tick_broadcast_sender` and the
+            // reset is a host IST-midnight observability task, so the whole
+            // wiring is now spawned EXACTLY ONCE in `main()`'s process-global
+            // prefix (after `build_shared_infra`, before the Dhan-lane gate),
+            // decoupled from the lane. Only the lane-readiness pings below
+            // (09:14 / 09:15:30) stay here — they are feed-readiness, not
+            // process-global.
 
             // Audit Finding #5 (2026-05-03): Pre-market positive readiness
             // ping at 09:14:00 IST — exactly 60s before the NSE opening bell.
