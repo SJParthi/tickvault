@@ -4753,9 +4753,42 @@ async fn start_dhan_lane(
         info!("verifying public IP against SSM static IP");
         match ip_verifier::verify_public_ip().await {
             Ok(result) => {
+                let verified_ip = result.verified_ip.clone();
                 notifier.notify(NotificationEvent::IpVerificationSuccess {
                     verified_ip: result.verified_ip,
                 });
+
+                // AUTH-P12 / GAP-NET-01: wire the RUNTIME IP monitor. The
+                // boot-time verify above is one-shot; a mid-session public-IP
+                // / Elastic-IP change (EIP disassociation, NAT failover) must
+                // be re-detected. The monitor polls the verified IP every
+                // IP_MONITOR_CHECK_INTERVAL_SECS and, on a CONFIRMED sustained
+                // mismatch (confirm-twice debounce), emits a CRITICAL
+                // GAP-NET-01 alert. It HALTS the process only when
+                // dry_run == false (real orders would be rejected by Dhan's
+                // static-IP mandate); under dry_run it alerts but keeps the
+                // live feed streaming (killing it for a no-orders IP change
+                // would drop ticks for zero benefit).
+                let ip_monitor_config =
+                    tickvault_core::network::ip_monitor::IpMonitorConfig::for_runtime(
+                        verified_ip,
+                        config.strategy.dry_run,
+                    );
+                // Mirror the seal-writer lifetime pattern: hold the watch
+                // sender for the process lifetime so the monitor's
+                // `.changed().await` never wakes on a disconnected channel.
+                let (ip_monitor_shutdown_tx, ip_monitor_shutdown_rx) =
+                    tokio::sync::watch::channel(false);
+                std::mem::forget(ip_monitor_shutdown_tx);
+                let (_ip_mismatch_rx, _ip_monitor_handle) =
+                    tickvault_core::network::ip_monitor::spawn_ip_monitor(
+                        ip_monitor_config,
+                        ip_monitor_shutdown_rx,
+                    );
+                info!(
+                    halt_on_mismatch = !config.strategy.dry_run,
+                    "GAP-NET-01 (AUTH-P12): runtime IP monitor spawned"
+                );
             }
             Err(err) => {
                 // GAP-NET-01: static-IP verification rejected boot.
