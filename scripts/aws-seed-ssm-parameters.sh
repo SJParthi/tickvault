@@ -21,10 +21,14 @@
 #   /tickvault/<env>/api/bearer-token      (SecureString)
 #   /tickvault/<env>/network/static-ip     (String — the EIP from terraform output)
 #
-# Optional parameters (sandbox mode + SNS SMS alerts):
+# Optional parameters (sandbox mode + SNS SMS alerts + Groww feed #2):
 #   /tickvault/<env>/dhan/sandbox-client-id  (SecureString — sandbox mode only)
 #   /tickvault/<env>/dhan/sandbox-token      (SecureString — sandbox mode only)
 #   /tickvault/<env>/sns/phone-number        (String — for CloudWatch SMS alarms)
+#   /tickvault/<env>/groww/api-key           (SecureString — REQUIRED when groww_enabled=true; else the Groww sidecar's SSM fetch backs off forever and Groww silently produces ZERO ticks while Dhan runs fine)
+#   /tickvault/<env>/groww/totp-secret       (SecureString — REQUIRED when groww_enabled=true)
+#
+# Groww env-var names for --from-env mode: TV_GROWW_API_KEY, TV_GROWW_TOTP_SECRET
 #
 # Usage:
 #   scripts/aws-seed-ssm-parameters.sh                        # interactive, env=dev
@@ -201,7 +205,7 @@ echo ""
 # ---------------------------------------------------------------------------
 # Optional parameters
 # ---------------------------------------------------------------------------
-echo -e "${CYAN}[3/3] Optional parameters (3 — skip with empty input)${NC}"
+echo -e "${CYAN}[3/3] Optional parameters (up to 5 — skip with empty input)${NC}"
 
 if [ "$ENVIRONMENT" = "sandbox" ]; then
     info "sandbox mode: the 2 sandbox-* parameters are needed"
@@ -215,6 +219,17 @@ if [ "$ENVIRONMENT" = "sandbox" ]; then
 fi
 
 put_param "/tickvault/${ENVIRONMENT}/sns/phone-number" TV_SNS_PHONE_NUMBER String "+CountryCode-PhoneNumber for SMS alarms (e.g. +91...)" || true
+
+# Groww second live feed (feed #2). REQUIRED when groww_enabled=true — which is
+# the prod default (config/production.toml). Without these two the Groww
+# sidecar's SSM fetch backs off FOREVER and Groww silently produces ZERO ticks
+# while Dhan runs fine. Optional here (skip with empty input) because Groww is
+# default-OFF in dev; a prod run MUST provide them or Groww stays dark.
+if [ "$ENVIRONMENT" = "prod" ]; then
+    warn "prod runs Groww (groww_enabled=true) — the 2 groww/* params below are REQUIRED; empty input leaves the Groww feed silent (zero ticks)"
+fi
+put_param "/tickvault/${ENVIRONMENT}/groww/api-key"     TV_GROWW_API_KEY     SecureString "Groww API key (feed #2; required when groww_enabled)" || true
+put_param "/tickvault/${ENVIRONMENT}/groww/totp-secret" TV_GROWW_TOTP_SECRET SecureString "Groww TOTP secret (feed #2; required when groww_enabled)" || true
 
 echo ""
 
