@@ -719,6 +719,25 @@ pub const PUBLIC_IP_CHECK_TIMEOUT_SECS: u64 = 10;
 /// Maximum retry attempts for public IP detection (primary + fallback).
 pub const PUBLIC_IP_CHECK_MAX_RETRIES: u32 = 3;
 
+/// GAP-NET-01 (AUTH-P12) — interval between runtime public-IP re-checks by
+/// the mid-session IP monitor. 300s = 5 minutes, matching the boot-time
+/// verify cadence; a confirmed mismatch therefore takes
+/// `IP_MONITOR_MISMATCH_CONFIRM_THRESHOLD` × this interval of the SAME wrong
+/// IP before any action fires (never a one-shot flap).
+pub const IP_MONITOR_CHECK_INTERVAL_SECS: u64 = 300;
+
+/// GAP-NET-01 (AUTH-P12) — number of CONSECUTIVE mismatched poll cycles the
+/// runtime IP monitor requires before it acts (confirm-twice debounce). A
+/// single transient metadata blip (1 cycle) never triggers an alert or halt;
+/// only a sustained wrong IP does.
+pub const IP_MONITOR_MISMATCH_CONFIRM_THRESHOLD: u32 = 2;
+
+/// GAP-NET-01 (AUTH-P12) — grace delay after the CRITICAL halt-class ERROR is
+/// logged, before the runtime IP monitor calls `std::process::exit`. Gives the
+/// log/Telegram sinks a moment to flush the alert so the operator sees WHY the
+/// process exited.
+pub const IP_MONITOR_HALT_FLUSH_DELAY_SECS: u64 = 2;
+
 /// Phase 0 Item 18b — Max retry attempts for the boot-time Dhan static
 /// IP gate (`/v2/ip/getIP`) when `orders_allowed = false`. Bounds the
 /// worst-case boot blocking time to `MAX_ATTEMPTS * INTERVAL_SECS`.
