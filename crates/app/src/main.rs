@@ -155,6 +155,39 @@ fn run_trading_day_gate() -> ! {
     ));
 }
 
+/// Metric name for the dedicated boot-completed CloudWatch signal.
+///
+/// Pinned as a named constant so the emit sites, the CloudWatch-agent scrape
+/// filter (`deploy/aws/terraform/user-data.sh.tftpl`), and the boot-heartbeat
+/// alarm (`deploy/aws/terraform/boot-heartbeat-alarm.tf`) all reference the
+/// exact same string. The source-scan guard
+/// `crates/app/tests/boot_completed_metric_guard.rs` ratchets that they stay in
+/// lockstep.
+const BOOT_COMPLETED_METRIC: &str = "tv_boot_completed";
+
+/// Emits the dedicated "the app finished a full boot and is alive" gauge.
+///
+/// The boot-heartbeat alarm (`deploy/aws/terraform/boot-heartbeat-alarm.tf`,
+/// repointed off the `tv_realtime_guarantee_score` PROXY — the PR #1278
+/// follow-up flagged in `daily-universe-scope-expansion-2026-05-27.md` §19
+/// "EC2 cron heartbeat") pages when this metric is MISSING in the 08:50–09:10
+/// IST boot window.
+///
+/// Called from BOTH boot-completion points (fast-boot crash-recovery + slow-boot
+/// normal), each reached ONLY after every boot gate has passed — a halt uses
+/// `process::exit(...)` / `bail!`/`?` propagation, none of which reach the call
+/// site, so a wedged/halted boot never emits it (missing = page, by design).
+///
+/// `metrics-exporter-prometheus` re-renders a gauge's last value on every
+/// `/metrics` scrape, so this one-shot `set(1.0)` keeps appearing while the
+/// process is alive (same pattern as the boot `tv_instrument_load_*` gauges)
+/// and goes MISSING only when the process exits — exactly the
+/// `treat_missing_data="breaching"` semantic the alarm needs. Boot is cold path,
+/// so a single gauge set is fine.
+fn emit_boot_completed() {
+    metrics::gauge!(BOOT_COMPLETED_METRIC).set(1.0);
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
@@ -2149,6 +2182,13 @@ async fn main() -> Result<()> {
         // which is exactly why ticks never persisted on AWS. No-op when
         // NOTIFY_SOCKET is unset (e.g. local `cargo run`).
         infra::notify_systemd_ready();
+
+        // Boot-completed CloudWatch signal (fast-boot / crash-recovery path).
+        // Emitted EXACTLY ONCE here, alongside the fast-boot `notify_systemd_ready()`,
+        // because this path returns into `run_shutdown_fast()` and never reaches
+        // the slow-boot emit at the end of `main()`. See `emit_boot_completed`
+        // for the full rationale (boot-heartbeat alarm pages on MISSING).
+        emit_boot_completed();
 
         // Boot-symmetry fix (2026-06-09): the post-market 15:31 cross-verify +
         // 15:31:30 EOD digest were slow-boot-only, so a mid-session crash restart
@@ -7339,6 +7379,14 @@ async fn start_dhan_lane(
 
     // C1: Notify systemd that boot is complete (no-op outside systemd).
     infra::notify_systemd_ready();
+
+    // Boot-completed CloudWatch signal (slow-boot / normal path). Emitted
+    // EXACTLY ONCE here, alongside `notify_systemd_ready()`, AFTER the
+    // boot-complete `if/else` block — so it fires for BOTH the under-budget and
+    // over-budget completed-boot cases, and NEVER on a halt (a halt uses
+    // `process::exit(...)` / `bail!`/`?`, none of which reach this line).
+    // See `emit_boot_completed` for the alarm semantics.
+    emit_boot_completed();
 
     // -----------------------------------------------------------------------
     // Step 12b: Background periodic health check (disk space + memory RSS + spill + QuestDB)

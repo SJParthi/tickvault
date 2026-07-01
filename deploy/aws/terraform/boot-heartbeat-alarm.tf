@@ -17,26 +17,34 @@
 #   is RUNNING at 08:45 IST, but NOT that the *app* booted. This file closes that
 #   exact gap.
 #
-# HONEST SIGNAL CHOICE — NO PHANTOM METRIC (evidence-backed):
-#   §19 names `tv_boot_completed`. That metric does NOT exist: it is published
-#   by NO Rust code (grep crates/app/src is empty) and is NOT in the CloudWatch
-#   agent's metric_declaration filter (user-data.sh.tftpl emf_processor — only
-#   18 tv_* metrics are scraped). Alarming on it would be a FALSE-OK (an alarm
-#   that can never fire). So this alarm uses the BEST signal that IS already in
-#   CloudWatch and is a genuine "app fully booted and alive" proof:
+# HONEST SIGNAL CHOICE — THE DEDICATED BOOT METRIC (the #1278 follow-up, now done):
+#   §19 names `tv_boot_completed`. As of this PR that metric IS REAL: it is set to
+#   1.0 by `crates/app/src/main.rs::emit_boot_completed()` at BOTH boot-completion
+#   points (fast-boot crash-recovery + slow-boot normal), each reached ONLY after
+#   every boot gate has passed — a halt uses `process::exit(...)` / `bail!`/`?`,
+#   none of which reach the emit, so a wedged/halted boot NEVER publishes it. It is
+#   in the CloudWatch-agent metric_declaration filter (user-data.sh.tftpl
+#   emf_processor). So this alarm now pages on the IDEAL signal:
 #
-#     tv_realtime_guarantee_score
+#     tv_boot_completed
 #
-#   It is emitted ONLY by the post-boot SLO loop (crates/app/src/main.rs ~L6814,
-#   a tokio task spawned after config load + the SLO feature gate), every 10s,
-#   and it IS in the metric filter + has its own alarm (realtime_guarantee_critical
-#   in app-alarms.tf). If the app never reaches steady state (hung CSV build, OOM,
-#   wedged Docker), this gauge is NEVER published -> the metric is MISSING.
+#   `metrics-exporter-prometheus` re-renders a gauge's last value on every scrape,
+#   so the one-shot `set(1.0)` keeps appearing while the process is alive (same
+#   pattern as the boot `tv_instrument_load_*` gauges) and disappears only when the
+#   process exits. If the app never finishes booting (hung CSV build, OOM, wedged
+#   Docker) or dies, this gauge is NEVER published -> the metric is MISSING.
+#
+#   Unlike the previous PROXY (`tv_realtime_guarantee_score`, the post-boot SLO
+#   loop gated on the `realtime_guarantee_score` feature flag), this signal does
+#   NOT depend on any feature gate and means EXACTLY "a full boot finished" — a
+#   strictly more honest boot proof.
 #
 #   So: treat_missing_data = "breaching" -> MISSING data PAGES. That is the
 #   inverse of every other app alarm (which use notBreaching to avoid stale-
 #   firing while the box is stopped) and it is INTENTIONAL: a missing boot
-#   heartbeat is EXACTLY the condition we must page on.
+#   heartbeat is EXACTLY the condition we must page on. (LessThanThreshold /
+#   threshold=0 / statistic=Maximum: the 1.0 gauge never satisfies <0, so
+#   present=OK, missing=breaching — unchanged math, dedicated signal.)
 #
 # AVOIDING THE EVENING/WEEKEND FALSE-PAGE (the pager-fatigue trap the other
 # alarms explicitly dodge): a "breaching on missing" alarm left always-on would
@@ -48,27 +56,27 @@
 # nightly/weekend stop can never page. This mirrors the inline-Lambda pattern
 # already used in budget-guards.tf.
 #
-# FOLLOW-UP (cited, not blocking): the cleanest long-term signal is a dedicated
-# `tv_boot_completed` counter emitted once when the 15-step boot finishes, added
-# to the metric_declaration filter. That is a Rust + user-data change (out of
-# scope for this terraform/shell-only PR). Until then, tv_realtime_guarantee_score
-# is the honest, already-working proxy. See §19.
+# DONE (the PR #1278 follow-up): the dedicated `tv_boot_completed` gauge is now
+# emitted by crates/app/src/main.rs (both boot paths) and added to the CloudWatch
+# metric_declaration filter (user-data.sh.tftpl). This alarm has been repointed
+# from the old `tv_realtime_guarantee_score` proxy to that dedicated signal. See
+# §19.
 #
 # Cost: 1 alarm (inside the free-tier headroom noted in app-alarms.tf) + 1 tiny
 # Lambda at 2 invokes/weekday (~44/mo) — well within the Lambda free tier (₹0).
 # =============================================================================
 
 # ---------------------------------------------------------------------------
-# The boot-heartbeat alarm itself — pages when tv_realtime_guarantee_score is
-# MISSING (app hung / never booted). Actions gated to the boot window below.
+# The boot-heartbeat alarm itself — pages when tv_boot_completed is MISSING
+# (app hung / never booted). Actions gated to the boot window below.
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "boot_heartbeat_missing" {
   alarm_name        = "tv-${var.environment}-boot-heartbeat-missing"
-  alarm_description = "App boot heartbeat ABSENT — the post-boot health signal (tv_realtime_guarantee_score) has not been published. The 08:30 IST start brought up the instance but the app HUNG or never finished booting (wedged Docker, CSV-build outage, OOM during build). systemd TimeoutStartSec=infinity (PR #1275) means systemd will NOT restart it — operator action needed. See daily-universe-scope-expansion-2026-05-27.md §19. Check: SSM -> the box -> 'systemctl status tickvault' + 'docker ps' + the instrument-CSV-fetch logs (INSTR-FETCH-*)."
+  alarm_description = "App boot heartbeat ABSENT — the dedicated boot-completed signal (tv_boot_completed, set to 1 by crates/app/src/main.rs only when a full boot finishes) has not been published. The 08:30 IST start brought up the instance but the app HUNG or never finished booting (wedged Docker, CSV-build outage, OOM during build). systemd TimeoutStartSec=infinity (PR #1275) means systemd will NOT restart it — operator action needed. See daily-universe-scope-expansion-2026-05-27.md §19. Check: SSM -> the box -> 'systemctl status tickvault' + 'docker ps' + the instrument-CSV-fetch logs (INSTR-FETCH-*)."
 
   comparison_operator = "LessThanThreshold"
   evaluation_periods  = 2 # two missing 60s periods = ~2 min absent before paging
-  metric_name         = "tv_realtime_guarantee_score"
+  metric_name         = "tv_boot_completed"
   namespace           = local.app_namespace
   period              = 60
   statistic           = "Maximum"
@@ -229,6 +237,6 @@ resource "aws_lambda_permission" "tv_boot_heartbeat_close" {
 }
 
 output "boot_heartbeat_alarm_name" {
-  description = "Boot-heartbeat alarm (pages on a hung/never-booted app in the 08:50-09:10 IST window). Signal: tv_realtime_guarantee_score MISSING (treat_missing_data=breaching). FOLLOW-UP: emit a dedicated tv_boot_completed metric + add to the CW-agent filter (daily-universe-scope-expansion-2026-05-27.md §19)."
+  description = "Boot-heartbeat alarm (pages on a hung/never-booted app in the 08:50-09:10 IST window). Signal: the dedicated tv_boot_completed gauge MISSING (treat_missing_data=breaching) — emitted by crates/app/src/main.rs on a completed boot, in the CW-agent filter (daily-universe-scope-expansion-2026-05-27.md §19). Repointed off the tv_realtime_guarantee_score proxy (PR #1278 follow-up)."
   value       = aws_cloudwatch_metric_alarm.boot_heartbeat_missing.alarm_name
 }
