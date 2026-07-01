@@ -1766,6 +1766,10 @@ async fn main() -> Result<()> {
             // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
             let greeks_enricher = build_inline_greeks_enricher(&config, &subscription_plan);
 
+            // NT-15: seed the tick-gap detector with every subscribed SID so a
+            // never-ticking instrument becomes a first-tick black-hole signal.
+            seed_tick_gap_detector_from_plan(&subscription_plan);
+
             // O(1) EXEMPT: cold path — clone registry once for tick processor enrichment.
             let fast_registry = subscription_plan
                 .as_ref()
@@ -2497,6 +2501,15 @@ async fn main() -> Result<()> {
             // here would break the D2a one-liner ratchet for zero runtime gain.
             Err(StartLaneError::BootAbortClean) => return Ok(()),
             Err(StartLaneError::BootAbortErr(err)) => return Err(err),
+            // FTC-14: boot-ON WS-pool build failed — exit with an error chain
+            // (a pool we intended to build but couldn't is a real boot failure,
+            // not an offline mode). The runtime classify path emits DHAN-LANE-02
+            // for the runtime cold-start arm.
+            Err(StartLaneError::WsPoolSpawn) => {
+                return Err(anyhow::anyhow!(
+                    "DHAN-LANE-02: WebSocket main-feed pool build/spawn failed at boot"
+                ));
+            }
         }
     } else {
         // Dhan-OFF (Groww-only / no-feed): no Dhan lane. The shared infra built
@@ -4845,6 +4858,16 @@ enum StartLaneError {
     /// Instrument load failed at boot — the inline spine `return Err(err)`d
     /// (process exits with the error chain).
     BootAbortErr(anyhow::Error),
+    /// FTC-14 (audit 2026-07-01): the WebSocket main-feed pool build/spawn
+    /// FAILED on a day we intended to connect (`should_connect_ws == true`,
+    /// so the plan was present) — `create_websocket_pool` returned `None`
+    /// despite a valid plan. Previously this silently proceeded with no pool
+    /// (offline-blind); it now fails the cold-start so `classify_start_lane_
+    /// error` can emit `DHAN-LANE-02` with `stage='ws_pool'`, pointing the
+    /// operator at the correct (pool-spawn) runbook instead of the wrong
+    /// (`universe_build_failed`) one. The lane FSM returns to `Off` + the
+    /// bounded retry re-attempts.
+    WsPoolSpawn,
 }
 
 /// Cold-start the full Dhan lane (slow boot arm). See the module-level doc
@@ -5527,6 +5550,22 @@ async fn start_dhan_lane(
             tickvault_storage::oom_monitor::DEFAULT_CGROUP_V2_MEMORY_EVENTS_PATH,
         ));
 
+    // BP-08 (RESOURCE-01/02/03, 2026-07-01): supervised process-level resource
+    // early-warning monitor. Samples open fd count vs LimitNOFILE (RESOURCE-01),
+    // VmRSS vs cgroup memory.max (RESOURCE-02), and spill-dir free-percent
+    // (RESOURCE-03) every 60s; pages Critical/High at 80% (fd/RSS) / <20% free
+    // (spill) so the operator acts BEFORE exhaustion — distinct from the host-
+    // aggregate mem_used_high / disk_used_high alarms. Always-on (resource
+    // exhaustion at any hour is critical); non-Linux probes fail softly
+    // (tv_resource_monitor_probe_failed_total, no page, no panic). Supervised so
+    // a monitor panic respawns instead of vanishing (mirrors DISK-WATCHER-01).
+    let _resource_monitor_supervisor =
+        tickvault_storage::resource_monitor::spawn_supervised_resource_monitor(
+            tickvault_storage::resource_monitor::ResourceMonitorPaths::platform_defaults(
+                std::path::PathBuf::from("data/spill"),
+            ),
+        );
+
     // D2 Stage 2: `health_status` is now built ONCE in the hoisted
     // `build_shared_infra` prefix and destructured into `main()` scope above, so
     // the lane references the SAME Arc the API server + run-loop hold. The
@@ -5826,7 +5865,11 @@ async fn start_dhan_lane(
             Some(token_manager.clone()),
         ) {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
-            None => (None, None),
+            // FTC-14: we intended to connect (should_connect_ws == true ⇒ plan
+            // present), but the pool build/spawn failed. Fail the cold-start so
+            // it surfaces as DHAN-LANE-02 (stage=ws_pool), not a silent
+            // offline-blind proceed. The lane returns to Off + bounded retry.
+            None => return Err(StartLaneError::WsPoolSpawn),
         }
     } else if !is_trading && !is_mock_trading {
         info!("WebSocket pool skipped — non-trading day (no live market data to capture)");
@@ -6041,6 +6084,10 @@ async fn start_dhan_lane(
 
         // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
         let greeks_enricher = build_inline_greeks_enricher(config, &subscription_plan);
+
+        // NT-15: seed the tick-gap detector with every subscribed SID so a
+        // never-ticking instrument becomes a first-tick black-hole signal.
+        seed_tick_gap_detector_from_plan(&subscription_plan);
 
         // O(1) EXEMPT: cold path — clone registry once for tick processor enrichment.
         let slow_registry = subscription_plan
@@ -8134,11 +8181,11 @@ impl DhanLaneRuntimeContext {
 ///     the most common runtime cold-start failure class.
 ///   * `BootAbortErr` (instrument-load failed) maps to `DHAN-LANE-01`
 ///     (universe-build).
-/// `DHAN-LANE-02` (ws-pool-spawn) + `DHAN-LANE-04` (teardown-timeout) are
-/// emitted at their own dedicated sites (the pool-spawn split of
-/// `start_dhan_lane`'s return type is tracked for D2c; today pool-spawn
-/// failures surface inside `BootAbortErr` and are cross-linked from the
-/// `DHAN-LANE-01` runbook).
+///   * `WsPoolSpawn` (FTC-14) maps to `DHAN-LANE-02` (ws-pool-spawn) with
+///     `stage='ws_pool'` — a runtime WS-pool build/spawn failure on a
+///     connect-day now points the operator at the correct pool-spawn
+///     runbook instead of the wrong `universe_build_failed` one.
+/// `DHAN-LANE-04` (teardown-timeout) is emitted at its own dedicated site.
 #[must_use]
 fn classify_start_lane_error(
     err: &StartLaneError,
@@ -8158,6 +8205,12 @@ fn classify_start_lane_error(
             ErrorCode::DhanLane01UniverseBuildFailed,
             "universe_build_failed",
             "universe",
+        ),
+        // FTC-14: WS-pool build/spawn failed on a connect-day.
+        StartLaneError::WsPoolSpawn => (
+            ErrorCode::DhanLane02WsPoolSpawnFailed,
+            "ws_pool_spawn_failed",
+            "ws_pool",
         ),
     }
 }
@@ -8245,6 +8298,35 @@ fn should_abort_cold_start_on_disable(
 ) -> bool {
     use tickvault_api::feed_state::LaneState;
     !desired_on && matches!(lane_state, LaneState::Starting)
+}
+
+/// NT-15 (audit 2026-07-01): seed the global `TickGapDetector` with every
+/// subscribed instrument at boot so a SID that never ticks all session is
+/// still detectable as a per-SID cold black-hole (WS-GAP-06 /
+/// `tv_tick_gap_instruments_silent`), not silently masked by other SIDs that
+/// do tick. Insert-if-absent — never clobbers an entry a real tick already
+/// wrote. Cold path, called once per boot after the subscription plan exists.
+fn seed_tick_gap_detector_from_plan(plan: &Option<SubscriptionPlan>) {
+    let Some(plan) = plan else {
+        return;
+    };
+    let Some(detector) = tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
+    else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let mut seeded = 0u64;
+    // O(1) EXEMPT: cold-path boot seeding, one insert-if-absent per
+    // subscribed instrument (~universe size), never on the hot loop.
+    for inst in plan.registry.iter() {
+        detector.seed_subscribed(inst.security_id, inst.exchange_segment, now);
+        seeded += 1;
+    }
+    info!(
+        seeded,
+        "NT-15: seeded tick-gap detector with subscribed instruments — a \
+         never-ticking SID is now a first-tick black-hole signal"
+    );
 }
 
 /// Decide whether the runtime supervisor should SPAWN a fresh cold-start task
@@ -9854,10 +9936,22 @@ mod tests {
         assert_eq!(code.code_str(), "DHAN-LANE-01");
         assert_eq!(reason, "universe_build_failed");
         assert_eq!(stage, "universe");
+        // FTC-14: WsPoolSpawn (WS-pool build/spawn failed on a connect-day) ->
+        // DHAN-LANE-02 with stage='ws_pool' — the CORRECT pool-spawn runbook,
+        // not the wrong universe-build one.
+        let (code, reason, stage) = classify_start_lane_error(&StartLaneError::WsPoolSpawn);
+        assert_eq!(code, ErrorCode::DhanLane02WsPoolSpawnFailed);
+        assert_eq!(code.code_str(), "DHAN-LANE-02");
+        assert_eq!(reason, "ws_pool_spawn_failed");
+        assert_eq!(stage, "ws_pool");
         // Secret discipline: the reason discriminants are FIXED strings, never
         // the raw error body (e.g. an auth response). Assert they contain no
         // dynamic content.
-        for r in ["auth_or_gate_failed", "universe_build_failed"] {
+        for r in [
+            "auth_or_gate_failed",
+            "universe_build_failed",
+            "ws_pool_spawn_failed",
+        ] {
             assert!(
                 !r.contains("synthetic"),
                 "reason must be a fixed discriminant, not the body"

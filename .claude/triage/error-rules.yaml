@@ -1200,6 +1200,77 @@ rules:
       connection budget. Operator inspects live_instance_lock table
       and stops one of the instances immediately.
 
+  - name: proc-01-oom-kill-detected-escalate
+    match:
+      code: PROC-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-4-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      PROC-01 = an OOM kill was detected (cgroup-v2 memory.events
+      oom_kill incremented vs the boot baseline). Severity::Critical.
+      The killed process may be tickvault itself or a sidecar; operator
+      inspects `docker ps -a` restart counts + host memory pressure and
+      right-sizes the workload. Never auto-actioned.
+
+  - name: auth-gap-04-totp-rotated-externally-escalate
+    match:
+      code: AUTH-GAP-04
+    action: escalate
+    runbook_path: .claude/rules/project/wave-4-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      AUTH-GAP-04 = the login TOTP/2FA secret was rotated externally
+      (e.g. operator regenerated it via the dhan.co web UI without
+      updating SSM). Token generation exhausted TOTP_MAX_RETRIES.
+      Severity::Critical — auth is dead until the secret is reconciled.
+      Operator verifies /tickvault/<env>/dhan/totp-secret vs dhan.co and
+      re-registers the TOTP. Never auto-actioned.
+
+  - name: resource-01-fd-count-high-escalate
+    match:
+      code: RESOURCE-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-4-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      RESOURCE-01 = open file-descriptor count crossed the 80%
+      early-warning threshold of LimitNOFILE. A leaked WS / QuestDB
+      socket can exhaust the fd table with zero signal until connect()
+      fails; the operator inspects /proc/self/fd for the leak source
+      before exhaustion. Severity::High — pages, does not auto-fix.
+
+  - name: resource-02-resident-memory-high-escalate
+    match:
+      code: RESOURCE-02
+    action: escalate
+    runbook_path: .claude/rules/project/wave-4-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      RESOURCE-02 = process resident memory (VmRSS) crossed the 80%
+      early-warning threshold of the cgroup memory limit — the tickvault
+      process is approaching its ceiling before the OOM killer (PROC-01)
+      fires. Operator right-sizes the workload / investigates the leak.
+      Severity::High — pages, does not auto-fix.
+
+  - name: resource-03-spill-free-low-escalate
+    match:
+      code: RESOURCE-03
+    action: escalate
+    runbook_path: .claude/rules/project/wave-4-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      RESOURCE-03 = spill-directory free space dropped below the 20%
+      early-warning threshold — a process-level percent view distinct
+      from the host disk_used_high aggregate, so a fast-filling spill
+      dir is caught before the zero-loss chain is at risk. Operator
+      frees disk / restores QuestDB drain. Severity::High — pages.
+
   # -----------------------------------------------------------------------
   # Fan-out rules for high-frequency codes — bring rule_count up to
   # >= variant_count per `triage_rules_full_coverage_guard.rs::rule_count_matches_or_exceeds_variant_count`.

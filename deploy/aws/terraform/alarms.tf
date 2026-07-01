@@ -37,8 +37,16 @@ resource "aws_cloudwatch_metric_alarm" "instance_status_check" {
     InstanceId = aws_instance.tv_app.id
   }
 
-  alarm_actions = [aws_sns_topic.tv_alerts.arn]
-  ok_actions    = [aws_sns_topic.tv_alerts.arn]
+  # BP-14 (audit 2026-07-01): a failed INSTANCE status check (hung OS / stuck
+  # instance) is best cleared by a reboot, so add the EC2 auto-`reboot` action
+  # ALONGSIDE the SNS page — the box self-heals a soft hang during market
+  # hours instead of only paging. autopilot only handles a cleanly-stopped
+  # box, not a status-impaired running one.
+  alarm_actions = [
+    aws_sns_topic.tv_alerts.arn,
+    "arn:aws:automate:${var.aws_region}:ec2:reboot",
+  ]
+  ok_actions = [aws_sns_topic.tv_alerts.arn]
 }
 
 # ---------------------------------------------------------------------------
@@ -58,14 +66,22 @@ resource "aws_cloudwatch_metric_alarm" "system_status_check" {
   period              = 60
   statistic           = "Maximum"
   threshold           = 0
-  alarm_description   = "AWS System Check failed — requires reboot to trigger underlying-host move. See DR runbook §5."
+  alarm_description   = "AWS System Check failed — requires recover to trigger underlying-host move. See DR runbook §5."
   treat_missing_data  = "notBreaching"
 
   dimensions = {
     InstanceId = aws_instance.tv_app.id
   }
 
-  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  # BP-14 (audit 2026-07-01): a failed SYSTEM status check is an AWS
+  # hardware/host fault — the correct auto-remediation is EC2 `recover`, which
+  # migrates the instance to healthy underlying hardware (EBS-backed, same
+  # instance-id, same private IP + EIP). Add it ALONGSIDE the SNS page so a
+  # hardware fault during market hours self-migrates instead of only paging.
+  alarm_actions = [
+    aws_sns_topic.tv_alerts.arn,
+    "arn:aws:automate:${var.aws_region}:ec2:recover",
+  ]
 }
 
 # ---------------------------------------------------------------------------

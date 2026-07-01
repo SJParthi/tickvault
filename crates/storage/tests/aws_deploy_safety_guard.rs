@@ -260,6 +260,41 @@ fn deploy_disk_used_alarm_exists() {
     );
 }
 
+const ALARMS_TF: &str = "deploy/aws/terraform/alarms.tf";
+
+/// BP-14 (audit 2026-07-01): the EC2 status-check alarms MUST carry an EC2
+/// auto-remediation action ALONGSIDE the SNS page, so a hardware/host fault or
+/// a soft OS hang during market hours self-heals instead of only paging.
+/// autopilot only handles a cleanly-stopped box, not a status-impaired running
+/// one. System check → `recover` (host migrate); Instance check → `reboot`.
+#[test]
+fn deploy_status_check_alarms_have_auto_recover_action() {
+    let body = code_only(&read(ALARMS_TF));
+    let squished = squish(&body);
+    // System status check → EC2 recover (migrate to healthy hardware).
+    assert!(
+        squished.contains("ec2:recover"),
+        "alarms.tf system_status_check must add an `arn:aws:automate:...:ec2:recover` \
+         action so an AWS hardware fault self-migrates the box, not just pages."
+    );
+    // Instance status check → EC2 reboot (clear a hung OS).
+    assert!(
+        squished.contains("ec2:reboot"),
+        "alarms.tf instance_status_check must add an `arn:aws:automate:...:ec2:reboot` \
+         action so a hung instance self-heals, not just pages."
+    );
+    // The auto-action must be region-parameterized, not a hardcoded region.
+    assert!(
+        squished.contains("arn:aws:automate:${var.aws_region}:ec2:recover"),
+        "the recover action must use ${{var.aws_region}}, not a hardcoded region."
+    );
+    // SNS page must still be present (the auto-action is ADDITIVE, not a replace).
+    assert!(
+        squished.contains("aws_sns_topic.tv_alerts.arn"),
+        "the SNS Telegram/SMS page must remain alongside the EC2 auto-action."
+    );
+}
+
 const HOLIDAY_GATE_SH: &str = "deploy/aws/holiday-gate.sh";
 const HOLIDAY_GATE_UNIT: &str = "deploy/systemd/tickvault-holiday-gate.service";
 const USER_DATA_TFTPL: &str = "deploy/aws/terraform/user-data.sh.tftpl";
