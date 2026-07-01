@@ -72,9 +72,37 @@ pub enum IpCheckResult {
     CheckFailed { reason: String },
 }
 
+/// AUTH-P13 (audit 2026-07-01): number of CONSECUTIVE `CheckFailed`
+/// outcomes (both the primary AND the fallback IP-echo endpoint failed)
+/// after which the monitor escalates from `warn!` to a CRITICAL
+/// stranded-box reachability alert.
+///
+/// A single `CheckFailed` is a benign network blip (retry next interval);
+/// but N in a row — with BOTH echo endpoints unreachable — means the box
+/// has likely lost its public route entirely (e.g. a detached Elastic IP),
+/// which ALSO silently breaks SSM token renewal and the Dhan feed. The
+/// escalation makes a stranded box distinguishable from a blip. At the
+/// default 300s check interval, 3 consecutive failures = ~15 minutes of
+/// sustained no-route before paging — long enough to rule out a transient
+/// upstream echo-service outage, short enough to act within a session.
+pub const IP_CHECK_FAILED_ESCALATION_STREAK: u32 = 3;
+
 // ---------------------------------------------------------------------------
 // Core Logic (pure, testable)
 // ---------------------------------------------------------------------------
+
+/// AUTH-P13: decide whether a run of consecutive IP-echo `CheckFailed`
+/// outcomes should ESCALATE to a CRITICAL stranded-box alert this tick.
+///
+/// Edge-triggered: returns `true` ONLY when the streak crosses the
+/// threshold exactly (`streak == IP_CHECK_FAILED_ESCALATION_STREAK`), so a
+/// sustained outage pages once, not on every subsequent poll. A recovered
+/// check resets the streak to 0 (caller's responsibility), after which a
+/// fresh outage can escalate again. Pure function for a truth-table test.
+#[must_use]
+pub const fn should_escalate_ip_check_streak(consecutive_failures: u32) -> bool {
+    consecutive_failures == IP_CHECK_FAILED_ESCALATION_STREAK
+}
 
 /// Compares an actual IP with the expected IP.
 ///
@@ -145,6 +173,10 @@ pub fn spawn_ip_monitor(
         let interval = Duration::from_secs(config.check_interval_secs);
         let timeout = Duration::from_secs(PUBLIC_IP_CHECK_TIMEOUT_SECS);
 
+        // AUTH-P13: run of consecutive `CheckFailed` outcomes (both echo
+        // endpoints unreachable). Reset on any Match / Mismatch.
+        let mut consecutive_check_failures: u32 = 0;
+
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
@@ -158,12 +190,14 @@ pub fn spawn_ip_monitor(
 
             match &result {
                 IpCheckResult::Match => {
+                    consecutive_check_failures = 0;
                     info!(
                         expected = %mask_ip(&config.expected_ip),
                         "GAP-NET-01: IP check passed"
                     );
                 }
                 IpCheckResult::Mismatch { expected, actual } => {
+                    consecutive_check_failures = 0;
                     // GAP-NET-01: CRITICAL alert — IP has changed
                     error!(
                         code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
@@ -178,10 +212,37 @@ pub fn spawn_ip_monitor(
                     _ = tx.send(true);
                 }
                 IpCheckResult::CheckFailed { reason } => {
-                    warn!(
-                        %reason,
-                        "GAP-NET-01: IP check failed (transient) — will retry next interval"
-                    );
+                    consecutive_check_failures = consecutive_check_failures.saturating_add(1);
+                    metrics::gauge!("tv_ip_monitor_check_failed_streak")
+                        .set(f64::from(consecutive_check_failures));
+                    if should_escalate_ip_check_streak(consecutive_check_failures) {
+                        // AUTH-P13: BOTH echo endpoints unreachable for
+                        // IP_CHECK_FAILED_ESCALATION_STREAK consecutive checks —
+                        // the box has likely lost its public route entirely (e.g.
+                        // detached Elastic IP), which ALSO silently breaks SSM
+                        // token renewal + the Dhan feed. Escalate to CRITICAL so
+                        // a stranded box is distinguishable from a benign blip.
+                        // Edge-triggered (fires once at the threshold, not every
+                        // subsequent poll).
+                        error!(
+                            code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
+                            severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
+                                .severity()
+                                .as_str(),
+                            consecutive_failures = consecutive_check_failures,
+                            %reason,
+                            "GAP-NET-01: CRITICAL — public IP unreachable for \
+                             {consecutive_check_failures} consecutive checks (both echo \
+                             endpoints failed). Box may have lost its fixed IP — SSM \
+                             renewal + Dhan feed are at risk. Re-associate the Elastic IP."
+                        );
+                    } else {
+                        warn!(
+                            %reason,
+                            consecutive_failures = consecutive_check_failures,
+                            "GAP-NET-01: IP check failed (transient) — will retry next interval"
+                        );
+                    }
                 }
             }
         }
@@ -251,6 +312,49 @@ async fn fetch_ip(url: &str, timeout: Duration) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // AUTH-P13 — should_escalate_ip_check_streak (pure, truth table)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ip_check_streak_below_threshold_does_not_escalate() {
+        // A single (or few) consecutive CheckFailed is a benign blip.
+        for streak in 0..IP_CHECK_FAILED_ESCALATION_STREAK {
+            assert!(
+                !should_escalate_ip_check_streak(streak),
+                "streak {streak} below threshold must NOT escalate"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ip_check_streak_at_threshold_escalates_once() {
+        // Edge-triggered: fires exactly at the threshold.
+        assert!(should_escalate_ip_check_streak(
+            IP_CHECK_FAILED_ESCALATION_STREAK
+        ));
+    }
+
+    #[test]
+    fn test_ip_check_streak_above_threshold_does_not_re_escalate() {
+        // Past the threshold the sustained outage must NOT page again on
+        // every poll (edge-triggered, not level-triggered — audit Rule 4).
+        assert!(!should_escalate_ip_check_streak(
+            IP_CHECK_FAILED_ESCALATION_STREAK + 1
+        ));
+        assert!(!should_escalate_ip_check_streak(
+            IP_CHECK_FAILED_ESCALATION_STREAK + 10
+        ));
+    }
+
+    #[test]
+    fn test_ip_check_streak_threshold_is_sane() {
+        // A meaningful runway: not 1 (too jumpy on a single blip),
+        // not absurdly large (would never page a truly stranded box).
+        assert!(IP_CHECK_FAILED_ESCALATION_STREAK >= 2);
+        assert!(IP_CHECK_FAILED_ESCALATION_STREAK <= 10);
+    }
 
     // -----------------------------------------------------------------------
     // compare_ips — pure function
