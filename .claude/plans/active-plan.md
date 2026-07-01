@@ -1,11 +1,24 @@
-# Implementation Plan: Downgrade the boot docker-compose-up CRITICAL to non-fatal when the required service (QuestDB) is already healthy
+# Implementation Plan: Gate the boot docker-compose-up CRITICAL on QuestDB health + drop a useless u64 conversion (consolidated boot/CI hardening)
 
 **Status:** APPROVED
 **Date:** 2026-07-01
 **Approved by:** Parthiban (operator) — false-CRITICAL hardening surfaced by the 2026-07-01
 prod boot re-check (`scratchpad/verify-boot.md` GAP-B: 11:09 IST crash-recovery boot fired
 `docker compose up failed after 5 attempts → Telegram CRITICAL` while QuestDB was already up
-and the app ran healthily). Standing approval for the alerting-hole hardening queue.
+and the app ran healthily). Standing approval for the alerting-hole hardening queue. This
+single consolidated PR combines that `tickvault-app` boot fix with a trivial `tickvault-core`
+clippy cleanup (drop a useless `u64::from` on an already-`u64` `security_id`) per the operator's
+fewer-bigger-PRs preference.
+
+## Included change 2 (trivial): drop useless `u64::from(security_id)` in `tickvault-core`
+
+`crates/core/src/pipeline/tick_processor.rs::TickDedupRing` computes the FNV-1a dedup hash.
+After the `security_id` u32→u64 widening, `security_id` is already `u64`, so `h ^= u64::from(security_id)`
+is a useless same-type conversion (clippy `useless_conversion`). Changed to `h ^= security_id`.
+NO logic change — the hash value, the dedup key, and every downstream behaviour are byte-identical;
+`u64::from(x: u64)` is the identity. This clears a clippy warning that would otherwise fail the
+`clippy -D warnings` CI gate. Rollback = revert the one-line hunk. No new tests needed (the existing
+`TickDedupRing` dedup tests already exercise the hash; the change is provably behaviour-preserving).
 
 ## Design
 
@@ -69,6 +82,9 @@ the reason. This does NOT suppress a real compose failure where the service is d
 - [x] Rewire the `!compose_succeeded` branch (infra.rs:216-222) to probe QuestDB + route via the pure fn (warn Low vs error CRITICAL); increment `tv_boot_compose_recreate_degraded_total` on the degraded path
   - Files: crates/app/src/infra.rs
   - Tests: (covered by the pure-function truth table above)
+- [x] Drop the useless `u64::from(security_id)` in the FNV-1a dedup hash (already-`u64` after the widening) — clippy `useless_conversion` cleanup, behaviour-preserving
+  - Files: crates/core/src/pipeline/tick_processor.rs
+  - Tests: (behaviour-preserving identity conversion; existing `TickDedupRing` dedup tests cover the hash)
 
 ## Scenarios
 
@@ -77,3 +93,4 @@ the reason. This does NOT suppress a real compose failure where the service is d
 | 1 | compose-up OK first try | info, health probe runs, no change |
 | 2 | compose-up fails 5×, QuestDB reachable (11:09 case) | warn Low, counter++, boot continues, NO page |
 | 3 | compose-up fails 5×, QuestDB unreachable | error CRITICAL, page fires (real outage) |
+| 4 | `tickvault-core` dedup hash with `u64` `security_id` | identical hash; clippy clean; `cargo check -p tickvault-core` green |
