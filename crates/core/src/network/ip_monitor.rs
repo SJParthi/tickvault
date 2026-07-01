@@ -250,6 +250,10 @@ pub fn spawn_ip_monitor(
         let interval = Duration::from_secs(config.check_interval_secs);
         let timeout = Duration::from_secs(PUBLIC_IP_CHECK_TIMEOUT_SECS);
 
+        // AUTH-P12: confirm-twice debounce. A single transient mismatch must
+        // never act — only a sustained wrong IP across `confirm_threshold`
+        // consecutive poll cycles does.
+        let mut consecutive_mismatches: u32 = 0;
         // AUTH-P13: run of consecutive `CheckFailed` outcomes (both echo
         // endpoints unreachable). Reset on any Match / Mismatch.
         let mut consecutive_check_failures: u32 = 0;
@@ -267,28 +271,23 @@ pub fn spawn_ip_monitor(
 
             match &result {
                 IpCheckResult::Match => {
+                    // Recovery / steady state — reset the debounce counter so
+                    // the next mismatch episode starts fresh (edge-triggered).
+                    consecutive_mismatches = 0;
                     consecutive_check_failures = 0;
                     info!(
                         expected = %mask_ip(&config.expected_ip),
                         "GAP-NET-01: IP check passed"
                     );
                 }
-                IpCheckResult::Mismatch { expected, actual } => {
-                    consecutive_check_failures = 0;
-                    // GAP-NET-01: CRITICAL alert — IP has changed
-                    error!(
-                        code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
-                        severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
-                            .severity()
-                            .as_str(),
-                        expected = %mask_ip(expected),
-                        actual = %mask_ip(actual),
-                        "GAP-NET-01: CRITICAL — IP MISMATCH DETECTED. \
-                         Dhan API calls will be rejected from wrong IP. Trading should halt."
-                    );
-                    _ = tx.send(true);
-                }
                 IpCheckResult::CheckFailed { reason } => {
+                    // AUTH-P12: a fetch blip must never confirm a mismatch, so
+                    // reset the mismatch debounce counter on any CheckFailed.
+                    consecutive_mismatches = 0;
+                    // AUTH-P13: track a run of consecutive `CheckFailed`s (both
+                    // echo endpoints unreachable) and escalate to CRITICAL once
+                    // it crosses the streak threshold — a stranded box (e.g. a
+                    // fully-detached Elastic IP) that also breaks SSM + the feed.
                     consecutive_check_failures = consecutive_check_failures.saturating_add(1);
                     metrics::gauge!("tv_ip_monitor_check_failed_streak")
                         .set(f64::from(consecutive_check_failures));
@@ -322,6 +321,9 @@ pub fn spawn_ip_monitor(
                     }
                 }
                 IpCheckResult::Mismatch { expected, actual } => {
+                    // AUTH-P13: a real mismatch means the echo endpoints ARE
+                    // reachable — reset the CheckFailed streak.
+                    consecutive_check_failures = 0;
                     consecutive_mismatches = consecutive_mismatches.saturating_add(1);
                     let action = decide_ip_action(
                         consecutive_mismatches,
