@@ -577,9 +577,15 @@ fn test_aws_autopilot_selfheal_workflow_exists() {
         sh.contains("associate-address"),
         "autopilot must auto-re-associate the Elastic IP (operator: 'configure static elastic IP')"
     );
+    // BP-09 (2026-07-01): a bare `systemctl restart` is a NO-OP on a
+    // StartLimit-`failed` unit (a Dhan-RST crash-loop trips this), so the
+    // script now `reset-failed`s to clear the latched start-limit BEFORE
+    // `start` — recovering both a plain enabled-but-inactive unit AND a
+    // stuck `failed` crash-loop with one path. The auto-restart intent is
+    // preserved; the mechanism is `reset-failed` + `start`, not `restart`.
     assert!(
-        sh.contains("systemctl restart tickvault"),
-        "autopilot must auto-restart the app"
+        sh.contains("systemctl reset-failed tickvault") && sh.contains("systemctl start tickvault"),
+        "autopilot must auto-restart the app (reset-failed to clear any crash-loop start-limit, then start)"
     );
     assert!(
         sh.contains("start-instances"),
