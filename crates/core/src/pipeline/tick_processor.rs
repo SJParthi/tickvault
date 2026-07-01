@@ -18,7 +18,8 @@ use crate::parser::dispatch_frame;
 use crate::parser::types::ParsedFrame;
 use tickvault_common::constants::{
     DEDUP_RING_BUFFER_POWER, IST_UTC_OFFSET_SECONDS, MINIMUM_VALID_EXCHANGE_TIMESTAMP,
-    SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST, TICK_PERSIST_START_SECS_OF_DAY_IST,
+    MUHURAT_PERSIST_END_SECS_OF_DAY_IST, MUHURAT_PERSIST_START_SECS_OF_DAY_IST, SECONDS_PER_DAY,
+    TICK_PERSIST_END_SECS_OF_DAY_IST, TICK_PERSIST_START_SECS_OF_DAY_IST,
     WS_GRACE_AFTER_CLOSE_SECS_U32,
 };
 use tickvault_common::tick_types::{GreeksEnricher, ParsedTick};
@@ -102,25 +103,43 @@ const CANARY_UNDERLYINGS: &[(u64, &str)] = &[(13, "NIFTY"), (25, "BANKNIFTY"), (
 // O(1) Market Hours Persist Window
 // ---------------------------------------------------------------------------
 
-/// Returns `true` if the exchange timestamp falls within [09:00, 15:30) IST.
+/// Returns `true` if the exchange timestamp falls within the regular
+/// `[09:00, 15:30)` IST window, OR — when `muhurat_active` is `true` — inside
+/// the Muhurat evening window `[18:00, 19:30)` IST.
 ///
-/// Only ticks inside this window are persisted to QuestDB. Pre-market and
-/// post-market ticks still flow through broadcast and candle aggregation.
+/// Only ticks inside the accepted window are persisted to QuestDB. Pre-market
+/// and post-market ticks still flow through broadcast and candle aggregation.
+///
+/// # CCL-06 (Muhurat)
+/// On a Diwali Muhurat date the live feed connects but the evening session runs
+/// ~18:00–19:30 IST, entirely OUTSIDE the regular window. `muhurat_active` is
+/// the boot-computed [`tickvault_common::muhurat`] flag; it is `false` on every
+/// trading/mock day, so the accepted set is then EXACTLY `[09:00, 15:30)` — the
+/// regular behaviour is byte-for-byte unchanged. The Muhurat range is purely
+/// ADDITIVE (disjoint from + after the regular range, pinned by a compile-time
+/// assert in `constants.rs`), so it can never narrow the regular window.
 ///
 /// # Algorithm (O(1), zero allocation)
 /// 1. Dhan WebSocket sends exchange_timestamp as IST epoch seconds (already adjusted).
 /// 2. Modulo 86,400 → seconds-of-day in IST directly.
-/// 3. Range check: `[TICK_PERSIST_START, TICK_PERSIST_END)`.
+/// 3. Range check: `[TICK_PERSIST_START, TICK_PERSIST_END)`, plus the Muhurat
+///    range when active.
 ///
 /// # Performance
-/// 1 modulo + 2 comparisons. No branching beyond the range check.
+/// 1 modulo + 2–4 comparisons. No branching beyond the range checks.
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: modulo by 86400 is safe
 #[inline(always)]
-fn is_within_persist_window(exchange_timestamp: u32) -> bool {
+fn is_within_persist_window(exchange_timestamp: u32, muhurat_active: bool) -> bool {
     // exchange_timestamp is already IST epoch seconds — no offset needed.
     let ist_secs_of_day = exchange_timestamp % SECONDS_PER_DAY;
-    (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
+    if (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
         .contains(&ist_secs_of_day)
+    {
+        return true;
+    }
+    muhurat_active
+        && (MUHURAT_PERSIST_START_SECS_OF_DAY_IST..MUHURAT_PERSIST_END_SECS_OF_DAY_IST)
+            .contains(&ist_secs_of_day)
 }
 
 /// Returns `true` if the exchange timestamp's IST day matches today.
@@ -371,10 +390,18 @@ fn current_received_at_nanos() -> i64 {
 /// NOT reject it on the basis of skew alone — that would drop
 /// legitimate ticks during a one-off correction).
 ///
-/// O(1) — reuses `utc_nanos_to_ist_secs_of_day` + 1 range check + 1
+/// ## CCL-06 (Muhurat)
+///
+/// When `muhurat_active` is `true`, the accepted set additionally includes the
+/// Muhurat evening window `[18:00, 19:30)` IST (no grace tail — 19:30 is already
+/// a generous superset upper bound). `muhurat_active` is `false` on every
+/// trading/mock day, so the accepted set is then EXACTLY `[09:00, 15:31)` — the
+/// regular behaviour is byte-for-byte unchanged.
+///
+/// O(1) — reuses `utc_nanos_to_ist_secs_of_day` + 1–2 range checks + 1
 /// relaxed atomic load + 1 CAS on rising edge.
 #[inline(always)]
-fn is_wall_clock_within_persist_window(received_at_nanos: i64) -> bool {
+fn is_wall_clock_within_persist_window(received_at_nanos: i64, muhurat_active: bool) -> bool {
     // I-P1-AUDIT-11: clock-skew monitor.
     use std::sync::atomic::Ordering;
     let prev_max = MAX_WALL_CLOCK_SEEN_NANOS.load(Ordering::Relaxed);
@@ -407,7 +434,14 @@ fn is_wall_clock_within_persist_window(received_at_nanos: i64) -> bool {
     // wrongly rejected.
     let grace_upper_bound =
         TICK_PERSIST_END_SECS_OF_DAY_IST.saturating_add(WS_GRACE_AFTER_CLOSE_SECS_U32);
-    (TICK_PERSIST_START_SECS_OF_DAY_IST..grace_upper_bound).contains(&wall_clock_ist_secs_of_day)
+    if (TICK_PERSIST_START_SECS_OF_DAY_IST..grace_upper_bound).contains(&wall_clock_ist_secs_of_day)
+    {
+        return true;
+    }
+    // CCL-06: additive Muhurat evening window when today is a Muhurat session.
+    muhurat_active
+        && (MUHURAT_PERSIST_START_SECS_OF_DAY_IST..MUHURAT_PERSIST_END_SECS_OF_DAY_IST)
+            .contains(&wall_clock_ist_secs_of_day)
 }
 
 /// Selects the depth timestamp: exchange_timestamp if valid, else wall-clock.
@@ -918,6 +952,15 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     m_channel_capacity.set(frame_receiver.max_capacity() as f64);
     info!(today_ist_day_number, "tick processor started");
 
+    // CCL-06: read the boot-computed Muhurat-session flag ONCE, before the hot
+    // loop (O(1), zero-alloc, `bool` Copy — mirrors the `always_on` set read).
+    // `false` on every trading/mock day (and any test that never boots the
+    // calendar), so the persist gates stay byte-for-byte identical to today;
+    // `true` only on a Diwali Muhurat date, when the evening [18:00, 19:30) IST
+    // window is additionally accepted so those ticks are persisted instead of
+    // silently dropped.
+    let muhurat_active = tickvault_common::muhurat::current();
+
     // PR #288: segment-aware sequence tracker (I-P1-11 compliant). Replaces
     // the previous `HashMap<(u32, u8), u32>` which keyed on security_id
     // alone — that was subject to the cross-segment collision bug where a
@@ -1143,7 +1186,9 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 // O(1): one lookup of a tiny boot-set set (usually ≤1 entry).
                 let window_exempt =
                     is_window_exempt(&always_on, tick.security_id, tick.exchange_segment_code);
-                if !window_exempt && !is_within_persist_window(tick.exchange_timestamp) {
+                if !window_exempt
+                    && !is_within_persist_window(tick.exchange_timestamp, muhurat_active)
+                {
                     // Phase 0 Item 12 (2026-05-17) — `last_tick_audit` LATE-TICK
                     // anomaly path. Before dropping the tick, if its
                     // `exchange_timestamp` stamps at or after the session
@@ -1166,7 +1211,9 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 // outside market hours (post-market data has valid exchange_timestamp
                 // from today's session but arrives after 15:30 IST).
                 // §30: always-on instruments (GIFT Nifty) are exempt here too.
-                if !window_exempt && !is_wall_clock_within_persist_window(tick.received_at_nanos) {
+                if !window_exempt
+                    && !is_wall_clock_within_persist_window(tick.received_at_nanos, muhurat_active)
+                {
                     outside_hours_filtered = outside_hours_filtered.saturating_add(1);
                     m_outside_hours.increment(1);
                     continue;
@@ -1415,7 +1462,9 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     // is not silently dropped ~16 h/day.
                     let window_exempt =
                         is_window_exempt(&always_on, tick.security_id, tick.exchange_segment_code);
-                    if !window_exempt && !is_within_persist_window(tick.exchange_timestamp) {
+                    if !window_exempt
+                        && !is_within_persist_window(tick.exchange_timestamp, muhurat_active)
+                    {
                         outside_hours_filtered = outside_hours_filtered.saturating_add(1);
                         m_outside_hours.increment(1);
                         continue;
@@ -1423,7 +1472,10 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     // Wall-clock guard: reject stale WebSocket snapshots received
                     // outside market hours (same as Ticker/Quote path above).
                     if !window_exempt
-                        && !is_wall_clock_within_persist_window(tick.received_at_nanos)
+                        && !is_wall_clock_within_persist_window(
+                            tick.received_at_nanos,
+                            muhurat_active,
+                        )
                     {
                         outside_hours_filtered = outside_hours_filtered.saturating_add(1);
                         m_outside_hours.increment(1);
@@ -1552,7 +1604,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     m_stale_day.increment(1);
                     continue;
                 }
-                if !is_within_persist_window(depth_ts_secs) {
+                if !is_within_persist_window(depth_ts_secs, muhurat_active) {
                     outside_hours_filtered = outside_hours_filtered.saturating_add(1);
                     m_outside_hours.increment(1);
                     continue;
@@ -1564,7 +1616,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 // (server-side replay / buffer). Without this guard the
                 // stale packet pollutes `market_depth` table. Same guard
                 // shape used by ticks.
-                if !is_wall_clock_within_persist_window(tick.received_at_nanos) {
+                if !is_wall_clock_within_persist_window(tick.received_at_nanos, muhurat_active) {
                     outside_hours_filtered = outside_hours_filtered.saturating_add(1);
                     m_outside_hours.increment(1);
                     continue;
@@ -3582,55 +3634,100 @@ mod tests {
     #[test]
     fn test_persist_window_market_open_boundary() {
         // 09:00:00 IST = first second of the window (inclusive)
-        assert!(is_within_persist_window(ist_hms_to_ist_epoch(9, 0, 0)));
+        assert!(is_within_persist_window(
+            ist_hms_to_ist_epoch(9, 0, 0),
+            false
+        ));
         // 09:00:01 IST = well within window
-        assert!(is_within_persist_window(ist_hms_to_ist_epoch(9, 0, 1)));
+        assert!(is_within_persist_window(
+            ist_hms_to_ist_epoch(9, 0, 1),
+            false
+        ));
     }
 
     #[test]
     fn test_persist_window_market_close_boundary() {
         // 15:29:59 IST = last second of the window (inclusive)
-        assert!(is_within_persist_window(ist_hms_to_ist_epoch(15, 29, 59)));
+        assert!(is_within_persist_window(
+            ist_hms_to_ist_epoch(15, 29, 59),
+            false
+        ));
         // 15:30:00 IST = first second outside the window (exclusive)
-        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(15, 30, 0)));
+        assert!(!is_within_persist_window(
+            ist_hms_to_ist_epoch(15, 30, 0),
+            false
+        ));
         // 15:30:01 IST = outside
-        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(15, 30, 1)));
+        assert!(!is_within_persist_window(
+            ist_hms_to_ist_epoch(15, 30, 1),
+            false
+        ));
     }
 
     #[test]
     fn test_persist_window_pre_market_rejected() {
         // 08:59:59 IST = one second before window
-        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(8, 59, 59)));
+        assert!(!is_within_persist_window(
+            ist_hms_to_ist_epoch(8, 59, 59),
+            false
+        ));
         // 08:00:00 IST = well before market
-        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(8, 0, 0)));
+        assert!(!is_within_persist_window(
+            ist_hms_to_ist_epoch(8, 0, 0),
+            false
+        ));
         // 06:00:00 IST = early morning
-        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(6, 0, 0)));
+        assert!(!is_within_persist_window(
+            ist_hms_to_ist_epoch(6, 0, 0),
+            false
+        ));
     }
 
     #[test]
     fn test_persist_window_post_market_rejected() {
         // 16:00:00 IST = post-market
-        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(16, 0, 0)));
+        assert!(!is_within_persist_window(
+            ist_hms_to_ist_epoch(16, 0, 0),
+            false
+        ));
         // 20:00:00 IST = evening
-        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(20, 0, 0)));
+        assert!(!is_within_persist_window(
+            ist_hms_to_ist_epoch(20, 0, 0),
+            false
+        ));
     }
 
     #[test]
     fn test_persist_window_midnight_rejected() {
         // 00:00:00 IST = midnight
-        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(0, 0, 0)));
+        assert!(!is_within_persist_window(
+            ist_hms_to_ist_epoch(0, 0, 0),
+            false
+        ));
         // 23:59:59 IST = end of day
-        assert!(!is_within_persist_window(ist_hms_to_ist_epoch(23, 59, 59)));
+        assert!(!is_within_persist_window(
+            ist_hms_to_ist_epoch(23, 59, 59),
+            false
+        ));
     }
 
     #[test]
     fn test_persist_window_mid_session() {
         // 12:00:00 IST = mid-session
-        assert!(is_within_persist_window(ist_hms_to_ist_epoch(12, 0, 0)));
+        assert!(is_within_persist_window(
+            ist_hms_to_ist_epoch(12, 0, 0),
+            false
+        ));
         // 09:15:00 IST = continuous trading start (within persist window [09:00, 15:30))
-        assert!(is_within_persist_window(ist_hms_to_ist_epoch(9, 15, 0)));
+        assert!(is_within_persist_window(
+            ist_hms_to_ist_epoch(9, 15, 0),
+            false
+        ));
         // 15:15:00 IST = near close
-        assert!(is_within_persist_window(ist_hms_to_ist_epoch(15, 15, 0)));
+        assert!(is_within_persist_window(
+            ist_hms_to_ist_epoch(15, 15, 0),
+            false
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -3640,7 +3737,7 @@ mod tests {
     #[test]
     fn test_persist_window_zero_timestamp() {
         // Timestamp 0 → seconds_of_day = 0, well outside [09:00, 15:30)
-        assert!(!is_within_persist_window(0));
+        assert!(!is_within_persist_window(0, false));
     }
 
     #[test]
@@ -3661,22 +3758,30 @@ mod tests {
     fn test_persist_window_raw_secs_of_day_boundary() {
         // Directly test with seconds-of-day values matching start/end constants
         // 32400 = 09:00 IST
-        assert!(is_within_persist_window(TICK_PERSIST_START_SECS_OF_DAY_IST));
+        assert!(is_within_persist_window(
+            TICK_PERSIST_START_SECS_OF_DAY_IST,
+            false
+        ));
         // 55800 = 15:30 IST (exclusive)
-        assert!(!is_within_persist_window(TICK_PERSIST_END_SECS_OF_DAY_IST));
+        assert!(!is_within_persist_window(
+            TICK_PERSIST_END_SECS_OF_DAY_IST,
+            false
+        ));
     }
 
     #[test]
     fn test_persist_window_just_before_start() {
         assert!(!is_within_persist_window(
-            TICK_PERSIST_START_SECS_OF_DAY_IST - 1
+            TICK_PERSIST_START_SECS_OF_DAY_IST - 1,
+            false
         ));
     }
 
     #[test]
     fn test_persist_window_just_before_end() {
         assert!(is_within_persist_window(
-            TICK_PERSIST_END_SECS_OF_DAY_IST - 1
+            TICK_PERSIST_END_SECS_OF_DAY_IST - 1,
+            false
         ));
     }
 
@@ -3720,14 +3825,14 @@ mod tests {
         // G1 — exchange-ts gate: 15:29:59 IST is in [09:15:00, 15:30:00).
         let exchange_ts_secs = 15 * 3600 + 29 * 60 + 59; // 15:29:59 IST
         assert!(
-            is_within_persist_window(exchange_ts_secs),
+            is_within_persist_window(exchange_ts_secs, false),
             "G1 must accept exchange_ts inside [09:00, 15:30) — 15:29:59 is in-session"
         );
         // G2 — wall-clock gate: 15:30:00.100 IST is in [09:00, 15:31)
         // because of the 60s grace tail.
         let recv_at_nanos = ist_hms_to_utc_received_at_nanos(15, 30, 0, 100);
         assert!(
-            is_wall_clock_within_persist_window(recv_at_nanos),
+            is_wall_clock_within_persist_window(recv_at_nanos, false),
             "G2 grace tail (PR-Item-11) must accept wall-clock 15:30:00.100"
         );
     }
@@ -3739,7 +3844,7 @@ mod tests {
     fn test_tick_with_exchange_ts_15_30_00_000_rejected() {
         let exchange_ts_secs = 15 * 3600 + 30 * 60; // 15:30:00 IST
         assert!(
-            !is_within_persist_window(exchange_ts_secs),
+            !is_within_persist_window(exchange_ts_secs, false),
             "G1 must reject exchange_ts at exactly 15:30:00 — interval is half-open"
         );
     }
@@ -3751,14 +3856,105 @@ mod tests {
         // At 15:30:59 wall-clock — STILL inside the grace tail.
         let recv_15_30_59 = ist_hms_to_utc_received_at_nanos(15, 30, 59, 0);
         assert!(
-            is_wall_clock_within_persist_window(recv_15_30_59),
+            is_wall_clock_within_persist_window(recv_15_30_59, false),
             "G2 must remain open at wall-clock 15:30:59 (inside 60s grace)"
         );
         // At 15:31:00 wall-clock — boundary, gate closes.
         let recv_15_31_00 = ist_hms_to_utc_received_at_nanos(15, 31, 0, 0);
         assert!(
-            !is_wall_clock_within_persist_window(recv_15_31_00),
+            !is_wall_clock_within_persist_window(recv_15_31_00, false),
             "G2 must close at wall-clock 15:31:00 sharp — grace window is half-open"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CCL-06 — Muhurat evening-session persist window (permutation-audit §140)
+    // -----------------------------------------------------------------------
+
+    /// The bug scenario: a Muhurat evening tick (~18:15 IST) MUST be persisted
+    /// when today is a Muhurat session (`muhurat_active = true`). Before the
+    /// fix, the whole ~1h Muhurat session was silently dropped despite a live
+    /// connection.
+    #[test]
+    fn test_muhurat_tick_1815_ist_is_persisted() {
+        let ts_1815 = ist_hms_to_ist_epoch(18, 15, 0);
+        assert!(
+            is_within_persist_window(ts_1815, true),
+            "18:15 IST tick must be persisted on a Muhurat day (muhurat_active=true)"
+        );
+    }
+
+    /// The gate MUST be `muhurat_active`-driven: the SAME 18:15 tick is still
+    /// DROPPED on a normal trading/mock day (`muhurat_active = false`). This
+    /// proves the Muhurat branch never widens a non-Muhurat day.
+    #[test]
+    fn test_muhurat_tick_1815_ist_dropped_when_flag_off() {
+        let ts_1815 = ist_hms_to_ist_epoch(18, 15, 0);
+        assert!(
+            !is_within_persist_window(ts_1815, false),
+            "18:15 IST tick must be DROPPED when muhurat_active=false (normal day)"
+        );
+    }
+
+    /// Half-open Muhurat window boundaries `[18:00, 19:30)` IST when active.
+    #[test]
+    fn test_muhurat_window_boundaries() {
+        // 18:00:00 IST — inclusive lower bound.
+        assert!(is_within_persist_window(
+            ist_hms_to_ist_epoch(18, 0, 0),
+            true
+        ));
+        // 17:59:59 IST — one second before open → rejected even when active.
+        assert!(!is_within_persist_window(
+            ist_hms_to_ist_epoch(17, 59, 59),
+            true
+        ));
+        // 19:29:59 IST — last accepted second.
+        assert!(is_within_persist_window(
+            ist_hms_to_ist_epoch(19, 29, 59),
+            true
+        ));
+        // 19:30:00 IST — exclusive upper bound → rejected.
+        assert!(!is_within_persist_window(
+            ist_hms_to_ist_epoch(19, 30, 0),
+            true
+        ));
+    }
+
+    /// The Muhurat window is purely ADDITIVE: with `muhurat_active = true` the
+    /// regular `[09:00, 15:30)` window still behaves EXACTLY as on a normal day
+    /// (accept mid-session, reject pre/post-market). Muhurat never narrows it.
+    #[test]
+    fn test_regular_window_unchanged_when_muhurat_active() {
+        // Mid-session still accepted with the flag on.
+        assert!(is_within_persist_window(
+            ist_hms_to_ist_epoch(12, 0, 0),
+            true
+        ));
+        // Pre-market still rejected with the flag on.
+        assert!(!is_within_persist_window(
+            ist_hms_to_ist_epoch(8, 0, 0),
+            true
+        ));
+        // Post-market gap between 15:30 and 18:00 still rejected with flag on.
+        assert!(!is_within_persist_window(
+            ist_hms_to_ist_epoch(16, 0, 0),
+            true
+        ));
+    }
+
+    /// The wall-clock gate (G2) is symmetric: an 18:15 IST wall-clock receipt
+    /// is accepted on a Muhurat day and dropped otherwise.
+    #[test]
+    fn test_muhurat_wall_clock_1815_accepted_when_active() {
+        let recv_1815 = ist_hms_to_utc_received_at_nanos(18, 15, 0, 0);
+        assert!(
+            is_wall_clock_within_persist_window(recv_1815, true),
+            "wall-clock 18:15 IST must pass G2 on a Muhurat day"
+        );
+        assert!(
+            !is_wall_clock_within_persist_window(recv_1815, false),
+            "wall-clock 18:15 IST must fail G2 on a normal day"
         );
     }
 
@@ -3880,7 +4076,7 @@ mod tests {
         let yesterday_day: u32 = 20538;
         let today_day: u32 = 20539;
         let ts: u32 = yesterday_day * 86400 + 36000; // yesterday 10:00:00 IST
-        assert!(is_within_persist_window(ts)); // time is within [09:00, 15:30)
+        assert!(is_within_persist_window(ts, false)); // time is within [09:00, 15:30)
         assert!(!is_today_ist(ts, today_day)); // but it's not today
     }
 
@@ -3895,7 +4091,7 @@ mod tests {
         // This test verifies the gate function rejects pre-market timestamps.
         let pre_market_ts = ist_hms_to_ist_epoch(8, 59, 59);
         assert!(
-            !is_within_persist_window(pre_market_ts),
+            !is_within_persist_window(pre_market_ts, false),
             "pre-market tick must be rejected by ingestion gate"
         );
         // The tick processor calls `continue` on this result, so no downstream
@@ -3907,7 +4103,7 @@ mod tests {
         // Post-market tick (15:30:00 IST) must be dropped BEFORE all processing.
         let post_market_ts = ist_hms_to_ist_epoch(15, 30, 0);
         assert!(
-            !is_within_persist_window(post_market_ts),
+            !is_within_persist_window(post_market_ts, false),
             "post-market tick (15:30 exclusive) must be rejected by ingestion gate"
         );
     }
@@ -3917,7 +4113,7 @@ mod tests {
         // 15:29:59 IST is the last second that passes the gate.
         let last_valid_ts = ist_hms_to_ist_epoch(15, 29, 59);
         assert!(
-            is_within_persist_window(last_valid_ts),
+            is_within_persist_window(last_valid_ts, false),
             "15:29:59 IST must pass the ingestion gate (last valid candle)"
         );
     }
@@ -3927,7 +4123,7 @@ mod tests {
         // 09:00:00 IST is the first second that passes the gate.
         let first_valid_ts = ist_hms_to_ist_epoch(9, 0, 0);
         assert!(
-            is_within_persist_window(first_valid_ts),
+            is_within_persist_window(first_valid_ts, false),
             "09:00:00 IST must pass the ingestion gate (market open)"
         );
     }
