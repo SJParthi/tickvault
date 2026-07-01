@@ -145,33 +145,34 @@ pub fn parse_cgroup_memory_max_bytes(memory_max_body: &str) -> Option<u64> {
 
 /// Count the entries in `/proc/self/fd` = open file descriptors. Returns
 /// `None` on a non-Linux host (dir missing / unreadable).
-// TEST-EXEMPT: thin fs-read wrapper; the count logic is trivial and the None
-// branch is exercised by `test_probe_fd_count_missing_dir_is_none`.
+// The count logic is trivial and the None branch is exercised by
+// `test_probe_fd_count_missing_dir_is_none`.
 #[must_use]
+// TEST-EXEMPT: thin fs-read wrapper; None branch covered by test_probe_fd_count_missing_dir_is_none.
 pub fn probe_open_fd_count(fd_dir: &Path) -> Option<u64> {
     let entries = std::fs::read_dir(fd_dir).ok()?;
     Some(entries.filter(std::result::Result::is_ok).count() as u64)
 }
 
 /// Read + parse the soft `Max open files` limit. `None` on non-Linux / missing.
-// TEST-EXEMPT: thin fs-read + delegate to the fully-tested `parse_max_open_files`.
 #[must_use]
+// TEST-EXEMPT: thin fs-read + delegate to the fully-tested `parse_max_open_files`.
 pub fn probe_max_open_files(limits_path: &Path) -> Option<u64> {
     let body = std::fs::read_to_string(limits_path).ok()?;
     parse_max_open_files(&body)
 }
 
 /// Read + parse VmRSS bytes. `None` on non-Linux / missing.
-// TEST-EXEMPT: thin fs-read + delegate to the fully-tested `parse_vmrss_bytes`.
 #[must_use]
+// TEST-EXEMPT: thin fs-read + delegate to the fully-tested `parse_vmrss_bytes`.
 pub fn probe_vmrss_bytes(status_path: &Path) -> Option<u64> {
     let body = std::fs::read_to_string(status_path).ok()?;
     parse_vmrss_bytes(&body)
 }
 
 /// Read + parse the cgroup memory limit. `None` on `max` / non-Linux / missing.
-// TEST-EXEMPT: thin fs-read + delegate to the fully-tested `parse_cgroup_memory_max_bytes`.
 #[must_use]
+// TEST-EXEMPT: thin fs-read + delegate to the fully-tested `parse_cgroup_memory_max_bytes`.
 pub fn probe_cgroup_memory_max_bytes(memory_max_path: &Path) -> Option<u64> {
     let body = std::fs::read_to_string(memory_max_path).ok()?;
     parse_cgroup_memory_max_bytes(&body)
@@ -223,9 +224,10 @@ impl ResourceMonitorPaths {
 /// emits RESOURCE-01/02/03 `error!` when a threshold is crossed. On a non-
 /// Linux host each probe fails softly (`tv_resource_monitor_probe_failed_total`,
 /// no page, no panic).
-// TEST-EXEMPT: tokio task spawn — the pure classifiers + parsers are fully
-// unit-tested; this wrapper is a probe loop that needs an integration harness.
+// The pure classifiers + parsers are fully unit-tested; this wrapper is a
+// probe loop that needs an integration harness to test usefully.
 #[must_use]
+// TEST-EXEMPT: tokio task spawn — pure classifiers/parsers unit-tested; loop needs an integration harness.
 pub fn spawn_resource_monitor(paths: ResourceMonitorPaths) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let m_fds = metrics::gauge!("tv_open_fds");

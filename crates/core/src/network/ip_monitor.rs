@@ -329,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ip_check_streak_at_threshold_escalates_once() {
+    fn test_should_escalate_ip_check_streak_at_threshold_fires_once() {
         // Edge-triggered: fires exactly at the threshold.
         assert!(should_escalate_ip_check_streak(
             IP_CHECK_FAILED_ESCALATION_STREAK
