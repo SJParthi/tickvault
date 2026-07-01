@@ -64,13 +64,13 @@ variable "enable_eip" {
 }
 
 variable "ebs_gp3_size_gb" {
-  description = "Root EBS volume size in GB. 30 per operator lock 2026-05-29 §7 Quote 6 — 30 GB hot window keeps the all-in bill ~₹2,058/mo; the partition manager auto-archives partitions >90d to the cheaper S3 cold bucket (~4x cheaper than EBS/GB), so EBS holds only hot data. gp3 grows online (no stop, no data loss) — raise this anytime the hot window needs more. root_block_device[0].volume_size is in the instance lifecycle.ignore_changes so a later `terraform apply` does NOT revert a script-grown disk (gp3 cannot shrink anyway). This var documents the intended size for a FRESH provision."
+  description = "Root EBS volume size in GB. 30 per operator lock 2026-05-29 §7 Quote 6 — 30 GB hot window keeps the all-in bill ~₹2,919/mo (r8g.large, §7 Quote 7); the partition manager auto-archives partitions >90d to the cheaper S3 cold bucket (~4x cheaper than EBS/GB), so EBS holds only hot data. gp3 grows online (no stop, no data loss) — raise this anytime the hot window needs more. root_block_device[0].volume_size is in the instance lifecycle.ignore_changes so a later `terraform apply` does NOT revert a script-grown disk (gp3 cannot shrink anyway). This var documents the intended size for a FRESH provision."
   type        = number
   default     = 30
 
   validation {
     condition     = var.ebs_gp3_size_gb >= 10 && var.ebs_gp3_size_gb <= 200
-    error_message = "EBS is sized 10-200 GB. 30 GB default per operator lock 2026-05-29 (hot window + S3 cold-tier archival keeps bill ~₹2,058/mo). gp3 grows online beyond this if needed."
+    error_message = "EBS is sized 10-200 GB. 30 GB default per operator lock 2026-05-29 (hot window + S3 cold-tier archival keeps bill ~₹2,919/mo on r8g.large). gp3 grows online beyond this if needed."
   }
 }
 
