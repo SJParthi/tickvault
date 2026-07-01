@@ -22,6 +22,27 @@ fn read_main_rs() -> String {
         .expect("main.rs must be readable from the app crate test working dir")
 }
 
+/// End index (relative to `src`) of the top-level item that starts at
+/// byte `item_start`, i.e. the position of the NEXT top-level item after it.
+///
+/// The earlier heuristic bounded a function body at the next `"\nasync fn "`
+/// only. That leaks any intervening NON-async top-level item (a `struct` or
+/// `enum` and its doc comment) into the body slice. FTC-14 (audit 2026-07-01)
+/// added the `enum StartLaneError { … WsPoolSpawn … }` block — whose doc
+/// comment legitimately mentions `create_websocket_pool` (it describes the
+/// LANE, not shared infra) — BETWEEN `build_shared_infra` and the next
+/// `async fn`, tripping the negative isolation assertion falsely. Bounding on
+/// the earliest of the next top-level `fn`/`async fn`/`struct`/`enum`/`impl`
+/// keeps each assertion scoped to the actual function body it names.
+fn next_top_level_item(src: &str, item_start: usize) -> usize {
+    let tail = &src[item_start + 1..];
+    ["\nasync fn ", "\nfn ", "\nstruct ", "\nenum ", "\nimpl "]
+        .iter()
+        .filter_map(|marker| tail.find(marker))
+        .min()
+        .map_or(src.len(), |rel| item_start + 1 + rel)
+}
+
 #[test]
 fn dhan_boot_is_gated_on_dhan_enabled() {
     let src = read_main_rs();
@@ -385,10 +406,7 @@ fn dhan_off_skips_auth_and_instruments_via_the_lane_gate() {
     let shared = src
         .find("async fn build_shared_infra(")
         .expect("build_shared_infra must exist (D2 Stage 2 shared-infra hoist)");
-    let shared_body_end = src[shared..]
-        .find("\nasync fn ")
-        .map(|rel| shared + rel)
-        .unwrap_or(src.len());
+    let shared_body_end = next_top_level_item(&src, shared);
     let shared_body = &src[shared..shared_body_end];
     assert!(
         !shared_body.contains("authenticating with Dhan")
@@ -445,10 +463,7 @@ fn api_server_up_in_dhan_off_mode() {
     let shared = src
         .find("async fn build_shared_infra(")
         .expect("build_shared_infra must exist (D2 Stage 2)");
-    let shared_body_end = src[shared..]
-        .find("\nasync fn ")
-        .map(|rel| shared + rel)
-        .unwrap_or(src.len());
+    let shared_body_end = next_top_level_item(&src, shared);
     let body = &src[shared..shared_body_end];
     for (needle, what) in [
         ("axum::serve", "the HTTP API server"),

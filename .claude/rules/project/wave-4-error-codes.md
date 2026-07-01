@@ -89,16 +89,55 @@ within 5s.
 `crates/core/src/notification/events.rs::Depth20DynamicSwapChannelBroken`,
 `.claude/triage/error-rules.yaml::depth-dyn-02-swap-channel-broken-escalate`.
 
-## PROC-01 — OOM kill detected (Wave-4-E1)
+## PROC-01 — OOM kill detected (Wave-4-E1 / BP-07)
 
-**Reserved.** Severity::Critical.
+**LIVE (2026-07-01).** Severity::Critical. Auto-triage: NO.
+`ErrorCode::Proc01OomKillDetected` (`code_str() == "PROC-01"`).
 
-Triage stub: scrape of `/sys/fs/cgroup/.../memory.events` shows an
-`oom_kill` increment vs the boot-time baseline. The killed process
-may not be tickvault itself (could be a sidecar) — check
-`docker ps -a` for restart count.
+**Trigger:** the supervised OOM monitor
+(`crates/storage/src/oom_monitor.rs::spawn_supervised_oom_monitor`, wired at
+boot in `crates/app/src/main.rs` next to the disk-health watcher) reads the
+cgroup-v2 `memory.events` file at [`DEFAULT_CGROUP_V2_MEMORY_EVENTS_PATH`]
+(`/sys/fs/cgroup/memory.events`) every 60s and compares the `oom_kill` counter
+against a boot-time baseline (captured on the FIRST successful read, so a
+pre-existing lifetime OOM count never fires a spurious page). A positive delta
+means one or more processes in this cgroup — tickvault itself OR a sidecar —
+were killed by the kernel OOM killer. The monitor emits
+`error!(code = "PROC-01", …)` (Telegram Critical) and increments
+`tv_oom_kills_total` by the delta, then advances the baseline so the same
+kills are not re-reported.
 
-**Source (planned):** `crates/app/src/oom_monitor.rs`
+**Triage:**
+1. `mcp__tickvault-logs__tail_errors` — read the `PROC-01` payload: `new_kills`,
+   `total_kills`, `baseline`.
+2. `mcp__tickvault-logs__docker_status` — is the host OOM-killed? Check any
+   container/service restart count; the killed process may be a sidecar, not
+   tickvault.
+3. Cross-check host memory pressure — the r8g.large 16 GiB budget
+   (`aws-budget.md` / `daily-universe-scope-expansion-2026-05-27.md` §7) has
+   ~7.8 GB headroom, so a real OOM points at a leak or an unexpected working-set
+   spike; correlate with `tv_subsystem_memory_estimated_bytes{component=…}` +
+   the host `mem_used_high` alarm.
+4. A repeating PROC-01 (OOM-loop) during market hours needs operator action —
+   the box will keep dying; investigate the offending subsystem before it
+   starves the feeds.
+
+**Observability:** `tv_oom_kills_total` (new kills since baseline),
+`tv_oom_monitor_probe_failed_total` (probe I/O/parse failures — a non-cgroup-v2
+host reports these instead of kills, honestly signalling "no OOM source"),
+`tv_oom_monitor_respawn_total{reason}` (supervisor respawn — flapping monitor).
+
+**Honest envelope:** the monitor reports kills the kernel attributes to THIS
+cgroup's `oom_kill` counter. On a non-cgroup-v2 host (cgroup-v1 / macOS dev box)
+the probe fails softly — no page, no panic, and `tv_oom_monitor_probe_failed_total`
+rises so the lack of a signal is itself visible. It never blocks boot or the
+hot path.
+
+**Source:** `crates/storage/src/oom_monitor.rs`
+(`parse_oom_kill_count` / `classify_oom_delta` pure primitives +
+`spawn_supervised_oom_monitor`), `crates/common/src/error_code.rs::Proc01OomKillDetected`.
+Boot wiring: `crates/app/src/main.rs`. Wiring ratchet:
+`crates/core/src/auth/secret_manager.rs::tests::test_oom_monitor_is_wired_into_main`.
 
 ## PROC-02 — container restart loop (Wave-4-E1)
 
@@ -128,12 +167,33 @@ api-feed.dhan.co, full-depth-api.dhan.co, depth-api-feed.dhan.co}.
 PR #406 item 9 (spill pre-flight). Wave-4-E2 extends to historical
 fetch + audit table writes.
 
-## AUTH-GAP-04 — TOTP secret rotated externally (Wave-4-E2)
+## AUTH-GAP-04 — TOTP secret rotated externally (AUTH-P11, live 2026-07-01)
 
-**Reserved.** Severity::Critical. Triage: token generation fails
-with `INVALID_TOTP` on first attempt despite TOTP secret being
-unchanged in our config. The secret was rotated externally (e.g.
-operator regenerated via dhan.co web UI without updating SSM).
+**Status (2026-07-01):** PROMOTED FROM RESERVED — defined as
+`ErrorCode::AuthGap04TotpRotatedExternally` with `code_str() == "AUTH-GAP-04"`.
+Severity::Critical. NOT auto-triage-safe.
+
+**Trigger:** the boot-time token-generation retry loop
+(`crates/core/src/auth/token_manager.rs`) rejected the TOTP code and
+exhausted `TOTP_MAX_RETRIES` (each retry waits a fresh 30s window). A
+genuinely wrong secret — the classic cause is the operator regenerating
+the 2FA/TOTP seed via the dhan.co web UI without updating the SSM param —
+never produces a valid code, so the loop terminates. That terminal branch
+now fires a distinctly-typed `error!(code = "AUTH-GAP-04", …)` (Telegram
+Critical) instead of a generic `AuthenticationFailed`, pointing the
+operator at the exact SSM parameter to reconcile.
+
+**Triage:**
+1. `mcp__tickvault-logs__tail_errors` — read the `AUTH-GAP-04` payload
+   (`totp_retries`, the SSM param hint).
+2. Verify `/tickvault/<env>/dhan/totp-secret` in SSM matches the seed
+   currently registered on the dhan.co web UI. If it was rotated, update
+   the SSM value + restart; if it was NOT changed, the seed drifted (clock
+   skew on the TOTP window is ruled out by BOOT-03).
+3. Auth is dead until the secret is reconciled — never auto-actioned.
+
+**Source:** `crates/common/src/error_code.rs::AuthGap04TotpRotatedExternally`,
+`crates/core/src/auth/token_manager.rs` (the TOTP-exhaustion terminal branch).
 
 ## DH-911 — Dhan API silent black-hole (Wave-4-E2)
 
@@ -148,18 +208,49 @@ filtering.
 in normal operation; if it does, the trading calendar is wrong or
 operator manually disabled the holiday gate.
 
-## RESOURCE-01 — file-descriptor count above threshold (Wave-4-E3)
+## RESOURCE-01/02/03 — fd / RSS / spill-free early-warning (BP-08, live 2026-07-01)
 
-**Reserved.** Severity::High. Threshold: > 80% of `ulimit -n`.
+**Status (2026-07-01):** PROMOTED FROM RESERVED — defined as
+`ErrorCode::Resource01FdCountHigh` / `Resource02ResidentMemoryHigh` /
+`Resource03SpillFreeLow` (`RESOURCE-01/02/03`). All Severity::High,
+auto-triage-safe (they page + are inspected, never auto-fixed).
 
-## RESOURCE-02 — resident memory bytes above threshold (Wave-4-E3)
+**Source:** the supervised `crates/app/src/resource_monitor.rs` task
+(mirrors the `disk_health_watcher.rs` supervised-poll + respawn template;
+`tv_resource_monitor_respawn_total` on a flapping monitor). Linux-only
+(`/proc`, cgroup); a non-Linux host or an unreadable probe degrades to a
+`ProbeFailed` skip with no false-OK.
 
-**Reserved.** Severity::High. Threshold: > 80% of cgroup limit.
+### RESOURCE-01 — file-descriptor count above threshold
 
-## RESOURCE-03 — spill file size above threshold (Wave-4-E3)
+**Trigger:** `/proc/self/fd` entry count crossed the early-warning
+threshold (default 80% of `LimitNOFILE`, read from `/proc/self/limits`).
+A leaked WS / QuestDB socket can exhaust the fd table with zero signal
+until `connect()` starts failing; this monitor pages BEFORE that.
+`tv_open_fds` gauge. **Triage:** `ls /proc/<pid>/fd | wc -l`; inspect for
+a socket leak (repeated same-peer entries) → cross-check WS reconnect
+churn (WS-GAP-05).
 
-**Reserved.** Severity::High. Threshold: > 50% of `data/spill/`
-free space.
+### RESOURCE-02 — resident memory bytes above threshold
+
+**Trigger:** process `VmRSS` (`/proc/self/status`) crossed the
+early-warning threshold (default 80% of the cgroup memory limit,
+`memory.max`). Distinct from the host-aggregate `mem_used_high` CloudWatch
+alarm — this is the tickvault process itself approaching its cgroup
+ceiling before the OOM killer (PROC-01) fires. `tv_process_rss_bytes`
+gauge. cgroup limit = `max` (unlimited) → skipped (no denominator).
+**Triage:** right-size the workload / investigate the leak; if it keeps
+climbing, PROC-01 (OOM kill) is imminent.
+
+### RESOURCE-03 — spill-directory free space below threshold
+
+**Trigger:** spill-dir free space dropped below the early-warning
+percent-of-total threshold (default 20% free). A process-level percent
+view distinct from the host `disk_used_high` aggregate, so a fast-filling
+spill dir is caught before the zero-loss chain is at risk. Reuses the
+`disk_health_watcher::probe_disk_free_bytes` probe. `tv_spill_free_pct`
+gauge. **Triage:** `df -h data/spill/`; restore the QuestDB drain
+(cross-check DISK-WATCHER-01 / BOOT-01/02) or free disk.
 
 ## OPER-01 — Dhan client-id changed in config (Wave-4-E3)
 

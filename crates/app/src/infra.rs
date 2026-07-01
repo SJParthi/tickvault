@@ -92,6 +92,69 @@ const DASHBOARD_SERVICES: &[(&str, &str, &str, u16)] = &[
 // from the runtime.
 
 // ---------------------------------------------------------------------------
+// Boot compose-up outcome classification (false-CRITICAL fix, 2026-07-01)
+// ---------------------------------------------------------------------------
+
+/// Outcome of the boot-time `docker compose up -d` retry loop, once the
+/// required service (QuestDB) has been probed.
+///
+/// Root cause this guards against: `run_docker_compose_up` runs
+/// `--force-recreate`, which is NOT idempotent — it tears down + recreates
+/// every container on every boot. On a same-day crash-recovery boot (QuestDB
+/// already up + busy) the recreate can fail all `COMPOSE_UP_MAX_RETRIES`
+/// attempts even though the service the app actually needs is healthy. The
+/// old code fired a Telegram CRITICAL unconditionally on that path — a
+/// false-CRITICAL that erodes operator trust in the pager. This enum routes
+/// the failure by whether the required service is ACTUALLY reachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposeOutcome {
+    /// `docker compose up -d` succeeded within the retry budget.
+    Succeeded,
+    /// compose-up exhausted its retries, but the required service (QuestDB)
+    /// is reachable — the app can run. Log Low (`warn!`), no CRITICAL page.
+    /// This is the `--force-recreate`-churn-while-service-up false-CRITICAL.
+    DegradedServiceUp,
+    /// compose-up exhausted its retries AND the required service is NOT
+    /// reachable — a real outage. Keep the CRITICAL page.
+    Critical,
+}
+
+impl ComposeOutcome {
+    /// True only for the genuine-outage outcome that must page CRITICAL.
+    /// Stable wire-semantics — ratcheted so a refactor cannot silently make
+    /// the false-CRITICAL page again.
+    #[must_use]
+    pub fn is_critical(&self) -> bool {
+        matches!(self, Self::Critical)
+    }
+}
+
+/// Pure decision for the boot compose-up outcome.
+///
+/// | `compose_succeeded` | `required_service_reachable` | outcome |
+/// |---|---|---|
+/// | `true`  | (ignored) | `Succeeded` |
+/// | `false` | `true`    | `DegradedServiceUp` (Low warn — no page) |
+/// | `false` | `false`   | `Critical` (real outage — page) |
+///
+/// The CRITICAL fires ONLY when compose-up failed AND the required service is
+/// actually unreachable — it never suppresses a real compose failure where the
+/// service is down, and never pages when the service the app needs is healthy.
+#[must_use]
+pub fn classify_compose_outcome(
+    compose_succeeded: bool,
+    required_service_reachable: bool,
+) -> ComposeOutcome {
+    if compose_succeeded {
+        ComposeOutcome::Succeeded
+    } else if required_service_reachable {
+        ComposeOutcome::DegradedServiceUp
+    } else {
+        ComposeOutcome::Critical
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -213,12 +276,31 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
             }
         }
     }
-    if !compose_succeeded {
-        tracing::error!(
-            "docker compose up failed after {COMPOSE_UP_MAX_RETRIES} attempts — \
-             services may not be available. Telegram CRITICAL alert should fire."
-        );
-        return;
+    // false-CRITICAL fix (2026-07-01): compose-up may fail all retries purely
+    // because `--force-recreate` churns containers that are ALREADY up (e.g. a
+    // same-day crash-recovery boot with QuestDB already serving). Only page
+    // CRITICAL when the required service (QuestDB) is ACTUALLY unreachable —
+    // otherwise the app can run and the CRITICAL was a false alarm.
+    let questdb_reachable =
+        !compose_succeeded && is_service_reachable(&questdb_config.host, questdb_config.http_port);
+    match classify_compose_outcome(compose_succeeded, questdb_reachable) {
+        ComposeOutcome::Succeeded => {}
+        ComposeOutcome::DegradedServiceUp => {
+            metrics::counter!("tv_boot_compose_recreate_degraded_total").increment(1);
+            warn!(
+                max_attempts = COMPOSE_UP_MAX_RETRIES,
+                "docker compose up failed on all attempts, but QuestDB is already up — \
+                 services already running despite compose recreate churn; boot continues"
+            );
+        }
+        ComposeOutcome::Critical => {
+            tracing::error!(
+                "docker compose up failed after {COMPOSE_UP_MAX_RETRIES} attempts and \
+                 QuestDB is unreachable — services may not be available. \
+                 Telegram CRITICAL alert should fire."
+            );
+            return;
+        }
     }
 
     // Wait for all critical services to become healthy.
@@ -2248,6 +2330,59 @@ mod tests {
             compose_pos < f_pos,
             "`compose` (at {compose_pos}) must precede `-f` (at {f_pos})"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_compose_outcome — false-CRITICAL truth table (2026-07-01)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_compose_outcome_succeeded() {
+        // compose-up succeeded — the service-reachable flag is irrelevant.
+        assert_eq!(
+            classify_compose_outcome(true, true),
+            ComposeOutcome::Succeeded
+        );
+        assert_eq!(
+            classify_compose_outcome(true, false),
+            ComposeOutcome::Succeeded
+        );
+        assert!(!classify_compose_outcome(true, false).is_critical());
+    }
+
+    #[test]
+    fn test_classify_compose_outcome_degraded_service_up() {
+        // The observed 11:09 IST case: compose-up failed all attempts but
+        // QuestDB is already up → Low warn, NOT a CRITICAL page.
+        let outcome = classify_compose_outcome(false, true);
+        assert_eq!(outcome, ComposeOutcome::DegradedServiceUp);
+        assert!(
+            !outcome.is_critical(),
+            "compose churn while the required service is up must NOT page CRITICAL"
+        );
+    }
+
+    #[test]
+    fn test_classify_compose_outcome_critical_only_when_service_down() {
+        // The genuine outage: compose-up failed AND QuestDB is unreachable.
+        let outcome = classify_compose_outcome(false, false);
+        assert_eq!(outcome, ComposeOutcome::Critical);
+        assert!(
+            outcome.is_critical(),
+            "a real compose failure with the required service DOWN must page CRITICAL"
+        );
+        // The CRITICAL must fire on exactly one of the four input combinations.
+        assert!(!classify_compose_outcome(true, true).is_critical());
+        assert!(!classify_compose_outcome(true, false).is_critical());
+        assert!(!classify_compose_outcome(false, true).is_critical());
+        assert!(classify_compose_outcome(false, false).is_critical());
+    }
+
+    #[test]
+    fn test_compose_outcome_is_critical_stable() {
+        assert!(ComposeOutcome::Critical.is_critical());
+        assert!(!ComposeOutcome::Succeeded.is_critical());
+        assert!(!ComposeOutcome::DegradedServiceUp.is_critical());
     }
 
     #[test]

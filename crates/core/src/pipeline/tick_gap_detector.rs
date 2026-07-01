@@ -89,6 +89,33 @@ impl TickGapDetector {
         pin.insert((security_id, segment), now);
     }
 
+    /// NT-15 (audit 2026-07-01): seed a subscribed instrument's `last_seen`
+    /// baseline at SUBSCRIBE time, but ONLY if the key is not already
+    /// present — never clobber a real tick.
+    ///
+    /// Before this, `last_seen` was populated exclusively from genuine
+    /// parsed ticks, so a subscribed SID that NEVER ticks all session never
+    /// becomes a map key — it never contributes to `scan_gaps` /
+    /// `tv_tick_gap_instruments_silent`, and a per-SID cold black-hole
+    /// (first-tick never arrives) is invisible while any OTHER SID ticks.
+    /// Seeding every subscribed `(security_id, segment)` with the subscribe
+    /// instant turns WS-GAP-06 into a first-tick black-hole detector: a
+    /// never-ticked SID crosses `threshold_secs` of silence during market
+    /// hours and gets flagged like any stalled instrument.
+    ///
+    /// Insert-if-absent is critical: a SID that has ALREADY ticked must
+    /// keep its real last-seen instant (seeding it with an older subscribe
+    /// instant would falsely age a healthy instrument; seeding with a newer
+    /// instant would mask a real stall). Called once per subscribed SID at
+    /// boot — cold path.
+    pub fn seed_subscribed(&self, security_id: u64, segment: ExchangeSegment, at: Instant) {
+        let pin = self.last_seen.pin();
+        // Insert-if-absent: `get_or_insert_with` never overwrites an
+        // existing (real-tick) entry.
+        // O(1) EXEMPT: cold-path subscribe-time seeding, one call per SID.
+        let _ = pin.get_or_insert_with((security_id, segment), || at);
+    }
+
     /// Age (seconds) of the MOST-RECENT real tick across ALL instruments,
     /// or `None` if no tick has ever been recorded (map empty).
     ///
@@ -348,6 +375,77 @@ mod tests {
         let gaps = d.scan_gaps(now);
         assert!(gaps.is_empty());
         assert_eq!(d.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // NT-15 — seed_subscribed (per-SID cold black-hole detection)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_seed_subscribed_makes_never_ticked_sid_a_scan_key() {
+        // NT-15: a subscribed SID that NEVER ticks must still be flagged by
+        // scan_gaps once it crosses the threshold. Before seeding it was
+        // never a map key and was invisible.
+        let d = TickGapDetector::new(30);
+        let t0 = Instant::now();
+        // Seed a subscribed SID at boot; it never ticks.
+        d.seed_subscribed(999, ExchangeSegment::NseEquity, t0);
+        assert_eq!(d.len(), 1);
+        // 31s later, with no real tick, it is a silent gap.
+        let gaps = d.scan_gaps(t0 + Duration::from_secs(31));
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].0, 999);
+        assert_eq!(gaps[0].1, ExchangeSegment::NseEquity);
+    }
+
+    #[test]
+    fn test_seed_subscribed_does_not_clobber_a_real_tick() {
+        // Insert-if-absent: a SID that already ticked keeps its REAL
+        // last-seen instant; a later (stale) seed must NOT overwrite it,
+        // else it would falsely age a healthy instrument.
+        let d = TickGapDetector::new(30);
+        let t_tick = Instant::now();
+        d.record_tick(13, ExchangeSegment::IdxI, t_tick);
+        // Seed with an OLDER instant — must be ignored.
+        let t_older = t_tick - Duration::from_secs(100);
+        d.seed_subscribed(13, ExchangeSegment::IdxI, t_older);
+        // Only 10s after the real tick → still fresh → no gap.
+        let gaps = d.scan_gaps(t_tick + Duration::from_secs(10));
+        assert!(
+            gaps.is_empty(),
+            "a real tick must survive a stale seed (insert-if-absent)"
+        );
+        assert_eq!(d.len(), 1);
+    }
+
+    #[test]
+    fn test_seed_subscribed_is_idempotent() {
+        // Re-seeding the same key is a no-op (never clobbers).
+        let d = TickGapDetector::new(30);
+        let t0 = Instant::now();
+        d.seed_subscribed(42, ExchangeSegment::NseEquity, t0);
+        d.seed_subscribed(42, ExchangeSegment::NseEquity, t0 + Duration::from_secs(50));
+        assert_eq!(d.len(), 1);
+        // The FIRST seed instant wins → 31s after it, it is a gap.
+        let gaps = d.scan_gaps(t0 + Duration::from_secs(31));
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].0, 42);
+    }
+
+    #[test]
+    fn test_seed_then_real_tick_clears_the_gap() {
+        // A seeded SID that LATER ticks must be refreshed by record_tick
+        // (record_tick unconditionally overwrites, which is correct — the
+        // real tick is newer than the seed).
+        let d = TickGapDetector::new(30);
+        let t0 = Instant::now();
+        d.seed_subscribed(7, ExchangeSegment::NseEquity, t0);
+        // Real tick arrives 5s later.
+        let t_tick = t0 + Duration::from_secs(5);
+        d.record_tick(7, ExchangeSegment::NseEquity, t_tick);
+        // 10s after the tick → fresh → no gap.
+        let gaps = d.scan_gaps(t_tick + Duration::from_secs(10));
+        assert!(gaps.is_empty());
     }
 
     #[test]

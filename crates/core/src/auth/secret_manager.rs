@@ -1201,15 +1201,37 @@ mod tests {
              from the live tick stream."
         );
         assert!(
-            main_rs.contains("spawn_midnight_reset_task("),
-            "main.rs MUST call `day_ohlc_orchestrator::spawn_midnight_reset_task` \
-             from the boot path. Without it, yesterday's day OHLC carries over \
-             past IST midnight (INDEX-OHLC-02 condition)."
+            main_rs.contains("spawn_supervised_midnight_reset_task("),
+            "main.rs MUST call `day_ohlc_orchestrator::spawn_supervised_midnight_reset_task` \
+             from the boot path (CCL-02). Without the SUPERVISED wrapper, a panic in the \
+             IST-midnight reset task silently takes the daily reset offline and yesterday's \
+             day OHLC carries over past IST midnight with no operator signal (INDEX-OHLC-02)."
         );
         assert!(
             main_rs.contains("DayOhlcTracker::new()"),
             "main.rs MUST construct an Arc<DayOhlcTracker> at boot to thread \
              through the two spawn sites."
+        );
+    }
+
+    /// BP-07 (PROC-01): `main.rs` MUST spawn the supervised OOM-kill monitor
+    /// at boot. Without this wire, an OOM kill has no dedicated signal — it is
+    /// only caught indirectly (process dies → systemd → missing-SLO page), so
+    /// an OOM-loop is indistinguishable from a panic-loop with zero OOM
+    /// attribution. The SUPERVISED wrapper (mirrors DISK-WATCHER-01) ensures a
+    /// panic in the monitor respawns instead of silently taking OOM detection
+    /// offline.
+    #[test]
+    fn test_oom_monitor_is_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        assert!(
+            main_rs.contains("spawn_supervised_oom_monitor("),
+            "main.rs MUST call `oom_monitor::spawn_supervised_oom_monitor` from \
+             the boot path (BP-07 / PROC-01). Without it, an OOM kill fires no \
+             dedicated signal and an OOM-loop is indistinguishable from a \
+             panic-loop."
         );
     }
 }

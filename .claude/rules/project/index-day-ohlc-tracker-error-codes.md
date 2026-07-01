@@ -41,20 +41,20 @@ first call after a daily reset.
 ## §1. INDEX-OHLC-02 — daily reset failed at IST midnight
 
 **Severity:** High.
-**Auto-triage:** Yes (transient — next day's first tick re-arms via auto-arm on `update_tick`).
-**Trigger:** the daily reset task calls `DayOhlcTracker::reset_daily_all()` at IST midnight. The reset internally iterates the papaya HashMap and locks each `parking_lot::Mutex<DayOhlc>` to call `reset_daily()`. Failure modes:
-- `parking_lot::Mutex` poisoned by a panic in a prior tick update (rare — `update_tick` has no panic paths)
+**Auto-triage:** Yes (transient — the CCL-02 supervisor respawns the reset task automatically, and the next day's first tick re-arms via auto-arm on `update_tick`).
+**Trigger:** the daily reset task calls `DayOhlcTracker::reset_daily_all()` at IST midnight. The reset internally iterates the papaya HashMap and locks each `parking_lot::Mutex<DayOhlc>` to call `reset_daily()`. The task is now wrapped by the CCL-02 supervisor `spawn_supervised_midnight_reset_task` (mirror WS-GAP-05 / DISK-WATCHER-01): whenever the inner reset task's `JoinHandle` resolves — a panic mid-iteration (`reason="panic"`), an external cancel (`reason="cancelled"`), or an unexpected clean return (`reason="clean_exit"`) — the supervisor logs `error!(code = "INDEX-OHLC-02", reason, ...)`, increments `tv_day_ohlc_reset_failures_total{reason}`, backs off `DAY_OHLC_RESET_RESPAWN_BACKOFF_SECS` (5s), and respawns so the midnight reset keeps firing. Failure vectors:
+- `parking_lot::Mutex` poisoned by a panic in a prior tick update (rare — `update_tick` has no panic paths; parking_lot does NOT poison, so this vector is near-unreachable — but the supervisor makes it non-silent if it ever fires)
 - Tracker `Arc` handle dropped before reset task could acquire it
 - Reset task panicked mid-iteration
 
-**Consequence:** day high / day low / day close from previous trading day carry over to next trading day. The next live tick re-arms all 4 fields via `update_tick`'s auto-arm path, so the carry-over only persists between IST midnight and the first live tick of the new session.
+**Consequence:** if the reset ever fails to fire, day high / day low / day close from the previous trading day carry over to the next trading day. The CCL-02 supervisor respawns the reset task within ~5s; the next live tick also re-arms all 4 fields via `update_tick`'s auto-arm path, so any carry-over only persists between IST midnight and the first live tick of the new session.
 
 **Triage:**
-1. Inspect `tv_day_ohlc_reset_failures_total` counter — if > 0, the reset failed at least once.
-2. Restart the app to re-create the tracker with default disarmed sentinel — first live tick re-arms cleanly.
+1. Inspect `tv_day_ohlc_reset_failures_total` counter (produced by `spawn_supervised_midnight_reset_task`) — if > 0, the reset task died at least once; the `reason` label (`panic`/`cancelled`/`clean_exit`/`unknown`) says why. A sustained non-zero rate means the reset task is flapping — inspect `data/logs/errors.jsonl.*` for the panic backtrace immediately preceding the INDEX-OHLC-02 line.
+2. The supervisor already respawned; no manual action is required for a one-off. For a flapping reset, restart the app to re-create the tracker with the default disarmed sentinel — first live tick re-arms cleanly.
 3. If poisoned mutex is suspected, the next `update_tick` call inserts a NEW slot which is unaffected.
 
-**Source:** `crates/trading/src/in_mem/day_ohlc_tracker.rs::DayOhlcTracker::reset_daily_all` + `crates/app/src/day_ohlc_orchestrator.rs::spawn_midnight_reset_task`.
+**Source:** `crates/trading/src/in_mem/day_ohlc_tracker.rs::DayOhlcTracker::reset_daily_all` + `crates/app/src/day_ohlc_orchestrator.rs::spawn_supervised_midnight_reset_task` (supervisor) / `spawn_midnight_reset_task` (inner task) / `classify_reset_task_exit` (pure exit classifier). Boot wiring: `crates/app/src/main.rs` (the `_reset_supervisor_handle` spawn). Wiring ratchet: `crates/core/src/auth/secret_manager.rs::test_day_ohlc_orchestrator_is_wired_into_main`.
 
 ---
 

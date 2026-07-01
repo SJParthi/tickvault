@@ -188,6 +188,121 @@ fn emit_boot_completed() {
     metrics::gauge!(BOOT_COMPLETED_METRIC).set(1.0);
 }
 
+/// How long the boot-completed emit waits for AT LEAST ONE enabled feed's lane
+/// to reach a running state before it decides. Feed lanes come up
+/// asynchronously (the Dhan lane FSM Starting→Running, the Groww activation
+/// watcher's watch-list build), so a point-in-time snapshot at the emit instant
+/// would false-NEGATIVE a feed that is legitimately still coming up. A bounded
+/// wait removes that race while keeping the honest end-state: a feed that never
+/// comes up correctly withholds the "alive" signal. Boot is cold path, so a
+/// bounded 60s poll is well inside every boot budget.
+const BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS: u64 = 60;
+
+/// Poll cadence for the boot-completed feed-liveness wait.
+const BOOT_COMPLETED_FEED_LIVENESS_POLL_MS: u64 = 1000;
+
+/// Decide whether the boot-completed "the app is alive" signal
+/// (`tv_boot_completed`) may be emitted, given each feed's enabled flag and its
+/// observed lane-running state.
+///
+/// FEED-AGNOSTIC by construction: the signal is warranted iff AT LEAST ONE
+/// ENABLED feed is running — a live Groww satisfies it when only Groww is
+/// enabled, a live Dhan when only Dhan is enabled, and either when both are
+/// enabled. A running-but-DISABLED feed never counts (an operator-off feed is
+/// not a reason to claim "alive").
+///
+/// The one exception: when NO feed is enabled (a deliberately feed-less run —
+/// shared-infra-only), the signal IS emitted so the boot-heartbeat alarm does
+/// not false-page a legitimately headless boot. The caller logs that case
+/// explicitly.
+///
+/// This closes the alerting hole where a boot that reached the emit line with
+/// EVERY enabled feed dead still published `tv_boot_completed=1` — so the
+/// boot-heartbeat alarm (`treat_missing_data="breaching"`) never paged. With
+/// this gate, "every enabled feed failed to come up" withholds the metric →
+/// MISSING → the alarm pages, exactly the intended signal.
+///
+/// Pure + O(1) — unit-tested truth table.
+fn boot_completed_should_emit(
+    dhan_enabled: bool,
+    groww_enabled: bool,
+    dhan_running: bool,
+    groww_running: bool,
+) -> bool {
+    // Deliberately feed-less run: nothing to be "live", so emit to avoid a
+    // false page on a headless shared-infra-only boot.
+    if !dhan_enabled && !groww_enabled {
+        return true;
+    }
+    // At least one feed enabled: emit iff at least one ENABLED feed is running.
+    (dhan_enabled && dhan_running) || (groww_enabled && groww_running)
+}
+
+/// Emit `tv_boot_completed` ONLY once at least one enabled feed's lane is
+/// genuinely running — waiting up to [`BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS`]
+/// for an async-starting feed to come up. Withholds the metric (and logs an
+/// `error!` naming the dead feed(s)) if the window elapses with every enabled
+/// feed dark, so the boot-heartbeat alarm pages on the MISSING signal.
+///
+/// The no-feed-enabled case (shared-infra-only) resolves `true` on the first
+/// poll and emits immediately (unchanged timing), logged at `info!`.
+async fn emit_boot_completed_when_feed_live(
+    feed_runtime: &std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
+    dhan_enabled: bool,
+    groww_enabled: bool,
+) {
+    if !dhan_enabled && !groww_enabled {
+        // Deliberately feed-less run — emit immediately (no feed to wait for),
+        // logged explicitly so the operator sees WHY the "alive" signal fired
+        // with no live feed.
+        info!(
+            "boot-completed: no feed enabled (dhan_enabled=false, groww_enabled=false) — \
+             emitting the alive signal for a deliberately shared-infra-only run"
+        );
+        emit_boot_completed();
+        return;
+    }
+
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS);
+    loop {
+        let dhan_running = feed_runtime.is_dhan_lane_running();
+        let groww_running = feed_runtime.is_groww_lane_running();
+        if boot_completed_should_emit(dhan_enabled, groww_enabled, dhan_running, groww_running) {
+            info!(
+                dhan_enabled,
+                groww_enabled,
+                dhan_running,
+                groww_running,
+                "boot-completed: a live feed is up — emitting the alive signal"
+            );
+            emit_boot_completed();
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            // Every enabled feed failed to reach running within the window.
+            // WITHHOLD the alive signal so the boot-heartbeat alarm pages on the
+            // MISSING metric, and name the dead feed(s) for the operator.
+            error!(
+                dhan_enabled,
+                groww_enabled,
+                dhan_running,
+                groww_running,
+                wait_secs = BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS,
+                "boot-completed: NO enabled feed reached a live state within the wait window — \
+                 WITHHOLDING the alive signal (tv_boot_completed) so the boot-heartbeat alarm \
+                 pages on the missing metric. Check the enabled feed(s): a Dhan lane that never \
+                 reached Running or a Groww activation that never built its watch-list."
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(
+            BOOT_COMPLETED_FEED_LIVENESS_POLL_MS,
+        ))
+        .await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
@@ -1223,6 +1338,12 @@ async fn main() -> Result<()> {
     let is_trading = trading_calendar.is_trading_day_today();
     let is_muhurat = trading_calendar.is_muhurat_trading_today();
     let is_mock_trading = trading_calendar.is_mock_trading_today();
+    // CCL-06: publish today's Muhurat-session flag to the process-global so the
+    // tick processor additionally accepts the evening [18:00, 19:30) IST window
+    // on a Muhurat date (otherwise the connected feed's Muhurat ticks are
+    // silently dropped by the regular [09:00, 15:30) persist gate). Idempotent,
+    // boot-once; `false` on every trading/mock day → today's behaviour.
+    tickvault_common::muhurat::init_muhurat_session(is_muhurat);
     info!(
         is_trading_day = is_trading,
         is_muhurat_session = is_muhurat,
@@ -1644,6 +1765,10 @@ async fn main() -> Result<()> {
 
             // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
             let greeks_enricher = build_inline_greeks_enricher(&config, &subscription_plan);
+
+            // NT-15: seed the tick-gap detector with every subscribed SID so a
+            // never-ticking instrument becomes a first-tick black-hole signal.
+            seed_tick_gap_detector_from_plan(&subscription_plan);
 
             // O(1) EXEMPT: cold path — clone registry once for tick processor enrichment.
             let fast_registry = subscription_plan
@@ -2188,7 +2313,19 @@ async fn main() -> Result<()> {
         // because this path returns into `run_shutdown_fast()` and never reaches
         // the slow-boot emit at the end of `main()`. See `emit_boot_completed`
         // for the full rationale (boot-heartbeat alarm pages on MISSING).
-        emit_boot_completed();
+        //
+        // GATED on a live feed (audit fix, this PR): the fast-boot arm is
+        // Dhan-ON-only, but the warm-snapshot re-injects the WS pool
+        // asynchronously — a crash-recovery where the pool never reconnects must
+        // NOT publish "alive". `emit_boot_completed_when_feed_live` waits (bounded)
+        // for the Dhan lane to reach Running and withholds the metric (→ alarm
+        // pages) if it never does.
+        emit_boot_completed_when_feed_live(
+            &feed_runtime,
+            config.feeds.dhan_enabled,
+            config.feeds.groww_enabled,
+        )
+        .await;
 
         // Boot-symmetry fix (2026-06-09): the post-market 15:31 cross-verify +
         // 15:31:30 EOD digest were slow-boot-only, so a mid-session crash restart
@@ -2364,6 +2501,15 @@ async fn main() -> Result<()> {
             // here would break the D2a one-liner ratchet for zero runtime gain.
             Err(StartLaneError::BootAbortClean) => return Ok(()),
             Err(StartLaneError::BootAbortErr(err)) => return Err(err),
+            // FTC-14: boot-ON WS-pool build failed — exit with an error chain
+            // (a pool we intended to build but couldn't is a real boot failure,
+            // not an offline mode). The runtime classify path emits DHAN-LANE-02
+            // for the runtime cold-start arm.
+            Err(StartLaneError::WsPoolSpawn) => {
+                return Err(anyhow::anyhow!(
+                    "DHAN-LANE-02: WebSocket main-feed pool build/spawn failed at boot"
+                ));
+            }
         }
     } else {
         // Dhan-OFF (Groww-only / no-feed): no Dhan lane. The shared infra built
@@ -4712,6 +4858,16 @@ enum StartLaneError {
     /// Instrument load failed at boot — the inline spine `return Err(err)`d
     /// (process exits with the error chain).
     BootAbortErr(anyhow::Error),
+    /// FTC-14 (audit 2026-07-01): the WebSocket main-feed pool build/spawn
+    /// FAILED on a day we intended to connect (`should_connect_ws == true`,
+    /// so the plan was present) — `create_websocket_pool` returned `None`
+    /// despite a valid plan. Previously this silently proceeded with no pool
+    /// (offline-blind); it now fails the cold-start so `classify_start_lane_
+    /// error` can emit `DHAN-LANE-02` with `stage='ws_pool'`, pointing the
+    /// operator at the correct (pool-spawn) runbook instead of the wrong
+    /// (`universe_build_failed`) one. The lane FSM returns to `Off` + the
+    /// bounded retry re-attempts.
+    WsPoolSpawn,
 }
 
 /// Cold-start the full Dhan lane (slow boot arm). See the module-level doc
@@ -5380,6 +5536,36 @@ async fn start_dhan_lane(
             std::path::PathBuf::from("data/spill"),
         );
 
+    // BP-07 (PROC-01, 2026-07-01): supervised OOM-kill monitor. Reads the
+    // cgroup-v2 `memory.events` `oom_kill` counter vs a boot baseline every
+    // 60s and pages Critical (`error!(code = "PROC-01")` + `tv_oom_kills_total`)
+    // when the host OOM-killer takes a process in this cgroup. Before this an
+    // OOM was only caught indirectly (die → systemd → missing-SLO page), so an
+    // OOM-loop was indistinguishable from a panic-loop. Always-on (an OOM at
+    // any hour is critical); on a non-cgroup-v2 dev box the probe fails softly
+    // (`tv_oom_monitor_probe_failed_total`, no page, no panic). Supervised so a
+    // monitor panic respawns instead of vanishing (mirrors DISK-WATCHER-01).
+    let _oom_monitor_supervisor =
+        tickvault_storage::oom_monitor::spawn_supervised_oom_monitor(std::path::PathBuf::from(
+            tickvault_storage::oom_monitor::DEFAULT_CGROUP_V2_MEMORY_EVENTS_PATH,
+        ));
+
+    // BP-08 (RESOURCE-01/02/03, 2026-07-01): supervised process-level resource
+    // early-warning monitor. Samples open fd count vs LimitNOFILE (RESOURCE-01),
+    // VmRSS vs cgroup memory.max (RESOURCE-02), and spill-dir free-percent
+    // (RESOURCE-03) every 60s; pages Critical/High at 80% (fd/RSS) / <20% free
+    // (spill) so the operator acts BEFORE exhaustion — distinct from the host-
+    // aggregate mem_used_high / disk_used_high alarms. Always-on (resource
+    // exhaustion at any hour is critical); non-Linux probes fail softly
+    // (tv_resource_monitor_probe_failed_total, no page, no panic). Supervised so
+    // a monitor panic respawns instead of vanishing (mirrors DISK-WATCHER-01).
+    let _resource_monitor_supervisor =
+        tickvault_storage::resource_monitor::spawn_supervised_resource_monitor(
+            tickvault_storage::resource_monitor::ResourceMonitorPaths::platform_defaults(
+                std::path::PathBuf::from("data/spill"),
+            ),
+        );
+
     // D2 Stage 2: `health_status` is now built ONCE in the hoisted
     // `build_shared_infra` prefix and destructured into `main()` scope above, so
     // the lane references the SAME Arc the API server + run-loop hold. The
@@ -5679,7 +5865,11 @@ async fn start_dhan_lane(
             Some(token_manager.clone()),
         ) {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
-            None => (None, None),
+            // FTC-14: we intended to connect (should_connect_ws == true ⇒ plan
+            // present), but the pool build/spawn failed. Fail the cold-start so
+            // it surfaces as DHAN-LANE-02 (stage=ws_pool), not a silent
+            // offline-blind proceed. The lane returns to Off + bounded retry.
+            None => return Err(StartLaneError::WsPoolSpawn),
         }
     } else if !is_trading && !is_mock_trading {
         info!("WebSocket pool skipped — non-trading day (no live market data to capture)");
@@ -5894,6 +6084,10 @@ async fn start_dhan_lane(
 
         // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
         let greeks_enricher = build_inline_greeks_enricher(config, &subscription_plan);
+
+        // NT-15: seed the tick-gap detector with every subscribed SID so a
+        // never-ticking instrument becomes a first-tick black-hole signal.
+        seed_tick_gap_detector_from_plan(&subscription_plan);
 
         // O(1) EXEMPT: cold path — clone registry once for tick processor enrichment.
         let slow_registry = subscription_plan
@@ -6322,9 +6516,14 @@ async fn start_dhan_lane(
                     );
             }
             {
+                // CCL-02: supervised respawn wrapper (INDEX-OHLC-02) so a panic
+                // in the IST-midnight reset task can never silently take the
+                // daily reset offline — mirror WS-GAP-05 / DISK-WATCHER-01.
                 let reset_tracker = std::sync::Arc::clone(&day_ohlc_tracker);
-                let _reset_handle =
-                    tickvault_app::day_ohlc_orchestrator::spawn_midnight_reset_task(reset_tracker);
+                let _reset_supervisor_handle =
+                    tickvault_app::day_ohlc_orchestrator::spawn_supervised_midnight_reset_task(
+                        reset_tracker,
+                    );
             }
             info!(
                 "DayOhlcTracker boot wired (tick consumer + midnight reset; day_open = first live tick LTP)"
@@ -7488,7 +7687,21 @@ async fn start_dhan_lane(
     // over-budget completed-boot cases, and NEVER on a halt (a halt uses
     // `process::exit(...)` / `bail!`/`?`, none of which reach this line).
     // See `emit_boot_completed` for the alarm semantics.
-    emit_boot_completed();
+    //
+    // GATED on a live feed (audit fix, this PR): for `dhan_enabled=true` the
+    // Dhan lane already had to reach Running to get here (a start failure
+    // returns/exits earlier), but the `dhan_enabled=false` / Groww-only branch
+    // proceeds even though Groww activation is an ASYNC watcher that may never
+    // come up. `emit_boot_completed_when_feed_live` waits (bounded) for at least
+    // one enabled feed to reach Running and withholds the metric (→ boot-heartbeat
+    // alarm pages) if every enabled feed stays dark. No feed enabled → emits
+    // immediately (headless shared-infra run must not false-page).
+    emit_boot_completed_when_feed_live(
+        &feed_runtime,
+        config.feeds.dhan_enabled,
+        config.feeds.groww_enabled,
+    )
+    .await;
 
     // -----------------------------------------------------------------------
     // Step 12b: Background periodic health check (disk space + memory RSS + spill + QuestDB)
@@ -7968,11 +8181,11 @@ impl DhanLaneRuntimeContext {
 ///     the most common runtime cold-start failure class.
 ///   * `BootAbortErr` (instrument-load failed) maps to `DHAN-LANE-01`
 ///     (universe-build).
-/// `DHAN-LANE-02` (ws-pool-spawn) + `DHAN-LANE-04` (teardown-timeout) are
-/// emitted at their own dedicated sites (the pool-spawn split of
-/// `start_dhan_lane`'s return type is tracked for D2c; today pool-spawn
-/// failures surface inside `BootAbortErr` and are cross-linked from the
-/// `DHAN-LANE-01` runbook).
+///   * `WsPoolSpawn` (FTC-14) maps to `DHAN-LANE-02` (ws-pool-spawn) with
+///     `stage='ws_pool'` — a runtime WS-pool build/spawn failure on a
+///     connect-day now points the operator at the correct pool-spawn
+///     runbook instead of the wrong `universe_build_failed` one.
+/// `DHAN-LANE-04` (teardown-timeout) is emitted at its own dedicated site.
 #[must_use]
 fn classify_start_lane_error(
     err: &StartLaneError,
@@ -7992,6 +8205,12 @@ fn classify_start_lane_error(
             ErrorCode::DhanLane01UniverseBuildFailed,
             "universe_build_failed",
             "universe",
+        ),
+        // FTC-14: WS-pool build/spawn failed on a connect-day.
+        StartLaneError::WsPoolSpawn => (
+            ErrorCode::DhanLane02WsPoolSpawnFailed,
+            "ws_pool_spawn_failed",
+            "ws_pool",
         ),
     }
 }
@@ -8079,6 +8298,35 @@ fn should_abort_cold_start_on_disable(
 ) -> bool {
     use tickvault_api::feed_state::LaneState;
     !desired_on && matches!(lane_state, LaneState::Starting)
+}
+
+/// NT-15 (audit 2026-07-01): seed the global `TickGapDetector` with every
+/// subscribed instrument at boot so a SID that never ticks all session is
+/// still detectable as a per-SID cold black-hole (WS-GAP-06 /
+/// `tv_tick_gap_instruments_silent`), not silently masked by other SIDs that
+/// do tick. Insert-if-absent — never clobbers an entry a real tick already
+/// wrote. Cold path, called once per boot after the subscription plan exists.
+fn seed_tick_gap_detector_from_plan(plan: &Option<SubscriptionPlan>) {
+    let Some(plan) = plan else {
+        return;
+    };
+    let Some(detector) = tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
+    else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let mut seeded = 0u64;
+    // O(1) EXEMPT: cold-path boot seeding, one insert-if-absent per
+    // subscribed instrument (~universe size), never on the hot loop.
+    for inst in plan.registry.iter() {
+        detector.seed_subscribed(inst.security_id, inst.exchange_segment, now);
+        seeded += 1;
+    }
+    info!(
+        seeded,
+        "NT-15: seeded tick-gap detector with subscribed instruments — a \
+         never-ticking SID is now a first-tick black-hole signal"
+    );
 }
 
 /// Decide whether the runtime supervisor should SPAWN a fresh cold-start task
@@ -8956,6 +9204,68 @@ mod tests {
     // All pure helper tests moved to boot_helpers.rs in the lib target.
     // Tests below verify main.rs-specific smoke behavior.
 
+    // ── boot_completed_should_emit truth table ──
+    // The alive signal (tv_boot_completed) must be published only when at least
+    // one ENABLED feed is running — so a boot where every enabled feed died
+    // withholds it and the boot-heartbeat alarm pages. No feed enabled emits
+    // (headless run must not false-page). A running-but-disabled feed never
+    // counts.
+
+    #[test]
+    fn test_boot_completed_should_emit_both_off_emits() {
+        // No feed enabled at all → emit (deliberately feed-less run must not
+        // false-page). Feed-running values are irrelevant here.
+        assert!(boot_completed_should_emit(false, false, false, false));
+        assert!(boot_completed_should_emit(false, false, true, true));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_dhan_only_live() {
+        assert!(boot_completed_should_emit(true, false, true, false));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_dhan_only_dead() {
+        // Dhan enabled but not running, Groww disabled → withhold (page).
+        assert!(!boot_completed_should_emit(true, false, false, false));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_groww_only_live() {
+        assert!(boot_completed_should_emit(false, true, false, true));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_groww_only_dead() {
+        assert!(!boot_completed_should_emit(false, true, false, false));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_both_enabled_only_dhan_live() {
+        assert!(boot_completed_should_emit(true, true, true, false));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_both_enabled_only_groww_live() {
+        assert!(boot_completed_should_emit(true, true, false, true));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_both_enabled_none_live() {
+        // Both enabled, neither running → withhold (page). This is the core
+        // alerting-hole case: previously the metric was published unconditionally.
+        assert!(!boot_completed_should_emit(true, true, false, false));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_running_but_disabled_feed_does_not_count() {
+        // Dhan DISABLED but its running flag is somehow true (stale) — it must NOT
+        // count; only the ENABLED Groww matters, and Groww is dead → withhold.
+        assert!(!boot_completed_should_emit(false, true, true, false));
+        // Symmetric: Groww disabled-but-running, Dhan enabled-and-dead → withhold.
+        assert!(!boot_completed_should_emit(true, false, false, true));
+    }
+
     #[test]
     fn test_main_imports_boot_helpers() {
         // Verify boot_helpers constants are accessible from main.
@@ -9626,10 +9936,22 @@ mod tests {
         assert_eq!(code.code_str(), "DHAN-LANE-01");
         assert_eq!(reason, "universe_build_failed");
         assert_eq!(stage, "universe");
+        // FTC-14: WsPoolSpawn (WS-pool build/spawn failed on a connect-day) ->
+        // DHAN-LANE-02 with stage='ws_pool' — the CORRECT pool-spawn runbook,
+        // not the wrong universe-build one.
+        let (code, reason, stage) = classify_start_lane_error(&StartLaneError::WsPoolSpawn);
+        assert_eq!(code, ErrorCode::DhanLane02WsPoolSpawnFailed);
+        assert_eq!(code.code_str(), "DHAN-LANE-02");
+        assert_eq!(reason, "ws_pool_spawn_failed");
+        assert_eq!(stage, "ws_pool");
         // Secret discipline: the reason discriminants are FIXED strings, never
         // the raw error body (e.g. an auth response). Assert they contain no
         // dynamic content.
-        for r in ["auth_or_gate_failed", "universe_build_failed"] {
+        for r in [
+            "auth_or_gate_failed",
+            "universe_build_failed",
+            "ws_pool_spawn_failed",
+        ] {
             assert!(
                 !r.contains("synthetic"),
                 "reason must be a fixed discriminant, not the body"
