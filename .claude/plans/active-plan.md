@@ -10,6 +10,11 @@ single consolidated PR combines that `tickvault-app` boot fix with a trivial `ti
 clippy cleanup (drop a useless `u64::from` on an already-`u64` `security_id`) per the operator's
 fewer-bigger-PRs preference.
 
+> **Guarantee matrices:** carried by cross-reference to
+> `.claude/rules/project/per-wave-guarantee-matrix.md` (mandatory per
+> `per-item-guarantee-check.sh`). All 15 rows of the 100% Guarantee Matrix and
+> all 7 rows of the Resilience Demand Matrix apply to every item in this plan.
+
 ## Included change 2 (trivial): drop useless `u64::from(security_id)` in `tickvault-core`
 
 `crates/core/src/pipeline/tick_processor.rs::TickDedupRing` computes the FNV-1a dedup hash.
