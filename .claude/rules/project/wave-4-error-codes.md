@@ -89,16 +89,55 @@ within 5s.
 `crates/core/src/notification/events.rs::Depth20DynamicSwapChannelBroken`,
 `.claude/triage/error-rules.yaml::depth-dyn-02-swap-channel-broken-escalate`.
 
-## PROC-01 — OOM kill detected (Wave-4-E1)
+## PROC-01 — OOM kill detected (Wave-4-E1 / BP-07)
 
-**Reserved.** Severity::Critical.
+**LIVE (2026-07-01).** Severity::Critical. Auto-triage: NO.
+`ErrorCode::Proc01OomKillDetected` (`code_str() == "PROC-01"`).
 
-Triage stub: scrape of `/sys/fs/cgroup/.../memory.events` shows an
-`oom_kill` increment vs the boot-time baseline. The killed process
-may not be tickvault itself (could be a sidecar) — check
-`docker ps -a` for restart count.
+**Trigger:** the supervised OOM monitor
+(`crates/storage/src/oom_monitor.rs::spawn_supervised_oom_monitor`, wired at
+boot in `crates/app/src/main.rs` next to the disk-health watcher) reads the
+cgroup-v2 `memory.events` file at [`DEFAULT_CGROUP_V2_MEMORY_EVENTS_PATH`]
+(`/sys/fs/cgroup/memory.events`) every 60s and compares the `oom_kill` counter
+against a boot-time baseline (captured on the FIRST successful read, so a
+pre-existing lifetime OOM count never fires a spurious page). A positive delta
+means one or more processes in this cgroup — tickvault itself OR a sidecar —
+were killed by the kernel OOM killer. The monitor emits
+`error!(code = "PROC-01", …)` (Telegram Critical) and increments
+`tv_oom_kills_total` by the delta, then advances the baseline so the same
+kills are not re-reported.
 
-**Source (planned):** `crates/app/src/oom_monitor.rs`
+**Triage:**
+1. `mcp__tickvault-logs__tail_errors` — read the `PROC-01` payload: `new_kills`,
+   `total_kills`, `baseline`.
+2. `mcp__tickvault-logs__docker_status` — is the host OOM-killed? Check any
+   container/service restart count; the killed process may be a sidecar, not
+   tickvault.
+3. Cross-check host memory pressure — the r8g.large 16 GiB budget
+   (`aws-budget.md` / `daily-universe-scope-expansion-2026-05-27.md` §7) has
+   ~7.8 GB headroom, so a real OOM points at a leak or an unexpected working-set
+   spike; correlate with `tv_subsystem_memory_estimated_bytes{component=…}` +
+   the host `mem_used_high` alarm.
+4. A repeating PROC-01 (OOM-loop) during market hours needs operator action —
+   the box will keep dying; investigate the offending subsystem before it
+   starves the feeds.
+
+**Observability:** `tv_oom_kills_total` (new kills since baseline),
+`tv_oom_monitor_probe_failed_total` (probe I/O/parse failures — a non-cgroup-v2
+host reports these instead of kills, honestly signalling "no OOM source"),
+`tv_oom_monitor_respawn_total{reason}` (supervisor respawn — flapping monitor).
+
+**Honest envelope:** the monitor reports kills the kernel attributes to THIS
+cgroup's `oom_kill` counter. On a non-cgroup-v2 host (cgroup-v1 / macOS dev box)
+the probe fails softly — no page, no panic, and `tv_oom_monitor_probe_failed_total`
+rises so the lack of a signal is itself visible. It never blocks boot or the
+hot path.
+
+**Source:** `crates/storage/src/oom_monitor.rs`
+(`parse_oom_kill_count` / `classify_oom_delta` pure primitives +
+`spawn_supervised_oom_monitor`), `crates/common/src/error_code.rs::Proc01OomKillDetected`.
+Boot wiring: `crates/app/src/main.rs`. Wiring ratchet:
+`crates/core/src/auth/secret_manager.rs::tests::test_oom_monitor_is_wired_into_main`.
 
 ## PROC-02 — container restart loop (Wave-4-E1)
 
