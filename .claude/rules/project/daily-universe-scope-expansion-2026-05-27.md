@@ -48,7 +48,12 @@
 > §5 markers, the `instance_type_lock_guard.rs` ratchet, the Terraform validation,
 > the upgrade-script `FROM_TYPE` default (now `m8g.large`), and the Docker
 > QuestDB `QDB_MEM_LIMIT` default (2g → 4g, comfortable in 16 GiB). This dated
-> quote satisfies §7 Mechanical Rule 1 for the instance change. The 2K-universe
+> quote satisfies §7 Mechanical Rule 1 for the instance change.
+> **Post-resize note (2026-07-01):** the resize is now DONE (box is physically
+> `r8g.large`/16 GiB, effective at the 08:30 IST auto-start), so the docker-compose
+> `mem_limit: ${QDB_MEM_LIMIT:-4g}` default is now 4g directly — no longer coupled
+> to `scripts/aws-upgrade-instance.sh` (which #1274/#1278 had used to keep the
+> compose default at 2g until the physical resize). The 2K-universe
 > expansion (`MAX_DAILY_UNIVERSE_SIZE` / `SEAL_BUFFER_CAPACITY`) is a SEPARATE
 > later PR gated on a live memory measurement and is NOT changed here;
 > `dry_run` stays `true`.
