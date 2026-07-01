@@ -82,8 +82,38 @@ fn autopilot_still_self_heals_enabled_but_inactive_unit() {
          distinguish an intentional kill-switch from an enabled-but-inactive unit"
     );
     assert!(
-        body.contains("systemctl restart tickvault"),
-        "aws-autopilot.sh must still `systemctl restart tickvault` to self-heal \
-         an enabled-but-inactive unit — the auto-start guarantee depends on it"
+        body.contains("systemctl start tickvault"),
+        "aws-autopilot.sh must still `systemctl start tickvault` to self-heal \
+         an enabled-but-inactive unit — the auto-start guarantee depends on it. \
+         (BP-09: the recovery is now `reset-failed` + `start`, not a bare \
+         `restart`, so this pins `start`, the launch step, not `restart`.)"
+    );
+}
+
+/// Section D (BP-09, 2026-07-01) — the self-heal restart MUST `reset-failed`
+/// BEFORE it starts the unit. `deploy/systemd/tickvault.service` sets
+/// StartLimitBurst=8 / StartLimitIntervalSec=600, so after > 8 restarts in 10
+/// min systemd flips the unit to `failed` and a bare `systemctl restart`/`start`
+/// returns "Start request repeated too quickly" and is a NO-OP until the
+/// start-limit counter is cleared with `systemctl reset-failed`. Without this,
+/// autopilot pages but cannot recover a crash-loop — the box stays down until a
+/// human runs reset-failed (BP-09). This guard fails the build if the recovery
+/// ever regresses to a bare `restart`/`start` that omits `reset-failed`.
+#[test]
+fn autopilot_resets_failed_before_start_to_recover_crash_loop() {
+    let body = read(&repo_root().join("scripts/aws-autopilot.sh"));
+    assert!(
+        body.contains("reset-failed tickvault"),
+        "aws-autopilot.sh must `systemctl reset-failed tickvault` before starting \
+         the unit, or a StartLimit-`failed` crash-loop (StartLimitBurst=8 in \
+         tickvault.service) cannot be recovered — a bare restart/start on a \
+         `failed` unit is a no-op (BP-09)"
+    );
+    // reset-failed alone does not launch the app; the recovery MUST also start it.
+    assert!(
+        body.contains("systemctl start tickvault"),
+        "aws-autopilot.sh must `systemctl start tickvault` after `reset-failed` — \
+         reset-failed only clears the start-limit counter, it does not launch the \
+         unit (BP-09)"
     );
 }

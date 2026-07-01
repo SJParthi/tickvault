@@ -1,101 +1,148 @@
-# Implementation Plan: Gate the boot docker-compose-up CRITICAL on QuestDB health + drop a useless u64 conversion (consolidated boot/CI hardening)
+# Implementation Plan: BP-09 — autopilot recovers a systemd `failed` crash-loop
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-01
-**Approved by:** Parthiban (operator) — false-CRITICAL hardening surfaced by the 2026-07-01
-prod boot re-check (`scratchpad/verify-boot.md` GAP-B: 11:09 IST crash-recovery boot fired
-`docker compose up failed after 5 attempts → Telegram CRITICAL` while QuestDB was already up
-and the app ran healthily). Standing approval for the alerting-hole hardening queue. This
-single consolidated PR combines that `tickvault-app` boot fix with a trivial `tickvault-core`
-clippy cleanup (drop a useless `u64::from` on an already-`u64` `security_id`) per the operator's
-fewer-bigger-PRs preference.
+**Approved by:** Parthiban (operator) — grounded directive, this session (continue the permutation-coverage audit BP-09 fix; the prod box flapped start/stop this morning)
 
 > **Guarantee matrices:** carried by cross-reference to
-> `.claude/rules/project/per-wave-guarantee-matrix.md` (mandatory per
-> `per-item-guarantee-check.sh`). All 15 rows of the 100% Guarantee Matrix and
-> all 7 rows of the Resilience Demand Matrix apply to every item in this plan.
-
-## Included change 2 (trivial): drop useless `u64::from(security_id)` in `tickvault-core`
-
-`crates/core/src/pipeline/tick_processor.rs::TickDedupRing` computes the FNV-1a dedup hash.
-After the `security_id` u32→u64 widening, `security_id` is already `u64`, so `h ^= u64::from(security_id)`
-is a useless same-type conversion (clippy `useless_conversion`). Changed to `h ^= security_id`.
-NO logic change — the hash value, the dedup key, and every downstream behaviour are byte-identical;
-`u64::from(x: u64)` is the identity. This clears a clippy warning that would otherwise fail the
-`clippy -D warnings` CI gate. Rollback = revert the one-line hunk. No new tests needed (the existing
-`TickDedupRing` dedup tests already exercise the hash; the change is provably behaviour-preserving).
+> `.claude/rules/project/per-wave-guarantee-matrix.md` (the 15-row 100% matrix +
+> the 7-row resilience matrix) and `operator-charter-forever.md` §C — all 15+7
+> rows apply to this item. This is a bash + docs + source-scan-guard change (no
+> Rust hot path, no new tick-drop path, no new WS/QuestDB path, no new DEDUP
+> table), so the hot-path/DHAT/bench/DEDUP rows resolve `N/A — not a hot path`
+> and the tick-loss/WS/O(1) rows resolve `N/A — infra self-heal script, no tick
+> path touched`; the coverage/audit-of-fix/logging/functionality/extreme-check
+> rows are satisfied by the source-scan guard test below.
 
 ## Design
 
-`crates/app/src/infra.rs::ensure_infra_running` runs `docker compose up -d --force-recreate`
-up to `COMPOSE_UP_MAX_RETRIES = 5` (infra.rs:191-215). `--force-recreate` (infra.rs:1160) is
-NOT idempotent — it tears down + recreates every container on every boot, so on a same-day
-crash-recovery boot (QuestDB already up + busy) the recreate can fail all 5 attempts. On
-failure the code unconditionally fires `tracing::error!("... Telegram CRITICAL alert should
-fire.")` (infra.rs:216-221) and `return`s BEFORE the `wait_for_service_healthy` probe
-(infra.rs:225) — so the CRITICAL never consults whether the service the app actually needs
-(QuestDB) is reachable. Evidence (`verify-boot.md`): the 11:09 boot survived and ran healthily
-(`QuestDB ready — boot probe succeeded`, ticks flowing, tick conservation OK) precisely because
-QuestDB was already up. Paging CRITICAL when the required service is demonstrably healthy is a
-false-CRITICAL that erodes operator trust in the pager.
+BP-09 (permutation-coverage audit §169, gaps-matrix row): `scripts/aws-autopilot.sh`
+self-heals an **enabled-but-inactive** `tickvault` unit by running
+`systemctl restart tickvault` (line 205). But `deploy/systemd/tickvault.service`
+sets `StartLimitIntervalSec=600` + `StartLimitBurst=8`: after **> 8 restarts in
+10 min** systemd transitions the unit to `failed` and refuses further
+(re)starts — a plain `restart`/`start` then returns *"Start request repeated too
+quickly"* and is a **no-op**. systemd requires `systemctl reset-failed` FIRST to
+clear the start-limit counter before it will start the unit again (the service
+file's own comment, line 93, documents the manual recovery
+`systemctl reset-failed tickvault && systemctl start tickvault`). Today the box
+stays down until a human runs `reset-failed`; autopilot correctly *pages* but
+cannot *recover* — exactly the BP-09 gap, and consistent with the prod box
+flap-loop observed this morning (team memory `dhan-feed-reset-root-cause-2026-06-30`
+— a Dhan-RST-driven restart storm is the crash-loop that trips StartLimitBurst).
 
-**Fix (scoped):** when compose-up exhausts its retries, probe the required service (QuestDB)
-via the SAME `is_service_reachable(host, http_port)` used by `wait_for_service_healthy`. Route
-the outcome through a pure, unit-testable decision function
-`classify_compose_outcome(compose_succeeded, required_service_reachable) -> ComposeOutcome`:
+**Fix (minimal, correct, idempotent):** in the enabled-but-inactive branch,
+replace the single `systemctl restart tickvault` with
+`systemctl reset-failed tickvault` (clears any start-limit `failed` state — a
+safe no-op on a non-failed unit) **then** `systemctl start tickvault`. This
+recovers BOTH cases with one code path:
+- plain enabled-but-inactive (not failed): `reset-failed` is a harmless no-op,
+  `start` brings it up (equivalent to the old `restart` for this case);
+- StartLimit-`failed` crash-loop: `reset-failed` clears the counter so `start`
+  actually launches the unit — the case the old `restart` could not recover.
 
-| compose_succeeded | required_service_reachable | ComposeOutcome | Log level |
-|---|---|---|---|
-| true  | (n/a) | `Succeeded`          | info  |
-| false | true  | `DegradedServiceUp` | warn (Low — NOT CRITICAL, no page) |
-| false | false | `Critical`          | error (CRITICAL — real outage, keeps paging) |
+`start` (not `restart`) is correct after `reset-failed`: the unit is inactive,
+so `start` launches it; `restart` would also work but `start` is the precise
+intent. The kill-switch (`disabled` unit) branch is UNCHANGED — a disabled unit
+is still treated as an intentional stop and never auto-recovered.
 
-Only the genuine `compose down + service actually unreachable` case keeps the CRITICAL. The
-false-CRITICAL (`--force-recreate` churn while QuestDB is up) becomes a Low `warn!` that names
-the reason. This does NOT suppress a real compose failure where the service is down.
+Two companion corrections in the same PR:
+1. **Runbook doc-drift** — `docs/runbooks/aws-tickvault-exit-loop.md` says
+   "3 retries" / "3rd systemd restart" while the service file is
+   `StartLimitBurst=8` / `StartLimitIntervalSec=600`. Correct to
+   "8 restarts in 10 min" and add the `reset-failed`-then-`start` recovery
+   command that autopilot now performs (so operator + autopilot agree).
+2. **Guard test** — extend the existing autopilot self-heal ratchet
+   (`crates/storage/tests/deploy_no_disable_on_failure_guard.rs` Section C
+   already pins the restart mechanism) with a test asserting autopilot invokes
+   `reset-failed tickvault` before the start, so this recovery can never
+   silently regress to a bare `restart` (which is the no-op that caused BP-09).
 
 ## Edge Cases
-- compose-up succeeds first attempt → `Succeeded`, unchanged behaviour (health probe still runs).
-- compose-up fails 5× but QuestDB reachable (the observed 11:09 case) → `DegradedServiceUp`, warn, boot continues, health probe still runs.
-- compose-up fails 5× AND QuestDB unreachable → `Critical`, error (page fires) — a REAL outage, preserved.
-- QuestDB probe itself flaky at the decision instant → single TCP probe with the existing `INFRA_PROBE_TIMEOUT`; a false-negative here just keeps the (correct) CRITICAL — fail-safe toward paging, never toward silence.
-- Docker daemon down / SSM creds missing → EARLY `return` upstream (infra.rs:120-146), never reaches this branch — untouched.
+
+- **Unit not failed, just inactive:** `reset-failed` on a healthy/inactive unit
+  is a documented no-op (exit 0, nothing to clear) — `start` then launches it.
+  No behavioural regression vs the old `restart` for this common case.
+- **Unit disabled (kill-switch):** untouched — the `ENABLED == disabled` branch
+  short-circuits before reaching the restart path, so a 429-cooldown intentional
+  stop is still never auto-recovered.
+- **reset-failed itself fails / SSM hiccup:** the `2>/dev/null` + subsequent
+  `is-active` re-check still classifies the outcome; a failed recovery routes to
+  `note_issue` ("not active after restart") exactly as before — autopilot still
+  pages, never silently claims success (audit Rule 11, no false-OK).
+- **Repeated crash-loop that re-trips StartLimit after recovery:** autopilot runs
+  every 15 min; each run clears + restarts once. If the app immediately re-loops
+  to `failed`, the next run's `is-active` re-check reports inactive -> `note_issue`
+  pages. autopilot does not mask a persistent crash — it recovers a *stuck*
+  `failed` state (the BP-09 harm) without hiding a *genuine* repeating crash.
+- **Guard test running with no repo file present:** the guard reads the script
+  from `repo_root()` (same helper the file already uses); a missing file panics
+  the test loudly (correct — the script must exist).
 
 ## Failure Modes
-- The probe is best-effort and cannot panic (`is_service_reachable` swallows parse/connect errors → bool).
-- If the probe wrongly reports QuestDB down, we keep CRITICAL (louder, safe). If it wrongly reports up, the downstream `wait_for_service_healthy` + the app's own boot QuestDB probe (BOOT-01/02) still catch a genuinely dead QuestDB — defence in depth, no silent proceed.
-- No new hot-path code (boot-only, cold path). No allocation on any tick path.
+
+- If Dhan keeps RST-storming the feed (team memory 2026-06-30), the app can
+  crash-loop -> StartLimit `failed` again; autopilot now un-sticks it every 15
+  min instead of leaving it dead all day. This does NOT fix the upstream RST
+  cause (a separate DHAN-LANE / WS-GAP-09 concern) — it removes the
+  self-inflicted "box stays down until a human runs reset-failed" amplifier.
+  Honest envelope: recovery of the systemd `failed` state, not prevention of the
+  crash that caused it.
+- No data path touched: zero tick-loss / WS / QuestDB / DEDUP exposure. This is
+  a control-plane heal script.
 
 ## Test Plan
-- Pure-function truth table `classify_compose_outcome`: 3 unit tests (`Succeeded`, `DegradedServiceUp`, `Critical`) + a `ComposeOutcome` `is_critical()`/label stability test.
-- Assert the CRITICAL branch fires ONLY on `(false, false)`.
-- `cargo test -p tickvault-app --lib` (touched crate = app).
-- Hooks: banned-pattern, pub-fn-test, pub-fn-wiring, plan-verify.
+
+- `crates/storage/tests/deploy_no_disable_on_failure_guard.rs` — NEW Section D
+  test `autopilot_resets_failed_before_start_to_recover_crash_loop`: source-scan
+  asserts `scripts/aws-autopilot.sh` contains `reset-failed tickvault` AND that
+  the recovery path launches the unit (`systemctl start tickvault` present).
+  Fails the build if the fix regresses to a bare `restart`.
+- Existing Section C test (`autopilot_still_self_heals_enabled_but_inactive_unit`)
+  is UPDATED: it asserted `systemctl restart tickvault`; the recovery now uses
+  `reset-failed` + `start`, so the assertion is retargeted to `systemctl start
+  tickvault` (the mechanism the auto-start guarantee now depends on) — keeping
+  the ratchet intact against silent deletion.
+- `cargo test -p tickvault-storage --test deploy_no_disable_on_failure_guard`
+  green.
+- `bash -n scripts/aws-autopilot.sh` — script parses.
+- Guard hooks: `per-item-guarantee-check.sh` (active-plan.md PASS),
+  `plan-verify.sh`, `banned-pattern-scanner.sh`, `pub-fn-test-guard.sh`,
+  `pub-fn-wiring-guard.sh`.
 
 ## Rollback
-- Single-file change in `crates/app/src/infra.rs` (new pure fn + rewired `!compose_succeeded` branch). Revert the commit to restore the prior unconditional-CRITICAL behaviour. No schema, no config, no data migration, no wire-format change.
+
+Single squash commit; `git revert <sha>` restores the prior autopilot
+`restart`, the prior runbook text, and drops the new guard test. No schema, no
+migration, no data, no config-flag state — a pure revert is complete and safe.
 
 ## Observability
-- `DegradedServiceUp` logs `warn!` (Low, no Telegram page) with a plain-English reason ("services already up despite compose recreate churn").
-- `Critical` keeps the existing `tracing::error!` CRITICAL (routes to Telegram via the 5-sink pipeline) — now correctly gated on the required service being actually unreachable.
-- New static-label counter `tv_boot_compose_recreate_degraded_total` incremented on the `DegradedServiceUp` path so the operator can see how often `--force-recreate` churns while the service is up (trend signal without paging).
+
+No new metric/ErrorCode needed — autopilot already emits `note_heal` /
+`note_issue` -> GitHub Step Summary + Telegram via SNS (`tv-prod-alerts`). The
+heal message ("restarted app (tickvault) — was inactive") continues to fire on
+success and the issue message on failure, so the operator sees the recovery (or
+its failure) exactly as before, now for the `failed`-crash-loop case too. The
+source-scan guard test is the regression-observability for the fix itself.
 
 ## Plan Items
-- [x] Add pure `ComposeOutcome` enum + `classify_compose_outcome(compose_succeeded, required_service_reachable)` in `crates/app/src/infra.rs`
-  - Files: crates/app/src/infra.rs
-  - Tests: test_classify_compose_outcome_succeeded, test_classify_compose_outcome_degraded_service_up, test_classify_compose_outcome_critical_only_when_service_down, test_compose_outcome_is_critical_stable
-- [x] Rewire the `!compose_succeeded` branch (infra.rs:216-222) to probe QuestDB + route via the pure fn (warn Low vs error CRITICAL); increment `tv_boot_compose_recreate_degraded_total` on the degraded path
-  - Files: crates/app/src/infra.rs
-  - Tests: (covered by the pure-function truth table above)
-- [x] Drop the useless `u64::from(security_id)` in the FNV-1a dedup hash (already-`u64` after the widening) — clippy `useless_conversion` cleanup, behaviour-preserving
-  - Files: crates/core/src/pipeline/tick_processor.rs
-  - Tests: (behaviour-preserving identity conversion; existing `TickDedupRing` dedup tests cover the hash)
+
+- [x] Item 1 — autopilot `reset-failed` + `start` recovery
+  - Files: scripts/aws-autopilot.sh
+  - Tests: autopilot_resets_failed_before_start_to_recover_crash_loop
+- [x] Item 2 — runbook doc-drift fix (3->8 retries, add reset-failed recovery)
+  - Files: docs/runbooks/aws-tickvault-exit-loop.md
+  - Tests: (docs; covered by guard test's script assertion + manual read)
+- [x] Item 3 — extend/retarget the autopilot self-heal guard
+  - Files: crates/storage/tests/deploy_no_disable_on_failure_guard.rs
+  - Tests: autopilot_resets_failed_before_start_to_recover_crash_loop, autopilot_still_self_heals_enabled_but_inactive_unit
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | compose-up OK first try | info, health probe runs, no change |
-| 2 | compose-up fails 5×, QuestDB reachable (11:09 case) | warn Low, counter++, boot continues, NO page |
-| 3 | compose-up fails 5×, QuestDB unreachable | error CRITICAL, page fires (real outage) |
-| 4 | `tickvault-core` dedup hash with `u64` `security_id` | identical hash; clippy clean; `cargo check -p tickvault-core` green |
+| 1 | Unit in StartLimit `failed` (>8 restarts/10min), autopilot runs | reset-failed clears counter, start relaunches, note_heal; box recovers without a human |
+| 2 | Unit enabled-but-inactive (not failed) | reset-failed is a no-op, start launches, note_heal (unchanged behaviour) |
+| 3 | Unit disabled (kill-switch) | untouched — note_ok "intentionally stopped"; never auto-recovered |
+| 4 | App re-loops to `failed` immediately after recovery | next run's is-active re-check -> note_issue pages; no false-OK |
+| 5 | Guard test after a future edit reverts to bare `restart` | build fails (reset-failed assertion) |
