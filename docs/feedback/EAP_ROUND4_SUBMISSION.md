@@ -27,22 +27,22 @@ What used to be zero-click persistent navigation is now repeated manual pin+expa
 
 ## Evidence — 8 screenshots, in sequence
 
-### Before (the good behavior — evening, ~10:47 PM)
+### Before (the good behavior — Jun 30, ~10:47 PM IST)
 
-**Image 1** — "Engineering standards review" session. Left sidebar shows an auto-populated **Recents** list (Tick vault dhan skills, Tickvault AWS, Brutex, Engineering standards review). Active work surfaces on its own.
+**Image 1** (Jun 30, ~10:47 PM IST) — "Engineering standards review" session. Left sidebar shows an auto-populated **Recents** list (Tick vault dhan skills, Tickvault AWS, Brutex, Engineering standards review). Active work surfaces on its own.
 
-**Image 2** — "Tickvault AWS" session, same auto **Recents** sidebar. Proof the good behavior existed hours before the change.
+**Image 2** (Jun 30, ~10:47 PM IST) — "Tickvault AWS" session, same auto **Recents** sidebar. Proof the good behavior existed hours before the change.
 
-### After (the regression — next morning, ~7:56–7:57 AM)
+### After (the regression — Jul 1, ~7:56–7:57 AM IST)
 
-**Image 3** — Projects grid shows ~18 projects, but the left sidebar is now **Pinned-only** and lists just 4 — none auto-matching the grid; the "Sessions you start will show up here" empty state persists.
+**Image 3** (Jul 1, ~7:56 AM IST) — Projects grid shows ~18 projects, but the left sidebar is now **Pinned-only** and lists just 4 — none auto-matching the grid; the "Sessions you start will show up here" empty state persists.
 
-**Image 4** — Inside the TickVault project: "Pinned 0 / No sessions are pinned," and TickVault itself is not in the sidebar even though I am inside it.
+**Image 4** (Jul 1, ~7:57 AM IST) — Inside the TickVault project: "Pinned 0 / No sessions are pinned," and TickVault itself is not in the sidebar even though I am inside it.
 
-**Image 5** — Same view after clicking the pin — TickVault now appears in the sidebar. This proves you must manually pin each project to make it visible.
+**Image 5** (Jul 1, ~7:57 AM IST) — Same view after clicking the pin — TickVault now appears in the sidebar. This proves you must manually pin each project to make it visible.
 
-**Image 6** — The "Tickvalut aws" project opens as a cramped narrow side thread panel that must be manually expanded.
+**Image 6** (Jul 1, ~7:57 AM IST) — The "Tickvalut aws" project opens as a cramped narrow side thread panel that must be manually expanded.
 
-**Image 7** — The "Tick vault dhan skills" session thread, for reference.
+**Image 7** (Jul 1, ~7:57 AM IST) — The "Tick vault dhan skills" session thread, for reference.
 
-**Image 8** — TickVault project with the Thread panel side-by-side; "Pinned 0," and the pin/expand state does not persist across switches.
+**Image 8** (Jul 1, ~7:57 AM IST) — TickVault project with the Thread panel side-by-side; "Pinned 0," and the pin/expand state does not persist across switches.
