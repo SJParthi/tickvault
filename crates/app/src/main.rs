@@ -5517,6 +5517,22 @@ async fn start_dhan_lane(
             tickvault_storage::oom_monitor::DEFAULT_CGROUP_V2_MEMORY_EVENTS_PATH,
         ));
 
+    // BP-08 (RESOURCE-01/02/03, 2026-07-01): supervised process-level resource
+    // early-warning monitor. Samples open fd count vs LimitNOFILE (RESOURCE-01),
+    // VmRSS vs cgroup memory.max (RESOURCE-02), and spill-dir free-percent
+    // (RESOURCE-03) every 60s; pages Critical/High at 80% (fd/RSS) / <20% free
+    // (spill) so the operator acts BEFORE exhaustion — distinct from the host-
+    // aggregate mem_used_high / disk_used_high alarms. Always-on (resource
+    // exhaustion at any hour is critical); non-Linux probes fail softly
+    // (tv_resource_monitor_probe_failed_total, no page, no panic). Supervised so
+    // a monitor panic respawns instead of vanishing (mirrors DISK-WATCHER-01).
+    let _resource_monitor_supervisor =
+        tickvault_storage::resource_monitor::spawn_supervised_resource_monitor(
+            tickvault_storage::resource_monitor::ResourceMonitorPaths::platform_defaults(
+                std::path::PathBuf::from("data/spill"),
+            ),
+        );
+
     // D2 Stage 2: `health_status` is now built ONCE in the hoisted
     // `build_shared_infra` prefix and destructured into `main()` scope above, so
     // the lane references the SAME Arc the API server + run-loop hold. The
