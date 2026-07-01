@@ -100,6 +100,9 @@ pub mod disk_health_watcher;
 // BP-07 (2026-07-01): PROC-01 OOM-kill monitor — reads cgroup-v2
 // `memory.events` `oom_kill` vs boot baseline; mirrors disk_health_watcher.
 pub mod oom_monitor;
+// BP-08 (2026-07-01): RESOURCE-01/02/03 fd / RSS / spill-free early-warning
+// monitors — supervised poll mirroring oom_monitor + disk_health_watcher.
+pub mod resource_monitor;
 // Sub-PR #10b-ε (2026-05-27): instrument_fetch_audit table contract —
 // schema constants + DEDUP key + FetchOutcome enum. Feature-gated under
 // `daily_universe_fetcher` per
