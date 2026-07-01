@@ -1201,10 +1201,11 @@ mod tests {
              from the live tick stream."
         );
         assert!(
-            main_rs.contains("spawn_midnight_reset_task("),
-            "main.rs MUST call `day_ohlc_orchestrator::spawn_midnight_reset_task` \
-             from the boot path. Without it, yesterday's day OHLC carries over \
-             past IST midnight (INDEX-OHLC-02 condition)."
+            main_rs.contains("spawn_supervised_midnight_reset_task("),
+            "main.rs MUST call `day_ohlc_orchestrator::spawn_supervised_midnight_reset_task` \
+             from the boot path (CCL-02). Without the SUPERVISED wrapper, a panic in the \
+             IST-midnight reset task silently takes the daily reset offline and yesterday's \
+             day OHLC carries over past IST midnight with no operator signal (INDEX-OHLC-02)."
         );
         assert!(
             main_rs.contains("DayOhlcTracker::new()"),
