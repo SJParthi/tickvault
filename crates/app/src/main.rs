@@ -6422,9 +6422,14 @@ async fn start_dhan_lane(
                     );
             }
             {
+                // CCL-02: supervised respawn wrapper (INDEX-OHLC-02) so a panic
+                // in the IST-midnight reset task can never silently take the
+                // daily reset offline — mirror WS-GAP-05 / DISK-WATCHER-01.
                 let reset_tracker = std::sync::Arc::clone(&day_ohlc_tracker);
-                let _reset_handle =
-                    tickvault_app::day_ohlc_orchestrator::spawn_midnight_reset_task(reset_tracker);
+                let _reset_supervisor_handle =
+                    tickvault_app::day_ohlc_orchestrator::spawn_supervised_midnight_reset_task(
+                        reset_tracker,
+                    );
             }
             info!(
                 "DayOhlcTracker boot wired (tick consumer + midnight reset; day_open = first live tick LTP)"
