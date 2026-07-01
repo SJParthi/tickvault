@@ -167,12 +167,33 @@ api-feed.dhan.co, full-depth-api.dhan.co, depth-api-feed.dhan.co}.
 PR #406 item 9 (spill pre-flight). Wave-4-E2 extends to historical
 fetch + audit table writes.
 
-## AUTH-GAP-04 — TOTP secret rotated externally (Wave-4-E2)
+## AUTH-GAP-04 — TOTP secret rotated externally (AUTH-P11, live 2026-07-01)
 
-**Reserved.** Severity::Critical. Triage: token generation fails
-with `INVALID_TOTP` on first attempt despite TOTP secret being
-unchanged in our config. The secret was rotated externally (e.g.
-operator regenerated via dhan.co web UI without updating SSM).
+**Status (2026-07-01):** PROMOTED FROM RESERVED — defined as
+`ErrorCode::AuthGap04TotpRotatedExternally` with `code_str() == "AUTH-GAP-04"`.
+Severity::Critical. NOT auto-triage-safe.
+
+**Trigger:** the boot-time token-generation retry loop
+(`crates/core/src/auth/token_manager.rs`) rejected the TOTP code and
+exhausted `TOTP_MAX_RETRIES` (each retry waits a fresh 30s window). A
+genuinely wrong secret — the classic cause is the operator regenerating
+the 2FA/TOTP seed via the dhan.co web UI without updating the SSM param —
+never produces a valid code, so the loop terminates. That terminal branch
+now fires a distinctly-typed `error!(code = "AUTH-GAP-04", …)` (Telegram
+Critical) instead of a generic `AuthenticationFailed`, pointing the
+operator at the exact SSM parameter to reconcile.
+
+**Triage:**
+1. `mcp__tickvault-logs__tail_errors` — read the `AUTH-GAP-04` payload
+   (`totp_retries`, the SSM param hint).
+2. Verify `/tickvault/<env>/dhan/totp-secret` in SSM matches the seed
+   currently registered on the dhan.co web UI. If it was rotated, update
+   the SSM value + restart; if it was NOT changed, the seed drifted (clock
+   skew on the TOTP window is ruled out by BOOT-03).
+3. Auth is dead until the secret is reconciled — never auto-actioned.
+
+**Source:** `crates/common/src/error_code.rs::AuthGap04TotpRotatedExternally`,
+`crates/core/src/auth/token_manager.rs` (the TOTP-exhaustion terminal branch).
 
 ## DH-911 — Dhan API silent black-hole (Wave-4-E2)
 
@@ -187,18 +208,49 @@ filtering.
 in normal operation; if it does, the trading calendar is wrong or
 operator manually disabled the holiday gate.
 
-## RESOURCE-01 — file-descriptor count above threshold (Wave-4-E3)
+## RESOURCE-01/02/03 — fd / RSS / spill-free early-warning (BP-08, live 2026-07-01)
 
-**Reserved.** Severity::High. Threshold: > 80% of `ulimit -n`.
+**Status (2026-07-01):** PROMOTED FROM RESERVED — defined as
+`ErrorCode::Resource01FdCountHigh` / `Resource02ResidentMemoryHigh` /
+`Resource03SpillFreeLow` (`RESOURCE-01/02/03`). All Severity::High,
+auto-triage-safe (they page + are inspected, never auto-fixed).
 
-## RESOURCE-02 — resident memory bytes above threshold (Wave-4-E3)
+**Source:** the supervised `crates/app/src/resource_monitor.rs` task
+(mirrors the `disk_health_watcher.rs` supervised-poll + respawn template;
+`tv_resource_monitor_respawn_total` on a flapping monitor). Linux-only
+(`/proc`, cgroup); a non-Linux host or an unreadable probe degrades to a
+`ProbeFailed` skip with no false-OK.
 
-**Reserved.** Severity::High. Threshold: > 80% of cgroup limit.
+### RESOURCE-01 — file-descriptor count above threshold
 
-## RESOURCE-03 — spill file size above threshold (Wave-4-E3)
+**Trigger:** `/proc/self/fd` entry count crossed the early-warning
+threshold (default 80% of `LimitNOFILE`, read from `/proc/self/limits`).
+A leaked WS / QuestDB socket can exhaust the fd table with zero signal
+until `connect()` starts failing; this monitor pages BEFORE that.
+`tv_open_fds` gauge. **Triage:** `ls /proc/<pid>/fd | wc -l`; inspect for
+a socket leak (repeated same-peer entries) → cross-check WS reconnect
+churn (WS-GAP-05).
 
-**Reserved.** Severity::High. Threshold: > 50% of `data/spill/`
-free space.
+### RESOURCE-02 — resident memory bytes above threshold
+
+**Trigger:** process `VmRSS` (`/proc/self/status`) crossed the
+early-warning threshold (default 80% of the cgroup memory limit,
+`memory.max`). Distinct from the host-aggregate `mem_used_high` CloudWatch
+alarm — this is the tickvault process itself approaching its cgroup
+ceiling before the OOM killer (PROC-01) fires. `tv_process_rss_bytes`
+gauge. cgroup limit = `max` (unlimited) → skipped (no denominator).
+**Triage:** right-size the workload / investigate the leak; if it keeps
+climbing, PROC-01 (OOM kill) is imminent.
+
+### RESOURCE-03 — spill-directory free space below threshold
+
+**Trigger:** spill-dir free space dropped below the early-warning
+percent-of-total threshold (default 20% free). A process-level percent
+view distinct from the host `disk_used_high` aggregate, so a fast-filling
+spill dir is caught before the zero-loss chain is at risk. Reuses the
+`disk_health_watcher::probe_disk_free_bytes` probe. `tv_spill_free_pct`
+gauge. **Triage:** `df -h data/spill/`; restore the QuestDB drain
+(cross-check DISK-WATCHER-01 / BOOT-01/02) or free disk.
 
 ## OPER-01 — Dhan client-id changed in config (Wave-4-E3)
 
