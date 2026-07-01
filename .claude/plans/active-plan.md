@@ -1,6 +1,6 @@
 # Implementation Plan: BP-09 — autopilot recovers a systemd `failed` crash-loop
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-01
 **Approved by:** Parthiban (operator) — grounded directive, this session (continue the permutation-coverage audit BP-09 fix; the prod box flapped start/stop this morning)
 
