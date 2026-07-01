@@ -1,153 +1,214 @@
-# Implementation Plan: Damp the QuestDB-reachable probe feeding the 429 ride-out exit gate
+# Implementation Plan: Gate the boot "alive" signal on a live feed
 
 **Status:** VERIFIED
 **Date:** 2026-07-01
-**Approved by:** Parthiban (operator) — watchdog-cascade audit HIGH finding, this session 2026-07-01
+**Approved by:** Parthiban (operator) — standing approval for the permutation-coverage
+audit fix queue (`.claude/plans/permutation-coverage-audit-2026-07-01.md`), cross-cutting
+"alerting hole" hardening surfaced by the recovery re-check, this session 2026-07-01.
 
-Crate referenced: **tickvault-app** (change lives in `crates/app/src/main.rs`) +
-`tickvault-api` (`crates/api/src/state.rs` health-status damped signal).
+Crate referenced: **tickvault-app** (change lives in `crates/app/src/main.rs` +
+its `crates/app/tests/` guard). Terraform (`deploy/aws/terraform/*liveness*.tf`)
+edited only if a residual market-hours-liveness gap is found — see Design §2.
 
 > Guarantee matrices: carried by cross-reference to
 > `.claude/rules/project/per-wave-guarantee-matrix.md` (mandatory per
-> `per-item-guarantee-check.sh`). Dominant guarantee here: **strictly no worse
-> than today** — a genuine sustained QuestDB outage still forces the exit after
-> N ticks; the 15-min ride-out ceiling stays; token-invalid + non-reconnectable
-> still force exit unchanged. No hot-path change (the probe/counter is the 5s
-> cold watchdog tick). Does NOT touch `dry_run`, budget, instance lock, WAL
-> spill, `MAX_DAILY_UNIVERSE_SIZE`, `SEAL_BUFFER_CAPACITY`, or the #1280 WAL
-> boot-confirm code.
+> `per-item-guarantee-check.sh`). Dominant guarantee: **strictly-no-worse than
+> today for the boot-heartbeat page** — the emit still fires on a healthy boot;
+> it now ADDITIONALLY withholds "alive" when every enabled feed failed to come
+> up, so the heartbeat alarm (`treat_missing_data="breaching"`) pages exactly in
+> the previously-silent case. No hot-path change (boot is cold path). Does NOT
+> touch `dry_run`, budget, instance lock, WAL spill, `MAX_DAILY_UNIVERSE_SIZE`,
+> `SEAL_BUFFER_CAPACITY`, the 2-WebSocket lock, or feed enablement semantics.
 
 ## Design
 
-The pool-watchdog (`spawn_pool_watchdog_task`, `crates/app/src/main.rs` ~3479)
-runs one QuestDB liveness probe per 5s tick:
-`timeout(2s, wait_for_questdb_ready(&cfg, 1))` (~main.rs:3574), stores the raw
-result via `health.set_questdb_reachable(...)` (~3583), and later the Halt arm
-reads `health.questdb_reachable()` (~3689) into the ride-out classifiers
-`is_bare_reset_class` (~3373) and `is_in_window_429_rideout_class` (~3435), both
-of which HARD-REQUIRE `questdb_reachable == true`. So a SINGLE momentary QuestDB
-blip (GC pause / transient HTTP hiccup / the 2s timeout firing under load)
-during a live in-market 429 storm flips the flag false → `ride_out == false` →
-`process::exit(2)` → 775-SID cold re-subscribe → next 429 → the self-inflicted
-restart/429 loop that #1277 exists to stop.
+### Ground truth established (STEP 0, verified against the live tree)
 
-**Fix — DAMP only the signal that feeds the EXIT decision.** Add a pure damping
-function and a separate damped atomic on the health status; the raw single-probe
-signal stays untouched for `/health` + `overall_status` + observability.
+`emit_boot_completed()` (`crates/app/src/main.rs`) sets the `tv_boot_completed`
+gauge to `1.0`. It is called at TWO boot-completion points, and the CURRENT emit
+condition at each is:
 
-1. `crates/api/src/state.rs`:
-   - Add `questdb_reachable_for_exit_decision: AtomicBool` (init `true` — a
-     watchdog that has never probed must not pre-force an exit) + a
-     `set_/get_` pair. This is the DAMPED signal, read ONLY by the exit gate.
-   - `set_questdb_reachable(...)` (raw) is UNCHANGED — `/health`,
-     `overall_status`, and `handlers/health.rs` keep reading the raw probe.
-2. `crates/app/src/main.rs`:
-   - Add pure fn `damp_questdb_exit_signal(consecutive_failures: u32,
-     threshold: u32) -> bool` returning `true` (reachable-for-exit) unless
-     `consecutive_failures >= threshold`.
-   - Add `const POOL_WATCHDOG_QDB_EXIT_DAMP_THRESHOLD: u32 = 2` (N=2).
-   - In the watchdog task, hold a local `qdb_consecutive_failures: u32`
-     alongside `reconnect_in_place_since`. Each tick, after the raw probe:
-     raw `true` → reset counter to 0; raw `false` → saturating-add 1. Compute
-     `damp_questdb_exit_signal(counter, N)` and push it via the new
-     `set_questdb_reachable_for_exit_decision(...)`. Still push the raw result
-     via the existing `set_questdb_reachable(...)`.
-   - The Halt arm reads `health.questdb_reachable_for_exit_decision()` (damped)
-     instead of `health.questdb_reachable()` (raw) for the two ride-out
-     classifiers ONLY.
+- **Slow-boot / normal** (main.rs:7458): fires unconditionally after the
+  boot-complete `if/else` + `notify_systemd_ready()`. For `dhan_enabled=true`,
+  the Dhan lane's `start_dhan_lane` must have returned `Ok` earlier to REACH this
+  line (a Dhan-start failure `return`s/exits before it) — so the Dhan-enabled
+  slow path is *already* effectively gated on the Dhan lane succeeding. BUT the
+  `dhan_enabled=false` / Groww-only branch takes the `None` arm and proceeds to
+  emit even though Groww's activation is an ASYNC spawned watcher
+  (`run_groww_activation_watcher`) that may never come up.
+- **Fast-boot / crash-recovery** (main.rs:2191): fires UNCONDITIONALLY after
+  `notify_systemd_ready()`. This arm is Dhan-ON-only (guarded by
+  `config.feeds.dhan_enabled` at main.rs:1320), but the warm-snapshot re-injects
+  the WS pool asynchronously — a crash-recovery where the pool never reconnects
+  still emits "alive."
 
-**Chosen N = 2.** Justification: N×5s = 10s of sustained unreachability before
-the exit gate treats QuestDB as down — well within the ~15s self-review budget
-and far below the 15-min ride-out ceiling, so a REAL outage still exits promptly
-(2 consecutive failed 5s ticks). N=1 = today's undamped bug; N=3 (15s) is the
-upper acceptable bound but 2 already absorbs a single blip while exiting a real
-outage in 10s. 2 is the smallest N that fixes the bug — minimal behaviour change.
+**Net current behaviour:** a boot where every enabled feed failed to reach a live
+state can still publish `tv_boot_completed=1` → the boot-heartbeat alarm
+(`treat_missing_data="breaching"`, boot-heartbeat-alarm.tf) does NOT page. **Gap
+is real and OPEN** for the Groww-only and fast-boot-pool-fail permutations.
+
+The async reality: both emit points are SYNCHRONOUS instants, but feed lanes come
+up asynchronously (`mark_dhan_lane_running` inside the `dhan_enabled` block +
+`start_dhan_lane` → Running; `mark_groww_lane_running` only after the async
+watch-list build). A point-in-time `lane_running` snapshot at the emit instant
+would FALSE-NEGATIVE a feed that is still legitimately coming up → a false page.
+
+### The fix
+
+1. **Pure guard helper** `boot_completed_should_emit(dhan_enabled, groww_enabled,
+   dhan_running, groww_running) -> bool`:
+   - No feed enabled (`!dhan_enabled && !groww_enabled`) → `true` (preserve
+     today's behaviour; a deliberately feed-less run must not false-page). The
+     caller logs this explicitly.
+   - At least one feed enabled → `true` iff at least ONE ENABLED feed is running
+     (`(dhan_enabled && dhan_running) || (groww_enabled && groww_running)`).
+     Feed-agnostic: Groww-only-live satisfies it, Dhan-only-live satisfies it,
+     both-enabled needs either.
+   - Both-enabled-none-live / only-enabled-feed-not-live → `false` (withhold
+     "alive" → heartbeat alarm pages).
+
+2. **Bounded liveness wait at each emit site.** Before calling
+   `emit_boot_completed()`, poll `feed_runtime.is_dhan_lane_running()` /
+   `is_groww_lane_running()` against `boot_completed_should_emit(...)` for a
+   bounded window (poll ~1s cadence, capped by a bounded boot-scale timeout). The
+   moment the guard returns `true`, emit and stop waiting. If the window elapses
+   with the guard still `false` (every enabled feed failed to come up), do NOT
+   emit and log an `error!` naming the dead feed(s) — the heartbeat alarm then
+   pages on the MISSING metric, exactly the intended signal. The no-feed-enabled
+   case returns `true` on the first poll (instant emit, unchanged timing).
+
+   Rationale for a bounded WAIT (not an instant snapshot): it removes the async
+   false-negative while keeping the honest end-state — a feed that comes up
+   within the window still yields a prompt "alive"; a feed that never comes up
+   correctly withholds it.
+
+3. **Source-scan wiring guard** in `crates/app/tests/boot_completed_metric_guard.rs`:
+   assert `emit_boot_completed()` is gated by `boot_completed_should_emit(` at
+   BOTH call sites (the emit is no longer a bare unconditional call), and that
+   the helper is defined. Rule-13 "defined-and-wired" ratchet.
+
+### §2 Market-hours liveness alarm
+
+PR #1284 already shipped `deploy/aws/terraform/market-hours-liveness-alarm.tf`:
+an ALWAYS-ON (window-gated 09:20–15:35 IST) alarm that pages when
+`tv_realtime_guarantee_score` is MISSING for ~5 min — i.e. the app is
+wedged/crash-looped/dead during market hours REGARDLESS of the narrow
+08:50–09:10 boot-heartbeat window. It covers "no enabled feed is streaming during
+market hours ⇒ SLO loop stops publishing ⇒ page": a dead feed makes the SLO
+composite loop stop emitting the score. **No duplicate alarm is needed.** This
+plan does NOT add a second market-hours alarm; §2 is a verify, not an extend.
 
 ## Edge Cases
 
-- First-ever tick before any probe: damped atomic inits `true`, so no
-  pre-emptive false-exit; the gate already requires other predicates too.
-- Single blip mid-storm: counter goes 0→1, `damp(1,2)==true` ⇒ ride-out
-  continues (the fix).
-- Two consecutive blips: counter 1→2, `damp(2,2)==false` ⇒ exit forced
-  (genuine sustained outage — never worse than today).
-- Success mid-way: a `true` probe resets counter to 0, so the NEXT single
-  failure starts fresh (a real outage must be N *consecutive*).
-- Off-hours / Dhan-OFF: the `should_act` gate short-circuits before the Halt
-  ride-out arm, so the damped signal is irrelevant there — unchanged.
-- Counter overflow: `saturating_add(1)` — can never wrap.
-- `/health` and `overall_status`: read the RAW signal, so a single blip still
-  shows "unreachable" for that one probe (observability NOT degraded).
+- **No feed enabled (both off):** helper → `true`, emit fires instantly, logged
+  explicitly (`info!`). Never a false page for a deliberately feed-less run.
+- **Groww-only, Groww comes up in 2s:** bounded wait polls, sees
+  `is_groww_lane_running()` flip true, emits. No false-negative.
+- **Groww-only, Groww never comes up:** window elapses, guard stays false, NO
+  emit, `error!` names Groww dead → heartbeat alarm pages.
+- **Dhan-only slow boot, Dhan start fails:** process `return`s/exits before the
+  emit (unchanged) → metric missing → pages. Guard is belt-and-suspenders here.
+- **Both enabled, one live:** helper → `true` (either satisfies). Correct.
+- **Both enabled, none live:** guard false → no emit → pages.
+- **Fast-boot pool re-inject fails:** bounded wait sees `is_dhan_lane_running()`
+  false for the window → no emit → pages (was silently "alive" before).
+- **Fast-boot pool re-inject succeeds:** `is_dhan_lane_running()` already true
+  (marked at main.rs:330 inside the `dhan_enabled` block) → instant emit.
 
 ## Failure Modes
 
-- Genuine sustained QuestDB outage: 2 consecutive failed probes flip the damped
-  signal false → ride-out classifiers return false → genuine-fatal exit (today's
-  behaviour, +10s). Correct — never a new wedge.
-- Token-invalid / non-reconnectable code: ride-out classifiers still require
-  `token_valid` + no `saw_non_reconnectable` — UNCHANGED by this diff, still
-  force exit.
-- 15-min ceiling: `reconnect_in_place_ceiling_exceeded` is untouched — a
-  ride-out that persists past 15 min still falls back to the genuine-fatal exit.
-- WS-GAP-08 persisted-cooldown / WS-GAP-09 ride-out counters: unchanged.
+- **Helper returns wrong verdict:** covered by the unit truth-table (both-off,
+  dhan-only-live/dead, groww-only-live/dead, both-live variants,
+  both-enabled-none-live, running-but-disabled-does-not-count).
+- **Bounded wait hangs boot:** capped by a bounded timeout, polls a cheap Relaxed
+  atomic; on timeout it proceeds (no emit + error log), so boot never blocks
+  indefinitely on this check.
+- **Guard regressed to a bare emit:** the source-scan wiring guard fails the
+  build (both call sites must show `boot_completed_should_emit`).
+- **False page on a healthy feed-less run:** prevented by the explicit
+  no-feed-enabled → `true` arm + its dedicated unit test + `info!` log.
 
 ## Test Plan
 
-Unit tests (in `crates/app/src/main.rs` `mod tests`, next to the ride-out tests):
-- `test_damp_questdb_exit_signal_single_blip_stays_reachable` — 1 failure with
-  N=2 ⇒ `true` (ride-out continues).
-- `test_damp_questdb_exit_signal_n_consecutive_flips` — 2 (and >2) failures with
-  N=2 ⇒ `false` (exit forced).
-- `test_damp_questdb_exit_signal_success_resets` — model the counter loop: a
-  `true` between failures resets, so it takes N fresh consecutive failures to
-  flip (proves a mid-way success resets).
-- `test_damp_questdb_exit_signal_threshold_is_two` — pin N=2.
+Unit (in `crates/app/src/main.rs` `#[cfg(test)]`), naming
+`test_boot_completed_should_emit_*`:
+- both-off → true
+- dhan-only enabled + dhan running → true
+- dhan-only enabled + dhan NOT running → false
+- groww-only enabled + groww running → true
+- groww-only enabled + groww NOT running → false
+- both enabled + only dhan running → true
+- both enabled + only groww running → true
+- both enabled + neither running → false
+- dhan disabled + dhan_running true (running-but-disabled) + groww enabled+dead
+  → false (a running-but-disabled feed does not count)
 
-Health-status test (in `crates/api/src/state.rs` `mod tests`):
-- `test_questdb_reachable_for_exit_decision_independent_of_raw` — the raw
-  `set_questdb_reachable(false)` does NOT change the damped
-  `questdb_reachable_for_exit_decision()` (still `true` until explicitly set),
-  proving `/health`'s raw signal and the exit signal are separate.
+Source-scan guard (`crates/app/tests/boot_completed_metric_guard.rs`):
+- `boot_completed_should_emit(` appears at BOTH emit sites and the helper is
+  defined.
+- existing 4 guard tests still pass (metric name, both-paths, CW scrape filter,
+  alarm repoint) — the emit is still present on both paths, just gated.
 
-Run `cargo test -p tickvault-app --lib` and `cargo test -p tickvault-api --lib`,
-paste `test result:` lines.
+Commands: `cargo check -p tickvault-app` then `cargo test -p tickvault-app --lib`
++ `cargo test -p tickvault-app --test boot_completed_metric_guard`. Paste the
+`test result: ok.` line. Known-unrelated env-only failures (ip_verifier /
+secret_manager "fails without real SSM") confirmed with empty `git diff` on those
+files.
 
 ## Rollback
 
-Single-commit, self-contained. Revert the commit to restore the undamped
-single-probe read (the `health.questdb_reachable()` call at the Halt arm) — no
-schema, no data, no config, no dependency change; nothing to migrate. The new
-`AtomicBool` and pure fn are additive and inert once the Halt-arm read reverts.
+Single-file logic change in `crates/app/src/main.rs` + its guard test. Revert the
+commit to restore the unconditional emit. No schema, no migration, no terraform
+state change (the alarm is untouched — it already pages on MISSING; this PR only
+makes MISSING happen in the dead-feed case). `git revert <sha>` is complete.
 
 ## Observability
 
-- The damped signal drives ONLY the exit decision; `/health`,
-  `overall_status`, and `handlers/health.rs` keep the RAW single-probe signal —
-  observability of QuestDB reachability is NOT degraded (a blip still shows on
-  `/health`).
-- The existing WS-GAP-09 `tv_ws_watchdog_reconnect_in_place_total{reason}`
-  counter now correctly stays on the ride-out path through a single blip instead
-  of dropping to `process::exit` — so the counter's meaning sharpens (fewer
-  false genuine-fatal `tv_pool_self_halts_total` increments from blips).
-- No new error code, no new Telegram event, no new metric — this is a damping of
-  an EXISTING gate, not a new failure mode (WS-GAP-09 already covers the ride-out
-  path; no rule-file/ErrorCode addition needed).
+- `tv_boot_completed` gauge — unchanged name/semantics; now published ONLY when a
+  live feed exists (or no feed is enabled). MISSING ⇒ boot-heartbeat alarm pages
+  (existing, `treat_missing_data="breaching"`).
+- New `error!` at each emit site when the bounded wait elapses with no live feed:
+  names the dead enabled feed(s) so the operator's Telegram/`errors.jsonl` shows
+  WHY the box will page (no new ErrorCode — boot-path diagnostic routed through
+  the existing 5-sink error pipeline; complements, not replaces, the
+  MISSING-metric page).
+- `info!` on the no-feed-enabled emit path (explicit, per task requirement).
+- Market-hours liveness: covered by the existing PR #1284 alarm (§2 verify).
 
 ## Plan Items
 
-- [x] Add damped `questdb_reachable_for_exit_decision` AtomicBool + setter/getter to health status
-  - Files: crates/api/src/state.rs
-  - Tests: test_questdb_reachable_for_exit_decision_independent_of_raw
-
-- [x] Add pure `damp_questdb_exit_signal` fn + N=2 threshold const; wire the watchdog counter + damped setter; switch the Halt-arm read to the damped getter
+- [x] Add pure `boot_completed_should_emit(dhan_enabled, groww_enabled,
+      dhan_running, groww_running) -> bool` helper + unit truth-table tests.
   - Files: crates/app/src/main.rs
-  - Tests: test_damp_questdb_exit_signal_single_blip_stays_reachable, test_damp_questdb_exit_signal_n_consecutive_flips, test_damp_questdb_exit_signal_success_resets, test_damp_questdb_exit_signal_threshold_is_two
+  - Tests: test_boot_completed_should_emit_both_off_emits,
+    test_boot_completed_should_emit_dhan_only_live,
+    test_boot_completed_should_emit_dhan_only_dead,
+    test_boot_completed_should_emit_groww_only_live,
+    test_boot_completed_should_emit_groww_only_dead,
+    test_boot_completed_should_emit_both_enabled_only_dhan_live,
+    test_boot_completed_should_emit_both_enabled_only_groww_live,
+    test_boot_completed_should_emit_both_enabled_none_live,
+    test_boot_completed_should_emit_running_but_disabled_feed_does_not_count
+
+- [x] Gate BOTH `emit_boot_completed()` call sites behind a bounded liveness wait
+      driven by the helper; error-log + withhold on timeout; info-log the
+      no-feed-enabled path.
+  - Files: crates/app/src/main.rs
+  - Tests: (source-scan) boot_completed_emit_sites_are_gated_on_live_feed
+
+- [x] Extend the source-scan wiring guard so a regression to a bare
+      unconditional emit fails the build.
+  - Files: crates/app/tests/boot_completed_metric_guard.rs
+  - Tests: boot_completed_emit_sites_are_gated_on_live_feed
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | 1 blip during in-market 429 storm | ride-out continues (no exit) |
-| 2 | 2 consecutive failed probes (real outage) | exit forced (genuine-fatal) |
-| 3 | success between two failures | counter resets; needs 2 fresh consecutive to flip |
-| 4 | `/health` during 1 blip | raw signal shows "unreachable" (observability intact) |
+| 1 | Both feeds off | emit fires, info-logged, no page |
+| 2 | Groww-only, comes up | emit fires promptly, no page |
+| 3 | Groww-only, never comes up | no emit, error-logged, heartbeat pages |
+| 4 | Both enabled, only Dhan live | emit fires, no page |
+| 5 | Both enabled, neither live | no emit, error-logged, heartbeat pages |
+| 6 | Fast-boot pool re-inject fails | no emit, heartbeat pages (was silent) |
+| 7 | Healthy Dhan slow boot | emit fires (unchanged), no page |
