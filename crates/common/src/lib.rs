@@ -35,6 +35,7 @@ pub mod instrument_registry;
 pub mod instrument_types;
 pub mod locked_universe;
 pub mod market_hours;
+pub mod muhurat;
 pub mod open_price_rest_fallback;
 pub mod open_price_source;
 pub mod order_types;
