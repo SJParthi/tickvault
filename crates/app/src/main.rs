@@ -188,6 +188,121 @@ fn emit_boot_completed() {
     metrics::gauge!(BOOT_COMPLETED_METRIC).set(1.0);
 }
 
+/// How long the boot-completed emit waits for AT LEAST ONE enabled feed's lane
+/// to reach a running state before it decides. Feed lanes come up
+/// asynchronously (the Dhan lane FSM Starting→Running, the Groww activation
+/// watcher's watch-list build), so a point-in-time snapshot at the emit instant
+/// would false-NEGATIVE a feed that is legitimately still coming up. A bounded
+/// wait removes that race while keeping the honest end-state: a feed that never
+/// comes up correctly withholds the "alive" signal. Boot is cold path, so a
+/// bounded 60s poll is well inside every boot budget.
+const BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS: u64 = 60;
+
+/// Poll cadence for the boot-completed feed-liveness wait.
+const BOOT_COMPLETED_FEED_LIVENESS_POLL_MS: u64 = 1000;
+
+/// Decide whether the boot-completed "the app is alive" signal
+/// (`tv_boot_completed`) may be emitted, given each feed's enabled flag and its
+/// observed lane-running state.
+///
+/// FEED-AGNOSTIC by construction: the signal is warranted iff AT LEAST ONE
+/// ENABLED feed is running — a live Groww satisfies it when only Groww is
+/// enabled, a live Dhan when only Dhan is enabled, and either when both are
+/// enabled. A running-but-DISABLED feed never counts (an operator-off feed is
+/// not a reason to claim "alive").
+///
+/// The one exception: when NO feed is enabled (a deliberately feed-less run —
+/// shared-infra-only), the signal IS emitted so the boot-heartbeat alarm does
+/// not false-page a legitimately headless boot. The caller logs that case
+/// explicitly.
+///
+/// This closes the alerting hole where a boot that reached the emit line with
+/// EVERY enabled feed dead still published `tv_boot_completed=1` — so the
+/// boot-heartbeat alarm (`treat_missing_data="breaching"`) never paged. With
+/// this gate, "every enabled feed failed to come up" withholds the metric →
+/// MISSING → the alarm pages, exactly the intended signal.
+///
+/// Pure + O(1) — unit-tested truth table.
+fn boot_completed_should_emit(
+    dhan_enabled: bool,
+    groww_enabled: bool,
+    dhan_running: bool,
+    groww_running: bool,
+) -> bool {
+    // Deliberately feed-less run: nothing to be "live", so emit to avoid a
+    // false page on a headless shared-infra-only boot.
+    if !dhan_enabled && !groww_enabled {
+        return true;
+    }
+    // At least one feed enabled: emit iff at least one ENABLED feed is running.
+    (dhan_enabled && dhan_running) || (groww_enabled && groww_running)
+}
+
+/// Emit `tv_boot_completed` ONLY once at least one enabled feed's lane is
+/// genuinely running — waiting up to [`BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS`]
+/// for an async-starting feed to come up. Withholds the metric (and logs an
+/// `error!` naming the dead feed(s)) if the window elapses with every enabled
+/// feed dark, so the boot-heartbeat alarm pages on the MISSING signal.
+///
+/// The no-feed-enabled case (shared-infra-only) resolves `true` on the first
+/// poll and emits immediately (unchanged timing), logged at `info!`.
+async fn emit_boot_completed_when_feed_live(
+    feed_runtime: &std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
+    dhan_enabled: bool,
+    groww_enabled: bool,
+) {
+    if !dhan_enabled && !groww_enabled {
+        // Deliberately feed-less run — emit immediately (no feed to wait for),
+        // logged explicitly so the operator sees WHY the "alive" signal fired
+        // with no live feed.
+        info!(
+            "boot-completed: no feed enabled (dhan_enabled=false, groww_enabled=false) — \
+             emitting the alive signal for a deliberately shared-infra-only run"
+        );
+        emit_boot_completed();
+        return;
+    }
+
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS);
+    loop {
+        let dhan_running = feed_runtime.is_dhan_lane_running();
+        let groww_running = feed_runtime.is_groww_lane_running();
+        if boot_completed_should_emit(dhan_enabled, groww_enabled, dhan_running, groww_running) {
+            info!(
+                dhan_enabled,
+                groww_enabled,
+                dhan_running,
+                groww_running,
+                "boot-completed: a live feed is up — emitting the alive signal"
+            );
+            emit_boot_completed();
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            // Every enabled feed failed to reach running within the window.
+            // WITHHOLD the alive signal so the boot-heartbeat alarm pages on the
+            // MISSING metric, and name the dead feed(s) for the operator.
+            error!(
+                dhan_enabled,
+                groww_enabled,
+                dhan_running,
+                groww_running,
+                wait_secs = BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS,
+                "boot-completed: NO enabled feed reached a live state within the wait window — \
+                 WITHHOLDING the alive signal (tv_boot_completed) so the boot-heartbeat alarm \
+                 pages on the missing metric. Check the enabled feed(s): a Dhan lane that never \
+                 reached Running or a Groww activation that never built its watch-list."
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(
+            BOOT_COMPLETED_FEED_LIVENESS_POLL_MS,
+        ))
+        .await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
@@ -2188,7 +2303,19 @@ async fn main() -> Result<()> {
         // because this path returns into `run_shutdown_fast()` and never reaches
         // the slow-boot emit at the end of `main()`. See `emit_boot_completed`
         // for the full rationale (boot-heartbeat alarm pages on MISSING).
-        emit_boot_completed();
+        //
+        // GATED on a live feed (audit fix, this PR): the fast-boot arm is
+        // Dhan-ON-only, but the warm-snapshot re-injects the WS pool
+        // asynchronously — a crash-recovery where the pool never reconnects must
+        // NOT publish "alive". `emit_boot_completed_when_feed_live` waits (bounded)
+        // for the Dhan lane to reach Running and withholds the metric (→ alarm
+        // pages) if it never does.
+        emit_boot_completed_when_feed_live(
+            &feed_runtime,
+            config.feeds.dhan_enabled,
+            config.feeds.groww_enabled,
+        )
+        .await;
 
         // Boot-symmetry fix (2026-06-09): the post-market 15:31 cross-verify +
         // 15:31:30 EOD digest were slow-boot-only, so a mid-session crash restart
@@ -7488,7 +7615,21 @@ async fn start_dhan_lane(
     // over-budget completed-boot cases, and NEVER on a halt (a halt uses
     // `process::exit(...)` / `bail!`/`?`, none of which reach this line).
     // See `emit_boot_completed` for the alarm semantics.
-    emit_boot_completed();
+    //
+    // GATED on a live feed (audit fix, this PR): for `dhan_enabled=true` the
+    // Dhan lane already had to reach Running to get here (a start failure
+    // returns/exits earlier), but the `dhan_enabled=false` / Groww-only branch
+    // proceeds even though Groww activation is an ASYNC watcher that may never
+    // come up. `emit_boot_completed_when_feed_live` waits (bounded) for at least
+    // one enabled feed to reach Running and withholds the metric (→ boot-heartbeat
+    // alarm pages) if every enabled feed stays dark. No feed enabled → emits
+    // immediately (headless shared-infra run must not false-page).
+    emit_boot_completed_when_feed_live(
+        &feed_runtime,
+        config.feeds.dhan_enabled,
+        config.feeds.groww_enabled,
+    )
+    .await;
 
     // -----------------------------------------------------------------------
     // Step 12b: Background periodic health check (disk space + memory RSS + spill + QuestDB)
@@ -8955,6 +9096,68 @@ mod tests {
 
     // All pure helper tests moved to boot_helpers.rs in the lib target.
     // Tests below verify main.rs-specific smoke behavior.
+
+    // ── boot_completed_should_emit truth table ──
+    // The alive signal (tv_boot_completed) must be published only when at least
+    // one ENABLED feed is running — so a boot where every enabled feed died
+    // withholds it and the boot-heartbeat alarm pages. No feed enabled emits
+    // (headless run must not false-page). A running-but-disabled feed never
+    // counts.
+
+    #[test]
+    fn test_boot_completed_should_emit_both_off_emits() {
+        // No feed enabled at all → emit (deliberately feed-less run must not
+        // false-page). Feed-running values are irrelevant here.
+        assert!(boot_completed_should_emit(false, false, false, false));
+        assert!(boot_completed_should_emit(false, false, true, true));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_dhan_only_live() {
+        assert!(boot_completed_should_emit(true, false, true, false));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_dhan_only_dead() {
+        // Dhan enabled but not running, Groww disabled → withhold (page).
+        assert!(!boot_completed_should_emit(true, false, false, false));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_groww_only_live() {
+        assert!(boot_completed_should_emit(false, true, false, true));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_groww_only_dead() {
+        assert!(!boot_completed_should_emit(false, true, false, false));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_both_enabled_only_dhan_live() {
+        assert!(boot_completed_should_emit(true, true, true, false));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_both_enabled_only_groww_live() {
+        assert!(boot_completed_should_emit(true, true, false, true));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_both_enabled_none_live() {
+        // Both enabled, neither running → withhold (page). This is the core
+        // alerting-hole case: previously the metric was published unconditionally.
+        assert!(!boot_completed_should_emit(true, true, false, false));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_running_but_disabled_feed_does_not_count() {
+        // Dhan DISABLED but its running flag is somehow true (stale) — it must NOT
+        // count; only the ENABLED Groww matters, and Groww is dead → withhold.
+        assert!(!boot_completed_should_emit(false, true, true, false));
+        // Symmetric: Groww disabled-but-running, Dhan enabled-and-dead → withhold.
+        assert!(!boot_completed_should_emit(true, false, false, true));
+    }
 
     #[test]
     fn test_main_imports_boot_helpers() {

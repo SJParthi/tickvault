@@ -54,14 +54,28 @@ fn test_emit_boot_completed_helper_exists_and_sets_the_gauge() {
 #[test]
 fn test_boot_completed_is_emitted_on_both_boot_paths() {
     let main_src = read_app("src/main.rs");
-    let call_sites = main_src.matches("emit_boot_completed()").count();
-    // 1 definition site (`fn emit_boot_completed()`) + 2 call sites
-    // (fast-boot crash-recovery + slow-boot normal). The helper is called on
-    // BOTH completion paths so a successful fast-boot never false-pages the alarm.
+    // The `tv_boot_completed` gauge is now published via the feed-liveness-gated
+    // wrapper `emit_boot_completed_when_feed_live(...)`, called on BOTH boot
+    // completion paths (fast-boot crash-recovery + slow-boot normal). The bare
+    // `emit_boot_completed()` remains the pure gauge-setter, called by the
+    // wrapper (and the no-feed-enabled fast arm). Count the gated wrapper call
+    // sites — there must be one per boot path so neither path can silently skip
+    // the alive signal.
+    let gated_sites = main_src
+        .matches("emit_boot_completed_when_feed_live(")
+        .count();
+    // 1 definition site (`async fn emit_boot_completed_when_feed_live(`) + 2 call
+    // sites (fast-boot + slow-boot).
     assert!(
-        call_sites >= 3,
-        "expected `emit_boot_completed` to appear >= 3 times (1 def + 2 boot-path calls), \
-         found {call_sites} — every boot-completion path must emit `{BOOT_COMPLETED_METRIC}`."
+        gated_sites >= 3,
+        "expected `emit_boot_completed_when_feed_live` to appear >= 3 times (1 def + 2 boot-path \
+         calls), found {gated_sites} — every boot-completion path must publish \
+         `{BOOT_COMPLETED_METRIC}` through the feed-liveness gate."
+    );
+    // The pure gauge-setter must still exist and be the thing the gate calls.
+    assert!(
+        main_src.contains("emit_boot_completed()"),
+        "the pure `emit_boot_completed()` gauge-setter must remain (called by the gated wrapper)."
     );
     // Both emits must sit next to the boot-complete `notify_systemd_ready()`
     // markers, i.e. on the success path only (a halt never reaches them).
@@ -69,6 +83,56 @@ fn test_boot_completed_is_emitted_on_both_boot_paths() {
         main_src.contains("infra::notify_systemd_ready();"),
         "the boot-complete `notify_systemd_ready()` markers must remain so the emit stays on \
          the success path."
+    );
+}
+
+/// The alive signal must be GATED on a live feed — closing the alerting hole
+/// where a boot that reached the emit line with every enabled feed dead still
+/// published `tv_boot_completed=1`, so the boot-heartbeat alarm never paged.
+/// This ratchets that the emit is no longer a bare unconditional call: both
+/// boot-path emits go through `emit_boot_completed_when_feed_live`, which is
+/// driven by the pure `boot_completed_should_emit` verdict.
+#[test]
+fn boot_completed_emit_sites_are_gated_on_live_feed() {
+    let main_src = read_app("src/main.rs");
+    // The pure verdict helper must exist and be feed-agnostic (4 bool inputs:
+    // per-feed enabled + per-feed running).
+    assert!(
+        main_src.contains("fn boot_completed_should_emit(")
+            && main_src.contains("dhan_enabled")
+            && main_src.contains("groww_enabled"),
+        "main.rs must define the pure `boot_completed_should_emit(dhan_enabled, groww_enabled, \
+         dhan_running, groww_running)` verdict helper — the feed-agnostic gate for the alive signal."
+    );
+    // The async wrapper that waits (bounded) for a live feed then emits/withholds.
+    assert!(
+        main_src.contains("async fn emit_boot_completed_when_feed_live("),
+        "main.rs must define `emit_boot_completed_when_feed_live` — the bounded-wait feed-liveness \
+         gate around the `emit_boot_completed()` gauge-setter."
+    );
+    // The wrapper must actually consult the pure verdict + the per-feed
+    // lane-running signals (so a regression to an unconditional emit is caught).
+    assert!(
+        main_src.contains("boot_completed_should_emit(")
+            && main_src.contains("is_dhan_lane_running()")
+            && main_src.contains("is_groww_lane_running()"),
+        "the feed-liveness gate must call `boot_completed_should_emit(...)` against \
+         `is_dhan_lane_running()` / `is_groww_lane_running()` — a bare unconditional emit is a \
+         regression that re-opens the alerting hole."
+    );
+    // Both boot-path emits must go through the gate — no bare `emit_boot_completed();`
+    // statement may remain on the success paths (only the wrapper body calls it).
+    // The bare form appears exactly once, inside the wrapper (and once more in the
+    // no-feed-enabled fast arm of the wrapper). Assert it is never called with a
+    // trailing `.await`-less statement at a boot-completion marker by requiring the
+    // gated wrapper to sit next to both `notify_systemd_ready()` sites.
+    let gated_sites = main_src
+        .matches("emit_boot_completed_when_feed_live(")
+        .count();
+    assert!(
+        gated_sites >= 3,
+        "both boot paths must emit via the feed-liveness gate (>= 1 def + 2 calls), found \
+         {gated_sites}."
     );
 }
 

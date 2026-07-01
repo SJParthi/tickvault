@@ -1,153 +1,214 @@
-# Implementation Plan: AUTH-P12 — wire the runtime static-IP / EIP-change monitor
+# Implementation Plan: Gate the boot "alive" signal on a live feed
 
 **Status:** VERIFIED
 **Date:** 2026-07-01
-**Approved by:** Parthiban (operator) — standing approval for the permutation-coverage audit fix queue (`.claude/plans/permutation-coverage-audit-2026-07-01.md` §"Fix queue", PR-1 AUTH-P12).
-**Branch:** `claude/harden-ip-monitor-wiring`
-**Changed crates:** `core` (crates/core), `app` (crates/app)
+**Approved by:** Parthiban (operator) — standing approval for the permutation-coverage
+audit fix queue (`.claude/plans/permutation-coverage-audit-2026-07-01.md`), cross-cutting
+"alerting hole" hardening surfaced by the recovery re-check, this session 2026-07-01.
+
+Crate referenced: **tickvault-app** (change lives in `crates/app/src/main.rs` +
+its `crates/app/tests/` guard). Terraform (`deploy/aws/terraform/*liveness*.tf`)
+edited only if a residual market-hours-liveness gap is found — see Design §2.
 
 > Guarantee matrices: carried by cross-reference to
-> `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row, mandatory
-> per `per-item-guarantee-check.sh`). Dominant guarantee here: **strictly no worse
-> than today** — purely additive detection; boot-time IP verify unchanged; no
-> hot-path (tick) code touched; the monitor is a 5-min-cadence cold-path task.
+> `.claude/rules/project/per-wave-guarantee-matrix.md` (mandatory per
+> `per-item-guarantee-check.sh`). Dominant guarantee: **strictly-no-worse than
+> today for the boot-heartbeat page** — the emit still fires on a healthy boot;
+> it now ADDITIONALLY withholds "alive" when every enabled feed failed to come
+> up, so the heartbeat alarm (`treat_missing_data="breaching"`) pages exactly in
+> the previously-silent case. No hot-path change (boot is cold path). Does NOT
+> touch `dry_run`, budget, instance lock, WAL spill, `MAX_DAILY_UNIVERSE_SIZE`,
+> `SEAL_BUFFER_CAPACITY`, the 2-WebSocket lock, or feed enablement semantics.
 
 ## Design
 
-**Gap (AUTH-P12).** `crates/core/src/network/ip_monitor.rs::spawn_ip_monitor` is
-defined + fully unit-tested but has ZERO production call site — every caller is
-`#[cfg(test)]`. `crates/app/src/main.rs` wires ONLY boot-time IP verification
-(`verify_public_ip` at Step 5.5 + `verify_static_ip_at_boot` at Step 6a). A
-mid-session public-IP / Elastic-IP change (EIP disassociation, NAT failover) is
-therefore never re-detected. `docs/architecture/guarantees.md:118` falsely cites
-the never-spawned detector as the proof artefact for "Static IP enforcement".
+### Ground truth established (STEP 0, verified against the live tree)
 
-**Fix.** Spawn `spawn_ip_monitor` from `run_dhan_lane` Step 5.5 (live mode only,
-where the boot `verify_public_ip` already runs and returns the verified egress
-IP). The monitor polls the public IP every `IP_MONITOR_CHECK_INTERVAL_SECS`
-against that boot-verified IP.
+`emit_boot_completed()` (`crates/app/src/main.rs`) sets the `tv_boot_completed`
+gauge to `1.0`. It is called at TWO boot-completion points, and the CURRENT emit
+condition at each is:
 
-**Halt-vs-alert decision (audit-mandated, NOT a blind halt).**
-On a *confirmed sustained* mismatch (confirm-twice debounce — a single transient
-metadata blip does not act):
-- Always emit `error!(code = GAP-NET-01)` CRITICAL (routes to Telegram via the
-  5-sink ERROR pipeline).
-- HALT the process (`std::process::exit(1)`) ONLY when `dry_run == false` — real
-  orders would be rejected by Dhan's static-IP mandate, so blinding-then-halting
-  is the safe outcome.
-- When `dry_run == true` (current state, ~3 months no real orders) DO NOT halt —
-  killing a working live feed for a no-orders IP change would drop ticks for zero
-  financial benefit. Alert only; keep streaming.
+- **Slow-boot / normal** (main.rs:7458): fires unconditionally after the
+  boot-complete `if/else` + `notify_systemd_ready()`. For `dhan_enabled=true`,
+  the Dhan lane's `start_dhan_lane` must have returned `Ok` earlier to REACH this
+  line (a Dhan-start failure `return`s/exits before it) — so the Dhan-enabled
+  slow path is *already* effectively gated on the Dhan lane succeeding. BUT the
+  `dhan_enabled=false` / Groww-only branch takes the `None` arm and proceeds to
+  emit even though Groww's activation is an ASYNC spawned watcher
+  (`run_groww_activation_watcher`) that may never come up.
+- **Fast-boot / crash-recovery** (main.rs:2191): fires UNCONDITIONALLY after
+  `notify_systemd_ready()`. This arm is Dhan-ON-only (guarded by
+  `config.feeds.dhan_enabled` at main.rs:1320), but the warm-snapshot re-injects
+  the WS pool asynchronously — a crash-recovery where the pool never reconnects
+  still emits "alive."
 
-The decision is a **pure function** `decide_ip_action(consecutive_mismatches,
-threshold, halt_on_mismatch) -> IpMonitorAction` so it is exhaustively
-unit-testable with no I/O.
+**Net current behaviour:** a boot where every enabled feed failed to reach a live
+state can still publish `tv_boot_completed=1` → the boot-heartbeat alarm
+(`treat_missing_data="breaching"`, boot-heartbeat-alarm.tf) does NOT page. **Gap
+is real and OPEN** for the Groww-only and fast-boot-pool-fail permutations.
 
-**Debounce.** The monitor tracks `consecutive_mismatches`; a `Match` or
-`CheckFailed` (network blip — indistinguishable from EIP-detach, handled as
-transient per existing `warn!`) resets the counter. Action fires only when
-`consecutive_mismatches >= IP_MONITOR_MISMATCH_CONFIRM_THRESHOLD` (= 2). Reuses
-the monitor's existing 5-minute polling loop, so a confirmed mismatch is ≥ 2 poll
-cycles of the SAME wrong IP — never a one-shot flap.
+The async reality: both emit points are SYNCHRONOUS instants, but feed lanes come
+up asynchronously (`mark_dhan_lane_running` inside the `dhan_enabled` block +
+`start_dhan_lane` → Running; `mark_groww_lane_running` only after the async
+watch-list build). A point-in-time `lane_running` snapshot at the emit instant
+would FALSE-NEGATIVE a feed that is still legitimately coming up → a false page.
 
-**Market-hours awareness (audit-findings Rule 3).** An EIP/IP change is a
-host-infrastructure fact true 24/7 (not live-data-driven) and it breaks SSM +
-Dhan reachability whenever it happens — so detection itself is NOT market-hours
-gated (a weekend EIP detach must still be seen). The *halt* is gated by `dry_run`
-(a wrong IP is equally fatal for orders whenever real trading resumes), not by
-market hours. The alert is edge-triggered (fires once per confirmed episode;
-counter resets on recovery) — no spam (audit-findings Rule 4).
+### The fix
 
-**Lifetime.** Mirror the seal-writer pattern (main.rs:4153): create a
-`watch::channel(false)` shutdown handle, `std::mem::forget` the sender for
-process lifetime, hand the receiver to `spawn_ip_monitor`.
+1. **Pure guard helper** `boot_completed_should_emit(dhan_enabled, groww_enabled,
+   dhan_running, groww_running) -> bool`:
+   - No feed enabled (`!dhan_enabled && !groww_enabled`) → `true` (preserve
+     today's behaviour; a deliberately feed-less run must not false-page). The
+     caller logs this explicitly.
+   - At least one feed enabled → `true` iff at least ONE ENABLED feed is running
+     (`(dhan_enabled && dhan_running) || (groww_enabled && groww_running)`).
+     Feed-agnostic: Groww-only-live satisfies it, Dhan-only-live satisfies it,
+     both-enabled needs either.
+   - Both-enabled-none-live / only-enabled-feed-not-live → `false` (withhold
+     "alive" → heartbeat alarm pages).
+
+2. **Bounded liveness wait at each emit site.** Before calling
+   `emit_boot_completed()`, poll `feed_runtime.is_dhan_lane_running()` /
+   `is_groww_lane_running()` against `boot_completed_should_emit(...)` for a
+   bounded window (poll ~1s cadence, capped by a bounded boot-scale timeout). The
+   moment the guard returns `true`, emit and stop waiting. If the window elapses
+   with the guard still `false` (every enabled feed failed to come up), do NOT
+   emit and log an `error!` naming the dead feed(s) — the heartbeat alarm then
+   pages on the MISSING metric, exactly the intended signal. The no-feed-enabled
+   case returns `true` on the first poll (instant emit, unchanged timing).
+
+   Rationale for a bounded WAIT (not an instant snapshot): it removes the async
+   false-negative while keeping the honest end-state — a feed that comes up
+   within the window still yields a prompt "alive"; a feed that never comes up
+   correctly withholds it.
+
+3. **Source-scan wiring guard** in `crates/app/tests/boot_completed_metric_guard.rs`:
+   assert `emit_boot_completed()` is gated by `boot_completed_should_emit(` at
+   BOTH call sites (the emit is no longer a bare unconditional call), and that
+   the helper is defined. Rule-13 "defined-and-wired" ratchet.
+
+### §2 Market-hours liveness alarm
+
+PR #1284 already shipped `deploy/aws/terraform/market-hours-liveness-alarm.tf`:
+an ALWAYS-ON (window-gated 09:20–15:35 IST) alarm that pages when
+`tv_realtime_guarantee_score` is MISSING for ~5 min — i.e. the app is
+wedged/crash-looped/dead during market hours REGARDLESS of the narrow
+08:50–09:10 boot-heartbeat window. It covers "no enabled feed is streaming during
+market hours ⇒ SLO loop stops publishing ⇒ page": a dead feed makes the SLO
+composite loop stop emitting the score. **No duplicate alarm is needed.** This
+plan does NOT add a second market-hours alarm; §2 is a verify, not an extend.
 
 ## Edge Cases
 
-- **`dry_run == true` (today):** confirmed mismatch → alert only, NO halt, feed
-  keeps running. `decide_ip_action(2, 2, false) == AlertOnly`.
-- **`dry_run == false` (future live):** confirmed mismatch → alert + halt.
-  `decide_ip_action(2, 2, true) == AlertAndHalt`.
-- **Single transient mismatch (1 poll):** below threshold → Continue (no action,
-  no alert). `decide_ip_action(1, 2, _) == Continue`.
-- **`CheckFailed` (both IP-echo endpoints unreachable — e.g. EIP fully detached):**
-  transient `warn!`, resets the consecutive-mismatch counter. AUTH-P13
-  (stranded-box escalation) is OUT OF SCOPE for this PR — tracked separately in
-  the audit at medium.
-- **Non-live mode (paper/sandbox):** monitor is NOT spawned (no Dhan orders, no
-  static-IP mandate) — same gating as the existing `verify_public_ip` Step 5.5.
-- **Empty / disabled config:** existing `spawn_ip_monitor` guard exits the task
-  immediately (already tested).
+- **No feed enabled (both off):** helper → `true`, emit fires instantly, logged
+  explicitly (`info!`). Never a false page for a deliberately feed-less run.
+- **Groww-only, Groww comes up in 2s:** bounded wait polls, sees
+  `is_groww_lane_running()` flip true, emits. No false-negative.
+- **Groww-only, Groww never comes up:** window elapses, guard stays false, NO
+  emit, `error!` names Groww dead → heartbeat alarm pages.
+- **Dhan-only slow boot, Dhan start fails:** process `return`s/exits before the
+  emit (unchanged) → metric missing → pages. Guard is belt-and-suspenders here.
+- **Both enabled, one live:** helper → `true` (either satisfies). Correct.
+- **Both enabled, none live:** guard false → no emit → pages.
+- **Fast-boot pool re-inject fails:** bounded wait sees `is_dhan_lane_running()`
+  false for the window → no emit → pages (was silently "alive" before).
+- **Fast-boot pool re-inject succeeds:** `is_dhan_lane_running()` already true
+  (marked at main.rs:330 inside the `dhan_enabled` block) → instant emit.
 
 ## Failure Modes
 
-- **False halt on a flap:** prevented by confirm-twice debounce (≥ 2 poll cycles
-  of the same wrong IP).
-- **Silent dead-code regression:** prevented by a source-scan wiring guard test
-  asserting `spawn_ip_monitor(` appears in `crates/app/src/main.rs`.
-- **IP-echo service outage misread as EIP change:** `CheckFailed` is handled as
-  transient and resets the counter, so an echo outage never triggers halt.
-- **Monitor task panic:** the task has no `unwrap`/`expect` on the poll path; a
-  panic kills only the monitor, never the feed. Supervised-respawn is a possible
-  follow-on but not required for this gap (boot-time gate remains primary).
+- **Helper returns wrong verdict:** covered by the unit truth-table (both-off,
+  dhan-only-live/dead, groww-only-live/dead, both-live variants,
+  both-enabled-none-live, running-but-disabled-does-not-count).
+- **Bounded wait hangs boot:** capped by a bounded timeout, polls a cheap Relaxed
+  atomic; on timeout it proceeds (no emit + error log), so boot never blocks
+  indefinitely on this check.
+- **Guard regressed to a bare emit:** the source-scan wiring guard fails the
+  build (both call sites must show `boot_completed_should_emit`).
+- **False page on a healthy feed-less run:** prevented by the explicit
+  no-feed-enabled → `true` arm + its dedicated unit test + `info!` log.
 
 ## Test Plan
 
-Unit (crates/core, `ip_monitor::tests`):
-- `test_decide_ip_action_below_threshold_continues`
-- `test_decide_ip_action_at_threshold_dry_run_alerts_only`
-- `test_decide_ip_action_at_threshold_live_alerts_and_halts`
-- `test_decide_ip_action_above_threshold_still_acts`
-- `test_ip_monitor_mismatch_confirm_threshold_is_two`
+Unit (in `crates/app/src/main.rs` `#[cfg(test)]`), naming
+`test_boot_completed_should_emit_*`:
+- both-off → true
+- dhan-only enabled + dhan running → true
+- dhan-only enabled + dhan NOT running → false
+- groww-only enabled + groww running → true
+- groww-only enabled + groww NOT running → false
+- both enabled + only dhan running → true
+- both enabled + only groww running → true
+- both enabled + neither running → false
+- dhan disabled + dhan_running true (running-but-disabled) + groww enabled+dead
+  → false (a running-but-disabled feed does not count)
 
-Wiring guard (crates/app, `ip_monitor_wiring_guard.rs`):
-- `test_spawn_ip_monitor_has_production_call_site` — source-scan asserts
-  `spawn_ip_monitor(` is present in `crates/app/src/main.rs` (mirrors
-  `health_counter_fix7_guard.rs`), so it can never regress to dead code.
-- `test_ip_monitor_halt_is_dry_run_gated` — source-scan asserts the wiring reads
-  `dry_run` to decide halt-vs-alert.
+Source-scan guard (`crates/app/tests/boot_completed_metric_guard.rs`):
+- `boot_completed_should_emit(` appears at BOTH emit sites and the helper is
+  defined.
+- existing 4 guard tests still pass (metric name, both-paths, CW scrape filter,
+  alarm repoint) — the emit is still present on both paths, just gated.
 
-Verify: `cargo check -p tickvault-core -p tickvault-app` then
-`cargo test -p tickvault-core -p tickvault-app --lib` green.
+Commands: `cargo check -p tickvault-app` then `cargo test -p tickvault-app --lib`
++ `cargo test -p tickvault-app --test boot_completed_metric_guard`. Paste the
+`test result: ok.` line. Known-unrelated env-only failures (ip_verifier /
+secret_manager "fails without real SSM") confirmed with empty `git diff` on those
+files.
 
 ## Rollback
 
-Single-commit PR on a feature branch. Revert = `git revert <sha>`; the monitor is
-purely additive (a new spawned task + a new pure fn + two new constants + a guard
-test). Removing it returns to the prior boot-only IP-verify behaviour with zero
-data-path change. No schema change, no config-format change, no migration.
+Single-file logic change in `crates/app/src/main.rs` + its guard test. Revert the
+commit to restore the unconditional emit. No schema, no migration, no terraform
+state change (the alarm is untouched — it already pages on MISSING; this PR only
+makes MISSING happen in the dead-feed case). `git revert <sha>` is complete.
 
 ## Observability
 
-- `error!(code = "GAP-NET-01", severity = "…")` on confirmed mismatch — routes to
-  Telegram via the 5-sink ERROR pipeline (existing GAP-NET-01 runbook:
-  `.claude/rules/dhan/authentication.md`, `docs/runbooks/README.md:40`).
-- The existing `spawn_ip_monitor` `info!("GAP-NET-01: IP monitoring started")`
-  positive-signal log confirms the monitor is live at boot.
-- Per-poll `IpCheckResult` logging (Match / Mismatch / CheckFailed) already exists;
-  no new Prometheus counter is strictly required (the ERROR-with-code is the
-  operator-actionable signal).
+- `tv_boot_completed` gauge — unchanged name/semantics; now published ONLY when a
+  live feed exists (or no feed is enabled). MISSING ⇒ boot-heartbeat alarm pages
+  (existing, `treat_missing_data="breaching"`).
+- New `error!` at each emit site when the bounded wait elapses with no live feed:
+  names the dead enabled feed(s) so the operator's Telegram/`errors.jsonl` shows
+  WHY the box will page (no new ErrorCode — boot-path diagnostic routed through
+  the existing 5-sink error pipeline; complements, not replaces, the
+  MISSING-metric page).
+- `info!` on the no-feed-enabled emit path (explicit, per task requirement).
+- Market-hours liveness: covered by the existing PR #1284 alarm (§2 verify).
 
 ## Plan Items
 
-- [x] Item 1 — Add `IP_MONITOR_CHECK_INTERVAL_SECS` + `IP_MONITOR_MISMATCH_CONFIRM_THRESHOLD` constants and a pure `decide_ip_action` + `IpMonitorAction` to `ip_monitor.rs`; wire the debounce + dry_run-gated halt into the `spawn_ip_monitor` loop.
-  - Files: crates/core/src/network/ip_monitor.rs
-  - Tests: test_decide_ip_action_below_threshold_continues, test_decide_ip_action_at_threshold_dry_run_alerts_only, test_decide_ip_action_at_threshold_live_alerts_and_halts, test_decide_ip_action_above_threshold_still_acts, test_ip_monitor_mismatch_confirm_threshold_is_two
-
-- [x] Item 2 — Spawn the monitor from `run_dhan_lane` Step 5.5 (live mode) using the boot-verified IP + `!config.strategy.dry_run` as the halt gate.
+- [x] Add pure `boot_completed_should_emit(dhan_enabled, groww_enabled,
+      dhan_running, groww_running) -> bool` helper + unit truth-table tests.
   - Files: crates/app/src/main.rs
-  - Tests: (covered by wiring guard in Item 3)
+  - Tests: test_boot_completed_should_emit_both_off_emits,
+    test_boot_completed_should_emit_dhan_only_live,
+    test_boot_completed_should_emit_dhan_only_dead,
+    test_boot_completed_should_emit_groww_only_live,
+    test_boot_completed_should_emit_groww_only_dead,
+    test_boot_completed_should_emit_both_enabled_only_dhan_live,
+    test_boot_completed_should_emit_both_enabled_only_groww_live,
+    test_boot_completed_should_emit_both_enabled_none_live,
+    test_boot_completed_should_emit_running_but_disabled_feed_does_not_count
 
-- [x] Item 3 — Add the source-scan wiring guard.
-  - Files: crates/app/tests/ip_monitor_wiring_guard.rs
-  - Tests: test_spawn_ip_monitor_has_production_call_site, test_ip_monitor_halt_is_dry_run_gated
+- [x] Gate BOTH `emit_boot_completed()` call sites behind a bounded liveness wait
+      driven by the helper; error-log + withhold on timeout; info-log the
+      no-feed-enabled path.
+  - Files: crates/app/src/main.rs
+  - Tests: (source-scan) boot_completed_emit_sites_are_gated_on_live_feed
+
+- [x] Extend the source-scan wiring guard so a regression to a bare
+      unconditional emit fails the build.
+  - Files: crates/app/tests/boot_completed_metric_guard.rs
+  - Tests: boot_completed_emit_sites_are_gated_on_live_feed
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | dry_run=true, IP changes for 2 poll cycles | CRITICAL Telegram + error!(GAP-NET-01); feed keeps running (no halt) |
-| 2 | dry_run=false, IP changes for 2 poll cycles | CRITICAL Telegram + error!; process halts (orders would be rejected) |
-| 3 | IP flaps for 1 poll cycle then recovers | No action, no alert (below confirm threshold) |
-| 4 | Both IP-echo endpoints unreachable | transient warn!, mismatch counter reset, no halt |
-| 5 | paper/sandbox mode | monitor not spawned |
+| 1 | Both feeds off | emit fires, info-logged, no page |
+| 2 | Groww-only, comes up | emit fires promptly, no page |
+| 3 | Groww-only, never comes up | no emit, error-logged, heartbeat pages |
+| 4 | Both enabled, only Dhan live | emit fires, no page |
+| 5 | Both enabled, neither live | no emit, error-logged, heartbeat pages |
+| 6 | Fast-boot pool re-inject fails | no emit, heartbeat pages (was silent) |
+| 7 | Healthy Dhan slow boot | emit fires (unchanged), no page |
