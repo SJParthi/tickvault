@@ -31,34 +31,18 @@ What used to be zero-click persistent navigation is now repeated manual pin+expa
 
 **Image 1** — "Engineering standards review" session. Left sidebar shows an auto-populated **Recents** list (Tick vault dhan skills, Tickvault AWS, Brutex, Engineering standards review). Active work surfaces on its own.
 
-![Image 1](images/round4/image-1.png)
-
 **Image 2** — "Tickvault AWS" session, same auto **Recents** sidebar. Proof the good behavior existed hours before the change.
-
-![Image 2](images/round4/image-2.png)
 
 ### After (the regression — next morning, ~7:56–7:57 AM)
 
 **Image 3** — Projects grid shows ~18 projects, but the left sidebar is now **Pinned-only** and lists just 4 — none auto-matching the grid; the "Sessions you start will show up here" empty state persists.
 
-![Image 3](images/round4/image-3.png)
-
 **Image 4** — Inside the TickVault project: "Pinned 0 / No sessions are pinned," and TickVault itself is not in the sidebar even though I am inside it.
-
-![Image 4](images/round4/image-4.png)
 
 **Image 5** — Same view after clicking the pin — TickVault now appears in the sidebar. This proves you must manually pin each project to make it visible.
 
-![Image 5](images/round4/image-5.png)
-
 **Image 6** — The "Tickvalut aws" project opens as a cramped narrow side thread panel that must be manually expanded.
-
-![Image 6](images/round4/image-6.png)
 
 **Image 7** — The "Tick vault dhan skills" session thread, for reference.
 
-![Image 7](images/round4/image-7.png)
-
 **Image 8** — TickVault project with the Thread panel side-by-side; "Pinned 0," and the pin/expand state does not persist across switches.
-
-![Image 8](images/round4/image-8.png)
