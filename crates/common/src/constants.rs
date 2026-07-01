@@ -1214,6 +1214,23 @@ pub const TICK_PERSIST_START_SECS_OF_DAY_IST: u32 = 32_400;
 /// The end is **exclusive** — a tick at exactly 15:30:00 is NOT persisted.
 pub const TICK_PERSIST_END_SECS_OF_DAY_IST: u32 = 55_800;
 
+/// CCL-06 (permutation-coverage audit §140): seconds-of-day (IST) at which the
+/// Muhurat (Diwali evening) trading-session persist window OPENS: 18:00:00 =
+/// 18 × 3600. This is a DELIBERATE SUPERSET of the historical announced NSE
+/// Muhurat windows (2023 was 18:15–19:15, 2024 was 18:00–19:00) so a
+/// slightly-early tick is still captured. Only active on a Muhurat date (gated
+/// by the boot `muhurat` flag — see `crate::muhurat`); on every trading/mock
+/// day this window is ignored, so the regular `[09:00, 15:30)` behaviour is
+/// byte-for-byte unchanged.
+pub const MUHURAT_PERSIST_START_SECS_OF_DAY_IST: u32 = 64_800;
+
+/// CCL-06: seconds-of-day (IST) at which the Muhurat persist window CLOSES:
+/// 19:30:00 = 19 × 3600 + 30 × 60. **Exclusive** — a tick at exactly 19:30:00
+/// is NOT persisted (matches the half-open `[start, end)` contract of the
+/// regular window). Superset upper bound (announced windows have ended by
+/// 19:15) so a slightly-late tick is still captured.
+pub const MUHURAT_PERSIST_END_SECS_OF_DAY_IST: u32 = 70_200;
+
 /// Operator-locked 2026-05-25: post-market historical fetch + cross-verify
 /// window START. Begins at 15:30:00 IST (= `TICK_PERSIST_END_SECS_OF_DAY_IST`).
 /// Operations gated by this constant: 90-day historical fetch, current-day
@@ -2101,6 +2118,30 @@ const _: () = assert!(
     "TICK_PERSIST_END must be within a single day"
 );
 
+// CCL-06: Muhurat persist window — start < end, both within a day, values match
+// IST times, and the window is disjoint from + AFTER the regular window (so the
+// two ranges never overlap and the Muhurat branch is purely additive).
+const _: () = assert!(
+    MUHURAT_PERSIST_START_SECS_OF_DAY_IST == 18 * 3600,
+    "MUHURAT_PERSIST_START must equal 18:00 IST (64800)"
+);
+const _: () = assert!(
+    MUHURAT_PERSIST_END_SECS_OF_DAY_IST == 19 * 3600 + 30 * 60,
+    "MUHURAT_PERSIST_END must equal 19:30 IST (70200)"
+);
+const _: () = assert!(
+    MUHURAT_PERSIST_START_SECS_OF_DAY_IST < MUHURAT_PERSIST_END_SECS_OF_DAY_IST,
+    "MUHURAT_PERSIST_START must be before MUHURAT_PERSIST_END"
+);
+const _: () = assert!(
+    MUHURAT_PERSIST_END_SECS_OF_DAY_IST < SECONDS_PER_DAY,
+    "MUHURAT_PERSIST_END must be within a single day"
+);
+const _: () = assert!(
+    TICK_PERSIST_END_SECS_OF_DAY_IST <= MUHURAT_PERSIST_START_SECS_OF_DAY_IST,
+    "MUHURAT window must be disjoint from + after the regular [09:00, 15:30) window"
+);
+
 // Post-market fetch window invariants (PR #796, operator-locked 2026-05-25).
 const _: () = assert!(
     POST_MARKET_FETCH_WINDOW_START_SECS_OF_DAY_IST == 15 * 3600 + 30 * 60,
@@ -2612,6 +2653,22 @@ mod market_hours_tests {
     fn test_tick_persist_end_matches_three_thirty() {
         assert_eq!(TICK_PERSIST_END_SECS_OF_DAY_IST, 15 * 3600 + 30 * 60);
         assert_eq!(TICK_PERSIST_END_SECS_OF_DAY_IST, 55_800);
+    }
+
+    #[test]
+    fn test_muhurat_window_constants_pinned() {
+        // CCL-06: 18:00 IST open, 19:30 IST close (exclusive), superset of the
+        // announced NSE Muhurat windows.
+        assert_eq!(MUHURAT_PERSIST_START_SECS_OF_DAY_IST, 18 * 3600);
+        assert_eq!(MUHURAT_PERSIST_START_SECS_OF_DAY_IST, 64_800);
+        assert_eq!(MUHURAT_PERSIST_END_SECS_OF_DAY_IST, 19 * 3600 + 30 * 60);
+        assert_eq!(MUHURAT_PERSIST_END_SECS_OF_DAY_IST, 70_200);
+        // start < end, within a day.
+        assert!(MUHURAT_PERSIST_START_SECS_OF_DAY_IST < MUHURAT_PERSIST_END_SECS_OF_DAY_IST);
+        assert!(MUHURAT_PERSIST_END_SECS_OF_DAY_IST < SECONDS_PER_DAY);
+        // Disjoint from + strictly after the regular window: the Muhurat range
+        // is purely additive, never overlapping [09:00, 15:30).
+        assert!(TICK_PERSIST_END_SECS_OF_DAY_IST <= MUHURAT_PERSIST_START_SECS_OF_DAY_IST);
     }
 
     #[test]

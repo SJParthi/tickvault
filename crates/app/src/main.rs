@@ -1338,6 +1338,12 @@ async fn main() -> Result<()> {
     let is_trading = trading_calendar.is_trading_day_today();
     let is_muhurat = trading_calendar.is_muhurat_trading_today();
     let is_mock_trading = trading_calendar.is_mock_trading_today();
+    // CCL-06: publish today's Muhurat-session flag to the process-global so the
+    // tick processor additionally accepts the evening [18:00, 19:30) IST window
+    // on a Muhurat date (otherwise the connected feed's Muhurat ticks are
+    // silently dropped by the regular [09:00, 15:30) persist gate). Idempotent,
+    // boot-once; `false` on every trading/mock day → today's behaviour.
+    tickvault_common::muhurat::init_muhurat_session(is_muhurat);
     info!(
         is_trading_day = is_trading,
         is_muhurat_session = is_muhurat,
