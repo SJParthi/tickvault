@@ -7,7 +7,8 @@
 
 .PHONY: help run run-supervised stop build test check fmt clippy clean \
         docker-up docker-down docker-restart docker-status docker-logs questdb-init \
-        health status open questdb jaeger prometheus traefik alloy loki \
+        health status open questdb questdb-prod questdb-autoopen-install questdb-autoopen-uninstall \
+        jaeger prometheus traefik alloy loki \
         obs obs-verify obs-restart obs-open \
         logs app-pid \
         audit coverage bench geiger typos quality doc bootstrap scoped-check full-qa parity-soak \
@@ -220,6 +221,15 @@ open: ## Open DLT Control Panel in browser
 
 questdb: ## Open QuestDB console (localhost:9000)
 	@open http://localhost:9000
+
+questdb-prod: ## Open the PROD QuestDB console via secure SSM tunnel (auto-opens browser)
+	@bash scripts/questdb-tunnel.sh
+
+questdb-autoopen-install: ## macOS: auto-open the prod QuestDB console weekdays at 08:35 IST (launchd)
+	@bash scripts/questdb-tunnel.sh --install-autostart
+
+questdb-autoopen-uninstall: ## macOS: remove the weekday auto-open launchd agent
+	@bash scripts/questdb-tunnel.sh --uninstall-autostart
 
 jaeger: ## Open Jaeger UI (localhost:16686)
 	@open http://localhost:16686
