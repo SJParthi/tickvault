@@ -59,10 +59,18 @@ fn test_qdb() -> QuestDbConfig {
     }
 }
 
-/// A shared `Arc<TradingCalendar>` for the `run_groww_bridge` 7th argument (the
-/// IST-midnight/EOD force-seal boundary task's trading-day gate). Empty holiday
-/// set is fine here — these e2e tests feed synthetic NDJSON and abort the bridge
-/// before any boundary fires; the calendar only needs to construct cleanly.
+/// A fresh Groww aggregator for the `run_groww_bridge` 7th argument (2026-07-02:
+/// the aggregator + IST-midnight force-seal are owned by the SUPERVISOR wrapper
+/// in prod — `spawn_supervised_groww_bridge` — so the raw bridge fn takes the
+/// instance; these e2e tests drive the raw bridge and never reach a midnight
+/// boundary, so a standalone instance is exactly right).
+fn test_aggregator() -> tickvault_trading::candles::MultiTfAggregator {
+    tickvault_trading::candles::MultiTfAggregator::with_capacity(
+        tickvault_app::groww_bridge::GROWW_AGGREGATOR_CAPACITY,
+    )
+}
+
+#[allow(dead_code)] // APPROVED: retained for future e2e that exercises the supervisor wrapper (needs the calendar arg)
 fn test_calendar() -> Arc<TradingCalendar> {
     let trading = TradingConfig {
         market_open_time: "09:00:00".to_string(),
@@ -245,7 +253,7 @@ async fn groww_ticks_and_candles_land_tagged_feed_groww() {
         Arc::clone(&feed_runtime),
         Arc::clone(&feed_health),
         None,
-        test_calendar(),
+        test_aggregator(),
     ));
 
     // --- Assert the 5 ticks landed in `ticks` tagged feed='groww' ---
@@ -402,7 +410,7 @@ async fn malformed_ndjson_line_is_skipped_and_valid_lines_land() {
         Arc::clone(&feed_runtime),
         Arc::clone(&feed_health),
         None,
-        test_calendar(),
+        test_aggregator(),
     ));
 
     let ticks_sql =
@@ -470,7 +478,7 @@ async fn replay_same_ndjson_is_idempotent_no_duplicate_rows() {
             Arc::clone(&feed_runtime),
             Arc::clone(&feed_health),
             None,
-            test_calendar(),
+            test_aggregator(),
         ));
         let _ = wait_until_count(&ticks_sql, 3, Duration::from_secs(15)).await;
         bridge.abort();
