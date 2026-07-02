@@ -697,38 +697,78 @@ jobs:
           fi
 
 
-      - name: Monitor first 60 seconds for crashes
+      - name: Verify app readiness (gate on readiness, not 60s is-active)
         # Skipped on an intentional off-hours skip — nothing was deployed to the
         # (stopped) box, so there is no fresh process to monitor.
         if: env.DEPLOY_SKIP_REASON == ''
+        env:
+          # WAL-REPLAY BOOT WINDOW: the app is systemd `Type=notify` and only sends
+          # READY=1 AFTER its boot gates + WAL frame-spill replay finish — a cold
+          # boot replays ~4.85M spilled frames (dropped:4853073, ~71s). Until READY,
+          # systemd reports the unit as "activating", NOT "active". The old 60s
+          # `is-active != active` check therefore FALSE-FAILED healthy builds and
+          # then `systemctl stop`ped a perfectly good app. We now gate on real
+          # readiness (unit reaches "active" = the app sent READY=1) with up to 180s
+          # headroom (matches the unit's TimeoutStartSec=infinity intent), while
+          # still catching a GENUINE crash immediately (unit "failed" via
+          # StartLimitBurst, or the auto-restart count climbing above baseline).
+          # A slow-but-healthy WAL-replay boot must NEVER be killed.
+          READINESS_TIMEOUT_SECS: "180"
+          READINESS_POLL_SECS: "10"
         run: |
+          set +e
           REGION="${{ vars.AWS_REGION || 'ap-south-1' }}"
           IID="${{ secrets.EC2_INSTANCE_ID }}"
-          # Poll the app systemd state every 10 seconds for 60 seconds.
-          # If it goes inactive, the deploy failed — capture WHY (the on-box
-          # journal) BEFORE rolling back, then roll back.
-          FAIL=0
-          for i in 1 2 3 4 5 6; do
-            STATE=$(aws ssm send-command \
-              --region "$REGION" \
-              --instance-ids "$IID" \
+          # One SSM round-trip returns BOTH the systemd state and the auto-restart
+          # count so we can tell "still booting (activating / replaying WAL)" apart
+          # from "crashed (failed, or Restart=always looping)". Single-line
+          # commands=[...] with escaped quotes only — no apostrophes (SSM-quoting guard).
+          probe() {
+            local cid
+            cid=$(aws ssm send-command \
+              --region "$REGION" --instance-ids "$IID" \
               --document-name "AWS-RunShellScript" \
-              --parameters 'commands=["systemctl is-active tickvault"]' \
-              --query 'Command.CommandId' --output text)
-            sleep 5
-            RESULT=$(aws ssm get-command-invocation \
-              --region "$REGION" \
-              --command-id "$STATE" \
-              --instance-id "$IID" \
-              --query 'StandardOutputContent' --output text | tr -d '[:space:]')
-            echo "Check $i: systemd state = $RESULT"
-            if [ "$RESULT" != "active" ]; then
-              FAIL=1
-              break
-            fi
-            sleep 5
+              --parameters 'commands=["printf STATE=; systemctl is-active tickvault 2>/dev/null || true; printf NRESTARTS=; systemctl show -p NRestarts --value tickvault 2>/dev/null || true"]' \
+              --query 'Command.CommandId' --output text 2>/dev/null)
+            if [ -z "$cid" ] || [ "$cid" = "None" ]; then echo "STATE=probefailed NRESTARTS="; return; fi
+            sleep 4
+            aws ssm get-command-invocation \
+              --region "$REGION" --command-id "$cid" --instance-id "$IID" \
+              --query 'StandardOutputContent' --output text 2>/dev/null | tr -d '[:space:]'
+          }
+          parse_state() { printf '%s' "$1" | sed -n 's/.*STATE=\([a-z-]*\).*/\1/p'; }
+          parse_nr()    { printf '%s' "$1" | sed -n 's/.*NRESTARTS=\([0-9]\+\).*/\1/p'; }
+          # Baseline restart count captured right after the deploy restart: any
+          # increase means the new binary died at least once (genuine crash).
+          BASELINE=$(parse_nr "$(probe)"); BASELINE="${BASELINE:-0}"
+          echo "Baseline NRestarts after deploy = ${BASELINE}"
+          VERIFIED=0; CRASHED=0; ELAPSED=0
+          while [ "$ELAPSED" -lt "${READINESS_TIMEOUT_SECS}" ]; do
+            OUT="$(probe)"
+            STATE=$(parse_state "$OUT")
+            NR=$(parse_nr "$OUT"); NR="${NR:-$BASELINE}"
+            echo "Readiness probe @ ~${ELAPSED}s: state=${STATE:-unknown} NRestarts=${NR} (baseline ${BASELINE})"
+            if [ "$STATE" = "active" ]; then VERIFIED=1; break; fi
+            if [ "$STATE" = "failed" ] || [ "$NR" -gt "$BASELINE" ]; then CRASHED=1; break; fi
+            # activating / reloading / transient probe hiccup -> slow WAL-replay boot; keep waiting.
+            sleep "${READINESS_POLL_SECS}"
+            ELAPSED=$((ELAPSED + READINESS_POLL_SECS))
           done
-          if [ "$FAIL" -eq 1 ]; then
+          if [ "$VERIFIED" -eq 0 ] && [ "$CRASHED" -eq 0 ]; then
+            # Timed out: re-probe once. Alive-but-slow (still "activating", no extra
+            # restart) is a healthy slow boot we DO NOT kill; only a failed/looping
+            # unit is a crash.
+            OUT="$(probe)"; STATE=$(parse_state "$OUT"); NR=$(parse_nr "$OUT"); NR="${NR:-$BASELINE}"
+            if [ "$STATE" = "active" ]; then
+              VERIFIED=1
+            elif [ "$STATE" = "failed" ] || [ "$NR" -gt "$BASELINE" ]; then
+              CRASHED=1
+            else
+              echo "::warning::Readiness not confirmed within ${READINESS_TIMEOUT_SECS}s, but the unit is '${STATE:-unknown}' with no extra restarts (baseline ${BASELINE}) — NOT rolling back. systemd Type=notify sends READY=1 only after the WAL-replay boot gates; a slow-but-healthy boot must not be killed."
+              VERIFIED=1
+            fi
+          fi
+          if [ "$CRASHED" -eq 1 ]; then
             # ── Z+ L1 DETECT (2026-06-05 fix, deploy run #176) ───────────────
             # The app started but DIED inside this 60s verify window — the most
             # common real failure (a delayed boot-step panic between T+5s and
@@ -773,7 +813,7 @@ jobs:
               --parameters 'commands=["set -euo pipefail","if [ ! -d /opt/tickvault ]; then echo SKIP_ROLLBACK_NO_DIR; exit 0; fi","cd /opt/tickvault","if [ -f bin/tickvault.backup ]; then mv bin/tickvault.backup bin/tickvault; systemctl restart tickvault; fi"]'
             exit 1
           fi
-          echo "DEPLOY VERIFIED: tickvault has been active for 60s"
+          echo "DEPLOY VERIFIED: tickvault reached readiness (systemd active, or a healthy slow WAL-replay boot with no crash)"
 
       - name: Notify Telegram on success
         # ANTI-FALSE-OK: an intentional off-hours skip now exits the deploy job
