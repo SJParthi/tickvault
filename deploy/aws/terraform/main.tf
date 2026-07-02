@@ -122,6 +122,15 @@ resource "aws_security_group" "tv_app" {
 # IAM
 # ---------------------------------------------------------------------------
 
+# Customer-managed KMS key for the Groww shared-token SSM parameters. Created
+# and owned by the bruteX repo's groww-token-minter terraform (operator lock
+# 2026-07-02, .claude/rules/project/groww-shared-token-minter-2026-07-02.md §1)
+# — referenced here read-only so the instance role can be granted kms:Decrypt
+# on exactly this one key (least privilege; no wildcard key access).
+data "aws_kms_key" "tickvault_groww" {
+  key_id = "alias/tickvault-groww"
+}
+
 resource "aws_iam_role" "tv_instance" {
   name = "tv-${var.environment}-instance-role"
 
@@ -164,6 +173,28 @@ resource "aws_iam_role_policy" "tv_instance" {
           # /tickvault/*. NO real orders — production.toml locks dry_run=true.
           "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/*"
         ]
+      },
+      {
+        # Groww shared-token decrypt (sidecar crash-loop fix, 2026-07-02):
+        # /tickvault/prod/groww/access-token is a SecureString encrypted with
+        # the CUSTOMER-MANAGED key alias/tickvault-groww (owned by the bruteX
+        # groww-token-minter terraform). Unlike AWS-managed aws/ssm keys, a
+        # CMK-encrypted param needs kms:Decrypt in THIS identity policy in
+        # addition to the ssm:GetParameter grant above — without it the
+        # GetParameter(WithDecryption=true) decrypt leg is denied, which
+        # crash-looped the Groww sidecar (CloudWatch 15:03-15:14 IST,
+        # 2026-07-02). Scoped to exactly that one key AND only via SSM
+        # (mirrors the telegram-webhook-lambda.tf ViaService pattern).
+        Effect = "Allow"
+        Action = [
+          "kms:Decrypt",
+        ]
+        Resource = data.aws_kms_key.tickvault_groww.arn
+        Condition = {
+          StringEquals = {
+            "kms:ViaService" = "ssm.${var.aws_region}.amazonaws.com"
+          }
+        }
       },
       {
         Effect = "Allow"
@@ -460,6 +491,13 @@ resource "aws_iam_role_policy" "eventbridge_ec2_scheduler" {
           "ssm:StartAutomationExecution"
         ]
         Resource = [
+          # IAM evaluates StartAutomationExecution for AWS-owned documents
+          # against the document/ ARN (empty account field) — verified via
+          # CloudTrail AccessDenied on 2026-07-02: the denied resource is
+          # arn:aws:ssm:ap-south-1::document/AWS-StartEC2Instance. Keep the
+          # automation-definition/ form too (EventBridge target ARN shape).
+          "arn:aws:ssm:${data.aws_region.current.name}::document/AWS-StartEC2Instance",
+          "arn:aws:ssm:${data.aws_region.current.name}::document/AWS-StopEC2Instance",
           "arn:aws:ssm:${data.aws_region.current.name}::automation-definition/AWS-StartEC2Instance:*",
           "arn:aws:ssm:${data.aws_region.current.name}::automation-definition/AWS-StopEC2Instance:*"
         ]

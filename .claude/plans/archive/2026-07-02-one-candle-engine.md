@@ -1,7 +1,8 @@
 # Implementation Plan: ONE common candle engine — Groww through the 21-TF MultiTfAggregator (all timeframes, feed=column)
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-06-23
+**Reconciled:** 2026-07-02 — audit verified all 5 items shipped on origin/main; checkboxes were stale.
 **Approved by:** Parthiban — §45-48 of `active-plan-groww-live-backtest-parity.md` (operator lock 2026-06-22 "from ticks always generate all candle timeframes"; "make everything as common runtime dynamic scalable approach"). This file is the executable design for the SP3 danger-zone aggregator unification.
 
 ## Design
@@ -75,11 +76,11 @@ Additive + gated: Groww default OFF. Reverting restores the siloed Groww 1m path
 Existing seal counters cover both feeds. `feed_health.record_candle(Feed::Groww)` on each Groww seal. Flush failures `error!` with code. Reuses AGGREGATOR-* family — no new error codes.
 
 ## Plan Items
-- [ ] SP3a — GOLDEN test FIRST.
-- [ ] SP3b — `FeedStrategy { late_policy }` + `cumulative_volume_override` threaded through consume_tick. Dhan = Refold + None.
-- [ ] SP3c — `BufferedSeal.feed: Feed` + `append_seal` stamps `seal.feed.as_str()`.
-- [ ] SP3d — rewrite `groww_bridge.rs` to feed a Groww `MultiTfAggregator` + route seals via `global_seal_sender`; token/ts width guards.
-- [ ] SP3e — DELETE `Groww1mAggregator` + mod; DELETE `GrowwCandle1mWriter`/`append_row`/`GrowwCandle1mRow`.
+- [x] SP3a — GOLDEN test FIRST. — DONE on main: `crates/trading/tests/groww_one_candle_engine_golden.rs`
+- [x] SP3b — `FeedStrategy { late_policy }` + `cumulative_volume_override` threaded through consume_tick. Dhan = Refold + None. — DONE on main: `FeedStrategy` + `cumulative_volume_override` in `crates/trading/src/candles/aggregator_cell.rs` + `multi_tf_aggregator.rs`
+- [x] SP3c — `BufferedSeal.feed: Feed` + `append_seal` stamps `seal.feed.as_str()`. — DONE on main: `seal.feed` stamp at `crates/storage/src/shadow_candle_writer.rs:225`
+- [x] SP3d — rewrite `groww_bridge.rs` to feed a Groww `MultiTfAggregator` + route seals via `global_seal_sender`; token/ts width guards. — DONE on main: `crates/app/src/groww_bridge.rs` feeds `MultiTfAggregator::consume_tick(FeedStrategy::GROWW)` (guard `test_run_groww_bridge_routes_seals_through_shared_writer`)
+- [x] SP3e — DELETE `Groww1mAggregator` + mod; DELETE `GrowwCandle1mWriter`/`append_row`/`GrowwCandle1mRow`. — DONE on main: modules deleted; deletion pinned by the `groww_bridge.rs` shared-writer source-scan guard
 
 ## Guarantee matrix
 Cross-references `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row). Proof: golden + unit tests; audit via existing `candles_<tf>` DEDUP `(ts,security_id,segment,feed)`; logging via existing seal counters + `error!` flush; performance: per-tick fold O(1)/zero-alloc (override stack arg, FeedStrategy Copy).
