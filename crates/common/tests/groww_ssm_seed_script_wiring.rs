@@ -1,15 +1,16 @@
-//! Ratchet: `scripts/aws-seed-ssm-parameters.sh` MUST seed the two Groww
-//! feed-#2 SSM parameters (`groww/api-key` + `groww/totp-secret`).
+//! Ratchet: `scripts/aws-seed-ssm-parameters.sh` must NEVER write any
+//! `/tickvault/<env>/groww/*` SSM parameter.
 //!
-//! Why this guard exists (closes the gap PR #1299 fixed): prod runs Groww
-//! (`config/production.toml` `groww_enabled = true`) and the Groww sidecar
-//! reads `/tickvault/<env>/groww/api-key` + `/totp-secret` from AWS SSM at
-//! boot (`crates/core/src/auth/secret_manager.rs`). If the seed script ever
-//! stops provisioning those two paths, the sidecar's SSM fetch backs off
-//! FOREVER and Groww silently produces ZERO ticks while Dhan runs fine — the
-//! AWS-side "subscribed but no ticks" trap. This ratchet makes that
-//! regression a BUILD FAILURE instead of a silent go-live surprise, so the
-//! "both feeds run unattended" guarantee cannot quietly rot.
+//! Shared token-minter lock 2026-07-02
+//! (`.claude/rules/project/groww-shared-token-minter-2026-07-02.md`): the
+//! bruteX-owned `groww-token-minter` Lambda is the SOLE minter and the sole
+//! owner of the `groww/api-key` + `groww/totp-secret` credential parameters;
+//! it writes the daily `groww/access-token`. TickVault is a READ-ONLY consumer
+//! of the access-token parameter — an uncoordinated TickVault write (a seed
+//! script overwriting the real credentials, or any token write) can break the
+//! shared token for BOTH repos. This ratchet supersedes the pre-2026-07-02
+//! version of this file, which pinned the OPPOSITE (that the seed script DID
+//! seed the two credential params — the flow the minter architecture retired).
 //!
 //! Mirrors `dhan_ip_registration_script_wiring.rs`.
 
@@ -36,7 +37,7 @@ fn test_seed_script_exists_and_is_executable() {
     assert!(
         path.exists(),
         "Z+ L1 DETECT ratchet: scripts/aws-seed-ssm-parameters.sh is missing — \
-         the operator cannot seed any SSM secrets (Dhan OR Groww)."
+         the operator cannot seed any SSM secrets (Dhan)."
     );
     let meta = fs::metadata(&path).unwrap_or_else(|e| panic!("stat: {e}")); // APPROVED: test
     assert!(
@@ -46,55 +47,76 @@ fn test_seed_script_exists_and_is_executable() {
 }
 
 #[test]
-fn test_seed_script_actually_seeds_both_groww_ssm_params() {
-    // Assert the REAL put_param seeding calls (not just a doc comment) for the
-    // two paths the Groww sidecar reads. A future edit that drops the seeding
-    // — even if it leaves the docstring — fails here.
+fn test_seed_script_never_writes_any_groww_param() {
+    // The HARD rule: no put_param (or any aws ssm put-parameter) against a
+    // groww/* path. The Lambda owns every /tickvault/<env>/groww/* parameter.
     let body = read("scripts/aws-seed-ssm-parameters.sh");
-    for path in &[
-        "/tickvault/${ENVIRONMENT}/groww/api-key",
-        "/tickvault/${ENVIRONMENT}/groww/totp-secret",
-    ] {
+    for line in body.lines() {
+        let l = line.trim();
+        if l.starts_with('#') {
+            continue; // documentation may NAME the paths to explain the ban
+        }
+        let lower = l.to_ascii_lowercase();
         assert!(
-            body.contains(&format!("put_param \"{path}\"")),
-            "Z+ L2 VERIFY ratchet: aws-seed-ssm-parameters.sh no longer SEEDS \
-             '{path}' (missing its put_param call). The Groww sidecar reads this \
-             exact path from SSM at boot — without it, Groww's SSM fetch backs off \
-             forever and produces ZERO ticks. Re-add the put_param seeding."
+            !(lower.contains("put_param") && lower.contains("/groww/")),
+            "shared token-minter lock 2026-07-02 VIOLATED: the seed script \
+             writes a /tickvault/<env>/groww/* parameter — those are owned by \
+             the bruteX groww-token-minter Lambda. Offending line: {l}"
+        );
+        assert!(
+            !(lower.contains("put-parameter") && lower.contains("/groww/")),
+            "shared token-minter lock 2026-07-02 VIOLATED: raw aws ssm \
+             put-parameter against a groww/* path. Offending line: {l}"
         );
     }
 }
 
 #[test]
-fn test_seed_script_groww_paths_match_the_rust_reader() {
-    // The seed script's SSM path SUFFIXES must match what
-    // secret_manager.rs reads, so a rename on either side is caught.
-    let script = read("scripts/aws-seed-ssm-parameters.sh");
-    let reader = read("crates/core/src/auth/secret_manager.rs");
-    for suffix in &["groww/api-key", "groww/totp-secret"] {
-        assert!(
-            script.contains(suffix),
-            "Z+ L3 RECONCILE ratchet: seed script missing SSM suffix '{suffix}'."
-        );
-        assert!(
-            reader.contains(suffix),
-            "Z+ L3 RECONCILE ratchet: secret_manager.rs no longer reads SSM suffix \
-             '{suffix}' — the seed script + the app would target different paths."
-        );
-    }
+fn test_seed_script_documents_the_minter_ownership() {
+    // The script must EXPLAIN the ban in place (so a future editor sees the
+    // contract at the exact spot they would re-add the seeding).
+    let body = read("scripts/aws-seed-ssm-parameters.sh");
+    assert!(
+        body.contains("groww-token-minter"),
+        "the seed script must document that the bruteX groww-token-minter \
+         Lambda owns the groww/* parameters (shared token-minter lock \
+         2026-07-02)."
+    );
+    assert!(
+        body.contains("read-only") || body.contains("READ-ONLY"),
+        "the seed script must state TickVault's read-only consumer role for \
+         the groww access-token parameter."
+    );
 }
 
 #[test]
-fn test_seed_script_exposes_groww_from_env_var_names() {
-    // The --from-env (CI / non-interactive automation) mode needs the two env
-    // var names, or automated seeding can never provide Groww creds unattended.
+fn test_seed_script_no_groww_credential_env_vars() {
+    // The old --from-env credential vars must not silently return.
     let body = read("scripts/aws-seed-ssm-parameters.sh");
     for var in &["TV_GROWW_API_KEY", "TV_GROWW_TOTP_SECRET"] {
         assert!(
-            body.contains(var),
-            "Z+ L2 VERIFY ratchet: aws-seed-ssm-parameters.sh missing --from-env \
-             var '{var}' — non-interactive/CI seeding of Groww creds would be \
-             impossible (breaks the zero-manual-intervention path)."
+            !body.contains(var),
+            "shared token-minter lock 2026-07-02: the seed script references \
+             {var} — Groww credentials must never pass through TickVault."
+        );
+    }
+}
+
+#[test]
+fn test_rust_reader_targets_the_access_token_param_only() {
+    // The Rust SSM reader must read groww/access-token and must NOT read the
+    // Lambda-only credential params.
+    let reader = read("crates/core/src/auth/secret_manager.rs");
+    assert!(
+        reader.contains("GROWW_ACCESS_TOKEN_SECRET"),
+        "secret_manager.rs no longer reads the groww access-token parameter — \
+         the read-only consumer path is broken."
+    );
+    for banned in &["GROWW_API_KEY_SECRET", "GROWW_TOTP_SECRET"] {
+        assert!(
+            !reader.contains(banned),
+            "shared token-minter lock 2026-07-02: secret_manager.rs references \
+             {banned} — the credential parameters are Lambda-only."
         );
     }
 }

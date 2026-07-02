@@ -31,8 +31,24 @@ Volume is Option A (price-only, operator 2026-06-20): the Groww live feed carrie
 NO traded volume (only ltp/value + tsInMillis), so cum_volume is always 0.
 
 Usage (auto-launched by the Rust supervisor; no manual run needed):
-    export GROWW_API_KEY=...   GROWW_TOTP_SECRET=...
+    export GROWW_SSM_TOKEN_PARAM=/tickvault/prod/groww/access-token
     python3 groww_sidecar.py
+    # local dev without AWS: export GROWW_ACCESS_TOKEN=<token> instead
+
+TOKEN ARCHITECTURE (shared token-minter lock 2026-07-02 —
+.claude/rules/project/groww-shared-token-minter-2026-07-02.md): this sidecar
+NEVER mints a Groww access token. The bruteX-owned `groww-token-minter` AWS
+Lambda is the SOLE minter (daily ~06:05 IST, right after Groww's 06:00 IST
+token reset); it writes the token to the SSM parameter named by
+GROWW_SSM_TOKEN_PARAM. This sidecar READS that ONE parameter (read-only IAM
+reader role, default credential chain) and builds GrowwAPI(access_token) +
+GrowwFeed from it — token only, never credentials. On an auth-class failure
+(the daily reset, a stale token) it drops the cached token and RE-READS the
+parameter on the next cycle, paced at >=60s for auth failures; if the token is
+still stale after ~10 minutes it prints ONE edge-triggered `GROWW LIVE FEED
+REJECTED:` alert line (routed by the Rust supervisor to feed-health +
+Telegram) and keeps retrying — it never mints (an uncoordinated mint can
+invalidate the shared token mid-session for BruteX).
 """
 import asyncio
 import glob
@@ -47,8 +63,6 @@ import time
 import traceback
 from datetime import datetime, timezone, timedelta
 
-import pyotp
-
 # DIAGNOSTIC (2026-06-29): turn ON the Groww SDK's OWN logging so the per-frame
 # decode errors it currently SWALLOWS (the bare "Error:" lines with no detail)
 # print with full context to stderr. The SDK's blocking consume() decodes
@@ -57,7 +71,7 @@ import pyotp
 # this, those errors vanish. Routed to STDERR (the Rust supervisor captures both
 # streams) and scoped to the `growwapi` logger at DEBUG; redaction of OUR
 # credentials is unaffected because the SDK logs protocol detail, not our
-# api_key/TOTP (and the supervisor-captured stream is operator-local per lock §32).
+# any secret (and the supervisor-captured stream is operator-local per lock §32).
 logging.basicConfig(
     level=logging.DEBUG,
     stream=sys.stderr,
@@ -528,6 +542,85 @@ def should_force_reconnect(
     return secs_since_change >= deadline_secs
 
 
+# ---------------------------------------------------------------------------
+# Shared-token acquisition (READ-ONLY — the bruteX groww-token-minter Lambda is
+# the sole minter; lock 2026-07-02). No TOTP generation, no SDK mint call, ever.
+# ---------------------------------------------------------------------------
+
+# Floor for retry pacing when the failure is auth-class (stale/unusable token):
+# ~60s rides the daily 06:00->06:05 IST mint gap without hammering anything.
+AUTH_RETRY_FLOOR_SECS = 60
+# After this many seconds of CONTINUOUS auth-class failure, print ONE
+# edge-triggered `GROWW LIVE FEED REJECTED:` alert line (the Rust supervisor
+# routes it to feed-health + Telegram) — then keep retrying, NEVER mint.
+TOKEN_STALE_ALERT_SECS = 600
+
+
+def _read_access_token():
+    """Read the shared Groww access token — env override, else SSM (read-only).
+
+    Order: GROWW_ACCESS_TOKEN env (local dev without AWS; token only, never a
+    credential) -> SSM GetParameter(WithDecryption=True) on the parameter named
+    by GROWW_SSM_TOKEN_PARAM, via boto3's default credential chain (the
+    instance-profile-delivered reader role in prod). Raises on any failure so
+    the caller's auth-phase backoff paces the retry. NEVER mints.
+    """
+    env_token = os.environ.get("GROWW_ACCESS_TOKEN")
+    if env_token and env_token.strip():
+        return env_token.strip()
+    param = os.environ.get("GROWW_SSM_TOKEN_PARAM")
+    if not param:
+        raise RuntimeError(
+            "no token source: set GROWW_SSM_TOKEN_PARAM (prod; SSM parameter "
+            "path of the minter-written access token) or GROWW_ACCESS_TOKEN "
+            "(local dev)"
+        )
+    import boto3  # deferred: only the SSM path needs AWS
+
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "ap-south-1"
+    ssm = boto3.client("ssm", region_name=region)
+    value = ssm.get_parameter(Name=param, WithDecryption=True)["Parameter"]["Value"]
+    token = (value or "").strip()
+    if not token or token.lower() in ("placeholder", "changeme", "todo", "unset"):
+        raise RuntimeError(
+            f"SSM parameter {param} holds no usable token — the "
+            "groww-token-minter Lambda has not written today's token yet"
+        )
+    return token
+
+
+def _is_auth_error(exc) -> bool:
+    """True if `exc` looks auth-class (401/403 or auth/token wording).
+
+    Used to drop the cached token on ANY phase's auth-shaped failure — the
+    daily 06:00 IST reset surfaces as a 401 on feed-connect/subscribe, not in
+    the [auth] read phase — so the NEXT cycle re-reads the SSM parameter
+    instead of retrying forever with the stale token.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None) if response is not None else None
+    if status in (401, 403):
+        return True
+    name = type(exc).__name__.lower()
+    if "auth" in name or "token" in name:
+        return True
+    text = str(exc).lower()
+    return "unauthorized" in text or "authorization violation" in text or "token expired" in text
+
+
+def _token_stale_alert_due(stale_since, now_secs, already_alerted) -> bool:
+    """Pure: is the ONE edge-triggered token-stale alert due?
+
+    True only when auth has been continuously failing for
+    TOKEN_STALE_ALERT_SECS and the alert has not fired yet this stale episode.
+    """
+    if already_alerted or stale_since is None:
+        return False
+    return (now_secs - stale_since) >= TOKEN_STALE_ALERT_SECS
+
+
 def _backoff_secs(consecutive_failures: int, rate_limited: bool, retry_after) -> float:
     """Exponential backoff with jitter for the Nth consecutive failure.
 
@@ -577,11 +670,11 @@ def _redact(text: str, secrets) -> str:
     """Scrub known secret values out of a string before it is logged.
 
     A Groww SDK HTTP error's str/repr can embed the request that carried the
-    access token / api_key, or echo the response body (security-review MEDIUM
+    access token, or echo the response body (security-review MEDIUM
     2026-06-19). We DO want the cause (status code, error message, SDK detail)
     for triage, so instead of dropping the whole detail we surface it with every
     known secret value masked. Two layers:
-      1. Exact-match every value in `secrets` (api_key, totp_secret, and — since
+      1. Exact-match every value in `secrets` (the shared access token — since
          2026-06-29 — the live access token, kept current across refreshes).
       2. Structural masks for any JWT-shaped / bearer-ish token even if it is NOT
          in `secrets` (an unanticipated token shape), so the redaction is no
@@ -618,7 +711,7 @@ class _RedactingLogFilter(logging.Filter):
     DEBUG (stderr). Those records are emitted by THIRD-PARTY code through Python's
     logging module, so they NEVER pass through our per-print-call _redact — an
     auth/connect line the SDK logs at DEBUG (CONNECT frame, connect URL, exception
-    repr) could carry the access token / api_key / TOTP and the Rust supervisor
+    repr) could carry the access token and the Rust supervisor
     forwards it verbatim to CloudWatch. This filter intercepts each record BEFORE
     emit, fully materialises its message (msg % args), runs it through _redact
     (exact-value masks for everything in `secrets` PLUS the structural JWT/bearer
@@ -1169,10 +1262,12 @@ def silent_feed_watchdog(stocks: int, indices: int, feed_cell=None) -> None:
 
 
 def main() -> None:
-    api_key = os.environ.get("GROWW_API_KEY")
-    totp_secret = os.environ.get("GROWW_TOTP_SECRET")
-    if not api_key or not totp_secret:
-        sys.exit("Set GROWW_API_KEY and GROWW_TOTP_SECRET in the environment.")
+    if not (os.environ.get("GROWW_SSM_TOKEN_PARAM") or os.environ.get("GROWW_ACCESS_TOKEN")):
+        sys.exit(
+            "Set GROWW_SSM_TOKEN_PARAM (prod: SSM path of the minter-written "
+            "access token) or GROWW_ACCESS_TOKEN (local dev). This sidecar "
+            "never mints — see the shared token-minter lock 2026-07-02."
+        )
 
     os.makedirs(os.path.dirname(OUTPUT_PATH) or ".", exist_ok=True)
     out = open(OUTPUT_PATH, "a", buffering=1)  # line-buffered append
@@ -1186,15 +1281,19 @@ def main() -> None:
     # reject poller — which capture this object by reference — mask it too. Also
     # installs a redacting logging.Filter on the SDK loggers so SDK-emitted DEBUG
     # records are scrubbed structurally, not just our own print() lines.
-    secrets = [api_key, totp_secret]
+    secrets = []  # the access token is added the moment it is read (below)
     _install_sdk_log_redaction(secrets)
 
-    # Cached access token, reused across FEED reconnects so a feed-connect /
-    # subscribe / consume failure does NOT re-hit the rate-limited token endpoint.
-    # We re-acquire ONLY when there is no token yet or the previous failure was an
-    # auth-class error (token actually invalid/expired). This, plus the exponential
-    # backoff below, is what stops the self-inflicted [auth] rate-limit storm.
+    # Cached access token, reused across FEED reconnects. Re-READ from SSM
+    # ONLY when there is no token yet or the previous failure was auth-class
+    # (the shared token actually rotated/stale) — "never cache the token past
+    # an auth failure" (lock 2026-07-02) while keeping the ms-ladder feed
+    # reconnects from hammering SSM. NEVER minted.
     access_token = None
+    # Continuous auth-failure episode tracking for the ONE edge-triggered
+    # token-stale alert (>= TOKEN_STALE_ALERT_SECS -> REJECTED marker line).
+    auth_stale_since = None
+    token_stale_alerted = False
     # Count of consecutive failed cycles — drives the exponential backoff. Reset to
     # 0 after a fully successful cycle (auth OK + connected + consuming).
     consecutive_failures = 0
@@ -1213,8 +1312,7 @@ def main() -> None:
         phase = "auth"
         try:
             if access_token is None:
-                totp = pyotp.TOTP(totp_secret).now()
-                access_token = GrowwAPI.get_access_token(api_key=api_key, totp=totp)
+                access_token = _read_access_token()
                 # Add the freshly-acquired bearer token to the live redaction set
                 # (security fix 2026-06-29): a NATS-over-WS auth/handshake error's
                 # repr can embed the CONNECT frame / auth payload carrying this
@@ -1228,7 +1326,9 @@ def main() -> None:
                 # connect failed" from "auth failed". Log only the token LENGTH,
                 # never the token value.
                 print(
-                    f"groww auth OK: access token acquired (len={len(access_token or '')})",
+                    "groww auth OK: shared access token read "
+                    f"(len={len(access_token or '')}) — minted by the "
+                    "groww-token-minter Lambda, never by this sidecar",
                     flush=True,
                 )
             else:
@@ -1294,6 +1394,9 @@ def main() -> None:
             # A full cycle succeeded up to the blocking consume — reset backoff so
             # the next genuine disconnect retries quickly, not at the capped delay.
             consecutive_failures = 0
+            # Auth is healthy — close any token-stale episode (edge reset).
+            auth_stale_since = None
+            token_stale_alerted = False
             # Surface the REAL NATS reject reason (2026-06-29). The SDK swallows it:
             # an "Authorization Violation" never reaches a growwapi callback (it is
             # stored only on the underlying socket's last_error) and the bare
@@ -1339,20 +1442,40 @@ def main() -> None:
             consecutive_failures += 1
             rate_limited = _is_rate_limit_error(exc)
             retry_after = _retry_after_secs(exc)
-            # Drop the cached token only on an auth-class failure (token actually
-            # bad/expired) so the NEXT iteration re-acquires it. A feed-side failure
-            # keeps the token cached → reconnect the feed without re-hitting the
-            # rate-limited token endpoint. A rate-limit in the [auth] phase is NOT
-            # an invalid token — keep any token we already have.
-            if phase == "auth" and not rate_limited:
+            # Drop the cached token on ANY auth-class failure — the [auth] read
+            # phase itself, OR a 401/auth-shaped reject in feed-connect/subscribe
+            # (how the daily 06:00 IST token reset actually surfaces) — so the
+            # NEXT iteration RE-READS the SSM parameter (never mints). A pure
+            # feed-side failure keeps the token cached so ms-ladder reconnects
+            # do not hammer SSM.
+            auth_class = (phase == "auth" and not rate_limited) or _is_auth_error(exc)
+            if auth_class:
                 access_token = None
+                if auth_stale_since is None:
+                    auth_stale_since = time.time()
             delay = _backoff_secs(consecutive_failures, rate_limited, retry_after)
+            if auth_class:
+                # Ride the 06:00->06:05 daily mint gap at a calm >=60s pace —
+                # an auth-stale token cannot be fixed by fast reconnects, only
+                # by the minter Lambda writing a fresh one.
+                delay = max(delay, AUTH_RETRY_FLOOR_SECS)
+                if _token_stale_alert_due(auth_stale_since, time.time(), token_stale_alerted):
+                    token_stale_alerted = True
+                    print(
+                        "GROWW LIVE FEED REJECTED: access token stale for "
+                        f"{int(time.time() - auth_stale_since)}s (>10min) — the "
+                        "bruteX groww-token-minter Lambda may not have run; "
+                        "check its last daily mint. This sidecar keeps retrying "
+                        "the SSM read and NEVER mints a replacement.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
             # Surface the WHY for triage, with every known secret value masked and
             # the detail length-capped: a Groww SDK HTTP error can embed the
-            # response body (and thus the access token / api_key) in its
+            # response body (and thus the access token) in its
             # str/repr/response, which the Rust supervisor captures from stdout
             # (security-review MEDIUM 2026-06-19). `_exception_detail` redacts the
-            # api_key + TOTP secret and caps length so the cause is visible without
+            # access token and caps length so the cause is visible without
             # leaking the credentials. We print to STDERR (errors belong there; the
             # supervisor captures both) with the exception TYPE + the full redacted
             # detail (now incl. the SDK `.msg`/`.code`, never just an empty str).
@@ -1368,7 +1491,7 @@ def main() -> None:
             # a fast-looping `consume()` that returns-then-raises can never flood the
             # log, while the operator still always sees the real stack on the first
             # occurrence (the deliverable that unblocks diagnosis). Redacted + capped
-            # so it can never leak the api_key / TOTP secret that an SDK frame's
+            # so it can never leak the access token that an SDK frame's
             # locals/repr might embed.
             if consecutive_failures == 1 or consecutive_failures % 100 == 0:
                 tb = _redact(traceback.format_exc(), secrets)
