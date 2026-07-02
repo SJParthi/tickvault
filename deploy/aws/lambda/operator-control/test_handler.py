@@ -335,6 +335,118 @@ class SafeSql(unittest.TestCase):
         self.assertFalse(handler._is_safe_sql("vacuum"))
 
 
+class SafeSqlHardened(unittest.TestCase):
+    """DB-console hardening (2026-07-02): single-statement, no comments,
+    QuestDB mutators banned anywhere, server-side row cap."""
+
+    def test_chained_unlisted_mutator_rejected(self) -> None:
+        # THE pre-hardening gap: 'backup' was not in the banned list and the
+        # first-word check only saw "select", so a ';'-chained second
+        # statement slipped through. Now BOTH the single-statement rule and
+        # the extended banned list reject it.
+        self.assertFalse(handler._is_safe_sql("select 1; backup table ticks"))
+
+    def test_multi_statement_rejected_single_trailing_semicolon_ok(self) -> None:
+        self.assertFalse(handler._is_safe_sql("select 1; select 2"))
+        self.assertFalse(handler._is_safe_sql("select 1;;"))
+        self.assertFalse(handler._is_safe_sql(";"))
+        self.assertTrue(handler._is_safe_sql("select 1;"))  # ONE trailing ';' stripped
+
+    def test_sql_comments_rejected(self) -> None:
+        self.assertFalse(handler._is_safe_sql("-- comment\nselect 1"))
+        self.assertFalse(handler._is_safe_sql("select 1 -- tail comment"))
+        self.assertFalse(handler._is_safe_sql("select /* hidden */ 1"))
+
+    def test_with_insert_still_rejected(self) -> None:
+        self.assertFalse(handler._is_safe_sql("WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x"))
+
+    def test_questdb_mutator_keywords_rejected_anywhere(self) -> None:
+        for kw in (
+            "backup", "checkpoint", "snapshot", "cancel", "set", "refresh",
+            "detach", "attach", "dedup", "squash", "resume", "suspend",
+        ):
+            self.assertFalse(handler._is_safe_sql(f"select {kw} from ticks"), kw)
+            self.assertFalse(handler._is_safe_sql(f"{kw} table ticks"), kw)
+
+    def test_plain_reads_still_pass(self) -> None:
+        self.assertTrue(handler._is_safe_sql("SELECT * FROM ticks LIMIT 10"))
+        self.assertTrue(handler._is_safe_sql("SHOW TABLES"))
+        self.assertTrue(handler._is_safe_sql("SELECT table_name FROM tables() ORDER BY table_name"))
+        self.assertTrue(handler._is_safe_sql("SELECT * FROM table_columns('ticks')"))
+        # word-boundary sanity: 'offset' must not trip the 'set' ban.
+        self.assertTrue(handler._is_safe_sql("select * from ticks limit 10 offset"))
+
+
+class SqlRowCap(unittest.TestCase):
+    def test_oversized_user_limit_is_clamped_to_1000(self) -> None:
+        self.assertEqual(
+            handler._cap_sql_rows("select * from ticks limit 99999"),
+            "select * from ticks LIMIT 1000",
+        )
+
+    def test_missing_limit_is_appended_for_select(self) -> None:
+        self.assertEqual(
+            handler._cap_sql_rows("select * from ticks"),
+            "select * from ticks LIMIT 1000",
+        )
+
+    def test_small_user_limit_is_kept(self) -> None:
+        self.assertEqual(
+            handler._cap_sql_rows("select * from ticks limit 50"),
+            "select * from ticks limit 50",
+        )
+
+    def test_show_is_left_untouched(self) -> None:
+        # Appending LIMIT to SHOW would be a syntax error; output is tiny.
+        self.assertEqual(handler._cap_sql_rows("SHOW TABLES"), "SHOW TABLES")
+
+    def test_trailing_semicolon_is_stripped_before_append(self) -> None:
+        self.assertEqual(handler._cap_sql_rows("select 1;"), "select 1 LIMIT 1000")
+
+    def test_sql_max_rows_constant_is_1000(self) -> None:
+        self.assertEqual(handler._SQL_MAX_ROWS, 1000)
+
+
+class DbConsoleTab(unittest.TestCase):
+    def test_html_has_db_tab_between_data_and_github(self) -> None:
+        html = handler._console_html()
+        for t in ("overview", "data", "db", "github", "logs", "aws", "latency"):
+            self.assertIn('data-t="' + t + '"', html)
+        self.assertLess(html.index('data-t="data"'), html.index('data-t="db"'))
+        self.assertLess(html.index('data-t="db"'), html.index('data-t="github"'))
+
+    def test_db_tab_shows_read_only_badge(self) -> None:
+        html = handler._console_html()
+        self.assertIn("READ-ONLY — writes are blocked server-side", html)
+
+    def test_db_tab_has_all_controls(self) -> None:
+        html = handler._console_html()
+        for needle in (
+            "loadDbTables()", "runDbSql()", "dbDownloadCsv()", "dbPick(",
+            'id="dbtables"', 'id="dbsql"', 'id="dbout"', 'id="dbcount"', 'id="dbcols"',
+        ):
+            self.assertIn(needle, html, needle)
+
+    def test_db_tab_autoloads_tables_on_open(self) -> None:
+        # tab('db') must trigger loadDbTables() without an extra click.
+        html = handler._console_html()
+        self.assertIn("name==='db' && !$('dbtables').dataset.loaded) loadDbTables()", html)
+
+    def test_table_pick_is_index_based_no_injection(self) -> None:
+        # The clicked table name comes from dbTables[i] — QuestDB's own
+        # tables() output — never from user-typed input.
+        html = handler._console_html()
+        self.assertIn("dbTables[i]", html)
+        self.assertIn("table_columns(", html)
+        self.assertIn("LIMIT 100", html)
+
+    def test_grid_rows_render_through_esc(self) -> None:
+        # Every cell of the shared grid renderer must pass through esc().
+        html = handler._console_html()
+        self.assertIn("'<th>'+esc(c)+'</th>'", html)
+        self.assertIn("'<td>'+esc(tcell(c))+'</td>'", html)
+
+
 class PostRequiresAuth(unittest.TestCase):
     def setUp(self) -> None:
         self._orig = handler._control_secret
