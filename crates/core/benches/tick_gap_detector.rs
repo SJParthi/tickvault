@@ -21,12 +21,12 @@ use tickvault_core::pipeline::TickGapDetector;
 fn bench_record_tick_steady_state(c: &mut Criterion) {
     let detector = TickGapDetector::new(30);
     let now = Instant::now();
-    for id in 0..2_500_u32 {
+    for id in 0..2_500_u64 {
         detector.record_tick(id, ExchangeSegment::IdxI, now);
         detector.record_tick(id, ExchangeSegment::NseFno, now);
     }
     c.bench_function("tick_gap/record_tick_steady_state", |b| {
-        let mut sid: u32 = 0;
+        let mut sid: u64 = 0;
         b.iter(|| {
             sid = sid.wrapping_add(1) % 2_500;
             detector.record_tick(
@@ -45,7 +45,7 @@ fn bench_scan_gaps_full_universe(c: &mut Criterion) {
     let detector = TickGapDetector::new(30);
     let now = Instant::now();
     // Pre-seed with ~24K entries to mimic the real F&O universe.
-    for id in 0..12_000_u32 {
+    for id in 0..12_000_u64 {
         detector.record_tick(id, ExchangeSegment::IdxI, now);
         detector.record_tick(id, ExchangeSegment::NseFno, now);
     }
