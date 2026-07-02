@@ -380,6 +380,41 @@ class WipeGate(unittest.TestCase):
     def test_wipe_is_in_destructive_set(self) -> None:
         self.assertIn("wipe-questdb", handler._DESTRUCTIVE)
 
+    def test_wipe_is_resurrect_proof_and_dynamic(self) -> None:
+        # Operator incident 2026-07-02: the wipe TRUNCATEd 6 hardcoded tables
+        # (of 27) and never touched the feed capture/replay files, so Groww
+        # rows RESURRECTED via the bridge's byte-0 re-tail and most candle
+        # tables survived for BOTH feeds. Pin the rewrite by source-scan:
+        import inspect
+
+        src = inspect.getsource(handler)
+        # (a) dynamic table discovery — no hardcoded 6-table list.
+        self.assertIn("SELECT table_name FROM tables()", src)
+        self.assertIn("t == 'ticks' or t.startswith('candles_')", src)
+        # (b) every feed's capture/replay source removed (feed-agnostic).
+        for needle in ("/ws_wal", "/groww", "/spill", "/dlq", "live-ticks.ndjson"):
+            self.assertIn(needle, src, f"wipe must remove the {needle} replay source")
+        # (c) the app is stopped before + started after the wipe.
+        wipe_block = src.split('action == "wipe-questdb"', 1)[1].split('action == "docker-reset"', 1)[0]
+        self.assertIn("systemctl stop tickvault", wipe_block)
+        self.assertIn("systemctl start tickvault", wipe_block)
+        # (d) honest completion marker — never a fake OK.
+        self.assertIn("WIPE-COMPLETE", wipe_block)
+        self.assertIn("WIPE-PARTIAL", wipe_block)
+
+    def test_docker_reset_and_bare_nuke_remove_feed_capture_sources(self) -> None:
+        # The full nuke + bare nuke must ALSO sweep the feed capture/replay
+        # dirs — the Groww capture file survived both before 2026-07-02.
+        import inspect
+
+        src = inspect.getsource(handler)
+        reset_block = src.split('action == "docker-reset"', 1)[1].split('action == "docker-nuke-bare"', 1)[0]
+        bare_block = src.split('action == "docker-nuke-bare"', 1)[1]
+        for name, block in (("docker-reset", reset_block), ("docker-nuke-bare", bare_block)):
+            self.assertIn("/ws_wal", block, f"{name} must remove the Dhan WAL")
+            self.assertIn("/groww", block, f"{name} must remove the Groww capture dir")
+            self.assertIn("live-ticks.ndjson", block, f"{name} must sweep future feeds' capture files")
+
     def _docker_reset(self, force: bool):
         return handler.lambda_handler(
             {

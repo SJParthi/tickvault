@@ -222,7 +222,10 @@ pub fn silent_feed_diagnostic_level(market_open: bool) -> tracing::Level {
 pub fn classify_sidecar_line(line: &str) -> SidecarLineClass {
     let l = line.to_ascii_lowercase();
     // Auth reject is the most specific cause — check before the generic error.
-    if l.contains("error [auth]") {
+    // "access token stale" is the sidecar's 10-min minter-dead marker (2026-07-02
+    // adversarial finding H1: without this arm the marker classified Info and the
+    // promised feed-health + Telegram routing never fired).
+    if l.contains("error [auth]") || l.contains("access token stale") {
         return SidecarLineClass::AuthRejected;
     }
     // Entitlement / permissions: the SILENT-FEED watchdog + permissions text.
@@ -1028,6 +1031,26 @@ pub async fn run_groww_sidecar_supervisor(
             tickvault_common::constants::GROWW_ACCESS_TOKEN_SECRET,
         );
 
+        // Orphan reap (2026-07-02 adversarial finding M5): a SIGKILLed tickvault
+        // never runs kill_on_drop, leaving an ORPHANED sidecar still appending to
+        // the NDJSON (duplicate capture_seq rows) — and a pre-deploy orphan could
+        // even carry the retired mint code. Best-effort pkill of any process
+        // running our sidecar script before spawning the fresh one (single-app
+        // host; matches the exact script path, nothing else).
+        let script_needle = opts.script_path.to_string_lossy().into_owned();
+        if let Ok(status) = Command::new("pkill")
+            .args(["-f", &script_needle])
+            .status()
+            .await
+            && status.success()
+        {
+            warn!(
+                script = %script_needle,
+                "[feeds] groww sidecar: reaped an orphaned prior sidecar process \
+                 before launch (stale process from a previous run)"
+            );
+        }
+
         let venv_python = venv_python_path(&opts.venv_dir);
         let (prog, args) = build_sidecar_run_command(&venv_python, &opts.script_path);
         let mut cmd = Command::new(&prog);
@@ -1694,6 +1717,17 @@ mod tests {
             p,
             PathBuf::from("data/groww/venv/.requirements-fingerprint")
         );
+    }
+
+    #[test]
+    fn test_classify_access_token_stale_marker_is_auth_rejected() {
+        // 2026-07-02 adversarial finding H1: the sidecar's 10-min minter-dead
+        // marker MUST route to feed-health Down + Telegram (AuthRejected), not
+        // classify Info and vanish.
+        let line = "GROWW LIVE FEED REJECTED: access token stale for 612s (>10min) — \
+                    the bruteX groww-token-minter Lambda may not have run";
+        assert_eq!(classify_sidecar_line(line), SidecarLineClass::AuthRejected);
+        assert!(classify_sidecar_line(line).sets_auth_rejected());
     }
 
     // ── is_silent_feed_diagnostic + silent_feed_diagnostic_level (the
