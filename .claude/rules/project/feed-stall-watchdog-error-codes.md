@@ -110,7 +110,17 @@ relaunch loop resumes on respawn.
 
 **Source:** `crates/common/src/error_code.rs::ErrorCode::FeedSupervisor01Respawned`,
 `crates/app/src/main.rs` (the respawning `tokio::spawn` wrapper),
-`crates/app/src/groww_sidecar_supervisor.rs` (`should_respawn_supervisor`).
+`crates/app/src/groww_sidecar_supervisor.rs` (`should_respawn_supervisor`),
+and — since 2026-07-02 — `crates/app/src/groww_bridge.rs::spawn_supervised_groww_bridge`
+(the NDJSON-consumer bridge task, `component="bridge"` on the respawn counter:
+a bridge panic used to silently stop ALL Groww persistence while the stall
+watchdog killed the wrong process; the supervisor respawns it with 5s→60s
+backoff — the re-tail is DEDUP-idempotent and bars survive on the shared
+aggregator). Companion fix, same sweep: the stall watchdog's liveness signal is
+now PARSE-time (`FeedHealthRegistry::record_feed_liveness`, stamped when NDJSON
+lines are parsed, independent of the QuestDB flush) — so a DB outage can no
+longer mimic a dead socket and trigger a false FEED-STALL-01 kill of a healthy
+sidecar.
 
 ---
 

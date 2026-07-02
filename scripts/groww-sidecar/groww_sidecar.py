@@ -543,6 +543,131 @@ def should_force_reconnect(
 
 
 # ---------------------------------------------------------------------------
+# Capture-file rotation (PR-3, 2026-07-02) — the WRITER owns rotation.
+# At the first write after IST midnight the current file is archived to
+# live-ticks-YYYYMMDD.ndjson (the COMPLETED IST day) and a fresh file opens;
+# archives older than NDJSON_ARCHIVE_KEEP_DAYS are deleted (the rows are in
+# QuestDB, cross-verified at 15:31 + conservation-audited at 15:40 daily — the
+# archive is only a crash-recovery window). Rotation happens BETWEEN records
+# (never splits a line) and ONLY at the IST day boundary: the market is closed
+# at midnight, so the Rust bridge's per-file capture_seq restart can never
+# collide same-second dedup keys across the boundary. A rotation failure NEVER
+# stops capture — the sidecar keeps appending to the current file.
+# ---------------------------------------------------------------------------
+
+NDJSON_ARCHIVE_KEEP_DAYS = 2
+
+
+def _ist_day(now_secs: float) -> int:
+    """IST calendar-day ordinal (pure): days since epoch of the IST wall date."""
+    return int((now_secs + 19800) // 86400)
+
+
+def _ist_date_str(day_ordinal: int) -> str:
+    """YYYYMMDD for an IST day ordinal (pure)."""
+    return (datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(days=day_ordinal)).strftime("%Y%m%d")
+
+
+def _archive_path(base: str, day_ordinal: int) -> str:
+    """Dated archive path for the COMPLETED IST day (pure)."""
+    root, ext = os.path.splitext(base)
+    return f"{root}-{_ist_date_str(day_ordinal)}{ext}"
+
+
+def _archives_to_delete(paths: list, base: str, today_ordinal: int, keep_days: int) -> list:
+    """Pure retention selector: dated archives older than keep_days."""
+    root, ext = os.path.splitext(os.path.basename(base))
+    out = []
+    for p in paths:
+        name = os.path.basename(p)
+        if not (name.startswith(root + "-") and name.endswith(ext)):
+            continue
+        stamp = name[len(root) + 1 : len(name) - len(ext)]
+        if len(stamp) != 8 or not stamp.isdigit():
+            continue
+        try:
+            d = datetime.strptime(stamp, "%Y%m%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        ordinal = int(d.timestamp() + 19800) // 86400 if False else (d - datetime(1970, 1, 1, tzinfo=timezone.utc)).days
+        if today_ordinal - ordinal > keep_days:
+            out.append(p)
+    return out
+
+
+class _RotatingOut:
+    """Line-buffered append handle that rotates at the IST day boundary.
+
+    Duck-typed drop-in for the plain file handle (`write`/`flush`/`fileno`).
+    The rotation check is one integer compare per write (O(1)).
+    """
+
+    def __init__(self, path: str):
+        self._path = path
+        self._fh = open(path, "a", buffering=1)
+        self._day = _ist_day(time.time())
+        self._rotate_error_printed = False
+
+    def _maybe_rotate(self) -> None:
+        now_day = _ist_day(time.time())
+        if now_day == self._day:
+            return
+        completed = self._day
+        # Advance the day FIRST: a failed rotation retries at the NEXT
+        # boundary, never per-write (capture must not churn on a bad disk).
+        self._day = now_day
+        try:
+            self._fh.flush()
+            os.fsync(self._fh.fileno())
+            self._fh.close()
+            archive = _archive_path(self._path, completed)
+            os.replace(self._path, archive)
+            print(
+                f"groww capture rotated: {archive} (completed IST day) -> fresh {self._path}",
+                flush=True,
+            )
+            for stale in _archives_to_delete(
+                glob.glob(_archive_path(self._path, 0).replace("19700101", "*")),
+                self._path,
+                now_day,
+                NDJSON_ARCHIVE_KEEP_DAYS,
+            ):
+                try:
+                    os.remove(stale)
+                    print(f"groww capture archive removed (retention): {stale}", flush=True)
+                except OSError as exc:
+                    print(
+                        f"groww sidecar error [rotate-retention]: {exc} — will retry next midnight",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+        except Exception as exc:  # noqa: BLE001 - rotation must never stop capture
+            if not self._rotate_error_printed:
+                print(
+                    f"groww sidecar error [rotate]: {type(exc).__name__}: {exc} — "
+                    "capture continues on the current file (retry next midnight)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self._rotate_error_printed = True
+        finally:
+            # Reopen: the fresh file after a successful rename, or the same
+            # file if the rename failed — capture NEVER stops for rotation.
+            if self._fh.closed:
+                self._fh = open(self._path, "a", buffering=1)
+
+    def write(self, s: str) -> int:
+        self._maybe_rotate()
+        return self._fh.write(s)
+
+    def flush(self) -> None:
+        self._fh.flush()
+
+    def fileno(self) -> int:
+        return self._fh.fileno()
+
+
+# ---------------------------------------------------------------------------
 # Shared-token acquisition (READ-ONLY — the bruteX groww-token-minter Lambda is
 # the sole minter; lock 2026-07-02). No TOTP generation, no SDK mint call, ever.
 # ---------------------------------------------------------------------------
@@ -550,6 +675,10 @@ def should_force_reconnect(
 # Floor for retry pacing when the failure is auth-class (stale/unusable token):
 # ~60s rides the daily 06:00->06:05 IST mint gap without hammering anything.
 AUTH_RETRY_FLOOR_SECS = 60
+# Safety net: every Nth consecutive NON-auth-shaped failure also drops the
+# cached token (forces a fresh SSM read next cycle) — so a daily reset that
+# surfaces as a bare socket close can never loop a stale token forever.
+TOKEN_REREAD_EVERY_N_FAILURES = 5
 # After this many seconds of CONTINUOUS auth-class failure, print ONE
 # edge-triggered `GROWW LIVE FEED REJECTED:` alert line (the Rust supervisor
 # routes it to feed-health + Telegram) — then keep retrying, NEVER mint.
@@ -1270,7 +1399,7 @@ def main() -> None:
         )
 
     os.makedirs(os.path.dirname(OUTPUT_PATH) or ".", exist_ok=True)
-    out = open(OUTPUT_PATH, "a", buffering=1)  # line-buffered append
+    out = _RotatingOut(OUTPUT_PATH)  # line-buffered append + IST-midnight rotation (PR-3)
     print(f"groww sidecar → appending NDJSON to {OUTPUT_PATH}", flush=True)
 
     stock_list, index_list, sid_map = wait_for_subscriptions()
@@ -1453,6 +1582,13 @@ def main() -> None:
                 access_token = None
                 if auth_stale_since is None:
                     auth_stale_since = time.time()
+            elif consecutive_failures % TOKEN_REREAD_EVERY_N_FAILURES == 0:
+                # Safety net (2026-07-02 adversarial finding M4): the 06:00 IST
+                # daily reset can surface as a BARE socket close (not auth-shaped),
+                # which would otherwise retry the cached stale token forever. Every
+                # Nth consecutive failure, drop the cache so the next cycle re-reads
+                # SSM — one cheap GetParameter, no Groww call, never a mint.
+                access_token = None
             delay = _backoff_secs(consecutive_failures, rate_limited, retry_after)
             if auth_class:
                 # Ride the 06:00->06:05 daily mint gap at a calm >=60s pace —
