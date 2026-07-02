@@ -546,6 +546,9 @@ pub(crate) struct GrowwBridgeState {
     /// on the 0x0A newline keeps partial chars + lines safely buffered until the
     /// next wake completes them.
     residual: Vec<u8>,
+    /// Last offset-snapshot write instant (PR-3 throttle — one write per
+    /// [`GROWW_OFFSET_PERSIST_MIN_SECS`], cold path).
+    last_offset_persist: Option<std::time::Instant>,
 }
 
 impl GrowwBridgeState {
@@ -566,6 +569,119 @@ impl GrowwBridgeState {
             capture_seq: AtomicI64::new(0),
             offset: 0,
             residual: Vec::new(),
+            last_offset_persist: None,
+        }
+    }
+
+    /// Read the first [`GROWW_OFFSET_HEAD_LEN`] bytes of the capture file (the
+    /// identity guard), lossy-decoded. Empty on any failure (fail-safe: an
+    /// empty head never matches a snapshot, forcing the byte-0 re-tail).
+    async fn read_file_head(tick_file_path: &Path) -> String {
+        let Ok(mut f) = File::open(tick_file_path).await else {
+            return String::new();
+        };
+        let mut buf = [0u8; GROWW_OFFSET_HEAD_LEN];
+        let Ok(n) = f.read(&mut buf).await else {
+            return String::new();
+        };
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    }
+
+    /// PR-3 (2026-07-02): resume the read position from the persisted
+    /// flushed-offset snapshot when it provably belongs to the current file
+    /// (pure decision: [`resume_from_snapshot`]). Called ONCE at bridge start;
+    /// any mismatch falls back to the byte-0 re-tail (DEDUP-idempotent —
+    /// exactly the pre-PR-3 behavior).
+    // TEST-EXEMPT: async file I/O wrapper; the pure resume decision (resume_from_snapshot) + snapshot round-trip are unit-tested.
+    pub(crate) async fn try_resume_from_snapshot(&mut self, tick_file_path: &Path) {
+        let snap_path = offset_snapshot_path(tick_file_path);
+        let Ok(raw) = tokio::fs::read_to_string(&snap_path).await else {
+            info!("groww bridge: no offset snapshot — starting from byte 0");
+            metrics::counter!("tv_groww_bridge_offset_resume_total", "outcome" => "no_snapshot")
+                .increment(1);
+            return;
+        };
+        let Ok(snap) = serde_json::from_str::<GrowwOffsetSnapshot>(&raw) else {
+            warn!("groww bridge: offset snapshot unparseable — byte-0 re-tail (fail-safe)");
+            metrics::counter!("tv_groww_bridge_offset_resume_total", "outcome" => "corrupt")
+                .increment(1);
+            return;
+        };
+        let current_len = match tokio::fs::metadata(tick_file_path).await {
+            Ok(m) => m.len(),
+            Err(_) => {
+                info!("groww bridge: capture file absent — snapshot ignored");
+                metrics::counter!("tv_groww_bridge_offset_resume_total", "outcome" => "no_file")
+                    .increment(1);
+                return;
+            }
+        };
+        let current_head = Self::read_file_head(tick_file_path).await;
+        match resume_from_snapshot(&snap, current_len, &current_head) {
+            Some((offset, capture_seq)) => {
+                self.offset = offset;
+                self.capture_seq.store(capture_seq, Ordering::Relaxed);
+                info!(
+                    offset,
+                    capture_seq,
+                    file_len = current_len,
+                    "groww bridge: resumed from persisted flushed-offset — no full re-tail"
+                );
+                metrics::counter!("tv_groww_bridge_offset_resume_total", "outcome" => "resumed")
+                    .increment(1);
+            }
+            None => {
+                info!(
+                    snapshot_offset = snap.offset,
+                    file_len = current_len,
+                    "groww bridge: snapshot does not match the current capture file \
+                     (rotated/replaced) — byte-0 re-tail (DEDUP-idempotent)"
+                );
+                metrics::counter!("tv_groww_bridge_offset_resume_total", "outcome" => "identity_mismatch")
+                    .increment(1);
+            }
+        }
+    }
+
+    /// PR-3 (2026-07-02): persist the FLUSHED-THROUGH offset snapshot —
+    /// called ONLY from the flush-`Ok` arm (source-scan-ratcheted ordering:
+    /// the offset on disk is never ahead of rows persisted to QuestDB, so a
+    /// crash replays only the unflushed tail). Throttled to one write per
+    /// [`GROWW_OFFSET_PERSIST_MIN_SECS`]; atomic tmp+rename; best-effort (a
+    /// write failure only means a longer re-tail after the next restart).
+    async fn maybe_persist_offset(&mut self, tick_file_path: &Path) {
+        if let Some(last) = self.last_offset_persist
+            && last.elapsed().as_secs() < GROWW_OFFSET_PERSIST_MIN_SECS
+        {
+            return;
+        }
+        self.last_offset_persist = Some(std::time::Instant::now());
+        let head = Self::read_file_head(tick_file_path).await;
+        if head.is_empty() {
+            return; // nothing durable to key the identity on
+        }
+        let file_len = tokio::fs::metadata(tick_file_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(self.offset);
+        let snap = GrowwOffsetSnapshot {
+            offset: self.offset,
+            capture_seq: self.capture_seq.load(Ordering::Relaxed),
+            file_len,
+            head,
+        };
+        let Ok(json) = serde_json::to_string(&snap) else {
+            return;
+        };
+        let path = offset_snapshot_path(tick_file_path);
+        let tmp = path.with_extension("json.tmp");
+        if tokio::fs::write(&tmp, &json).await.is_ok()
+            && let Err(err) = tokio::fs::rename(&tmp, &path).await
+        {
+            warn!(
+                ?err,
+                "groww bridge: offset snapshot rename failed (best-effort)"
+            );
         }
     }
 
@@ -773,6 +889,9 @@ impl GrowwBridgeState {
             match self.live_writer.flush() {
                 Ok(outcome) => {
                     feed_health.record_ticks(Feed::Groww, outcome.persisted as u64, ts);
+                    // PR-3: persist the FLUSHED-THROUGH offset (ordering
+                    // ratcheted — never ahead of rows persisted to QuestDB).
+                    self.maybe_persist_offset(tick_file_path).await;
                     // A transient QuestDB socket reset (broken pipe) that the writer
                     // reconnected + replayed IN this wake is a SELF-HEALED recovery,
                     // NOT data-at-risk — log it at info! so it doesn't re-spam the
@@ -896,6 +1015,61 @@ fn spawn_groww_ist_midnight_force_seal(
         }
     });
     info!("Groww bridge — IST-midnight force-seal task spawned (parity with Dhan)");
+}
+
+/// Persisted bridge read-position (PR-3, 2026-07-02): written AFTER each
+/// successful flush (never ahead of persisted rows), read once at bridge
+/// start so a process restart resumes the tail instead of re-reading the
+/// whole capture file from byte 0. `head` is the file's first bytes — the
+/// identity guard: a rotated/replaced file has a different first line, so a
+/// stale snapshot can never resume into the middle of a DIFFERENT file
+/// (fail-safe = byte-0 re-tail, which is DEDUP-idempotent).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GrowwOffsetSnapshot {
+    /// Flushed-through byte offset into the capture file.
+    pub offset: u64,
+    /// The capture_seq counter value at the flush (restored on resume so the
+    /// dedup tiebreaker stays monotonic across the restart).
+    pub capture_seq: i64,
+    /// Capture-file length at the flush (diagnostic only).
+    pub file_len: u64,
+    /// First bytes of the capture file at the flush (identity guard).
+    pub head: String,
+}
+
+/// How many leading bytes of the capture file form the identity guard.
+pub const GROWW_OFFSET_HEAD_LEN: usize = 64;
+
+/// Minimum seconds between offset-snapshot writes (cold-path throttle).
+pub const GROWW_OFFSET_PERSIST_MIN_SECS: u64 = 5;
+
+/// Sibling path of the capture file where the offset snapshot lives.
+#[must_use]
+pub fn offset_snapshot_path(tick_file_path: &Path) -> PathBuf {
+    tick_file_path
+        .parent()
+        .map(|d| d.join("bridge-offset.json"))
+        .unwrap_or_else(|| PathBuf::from("bridge-offset.json"))
+}
+
+/// Pure resume decision: `Some((offset, capture_seq))` ONLY when the snapshot
+/// provably belongs to the CURRENT file — its head matches and its offset is
+/// within the current length (the file only grew since the flush). Any
+/// mismatch (rotation, truncation, corruption, empty head) → `None` →
+/// fail-safe byte-0 re-tail.
+#[must_use]
+pub fn resume_from_snapshot(
+    snap: &GrowwOffsetSnapshot,
+    current_len: u64,
+    current_head: &str,
+) -> Option<(u64, i64)> {
+    if snap.head.is_empty() || snap.head != current_head {
+        return None; // rotated / replaced / unreadable — identity broken
+    }
+    if snap.offset > current_len {
+        return None; // shrank below the flushed point — rotated/truncated
+    }
+    Some((snap.offset, snap.capture_seq))
 }
 
 /// ws_event_audit edge latches shared between the supervisor wrapper and the
@@ -1110,6 +1284,10 @@ pub async fn run_groww_bridge(
     // (in-memory bars survive a bridge panic) and never leaks a duplicate
     // force-seal task. Parity with the Dhan IST-midnight force-seal (`main.rs`).
     let mut state = GrowwBridgeState::with_aggregator(&qdb, aggregator);
+    // PR-3 (2026-07-02): resume from the persisted flushed-offset when it
+    // provably belongs to the current capture file — otherwise byte-0 re-tail
+    // (DEDUP-idempotent, the pre-PR-3 behavior).
+    state.try_resume_from_snapshot(&tick_file_path).await;
 
     // PRIMARY path: install the event-driven filesystem watcher. If it fails, the
     // fallback poll alone keeps the bridge working (degraded, logged once). The
@@ -2188,6 +2366,108 @@ mod tests {
         );
         // Defensive: a 0th call (before any respawn) still yields the base.
         assert_eq!(bridge_respawn_backoff(0).as_secs(), 5);
+    }
+
+    #[test]
+    fn test_offset_snapshot_roundtrip() {
+        // PR-3: the persisted snapshot must serialize/parse losslessly.
+        let snap = GrowwOffsetSnapshot {
+            offset: 123_456,
+            capture_seq: 1_780_000_020_123_000_000,
+            file_len: 200_000,
+            head: "{\"security_id\":1333".to_string(),
+        };
+        let json = serde_json::to_string(&snap).expect("serialize");
+        let back: GrowwOffsetSnapshot = serde_json::from_str(&json).expect("parse");
+        assert_eq!(back, snap);
+    }
+
+    #[test]
+    fn test_resume_from_snapshot_decision_matrix() {
+        // PR-3: resume ONLY when the snapshot provably belongs to the current
+        // file — every mismatch is a fail-safe byte-0 re-tail.
+        let snap = GrowwOffsetSnapshot {
+            offset: 100,
+            capture_seq: 42,
+            file_len: 100,
+            head: "HEAD".to_string(),
+        };
+        // Match: same head, file grew → resume.
+        assert_eq!(resume_from_snapshot(&snap, 150, "HEAD"), Some((100, 42)));
+        // Match: same head, file unchanged → resume (nothing new).
+        assert_eq!(resume_from_snapshot(&snap, 100, "HEAD"), Some((100, 42)));
+        // Rotated: fresh file has a different first line → byte-0.
+        assert_eq!(resume_from_snapshot(&snap, 150, "OTHER"), None);
+        // Truncated below the flushed point → byte-0.
+        assert_eq!(resume_from_snapshot(&snap, 50, "HEAD"), None);
+        // Empty-head snapshot (unreadable at persist) never resumes.
+        let empty = GrowwOffsetSnapshot {
+            head: String::new(),
+            ..snap
+        };
+        assert_eq!(resume_from_snapshot(&empty, 150, ""), None);
+    }
+
+    #[test]
+    fn test_offset_snapshot_path_is_sibling() {
+        assert_eq!(
+            offset_snapshot_path(Path::new("data/groww/live-ticks.ndjson")),
+            PathBuf::from("data/groww/bridge-offset.json")
+        );
+    }
+
+    #[test]
+    fn test_offset_persist_is_after_flush_ok() {
+        // PR-3 ordering ratchet: the offset on disk must NEVER be ahead of
+        // rows persisted to QuestDB — the persist call must live INSIDE the
+        // flush-Ok arm (after record_ticks), never before the flush.
+        let src = include_str!("groww_bridge.rs");
+        let flush_idx = src
+            .find("self.live_writer.flush()")
+            .expect("flush arm exists");
+        let persist_idx = src
+            .find("self.maybe_persist_offset(")
+            .expect("persist call exists");
+        assert!(
+            persist_idx > flush_idx,
+            "maybe_persist_offset must be called AFTER the flush — persisting \
+             an offset ahead of the QuestDB rows is a data-loss ordering bug"
+        );
+        // And it must sit before the flush-Err arm (i.e. inside Ok).
+        let err_arm = src[flush_idx..]
+            .find("Err(err) => {")
+            .map(|i| flush_idx + i)
+            .expect("flush Err arm exists");
+        assert!(
+            persist_idx < err_arm,
+            "maybe_persist_offset must be inside the flush-Ok arm"
+        );
+    }
+
+    #[test]
+    fn test_sidecar_rotates_at_ist_midnight() {
+        // PR-3 ratchet on the PYTHON writer: rotation must be gated on the IST
+        // day boundary (never size-based — a mid-session size rotation could
+        // reset capture_seq and collide same-second dedup keys) and must never
+        // stop capture on failure.
+        let sidecar = include_str!("../../../scripts/groww-sidecar/groww_sidecar.py");
+        assert!(
+            sidecar.contains("NDJSON_ARCHIVE_KEEP_DAYS = 2"),
+            "archive retention constant must be pinned"
+        );
+        assert!(
+            sidecar.contains("def _ist_day(") && sidecar.contains("class _RotatingOut"),
+            "the sidecar must rotate via the IST-day-boundary rotating writer"
+        );
+        assert!(
+            sidecar.contains("capture continues on the current file"),
+            "a rotation failure must never stop capture"
+        );
+        assert!(
+            !sidecar.contains("MAX_NDJSON_BYTES"),
+            "size-based rotation is deliberately NOT allowed (capture_seq \
+             collision risk mid-session)"
+        );
     }
 
     #[test]
