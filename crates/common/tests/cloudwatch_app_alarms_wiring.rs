@@ -136,6 +136,133 @@ fn test_every_alarm_metric_is_in_emf_filter_list() {
     );
 }
 
+/// Extract the single-quoted-string content of the first EMF `label_matcher`
+/// anchored-regex list `^(...)$` from an agent config body.
+fn emf_regex_body<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    // Find `"<key>": "^(` ... `)$"` and return the inner `...` alternation.
+    let key_marker = format!("\"{key}\":");
+    let after_key = body.split_once(&key_marker)?.1;
+    let start = after_key.find("^(")? + 2;
+    let end = after_key[start..].find(")$")? + start;
+    Some(&after_key[start..end])
+}
+
+/// The set of `tv_*` names inside an EMF anchored-regex alternation body
+/// (`a|b|c`), sorted + de-duplicated for order-independent comparison.
+fn emf_declared_names(body: &str, key: &str) -> Vec<String> {
+    let mut names: Vec<String> = emf_regex_body(body, key)
+        .unwrap_or_default()
+        .split('|')
+        .map(|s| s.trim().to_string())
+        .filter(|s| s.starts_with("tv_"))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+#[test]
+fn test_deployed_emf_label_matcher_equals_metric_selectors() {
+    // Drift-guard: the CloudWatch agent's EMF processor only publishes a
+    // scraped sample when BOTH `label_matcher` (which rows to keep) AND
+    // `metric_selectors` (which metrics to emit) match. If the two lists
+    // drift, the intersection silently shrinks and some metrics never
+    // reach `Tickvault/Prod` — the exact "0 datapoints" class of failure.
+    let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
+    let matcher = emf_declared_names(&user_data, "label_matcher");
+    let selectors = emf_declared_names(&user_data, "metric_selectors");
+    assert!(
+        !matcher.is_empty(),
+        "ratchet self-check: could not parse label_matcher from user-data.sh.tftpl"
+    );
+    assert_eq!(
+        matcher,
+        selectors,
+        "Z+ L2 VERIFY drift-guard: the deployed CloudWatch-agent EMF `label_matcher` \
+         and `metric_selectors` name-sets disagree. The agent publishes only the \
+         intersection, so any name present in one list but not the other is silently \
+         dropped from Tickvault/Prod (the '0 datapoints' failure class). Keep both \
+         lists byte-identical.\n  in label_matcher only: {:?}\n  in metric_selectors only: {:?}",
+        matcher
+            .iter()
+            .filter(|n| !selectors.contains(n))
+            .collect::<Vec<_>>(),
+        selectors
+            .iter()
+            .filter(|n| !matcher.contains(n))
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn test_deployed_emf_declaration_is_superset_of_every_alarm_metric() {
+    // Drift-guard: every alarm's `metric_name` MUST be in the deployed EMF
+    // declaration, or the agent never publishes it and the alarm evaluates
+    // against a permanently-empty metric (treat_missing_data=breaching pages
+    // forever). This is the name-set superset check the restore fix pins.
+    let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
+    let declared = emf_declared_names(&user_data, "metric_selectors");
+    let alarms = alarm_metric_names();
+    let missing: Vec<&String> = alarms.iter().filter(|a| !declared.contains(a)).collect();
+    assert!(
+        missing.is_empty(),
+        "Z+ L2 VERIFY drift-guard: the deployed CloudWatch-agent EMF metric_declaration \
+         is NOT a superset of the alarm metric_name set. These alarm metrics are not in \
+         the agent's publish filter, so they will never appear in Tickvault/Prod: {missing:?}"
+    );
+}
+
+#[test]
+fn test_reference_cloudwatch_agent_json_matches_deployed_emf_declaration() {
+    // Drift-guard: `deploy/aws/cloudwatch-agent.json` is a REFERENCE copy of
+    // the DEPLOYED inline config in user-data.sh.tftpl (the file that
+    // `amazon-cloudwatch-agent-ctl -a fetch-config` actually loads). The
+    // grafana-cloud README cites the reference file as ground truth, so it
+    // must not drift. Pin the two EMF declarations to the same name-set.
+    let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
+    let reference = read("deploy/aws/cloudwatch-agent.json");
+    let deployed_names = emf_declared_names(&user_data, "metric_selectors");
+    let reference_names = emf_declared_names(&reference, "metric_selectors");
+    assert!(
+        !reference_names.is_empty(),
+        "ratchet self-check: could not parse metric_selectors from cloudwatch-agent.json"
+    );
+    assert_eq!(
+        deployed_names,
+        reference_names,
+        "Z+ L3 RECONCILE drift-guard: the reference deploy/aws/cloudwatch-agent.json EMF \
+         name-set has drifted from the DEPLOYED user-data.sh.tftpl EMF name-set. The \
+         grafana-cloud README cites the reference file, so it must stay byte-in-sync with \
+         what the box actually loads.\n  deployed-only: {:?}\n  reference-only: {:?}",
+        deployed_names
+            .iter()
+            .filter(|n| !reference_names.contains(n))
+            .collect::<Vec<_>>(),
+        reference_names
+            .iter()
+            .filter(|n| !deployed_names.contains(n))
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn test_emf_metric_namespace_is_tickvault_prod_in_both_configs() {
+    // The alarms in app-alarms.tf all key on namespace="Tickvault/Prod".
+    // If the agent's emf_processor.metric_namespace ever changes, every
+    // metric lands in a namespace no alarm reads → silent 0 datapoints.
+    for rel in [
+        "deploy/aws/terraform/user-data.sh.tftpl",
+        "deploy/aws/cloudwatch-agent.json",
+    ] {
+        let body = read(rel);
+        assert!(
+            body.contains("\"metric_namespace\": \"Tickvault/Prod\""),
+            "Z+ L2 VERIFY drift-guard: {rel} must set emf_processor.metric_namespace to \
+             exactly \"Tickvault/Prod\" — the namespace every app-alarms.tf alarm reads."
+        );
+    }
+}
+
 #[test]
 fn test_app_alarms_count_is_thirteen() {
     // Pin the count so future PRs that delete an alarm without updating
