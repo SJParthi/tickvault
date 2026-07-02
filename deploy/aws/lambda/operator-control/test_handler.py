@@ -824,5 +824,145 @@ class FeedsCardHtml(unittest.TestCase):
         self.assertIn("j.app_response.error", html)
 
 
+class _FakeEc2:
+    """Minimal describe_instances stub for the box-must-be-running gate."""
+
+    def __init__(self, state: str) -> None:
+        self._state = state
+
+    def describe_instances(self, InstanceIds):  # noqa: N803 — boto3 casing
+        return {"Reservations": [{"Instances": [{"State": {"Name": self._state}}]}]}
+
+
+class WipeGrowwGate(unittest.TestCase):
+    def setUp(self) -> None:
+        self._orig_secret = handler._control_secret
+        handler._control_secret = lambda: "s3cret-token"  # type: ignore[assignment]
+
+    def tearDown(self) -> None:
+        handler._control_secret = self._orig_secret  # type: ignore[assignment]
+
+    def _wipe_groww(self, force: bool = True, confirm: str = "GROWW"):
+        return handler.lambda_handler(
+            {
+                "requestContext": {"http": {"method": "POST"}},
+                "headers": {"authorization": "Bearer s3cret-token"},
+                "body": json.dumps({"action": "wipe-groww", "force": force, "confirm": confirm}),
+            },
+            None,
+        )
+
+    def test_wipe_groww_is_in_destructive_set(self) -> None:
+        # Membership = market-hours-blocked during 09:15-15:30 IST Mon-Fri.
+        self.assertIn("wipe-groww", handler._DESTRUCTIVE)
+
+    def test_wipe_groww_without_confirm_token_is_blocked(self) -> None:
+        # The server-side confirm token is the anti-bypass guard: even a
+        # forced, authenticated call without {"confirm": "GROWW"} is 409 and
+        # never reaches boto3/SSM.
+        for bad in ("", "WIPE", "groww", "NUKE"):
+            resp = self._wipe_groww(force=True, confirm=bad)
+            self.assertEqual(resp["statusCode"], 409, repr(bad))
+            self.assertIn("GROWW", json.loads(resp["body"])["error"])
+
+    def test_wipe_groww_requires_running_box(self) -> None:
+        # Dispatching the rewrite to a stopped box would silently no-op —
+        # the gate must 409 with the real state and never call SSM.
+        orig_client = handler._client
+        orig_shell = handler._ssm_shell
+        handler._client = lambda name, region="": _FakeEc2("stopped")  # type: ignore[assignment]
+        handler._ssm_shell = lambda cmds: self.fail("SSM must not be called for a stopped box")  # type: ignore[assignment]
+        try:
+            resp = self._wipe_groww(force=True)
+        finally:
+            handler._client = orig_client  # type: ignore[assignment]
+            handler._ssm_shell = orig_shell  # type: ignore[assignment]
+        self.assertEqual(resp["statusCode"], 409)
+        self.assertIn("stopped", json.loads(resp["body"])["error"])
+
+    def test_wipe_groww_forced_is_surgical_and_scoped(self) -> None:
+        # The dispatched command list must be groww-SCOPED and SURGICAL:
+        # exact-DDL per-table rewrite, dhan replay sources untouched, SEBI
+        # tables never named, honest completion markers.
+        captured: dict = {}
+        orig_client = handler._client
+        orig_shell = handler._ssm_shell
+        handler._client = lambda name, region="": _FakeEc2("running")  # type: ignore[assignment]
+        handler._ssm_shell = lambda cmds: (captured.__setitem__("cmds", cmds) or "cmd-groww")  # type: ignore[assignment]
+        try:
+            resp = self._wipe_groww(force=True)
+        finally:
+            handler._client = orig_client  # type: ignore[assignment]
+            handler._ssm_shell = orig_shell  # type: ignore[assignment]
+        self.assertEqual(resp["statusCode"], 200)
+        self.assertEqual(json.loads(resp["body"])["command_id"], "cmd-groww")
+        joined = "\n".join(captured["cmds"])
+        # app + groww sidecar stopped first; app restarted after.
+        self.assertIn("systemctl stop tickvault", joined)
+        self.assertIn("pkill -f groww_sidecar.py", joined)
+        self.assertIn("systemctl start tickvault", joined)
+        # ONLY the groww capture dir removed (capture file + status + bridge
+        # offset snapshot) — the resurrection vector, removed BEFORE restart.
+        self.assertIn("rm -rf /opt/tickvault/data/groww", joined)
+        # Dhan replay sources + caches MUST survive a groww-only wipe.
+        for keep in ("/ws_wal", "/spill", "/dlq", "instrument-cache"):
+            self.assertNotIn(keep, joined, f"groww-only wipe must NOT touch {keep}")
+        # Surgical rewrite, never TRUNCATE (that would kill dhan rows too).
+        self.assertNotIn("TRUNCATE", joined)
+        # Dynamic candles_* discovery — nothing hardcoded to rot.
+        self.assertIn("SELECT table_name FROM tables()", joined)
+        self.assertIn("t.startswith('candles_')", joined)
+        # Exact canonical DDL anchors (mirrored from tick_persistence.rs +
+        # shadow_persistence.rs) incl. the real DEDUP keys.
+        self.assertIn("TIMESTAMP(ts) PARTITION BY HOUR WAL", joined)
+        self.assertIn("DEDUP ENABLE UPSERT KEYS(%s)", joined)
+        self.assertIn("'ts, security_id, segment, capture_seq, feed'", joined)
+        self.assertIn("timestamp(ts) PARTITION BY DAY DEDUP UPSERT KEYS(ts, security_id, segment, feed)", joined)
+        # Keep-filter preserves NULL-feed legacy dhan rows.
+        self.assertIn("feed != 'groww' OR feed IS NULL", joined)
+        # Verified copy-before-drop + honest completion markers.
+        self.assertIn("GWIPE-ABORT", joined)
+        self.assertIn("ORIGINAL UNTOUCHED", joined)
+        self.assertIn("GROWW-WIPE-COMPLETE", joined)
+        self.assertIn("GROWW-WIPE-PARTIAL", joined)
+        # SEBI scope lock: the never-delete tables are never named.
+        for sebi in ("_audit", "instrument_lifecycle", "index_constituency", "prev_day_ohlcv", "ws_event"):
+            self.assertNotIn(sebi, joined, f"groww wipe must never name {sebi}")
+
+    def test_wipe_groww_never_drops_original_before_verify(self) -> None:
+        # Ordering ratchet inside the embedded rewrite: INSERT copy → count
+        # verify (with the abort path) → only then DROP the original table.
+        py = handler._GROWW_WIPE_PY
+        i_insert = py.index("INSERT INTO %s (%s) SELECT")
+        i_verify = py.index("copy verify failed")
+        i_drop = py.index("q('DROP TABLE %s' % table)")
+        self.assertLess(i_insert, i_verify)
+        self.assertLess(i_verify, i_drop)
+        # The abort path drops the TEMP table, never the original.
+        self.assertIn("DROP TABLE IF EXISTS %s' % new", py)
+        # The worst-case swap failure names the safe copy + the manual fix.
+        self.assertIn("GWIPE-CRITICAL", py)
+        self.assertIn("RENAME TABLE %s TO %s", py)
+
+
+class HtmlWipeGrowwButton(unittest.TestCase):
+    def test_html_has_wipe_groww_button(self) -> None:
+        html = handler._console_html()
+        self.assertIn("wipeGroww()", html)
+        self.assertIn("Wipe GROWW data only", html)
+        # Confirm prompt: the operator must type GROWW.
+        self.assertIn("Type GROWW to confirm", html)
+        # The explanatory line must spell out the scope honestly.
+        self.assertIn("Dhan data untouched", html)
+        self.assertIn("SEBI", html)
+
+    def test_wipe_groww_sends_confirm_token_and_polls_real_outcome(self) -> None:
+        html = handler._console_html()
+        self.assertIn("confirm:'GROWW'", html)
+        # Truthful async outcome via the shared command-status poller.
+        self.assertIn("GROWW-WIPE-COMPLETE", html)
+        self.assertIn("GROWW-WIPE-PARTIAL", html)
+
+
 if __name__ == "__main__":
     unittest.main()
