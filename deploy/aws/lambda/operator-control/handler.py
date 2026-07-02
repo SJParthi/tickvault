@@ -203,6 +203,10 @@ _VIEW_COMMANDS = [
     'echo "APP=$(systemctl is-active tickvault 2>/dev/null || echo inactive)"',
     "Q='http://127.0.0.1:9000/exp?query='",
     'echo "TICKS_TODAY=$(curl -fsS "${Q}SELECT%20count()%20FROM%20ticks%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
+    # Per-feed split of today's ticks (operator portal feed card). /exp emits a
+    # CSV header line + one row per feed ("dhan",123) — skip the header and
+    # join rows with ';' so the labeled-line parser sees ONE line.
+    'echo "TICKS_BY_FEED=$(curl -fsS "${Q}SELECT%20feed%2C%20count()%20FROM%20ticks%20WHERE%20ts%20IN%20today()%20GROUP%20BY%20feed" 2>/dev/null | tail -n +2 | tr \'\\n\' \';\')"',
     'echo "C1M=$(curl -fsS "${Q}SELECT%20count()%20FROM%20candles_1m%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
     'echo "C5M=$(curl -fsS "${Q}SELECT%20count()%20FROM%20candles_5m%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
     'echo "C15M=$(curl -fsS "${Q}SELECT%20count()%20FROM%20candles_15m%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)"',
@@ -212,13 +216,34 @@ _VIEW_COMMANDS = [
     # ONLY view query carrying a raw `=` inside the ?query= value, which the
     # QuestDB /exp query-string parser mis-handled, returning empty so the
     # dashboard "Dedup key columns" panel showed "?". Encoded form = a clean
-    # `count` of the 4 upsert-key columns (ts, security_id, segment, received_at).
+    # `count` of the 5 upsert-key columns — the REAL `ticks` DEDUP key is
+    # (ts, security_id, segment, capture_seq, feed) per DEDUP_KEY_TICKS in
+    # crates/storage/src/tick_persistence.rs (designated ts is always an
+    # upsertKey column; received_at/payload_hash are stored columns only).
     'echo "DEDUP_KEYS=$(curl -fsS "${Q}SELECT%20count()%20FROM%20table_columns(%27ticks%27)%20WHERE%20upsertKey%3Dtrue" 2>/dev/null | tail -1)"',
     'echo "MAX_TPS=$(curl -fsS "${Q}SELECT%20max(c)%20FROM%20(SELECT%20count()%20c%20FROM%20ticks%20WHERE%20ts%20IN%20today()%20GROUP%20BY%20ts,security_id)" 2>/dev/null | tail -1)"',
     'echo "ERRORS_BEGIN"',
     "journalctl -u tickvault -p err -n 5 --no-pager 2>/dev/null | tail -5 || true",
     'echo "ERRORS_END"',
 ]
+
+
+def _parse_feed_counts(raw: str) -> dict:
+    """Parse the TICKS_BY_FEED value — ';'-joined QuestDB CSV rows like
+    '"dhan",123;"groww",45;' — into {feed: count_str}. Pure. Malformed
+    fragments are skipped; an empty/absent value yields {} (the UI then shows
+    nothing rather than fabricated zeros)."""
+    out: dict[str, str] = {}
+    for part in (raw or "").split(";"):
+        part = part.strip()
+        if not part or "," not in part:
+            continue
+        name, _, cnt = part.partition(",")
+        name = name.strip().strip('"')
+        cnt = cnt.strip().strip('"')
+        if name and cnt:
+            out[name] = cnt
+    return out
 
 
 def _parse_view(stdout: str) -> dict:
@@ -243,6 +268,7 @@ def _parse_view(stdout: str) -> dict:
     return {
         "app": fields.get("APP", ""),
         "ticks_today": fields.get("TICKS_TODAY", ""),
+        "ticks_by_feed": _parse_feed_counts(fields.get("TICKS_BY_FEED", "")),
         "candles": {
             "1m": fields.get("C1M", ""),
             "5m": fields.get("C5M", ""),
@@ -576,6 +602,139 @@ def _parse_cross_verify(stdout: str) -> dict:
     }
 
 
+# ------------------------------------------------------------------- feeds card
+# Feed enable/disable from the portal (the app's :3001 is closed in the SG —
+# reachable ONLY via SSM RunShellScript curling 127.0.0.1, same mechanism as
+# the cross-verify card above). Contract read from crates/api (2026-07-02):
+#   GET  /api/feeds        -> {"dhan_enabled": bool, "groww_enabled": bool,
+#                              "dhan_lane_running": bool, "groww_lane_running": bool}
+#   GET  /api/feeds/health -> {"market_open": bool, "feeds": [{"feed", "verdict",
+#                              "reason", "enabled", "lane_running", "connected",
+#                              "ticks_total", "subscribed_total", ...}]}
+#   POST /api/feeds/{feed} body {"enabled": bool} -> 200 same status JSON;
+#        400 {"error", "allowed"} unknown feed; 409 {"error", "allowed"} =
+#        the Dhan-disable safety guard (live trading active). Tokenless when
+#        the app runs dry_run=true (feed_toggle_public); pass-through verbatim.
+#
+# FUTURE-FEEDS: the portal card iterates the health response's `feeds` array
+# (Feed::ALL-driven in the app), so a feed #3/#4 added to the app auto-appears
+# with its own toggle — zero portal changes. The Lambda therefore validates the
+# feed NAME by strict charset (injection-safe) and lets the app's own 400
+# "unknown feed" response be the authority, passed through verbatim.
+_FEED_API_UNREACHABLE = (
+    "app API unreachable on the box (curl to 127.0.0.1:3001 failed — is the app running?)"
+)
+_BOX_UNREACHABLE = "box unreachable (SSM offline or instance stopped)"
+
+_FEEDS_VIEW_COMMANDS = [
+    "set +e",
+    'echo "FEEDS_BEGIN"',
+    # `; echo` guarantees the end-marker lands on its own line even when the
+    # JSON body has no trailing newline. TV_CURL_FAILED = truthful sentinel —
+    # the parser reports an error, never fake zeros/disabled.
+    "curl -fsS --max-time 8 http://127.0.0.1:3001/api/feeds 2>/dev/null || echo TV_CURL_FAILED; echo",
+    'echo "FEEDS_END"',
+    'echo "FEEDS_HEALTH_BEGIN"',
+    "curl -fsS --max-time 8 http://127.0.0.1:3001/api/feeds/health 2>/dev/null || echo TV_CURL_FAILED; echo",
+    'echo "FEEDS_HEALTH_END"',
+]
+# Two 8s curls + SSM registration need more than the 6s view window.
+_FEEDS_TIMEOUT_SECS = 20.0
+
+
+def _extract_marked_json(stdout: str, begin: str, end: str) -> tuple[object, str]:
+    """Extract + parse the JSON between two marker lines. Returns
+    (parsed_or_None, error_str). Pure; never fabricates a payload."""
+    raw = ""
+    if begin in stdout and end in stdout:
+        raw = stdout.split(begin, 1)[1].split(end, 1)[0].strip()
+    if not raw or "TV_CURL_FAILED" in raw:
+        return None, _FEED_API_UNREACHABLE
+    try:
+        return json.loads(raw), ""
+    except (json.JSONDecodeError, ValueError):
+        return None, "app API returned invalid JSON"
+
+
+def _parse_feeds_view(stdout: str) -> dict:
+    """Parse the marked feeds-view snapshot (pure). On any failure the matching
+    *_error field carries a structured reason and the payload is None — the UI
+    renders the error verbatim instead of defaulting to zeros."""
+    if not (stdout or "").strip():
+        return {
+            "feeds": None,
+            "feeds_error": _BOX_UNREACHABLE,
+            "health": None,
+            "health_error": _BOX_UNREACHABLE,
+        }
+    feeds, feeds_error = _extract_marked_json(stdout, "FEEDS_BEGIN", "FEEDS_END")
+    health, health_error = _extract_marked_json(stdout, "FEEDS_HEALTH_BEGIN", "FEEDS_HEALTH_END")
+    return {"feeds": feeds, "feeds_error": feeds_error, "health": health, "health_error": health_error}
+
+
+def _validate_feed_toggle(feed: object, enabled: object) -> str:
+    """Strict validation for the feed-toggle action (pure). Returns "" when
+    valid, else the rejection reason. The feed name is charset-locked
+    (lowercase token — injection-safe for the shell/URL interpolation) but NOT
+    allowlisted, so a future feed #3 toggles with zero Lambda changes; the app
+    itself 400s unknown names (passed through verbatim). `enabled` must be a
+    JSON boolean — 1/"true"/None are rejected so nothing ambiguous ever
+    reaches the shell."""
+    import re  # noqa: PLC0415
+
+    if not isinstance(feed, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", feed):
+        return "feed must be a lowercase feed name like 'dhan' or 'groww'"
+    if not isinstance(enabled, bool):
+        return "enabled must be a JSON boolean (true or false)"
+    return ""
+
+
+def _feed_toggle_commands(feed: str, enabled: bool) -> list[str]:
+    """Build the SSM curl for POST /api/feeds/{feed}. Only called AFTER
+    _validate_feed_toggle passed, so `feed` is a charset-locked lowercase
+    token and `enabled` is a real bool — the interpolations cannot carry
+    shell metacharacters."""
+    body = json.dumps({"enabled": enabled})
+    return [
+        "set +e",
+        # -w %{http_code} captures the app's status; the body goes to a temp
+        # file so status + body are cleanly separable in the labeled output.
+        'echo "FEED_TOGGLE_STATUS=$(curl -sS --max-time 8 -o /tmp/tv-feed-toggle.json '
+        f"-w %{{http_code}} -X POST -H 'content-type: application/json' -d '{body}' "
+        f'http://127.0.0.1:3001/api/feeds/{feed} 2>/dev/null)"',
+        'echo "FEED_TOGGLE_BODY_BEGIN"',
+        "cat /tmp/tv-feed-toggle.json 2>/dev/null; echo",
+        'echo "FEED_TOGGLE_BODY_END"',
+        "rm -f /tmp/tv-feed-toggle.json",
+    ]
+
+
+def _parse_feed_toggle(stdout: str) -> dict:
+    """Parse the toggle result (pure): the app's HTTP status + its JSON body
+    passed through VERBATIM (incl. the 409 Dhan-guard message). curl prints
+    000 when it could not connect — reported as unreachable, never success."""
+    if not (stdout or "").strip():
+        return {"app_status": None, "app_response": None, "error": _BOX_UNREACHABLE}
+    status = None
+    for line in stdout.splitlines():
+        if line.startswith("FEED_TOGGLE_STATUS="):
+            raw = line[len("FEED_TOGGLE_STATUS=") :].strip()
+            if raw.isdigit():
+                status = int(raw)
+    body_raw = ""
+    if "FEED_TOGGLE_BODY_BEGIN" in stdout and "FEED_TOGGLE_BODY_END" in stdout:
+        body_raw = stdout.split("FEED_TOGGLE_BODY_BEGIN", 1)[1].split("FEED_TOGGLE_BODY_END", 1)[0].strip()
+    body: object = None
+    if body_raw:
+        try:
+            body = json.loads(body_raw)
+        except (json.JSONDecodeError, ValueError):
+            body = {"raw": body_raw[:500]}
+    if status is None or status == 0:
+        return {"app_status": None, "app_response": body, "error": _FEED_API_UNREACHABLE}
+    return {"app_status": status, "app_response": body, "error": ""}
+
+
 # ---------------------------------------------------------------- GitHub helper
 def _gh(method: str, path: str, body: dict | None = None) -> tuple[int, object]:
     """Minimal GitHub REST call using urllib (no deps). Returns (status, json)."""
@@ -717,20 +876,87 @@ def lambda_handler(event, _context):
                 {"ok": True, "action": action, "status": inv.get("Status", ""), "stdout_tail": out[-1500:]},
             )
         if action == "wipe-questdb":
-            # DESTRUCTIVE: empties the market-data tables for a fresh start.
-            # Requires force=true (even off-hours) + is in _DESTRUCTIVE
-            # (market-hours-blocked). TRUNCATEs ticks + candles directly in
-            # QuestDB — the docker-volume approach (down -v) proved unreliable on
-            # this box (QuestDB started outside the compose project / volume
-            # in-use), but TRUNCATE clears the rows regardless and keeps the
-            # schema, so no recreation is needed. Audit tables are intentionally
-            # preserved (SEBI retention). Next session = fresh data.
+            # DESTRUCTIVE: empties the market-data tables + EVERY feed's
+            # capture/replay files for a fresh start. Requires force=true (even
+            # off-hours) + is in _DESTRUCTIVE (market-hours-blocked).
+            #
+            # FEED-AGNOSTIC RESURRECT-PROOF REWRITE (operator incident
+            # 2026-07-02: "wipe removed only Dhan data, Groww came back"):
+            #   1. The old code TRUNCATEd a hardcoded list of just 6 tables —
+            #      but 27 candles_* tables exist (1s..7d), so most candles
+            #      SURVIVED for BOTH feeds. Now the table list is discovered
+            #      DYNAMICALLY from QuestDB tables() at wipe time (ticks +
+            #      every candles_* — any future timeframe/table is wiped
+            #      automatically, nothing hardcoded to rot).
+            #   2. The Groww sidecar's capture file (data/groww/
+            #      live-ticks.ndjson) is a durable REPLAY SOURCE the DB wipe
+            #      cannot see — the bridge re-tails it from byte 0 on restart
+            #      and RESURRECTS every Groww row. Same class: the Dhan WAL
+            #      (data/ws_wal) replays residual frames, and spill/dlq
+            #      re-drain. ALL feed capture/replay dirs are now removed —
+            #      any FUTURE feed's capture dir under data/ is caught by the
+            #      generic sweep, so every feed (present and future) wipes
+            #      IDENTICALLY.
+            #   3. The app is STOPPED first (releases writers + drops
+            #      in-memory bars so nothing re-seals stale candles) and
+            #      restarted after — it recreates schemas + resumes live-only.
+            #   4. Honest completion: post-wipe row counts are echoed; the
+            #      marker line WIPE-COMPLETE only prints when ticks AND
+            #      candles_1m are both 0 — a partial wipe reads WIPE-PARTIAL,
+            #      never a fake OK.
+            # Audit tables are intentionally preserved (SEBI retention) — the
+            # dynamic list matches ONLY ticks + candles_*.
             if not force:
                 return _resp(409, {"error": 'wipe is destructive — re-send with {"force": true}', "action": action})
-            tables = ["ticks", "candles_1m", "candles_5m", "candles_15m", "candles_60m", "candles_1d"]
-            cmds = ["set +e"]
-            cmds += [
-                f"curl -fsS 'http://127.0.0.1:9000/exec?query=TRUNCATE%20TABLE%20{t}' 2>/dev/null; echo" for t in tables
+            data_dir = "/opt/tickvault/data"
+            cmds = [
+                "set +e",
+                # 1. stop the app: releases QuestDB writers + drops in-memory
+                #    bars + stops the Groww bridge/sidecar so nothing re-appends
+                #    the capture file mid-wipe.
+                "systemctl stop tickvault || true",
+                "pkill -f groww_sidecar.py 2>/dev/null || true",
+                # 2. discover + truncate EVERY market-data table dynamically
+                #    (ticks + all candles_* — 27 today, future ones included).
+                #    python3 is on the box (the Groww sidecar runtime).
+                (
+                    "python3 - <<'PYWIPE'\n"
+                    "import json, urllib.request, urllib.parse\n"
+                    "base = 'http://127.0.0.1:9000/exec?query='\n"
+                    "q = urllib.parse.quote(\"SELECT table_name FROM tables()\")\n"
+                    "rows = json.load(urllib.request.urlopen(base + q, timeout=15)).get('dataset', [])\n"
+                    "names = [r[0] for r in rows if isinstance(r, list) and r]\n"
+                    "targets = [t for t in names if t == 'ticks' or t.startswith('candles_')]\n"
+                    "print('WIPE-TARGETS', len(targets), sorted(targets))\n"
+                    "for t in targets:\n"
+                    "    tq = urllib.parse.quote(f'TRUNCATE TABLE {t}')\n"
+                    "    try:\n"
+                    "        urllib.request.urlopen(base + tq, timeout=30).read()\n"
+                    "        print('TRUNCATED', t)\n"
+                    "    except Exception as exc:\n"
+                    "        print('TRUNCATE-FAILED', t, exc)\n"
+                    "PYWIPE"
+                ),
+                # 3. remove EVERY feed's capture/replay sources so nothing
+                #    resurrects: Dhan WAL, Groww capture, spill, dlq, caches —
+                #    plus a GENERIC sweep of any future feed's live-ticks
+                #    capture file under data/*/ . Logs are KEPT for forensics.
+                f"rm -rf {data_dir}/ws_wal {data_dir}/groww {data_dir}/spill {data_dir}/dlq {data_dir}/instrument-cache 2>/dev/null || true",
+                f"rm -f {data_dir}/*/live-ticks.ndjson {data_dir}/*/*-status.json 2>/dev/null || true",
+                "echo 'OK: feed capture/replay sources removed (ws_wal, groww, spill, dlq, instrument-cache)'",
+                # 4. restart the app — recreates schemas, resumes LIVE-only.
+                "systemctl start tickvault || true",
+                # 5. honest verification: both counts must be 0 (QuestDB may
+                #    need a moment; count right after truncate, before live
+                #    ticks resume mid-market is inherently racy off-hours only —
+                #    wipe is market-hours-blocked, so 0 is the honest baseline).
+                (
+                    "sleep 3; "
+                    "T=$(curl -fsS 'http://127.0.0.1:9000/exec?query=SELECT%20count()%20FROM%20ticks' 2>/dev/null | grep -o '\\[\\[[0-9]*' | grep -o '[0-9]*'); "
+                    "C=$(curl -fsS 'http://127.0.0.1:9000/exec?query=SELECT%20count()%20FROM%20candles_1m' 2>/dev/null | grep -o '\\[\\[[0-9]*' | grep -o '[0-9]*'); "
+                    "echo \"WIPE-RESULT ticks=${T:-?} candles_1m=${C:-?}\"; "
+                    "if [ \"${T:-1}\" = 0 ] && [ \"${C:-1}\" = 0 ]; then echo WIPE-COMPLETE; else echo 'WIPE-PARTIAL: rows remain (or count unavailable) — inspect above'; fi"
+                ),
             ]
             cid = _ssm_shell(cmds)
             return _resp(200, {"ok": True, "action": action, "command_id": cid})
@@ -798,8 +1024,16 @@ def lambda_handler(event, _context):
                 # 6. wipe HOST app caches too (the Docker nuke can't see these) —
                 #    instrument-cache (the 'reused existing list' that survived),
                 #    spill + dlq. Logs are KEPT for forensics.
-                f"rm -rf {data_dir}/instrument-cache {data_dir}/spill {data_dir}/dlq 2>/dev/null || true",
-                "echo 'OK: host caches wiped (instrument-cache, spill, dlq); logs preserved'",
+                #    + EVERY feed's capture/replay source (operator incident
+                #    2026-07-02: the Groww capture file data/groww/
+                #    live-ticks.ndjson survived the nuke and RESURRECTED all
+                #    Groww rows via the bridge's byte-0 re-tail; the Dhan WAL
+                #    replays residual frames the same way). Feed-agnostic:
+                #    the generic data/*/live-ticks.ndjson sweep catches any
+                #    future feed's capture file too.
+                f"rm -rf {data_dir}/instrument-cache {data_dir}/spill {data_dir}/dlq {data_dir}/ws_wal {data_dir}/groww 2>/dev/null || true",
+                f"rm -f {data_dir}/*/live-ticks.ndjson {data_dir}/*/*-status.json 2>/dev/null || true",
+                "echo 'OK: host caches + feed capture/replay sources wiped (instrument-cache, spill, dlq, ws_wal, groww); logs preserved'",
                 # 7. recreate QuestDB fresh (empty volume) + restart app. Use
                 #    ensure-questdb.sh — robust to docker-compose v1/v2 absence +
                 #    correct service name + SSM creds. The old bare
@@ -847,9 +1081,13 @@ def lambda_handler(event, _context):
                 "docker volume ls -q | xargs -r docker volume rm -f 2>/dev/null || true",
                 # 5. final sweep for anything dangling (networks/build cache too)
                 "docker system prune -af --volumes 2>/dev/null || true",
-                # 6. wipe HOST app caches so the box truly looks fresh (logs KEPT
-                #    for forensics — they are not a Docker object)
-                f"rm -rf {data_dir}/instrument-cache {data_dir}/spill {data_dir}/dlq 2>/dev/null || true",
+                # 6. wipe HOST app caches + EVERY feed's capture/replay source
+                #    so the box truly looks fresh (logs KEPT for forensics —
+                #    they are not a Docker object). Feed-agnostic sweep incl.
+                #    the Groww capture file + Dhan WAL (operator incident
+                #    2026-07-02: capture files survived and resurrected rows).
+                f"rm -rf {data_dir}/instrument-cache {data_dir}/spill {data_dir}/dlq {data_dir}/ws_wal {data_dir}/groww 2>/dev/null || true",
+                f"rm -f {data_dir}/*/live-ticks.ndjson {data_dir}/*/*-status.json 2>/dev/null || true",
                 # 7. VERIFY + report the exact remaining counts — truthful, never
                 #    a fake OK. 0/0/0 => bare-nuke-complete; otherwise PARTIAL
                 #    (something is still in-use) so the operator is not misled.
@@ -907,6 +1145,40 @@ def lambda_handler(event, _context):
             # check vs the exchange record. Bearer auth already enforced by
             # the top-level _authorized() gate.
             return _resp(200, {"ok": True, "action": "cross_verify", **_parse_cross_verify(_ssm_shell_sync(_CROSS_VERIFY_COMMANDS))})
+        if action == "feeds-view":
+            # READ-ONLY: current per-feed enabled/lane state + per-feed health,
+            # via SSM-curl of the app's local API (SG keeps :3001 closed).
+            return _resp(
+                200,
+                {
+                    "ok": True,
+                    "action": action,
+                    **_parse_feeds_view(_ssm_shell_sync(_FEEDS_VIEW_COMMANDS, timeout=_FEEDS_TIMEOUT_SECS)),
+                },
+            )
+        if action == "feed-toggle":
+            # MUTATING but feed-scoped (not box-destructive): flips one feed's
+            # runtime flag via the app's POST /api/feeds/{feed}. The dangerous
+            # direction (disabling Dhan during live trading) is guarded by the
+            # APP's own 409 — passed through verbatim below. Not in
+            # _DESTRUCTIVE: the app is the authority on when a flip is unsafe.
+            feed = payload.get("feed")
+            enabled = payload.get("enabled")
+            verr = _validate_feed_toggle(feed, enabled)
+            if verr:
+                return _resp(400, {"error": verr, "action": action})
+            out = _ssm_shell_sync(_feed_toggle_commands(feed, enabled), timeout=_FEEDS_TIMEOUT_SECS)
+            r = _parse_feed_toggle(out)
+            return _resp(
+                200,
+                {
+                    "ok": r["app_status"] == 200,
+                    "action": action,
+                    "feed": feed,
+                    "enabled": enabled,
+                    **r,
+                },
+            )
 
         # ---- github ----
         if action == "gh_prs":
@@ -1082,7 +1354,7 @@ def _console_html() -> str:
     <section data-tab="overview">
       <div class="card">
         <div class="hero">
-          <div class="bignum"><div class="n" id="ticksbig">0</div><div class="c">ticks captured today</div></div>
+          <div class="bignum"><div class="n" id="ticksbig">0</div><div class="c">ticks captured today</div><div class="c" id="feedsplit"></div></div>
           <div class="pills">
             <div class="pill"><div class="v" id="p_inst">—</div><div class="k">instance</div></div>
             <div class="pill"><div class="v" id="p_app">—</div><div class="k">app</div></div>
@@ -1099,6 +1371,12 @@ def _console_html() -> str:
       <div class="card"><div class="lbl">live ticks/sec — proof no sub-second tick is lost</div>
         <svg class="spark" id="spark" viewBox="0 0 300 70" preserveAspectRatio="none"></svg></div>
       <div class="card"><div class="lbl">guarantees — live proof read from the box</div><div class="shields" id="shields"></div></div>
+      <div class="card"><div class="lbl">feeds — live market-data sources (toggle on/off)</div>
+        <div class="row" style="margin-bottom:10px"><button class="b-blu" onclick="loadFeeds()">🔄 Load feeds</button></div>
+        <div id="feeds"><span class="muted">not loaded yet</span></div>
+        <div class="muted" id="feedsmsg" style="margin-top:8px"></div>
+        <div class="muted" style="margin-top:6px">Every feed the app reports appears here automatically (a future feed #3 needs zero portal changes). Turning a feed OFF asks for confirmation; disabling Dhan during live trading is refused by the app itself.</div>
+      </div>
       <div class="card"><div class="lbl">control</div>
         <div class="row" style="margin-bottom:10px">
           <button class="b-go" onclick="act('start')">▶ Start instance</button>
@@ -1110,7 +1388,7 @@ def _console_html() -> str:
         <div class="muted" style="margin-top:10px">Stop / restart are blocked 9:15 AM–3:30 PM IST Mon–Fri.</div>
         <label class="switch" style="margin-top:8px"><input type="checkbox" id="force"> force (override market-hours guard)</label>
         <div class="row" style="margin-top:18px"><button class="b-stop" onclick="wipeData()">🗑️ Wipe ALL data → fresh start</button></div>
-        <div class="muted" style="margin-top:6px">Deletes every tick &amp; candle and restarts empty (audit tables kept). Run when the box is RUNNING; next session = fresh data. Asks you to type WIPE.</div>
+        <div class="muted" style="margin-top:6px">Deletes every tick &amp; candle in ALL timeframe tables for BOTH feeds (Dhan + Groww + any future feed) AND their capture/replay files (Groww capture file, Dhan WAL, spill, dlq) so NOTHING resurrects after restart — audit tables kept. Run when the box is RUNNING; next session = fresh data. Asks you to type WIPE.</div>
         <div class="row" style="margin-top:18px"><button class="b-stop" onclick="dockerReset()">💥 Full Docker reset → wipe EVERYTHING</button></div>
         <div class="muted" style="margin-top:6px">⚠️ NUCLEAR: deletes Docker containers + volumes + images and rebuilds from scratch. Wipes <b>ALL</b> data INCLUDING the SEBI-retention audit tables. Box must be RUNNING. Asks you to type NUKE.</div>
         <div class="row" style="margin-top:18px"><button class="b-stop" onclick="bareNuke()">☢️ Bare Nuke → delete ALL &amp; leave EMPTY</button></div>
@@ -1232,7 +1510,9 @@ function drawSpark(){ const w=300,h=70,pad=6,xs=hist.slice(-40),max=Math.max(2,.
 
 function bar(name,n,max){ const pct=max>0?Math.max(3,Math.round(100*n/max)):0;
   return '<div class="bar"><div class="name">'+name+'</div><div class="track"><div class="fill" style="width:'+pct+'%"></div></div><div class="num">'+n.toLocaleString()+'</div></div>'; }
-function shield(t,s,good){ return '<div class="shield '+(good?'good':'bad')+'"><div class="ttl">'+t+'</div><div class="st '+(good?'ok':'warn')+'">'+s+'</div></div>'; }
+// Optional 4th arg picks the value colour explicitly: 'ok' green, 'warn' amber,
+// 'bad' red — so a critical state (red) is distinguishable from drift (amber).
+function shield(t,s,good,cls){ return '<div class="shield '+(good?'good':'bad')+'"><div class="ttl">'+t+'</div><div class="st '+(cls||(good?'ok':'warn'))+'">'+s+'</div></div>'; }
 
 async function loadOverview(){ $('refbtn').innerHTML='<span class="spin">🔄</span> Refreshing…'; const j=await call('view'); $('refbtn').textContent='🔄 Refresh now'; if(!j) return;
   const appOk=j.app==='active', running=j.instance_state==='running'; setLive(appOk&&running);
@@ -1242,12 +1522,73 @@ async function loadOverview(){ $('refbtn').innerHTML='<span class="spin">🔄</s
   $('p_mkt').innerHTML='<span class="'+(j.market_hours?'warn':'')+'">'+(j.market_hours?'OPEN':'closed')+'</span>';
   const tpsN=parseInt(j.max_ticks_per_second,10)||0; $('p_tps').innerHTML='<span class="cy">'+tpsN+'</span>';
   hist.push(tpsN); if(hist.length>60) hist.shift(); drawSpark();
+  // Per-feed split of today's ticks, e.g. "dhan: 152,340 | groww: 8,102" —
+  // rendered generically from whatever feeds QuestDB reports (no hardcoding).
+  const fb=j.ticks_by_feed||{}, fbKeys=Object.keys(fb).sort();
+  $('feedsplit').textContent = fbKeys.length ? fbKeys.map(k=>k+': '+((parseInt(fb[k],10)||0).toLocaleString())).join(' | ') : '';
   const c=j.candles||{}, vals=['1m','5m','15m','60m','1d'].map(k=>parseInt(c[k],10)||0), mx=Math.max(1,...vals);
   $('bars').innerHTML=['1m','5m','15m','60m','1d'].map((k,i)=>bar(k,vals[i],mx)).join('');
-  const keysOk=(j.dedup_key_columns||'')==='4', capOk=tpsN>1;
-  $('shields').innerHTML=shield('Dedup key columns',(j.dedup_key_columns||'?'),keysOk)+shield('Sub-second fix',keysOk?'LIVE ✅':'OLD ⚠',keysOk)+
+  // Dedup-key check: the real ticks upsert key is 5 columns
+  // (ts, security_id, segment, capture_seq, feed). Three distinct states:
+  //   5 = OK (green) · 0 = DEDUP disabled entirely (RED — duplicate rows will
+  //   accumulate) · any other number = schema drift (amber). A fetch failure
+  //   (box/QuestDB unreachable) renders "unreachable" (amber), never a fake 0.
+  const dkRaw=String(j.dedup_key_columns||'').trim(), dkN=parseInt(dkRaw,10);
+  const dkUnknown=(dkRaw===''||isNaN(dkN)), keysOk=dkN===5;
+  let dkTxt,dkCls;
+  if(dkUnknown){ dkTxt='unreachable'; dkCls='warn'; }
+  else if(dkN===5){ dkTxt='5 ✅'; dkCls='ok'; }
+  else if(dkN===0){ dkTxt='0 — DEDUP disabled!'; dkCls='bad'; }
+  else { dkTxt=dkRaw+' — schema drift (expected 5)'; dkCls='warn'; }
+  const capOk=tpsN>1;
+  $('shields').innerHTML=shield('Dedup key columns',dkTxt,keysOk,dkCls)+
+    shield('Sub-second fix',keysOk?'LIVE ✅':(dkUnknown?'unreachable':'OLD ⚠'),keysOk,dkUnknown?'warn':undefined)+
     shield('No tick lost',capOk?'WORKING ✅':(j.market_hours?'CHECK ⚠':'idle'),capOk||!j.market_hours)+shield('Peak ticks / second',tpsN,capOk);
+  if(!$('feeds').dataset.loaded) loadFeeds();
   $('updated').textContent='updated '+new Date().toLocaleTimeString(); }
+
+// FEEDS card. Rendered by ITERATING the app's own per-feed list — primarily the
+// health response's `feeds` array (one row per feed the app knows about), with
+// a generic fallback that derives feed names from the `<name>_enabled` keys of
+// GET /api/feeds. No feed name is hardcoded, so a future feed #3/#4 added to
+// the app automatically appears here with its own toggle. Errors are rendered
+// VERBATIM (esc()-wrapped) — never silent defaults.
+async function loadFeeds(){ $('feeds').dataset.loaded='1'; $('feeds').innerHTML='<span class="muted">loading…</span>'; $('feedsmsg').textContent='';
+  const j=await call('feeds-view'); if(!j){ $('feeds').innerHTML='<span class="warn">feeds-view request failed</span>'; return; }
+  let list=[];
+  if(j.health && Array.isArray(j.health.feeds) && j.health.feeds.length){
+    list=j.health.feeds.map(r=>({name:String(r.feed), enabled:!!r.enabled, lane:!!r.lane_running, h:r}));
+  } else if(j.feeds && typeof j.feeds==='object'){
+    list=Object.keys(j.feeds).filter(k=>k.endsWith('_enabled')).map(k=>k.slice(0,-'_enabled'.length))
+      .map(n=>({name:n, enabled:!!j.feeds[n+'_enabled'], lane:!!j.feeds[n+'_lane_running'], h:null}));
+  }
+  // Prefer the /api/feeds runtime flags when both payloads are present.
+  if(j.feeds && typeof j.feeds==='object'){ list.forEach(f=>{ if((f.name+'_enabled') in j.feeds){ f.enabled=!!j.feeds[f.name+'_enabled']; }
+    if((f.name+'_lane_running') in j.feeds){ f.lane=!!j.feeds[f.name+'_lane_running']; } }); }
+  if(!list.length){ $('feeds').innerHTML='<span class="warn">'+esc(j.feeds_error||j.health_error||'no feed data returned')+'</span>'; return; }
+  const vb=v=>({ok:'success',down:'failure',disabled:'unknown',unknown:'unknown'})[v]||'pending';
+  $('feeds').innerHTML=list.map(f=>{
+    // safe token for the onclick attribute (display uses esc()); the Lambda
+    // re-validates the same charset server-side before any shell command.
+    const safeName=String(f.name).toLowerCase().replace(/[^a-z0-9_-]/g,'');
+    const h=f.h; const badge=h?('<span class="badge '+vb(h.verdict)+'">'+esc(h.verdict||'?')+'</span>'):'<span class="badge unknown">no health</span>';
+    const detail=h?('<div class="muted">'+esc(h.reason||'')+(h.ticks_total!=null?' · ticks '+esc(String(h.ticks_total)):'')
+      +(h.subscribed_total!=null?' · subscribed '+esc(String(h.subscribed_total)):'')+'</div>'):'';
+    return '<div class="pr"><div class="t"><b>'+esc(f.name)+'</b> — <span class="'+(f.enabled?'ok':'bad')+'">'+(f.enabled?'ENABLED':'disabled')+'</span>'
+      +' · lane '+(f.lane?'<span class="ok">running</span>':'<span class="warn">not running</span>')+' '+badge+detail+'</div>'
+      +'<button class="'+(f.enabled?'b-stop':'b-go')+' mini" onclick="feedToggle(\''+safeName+'\','+(!f.enabled)+')">'+(f.enabled?'⏹ turn OFF':'▶ turn ON')+'</button></div>'; }).join('');
+  const errs=[j.feeds_error,j.health_error].filter(Boolean).join(' · ');
+  if(errs) $('feedsmsg').textContent=errs; }
+async function feedToggle(feed,enabled){
+  if(!enabled && !confirm('Turn OFF the "'+feed+'" live feed? Ticks from '+feed+' stop until you turn it back on.')){ toast('cancelled'); return; }
+  toast((enabled?'enabling ':'disabling ')+feed+'…');
+  const j=await call('feed-toggle',{feed:feed,enabled:enabled}); if(!j) return;
+  if(j.ok){ toast('✅ '+feed+' '+(enabled?'enabled':'disabled')); }
+  else{ // Surface the APP's own message verbatim — incl. the 409 Dhan
+        // live-trading guard ("refusing to disable the Dhan feed …").
+    const m=(j.app_response&&j.app_response.error)||j.error||('feed toggle failed (app status '+j.app_status+')');
+    $('feedsmsg').textContent='⚠ '+m; toast('⚠ '+String(m).slice(0,120)); }
+  setTimeout(loadFeeds,1200); }
 
 async function runSql(){ const q=$('sql').value.trim(); if(!q){ toast('Type a query'); return; } $('sqlout').innerHTML='<span class="muted">running…</span>';
   const j=await call('sql',{query:q}); if(!j){ $('sqlout').innerHTML=''; return; }

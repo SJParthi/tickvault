@@ -613,17 +613,24 @@ pub const DHAN_SANDBOX_TOKEN_SECRET: &str = "sandbox-token";
 // `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`
 // ---------------------------------------------------------------------------
 
-/// SSM service path segment for Groww credentials.
-/// Full paths: `/tickvault/<env>/groww/api-key` + `/tickvault/<env>/groww/totp-secret`.
+/// SSM service path segment for the Groww feed.
+/// Full path read by TickVault: `/tickvault/<env>/groww/access-token` ONLY.
 pub const SSM_GROWW_SERVICE: &str = "groww";
 
-/// SSM secret name for the Groww API key (the "TOTP token" from the Groww
-/// trade-api keys page; sent as `Authorization: Bearer <api_key>`).
-pub const GROWW_API_KEY_SECRET: &str = "api-key";
-
-/// SSM secret name for the Groww TOTP secret (the seed for the rotating
-/// 6-digit code; SHA1 / 6 digits / 30s — same as Dhan).
-pub const GROWW_TOTP_SECRET: &str = "totp-secret";
+/// SSM parameter name for the Groww ACCESS TOKEN — the daily token minted by
+/// the bruteX-owned `groww-token-minter` Lambda (~06:05 IST, EventBridge) into
+/// `/tickvault/<env>/groww/access-token` (SecureString, KMS
+/// `alias/tickvault-groww`). TickVault is a READ-ONLY consumer of this ONE
+/// parameter (IAM reader role `groww-token-minter-reader-tickvault`).
+///
+/// Operator lock 2026-07-02
+/// (`.claude/rules/project/groww-shared-token-minter-2026-07-02.md`):
+/// TickVault NEVER mints a Groww token, NEVER reads the `api-key` /
+/// `totp-secret` credential parameters (Lambda-only), and NEVER writes any
+/// `/tickvault/*/groww/*` parameter. The former credential-name constants were
+/// deleted with the mint path; ratchet:
+/// `crates/common/tests/groww_no_mint_guard.rs`.
+pub const GROWW_ACCESS_TOKEN_SECRET: &str = "access-token";
 
 /// Groww master instrument CSV (public static asset, no auth). Source of every
 /// Groww `exchange_token` — joined to NTM ISINs to build the watch-list (§31).
@@ -718,6 +725,25 @@ pub const PUBLIC_IP_CHECK_TIMEOUT_SECS: u64 = 10;
 
 /// Maximum retry attempts for public IP detection (primary + fallback).
 pub const PUBLIC_IP_CHECK_MAX_RETRIES: u32 = 3;
+
+/// GAP-NET-01 (AUTH-P12) — interval between runtime public-IP re-checks by
+/// the mid-session IP monitor. 300s = 5 minutes, matching the boot-time
+/// verify cadence; a confirmed mismatch therefore takes
+/// `IP_MONITOR_MISMATCH_CONFIRM_THRESHOLD` × this interval of the SAME wrong
+/// IP before any action fires (never a one-shot flap).
+pub const IP_MONITOR_CHECK_INTERVAL_SECS: u64 = 300;
+
+/// GAP-NET-01 (AUTH-P12) — number of CONSECUTIVE mismatched poll cycles the
+/// runtime IP monitor requires before it acts (confirm-twice debounce). A
+/// single transient metadata blip (1 cycle) never triggers an alert or halt;
+/// only a sustained wrong IP does.
+pub const IP_MONITOR_MISMATCH_CONFIRM_THRESHOLD: u32 = 2;
+
+/// GAP-NET-01 (AUTH-P12) — grace delay after the CRITICAL halt-class ERROR is
+/// logged, before the runtime IP monitor calls `std::process::exit`. Gives the
+/// log/Telegram sinks a moment to flush the alert so the operator sees WHY the
+/// process exited.
+pub const IP_MONITOR_HALT_FLUSH_DELAY_SECS: u64 = 2;
 
 /// Phase 0 Item 18b — Max retry attempts for the boot-time Dhan static
 /// IP gate (`/v2/ip/getIP`) when `orders_allowed = false`. Bounds the

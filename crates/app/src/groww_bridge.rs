@@ -60,7 +60,7 @@ use tickvault_trading::candles::{FeedStrategy, MultiTfAggregator};
 /// Capacity hint for the Groww feed's own [`MultiTfAggregator`] instance —
 /// matches the NTM-union universe headroom (operator §31). The container grows
 /// lazily; this only sizes the initial papaya table.
-const GROWW_AGGREGATOR_CAPACITY: usize = 1_200;
+pub const GROWW_AGGREGATOR_CAPACITY: usize = 1_200;
 
 /// Max bytes read from the tick file per wake (hostile-review HIGH 2026-06-19).
 /// Bounds the per-wake allocation so a large backlog on restart (e.g. a full
@@ -546,6 +546,9 @@ pub(crate) struct GrowwBridgeState {
     /// on the 0x0A newline keeps partial chars + lines safely buffered until the
     /// next wake completes them.
     residual: Vec<u8>,
+    /// Last offset-snapshot write instant (PR-3 throttle — one write per
+    /// [`GROWW_OFFSET_PERSIST_MIN_SECS`], cold path).
+    last_offset_persist: Option<std::time::Instant>,
 }
 
 impl GrowwBridgeState {
@@ -566,6 +569,119 @@ impl GrowwBridgeState {
             capture_seq: AtomicI64::new(0),
             offset: 0,
             residual: Vec::new(),
+            last_offset_persist: None,
+        }
+    }
+
+    /// Read the first [`GROWW_OFFSET_HEAD_LEN`] bytes of the capture file (the
+    /// identity guard), lossy-decoded. Empty on any failure (fail-safe: an
+    /// empty head never matches a snapshot, forcing the byte-0 re-tail).
+    async fn read_file_head(tick_file_path: &Path) -> String {
+        let Ok(mut f) = File::open(tick_file_path).await else {
+            return String::new();
+        };
+        let mut buf = [0u8; GROWW_OFFSET_HEAD_LEN];
+        let Ok(n) = f.read(&mut buf).await else {
+            return String::new();
+        };
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    }
+
+    /// PR-3 (2026-07-02): resume the read position from the persisted
+    /// flushed-offset snapshot when it provably belongs to the current file
+    /// (pure decision: [`resume_from_snapshot`]). Called ONCE at bridge start;
+    /// any mismatch falls back to the byte-0 re-tail (DEDUP-idempotent —
+    /// exactly the pre-PR-3 behavior).
+    // TEST-EXEMPT: async file I/O wrapper; the pure resume decision (resume_from_snapshot) + snapshot round-trip are unit-tested.
+    pub(crate) async fn try_resume_from_snapshot(&mut self, tick_file_path: &Path) {
+        let snap_path = offset_snapshot_path(tick_file_path);
+        let Ok(raw) = tokio::fs::read_to_string(&snap_path).await else {
+            info!("groww bridge: no offset snapshot — starting from byte 0");
+            metrics::counter!("tv_groww_bridge_offset_resume_total", "outcome" => "no_snapshot")
+                .increment(1);
+            return;
+        };
+        let Ok(snap) = serde_json::from_str::<GrowwOffsetSnapshot>(&raw) else {
+            warn!("groww bridge: offset snapshot unparseable — byte-0 re-tail (fail-safe)");
+            metrics::counter!("tv_groww_bridge_offset_resume_total", "outcome" => "corrupt")
+                .increment(1);
+            return;
+        };
+        let current_len = match tokio::fs::metadata(tick_file_path).await {
+            Ok(m) => m.len(),
+            Err(_) => {
+                info!("groww bridge: capture file absent — snapshot ignored");
+                metrics::counter!("tv_groww_bridge_offset_resume_total", "outcome" => "no_file")
+                    .increment(1);
+                return;
+            }
+        };
+        let current_head = Self::read_file_head(tick_file_path).await;
+        match resume_from_snapshot(&snap, current_len, &current_head) {
+            Some((offset, capture_seq)) => {
+                self.offset = offset;
+                self.capture_seq.store(capture_seq, Ordering::Relaxed);
+                info!(
+                    offset,
+                    capture_seq,
+                    file_len = current_len,
+                    "groww bridge: resumed from persisted flushed-offset — no full re-tail"
+                );
+                metrics::counter!("tv_groww_bridge_offset_resume_total", "outcome" => "resumed")
+                    .increment(1);
+            }
+            None => {
+                info!(
+                    snapshot_offset = snap.offset,
+                    file_len = current_len,
+                    "groww bridge: snapshot does not match the current capture file \
+                     (rotated/replaced) — byte-0 re-tail (DEDUP-idempotent)"
+                );
+                metrics::counter!("tv_groww_bridge_offset_resume_total", "outcome" => "identity_mismatch")
+                    .increment(1);
+            }
+        }
+    }
+
+    /// PR-3 (2026-07-02): persist the FLUSHED-THROUGH offset snapshot —
+    /// called ONLY from the flush-`Ok` arm (source-scan-ratcheted ordering:
+    /// the offset on disk is never ahead of rows persisted to QuestDB, so a
+    /// crash replays only the unflushed tail). Throttled to one write per
+    /// [`GROWW_OFFSET_PERSIST_MIN_SECS`]; atomic tmp+rename; best-effort (a
+    /// write failure only means a longer re-tail after the next restart).
+    async fn maybe_persist_offset(&mut self, tick_file_path: &Path) {
+        if let Some(last) = self.last_offset_persist
+            && last.elapsed().as_secs() < GROWW_OFFSET_PERSIST_MIN_SECS
+        {
+            return;
+        }
+        self.last_offset_persist = Some(std::time::Instant::now());
+        let head = Self::read_file_head(tick_file_path).await;
+        if head.is_empty() {
+            return; // nothing durable to key the identity on
+        }
+        let file_len = tokio::fs::metadata(tick_file_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(self.offset);
+        let snap = GrowwOffsetSnapshot {
+            offset: self.offset,
+            capture_seq: self.capture_seq.load(Ordering::Relaxed),
+            file_len,
+            head,
+        };
+        let Ok(json) = serde_json::to_string(&snap) else {
+            return;
+        };
+        let path = offset_snapshot_path(tick_file_path);
+        let tmp = path.with_extension("json.tmp");
+        if tokio::fs::write(&tmp, &json).await.is_ok()
+            && let Err(err) = tokio::fs::rename(&tmp, &path).await
+        {
+            warn!(
+                ?err,
+                "groww bridge: offset snapshot rename failed (best-effort)"
+            );
         }
     }
 
@@ -752,6 +868,16 @@ impl GrowwBridgeState {
         // `appended_this_wake == 0` — those retained rows must still be re-attempted
         // on a quiet wake (otherwise they sit unflushed until the next NEW tick,
         // exactly during a post-burst quiet period — hostile-review MEDIUM finding).
+        // PARSE-TIME LIVENESS (2026-07-02 adversarial-sweep fix): lines were
+        // parsed from the sidecar NDJSON this wake — the FEED delivered,
+        // regardless of what QuestDB does next. Stamp liveness BEFORE the flush
+        // so the sidecar stall-watchdog (`should_restart_on_stall`, which reads
+        // `last_tick_age_secs`) never mistakes a QuestDB outage for a dead
+        // socket and kills the healthy Python sidecar in a restart storm. Tick
+        // COUNTS stay persist-honest via record_ticks in the flush arm below.
+        if last_receipt_ist_nanos != 0 {
+            feed_health.record_feed_liveness(Feed::Groww, last_receipt_ist_nanos);
+        }
         if self.live_writer.pending() > 0 {
             // For a quiet wake (no new appends), `last_receipt_ist_nanos` is 0 — use
             // the wall-clock receipt time so record_ticks never stamps a 1970 ts.
@@ -763,6 +889,9 @@ impl GrowwBridgeState {
             match self.live_writer.flush() {
                 Ok(outcome) => {
                     feed_health.record_ticks(Feed::Groww, outcome.persisted as u64, ts);
+                    // PR-3: persist the FLUSHED-THROUGH offset (ordering
+                    // ratcheted — never ahead of rows persisted to QuestDB).
+                    self.maybe_persist_offset(tick_file_path).await;
                     // A transient QuestDB socket reset (broken pipe) that the writer
                     // reconnected + replayed IN this wake is a SELF-HEALED recovery,
                     // NOT data-at-risk — log it at info! so it doesn't re-spam the
@@ -888,6 +1017,217 @@ fn spawn_groww_ist_midnight_force_seal(
     info!("Groww bridge — IST-midnight force-seal task spawned (parity with Dhan)");
 }
 
+/// Persisted bridge read-position (PR-3, 2026-07-02): written AFTER each
+/// successful flush (never ahead of persisted rows), read once at bridge
+/// start so a process restart resumes the tail instead of re-reading the
+/// whole capture file from byte 0. `head` is the file's first bytes — the
+/// identity guard: a rotated/replaced file has a different first line, so a
+/// stale snapshot can never resume into the middle of a DIFFERENT file
+/// (fail-safe = byte-0 re-tail, which is DEDUP-idempotent).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GrowwOffsetSnapshot {
+    /// Flushed-through byte offset into the capture file.
+    pub offset: u64,
+    /// The capture_seq counter value at the flush (restored on resume so the
+    /// dedup tiebreaker stays monotonic across the restart).
+    pub capture_seq: i64,
+    /// Capture-file length at the flush (diagnostic only).
+    pub file_len: u64,
+    /// First bytes of the capture file at the flush (identity guard).
+    pub head: String,
+}
+
+/// How many leading bytes of the capture file form the identity guard.
+pub const GROWW_OFFSET_HEAD_LEN: usize = 64;
+
+/// Minimum seconds between offset-snapshot writes (cold-path throttle).
+pub const GROWW_OFFSET_PERSIST_MIN_SECS: u64 = 5;
+
+/// Sibling path of the capture file where the offset snapshot lives.
+#[must_use]
+pub fn offset_snapshot_path(tick_file_path: &Path) -> PathBuf {
+    tick_file_path
+        .parent()
+        .map(|d| d.join("bridge-offset.json"))
+        .unwrap_or_else(|| PathBuf::from("bridge-offset.json"))
+}
+
+/// Pure resume decision: `Some((offset, capture_seq))` ONLY when the snapshot
+/// provably belongs to the CURRENT file — its head matches and its offset is
+/// within the current length (the file only grew since the flush). Any
+/// mismatch (rotation, truncation, corruption, empty head) → `None` →
+/// fail-safe byte-0 re-tail.
+#[must_use]
+pub fn resume_from_snapshot(
+    snap: &GrowwOffsetSnapshot,
+    current_len: u64,
+    current_head: &str,
+) -> Option<(u64, i64)> {
+    if snap.head.is_empty() || snap.head != current_head {
+        return None; // rotated / replaced / unreadable — identity broken
+    }
+    if snap.offset > current_len {
+        return None; // shrank below the flushed point — rotated/truncated
+    }
+    Some((snap.offset, snap.capture_seq))
+}
+
+/// ws_event_audit edge latches shared between the supervisor wrapper and the
+/// (respawnable) bridge task, so a bridge panic never resets the forensic
+/// Connected/Disconnected/Reconnected chain (2026-07-02 adversarial finding M3).
+#[derive(Debug, Default)]
+pub struct GrowwAuditLatches {
+    /// A Connected/Reconnected row has been emitted for the current streaming
+    /// episode (rising-edge gate).
+    pub audited_connected: std::sync::atomic::AtomicBool,
+    /// A Disconnected row was emitted since the last connect — the next rising
+    /// edge classifies as Reconnected, not a second Connected.
+    pub prior_disconnect: std::sync::atomic::AtomicBool,
+}
+
+/// Pure: the next consecutive-respawn count given how long the previous bridge
+/// incarnation ran. A HEALTHY long run (>= `HEALTHY_RUN_RESET_SECS`) resets the
+/// curve to 1 so one panic per day never converges to the permanent 60s
+/// ceiling (2026-07-02 adversarial finding M2); rapid deaths keep climbing.
+#[must_use]
+pub fn next_respawn_count(prev_count: u32, ran_secs: u64) -> u32 {
+    if ran_secs >= HEALTHY_RUN_RESET_SECS {
+        1
+    } else {
+        prev_count.saturating_add(1)
+    }
+}
+
+/// A bridge incarnation that survived this long ran healthy — reset the
+/// respawn-backoff curve (5 minutes ≫ the 60s backoff ceiling).
+pub const HEALTHY_RUN_RESET_SECS: u64 = 300;
+
+/// Backoff (seconds) before the Nth consecutive bridge respawn: 5s doubling to
+/// a 60s cap. Pure — mirrors the sidecar supervisor's restart curve so a
+/// persistently-panicking bridge never tight-loops, yet a one-off panic
+/// self-heals within seconds.
+#[must_use]
+pub fn bridge_respawn_backoff(consecutive_respawns: u32) -> std::time::Duration {
+    const BASE_SECS: u64 = 5;
+    const CAP_SECS: u64 = 60;
+    let exp = consecutive_respawns.saturating_sub(1).min(6); // 5 * 2^6 > cap
+    std::time::Duration::from_secs((BASE_SECS << exp).min(CAP_SECS))
+}
+
+/// Spawn the Groww bridge UNDER A SUPERVISOR (2026-07-02 adversarial-sweep fix
+/// — WS-GAP-05 / DISK-WATCHER-01 / FEED-SUPERVISOR-01 pattern). Before this,
+/// `run_groww_bridge` was a bare `tokio::spawn`: a panic anywhere in the bridge
+/// silently killed the ONLY consumer of the sidecar NDJSON — ticks kept
+/// appending to disk while nothing persisted and no candle sealed, and the only
+/// eventual signal was the stall watchdog killing the WRONG process (the
+/// healthy Python sidecar, in a loop).
+///
+/// The wrapper creates the Groww aggregator ONCE and spawns the IST-midnight
+/// force-seal ONCE (both hoisted out of the respawned body, so respawns never
+/// leak duplicate force-seal tasks and in-memory bars survive a panic), then
+/// loops: spawn the bridge → await its JoinHandle → on ANY exit (panic or
+/// unexpected clean return) log `error!(code = FEED-SUPERVISOR-01)`, increment
+/// `tv_feed_supervisor_respawn_total{feed="groww", component="bridge"}`, back
+/// off ([`bridge_respawn_backoff`]) and respawn. A respawned bridge re-tails
+/// the NDJSON from byte 0 — residual-neutral: the deterministic `capture_seq`
+/// regenerates identical DEDUP keys, so QuestDB collapses the replay.
+// TEST-EXEMPT: supervision loop (spawn/await/sleep); the pure backoff curve is unit-tested (test_bridge_respawn_backoff_curve) and the wiring is pinned by per_feed_boot_isolation_guard + test_spawn_supervised_groww_bridge_owns_aggregator_and_force_seal_once.
+pub fn spawn_supervised_groww_bridge(
+    qdb: QuestDbConfig,
+    tick_file_path: PathBuf,
+    status_file_path: PathBuf,
+    feed_runtime: Arc<FeedRuntimeState>,
+    feed_health: Arc<tickvault_common::feed_health::FeedHealthRegistry>,
+    ws_audit_tx: Option<tokio::sync::mpsc::Sender<WsEventAuditRow>>,
+    trading_calendar: Arc<tickvault_common::trading_calendar::TradingCalendar>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Process-lifetime state: ONE aggregator (shared papaya map) + ONE
+        // IST-midnight force-seal task, regardless of how often the inner
+        // bridge task respawns.
+        let aggregator = MultiTfAggregator::with_capacity(GROWW_AGGREGATOR_CAPACITY);
+        spawn_groww_ist_midnight_force_seal(
+            aggregator.clone(),
+            Arc::clone(&feed_runtime),
+            trading_calendar,
+        );
+        // Process-lifetime ws_event_audit edge latches (finding M3): survive a
+        // bridge respawn so the forensic chain stays Connected → Disconnected →
+        // Reconnected, never Connected → Connected.
+        let audit_latches = Arc::new(GrowwAuditLatches::default());
+        let mut consecutive_respawns: u32 = 0;
+        loop {
+            let started = std::time::Instant::now();
+            let handle = tokio::spawn(run_groww_bridge(
+                qdb.clone(),
+                tick_file_path.clone(),
+                status_file_path.clone(),
+                Arc::clone(&feed_runtime),
+                Arc::clone(&feed_health),
+                ws_audit_tx.clone(),
+                aggregator.clone(),
+                Arc::clone(&audit_latches),
+            ));
+            let reason = match handle.await {
+                Err(err) if err.is_panic() => "panic",
+                // A non-panic JoinError = the inner task was CANCELLED — the
+                // runtime is shutting down (finding M2). Do NOT respawn onto a
+                // dying runtime and do NOT page a spurious FEED-SUPERVISOR-01;
+                // exit the supervisor cleanly (mirrors the sidecar wrapper).
+                Err(_) => {
+                    info!(
+                        "groww bridge supervisor: inner task cancelled (runtime \
+                         shutdown) — supervisor exiting cleanly"
+                    );
+                    return;
+                }
+                Ok(()) => "clean_exit",
+            };
+            // If the previous incarnation ran healthy for a while, reset the
+            // backoff curve — one panic per day must never converge to the
+            // permanent 60s ceiling (finding M2).
+            consecutive_respawns =
+                next_respawn_count(consecutive_respawns, started.elapsed().as_secs());
+            let backoff = bridge_respawn_backoff(consecutive_respawns);
+            // Forensic falling edge (finding M3): a panic unwound the bridge
+            // before it could emit its Disconnected row — emit it HERE so the
+            // audit chain never reads Connected → Connected. The respawned
+            // bridge's first streaming rising edge then classifies Reconnected.
+            if audit_latches
+                .audited_connected
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                emit_groww_ws_audit(
+                    ws_audit_tx.as_ref(),
+                    WsEventKind::Disconnected,
+                    "bridge_died",
+                    "groww bridge task died — respawning",
+                );
+                audit_latches
+                    .prior_disconnect
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            error!(
+                code =
+                    tickvault_common::error_code::ErrorCode::FeedSupervisor01Respawned.code_str(),
+                reason,
+                consecutive_respawns,
+                backoff_secs = backoff.as_secs(),
+                "FEED-SUPERVISOR-01: groww bridge task died — respawning (the \
+                 NDJSON re-tail is DEDUP-idempotent; in-memory bars survive on \
+                 the shared aggregator)"
+            );
+            metrics::counter!(
+                "tv_feed_supervisor_respawn_total",
+                "feed" => "groww",
+                "component" => "bridge"
+            )
+            .increment(1);
+            tokio::time::sleep(backoff).await;
+        }
+    })
+}
+
 /// Consumer driver: EVENT-DRIVEN (zero-poll) tail of the sidecar's append-only
 /// NDJSON tick file (operator 2026-06-28: "true zero latency, no polling"). A
 /// `notify` filesystem watcher wakes the loop sub-ms on each append; the loop reads
@@ -923,10 +1263,14 @@ pub async fn run_groww_bridge(
     // (`spawn_ws_event_audit_consumer`). `Option` mirrors the Dhan `ws_audit_tx`
     // convention so a `None` build (defensive / test) is a no-op.
     ws_audit_tx: Option<tokio::sync::mpsc::Sender<WsEventAuditRow>>,
-    // Trading calendar (2026-06-29): drives the IST-midnight force-seal boundary
-    // task's trading-day gate, using the SAME calendar handle the Dhan
-    // IST-midnight force-seal uses (`crates/app/src/main.rs`). Shared `Arc`.
-    trading_calendar: Arc<tickvault_common::trading_calendar::TradingCalendar>,
+    // The process-lifetime Groww aggregator, created ONCE by the supervisor
+    // wrapper — a respawned bridge reuses it (bars survive a panic) and the
+    // IST-midnight force-seal (spawned once by the wrapper) keeps sealing it.
+    aggregator: MultiTfAggregator,
+    // Process-lifetime ws_event_audit edge latches (created once by the
+    // supervisor wrapper) — survive a bridge respawn so the forensic
+    // Connected/Disconnected/Reconnected chain stays consistent (finding M3).
+    audit_latches: Arc<GrowwAuditLatches>,
 ) {
     info!(
         path = %tick_file_path.display(),
@@ -934,17 +1278,16 @@ pub async fn run_groww_bridge(
         "Groww bridge started — EVENT-DRIVEN tail of the sidecar tick file (zero-poll; \
          fallback watchdog only if the watcher drops). Idles until the sidecar appends."
     );
-    // Build the Groww aggregator ONCE and hand a `.clone()` (shared papaya map)
-    // to the IST-midnight force-seal boundary task — parity with the Dhan
-    // IST-midnight force-seal (`main.rs`). The per-tick fold path keeps the SAME
-    // instance via `GrowwBridgeState`.
-    let aggregator = MultiTfAggregator::with_capacity(GROWW_AGGREGATOR_CAPACITY);
-    spawn_groww_ist_midnight_force_seal(
-        aggregator.clone(),
-        Arc::clone(&feed_runtime),
-        trading_calendar,
-    );
+    // The aggregator is created ONCE by `spawn_supervised_groww_bridge` (which
+    // also spawns the IST-midnight force-seal exactly once) and passed in —
+    // so a supervised RESPAWN of this task reuses the same shared papaya map
+    // (in-memory bars survive a bridge panic) and never leaks a duplicate
+    // force-seal task. Parity with the Dhan IST-midnight force-seal (`main.rs`).
     let mut state = GrowwBridgeState::with_aggregator(&qdb, aggregator);
+    // PR-3 (2026-07-02): resume from the persisted flushed-offset when it
+    // provably belongs to the current capture file — otherwise byte-0 re-tail
+    // (DEDUP-idempotent, the pre-PR-3 behavior).
+    state.try_resume_from_snapshot(&tick_file_path).await;
 
     // PRIMARY path: install the event-driven filesystem watcher. If it fails, the
     // fallback poll alone keeps the bridge working (degraded, logged once). The
@@ -972,8 +1315,11 @@ pub async fn run_groww_bridge(
     // per streaming rising edge (never per loop turn). `prior_disconnect` is set when
     // a Disconnected/DisconnectedOffHours row was emitted on a disable falling edge,
     // so the NEXT rising edge is classified Reconnected (not a second Connected).
-    let mut audited_connected = false;
-    let mut prior_disconnect = false;
+    // SHARED with the supervisor wrapper (2026-07-02 adversarial finding M3): the
+    // latches live in `audit_latches` (created once per process) so a bridge PANIC
+    // does not reset them — the wrapper emits the missing Disconnected row on death
+    // and the respawned bridge's first rising edge classifies as RECONNECTED, so the
+    // forensic chain never reads Connected→Connected with no disconnect between.
 
     loop {
         // Wake on EITHER a filesystem event (zero-latency) OR the fallback timer.
@@ -1016,7 +1362,10 @@ pub async fn run_groww_bridge(
             // DisconnectedOffHours Low, else Disconnected). Gated on
             // `audited_connected` so a disable while already-disconnected (or
             // never-connected) does not spam a row each idle turn.
-            if audited_connected {
+            if audit_latches
+                .audited_connected
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 let kind = if tickvault_common::market_hours::is_within_market_hours_ist() {
                     WsEventKind::Disconnected
                 } else {
@@ -1028,9 +1377,13 @@ pub async fn run_groww_bridge(
                     "feed_disabled",
                     "groww disabled",
                 );
-                prior_disconnect = true;
+                audit_latches
+                    .prior_disconnect
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            audited_connected = false;
+            audit_latches
+                .audited_connected
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             connect_logged = false;
             streaming_observed = false;
             continue;
@@ -1085,15 +1438,26 @@ pub async fn run_groww_bridge(
         // last (re)arm, emit ONE row — Reconnected if a Disconnected was emitted
         // since the last connect, else Connected. Gated on `audited_connected` so
         // it fires once per rising edge, never per loop turn (audit-findings Rule 4).
-        if streaming_observed && !audited_connected {
-            let (kind, source) = if prior_disconnect {
+        if streaming_observed
+            && !audit_latches
+                .audited_connected
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let (kind, source) = if audit_latches
+                .prior_disconnect
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 (WsEventKind::Reconnected, "groww_resumed")
             } else {
                 (WsEventKind::Connected, "groww_sidecar")
             };
             emit_groww_ws_audit(ws_audit_tx.as_ref(), kind, source, "groww streaming");
-            audited_connected = true;
-            prior_disconnect = false;
+            audit_latches
+                .audited_connected
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            audit_latches
+                .prior_disconnect
+                .store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -1727,9 +2091,10 @@ mod tests {
         let disable_idx = src
             .find("if !feed_runtime.is_enabled(Feed::Groww) {")
             .expect("disable branch present");
-        // Window widened (PR-10) to span the inserted ws_event_audit falling-edge
-        // emit block — the latch re-arm now lives just below it.
-        let after = &src[disable_idx..disable_idx + 1600];
+        // Window widened (PR-10, then 2026-07-02 M3 atomic-latch expansion) to
+        // span the ws_event_audit falling-edge emit block — the latch re-arm
+        // lives just below it.
+        let after = &src[disable_idx..disable_idx + 2600];
         assert!(
             after.contains(&clear)
                 && after.contains("connect_logged = false")
@@ -1978,6 +2343,201 @@ mod tests {
         assert!(
             src.contains(&groww_feed),
             "the force-seal closure must route with feed: Feed::Groww (drop_d1: false)"
+        );
+    }
+
+    // ── 2026-07-02 adversarial-sweep fixes: bridge supervision + parse-time
+    // liveness (the two HIGHs) ──
+
+    #[test]
+    fn test_bridge_respawn_backoff_curve() {
+        // 5s doubling to a 60s cap — a one-off panic self-heals in seconds, a
+        // persistent panic never tight-loops.
+        assert_eq!(bridge_respawn_backoff(1).as_secs(), 5);
+        assert_eq!(bridge_respawn_backoff(2).as_secs(), 10);
+        assert_eq!(bridge_respawn_backoff(3).as_secs(), 20);
+        assert_eq!(bridge_respawn_backoff(4).as_secs(), 40);
+        assert_eq!(bridge_respawn_backoff(5).as_secs(), 60, "cap");
+        assert_eq!(bridge_respawn_backoff(50).as_secs(), 60, "stays capped");
+        assert_eq!(
+            bridge_respawn_backoff(u32::MAX).as_secs(),
+            60,
+            "no overflow"
+        );
+        // Defensive: a 0th call (before any respawn) still yields the base.
+        assert_eq!(bridge_respawn_backoff(0).as_secs(), 5);
+    }
+
+    #[test]
+    fn test_offset_snapshot_roundtrip() {
+        // PR-3: the persisted snapshot must serialize/parse losslessly.
+        let snap = GrowwOffsetSnapshot {
+            offset: 123_456,
+            capture_seq: 1_780_000_020_123_000_000,
+            file_len: 200_000,
+            head: "{\"security_id\":1333".to_string(),
+        };
+        let json = serde_json::to_string(&snap).expect("serialize");
+        let back: GrowwOffsetSnapshot = serde_json::from_str(&json).expect("parse");
+        assert_eq!(back, snap);
+    }
+
+    #[test]
+    fn test_resume_from_snapshot_decision_matrix() {
+        // PR-3: resume ONLY when the snapshot provably belongs to the current
+        // file — every mismatch is a fail-safe byte-0 re-tail.
+        let snap = GrowwOffsetSnapshot {
+            offset: 100,
+            capture_seq: 42,
+            file_len: 100,
+            head: "HEAD".to_string(),
+        };
+        // Match: same head, file grew → resume.
+        assert_eq!(resume_from_snapshot(&snap, 150, "HEAD"), Some((100, 42)));
+        // Match: same head, file unchanged → resume (nothing new).
+        assert_eq!(resume_from_snapshot(&snap, 100, "HEAD"), Some((100, 42)));
+        // Rotated: fresh file has a different first line → byte-0.
+        assert_eq!(resume_from_snapshot(&snap, 150, "OTHER"), None);
+        // Truncated below the flushed point → byte-0.
+        assert_eq!(resume_from_snapshot(&snap, 50, "HEAD"), None);
+        // Empty-head snapshot (unreadable at persist) never resumes.
+        let empty = GrowwOffsetSnapshot {
+            head: String::new(),
+            ..snap
+        };
+        assert_eq!(resume_from_snapshot(&empty, 150, ""), None);
+    }
+
+    #[test]
+    fn test_offset_snapshot_path_is_sibling() {
+        assert_eq!(
+            offset_snapshot_path(Path::new("data/groww/live-ticks.ndjson")),
+            PathBuf::from("data/groww/bridge-offset.json")
+        );
+    }
+
+    #[test]
+    fn test_offset_persist_is_after_flush_ok() {
+        // PR-3 ordering ratchet: the offset on disk must NEVER be ahead of
+        // rows persisted to QuestDB — the persist call must live INSIDE the
+        // flush-Ok arm (after record_ticks), never before the flush.
+        let src = include_str!("groww_bridge.rs");
+        let flush_idx = src
+            .find("self.live_writer.flush()")
+            .expect("flush arm exists");
+        let persist_idx = src
+            .find("self.maybe_persist_offset(")
+            .expect("persist call exists");
+        assert!(
+            persist_idx > flush_idx,
+            "maybe_persist_offset must be called AFTER the flush — persisting \
+             an offset ahead of the QuestDB rows is a data-loss ordering bug"
+        );
+        // And it must sit before the flush-Err arm (i.e. inside Ok).
+        let err_arm = src[flush_idx..]
+            .find("Err(err) => {")
+            .map(|i| flush_idx + i)
+            .expect("flush Err arm exists");
+        assert!(
+            persist_idx < err_arm,
+            "maybe_persist_offset must be inside the flush-Ok arm"
+        );
+    }
+
+    #[test]
+    fn test_sidecar_rotates_at_ist_midnight() {
+        // PR-3 ratchet on the PYTHON writer: rotation must be gated on the IST
+        // day boundary (never size-based — a mid-session size rotation could
+        // reset capture_seq and collide same-second dedup keys) and must never
+        // stop capture on failure.
+        let sidecar = include_str!("../../../scripts/groww-sidecar/groww_sidecar.py");
+        assert!(
+            sidecar.contains("NDJSON_ARCHIVE_KEEP_DAYS = 2"),
+            "archive retention constant must be pinned"
+        );
+        assert!(
+            sidecar.contains("def _ist_day(") && sidecar.contains("class _RotatingOut"),
+            "the sidecar must rotate via the IST-day-boundary rotating writer"
+        );
+        assert!(
+            sidecar.contains("capture continues on the current file"),
+            "a rotation failure must never stop capture"
+        );
+        assert!(
+            !sidecar.contains("MAX_NDJSON_BYTES"),
+            "size-based rotation is deliberately NOT allowed (capture_seq \
+             collision risk mid-session)"
+        );
+    }
+
+    #[test]
+    fn test_next_respawn_count_resets_after_healthy_run() {
+        // Finding M2: a bridge that ran healthy >= HEALTHY_RUN_RESET_SECS resets
+        // the curve (one panic/day never converges to the 60s ceiling); rapid
+        // deaths keep climbing.
+        assert_eq!(next_respawn_count(0, 0), 1);
+        assert_eq!(next_respawn_count(3, 10), 4, "rapid death keeps climbing");
+        assert_eq!(
+            next_respawn_count(7, HEALTHY_RUN_RESET_SECS),
+            1,
+            "healthy run resets"
+        );
+        assert_eq!(next_respawn_count(u32::MAX, 0), u32::MAX, "no overflow");
+        assert_eq!(HEALTHY_RUN_RESET_SECS, 300);
+    }
+
+    #[test]
+    fn test_spawn_supervised_groww_bridge_owns_aggregator_and_force_seal_once() {
+        // The supervisor wrapper must create the aggregator + spawn the
+        // IST-midnight force-seal ONCE (outside the respawn loop) so respawns
+        // never leak duplicate force-seal tasks and bars survive a panic. Pin
+        // by source-scan: inside spawn_supervised_groww_bridge, the force-seal
+        // spawn appears BEFORE the respawn `loop {`.
+        let src = include_str!("groww_bridge.rs");
+        let sup_idx = src
+            .find("pub fn spawn_supervised_groww_bridge(")
+            .expect("spawn_supervised_groww_bridge must exist");
+        let tail = &src[sup_idx..];
+        let seal_idx = tail
+            .find("spawn_groww_ist_midnight_force_seal(")
+            .expect("the supervisor must spawn the force-seal");
+        let loop_idx = tail
+            .find("loop {")
+            .expect("the supervisor must have a respawn loop");
+        assert!(
+            seal_idx < loop_idx,
+            "the force-seal spawn must be OUTSIDE (before) the respawn loop — \
+             inside it, every respawn would leak a duplicate force-seal task"
+        );
+        // And the respawn must be observable: FEED-SUPERVISOR-01 + the counter.
+        assert!(
+            tail.contains("FeedSupervisor01Respawned"),
+            "a bridge respawn must log error!(code = FEED-SUPERVISOR-01)"
+        );
+        assert!(
+            tail.contains("tv_feed_supervisor_respawn_total"),
+            "a bridge respawn must increment tv_feed_supervisor_respawn_total"
+        );
+    }
+
+    #[test]
+    fn test_parse_time_liveness_is_recorded_before_flush() {
+        // The stall watchdog reads last_tick_age_secs; it MUST see parse-time
+        // delivery (the sidecar is healthy) even while QuestDB is down —
+        // otherwise a DB outage mimics a dead socket and the watchdog kills the
+        // healthy Python sidecar in a restart storm (2026-07-02 HIGH). Pin: the
+        // record_feed_liveness call appears BEFORE the flush arm in this file.
+        let src = include_str!("groww_bridge.rs");
+        let liveness_idx = src
+            .find("feed_health.record_feed_liveness(Feed::Groww")
+            .expect("the bridge must record parse-time liveness");
+        let flush_idx = src
+            .find("self.live_writer.flush()")
+            .expect("the flush arm must exist");
+        assert!(
+            liveness_idx < flush_idx,
+            "record_feed_liveness must be stamped BEFORE (independent of) the \
+             QuestDB flush — persist-coupled liveness is the bug this fixes"
         );
     }
 }

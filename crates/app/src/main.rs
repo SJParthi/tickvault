@@ -501,7 +501,13 @@ async fn main() -> Result<()> {
         TradingCalendar::from_config(&config.trading)
             .context("failed to build Groww trading calendar")?,
     );
-    tokio::spawn(tickvault_app::groww_bridge::run_groww_bridge(
+    // SUPERVISED (2026-07-02 adversarial-sweep fix): the bridge — the ONLY
+    // consumer of the sidecar NDJSON — used to be a bare tokio::spawn, so a
+    // panic silently stopped all Groww persistence while the stall watchdog
+    // killed the WRONG process (the healthy Python sidecar). The supervisor
+    // respawns it (FEED-SUPERVISOR-01 + tv_feed_supervisor_respawn_total,
+    // WS-GAP-05 pattern); the NDJSON re-tail is DEDUP-idempotent.
+    let _groww_bridge_supervisor = tickvault_app::groww_bridge::spawn_supervised_groww_bridge(
         config.questdb.clone(),
         std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
         std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_STATUS_FILE_DEFAULT),
@@ -515,7 +521,7 @@ async fn main() -> Result<()> {
         // boundary task's trading-day gate — built from the SAME `config.trading`
         // the Dhan IST-midnight force-seal calendar uses.
         groww_trading_calendar,
-    ));
+    );
     // Deferred Telegram slot for the Groww sidecar supervisor: the supervisor is
     // spawned here (before the notifier is built), so it gets a shared slot that
     // is filled with the live `NotificationService` once it exists (below). On a
@@ -2470,6 +2476,14 @@ async fn main() -> Result<()> {
             ),
         );
 
+    // Daily 15:40 IST per-feed tick-conservation audit — PROCESS-GLOBAL
+    // (2026-07-02 adversarial-sweep fix). Previously nested inside the
+    // Dhan-gated `spawn_post_market_tasks`, so a Groww-only session ran ZERO
+    // conservation audits and runtime Dhan enable cycles duplicated the task.
+    // Spawned exactly once here; each lane's run is gated at 15:40 on the
+    // truthful runtime feed flags. See `spawn_daily_tick_conservation_task`.
+    spawn_daily_tick_conservation_task(&config, &trading_calendar, &feed_runtime);
+
     // -----------------------------------------------------------------------
     // DayOhlcTracker boot wiring (post 2026-05-26 simplification; MOVED to
     // process-global scope 2026-07-01 to stop the per-lane cold-start leak).
@@ -3195,13 +3209,23 @@ fn create_websocket_pool(
         tickvault_common::config::SubscriptionScope::Indices4Only => {
             tickvault_core::websocket::activity_watchdog::WATCHDOG_THRESHOLD_IDX_I_SECS
         }
-        // Sub-PR #1 of 2026-05-27 — `DailyUniverse` variant introduced;
-        // production code-path activation lands in Sub-PRs #2-#13. Same
-        // IDX_I watchdog threshold applies until #8 tunes it for the
-        // 250-SID mixed universe (indices + NSE_EQ underlyings).
-        // See `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`.
+        // Audit GAP-1 fix (Operator approved 2026-07-02: "approve 15s"): the
+        // DailyUniverse clamp previously reused the 3s IDX_I threshold
+        // (the Sub-PR #1 2026-05-27 comment here explicitly deferred
+        // re-tuning to "#8", which never happened). Dhan's server pings
+        // every 10s and the read loop counts pings as activity
+        // (connection.rs STAGE-C.3), so the 3s clamp force-reconnected
+        // HEALTHY, still-pinging sockets during any >=3s data lull
+        // inside the market-hours gate (thin pre-open 09:00–09:15
+        // especially). 15s = one full Dhan ping interval + 50% margin:
+        // can never fire on a healthy socket, still detects a truly
+        // silent one 3.3x faster than the 50s config default. The
+        // Indices4Only arm above keeps its historical 3s value
+        // untouched. See `WATCHDOG_THRESHOLD_DAILY_UNIVERSE_SECS` docs +
+        // `.claude/rules/project/live-market-feed-subscription.md`
+        // (2026-07-02 section).
         tickvault_common::config::SubscriptionScope::DailyUniverse => {
-            tickvault_core::websocket::activity_watchdog::WATCHDOG_THRESHOLD_IDX_I_SECS
+            tickvault_core::websocket::activity_watchdog::WATCHDOG_THRESHOLD_DAILY_UNIVERSE_SECS
         }
     };
     if effective_watchdog_threshold != configured_watchdog_threshold {
@@ -5019,9 +5043,42 @@ async fn start_dhan_lane(
         info!("verifying public IP against SSM static IP");
         match ip_verifier::verify_public_ip().await {
             Ok(result) => {
+                let verified_ip = result.verified_ip.clone();
                 notifier.notify(NotificationEvent::IpVerificationSuccess {
                     verified_ip: result.verified_ip,
                 });
+
+                // AUTH-P12 / GAP-NET-01: wire the RUNTIME IP monitor. The
+                // boot-time verify above is one-shot; a mid-session public-IP
+                // / Elastic-IP change (EIP disassociation, NAT failover) must
+                // be re-detected. The monitor polls the verified IP every
+                // IP_MONITOR_CHECK_INTERVAL_SECS and, on a CONFIRMED sustained
+                // mismatch (confirm-twice debounce), emits a CRITICAL
+                // GAP-NET-01 alert. It HALTS the process only when
+                // dry_run == false (real orders would be rejected by Dhan's
+                // static-IP mandate); under dry_run it alerts but keeps the
+                // live feed streaming (killing it for a no-orders IP change
+                // would drop ticks for zero benefit).
+                let ip_monitor_config =
+                    tickvault_core::network::ip_monitor::IpMonitorConfig::for_runtime(
+                        verified_ip,
+                        config.strategy.dry_run,
+                    );
+                // Mirror the seal-writer lifetime pattern: hold the watch
+                // sender for the process lifetime so the monitor's
+                // `.changed().await` never wakes on a disconnected channel.
+                let (ip_monitor_shutdown_tx, ip_monitor_shutdown_rx) =
+                    tokio::sync::watch::channel(false);
+                std::mem::forget(ip_monitor_shutdown_tx);
+                let (_ip_mismatch_rx, _ip_monitor_handle) =
+                    tickvault_core::network::ip_monitor::spawn_ip_monitor(
+                        ip_monitor_config,
+                        ip_monitor_shutdown_rx,
+                    );
+                info!(
+                    halt_on_mismatch = !config.strategy.dry_run,
+                    "GAP-NET-01 (AUTH-P12): runtime IP monitor spawned"
+                );
             }
             Err(err) => {
                 // GAP-NET-01: static-IP verification rejected boot.
@@ -10603,13 +10660,29 @@ fn redact_ip_last_octet(raw: &str) -> String {
     "[REDACTED]".to_string()
 }
 
-/// Spawn the scheduled daily tasks — end-of-day digest (15:31:30 IST), the
-/// 1-minute cross-verify (15:31:00 IST), and the REST-health canary
-/// (09:05 / 12:00 / 15:25 IST — DHAN-REST-400, 2026-06-10). Called from BOTH
-/// boot paths so a mid-session fast-boot restart runs them too
-/// (boot-symmetry, 2026-06-09). Each spawned task self-skips if past its IST
-/// trigger(s) or on a non-trading day, so calling this from a late/
-/// non-trading boot is safe (no-op).
+/// Process-global once-guard for `spawn_post_market_tasks` (2026-07-02
+/// adversarial-sweep fix). The runtime Dhan cold-start path
+/// (`run_dhan_lane_cold_start` → `start_dhan_lane`) re-invokes
+/// `spawn_post_market_tasks` on EVERY disable→enable cycle, and the spawned
+/// tasks are bare `tokio::spawn`s not owned by `DhanLaneRunHandles` — so N
+/// enable cycles before the triggers accumulated N duplicate task families
+/// (N EOD digests, N cross-verifies, N orphan watchdogs). First caller wins;
+/// later calls log INFO and return.
+static POST_MARKET_TASKS_SPAWNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Spawn the scheduled daily tasks — the 15:25 IST orphan-position watchdog,
+/// end-of-day digest (15:31:30 IST), the 1-minute cross-verify (15:31:00 IST),
+/// and the REST-health canary (09:05 / 12:00 / 15:25 IST — DHAN-REST-400,
+/// 2026-06-10). Called from BOTH boot paths so a mid-session fast-boot restart
+/// runs them too (boot-symmetry, 2026-06-09); a process-global once-guard makes
+/// repeat calls (runtime Dhan cold-start cycles) no-ops so the family is never
+/// duplicated. Each spawned task self-skips if past its IST trigger(s) or on a
+/// non-trading day, so calling this from a late/non-trading boot is safe
+/// (no-op). NOTE: these tasks are Dhan-REST-dependent (token + client-id); the
+/// feed-agnostic 15:40 tick-conservation audit was HOISTED to the
+/// process-global prefix (`spawn_daily_tick_conservation_task`) on 2026-07-02
+/// so it fires in Groww-only sessions too.
 fn spawn_post_market_tasks(
     notifier: std::sync::Arc<NotificationService>,
     health_status: SharedHealthStatus,
@@ -10618,6 +10691,13 @@ fn spawn_post_market_tasks(
     client_id: String,
     config: &ApplicationConfig,
 ) {
+    if POST_MARKET_TASKS_SPAWNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        info!(
+            "post-market tasks already spawned this process — skipping duplicate \
+             (runtime Dhan cold-start re-entry)"
+        );
+        return;
+    }
     // Phase 0 Item 20 (wired 2026-06-13): supervised 15:25 IST orphan-position
     // watchdog — the daily open-position safety gate. Alert-only in
     // sandbox/dry-run (no order/cancel call exists on any path); pages CRITICAL
@@ -10902,74 +10982,97 @@ fn spawn_post_market_tasks(
         });
         info!("rest_canary: REST-health probe task spawned (09:05 / 12:00 / 15:25 IST)");
     }
+}
 
-    // Operator directive 2026-06-10 ("Go ahead to achieve zero tick loss"):
-    // daily end-to-end tick-conservation audit at 15:40:00 IST. Reconciles
-    // the WAL disk log (every frame Dhan delivered) against the processor
-    // outcome counters (self-scraped from /metrics) and the QuestDB `ticks`
-    // row count, then writes one forensic row to `tick_conservation_audit`.
-    // Residual > 0 → error! TICK-CONSERVE-01 (Telegram). Cold path,
-    // fail-soft, market-hours-gated (audit Rule 3). Runbook:
-    // `.claude/rules/project/tick-conservation-audit-error-codes.md`.
-    {
-        let tc_qcfg = config.questdb.clone();
-        let tc_metrics_port = config.observability.metrics_port;
-        let tc_calendar = std::sync::Arc::clone(&trading_calendar);
-        // Single source of truth for the WAL dir (shared with STAGE-C).
-        let tc_wal_dir = tickvault_app::tick_conservation_boot::ws_wal_dir();
-        tokio::spawn(async move {
-            use chrono::{FixedOffset, TimeZone, Timelike, Utc};
-            use tickvault_app::tick_conservation_boot::{
-                ConservationStart, boot_covers_full_session, decide_conservation_start,
-                run_tick_conservation_audit,
-            };
-            use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
-            let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+/// Daily 15:40 IST tick-conservation audit — PROCESS-GLOBAL (2026-07-02
+/// adversarial-sweep fix). This used to live inside `spawn_post_market_tasks`,
+/// whose two call sites are BOTH Dhan-gated (fast-boot `dhan_enabled` filter +
+/// `start_dhan_lane`), so a Groww-only session (`dhan_enabled=false`) ran ZERO
+/// conservation audits all day — a silent audit-coverage hole — and every
+/// runtime Dhan enable cycle spawned a DUPLICATE conservation task. It is now
+/// spawned exactly once from `main()`'s process-global prefix, independent of
+/// which feeds are enabled; each lane's run is gated at 15:40 on the truthful
+/// runtime "is this feed on" Arc, so a disabled lane writes no misleading zero
+/// row. Honest envelope: a feed toggled OFF at 15:40 after a full ON day skips
+/// its row that day.
+///
+/// Reconciles, per feed: the durable delivered-count (Dhan WAL frames / Groww
+/// sidecar NDJSON) against the processor outcome counters (Dhan) and the
+/// feed-filtered QuestDB `ticks` row count, then writes one forensic row per
+/// feed to `tick_conservation_audit`. Dhan residual > 0 → error!
+/// TICK-CONSERVE-01 (Telegram). Cold path, fail-soft, market-hours-gated
+/// (audit Rule 3). Runbook:
+/// `.claude/rules/project/tick-conservation-audit-error-codes.md`.
+// TEST-EXEMPT: tokio::spawn wrapper over the unit-tested pure parts (decide_conservation_start / boot_covers_full_session / build_conservation_ticks_count_sql); spawn site pinned by tick_conservation_wiring_guard.rs.
+fn spawn_daily_tick_conservation_task(
+    config: &ApplicationConfig,
+    trading_calendar: &std::sync::Arc<TradingCalendar>,
+    feed_runtime: &std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
+) {
+    let tc_qcfg = config.questdb.clone();
+    let tc_metrics_port = config.observability.metrics_port;
+    let tc_calendar = std::sync::Arc::clone(trading_calendar);
+    // Single source of truth for the WAL dir (shared with STAGE-C).
+    let tc_wal_dir = tickvault_app::tick_conservation_boot::ws_wal_dir();
+    let tc_groww_ndjson =
+        std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT);
+    let tc_feed_runtime = std::sync::Arc::clone(feed_runtime);
+    tokio::spawn(async move {
+        use chrono::{FixedOffset, TimeZone, Timelike, Utc};
+        use tickvault_app::tick_conservation_boot::{
+            ConservationStart, boot_covers_full_session, decide_conservation_start,
+            run_groww_tick_conservation_audit, run_tick_conservation_audit,
+        };
+        use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+        let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+            return;
+        };
+        let boot_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+        let today_ist = boot_ist.date_naive();
+        let boot_secs_of_day = boot_ist.time().num_seconds_from_midnight();
+        let force_now = std::env::var("TICKVAULT_TICK_CONSERVE_NOW")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let is_trading_day = tc_calendar.is_trading_day(today_ist);
+        match decide_conservation_start(boot_secs_of_day, is_trading_day, force_now) {
+            ConservationStart::SkipNonTradingDay => {
+                info!("tick_conservation: skipping (non-trading day)");
                 return;
-            };
-            let boot_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
-            let today_ist = boot_ist.date_naive();
-            let boot_secs_of_day = boot_ist.time().num_seconds_from_midnight();
-            let force_now = std::env::var("TICKVAULT_TICK_CONSERVE_NOW")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            let is_trading_day = tc_calendar.is_trading_day(today_ist);
-            match decide_conservation_start(boot_secs_of_day, is_trading_day, force_now) {
-                ConservationStart::SkipNonTradingDay => {
-                    info!("tick_conservation: skipping (non-trading day)");
-                    return;
-                }
-                ConservationStart::SkipPastTrigger => {
-                    debug!(
-                        now = %boot_ist.time(),
-                        "tick_conservation: skipping (past 15:40 — mid-evening boot)"
-                    );
-                    return;
-                }
-                ConservationStart::RunNow => {
-                    info!(
-                        "tick_conservation: TICKVAULT_TICK_CONSERVE_NOW set — running \
-                         on-demand NOW (operator dry-run)"
-                    );
-                }
-                ConservationStart::SleepThenRun(secs_until) => {
-                    info!(secs_until, "tick_conservation: sleeping until 15:40:00 IST");
-                    tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
-                }
             }
+            ConservationStart::SkipPastTrigger => {
+                debug!(
+                    now = %boot_ist.time(),
+                    "tick_conservation: skipping (past 15:40 — mid-evening boot)"
+                );
+                return;
+            }
+            ConservationStart::RunNow => {
+                info!(
+                    "tick_conservation: TICKVAULT_TICK_CONSERVE_NOW set — running \
+                     on-demand NOW (operator dry-run)"
+                );
+            }
+            ConservationStart::SleepThenRun(secs_until) => {
+                info!(secs_until, "tick_conservation: sleeping until 15:40:00 IST");
+                tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+            }
+        }
 
-            // IST day number for WAL attribution + the ticks-table window
-            // (ts stores IST-epoch nanos — data-integrity.md).
-            let now_utc_secs = Utc::now().timestamp();
-            let ist_secs = now_utc_secs.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
-            // APPROVED: epoch day number fits u64 trivially.
-            let target_ist_day = ist_secs.max(0) as u64 / 86_400;
-            let trading_date_ist_nanos = i64::try_from(target_ist_day)
-                .unwrap_or(0)
-                .saturating_mul(86_400)
-                .saturating_mul(1_000_000_000);
-            let run_ts_ist_nanos = ist_secs.saturating_mul(1_000_000_000);
+        // IST day number for WAL attribution + the ticks-table window
+        // (ts stores IST-epoch nanos — data-integrity.md).
+        let now_utc_secs = Utc::now().timestamp();
+        let ist_secs = now_utc_secs.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+        // APPROVED: epoch day number fits u64 trivially.
+        let target_ist_day = ist_secs.max(0) as u64 / 86_400;
+        let trading_date_ist_nanos = i64::try_from(target_ist_day)
+            .unwrap_or(0)
+            .saturating_mul(86_400)
+            .saturating_mul(1_000_000_000);
+        let run_ts_ist_nanos = ist_secs.saturating_mul(1_000_000_000);
 
+        // Dhan lane — runtime-gated (symmetric with the Groww gate below) so a
+        // Groww-only session writes no misleading zero-balanced Dhan row.
+        if tc_feed_runtime.is_enabled(tickvault_common::feed::Feed::Dhan) {
             run_tick_conservation_audit(
                 &tc_wal_dir,
                 &tc_qcfg,
@@ -10981,7 +11084,26 @@ fn spawn_post_market_tasks(
             )
             .await;
             info!("PROOF: tick_conservation audit fired @ 15:40:00 IST");
-        });
-        info!("tick_conservation: daily WAL-vs-DB audit task spawned");
-    }
+        } else {
+            debug!("tick_conservation: Dhan run skipped (Dhan feed disabled this session)");
+        }
+
+        // Groww lane — same IST day, same window, runtime-gated so a
+        // Dhan-only session writes no misleading zero Groww row.
+        if tc_feed_runtime.is_enabled(tickvault_common::feed::Feed::Groww) {
+            run_groww_tick_conservation_audit(
+                &tc_groww_ndjson,
+                &tc_qcfg,
+                target_ist_day,
+                trading_date_ist_nanos,
+                run_ts_ist_nanos,
+                boot_covers_full_session(boot_secs_of_day),
+            )
+            .await;
+            info!("PROOF: groww tick_conservation audit fired @ 15:40:00 IST");
+        } else {
+            debug!("groww_conservation: skipped (Groww feed disabled this session)");
+        }
+    });
+    info!("tick_conservation: daily per-feed WAL/NDJSON-vs-DB audit task spawned (process-global)");
 }

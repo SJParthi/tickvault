@@ -343,6 +343,22 @@ impl FeedHealthRegistry {
         self.clear_auth_rejected_on_recovery(i);
     }
 
+    /// Record feed LIVENESS only — stamp `ts_ist_nanos` as the most-recent tick
+    /// time WITHOUT bumping the persisted-tick count (2026-07-02 adversarial-
+    /// sweep fix). Called at PARSE time by the Groww bridge (lines parsed from
+    /// the sidecar NDJSON this wake — proof the feed DELIVERED), independent of
+    /// whether the QuestDB flush succeeds. This decouples the sidecar
+    /// stall-watchdog (`should_restart_on_stall`, which reads
+    /// `last_tick_age_secs`) from persistence: a QuestDB outage no longer
+    /// mimics a dead socket and can no longer trigger a false FEED-STALL-01
+    /// kill of a healthy sidecar. Tick COUNTS stay persist-honest via
+    /// [`Self::record_ticks`] in the flush arm. O(1), one relaxed store.
+    pub fn record_feed_liveness(&self, feed: Feed, ts_ist_nanos: i64) {
+        let i = feed.index();
+        self.last_tick_ist_nanos[i].store(ts_ist_nanos, Ordering::Relaxed);
+        self.mark_instrumented(i);
+    }
+
     /// Record one sealed candle for `feed`. O(1).
     pub fn record_candle(&self, feed: Feed) {
         let i = feed.index();
@@ -779,6 +795,17 @@ mod tests {
     }
 
     #[test]
+    fn test_registry_default_matches_new_for_unwired_feed() {
+        // `Default` must be identical to `new()`: an un-instrumented feed
+        // reports no last-tick and zero counters (never a false Down).
+        let reg = FeedHealthRegistry::default();
+        assert!(reg.last_tick_age_secs(Feed::Dhan, T0).is_none());
+        let r = reg.snapshot(Feed::Dhan, true, true, true, T0);
+        assert_eq!(r.input.ticks_total, 0);
+        assert_eq!(r.input.candles_total, 0);
+    }
+
+    #[test]
     fn test_record_ticks_bumps_total_by_n() {
         // The honest-counter helper: increment ticks_total by exactly N in one
         // atomic add (Groww counts PERSISTED rows in flush-sized batches).
@@ -788,6 +815,39 @@ mod tests {
         let r = reg.snapshot(Feed::Groww, true, true, true, T0 + 1_000_000_000);
         assert_eq!(r.input.ticks_total, 5, "record_ticks must add exactly N");
         assert_eq!(r.input.last_tick_age_secs, Some(1), "ts stamped");
+    }
+
+    #[test]
+    fn test_record_feed_liveness_updates_age_not_counts() {
+        // Parse-time liveness (2026-07-02): stamps the last-tick time so the
+        // stall watchdog sees a DELIVERING feed even while QuestDB is down —
+        // but never bumps the persist-honest tick count.
+        let reg = FeedHealthRegistry::new();
+        reg.set_connected(Feed::Groww, true);
+        reg.record_feed_liveness(Feed::Groww, T0);
+        let r = reg.snapshot(Feed::Groww, true, true, true, T0 + 2_000_000_000);
+        assert_eq!(
+            r.input.last_tick_age_secs,
+            Some(2),
+            "liveness must stamp the last-tick time"
+        );
+        assert_eq!(
+            r.input.ticks_total, 0,
+            "liveness must NOT bump the persisted-tick count"
+        );
+    }
+
+    #[test]
+    fn test_record_feed_liveness_interleaves_with_record_ticks() {
+        // Flush success later stamps a newer ts + the count; both helpers write
+        // the same last-tick slot (last-writer-wins, both are "now").
+        let reg = FeedHealthRegistry::new();
+        reg.set_connected(Feed::Groww, true);
+        reg.record_feed_liveness(Feed::Groww, T0);
+        reg.record_ticks(Feed::Groww, 3, T0 + 1_000_000_000);
+        let r = reg.snapshot(Feed::Groww, true, true, true, T0 + 1_000_000_000);
+        assert_eq!(r.input.ticks_total, 3);
+        assert_eq!(r.input.last_tick_age_secs, Some(0), "newest stamp wins");
     }
 
     #[test]

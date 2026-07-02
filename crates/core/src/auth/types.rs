@@ -84,30 +84,12 @@ impl fmt::Debug for DhanCredentials {
 }
 
 // ---------------------------------------------------------------------------
-// Groww Credentials (from SSM) — second feed, operator lock 2026-06-19
-// `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`
+// Groww credentials type: DELETED 2026-07-02 (shared token-minter lock,
+// `.claude/rules/project/groww-shared-token-minter-2026-07-02.md`). TickVault
+// never holds Groww api-key/totp-secret — the bruteX `groww-token-minter`
+// Lambda is the sole credential reader/minter; TickVault reads ONLY the minted
+// access token (`fetch_groww_access_token` → SecretString).
 // ---------------------------------------------------------------------------
-
-/// Groww API credentials fetched from AWS SSM Parameter Store.
-///
-/// TOTP flow (no-expiry): the `api_key` (Groww "TOTP token") is sent as a
-/// Bearer header, and `totp_secret` seeds the rotating 6-digit code. Both
-/// `Secret<String>` — Debug/Display never leak raw values.
-pub struct GrowwCredentials {
-    /// Groww API key / "TOTP token" (from the Groww trade-api keys page).
-    pub api_key: SecretString,
-    /// TOTP base32-encoded secret for the rotating 6-digit code.
-    pub totp_secret: SecretString,
-}
-
-impl fmt::Debug for GrowwCredentials {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("GrowwCredentials")
-            .field("api_key", &"[REDACTED]")
-            .field("totp_secret", &"[REDACTED]")
-            .finish()
-    }
-}
 
 // ---------------------------------------------------------------------------
 // QuestDB Credentials (from SSM)

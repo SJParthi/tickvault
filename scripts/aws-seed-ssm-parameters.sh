@@ -21,10 +21,19 @@
 #   /tickvault/<env>/api/bearer-token      (SecureString)
 #   /tickvault/<env>/network/static-ip     (String — the EIP from terraform output)
 #
-# Optional parameters (sandbox mode + SNS SMS alerts):
+# Optional parameters (sandbox mode + SNS SMS alerts + Groww feed #2):
 #   /tickvault/<env>/dhan/sandbox-client-id  (SecureString — sandbox mode only)
 #   /tickvault/<env>/dhan/sandbox-token      (SecureString — sandbox mode only)
 #   /tickvault/<env>/sns/phone-number        (String — for CloudWatch SMS alarms)
+#
+# GROWW: this script seeds NOTHING under /tickvault/<env>/groww/* — shared
+# token-minter lock 2026-07-02
+# (.claude/rules/project/groww-shared-token-minter-2026-07-02.md). The bruteX
+# repo's groww-token-minter Lambda owns the groww/api-key + groww/totp-secret
+# credential parameters AND writes the daily groww/access-token; TickVault is
+# a READ-ONLY consumer of the access-token parameter and must NEVER write any
+# groww/* parameter (uncoordinated writes/mints can invalidate the shared
+# token mid-session for BruteX).
 #
 # Usage:
 #   scripts/aws-seed-ssm-parameters.sh                        # interactive, env=dev
@@ -201,7 +210,7 @@ echo ""
 # ---------------------------------------------------------------------------
 # Optional parameters
 # ---------------------------------------------------------------------------
-echo -e "${CYAN}[3/3] Optional parameters (3 — skip with empty input)${NC}"
+echo -e "${CYAN}[3/3] Optional parameters (up to 5 — skip with empty input)${NC}"
 
 if [ "$ENVIRONMENT" = "sandbox" ]; then
     info "sandbox mode: the 2 sandbox-* parameters are needed"
@@ -215,6 +224,14 @@ if [ "$ENVIRONMENT" = "sandbox" ]; then
 fi
 
 put_param "/tickvault/${ENVIRONMENT}/sns/phone-number" TV_SNS_PHONE_NUMBER String "+CountryCode-PhoneNumber for SMS alarms (e.g. +91...)" || true
+
+# Groww second live feed (feed #2): NO SEEDING HERE — shared token-minter lock
+# 2026-07-02. The Groww credential parameters (groww/api-key, groww/totp-secret)
+# are owned + read ONLY by the bruteX groww-token-minter Lambda, and the daily
+# groww/access-token is WRITTEN only by that Lambda. TickVault reads the
+# access-token parameter read-only at runtime and must never write any
+# /tickvault/<env>/groww/* parameter from this repo.
+info "groww/*: skipped by design — owned by the bruteX groww-token-minter (TickVault is a read-only access-token consumer)"
 
 echo ""
 

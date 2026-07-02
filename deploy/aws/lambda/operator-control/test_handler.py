@@ -82,12 +82,13 @@ class ParseView(unittest.TestCase):
         stdout = (
             "APP=active\n"
             "TICKS_TODAY=152340\n"
+            'TICKS_BY_FEED="dhan",152000;"groww",340;\n'
             "C1M=372\n"
             "C5M=75\n"
             "C15M=25\n"
             "C60M=6\n"
             "C1D=4\n"
-            "DEDUP_KEYS=4\n"
+            "DEDUP_KEYS=5\n"
             "MAX_TPS=5\n"
             "ERRORS_BEGIN\n"
             "Jun 01 11:00 tickvault: WARN something\n"
@@ -96,9 +97,10 @@ class ParseView(unittest.TestCase):
         out = handler._parse_view(stdout)
         self.assertEqual(out["app"], "active")
         self.assertEqual(out["ticks_today"], "152340")
+        self.assertEqual(out["ticks_by_feed"], {"dhan": "152000", "groww": "340"})
         self.assertEqual(out["candles"]["1m"], "372")
         self.assertEqual(out["candles"]["1d"], "4")
-        self.assertEqual(out["dedup_key_columns"], "4")
+        self.assertEqual(out["dedup_key_columns"], "5")
         self.assertEqual(out["max_ticks_per_second"], "5")
         self.assertEqual(len(out["recent_errors"]), 1)
         self.assertIn("WARN something", out["recent_errors"][0])
@@ -108,6 +110,7 @@ class ParseView(unittest.TestCase):
         self.assertEqual(out["app"], "")
         self.assertEqual(out["dedup_key_columns"], "")
         self.assertEqual(out["max_ticks_per_second"], "")
+        self.assertEqual(out["ticks_by_feed"], {})
         self.assertEqual(out["recent_errors"], [])
 
     def test_no_error_lines_between_markers(self) -> None:
@@ -377,6 +380,41 @@ class WipeGate(unittest.TestCase):
     def test_wipe_is_in_destructive_set(self) -> None:
         self.assertIn("wipe-questdb", handler._DESTRUCTIVE)
 
+    def test_wipe_is_resurrect_proof_and_dynamic(self) -> None:
+        # Operator incident 2026-07-02: the wipe TRUNCATEd 6 hardcoded tables
+        # (of 27) and never touched the feed capture/replay files, so Groww
+        # rows RESURRECTED via the bridge's byte-0 re-tail and most candle
+        # tables survived for BOTH feeds. Pin the rewrite by source-scan:
+        import inspect
+
+        src = inspect.getsource(handler)
+        # (a) dynamic table discovery — no hardcoded 6-table list.
+        self.assertIn("SELECT table_name FROM tables()", src)
+        self.assertIn("t == 'ticks' or t.startswith('candles_')", src)
+        # (b) every feed's capture/replay source removed (feed-agnostic).
+        for needle in ("/ws_wal", "/groww", "/spill", "/dlq", "live-ticks.ndjson"):
+            self.assertIn(needle, src, f"wipe must remove the {needle} replay source")
+        # (c) the app is stopped before + started after the wipe.
+        wipe_block = src.split('action == "wipe-questdb"', 1)[1].split('action == "docker-reset"', 1)[0]
+        self.assertIn("systemctl stop tickvault", wipe_block)
+        self.assertIn("systemctl start tickvault", wipe_block)
+        # (d) honest completion marker — never a fake OK.
+        self.assertIn("WIPE-COMPLETE", wipe_block)
+        self.assertIn("WIPE-PARTIAL", wipe_block)
+
+    def test_docker_reset_and_bare_nuke_remove_feed_capture_sources(self) -> None:
+        # The full nuke + bare nuke must ALSO sweep the feed capture/replay
+        # dirs — the Groww capture file survived both before 2026-07-02.
+        import inspect
+
+        src = inspect.getsource(handler)
+        reset_block = src.split('action == "docker-reset"', 1)[1].split('action == "docker-nuke-bare"', 1)[0]
+        bare_block = src.split('action == "docker-nuke-bare"', 1)[1]
+        for name, block in (("docker-reset", reset_block), ("docker-nuke-bare", bare_block)):
+            self.assertIn("/ws_wal", block, f"{name} must remove the Dhan WAL")
+            self.assertIn("/groww", block, f"{name} must remove the Groww capture dir")
+            self.assertIn("live-ticks.ndjson", block, f"{name} must sweep future feeds' capture files")
+
     def _docker_reset(self, force: bool):
         return handler.lambda_handler(
             {
@@ -538,6 +576,252 @@ class CrossVerifyCard(unittest.TestCase):
     def test_cross_verify_action_is_read_only(self) -> None:
         # Read-only action: must NOT be market-hours-blocked.
         self.assertNotIn("cross_verify", handler._DESTRUCTIVE)
+
+
+class FeedCounts(unittest.TestCase):
+    def test_parse_feed_counts_two_feeds(self) -> None:
+        got = handler._parse_feed_counts('"dhan",152000;"groww",340;')
+        self.assertEqual(got, {"dhan": "152000", "groww": "340"})
+
+    def test_parse_feed_counts_empty_or_garbage_yields_empty(self) -> None:
+        # No fabricated zeros — an unreachable QuestDB renders NOTHING.
+        self.assertEqual(handler._parse_feed_counts(""), {})
+        self.assertEqual(handler._parse_feed_counts(";;"), {})
+        self.assertEqual(handler._parse_feed_counts("garbage-without-comma"), {})
+
+    def test_view_commands_query_ticks_grouped_by_feed(self) -> None:
+        cmd = next(c for c in handler._VIEW_COMMANDS if "TICKS_BY_FEED=" in c)
+        self.assertIn("GROUP%20BY%20feed", cmd)
+        self.assertIn("FROM%20ticks", cmd)
+
+
+class FeedsView(unittest.TestCase):
+    def test_parse_feeds_view_full(self) -> None:
+        stdout = (
+            "FEEDS_BEGIN\n"
+            '{"dhan_enabled": true, "groww_enabled": false, '
+            '"dhan_lane_running": true, "groww_lane_running": false}\n'
+            "FEEDS_END\n"
+            "FEEDS_HEALTH_BEGIN\n"
+            '{"market_open": true, "feeds": [{"feed": "dhan", "verdict": "ok", '
+            '"reason": "streaming", "enabled": true, "lane_running": true, '
+            '"ticks_total": 152000}]}\n'
+            "FEEDS_HEALTH_END\n"
+        )
+        out = handler._parse_feeds_view(stdout)
+        self.assertEqual(out["feeds_error"], "")
+        self.assertEqual(out["health_error"], "")
+        self.assertTrue(out["feeds"]["dhan_enabled"])
+        self.assertFalse(out["feeds"]["groww_enabled"])
+        self.assertTrue(out["feeds"]["dhan_lane_running"])
+        self.assertEqual(out["health"]["feeds"][0]["feed"], "dhan")
+        self.assertEqual(out["health"]["feeds"][0]["verdict"], "ok")
+
+    def test_parse_feeds_view_curl_failed_is_structured_error_not_zeros(self) -> None:
+        stdout = (
+            "FEEDS_BEGIN\nTV_CURL_FAILED\nFEEDS_END\n"
+            "FEEDS_HEALTH_BEGIN\nTV_CURL_FAILED\nFEEDS_HEALTH_END\n"
+        )
+        out = handler._parse_feeds_view(stdout)
+        self.assertIsNone(out["feeds"])
+        self.assertIsNone(out["health"])
+        self.assertIn("unreachable", out["feeds_error"])
+        self.assertIn("unreachable", out["health_error"])
+
+    def test_parse_feeds_view_empty_stdout_is_box_unreachable(self) -> None:
+        out = handler._parse_feeds_view("")
+        self.assertIsNone(out["feeds"])
+        self.assertIn("SSM offline or instance stopped", out["feeds_error"])
+        self.assertIn("SSM offline or instance stopped", out["health_error"])
+
+    def test_parse_feeds_view_invalid_json_is_error(self) -> None:
+        stdout = (
+            "FEEDS_BEGIN\n{not json\nFEEDS_END\n"
+            "FEEDS_HEALTH_BEGIN\n{}\nFEEDS_HEALTH_END\n"
+        )
+        out = handler._parse_feeds_view(stdout)
+        self.assertIsNone(out["feeds"])
+        self.assertIn("invalid JSON", out["feeds_error"])
+        self.assertEqual(out["health"], {})
+        self.assertEqual(out["health_error"], "")
+
+
+class FeedToggleValidation(unittest.TestCase):
+    def test_valid_feed_and_bool_accepted(self) -> None:
+        self.assertEqual(handler._validate_feed_toggle("dhan", True), "")
+        self.assertEqual(handler._validate_feed_toggle("groww", False), "")
+        # Future feed #3: a well-formed lowercase name passes the Lambda; the
+        # APP is the authority that 400s unknown feeds (passed through).
+        self.assertEqual(handler._validate_feed_toggle("kite", True), "")
+
+    def test_bad_feed_name_rejected(self) -> None:
+        for bad in ("", "DHAN", "dhan; rm -rf /", "a b", "../etc", None, 7, ["dhan"]):
+            self.assertNotEqual(handler._validate_feed_toggle(bad, True), "", repr(bad))
+
+    def test_enabled_must_be_json_bool(self) -> None:
+        for bad in (1, 0, "true", "false", None, "yes"):
+            msg = handler._validate_feed_toggle("dhan", bad)
+            self.assertIn("boolean", msg, repr(bad))
+
+    def test_lambda_rejects_bad_feed_with_400(self) -> None:
+        orig = handler._control_secret
+        handler._control_secret = lambda: "s3cret-token"  # type: ignore[assignment]
+        try:
+            resp = handler.lambda_handler(
+                {
+                    "requestContext": {"http": {"method": "POST"}},
+                    "headers": {"authorization": "Bearer s3cret-token"},
+                    "body": json.dumps({"action": "feed-toggle", "feed": "x; reboot", "enabled": True}),
+                },
+                None,
+            )
+        finally:
+            handler._control_secret = orig  # type: ignore[assignment]
+        self.assertEqual(resp["statusCode"], 400)
+
+    def test_toggle_commands_target_correct_url_and_body(self) -> None:
+        cmds = handler._feed_toggle_commands("groww", True)
+        joined = "\n".join(cmds)
+        self.assertIn("http://127.0.0.1:3001/api/feeds/groww", joined)
+        self.assertIn('{"enabled": true}', joined)
+        self.assertIn("-X POST", joined)
+        cmds_off = "\n".join(handler._feed_toggle_commands("dhan", False))
+        self.assertIn("http://127.0.0.1:3001/api/feeds/dhan", cmds_off)
+        self.assertIn('{"enabled": false}', cmds_off)
+
+    def test_feed_toggle_is_not_market_hours_blocked(self) -> None:
+        # The APP owns the safety gate (409 on Dhan-disable during live
+        # trading); the Lambda must not double-gate a read-mostly feed flip.
+        self.assertNotIn("feed-toggle", handler._DESTRUCTIVE)
+        self.assertNotIn("feeds-view", handler._DESTRUCTIVE)
+
+
+class FeedTogglePassthrough(unittest.TestCase):
+    DHAN_GUARD = (
+        "refusing to disable the Dhan feed while live trading is active "
+        "(orders/positions open) — Dhan can only be turned off in the no-orders "
+        "data-pull phase, so the system is never blinded mid-trade"
+    )
+
+    def test_parse_feed_toggle_200_success(self) -> None:
+        stdout = (
+            "FEED_TOGGLE_STATUS=200\n"
+            "FEED_TOGGLE_BODY_BEGIN\n"
+            '{"dhan_enabled": true, "groww_enabled": true, '
+            '"dhan_lane_running": true, "groww_lane_running": false}\n'
+            "FEED_TOGGLE_BODY_END\n"
+        )
+        out = handler._parse_feed_toggle(stdout)
+        self.assertEqual(out["app_status"], 200)
+        self.assertEqual(out["error"], "")
+        self.assertTrue(out["app_response"]["groww_enabled"])
+
+    def test_parse_feed_toggle_409_dhan_guard_message_verbatim(self) -> None:
+        stdout = (
+            "FEED_TOGGLE_STATUS=409\n"
+            "FEED_TOGGLE_BODY_BEGIN\n"
+            + json.dumps({"error": self.DHAN_GUARD, "allowed": ["groww"]})
+            + "\nFEED_TOGGLE_BODY_END\n"
+        )
+        out = handler._parse_feed_toggle(stdout)
+        self.assertEqual(out["app_status"], 409)
+        # The app's 409 guard message must survive VERBATIM.
+        self.assertEqual(out["app_response"]["error"], self.DHAN_GUARD)
+
+    def test_parse_feed_toggle_curl_000_is_unreachable_not_success(self) -> None:
+        out = handler._parse_feed_toggle(
+            "FEED_TOGGLE_STATUS=000\nFEED_TOGGLE_BODY_BEGIN\nFEED_TOGGLE_BODY_END\n"
+        )
+        self.assertIsNone(out["app_status"])
+        self.assertIn("unreachable", out["error"])
+
+    def test_parse_feed_toggle_empty_stdout_is_box_unreachable(self) -> None:
+        out = handler._parse_feed_toggle("")
+        self.assertIsNone(out["app_status"])
+        self.assertIn("SSM offline or instance stopped", out["error"])
+
+    def test_lambda_passes_409_through_with_ok_false(self) -> None:
+        stdout = (
+            "FEED_TOGGLE_STATUS=409\n"
+            "FEED_TOGGLE_BODY_BEGIN\n"
+            + json.dumps({"error": self.DHAN_GUARD, "allowed": ["groww"]})
+            + "\nFEED_TOGGLE_BODY_END\n"
+        )
+        orig_secret = handler._control_secret
+        orig_sync = handler._ssm_shell_sync
+        handler._control_secret = lambda: "s3cret-token"  # type: ignore[assignment]
+        handler._ssm_shell_sync = lambda cmds, timeout=6.0: stdout  # type: ignore[assignment]
+        try:
+            resp = handler.lambda_handler(
+                {
+                    "requestContext": {"http": {"method": "POST"}},
+                    "headers": {"authorization": "Bearer s3cret-token"},
+                    "body": json.dumps({"action": "feed-toggle", "feed": "dhan", "enabled": False}),
+                },
+                None,
+            )
+        finally:
+            handler._control_secret = orig_secret  # type: ignore[assignment]
+            handler._ssm_shell_sync = orig_sync  # type: ignore[assignment]
+        self.assertEqual(resp["statusCode"], 200)
+        body = json.loads(resp["body"])
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["app_status"], 409)
+        self.assertEqual(body["app_response"]["error"], self.DHAN_GUARD)
+
+
+class DedupFiveColumnCheck(unittest.TestCase):
+    def test_view_comment_names_the_five_real_key_columns(self) -> None:
+        # The dedup comment must name the REAL 5-column upsert key
+        # (ts, security_id, segment, capture_seq, feed) — not the stale
+        # 4-column (received_at) wording.
+        src = Path(handler.__file__).read_text(encoding="utf-8")
+        self.assertIn("(ts, security_id, segment, capture_seq, feed)", src)
+        self.assertNotIn("(ts, security_id, segment, received_at)", src)
+
+    def test_html_distinguishes_ok_disabled_drift_unreachable(self) -> None:
+        html = handler._console_html()
+        # 5 = OK (green): the check compares against 5, not the stale 4.
+        self.assertIn("dkN===5", html)
+        self.assertNotIn("==='4'", html)
+        # 0 = DEDUP disabled entirely (RED).
+        self.assertIn("DEDUP disabled!", html)
+        self.assertIn("'bad'", html)
+        # other = schema drift (amber).
+        self.assertIn("schema drift (expected 5)", html)
+        # fetch failure = "unreachable" (amber), never a fake 0/OLD.
+        self.assertIn("'unreachable'", html)
+
+
+class FeedsCardHtml(unittest.TestCase):
+    def test_html_has_feeds_card_and_actions(self) -> None:
+        html = handler._console_html()
+        self.assertIn("loadFeeds()", html)
+        self.assertIn("feedToggle(", html)
+        self.assertIn("feeds-view", html)
+        self.assertIn("feed-toggle", html)
+        self.assertIn('id="feeds"', html)
+        self.assertIn('id="feedsplit"', html)
+
+    def test_feeds_card_iterates_feed_list_no_hardcoded_names(self) -> None:
+        # Future-feeds property: the card renders whatever the app reports —
+        # it iterates health.feeds / derives names from *_enabled keys, and
+        # must NOT hardcode row('dhan')/row('groww') calls.
+        html = handler._console_html()
+        self.assertIn("j.health.feeds.map", html)
+        self.assertIn("_enabled'", html)
+        self.assertNotIn("row('dhan'", html)
+        self.assertNotIn("row('groww'", html)
+
+    def test_disable_asks_for_confirmation(self) -> None:
+        html = handler._console_html()
+        self.assertIn("Turn OFF the ", html)
+        self.assertIn("confirm(", html)
+
+    def test_errors_render_verbatim_through_esc(self) -> None:
+        html = handler._console_html()
+        self.assertIn("esc(j.feeds_error", html)
+        self.assertIn("j.app_response.error", html)
 
 
 if __name__ == "__main__":

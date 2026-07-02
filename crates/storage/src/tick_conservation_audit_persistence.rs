@@ -37,7 +37,7 @@
 //!     partial_coverage   BOOLEAN,    -- boot after 09:00 IST / a source missing
 //!     outcome            SYMBOL      -- balanced / leak / partial
 //! ) timestamp(ts) PARTITION BY DAY
-//!   DEDUP UPSERT KEYS(ts, trading_date_ist);
+//!   DEDUP UPSERT KEYS(ts, trading_date_ist, feed);
 //! ```
 //!
 //! The table is per-RUN (not per-instrument), so I-P1-11's
@@ -70,6 +70,13 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 /// future per-feed reconciliation would stamp its own. Replay-stable
 /// `&'static str` from the canonical `Feed` enum.
 pub const CONSERVATION_FEED_DHAN: &str = tickvault_common::feed::Feed::Dhan.as_str();
+
+/// Broker-source label for the Groww lane's daily conservation-audit row. The
+/// Groww audit reconciles the sidecar NDJSON delivered-count vs the persisted
+/// `feed='groww'` ticks for the IST day (see `run_groww_tick_conservation_audit`).
+/// Replay-stable `&'static str` from the canonical `Feed` enum; part of the
+/// `(ts, trading_date_ist, feed)` DEDUP key so the Dhan + Groww rows coexist.
+pub const CONSERVATION_FEED_GROWW: &str = tickvault_common::feed::Feed::Groww.as_str();
 
 /// Audit verdict for the `outcome` SYMBOL column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -8,7 +8,7 @@
 //! is set, tickvault itself
 //!
 //! 1. **auto-provisions** an isolated Python virtual-env under
-//!    `data/groww/venv` and `pip install`s `growwapi` + `pyotp` into it ONCE
+//!    `data/groww/venv` and `pip install`s `growwapi` + `boto3` into it ONCE
 //!    (idempotent — skipped if the venv python already exists), so the
 //!    operator never types `pip install`. The system interpreter used to
 //!    BUILD the venv is **auto-discovered** ([`discover_system_python`]) across
@@ -19,9 +19,14 @@
 //!    `brew` is BANNED per CLAUDE.md and an OS package install needs `sudo` —
 //!    neither is one-click-safe; every normal Mac/AWS host already ships one,
 //!    which discovery finds.);
-//! 2. **fetches** the Groww credentials from SSM (the SAME
-//!    `/tickvault/<env>/groww/api-key` + `/totp-secret` the native auth path
-//!    uses) and injects them as env vars into the child — never logged;
+//! 2. **hands the child the SSM PARAMETER PATH of the shared access token**
+//!    (`GROWW_SSM_TOKEN_PARAM=/tickvault/<env>/groww/access-token`) — shared
+//!    token-minter lock 2026-07-02
+//!    (`.claude/rules/project/groww-shared-token-minter-2026-07-02.md`): the
+//!    bruteX `groww-token-minter` Lambda is the SOLE minter; the sidecar
+//!    reads that ONE parameter fresh on every connect cycle (read-only reader
+//!    role) and NEVER mints. The supervisor no longer touches any Groww
+//!    credential (the api-key/totp-secret params are Lambda-only by IAM);
 //! 3. **spawns** `scripts/groww-sidecar/groww_sidecar.py` from that venv,
 //!    which appends capture-at-receipt NDJSON ticks the [`crate::groww_bridge`]
 //!    consumer tails;
@@ -38,13 +43,11 @@
 //!
 //! # Security (3-agent review 2026-06-19 — 0 critical / 0 high / 2 medium / 1 low)
 //!
-//! - Credentials are injected via [`Command::env`], NEVER argv — so they are
-//!   not visible in a `ps`/argv listing and are never logged (`expose_secret`
-//!   is called only at the injection point, never stored or re-logged).
-//!   Residual MEDIUM: a same-UID process could read `/proc/<pid>/environ`. On
-//!   this single-app host the only same-UID processes are ours; tightening to
-//!   a stdin/pipe channel (would require the sidecar to stop reading
-//!   `os.environ`) is a documented follow-up, not a blocker.
+//! - NO secret crosses the process boundary (2026-07-02 token-minter sync):
+//!   the child env carries only the SSM parameter PATH of the access token —
+//!   a non-secret string — and the sidecar reads the SecureString itself via
+//!   the read-only reader role. The former env-injected credentials (and the
+//!   `/proc/<pid>/environ` residual MEDIUM they carried) are gone.
 //! - `pip install -r requirements.txt` can run package `setup.py` at cold boot
 //!   (MEDIUM). Mitigated: the manifest is version-controlled + pinned and the
 //!   venv is isolated under `data/`. Inherent to the operator-chosen `growwapi`
@@ -77,7 +80,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use secrecy::ExposeSecret;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::sleep;
@@ -86,9 +88,7 @@ use tracing::{error, info, warn};
 use tickvault_api::feed_state::{Feed, FeedRuntimeState};
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed_health::FeedHealthRegistry;
-use tickvault_core::auth::secret_manager::{
-    build_ssm_path, fetch_groww_credentials, resolve_environment,
-};
+use tickvault_core::auth::secret_manager::{build_ssm_path, resolve_environment};
 use tickvault_core::notification::{NotificationEvent, NotificationService};
 
 /// Classification of one diagnostic line the Python sidecar prints, used by the
@@ -103,8 +103,10 @@ pub enum SidecarLineClass {
     /// SILENT-FEED watchdog), or the line names a permissions/authorization
     /// problem. The socket connects but streams nothing.
     EntitlementRejected,
-    /// An auth-phase reject (`groww sidecar error [auth]`) — the token is
-    /// invalid/expired.
+    /// An auth-phase reject (`groww sidecar error [auth]`) — the shared SSM
+    /// access token is stale/unusable (the sidecar NEVER mints; it re-reads
+    /// the bruteX-minted token from SSM each cycle, so a persistent auth
+    /// reject means the daily minter Lambda has not produced a fresh token).
     AuthRejected,
     /// A generic sidecar error (feed-connect / subscribe / consume phase, or the
     /// SDK's bare `Error:` NATS line).
@@ -168,7 +170,10 @@ impl SidecarLineClass {
             Self::EntitlementRejected => Some(
                 "account lacks a live market-data feed entitlement (or feed permissions denied)",
             ),
-            Self::AuthRejected => Some("authentication rejected — refresh the Groww api-key"),
+            Self::AuthRejected => Some(
+                "authentication rejected — the shared access token is stale/unusable; \
+                 check the bruteX groww-token-minter Lambda's last daily mint",
+            ),
             Self::Error => Some("the feed reported an error and is retrying"),
             Self::Subscribed | Self::Streaming | Self::Info => None,
         }
@@ -217,7 +222,10 @@ pub fn silent_feed_diagnostic_level(market_open: bool) -> tracing::Level {
 pub fn classify_sidecar_line(line: &str) -> SidecarLineClass {
     let l = line.to_ascii_lowercase();
     // Auth reject is the most specific cause — check before the generic error.
-    if l.contains("error [auth]") {
+    // "access token stale" is the sidecar's 10-min minter-dead marker (2026-07-02
+    // adversarial finding H1: without this arm the marker classified Info and the
+    // promised feed-health + Telegram routing never fired).
+    if l.contains("error [auth]") || l.contains("access token stale") {
         return SidecarLineClass::AuthRejected;
     }
     // Entitlement / permissions: the SILENT-FEED watchdog + permissions text.
@@ -503,6 +511,48 @@ pub fn venv_is_provisioned(venv_dir: &Path) -> bool {
     venv_python_path(venv_dir).is_file()
 }
 
+/// Path of the requirements-fingerprint marker written into the venv after a
+/// successful `pip install`. When `requirements.txt` changes (e.g. the
+/// 2026-07-02 pyotp→boto3 swap for the shared token-minter sync), the stored
+/// fingerprint no longer matches and provisioning re-runs `pip install` into
+/// the EXISTING venv — otherwise an already-deployed box would keep a stale
+/// dependency set forever and the sidecar would die on import.
+#[must_use]
+pub fn requirements_marker_path(venv_dir: &Path) -> PathBuf {
+    venv_dir.join(".requirements-fingerprint")
+}
+
+/// FNV-1a 64-bit fingerprint of the requirements manifest contents. Pure —
+/// same non-cryptographic content-fingerprint family the codebase already
+/// uses for log-signature hashing (collision here only means a skipped
+/// re-install, corrected by deleting the marker; not security-relevant).
+#[must_use]
+pub fn requirements_fingerprint(contents: &str) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in contents.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}")
+}
+
+/// Pure decision: does the venv need (re-)provisioning? True when the python
+/// interpreter is missing (fresh box) OR the stored requirements fingerprint
+/// differs from the current manifest's (deps changed since the last install).
+#[must_use]
+pub fn venv_needs_provisioning(
+    python_present: bool,
+    stored_fingerprint: Option<&str>,
+    current_fingerprint: &str,
+) -> bool {
+    if !python_present {
+        return true;
+    }
+    stored_fingerprint != Some(current_fingerprint)
+}
+
 /// Build the `python3 -m venv <dir>` command parts (program, args). Pure.
 #[must_use]
 pub fn build_venv_create_command(system_python: &str, venv_dir: &Path) -> (String, Vec<String>) {
@@ -581,11 +631,22 @@ async fn discover_system_python(preferred: &str) -> String {
     pick_system_python(preferred, |c| working.contains(c))
 }
 
-/// Provision the isolated venv + dependencies if not already present.
-/// Idempotent: returns early when [`venv_is_provisioned`] is true.
-// TEST-EXEMPT: spawns `python -m venv` + `pip install` child processes + filesystem; the command/arg construction is unit-tested (build_venv_create_command / build_pip_install_command) and the idempotency gate is unit-tested (venv_is_provisioned).
+/// Provision the isolated venv + dependencies if not already present OR if the
+/// requirements manifest changed since the last install (fingerprint marker —
+/// so a dependency swap like the 2026-07-02 pyotp→boto3 token-minter sync
+/// reaches already-deployed boxes automatically).
+/// Idempotent: returns early when the venv python exists AND the stored
+/// fingerprint matches the current `requirements.txt`.
+// TEST-EXEMPT: spawns `python -m venv` + `pip install` child processes + filesystem; the command/arg construction is unit-tested (build_venv_create_command / build_pip_install_command) and the idempotency gates are unit-tested (venv_is_provisioned / venv_needs_provisioning / requirements_fingerprint).
 async fn ensure_python_env(opts: &GrowwSidecarOptions) -> anyhow::Result<()> {
-    if venv_is_provisioned(&opts.venv_dir) {
+    let python_present = venv_is_provisioned(&opts.venv_dir);
+    let requirements_contents = tokio::fs::read_to_string(&opts.requirements_path)
+        .await
+        .unwrap_or_default();
+    let current_fingerprint = requirements_fingerprint(&requirements_contents);
+    let marker = requirements_marker_path(&opts.venv_dir);
+    let stored = tokio::fs::read_to_string(&marker).await.ok();
+    if !venv_needs_provisioning(python_present, stored.as_deref(), &current_fingerprint) {
         return Ok(());
     }
     if let Some(parent) = opts.venv_dir.parent() {
@@ -610,23 +671,27 @@ async fn ensure_python_env(opts: &GrowwSidecarOptions) -> anyhow::Result<()> {
         "[feeds] groww sidecar: provisioning isolated Python env (one-time, automated — discovered interpreter, no manual pip)"
     );
 
-    let (venv_prog, venv_args) = build_venv_create_command(&system_python, &opts.venv_dir);
-    let venv_status = tokio::time::timeout(SIDECAR_PROVISION_TIMEOUT, async {
-        Command::new(&venv_prog).args(&venv_args).status().await
-    })
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "python venv creation timed out after {}s",
-            SIDECAR_PROVISION_TIMEOUT.as_secs()
-        )
-    })??;
-    if !venv_status.success() {
-        anyhow::bail!(
-            "python venv creation (`{system_python} -m venv`) exited with status {venv_status} \
-             — on a Debian/Ubuntu host the `python3-venv` package may be missing; \
-             Mac (Xcode CLT) and AWS Linux ship it by default"
-        );
+    // A dependency change re-provisions into the EXISTING venv (pip install is
+    // idempotent) — only a missing interpreter needs the venv created.
+    if !python_present {
+        let (venv_prog, venv_args) = build_venv_create_command(&system_python, &opts.venv_dir);
+        let venv_status = tokio::time::timeout(SIDECAR_PROVISION_TIMEOUT, async {
+            Command::new(&venv_prog).args(&venv_args).status().await
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "python venv creation timed out after {}s",
+                SIDECAR_PROVISION_TIMEOUT.as_secs()
+            )
+        })??;
+        if !venv_status.success() {
+            anyhow::bail!(
+                "python venv creation (`{system_python} -m venv`) exited with status {venv_status} \
+                 — on a Debian/Ubuntu host the `python3-venv` package may be missing; \
+                 Mac (Xcode CLT) and AWS Linux ship it by default"
+            );
+        }
     }
 
     let venv_python = venv_python_path(&opts.venv_dir);
@@ -644,7 +709,17 @@ async fn ensure_python_env(opts: &GrowwSidecarOptions) -> anyhow::Result<()> {
     if !pip_status.success() {
         anyhow::bail!("pip install of groww sidecar deps exited with status {pip_status}");
     }
-    info!("[feeds] groww sidecar: Python env provisioned (growwapi + pyotp installed)");
+    // Record what was installed so a future requirements change re-triggers
+    // this path. Best-effort: a write failure only means a redundant future
+    // pip install (idempotent), never a broken env.
+    if let Err(err) = tokio::fs::write(&marker, &current_fingerprint).await {
+        warn!(
+            error = %err,
+            marker = %marker.display(),
+            "[feeds] groww sidecar: could not write requirements fingerprint marker"
+        );
+    }
+    info!("[feeds] groww sidecar: Python env provisioned (growwapi + boto3 installed)");
     Ok(())
 }
 
@@ -941,45 +1016,46 @@ pub async fn run_groww_sidecar_supervisor(
             continue;
         }
 
-        let creds = match fetch_groww_credentials().await {
-            Ok(creds) => creds,
-            Err(err) => {
-                consecutive_failures = consecutive_failures.saturating_add(1);
-                let backoff = sidecar_restart_backoff(consecutive_failures);
-                // Name the RESOLVED env + the EXACT SSM paths read (never the
-                // values) so the hint is self-diagnosing — no literal `<env>`.
-                let env = resolve_environment().unwrap_or_else(|_| "<unresolved>".to_string());
-                let api_key_path = build_ssm_path(
-                    &env,
-                    tickvault_common::constants::SSM_GROWW_SERVICE,
-                    tickvault_common::constants::GROWW_API_KEY_SECRET,
-                );
-                let totp_path = build_ssm_path(
-                    &env,
-                    tickvault_common::constants::SSM_GROWW_SERVICE,
-                    tickvault_common::constants::GROWW_TOTP_SECRET,
-                );
-                error!(
-                    error = %err,
-                    env = %env,
-                    api_key_path = %api_key_path,
-                    totp_secret_path = %totp_path,
-                    backoff_secs = backoff.as_secs(),
-                    "[feeds] groww sidecar: SSM credential fetch failed — verify the \
-                     api-key + totp-secret exist at the SSM paths above; retrying \
-                     with backoff"
-                );
-                sleep(backoff).await;
-                continue;
-            }
-        };
+        // Shared token-minter architecture (operator lock 2026-07-02 —
+        // `.claude/rules/project/groww-shared-token-minter-2026-07-02.md`):
+        // the supervisor NEVER fetches Groww credentials and NEVER mints. It
+        // hands the sidecar the SSM PARAMETER PATH of the access token minted
+        // daily by the bruteX `groww-token-minter` Lambda; the sidecar reads
+        // that ONE parameter (read-only, reader-role via the default AWS
+        // credential chain) FRESH on every connect cycle — which is what makes
+        // the 06:00 IST daily token reset + re-read-on-401 self-healing.
+        let env = resolve_environment().unwrap_or_else(|_| "<unresolved>".to_string());
+        let token_param_path = build_ssm_path(
+            &env,
+            tickvault_common::constants::SSM_GROWW_SERVICE,
+            tickvault_common::constants::GROWW_ACCESS_TOKEN_SECRET,
+        );
+
+        // Orphan reap (2026-07-02 adversarial finding M5): a SIGKILLed tickvault
+        // never runs kill_on_drop, leaving an ORPHANED sidecar still appending to
+        // the NDJSON (duplicate capture_seq rows) — and a pre-deploy orphan could
+        // even carry the retired mint code. Best-effort pkill of any process
+        // running our sidecar script before spawning the fresh one (single-app
+        // host; matches the exact script path, nothing else).
+        let script_needle = opts.script_path.to_string_lossy().into_owned();
+        if let Ok(status) = Command::new("pkill")
+            .args(["-f", &script_needle])
+            .status()
+            .await
+            && status.success()
+        {
+            warn!(
+                script = %script_needle,
+                "[feeds] groww sidecar: reaped an orphaned prior sidecar process \
+                 before launch (stale process from a previous run)"
+            );
+        }
 
         let venv_python = venv_python_path(&opts.venv_dir);
         let (prog, args) = build_sidecar_run_command(&venv_python, &opts.script_path);
         let mut cmd = Command::new(&prog);
         cmd.args(&args)
-            .env("GROWW_API_KEY", creds.api_key.expose_secret())
-            .env("GROWW_TOTP_SECRET", creds.totp_secret.expose_secret())
+            .env("GROWW_SSM_TOKEN_PARAM", &token_param_path)
             .env("GROWW_TICK_FILE", opts.tick_file.to_string_lossy().as_ref())
             // Connect+subscribe PROOF status file (operator 2026-06-28). The sidecar
             // writes its subscribe counts here atomically; the bridge reads it to emit
@@ -1581,6 +1657,77 @@ mod tests {
             "the supervisor must inject GROWW_STATUS_FILE (the connect+subscribe \
              proof status file) into the sidecar child"
         );
+    }
+
+    #[test]
+    fn test_supervisor_injects_token_param_env_and_no_credentials() {
+        // Shared token-minter lock 2026-07-02: the supervisor hands the child
+        // ONLY the SSM parameter PATH of the minter-written access token —
+        // never a credential. Source-scan (the supervise loop is TEST-EXEMPT).
+        let src = include_str!("groww_sidecar_supervisor.rs");
+        let token_key = format!("\"GROWW_SSM{}_TOKEN_PARAM\"", "");
+        assert!(
+            src.contains(&token_key) && src.contains("GROWW_ACCESS_TOKEN_SECRET"),
+            "the supervisor must inject GROWW_SSM_TOKEN_PARAM (built from \
+             GROWW_ACCESS_TOKEN_SECRET) into the sidecar child"
+        );
+        // The former credential env injections must never return.
+        for banned in [
+            format!("\"GROWW_API{}_KEY\"", ""),
+            format!("\"GROWW_TOTP{}_SECRET\"", ""),
+        ] {
+            assert!(
+                !src.contains(&banned),
+                "token-minter lock violated: the supervisor injects the {banned} \
+                 credential env var — Groww credentials are Lambda-only"
+            );
+        }
+    }
+
+    // ── requirements fingerprint re-provisioning gate (2026-07-02 boto3 swap) ──
+
+    #[test]
+    fn test_requirements_fingerprint_is_stable_and_content_sensitive() {
+        let a = requirements_fingerprint("growwapi==1.5.0\nboto3==1.35.36\n");
+        let b = requirements_fingerprint("growwapi==1.5.0\nboto3==1.35.36\n");
+        let c = requirements_fingerprint("growwapi==1.5.0\npyotp==2.9.0\n");
+        assert_eq!(a, b, "same contents must fingerprint identically");
+        assert_ne!(a, c, "changed contents must change the fingerprint");
+        assert_eq!(a.len(), 16, "fnv-1a 64-bit hex is 16 chars");
+    }
+
+    #[test]
+    fn test_venv_needs_provisioning_on_missing_python_or_changed_deps() {
+        // Fresh box: python absent → provision regardless of marker.
+        assert!(venv_needs_provisioning(false, None, "abc"));
+        assert!(venv_needs_provisioning(false, Some("abc"), "abc"));
+        // Deployed box, unchanged deps → skip.
+        assert!(!venv_needs_provisioning(true, Some("abc"), "abc"));
+        // Deployed box, CHANGED deps (the pyotp→boto3 swap) → re-provision.
+        assert!(venv_needs_provisioning(true, Some("old"), "new"));
+        // Deployed box, marker missing (pre-marker deployment) → re-provision
+        // once (idempotent pip) so the marker gets written.
+        assert!(venv_needs_provisioning(true, None, "abc"));
+    }
+
+    #[test]
+    fn test_requirements_marker_path_is_inside_the_venv() {
+        let p = requirements_marker_path(Path::new("data/groww/venv"));
+        assert_eq!(
+            p,
+            PathBuf::from("data/groww/venv/.requirements-fingerprint")
+        );
+    }
+
+    #[test]
+    fn test_classify_access_token_stale_marker_is_auth_rejected() {
+        // 2026-07-02 adversarial finding H1: the sidecar's 10-min minter-dead
+        // marker MUST route to feed-health Down + Telegram (AuthRejected), not
+        // classify Info and vanish.
+        let line = "GROWW LIVE FEED REJECTED: access token stale for 612s (>10min) — \
+                    the bruteX groww-token-minter Lambda may not have run";
+        assert_eq!(classify_sidecar_line(line), SidecarLineClass::AuthRejected);
+        assert!(classify_sidecar_line(line).sets_auth_rejected());
     }
 
     // ── is_silent_feed_diagnostic + silent_feed_diagnostic_level (the

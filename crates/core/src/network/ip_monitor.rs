@@ -19,6 +19,7 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use tickvault_common::constants::{
+    IP_MONITOR_CHECK_INTERVAL_SECS, IP_MONITOR_MISMATCH_CONFIRM_THRESHOLD,
     PUBLIC_IP_CHECK_FALLBACK_URL, PUBLIC_IP_CHECK_PRIMARY_URL, PUBLIC_IP_CHECK_TIMEOUT_SECS,
 };
 
@@ -35,15 +36,45 @@ pub struct IpMonitorConfig {
     pub expected_ip: String,
     /// Whether IP monitoring is enabled.
     pub enabled: bool,
+    /// Consecutive mismatched cycles required before acting (confirm-twice
+    /// debounce). A single transient blip must NOT act.
+    pub confirm_threshold: u32,
+    /// AUTH-P12: whether a CONFIRMED mismatch halts the process.
+    ///
+    /// Set to `!dry_run`: when real orders are live (`dry_run == false`) a
+    /// wrong IP means Dhan rejects every order, so the process halts
+    /// (blind-then-halt is the safe outcome). When `dry_run == true` the
+    /// monitor only alerts — killing a working live feed for a no-orders IP
+    /// change would drop ticks for zero financial benefit.
+    pub halt_on_mismatch: bool,
 }
 
 impl IpMonitorConfig {
     /// Creates a new config with the verified IP from boot.
+    ///
+    /// `confirm_threshold` defaults to
+    /// [`IP_MONITOR_MISMATCH_CONFIRM_THRESHOLD`]; `halt_on_mismatch` defaults
+    /// to `false` (alert-only). Use [`IpMonitorConfig::for_runtime`] to set
+    /// the halt gate from `dry_run`.
     pub fn new(expected_ip: String, check_interval_secs: u64) -> Self {
         Self {
             check_interval_secs,
             expected_ip,
             enabled: true,
+            confirm_threshold: IP_MONITOR_MISMATCH_CONFIRM_THRESHOLD,
+            halt_on_mismatch: false,
+        }
+    }
+
+    /// Builds the runtime (production) config with the dry_run-derived halt
+    /// gate. AUTH-P12: `halt_on_mismatch = !dry_run`.
+    pub fn for_runtime(expected_ip: String, dry_run: bool) -> Self {
+        Self {
+            check_interval_secs: IP_MONITOR_CHECK_INTERVAL_SECS,
+            expected_ip,
+            enabled: true,
+            confirm_threshold: IP_MONITOR_MISMATCH_CONFIRM_THRESHOLD,
+            halt_on_mismatch: !dry_run,
         }
     }
 
@@ -53,7 +84,51 @@ impl IpMonitorConfig {
             check_interval_secs: 300,
             expected_ip: String::new(),
             enabled: false,
+            confirm_threshold: IP_MONITOR_MISMATCH_CONFIRM_THRESHOLD,
+            halt_on_mismatch: false,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Action decision (pure, testable) — AUTH-P12
+// ---------------------------------------------------------------------------
+
+/// What the runtime IP monitor should do after a poll, given how many
+/// consecutive mismatches it has seen. Pure — computed with no I/O so it is
+/// exhaustively unit-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpMonitorAction {
+    /// Below the confirm threshold — keep polling, no alert, no halt.
+    Continue,
+    /// Confirmed mismatch, but `dry_run == true` — alert only, keep streaming.
+    AlertOnly,
+    /// Confirmed mismatch with real orders live (`dry_run == false`) —
+    /// alert AND halt the process (Dhan would reject every order).
+    AlertAndHalt,
+}
+
+/// GAP-NET-01 (AUTH-P12): decides the runtime IP monitor's action.
+///
+/// * `consecutive_mismatches` — how many back-to-back poll cycles observed the
+///   SAME wrong IP (reset to 0 on any `Match` or `CheckFailed`).
+/// * `confirm_threshold` — cycles required to confirm a sustained change.
+/// * `halt_on_mismatch` — `!dry_run`; whether a confirmed mismatch halts.
+///
+/// Returns [`IpMonitorAction::Continue`] until the confirm threshold is
+/// reached, then [`IpMonitorAction::AlertAndHalt`] (live) or
+/// [`IpMonitorAction::AlertOnly`] (dry-run).
+pub fn decide_ip_action(
+    consecutive_mismatches: u32,
+    confirm_threshold: u32,
+    halt_on_mismatch: bool,
+) -> IpMonitorAction {
+    if consecutive_mismatches < confirm_threshold {
+        IpMonitorAction::Continue
+    } else if halt_on_mismatch {
+        IpMonitorAction::AlertAndHalt
+    } else {
+        IpMonitorAction::AlertOnly
     }
 }
 
@@ -167,12 +242,18 @@ pub fn spawn_ip_monitor(
         info!(
             expected_ip = %mask_ip(&config.expected_ip),
             interval_secs = config.check_interval_secs,
+            confirm_threshold = config.confirm_threshold,
+            halt_on_mismatch = config.halt_on_mismatch,
             "GAP-NET-01: IP monitoring started"
         );
 
         let interval = Duration::from_secs(config.check_interval_secs);
         let timeout = Duration::from_secs(PUBLIC_IP_CHECK_TIMEOUT_SECS);
 
+        // AUTH-P12: confirm-twice debounce. A single transient mismatch must
+        // never act — only a sustained wrong IP across `confirm_threshold`
+        // consecutive poll cycles does.
+        let mut consecutive_mismatches: u32 = 0;
         // AUTH-P13: run of consecutive `CheckFailed` outcomes (both echo
         // endpoints unreachable). Reset on any Match / Mismatch.
         let mut consecutive_check_failures: u32 = 0;
@@ -190,28 +271,23 @@ pub fn spawn_ip_monitor(
 
             match &result {
                 IpCheckResult::Match => {
+                    // Recovery / steady state — reset the debounce counter so
+                    // the next mismatch episode starts fresh (edge-triggered).
+                    consecutive_mismatches = 0;
                     consecutive_check_failures = 0;
                     info!(
                         expected = %mask_ip(&config.expected_ip),
                         "GAP-NET-01: IP check passed"
                     );
                 }
-                IpCheckResult::Mismatch { expected, actual } => {
-                    consecutive_check_failures = 0;
-                    // GAP-NET-01: CRITICAL alert — IP has changed
-                    error!(
-                        code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
-                        severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
-                            .severity()
-                            .as_str(),
-                        expected = %mask_ip(expected),
-                        actual = %mask_ip(actual),
-                        "GAP-NET-01: CRITICAL — IP MISMATCH DETECTED. \
-                         Dhan API calls will be rejected from wrong IP. Trading should halt."
-                    );
-                    _ = tx.send(true);
-                }
                 IpCheckResult::CheckFailed { reason } => {
+                    // AUTH-P12: a fetch blip must never confirm a mismatch, so
+                    // reset the mismatch debounce counter on any CheckFailed.
+                    consecutive_mismatches = 0;
+                    // AUTH-P13: track a run of consecutive `CheckFailed`s (both
+                    // echo endpoints unreachable) and escalate to CRITICAL once
+                    // it crosses the streak threshold — a stranded box (e.g. a
+                    // fully-detached Elastic IP) that also breaks SSM + the feed.
                     consecutive_check_failures = consecutive_check_failures.saturating_add(1);
                     metrics::gauge!("tv_ip_monitor_check_failed_streak")
                         .set(f64::from(consecutive_check_failures));
@@ -242,6 +318,85 @@ pub fn spawn_ip_monitor(
                             consecutive_failures = consecutive_check_failures,
                             "GAP-NET-01: IP check failed (transient) — will retry next interval"
                         );
+                    }
+                }
+                IpCheckResult::Mismatch { expected, actual } => {
+                    // AUTH-P13: a real mismatch means the echo endpoints ARE
+                    // reachable — reset the CheckFailed streak.
+                    consecutive_check_failures = 0;
+                    consecutive_mismatches = consecutive_mismatches.saturating_add(1);
+                    let action = decide_ip_action(
+                        consecutive_mismatches,
+                        config.confirm_threshold,
+                        config.halt_on_mismatch,
+                    );
+
+                    match action {
+                        IpMonitorAction::Continue => {
+                            // Below the confirm threshold — a possible blip.
+                            warn!(
+                                expected = %mask_ip(expected),
+                                actual = %mask_ip(actual),
+                                consecutive_mismatches,
+                                confirm_threshold = config.confirm_threshold,
+                                "GAP-NET-01: IP mismatch observed (unconfirmed) — \
+                                 awaiting confirmation before acting"
+                            );
+                        }
+                        IpMonitorAction::AlertOnly => {
+                            // GAP-NET-01: CRITICAL alert — IP has changed.
+                            // dry_run == true: alert only, keep the feed alive.
+                            error!(
+                                code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
+                                    .code_str(),
+                                severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
+                                    .severity()
+                                    .as_str(),
+                                expected = %mask_ip(expected),
+                                actual = %mask_ip(actual),
+                                consecutive_mismatches,
+                                "GAP-NET-01: CRITICAL — SUSTAINED IP CHANGE CONFIRMED. \
+                                 Dhan orders would be rejected from this IP. Running in \
+                                 dry-run (no live orders) — feed kept alive, NOT halting. \
+                                 Re-associate the registered static IP before live trading."
+                            );
+                            // Best-effort signal to any watch consumer. The
+                            // ERROR line above is the authoritative alert; if
+                            // the receiver was dropped, surface that at warn!
+                            // so a lost signal is never fully silent.
+                            if tx.send(true).is_err() {
+                                warn!(
+                                    "GAP-NET-01: IP-mismatch watch receiver dropped — \
+                                     signal not delivered (ERROR alert still fired)"
+                                );
+                            }
+                        }
+                        IpMonitorAction::AlertAndHalt => {
+                            // dry_run == false: real orders would be rejected.
+                            // Blind-then-halt is the safe outcome.
+                            error!(
+                                code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
+                                    .code_str(),
+                                severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
+                                    .severity()
+                                    .as_str(),
+                                expected = %mask_ip(expected),
+                                actual = %mask_ip(actual),
+                                consecutive_mismatches,
+                                "GAP-NET-01: CRITICAL — SUSTAINED IP CHANGE CONFIRMED with \
+                                 LIVE ORDERS enabled. Dhan will reject every order from this \
+                                 IP — HALTING to avoid trading blind. Re-associate the \
+                                 registered static IP and restart."
+                            );
+                            _ = tx.send(true);
+                            // Give the ERROR line a moment to flush to the log
+                            // sinks / Telegram before the process exits.
+                            tokio::time::sleep(Duration::from_secs(
+                                tickvault_common::constants::IP_MONITOR_HALT_FLUSH_DELAY_SECS,
+                            ))
+                            .await;
+                            std::process::exit(1);
+                        }
                     }
                 }
             }
@@ -485,6 +640,69 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // decide_ip_action — AUTH-P12 pure decision function
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decide_ip_action_below_threshold_continues() {
+        // A single (unconfirmed) mismatch must NOT act, whether live or dry.
+        assert_eq!(decide_ip_action(1, 2, false), IpMonitorAction::Continue);
+        assert_eq!(decide_ip_action(1, 2, true), IpMonitorAction::Continue);
+        // Zero mismatches (steady state) also continues.
+        assert_eq!(decide_ip_action(0, 2, true), IpMonitorAction::Continue);
+    }
+
+    #[test]
+    fn test_decide_ip_action_at_threshold_dry_run_alerts_only() {
+        // dry_run == true → halt_on_mismatch == false → alert only, no halt.
+        assert_eq!(decide_ip_action(2, 2, false), IpMonitorAction::AlertOnly);
+    }
+
+    #[test]
+    fn test_decide_ip_action_at_threshold_live_alerts_and_halts() {
+        // dry_run == false → halt_on_mismatch == true → alert AND halt.
+        assert_eq!(decide_ip_action(2, 2, true), IpMonitorAction::AlertAndHalt);
+    }
+
+    #[test]
+    fn test_decide_ip_action_above_threshold_still_acts() {
+        // Once confirmed, staying mismatched keeps acting (not just at ==).
+        assert_eq!(decide_ip_action(5, 2, false), IpMonitorAction::AlertOnly);
+        assert_eq!(decide_ip_action(5, 2, true), IpMonitorAction::AlertAndHalt);
+    }
+
+    #[test]
+    fn test_ip_monitor_mismatch_confirm_threshold_is_two() {
+        // Pin the confirm-twice debounce so a future edit can't silently make
+        // the monitor act on a single transient blip.
+        assert_eq!(IP_MONITOR_MISMATCH_CONFIRM_THRESHOLD, 2);
+        let cfg = IpMonitorConfig::for_runtime("1.2.3.4".to_string(), true);
+        assert_eq!(cfg.confirm_threshold, 2);
+    }
+
+    #[test]
+    fn test_ip_monitor_config_for_runtime_dry_run_does_not_halt() {
+        let cfg = IpMonitorConfig::for_runtime("1.2.3.4".to_string(), true);
+        assert!(cfg.enabled);
+        assert!(!cfg.halt_on_mismatch, "dry_run=true must NOT halt");
+        assert_eq!(cfg.check_interval_secs, IP_MONITOR_CHECK_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn test_ip_monitor_config_for_runtime_live_halts() {
+        let cfg = IpMonitorConfig::for_runtime("1.2.3.4".to_string(), false);
+        assert!(cfg.enabled);
+        assert!(cfg.halt_on_mismatch, "dry_run=false (live) MUST halt");
+    }
+
+    #[test]
+    fn test_ip_monitor_action_variants_distinct() {
+        assert_ne!(IpMonitorAction::Continue, IpMonitorAction::AlertOnly);
+        assert_ne!(IpMonitorAction::AlertOnly, IpMonitorAction::AlertAndHalt);
+        assert_ne!(IpMonitorAction::Continue, IpMonitorAction::AlertAndHalt);
+    }
+
+    // -----------------------------------------------------------------------
     // IpCheckResult
     // -----------------------------------------------------------------------
 
@@ -723,6 +941,8 @@ mod tests {
             check_interval_secs: 1,
             expected_ip: String::new(),
             enabled: true,
+            confirm_threshold: IP_MONITOR_MISMATCH_CONFIRM_THRESHOLD,
+            halt_on_mismatch: false,
         };
         let (rx, handle) = spawn_ip_monitor(config, shutdown_rx);
 

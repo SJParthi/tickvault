@@ -199,6 +199,33 @@ mod tests {
         late_policy: LatePolicy::Refold,
     };
 
+    /// Coverage-friendly outcome extractor: BOTH arms are exercised
+    /// (`test_outcome_extractors_reject_non_matching_variants` covers the
+    /// `None` arm), so seal-asserting tests carry no unreachable
+    /// multi-line `panic!` arm that llvm-cov flags as a missed line.
+    fn as_sealed(out: FoldOutcome) -> Option<FoldedCandle> {
+        match out {
+            FoldOutcome::Sealed(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// See [`as_sealed`] — same coverage rationale for `AmendedLate`.
+    fn as_amended(out: FoldOutcome) -> Option<FoldedCandle> {
+        match out {
+            FoldOutcome::AmendedLate(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn test_outcome_extractors_reject_non_matching_variants() {
+        assert!(as_sealed(FoldOutcome::Discarded).is_none());
+        assert!(as_sealed(FoldOutcome::Updated).is_none());
+        assert!(as_amended(FoldOutcome::Discarded).is_none());
+        assert!(as_amended(FoldOutcome::Updated).is_none());
+    }
+
     // ── GOLDEN: the common cell reproduces the existing Groww1mAggregator EXACTLY
     // (same scenarios + values as crates/core/src/feed/groww/aggregator_1m.rs tests),
     // so Groww can switch to this cell with provably-identical candles. ──
@@ -225,9 +252,7 @@ mod tests {
         let mut cell = OneMinFoldCell::new(M1, 100.0, 100, 100); // baseline 100
         cell.consume(M1 + 30_000_000_000, 110.0, 150, DISCARD); // fold, last cum 150
         let out = cell.consume(M1 + NANOS_PER_MINUTE, 111.0, 170, DISCARD);
-        let FoldOutcome::Sealed(sealed) = out else {
-            panic!("expected seal")
-        };
+        let sealed = as_sealed(out).expect("expected seal");
         assert_eq!(sealed.minute_start_ist_nanos, M1);
         assert_eq!(sealed.open, 100.0);
         assert_eq!(sealed.high, 110.0);
@@ -253,9 +278,7 @@ mod tests {
         // Groww test_volume_saturates_at_zero_on_cumulative_reset.
         let mut cell = OneMinFoldCell::new(M1, 100.0, 1_000, 1_000);
         let out = cell.consume(M1 + NANOS_PER_MINUTE, 100.0, 5, DISCARD);
-        let FoldOutcome::Sealed(sealed) = out else {
-            panic!("seal")
-        };
+        let sealed = as_sealed(out).expect("seal");
         assert_eq!(sealed.volume, 0, "saturated, never negative");
     }
 
@@ -265,16 +288,12 @@ mod tests {
     fn test_refold_amends_one_bucket_late_tick() {
         let mut cell = OneMinFoldCell::new(M1, 100.0, 100, 100);
         // Seal minute 1 by crossing into minute 2.
-        let FoldOutcome::Sealed(sealed) = cell.consume(M1 + NANOS_PER_MINUTE, 90.0, 100, REFOLD)
-        else {
-            panic!("seal")
-        };
+        let sealed_out = cell.consume(M1 + NANOS_PER_MINUTE, 90.0, 100, REFOLD);
+        let sealed = as_sealed(sealed_out).expect("seal");
         assert_eq!(sealed.high, 100.0);
         // A minute-1 tick arrives 1 bucket late with a NEW high → re-fold + re-emit.
         let out = cell.consume(M1, 120.0, 100, REFOLD);
-        let FoldOutcome::AmendedLate(amended) = out else {
-            panic!("expected amend")
-        };
+        let amended = as_amended(out).expect("expected amend");
         assert_eq!(amended.minute_start_ist_nanos, M1);
         assert_eq!(
             amended.high, 120.0,

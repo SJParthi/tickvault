@@ -109,6 +109,26 @@ Environment=RUST_LOG=info
 # live trading is a separate, deliberate change (set dry_run=false +
 # mode=live AND re-register the static EIP). See config/production.toml.
 Environment=TV_ENVIRONMENT=prod
+# AWS SDK credentials: pin the default provider chain straight to the EC2
+# instance-profile (IMDS) credentials — the ONLY intended credential source on
+# the box (SSM reads, and the CloudWatch metrics pipeline that fills the
+# Tickvault/Prod namespace).
+#
+# Root cause (live incident 2026-07-02): this unit hardens with
+# ProtectHome=true (below), which masks /home for the service. The AWS SDK's
+# default profile-file probe of ~/.aws/config + ~/.aws/credentials
+# (HOME=/home/ec2-user under User=ec2-user) therefore fails with EACCES and
+# logs "failed to read config file ... Permission denied" on every boot.
+# On the pinned Rust SDK (aws-runtime 1.7.5, src/env_config/source.rs — the
+# "default config/credentials files MUST NOT return an error" arm) that is a
+# warn-and-treat-as-empty, but the probe is pure noise/ambiguity, and every
+# CHILD process this unit spawns (e.g. the Groww sidecar's boto3) inherits
+# this environment with its own, stricter, profile-file handling. Pointing
+# both files at /dev/null removes the unreadable-file probe entirely: the
+# chain resolves env -> (empty profile) -> IMDS instance profile
+# deterministically, with zero dependency on any on-disk ~/.aws state.
+Environment=AWS_CONFIG_FILE=/dev/null
+Environment=AWS_SHARED_CREDENTIALS_FILE=/dev/null
 # GROWW_MAX_SUBSCRIBE caps the first-run Groww subscription set. Default in code
 # is 60 (subset-safe); set to 1000 here to subscribe the FULL ~779-instrument
 # Groww universe (NTM-union: indices + F&O underlyings + NIFTY-Total-Market
