@@ -1,7 +1,8 @@
 # Implementation Plan: Comprehensive Operator Dashboard Page at `/dashboard`
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-06-29
+**Reconciled:** 2026-07-02 — audit verified the single item shipped on origin/main; checkbox was stale.
 **Approved by:** Parthiban (operator) — 2026-06-29 ("fix everything dude", in direct
 response to me listing "Part 2 — the full everything dashboard page").
 
@@ -162,7 +163,7 @@ needed (reuses already-tested `/api/feeds`, `/api/feeds/health`, `/api/stats`,
 
 ## Plan Items
 
-- [ ] **Item 1 — Comprehensive operator dashboard page at `/dashboard`**
+- [x] **Item 1 — Comprehensive operator dashboard page at `/dashboard`** — DONE on main: `crates/api/src/handlers/dashboard_page.rs` (`DASHBOARD_HTML`) + router wiring in `crates/api/src/lib.rs`
   - Files:
     - `crates/api/src/handlers/dashboard_page.rs` (NEW — `const DASHBOARD_HTML`
       + `dashboard_page()` handler + `root_redirect()` handler + tests)
