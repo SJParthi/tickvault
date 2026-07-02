@@ -1,11 +1,21 @@
 """Operator portal Lambda — ONE URL to run the whole product (VIEW + CONTROL).
 
 Open the Function URL in a browser and you get a device-locked mission-control
-page with tabs: Overview (box status + control), Data (live metrics + a QuestDB
-query box), DB (READ-ONLY database console: tables list + columns + query grid
-+ CSV download — writes blocked server-side), GitHub (open PRs + CI status +
-merge + trigger deploy), Logs (live error/app tail), and AWS (CloudWatch alarms
-+ month-to-date cost).
+page with THREE tabs (2026-07-02 redesign — operator: "webpage looks completely
+messy, too many buttons"):
+  * Overview — box status, ticks hero, ticks/sec sparkline, guarantees shields
+    (greyed to a single "box stopped" banner when the instance is off), feed
+    toggles, a thin AWS strip (spend / alarms / disk, click-to-expand), a
+    compact latency card, and ONE context-aware Start/Stop instance button.
+  * Data — candles per timeframe, the daily cross-verify result, and the
+    READ-ONLY database console (tables + columns + query grid + CSV download —
+    writes blocked server-side).
+  * Admin — restart/stop app + QuestDB, a COLLAPSED danger zone (severity
+    picker over the four wipes, each with its own typed confirm token), and
+    the device lock.
+The former GitHub + Logs tabs are gone. The `logs` API action is KEPT (the
+tickvault-logs MCP server POSTs {"action":"logs"}); the gh_* actions had no
+caller outside the deleted tab and are removed.
 
 ONE URL, two layers:
   * `GET  /` → serves the portal HTML. PUBLIC shell with ZERO secrets — it just
@@ -17,11 +27,9 @@ ONE URL, two layers:
 
 SECURITY MODEL (deliberately strict — this can stop a live trading box):
 * Bearer secret from SSM SecureString /tickvault/<env>/operator/control-secret.
-* GitHub actions use a fine-grained PAT from SSM
-  /tickvault/<env>/operator/github-token, scoped to this one repo. Never in the
-  page, never in env, never in Terraform state.
 * IAM scoped to exactly this instance + read-only CloudWatch/CostExplorer +
-  the two SSM secrets. Nothing else.
+  the SSM secret. Nothing else. (The former GitHub-PAT read went with the
+  GitHub tab; Terraform may still set OPERATOR_GITHUB_TOKEN_PARAM — ignored.)
 * Destructive box actions (stop/reboot/restart-app/stop-app) are blocked during
   market hours (09:15-15:30 IST Mon-Fri) unless {"force": true}.
 * The SQL box is READ-ONLY: only SELECT/SHOW/EXPLAIN/WITH are accepted; any
@@ -35,15 +43,10 @@ import hmac
 import json
 import os
 import time
-import urllib.error
-import urllib.request
 
 REGION = os.environ.get("AWS_REGION", "ap-south-1")
 INSTANCE_ID = os.environ.get("TV_INSTANCE_ID", "")
-GH_REPO = os.environ.get("GH_REPO", "SJParthi/tickvault")
-GH_DEPLOY_WORKFLOW = os.environ.get("GH_DEPLOY_WORKFLOW", "deploy-aws.yml")
 _SECRET_PARAM = os.environ.get("OPERATOR_CONTROL_SECRET_PARAM", "")
-_GH_TOKEN_PARAM = os.environ.get("OPERATOR_GITHUB_TOKEN_PARAM", "")
 
 # Lazy-init boto3 clients so the pure-function tests run without boto3 installed.
 _clients: dict[str, object] = {}
@@ -81,10 +84,6 @@ def _cached_param(param: str) -> str:
 
 def _control_secret() -> str:
     return _cached_param(_SECRET_PARAM)
-
-
-def _github_token() -> str:
-    return _cached_param(_GH_TOKEN_PARAM)
 
 
 # Destructive box actions blocked during market hours unless force=true.
@@ -288,6 +287,24 @@ _VIEW_COMMANDS = [
     # upsertKey column; received_at/payload_hash are stored columns only).
     'echo "DEDUP_KEYS=$(curl -fsS "${Q}SELECT%20count()%20FROM%20table_columns(%27ticks%27)%20WHERE%20upsertKey%3Dtrue" 2>/dev/null | tail -1)"',
     'echo "MAX_TPS=$(curl -fsS "${Q}SELECT%20max(c)%20FROM%20(SELECT%20count()%20c%20FROM%20ticks%20WHERE%20ts%20IN%20today()%20GROUP%20BY%20ts,security_id)" 2>/dev/null | tail -1)"',
+    # Tick-conservation shield inputs (audit fix #1, 2026-07-02 — kills the
+    # false-OK ">1 tick/sec == no tick lost" heuristic):
+    #  * CONSERVE — the latest tick_conservation_audit rows (last ~2 days, per
+    #    feed; the 15:40 IST daily audit per
+    #    .claude/rules/project/tick-conservation-audit-error-codes.md). CSV
+    #    header skipped, rows ';'-joined (same convention as TICKS_BY_FEED).
+    #    Table absent on a fresh box → curl -f fails → empty value → the UI
+    #    shows "no audit yet", NEVER a fabricated green.
+    #  * WS_DISC — count of TODAY's in-market socket drops. event_kind
+    #    'disconnected' is the app's own market-hours disconnect class
+    #    (off-hours drops are stamped 'disconnected_off_hours' — see
+    #    crates/common/src/ws_event_types.rs), so this IS the 09:15-15:30 IST
+    #    filter, applied at write time by the app itself. Any such drop means
+    #    upstream ticks in that window never reached the box — the shield can
+    #    never claim green "no tick lost" for today. `=` encoded as %3D per
+    #    the DEDUP_KEYS lesson above.
+    'echo "CONSERVE=$(curl -fsS "${Q}SELECT%20feed%2C%20trading_date_ist%2C%20delivery_residual%2C%20outcome_residual%2C%20partial_coverage%2C%20outcome%20FROM%20tick_conservation_audit%20WHERE%20ts%20%3E%20dateadd(%27d%27%2C%20-2%2C%20now())%20ORDER%20BY%20ts%20DESC%20LIMIT%208" 2>/dev/null | tail -n +2 | tr \'\\n\' \';\')"',
+    'echo "WS_DISC=$(curl -fsS "${Q}SELECT%20count()%20FROM%20ws_event_audit%20WHERE%20ts%20IN%20today()%20AND%20event_kind%3D%27disconnected%27" 2>/dev/null | tail -1)"',
     'echo "ERRORS_BEGIN"',
     "journalctl -u tickvault -p err -n 5 --no-pager 2>/dev/null | tail -5 || true",
     'echo "ERRORS_END"',
@@ -344,8 +361,145 @@ def _parse_view(stdout: str) -> dict:
         },
         "dedup_key_columns": fields.get("DEDUP_KEYS", ""),
         "max_ticks_per_second": fields.get("MAX_TPS", ""),
+        "conservation_rows": _parse_conserve_rows(fields.get("CONSERVE", "")),
+        "ws_disconnects_today": fields.get("WS_DISC", ""),
         "recent_errors": errors,
     }
+
+
+# ------------------------------------------------- tick-conservation shield
+# Audit fix #1 (2026-07-02): the old "No tick lost" shield was a >1-tick/sec
+# LIVENESS heuristic — it showed WORKING ✅ through a mid-market crash-loop
+# where upstream ticks were genuinely lost (a false-OK, banned by
+# audit-findings Rule 11). The shield is now a 3-source honest composite:
+#   a. the 15:40 IST tick_conservation_audit verdict (balanced/leak/partial +
+#      the two residuals) — the end-to-end WAL-vs-processed-vs-outcome proof
+#      (.claude/rules/project/tick-conservation-audit-error-codes.md);
+#   b. TODAY's in-market ws_event_audit 'disconnected' count — any drop means
+#      Dhan-sent ticks in that window never REACHED the box, so green is
+#      impossible for today (the honest capture-at-receipt envelope);
+#   c. live ticks/sec — kept ONLY as a decorating label when a+b are clean.
+# Classification precedence (ratcheted by test_handler.py):
+#   residual (RED) > partial (AMBER) > disconnects-today (AMBER) > balanced
+#   (GREEN) > no-audit/idle/unreachable. A tick rate ALONE can never go green.
+
+# The honest-envelope sentence surfaced as the shield tooltip (task 3).
+_CONSERVATION_ENVELOPE = (
+    "Proves every tick that REACHED the box is stored. Ticks Dhan sent during "
+    "a disconnect window never arrived and are outside this proof."
+)
+
+
+def _parse_conserve_rows(raw: str) -> list:
+    """Parse the CONSERVE value — ';'-joined QuestDB /exp CSV rows like
+    '"dhan","2026-07-01T00:00:00.000000Z",0,0,false,"balanced"' — into a list
+    of dicts. Pure. Malformed fragments are skipped; empty/absent input (table
+    missing on a fresh box, QuestDB down) yields [] — the classifier then
+    reports "no audit yet"/"unreachable", never a fabricated verdict."""
+    rows: list = []
+    for part in (raw or "").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        cells = [c.strip().strip('"') for c in part.split(",")]
+        if len(cells) != 6:
+            continue
+        feed, tdate, dres, ores, partial, outcome = cells
+        try:
+            drow = {
+                "feed": feed,
+                "date": tdate[:10],  # trading_date_ist → YYYY-MM-DD
+                "delivery_residual": int(dres),
+                "outcome_residual": int(ores),
+                "partial_coverage": partial.lower() == "true",
+                "outcome": outcome.lower(),
+            }
+        except ValueError:
+            continue
+        if drow["feed"] and len(drow["date"]) == 10:
+            rows.append(drow)
+    return rows
+
+
+def _classify_tick_conservation(rows: list, disconnects_raw: str, market_hours: bool, max_tps_raw: str) -> dict:
+    """The shield's state machine (pure — one unit test per state).
+
+    | state        | colour | when                                              |
+    |--------------|--------|---------------------------------------------------|
+    | residual     | RED    | latest audit day has residual>0 or outcome=leak   |
+    | partial      | AMBER  | latest audit day has partial_coverage/partial     |
+    | disconnects  | AMBER  | ≥1 in-market socket drop TODAY (ws_event_audit)   |
+    | balanced     | GREEN  | audit balanced AND zero drops today               |
+    | no_audit     | AMBER  | market open, no audit row yet — NEVER green       |
+    | idle         | grey-ok| market closed, no audit row, QuestDB reachable    |
+    | unreachable  | AMBER  | neither source answered (QuestDB/box down)        |
+
+    Only the latest trading day's rows count (one per feed, newest first —
+    the CONSERVE query is ORDER BY ts DESC). tps decorates the balanced label
+    only; it can no longer produce green by itself (the old false-OK)."""
+    try:
+        disconnects = int(str(disconnects_raw or "").strip())
+    except ValueError:
+        disconnects = None
+    try:
+        tps = int(str(max_tps_raw or "").strip())
+    except ValueError:
+        tps = 0
+
+    latest: list = []
+    if rows:
+        latest_date = max(r["date"] for r in rows)
+        seen_feeds: set = set()
+        for r in rows:  # newest first — keep the latest row per feed
+            if r["date"] == latest_date and r["feed"] not in seen_feeds:
+                seen_feeds.add(r["feed"])
+                latest.append(r)
+
+    def _result(state: str, label: str, good: bool, cls: str) -> dict:
+        return {
+            "state": state,
+            "label": label,
+            "good": good,
+            "cls": cls,
+            "audit_date": latest[0]["date"] if latest else "",
+            "disconnects_today": disconnects,
+            "envelope": _CONSERVATION_ENVELOPE,
+        }
+
+    # 1. RESIDUAL — ticks delivered to the box but unaccounted. Hard red.
+    residual_rows = [
+        r
+        for r in latest
+        if r["delivery_residual"] > 0 or r["outcome_residual"] > 0 or r["outcome"] == "leak"
+    ]
+    if residual_rows:
+        n = sum(max(r["delivery_residual"], 0) + max(r["outcome_residual"], 0) for r in residual_rows)
+        return _result("residual", f"RESIDUAL: {n} ❌ ({latest[0]['date']})", False, "bad")
+    # 2. PARTIAL — the audit could not vouch for the full session (mid-day boot
+    #    / a source missing). Honest "cannot vouch", never a false OK.
+    if any(r["partial_coverage"] or r["outcome"] == "partial" for r in latest):
+        return _result("partial", f"partial coverage ⚠ — mid-day restart ({latest[0]['date']})", False, "warn")
+    # 3. DISCONNECTS TODAY — socket-down evidence outranks yesterday's clean
+    #    audit: upstream ticks in those windows are outside the capture proof.
+    if disconnects is not None and disconnects > 0:
+        return _result(
+            "disconnects",
+            f"{disconnects} disconnect(s) today ⚠ — upstream ticks in those windows are unverifiable",
+            False,
+            "warn",
+        )
+    # 4. BALANCED — audit vouches, zero drops today. Liveness decorates only.
+    if latest:
+        if market_hours and tps > 1:
+            return _result("balanced", f"BALANCED ✅ · capturing ({tps} ticks/sec)", True, "ok")
+        return _result("balanced", f"BALANCED ✅ (audit {latest[0]['date']})", True, "ok")
+    # 5. No audit rows at all.
+    if disconnects is None:
+        # Neither source answered — QuestDB (or the box) is unreachable.
+        return _result("unreachable", "unreachable", False, "warn")
+    if not market_hours:
+        return _result("idle", "idle (market closed)", True, "ok")
+    return _result("no_audit", "no audit yet ⚠ (daily audit runs 15:40 IST)", False, "warn")
 
 
 # ----------------------------------------------------------------- latency snap
@@ -958,58 +1112,6 @@ def _wipe_groww_commands() -> list[str]:
     ]
 
 
-# ---------------------------------------------------------------- GitHub helper
-def _gh(method: str, path: str, body: dict | None = None) -> tuple[int, object]:
-    """Minimal GitHub REST call using urllib (no deps). Returns (status, json)."""
-    token = _github_token()
-    if not token:
-        return 0, {"error": "github token not configured"}
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request("https://api.github.com" + path, data=data, method=method)
-    req.add_header("authorization", "Bearer " + token)
-    req.add_header("accept", "application/vnd.github+json")
-    req.add_header("x-github-api-version", "2022-11-28")
-    req.add_header("user-agent", "tickvault-operator-console")
-    if data is not None:
-        req.add_header("content-type", "application/json")
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:  # noqa: S310 — fixed host
-            txt = r.read().decode() or "{}"
-            return r.status, (json.loads(txt) if txt.strip() else {})
-    except urllib.error.HTTPError as e:
-        try:
-            return e.code, json.loads(e.read().decode() or "{}")
-        except Exception:  # noqa: BLE001
-            return e.code, {"error": "github http error"}
-    except Exception:  # noqa: BLE001
-        return 0, {"error": "github request failed"}
-
-
-def _gh_open_prs() -> list[dict]:
-    """List open PRs with their head-commit CI rollup. Top 10, newest first."""
-    st, prs = _gh("GET", f"/repos/{GH_REPO}/pulls?state=open&per_page=10&sort=created&direction=desc")
-    if st != 200 or not isinstance(prs, list):
-        return []
-    out = []
-    for pr in prs[:10]:
-        sha = (pr.get("head") or {}).get("sha", "")
-        ci = "unknown"
-        if sha:
-            cst, cs = _gh("GET", f"/repos/{GH_REPO}/commits/{sha}/status")
-            if cst == 200 and isinstance(cs, dict):
-                ci = cs.get("state", "unknown")  # success | pending | failure
-        out.append(
-            {
-                "number": pr.get("number"),
-                "title": pr.get("title", ""),
-                "draft": bool(pr.get("draft")),
-                "mergeable_state": pr.get("mergeable_state", ""),
-                "ci": ci,
-            }
-        )
-    return out
-
-
 # --------------------------------------------------------------------- response
 def _resp(status: int, body: dict) -> dict:
     return {"statusCode": status, "headers": {"content-type": "application/json"}, "body": json.dumps(body)}
@@ -1364,9 +1466,18 @@ def lambda_handler(event, _context):
             # then taps ▶ Start. _ssm_shell_sync also fails-soft, but skipping
             # avoids a pointless ~6s wait.
             snap = _parse_view(_ssm_shell_sync(_VIEW_COMMANDS) if state == "running" else "")
+            mh = _is_market_hours(datetime.datetime.utcnow())
+            # Server-side classification (pure, unit-tested) — the UI renders
+            # the verdict verbatim; it can no longer invent green from a rate.
+            snap["tick_conservation"] = _classify_tick_conservation(
+                snap.get("conservation_rows", []),
+                snap.get("ws_disconnects_today", ""),
+                mh,
+                snap.get("max_ticks_per_second", ""),
+            )
             return _resp(
                 200,
-                {"ok": True, "action": "view", "instance_state": state, "market_hours": _is_market_hours(datetime.datetime.utcnow()), **snap},
+                {"ok": True, "action": "view", "instance_state": state, "market_hours": mh, **snap},
             )
         if action == "sql":
             # READ-ONLY console query (Data tab box + DB tab). Writes are
@@ -1437,20 +1548,10 @@ def lambda_handler(event, _context):
                 },
             )
 
-        # ---- github ----
-        if action == "gh_prs":
-            # gh_configured=False lets the UI say "token not set" instead of the
-            # misleading "no open PRs 🎉" when the github-token SSM param is absent.
-            return _resp(200, {"ok": True, "action": action, "prs": _gh_open_prs(), "repo": GH_REPO, "gh_configured": bool(_github_token())})
-        if action == "gh_merge":
-            n = int(payload.get("number", 0))
-            if n <= 0:
-                return _resp(400, {"error": "missing PR number"})
-            st, body = _gh("PUT", f"/repos/{GH_REPO}/pulls/{n}/merge", {"merge_method": "squash"})
-            return _resp(200, {"ok": st in (200, 201), "action": action, "status": st, "merged": isinstance(body, dict) and body.get("merged", False)})
-        if action == "gh_deploy":
-            st, _b = _gh("POST", f"/repos/{GH_REPO}/actions/workflows/{GH_DEPLOY_WORKFLOW}/dispatches", {"ref": "main"})
-            return _resp(200, {"ok": st in (201, 204), "action": action, "status": st})
+        # (gh_prs / gh_merge / gh_deploy removed 2026-07-02 with the GitHub tab —
+        # no caller existed outside the deleted tab UI. The `logs` action above
+        # is KEPT even though its tab is gone: the tickvault-logs MCP server's
+        # cloudwatch_logs tool POSTs {"action":"logs"} to this portal.)
 
         # ---- aws ----
         if action == "aws_status":
@@ -1558,6 +1659,13 @@ def _console_html() -> str:
   @keyframes pop{ from{opacity:0; transform:scale(.94)} to{opacity:1} }
   .shield .ttl{ font-size:12px; color:var(--mut); } .shield .st{ font-size:17px; font-weight:800; margin-top:5px; }
   .shield.good{ border-color:#1d5b3d; box-shadow:0 0 18px #28d17c22; } .shield.bad{ border-color:#5b2330; box-shadow:0 0 18px #ff5d6c22; }
+  .shield.idle{ border-color:var(--line); box-shadow:none; opacity:.55; } .shield.idle .st{ color:var(--mut); }
+  .banner{ border:1px solid #3a3110; background:#141207; color:var(--amb); border-radius:12px; padding:12px 14px;
+           font-size:13px; margin-bottom:10px; }
+  details.fold>summary{ cursor:pointer; list-style:none; } details.fold>summary::-webkit-details-marker{ display:none; }
+  .strip{ display:flex; gap:14px; flex-wrap:wrap; align-items:center; font-size:13px; font-weight:700; }
+  .danger-opt{ display:flex; gap:10px; align-items:flex-start; margin:12px 0; cursor:pointer; }
+  .danger-opt input{ width:auto; margin-top:3px; }
   .spark{ width:100%; height:70px; display:block; }
   .ok{ color:var(--grn);} .bad{ color:var(--red);} .warn{ color:var(--amb);} .cy{ color:var(--cyan);}
   .muted{ color:var(--mut); font-size:12px; }
@@ -1601,11 +1709,7 @@ def _console_html() -> str:
     <div class="tabs">
       <div class="tab active" data-t="overview" onclick="tab('overview')">📊 Overview</div>
       <div class="tab" data-t="data" onclick="tab('data')">📈 Data</div>
-      <div class="tab" data-t="db" onclick="tab('db')">🗄️ DB</div>
-      <div class="tab" data-t="github" onclick="tab('github')">🔀 GitHub</div>
-      <div class="tab" data-t="logs" onclick="tab('logs')">📜 Logs</div>
-      <div class="tab" data-t="aws" onclick="tab('aws')">☁️ AWS</div>
-      <div class="tab" data-t="latency" onclick="tab('latency')">⚡ Latency</div>
+      <div class="tab" data-t="admin" onclick="tab('admin')">🛠️ Admin</div>
     </div>
 
     <!-- OVERVIEW -->
@@ -1620,40 +1724,46 @@ def _console_html() -> str:
             <div class="pill"><div class="v" id="p_tps">—</div><div class="k">peak ticks/sec</div></div>
           </div>
         </div>
-        <div class="row" style="margin-top:14px"><button class="b-blu" id="refbtn" onclick="loadOverview()">🔄 Refresh now</button></div>
-        <div style="display:flex;align-items:center;gap:14px;margin-top:10px">
+        <div class="row" style="margin-top:14px">
+          <button class="b-blu" id="refbtn" onclick="loadOverview()">🔄 Refresh now</button>
+          <button class="b-go" id="instbtn" onclick="instAct()" hidden>▶ Start instance</button>
+        </div>
+        <div style="display:flex;align-items:center;gap:14px;margin-top:10px;flex-wrap:wrap">
           <label class="switch"><input type="checkbox" id="auto" checked onchange="autotoggle()"> auto-refresh (8s)</label>
+          <label class="switch"><input type="checkbox" id="force_inst"> force (override market-hours guard)</label>
           <span class="muted" id="updated"></span>
         </div>
+        <div class="muted" style="margin-top:8px">One button, context-aware: ▶ Start when the box is stopped, ■ Stop when it is running. Stop is blocked 9:15 AM–3:30 PM IST Mon–Fri unless force is ticked.</div>
+      </div>
+      <div class="card">
+        <details class="fold" id="awsdetails">
+          <summary><div class="lbl" style="margin-bottom:6px">aws — tap to expand alarms + storage</div>
+            <div class="strip" id="awsstrip"><span class="muted">not loaded yet</span></div></summary>
+          <div class="row" style="margin:12px 0"><button class="b-ghost mini" onclick="loadAws()">🔄 Refresh AWS</button></div>
+          <div id="alarms"></div>
+          <div class="lbl" style="margin-top:14px">storage — disk space &amp; database size (on the box)</div>
+          <div class="shields" id="storage"></div>
+          <div class="muted" style="margin-top:8px">EBS auto-archives partitions &gt;90d to S3, and grows online — so it won't fill. Watch "DB size" climb day-by-day to see your GB/day. (Shows — when the box is stopped.)</div>
+        </details>
       </div>
       <div class="card"><div class="lbl">live ticks/sec — proof no sub-second tick is lost</div>
         <svg class="spark" id="spark" viewBox="0 0 300 70" preserveAspectRatio="none"></svg></div>
-      <div class="card"><div class="lbl">guarantees — live proof read from the box</div><div class="shields" id="shields"></div></div>
+      <div class="card"><div class="lbl">guarantees — live proof read from the box</div>
+        <div class="banner" id="stoppedbanner" hidden>⏸ Box stopped (auto-stops 16:30 IST, auto-starts 08:30 Mon–Fri) — guarantees resume on start.</div>
+        <div class="shields" id="shields"></div></div>
       <div class="card"><div class="lbl">feeds — live market-data sources (toggle on/off)</div>
         <div class="row" style="margin-bottom:10px"><button class="b-blu" onclick="loadFeeds()">🔄 Load feeds</button></div>
         <div id="feeds"><span class="muted">not loaded yet</span></div>
         <div class="muted" id="feedsmsg" style="margin-top:8px"></div>
         <div class="muted" style="margin-top:6px">Every feed the app reports appears here automatically (a future feed #3 needs zero portal changes). Turning a feed OFF asks for confirmation; disabling Dhan during live trading is refused by the app itself.</div>
       </div>
-      <div class="card"><div class="lbl">control</div>
-        <div class="row" style="margin-bottom:10px">
-          <button class="b-go" onclick="act('start')">▶ Start instance</button>
-          <button class="b-amb" onclick="act('restart-app')">♻ Restart app</button>
-          <button class="b-amb" onclick="act('restart-questdb')">♻ Restart QuestDB</button></div>
-        <div class="row">
-          <button class="b-stop" onclick="act('stop')">⏹ Stop instance</button>
-          <button class="b-stop" onclick="act('stop-app')">⏹ Stop app</button></div>
-        <div class="muted" style="margin-top:10px">Stop / restart are blocked 9:15 AM–3:30 PM IST Mon–Fri.</div>
-        <label class="switch" style="margin-top:8px"><input type="checkbox" id="force"> force (override market-hours guard)</label>
-        <div class="row" style="margin-top:18px"><button class="b-stop" onclick="wipeData()">🗑️ Wipe ALL data → fresh start</button></div>
-        <div class="muted" style="margin-top:6px">Deletes every tick &amp; candle in ALL timeframe tables for BOTH feeds (Dhan + Groww + any future feed) AND their capture/replay files (Groww capture file, Dhan WAL, spill, dlq) so NOTHING resurrects after restart — audit tables kept. Run when the box is RUNNING; next session = fresh data. Asks you to type WIPE.</div>
-        <div class="row" style="margin-top:18px"><button class="b-amb" onclick="wipeGroww()">🧹 Wipe GROWW data only</button></div>
-        <div class="muted" style="margin-top:6px">Surgical per-feed wipe: deletes every <b>groww</b> tick &amp; candle from every timeframe table (per-table rewrite — the DB can't delete rows in place) AND the groww capture file + offsets so nothing resurrects. <b>Dhan data untouched. Audit tables kept (SEBI).</b> Box must be RUNNING. Asks you to type GROWW.</div>
-        <div class="row" style="margin-top:18px"><button class="b-stop" onclick="dockerReset()">💥 Full Docker reset → wipe EVERYTHING</button></div>
-        <div class="muted" style="margin-top:6px">⚠️ NUCLEAR: deletes Docker containers + volumes + images and rebuilds from scratch. Wipes <b>ALL</b> data INCLUDING the SEBI-retention audit tables. Box must be RUNNING. Asks you to type NUKE.</div>
-        <div class="row" style="margin-top:18px"><button class="b-stop" onclick="bareNuke()">☢️ Bare Nuke → delete ALL &amp; leave EMPTY</button></div>
-        <div class="muted" style="margin-top:6px">☢️ Like Docker Desktop "delete all": removes <b>every</b> container + image + volume and does <b>NOT</b> rebuild — the box is left completely bare with <b>nothing running</b> (trading OFF until you redeploy). Asks you to type ERASE.</div>
-        <div class="row" style="margin-top:14px"><button class="b-ghost" onclick="lock()">🔒 Lock / forget this device</button></div>
+      <div class="card"><div class="lbl">latency — measured live on the box</div>
+        <div class="row" style="margin-bottom:12px"><button class="b-blu" onclick="loadLatency()">⚡ Measure now</button></div>
+        <div class="shields" id="latnet"></div>
+        <div class="shields" id="latproc" style="margin-top:10px"></div>
+        <div class="muted" id="lattick" style="margin-top:10px"></div>
+        <div class="muted" style="margin-top:6px">Takes ~15s (live probe on the box). Budgets: tick parse ≤10 ns · full tick process ≤10 µs · order ≤100 ns.
+          Dhan's exchange timestamp is 1-second granular, so the win is low, steady arrival — not microsecond co-location.</div>
       </div>
     </section>
 
@@ -1665,16 +1775,6 @@ def _console_html() -> str:
         <div class="shields" id="cvshields"></div>
         <div class="muted" id="cvnote" style="margin-top:8px"></div>
       </div>
-      <div class="card"><div class="lbl">QuestDB query (read-only)</div>
-        <textarea id="sql" placeholder="SELECT ts, security_id, count() FROM ticks WHERE ts IN today() GROUP BY ts, security_id ORDER BY 3 DESC LIMIT 20"></textarea>
-        <div class="row" style="margin-top:10px"><button class="b-blu" onclick="runSql()">▶ Run query</button></div>
-        <div id="sqlout" style="margin-top:12px;overflow:auto"></div>
-        <div class="muted" style="margin-top:8px">Only SELECT / SHOW / EXPLAIN / WITH are allowed. Capped at 1000 rows. Full console in the DB tab.</div>
-      </div>
-    </section>
-
-    <!-- DB (read-only database console) -->
-    <section data-tab="db" hidden>
       <div class="card">
         <div class="lbl">database console &nbsp;<span class="badge unknown">READ-ONLY — writes are blocked server-side</span></div>
         <div style="display:flex;gap:16px;flex-wrap:wrap">
@@ -1699,52 +1799,34 @@ def _console_html() -> str:
       </div>
     </section>
 
-    <!-- GITHUB -->
-    <section data-tab="github" hidden>
-      <div class="card"><div class="lbl">github — <span id="ghrepo">repo</span></div>
-        <div class="row" style="margin-bottom:8px">
-          <button class="b-blu" onclick="loadGithub()">🔄 Load open PRs</button>
-          <button class="b-amb" onclick="ghDeploy()">🚀 Trigger deploy to AWS</button></div>
-        <div id="prs"></div>
-        <div class="muted" style="margin-top:8px">Merge = squash to main. Deploy runs the deploy-aws workflow on main.</div>
+    <!-- ADMIN -->
+    <section data-tab="admin" hidden>
+      <div class="card"><div class="lbl">app control</div>
+        <div class="row" style="margin-bottom:10px">
+          <button class="b-amb" onclick="act('restart-app')">♻ Restart app</button>
+          <button class="b-amb" onclick="act('restart-questdb')">♻ Restart QuestDB</button>
+          <button class="b-stop" onclick="act('stop-app')">⏹ Stop app</button></div>
+        <div class="muted" style="margin-top:10px">Stop / restart are blocked 9:15 AM–3:30 PM IST Mon–Fri.</div>
+        <label class="switch" style="margin-top:8px"><input type="checkbox" id="force"> force (override market-hours guard)</label>
       </div>
-    </section>
-
-    <!-- LOGS -->
-    <section data-tab="logs" hidden>
-      <div class="card"><div class="lbl">errors (last 40)</div>
-        <div class="row" style="margin-bottom:10px"><button class="b-blu" onclick="loadLogs()">🔄 Load logs</button></div>
-        <pre id="logErr">—</pre></div>
-      <div class="card"><div class="lbl">app log (last 40)</div><pre id="logApp">—</pre></div>
-    </section>
-
-    <!-- AWS -->
-    <section data-tab="aws" hidden>
-      <div class="card"><div class="lbl">aws</div>
-        <div class="row" style="margin-bottom:12px"><button class="b-blu" onclick="loadAws()">🔄 Load alarms + cost</button></div>
-        <div class="hero">
-          <div class="bignum"><div class="n" id="cost">$—</div><div class="c">AWS spend this month (USD)</div></div>
-          <div class="pills" style="grid-template-columns:1fr"><div class="pill"><div class="v" id="alarmcount">—</div><div class="k">alarms firing</div></div></div>
-        </div>
-        <div id="alarms" style="margin-top:12px"></div>
+      <div class="card">
+        <details class="fold" id="danger">
+          <summary><span class="lbl" style="display:inline">⚠️ danger zone — destructive data actions (tap to open)</span></summary>
+          <div class="muted" style="margin-top:10px">Pick ONE severity, then Execute. Every action still asks you to type its own confirm word — nothing fires from a mis-click.</div>
+          <label class="danger-opt"><input type="radio" name="danger" value="groww">
+            <span><b>🧹 Wipe GROWW data only</b> — <span class="muted">surgical per-feed wipe: deletes every <b>groww</b> tick &amp; candle from every timeframe table (per-table rewrite — the DB can't delete rows in place) AND the groww capture file + offsets so nothing resurrects. <b>Dhan data untouched. Audit tables kept (SEBI).</b> Box must be RUNNING. Asks you to type GROWW.</span></span></label>
+          <label class="danger-opt"><input type="radio" name="danger" value="wipe">
+            <span><b>🗑️ Wipe ALL data → fresh start</b> — <span class="muted">deletes every tick &amp; candle in ALL timeframe tables for BOTH feeds (Dhan + Groww + any future feed) AND their capture/replay files (Groww capture file, Dhan WAL, spill, dlq) so NOTHING resurrects after restart — audit tables kept. Run when the box is RUNNING; next session = fresh data. Asks you to type WIPE.</span></span></label>
+          <label class="danger-opt"><input type="radio" name="danger" value="nuke">
+            <span><b>💥 Full Docker reset → wipe EVERYTHING</b> — <span class="muted">⚠️ NUCLEAR: deletes Docker containers + volumes + images and rebuilds from scratch. Wipes <b>ALL</b> data INCLUDING the SEBI-retention audit tables. Box must be RUNNING. Asks you to type NUKE.</span></span></label>
+          <label class="danger-opt"><input type="radio" name="danger" value="erase">
+            <span><b>☢️ Bare Nuke → delete ALL &amp; leave EMPTY</b> — <span class="muted">☢️ Like Docker Desktop "delete all": removes <b>every</b> container + image + volume and does <b>NOT</b> rebuild — the box is left completely bare with <b>nothing running</b> (trading OFF until you redeploy). Asks you to type ERASE.</span></span></label>
+          <div class="row" style="margin-top:12px"><button class="b-stop" onclick="dangerExecute()">☠ Execute selected action</button></div>
+        </details>
       </div>
-      <div class="card"><div class="lbl">storage — disk space &amp; database size (on the box)</div>
-        <div class="shields" id="storage"></div>
-        <div class="muted" style="margin-top:8px">EBS auto-archives partitions &gt;90d to S3, and grows online — so it won't fill. Watch "DB size" climb day-by-day to see your GB/day. (Shows — when the box is stopped.)</div>
-      </div>
-    </section>
-
-    <!-- LATENCY -->
-    <section data-tab="latency" hidden>
-      <div class="card"><div class="lbl">latency — measured live on the box</div>
-        <div class="row" style="margin-bottom:12px"><button class="b-blu" onclick="loadLatency()">⚡ Measure now</button></div>
-        <div class="lbl" style="margin-top:4px">network — how fast each tick reaches us</div>
-        <div class="shields" id="latnet"></div>
-        <div class="lbl" style="margin-top:16px">processing — how fast we handle each tick</div>
-        <div class="shields" id="latproc"></div>
-        <div class="muted" id="lattick" style="margin-top:10px"></div>
-        <div class="muted" style="margin-top:6px">Budgets: tick parse ≤10 ns · full tick process ≤10 µs · order ≤100 ns.
-          Dhan's exchange timestamp is 1-second granular, so the win is low, steady arrival — not microsecond co-location.</div>
+      <div class="card"><div class="lbl">device</div>
+        <div class="row"><button class="b-ghost" onclick="lock()">🔒 Lock / forget this device</button></div>
+        <div class="muted" style="margin-top:8px">Forgets the operator key on THIS device — the portal locks until the key is pasted again.</div>
       </div>
     </section>
   </div>
@@ -1766,12 +1848,8 @@ function lock(){ TOKEN=''; localStorage.removeItem('tv_token'); $('tok').value='
 
 function tab(name){ curTab=name; document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.t===name));
   document.querySelectorAll('section[data-tab]').forEach(s=>s.hidden=s.dataset.tab!==name);
-  if(name==='github' && !$('prs').dataset.loaded) loadGithub();
   if(name==='data' && !$('cvshields').dataset.loaded) loadCrossVerify();
-  if(name==='db' && !$('dbtables').dataset.loaded) loadDbTables();
-  if(name==='aws' && !$('alarms').dataset.loaded) loadAws();
-  if(name==='latency' && !$('latnet').dataset.loaded) loadLatency();
-  if(name==='logs' && $('logErr').textContent==='—') loadLogs(); }
+  if(name==='data' && !$('dbtables').dataset.loaded) loadDbTables(); }
 
 async function call(action, extra){ if(!TOKEN){ toast('Locked'); return null; }
   try{ const r=await fetch(location.href,{method:'POST',
@@ -1799,10 +1877,23 @@ function bar(name,n,max){ const pct=max>0?Math.max(3,Math.round(100*n/max)):0;
   return '<div class="bar"><div class="name">'+name+'</div><div class="track"><div class="fill" style="width:'+pct+'%"></div></div><div class="num">'+n.toLocaleString()+'</div></div>'; }
 // Optional 4th arg picks the value colour explicitly: 'ok' green, 'warn' amber,
 // 'bad' red — so a critical state (red) is distinguishable from drift (amber).
-function shield(t,s,good,cls){ return '<div class="shield '+(good?'good':'bad')+'"><div class="ttl">'+t+'</div><div class="st '+(cls||(good?'ok':'warn'))+'">'+s+'</div></div>'; }
+// Optional 5th arg `tip` renders a hover tooltip (title attribute) — used by
+// the Tick-conservation shield to state its honest envelope.
+function shield(t,s,good,cls,tip){ return '<div class="shield '+(good?'good':'bad')+'"'+(tip?' title="'+esc(tip).replace(/"/g,'&quot;')+'"':'')+'><div class="ttl">'+t+'</div><div class="st '+(cls||(good?'ok':'warn'))+'">'+s+'</div></div>'; }
+// Greyed "box stopped" shield: neither good nor bad — the box is off, so the
+// guarantee is neither proven nor violated. Used ONLY when instance_state is
+// not 'running' (a RUNNING box with unreachable data keeps the REAL warnings).
+function shieldIdle(t){ return '<div class="shield idle"><div class="ttl">'+t+'</div><div class="st">—</div></div>'; }
 
 async function loadOverview(){ $('refbtn').innerHTML='<span class="spin">🔄</span> Refreshing…'; const j=await call('view'); $('refbtn').textContent='🔄 Refresh now'; if(!j) return;
   const appOk=j.app==='active', running=j.instance_state==='running'; setLive(appOk&&running);
+  // ONE context-aware instance button: ▶ Start when stopped, ■ Stop when
+  // running. Server-side market-hours guard on 'stop' is unchanged; the
+  // force checkbox next to it feeds through act().
+  instState=j.instance_state||'';
+  const ib=$('instbtn'); ib.hidden=false;
+  if(running){ ib.textContent='■ Stop instance'; ib.className='b-stop'; }
+  else{ ib.textContent='▶ Start instance'; ib.className='b-go'; }
   countUp($('ticksbig'), j.ticks_today||'0');
   $('p_inst').innerHTML='<span class="'+(running?'ok':'bad')+'">'+(j.instance_state||'?')+'</span>';
   $('p_app').innerHTML='<span class="'+(appOk?'ok':'bad')+'">'+(appOk?'up':(j.app||'down'))+'</span>';
@@ -1820,6 +1911,15 @@ async function loadOverview(){ $('refbtn').innerHTML='<span class="spin">🔄</s
   //   5 = OK (green) · 0 = DEDUP disabled entirely (RED — duplicate rows will
   //   accumulate) · any other number = schema drift (amber). A fetch failure
   //   (box/QuestDB unreachable) renders "unreachable" (amber), never a fake 0.
+  // Stopped box → ONE calm banner + greyed "—" shields instead of a scatter
+  // of scary per-shield "unreachable" warnings. Gated STRICTLY on
+  // instance_state!=='running' — a RUNNING box with unreachable data keeps
+  // the real unreachable/drift/disabled warnings below.
+  $('stoppedbanner').hidden=running;
+  if(!running){
+    $('shields').innerHTML=shieldIdle('Dedup key columns')+shieldIdle('Sub-second fix')+
+      shieldIdle('Tick conservation')+shieldIdle('Peak ticks / second');
+  } else {
   const dkRaw=String(j.dedup_key_columns||'').trim(), dkN=parseInt(dkRaw,10);
   const dkUnknown=(dkRaw===''||isNaN(dkN)), keysOk=dkN===5;
   let dkTxt,dkCls;
@@ -1828,11 +1928,24 @@ async function loadOverview(){ $('refbtn').innerHTML='<span class="spin">🔄</s
   else if(dkN===0){ dkTxt='0 — DEDUP disabled!'; dkCls='bad'; }
   else { dkTxt=dkRaw+' — schema drift (expected 5)'; dkCls='warn'; }
   const capOk=tpsN>1;
+  // Tick-conservation shield: the verdict is computed SERVER-SIDE from the
+  // 15:40 audit + today's ws_event_audit disconnects (audit fix #1 — the old
+  // ">1 tick/sec" liveness false-OK heuristic is gone). The UI renders the
+  // server verdict verbatim; the tooltip states the envelope.
+  const tc=j.tick_conservation||{state:'unreachable',label:'unreachable',good:false,cls:'warn',envelope:''};
   $('shields').innerHTML=shield('Dedup key columns',dkTxt,keysOk,dkCls)+
     shield('Sub-second fix',keysOk?'LIVE ✅':(dkUnknown?'unreachable':'OLD ⚠'),keysOk,dkUnknown?'warn':undefined)+
-    shield('No tick lost',capOk?'WORKING ✅':(j.market_hours?'CHECK ⚠':'idle'),capOk||!j.market_hours)+shield('Peak ticks / second',tpsN,capOk);
+    shield('Tick conservation',esc(tc.label||'unreachable'),!!tc.good,tc.cls||'warn',tc.envelope||'')+
+    shield('Peak ticks / second',tpsN,capOk);
+  }
   if(!$('feeds').dataset.loaded) loadFeeds();
+  if(!$('alarms').dataset.loaded) loadAws();
   $('updated').textContent='updated '+new Date().toLocaleTimeString(); }
+
+// The one context-aware instance action. 'start' is never market-hours
+// blocked server-side; 'stop' keeps the guard — force feeds through act().
+let instState='';
+function instAct(){ act(instState==='running'?'stop':'start','force_inst'); }
 
 // FEEDS card. Rendered by ITERATING the app's own per-feed list — primarily the
 // health response's `feeds` array (one row per feed the app knows about), with
@@ -1890,11 +2003,7 @@ function renderGrid(el,rows){ if(!rows.length){ el.innerHTML='<span class="muted
   for(let i=1;i<rows.length;i++) h+='<tr>'+rows[i].map(c=>'<td>'+esc(tcell(c))+'</td>').join('')+'</tr>';
   el.innerHTML=h+'</table>'; return rows.length-1; }
 
-async function runSql(){ const q=$('sql').value.trim(); if(!q){ toast('Type a query'); return; } $('sqlout').innerHTML='<span class="muted">running…</span>';
-  const j=await call('sql',{query:q}); if(!j){ $('sqlout').innerHTML=''; return; }
-  renderGrid($('sqlout'),parseCsv(j.csv)); }
-
-// ---- DB tab (read-only database console) ----
+// ---- DB console (read-only, lives in the Data tab) ----
 // Writes are blocked SERVER-SIDE by the hardened _is_safe_sql gate (single
 // statement, no comments, banned mutators) + the 1000-row cap — the UI is a
 // convenience, never the security boundary.
@@ -1924,27 +2033,20 @@ function dbDownloadCsv(){ if(!dbCsv){ toast('Run a query first'); return; }
   a.download='tickvault-query-'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.csv';
   document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(a.href); }
 
-function ciBadge(s){ const k=['success','pending','failure'].includes(s)?s:'unknown'; return '<span class="badge '+k+'">'+s+'</span>'; }
-async function loadGithub(){ $('prs').dataset.loaded='1'; $('prs').innerHTML='<span class="muted">loading…</span>'; const j=await call('gh_prs'); if(!j){ $('prs').innerHTML=''; return; }
-  $('ghrepo').textContent=j.repo||''; const prs=j.prs||[];
-  if(j.gh_configured===false){ $('prs').innerHTML='<span class="warn">GitHub token not set — add the github-token SSM param to enable this tab.</span>'; return; }
-  if(!prs.length){ $('prs').innerHTML='<span class="muted">no open PRs 🎉</span>'; return; }
-  $('prs').innerHTML=prs.map(p=>'<div class="pr"><div class="t"><span class="num">#'+p.number+'</span>'+esc(p.title)+(p.draft?' <span class="badge unknown">draft</span>':'')+'</div>'+ciBadge(p.ci)+
-    '<button class="b-go mini" onclick="ghMerge('+p.number+')">merge</button></div>').join(''); }
-async function ghMerge(n){ if(!confirm('Squash-merge PR #'+n+' to main?')) return; toast('merging #'+n+'…'); const j=await call('gh_merge',{number:n});
-  if(j&&j.merged){ toast('✅ merged #'+n); setTimeout(loadGithub,1500); } else { toast('merge not completed (status '+(j&&j.status)+')'); } }
-async function ghDeploy(){ if(!confirm('Trigger a deploy to AWS (deploy-aws workflow on main)?')) return; toast('triggering deploy…'); const j=await call('gh_deploy');
-  toast(j&&j.ok?'🚀 deploy triggered':'deploy trigger failed (status '+(j&&j.status)+')'); }
-
-async function loadLogs(){ $('logErr').textContent='loading…'; const j=await call('logs'); if(!j){ $('logErr').textContent='—'; return; }
-  const raw=j.raw||''; const grab=(a,b)=>{ const m=raw.split(a)[1]; return m?m.split(b)[0].trim():''; };
-  $('logErr').textContent=grab('ERR_BEGIN','ERR_END')||'none 🎉'; $('logApp').textContent=grab('APP_BEGIN','APP_END')||'—'; }
-
-async function loadAws(){ $('alarms').dataset.loaded='1'; $('alarms').innerHTML='<span class="muted">loading…</span>'; const j=await call('aws_status'); if(!j){ $('alarms').innerHTML=''; return; }
-  $('cost').textContent='$'+(j.cost_mtd_usd||'—');
-  if(j.alarms_firing===null){ $('alarmcount').innerHTML='<span class="warn">?</span>'; $('alarms').innerHTML='<span class="warn">CloudWatch read failed — retry.</span>'; return; }
-  const al=j.alarms_firing||[]; $('alarmcount').innerHTML='<span class="'+(al.length?'bad':'ok')+'">'+al.length+'</span>';
-  $('alarms').innerHTML=al.length? al.map(a=>'<div class="pr"><span class="badge failure">ALARM</span> <span class="t">'+esc(a)+'</span></div>').join('') : '<span class="ok">all clear 🎉</span>';
+// AWS strip on Overview (spend $ · alarms firing · disk used %) — sourced from
+// the same aws_status action the old AWS tab used. The <details> expands to
+// the full alarm list + storage shields. Loaded once on first Overview load
+// (NOT on the 8s auto-refresh — aws_status does an SSM probe + Cost Explorer
+// call) and on demand via the 🔄 Refresh AWS button.
+async function loadAws(){ $('alarms').dataset.loaded='1'; $('awsstrip').innerHTML='<span class="muted">loading…</span>'; $('alarms').innerHTML='<span class="muted">loading…</span>';
+  const j=await call('aws_status'); if(!j){ $('awsstrip').innerHTML='<span class="warn">AWS read failed — retry</span>'; $('alarms').innerHTML=''; return; }
+  const cwFail=(j.alarms_firing===null||j.alarms_firing===undefined), al=j.alarms_firing||[];
+  const alTxt=cwFail?'?':String(al.length), alCls=cwFail?'warn':(al.length?'bad':'ok');
+  $('awsstrip').innerHTML='<span>💵 $'+esc(j.cost_mtd_usd||'—')+' spent this month</span>'+
+    '<span class="'+alCls+'">🔔 '+alTxt+' alarm'+(alTxt==='1'?'':'s')+' firing</span>'+
+    '<span>💾 disk '+esc(j.disk_pct||'—')+' used</span>';
+  if(cwFail){ $('alarms').innerHTML='<span class="warn">CloudWatch read failed — retry.</span>'; }
+  else{ $('alarms').innerHTML=al.length? al.map(a=>'<div class="pr"><span class="badge failure">ALARM</span> <span class="t">'+esc(a)+'</span></div>').join('') : '<span class="ok">all clear 🎉</span>'; }
   const free=parseInt(j.disk_free_gb,10), pct=parseInt(j.disk_pct,10);
   const freeOk=isNaN(free)?true:free>5; const pctOk=isNaN(pct)?true:pct<85;
   $('storage').innerHTML=
@@ -2008,8 +2110,19 @@ async function loadLatency(){ $('latnet').dataset.loaded='1'; $('latnet').innerH
     ? ('measured live over '+Number(j.tick_window_count).toLocaleString()+' ticks in a '+(j.window_secs||'~10')+'s window — lifetime avg '+fmtNs(j.tick_process_avg_ns)+' over '+Number(j.tick_count||0).toLocaleString()+' ticks since boot')
     : (j.tick_count? ('no live ticks in the probe window (market closed?) — lifetime avg over '+Number(j.tick_count).toLocaleString()+' ticks since boot') : 'no ticks measured yet (market closed?)'); }
 
-async function act(action){ if(!confirm('Run "'+action+'" on the trading box?')) return; const force=$('force').checked; toast(action+'…');
+// forceId lets each tab keep its own force checkbox next to its own buttons:
+// Overview's instance button uses #force_inst, Admin's app controls use #force.
+async function act(action,forceId){ if(!confirm('Run "'+action+'" on the trading box?')) return;
+  const fEl=$(forceId||'force'); const force=!!(fEl&&fEl.checked); toast(action+'…');
   const j=await call(action,{force}); if(j){ toast('✅ '+action+' sent'); setTimeout(loadOverview,1600); } }
+
+// Danger-zone severity picker → the UNCHANGED per-action functions. Each still
+// asks for its OWN typed confirm token (GROWW / WIPE / NUKE / ERASE) — the
+// picker only chooses WHICH prompt fires; there is no token bypass path.
+function dangerExecute(){ const sel=document.querySelector('input[name="danger"]:checked');
+  if(!sel){ toast('Pick a danger-zone action first'); return; }
+  const fn={groww:wipeGroww, wipe:wipeData, nuke:dockerReset, erase:bareNuke}[sel.value];
+  if(fn) fn(); else toast('Unknown action'); }
 
 async function wipeData(){
   if(prompt('This DELETES every tick and candle, then restarts empty. The box must be RUNNING. Type WIPE to confirm:')!=='WIPE'){ toast('cancelled'); return; }
@@ -2048,7 +2161,7 @@ async function pollNuke(cid,n){
   const s=await call('command-status',{command_id:cid}); const st=(s&&s.status)||'', out=(s&&s.stdout_tail)||'';
   if(st==='Success'||st==='Failed'||st==='Cancelled'||st==='TimedOut'){
     if(out.indexOf('GROWW-WIPE-COMPLETE')>=0){ toast('✅ GROWW wipe complete — 0 groww rows left, dhan data intact; app restarting'); }
-    else if(out.indexOf('GROWW-WIPE-PARTIAL')>=0){ toast('🟠 GROWW wipe PARTIAL — some tables not rewritten (originals kept SAFE, nothing lost). Check the Logs tab / box output.'); }
+    else if(out.indexOf('GROWW-WIPE-PARTIAL')>=0){ toast('🟠 GROWW wipe PARTIAL — some tables not rewritten (originals kept SAFE, nothing lost). Inspect the box output (GWIPE lines).'); }
     else if(out.indexOf('DOCKER-RESET-FAILED')>=0){ toast('🔴 NUKE FAILED — QuestDB volume still in use, data NOT wiped. Check the box.'); }
     else if(out.indexOf('bare-nuke-complete')>=0){ toast('☢️ BARE NUKE complete — 0 containers, 0 images, 0 volumes. Box is empty + DEAD (redeploy to restart).'); }
     else if(out.indexOf('bare-nuke-PARTIAL')>=0){ toast('🟠 bare nuke PARTIAL — something is still in-use. '+(out.match(/BARE-NUKE-RESULT[^\n]*/)||[''])[0]); }

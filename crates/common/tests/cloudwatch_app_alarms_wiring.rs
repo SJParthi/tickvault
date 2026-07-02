@@ -162,35 +162,108 @@ fn emf_declared_names(body: &str, key: &str) -> Vec<String> {
 }
 
 #[test]
-fn test_deployed_emf_label_matcher_equals_metric_selectors() {
-    // Drift-guard: the CloudWatch agent's EMF processor only publishes a
-    // scraped sample when BOTH `label_matcher` (which rows to keep) AND
-    // `metric_selectors` (which metrics to emit) match. If the two lists
-    // drift, the intersection silently shrinks and some metrics never
-    // reach `Tickvault/Prod` — the exact "0 datapoints" class of failure.
+fn test_deployed_emf_source_labels_match_a_real_series_label() {
+    // ROOT-CAUSE PIN (2026-07-02, B1 evidence): the previous declaration used
+    // `source_labels: ["__name__"]` with the metric-name regex as
+    // `label_matcher`. `__name__` is NOT a label on the scraped series at the
+    // emf_processor stage (live events carry host/instance/job/
+    // prom_metric_type only), so the concatenated source-label value was
+    // empty, the label_matcher NEVER matched, no metric ever received the
+    // `_aws` EMF envelope, and `Tickvault/Prod` sat empty for ~40 days while
+    // both liveness alarms rang blind. The CORRECT shape: `source_labels`
+    // references a REAL label (`host`, stamped by prometheus.yaml's
+    // static_configs) with `label_matcher` pinned to its literal value;
+    // `metric_selectors` alone filters metric NAMES.
+    for rel in [
+        "deploy/aws/terraform/user-data.sh.tftpl",
+        "deploy/aws/cloudwatch-agent.json",
+    ] {
+        let body = read(rel);
+        assert!(
+            body.contains("\"source_labels\": [\"host\"]"),
+            "Z+ L2 VERIFY root-cause pin: {rel} must use source_labels [\"host\"] — \
+             a label that actually exists on the scraped series."
+        );
+        assert!(
+            body.contains("\"label_matcher\": \"^tickvault-prod$\""),
+            "Z+ L2 VERIFY root-cause pin: {rel} must match the host label's literal \
+             value ^tickvault-prod$ (from prometheus.yaml static label)."
+        );
+        assert!(
+            !body.contains("\"source_labels\": [\"__name__\"]"),
+            "Z+ L2 VERIFY root-cause pin: {rel} regressed to source_labels \
+             [\"__name__\"] — __name__ is not a series label at the emf_processor \
+             stage; this exact shape produced the 40-day-empty Tickvault/Prod \
+             namespace (B1 analysis, 2026-07-02)."
+        );
+    }
+}
+
+#[test]
+fn test_emf_metric_selectors_name_count_is_twenty_one() {
+    // Pin the EMF publish list: 19 alarm-backing signals + 2 memory-measurement
+    // gauges added 2026-07-02 for the 2K-universe RAM measurement
+    // (tv_process_rss_bytes — crates/storage/src/resource_monitor.rs;
+    // tv_subsystem_memory_estimated_bytes — crates/app/src/metrics_catalog.rs
+    // SUBSYSTEM_MEMORY_GAUGE_NAME). Cost note: each custom metric is ~$0.30/mo.
+    // If you intentionally add/remove a name, update BOTH configs + this pin.
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
-    let matcher = emf_declared_names(&user_data, "label_matcher");
-    let selectors = emf_declared_names(&user_data, "metric_selectors");
-    assert!(
-        !matcher.is_empty(),
-        "ratchet self-check: could not parse label_matcher from user-data.sh.tftpl"
-    );
+    let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
-        matcher,
-        selectors,
-        "Z+ L2 VERIFY drift-guard: the deployed CloudWatch-agent EMF `label_matcher` \
-         and `metric_selectors` name-sets disagree. The agent publishes only the \
-         intersection, so any name present in one list but not the other is silently \
-         dropped from Tickvault/Prod (the '0 datapoints' failure class). Keep both \
-         lists byte-identical.\n  in label_matcher only: {:?}\n  in metric_selectors only: {:?}",
-        matcher
-            .iter()
-            .filter(|n| !selectors.contains(n))
-            .collect::<Vec<_>>(),
-        selectors
-            .iter()
-            .filter(|n| !matcher.contains(n))
-            .collect::<Vec<_>>(),
+        names.len(),
+        21,
+        "Z+ L2 VERIFY ratchet: expected exactly 21 names in the EMF metric_selectors \
+         list; found {}: {names:?}",
+        names.len()
+    );
+    for required in [
+        "tv_process_rss_bytes",
+        "tv_subsystem_memory_estimated_bytes",
+    ] {
+        assert!(
+            names.iter().any(|n| n == required),
+            "Z+ L2 VERIFY ratchet: {required} must be in the EMF metric_selectors list \
+             (2K-universe memory measurement reads it as a real CloudWatch metric)."
+        );
+    }
+}
+
+#[test]
+fn test_log_metric_filter_fallback_covers_both_liveness_alarm_metrics() {
+    // Belt-and-suspenders pin: even if the EMF fix is imperfect on the live
+    // box, the two `aws_cloudwatch_log_metric_filter` resources extract
+    // tv_boot_completed + tv_realtime_guarantee_score from the plain-JSON
+    // events already flowing into /tickvault/<env>/metrics, publishing into
+    // the EXACT namespace + host dimension the alarms watch. Deleting either
+    // filter (or dropping the host dimension extraction) re-blinds the alarm.
+    let tf = read("deploy/aws/terraform/metrics-log-metric-filters.tf");
+    for metric in ["tv_boot_completed", "tv_realtime_guarantee_score"] {
+        assert!(
+            tf.contains(&format!("{{ $.{metric} = * }}")),
+            "fallback filter pattern for {metric} missing from \
+             metrics-log-metric-filters.tf"
+        );
+        assert!(
+            tf.contains(&format!("name      = \"{metric}\"")),
+            "fallback metric_transformation name for {metric} must EXACTLY match \
+             the alarm's metric_name"
+        );
+    }
+    assert!(
+        tf.contains("namespace = \"Tickvault/Prod\""),
+        "fallback filters must publish into Tickvault/Prod — the namespace every \
+         app alarm reads"
+    );
+    assert!(
+        tf.contains("host = \"$.host\""),
+        "fallback filters must extract the host dimension from the JSON event — \
+         the alarms key on dimensions {{host=tickvault-prod}}; a dimensionless \
+         metric is invisible to them"
+    );
+    assert!(
+        !tf.contains("default_value"),
+        "fallback filters must NOT set default_value — missing data must stay \
+         missing (treat_missing_data=breaching is the alarms' detection model)"
     );
 }
 

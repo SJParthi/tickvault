@@ -133,10 +133,14 @@ class GetServesPublicHtml(unittest.TestCase):
         self.assertNotIn("Bearer s3cret", html)
         self.assertIn("localStorage", html)  # token kept client-side only
 
-    def test_html_has_all_tabs(self) -> None:
+    def test_html_has_exactly_three_tabs(self) -> None:
+        # 2026-07-02 redesign (operator: "webpage looks completely messy, too
+        # many buttons"): exactly Overview / Data / Admin — nothing else.
+        import re
+
         html = handler._console_html()
-        for t in ("overview", "data", "github", "logs", "aws", "latency"):
-            self.assertIn('data-t="' + t + '"', html)
+        tabs = re.findall(r'data-t="(\w+)"', html)
+        self.assertEqual(tabs, ["overview", "data", "admin"])
 
     def test_html_supports_ready_made_key_link(self) -> None:
         # A #key=... link must auto-unlock + strip the fragment from the URL.
@@ -408,12 +412,15 @@ class SqlRowCap(unittest.TestCase):
 
 
 class DbConsoleTab(unittest.TestCase):
-    def test_html_has_db_tab_between_data_and_github(self) -> None:
+    def test_db_console_folded_into_data_tab(self) -> None:
+        # 2026-07-02 redesign: the DB console (PR #1326) is no longer its own
+        # tab — it lives INSIDE the Data tab. There is no data-t="db" tab, and
+        # the console markup sits inside the data <section>.
         html = handler._console_html()
-        for t in ("overview", "data", "db", "github", "logs", "aws", "latency"):
-            self.assertIn('data-t="' + t + '"', html)
-        self.assertLess(html.index('data-t="data"'), html.index('data-t="db"'))
-        self.assertLess(html.index('data-t="db"'), html.index('data-t="github"'))
+        self.assertNotIn('data-t="db"', html)
+        data_section = html.split('<section data-tab="data"', 1)[1].split("</section>", 1)[0]
+        for needle in ('id="dbtables"', 'id="dbsql"', 'id="dbout"', 'id="dbcols"', 'id="bars"', 'id="cvshields"'):
+            self.assertIn(needle, data_section, needle)
 
     def test_db_tab_shows_read_only_badge(self) -> None:
         html = handler._console_html()
@@ -427,10 +434,10 @@ class DbConsoleTab(unittest.TestCase):
         ):
             self.assertIn(needle, html, needle)
 
-    def test_db_tab_autoloads_tables_on_open(self) -> None:
-        # tab('db') must trigger loadDbTables() without an extra click.
+    def test_data_tab_autoloads_tables_on_open(self) -> None:
+        # tab('data') must trigger loadDbTables() without an extra click.
         html = handler._console_html()
-        self.assertIn("name==='db' && !$('dbtables').dataset.loaded) loadDbTables()", html)
+        self.assertIn("name==='data' && !$('dbtables').dataset.loaded) loadDbTables()", html)
 
     def test_table_pick_is_index_based_no_injection(self) -> None:
         # The clicked table name comes from dbTables[i] — QuestDB's own
@@ -1074,6 +1081,306 @@ class HtmlWipeGrowwButton(unittest.TestCase):
         # Truthful async outcome via the shared command-status poller.
         self.assertIn("GROWW-WIPE-COMPLETE", html)
         self.assertIn("GROWW-WIPE-PARTIAL", html)
+
+
+class RedesignThreeTabs(unittest.TestCase):
+    """2026-07-02 portal redesign — Overview / Data / Admin, collapsed danger
+    zone, Logs + GitHub tabs removed. UI reorganization ONLY: every action
+    semantic, guard, and confirm token is unchanged (pinned by the classes
+    above); these tests pin the new structure."""
+
+    def test_logs_and_github_tabs_absent(self) -> None:
+        html = handler._console_html()
+        self.assertNotIn('data-t="logs"', html)
+        self.assertNotIn('data-t="github"', html)
+        # ...and their now-unused JS is gone too.
+        for dead in ("loadLogs", "loadGithub", "ghMerge", "ghDeploy", "ciBadge", "runSql"):
+            self.assertNotIn(dead, html, dead)
+
+    def test_logs_route_kept_for_mcp_server(self) -> None:
+        # The tickvault-logs MCP server POSTs {"action":"logs"} to this portal
+        # (scripts/mcp-servers/tickvault-logs/server.py) — the API route must
+        # survive the tab removal.
+        orig_secret = handler._control_secret
+        orig_sync = handler._ssm_shell_sync
+        handler._control_secret = lambda: "s3cret-token"  # type: ignore[assignment]
+        handler._ssm_shell_sync = lambda cmds, timeout=6.0: "ERR_BEGIN\nERR_END\nAPP_BEGIN\nAPP_END\n"  # type: ignore[assignment]
+        try:
+            resp = handler.lambda_handler(
+                {
+                    "requestContext": {"http": {"method": "POST"}},
+                    "headers": {"authorization": "Bearer s3cret-token"},
+                    "body": json.dumps({"action": "logs"}),
+                },
+                None,
+            )
+        finally:
+            handler._control_secret = orig_secret  # type: ignore[assignment]
+            handler._ssm_shell_sync = orig_sync  # type: ignore[assignment]
+        self.assertEqual(resp["statusCode"], 200)
+        self.assertIn("raw", json.loads(resp["body"]))
+
+    def test_gh_actions_are_removed_from_backend(self) -> None:
+        # No caller existed outside the deleted GitHub tab → the routes are
+        # fully dead and now 400 as unknown actions.
+        orig_secret = handler._control_secret
+        handler._control_secret = lambda: "s3cret-token"  # type: ignore[assignment]
+        try:
+            for action in ("gh_prs", "gh_merge", "gh_deploy"):
+                resp = handler.lambda_handler(
+                    {
+                        "requestContext": {"http": {"method": "POST"}},
+                        "headers": {"authorization": "Bearer s3cret-token"},
+                        "body": json.dumps({"action": action}),
+                    },
+                    None,
+                )
+                self.assertEqual(resp["statusCode"], 400, action)
+                self.assertIn("unknown action", json.loads(resp["body"])["error"])
+        finally:
+            handler._control_secret = orig_secret  # type: ignore[assignment]
+
+    def test_danger_zone_collapsed_by_default(self) -> None:
+        # The four destructive wipes live inside a <details> WITHOUT the open
+        # attribute — collapsed until the operator deliberately taps it.
+        html = handler._console_html()
+        self.assertIn('<details class="fold" id="danger">', html)
+        danger = html.split('<details class="fold" id="danger">', 1)[1].split("</details>", 1)[0]
+        for needle in ('value="groww"', 'value="wipe"', 'value="nuke"', 'value="erase"', "dangerExecute()"):
+            self.assertIn(needle, danger, needle)
+        # No <details ... open> anywhere (both folds start collapsed).
+        self.assertNotIn("<details open", html)
+        self.assertNotIn('id="danger" open', html)
+
+    def test_severity_picker_maps_each_choice_to_action_and_token(self) -> None:
+        html = handler._console_html()
+        # One dispatch map, radio value → the UNCHANGED per-action function.
+        self.assertIn("{groww:wipeGroww, wipe:wipeData, nuke:dockerReset, erase:bareNuke}", html)
+        # Each function still demands its OWN typed confirm token — the picker
+        # introduces no token-bypass path.
+        self.assertIn("Type GROWW to confirm:')!=='GROWW'", html)
+        self.assertIn("Type WIPE to confirm:')!=='WIPE'", html)
+        self.assertIn("Type NUKE to confirm:')!=='NUKE'", html)
+        self.assertIn("Type ERASE to confirm:')!=='ERASE'", html)
+        # No selection → no dispatch.
+        self.assertIn("Pick a danger-zone action first", html)
+
+    def test_context_aware_instance_button(self) -> None:
+        # ONE instance button: ▶ Start when stopped, ■ Stop when running —
+        # label + action derived from the live instance_state.
+        html = handler._console_html()
+        self.assertIn('id="instbtn"', html)
+        self.assertIn("■ Stop instance", html)
+        self.assertIn("▶ Start instance", html)
+        self.assertIn("instState==='running'?'stop':'start'", html)
+        # Its force checkbox sits next to it and feeds through act().
+        self.assertIn('id="force_inst"', html)
+        self.assertIn("'force_inst'", html)
+
+    def test_stopped_box_banner_and_grey_shields(self) -> None:
+        html = handler._console_html()
+        # One calm banner replaces the per-shield "unreachable" scatter…
+        self.assertIn('id="stoppedbanner"', html)
+        self.assertIn("Box stopped (auto-stops 16:30 IST, auto-starts 08:30 Mon–Fri) — guarantees resume on start", html)
+        self.assertIn("$('stoppedbanner').hidden=running", html)
+        # …and the shields grey out as "—" ONLY when the box is not running.
+        self.assertIn("shieldIdle", html)
+        self.assertIn("if(!running){", html)
+        # The REAL warning paths for a RUNNING box must still exist (a stopped
+        # banner must never hide genuine failures while running).
+        self.assertIn("'unreachable'", html)
+        self.assertIn("DEDUP disabled!", html)
+        self.assertIn("schema drift (expected 5)", html)
+
+    def test_overview_has_aws_strip_and_latency_card(self) -> None:
+        html = handler._console_html()
+        overview = html.split('<section data-tab="overview"', 1)[1].split("</section>", 1)[0]
+        # Thin AWS strip (spend / alarms / disk) with click-to-expand details.
+        self.assertIn('id="awsstrip"', overview)
+        self.assertIn('id="awsdetails"', overview)
+        self.assertIn('id="alarms"', overview)
+        self.assertIn('id="storage"', overview)
+        # Compact latency card reusing the existing endpoint + renderers.
+        self.assertIn("loadLatency()", overview)
+        self.assertIn("Measure now", overview)
+        self.assertIn('id="latnet"', overview)
+        self.assertIn('id="latproc"', overview)
+        # Strip is fed by the same aws_status action the old AWS tab used.
+        self.assertIn("call('aws_status')", html)
+
+    def test_admin_tab_holds_ops_and_lock(self) -> None:
+        html = handler._console_html()
+        admin = html.split('<section data-tab="admin"', 1)[1].split("</section>", 1)[0]
+        for needle in (
+            "act('restart-app')", "act('restart-questdb')", "act('stop-app')",
+            'id="force"', 'id="danger"', "lock()",
+        ):
+            self.assertIn(needle, admin, needle)
+        # The bare start/stop instance buttons left the Admin tab — the ONE
+        # context-aware button on Overview owns instance lifecycle now.
+        self.assertNotIn("act('start')", admin)
+        self.assertNotIn("act('stop')", admin)
+
+
+class TickConservationShield(unittest.TestCase):
+    """Audit fix #1 — the shield is a conservation-backed verdict, not a
+    liveness heuristic. One test per state + the precedence ratchet +
+    the false-OK-is-dead ratchet."""
+
+    # Raw CONSERVE snapshots (QuestDB /exp CSV rows, ';'-joined, header
+    # already skipped on the box).
+    _BALANCED = '"dhan","2026-07-01T00:00:00.000000Z",0,0,false,"balanced";"groww","2026-07-01T00:00:00.000000Z",0,0,false,"balanced";'
+    _RESIDUAL = '"dhan","2026-07-01T00:00:00.000000Z",42,0,false,"leak";'
+    _PARTIAL = '"dhan","2026-07-01T00:00:00.000000Z",0,0,true,"partial";'
+
+    def _classify(self, raw: str, disc: str, market_hours: bool, tps: str) -> dict:
+        return handler._classify_tick_conservation(handler._parse_conserve_rows(raw), disc, market_hours, tps)
+
+    # ---- one test per shield state ----
+    def test_state_balanced_market_open_decorated_with_liveness(self) -> None:
+        tc = self._classify(self._BALANCED, "0", True, "500")
+        self.assertEqual(tc["state"], "balanced")
+        self.assertTrue(tc["good"])
+        self.assertEqual(tc["cls"], "ok")
+        self.assertIn("BALANCED ✅", tc["label"])
+        self.assertIn("capturing (500 ticks/sec)", tc["label"])
+
+    def test_state_balanced_market_closed_names_audit_date(self) -> None:
+        tc = self._classify(self._BALANCED, "0", False, "0")
+        self.assertEqual(tc["state"], "balanced")
+        self.assertEqual(tc["label"], "BALANCED ✅ (audit 2026-07-01)")
+
+    def test_state_residual_is_red_and_counts_ticks(self) -> None:
+        tc = self._classify(self._RESIDUAL, "0", True, "500")
+        self.assertEqual(tc["state"], "residual")
+        self.assertFalse(tc["good"])
+        self.assertEqual(tc["cls"], "bad")
+        self.assertIn("RESIDUAL: 42", tc["label"])
+        self.assertIn("2026-07-01", tc["label"])
+
+    def test_state_partial_is_amber(self) -> None:
+        tc = self._classify(self._PARTIAL, "0", True, "500")
+        self.assertEqual(tc["state"], "partial")
+        self.assertFalse(tc["good"])
+        self.assertEqual(tc["cls"], "warn")
+        self.assertIn("partial coverage", tc["label"])
+
+    def test_state_disconnects_today_blocks_green_despite_balanced_audit(self) -> None:
+        # Yesterday's audit was balanced, but the socket dropped twice TODAY —
+        # upstream ticks in those windows never reached the box, so the shield
+        # must NOT claim green (the honest capture-at-receipt envelope).
+        tc = self._classify(self._BALANCED, "2", True, "500")
+        self.assertEqual(tc["state"], "disconnects")
+        self.assertFalse(tc["good"])
+        self.assertEqual(tc["cls"], "warn")
+        self.assertIn("2 disconnect(s) today", tc["label"])
+        self.assertIn("unverifiable", tc["label"])
+
+    def test_state_idle_market_closed_no_audit(self) -> None:
+        tc = self._classify("", "0", False, "0")
+        self.assertEqual(tc["state"], "idle")
+        self.assertEqual(tc["label"], "idle (market closed)")
+
+    def test_state_no_audit_market_open_is_amber_never_green(self) -> None:
+        # Fresh box: tick_conservation_audit table absent → CONSERVE empty.
+        tc = self._classify("", "0", True, "500")
+        self.assertEqual(tc["state"], "no_audit")
+        self.assertFalse(tc["good"])
+        self.assertEqual(tc["cls"], "warn")
+        self.assertIn("no audit yet", tc["label"])
+
+    def test_state_unreachable_when_no_source_answers(self) -> None:
+        tc = self._classify("", "", True, "")
+        self.assertEqual(tc["state"], "unreachable")
+        self.assertFalse(tc["good"])
+        self.assertEqual(tc["label"], "unreachable")
+
+    # ---- the precedence ratchet: residual > partial > disconnects > balanced
+    def test_precedence_residual_beats_partial_and_disconnects(self) -> None:
+        raw = (
+            '"dhan","2026-07-01T00:00:00.000000Z",0,7,false,"leak";'
+            '"groww","2026-07-01T00:00:00.000000Z",0,0,true,"partial";'
+        )
+        tc = self._classify(raw, "3", True, "500")
+        self.assertEqual(tc["state"], "residual")
+
+    def test_precedence_partial_beats_disconnects(self) -> None:
+        tc = self._classify(self._PARTIAL, "3", True, "500")
+        self.assertEqual(tc["state"], "partial")
+
+    def test_precedence_disconnects_beats_balanced(self) -> None:
+        tc = self._classify(self._BALANCED, "1", True, "500")
+        self.assertEqual(tc["state"], "disconnects")
+
+    # ---- the false-OK is DEAD: a tick rate alone can never produce green
+    def test_tick_rate_alone_never_produces_balanced(self) -> None:
+        for raw, disc in (("", "0"), ("", ""), (self._PARTIAL, "0"), (self._BALANCED, "5")):
+            tc = self._classify(raw, disc, True, "9999")
+            self.assertNotEqual(tc["state"], "balanced", f"raw={raw!r} disc={disc!r}")
+            self.assertFalse(tc["good"] and tc["state"] != "idle", f"raw={raw!r} disc={disc!r}")
+
+    def test_only_latest_trading_day_rows_count(self) -> None:
+        # Yesterday had a residual; TODAY's audit is balanced — the shield
+        # reports the latest day's verdict (yesterday's row is history).
+        raw = (
+            '"dhan","2026-07-02T00:00:00.000000Z",0,0,false,"balanced";'
+            '"dhan","2026-07-01T00:00:00.000000Z",42,0,false,"leak";'
+        )
+        tc = self._classify(raw, "0", False, "0")
+        self.assertEqual(tc["state"], "balanced")
+        self.assertEqual(tc["audit_date"], "2026-07-02")
+
+    def test_envelope_sentence_is_carried_on_every_verdict(self) -> None:
+        for raw, disc in ((self._BALANCED, "0"), (self._RESIDUAL, "0"), ("", "")):
+            tc = self._classify(raw, disc, True, "5")
+            self.assertEqual(
+                tc["envelope"],
+                "Proves every tick that REACHED the box is stored. Ticks Dhan sent "
+                "during a disconnect window never arrived and are outside this proof.",
+            )
+
+    # ---- parser ----
+    def test_parse_conserve_rows_happy_and_malformed(self) -> None:
+        rows = handler._parse_conserve_rows(self._BALANCED + "garbage;1,2;")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["feed"], "dhan")
+        self.assertEqual(rows[0]["date"], "2026-07-01")
+        self.assertEqual(rows[0]["outcome"], "balanced")
+        self.assertFalse(rows[0]["partial_coverage"])
+        self.assertEqual(handler._parse_conserve_rows(""), [])
+
+    # ---- view plumbing ----
+    def test_parse_view_carries_conservation_fields(self) -> None:
+        out = handler._parse_view(f"CONSERVE={self._BALANCED}\nWS_DISC=0\n")
+        self.assertEqual(len(out["conservation_rows"]), 2)
+        self.assertEqual(out["ws_disconnects_today"], "0")
+        # Empty stdout (box stopped) degrades honestly.
+        empty = handler._parse_view("")
+        self.assertEqual(empty["conservation_rows"], [])
+        self.assertEqual(empty["ws_disconnects_today"], "")
+
+    def test_view_commands_query_both_audit_tables(self) -> None:
+        conserve = next(c for c in handler._VIEW_COMMANDS if "CONSERVE=" in c)
+        self.assertIn("tick_conservation_audit", conserve)
+        # `>` must be URL-encoded (%3E) and the CSV header skipped.
+        self.assertIn("ts%20%3E%20dateadd", conserve)
+        self.assertIn("tail -n +2", conserve)
+        disc = next(c for c in handler._VIEW_COMMANDS if "WS_DISC=" in c)
+        self.assertIn("ws_event_audit", disc)
+        # `=` encoded as %3D (the DEDUP_KEYS lesson) + in-market kind only.
+        self.assertIn("event_kind%3D%27disconnected%27", disc)
+        self.assertNotIn("event_kind='disconnected'", disc)
+
+    # ---- the UI no longer holds shield logic ----
+    def test_html_renames_shield_and_drops_liveness_heuristic(self) -> None:
+        html = handler._console_html()
+        self.assertIn("Tick conservation", html)
+        self.assertNotIn("No tick lost", html)
+        # The old always-green path — capOk driving a WORKING ✅ shield — is gone.
+        self.assertNotIn("WORKING ✅", html)
+        # The UI renders the server verdict + its envelope tooltip.
+        self.assertIn("j.tick_conservation", html)
+        self.assertIn("tc.envelope", html)
 
 
 if __name__ == "__main__":
