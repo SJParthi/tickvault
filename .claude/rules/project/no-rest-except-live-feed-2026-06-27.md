@@ -27,7 +27,7 @@ A **literal** reading ("kill ALL REST") is self-contradictory: it would also kil
 
 | Kept REST class | Why it is NOT "market data" and MUST stay |
 |---|---|
-| **Live-feed AUTH** — Dhan `generateAccessToken` / `RenewToken` / static-IP gate; Groww `/v1/token` | Produces the token the live WS needs to connect. No auth ⇒ no live feed at all. |
+| **Live-feed AUTH** — Dhan `generateAccessToken` / `RenewToken` / static-IP gate. *(Groww's former `/v1/token` mint call was DELETED 2026-07-02 — the Groww token now arrives via a READ-ONLY SSM read of the bruteX-Lambda-minted `/tickvault/<env>/groww/access-token`; see `groww-shared-token-minter-2026-07-02.md`.)* | Produces the token the live WS needs to connect. No auth ⇒ no live feed at all. |
 | **Static instrument-master CSVs** — Dhan Detailed CSV, niftyindices NTM list, Groww master CSV | Public, daily, STATIC reference files (not prices). They build the `security_id`↔instrument map + the Groww ISIN→token map. No master ⇒ arriving ticks cannot be mapped/subscribed. This matches `daily-universe-scope-expansion-2026-05-27.md` §3 which already REQUIRES the static Detailed CSV while BANNING per-segment REST + `/marketfeed/ltp` price pulls. |
 
 **This lock is consistent with the prior daily-universe lock** — it only adds the removal of the remaining market-data REST endpoints (§3 REMOVE rows). It is scoped, pending operator confirmation, to **market-data pulls only**.
@@ -43,7 +43,7 @@ A **literal** reading ("kill ALL REST") is self-contradictory: it would also kil
 | `GET/PUT /v2/ip/getIP` `setIP` | `constants.rs:1017,1270,1279`; `main.rs:4417…` | live-feed STATIC-IP gate | **KEEP** |
 | `GET images.dhan.co/api-data/api-scrip-master-detailed.csv` | `csv_downloader.rs:129,209` | instrument-master (static ref) — the MAP source | **KEEP** |
 | `GET niftyindices.com ind_niftytotalmarket_list.csv` | `instruments.rs:646`; `main.rs:1978,2667,6806` | constituents (static ref) — the MAP source | **KEEP** |
-| `POST api.groww.in/v1/token/api/access` | `groww/auth.rs:39` | Groww live-feed AUTH | **KEEP** |
+| ~~`POST api.groww.in/v1/token/api/access`~~ | ~~`groww/auth.rs`~~ | Groww live-feed AUTH | **REMOVED 2026-07-02** — superseded by the shared token-minter SSM read (`groww-shared-token-minter-2026-07-02.md`); TickVault never mints |
 | `GET GROWW_INSTRUMENT_CSV_URL` | `constants.rs:612`; `instruments.rs:639` | Groww master (static ref) — the MAP source | **KEEP** |
 | `POST /v2/charts/intraday` (1m cross-verify) | `cross_verify_1m_boot.rs:283`; `constants.rs:1255` | MARKET-DATA pull | **REMOVE** |
 | `POST /v2/charts/historical` (prev-day OHLCV) | `prev_day_ohlcv_boot.rs:120`; `constants.rs:1259` | MARKET-DATA pull | **REMOVE** |

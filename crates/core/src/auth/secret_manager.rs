@@ -14,12 +14,12 @@ use tracing::{info, instrument, warn};
 use tickvault_common::constants::{
     DEFAULT_SSM_ENVIRONMENT, DHAN_CLIENT_ID_SECRET, DHAN_CLIENT_SECRET_SECRET,
     DHAN_SANDBOX_CLIENT_ID_SECRET, DHAN_SANDBOX_TOKEN_SECRET, DHAN_TOTP_SECRET,
-    GROWW_API_KEY_SECRET, GROWW_TOTP_SECRET, QUESTDB_PG_PASSWORD_SECRET, QUESTDB_PG_USER_SECRET,
+    GROWW_ACCESS_TOKEN_SECRET, QUESTDB_PG_PASSWORD_SECRET, QUESTDB_PG_USER_SECRET,
     SSM_DHAN_SERVICE, SSM_GROWW_SERVICE, SSM_QUESTDB_SERVICE, SSM_SECRET_BASE_PATH,
 };
 use tickvault_common::error::ApplicationError;
 
-use super::types::{DhanCredentials, GrowwCredentials, QuestDbCredentials, TelegramCredentials};
+use super::types::{DhanCredentials, QuestDbCredentials, TelegramCredentials};
 
 // ---------------------------------------------------------------------------
 // SSM Path Construction
@@ -219,47 +219,43 @@ pub async fn fetch_dhan_credentials() -> Result<DhanCredentials, ApplicationErro
     })
 }
 
-/// Fetches Groww authentication credentials from AWS SSM Parameter Store
-/// (second feed, operator lock 2026-06-19 —
-/// `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`).
+/// Fetches the Groww ACCESS TOKEN from AWS SSM Parameter Store — READ-ONLY
+/// (shared token-minter architecture, operator lock 2026-07-02 —
+/// `.claude/rules/project/groww-shared-token-minter-2026-07-02.md`).
 ///
-/// Retrieves `api-key` (the Groww "TOTP token") and `totp-secret`, both
-/// wrapped in `SecretString`. Uses the same `resolve_environment()` prefix
-/// as Dhan, so the paths are `/tickvault/<env>/groww/api-key` and
-/// `/tickvault/<env>/groww/totp-secret`. Only called when the Groww feed is
-/// enabled (`feeds.groww_enabled`); the Dhan path is untouched.
+/// The token at `/tickvault/<env>/groww/access-token` is minted DAILY by the
+/// bruteX-owned `groww-token-minter` Lambda (~06:05 IST, EventBridge);
+/// TickVault is a read-only consumer via IAM role
+/// `groww-token-minter-reader-tickvault` (`ssm:GetParameter` on this ONE
+/// parameter + `kms:Decrypt`, delivered through the default AWS credential
+/// chain). TickVault NEVER mints a Groww token, NEVER reads the
+/// `api-key`/`totp-secret` credential parameters (Lambda-only by IAM design),
+/// and NEVER writes any `/tickvault/*/groww/*` parameter. Only called when the
+/// Groww feed is enabled (`feeds.groww_enabled`); the Dhan path is untouched.
 ///
 /// # Errors
 ///
-/// Returns `ApplicationError::SecretRetrieval` if either secret cannot be fetched.
+/// Returns `ApplicationError::SecretRetrieval` if the token cannot be fetched.
 #[instrument(skip_all, fields(environment))]
 // TEST-EXEMPT: live AWS SSM fetch — mirrors the TEST-EXEMPT fetch_dhan_credentials; path construction is covered by build_ssm_path tests.
-pub async fn fetch_groww_credentials() -> Result<GrowwCredentials, ApplicationError> {
+pub async fn fetch_groww_access_token() -> Result<SecretString, ApplicationError> {
     let environment = resolve_environment()?;
     tracing::Span::current().record("environment", environment.as_str());
 
     let ssm_client = create_ssm_client().await;
 
-    let api_key_path = build_ssm_path(&environment, SSM_GROWW_SERVICE, GROWW_API_KEY_SECRET);
-    let totp_secret_path = build_ssm_path(&environment, SSM_GROWW_SERVICE, GROWW_TOTP_SECRET);
+    let token_path = build_ssm_path(&environment, SSM_GROWW_SERVICE, GROWW_ACCESS_TOKEN_SECRET);
 
     info!(
-        api_key_path = %api_key_path,
-        totp_secret_path = %totp_secret_path,
-        "fetching Groww credentials from SSM"
+        token_path = %token_path,
+        "fetching Groww access token from SSM (read-only; minted by the bruteX groww-token-minter Lambda)"
     );
 
-    let (api_key, totp_secret) = tokio::try_join!(
-        fetch_secret(&ssm_client, &api_key_path),
-        fetch_secret(&ssm_client, &totp_secret_path),
-    )?;
+    let token = fetch_secret(&ssm_client, &token_path).await?;
 
-    info!("all Groww credentials fetched successfully from SSM");
+    info!("Groww access token fetched successfully from SSM");
 
-    Ok(GrowwCredentials {
-        api_key,
-        totp_secret,
-    })
+    Ok(token)
 }
 
 /// Fetches Dhan Sandbox credentials from AWS SSM Parameter Store.
