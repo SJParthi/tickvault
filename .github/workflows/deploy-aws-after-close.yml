@@ -8,7 +8,7 @@
 # window is 09:00-15:45 IST (the live trading + post-close-settle band); every
 # other time — including the 08:30 IST auto-start — auto-deploys the latest main.
 #
-# Three crons, all Mon–Fri:
+# Five crons, all Mon–Fri:
 #   • 03:00 UTC = 08:30 IST → INSTANCE-START deploy. Fires the moment the box is
 #     scheduled to auto-start. deploy-aws SELF-STARTS a stopped box in the
 #     08:30-16:30 up-window (see "Ensure instance running" in deploy-aws.yml),
@@ -20,17 +20,33 @@
 #   • 10:16 UTC = 15:46 IST → POST-MARKET window, just AFTER the 15:45 IST end of
 #     the no-deploy band (moved from 15:31 so it is no longer blocked by the
 #     guard). ~16 min after NSE close — redeploys anything merged during hours.
+#   • 10:46 UTC = 16:16 IST + 11:31 UTC = 17:01 IST → SCHEDULER-DROP retries
+#     (2026-07-02 incident): GitHub's cron scheduler DROPPED the single 10:16
+#     UTC slot today (repo-wide ~09:40–10:30 UTC drop window; dropped slots
+#     never queue — they are silently skipped), so a merge blocked during
+#     market hours stayed undeployed all day. Two staggered retries give three
+#     independent chances. Each firing is idempotent via the sha check below,
+#     so on a normal day the retries exit clean with no restart. The 11:31 UTC
+#     slot is past the 16:30 IST box auto-stop — safe: the dispatched
+#     deploy-aws run self-starts a stopped box (workflow_dispatch ⇒
+#     SHOULD_BE_UP=yes in its "Ensure instance running" step) and its final
+#     never-cross step stops the box again once the deploy finishes.
 #
 # Idempotent: before dispatching, we compare main's current HEAD against the
 # `head_sha` of the most recent SUCCESSFUL deploy-aws run on main. If equal,
 # nothing to deploy — exit clean (no spurious restart on quiet days).
 #
 # Triggers:
-#   - schedule: 03:00 + 03:15 + 10:16 UTC Mon–Fri
+#   - schedule: 03:00 + 03:15 + 10:16 + 10:46 + 11:31 UTC Mon–Fri
 #   - workflow_dispatch: manual operator override (just-in-case button)
 #
 # Honest envelope:
-#   - Merge during 09:00-15:45 IST → blocked → auto-fires at 15:46 IST same day ✅
+#   - Merge during 09:00-15:45 IST → blocked → auto-fires at 15:46 IST same day
+#     (retried at 16:16 + 17:01 IST if the scheduler drops a slot) ✅
+#   - GitHub scheduler drops a cron slot → the two staggered retries cover it.
+#     HONEST ENVELOPE: cron redundancy REDUCES but cannot ELIMINATE GitHub
+#     scheduler risk — the scheduler is an external system and can drop any or
+#     all slots (as it did repo-wide on 2026-07-02). ⚠️
 #   - Merge over the weekend → auto-fires Monday 08:30 IST (instance-start) ✅
 #   - Merge before 08:30 IST on a weekday → auto-fires same day 08:30 IST ✅
 #   - Box failed to auto-start at 08:30 → the 08:30 cron self-starts it + deploys ✅
@@ -45,10 +61,14 @@ on:
   schedule:
     # 03:00 UTC = 08:30 IST (instance-start). 03:15 UTC = 08:45 IST (pre-market).
     # 10:16 UTC = 15:46 IST (post-market, just after the 15:45 no-deploy band).
+    # 10:46 UTC = 16:16 IST + 11:31 UTC = 17:01 IST (scheduler-drop retries,
+    # 2026-07-02 — see header; idempotent sha check makes extras free).
     # Mon–Fri only.
     - cron: '0 3 * * 1-5'
     - cron: '15 3 * * 1-5'
     - cron: '16 10 * * 1-5'
+    - cron: '46 10 * * 1-5'
+    - cron: '31 11 * * 1-5'
   workflow_dispatch: {}
 
 concurrency:
