@@ -145,7 +145,15 @@ fn bench_build_tick_row_prevalidated_names(c: &mut Criterion) {
                 buffer
                     .table(t_ticks)?
                     .symbol(c_segment, "IDX_I")?
-                    .column_i64(c_security_id, i64::from(tick.security_id))?
+                    // `ParsedTick.security_id` is `u64` (2026-06-29 widening); the ILP
+                    // `security_id` LONG column is `i64`. Mirrors the production
+                    // conversion in `tick_persistence.rs` (`build_tick_row`):
+                    // `try_from` saturates a (never-produced) bit-63 id to i64::MAX
+                    // rather than wrapping it negative.
+                    .column_i64(
+                        c_security_id,
+                        i64::try_from(tick.security_id).unwrap_or(i64::MAX),
+                    )?
                     .column_f64(
                         c_ltp,
                         round_to_2dp(f32_to_f64_clean(tick.last_traded_price)),
