@@ -93,6 +93,28 @@ exists — forbidden feed; citation corrected for accuracy).
   - Files: .claude/rules/dhan/live-order-update.md, .claude/rules/project/websocket-connection-scope-lock.md
   - Tests: (doc)
 
+### Adversarial 4-agent verification addendum (2026-07-02, post-implementation pass)
+
+Hot-path: PASS on all 4 required checks (1 MEDIUM: bounded <=350ms thread::sleep
+on the QuestDB ERROR path only — documented, default-OFF feed; 2 LOW pre-existing).
+Security: token-minter path CLEAN, SQL gate no bypass, guards non-tautological
+(1 MEDIUM queued to PR-5: server-side confirm tokens for the 3 legacy destructive
+Lambda actions). Hostile: 3 HIGH + 1 LOW verified REAL and FIXED inline below;
+2 MEDIUM (F4 rotation-spanning downtime tail, F5 wipe/app-start race) queued to PR-5.
+
+- [x] F1 fix — cross-day offset-snapshot resume blocked (head 64→256 + ist_day field + day check)
+  - Files: crates/app/src/groww_bridge.rs
+  - Tests: test_resume_from_snapshot_decision_matrix
+- [x] F2 fix — rotation/persist race guard (skip persist when file-by-path shorter than drained offset)
+  - Files: crates/app/src/groww_bridge.rs
+  - Tests: test_resume_from_snapshot_decision_matrix
+- [x] F3 fix — ILP buffer bounded at 64 MiB; over cap pauses NDJSON consumption (capture file = durable spill; rising-edge error! + counter)
+  - Files: crates/app/src/groww_bridge.rs
+  - Tests: test_wake_read_budget_pauses_consumption_over_ilp_cap
+- [x] F6 fix — future-ts clamp fails OPEN on a degenerate ~1970 clock (min-plausible receipt guard; doc corrected)
+  - Files: crates/app/src/groww_bridge.rs
+  - Tests: test_validate_rejects_future_timestamp
+
 ## Scenarios
 
 | # | Scenario | Expected |
