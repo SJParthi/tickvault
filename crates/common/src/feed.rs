@@ -127,10 +127,10 @@ mod tests {
     #[test]
     fn test_both_feeds_runtime_toggleable() {
         for &feed in Feed::ALL {
+            let name = feed.as_str();
             assert!(
                 feed.is_runtime_toggleable(),
-                "{} must be runtime-toggleable (PR-E)",
-                feed.as_str()
+                "{name} must be toggleable (PR-E)"
             );
         }
     }
@@ -147,11 +147,8 @@ mod tests {
         // The feed-control page renders its switch label from display_name; every
         // feed in ALL must have one so a new feed's row is never blank.
         for &feed in Feed::ALL {
-            assert!(
-                !feed.display_name().is_empty(),
-                "{} must have a display_name",
-                feed.as_str()
-            );
+            let name = feed.as_str();
+            assert!(!feed.display_name().is_empty(), "{name} needs display_name");
         }
         assert_eq!(Feed::Dhan.display_name(), "Dhan");
         assert_eq!(Feed::Groww.display_name(), "Groww");
@@ -163,12 +160,8 @@ mod tests {
         // arrays indexed by index() line up with Feed::ALL.
         assert_eq!(Feed::COUNT, Feed::ALL.len());
         for (i, &feed) in Feed::ALL.iter().enumerate() {
-            assert_eq!(
-                feed.index(),
-                i,
-                "{} index must match ALL order",
-                feed.as_str()
-            );
+            let name = feed.as_str();
+            assert_eq!(feed.index(), i, "{name} index must match ALL order");
             assert!(feed.index() < Feed::COUNT);
         }
     }

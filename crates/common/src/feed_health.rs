@@ -795,6 +795,17 @@ mod tests {
     }
 
     #[test]
+    fn test_registry_default_matches_new_for_unwired_feed() {
+        // `Default` must be identical to `new()`: an un-instrumented feed
+        // reports no last-tick and zero counters (never a false Down).
+        let reg = FeedHealthRegistry::default();
+        assert!(reg.last_tick_age_secs(Feed::Dhan, T0).is_none());
+        let r = reg.snapshot(Feed::Dhan, true, true, true, T0);
+        assert_eq!(r.input.ticks_total, 0);
+        assert_eq!(r.input.candles_total, 0);
+    }
+
+    #[test]
     fn test_record_ticks_bumps_total_by_n() {
         // The honest-counter helper: increment ticks_total by exactly N in one
         // atomic add (Groww counts PERSISTED rows in flush-sized batches).

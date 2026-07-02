@@ -142,3 +142,55 @@ fn coverage_gate_source_has_no_anchored_match() {
         "scripts/coverage-gate.sh must keep the fail-closed empty-aggregation guard"
     );
 }
+
+/// 2026-07-02 fix: a crate EXACTLY AT its threshold must PASS — a ratchet
+/// floor means "at least the threshold". The old gate computed the percentage
+/// in binary floating point (`covered/count*100.0`), where a true ratio equal
+/// to the threshold can evaluate a hair BELOW it (e.g. `0.995` is not exactly
+/// representable), and printed it rounded to 1 decimal — producing the
+/// contradictory `FAIL: common 99.5% (threshold: 99.5%)` seen on main. The
+/// fixed gate compares exact rationals (`Fraction(covered*100, count)` vs the
+/// decimal threshold string), so exact-equal ALWAYS passes and just-below
+/// ALWAYS fails, at full precision.
+#[test]
+fn coverage_gate_exact_threshold_value_passes() {
+    // storage floor is 91.2 → 912 covered of 1000 lines is EXACTLY at it.
+    let json = coverage_json(&[file_entry(
+        "/home/runner/work/tickvault/tickvault/crates/storage/src/lib.rs",
+        1000,
+        912,
+    )]);
+    let (code, out) = run_gate("tv_gate_exact_at_floor.json", &json);
+    assert_eq!(
+        code, 0,
+        "coverage exactly AT the threshold must PASS (ratchet = at least):\n{out}"
+    );
+    assert!(
+        out.contains("PASS") && out.contains("storage"),
+        "exact-threshold crate must produce an explicit PASS row:\n{out}"
+    );
+}
+
+/// Companion boundary: one line BELOW the exact threshold must still FAIL —
+/// the exact-rational comparison must not introduce any pass-side slack, and
+/// the printed percentage now carries 2 decimals so a just-below value can no
+/// longer be DISPLAYED as visually equal to its threshold.
+#[test]
+fn coverage_gate_one_line_below_threshold_fails_with_honest_display() {
+    // 9119/10000 = 91.19% — strictly below the 91.2 storage floor.
+    let json = coverage_json(&[file_entry(
+        "/home/runner/work/tickvault/tickvault/crates/storage/src/lib.rs",
+        10000,
+        9119,
+    )]);
+    let (code, out) = run_gate("tv_gate_just_below_floor.json", &json);
+    assert_ne!(
+        code, 0,
+        "coverage strictly below the threshold must FAIL:\n{out}"
+    );
+    assert!(
+        out.contains("91.19"),
+        "the FAIL row must display the true 2-decimal value (91.19), never a \
+         rounded 91.2 that looks equal to the threshold:\n{out}"
+    );
+}

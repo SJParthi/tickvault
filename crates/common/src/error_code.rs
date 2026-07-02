@@ -1363,20 +1363,16 @@ mod tests {
     fn test_all_variants_have_unique_code_str() {
         let mut seen: HashSet<&'static str> = HashSet::new();
         for code in ErrorCode::all() {
-            assert!(
-                seen.insert(code.code_str()),
-                "duplicate code_str: {}",
-                code.code_str()
-            );
+            let cs = code.code_str();
+            assert!(seen.insert(cs), "duplicate code_str: {cs}");
         }
     }
 
     #[test]
     fn test_code_str_roundtrip_via_from_str() {
         for code in ErrorCode::all() {
-            let parsed: ErrorCode = code.code_str().parse().unwrap_or_else(|e| {
-                panic!("FromStr failed to roundtrip for {}: {e:?}", code.code_str())
-            });
+            let cs = code.code_str();
+            let parsed: ErrorCode = cs.parse().unwrap_or_else(|e| panic!("{cs}: {e:?}"));
             assert_eq!(parsed, *code);
         }
     }
@@ -1390,17 +1386,12 @@ mod tests {
     #[test]
     fn test_every_variant_has_non_empty_runbook_path() {
         for code in ErrorCode::all() {
+            let cs = code.code_str();
             let path = code.runbook_path();
-            assert!(
-                !path.is_empty(),
-                "runbook_path empty for {}",
-                code.code_str()
-            );
+            assert!(!path.is_empty(), "runbook_path empty for {cs}");
             assert!(
                 path.starts_with(".claude/"),
-                "runbook_path for {} should point at .claude/: got {}",
-                code.code_str(),
-                path
+                "{cs} must point at .claude/: {path}"
             );
         }
     }
@@ -1426,10 +1417,10 @@ mod tests {
     fn test_critical_codes_never_auto_triage() {
         for code in ErrorCode::all() {
             if code.severity() == Severity::Critical {
+                let cs = code.code_str();
                 assert!(
                     !code.is_auto_triage_safe(),
-                    "{} is Critical but is_auto_triage_safe returned true",
-                    code.code_str()
+                    "{cs} is Critical but auto-triage-safe"
                 );
             }
         }
@@ -1627,11 +1618,8 @@ mod tests {
             .and_then(std::path::Path::parent)
             .map(|root| root.join(code.runbook_path()))
             .expect("workspace root");
-        assert!(
-            abs.exists(),
-            "PREVDAY-01 runbook missing on disk: {}",
-            abs.display()
-        );
+        let shown = abs.display().to_string();
+        assert!(abs.exists(), "PREVDAY-01 runbook missing on disk: {shown}");
         // Listed in the catalogue.
         assert!(ErrorCode::all().contains(&code));
     }

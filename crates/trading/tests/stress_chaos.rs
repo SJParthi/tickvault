@@ -67,15 +67,62 @@ mod stress_rate_limiter {
 
     #[test]
     fn test_stress_rate_limiter_high_burst_all_pass() {
-        // With burst = 1000, all 1000 should pass instantly.
-        let limiter = OrderRateLimiter::new(1000);
-        for i in 0..1000 {
-            assert!(
-                limiter.check().is_ok(),
-                "order {i} within high burst must pass"
+        // With burst = 1000, all 1000 must pass. The limiter's GCRA quota is
+        // wall-clock based (`Quota::per_second(1000)` = one cell re-earned
+        // every 1ms), so under slow instrumented runs (llvm-cov, sanitizers,
+        // loaded CI) the burst itself can take >1ms and legitimately re-earn
+        // cells — a fixed "order 1001 must be denied" assertion is a timing
+        // flake (observed in main CI run #3843). Assert the actual GCRA
+        // wall-clock contract instead:
+        //   allowed is ALWAYS >= burst, and NEVER > burst + rate * elapsed.
+        // The strict order-1001 denial is asserted only when the burst
+        // provably completed inside one refill period (elapsed < 1ms).
+        const BURST: u32 = 1000;
+        const REFILL_PERIOD: std::time::Duration = std::time::Duration::from_millis(1);
+
+        let limiter = OrderRateLimiter::new(BURST);
+        let start = std::time::Instant::now();
+        let mut allowed = 0_u32;
+        let mut denied = 0_u32;
+        for _ in 0..=BURST {
+            match limiter.check() {
+                Ok(()) => allowed += 1,
+                Err(_) => denied += 1,
+            }
+        }
+        let elapsed = start.elapsed();
+
+        // Invariant 1: the full burst capacity must always be honored.
+        assert!(
+            allowed >= BURST,
+            "all {BURST} orders within high burst must pass, allowed={allowed}"
+        );
+
+        // Invariant 2: GCRA upper bound — allowance can never exceed
+        // burst + cells re-earned by wall-clock elapse during the loop.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let refilled = (elapsed.as_secs_f64() * f64::from(BURST)).ceil() as u32;
+        assert!(
+            allowed <= BURST.saturating_add(refilled),
+            "allowed={allowed} exceeds GCRA bound burst({BURST}) + refilled({refilled}) over {elapsed:?}"
+        );
+
+        if elapsed < REFILL_PERIOD {
+            // Fast path (normal builds): zero cells could have refilled, so
+            // order 1001 is deterministically denied.
+            assert_eq!(
+                denied, 1,
+                "order 1001 must be denied when burst completed in {elapsed:?} (< one 1ms GCRA refill period)"
+            );
+        } else {
+            // Slow environment (instrumented build): wall-clock refill makes
+            // strict denial unverifiable — the GCRA bound above still holds.
+            eprintln!(
+                "SKIP strict order-1001 denial: burst took {elapsed:?} (>= 1ms refill period); \
+                 wall-clock GCRA legitimately re-earned up to {refilled} cell(s). \
+                 allowed={allowed} denied={denied}"
             );
         }
-        assert!(limiter.check().is_err(), "order 1001 must be denied");
     }
 
     #[test]
