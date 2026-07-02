@@ -1,6 +1,6 @@
 # Implementation Plan: Surface Groww sidecar stderr/diagnostics to tracing + feed_health + Telegram
 
-**Status:** APPROVED
+**Status:** VERIFIED (reconciled 2026-07-02 — audit verified all items shipped on origin/main)
 **Date:** 2026-06-29
 **Approved by:** Parthiban (operator) — "fix everything", this session
 
@@ -187,10 +187,10 @@ key; Groww is default-OFF so prod behaviour is byte-identical until enabled.
 
 ## Plan Items
 
-- [ ] Add `SidecarLineClass` + pure `classify_sidecar_line` to the supervisor; pipe stdout/stderr; drain via BufReader lines tasks; edge-triggered feed_health + Telegram on reject/error.
+- [x] Add `SidecarLineClass` + pure `classify_sidecar_line` to the supervisor; pipe stdout/stderr; drain via BufReader lines tasks; edge-triggered feed_health + Telegram on reject/error. — DONE on main: `classify_sidecar_line` in `crates/app/src/groww_sidecar_supervisor.rs`
   - Files: crates/app/src/groww_sidecar_supervisor.rs, crates/app/src/main.rs
   - Tests: test_classify_sidecar_line_*, test_sidecar_line_class_triggers_alert, test_supervisor_pipes_and_drains_child_stdio
-- [ ] Add typed `NotificationEvent::GrowwSidecarRejected { reason }` (to_message/topic/severity) + render test.
+- [x] Add typed `NotificationEvent::GrowwSidecarRejected { reason }` (to_message/topic/severity) + render test. — DONE on main: `GrowwSidecarRejected` in `crates/core/src/notification/events.rs`
   - Files: crates/core/src/notification/events.rs
   - Tests: test_groww_sidecar_rejected_renders_reason_and_topic_and_severity
 

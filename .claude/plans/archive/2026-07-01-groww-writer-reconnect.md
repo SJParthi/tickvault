@@ -1,6 +1,6 @@
 # Implementation Plan: Groww QuestDB tick-writer reconnect + honest persisted-row counter
 
-**Status:** APPROVED
+**Status:** VERIFIED (reconciled 2026-07-02 — audit verified all items shipped on origin/main)
 **Date:** 2026-06-29
 **Approved by:** Parthiban (operator) — grounded directive, this session
 
@@ -143,12 +143,12 @@ follow-up, not part of this minimal correctness fix.
 
 ## Plan Items
 
-- [ ] Add `ilp_conf` field + lazy reconnect to `GrowwLiveTickWriter::flush` (returns `Ok(usize)` rows flushed; buffer retained on failure; drop-and-reconnect on existing-sender Err)
+- [x] Add `ilp_conf` field + lazy reconnect to `GrowwLiveTickWriter::flush` (returns `Ok(usize)` rows flushed; buffer retained on failure; drop-and-reconnect on existing-sender Err) — DONE on main: `ilp_conf` + `flush() -> Result<GrowwFlushOutcome>` at `crates/storage/src/groww_persistence.rs:326`
   - Files: crates/storage/src/groww_persistence.rs
   - Tests: test_writer_stores_conf_for_reconnect, test_disconnected_flush_errs_and_retains_buffer
-- [ ] Add `FeedHealth::record_ticks(feed, n, ts)` (single fetch_add)
+- [x] Add `FeedHealth::record_ticks(feed, n, ts)` (single fetch_add) — DONE on main: `record_ticks` in `crates/common/src/feed_health.rs`
   - Files: crates/common/src/feed_health.rs
   - Tests: test_record_ticks_bumps_total_by_n, test_record_ticks_zero_is_noop
-- [ ] Move the Groww counter from per-append to post-successful-flush; count persisted rows
+- [x] Move the Groww counter from per-append to post-successful-flush; count persisted rows — DONE on main: post-flush `record_ticks` counting wired in `crates/app/src/groww_bridge.rs`
   - Files: crates/app/src/groww_bridge.rs
   - Tests: covered by storage flush return + common record_ticks unit tests
