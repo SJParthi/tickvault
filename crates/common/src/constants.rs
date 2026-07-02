@@ -613,17 +613,24 @@ pub const DHAN_SANDBOX_TOKEN_SECRET: &str = "sandbox-token";
 // `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`
 // ---------------------------------------------------------------------------
 
-/// SSM service path segment for Groww credentials.
-/// Full paths: `/tickvault/<env>/groww/api-key` + `/tickvault/<env>/groww/totp-secret`.
+/// SSM service path segment for the Groww feed.
+/// Full path read by TickVault: `/tickvault/<env>/groww/access-token` ONLY.
 pub const SSM_GROWW_SERVICE: &str = "groww";
 
-/// SSM secret name for the Groww API key (the "TOTP token" from the Groww
-/// trade-api keys page; sent as `Authorization: Bearer <api_key>`).
-pub const GROWW_API_KEY_SECRET: &str = "api-key";
-
-/// SSM secret name for the Groww TOTP secret (the seed for the rotating
-/// 6-digit code; SHA1 / 6 digits / 30s — same as Dhan).
-pub const GROWW_TOTP_SECRET: &str = "totp-secret";
+/// SSM parameter name for the Groww ACCESS TOKEN — the daily token minted by
+/// the bruteX-owned `groww-token-minter` Lambda (~06:05 IST, EventBridge) into
+/// `/tickvault/<env>/groww/access-token` (SecureString, KMS
+/// `alias/tickvault-groww`). TickVault is a READ-ONLY consumer of this ONE
+/// parameter (IAM reader role `groww-token-minter-reader-tickvault`).
+///
+/// Operator lock 2026-07-02
+/// (`.claude/rules/project/groww-shared-token-minter-2026-07-02.md`):
+/// TickVault NEVER mints a Groww token, NEVER reads the `api-key` /
+/// `totp-secret` credential parameters (Lambda-only), and NEVER writes any
+/// `/tickvault/*/groww/*` parameter. The former credential-name constants were
+/// deleted with the mint path; ratchet:
+/// `crates/common/tests/groww_no_mint_guard.rs`.
+pub const GROWW_ACCESS_TOKEN_SECRET: &str = "access-token";
 
 /// Groww master instrument CSV (public static asset, no auth). Source of every
 /// Groww `exchange_token` — joined to NTM ISINs to build the watch-list (§31).

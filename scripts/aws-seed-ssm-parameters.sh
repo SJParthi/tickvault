@@ -25,10 +25,15 @@
 #   /tickvault/<env>/dhan/sandbox-client-id  (SecureString — sandbox mode only)
 #   /tickvault/<env>/dhan/sandbox-token      (SecureString — sandbox mode only)
 #   /tickvault/<env>/sns/phone-number        (String — for CloudWatch SMS alarms)
-#   /tickvault/<env>/groww/api-key           (SecureString — REQUIRED when groww_enabled=true; else the Groww sidecar's SSM fetch backs off forever and Groww silently produces ZERO ticks while Dhan runs fine)
-#   /tickvault/<env>/groww/totp-secret       (SecureString — REQUIRED when groww_enabled=true)
 #
-# Groww env-var names for --from-env mode: TV_GROWW_API_KEY, TV_GROWW_TOTP_SECRET
+# GROWW: this script seeds NOTHING under /tickvault/<env>/groww/* — shared
+# token-minter lock 2026-07-02
+# (.claude/rules/project/groww-shared-token-minter-2026-07-02.md). The bruteX
+# repo's groww-token-minter Lambda owns the groww/api-key + groww/totp-secret
+# credential parameters AND writes the daily groww/access-token; TickVault is
+# a READ-ONLY consumer of the access-token parameter and must NEVER write any
+# groww/* parameter (uncoordinated writes/mints can invalidate the shared
+# token mid-session for BruteX).
 #
 # Usage:
 #   scripts/aws-seed-ssm-parameters.sh                        # interactive, env=dev
@@ -220,16 +225,13 @@ fi
 
 put_param "/tickvault/${ENVIRONMENT}/sns/phone-number" TV_SNS_PHONE_NUMBER String "+CountryCode-PhoneNumber for SMS alarms (e.g. +91...)" || true
 
-# Groww second live feed (feed #2). REQUIRED when groww_enabled=true — which is
-# the prod default (config/production.toml). Without these two the Groww
-# sidecar's SSM fetch backs off FOREVER and Groww silently produces ZERO ticks
-# while Dhan runs fine. Optional here (skip with empty input) because Groww is
-# default-OFF in dev; a prod run MUST provide them or Groww stays dark.
-if [ "$ENVIRONMENT" = "prod" ]; then
-    warn "prod runs Groww (groww_enabled=true) — the 2 groww/* params below are REQUIRED; empty input leaves the Groww feed silent (zero ticks)"
-fi
-put_param "/tickvault/${ENVIRONMENT}/groww/api-key"     TV_GROWW_API_KEY     SecureString "Groww API key (feed #2; required when groww_enabled)" || true
-put_param "/tickvault/${ENVIRONMENT}/groww/totp-secret" TV_GROWW_TOTP_SECRET SecureString "Groww TOTP secret (feed #2; required when groww_enabled)" || true
+# Groww second live feed (feed #2): NO SEEDING HERE — shared token-minter lock
+# 2026-07-02. The Groww credential parameters (groww/api-key, groww/totp-secret)
+# are owned + read ONLY by the bruteX groww-token-minter Lambda, and the daily
+# groww/access-token is WRITTEN only by that Lambda. TickVault reads the
+# access-token parameter read-only at runtime and must never write any
+# /tickvault/<env>/groww/* parameter from this repo.
+info "groww/*: skipped by design — owned by the bruteX groww-token-minter (TickVault is a read-only access-token consumer)"
 
 echo ""
 

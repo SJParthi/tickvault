@@ -254,62 +254,54 @@ async fn activate_groww_lane(
     use tickvault_core::auth::secret_manager::{build_ssm_path, resolve_environment};
     use tickvault_core::feed::groww::auth::GrowwAuthSmokeError;
     let env = resolve_environment().unwrap_or_else(|_| "<unresolved>".to_string());
-    let api_key_path = build_ssm_path(
+    let token_param_path = build_ssm_path(
         &env,
         tickvault_common::constants::SSM_GROWW_SERVICE,
-        tickvault_common::constants::GROWW_API_KEY_SECRET,
-    );
-    let totp_path = build_ssm_path(
-        &env,
-        tickvault_common::constants::SSM_GROWW_SERVICE,
-        tickvault_common::constants::GROWW_TOTP_SECRET,
+        tickvault_common::constants::GROWW_ACCESS_TOKEN_SECRET,
     );
     match tickvault_core::feed::groww::auth::run_groww_auth_smoke_check(auth_timeout_ms).await {
         Ok(()) => {
-            // Auth recovered / valid — clear any stale auth-rejected flag so the
-            // Feed Control page resolves back to a normal verdict.
+            // Token present + plausible — clear any stale auth-rejected flag so
+            // the Feed Control page resolves back to a normal verdict.
             feed_health.set_auth_rejected(Feed::Groww, false);
         }
-        Err(GrowwAuthSmokeError::Rejected { status, body }) => {
-            // Groww RECEIVED the request and refused the credential — the
-            // actionable "refresh the SSM api-key" case. Surface it on the Feed
-            // Control page AND name the env + both SSM paths + Groww's verbatim
-            // (already-redacted) status+body in the log. The api-key/TOTP values
-            // are NEVER in `body` (it is the response body, not the request).
+        Err(GrowwAuthSmokeError::Rejected { status: _, body }) => {
+            // The token parameter was READ but its value is unusable (empty /
+            // placeholder) — the actionable "the bruteX groww-token-minter
+            // Lambda has not populated the token" case. Surface it on the Feed
+            // Control page. TickVault NEVER mints a replacement (shared
+            // token-minter lock 2026-07-02).
             feed_health.set_auth_rejected(Feed::Groww, true);
             error!(
                 env = %env,
-                api_key_path = %api_key_path,
-                totp_secret_path = %totp_path,
-                status,
+                token_param_path = %token_param_path,
                 body = %body,
-                "Groww access-token auth REJECTED by Groww — refresh the Groww SSM \
-                 api-key. Ensure the SSM api-key is a Groww TOTP token (not a \
-                 regular API Key) and the Trading API subscription is active"
+                "Groww shared access token UNUSABLE — check the bruteX \
+                 groww-token-minter Lambda's last daily mint (~06:05 IST); \
+                 TickVault is a read-only consumer and never mints"
             );
         }
         Err(GrowwAuthSmokeError::Transport(reason)) => {
-            // Could not reach Groww — a network blip, NOT a credential fault. Do
-            // NOT set auth-rejected (would falsely blame the key + stick red).
+            // Retained for API compatibility; the SSM-read smoke check does
+            // not construct this variant.
             error!(
                 env = %env,
-                api_key_path = %api_key_path,
-                totp_secret_path = %totp_path,
+                token_param_path = %token_param_path,
                 reason = %reason,
-                "Groww access-token auth smoke-check could not reach Groww \
-                 (transient) — the credential is NOT marked rejected; retrying \
-                 via the watch-list build / sidecar"
+                "Groww token smoke-check transport failure (transient) — the \
+                 token is NOT marked rejected"
             );
         }
         Err(GrowwAuthSmokeError::Credentials(reason)) => {
-            // SSM fetch / local setup failed before the request went out.
+            // The SSM read itself failed (parameter missing / IAM / network) —
+            // an infra fault, NOT a token-value problem; do NOT mark rejected.
             error!(
                 env = %env,
-                api_key_path = %api_key_path,
-                totp_secret_path = %totp_path,
+                token_param_path = %token_param_path,
                 reason = %reason,
-                "Groww access-token auth smoke-check failed before reaching Groww \
-                 — verify the api-key + totp-secret exist at the SSM paths above"
+                "Groww access-token SSM read failed — verify the reader role \
+                 (groww-token-minter-reader-tickvault) can GetParameter+Decrypt \
+                 the token param above; TickVault never mints a fallback"
             );
         }
     }
