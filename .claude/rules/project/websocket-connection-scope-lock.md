@@ -49,7 +49,7 @@ And the immediate follow-up:
 | ❌ Forbidden FOREVER | Why |
 |---|---|
 | Depth-20 connections (`wss://depth-api-feed.dhan.co/twentydepth`) | Operator lock 2026-05-15; depth not in product scope for any phase. Modules deleted in PR #4 (#707). |
-| Depth-200 connections (`wss://full-depth-api.dhan.co/?token=...`) | Same |
+| Depth-200 connections (`wss://full-depth-api.dhan.co/twohundreddepth` per the official Full Market Depth page; an earlier citation here used the retired `/?token=` form) | Same |
 | Any 2nd/3rd/4th/5th main-feed conn | 4 SIDs fit comfortably on 1 conn (Dhan cap = 5,000/conn); more conns waste token+IP budget. `effective_main_feed_pool_size` returns constant 1. |
 | Any new WebSocket endpoint Dhan introduces in future | Not in scope without operator explicit re-approval |
 | NSE_EQ / BSE_EQ subscriptions (including F&O underlying cash equities) | AWS-lifecycle PR #7 dropped the 218 NSE_EQ universe; `SubscriptionScope::Indices4Only` has no path to emit them. |

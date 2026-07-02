@@ -429,6 +429,18 @@ impl GrowwLiveTickWriter {
     /// means rows appended while disconnected are NOT lost — they drain on the
     /// first successful flush after reconnect. Cold path: only runs when `sender`
     /// is `None`.
+    ///
+    /// HONEST ENVELOPE — connect-leg timeout (PR-4 M-B, 2026-07-02): the
+    /// retry LADDER is bounded (3 attempts, ≤350ms backoff sum, ratcheted by
+    /// `test_flush_reconnect_ladder_is_bounded`), but each `Sender::from_conf`
+    /// TCP connect leg rides the OS kernel connect timeout (can be minutes
+    /// against a black-holed host). The questdb crate's TCP transport exposes
+    /// no connect-timeout knob, and guessing conf-string params risks a silent
+    /// `sender = None` (zero Groww persistence) — so the kernel default is the
+    /// documented envelope, NOT papered over. In practice the failure mode we
+    /// see (QuestDB down / restarting on the same box) refuses instantly; the
+    /// black-hole case is bounded by the producer's capture-at-receipt
+    /// spill/DLQ floor. Future lift: HTTP ILP transport (request timeouts).
     fn reconnect(&mut self) -> Result<()> {
         let new_sender =
             Sender::from_conf(&self.ilp_conf).context("groww_live_ticks: ILP reconnect failed")?;
@@ -625,6 +637,32 @@ mod tests {
                 .all(|w| w[0] <= w[1]),
             "backoff must be non-decreasing"
         );
+    }
+
+    #[test]
+    fn test_flush_reconnect_ladder_is_bounded() {
+        // PR-4 M-B ratchet: the flush retry ladder must stay BOUNDED — a future
+        // edit re-widening it to an unbounded `loop`/`while` (stalling the
+        // bridge wake forever on a wedged QuestDB) fails this build. Source-scan
+        // pins: (a) the loop iterates `0..=GROWW_FLUSH_RECONNECT_MAX_RETRIES`,
+        // (b) the buffer-retained contract is documented, (c) the connect-leg
+        // kernel-timeout envelope stays documented honestly (not deleted).
+        let src = include_str!("groww_persistence.rs");
+        assert!(
+            src.contains("for attempt in 0..=GROWW_FLUSH_RECONNECT_MAX_RETRIES"),
+            "flush retry loop must be bounded by GROWW_FLUSH_RECONNECT_MAX_RETRIES"
+        );
+        assert!(
+            src.contains("buffer + `pending` RETAINED"),
+            "retained-buffer contract doc must stay in the flush docs"
+        );
+        assert!(
+            src.contains("HONEST ENVELOPE — connect-leg timeout"),
+            "the connect-leg kernel-timeout envelope doc must not be deleted"
+        );
+        // Constants re-pinned here so the ratchet is self-contained.
+        assert_eq!(GROWW_FLUSH_RECONNECT_MAX_RETRIES, 3);
+        assert!(GROWW_FLUSH_RECONNECT_BACKOFF_MS.iter().sum::<u64>() <= 350);
     }
 
     #[test]
