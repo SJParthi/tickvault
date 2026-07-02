@@ -77,6 +77,23 @@ rollback).
   `tv_wipe_operations_total{scope, outcome}` counter, `error!` with code on
   failures.
 
+## Per-Item Guarantee Matrix
+
+Every item in this plan carries the 15-row 100% Guarantee Matrix and the 7-row
+Resilience Demand Matrix by cross-reference to the canonical rule —
+`.claude/rules/project/per-wave-guarantee-matrix.md` (Item 22 / Item 24 style):
+coverage via the unit + handler-gate + ratchet tests listed per item; audit via
+the new `wipe_audit` table (DEDUP keys, audit-first ordering); monitoring via
+`tv_wipe_operations_total{scope, outcome}`; logging via `error!` on failures;
+alerting via the Severity::Critical Telegram on every executed wipe; security
+via the 5-gate server-side chain (auth, market-hours, confirm, feed-disabled,
+in-flight lock); extreme check via `wipe_gates_guard.rs` failing the build if
+any gate or the audit-first ordering regresses. Honest envelope: wipes are
+operator-invoked destructive actions — the guarantee is that they cannot fire
+accidentally (5 gates), cannot run mid-market, cannot race a live writer, and
+are always forensically recorded; the EVERYTHING scope crosses the SEBI
+retention rows ONLY under the operator's recorded 2026-07-02 override.
+
 ## Plan Items
 - [ ] `wipe_audit` persistence + wipe-plan pure builder
   - Files: crates/storage/src/wipe_audit_persistence.rs, crates/api/src/handlers/wipe.rs
