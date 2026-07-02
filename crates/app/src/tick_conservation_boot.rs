@@ -354,18 +354,13 @@ pub async fn run_tick_conservation_audit(
 
     // 3. QuestDB row count for the IST day window. `ts` stores IST-epoch
     //    nanos, so the day window is [day*86400, (day+1)*86400) seconds in
-    //    ts-space (data-integrity.md).
+    //    ts-space (data-integrity.md). Feed-filtered to 'dhan' — the shared
+    //    `ticks` table also carries feed='groww' rows, which would otherwise
+    //    inflate this lane's db_rows and mask the runbook's
+    //    "db_rows vs persisted ⇒ DEDUP collapse / WAL lag" triage.
     let mut db_rows: i64 = -1;
     if let Some(ref client) = client {
-        // APPROVED: u64→i64 — IST day numbers are ~20K, far below i64::MAX.
-        let day_start_nanos = i64::try_from(target_ist_day)
-            .unwrap_or(0)
-            .saturating_mul(86_400)
-            .saturating_mul(1_000_000_000);
-        let day_end_nanos = day_start_nanos.saturating_add(86_400_000_000_000);
-        let sql = format!(
-            "select count() from ticks where ts >= {day_start_nanos} and ts < {day_end_nanos}"
-        );
+        let sql = build_conservation_ticks_count_sql(CONSERVATION_FEED_DHAN, target_ist_day);
         let url = format!(
             "http://{}:{}/exec",
             questdb_config.host, questdb_config.http_port
@@ -485,6 +480,26 @@ pub async fn run_tick_conservation_audit(
 /// Nanoseconds in one IST day — the day-window width for the conservation scan.
 const NANOS_PER_IST_DAY: i64 = 86_400_000_000_000;
 
+/// Build the feed-filtered per-IST-day `ticks` count SQL for a conservation
+/// run. Pure. BOTH lanes go through this so neither query can silently drop
+/// the `feed` predicate again — the shared `ticks` table carries every feed's
+/// rows, and an unfiltered count inflates one lane's `db_rows` with the other
+/// lane's ticks (2026-07-02 adversarial-sweep finding). `feed` is a compile-time
+/// constant (`CONSERVATION_FEED_*`), never user input — no injection surface.
+#[must_use]
+pub fn build_conservation_ticks_count_sql(feed: &str, target_ist_day: u64) -> String {
+    // APPROVED: IST day numbers are ~20K, far below i64::MAX — saturating keeps adversarial inputs bounded.
+    let day_start_nanos = i64::try_from(target_ist_day)
+        .unwrap_or(0)
+        .saturating_mul(86_400)
+        .saturating_mul(1_000_000_000);
+    let day_end_nanos = day_start_nanos.saturating_add(NANOS_PER_IST_DAY);
+    format!(
+        "select count() from ticks where feed = '{feed}' \
+         and ts >= {day_start_nanos} and ts < {day_end_nanos}"
+    )
+}
+
 /// Extract `ts_ist_nanos` from one Groww NDJSON tick line. Pure. Returns `None`
 /// for a malformed / ts-less / non-positive line (skipped, never panics).
 #[must_use]
@@ -538,8 +553,12 @@ pub fn count_groww_ndjson_lines_for_ist_day(path: &Path, target_ist_day: u64) ->
 /// residual because the WAL is a strict one-write-per-frame ground truth), a
 /// positive Groww residual (`ndjson_lines − persisted_groww`) is EXPECTED for
 /// BENIGN reasons — the in-flight NDJSON tail not yet drained at 15:40, and
-/// DEDUP collapse of lines re-tailed from the persisted byte-offset after a
-/// same-day restart (same monotonic `capture_seq` → collapsed in QuestDB). So a
+/// lines the bridge's stricter validation rejects before persist (e.g. a
+/// timestamp outside its accepted range). A same-day restart is residual-
+/// NEUTRAL: the bridge's byte-offset is in-memory only, so it re-tails the
+/// whole file from byte 0, but the deterministic `capture_seq` (seeded from
+/// `ts_ist_nanos`) regenerates identical keys → QuestDB DEDUP collapses the
+/// replay; neither the NDJSON count nor db_rows moves. So a
 /// non-zero residual is classified `Partial` (a recorded DIAGNOSTIC), NEVER
 /// `Leak` — this deliberately avoids the false-loss CRITICAL page a naive
 /// `residual>0 ⇒ leak` would produce. The forensic row + the numbers are still
@@ -596,23 +615,19 @@ pub async fn run_groww_tick_conservation_audit(
         }
     };
 
-    // 2. PERSISTED — feed='groww' ticks in QuestDB for the IST day.
+    // 2. PERSISTED — feed='groww' ticks in QuestDB for the IST day. Bounded
+    //    client: `Client::new()` has NO total-request timeout, so a wedged
+    //    QuestDB could park this cold-path task forever (2026-07-02 sweep).
     let mut groww_db_rows: i64 = -1;
+    if let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(AUDIT_HTTP_TIMEOUT_SECS))
+        .build()
     {
-        let day_start_nanos = i64::try_from(target_ist_day)
-            .unwrap_or(0)
-            .saturating_mul(86_400)
-            .saturating_mul(1_000_000_000);
-        let day_end_nanos = day_start_nanos.saturating_add(NANOS_PER_IST_DAY);
-        let sql = format!(
-            "select count() from ticks where feed = '{CONSERVATION_FEED_GROWW}' \
-             and ts >= {day_start_nanos} and ts < {day_end_nanos}"
-        );
+        let sql = build_conservation_ticks_count_sql(CONSERVATION_FEED_GROWW, target_ist_day);
         let url = format!(
             "http://{}:{}/exec",
             questdb_config.host, questdb_config.http_port
         );
-        let client = reqwest::Client::new();
         match client
             .get(&url)
             .query(&[("query", sql.as_str())])
@@ -730,6 +745,33 @@ mod tests {
         let path = dir.join("live-ticks.ndjson");
         std::fs::write(&path, lines.join("\n")).expect("write ndjson");
         (TmpDir(dir), path)
+    }
+
+    #[test]
+    fn test_build_conservation_ticks_count_sql_feed_filtered() {
+        // Both lanes' counts MUST be feed-filtered — the shared `ticks` table
+        // carries every feed's rows (2026-07-02 sweep: the unfiltered Dhan
+        // count silently included Groww rows on a both-feeds day).
+        let dhan = build_conservation_ticks_count_sql(CONSERVATION_FEED_DHAN, GROWW_TEST_DAY);
+        let groww = build_conservation_ticks_count_sql(CONSERVATION_FEED_GROWW, GROWW_TEST_DAY);
+        assert!(
+            dhan.contains("feed = 'dhan'"),
+            "Dhan count must filter feed: {dhan}"
+        );
+        assert!(
+            groww.contains("feed = 'groww'"),
+            "Groww count must filter feed: {groww}"
+        );
+        // Exact day window bounds: [day*86400e9, (day+1)*86400e9).
+        let start = (GROWW_TEST_DAY as i64) * 86_400 * 1_000_000_000;
+        let end = start + 86_400_000_000_000;
+        for sql in [&dhan, &groww] {
+            assert!(
+                sql.contains(&format!("ts >= {start}")),
+                "window start: {sql}"
+            );
+            assert!(sql.contains(&format!("ts < {end}")), "window end: {sql}");
+        }
     }
 
     #[test]

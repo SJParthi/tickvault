@@ -1,14 +1,15 @@
-//! Source-scan ratchet (Z+ L4 PREVENT / L5 AUDIT) pinning that BOTH the Dhan
-//! and Groww daily tick-conservation audits are actually wired into boot at
-//! 15:40:00 IST.
+//! Source-scan ratchet (Z+ L4 PREVENT / L5 AUDIT) pinning that the daily
+//! 15:40 IST tick-conservation audit is wired PROCESS-GLOBALLY for BOTH feeds.
 //!
-//! Background: the Dhan conservation audit reconciles the WAL frame count vs
-//! the processor outcome counters vs the persisted `feed='dhan'` ticks. The
-//! Groww lane reconciles the sidecar NDJSON delivered-count vs the persisted
-//! `feed='groww'` ticks — closing the audit-coverage gap where the Groww feed
-//! wrote ticks but no daily conservation row. If either spawn is silently
-//! removed from `main.rs`, the daily zero-tick-loss audit stops firing for that
-//! feed with no other signal — this guard fails the build first.
+//! Background (2026-07-02 adversarial sweep): the conservation task originally
+//! lived inside `spawn_post_market_tasks`, whose two call sites are BOTH
+//! Dhan-gated — so a Groww-only session (`dhan_enabled=false`) ran ZERO
+//! conservation audits all day (silent audit-coverage hole), and every runtime
+//! Dhan disable→enable cycle spawned a DUPLICATE post-market task family. The
+//! fix hoisted the conservation spawn into `main()`'s process-global prefix
+//! (`spawn_daily_tick_conservation_task`, feed-gated per lane at 15:40) and
+//! once-guarded `spawn_post_market_tasks`. This guard fails the build if any
+//! of that topology regresses.
 //!
 //! Mirrors the codebase's `*_is_wired` guard pattern
 //! (`orphan_position_watchdog_wiring_guard.rs`,
@@ -39,17 +40,69 @@ fn test_groww_tick_conservation_audit_is_wired_into_main() {
     assert!(
         src.contains("run_groww_tick_conservation_audit("),
         "main.rs must call run_groww_tick_conservation_audit(...) at 15:40 IST — \
-         otherwise the Groww feed writes ticks but no daily conservation row \
-         (the audit-coverage gap this slice closes)."
+         otherwise the Groww feed writes ticks but no daily conservation row."
     );
 }
 
 #[test]
-fn test_groww_conservation_is_runtime_gated_and_shares_the_dhan_window() {
-    // The Groww run must live AFTER the Dhan run (same 15:40 IST spawned task,
-    // same target_ist_day/window) and be gated on the truthful runtime "is
-    // Groww enabled" Arc so a Dhan-only session writes no misleading zero row.
+fn test_conservation_spawn_lives_in_common_path_not_post_market() {
+    // The conservation task MUST be process-global: spawned from main()'s
+    // common prefix via spawn_daily_tick_conservation_task, NOT from inside
+    // the Dhan-gated spawn_post_market_tasks (the 2026-07-02 CRITICAL: a
+    // Groww-only boot never reached it there).
     let src = main_rs_source();
+    let spawn_def_idx = src
+        .find("fn spawn_daily_tick_conservation_task(")
+        .expect("spawn_daily_tick_conservation_task must exist in main.rs");
+    let call_count = src.matches("spawn_daily_tick_conservation_task(").count();
+    assert!(
+        call_count >= 2,
+        "spawn_daily_tick_conservation_task must be defined once and CALLED at \
+         least once from main()'s process-global prefix (>= 2 textual mentions); \
+         found {call_count}."
+    );
+    // No conservation run may appear inside spawn_post_market_tasks: every
+    // run_*_tick_conservation_audit mention must live inside the dedicated
+    // spawn fn (which is defined AFTER spawn_post_market_tasks in the file) —
+    // i.e. after the post-market fn's definition point AND after the dedicated
+    // fn's definition point.
+    let post_market_def_idx = src
+        .find("fn spawn_post_market_tasks(")
+        .expect("spawn_post_market_tasks must exist in main.rs");
+    for pat in [
+        "run_tick_conservation_audit(",
+        "run_groww_tick_conservation_audit(",
+    ] {
+        let mut search_from = 0;
+        while let Some(rel) = src[search_from..].find(pat) {
+            let abs = search_from + rel;
+            assert!(
+                abs > spawn_def_idx && abs > post_market_def_idx,
+                "conservation run `{pat}` found at byte {abs}, before the \
+                 dedicated spawn fn (byte {spawn_def_idx}) — a conservation run \
+                 must not be re-nested into a Dhan-gated path."
+            );
+            search_from = abs + pat.len();
+        }
+    }
+}
+
+#[test]
+fn test_both_feed_gates_present_and_groww_after_dhan() {
+    // Each lane's 15:40 run is gated on the truthful runtime feed flag so a
+    // disabled lane writes no misleading zero-balanced row; the Groww run is
+    // sequenced after the Dhan run in the same task (same IST day/window).
+    let src = main_rs_source();
+    assert!(
+        src.contains("is_enabled(tickvault_common::feed::Feed::Dhan)"),
+        "the Dhan conservation run must be gated on \
+         feed_runtime.is_enabled(Feed::Dhan)."
+    );
+    assert!(
+        src.contains("is_enabled(tickvault_common::feed::Feed::Groww)"),
+        "the Groww conservation run must be gated on \
+         feed_runtime.is_enabled(Feed::Groww)."
+    );
     let dhan_idx = src
         .find("run_tick_conservation_audit(")
         .expect("Dhan conservation run must exist in main.rs");
@@ -61,10 +114,22 @@ fn test_groww_conservation_is_runtime_gated_and_shares_the_dhan_window() {
         "the Groww conservation run must be sequenced AFTER the Dhan run inside \
          the same 15:40 IST task so both reconcile the same IST day."
     );
+}
+
+#[test]
+fn test_post_market_tasks_has_process_global_once_guard() {
+    // Runtime Dhan cold-start re-invokes spawn_post_market_tasks on every
+    // disable→enable cycle; without the once-guard, N cycles = N duplicate
+    // EOD digests / cross-verifies / orphan watchdogs (2026-07-02 HIGH).
+    let src = main_rs_source();
     assert!(
-        src.contains("is_enabled(tickvault_common::feed::Feed::Groww)"),
-        "the Groww conservation run must be gated on \
-         feed_runtime.is_enabled(Feed::Groww) — a Dhan-only session must not \
-         write a misleading zero-balanced Groww conservation row."
+        src.contains("POST_MARKET_TASKS_SPAWNED"),
+        "spawn_post_market_tasks must be protected by the process-global \
+         POST_MARKET_TASKS_SPAWNED once-guard."
+    );
+    assert!(
+        src.contains("POST_MARKET_TASKS_SPAWNED.swap(true"),
+        "the once-guard must use an atomic swap(true) so exactly the FIRST \
+         caller proceeds and later cold-start re-entries no-op."
     );
 }
