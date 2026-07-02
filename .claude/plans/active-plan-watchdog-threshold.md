@@ -1,8 +1,8 @@
 # Implementation Plan: DailyUniverse activity-watchdog floor 3s → 15s (audit GAP-1)
 
-**Status:** DRAFT
+**Status:** APPROVED
 **Date:** 2026-07-02
-**Approved by:** pending — `<PENDING OPERATOR APPROVAL 2026-07-02>` (changes the operator-locked 2026-05-13 3s clamp; Status flips to APPROVED only on the operator's dated quote, then push)
+**Approved by:** Parthiban (operator, 2026-07-02) — verbatim dated quote: `Operator approved 2026-07-02: "approve 15s"` (supersedes the operator-locked 2026-05-13 3s clamp for the DailyUniverse arm)
 
 > Guarantee matrices: cross-reference `.claude/rules/project/per-wave-guarantee-matrix.md`
 > (15-row + 7-row) — this is a single-constant safety fix in `tickvault-core`
@@ -95,8 +95,9 @@ config surface, TOML schema, and every other scope arm are untouched.
 - [x] Rule-file dated section (pending-approval marked)
   - Files: .claude/rules/project/live-market-feed-subscription.md
   - Tests: (docs)
-- [ ] ON OPERATOR APPROVAL: fill `<PENDING OPERATOR APPROVAL 2026-07-02>`
-  markers with the dated quote, flip Status → APPROVED, push branch
+- [x] ON OPERATOR APPROVAL: filled all pending markers with the dated quote
+  `Operator approved 2026-07-02: "approve 15s"`, flipped Status → APPROVED,
+  pushed branch + opened PR
   - Files: this plan, activity_watchdog.rs, main.rs, connection.rs,
     live-market-feed-subscription.md
   - Tests: (docs)

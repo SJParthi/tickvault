@@ -4,11 +4,12 @@
 > **Scope:** Any file touching main WebSocket connection pool, subscription planning, or instrument distribution.
 > **Ground truth:** `docs/dhan-ref/03-live-market-feed-websocket.md`, `docs/dhan-ref/08-annexure-enums.md`
 
-## 2026-07-02 Update — DailyUniverse activity-watchdog floor 3s → 15s (audit GAP-1, PENDING OPERATOR APPROVAL)
+## 2026-07-02 Update — DailyUniverse activity-watchdog floor 3s → 15s (audit GAP-1, OPERATOR APPROVED)
 
-> **Status: `<PENDING OPERATOR APPROVAL 2026-07-02>`** — prepared on branch
-> `claude/watchdog-threshold-15s`; NOT pushed/merged until the operator
-> approves (this changes a value operator-locked 2026-05-13).
+> **Status: Operator approved 2026-07-02: "approve 15s"** — Parthiban
+> (operator), 2026-07-02, this session. Delivered on branch
+> `claude/watchdog-threshold-15s` (supersedes the 3s value
+> operator-locked 2026-05-13 for the DailyUniverse arm only).
 
 **The gap (verified):** `crates/app/src/main.rs` clamped the main-feed
 `activity_watchdog_threshold_secs` to `WATCHDOG_THRESHOLD_IDX_I_SECS = 3`
@@ -34,11 +35,11 @@ keeps its historical 3s value untouched.
 **Ratchet:** `activity_watchdog.rs::tests::daily_universe_threshold_is_15_above_dhan_ping_cadence`
 pins 15, `> 10` (ping cadence), `< 50` (legacy), and ≥3 poll windows.
 
-**On operator approval:** replace every
-`<PENDING OPERATOR APPROVAL 2026-07-02>` marker (this file,
-`activity_watchdog.rs`, `main.rs`, `connection.rs`) with the dated
-operator quote, flip the plan
-`.claude/plans/active-plan-watchdog-threshold.md` to APPROVED, then push.
+**Approval executed 2026-07-02:** all pending markers (this file,
+`activity_watchdog.rs`, `main.rs`, `connection.rs`) replaced with the
+dated operator quote `Operator approved 2026-07-02: "approve 15s"`;
+plan `.claude/plans/active-plan-watchdog-threshold.md` flipped to
+APPROVED (Approved by: Parthiban, operator, 2026-07-02).
 
 ## 2026-05-26 Update — pre-market buffer + Dhan historical REMOVED
 

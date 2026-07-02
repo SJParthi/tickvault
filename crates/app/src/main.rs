@@ -3203,7 +3203,7 @@ fn create_websocket_pool(
         tickvault_common::config::SubscriptionScope::Indices4Only => {
             tickvault_core::websocket::activity_watchdog::WATCHDOG_THRESHOLD_IDX_I_SECS
         }
-        // Audit GAP-1 fix (<PENDING OPERATOR APPROVAL 2026-07-02>): the
+        // Audit GAP-1 fix (Operator approved 2026-07-02: "approve 15s"): the
         // DailyUniverse clamp previously reused the 3s IDX_I threshold
         // (the Sub-PR #1 2026-05-27 comment here explicitly deferred
         // re-tuning to "#8", which never happened). Dhan's server pings

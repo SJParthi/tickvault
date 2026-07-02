@@ -1649,8 +1649,8 @@ impl WebSocketConnection {
             // Dhan pings (every 10s) keeps the counter advancing during
             // data-quiet periods, so the watchdog never fires a false
             // positive PROVIDED the effective threshold sits above the
-            // 10s ping cadence. Audit GAP-1 (<PENDING OPERATOR APPROVAL
-            // 2026-07-02>): the DailyUniverse scope clamp is
+            // 10s ping cadence. Audit GAP-1 (Operator approved
+            // 2026-07-02: "approve 15s"): the DailyUniverse scope clamp is
             // WATCHDOG_THRESHOLD_DAILY_UNIVERSE_SECS = 15 (> 10s), so
             // this guarantee holds; the historical Indices4Only 3s clamp
             // pre-dates it and is retained unchanged. One relaxed atomic

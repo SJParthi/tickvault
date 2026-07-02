@@ -77,7 +77,7 @@ pub const WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS: u64 = 50;
 pub const WATCHDOG_THRESHOLD_IDX_I_SECS: u64 = 3;
 
 /// Scope-level threshold for the `DailyUniverse` main-feed connection
-/// (audit GAP-1 fix, <PENDING OPERATOR APPROVAL 2026-07-02>).
+/// (audit GAP-1 fix, Operator approved 2026-07-02: "approve 15s").
 ///
 /// Dhan's server pings every 10s (`live-market-feed.md` rule 16) and the
 /// read loop bumps the activity counter on EVERY `Some(Ok(_))` frame —
@@ -521,7 +521,7 @@ mod tests {
 
     #[test]
     fn daily_universe_threshold_is_15_above_dhan_ping_cadence() {
-        // Audit GAP-1 (<PENDING OPERATOR APPROVAL 2026-07-02>): Dhan's
+        // Audit GAP-1 (Operator approved 2026-07-02: "approve 15s"): Dhan's
         // server pings every 10s and the read loop counts pings as
         // activity (connection.rs STAGE-C.3), so any threshold > 10s
         // can NEVER fire on a healthy socket. 15 = 10s ping interval
