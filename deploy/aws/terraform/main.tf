@@ -491,6 +491,13 @@ resource "aws_iam_role_policy" "eventbridge_ec2_scheduler" {
           "ssm:StartAutomationExecution"
         ]
         Resource = [
+          # IAM evaluates StartAutomationExecution for AWS-owned documents
+          # against the document/ ARN (empty account field) — verified via
+          # CloudTrail AccessDenied on 2026-07-02: the denied resource is
+          # arn:aws:ssm:ap-south-1::document/AWS-StartEC2Instance. Keep the
+          # automation-definition/ form too (EventBridge target ARN shape).
+          "arn:aws:ssm:${data.aws_region.current.name}::document/AWS-StartEC2Instance",
+          "arn:aws:ssm:${data.aws_region.current.name}::document/AWS-StopEC2Instance",
           "arn:aws:ssm:${data.aws_region.current.name}::automation-definition/AWS-StartEC2Instance:*",
           "arn:aws:ssm:${data.aws_region.current.name}::automation-definition/AWS-StopEC2Instance:*"
         ]
