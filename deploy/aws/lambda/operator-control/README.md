@@ -5,7 +5,7 @@ One URL you open on a phone or laptop to run the whole product. Three tabs
 
 | Tab | What you do |
 |---|---|
-| 📊 **Overview** | Live status (instance/app/market), count-up tick counter, ticks/sec sparkline, **live no-loss proof** shields (greyed to one calm "box stopped" banner when the instance is off), feed toggles, a thin **AWS strip** (spend $ · alarms · disk %, tap to expand), a compact **latency** card ("Measure now"), and **ONE context-aware ▶ Start / ■ Stop instance button** |
+| 📊 **Overview** | Live status (instance/app/market), count-up tick counter, ticks/sec sparkline, **guarantee shields** incl. the audit-backed **Tick conservation** verdict (15:40 IST `tick_conservation_audit` + today's `ws_event_audit` disconnects — never green from a tick rate alone; greyed to one calm "box stopped" banner when the instance is off), feed toggles, a thin **AWS strip** (spend $ · alarms · disk %, tap to expand), a compact **latency** card ("Measure now"), and **ONE context-aware ▶ Start / ■ Stop instance button** |
 | 📈 **Data** | Animated candle bars per timeframe, the daily **cross-verify** result, and the **read-only database console** (tables + columns + query grid + CSV download; SELECT/SHOW/EXPLAIN/WITH only, capped 1000 rows) |
 | 🛠️ **Admin** | Restart app / Restart QuestDB / Stop app (+ force), a **collapsed danger zone** (severity picker: Wipe GROWW only → Wipe ALL data → Full Docker reset → Bare Nuke, each with its own typed confirm word), and "Lock / forget this device" |
 
