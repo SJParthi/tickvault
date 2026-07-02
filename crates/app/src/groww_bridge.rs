@@ -607,6 +607,11 @@ pub(crate) struct GrowwBridgeState {
     /// F3 rising-edge latch: true while NDJSON consumption is paused because
     /// the retained ILP buffer is over cap (one error! per episode, not per wake).
     ilp_backpressure_active: bool,
+    /// PR-5 H-3: while draining a PREVIOUS day's archive tail at boot, the
+    /// offset snapshot must be stamped with the ARCHIVE's day (not today's) so
+    /// a crash mid-drain resumes the SAME archive from the flushed offset
+    /// instead of orphaning its tail.
+    active_drain_ist_day: Option<i64>,
 }
 
 impl GrowwBridgeState {
@@ -629,6 +634,7 @@ impl GrowwBridgeState {
             residual: Vec::new(),
             last_offset_persist: None,
             ilp_backpressure_active: false,
+            active_drain_ist_day: None,
         }
     }
 
@@ -652,7 +658,11 @@ impl GrowwBridgeState {
     /// any mismatch falls back to the byte-0 re-tail (DEDUP-idempotent —
     /// exactly the pre-PR-3 behavior).
     // TEST-EXEMPT: async file I/O wrapper; the pure resume decision (resume_from_snapshot) + snapshot round-trip are unit-tested.
-    pub(crate) async fn try_resume_from_snapshot(&mut self, tick_file_path: &Path) {
+    pub(crate) async fn try_resume_from_snapshot(
+        &mut self,
+        tick_file_path: &Path,
+        feed_health: &tickvault_common::feed_health::FeedHealthRegistry,
+    ) {
         let snap_path = offset_snapshot_path(tick_file_path);
         let Ok(raw) = tokio::fs::read_to_string(&snap_path).await else {
             info!("groww bridge: no offset snapshot — starting from byte 0");
@@ -691,6 +701,51 @@ impl GrowwBridgeState {
                     .increment(1);
             }
             None => {
+                // PR-5 H-3 (hostile F4): if the snapshot belongs to a PREVIOUS
+                // IST day, the sidecar rotated the live file at midnight and
+                // any bytes appended after our last flush were ARCHIVED unread
+                // (deleted after 2 days). Drain that archive's tail ONCE
+                // through the SAME parse/validate/persist path before the
+                // byte-0 re-tail of the fresh live file. Bounded + non-fatal:
+                // an absent/short archive falls straight through to byte-0.
+                let today_ist_day = ist_day_from_ist_nanos(receipt_ist_nanos());
+                let archive = archive_path_for_ist_day(tick_file_path, snap.ist_day);
+                let archive_len = tokio::fs::metadata(&archive).await.ok().map(|m| m.len());
+                if should_drain_archive(snap.ist_day, today_ist_day, archive_len, snap.offset) {
+                    let len = archive_len.unwrap_or(0);
+                    info!(
+                        archive = %archive.display(),
+                        from_offset = snap.offset,
+                        archive_len = len,
+                        "groww bridge: draining rotated archive tail (bytes flushed before \
+                         the downtime resume from the flushed offset; DEDUP-idempotent)"
+                    );
+                    metrics::counter!("tv_groww_bridge_archive_tail_drains_total").increment(1);
+                    self.offset = snap.offset;
+                    self.capture_seq.store(snap.capture_seq, Ordering::Relaxed);
+                    self.active_drain_ist_day = Some(snap.ist_day);
+                    let mut wakes: u32 = 0;
+                    while self.offset < len && wakes < GROWW_ARCHIVE_DRAIN_MAX_WAKES {
+                        let before = self.offset;
+                        self.drain_new_data(&archive, feed_health).await;
+                        wakes = wakes.saturating_add(1);
+                        if self.offset <= before {
+                            break; // no forward progress — read error / EOF
+                        }
+                    }
+                    if wakes >= GROWW_ARCHIVE_DRAIN_MAX_WAKES {
+                        warn!(
+                            archive = %archive.display(),
+                            drained_to = self.offset,
+                            archive_len = len,
+                            "groww bridge: archive tail drain hit the wake cap — proceeding \
+                             to the live file (remaining archive rows stay on disk)"
+                        );
+                    }
+                    self.active_drain_ist_day = None;
+                    self.residual.clear();
+                }
+                self.offset = 0;
                 info!(
                     snapshot_offset = snap.offset,
                     file_len = current_len,
@@ -738,7 +793,9 @@ impl GrowwBridgeState {
             capture_seq: self.capture_seq.load(Ordering::Relaxed),
             file_len,
             head,
-            ist_day: ist_day_from_ist_nanos(receipt_ist_nanos()),
+            ist_day: self
+                .active_drain_ist_day
+                .unwrap_or_else(|| ist_day_from_ist_nanos(receipt_ist_nanos())),
         };
         let Ok(json) = serde_json::to_string(&snap) else {
             return;
@@ -1191,6 +1248,42 @@ pub fn ist_day_from_ist_nanos(ist_nanos: i64) -> i64 {
     ist_nanos.div_euclid(86_400 * 1_000_000_000)
 }
 
+/// Max archive-drain iterations (× 4 MiB chunks ⇒ ≤16 GiB) — a hard bound so
+/// a pathological archive can never wedge boot (PR-5 H-3, hostile F4).
+pub const GROWW_ARCHIVE_DRAIN_MAX_WAKES: u32 = 4096;
+
+/// The dated archive the sidecar leaves at IST-midnight rotation for a
+/// COMPLETED IST day index: `live-ticks-YYYYMMDD.ndjson`, sibling of the live
+/// capture file (mirrors the sidecar's `_archive_path`).
+#[must_use]
+pub fn archive_path_for_ist_day(tick_file_path: &Path, ist_day: i64) -> PathBuf {
+    let date = chrono::DateTime::<chrono::Utc>::from_timestamp(ist_day.saturating_mul(86_400), 0)
+        .map(|d| d.format("%Y%m%d").to_string())
+        .unwrap_or_default();
+    let name = format!("live-ticks-{date}.ndjson");
+    tick_file_path
+        .parent()
+        .map(|d| d.join(&name))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// Pure drain decision (PR-5 H-3): drain a PREVIOUS day's archive tail ONLY
+/// when the snapshot provably belongs to an earlier IST day (a legacy
+/// `ist_day == 0` snapshot is NOT trusted to name an archive), the archive
+/// exists, and it holds bytes beyond the flushed offset. Everything else →
+/// exact prior behavior (byte-0 re-tail of the live file).
+#[must_use]
+pub fn should_drain_archive(
+    snap_ist_day: i64,
+    today_ist_day: i64,
+    archive_len: Option<u64>,
+    snap_offset: u64,
+) -> bool {
+    snap_ist_day > 0
+        && snap_ist_day < today_ist_day
+        && archive_len.is_some_and(|len| len > snap_offset)
+}
+
 /// ws_event_audit edge latches shared between the supervisor wrapper and the
 /// (respawnable) bridge task, so a bridge panic never resets the forensic
 /// Connected/Disconnected/Reconnected chain (2026-07-02 adversarial finding M3).
@@ -1406,7 +1499,9 @@ pub async fn run_groww_bridge(
     // PR-3 (2026-07-02): resume from the persisted flushed-offset when it
     // provably belongs to the current capture file — otherwise byte-0 re-tail
     // (DEDUP-idempotent, the pre-PR-3 behavior).
-    state.try_resume_from_snapshot(&tick_file_path).await;
+    state
+        .try_resume_from_snapshot(&tick_file_path, &feed_health)
+        .await;
 
     // PRIMARY path: install the event-driven filesystem watcher. If it fails, the
     // fallback poll alone keeps the bridge working (degraded, logged once). The
@@ -2537,6 +2632,43 @@ mod tests {
         assert_eq!(ist_day_from_ist_nanos(20_636 * day_nanos + 5), 20_636);
         // Negative (pre-epoch, defensive): div_euclid floors, never panics.
         assert_eq!(ist_day_from_ist_nanos(-1), -1);
+    }
+
+    #[test]
+    fn test_archive_path_for_ist_day_matches_sidecar_rotation() {
+        // PR-5 H-3: the archive name must match the sidecar's rotation output
+        // (live-ticks-YYYYMMDD.ndjson, sibling of the live capture file).
+        // 2026-07-01 in IST-day-index terms: days since epoch for that date.
+        let day_20026_07_01 = 20_635; // 20635 * 86400 = 2026-07-01T00:00:00
+        let p =
+            archive_path_for_ist_day(Path::new("/data/groww/live-ticks.ndjson"), day_20026_07_01);
+        assert_eq!(p, PathBuf::from("/data/groww/live-ticks-20260701.ndjson"));
+        // Parent-less path degrades to a bare file name (never panics).
+        let bare = archive_path_for_ist_day(Path::new("live-ticks.ndjson"), day_20026_07_01);
+        assert!(
+            bare.to_string_lossy()
+                .ends_with("live-ticks-20260701.ndjson")
+        );
+    }
+
+    #[test]
+    fn test_should_drain_archive_decision() {
+        // PR-5 H-3 decision matrix — drain ONLY a provable previous-day
+        // archive holding bytes beyond the flushed offset.
+        let today = 20_636;
+        // Previous day, archive longer than offset → drain.
+        assert!(should_drain_archive(today - 1, today, Some(500), 100));
+        // Archive absent → no drain (retention passed / wiped).
+        assert!(!should_drain_archive(today - 1, today, None, 100));
+        // Archive shorter/equal (already fully flushed) → no drain.
+        assert!(!should_drain_archive(today - 1, today, Some(100), 100));
+        assert!(!should_drain_archive(today - 1, today, Some(50), 100));
+        // Same-day snapshot → never an archive case.
+        assert!(!should_drain_archive(today, today, Some(500), 100));
+        // Legacy pre-F1 snapshot (ist_day=0) names no trustworthy archive.
+        assert!(!should_drain_archive(0, today, Some(500), 100));
+        // Future-day snapshot (clock weirdness) → fail safe, no drain.
+        assert!(!should_drain_archive(today + 1, today, Some(500), 100));
     }
 
     #[test]
