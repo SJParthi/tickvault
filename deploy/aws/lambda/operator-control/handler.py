@@ -287,6 +287,24 @@ _VIEW_COMMANDS = [
     # upsertKey column; received_at/payload_hash are stored columns only).
     'echo "DEDUP_KEYS=$(curl -fsS "${Q}SELECT%20count()%20FROM%20table_columns(%27ticks%27)%20WHERE%20upsertKey%3Dtrue" 2>/dev/null | tail -1)"',
     'echo "MAX_TPS=$(curl -fsS "${Q}SELECT%20max(c)%20FROM%20(SELECT%20count()%20c%20FROM%20ticks%20WHERE%20ts%20IN%20today()%20GROUP%20BY%20ts,security_id)" 2>/dev/null | tail -1)"',
+    # Tick-conservation shield inputs (audit fix #1, 2026-07-02 — kills the
+    # false-OK ">1 tick/sec == no tick lost" heuristic):
+    #  * CONSERVE — the latest tick_conservation_audit rows (last ~2 days, per
+    #    feed; the 15:40 IST daily audit per
+    #    .claude/rules/project/tick-conservation-audit-error-codes.md). CSV
+    #    header skipped, rows ';'-joined (same convention as TICKS_BY_FEED).
+    #    Table absent on a fresh box → curl -f fails → empty value → the UI
+    #    shows "no audit yet", NEVER a fabricated green.
+    #  * WS_DISC — count of TODAY's in-market socket drops. event_kind
+    #    'disconnected' is the app's own market-hours disconnect class
+    #    (off-hours drops are stamped 'disconnected_off_hours' — see
+    #    crates/common/src/ws_event_types.rs), so this IS the 09:15-15:30 IST
+    #    filter, applied at write time by the app itself. Any such drop means
+    #    upstream ticks in that window never reached the box — the shield can
+    #    never claim green "no tick lost" for today. `=` encoded as %3D per
+    #    the DEDUP_KEYS lesson above.
+    'echo "CONSERVE=$(curl -fsS "${Q}SELECT%20feed%2C%20trading_date_ist%2C%20delivery_residual%2C%20outcome_residual%2C%20partial_coverage%2C%20outcome%20FROM%20tick_conservation_audit%20WHERE%20ts%20%3E%20dateadd(%27d%27%2C%20-2%2C%20now())%20ORDER%20BY%20ts%20DESC%20LIMIT%208" 2>/dev/null | tail -n +2 | tr \'\\n\' \';\')"',
+    'echo "WS_DISC=$(curl -fsS "${Q}SELECT%20count()%20FROM%20ws_event_audit%20WHERE%20ts%20IN%20today()%20AND%20event_kind%3D%27disconnected%27" 2>/dev/null | tail -1)"',
     'echo "ERRORS_BEGIN"',
     "journalctl -u tickvault -p err -n 5 --no-pager 2>/dev/null | tail -5 || true",
     'echo "ERRORS_END"',
@@ -343,8 +361,145 @@ def _parse_view(stdout: str) -> dict:
         },
         "dedup_key_columns": fields.get("DEDUP_KEYS", ""),
         "max_ticks_per_second": fields.get("MAX_TPS", ""),
+        "conservation_rows": _parse_conserve_rows(fields.get("CONSERVE", "")),
+        "ws_disconnects_today": fields.get("WS_DISC", ""),
         "recent_errors": errors,
     }
+
+
+# ------------------------------------------------- tick-conservation shield
+# Audit fix #1 (2026-07-02): the old "No tick lost" shield was a >1-tick/sec
+# LIVENESS heuristic — it showed WORKING ✅ through a mid-market crash-loop
+# where upstream ticks were genuinely lost (a false-OK, banned by
+# audit-findings Rule 11). The shield is now a 3-source honest composite:
+#   a. the 15:40 IST tick_conservation_audit verdict (balanced/leak/partial +
+#      the two residuals) — the end-to-end WAL-vs-processed-vs-outcome proof
+#      (.claude/rules/project/tick-conservation-audit-error-codes.md);
+#   b. TODAY's in-market ws_event_audit 'disconnected' count — any drop means
+#      Dhan-sent ticks in that window never REACHED the box, so green is
+#      impossible for today (the honest capture-at-receipt envelope);
+#   c. live ticks/sec — kept ONLY as a decorating label when a+b are clean.
+# Classification precedence (ratcheted by test_handler.py):
+#   residual (RED) > partial (AMBER) > disconnects-today (AMBER) > balanced
+#   (GREEN) > no-audit/idle/unreachable. A tick rate ALONE can never go green.
+
+# The honest-envelope sentence surfaced as the shield tooltip (task 3).
+_CONSERVATION_ENVELOPE = (
+    "Proves every tick that REACHED the box is stored. Ticks Dhan sent during "
+    "a disconnect window never arrived and are outside this proof."
+)
+
+
+def _parse_conserve_rows(raw: str) -> list:
+    """Parse the CONSERVE value — ';'-joined QuestDB /exp CSV rows like
+    '"dhan","2026-07-01T00:00:00.000000Z",0,0,false,"balanced"' — into a list
+    of dicts. Pure. Malformed fragments are skipped; empty/absent input (table
+    missing on a fresh box, QuestDB down) yields [] — the classifier then
+    reports "no audit yet"/"unreachable", never a fabricated verdict."""
+    rows: list = []
+    for part in (raw or "").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        cells = [c.strip().strip('"') for c in part.split(",")]
+        if len(cells) != 6:
+            continue
+        feed, tdate, dres, ores, partial, outcome = cells
+        try:
+            drow = {
+                "feed": feed,
+                "date": tdate[:10],  # trading_date_ist → YYYY-MM-DD
+                "delivery_residual": int(dres),
+                "outcome_residual": int(ores),
+                "partial_coverage": partial.lower() == "true",
+                "outcome": outcome.lower(),
+            }
+        except ValueError:
+            continue
+        if drow["feed"] and len(drow["date"]) == 10:
+            rows.append(drow)
+    return rows
+
+
+def _classify_tick_conservation(rows: list, disconnects_raw: str, market_hours: bool, max_tps_raw: str) -> dict:
+    """The shield's state machine (pure — one unit test per state).
+
+    | state        | colour | when                                              |
+    |--------------|--------|---------------------------------------------------|
+    | residual     | RED    | latest audit day has residual>0 or outcome=leak   |
+    | partial      | AMBER  | latest audit day has partial_coverage/partial     |
+    | disconnects  | AMBER  | ≥1 in-market socket drop TODAY (ws_event_audit)   |
+    | balanced     | GREEN  | audit balanced AND zero drops today               |
+    | no_audit     | AMBER  | market open, no audit row yet — NEVER green       |
+    | idle         | grey-ok| market closed, no audit row, QuestDB reachable    |
+    | unreachable  | AMBER  | neither source answered (QuestDB/box down)        |
+
+    Only the latest trading day's rows count (one per feed, newest first —
+    the CONSERVE query is ORDER BY ts DESC). tps decorates the balanced label
+    only; it can no longer produce green by itself (the old false-OK)."""
+    try:
+        disconnects = int(str(disconnects_raw or "").strip())
+    except ValueError:
+        disconnects = None
+    try:
+        tps = int(str(max_tps_raw or "").strip())
+    except ValueError:
+        tps = 0
+
+    latest: list = []
+    if rows:
+        latest_date = max(r["date"] for r in rows)
+        seen_feeds: set = set()
+        for r in rows:  # newest first — keep the latest row per feed
+            if r["date"] == latest_date and r["feed"] not in seen_feeds:
+                seen_feeds.add(r["feed"])
+                latest.append(r)
+
+    def _result(state: str, label: str, good: bool, cls: str) -> dict:
+        return {
+            "state": state,
+            "label": label,
+            "good": good,
+            "cls": cls,
+            "audit_date": latest[0]["date"] if latest else "",
+            "disconnects_today": disconnects,
+            "envelope": _CONSERVATION_ENVELOPE,
+        }
+
+    # 1. RESIDUAL — ticks delivered to the box but unaccounted. Hard red.
+    residual_rows = [
+        r
+        for r in latest
+        if r["delivery_residual"] > 0 or r["outcome_residual"] > 0 or r["outcome"] == "leak"
+    ]
+    if residual_rows:
+        n = sum(max(r["delivery_residual"], 0) + max(r["outcome_residual"], 0) for r in residual_rows)
+        return _result("residual", f"RESIDUAL: {n} ❌ ({latest[0]['date']})", False, "bad")
+    # 2. PARTIAL — the audit could not vouch for the full session (mid-day boot
+    #    / a source missing). Honest "cannot vouch", never a false OK.
+    if any(r["partial_coverage"] or r["outcome"] == "partial" for r in latest):
+        return _result("partial", f"partial coverage ⚠ — mid-day restart ({latest[0]['date']})", False, "warn")
+    # 3. DISCONNECTS TODAY — socket-down evidence outranks yesterday's clean
+    #    audit: upstream ticks in those windows are outside the capture proof.
+    if disconnects is not None and disconnects > 0:
+        return _result(
+            "disconnects",
+            f"{disconnects} disconnect(s) today ⚠ — upstream ticks in those windows are unverifiable",
+            False,
+            "warn",
+        )
+    # 4. BALANCED — audit vouches, zero drops today. Liveness decorates only.
+    if latest:
+        if market_hours and tps > 1:
+            return _result("balanced", f"BALANCED ✅ · capturing ({tps} ticks/sec)", True, "ok")
+        return _result("balanced", f"BALANCED ✅ (audit {latest[0]['date']})", True, "ok")
+    # 5. No audit rows at all.
+    if disconnects is None:
+        # Neither source answered — QuestDB (or the box) is unreachable.
+        return _result("unreachable", "unreachable", False, "warn")
+    if not market_hours:
+        return _result("idle", "idle (market closed)", True, "ok")
+    return _result("no_audit", "no audit yet ⚠ (daily audit runs 15:40 IST)", False, "warn")
 
 
 # ----------------------------------------------------------------- latency snap
@@ -1311,9 +1466,18 @@ def lambda_handler(event, _context):
             # then taps ▶ Start. _ssm_shell_sync also fails-soft, but skipping
             # avoids a pointless ~6s wait.
             snap = _parse_view(_ssm_shell_sync(_VIEW_COMMANDS) if state == "running" else "")
+            mh = _is_market_hours(datetime.datetime.utcnow())
+            # Server-side classification (pure, unit-tested) — the UI renders
+            # the verdict verbatim; it can no longer invent green from a rate.
+            snap["tick_conservation"] = _classify_tick_conservation(
+                snap.get("conservation_rows", []),
+                snap.get("ws_disconnects_today", ""),
+                mh,
+                snap.get("max_ticks_per_second", ""),
+            )
             return _resp(
                 200,
-                {"ok": True, "action": "view", "instance_state": state, "market_hours": _is_market_hours(datetime.datetime.utcnow()), **snap},
+                {"ok": True, "action": "view", "instance_state": state, "market_hours": mh, **snap},
             )
         if action == "sql":
             # READ-ONLY console query (Data tab box + DB tab). Writes are
@@ -1713,7 +1877,9 @@ function bar(name,n,max){ const pct=max>0?Math.max(3,Math.round(100*n/max)):0;
   return '<div class="bar"><div class="name">'+name+'</div><div class="track"><div class="fill" style="width:'+pct+'%"></div></div><div class="num">'+n.toLocaleString()+'</div></div>'; }
 // Optional 4th arg picks the value colour explicitly: 'ok' green, 'warn' amber,
 // 'bad' red — so a critical state (red) is distinguishable from drift (amber).
-function shield(t,s,good,cls){ return '<div class="shield '+(good?'good':'bad')+'"><div class="ttl">'+t+'</div><div class="st '+(cls||(good?'ok':'warn'))+'">'+s+'</div></div>'; }
+// Optional 5th arg `tip` renders a hover tooltip (title attribute) — used by
+// the Tick-conservation shield to state its honest envelope.
+function shield(t,s,good,cls,tip){ return '<div class="shield '+(good?'good':'bad')+'"'+(tip?' title="'+esc(tip).replace(/"/g,'&quot;')+'"':'')+'><div class="ttl">'+t+'</div><div class="st '+(cls||(good?'ok':'warn'))+'">'+s+'</div></div>'; }
 // Greyed "box stopped" shield: neither good nor bad — the box is off, so the
 // guarantee is neither proven nor violated. Used ONLY when instance_state is
 // not 'running' (a RUNNING box with unreachable data keeps the REAL warnings).
@@ -1752,7 +1918,7 @@ async function loadOverview(){ $('refbtn').innerHTML='<span class="spin">🔄</s
   $('stoppedbanner').hidden=running;
   if(!running){
     $('shields').innerHTML=shieldIdle('Dedup key columns')+shieldIdle('Sub-second fix')+
-      shieldIdle('No tick lost')+shieldIdle('Peak ticks / second');
+      shieldIdle('Tick conservation')+shieldIdle('Peak ticks / second');
   } else {
   const dkRaw=String(j.dedup_key_columns||'').trim(), dkN=parseInt(dkRaw,10);
   const dkUnknown=(dkRaw===''||isNaN(dkN)), keysOk=dkN===5;
@@ -1762,9 +1928,15 @@ async function loadOverview(){ $('refbtn').innerHTML='<span class="spin">🔄</s
   else if(dkN===0){ dkTxt='0 — DEDUP disabled!'; dkCls='bad'; }
   else { dkTxt=dkRaw+' — schema drift (expected 5)'; dkCls='warn'; }
   const capOk=tpsN>1;
+  // Tick-conservation shield: the verdict is computed SERVER-SIDE from the
+  // 15:40 audit + today's ws_event_audit disconnects (audit fix #1 — the old
+  // ">1 tick/sec" liveness false-OK heuristic is gone). The UI renders the
+  // server verdict verbatim; the tooltip states the envelope.
+  const tc=j.tick_conservation||{state:'unreachable',label:'unreachable',good:false,cls:'warn',envelope:''};
   $('shields').innerHTML=shield('Dedup key columns',dkTxt,keysOk,dkCls)+
     shield('Sub-second fix',keysOk?'LIVE ✅':(dkUnknown?'unreachable':'OLD ⚠'),keysOk,dkUnknown?'warn':undefined)+
-    shield('No tick lost',capOk?'WORKING ✅':(j.market_hours?'CHECK ⚠':'idle'),capOk||!j.market_hours)+shield('Peak ticks / second',tpsN,capOk);
+    shield('Tick conservation',esc(tc.label||'unreachable'),!!tc.good,tc.cls||'warn',tc.envelope||'')+
+    shield('Peak ticks / second',tpsN,capOk);
   }
   if(!$('feeds').dataset.loaded) loadFeeds();
   if(!$('alarms').dataset.loaded) loadAws();

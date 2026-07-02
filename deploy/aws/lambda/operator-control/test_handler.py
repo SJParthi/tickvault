@@ -1222,5 +1222,166 @@ class RedesignThreeTabs(unittest.TestCase):
         self.assertNotIn("act('stop')", admin)
 
 
+class TickConservationShield(unittest.TestCase):
+    """Audit fix #1 — the shield is a conservation-backed verdict, not a
+    liveness heuristic. One test per state + the precedence ratchet +
+    the false-OK-is-dead ratchet."""
+
+    # Raw CONSERVE snapshots (QuestDB /exp CSV rows, ';'-joined, header
+    # already skipped on the box).
+    _BALANCED = '"dhan","2026-07-01T00:00:00.000000Z",0,0,false,"balanced";"groww","2026-07-01T00:00:00.000000Z",0,0,false,"balanced";'
+    _RESIDUAL = '"dhan","2026-07-01T00:00:00.000000Z",42,0,false,"leak";'
+    _PARTIAL = '"dhan","2026-07-01T00:00:00.000000Z",0,0,true,"partial";'
+
+    def _classify(self, raw: str, disc: str, market_hours: bool, tps: str) -> dict:
+        return handler._classify_tick_conservation(handler._parse_conserve_rows(raw), disc, market_hours, tps)
+
+    # ---- one test per shield state ----
+    def test_state_balanced_market_open_decorated_with_liveness(self) -> None:
+        tc = self._classify(self._BALANCED, "0", True, "500")
+        self.assertEqual(tc["state"], "balanced")
+        self.assertTrue(tc["good"])
+        self.assertEqual(tc["cls"], "ok")
+        self.assertIn("BALANCED ✅", tc["label"])
+        self.assertIn("capturing (500 ticks/sec)", tc["label"])
+
+    def test_state_balanced_market_closed_names_audit_date(self) -> None:
+        tc = self._classify(self._BALANCED, "0", False, "0")
+        self.assertEqual(tc["state"], "balanced")
+        self.assertEqual(tc["label"], "BALANCED ✅ (audit 2026-07-01)")
+
+    def test_state_residual_is_red_and_counts_ticks(self) -> None:
+        tc = self._classify(self._RESIDUAL, "0", True, "500")
+        self.assertEqual(tc["state"], "residual")
+        self.assertFalse(tc["good"])
+        self.assertEqual(tc["cls"], "bad")
+        self.assertIn("RESIDUAL: 42", tc["label"])
+        self.assertIn("2026-07-01", tc["label"])
+
+    def test_state_partial_is_amber(self) -> None:
+        tc = self._classify(self._PARTIAL, "0", True, "500")
+        self.assertEqual(tc["state"], "partial")
+        self.assertFalse(tc["good"])
+        self.assertEqual(tc["cls"], "warn")
+        self.assertIn("partial coverage", tc["label"])
+
+    def test_state_disconnects_today_blocks_green_despite_balanced_audit(self) -> None:
+        # Yesterday's audit was balanced, but the socket dropped twice TODAY —
+        # upstream ticks in those windows never reached the box, so the shield
+        # must NOT claim green (the honest capture-at-receipt envelope).
+        tc = self._classify(self._BALANCED, "2", True, "500")
+        self.assertEqual(tc["state"], "disconnects")
+        self.assertFalse(tc["good"])
+        self.assertEqual(tc["cls"], "warn")
+        self.assertIn("2 disconnect(s) today", tc["label"])
+        self.assertIn("unverifiable", tc["label"])
+
+    def test_state_idle_market_closed_no_audit(self) -> None:
+        tc = self._classify("", "0", False, "0")
+        self.assertEqual(tc["state"], "idle")
+        self.assertEqual(tc["label"], "idle (market closed)")
+
+    def test_state_no_audit_market_open_is_amber_never_green(self) -> None:
+        # Fresh box: tick_conservation_audit table absent → CONSERVE empty.
+        tc = self._classify("", "0", True, "500")
+        self.assertEqual(tc["state"], "no_audit")
+        self.assertFalse(tc["good"])
+        self.assertEqual(tc["cls"], "warn")
+        self.assertIn("no audit yet", tc["label"])
+
+    def test_state_unreachable_when_no_source_answers(self) -> None:
+        tc = self._classify("", "", True, "")
+        self.assertEqual(tc["state"], "unreachable")
+        self.assertFalse(tc["good"])
+        self.assertEqual(tc["label"], "unreachable")
+
+    # ---- the precedence ratchet: residual > partial > disconnects > balanced
+    def test_precedence_residual_beats_partial_and_disconnects(self) -> None:
+        raw = (
+            '"dhan","2026-07-01T00:00:00.000000Z",0,7,false,"leak";'
+            '"groww","2026-07-01T00:00:00.000000Z",0,0,true,"partial";'
+        )
+        tc = self._classify(raw, "3", True, "500")
+        self.assertEqual(tc["state"], "residual")
+
+    def test_precedence_partial_beats_disconnects(self) -> None:
+        tc = self._classify(self._PARTIAL, "3", True, "500")
+        self.assertEqual(tc["state"], "partial")
+
+    def test_precedence_disconnects_beats_balanced(self) -> None:
+        tc = self._classify(self._BALANCED, "1", True, "500")
+        self.assertEqual(tc["state"], "disconnects")
+
+    # ---- the false-OK is DEAD: a tick rate alone can never produce green
+    def test_tick_rate_alone_never_produces_balanced(self) -> None:
+        for raw, disc in (("", "0"), ("", ""), (self._PARTIAL, "0"), (self._BALANCED, "5")):
+            tc = self._classify(raw, disc, True, "9999")
+            self.assertNotEqual(tc["state"], "balanced", f"raw={raw!r} disc={disc!r}")
+            self.assertFalse(tc["good"] and tc["state"] != "idle", f"raw={raw!r} disc={disc!r}")
+
+    def test_only_latest_trading_day_rows_count(self) -> None:
+        # Yesterday had a residual; TODAY's audit is balanced — the shield
+        # reports the latest day's verdict (yesterday's row is history).
+        raw = (
+            '"dhan","2026-07-02T00:00:00.000000Z",0,0,false,"balanced";'
+            '"dhan","2026-07-01T00:00:00.000000Z",42,0,false,"leak";'
+        )
+        tc = self._classify(raw, "0", False, "0")
+        self.assertEqual(tc["state"], "balanced")
+        self.assertEqual(tc["audit_date"], "2026-07-02")
+
+    def test_envelope_sentence_is_carried_on_every_verdict(self) -> None:
+        for raw, disc in ((self._BALANCED, "0"), (self._RESIDUAL, "0"), ("", "")):
+            tc = self._classify(raw, disc, True, "5")
+            self.assertEqual(
+                tc["envelope"],
+                "Proves every tick that REACHED the box is stored. Ticks Dhan sent "
+                "during a disconnect window never arrived and are outside this proof.",
+            )
+
+    # ---- parser ----
+    def test_parse_conserve_rows_happy_and_malformed(self) -> None:
+        rows = handler._parse_conserve_rows(self._BALANCED + "garbage;1,2;")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["feed"], "dhan")
+        self.assertEqual(rows[0]["date"], "2026-07-01")
+        self.assertEqual(rows[0]["outcome"], "balanced")
+        self.assertFalse(rows[0]["partial_coverage"])
+        self.assertEqual(handler._parse_conserve_rows(""), [])
+
+    # ---- view plumbing ----
+    def test_parse_view_carries_conservation_fields(self) -> None:
+        out = handler._parse_view(f"CONSERVE={self._BALANCED}\nWS_DISC=0\n")
+        self.assertEqual(len(out["conservation_rows"]), 2)
+        self.assertEqual(out["ws_disconnects_today"], "0")
+        # Empty stdout (box stopped) degrades honestly.
+        empty = handler._parse_view("")
+        self.assertEqual(empty["conservation_rows"], [])
+        self.assertEqual(empty["ws_disconnects_today"], "")
+
+    def test_view_commands_query_both_audit_tables(self) -> None:
+        conserve = next(c for c in handler._VIEW_COMMANDS if "CONSERVE=" in c)
+        self.assertIn("tick_conservation_audit", conserve)
+        # `>` must be URL-encoded (%3E) and the CSV header skipped.
+        self.assertIn("ts%20%3E%20dateadd", conserve)
+        self.assertIn("tail -n +2", conserve)
+        disc = next(c for c in handler._VIEW_COMMANDS if "WS_DISC=" in c)
+        self.assertIn("ws_event_audit", disc)
+        # `=` encoded as %3D (the DEDUP_KEYS lesson) + in-market kind only.
+        self.assertIn("event_kind%3D%27disconnected%27", disc)
+        self.assertNotIn("event_kind='disconnected'", disc)
+
+    # ---- the UI no longer holds shield logic ----
+    def test_html_renames_shield_and_drops_liveness_heuristic(self) -> None:
+        html = handler._console_html()
+        self.assertIn("Tick conservation", html)
+        self.assertNotIn("No tick lost", html)
+        # The old always-green path — capOk driving a WORKING ✅ shield — is gone.
+        self.assertNotIn("WORKING ✅", html)
+        # The UI renders the server verdict + its envelope tooltip.
+        self.assertIn("j.tick_conservation", html)
+        self.assertIn("tc.envelope", html)
+
+
 if __name__ == "__main__":
     unittest.main()
