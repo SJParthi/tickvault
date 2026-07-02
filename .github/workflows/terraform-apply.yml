@@ -12,6 +12,17 @@
 #   - Pull request → `terraform plan` only (safe review)
 #   - Push to main with infra path filter → plan + apply (fully automated)
 #   - workflow_dispatch → on-demand operator override (e.g. emergency apply)
+#   - schedule 10:20 UTC = 15:50 IST Mon–Fri → POST-CLOSE RETRY. When a merge
+#     lands during market hours, the push-triggered apply is BLOCKED by the
+#     market-hours guard below and the infra change would otherwise silently
+#     never deploy (e.g. run #175: PR #1308's Lambda change blocked at 06:10
+#     UTC, apply skipped forever). This mirrors deploy-aws-after-close.yml's
+#     10:16 UTC re-fire for the app. The scheduled run does the normal
+#     preflight + plan, then applies ONLY if `terraform plan -detailed-exitcode`
+#     returns 2 (changes pending). Exit 0 → the no-drift job logs
+#     "no drift, nothing to apply" and the run exits green (no false-OK).
+#     10:20 UTC is safely past the guard's 10:15 UTC edge — the guard itself
+#     is unchanged and passes naturally.
 #
 # Auth precedence (try in order):
 #   1. OIDC role via secrets.AWS_TERRAFORM_ROLE_ARN (preferred, set after first run)
@@ -33,6 +44,10 @@ on:
     paths:
       - 'deploy/aws/terraform/**'
       - '.github/workflows/terraform-apply.yml'
+  schedule:
+    # 10:20 UTC = 15:50 IST Mon–Fri — post-close retry for market-hours-blocked
+    # applies (just past the guard's 09:00-15:45 IST / 03:30-10:15 UTC band).
+    - cron: '20 10 * * 1-5'
   workflow_dispatch:
     inputs:
       confirm_market_hours:
@@ -192,7 +207,7 @@ jobs:
     name: Market-hours guard
     runs-on: ubuntu-24.04
     needs: [preflight, terraform-plan]
-    if: needs.preflight.outputs.bootstrap_ready == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    if: needs.preflight.outputs.bootstrap_ready == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
     steps:
       - name: Check current IST time against market window
         run: |
@@ -228,7 +243,8 @@ jobs:
     if: |
       needs.preflight.outputs.bootstrap_ready == 'true' && (
         (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-        (github.event_name == 'workflow_dispatch' && github.event.inputs.skip_apply != 'yes')
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.skip_apply != 'yes') ||
+        (github.event_name == 'schedule' && needs.terraform-plan.outputs.plan_exitcode == '2')
       )
     environment: prod
     outputs:
@@ -333,13 +349,41 @@ jobs:
           echo "Operator portal URL (key sent privately via Telegram): ${URL}" >> "$GITHUB_STEP_SUMMARY"
 
   # ─────────────────────────────────────────────────────────────────
+  # Job 3b: scheduled retry found no drift — skip green, but LOUDLY.
+  # Per audit-findings Rule 11 ("no false-OK"): a silent skip is
+  # indistinguishable from a stranded change, so the no-drift case
+  # logs its verdict explicitly instead of just not running apply.
+  # ─────────────────────────────────────────────────────────────────
+  no-drift:
+    name: Post-close retry — no drift
+    runs-on: ubuntu-24.04
+    needs: [preflight, terraform-plan]
+    if: |
+      github.event_name == 'schedule' &&
+      needs.preflight.outputs.bootstrap_ready == 'true' &&
+      needs.terraform-plan.outputs.plan_exitcode == '0'
+    steps:
+      - name: Log no-drift verdict
+        run: |
+          echo "no drift, nothing to apply — terraform plan exit 0, main's infra is already live."
+          {
+            echo "## Post-close scheduled retry"
+            echo ""
+            echo "ℹ️ no drift, nothing to apply (terraform plan -detailed-exitcode returned 0)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ─────────────────────────────────────────────────────────────────
   # Job 4: notify Telegram (via SNS) — success + failure paths
   # ─────────────────────────────────────────────────────────────────
   notify:
     name: Notify Telegram via SNS
     runs-on: ubuntu-24.04
     needs: [preflight, terraform-plan, terraform-apply]
-    if: always() && needs.preflight.outputs.bootstrap_ready == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    if: |
+      always() && needs.preflight.outputs.bootstrap_ready == 'true' && (
+        github.event_name == 'push' || github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'schedule' && needs.terraform-apply.result != 'skipped')
+      )
     steps:
       - name: Configure AWS credentials (OIDC if available, else access keys)
         uses: aws-actions/configure-aws-credentials@v4
