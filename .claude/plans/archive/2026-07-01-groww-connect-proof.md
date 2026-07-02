@@ -1,8 +1,24 @@
 # Implementation Plan: Groww live-feed CONNECT + subscribe PROOF + synthetic tick→DB e2e
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-06-28
 **Approved by:** operator (task brief — "implement … verify by ACTUALLY RUNNING it against QuestDB")
+
+> **Reconciliation note (2026-07-02):** every item below was ALREADY SHIPPED to
+> `main` by merged PR **#1237** ("feat(feeds): Groww live-feed connect+subscribe
+> PROOF, zero-poll event-driven tail, synthetic tick→DB e2e", commit `8d8d8534`;
+> e2e arity later repaired by #1253). This plan was archived as confirmed-merged
+> in #1298 with its checkboxes still unticked — this edit ticks them with
+> evidence instead of re-building anything. Verified on 2026-07-02 against main
+> `6a8f272d`: `cargo test -p tickvault-common --lib feed_health::` →
+> `39 passed; 0 failed`; `cargo test -p tickvault-app --lib groww_bridge::` →
+> `47 passed; 0 failed`; `groww_sidecar_supervisor::` → `51 passed; 0 failed`;
+> `cargo test -p tickvault-api --lib feeds` → `32 passed; 0 failed`;
+> `cargo test -p tickvault-app --test groww_live_pipeline_e2e` → `3 passed`
+> (in this sandbox QuestDB is not reachable, so the 3 e2e tests took their
+> honest SKIP path — "SKIP …: QuestDB not reachable on 127.0.0.1:9000/9009" —
+> exactly per the Edge Cases contract; the live-QuestDB green run was part of
+> #1237's landing evidence).
 
 ## Per-Item Guarantee Matrix
 
@@ -122,24 +138,30 @@ path (not a re-implementation) so the proof is faithful.
   so the existing verdict engine (Ok/Down/Unknown) is truthful.
 
 ## Plan Items
-- [ ] B4 — `feed_health.rs`: `subscribed_stocks`/`subscribed_indices` + `set_subscribed` + snapshot surfacing
+- [x] B4 — `feed_health.rs`: `subscribed_stocks`/`subscribed_indices` + `set_subscribed` + snapshot surfacing
   - Files: crates/common/src/feed_health.rs
   - Tests: test_registry_set_subscribed_round_trip, snapshot subscribed fields
-- [ ] B1 — sidecar status JSON (subscribed + streaming), atomic, no creds
+  - Shipped by #1237: `set_subscribed` (feed_health.rs:372), `subscribed_stocks`/`subscribed_indices` AtomicU64 arrays (:232-234), snapshot surfacing (:475-476); test landed as `test_registry_set_subscribed_surfaces_counts_and_instruments` (:1012)
+- [x] B1 — sidecar status JSON (subscribed + streaming), atomic, no creds
   - Files: scripts/groww-sidecar/groww_sidecar.py
   - Tests: supervisor env source-scan (B2), bridge parser unit test (B3)
-- [ ] B2 — supervisor injects GROWW_STATUS_FILE
+  - Shipped by #1237: `STATUS_PATH` from `GROWW_STATUS_FILE` (groww_sidecar.py:104), atomic-rename write throttled ≤1/s (:440-445), counts + event tag + timestamp only — no creds
+- [x] B2 — supervisor injects GROWW_STATUS_FILE
   - Files: crates/app/src/groww_sidecar_supervisor.rs
   - Tests: test_sidecar_run_injects_status_file_env (source-scan)
-- [ ] B3 — bridge reads status, emits CONNECT log + set_subscribed, re-gates connected
+  - Shipped by #1237: `.env("GROWW_STATUS_FILE", …)` injection (groww_sidecar_supervisor.rs:1042) + source-scan ratchet (:1622-1634)
+- [x] B3 — bridge reads status, emits CONNECT log + set_subscribed, re-gates connected
   - Files: crates/app/src/groww_bridge.rs
   - Tests: test_parse_groww_status_line_*, test_connect_gate_requires_streaming, source-scan
-- [ ] B5 — API FeedHealthRow.subscribed_total + page health line part
+  - Shipped by #1237: `set_connected(Feed::Groww, streaming_observed)` gate (groww_bridge.rs:1082), ONE structured CONNECTED log + `set_subscribed`, `test_parse_groww_status_line_*` (:1438-1502), gate source-scan ratchet (:1614-1620)
+- [x] B5 — API FeedHealthRow.subscribed_total + page health line part
   - Files: crates/api/src/handlers/feeds.rs, crates/api/src/handlers/feeds_page.rs
   - Tests: test_feed_health_row_has_subscribed_total, page string-scan
-- [ ] C1+C2 — live-QuestDB e2e + chaos/idempotency/coexistence
+  - Shipped by #1237: `subscribed_total` field (feeds.rs:264, computed :333, asserted 767 in test :444) + page `subscribed` health-line part (feeds_page.rs:245-261)
+- [x] C1+C2 — live-QuestDB e2e + chaos/idempotency/coexistence
   - Files: crates/app/tests/groww_live_pipeline_e2e.rs
   - Tests: groww_ticks_and_candles_land_tagged_feed_groww (live), malformed/idempotency/coexistence
+  - Shipped by #1237 (arity repaired by #1253): `groww_ticks_and_candles_land_tagged_feed_groww` + `malformed_ndjson_line_is_skipped_and_valid_lines_land` + `replay_same_ndjson_is_idempotent_no_duplicate_rows`, with the honest QuestDB-down SKIP path (no false green)
 
 ## Scenarios
 
