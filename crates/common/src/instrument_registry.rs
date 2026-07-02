@@ -674,6 +674,16 @@ mod tests {
     }
 
     #[test]
+    fn test_instrument_type_tag_returns_unknown_for_derivative_without_kind() {
+        // A derivative row whose DhanInstrumentKind never resolved must fall
+        // to the explicit "UNKNOWN" bucket — never a wrong INDEX/EQUITY tag.
+        let stock = sample_instrument(50004, SubscriptionCategory::StockDerivative);
+        assert_eq!(stock.instrument_type_tag(), "UNKNOWN");
+        let index = sample_instrument(50005, SubscriptionCategory::IndexDerivative);
+        assert_eq!(index.instrument_type_tag(), "UNKNOWN");
+    }
+
+    #[test]
     fn test_instrument_type_tag_all_seven_buckets_are_unique() {
         // Pins the operator's 4-bucket classification: every category +
         // instrument_kind combination produces a distinct, well-defined tag.

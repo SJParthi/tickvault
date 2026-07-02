@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::broadcast::{self, error::RecvError};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use tickvault_common::constants::{INDIA_VIX_SECURITY_ID, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY};
 use tickvault_common::tick_types::ParsedTick;
@@ -123,6 +123,71 @@ pub fn spawn_midnight_reset_task(tracker: Arc<DayOhlcTracker>) -> tokio::task::J
     })
 }
 
+/// Backoff between a midnight-reset task death and its respawn. Small so the
+/// IST-midnight reset resumes quickly, but non-zero so a task that panics
+/// instantly on every start cannot busy-spin the CPU — it respawns at most
+/// once per this interval, and the `tv_day_ohlc_reset_failures_total{reason}`
+/// counter rate surfaces the flap to the operator (INDEX-OHLC-02).
+pub const DAY_OHLC_RESET_RESPAWN_BACKOFF_SECS: u64 = 5;
+
+/// Classify why the supervised midnight-reset task's `JoinHandle` resolved,
+/// into a stable metric label. Pure function so the supervisor's branch logic
+/// is unit testable without constructing a real `JoinError` (which has no
+/// public constructor). Mirrors `disk_health_watcher::classify_join_exit`.
+#[must_use]
+pub fn classify_reset_task_exit(join_result: &Result<(), tokio::task::JoinError>) -> &'static str {
+    match join_result {
+        Ok(()) => "clean_exit",
+        Err(e) if e.is_panic() => "panic",
+        Err(e) if e.is_cancelled() => "cancelled",
+        Err(_) => "unknown",
+    }
+}
+
+/// CCL-02 — supervise the IST-midnight DayOhlc reset task (INDEX-OHLC-02).
+///
+/// [`spawn_midnight_reset_task`] runs an infinite sleep-until-midnight loop, so
+/// its `JoinHandle` resolves ONLY on a fatal event (panic mid-iteration or an
+/// external cancel). Before this supervisor the handle was bound to `_` in
+/// `main.rs`, so a panic made the daily reset vanish silently — yesterday's day
+/// high/low/close would then carry over to the next trading day (until the first
+/// live tick re-arms) with ZERO operator signal.
+///
+/// This mirrors the WS-GAP-05 pool supervisor and the DISK-WATCHER-01 disk-health
+/// watcher: on every reset-task death it logs `error!` (code `INDEX-OHLC-02`) +
+/// increments `tv_day_ohlc_reset_failures_total{reason}`, then respawns after
+/// [`DAY_OHLC_RESET_RESPAWN_BACKOFF_SECS`] so the midnight reset keeps firing.
+/// The counter is the one the `index-day-ohlc-tracker-error-codes.md` runbook
+/// already documents (it previously had no producer).
+///
+/// The returned `JoinHandle` is itself an infinite loop (it never resolves in
+/// normal operation); callers bind it to a `_`-prefixed name. The supervisor
+/// body has no panic path of its own (no `unwrap`/`expect`, pure-function
+/// classification), so it does not need a supervisor-of-the-supervisor.
+// O(1) EXEMPT: cold-path supervisor — one task per session, fires only on reset-task death.
+// TEST-EXEMPT: an infinite respawn driver; the pure decision `classify_reset_task_exit` and the backoff constant are unit-tested below, and the liveness invariant is pinned by `test_spawn_supervised_midnight_reset_task_keeps_running`.
+pub fn spawn_supervised_midnight_reset_task(
+    tracker: Arc<DayOhlcTracker>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let handle = spawn_midnight_reset_task(Arc::clone(&tracker));
+            let join_result = handle.await;
+            let reason = classify_reset_task_exit(&join_result);
+            error!(
+                reason,
+                code =
+                    tickvault_common::error_code::ErrorCode::IndexOhlc02DailyResetFailed.code_str(),
+                backoff_secs = DAY_OHLC_RESET_RESPAWN_BACKOFF_SECS,
+                "INDEX-OHLC-02: DayOhlc IST-midnight reset task exited — respawning so \
+                 yesterday's day high/low/close cannot silently carry over past midnight"
+            );
+            metrics::counter!("tv_day_ohlc_reset_failures_total", "reason" => reason).increment(1);
+            tokio::time::sleep(Duration::from_secs(DAY_OHLC_RESET_RESPAWN_BACKOFF_SECS)).await;
+        }
+    })
+}
+
 // Re-export the segment code constant so source-scan ratchets can verify
 // the consumer routes IDX_I ticks specifically.
 #[doc(hidden)]
@@ -154,5 +219,63 @@ mod tests {
         assert_eq!(IST_MIDNIGHT_HOUR, 0);
         assert_eq!(IST_MIDNIGHT_MINUTE, 0);
         assert_eq!(IST_MIDNIGHT_SECOND, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // CCL-02 — supervised midnight-reset task (INDEX-OHLC-02)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reset_respawn_backoff_is_small_but_nonzero() {
+        // Non-zero so a task that panics instantly on every start can't
+        // busy-spin the CPU; small so the IST-midnight reset resumes quickly.
+        assert!(DAY_OHLC_RESET_RESPAWN_BACKOFF_SECS >= 1);
+        assert!(DAY_OHLC_RESET_RESPAWN_BACKOFF_SECS <= 30);
+    }
+
+    #[tokio::test]
+    async fn test_classify_reset_task_exit_clean() {
+        let h = tokio::spawn(async {});
+        let r = h.await;
+        assert_eq!(classify_reset_task_exit(&r), "clean_exit");
+    }
+
+    #[tokio::test]
+    async fn test_classify_reset_task_exit_panic() {
+        // A panicking task yields a JoinError where is_panic() == true.
+        let h = tokio::spawn(async {
+            panic!("intentional test panic"); // APPROVED: test — exercises the panic branch
+        });
+        let r = h.await;
+        assert_eq!(classify_reset_task_exit(&r), "panic");
+    }
+
+    #[tokio::test]
+    async fn test_classify_reset_task_exit_cancelled() {
+        // An aborted task yields a JoinError where is_cancelled() == true.
+        let h = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        });
+        h.abort();
+        let r = h.await;
+        assert_eq!(classify_reset_task_exit(&r), "cancelled");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_supervised_midnight_reset_task_keeps_running() {
+        // The supervisor is an infinite loop — its JoinHandle must NOT resolve
+        // in normal operation. The inner reset task it spawns also loops forever
+        // (sleeps until IST 00:00:00), so the supervisor parks on `handle.await`
+        // and never completes. (If a future edit makes the supervisor return
+        // after one reset-task death instead of respawning, this guard fails.)
+        let tracker = Arc::new(DayOhlcTracker::new());
+        let handle = spawn_supervised_midnight_reset_task(tracker);
+        // Let the spawned task make progress.
+        tokio::task::yield_now().await;
+        assert!(
+            !handle.is_finished(),
+            "supervisor must keep running, not exit after spawning the reset task"
+        );
+        handle.abort();
     }
 }

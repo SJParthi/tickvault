@@ -39,8 +39,8 @@ use tracing::{error, info, warn};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_storage::tick_conservation_audit_persistence::{
-    CONSERVATION_FEED_DHAN, ConservationOutcome, TickConservationAuditWriter, TickConservationRow,
-    ensure_tick_conservation_audit_table,
+    CONSERVATION_FEED_DHAN, CONSERVATION_FEED_GROWW, ConservationOutcome,
+    TickConservationAuditWriter, TickConservationRow, ensure_tick_conservation_audit_table,
 };
 use tickvault_storage::ws_frame_spill::{WalDayFrameCounts, count_frames_for_ist_day};
 
@@ -354,18 +354,13 @@ pub async fn run_tick_conservation_audit(
 
     // 3. QuestDB row count for the IST day window. `ts` stores IST-epoch
     //    nanos, so the day window is [day*86400, (day+1)*86400) seconds in
-    //    ts-space (data-integrity.md).
+    //    ts-space (data-integrity.md). Feed-filtered to 'dhan' — the shared
+    //    `ticks` table also carries feed='groww' rows, which would otherwise
+    //    inflate this lane's db_rows and mask the runbook's
+    //    "db_rows vs persisted ⇒ DEDUP collapse / WAL lag" triage.
     let mut db_rows: i64 = -1;
     if let Some(ref client) = client {
-        // APPROVED: u64→i64 — IST day numbers are ~20K, far below i64::MAX.
-        let day_start_nanos = i64::try_from(target_ist_day)
-            .unwrap_or(0)
-            .saturating_mul(86_400)
-            .saturating_mul(1_000_000_000);
-        let day_end_nanos = day_start_nanos.saturating_add(86_400_000_000_000);
-        let sql = format!(
-            "select count() from ticks where ts >= {day_start_nanos} and ts < {day_end_nanos}"
-        );
+        let sql = build_conservation_ticks_count_sql(CONSERVATION_FEED_DHAN, target_ist_day);
         let url = format!(
             "http://{}:{}/exec",
             questdb_config.host, questdb_config.http_port
@@ -479,12 +474,415 @@ pub async fn run_tick_conservation_audit(
 }
 
 // ---------------------------------------------------------------------------
+// Groww lane conservation audit (feed='groww')
+// ---------------------------------------------------------------------------
+
+/// Nanoseconds in one IST day — the day-window width for the conservation scan.
+const NANOS_PER_IST_DAY: i64 = 86_400_000_000_000;
+
+/// Build the feed-filtered per-IST-day `ticks` count SQL for a conservation
+/// run. Pure. BOTH lanes go through this so neither query can silently drop
+/// the `feed` predicate again — the shared `ticks` table carries every feed's
+/// rows, and an unfiltered count inflates one lane's `db_rows` with the other
+/// lane's ticks (2026-07-02 adversarial-sweep finding). `feed` is a compile-time
+/// constant (`CONSERVATION_FEED_*`), never user input — no injection surface.
+#[must_use]
+pub fn build_conservation_ticks_count_sql(feed: &str, target_ist_day: u64) -> String {
+    // APPROVED: IST day numbers are ~20K, far below i64::MAX — saturating keeps adversarial inputs bounded.
+    let day_start_nanos = i64::try_from(target_ist_day)
+        .unwrap_or(0)
+        .saturating_mul(86_400)
+        .saturating_mul(1_000_000_000);
+    let day_end_nanos = day_start_nanos.saturating_add(NANOS_PER_IST_DAY);
+    format!(
+        "select count() from ticks where feed = '{feed}' \
+         and ts >= {day_start_nanos} and ts < {day_end_nanos}"
+    )
+}
+
+/// Extract `ts_ist_nanos` from one Groww NDJSON tick line. Pure. Returns `None`
+/// for a malformed / ts-less / non-positive line (skipped, never panics).
+#[must_use]
+pub fn parse_groww_line_ts(line: &str) -> Option<i64> {
+    #[derive(serde::Deserialize)]
+    struct TsOnly {
+        ts_ist_nanos: i64,
+    }
+    serde_json::from_str::<TsOnly>(line.trim())
+        .ok()
+        .map(|t| t.ts_ist_nanos)
+        .filter(|&t| t > 0)
+}
+
+/// Count Groww NDJSON lines whose `ts_ist_nanos` floors to `target_ist_day`.
+/// The sidecar's fsync'd append-only NDJSON is the durable DELIVERED-count
+/// ground truth for the Groww lane (mirrors Dhan's on-disk WAL frame count;
+/// survives a restart). Pure over the file contents. Missing file → 0; a
+/// malformed / ts-less line is skipped. Blocking file I/O — the caller wraps
+/// this in `spawn_blocking`.
+#[must_use]
+pub fn count_groww_ndjson_lines_for_ist_day(path: &Path, target_ist_day: u64) -> u64 {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(path) else {
+        return 0; // Groww disabled / first boot — a valid "0 delivered" measurement.
+    };
+    // APPROVED: IST day numbers are ~20K, far below i64::MAX — the cast + muls cannot overflow realistically; saturating keeps adversarial inputs bounded.
+    let day_start = i64::try_from(target_ist_day)
+        .unwrap_or(0)
+        .saturating_mul(86_400)
+        .saturating_mul(1_000_000_000);
+    let day_end = day_start.saturating_add(NANOS_PER_IST_DAY);
+    let mut count: u64 = 0;
+    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(ts) = parse_groww_line_ts(&line)
+            && ts >= day_start
+            && ts < day_end
+        {
+            count = count.saturating_add(1);
+        }
+    }
+    count
+}
+
+/// Groww conservation verdict. Pure.
+///
+/// UNLIKE the Dhan `classify_outcome` (which pages `Leak` on any positive
+/// residual because the WAL is a strict one-write-per-frame ground truth), a
+/// positive Groww residual (`ndjson_lines − persisted_groww`) is EXPECTED for
+/// BENIGN reasons — the in-flight NDJSON tail not yet drained at 15:40, and
+/// lines the bridge's stricter validation rejects before persist (e.g. a
+/// timestamp outside its accepted range). A same-day restart is residual-
+/// NEUTRAL: the bridge's byte-offset is in-memory only, so it re-tails the
+/// whole file from byte 0, but the deterministic `capture_seq` (seeded from
+/// `ts_ist_nanos`) regenerates identical keys → QuestDB DEDUP collapses the
+/// replay; neither the NDJSON count nor db_rows moves. So a
+/// non-zero residual is classified `Partial` (a recorded DIAGNOSTIC), NEVER
+/// `Leak` — this deliberately avoids the false-loss CRITICAL page a naive
+/// `residual>0 ⇒ leak` would produce. The forensic row + the numbers are still
+/// written every day (the 100%-audit-coverage requirement); leak-THRESHOLD
+/// precision is on-box-tuned later, exactly as the Dhan audit was validated at
+/// 15:40 IST on a real box.
+#[must_use]
+pub fn classify_groww_outcome(
+    delivery_residual: i64,
+    partial_coverage: bool,
+) -> ConservationOutcome {
+    if partial_coverage {
+        return ConservationOutcome::Partial;
+    }
+    if delivery_residual == 0 {
+        return ConservationOutcome::Balanced;
+    }
+    // Non-zero (either sign) → diagnostic, never a false CRITICAL leak.
+    ConservationOutcome::Partial
+}
+
+/// Runs the Groww lane's daily conservation audit once. Cold path (once/day at
+/// 15:40 IST, right after the Dhan run). Reconciles the sidecar NDJSON
+/// delivered-count vs the persisted `feed='groww'` ticks for the IST day, writes
+/// one forensic row to `tick_conservation_audit` tagged `feed='groww'`.
+///
+/// Fail-soft everywhere: a missing NDJSON file → 0 delivered; QuestDB
+/// unreachable → `db_rows=-1` → `partial`. Never panics, never a false leak.
+// APPROVED: cold-path orchestrator — 6 independent live inputs; bundling only relocates the arity.
+#[allow(clippy::too_many_arguments)]
+// TEST-EXEMPT: orchestration over the unit-tested pure parts (count/classify/persistence); a direct test needs a live QuestDB — the pure helpers below ARE tested.
+pub async fn run_groww_tick_conservation_audit(
+    ndjson_path: &Path,
+    questdb_config: &QuestDbConfig,
+    target_ist_day: u64,
+    trading_date_ist_nanos: i64,
+    run_ts_ist_nanos: i64,
+    boot_covered_full_session: bool,
+) {
+    ensure_tick_conservation_audit_table(questdb_config).await;
+
+    // 1. DELIVERED — Groww NDJSON line count for the IST day (on-disk ground
+    //    truth; blocking scan off the async worker).
+    let path_owned = ndjson_path.to_path_buf();
+    let ndjson_lines: u64 = match tokio::task::spawn_blocking(move || {
+        count_groww_ndjson_lines_for_ist_day(&path_owned, target_ist_day)
+    })
+    .await
+    {
+        Ok(n) => n,
+        Err(err) => {
+            warn!(?err, "groww_conservation: ndjson scan task failed");
+            0
+        }
+    };
+
+    // 2. PERSISTED — feed='groww' ticks in QuestDB for the IST day. Bounded
+    //    client: `Client::new()` has NO total-request timeout, so a wedged
+    //    QuestDB could park this cold-path task forever (2026-07-02 sweep).
+    let mut groww_db_rows: i64 = -1;
+    if let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(AUDIT_HTTP_TIMEOUT_SECS))
+        .build()
+    {
+        let sql = build_conservation_ticks_count_sql(CONSERVATION_FEED_GROWW, target_ist_day);
+        let url = format!(
+            "http://{}:{}/exec",
+            questdb_config.host, questdb_config.http_port
+        );
+        match client
+            .get(&url)
+            .query(&[("query", sql.as_str())])
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(body) = resp.text().await {
+                    groww_db_rows = parse_questdb_count(&body).unwrap_or(-1);
+                }
+            }
+            Ok(resp) => warn!(status = %resp.status(), "groww_conservation: ticks count non-2xx"),
+            Err(err) => warn!(?err, "groww_conservation: ticks count query failed"),
+        }
+    }
+
+    // 3. Residual + verdict (Groww-specific: a positive residual is a recorded
+    //    diagnostic, NEVER a false CRITICAL leak).
+    let sources_complete = groww_db_rows >= 0;
+    let partial_coverage = !boot_covered_full_session || !sources_complete;
+    let delivery_residual = i64::try_from(ndjson_lines)
+        .unwrap_or(i64::MAX)
+        .saturating_sub(groww_db_rows.max(0));
+    let outcome = classify_groww_outcome(delivery_residual, partial_coverage);
+
+    metrics::counter!("tv_tick_conservation_audit_runs_total", "outcome" => outcome.as_str(), "feed" => CONSERVATION_FEED_GROWW).increment(1);
+
+    let to_i64 = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+    let row = TickConservationRow {
+        run_ts_ist_nanos,
+        trading_date_ist_nanos,
+        // `wal_tick_frames` carries the Groww DELIVERED count (NDJSON lines) —
+        // the on-disk ground truth analogous to the Dhan WAL frame count.
+        wal_tick_frames: to_i64(ndjson_lines),
+        wal_other_frames: 0,
+        wal_unattributable: 0,
+        db_rows: groww_db_rows,
+        // The Groww bridge is a simple tail→persist path with no intermediate
+        // processed/junk/stale classification stage, so these Dhan-pipeline
+        // counters are 0 for the Groww lane (delivered vs db_rows is the signal).
+        processed: 0,
+        persisted: 0,
+        junk: 0,
+        stale_day: 0,
+        outside_hours: 0,
+        dedup: 0,
+        parse_errors: 0,
+        storage_errors: 0,
+        dropped_total: 0,
+        delivery_residual,
+        outcome_residual: 0,
+        partial_coverage,
+        outcome,
+        feed: CONSERVATION_FEED_GROWW,
+    };
+
+    // 4. Operator signal — INFO only (a positive Groww residual is benign; the
+    //    row + numbers are the audit coverage, no false CRITICAL page).
+    info!(
+        ndjson_lines,
+        groww_db_rows,
+        delivery_residual,
+        outcome = outcome.as_str(),
+        partial_coverage,
+        "groww tick conservation: reconciled sidecar NDJSON delivered-count vs \
+         persisted feed='groww' ticks (feed='groww' row in tick_conservation_audit)"
+    );
+
+    // 5. Forensic row (fail-soft).
+    let mut writer = TickConservationAuditWriter::new(questdb_config);
+    if let Err(err) = writer.append_row(&row) {
+        error!(?err, "groww_conservation: audit row append failed");
+        return;
+    }
+    if let Err(err) = writer.flush() {
+        error!(
+            ?err,
+            "groww_conservation: audit row flush failed (QuestDB down?)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Groww conservation audit (feed='groww') pure helpers ──
+
+    /// Day 20601 (an arbitrary IST day number); its start in ts_ist_nanos.
+    const GROWW_TEST_DAY: u64 = 20_601;
+    fn day_ts(day: u64, secs_into_day: i64) -> i64 {
+        (day as i64) * 86_400 * 1_000_000_000 + secs_into_day * 1_000_000_000
+    }
+
+    /// Guard that removes its unique temp dir on drop (no `tempfile` dep — mirrors
+    /// the `unique_dir()` pattern in `crates/app/tests/groww_live_pipeline_e2e.rs`).
+    struct TmpDir(std::path::PathBuf);
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    static NDJSON_TMP_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    fn write_ndjson(lines: &[String]) -> (TmpDir, std::path::PathBuf) {
+        let n = NDJSON_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("tv_groww_conserve_{}_{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("live-ticks.ndjson");
+        std::fs::write(&path, lines.join("\n")).expect("write ndjson");
+        (TmpDir(dir), path)
+    }
+
+    #[test]
+    fn test_build_conservation_ticks_count_sql_feed_filtered() {
+        // Both lanes' counts MUST be feed-filtered — the shared `ticks` table
+        // carries every feed's rows (2026-07-02 sweep: the unfiltered Dhan
+        // count silently included Groww rows on a both-feeds day).
+        let dhan = build_conservation_ticks_count_sql(CONSERVATION_FEED_DHAN, GROWW_TEST_DAY);
+        let groww = build_conservation_ticks_count_sql(CONSERVATION_FEED_GROWW, GROWW_TEST_DAY);
+        assert!(
+            dhan.contains("feed = 'dhan'"),
+            "Dhan count must filter feed: {dhan}"
+        );
+        assert!(
+            groww.contains("feed = 'groww'"),
+            "Groww count must filter feed: {groww}"
+        );
+        // Exact day window bounds: [day*86400e9, (day+1)*86400e9).
+        let start = (GROWW_TEST_DAY as i64) * 86_400 * 1_000_000_000;
+        let end = start + 86_400_000_000_000;
+        for sql in [&dhan, &groww] {
+            assert!(
+                sql.contains(&format!("ts >= {start}")),
+                "window start: {sql}"
+            );
+            assert!(sql.contains(&format!("ts < {end}")), "window end: {sql}");
+        }
+    }
+
+    #[test]
+    fn test_parse_groww_line_ts_extracts_and_filters() {
+        assert_eq!(
+            parse_groww_line_ts(r#"{"security_id":13,"ts_ist_nanos":1780000000000000000}"#),
+            Some(1_780_000_000_000_000_000)
+        );
+        // Malformed / missing field / non-positive → None (skipped, no panic).
+        assert_eq!(parse_groww_line_ts("not json"), None);
+        assert_eq!(parse_groww_line_ts(r#"{"security_id":13}"#), None);
+        assert_eq!(parse_groww_line_ts(r#"{"ts_ist_nanos":0}"#), None);
+    }
+
+    #[test]
+    fn test_count_groww_ndjson_lines_for_ist_day_in_day() {
+        // 3 lines inside GROWW_TEST_DAY (09:15, 12:00, 15:29) → count 3.
+        let lines: Vec<String> = [33_300, 43_200, 55_740]
+            .iter()
+            .map(|s| {
+                format!(
+                    r#"{{"security_id":13,"ts_ist_nanos":{}}}"#,
+                    day_ts(GROWW_TEST_DAY, *s)
+                )
+            })
+            .collect();
+        let (_d, path) = write_ndjson(&lines);
+        assert_eq!(
+            count_groww_ndjson_lines_for_ist_day(&path, GROWW_TEST_DAY),
+            3
+        );
+    }
+
+    #[test]
+    fn test_groww_ndjson_line_count_excludes_other_day() {
+        // 2 in-day + 2 next-day + 1 prev-day → only 2 counted for GROWW_TEST_DAY.
+        let mut lines: Vec<String> = vec![
+            format!(r#"{{"ts_ist_nanos":{}}}"#, day_ts(GROWW_TEST_DAY, 40_000)),
+            format!(r#"{{"ts_ist_nanos":{}}}"#, day_ts(GROWW_TEST_DAY, 50_000)),
+        ];
+        lines.push(format!(
+            r#"{{"ts_ist_nanos":{}}}"#,
+            day_ts(GROWW_TEST_DAY + 1, 100)
+        ));
+        lines.push(format!(
+            r#"{{"ts_ist_nanos":{}}}"#,
+            day_ts(GROWW_TEST_DAY + 1, 200)
+        ));
+        lines.push(format!(
+            r#"{{"ts_ist_nanos":{}}}"#,
+            day_ts(GROWW_TEST_DAY - 1, 80_000)
+        ));
+        let (_d, path) = write_ndjson(&lines);
+        assert_eq!(
+            count_groww_ndjson_lines_for_ist_day(&path, GROWW_TEST_DAY),
+            2
+        );
+    }
+
+    #[test]
+    fn test_groww_ndjson_line_count_skips_malformed_and_blank() {
+        let lines = vec![
+            format!(r#"{{"ts_ist_nanos":{}}}"#, day_ts(GROWW_TEST_DAY, 40_000)),
+            "not json at all".to_string(),
+            String::new(),
+            r#"{"security_id":13}"#.to_string(), // no ts field
+            format!(r#"{{"ts_ist_nanos":{}}}"#, day_ts(GROWW_TEST_DAY, 41_000)),
+        ];
+        let (_d, path) = write_ndjson(&lines);
+        assert_eq!(
+            count_groww_ndjson_lines_for_ist_day(&path, GROWW_TEST_DAY),
+            2,
+            "malformed/blank/ts-less lines skipped without panic"
+        );
+    }
+
+    #[test]
+    fn test_groww_ndjson_line_count_missing_file_is_zero() {
+        let missing = std::path::Path::new("/nonexistent/groww/live-ticks.ndjson");
+        assert_eq!(
+            count_groww_ndjson_lines_for_ist_day(missing, GROWW_TEST_DAY),
+            0
+        );
+    }
+
+    #[test]
+    fn test_classify_groww_outcome_positive_residual_is_partial_not_leak() {
+        // The false-alarm guard: a positive residual (tail / DEDUP-collapse) must
+        // classify Partial (diagnostic), NEVER Leak — Groww's NDJSON is not a
+        // strict one-write-per-tick ground truth like the Dhan WAL.
+        assert_eq!(
+            classify_groww_outcome(10, false),
+            ConservationOutcome::Partial,
+            "positive Groww residual must NOT be a false CRITICAL leak"
+        );
+        // Exact match → Balanced.
+        assert_eq!(
+            classify_groww_outcome(0, false),
+            ConservationOutcome::Balanced
+        );
+        // Incomplete sources → Partial regardless.
+        assert_eq!(
+            classify_groww_outcome(0, true),
+            ConservationOutcome::Partial
+        );
+        // Negative residual (db has more, e.g. prior-session rows) → Partial, not leak.
+        assert_eq!(
+            classify_groww_outcome(-5, false),
+            ConservationOutcome::Partial
+        );
+    }
 
     #[test]
     fn test_decide_conservation_start_before_after_force() {

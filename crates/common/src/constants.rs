@@ -613,17 +613,24 @@ pub const DHAN_SANDBOX_TOKEN_SECRET: &str = "sandbox-token";
 // `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`
 // ---------------------------------------------------------------------------
 
-/// SSM service path segment for Groww credentials.
-/// Full paths: `/tickvault/<env>/groww/api-key` + `/tickvault/<env>/groww/totp-secret`.
+/// SSM service path segment for the Groww feed.
+/// Full path read by TickVault: `/tickvault/<env>/groww/access-token` ONLY.
 pub const SSM_GROWW_SERVICE: &str = "groww";
 
-/// SSM secret name for the Groww API key (the "TOTP token" from the Groww
-/// trade-api keys page; sent as `Authorization: Bearer <api_key>`).
-pub const GROWW_API_KEY_SECRET: &str = "api-key";
-
-/// SSM secret name for the Groww TOTP secret (the seed for the rotating
-/// 6-digit code; SHA1 / 6 digits / 30s — same as Dhan).
-pub const GROWW_TOTP_SECRET: &str = "totp-secret";
+/// SSM parameter name for the Groww ACCESS TOKEN — the daily token minted by
+/// the bruteX-owned `groww-token-minter` Lambda (~06:05 IST, EventBridge) into
+/// `/tickvault/<env>/groww/access-token` (SecureString, KMS
+/// `alias/tickvault-groww`). TickVault is a READ-ONLY consumer of this ONE
+/// parameter (IAM reader role `groww-token-minter-reader-tickvault`).
+///
+/// Operator lock 2026-07-02
+/// (`.claude/rules/project/groww-shared-token-minter-2026-07-02.md`):
+/// TickVault NEVER mints a Groww token, NEVER reads the `api-key` /
+/// `totp-secret` credential parameters (Lambda-only), and NEVER writes any
+/// `/tickvault/*/groww/*` parameter. The former credential-name constants were
+/// deleted with the mint path; ratchet:
+/// `crates/common/tests/groww_no_mint_guard.rs`.
+pub const GROWW_ACCESS_TOKEN_SECRET: &str = "access-token";
 
 /// Groww master instrument CSV (public static asset, no auth). Source of every
 /// Groww `exchange_token` — joined to NTM ISINs to build the watch-list (§31).
@@ -718,6 +725,25 @@ pub const PUBLIC_IP_CHECK_TIMEOUT_SECS: u64 = 10;
 
 /// Maximum retry attempts for public IP detection (primary + fallback).
 pub const PUBLIC_IP_CHECK_MAX_RETRIES: u32 = 3;
+
+/// GAP-NET-01 (AUTH-P12) — interval between runtime public-IP re-checks by
+/// the mid-session IP monitor. 300s = 5 minutes, matching the boot-time
+/// verify cadence; a confirmed mismatch therefore takes
+/// `IP_MONITOR_MISMATCH_CONFIRM_THRESHOLD` × this interval of the SAME wrong
+/// IP before any action fires (never a one-shot flap).
+pub const IP_MONITOR_CHECK_INTERVAL_SECS: u64 = 300;
+
+/// GAP-NET-01 (AUTH-P12) — number of CONSECUTIVE mismatched poll cycles the
+/// runtime IP monitor requires before it acts (confirm-twice debounce). A
+/// single transient metadata blip (1 cycle) never triggers an alert or halt;
+/// only a sustained wrong IP does.
+pub const IP_MONITOR_MISMATCH_CONFIRM_THRESHOLD: u32 = 2;
+
+/// GAP-NET-01 (AUTH-P12) — grace delay after the CRITICAL halt-class ERROR is
+/// logged, before the runtime IP monitor calls `std::process::exit`. Gives the
+/// log/Telegram sinks a moment to flush the alert so the operator sees WHY the
+/// process exited.
+pub const IP_MONITOR_HALT_FLUSH_DELAY_SECS: u64 = 2;
 
 /// Phase 0 Item 18b — Max retry attempts for the boot-time Dhan static
 /// IP gate (`/v2/ip/getIP`) when `orders_allowed = false`. Bounds the
@@ -1213,6 +1239,23 @@ pub const TICK_PERSIST_START_SECS_OF_DAY_IST: u32 = 32_400;
 /// Seconds-of-day (IST) at which tick persistence ends: 15:30:00 = 15 × 3600 + 30 × 60.
 /// The end is **exclusive** — a tick at exactly 15:30:00 is NOT persisted.
 pub const TICK_PERSIST_END_SECS_OF_DAY_IST: u32 = 55_800;
+
+/// CCL-06 (permutation-coverage audit §140): seconds-of-day (IST) at which the
+/// Muhurat (Diwali evening) trading-session persist window OPENS: 18:00:00 =
+/// 18 × 3600. This is a DELIBERATE SUPERSET of the historical announced NSE
+/// Muhurat windows (2023 was 18:15–19:15, 2024 was 18:00–19:00) so a
+/// slightly-early tick is still captured. Only active on a Muhurat date (gated
+/// by the boot `muhurat` flag — see `crate::muhurat`); on every trading/mock
+/// day this window is ignored, so the regular `[09:00, 15:30)` behaviour is
+/// byte-for-byte unchanged.
+pub const MUHURAT_PERSIST_START_SECS_OF_DAY_IST: u32 = 64_800;
+
+/// CCL-06: seconds-of-day (IST) at which the Muhurat persist window CLOSES:
+/// 19:30:00 = 19 × 3600 + 30 × 60. **Exclusive** — a tick at exactly 19:30:00
+/// is NOT persisted (matches the half-open `[start, end)` contract of the
+/// regular window). Superset upper bound (announced windows have ended by
+/// 19:15) so a slightly-late tick is still captured.
+pub const MUHURAT_PERSIST_END_SECS_OF_DAY_IST: u32 = 70_200;
 
 /// Operator-locked 2026-05-25: post-market historical fetch + cross-verify
 /// window START. Begins at 15:30:00 IST (= `TICK_PERSIST_END_SECS_OF_DAY_IST`).
@@ -2101,6 +2144,30 @@ const _: () = assert!(
     "TICK_PERSIST_END must be within a single day"
 );
 
+// CCL-06: Muhurat persist window — start < end, both within a day, values match
+// IST times, and the window is disjoint from + AFTER the regular window (so the
+// two ranges never overlap and the Muhurat branch is purely additive).
+const _: () = assert!(
+    MUHURAT_PERSIST_START_SECS_OF_DAY_IST == 18 * 3600,
+    "MUHURAT_PERSIST_START must equal 18:00 IST (64800)"
+);
+const _: () = assert!(
+    MUHURAT_PERSIST_END_SECS_OF_DAY_IST == 19 * 3600 + 30 * 60,
+    "MUHURAT_PERSIST_END must equal 19:30 IST (70200)"
+);
+const _: () = assert!(
+    MUHURAT_PERSIST_START_SECS_OF_DAY_IST < MUHURAT_PERSIST_END_SECS_OF_DAY_IST,
+    "MUHURAT_PERSIST_START must be before MUHURAT_PERSIST_END"
+);
+const _: () = assert!(
+    MUHURAT_PERSIST_END_SECS_OF_DAY_IST < SECONDS_PER_DAY,
+    "MUHURAT_PERSIST_END must be within a single day"
+);
+const _: () = assert!(
+    TICK_PERSIST_END_SECS_OF_DAY_IST <= MUHURAT_PERSIST_START_SECS_OF_DAY_IST,
+    "MUHURAT window must be disjoint from + after the regular [09:00, 15:30) window"
+);
+
 // Post-market fetch window invariants (PR #796, operator-locked 2026-05-25).
 const _: () = assert!(
     POST_MARKET_FETCH_WINDOW_START_SECS_OF_DAY_IST == 15 * 3600 + 30 * 60,
@@ -2612,6 +2679,22 @@ mod market_hours_tests {
     fn test_tick_persist_end_matches_three_thirty() {
         assert_eq!(TICK_PERSIST_END_SECS_OF_DAY_IST, 15 * 3600 + 30 * 60);
         assert_eq!(TICK_PERSIST_END_SECS_OF_DAY_IST, 55_800);
+    }
+
+    #[test]
+    fn test_muhurat_window_constants_pinned() {
+        // CCL-06: 18:00 IST open, 19:30 IST close (exclusive), superset of the
+        // announced NSE Muhurat windows.
+        assert_eq!(MUHURAT_PERSIST_START_SECS_OF_DAY_IST, 18 * 3600);
+        assert_eq!(MUHURAT_PERSIST_START_SECS_OF_DAY_IST, 64_800);
+        assert_eq!(MUHURAT_PERSIST_END_SECS_OF_DAY_IST, 19 * 3600 + 30 * 60);
+        assert_eq!(MUHURAT_PERSIST_END_SECS_OF_DAY_IST, 70_200);
+        // start < end, within a day.
+        assert!(MUHURAT_PERSIST_START_SECS_OF_DAY_IST < MUHURAT_PERSIST_END_SECS_OF_DAY_IST);
+        assert!(MUHURAT_PERSIST_END_SECS_OF_DAY_IST < SECONDS_PER_DAY);
+        // Disjoint from + strictly after the regular window: the Muhurat range
+        // is purely additive, never overlapping [09:00, 15:30).
+        assert!(TICK_PERSIST_END_SECS_OF_DAY_IST <= MUHURAT_PERSIST_START_SECS_OF_DAY_IST);
     }
 
     #[test]

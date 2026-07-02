@@ -43,13 +43,20 @@ fi
 # llvm-cov JSON format: { "data": [ { "files": [ { "filename": "...", "summary": { "lines": { "percent": N } } } ] } ] }
 python3 -c "
 import json, sys, re
+from fractions import Fraction
 
 with open('$COVERAGE_JSON') as f:
     data = json.load(f)
 
-# Parse thresholds TOML (simple key=value parser — no toml library needed)
+# Parse thresholds TOML (simple key=value parser — no toml library needed).
+# Thresholds are kept as EXACT decimals (Fraction), never binary floats:
+# float('99.5') is exact, but a computed pct like covered/count*100.0 for a
+# ratio of exactly 0.995 evaluates to 99.49999999999999 in binary float and
+# would FAIL a >= 99.5 gate even though the true value EQUALS the threshold.
+# A ratchet floor means 'at least the threshold' — exact-equal MUST pass, so
+# the comparison below is done in exact rational arithmetic.
 thresholds = {}
-default_threshold = float('$DEFAULT_THRESHOLD')
+default_threshold = Fraction('$DEFAULT_THRESHOLD')
 in_crates = False
 with open('$THRESHOLDS_FILE') as f:
     for line in f:
@@ -62,7 +69,7 @@ with open('$THRESHOLDS_FILE') as f:
             continue
         if in_crates and '=' in line:
             key, val = line.split('=', 1)
-            thresholds[key.strip()] = float(val.strip())
+            thresholds[key.strip()] = Fraction(val.strip())
 
 # Aggregate per-crate: group files by crate name (crates/<name>/...)
 crate_lines = {}
@@ -98,14 +105,19 @@ failed = False
 for crate_name in sorted(crate_lines.keys()):
     info = crate_lines[crate_name]
     if info['count'] == 0:
-        pct = 100.0
+        pct = Fraction(100)
     else:
-        pct = (info['covered'] / info['count']) * 100.0
+        # EXACT rational percentage — no binary-float rounding error.
+        pct = Fraction(info['covered'] * 100, info['count'])
     threshold = thresholds.get(crate_name, default_threshold)
+    # Exact comparison: pct == threshold PASSES (ratchet = 'at least').
     status = 'PASS' if pct >= threshold else 'FAIL'
     if status == 'FAIL':
         failed = True
-    print(f'  {status}: {crate_name:15s} {pct:6.1f}% (threshold: {threshold}%)')
+    # Display at 2 decimals so a value just below the threshold can no
+    # longer be printed as visually EQUAL to it (the old 1-decimal display
+    # showed 'FAIL: 99.5% (threshold: 99.5%)' for a true 99.46%).
+    print(f'  {status}: {crate_name:15s} {float(pct):7.2f}% (threshold: {float(threshold)}%)')
 
 if failed:
     print('')

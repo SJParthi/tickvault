@@ -129,11 +129,11 @@ fn bench_gap_detector(c: &mut Criterion) {
     let detector = TickGapDetector::new(30);
     let now = std::time::Instant::now();
     // Seed at the live universe scale (~250 SIDs, Quote mode).
-    for id in 0..250_u32 {
+    for id in 0..250_u64 {
         detector.record_tick(id, ExchangeSegment::IdxI, now);
     }
     c.bench_function("gap_detector/record_tick_250_sids", |b| {
-        let mut sid: u32 = 0;
+        let mut sid: u64 = 0;
         b.iter(|| {
             sid = sid.wrapping_add(1) % 250;
             detector.record_tick(
@@ -247,7 +247,9 @@ fn bench_composite(c: &mut Criterion) {
     let mut buffer = tickvault_storage::tick_persistence_testing::new_ilp_buffer_pub();
     let (sender, receiver) = tokio::sync::broadcast::channel::<ParsedTick>(262_144);
     let _keep_alive = receiver;
-    let canary_sids: [u32; 3] = [13, 25, 51];
+    // `ParsedTick.security_id` is `u64` (2026-06-29 widening); mirrors the
+    // production `CANARY_UNDERLYINGS: &[(u64, &str)]` in `tick_processor.rs`.
+    let canary_sids: [u64; 3] = [13, 25, 51];
     let mut rows: usize = 0;
     let mut seq: i64 = 1;
 

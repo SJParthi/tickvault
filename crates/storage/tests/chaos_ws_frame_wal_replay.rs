@@ -40,7 +40,9 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType, replay_all};
+use tickvault_storage::ws_frame_spill::{
+    AppendOutcome, WsFrameSpill, WsType, confirm_replayed, replay_all,
+};
 
 /// Build a unique temp dir keyed on caller tag + nanosecond timestamp
 /// so concurrent `cargo test` invocations never collide.
@@ -149,21 +151,32 @@ fn chaos_sigkill_ws_frame_wal_recovers_all_four_types() {
     assert_eq!(live, 50, "LiveFeed count");
     assert_eq!(ord, 10, "OrderUpdate count");
 
-    // Replayed segments are archived, not deleted — a second replay
-    // on the same directory should return zero because the archive
-    // walk is only performed on `.wal` files, which have been moved.
-    let second = replay_all(&dir).expect("replay_all idempotent");
+    // Crash-safety contract (zero-loss MEDIUM fix 2026-06-30): replayed
+    // segments are STAGED in `replaying/`, not archived, until the caller
+    // confirms durable re-capture. WITHOUT a confirm, a second replay
+    // re-returns the same frames (un-confirmed → re-replayed). This is the
+    // fix: a second crash before persist no longer strands frames.
+    let second_no_confirm = replay_all(&dir).expect("replay_all re-replays un-confirmed");
     assert_eq!(
-        second.len(),
-        0,
-        "P7 Scenario 5: replayed segments must not double-replay"
+        second_no_confirm.len(),
+        60,
+        "P7 Scenario 5 (crash-safe): un-confirmed segments MUST re-replay"
     );
 
-    // Archive directory must contain at least one original segment.
+    // Now confirm (caller proved durable re-capture) → archive → no re-replay.
+    confirm_replayed(&dir);
+    let third_after_confirm = replay_all(&dir).expect("replay_all idempotent after confirm");
+    assert_eq!(
+        third_after_confirm.len(),
+        0,
+        "P7 Scenario 5: confirmed (archived) segments must not double-replay"
+    );
+
+    // Archive directory must contain the confirmed segment(s) AFTER confirm.
     let archive = dir.join("archive");
     assert!(
         archive.exists(),
-        "archive directory must exist after replay"
+        "archive directory must exist after confirm"
     );
     let archived = std::fs::read_dir(&archive).expect("read archive").count();
     assert!(archived >= 1, "archive must contain at least one segment");

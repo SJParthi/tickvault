@@ -241,15 +241,29 @@ impl TokenManager {
                     if is_totp_error(&reason) {
                         totp_retries = totp_retries.saturating_add(1);
                         if totp_retries > TOTP_MAX_RETRIES {
+                            // AUTH-P11 (AUTH-GAP-04): TOTP retries exhausted. A
+                            // genuinely-wrong secret never produces a valid code,
+                            // so this terminal branch means the TOTP/2FA seed was
+                            // rotated externally (operator regenerated on dhan.co
+                            // without updating SSM). Emit a distinctly-typed code
+                            // so Telegram + the errors.jsonl sink point the
+                            // operator at the exact SSM param to reconcile,
+                            // instead of a generic auth failure.
                             error!(
+                                code = tickvault_common::error_code::ErrorCode::AuthGap04TotpRotatedExternally.code_str(),
+                                severity = tickvault_common::error_code::ErrorCode::AuthGap04TotpRotatedExternally
+                                    .severity()
+                                    .as_str(),
                                 attempt,
                                 totp_retries,
                                 error = %reason,
-                                "TOTP failed after {TOTP_MAX_RETRIES} retries — verify TOTP secret in SSM"
+                                "AUTH-GAP-04: TOTP failed after {TOTP_MAX_RETRIES} retries — \
+                                 the TOTP secret was likely rotated externally; verify \
+                                 /tickvault/<env>/dhan/totp-secret in SSM matches dhan.co"
                             );
                             notifier.notify(NotificationEvent::AuthenticationFailed {
                                 reason: format!(
-                                    "TOTP invalid after {TOTP_MAX_RETRIES} retries — check /tickvault/<env>/dhan/totp-secret in SSM"
+                                    "TOTP invalid after {TOTP_MAX_RETRIES} retries — secret rotated externally? check /tickvault/<env>/dhan/totp-secret in SSM"
                                 ),
                             });
                             return Err(err);
@@ -2665,6 +2679,33 @@ mod tests {
         assert!(is_permanent_auth_error("account blocked"));
         assert!(is_permanent_auth_error("account suspended"));
         assert!(is_permanent_auth_error("account disabled"));
+    }
+
+    #[test]
+    fn test_totp_exhaustion_branch_emits_auth_gap_04() {
+        // AUTH-P11 (audit 2026-07-01): the TOTP-retry-exhaustion terminal
+        // branch MUST emit the distinctly-typed AUTH-GAP-04 code (with a
+        // `code =` field) so a rotated-secret failure routes to Telegram
+        // Critical and names the SSM param — not a generic auth failure.
+        // Source-scan ratchet: the full emit path requires a live auth
+        // loop with I/O, so we pin the coded emit at the source level.
+        let src = include_str!("token_manager.rs");
+        assert!(
+            src.contains("AuthGap04TotpRotatedExternally.code_str()"),
+            "the TOTP-exhaustion branch must emit \
+             ErrorCode::AuthGap04TotpRotatedExternally.code_str() (AUTH-GAP-04)"
+        );
+        // The wire-format string must resolve correctly.
+        assert_eq!(
+            tickvault_common::error_code::ErrorCode::AuthGap04TotpRotatedExternally.code_str(),
+            "AUTH-GAP-04"
+        );
+        // And it must be Critical (never auto-triage-safe).
+        assert!(
+            !tickvault_common::error_code::ErrorCode::AuthGap04TotpRotatedExternally
+                .is_auto_triage_safe(),
+            "AUTH-GAP-04 must be Critical — auth is dead until the secret is fixed"
+        );
     }
 
     #[test]

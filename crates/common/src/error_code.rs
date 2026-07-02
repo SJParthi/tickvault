@@ -244,8 +244,24 @@ pub enum ErrorCode {
     /// durable-loss signal — previously this arm returned silently.
     /// Severity::Critical.
     WsSpill02FrameDropped,
+    /// PROC-01: an OOM kill was detected — the cgroup-v2 `memory.events`
+    /// `oom_kill` counter rose above the boot-time baseline. Some process in
+    /// this cgroup (tickvault itself or a sidecar) was killed by the kernel
+    /// OOM killer. Before this signal an OOM was only caught indirectly
+    /// (process dies → systemd → market-hours-liveness page on a missing SLO),
+    /// so an OOM-loop was indistinguishable from a panic-loop with zero OOM
+    /// attribution. Severity::Critical — the host is out of memory.
+    Proc01OomKillDetected,
     /// AUTH-GAP-03: token force-renewed on WebSocket wake.
     AuthGap03TokenForceRenewedOnWake,
+    /// AUTH-GAP-04: the login TOTP/2FA secret was rotated externally
+    /// (e.g. operator regenerated it via the dhan.co web UI without
+    /// updating SSM). Token generation exhausts `TOTP_MAX_RETRIES` and
+    /// returns a distinctly-typed failure instead of a generic auth
+    /// error, so the operator is pointed at the exact SSM parameter to
+    /// reconcile. Severity::Critical — auth is dead until the secret is
+    /// fixed. AUTH-P11 (audit 2026-07-01).
+    AuthGap04TotpRotatedExternally,
     /// BOOT-01: slow-boot QuestDB readiness deadline approaching (>30s).
     Boot01QuestDbSlow,
     /// BOOT-02: boot deadline exceeded (>60s) — HALTING.
@@ -435,6 +451,24 @@ pub enum ErrorCode {
     /// the other instance shuts down (or its 90 s TTL expires after
     /// a hard crash). Severity::Critical.
     Resilience01DualInstanceDetected,
+    /// RESOURCE-01: open file-descriptor count crossed the early-warning
+    /// threshold (default 80% of `LimitNOFILE`). A leaked WS / QuestDB
+    /// socket can exhaust the fd table with zero signal until `connect()`
+    /// starts failing; this monitor pages BEFORE that. Severity::High.
+    /// BP-08 (audit 2026-07-01).
+    Resource01FdCountHigh,
+    /// RESOURCE-02: process resident memory (VmRSS) crossed the
+    /// early-warning threshold (default 80% of the cgroup memory limit).
+    /// Distinct from the host-aggregate `mem_used_high` alarm — this is
+    /// the tickvault process itself approaching its cgroup ceiling before
+    /// the OOM killer fires. Severity::High. BP-08 (audit 2026-07-01).
+    Resource02ResidentMemoryHigh,
+    /// RESOURCE-03: spill-directory free space dropped below the
+    /// early-warning percent-of-total threshold (default 20% free). A
+    /// process-level percent view distinct from the host `disk_used_high`
+    /// aggregate, so a fast-filling spill dir is caught before the zero-
+    /// loss chain is at risk. Severity::High. BP-08 (audit 2026-07-01).
+    Resource03SpillFreeLow,
     /// ORPHAN-POSITION-01: at 15:25:00 IST the orphan-position
     /// watchdog observed one or more open positions (`net_qty != 0`)
     /// in the account. Strategy is intraday option-buying — NO
@@ -699,7 +733,9 @@ impl ErrorCode {
             Self::DiskWatcher01Respawned => "DISK-WATCHER-01",
             Self::WsSpill01WriterRespawn => "WS-SPILL-01",
             Self::WsSpill02FrameDropped => "WS-SPILL-02",
+            Self::Proc01OomKillDetected => "PROC-01",
             Self::AuthGap03TokenForceRenewedOnWake => "AUTH-GAP-03",
+            Self::AuthGap04TotpRotatedExternally => "AUTH-GAP-04",
             Self::Boot01QuestDbSlow => "BOOT-01",
             Self::Boot02DeadlineExceeded => "BOOT-02",
             Self::Boot03ClockSkewExceeded => "BOOT-03",
@@ -760,6 +796,9 @@ impl ErrorCode {
             Self::AggregatorHb01Heartbeat => "AGGREGATOR-HB-01",
             Self::Boundary01CatchupSeal => "BOUNDARY-01",
             Self::Resilience01DualInstanceDetected => "RESILIENCE-01",
+            Self::Resource01FdCountHigh => "RESOURCE-01",
+            Self::Resource02ResidentMemoryHigh => "RESOURCE-02",
+            Self::Resource03SpillFreeLow => "RESOURCE-03",
             Self::OrphanPosition01Detected => "ORPHAN-POSITION-01",
             Self::BarMismatch01CorrectedFromHistorical => "BAR-MISMATCH-01",
             Self::BarMismatch02CrossCheckInconclusive => "BAR-MISMATCH-02",
@@ -823,8 +862,13 @@ impl ErrorCode {
             | Self::InstrFetch03DanglingReferences
             | Self::InstrFetch04UniverseSizeOutOfBounds
             | Self::NtmConstituency01SourceDegraded
+            // AUTH-P11 (2026-07-01) — TOTP secret rotated externally; auth is
+            // dead until the SSM secret is reconciled (Critical, not auto-triage).
+            | Self::AuthGap04TotpRotatedExternally
             // WS-SPILL-02 — durable frame dropped (writer dead at append instant)
-            | Self::WsSpill02FrameDropped => Severity::Critical,
+            | Self::WsSpill02FrameDropped
+            // PROC-01 — OOM kill detected (host out of memory)
+            | Self::Proc01OomKillDetected => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
             Self::Selftest01Passed
             | Self::Slo01Healthy
@@ -880,7 +924,12 @@ impl ErrorCode {
             // the operator must see; a flapping restart STORM points at a
             // persistent provider-side reject).
             | Self::FeedStall01SidecarRestarted
-            | Self::FeedSupervisor01Respawned => Severity::High,
+            | Self::FeedSupervisor01Respawned
+            // BP-08 (2026-07-01) — fd / RSS / spill-free early-warning
+            // monitors: page at 80% so the operator acts before exhaustion.
+            | Self::Resource01FdCountHigh
+            | Self::Resource02ResidentMemoryHigh
+            | Self::Resource03SpillFreeLow => Severity::High,
             // Medium: data pipeline correctness
             // PR #6b (2026-05-19): I-P0-01/02/04/05 retired with their modules.
             Self::InstrumentP1CrossSegmentCollision
@@ -1047,7 +1096,16 @@ impl ErrorCode {
             | Self::AggregatorSeal01IlpFailed
             | Self::AggregatorHb01Heartbeat
             | Self::Boundary01CatchupSeal => ".claude/rules/project/wave-6-error-codes.md",
-            Self::Resilience01DualInstanceDetected => ".claude/rules/project/wave-4-error-codes.md",
+            Self::Resilience01DualInstanceDetected
+            | Self::Proc01OomKillDetected
+            // AUTH-P11 (2026-07-01) — TOTP secret rotated externally (promotes
+            // the RESERVED AUTH-GAP-04 stub in wave-4-error-codes.md).
+            | Self::AuthGap04TotpRotatedExternally
+            // BP-08 (2026-07-01) — fd / RSS / spill-free early-warning monitors
+            // (promotes the RESERVED RESOURCE-01/02/03 stubs).
+            | Self::Resource01FdCountHigh
+            | Self::Resource02ResidentMemoryHigh
+            | Self::Resource03SpillFreeLow => ".claude/rules/project/wave-4-error-codes.md",
             Self::OrphanPosition01Detected => {
                 ".claude/rules/project/phase-0-item-20-error-codes.md"
             }
@@ -1188,7 +1246,9 @@ impl ErrorCode {
             Self::DiskWatcher01Respawned,
             Self::WsSpill01WriterRespawn,
             Self::WsSpill02FrameDropped,
+            Self::Proc01OomKillDetected,
             Self::AuthGap03TokenForceRenewedOnWake,
+            Self::AuthGap04TotpRotatedExternally,
             Self::Boot01QuestDbSlow,
             Self::Boot02DeadlineExceeded,
             Self::Boot03ClockSkewExceeded,
@@ -1219,6 +1279,10 @@ impl ErrorCode {
             Self::Boundary01CatchupSeal,
             // Wave 4 — Item 19 dual-instance lock
             Self::Resilience01DualInstanceDetected,
+            // BP-08 (2026-07-01) — fd / RSS / spill-free early-warning monitors
+            Self::Resource01FdCountHigh,
+            Self::Resource02ResidentMemoryHigh,
+            Self::Resource03SpillFreeLow,
             // Phase 0 Item 20 — orphan position 15:25 IST watchdog
             Self::OrphanPosition01Detected,
             // Phase 0 Items 15+28+29 — 09:16:05 IST post-open cross-check
@@ -1299,20 +1363,16 @@ mod tests {
     fn test_all_variants_have_unique_code_str() {
         let mut seen: HashSet<&'static str> = HashSet::new();
         for code in ErrorCode::all() {
-            assert!(
-                seen.insert(code.code_str()),
-                "duplicate code_str: {}",
-                code.code_str()
-            );
+            let cs = code.code_str();
+            assert!(seen.insert(cs), "duplicate code_str: {cs}");
         }
     }
 
     #[test]
     fn test_code_str_roundtrip_via_from_str() {
         for code in ErrorCode::all() {
-            let parsed: ErrorCode = code.code_str().parse().unwrap_or_else(|e| {
-                panic!("FromStr failed to roundtrip for {}: {e:?}", code.code_str())
-            });
+            let cs = code.code_str();
+            let parsed: ErrorCode = cs.parse().unwrap_or_else(|e| panic!("{cs}: {e:?}"));
             assert_eq!(parsed, *code);
         }
     }
@@ -1326,17 +1386,12 @@ mod tests {
     #[test]
     fn test_every_variant_has_non_empty_runbook_path() {
         for code in ErrorCode::all() {
+            let cs = code.code_str();
             let path = code.runbook_path();
-            assert!(
-                !path.is_empty(),
-                "runbook_path empty for {}",
-                code.code_str()
-            );
+            assert!(!path.is_empty(), "runbook_path empty for {cs}");
             assert!(
                 path.starts_with(".claude/"),
-                "runbook_path for {} should point at .claude/: got {}",
-                code.code_str(),
-                path
+                "{cs} must point at .claude/: {path}"
             );
         }
     }
@@ -1362,10 +1417,10 @@ mod tests {
     fn test_critical_codes_never_auto_triage() {
         for code in ErrorCode::all() {
             if code.severity() == Severity::Critical {
+                let cs = code.code_str();
                 assert!(
                     !code.is_auto_triage_safe(),
-                    "{} is Critical but is_auto_triage_safe returned true",
-                    code.code_str()
+                    "{cs} is Critical but auto-triage-safe"
                 );
             }
         }
@@ -1537,7 +1592,11 @@ mod tests {
         // 2026-06-30 (Dhan reconnect hardening Fix A): bumped 109 -> 110 for
         // WS-GAP-09 (watchdog reconnect-in-place on the bare-Dhan-reset class
         // instead of process::exit + 775-SID re-subscribe → 429).
-        assert_eq!(ErrorCode::all().len(), 110);
+        // 2026-07-01 (BP-07 / Wave-4-E1): bumped 110 -> 111 for PROC-01
+        // (OOM-kill monitor — cgroup-v2 memory.events oom_kill vs boot baseline).
+        // 2026-07-01 (audit sweep): bumped 111 -> 115 for AUTH-GAP-04 (AUTH-P11)
+        // + RESOURCE-01/02/03 (BP-08 fd / RSS / spill-free monitors).
+        assert_eq!(ErrorCode::all().len(), 115);
     }
 
     #[test]
@@ -1559,11 +1618,8 @@ mod tests {
             .and_then(std::path::Path::parent)
             .map(|root| root.join(code.runbook_path()))
             .expect("workspace root");
-        assert!(
-            abs.exists(),
-            "PREVDAY-01 runbook missing on disk: {}",
-            abs.display()
-        );
+        let shown = abs.display().to_string();
+        assert!(abs.exists(), "PREVDAY-01 runbook missing on disk: {shown}");
         // Listed in the catalogue.
         assert!(ErrorCode::all().contains(&code));
     }
@@ -1609,6 +1665,8 @@ mod tests {
                 || s.starts_with("BOUNDARY-")
                 // Wave 4 Item 19 (Phase 0): dual-instance lock.
                 || s.starts_with("RESILIENCE-")
+                // BP-08 (audit 2026-07-01): fd / RSS / spill-free monitors.
+                || s.starts_with("RESOURCE-")
                 // Phase 0 Item 20: orphan position 15:25 IST watchdog.
                 || s.starts_with("ORPHAN-POSITION-")
                 // Phase 0 Items 15+28+29: 09:16:05 IST post-open cross-check.
@@ -1635,7 +1693,9 @@ mod tests {
                 || s.starts_with("GROWW-MASTER-")
                 // 2026-06-30: feed-agnostic sidecar stall-watchdog + respawn
                 || s.starts_with("FEED-STALL-")
-                || s.starts_with("FEED-SUPERVISOR-");
+                || s.starts_with("FEED-SUPERVISOR-")
+                // Wave-4-E1 / BP-07 (2026-07-01): OOM-kill monitor.
+                || s.starts_with("PROC-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

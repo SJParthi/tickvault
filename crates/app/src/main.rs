@@ -188,6 +188,121 @@ fn emit_boot_completed() {
     metrics::gauge!(BOOT_COMPLETED_METRIC).set(1.0);
 }
 
+/// How long the boot-completed emit waits for AT LEAST ONE enabled feed's lane
+/// to reach a running state before it decides. Feed lanes come up
+/// asynchronously (the Dhan lane FSM Starting→Running, the Groww activation
+/// watcher's watch-list build), so a point-in-time snapshot at the emit instant
+/// would false-NEGATIVE a feed that is legitimately still coming up. A bounded
+/// wait removes that race while keeping the honest end-state: a feed that never
+/// comes up correctly withholds the "alive" signal. Boot is cold path, so a
+/// bounded 60s poll is well inside every boot budget.
+const BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS: u64 = 60;
+
+/// Poll cadence for the boot-completed feed-liveness wait.
+const BOOT_COMPLETED_FEED_LIVENESS_POLL_MS: u64 = 1000;
+
+/// Decide whether the boot-completed "the app is alive" signal
+/// (`tv_boot_completed`) may be emitted, given each feed's enabled flag and its
+/// observed lane-running state.
+///
+/// FEED-AGNOSTIC by construction: the signal is warranted iff AT LEAST ONE
+/// ENABLED feed is running — a live Groww satisfies it when only Groww is
+/// enabled, a live Dhan when only Dhan is enabled, and either when both are
+/// enabled. A running-but-DISABLED feed never counts (an operator-off feed is
+/// not a reason to claim "alive").
+///
+/// The one exception: when NO feed is enabled (a deliberately feed-less run —
+/// shared-infra-only), the signal IS emitted so the boot-heartbeat alarm does
+/// not false-page a legitimately headless boot. The caller logs that case
+/// explicitly.
+///
+/// This closes the alerting hole where a boot that reached the emit line with
+/// EVERY enabled feed dead still published `tv_boot_completed=1` — so the
+/// boot-heartbeat alarm (`treat_missing_data="breaching"`) never paged. With
+/// this gate, "every enabled feed failed to come up" withholds the metric →
+/// MISSING → the alarm pages, exactly the intended signal.
+///
+/// Pure + O(1) — unit-tested truth table.
+fn boot_completed_should_emit(
+    dhan_enabled: bool,
+    groww_enabled: bool,
+    dhan_running: bool,
+    groww_running: bool,
+) -> bool {
+    // Deliberately feed-less run: nothing to be "live", so emit to avoid a
+    // false page on a headless shared-infra-only boot.
+    if !dhan_enabled && !groww_enabled {
+        return true;
+    }
+    // At least one feed enabled: emit iff at least one ENABLED feed is running.
+    (dhan_enabled && dhan_running) || (groww_enabled && groww_running)
+}
+
+/// Emit `tv_boot_completed` ONLY once at least one enabled feed's lane is
+/// genuinely running — waiting up to [`BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS`]
+/// for an async-starting feed to come up. Withholds the metric (and logs an
+/// `error!` naming the dead feed(s)) if the window elapses with every enabled
+/// feed dark, so the boot-heartbeat alarm pages on the MISSING signal.
+///
+/// The no-feed-enabled case (shared-infra-only) resolves `true` on the first
+/// poll and emits immediately (unchanged timing), logged at `info!`.
+async fn emit_boot_completed_when_feed_live(
+    feed_runtime: &std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
+    dhan_enabled: bool,
+    groww_enabled: bool,
+) {
+    if !dhan_enabled && !groww_enabled {
+        // Deliberately feed-less run — emit immediately (no feed to wait for),
+        // logged explicitly so the operator sees WHY the "alive" signal fired
+        // with no live feed.
+        info!(
+            "boot-completed: no feed enabled (dhan_enabled=false, groww_enabled=false) — \
+             emitting the alive signal for a deliberately shared-infra-only run"
+        );
+        emit_boot_completed();
+        return;
+    }
+
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS);
+    loop {
+        let dhan_running = feed_runtime.is_dhan_lane_running();
+        let groww_running = feed_runtime.is_groww_lane_running();
+        if boot_completed_should_emit(dhan_enabled, groww_enabled, dhan_running, groww_running) {
+            info!(
+                dhan_enabled,
+                groww_enabled,
+                dhan_running,
+                groww_running,
+                "boot-completed: a live feed is up — emitting the alive signal"
+            );
+            emit_boot_completed();
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            // Every enabled feed failed to reach running within the window.
+            // WITHHOLD the alive signal so the boot-heartbeat alarm pages on the
+            // MISSING metric, and name the dead feed(s) for the operator.
+            error!(
+                dhan_enabled,
+                groww_enabled,
+                dhan_running,
+                groww_running,
+                wait_secs = BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS,
+                "boot-completed: NO enabled feed reached a live state within the wait window — \
+                 WITHHOLDING the alive signal (tv_boot_completed) so the boot-heartbeat alarm \
+                 pages on the missing metric. Check the enabled feed(s): a Dhan lane that never \
+                 reached Running or a Groww activation that never built its watch-list."
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(
+            BOOT_COMPLETED_FEED_LIVENESS_POLL_MS,
+        ))
+        .await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
@@ -1223,6 +1338,12 @@ async fn main() -> Result<()> {
     let is_trading = trading_calendar.is_trading_day_today();
     let is_muhurat = trading_calendar.is_muhurat_trading_today();
     let is_mock_trading = trading_calendar.is_mock_trading_today();
+    // CCL-06: publish today's Muhurat-session flag to the process-global so the
+    // tick processor additionally accepts the evening [18:00, 19:30) IST window
+    // on a Muhurat date (otherwise the connected feed's Muhurat ticks are
+    // silently dropped by the regular [09:00, 15:30) persist gate). Idempotent,
+    // boot-once; `false` on every trading/mock day → today's behaviour.
+    tickvault_common::muhurat::init_muhurat_session(is_muhurat);
     info!(
         is_trading_day = is_trading,
         is_muhurat_session = is_muhurat,
@@ -1516,6 +1637,14 @@ async fn main() -> Result<()> {
         //
         // If the pool build failed (ws_pool_ready is None) we log a
         // warning but preserve the frames in the WAL archive.
+        //
+        // CRASH-SAFETY (zero-loss MEDIUM fix 2026-06-30): mirror of the
+        // slow-boot staged-then-confirm contract. The fast-boot confirm
+        // (just before notify_systemd_ready below) archives the staged
+        // segments ONLY if this re-injection was clean — i.e. a pool
+        // existed AND no frame was dropped. A dropped/no-pool case keeps
+        // the segments in replaying/ so they re-replay next boot.
+        let mut fast_ws_wal_replay_reinjection_clean = true;
         if !ws_wal_replay_live_feed.is_empty() {
             if let Some(ref pool) = ws_pool_ready {
                 let sender = pool.frame_sender_clone();
@@ -1550,6 +1679,7 @@ async fn main() -> Result<()> {
                     // archive for forensic replay but could not be handed
                     // to the live consumer. This is a degraded mode, not a
                     // data loss (the frames are still on disk).
+                    fast_ws_wal_replay_reinjection_clean = false;
                     error!(
                         dropped,
                         injected,
@@ -1568,6 +1698,7 @@ async fn main() -> Result<()> {
                     );
                 }
             } else {
+                fast_ws_wal_replay_reinjection_clean = false;
                 warn!(
                     frames = ws_wal_replay_live_feed.len(),
                     "STAGE-C.2b: LiveFeed replay frames held but pool build failed — \
@@ -1634,6 +1765,10 @@ async fn main() -> Result<()> {
 
             // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
             let greeks_enricher = build_inline_greeks_enricher(&config, &subscription_plan);
+
+            // NT-15: seed the tick-gap detector with every subscribed SID so a
+            // never-ticking instrument becomes a first-tick black-hole signal.
+            seed_tick_gap_detector_from_plan(&subscription_plan);
 
             // O(1) EXEMPT: cold path — clone registry once for tick processor enrichment.
             let fast_registry = subscription_plan
@@ -2140,6 +2275,28 @@ async fn main() -> Result<()> {
                 .to_string(),
         });
 
+        // CRASH-SAFETY confirm (fast boot): mirror of the slow-boot confirm
+        // near the end of main(). Archive the staged WAL segments out of
+        // replaying/ ONLY if the LiveFeed re-injection above was clean (pool
+        // existed AND no frame dropped). Without this the fast-boot path
+        // re-replayed every crash-recovery boot — bounded by QuestDB dedup but
+        // growing replaying/ + replay cost on a crash-loop, defeating the
+        // cleanup this fix targets on the exact path it targets. Gated on the
+        // clean flag so a dropped/no-pool re-injection leaves the segments in
+        // replaying/ to re-replay next boot (never confirmed early = no loss).
+        {
+            let fast_ws_wal_path = tickvault_app::tick_conservation_boot::ws_wal_dir();
+            if fast_ws_wal_replay_reinjection_clean {
+                tickvault_storage::ws_frame_spill::confirm_replayed(&fast_ws_wal_path);
+            } else {
+                warn!(
+                    dir = %fast_ws_wal_path.display(),
+                    "STAGE-C.2b: WAL replay NOT confirmed (fast boot — a re-injection dropped or \
+                     pool not ready) — staged segments remain in replaying/ for re-replay next boot"
+                );
+            }
+        }
+
         // CRITICAL: tell systemd the service is up. The unit is Type=notify, so
         // systemd kills the process at TimeoutStartSec (default 90s) unless it
         // receives sd_notify(READY=1). The slow-boot path sends this near the
@@ -2156,7 +2313,19 @@ async fn main() -> Result<()> {
         // because this path returns into `run_shutdown_fast()` and never reaches
         // the slow-boot emit at the end of `main()`. See `emit_boot_completed`
         // for the full rationale (boot-heartbeat alarm pages on MISSING).
-        emit_boot_completed();
+        //
+        // GATED on a live feed (audit fix, this PR): the fast-boot arm is
+        // Dhan-ON-only, but the warm-snapshot re-injects the WS pool
+        // asynchronously — a crash-recovery where the pool never reconnects must
+        // NOT publish "alive". `emit_boot_completed_when_feed_live` waits (bounded)
+        // for the Dhan lane to reach Running and withholds the metric (→ alarm
+        // pages) if it never does.
+        emit_boot_completed_when_feed_live(
+            &feed_runtime,
+            config.feeds.dhan_enabled,
+            config.feeds.groww_enabled,
+        )
+        .await;
 
         // Boot-symmetry fix (2026-06-09): the post-market 15:31 cross-verify +
         // 15:31:30 EOD digest were slow-boot-only, so a mid-session crash restart
@@ -2236,6 +2405,124 @@ async fn main() -> Result<()> {
         std::sync::Arc::clone(&tick_storage),
     )
     .await?;
+
+    // =======================================================================
+    // PROCESS-GLOBAL supervised observability monitors (2026-07-01 per-lane-leak
+    // fix). These four host/process-level monitors used to be spawned inside the
+    // per-lane `start_dhan_lane`, which re-runs on every Dhan enable / stop→restart
+    // / cold-start retry (`run_dhan_lane_cold_start`) — so each re-invocation
+    // leaked a fresh never-aborted monitor (duplicate PROC-01 / RESOURCE-01/02/03 /
+    // INDEX-OHLC-02 / DISK-WATCHER-01 pages + N× metric increments for one real
+    // event, unbounded task growth under toggling), and on a boot-OFF-Dhan
+    // deployment they never started at all until Dhan was toggled on. They are
+    // spawned EXACTLY ONCE here in the process-global prefix (after
+    // `build_shared_infra`, before the Dhan-lane gate) and owned at process scope,
+    // so they run regardless of Dhan enable/disable/restart. This block is placed
+    // AFTER `build_shared_infra` returns (NOT inside it), so the
+    // build-shared-infra isolation guard — which forbids auth / instrument-load /
+    // WebSocket strings in that fn's body — is unaffected (these are pure
+    // observability, none of those strings).
+    // =======================================================================
+
+    // 2026-04-28 audit gap closure: spawn the disk-health watcher.
+    // Closes the highest-risk hole in the zero-loss chain ("disk full +
+    // QuestDB down simultaneously"). Operator now gets ~hours of warning
+    // via `tv_spill_dir_free_bytes` gauge before the spill disk fills.
+    //
+    // G3 (zero-tick-loss audit PR-5): run the watcher UNDER A SUPERVISOR
+    // (mirrors the WS-GAP-05 pool supervisor) so a panic in the watcher
+    // respawns it + logs DISK-WATCHER-01 + increments
+    // `tv_disk_watcher_respawn_total` (CloudWatch-alarmed) instead of
+    // silently vanishing — previously this handle was bound to `_` and a
+    // watcher panic killed disk-free monitoring with no signal.
+    let _disk_health_watcher_supervisor =
+        tickvault_storage::disk_health_watcher::spawn_supervised_spill_disk_health_watcher(
+            std::path::PathBuf::from("data/spill"),
+        );
+
+    // BP-07 (PROC-01, 2026-07-01): supervised OOM-kill monitor. Reads the
+    // cgroup-v2 `memory.events` `oom_kill` counter vs a boot baseline every
+    // 60s and pages Critical (`error!(code = "PROC-01")` + `tv_oom_kills_total`)
+    // when the host OOM-killer takes a process in this cgroup. Before this an
+    // OOM was only caught indirectly (die → systemd → missing-SLO page), so an
+    // OOM-loop was indistinguishable from a panic-loop. Always-on (an OOM at
+    // any hour is critical); on a non-cgroup-v2 dev box the probe fails softly
+    // (`tv_oom_monitor_probe_failed_total`, no page, no panic). Supervised so a
+    // monitor panic respawns instead of vanishing (mirrors DISK-WATCHER-01).
+    let _oom_monitor_supervisor =
+        tickvault_storage::oom_monitor::spawn_supervised_oom_monitor(std::path::PathBuf::from(
+            tickvault_storage::oom_monitor::DEFAULT_CGROUP_V2_MEMORY_EVENTS_PATH,
+        ));
+
+    // BP-08 (RESOURCE-01/02/03, 2026-07-01): supervised process-level resource
+    // early-warning monitor. Samples open fd count vs LimitNOFILE (RESOURCE-01),
+    // VmRSS vs cgroup memory.max (RESOURCE-02), and spill-dir free-percent
+    // (RESOURCE-03) every 60s; pages Critical/High at 80% (fd/RSS) / <20% free
+    // (spill) so the operator acts BEFORE exhaustion — distinct from the host-
+    // aggregate mem_used_high / disk_used_high alarms. Always-on (resource
+    // exhaustion at any hour is critical); non-Linux probes fail softly
+    // (tv_resource_monitor_probe_failed_total, no page, no panic). Supervised so
+    // a monitor panic respawns instead of vanishing (mirrors DISK-WATCHER-01).
+    let _resource_monitor_supervisor =
+        tickvault_storage::resource_monitor::spawn_supervised_resource_monitor(
+            tickvault_storage::resource_monitor::ResourceMonitorPaths::platform_defaults(
+                std::path::PathBuf::from("data/spill"),
+            ),
+        );
+
+    // Daily 15:40 IST per-feed tick-conservation audit — PROCESS-GLOBAL
+    // (2026-07-02 adversarial-sweep fix). Previously nested inside the
+    // Dhan-gated `spawn_post_market_tasks`, so a Groww-only session ran ZERO
+    // conservation audits and runtime Dhan enable cycles duplicated the task.
+    // Spawned exactly once here; each lane's run is gated at 15:40 on the
+    // truthful runtime feed flags. See `spawn_daily_tick_conservation_task`.
+    spawn_daily_tick_conservation_task(&config, &trading_calendar, &feed_runtime);
+
+    // -----------------------------------------------------------------------
+    // DayOhlcTracker boot wiring (post 2026-05-26 simplification; MOVED to
+    // process-global scope 2026-07-01 to stop the per-lane cold-start leak).
+    //
+    // Per operator directive 2026-05-26 the Dhan historical / pre-market buffer
+    // code was removed. `day_open` for the 4 LOCKED IDX_I SIDs is now the FIRST
+    // OBSERVED LIVE TICK LTP after the IST midnight reset — no external arming
+    // required. The tracker reads the PROCESS-GLOBAL `tick_broadcast_sender`
+    // (filtering IDX_I ticks by segment, not by an instrument list), and the
+    // IST-midnight reset is a host observability task — so the whole wiring is
+    // process-global, spawned ONCE here instead of inside the per-lane
+    // subscription-plan block (which re-ran on every cold-start and leaked a
+    // fresh midnight-reset supervisor → duplicate INDEX-OHLC-02 pages).
+    //
+    // Two tokio tasks spawned here:
+    //   1. tick consumer  — drain tick broadcast, route IDX_I ticks to
+    //                       update_tick() which auto-arms on first call and
+    //                       advances day_high/low/close on subsequent calls.
+    //   2. midnight reset — IST 00:00:00 clears prev-day state so the next live
+    //                       tick re-arms (CCL-02 supervised respawn wrapper,
+    //                       INDEX-OHLC-02).
+    // -----------------------------------------------------------------------
+    let day_ohlc_tracker = std::sync::Arc::new(tickvault_trading::in_mem::DayOhlcTracker::new());
+    {
+        let consumer_tracker = std::sync::Arc::clone(&day_ohlc_tracker);
+        let consumer_rx = tick_broadcast_sender.subscribe();
+        let _consumer_handle = tickvault_app::day_ohlc_orchestrator::spawn_day_ohlc_tick_consumer(
+            consumer_tracker,
+            consumer_rx,
+        );
+    }
+    {
+        // CCL-02: supervised respawn wrapper (INDEX-OHLC-02) so a panic in the
+        // IST-midnight reset task can never silently take the daily reset offline
+        // — mirror WS-GAP-05 / DISK-WATCHER-01.
+        let reset_tracker = std::sync::Arc::clone(&day_ohlc_tracker);
+        let _reset_supervisor_handle =
+            tickvault_app::day_ohlc_orchestrator::spawn_supervised_midnight_reset_task(
+                reset_tracker,
+            );
+    }
+    info!(
+        "DayOhlcTracker boot wired at process scope (tick consumer + midnight reset; \
+         day_open = first live tick LTP)"
+    );
 
     // =======================================================================
     // D2b: build + publish the OWNED runtime Dhan-lane context, so the
@@ -2332,6 +2619,15 @@ async fn main() -> Result<()> {
             // here would break the D2a one-liner ratchet for zero runtime gain.
             Err(StartLaneError::BootAbortClean) => return Ok(()),
             Err(StartLaneError::BootAbortErr(err)) => return Err(err),
+            // FTC-14: boot-ON WS-pool build failed — exit with an error chain
+            // (a pool we intended to build but couldn't is a real boot failure,
+            // not an offline mode). The runtime classify path emits DHAN-LANE-02
+            // for the runtime cold-start arm.
+            Err(StartLaneError::WsPoolSpawn) => {
+                return Err(anyhow::anyhow!(
+                    "DHAN-LANE-02: WebSocket main-feed pool build/spawn failed at boot"
+                ));
+            }
         }
     } else {
         // Dhan-OFF (Groww-only / no-feed): no Dhan lane. The shared infra built
@@ -2907,13 +3203,23 @@ fn create_websocket_pool(
         tickvault_common::config::SubscriptionScope::Indices4Only => {
             tickvault_core::websocket::activity_watchdog::WATCHDOG_THRESHOLD_IDX_I_SECS
         }
-        // Sub-PR #1 of 2026-05-27 — `DailyUniverse` variant introduced;
-        // production code-path activation lands in Sub-PRs #2-#13. Same
-        // IDX_I watchdog threshold applies until #8 tunes it for the
-        // 250-SID mixed universe (indices + NSE_EQ underlyings).
-        // See `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`.
+        // Audit GAP-1 fix (Operator approved 2026-07-02: "approve 15s"): the
+        // DailyUniverse clamp previously reused the 3s IDX_I threshold
+        // (the Sub-PR #1 2026-05-27 comment here explicitly deferred
+        // re-tuning to "#8", which never happened). Dhan's server pings
+        // every 10s and the read loop counts pings as activity
+        // (connection.rs STAGE-C.3), so the 3s clamp force-reconnected
+        // HEALTHY, still-pinging sockets during any >=3s data lull
+        // inside the market-hours gate (thin pre-open 09:00–09:15
+        // especially). 15s = one full Dhan ping interval + 50% margin:
+        // can never fire on a healthy socket, still detects a truly
+        // silent one 3.3x faster than the 50s config default. The
+        // Indices4Only arm above keeps its historical 3s value
+        // untouched. See `WATCHDOG_THRESHOLD_DAILY_UNIVERSE_SECS` docs +
+        // `.claude/rules/project/live-market-feed-subscription.md`
+        // (2026-07-02 section).
         tickvault_common::config::SubscriptionScope::DailyUniverse => {
-            tickvault_core::websocket::activity_watchdog::WATCHDOG_THRESHOLD_IDX_I_SECS
+            tickvault_core::websocket::activity_watchdog::WATCHDOG_THRESHOLD_DAILY_UNIVERSE_SECS
         }
     };
     if effective_watchdog_threshold != configured_watchdog_threshold {
@@ -3476,6 +3782,39 @@ fn should_reconnect_in_place(
         || is_in_window_429_rideout_class(healths, in_market_hours, token_valid, questdb_reachable)
 }
 
+/// QuestDB-probe damping (2026-07-01, watchdog-cascade audit HIGH) — number of
+/// CONSECUTIVE failed QuestDB liveness probes the pool watchdog tolerates before
+/// the 429 ride-out EXIT gate treats QuestDB as "down". N=2 (× the 5s tick =
+/// 10s of sustained unreachability). Rationale: the ride-out classifiers
+/// (`is_bare_reset_class` / `is_in_window_429_rideout_class`) HARD-REQUIRE
+/// `questdb_reachable == true`, and the raw signal is a SINGLE un-damped probe
+/// (`timeout(2s, wait_for_questdb_ready(_, 1))`). A single momentary blip (GC
+/// pause / transient HTTP hiccup / the 2s timeout firing under load) during a
+/// live in-market 429 storm flips the raw flag false → `ride_out == false` →
+/// `process::exit(2)` → 775-SID cold re-subscribe → next 429 → the self-inflicted
+/// restart/429 loop #1277 exists to stop. N=2 is the SMALLEST N that absorbs a
+/// one-tick blip while still forcing the exit on a genuine SUSTAINED outage
+/// after 10s (2 consecutive ticks) — well inside the 15-min ride-out ceiling, so
+/// a real dead DB is never worse than today (N=1 = today's undamped bug). Cold
+/// path (5s watchdog tick), not the hot tick path.
+const POOL_WATCHDOG_QDB_EXIT_DAMP_THRESHOLD: u32 = 2; // APPROVED: cold-path watchdog damping threshold, 2026-07-01 audit fix
+
+/// QuestDB-probe damping (2026-07-01) — pure decision: given the count of
+/// CONSECUTIVE failed QuestDB probes seen so far, is QuestDB "reachable" FOR THE
+/// EXIT DECISION? Returns `true` (reachable — keep riding out) until
+/// `consecutive_failures >= threshold`, then `false` (treat as down → the
+/// ride-out gate falls back to the genuine-fatal exit). A single successful
+/// probe resets the caller's counter to 0, so the flip requires N *consecutive*
+/// failures — a real SUSTAINED outage, not a blip.
+///
+/// The RAW single-probe signal (`health.set_questdb_reachable`) is UNCHANGED and
+/// keeps feeding `/health` + `overall_status` — only the exit gate consults this
+/// damped view. Pure function. Tested by `test_damp_questdb_exit_signal_*`.
+#[must_use]
+const fn damp_questdb_exit_signal(consecutive_failures: u32, threshold: u32) -> bool {
+    consecutive_failures < threshold
+}
+
 fn spawn_pool_watchdog_task(
     pool: std::sync::Arc<WebSocketConnectionPool>,
     shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
@@ -3526,6 +3865,14 @@ fn spawn_pool_watchdog_task(
         // `None` on any non-Halt verdict (the pool recovered / is no longer
         // all-down), so the 15-min ceiling measures one continuous episode.
         let mut reconnect_in_place_since: Option<std::time::Instant> = None;
+        // QuestDB-probe damping (2026-07-01 audit fix): count of CONSECUTIVE
+        // failed QuestDB liveness probes. A single successful probe resets it
+        // to 0. Feeds `damp_questdb_exit_signal(..)` → the DAMPED
+        // `questdb_reachable_for_exit_decision` signal the Halt-arm ride-out
+        // gate reads (the RAW `set_questdb_reachable` signal is still pushed
+        // every tick for `/health`). Local to the task (cold-path 5s tick, no
+        // shared state, no hot-path alloc).
+        let mut qdb_consecutive_failures: u32 = 0;
         // 5-second poll interval — cold path, not per tick. Matches the
         // degrading/halt thresholds (60s/300s) with plenty of resolution.
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5)); // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
@@ -3580,7 +3927,26 @@ fn spawn_pool_watchdog_task(
                     )
                     .await
                     .is_ok_and(|res| res.is_ok());
+                    // RAW single-probe signal — feeds `/health` + `overall_status`
+                    // + observability. A single blip legitimately shows here.
                     health.set_questdb_reachable(questdb_reachable_now);
+
+                    // DAMPED exit signal (2026-07-01 audit fix): track CONSECUTIVE
+                    // failures so the 429 ride-out EXIT gate treats QuestDB as
+                    // "down" ONLY after N consecutive failed probes — a single
+                    // blip during an in-market 429 storm no longer forces
+                    // process::exit + a 775-SID cold re-subscribe that trips the
+                    // next 429. A genuine SUSTAINED outage still flips it after N
+                    // ticks (never worse than today for a real dead DB).
+                    if questdb_reachable_now {
+                        qdb_consecutive_failures = 0;
+                    } else {
+                        qdb_consecutive_failures = qdb_consecutive_failures.saturating_add(1);
+                    }
+                    health.set_questdb_reachable_for_exit_decision(damp_questdb_exit_signal(
+                        qdb_consecutive_failures,
+                        POOL_WATCHDOG_QDB_EXIT_DAMP_THRESHOLD,
+                    ));
 
                     // Live-feed health (SP5): mirror the active-socket count into
                     // the Dhan connected slot so `/api/feeds/health` reports Dhan
@@ -3686,7 +4052,16 @@ fn spawn_pool_watchdog_task(
                                         .as_ref()
                                         .is_some_and(|s| s.is_valid())
                                 });
-                                let questdb_reachable = health.questdb_reachable();
+                                // DAMPED signal (2026-07-01 audit fix): the
+                                // ride-out classifiers require QuestDB "reachable",
+                                // but reading the RAW single-probe signal here let
+                                // a single blip force process::exit → 775-SID cold
+                                // re-subscribe → next 429 → restart/429 loop. The
+                                // damped signal is false only after N consecutive
+                                // failed probes, so a blip rides out but a genuine
+                                // SUSTAINED outage still exits (never worse than
+                                // today). `/health` still reads the raw signal.
+                                let questdb_reachable = health.questdb_reachable_for_exit_decision();
                                 // In-window 429 ride-out (2026-06-30): the
                                 // ride-out decision now covers BOTH the streak==0
                                 // bare-RST storm AND the in-market-hours Dhan 429
@@ -4611,6 +4986,16 @@ enum StartLaneError {
     /// Instrument load failed at boot — the inline spine `return Err(err)`d
     /// (process exits with the error chain).
     BootAbortErr(anyhow::Error),
+    /// FTC-14 (audit 2026-07-01): the WebSocket main-feed pool build/spawn
+    /// FAILED on a day we intended to connect (`should_connect_ws == true`,
+    /// so the plan was present) — `create_websocket_pool` returned `None`
+    /// despite a valid plan. Previously this silently proceeded with no pool
+    /// (offline-blind); it now fails the cold-start so `classify_start_lane_
+    /// error` can emit `DHAN-LANE-02` with `stage='ws_pool'`, pointing the
+    /// operator at the correct (pool-spawn) runbook instead of the wrong
+    /// (`universe_build_failed`) one. The lane FSM returns to `Off` + the
+    /// bounded retry re-attempts.
+    WsPoolSpawn,
 }
 
 /// Cold-start the full Dhan lane (slow boot arm). See the module-level doc
@@ -4652,9 +5037,42 @@ async fn start_dhan_lane(
         info!("verifying public IP against SSM static IP");
         match ip_verifier::verify_public_ip().await {
             Ok(result) => {
+                let verified_ip = result.verified_ip.clone();
                 notifier.notify(NotificationEvent::IpVerificationSuccess {
                     verified_ip: result.verified_ip,
                 });
+
+                // AUTH-P12 / GAP-NET-01: wire the RUNTIME IP monitor. The
+                // boot-time verify above is one-shot; a mid-session public-IP
+                // / Elastic-IP change (EIP disassociation, NAT failover) must
+                // be re-detected. The monitor polls the verified IP every
+                // IP_MONITOR_CHECK_INTERVAL_SECS and, on a CONFIRMED sustained
+                // mismatch (confirm-twice debounce), emits a CRITICAL
+                // GAP-NET-01 alert. It HALTS the process only when
+                // dry_run == false (real orders would be rejected by Dhan's
+                // static-IP mandate); under dry_run it alerts but keeps the
+                // live feed streaming (killing it for a no-orders IP change
+                // would drop ticks for zero benefit).
+                let ip_monitor_config =
+                    tickvault_core::network::ip_monitor::IpMonitorConfig::for_runtime(
+                        verified_ip,
+                        config.strategy.dry_run,
+                    );
+                // Mirror the seal-writer lifetime pattern: hold the watch
+                // sender for the process lifetime so the monitor's
+                // `.changed().await` never wakes on a disconnected channel.
+                let (ip_monitor_shutdown_tx, ip_monitor_shutdown_rx) =
+                    tokio::sync::watch::channel(false);
+                std::mem::forget(ip_monitor_shutdown_tx);
+                let (_ip_mismatch_rx, _ip_monitor_handle) =
+                    tickvault_core::network::ip_monitor::spawn_ip_monitor(
+                        ip_monitor_config,
+                        ip_monitor_shutdown_rx,
+                    );
+                info!(
+                    halt_on_mismatch = !config.strategy.dry_run,
+                    "GAP-NET-01 (AUTH-P12): runtime IP monitor spawned"
+                );
             }
             Err(err) => {
                 // GAP-NET-01: static-IP verification rejected boot.
@@ -5230,21 +5648,17 @@ async fn start_dhan_lane(
         );
     }
 
-    // 2026-04-28 audit gap closure: spawn the disk-health watcher.
-    // Closes the highest-risk hole in the zero-loss chain ("disk full +
-    // QuestDB down simultaneously"). Operator now gets ~hours of warning
-    // via `tv_spill_dir_free_bytes` gauge before the spill disk fills.
-    //
-    // G3 (zero-tick-loss audit PR-5): run the watcher UNDER A SUPERVISOR
-    // (mirrors the WS-GAP-05 pool supervisor) so a panic in the watcher
-    // respawns it + logs DISK-WATCHER-01 + increments
-    // `tv_disk_watcher_respawn_total` (CloudWatch-alarmed) instead of
-    // silently vanishing — previously this handle was bound to `_` and a
-    // watcher panic killed disk-free monitoring with no signal.
-    let _disk_health_watcher_supervisor =
-        tickvault_storage::disk_health_watcher::spawn_supervised_spill_disk_health_watcher(
-            std::path::PathBuf::from("data/spill"),
-        );
+    // 2026-07-01 per-lane-leak fix: the three PROCESS-GLOBAL (host-level)
+    // supervised observability monitors — spill disk-health watcher
+    // (DISK-WATCHER-01), OOM-kill monitor (PROC-01), and the fd/RSS/spill-free
+    // resource monitor (RESOURCE-01/02/03) — used to be spawned HERE, inside the
+    // per-lane `start_dhan_lane`. Because `start_dhan_lane` re-runs on every Dhan
+    // enable / stop→restart / cold-start retry (`run_dhan_lane_cold_start`), each
+    // re-invocation leaked a fresh never-aborted monitor → duplicate pages + N×
+    // metric increments for one real event. They are host/process-global, so they
+    // are now spawned EXACTLY ONCE in `main()`'s process-global prefix (right
+    // after `build_shared_infra`, before the Dhan-lane gate) and owned at the
+    // process level — independent of any Dhan enable/disable/restart.
 
     // D2 Stage 2: `health_status` is now built ONCE in the hoisted
     // `build_shared_infra` prefix and destructured into `main()` scope above, so
@@ -5545,7 +5959,11 @@ async fn start_dhan_lane(
             Some(token_manager.clone()),
         ) {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
-            None => (None, None),
+            // FTC-14: we intended to connect (should_connect_ws == true ⇒ plan
+            // present), but the pool build/spawn failed. Fail the cold-start so
+            // it surfaces as DHAN-LANE-02 (stage=ws_pool), not a silent
+            // offline-blind proceed. The lane returns to Off + bounded retry.
+            None => return Err(StartLaneError::WsPoolSpawn),
         }
     } else if !is_trading && !is_mock_trading {
         info!("WebSocket pool skipped — non-trading day (no live market data to capture)");
@@ -5559,6 +5977,11 @@ async fn start_dhan_lane(
     // Re-inject replayed LiveFeed frames into the pool's mpsc BEFORE the
     // tick processor spawns, so recovered frames land ahead of any live
     // frames and are persisted idempotently via QuestDB dedup keys.
+    //
+    // CRASH-SAFETY (zero-loss MEDIUM fix 2026-06-30): same staged-then-confirm
+    // contract as the fast-boot path — see its comment. Confirm only if BOTH
+    // the LiveFeed re-injection and the OrderUpdate drain below are clean.
+    let mut ws_wal_replay_reinjection_clean = true;
     if !ws_wal_replay_live_feed.is_empty() {
         if let Some(ref pool) = ws_pool_ready {
             let sender = pool.frame_sender_clone();
@@ -5585,11 +6008,12 @@ async fn start_dhan_lane(
             )
             .increment(injected);
             if dropped > 0 {
+                ws_wal_replay_reinjection_clean = false;
                 error!(
                     dropped,
                     injected,
                     "STAGE-C.2b: LiveFeed re-injection dropped frames (slow boot) — \
-                     channel full/closed, frames remain in WAL archive"
+                     channel full/closed, frames stay staged in WAL replaying/ and re-replay next boot"
                 );
                 metrics::counter!(
                     "tv_ws_frame_wal_reinjected_dropped_total",
@@ -5603,10 +6027,11 @@ async fn start_dhan_lane(
                 );
             }
         } else {
+            ws_wal_replay_reinjection_clean = false;
             warn!(
                 frames = ws_wal_replay_live_feed.len(),
                 "STAGE-C.2b: LiveFeed replay frames held but no pool (slow boot) — \
-                 frames remain in WAL archive, not re-injected"
+                 frames stay staged in WAL replaying/, not re-injected"
             );
         }
     }
@@ -5753,6 +6178,10 @@ async fn start_dhan_lane(
 
         // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
         let greeks_enricher = build_inline_greeks_enricher(config, &subscription_plan);
+
+        // NT-15: seed the tick-gap detector with every subscribed SID so a
+        // never-ticking instrument becomes a first-tick black-hole signal.
+        seed_tick_gap_detector_from_plan(&subscription_plan);
 
         // O(1) EXEMPT: cold path — clone registry once for tick processor enrichment.
         let slow_registry = subscription_plan
@@ -6154,40 +6583,22 @@ async fn start_dhan_lane(
         // `subscription_plan.is_some()` (above) is the correct gate.
         {
             // -----------------------------------------------------------------
-            // DayOhlcTracker boot wiring (post 2026-05-26 simplification).
+            // DayOhlcTracker boot wiring — MOVED to process-global scope
+            // (2026-07-01 per-lane-leak fix).
             //
-            // Per operator directive 2026-05-26 the Dhan historical /
-            // pre-market buffer code was removed. `day_open` for the 4
-            // LOCKED IDX_I SIDs is now the FIRST OBSERVED LIVE TICK LTP
-            // after the IST midnight reset — no external arming required.
-            //
-            // Two tokio tasks spawned here:
-            //   1. tick consumer  — drain tick broadcast, route IDX_I ticks
-            //                       to update_tick() which auto-arms on
-            //                       first call and advances day_high/low/
-            //                       close on subsequent calls.
-            //   2. midnight reset — IST 00:00:00 clears prev-day state so
-            //                       the next live tick re-arms.
-            // -----------------------------------------------------------------
-            let day_ohlc_tracker =
-                std::sync::Arc::new(tickvault_trading::in_mem::DayOhlcTracker::new());
-            {
-                let consumer_tracker = std::sync::Arc::clone(&day_ohlc_tracker);
-                let consumer_rx = tick_broadcast_sender.subscribe();
-                let _consumer_handle =
-                    tickvault_app::day_ohlc_orchestrator::spawn_day_ohlc_tick_consumer(
-                        consumer_tracker,
-                        consumer_rx,
-                    );
-            }
-            {
-                let reset_tracker = std::sync::Arc::clone(&day_ohlc_tracker);
-                let _reset_handle =
-                    tickvault_app::day_ohlc_orchestrator::spawn_midnight_reset_task(reset_tracker);
-            }
-            info!(
-                "DayOhlcTracker boot wired (tick consumer + midnight reset; day_open = first live tick LTP)"
-            );
+            // The DayOhlc tracker + tick consumer + IST-midnight reset supervisor
+            // (INDEX-OHLC-02) used to be spawned HERE, inside the lane-local
+            // `should_connect_ws && subscription_plan.is_some()` block. Because
+            // `start_dhan_lane` re-runs on every Dhan enable / stop→restart /
+            // cold-start retry, each re-invocation leaked a fresh never-aborted
+            // midnight-reset supervisor → duplicate INDEX-OHLC-02 pages. The
+            // tracker reads the PROCESS-GLOBAL `tick_broadcast_sender` and the
+            // reset is a host IST-midnight observability task, so the whole
+            // wiring is now spawned EXACTLY ONCE in `main()`'s process-global
+            // prefix (after `build_shared_infra`, before the Dhan-lane gate),
+            // decoupled from the lane. Only the lane-readiness pings below
+            // (09:14 / 09:15:30) stay here — they are feed-readiness, not
+            // process-global.
 
             // Audit Finding #5 (2026-05-03): Pre-market positive readiness
             // ping at 09:14:00 IST — exactly 60s before the NSE opening bell.
@@ -7026,6 +7437,21 @@ async fn start_dhan_lane(
         }
     }
 
+    // CRASH-SAFETY confirm (slow boot): mirror of the fast-boot confirm — only
+    // archive the staged segments if both re-injection legs were clean.
+    {
+        let slow_ws_wal_path = tickvault_app::tick_conservation_boot::ws_wal_dir();
+        if ws_wal_replay_reinjection_clean {
+            tickvault_storage::ws_frame_spill::confirm_replayed(&slow_ws_wal_path);
+        } else {
+            warn!(
+                dir = %slow_ws_wal_path.display(),
+                "STAGE-C.2b: WAL replay NOT confirmed (slow boot — a re-injection dropped or pool \
+                 not ready) — staged segments remain in replaying/ for re-replay next boot"
+            );
+        }
+    }
+
     let order_update_handle = {
         let url = config.dhan.order_update_websocket_url.clone();
         let order_ws_client_id = ws_client_id.clone();
@@ -7332,7 +7758,21 @@ async fn start_dhan_lane(
     // over-budget completed-boot cases, and NEVER on a halt (a halt uses
     // `process::exit(...)` / `bail!`/`?`, none of which reach this line).
     // See `emit_boot_completed` for the alarm semantics.
-    emit_boot_completed();
+    //
+    // GATED on a live feed (audit fix, this PR): for `dhan_enabled=true` the
+    // Dhan lane already had to reach Running to get here (a start failure
+    // returns/exits earlier), but the `dhan_enabled=false` / Groww-only branch
+    // proceeds even though Groww activation is an ASYNC watcher that may never
+    // come up. `emit_boot_completed_when_feed_live` waits (bounded) for at least
+    // one enabled feed to reach Running and withholds the metric (→ boot-heartbeat
+    // alarm pages) if every enabled feed stays dark. No feed enabled → emits
+    // immediately (headless shared-infra run must not false-page).
+    emit_boot_completed_when_feed_live(
+        &feed_runtime,
+        config.feeds.dhan_enabled,
+        config.feeds.groww_enabled,
+    )
+    .await;
 
     // -----------------------------------------------------------------------
     // Step 12b: Background periodic health check (disk space + memory RSS + spill + QuestDB)
@@ -7812,11 +8252,11 @@ impl DhanLaneRuntimeContext {
 ///     the most common runtime cold-start failure class.
 ///   * `BootAbortErr` (instrument-load failed) maps to `DHAN-LANE-01`
 ///     (universe-build).
-/// `DHAN-LANE-02` (ws-pool-spawn) + `DHAN-LANE-04` (teardown-timeout) are
-/// emitted at their own dedicated sites (the pool-spawn split of
-/// `start_dhan_lane`'s return type is tracked for D2c; today pool-spawn
-/// failures surface inside `BootAbortErr` and are cross-linked from the
-/// `DHAN-LANE-01` runbook).
+///   * `WsPoolSpawn` (FTC-14) maps to `DHAN-LANE-02` (ws-pool-spawn) with
+///     `stage='ws_pool'` — a runtime WS-pool build/spawn failure on a
+///     connect-day now points the operator at the correct pool-spawn
+///     runbook instead of the wrong `universe_build_failed` one.
+/// `DHAN-LANE-04` (teardown-timeout) is emitted at its own dedicated site.
 #[must_use]
 fn classify_start_lane_error(
     err: &StartLaneError,
@@ -7836,6 +8276,12 @@ fn classify_start_lane_error(
             ErrorCode::DhanLane01UniverseBuildFailed,
             "universe_build_failed",
             "universe",
+        ),
+        // FTC-14: WS-pool build/spawn failed on a connect-day.
+        StartLaneError::WsPoolSpawn => (
+            ErrorCode::DhanLane02WsPoolSpawnFailed,
+            "ws_pool_spawn_failed",
+            "ws_pool",
         ),
     }
 }
@@ -7923,6 +8369,35 @@ fn should_abort_cold_start_on_disable(
 ) -> bool {
     use tickvault_api::feed_state::LaneState;
     !desired_on && matches!(lane_state, LaneState::Starting)
+}
+
+/// NT-15 (audit 2026-07-01): seed the global `TickGapDetector` with every
+/// subscribed instrument at boot so a SID that never ticks all session is
+/// still detectable as a per-SID cold black-hole (WS-GAP-06 /
+/// `tv_tick_gap_instruments_silent`), not silently masked by other SIDs that
+/// do tick. Insert-if-absent — never clobbers an entry a real tick already
+/// wrote. Cold path, called once per boot after the subscription plan exists.
+fn seed_tick_gap_detector_from_plan(plan: &Option<SubscriptionPlan>) {
+    let Some(plan) = plan else {
+        return;
+    };
+    let Some(detector) = tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
+    else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let mut seeded = 0u64;
+    // O(1) EXEMPT: cold-path boot seeding, one insert-if-absent per
+    // subscribed instrument (~universe size), never on the hot loop.
+    for inst in plan.registry.iter() {
+        detector.seed_subscribed(inst.security_id, inst.exchange_segment, now);
+        seeded += 1;
+    }
+    info!(
+        seeded,
+        "NT-15: seeded tick-gap detector with subscribed instruments — a \
+         never-ticking SID is now a first-tick black-hole signal"
+    );
 }
 
 /// Decide whether the runtime supervisor should SPAWN a fresh cold-start task
@@ -8800,6 +9275,68 @@ mod tests {
     // All pure helper tests moved to boot_helpers.rs in the lib target.
     // Tests below verify main.rs-specific smoke behavior.
 
+    // ── boot_completed_should_emit truth table ──
+    // The alive signal (tv_boot_completed) must be published only when at least
+    // one ENABLED feed is running — so a boot where every enabled feed died
+    // withholds it and the boot-heartbeat alarm pages. No feed enabled emits
+    // (headless run must not false-page). A running-but-disabled feed never
+    // counts.
+
+    #[test]
+    fn test_boot_completed_should_emit_both_off_emits() {
+        // No feed enabled at all → emit (deliberately feed-less run must not
+        // false-page). Feed-running values are irrelevant here.
+        assert!(boot_completed_should_emit(false, false, false, false));
+        assert!(boot_completed_should_emit(false, false, true, true));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_dhan_only_live() {
+        assert!(boot_completed_should_emit(true, false, true, false));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_dhan_only_dead() {
+        // Dhan enabled but not running, Groww disabled → withhold (page).
+        assert!(!boot_completed_should_emit(true, false, false, false));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_groww_only_live() {
+        assert!(boot_completed_should_emit(false, true, false, true));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_groww_only_dead() {
+        assert!(!boot_completed_should_emit(false, true, false, false));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_both_enabled_only_dhan_live() {
+        assert!(boot_completed_should_emit(true, true, true, false));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_both_enabled_only_groww_live() {
+        assert!(boot_completed_should_emit(true, true, false, true));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_both_enabled_none_live() {
+        // Both enabled, neither running → withhold (page). This is the core
+        // alerting-hole case: previously the metric was published unconditionally.
+        assert!(!boot_completed_should_emit(true, true, false, false));
+    }
+
+    #[test]
+    fn test_boot_completed_should_emit_running_but_disabled_feed_does_not_count() {
+        // Dhan DISABLED but its running flag is somehow true (stale) — it must NOT
+        // count; only the ENABLED Groww matters, and Groww is dead → withhold.
+        assert!(!boot_completed_should_emit(false, true, true, false));
+        // Symmetric: Groww disabled-but-running, Dhan enabled-and-dead → withhold.
+        assert!(!boot_completed_should_emit(true, false, false, true));
+    }
+
     #[test]
     fn test_main_imports_boot_helpers() {
         // Verify boot_helpers constants are accessible from main.
@@ -8917,6 +9454,82 @@ mod tests {
     fn test_is_bare_reset_class_empty_pool_false() {
         // No connections to reconnect → never ride out an absent pool.
         assert!(!is_bare_reset_class(&[], true, true));
+    }
+
+    // --- QuestDB-probe damping (2026-07-01 audit fix) ---
+
+    #[test]
+    fn test_damp_questdb_exit_signal_threshold_is_two() {
+        // Pin N=2: 10s (2 × 5s tick) of sustained unreachability before the
+        // exit gate treats QuestDB as down — smallest N that absorbs a blip.
+        assert_eq!(POOL_WATCHDOG_QDB_EXIT_DAMP_THRESHOLD, 2);
+    }
+
+    #[test]
+    fn test_damp_questdb_exit_signal_single_blip_stays_reachable() {
+        // 1 failed probe with N=2 ⇒ still "reachable" for the exit gate, so a
+        // single blip during an in-market 429 storm keeps riding out (the fix).
+        assert!(
+            damp_questdb_exit_signal(0, POOL_WATCHDOG_QDB_EXIT_DAMP_THRESHOLD),
+            "zero failures: reachable"
+        );
+        assert!(
+            damp_questdb_exit_signal(1, POOL_WATCHDOG_QDB_EXIT_DAMP_THRESHOLD),
+            "one blip (< N) must NOT flip the exit gate — ride-out continues"
+        );
+    }
+
+    #[test]
+    fn test_damp_questdb_exit_signal_n_consecutive_flips() {
+        // N (and beyond) consecutive failures ⇒ NOT reachable ⇒ the ride-out
+        // classifiers return false ⇒ genuine-fatal exit forced. A real
+        // sustained outage is never worse than today.
+        assert!(
+            !damp_questdb_exit_signal(2, POOL_WATCHDOG_QDB_EXIT_DAMP_THRESHOLD),
+            "N consecutive failures must flip the exit gate (exit forced)"
+        );
+        assert!(
+            !damp_questdb_exit_signal(3, POOL_WATCHDOG_QDB_EXIT_DAMP_THRESHOLD),
+            ">N consecutive failures stays flipped (exit forced)"
+        );
+        assert!(
+            !damp_questdb_exit_signal(100, POOL_WATCHDOG_QDB_EXIT_DAMP_THRESHOLD),
+            "a long sustained outage stays flipped (exit forced)"
+        );
+    }
+
+    #[test]
+    fn test_damp_questdb_exit_signal_success_resets() {
+        // Model the watchdog counter loop: fail, fail, SUCCESS, fail — a success
+        // between failures resets the counter, so it takes N FRESH consecutive
+        // failures to flip. Proves a mid-way success resets (a real outage must
+        // be N *consecutive*, not N cumulative).
+        let n = POOL_WATCHDOG_QDB_EXIT_DAMP_THRESHOLD;
+        let mut counter: u32 = 0;
+
+        // Two failures in a row would flip — but a success interrupts them.
+        let probes = [false, true, false]; // fail, SUCCESS (reset), fail
+        for &reachable in &probes {
+            if reachable {
+                counter = 0;
+            } else {
+                counter = counter.saturating_add(1);
+            }
+        }
+        // After fail→success(reset)→fail the counter is only 1, so the exit
+        // gate still reads "reachable" — the mid-way success reset it.
+        assert_eq!(counter, 1, "success mid-way must reset the counter");
+        assert!(
+            damp_questdb_exit_signal(counter, n),
+            "after a mid-way success it takes N FRESH consecutive failures to flip"
+        );
+
+        // Now the SECOND consecutive fresh failure flips it.
+        counter = counter.saturating_add(1);
+        assert!(
+            !damp_questdb_exit_signal(counter, n),
+            "two fresh consecutive failures after the reset flip the exit gate"
+        );
     }
 
     #[test]
@@ -9394,10 +10007,22 @@ mod tests {
         assert_eq!(code.code_str(), "DHAN-LANE-01");
         assert_eq!(reason, "universe_build_failed");
         assert_eq!(stage, "universe");
+        // FTC-14: WsPoolSpawn (WS-pool build/spawn failed on a connect-day) ->
+        // DHAN-LANE-02 with stage='ws_pool' — the CORRECT pool-spawn runbook,
+        // not the wrong universe-build one.
+        let (code, reason, stage) = classify_start_lane_error(&StartLaneError::WsPoolSpawn);
+        assert_eq!(code, ErrorCode::DhanLane02WsPoolSpawnFailed);
+        assert_eq!(code.code_str(), "DHAN-LANE-02");
+        assert_eq!(reason, "ws_pool_spawn_failed");
+        assert_eq!(stage, "ws_pool");
         // Secret discipline: the reason discriminants are FIXED strings, never
         // the raw error body (e.g. an auth response). Assert they contain no
         // dynamic content.
-        for r in ["auth_or_gate_failed", "universe_build_failed"] {
+        for r in [
+            "auth_or_gate_failed",
+            "universe_build_failed",
+            "ws_pool_spawn_failed",
+        ] {
             assert!(
                 !r.contains("synthetic"),
                 "reason must be a fixed discriminant, not the body"
@@ -10029,13 +10654,29 @@ fn redact_ip_last_octet(raw: &str) -> String {
     "[REDACTED]".to_string()
 }
 
-/// Spawn the scheduled daily tasks — end-of-day digest (15:31:30 IST), the
-/// 1-minute cross-verify (15:31:00 IST), and the REST-health canary
-/// (09:05 / 12:00 / 15:25 IST — DHAN-REST-400, 2026-06-10). Called from BOTH
-/// boot paths so a mid-session fast-boot restart runs them too
-/// (boot-symmetry, 2026-06-09). Each spawned task self-skips if past its IST
-/// trigger(s) or on a non-trading day, so calling this from a late/
-/// non-trading boot is safe (no-op).
+/// Process-global once-guard for `spawn_post_market_tasks` (2026-07-02
+/// adversarial-sweep fix). The runtime Dhan cold-start path
+/// (`run_dhan_lane_cold_start` → `start_dhan_lane`) re-invokes
+/// `spawn_post_market_tasks` on EVERY disable→enable cycle, and the spawned
+/// tasks are bare `tokio::spawn`s not owned by `DhanLaneRunHandles` — so N
+/// enable cycles before the triggers accumulated N duplicate task families
+/// (N EOD digests, N cross-verifies, N orphan watchdogs). First caller wins;
+/// later calls log INFO and return.
+static POST_MARKET_TASKS_SPAWNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Spawn the scheduled daily tasks — the 15:25 IST orphan-position watchdog,
+/// end-of-day digest (15:31:30 IST), the 1-minute cross-verify (15:31:00 IST),
+/// and the REST-health canary (09:05 / 12:00 / 15:25 IST — DHAN-REST-400,
+/// 2026-06-10). Called from BOTH boot paths so a mid-session fast-boot restart
+/// runs them too (boot-symmetry, 2026-06-09); a process-global once-guard makes
+/// repeat calls (runtime Dhan cold-start cycles) no-ops so the family is never
+/// duplicated. Each spawned task self-skips if past its IST trigger(s) or on a
+/// non-trading day, so calling this from a late/non-trading boot is safe
+/// (no-op). NOTE: these tasks are Dhan-REST-dependent (token + client-id); the
+/// feed-agnostic 15:40 tick-conservation audit was HOISTED to the
+/// process-global prefix (`spawn_daily_tick_conservation_task`) on 2026-07-02
+/// so it fires in Groww-only sessions too.
 fn spawn_post_market_tasks(
     notifier: std::sync::Arc<NotificationService>,
     health_status: SharedHealthStatus,
@@ -10044,6 +10685,13 @@ fn spawn_post_market_tasks(
     client_id: String,
     config: &ApplicationConfig,
 ) {
+    if POST_MARKET_TASKS_SPAWNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        info!(
+            "post-market tasks already spawned this process — skipping duplicate \
+             (runtime Dhan cold-start re-entry)"
+        );
+        return;
+    }
     // Phase 0 Item 20 (wired 2026-06-13): supervised 15:25 IST orphan-position
     // watchdog — the daily open-position safety gate. Alert-only in
     // sandbox/dry-run (no order/cancel call exists on any path); pages CRITICAL
@@ -10328,74 +10976,97 @@ fn spawn_post_market_tasks(
         });
         info!("rest_canary: REST-health probe task spawned (09:05 / 12:00 / 15:25 IST)");
     }
+}
 
-    // Operator directive 2026-06-10 ("Go ahead to achieve zero tick loss"):
-    // daily end-to-end tick-conservation audit at 15:40:00 IST. Reconciles
-    // the WAL disk log (every frame Dhan delivered) against the processor
-    // outcome counters (self-scraped from /metrics) and the QuestDB `ticks`
-    // row count, then writes one forensic row to `tick_conservation_audit`.
-    // Residual > 0 → error! TICK-CONSERVE-01 (Telegram). Cold path,
-    // fail-soft, market-hours-gated (audit Rule 3). Runbook:
-    // `.claude/rules/project/tick-conservation-audit-error-codes.md`.
-    {
-        let tc_qcfg = config.questdb.clone();
-        let tc_metrics_port = config.observability.metrics_port;
-        let tc_calendar = std::sync::Arc::clone(&trading_calendar);
-        // Single source of truth for the WAL dir (shared with STAGE-C).
-        let tc_wal_dir = tickvault_app::tick_conservation_boot::ws_wal_dir();
-        tokio::spawn(async move {
-            use chrono::{FixedOffset, TimeZone, Timelike, Utc};
-            use tickvault_app::tick_conservation_boot::{
-                ConservationStart, boot_covers_full_session, decide_conservation_start,
-                run_tick_conservation_audit,
-            };
-            use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
-            let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+/// Daily 15:40 IST tick-conservation audit — PROCESS-GLOBAL (2026-07-02
+/// adversarial-sweep fix). This used to live inside `spawn_post_market_tasks`,
+/// whose two call sites are BOTH Dhan-gated (fast-boot `dhan_enabled` filter +
+/// `start_dhan_lane`), so a Groww-only session (`dhan_enabled=false`) ran ZERO
+/// conservation audits all day — a silent audit-coverage hole — and every
+/// runtime Dhan enable cycle spawned a DUPLICATE conservation task. It is now
+/// spawned exactly once from `main()`'s process-global prefix, independent of
+/// which feeds are enabled; each lane's run is gated at 15:40 on the truthful
+/// runtime "is this feed on" Arc, so a disabled lane writes no misleading zero
+/// row. Honest envelope: a feed toggled OFF at 15:40 after a full ON day skips
+/// its row that day.
+///
+/// Reconciles, per feed: the durable delivered-count (Dhan WAL frames / Groww
+/// sidecar NDJSON) against the processor outcome counters (Dhan) and the
+/// feed-filtered QuestDB `ticks` row count, then writes one forensic row per
+/// feed to `tick_conservation_audit`. Dhan residual > 0 → error!
+/// TICK-CONSERVE-01 (Telegram). Cold path, fail-soft, market-hours-gated
+/// (audit Rule 3). Runbook:
+/// `.claude/rules/project/tick-conservation-audit-error-codes.md`.
+// TEST-EXEMPT: tokio::spawn wrapper over the unit-tested pure parts (decide_conservation_start / boot_covers_full_session / build_conservation_ticks_count_sql); spawn site pinned by tick_conservation_wiring_guard.rs.
+fn spawn_daily_tick_conservation_task(
+    config: &ApplicationConfig,
+    trading_calendar: &std::sync::Arc<TradingCalendar>,
+    feed_runtime: &std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
+) {
+    let tc_qcfg = config.questdb.clone();
+    let tc_metrics_port = config.observability.metrics_port;
+    let tc_calendar = std::sync::Arc::clone(trading_calendar);
+    // Single source of truth for the WAL dir (shared with STAGE-C).
+    let tc_wal_dir = tickvault_app::tick_conservation_boot::ws_wal_dir();
+    let tc_groww_ndjson =
+        std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT);
+    let tc_feed_runtime = std::sync::Arc::clone(feed_runtime);
+    tokio::spawn(async move {
+        use chrono::{FixedOffset, TimeZone, Timelike, Utc};
+        use tickvault_app::tick_conservation_boot::{
+            ConservationStart, boot_covers_full_session, decide_conservation_start,
+            run_groww_tick_conservation_audit, run_tick_conservation_audit,
+        };
+        use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+        let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+            return;
+        };
+        let boot_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+        let today_ist = boot_ist.date_naive();
+        let boot_secs_of_day = boot_ist.time().num_seconds_from_midnight();
+        let force_now = std::env::var("TICKVAULT_TICK_CONSERVE_NOW")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let is_trading_day = tc_calendar.is_trading_day(today_ist);
+        match decide_conservation_start(boot_secs_of_day, is_trading_day, force_now) {
+            ConservationStart::SkipNonTradingDay => {
+                info!("tick_conservation: skipping (non-trading day)");
                 return;
-            };
-            let boot_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
-            let today_ist = boot_ist.date_naive();
-            let boot_secs_of_day = boot_ist.time().num_seconds_from_midnight();
-            let force_now = std::env::var("TICKVAULT_TICK_CONSERVE_NOW")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            let is_trading_day = tc_calendar.is_trading_day(today_ist);
-            match decide_conservation_start(boot_secs_of_day, is_trading_day, force_now) {
-                ConservationStart::SkipNonTradingDay => {
-                    info!("tick_conservation: skipping (non-trading day)");
-                    return;
-                }
-                ConservationStart::SkipPastTrigger => {
-                    debug!(
-                        now = %boot_ist.time(),
-                        "tick_conservation: skipping (past 15:40 — mid-evening boot)"
-                    );
-                    return;
-                }
-                ConservationStart::RunNow => {
-                    info!(
-                        "tick_conservation: TICKVAULT_TICK_CONSERVE_NOW set — running \
-                         on-demand NOW (operator dry-run)"
-                    );
-                }
-                ConservationStart::SleepThenRun(secs_until) => {
-                    info!(secs_until, "tick_conservation: sleeping until 15:40:00 IST");
-                    tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
-                }
             }
+            ConservationStart::SkipPastTrigger => {
+                debug!(
+                    now = %boot_ist.time(),
+                    "tick_conservation: skipping (past 15:40 — mid-evening boot)"
+                );
+                return;
+            }
+            ConservationStart::RunNow => {
+                info!(
+                    "tick_conservation: TICKVAULT_TICK_CONSERVE_NOW set — running \
+                     on-demand NOW (operator dry-run)"
+                );
+            }
+            ConservationStart::SleepThenRun(secs_until) => {
+                info!(secs_until, "tick_conservation: sleeping until 15:40:00 IST");
+                tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+            }
+        }
 
-            // IST day number for WAL attribution + the ticks-table window
-            // (ts stores IST-epoch nanos — data-integrity.md).
-            let now_utc_secs = Utc::now().timestamp();
-            let ist_secs = now_utc_secs.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
-            // APPROVED: epoch day number fits u64 trivially.
-            let target_ist_day = ist_secs.max(0) as u64 / 86_400;
-            let trading_date_ist_nanos = i64::try_from(target_ist_day)
-                .unwrap_or(0)
-                .saturating_mul(86_400)
-                .saturating_mul(1_000_000_000);
-            let run_ts_ist_nanos = ist_secs.saturating_mul(1_000_000_000);
+        // IST day number for WAL attribution + the ticks-table window
+        // (ts stores IST-epoch nanos — data-integrity.md).
+        let now_utc_secs = Utc::now().timestamp();
+        let ist_secs = now_utc_secs.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+        // APPROVED: epoch day number fits u64 trivially.
+        let target_ist_day = ist_secs.max(0) as u64 / 86_400;
+        let trading_date_ist_nanos = i64::try_from(target_ist_day)
+            .unwrap_or(0)
+            .saturating_mul(86_400)
+            .saturating_mul(1_000_000_000);
+        let run_ts_ist_nanos = ist_secs.saturating_mul(1_000_000_000);
 
+        // Dhan lane — runtime-gated (symmetric with the Groww gate below) so a
+        // Groww-only session writes no misleading zero-balanced Dhan row.
+        if tc_feed_runtime.is_enabled(tickvault_common::feed::Feed::Dhan) {
             run_tick_conservation_audit(
                 &tc_wal_dir,
                 &tc_qcfg,
@@ -10407,7 +11078,26 @@ fn spawn_post_market_tasks(
             )
             .await;
             info!("PROOF: tick_conservation audit fired @ 15:40:00 IST");
-        });
-        info!("tick_conservation: daily WAL-vs-DB audit task spawned");
-    }
+        } else {
+            debug!("tick_conservation: Dhan run skipped (Dhan feed disabled this session)");
+        }
+
+        // Groww lane — same IST day, same window, runtime-gated so a
+        // Dhan-only session writes no misleading zero Groww row.
+        if tc_feed_runtime.is_enabled(tickvault_common::feed::Feed::Groww) {
+            run_groww_tick_conservation_audit(
+                &tc_groww_ndjson,
+                &tc_qcfg,
+                target_ist_day,
+                trading_date_ist_nanos,
+                run_ts_ist_nanos,
+                boot_covers_full_session(boot_secs_of_day),
+            )
+            .await;
+            info!("PROOF: groww tick_conservation audit fired @ 15:40:00 IST");
+        } else {
+            debug!("groww_conservation: skipped (Groww feed disabled this session)");
+        }
+    });
+    info!("tick_conservation: daily per-feed WAL/NDJSON-vs-DB audit task spawned (process-global)");
 }

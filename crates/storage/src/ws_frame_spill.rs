@@ -641,8 +641,8 @@ fn crc32_ieee_of(chunks: &[&[u8]]) -> u32 {
 // (TICK-CONSERVE-01, operator directive 2026-06-10 "Go ahead to achieve
 // zero tick loss"). Unlike `replay_all` this NEVER archives or mutates —
 // it only counts frames attributable to one IST trading day across the
-// live segments AND `<wal_dir>/archive/` (where the boot replay moves
-// processed segments).
+// live segments, `<wal_dir>/replaying/` (un-confirmed segments mid-recovery),
+// AND `<wal_dir>/archive/` (confirmed segments the boot replay moved out).
 // ---------------------------------------------------------------------------
 
 /// Per-day WAL frame counts for the daily tick-conservation audit.
@@ -739,7 +739,15 @@ pub fn count_frames_for_ist_day<P: AsRef<Path>>(
     let mut counts = WalDayFrameCounts::default();
 
     let mut segments: Vec<PathBuf> = Vec::new();
-    for dir in [wal_dir.to_path_buf(), wal_dir.join("archive")] {
+    // Scan the live dir, the IN-PROGRESS staging dir (un-confirmed segments
+    // from a crashed boot still carry real frames for the day), AND the
+    // confirmed archive — so the audit never silently under-counts a frame
+    // that is mid-recovery. READ-ONLY: never moves or mutates anything.
+    for dir in [
+        wal_dir.to_path_buf(),
+        wal_dir.join(REPLAYING_SUBDIR),
+        wal_dir.join(ARCHIVE_SUBDIR),
+    ] {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -804,23 +812,59 @@ pub fn count_frames_for_ist_day<P: AsRef<Path>>(
 
 // ---------------------------------------------------------------------------
 // Replay — walk every `.wal` file, parse records, return recovered frames.
-// Corrupted / truncated tails are logged and skipped. Processed segments are
-// moved to `<wal_dir>/archive/` so the next session starts clean.
+// Corrupted / truncated tails are logged and skipped.
+//
+// CRASH-SAFETY (zero-loss MEDIUM fix 2026-06-30): a replayed segment is moved
+// to the IN-PROGRESS staging dir `<wal_dir>/replaying/` — NOT straight to
+// `archive/`. The caller re-injects the returned frames into the live pipeline
+// (ring → spill → WAL → DB), which durably RE-captures them into a fresh
+// segment; ONLY THEN does the caller call `confirm_replayed`, which moves
+// `replaying/` → `archive/`. Until confirmed, the segment stays in `replaying/`
+// and `replay_all` re-globs it on the next boot, so a SECOND crash between
+// replay and persist no longer strands frames in `archive/` (which is never
+// re-globbed). `archive/` holds ONLY confirmed segments → it is never
+// re-replayed, so the confirmed-history never re-injects (no whole-archive
+// re-replay regression). Re-replay is idempotent via the replay-stable
+// `capture_seq` DEDUP key.
 // ---------------------------------------------------------------------------
 
-// TEST-EXEMPT: covered by test_append_spill_and_replay_roundtrip + test_replay_handles_missing_dir + test_replay_detects_crc_corruption
+/// In-progress staging directory: holds segments that have been replayed but
+/// whose re-injection into the live pipeline has not yet been confirmed. These
+/// are re-globbed (and thus re-replayed) on every boot until `confirm_replayed`
+/// moves them to `archive/`.
+const REPLAYING_SUBDIR: &str = "replaying";
+
+/// Confirmed-history directory: holds segments whose frames have been durably
+/// re-captured into the live pipeline. NEVER re-globbed by `replay_all`.
+const ARCHIVE_SUBDIR: &str = "archive";
+
+// TEST-EXEMPT: covered by test_append_spill_and_replay_roundtrip + test_replay_handles_missing_dir + test_replay_detects_crc_corruption + test_unconfirmed_segment_is_rereplayed_on_next_boot + test_confirmed_segment_is_not_rereplayed
 pub fn replay_all<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<Vec<ReplayedFrame>> {
     let wal_dir = wal_dir.as_ref();
     if !wal_dir.exists() {
         return Ok(Vec::new());
     }
 
-    let mut segments: Vec<PathBuf> = std::fs::read_dir(wal_dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("wal"))
-        .collect();
-    segments.sort();
+    // Re-glob BOTH the in-progress staging dir (un-confirmed leftovers from a
+    // PRIOR crashed boot — small + bounded: at most the segments a single
+    // crashed boot was draining) AND the live `*.wal` segments (this crash's
+    // fresh segments). NOT `archive/` — confirmed segments are never replayed.
+    let replaying_dir = wal_dir.join(REPLAYING_SUBDIR);
+    let mut segments: Vec<PathBuf> = wal_segments_in(wal_dir);
+    let leftover_count = {
+        let mut leftovers = wal_segments_in(&replaying_dir);
+        let n = leftovers.len();
+        segments.append(&mut leftovers);
+        n
+    };
+    // Lexicographic == chronological == append order: every segment is named
+    // `ws-frames-{nanos:020}.wal`, so a `replaying/` leftover (created on an
+    // EARLIER boot → smaller nanos) sorts BEFORE this boot's fresh segments.
+    // FIFO across both sources is preserved (operator invariant: tick order is
+    // never changed). Sort on the FILE NAME (the zero-padded nanos), NOT the
+    // full path — the full path would order by parent dir (`replaying/` vs the
+    // bare live dir) instead of by capture time, breaking cross-source FIFO.
+    segments.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
     let mut frames = Vec::new();
     let mut corrupted = 0usize;
@@ -838,6 +882,7 @@ pub fn replay_all<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<Vec<ReplayedFram
     info!(
         wal_dir = ?wal_dir,
         segments = segments.len(),
+        replaying_leftovers = leftover_count,
         frames_replayed = frames.len(),
         corrupted_segments = corrupted,
         "WAL replay complete"
@@ -854,17 +899,84 @@ pub fn replay_all<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<Vec<ReplayedFram
         metrics::counter!("tv_wal_replay_corrupted_segments_total").increment(corrupted as u64);
     }
 
-    // Archive processed segments so we don't replay them twice.
-    let archive_dir = wal_dir.join("archive");
-    drop(std::fs::create_dir_all(&archive_dir));
+    // Move processed segments to the IN-PROGRESS staging dir (NOT archive).
+    // They remain re-globbable next boot until `confirm_replayed` is called.
+    // Best-effort, like the prior archive move: a failed move leaves the
+    // segment as `*.wal`, which is STILL re-globbed next boot — never worse.
+    drop(std::fs::create_dir_all(&replaying_dir));
     for seg in &segments {
         if let Some(name) = seg.file_name() {
-            let dst = archive_dir.join(name);
-            drop(std::fs::rename(seg, dst));
+            let dst = replaying_dir.join(name);
+            // A leftover that was re-read from `replaying/` renames onto
+            // itself / is overwritten by identical bytes — safe.
+            if seg != &dst {
+                drop(std::fs::rename(seg, dst));
+            }
         }
     }
 
     Ok(frames)
+}
+
+/// Lists the `*.wal` segment files directly under `dir` (NOT recursive).
+/// Returns an empty Vec for a missing/unreadable dir.
+fn wal_segments_in(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("wal"))
+        .collect()
+}
+
+/// CRASH-SAFETY confirm step: move every segment in `<wal_dir>/replaying/` to
+/// `<wal_dir>/archive/`. Call this ONLY after the frames returned by
+/// `replay_all` have been durably re-captured into the live pipeline (i.e. the
+/// boot re-injection succeeded). Until this runs, the staged segments are
+/// re-replayed on the next boot — so a crash between `replay_all` and this call
+/// can never strand frames. Idempotent and best-effort: a missing `replaying/`
+/// is a no-op; a rename failure leaves the segment in `replaying/` for a
+/// harmless (DEDUP-idempotent) re-replay next boot. NEVER panics, NEVER blocks.
+// TEST-EXEMPT: covered by test_confirmed_segment_is_not_rereplayed + test_confirm_replayed_missing_dir_is_noop + test_crash_between_move_and_confirm_still_rereplays
+pub fn confirm_replayed<P: AsRef<Path>>(wal_dir: P) {
+    let wal_dir = wal_dir.as_ref();
+    let replaying_dir = wal_dir.join(REPLAYING_SUBDIR);
+    let staged = wal_segments_in(&replaying_dir);
+    if staged.is_empty() {
+        return;
+    }
+    let archive_dir = wal_dir.join(ARCHIVE_SUBDIR);
+    drop(std::fs::create_dir_all(&archive_dir));
+    let mut confirmed = 0u64;
+    for seg in &staged {
+        if let Some(name) = seg.file_name() {
+            let dst = archive_dir.join(name);
+            match std::fs::rename(seg, &dst) {
+                Ok(()) => confirmed += 1,
+                Err(err) => {
+                    // Stays in `replaying/` → re-replayed next boot (DEDUP-safe).
+                    error!(
+                        segment = ?seg,
+                        error = %err,
+                        "WAL replay confirm: could not archive staged segment — \
+                         it stays in replaying/ and will be re-replayed next boot \
+                         (idempotent via capture_seq DEDUP)"
+                    );
+                }
+            }
+        }
+    }
+    if confirmed > 0 {
+        metrics::counter!("tv_wal_replay_confirmed_segments_total").increment(confirmed);
+    }
+    info!(
+        wal_dir = ?wal_dir,
+        confirmed_segments = confirmed,
+        staged = staged.len(),
+        "WAL replay confirmed — staged segments archived"
+    );
 }
 
 fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
@@ -1149,9 +1261,225 @@ mod tests {
         assert_eq!(frames[0].frame, vec![1, 2, 3, 4]);
         assert_eq!(frames[1].ws_type, WsType::OrderUpdate);
 
-        // Second replay must be empty (segments archived).
+        // Crash-safety contract: the segment is now STAGED in `replaying/`,
+        // NOT archived — so it is re-globbed (re-replayed) until confirmed.
+        // ONLY after `confirm_replayed` (the caller proves durable re-capture)
+        // is the second replay empty.
+        confirm_replayed(&dir);
         let frames2 = replay_all(&dir).unwrap();
-        assert!(frames2.is_empty());
+        assert!(
+            frames2.is_empty(),
+            "after confirm_replayed, segments are archived and must NOT re-replay"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Crash-safety: un-confirmed segments re-replay, confirmed do not -----
+
+    #[test]
+    fn test_replay_moves_to_replaying_not_archive_until_confirmed() {
+        let dir = tmp_dir("staging-not-archive");
+        {
+            let spill = WsFrameSpill::new(&dir).unwrap();
+            spill.append(WsType::LiveFeed, vec![1, 2, 3, 4]);
+            wait_until_persisted(&spill, 1);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        let frames = replay_all(&dir).unwrap();
+        assert_eq!(frames.len(), 1);
+
+        // The replayed segment is in `replaying/`, NOT `archive/`.
+        let replaying = dir.join("replaying");
+        let archive = dir.join("archive");
+        assert_eq!(
+            wal_segments_in(&replaying).len(),
+            1,
+            "segment must be staged in replaying/"
+        );
+        assert_eq!(
+            wal_segments_in(&archive).len(),
+            0,
+            "segment must NOT be archived before confirm"
+        );
+
+        confirm_replayed(&dir);
+        assert_eq!(
+            wal_segments_in(&replaying).len(),
+            0,
+            "confirm must empty replaying/"
+        );
+        assert_eq!(
+            wal_segments_in(&archive).len(),
+            1,
+            "confirm must move the segment to archive/"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_unconfirmed_segment_is_rereplayed_on_next_boot() {
+        // TEST CASE 1: the exact bug. A segment whose persist is NOT confirmed
+        // MUST be re-replayed on the next boot (no `confirm_replayed` between).
+        let dir = tmp_dir("unconfirmed-rereplay");
+        {
+            let spill = WsFrameSpill::new(&dir).unwrap();
+            spill.append(WsType::LiveFeed, vec![7, 7, 7, 7]);
+            spill.append(WsType::OrderUpdate, b"{\"x\":1}".to_vec());
+            wait_until_persisted(&spill, 2);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        // First boot: replay returns the frames, stages them in `replaying/`.
+        let first = replay_all(&dir).unwrap();
+        assert_eq!(first.len(), 2, "first boot recovers all frames");
+
+        // CRASH before confirm — no `confirm_replayed` call. Next boot MUST
+        // re-replay the staged segment (the pre-fix bug stranded it in
+        // `archive/` and returned 0 here, silently losing auto-recovery).
+        let second = replay_all(&dir).unwrap();
+        assert_eq!(
+            second.len(),
+            2,
+            "un-confirmed segment MUST be re-replayed on the next boot"
+        );
+        assert_eq!(second[0].frame, vec![7, 7, 7, 7]);
+        assert_eq!(second[0].ws_type, WsType::LiveFeed);
+        assert_eq!(second[1].ws_type, WsType::OrderUpdate);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_confirmed_segment_is_not_rereplayed() {
+        // TEST CASE 2: a confirmed/archived segment must NOT be re-replayed,
+        // and the confirmed archive must NEVER be re-globbed (no whole-archive
+        // re-replay regression).
+        let dir = tmp_dir("confirmed-no-rereplay");
+        {
+            let spill = WsFrameSpill::new(&dir).unwrap();
+            spill.append(WsType::LiveFeed, vec![5, 5, 5, 5]);
+            wait_until_persisted(&spill, 1);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        let first = replay_all(&dir).unwrap();
+        assert_eq!(first.len(), 1);
+        confirm_replayed(&dir); // durable re-capture confirmed
+
+        // Boot again: the confirmed segment lives only in `archive/`, which is
+        // never re-globbed → zero re-replay.
+        let second = replay_all(&dir).unwrap();
+        assert!(
+            second.is_empty(),
+            "confirmed (archived) segment must NOT re-replay"
+        );
+
+        // A THIRD boot also returns 0 — the archive accumulates confirmed
+        // history but is never re-injected (regression guard against
+        // re-globbing the whole archive every boot).
+        let third = replay_all(&dir).unwrap();
+        assert!(third.is_empty(), "archive must never be re-replayed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_replaying_leftover_and_fresh_replay_in_order() {
+        // TEST CASE 3: a `replaying/` leftover (older nanos) + a fresh `*.wal`
+        // (newer nanos) must BOTH replay, in strict append order (leftover
+        // first). Proves FIFO across the two glob sources.
+        let dir = tmp_dir("leftover-plus-fresh");
+        let replaying = dir.join("replaying");
+        std::fs::create_dir_all(&replaying).unwrap();
+
+        // Older leftover segment (small nanos) staged in replaying/, marker AA.
+        let leftover = replaying.join("ws-frames-00000000000000000001.wal");
+        std::fs::write(&leftover, encode_v1_record(WsType::LiveFeed, &[0xAA])).unwrap();
+        // Newer fresh segment (large nanos) in the live dir, marker BB.
+        let fresh = dir.join("ws-frames-00000000000000009999.wal");
+        std::fs::write(&fresh, encode_v1_record(WsType::LiveFeed, &[0xBB])).unwrap();
+
+        let frames = replay_all(&dir).unwrap();
+        assert_eq!(frames.len(), 2, "both leftover and fresh must replay");
+        assert_eq!(
+            frames[0].frame,
+            vec![0xAA],
+            "older leftover (smaller nanos) must replay FIRST — FIFO preserved"
+        );
+        assert_eq!(frames[1].frame, vec![0xBB], "fresh segment replays second");
+
+        // Both are now staged together in replaying/ (un-confirmed).
+        assert_eq!(wal_segments_in(&replaying).len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_crash_between_move_and_confirm_still_rereplays() {
+        // TEST CASE 4: the staging transition is crash-safe. After `replay_all`
+        // moves the segment to `replaying/`, a crash BEFORE `confirm_replayed`
+        // (simulated by simply not calling it) leaves the segment recoverable:
+        // a fresh `replay_all` re-returns it.
+        let dir = tmp_dir("crash-mid-transition");
+        {
+            let spill = WsFrameSpill::new(&dir).unwrap();
+            spill.append(WsType::LiveFeed, vec![3, 1, 4, 1]);
+            wait_until_persisted(&spill, 1);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        let _first = replay_all(&dir).unwrap();
+        // Segment is now in replaying/. Simulate crash: no confirm.
+        assert_eq!(wal_segments_in(&dir.join("replaying")).len(), 1);
+
+        // Fresh process boots → re-replays the staged segment.
+        let recovered = replay_all(&dir).unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "a crash between move and confirm must still re-replay the segment"
+        );
+        assert_eq!(recovered[0].frame, vec![3, 1, 4, 1]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_confirm_replayed_missing_dir_is_noop() {
+        // confirm on a dir with no `replaying/` must not error or panic.
+        let dir = tmp_dir("confirm-noop");
+        confirm_replayed(&dir); // no replaying/ exists yet
+        // Also a no-op on a completely missing dir.
+        let missing = dir.join("does-not-exist");
+        confirm_replayed(&missing);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_count_frames_scans_replaying_dir() {
+        // The daily conservation audit must count a frame staged in
+        // `replaying/` (un-confirmed, mid-recovery) so it never under-counts.
+        let dir = tmp_dir("conserve-replaying");
+        let today = ist_day_of_wall_nanos(now_wall_nanos());
+        {
+            let spill = WsFrameSpill::new(&dir).unwrap();
+            spill.append(WsType::LiveFeed, vec![4, 1, 2, 3]);
+            wait_until_persisted(&spill, 1);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Replay stages the segment in replaying/ (no confirm).
+        let _ = replay_all(&dir).unwrap();
+        assert_eq!(wal_segments_in(&dir.join("replaying")).len(), 1);
+
+        let counts = count_frames_for_ist_day(&dir, today);
+        assert_eq!(
+            counts.tick_frames, 1,
+            "conservation count must include frames staged in replaying/: {counts:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

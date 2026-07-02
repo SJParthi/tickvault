@@ -10,15 +10,14 @@ This script subscribes one instrument's LTP and PRINTS the parsed tick dict +
 its meta so we can eyeball the real field names (expected: ltp, tsInMillis,
 volume, open, high, low, close, ...).
 
-Usage:
-    export GROWW_API_KEY=...   GROWW_TOTP_SECRET=...
+Usage (shared token-minter lock 2026-07-02 — this script NEVER mints):
+    export GROWW_ACCESS_TOKEN=<token>                 # direct token, or:
+    export GROWW_SSM_TOKEN_PARAM=/tickvault/prod/groww/access-token
     python3 groww_smoke.py
 """
 import json
 import os
 import sys
-
-import pyotp
 
 try:
     from growwapi import GrowwAPI, GrowwFeed
@@ -32,14 +31,24 @@ WATCH = [{"exchange": "NSE", "segment": "CASH", "exchange_token": "2885"}]
 
 
 def main() -> None:
-    api_key = os.environ.get("GROWW_API_KEY")
-    totp_secret = os.environ.get("GROWW_TOTP_SECRET")
-    if not api_key or not totp_secret:
-        sys.exit("Set GROWW_API_KEY and GROWW_TOTP_SECRET in the environment.")
+    # Shared token-minter lock 2026-07-02: read the bruteX-Lambda-minted token
+    # (env override for local dev, else read-only SSM GetParameter). NEVER mint.
+    access_token = os.environ.get("GROWW_ACCESS_TOKEN", "").strip()
+    if not access_token:
+        param = os.environ.get("GROWW_SSM_TOKEN_PARAM")
+        if not param:
+            sys.exit(
+                "Set GROWW_ACCESS_TOKEN (direct token) or GROWW_SSM_TOKEN_PARAM "
+                "(SSM path of the minter-written token). This script never mints."
+            )
+        import boto3
 
-    # 1a. REST access token (verified: POST /v1/token/api/access, key_type=totp).
-    totp = pyotp.TOTP(totp_secret).now()
-    access_token = GrowwAPI.get_access_token(api_key=api_key, totp=totp)
+        region = os.environ.get("AWS_REGION") or "ap-south-1"
+        access_token = (
+            boto3.client("ssm", region_name=region)
+            .get_parameter(Name=param, WithDecryption=True)["Parameter"]["Value"]
+            .strip()
+        )
     groww = GrowwAPI(access_token)
 
     # Live feed: NATS-over-WS + protobuf, all handled by GrowwFeed (1b socket token).
