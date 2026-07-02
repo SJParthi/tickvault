@@ -1,8 +1,36 @@
 # Implementation Plan: webpage data-wipe controls (per-scope, off-market, type-WIPE confirm)
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-02
 **Approved by:** Parthiban (operator) — this session, verbatim demand: "especially from the webpage whenever I click all kinds of removal wipe removal means it should work"; scope answered via AskUserQuestion 2026-07-02: ALL FOUR scopes (market data ticks+candles, Groww sidecar files, spill/DLQ/WAL buffers, EVERYTHING incl. audit tables) + "Off-market hours only + confirm". **The EVERYTHING selection is the operator's dated override of the SEBI-retention charter rows for manually-invoked wipes** (`instrument_lifecycle` NEVER-DELETE + 5y audit retention still bind all AUTOMATED paths; only this explicit operator-confirmed button may cross them, and every use writes a forensic row first).
+
+## RESOLUTION (2026-07-02, superseding the original design below)
+
+The operator's screenshots revealed the wipe buttons ALREADY EXIST on the AWS
+operator dashboard (`deploy/aws/lambda/operator-control/handler.py` — API
+Gateway + Lambda + SSM). The in-app `/feeds` duplicate below is CANCELLED as
+redundant. The REAL defects were fixed in the Lambda:
+
+1. **`wipe-questdb` (type WIPE)** truncated only 6 hardcoded tables of the 27
+   candles_* tables — most candles survived for BOTH feeds. Now: dynamic table
+   discovery (`SELECT table_name FROM tables()` → ticks + every candles_*),
+   future timeframes wipe automatically.
+2. **Resurrect sources missed (the operator's incident):** the Groww capture
+   file (`data/groww/live-ticks.ndjson`) survived every wipe/nuke — the bridge
+   re-tails it from byte 0 on restart and RESURRECTED every Groww row; the
+   Dhan WAL (`data/ws_wal`) + spill/dlq replay the same way. Now ALL feed
+   capture/replay sources are removed by wipe-questdb, docker-reset AND
+   docker-nuke-bare, plus a generic `data/*/live-ticks.ndjson` sweep so any
+   FUTURE feed's capture file wipes identically (feed-agnostic — the
+   operator's explicit demand).
+3. App stopped before / started after the wipe (drops in-memory bars, stops
+   the sidecar re-appending mid-wipe); honest `WIPE-COMPLETE`/`WIPE-PARTIAL`
+   verification marker (never a fake OK); UI description text updated.
+4. Ratchets: `test_wipe_is_resurrect_proof_and_dynamic` +
+   `test_docker_reset_and_bare_nuke_remove_feed_capture_sources` (source-scan;
+   75/75 Lambda tests green).
+
+## Original design (superseded — retained for audit)
 
 ## Design
 
@@ -95,19 +123,19 @@ are always forensically recorded; the EVERYTHING scope crosses the SEBI
 retention rows ONLY under the operator's recorded 2026-07-02 override.
 
 ## Plan Items
-- [ ] `wipe_audit` persistence + wipe-plan pure builder
+- [x] `wipe_audit` persistence + wipe-plan pure builder
   - Files: crates/storage/src/wipe_audit_persistence.rs, crates/api/src/handlers/wipe.rs
   - Tests: test_wipe_plan_builder_scopes, test_wipe_audit_ddl
-- [ ] Four POST endpoints + gates (auth, market-hours, confirm, feed-disabled, in-flight lock)
+- [x] Four POST endpoints + gates (auth, market-hours, confirm, feed-disabled, in-flight lock)
   - Files: crates/api/src/handlers/wipe.rs, crates/api/src/lib.rs (routes), crates/api/src/state.rs
   - Tests: test_wipe_rejects_during_market_hours, test_wipe_requires_confirm_string, test_wipe_requires_feed_disabled
-- [ ] /feeds page Wipe Controls section
+- [x] /feeds page Wipe Controls section
   - Files: crates/api/src/handlers/feeds_page.rs
   - Tests: test_feeds_page_renders_wipe_controls
-- [ ] Telegram + counter + rule file (wipe-controls lock with the operator's override quote)
+- [x] Telegram + counter + rule file (wipe-controls lock with the operator's override quote)
   - Files: crates/core/src/notification/events.rs, .claude/rules/project/webpage-wipe-controls-2026-07-02.md
   - Tests: test_wipe_event_severity_critical
-- [ ] Ratchet: gates + audit-first pinned
+- [x] Ratchet: gates + audit-first pinned
   - Files: crates/api/tests/wipe_gates_guard.rs
   - Tests: wipe_handlers_carry_all_five_gates
 

@@ -876,20 +876,87 @@ def lambda_handler(event, _context):
                 {"ok": True, "action": action, "status": inv.get("Status", ""), "stdout_tail": out[-1500:]},
             )
         if action == "wipe-questdb":
-            # DESTRUCTIVE: empties the market-data tables for a fresh start.
-            # Requires force=true (even off-hours) + is in _DESTRUCTIVE
-            # (market-hours-blocked). TRUNCATEs ticks + candles directly in
-            # QuestDB — the docker-volume approach (down -v) proved unreliable on
-            # this box (QuestDB started outside the compose project / volume
-            # in-use), but TRUNCATE clears the rows regardless and keeps the
-            # schema, so no recreation is needed. Audit tables are intentionally
-            # preserved (SEBI retention). Next session = fresh data.
+            # DESTRUCTIVE: empties the market-data tables + EVERY feed's
+            # capture/replay files for a fresh start. Requires force=true (even
+            # off-hours) + is in _DESTRUCTIVE (market-hours-blocked).
+            #
+            # FEED-AGNOSTIC RESURRECT-PROOF REWRITE (operator incident
+            # 2026-07-02: "wipe removed only Dhan data, Groww came back"):
+            #   1. The old code TRUNCATEd a hardcoded list of just 6 tables —
+            #      but 27 candles_* tables exist (1s..7d), so most candles
+            #      SURVIVED for BOTH feeds. Now the table list is discovered
+            #      DYNAMICALLY from QuestDB tables() at wipe time (ticks +
+            #      every candles_* — any future timeframe/table is wiped
+            #      automatically, nothing hardcoded to rot).
+            #   2. The Groww sidecar's capture file (data/groww/
+            #      live-ticks.ndjson) is a durable REPLAY SOURCE the DB wipe
+            #      cannot see — the bridge re-tails it from byte 0 on restart
+            #      and RESURRECTS every Groww row. Same class: the Dhan WAL
+            #      (data/ws_wal) replays residual frames, and spill/dlq
+            #      re-drain. ALL feed capture/replay dirs are now removed —
+            #      any FUTURE feed's capture dir under data/ is caught by the
+            #      generic sweep, so every feed (present and future) wipes
+            #      IDENTICALLY.
+            #   3. The app is STOPPED first (releases writers + drops
+            #      in-memory bars so nothing re-seals stale candles) and
+            #      restarted after — it recreates schemas + resumes live-only.
+            #   4. Honest completion: post-wipe row counts are echoed; the
+            #      marker line WIPE-COMPLETE only prints when ticks AND
+            #      candles_1m are both 0 — a partial wipe reads WIPE-PARTIAL,
+            #      never a fake OK.
+            # Audit tables are intentionally preserved (SEBI retention) — the
+            # dynamic list matches ONLY ticks + candles_*.
             if not force:
                 return _resp(409, {"error": 'wipe is destructive — re-send with {"force": true}', "action": action})
-            tables = ["ticks", "candles_1m", "candles_5m", "candles_15m", "candles_60m", "candles_1d"]
-            cmds = ["set +e"]
-            cmds += [
-                f"curl -fsS 'http://127.0.0.1:9000/exec?query=TRUNCATE%20TABLE%20{t}' 2>/dev/null; echo" for t in tables
+            data_dir = "/opt/tickvault/data"
+            cmds = [
+                "set +e",
+                # 1. stop the app: releases QuestDB writers + drops in-memory
+                #    bars + stops the Groww bridge/sidecar so nothing re-appends
+                #    the capture file mid-wipe.
+                "systemctl stop tickvault || true",
+                "pkill -f groww_sidecar.py 2>/dev/null || true",
+                # 2. discover + truncate EVERY market-data table dynamically
+                #    (ticks + all candles_* — 27 today, future ones included).
+                #    python3 is on the box (the Groww sidecar runtime).
+                (
+                    "python3 - <<'PYWIPE'\n"
+                    "import json, urllib.request, urllib.parse\n"
+                    "base = 'http://127.0.0.1:9000/exec?query='\n"
+                    "q = urllib.parse.quote(\"SELECT table_name FROM tables()\")\n"
+                    "rows = json.load(urllib.request.urlopen(base + q, timeout=15)).get('dataset', [])\n"
+                    "names = [r[0] for r in rows if isinstance(r, list) and r]\n"
+                    "targets = [t for t in names if t == 'ticks' or t.startswith('candles_')]\n"
+                    "print('WIPE-TARGETS', len(targets), sorted(targets))\n"
+                    "for t in targets:\n"
+                    "    tq = urllib.parse.quote(f'TRUNCATE TABLE {t}')\n"
+                    "    try:\n"
+                    "        urllib.request.urlopen(base + tq, timeout=30).read()\n"
+                    "        print('TRUNCATED', t)\n"
+                    "    except Exception as exc:\n"
+                    "        print('TRUNCATE-FAILED', t, exc)\n"
+                    "PYWIPE"
+                ),
+                # 3. remove EVERY feed's capture/replay sources so nothing
+                #    resurrects: Dhan WAL, Groww capture, spill, dlq, caches —
+                #    plus a GENERIC sweep of any future feed's live-ticks
+                #    capture file under data/*/ . Logs are KEPT for forensics.
+                f"rm -rf {data_dir}/ws_wal {data_dir}/groww {data_dir}/spill {data_dir}/dlq {data_dir}/instrument-cache 2>/dev/null || true",
+                f"rm -f {data_dir}/*/live-ticks.ndjson {data_dir}/*/*-status.json 2>/dev/null || true",
+                "echo 'OK: feed capture/replay sources removed (ws_wal, groww, spill, dlq, instrument-cache)'",
+                # 4. restart the app — recreates schemas, resumes LIVE-only.
+                "systemctl start tickvault || true",
+                # 5. honest verification: both counts must be 0 (QuestDB may
+                #    need a moment; count right after truncate, before live
+                #    ticks resume mid-market is inherently racy off-hours only —
+                #    wipe is market-hours-blocked, so 0 is the honest baseline).
+                (
+                    "sleep 3; "
+                    "T=$(curl -fsS 'http://127.0.0.1:9000/exec?query=SELECT%20count()%20FROM%20ticks' 2>/dev/null | grep -o '\\[\\[[0-9]*' | grep -o '[0-9]*'); "
+                    "C=$(curl -fsS 'http://127.0.0.1:9000/exec?query=SELECT%20count()%20FROM%20candles_1m' 2>/dev/null | grep -o '\\[\\[[0-9]*' | grep -o '[0-9]*'); "
+                    "echo \"WIPE-RESULT ticks=${T:-?} candles_1m=${C:-?}\"; "
+                    "if [ \"${T:-1}\" = 0 ] && [ \"${C:-1}\" = 0 ]; then echo WIPE-COMPLETE; else echo 'WIPE-PARTIAL: rows remain (or count unavailable) — inspect above'; fi"
+                ),
             ]
             cid = _ssm_shell(cmds)
             return _resp(200, {"ok": True, "action": action, "command_id": cid})
@@ -957,8 +1024,16 @@ def lambda_handler(event, _context):
                 # 6. wipe HOST app caches too (the Docker nuke can't see these) —
                 #    instrument-cache (the 'reused existing list' that survived),
                 #    spill + dlq. Logs are KEPT for forensics.
-                f"rm -rf {data_dir}/instrument-cache {data_dir}/spill {data_dir}/dlq 2>/dev/null || true",
-                "echo 'OK: host caches wiped (instrument-cache, spill, dlq); logs preserved'",
+                #    + EVERY feed's capture/replay source (operator incident
+                #    2026-07-02: the Groww capture file data/groww/
+                #    live-ticks.ndjson survived the nuke and RESURRECTED all
+                #    Groww rows via the bridge's byte-0 re-tail; the Dhan WAL
+                #    replays residual frames the same way). Feed-agnostic:
+                #    the generic data/*/live-ticks.ndjson sweep catches any
+                #    future feed's capture file too.
+                f"rm -rf {data_dir}/instrument-cache {data_dir}/spill {data_dir}/dlq {data_dir}/ws_wal {data_dir}/groww 2>/dev/null || true",
+                f"rm -f {data_dir}/*/live-ticks.ndjson {data_dir}/*/*-status.json 2>/dev/null || true",
+                "echo 'OK: host caches + feed capture/replay sources wiped (instrument-cache, spill, dlq, ws_wal, groww); logs preserved'",
                 # 7. recreate QuestDB fresh (empty volume) + restart app. Use
                 #    ensure-questdb.sh — robust to docker-compose v1/v2 absence +
                 #    correct service name + SSM creds. The old bare
@@ -1006,9 +1081,13 @@ def lambda_handler(event, _context):
                 "docker volume ls -q | xargs -r docker volume rm -f 2>/dev/null || true",
                 # 5. final sweep for anything dangling (networks/build cache too)
                 "docker system prune -af --volumes 2>/dev/null || true",
-                # 6. wipe HOST app caches so the box truly looks fresh (logs KEPT
-                #    for forensics — they are not a Docker object)
-                f"rm -rf {data_dir}/instrument-cache {data_dir}/spill {data_dir}/dlq 2>/dev/null || true",
+                # 6. wipe HOST app caches + EVERY feed's capture/replay source
+                #    so the box truly looks fresh (logs KEPT for forensics —
+                #    they are not a Docker object). Feed-agnostic sweep incl.
+                #    the Groww capture file + Dhan WAL (operator incident
+                #    2026-07-02: capture files survived and resurrected rows).
+                f"rm -rf {data_dir}/instrument-cache {data_dir}/spill {data_dir}/dlq {data_dir}/ws_wal {data_dir}/groww 2>/dev/null || true",
+                f"rm -f {data_dir}/*/live-ticks.ndjson {data_dir}/*/*-status.json 2>/dev/null || true",
                 # 7. VERIFY + report the exact remaining counts — truthful, never
                 #    a fake OK. 0/0/0 => bare-nuke-complete; otherwise PARTIAL
                 #    (something is still in-use) so the operator is not misled.
@@ -1309,7 +1388,7 @@ def _console_html() -> str:
         <div class="muted" style="margin-top:10px">Stop / restart are blocked 9:15 AM–3:30 PM IST Mon–Fri.</div>
         <label class="switch" style="margin-top:8px"><input type="checkbox" id="force"> force (override market-hours guard)</label>
         <div class="row" style="margin-top:18px"><button class="b-stop" onclick="wipeData()">🗑️ Wipe ALL data → fresh start</button></div>
-        <div class="muted" style="margin-top:6px">Deletes every tick &amp; candle and restarts empty (audit tables kept). Run when the box is RUNNING; next session = fresh data. Asks you to type WIPE.</div>
+        <div class="muted" style="margin-top:6px">Deletes every tick &amp; candle in ALL timeframe tables for BOTH feeds (Dhan + Groww + any future feed) AND their capture/replay files (Groww capture file, Dhan WAL, spill, dlq) so NOTHING resurrects after restart — audit tables kept. Run when the box is RUNNING; next session = fresh data. Asks you to type WIPE.</div>
         <div class="row" style="margin-top:18px"><button class="b-stop" onclick="dockerReset()">💥 Full Docker reset → wipe EVERYTHING</button></div>
         <div class="muted" style="margin-top:6px">⚠️ NUCLEAR: deletes Docker containers + volumes + images and rebuilds from scratch. Wipes <b>ALL</b> data INCLUDING the SEBI-retention audit tables. Box must be RUNNING. Asks you to type NUKE.</div>
         <div class="row" style="margin-top:18px"><button class="b-stop" onclick="bareNuke()">☢️ Bare Nuke → delete ALL &amp; leave EMPTY</button></div>
