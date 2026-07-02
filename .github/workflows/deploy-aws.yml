@@ -505,6 +505,7 @@ jobs:
               "command -v docker >/dev/null 2>&1 || sudo dnf install -y docker || sudo yum install -y docker",
               "sudo systemctl enable --now docker",
               "sudo usermod -aG docker ec2-user || true",
+              "docker compose version >/dev/null 2>&1 || sudo dnf install -y docker-compose-plugin || true",
               "if ! docker compose version >/dev/null 2>&1; then sudo mkdir -p /usr/local/lib/docker/cli-plugins && sudo curl -fsSL https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-$(uname -m) -o /usr/local/lib/docker/cli-plugins/docker-compose && sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose; fi",
               "docker compose version || (echo FATAL: docker compose plugin install failed; exit 1)",
               "mkdir -p /opt/tickvault/config /opt/tickvault/data/spill /opt/tickvault/logs /opt/tickvault/bin",
