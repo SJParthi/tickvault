@@ -133,10 +133,14 @@ class GetServesPublicHtml(unittest.TestCase):
         self.assertNotIn("Bearer s3cret", html)
         self.assertIn("localStorage", html)  # token kept client-side only
 
-    def test_html_has_all_tabs(self) -> None:
+    def test_html_has_exactly_three_tabs(self) -> None:
+        # 2026-07-02 redesign (operator: "webpage looks completely messy, too
+        # many buttons"): exactly Overview / Data / Admin — nothing else.
+        import re
+
         html = handler._console_html()
-        for t in ("overview", "data", "github", "logs", "aws", "latency"):
-            self.assertIn('data-t="' + t + '"', html)
+        tabs = re.findall(r'data-t="(\w+)"', html)
+        self.assertEqual(tabs, ["overview", "data", "admin"])
 
     def test_html_supports_ready_made_key_link(self) -> None:
         # A #key=... link must auto-unlock + strip the fragment from the URL.
@@ -408,12 +412,15 @@ class SqlRowCap(unittest.TestCase):
 
 
 class DbConsoleTab(unittest.TestCase):
-    def test_html_has_db_tab_between_data_and_github(self) -> None:
+    def test_db_console_folded_into_data_tab(self) -> None:
+        # 2026-07-02 redesign: the DB console (PR #1326) is no longer its own
+        # tab — it lives INSIDE the Data tab. There is no data-t="db" tab, and
+        # the console markup sits inside the data <section>.
         html = handler._console_html()
-        for t in ("overview", "data", "db", "github", "logs", "aws", "latency"):
-            self.assertIn('data-t="' + t + '"', html)
-        self.assertLess(html.index('data-t="data"'), html.index('data-t="db"'))
-        self.assertLess(html.index('data-t="db"'), html.index('data-t="github"'))
+        self.assertNotIn('data-t="db"', html)
+        data_section = html.split('<section data-tab="data"', 1)[1].split("</section>", 1)[0]
+        for needle in ('id="dbtables"', 'id="dbsql"', 'id="dbout"', 'id="dbcols"', 'id="bars"', 'id="cvshields"'):
+            self.assertIn(needle, data_section, needle)
 
     def test_db_tab_shows_read_only_badge(self) -> None:
         html = handler._console_html()
@@ -427,10 +434,10 @@ class DbConsoleTab(unittest.TestCase):
         ):
             self.assertIn(needle, html, needle)
 
-    def test_db_tab_autoloads_tables_on_open(self) -> None:
-        # tab('db') must trigger loadDbTables() without an extra click.
+    def test_data_tab_autoloads_tables_on_open(self) -> None:
+        # tab('data') must trigger loadDbTables() without an extra click.
         html = handler._console_html()
-        self.assertIn("name==='db' && !$('dbtables').dataset.loaded) loadDbTables()", html)
+        self.assertIn("name==='data' && !$('dbtables').dataset.loaded) loadDbTables()", html)
 
     def test_table_pick_is_index_based_no_injection(self) -> None:
         # The clicked table name comes from dbTables[i] — QuestDB's own
@@ -1074,6 +1081,145 @@ class HtmlWipeGrowwButton(unittest.TestCase):
         # Truthful async outcome via the shared command-status poller.
         self.assertIn("GROWW-WIPE-COMPLETE", html)
         self.assertIn("GROWW-WIPE-PARTIAL", html)
+
+
+class RedesignThreeTabs(unittest.TestCase):
+    """2026-07-02 portal redesign — Overview / Data / Admin, collapsed danger
+    zone, Logs + GitHub tabs removed. UI reorganization ONLY: every action
+    semantic, guard, and confirm token is unchanged (pinned by the classes
+    above); these tests pin the new structure."""
+
+    def test_logs_and_github_tabs_absent(self) -> None:
+        html = handler._console_html()
+        self.assertNotIn('data-t="logs"', html)
+        self.assertNotIn('data-t="github"', html)
+        # ...and their now-unused JS is gone too.
+        for dead in ("loadLogs", "loadGithub", "ghMerge", "ghDeploy", "ciBadge", "runSql"):
+            self.assertNotIn(dead, html, dead)
+
+    def test_logs_route_kept_for_mcp_server(self) -> None:
+        # The tickvault-logs MCP server POSTs {"action":"logs"} to this portal
+        # (scripts/mcp-servers/tickvault-logs/server.py) — the API route must
+        # survive the tab removal.
+        orig_secret = handler._control_secret
+        orig_sync = handler._ssm_shell_sync
+        handler._control_secret = lambda: "s3cret-token"  # type: ignore[assignment]
+        handler._ssm_shell_sync = lambda cmds, timeout=6.0: "ERR_BEGIN\nERR_END\nAPP_BEGIN\nAPP_END\n"  # type: ignore[assignment]
+        try:
+            resp = handler.lambda_handler(
+                {
+                    "requestContext": {"http": {"method": "POST"}},
+                    "headers": {"authorization": "Bearer s3cret-token"},
+                    "body": json.dumps({"action": "logs"}),
+                },
+                None,
+            )
+        finally:
+            handler._control_secret = orig_secret  # type: ignore[assignment]
+            handler._ssm_shell_sync = orig_sync  # type: ignore[assignment]
+        self.assertEqual(resp["statusCode"], 200)
+        self.assertIn("raw", json.loads(resp["body"]))
+
+    def test_gh_actions_are_removed_from_backend(self) -> None:
+        # No caller existed outside the deleted GitHub tab → the routes are
+        # fully dead and now 400 as unknown actions.
+        orig_secret = handler._control_secret
+        handler._control_secret = lambda: "s3cret-token"  # type: ignore[assignment]
+        try:
+            for action in ("gh_prs", "gh_merge", "gh_deploy"):
+                resp = handler.lambda_handler(
+                    {
+                        "requestContext": {"http": {"method": "POST"}},
+                        "headers": {"authorization": "Bearer s3cret-token"},
+                        "body": json.dumps({"action": action}),
+                    },
+                    None,
+                )
+                self.assertEqual(resp["statusCode"], 400, action)
+                self.assertIn("unknown action", json.loads(resp["body"])["error"])
+        finally:
+            handler._control_secret = orig_secret  # type: ignore[assignment]
+
+    def test_danger_zone_collapsed_by_default(self) -> None:
+        # The four destructive wipes live inside a <details> WITHOUT the open
+        # attribute — collapsed until the operator deliberately taps it.
+        html = handler._console_html()
+        self.assertIn('<details class="fold" id="danger">', html)
+        danger = html.split('<details class="fold" id="danger">', 1)[1].split("</details>", 1)[0]
+        for needle in ('value="groww"', 'value="wipe"', 'value="nuke"', 'value="erase"', "dangerExecute()"):
+            self.assertIn(needle, danger, needle)
+        # No <details ... open> anywhere (both folds start collapsed).
+        self.assertNotIn("<details open", html)
+        self.assertNotIn('id="danger" open', html)
+
+    def test_severity_picker_maps_each_choice_to_action_and_token(self) -> None:
+        html = handler._console_html()
+        # One dispatch map, radio value → the UNCHANGED per-action function.
+        self.assertIn("{groww:wipeGroww, wipe:wipeData, nuke:dockerReset, erase:bareNuke}", html)
+        # Each function still demands its OWN typed confirm token — the picker
+        # introduces no token-bypass path.
+        self.assertIn("Type GROWW to confirm:')!=='GROWW'", html)
+        self.assertIn("Type WIPE to confirm:')!=='WIPE'", html)
+        self.assertIn("Type NUKE to confirm:')!=='NUKE'", html)
+        self.assertIn("Type ERASE to confirm:')!=='ERASE'", html)
+        # No selection → no dispatch.
+        self.assertIn("Pick a danger-zone action first", html)
+
+    def test_context_aware_instance_button(self) -> None:
+        # ONE instance button: ▶ Start when stopped, ■ Stop when running —
+        # label + action derived from the live instance_state.
+        html = handler._console_html()
+        self.assertIn('id="instbtn"', html)
+        self.assertIn("■ Stop instance", html)
+        self.assertIn("▶ Start instance", html)
+        self.assertIn("instState==='running'?'stop':'start'", html)
+        # Its force checkbox sits next to it and feeds through act().
+        self.assertIn('id="force_inst"', html)
+        self.assertIn("'force_inst'", html)
+
+    def test_stopped_box_banner_and_grey_shields(self) -> None:
+        html = handler._console_html()
+        # One calm banner replaces the per-shield "unreachable" scatter…
+        self.assertIn('id="stoppedbanner"', html)
+        self.assertIn("Box stopped (auto-stops 16:30 IST, auto-starts 08:30 Mon–Fri) — guarantees resume on start", html)
+        self.assertIn("$('stoppedbanner').hidden=running", html)
+        # …and the shields grey out as "—" ONLY when the box is not running.
+        self.assertIn("shieldIdle", html)
+        self.assertIn("if(!running){", html)
+        # The REAL warning paths for a RUNNING box must still exist (a stopped
+        # banner must never hide genuine failures while running).
+        self.assertIn("'unreachable'", html)
+        self.assertIn("DEDUP disabled!", html)
+        self.assertIn("schema drift (expected 5)", html)
+
+    def test_overview_has_aws_strip_and_latency_card(self) -> None:
+        html = handler._console_html()
+        overview = html.split('<section data-tab="overview"', 1)[1].split("</section>", 1)[0]
+        # Thin AWS strip (spend / alarms / disk) with click-to-expand details.
+        self.assertIn('id="awsstrip"', overview)
+        self.assertIn('id="awsdetails"', overview)
+        self.assertIn('id="alarms"', overview)
+        self.assertIn('id="storage"', overview)
+        # Compact latency card reusing the existing endpoint + renderers.
+        self.assertIn("loadLatency()", overview)
+        self.assertIn("Measure now", overview)
+        self.assertIn('id="latnet"', overview)
+        self.assertIn('id="latproc"', overview)
+        # Strip is fed by the same aws_status action the old AWS tab used.
+        self.assertIn("call('aws_status')", html)
+
+    def test_admin_tab_holds_ops_and_lock(self) -> None:
+        html = handler._console_html()
+        admin = html.split('<section data-tab="admin"', 1)[1].split("</section>", 1)[0]
+        for needle in (
+            "act('restart-app')", "act('restart-questdb')", "act('stop-app')",
+            'id="force"', 'id="danger"', "lock()",
+        ):
+            self.assertIn(needle, admin, needle)
+        # The bare start/stop instance buttons left the Admin tab — the ONE
+        # context-aware button on Overview owns instance lifecycle now.
+        self.assertNotIn("act('start')", admin)
+        self.assertNotIn("act('stop')", admin)
 
 
 if __name__ == "__main__":
