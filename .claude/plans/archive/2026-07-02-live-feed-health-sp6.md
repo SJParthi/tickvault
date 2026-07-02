@@ -1,7 +1,8 @@
 # Implementation Plan: Live-Feed Health SP6 — verdict badges on the /feeds page
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-06-23
+**Reconciled:** 2026-07-02 — audit verified the single item shipped on origin/main; checkbox was stale.
 **Approved by:** Parthiban ("yes go ahead dude")
 
 ## Per-Item Guarantee Matrix
@@ -93,7 +94,7 @@ renders exactly the server verdict (which is `down` on disconnect/silence,
 
 ## Plan Items
 
-- [ ] Add verdict-badge CSS (5 colours) + health-fetch + per-row badge render + 5s auto-refresh to `feeds_page.rs`
+- [x] Add verdict-badge CSS (5 colours) + health-fetch + per-row badge render + 5s auto-refresh to `feeds_page.rs` — DONE on main: `test_feeds_page_renders_verdict_badge` + `test_feeds_page_auto_refreshes` in `crates/api/src/handlers/feeds_page.rs`
   - Files: crates/api/src/handlers/feeds_page.rs
   - Tests: test_feeds_page_fetches_health_endpoint, test_feeds_page_renders_verdict_badge, test_feeds_page_has_all_five_verdict_colours, test_feeds_page_auto_refreshes
 
