@@ -1158,11 +1158,10 @@ mod tests {
 
     #[test]
     fn test_sanitize_ilp_symbol_clean_input_borrows_zero_alloc() {
-        let clean = "NIFTY";
-        match sanitize_ilp_symbol(clean) {
-            std::borrow::Cow::Borrowed(s) => assert_eq!(s, "NIFTY"),
-            std::borrow::Cow::Owned(_) => panic!("clean input must not allocate"),
-        }
+        let out = sanitize_ilp_symbol("NIFTY");
+        assert_eq!(out, "NIFTY");
+        let borrowed = matches!(out, std::borrow::Cow::Borrowed(_));
+        assert!(borrowed, "clean input must not allocate");
     }
 
     #[test]
@@ -1205,10 +1204,9 @@ mod tests {
     #[test]
     fn test_sanitize_ilp_symbol_empty_string_borrowed() {
         let out = sanitize_ilp_symbol("");
-        match out {
-            std::borrow::Cow::Borrowed(s) => assert_eq!(s, ""),
-            std::borrow::Cow::Owned(_) => panic!("empty input must not allocate"),
-        }
+        assert_eq!(out, "");
+        let borrowed = matches!(out, std::borrow::Cow::Borrowed(_));
+        assert!(borrowed, "empty input must not allocate");
     }
 
     #[test]
@@ -1234,6 +1232,45 @@ mod tests {
         for ch in out.chars() {
             assert_eq!(ch, '😀');
         }
+    }
+
+    #[test]
+    fn test_sanitize_ilp_symbol_cap_walks_back_to_char_boundary() {
+        // 3-byte chars ('₹' = U+20B9): 256 % 3 == 1, so the byte cap lands
+        // MID-character and the boundary walk must step `end` back — the
+        // complement of the 4-byte test above where 256 % 4 == 0 lands
+        // exactly on a boundary and the walk never runs.
+        let input = "₹".repeat(100); // 300 bytes > ILP_SYMBOL_MAX_BYTES
+        let out = sanitize_ilp_symbol(&input);
+        assert_eq!(out.len(), ILP_SYMBOL_MAX_BYTES - 1); // 255 = 85 chars × 3 B
+        assert!(out.chars().all(|c| c == '₹'));
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_strips_bidi_isolates() {
+        // U+2066 LRI ..= U+2069 PDI (bidi ISOLATES — distinct from the
+        // U+202A..U+202E override range) must be stripped: they can
+        // reverse-render Telegram text and break grep/jq on audit logs.
+        let out = sanitize_audit_string("a\u{2066}b\u{2067}c\u{2068}d\u{2069}e");
+        assert_eq!(out, "abcde");
+    }
+
+    #[test]
+    fn test_redact_json_field_key_without_colon_left_untouched() {
+        // The key token appearing WITHOUT a following colon is not a JSON
+        // field assignment — nothing may be redacted and nothing dropped.
+        let input = "{\"accessToken\" \"abc\"}";
+        let out = redact_json_string_field(input, "accessToken");
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn test_redact_json_field_non_string_value_left_untouched() {
+        // Documented contract: non-string values (numbers, null) are left
+        // untouched — only string values are replaced with [REDACTED].
+        let input = "{\"accessToken\": 12345}";
+        let out = redact_json_string_field(input, "accessToken");
+        assert_eq!(out, input);
     }
 
     #[test]
